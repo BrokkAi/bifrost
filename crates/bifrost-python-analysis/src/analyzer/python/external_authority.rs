@@ -2,6 +2,8 @@
 //!
 //! All memoized authority belongs to one active query, never to an analyzer.
 
+use brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelNamespace;
+
 use brokk_bifrost_analysis::analyzer::usages::get_definition::*;
 use brokk_bifrost_analysis::analyzer::{IAnalyzer, ProjectFile, resolve_analyzer};
 use brokk_bifrost_core::analyzer::usages::reference_site::ResolvedReferenceSite;
@@ -1149,8 +1151,11 @@ pub mod native {
                 let Some(overlay) = active.semantic_model_overlay() else {
                     return Err(fail("active declaration overlay is unavailable".into()));
                 };
-                let matched =
-                    overlay.symbols_named_in_family(&self.canonical().join("."), "python");
+                let matched = overlay.symbols_named_in_family(
+                    &self.canonical().join("."),
+                    "python",
+                    SemanticModelNamespace::Unknown,
+                );
                 let candidates = matched.records.into_iter().filter(|symbol| {
                     active.active_models().shards().iter().any(|shard| {
                         shard.manifest.content_sha256 == self.checked.binding.model_manifest_sha256()
@@ -1525,13 +1530,18 @@ pub mod native {
             else {
                 return false;
             };
-            // Existence queries are capped at one row; an interrupted empty
-            // query cannot prove that a workspace namespace is absent.
+            // An interrupted empty query cannot prove that a workspace
+            // namespace is absent. The declaration lookup reads rows by the
+            // last name segment before it matches the full name, so its row
+            // limit counts unrelated declarations that share the segment (a
+            // module-level `builtins` variable beside `import builtins`).
+            // Capping it would report such a namespace as possibly local.
             let modules = python
                 .module_candidates_by_fqn_limited(name, 1, || !self.cancellation.is_cancelled());
-            let declarations = python.declaration_candidates_by_fqn_limited(name, 1, || {
-                !self.cancellation.is_cancelled()
-            });
+            let declarations =
+                python.declaration_candidates_by_fqn_limited(name, usize::MAX, || {
+                    !self.cancellation.is_cancelled()
+                });
             if !modules.complete
                 || !modules.rows.is_empty()
                 || !declarations.complete
@@ -1566,7 +1576,7 @@ pub mod native {
                 return None;
             }
             let overlay = self.snapshot.semantic_model_overlay()?;
-            let matched = overlay.symbols_named_for(name, "python");
+            let matched = overlay.python_symbols_named(name);
             let [symbol] = matched.records.as_slice() else {
                 return None;
             };

@@ -203,7 +203,10 @@ fn measured_cold_refresh_matches_producers_and_warm_refresh_does_not_reparse() {
     );
     let (response, progress) = read_response_collecting_progress(&mut reader, &mut stderr, 4);
     assert_eq!(response["result"]["isError"], false, "{response}");
-    assert!(progress.is_empty());
+    assert!(
+        progress.is_empty(),
+        "a tokenless call must not collect progress from an earlier request: {progress:?}"
+    );
     drop(stdin);
     assert!(child.wait().unwrap().success());
 }

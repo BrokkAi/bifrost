@@ -27,6 +27,7 @@ use brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceProvenance;
 use brokk_bifrost_core::analyzer::source_facts::SourceDeclarationId;
 use brokk_bifrost_core::analyzer::source_facts::SourceImportId;
 
+use brokk_bifrost_core::analyzer::structural::callable::CalleeSpelling;
 use brokk_bifrost_core::analyzer::structural::code::VocabularyCode;
 
 use brokk_bifrost_core::analyzer::CodeUnit;
@@ -272,7 +273,7 @@ pub const RUST_DECLARATION_PROPERTIES_SQL: &str =
             declaration_kind, macro_exported, trait_impl_member,
             has_impl_or_trait_ancestor, nearest_declaration_boundary,
             json(derive_helper_attributes),
-            generated_surface
+            generated_surface, json(builtin_derives)
              FROM source_rust_declaration_properties WHERE blob_id = ?1 ORDER BY declaration_id";
 
 fn decode_rust_declaration_boundary(boundary: i64) -> Result<RustDeclarationBoundary> {
@@ -555,6 +556,22 @@ impl super::AnalyzerStore {
                     Ok(names)
                 })
                 .transpose()?;
+            let builtin_derives = row
+                .get::<_, Option<String>>(11)?
+                .map(|encoded| {
+                    let names = serde_json::from_str::<Vec<String>>(&encoded).map_err(|error| {
+                        StoreError::new(format!(
+                            "invalid Rust built-in derive names {encoded:?} for {oid}/{declaration:?}: {error}"
+                        ))
+                    })?;
+                    if names.is_empty() || names.windows(2).any(|pair| pair[0] >= pair[1]) {
+                        return Err(StoreError::new(format!(
+                            "Rust built-in derive names are not nonempty, sorted and distinct for {oid}/{declaration:?}: {names:?}"
+                        )));
+                    }
+                    Ok(names)
+                })
+                .transpose()?;
             properties.insert(
                 declaration,
                 RustDeclarationPropertyFact {
@@ -565,6 +582,7 @@ impl super::AnalyzerStore {
                     has_impl_or_trait_ancestor: row.get(7)?,
                     nearest_declaration_boundary: decode_rust_declaration_boundary(row.get(8)?)?,
                     derive_helper_attributes: helper_attributes,
+                    builtin_derives,
                     generated_surface: strict_bool(row.get(10)?, "generated surface")?,
                     visibility,
                     cfg_condition,
@@ -927,6 +945,15 @@ fn encode_structural_facts(
         } else {
             node_json.push_str("null,null");
         }
+        node_json.push(',');
+        push_json_optional(
+            &mut node_json,
+            node.call_site
+                .as_ref()
+                .map(|call| call.callee_spelling)
+                .filter(|spelling| *spelling != CalleeSpelling::Written)
+                .map(|spelling| u32::from(spelling.code())),
+        );
         node_json.push(']');
     }
     node_json.push(']');
@@ -1207,6 +1234,7 @@ pub(super) fn insert_source_facts_tx(
     cancellation: &CancellationToken,
 ) -> Result<()> {
     check_cancelled(cancellation)?;
+    tx.execute("DELETE FROM surface_sets WHERE blob_id=?1", [blob_id])?;
     // The seal no longer re-reads these rows (#3737). Every row count and id
     // below comes from the collection its insert loop iterates, and each
     // inline span comes from an arena lookup of the id written beside it, so
@@ -1661,7 +1689,11 @@ mod roundtrip_properties {
                 parent: None,
                 name: Some(id(1)),
                 subtree_end: index as u32 + 1,
-                call_site: (index == 3).then(|| CallSiteFacts::unrefined().continuing()),
+                call_site: (index == 3).then(|| {
+                    CallSiteFacts::of_coverage(
+                        brokk_bifrost_core::analyzer::structural::callable::CallShapeCoverage::CandidateMacroDerived,
+                    ).continuing()
+                }),
             })
             .collect();
         let roles = [
@@ -1837,7 +1869,9 @@ mod roundtrip_properties {
         assert_eq!(storage, ("blob".to_owned(), true, "array".to_owned()));
         let encoded: serde_json::Value = serde_json::from_str(&nodes).unwrap();
         for node in encoded.as_array().unwrap() {
-            assert_eq!(node.as_array().unwrap().len(), 26);
+            assert_eq!(node.as_array().unwrap().len(), 27);
+            // Position 26 is the callee spelling, absent for a written callee.
+            assert!(node[26].is_null());
         }
         assert_eq!(encoded[0][24], serde_json::json!(["public", "final"]));
         assert_eq!(encoded[0][25], serde_json::json!("class"));
@@ -1856,6 +1890,12 @@ mod roundtrip_properties {
             vec![Some(true), Some(false), None, None]
         );
         assert!(nodes[3].call_site.as_ref().unwrap().continues_callee_groups);
+        assert_eq!(nodes[3].call_site.as_ref().unwrap().coverage, 5);
+        let coverage =
+            brokk_bifrost_core::analyzer::structural::callable::CallShapeCoverage::from_code(5)
+                .unwrap();
+        assert_eq!(coverage.label(), "candidate_macro_derived");
+        assert!(!coverage.is_exact());
         let mut corrupt_roles: serde_json::Value = serde_json::from_str(&roles).unwrap();
         corrupt_roles[0][2] = serde_json::json!(9);
         assert!(decode_structural_roles(&corrupt_roles.to_string()).is_err());

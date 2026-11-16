@@ -66,6 +66,22 @@ impl RootMemoKey {
 }
 
 impl SelectedDemandState {
+    /// Retain canonical identity authority, discard completed query answers.
+    pub(crate) fn discard_completed_answers(&self) {
+        self.roots
+            .lock()
+            .expect("selected demand roots are not poisoned")
+            .clear();
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn completed_answers_empty(&self) -> bool {
+        self.roots
+            .lock()
+            .expect("selected demand roots are not poisoned")
+            .is_empty()
+    }
+
     pub(crate) fn identity_digest(&self, number: u64) -> Option<[u8; 32]> {
         self.identities
             .lock()
@@ -282,7 +298,9 @@ impl SelectedDemandState {
                     | ResolutionIncompleteReason::UnsupportedSemantic(id)
                     | ResolutionIncompleteReason::ReceiverSubclassObligation(id)
                     | ResolutionIncompleteReason::ReceiverBudgetExhausted(id)
-                    | ResolutionIncompleteReason::TimeBudgetExceeded(id) => semantic(id),
+                    | ResolutionIncompleteReason::TimeBudgetExceeded(id)
+                    | ResolutionIncompleteReason::OverlayFrontierUnknown(id)
+                    | ResolutionIncompleteReason::Unclassified(id) => semantic(id),
                 })
             }
         };
@@ -345,6 +363,10 @@ impl SelectedDemandState {
                         .iter()
                         .all(|value| semantic(value.ty().identity()))
                     && completion(row.completion())
+                    && row
+                        .declared_type_edges
+                        .iter()
+                        .all(|(edge, evidence)| semantic(*edge) && completion(evidence))
             })
             && answer.projected_type_shapes().iter().all(|shape| {
                 semantic(shape.output_slot)

@@ -908,11 +908,6 @@ impl AnalyzerConfig {
     }
 
     // #9737 M1 part 2b: legacy cache constructors still size their local caps here.
-    pub fn store_cache_budget_bytes(&self) -> u64 {
-        self.retention_budget_bytes() / 4
-    }
-
-    // #9737 M1 part 2b: legacy cache constructors still size their local caps here.
     pub fn memo_cache_budget_bytes(&self) -> u64 {
         self.retention_budget_bytes() / 4
     }

@@ -11,6 +11,9 @@ use std::mem::size_of;
 use std::sync::Arc;
 use tree_sitter::Node;
 
+mod hazards;
+pub(crate) use hazards::PythonDynamicHazards;
+
 /// Syntax-only proof candidates for module-level initializer values.
 ///
 /// This is deliberately separate from [`PythonFileSourceFacts`]: that type is
@@ -88,6 +91,7 @@ enum PythonModuleMutationHazard {
 fn python_module_mutation_hazard_bounded(
     node: Node<'_>,
     source: &str,
+    hazards: &PythonDynamicHazards,
     mut scope_step: impl FnMut() -> bool,
 ) -> Option<Option<PythonModuleMutationHazard>> {
     if !scope_step() {
@@ -106,9 +110,16 @@ fn python_module_mutation_hazard_bounded(
         }
         return Some(Some(PythonModuleMutationHazard::Global(names)));
     }
+    if hazards.contains(node) {
+        return Some(Some(PythonModuleMutationHazard::Exec));
+    }
     if node.kind() != "call" {
         return Some(None);
     }
+    // #12522 retires this conservative legacy marker once unresolved calls
+    // carry effects authority. python_shadowed_exec_unresolved_runner_golden
+    // pins a local exec delegating to an opaque runner: dropping this marker
+    // certified an obsolete Base binding. This is not proof of builtin identity.
     if node
         .child_by_field_name("function")
         .is_some_and(|function| {
@@ -127,9 +138,13 @@ fn python_module_mutation_hazard_bounded(
 /// Native producers reuse the same selected-node hazard classification. This
 /// retains unknown lexical binders during parsing rather than reparsing a file
 /// to certify a later builtin lookup. Global directives have binding events.
-pub(crate) fn python_module_dynamic_write_candidate(node: Node<'_>, source: &str) -> bool {
+pub(crate) fn python_module_dynamic_write_candidate(
+    node: Node<'_>,
+    source: &str,
+    hazards: &PythonDynamicHazards,
+) -> bool {
     matches!(
-        python_module_mutation_hazard_bounded(node, source, || true),
+        python_module_mutation_hazard_bounded(node, source, hazards, || true),
         Some(Some(
             PythonModuleMutationHazard::Exec | PythonModuleMutationHazard::ReflectiveWrite
         ))
@@ -161,6 +176,7 @@ impl PythonModuleMutationFacts {
         if !scope_step() || root.kind() != "module" || root.has_error() {
             return None;
         }
+        let hazards = PythonDynamicHazards::collect_bounded(root, source, &mut scope_step)?;
         let mut facts = Self {
             global_binding_events: HashSet::new(),
             dynamic_hazards: Vec::new(),
@@ -170,7 +186,9 @@ impl PythonModuleMutationFacts {
             if !scope_step() {
                 return Err(());
             }
-            match python_module_mutation_hazard_bounded(node, source, &mut scope_step).ok_or(())? {
+            match python_module_mutation_hazard_bounded(node, source, &hazards, &mut scope_step)
+                .ok_or(())?
+            {
                 Some(PythonModuleMutationHazard::Global(_)) => {
                     // Directives belong to their nearest lexical body. Keep
                     // this outer scan file-wide to include sibling writers.
@@ -542,6 +560,20 @@ pub fn python_module_global_source_facts(
         }
     }
 
+    // max_nodes bounds source size, not the classifier's graph operations.
+    // Check the full tree before collection so an oversized or cancelled walk
+    // cannot publish partial clean facts. Internal work still polls cancellation.
+    remaining = max_nodes;
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if remaining == 0 || !keep_going() {
+            return None;
+        }
+        remaining -= 1;
+        let mut cursor = node.walk();
+        pending.extend(node.named_children(&mut cursor));
+    }
+    let hazards = PythonDynamicHazards::collect_bounded(root, source, &mut keep_going)?;
     remaining = max_nodes;
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
@@ -551,7 +583,7 @@ pub fn python_module_global_source_facts(
         remaining -= 1;
         // Preserve the file-wide/deferred contract, including its historical
         // node budget. The reference-time consumer meters classifier internals.
-        match python_module_mutation_hazard_bounded(node, source, || true)? {
+        match python_module_mutation_hazard_bounded(node, source, &hazards, || true)? {
             Some(PythonModuleMutationHazard::Global(names)) => {
                 facts.global_declarations.extend(names);
             }
@@ -751,6 +783,88 @@ mod tests {
     ) -> Option<&'a str> {
         let range = facts.initializer_range(name)?;
         source.get(range.start_byte..range.end_byte)
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12323: alias propagation must not publish partial clean facts when stopped"
+    )]
+    fn dynamic_alias_collection_exhaustion_refuses_partial_facts() {
+        let source = "run = exec\nother = run\nrun = other\nother(payload)\nimport types\ncheck = another\nanother = check\ncheck(payload, (types.FunctionType,))\n";
+        let tree = crate::declarations::parse_python_tree(source).unwrap();
+        let mut visits = 0_usize;
+        let facts = PythonModuleMutationFacts::collect_bounded(tree.root_node(), source, || {
+            visits += 1;
+            true
+        })
+        .unwrap();
+        assert!(!facts.dynamic_hazards.is_empty());
+        for allowance in 0..visits {
+            let mut remaining = allowance;
+            assert!(
+                PythonModuleMutationFacts::collect_bounded(tree.root_node(), source, || {
+                    let allowed = remaining > 0;
+                    remaining = remaining.saturating_sub(1);
+                    allowed
+                })
+                .is_none(),
+                "allowance={allowance}"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#12323: comprehension lookups multiplied parsing work and consumed the node allowance"
+    )]
+    fn dynamic_hazard_comprehensions_preserve_scaling_and_node_budget() {
+        for statement in [
+            "values = [item for item in items]\n",
+            "unrelated = 1\nvalue = eval\n",
+            "v = vars\nvars = v\n",
+        ] {
+            let mut previous_work = None;
+            for count in [128, 256] {
+                let mut source = String::from("sentinel = 1\neval = object\n");
+                for _ in 0..count {
+                    source.push_str(statement);
+                }
+                let tree = crate::declarations::parse_python_tree(&source).unwrap();
+                let root = tree.root_node();
+                let mut work = 0_usize;
+                let hazards = PythonDynamicHazards::collect_bounded(root, &source, || {
+                    work += 1;
+                    true
+                })
+                .unwrap();
+                assert!(!hazards.contains(root));
+                if let Some(previous) = previous_work {
+                    assert!(
+                        work < previous * 3,
+                        "doubling {statement:?}: {previous} -> {work}"
+                    );
+                }
+                previous_work = Some(work);
+                let mut nodes = 0_usize;
+                let mut stack = vec![root];
+                while let Some(node) = stack.pop() {
+                    nodes += 1;
+                    let mut cursor = node.walk();
+                    stack.extend(node.named_children(&mut cursor));
+                }
+                // Preserve the existing source-fact walk's allowance, including
+                // its binder visits, without charging the origin graph against it.
+                let facts = python_module_global_source_facts(root, &source, nodes * 4, || true)
+                    .expect("ordinary source within its node allowance");
+                assert_eq!(Some("1"), initializer(&facts, &source, "sentinel"));
+                assert!(
+                    python_module_global_source_facts(root, &source, nodes - 1, || true).is_none()
+                );
+                assert!(
+                    python_module_global_source_facts(root, &source, nodes * 4, || false).is_none()
+                );
+            }
+        }
     }
 
     #[test]

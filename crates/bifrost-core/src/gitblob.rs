@@ -466,8 +466,18 @@ fn platform_path_bytes(path: &Path) -> Vec<u8> {
 /// index entry, the same way Git detects worktree edits, so a snapshot taken
 /// at startup stays valid for later full-refresh sweeps.
 pub struct WorkingTreeIdentity {
+    /// The canonical working directory every tracked and dirty path is relative
+    /// to.
+    workdir: PathBuf,
     tracked: HashMap<String, TrackedIdentity>,
     dirty: HashSet<String>,
+    /// Dirty paths Git reported that are not UTF-8. `dirty` holds their lossy
+    /// spelling, which names no file; a listing reports these as omissions.
+    non_utf8_dirty: Vec<PathBuf>,
+    /// Whether the index holds a gitlink. A materialized submodule contributes
+    /// its own repository's files and dirty set to a workspace listing, which
+    /// this scan does not read.
+    has_gitlinks: bool,
     verified_clean_paths: Mutex<HashSet<String>>,
     /// Paths a long-lived caller explicitly reported as changed after this
     /// identity was captured. Their current bytes must be hashed even when an
@@ -491,6 +501,60 @@ struct TrackedIdentity {
 }
 
 impl WorkingTreeIdentity {
+    /// The canonical, normalized working directory this snapshot's paths are
+    /// relative to. It is spelled the way
+    /// [`crate::analyzer::project::collect_workspace_files`] spells a workdir,
+    /// so a root selected through that spelling strips against it on every
+    /// platform, including a Windows verbatim (`\\?\`) canonical path.
+    pub fn workdir(&self) -> &Path {
+        &self.workdir
+    }
+
+    /// The current worktree paths under `subtree`, from this snapshot's index
+    /// and dirty sets, with every dirty path Git could not decode (unscoped: a
+    /// caller keeps the ones under its root).
+    ///
+    /// This is the membership [`working_tree_paths_with_non_utf8`] computes,
+    /// without another `git status`: the snapshot already observed which
+    /// tracked paths disappeared and which untracked paths exist, and
+    /// [`Self::invalidate_paths`] adds every path a caller later reported as
+    /// changed. A dirty or invalidated path still costs one stat, so a file
+    /// created, removed or renamed since the scan is classified from the
+    /// filesystem rather than from stale state.
+    ///
+    /// `None` means the snapshot cannot reproduce that membership: it holds a
+    /// gitlink, whose materialized submodule contributes its own repository's
+    /// files and dirty set.
+    pub fn working_tree_paths(
+        &self,
+        subtree: Option<&str>,
+    ) -> Option<(HashSet<String>, Vec<PathBuf>)> {
+        if self.has_gitlinks {
+            return None;
+        }
+        let mut dirty = self.dirty.clone();
+        dirty.extend(
+            self.invalidated_paths
+                .lock()
+                .expect("working-tree identity invalidation mutex poisoned")
+                .iter()
+                .cloned(),
+        );
+        let mut paths = HashSet::new();
+        listed_git_paths(
+            self.tracked.keys().map(String::as_str),
+            &dirty,
+            |rel| self.tracked.contains_key(rel),
+            &self.workdir,
+            "",
+            subtree,
+            |_| Ok(true),
+            &mut paths,
+        )
+        .expect("an unprefixed listing checks no containment");
+        Some((paths, self.non_utf8_dirty.clone()))
+    }
+
     /// Stop serving this snapshot's index identity for explicitly changed paths.
     ///
     /// Invalidations last for the lifetime of this repository-wide snapshot.
@@ -688,13 +752,21 @@ pub fn working_tree_identity(repo: &Repository) -> Result<WorkingTreeIdentity> {
     let started = std::time::Instant::now();
     let mut index = repo.index().map_err(|e| e.to_string())?;
     index.read(true).map_err(|e| e.to_string())?;
-    let dirty = dirty_worktree_paths(repo, None)?;
+    let (dirty, non_utf8_dirty) = dirty_worktree_paths_with_non_utf8(repo, None)?;
+    // Normalized as the workspace listing normalizes its workdir: a Windows
+    // canonical path is verbatim (`\\?\C:\...`), and a project root is not.
+    let workdir = workdir(repo)?
+        .canonicalize()
+        .map_err(|error| format!("canonicalizing worktree: {error}"))?
+        .normalize();
     // Keep the startup scan to index and dirty-tree data. Canonical blob sizes
     // and attributes are checked only when an analyzer requests that path.
     // This avoids object-database work for unrelated languages and files.
     let entries: Vec<IndexEntry> = index.iter().collect();
     let mut tracked = HashMap::with_capacity(entries.len());
+    let mut has_gitlinks = false;
     for entry in entries {
+        has_gitlinks |= entry.mode == 0o160000;
         let rel = index_path_to_string(&entry)?;
         tracked.insert(
             rel,
@@ -715,8 +787,11 @@ pub fn working_tree_identity(repo: &Repository) -> Result<WorkingTreeIdentity> {
         ));
     }
     Ok(WorkingTreeIdentity {
+        workdir,
         tracked,
         dirty,
+        non_utf8_dirty,
+        has_gitlinks,
         verified_clean_paths: Mutex::new(HashSet::new()),
         invalidated_paths: Mutex::new(HashSet::new()),
     })
@@ -905,10 +980,66 @@ fn working_tree_paths(repo: &Repository, subtree: Option<&str>) -> Result<HashSe
     working_tree_paths_with_non_utf8(repo, subtree).map(|(paths, _)| paths)
 }
 
+/// Append the paths one Git index and dirty set describe.
+///
+/// `tracked` names the index entries that are ordinary files; a caller handles
+/// gitlinks itself because they descend into their own repository.
+/// `is_tracked` answers whether a dirty path also has an index entry. `scope`
+/// keeps only paths under one [`subtree_pathspec`]; a dirty set Git already
+/// scoped passes it unchanged.
+#[allow(clippy::too_many_arguments)]
+fn listed_git_paths<'a>(
+    tracked: impl IntoIterator<Item = &'a str>,
+    dirty: &HashSet<String>,
+    is_tracked: impl Fn(&str) -> bool,
+    workdir: &Path,
+    prefix: &str,
+    scope: Option<&str>,
+    contained: impl Fn(&Path) -> Result<bool>,
+    paths: &mut HashSet<String>,
+) -> Result<()> {
+    for rel in tracked {
+        if scope.is_some_and(|scope| !rel.starts_with(scope)) {
+            continue;
+        }
+        if (!dirty.contains(rel) || listed_working_tree_kind(&workdir.join(rel)))
+            && (prefix.is_empty() || contained(Path::new(rel))?)
+        {
+            paths.insert(format!("{prefix}{rel}"));
+        }
+    }
+    for rel in dirty {
+        if !is_tracked(rel)
+            && scope.is_none_or(|scope| rel.starts_with(scope))
+            && listed_working_tree_kind(&workdir.join(rel))
+            && (prefix.is_empty() || contained(Path::new(rel))?)
+        {
+            paths.insert(format!("{prefix}{rel}"));
+        }
+    }
+    Ok(())
+}
+
 pub fn working_tree_paths_with_non_utf8(
     repo: &Repository,
     subtree: Option<&str>,
 ) -> Result<(HashSet<String>, Vec<std::path::PathBuf>)> {
+    let listing = working_tree_listing_with_inputs(repo, subtree)?;
+    Ok((listing.paths, listing.non_utf8))
+}
+
+pub(crate) struct WorkingTreeListing {
+    pub paths: HashSet<String>,
+    pub non_utf8: Vec<PathBuf>,
+    pub directories: Result<std::collections::BTreeSet<PathBuf>>,
+}
+
+pub(crate) fn working_tree_listing_with_inputs(
+    repo: &Repository,
+    subtree: Option<&str>,
+) -> Result<WorkingTreeListing> {
+    let mut directories = std::collections::BTreeSet::new();
+    let mut census_failure = None;
     let mut paths = HashSet::new();
     let mut non_utf8 = Vec::new();
     // Strict descendant workdirs make traversal acyclic. The stack and full
@@ -925,15 +1056,54 @@ pub fn working_tree_paths_with_non_utf8(
             .map_err(|error| error.to_string())?;
         let mut index = current.index().map_err(|error| error.to_string())?;
         index.read(true).map_err(|error| error.to_string())?;
-        let (dirty, invalid) = dirty_worktree_paths_with_non_utf8(&current, scope.as_deref())?;
+        let (dirty, invalid, ignored) =
+            dirty_worktree_paths_and_ignored(&current, scope.as_deref())?;
+        if !crate::analyzer::project::ignore_inputs::supports_matching(&workdir) {
+            census_failure = Some("Git older than 2.16 or version unavailable".to_owned());
+        }
+        if !invalid.is_empty() || ignored.iter().any(|path| path.to_str().is_none()) {
+            census_failure = Some("non-UTF-8 Git entry prevents ignore-input census".to_owned());
+        }
+        directories.insert(workdir.clone());
+        let mut record_entry = |path: &Path| {
+            let absolute = workdir.join(path);
+            if path.as_os_str().as_encoded_bytes().last() == Some(&b'/')
+                && absolute.join(".git").exists()
+            {
+                census_failure = Some(format!("nested repository: {}", absolute.display()));
+            }
+            for ancestor in absolute.parent().into_iter().flat_map(Path::ancestors) {
+                if !ancestor.starts_with(&workdir) {
+                    break;
+                }
+                if directories.insert(ancestor.to_path_buf())
+                    && ancestor != workdir
+                    && ancestor.join(".git").exists()
+                {
+                    census_failure = Some(format!("nested repository: {}", ancestor.display()));
+                }
+            }
+        };
+        for path in dirty
+            .iter()
+            .map(Path::new)
+            .chain(ignored.iter().map(PathBuf::as_path))
+        {
+            record_entry(path);
+        }
         non_utf8.extend(
             invalid
                 .into_iter()
                 .map(|path| std::path::PathBuf::from(&prefix).join(path)),
         );
+        let mut has_gitlinks = false;
         let mut visited_gitlinks = HashSet::new();
+        let mut tracked = Vec::new();
         for entry in index.iter() {
             let rel = index_path_to_string(&entry)?;
+            if scope.as_deref().is_none_or(|scope| rel.starts_with(scope)) {
+                record_entry(Path::new(&rel));
+            }
             if entry.mode == 0o160000 {
                 // Conflict stages may contain the same gitlink several times.
                 if !visited_gitlinks.insert(rel.clone()) {
@@ -947,6 +1117,8 @@ pub fn working_tree_paths_with_non_utf8(
                     Some(scope) if !child_prefix.starts_with(scope) => continue,
                     _ => None,
                 };
+                // Only gitlinks intersecting the selected scope prevent certification.
+                has_gitlinks = true;
                 if let Some(child) = materialized_submodule(&current, &rel)? {
                     pending.push((
                         child.path().to_path_buf(),
@@ -956,28 +1128,27 @@ pub fn working_tree_paths_with_non_utf8(
                 }
                 continue;
             }
-            if scope
-                .as_deref()
-                .is_some_and(|scope| !rel.starts_with(scope))
-            {
-                continue;
-            }
-            if (!dirty.contains(&rel) || listed_working_tree_kind(&workdir.join(&rel)))
-                && (prefix.is_empty() || contained_child_file(&workdir, Path::new(&rel))?)
-            {
-                paths.insert(format!("{prefix}{rel}"));
-            }
+            tracked.push(rel);
         }
-        for rel in dirty {
-            if index.get_path(Path::new(&rel), 0).is_none()
-                && listed_working_tree_kind(&workdir.join(&rel))
-                && (prefix.is_empty() || contained_child_file(&workdir, Path::new(&rel))?)
-            {
-                paths.insert(format!("{prefix}{rel}"));
-            }
+        if has_gitlinks {
+            census_failure = Some("submodule input scope".to_owned());
         }
+        listed_git_paths(
+            tracked.iter().map(String::as_str),
+            &dirty,
+            |rel| index.get_path(Path::new(rel), 0).is_some(),
+            &workdir,
+            &prefix,
+            scope.as_deref(),
+            |rel| contained_child_file(&workdir, rel),
+            &mut paths,
+        )?;
     }
-    Ok((paths, non_utf8))
+    Ok(WorkingTreeListing {
+        paths,
+        non_utf8,
+        directories: census_failure.map_or(Ok(directories), Err),
+    })
 }
 
 fn listed_working_tree_kind(path: &Path) -> bool {
@@ -1338,14 +1509,18 @@ pub fn index_path_to_string(entry: &IndexEntry) -> Result<String> {
     String::from_utf8(entry.path.clone()).map_err(|err| format!("non-UTF-8 git index path: {err}"))
 }
 
-fn dirty_worktree_paths(repo: &Repository, subtree: Option<&str>) -> Result<HashSet<String>> {
-    dirty_worktree_paths_with_non_utf8(repo, subtree).map(|(paths, _)| paths)
-}
-
 fn dirty_worktree_paths_with_non_utf8(
     repo: &Repository,
     subtree: Option<&str>,
 ) -> Result<(HashSet<String>, Vec<std::path::PathBuf>)> {
+    let (dirty, invalid, _) = dirty_worktree_paths_and_ignored(repo, subtree)?;
+    Ok((dirty, invalid))
+}
+
+fn dirty_worktree_paths_and_ignored(
+    repo: &Repository,
+    subtree: Option<&str>,
+) -> Result<(HashSet<String>, Vec<PathBuf>, Vec<PathBuf>)> {
     let _scope = crate::profiling::scope("gitblob::dirty_worktree_paths");
     let workdir = workdir(repo)?;
     // libgit2's recursive index-to-worktree diff can rescan very large trees
@@ -1357,6 +1532,9 @@ fn dirty_worktree_paths_with_non_utf8(
             .into_iter()
             .map(Into::into)
             .collect();
+    if crate::analyzer::project::ignore_inputs::supports_matching(workdir) {
+        args.push("--ignored=matching".into());
+    }
     if let Some(subtree) = subtree {
         // Porcelain paths stay relative to the working directory root, so the
         // pathspec changes only which part of the tree Git walks. `:(literal)`
@@ -1392,6 +1570,7 @@ fn dirty_worktree_paths_with_non_utf8(
         ));
     }
 
+    let mut ignored = Vec::new();
     let mut dirty = HashSet::new();
     let mut non_utf8 = Vec::new();
     let mut fields = output.stdout.split(|byte| *byte == 0);
@@ -1408,6 +1587,9 @@ fn dirty_worktree_paths_with_non_utf8(
         }
         let status = &field[..2];
         let path = &field[3..];
+        if status == b"!!" {
+            ignored.push(bytes_to_path(path));
+        }
         if status != b"  " && status != b"!!" {
             if std::str::from_utf8(path).is_err() {
                 non_utf8.push(bytes_to_path(path));
@@ -1423,10 +1605,10 @@ fn dirty_worktree_paths_with_non_utf8(
             }
         }
     }
-    Ok((dirty, non_utf8))
+    Ok((dirty, non_utf8, ignored))
 }
 
-fn bytes_to_path(bytes: &[u8]) -> std::path::PathBuf {
+pub(crate) fn bytes_to_path(bytes: &[u8]) -> std::path::PathBuf {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;

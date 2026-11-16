@@ -282,6 +282,7 @@ fn seed_of_source(plan: &TaintAnalysisPlan, procedure: &ProcedureHandle) -> Inte
         .find(|(_, spec)| spec.point().procedure() == procedure)
         .expect("the procedure holds a source");
     InteriorSeed::Source {
+        selected_entry: spec.selected_entry().cloned(),
         point: spec.point().id(),
         phase: spec.phase(),
         carrier: spec.carrier().clone(),
@@ -348,6 +349,8 @@ struct FakeGraph {
     callers: HashMap<DurableProcedureKey, Callers>,
     parents: HashMap<DurableProcedureKey, DurableProcedureKey>,
     models: HashMap<DurableCallSiteKey, CallModel>,
+    model_content_cause: Option<IncompleteCause>,
+    model_content_consults: std::cell::Cell<usize>,
     behavior: UnmodeledCallBehavior,
     fallbacks: HashMap<DurableCallSiteKey, FallbackPorts>,
     endpoints: HashMap<DurableProcedureKey, ProcedureEndpoints>,
@@ -691,6 +694,13 @@ impl CompositionProvider for FakeGraph {
         })
     }
 
+    fn certify_model_content_refusal(&self, _request: &mut SemanticRequest<'_>) -> IncompleteCause {
+        self.model_content_consults
+            .set(self.model_content_consults.get() + 1);
+        self.model_content_cause
+            .unwrap_or(IncompleteCause::Operational(OperationalCause::Provider))
+    }
+
     fn dispatch(
         &self,
         call: &DurableCallSiteKey,
@@ -875,15 +885,15 @@ fn output_product_round_trips_two_origins_and_a_witness() {
         "missing witness evidence stays open"
     );
     assert_eq!(serde_json::to_value(decoded).unwrap(), encoded);
-    assert_eq!(encoded["version"], 8);
+    assert_eq!(encoded["version"], 10);
     let mut empty = encoded.clone();
     empty["findings"] = serde_json::json!([]);
     empty["witnesses"] = serde_json::json!([]);
     empty["retained_witnesses"] = 0.into();
     empty["retained_witness_steps"] = 0.into();
     assert!(OutputReportRow::decode(empty.clone()).is_ok());
-    // The version is an exact fence: the previous version 6 is rejected too.
-    for old_version in [1, 2, 3, 4, 5, 6] {
+    // The version is an exact fence: every earlier version is rejected too.
+    for old_version in [1, 2, 3, 4, 5, 6, 7, 8, 9] {
         let mut old = encoded.clone();
         old["version"] = old_version.into();
         assert_eq!(
@@ -1250,6 +1260,7 @@ fn report_dispatches_a_sink_call_not_seen_by_search() {
     graph.models.insert(
         (caller.durable_key(), call.id),
         CallModel {
+            endpoint_projections: false,
             summary: None,
             summary_target: None,
             transfers: Vec::new(),
@@ -1702,6 +1713,7 @@ fn a_model_replaces_the_callee_with_a_receiver_to_result_transfer() {
     graph.models.insert(
         (target.durable_key(), call),
         CallModel {
+            endpoint_projections: false,
             summary: None,
             summary_target: None,
             transfers: vec![ModelTransfer {
@@ -1710,6 +1722,7 @@ fn a_model_replaces_the_callee_with_a_receiver_to_result_transfer() {
                 function: TaintEdgeFunction::identity(plan.universe()),
                 proven: true,
                 unresolved_output_storage: false,
+                preserves_member_contents: false,
             }],
             writeback: Box::default(),
             receiver_reads: Box::default(),
@@ -2016,6 +2029,7 @@ fn openness_retains_each_residual_cause() {
             Openness::Open {
                 residual: vec![residual.clone()].into_boxed_slice(),
                 residual_causes: vec![cause].into_boxed_slice(),
+                relation_cause: None,
                 cause,
                 blocked: None,
                 status: SemanticInputStatus::Complete,
@@ -2495,6 +2509,7 @@ fn a_require_model_policy_abstains_at_an_unmodeled_call() {
 fn frontier_source(fixture: &Fixture, plan: &TaintAnalysisPlan, name: &str) -> BoundSource {
     let relation = &fixture.first_relation[name];
     BoundSource {
+        selected_entry: None,
         point: relation.point().clone(),
         phase: ValueFlowObservationPhase::BeforeEffects,
         carrier: ValueFlowCarrier::from(&relation.source),
@@ -2535,6 +2550,7 @@ fn a_source_matched_on_the_frontier_reaches_the_sink() {
     graph.interior(
         origin,
         InteriorSeed::Source {
+            selected_entry: source.selected_entry.clone(),
             point: source.point.id(),
             phase: source.phase,
             carrier: source.carrier.clone(),
@@ -2594,6 +2610,7 @@ fn a_frontier_source_with_unknown_evidence_is_judged_when_it_reaches_a_sink() {
     graph.interior(
         origin,
         InteriorSeed::Source {
+            selected_entry: source.selected_entry.clone(),
             point: source.point.id(),
             phase: source.phase,
             carrier: source.carrier.clone(),
@@ -3554,4 +3571,110 @@ fn execution_relation_declaring_body_still_descends_own_invocations() {
     );
     assert!(answer.reaches.iter().any(|reach| reach.hops.is_empty()));
     assert!(answer.reaches.iter().any(|reach| !reach.hops.is_empty()));
+}
+
+#[test]
+#[hardwon(
+    "#12107: a returned-member model gap minted Provider instead of retaining its actual input causes"
+)]
+fn returned_member_refusal_preserves_all_operational_contributors() {
+    let mut budget = SemanticBudget::default();
+    let cancellation = CancellationToken::default();
+    assert_eq!(
+        ToyGraph::default()
+            .certify_model_content_refusal(&mut SemanticRequest::new(&mut budget, &cancellation),),
+        IncompleteCause::Operational(OperationalCause::Provider),
+        "providers without a receipt certificate keep the operational default",
+    );
+    let fixture = fixture();
+    let plan = fixture.plan(&["origin"], &["caller"], None);
+    let caller = &fixture.procedures["caller"];
+    let call = fixture.helper_call().id;
+    let member = PartialFlowPort::Heap {
+        root: Box::new(PartialFlowPort::CallResult {
+            call,
+            ordinal: None,
+        }),
+        selectors: vec![HeapSelector::AnyIndex].into_boxed_slice(),
+        tail: AccessPathTail::Exact,
+    };
+    let provider = IncompleteCause::Operational(OperationalCause::Provider);
+    let cancelled = IncompleteCause::Operational(OperationalCause::Cancelled);
+    let budget = IncompleteCause::Operational(OperationalCause::Budget(BudgetLane::Semantic));
+    let cases = [
+        (None, None, None, vec![provider]),
+        (
+            Some(IncompleteCause::Content),
+            None,
+            None,
+            vec![IncompleteCause::Content],
+        ),
+        (Some(provider), None, None, vec![provider]),
+        (Some(cancelled), None, None, vec![cancelled]),
+        (Some(budget), None, None, vec![budget]),
+        (
+            Some(IncompleteCause::Content),
+            Some(provider),
+            None,
+            vec![provider],
+        ),
+        (
+            Some(IncompleteCause::Content),
+            Some(cancelled),
+            Some(budget),
+            vec![cancelled, budget],
+        ),
+    ];
+    for (certificate, model_cause, dispatch_cause, expected) in cases {
+        let mut graph = FakeGraph::new(&fixture);
+        graph.model_content_cause = certificate;
+        graph.stored(caller, std::slice::from_ref(&member), &[]);
+        graph.interior(
+            caller,
+            InteriorSeed::Port(member.clone()),
+            sink_in(&plan, caller),
+        );
+        let completeness = |cause: Option<IncompleteCause>| match cause {
+            None => Completeness::Complete,
+            Some(cause) => Completeness::Incomplete {
+                cause,
+                reason: "upstream model input".into(),
+            },
+        };
+        graph.route(caller, call, vec![], completeness(dispatch_cause));
+        graph.models.insert(
+            (caller.durable_key(), call),
+            CallModel {
+                transfers: vec![],
+                endpoint_projections: false,
+                summary: None,
+                summary_target: None,
+                retains_dispatch: false,
+                writeback: Box::default(),
+                receiver_reads: Box::default(),
+                proven: true,
+                completeness: completeness(model_cause),
+                authored: None,
+            },
+        );
+        let outcome = compose(&plan, &graph, BUDGET);
+        let actual = outcome
+            .incompleteness
+            .iter()
+            .filter_map(|reason| match reason {
+                Incompleteness::Model { reason, cause, .. }
+                    if reason.as_ref() == "a call model does not describe a returned member" =>
+                {
+                    Some(*cause)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual, expected,
+            "certificate={certificate:?}, model={model_cause:?}, dispatch={dispatch_cause:?}"
+        );
+        assert_eq!(graph.model_content_consults.get(), 1);
+        assert!(outcome.report.findings().is_empty());
+    }
 }

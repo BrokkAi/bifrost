@@ -17,6 +17,15 @@ use brokk_bifrost_core::analyzer::memo_attribution::ReadReuseRefusal;
 #[doc(hidden)]
 pub struct AnalyzerSelectedServices<'a>(pub &'a dyn IAnalyzer);
 
+// Owned keys prevent a caller's replay ledger from keeping evicted receipt backing alive.
+struct MacroFrontReceipt {
+    keys: Vec<super::read_ledger::ReadKey>,
+    channels: brokk_bifrost_core::analyzer::memo_attribution::ReadChannels,
+    first_refusal: Option<brokk_bifrost_core::profiling::ReadRefusal>,
+    first_execution_refusal: Option<brokk_bifrost_core::profiling::ReadRefusal>,
+    runtime_cache_touched: bool,
+}
+
 impl SelectedMacroFrontierReads for &dyn IAnalyzer {
     fn capture(
         &self,
@@ -26,21 +35,65 @@ impl SelectedMacroFrontierReads for &dyn IAnalyzer {
         Box<dyn std::any::Any + Send + Sync>,
     ) {
         let (outcome, reads) = super::i_analyzer::capture_query_reads(*self, prepare);
-        (outcome, Box::new(reads))
+        (
+            outcome,
+            Box::new(MacroFrontReceipt {
+                keys: reads.unordered_keys(),
+                channels: reads.channels(),
+                first_refusal: reads.first_refusal(),
+                first_execution_refusal: reads.first_execution_refusal(),
+                runtime_cache_touched: reads.runtime_cache_touched(),
+            }),
+        )
     }
 
     fn replay(&self, receipt: &(dyn std::any::Any + Send + Sync)) {
-        let reads = receipt
-            .downcast_ref::<Arc<super::read_ledger::ReadLedger>>()
+        let receipt = receipt
+            .downcast_ref::<MacroFrontReceipt>()
             .expect("macro frontier receipt belongs to the analyzer read ledger");
-        super::i_analyzer::replay_query_reads(*self, reads);
+        let _refusal =
+            brokk_bifrost_core::profiling::read_refusal_scope(receipt.first_refusal.clone());
+        let _execution = brokk_bifrost_core::profiling::read_execution_refusal_scope(
+            receipt.first_execution_refusal.clone(),
+        );
+        if receipt.runtime_cache_touched {
+            self.mark_runtime_cache_touched();
+        }
+        super::i_analyzer::replay_query_read_receipt(
+            *self,
+            receipt.keys.iter().cloned(),
+            receipt.channels,
+        );
     }
 
     fn receipt_bytes(&self, receipt: &(dyn std::any::Any + Send + Sync)) -> usize {
-        let reads = receipt
-            .downcast_ref::<Arc<super::read_ledger::ReadLedger>>()
+        use brokk_bifrost_core::retention_budget::RetainedBytes;
+        let receipt = receipt
+            .downcast_ref::<MacroFrontReceipt>()
             .expect("macro frontier receipt belongs to the analyzer read ledger");
-        format!("{reads:?}").len()
+        std::mem::size_of_val(receipt) + receipt.keys.retained_bytes()
+            - std::mem::size_of_val(&receipt.keys)
+            + receipt
+                .first_refusal
+                .as_ref()
+                .map_or(0, |r| r.reason.capacity())
+            + receipt
+                .first_execution_refusal
+                .as_ref()
+                .map_or(0, |r| r.reason.capacity())
+    }
+
+    fn receipt_is_reusable(&self, receipt: &(dyn std::any::Any + Send + Sync)) -> bool {
+        let receipt = receipt
+            .downcast_ref::<MacroFrontReceipt>()
+            .expect("macro frontier receipt belongs to the analyzer read ledger");
+        receipt.channels.explicit_verdict.is_content()
+            && receipt.channels.budget_dependences == 0
+            && receipt.channels.execution_dependences == 0
+            && receipt.channels.unattributed_reads == 0
+            && receipt.channels.persistence_refusals == 0
+            && !receipt.channels.reuse_refused
+            && !receipt.channels.store_failed
     }
 
     fn policy_unit_label(&self) -> Option<String> {
@@ -63,6 +116,92 @@ impl ReadReuseRefusal for AnalyzerSelectedServices<'_> {
 }
 
 impl SelectedAnalyzerServices for AnalyzerSelectedServices<'_> {
+    fn selected_read_recorder(
+        &self,
+    ) -> Option<super::store::selected_read::SelectedReadRecorder<'_>> {
+        self.0
+            .supports_selected_read_recording()
+            .then(|| super::store::selected_read::SelectedReadRecorder::new(self))
+    }
+    fn record_selected_dependency(
+        &self,
+        dependency: &super::store::selected_read::SelectedDependency,
+    ) -> super::store::Result<()> {
+        use super::store::selected_read::SelectedDependency;
+        match dependency {
+            SelectedDependency::Path {
+                language,
+                rel_path,
+                selected,
+            } => self.0.record_read(match selected {
+                Some((blob, parse_variant)) => ReadKey::File {
+                    language: *language,
+                    rel_path: rel_path.clone(),
+                    blob: *blob,
+                    parse_variant: *parse_variant,
+                },
+                None => ReadKey::PathAbsent {
+                    language: *language,
+                    rel_path: rel_path.clone(),
+                },
+            }),
+            SelectedDependency::Scope { languages } => self
+                .0
+                .record_read(self.0.workspace_scope_read_key(languages)),
+            SelectedDependency::WorkspaceFact {
+                family,
+                question: _,
+                snapshot,
+                base_profile,
+            } => {
+                let language =
+                    super::Language::from_config_label(&snapshot.lang).ok_or_else(|| {
+                        super::store::StoreError::new("unknown selected dependency language")
+                    })?;
+                super::languages::language_support_for_hook(
+                    language,
+                    "record_selected_build_dependency",
+                )
+                .ok_or_else(|| {
+                    super::store::StoreError::new("selected build recorder unavailable")
+                })?
+                // The owner records its full build authority, a conservative
+                // superset of the declared question, never less than it asks.
+                .record_selected_build_dependency(
+                    self.0,
+                    *family,
+                    snapshot,
+                    *base_profile,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn selected_read_failed(&self, error: &super::store::StoreError, cancelled: bool) {
+        use super::store::selected_read::SelectedReadRecording;
+        self.failed(error, cancelled);
+    }
+
+    fn record_selected_derivation(
+        &self,
+        inventory: &super::store::resolution_selection::SelectedResolutionMountInventory<'_>,
+        kind: super::semantic::derivation::DerivationKindId,
+        question: &super::semantic::derivation::DerivationQuestion,
+    ) {
+        use brokk_bifrost_semantic::analyzer::semantic::derivation::ReplayedDemand;
+        let Some(host) = self.0.derivations() else {
+            self.refuse_read_reuse();
+            return;
+        };
+        match host.demand_selected_question(self.0, inventory, kind, question) {
+            ReplayedDemand::Available { retained: true, .. } => {}
+            // Unavailable or request-owned evidence still permits the current
+            // answer, but cannot certify a retained policy receipt.
+            _ => self.refuse_read_reuse(),
+        }
+    }
+
     fn certify_selected_configuration(
         &self,
         language: super::Language,
@@ -157,8 +296,35 @@ impl SelectedAnalyzerServices for AnalyzerSelectedServices<'_> {
 
     fn model_authority(&self) -> Option<Arc<dyn SelectedModelAuthority + Send + Sync>> {
         self.0
-            .semantic_model_overlay()
+            .semantic_model_overlay_read()
+            .published()
             .map(|overlay| overlay as Arc<dyn SelectedModelAuthority + Send + Sync>)
+    }
+
+    fn record_source_read(&self, file: &ProjectFile) {
+        crate::analyzer::record_position_read(self.0, file);
+    }
+
+    fn record_selected_rust_inventory(
+        &self,
+        kind: LookupKind,
+        question: LookupQuestion,
+        digest: crate::analyzer::semantic::ids::StableDigest,
+    ) -> bool {
+        self.0.record_read(ReadKey::lookup(kind, question, digest));
+        true
+    }
+
+    fn record_rust_macro_invocations(
+        &self,
+        question: LookupQuestion,
+        digest: crate::analyzer::semantic::ids::StableDigest,
+    ) {
+        self.0.record_read(ReadKey::lookup(
+            LookupKind::RustMacroInvocations,
+            question,
+            digest,
+        ));
     }
 
     fn record_model_authority_read(&self, hash: &str) {
@@ -166,6 +332,72 @@ impl SelectedAnalyzerServices for AnalyzerSelectedServices<'_> {
             .record_read(crate::analyzer::read_ledger::ReadKey::Models(
                 crate::analyzer::semantic::ids::StableDigest::sha256(hash),
             ));
+    }
+}
+
+impl super::store::selected_read::SelectedReadRecording for AnalyzerSelectedServices<'_> {
+    fn capture(
+        &self,
+        work: &mut dyn FnMut() -> super::store::Result<()>,
+    ) -> (
+        super::store::Result<()>,
+        Arc<dyn std::any::Any + Send + Sync>,
+    ) {
+        let (answer, receipt) = super::i_analyzer::QueryReadReceipt::capture(self.0, work);
+        (answer, Arc::new(receipt))
+    }
+    fn replay(&self, receipt: &(dyn std::any::Any + Send + Sync)) {
+        receipt
+            .downcast_ref::<super::i_analyzer::QueryReadReceipt>()
+            .expect("selected receipt belongs to analyzer")
+            .replay(self.0);
+    }
+    fn reusable(&self, receipt: &(dyn std::any::Any + Send + Sync)) -> bool {
+        receipt
+            .downcast_ref::<super::i_analyzer::QueryReadReceipt>()
+            .expect("selected receipt belongs to analyzer")
+            .reusable()
+    }
+    fn receipt_bytes(&self, receipt: &(dyn std::any::Any + Send + Sync)) -> usize {
+        let mut heap = super::store::cache_budget::RetainedHeap::default();
+        receipt
+            .downcast_ref::<super::i_analyzer::QueryReadReceipt>()
+            .expect("selected receipt belongs to analyzer")
+            .retained_heap(&mut heap);
+        heap.bytes() + std::mem::size_of::<super::i_analyzer::QueryReadReceipt>()
+    }
+    fn failed(&self, error: &super::store::StoreError, cancelled: bool) {
+        if cancelled {
+            self.0
+                .record_query_incomplete(super::QueryReadIncomplete::Cancelled);
+        } else {
+            self.0.record_query_failure(error.clone());
+        }
+    }
+    fn matches_frame(
+        &self,
+        owner: brokk_bifrost_semantic::analyzer::semantic::derivation::DerivationKindId,
+        revision: &dyn std::any::Any,
+        authority: &dyn std::any::Any,
+        inventory: &super::store::resolution_selection::SelectedResolutionMountInventory<'_>,
+    ) -> bool {
+        let Some(revision) = revision.downcast_ref::<super::store::reader_binding::ReaderBinding>()
+        else {
+            return false;
+        };
+        let Some(authority) =
+            authority.downcast_ref::<super::derivation_host::authority::AnalyzerAuthority>()
+        else {
+            return false;
+        };
+        inventory.derivation_reader_binding().is_ok_and(|bound| {
+            &bound == revision
+                && inventory.derivation_read_still_bound(revision)
+                && *authority
+                    == super::derivation_host::authority::AnalyzerAuthority::for_kind(
+                        revision, owner,
+                    )
+        })
     }
 }
 

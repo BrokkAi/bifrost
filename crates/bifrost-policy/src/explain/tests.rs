@@ -262,6 +262,7 @@ impl Fixture {
 
     fn context(&self) -> PolicyEvaluationContext<'_> {
         PolicyEvaluationContext {
+            acceptance_hint: None,
             analyzer: &self.analyzer,
             workspace: None,
             flow_state: &self.flow_state,
@@ -1159,7 +1160,7 @@ impl crate::evaluator::TaintPolicyEvaluator for FakePathAdapter {
             scope: None,
             projections: vec![fake_projection(spec, self.shape)],
             completion: PolicyRunCompletion::Complete,
-            diagnostics: Vec::new(),
+            diagnostics: Vec::new().into(),
             diagnostics_truncated: false,
             work: crate::finding::PolicyWorkReport::default(),
             authored_arm_closures: Vec::new(),
@@ -1356,6 +1357,7 @@ fn fake_projection(
             witness_refs_truncated: shape.witnesses_truncated,
             model_attribution: None,
             report: crate::projection::ProjectedFindingReport {
+                evaluation_location: None,
                 value_type_barrier_notes: Default::default(),
                 primary: observation_location(),
                 certainty,
@@ -2271,7 +2273,7 @@ impl crate::evaluator::TypestatePolicyEvaluator for FakeProtocolAdapter {
         crate::projection::TypestateProjectionPayload {
             projections: vec![fake_protocol_projection(spec, self.shape)],
             completion: PolicyRunCompletion::Complete,
-            diagnostics: Vec::new(),
+            diagnostics: Vec::new().into(),
             diagnostics_truncated: false,
             work: crate::finding::PolicyWorkReport::default(),
             subjects: None,
@@ -2409,6 +2411,7 @@ fn fake_protocol_projection(
         witness_refs_truncated: false,
         model_attribution: None,
         report: crate::projection::ProjectedFindingReport {
+            evaluation_location: None,
             value_type_barrier_notes: Default::default(),
             primary: observation_location(),
             certainty: FindingCertainty::Definite,
@@ -3160,8 +3163,8 @@ fn why_explains_a_relational_assertion_finding_from_retained_evidence() {
     assert!(expected.contains(evidence.expectation()), "{expected}");
     assert!(expected.contains(evidence.expected_class()), "{expected}");
     assert!(
-        expected.contains(evidence.anchor().subject_ast_id()),
-        "the group key is stated: {expected}"
+        !expected.contains(evidence.anchor().subject_ast_id()),
+        "the anchor subject is an identity digest, not the group key: {expected}"
     );
     assert_eq!(
         assertion.actual(),

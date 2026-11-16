@@ -8,6 +8,7 @@ fn diagnostic() -> PolicyReportDiagnostic {
         Some(PolicySourceIdentity::new("input.rqlp")),
         None,
         Vec::new(),
+        crate::RelatedLocationOmissions::Known(0),
     )
     .unwrap()
 }
@@ -60,13 +61,15 @@ fn evaluation_waits_for_all_input_outcomes() {
     let mut builder = PolicyReportBuilder::new(PolicyBatchBudget::default(), 2).unwrap();
     builder.register_policy(descriptor, run).unwrap();
     assert!(matches!(
-        builder.retain_finding(report_finding(&loaded)),
+        builder.retain_policy_findings(vec![vec![report_finding(&loaded)]]),
         Err(PolicyReportBuilderError::EvaluationBeforeSkeletonsComplete)
     ));
     builder.register_primary_diagnostic(diagnostic()).unwrap();
-    assert_eq!(
-        builder.retain_finding(report_finding(&loaded)).unwrap(),
-        PolicyRetentionOutcome::Retained
+    assert!(
+        builder
+            .retain_policy_findings(vec![vec![report_finding(&loaded)]])
+            .unwrap()
+            .is_empty()
     );
 }
 
@@ -149,8 +152,6 @@ fn registration_preserves_emergency_bytes_at_exact_bound() {
         PolicyBatchBudget::builder()
             .with_max_retained_report_bytes(cap)
             .unwrap()
-            .with_max_total_findings(0)
-            .unwrap()
             .with_per_policy(per_policy)
             .unwrap()
             .build()
@@ -177,12 +178,6 @@ fn registration_preserves_emergency_bytes_at_exact_bound() {
             refused = mid;
         }
     }
-    let mut builder = PolicyReportBuilder::new(budget_at(admitted), 1).unwrap();
-    builder.set_packs(review.clone()).unwrap();
-    builder
-        .register_policy(descriptor.clone(), run.clone())
-        .unwrap();
-
     // Consume the ordinary execution allowance before the first omission.
     let stages = [
         PolicyExecutionStage::PolicySelection,
@@ -210,23 +205,85 @@ fn registration_preserves_emergency_bytes_at_exact_bound() {
         },
     )
     .unwrap();
-    builder.set_execution(execution).unwrap();
+    // Empty policies need no hypothetical omission metadata reservation, even
+    // when execution metadata has consumed the ordinary shell allowance.
+    let mut empty = PolicyReportBuilder::new(budget_at(admitted), 1).unwrap();
+    empty.set_packs(review.clone()).unwrap();
+    empty
+        .register_policy(descriptor.clone(), run.clone())
+        .unwrap();
+    empty.set_execution(execution.clone()).unwrap();
+    assert!(
+        empty
+            .retain_policy_findings(vec![Vec::new()])
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(
-        builder.retain_finding(report_finding(&loaded)).unwrap(),
-        PolicyRetentionOutcome::Omitted {
-            reason: PolicyIncompleteReason::BatchFindingLimit
-        }
+        empty.finish().unwrap().runs()[0]
+            .work()
+            .omitted_findings_lower_bound(),
+        0
     );
+
+    // A nonempty candidate set reserves its exact admission metadata before
+    // it spends any finding bytes. This reservation cannot spend emergency.
+    let mut envelope = run.clone();
+    envelope.reserve_admission_metadata(
+        &[&report_finding(&loaded)],
+        &[
+            "policy/evaluator_retention",
+            "policy/findings",
+            "policy/retained_report_bytes",
+            "batch/retained_report_bytes",
+        ],
+    );
+    let mut refused_run = run.clone();
+    refused_run
+        .work_mut()
+        .add_retention_omitted_findings_for_dimension("batch/retained_report_bytes", 1);
+    refused_run.record_budget_refusal("batch/retained_report_bytes");
+    refused_run.mark_inconclusive(PolicyIncompleteReason::ReportRetentionBudget);
+    let actual_metadata = refused_run.retained_size() - run.retained_size();
+    assert!(actual_metadata < envelope.retained_size() - run.retained_size());
+    let admission_cap = admitted + actual_metadata;
+    let mut builder = PolicyReportBuilder::new(budget_at(admission_cap), 1).unwrap();
+    builder.set_packs(review.clone()).unwrap();
+    builder
+        .register_policy(descriptor.clone(), run.clone())
+        .unwrap();
+    builder.set_execution(execution.clone()).unwrap();
+    let emergency = builder.emergency_allowance;
+    assert_eq!(
+        builder
+            .retain_policy_findings(vec![vec![report_finding(&loaded)]])
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(builder.emergency_allowance, emergency);
     let report = builder.finish().unwrap();
-    // The first omission must leave room for the remaining emergency metadata.
-    assert!(
-        admitted - report.retained_size()
-            >= EMERGENCY_DIAGNOSTIC_ALLOWANCE - PER_POLICY_INCOMPLETE_REASON_ALLOWANCE
+    assert!(admission_cap - report.retained_size() >= EMERGENCY_DIAGNOSTIC_ALLOWANCE);
+    let omitted_run = &report.runs()[0];
+    assert_eq!(omitted_run.work().omitted_findings_lower_bound(), 1);
+    assert_eq!(
+        omitted_run.work().retention_omitted_findings_by_dimension(),
+        &std::collections::BTreeMap::from([("batch/retained_report_bytes".to_owned(), 1)])
     );
-    assert_eq!(report.runs()[0].work().omitted_findings_lower_bound(), 1);
     assert!(
-        matches!(report.runs()[0].completion(), PolicyRunCompletion::Inconclusive { reasons, .. }
-        if reasons.contains(&PolicyIncompleteReason::BatchFindingLimit))
+        matches!(omitted_run.completion(), PolicyRunCompletion::Inconclusive { reasons, .. } if reasons.contains(&PolicyIncompleteReason::ReportRetentionBudget))
+    );
+
+    // The same shell has no allowance for even the actual omission metadata.
+    let mut too_tight = PolicyReportBuilder::new(budget_at(admitted), 1).unwrap();
+    too_tight.set_packs(review.clone()).unwrap();
+    too_tight
+        .register_policy(descriptor.clone(), run.clone())
+        .unwrap();
+    too_tight.set_execution(execution).unwrap();
+    assert!(
+        matches!(too_tight.retain_policy_findings(vec![vec![report_finding(&loaded)]]),
+        Err(PolicyReportBuilderError::BatchRetentionExceeded { retained_bytes, max_bytes }) if max_bytes == admitted && retained_bytes > max_bytes)
     );
 
     let mut below = PolicyReportBuilder::new(budget_at(admitted - 1), 1).unwrap();
@@ -258,10 +315,11 @@ fn candidate_finding_reserves_incomplete_reason_bytes() {
     let mut builder = PolicyReportBuilder::new(budget, 1).unwrap();
     builder.register_policy(descriptor, run).unwrap();
     assert_eq!(
-        builder.retain_finding(finding).unwrap(),
-        PolicyRetentionOutcome::Omitted {
-            reason: PolicyIncompleteReason::ReportRetentionBudget
-        }
+        builder
+            .retain_policy_findings(vec![vec![finding]])
+            .unwrap()
+            .len(),
+        1
     );
     let document = builder.finish().unwrap();
     assert!(
@@ -314,7 +372,9 @@ fn a_run_lookup_requires_both_policy_id_and_hash() {
         ),
         Err(PolicyReportBuilderError::UnknownPolicyRun)
     ));
-    builder.retain_finding(report_finding(&second)).unwrap();
+    builder
+        .retain_policy_findings(vec![vec![report_finding(&second)]])
+        .unwrap();
     let report = builder.finish().unwrap();
     assert_eq!(
         report
@@ -374,6 +434,7 @@ fn primary_diagnostic_uses_the_full_input_allowance() {
         Some(PolicySourceIdentity::new("input.rqlp")),
         None,
         Vec::new(),
+        crate::RelatedLocationOmissions::Known(0),
     )
     .unwrap();
     assert!(large.retained_size() > SKELETON_ALLOWANCE_PER_INPUT / 2);
@@ -391,6 +452,7 @@ fn run_diagnostic(message: &str) -> PolicyDiagnostic {
         message,
         None,
         Vec::new(),
+        crate::RelatedLocationOmissions::Known(0),
     )
     .unwrap()
 }
@@ -425,7 +487,9 @@ fn candidate_reports_the_full_retained_policy_bytes() {
     let (descriptor, run) = report_skeleton();
     let mut builder = PolicyReportBuilder::new(PolicyBatchBudget::default(), 1).unwrap();
     builder.register_policy(descriptor, run).unwrap();
-    builder.retain_finding(report_finding(&loaded)).unwrap();
+    builder
+        .retain_policy_findings(vec![vec![report_finding(&loaded)]])
+        .unwrap();
     let report = builder.finish().unwrap();
     let expected = report.rules()[0].retained_size() + report.runs()[0].retained_size();
     assert_eq!(
@@ -435,56 +499,22 @@ fn candidate_reports_the_full_retained_policy_bytes() {
 }
 
 #[test]
-fn batch_finding_limit_counts_all_runs() {
-    let first = loaded_match_policy();
-    let second = another_match_policy();
-    let budget = PolicyBatchBudget::builder()
-        .with_max_total_findings(2)
-        .unwrap()
-        .build()
-        .unwrap();
-    let mut builder = PolicyReportBuilder::new(budget, 2).unwrap();
-    builder
-        .register_policy(
-            report_skeleton().0,
-            report_run(
-                &first,
-                PolicyAnalysisType::Match,
-                PolicyRunCompletion::Complete,
-            ),
-        )
-        .unwrap();
-    builder
-        .register_policy(
-            PolicyRuleDescriptor::from_loaded(&second),
-            report_run(
-                &second,
-                PolicyAnalysisType::Match,
-                PolicyRunCompletion::Complete,
-            ),
-        )
-        .unwrap();
-    builder.retain_finding(report_finding(&first)).unwrap();
-    builder.retain_finding(report_finding(&second)).unwrap();
-    let alternate_anchor = MatchFindingAnchor::strong(
-        MatchResultDomain::CallSite,
-        WorkspaceRelativePath::new("src/app.rs").unwrap(),
-        None,
-        Some(SourceSliceHash::from_bytes([5; 32])),
-        0,
-    )
-    .unwrap();
-    assert_eq!(
+fn batch_finding_count_does_not_refuse_later_policies() {
+    let policies = (0..11).map(retention_policy).collect::<Vec<_>>();
+    let candidates = policies
+        .iter()
+        .map(|policy| {
+            (0..1000)
+                .map(|i| retention_candidate(policy, i, 16, "detail"))
+                .collect()
+        })
+        .collect();
+    let mut builder = retention_builder(&policies, 64 * 1024 * 1024);
+    assert!(
         builder
-            .retain_finding(report_finding_with_anchor(
-                &second,
-                alternate_anchor,
-                FindingCompleteness::Complete
-            ))
-            .unwrap(),
-        PolicyRetentionOutcome::Omitted {
-            reason: PolicyIncompleteReason::BatchFindingLimit
-        }
+            .retain_policy_findings(candidates)
+            .unwrap()
+            .is_empty()
     );
     let report = builder.finish().unwrap();
     assert_eq!(
@@ -493,13 +523,13 @@ fn batch_finding_limit_counts_all_runs() {
             .iter()
             .map(|run| run.findings().len())
             .sum::<usize>(),
-        2
+        11_000
     );
     assert!(
         report
             .runs()
             .iter()
-            .any(|run| run.work().omitted_findings_lower_bound() == 1)
+            .all(|run| run.work().omitted_findings_lower_bound() == 0)
     );
 }
 
@@ -646,6 +676,7 @@ fn diagnostic_messages_make_report_order_independent_of_input_order() {
         Some(PolicySourceIdentity::new("input.rqlp")),
         None,
         Vec::new(),
+        crate::RelatedLocationOmissions::Known(0),
     )
     .unwrap();
     let second = PolicyReportDiagnostic::try_new(
@@ -655,6 +686,7 @@ fn diagnostic_messages_make_report_order_independent_of_input_order() {
         Some(PolicySourceIdentity::new("input.rqlp")),
         None,
         Vec::new(),
+        crate::RelatedLocationOmissions::Known(0),
     )
     .unwrap();
     let mut outputs = Vec::new();
@@ -685,6 +717,7 @@ fn related_diagnostic_ranges_make_report_order_independent_of_input_order() {
                 range: 1..end,
                 message: "related".into(),
             }],
+            crate::RelatedLocationOmissions::Known(0),
         )
         .unwrap()
     };
@@ -791,7 +824,7 @@ fn applied_suppression_requires_a_suppressed_finding() {
                 ),
             )
             .unwrap();
-        builder.retain_finding(finding).unwrap();
+        builder.retain_policy_findings(vec![vec![finding]]).unwrap();
         let result = builder.finish();
         if attached {
             assert!(result.is_ok());
@@ -836,7 +869,7 @@ fn scope_join_requires_an_applied_review() {
                 ),
             )
             .unwrap();
-        builder.retain_finding(finding).unwrap();
+        builder.retain_policy_findings(vec![vec![finding]]).unwrap();
         let result = builder.finish();
         if applied {
             assert!(result.is_ok());
@@ -896,7 +929,7 @@ fn baseline_join_subtracts_omitted_results() {
                 ),
             )
             .unwrap();
-        builder.retain_finding(finding).unwrap();
+        builder.retain_policy_findings(vec![vec![finding]]).unwrap();
         builder.set_baseline(review.clone()).unwrap();
         builder
     };
@@ -919,4 +952,755 @@ fn baseline_join_subtracts_omitted_results() {
     assert_eq!(report.baseline().unwrap().applied_count(), 2);
     assert_eq!(report.baseline().unwrap().result_omitted_count(), 1);
     assert_eq!(report.runs()[0].findings().len(), 1);
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#11321: omitted diagnostics lost original lanes and simultaneous policy/batch byte cuts"
+)]
+fn budget_telemetry_survives_omitted_run_diagnostic() {
+    let loaded = loaded_match_policy();
+    for (batch_limit, expected) in [
+        (
+            16 * 1024,
+            vec![
+                "batch/retained_report_bytes",
+                "policy/retained_report_bytes",
+                "query/fact_nodes",
+            ],
+        ),
+        (
+            64 * 1024 * 1024,
+            vec!["policy/retained_report_bytes", "query/fact_nodes"],
+        ),
+    ] {
+        let per_policy = crate::budget::PolicyBudget::builder()
+            .with_max_retained_report_bytes(4096)
+            .unwrap()
+            .build()
+            .unwrap();
+        let budget = PolicyBatchBudget::builder()
+            .with_max_retained_report_bytes(batch_limit)
+            .unwrap()
+            .with_per_policy(per_policy)
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut builder = PolicyReportBuilder::new(budget, 1).unwrap();
+        builder
+            .register_policy(
+                PolicyRuleDescriptor::from_loaded(&loaded),
+                report_run(
+                    &loaded,
+                    PolicyAnalysisType::Match,
+                    PolicyRunCompletion::inconclusive(vec![
+                        PolicyIncompleteReason::PartialDiscovery,
+                    ])
+                    .unwrap(),
+                ),
+            )
+            .unwrap();
+        let diagnostic = PolicyDiagnostic::try_new(
+            PolicyDiagnosticCode::CodeQuery {
+                code:
+                    brokk_bifrost_rql::structural::CodeQueryDiagnosticCode::ExecutionBudgetExhausted
+                        .try_into()
+                        .unwrap(),
+            },
+            PolicyDiagnosticSeverity::Error,
+            PolicyDiagnosticImpact::RunIncomplete,
+            "x".repeat(4096),
+            None,
+            (0..64)
+                .map(|index| {
+                    crate::finding::RelatedPolicyLocation::try_new(
+                        crate::finding::PolicyLocationRelationship::Evidence,
+                        crate::test_support::policy_test_location(
+                            &format!("src/{}/site{index}.rs", "x".repeat(200)),
+                            0,
+                            1,
+                            1,
+                        ),
+                        Vec::new(),
+                    )
+                    .unwrap()
+                })
+                .collect(),
+            crate::RelatedLocationOmissions::Known(0),
+        )
+        .unwrap()
+        .with_exhausted_roots(vec![
+            brokk_bifrost_rql::structural::CodeQueryExhaustedRoot {
+                path: ".".to_string(),
+                procedure: None,
+                lane: "query/fact_nodes".to_string(),
+                stage: None,
+                budget: None,
+                charge: None,
+                feedback_iteration: None,
+            },
+        ]);
+        assert_eq!(
+            builder
+                .retain_run_diagnostic(
+                    &loaded.definition().metadata.id,
+                    loaded.semantic_hash(),
+                    diagnostic
+                )
+                .unwrap(),
+            PolicyRetentionOutcome::DiagnosticOmitted
+        );
+        let report = builder.finish().unwrap();
+        assert_eq!(report.runs()[0].budget_refusals(), expected);
+        assert_eq!(
+            report.runs()[0].worst_omitted_diagnostic_severity(),
+            Some(PolicyDiagnosticSeverity::Error)
+        );
+        assert_eq!(
+            serde_json::to_value(report.runs()[0].diagnostic_causes()).unwrap(),
+            serde_json::json!([{ "code": "execution_budget_exhausted", "impact": "run_incomplete", "execution_cause": "unknown" }])
+        );
+    }
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#11321: simultaneous policy and batch finding cuts reported only the batch lane"
+)]
+fn budget_telemetry_reports_each_reached_finding_limit() {
+    let loaded = loaded_match_policy();
+    let per_policy = crate::budget::PolicyBudget::builder()
+        .with_max_findings(0)
+        .unwrap()
+        .build()
+        .unwrap();
+    let budget = PolicyBatchBudget::builder()
+        .with_per_policy(per_policy)
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut builder = PolicyReportBuilder::new(budget, 1).unwrap();
+    let (descriptor, run) = report_skeleton();
+    builder.register_policy(descriptor, run).unwrap();
+    assert_eq!(
+        builder
+            .retain_policy_findings(vec![vec![report_finding(&loaded)]])
+            .unwrap()
+            .len(),
+        1
+    );
+    let report = builder.finish().unwrap();
+    assert_eq!(report.runs()[0].budget_refusals(), ["policy/findings"]);
+    assert!(report.runs()[0].findings().is_empty());
+}
+
+#[test]
+// Hard-won: #12089 interaction: a finding-ID collision crossed retention accounting.
+#[brokk_bifrost_test_macros::hardwon(
+    "#12089: interaction: partial suppression-group retention rejected a surviving sibling"
+)]
+fn partially_retained_suppressed_collision_group_keeps_valid_audit() {
+    let loaded = loaded_match_policy();
+    let mut finding = report_finding(&loaded);
+    let document = parse_policy_suppression_document(
+        &serde_json::json!({
+            "schema_version": 1, "suppressions": [{
+                "policy_id": finding.policy_id(), "finding_id": finding.id(),
+                "identity_stability": "strong", "status": "accepted", "reason": "Reviewed",
+                "accepted_at": "2026-07-01"
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let review = PolicySuppressionReview::new(
+        &document.suppressions()[0],
+        PolicySuppressionMatchState::StrongFinding,
+        PolicySuppressionTemporalState::Current,
+        PolicySuppressionPolicyHashState::Unknown,
+        PolicySuppressionOrphanState::Resolved,
+        Vec::new(),
+    );
+    finding
+        .attach_suppression(review.finding_suppression().unwrap())
+        .unwrap();
+    for record_omission in [false, true] {
+        let (descriptor, mut run) = report_skeleton();
+        run.replace_findings(vec![finding.clone()]);
+        if record_omission {
+            run.add_retention_omitted_findings(1);
+            run.mark_inconclusive(PolicyIncompleteReason::ReportRetentionBudget);
+        }
+        let mut review = review.clone();
+        review.mark_result_omitted();
+        let result = PolicyReportDocument::try_new_with_suppression_audit(
+            default_test_evaluation_context(),
+            vec![descriptor],
+            vec![run],
+            vec![review],
+            Vec::new(),
+            false,
+            0,
+            None,
+        );
+        assert_eq!(
+            result.is_ok(),
+            record_omission,
+            "recorded omission: {record_omission}: {result:?}"
+        );
+    }
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#12105: per-policy byte admission shed unrelated policies' optional detail"
+)]
+fn per_policy_byte_refusal_preserves_other_runs_detail() {
+    use serde::de::DeserializeSeed;
+    let loaded = loaded_match_policy();
+    let other = another_match_policy();
+    let make = |policy: &LoadedPolicy, label: &str| {
+        let finding = report_finding(policy);
+        let related = crate::finding::RelatedPolicyLocation::try_new(
+            crate::finding::PolicyLocationRelationship::Evidence,
+            finding.primary().clone(),
+            Vec::new(),
+        )
+        .unwrap()
+        .with_label(label.to_owned())
+        .unwrap();
+        let mut wire = serde_json::to_value(&finding).unwrap();
+        wire["related"] = serde_json::json!([related]);
+        crate::finding::PolicyFindingSeed::new(&crate::budget::PolicyBudget::default())
+            .deserialize(wire)
+            .unwrap()
+    };
+    let descriptor = PolicyRuleDescriptor::from_loaded(&loaded);
+    let mut minimal = report_run(
+        &loaded,
+        PolicyAnalysisType::Match,
+        PolicyRunCompletion::Complete,
+    );
+    minimal.replace_findings(vec![report_finding(&loaded)]);
+    let cap = descriptor.retained_size()
+        + minimal.retained_size()
+        + PER_POLICY_INCOMPLETE_REASON_ALLOWANCE
+        + 2048;
+    let budget = PolicyBatchBudget::builder()
+        .with_per_policy(
+            crate::budget::PolicyBudget::builder()
+                .with_max_retained_report_bytes(cap)
+                .unwrap()
+                .build()
+                .unwrap(),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut builder = PolicyReportBuilder::new(budget, 2).unwrap();
+    for policy in [&loaded, &other] {
+        builder
+            .register_policy(
+                PolicyRuleDescriptor::from_loaded(policy),
+                report_run(
+                    policy,
+                    PolicyAnalysisType::Match,
+                    PolicyRunCompletion::Complete,
+                ),
+            )
+            .unwrap();
+    }
+    let unaffected = make(&other, "retained source context");
+    assert!(
+        builder
+            .retain_policy_findings(vec![
+                vec![unaffected.clone()],
+                vec![make(&loaded, &"x".repeat(2048))]
+            ])
+            .unwrap()
+            .is_empty()
+    );
+    let document = builder.finish().unwrap();
+    let run = document
+        .runs()
+        .iter()
+        .find(|run| run.policy_id() == &other.definition().metadata.id)
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(run.findings()).unwrap(),
+        serde_json::json!([unaffected])
+    );
+    assert!(matches!(run.completion(), PolicyRunCompletion::Complete));
+    assert!(run.diagnostic_causes().iter().next().is_none());
+}
+
+fn retention_policy(index: usize) -> LoadedPolicy {
+    load_match_policy(
+        &include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/policies/dynamic-eval.rqlp"
+        ))
+        .replace(
+            "bifrost.security.dynamic-eval",
+            &format!("test.retention.p{index:03}"),
+        ),
+    )
+}
+
+fn retention_candidate(
+    policy: &LoadedPolicy,
+    index: usize,
+    message_bytes: usize,
+    detail: &str,
+) -> PolicyFinding {
+    use serde::de::DeserializeSeed;
+    let anchor = MatchFindingAnchor::strong(
+        MatchResultDomain::CallSite,
+        WorkspaceRelativePath::new("src/app.rs").unwrap(),
+        None,
+        Some(SourceSliceHash::from_bytes([5; 32])),
+        index as u32,
+    )
+    .unwrap();
+    let finding = report_finding_with_anchor(policy, anchor, FindingCompleteness::Complete);
+    let related = crate::finding::RelatedPolicyLocation::try_new(
+        crate::finding::PolicyLocationRelationship::Evidence,
+        finding.primary().clone(),
+        Vec::new(),
+    )
+    .unwrap()
+    .with_label(detail.to_owned())
+    .unwrap();
+    let mut wire = serde_json::to_value(&finding).unwrap();
+    wire["message"] = serde_json::json!("x".repeat(message_bytes));
+    wire["related"] = serde_json::json!([related]);
+    crate::finding::PolicyFindingSeed::new(&crate::budget::PolicyBudget::default())
+        .deserialize(wire)
+        .unwrap()
+}
+
+fn retention_builder(policies: &[LoadedPolicy], cap: usize) -> PolicyReportBuilder {
+    let budget = PolicyBatchBudget::builder()
+        .with_max_retained_report_bytes(cap)
+        .unwrap()
+        .with_per_policy(
+            crate::budget::PolicyBudget::builder()
+                .with_max_retained_report_bytes(cap.min(16 * 1024 * 1024))
+                .unwrap()
+                .build()
+                .unwrap(),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut builder = PolicyReportBuilder::new(budget, policies.len()).unwrap();
+    for policy in policies {
+        builder
+            .register_policy(
+                PolicyRuleDescriptor::from_loaded(policy),
+                report_run(
+                    policy,
+                    PolicyAnalysisType::Match,
+                    PolicyRunCompletion::Complete,
+                ),
+            )
+            .unwrap();
+    }
+    builder
+}
+
+fn retention_base_and_metadata(
+    builder: &PolicyReportBuilder,
+    findings: &[Vec<PolicyFinding>],
+) -> usize {
+    let base = report_storage_size(
+        &builder.evaluation,
+        &builder.rules,
+        &builder.runs,
+        &builder.suppressions,
+        &builder.scope,
+        &builder.diagnostics,
+    ) + builder.reviews_extra()
+        + builder.outstanding_skeleton_allowance
+        + builder.emergency_allowance;
+    base + builder
+        .runs
+        .iter()
+        .zip(findings)
+        .map(|(run, findings)| {
+            let mut envelope = run.clone();
+            envelope.reserve_admission_metadata(
+                &findings.iter().collect::<Vec<_>>(),
+                &[
+                    "policy/evaluator_retention",
+                    "policy/findings",
+                    "policy/retained_report_bytes",
+                    "batch/retained_report_bytes",
+                ],
+            );
+            envelope.retained_size() - run.retained_size()
+        })
+        .sum::<usize>()
+}
+
+#[test]
+fn fair_prefix_keeps_small_policies_complete_with_detail_independent_of_arrival() {
+    let policies = (0..4).map(retention_policy).collect::<Vec<_>>();
+    let candidates = policies
+        .iter()
+        .enumerate()
+        .map(|(i, policy)| {
+            (0..if i == 0 { 100 } else { 1 })
+                .map(|j| {
+                    retention_candidate(
+                        policy,
+                        j,
+                        if i == 0 { 4096 } else { 32 },
+                        if i == 0 {
+                            "dominant detail"
+                        } else {
+                            "small detail"
+                        },
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let probe = retention_builder(&policies, 64 * 1024 * 1024);
+    let mut stripped = candidates[0][0].clone();
+    stripped.omit_optional_detail();
+    let cap = retention_base_and_metadata(&probe, &candidates)
+        + candidates[1..]
+            .iter()
+            .map(|p| {
+                let mut f = p[0].clone();
+                f.omit_optional_detail();
+                f.retained_size()
+            })
+            .sum::<usize>()
+        + 5 * stripped.retained_size()
+        + stripped.retained_size() / 2;
+    let mut builder = retention_builder(&policies, cap);
+    let omitted = builder.retain_policy_findings(candidates.clone()).unwrap();
+    let report = builder.finish().unwrap();
+    assert_eq!(report.runs()[0].findings().len(), 5);
+    assert_eq!(omitted.len(), 95);
+    assert_eq!(
+        report.runs()[0]
+            .work()
+            .retention_omitted_findings_by_dimension(),
+        &std::collections::BTreeMap::from([("batch/retained_report_bytes".to_string(), 95)])
+    );
+    for (run, expected) in report.runs()[1..].iter().zip(&candidates[1..]) {
+        assert!(matches!(run.completion(), PolicyRunCompletion::Complete));
+        assert_eq!(
+            serde_json::to_value(run.findings()).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+    }
+    let mut reversed_policies = policies;
+    reversed_policies.reverse();
+    let mut reversed = candidates;
+    reversed.reverse();
+    for policy in &mut reversed {
+        policy.reverse();
+    }
+    let mut builder = retention_builder(&reversed_policies, cap);
+    builder.retain_policy_findings(reversed).unwrap();
+    assert_eq!(
+        serde_json::to_value(&report).unwrap(),
+        serde_json::to_value(builder.finish().unwrap()).unwrap()
+    );
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#12089: interaction: ID-keyed rollback deleted prior colliding records"
+)]
+fn rejected_duplicate_preserves_all_prior_records_and_detail() {
+    use serde::de::DeserializeSeed;
+    let policies = vec![retention_policy(0)];
+    let admitted = retention_candidate(&policies[0], 0, 32, "retained source context");
+    let mut wire = serde_json::to_value(&admitted).unwrap();
+    wire["message"] = serde_json::json!("z".repeat(4000));
+    let refused = crate::finding::PolicyFindingSeed::new(&crate::budget::PolicyBudget::default())
+        .deserialize(wire)
+        .unwrap();
+    assert_eq!(admitted.id(), refused.id());
+    let candidates = vec![vec![refused.clone(), admitted.clone(), admitted.clone()]];
+    let mut builder = retention_builder(&policies, 100_000);
+    let base = retention_base_and_metadata(&builder, &candidates);
+    let review_at = |length| {
+        PolicyPackActivationReview::new_with_mode(
+            "x".repeat(length),
+            PolicyDependencyPackActivationMode::Default,
+            Vec::new(),
+            true,
+            Vec::new(),
+        )
+    };
+    let review_fixed = retained_extra(&review_at(1)) - 1;
+    let path_bytes = builder.budget.max_retained_report_bytes()
+        - base
+        - review_fixed
+        - 2 * admitted.retained_size();
+    builder.set_packs(review_at(path_bytes)).unwrap();
+    let omitted = builder.retain_policy_findings(candidates).unwrap();
+    assert_eq!(omitted, vec![refused]);
+    let report = builder.finish().unwrap();
+    let run = &report.runs()[0];
+    // Exact equality includes every optional-detail field of both siblings.
+    assert_eq!(run.findings(), &[admitted.clone(), admitted]);
+    assert_eq!(
+        run.work().retention_omitted_findings_by_dimension(),
+        &std::collections::BTreeMap::from([("batch/retained_report_bytes".to_owned(), 1)])
+    );
+    assert_eq!(run.budget_refusals(), ["batch/retained_report_bytes"]);
+    assert!(
+        run.diagnostics()
+            .iter()
+            .any(|diagnostic| { diagnostic.code() == &PolicyDiagnosticCode::DuplicateFindingId })
+    );
+}
+
+#[test]
+fn batch_detail_refusal_does_not_claim_policy_byte_exhaustion() {
+    let policies = vec![retention_policy(0)];
+    let full = retention_candidate(&policies[0], 0, 32, &"x".repeat(2048));
+    let mut stripped = full.clone();
+    assert!(stripped.omit_optional_detail());
+    let candidates = vec![vec![full.clone()]];
+    let mut builder = retention_builder(&policies, 100_000);
+    let base = retention_base_and_metadata(&builder, &candidates);
+    let review_at = |length| {
+        PolicyPackActivationReview::new_with_mode(
+            "x".repeat(length),
+            PolicyDependencyPackActivationMode::Default,
+            Vec::new(),
+            true,
+            Vec::new(),
+        )
+    };
+    let review_fixed = retained_extra(&review_at(1)) - 1;
+    let path_bytes =
+        builder.budget.max_retained_report_bytes() - base - review_fixed - stripped.retained_size();
+    builder.set_packs(review_at(path_bytes)).unwrap();
+    assert!(
+        builder.policy_retained_bytes(&builder.runs, 0)
+            + full.retained_size()
+            + PER_POLICY_INCOMPLETE_REASON_ALLOWANCE
+            < builder.budget.per_policy().max_retained_report_bytes()
+    );
+    assert!(
+        builder
+            .retain_policy_findings(candidates)
+            .unwrap()
+            .is_empty()
+    );
+    let report = builder.finish().unwrap();
+    let run = &report.runs()[0];
+    assert_eq!(run.budget_refusals(), ["batch/retained_report_bytes"]);
+    assert_eq!(run.work().retention_omitted_findings_lower_bound(), 0);
+    assert!(
+        run.work()
+            .retention_omitted_findings_by_dimension()
+            .is_empty()
+    );
+    assert_eq!(run.findings(), &[stripped]);
+    assert!(run.diagnostic_causes().iter().any(|cause| {
+        cause.execution_cause() == crate::finding::PolicyDiagnosticExecutionCause::DetailRetention
+    }));
+}
+
+#[test]
+fn presence_tiers_precede_other_policies_lower_priority_findings() {
+    let policies = (0..2).map(retention_policy).collect::<Vec<_>>();
+    let scope = crate::scope::parse_policy_scope_document(
+        r#"{"schema_version":1,"scopes":[{"path":"src","reason":"Reviewed"}]}"#,
+    )
+    .unwrap();
+    let accepted = (0..3)
+        .map(|i| {
+            let mut finding = retention_candidate(&policies[1], i, 4096, "accepted");
+            finding
+                .attach_scope(scope.scopes()[0].finding_scope())
+                .unwrap();
+            finding
+        })
+        .collect::<Vec<_>>();
+    let accepted_ids = accepted
+        .iter()
+        .map(|finding| finding.id())
+        .collect::<std::collections::BTreeSet<_>>();
+    let candidates = vec![
+        (0..100)
+            .map(|i| retention_candidate(&policies[0], i, 4096, "active"))
+            .collect::<Vec<_>>(),
+        accepted,
+    ];
+    let probe = retention_builder(&policies, 64 * 1024 * 1024);
+    let presence = candidates[1]
+        .iter()
+        .map(|finding| {
+            let mut stripped = finding.clone();
+            stripped.omit_optional_detail();
+            stripped.retained_size()
+        })
+        .sum::<usize>();
+    let cap = retention_base_and_metadata(&probe, &candidates) + presence + 1024;
+    let mut builder = retention_builder(&policies, cap);
+    let omitted = builder.retain_policy_findings(candidates).unwrap();
+    assert!(builder.runs[0].findings().is_empty());
+    assert_eq!(
+        builder.runs[1]
+            .findings()
+            .iter()
+            .map(|finding| finding.id())
+            .collect::<std::collections::BTreeSet<_>>(),
+        accepted_ids
+    );
+    assert_eq!(omitted.len(), 100);
+}
+
+#[test]
+fn all_policy_metadata_reservations_preserve_the_emergency_allowance() {
+    let policies = (0..256).map(retention_policy).collect::<Vec<_>>();
+    let per_policy = crate::budget::PolicyBudget::builder()
+        .with_max_findings(0)
+        .unwrap()
+        .with_max_retained_report_bytes(3 * 1024 * 1024)
+        .unwrap()
+        .build()
+        .unwrap();
+    let budget = PolicyBatchBudget::builder()
+        .with_max_retained_report_bytes(3 * 1024 * 1024)
+        .unwrap()
+        .with_per_policy(per_policy)
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut builder = PolicyReportBuilder::new(budget, 256).unwrap();
+    let dimensions = [
+        "policy/evaluator_retention",
+        "policy/findings",
+        "policy/retained_report_bytes",
+        "batch/retained_report_bytes",
+    ];
+    for policy in &policies {
+        let mut run = report_run(
+            policy,
+            PolicyAnalysisType::Match,
+            PolicyRunCompletion::Complete,
+        );
+        for dimension in dimensions {
+            run.work_mut()
+                .add_retention_omitted_findings_for_dimension(dimension, 1);
+        }
+        builder
+            .register_policy(PolicyRuleDescriptor::from_loaded(policy), run)
+            .unwrap();
+    }
+    let before = builder.emergency_allowance;
+    let candidates = policies.iter().map(|p| vec![report_finding(p)]).collect();
+    assert_eq!(
+        builder.retain_policy_findings(candidates).unwrap().len(),
+        256
+    );
+    assert_eq!(builder.emergency_allowance, before);
+    for run in &builder.runs {
+        assert_eq!(run.work().retention_omitted_findings_lower_bound(), 5);
+        assert_eq!(
+            run.work().retention_omitted_findings_by_dimension()["policy/findings"],
+            2
+        );
+        assert_eq!(
+            run.work()
+                .retention_omitted_findings_by_dimension()
+                .values()
+                .sum::<u64>(),
+            5
+        );
+    }
+    builder.finish().unwrap();
+}
+
+#[test]
+fn simultaneous_byte_refusals_count_a_dropped_finding_once() {
+    let policy = loaded_match_policy();
+    let finding = report_finding(&policy);
+    let (descriptor, run) = report_skeleton();
+    let mut stripped = finding.clone();
+    stripped.omit_optional_detail();
+    let mut envelope = run.clone();
+    envelope.reserve_admission_metadata(
+        &[&finding],
+        &[
+            "policy/evaluator_retention",
+            "policy/findings",
+            "policy/retained_report_bytes",
+            "batch/retained_report_bytes",
+        ],
+    );
+    let metadata = envelope.retained_size() - run.retained_size();
+    let policy_cap = descriptor.retained_size()
+        + run.retained_size()
+        + metadata
+        + PER_POLICY_INCOMPLETE_REASON_ALLOWANCE
+        + stripped.retained_size() / 2;
+    let budget = PolicyBatchBudget::builder()
+        .with_max_retained_report_bytes(100_000)
+        .unwrap()
+        .with_per_policy(
+            crate::budget::PolicyBudget::builder()
+                .with_max_retained_report_bytes(policy_cap)
+                .unwrap()
+                .build()
+                .unwrap(),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut builder = PolicyReportBuilder::new(budget, 1).unwrap();
+    builder.register_policy(descriptor, run).unwrap();
+    let base = retention_base_and_metadata(&builder, &[vec![finding.clone()]]);
+    let review_at = |length| {
+        PolicyPackActivationReview::new_with_mode(
+            "x".repeat(length),
+            PolicyDependencyPackActivationMode::Default,
+            Vec::new(),
+            true,
+            Vec::new(),
+        )
+    };
+    let review_fixed = retained_extra(&review_at(1)) - 1;
+    let path_bytes =
+        budget.max_retained_report_bytes() - base - review_fixed - stripped.retained_size() / 2;
+    builder.set_packs(review_at(path_bytes)).unwrap();
+    assert_eq!(
+        builder
+            .retain_policy_findings(vec![vec![finding]])
+            .unwrap()
+            .len(),
+        1
+    );
+    let report = builder.finish().unwrap();
+    let run = &report.runs()[0];
+    assert_eq!(
+        run.budget_refusals(),
+        [
+            "batch/retained_report_bytes",
+            "policy/retained_report_bytes"
+        ]
+    );
+    assert_eq!(
+        run.work().retention_omitted_findings_by_dimension(),
+        &std::collections::BTreeMap::from([("policy/retained_report_bytes".to_owned(), 1)])
+    );
+    assert_eq!(
+        run.work()
+            .retention_omitted_findings_by_dimension()
+            .values()
+            .sum::<u64>(),
+        run.work().retention_omitted_findings_lower_bound()
+    );
 }

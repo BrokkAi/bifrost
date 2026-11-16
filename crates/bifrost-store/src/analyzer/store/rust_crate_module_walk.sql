@@ -54,10 +54,8 @@ WITH RECURSIVE modules(module_path, blob_id, scope_ordinal, rel_path,
   -- expansions of the same blob whose range holds the module's declaration.
   SELECT parent.module_path || '::' || declarations.module_name, parent.blob_id,
          scopes.ordinal, parent.rel_path, 'inline',
-         cr_join(CASE WHEN declarations.path_attribute IS NULL THEN parent.module_dir ELSE parent.path_dir END,
-                 COALESCE(declarations.path_attribute, declarations.module_name)),
-         cr_join(CASE WHEN declarations.path_attribute IS NULL THEN parent.module_dir ELSE parent.path_dir END,
-                 COALESCE(declarations.path_attribute, declarations.module_name)),
+         cr_module_candidate(parent.module_dir, parent.path_dir, declarations.module_name, declarations.path_attribute, ''),
+         cr_module_candidate(parent.module_dir, parent.path_dir, declarations.module_name, declarations.path_attribute, ''),
          CASE WHEN parent.activation = 0 THEN 0
               WHEN parent.activation = -1 THEN
                 CASE WHEN (CASE WHEN cr_cfg(properties.cfg_condition, ?2) <> 1
@@ -172,15 +170,7 @@ WITH RECURSIVE modules(module_path, blob_id, scope_ordinal, rel_path,
          parent.blob_id, route_declaration.start_byte, parent.module_path,
          parent.frontier = 1 AND parent.activation = 1,
          -- Must stay identical to the selected-file join below.
-         CASE WHEN cr_join(CASE WHEN declarations.path_attribute IS NULL THEN parent.module_dir ELSE parent.path_dir END,
-                           COALESCE(declarations.path_attribute, declarations.module_name || '.rs')) IS NULL
-              THEN NULL
-              WHEN declarations.path_attribute IS NOT NULL
-              THEN json_array(cr_join(parent.path_dir, declarations.path_attribute))
-              ELSE json_array(
-                cr_join(parent.module_dir, declarations.module_name || '.rs'),
-                cr_join(parent.module_dir, declarations.module_name || '/mod.rs'))
-         END
+         cr_module_candidates(parent.module_dir, parent.path_dir, declarations.module_name, declarations.path_attribute)
   FROM modules AS parent
   CROSS JOIN source_rust_module_routes AS routes
     ON routes.blob_id = parent.blob_id AND routes.scope_ordinal = parent.scope_ordinal
@@ -196,10 +186,8 @@ WITH RECURSIVE modules(module_path, blob_id, scope_ordinal, rel_path,
   LEFT JOIN workspace_file_versions AS files ON files.file_version_id IN (
     SELECT selected.file_version_id FROM selected_workspace_file_versions AS selected
     WHERE selected.lang = 'rust' AND selected.rel_path IN (
-      cr_join(CASE WHEN declarations.path_attribute IS NULL THEN parent.module_dir ELSE parent.path_dir END,
-              COALESCE(declarations.path_attribute, declarations.module_name || '.rs')),
-      cr_join(CASE WHEN declarations.path_attribute IS NULL THEN parent.module_dir ELSE parent.path_dir END,
-              COALESCE(declarations.path_attribute, declarations.module_name || '/mod.rs'))))
+      cr_module_candidate(parent.module_dir, parent.path_dir, declarations.module_name, declarations.path_attribute, '.rs'),
+      cr_module_candidate(parent.module_dir, parent.path_dir, declarations.module_name, declarations.path_attribute, '/mod.rs')))
   LEFT JOIN blobs ON blobs.blob_oid = files.blob_oid AND blobs.lang = files.lang
                  AND blobs.generation = files.generation AND blobs.parse_variant = x''
   WHERE parent.blob_id IS NOT NULL AND parent.depth < 256

@@ -17,9 +17,11 @@
 //! fact of the renamed crate, and the overlay indexes aliases alongside
 //! qualified names. So `use registry_alias::Widget` looks up
 //! `registry_alias.Widget` and hits, with no rename table on this side. By the
-//! same token two versions of one crate mint the same version-free declaration
-//! id, which makes the overlay report `Conflict`; [`RustOverlayCrates::unique_symbol`]
-//! answers `None` there rather than picking a winner.
+//! same token different versions can mint the same version-free declaration id.
+//! Conflicting facts report `Conflict`, and [`RustOverlayCrates::unique_symbol`]
+//! answers `None`; equivalent facts from multiple providers can coalesce.
+//! Cargo activation separately refuses package-scoped models when member
+//! declarations may select multiple package versions (`cargo_lock_activation_rows`).
 //!
 //! # Why the crate root gates every reference (#1795)
 //!
@@ -47,7 +49,6 @@ use std::sync::Arc;
 
 use brokk_bifrost_analysis::analyzer::semantic_model::overlay::{
     RustReexportLookup, RustReexportNamespace, SemanticModelOverlay,
-    SemanticModelOverlayDisposition,
 };
 
 use crate::analyzer::semantic_model::SemanticModelSymbol;
@@ -85,16 +86,20 @@ impl<'a> RustOverlayCrates<'a> {
     /// the overlay marks it `Conflict` and this returns `None`, so neither the
     /// trace nor a diagnostic picks an arbitrary winner between, say, two
     /// versions of the same crate.
-    pub(crate) fn unique_symbol(&self, qualified_name: &str) -> Option<Arc<SemanticModelSymbol>> {
+    pub(crate) fn unique_symbol(
+        &self,
+        qualified_name: &str,
+        namespace: RustReexportNamespace,
+    ) -> Option<Arc<SemanticModelSymbol>> {
         self.overlay?
-            .symbols_named_in_family(qualified_name, "rust")
+            .symbols_named_in_family(qualified_name, "rust", namespace)
             .unique()
     }
 
     /// The unique symbol a Rust reference may resolve to: one visible, public
     /// Rust declaration.
     fn visible_symbol(&self, qualified_name: &str) -> Option<Arc<SemanticModelSymbol>> {
-        let symbol = self.unique_symbol(qualified_name)?;
+        let symbol = self.unique_symbol(qualified_name, RustReexportNamespace::Unknown)?;
         SemanticModelOverlay::symbol_is_visible_public(&symbol, "rust").then_some(symbol)
     }
 
@@ -163,27 +168,19 @@ impl<'a> RustOverlayCrates<'a> {
             RustReexportLookup::MissingEvidence(_) => return None,
             RustReexportLookup::Absent => {}
         }
-        if namespace == RustReexportNamespace::Unknown {
-            return self.visible_symbol(qualified_name);
-        }
-        let matched = self
+        let symbol = self
             .overlay?
-            .symbols_named_in_family(qualified_name, "rust");
-        if matches!(
-            matched.disposition,
-            SemanticModelOverlayDisposition::Open(_)
-        ) {
-            return None;
-        }
-        let mut candidates = matched
-            .records
-            .into_iter()
-            .filter(|symbol| namespace.accepts(symbol.kind));
-        let symbol = candidates.next()?;
-        if candidates.next().is_some() || symbol.provenance.ambiguous {
-            return None;
-        }
+            .symbols_named_in_family(qualified_name, "rust", namespace)
+            .unique()?;
         SemanticModelOverlay::symbol_is_visible_public(&symbol, "rust").then_some(symbol)
+    }
+
+    /// A path-call owner must be a type or module, never a value or macro.
+    pub(crate) fn referenceable_owner(
+        &self,
+        qualified_name: &str,
+    ) -> Option<Arc<SemanticModelSymbol>> {
+        self.referenceable_symbol_in_namespace(qualified_name, RustReexportNamespace::TypeOrModule)
     }
 
     /// How completely the activated packs describe `crate_name`.

@@ -92,8 +92,17 @@ impl EmbeddedSyntaxTree {
 }
 
 #[derive(Debug)]
+struct EmbeddedSyntaxParent {
+    host: Option<usize>,
+    range: Span,
+    kind: u16,
+}
+
+#[derive(Debug)]
 pub struct EmbeddedSyntaxForest {
     trees: Vec<EmbeddedSyntaxTree>,
+    parents: Vec<EmbeddedSyntaxParent>,
+    by_root: crate::hash::HashMap<usize, usize>,
     by_anchor: crate::hash::HashMap<usize, Vec<usize>>,
 }
 
@@ -116,10 +125,13 @@ impl EmbeddedSyntaxForest {
         if spec.embedded_syntax_kinds().is_empty() {
             return Ok(Self {
                 trees: Vec::new(),
+                parents: Vec::new(),
+                by_root: crate::hash::HashMap::default(),
                 by_anchor: crate::hash::HashMap::default(),
             });
         }
         let mut trees: Vec<EmbeddedSyntaxTree> = Vec::new();
+        let mut parents = Vec::new();
         let mut index = 0;
         let mut retained_nodes = 0usize;
         loop {
@@ -146,6 +158,39 @@ impl EmbeddedSyntaxForest {
                     if retained_nodes > max_trees {
                         return Err(EmbeddedSyntaxStop::Exceeded);
                     }
+                    let batch_base = trees.len() + additions.len();
+                    for fragment in &embedded {
+                        let (anchor, host) = if fragment.anchor == node.id() {
+                            (node, index.checked_sub(1))
+                        } else {
+                            let mut found = None;
+                            for (offset, sibling) in embedded.iter().enumerate() {
+                                let mut pending = vec![sibling.root()];
+                                while let Some(candidate) = pending.pop() {
+                                    if candidate.id() == fragment.anchor {
+                                        found = Some((candidate, Some(batch_base + offset)));
+                                        break;
+                                    }
+                                    crate::analyzer::tree_walk::push_children_reversed(
+                                        candidate,
+                                        &mut pending,
+                                    );
+                                }
+                                if found.is_some() {
+                                    break;
+                                }
+                            }
+                            found.expect("an embedded anchor belongs to its host or its batch")
+                        };
+                        parents.push(EmbeddedSyntaxParent {
+                            host,
+                            range: Span {
+                                start_byte: anchor.start_byte(),
+                                end_byte: anchor.end_byte(),
+                            },
+                            kind: anchor.kind_id(),
+                        });
+                    }
                     additions.extend(embedded);
                 } else {
                     crate::analyzer::tree_walk::push_named_children_reversed_as(
@@ -166,7 +211,56 @@ impl EmbeddedSyntaxForest {
         for (index, tree) in trees.iter().enumerate() {
             by_anchor.entry(tree.anchor).or_default().push(index);
         }
-        Ok(Self { trees, by_anchor })
+        let by_root = trees
+            .iter()
+            .enumerate()
+            .map(|(index, tree)| (tree.root().id(), index))
+            .collect();
+        Ok(Self {
+            trees,
+            parents,
+            by_root,
+            by_anchor,
+        })
+    }
+
+    /// Cross an admitted fragment boundary through its recorded host anchor.
+    pub fn logical_parent<'a>(
+        &'a self,
+        primary: &'a tree_sitter::Tree,
+        node: Node<'a>,
+    ) -> Option<Node<'a>> {
+        let Some(index) = self.by_root.get(&node.id()) else {
+            return node.parent();
+        };
+        let parent = &self.parents[*index];
+        let host = parent.host.map_or(primary, |index| &self.trees[index].tree);
+        let anchor = host
+            .root_node()
+            .descendant_for_byte_range(parent.range.start_byte, parent.range.end_byte)
+            .expect("recorded embedded anchor remains in its host");
+        assert_eq!(
+            anchor.kind_id(),
+            parent.kind,
+            "recorded embedded anchor kind"
+        );
+        assert_eq!(
+            anchor.byte_range(),
+            parent.range.start_byte..parent.range.end_byte
+        );
+        Some(anchor)
+    }
+
+    /// The source root reached without visiting synthetic fragment wrappers.
+    pub fn logical_root<'a>(
+        &'a self,
+        primary: &'a tree_sitter::Tree,
+        mut node: Node<'a>,
+    ) -> Node<'a> {
+        while let Some(parent) = self.logical_parent(primary, node) {
+            node = parent;
+        }
+        node
     }
 
     /// Select syntax by original source coordinates before interpreting a site.
@@ -245,6 +339,35 @@ pub enum BindingCandidateVerdict {
     Binding,
     ValueItem,
     Open,
+}
+
+/// A deterministic engine work limit, distinct from a source identity gap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BindingWorkLimit {
+    pub bound: BindingWorkBound,
+    pub limit: usize,
+    pub value: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingWorkBound {
+    OrPatternBytes,
+    OrPatternCandidates,
+}
+
+pub type BindingAnchorAnswer = Result<Option<(usize, usize)>, BindingWorkLimit>;
+
+/// Caller-owned per-file hooks using syntax already admitted by the caller.
+pub trait StructuralFileHooks<'tree> {
+    fn callee_provenance(
+        &self,
+        node: Node<'tree>,
+        source: &str,
+        charge: &mut dyn FnMut(usize) -> Result<(), super::collector::StructuralFactCollectorStop>,
+    ) -> Result<
+        Option<super::callable::CalleeProvenanceFact>,
+        super::collector::StructuralFactCollectorStop,
+    >;
 }
 
 pub trait StructuralSpec: Send + Sync + 'static {
@@ -814,6 +937,26 @@ pub trait StructuralSpec: Send + Sync + 'static {
             .collect()
     }
 
+    /// Anchors with deterministic engine limits preserved as typed evidence.
+    fn logical_binding_anchor_checked(
+        &self,
+        binder: Node<'_>,
+        source: &str,
+    ) -> BindingAnchorAnswer {
+        Ok(self.logical_binding_anchor(binder, source))
+    }
+
+    fn logical_binding_anchors_checked(
+        &self,
+        binders: &[Node<'_>],
+        source: &str,
+    ) -> Vec<BindingAnchorAnswer> {
+        self.logical_binding_anchors(binders, source)
+            .into_iter()
+            .map(Ok)
+            .collect()
+    }
+
     /// Syntax that belongs to the binder, independent of name resolution.
     fn binding_syntax(&self, _binder: Node<'_>) -> Option<BindingSyntax> {
         None
@@ -1045,7 +1188,7 @@ pub struct PendingRoleTarget {
 #[derive(Debug, Clone, Copy)]
 pub enum PendingRoleTargetKind {
     Node(usize),
-    Span,
+    Span(Span),
 }
 
 /// An occurrence-role classification captured before the collector has built
@@ -1389,7 +1532,7 @@ impl<'a> RoleSink<'a> {
             },
             mode: ArgumentMode::Plain,
             keyword: keyword.map(|node| self.source_facts.intern_node(node)),
-            target: PendingRoleTargetKind::Span,
+            target: PendingRoleTargetKind::Span(value),
             occurrence,
             name: None,
         });

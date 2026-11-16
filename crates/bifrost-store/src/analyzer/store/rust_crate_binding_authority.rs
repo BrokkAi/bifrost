@@ -13,6 +13,33 @@ CREATE TEMP TABLE IF NOT EXISTS cr_authority_blockers(
  evidence_rel_path TEXT NOT NULL,evidence_kind TEXT NOT NULL,evidence_key INTEGER NOT NULL,owner_gap INTEGER NOT NULL,
  PRIMARY KEY(owner,namespace,name,reason,boundary,evidence_crate_key,evidence_module_path,evidence_rel_path,evidence_kind,evidence_key,owner_gap)
 ) WITHOUT ROWID;
+-- A declaration-body wrapper belongs to its native parent, not an enclosing
+-- source extent. In particular, a module inside a function is still a module.
+CREATE TEMP VIEW IF NOT EXISTS cr_authority_module_contexts AS
+ SELECT context.blob_id,context.occurrence_id FROM source_rust_item_contexts context
+ LEFT JOIN source_rust_item_contexts parent ON context.context_kind=6
+ AND parent.blob_id=context.blob_id AND parent.occurrence_id=context.parent_occurrence_id
+ WHERE COALESCE(parent.context_kind,context.context_kind) IN (0,1);
+CREATE TEMP TABLE IF NOT EXISTS cr_authority_explicit_names(node INTEGER NOT NULL PRIMARY KEY) WITHOUT ROWID;
+-- Inventories remain open. This relation answers only whether their unscoped
+-- evidence can change this particular own type/value binding.
+CREATE TEMP VIEW IF NOT EXISTS cr_authority_name_blockers AS
+ SELECT node.name AS lookup_name,blocker.*
+ FROM cr_binding_nodes node CROSS JOIN cr_authority_blockers blocker
+ ON blocker.owner=node.owner AND blocker.namespace=node.namespace
+ AND blocker.name IN ('',node.name)
+ WHERE (blocker.name<>'' OR NOT (
+ blocker.reason IN ('OpenBoundary','UnsupportedMacroGeneratedModule','UnresolvedVisibility','unresolved_visibility')
+ -- An unknown cfg on a different glob cannot shadow an active explicit
+ -- binding either. Unknown activation of the binding/module itself stays.
+ OR (blocker.reason='unknown_activation' AND blocker.evidence_kind='import'
+ AND blocker.evidence_crate_key=(SELECT crate_key FROM cr_identity)
+ AND EXISTS(SELECT 1 FROM cr_members member CROSS JOIN cr_member_imports source
+ ON source.blob_id=member.blob_id AND source.module_path=member.module_path
+ WHERE member.rel_path=blocker.evidence_rel_path AND source.module_path=blocker.evidence_module_path
+ AND source.import_ordinal=blocker.evidence_key AND source.is_glob=1)))
+ OR NOT EXISTS(SELECT 1 FROM cr_authority_explicit_names own WHERE own.node=node.node))
+;
 CREATE TEMP VIEW IF NOT EXISTS cr_authority_owner_keys AS
  SELECT owner.owner,owner.module_path,
  CASE WHEN owner.blob_id=0 THEN 'module' ELSE 'local' END AS kind,
@@ -34,19 +61,29 @@ CREATE TEMP VIEW IF NOT EXISTS cr_authority_owner_keys AS
 // SCCs: unlisted names have no binding nodes, so the derivation cannot carry
 // it. Per-name evidence comes only from cr_gaps, where the derivation already
 // carried it along the binding edges that can actually import the name.
-// owner_gap marks the owner's own unscoped gaps. They can add a binding of
-// equal rank to any name, so they also void that namespace's certificates;
-// a declaration or named import shadows what an open glob source adds.
+// owner_gap marks the owner's own unscoped gaps. They void macro certificates,
+// but own explicit type/value bindings can exclude unrelated frontier evidence
+// through cr_authority_name_blockers. The owner's inventory remains open.
 // A gap belongs to an owner when its subject is the owner's module path or
 // that path joined with one of the owner's names. Both cases are equi-joins on
 // cr_gaps_subject; a prefix test instead paired every owner with every gap.
-pub(super) const BLOCKERS_SQL: &str = "INSERT OR IGNORE INTO cr_authority_blockers
- WITH RECURSIVE inputs(owner,namespace,name,reason,boundary,evidence_crate_key,evidence_module_path,
+// The blocker's evidence is the item the gap names, in the module that holds
+// it. A module-level gap's subject is that module, so a gap reached through a
+// name (`crate::provider` for the owner `crate`) names its evidence in the
+// child module. A binding-level gap's subject is the binding, whose item is in
+// the owner's own module, and a gap without an item is owner-wide evidence.
+pub(super) const BLOCKERS_SQL: &str = "INSERT INTO cr_authority_blockers
+ SELECT * FROM (
+WITH RECURSIVE inputs(owner,namespace,name,reason,boundary,evidence_crate_key,evidence_module_path,
  evidence_rel_path,evidence_kind,evidence_key,owner_gap) AS (
- SELECT owner.owner,COALESCE(json_extract(gap.detail,'$.namespace'),namespace.value),
+ -- Module evidence names the invoked macro's namespace, while the opaque
+ -- expansion can introduce names in every output namespace.
+ SELECT owner.owner,CASE WHEN json_extract(gap.detail,'$.subject_level')='module' THEN namespace.value
+ ELSE COALESCE(json_extract(gap.detail,'$.namespace'),namespace.value) END,
  CASE WHEN gap.subject=owner.module_path THEN '' ELSE substr(gap.subject,length(owner.module_path)+3) END,
  COALESCE(json_extract(gap.detail,'$.reason'),gap.gap_kind),
- COALESCE(json_extract(gap.detail,'$.boundary'),'workspace_local'),owner.crate_key,owner.module_path,
+ COALESCE(json_extract(gap.detail,'$.boundary'),'workspace_local'),owner.crate_key,
+ CASE WHEN json_extract(gap.detail,'$.subject_level')='module' THEN gap.subject ELSE owner.module_path END,
  COALESCE(member.rel_path,''),
  CASE WHEN json_extract(gap.detail,'$.declaration_id') IS NOT NULL THEN 'declaration'
  WHEN json_extract(gap.detail,'$.invocation_occurrence') IS NOT NULL THEN 'macro'
@@ -64,7 +101,7 @@ pub(super) const BLOCKERS_SQL: &str = "INSERT OR IGNORE INTO cr_authority_blocke
  CROSS JOIN cr_gaps gap ON gap.rowid=matched.gap
  CROSS JOIN cr_identity identity ON identity.crate_key=owner.crate_key
  CROSS JOIN json_each('[\"type\",\"value\",\"macro\"]') namespace
- LEFT JOIN cr_members member ON member.module_path=owner.module_path
+ LEFT JOIN cr_members member ON member.module_path=CASE WHEN json_extract(gap.detail,'$.subject_level')='module' THEN gap.subject ELSE owner.module_path END
  AND member.blob_id=json_extract(gap.detail,'$.member_blob')
  WHERE (json_extract(gap.detail,'$.binder_scope') IS NULL
  OR (json_extract(gap.detail,'$.binder_scope')=owner.binder_scope AND json_extract(gap.detail,'$.member_blob')=owner.blob_id))
@@ -92,7 +129,76 @@ pub(super) const BLOCKERS_SQL: &str = "INSERT OR IGNORE INTO cr_authority_blocke
  SELECT glob.owner,input.namespace,input.name,input.reason,input.boundary,
  input.evidence_crate_key,input.evidence_module_path,input.evidence_rel_path,input.evidence_kind,input.evidence_key,0
  FROM inputs input CROSS JOIN cr_binding_globs glob ON glob.target_owner=input.owner WHERE input.name=''
- ) SELECT * FROM inputs";
+ ) SELECT * FROM inputs
+) WHERE true ON CONFLICT DO NOTHING";
+
+// Run after the import fixpoint, never during its monotone propagation. Start
+// with own witnesses, then remove certificates whose route reaches evidence
+// that still applies. Deletion converges without changing SCC/negative strata.
+// A terminal indexed declaration must positively establish the namespace.
+// An unindexed sysroot route alone is never a precedence certificate.
+pub(super) const EXPLICIT_NAMES_SQL: &str = "INSERT INTO cr_authority_explicit_names SELECT * FROM (
+ SELECT node.node FROM cr_binding_nodes node
+ CROSS JOIN cr_binding_owners owner ON owner.owner=node.owner
+ CROSS JOIN cr_identity identity ON identity.crate_key=owner.crate_key
+ CROSS JOIN cr_binding_targets target ON target.owner=node.owner
+ AND target.namespace=node.namespace AND target.name=node.name AND target.origin='declaration'
+ WHERE node.namespace IN ('type','value')
+ AND NOT (target.visibility='restricted' AND target.restricted_module_path IS NULL)
+ AND (owner.blob_id=0 OR EXISTS(
+ SELECT 1 FROM cr_authority_local_seeds seed WHERE seed.owner=node.owner
+ AND seed.namespace=node.namespace AND seed.name=node.name
+ AND seed.declaration_blob_id=target.declaration_blob_id AND seed.declaration_site=target.declaration_site))
+ UNION
+ -- A dependency already published the same own-binding certificate. Its
+ -- complete bit plus explicit provenance is the witness, not an alternative
+ -- alone. Keep that certificate when validating a consumer's import route.
+ SELECT node.node FROM cr_binding_nodes node
+ CROSS JOIN cr_binding_owners owner ON owner.owner=node.owner AND owner.blob_id=0 AND owner.binder_scope=0
+ CROSS JOIN cr_foreign foreign_owner ON foreign_owner.crate_key=owner.crate_key
+ CROSS JOIN rust_crate_binding_owners published ON published.topology_id=foreign_owner.topology_id
+ AND published.module_path=owner.module_path AND published.kind='module'
+ CROSS JOIN rust_crate_binding_names name ON name.owner_id=published.owner_id
+ AND name.namespace=node.namespace AND name.name=node.name AND name.complete=1
+ WHERE node.namespace IN ('type','value') AND EXISTS(
+ SELECT 1 FROM rust_crate_binding_alternatives alternative WHERE alternative.owner_id=published.owner_id
+ AND alternative.namespace=node.namespace AND alternative.name=node.name
+ AND alternative.origin IN ('declaration','named_import'))
+ UNION
+ SELECT node.node
+ FROM cr_binding_imports source CROSS JOIN cr_binding_nodes node
+ ON node.owner=source.owner AND node.name=source.bound_name AND node.namespace IN ('type','value')
+ LEFT JOIN cr_binding_import_complete done ON done.blob_id=source.blob_id
+ AND done.import_ordinal=source.import_ordinal AND done.module_path=source.module_path
+ AND done.namespace=node.namespace
+ WHERE source.is_glob=0 AND source.import_ordinal>=0
+ AND NOT (source.visibility='restricted' AND source.restricted_module_path IS NULL)
+ AND (done.namespace=node.namespace AND EXISTS(SELECT 1 FROM cr_binding_import_present present
+ WHERE present.blob_id=source.blob_id AND present.import_ordinal=source.import_ordinal
+ AND present.module_path=source.module_path AND present.namespace=node.namespace))
+) WHERE true ON CONFLICT DO NOTHING";
+
+// Validate every prefix and negative predecessor of each indexed route.
+pub(super) const REJECT_EXPLICIT_NAMES_SQL: &str = "WITH RECURSIVE reach(root,node) AS (
+ SELECT node,node FROM cr_authority_explicit_names
+ UNION SELECT reach.root,edge.target FROM reach
+ CROSS JOIN cr_binding_edges edge ON edge.source=reach.node
+ ) DELETE FROM cr_authority_explicit_names WHERE node IN (
+ SELECT reach.root FROM reach CROSS JOIN cr_binding_nodes name ON name.node=reach.node
+ CROSS JOIN cr_authority_name_blockers blocker ON blocker.owner=name.owner
+ AND blocker.namespace=name.namespace AND blocker.lookup_name=name.name
+ )";
+
+pub(super) fn derive_explicit_names(conn: &Connection) -> Result<()> {
+    conn.execute_batch("DELETE FROM cr_authority_explicit_names;")?;
+    conn.prepare_cached(EXPLICIT_NAMES_SQL)?.execute([])?;
+    while conn
+        .prepare_cached(REJECT_EXPLICIT_NAMES_SQL)?
+        .execute([])?
+        != 0
+    {}
+    Ok(())
+}
 
 pub(super) const OWNERS_SQL: &str = "SELECT DISTINCT owner.module_path,owner.kind,owner.rel_path,
  owner.scope_identity,owner.blob_id,owner.native_scope,
@@ -110,8 +216,8 @@ pub(super) const NAMES_SQL: &str =
     "SELECT DISTINCT owner.module_path,owner.rel_path,owner.scope_identity,
  name.namespace,name.name,EXISTS(SELECT 1 FROM cr_binding_complete complete
  WHERE complete.owner=name.owner AND complete.namespace=name.namespace AND complete.name=name.name)
- AND NOT EXISTS(SELECT 1 FROM cr_authority_blockers blocker WHERE blocker.owner=name.owner
- AND blocker.namespace=name.namespace AND blocker.owner_gap)
+ AND NOT EXISTS(SELECT 1 FROM cr_authority_name_blockers blocker WHERE blocker.owner=name.owner
+ AND blocker.namespace=name.namespace AND blocker.lookup_name=name.name AND blocker.owner_gap)
  FROM cr_authority_owner_keys owner CROSS JOIN cr_binding_names name ON name.owner=owner.owner
  WHERE name.name<>'self' ORDER BY 1,2,3,4,5";
 
@@ -228,30 +334,83 @@ pub(super) const ALTERNATIVES_INSERT_SQL: &str = "INSERT INTO rust_crate_binding
  FROM rust_crate_binding_owners WHERE topology_id=?1 AND module_path=?2 AND rel_path=?3 AND scope_identity=?4";
 
 // Full rows are the result of this single derivation query, not a retained
-// workspace index. Logical hashing excludes storage coordinates, not facts.
-pub(super) fn hash_rows(
-    digest: &mut Sha256,
-    rows: &[Vec<Value>],
-    family: &str,
-    physical_columns: &[usize],
-) {
-    hash_cell(digest, family.as_bytes());
-    for row in rows {
-        for (column, value) in row.iter().enumerate() {
-            if physical_columns.contains(&column) {
-                continue;
-            }
+// workspace index. The topology digest hashes name-level columns only, never a
+// dense coordinate (a declaration or scope ordinal, an import ordinal, a row
+// order): an edit that changes no name-level output must leave the digest equal
+// so dependents keep their derivations (#11764). A row set is therefore a
+// multiset: its rows are sorted by their own encoded name-level cells, here,
+// whatever order the SQL produced, and repeated rows keep their count.
+pub(super) fn encode_name_level_row<'a>(cells: impl Iterator<Item = &'a Value>) -> Vec<Vec<u8>> {
+    cells
+        .map(|value| {
+            let mut cell = Vec::new();
             match value {
-                Value::Null => hash_cell(digest, b"null"),
-                Value::Text(value) => hash_cell(digest, value.as_bytes()),
-                Value::Blob(value) => hash_cell(digest, value),
-                Value::Integer(value) => hash_cell(digest, &value.to_be_bytes()),
+                Value::Null => cell.push(0),
+                Value::Text(value) => {
+                    cell.push(1);
+                    cell.extend_from_slice(value.as_bytes());
+                }
+                Value::Blob(value) => {
+                    cell.push(2);
+                    cell.extend_from_slice(value);
+                }
+                Value::Integer(value) => {
+                    cell.push(3);
+                    cell.extend_from_slice(&value.to_be_bytes());
+                }
                 Value::Real(_) => {
                     unreachable!("binding authority contains no floating point values")
                 }
             }
+            cell
+        })
+        .collect()
+}
+
+pub(super) fn hash_row_set(digest: &mut Sha256, family: &str, mut rows: Vec<Vec<Vec<u8>>>) {
+    hash_cell(digest, family.as_bytes());
+    hash_cell(digest, &(rows.len() as u64).to_be_bytes());
+    rows.sort_unstable();
+    for row in rows {
+        for cell in row {
+            hash_cell(digest, &cell);
         }
     }
+}
+
+/// The hashed columns of the module-level rows of one binding-authority family.
+///
+/// A row of a fn-local owner is omitted. A local owner's only key is a scope
+/// ordinal, and no unit other than the crate itself reads one: a dependent
+/// reads a foreign crate's module owners and module-level exports, and
+/// summaries reject a lexical provider in another unit. The crate's own
+/// derivations are reached by its own member blobs, not by this digest.
+/// `scope_identity_column` is the dense scope column used to recognise a module
+/// owner (empty for a module, per `cr_authority_owner_keys`).
+pub(super) fn module_level_rows(
+    rows: &[Vec<Value>],
+    scope_identity_column: usize,
+    columns: &[usize],
+) -> Vec<Vec<Vec<u8>>> {
+    rows.iter()
+        .filter(|row| {
+            let Value::Blob(scope) = &row[scope_identity_column] else {
+                unreachable!(
+                    "a scope identity is a blob: {:?}",
+                    row[scope_identity_column]
+                )
+            };
+            scope.is_empty()
+        })
+        .map(|row| {
+            encode_name_level_row(
+                row.iter()
+                    .enumerate()
+                    .filter(|(column, _)| columns.contains(column))
+                    .map(|(_, value)| value),
+            )
+        })
+        .collect()
 }
 
 // A declaration is owned by the scope head of its direct definition path.
@@ -274,8 +433,9 @@ pub(super) const LOCAL_DECLARATIONS_SQL: &str = "INSERT OR IGNORE INTO cr_author
 
 // Walk forward from scope heads: endpoints have no semantic-key index, so
 // starting from authorities scanned every node and path of the blob per declaration.
-pub(super) const LOCAL_OWNERS_SQL: &str = "INSERT OR IGNORE INTO cr_binding_owners(crate_key,module_path,blob_id,binder_scope)
- SELECT identity.crate_key,member.module_path,scope.blob_id,scope.source_scope
+pub(super) const LOCAL_OWNERS_SQL: &str = "INSERT INTO cr_binding_owners(crate_key,module_path,blob_id,binder_scope)
+ SELECT * FROM (
+SELECT identity.crate_key,member.module_path,scope.blob_id,scope.source_scope
  FROM cr_member_blobs selected CROSS JOIN cr_identity identity
  CROSS JOIN resolution_node_catalog scope ON scope.blob_id=selected.blob_id AND scope.kind=1
  CROSS JOIN resolution_paths path INDEXED BY resolution_paths_forward
@@ -293,7 +453,8 @@ pub(super) const LOCAL_OWNERS_SQL: &str = "INSERT OR IGNORE INTO cr_binding_owne
  AND NOT EXISTS(SELECT 1 FROM cr_scopes inner_module WHERE inner_module.blob_id=member.blob_id
  AND inner_module.scope_ordinal<>member.scope_ordinal AND inner_module.start_byte>=member.start_byte
  AND inner_module.end_byte<=member.end_byte AND declaration.start_byte>=inner_module.start_byte
- AND declaration.end_byte<=inner_module.end_byte)";
+ AND declaration.end_byte<=inner_module.end_byte)
+) WHERE true ON CONFLICT DO NOTHING";
 
 pub(super) const LOCAL_PARENTS_SQL: &str = "WITH RECURSIVE ancestors(owner,blob_id,node) AS (
  SELECT owner.owner,scope.blob_id,path.end_node

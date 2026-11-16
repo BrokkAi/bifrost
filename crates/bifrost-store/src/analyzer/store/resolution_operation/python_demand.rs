@@ -80,9 +80,34 @@ type MemberRoleRows = RequestReadCache<
     Option<std::rc::Rc<super::python_members::PythonMemberRoleInputs>>,
 >;
 
-const PYTHON_HALF_PLACEMENTS: &str = "SELECT providers.container_path
+pub(crate) const PYTHON_IMPORT_STARTS_SQL: &str = "WITH routes AS (
+               SELECT imports.*,NOT EXISTS(SELECT 1 FROM resolution_root_import_segments prefix WHERE prefix.blob_id=?4 AND prefix.import_site=imports.import_site) AS binds_head
+               FROM (SELECT retained.summary_id,retained.member_ordinal,(SELECT dense.dense_id FROM temp.surface_dense dense WHERE dense.blob_id=selected.blob_id
+                      AND dense.id_space=1 AND dense.surface_ordinal=retained.import_surface_ordinal) AS import_site,
+                    retained.importer_container,retained.target_container,retained.module_name,
+                    retained.relative_level,retained.requested_name,retained.bound_name,retained.form,retained.state
+                 FROM main.python_unit_summary_imports retained
+                 JOIN temp.selected_unit_member_mounts selected
+                   ON selected.summary_id=retained.summary_id AND selected.member_ordinal=retained.member_ordinal) imports
+               WHERE imports.summary_id=?1 AND imports.importer_container=?2 AND imports.import_site=?3
+             ) SELECT CASE WHEN routes.form='module' AND routes.binds_head THEN binding.container_path WHEN routes.form='module' THEN loaded.container_path ELSE routes.target_container END,routes.form,routes.requested_name
+             FROM routes
+             LEFT JOIN resolution_import_selectors selector ON selector.blob_id=?4 AND selector.site=routes.import_site
+             LEFT JOIN python_unit_summary_providers loaded ON loaded.summary_id=routes.summary_id AND loaded.container_path=routes.target_container
+             LEFT JOIN python_unit_summary_providers binding ON routes.form='module' AND routes.binds_head
+               AND binding.summary_id=routes.summary_id AND (binding.module_name=selector.source_name OR (
+                 NOT EXISTS(SELECT 1 FROM python_unit_summary_providers exact WHERE exact.summary_id=routes.summary_id AND exact.module_name=selector.source_name AND exact.root_slot=loaded.root_slot AND exact.state IN ('selected','alternative'))
+                 AND EXISTS(SELECT 1 FROM python_unit_summary_spellings head JOIN python_unit_summary_spellings full_spelling ON full_spelling.summary_id=head.summary_id AND full_spelling.source_root=head.source_root
+                   WHERE head.summary_id=routes.summary_id AND head.module_name=selector.source_name AND head.target_container=binding.container_path AND head.admitted
+                     AND full_spelling.module_name=routes.module_name AND full_spelling.target_container=routes.target_container AND full_spelling.admitted)))
+               AND binding.root_slot=loaded.root_slot AND binding.state IN ('selected','alternative')";
+
+pub(crate) const PYTHON_HALF_PLACEMENTS: &str = "SELECT providers.container_path
              FROM main.python_unit_summary_providers providers
-             JOIN main.resolution_unit_summary_members members
+             JOIN (SELECT retained.summary_id,retained.member_ordinal,retained.rel_path,selected.blob_id
+                 FROM main.resolution_unit_summary_members retained
+                 JOIN temp.selected_unit_member_mounts selected
+                   ON selected.summary_id=retained.summary_id AND selected.member_ordinal=retained.member_ordinal) members
                ON members.summary_id=providers.summary_id
               AND members.member_ordinal=providers.member_ordinal
              JOIN temp.selected_resolution_mounts mounted
@@ -243,22 +268,34 @@ pub(crate) const REFERENCE_BY_SOURCE_SITE_SQL: &str =
  WHERE semantic.blob_id=?1 AND semantic.source_site=?2 AND semantic.semantic_role='reference'";
 
 const CURATED_STAR_CHILD_PREFIX_SQL: &str = "SELECT EXISTS(
-                               SELECT 1 FROM resolution_unit_summary_members member
-                               INDEXED BY resolution_unit_summary_members_blob
-                               CROSS JOIN python_unit_summary_imports imports
+                               SELECT 1 FROM (SELECT retained.summary_id,retained.member_ordinal,retained.rel_path,selected.blob_id
+                 FROM main.resolution_unit_summary_members retained
+                 JOIN temp.selected_unit_member_mounts selected
+                   ON selected.summary_id=retained.summary_id AND selected.member_ordinal=retained.member_ordinal) member
+
+                               CROSS JOIN (SELECT retained.summary_id,retained.member_ordinal,(SELECT dense.dense_id FROM temp.surface_dense dense WHERE dense.blob_id=selected.blob_id
+                      AND dense.id_space=1 AND dense.surface_ordinal=retained.import_surface_ordinal) AS import_site,
+                    retained.importer_container,retained.target_container,retained.module_name,
+                    retained.relative_level,retained.requested_name,retained.bound_name,retained.form,retained.state
+                 FROM main.python_unit_summary_imports retained
+                 JOIN temp.selected_unit_member_mounts selected
+                   ON selected.summary_id=retained.summary_id AND selected.member_ordinal=retained.member_ordinal) imports
                                  ON imports.summary_id=member.summary_id AND imports.member_ordinal=member.member_ordinal
                                CROSS JOIN python_unit_summary_providers parent
                                  ON parent.summary_id=imports.summary_id AND parent.container_path=imports.target_container
                                CROSS JOIN python_unit_summary_surfaces surface
                                  ON surface.summary_id=parent.summary_id AND surface.container_path=parent.container_path
                                   AND surface.surface='wildcard' AND surface.policy='curated'
-                               CROSS JOIN python_unit_summary_export_names exported
+                               CROSS JOIN main.python_unit_summary_export_names exported
                                  ON exported.summary_id=surface.summary_id AND exported.container_path=surface.container_path
-                                  AND exported.surface=surface.surface AND exported.name=?5 AND exported.slot_site IS NULL
+                                  AND exported.surface=surface.surface AND exported.name=?5 AND exported.slot_surface_ordinal IS NULL
                                CROSS JOIN python_unit_summary_providers child INDEXED BY python_unit_summary_providers_module
                                  ON child.summary_id=parent.summary_id AND child.module_name=parent.module_name || '.' || ?5
                                   AND child.root_slot=parent.root_slot AND child.state='selected' AND child.kind IN ('module','package')
-                               CROSS JOIN resolution_unit_summary_members child_member
+                               CROSS JOIN (SELECT retained.summary_id,retained.member_ordinal,retained.rel_path,selected.blob_id
+                 FROM main.resolution_unit_summary_members retained
+                 JOIN temp.selected_unit_member_mounts selected
+                   ON selected.summary_id=retained.summary_id AND selected.member_ordinal=retained.member_ordinal) child_member
                                  ON child_member.summary_id=child.summary_id AND child_member.member_ordinal=child.member_ordinal
                                CROSS JOIN selected_resolution_mounts mounted
                                  ON mounted.storage_language='python' AND mounted.persisted_relative_path=child_member.rel_path
@@ -266,13 +303,19 @@ const CURATED_STAR_CHILD_PREFIX_SQL: &str = "SELECT EXISTS(
                                WHERE member.blob_id=?3 AND member.summary_id=?1 AND member.rel_path=?2
                                  AND imports.import_site=?4 AND imports.form='star' AND imports.state='activation_open'
                                  AND parent.kind='package' AND parent.state='selected'
-                                 AND NOT EXISTS(SELECT 1 FROM python_unit_summary_imports other
+                                 AND NOT EXISTS(SELECT 1 FROM (SELECT retained.summary_id,retained.member_ordinal,(SELECT dense.dense_id FROM temp.surface_dense dense WHERE dense.blob_id=selected.blob_id
+                      AND dense.id_space=1 AND dense.surface_ordinal=retained.import_surface_ordinal) AS import_site,
+                    retained.importer_container,retained.target_container,retained.module_name,
+                    retained.relative_level,retained.requested_name,retained.bound_name,retained.form,retained.state
+                 FROM main.python_unit_summary_imports retained
+                 JOIN temp.selected_unit_member_mounts selected
+                   ON selected.summary_id=retained.summary_id AND selected.member_ordinal=retained.member_ordinal) other
                                    WHERE other.summary_id=imports.summary_id AND other.member_ordinal=imports.member_ordinal
                                      AND other.import_site=imports.import_site AND other.target_container<>imports.target_container)
                                  AND NOT EXISTS(SELECT 1 FROM python_unit_summary_providers other
                                    WHERE other.summary_id=child.summary_id AND other.module_name=child.module_name
                                      AND other.state IN ('alternative','open'))
-                                 AND NOT EXISTS(SELECT 1 FROM python_unit_summary_export_names hook
+                                 AND NOT EXISTS(SELECT 1 FROM main.python_unit_summary_export_names hook
                                    WHERE hook.summary_id=parent.summary_id AND hook.container_path=parent.container_path
                                      AND hook.surface='module' AND hook.name='__getattr__'))";
 
@@ -510,11 +553,12 @@ pub(super) fn model_open(
         .model_member_identity(token)
         .expect("model reason has a selected coordinate");
     super::python_models::hash_model_symbol(&mut hash, &model);
-    let reason =
-        rules
-            .ready
-            .context_identities
-            .named_semantic(hash.finish(), code, &format!("{token:?}"));
+    let reason = rules.ready.context_identities.named_semantic(
+        hash.finish(),
+        code,
+        crate::analyzer::resolution::ReasonDeterminism::Unaudited,
+        &format!("{token:?}"),
+    );
     ResolutionCompletion::incomplete([ResolutionIncompleteReason::UnsupportedSemantic(reason)])
 }
 
@@ -775,8 +819,7 @@ impl crate::analyzer::resolution::QualifiedMemberProvider for PythonRules<'_, '_
             let mount = self.ready.inventory.mount_record_by_ordinal(
                 SelectedResolutionMountOrdinal::new(input.fragment.ordinal()),
             )?;
-            let Some(rows) = self.load_binding_rows(mount.blob_id(), Some(mount.blob_oid()))?
-            else {
+            let Some(rows) = self.load_binding_rows(&mount)? else {
                 return Ok(CloseProgress::Cancelled(cancelled_completion()));
             };
             let SelectedLookupRecipeReadOutcome::Ready(recipes) =
@@ -1106,6 +1149,7 @@ impl crate::analyzer::resolution::QualifiedMemberProvider for PythonRules<'_, '_
                     let reason = self.ready.context_identities.named_semantic(
                         hash.finish(),
                         "python_source_implicit_protocol_open",
+                        crate::analyzer::resolution::ReasonDeterminism::Unaudited,
                         "source implicit protocol lookup is not published",
                     );
                     self.qualified_members.insert(id, slot);
@@ -1278,6 +1322,7 @@ impl crate::analyzer::resolution::QualifiedMemberProvider for PythonRules<'_, '_
                 let reason = self.ready.context_identities.named_semantic(
                     hash.finish(),
                     "python_receiver_subclass_member_missing",
+                    crate::analyzer::resolution::ReasonDeterminism::Unaudited,
                     &label,
                 );
                 *completion = completion.combine(&open(reason));
@@ -1353,6 +1398,8 @@ pub(super) struct PythonHalf<'a, 'store, 'input> {
     deferred_module_scope: Option<u32>,
     prefix: Option<std::rc::Rc<ResolutionAnswer>>,
     universe_unmutated: bool,
+    builtin_namespace_closed: bool,
+    root_namespace_gap: Option<SemanticId>,
     import_aliases: std::rc::Rc<[PythonAliasTargets]>,
     module_mutations: std::rc::Rc<[super::python_members::operations::ModuleMutation]>,
     completion: ResolutionCompletion,
@@ -1392,6 +1439,8 @@ impl<'a, 'store, 'input> PythonHalf<'a, 'store, 'input> {
             deferred_module_scope: None,
             prefix: None,
             universe_unmutated: false,
+            builtin_namespace_closed: false,
+            root_namespace_gap: None,
             import_aliases: Vec::new().into(),
             module_mutations: Vec::new().into(),
             completion,
@@ -1412,10 +1461,12 @@ impl<'a, 'store, 'input> PythonHalf<'a, 'store, 'input> {
         let mut hash = CanonicalHasher::new(b"python-open-source-half:v1");
         hash.field("source", &source.token.get().to_le_bytes());
         hash.field("label", label.as_bytes());
-        let reason = rules
-            .ready
-            .context_identities
-            .named_semantic(hash.finish(), label, evidence);
+        let reason = rules.ready.context_identities.named_semantic(
+            hash.finish(),
+            label,
+            crate::analyzer::resolution::ReasonDeterminism::Unaudited,
+            evidence,
+        );
         Self {
             open: Some(OpenHalf::new(ResolutionCompletion::incomplete([
                 ResolutionIncompleteReason::UnsupportedSemantic(reason),
@@ -1452,6 +1503,8 @@ struct PythonHalfInputs {
     deferred_module_scope: Option<u32>,
     prefix: Option<std::rc::Rc<ResolutionAnswer>>,
     universe_unmutated: bool,
+    builtin_namespace_closed: bool,
+    root_namespace_gap: Option<SemanticId>,
     import_aliases: std::rc::Rc<[PythonAliasTargets]>,
     module_mutations: std::rc::Rc<[super::python_members::operations::ModuleMutation]>,
     rendered_order: std::rc::Rc<std::cell::Cell<bool>>,
@@ -1488,6 +1541,8 @@ impl PythonHalfInputs {
             deferred_module_scope: self.deferred_module_scope,
             prefix: self.prefix.clone(),
             universe_unmutated: self.universe_unmutated,
+            builtin_namespace_closed: self.builtin_namespace_closed,
+            root_namespace_gap: self.root_namespace_gap,
             import_aliases: std::rc::Rc::clone(&self.import_aliases),
             module_mutations: std::rc::Rc::clone(&self.module_mutations),
             ..PythonHalf::new(
@@ -1532,7 +1587,16 @@ pub(super) fn conditional_imports(
     blob: i64,
 ) -> Result<Vec<u32>> {
     let sites = ready.inventory.connection().prepare_cached(
-            "SELECT imports.import_site FROM resolution_unit_summary_members member JOIN python_unit_summary_imports imports ON imports.summary_id=member.summary_id AND imports.member_ordinal=member.member_ordinal WHERE member.summary_id=?1 AND member.rel_path=?2 AND member.blob_id=?3 GROUP BY imports.import_site HAVING COUNT(DISTINCT imports.target_container)=1 AND MIN(imports.state='activation_open') AND MIN(EXISTS(SELECT 1 FROM python_unit_summary_providers provider WHERE provider.summary_id=imports.summary_id AND provider.container_path=imports.target_container AND (provider.state='selected' OR (provider.state='alternative' AND EXISTS(SELECT 1 FROM python_unit_summary_roots root WHERE root.summary_id=provider.summary_id AND root.root_slot=provider.root_slot AND root.authority='workspace')))))",
+            "SELECT imports.import_site FROM (SELECT retained.summary_id,retained.member_ordinal,retained.rel_path,selected.blob_id
+                 FROM main.resolution_unit_summary_members retained
+                 JOIN temp.selected_unit_member_mounts selected
+                   ON selected.summary_id=retained.summary_id AND selected.member_ordinal=retained.member_ordinal) member JOIN (SELECT retained.summary_id,retained.member_ordinal,(SELECT dense.dense_id FROM temp.surface_dense dense WHERE dense.blob_id=selected.blob_id
+                      AND dense.id_space=1 AND dense.surface_ordinal=retained.import_surface_ordinal) AS import_site,
+                    retained.importer_container,retained.target_container,retained.module_name,
+                    retained.relative_level,retained.requested_name,retained.bound_name,retained.form,retained.state
+                 FROM main.python_unit_summary_imports retained
+                 JOIN temp.selected_unit_member_mounts selected
+                   ON selected.summary_id=retained.summary_id AND selected.member_ordinal=retained.member_ordinal) imports ON imports.summary_id=member.summary_id AND imports.member_ordinal=member.member_ordinal WHERE member.summary_id=?1 AND member.rel_path=?2 AND member.blob_id=?3 GROUP BY imports.import_site HAVING COUNT(DISTINCT imports.target_container)=1 AND MIN(imports.state='activation_open') AND MIN(EXISTS(SELECT 1 FROM python_unit_summary_providers provider WHERE provider.summary_id=imports.summary_id AND provider.container_path=imports.target_container AND (provider.state='selected' OR (provider.state='alternative' AND EXISTS(SELECT 1 FROM python_unit_summary_roots root WHERE root.summary_id=provider.summary_id AND root.root_slot=provider.root_slot AND root.authority='workspace')))))",
         )?.query_map(rusqlite::params![summary,caller,blob], |row| row.get::<_,u32>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
     let sites = sites
         .into_iter()
@@ -1581,9 +1645,12 @@ pub(super) fn import_route_obligation(
     hash.field("unit", &unit);
     hash.field("profile", profile.as_bytes());
     hash.field("import", label.as_bytes());
-    let reason = ready
-        .context_identities
-        .named_semantic(hash.finish(), kind, &label);
+    let reason = ready.context_identities.named_semantic(
+        hash.finish(),
+        kind,
+        crate::analyzer::resolution::ReasonDeterminism::Unaudited,
+        &label,
+    );
     Ok((open(reason), label))
 }
 
@@ -1865,6 +1932,7 @@ impl PythonRules<'_, '_, '_> {
         self.ready.context_identities.named_semantic(
             hash.finish(),
             "python_lexical_selection_open",
+            crate::analyzer::resolution::ReasonDeterminism::Unaudited,
             &detail,
         )
     }
@@ -1880,7 +1948,7 @@ impl PythonRules<'_, '_, '_> {
             .ready
             .inventory
             .mount_record_by_ordinal(SelectedResolutionMountOrdinal::new(ordinal))?;
-        let Some(rows) = self.load_binding_rows(mount.blob_id(), Some(mount.blob_oid()))? else {
+        let Some(rows) = self.load_binding_rows(&mount)? else {
             return Ok(None);
         };
         let prefix_row: Option<(u32,String)> = self.ready.inventory.connection().prepare_cached("SELECT semantic.source_site,name.spelling FROM resolution_semantic_sites semantic
@@ -2096,8 +2164,17 @@ impl PythonRules<'_, '_, '_> {
                      AND MIN(EXISTS(SELECT 1 FROM python_unit_summary_providers provider
                        WHERE provider.summary_id=imports.summary_id AND provider.container_path=imports.target_container
                          AND provider.state='selected'))
-                     FROM python_unit_summary_imports imports
-                     JOIN resolution_unit_summary_members member ON member.summary_id=imports.summary_id
+                     FROM (SELECT retained.summary_id,retained.member_ordinal,(SELECT dense.dense_id FROM temp.surface_dense dense WHERE dense.blob_id=selected.blob_id
+                      AND dense.id_space=1 AND dense.surface_ordinal=retained.import_surface_ordinal) AS import_site,
+                    retained.importer_container,retained.target_container,retained.module_name,
+                    retained.relative_level,retained.requested_name,retained.bound_name,retained.form,retained.state
+                 FROM main.python_unit_summary_imports retained
+                 JOIN temp.selected_unit_member_mounts selected
+                   ON selected.summary_id=retained.summary_id AND selected.member_ordinal=retained.member_ordinal) imports
+                     JOIN (SELECT retained.summary_id,retained.member_ordinal,retained.rel_path,selected.blob_id
+                 FROM main.resolution_unit_summary_members retained
+                 JOIN temp.selected_unit_member_mounts selected
+                   ON selected.summary_id=retained.summary_id AND selected.member_ordinal=retained.member_ordinal) member ON member.summary_id=imports.summary_id
                        AND member.member_ordinal=imports.member_ordinal
                      WHERE imports.summary_id=?1 AND member.blob_id=?2 AND imports.import_site=?3 AND member.rel_path=?4")?.query_row(
                     rusqlite::params![self.summary,mount.blob_id(),import.import_site.get(),mount.persisted_relative_path()], |row| row.get::<_,Option<bool>>(0),
@@ -2323,7 +2400,16 @@ impl PythonRules<'_, '_, '_> {
                 .insert((caller.to_owned(), import.import_site.get()));
         }
         let states = self.ready.inventory.connection().prepare_cached(
-            "SELECT DISTINCT imports.state FROM resolution_unit_summary_members member INDEXED BY resolution_unit_summary_members_blob CROSS JOIN python_unit_summary_imports imports ON imports.summary_id=member.summary_id AND imports.member_ordinal=member.member_ordinal WHERE member.blob_id=?4 AND member.summary_id=?1 AND member.rel_path=?2 AND imports.import_site=?3",
+            "SELECT DISTINCT imports.state FROM (SELECT retained.summary_id,retained.member_ordinal,retained.rel_path,selected.blob_id
+                 FROM main.resolution_unit_summary_members retained
+                 JOIN temp.selected_unit_member_mounts selected
+                   ON selected.summary_id=retained.summary_id AND selected.member_ordinal=retained.member_ordinal) member CROSS JOIN (SELECT retained.summary_id,retained.member_ordinal,(SELECT dense.dense_id FROM temp.surface_dense dense WHERE dense.blob_id=selected.blob_id
+                      AND dense.id_space=1 AND dense.surface_ordinal=retained.import_surface_ordinal) AS import_site,
+                    retained.importer_container,retained.target_container,retained.module_name,
+                    retained.relative_level,retained.requested_name,retained.bound_name,retained.form,retained.state
+                 FROM main.python_unit_summary_imports retained
+                 JOIN temp.selected_unit_member_mounts selected
+                   ON selected.summary_id=retained.summary_id AND selected.member_ordinal=retained.member_ordinal) imports ON imports.summary_id=member.summary_id AND imports.member_ordinal=member.member_ordinal WHERE member.blob_id=?4 AND member.summary_id=?1 AND member.rel_path=?2 AND imports.import_site=?3",
         )?.query_map(rusqlite::params![self.summary,caller,import.import_site.get(),blob], |row| row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
         let mut completion = ResolutionCompletion::Complete;
         for state in states {
@@ -2401,7 +2487,7 @@ impl PythonRules<'_, '_, '_> {
         if sites.is_empty() {
             return Ok(Vec::new());
         }
-        let Some(rows) = self.load_binding_rows(blob, Some(mount.blob_oid()))? else {
+        let Some(rows) = self.load_binding_rows(&mount)? else {
             return Ok(Vec::new());
         };
         let fixed = self.conditional_imports(&rows, mount.persisted_relative_path(), blob)?;
@@ -2440,12 +2526,18 @@ impl PythonRules<'_, '_, '_> {
 
     pub(super) fn load_binding_rows(
         &self,
-        blob: i64,
-        oid: Option<git2::Oid>,
+        mount: &crate::analyzer::store::resolution_selection::SelectedResolutionMountRecord,
     ) -> Result<Option<brokk_bifrost_core::retention_budget::BudgetedValue<PythonBindingRows>>>
     {
+        let blob = mount.blob_id();
         if self.cancellation.is_cancelled() {
             return Ok(None);
+        }
+        if let Some(analyzer) = self.ready.analyzer {
+            analyzer.record_source_read(&ProjectFile::new(
+                self.ready.project.root(),
+                mount.persisted_relative_path(),
+            ));
         }
         if let Some(rows) = self.binding_rows.borrow().get(&blob) {
             return Ok(Some(rows.clone()));
@@ -2454,7 +2546,7 @@ impl PythonRules<'_, '_, '_> {
             self.ready.inventory.connection(),
             &self.ready.store.cache_budget,
             blob,
-            oid,
+            Some(mount.blob_oid()),
             self.cancellation,
         )?
         else {
@@ -2476,17 +2568,24 @@ impl PythonRules<'_, '_, '_> {
     fn module_bindings(&self, container: &str) -> Result<Read<Option<PythonModuleBindings>>> {
         let selected = self.ready.inventory.connection().prepare_cached(
             "SELECT mounted.mount_ordinal,mounted.blob_id FROM python_unit_summary_providers provider
-             JOIN resolution_unit_summary_members member ON member.summary_id=provider.summary_id AND member.member_ordinal=provider.member_ordinal
+             JOIN (SELECT retained.summary_id,retained.member_ordinal,retained.rel_path,selected.blob_id
+                 FROM main.resolution_unit_summary_members retained
+                 JOIN temp.selected_unit_member_mounts selected
+                   ON selected.summary_id=retained.summary_id AND selected.member_ordinal=retained.member_ordinal) member ON member.summary_id=provider.summary_id AND member.member_ordinal=provider.member_ordinal
              JOIN selected_resolution_mounts mounted ON mounted.blob_id=member.blob_id AND mounted.persisted_relative_path=member.rel_path
              WHERE provider.summary_id=?1 AND provider.container_path=?2 AND provider.state IN ('selected','alternative')",
         )?.query_row(
             rusqlite::params![self.summary,container],|row|Ok((row.get::<_,u32>(0)?,row.get::<_,i64>(1)?)),
         ).optional()?;
-        let Some((mount, blob)) = selected else {
+        let Some((ordinal, blob)) = selected else {
             return Ok(Read::ready(None));
         };
-        let rows = self.load_binding_rows(blob, None)?;
-        Ok(Read::ready(rows.map(|rows| (mount, blob, rows))))
+        let mount = self
+            .ready
+            .inventory
+            .mount_record_by_ordinal(SelectedResolutionMountOrdinal::new(ordinal))?;
+        let rows = self.load_binding_rows(&mount)?;
+        Ok(Read::ready(rows.map(|rows| (ordinal, blob, rows))))
     }
 
     fn read_reference_inputs(&self, reference: SemanticId) -> Result<Read<PythonReferenceInputs>> {
@@ -2515,7 +2614,7 @@ impl PythonRules<'_, '_, '_> {
         else {
             return Ok(Read::ready(PythonReferenceInputs::default()));
         };
-        let Some(rows) = self.load_binding_rows(blob, Some(mount.blob_oid()))? else {
+        let Some(rows) = self.load_binding_rows(&mount)? else {
             return Ok(if self.cancellation.is_cancelled() {
                 Read::Cancelled(cancelled_completion())
             } else {
@@ -2624,7 +2723,10 @@ impl PythonRules<'_, '_, '_> {
         let containers = self.ready.inventory.connection().prepare_cached(
             "SELECT provider.container_path
              FROM python_unit_summary_providers provider
-             JOIN resolution_unit_summary_members member
+             JOIN (SELECT retained.summary_id,retained.member_ordinal,retained.rel_path,selected.blob_id
+                 FROM main.resolution_unit_summary_members retained
+                 JOIN temp.selected_unit_member_mounts selected
+                   ON selected.summary_id=retained.summary_id AND selected.member_ordinal=retained.member_ordinal) member
                ON member.summary_id=provider.summary_id AND member.member_ordinal=provider.member_ordinal
              WHERE provider.summary_id=?1 AND member.blob_id=?2 AND member.rel_path=?3
                AND provider.state IN ('selected','alternative') AND provider.kind IN ('module','package') LIMIT 2",
@@ -2673,7 +2775,7 @@ impl PythonRules<'_, '_, '_> {
             .ready
             .inventory
             .mount_record_by_ordinal(SelectedResolutionMountOrdinal::new(ordinal))?;
-        let Some(rows) = self.load_binding_rows(mount.blob_id(), Some(mount.blob_oid()))? else {
+        let Some(rows) = self.load_binding_rows(&mount)? else {
             return Ok(None);
         };
         let reference: Option<(u32, String)> = self.ready.inventory.connection().prepare_cached(
@@ -2763,8 +2865,17 @@ impl PythonRules<'_, '_, '_> {
                      WHERE provider.summary_id=?1 AND provider.container_path=?2
                        AND provider.module_name=?6
                        AND provider.kind='namespace' AND provider.state IN ('selected','alternative')
-                       AND EXISTS(SELECT 1 FROM python_unit_summary_imports imported
-                         JOIN resolution_unit_summary_members source
+                       AND EXISTS(SELECT 1 FROM (SELECT retained.summary_id,retained.member_ordinal,(SELECT dense.dense_id FROM temp.surface_dense dense WHERE dense.blob_id=selected.blob_id
+                      AND dense.id_space=1 AND dense.surface_ordinal=retained.import_surface_ordinal) AS import_site,
+                    retained.importer_container,retained.target_container,retained.module_name,
+                    retained.relative_level,retained.requested_name,retained.bound_name,retained.form,retained.state
+                 FROM main.python_unit_summary_imports retained
+                 JOIN temp.selected_unit_member_mounts selected
+                   ON selected.summary_id=retained.summary_id AND selected.member_ordinal=retained.member_ordinal) imported
+                         JOIN (SELECT retained.summary_id,retained.member_ordinal,retained.rel_path,selected.blob_id
+                 FROM main.resolution_unit_summary_members retained
+                 JOIN temp.selected_unit_member_mounts selected
+                   ON selected.summary_id=retained.summary_id AND selected.member_ordinal=retained.member_ordinal) source
                            ON source.summary_id=imported.summary_id
                             AND source.member_ordinal=imported.member_ordinal
                          JOIN python_unit_summary_providers target
@@ -2891,7 +3002,10 @@ impl PythonRules<'_, '_, '_> {
             return Ok(None);
         };
         let same_package: bool = self.ready.inventory.connection().prepare_cached("SELECT EXISTS(SELECT 1 FROM python_unit_summary_providers provider
-             JOIN resolution_unit_summary_members member
+             JOIN (SELECT retained.summary_id,retained.member_ordinal,retained.rel_path,selected.blob_id
+                 FROM main.resolution_unit_summary_members retained
+                 JOIN temp.selected_unit_member_mounts selected
+                   ON selected.summary_id=retained.summary_id AND selected.member_ordinal=retained.member_ordinal) member
                ON member.summary_id=provider.summary_id AND member.member_ordinal=provider.member_ordinal
              JOIN selected_resolution_mounts mounted
                ON mounted.blob_id=member.blob_id AND mounted.persisted_relative_path=member.rel_path
@@ -2908,7 +3022,7 @@ impl PythonRules<'_, '_, '_> {
             .ready
             .inventory
             .mount_record_by_ordinal(SelectedResolutionMountOrdinal::new(observation.mount))?;
-        let Some(rows) = self.load_binding_rows(mount.blob_id(), Some(mount.blob_oid()))? else {
+        let Some(rows) = self.load_binding_rows(&mount)? else {
             return Ok(None);
         };
         Ok(
@@ -3175,10 +3289,13 @@ impl<'a, 'store, 'input> DemandRules for PythonRules<'a, 'store, 'input> {
                 },
             )));
         }
-        let selected = self
-            .arena
-            .borrow()
-            .selected_universe_continuation_completion(endpoint);
+        let (selected, generated) = {
+            let arena = self.arena.borrow();
+            (
+                arena.selected_universe_continuation_completion(endpoint),
+                arena.generated_base_admission(endpoint, self.session),
+            )
+        };
         if self.cancellation.is_cancelled() || !self.session.observe_cancellation() {
             return Ok(Read::Cancelled(cancelled_completion()));
         }
@@ -3190,7 +3307,14 @@ impl<'a, 'store, 'input> DemandRules for PythonRules<'a, 'store, 'input> {
                 },
             )));
         }
-        Ok(Read::ready(EndpointAdmission::Discover))
+        // A generated terminal published by a star re-export or an import
+        // chain has no authored source anchor, so source discovery would
+        // refuse it for missing provenance. Its owning relation already
+        // supplied the completion and base authority (#12288).
+        Ok(Read::ready(match generated {
+            Some(admission) => EndpointAdmission::Context(admission),
+            None => EndpointAdmission::Discover,
+        }))
     }
     fn describe_source(
         &mut self,
@@ -3310,9 +3434,7 @@ impl<'a, 'store, 'input> DemandRules for PythonRules<'a, 'store, 'input> {
                 let read = if let Some((spelling, site)) = spelling.filter(|(spelling, _)| {
                     brokk_bifrost_python::intrinsics::builtin(spelling).is_some()
                 }) {
-                    let Some(rows) =
-                        self.load_binding_rows(mount.blob_id(), Some(mount.blob_oid()))?
-                    else {
+                    let Some(rows) = self.load_binding_rows(&mount)? else {
                         return Ok(if self.cancellation.is_cancelled() {
                             Read::Cancelled(cancelled_completion())
                         } else {
@@ -3413,9 +3535,18 @@ impl<'a, 'store, 'input> DemandRules for PythonRules<'a, 'store, 'input> {
             let needs_attributes = match half {
                 SelectedRootPathHalf::Import { .. } => {
                     if let Some(site) = self.source_import_site(blob, identity, token)? {
-                        self.ready.inventory.connection().prepare_cached("SELECT EXISTS(SELECT 1 FROM python_unit_summary_imports
+                        self.ready.inventory.connection().prepare_cached("SELECT EXISTS(SELECT 1 FROM (SELECT retained.summary_id,retained.member_ordinal,(SELECT dense.dense_id FROM temp.surface_dense dense WHERE dense.blob_id=selected.blob_id
+                      AND dense.id_space=1 AND dense.surface_ordinal=retained.import_surface_ordinal) AS import_site,
+                    retained.importer_container,retained.target_container,retained.module_name,
+                    retained.relative_level,retained.requested_name,retained.bound_name,retained.form,retained.state
+                 FROM main.python_unit_summary_imports retained
+                 JOIN temp.selected_unit_member_mounts selected
+                   ON selected.summary_id=retained.summary_id AND selected.member_ordinal=retained.member_ordinal)
                              WHERE summary_id=?1 AND import_site=?2 AND form IN ('from','star')
-                             AND member_ordinal IN (SELECT member_ordinal FROM resolution_unit_summary_members
+                             AND member_ordinal IN (SELECT member_ordinal FROM (SELECT retained.summary_id,retained.member_ordinal,retained.rel_path,selected.blob_id
+                 FROM main.resolution_unit_summary_members retained
+                 JOIN temp.selected_unit_member_mounts selected
+                   ON selected.summary_id=retained.summary_id AND selected.member_ordinal=retained.member_ordinal)
                               WHERE summary_id=?1 AND blob_id=?3))")?.query_row(
                             rusqlite::params![self.summary, site, blob], |row| row.get(0),
                         )?
@@ -3468,7 +3599,10 @@ impl<'a, 'store, 'input> DemandRules for PythonRules<'a, 'store, 'input> {
                 } else {
                     let rows = self.ready.inventory.connection().prepare_cached(
                     "SELECT provider.container_path FROM python_unit_summary_providers provider
-                     JOIN resolution_unit_summary_members member ON member.summary_id=provider.summary_id AND member.member_ordinal=provider.member_ordinal
+                     JOIN (SELECT retained.summary_id,retained.member_ordinal,retained.rel_path,selected.blob_id
+                 FROM main.resolution_unit_summary_members retained
+                 JOIN temp.selected_unit_member_mounts selected
+                   ON selected.summary_id=retained.summary_id AND selected.member_ordinal=retained.member_ordinal) member ON member.summary_id=provider.summary_id AND member.member_ordinal=provider.member_ordinal
                      WHERE provider.summary_id=?1 AND member.blob_id=?2 AND provider.state IN ('selected','alternative')"
                 )?.query_map(rusqlite::params![self.summary,blob], |row| row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
                     let rows = std::sync::Arc::new(rows);
@@ -3778,7 +3912,7 @@ impl<'a, 'store, 'input> DemandRules for PythonRules<'a, 'store, 'input> {
                 .collect();
             self.retain_external_imports(source, inherited);
         }
-        let Some(rows) = self.load_binding_rows(blob, Some(mount_record.blob_oid()))? else {
+        let Some(rows) = self.load_binding_rows(&mount_record)? else {
             if self.cancellation.is_cancelled() {
                 return Ok(HalfRowsOutcome::Stopped);
             }
@@ -3854,12 +3988,13 @@ impl<'a, 'store, 'input> DemandRules for PythonRules<'a, 'store, 'input> {
                 mutations.operations.len()
             ));
         }
-        if universe_unmutated
-            && brokk_bifrost_python::intrinsics::builtin(source.demand.spelling()).is_some()
-        {
+        // Nonbuiltin absence keeps its existing mutation-only guard.
+        let mut builtin_namespace_closed = true;
+        let mut root_namespace_gap = None;
+        if brokk_bifrost_python::intrinsics::builtin(source.demand.spelling()).is_some() {
             let origin=crate::analyzer::store::resolution_prepare::resolution_rows::gap_origin_code(
                 crate::analyzer::resolution::LoweringGapOrigin::Extracted(brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::UnsupportedRoute));
-            universe_unmutated = if let Some(site) = reference_site {
+            (builtin_namespace_closed, root_namespace_gap) = if let Some(site) = reference_site {
                 let owner: Option<u32> = self.ready.inventory.connection().prepare_cached("SELECT definition.semantic_key FROM python_member_sites site
                      JOIN resolution_node_catalog node ON node.blob_id=site.blob_id AND node.source_scope=site.scope
                      JOIN resolution_member_scope_properties scope ON scope.blob_id=node.blob_id AND scope.scope_head_node_key=node.local_key AND scope.scope_kind='type_body'
@@ -3883,13 +4018,20 @@ impl<'a, 'store, 'input> DemandRules for PythonRules<'a, 'store, 'input> {
                     )?
                     .query_row(
                         rusqlite::params![blob, site, origin, ordinary_owner],
-                        |row| row.get(0),
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get::<_, Option<u32>>(1)?.map(|reason| {
+                                    SemanticId::local(source.identity.fragment().ordinal(), reason)
+                                }),
+                            ))
+                        },
                     )?
             } else {
-                false
+                (false, None)
             };
             self.observations.borrow_mut().push(format!(
-                "universe lexical-namespace closed={universe_unmutated} statements=1"
+                "universe lexical-namespace closed={builtin_namespace_closed} statements=1"
             ));
         }
         let mut activation_reasons = Vec::new();
@@ -3997,6 +4139,8 @@ impl<'a, 'store, 'input> DemandRules for PythonRules<'a, 'store, 'input> {
                 .and_then(|inputs| inputs.deferred_module_scope),
             prefix,
             universe_unmutated,
+            builtin_namespace_closed,
+            root_namespace_gap,
             import_aliases,
             module_mutations: module_mutations.into(),
             rendered_order: std::rc::Rc::new(std::cell::Cell::new(false)),
@@ -4068,15 +4212,22 @@ impl<'a, 'store, 'input> DemandRules for PythonRules<'a, 'store, 'input> {
                 ResolutionCompletion::Complete,
                 BaseEligibility::Exclude,
                 DemandClosureDischarges::exact(activation_reasons),
-                facts
-                    .generated
-                    .iter()
-                    .map(|(candidate, source)| GeneratedContinuation {
-                        candidate: *candidate,
-                        source: *source,
-                        base: BaseEligibility::Exclude,
-                    })
-                    .collect(),
+                // A generated terminal continues in the base relation. A class
+                // prefix never starts a star route, so no generated terminal can
+                // have one: every resolved prefix target is a module.
+                facts.generated_continuations(&frame.halves, |targets| {
+                    for &target in targets {
+                        debug_assert!(
+                            is_module_definition(
+                                &self.ready.inventory,
+                                target,
+                                &self.module_sites
+                            )?,
+                            "a generated continuation has a class prefix: {target:?}"
+                        );
+                    }
+                    Ok(false)
+                })?,
             )
             .with_query_scope(crate::analyzer::resolution::ClosedQueryScope {
                 query_obligations,
@@ -4157,37 +4308,36 @@ impl PythonHalf<'_, '_, '_> {
         lookup: &ResolutionLookupSemanticRecipe,
     ) -> Result<Vec<(RouteLocation, Option<ResolutionLookupSemanticRecipe>)>> {
         let key = (self.rules.summary, container.to_owned(), site, blob);
-        let destinations = if let Some(rows) =
-            { self.rules.import_routes.borrow().get(&key).cloned() }
-        {
-            rows
-        } else {
-            let rows = self.rules.ready.inventory.connection().prepare_cached(
-            "WITH routes AS (
-               SELECT imports.*,NOT EXISTS(SELECT 1 FROM resolution_root_import_segments prefix WHERE prefix.blob_id=?4 AND prefix.import_site=imports.import_site) AS binds_head
-               FROM python_unit_summary_imports imports
-               WHERE imports.summary_id=?1 AND imports.importer_container=?2 AND imports.import_site=?3
-             ) SELECT CASE WHEN routes.form='module' AND routes.binds_head THEN binding.container_path WHEN routes.form='module' THEN loaded.container_path ELSE routes.target_container END,routes.form,routes.requested_name
-             FROM routes
-             LEFT JOIN resolution_import_selectors selector ON selector.blob_id=?4 AND selector.site=routes.import_site
-             LEFT JOIN python_unit_summary_providers loaded ON loaded.summary_id=routes.summary_id AND loaded.container_path=routes.target_container
-             LEFT JOIN python_unit_summary_providers binding ON routes.form='module' AND routes.binds_head
-               AND binding.summary_id=routes.summary_id AND (binding.module_name=selector.source_name OR (
-                 NOT EXISTS(SELECT 1 FROM python_unit_summary_providers exact WHERE exact.summary_id=routes.summary_id AND exact.module_name=selector.source_name AND exact.root_slot=loaded.root_slot AND exact.state IN ('selected','alternative'))
-                 AND EXISTS(SELECT 1 FROM python_unit_summary_spellings head JOIN python_unit_summary_spellings full_spelling ON full_spelling.summary_id=head.summary_id AND full_spelling.source_root=head.source_root
-                   WHERE head.summary_id=routes.summary_id AND head.module_name=selector.source_name AND head.target_container=binding.container_path AND head.admitted
-                     AND full_spelling.module_name=routes.module_name AND full_spelling.target_container=routes.target_container AND full_spelling.admitted)))
-               AND binding.root_slot=loaded.root_slot AND binding.state IN ('selected','alternative')",
-        )?.query_map(rusqlite::params![self.rules.summary,container,site,blob], |row| Ok((row.get::<_,Option<String>>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
-            let rows = std::sync::Arc::new(rows);
-            if !self.rules.cancellation.is_cancelled() {
-                self.rules
-                    .import_routes
-                    .borrow_mut()
-                    .insert(key, std::sync::Arc::clone(&rows));
-            }
-            rows
-        };
+        let destinations =
+            if let Some(rows) = { self.rules.import_routes.borrow().get(&key).cloned() } {
+                rows
+            } else {
+                let rows = self
+                    .rules
+                    .ready
+                    .inventory
+                    .connection()
+                    .prepare_cached(PYTHON_IMPORT_STARTS_SQL)?
+                    .query_map(
+                        rusqlite::params![self.rules.summary, container, site, blob],
+                        |row| {
+                            Ok((
+                                row.get::<_, Option<String>>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                            ))
+                        },
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let rows = std::sync::Arc::new(rows);
+                if !self.rules.cancellation.is_cancelled() {
+                    self.rules
+                        .import_routes
+                        .borrow_mut()
+                        .insert(key, std::sync::Arc::clone(&rows));
+                }
+                rows
+            };
         Ok(destinations
             .iter()
             .filter_map(|(container, form, name)| {
@@ -4321,7 +4471,7 @@ impl PythonHalf<'_, '_, '_> {
                 let RouteLocation::Container { ref container, .. } = location else {
                     unreachable!()
                 };
-                let present: bool = self.rules.ready.inventory.connection().prepare_cached("SELECT EXISTS(SELECT 1 FROM python_unit_summary_export_names WHERE summary_id=?1 AND container_path=?2 AND surface='wildcard' AND name=?3)")?.query_row(
+                let present: bool = self.rules.ready.inventory.connection().prepare_cached("SELECT EXISTS(SELECT 1 FROM main.python_unit_summary_export_names WHERE summary_id=?1 AND container_path=?2 AND surface='wildcard' AND name=?3)")?.query_row(
                     rusqlite::params![self.rules.summary,container,lookup.spelling()], |row|row.get(0),
                 )?;
                 let closed = self.wildcard_inventory_closed(container, lookup.spelling())?;
@@ -4366,7 +4516,10 @@ impl PythonHalf<'_, '_, '_> {
         }
         let mut statement = self.rules.ready.inventory.connection().prepare_cached(
             "SELECT p.kind,p.state,p.rel_path,root.root_path,
-               EXISTS(SELECT 1 FROM resolution_unit_summary_members member
+               EXISTS(SELECT 1 FROM (SELECT retained.summary_id,retained.member_ordinal,retained.rel_path,selected.blob_id
+                 FROM main.resolution_unit_summary_members retained
+                 JOIN temp.selected_unit_member_mounts selected
+                   ON selected.summary_id=retained.summary_id AND selected.member_ordinal=retained.member_ordinal) member
                 JOIN selected_resolution_mounts mounted ON mounted.blob_id=member.blob_id
                  AND mounted.persisted_relative_path=member.rel_path
                 WHERE member.summary_id=p.summary_id AND member.member_ordinal=p.member_ordinal)
@@ -4563,7 +4716,13 @@ impl PythonHalf<'_, '_, '_> {
                     };
                     star_completion = open(owner);
                 }
-                let unresolved_star: bool = self.rules.ready.inventory.connection().prepare_cached("SELECT EXISTS(SELECT 1 FROM python_unit_summary_imports imports WHERE imports.summary_id=?1 AND imports.importer_container=?2 AND imports.form='star' AND (imports.state<>'activation_open' OR NOT EXISTS(SELECT 1 FROM python_unit_summary_providers provider WHERE provider.summary_id=imports.summary_id AND provider.container_path=imports.target_container AND provider.state IN ('selected','alternative') AND provider.member_ordinal IS NOT NULL)))")?.query_row(
+                let unresolved_star: bool = self.rules.ready.inventory.connection().prepare_cached("SELECT EXISTS(SELECT 1 FROM (SELECT retained.summary_id,retained.member_ordinal,(SELECT dense.dense_id FROM temp.surface_dense dense WHERE dense.blob_id=selected.blob_id
+                      AND dense.id_space=1 AND dense.surface_ordinal=retained.import_surface_ordinal) AS import_site,
+                    retained.importer_container,retained.target_container,retained.module_name,
+                    retained.relative_level,retained.requested_name,retained.bound_name,retained.form,retained.state
+                 FROM main.python_unit_summary_imports retained
+                 JOIN temp.selected_unit_member_mounts selected
+                   ON selected.summary_id=retained.summary_id AND selected.member_ordinal=retained.member_ordinal) imports WHERE imports.summary_id=?1 AND imports.importer_container=?2 AND imports.form='star' AND (imports.state<>'activation_open' OR NOT EXISTS(SELECT 1 FROM python_unit_summary_providers provider WHERE provider.summary_id=imports.summary_id AND provider.container_path=imports.target_container AND provider.state IN ('selected','alternative') AND provider.member_ordinal IS NOT NULL)))")?.query_row(
                     rusqlite::params![self.rules.summary,container], |row|row.get(0))?;
                 self.rules.observations.borrow_mut().push(format!(
                     "module attribute-space hook={hook} dynamic={dynamic} unresolved-star={unresolved_star}"
@@ -4629,7 +4788,10 @@ impl PythonHalf<'_, '_, '_> {
     fn module_owner(&self, container: &str) -> Result<Option<RouteLocation>> {
         let selected = self.rules.ready.inventory.connection().prepare_cached("SELECT mounted.mount_ordinal, member.blob_id
              FROM python_unit_summary_providers provider
-             JOIN resolution_unit_summary_members member
+             JOIN (SELECT retained.summary_id,retained.member_ordinal,retained.rel_path,selected.blob_id
+                 FROM main.resolution_unit_summary_members retained
+                 JOIN temp.selected_unit_member_mounts selected
+                   ON selected.summary_id=retained.summary_id AND selected.member_ordinal=retained.member_ordinal) member
                ON member.summary_id=provider.summary_id AND member.member_ordinal=provider.member_ordinal
              JOIN selected_resolution_mounts mounted
                ON mounted.blob_id=member.blob_id AND mounted.persisted_relative_path=member.rel_path
@@ -4672,8 +4834,17 @@ impl PythonHalf<'_, '_, '_> {
         )?;
         let imports = self.rules.ready.inventory.connection().prepare_cached(
             "SELECT DISTINCT imports.import_site
-             FROM python_unit_summary_imports imports
-             JOIN resolution_unit_summary_members caller
+             FROM (SELECT retained.summary_id,retained.member_ordinal,(SELECT dense.dense_id FROM temp.surface_dense dense WHERE dense.blob_id=selected.blob_id
+                      AND dense.id_space=1 AND dense.surface_ordinal=retained.import_surface_ordinal) AS import_site,
+                    retained.importer_container,retained.target_container,retained.module_name,
+                    retained.relative_level,retained.requested_name,retained.bound_name,retained.form,retained.state
+                 FROM main.python_unit_summary_imports retained
+                 JOIN temp.selected_unit_member_mounts selected
+                   ON selected.summary_id=retained.summary_id AND selected.member_ordinal=retained.member_ordinal) imports
+             JOIN (SELECT retained.summary_id,retained.member_ordinal,retained.rel_path,selected.blob_id
+                 FROM main.resolution_unit_summary_members retained
+                 JOIN temp.selected_unit_member_mounts selected
+                   ON selected.summary_id=retained.summary_id AND selected.member_ordinal=retained.member_ordinal) caller
                ON caller.summary_id=imports.summary_id AND caller.member_ordinal=imports.member_ordinal
              JOIN python_unit_summary_providers loaded
                ON loaded.summary_id=imports.summary_id AND loaded.container_path=imports.target_container
@@ -4889,12 +5060,35 @@ impl PythonHalf<'_, '_, '_> {
     /// through the shared prefix prerequisites. Lexical source events remain
     /// the authority for local/module shadowing; no source is reparsed here.
     fn builtin_inventory_closed(&self) -> bool {
+        self.universe_unmutated
+            && self.builtin_namespace_closed
+            && self.builtin_reference_eligible()
+    }
+
+    fn builtin_reference_eligible(&self) -> bool {
         let Some(site) = self.reference_site else {
             return false;
         };
-        self.universe_unmutated && self.import_site.is_none()
+        self.import_site.is_none()
             && !self.rules.cancellation.is_cancelled()
             && !self.rows.events.iter().any(|event|event.target==site && event.kind!=brokk_bifrost_core::analyzer::resolution_facts::ResolutionBindingEventKind::Augment)
+    }
+
+    fn root_namespace_completion(&self, name: &str) -> Option<ResolutionCompletion> {
+        let gap = self.root_namespace_gap?;
+        let detail = format!(
+            "root UnknownBinder/builtins-write gap={gap:?}:builtin={name}:reference={:?}",
+            self.source.token,
+        );
+        let mut hash = CanonicalHasher::new(b"python-root-unknown-binder:v1");
+        hash.field("gap", detail.as_bytes());
+        let reason = self.rules.ready.context_identities.named_semantic(
+            hash.finish(),
+            "python_root_unknown_binder",
+            crate::analyzer::resolution::ReasonDeterminism::Unaudited,
+            &detail,
+        );
+        Some(open(reason))
     }
 
     fn selection_completion(&self, state: &PythonLexical) -> Read<()> {
@@ -5357,6 +5551,7 @@ impl HalfRules for PythonHalf<'_, '_, '_> {
             let reason = self.rules.ready.context_identities.named_semantic(
                 hash.finish(),
                 "python_builtin_fallback_before_writer",
+                crate::analyzer::resolution::ReasonDeterminism::Unaudited,
                 &detail,
             );
             let completion = ResolutionCompletion::incomplete([
@@ -5372,35 +5567,53 @@ impl HalfRules for PythonHalf<'_, '_, '_> {
         if self.source.route.len() <= 1
             && lookup.spelling() == self.source.demand.spelling()
             && python_lexical::lexical_parent(state, &self.rows, scope.get()).is_none()
-            && !state.selection.open
             && state.selection.stopped.is_none()
             && state.selection.unbound.is_empty()
             && state.selection.selected.is_empty()
             && !state.selection.residual.is_empty()
-            && state.selection.completion == ResolutionCompletion::Complete
             && let Some(builtin) = brokk_bifrost_python::intrinsics::builtin(lookup.spelling())
             && builtin.versions.availability(self.rules.python_version)
                 == brokk_bifrost_python::intrinsics::Availability::Present
-            && self.builtin_inventory_closed()
+            && self.builtin_reference_eligible()
         {
             self.record_environment(self.source.token);
             self.record_mutation(self.source.token)?;
-            let entry = crate::analyzer::resolution::universe_lookup(
-                Language::Python,
-                ResolutionNamespace::Value,
-                builtin.name,
-            )
-            .expect("Python builtin table is registered in the universe");
-            placement.universe.set(Some(entry));
-            state.selection.residual.clear();
-            self.rules.observations.borrow_mut().push(format!(
-                "universe={} identity={} predeclared=true version={:?}",
-                builtin.qualified_name,
-                brokk_bifrost_core::analyzer::canonical_hash::lower_hex_string(
-                    &crate::analyzer::resolution::universe::identity_digest(entry)
-                ),
-                self.rules.python_version,
-            ));
+            // #12742: a root gap prevents a unique binding proof; it does not
+            // disprove the builtin candidate. Preserve that candidate through
+            // the existing universe path and carry the gap's reason instead.
+            // Known mutations, shadowing and stopped/unbound paths still gate
+            // admission independently from lexical namespace closure.
+            if let Some(completion) = self.root_namespace_completion(lookup.spelling()) {
+                state.selection.completion = state.selection.completion.combine(&completion);
+                let mut inputs = self.rules.source_inputs.borrow_mut();
+                let prepared = inputs
+                    .get_mut(&self.source.identity)
+                    .expect("prepared Python source half");
+                prepared.endpoint_completion = prepared.endpoint_completion.combine(&completion);
+            }
+            if self.universe_unmutated
+                && (self.root_namespace_gap.is_some()
+                    || (self.builtin_namespace_closed
+                        && !state.selection.open
+                        && state.selection.completion == ResolutionCompletion::Complete))
+            {
+                let entry = crate::analyzer::resolution::universe_lookup(
+                    Language::Python,
+                    ResolutionNamespace::Value,
+                    builtin.name,
+                )
+                .expect("Python builtin table is registered in the universe");
+                placement.universe.set(Some(entry));
+                state.selection.residual.clear();
+                self.rules.observations.borrow_mut().push(format!(
+                    "universe={} identity={} predeclared=true version={:?}",
+                    builtin.qualified_name,
+                    brokk_bifrost_core::analyzer::canonical_hash::lower_hex_string(
+                        &crate::analyzer::resolution::universe::identity_digest(entry)
+                    ),
+                    self.rules.python_version,
+                ));
+            }
         }
         // Closed source and wildcard inventories can prove a missing name.
         // Residual at the final scope is then absence, not an unknown writer.
@@ -5761,7 +5974,13 @@ impl HalfRules for PythonHalf<'_, '_, '_> {
                 },
             );
             let star = match self.import_site {
-                Some(site) if self.source.is_import => self.rules.ready.inventory.connection().prepare_cached("SELECT EXISTS(SELECT 1 FROM python_unit_summary_imports WHERE summary_id=?1 AND import_site=?2 AND importer_container=?3 AND form='star')")?.query_row(
+                Some(site) if self.source.is_import => self.rules.ready.inventory.connection().prepare_cached("SELECT EXISTS(SELECT 1 FROM (SELECT retained.summary_id,retained.member_ordinal,(SELECT dense.dense_id FROM temp.surface_dense dense WHERE dense.blob_id=selected.blob_id
+                      AND dense.id_space=1 AND dense.surface_ordinal=retained.import_surface_ordinal) AS import_site,
+                    retained.importer_container,retained.target_container,retained.module_name,
+                    retained.relative_level,retained.requested_name,retained.bound_name,retained.form,retained.state
+                 FROM main.python_unit_summary_imports retained
+                 JOIN temp.selected_unit_member_mounts selected
+                   ON selected.summary_id=retained.summary_id AND selected.member_ordinal=retained.member_ordinal) WHERE summary_id=?1 AND import_site=?2 AND importer_container=?3 AND form='star')")?.query_row(
                     rusqlite::params![unit, site, placement.container], |row| row.get::<_, bool>(0),
                 )?,
                 _ => false,
@@ -5773,7 +5992,7 @@ impl HalfRules for PythonHalf<'_, '_, '_> {
                 .inventory
                 .connection()
                 .prepare_cached(
-                    "SELECT slot_site FROM python_unit_summary_export_names
+                    "SELECT slot_surface_ordinal FROM main.python_unit_summary_export_names
                  WHERE summary_id=?1 AND container_path=?2 AND surface=?3 AND name=?4",
                 )?
                 .query_row(
@@ -5825,19 +6044,31 @@ impl HalfRules for PythonHalf<'_, '_, '_> {
                     .as_deref()
                     .unwrap_or(self.source.demand.spelling());
                 let star = match self.import_site {
-                    Some(site) if self.source.is_import => self.rules.ready.inventory.connection().prepare_cached("SELECT EXISTS(SELECT 1 FROM python_unit_summary_imports WHERE summary_id=?1 AND importer_container=?2 AND import_site=?3 AND form='star')")?.query_row(
+                    Some(site) if self.source.is_import => self.rules.ready.inventory.connection().prepare_cached("SELECT EXISTS(SELECT 1 FROM (SELECT retained.summary_id,retained.member_ordinal,(SELECT dense.dense_id FROM temp.surface_dense dense WHERE dense.blob_id=selected.blob_id
+                      AND dense.id_space=1 AND dense.surface_ordinal=retained.import_surface_ordinal) AS import_site,
+                    retained.importer_container,retained.target_container,retained.module_name,
+                    retained.relative_level,retained.requested_name,retained.bound_name,retained.form,retained.state
+                 FROM main.python_unit_summary_imports retained
+                 JOIN temp.selected_unit_member_mounts selected
+                   ON selected.summary_id=retained.summary_id AND selected.member_ordinal=retained.member_ordinal) WHERE summary_id=?1 AND importer_container=?2 AND import_site=?3 AND form='star')")?.query_row(
                         rusqlite::params![self.rules.summary,placement.container,site],|row|row.get::<_,bool>(0),
                     )?,
                     _ => false,
                 };
-                if star && !self.rules.ready.inventory.connection().prepare_cached("SELECT EXISTS(SELECT 1 FROM python_unit_summary_export_names WHERE summary_id=?1 AND container_path=?2 AND surface='wildcard' AND name=?3)")?.query_row(
+                if star && !self.rules.ready.inventory.connection().prepare_cached("SELECT EXISTS(SELECT 1 FROM main.python_unit_summary_export_names WHERE summary_id=?1 AND container_path=?2 AND surface='wildcard' AND name=?3)")?.query_row(
                     rusqlite::params![self.rules.summary,container,name], |row|row.get::<_,bool>(0),
                 )? {
                     let closed = self.wildcard_inventory_closed(container, name)?;
                     return Ok(Read::Ready { value:Vec::new(), completion: if closed { completion.clone() } else { completion.combine(&open(self.source.token)) } });
                 }
                 let module_import = match self.import_site {
-                    Some(site) if self.source.is_import => self.rules.ready.inventory.connection().prepare_cached("SELECT EXISTS(SELECT 1 FROM python_unit_summary_imports WHERE summary_id=?1 AND importer_container=?2 AND import_site=?3 AND form='module')")?.query_row(
+                    Some(site) if self.source.is_import => self.rules.ready.inventory.connection().prepare_cached("SELECT EXISTS(SELECT 1 FROM (SELECT retained.summary_id,retained.member_ordinal,(SELECT dense.dense_id FROM temp.surface_dense dense WHERE dense.blob_id=selected.blob_id
+                      AND dense.id_space=1 AND dense.surface_ordinal=retained.import_surface_ordinal) AS import_site,
+                    retained.importer_container,retained.target_container,retained.module_name,
+                    retained.relative_level,retained.requested_name,retained.bound_name,retained.form,retained.state
+                 FROM main.python_unit_summary_imports retained
+                 JOIN temp.selected_unit_member_mounts selected
+                   ON selected.summary_id=retained.summary_id AND selected.member_ordinal=retained.member_ordinal) WHERE summary_id=?1 AND importer_container=?2 AND import_site=?3 AND form='module')")?.query_row(
                         rusqlite::params![self.rules.summary, placement.container, site], |row| row.get::<_, bool>(0),
                     )?,
                     _ => false,
@@ -6062,7 +6293,13 @@ impl<T: Clone + Eq + std::hash::Hash> RouteRules<T> for PythonRoute<'_, '_, '_> 
                 .connection()
                 .prepare_cached(
                     "SELECT imports.target_container,imports.form,imports.module_name,coalesce(provider.rel_path,''),imports.state
-                 FROM main.python_unit_summary_imports imports
+                 FROM (SELECT retained.summary_id,retained.member_ordinal,(SELECT dense.dense_id FROM temp.surface_dense dense WHERE dense.blob_id=selected.blob_id
+                      AND dense.id_space=1 AND dense.surface_ordinal=retained.import_surface_ordinal) AS import_site,
+                    retained.importer_container,retained.target_container,retained.module_name,
+                    retained.relative_level,retained.requested_name,retained.bound_name,retained.form,retained.state
+                 FROM main.python_unit_summary_imports retained
+                 JOIN temp.selected_unit_member_mounts selected
+                   ON selected.summary_id=retained.summary_id AND selected.member_ordinal=retained.member_ordinal) imports
                  LEFT JOIN main.python_unit_summary_providers provider
                    ON provider.summary_id=imports.summary_id AND provider.container_path=imports.target_container
                  WHERE imports.summary_id=?1 AND imports.importer_container=?2 AND imports.import_site=?3",
@@ -6692,7 +6929,16 @@ fn source_root_gap(
     let mut imports = imports.iter().collect::<Vec<_>>();
     imports.sort();
     for (path, site) in imports {
-        let mut modules = conn.prepare_cached("SELECT DISTINCT imported.module_name FROM python_unit_summary_imports imported JOIN resolution_unit_summary_members member ON member.summary_id=imported.summary_id AND member.member_ordinal=imported.member_ordinal WHERE imported.summary_id=?1 AND member.rel_path=?2 AND imported.import_site=?3 AND imported.relative_level=0 AND instr(imported.module_name,'.')>0")?;
+        let mut modules = conn.prepare_cached("SELECT DISTINCT imported.module_name FROM (SELECT retained.summary_id,retained.member_ordinal,(SELECT dense.dense_id FROM temp.surface_dense dense WHERE dense.blob_id=selected.blob_id
+                      AND dense.id_space=1 AND dense.surface_ordinal=retained.import_surface_ordinal) AS import_site,
+                    retained.importer_container,retained.target_container,retained.module_name,
+                    retained.relative_level,retained.requested_name,retained.bound_name,retained.form,retained.state
+                 FROM main.python_unit_summary_imports retained
+                 JOIN temp.selected_unit_member_mounts selected
+                   ON selected.summary_id=retained.summary_id AND selected.member_ordinal=retained.member_ordinal) imported JOIN (SELECT retained.summary_id,retained.member_ordinal,retained.rel_path,selected.blob_id
+                 FROM main.resolution_unit_summary_members retained
+                 JOIN temp.selected_unit_member_mounts selected
+                   ON selected.summary_id=retained.summary_id AND selected.member_ordinal=retained.member_ordinal) member ON member.summary_id=imported.summary_id AND member.member_ordinal=imported.member_ordinal WHERE imported.summary_id=?1 AND member.rel_path=?2 AND imported.import_site=?3 AND imported.relative_level=0 AND instr(imported.module_name,'.')>0")?;
         let modules = modules
             .query_map(rusqlite::params![summary, path, site], |row| {
                 row.get::<_, String>(0)
@@ -6777,14 +7023,41 @@ impl PythonRules<'_, '_, '_> {
         let row = connection.prepare_cached("SELECT authored.form,authored.relative_level,authored.module_segments,authored.binding_event,json(authored.route),slot.name,
                 CASE WHEN authored.form=0 AND NOT EXISTS(SELECT 1 FROM resolution_root_import_segments prefix WHERE prefix.blob_id=authored.blob_id AND prefix.import_site=authored.import_site) THEN 1 ELSE json_array_length(authored.route) END,member.rel_path
              FROM python_binding_imports authored
-             JOIN resolution_unit_summary_members member ON member.summary_id=?3 AND member.blob_id=authored.blob_id AND member.rel_path=?4
+             JOIN (SELECT retained.summary_id,retained.member_ordinal,retained.rel_path,selected.blob_id
+                 FROM main.resolution_unit_summary_members retained
+                 JOIN temp.selected_unit_member_mounts selected
+                   ON selected.summary_id=retained.summary_id AND selected.member_ordinal=retained.member_ordinal) member ON member.summary_id=?3 AND member.blob_id=authored.blob_id AND member.rel_path=?4
              LEFT JOIN resolution_binding_events event ON event.blob_id=authored.blob_id AND event.event=authored.binding_event
              LEFT JOIN resolution_binding_slots slot ON slot.blob_id=event.blob_id AND slot.slot=event.slot
              WHERE authored.blob_id=?1 AND authored.import_site=?2
-               AND EXISTS(SELECT 1 FROM python_unit_summary_imports route WHERE route.summary_id=?3 AND route.member_ordinal=member.member_ordinal AND route.import_site=authored.import_site AND route.state='provider_open')
-               AND NOT EXISTS(SELECT 1 FROM python_unit_summary_imports route WHERE route.summary_id=?3 AND route.member_ordinal=member.member_ordinal AND route.import_site=authored.import_site AND route.target_container!='')
-               AND (authored.relative_level=0 OR ((SELECT count(DISTINCT route.module_name) FROM python_unit_summary_imports route WHERE route.summary_id=?3 AND route.member_ordinal=member.member_ordinal AND route.import_site=authored.import_site)=1
-                 AND NOT EXISTS(SELECT 1 FROM python_unit_summary_imports route WHERE route.summary_id=?3 AND route.member_ordinal=member.member_ordinal AND route.import_site=authored.import_site AND route.state!='provider_open')))")?.query_row(
+               AND EXISTS(SELECT 1 FROM (SELECT retained.summary_id,retained.member_ordinal,(SELECT dense.dense_id FROM temp.surface_dense dense WHERE dense.blob_id=selected.blob_id
+                      AND dense.id_space=1 AND dense.surface_ordinal=retained.import_surface_ordinal) AS import_site,
+                    retained.importer_container,retained.target_container,retained.module_name,
+                    retained.relative_level,retained.requested_name,retained.bound_name,retained.form,retained.state
+                 FROM main.python_unit_summary_imports retained
+                 JOIN temp.selected_unit_member_mounts selected
+                   ON selected.summary_id=retained.summary_id AND selected.member_ordinal=retained.member_ordinal) route WHERE route.summary_id=?3 AND route.member_ordinal=member.member_ordinal AND route.import_site=authored.import_site AND route.state='provider_open')
+               AND NOT EXISTS(SELECT 1 FROM (SELECT retained.summary_id,retained.member_ordinal,(SELECT dense.dense_id FROM temp.surface_dense dense WHERE dense.blob_id=selected.blob_id
+                      AND dense.id_space=1 AND dense.surface_ordinal=retained.import_surface_ordinal) AS import_site,
+                    retained.importer_container,retained.target_container,retained.module_name,
+                    retained.relative_level,retained.requested_name,retained.bound_name,retained.form,retained.state
+                 FROM main.python_unit_summary_imports retained
+                 JOIN temp.selected_unit_member_mounts selected
+                   ON selected.summary_id=retained.summary_id AND selected.member_ordinal=retained.member_ordinal) route WHERE route.summary_id=?3 AND route.member_ordinal=member.member_ordinal AND route.import_site=authored.import_site AND route.target_container!='')
+               AND (authored.relative_level=0 OR ((SELECT count(DISTINCT route.module_name) FROM (SELECT retained.summary_id,retained.member_ordinal,(SELECT dense.dense_id FROM temp.surface_dense dense WHERE dense.blob_id=selected.blob_id
+                      AND dense.id_space=1 AND dense.surface_ordinal=retained.import_surface_ordinal) AS import_site,
+                    retained.importer_container,retained.target_container,retained.module_name,
+                    retained.relative_level,retained.requested_name,retained.bound_name,retained.form,retained.state
+                 FROM main.python_unit_summary_imports retained
+                 JOIN temp.selected_unit_member_mounts selected
+                   ON selected.summary_id=retained.summary_id AND selected.member_ordinal=retained.member_ordinal) route WHERE route.summary_id=?3 AND route.member_ordinal=member.member_ordinal AND route.import_site=authored.import_site)=1
+                 AND NOT EXISTS(SELECT 1 FROM (SELECT retained.summary_id,retained.member_ordinal,(SELECT dense.dense_id FROM temp.surface_dense dense WHERE dense.blob_id=selected.blob_id
+                      AND dense.id_space=1 AND dense.surface_ordinal=retained.import_surface_ordinal) AS import_site,
+                    retained.importer_container,retained.target_container,retained.module_name,
+                    retained.relative_level,retained.requested_name,retained.bound_name,retained.form,retained.state
+                 FROM main.python_unit_summary_imports retained
+                 JOIN temp.selected_unit_member_mounts selected
+                   ON selected.summary_id=retained.summary_id AND selected.member_ordinal=retained.member_ordinal) route WHERE route.summary_id=?3 AND route.member_ordinal=member.member_ordinal AND route.import_site=authored.import_site AND route.state!='provider_open')))")?.query_row(
             rusqlite::params![blob, site, self.summary, mount.persisted_relative_path()], |row| Ok((row.get::<_,u32>(0)?,row.get::<_,u32>(1)?,row.get::<_,u32>(2)?,row.get::<_,Option<u32>>(3)?,row.get::<_,String>(4)?,row.get::<_,Option<String>>(5)?,row.get::<_,u32>(6)?,row.get::<_,String>(7)?))
         ).optional()?;
         let Some((
@@ -6868,15 +7141,20 @@ pub(super) fn project_python_named_argument<
     impl<P: crate::analyzer::resolution::DemandRootProvider + ?Sized> PythonNamedArguments<'_, P> {
         fn load_binding_rows(
             &self,
-            blob: i64,
-            oid: Option<git2::Oid>,
+            mount: &crate::analyzer::store::resolution_selection::SelectedResolutionMountRecord,
         ) -> Result<Option<brokk_bifrost_core::retention_budget::BudgetedValue<PythonBindingRows>>>
         {
+            if let Some(analyzer) = self.ready.analyzer {
+                analyzer.record_source_read(&ProjectFile::new(
+                    self.ready.project.root(),
+                    mount.persisted_relative_path(),
+                ));
+            }
             PythonBindingRows::load(
                 self.ready.inventory.connection(),
                 &self.ready.store.cache_budget,
-                blob,
-                oid,
+                mount.blob_id(),
+                Some(mount.blob_oid()),
                 self.cancellation,
             )
         }
@@ -7108,11 +7386,7 @@ pub(super) fn project_python_named_argument<
                 )?.query_row(rusqlite::params![class_rows_mount.blob_id(), callable.local_key().expect("source class")], |row| row.get(0))?;
                 let class_rows = if decorator_count > 0 && (!explicit_init || decorator_count == 1)
                 {
-                    let Some(rows) = self.load_binding_rows(
-                        class_rows_mount.blob_id(),
-                        Some(class_rows_mount.blob_oid()),
-                    )?
-                    else {
+                    let Some(rows) = self.load_binding_rows(&class_rows_mount)? else {
                         return Ok(NamedParameter::Open);
                     };
                     Some(rows)
@@ -7242,11 +7516,7 @@ pub(super) fn project_python_named_argument<
                             if decorators != 1 {
                                 return Ok(NamedParameter::Open);
                             }
-                            let Some(owner_rows) = self.load_binding_rows(
-                                owner_mount.blob_id(),
-                                Some(owner_mount.blob_oid()),
-                            )?
-                            else {
+                            let Some(owner_rows) = self.load_binding_rows(&owner_mount)? else {
                                 return Ok(NamedParameter::Open);
                             };
                             if python_member_rows::admitted_dataclass_expression(
@@ -7373,9 +7643,7 @@ pub(super) fn project_python_named_argument<
                             callable.ordinal().expect("source field"),
                         ),
                     )?;
-                    let Some(field_rows) = self
-                        .load_binding_rows(field_mount.blob_id(), Some(field_mount.blob_oid()))?
-                    else {
+                    let Some(field_rows) = self.load_binding_rows(&field_mount)? else {
                         return Ok(NamedParameter::Open);
                     };
                     return Ok(
@@ -7667,15 +7935,33 @@ impl SelectedResolutionOperation<'_, '_> {
                        ON slot.blob_id=event.blob_id AND slot.slot=event.slot
                      WHERE authored.blob_id=?1 AND authored.relative_level=0
                        AND EXISTS(
-                         SELECT 1 FROM resolution_unit_summary_members member
-                         JOIN python_unit_summary_imports route
+                         SELECT 1 FROM (SELECT retained.summary_id,retained.member_ordinal,retained.rel_path,selected.blob_id
+                 FROM main.resolution_unit_summary_members retained
+                 JOIN temp.selected_unit_member_mounts selected
+                   ON selected.summary_id=retained.summary_id AND selected.member_ordinal=retained.member_ordinal) member
+                         JOIN (SELECT retained.summary_id,retained.member_ordinal,(SELECT dense.dense_id FROM temp.surface_dense dense WHERE dense.blob_id=selected.blob_id
+                      AND dense.id_space=1 AND dense.surface_ordinal=retained.import_surface_ordinal) AS import_site,
+                    retained.importer_container,retained.target_container,retained.module_name,
+                    retained.relative_level,retained.requested_name,retained.bound_name,retained.form,retained.state
+                 FROM main.python_unit_summary_imports retained
+                 JOIN temp.selected_unit_member_mounts selected
+                   ON selected.summary_id=retained.summary_id AND selected.member_ordinal=retained.member_ordinal) route
                            ON route.summary_id=member.summary_id AND route.member_ordinal=member.member_ordinal
                          WHERE member.summary_id=?2 AND member.blob_id=authored.blob_id
                            AND member.rel_path=?3 AND route.import_site=authored.import_site
                            AND route.state='provider_open')
                        AND NOT EXISTS(
-                         SELECT 1 FROM resolution_unit_summary_members member
-                         JOIN python_unit_summary_imports route
+                         SELECT 1 FROM (SELECT retained.summary_id,retained.member_ordinal,retained.rel_path,selected.blob_id
+                 FROM main.resolution_unit_summary_members retained
+                 JOIN temp.selected_unit_member_mounts selected
+                   ON selected.summary_id=retained.summary_id AND selected.member_ordinal=retained.member_ordinal) member
+                         JOIN (SELECT retained.summary_id,retained.member_ordinal,(SELECT dense.dense_id FROM temp.surface_dense dense WHERE dense.blob_id=selected.blob_id
+                      AND dense.id_space=1 AND dense.surface_ordinal=retained.import_surface_ordinal) AS import_site,
+                    retained.importer_container,retained.target_container,retained.module_name,
+                    retained.relative_level,retained.requested_name,retained.bound_name,retained.form,retained.state
+                 FROM main.python_unit_summary_imports retained
+                 JOIN temp.selected_unit_member_mounts selected
+                   ON selected.summary_id=retained.summary_id AND selected.member_ordinal=retained.member_ordinal) route
                            ON route.summary_id=member.summary_id AND route.member_ordinal=member.member_ordinal
                          WHERE member.summary_id=?2 AND member.blob_id=authored.blob_id
                            AND member.rel_path=?3 AND route.import_site=authored.import_site
@@ -7953,6 +8239,9 @@ impl SelectedResolutionOperation<'_, '_> {
             .ready
             .lexical_source()
             .with_forward_reference_fragments(fragments);
+        // The request's coverage proof, not a second one: uncovered overlay
+        // members leave every staged binding incomplete.
+        let coverage = self.python_coverage_completion(environment);
         self.with_python_forward_inputs(
             environment.summary,
             environment.python_version,
@@ -7974,7 +8263,10 @@ impl SelectedResolutionOperation<'_, '_> {
                         let mut project_label = |operation: &mut crate::analyzer::resolution::FactResolutionOperation<'_>,
                             provider: &mut dyn crate::analyzer::resolution::DemandRootProvider,
                             reference: SemanticId,
-                            answer: FactResolutionAnswer| -> Result<(FactResolutionAnswer, Option<Vec<SemanticId>>)> {
+                            mut answer: FactResolutionAnswer| -> Result<(FactResolutionAnswer, Option<Vec<SemanticId>>)> {
+                            if coverage != ResolutionCompletion::Complete {
+                                answer.combine_binding_completion(&coverage);
+                            }
                             let (named, classes, callee_complete) = project_python_named_argument(
                                 &self.ready, operation, provider, reference, environment.summary,
                                 cancellation, session, mutations,
@@ -8004,7 +8296,7 @@ impl SelectedResolutionOperation<'_, '_> {
                                     hash.field("reference", format!("{reference:?}").as_bytes());
                                     hash.field("reason", message.as_bytes());
                                     let reason = self.ready.context_identities.named_semantic(
-                                        hash.finish(), "python_named_argument_open", &message,
+                                        hash.finish(), "python_named_argument_open", crate::analyzer::resolution::ReasonDeterminism::Unaudited, &message,
                                     );
                                     (Vec::new(), ResolutionCompletion::incomplete([
                                         ResolutionIncompleteReason::UnsupportedSemantic(reason),
@@ -8015,6 +8307,9 @@ impl SelectedResolutionOperation<'_, '_> {
                                 metadata, targets, completion,
                             );
                             projected.query_obligations = answer.query_obligations;
+                            if coverage != ResolutionCompletion::Complete {
+                                projected.combine_binding_completion(&coverage);
+                            }
                             Ok((projected, scoped))
                         };
                         operation.stage_all_reference_batches_with_projection(
@@ -8220,6 +8515,11 @@ impl SelectedResolutionOperation<'_, '_> {
     > {
         use super::native_units::{SelectedNativeReferenceUnits, project_native_definition_units};
         let cancellation = session.cancellation().cloned().unwrap_or_default();
+        // The request's coverage proof, not a second one: a reference in or through
+        // an uncovered overlay member is never a complete answer, and never an
+        // empty one.
+        let coverage = self.python_coverage_completion(environment);
+        let coverage_labels = self.python_coverage_labels(environment).join(", ");
         let mut run = || -> Result<_> {
             let locator = SelectedSemanticLocator::for_reference_range(
                 "python",
@@ -8227,22 +8527,25 @@ impl SelectedResolutionOperation<'_, '_> {
                 range.start,
                 range.end,
             );
-            let reference =
-                match self.python_definition_reference(&locator, &cancellation, session)? {
-                    LocatedSemantic::Found(reference) => reference,
-                    LocatedSemantic::Missing => {
-                        return self.finish_native(
-                            SelectedResolutionLocated::Missing,
+            let reference = match self.python_definition_reference(
+                &locator,
+                &cancellation,
+                session,
+            )? {
+                LocatedSemantic::Found(reference) => reference,
+                LocatedSemantic::Missing => {
+                    return self.finish_native(
+                            SelectedResolutionLocated::Missing(crate::analyzer::store::resolution_operation::ReferenceInventoryCompleteness::Unavailable),
                             &ResolutionCompletion::Complete,
                             &cancellation,
                         );
-                    }
-                    LocatedSemantic::Cancelled => {
-                        return Ok(SelectedResolutionOperationOutcome::Cancelled(
-                            cancelled_completion(),
-                        ));
-                    }
-                };
+                }
+                LocatedSemantic::Cancelled => {
+                    return Ok(SelectedResolutionOperationOutcome::Cancelled(
+                        cancelled_completion(),
+                    ));
+                }
+            };
             let context = self.empty_contexts(&ResolutionCompletion::Complete)?;
             let Some(blueprint) = self.prepare_prefix_blueprint(context, &cancellation)? else {
                 return Ok(SelectedResolutionOperationOutcome::Cancelled(
@@ -8333,6 +8636,10 @@ impl SelectedResolutionOperation<'_, '_> {
                             return Ok(Err(cancelled_completion()));
                         }
                     }
+                    // After the definition-only replies above, which restate completeness.
+                    if coverage != ResolutionCompletion::Complete {
+                        answer.combine_binding_completion(&coverage);
+                    }
                     // Binding identity is independent of invocation/application completion.
                     let mut named_reasons =
                         named_reason_details(&self.ready, answer.binding().completion())?;
@@ -8394,8 +8701,20 @@ impl SelectedResolutionOperation<'_, '_> {
                                         let source_root_gap = if matches!(&definitions, SelectedNativeDefinitions::Ready(units) if units.is_empty()) {
                         source_root_gap(self.ready.inventory.connection(), environment.summary, &external_imports.borrow().observed_imports)?
                     } else { None };
-                    let selected_external_imports = if source_root_gap.is_some() { Vec::new() } else {
+                    // Provider-open routes come from the summary rows. With an uncovered
+                    // member they cannot admit a cross-language or external identity.
+                    let selected_external_imports = if source_root_gap.is_some() || coverage != ResolutionCompletion::Complete { Vec::new() } else {
                         selected_external_imports(external_imports, reference)
+                    };
+                    // A keyword definition projects the callee's parameters from summary
+                    // rows and is returned before the binding's completion is read.
+                    let named_argument = match named_argument {
+                        Some(super::native_units::SelectedNativeNamedArgument::Resolved(..) | super::native_units::SelectedNativeNamedArgument::Absent(_))
+                            if coverage != ResolutionCompletion::Complete =>
+                        {
+                            Some(super::native_units::SelectedNativeNamedArgument::Incomplete(coverage_labels.clone()))
+                        }
+                        other => other,
                     };
                     let dispatch = match &definitions {
                         SelectedNativeDefinitions::Ready(definitions)
@@ -8583,9 +8902,9 @@ impl SelectedResolutionOperation<'_, '_> {
                         .is_some_and(|metadata| !metadata.is_callable_reference());
                     if standalone {
                         let prerequisite = operation.resolve_prerequisite_for_test(reference, &mut *provider)?;
-                        if let Some((_, _, Some(entry))) = arena.borrow().selected_universe.get(&reference) {
+                        if let Some((owner, _, Some(entry))) = arena.borrow().selected_universe.get(&reference) {
                             assert!(prerequisite.as_ref().is_some_and(|answer|
-                                answer.binding().completion() == &ResolutionCompletion::Complete
+                                answer.binding().completion() == arena.borrow().endpoint_completions.get(owner).unwrap_or(&ResolutionCompletion::Complete)
                                     && !answer.binding().targets().is_empty()),
                                 "selected universe prerequisite must reach Ready: {path}:{start}..{end} {reference:?}; answer={:?}; certificate={:?}", prerequisite.as_ref().map(|answer| answer.binding()), arena.borrow().selected_universe.get(&reference));
                             use std::fmt::Write;
@@ -8687,7 +9006,13 @@ mod curated_star_prefix_plan_tests {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store.conn.execute_fixture(|conn| {
             prepare_pin_context(conn);
-            conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+            conn.execute_batch("PRAGMA foreign_keys=OFF;
+                INSERT INTO temp.selected_workspace_revisions VALUES('plan','python',1,1);
+                INSERT INTO resolution_unit_summaries(summary_id,lang,unit_kind,unit_key,summary_digest,producer_epoch,derivation_identity,complete,output_digest,publication_state)
+                  VALUES(1,'python','python_environment',zeroblob(32),zeroblob(32),'plan',x'0101010101010101010101010101010101010101010101010101010101010101',1,zeroblob(32),'complete');").unwrap();
+            let list_digest = crate::analyzer::store::surface_relations::list_digest(
+                crate::analyzer::store::surface_relations::PYTHON_RELATIONS,
+            );
             for index in 1..=80_i64 {
                 let importer = index * 3;
                 let parent = importer + 1;
@@ -8701,8 +9026,12 @@ mod curated_star_prefix_plan_tests {
                     (parent, &parent_path),
                     (child, &child_path),
                 ] {
+                    let oid = format!("{ordinal:040x}");
+                    conn.execute("INSERT INTO blobs(id,blob_oid,lang,generation) VALUES(?1,?2,'python',1)", params![ordinal,oid]).unwrap();
+                    conn.execute("INSERT INTO workspace_file_versions(workspace_id,lang,generation,rel_path,blob_oid,projection_digest,valid_from) VALUES('plan','python',1,?1,?2,printf('%064d',0),1)", params![path,oid]).unwrap();
+                    conn.execute("INSERT INTO surface_sets(set_id,blob_id,generation,source_facts_version,producer_epoch,publication_witness,list_digest,fingerprint) VALUES(?1,?1,1,1,'plan',?1,?2,zeroblob(32))", params![ordinal,list_digest.as_slice()]).unwrap();
                     conn.execute(
-                        "INSERT INTO resolution_unit_summary_members VALUES(1,?1,?1,?2,'source')",
+                        "INSERT INTO resolution_unit_summary_members(summary_id,member_ordinal,blob_id,rel_path,source_role,member_surface_fingerprint) VALUES(1,?1,?1,?2,'source',zeroblob(32))",
                         params![ordinal, path],
                     )
                     .unwrap();
@@ -8712,6 +9041,7 @@ mod curated_star_prefix_plan_tests {
                     )
                     .unwrap();
                 }
+                conn.execute("INSERT INTO surface_ids VALUES(?1,1,0,0)", [importer]).unwrap();
                 let parent_container = format!("parent-{index}");
                 let child_container = format!("child-{index}");
                 for (container, module, parent_module, kind, path, ordinal) in [
@@ -8725,7 +9055,7 @@ mod curated_star_prefix_plan_tests {
                     .unwrap();
                 }
                 conn.execute(
-                    "INSERT INTO python_unit_summary_imports VALUES(1,?1,0,?2,?3,?4,0,'','','star','activation_open')",
+                    "INSERT INTO python_unit_summary_imports(summary_id,member_ordinal,importer_container,target_container,module_name,relative_level,requested_name,bound_name,form,state,import_surface_ordinal) VALUES(1,?1,?2,?3,?4,0,'','','star','activation_open',0)",
                     params![importer, format!("importer-{index}"), parent_container, package],
                 )
                 .unwrap();
@@ -8735,7 +9065,7 @@ mod curated_star_prefix_plan_tests {
                 )
                 .unwrap();
                 conn.execute(
-                    "INSERT INTO python_unit_summary_export_names VALUES(1,?1,'wildcard','child',NULL)",
+                    "INSERT INTO python_unit_summary_export_names(summary_id,container_path,surface,name,slot_surface_ordinal) VALUES(1,?1,'wildcard','child',NULL)",
                     [&parent_container],
                 )
                 .unwrap();
@@ -8758,8 +9088,8 @@ mod curated_star_prefix_plan_tests {
                     .collect::<rusqlite::Result<Vec<_>>>()
                     .unwrap();
                 for table in [
-                    "member", "imports", "parent", "surface", "exported", "child",
-                    "child_member", "mounted",
+                    "retained", "members", "summaries", "mounts", "mounted_blob", "blobs", "sets", "ids",
+                    "parent", "surface", "exported", "child", "mounted",
                 ] {
                     assert!(
                         plan.iter().any(|step| step.starts_with(&format!("SEARCH {table} "))),
@@ -8770,6 +9100,9 @@ mod curated_star_prefix_plan_tests {
                     plan.iter().all(|step| !step.contains("AUTOMATIC")),
                     "{state}: no automatic indexes: {plan:?}"
                 );
+                assert!(plan.iter().all(|step| !step.contains("MATERIALIZE")
+                    && !step.starts_with("SCAN sets ") && !step.starts_with("SCAN ids ")),
+                    "{state}: surface translation must remain point reads: {plan:?}");
             }
         });
     }

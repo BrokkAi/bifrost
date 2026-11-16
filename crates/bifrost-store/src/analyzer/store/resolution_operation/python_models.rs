@@ -67,6 +67,68 @@ pub(in crate::analyzer::store) fn type_owner(
         },
     )
 }
+/// The class a hierarchy edge names. Two selected providers that declare the
+/// same class (same symbol id and qualified name) make `model_type_owner`
+/// answer Ambiguous, because their member rows differ. Ancestry does not: the
+/// bases are adjudicated across all providers by the runtime-base authority,
+/// so the class is one owner and the first provider (by pack digest) names it.
+/// Declarations that disagree on id, name or kind stay unresolved.
+pub(in crate::analyzer::store) fn agreed_class_owner(
+    authority: &dyn SelectedModelAuthority,
+    active: &super::super::active_models::ResolvedActiveSemanticModels,
+    ty: &TypeRef,
+    cancellation: &CancellationToken,
+) -> Result<Option<SemanticModelSymbol>> {
+    let answer = authority.model_type_owner(
+        "python",
+        ty,
+        &active.model_provider_selection(),
+        cancellation,
+    );
+    if cancellation.is_cancelled() {
+        return Ok(None);
+    }
+    match answer.map_err(|error| StoreError::new(format!("model type owner: {error:?}")))? {
+        ModelTypeOwnerAnswer::Unique { declaration, .. }
+            if declaration.kind == SemanticModelSymbolKind::Class =>
+        {
+            Ok(Some(declaration))
+        }
+        ModelTypeOwnerAnswer::Ambiguous(mut refs) => {
+            refs.sort_by(|a, b| {
+                (
+                    &a.provider.pack_digest,
+                    &a.provider.pack_id,
+                    &a.provider.pack_version,
+                )
+                    .cmp(&(
+                        &b.provider.pack_digest,
+                        &b.provider.pack_id,
+                        &b.provider.pack_version,
+                    ))
+            });
+            let mut chosen: Option<SemanticModelSymbol> = None;
+            for reference in &refs {
+                let Some(owner) = declaration(authority, active, reference, cancellation)? else {
+                    return Ok(None);
+                };
+                let owner = owner.declaration;
+                if owner.kind != SemanticModelSymbolKind::Class || owner.provenance.ambiguous {
+                    return Ok(None);
+                }
+                match &chosen {
+                    None => chosen = Some(owner),
+                    Some(first)
+                        if first.id == owner.id && first.qualified_name == owner.qualified_name => {
+                    }
+                    Some(_) => return Ok(None),
+                }
+            }
+            Ok(chosen)
+        }
+        _ => Ok(None),
+    }
+}
 impl super::SelectedResolutionOperation<'_, '_> {
     /// Return only an exact, complete class owner in this operation's selected
     /// model authority. An overlay spelling alone cannot establish ownership.
@@ -182,21 +244,16 @@ impl super::python_demand::PythonRules<'_, '_, '_> {
             .cloned()
             .collect::<Vec<_>>();
         path.extend_from_slice(&selected.remaining_member_path);
-        match self
-            .ready
-            .store
-            .lend_selected_reader(self.ready.inventory.connection(), || {
-                analyzer.admit_selected_external_binding(
-                    &SelectedExternalBindingRequest {
-                        file: &file,
-                        language: Language::Python,
-                        snapshot,
-                        selected,
-                        path: &path,
-                    },
-                    self.cancellation,
-                )
-            }) {
+        match analyzer.admit_selected_external_binding(
+            &SelectedExternalBindingRequest {
+                file: &file,
+                language: Language::Python,
+                snapshot,
+                selected,
+                path: &path,
+            },
+            self.cancellation,
+        ) {
             SelectedExternalBindingRead::Admitted(symbol) => Ok(Some(self.model_token(&symbol))),
             SelectedExternalBindingRead::Refused { code, detail } => {
                 self.observations

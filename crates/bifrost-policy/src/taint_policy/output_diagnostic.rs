@@ -14,6 +14,15 @@ pub(super) struct OutputDiagnosticLocation {
 }
 
 impl OutputDiagnosticLocation {
+    fn retained_heap(&self, heap: &mut RetainedHeap) {
+        let Self {
+            path,
+            span: _,
+            region: _,
+        } = self;
+        heap.add(path.capacity());
+    }
+
     /// Accept exactly the locations `policy_location` can rebuild: a decoded
     /// row that passes here must never reach its `expect`.
     fn validate(&self) -> Result<(), ()> {
@@ -151,6 +160,81 @@ pub(super) enum CompositionText {
 }
 
 impl CompositionText {
+    fn retained_heap(&self, heap: &mut RetainedHeap) {
+        match self {
+            Self::Object { site, procedure } => {
+                heap.add(site.capacity());
+                heap.add(procedure.capacity());
+            }
+            Self::Execution { procedure }
+            | Self::Callers { procedure }
+            | Self::Interior { procedure }
+            | Self::Open { procedure }
+            | Self::Endpoints { procedure }
+            | Self::StoreInventory { procedure } => heap.add(procedure.capacity()),
+            Self::Dispatch { call, procedure }
+            | Self::ModelOutputStorage { call, procedure }
+            | Self::Model { call, procedure } => {
+                heap.add(call.capacity());
+                heap.add(procedure.capacity());
+            }
+            Self::UnknownSummaryEffects {
+                call,
+                procedure,
+                summary_path,
+                summary,
+                target,
+            } => {
+                for text in [call, procedure, summary_path, summary, target] {
+                    heap.add(text.capacity());
+                }
+            }
+            Self::PartialFlows { procedure, outcome } => {
+                heap.add(procedure.capacity());
+                heap.add(outcome.capacity());
+            }
+            Self::MissingCaptureBinding { procedure, slot } => {
+                heap.add(procedure.capacity());
+                heap.add(slot.capacity());
+            }
+            Self::UnplacedTransfer { procedure, carrier } => {
+                heap.add(procedure.capacity());
+                heap.add(carrier.capacity());
+            }
+            Self::CompositionBudget { lane } => heap.add(lane.capacity()),
+            Self::ProcedureCause {
+                label,
+                path,
+                procedure,
+                status,
+            } => {
+                for text in [label, path, procedure, status] {
+                    heap.add(text.capacity());
+                }
+            }
+            Self::CallSiteEvidence(CallSiteEvidenceText {
+                callee,
+                path,
+                start: _,
+                end: _,
+                status,
+                resolver_complete: _,
+                boundary_status,
+                gap,
+            }) => {
+                for text in [path, status, boundary_status]
+                    .into_iter()
+                    .chain(callee)
+                    .chain(gap)
+                {
+                    heap.add(text.capacity());
+                }
+            }
+            Self::ModeledOutput { path } => heap.add(path.capacity()),
+            Self::ExecutionRoots | Self::SemanticBudget | Self::Cancelled => {}
+        }
+    }
+
     pub(super) fn render(&self, detail: &str) -> String {
         match self {
             Self::Object { site, procedure } => {
@@ -255,7 +339,7 @@ impl std::fmt::Display for CallSiteEvidenceText {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "call `{}` at {} bytes {}..{} has snapshot input status {}; {}; resolver boundary status: {}; call semantic gap: {}",
+            "call `{}` at {} bytes {}..{} has dispatch status {}; {}; resolver boundary status: {}; call semantic gap: {}",
             self.callee
                 .as_deref()
                 .unwrap_or("<unavailable from call shape>"),
@@ -324,6 +408,91 @@ pub(super) enum OutputDiagnosticRecord {
 }
 
 impl OutputDiagnosticRecord {
+    /// Visit owned children only; the enclosing record storage is charged by its owner.
+    pub(super) fn retained_heap(&self, heap: &mut RetainedHeap) {
+        match self {
+            Self::Incompleteness {
+                kind,
+                cause: _,
+                family,
+                primary,
+                detail,
+            }
+            | Self::Finding {
+                kind,
+                cause: _,
+                family,
+                primary,
+                detail,
+            } => {
+                kind.retained_heap(heap);
+                heap.add(family.capacity());
+                heap.add(detail.capacity());
+                if let Some(primary) = primary {
+                    primary.retained_heap(heap);
+                }
+            }
+            Self::ConditionalSanitizerDecline {
+                site,
+                sanitizer,
+                reason,
+            } => {
+                site.retained_heap(heap);
+                heap.add(sanitizer.capacity());
+                match reason {
+                    SanitizerDeclineReason::GuardEvidence { detail }
+                    | SanitizerDeclineReason::Admission { detail } => heap.add(detail.capacity()),
+                }
+            }
+            Self::ProviderRefusal {
+                site,
+                reason,
+                run_incomplete: _,
+                cause: _,
+            } => {
+                site.retained_heap(heap);
+                match reason {
+                    RefusalReason::UnsupportedReturnProjection { record, port } => {
+                        heap.add(record.capacity());
+                        heap.add(port.capacity());
+                    }
+                    RefusalReason::ReturnProjection { reason: _, detail } => {
+                        heap.add(detail.capacity())
+                    }
+                    RefusalReason::AmbiguousCallSite(spans) => heap.vec(spans),
+                    RefusalReason::UnidentifiedFormal { name, detail } => {
+                        heap.add(name.capacity());
+                        match detail {
+                            FormalBindingGap::MultipleActuals(actuals) => heap.vec(actuals),
+                            FormalBindingGap::FormalNamesUnavailable
+                            | FormalBindingGap::ArgumentRelationUnavailable
+                            | FormalBindingGap::CandidateDisagreement {
+                                previous: _,
+                                other: _,
+                            }
+                            | FormalBindingGap::CandidateDoesNotDeclare
+                            | FormalBindingGap::CandidatesDoNotAgree
+                            | FormalBindingGap::CandidateFormalNamesUnavailable
+                            | FormalBindingGap::UnresolvedCalleeWithoutNamedActual
+                            | FormalBindingGap::NoRetainedBinding => {}
+                        }
+                    }
+                    RefusalReason::MissingOperand {
+                        port,
+                        arguments: _,
+                        lowering_gap: _,
+                    } => heap.add(port.capacity()),
+                    RefusalReason::SelectedPatternProofStopped { detail, causes: _ } => {
+                        if let std::borrow::Cow::Owned(detail) = detail {
+                            heap.add(detail.capacity());
+                        }
+                    }
+                    RefusalReason::NoSemanticCallSite | RefusalReason::NoValueObservation => {}
+                }
+            }
+        }
+    }
+
     /// A record's cause identity is independent of its presentation detail,
     /// except for a semantic budget stop, which names where it stopped.
     pub(super) fn typed_identity(&self) -> Vec<u8> {
@@ -495,7 +664,7 @@ impl OutputDiagnosticRecord {
 }
 
 pub(super) fn render(record: &OutputDiagnosticRecord) -> PolicyDiagnostic {
-    match record {
+    let diagnostic = match record {
         OutputDiagnosticRecord::Incompleteness {
             kind,
             family,
@@ -517,7 +686,9 @@ pub(super) fn render(record: &OutputDiagnosticRecord) -> PolicyDiagnostic {
             };
             let code = if matches!(kind, CompositionText::SemanticBudget) {
                 PolicyDiagnosticCode::CodeQuery {
-                    code: CodeQueryDiagnosticCode::SemanticBudgetExhausted,
+                    code: CodeQueryDiagnosticCode::SemanticBudgetExhausted
+                        .try_into()
+                        .expect("non-partial query code"),
                 }
             } else {
                 PolicyDiagnosticCode::EvaluationFailure
@@ -532,6 +703,7 @@ pub(super) fn render(record: &OutputDiagnosticRecord) -> PolicyDiagnostic {
                     .as_ref()
                     .map(OutputDiagnosticLocation::policy_location),
                 Vec::new(),
+                crate::RelatedLocationOmissions::Known(0),
             )
             .expect("captured bounded diagnostic")
         }
@@ -555,6 +727,7 @@ pub(super) fn render(record: &OutputDiagnosticRecord) -> PolicyDiagnostic {
                 )),
                 Some(site.policy_location()),
                 Vec::new(),
+                crate::RelatedLocationOmissions::Known(0),
             )
             .expect("bounded sanitizer decline")
         }
@@ -571,12 +744,26 @@ pub(super) fn render(record: &OutputDiagnosticRecord) -> PolicyDiagnostic {
                 site.span.expect("refusal selector range")[1]
             );
             let message = match reason {
+                RefusalReason::UnsupportedReturnProjection { record, port } => format!(
+                    "taint return projection refused at {site_text}: UnsupportedReturnProjection: record {record}, port {port}; projected return ports are supported only for sources"
+                ),
+                RefusalReason::ReturnProjection { reason, detail } => {
+                    format!("taint return projection refused at {site_text}: {reason:?}: {detail}")
+                }
                 RefusalReason::AmbiguousCallSite(ranges) => format!(
                     "taint semantic binding refused one site: the selector row at {site_text} identifies {} distinct semantic call sites {ranges:?}, so it names no single call",
                     ranges.len()
                 ),
                 RefusalReason::NoSemanticCallSite => format!(
                     "taint semantic binding refused one site: the selector row at {site_text} does not identify a semantic call site"
+                ),
+                RefusalReason::SelectedPatternProofStopped { detail, .. } => format!(
+                    "taint semantic binding refused one site: the matched source row at {site_text} produced no complete point-sensitive value observation{}",
+                    if detail.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {detail}")
+                    },
                 ),
                 RefusalReason::NoValueObservation => format!(
                     "taint semantic binding refused one site: the matched source row at {site_text} produced no point-sensitive value observation"
@@ -607,6 +794,16 @@ pub(super) fn render(record: &OutputDiagnosticRecord) -> PolicyDiagnostic {
                 },
                 message,
             )
+        }
+    };
+    match record {
+        OutputDiagnosticRecord::Incompleteness { cause, .. }
+        | OutputDiagnosticRecord::Finding { cause, .. }
+        | OutputDiagnosticRecord::ProviderRefusal { cause, .. } => {
+            diagnostic.with_execution_cause(cause.execution_cause())
+        }
+        OutputDiagnosticRecord::ConditionalSanitizerDecline { .. } => {
+            diagnostic.with_execution_cause(None)
         }
     }
 }
@@ -693,7 +890,7 @@ mod tests {
 
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
-        "#9947: provider refusal with a byte span failed Output decode"
+        "#12300: stopped source details lost cause classes and refused-only Output diagnostics; preserves #9947 byte-span decode"
     )]
     fn provider_refusal_span_only_round_trips() {
         let record = OutputDiagnosticRecord::provider_refusal(
@@ -708,6 +905,108 @@ mod tests {
         decoded.validate().unwrap();
         assert_eq!(record, decoded);
         let _ = render(&decoded);
+
+        // #12300: first proof-stop prose must not hide later typed causes,
+        // including on a refused-only compilation with no Output unit.
+        use brokk_bifrost_analysis::analyzer::i_analyzer::SELECTED_PATTERN_ALIAS_LIMIT_REASON;
+        use brokk_bifrost_analysis::analyzer::{
+            QueryReadIncomplete, read_ledger::DerivationExecutionCause as Cause,
+        };
+        let mut causes = SelectorGapCauses::default();
+        for reason in [
+            QueryReadIncomplete::ProofStopped {
+                reason: SELECTED_PATTERN_ALIAS_LIMIT_REASON,
+                cause: None,
+            },
+            QueryReadIncomplete::ProofStopped {
+                reason: "unregistered_stop",
+                cause: None,
+            },
+            QueryReadIncomplete::ProofStopped {
+                reason: "budget_stop",
+                cause: Some(Cause::Budget),
+            },
+            QueryReadIncomplete::Cancelled,
+        ] {
+            causes.insert_read(&reason);
+        }
+        assert!(causes.content && causes.provider && causes.budget && causes.cancelled);
+        let borrowed = OutputDiagnosticRecord::provider_refusal(
+            "src/main.rs".to_owned(),
+            [86, 87],
+            RefusalReason::SelectedPatternProofStopped {
+                detail: std::borrow::Cow::Borrowed(SELECTED_PATTERN_ALIAS_LIMIT_REASON),
+                causes,
+            },
+            true,
+            causes.admission_cause(IncompleteCause::Content),
+        );
+        let encoded = serde_json::to_vec(&borrowed).unwrap();
+        let decoded: OutputDiagnosticRecord = serde_json::from_slice(&encoded).unwrap();
+        decoded.validate().unwrap();
+        assert_eq!(borrowed, decoded);
+        let OutputDiagnosticRecord::ProviderRefusal {
+            reason: RefusalReason::SelectedPatternProofStopped { detail, .. },
+            ..
+        } = &decoded
+        else {
+            panic!("proof stop record");
+        };
+        assert!(matches!(detail, std::borrow::Cow::Owned(_)));
+        assert!(
+            serde_json::to_string(&render(&decoded))
+                .unwrap()
+                .contains(SELECTED_PATTERN_ALIAS_LIMIT_REASON)
+        );
+        let notice = super::super::RefusalNotice {
+            message: SELECTED_PATTERN_ALIAS_LIMIT_REASON.to_owned(),
+            impact: PolicyDiagnosticImpact::RunIncomplete,
+            record: Some(decoded.clone()),
+        };
+        let payload = super::super::compiled_payload(
+            &crate::definition::PolicyId::new("test.proof-stop").unwrap(),
+            crate::finding::PolicyWorkReport::default(),
+            vec![notice],
+            None,
+            false,
+            Vec::new(),
+            Vec::new(),
+            |_| String::new(),
+            crate::budget::PolicyBudget::default().max_related_locations_per_finding(),
+        );
+        assert!(!payload.completion.is_reliable());
+        let projected = payload.diagnostics.causes();
+        for cause in [
+            None,
+            Some(Cause::Provider),
+            Some(Cause::Budget),
+            Some(Cause::Cancelled),
+        ] {
+            assert!(
+                projected.iter().any(|item| item.execution_cause()
+                    == crate::finding::PolicyDiagnosticExecutionCause::Known(cause)),
+                "{projected:?}"
+            );
+        }
+        let mut damaged = serde_json::to_value(&decoded).unwrap();
+        // Both detail and the finite cause inventory are required members.
+        let stopped = damaged["provider_refusal"]["reason"]["SelectedPatternProofStopped"]
+            .as_object_mut()
+            .unwrap();
+        stopped.remove("causes");
+        assert!(serde_json::from_value::<OutputDiagnosticRecord>(damaged).is_err());
+        let mut damaged = serde_json::to_value(&decoded).unwrap();
+        damaged["provider_refusal"]["reason"]["SelectedPatternProofStopped"]
+            .as_object_mut()
+            .unwrap()
+            .remove("detail");
+        assert!(serde_json::from_value::<OutputDiagnosticRecord>(damaged).is_err());
+        let mut damaged = serde_json::to_value(&decoded).unwrap();
+        damaged["provider_refusal"]["reason"]["SelectedPatternProofStopped"]["causes"]
+            .as_object_mut()
+            .unwrap()
+            .remove("provider");
+        assert!(serde_json::from_value::<OutputDiagnosticRecord>(damaged).is_err());
     }
 
     fn artifact(path: &str) -> PolicySourceLocation {

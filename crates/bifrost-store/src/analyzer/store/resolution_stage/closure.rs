@@ -11,18 +11,23 @@ use brokk_bifrost_core::analyzer::source_facts::{SourceDeclarationId, SourceOccu
 use brokk_bifrost_core::analyzer::structural::resolution::ResolutionGapOriginKind;
 use rusqlite::{Connection, OptionalExtension, params};
 
-pub(super) const MACRO_GAP_REASONS_SQL: &str = "SELECT DISTINCT ?4+gap.reason AS runtime FROM main.source_rust_macro_inputs input CROSS JOIN main.resolution_gap_reasons gap ON gap.blob_id=input.blob_id AND gap.site=input.native_gap_site AND gap.origin IN(?5,?6) WHERE input.blob_id=?1 AND input.invocation_occurrence_id=?2 ORDER BY runtime";
+pub(super) const MACRO_GAP_REASONS_SQL: &str = "SELECT DISTINCT ?4+gap.reason AS runtime FROM main.source_rust_macro_inputs input CROSS JOIN main.resolution_gap_reasons gap ON gap.blob_id=input.blob_id AND gap.site=input.native_gap_site AND gap.origin IN(?5,?6,?7) WHERE input.blob_id=?1 AND input.invocation_occurrence_id=?2 ORDER BY runtime";
 
 /// Gaps in the invocation's argument references that capsule lowering can close.
 /// This does not expand the transcriber: even reference-free arguments can
 /// produce declarations or impls. UnexpandedItemMacro therefore remains open.
-fn origins() -> (i64, i64) {
+/// Macro activation is closed only by callers that proved a selected definition
+/// for this invocation; an undecided textual definition never reaches admission.
+fn origins() -> (i64, i64, i64) {
     (
         gap_origin_code(LoweringGapOrigin::from_kind(
             ResolutionGapOriginKind::UnsupportedScopeOrBinder,
         )),
         gap_origin_code(LoweringGapOrigin::from_kind(
             ResolutionGapOriginKind::UnsupportedExpression,
+        )),
+        gap_origin_code(LoweringGapOrigin::from_kind(
+            ResolutionGapOriginKind::UnprovenActivation,
         )),
     )
 }
@@ -40,7 +45,7 @@ pub(super) fn insert_capsule_closed_reasons(
  crate::analyzer::store::resolution_selection::note_selected_static_sql_capacity(16, sql.capacity());
  sql
 });
-    let (first, second) = origins();
+    let (first, second, activation) = origins();
     connection.execute(
         sql,
         params![
@@ -49,7 +54,8 @@ pub(super) fn insert_capsule_closed_reasons(
             producer,
             i64::from(host.ordinal().get()) << 32,
             first,
-            second
+            second,
+            activation
         ],
     )?;
     Ok(())
@@ -161,7 +167,7 @@ impl SelectedResolutionStage<'_, '_> {
         let result = self.with_generated_admission(cancellation, |connection| {
             require_selected_host(connection, host)?;
             require_selected_host(connection, proof_owner)?;
-            let (first, second) = origins();
+            let (first, second, activation) = origins();
             let mut statement = connection.prepare_cached(MACRO_GAP_REASONS_SQL)?;
             let mut cursor = statement.query(params![
                 host.blob_id(),
@@ -169,7 +175,8 @@ impl SelectedResolutionStage<'_, '_> {
                 rusqlite::types::Value::Null,
                 i64::from(host.ordinal().get()) << 32,
                 first,
-                second
+                second,
+                activation
             ])?;
             let mut reasons = Vec::new();
             while let Some(row) = cursor.next()? {

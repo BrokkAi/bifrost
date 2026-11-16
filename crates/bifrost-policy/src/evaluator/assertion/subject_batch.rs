@@ -5,8 +5,8 @@ use std::hash::Hash;
 use std::sync::{Arc, Mutex};
 
 use brokk_bifrost_analysis::analyzer::ReadKey;
-use brokk_bifrost_analysis::analyzer::capture_query_reads;
 use brokk_bifrost_analysis::analyzer::content_identity::WorkspaceContentIdentity;
+use brokk_bifrost_analysis::analyzer::i_analyzer::capture_query_reads_judged;
 use brokk_bifrost_rql::structural::search::UnitExecutionResult;
 
 use super::*;
@@ -73,6 +73,8 @@ trait RetainableRows: Clone {
     fn exhaustive(&self) -> bool;
     /// Retained rows plus evidence records, before dependency keys.
     fn weight(&self) -> usize;
+    /// The execution's reuse verdict, which the batch's capture joins.
+    fn reuse(&self) -> ReuseVerdict;
 }
 
 impl RetainableRows for Arc<ExecutedQueryRows> {
@@ -84,6 +86,10 @@ impl RetainableRows for Arc<ExecutedQueryRows> {
 
     fn weight(&self) -> usize {
         self.items.len().saturating_add(self.evidence.len())
+    }
+
+    fn reuse(&self) -> ReuseVerdict {
+        self.reuse
     }
 }
 
@@ -100,6 +106,10 @@ impl RetainableRows for UnitExecutionResult {
             .len()
             .saturating_mul(2)
             .saturating_add(self.depth_answer_row_count())
+    }
+
+    fn reuse(&self) -> ReuseVerdict {
+        self.reuse
     }
 }
 
@@ -305,7 +315,11 @@ impl<'a> SubjectQueryBatch<'a> {
             return product.rows.clone();
         }
 
-        let (rows, reads) = capture_query_reads(analyzer, execute);
+        let (rows, reads) = capture_query_reads_judged(analyzer, || {
+            let rows = execute();
+            let reuse = rows.reuse();
+            (rows, reuse)
+        });
         if rows.exhaustive() && !cancelled() && reads.is_bounded() {
             let persistence_refusals = reads.persistence_refusals();
             let reads = reads.keys();
@@ -378,6 +392,7 @@ mod tests {
         let query = assertion_subject_query(policy, &budget).unwrap();
         let flow_state = brokk_bifrost_flow::FlowWorkspaceState::default();
         let context = PolicyEvaluationContext {
+            acceptance_hint: None,
             analyzer: workspace.analyzer(),
             workspace: Some(&workspace),
             flow_state: &flow_state,
@@ -430,6 +445,7 @@ mod tests {
         let query = assertion_subject_query(policy, &budget).unwrap();
         let flow_state = brokk_bifrost_flow::FlowWorkspaceState::default();
         let context = PolicyEvaluationContext {
+            acceptance_hint: None,
             analyzer: workspace.analyzer(),
             workspace: Some(&workspace),
             flow_state: &flow_state,
@@ -496,6 +512,7 @@ mod tests {
         let query = assertion_subject_query(policy, &budget).unwrap();
         let flow_state = brokk_bifrost_flow::FlowWorkspaceState::default();
         let mut context = PolicyEvaluationContext {
+            acceptance_hint: None,
             analyzer: workspace.analyzer(),
             workspace: Some(&workspace),
             flow_state: &flow_state,
@@ -560,6 +577,7 @@ mod tests {
         let query = assertion_subject_query(registry.policies().next().unwrap(), &budget).unwrap();
         let flow_state = brokk_bifrost_flow::FlowWorkspaceState::default();
         let context = PolicyEvaluationContext {
+            acceptance_hint: None,
             analyzer: workspace.analyzer(),
             workspace: Some(&workspace),
             flow_state: &flow_state,

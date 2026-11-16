@@ -1,6 +1,6 @@
 //! Bounded Python definition points shared by navigation and receiver requests.
 
-use super::{PythonNativeOpen, open_python_native_request};
+use super::{PythonNativeOpen, PythonNativeRequest, open_python_native_request};
 use crate::analyzer::PythonAnalyzer;
 use crate::analyzer::python::external_authority::native::{
     PythonExternalAuthority, PythonExternalAuthorityResult, PythonExternalIdentityKind,
@@ -69,10 +69,20 @@ pub(crate) struct PythonReceiverRequest<'a> {
     python: &'a PythonAnalyzer,
     opened: PythonNativeOpen<'a>,
     artifacts: brokk_bifrost_analysis::analyzer::resolution::batch::ForwardCandidateArtifactCache,
-    /// Set once `opened` was dropped to free a writer-backed reader's mutex
-    /// for a legacy lookup. A released request answers `Unavailable`, and
-    /// `reader_excludes_store_access` stays true so every caller drops it.
-    released_for_store_access: bool,
+}
+
+impl<'a> PythonReceiverRequest<'a> {
+    /// Run `read` on the selected native request this receiver request holds,
+    /// or return `None` when opening it did not produce one.
+    pub(crate) fn with_native_request<R>(
+        &mut self,
+        read: impl FnOnce(&mut PythonNativeRequest<'a>) -> R,
+    ) -> Option<R> {
+        let PythonNativeOpen::Ready(request) = &mut self.opened else {
+            return None;
+        };
+        Some(read(request))
+    }
 }
 
 impl PythonReceiverRequest<'_> {
@@ -191,17 +201,6 @@ impl<'a> PythonReceiverRequest<'a> {
             }));
         if !typed_open {
             return result;
-        }
-        // The legacy lookup reads the store through its own checkouts. A
-        // writer-backed reader holds the writer mutex, so the request must be
-        // dropped first (#6018); a pooled reader keeps the request and its
-        // candidate cache.
-        if self.reader_excludes_store_access() {
-            self.opened = PythonNativeOpen::Unavailable {
-                kind: "native_request_released",
-                message: "the request released its writer-backed reader".into(),
-            };
-            self.released_for_store_access = true;
         }
         use brokk_bifrost_core::analyzer::query_token::QueryScope as _;
         let scope =
@@ -421,7 +420,7 @@ impl<'a> PythonReceiverRequest<'a> {
                         adapt_type_answer(query.site, Language::Python, answer)
                     }
                     SelectedResolutionOperationOutcome::Native(
-                        SelectedResolutionLocated::Missing,
+                        SelectedResolutionLocated::Missing(_),
                     ) => {
                         let mut outcome = unavailable_type(
                             query.site,
@@ -505,23 +504,7 @@ impl<'a> PythonReceiverRequest<'a> {
             python,
             opened,
             artifacts: Default::default(),
-            released_for_store_access: false,
         }
-    }
-
-    /// A writer-backed reader owns the store's writer mutex, so a request that
-    /// holds one must not outlive its lookup into the caller's store reads.
-    pub(crate) fn reader_excludes_store_access(&self) -> bool {
-        self.released_for_store_access
-            || match &self.opened {
-                PythonNativeOpen::Ready(request) => request
-                    .operation
-                    .ready
-                    .inventory
-                    .conn
-                    .excludes_store_access(),
-                PythonNativeOpen::Unavailable { .. } | PythonNativeOpen::Cancelled => false,
-            }
     }
 
     pub(crate) fn resolve_definition_with_call_evidence_bounded(
@@ -1029,7 +1012,7 @@ impl<'a> PythonReceiverRequest<'a> {
                         outcome
                     }
                     SelectedResolutionOperationOutcome::Native(
-                        SelectedResolutionLocated::Missing,
+                        SelectedResolutionLocated::Missing(_),
                     ) => {
                         let non_reference = query.tree.and_then(|tree| {
                             brokk_bifrost_core::analyzer::usages::reference_site::smallest_named_node_covering_with_scope(
@@ -1261,10 +1244,6 @@ pub(crate) fn resolve_type_bounded(
 }
 
 impl brokk_bifrost_analysis::analyzer::languages::ReceiverRequest for PythonReceiverRequest<'_> {
-    fn reader_excludes_store_access(&self) -> bool {
-        PythonReceiverRequest::reader_excludes_store_access(self)
-    }
-
     fn resolve_type(
         &mut self,
         query: brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery<'_>,
@@ -1301,30 +1280,6 @@ pub(crate) fn resolve_definition_bounded(
 }
 
 /// The same point admission for Python hooks that start from a source range.
-pub(crate) fn definition_at_range(
-    analyzer: &dyn brokk_bifrost_analysis::analyzer::IAnalyzer,
-    file: &brokk_bifrost_core::analyzer::ProjectFile,
-    source: &str,
-    tree: &tree_sitter::Tree,
-    range: std::ops::Range<usize>,
-    cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
-) -> Result<Option<(DefinitionLookupOutcome, CallEvidence)>, DerivationExecutionCause> {
-    let Some(python) = resolve_analyzer::<PythonAnalyzer>(analyzer) else {
-        return Err(DerivationExecutionCause::Provider);
-    };
-    let cancel = cancellation.cloned().unwrap_or_default();
-    let mut retained = PythonReceiverRequest::open(python, &cancel);
-    definition_at_range_with_request(
-        &mut retained,
-        analyzer,
-        file,
-        source,
-        tree,
-        range,
-        cancellation,
-    )
-}
-
 pub(crate) fn definition_at_range_with_request(
     retained: &mut PythonReceiverRequest<'_>,
     analyzer: &dyn brokk_bifrost_analysis::analyzer::IAnalyzer,
@@ -1467,7 +1422,9 @@ mod native_type_reader_tests {
                 } => answer,
                 BoundedResolution::Complete {
                     value:
-                        SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Missing),
+                        SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Missing(
+                            _,
+                        )),
                     ..
                 } => panic!("native value missing for {expression}: missing"),
                 BoundedResolution::Complete { .. } => {
@@ -1523,7 +1480,8 @@ mod native_type_reader_tests {
     #[hardwon(
         "#5658: the legacy fallback of a provider-open type answer ran while the request held the writer-only store mutex"
     )]
-    fn provider_open_type_fallback_releases_a_writer_only_reader() {
+    fn provider_open_type_fallback_on_pooled_store() {
+        // This regression now runs on the pooled store.
         // The lookup runs on its own thread, so a regression fails by timeout
         // instead of hanging the suite.
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -1533,8 +1491,11 @@ mod native_type_reader_tests {
                 .file("sample.py", source)
                 .build();
             let project = fixture.project_dyn();
-            let store = brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::single_connection_store_context_for_test(project.as_ref()).expect("writer-only store");
-            assert!(store.store.uses_single_connection_reads());
+            let store =
+                brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::ephemeral_store_context(
+                    project.as_ref(),
+                )
+                .expect("pooled store");
             let python = PythonAnalyzer::new_with_config_store_context(
                 project,
                 Default::default(),
@@ -1551,7 +1512,6 @@ mod native_type_reader_tests {
                 .prepare_native_environment_for_test(&cancellation)
                 .expect("native fixture");
             let mut request = PythonReceiverRequest::open(&python, &cancellation);
-            assert!(request.reader_excludes_store_access());
             let site = site_at(source, "direct()");
             let native = request.resolve_native_type_bounded(BoundedReceiverQuery {
                 analyzer,
@@ -1581,17 +1541,15 @@ mod native_type_reader_tests {
                 budget: INTERACTIVE_TYPE_LOOKUP_BUDGET,
                 cancellation: Some(&cancellation),
             });
-            // The caller must drop a released writer-backed request.
-            assert!(request.reader_excludes_store_access());
             sender.send(()).expect("test is waiting");
         });
         receiver
             .recv_timeout(std::time::Duration::from_secs(60))
-            .expect("the legacy fallback reacquired the writer-only store mutex (deadlock or reentrancy panic)");
+            .expect("the legacy fallback completed through the pooled store");
     }
 
     #[test]
-    fn receiver_service_reopens_after_writer_only_fallback() {
+    fn receiver_service_reopens_after_fallback() {
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             use brokk_bifrost_analysis::analyzer::usages::receiver_query::{
@@ -1602,10 +1560,14 @@ mod native_type_reader_tests {
                 .file("sample.py", source)
                 .build();
             let project = fixture.project_dyn();
-            let store = brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::single_connection_store_context_for_test(project.as_ref()).expect("writer-only store");
+            let store =
+                brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::ephemeral_store_context(
+                    project.as_ref(),
+                )
+                .expect("pooled store");
             let workspace = brokk_bifrost_analysis::analyzer::WorkspaceAnalyzer::build_with_store_context_for_test(
                 project, Default::default(), store,
-            ).expect("writer-only workspace");
+            ).expect("pooled workspace");
             let python =
                 resolve_analyzer::<PythonAnalyzer>(workspace.analyzer()).expect("Python analyzer");
             let cancellation = brokk_bifrost_core::cancellation::CancellationToken::new();

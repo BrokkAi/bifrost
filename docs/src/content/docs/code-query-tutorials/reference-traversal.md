@@ -142,7 +142,162 @@ Accepted kinds are `method_call`, `constructor_call`, `field_read`, `field_write
 
 <!-- code-query-case:method-uses:expected -->
 ```json
-{"diagnostics":[{"code":"uses_candidates_omitted","impact":"incomplete","language":"java","message":"uses omitted 4 candidate reference sites in User.java because the structured usage analyzer did not confirm every exact edge"}],"results":[{"end_line":1,"fq_name":"Target","kind":"class","language":"java","path":"Target.java","provenance":[{"seed":{"end_line":1,"kind":"method","path":"User.java","result_type":"structural_match","start_line":1},"steps":[{"op":"enclosing_decl","result":{"end_line":1,"fq_name":"User.read","kind":"method","path":"User.java","result_type":"declaration","start_line":1}},{"op":"uses","result":{"end_line":1,"fq_name":"Target","kind":"class","path":"Target.java","result_type":"declaration","start_line":1},"via":{"path":"User.java","proof":"proven","range":{"end_column":29,"end_line":1,"start_column":23,"start_line":1},"reference_facets":{"known":["type_reference"],"undecided":["self_type_alias","static_reference"]},"result_type":"reference_site","target_fq_name":"Target"}}]}],"result_type":"declaration","signature":"class Target {","start_line":1},{"end_line":1,"fq_name":"Target.status","kind":"field","language":"java","path":"Target.java","provenance":[{"seed":{"end_line":1,"kind":"method","path":"User.java","result_type":"structural_match","start_line":1},"steps":[{"op":"enclosing_decl","result":{"end_line":1,"fq_name":"User.read","kind":"method","path":"User.java","result_type":"declaration","start_line":1}},{"op":"uses","result":{"end_line":1,"fq_name":"Target.status","kind":"field","path":"Target.java","result_type":"declaration","start_line":1},"via":{"path":"User.java","proof":"proven","range":{"end_column":60,"end_line":1,"start_column":54,"start_line":1},"reference_facets":{"known":[],"undecided":["field_read","field_write","static_reference"]},"result_type":"reference_site","target_fq_name":"Target.status"}}]}],"result_type":"declaration","signature":"int status;","start_line":1}],"truncated":false}
+{
+  "diagnostics": [
+    {
+      "code": "uses_candidate_unresolved",
+      "impact": "incomplete",
+      "incompleteness": {
+        "operational": "provider"
+      },
+      "language": "java",
+      "message": "uses omitted 2 candidate reference sites in User.java because the structured usage analyzer did not confirm every exact edge"
+    },
+    {
+      "code": "uses_definition_projection_missing",
+      "impact": "incomplete",
+      "incompleteness": {
+        "operational": "provider"
+      },
+      "language": "java",
+      "message": "uses omitted 2 candidate reference sites in User.java because the structured usage analyzer did not confirm every exact edge"
+    }
+  ],
+  "results": [
+    {
+      "end_line": 1,
+      "fq_name": "Target",
+      "kind": "class",
+      "language": "java",
+      "path": "Target.java",
+      "provenance": [
+        {
+          "seed": {
+            "end_line": 1,
+            "kind": "method",
+            "path": "User.java",
+            "result_type": "structural_match",
+            "start_line": 1
+          },
+          "steps": [
+            {
+              "op": "enclosing_decl",
+              "result": {
+                "end_line": 1,
+                "fq_name": "User.read",
+                "kind": "method",
+                "path": "User.java",
+                "result_type": "declaration",
+                "start_line": 1
+              }
+            },
+            {
+              "op": "uses",
+              "result": {
+                "end_line": 1,
+                "fq_name": "Target",
+                "kind": "class",
+                "path": "Target.java",
+                "result_type": "declaration",
+                "start_line": 1
+              },
+              "via": {
+                "path": "User.java",
+                "proof": "proven",
+                "range": {
+                  "end_column": 29,
+                  "end_line": 1,
+                  "start_column": 23,
+                  "start_line": 1
+                },
+                "reference_facets": {
+                  "known": [
+                    "type_reference"
+                  ],
+                  "undecided": [
+                    "self_type_alias",
+                    "static_reference"
+                  ]
+                },
+                "result_type": "reference_site",
+                "target_fq_name": "Target"
+              }
+            }
+          ]
+        }
+      ],
+      "result_type": "declaration",
+      "signature": "class Target {",
+      "start_line": 1
+    },
+    {
+      "end_line": 1,
+      "fq_name": "Target.status",
+      "kind": "field",
+      "language": "java",
+      "path": "Target.java",
+      "provenance": [
+        {
+          "seed": {
+            "end_line": 1,
+            "kind": "method",
+            "path": "User.java",
+            "result_type": "structural_match",
+            "start_line": 1
+          },
+          "steps": [
+            {
+              "op": "enclosing_decl",
+              "result": {
+                "end_line": 1,
+                "fq_name": "User.read",
+                "kind": "method",
+                "path": "User.java",
+                "result_type": "declaration",
+                "start_line": 1
+              }
+            },
+            {
+              "op": "uses",
+              "result": {
+                "end_line": 1,
+                "fq_name": "Target.status",
+                "kind": "field",
+                "path": "Target.java",
+                "result_type": "declaration",
+                "start_line": 1
+              },
+              "via": {
+                "path": "User.java",
+                "proof": "proven",
+                "range": {
+                  "end_column": 60,
+                  "end_line": 1,
+                  "start_column": 54,
+                  "start_line": 1
+                },
+                "reference_facets": {
+                  "known": [],
+                  "undecided": [
+                    "field_read",
+                    "field_write",
+                    "static_reference"
+                  ]
+                },
+                "result_type": "reference_site",
+                "target_fq_name": "Target.status"
+              }
+            }
+          ]
+        }
+      ],
+      "result_type": "declaration",
+      "signature": "int status;",
+      "start_line": 1
+    }
+  ],
+  "truncated": false
+}
 ```
 
 To inspect all direct members of a type without attributing nested member bodies to the type itself, compose the ownership steps explicitly:
@@ -164,7 +319,37 @@ To inspect all direct members of a type without attributing nested member bodies
 
 <!-- code-query-case:members-use:expected -->
 ```json
-{"diagnostics":[{"code":"uses_candidates_omitted","impact":"incomplete","language":"java","message":"uses omitted 4 candidate reference sites in User.java because the structured usage analyzer did not confirm every exact edge"},{"code":"reference_kind_undecided","impact":"incomplete","language":"java","message":"reference sites without a classified kind could not be excluded for requested kinds [\"field_read\"]: [\"User.java:1@53\"]"}],"results":[],"truncated":false}
+{
+  "diagnostics": [
+    {
+      "code": "uses_candidate_unresolved",
+      "impact": "incomplete",
+      "incompleteness": {
+        "operational": "provider"
+      },
+      "language": "java",
+      "message": "uses omitted 2 candidate reference sites in User.java because the structured usage analyzer did not confirm every exact edge"
+    },
+    {
+      "code": "uses_definition_projection_missing",
+      "impact": "incomplete",
+      "incompleteness": {
+        "operational": "provider"
+      },
+      "language": "java",
+      "message": "uses omitted 2 candidate reference sites in User.java because the structured usage analyzer did not confirm every exact edge"
+    },
+    {
+      "code": "reference_kind_undecided",
+      "impact": "incomplete",
+      "incompleteness": "content",
+      "language": "java",
+      "message": "reference sites without a classified kind could not be excluded for requested kinds [\"field_read\"]: [\"User.java:1@53\"]"
+    }
+  ],
+  "results": [],
+  "truncated": false
+}
 ```
 
 This exact ownership rule makes `A uses B` and `B used-by A` inverses under identical filters.

@@ -83,8 +83,12 @@ pub fn rust_dead_write_macro_sources_by_binding(
     cancellation: Option<&CancellationToken>,
 ) -> HashMap<ValueId, (Vec<SourceMappingId>, Vec<SourceMappingId>)> {
     let mut result = HashMap::new();
-    let Ok(prepared) = ProcedureSyntax::prepare(workspace, procedure, cancellation) else {
-        return result;
+    let prepared = match ProcedureSyntax::prepare(workspace, procedure, cancellation) {
+        Ok(prepared) => prepared,
+        Err(open) => {
+            open.reason_joined(workspace.analyzer());
+            return result;
+        }
     };
     let Ok(procedure_node) = prepared.procedure_node(procedure) else {
         return result;
@@ -127,7 +131,8 @@ pub fn rust_dead_write_macro_sources_by_binding(
         brokk_bifrost_rust::macro_matcher::ExportedMacroDefinitions::from_candidates(
             definition_candidates,
             source,
-        );
+        )
+        .with_root(root);
     let mut stack = vec![procedure_node];
     while let Some(node) = stack.pop() {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
@@ -300,7 +305,7 @@ fn pilot_plain_assignment_candidates(
     }
     let prepared = match ProcedureSyntax::prepare(workspace, procedure, cancellation) {
         Ok(prepared) => prepared,
-        Err(reason) => return unavailable(reason),
+        Err(open) => return unavailable(open.reason_joined(workspace.analyzer())),
     };
     let semantics = procedure.semantics();
     let syntax = &prepared.syntax;
@@ -459,7 +464,7 @@ pub fn java_overwritten_local_candidates(
     }
     let prepared = match ProcedureSyntax::prepare(workspace, procedure, cancellation) {
         Ok(prepared) => prepared,
-        Err(reason) => return unavailable(reason),
+        Err(open) => return unavailable(open.reason_joined(workspace.analyzer())),
     };
     let semantics = procedure.semantics();
     let syntax = &prepared.syntax;
@@ -681,7 +686,7 @@ pub fn js_ts_overwritten_local_candidates(
     }
     let prepared = match ProcedureSyntax::prepare(workspace, procedure, cancellation) {
         Ok(prepared) => prepared,
-        Err(reason) => return unavailable(reason),
+        Err(open) => return unavailable(open.reason_joined(workspace.analyzer())),
     };
     let semantics = procedure.semantics();
     let syntax = &prepared.syntax;
@@ -935,7 +940,7 @@ pub fn python_overwritten_local_candidates(
     }
     let prepared = match ProcedureSyntax::prepare(workspace, procedure, cancellation) {
         Ok(prepared) => prepared,
-        Err(reason) => return unavailable(reason),
+        Err(open) => return unavailable(open.reason_joined(workspace.analyzer())),
     };
     let procedure_node = match prepared.procedure_node(procedure) {
         Ok(node) => node,
@@ -1084,7 +1089,7 @@ pub fn go_overwritten_local_candidates(
     }
     let prepared = match ProcedureSyntax::prepare(workspace, procedure, cancellation) {
         Ok(prepared) => prepared,
-        Err(reason) => return unavailable(reason),
+        Err(open) => return unavailable(open.reason_joined(workspace.analyzer())),
     };
     let procedure_node = match prepared.procedure_node(procedure) {
         Ok(node) => node,
@@ -1330,7 +1335,7 @@ pub fn single_target_overwritten_local_candidates(
         };
     let prepared = match ProcedureSyntax::prepare(workspace, procedure, cancellation) {
         Ok(prepared) => prepared,
-        Err(reason) => return unavailable(reason),
+        Err(open) => return unavailable(open.reason_joined(workspace.analyzer())),
     };
     let procedure_node = match prepared.procedure_node(procedure) {
         Ok(node) => node,
@@ -1602,7 +1607,7 @@ fn single_target_plain_assignment_candidates(
     let language = procedure.artifact().key().language().language();
     let prepared = match ProcedureSyntax::prepare(workspace, procedure, cancellation) {
         Ok(prepared) => prepared,
-        Err(reason) => return unavailable(reason),
+        Err(open) => return unavailable(open.reason_joined(workspace.analyzer())),
     };
     let procedure_node = match prepared.procedure_node(procedure) {
         Ok(node) => node,

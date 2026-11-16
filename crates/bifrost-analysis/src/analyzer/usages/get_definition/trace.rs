@@ -1183,19 +1183,25 @@ fn boundary_evidence_for(
             // host asked, which in a mixed JVM workspace is the `MultiAnalyzer`.
             // This is the same reason `collect_java_semantic_diagnostics` takes
             // its `JvmOverlayModel` as a parameter (#1893).
+            let mut reuse = crate::analyzer::reuse_verdict::ReuseVerdict::Content;
             let evidence = crate::analyzer::languages::language_support_for_hook(
                 language,
                 "definition_boundary_evidence",
             )
             .and_then(|support| match usage {
                 BoundaryEvidenceUse::Reference => {
-                    support.definition_boundary_evidence(analyzer, token, file, name)
+                    support.definition_boundary_evidence(analyzer, token, file, name, &mut reuse)
                 }
                 // A call target is the canonical name an earlier lookup
                 // resolved, not a spelling written at a reference site.
                 BoundaryEvidenceUse::CallTarget => support
-                    .definition_boundary_evidence_for_resolved_callee(analyzer, token, file, name),
+                    .definition_boundary_evidence_for_resolved_callee(
+                        analyzer, token, file, name, &mut reuse,
+                    ),
             });
+            // Boundary evidence cannot carry a verdict; it joins the current
+            // captures, where the hook's ambient mark went.
+            analyzer.join_reuse_verdict(reuse);
             match evidence {
                 Some((BoundaryStatus::ExternalUnknown, target)) => {
                     let discovery = analyzer.dependency_discovery_evidence(language);
@@ -1222,13 +1228,16 @@ fn boundary_evidence_for(
             }
         }
         language @ (Language::Python | Language::JavaScript | Language::TypeScript) => {
-            let indexed = analyzer.semantic_model_overlay().and_then(|overlay| {
-                overlay
-                    .symbols_named_for(name, language.config_label())
-                    .records
-                    .first()
-                    .map(|symbol| symbol.id.clone())
-            });
+            let indexed = analyzer
+                .semantic_model_overlay_read()
+                .published()
+                .and_then(|overlay| {
+                    overlay
+                        .symbols_named_for(name, language.config_label())
+                        .records
+                        .first()
+                        .map(|symbol| symbol.id.clone())
+                });
             if let Some(id) = indexed {
                 return (BoundaryStatus::ExternalIndexed, Some(id));
             }
@@ -1259,16 +1268,20 @@ fn boundary_evidence_for(
             // Python arm's strength; filtering to PHP symbols keeps another
             // ecosystem's posting from answering, and a namespace scaffold is
             // not a type a reference can name.
-            let indexed = analyzer.semantic_model_overlay().and_then(|overlay| {
-                overlay
-                    .symbols_named_for(name, "php")
-                    .records
-                    .iter()
-                    .find(|symbol| {
-                        symbol.language == "php" && symbol.kind != SemanticModelSymbolKind::Module
-                    })
-                    .map(|symbol| symbol.id.clone())
-            });
+            let indexed = analyzer
+                .semantic_model_overlay_read()
+                .published()
+                .and_then(|overlay| {
+                    overlay
+                        .symbols_named_for(name, "php")
+                        .records
+                        .iter()
+                        .find(|symbol| {
+                            symbol.language == "php"
+                                && symbol.kind != SemanticModelSymbolKind::Module
+                        })
+                        .map(|symbol| symbol.id.clone())
+                });
             if let Some(id) = indexed {
                 return (BoundaryStatus::ExternalIndexed, Some(id));
             }
@@ -1284,12 +1297,19 @@ fn boundary_evidence_for(
             }
         }
         Language::Go | Language::Rust | Language::Ruby | Language::Cpp => {
-            crate::analyzer::languages::language_support_for_hook(
+            let mut reuse = crate::analyzer::reuse_verdict::ReuseVerdict::Content;
+            let evidence = crate::analyzer::languages::language_support_for_hook(
                 language_for_file(file),
                 "definition_boundary_evidence",
             )
-            .and_then(|support| support.definition_boundary_evidence(analyzer, token, file, name))
-            .unwrap_or((BoundaryStatus::ExternalUnknown, None))
+            .and_then(|support| {
+                support.definition_boundary_evidence(analyzer, token, file, name, &mut reuse)
+            })
+            .unwrap_or((BoundaryStatus::ExternalUnknown, None));
+            // Boundary evidence cannot carry a verdict; it joins the current
+            // captures, where the hook's ambient mark went.
+            analyzer.join_reuse_verdict(reuse);
+            evidence
         }
         Language::None => (BoundaryStatus::ExternalUnknown, None),
     }
@@ -1321,7 +1341,8 @@ pub fn dispatch_quality_for_status(
             DispatchQuality::Unsupported(crate::analyzer::semantic::SemanticCapability::Calls)
         }
         Some(
-            DefinitionLookupStatus::NoDefinition
+            DefinitionLookupStatus::NotAReference
+            | DefinitionLookupStatus::NoDefinition
             | DefinitionLookupStatus::Unavailable
             | DefinitionLookupStatus::InvalidLocation
             | DefinitionLookupStatus::NotFound,
@@ -1369,6 +1390,7 @@ mod dispatch_quality_tests {
             DispatchQuality::Unsupported(SemanticCapability::Calls)
         );
         for status in [
+            DefinitionLookupStatus::NotAReference,
             DefinitionLookupStatus::NoDefinition,
             DefinitionLookupStatus::InvalidLocation,
             DefinitionLookupStatus::NotFound,

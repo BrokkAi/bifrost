@@ -2,6 +2,7 @@
 mod jvm_extraction_tests {
     use crate::analyzer::java::receiver_query::*;
     use brokk_bifrost_analysis::analyzer::usages::receiver_analysis::ReceiverValue;
+    use brokk_bifrost_test_macros::hardwon;
 
     use brokk_bifrost_analysis::analyzer::semantic::AbstractObjectIdentity;
 
@@ -281,6 +282,88 @@ void caller() {
         assert_eq!(cancelled_ledger.work(), ReceiverAnalysisWork::default());
     }
     #[test]
+    #[hardwon(
+        "#12679: Java resolution budget stop reached captures without an execution-dependence mark"
+    )]
+    fn java_resolution_budget_stops_mark_their_capture() {
+        use brokk_bifrost_analysis::analyzer::i_analyzer::capture_query_reads;
+        let mut source = String::from("class Root { void target() {} }\n");
+        for level in 1..=12 {
+            let parent = if level == 1 {
+                "Root".to_string()
+            } else {
+                format!("Level{}", level - 1)
+            };
+            source.push_str(&format!("class Level{level} extends {parent} {{}}\n"));
+        }
+        source.push_str(
+            "class Sample { void caller() { Level12 value = new Level12(); value.target(); } }\n",
+        );
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = ProjectFile::new(root.clone(), PathBuf::from("DeepHierarchy.java"));
+        file.write(&source).expect("write source");
+        let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
+            Arc::new(TestProject::new(root, Language::Java)),
+            AnalyzerConfig::default(),
+        )
+        .expect("ephemeral workspace should build");
+        let service = ReceiverQueryService::from_workspace(&workspace);
+        let tree = parse_tree_for_language(&file, Language::Java, &source).expect("Java tree");
+        let line_starts = compute_line_starts(&source);
+        let input = JavaReceiverResolutionInput {
+            source: &source,
+            tree: &tree,
+            line_starts: &line_starts,
+        };
+        let range = marker_range(&source, "value.target");
+        let invocation =
+            smallest_named_node_covering(tree.root_node(), range.start_byte, range.end_byte)
+                .expect("method invocation");
+        let node = invocation.child_by_field_name("name").expect("method name");
+        let resolve = |budget| {
+            capture_query_reads(service.analyzer, || {
+                java_definition_at(
+                    service.analyzer,
+                    &service.definitions,
+                    &file,
+                    input,
+                    node,
+                    budget,
+                    None,
+                )
+            })
+        };
+
+        // A finished resolution depends only on content.
+        let (complete, reads) = resolve(ReceiverAnalysisBudget::default());
+        assert!(matches!(complete, BoundedResolution::Complete { .. }));
+        assert_eq!(reads.execution_dependences(), 0);
+
+        // A hierarchy walk stopped by its summary allowance, and a request
+        // with no scope allowance at all, depend on the budget that stopped
+        // them, so their captures must not be kept as content.
+        for budget in [
+            ReceiverAnalysisBudget {
+                max_summary_expansions: 4,
+                ..ReceiverAnalysisBudget::default()
+            },
+            ReceiverAnalysisBudget {
+                max_scope_nodes: 0,
+                ..ReceiverAnalysisBudget::default()
+            },
+        ] {
+            let (stopped, reads) = resolve(budget);
+            assert!(
+                matches!(stopped, BoundedResolution::Exceeded { .. }),
+                "{budget:?}: {stopped:#?}"
+            );
+            assert!(reads.execution_dependences() > 0, "{budget:?}");
+            assert!(!reads.is_bounded(), "{budget:?}");
+        }
+    }
+
+    #[test]
     fn java_compatibility_resolution_bounds_deep_hierarchy_and_precancellation() {
         let mut source = String::from("class Root { void target() {} }\n");
         for level in 1..=12 {
@@ -370,7 +453,9 @@ void caller() {
             one_preprocessing_step,
             BoundedResolution::Complete {
                 value: DefinitionLookupOutcome {
-                    status: DefinitionLookupStatus::InvalidLocation,
+                    inventory_evidence: None,
+                    incomplete_evidence: None,
+        status: DefinitionLookupStatus::InvalidLocation,
                     ..
                 },
                 work,

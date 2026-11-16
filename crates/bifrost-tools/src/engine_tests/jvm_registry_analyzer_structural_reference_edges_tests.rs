@@ -464,7 +464,10 @@ mod jvm_registry_tests {
             result.completeness,
             EdgeCompleteness::Incomplete {
                 reasons: vec![EdgeIncompleteReason::OccurrenceRowsIncomplete {
-                    uncovered_roles: vec![OccurrenceRole::PatternPosition]
+                    uncovered_roles: vec![
+                        OccurrenceRole::PatternPosition,
+                        OccurrenceRole::CalleePosition,
+                    ]
                 }]
             }
         );

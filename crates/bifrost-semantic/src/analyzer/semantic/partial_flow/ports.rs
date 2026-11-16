@@ -169,6 +169,11 @@ fn selectors_name_same_member(read: &HeapSelector, written: &HeapSelector) -> bo
 
 /// A declaration-backed field can be used from different procedure scopes.
 pub fn canonical_field_member_matches(read: &SemanticLocator, written: &SemanticLocator) -> bool {
+    // Canonical fields carry their complete identity in the declaration key,
+    // not the zero anchor shared by artifact-independent member locators.
+    if read.is_artifact_independent_field() || written.is_artifact_independent_field() {
+        return read == written;
+    }
     read.mount() == written.mount()
         && read.path() == written.path()
         && read.language() == written.language()

@@ -16,7 +16,6 @@ pub mod analyzer {
             pub mod python;
         }
         pub mod get_type {
-            pub(crate) use python::resolve_python_type_bounded;
             pub mod python;
         }
         pub mod python_graph;

@@ -473,6 +473,237 @@ mod fact_resolution {
             assert_eq!(answer.binding().targets().len(), 2);
             assert_incomplete_with_reason(answer.completion(), reason);
         }
+        #[test]
+        #[hardwon(
+            "#13243: a zero-length vararg tail was classified as strict, so both applicable overloads became less specific"
+        )]
+        fn java_nested_array_varargs_keeps_fixed_arity_overload() {
+            // JLS 15.12.2: m(String[]...) accepts String[][] in fixed arity;
+            // m(String[][], String...) needs variable arity for its empty tail.
+            let source = "class A { void m(String[]... xs) {} void m(String[][] first, String... rest) {} void caller(String[][] values) { m(values); } }";
+            let mut fixture = parsed_java_service_fixture(source, b"nested-array-varargs");
+            let declaration =
+                java_callable_definition_at(&fixture, source.find("m(String[]...").unwrap());
+            let sibling =
+                java_callable_definition_at(&fixture, source.find("m(String[][]").unwrap());
+            let old = &fixture.typed;
+            let formal = old
+                .callable_signatures()
+                .iter()
+                .find(|signature| signature.definition() == declaration)
+                .unwrap()
+                .parameters()[0]
+                .slot();
+            let parameters = old
+                .callable_signatures()
+                .iter()
+                .find(|signature| signature.definition() == sibling)
+                .unwrap()
+                .parameters();
+            let actual = old
+                .call_obligations()
+                .iter()
+                .find(|call| !call.arguments().is_empty())
+                .unwrap()
+                .arguments()[0]
+                .slot();
+            let array = SemanticId::for_test(b"nested-array-string-array");
+            let nested = SemanticId::for_test(b"nested-array-string-array-array");
+            let string = SemanticId::for_test(b"nested-array-java-string");
+            let element = SemanticId::for_test(b"nested-array-element-slot");
+            let scalar = SemanticId::for_test(b"nested-array-scalar-slot");
+            // Complete type facts are the analyzer handoff. Their canonical
+            // identities differ from the projected operand slots. This keeps
+            // the test independent of source-array producer proof gaps.
+            let actual_source = SemanticId::for_test(b"nested-argument-expression");
+            let argument_transfer = old
+                .transfers()
+                .iter()
+                .find(|row| row.rule().target_slot() == actual)
+                .unwrap();
+            let type_slots = [
+                SemanticId::for_test(b"nested-formal-type"),
+                SemanticId::for_test(b"nested-sibling-type"),
+                SemanticId::for_test(b"nested-tail-type"),
+            ];
+            let values = [
+                (
+                    actual_source,
+                    ResolutionSlotValue::runtime(ResolutionTypeRef::new(nested, 0), false),
+                ),
+                (
+                    type_slots[0],
+                    ResolutionSlotValue::type_object(ResolutionTypeRef::new(array, 0)),
+                ),
+                (
+                    type_slots[1],
+                    ResolutionSlotValue::type_object(ResolutionTypeRef::new(nested, 0)),
+                ),
+                (
+                    type_slots[2],
+                    ResolutionSlotValue::type_object(ResolutionTypeRef::new(string, 0)),
+                ),
+                (
+                    element,
+                    ResolutionSlotValue::type_object(ResolutionTypeRef::new(array, 0)),
+                ),
+                (
+                    scalar,
+                    ResolutionSlotValue::type_object(ResolutionTypeRef::new(string, 0)),
+                ),
+            ];
+            let overridden = [actual, formal, parameters[0].slot(), parameters[1].slot()]
+                .into_iter()
+                .collect::<HashSet<_>>();
+            let mut frontiers = old
+                .frontiers()
+                .iter()
+                .map(|frontier| {
+                    if overridden.contains(&frontier.slot()) {
+                        LoweredTypedFrontier::new(frontier.slot(), frontier.role())
+                    } else {
+                        *frontier
+                    }
+                })
+                .collect::<Vec<_>>();
+            frontiers.extend(
+                [array, nested, element, scalar]
+                    .into_iter()
+                    .chain(type_slots)
+                    .map(|slot| {
+                        LoweredTypedFrontier::new(slot, ResolutionTypeSlotRole::TargetTypeIdentity)
+                    }),
+            );
+            frontiers.push(LoweredTypedFrontier::new(
+                actual_source,
+                ResolutionTypeSlotRole::ExpressionValue,
+            ));
+            let mut seeds = old
+                .intrinsic_seeds()
+                .iter()
+                .filter(|seed| !overridden.contains(&seed.frontier().slot()))
+                .cloned()
+                .collect::<Vec<_>>();
+            seeds.extend(values.map(|(slot, value)| {
+                LoweredIntrinsicSeed::new(
+                    if value.ty().identity() == string {
+                        IntrinsicTypeKind::LanguageBuiltin
+                    } else {
+                        IntrinsicTypeKind::Structural
+                    },
+                    if value.ty().identity() == string {
+                        "java.lang.String"
+                    } else {
+                        "array"
+                    },
+                    TypedFrontierState::new(slot, vec![value], ResolutionCompletion::Complete),
+                )
+            }));
+            let mut transfers = old
+                .transfers()
+                .iter()
+                .filter(|row| !overridden.contains(&row.rule().target_slot()))
+                .cloned()
+                .collect::<Vec<_>>();
+            for ((source, target), name) in type_slots
+                .into_iter()
+                .zip([formal, parameters[0].slot(), parameters[1].slot()])
+                .zip([
+                    b"nested-formal-rule".as_slice(),
+                    b"nested-sibling-rule",
+                    b"nested-tail-rule",
+                ])
+            {
+                transfers.push(LoweredTypeTransfer::new(
+                    source,
+                    ResolutionTypeTransferKind::DeclaredType,
+                    TypeTransferRule::new(
+                        SemanticId::for_test(name),
+                        target,
+                        0,
+                        TypeTransferValueTransform::ToRuntime { addressable: false },
+                        ResolutionCompletion::Complete,
+                    ),
+                ));
+            }
+            transfers.push(LoweredTypeTransfer::new(
+                actual_source,
+                argument_transfer.kind(),
+                TypeTransferRule::new(
+                    SemanticId::for_test(b"nested-argument-rule"),
+                    actual,
+                    0,
+                    argument_transfer.rule().value_transform(),
+                    ResolutionCompletion::Complete,
+                ),
+            ));
+            let typed = LoweredTypedFragment::new_with_type_relations(
+                old.fragment(),
+                old.language(),
+                frontiers,
+                transfers,
+                vec![
+                    LoweredTypeComponent::new(
+                        array,
+                        ResolutionTypeConstructorKind::Sequence,
+                        ResolutionTypeComponentKind::Element,
+                        scalar,
+                    ),
+                    LoweredTypeComponent::new(
+                        nested,
+                        ResolutionTypeConstructorKind::Sequence,
+                        ResolutionTypeComponentKind::Element,
+                        element,
+                    ),
+                ],
+                vec![],
+                vec![],
+                vec![],
+                seeds,
+                old.projections()
+                    .iter()
+                    .filter(|row| !overridden.contains(&row.output_slot()))
+                    .cloned()
+                    .collect(),
+                old.qualified_routes().to_vec(),
+                old.declaration_types().to_vec(),
+                old.declaration_visibilities().to_vec(),
+                old.member_scopes().to_vec(),
+                old.member_owners().to_vec(),
+                vec![],
+                old.construction_requirements().to_vec(),
+                old.supertypes().to_vec(),
+                old.property_gaps().to_vec(),
+                old.call_obligations().to_vec(),
+                old.callable_signatures().to_vec(),
+            );
+            fixture.service = PreloadedFactResolutionService::from_lowered_fragments(
+                [fixture.lexical.clone()],
+                [typed.clone()],
+            );
+            fixture.typed = typed;
+            let owner = lowered_semantics_named(
+                &fixture.facts,
+                &fixture.lexical,
+                "A",
+                ResolutionIdentifierRole::Declaration,
+            )[0];
+            fixture.service.set_java_inheritance_metadata([JavaInheritanceDeclaration {
+                definition: owner, name: "A".to_owned(),
+                package: brokk_bifrost_analysis::analyzer::resolution::fact_source::JvmDeclarationPackage::Known(Some(String::new())),
+                kind: JavaInheritanceDeclarationKind::Type { is_interface: false, is_singleton: false },
+            }]);
+            let (answer, reason) =
+                resolve_java_call_at(&fixture, source.rfind("m(values)").unwrap());
+            assert_eq!(answer.binding().targets(), &[declaration], "{answer:?}");
+            assert!(
+                !answer
+                    .completion()
+                    .contains_reason(ResolutionIncompleteReason::UnsupportedSemantic(reason)),
+                "fixed-arity applicability must be proven: {answer:?}"
+            );
+        }
+
         #[cfg(test)]
         #[test]
         fn repeated_parameter_retains_exact_applicability_obligation() {
@@ -1083,5 +1314,227 @@ mod fact_resolution {
             let oracle = hierarchy_qualifier_completion_oracle(&fixture, reference);
             assert_hierarchy_success_transfers_qualifier_evidence(&answer, &oracle);
         }
+    }
+}
+
+/// Java header bindings, read through the registered `scope_header` hook.
+mod lexical_definitions {
+    use brokk_bifrost_analysis::analyzer::lexical_definitions::{
+        LexicalBindingResolution, resolve_lexical_binding,
+    };
+    use brokk_bifrost_core::analyzer::model::Language;
+    use brokk_bifrost_test_macros::hardwon;
+
+    /// The byte where `name` starts at the end of the unique `anchor`.
+    fn at(source: &str, anchor: &str, name: &str) -> usize {
+        assert!(anchor.ends_with(name), "{anchor} must end with {name}");
+        let start = source
+            .find(anchor)
+            .unwrap_or_else(|| panic!("{anchor} in {source}"));
+        assert_eq!(
+            source.rfind(anchor),
+            Some(start),
+            "{anchor} repeats in {source}"
+        );
+        start + anchor.len() - name.len()
+    }
+
+    /// A reference anchor, the name it ends with, and the expected answer:
+    /// the declaration kind with the anchor of its binder, or `None`.
+    type Case<'a> = (&'a str, &'a str, Option<(&'a str, &'a str)>);
+
+    /// Resolve the `name` ending each reference anchor and compare the answer
+    /// kind and bound-name start with the expected binder anchor. `None`
+    /// means no lexical answer, so navigation goes on to the field.
+    fn assert_answers(source: &str, cases: &[Case<'_>]) {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_java::LANGUAGE.into())
+            .expect("Java grammar");
+        let tree = parser.parse(source, None).expect("Java tree");
+        assert!(!tree.root_node().has_error(), "{source}");
+        let mut failures = Vec::new();
+        for &(reference, name, binder) in cases {
+            let focus = at(source, reference, name);
+            let actual = resolve_lexical_binding(
+                Language::Java,
+                tree.root_node(),
+                source,
+                focus,
+                focus + name.len(),
+                name,
+            )
+            .map(|resolution| match resolution {
+                LexicalBindingResolution::Parameter(definition) => (
+                    format!("Parameter {:?}", definition.kind),
+                    definition.name_range.start_byte,
+                ),
+                LexicalBindingResolution::OtherLocal(definition) => (
+                    format!("OtherLocal {:?}", definition.kind),
+                    definition.name_range.start_byte,
+                ),
+            });
+            let expected = binder
+                .map(|(kind, binder)| (format!("OtherLocal {kind}"), at(source, binder, name)));
+            if actual != expected {
+                failures.push((reference, expected, actual));
+            }
+        }
+        assert!(failures.is_empty(), "{source}\n{failures:#?}");
+    }
+
+    #[test]
+    #[hardwon(
+        "97a35feae74c: quicksilver round 12 on brokk-bifrost-analysis: resource binding leaked past try"
+    )]
+    fn resource_bindings_end_with_the_try_body() {
+        const RESOURCE: &str = "ResourceVariable";
+        let source = concat!(
+            "class C {\n",
+            "  AutoCloseable r;\n",
+            "  void m() throws Exception {\n",
+            "    try (AutoCloseable r = open(); AutoCloseable s = wrap(r)) {\n",
+            "      use(r, s);\n",
+            "    } catch (Exception e) {\n",
+            "      fail(r);\n",
+            "    } finally {\n",
+            "      done(r);\n",
+            "    }\n",
+            "    after(r);\n",
+            "    try (r) {\n",
+            "      named(r);\n",
+            "    }\n",
+            "    try (AutoCloseable q = q) {}\n",
+            "    try (AutoCloseable r = outer()) {\n",
+            "      try (AutoCloseable r = nest(r)) {\n",
+            "        inside(r);\n",
+            "      }\n",
+            "      beyond(r);\n",
+            "    }\n",
+            "  }\n",
+            "}\n",
+        );
+        assert_answers(
+            source,
+            &[
+                // A resource is visible in the later resources and the try block.
+                (
+                    "wrap(r",
+                    "r",
+                    Some((RESOURCE, "Exception {\n    try (AutoCloseable r")),
+                ),
+                (
+                    "use(r",
+                    "r",
+                    Some((RESOURCE, "Exception {\n    try (AutoCloseable r")),
+                ),
+                ("use(r, s", "s", Some((RESOURCE, "AutoCloseable s"))),
+                // Its name is its own declaration site.
+                (
+                    "Exception {\n    try (AutoCloseable r",
+                    "r",
+                    Some((RESOURCE, "Exception {\n    try (AutoCloseable r")),
+                ),
+                // Not in the catch or finally blocks, nor after the statement:
+                // those reads name the field.
+                ("fail(r", "r", None),
+                ("done(r", "r", None),
+                ("after(r", "r", None),
+                // `try (r)` names an existing variable and declares nothing.
+                ("try (r", "r", None),
+                ("named(r", "r", None),
+                // A resource's own initializer reads the outer binding, as the
+                // native Java resolver answers (#2771).
+                ("q = q", "q", None),
+                // A nested try-with-resources may reuse the name: the inner
+                // initializer and the outer try block after the inner
+                // statement read the outer resource, the inner try block reads
+                // the inner one.
+                (
+                    "nest(r",
+                    "r",
+                    Some((RESOURCE, "q = q) {}\n    try (AutoCloseable r")),
+                ),
+                (
+                    "inside(r",
+                    "r",
+                    Some((RESOURCE, "= outer()) {\n      try (AutoCloseable r")),
+                ),
+                (
+                    "beyond(r",
+                    "r",
+                    Some((RESOURCE, "q = q) {}\n    try (AutoCloseable r")),
+                ),
+            ],
+        );
+    }
+
+    #[test]
+    #[hardwon("#7632: catch parameters and enhanced-for variables leaked past their statements")]
+    fn catch_and_enhanced_for_bindings_end_with_their_bodies() {
+        let source = concat!(
+            "class C {\n",
+            "  Exception e;\n",
+            "  String s;\n",
+            "  void m(java.util.List<String> xs) {\n",
+            "    try {\n",
+            "      attempt(e);\n",
+            "    } catch (IllegalStateException | IllegalArgumentException e) {\n",
+            "      fail(e);\n",
+            "      Runnable later = () -> rethrow(e);\n",
+            "    } catch (RuntimeException other) {\n",
+            "      second(e);\n",
+            "    } finally {\n",
+            "      done(e);\n",
+            "    }\n",
+            "    after(e);\n",
+            "    for (String s : split(s)) {\n",
+            "      each(s);\n",
+            "    }\n",
+            "    for (String s : xs) single(s);\n",
+            "    last(s);\n",
+            "  }\n",
+            "}\n",
+        );
+        assert_answers(
+            source,
+            &[
+                (
+                    "fail(e",
+                    "e",
+                    Some(("CatchParameter", "IllegalArgumentException e")),
+                ),
+                (
+                    "rethrow(e",
+                    "e",
+                    Some(("CatchParameter", "IllegalArgumentException e")),
+                ),
+                (
+                    "IllegalArgumentException e",
+                    "e",
+                    Some(("CatchParameter", "IllegalArgumentException e")),
+                ),
+                // The try block, a later catch, the finally block and the
+                // code after the statement read the field.
+                ("attempt(e", "e", None),
+                ("second(e", "e", None),
+                ("done(e", "e", None),
+                ("after(e", "e", None),
+                // An enhanced-for variable is visible in the loop body only,
+                // whether that is a block or a single statement.
+                (
+                    "each(s",
+                    "s",
+                    Some(("EnhancedForVariable", "after(e);\n    for (String s")),
+                ),
+                (
+                    "single(s",
+                    "s",
+                    Some(("EnhancedForVariable", "}\n    for (String s")),
+                ),
+                ("split(s", "s", None),
+                ("last(s", "s", None),
+            ],
+        );
     }
 }

@@ -12,7 +12,15 @@ use brokk_bifrost_core::analyzer::tree_walk::find_ancestor;
 use brokk_bifrost_core::hash::HashMap;
 use tree_sitter::Node;
 
+#[cfg(test)]
+thread_local! {
+    static REFERENCE_OPERANDS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FRAGMENT_PARSED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn parse_rust_tree_for_fragment(source: &str) -> Option<tree_sitter::Tree> {
+    #[cfg(test)]
+    FRAGMENT_PARSED_BYTES.with(|bytes| bytes.set(bytes.get() + source.len()));
     // Generated macro fragments have no analyzer owner and are uncached.
     crate::lexical_scope::parse_rust_tree_uncached(source)
 }
@@ -85,15 +93,121 @@ pub enum MacroMatchError {
     Interrupted,
 }
 
+/// One file's macro syntax, retained only by that file's dispatch/proof owner.
+/// Ranges avoid borrowing nodes from the retained tree. Textual definitions
+/// include conditional definitions; exports retain the existing active filter.
+#[derive(Debug)]
+pub struct MacroDefinitionInventory {
+    tree: tree_sitter::Tree,
+    exports: HashMap<String, Vec<(usize, usize)>>,
+    textual: HashMap<usize, HashMap<String, Vec<(usize, usize)>>>,
+}
+
+impl MacroDefinitionInventory {
+    pub fn build(
+        tree: &tree_sitter::Tree,
+        source: &str,
+        keep_going: &dyn Fn() -> bool,
+    ) -> Result<Self, crate::graph_support::RustCargoRouteError> {
+        use brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix;
+        use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, try_walk_named_tree_preorder};
+        let mut inventory = Self {
+            tree: tree.clone(),
+            exports: HashMap::default(),
+            textual: HashMap::default(),
+        };
+        try_walk_named_tree_preorder(tree.root_node(), true, |node| {
+            if !keep_going() {
+                return Err(crate::graph_support::RustCargoRouteError::Cancelled);
+            }
+            if node.kind() == "macro_definition"
+                && let Some(name) = node.child_by_field_name("name")
+                && let Some(parent) = node.parent()
+            {
+                let raw = rust_node_text(name, source);
+                inventory
+                    .textual
+                    .entry(parent.id())
+                    .or_default()
+                    .entry(strip_raw_identifier_prefix(raw).to_owned())
+                    .or_default()
+                    .push((node.start_byte(), node.end_byte()));
+            }
+            Ok(WalkControl::Continue)
+        })?;
+        let exports =
+            ExportedMacroDefinitions::from_root_while(tree.root_node(), source, keep_going)?;
+        for node in exports.definitions {
+            let name = node.child_by_field_name("name").expect("export has a name");
+            inventory
+                .exports
+                .entry(rust_node_text(name, source).to_owned())
+                .or_default()
+                .push((node.start_byte(), node.end_byte()));
+        }
+        Ok(inventory)
+    }
+
+    pub fn matches_tree(&self, tree: &tree_sitter::Tree) -> bool {
+        self.tree.root_node().id() == tree.root_node().id()
+    }
+
+    /// Whether any textual macro_rules definition in this file, in any
+    /// scope, declares `name` (raw identifier prefix already stripped).
+    pub fn defines_textual_macro_anywhere(&self, name: &str) -> bool {
+        self.textual.values().any(|names| names.contains_key(name))
+    }
+
+    /// Syntax-only shadow evidence for callers that previously supplied no
+    /// export visibility authority. This view does not enable import checks
+    /// that the caller's previous `None` deliberately left to the resolver.
+    pub fn exported(&self) -> ExportedMacroDefinitions<'_> {
+        ExportedMacroDefinitions {
+            definitions: Vec::new(),
+            inventory: Some(self),
+            textual: HashMap::default(),
+            roots: vec![self.tree.root_node().id()],
+        }
+    }
+
+    fn node(&self, range: (usize, usize)) -> Node<'_> {
+        self.tree
+            .root_node()
+            .named_descendant_for_byte_range(range.0, range.1)
+            .expect("inventoried definition remains in its retained tree")
+    }
+}
+
 /// The exported macro definitions visible to procedures lowered from one file.
 #[derive(Clone, Debug)]
 pub struct ExportedMacroDefinitions<'tree> {
     definitions: Vec<Node<'tree>>,
+    inventory: Option<&'tree MacroDefinitionInventory>,
+    textual: HashMap<usize, Vec<Node<'tree>>>,
+    roots: Vec<usize>,
 }
 
 impl<'tree> ExportedMacroDefinitions<'tree> {
     /// Filter macro definitions discovered during the file's charged syntax walk.
     pub fn from_candidates(candidates: Vec<Node<'tree>>, source: &str) -> Self {
+        let mut textual: HashMap<usize, Vec<Node<'tree>>> = HashMap::default();
+        for node in &candidates {
+            if node.kind() == "macro_definition"
+                && let Some(parent) = node.parent()
+            {
+                textual.entry(parent.id()).or_default().push(*node);
+            }
+        }
+        let mut roots = Vec::new();
+        for node in &candidates {
+            let mut root = *node;
+            while let Some(parent) = root.parent() {
+                root = parent;
+            }
+            if !roots.contains(&root.id()) {
+                roots.push(root.id());
+            }
+        }
         let mut cfg_cache = HashMap::default();
         let definitions = candidates
             .into_iter()
@@ -112,18 +226,64 @@ impl<'tree> ExportedMacroDefinitions<'tree> {
                     && macro_definition_is_unconditionally_active(*node, source, &mut cfg_cache)
             })
             .collect();
-        Self { definitions }
+        Self {
+            definitions,
+            inventory: None,
+            textual,
+            roots,
+        }
     }
 
-    pub(crate) fn from_root(root: Node<'tree>, source: &str) -> Self {
-        let mut pending = vec![(root, None)];
-        let mut definitions = Vec::new();
-        while let Some((node, parent)) = pending.pop() {
+    /// Bind a complete candidate inventory even when the file has no definitions.
+    pub fn with_root(mut self, root: Node<'tree>) -> Self {
+        if !self.roots.contains(&root.id()) {
+            self.roots.push(root.id());
+        }
+        self
+    }
+
+    pub fn from_root(root: Node<'tree>, source: &str) -> Self {
+        Self::from_root_while(root, source, &|| true).expect("uncancelled macro walk completes")
+    }
+
+    fn from_root_while(
+        root: Node<'tree>,
+        source: &str,
+        keep_going: &dyn Fn() -> bool,
+    ) -> Result<Self, crate::graph_support::RustCargoRouteError> {
+        use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, try_walk_named_tree_preorder};
+        let mut candidates = Vec::new();
+        try_walk_named_tree_preorder(root, true, |node| {
+            if !keep_going() {
+                return Err(crate::graph_support::RustCargoRouteError::Cancelled);
+            }
+            if node.kind() == "macro_definition" {
+                candidates.push(node);
+            }
+            Ok(WalkControl::Continue)
+        })?;
+        let mut textual: HashMap<usize, Vec<Node<'tree>>> = HashMap::default();
+        for node in candidates {
+            if let Some(parent) = node.parent() {
+                textual.entry(parent.id()).or_default().push(node);
+            }
+        }
+        let mut result = Self {
+            definitions: Vec::new(),
+            inventory: None,
+            textual,
+            roots: vec![root.id()],
+        };
+        try_walk_named_tree_preorder(root, true, |node| {
+            if !keep_going() {
+                return Err(crate::graph_support::RustCargoRouteError::Cancelled);
+            }
+            let parent = (node.id() != root.id()).then(|| node.parent()).flatten();
             if matches!(node.kind(), "macro_invocation" | "token_tree")
                 || crate::lexical_scope::rust_cfg_condition_with_parent(node, parent, source)
                     != crate::lexical_scope::RustCfgCondition::Always
             {
-                continue;
+                return Ok(WalkControl::SkipChildren);
             }
             if node.kind() == "macro_definition" {
                 if node.child_by_field_name("name").is_some_and(|name| {
@@ -135,20 +295,73 @@ impl<'tree> ExportedMacroDefinitions<'tree> {
                             "macro_export",
                         )
                 }) {
-                    definitions.push(node);
+                    result.definitions.push(node);
                 }
-                continue;
+                return Ok(WalkControl::SkipChildren);
             }
-            let mut cursor = node.walk();
-            pending.extend(
-                node.named_children(&mut cursor)
-                    .map(|child| (child, Some(node))),
+            Ok(WalkControl::Continue)
+        })?;
+        // The old explicit stack visited siblings in reverse source order.
+        result.definitions.reverse();
+        Ok(result)
+    }
+
+    fn textual_named(
+        &self,
+        scope: Node<'tree>,
+        name: &str,
+        source: &str,
+    ) -> Option<Vec<Node<'tree>>> {
+        use brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix;
+        if let Some(inventory) = self.inventory {
+            let mut root = scope;
+            while let Some(parent) = root.parent() {
+                root = parent;
+            }
+            if root.id() != inventory.tree.root_node().id() {
+                return None;
+            }
+            return Some(
+                inventory
+                    .textual
+                    .get(&scope.id())
+                    .and_then(|names| names.get(strip_raw_identifier_prefix(name)))
+                    .into_iter()
+                    .flatten()
+                    .map(|range| inventory.node(*range))
+                    .collect(),
             );
         }
-        Self { definitions }
+        let mut root = scope;
+        while let Some(parent) = root.parent() {
+            root = parent;
+        }
+        if !self.roots.contains(&root.id()) {
+            return None;
+        }
+        Some(
+            self.textual
+                .get(&scope.id())
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|node| {
+                    node.child_by_field_name("name").is_some_and(|declared| {
+                        crate::imports::rust_binding_name_matches(
+                            rust_node_text(declared, source),
+                            name,
+                        )
+                    })
+                })
+                .collect(),
+        )
     }
 
     fn unique_named(&self, name: &str, source: &str) -> Option<Node<'tree>> {
+        if let Some(inventory) = self.inventory {
+            let ranges = inventory.exports.get(name)?;
+            return (ranges.len() == 1).then(|| inventory.node(ranges[0]));
+        }
         let mut candidates = self.definitions.iter().copied().filter(|node| {
             node.child_by_field_name("name")
                 .is_some_and(|node| rust_node_text(node, source) == name)
@@ -301,7 +514,9 @@ pub fn macro_invocation_is_locally_bound<'tree>(
         return false;
     };
     let name = strip_raw_identifier_prefix(name);
-    if exported_definitions.definitions.iter().any(|definition| {
+    if exported_definitions.inventory.is_some_and(|inventory| {
+        inventory.exports.contains_key(name) || inventory.exports.contains_key(&format!("r#{name}"))
+    }) || exported_definitions.definitions.iter().any(|definition| {
         definition
             .child_by_field_name("name")
             .is_some_and(|declared| {
@@ -310,15 +525,19 @@ pub fn macro_invocation_is_locally_bound<'tree>(
     }) {
         return true;
     }
+    if macro_invocation_has_textual_definition(
+        invocation,
+        source,
+        Some(exported_definitions),
+        lexical_context,
+    ) {
+        return true;
+    }
     macro_lexical_scopes(invocation, lexical_context).any(|scope| {
         let mut cursor = scope.walk();
         scope.named_children(&mut cursor).any(|item| {
-            if item.kind() == "macro_definition" && item.end_byte() <= invocation.start_byte() {
-                return item.child_by_field_name("name").is_some_and(|declared| {
-                    strip_raw_identifier_prefix(rust_node_text(declared, source)) == name
-                });
-            }
-            item.kind() == "use_declaration"
+            crate::format_args::rust_logging_macro("log", name).is_none()
+                && item.kind() == "use_declaration"
                 && crate::imports::rust_imports_with_visibility_from_use_declaration(item, source)
                     .iter()
                     .any(|import| {
@@ -331,6 +550,55 @@ pub fn macro_invocation_is_locally_bound<'tree>(
                     })
         })
     })
+}
+
+/// Textual macro_rules bindings precede path/prelude resolution, including
+/// conditional definitions whose absence the identity proof cannot establish.
+fn macro_invocation_has_textual_definition<'tree>(
+    invocation: Node<'tree>,
+    source: &str,
+    exported: Option<&ExportedMacroDefinitions<'tree>>,
+    lexical_context: Node<'tree>,
+) -> bool {
+    let Some(name) =
+        crate::declarations::rust_unqualified_macro_invocation_name(invocation, source)
+    else {
+        return false;
+    };
+    macro_lexical_scopes(invocation, lexical_context).any(|scope| {
+        let cached = exported.and_then(|inventory| inventory.textual_named(scope, name, source));
+        let mut cursor = scope.walk();
+        let items = cached.unwrap_or_else(|| {
+            scope
+                .named_children(&mut cursor)
+                .filter(|item| item.kind() == "macro_definition")
+                .collect()
+        });
+        items.into_iter().any(|item| {
+            item.kind() == "macro_definition"
+                && item.end_byte() <= invocation.start_byte()
+                && item.child_by_field_name("name").is_some_and(|declared| {
+                    crate::imports::rust_binding_name_matches(
+                        rust_node_text(declared, source),
+                        name,
+                    )
+                })
+        })
+    })
+}
+
+/// Whether the invocation's terminal macro name is `matches`, in any path shape.
+/// Identity (std/core versus a shadowing macro) is a separate proof.
+pub fn invocation_names_matches(invocation: Node<'_>, source: &str) -> bool {
+    invocation
+        .child_by_field_name("macro")
+        .and_then(crate::graph_support::rust_path_segments)
+        .and_then(|segments| segments.last().copied())
+        .is_some_and(|name| {
+            brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix(rust_node_text(
+                name, source,
+            )) == "matches"
+        })
 }
 
 /// Fragment scopes precede the real source scope that contains their anchor.
@@ -374,8 +642,16 @@ fn local_macro_definition<'tree>(
     // Match through the same original-coordinate scopes as explicit imports.
     for scope in macro_lexical_scopes(invocation, lexical_context) {
         let mut cursor = scope.walk();
-        let definition = scope
-            .named_children(&mut cursor)
+        let cached =
+            exported_definitions.and_then(|inventory| inventory.textual_named(scope, name, source));
+        let items = cached.unwrap_or_else(|| {
+            scope
+                .named_children(&mut cursor)
+                .filter(|item| item.kind() == "macro_definition")
+                .collect()
+        });
+        let definition = items
+            .into_iter()
             .filter(|child| {
                 textual_name.is_some()
                     && child.kind() == "macro_definition"
@@ -384,7 +660,7 @@ fn local_macro_definition<'tree>(
                         .child_by_field_name("name")
                         .is_some_and(|node| rust_node_text(node, source) == name)
             })
-            .last();
+            .max_by_key(|node| node.start_byte());
         if let Some(definition) = definition {
             if crate::lexical_scope::rust_cfg_condition(definition, source)
                 != crate::lexical_scope::RustCfgCondition::Always
@@ -737,11 +1013,32 @@ fn consume_parsed_fragment(
     Some((start, end))
 }
 
+/// Source roles in the log crate's macro grammar. These are never persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RustLogOperandRole {
+    Target,
+    Level,
+    KeyValue { capture: RustLogCapture },
+    Format,
+    FormatArgument,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RustLogCapture {
+    ToValue,
+    Debug,
+    Display,
+    Error,
+    Sval,
+    Serde,
+}
+
 /// An operand parsed by the same fragment machinery used by native resolution.
 /// The tree is owned by one file derivation; its nodes use original coordinates.
 #[derive(Debug)]
 pub struct ParsedMacroOperand {
     pub binding: MacroBinding,
+    pub role: Option<RustLogOperandRole>,
     pub tree: tree_sitter::Tree,
 }
 
@@ -757,11 +1054,471 @@ impl ParsedMacroOperand {
 /// Read separators from token-tree structure, then parse every group using
 /// native fragment grammar. Items and malformed groups retain the caller's gap.
 pub fn parse_macro_operands(invocation: Node<'_>, source: &str) -> Option<Vec<ParsedMacroOperand>> {
+    #[cfg(test)]
+    if REFERENCE_OPERANDS.with(|reference| reference.get()) {
+        return parse_macro_operands_reference(invocation, source);
+    }
+    parse_macro_operands_while(invocation, source, &|| true)
+}
+
+fn parse_macro_operands_while(
+    invocation: Node<'_>,
+    source: &str,
+    keep_going: &dyn Fn() -> bool,
+) -> Option<Vec<ParsedMacroOperand>> {
+    if !keep_going() {
+        return None;
+    }
     let arguments = crate::declarations::rust_macro_invocation_arguments(invocation)?;
     let path = invocation.child_by_field_name("macro")?;
-    let matches_macro = crate::graph_support::rust_path_segments(path)
-        .and_then(|segments| segments.last().copied())
-        .is_some_and(|name| rust_node_text(name, source) == "matches");
+    let matches_macro = invocation_names_matches(invocation, source);
+    let captured = capture_macro_input(arguments, source, keep_going).ok()?;
+    let input_tree = MacroInputTree::new(&captured, keep_going).ok()?;
+    let (tokens, end_byte) = input_tree.root().interior(keep_going).ok()?;
+    let mut input = TokenCursor {
+        tokens,
+        index: 0,
+        end_byte,
+        source_start: captured.start_byte,
+    };
+    let segments = crate::graph_support::rust_path_segments(path)?;
+    let bare = segments.len() == 1;
+    let log_name = segments
+        .last()
+        .copied()
+        .map(|name| rust_node_text(name, source))
+        .filter(|name| {
+            (bare || rust_node_text(segments[0], source) == "log")
+                && crate::format_args::rust_logging_macro("log", name).is_some()
+        });
+    let mut roles = Vec::new();
+    let log_spans = if let Some(name) = log_name {
+        let saved_index = input.index;
+        match parse_log_operand_spans(&mut input, &captured.source, name, &mut roles) {
+            Some(spans) => Some(spans),
+            None if bare => {
+                input.index = saved_index;
+                roles.clear();
+                None
+            }
+            None => return None,
+        }
+    } else {
+        None
+    };
+    let spans = if let Some(spans) = log_spans {
+        spans
+    } else if matches_macro {
+        parse_matches_operands(&mut input, &captured.source)?
+    } else {
+        parse_expression_list(&mut input, &captured.source)?
+    };
+    if !keep_going() {
+        return None;
+    }
+    // Recomputing each operand's point from the file start is quadratic for a
+    // large file with many macro invocations; advance from the invocation.
+    let mut point = invocation.start_position();
+    let mut point_byte = invocation.start_byte();
+    spans
+        .into_iter()
+        .enumerate()
+        .map(|(index, (start_byte, end_byte))| {
+            if !keep_going() {
+                return None;
+            }
+            let binding = MacroBinding {
+                name: String::new(),
+                fragment: if matches_macro && index == 1 {
+                    MacroFragmentKind::Pat
+                } else {
+                    MacroFragmentKind::Expr
+                },
+                start_byte,
+                end_byte,
+                repetition_path: Vec::new(),
+                ident_role: None,
+            };
+            point = advance_point(
+                point,
+                source
+                    .get(point_byte..start_byte)
+                    .expect("macro operand starts after the invocation"),
+            );
+            point_byte = start_byte;
+            let tree = parse_bound_fragment_at(&binding, source, point)?;
+            let node = tree
+                .root_node()
+                .descendant_for_byte_range(start_byte, end_byte)?;
+            if tree.root_node().has_error()
+                || node.start_byte() != start_byte
+                || node.end_byte() != end_byte
+                || crate::declarations::rust_node_is_item(node)
+            {
+                return None;
+            }
+            Some(ParsedMacroOperand {
+                binding,
+                tree,
+                role: roles.get(index).copied(),
+            })
+        })
+        .collect()
+}
+
+// Separators and keys come from the captured token tree; all values use the
+// same native expression parser as ordinary macro operands.
+fn parse_log_operand_spans(
+    input: &mut TokenCursor<'_>,
+    source: &str,
+    name: &str,
+    roles: &mut Vec<RustLogOperandRole>,
+) -> Option<Vec<(usize, usize)>> {
+    use RustLogOperandRole::*;
+    let mut spans = Vec::new();
+    if matches!(input.tokens.as_slice(), [key, colon, ..]
+        if key.kind() == "identifier" && key.text() == "target" && colon.kind() == ":")
+    {
+        input.advance();
+        input.advance();
+        spans.push(consume_parsed_fragment(
+            MacroFragmentKind::Expr,
+            input,
+            source,
+        )?);
+        roles.push(Target);
+        if input.current()?.kind() != "," {
+            return None;
+        }
+        input.advance();
+    }
+    if name == "log" {
+        spans.push(consume_parsed_fragment(
+            MacroFragmentKind::Expr,
+            input,
+            source,
+        )?);
+        roles.push(Level);
+        if input.current()?.kind() != "," {
+            return None;
+        }
+        input.advance();
+    }
+    if input.tokens[input.index..]
+        .iter()
+        .any(|token| token.kind() == ";")
+    {
+        spans.extend(parse_log_key_values(input, source, roles)?);
+    }
+    let expressions = parse_comma_list(input, source)?;
+    if expressions.is_empty() {
+        return None;
+    }
+    for (index, span) in expressions.into_iter().enumerate() {
+        spans.push(span);
+        roles.push(if index == 0 { Format } else { FormatArgument });
+    }
+    Some(spans)
+}
+
+// The grammar, rather than token commas, owns list boundaries. In particular,
+// closure parameter and generic argument commas belong to their expressions.
+fn parse_operand_list_tree(
+    input: &TokenCursor<'_>,
+    source: &str,
+) -> Option<(tree_sitter::Tree, usize, usize)> {
+    let start = input.remaining_start()?;
+    let contents = source.get(start - input.source_start..input.end_byte - input.source_start)?;
+    let prefix = "fn __bifrost_list() { let _ = [";
+    let wrapped = format!("{prefix}{contents}\n]; }}");
+    let tree = parse_rust_tree_for_fragment(&wrapped)?;
+    if tree.root_node().has_error() {
+        return None;
+    }
+    Some((tree, prefix.len(), start))
+}
+
+// A direct-child semicolon separates expressions; semicolons within blocks,
+// arrays and other balanced token-tree groups remain inside those groups.
+fn parse_expression_list(input: &mut TokenCursor<'_>, source: &str) -> Option<Vec<(usize, usize)>> {
+    let mut spans = Vec::new();
+    let mut segment_start = input.index;
+    for segment_end in (input.index..input.tokens.len())
+        .filter(|&index| input.tokens[index].kind() == ";")
+        .chain(std::iter::once(input.tokens.len()))
+    {
+        let tokens = &input.tokens[segment_start..segment_end];
+        if segment_end != input.tokens.len()
+            && tokens.last().is_some_and(|token| token.kind() == ",")
+        {
+            return None;
+        }
+        if tokens.is_empty() {
+            if segment_end != input.tokens.len() {
+                return None;
+            }
+        } else {
+            let mut segment = TokenCursor {
+                tokens: tokens.to_vec(),
+                index: 0,
+                end_byte: input
+                    .tokens
+                    .get(segment_end)
+                    .map_or(input.end_byte, |separator| separator.start_byte()),
+                source_start: input.source_start,
+            };
+            spans.extend(parse_comma_list(&mut segment, source)?);
+        }
+        segment_start = segment_end + 1;
+    }
+    input.index = input.tokens.len();
+    Some(spans)
+}
+
+fn parse_comma_list(input: &mut TokenCursor<'_>, source: &str) -> Option<Vec<(usize, usize)>> {
+    if input.tokens[input.index..]
+        .iter()
+        .any(|token| token.kind() == ";")
+    {
+        return None;
+    }
+    let (tree, prefix, start) = parse_operand_list_tree(input, source)?;
+    let array = named_descendant(tree.root_node(), "array_expression")?;
+    let mut cursor = array.walk();
+    let mut spans = Vec::new();
+    for node in array
+        .named_children(&mut cursor)
+        .filter(|node| !node.is_extra())
+    {
+        // Attributes are not operands and cannot be silently dropped.
+        if node.kind() == "attribute_item" {
+            return None;
+        }
+        spans.push((
+            start + node.start_byte() - prefix,
+            start + node.end_byte() - prefix,
+        ));
+    }
+    // The released grammar accepts `[,]` as an empty array. Non-empty
+    // invocation input must expose at least one actual expression element.
+    if spans.is_empty() && input.current().is_some() {
+        return None;
+    }
+    input.index = input.tokens.len();
+    Some(spans)
+}
+
+fn parse_matches_operands(
+    input: &mut TokenCursor<'_>,
+    source: &str,
+) -> Option<Vec<(usize, usize)>> {
+    let scrutinee = consume_parsed_fragment(MacroFragmentKind::Expr, input, source)?;
+    if input.current()?.kind() != "," {
+        return None;
+    }
+    input.advance();
+    // Remove only the optional final separator selected from the token tree.
+    let end = input
+        .tokens
+        .last()
+        .filter(|token| token.kind() == ",")
+        .map_or(input.end_byte, |token| token.start_byte());
+    let start = input.remaining_start()?;
+    let body = source.get(start - input.source_start..end - input.source_start)?;
+    let prefix = "fn __bifrost_list() { match () { ";
+    let wrapped = format!("{prefix}{body}\n => (), }} }}");
+    let tree = parse_rust_tree_for_fragment(&wrapped)?;
+    if tree.root_node().has_error() {
+        return None;
+    }
+    let expression = named_descendant(tree.root_node(), "match_expression")?;
+    let arms = expression.child_by_field_name("body")?;
+    let mut cursor = arms.walk();
+    let mut children = arms
+        .named_children(&mut cursor)
+        .filter(|node| node.kind() == "match_arm");
+    let arm = children.next()?;
+    if children.next().is_some() {
+        return None;
+    }
+    let pattern = arm.child_by_field_name("pattern")?;
+    let value = arm.child_by_field_name("value")?;
+    let synthetic_value_start = prefix.len() + body.len() + "\n => ".len();
+    // The supplied text must be only this pattern/guard. An injected arm
+    // value or an attribute before the pattern is not an operand list.
+    if pattern.start_byte() != prefix.len()
+        || value.byte_range() != (synthetic_value_start..synthetic_value_start + 2)
+    {
+        return None;
+    }
+    let mut spans = vec![scrutinee];
+    let mut pattern_cursor = pattern.walk();
+    let base_pattern = pattern
+        .children(&mut pattern_cursor)
+        .find(|child| !child.is_extra())?;
+    spans.push((
+        start + base_pattern.start_byte() - prefix.len(),
+        start + base_pattern.end_byte() - prefix.len(),
+    ));
+    if let Some(guard) = pattern.child_by_field_name("condition") {
+        spans.push((
+            start + guard.start_byte() - prefix.len(),
+            start + guard.end_byte() - prefix.len(),
+        ));
+    }
+    input.index = input.tokens.len();
+    Some(spans)
+}
+
+// Keys and capture modifiers are token-tree syntax, independent of Rust
+// expression syntax. Replace assignment keys with same-width placeholders in
+// scratch, then let the list grammar select the unchanged value spans.
+fn parse_log_key_values(
+    input: &mut TokenCursor<'_>,
+    source: &str,
+    roles: &mut Vec<RustLogOperandRole>,
+) -> Option<Vec<(usize, usize)>> {
+    let remaining = &input.tokens[input.index..];
+    let separator = remaining
+        .iter()
+        .enumerate()
+        .find(|(index, token)| {
+            // A semicolon can itself be a token-tree assignment key. Its
+            // assignment/capture continuation distinguishes it from the delimiter.
+            token.kind() == ";"
+                && !remaining
+                    .get(index + 1)
+                    .is_some_and(|next| matches!(next.kind(), "=" | ":"))
+        })?
+        .0
+        + input.index;
+    let key_ends: HashMap<_, _> = input.tokens[input.index..separator]
+        .iter()
+        .map(|token| (token.start_byte(), token.end_byte()))
+        .collect();
+    if separator == input.index || input.tokens[separator - 1].kind() == "," {
+        return None;
+    }
+    let mut rewritten = source.as_bytes().to_vec();
+    let mut captures = HashMap::default();
+    let tokens = &input.tokens[input.index..separator];
+    for (index, candidate) in tokens.windows(3).enumerate() {
+        if candidate[1].kind() != ":"
+            || (index != 0 && tokens[index - 1].kind() != ",")
+            || tokens
+                .get(index + 3)
+                .is_some_and(|next| !matches!(next.kind(), "=" | ","))
+        {
+            continue;
+        }
+        // A capture is a complete token-tree preamble, not a type-name
+        // prefix. In particular, `debug::Type` and `debug<T, U>` in values
+        // must retain their colon and type tokens.
+        let capture = match candidate[2].text() {
+            "?" | "debug" => RustLogCapture::Debug,
+            "%" | "display" => RustLogCapture::Display,
+            "value" => RustLogCapture::ToValue,
+            "err" => RustLogCapture::Error,
+            "sval" => RustLogCapture::Sval,
+            "serde" => RustLogCapture::Serde,
+            _ => continue,
+        };
+        captures.insert(candidate[0].start_byte(), capture);
+        rewritten[candidate[1].start_byte() - input.source_start
+            ..candidate[2].end_byte() - input.source_start]
+            .fill(b' ');
+    }
+    let mut rewritten_keys = brokk_bifrost_core::hash::HashSet::default();
+    for (index, token) in tokens.iter().enumerate() {
+        if token.kind() != "=" || index == 0 {
+            continue;
+        }
+        let key_index = if index >= 3
+            && tokens[index - 2].kind() == ":"
+            && captures.contains_key(&tokens[index - 3].start_byte())
+        {
+            index - 3
+        } else {
+            index - 1
+        };
+        // Only preamble candidates may be rewritten. In particular, an
+        // assignment inside a value must retain its call/group/type syntax.
+        if key_index != 0 && tokens[key_index - 1].kind() != "," {
+            continue;
+        }
+        let key = tokens[key_index];
+        let range = key.start_byte() - input.source_start..key.end_byte() - input.source_start;
+        rewritten[range.clone()].fill(b' ');
+        rewritten[range.start] = b'k';
+        rewritten_keys.insert(key.start_byte());
+    }
+    let saved_end = input.end_byte;
+    input.end_byte = input.tokens[separator].start_byte();
+    let parsed = parse_operand_list_tree(
+        input,
+        std::str::from_utf8(&rewritten).expect("token rewrites preserve UTF-8"),
+    );
+    input.end_byte = saved_end;
+    let (tree, prefix, start) = parsed?;
+    let array = named_descendant(tree.root_node(), "array_expression")?;
+    let mut cursor = array.walk();
+    let mut spans = Vec::new();
+    for node in array
+        .named_children(&mut cursor)
+        .filter(|node| !node.is_extra())
+    {
+        let (key, value_start) = if node.kind() == "assignment_expression" {
+            // The released grammar groups chained assignments to the left.
+            // The original value starts at the first assignment's right field
+            // and extends through the whole list element.
+            let mut assignment = node;
+            while let Some(left) = assignment.child_by_field_name("left") {
+                if left.kind() != "assignment_expression" {
+                    break;
+                }
+                assignment = left;
+            }
+            (
+                assignment.child_by_field_name("left")?,
+                assignment.child_by_field_name("right")?.start_byte(),
+            )
+        } else if node.kind() == "identifier" {
+            (node, node.start_byte())
+        } else {
+            return None;
+        };
+        let key_start = start + key.start_byte() - prefix;
+        let key_end = start + key.end_byte() - prefix;
+        let original_end = *key_ends.get(&key_start)?;
+        let expected_end = if rewritten_keys.contains(&key_start) {
+            key_start + 1
+        } else {
+            original_end
+        };
+        if key_end != expected_end {
+            return None;
+        }
+        let capture = captures
+            .remove(&key_start)
+            .unwrap_or(RustLogCapture::ToValue);
+        roles.push(RustLogOperandRole::KeyValue { capture });
+        spans.push((
+            start + value_start - prefix,
+            start + node.end_byte() - prefix,
+        ));
+    }
+    input.index = separator + 1;
+    Some(spans)
+}
+
+#[cfg(test)]
+fn parse_macro_operands_reference(
+    invocation: Node<'_>,
+    source: &str,
+) -> Option<Vec<ParsedMacroOperand>> {
+    let arguments = crate::declarations::rust_macro_invocation_arguments(invocation)?;
+    let path = invocation.child_by_field_name("macro")?;
+    let matches_macro = invocation_names_matches(invocation, source);
     let captured = capture_macro_input(arguments, source, &|| true).ok()?;
     let input_tree = MacroInputTree::new(&captured, &|| true).ok()?;
     let (tokens, end_byte) = input_tree.root().interior(&|| true).ok()?;
@@ -771,26 +1528,98 @@ pub fn parse_macro_operands(invocation: Node<'_>, source: &str) -> Option<Vec<Pa
         end_byte,
         source_start: captured.start_byte,
     };
-    let mut spans = Vec::new();
-    while input.current().is_some() {
-        let fragment = if matches_macro && spans.len() == 1 {
-            MacroFragmentKind::Pat
-        } else {
-            MacroFragmentKind::Expr
-        };
-        spans.push(consume_parsed_fragment(
-            fragment,
-            &mut input,
-            &captured.source,
-        )?);
-        if let Some(separator) = input.current() {
-            if !matches!(separator.kind(), "," | ";") {
-                return None;
+    let segments = crate::graph_support::rust_path_segments(path)?;
+    let bare = segments.len() == 1;
+    let log_name = segments
+        .last()
+        .copied()
+        .map(|name| rust_node_text(name, source))
+        .filter(|name| {
+            (bare || rust_node_text(segments[0], source) == "log")
+                && crate::format_args::rust_logging_macro("log", name).is_some()
+        });
+    let mut roles = Vec::new();
+    let log_spans = if let Some(name) = log_name {
+        let saved_index = input.index;
+        match parse_log_operand_spans_reference(&mut input, &captured.source, name, &mut roles) {
+            Some(spans) => Some(spans),
+            None if bare => {
+                input.index = saved_index;
+                roles.clear();
+                None
             }
-            input.advance();
+            None => return None,
         }
-    }
-    if matches_macro && spans.len() != 2 {
+    } else {
+        None
+    };
+    // Set only when an explicit `if` separated a matches! pattern from its guard.
+    let mut guarded = false;
+    let spans = if let Some(spans) = log_spans {
+        spans
+    } else {
+        let mut spans = Vec::new();
+        while input.current().is_some() {
+            let fragment = if matches_macro && spans.len() == 1 {
+                MacroFragmentKind::Pat
+            } else {
+                MacroFragmentKind::Expr
+            };
+            // `matches!(scrutinee, pattern if guard)`: a top-level `if` token ends
+            // the pattern. Nested groups are single tokens, so this scan is
+            // structural.
+            if fragment == MacroFragmentKind::Pat
+                && let Some(guard_index) = input.tokens[input.index..]
+                    .iter()
+                    .position(|token| token.text() == "if")
+                    .map(|offset| input.index + offset)
+            {
+                let after_pattern_end = input.end_byte;
+                input.end_byte = input.tokens[guard_index].start_byte();
+                let pattern = consume_parsed_fragment(fragment, &mut input, &captured.source);
+                input.end_byte = after_pattern_end;
+                spans.push(pattern?);
+                if input.index != guard_index {
+                    return None;
+                }
+                input.advance();
+                spans.push(consume_parsed_fragment(
+                    MacroFragmentKind::Expr,
+                    &mut input,
+                    &captured.source,
+                )?);
+                // One optional trailing comma, then nothing.
+                if let Some(separator) = input.current() {
+                    if separator.kind() != "," {
+                        return None;
+                    }
+                    input.advance();
+                }
+                if input.current().is_some() {
+                    return None;
+                }
+                guarded = true;
+                break;
+            }
+            spans.push(consume_parsed_fragment(
+                fragment,
+                &mut input,
+                &captured.source,
+            )?);
+            if let Some(separator) = input.current() {
+                if (matches_macro && separator.kind() != ",")
+                    || !matches!(separator.kind(), "," | ";")
+                {
+                    return None;
+                }
+                input.advance();
+            }
+        }
+        spans
+    };
+    // Scrutinee and pattern, plus a guard only after an explicit `if`: a third
+    // comma-separated operand is malformed, not a guard.
+    if matches_macro && spans.len() != if guarded { 3 } else { 2 } {
         return None;
     }
     // Recomputing each operand's point from the file start is quadratic for a
@@ -831,9 +1660,119 @@ pub fn parse_macro_operands(invocation: Node<'_>, source: &str) -> Option<Vec<Pa
             {
                 return None;
             }
-            Some(ParsedMacroOperand { binding, tree })
+            Some(ParsedMacroOperand {
+                binding,
+                tree,
+                role: roles.get(index).copied(),
+            })
         })
         .collect()
+}
+
+// Separators and keys come from the captured token tree; all values use the
+// same native expression parser as ordinary macro operands.
+#[cfg(test)]
+fn parse_log_operand_spans_reference(
+    input: &mut TokenCursor<'_>,
+    source: &str,
+    name: &str,
+    roles: &mut Vec<RustLogOperandRole>,
+) -> Option<Vec<(usize, usize)>> {
+    use RustLogOperandRole::*;
+    let mut spans = Vec::new();
+    if matches!(input.tokens.as_slice(), [key, colon, ..]
+        if key.kind() == "identifier" && key.text() == "target" && colon.kind() == ":")
+    {
+        input.advance();
+        input.advance();
+        spans.push(consume_parsed_fragment(
+            MacroFragmentKind::Expr,
+            input,
+            source,
+        )?);
+        roles.push(Target);
+        if input.current()?.kind() != "," {
+            return None;
+        }
+        input.advance();
+    }
+    if name == "log" {
+        spans.push(consume_parsed_fragment(
+            MacroFragmentKind::Expr,
+            input,
+            source,
+        )?);
+        roles.push(Level);
+        if input.current()?.kind() != "," {
+            return None;
+        }
+        input.advance();
+    }
+    if input.tokens[input.index..]
+        .iter()
+        .any(|token| token.kind() == ";")
+    {
+        loop {
+            let key = input.current()?;
+            // A key is one token tree; shorthand keys must be identifiers.
+            input.advance();
+            let mut capture = RustLogCapture::ToValue;
+            if input.current().is_some_and(|token| token.kind() == ":") {
+                input.advance();
+                capture = match input.current()?.text() {
+                    "?" | "debug" => RustLogCapture::Debug,
+                    "%" | "display" => RustLogCapture::Display,
+                    "value" => RustLogCapture::ToValue,
+                    "err" => RustLogCapture::Error,
+                    "sval" => RustLogCapture::Sval,
+                    "serde" => RustLogCapture::Serde,
+                    _ => return None,
+                };
+                input.advance();
+            }
+            let span = if input.current().is_some_and(|token| token.kind() == "=") {
+                input.advance();
+                consume_parsed_fragment(MacroFragmentKind::Expr, input, source)?
+            } else {
+                if key.kind() != "identifier" {
+                    return None;
+                }
+                (key.start_byte(), key.end_byte())
+            };
+            spans.push(span);
+            roles.push(KeyValue { capture });
+            match input.current()?.kind() {
+                ";" => {
+                    input.advance();
+                    break;
+                }
+                "," => input.advance(),
+                _ => return None,
+            }
+        }
+    }
+    spans.push(consume_parsed_fragment(
+        MacroFragmentKind::Expr,
+        input,
+        source,
+    )?);
+    roles.push(Format);
+    while let Some(separator) = input.current() {
+        if separator.kind() != "," {
+            return None;
+        }
+        input.advance();
+        if input.current().is_none() {
+            break;
+        }
+        spans.push(consume_parsed_fragment(
+            MacroFragmentKind::Expr,
+            input,
+            source,
+        )?);
+        roles.push(FormatArgument);
+    }
+    Some(spans)
 }
 
 /// Parse a captured fragment and retain its original source coordinates.
@@ -849,6 +1788,32 @@ pub fn parse_bound_fragment(binding: &MacroBinding, source: &str) -> Option<tree
 }
 
 fn parse_bound_fragment_at(
+    binding: &MacroBinding,
+    source: &str,
+    start_position: tree_sitter::Point,
+) -> Option<tree_sitter::Tree> {
+    let (wrapped, prefix) = wrap_fragment(
+        binding.fragment,
+        &source[binding.start_byte..binding.end_byte],
+    );
+    // Source collectors key live nodes by identity. Cached Tree clones share
+    // subtree IDs, even after edits shift their coordinates. Each invocation
+    // therefore needs fresh nodes before rebasing, or a repeated closure's
+    // parameter can inherit the previous invocation's declaration occurrence.
+    let mut tree = parse_rust_tree_for_fragment(&wrapped)?;
+    tree.edit(&tree_sitter::InputEdit {
+        start_byte: 0,
+        old_end_byte: prefix,
+        new_end_byte: binding.start_byte,
+        start_position: tree_sitter::Point::new(0, 0),
+        old_end_position: tree_sitter::Point::new(0, prefix),
+        new_end_position: start_position,
+    });
+    Some(tree)
+}
+
+#[cfg(test)]
+fn parse_bound_fragment_at_reference(
     binding: &MacroBinding,
     source: &str,
     start_position: tree_sitter::Point,
@@ -1384,7 +2349,7 @@ impl MacroTranscriber {
                         {
                             Some(MacroTranscribedReferenceRole::Type)
                         }
-                        Some(brokk_bifrost_core::analyzer::structural::occurrences::OccurrenceRole::ValueReference)
+                        Some(brokk_bifrost_core::analyzer::structural::occurrences::OccurrenceRole::CalleePosition)
                             if node.kind() == "identifier"
                                 && node.parent().is_some_and(|parent| {
                                     parent.kind() == "call_expression"
@@ -2524,6 +3489,411 @@ mod tests {
     };
     use brokk_bifrost_test_macros::hardwon;
 
+    #[test]
+    #[hardwon("#10972: repeated embedded fragments must retain distinct source IDs and ordinals")]
+    fn operand_primary_rows_ids_ordinals() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = brokk_bifrost_core::analyzer::ProjectFile::new(
+            temp.path().canonicalize().unwrap(),
+            "src/lib.rs",
+        );
+        let source = r###"
+            fn f(value: i32, count: usize) {
+                take!(0xff, 1.5, true, 'x', b'x', "str", r#"raw"#, b"bytes", br#"raw"#, c"cstr", cr#"raw"#, -1);
+                take!(|x,y| x+y, target::<A,B>(), nested!(value, count));
+                take!(|x| x+1, |x| x+1);
+                vec![value; count];
+                matches!(value, Some(x) | Other(x) if x > 0);
+                matches!(compute(), _);
+                matches!(compute(), _ if predicate());
+                log::info!(target: destination(), key:? = value, count; "{}", value);
+                log::info!(type = compute(), "key":? = value, (grouped) = other(); "message");
+                log::info!(key = |x: debug::Type| x, other = |a, x: debug<T, U>| x; "message");
+            }
+        "###;
+        let tree = parse(source);
+        let new = crate::declarations::parse_rust_file(&file, source, &tree);
+        struct ReferenceReset;
+        impl Drop for ReferenceReset {
+            fn drop(&mut self) {
+                REFERENCE_OPERANDS.with(|reference| reference.set(false));
+            }
+        }
+        REFERENCE_OPERANDS.with(|reference| reference.set(true));
+        let reset = ReferenceReset;
+        let old = crate::declarations::parse_rust_file(&file, source, &tree);
+        drop(reset);
+        assert!(new.source_facts.is_some());
+        assert_eq!(
+            old.source_facts, new.source_facts,
+            "source and structural rows, IDs and ordinals"
+        );
+        assert_eq!(old.rust_usage_facts, new.rust_usage_facts);
+        assert_eq!(old.resolution_facts, new.resolution_facts);
+        assert_eq!(old.source_declaration_units, new.source_declaration_units);
+        assert_eq!(
+            old.source_declaration_metadata,
+            new.source_declaration_metadata
+        );
+        assert_eq!(old.top_level_declarations, new.top_level_declarations);
+        assert_eq!(old.imports, new.imports);
+        assert_eq!(old.ranges, new.ranges);
+    }
+
+    #[test]
+    fn operand_finalization_polls_cancellation() {
+        let source = "fn f() { take!(1, 2, 3); }";
+        let tree = parse(source);
+        let invocation = named_descendant(tree.root_node(), "macro_invocation").unwrap();
+        let polls = std::cell::Cell::new(0usize);
+        assert!(
+            parse_macro_operands_while(invocation, source, &|| {
+                let n = polls.get() + 1;
+                polls.set(n);
+                n < 3
+            })
+            .is_none()
+        );
+    }
+
+    fn fragment_tree_snapshot(tree: &tree_sitter::Tree) -> Vec<String> {
+        let mut result = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            result.push(format!(
+                "{} {:?} {:?} {:?} {} {} {} {}",
+                node.kind(),
+                node.byte_range(),
+                node.start_position(),
+                node.end_position(),
+                node.is_named(),
+                node.is_missing(),
+                node.is_error(),
+                node.has_error()
+            ));
+            let mut cursor = node.walk();
+            stack.extend(
+                node.children(&mut cursor)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev(),
+            );
+        }
+        result
+    }
+
+    fn operand_snapshot(operands: &Option<Vec<ParsedMacroOperand>>) -> Option<Vec<String>> {
+        operands.as_ref().map(|operands| {
+            operands
+                .iter()
+                .map(|operand| {
+                    format!(
+                        "{:?} {:?} {:?}",
+                        operand.binding,
+                        operand.role,
+                        fragment_tree_snapshot(&operand.tree)
+                    )
+                })
+                .collect()
+        })
+    }
+
+    fn macro_differential_fixture_sources() -> Vec<String> {
+        let mut sources = Vec::new();
+        for body in [
+            "",
+            "1",
+            "1,2,",
+            "0xff, 23u8, 1_000",
+            "1,,2",
+            ",",
+            "1;2",
+            "1;2;",
+            "left, right; flags, caps;",
+            "|x,y| x+y; f::<A,B>(), [value; count]",
+            "{let x=1;x}; [value;count], || {first();second()};",
+            "1;;2",
+            ";1",
+            "1;,",
+            "left,; right",
+            "left,;",
+            "left; middle,; right",
+            "left; middle, right,",
+            ";",
+            ";;",
+            "1 /* hi */,2",
+            "-1,-2",
+            "true,false",
+            "\"\u{e9}\",r#\"raw\"#",
+            "b'a',b\"abc\"",
+            "1.0,2e3",
+            "'a','b'",
+            "c\"abc\",cr#\"raw\"#",
+            "nested!(1,2),3",
+            "|x,y| x+y, 1",
+            "f::<A,B>(),1",
+            "{let x=1;x},2",
+            "#[cfg(a)] 1,2",
+            "1,+",
+            "1,(",
+        ] {
+            for name in ["vec", "qualified::list", "matches"] {
+                sources.push(format!("fn f() {{\n {name}![{body}];\n}}"));
+            }
+        }
+        for invocation in [
+            "matches!(value, Some(x) | Other(x) if x > 0)",
+            "matches!(value, Some(x), guard)",
+            "matches!(compute(), _)",
+            "matches!(compute(), _ if predicate())",
+            "matches!(value, Some(x) => dangerous(), None)",
+            "matches!(value, _ => dangerous(), _ if predicate())",
+            "matches!(value, #[attribute] _)",
+            "matches!(value, _ if match value { _ => true })",
+            "assert!(matches!(compute(), _))",
+            "assert!(matches!(compute(), _ if predicate()))",
+            "matches!(value, Some(x) if pred::<A,B>(x),)",
+            "matches!(value, Some(x) if |x,y| x+y)",
+            "info!(value; count;)",
+            "info!(value(); count)",
+            "log::info!(target: destination(), key:? = value, count; \"{}\", f::<A,B>())",
+            "log::info!(key = |x:debug,y| x+y; \"{}\", value)",
+            "log::info!(key = |x: debug::Type| x; \"message\")",
+            "log::info!(key = |x: debug<T, U>| x; \"message\")",
+            "log::info!(key:? = |x:debug,y| x+y; \"{}\", value)",
+            "log::info!(type = compute(); \"message\")",
+            "log::info!(type:? = compute(), \"key\":display = other(); \"message\")",
+            "log::info!((grouped) = compute(); \"message\")",
+            "log::info!(;:? = compute(); \"message\")",
+            "log::info!(key = value,; \"message\")",
+            "log::info!(\"key\"; \"message\")",
+            "log::info!(key:unknown = value; \"message\")",
+            "log::info!(key = ; \"message\")",
+            "log::info!(logger: logger, \"message\")",
+        ] {
+            sources.push(format!("fn f() {{ {invocation}; }}"));
+        }
+        sources
+    }
+
+    // This explicitly invoked development census is intentionally excluded from
+    // routine tests: its input is the current repository, including malformed
+    // fixtures, rather than a versioned expected output.
+    #[test]
+    #[ignore = "repository-wide development differential for #12363"]
+    fn macro_operand_corpus_differential() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let mut pending = vec![root.join("crates"), root.join("tests/fixtures")];
+        let mut files = Vec::new();
+        while let Some(path) = pending.pop() {
+            if path.is_dir() {
+                for entry in std::fs::read_dir(&path).unwrap() {
+                    let entry = entry.unwrap();
+                    if entry.file_type().unwrap().is_symlink() {
+                        continue;
+                    }
+                    if entry.file_name() == "target" || entry.file_name() == ".git" {
+                        continue;
+                    }
+                    pending.push(entry.path());
+                }
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                files.push(path);
+            }
+        }
+        files.sort();
+        let mut counts = [0usize; 5];
+        let mut report = String::new();
+        let mut inputs = files
+            .iter()
+            .map(|path| (path.clone(), std::fs::read_to_string(path).unwrap()))
+            .collect::<Vec<_>>();
+        inputs.extend(
+            macro_differential_fixture_sources()
+                .into_iter()
+                .enumerate()
+                .map(|(index, source)| {
+                    (root.join(format!("synthetic-recovery/{index}.rs")), source)
+                }),
+        );
+        for (path, source) in inputs {
+            let mut trees = vec![parse(&source)];
+            let mut seen = brokk_bifrost_core::hash::HashSet::default();
+            while let Some(tree) = trees.pop() {
+                let mut pending = vec![tree.root_node()];
+                while let Some(node) = pending.pop() {
+                    if node.kind() == "macro_invocation"
+                        && seen.insert((node.start_byte(), node.end_byte()))
+                    {
+                        let old = parse_macro_operands_reference(node, &source);
+                        let new = parse_macro_operands(node, &source);
+                        let class = match (&old, &new) {
+                            (None, None) => 0,
+                            (Some(_), Some(_))
+                                if operand_snapshot(&old) == operand_snapshot(&new) =>
+                            {
+                                1
+                            }
+                            (Some(_), Some(_)) => 2,
+                            (Some(_), None) => 3,
+                            (None, Some(_)) => 4,
+                        };
+                        counts[class] += 1;
+                        // Also discover invocations hidden inside opaque token
+                        // trees, through whichever operand path can expose them.
+                        for operand in new.as_ref().or(old.as_ref()).into_iter().flatten() {
+                            trees.push(operand.tree.clone());
+                        }
+                        if class >= 2 {
+                            report.push_str(&format!(
+                                "class={class} {}:{}:{} {:?}\nold={:?}\nnew={:?}\n",
+                                path.strip_prefix(root).unwrap().display(),
+                                node.start_position().row + 1,
+                                node.start_position().column + 1,
+                                &source[node.byte_range()],
+                                operand_snapshot(&old),
+                                operand_snapshot(&new)
+                            ));
+                        }
+                    }
+                    let mut cursor = node.walk();
+                    pending.extend(node.named_children(&mut cursor));
+                }
+            }
+        }
+        let output = std::env::var_os("MACRO_DIFFERENTIAL_REPORT")
+            .expect("set MACRO_DIFFERENTIAL_REPORT to an evidence path");
+        std::fs::write(
+            output,
+            format!(
+                "files={} counts [both-none,equal,differ,lost,gained]={counts:?}\n{report}",
+                files.len()
+            ),
+        )
+        .unwrap();
+        eprintln!("files={} counts={counts:?}", files.len());
+        assert_eq!(counts[2], 0, "both successful paths must agree");
+    }
+
+    #[test]
+    #[hardwon("#12363: list discovery must preserve recovered operand fragment contracts")]
+    fn literal_list_recovery_equivalence() {
+        for body in [
+            "",
+            "1",
+            "1,2,",
+            "0xff, 23u8, 1_000",
+            "1,,2",
+            ",",
+            "1;2",
+            "1 /* hi */,2",
+            "-1,-2",
+            "true,false",
+            "\"\u{e9}\",r#\"raw\"#",
+            "b'a',b\"abc\"",
+            "1.0,2e3",
+            "'a','b'",
+            "c\"abc\",c\"def\"",
+            "nested!(1,2),3",
+            "|x,y| x+y, 1",
+            "f::<A,B>(),1",
+            "{let x=1;x},2",
+            "#[cfg(a)] 1,2",
+            "1,+",
+            "1,(",
+        ] {
+            for name in ["vec", "qualified::list", "matches"] {
+                let source = format!("fn f() {{\n    {name}![{body}];\n}}");
+                let tree = parse(&source);
+                let invocation = named_descendant(tree.root_node(), "macro_invocation").unwrap();
+                let old = parse_macro_operands_reference(invocation, &source);
+                let new = parse_macro_operands(invocation, &source);
+                // Recovery may fail closed under the new list context. When
+                // both succeed, all tree fields and operand metadata agree.
+                if old.is_some() && new.is_some() {
+                    assert_eq!(operand_snapshot(&old), operand_snapshot(&new), "{source}");
+                }
+                if name != "matches"
+                    && [
+                        "1",
+                        "1,2,",
+                        "0xff, 23u8, 1_000",
+                        "-1,-2",
+                        "true,false",
+                        "\"\u{e9}\",r#\"raw\"#",
+                        "b'a',b\"abc\"",
+                        "1.0,2e3",
+                        "'a','b'",
+                        "c\"abc\",c\"def\"",
+                    ]
+                    .contains(&body)
+                {
+                    assert!(new.is_some(), "{source}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#11221+#10972: operand discovery must preserve public fragment trees and coordinates"
+    )]
+    fn bound_fragment_tree_contract() {
+        for text in [
+            "0xff",
+            "-1",
+            "foo",
+            "\"\u{e9}\"",
+            "true",
+            "1.0",
+            "'x'",
+            "b'x'",
+            "b\"x\"",
+            "r#\"x\"#",
+            "c\"x\"",
+            "f::<A,B>()",
+            "|x,y| x+y",
+            "{1}",
+            "",
+            "(",
+            ",",
+            "1 +",
+        ] {
+            for fragment in [
+                MacroFragmentKind::Expr,
+                MacroFragmentKind::Pat,
+                MacroFragmentKind::Stmt,
+            ] {
+                let source = format!("// \u{e9}\n  {text}\n");
+                let prefix = "// \u{e9}\n  ";
+                let binding = MacroBinding {
+                    name: String::new(),
+                    fragment,
+                    start_byte: prefix.len(),
+                    end_byte: prefix.len() + text.len(),
+                    repetition_path: vec![],
+                    ident_role: None,
+                };
+                let expected = parse_bound_fragment_at_reference(
+                    &binding,
+                    &source,
+                    tree_sitter::Point::new(1, 2),
+                );
+                assert_eq!(
+                    parse_bound_fragment(&binding, &source)
+                        .as_ref()
+                        .map(fragment_tree_snapshot),
+                    expected.as_ref().map(fragment_tree_snapshot),
+                    "{fragment:?}: {text}"
+                );
+            }
+        }
+    }
+
     fn parse(source: &str) -> tree_sitter::Tree {
         parse_rust_tree_for_fragment(source).expect("parse rust fixture")
     }
@@ -2542,6 +3912,80 @@ mod tests {
 
     fn binding_text<'a>(source: &'a str, binding: &MacroBinding) -> &'a str {
         &source[binding.start_byte..binding.end_byte]
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12363: macro operand discovery reparsed the remaining suffix for each operand"
+    )]
+    fn macro_operand_parsed_bytes() {
+        for n in [64, 128, 256] {
+            let source = format!("fn f() {{ vec![{}, ]; }}", vec!["0xff"; n].join(", "));
+            let tree = parse(&source);
+            let invocation = named_descendant(tree.root_node(), "macro_invocation").unwrap();
+            FRAGMENT_PARSED_BYTES.with(|bytes| bytes.set(0));
+            let operands = parse_macro_operands(invocation, &source).unwrap();
+            let bytes = FRAGMENT_PARSED_BYTES.with(|bytes| bytes.get());
+            assert_eq!(operands.len(), n);
+            eprintln!("macro_operand_parsed_bytes n={n} bytes={bytes}");
+            assert!(bytes <= 40 * n + 64, "n={n} bytes={bytes}");
+        }
+        for expression in [
+            "-123",
+            "1.25",
+            "true",
+            "'x'",
+            "b'x'",
+            "\"x\"",
+            "r#\"raw\"#",
+            "b\"x\"",
+            "c\"x\"",
+            "|x,y| x+y",
+            "f::<A,B>()",
+        ] {
+            for n in [64, 128, 256] {
+                let source = format!("fn f() {{ take![{}]; }}", vec![expression; n].join(", "));
+                let tree = parse(&source);
+                let invocation = named_descendant(tree.root_node(), "macro_invocation").unwrap();
+                FRAGMENT_PARSED_BYTES.with(|bytes| bytes.set(0));
+                assert_eq!(parse_macro_operands(invocation, &source).unwrap().len(), n);
+                let bytes = FRAGMENT_PARSED_BYTES.with(|bytes| bytes.get());
+                assert!(
+                    bytes <= 2 * source.len() + 40 * n + 64,
+                    "{expression} n={n} bytes={bytes}"
+                );
+                eprintln!(
+                    "macro_operand_parsed_bytes expression={expression:?} n={n} bytes={bytes}"
+                );
+            }
+        }
+        for n in [64, 128, 256] {
+            let body = (0..n)
+                .map(|index| if index % 2 == 0 { "0xff, " } else { "0xff; " })
+                .collect::<String>();
+            let source = format!("fn f() {{ take![{body}]; }}");
+            let tree = parse(&source);
+            let invocation = named_descendant(tree.root_node(), "macro_invocation").unwrap();
+            FRAGMENT_PARSED_BYTES.with(|bytes| bytes.set(0));
+            let new = parse_macro_operands(invocation, &source);
+            let new_bytes = FRAGMENT_PARSED_BYTES.with(|bytes| bytes.get());
+            assert_eq!(new.as_ref().unwrap().len(), n);
+            assert!(new_bytes <= 60 * n + 64, "mixed n={n} bytes={new_bytes}");
+            FRAGMENT_PARSED_BYTES.with(|bytes| bytes.set(0));
+            let old = parse_macro_operands_reference(invocation, &source);
+            let old_bytes = FRAGMENT_PARSED_BYTES.with(|bytes| bytes.get());
+            assert_eq!(operand_snapshot(&old), operand_snapshot(&new));
+            eprintln!("macro_operand_parsed_bytes mixed n={n} old={old_bytes} new={new_bytes}");
+        }
+        let source = "fn f() { vec![value; count]; }";
+        let tree = parse(source);
+        let invocation = named_descendant(tree.root_node(), "macro_invocation").unwrap();
+        FRAGMENT_PARSED_BYTES.with(|bytes| bytes.set(0));
+        assert_eq!(parse_macro_operands(invocation, source).unwrap().len(), 2);
+        eprintln!(
+            "macro_operand_parsed_bytes repeat bytes={}",
+            FRAGMENT_PARSED_BYTES.with(|bytes| bytes.get())
+        );
     }
 
     #[test]
@@ -2863,6 +4307,308 @@ mod tests {
                 );
                 assert!(occurrences.iter().all(|row| row.provenance == brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceProvenance::Embedded), "{occurrences:?}");
             }
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10930: unrelated logging-shaped macros lost their operands"
+    )]
+    fn unrelated_logging_names_keep_generic_operands() {
+        for input in ["other::log!(value)", "info!(value; count;)"] {
+            let source = format!("fn f() {{ {input}; }}");
+            let tree = parse(&source);
+            let invocation = named_descendant(tree.root_node(), "macro_invocation").unwrap();
+            let operands = parse_macro_operands(invocation, &source).unwrap();
+            assert_eq!(
+                operands.len(),
+                if input.starts_with("other") { 1 } else { 2 }
+            );
+            assert_eq!(operands[0].node().kind(), "identifier");
+            assert_eq!(
+                &source[operands[0].binding.start_byte..operands[0].binding.end_byte],
+                "value"
+            );
+            assert!(operands.iter().all(|operand| operand.role.is_none()));
+        }
+    }
+
+    #[test]
+    #[hardwon("#12363: logging token-tree keys were parsed as Rust expressions")]
+    fn logging_token_tree_key_equivalence() {
+        for key in [
+            "type",
+            "match",
+            "true",
+            "42",
+            "\"key\"",
+            "(grouped)",
+            "[grouped, key]",
+            "{grouped}",
+            "+",
+            ",",
+            ";",
+        ] {
+            for modifier in ["", ":?", ":display"] {
+                for value in [
+                    "compute()",
+                    "make() = rhs",
+                    "make::<T> = rhs",
+                    "(left) = rhs",
+                    "|x,y| x+y",
+                    "|x:debug,y| x+y",
+                    "|x: debug::Type| x",
+                    "|x: debug<T, U>| x",
+                    "|a, x: debug::Type| x",
+                    "|a, x: debug<T, U>| x",
+                    "|a, x: debug, y| x",
+                ] {
+                    let source =
+                        format!("fn f() {{ log::info!({key}{modifier} = {value}; \"message\"); }}");
+                    let tree = parse(&source);
+                    let invocation =
+                        named_descendant(tree.root_node(), "macro_invocation").unwrap();
+                    let old = parse_macro_operands_reference(invocation, &source);
+                    let new = parse_macro_operands(invocation, &source);
+                    assert!(old.is_some(), "{source}");
+                    assert_eq!(operand_snapshot(&old), operand_snapshot(&new), "{source}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon("#12363: matches wildcard patterns are anonymous grammar children")]
+    fn matches_pattern_operand_equivalence() {
+        for pattern in [
+            "_",
+            "_ if predicate()",
+            "_ if match value { _ => true }",
+            "Some(_) | Other(_) if predicate()",
+            "Some(x)",
+            "true",
+            "-1",
+        ] {
+            let source = format!("fn f() {{ matches!(compute(), {pattern}); }}");
+            let tree = parse(&source);
+            let invocation = named_descendant(tree.root_node(), "macro_invocation").unwrap();
+            let old = parse_macro_operands_reference(invocation, &source);
+            let new = parse_macro_operands(invocation, &source);
+            assert!(old.is_some(), "{source}");
+            assert_eq!(operand_snapshot(&old), operand_snapshot(&new), "{source}");
+        }
+    }
+
+    #[test]
+    #[hardwon("#12363: synthetic matches arms must not hide supplied input")]
+    fn matches_rejects_supplied_arms() {
+        for pattern in [
+            "Some(x) => dangerous(), None",
+            "_ => dangerous(), _ if predicate()",
+            "_ => dangerous(), _ => other(), _",
+            "#[attribute] _",
+        ] {
+            let source = format!("fn f() {{ matches!(value, {pattern}); }}");
+            let tree = parse(&source);
+            let invocation = named_descendant(tree.root_node(), "macro_invocation").unwrap();
+            assert!(
+                parse_macro_operands_reference(invocation, &source).is_none(),
+                "{source}"
+            );
+            assert!(
+                parse_macro_operands(invocation, &source).is_none(),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon("#12363: valid mixed-separator lists must preserve every expression")]
+    fn mixed_separator_operand_equivalence() {
+        for body in [
+            "left, right; flags, caps",
+            "left; middle, right;",
+            "|x,y| x+y; f::<A,B>(), [value; count]",
+            "{let x=1;x}; [value;count], || {first();second()};",
+            "value; count",
+            "value; count;",
+            "left; middle, right,",
+        ] {
+            let source = format!("fn f() {{ take!({body}); }}");
+            let tree = parse(&source);
+            let invocation = named_descendant(tree.root_node(), "macro_invocation").unwrap();
+            let old = parse_macro_operands_reference(invocation, &source);
+            let new = parse_macro_operands(invocation, &source);
+            assert!(old.is_some(), "{source}");
+            assert_eq!(operand_snapshot(&old), operand_snapshot(&new), "{source}");
+        }
+        for body in [
+            ",",
+            ",,",
+            ";",
+            ";;",
+            "1;;2",
+            ";1",
+            "1;,",
+            "1;;",
+            "left,; right",
+            "left,;",
+            "left; middle,; right",
+        ] {
+            let source = format!("fn f() {{ take!({body}); }}");
+            let tree = parse(&source);
+            let invocation = named_descendant(tree.root_node(), "macro_invocation").unwrap();
+            assert!(
+                parse_macro_operands(invocation, &source).is_none(),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn logging_key_value_grammar_roles() {
+        use RustLogOperandRole::*;
+        for (input, expected) in [
+            (
+                r#"log::info!(key = compute(); "{}", value)"#,
+                vec![
+                    KeyValue {
+                        capture: RustLogCapture::ToValue,
+                    },
+                    Format,
+                    FormatArgument,
+                ],
+            ),
+            (
+                r#"log::info!(target: destination(), key = compute(); "{}", value)"#,
+                vec![
+                    Target,
+                    KeyValue {
+                        capture: RustLogCapture::ToValue,
+                    },
+                    Format,
+                    FormatArgument,
+                ],
+            ),
+            (
+                r#"log::info!(key; "message")"#,
+                vec![
+                    KeyValue {
+                        capture: RustLogCapture::ToValue,
+                    },
+                    Format,
+                ],
+            ),
+            (
+                r#"log::log!(level(), key = compute(); "message")"#,
+                vec![
+                    Level,
+                    KeyValue {
+                        capture: RustLogCapture::ToValue,
+                    },
+                    Format,
+                ],
+            ),
+        ] {
+            let source = format!("fn f() {{ {input}; }}");
+            let tree = parse(&source);
+            let invocation = named_descendant(tree.root_node(), "macro_invocation").unwrap();
+            let operands = parse_macro_operands(invocation, &source).unwrap();
+            assert_eq!(
+                operands
+                    .iter()
+                    .map(|operand| operand.role.unwrap())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(
+                operands[0].node().kind(),
+                if input.contains("target:")
+                    || input.contains("level()")
+                    || input.contains("compute()")
+                {
+                    "call_expression"
+                } else {
+                    "identifier"
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn logging_capture_tokens_are_native_value_fragments() {
+        for (modifier, capture) in [
+            ("?", RustLogCapture::Debug),
+            ("debug", RustLogCapture::Debug),
+            ("%", RustLogCapture::Display),
+            ("display", RustLogCapture::Display),
+            ("value", RustLogCapture::ToValue),
+            ("err", RustLogCapture::Error),
+            ("sval", RustLogCapture::Sval),
+            ("serde", RustLogCapture::Serde),
+        ] {
+            let source =
+                format!(r#"fn f() {{ log::info!(key:{modifier} = compute(); "message"); }}"#);
+            let tree = parse(&source);
+            let invocation = named_descendant(tree.root_node(), "macro_invocation").unwrap();
+            let operands = parse_macro_operands(invocation, &source).unwrap();
+            assert_eq!(
+                operands[0].role,
+                Some(RustLogOperandRole::KeyValue { capture })
+            );
+            assert_eq!(operands[0].node().kind(), "call_expression");
+        }
+    }
+
+    #[test]
+    fn malformed_logging_key_value_lists_stay_opaque() {
+        for input in [
+            r#"log::info!(key = value,; "message")"#,
+            r#"log::info!("key"; "message")"#,
+            r#"log::info!(key:unknown = value; "message")"#,
+            r#"log::info!(key = ; "message")"#,
+            r#"log::info!(logger: logger, "message")"#,
+        ] {
+            let source = format!("fn f() {{ {input}; }}");
+            let tree = parse(&source);
+            let invocation = named_descendant(tree.root_node(), "macro_invocation").unwrap();
+            assert!(
+                parse_macro_operands(invocation, &source).is_none(),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn logging_target_and_level_are_native_expression_fragments() {
+        let source =
+            "fn f() { log::log!(target: destination(), log::Level::Info, \"{}\", value); }";
+        let tree = parse(source);
+        let invocation = named_descendant(tree.root_node(), "macro_invocation").unwrap();
+        let operands = parse_macro_operands(invocation, source).unwrap();
+        assert_eq!(
+            operands
+                .iter()
+                .map(|operand| operand.node().kind())
+                .collect::<Vec<_>>(),
+            [
+                "call_expression",
+                "scoped_identifier",
+                "string_literal",
+                "identifier"
+            ]
+        );
+        assert_eq!(
+            rust_node_text(operands[1].node(), source),
+            "log::Level::Info"
+        );
+        for source in [
+            "fn f() { log::info!(other: destination(), \"{}\", value); }",
+            "fn f() { println!(target: destination(), \"{}\", value); }",
+        ] {
+            let tree = parse(source);
+            let invocation = named_descendant(tree.root_node(), "macro_invocation").unwrap();
+            assert!(parse_macro_operands(invocation, source).is_none());
         }
     }
 
@@ -3853,5 +5599,933 @@ pub fn lower_selected_macro_input_with_sources(
         facts: output.facts,
         sources: output.source_facts,
         declarations: output.declaration_sources,
+    }
+}
+
+pub fn rust_standard_macro_prelude_owner(member: &str) -> Option<&'static str> {
+    match member {
+        "format" => Some("alloc"),
+        "format_args" | "write" | "writeln" | "panic" | "assert" | "assert_eq" | "assert_ne"
+        | "debug_assert" | "debug_assert_eq" | "debug_assert_ne" | "unreachable" | "todo"
+        | "unimplemented" | "matches" => Some("core"),
+        "print" | "println" | "eprint" | "eprintln" => Some("std"),
+        "dbg" => Some("std"),
+        "vec" => Some("alloc"),
+        _ => None,
+    }
+}
+
+pub fn rust_standard_macro_in_crate(owner: &str, member: &str) -> bool {
+    match owner {
+        "std" => rust_standard_macro_prelude_owner(member).is_some(),
+        "core" => matches!(
+            member,
+            "format_args"
+                | "write"
+                | "writeln"
+                | "panic"
+                | "assert"
+                | "assert_eq"
+                | "assert_ne"
+                | "debug_assert"
+                | "debug_assert_eq"
+                | "debug_assert_ne"
+                | "unreachable"
+                | "todo"
+                | "unimplemented"
+                | "matches"
+        ),
+        "alloc" => matches!(member, "format" | "vec"),
+        _ => false,
+    }
+}
+
+/// Source scopes supplied by native operand parsing retain original offsets.
+pub struct RustMacroSourceScope<'a> {
+    pub byte: usize,
+    pub leading_absolute: bool,
+    pub fragments: &'a [tree_sitter::Tree],
+    pub source: &'a str,
+}
+
+pub fn rust_macro_root_is_shadowed_in_scopes(
+    rust: &dyn crate::graph_support::RustFactSource,
+    walks: &crate::usage_walks::RustUsageWalks<'_>,
+    file: &brokk_bifrost_core::analyzer::model::ProjectFile,
+    root_name: &str,
+    scope: &RustMacroSourceScope<'_>,
+) -> Result<bool, crate::graph_support::RustCargoRouteError> {
+    let byte = scope.byte;
+    let leading_absolute = scope.leading_absolute;
+    let legacy_paths = walks.uses_rust_2015_edition(file);
+    if !leading_absolute {
+        for fragment in scope.fragments {
+            let root = fragment.root_node();
+            if root.has_error() {
+                return Ok(true);
+            }
+            // Full-source lexical caches cannot hold rebased fragment roots.
+            // Project imports directly with their parser-owned scope extents.
+            for import in crate::imports::rust_import_projection(root, scope.source, "") {
+                use crate::imports::RustImportOwner;
+                let (start, end) = match import.owner {
+                    RustImportOwner::Module { start, end, .. }
+                    | RustImportOwner::LocalOnly { start, end, .. } => (start, end),
+                };
+                // Conservative by design: even identity-preserving fragment imports refuse.
+                if start <= byte
+                    && byte < end
+                    && import.import.binding_name().named() == Some(root_name)
+                {
+                    return Ok(true);
+                }
+            }
+            let mut node = root.named_descendant_for_byte_range(byte, byte + 1);
+            while let Some(current) = node {
+                if matches!(current.kind(), "block" | "declaration_list") {
+                    let mut cursor = current.walk();
+                    for child in current.named_children(&mut cursor) {
+                        if matches!(
+                            child.kind(),
+                            "mod_item"
+                                | "struct_item"
+                                | "enum_item"
+                                | "union_item"
+                                | "trait_item"
+                                | "type_item"
+                        ) && child.child_by_field_name("name").is_some_and(|name| {
+                            brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix(
+                                crate::declarations::rust_node_text(name, scope.source),
+                            ) == root_name
+                        }) {
+                            return Ok(true);
+                        }
+                        // An opaque sibling expansion can introduce a path binding.
+                        // Do not descend into item bodies or sibling lexical scopes.
+                        let expression = if child.kind() == "expression_statement" {
+                            child.named_child(0).unwrap_or(child)
+                        } else {
+                            child
+                        };
+                        if expression.kind() == "macro_invocation"
+                            && !(expression.start_byte() <= byte && byte < expression.end_byte())
+                        {
+                            return Ok(true);
+                        }
+                    }
+                }
+                node = current.parent();
+            }
+        }
+    }
+    let extern_only = leading_absolute && !legacy_paths;
+    let modules = if leading_absolute {
+        let roots = walks.target_roots_of(file);
+        if roots.is_empty() {
+            return Ok(true);
+        }
+        let mut modules = Vec::with_capacity(roots.len());
+        for root in &roots {
+            let Some(module) = walks.physical_root_of(root) else {
+                return Ok(true);
+            };
+            modules.push(module);
+        }
+        modules
+    } else {
+        walks
+            .queries()
+            .module_at_byte(file, byte)?
+            .into_iter()
+            .collect()
+    };
+    if modules.is_empty() {
+        return Ok(true);
+    }
+    for module in &modules {
+        // Import extents are byte offsets in the file that owns the module.
+        // A leading absolute path in an out-of-line module is rooted in the
+        // target root file, so test the root module's scope at its start.
+        let scope_byte = if leading_absolute { 0 } else { byte };
+        for candidate_file in walks.files_for_module(module).iter() {
+            let facts = walks.queries().declaration_facts_of(candidate_file)?;
+            if !extern_only
+                && facts.identities.iter().any(|(_, identity)| {
+                    identity.module == *module
+                        && identity.name == root_name
+                        && identity
+                            .namespace
+                            .accepts(crate::usage::RustReferenceNamespace::PathPrefix)
+                })
+            {
+                return Ok(true);
+            }
+            let bindings = walks.bindings_at(candidate_file, module)?;
+            // In 2018+, a glob competing with an extern-prelude name during
+            // macro resolution is rustc E0659. Under the analyzer's assumption
+            // that the program compiles, a glob cannot shadow that crate name.
+            for binding in walks.import_bindings_of(candidate_file)?.iter() {
+                if binding.importer_module != *module || !binding.extent.contains(scope_byte) {
+                    continue;
+                }
+                if extern_only && !binding.is_extern_crate {
+                    continue;
+                }
+                if binding.local_name.named() == Some(root_name) {
+                    // Canonical import segments retain the extern-crate name field.
+                    // A direct crate import preserves identity only when Cargo selects
+                    // that exposed name (or it is the corresponding standard crate).
+                    let same_external_crate = binding.path.as_slice() == [root_name]
+                        && (matches!(root_name, "std" | "core" | "alloc")
+                            || rust
+                                .selected_dependency_package(candidate_file, root_name)
+                                .map_err(|_| {
+                                    crate::graph_support::RustCargoRouteError::Unavailable
+                                })?
+                                .as_str()
+                                == root_name)
+                        && (binding.is_extern_crate
+                            || walks
+                                .resolve_segments(candidate_file, &module.package(), &binding.path)?
+                                .is_empty());
+                    if same_external_crate {
+                        continue;
+                    }
+                    // A known log macro export binds only the macro namespace.
+                    // External macro declarations need not be mounted, so absence
+                    // from `bindings` alone cannot make this a path-prefix shadow.
+                    let macro_only = matches!(binding.path.as_slice(), [exposed, member]
+                        if exposed == root_name
+                            && crate::format_args::rust_logging_macro("log", member).is_some())
+                        && rust
+                            .selected_dependency_package(candidate_file, root_name)
+                            .map_err(|_| crate::graph_support::RustCargoRouteError::Unavailable)?
+                            .as_str()
+                            == "log"
+                        && !bindings.iter().any(|bound| {
+                            bound.name == root_name
+                                && bound
+                                    .namespace
+                                    .accepts(crate::usage::RustReferenceNamespace::PathPrefix)
+                        });
+                    if macro_only {
+                        continue;
+                    }
+                    if binding.is_extern_crate
+                        || !bindings.iter().any(|bound| bound.name == root_name)
+                        || bindings.iter().any(|bound| {
+                            bound.name == root_name
+                                && bound
+                                    .namespace
+                                    .accepts(crate::usage::RustReferenceNamespace::PathPrefix)
+                        })
+                    {
+                        return Ok(true);
+                    }
+                } else if legacy_paths && binding.local_name.is_glob() {
+                    return Ok(true);
+                }
+            }
+        }
+        if extern_only {
+            continue;
+        }
+        let root = vec![root_name.to_owned()];
+        if !walks
+            .resolve_segments(file, &module.package(), &root)?
+            .is_empty()
+        {
+            return Ok(true);
+        }
+        let routes = walks.origin_routes_of(file)?;
+        if routes.get(root_name).is_some_and(|routes| {
+            routes.iter().any(|route| {
+                route.importer_module == *module
+                    && route.extent.contains(scope_byte)
+                    && route
+                        .namespace
+                        .accepts(crate::usage::RustReferenceNamespace::PathPrefix)
+            })
+        }) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The library crate that owns a standard macro.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StandardMacroOwner {
+    Std,
+    Core,
+    Alloc,
+}
+
+impl StandardMacroOwner {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Std => "std",
+            Self::Core => "core",
+            Self::Alloc => "alloc",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StandardMacroIdentityUnknown {
+    Route(crate::graph_support::RustCargoRouteError),
+    ExternalGlobInventoryUnavailable,
+    Ambiguous,
+    PreludeDisabled,
+    Unresolved,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StandardMacroIdentity {
+    Standard {
+        owner: StandardMacroOwner,
+        member: String,
+    },
+    NotStandard,
+    LocallyBound,
+    Shadowed,
+    Unknown(StandardMacroIdentityUnknown),
+}
+
+/// Exact source revision of nightly-2026-08-24's standard library, audited for
+/// enclosing-scope item freedom (#11532). Other selected libraries fail closed.
+pub const ITEM_FREE_MACRO_STDLIB_REVISION: &str = "fb6531d550e0075b9eb9a51464f404805eec87d9";
+
+/// This proves only that no items enter the invocation's enclosing scope.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StandardMacroLexicalEffect {
+    NoItemsIntroduced,
+    Unknown,
+}
+
+/// Audited expansion shapes at ITEM_FREE_MACRO_STDLIB_REVISION:
+/// print/eprint create a block with an I/O formatting call; println/eprintln
+/// delegate their empty arm to those macros and otherwise create the same block.
+/// assert is a compiler expression (rustc_builtin_macros/src/assert.rs).
+/// assert_eq/assert_ne create block-wrapped match expressions; all locals stay
+/// in the match arms. debug_assert/debug_assert_eq/debug_assert_ne create an if
+/// expression whose block invokes the corresponding hygienic assertion macro.
+/// An item inside an argument block remains inside that block, not this scope.
+pub fn standard_macro_lexical_effect(
+    identity: &StandardMacroIdentity,
+    selected_stdlib_revision: &str,
+) -> StandardMacroLexicalEffect {
+    let StandardMacroIdentity::Standard { owner, member } = identity else {
+        return StandardMacroLexicalEffect::Unknown;
+    };
+    if selected_stdlib_revision == ITEM_FREE_MACRO_STDLIB_REVISION
+        && rust_item_free_macro_candidate(member)
+        && rust_standard_macro_in_crate(owner.as_str(), member)
+    {
+        StandardMacroLexicalEffect::NoItemsIntroduced
+    } else {
+        StandardMacroLexicalEffect::Unknown
+    }
+}
+
+/// A syntax candidate only; identity and selected-library audit are required
+/// before any consumer can use the guarded alternate.
+pub fn rust_item_free_macro_candidate(member: &str) -> bool {
+    matches!(
+        member,
+        "print"
+            | "println"
+            | "eprint"
+            | "eprintln"
+            | "assert"
+            | "assert_eq"
+            | "assert_ne"
+            | "debug_assert"
+            | "debug_assert_eq"
+            | "debug_assert_ne"
+    )
+}
+
+/// Prove standard macro identity independently of a caller's supported operands.
+/// Qualified paths deliberately do not require the implicit prelude: explicit
+/// library paths remain usable when the implicit prelude is disabled.
+#[allow(clippy::too_many_arguments)]
+pub fn standard_macro_identity<'tree>(
+    analyzer: &dyn crate::graph_support::RustFactSource,
+    walks: &crate::usage_walks::RustUsageWalks<'_>,
+    file: &brokk_bifrost_core::analyzer::model::ProjectFile,
+    invocation: Node<'tree>,
+    source: &str,
+    exported: Option<&ExportedMacroDefinitions<'tree>>,
+    lexical_context: Node<'tree>,
+    enclosing_fragments: &[tree_sitter::Tree],
+) -> StandardMacroIdentity {
+    // Certify enclosing opaque wrappers iteratively. Their token trees do not
+    // expose nested invocations until the operand parser supplies fragments.
+    let mut wrappers = Vec::new();
+    let mut context = Some(lexical_context);
+    while let Some(node) = context {
+        if node.kind() == "macro_invocation"
+            && node.id() != invocation.id()
+            && node.start_byte() <= invocation.start_byte()
+            && invocation.end_byte() <= node.end_byte()
+        {
+            wrappers.push(node);
+        }
+        context = node.parent();
+    }
+    for fragment in enclosing_fragments {
+        if fragment.root_node().has_error() {
+            return StandardMacroIdentity::Unknown(StandardMacroIdentityUnknown::Unresolved);
+        }
+        let mut context = fragment
+            .root_node()
+            .named_descendant_for_byte_range(invocation.start_byte(), invocation.start_byte() + 1);
+        while let Some(node) = context {
+            if node.kind() == "macro_invocation"
+                && (node.start_byte() < invocation.start_byte()
+                    || invocation.end_byte() < node.end_byte())
+                && node.start_byte() <= invocation.start_byte()
+                && invocation.end_byte() <= node.end_byte()
+            {
+                wrappers.push(node);
+            }
+            context = node.parent();
+        }
+    }
+    for wrapper in wrappers {
+        match standard_macro_identity_in_scope(
+            analyzer,
+            walks,
+            file,
+            wrapper,
+            source,
+            exported,
+            lexical_context,
+            enclosing_fragments,
+        ) {
+            StandardMacroIdentity::Standard { .. } => {}
+            StandardMacroIdentity::Unknown(reason) => {
+                return StandardMacroIdentity::Unknown(reason);
+            }
+            _ => return StandardMacroIdentity::Unknown(StandardMacroIdentityUnknown::Unresolved),
+        }
+    }
+    standard_macro_identity_in_scope(
+        analyzer,
+        walks,
+        file,
+        invocation,
+        source,
+        exported,
+        lexical_context,
+        enclosing_fragments,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn standard_macro_identity_in_scope<'tree>(
+    analyzer: &dyn crate::graph_support::RustFactSource,
+    walks: &crate::usage_walks::RustUsageWalks<'_>,
+    file: &brokk_bifrost_core::analyzer::model::ProjectFile,
+    invocation: Node<'tree>,
+    source: &str,
+    exported: Option<&ExportedMacroDefinitions<'tree>>,
+    lexical_context: Node<'tree>,
+    enclosing_fragments: &[tree_sitter::Tree],
+) -> StandardMacroIdentity {
+    use crate::usage::RustReferenceNamespace;
+    use StandardMacroIdentity::{NotStandard, Unknown};
+    use StandardMacroIdentityUnknown::{Route, Unresolved};
+    let Some(path) = invocation.child_by_field_name("macro") else {
+        return NotStandard;
+    };
+    let Some(segments) = crate::graph_support::rust_path_segments(path) else {
+        return NotStandard;
+    };
+    let names = segments
+        .iter()
+        .map(|node| {
+            brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix(rust_node_text(
+                *node, source,
+            ))
+        })
+        .collect::<Vec<_>>();
+    let Some(member) = names.last().copied() else {
+        return NotStandard;
+    };
+    let declarations = match walks.macro_declarations_named(member) {
+        Ok(value) => value,
+        Err(error) => return Unknown(Route(error)),
+    };
+    let roots = declarations.into_iter().collect();
+    // The walker carries the request's cancellation predicate; a cancelled walk
+    // reports cancellation instead of a truncated standard answer.
+    let seeds = match walks.binding_seeds_while(analyzer, &roots, &|| !walks.cancelled()) {
+        Ok(Some(value)) => value,
+        Ok(None) if walks.cancelled() => {
+            return Unknown(Route(crate::graph_support::RustCargoRouteError::Cancelled));
+        }
+        Ok(None) => return Unknown(Unresolved),
+        Err(error) => return Unknown(Route(error)),
+    };
+    let absolute = crate::graph_support::rust_path_is_leading_absolute(path);
+    let resolution = match crate::usage::usage_reference_at_with_walks(
+        analyzer,
+        walks,
+        file,
+        &seeds,
+        &names,
+        path.start_byte(),
+        RustReferenceNamespace::Macro,
+        false,
+        absolute,
+    ) {
+        Ok(resolution) => resolution,
+        Err(error) => return Unknown(Route(error.into())),
+    };
+    standard_macro_identity_with_resolution(
+        analyzer,
+        walks,
+        file,
+        invocation,
+        source,
+        exported,
+        lexical_context,
+        enclosing_fragments,
+        &seeds,
+        &resolution,
+    )
+}
+
+/// Selected authority for the shared standard-macro classifier. A native
+/// implementation must prove complete routes; legacy partial-route exceptions
+/// belong to the adapter that opts into them.
+pub trait StandardMacroAuthority {
+    fn resolution(&self) -> StandardMacroResolution<'_>;
+    fn exact_is_locally_bound(&self) -> bool;
+    fn lexical_shadow(&self, member: &str) -> Option<StandardMacroIdentity>;
+    fn prelude_shadow(&self, member: &str) -> Option<StandardMacroIdentity>;
+    fn root_shadow(&self, root: &str) -> Option<StandardMacroIdentity>;
+}
+
+pub enum StandardMacroResolution<'a> {
+    Exact {
+        crate_root: &'a str,
+        member: &'a str,
+        is_macro: bool,
+    },
+    Ambiguous,
+    Unresolved,
+}
+
+/// One classifier for standard macro identity, independent of route storage.
+pub fn certify_standard_macro(
+    names: &[&str],
+    authority: &impl StandardMacroAuthority,
+) -> StandardMacroIdentity {
+    use StandardMacroIdentity::{LocallyBound, NotStandard, Shadowed, Standard, Unknown};
+    use StandardMacroIdentityUnknown::Ambiguous;
+    let owner = |name| match name {
+        "std" => StandardMacroOwner::Std,
+        "core" => StandardMacroOwner::Core,
+        "alloc" => StandardMacroOwner::Alloc,
+        _ => unreachable!("standard owner table contains only library crates"),
+    };
+    match authority.resolution() {
+        StandardMacroResolution::Ambiguous => return Unknown(Ambiguous),
+        StandardMacroResolution::Exact {
+            crate_root,
+            member,
+            is_macro,
+        } => {
+            return if is_macro && rust_standard_macro_in_crate(crate_root, member) {
+                Standard {
+                    owner: owner(crate_root),
+                    member: member.to_owned(),
+                }
+            } else if authority.exact_is_locally_bound() {
+                LocallyBound
+            } else {
+                Shadowed
+            };
+        }
+        StandardMacroResolution::Unresolved => {}
+    }
+    let (fallback_owner, member) = match names {
+        [member] => {
+            let Some(owner) = rust_standard_macro_prelude_owner(member) else {
+                return NotStandard;
+            };
+            (owner, *member)
+        }
+        [owner, member] if rust_standard_macro_in_crate(owner, member) => (*owner, *member),
+        _ => return NotStandard,
+    };
+    if names.len() == 1 {
+        if let Some(identity) = authority.lexical_shadow(member) {
+            return identity;
+        }
+        if let Some(identity) = authority.prelude_shadow(member) {
+            return identity;
+        }
+    } else if let Some(identity) = authority.root_shadow(fallback_owner) {
+        return identity;
+    }
+    Standard {
+        owner: owner(fallback_owner),
+        member: member.to_owned(),
+    }
+}
+
+/// Classify an invocation using the caller's already-computed macro resolution.
+/// This avoids repeating declaration and binding walks in dispatch.
+#[allow(clippy::too_many_arguments)]
+pub fn standard_macro_identity_with_resolution<'tree>(
+    analyzer: &dyn crate::graph_support::RustFactSource,
+    walks: &crate::usage_walks::RustUsageWalks<'_>,
+    file: &brokk_bifrost_core::analyzer::model::ProjectFile,
+    invocation: Node<'tree>,
+    source: &str,
+    exported: Option<&ExportedMacroDefinitions<'tree>>,
+    lexical_context: Node<'tree>,
+    enclosing_fragments: &[tree_sitter::Tree],
+    seeds: &crate::usage::RustBindingSeeds,
+    resolution: &crate::usage::RustReferenceResolution,
+) -> StandardMacroIdentity {
+    struct Authority<'a, 'walks, 'tree> {
+        analyzer: &'a dyn crate::graph_support::RustFactSource,
+        walks: &'a crate::usage_walks::RustUsageWalks<'walks>,
+        file: &'a brokk_bifrost_core::analyzer::model::ProjectFile,
+        invocation: Node<'tree>,
+        source: &'a str,
+        exported: Option<&'a ExportedMacroDefinitions<'tree>>,
+        lexical_context: Node<'tree>,
+        fragments: &'a [tree_sitter::Tree],
+        seeds: &'a crate::usage::RustBindingSeeds,
+        resolution: &'a crate::usage::RustReferenceResolution,
+        absolute: bool,
+    }
+    impl StandardMacroAuthority for Authority<'_, '_, '_> {
+        fn resolution(&self) -> StandardMacroResolution<'_> {
+            use crate::usage::{RustReferenceResolution as R, RustSymbolNamespace};
+            match self.resolution {
+                R::Ambiguous(_) => StandardMacroResolution::Ambiguous,
+                R::Unresolved => StandardMacroResolution::Unresolved,
+                R::Exact(identity) => StandardMacroResolution::Exact {
+                    crate_root: &identity.module.crate_root,
+                    member: &identity.name,
+                    is_macro: identity.namespace == RustSymbolNamespace::Macro,
+                },
+            }
+        }
+        fn exact_is_locally_bound(&self) -> bool {
+            self.exported.is_some_and(|exported| {
+                local_macro_definition(
+                    self.invocation,
+                    self.source,
+                    Some(exported),
+                    self.lexical_context,
+                )
+                .is_some()
+            })
+        }
+        fn lexical_shadow(&self, member: &str) -> Option<StandardMacroIdentity> {
+            use StandardMacroIdentity::{LocallyBound, Shadowed};
+            let mut root = self.lexical_context;
+            while let Some(parent) = root.parent() {
+                root = parent;
+            }
+            if crate::lexical_scope::macro_named_import_may_shadow(
+                self.analyzer.lexical_caches(),
+                root,
+                self.source,
+                self.invocation.start_byte(),
+                member,
+            ) {
+                return Some(Shadowed);
+            }
+            for fragment in self.fragments {
+                if crate::lexical_scope::macro_named_import_may_shadow(
+                    self.analyzer.lexical_caches(),
+                    fragment.root_node(),
+                    self.source,
+                    self.invocation.start_byte(),
+                    member,
+                ) {
+                    return Some(Shadowed);
+                }
+            }
+            if let Some(exported) = self.exported {
+                for fragment in self.fragments {
+                    let module = crate::imports::rust_module_extent_at(
+                        fragment.root_node(),
+                        self.source,
+                        self.invocation.start_byte(),
+                    );
+                    for import in crate::imports::rust_import_projection(
+                        fragment.root_node(),
+                        self.source,
+                        "",
+                    ) {
+                        if import
+                            .owner
+                            .visible_at(module, self.invocation.start_byte())
+                            && import.import.binding_name().named() == Some(member)
+                        {
+                            return Some(Shadowed);
+                        }
+                    }
+                }
+                if local_macro_definition(
+                    self.invocation,
+                    self.source,
+                    Some(exported),
+                    self.lexical_context,
+                )
+                .is_some()
+                {
+                    return Some(LocallyBound);
+                }
+                if macro_invocation_is_locally_bound(
+                    self.invocation,
+                    self.source,
+                    exported,
+                    self.lexical_context,
+                ) {
+                    return Some(Shadowed);
+                }
+            }
+            None
+        }
+        fn prelude_shadow(&self, member: &str) -> Option<StandardMacroIdentity> {
+            use StandardMacroIdentity::{Shadowed, Unknown};
+            use StandardMacroIdentityUnknown::{PreludeDisabled, Route, Unresolved};
+            // A prelude fallback needs negative macro-namespace evidence for
+            // every relevant glob, independently of type-namespace absence.
+            let mut root = self.lexical_context;
+            while let Some(parent) = root.parent() {
+                root = parent;
+            }
+            let trees = std::iter::once(root)
+                .chain(self.fragments.iter().map(|fragment| fragment.root_node()))
+                .collect::<Vec<_>>();
+            // A path-based import is visible only in the module that holds it
+            // (and in its block, for a block import); child and sibling
+            // modules do not inherit it.
+            for import in trees.into_iter().flat_map(|tree| {
+                let module = crate::imports::rust_module_extent_at(
+                    tree,
+                    self.source,
+                    self.invocation.start_byte(),
+                );
+                crate::imports::rust_import_projection(tree, self.source, "")
+                    .into_iter()
+                    .filter(move |import| {
+                        import
+                            .owner
+                            .visible_at(module, self.invocation.start_byte())
+                    })
+                    .collect::<Vec<_>>()
+            }) {
+                if import.import.binding_name().is_glob() {
+                    use crate::graph_support::{RustGlobNameAbsence, RustGlobNamespace};
+                    match self.analyzer.local_glob_name_absence(
+                        self.file,
+                        &import.import.info,
+                        RustGlobNamespace::Macro,
+                        member,
+                    ) {
+                        RustGlobNameAbsence::ClosedAbsent => (),
+                        RustGlobNameAbsence::Present => return Some(Shadowed),
+                        RustGlobNameAbsence::Incomplete => return Some(Unknown(Unresolved)),
+                        RustGlobNameAbsence::ExternalGlobInventoryUnavailable => {
+                            return Some(Unknown(
+                                StandardMacroIdentityUnknown::ExternalGlobInventoryUnavailable,
+                            ));
+                        }
+                    }
+                }
+            }
+            match self.walks.selected_macro_invocation_candidates_named(
+                self.seeds,
+                self.file,
+                member,
+                self.invocation.start_byte(),
+            ) {
+                Ok(candidates) if !candidates.is_empty() => return Some(Shadowed),
+                Err(error) => return Some(Unknown(Route(error))),
+                _ => {}
+            }
+            match self.walks.unenumerated_macro_use_extern_crates(self.file) {
+                Ok(crates) if crates.is_empty() => {}
+                Ok(_) => return Some(Unknown(Unresolved)),
+                Err(error) => return Some(Unknown(Route(error))),
+            }
+            // Preserve today's behavior: partial routes with nonempty positive
+            // roots still count as prelude-enabled. #11527 tracks tightening this.
+            match self.walks.standard_macro_prelude_enabled(self.file) {
+                Ok(true) => None,
+                Ok(false) => Some(Unknown(PreludeDisabled)),
+                Err(error) => Some(Unknown(Route(error))),
+            }
+        }
+        fn root_shadow(&self, root: &str) -> Option<StandardMacroIdentity> {
+            use StandardMacroIdentity::{Shadowed, Unknown};
+            match rust_macro_root_is_shadowed_in_scopes(
+                self.analyzer,
+                self.walks,
+                self.file,
+                root,
+                &RustMacroSourceScope {
+                    byte: self.invocation.start_byte(),
+                    leading_absolute: self.absolute,
+                    fragments: self.fragments,
+                    source: self.source,
+                },
+            ) {
+                Ok(true) => Some(Shadowed),
+                Ok(false) => None,
+                Err(error) => Some(Unknown(StandardMacroIdentityUnknown::Route(error))),
+            }
+        }
+    }
+    let Some(path) = invocation.child_by_field_name("macro") else {
+        return StandardMacroIdentity::NotStandard;
+    };
+    let Some(segments) = crate::graph_support::rust_path_segments(path) else {
+        return StandardMacroIdentity::NotStandard;
+    };
+    let names = segments
+        .iter()
+        .map(|node| {
+            brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix(rust_node_text(
+                *node, source,
+            ))
+        })
+        .collect::<Vec<_>>();
+    let absolute = crate::graph_support::rust_path_is_leading_absolute(path);
+    // Native macro-reference lookup does not inventory function-local textual
+    // macro_rules bindings. Check syntax before trusting even an Exact prelude
+    // identity, and do so when the caller has no exported-definition inventory.
+    // A parse error can hide a macro_rules definition from that scan. (The root
+    // node's byte range is not a check: it excludes leading whitespace.)
+    if names.len() == 1 && !absolute {
+        let mut root = lexical_context;
+        while let Some(parent) = root.parent() {
+            root = parent;
+        }
+        debug_assert!(
+            root.end_byte() <= source.len(),
+            "lexical context from another source"
+        );
+        if root.has_error() {
+            return StandardMacroIdentity::Unknown(StandardMacroIdentityUnknown::Unresolved);
+        }
+        let fallback;
+        let shadow_definitions = if let Some(exported) = exported {
+            Some(exported)
+        } else {
+            fallback = match ExportedMacroDefinitions::from_root_while(root, source, &|| {
+                !walks.cancelled()
+            }) {
+                Ok(definitions) => definitions,
+                Err(error) => {
+                    return StandardMacroIdentity::Unknown(StandardMacroIdentityUnknown::Route(
+                        error,
+                    ));
+                }
+            };
+            Some(&fallback)
+        };
+        if macro_invocation_has_textual_definition(
+            invocation,
+            source,
+            shadow_definitions,
+            lexical_context,
+        ) {
+            return StandardMacroIdentity::LocallyBound;
+        }
+        // Fail closed: local_macro_definition also searches the file-wide
+        // exported inventory. An export in a sibling module need not be in
+        // textual scope, so this can reject an exact standard resolution.
+        // Removing that fallback requires proving textual visibility together
+        // with imports and #[macro_use] routes, including unresolved routes.
+        if local_macro_definition(invocation, source, shadow_definitions, lexical_context).is_some()
+        {
+            return StandardMacroIdentity::LocallyBound;
+        }
+    }
+    // A cached syntax-only view replaces the old no-inventory shadow scan.
+    // Preserve None's downstream visibility semantics: admitting an inventory
+    // must not enable the extra import/fragment checks of legacy export callers.
+    let exported = exported.filter(|definitions| definitions.inventory.is_none());
+    certify_standard_macro(
+        &names,
+        &Authority {
+            analyzer,
+            walks,
+            file,
+            invocation,
+            source,
+            exported,
+            lexical_context,
+            fragments: enclosing_fragments,
+            seeds,
+            resolution,
+            absolute,
+        },
+    )
+}
+
+#[cfg(test)]
+mod lexical_effect_tests {
+    use super::*;
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11532: lexical macro admission must bind identity and audited stdlib"
+    )]
+    fn lexical_effect_requires_standard_identity_and_exact_audit() {
+        for member in [
+            "print",
+            "println",
+            "eprint",
+            "eprintln",
+            "assert",
+            "assert_eq",
+            "assert_ne",
+            "debug_assert",
+            "debug_assert_eq",
+            "debug_assert_ne",
+        ] {
+            let standard = StandardMacroIdentity::Standard {
+                owner: StandardMacroOwner::Std,
+                member: member.to_owned(),
+            };
+            assert_eq!(
+                standard_macro_lexical_effect(&standard, ITEM_FREE_MACRO_STDLIB_REVISION),
+                StandardMacroLexicalEffect::NoItemsIntroduced
+            );
+            assert_eq!(
+                standard_macro_lexical_effect(&standard, "other-revision"),
+                StandardMacroLexicalEffect::Unknown
+            );
+        }
+        for identity in [
+            StandardMacroIdentity::Shadowed,
+            StandardMacroIdentity::LocallyBound,
+            StandardMacroIdentity::NotStandard,
+            StandardMacroIdentity::Unknown(StandardMacroIdentityUnknown::Unresolved),
+            StandardMacroIdentity::Standard {
+                owner: StandardMacroOwner::Std,
+                member: "include".to_owned(),
+            },
+        ] {
+            assert_eq!(
+                standard_macro_lexical_effect(&identity, ITEM_FREE_MACRO_STDLIB_REVISION),
+                StandardMacroLexicalEffect::Unknown
+            );
+        }
     }
 }

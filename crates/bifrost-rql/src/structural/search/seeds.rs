@@ -42,13 +42,20 @@ pub(super) fn scan_seed_file(
     }
     let mut projected = state.budget;
     projected.scanned_files = projected.scanned_files.saturating_add(1);
-    if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+    if brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
         projected.scanned_files,
         limits.max_scanned_files,
     )
-    .allows(0)
+    .try_allow(0)
+    .is_err()
     {
-        push_budget_diagnostic(diagnostics, &projected);
+        push_budget_diagnostic(
+            diagnostics,
+            &projected,
+            limits,
+            Some(&state.budget),
+            "structural_candidate_scan",
+        );
         return SeedFileScanStatus::BudgetExhausted;
     }
     state.budget.scanned_files = projected.scanned_files;
@@ -727,6 +734,110 @@ pub(super) fn seed_scan_files(
     files
 }
 
+/// Report every workspace file in the seed's path scope that embeds a requested
+/// language in a template format no adapter reads (#11370).
+///
+/// A Rails view (`.erb`), a Vue or Svelte component, or a Razor page holds
+/// code of an analyzed language, but no analyzer reads it. A query over that
+/// language would otherwise answer complete without those files. Each one
+/// gets its own diagnostic whose withheld rows lie in that file.
+///
+/// Only a whole-workspace execution reports these. The file listing is an
+/// inventory read, and a unit charged with it would be invalidated by any file
+/// added anywhere in the workspace, which is the reuse units exist to keep
+/// (see [`seed_scan_files`]). A coordinator that runs units owns this report.
+pub(super) fn push_unanalyzed_embedding_diagnostics(
+    state: &mut QueryExecutionState<'_>,
+    languages: &[Language],
+    where_globs: &QueryPathScope,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+) {
+    if state.scope.seed_files().is_some() || state.scope.workspace_files().is_some() {
+        return;
+    }
+    let embedded = Language::ANALYZABLE
+        .into_iter()
+        .filter(|language| languages.is_empty() || languages.contains(language))
+        .flat_map(|language| {
+            language
+                .reference_only_sibling_extensions()
+                .iter()
+                .map(move |extension| (*extension, language))
+        })
+        .collect::<Vec<_>>();
+    if embedded.is_empty() {
+        return;
+    }
+    let files = match state.analyzer.project().all_files_shared() {
+        Ok(files) => files,
+        Err(error) => {
+            state.mark_execution_dependent();
+            diagnostics.push(QueryExecutionState::diagnostic(
+                state.analyzer,
+                CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
+                    incompleteness: brokk_bifrost_rql::Incompleteness::Content,
+                    related: Vec::new(),
+                    source: None,
+                    code: CodeQueryDiagnosticCode::PathDerivationIncomplete,
+                    impact: CodeQueryDiagnosticImpact::Incomplete,
+                    branch: Vec::new(),
+                    language: "workspace",
+                    message: format!(
+                        "could not list workspace files to find unanalyzed embedded templates: {error}"
+                    ),
+                    exhausted_roots: Vec::new(),
+                    withheld_rows_path: None,
+                }),
+                Some(DerivationExecutionCause::Provider),
+            ));
+            return;
+        }
+    };
+    for file in files.iter() {
+        let Some(extension) = file
+            .rel_path()
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+        else {
+            continue;
+        };
+        let Some((_, language)) = embedded
+            .iter()
+            .find(|(embedding, _)| *embedding == extension)
+        else {
+            continue;
+        };
+        let path = rel_path_string(file);
+        if !where_globs.matches(&path) {
+            continue;
+        }
+        diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            has_non_utf8_refusal: false,
+            refusal_sites: Default::default(),
+            call_relation_facts: None,
+            uses_omissions: Vec::new(),
+            incompleteness: brokk_bifrost_rql::Incompleteness::Content,
+            related: Vec::new(),
+            source: None,
+            code: CodeQueryDiagnosticCode::MissingStructuralAdapter,
+            impact: CodeQueryDiagnosticImpact::Incomplete,
+            branch: Vec::new(),
+            language: language.config_label(),
+            message: format!(
+                "no adapter reads {} code embedded in .{extension} files; {path} was not searched",
+                language.config_label()
+            ),
+            exhausted_roots: Vec::new(),
+            withheld_rows_path: Some(path),
+        }));
+    }
+}
+
 /// Whether one file is inside a seed's declared language and path scope.
 fn seed_file_in_scope(
     file: &ProjectFile,
@@ -809,6 +920,7 @@ pub(super) fn execute_occurrence_seed(
         return PlanExecution::truncated(Vec::new());
     };
 
+    push_unanalyzed_embedding_diagnostics(state, &seed.languages, &seed.where_globs, diagnostics);
     let files = seed_scan_files(state, &seed.languages, &seed.where_globs);
 
     let mut rows: Vec<PipelineRow> = Vec::new();
@@ -851,6 +963,10 @@ pub(super) fn execute_occurrence_seed(
             ) {
                 truncated = true;
                 diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                     incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                     related: Vec::new(),
                     source: None,
@@ -900,6 +1016,7 @@ pub(super) fn execute_environment_seed(
         return PlanExecution::truncated(Vec::new());
     };
 
+    push_unanalyzed_embedding_diagnostics(state, languages, where_globs, diagnostics);
     let files = seed_scan_files(state, languages, where_globs);
 
     let required_axes = match kind {
@@ -968,6 +1085,10 @@ pub(super) fn execute_environment_seed(
             ) {
                 truncated = true;
                 diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                     incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                     related: Vec::new(),
                     source: None,
@@ -1015,6 +1136,7 @@ pub(super) fn execute_materialization_seed(
         return PlanExecution::truncated(Vec::new());
     };
 
+    push_unanalyzed_embedding_diagnostics(state, languages, where_globs, diagnostics);
     let files = seed_scan_files(state, languages, where_globs);
 
     let required_axes = match kind {
@@ -1076,6 +1198,10 @@ pub(super) fn execute_materialization_seed(
             ) {
                 truncated = true;
                 diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                     incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                     related: Vec::new(),
                     source: None,
@@ -1113,6 +1239,7 @@ pub(super) fn execute_path_seed(
         return PlanExecution::truncated(Vec::new());
     };
 
+    push_unanalyzed_embedding_diagnostics(state, languages, where_globs, diagnostics);
     let files = seed_scan_files(state, languages, where_globs);
 
     let mut rows: Vec<PipelineRow> = Vec::new();
@@ -1171,6 +1298,10 @@ pub(super) fn execute_path_seed(
             ) {
                 truncated = true;
                 diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                     incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                     related: Vec::new(),
                     source: None,
@@ -1256,6 +1387,10 @@ fn push_recovered_syntax_diagnostic(
         message.push_str(&line);
     }
     diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        has_non_utf8_refusal: false,
+        refusal_sites: Default::default(),
+        call_relation_facts: None,
+        uses_omissions: Vec::new(),
         incompleteness: brokk_bifrost_rql::Incompleteness::Content,
         related: Vec::new(),
         source: None,
@@ -1265,7 +1400,9 @@ fn push_recovered_syntax_diagnostic(
         language: language.config_label(),
         message,
         exhausted_roots: Vec::new(),
-        withheld_rows_path: None,
+        // A node recovery removed lies in this file, so every row the
+        // diagnostic withholds is a row of it (#11673).
+        withheld_rows_path: Some(rel_path_string(file)),
     }));
 }
 
@@ -1394,7 +1531,13 @@ fn push_comparison_chain_roles_diagnostic(
             match lease.admit(projected) {
                 FairSeedBudgetAdmission::Admitted => {}
                 FairSeedBudgetAdmission::Rejected(global) => {
-                    push_budget_diagnostic(diagnostics, &global);
+                    push_budget_diagnostic(
+                        diagnostics,
+                        &global,
+                        limits,
+                        Some(&state.budget),
+                        "structural_candidate_scan",
+                    );
                     stop = SeedFileScanStatus::BudgetExhausted;
                     return false;
                 }
@@ -1403,15 +1546,22 @@ fn push_comparison_chain_roles_diagnostic(
                     return false;
                 }
             }
-        } else if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+        } else if brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
             projected
                 .fact_nodes
                 .saturating_add(projected.examined_references),
             limits.max_fact_nodes,
         )
-        .allows(0)
+        .try_allow(0)
+        .is_err()
         {
-            push_budget_diagnostic(diagnostics, &projected);
+            push_budget_diagnostic(
+                diagnostics,
+                &projected,
+                limits,
+                Some(&state.budget),
+                "structural_candidate_scan",
+            );
             stop = SeedFileScanStatus::BudgetExhausted;
             return false;
         }
@@ -1520,6 +1670,10 @@ fn push_comparison_chain_roles_diagnostic(
     }
     // No matcher or capture state was evaluated by this negative proof.
     diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
         incompleteness: brokk_bifrost_rql::Incompleteness::Content,
         related: Vec::new(),
         source: None,
@@ -1527,9 +1681,16 @@ fn push_comparison_chain_roles_diagnostic(
         impact: CodeQueryDiagnosticImpact::Incomplete,
         branch: Vec::new(),
         language: language.config_label(),
-        message: format!(
-            "Python comparison chains do not expose singular left/right/operator roles required by this query in {} at byte ranges {ranges:?}",
-            rel_path_string(file)
+        message: brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+            format_args!(
+                "Python comparison chains do not expose singular left/right/operator roles required by this query in {} at byte ranges {ranges:?}",
+                rel_path_string(file)
+            ),
+            format_args!(
+                "Python comparison chains do not expose singular left/right/operator roles required by this query in {}",
+                rel_path_string(file)
+            ),
+            ranges.iter(),
         ),
         exhausted_roots: Vec::new(),
         withheld_rows_path: None,
@@ -1544,7 +1705,11 @@ pub(super) fn execute_seed(
     limits: CodeQueryExecutionLimits,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> PlanExecution {
-    let cache_key = seed.canonical_cache_key();
+    let cache_key = if state.scope.sink_sites.is_some() {
+        format!("reached-sink:{}", seed.canonical_cache_key())
+    } else {
+        seed.canonical_cache_key()
+    };
     let parallel_budget = state.parallel_seed_budget.clone();
     if parallel_budget.is_some() {
         debug_assert!(
@@ -1657,6 +1822,10 @@ pub(super) fn execute_seed(
                 .into_iter()
                 .map(|diagnostic| {
                     CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                        has_non_utf8_refusal: false,
+                        refusal_sites: Default::default(),
+                        call_relation_facts: None,
+                        uses_omissions: Vec::new(),
                         incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                         related: Vec::new(),
                         source: None,
@@ -1778,6 +1947,10 @@ pub(super) fn execute_seed(
             && (explicitly_requested || scoped_languages.contains(&language))
         {
             diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                 incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                 related: Vec::new(),
                 source: None,
@@ -1794,6 +1967,8 @@ pub(super) fn execute_seed(
             }));
         }
     }
+
+    push_unanalyzed_embedding_diagnostics(state, &seed.languages, &seed.where_globs, diagnostics);
 
     let selected_index_content = provider_scopes
         .iter()
@@ -1902,7 +2077,13 @@ pub(super) fn execute_seed(
                     state.budget.scanned_source_bytes = projected.scanned_source_bytes;
                 }
                 FairSeedBudgetSharedAdmission::Rejected(global_projected) => {
-                    push_budget_diagnostic(diagnostics, &global_projected);
+                    push_budget_diagnostic(
+                        diagnostics,
+                        &global_projected,
+                        limits,
+                        Some(&state.budget),
+                        "structural_candidate_scan",
+                    );
                     truncated = true;
                     cache_complete = cache_complete.map(|_| false);
                     break;
@@ -1912,18 +2093,26 @@ pub(super) fn execute_seed(
                 }
             }
         } else if !state.seed_scan_ledger.scanned.contains(&ledger_key) {
-            if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+            if brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
                 projected.scanned_files,
                 limits.max_scanned_files,
             )
-            .allows(0)
-                || !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+            .try_allow(0)
+            .is_err()
+                || brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
                     projected.scanned_source_bytes,
                     limits.max_scanned_source_bytes,
                 )
-                .allows(0)
+                .try_allow(0)
+                .is_err()
             {
-                push_budget_diagnostic(diagnostics, &projected);
+                push_budget_diagnostic(
+                    diagnostics,
+                    &projected,
+                    limits,
+                    Some(&state.budget),
+                    "structural_candidate_scan",
+                );
                 truncated = true;
                 cache_complete = cache_complete.map(|_| false);
                 break;
@@ -2043,7 +2232,13 @@ pub(super) fn execute_seed(
                 match lease.admit(projected) {
                     FairSeedBudgetAdmission::Admitted => {}
                     FairSeedBudgetAdmission::Rejected(global_projected) => {
-                        push_budget_diagnostic(diagnostics, &global_projected);
+                        push_budget_diagnostic(
+                            diagnostics,
+                            &global_projected,
+                            limits,
+                            Some(&state.budget),
+                            "structural_candidate_scan",
+                        );
                         truncated = true;
                         cache_complete = cache_complete.map(|_| false);
                         break;
@@ -2060,7 +2255,13 @@ pub(super) fn execute_seed(
                     }
                     FairSeedBudgetSharedAdmission::Admitted => {}
                     FairSeedBudgetSharedAdmission::Rejected(global_projected) => {
-                        push_budget_diagnostic(diagnostics, &global_projected);
+                        push_budget_diagnostic(
+                            diagnostics,
+                            &global_projected,
+                            limits,
+                            Some(&state.budget),
+                            "structural_candidate_scan",
+                        );
                         truncated = true;
                         cache_complete = cache_complete.map(|_| false);
                         break;
@@ -2071,15 +2272,22 @@ pub(super) fn execute_seed(
                 }
             }
         } else if charged_fact_nodes > 0 {
-            if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+            if brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
                 projected
                     .fact_nodes
                     .saturating_add(projected.examined_references),
                 limits.max_fact_nodes,
             )
-            .allows(0)
+            .try_allow(0)
+            .is_err()
             {
-                push_budget_diagnostic(diagnostics, &projected);
+                push_budget_diagnostic(
+                    diagnostics,
+                    &projected,
+                    limits,
+                    Some(&state.budget),
+                    "structural_candidate_scan",
+                );
                 truncated = true;
                 cache_complete = cache_complete.map(|_| false);
                 break;
@@ -2333,6 +2541,23 @@ pub(super) fn execute_seed(
         let selected_facts = scoped_candidates
             .as_deref()
             .unwrap_or(selected_facts.as_ref());
+        // A sink demand constrains exact terminal anchors. Nested pattern
+        // predicates still see the full file facts and quantified domains.
+        let demanded_candidates = state.scope.sink_sites.as_ref().map(|sites| {
+            let candidates: Box<dyn Iterator<Item = u32>> = if indexed_file.is_some()
+                || scoped_candidates.is_some()
+            {
+                Box::new(selected_facts.iter().copied())
+            } else {
+                Box::new(
+                    0..u32::try_from(facts.nodes().len()).expect("FileFacts node ids fit in u32"),
+                )
+            };
+            candidates
+                .filter(|&node| sites.contains_range(&file, facts.node(node).range))
+                .collect::<Vec<_>>()
+        });
+        let selected_facts = demanded_candidates.as_deref().unwrap_or(selected_facts);
         // Charge the verifier walk beyond the facts already charged: the
         // selected candidates on the indexed path, the file's whole fact
         // count on the scan path. One execution charges a file's full walk
@@ -2360,7 +2585,10 @@ pub(super) fn execute_seed(
         )
         .unwrap_or(u64::MAX);
         let mut examined = 0u64;
-        let matches = if indexed_file.is_some() || scoped_candidates.is_some() {
+        let matches = if indexed_file.is_some()
+            || scoped_candidates.is_some()
+            || demanded_candidates.is_some()
+        {
             let matches = super::super::matcher::match_query_candidates(
                 &matcher_seed,
                 &facts,
@@ -2420,7 +2648,13 @@ pub(super) fn execute_seed(
                 match lease.admit(projected) {
                     FairSeedBudgetAdmission::Admitted => {}
                     FairSeedBudgetAdmission::Rejected(global_projected) => {
-                        push_budget_diagnostic(diagnostics, &global_projected);
+                        push_budget_diagnostic(
+                            diagnostics,
+                            &global_projected,
+                            limits,
+                            Some(&state.budget),
+                            "structural_verification",
+                        );
                         truncated = true;
                         cache_complete = cache_complete.map(|_| false);
                         break;
@@ -2429,15 +2663,22 @@ pub(super) fn execute_seed(
                         return PlanExecution::cancelled(Vec::new());
                     }
                 }
-            } else if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+            } else if brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
                 projected
                     .fact_nodes
                     .saturating_add(projected.examined_references),
                 limits.max_fact_nodes,
             )
-            .allows(0)
+            .try_allow(0)
+            .is_err()
             {
-                push_budget_diagnostic(diagnostics, &projected);
+                push_budget_diagnostic(
+                    diagnostics,
+                    &projected,
+                    limits,
+                    Some(&state.budget),
+                    "structural_verification",
+                );
                 truncated = true;
                 cache_complete = cache_complete.map(|_| false);
                 break;
@@ -2449,6 +2690,19 @@ pub(super) fn execute_seed(
         } else {
             matches
         };
+        // Only surviving fact matches become query-lifetime proof owners.
+        // Reject a positive role before any pipeline row can leave this file.
+        let matches = matches
+            .into_iter()
+            .filter(|matched| match &matched.selected_pattern_source {
+                super::SelectedPatternSourceEvidence::Admitted(proof) => state
+                    .semantic
+                    .as_mut()
+                    .expect("selected source proof has a workspace context")
+                    .retain_selected_pattern_source(&file, proof),
+                _ => true,
+            })
+            .collect::<Vec<_>>();
         let unknown_sites = signature_incomplete
             .qualifying_type_sites
             .borrow_mut()
@@ -2464,6 +2718,10 @@ pub(super) fn execute_seed(
                 .reported_range
                 .unwrap_or_else(|| facts.node(site.node).range);
             diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                 incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                 related: Vec::new(),
                 source: Some(CodeQuerySourceSpan {
@@ -2490,6 +2748,10 @@ pub(super) fn execute_seed(
                 _ => "unknown".to_string(),
             };
             diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                 incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                 related: Vec::new(),
                 source: None,
@@ -2526,6 +2788,10 @@ pub(super) fn execute_seed(
                 _ => "unknown".to_string(),
             };
             diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                 incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                 related: Vec::new(),
                 source: None,
@@ -2584,6 +2850,10 @@ pub(super) fn execute_seed(
     }
     if signature_incomplete.visibility_unrecorded.get() {
         diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
             incompleteness: brokk_bifrost_rql::Incompleteness::Content,
             related: Vec::new(),
             source: None,
@@ -2598,6 +2868,10 @@ pub(super) fn execute_seed(
     }
     if signature_incomplete.parameter_types_unrecorded.get() {
         diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
             incompleteness: brokk_bifrost_rql::Incompleteness::Content,
             related: Vec::new(),
             source: None,
@@ -2615,6 +2889,10 @@ pub(super) fn execute_seed(
         .get()
     {
         diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
             incompleteness: brokk_bifrost_rql::Incompleteness::Content,
             related: Vec::new(),
             source: None,
@@ -2629,6 +2907,10 @@ pub(super) fn execute_seed(
     }
     if signature_incomplete.string_literal_value_unrecorded.get() {
         diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
             incompleteness: brokk_bifrost_rql::Incompleteness::Content,
             related: Vec::new(),
             source: None,
@@ -2643,6 +2925,10 @@ pub(super) fn execute_seed(
     }
     if signature_incomplete.selection_application_undecided.get() {
         diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
             incompleteness: brokk_bifrost_rql::Incompleteness::Content,
             related: Vec::new(),
             source: None,
@@ -2657,6 +2943,10 @@ pub(super) fn execute_seed(
     }
     if signature_incomplete.role_target_unrecorded.get() {
         diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
             incompleteness: brokk_bifrost_rql::Incompleteness::Content,
             related: Vec::new(),
             source: None,
@@ -2677,6 +2967,10 @@ pub(super) fn execute_seed(
             .map(|role| role.label())
             .collect::<Vec<_>>();
         diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
             incompleteness: brokk_bifrost_rql::Incompleteness::Content,
             related: Vec::new(),
             source: None,
@@ -2693,6 +2987,10 @@ pub(super) fn execute_seed(
     }
     if signature_incomplete.each_incomplete.get() {
         diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            has_non_utf8_refusal: false,
+            refusal_sites: Default::default(),
+            call_relation_facts: None,
+            uses_omissions: Vec::new(),
             incompleteness: brokk_bifrost_rql::Incompleteness::Content,
             related: Vec::new(),
             source: None,
@@ -2708,6 +3006,10 @@ pub(super) fn execute_seed(
     }
     if signature_incomplete.argument_mode_unrecorded.get() {
         diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            has_non_utf8_refusal: false,
+            refusal_sites: Default::default(),
+            call_relation_facts: None,
+            uses_omissions: Vec::new(),
             incompleteness: brokk_bifrost_rql::Incompleteness::Content,
             related: Vec::new(),
             source: None,
@@ -2723,10 +3025,14 @@ pub(super) fn execute_seed(
         }));
     }
     if signature_incomplete.fact_budget_exhausted.get() {
-        push_budget_diagnostic(diagnostics, &state.budget);
+        push_matcher_budget_diagnostic(diagnostics, &state.budget, &signature_incomplete);
     }
     if signature_incomplete.local_value_unresolved.get() {
         diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
             incompleteness: brokk_bifrost_rql::Incompleteness::Content,
             related: Vec::new(),
             source: None,
@@ -2750,6 +3056,10 @@ pub(super) fn execute_seed(
             "workspace content changed during structural posting replay".to_string()
         });
         diagnostics.push(super::QueryExecutionState::diagnostic(analyzer, CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
             incompleteness: brokk_bifrost_rql::Incompleteness::Content,
             related: Vec::new(),
             source: None,
@@ -2781,6 +3091,7 @@ pub(super) fn execute_seed(
                 python_import: None,
             });
             PipelineRow {
+                call_path_evidence: None,
                 value: PipelineValue::StructuralMatch(Arc::clone(&seed)),
                 traces: vec![PipelineTrace {
                     window_order: None,
@@ -2826,7 +3137,7 @@ pub(super) fn execute_seed(
 /// exact source span into rendering. Most relations select the root fact
 /// itself; declaration/type-shape relations may select a nested AST node that
 /// the language-neutral vocabulary does not represent as a fact.
-fn language_rule_matches(
+pub(super) fn language_rule_matches(
     facts: &FileFacts,
     matches: Vec<FactMatch>,
     ranges: &[super::language_rules::LanguageRuleMatch],
@@ -2846,6 +3157,7 @@ fn language_rule_matches(
                 .cloned()?;
             fact_match.reported_range = Some(range.report);
             fact_match.heuristic = range.heuristic;
+            fact_match.selected_pattern_source = range.selected_pattern_source.clone();
             Some(fact_match)
         })
         .collect()

@@ -70,6 +70,18 @@ pub(in crate::analyzer::java::semantic) struct JavaDeclarationInventory<'tree> {
     pub(in crate::analyzer::java::semantic) pattern_names: HashSet<Box<str>>,
 }
 
+// Test-only work counters: inventory builds and tree nodes visited by them, on
+// the calling thread.
+#[cfg(test)]
+thread_local! {
+    pub(in crate::analyzer::java::semantic) static INVENTORY_BUILDS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    pub(in crate::analyzer::java::semantic) static INVENTORY_NODES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Walks the whole file. Callers build it once per file: building it per
+/// procedure costs procedures x file nodes.
 pub(in crate::analyzer::java::semantic) fn java_declaration_inventory<'tree>(
     prepared: &'tree PreparedSyntaxTree,
 ) -> JavaDeclarationInventory<'tree> {
@@ -78,7 +90,11 @@ pub(in crate::analyzer::java::semantic) fn java_declaration_inventory<'tree>(
     let mut type_roots = HashSet::default();
     let mut type_nodes = HashMap::<(usize, Box<str>), Option<Node<'tree>>>::default();
     let mut stack = vec![prepared.tree().root_node()];
+    #[cfg(test)]
+    INVENTORY_BUILDS.with(|builds| builds.set(builds.get() + 1));
     while let Some(node) = stack.pop() {
+        #[cfg(test)]
+        INVENTORY_NODES.with(|nodes| nodes.set(nodes.get() + 1));
         if let Some(name) = brokk_bifrost_jvm::java::structural::java_pattern_binding_name(node)
             .and_then(|name| node_text(prepared.source(), name))
         {
@@ -381,28 +397,27 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         value,
                     });
             }
-            // Keep pattern names as a cheap query-local filter. Visibility is
-            // resolved per reference; record extraction remains explicitly open.
-            if let Some(binder) =
+            // The file inventory already holds every pattern spelling in the
+            // file, so this walk over a part of the file adds none.
+            debug_assert!(
                 brokk_bifrost_jvm::java::structural::java_pattern_binding_name(node)
-                && let Some(text) = node_text(self.prepared.source(), binder)
-            {
-                self.pattern_variable_names.insert(text.into());
-            }
+                    .and_then(|binder| node_text(self.prepared.source(), binder))
+                    .is_none_or(|text| self.pattern_variable_names.contains(text)),
+                "a pattern spelling in a procedure body is missing from the file inventory"
+            );
             Ok(WalkControl::Continue)
         })?;
-        if self.constant_locals.is_empty() {
-            return Ok(());
-        }
-        // A literal-initialized local keeps its value only if nothing writes
-        // it again. Nested procedures are scanned too: Java rejects their
-        // writes to a captured local, and a write to a shadowing binding
-        // resolves to the outer local here, which only drops a constant.
+        // All bindings are indexed before this pass, so lookup works at any
+        // source position. JLS 4.12.4: later writes defeat effective finality.
+        // Nested procedures index and scan their own locals independently.
         try_walk_named_tree_preorder(body, true, |node| {
             if self.session.cancellation().is_cancelled() {
                 return Err(JavaLoweringError::Cancelled(Box::new(
                     builder.prospective_work(),
                 )));
+            }
+            if is_java_nested_execution_boundary(node) {
+                return Ok(WalkControl::SkipChildren);
             }
             if !matches!(node.kind(), "assignment_expression" | "update_expression") {
                 return Ok(WalkControl::Continue);
@@ -414,10 +429,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 target = first_named_child(inner);
             }
             if let Some(target) = target.filter(|t| t.kind() == "identifier")
-                && let Some(name) = node_text(self.prepared.source(), target)
-                && let Some(local) = self.local_at(name, target.start_byte())
+                && let Some((binding, _)) = self.lexical_reference_binding(target)
             {
-                self.constant_locals.remove(&local);
+                self.written_bindings.insert(binding);
+                self.constant_locals.remove(&binding);
             }
             Ok(WalkControl::Continue)
         })
@@ -686,11 +701,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         node: Node<'tree>,
     ) -> bool {
         match node.kind() {
+            // JLS 15.8.3: this is never null.
+            "this" => true,
             "object_creation_expression" | "array_creation_expression" => true,
             "field_access" if is_qualified_this(node) => true,
             "identifier" => node_text(self.prepared.source(), node).is_some_and(|name| {
-                self.local_at(name, node.start_byte())
-                    .is_some_and(|value| self.non_null_values.contains(&value))
+                self.local_at(name, node.start_byte()).is_some_and(|value| {
+                    !self.written_bindings.contains(&value) && self.non_null_values.contains(&value)
+                })
             }),
             "parenthesized_expression" => {
                 first_named_child(node).is_some_and(|inner| self.expression_is_non_null(inner))
@@ -719,17 +737,21 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     /// apart on which node names which slot. A lexical refusal, including
     /// unavailable formal layout, also blocks an implicit field proof.
     pub(super) fn pattern_visibility_unproven(&self, node: Node<'tree>) -> bool {
-        use brokk_bifrost_analysis::analyzer::lexical_definitions::resolve_lexical_binding_from_focus_with_visibility;
+        use brokk_bifrost_analysis::analyzer::lexical_definitions::{
+            LexicalBindingUnproven, resolve_lexical_binding_from_focus_with_visibility,
+        };
         node.kind() == "identifier"
             && node_text(self.prepared.source(), node).is_some_and(|name| {
-                resolve_lexical_binding_from_focus_with_visibility(
-                    Language::Java,
-                    node,
-                    self.prepared.source(),
-                    node.start_byte(),
-                    name,
+                matches!(
+                    resolve_lexical_binding_from_focus_with_visibility(
+                        Language::Java,
+                        node,
+                        self.prepared.source(),
+                        node.start_byte(),
+                        name,
+                    ),
+                    Err(LexicalBindingUnproven::Unknown)
                 )
-                .is_err()
             })
     }
 
@@ -1612,6 +1634,33 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             )?;
         }
         Ok(())
+    }
+
+    pub(super) fn call_dispatch(&self, call: Node<'tree>) -> CallTargetDispatch {
+        if call.kind() != "method_invocation" {
+            return CallTargetDispatch::Special;
+        }
+        let receiver = call.child_by_field_name("object");
+        if receiver.is_some_and(|node| node.kind() == "super") {
+            return CallTargetDispatch::Special;
+        }
+        let qualifier = receiver.and_then(|receiver| self.source_qualifier(receiver));
+        if receiver.is_some() {
+            let Some(qualifier) = &qualifier else {
+                return CallTargetDispatch::Unspecified;
+            };
+            if !qualifier.is_value {
+                return CallTargetDispatch::Static;
+            }
+        }
+        // A same-name local private/static declaration does not prove which
+        // overload is selected: an inherited virtual overload may apply.
+        // Exact target resolution owns that proof at query time.
+        match qualifier.map(|qualifier| qualifier.owner.kind()) {
+            Some("interface_declaration") => CallTargetDispatch::Interface,
+            Some("class_declaration") => CallTargetDispatch::Virtual,
+            _ => CallTargetDispatch::Unspecified,
+        }
     }
 
     pub(in crate::analyzer::java::semantic) fn resolution_gaps(

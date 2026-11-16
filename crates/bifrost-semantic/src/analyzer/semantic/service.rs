@@ -167,7 +167,9 @@ impl CompleteSemanticArtifactCache {
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn new(max_retained_bytes: u64) -> Self {
-        let budget = brokk_bifrost_core::retention_budget::RetentionBudget::new(max_retained_bytes);
+        let budget = brokk_bifrost_core::retention_budget::RetentionBudget::for_test_capacity(
+            max_retained_bytes,
+        );
         Self::new_with_budget(&budget)
     }
 
@@ -533,7 +535,8 @@ struct SourceBlobKey(BlobKey);
 
 impl RetainedBytes for SourceBlobKey {
     fn retained_bytes(&self) -> usize {
-        size_of::<Self>() + self.0.lang.capacity()
+        size_of::<Self>()
+            + brokk_bifrost_core::allocation_size::allocation_size(self.0.lang.capacity())
     }
 }
 
@@ -581,6 +584,11 @@ pub fn retained_artifact_base_bytes(artifact: &SemanticArtifact) -> u64 {
         .iter()
         .fold(0usize, |rows, procedure| {
             rows.saturating_add(procedure.pointer_invalidations().len())
+                .saturating_add(
+                    procedure
+                        .guarded_alternate()
+                        .map_or(0, |alternate| alternate.pointer_invalidations().len()),
+                )
         });
     ((size_of::<Arc<SemanticArtifact>>()
         + size_of::<SemanticArtifact>()
@@ -630,13 +638,18 @@ fn retained_work_bytes(work: &SemanticWork, pointer_invalidation_rows: usize) ->
         .saturating_add(work.source_bytes as u64)
 }
 
+/// Row storage of one frozen native body copied into a demand view.
+#[doc(hidden)]
+pub fn frozen_procedure_row_bytes(procedure: &ProcedureSemantics, census: SemanticWork) -> u64 {
+    retained_work_bytes(&census, procedure.pointer_invalidations().len())
+        .saturating_add(size_of::<ProcedureSemantics>() as u64)
+}
+
 /// Conservative retained size of a decoded procedure, including nested rows.
 pub fn procedure_parts_retained_bytes(parts: &ProcedureSemanticsParts) -> usize {
     let work = crate::analyzer::semantic::measure_procedure_work(parts);
-    let bytes = (size_of::<ProcedureSemanticsParts>() as u64).saturating_add(retained_work_bytes(
-        &work,
-        parts.pointer_invalidations.len(),
-    ));
+    let (headers, invalidations) = parts.retained_layout();
+    let bytes = (headers as u64).saturating_add(retained_work_bytes(&work, invalidations));
     usize::try_from(bytes).unwrap_or(usize::MAX)
 }
 
@@ -650,6 +663,9 @@ pub fn retained_artifact_bytes(key: &SemanticArtifactKey, artifact: &SemanticArt
     // `key` is intentionally used here as an invariant check: the cache must
     // weigh the same immutable identity embedded in the artifact.
     debug_assert_eq!(key, artifact.key());
+    if let Some(bytes) = artifact.ownership_projection_retained_bytes() {
+        return bytes;
+    }
     artifact
         .procedures()
         .iter()
@@ -658,8 +674,18 @@ pub fn retained_artifact_bytes(key: &SemanticArtifactKey, artifact: &SemanticArt
                 .saturating_add(artifact.lexical_children_index_retained_bytes())
                 .saturating_add(artifact.call_source_extents_retained_bytes()),
             |bytes, procedure| {
+                let alternate_bytes = procedure.guarded_alternate().map_or(0, |alternate| {
+                    procedure
+                        .guarded_alternate_wrapper_bytes()
+                        .saturating_add(alternate.call_indexes_retained_bytes())
+                        .saturating_add(alternate.cleanup_chains().index_retained_bytes() as u64)
+                        .saturating_add(alternate.callable_selection_dominance_reserved_bytes())
+                        .saturating_add(alternate.value_identity_index_retained_bytes())
+                });
                 bytes
+                    .saturating_add(alternate_bytes)
                     .saturating_add(procedure.call_indexes_retained_bytes())
+                    .saturating_add(procedure.cleanup_chains().index_retained_bytes() as u64)
                     .saturating_add(procedure.callable_selection_dominance_reserved_bytes())
                     .saturating_add(procedure.call_gap_index_reserved_bytes())
                     .saturating_add(procedure.value_identity_index_retained_bytes())
@@ -670,6 +696,69 @@ pub fn retained_artifact_bytes(key: &SemanticArtifactKey, artifact: &SemanticArt
 
 pub fn semantic_artifact_retained_bytes(artifact: &SemanticArtifact) -> u64 {
     retained_artifact_bytes(artifact.key(), artifact)
+        .saturating_add(artifact.candidate_evidence_retained_bytes() as u64)
+        .saturating_add(artifact.candidate_arena_retained_bytes())
+}
+
+impl SemanticArtifact {
+    #[doc(hidden)]
+    pub fn charge_guarded_arena(&mut self, budget: &RetentionBudget) {
+        self.charge =
+            AllocationCharge::acquire(budget, semantic_artifact_retained_bytes(self) as usize);
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl SemanticArtifact {
+    /// Record this canonical artifact allocation and its existing budget
+    /// ownership for an explicit test-support census.
+    #[doc(hidden)]
+    pub fn retention_census_for_test(
+        self: &Arc<Self>,
+        census: &mut brokk_bifrost_core::retention_census::RetentionCensus<'_>,
+        family: &'static str,
+    ) {
+        use brokk_bifrost_core::retention_census::{
+            AllocationAccounting, FamilyLifetime, UnknownKind,
+        };
+
+        let mut pending = vec![Arc::clone(self)];
+        let mut visited = std::collections::HashSet::new();
+        while let Some(artifact) = pending.pop() {
+            if !visited.insert(Arc::as_ptr(&artifact) as usize) {
+                continue;
+            }
+
+            if let Some(base) = artifact.shared_ownership_base() {
+                pending.push(Arc::clone(base));
+            }
+            let accounting = if artifact.charge.is_charged() {
+                AllocationAccounting::AlreadyBudgeted
+            } else {
+                AllocationAccounting::OutsideBudget
+            };
+            let estimated_bytes = retained_artifact_bytes(artifact.key(), &artifact)
+                .saturating_add(artifact.candidate_evidence_retained_bytes() as u64);
+            let retained_candidate = artifact.retained_candidate_arena_for_test();
+            census.record_arc_allocation(
+                Arc::clone(&artifact),
+                family,
+                FamilyLifetime::Persistent,
+                "semantic-artifact",
+                estimated_bytes,
+                accounting,
+            );
+            census.record_unknown(
+                family,
+                FamilyLifetime::Persistent,
+                UnknownKind::Coverage,
+                "semantic_artifact_estimate_omits_shared_cache_pin_and_opaque_evidence_allocations",
+            );
+            if let Some(retained_candidate) = retained_candidate {
+                pending.push(retained_candidate);
+            }
+        }
+    }
 }
 
 impl SelfCharged for SemanticArtifact {
@@ -680,7 +769,9 @@ impl SelfCharged for SemanticArtifact {
 
 impl RetainedBytes for SemanticArtifactKey {
     fn retained_bytes(&self) -> usize {
-        size_of::<Self>().saturating_add(self.path().as_str().len())
+        size_of::<Self>().saturating_add(brokk_bifrost_core::allocation_size::allocation_size(
+            self.path().as_str().len(),
+        ))
     }
 }
 
@@ -980,6 +1071,7 @@ pub fn publish_lowered(
                 capabilities.clone(),
                 $parts,
                 &mut staged_budget,
+                request.cancellation,
             ) {
                 Ok(publication) => publication,
                 Err(error) => {
@@ -989,6 +1081,18 @@ pub fn publish_lowered(
             };
             match publication {
                 Publication::Artifact(artifact) => artifact,
+                Publication::Cancelled => {
+                    reconcile_observed_work(
+                        &mut staged_budget,
+                        started_work,
+                        source_work.component_max($work),
+                    );
+                    *request.budget = staged_budget;
+                    return Ok(SemanticOutcome::Cancelled {
+                        partial: None,
+                        work: source_work.component_max($work),
+                    });
+                }
                 Publication::Exceeded(exceeded) => {
                     *request.budget = staged_budget;
                     return Ok(SemanticOutcome::ExceededBudget {
@@ -1217,6 +1321,7 @@ fn reconcile_observed_work(
 enum Publication {
     Artifact(Arc<SemanticArtifact>),
     Exceeded(crate::analyzer::semantic::SemanticBudgetExceeded),
+    Cancelled,
 }
 
 fn publish(
@@ -1225,8 +1330,9 @@ fn publish(
     capabilities: SemanticCapabilities,
     parts: Vec<ProcedureSemanticsParts>,
     budget: &mut crate::analyzer::semantic::SemanticBudget,
+    cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
 ) -> Result<Publication, SemanticProviderError> {
-    match SemanticArtifact::try_new_with_budget(key, capabilities, parts, budget) {
+    match SemanticArtifact::try_new_with_budget(key, capabilities, parts, budget, cancellation) {
         Ok(mut artifact) => {
             artifact.charge = AllocationCharge::acquire(
                 retention_budget,
@@ -1236,6 +1342,7 @@ fn publish(
             budget.track_resident_artifact(&artifact);
             Ok(Publication::Artifact(artifact))
         }
+        Err(SemanticArtifactBuildError::Cancelled) => Ok(Publication::Cancelled),
         Err(SemanticArtifactBuildError::Invalid(error)) => {
             Err(SemanticProviderError::invalid_artifact(error))
         }
@@ -1389,24 +1496,336 @@ impl Drop for CachedSemanticArtifact {
     }
 }
 
+/// Shared retained-byte model for a concrete standard-library hash table.
+/// Census scratch itself uses exact boxed slots instead of this payload model.
+pub fn retained_hash_table_bytes<T>(capacity: usize) -> usize {
+    if capacity == 0 {
+        return 0;
+    }
+    let Some(buckets) = capacity
+        .saturating_mul(8)
+        .div_ceil(7)
+        .checked_next_power_of_two()
+    else {
+        return usize::MAX;
+    };
+    buckets
+        .saturating_mul(size_of::<T>() + 1)
+        .saturating_add(16)
+}
+
+/// Allocation and temporary traversal storage share the caller's existing
+/// retention allowance. Refusal is terminal for the lifetime of this census.
+pub trait RetentionCensusSink {
+    fn allocation(&mut self, identity: usize, bytes: usize) -> bool;
+    fn exclusive(&mut self, bytes: usize);
+    fn reserve_scratch(&mut self, bytes: usize) -> bool;
+    fn release_scratch(&mut self, bytes: usize);
+    fn is_refused(&self) -> bool;
+    fn refuse(&mut self);
+    fn weak_allocation(&mut self, identity: usize, bytes: usize);
+}
+
+/// Exact boxed traversal storage, funded before allocation. The previous box
+/// remains charged until the replacement has been populated and installed.
+pub struct RetentionScratch<T> {
+    slots: Box<[Option<T>]>,
+    len: usize,
+}
+impl<T> Default for RetentionScratch<T> {
+    fn default() -> Self {
+        Self {
+            slots: Box::default(),
+            len: 0,
+        }
+    }
+}
+impl<T> RetentionScratch<T> {
+    pub fn push(&mut self, value: T, sink: &mut (impl RetentionCensusSink + ?Sized)) {
+        if sink.is_refused() {
+            return;
+        }
+        if self.len == self.slots.len() {
+            let Some(capacity) = self.slots.len().max(1).checked_mul(2) else {
+                sink.refuse();
+                return;
+            };
+            let Some(bytes) = capacity.checked_mul(size_of::<Option<T>>()) else {
+                sink.refuse();
+                return;
+            };
+            if !sink.reserve_scratch(bytes) {
+                return;
+            }
+            let mut slots = Box::<[Option<T>]>::new_uninit_slice(capacity);
+            for slot in &mut slots {
+                slot.write(None);
+            }
+            // SAFETY: every slot contains an initialized None.
+            let mut slots = unsafe { slots.assume_init() };
+            for (next, previous) in slots.iter_mut().zip(self.slots.iter_mut()) {
+                *next = previous.take();
+            }
+            let old = std::mem::replace(&mut self.slots, slots);
+            let old_bytes = std::mem::size_of_val(old.as_ref());
+            drop(old);
+            sink.release_scratch(old_bytes);
+        }
+        self.slots[self.len] = Some(value);
+        self.len += 1;
+    }
+    pub fn extend(
+        &mut self,
+        values: impl IntoIterator<Item = T>,
+        sink: &mut (impl RetentionCensusSink + ?Sized),
+    ) {
+        for value in values {
+            if sink.is_refused() {
+                break;
+            }
+            self.push(value, sink);
+        }
+    }
+    pub fn pop(&mut self) -> Option<T> {
+        if self.len == 0 {
+            return None;
+        }
+        self.len -= 1;
+        self.slots[self.len].take()
+    }
+    pub fn release(self, sink: &mut (impl RetentionCensusSink + ?Sized)) {
+        let bytes = std::mem::size_of_val(self.slots.as_ref());
+        drop(self);
+        sink.release_scratch(bytes);
+    }
+}
+
+/// Existing semantic owner traversal, independent of the store's census type.
+pub trait ArtifactRetentionVisitor: RetentionCensusSink {
+    fn artifact(&mut self, artifact: &Arc<SemanticArtifact>);
+    fn relation(&mut self, relation: &crate::analyzer::semantic::OracleRelationHandle);
+    fn shared_allocation(&mut self, identity: usize, bytes: impl FnOnce() -> usize) -> bool {
+        if self.is_refused() {
+            return false;
+        }
+        self.allocation(identity, bytes())
+    }
+    fn map<K, V, S>(&mut self, values: &std::collections::HashMap<K, V, S>) {
+        self.exclusive(retained_hash_table_bytes::<(K, V)>(values.capacity()));
+    }
+    fn hash_set<T, S>(&mut self, values: &std::collections::HashSet<T, S>) {
+        self.exclusive(retained_hash_table_bytes::<T>(values.capacity()));
+    }
+    fn arena(&mut self, identity: usize, bytes: impl FnOnce() -> usize) -> bool {
+        self.shared_allocation(identity, bytes)
+    }
+    fn owned_box<T: ?Sized>(&mut self, value: &T) -> bool {
+        let bytes = std::mem::size_of_val(value);
+        bytes == 0 || self.allocation(std::ptr::from_ref(value).cast::<()>() as usize, bytes)
+    }
+    fn owned_slice<T>(&mut self, values: &[T]) -> bool {
+        let bytes = std::mem::size_of_val(values);
+        bytes != 0 && self.allocation(values.as_ptr().cast::<()>() as usize, bytes)
+    }
+    fn owned_vec<T>(&mut self, values: &Vec<T>) -> bool {
+        let bytes = values.capacity().saturating_mul(size_of::<T>());
+        bytes != 0 && self.allocation(values.as_ptr().cast::<()>() as usize, bytes)
+    }
+    fn owned_string(&mut self, value: &String) {
+        if value.capacity() != 0 {
+            self.allocation(value.as_ptr() as usize, value.capacity());
+        }
+    }
+    fn locator(&mut self, locator: &crate::analyzer::semantic::SemanticLocator) {
+        self.owned_slice(locator.path().as_str().as_bytes());
+        self.declaration(locator.declaration());
+    }
+    fn declaration(&mut self, declaration: &crate::analyzer::semantic::DeclarationLocator) {
+        if self.owned_slice(declaration.segments()) {
+            for segment in declaration.segments() {
+                if let Some(name) = segment.name() {
+                    self.owned_slice(name.as_bytes());
+                }
+            }
+        }
+    }
+    fn artifact_key(&mut self, key: &crate::analyzer::semantic::SemanticArtifactKey) {
+        self.owned_slice(key.path().as_str().as_bytes());
+        self.owned_slice(key.adapter().name().as_bytes());
+    }
+    fn project_file(&mut self, file: &brokk_bifrost_core::analyzer::model::ProjectFile) {
+        let (owner, root, path_capacity) = file.retained_parts();
+        if self.shared_allocation(Arc::as_ptr(owner).cast::<()>() as usize, || {
+            std::mem::size_of_val(owner.as_ref()) + 2 * size_of::<usize>() + path_capacity
+        }) {
+            self.shared_allocation(Arc::as_ptr(root).cast::<()>() as usize, || {
+                std::mem::size_of_val(root.as_ref()) + 2 * size_of::<usize>()
+            });
+        }
+    }
+    fn code_unit(&mut self, unit: &brokk_bifrost_core::analyzer::model::CodeUnit) {
+        let (owner, source, bytes) = unit.retained_parts();
+        if self.shared_allocation(Arc::as_ptr(owner).cast::<()>() as usize, || {
+            std::mem::size_of_val(owner.as_ref()) + 2 * size_of::<usize>() + bytes
+        }) {
+            self.project_file(source);
+        }
+    }
+    fn usage(&mut self, usage: &brokk_bifrost_core::analyzer::usages::model::UsageHit) {
+        self.project_file(&usage.file);
+        self.code_unit(&usage.enclosing);
+        self.owned_string(&usage.snippet);
+        if let Some(reason) = &usage.reason_kind {
+            self.owned_string(reason);
+        }
+    }
+    fn procedure(&mut self, procedure: &crate::analyzer::semantic::ProcedureHandle) {
+        self.artifact(procedure.artifact());
+    }
+    fn context(&mut self, context: &crate::analyzer::semantic::OracleCallContext) {
+        self.owned_slice(context.calls());
+        for call in context.calls() {
+            self.procedure(call.procedure());
+        }
+    }
+}
+
+enum RetainedArtifactTask {
+    Artifact(Arc<SemanticArtifact>),
+    Relation(crate::analyzer::semantic::OracleRelationHandle),
+}
+
+/// Uses the caller's ONE owner registry; allocates no separate visited tables.
+/// All pending traversal slots are prepaid through that same sink.
+pub struct RetainedArtifactWalker<'a, S: RetentionCensusSink> {
+    sink: &'a mut S,
+    pending: RetentionScratch<RetainedArtifactTask>,
+}
+impl<'a, S: RetentionCensusSink> RetainedArtifactWalker<'a, S> {
+    pub fn new(sink: &'a mut S) -> Self {
+        Self {
+            sink,
+            pending: RetentionScratch::default(),
+        }
+    }
+    pub fn finish(mut self) {
+        while !self.sink.is_refused() {
+            let Some(task) = self.pending.pop() else {
+                break;
+            };
+            match task {
+                RetainedArtifactTask::Relation(relation) => {
+                    relation.collect_retained_artifacts(&mut self)
+                }
+                RetainedArtifactTask::Artifact(artifact) => {
+                    artifact.for_each_retained_candidate_arena(|arena| self.artifact(arena));
+                }
+            }
+        }
+        self.pending.release(self.sink);
+    }
+}
+impl<S: RetentionCensusSink> RetentionCensusSink for RetainedArtifactWalker<'_, S> {
+    fn allocation(&mut self, identity: usize, bytes: usize) -> bool {
+        self.sink.allocation(identity, bytes)
+    }
+    fn exclusive(&mut self, bytes: usize) {
+        self.sink.exclusive(bytes);
+    }
+    fn reserve_scratch(&mut self, bytes: usize) -> bool {
+        self.sink.reserve_scratch(bytes)
+    }
+    fn release_scratch(&mut self, bytes: usize) {
+        self.sink.release_scratch(bytes);
+    }
+    fn is_refused(&self) -> bool {
+        self.sink.is_refused()
+    }
+    fn refuse(&mut self) {
+        self.sink.refuse();
+    }
+    fn weak_allocation(&mut self, identity: usize, bytes: usize) {
+        self.sink.weak_allocation(identity, bytes);
+    }
+}
+impl<S: RetentionCensusSink> ArtifactRetentionVisitor for RetainedArtifactWalker<'_, S> {
+    fn artifact(&mut self, artifact: &Arc<SemanticArtifact>) {
+        if self.is_refused() {
+            return;
+        }
+        // Preserve the existing semantic artifact owner's byte model, but walk
+        // retained candidate arenas independently so aliased arenas count once.
+        let bytes = retained_artifact_bytes(artifact.key(), artifact)
+            .saturating_add(artifact.candidate_evidence_retained_bytes() as u64);
+        if self.allocation(
+            Arc::as_ptr(artifact) as usize,
+            usize::try_from(bytes).unwrap_or(usize::MAX),
+        ) {
+            // These concrete control allocations are not part of the stored
+            // artifact row-weight estimate. Other receipts can share them.
+            self.allocation(
+                Arc::as_ptr(&artifact.cache_pins) as usize,
+                std::mem::size_of_val(artifact.cache_pins.as_ref()) + 2 * size_of::<usize>(),
+            );
+            if let Some((identity, bytes)) =
+                artifact.allocation_charge().retained_control_allocation()
+            {
+                self.allocation(identity, bytes);
+            }
+            self.pending.push(
+                RetainedArtifactTask::Artifact(Arc::clone(artifact)),
+                self.sink,
+            );
+        }
+    }
+    fn relation(&mut self, relation: &crate::analyzer::semantic::OracleRelationHandle) {
+        self.pending
+            .push(RetainedArtifactTask::Relation(relation.clone()), self.sink);
+    }
+}
+
 /// Temporary, allocation-deduplicated census for cache admission and timing.
 /// Drop after one entry weight or one diagnostic sample.
 #[doc(hidden)]
 #[derive(Default)]
 pub struct ArtifactRetentionCensus {
-    artifacts: brokk_bifrost_core::hash::HashSet<usize>,
-    arenas: brokk_bifrost_core::hash::HashSet<usize>,
+    artifacts: brokk_bifrost_core::hash::HashMap<usize, (Arc<SemanticArtifact>, u64)>,
+    arenas: brokk_bifrost_core::hash::HashMap<usize, usize>,
+    shared_allocations: brokk_bifrost_core::hash::HashMap<usize, usize>,
     artifact_bytes: u64,
     arena_bytes: u64,
+    shared_bytes: u64,
     pending_relations: Vec<crate::analyzer::semantic::OracleRelationHandle>,
 }
 
 impl ArtifactRetentionCensus {
+    /// Count an immutable shared allocation once within this census. The
+    /// caller must keep its owner alive while the census is being assembled.
+    pub fn shared_allocation(&mut self, identity: usize, bytes: impl FnOnce() -> usize) -> bool {
+        if self.shared_allocations.contains_key(&identity) {
+            return false;
+        }
+        let bytes = bytes();
+        self.shared_allocations.insert(identity, bytes);
+        self.shared_bytes = self.shared_bytes.saturating_add(bytes as u64);
+        true
+    }
+
+    pub(crate) fn owned_slice<T>(&mut self, values: &[T]) -> bool {
+        if std::mem::size_of_val(values) == 0 {
+            return false;
+        }
+        self.shared_allocation(values.as_ptr().cast::<()>() as usize, || {
+            std::mem::size_of_val(values)
+        })
+    }
+
     pub fn artifact(&mut self, artifact: &Arc<SemanticArtifact>) {
-        if self.artifacts.insert(Arc::as_ptr(artifact) as usize) {
-            self.artifact_bytes = self
-                .artifact_bytes
-                .saturating_add(semantic_artifact_retained_bytes(artifact));
+        let identity = Arc::as_ptr(artifact) as usize;
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.artifacts.entry(identity) {
+            let bytes = semantic_artifact_retained_bytes(artifact);
+            entry.insert((Arc::clone(artifact), bytes));
+            self.artifact_bytes = self.artifact_bytes.saturating_add(bytes);
         }
     }
 
@@ -1415,14 +1834,17 @@ impl ArtifactRetentionCensus {
     }
 
     pub(crate) fn arena(&mut self, identity: usize, bytes: impl FnOnce() -> usize) -> bool {
-        if !self.arenas.insert(identity) {
+        if self.arenas.contains_key(&identity) {
             return false;
         }
-        self.arena_bytes = self.arena_bytes.saturating_add(bytes() as u64);
+        let bytes = bytes();
+        self.arenas.insert(identity, bytes);
+        self.arena_bytes = self.arena_bytes.saturating_add(bytes as u64);
         true
     }
 
     pub fn context(&mut self, context: &crate::analyzer::semantic::OracleCallContext) {
+        self.owned_slice(context.calls());
         for call in context.calls() {
             self.procedure(call.procedure());
         }
@@ -1438,12 +1860,259 @@ impl ArtifactRetentionCensus {
         }
     }
 
+    /// Borrow every actual artifact allocation found by the existing provenance
+    /// traversal, including artifacts reached only through nested arenas.
+    pub fn for_each_artifact(&mut self, mut visit: impl FnMut(&Arc<SemanticArtifact>)) {
+        self.drain_relations();
+        for (artifact, _) in self.artifacts.values() {
+            visit(artifact);
+        }
+    }
+
+    /// Reuse the first census's artifact weights without walking those artifacts again.
+    pub fn artifact_allocation_records(&mut self) -> impl Iterator<Item = (usize, u64)> + '_ {
+        self.drain_relations();
+        self.artifacts
+            .iter()
+            .map(|(identity, (_, bytes))| (*identity, *bytes))
+    }
+
+    /// Non-artifact shared allocations. The caller must retain their owners
+    /// until these pointer identities have been removed from its accounting.
+    pub fn shared_allocation_records(&mut self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.drain_relations();
+        self.shared_allocations
+            .iter()
+            .chain(&self.arenas)
+            .map(|(identity, bytes)| (*identity, *bytes))
+    }
+
     pub fn artifact_bytes(&mut self) -> u64 {
         self.drain_relations();
         self.artifact_bytes
     }
     pub fn retained_bytes(&mut self) -> u64 {
         self.drain_relations();
-        self.artifact_bytes.saturating_add(self.arena_bytes)
+        self.artifact_bytes
+            .saturating_add(self.arena_bytes)
+            .saturating_add(self.shared_bytes)
+    }
+}
+
+impl RetentionCensusSink for ArtifactRetentionCensus {
+    fn exclusive(&mut self, bytes: usize) {
+        self.shared_bytes = self.shared_bytes.saturating_add(bytes as u64);
+    }
+    fn allocation(&mut self, identity: usize, bytes: usize) -> bool {
+        self.shared_allocation(identity, || bytes)
+    }
+    fn reserve_scratch(&mut self, _: usize) -> bool {
+        true
+    }
+    fn release_scratch(&mut self, _: usize) {}
+    fn is_refused(&self) -> bool {
+        false
+    }
+    fn refuse(&mut self) {
+        panic!("semantic census storage overflow");
+    }
+    fn weak_allocation(&mut self, identity: usize, bytes: usize) {
+        if identity != usize::MAX {
+            self.allocation(identity, bytes);
+        }
+    }
+}
+impl ArtifactRetentionVisitor for ArtifactRetentionCensus {
+    fn artifact(&mut self, artifact: &Arc<SemanticArtifact>) {
+        ArtifactRetentionCensus::artifact(self, artifact);
+    }
+    fn relation(&mut self, relation: &crate::analyzer::semantic::OracleRelationHandle) {
+        ArtifactRetentionCensus::relation(self, relation);
+    }
+    fn arena(&mut self, identity: usize, bytes: impl FnOnce() -> usize) -> bool {
+        ArtifactRetentionCensus::arena(self, identity, bytes)
+    }
+}
+
+/// All-or-none selection returned by the language admission owner.
+pub enum CandidateProcedureSelection<T> {
+    Base(T),
+    Alternate(T),
+}
+
+#[derive(Clone)]
+pub struct SelectedCandidateProcedure<T> {
+    pub side: CandidateProcedureSide,
+    pub procedure: super::ProcedureHandle,
+    pub flows: super::partial_flow::ProcedurePartialFlows,
+    pub admissions: T,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateProcedureSide {
+    Base,
+    Alternate,
+}
+
+/// Stops never carry an executable, partially admitted alternate.
+pub enum CandidateProcedureOutcome<T> {
+    Selected(SelectedCandidateProcedure<T>),
+    Cancelled,
+    ExceededBudget(super::SemanticBudgetExceeded),
+}
+
+/// Preserve dispatch evidence while binding the selected callee's formal ports.
+pub fn reseal_selected_candidate(
+    candidate: &super::DispatchCandidate,
+    call: &super::CallSiteHandle,
+    selected: &super::ProcedureHandle,
+    limits: super::OracleLimits,
+) -> Result<super::DispatchCandidate, super::OracleContractError> {
+    candidate.reseal_selected(call, selected, limits)
+}
+
+/// The sole query-time mint for executable guarded procedure handles.
+/// The callback owns admission policy; this owner keeps semantics and flows paired.
+pub fn select_candidate_procedure<T>(
+    prepared: &super::StoredCandidateMacroArtifact<
+        impl AsRef<
+            [(
+                super::ProcedureId,
+                super::partial_flow::ProcedurePartialFlows,
+            )],
+        >,
+    >,
+    base: &super::ProcedureHandle,
+    base_flows: Option<&super::partial_flow::ProcedurePartialFlows>,
+    select: impl FnOnce(
+        &super::ProcedureSemantics,
+        &[super::CandidateRecord],
+    ) -> CandidateProcedureSelection<T>,
+    request: &mut super::SemanticRequest<'_>,
+) -> Result<CandidateProcedureOutcome<T>, super::SemanticProviderError> {
+    use super::SemanticWork;
+    use super::partial_flow::{
+        file_local_procedure_relations, fixpoint::partial_flows_from_projection,
+    };
+    if request.cancellation.is_cancelled() {
+        return Ok(CandidateProcedureOutcome::Cancelled);
+    }
+    assert_eq!(prepared.artifact.key(), base.artifact().key());
+    let procedure = prepared
+        .artifact
+        .procedure(base.id())
+        .expect("validated base procedure");
+    let alternate = procedure.candidate_macro_alternate();
+    let (semantics, candidates) = alternate.unwrap_or((procedure, &[]));
+    // Charge candidate processing before invoking any language proof.
+    if let Err(exceeded) = request.budget.admit(SemanticWork {
+        call_sites: candidates.len(),
+        ..Default::default()
+    }) {
+        return Ok(CandidateProcedureOutcome::ExceededBudget(exceeded));
+    }
+    let (mut side, admissions) = match select(semantics, candidates) {
+        CandidateProcedureSelection::Base(answers) => (CandidateProcedureSide::Base, answers),
+        CandidateProcedureSelection::Alternate(answers) => {
+            (CandidateProcedureSide::Alternate, answers)
+        }
+    };
+    if request.cancellation.is_cancelled() {
+        return Ok(CandidateProcedureOutcome::Cancelled);
+    }
+    if alternate.is_none() {
+        side = CandidateProcedureSide::Base;
+    }
+    let (handle, stored) = match side {
+        CandidateProcedureSide::Base => (base.base_interpretation(), base_flows),
+        CandidateProcedureSide::Alternate => (
+            prepared
+                .artifact
+                .candidate_alternate_handle(base.id())
+                .expect("validated alternate"),
+            prepared
+                .flows
+                .as_ref()
+                .iter()
+                .find(|(id, _)| *id == base.id())
+                .map(|(_, flows)| flows),
+        ),
+    };
+    let flows = if let Some(stored) = stored {
+        if let Err(exceeded) = request.budget.admit(stored.semantic_work()) {
+            return Ok(CandidateProcedureOutcome::ExceededBudget(exceeded));
+        }
+        stored.clone()
+    } else {
+        let projected =
+            file_local_procedure_relations(&handle, &super::OracleCallContext::empty(), request);
+        let Some(flows) = partial_flows_from_projection(&handle, projected, request) else {
+            return Ok(CandidateProcedureOutcome::Cancelled);
+        };
+        flows
+    };
+    if request.cancellation.is_cancelled() {
+        return Ok(CandidateProcedureOutcome::Cancelled);
+    }
+    debug_assert!(side != CandidateProcedureSide::Base || !handle.is_candidate_alternate());
+    // Selection is decided even when the paired flows retain a coarse budget stop.
+    Ok(CandidateProcedureOutcome::Selected(
+        SelectedCandidateProcedure {
+            side,
+            procedure: handle,
+            flows,
+            admissions,
+        },
+    ))
+}
+
+#[derive(Debug, Clone)]
+pub enum CandidateMacroRefusal {
+    /// `candidate_realization_incomplete`: guarded actuals do not match the proven layout.
+    RealizationIncomplete,
+    UnsupportedLanguage,
+    UnavailableAnalyzer,
+    Cancelled,
+    Evidence(String),
+    Route(String),
+}
+
+/// Lightweight executable selection with the refusal evidence from its admission receipt.
+#[derive(Debug, Clone)]
+pub struct SelectedProcedureHandle {
+    pub handle: super::ProcedureHandle,
+    pub side: CandidateProcedureSide,
+    pub refusals: Vec<CandidateMacroRefusalEvidence>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CandidateMacroRefusalEvidence {
+    pub anchor: super::SourceAnchor,
+    pub reason: CandidateMacroRefusal,
+}
+
+/// Shared evidence rendering for query and policy coverage diagnostics.
+pub fn candidate_macro_refusal_detail(refusals: &[CandidateMacroRefusalEvidence]) -> String {
+    refusals
+        .iter()
+        .map(|evidence| format!("{:?}: {:?}", evidence.anchor, evidence.reason))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+#[cfg(test)]
+mod allocated_bytes_refusing_pins {
+    use super::*;
+
+    #[test]
+    fn resident_work_and_registration_payload_keep_master_bytes() {
+        // Resident admission and both protocol/taint artifact registrations use
+        // this raw census. Text doubles and source bytes stay unrounded.
+        let work = SemanticWork {
+            owned_text_bytes: 64,
+            source_bytes: 17,
+            ..SemanticWork::default()
+        };
+        assert_eq!(retained_work_bytes(&work, 0), 145);
     }
 }

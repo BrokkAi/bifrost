@@ -630,6 +630,56 @@ pub fn go_vendor_root(path: &Path) -> Option<&Path> {
         .filter(|vendor| vendor.file_name() == Some("vendor".as_ref()))
 }
 
+/// The module path and version that a complete `vendor/modules.txt` lists for
+/// the vendored package holding `file`, when the file's nearest module anchor
+/// is a vendor tree (#11322). The go command builds that package from exactly
+/// this copy of that module version, so a model activated for the same module
+/// and version describes the code in `file`. A replaced module, a package the
+/// listing does not name, or an unreadable or incomplete listing names no
+/// version: the file is then not known to be a dependency's copy.
+pub fn go_vendored_module(file: &ProjectFile) -> Option<(String, String)> {
+    let abs = file.abs_path();
+    let file_dir = abs.parent()?;
+    // Only a vendor anchor names its packages without a module prefix.
+    let GoModuleLookup::Found((vendor, module_path)) =
+        nearest_go_module_anchor(file_dir, file.root())
+    else {
+        return None;
+    };
+    if !module_path.is_empty() {
+        return None;
+    }
+    let package = file_dir
+        .strip_prefix(&vendor)
+        .ok()?
+        .to_string_lossy()
+        .replace('\\', "/");
+    let listing = std::fs::read_to_string(vendor.join("modules.txt")).ok()?;
+    let document = crate::build_files::parse_vendor_modules(
+        &listing,
+        &crate::build_files::BuildFileLimits::default(),
+        || false,
+    );
+    if !document.complete() {
+        return None;
+    }
+    let [module] = document
+        .modules
+        .iter()
+        .filter(|module| module.packages.iter().any(|listed| listed.value == package))
+        .collect::<Vec<_>>()[..]
+    else {
+        return None;
+    };
+    if module.replacement.is_some() {
+        return None;
+    }
+    Some((
+        module.module.value.clone(),
+        module.version.as_ref()?.value.clone(),
+    ))
+}
+
 pub fn go_module_roots(project: &dyn Project) -> Vec<GoModuleRoot> {
     let files = project.all_files().unwrap_or_default();
     go_module_roots_from_files(project, &files).0

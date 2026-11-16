@@ -71,6 +71,10 @@ fn provenance_expansions_with_model_key(
     }
     let Some(workspace) = workspace else {
         diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            has_non_utf8_refusal: false,
+            refusal_sites: Default::default(),
+            call_relation_facts: None,
+            uses_omissions: Vec::new(),
             incompleteness: brokk_bifrost_rql::Incompleteness::Content,
             related: Vec::new(),
             source: None,
@@ -86,6 +90,10 @@ fn provenance_expansions_with_model_key(
     };
     let Some(semantic) = semantic.as_mut() else {
         diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            has_non_utf8_refusal: false,
+            refusal_sites: Default::default(),
+            call_relation_facts: None,
+            uses_omissions: Vec::new(),
             incompleteness: brokk_bifrost_rql::Incompleteness::Content,
             related: Vec::new(),
             source: None,
@@ -113,6 +121,10 @@ fn provenance_expansions_with_model_key(
                 diagnostics.push(super::QueryExecutionState::diagnostic(
                     workspace.analyzer(),
                     CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                        has_non_utf8_refusal: false,
+                        refusal_sites: Default::default(),
+                        call_relation_facts: None,
+                        uses_omissions: Vec::new(),
                         incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                         related: Vec::new(),
                         source: None,
@@ -177,6 +189,10 @@ fn report_incomplete(
     diagnostics.push(super::QueryExecutionState::diagnostic(
         analyzer,
         CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            has_non_utf8_refusal: false,
+            refusal_sites: Default::default(),
+            call_relation_facts: None,
+            uses_omissions: Vec::new(),
             incompleteness: brokk_bifrost_rql::Incompleteness::Content,
             related: Vec::new(),
             source: None,

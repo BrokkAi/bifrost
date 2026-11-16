@@ -108,6 +108,23 @@ impl MemberSelectionRequest {
     }
 }
 
+/// A class's declared bases and ordered ancestry, requested without a member.
+/// The walk reads supertype edges only: no candidate inventory is read for any
+/// owner, and no direct definition can stop it.
+#[derive(Debug)]
+#[doc(hidden)]
+pub struct HierarchyDemandRequest {
+    pub(crate) policy: &'static dyn HierarchyPolicy,
+    /// With no order, the request reads only the root's own base edges: no
+    /// base is expanded and nothing is linearized.
+    pub(crate) order: Option<HierarchyOrderRequest>,
+    pub(crate) root: SemanticId,
+    /// Identity of the walk's shape. It names no member and no inventory is
+    /// read for it; it only keeps this walk's summaries apart from member walks.
+    pub(crate) shape: SemanticId,
+    pub(crate) language: Language,
+}
+
 /// One qualified member group from evaluated slots, without a lexical ROOT.
 #[derive(Clone, Debug)]
 pub(crate) struct QualifiedMemberInput {
@@ -365,6 +382,8 @@ pub(crate) struct MemberQueryResult {
 }
 
 struct MemberSelectionFrame<'source> {
+    /// A direct-bases request: the root's edge node, read without a closure.
+    direct: Option<(SemanticId, DemandHierarchyEdgeFrame)>,
     order: Option<HierarchyOrderState>,
     provenance: HierarchyProvenanceId,
     evaluation: Option<FactEvaluationState<'source>>,
@@ -507,6 +526,7 @@ impl<'source> MemberSelectionFrame<'source> {
             groups.clear();
         }
         Some(Self {
+            direct: None,
             order,
             evaluation: Some(evaluation.into_checkpoint_state()),
             provenance: HierarchyProvenanceId::default(),
@@ -516,6 +536,82 @@ impl<'source> MemberSelectionFrame<'source> {
             completion: ResolutionCompletion::Complete,
             discharged_provider_reasons: BTreeSet::new(),
         })
+    }
+
+    fn for_hierarchy(
+        operation: &mut Resources<'_, 'source>,
+        request: HierarchyDemandRequest,
+    ) -> Option<Self> {
+        let mut evaluation = FactEvaluation::new_with_forward_artifacts(
+            operation.session,
+            operation.hierarchy,
+            operation.forward_candidate_artifacts,
+            operation.candidate_paths,
+            request.root,
+        );
+        evaluation.hierarchy_policy = evaluation.hierarchy.register_policy(request.policy);
+        evaluation.selected_route_language = request.language;
+        if evaluation.poll_cancelled() {
+            return None;
+        }
+        let Some(order_request) = request.order else {
+            let edges = DemandHierarchyEdgeFrame::new(&mut evaluation, &[request.root])?;
+            return Some(Self {
+                direct: Some((request.root, edges)),
+                order: None,
+                evaluation: Some(evaluation.into_checkpoint_state()),
+                provenance: HierarchyProvenanceId::default(),
+                groups: BTreeMap::new(),
+                active: None,
+                owners: BTreeSet::new(),
+                completion: ResolutionCompletion::Complete,
+                discharged_provider_reasons: BTreeSet::new(),
+            });
+        };
+        let order = HierarchyOrderState::new(
+            order_request,
+            HierarchyProvenanceView::new(evaluation.hierarchy),
+        );
+        let value = ResolutionSlotValue::type_object(ResolutionTypeRef::new(request.root, 0));
+        let mut shape = HierarchyLookupShape::new(
+            request.shape,
+            ResolutionNamespace::Value,
+            QualifierCategory::of(value),
+            0,
+        )
+        .hierarchy_only();
+        shape.policy = evaluation.hierarchy_policy;
+        let groups = BTreeMap::from([(
+            shape,
+            vec![HierarchyRoot {
+                owner_path_prefix: None,
+                owner: request.root,
+                value,
+                route_ordinal: 0,
+            }],
+        )]);
+        Some(Self {
+            direct: None,
+            order: Some(order),
+            evaluation: Some(evaluation.into_checkpoint_state()),
+            provenance: HierarchyProvenanceId::default(),
+            groups,
+            active: None,
+            owners: BTreeSet::new(),
+            completion: ResolutionCompletion::Complete,
+            discharged_provider_reasons: BTreeSet::new(),
+        })
+    }
+
+    fn for_guard(
+        operation: &mut Resources<'_, 'source>,
+        request: HierarchyDemandRequest,
+        rule: crate::analyzer::resolution::BasePreservationRule,
+    ) -> Option<Self> {
+        let owner = request.root;
+        let mut frame = Self::for_hierarchy(operation, request)?;
+        frame.direct = Some((owner, DemandHierarchyEdgeFrame::for_guard(owner, rule)));
+        Some(frame)
     }
 
     fn poll(
@@ -551,6 +647,52 @@ impl<'source> MemberSelectionFrame<'source> {
     ) -> StoreResult<MemberSelectionPoll> {
         if evaluation.poll_cancelled() {
             return Ok(MemberSelectionPoll::Cancelled);
+        }
+        if let Some((root, edges)) = &mut self.direct {
+            let root = *root;
+            let polled = edges.poll(evaluation, readiness)?;
+            let endpoints =
+                matches!(polled, DemandHierarchyLocalPoll::AwaitingDependencies).then(|| {
+                    edges
+                        .pending_requests()
+                        .iter()
+                        .map(|request| request.endpoint().clone())
+                        .collect::<Vec<_>>()
+                });
+            return Ok(match polled {
+                DemandHierarchyLocalPoll::Continue => MemberSelectionPoll::Continue,
+                DemandHierarchyLocalPoll::AwaitingDependencies => {
+                    let endpoints = endpoints.expect("endpoints read while suspended");
+                    assert!(
+                        !endpoints.is_empty(),
+                        "a suspended direct-bases phase retains its requests"
+                    );
+                    MemberSelectionPoll::AwaitingDependencies(endpoints)
+                }
+                DemandHierarchyLocalPoll::AwaitingHierarchyReferences(references) => {
+                    MemberSelectionPoll::AwaitingHierarchyReferences(references)
+                }
+                DemandHierarchyLocalPoll::Ready(false) => MemberSelectionPoll::Cancelled,
+                DemandHierarchyLocalPoll::Ready(true) => {
+                    self.direct = None;
+                    self.owners.insert(root);
+                    MemberSelectionPoll::Ready(MemberSelection {
+                        own_dictionary: false,
+                        query_obligations: evaluation.query_obligations.published(),
+                        order: None,
+                        provenance: HierarchyProvenanceView::new(evaluation.hierarchy)
+                            .selection(self.provenance),
+                        owners: std::mem::take(&mut self.owners).into_iter().collect(),
+                        completion: std::mem::replace(
+                            &mut self.completion,
+                            ResolutionCompletion::Complete,
+                        ),
+                        discharged_provider_reasons: std::mem::take(
+                            &mut self.discharged_provider_reasons,
+                        ),
+                    })
+                }
+            });
         }
         if let Some(active) = &mut self.active {
             match active.poll(evaluation, readiness)? {
@@ -693,6 +835,9 @@ impl<'source> MemberSelectionFrame<'source> {
             FactEvaluation::new(operation.session, operation.hierarchy, state.root)
                 .with_candidate_paths(operation.candidate_paths);
         evaluation.replace_with_checkpoint_state(state);
+        if let Some((_, edges)) = self.direct.take() {
+            edges.cancel(&mut evaluation);
+        }
         if let Some(active) = self.active.take()
             && let Some(inherited) = active.inherited
         {
@@ -709,6 +854,9 @@ impl<'source> MemberSelectionFrame<'source> {
             FactEvaluation::new(operation.session, operation.hierarchy, state.root)
                 .with_candidate_paths(operation.candidate_paths);
         evaluation.replace_with_checkpoint_state(state);
+        if let Some((_, edges)) = self.direct.take() {
+            edges.abandon(&mut evaluation);
+        }
         if let Some(active) = self.active.take()
             && let Some(inherited) = active.inherited
         {
@@ -4948,9 +5096,111 @@ pub(super) fn select_members(
     provider: &mut (impl RootProvider + ?Sized),
     request: MemberSelectionRequest,
 ) -> StoreResult<(Option<MemberSelection>, ResolutionCompletion)> {
+    let symbols = [request.reference, request.lookup];
+    select_with_frame(resources, provider, symbols, |resources| {
+        MemberSelectionFrame::new(resources, request)
+    })
+    .map(|(selection, completion, _)| (selection, completion))
+}
+
+/// The same selection phase for a request that names no member.
+pub(super) fn select_hierarchy(
+    resources: &mut Resources<'_, '_>,
+    provider: &mut (impl RootProvider + ?Sized),
+    request: HierarchyDemandRequest,
+) -> StoreResult<(
+    Option<MemberSelection>,
+    ResolutionCompletion,
+    Option<HierarchyStop>,
+)> {
+    let symbols = [request.root, request.shape];
+    select_with_frame(resources, provider, symbols, |resources| {
+        MemberSelectionFrame::for_hierarchy(resources, request)
+    })
+}
+
+pub(super) fn prove_guard(
+    resources: &mut Resources<'_, '_>,
+    provider: &mut (impl RootProvider + ?Sized),
+    request: HierarchyDemandRequest,
+    rule: crate::analyzer::resolution::BasePreservationRule,
+) -> StoreResult<bool> {
+    let owner = request.root;
+    let policy = request.policy.identity();
+    let symbols = [owner, request.shape];
+    let (selection, completion, _) =
+        select_with_frame(resources, provider, symbols, |resources| {
+            MemberSelectionFrame::for_guard(resources, request, rule)
+        })?;
+    if selection.is_none()
+        || completion != ResolutionCompletion::Complete
+        || resources.session.cancellation.is_cancelled()
+    {
+        return Ok(false);
+    }
+    let key = hierarchy_policy::BaseGuardKey {
+        owner: HierarchyOwnerKey { owner, policy },
+        rule,
+    };
+    Ok(resources
+        .hierarchy
+        .base_guard_proofs
+        .get(&key)
+        .is_some_and(|proof| {
+            proof
+                .read(&mut super::super::QueryObligations::empty())
+                .admitted
+        }))
+}
+
+/// A scheduler refusal, retained with its endpoint and actual completion.
+#[derive(Debug)]
+#[doc(hidden)]
+pub enum HierarchyStop {
+    Unavailable {
+        endpoint: EndpointSignature,
+        reason: RootUnavailableReason,
+        completion: ResolutionCompletion,
+    },
+    Cancelled(ResolutionCompletion),
+    Cyclic(ResolutionCompletion),
+    Provider(ResolutionCompletion),
+    /// A deterministic proof stop with a registered label. Only tests construct
+    /// it; it is not cfg-gated so that every crate's match stays exhaustive no
+    /// matter which crates enable `test-support` (#12807).
+    Deterministic(&'static str),
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl HierarchyStop {
+    pub fn missing_provenance_for_test(root: SemanticId) -> Self {
+        Self::Unavailable {
+            endpoint: EndpointSignature::new(
+                BindingNodeId::universal_root(),
+                StackPattern::closed([root]),
+                StackPattern::closed(Vec::<BindingNodeId>::new()),
+            ),
+            reason: RootUnavailableReason::MissingSourceProvenance,
+            completion: ResolutionCompletion::incomplete([
+                ResolutionIncompleteReason::UnsupportedSemantic(root),
+            ]),
+        }
+    }
+}
+
+fn select_with_frame<'source>(
+    resources: &mut Resources<'_, 'source>,
+    provider: &mut (impl RootProvider + ?Sized),
+    symbols: [SemanticId; 2],
+    make_frame: impl FnOnce(&mut Resources<'_, 'source>) -> Option<MemberSelectionFrame<'source>>,
+) -> StoreResult<(
+    Option<MemberSelection>,
+    ResolutionCompletion,
+    Option<HierarchyStop>,
+)> {
     let endpoint = RelationKey::caller(EndpointSignature::new(
         BindingNodeId::universal_root(),
-        StackPattern::closed([request.reference, request.lookup]),
+        StackPattern::closed(symbols),
         StackPattern::closed(Vec::<BindingNodeId>::new()),
     ));
     let (mut scheduler, admission) = seed_close_scheduler(
@@ -4960,10 +5210,18 @@ pub(super) fn select_members(
         ResolutionCompletion::Complete,
     );
     let RelationAdmission::Ready(relation) = admission else {
-        return Ok((None, incomplete_cancelled()));
+        return Ok((
+            None,
+            incomplete_cancelled(),
+            Some(HierarchyStop::Cancelled(incomplete_cancelled())),
+        ));
     };
-    let Some(frame) = MemberSelectionFrame::new(resources, request) else {
-        return Ok((None, incomplete_cancelled()));
+    let Some(frame) = make_frame(resources) else {
+        return Ok((
+            None,
+            incomplete_cancelled(),
+            Some(HierarchyStop::Cancelled(incomplete_cancelled())),
+        ));
     };
     scheduler.relations[relation].member_requested = true;
     scheduler.relations[relation].member_selection = Some(Box::new(frame));
@@ -4978,19 +5236,33 @@ pub(super) fn select_members(
                 .expect("requested selection is ready");
             let completion = selection.completion.clone();
             scheduler.retain_completed_roots(resources);
-            Ok((Some(selection), completion))
+            Ok((Some(selection), completion, None))
         }
         SchedulerOutcome::Incomplete(_, outcome) | SchedulerOutcome::Terminal(outcome) => {
-            let completion = match outcome {
-                BatchOutcome::Cancelled(completion)
-                | BatchOutcome::Unavailable { completion, .. }
-                | BatchOutcome::Unsupported(Unsupported::CyclicPrefixDependency {
+            let (completion, stop) = match outcome {
+                BatchOutcome::Cancelled(completion) => {
+                    (completion.clone(), HierarchyStop::Cancelled(completion))
+                }
+                BatchOutcome::Unavailable {
+                    endpoint,
+                    reason,
                     completion,
                     ..
-                }) => completion,
+                } => (
+                    completion.clone(),
+                    HierarchyStop::Unavailable {
+                        endpoint,
+                        reason,
+                        completion,
+                    },
+                ),
+                BatchOutcome::Unsupported(Unsupported::CyclicPrefixDependency {
+                    completion,
+                    ..
+                }) => (completion.clone(), HierarchyStop::Cyclic(completion)),
                 BatchOutcome::Ready(_) => unreachable!("ready selection returns its scheduler"),
             };
-            Ok((None, completion))
+            Ok((None, completion, Some(stop)))
         }
     }
 }
@@ -6711,6 +6983,7 @@ mod tests {
                 scheduler.relations[ids[0]].member_requested = true;
                 scheduler.relations[ids[0]].member_selection =
                     Some(Box::new(MemberSelectionFrame {
+                        direct: None,
                         order: None,
                         provenance: HierarchyProvenanceId::default(),
                         evaluation: Some(evaluation),

@@ -197,8 +197,10 @@ pub fn selected_resolution_temp_schema_sql() -> &'static str {
              CREATE TEMP TABLE IF NOT EXISTS selected_resolution_scope_mounts(
                mount_ordinal INTEGER NOT NULL PRIMARY KEY CHECK(mount_ordinal >= 0)
              ) WITHOUT ROWID, STRICT;
-             {module_placements_schema}",
+             {module_placements_schema}
+             {rust_source_scopes}",
             stage_schema = super::resolution_stage::schema_sql(),
+            rust_source_scopes = super::rust_crates::derivation::source_declaration_scopes_schema_sql(),
             module_placements_schema = super::resolution_operation::rust_crate_context::SELECTED_MODULE_PLACEMENTS_SCHEMA_SQL,
             go_placements = super::resolution_operation::go_context::GO_TRANSIENT_PLACEMENTS_SQL,
         );
@@ -1385,6 +1387,17 @@ impl SelectedResolutionMountRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MissingDefinitionReason {
+    UnprojectedDefinition {
+        target_files: Vec<(String, Oid)>,
+    },
+    UncertifiedDefinition,
+    /// Only fixed language-universe targets, pending the consumer shadow proof.
+    UniverseDefinition,
+    UnplacedDefinition,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[doc(hidden)]
 pub enum SelectedResolutionUnavailable {
     CatalogInputUnavailable {
@@ -1440,6 +1453,7 @@ pub enum SelectedResolutionUnavailable {
         persisted_relative_path: String,
     },
     MissingDefinitionUnit {
+        reason: MissingDefinitionReason,
         storage_language: String,
         persisted_relative_path: String,
     },
@@ -1465,7 +1479,6 @@ pub enum SelectedResolutionStale {
     /// connection, another user wrote rows or schema there that an ordinary
     /// selection read never writes, so its temp selection is no longer known
     /// to be the one it installed.
-    LentWriterChanged,
     TransientAnalysisGeneration {
         expected: u64,
         actual: u64,
@@ -1524,19 +1537,39 @@ fn next_stage_request_identity() -> u64 {
     .expect("selected stage request identity space exhausted")
 }
 
-#[derive(Clone, Copy)]
+/// Source-content evidence for one overlay or stage host, kept in replay recipes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SelectedContentComparison {
+    pub path: Option<String>,
+    pub main_oid: Option<String>,
+    pub selected_oid: Option<String>,
+    pub removed: bool,
+}
+
+impl SelectedContentComparison {
+    pub fn unchanged(&self) -> bool {
+        !self.removed
+            && self.path.is_some()
+            && self.main_oid.as_ref().is_some_and(|oid| {
+                self.selected_oid.as_ref() == Some(oid) && Oid::from_str(oid).is_ok()
+            })
+    }
+}
+
+#[derive(Clone)]
 struct DeclaredRustRouteRecipe {
     routing: [u8; 32],
     selection: [u8; 32],
     scope: [u8; 32],
     stage: (u64, u64),
+    configuration_content: Vec<SelectedContentComparison>,
 }
 
 #[doc(hidden)]
 pub struct SelectedResolutionMountInventory<'store> {
     store_identity: usize,
     #[doc(hidden)]
-    pub conn: ReaderGuard<'store>,
+    conn: ReaderGuard<'store>,
     pub(in crate::analyzer::store) retained_macro_frontier:
         RefCell<Option<Box<super::resolution_operation::RetainedMacroFrontier>>>,
     pub(in crate::analyzer::store) macro_reader_checkin: Cell<MacroReaderCheckin>,
@@ -1553,8 +1586,13 @@ pub struct SelectedResolutionMountInventory<'store> {
     stage_request_identity: u64,
     /// Valid only while the same derivation-read transaction remains bound.
     derivation_binding: RefCell<Option<super::reader_binding::ReaderBinding>>,
+    /// The opening request's cancellation. Reader binding revalidates the
+    /// selection after unrelated Main commits, and that reread must stop
+    /// when the request does.
+    cancellation: CancellationToken,
     /// Construction proof is request-local and never participates in retained entry identity.
-    declared_rust_route_recipe: Cell<Option<DeclaredRustRouteRecipe>>,
+    declared_rust_route_recipe: RefCell<Option<DeclaredRustRouteRecipe>>,
+    project_overlay_oids: RefCell<Vec<(String, Option<String>)>>,
     context_token_counter: Cell<u32>,
     stage_content_epoch: Cell<u64>,
     /// Version of arbitrary owned TEMP row writes. Staged read memos must
@@ -1653,15 +1691,6 @@ pub struct SelectedResolutionMountInventory<'store> {
     generic_formals_schema_ready: Cell<bool>,
     generic_formal_defaults_schema_ready: Cell<bool>,
     reverse_candidate_keys_schema_ready: Cell<bool>,
-    /// The snapshots whose revision rows this selection staged on the
-    /// in-memory fallback's writer connection; `None` for a pooled reader.
-    /// See [`Self::lend_writer`].
-    writer_installed_snapshots: Option<WorkspaceSnapshots>,
-    /// Set when another store user made a change other than an ordinary
-    /// selection read while this inventory had lent its writer connection.
-    /// The temp selection is then not known to be this one, so the operation
-    /// is stale and its selection is not retained.
-    lent_writer_changed: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1917,7 +1946,7 @@ impl RetainedResolutionSelection {
         {
             return Ok(false);
         }
-        let mut tables = conn.prepare("SELECT name FROM temp.sqlite_schema WHERE type='table' AND (name LIKE 'selected_resolution_stage_%' OR name LIKE 'selected_resolution_admission%' OR name IN ('selected_resolution_contexts', 'selected_resolution_context_paths') OR name LIKE 'retained_macro_%')")?;
+        let mut tables = conn.prepare("SELECT name FROM temp.sqlite_schema WHERE type='table' AND (name LIKE 'selected_resolution_stage_%' OR name LIKE 'selected_resolution_admission%' OR name IN ('selected_resolution_contexts', 'selected_resolution_context_paths'))")?;
         let names = tables
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2061,34 +2090,224 @@ impl SelectedResolutionMountInventory<'_> {
             && binding.matches_schema(self.connection(), self.conn.cache_budget)
     }
 
-    /// Called by the Rust route inventory constructor after its complete selection opens.
-    /// The selection fingerprint includes workspace, snapshots, languages and profile.
+    /// Overlay buffers need not have parsed mounts yet (configuration and new
+    /// source files). Capture every pinned OID as an input; the one comparison
+    /// inventory below applies each consumer's path classifier.
+    pub fn capture_project_overlay_oids(
+        &self,
+        project: &dyn crate::analyzer::Project,
+    ) -> Result<()> {
+        let pinned = project.capture_source_overlays().map_err(|error| {
+            StoreError::new(format!("capture overlay content identities: {error}"))
+        })?;
+        let mut inputs = Vec::new();
+        if let Some(content) = pinned.content() {
+            for (file, _) in content.entries() {
+                inputs.push((
+                    brokk_bifrost_core::path_utils::workspace_relative_slash_path(file.rel_path()),
+                    pinned
+                        .source_snapshot(file)
+                        .map(|source| source.oid().to_string()),
+                ));
+            }
+        }
+        *self.project_overlay_oids.borrow_mut() = inputs;
+        *self.derivation_binding.borrow_mut() = None;
+        *self.declared_rust_route_recipe.borrow_mut() = None;
+        Ok(())
+    }
+
+    fn configuration_content_comparisons(
+        &self,
+        recorded: &[SelectedContentComparison],
+    ) -> Result<Vec<SelectedContentComparison>> {
+        self.selected_content_comparisons(recorded, |path| {
+            super::workspace_inputs::WorkspaceConfigurationInput::is_native_input(
+                Language::Rust,
+                path,
+            )
+        })
+    }
+
+    /// Capture the exact compared source OIDs, including identical overlays.
     pub fn stamp_declared_rust_route_recipe(&self) {
-        self.declared_rust_route_recipe
-            .set(Some(DeclaredRustRouteRecipe {
-                routing: self.routing_digest(),
-                selection: self.fingerprint(),
-                scope: self.scope_identity(),
-                stage: self.staged_read_epoch(),
-            }));
+        let routing = self.routing_digest();
+        let selection = self.fingerprint();
+        let scope = self.scope_identity();
+        let stage = self.staged_read_epoch();
+        let mut slot = self.declared_rust_route_recipe.borrow_mut();
+        let recorded = slot
+            .as_ref()
+            .filter(|previous| {
+                previous.routing == routing
+                    && previous.selection == selection
+                    && previous.scope == scope
+                    && previous.stage == stage
+            })
+            .map_or(&[][..], |previous| {
+                previous.configuration_content.as_slice()
+            });
+        let Ok(configuration_content) = self.configuration_content_comparisons(recorded) else {
+            // Keep any earlier proof: replay still revalidates it and fails closed.
+            return;
+        };
+        if configuration_content
+            .iter()
+            .all(SelectedContentComparison::unchanged)
+        {
+            *slot = Some(DeclaredRustRouteRecipe {
+                routing,
+                selection,
+                scope,
+                stage,
+                configuration_content,
+            });
+        }
+    }
+
+    /// Compare selected source content with Main, independent of producer kind.
+    /// Capsule admission OIDs describe generated content; their host mount is
+    /// the source whose identity matters here. Unknown hosts fail closed.
+    pub fn selected_content_comparisons(
+        &self,
+        recorded: &[SelectedContentComparison],
+        relevant: impl Fn(&std::path::Path) -> bool,
+    ) -> Result<Vec<SelectedContentComparison>> {
+        // A replay-admission identity probe. The Main receipt records the
+        // underlying facts; these OIDs only decide whether it may be replayed.
+        let _classifier = brokk_bifrost_core::attribution::classifier_statements();
+        let mut sql = String::from(
+            "WITH inputs(path,selected_oid,removed) AS (
+             SELECT masks.persisted_relative_path, content.blob_oid, masks.intent='removal'
+             FROM temp.selected_resolution_overlay_masks masks
+             LEFT JOIN temp.selected_resolution_content_mounts content
+               ON content.storage_language=masks.storage_language AND content.persisted_relative_path=masks.persisted_relative_path
+             WHERE masks.storage_language='rust'
+             UNION SELECT persisted_relative_path,blob_oid,0 FROM temp.selected_resolution_content_mounts WHERE storage_language='rust'"
+        );
+        let has_stage: bool = self.connection().query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_temp_schema WHERE name='selected_resolution_stage_producers' AND type='table')", [], |row| row.get(0))?;
+        if has_stage {
+            sql.push_str(" UNION SELECT mounts.persisted_relative_path,mounts.blob_oid,0 FROM temp.selected_resolution_stage_producers producers LEFT JOIN temp.selected_resolution_mounts mounts ON mounts.mount_ordinal=producers.host_ordinal WHERE mounts.storage_language='rust' OR mounts.mount_ordinal IS NULL");
+        }
+        sql.push_str(
+            " UNION SELECT value->>0,value->>1,value->>2 FROM json_each(?1)
+             ) SELECT inputs.path,base.blob_oid,inputs.selected_oid,inputs.removed
+             FROM inputs
+             LEFT JOIN temp.selected_workspace_revisions selected ON selected.lang='rust'
+             LEFT JOIN main.workspace_file_versions base
+               ON base.workspace_id=selected.workspace_id AND base.lang=selected.lang
+              AND base.generation=selected.generation AND base.rel_path=inputs.path
+              AND (base.input_kind='source' OR base.file_present=1)
+              AND base.valid_from<=selected.revision
+              AND (base.valid_until IS NULL OR selected.revision<base.valid_until)
+             ORDER BY inputs.path,base.blob_oid,inputs.selected_oid,inputs.removed",
+        );
+        let overlays = self.project_overlay_oids.borrow();
+        let mut inputs = overlays
+            .iter()
+            .map(|(path, oid)| (Some(path.as_str()), oid.as_deref(), false))
+            .collect::<Vec<_>>();
+        // Validate the union, even when a producer header disappears without a
+        // content-epoch change. Recorded OIDs are compared with Main again;
+        // an unknown or previously invalid OID never acquires authority here.
+        inputs.extend(recorded.iter().map(|input| {
+            (
+                input.path.as_deref(),
+                if input.unchanged() {
+                    input.selected_oid.as_deref()
+                } else {
+                    None
+                },
+                input.removed,
+            )
+        }));
+        let parameters = serde_json::to_string(&inputs).expect("overlay OID parameters serialize");
+        let mut statement = self.connection().prepare_cached(&sql)?;
+        let rows = statement.query_map([parameters], |row| {
+            Ok(SelectedContentComparison {
+                path: row.get(0)?,
+                main_oid: row.get(1)?,
+                selected_oid: row.get(2)?,
+                removed: row.get(3)?,
+            })
+        })?;
+        let mut comparisons = Vec::new();
+        for row in rows {
+            let row = row?;
+            if row
+                .path
+                .as_ref()
+                .is_none_or(|path| relevant(std::path::Path::new(path)))
+            {
+                comparisons.push(row);
+            }
+        }
+        Ok(comparisons)
+    }
+
+    /// Re-evaluated on capture and replay; classification belongs to Rust.
+    pub fn proves_configuration_only_selection(&self) -> Result<bool> {
+        if super::store_language_support(Language::Rust).is_none() {
+            return Ok(false);
+        }
+        Ok(self
+            .configuration_content_comparisons(&[])?
+            .iter()
+            .all(SelectedContentComparison::unchanged))
+    }
+
+    pub fn proves_configuration_route_recipe(
+        &self,
+        binding: &super::reader_binding::ReaderBinding,
+    ) -> bool {
+        let mut slot = self.declared_rust_route_recipe.borrow_mut();
+        let Some(recipe) = slot.as_mut() else {
+            return false;
+        };
+        if !binding.matches_configuration_route_recipe(
+            recipe.routing,
+            recipe.selection,
+            recipe.scope,
+            recipe.stage,
+        ) || self.routing_digest() != recipe.routing
+            || self.fingerprint() != recipe.selection
+            || self.scope_identity() != recipe.scope
+            || self.staged_read_epoch() != recipe.stage
+            || !self.derivation_read_still_bound(binding)
+        {
+            return false;
+        }
+        let Ok(current) = self.configuration_content_comparisons(&recipe.configuration_content)
+        else {
+            return false;
+        };
+        if !current.iter().all(SelectedContentComparison::unchanged) {
+            return false;
+        }
+        recipe.configuration_content = current;
+        true
     }
 
     pub fn proves_declared_rust_route_recipe(
         &self,
         binding: &super::reader_binding::ReaderBinding,
     ) -> bool {
-        self.declared_rust_route_recipe.get().is_some_and(|recipe| {
-            binding.matches_declared_route_recipe(
-                recipe.routing,
-                recipe.selection,
-                recipe.scope,
-                recipe.stage,
-            ) && self.routing_digest() == recipe.routing
-                && self.fingerprint() == recipe.selection
-                && self.scope_identity() == recipe.scope
-                && self.staged_read_epoch() == recipe.stage
-                && self.derivation_read_still_bound(binding)
-        })
+        self.declared_rust_route_recipe
+            .borrow()
+            .as_ref()
+            .is_some_and(|recipe| {
+                binding.matches_declared_route_recipe(
+                    recipe.routing,
+                    recipe.selection,
+                    recipe.scope,
+                    recipe.stage,
+                ) && self.routing_digest() == recipe.routing
+                    && self.fingerprint() == recipe.selection
+                    && self.scope_identity() == recipe.scope
+                    && self.staged_read_epoch() == recipe.stage
+                    && self.derivation_read_still_bound(binding)
+            })
     }
 
     /// Reuse setup only within one continuously live derivation-read lease.
@@ -2363,7 +2582,7 @@ impl SelectedResolutionMountInventory<'_> {
     /// say *which* scope answered it -- the seed-key profile is the only one --
     /// cannot ask that table without issuing SQL of its own, so the two writers
     /// keep the answer here instead.
-    pub(crate) fn scope_identity(&self) -> [u8; 32] {
+    pub fn scope_identity(&self) -> [u8; 32] {
         self.scope_identity.get()
     }
 
@@ -2570,7 +2789,7 @@ impl SelectedResolutionMountInventory<'_> {
         self.stage_content_epoch.get()
     }
 
-    pub(super) fn staged_read_epoch(&self) -> (u64, u64) {
+    pub fn staged_read_epoch(&self) -> (u64, u64) {
         (
             self.stage_content_epoch.get(),
             self.stage_direct_write_epoch.get(),
@@ -2739,6 +2958,32 @@ impl SelectedResolutionMountInventory<'_> {
     }
 
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn pooled_reader_serial_for_test(&self) -> Option<u64> {
+        self.conn.pooled_reader_serial_for_test()
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn idle_reader_serials_for_test(&self) -> Vec<u64> {
+        self.conn.idle_reader_serials_for_test()
+    }
+
+    pub(crate) fn selected_read_epoch(&self) -> (u64, u64, [u8; 32], (u64, u64)) {
+        (
+            self.binding_transaction_epoch.get(),
+            self.read_snapshot_epoch.get(),
+            self.scope_identity(),
+            self.staged_read_epoch(),
+        )
+    }
+
+    pub(crate) fn selected_read_cancellation(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+
+    pub(crate) fn selected_read_request_identity(&self) -> u64 {
+        self.stage_request_identity
+    }
+
     pub fn store_identity(&self) -> usize {
         self.store_identity
     }
@@ -3086,98 +3331,6 @@ impl SelectedResolutionMountInventory<'_> {
         Ok(())
     }
 
-    /// Let code outside this operation use the store until
-    /// [`Self::reclaim_writer`]. A pooled reader is the operation's own
-    /// connection and is not lent.
-    ///
-    /// The in-memory fallback reads through the one writer connection, so an
-    /// operation that held it while a caller read the store would wait for
-    /// itself (#6018). The temp selection stays on the connection, and an
-    /// ordinary read of this selection's snapshots finds its revision rows
-    /// already installed. A read of other snapshots replaces them until
-    /// [`Self::reclaim_writer`] restores them.
-    pub(crate) fn lend_writer(&mut self) -> Result<()> {
-        if !self.conn.excludes_store_access() {
-            return Ok(());
-        }
-        assert!(
-            !self.stage_read.get(),
-            "a crate stage does not lend its reader"
-        );
-        assert_no_statement_in_progress(self.connection());
-        let installed = lent_writer_installed_snapshots(
-            self.lent_writer_changed,
-            &self.writer_installed_snapshots,
-        );
-        self.advance_read_snapshot_epoch();
-        self.conn.lend_writer(installed)
-    }
-
-    /// Take back a connection lent by [`Self::lend_writer`] before this
-    /// operation answers, waiting for it while observing `cancellation`.
-    /// `Current` also covers a reader that was not lent.
-    ///
-    /// The selection keeps its authority while every other user of the
-    /// connection only applied ordinary workspace selections: their writes
-    /// replace only its revision rows, which it restores. After any other
-    /// write its temp rows may belong to another operation: the operation is
-    /// stale and stays stale, and its connection stays lent so the caller can
-    /// still read the store.
-    pub(crate) fn reclaim_writer(
-        &mut self,
-        cancellation: &CancellationToken,
-    ) -> Result<SelectedResolutionRevalidationOutcome> {
-        if !self.conn.is_lent_writer() {
-            return Ok(SelectedResolutionRevalidationOutcome::Current);
-        }
-        if !self.lent_writer_changed {
-            match self.take_back_writer(Some(cancellation))? {
-                super::WriterReclaim::Unchanged | super::WriterReclaim::Restored { .. } => {
-                    return Ok(SelectedResolutionRevalidationOutcome::Current);
-                }
-                super::WriterReclaim::Cancelled => {
-                    return Ok(SelectedResolutionRevalidationOutcome::Cancelled);
-                }
-                super::WriterReclaim::Changed => self.lend_writer()?,
-            }
-        }
-        Ok(SelectedResolutionRevalidationOutcome::Stale(
-            SelectedResolutionStale::LentWriterChanged,
-        ))
-    }
-
-    /// Take back a lent connection for this operation's own cleanup and
-    /// final authority check, which need it whatever the request's
-    /// cancellation says.
-    pub(crate) fn end_writer_loan(&mut self) -> Result<()> {
-        if self.conn.is_lent_writer() {
-            self.take_back_writer(None)?;
-        }
-        Ok(())
-    }
-
-    fn take_back_writer(
-        &mut self,
-        cancellation: Option<&CancellationToken>,
-    ) -> Result<super::WriterReclaim> {
-        let installed = lent_writer_installed_snapshots(
-            self.lent_writer_changed,
-            &self.writer_installed_snapshots,
-        );
-        self.advance_read_snapshot_epoch();
-        let reclaim = self.conn.reclaim_writer(cancellation, installed)?;
-        match reclaim {
-            // The restored connection holds exactly what this selection
-            // staged, so the retained stamp still describes it.
-            super::WriterReclaim::Restored { changes } => {
-                self.account_committed_request_changes(changes);
-            }
-            super::WriterReclaim::Changed => self.lent_writer_changed = true,
-            super::WriterReclaim::Unchanged | super::WriterReclaim::Cancelled => {}
-        }
-        Ok(reclaim)
-    }
-
     #[doc(hidden)]
     pub fn resume_stage_read(&self) -> Result<()> {
         if self.stage_read.get() {
@@ -3331,7 +3484,6 @@ impl SelectedResolutionMountInventory<'_> {
         if !self.stage_read.get()
             || self.connection().is_autocommit()
             || !self.connection().is_readonly(rusqlite::MAIN_DB)?
-            || self.lent_writer_changed
         {
             return Ok(ReaderBinding::unestablished());
         }
@@ -3347,6 +3499,29 @@ impl SelectedResolutionMountInventory<'_> {
         if stamp != self.retained().stamp {
             self.advance_read_snapshot_epoch();
         }
+        // A capsule can commit after acquisition and before BEGIN DEFERRED
+        // establishes this snapshot. Main drift alone does not invalidate the
+        // selected mounts. Reuse the exact finish revalidation in this pinned
+        // snapshot, while keeping independent TEMP/rollback witnesses strict.
+        let baseline = self.retained().stamp;
+        let current = if stamp == baseline {
+            true
+        } else if !stamp.rolled_back
+            && stamp.temp_schema_version == baseline.temp_schema_version
+            && stamp.unowned_changes == baseline.unowned_changes
+        {
+            match self.revalidate(&self.cancellation)? {
+                SelectedResolutionRevalidationOutcome::Current => true,
+                SelectedResolutionRevalidationOutcome::Stale(_) => false,
+                SelectedResolutionRevalidationOutcome::Cancelled => {
+                    return Err(StoreError::cancelled(
+                        "reader binding revalidation was cancelled",
+                    ));
+                }
+            }
+        } else {
+            false
+        };
         let has_overlay_inputs: bool =
             self.connection()
                 .query_row(OVERLAY_INPUTS_PRESENT_SQL, [], |row| row.get(0))?;
@@ -3361,10 +3536,12 @@ impl SelectedResolutionMountInventory<'_> {
             self.connection().total_changes(),
             self.scope_identity(),
             self.staged_read_epoch(),
-            stamp == self.retained().stamp,
+            current,
             !has_overlay_inputs
+                && self.project_overlay_oids.borrow().is_empty()
                 && self.stage_has_no_content()
                 && self.scope_identity() == scope_identity_of(&[]),
+            self.proves_configuration_only_selection()?,
         ))
     }
 
@@ -3385,11 +3562,6 @@ impl SelectedResolutionMountInventory<'_> {
             return Ok(SelectedResolutionRevalidationOutcome::Cancelled);
         }
         self.retention_authorized.set(false);
-        if self.lent_writer_changed {
-            return Ok(SelectedResolutionRevalidationOutcome::Stale(
-                SelectedResolutionStale::LentWriterChanged,
-            ));
-        }
         // Finish is an external freshness boundary, not an interior memo hit.
         self.clear_operation_change_stamp();
         let current = self.retained().current_stamp(self.connection())?;
@@ -3472,10 +3644,6 @@ impl Drop for SelectedResolutionMountInventory<'_> {
             self.raise_macro_reader_checkin(MacroReaderCheckin::Close);
         }
         let macro_frontier = self.retained_macro_frontier.get_mut().take();
-        if let Err(error) = self.end_writer_loan() {
-            eprintln!("failed to check the lent selected resolution writer: {error}");
-            self.lent_writer_changed = true;
-        }
         if self.stage_request_used.get()
             && let Err(error) = self.with_owned_temp_write(|connection| {
                 connection.execute_batch(super::resolution_stage::CLEAR_REQUEST_SQL)?;
@@ -3495,36 +3663,28 @@ impl Drop for SelectedResolutionMountInventory<'_> {
         } else {
             retained.current_stamp(&self.conn)
         };
+        // Portable fronts belong to the physical reader's region, independently
+        // of its current selection. Full keys prevent reuse by another authority.
+        if let Some(frontier) = macro_frontier {
+            self.conn.put_macro_frontier(frontier);
+        }
         match current {
             Ok(current)
                 if current == retained.stamp
-                    && !self.lent_writer_changed
                     && self.macro_reader_checkin.get() != MacroReaderCheckin::Clear =>
             {
-                if let Some(frontier) = macro_frontier {
-                    self.conn.put_macro_frontier(frontier);
-                }
                 self.conn.put_retained_resolution_selection(retained);
             }
             Ok(_) | Err(_) => {
-                if macro_frontier.is_some() {
-                    // The attached cache belongs to this selection. Closing its
-                    // reader is safer than returning an orphaned snapshot.
-                    self.conn.discard_before_checkin();
-                } else {
-                    super::selected_summary_write(
-                        super::SelectedSummaryWriteTarget::OnCheckin(&mut self.conn),
-                        super::SelectedSummaryWrite::ClearSelection,
-                        Some(&self.selected_rows_generation),
-                        self.operation_change_stamp.is_some(),
-                    )
-                    .expect("scheduling selected cleanup cannot fail");
-                    // A reader this selection would have closed for an unusable
-                    // macro frontier is pooled only after its baseline check. An
-                    // ordinary stale selection clears as it always has.
-                    if self.macro_reader_checkin.get() == MacroReaderCheckin::Clear {
-                        self.conn.verify_selection_clear_on_checkin(retained);
-                    }
+                super::selected_summary_write(
+                    super::SelectedSummaryWriteTarget::OnCheckin(&mut self.conn),
+                    super::SelectedSummaryWrite::ClearSelection,
+                    Some(&self.selected_rows_generation),
+                    self.operation_change_stamp.is_some(),
+                )
+                .expect("scheduling selected cleanup cannot fail");
+                if self.macro_reader_checkin.get() == MacroReaderCheckin::Clear {
+                    self.conn.verify_selection_clear_on_checkin(retained);
                 }
             }
         }
@@ -3534,19 +3694,6 @@ impl Drop for SelectedResolutionMountInventory<'_> {
             self.conn.discard_before_checkin();
         }
     }
-}
-
-/// The snapshots a lent writer connection's revision rows are to hold, or
-/// `None` once the lending selection's authority over them is gone.
-fn lent_writer_installed_snapshots(
-    changed: bool,
-    installed: &Option<WorkspaceSnapshots>,
-) -> Option<&WorkspaceSnapshots> {
-    (!changed).then(|| {
-        installed
-            .as_ref()
-            .expect("a writer-backed selection records its installed snapshots")
-    })
 }
 
 /// A write to this reader's temp tables.
@@ -3977,7 +4124,9 @@ impl AnalyzerStore {
                             stage_request_used: Cell::new(false),
                             stage_request_identity: next_stage_request_identity(),
                             derivation_binding: RefCell::new(None),
-                            declared_rust_route_recipe: Cell::new(None),
+                            cancellation: cancellation.clone(),
+                            declared_rust_route_recipe: RefCell::new(None),
+                            project_overlay_oids: RefCell::new(Vec::new()),
                             context_token_counter: Cell::new(0),
                             stage_content_epoch: Cell::new(0),
                             stage_direct_write_epoch: Cell::new(0),
@@ -4008,10 +4157,6 @@ impl AnalyzerStore {
                             generic_formals_schema_ready: Cell::new(false),
                             generic_formal_defaults_schema_ready: Cell::new(false),
                             reverse_candidate_keys_schema_ready: Cell::new(false),
-                            writer_installed_snapshots: conn
-                                .excludes_store_access()
-                                .then(|| selected_snapshots.clone()),
-                            lent_writer_changed: false,
                             shared_names: super::resolution::SharedNameTable::new(
                                 self.resolution_shared_name_cache().clone(),
                             ),
@@ -4047,11 +4192,10 @@ impl AnalyzerStore {
             schedule_preoperation_selection_cleanup(&mut conn);
             return Err(error);
         }
-        // A publication that commits to the main store while this selection
-        // stages leaves the staged inventory stale. That is a race with a
-        // concurrent writer, not a property of the request, so stage again
-        // against a fresh start stamp a bounded number of times; publication
-        // that keeps moving still reports stale (#3823).
+        // Main's change stamp is only a cheap drift probe. Lazy macro capsule
+        // publication also advances it without changing selected mounts. On
+        // drift, compare the exact selected inventory in one read transaction;
+        // only a changed selection needs another staging attempt (#12171).
         let mut remaining_attempts = SELECTED_INVENTORY_ACQUISITION_ATTEMPTS;
         let (staged, verified_stamp) = loop {
             remaining_attempts -= 1;
@@ -4079,7 +4223,12 @@ impl AnalyzerStore {
                 }
                 let staged = read_selected_inventory(&tx, cancellation)?;
                 if let StagedSelection::Ready(ready) = &staged
-                    && !persist_selected_inventory(&tx, ready, cancellation)?
+                    && !persist_selected_inventory(
+                        &tx,
+                        ready,
+                        cancellation,
+                        self.retention_budget(),
+                    )?
                 {
                     tx.rollback()?;
                     return Ok(StagedSelection::Cancelled);
@@ -4110,6 +4259,12 @@ impl AnalyzerStore {
                 conn.is_autocommit(),
                 "selected mount inventory must not pin a main-database read transaction"
             );
+            #[cfg(test)]
+            AFTER_INVENTORY_STAGING.with(|hook| {
+                if let Some(hook) = hook.borrow_mut().as_mut() {
+                    hook();
+                }
+            });
             let owned_change_baseline = conn.total_changes();
             let stamp = match read_change_stamp(&conn, owned_change_baseline, 0) {
                 Ok(stamp) => stamp,
@@ -4122,6 +4277,38 @@ impl AnalyzerStore {
                 && stamp.main_schema_version == selection_start_stamp.main_schema_version
             {
                 break (staged, Some((stamp, owned_change_baseline)));
+            }
+            let expected_fingerprint = match &staged {
+                StagedSelection::Ready(ready) => ready.fingerprint,
+                _ => unreachable!("only a ready selection reaches freshness verification"),
+            };
+            let verified = with_resolution_progress_handler(&mut conn, cancellation, |conn| {
+                let tx = conn.transaction()?;
+                let current = read_selected_inventory(&tx, cancellation)?;
+                // This stamp belongs to the same Main snapshot as the exact
+                // inventory comparison. A later commit remains visible to
+                // ordinary reader binding and finish revalidation.
+                let stamp = read_change_stamp(&tx, owned_change_baseline, 0)?;
+                tx.commit()?;
+                Ok((current, stamp))
+            });
+            let (current, stamp) = match verified {
+                Err(error) if error.is_sqlite_interrupted() && cancellation.is_cancelled() => {
+                    schedule_preoperation_selection_cleanup(&mut conn);
+                    return Ok(SelectedResolutionMountInventoryOutcome::Cancelled);
+                }
+                Err(error) => {
+                    schedule_preoperation_selection_cleanup(&mut conn);
+                    return Err(error);
+                }
+                Ok(verified) => verified,
+            };
+            match current {
+                StagedSelection::Ready(current) if current.fingerprint == expected_fingerprint => {
+                    break (staged, Some((stamp, owned_change_baseline)));
+                }
+                StagedSelection::Ready(_) => {}
+                other => break (other, None),
             }
             if remaining_attempts == 0 {
                 schedule_preoperation_selection_cleanup(&mut conn);
@@ -4171,7 +4358,9 @@ impl AnalyzerStore {
                         stage_request_used: Cell::new(false),
                         stage_request_identity: next_stage_request_identity(),
                         derivation_binding: RefCell::new(None),
-                        declared_rust_route_recipe: Cell::new(None),
+                        cancellation: cancellation.clone(),
+                        declared_rust_route_recipe: RefCell::new(None),
+                        project_overlay_oids: RefCell::new(Vec::new()),
                         context_token_counter: Cell::new(0),
                         stage_content_epoch: Cell::new(0),
                         stage_direct_write_epoch: Cell::new(0),
@@ -4202,10 +4391,6 @@ impl AnalyzerStore {
                         generic_formals_schema_ready: Cell::new(false),
                         generic_formal_defaults_schema_ready: Cell::new(false),
                         reverse_candidate_keys_schema_ready: Cell::new(false),
-                        writer_installed_snapshots: conn
-                            .excludes_store_access()
-                            .then(|| selected_snapshots.clone()),
-                        lent_writer_changed: false,
                         shared_names: super::resolution::SharedNameTable::new(
                             self.resolution_shared_name_cache().clone(),
                         ),
@@ -4231,9 +4416,14 @@ impl AnalyzerStore {
     }
 }
 
-/// How many times selection staging may restart after a concurrent main-store
-/// commit before the request reports `MountInventoryChanged`.
+/// How many times selection staging may restart after the exact selected
+/// inventory changes before the request reports `MountInventoryChanged`.
 const SELECTED_INVENTORY_ACQUISITION_ATTEMPTS: usize = 3;
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_INVENTORY_STAGING: RefCell<Option<Box<dyn FnMut()>>> = RefCell::new(None);
+}
 
 type ValidatedSelectionInput = RetainedResolutionSelectionKey;
 
@@ -5134,6 +5324,7 @@ pub fn persist_selected_inventory(
     tx: &Transaction<'_>,
     staged: &StagedReadySelection,
     cancellation: &CancellationToken,
+    budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
 ) -> Result<bool> {
     debug_assert_eq!(
         tx.query_row(
@@ -5259,7 +5450,7 @@ pub fn persist_selected_inventory(
         .languages
         .iter()
         .any(|language| language.storage_language == "csharp")
-        && !super::csharp_compilation::extent::stage(tx, cancellation)?
+        && !super::csharp_compilation::extent::stage(tx, cancellation, budget)?
     {
         return Ok(false);
     }
@@ -6115,21 +6306,15 @@ pub mod tests {
     }
 
     #[test]
-    fn rust_point_gap_details_never_reuses_writer_backed_ephemeral_reader() {
-        use super::super::resolution_operation::selected_sql_trace::{
-            begin_production_selected_sql_trace_on_connection,
-            finish_production_selected_sql_trace_on_connection,
-        };
-        let (store, workspace, snapshots) = qualifier_completion_gap_fixture_in(
-            AnalyzerStore::open_in_memory_single_connection().unwrap(),
-        );
+    #[hardwon("#12171: macro capsule commits between acquisition and binding refused Main routes")]
+    fn reader_binding_revalidates_unrelated_main_publications() {
+        let (store, workspace, snapshots) = qualifier_completion_gap_fixture();
         let cancellation = CancellationToken::new();
-        let languages = [SelectedResolutionLanguage::new("go", Language::Go)];
-        let SelectedResolutionMountInventoryOutcome::Ready(mut selection) = store
+        let SelectedResolutionMountInventoryOutcome::Ready(selection) = store
             .open_selected_resolution_mount_inventory(
                 &workspace,
                 &snapshots,
-                &languages,
+                &[SelectedResolutionLanguage::new("go", Language::Go)],
                 &[],
                 &cancellation,
             )
@@ -6137,39 +6322,19 @@ pub mod tests {
         else {
             panic!("fixture must open a selected inventory");
         };
-        assert!(
-            !selection
-                .connection()
-                .is_readonly(rusqlite::MAIN_DB)
-                .unwrap()
-        );
-        selection
-            .connection()
-            .execute_batch("CREATE TABLE main.gap_memo_ephemeral_probe(value INTEGER)")
-            .unwrap();
-        selection.begin_operation_reads();
+        // The commit lands after the inventory was certified and before its
+        // derivation lease establishes a Main snapshot.
+        store.advance_data_version_for_test();
         selection.begin_stage_read().unwrap();
-        begin_production_selected_sql_trace_on_connection(selection.connection());
-        selection
-            .rust_point_gap_details("file.rs", &cancellation)
-            .unwrap();
+        assert!(selection.reader_binding().unwrap().proves_main_selection());
         selection.end_stage_read().unwrap();
-        selection
-            .connection()
-            .execute("INSERT INTO main.gap_memo_ephemeral_probe VALUES(1)", [])
+
+        // Exact revalidation must still reject a real authority change.
+        store
+            .ensure_language_epoch_value("go", "12171-next-generation")
             .unwrap();
         selection.begin_stage_read().unwrap();
-        selection
-            .rust_point_gap_details("file.rs", &cancellation)
-            .unwrap();
-        let cost = finish_production_selected_sql_trace_on_connection(selection.connection());
-        assert_eq!(
-            cost.statements
-                .iter()
-                .filter(|sql| sql.contains("WITH RECURSIVE graph(workspace_id, generation"))
-                .count(),
-            2
-        );
+        assert!(!selection.reader_binding().unwrap().proves_main_selection());
         selection.end_stage_read().unwrap();
     }
 
@@ -6605,29 +6770,46 @@ pub mod tests {
     }
 
     #[test]
-    fn reader_binding_refuses_writer_backed_reader() {
-        use brokk_bifrost_semantic::analyzer::semantic::derivation::DerivationRevision;
-
-        let (store, workspace, snapshots) = qualifier_completion_gap_fixture_in(
-            AnalyzerStore::open_in_memory_single_connection().unwrap(),
-        );
+    #[hardwon("#12171: concurrent macro capsule commits exhausted mount acquisition retries")]
+    fn inventory_acquisition_ignores_unrelated_main_publications() {
+        let (store, workspace, snapshots) = qualifier_completion_gap_fixture();
+        let store = Arc::new(store);
+        let calls = std::rc::Rc::new(Cell::new(0));
+        let hook_store = Arc::clone(&store);
+        let hook_calls = std::rc::Rc::clone(&calls);
+        struct ResetHook;
+        impl Drop for ResetHook {
+            fn drop(&mut self) {
+                AFTER_INVENTORY_STAGING.with(|hook| *hook.borrow_mut() = None);
+            }
+        }
+        let _reset = ResetHook;
+        AFTER_INVENTORY_STAGING.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                hook_calls.set(hook_calls.get() + 1);
+                // A separate writer commits on every attempt, just as lazy
+                // capsule publication does, without changing selected mounts.
+                hook_store.advance_data_version_for_test();
+            }));
+        });
         let cancellation = CancellationToken::new();
-        let languages = [SelectedResolutionLanguage::new("go", Language::Go)];
-        let SelectedResolutionMountInventoryOutcome::Ready(selection) = store
+        let outcome = store
             .open_selected_resolution_mount_inventory(
                 &workspace,
                 &snapshots,
-                &languages,
+                &[SelectedResolutionLanguage::new("go", Language::Go)],
                 &[],
                 &cancellation,
             )
-            .unwrap()
-        else {
-            panic!("fixture must have a selected inventory")
+            .unwrap();
+        let SelectedResolutionMountInventoryOutcome::Ready(selection) = outcome else {
+            panic!("unrelated Main commits must not make selected mounts stale");
         };
-        selection.begin_stage_read().unwrap();
-        assert!(!selection.reader_binding().unwrap().is_established());
-        selection.end_stage_read().unwrap();
+        assert_eq!(calls.get(), 1);
+        assert!(matches!(
+            selection.revalidate(&cancellation).unwrap(),
+            SelectedResolutionRevalidationOutcome::Current
+        ));
     }
 
     #[test]
@@ -6750,139 +6932,42 @@ pub mod tests {
         );
     }
 
-    #[cfg(test)]
-    #[test]
-    fn scoped_query_plans_restore_writer_fallback_after_success_and_error() {
-        use rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_QPSG;
-
-        let store = AnalyzerStore::open_in_memory_single_connection().unwrap();
-        for previous in [false, true] {
-            store
-                .active_read_conn()
-                .unwrap()
-                .set_db_config(SQLITE_DBCONFIG_ENABLE_QPSG, previous)
-                .unwrap();
-            {
-                let mut conn = store.active_read_conn().unwrap();
-                conn.stabilize_query_plans().unwrap();
-                assert!(conn.db_config(SQLITE_DBCONFIG_ENABLE_QPSG).unwrap());
-            }
-            assert_eq!(
-                store
-                    .active_read_conn()
-                    .unwrap()
-                    .db_config(SQLITE_DBCONFIG_ENABLE_QPSG)
-                    .unwrap(),
-                previous
-            );
-            let failure = (|| -> Result<()> {
-                let mut conn = store.active_read_conn()?;
-                conn.stabilize_query_plans()?;
-                conn.execute_batch("SELECT * FROM absent_planner_lifecycle_table")?;
-                Ok(())
-            })();
-            assert!(failure.is_err(), "the SQL error must propagate");
-            assert_eq!(
-                store
-                    .active_read_conn()
-                    .unwrap()
-                    .db_config(SQLITE_DBCONFIG_ENABLE_QPSG)
-                    .unwrap(),
-                previous,
-                "a failed read must restore the writer's planner configuration"
-            );
-        }
-    }
-
     /// A token that cancels itself as soon as its holder starts to wait for
     /// the writer, so the wait it observes is the one being tested.
     #[cfg(test)]
-    fn cancelled_on_writer_wait() -> CancellationToken {
+    fn cancelled_on_reader_pool_wait() -> CancellationToken {
         let token = CancellationToken::new();
         let canceller = token.clone();
         token.with_phase_sink(move |phase| {
-            assert_eq!(phase, super::super::writer::WRITER_WAIT_PHASE);
+            assert_eq!(phase, super::super::READER_POOL_WAIT_PHASE);
             canceller.cancel();
         })
     }
 
     #[cfg(test)]
     #[test]
-    #[hardwon(
-        "#6018: writer-only waits for the selected writer ignored the request's cancellation"
-    )]
-    fn writer_only_waits_for_the_writer_observe_cancellation() {
-        let (store, workspace, snapshots) = qualifier_completion_gap_fixture_in(
-            AnalyzerStore::open_in_memory_single_connection().unwrap(),
-        );
+    #[hardwon("#11275: a cancelled request kept waiting for a pooled reader")]
+    fn pooled_reader_wait_observes_cancellation() {
+        // Descends from #6018's writer-only wait test; now exercises the pooled reader pool.
+        let (mut store, workspace, snapshots) =
+            qualifier_completion_gap_fixture_in(AnalyzerStore::open_ephemeral().unwrap());
+        store.active_readers.capacity = 1;
         let languages = [SelectedResolutionLanguage::new("go", Language::Go)];
-        let open = |cancellation: &CancellationToken| {
-            store
-                .open_selected_resolution_mount_inventory(
-                    &workspace,
-                    &snapshots,
-                    &languages,
-                    &[],
-                    cancellation,
-                )
-                .unwrap()
-        };
-        let SelectedResolutionMountInventoryOutcome::Ready(mut selection) =
-            open(&CancellationToken::new())
-        else {
-            panic!("published fixture must open a selected inventory");
-        };
-        selection.lend_writer().unwrap();
         std::thread::scope(|scope| {
             let (held, wait_until_held) = std::sync::mpsc::channel();
             let (release, wait_for_release) = std::sync::mpsc::channel::<()>();
-            let writer = &store.conn;
+            let store = &store;
             let holder = scope.spawn(move || {
-                let _writer = writer.lock().unwrap();
+                let readers: Vec<_> = (0..store.active_readers.capacity)
+                    .map(|_| store.active_read_conn().unwrap())
+                    .collect();
                 held.send(()).unwrap();
                 wait_for_release.recv().unwrap();
+                drop(readers);
             });
             wait_until_held.recv().unwrap();
-            // Only the wait's phase cancels these tokens, so each outcome is
-            // a wait that stopped while the other thread held the writer.
-            let opener = cancelled_on_writer_wait();
-            assert!(matches!(
-                open(&opener),
-                SelectedResolutionMountInventoryOutcome::Cancelled
-            ));
-            assert!(opener.is_cancelled() && opener.phase().is_none());
-            let operation = cancelled_on_writer_wait();
-            assert_eq!(
-                selection.reclaim_writer(&operation).unwrap(),
-                SelectedResolutionRevalidationOutcome::Cancelled
-            );
-            assert!(operation.is_cancelled() && operation.phase().is_none());
-            release.send(()).unwrap();
-            holder.join().unwrap();
-        });
-        // The other thread wrote nothing, so the lent selection is still the
-        // operation's authority.
-        let cancellation = CancellationToken::new();
-        assert_eq!(
-            selection.reclaim_writer(&cancellation).unwrap(),
-            SelectedResolutionRevalidationOutcome::Current
-        );
-        assert_eq!(
-            selection.revalidate(&cancellation).unwrap(),
-            SelectedResolutionRevalidationOutcome::Current
-        );
-    }
-
-    #[cfg(test)]
-    #[test]
-    fn lent_writer_selection_survives_ordinary_reads_but_not_another_selection() {
-        let (store, workspace, snapshots) = qualifier_completion_gap_fixture_in(
-            AnalyzerStore::open_in_memory_single_connection().unwrap(),
-        );
-        let languages = [SelectedResolutionLanguage::new("go", Language::Go)];
-        let cancellation = CancellationToken::new();
-        let open = || {
-            let SelectedResolutionMountInventoryOutcome::Ready(selection) = store
+            let cancellation = cancelled_on_reader_pool_wait();
+            let outcome = store
                 .open_selected_resolution_mount_inventory(
                     &workspace,
                     &snapshots,
@@ -6890,66 +6975,16 @@ pub mod tests {
                     &[],
                     &cancellation,
                 )
-                .unwrap()
-            else {
-                panic!("published fixture must open a selected inventory");
-            };
-            selection
-        };
-        let retained = || store.writer_resolution_selection.lock().unwrap().is_some();
-        let revisions = |selection: &SelectedResolutionMountInventory<'_>| {
-            selection
-                .connection()
-                .prepare("SELECT revision FROM temp.selected_workspace_revisions")
-                .unwrap()
-                .query_map([], |row| row.get::<_, i64>(0))
-                .unwrap()
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .unwrap()
-        };
-        let mut other = snapshots.clone();
-        other.get_mut("go").unwrap().revision += 1;
-
-        // Ordinary reads share the selection's revision rows. A read of its own
-        // snapshots leaves them as they are; a read of other snapshots replaces
-        // them, and the selection restores them when it takes the connection
-        // back.
-        let mut selection = open();
-        selection.lend_writer().unwrap();
-        drop(store.read_conn_for_workspace(&snapshots).unwrap());
-        drop(store.read_conn_for_workspace(&other).unwrap());
-        assert_eq!(
-            selection.reclaim_writer(&cancellation).unwrap(),
-            SelectedResolutionRevalidationOutcome::Current
-        );
-        assert_eq!(revisions(&selection), [1]);
-        assert_eq!(
-            selection.revalidate(&cancellation).unwrap(),
-            SelectedResolutionRevalidationOutcome::Current
-        );
-        drop(selection);
-        assert!(retained(), "a restored selection is retained");
-
-        // Another selection staged over the lent one replaces rows that
-        // ordinary reads never write. The lent operation is stale from then on,
-        // and its connection stays lent so the caller can still read.
-        let mut selection = open();
-        selection.lend_writer().unwrap();
-        drop(open());
-        assert!(retained(), "the other selection retains its own rows");
-        let stale = SelectedResolutionRevalidationOutcome::Stale(
-            SelectedResolutionStale::LentWriterChanged,
-        );
-        assert_eq!(selection.reclaim_writer(&cancellation).unwrap(), stale);
-        drop(store.read_conn_for_workspace(&other).unwrap());
-        assert_eq!(selection.reclaim_writer(&cancellation).unwrap(), stale);
-        selection.end_writer_loan().unwrap();
-        assert_eq!(selection.revalidate(&cancellation).unwrap(), stale);
-        // It clears the connection instead of returning its selection over
-        // the other one.
-        drop(selection);
-        assert!(!retained());
-        assert_eq!(revisions(&open()), [1]);
+                .unwrap();
+            // Release before asserting so a failed assertion cannot strand the holder.
+            release.send(()).unwrap();
+            holder.join().unwrap();
+            assert!(matches!(
+                outcome,
+                SelectedResolutionMountInventoryOutcome::Cancelled
+            ));
+            assert!(cancellation.is_cancelled() && cancellation.phase().is_none());
+        });
     }
 
     #[doc(hidden)]

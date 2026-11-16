@@ -438,6 +438,7 @@ fn project_type<'tree>(
         hierarchy,
         aliases: Vec::new(),
         extension_surfaces: Vec::new(),
+        rust_stability: None,
         guard: None,
         locator: locator(archive_sha256, entry_path, &namespace.join("::")),
     });
@@ -506,6 +507,7 @@ fn project_method(
         generic_arity: 0,
         parameter_types: &parameter_types,
         parameter_variadics: &[],
+        extension_receiver: None,
         return_type: signature.returns.as_ref(),
     });
     Some(MemberFact {
@@ -532,6 +534,7 @@ fn project_method(
         extension_receiver: None,
         extension_receiver_constraints: Vec::new(),
         aliases: Vec::new(),
+        rust_stability: None,
         guard: None,
         locator: locator(archive_sha256, entry_path, name),
     })
@@ -624,6 +627,7 @@ fn project_call(
                 generic_arity: 0,
                 parameter_types: &[],
                 parameter_variadics: &[],
+                extension_receiver: None,
                 return_type: signature.returns.as_ref(),
             });
             members.push(MemberFact {
@@ -650,6 +654,7 @@ fn project_call(
                 extension_receiver: None,
                 extension_receiver_constraints: Vec::new(),
                 aliases: Vec::new(),
+                rust_stability: None,
                 guard: None,
                 locator: locator(archive_sha256, entry_path, &name),
             });

@@ -1,0 +1,19 @@
+# The language-neutral semantic IR schema lever (#11570).
+#
+# Add one `<issue>-<slug>` line when a change extends or reinterprets the
+# semantic IR vocabulary. It is hashed into `SemanticIrVersion::current()`, so
+# every semantic artifact key, every public id derived from one, every stored
+# lowered-IR producer epoch, the policy lowering identity and the
+# correspondence analyzer-schema pin of every language rotate once. Git merges
+# this file with merge=union, so two branches that each add a line keep both.
+# Never edit or remove a line; compaction replaces a prefix with a checkpoint
+# line and keeps the identity. See .agents/docs/cache-identity-levers.md.
+#
+# Replaced the numbered literal `SEMANTIC_IR_SCHEMA_VERSION = 50`.
+11570-slice2a-token-files
+11360-m2-cleanup-owner-gaps
+11251-matches-intrinsic
+4318-address-of-flow
+4318-pointer-memory-load-flow
+12128-rust-async-body-execution
+9925-poem-field-binders

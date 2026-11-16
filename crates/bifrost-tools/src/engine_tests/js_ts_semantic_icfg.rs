@@ -166,6 +166,7 @@ mod js_ts_extraction_tests {
             impacts,
             kind: SemanticGapKind::Unproven,
             budget: None,
+            dispatch: Default::default(),
             discharge: SemanticGapDischarge::None,
             detail: "caller-side evaluation is incomplete".into(),
             source: call.source,

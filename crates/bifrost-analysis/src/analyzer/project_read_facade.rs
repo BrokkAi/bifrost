@@ -2,9 +2,11 @@
 use super::{Language, Project, ProjectFile, ProjectSourceSnapshot};
 use brokk_bifrost_core::analyzer::project::AsProject;
 use brokk_bifrost_core::analyzer::project::{
-    ProjectCoverage, SharedWorkspaceFileListing, WorkspaceOverlayContent,
+    ProjectCoverage, ProjectViewStamp, SharedWorkspaceFileListing, WorkspaceOverlayContent,
 };
-use brokk_bifrost_core::analyzer::project_reads::{ProjectReadSlot, ReadCapability, listing_read};
+use brokk_bifrost_core::analyzer::project_reads::{
+    ProjectReadSlot, ReadCapability, listing_read, publish_file_set,
+};
 use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -15,16 +17,75 @@ pub(super) fn with_project_read_slot(project: Arc<dyn Project>) -> Arc<dyn Proje
         project
     } else {
         Arc::new(ProjectReadFacade {
-            delegate: project,
+            delegate: ProjectDelegate::Owned(project),
             project_reads: ProjectReadSlot::default(),
+            listing: None,
         })
     }
 }
-struct ProjectReadFacade {
-    delegate: Arc<dyn Project>,
-    project_reads: ProjectReadSlot,
+
+/// A discovery view over an already captured membership-and-omissions record.
+/// File reads still delegate to the host project and share its recorder slot.
+pub(super) fn with_workspace_file_listing(
+    project: &dyn Project,
+    listing: SharedWorkspaceFileListing,
+) -> Arc<dyn Project + '_> {
+    // Share the host project's recorder slot so the dependency discovery
+    // capture attributes the listing and file reads that discovery performs.
+    let project_reads = project.project_read_slot().cloned().unwrap_or_default();
+    Arc::new(ProjectReadFacade {
+        delegate: ProjectDelegate::Borrowed(project),
+        project_reads,
+        listing: Some(Ok(listing)),
+    })
 }
-impl Project for ProjectReadFacade {
+
+/// Borrow the generation's one membership record, including an unavailable record.
+pub(super) fn for_generation(analyzer: &dyn super::IAnalyzer) -> Arc<dyn Project + '_> {
+    if let Ok(listing) = analyzer.generation_membership().listing() {
+        return with_workspace_file_listing(analyzer.project(), listing.clone());
+    }
+    Arc::new(ProjectReadFacade {
+        delegate: ProjectDelegate::Borrowed(analyzer.project()),
+        project_reads: analyzer
+            .project()
+            .project_read_slot()
+            .cloned()
+            .unwrap_or_default(),
+        listing: Some(analyzer.generation_membership().listing().cloned()),
+    })
+}
+
+enum ProjectDelegate<'a> {
+    Owned(Arc<dyn Project>),
+    Borrowed(&'a dyn Project),
+}
+impl<'a> std::ops::Deref for ProjectDelegate<'a> {
+    type Target = dyn Project + 'a;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Owned(project) => project.as_ref(),
+            Self::Borrowed(project) => *project,
+        }
+    }
+}
+
+struct ProjectReadFacade<'a> {
+    delegate: ProjectDelegate<'a>,
+    project_reads: ProjectReadSlot,
+    /// A listing the caller already owns, served instead of the delegate's.
+    listing: Option<
+        Result<
+            SharedWorkspaceFileListing,
+            super::tree_sitter_analyzer::GenerationListingUnavailable,
+        >,
+    >,
+}
+impl Project for ProjectReadFacade<'_> {
+    fn view_stamp(&self) -> Option<ProjectViewStamp> {
+        self.delegate.view_stamp()
+    }
+
     fn directory_entries(&self, parent: &Path) -> std::io::Result<BTreeSet<ProjectFile>> {
         self.delegate.directory_entries(parent)
     }
@@ -59,13 +120,24 @@ impl Project for ProjectReadFacade {
         let _project_read = self
             .project_read_slot()
             .map(|slot| slot.inventory(self.as_project()));
-        self.delegate.all_files()
+        match &self.listing {
+            Some(Ok((files, _))) => Ok((**files).clone()),
+            Some(Err(error)) => Err(io::Error::other(*error)),
+            None => self.delegate.all_files(),
+        }
     }
     fn all_files_shared(&self) -> io::Result<Arc<BTreeSet<ProjectFile>>> {
         let _project_read = self
             .project_read_slot()
             .map(|slot| slot.inventory(self.as_project()));
-        self.delegate.all_files_shared()
+        match &self.listing {
+            Some(Ok((files, _))) => {
+                publish_file_set(self, files.as_ref())?;
+                Ok(Arc::clone(files))
+            }
+            Some(Err(error)) => Err(io::Error::other(*error)),
+            None => self.delegate.all_files_shared(),
+        }
     }
     fn cached_omissions_if_available(
         &self,
@@ -74,13 +146,21 @@ impl Project for ProjectReadFacade {
         let _project_read = self
             .project_read_slot()
             .map(|slot| slot.inventory(self.as_project()));
-        self.delegate.cached_omissions_if_available()
+        match &self.listing {
+            Some(Ok((_, omissions))) => Ok(Some(Arc::clone(omissions))),
+            Some(Err(error)) => Err(io::Error::other(*error)),
+            None => self.delegate.cached_omissions_if_available(),
+        }
     }
     fn cached_listing_if_available(&self) -> io::Result<Option<SharedWorkspaceFileListing>> {
         let _project_read = self
             .project_read_slot()
             .map(|slot| slot.inventory(self.as_project()));
-        self.delegate.cached_listing_if_available()
+        match &self.listing {
+            Some(Ok(listing)) => Ok(Some(listing.clone())),
+            Some(Err(error)) => Err(io::Error::other(*error)),
+            None => self.delegate.cached_listing_if_available(),
+        }
     }
     fn cached_analyzable_files_from(
         &self,
@@ -94,14 +174,28 @@ impl Project for ProjectReadFacade {
         let _project_read = self
             .project_read_slot()
             .map(|slot| slot.inventory(self.as_project()));
-        self.delegate.all_files_with_omissions()
+        match &self.listing {
+            Some(Ok(listing)) => {
+                publish_file_set(self, listing.0.as_ref())?;
+                Ok(listing.clone())
+            }
+            Some(Err(error)) => Err(io::Error::other(*error)),
+            None => self.delegate.all_files_with_omissions(),
+        }
     }
     fn workspace_file_listing_count(&self) -> usize {
         self.delegate.workspace_file_listing_count()
     }
     fn analyzable_files(&self, language: Language) -> io::Result<BTreeSet<ProjectFile>> {
         let _read = listing_read(self);
-        self.delegate.analyzable_files(language)
+        match &self.listing {
+            Some(Ok((files, _))) => {
+                publish_file_set(self, files.as_ref())?;
+                self.delegate.analyzable_files_from(files, language)
+            }
+            Some(Err(error)) => Err(io::Error::other(*error)),
+            None => self.delegate.analyzable_files(language),
+        }
     }
     fn analyzable_files_from(
         &self,
@@ -144,7 +238,25 @@ impl Project for ProjectReadFacade {
             .map(|slot| slot.git_ignore(self.as_project(), path));
         self.delegate.is_gitignored(path)
     }
-    fn is_bifrostignored(&self, path: &Path) -> bool {
+    fn retained_ignore_observation(
+        &self,
+    ) -> brokk_bifrost_core::analyzer::project::RetainedIgnoreObservation {
+        self.delegate.retained_ignore_observation()
+    }
+    fn ignore_observation_for_files(
+        &self,
+        files: &BTreeSet<ProjectFile>,
+    ) -> Result<
+        brokk_bifrost_core::analyzer::project::IgnoreObservation,
+        brokk_bifrost_core::analyzer::project::IgnoreObservationError,
+    > {
+        self.delegate.ignore_observation_for_files(files)
+    }
+
+    fn is_bifrostignored(
+        &self,
+        path: &Path,
+    ) -> Result<bool, brokk_bifrost_core::analyzer::project::IgnoreObservationError> {
         let _project_read = self
             .project_read_slot()
             .map(|slot| slot.ignore_rules(self.as_project()));
@@ -163,6 +275,12 @@ impl Project for ProjectReadFacade {
         let answer = self.delegate.has_overlay(file);
         brokk_bifrost_core::analyzer::project_reads::publish_overlay_membership(answer);
         answer
+    }
+    fn capture_source_overlays(
+        &self,
+    ) -> io::Result<Arc<brokk_bifrost_core::analyzer::project::PinnedSourceOverlayView>> {
+        // Unobserved: the delegate's capture is the one atomic view.
+        self.delegate.capture_source_overlays()
     }
     fn analysis_generation(&self) -> u64 {
         self.delegate.analysis_generation()
@@ -184,6 +302,9 @@ impl Project for ProjectReadFacade {
 
     fn update_cached_listing_for_path(&self, path: &Path) -> bool {
         self.delegate.update_cached_listing_for_path(path)
+    }
+    fn update_cached_listing_for_removed_paths(&self, files: &[ProjectFile]) -> bool {
+        self.delegate.update_cached_listing_for_removed_paths(files)
     }
     fn read_source(&self, file: &ProjectFile) -> io::Result<String> {
         self.project_reads.source(
@@ -250,6 +371,29 @@ mod tests {
     use brokk_bifrost_core::analyzer::project::{FilesystemProject, WorkspaceFileOmissionReason};
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon("#11902: C++ discovery bypassed the generation listing")]
+    fn discovery_analyzable_files_respects_supplied_membership() {
+        use brokk_bifrost_core::analyzer::project::FileSetProject;
+        let root = tempfile::tempdir().unwrap();
+        let project: Arc<dyn Project> = Arc::new(FileSetProject::new(
+            root.path(),
+            [PathBuf::from("selected.cpp"), PathBuf::from("later.cpp")],
+        ));
+        let selected = ProjectFile::new(root.path().to_path_buf(), "selected.cpp");
+        let facade = with_workspace_file_listing(
+            project.as_ref(),
+            (
+                Arc::new(BTreeSet::from([selected.clone()])),
+                Arc::new(Vec::new()),
+            ),
+        );
+        assert_eq!(
+            facade.analyzable_files(Language::Cpp).unwrap(),
+            BTreeSet::from([selected])
+        );
+    }
+
+    #[test]
     #[brokk_bifrost_test_macros::hardwon("#9737: the read facade discarded symlink omissions")]
     fn facade_forwards_listing_omissions() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -258,10 +402,24 @@ mod tests {
         std::os::unix::fs::symlink(root.join("source.rs"), root.join("linked.rs")).unwrap();
         let inner: Arc<dyn Project> = Arc::new(FilesystemProject::new(&root).unwrap());
         let facade = ProjectReadFacade {
-            delegate: inner,
+            delegate: ProjectDelegate::Owned(inner),
             project_reads: ProjectReadSlot::default(),
+            listing: None,
         };
-        let (_, omissions) = facade.all_files_with_omissions().unwrap();
+        let listing = facade.all_files_with_omissions().unwrap();
+        let omissions = Arc::clone(&listing.1);
+        let retained = with_workspace_file_listing(&facade, listing.clone());
+        std::fs::write(root.join("later.rs"), "fn later() {}\n").unwrap();
+        let observed = retained.all_files_with_omissions().unwrap();
+        let cached = retained.cached_listing_if_available().unwrap().unwrap();
+        assert!(Arc::ptr_eq(&observed.0, &listing.0));
+        assert!(Arc::ptr_eq(&observed.1, &omissions));
+        assert!(Arc::ptr_eq(&cached.0, &listing.0));
+        assert!(Arc::ptr_eq(&cached.1, &omissions));
+        assert!(Arc::ptr_eq(
+            &retained.cached_omissions_if_available().unwrap().unwrap(),
+            &omissions,
+        ));
         assert!(omissions.iter().any(|omission| {
             omission.path == Path::new("linked.rs")
                 && omission.reason == WorkspaceFileOmissionReason::Symlink

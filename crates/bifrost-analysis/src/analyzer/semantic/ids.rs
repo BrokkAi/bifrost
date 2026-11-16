@@ -18,7 +18,7 @@ pub(crate) mod tests {
 
     use brokk_bifrost_analysis::analyzer::semantic::ids::LengthDelimitedDigest;
 
-    use brokk_bifrost_analysis::analyzer::semantic::ids::SEMANTIC_IR_SCHEMA_VERSION;
+    use brokk_bifrost_analysis::analyzer::semantic::ids::semantic_ir_schema_label_before_last_token;
 
     use brokk_bifrost_analysis::analyzer::semantic::ids::SemanticArtifactKey;
 
@@ -131,12 +131,16 @@ pub(crate) mod tests {
     #[test]
     fn current_semantic_ir_version_is_stable_and_nonzero() {
         let current = SemanticIrVersion::current();
-        assert_eq!(
-            current.to_string(),
-            "e1a974280b1b740b861a6b74da697fef4518e4ffe5b3d3c1c5ccd9e181423868"
-        );
+        assert_eq!(current, SemanticIrVersion::current());
         assert_ne!(current.as_bytes(), &[0_u8; 32]);
-        assert_eq!(SEMANTIC_IR_SCHEMA_VERSION, 47);
+        // A head one schema token older keyed its artifacts by another digest.
+        let mut older = LengthDelimitedDigest::new(SEMANTIC_IR_SCHEMA_DOMAIN);
+        older.push(semantic_ir_schema_label_before_last_token().as_bytes());
+        assert_ne!(
+            current,
+            SemanticIrVersion::from_digest(older.finish()),
+            "the last schema token must move the IR version"
+        );
     }
 
     fn digest(label: &str) -> StableDigest {

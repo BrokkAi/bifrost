@@ -1,6 +1,7 @@
 //! Rust selection rules over the shared modeled callable surface.
 
 use crate::analyzer::rust::native_points;
+use brokk_bifrost_analysis::analyzer::semantic_model::overlay::ModeledTraitOwnersMemo;
 
 use crate::analyzer::rust::rust_import_binder_visible_at_byte;
 
@@ -71,6 +72,8 @@ pub(crate) struct UfcsTrait<'tree> {
 /// Declaration identity and the implementation evidence proved at this probe.
 /// A trait declaration alone never closes its implementation set.
 pub(crate) struct SelectedMember {
+    /// Type-level dereferences proved by selection, independent of flow admission.
+    pub receiver_steps: usize,
     unadmitted_receiver_deref: bool,
     adjustments: Box<[crate::analyzer::semantic_model::ReceiverAdjustment]>,
     pub owner: String,
@@ -124,9 +127,9 @@ pub(crate) fn select<'analyzer>(
     if cancellation.is_cancelled() {
         return None;
     }
-    let overlay = analyzer.semantic_model_overlay()?;
+    let overlay = analyzer.semantic_model_overlay_read().published()?;
     let active = analyzer.active_semantic_models()?;
-    let owner = RustOverlayCrates::new(Some(&overlay)).referenceable_symbol(owner)?;
+    let owner = RustOverlayCrates::new(Some(&overlay)).referenceable_owner(owner)?;
     let rust = resolve_analyzer::<RustAnalyzer>(analyzer)?;
     let scope = AnalyzerQueryScope::new(analyzer);
     let prepared = rust.prepared_syntax(scope.token(), file)?;
@@ -138,13 +141,15 @@ pub(crate) fn select<'analyzer>(
         return None;
     }
     let tree = prepared.tree();
-    let callee = crate::analyzer::rust::external_calls::call_path_for_site(tree, site)?;
-    let terminal = callee
-        .child_by_field_name("field")
+    let function = crate::analyzer::rust::external_calls::call_path_for_site(tree, site)?;
+    let callee = brokk_bifrost_rust::structural::call_function_target(function);
+    let method = brokk_bifrost_rust::structural::rust_method_call_parts(function);
+    let terminal = method
+        .map(|(_, member)| member)
         .or_else(|| callee.child_by_field_name("name"))?;
     let member = rust_node_text(terminal, source);
     let receiver_facts = super::semantic::RustReceiverTypeFacts::from_tree(source, tree);
-    let expression = callee.child_by_field_name("value");
+    let expression = method.map(|(receiver, _)| receiver);
     let application = SemanticModelCallApplication::positional(parameter_count);
     let callable_on = |declaring: &SemanticModelSymbol| {
         overlay.callable_for_application(
@@ -158,6 +163,28 @@ pub(crate) fn select<'analyzer>(
             &application,
         )
     };
+    // Explicit UFCS names its trait; an alias own-member surface cannot
+    // replace that declaration or prevent the typed trait search below.
+    if named_trait.is_none()
+        && owner.kind == SemanticModelSymbolKind::TypeAlias
+        && super::call_conversion::modeled_primitive(&owner.qualified_name).is_none()
+        && brokk_bifrost_analysis::analyzer::semantic_model::overlay::owner_declaration(
+            &active, &owner,
+        )?
+        .alias_target
+        .is_none()
+    {
+        // The declaration owns this evidence independently of expansion.
+        // An alias target contributes nothing: this proof remains OPEN and
+        // cannot authorize an exact call or a transfer summary (#7219).
+        return callable_is_proven(&callable_on(&owner)).then(|| SelectedMember {
+            receiver_steps: 0,
+            unadmitted_receiver_deref: false,
+            adjustments: Box::new([]),
+            owner: owner.qualified_name.clone(),
+            extensibility: DispatchExtensibility::Open,
+        });
+    }
     // Scope must be known before certifying even an inherent family: a
     // by-value trait method can precede an inherent borrowed-self method.
     let mut selected_receiver_extensibility =
@@ -188,7 +215,7 @@ pub(crate) fn select<'analyzer>(
             .iter()
             .filter(|import| {
                 import.path.as_ref().is_some_and(|path| {
-                    rust_import_binder_visible_at_byte(path, terminal.start_byte())
+                    rust_import_binder_visible_at_byte(path, terminal.start_byte(), tree)
                 })
             })
             .cloned()
@@ -256,7 +283,6 @@ pub(crate) fn select<'analyzer>(
         }
         let lexical = brokk_bifrost_rust::lexical_scope::rust_lexical_scope_index_with(
             rust.inner.adapter().lexical_caches(),
-            tree.root_node(),
             source,
         );
         let visible = |candidate: &SemanticModelSymbol| {
@@ -264,7 +290,7 @@ pub(crate) fn select<'analyzer>(
                 let Some(path) = &import.path else {
                     return false;
                 };
-                if !rust_import_binder_visible_at_byte(path, terminal.start_byte()) {
+                if !rust_import_binder_visible_at_byte(path, terminal.start_byte(), tree) {
                     return false;
                 }
                 let mut segments = path.segments.clone();
@@ -272,7 +298,7 @@ pub(crate) fn select<'analyzer>(
                     segments.push(candidate.name.clone());
                 }
                 RustOverlayCrates::new(Some(&overlay))
-                    .referenceable_symbol(&segments.join("."))
+                    .referenceable_owner(&segments.join("."))
                     .is_some_and(|symbol| symbol.id == candidate.id)
             });
             if imported {
@@ -295,7 +321,7 @@ pub(crate) fn select<'analyzer>(
                             prelude_crate.name(),
                             module,
                             candidate.name
-                        ))
+                        ), brokk_bifrost_analysis::analyzer::semantic_model::overlay::RustReexportNamespace::TypeOrModule)
                     })
                     .is_some_and(|symbol| symbol.id == candidate.id);
             // Method lookup retains prelude traits even when an item or import
@@ -400,7 +426,30 @@ pub(crate) fn select<'analyzer>(
                     .and_then(|ty| applicability.receiver_type(file, source, ty))
             })
             .or_else(|| resolver.modeled_receiver_type(file, expression?))
+            .or_else(|| {
+                // Qualified inherent calls have no field receiver. Retain
+                // their explicit typed owner just as selected_receiver_type
+                // already does, including concrete unit arguments.
+                if expression.is_some() {
+                    return None;
+                }
+                applicability.receiver_type(file, source, callee.child_by_field_name("path")?)
+            })
             .unwrap_or_else(|| applicability.abstract_receiver(&owner));
+        receiver_type = super::std_types::normalized_receiver_application(analyzer, receiver_type)?;
+        // An alias's member set is empty. Probe the canonical application,
+        // retaining the shared cursor's fully bound arguments above.
+        let owner = if owner.kind == SemanticModelSymbolKind::TypeAlias
+            && super::call_conversion::modeled_primitive(&owner.qualified_name).is_none()
+        {
+            let mut nominal = &receiver_type;
+            while let TypeRef::ByRef { element, .. } = nominal {
+                nominal = element;
+            }
+            applicability.owner(nominal)?
+        } else {
+            owner
+        };
         let borrowed = expression.and_then(|mut expression| {
             while expression.kind() == "parenthesized_expression" {
                 expression = expression.named_child(0)?;
@@ -457,8 +506,15 @@ pub(crate) fn select<'analyzer>(
                     return None;
                 }
             }
-            let in_scope = overlay
-                .trait_owners_with_callable_member(member)
+            let memo = rust
+                .inner
+                .active_query_request_memo::<ModeledTraitOwnersMemo>()
+                .unwrap_or_default();
+            // Include external imported and edition-prelude traits, not just
+            // source_rivals. Declaration completeness (including the inherent
+            // E0592 exemption) never bypasses this call-site competition check.
+            let in_scope = memo
+                .owners(&overlay, analyzer, member)
                 .into_iter()
                 .filter(|candidate| {
                     visible(candidate)
@@ -485,6 +541,19 @@ pub(crate) fn select<'analyzer>(
             }
             if has_inherent && has_trait {
                 return None;
+            }
+            if has_inherent
+                && receiver.kind != SemanticModelSymbolKind::Trait
+                && (receiver_type.contains_unknown()
+                    || super::std_types::type_ref_mentions_type_parameter(&receiver_type))
+            {
+                // Canonical ownership does not prove which instantiation's
+                // inherent impl applies. Today's packs omit that structural
+                // evidence; the shared gate refuses rather than guessing.
+                if brokk_bifrost_analysis::analyzer::semantic_model::overlay::rust_inherent_member_argument_independence(&receiver, member).is_err() {
+                    super::std_types::incomplete_proof("external_receiver_type_arguments_unknown");
+                    return None;
+                }
             }
             use brokk_bifrost_analysis::analyzer::resolution::fact_resolution::call_applicability::{
                 CandidateAssessment, adapter, select_candidate_indices,
@@ -566,6 +635,7 @@ pub(crate) fn select<'analyzer>(
                         });
                         return (self_forms_known && callable_is_proven(&matched)).then(|| {
                             SelectedMember {
+                                receiver_steps,
                                 unadmitted_receiver_deref,
                                 adjustments: adjustments.clone().into_boxed_slice(),
                                 owner: trait_.qualified_name.clone(),
@@ -588,6 +658,7 @@ pub(crate) fn select<'analyzer>(
                 let extensibility =
                     selected_receiver_extensibility.unwrap_or(DispatchExtensibility::Open);
                 return callable_is_proven(&matched).then(|| SelectedMember {
+                    receiver_steps,
                     unadmitted_receiver_deref,
                     adjustments: adjustments.clone().into_boxed_slice(),
                     owner: receiver.qualified_name.clone(),
@@ -619,7 +690,7 @@ pub(crate) fn select<'analyzer>(
             .filter(|candidate| visible(&candidate.owner))
             .collect::<Vec<_>>()
     };
-    let call = callee
+    let call = function
         .parent()
         .filter(|node| node.kind() == "call_expression")?;
     let arguments = call.child_by_field_name("arguments")?;
@@ -703,6 +774,7 @@ pub(crate) fn select<'analyzer>(
             Some(_) => return None, // More than one applicable typed impl remains ambiguous.
             None => {
                 selected = Some(SelectedMember {
+                    receiver_steps,
                     unadmitted_receiver_deref,
                     adjustments: adjustments.clone().into_boxed_slice(),
                     owner: candidate.owner.qualified_name.clone(),

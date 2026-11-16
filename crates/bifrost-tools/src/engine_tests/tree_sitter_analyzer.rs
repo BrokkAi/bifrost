@@ -1165,6 +1165,15 @@ mod tests {
             self.delegate.all_files()
         }
 
+        // The delegate's listing is the whole workspace and omits nothing; the
+        // trait default would state an unknown remainder instead.
+        fn all_files_with_omissions(
+            &self,
+        ) -> std::io::Result<brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing>
+        {
+            self.all_files()
+                .map(|files| (Arc::new(files), Arc::new(Vec::new())))
+        }
         fn analyzable_files(&self, language: Language) -> std::io::Result<BTreeSet<ProjectFile>> {
             self.delegate.analyzable_files(language)
         }
@@ -1887,6 +1896,8 @@ mod tests {
             ),
             liveness: None,
             workspace_snapshot: None,
+            membership: None,
+            prepared_membership: None,
             workspace_listing_complete: true,
             revision_blobs: None,
             live_paths: Arc::new(LivePathMap::default()),
@@ -1918,6 +1929,9 @@ mod tests {
 
     #[test]
     fn reconcile_persists_fast_parse_before_blocked_slow_parse_is_released() {
+        // The process pool is one worker wide under Cargo; the slow parse parks one.
+        let _pool =
+            brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::override_parse_pool_for_test(2);
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("canonical temp dir");
         let fast = temp_file(&root, "src/Fast.java");
@@ -2176,6 +2190,9 @@ mod tests {
     /// wedging the test process.
     #[test]
     fn a_panicking_build_worker_aborts_the_whole_build_promptly() {
+        // One parked worker for the blocked language and one for the panicking one.
+        let _pool =
+            brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::override_parse_pool_for_test(2);
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("canonical temp dir");
         let panicking = temp_file(&root, "src/panics.cpp");
@@ -2728,6 +2745,8 @@ mod tests {
             ),
             liveness: None,
             workspace_snapshot: None,
+            membership: None,
+            prepared_membership: None,
             workspace_listing_complete: true,
             revision_blobs: None,
             live_paths: Arc::new(LivePathMap::default()),
@@ -2876,6 +2895,8 @@ mod tests {
             ),
             liveness: None,
             workspace_snapshot: None,
+            membership: None,
+            prepared_membership: None,
             workspace_listing_complete: true,
             revision_blobs: None,
             live_paths: Arc::new(LivePathMap::default()),
@@ -3060,8 +3081,26 @@ mod tests {
 
         assert!(outcomes[0].error.is_none());
         assert_eq!(stats.transactions, 1);
-        assert_eq!(stats.peak_batch_rows, expected_rows);
-        assert_eq!(stats.peak_batch_payload_bytes, expected_bytes);
+        // Publication also writes the blob's surface set in the same transaction
+        // and charges its exact creation cost to the batch: one set row plus one
+        // row per surface id, and the set's epoch string and two digests.
+        let (surface_rows, surface_bytes): (usize, usize) = store
+            .read_conn()
+            .unwrap()
+            .query_row(
+                "SELECT (SELECT count(*) FROM surface_sets) + (SELECT count(*) FROM surface_ids),
+                        (SELECT sum(length(producer_epoch) + length(list_digest) + length(fingerprint))
+                         FROM surface_sets)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(surface_rows > 0, "publication must write the surface set");
+        assert_eq!(stats.peak_batch_rows, expected_rows + surface_rows);
+        assert_eq!(
+            stats.peak_batch_payload_bytes,
+            expected_bytes + surface_bytes
+        );
         assert!(
             store
                 .contains_parsed_blob(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
@@ -3736,6 +3775,8 @@ mod tests {
             ),
             liveness: None,
             workspace_snapshot: None,
+            membership: None,
+            prepared_membership: None,
             workspace_listing_complete: true,
             revision_blobs: None,
             live_paths,
@@ -3944,6 +3985,8 @@ mod tests {
             ),
             liveness: None,
             workspace_snapshot: None,
+            membership: None,
+            prepared_membership: None,
             workspace_listing_complete: true,
             revision_blobs: None,
             live_paths,
@@ -4318,6 +4361,59 @@ mod tests {
             0,
             "persisted owner lookup must not hydrate a FileState"
         );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12162: indexed_source served unverified current-disk bytes paired with generation facts"
+    )]
+    fn indexed_source_12162_requires_generation_bytes() {
+        for changed in [false, true] {
+            let source = "pub fn indexed() {}\n";
+            let fixture = crate::inline_project::InlineTestProject::with_language(Language::Rust)
+                .file("src/main.rs", source)
+                .build();
+            let file = fixture.file("src/main.rs");
+            let project: Arc<dyn Project> = Arc::new(TestProject::new(
+                fixture.root().to_path_buf(),
+                Language::Rust,
+            ));
+            let store = AnalyzerStore::open_persistent(&fixture.root().join("source.db"))
+                .expect("persistent store");
+            let context = store_context_from_store(project.as_ref(), store, false);
+            let mut analyzer = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
+                project,
+                RustAdapter::for_tests(),
+                AnalyzerConfig::default(),
+                context,
+                None,
+            )
+            .expect("indexed project");
+            assert!(analyzer.state.dirty_snapshot().is_empty());
+            analyzer.source_snapshot_file_states = Arc::new(HashMap::default());
+            analyzer.query_file_state_snapshot.store(None);
+            analyzer.transient_file_states.lock().unwrap().clear();
+            analyzer
+                .query_read_cache_lock()
+                .file_states
+                .write()
+                .unwrap()
+                .clear();
+            if changed {
+                file.write("pub fn disk_revision() {}\n").unwrap();
+            }
+            let scope = AnalyzerQueryScope::capturing_read_incompleteness(&analyzer);
+            let actual = analyzer.indexed_source(&file);
+            if changed {
+                assert_eq!(actual, None);
+                assert!(scope.captured_read_incompleteness().iter().any(|reason| {
+                    matches!(reason.base_cause(), QueryReadIncomplete::StructureUnavailable(missing) if missing == &file)
+                }));
+            } else {
+                assert_eq!(actual.as_deref(), Some(source));
+                assert!(scope.captured_read_incompleteness().is_empty());
+            }
+        }
     }
 
     #[brokk_bifrost_test_macros::hardwon(
@@ -6491,6 +6587,7 @@ mod tests {
                    ON retained.content_oid = versions.blob_oid
                  WHERE versions.workspace_id = ?1 AND versions.lang = ?2
                    AND versions.generation = ?3 AND versions.input_kind = 'configuration'
+                   AND versions.file_present = 1
                    AND versions.valid_from <= ?4
                    AND (versions.valid_until IS NULL OR ?4 < versions.valid_until)",
                 rusqlite::params![
@@ -6654,6 +6751,7 @@ mod tests {
                        ON retained.content_oid = versions.blob_oid
                      WHERE versions.workspace_id = ?1 AND versions.lang = ?2
                        AND versions.generation = ?3 AND versions.input_kind = 'configuration'
+                       AND versions.file_present = 1
                        AND versions.valid_from <= ?4
                        AND (versions.valid_until IS NULL OR ?4 < versions.valid_until)",
                     rusqlite::params![
@@ -6678,6 +6776,7 @@ mod tests {
                            ON retained.content_oid = versions.blob_oid
                          WHERE versions.workspace_id = ?1 AND versions.lang = ?2
                            AND versions.generation = ?3 AND versions.input_kind = 'configuration'
+                           AND versions.file_present = 1
                          ORDER BY versions.valid_from",
                     )
                     .expect("configuration history query");
@@ -6905,6 +7004,16 @@ mod tests {
 
     #[test]
     fn rust_configuration_capture_failure_keeps_old_head_and_recovers() {
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        struct ConfigurationHistoryRow {
+            generation: i64,
+            rel_path: String,
+            blob_oid: String,
+            valid_from: i64,
+            valid_until: Option<i64>,
+            file_present: Option<bool>,
+        }
+
         let manifest_v1 = "[package]\nname = \"sample\"\nedition = \"2021\"\n";
         let manifest_v2 = "[package]\nname = \"sample\"\nedition = \"2024\"\n";
         let fixture = crate::inline_project::InlineTestProject::with_language(Language::Rust)
@@ -6940,6 +7049,7 @@ mod tests {
                    ON retained.content_oid = versions.blob_oid
                  WHERE versions.workspace_id = ?1 AND versions.lang = ?2
                    AND versions.generation = ?3 AND versions.input_kind = 'configuration'
+                   AND versions.file_present = 1
                    AND versions.valid_from <= ?4
                    AND (versions.valid_until IS NULL OR ?4 < versions.valid_until)",
                 rusqlite::params![
@@ -6952,23 +7062,47 @@ mod tests {
             )
             .expect("current Cargo manifest bytes")
         };
-        let configuration_history = |analyzer: &TreeSitterAnalyzer<RustAdapter>| -> i64 {
+        let configuration_history_rows = |analyzer: &TreeSitterAnalyzer<RustAdapter>| {
             let conn = brokk_bifrost_core::cache_db::open_unified_connection(&db)
                 .expect("workspace database");
-            conn.query_row(
-                "SELECT count(*)
-                 FROM workspace_file_versions
-                 WHERE workspace_id = ?1 AND lang = 'rust'
-                   AND input_kind = 'configuration'",
-                [analyzer.workspace_id().as_str()],
-                |row| row.get(0),
-            )
-            .expect("configuration history")
+            let mut statement = conn
+                .prepare(
+                    "SELECT generation, rel_path, blob_oid, valid_from, valid_until, file_present
+                     FROM workspace_file_versions
+                     WHERE workspace_id = ?1 AND lang = 'rust'
+                       AND input_kind = 'configuration'
+                     ORDER BY generation, valid_from, rel_path",
+                )
+                .expect("configuration history query");
+            statement
+                .query_map([analyzer.workspace_id().as_str()], |row| {
+                    Ok(ConfigurationHistoryRow {
+                        generation: row.get(0)?,
+                        rel_path: row.get(1)?,
+                        blob_oid: row.get(2)?,
+                        valid_from: row.get(3)?,
+                        valid_until: row.get(4)?,
+                        file_present: row.get(5)?,
+                    })
+                })
+                .expect("configuration history rows")
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .expect("configuration history values")
         };
 
         let old_revision = analyzer.selected_workspace_snapshots()["rust"].revision;
         assert_eq!(current_configuration(&analyzer), manifest_v1.as_bytes());
-        assert_eq!(configuration_history(&analyzer), 1);
+        let initial_configuration_history = configuration_history_rows(&analyzer);
+        // Acquisition also records the two absent local Cargo config
+        // candidates. Only the manifest rows move with this test's edits.
+        assert_eq!(
+            initial_configuration_history
+                .iter()
+                .filter(|row| row.rel_path == "Cargo.toml")
+                .count(),
+            1,
+            "the successful generation records the Cargo manifest"
+        );
 
         manifest.write(manifest_v2).expect("updated manifest");
         project.fail_next_capture();
@@ -6987,9 +7121,9 @@ mod tests {
         );
         assert_eq!(current_configuration(&failed), manifest_v1.as_bytes());
         assert_eq!(
-            configuration_history(&failed),
-            1,
-            "the failed generation must not publish a configuration revision"
+            configuration_history_rows(&failed),
+            initial_configuration_history,
+            "the failed generation must not publish any configuration history row"
         );
         let scope = AnalyzerQueryScope::new(&failed);
         let error = scope
@@ -7008,7 +7142,14 @@ mod tests {
             old_revision + 1
         );
         assert_eq!(current_configuration(&recovered), manifest_v2.as_bytes());
-        assert_eq!(configuration_history(&recovered), 2);
+        assert_eq!(
+            configuration_history_rows(&recovered)
+                .iter()
+                .filter(|row| row.rel_path == "Cargo.toml")
+                .count(),
+            2,
+            "recovery publishes one new Cargo manifest version"
+        );
         let scope = AnalyzerQueryScope::new(&recovered);
         assert!(
             scope.store_error().is_none(),
@@ -7269,9 +7410,19 @@ mod tests {
             Some(snapshot.as_ref()),
         )
         .expect("disk configuration capture");
-        assert_eq!(captured.len(), 1);
-        assert_eq!(captured[0].relative_path(), "Cargo.toml");
-        assert_eq!(captured[0].source_bytes(), disk_manifest.as_bytes());
+        // Acquisition also retains the absent local Cargo config candidates,
+        // so identify the manifest rather than assuming it is the only input.
+        let manifests = captured
+            .iter()
+            .filter(|input| input.relative_path() == "Cargo.toml")
+            .collect::<Vec<_>>();
+        assert_eq!(manifests.len(), 1);
+        assert_eq!(manifests[0].source_bytes(), disk_manifest.as_bytes());
+        assert!(
+            captured
+                .iter()
+                .all(|input| input.relative_path() != "generated/Cargo.toml")
+        );
 
         let overlay_only = fixture.file("generated/Cargo.toml");
         assert!(overlay.set(
@@ -7286,9 +7437,17 @@ mod tests {
             Some(snapshot.as_ref()),
         )
         .expect("overlay-only configuration is transient");
-        assert_eq!(captured.len(), 1);
-        assert_eq!(captured[0].relative_path(), "Cargo.toml");
-        assert_eq!(captured[0].source_bytes(), disk_manifest.as_bytes());
+        let manifests = captured
+            .iter()
+            .filter(|input| input.relative_path() == "Cargo.toml")
+            .collect::<Vec<_>>();
+        assert_eq!(manifests.len(), 1);
+        assert_eq!(manifests[0].source_bytes(), disk_manifest.as_bytes());
+        assert!(
+            captured
+                .iter()
+                .all(|input| input.relative_path() != "generated/Cargo.toml")
+        );
     }
 
     #[test]
@@ -7817,6 +7976,8 @@ mod tests {
             ),
             liveness: None,
             workspace_snapshot: None,
+            membership: None,
+            prepared_membership: None,
             workspace_listing_complete: true,
             revision_blobs: None,
             live_paths: Arc::new(LivePathMap::default()),
@@ -8220,7 +8381,7 @@ mod tests {
         assert!(candidates.iter().any(|candidate| {
             candidate.code_unit.fq_name() == "demo.Gson.fromJson"
                 && candidate.primary_range.is_some()
-                && !candidate.in_test_region
+                && candidate.in_test_region == Some(false)
         }));
     }
 
@@ -8250,5 +8411,213 @@ mod tests {
         assert!(!candidates.complete, "{candidates:#?}");
         assert!(candidates.inspected > 0, "{candidates:#?}");
         assert!(cancellation.is_cancelled());
+    }
+
+    /// Wait for `count` results from builds on their own threads. A deadlock
+    /// fails here after the timeout instead of hanging the test binary.
+    fn wait_for_builds(results: &std::sync::mpsc::Receiver<(&'static str, usize)>, count: usize) {
+        for _ in 0..count {
+            let (language, committed) = results
+                .recv_timeout(std::time::Duration::from_secs(120))
+                .expect("both languages must finish on the shared parse pool");
+            assert_eq!(committed, SHARED_POOL_FILES, "{language} blobs");
+        }
+    }
+
+    const SHARED_POOL_FILES: usize = 40;
+
+    /// Build a Java and a C++ analyzer at the same time on one shared parse
+    /// worker, the Java one reporting to `java_progress`. Both builds persist
+    /// through their own consumer while their producers share that worker.
+    fn build_java_and_cpp_on_one_worker(java_progress: Option<BuildProgress>) {
+        let _pool =
+            brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::override_parse_pool_for_test(1);
+        let java_temp = tempfile::tempdir().expect("temp dir");
+        let java_root = java_temp.path().canonicalize().expect("canonical temp dir");
+        let cpp_temp = tempfile::tempdir().expect("temp dir");
+        let cpp_root = cpp_temp.path().canonicalize().expect("canonical temp dir");
+        for index in 0..SHARED_POOL_FILES {
+            temp_file(&java_root, &format!("src/Type{index}.java"))
+                .write(format!("package demo; class Type{index} {{}}\n"))
+                .expect("Java source");
+            temp_file(&cpp_root, &format!("src/unit{index}.cpp"))
+                .write(format!("int unit_{index}() {{ return {index}; }}\n"))
+                .expect("C++ source");
+        }
+        let config = AnalyzerConfig {
+            parallelism: Some(1),
+            ..AnalyzerConfig::default()
+        };
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let (done, results) = std::sync::mpsc::channel();
+        let java_project: Arc<dyn Project> = Arc::new(TestProject::new(&java_root, Language::Java));
+        let java_store = ephemeral_store_context(java_project.as_ref()).unwrap();
+        let java_done = done.clone();
+        let java_start = Arc::clone(&start);
+        let java_config = config.clone();
+        std::thread::spawn(move || {
+            java_start.wait();
+            let analyzer = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
+                java_project,
+                JavaAdapter,
+                java_config,
+                java_store,
+                java_progress,
+            )
+            .expect("Java analyzer epochs should initialize");
+            java_done
+                .send(("java", analyzer.state.persistence_stats.committed_blobs))
+                .expect("test thread waits for the build");
+        });
+        let cpp_project: Arc<dyn Project> = Arc::new(TestProject::new(&cpp_root, Language::Cpp));
+        let cpp_store = ephemeral_store_context(cpp_project.as_ref()).unwrap();
+        std::thread::spawn(move || {
+            start.wait();
+            let analyzer = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
+                cpp_project,
+                CppAdapter,
+                config,
+                cpp_store,
+                None,
+            )
+            .expect("C++ analyzer epochs should initialize");
+            done.send(("cpp", analyzer.state.persistence_stats.committed_blobs))
+                .expect("test thread waits for the build");
+        });
+        wait_for_builds(&results, 2);
+    }
+
+    /// #11801: every language shares one parse pool, so two languages whose
+    /// batches run at once on a single worker must both finish. Each batch's
+    /// producer parks that worker on its bounded channel while the persist
+    /// consumer, which runs on the batch's own thread, drains it.
+    #[test]
+    fn two_languages_finish_on_one_shared_parse_worker() {
+        build_java_and_cpp_on_one_worker(None);
+    }
+
+    /// Progress callbacks run on a parse worker. A slow one in one language
+    /// holds the only worker, and the other language only waits for it.
+    #[test]
+    fn a_slow_progress_callback_only_delays_the_other_language() {
+        let slow: BuildProgress = Arc::new(|event| {
+            if event.phase == BuildProgressPhase::Parse {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        });
+        build_java_and_cpp_on_one_worker(Some(slow));
+    }
+
+    /// A persist consumer that started another parse batch would wait on
+    /// workers that its own producers hold blocked on `send` to it. The batch
+    /// refuses to start there.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_persist_consumer_cannot_start_another_parse_batch() {
+        let _pool =
+            brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::override_parse_pool_for_test(1);
+        let inner_temp = tempfile::tempdir().expect("temp dir");
+        let inner_root = inner_temp
+            .path()
+            .canonicalize()
+            .expect("canonical temp dir");
+        let inner_file = temp_file(&inner_root, "src/Inner.java");
+        inner_file
+            .write("package demo; class Inner {}\n")
+            .expect("Java source");
+        let inner = Arc::new(TreeSitterAnalyzer::new(
+            Arc::new(TestProject::new(&inner_root, Language::Java)) as Arc<dyn Project>,
+            JavaAdapter,
+        ));
+        let outer_temp = tempfile::tempdir().expect("temp dir");
+        let outer_root = outer_temp
+            .path()
+            .canonicalize()
+            .expect("canonical temp dir");
+        for index in 0..SHARED_POOL_FILES {
+            temp_file(&outer_root, &format!("src/Outer{index}.java"))
+                .write(format!("package demo; class Outer{index} {{}}\n"))
+                .expect("Java source");
+        }
+        let outer_project: Arc<dyn Project> =
+            Arc::new(TestProject::new(&outer_root, Language::Java));
+        let outer_store = ephemeral_store_context(outer_project.as_ref()).unwrap();
+        // The consumer reports persistence, and from there starts a batch of the
+        // already built analyzer's files.
+        let progress: BuildProgress = Arc::new(move |event| {
+            if event.phase == BuildProgressPhase::Persist {
+                inner.persist_live_blobs(std::slice::from_ref(&inner_file));
+            }
+        });
+        let (done, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
+                    outer_project,
+                    JavaAdapter,
+                    AnalyzerConfig {
+                        parallelism: Some(1),
+                        ..AnalyzerConfig::default()
+                    },
+                    outer_store,
+                    Some(progress),
+                )
+                .map(|_| ())
+            }));
+            done.send(outcome.err())
+                .expect("test thread waits for the build");
+        });
+        let payload = result
+            .recv_timeout(std::time::Duration::from_secs(120))
+            .expect("the refused nested batch must fail the build, not hang it")
+            .expect("starting a batch from a persist consumer must panic");
+        let message = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| {
+                payload
+                    .downcast_ref::<&str>()
+                    .map(|message| (*message).to_owned())
+            })
+            .unwrap_or_default();
+        assert!(message.contains("persist consumer"), "{message}");
+    }
+
+    /// Every language used to leak a parse pool as wide as the machine, so a
+    /// process that parsed twelve languages held twelve times the cores in
+    /// parse threads. Languages now share one pool.
+    #[cfg(target_os = "linux")]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11801: each language leaked its own core-count parse pool"
+    )]
+    #[test]
+    fn parsing_several_languages_holds_at_most_one_parse_pool_of_threads() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        temp_file(&root, "src/Demo.java")
+            .write("package demo; class Demo {}\n")
+            .expect("Java source");
+        temp_file(&root, "src/demo.cpp")
+            .write("int demo() { return 1; }\n")
+            .expect("C++ source");
+        temp_file(&root, "src/demo.py")
+            .write("def demo():\n    return 1\n")
+            .expect("Python source");
+        let project =
+            |language| -> Arc<dyn Project> { Arc::new(TestProject::new(&root, language)) };
+        let _java = TreeSitterAnalyzer::new(project(Language::Java), JavaAdapter);
+        let _cpp = TreeSitterAnalyzer::new(project(Language::Cpp), CppAdapter);
+        let _python = TreeSitterAnalyzer::new(project(Language::Python), PythonAdapter::default());
+
+        let parse_threads = std::fs::read_dir("/proc/self/task")
+            .expect("task directory")
+            .filter_map(|task| std::fs::read_to_string(task.ok()?.path().join("comm")).ok())
+            .filter(|name| name.starts_with("bifrost-parse-"))
+            .count();
+        let width = brokk_bifrost_core::analyzer::config::default_parallelism();
+        assert!(
+            parse_threads <= width,
+            "{parse_threads} parse threads for a pool of {width}"
+        );
     }
 }

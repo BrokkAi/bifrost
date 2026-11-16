@@ -45,6 +45,7 @@ use std::sync::Arc;
 
 use brokk_bifrost_analysis::analyzer::WorkspaceAnalyzer;
 use brokk_bifrost_analysis::analyzer::semantic_model::ActiveSemanticModelSnapshot;
+use brokk_bifrost_analysis::analyzer::store::cache_budget::RetainedHeap;
 
 use crate::budget::PolicyBudget;
 use crate::definition::PolicyAnalysis;
@@ -180,7 +181,13 @@ pub fn explain_flow_candidate(
     // One model publication for the whole question: both passes, and the
     // projection of a reached candidate, read this exact snapshot.
     let snapshot = context.analyzer.active_semantic_model_snapshot();
-    let authored = solve_flow_candidate(
+    let _question_scope = super::value_flow_question_scope(context.analyzer, snapshot.clone())?;
+    // Pointer identities remain valid because the admitted products stay
+    // owned by the two solves until this question finishes. A refusal is
+    // terminal, so no dropped owner can be mistaken for a later allocation.
+    let mut input_retention = (limits.max_prefix_executions() >= 2 && !spec.sanitizers.is_empty())
+        .then(|| RetainedHeap::bounded(budget.max_retained_report_bytes()));
+    let mut authored = solve_flow_candidate(
         policy,
         context.flow_resources(),
         spec,
@@ -189,6 +196,7 @@ pub fn explain_flow_candidate(
         context.cancellation,
         budget,
         candidate,
+        input_retention.as_mut(),
     );
 
     let mut root = RawNode::new(
@@ -265,9 +273,19 @@ pub fn explain_flow_candidate(
             let negative = propagation.outcome == ExplanationOutcome::Failed;
             stages.push(propagation);
             if negative && solve.kill_sites().next().is_some() {
+                authored.discard_negative_display();
                 stages.push(attribution_stage(
-                    policy, spec, context, workspace, solve, candidate, vocabulary, budget, limits,
+                    policy,
+                    spec,
+                    context,
+                    workspace,
+                    &authored,
+                    candidate,
+                    vocabulary,
+                    budget,
+                    limits,
                     snapshot,
+                    input_retention.as_mut(),
                 )?);
             }
             decided = decided_by(&stages);
@@ -510,7 +528,8 @@ fn propagation_stage(
             unreachable!("a solved candidate has both sites bound");
         };
         let finding = run.findings().iter().find(|finding| {
-            finding.primary() == &observation_sites[0].location
+            finding.evaluation_location().unwrap_or(finding.primary())
+                == &observation_sites[0].location
                 && reported_origin(finding).is_some_and(|endpoint| {
                     origin_sites.iter().any(|site| &site.endpoint == endpoint)
                 })
@@ -744,13 +763,18 @@ fn attribution_stage(
     spec: &ResolvedTaintPolicySpec,
     context: &PolicyEvaluationContext<'_>,
     workspace: &WorkspaceAnalyzer,
-    authored_solve: &CandidateSolve,
+    authored: &CandidatePass,
     candidate: &FlowExplanationCandidate,
     vocabulary: &Vocabulary,
     budget: &PolicyBudget,
     limits: &ExplanationLimits,
     snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
+    input_retention: Option<&mut RetainedHeap>,
 ) -> Result<RawNode, ExplainError> {
+    let authored_solve = authored
+        .solve
+        .as_ref()
+        .expect("kill attribution follows a solved authored candidate");
     let label = vocabulary.attribution_stage;
     let expected = format!(
         "with the policy's {}s removed, the same route reaches the {}, and every such path \
@@ -772,11 +796,18 @@ fn attribution_stage(
     }
     let mut relaxed_spec = spec.clone();
     relaxed_spec.sanitizers.clear();
+    let relaxed_budget = budget.with_remaining_report_bytes(
+        input_retention
+            .as_ref()
+            .map_or(budget.max_retained_report_bytes(), |heap| {
+                heap.remaining_bytes()
+            }),
+    );
     // The second pass asks a different policy question. Shadow any enclosing
     // read ledger so its selector, artifact and absence reads cannot certify
     // the authored pass. Each solve also builds its own composition memo and
     // the candidate plan's compatibility includes its effective kill bindings.
-    let (relaxed, _counterfactual_reads) =
+    let (mut relaxed, _counterfactual_reads) =
         brokk_bifrost_analysis::analyzer::i_analyzer::capture_nested_reads(
             context.analyzer,
             || {
@@ -787,11 +818,13 @@ fn attribution_stage(
                     workspace,
                     snapshot,
                     context.cancellation,
-                    budget,
+                    &relaxed_budget,
                     candidate,
+                    input_retention,
                 )
             },
         );
+    relaxed.discard_projection();
     let Some(relaxed_solve) = relaxed.solve.as_ref().filter(|solve| solve.reached) else {
         let boundaries = relaxed
             .selection_gaps
@@ -833,6 +866,11 @@ fn attribution_stage(
     let mut kills = Vec::<&CandidateSite>::new();
     let mut unattributed = 0usize;
     let mut paths = Vec::new();
+    let incomplete_steps = relaxed_solve.witnesses.is_empty()
+        || relaxed_solve
+            .witnesses
+            .iter()
+            .any(|witness| witness.truncated() || witness.steps().is_empty());
     for (index, witness) in relaxed_solve
         .witnesses
         .iter()
@@ -860,11 +898,31 @@ fn attribution_stage(
             paths.push(projected);
         }
     }
+    // A representative can disclose other paths without retaining their exact
+    // count. Its boolean proves at least one omission, not one per witness;
+    // those paths may also overlap the local retained-vector cutoff.
     let omitted_paths = relaxed_solve
         .witnesses
         .len()
-        .saturating_sub(budget.max_witnesses_per_finding());
-    let attributed = unattributed == 0 && omitted_paths == 0 && !kills.is_empty();
+        .saturating_sub(budget.max_witnesses_per_finding())
+        .max(usize::from(
+            relaxed_solve
+                .witnesses
+                .iter()
+                .any(|witness| witness.alternatives_truncated()),
+        ));
+    let boundaries = relaxed
+        .selection_gaps
+        .iter()
+        .chain(relaxed_solve.boundaries.iter())
+        .collect::<Vec<_>>();
+    let correspondence = authored.collective_kill_dependence(&relaxed);
+    let attributed = correspondence.is_ok();
+    if attributed {
+        // These are members of the collectively blocking set. The proof does
+        // not establish individual necessity of the displayed examples.
+        kills = authored_solve.kill_sites().collect();
+    }
     let retained_paths = relaxed_solve
         .witnesses
         .len()
@@ -881,32 +939,38 @@ fn attribution_stage(
     .with_expected(expected)
     .with_actual(if attributed {
         format!(
-            "with the {}s removed the same route reaches the {}; each of {} retained path(s) \
-             passes a {} the policy declares",
-            vocabulary.kill, vocabulary.observation, retained_paths, vocabulary.kill
+            "the complete strict own-source relation has no accepted meeting; the corresponding \
+             relaxed relation reaches the {} with only bound {} class removals disabled, so every \
+             accepted relaxed derivation depends on the declared {} set collectively; \
+             {retained_paths} representative path(s) retained, at least {omitted_paths} omitted",
+            vocabulary.observation, vocabulary.kill, vocabulary.kill
         )
-    } else if omitted_paths > 0 {
+    } else {
+        let reason = correspondence
+            .err()
+            .unwrap_or("counterfactual selector coverage is incomplete");
         format!(
-            "with the {}s removed the same route reaches the {}; {} of {retained_paths} retained \
-             path(s) pass a declared {}, but {omitted_paths} path(s) were omitted and not checked",
+            "collective {} dependence is unknown: {reason}; {} of {retained_paths} retained \
+             path(s) pass a declared {}; at least {omitted_paths} display path(s) were omitted",
             vocabulary.kill,
-            vocabulary.observation,
             retained_paths.saturating_sub(unattributed),
             vocabulary.kill
         )
-    } else {
-        format!(
-            "with the {}s removed the same route reaches the {}, but {unattributed} retained \
-             path(s) pass no bound {} site",
-            vocabulary.kill, vocabulary.observation, vocabulary.kill
-        )
     })
     .with_source_truncation(
-        omitted_paths > 0,
+        omitted_paths > 0 || incomplete_steps,
         u64::try_from(omitted_paths).unwrap_or(u64::MAX),
     );
     if !attributed {
-        node = node.with_reasons(vec![PolicyIncompleteReason::CapabilityIncomplete]);
+        let mut reasons = vec![PolicyIncompleteReason::CapabilityIncomplete];
+        if authored_solve.input_retention_refused() || relaxed_solve.input_retention_refused() {
+            reasons.push(PolicyIncompleteReason::ReportRetentionBudget);
+        }
+        reasons.extend(boundary_reasons(boundaries.iter().copied()));
+        node = node.with_reasons(reasons);
+    }
+    for boundary in boundaries {
+        node.push_child(boundary_node(boundary));
     }
     for kill in kills {
         node.push_child(
@@ -916,11 +980,11 @@ fn attribution_stage(
                 vocabulary.kill,
             )
             .with_expected(format!(
-                "a declared {} clears the tracked value on the path",
+                "a declared {} is bound in the authored pass",
                 vocabulary.kill
             ))
             .with_actual(format!(
-                "{} `{}` is bound at this program point, which the counterfactual path passes",
+                "{} `{}` is bound at this program point",
                 vocabulary.kill,
                 endpoint_entry(&kill.endpoint)
             ))

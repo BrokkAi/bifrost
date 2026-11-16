@@ -15,8 +15,9 @@ pub(super) struct LanguageRuleMatches {
 
 /// The fact range used to select a language-rule match and its displayed
 /// source range. Most rules use the same range for both.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(super) struct LanguageRuleMatch {
+    pub(super) selected_pattern_source: super::SelectedPatternSourceEvidence,
     pub(super) select: Range,
     pub(super) report: Range,
     /// Why the match is a heuristic guess rather than a structural fact, for
@@ -28,6 +29,7 @@ pub(super) struct LanguageRuleMatch {
 impl From<Range> for LanguageRuleMatch {
     fn from(range: Range) -> Self {
         Self {
+            selected_pattern_source: Default::default(),
             select: range,
             report: range,
             heuristic: None,
@@ -87,6 +89,10 @@ impl LanguageRuleMatches {
         Self {
             matches: ranges.into_iter().map(Into::into).collect(),
             diagnostics: vec![CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                 incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                 related: Vec::new(),
                 source: None,
@@ -116,7 +122,16 @@ impl LanguageRuleMatches {
     ) -> Self {
         let mut matches = ranges.into_iter().map(Into::into).collect::<Vec<_>>();
         matches.sort_unstable_by_key(|matched| (matched.select, matched.report, matched.heuristic));
-        matches.dedup_by_key(|matched| (matched.select, matched.report, matched.heuristic));
+        matches.dedup_by(|right, left| {
+            if (left.select, left.report, left.heuristic)
+                != (right.select, right.report, right.heuristic)
+            {
+                return false;
+            }
+            left.selected_pattern_source
+                .merge(&right.selected_pattern_source);
+            true
+        });
         if undecided.is_empty() {
             return Self {
                 matches,
@@ -127,9 +142,13 @@ impl LanguageRuleMatches {
             .iter()
             .map(|site| format!("{}: {}", site.site, site.reason))
             .collect::<Vec<_>>();
-        let message = format!(
-            "{rule} is incomplete for {}: the relation could not be decided at {sites:?}",
-            super::rel_path_string(file),
+        let message = brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+            format_args!(
+                "{rule} is incomplete for {}: the relation could not be decided at {sites:?}",
+                super::rel_path_string(file),
+            ),
+            format_args!("{rule} is incomplete for {}", super::rel_path_string(file)),
+            sites.iter(),
         );
         Self::incomplete(matches, language, message)
     }
@@ -178,6 +197,8 @@ pub(super) fn selected_syntax(
             "selected syntax is unavailable",
         ),
     };
+    // The execution-state diagnostic this pushes carries the dependence into
+    // the query's reuse verdict.
     analyzer.mark_execution_dependent();
     let mut result = LanguageRuleMatches::incomplete(
         Vec::<Range>::new(),

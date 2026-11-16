@@ -470,6 +470,10 @@ pub struct UsageEdges<K = String> {
     pub unproven_sites_complete: bool,
     /// Missing local import targets observed at admitted reference sites.
     pub unresolved_relative_imports: BTreeMap<String, Vec<RelativeImportGap>>,
+    /// The typed causes of an incomplete source inventory the edges were
+    /// resolved over, `None` when the inventory was complete. The edges stand;
+    /// what they do not hold may be in a source the inventory missed.
+    pub incomplete_inventory: Option<Vec<crate::analyzer::query_batch::QueryIncompleteReason>>,
 }
 
 // Hand-written so the bound is `K: Ord` (BTreeMap), not `K: Default` that
@@ -483,6 +487,7 @@ impl<K: Ord> Default for UsageEdges<K> {
             unproven_sites: BTreeMap::new(),
             unproven_sites_complete: true,
             unresolved_relative_imports: BTreeMap::new(),
+            incomplete_inventory: None,
         }
     }
 }

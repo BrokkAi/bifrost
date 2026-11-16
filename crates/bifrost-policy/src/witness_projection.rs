@@ -25,7 +25,8 @@ use std::sync::Arc;
 pub(super) struct PatternProvenance<'a> {
     cancellation: &'a CancellationToken,
     budget: RefCell<&'a mut SemanticBudget>,
-    memo: RefCell<HashMap<SemanticLocator, WitnessStepProvenance>>,
+    /// One successful proof per binder, valid only for its exact selected field.
+    memo: RefCell<HashMap<SemanticLocator, (SemanticLocator, WitnessStepProvenance)>>,
     /// Each file's binders, indexed once, so a witness finds its candidate
     /// without scanning every procedure of the file again.
     binders: RefCell<HashMap<WorkspaceRelativePath, Arc<BinderIndex>>>,
@@ -93,13 +94,27 @@ impl<'a> PatternProvenance<'a> {
     }
 
     /// The provenance of a binder the plan's binding admitted. `None` with the
-    /// unavailable flag set means the lookup could not decide.
+    /// unavailable flag set means the lookup could not decide. The field is
+    /// evidence retained by the same admission, not another source identity.
     fn lookup(
         &self,
         workspace: &WorkspaceAnalyzer,
         source_site: &SemanticLocator,
+        field_site: &SemanticLocator,
     ) -> Result<Option<WitnessStepProvenance>, String> {
-        if let Some(found) = self.memo.borrow().get(source_site) {
+        if source_site.mount() != field_site.mount()
+            || source_site.path() != field_site.path()
+            || source_site.language() != field_site.language()
+            || source_site.declaration() != field_site.declaration()
+            || source_site.role() != field_site.role()
+        {
+            self.unavailable.set(true);
+            self.record_reason("selected field owner does not match the admitted binder");
+            return Ok(None);
+        }
+        if let Some((field, found)) = self.memo.borrow().get(source_site)
+            && field == field_site
+        {
             return Ok(Some(found.clone()));
         }
         let looked_up = {
@@ -107,6 +122,7 @@ impl<'a> PatternProvenance<'a> {
             admitted_pattern_provenance(
                 workspace,
                 source_site,
+                field_site,
                 self.cancellation,
                 &mut budget,
                 &self.binders,
@@ -116,7 +132,7 @@ impl<'a> PatternProvenance<'a> {
             Ok(found) => {
                 self.memo
                     .borrow_mut()
-                    .insert(source_site.clone(), found.clone());
+                    .insert(source_site.clone(), (field_site.clone(), found.clone()));
                 Ok(Some(found))
             }
             Err(reason) => {
@@ -238,6 +254,7 @@ fn index_binders(artifact: &SemanticArtifact) -> BinderIndex {
 fn admitted_pattern_provenance(
     workspace: &WorkspaceAnalyzer,
     source_site: &SemanticLocator,
+    field_site: &SemanticLocator,
     cancellation: &CancellationToken,
     budget: &mut SemanticBudget,
     binders: &RefCell<HashMap<WorkspaceRelativePath, Arc<BinderIndex>>>,
@@ -270,11 +287,26 @@ fn admitted_pattern_provenance(
     };
     let oracle = WorkspaceSemanticOracle::new(workspace);
     let mut records: Vec<SelectedPatternProjection> = Vec::new();
-    for (id, ordinal) in index.get(source_site).map_or(&[][..], Vec::as_slice) {
+    let source_span = source_site.anchor().span();
+    for (id, ordinal) in index
+        .iter()
+        .filter(|(binder, _)| {
+            binder.declaration() == source_site.declaration()
+                && source_span.start_byte() <= binder.anchor().span().start_byte()
+                && binder.anchor().span().end_byte() <= source_span.end_byte()
+        })
+        .flat_map(|(_, candidates)| candidates)
+    {
         let Some(handle) = artifact.procedure_handle(*id) else {
             return Ok(Err("the binder's procedure is no longer found".to_owned()));
         };
-        match oracle.selected_pattern_projection_at(&handle, *ordinal, &mut request) {
+        match oracle.selected_pattern_source_at(
+            &handle,
+            *ordinal,
+            field_site.anchor().span().start_byte() as usize
+                ..field_site.anchor().span().end_byte() as usize,
+            &mut request,
+        ) {
             Ok(Some(record)) => records.push(record),
             Ok(None) => return Err("pattern witness projection was cancelled".to_owned()),
             Err(error) => return Ok(Err(format!("semantic provider failed: {error}"))),
@@ -302,6 +334,7 @@ fn provenance_from_records<'a>(
     }
     let binding = match &record.binding {
         SelectedTupleBinding::Admitted(binding) => binding,
+        SelectedTupleBinding::Observed(source) => &source.binding,
         SelectedTupleBinding::Unavailable(cause) => {
             return Err(format!("admission unavailable: {}", cause.reason()));
         }
@@ -367,7 +400,7 @@ pub(super) fn project_summary_witness_with_source(
     id: WitnessId,
     max_steps: usize,
     max_bytes: usize,
-    source_site: Option<&SemanticLocator>,
+    source_site: Option<(&SemanticLocator, &SemanticLocator)>,
     labels: impl Fn(&SummaryWitnessStepKind) -> (WitnessStepKind, &'static str),
 ) -> Result<Option<BoundedWitness>, String> {
     let steps = project_summary_witness_steps_with_source(
@@ -417,12 +450,12 @@ fn project_summary_witness_steps_with_source(
     id: &WitnessId,
     max_steps: usize,
     max_bytes: usize,
-    source_site: Option<&SemanticLocator>,
+    source_site: Option<(&SemanticLocator, &SemanticLocator)>,
     labels: impl Fn(&SummaryWitnessStepKind) -> (WitnessStepKind, &'static str),
 ) -> Result<Vec<WitnessStep>, String> {
     let mut steps = Vec::new();
     let admitted = match (provenance, source_site) {
-        (Some(provenance), Some(site)) => provenance.lookup(workspace, site)?,
+        (Some(provenance), Some((binder, field))) => provenance.lookup(workspace, binder, field)?,
         _ => None,
     };
     for step in witness.steps().iter().take(max_steps) {
@@ -431,6 +464,7 @@ fn project_summary_witness_steps_with_source(
             // The plan admitted this binder, so its site is the source even
             // when the provenance could not be rebuilt.
             source_site
+                .map(|(binder, _)| binder)
                 .unwrap_or_else(|| super::semantic_identity::program_point_locator(step.source()))
         } else {
             step.receiver_operand()
@@ -472,11 +506,11 @@ pub(super) fn project_output_witness(
     id: WitnessId,
     max_steps: usize,
     max_bytes: usize,
-    source_site: Option<&SemanticLocator>,
+    source_site: Option<(&SemanticLocator, &SemanticLocator)>,
 ) -> Result<Option<BoundedWitness>, String> {
     let mut steps = Vec::new();
     let admitted = source_site
-        .map(|site| provenance.lookup(workspace, site))
+        .map(|(binder, field)| provenance.lookup(workspace, binder, field))
         .transpose()?
         .flatten();
     for step in witness.steps.iter().take(max_steps) {
@@ -490,7 +524,7 @@ pub(super) fn project_output_witness(
             debug_assert!(step.kind.starts_with("edge:"));
             (WitnessStepKind::Propagation, "taint propagation")
         };
-        let source = if let Some(site) = source_site.filter(|_| step.kind == "seed") {
+        let source = if let Some((site, _)) = source_site.filter(|_| step.kind == "seed") {
             site.clone()
         } else {
             step.modeled_receiver_operand()
@@ -549,6 +583,7 @@ pub(crate) mod tests {
     use brokk_bifrost_analysis::analyzer::AnalyzerConfig;
     use brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadReceipt;
     use brokk_bifrost_analysis::analyzer::semantic::SemanticWork;
+    use brokk_bifrost_test_macros::hardwon;
 
     const POEM_PACK: &str = include_str!(
         "../../bifrost-rql/src/structural/search/tests/fixtures/rust-poem-g3-test-only.json"
@@ -683,6 +718,87 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[hardwon("#9925: witness re-admission used binder span instead of the admitted complex field")]
+    fn complex_field_provenance_keeps_binders_and_checks_memo_field() {
+        use brokk_bifrost_analysis::analyzer::semantic::{
+            SourceAnchor, SourcePosition, SourceSpan,
+        };
+
+        // Keep the actual failed capture's field and binder coordinates.
+        let prefix = "use poem::web::Query;\npub fn complex(Query(";
+        let source = format!(
+            "{prefix}{}(first, second)): Query<(String, String)>) {{ let _ = (first, second); }}\n",
+            " ".repeat(526 - prefix.len()),
+        );
+        let (_project, workspace) = workspace(&[("Cargo.toml", CARGO), ("src/lib.rs", &source)]);
+        let snapshot = activate_poem_pack(&workspace);
+        let _scope =
+            brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::with_active_semantic_model_snapshot(
+                workspace.analyzer(),
+                Some(snapshot),
+            );
+        let mut sites = all_binders(&workspace, "src/lib.rs");
+        sites.sort_by_key(|site| site.anchor().span().start_byte());
+        let [first, second] = sites.as_slice() else {
+            panic!("two real complex-field binders: {sites:?}");
+        };
+        assert_eq!(first.anchor().span().start_byte(), 527);
+        assert_eq!(first.anchor().span().end_byte(), 532);
+        assert_eq!(second.anchor().span().start_byte(), 534);
+        assert_eq!(second.anchor().span().end_byte(), 540);
+        assert_ne!(first, second);
+        let field = SemanticLocator::new(
+            first.mount(),
+            first.path().clone(),
+            first.language(),
+            first.declaration().clone(),
+            first.role(),
+            SourceAnchor::new(
+                SourceSpan::new(
+                    SourcePosition::new(526, 1, 504),
+                    SourcePosition::new(541, 1, 519),
+                )
+                .expect("field span"),
+                0,
+            ),
+        );
+        let live = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let context = PatternProvenance::new(&live, &mut budget);
+        for binder_site in [first, second] {
+            let Some(WitnessStepProvenance::AdmittedPatternProjection { binder, .. }) = context
+                .lookup(&workspace, binder_site, &field)
+                .expect("lookup")
+            else {
+                panic!("wide field admits each exact binder");
+            };
+            assert_eq!(
+                binder,
+                super::super::semantic_identity::policy_location(&workspace, binder_site).unwrap()
+            );
+        }
+        assert!(!context.take_unavailable());
+        // Same binder, wrong field: a cached correct proof cannot certify it.
+        assert!(
+            context
+                .lookup(&workspace, first, first)
+                .expect("wrong field lookup")
+                .is_none()
+        );
+        assert!(context.take_unavailable());
+        assert!(context.take_reasons().iter().any(|reason| {
+            reason.contains("selected field does not match the recorded pattern path")
+        }));
+        assert!(
+            context
+                .lookup(&workspace, first, &field)
+                .expect("correct again")
+                .is_some()
+        );
+        assert!(!context.take_unavailable());
+    }
+
+    #[test]
     fn only_a_rust_source_site_reads_for_pattern_provenance() {
         let (_project, workspace) = workspace(&[
             ("app.py", "def handler(value):\n    return value\n"),
@@ -700,6 +816,7 @@ pub(crate) mod tests {
                 found = Some(
                     admitted_pattern_provenance(
                         &workspace,
+                        site,
                         site,
                         &cancellation,
                         &mut budget,
@@ -732,7 +849,7 @@ pub(crate) mod tests {
         let mut budget = SemanticBudget::default();
         let context = PatternProvenance::new(&cancelled, &mut budget);
         let error = context
-            .lookup(&workspace, &site)
+            .lookup(&workspace, &site, &site)
             .expect_err("a cancelled run must not project");
         assert!(error.contains("cancelled"), "{error}");
     }
@@ -757,7 +874,11 @@ pub(crate) mod tests {
         let context = PatternProvenance::new(&live, &mut budget);
         let mut first = None;
         let first_reads = reads_digest(&workspace, || {
-            first = Some(context.lookup(&workspace, &site).expect("first lookup"));
+            first = Some(
+                context
+                    .lookup(&workspace, &site, &site)
+                    .expect("first lookup"),
+            );
         });
         assert!(
             matches!(
@@ -771,13 +892,17 @@ pub(crate) mod tests {
         assert_ne!(first_reads, no_reads, "the first lookup reads");
         assert!(!context.take_unavailable());
         let second_reads = reads_digest(&workspace, || {
-            assert!(context.lookup(&workspace, &site).expect("memo").is_some());
+            assert!(
+                context
+                    .lookup(&workspace, &site, &site)
+                    .expect("memo")
+                    .is_some()
+            );
         });
         assert_eq!(second_reads, no_reads, "the second lookup is the memo");
         drop(context);
 
-        // A budget stop is "unavailable", flagged, and never memoized: the next
-        // lookup under a live budget still proves the admission.
+        // A budget stop is "unavailable", flagged, and never memoized.
         let (_other_project, other) =
             self::workspace(&[("Cargo.toml", CARGO), ("src/lib.rs", source)]);
         let other_snapshot = activate_poem_pack(&other);
@@ -786,11 +911,32 @@ pub(crate) mod tests {
                 other.analyzer(),
                 Some(other_snapshot),
             );
+        let other_file = ProjectFile::new(other.analyzer().project().root(), "src/lib.rs");
+        let other_artifact = {
+            let mut preparation_budget = SemanticBudget::default();
+            let mut request = SemanticRequest::new(&mut preparation_budget, &live);
+            other
+                .materialize_program_semantics(&other_file, &mut request)
+                .expect("normal-budget artifact preparation")
+                .available_value()
+                .expect("the independent workspace has semantics")
+                .clone()
+        };
+        assert!(
+            other_artifact.work().owned_text_bytes > 1,
+            "the real retained artifact must exceed the lookup's one-byte text limit: {:?}",
+            other_artifact.work()
+        );
         let mut limits = SemanticWork::default_limits();
-        limits.source_bytes = 1;
-        let mut tiny = SemanticBudget::new(limits).expect("a one-byte source budget");
+        limits.owned_text_bytes = 1;
+        let mut tiny = SemanticBudget::new(limits).expect("a one-byte retained-text budget");
         let stopped = PatternProvenance::new(&live, &mut tiny);
-        assert!(stopped.lookup(&other, &site).expect("lookup").is_none());
+        assert!(
+            stopped
+                .lookup(&other, &site, &site)
+                .expect("lookup")
+                .is_none()
+        );
         assert!(stopped.take_unavailable(), "a budget stop must be flagged");
         assert!(!stopped.take_unavailable(), "the flag is taken once");
         assert!(stopped.memo.borrow().is_empty(), "a stop is not memoized");
@@ -821,7 +967,7 @@ pub(crate) mod tests {
         for site in &sites {
             assert!(
                 matches!(
-                    context.lookup(&workspace, site),
+                    context.lookup(&workspace, site, site),
                     Ok(Some(
                         WitnessStepProvenance::AdmittedPatternProjection { .. }
                     ))
@@ -882,7 +1028,7 @@ pub(crate) mod tests {
             .chain(&all_binders(&workspace, "src/other.rs"))
         {
             assert!(
-                matches!(context.lookup(&workspace, site), Ok(Some(_))),
+                matches!(context.lookup(&workspace, site, site), Ok(Some(_))),
                 "{site:?}"
             );
         }
@@ -943,9 +1089,9 @@ pub(crate) mod tests {
         };
 
         // A budget that stops the provenance lookup must not move the source
-        // to the enclosing program point the compile did not key it by.
-        // A fresh workspace, so the file's artifact is not already cached and
-        // the budget is charged.
+        // to the enclosing program point the compile did not key it by. Prepare
+        // the real artifact under a normal independent budget first: admission
+        // charges its measured retained text even when the artifact is cached.
         let (_other_project, other) =
             self::workspace(&[("Cargo.toml", CARGO), ("src/lib.rs", source)]);
         let other_snapshot = activate_poem_pack(&other);
@@ -955,9 +1101,25 @@ pub(crate) mod tests {
                 Some(other_snapshot),
             );
         let live = CancellationToken::default();
+        let other_file = ProjectFile::new(other.analyzer().project().root(), "src/lib.rs");
+        let other_artifact = {
+            let mut preparation_budget = SemanticBudget::default();
+            let mut request = SemanticRequest::new(&mut preparation_budget, &live);
+            other
+                .materialize_program_semantics(&other_file, &mut request)
+                .expect("normal-budget artifact preparation")
+                .available_value()
+                .expect("the independent workspace has semantics")
+                .clone()
+        };
+        assert!(
+            other_artifact.work().owned_text_bytes > 1,
+            "the real retained artifact must exceed the lookup's one-byte text limit: {:?}",
+            other_artifact.work()
+        );
         let mut limits = SemanticWork::default_limits();
-        limits.source_bytes = 1;
-        let mut tiny = SemanticBudget::new(limits).expect("a one-byte source budget");
+        limits.owned_text_bytes = 1;
+        let mut tiny = SemanticBudget::new(limits).expect("a one-byte retained-text budget");
         let context = PatternProvenance::new(&live, &mut tiny);
         let projected = project_output_witness(
             &other,
@@ -966,7 +1128,7 @@ pub(crate) mod tests {
             WitnessId::try_new("bifrost", "stopped").expect("witness id"),
             8,
             1 << 20,
-            Some(&binder),
+            Some((&binder, &binder)),
         )
         .expect("projection")
         .expect("a witness");
@@ -1197,7 +1359,7 @@ pub(crate) mod tests {
             import_chain_truncated,
             import_route_complete,
             ..
-        }) = context.lookup(&workspace, &site).expect("lookup")
+        }) = context.lookup(&workspace, &site, &site).expect("lookup")
         else {
             panic!("a re-exported constructor still carries provenance");
         };
@@ -1227,7 +1389,7 @@ pub(crate) mod tests {
         let context = PatternProvenance::new(&live, &mut budget);
         assert!(
             context
-                .lookup(&empty, &site)
+                .lookup(&empty, &site, &site)
                 .expect("no cancellation")
                 .is_none()
         );

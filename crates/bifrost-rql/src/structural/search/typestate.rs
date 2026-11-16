@@ -1,4 +1,5 @@
-use super::{DerivationExecutionCause, Incompleteness};
+use super::{DerivationExecutionCause, EXECUTION_DEPENDENT, Incompleteness};
+use brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict;
 use std::sync::Arc;
 
 use super::witness_projection::{
@@ -66,6 +67,8 @@ pub(super) struct TypestateQueryState {
     diagnostics: Vec<CodeQueryDiagnostic>,
     work: CodeQueryTypestateWork,
     semantic_budget_exhausted: bool,
+    /// The execution dependences these findings marked.
+    pub(super) reuse: ReuseVerdict,
 }
 
 #[derive(Debug, Clone)]
@@ -138,6 +141,7 @@ impl TypestateQueryState {
                     )
                 });
                 workspace.analyzer().mark_execution_dependent();
+                self.reuse.join_in(EXECUTION_DEPENDENT);
                 self.push_context_error(error);
                 return Vec::new();
             }
@@ -204,6 +208,7 @@ impl TypestateQueryState {
                             )
                         });
                         workspace.analyzer().mark_execution_dependent();
+                        self.reuse.join_in(EXECUTION_DEPENDENT);
                         push_deduplicated_diagnostic(
                             &mut self.diagnostics,
                             CodeQueryDiagnosticCode::TypestateProviderFailed,
@@ -245,6 +250,7 @@ impl TypestateQueryState {
                             )
                         });
                         workspace.analyzer().mark_execution_dependent();
+                        self.reuse.join_in(EXECUTION_DEPENDENT);
                         push_deduplicated_diagnostic(
                             &mut self.diagnostics,
                             CodeQueryDiagnosticCode::TypestateSolverBudgetExhausted,
@@ -284,6 +290,7 @@ impl TypestateQueryState {
                             )
                         });
                         workspace.analyzer().mark_execution_dependent();
+                        self.reuse.join_in(EXECUTION_DEPENDENT);
                         push_deduplicated_diagnostic(
                             &mut self.diagnostics,
                             CodeQueryDiagnosticCode::TypestateFindingBudgetExhausted,
@@ -316,6 +323,7 @@ impl TypestateQueryState {
                             )
                         });
                         workspace.analyzer().mark_execution_dependent();
+                        self.reuse.join_in(EXECUTION_DEPENDENT);
                         push_deduplicated_diagnostic(
                             &mut self.diagnostics,
                             CodeQueryDiagnosticCode::TypestateProviderFailed,
@@ -364,6 +372,7 @@ impl TypestateQueryState {
                         )
                     });
                     workspace.analyzer().mark_execution_dependent();
+                    self.reuse.join_in(EXECUTION_DEPENDENT);
                     push_deduplicated_diagnostic(
                         &mut self.diagnostics,
                         CodeQueryDiagnosticCode::TypestateFindingBudgetExhausted,
@@ -479,7 +488,8 @@ impl TypestateQueryState {
             QueryAnalysisContextError::ValidationBudgetExceeded { .. } => {
                 CodeQueryDiagnosticCode::SemanticBudgetExhausted
             }
-            QueryAnalysisContextError::ValueFlowRegistrationInvalid { .. } => {
+            QueryAnalysisContextError::ValueFlowRetentionUnavailable { .. }
+            | QueryAnalysisContextError::ValueFlowRegistrationInvalid { .. } => {
                 CodeQueryDiagnosticCode::ValueFlowRegistrationStale
             }
             QueryAnalysisContextError::GenerationExhausted

@@ -353,7 +353,7 @@ remain distinct from static keys, while spreads use the context-free
       "start_line": 4,
       "end_line": 4,
       "text": "__html: html",
-      "enclosing_symbol": "jsx-structure.tsx.config"
+      "enclosing_symbol": "jsx-structure.tsx.config.__html"
     }
   ],
   "truncated": false

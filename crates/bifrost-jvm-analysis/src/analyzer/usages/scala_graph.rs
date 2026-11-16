@@ -153,6 +153,7 @@ pub(crate) fn dead_code_bulk_eligibility(
     target: &CodeUnit,
     overloaded_fqns: &HashSet<String>,
     context: &ScalaDeadCodeBulkContext,
+    jvm_peer_files_present: bool,
 ) -> ScalaDeadCodeBulkEligibility {
     let Some(scala) = resolve_analyzer::<ScalaAnalyzer>(analyzer) else {
         return ScalaDeadCodeBulkEligibility::NeedsPrecise;
@@ -163,6 +164,10 @@ pub(crate) fn dead_code_bulk_eligibility(
     };
 
     match spec.kind {
+        // Java and Kotlin source can name a Scala type, but the bulk edges are
+        // Scala-only. The precise query scans those files too, so a type in a
+        // mixed JVM workspace goes there, as a Java type does when Scala is present.
+        TargetKind::Type if jvm_peer_files_present => ScalaDeadCodeBulkEligibility::NeedsPrecise,
         TargetKind::Type => ScalaDeadCodeBulkEligibility::BulkSafe,
         TargetKind::Method if spec.owner.is_none() => ScalaDeadCodeBulkEligibility::NeedsPrecise,
         TargetKind::Method if scala.signatures(target).len() > 1 => {

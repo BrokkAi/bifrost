@@ -276,27 +276,29 @@ impl<'plan> ValueFlowProblem<'plan> {
     ) -> Vec<ActiveFlow> {
         let mut generated = Vec::new();
         for source in self.plan.sources_at(point, phase) {
-            match source
-                .activation_triggers
-                .map(|list| self.plan.source_list(list))
-            {
-                None if is_zero => generated.push(ActiveFlow {
-                    source: source.id,
-                    carrier: source.carrier,
-                    uncertainty: quality_uncertainty(
+            for carrier in self.plan.source_carriers(source.carrier) {
+                match source
+                    .activation_triggers
+                    .map(|list| self.plan.source_list(list))
+                {
+                    None if is_zero => generated.push(ActiveFlow {
+                        source: source.id,
+                        carrier,
+                        uncertainty: quality_uncertainty(
+                            source.spec.proof(),
+                            source.spec.completeness(),
+                        ),
+                    }),
+                    Some(triggers) if !is_zero => generated.extend(conditional_source_flows(
+                        source.id,
+                        carrier,
+                        triggers,
+                        active.iter().copied(),
                         source.spec.proof(),
                         source.spec.completeness(),
-                    ),
-                }),
-                Some(triggers) if !is_zero => generated.extend(conditional_source_flows(
-                    source.id,
-                    source.carrier,
-                    triggers,
-                    active.iter().copied(),
-                    source.spec.proof(),
-                    source.spec.completeness(),
-                )),
-                None | Some(_) => {}
+                    )),
+                    None | Some(_) => {}
+                }
             }
         }
         generated
@@ -318,6 +320,30 @@ impl<'plan> ValueFlowProblem<'plan> {
             &active,
             meetings,
         );
+        let active = if point
+            .procedure()
+            .semantics()
+            .point(point.id())
+            .is_some_and(|point| {
+                point.events.iter().any(|event| {
+                    event.effect == crate::analyzer::semantic::SemanticEffect::MemoryInterference
+                })
+            }) {
+            active
+                .into_iter()
+                .map(|mut flow| {
+                    if self
+                        .plan
+                        .interference_may_modify_carrier(point.procedure(), flow.carrier)
+                    {
+                        flow.uncertainty = flow.uncertainty.with_semantic();
+                    }
+                    flow
+                })
+                .collect::<Vec<_>>()
+        } else {
+            active
+        };
         let mut active = active.into_iter().collect::<HashSet<_>>();
         for rule in self.plan.local_rule_views(point) {
             apply_local_rule(&mut active, rule);

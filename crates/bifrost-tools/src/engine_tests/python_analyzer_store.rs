@@ -57,6 +57,176 @@ mod python_extraction_tests {
 
     use brokk_bifrost_analysis::analyzer::store::test_support::assert_prior_parsed_blob_invalidated;
 
+    #[test]
+    fn go_and_rust_surface_estimates_bound_published_rows() {
+        use brokk_bifrost_core::analyzer::model::Language;
+        use brokk_bifrost_go_analysis::analyzer::go::adapter::GoAdapter;
+
+        for (language, path, source) in [
+            (
+                Language::Go,
+                "api.go",
+                r#"package api
+import "net/http"
+type Alias = http.Client
+type Server struct { Client *Alias }
+func (s *Server) Serve() *Alias { return s.Client }
+"#,
+            ),
+            (
+                Language::Rust,
+                "api.rs",
+                r#"#![allow(dead_code)]
+use std::collections::HashMap;
+pub mod nested { pub use std::fmt::Debug; pub struct Item; }
+pub trait API { fn run(&self); }
+pub struct Server(pub HashMap<String, usize>);
+impl API for Server { fn run(&self) {} }
+impl Server { pub fn new() -> Self { Self(HashMap::new()) } }
+macro_rules! item { () => { pub struct Generated; } }
+item!();
+"#,
+            ),
+        ] {
+            let fixture = crate::inline_project::InlineTestProject::with_language(language)
+                .file(path, source)
+                .build();
+            let file = fixture.file(path);
+            fn prepare<
+                A: brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::LanguageAdapter,
+            >(
+                adapter: &A,
+                file: &brokk_bifrost_core::analyzer::model::ProjectFile,
+                language: &str,
+            ) -> brokk_bifrost_analysis::analyzer::store::PreparedParsedBlob {
+                let state = Arc::new(parse_state(adapter, file));
+                let oid = oid_for(state.source.as_bytes());
+                AnalyzerStore::prepare_parsed_blob(
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, language),
+                    GenerationId::BOOTSTRAP,
+                    adapter,
+                    state,
+                )
+                .unwrap()
+            }
+            let blob = match language {
+                Language::Go => prepare(&GoAdapter, &file, "go"),
+                Language::Rust => prepare(&RustAdapter::for_tests(), &file, "rust"),
+                _ => unreachable!(),
+            };
+            let estimate = blob.surface_logical_rows_for_test();
+            let base_rows = blob.logical_rows();
+            let store = AnalyzerStore::open_ephemeral().unwrap();
+            let (outcomes, stats) =
+                store.persist_prepared_blobs(vec![blob], PersistBatchTargets::PRODUCTION);
+            assert!(
+                outcomes.iter().all(|outcome| outcome.error.is_none()),
+                "{outcomes:?}"
+            );
+            let actual: usize = store.conn.lock().unwrap().query_row(
+                "SELECT (SELECT count(*) FROM surface_sets) + (SELECT count(*) FROM surface_ids)",
+                [], |row| row.get(0),
+            ).unwrap();
+            assert!(actual > 1, "{language:?} must publish IDs");
+            assert!(
+                estimate >= actual,
+                "{language:?}: estimate={estimate}, actual={actual}"
+            );
+            assert!(
+                estimate < base_rows,
+                "{language:?}: do not charge the whole base census"
+            );
+            assert_eq!(stats.logical_rows, base_rows + actual);
+            assert_eq!(stats.failed_transaction_attempts, 0);
+        }
+    }
+
+    #[brokk_bifrost_test_macros::hardwon(
+        "#13104: omitted surface rows overflowed grouping only after writing and replayed the batch"
+    )]
+    #[test]
+    fn surface_rows_split_prepared_batches_before_writing() {
+        let fixture = crate::inline_project::InlineTestProject::with_language(
+            brokk_bifrost_core::analyzer::model::Language::Python,
+        )
+        .file(
+            "a.py",
+            "import os\nanswer = 42\ndef f():\n    import sys\n    return sys.version\n",
+        )
+        .file("b.py", "from os import path\nvalue = 7\n")
+        .build();
+        let prepare = || {
+            ["a.py", "b.py"]
+                .into_iter()
+                .map(|path| {
+                    let file = fixture.file(path);
+                    let adapter = PythonAdapter::for_test_file(&file);
+                    let state = Arc::new(parse_state(&adapter, &file));
+                    let oid = oid_for(state.source.as_bytes());
+                    AnalyzerStore::prepare_parsed_blob(
+                        &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "python"),
+                        GenerationId::BOOTSTRAP,
+                        &adapter,
+                        state,
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>()
+        };
+        let blobs = prepare();
+        let non_surface_rows = blobs.iter().map(|blob| blob.logical_rows()).sum::<usize>();
+        let non_surface_bytes = blobs.iter().map(|blob| blob.payload_bytes()).sum::<usize>();
+        // An unconstrained publication measures the independent persisted cost.
+        let control = AnalyzerStore::open_ephemeral().unwrap();
+        let (outcomes, control_stats) =
+            control.persist_prepared_blobs(prepare(), PersistBatchTargets::PRODUCTION);
+        assert!(outcomes.iter().all(|outcome| outcome.error.is_none()));
+        assert_eq!(control_stats.transactions, 1);
+        assert_eq!(control_stats.failed_transaction_attempts, 0);
+        let surface_rows: usize =
+            {
+                let conn = control.conn.lock().unwrap();
+                conn.query_row(
+                "SELECT (SELECT count(*) FROM surface_sets) + (SELECT count(*) FROM surface_ids)",
+                [], |row| row.get(0),
+            ).unwrap()
+            };
+        assert!(
+            surface_rows > 2,
+            "fixture must publish surface IDs as well as sets"
+        );
+        assert_eq!(control_stats.logical_rows, non_surface_rows + surface_rows);
+        assert!(control_stats.payload_bytes > non_surface_bytes);
+        for targets in [
+            PersistBatchTargets {
+                max_blobs: usize::MAX,
+                max_rows: non_surface_rows,
+                max_payload_bytes: usize::MAX,
+            },
+            PersistBatchTargets {
+                max_blobs: usize::MAX,
+                max_rows: usize::MAX,
+                max_payload_bytes: non_surface_bytes,
+            },
+        ] {
+            let store = AnalyzerStore::open_ephemeral().unwrap();
+            let (outcomes, stats) = store.persist_prepared_blobs(prepare(), targets);
+            assert!(
+                outcomes.iter().all(|outcome| outcome.error.is_none()),
+                "{outcomes:?}"
+            );
+            assert_eq!(stats.transactions, 2, "{targets:?}");
+            assert_eq!(
+                stats.failed_transaction_attempts, 0,
+                "no rollback or replay: {targets:?}"
+            );
+            assert_eq!(store.parsed_blob_transaction_starts_for_test(), 2);
+            assert_eq!(stats.committed_blobs, 2);
+            assert_eq!(stats.logical_rows, control_stats.logical_rows);
+            assert_eq!(stats.payload_bytes, control_stats.payload_bytes);
+        }
+    }
+
     #[brokk_bifrost_test_macros::hardwon(
         "4b3f6065fca9: batched parsed-blob membership must preserve mixed-language and incomplete-key semantics"
     )]

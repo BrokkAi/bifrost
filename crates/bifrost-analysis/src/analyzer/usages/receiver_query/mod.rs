@@ -5,6 +5,7 @@ use crate::analyzer::languages::{
     BoundedReceiverQuery, LanguageSupport, ReceiverFactContext, StructuralReceiverResolver,
     language_support_for_hook,
 };
+use crate::analyzer::reuse_verdict::{CarriesReuseVerdict, ExecutionCause, ReuseVerdict};
 use crate::analyzer::semantic::{
     AbstractObjectIdentity, CandidateCoverage, OracleLimitValues, OracleLimits, SemanticBudget,
     SemanticBudgetDimension, SemanticBudgetExceeded, SemanticCapability, SemanticOutcome,
@@ -244,7 +245,11 @@ impl ReceiverQueryReport {
         };
     }
 
-    pub fn cap_possible_candidates(&mut self, limit: usize) {
+    /// Cap the possible candidates at the ledger's remaining target
+    /// allowance. A truncation joins the ledger's verdict: the cap, not the
+    /// content, decided which candidates remain.
+    pub fn cap_possible_candidates(&mut self, ledger: &mut ReceiverWorkLedger) {
+        let limit = ledger.remaining_budget().max_targets;
         let truncated = match &mut self.analysis {
             ReceiverQueryAnalysis::Values(ReceiverAnalysisOutcome::Incomplete { candidates }) => {
                 let truncated = candidates.len() > limit;
@@ -263,6 +268,7 @@ impl ReceiverQueryReport {
         if truncated {
             self.candidates_truncated = true;
             brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
+            ledger.join(ReuseVerdict::ExecutionDependent(ExecutionCause::Other));
         }
     }
 }
@@ -467,6 +473,15 @@ impl SemanticReceiverEvidence {
 pub struct ReceiverWorkLedger {
     budget: ReceiverAnalysisBudget,
     work: ReceiverAnalysisWork,
+    /// Every limit this query refused. The service joins it into its capture
+    /// when the query ends.
+    reuse: ReuseVerdict,
+}
+
+impl CarriesReuseVerdict for ReceiverWorkLedger {
+    fn reuse_verdict(&self) -> ReuseVerdict {
+        self.reuse
+    }
 }
 
 impl ReceiverWorkLedger {
@@ -475,6 +490,27 @@ impl ReceiverWorkLedger {
         Self {
             budget,
             work: ReceiverAnalysisWork::default(),
+            reuse: ReuseVerdict::Content,
+        }
+    }
+
+    /// Join the verdict of a bounded step this query consumed.
+    #[doc(hidden)]
+    pub fn join(&mut self, verdict: ReuseVerdict) {
+        self.reuse.join_in(verdict);
+    }
+
+    /// Whether `used` more units fit in `remaining`. A refusal joins this
+    /// query's verdict.
+    fn fits(&mut self, used: usize, remaining: usize) -> bool {
+        match brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(used, remaining)
+            .try_allow(0)
+        {
+            Ok(()) => true,
+            Err(refused) => {
+                self.join(refused.reuse_verdict());
+                false
+            }
         }
     }
 
@@ -491,9 +527,7 @@ impl ReceiverWorkLedger {
     pub fn charge_setup(&mut self, nodes: usize) -> Result<(), ReceiverBudgetLimit> {
         let remaining = self.remaining_budget().max_scope_nodes;
         self.work.setup_nodes = self.work.setup_nodes.saturating_add(nodes.min(remaining));
-        if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(nodes, remaining)
-            .allows(0)
-        {
+        if !self.fits(nodes, remaining) {
             Err(ReceiverBudgetLimit::ScopeNodes)
         } else {
             Ok(())
@@ -503,24 +537,10 @@ impl ReceiverWorkLedger {
     fn charge_analysis(&mut self, work: ReceiverAnalysisWork) -> Result<(), ReceiverBudgetLimit> {
         debug_assert_eq!(work.setup_nodes, 0);
         let remaining = self.remaining_budget();
-        let scope_exceeded =
-            !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
-                work.scope_nodes,
-                remaining.max_scope_nodes,
-            )
-            .allows(0);
+        let scope_exceeded = !self.fits(work.scope_nodes, remaining.max_scope_nodes);
         let summaries_exceeded =
-            !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
-                work.summary_expansions,
-                remaining.max_summary_expansions,
-            )
-            .allows(0);
-        let rounds_exceeded =
-            !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
-                work.resolution_rounds,
-                remaining.max_resolution_rounds,
-            )
-            .allows(0);
+            !self.fits(work.summary_expansions, remaining.max_summary_expansions);
+        let rounds_exceeded = !self.fits(work.resolution_rounds, remaining.max_resolution_rounds);
         let hierarchy_exceeded = work.hierarchy_order_steps > remaining.max_hierarchy_order_work;
         self.work.scope_nodes = self
             .work
@@ -577,6 +597,7 @@ pub fn charge_bounded_resolution<T>(
     resolution: BoundedResolution<T>,
 ) -> Result<CompatibilityOutcome<T>, ReceiverQueryError> {
     let aggregate_limit = ledger.charge_analysis(resolution.work()).err();
+    ledger.join(resolution.reuse_verdict());
     match resolution {
         BoundedResolution::Complete { value, .. } => Ok(match aggregate_limit {
             Some(limit) => CompatibilityOutcome::Exceeded(limit),
@@ -668,9 +689,6 @@ impl<'a> ReceiverQueryService<'a> {
             let mut retained = self.receiver_request.borrow_mut();
             if let Some(request) = retained.as_mut() {
                 let result = request.resolve_type(query);
-                if request.reader_excludes_store_access() {
-                    *retained = None;
-                }
                 return result;
             }
         }
@@ -691,9 +709,6 @@ impl<'a> ReceiverQueryService<'a> {
             let mut retained = self.receiver_request.borrow_mut();
             if let Some(request) = retained.as_mut() {
                 let result = request.resolve_definition(query);
-                if request.reader_excludes_store_access() {
-                    *retained = None;
-                }
                 return result;
             }
         }
@@ -769,40 +784,57 @@ impl<'a> ReceiverQueryService<'a> {
         cancellation: Option<&CancellationToken>,
     ) -> Result<ReceiverQueryReport, ReceiverQueryError> {
         let previous = self.reads.take();
-        let (result, reads) = super::common::capture_memo_reads(self.analyzer, || {
-            let selected_variant = self.analyzer.selected_parse_variant(file).ok_or_else(|| {
-                ReceiverQueryError::SemanticProvider(SemanticProviderError::internal(
-                    "selected parse variant unreadable",
-                ))
-            })?;
-            if let Some(previous) = previous {
-                crate::analyzer::usages::common::replay_memo_reads(&previous, self.analyzer);
-            }
-            if crate::analyzer::read_attribution_records_reads(|| {
-                self.analyzer.read_ledger_attached()
-            }) {
-                if let Some(blob) = self.analyzer.indexed_blob_oid(file) {
-                    self.analyzer.record_read(crate::analyzer::ReadKey::file(
-                        file.language(),
-                        crate::path_utils::rel_path_string(file),
-                        blob,
-                        selected_variant,
-                    ));
-                } else {
-                    self.analyzer.record_unattributed_read();
+        let mut service = self;
+        let (result, reads) = super::common::capture_mutable_memo_reads(
+            super::common::QueryMemoOwner::ReceiverQuery,
+            self.analyzer,
+            &mut service,
+            previous.as_ref(),
+            |service| {
+                service.prepared_files.borrow_mut().clear();
+                service.prepared_java_files.borrow_mut().clear();
+                service.prepared_structural_files.borrow_mut().clear();
+                service.receiver_request.borrow_mut().take();
+                service.definitions.discard_failed_request_state();
+            },
+            |_| {
+                let selected_variant =
+                    self.analyzer.selected_parse_variant(file).ok_or_else(|| {
+                        ReceiverQueryError::SemanticProvider(SemanticProviderError::internal(
+                            "selected parse variant unreadable",
+                        ))
+                    })?;
+                if crate::analyzer::read_attribution_records_reads(|| {
+                    self.analyzer.read_ledger_attached()
+                }) {
+                    if let Some(blob) = self.analyzer.indexed_blob_oid(file) {
+                        self.analyzer.record_read(crate::analyzer::ReadKey::file(
+                            file.language(),
+                            crate::path_utils::rel_path_string(file),
+                            blob,
+                            selected_variant,
+                        ));
+                    } else {
+                        self.analyzer.record_unattributed_read();
+                    }
                 }
-            }
-            self.analyze_with_prepared_inputs(
-                operation,
-                file,
-                range,
-                input,
-                structural_facts,
-                budget,
-                cancellation,
-            )
-        });
-        *self.reads.borrow_mut() = Some(reads);
+                let mut ledger = ReceiverWorkLedger::new(budget);
+                let report = self.analyze_with_prepared_inputs(
+                    operation,
+                    file,
+                    range,
+                    input,
+                    structural_facts,
+                    &mut ledger,
+                    cancellation,
+                );
+                // A report cannot carry a verdict; the query's refusals join
+                // this capture, where their ambient marks went.
+                self.analyzer.join_reuse_verdict(ledger.reuse_verdict());
+                report
+            },
+        );
+        *self.reads.borrow_mut() = reads;
         result
     }
 
@@ -814,7 +846,7 @@ impl<'a> ReceiverQueryService<'a> {
         range: Range,
         input: ReceiverQueryInput,
         structural_facts: Option<&Arc<FileFacts>>,
-        budget: ReceiverAnalysisBudget,
+        ledger: &mut ReceiverWorkLedger,
         cancellation: Option<&CancellationToken>,
     ) -> Result<ReceiverQueryReport, ReceiverQueryError> {
         check_cancelled(cancellation)?;
@@ -830,7 +862,7 @@ impl<'a> ReceiverQueryService<'a> {
                 range,
                 input,
                 structural_facts,
-                budget,
+                ledger,
                 cancellation,
             );
         }
@@ -843,7 +875,7 @@ impl<'a> ReceiverQueryService<'a> {
                     file,
                     range,
                     input,
-                    budget,
+                    ledger,
                     cancellation,
                     indexed_source.clone(),
                 )
@@ -873,7 +905,6 @@ impl<'a> ReceiverQueryService<'a> {
                 None,
             ));
         };
-        let mut ledger = ReceiverWorkLedger::new(budget);
         if !self.prepared_files.borrow().contains_key(file) {
             match factory.prepare_file(&ReceiverFileCtx {
                 file,
@@ -966,7 +997,7 @@ impl<'a> ReceiverQueryService<'a> {
                     ledger.remaining_budget(),
                     cancellation,
                 )?;
-                if let Some(limit) = charge_semantic_gate(&mut ledger, &gate) {
+                if let Some(limit) = charge_semantic_gate(ledger, &gate) {
                     return Ok(budget_report(
                         operation,
                         site(
@@ -986,7 +1017,7 @@ impl<'a> ReceiverQueryService<'a> {
                     self.analyzer,
                     values_report(operation, file, language, input_node, source, analysis),
                     gate,
-                    &mut ledger,
+                    ledger,
                 )
             }
             ReceiverQueryOperation::ReceiverTargets => {
@@ -1017,7 +1048,7 @@ impl<'a> ReceiverQueryService<'a> {
                     ledger.remaining_budget(),
                     cancellation,
                 )?;
-                if let Some(limit) = charge_semantic_gate(&mut ledger, &gate) {
+                if let Some(limit) = charge_semantic_gate(ledger, &gate) {
                     return Ok(budget_report(
                         operation,
                         site(
@@ -1043,7 +1074,7 @@ impl<'a> ReceiverQueryService<'a> {
                         file,
                         language,
                         dispatch_range,
-                        &mut ledger,
+                        ledger,
                         cancellation,
                     )?;
                     let modeled_call_result = match modeled_call_result {
@@ -1069,7 +1100,7 @@ impl<'a> ReceiverQueryService<'a> {
                             type_outcome.status,
                             model_values,
                         ));
-                        return Ok(finalize_exact_modeled_report(report, &mut ledger));
+                        return Ok(finalize_exact_modeled_report(report, ledger));
                     }
                     let reference_site =
                         structural_reference_site(file, source, node_range(receiver));
@@ -1089,7 +1120,7 @@ impl<'a> ReceiverQueryService<'a> {
                             },
                         )
                         .expect("JS/TS supports bounded type resolution");
-                    let type_outcome = match charge_bounded_resolution(&mut ledger, resolution)? {
+                    let type_outcome = match charge_bounded_resolution(ledger, resolution)? {
                         CompatibilityOutcome::Complete(outcome) => Some(outcome),
                         CompatibilityOutcome::Exceeded(limit) => {
                             return Ok(budget_report(operation, report.site, ledger.work(), limit));
@@ -1128,7 +1159,7 @@ impl<'a> ReceiverQueryService<'a> {
                                 &[],
                                 false,
                                 cancellation,
-                                &mut ledger,
+                                ledger,
                             )?;
                             let projection = match projection {
                                 CompatibilityOutcome::Complete(projection) => projection,
@@ -1165,7 +1196,7 @@ impl<'a> ReceiverQueryService<'a> {
                         }
                     }
                 }
-                finalize_legacy_report(self.analyzer, report, gate, &mut ledger)
+                finalize_legacy_report(self.analyzer, report, gate, ledger)
             }
             ReceiverQueryOperation::MemberTargets => {
                 let Some(member_expression) = provider.member_expression_at_site(input_node) else {
@@ -1233,7 +1264,7 @@ impl<'a> ReceiverQueryService<'a> {
                     ledger.remaining_budget(),
                     cancellation,
                 )?;
-                if let Some(limit) = charge_semantic_gate(&mut ledger, &gate) {
+                if let Some(limit) = charge_semantic_gate(ledger, &gate) {
                     return Ok(budget_report(operation, gate_site, ledger.work(), limit));
                 }
                 let member_report = provider
@@ -1262,7 +1293,7 @@ impl<'a> ReceiverQueryService<'a> {
                         },
                     )
                     .expect("JS/TS supports bounded type resolution");
-                let type_outcome = match charge_bounded_resolution(&mut ledger, resolution)? {
+                let type_outcome = match charge_bounded_resolution(ledger, resolution)? {
                     CompatibilityOutcome::Complete(outcome) => outcome,
                     CompatibilityOutcome::Exceeded(limit) => {
                         return Ok(budget_report(operation, gate_site, ledger.work(), limit));
@@ -1329,7 +1360,7 @@ impl<'a> ReceiverQueryService<'a> {
                         points_to: None,
                     },
                     gate,
-                    &mut ledger,
+                    ledger,
                 )
             }
         };
@@ -1429,7 +1460,7 @@ impl<'a> ReceiverQueryService<'a> {
         let Some(workspace) = self.workspace else {
             return Ok(CompatibilityOutcome::Complete(None));
         };
-        let Some(overlay) = self.analyzer.semantic_model_overlay() else {
+        let Some(overlay) = self.analyzer.semantic_model_overlay_read().published() else {
             return Ok(CompatibilityOutcome::Complete(None));
         };
         let cancellation = cancellation.cloned().unwrap_or_default();
@@ -1562,7 +1593,7 @@ impl<'a> ReceiverQueryService<'a> {
         range: Range,
         input: ReceiverQueryInput,
         structural_facts: Option<&Arc<FileFacts>>,
-        budget: ReceiverAnalysisBudget,
+        ledger: &mut ReceiverWorkLedger,
         cancellation: Option<&CancellationToken>,
     ) -> Result<ReceiverQueryReport, ReceiverQueryError> {
         let Some(workspace) = self.workspace else {
@@ -1576,7 +1607,6 @@ impl<'a> ReceiverQueryService<'a> {
             ));
         };
 
-        let mut ledger = ReceiverWorkLedger::new(budget);
         let Some(facts) = structural_facts else {
             return Ok(unsupported_report(
                 operation,
@@ -1655,7 +1685,8 @@ impl<'a> ReceiverQueryService<'a> {
                                 return Ok(report);
                             }
                         }
-                        StructuralSyntaxLimitedOutcome::Exceeded { .. } => {
+                        exceeded @ StructuralSyntaxLimitedOutcome::Exceeded { .. } => {
+                            ledger.join(exceeded.reuse_verdict());
                             let mut report = unsupported_report(
                                 operation,
                                 file,
@@ -1693,7 +1724,11 @@ impl<'a> ReceiverQueryService<'a> {
                         },
                     );
                 }
-                ReceiverSiteIndexBuild::Exceeded { inspected_work } => {
+                ReceiverSiteIndexBuild::Exceeded {
+                    inspected_work,
+                    refused,
+                } => {
+                    ledger.join(refused.reuse_verdict());
                     let _ = ledger.charge_setup(inspected_work);
                     return Ok(setup_budget_report(
                         operation,
@@ -1741,7 +1776,11 @@ impl<'a> ReceiverQueryService<'a> {
                     .expect("completed site selection fits its supplied receiver budget");
                 site
             }
-            ReceiverSiteSelection::Exceeded { inspected_sites } => {
+            ReceiverSiteSelection::Exceeded {
+                inspected_sites,
+                refused,
+            } => {
+                ledger.join(refused.reuse_verdict());
                 let _ = ledger.charge_setup(inspected_sites);
                 return Ok(setup_budget_report(
                     operation,
@@ -1809,7 +1848,7 @@ impl<'a> ReceiverQueryService<'a> {
         let fallback_cancellation = CancellationToken::default();
         let cancellation = cancellation.unwrap_or(&fallback_cancellation);
         check_cancelled(Some(cancellation))?;
-        if let Err(limit) = charge_scope_step(&mut ledger) {
+        if let Err(limit) = charge_scope_step(ledger) {
             return Ok(budget_report(operation, report_site, ledger.work(), limit));
         }
 
@@ -1827,7 +1866,7 @@ impl<'a> ReceiverQueryService<'a> {
                 cancellation: Some(cancellation),
             },
         );
-        let type_outcome = match charge_bounded_resolution(&mut ledger, resolution)? {
+        let type_outcome = match charge_bounded_resolution(ledger, resolution)? {
             CompatibilityOutcome::Complete(outcome) => outcome,
             CompatibilityOutcome::Exceeded(limit) => {
                 return Ok(budget_report(operation, report_site, ledger.work(), limit));
@@ -1850,24 +1889,21 @@ impl<'a> ReceiverQueryService<'a> {
         let static_type_resolved = type_outcome.status == TypeLookupStatus::Resolved;
 
         if operation != ReceiverQueryOperation::MemberTargets && static_type_reference {
-            let projection = match project_static_receiver_values(
-                &type_outcome,
-                Some(cancellation),
-                &mut ledger,
-            )? {
-                CompatibilityOutcome::Complete(projection) => projection,
-                CompatibilityOutcome::Exceeded(limit) => {
-                    return Ok(budget_report(operation, report_site, ledger.work(), limit));
-                }
-                CompatibilityOutcome::Unavailable(reason) => {
-                    return Ok(unavailable_report(
-                        operation,
-                        report_site,
-                        ledger.work(),
-                        reason,
-                    ));
-                }
-            };
+            let projection =
+                match project_static_receiver_values(&type_outcome, Some(cancellation), ledger)? {
+                    CompatibilityOutcome::Complete(projection) => projection,
+                    CompatibilityOutcome::Exceeded(limit) => {
+                        return Ok(budget_report(operation, report_site, ledger.work(), limit));
+                    }
+                    CompatibilityOutcome::Unavailable(reason) => {
+                        return Ok(unavailable_report(
+                            operation,
+                            report_site,
+                            ledger.work(),
+                            reason,
+                        ));
+                    }
+                };
             let mut analysis = ReceiverQueryAnalysis::Values(receiver_type_outcome(
                 type_outcome.status,
                 projection.values,
@@ -1887,7 +1923,7 @@ impl<'a> ReceiverQueryService<'a> {
                 possible_candidates_suppressed: false,
                 points_to: None,
             };
-            report.cap_possible_candidates(ledger.remaining_budget().max_targets);
+            report.cap_possible_candidates(ledger);
             return Ok(report);
         }
 
@@ -1902,7 +1938,7 @@ impl<'a> ReceiverQueryService<'a> {
             })
             .transpose()?;
         if let Some(semantic) = &semantic
-            && let Some(limit) = charge_semantic_gate(&mut ledger, semantic)
+            && let Some(limit) = charge_semantic_gate(ledger, semantic)
         {
             return Ok(budget_report(operation, report_site, ledger.work(), limit));
         }
@@ -1944,7 +1980,7 @@ impl<'a> ReceiverQueryService<'a> {
                     cancellation: Some(cancellation),
                 },
             );
-            let outcome = match charge_bounded_resolution(&mut ledger, resolution)? {
+            let outcome = match charge_bounded_resolution(ledger, resolution)? {
                 CompatibilityOutcome::Complete(outcome) => outcome,
                 CompatibilityOutcome::Exceeded(limit) => {
                     return Ok(budget_report(operation, report_site, ledger.work(), limit));
@@ -1995,7 +2031,7 @@ impl<'a> ReceiverQueryService<'a> {
                     language,
                     &analysis,
                     Some(cancellation),
-                    &mut ledger,
+                    ledger,
                 )? {
                     CompatibilityOutcome::Complete(supports_precise) => supports_precise,
                     CompatibilityOutcome::Exceeded(limit) => {
@@ -2030,7 +2066,7 @@ impl<'a> ReceiverQueryService<'a> {
                 possible_candidates_suppressed: false,
                 points_to: None,
             };
-            report.cap_possible_candidates(ledger.remaining_budget().max_targets);
+            report.cap_possible_candidates(ledger);
             return Ok(report);
         }
 
@@ -2041,7 +2077,7 @@ impl<'a> ReceiverQueryService<'a> {
             query_range.start_byte,
             query_range.end_byte,
             Some(cancellation),
-            &mut ledger,
+            ledger,
         )? {
             CompatibilityOutcome::Complete(node) => node,
             CompatibilityOutcome::Exceeded(limit) => {
@@ -2074,7 +2110,7 @@ impl<'a> ReceiverQueryService<'a> {
                     cancellation: Some(cancellation),
                 },
             );
-            match charge_bounded_resolution(&mut ledger, resolution)? {
+            match charge_bounded_resolution(ledger, resolution)? {
                 CompatibilityOutcome::Complete(outcome)
                     if outcome.status == DefinitionLookupStatus::Resolved
                         && !outcome.definitions.is_empty()
@@ -2112,7 +2148,7 @@ impl<'a> ReceiverQueryService<'a> {
             &factories,
             false,
             Some(cancellation),
-            &mut ledger,
+            ledger,
         )?;
         let projection = match values {
             CompatibilityOutcome::Complete(projection) => projection,
@@ -2310,7 +2346,7 @@ fn finalize_legacy_report(
 ) -> ReceiverQueryReport {
     let compatibility_limit = ledger.charge_analysis(report.work).err();
     let mut report = report;
-    report.cap_possible_candidates(ledger.remaining_budget().max_targets);
+    report.cap_possible_candidates(ledger);
     let mut report = apply_semantic_gate(analyzer, report, gate);
     if let Some(limit) = compatibility_limit {
         report.note_possible_candidates_suppressed();
@@ -2457,7 +2493,7 @@ fn legacy_external_model_identity_is_precise(
     let ReceiverQueryAnalysis::Values(ReceiverAnalysisOutcome::Precise(values)) = analysis else {
         return false;
     };
-    let Some(overlay) = analyzer.semantic_model_overlay() else {
+    let Some(overlay) = analyzer.semantic_model_overlay_read().published() else {
         return false;
     };
     !values.is_empty()
@@ -2492,7 +2528,7 @@ fn legacy_exact_modeled_receiver_proof(
         return None;
     };
     let model_id = ty.semantic_model_id.as_deref()?;
-    let overlay = analyzer.semantic_model_overlay()?;
+    let overlay = analyzer.semantic_model_overlay_read().published()?;
     let owners = overlay.symbols_with_id(model_id);
     if matches!(owners.disposition, SemanticModelOverlayDisposition::Open(_)) {
         return None;
@@ -3385,7 +3421,8 @@ pub fn definition_outcome(
             DefinitionLookupStatus::Unavailable => ReceiverAnalysisOutcome::Unsupported {
                 reason: "canonical_facts_unavailable",
             },
-            DefinitionLookupStatus::NoDefinition
+            DefinitionLookupStatus::NotAReference
+            | DefinitionLookupStatus::NoDefinition
             | DefinitionLookupStatus::UnresolvableImportBoundary
             | DefinitionLookupStatus::Incomplete
             | DefinitionLookupStatus::Cancelled
@@ -3455,7 +3492,7 @@ fn resolved_member_targets(
         let Some(receiver_proof) = receiver_proof else {
             return ReceiverAnalysisOutcome::Unknown;
         };
-        let Some(overlay) = analyzer.semantic_model_overlay() else {
+        let Some(overlay) = analyzer.semantic_model_overlay_read().published() else {
             return ReceiverAnalysisOutcome::Unsupported {
                 reason: "semantic_model_member_unavailable",
             };
@@ -4074,3 +4111,8 @@ pub mod test_support;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod tests;
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+#[path = "owner_memo_tests.rs"]
+pub mod owner_memo_tests;

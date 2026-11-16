@@ -17,6 +17,38 @@ use rayon::prelude::*;
 use std::collections::{BTreeSet, VecDeque};
 use tree_sitter::Node;
 
+/// The completeness of the source inventory a [`JsTsUsageIndex`] was built
+/// under: a copy of the inventory's own fact and typed cause, not a second flag.
+///
+/// An index over an incomplete inventory resolves what it holds, so its positive
+/// answers stand; it can prove no absence, because a source it was not given may
+/// hold the missing import target, caller or ancestor.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub enum IndexInventory {
+    #[default]
+    Complete,
+    Incomplete(Vec<brokk_bifrost_core::analyzer::query_batch::QueryIncompleteReason>),
+}
+
+impl IndexInventory {
+    pub fn is_complete(&self) -> bool {
+        matches!(self, Self::Complete)
+    }
+
+    fn merge(&mut self, other: &Self) {
+        if let Self::Incomplete(more) = other {
+            match self {
+                Self::Complete => *self = other.clone(),
+                Self::Incomplete(reasons) => {
+                    reasons.extend(more.iter().cloned());
+                    reasons.sort();
+                    reasons.dedup();
+                }
+            }
+        }
+    }
+}
+
 /// JS/TS resolution maps for one language: a re-export + importer index built from the
 /// per-file export/import indices plus analyzer-level module resolution
 /// (`resolve_js_ts_module_specifier` + tsconfig aliases), so the forward scan resolves
@@ -31,12 +63,16 @@ pub struct JsTsUsageIndex {
     pub star_reexports: HashMap<ProjectFile, Vec<ProjectFile>>,
     pub direct_star_reexports: HashMap<ProjectFile, Vec<ProjectFile>>,
     pub importer_reverse: HashMap<ProjectFile, Vec<ImportEdge>>,
+    /// The inventory this index was built under.
+    pub inventory: IndexInventory,
 }
 
 /// Build the cacheable [`JsTsUsageIndex`] for one language from the published
 /// per-file source facts, then build the re-export + importer maps. Missing
 /// publication aborts the build; the graph never reparses a file to replace an
-/// unavailable source fact.
+/// unavailable source fact. An incomplete source inventory does not abort it: the
+/// index records the inventory's completion for the consumers that make absence
+/// claims, and the usage graph builder refuses it (#2744).
 pub fn build_jsts_usage_index(
     analyzer: &dyn JsTsSource,
     aliases: &AliasResolver,
@@ -58,9 +94,12 @@ pub fn build_jsts_usage_index_with_cancellation(
     parallel: bool,
     cancellation: Option<&CancellationToken>,
 ) -> Option<JsTsUsageIndex> {
-    let files = collect_jsts_files(analyzer, language)?;
+    let (files, inventory) = collect_jsts_files(analyzer, language);
     if tree_sitter_language_for(language).is_none() {
-        return Some(JsTsUsageIndex::default());
+        return Some(JsTsUsageIndex {
+            inventory,
+            ..JsTsUsageIndex::default()
+        });
     }
 
     let compute_file = |file: &ProjectFile| {
@@ -130,6 +169,7 @@ pub fn build_jsts_usage_index_with_cancellation(
         direct_star_reexports,
         importer_reverse,
         binders_by_file,
+        inventory,
     })
 }
 
@@ -354,9 +394,11 @@ pub fn combine_jsts_usage_indices<'a>(
 ) -> JsTsUsageIndex {
     let mut exports_by_file = HashMap::default();
     let mut binders_by_file = HashMap::default();
+    let mut inventory = IndexInventory::Complete;
     for index in indices {
         exports_by_file.extend(index.exports_by_file.clone());
         binders_by_file.extend(index.binders_by_file.clone());
+        inventory.merge(&index.inventory);
     }
 
     let resolve = |file: &ProjectFile, module_specifier: &str| {
@@ -401,6 +443,7 @@ pub fn combine_jsts_usage_indices<'a>(
         star_reexports,
         direct_star_reexports,
         importer_reverse,
+        inventory,
     }
 }
 
@@ -706,14 +749,21 @@ fn export_names_for_file(
     names
 }
 
+/// The language's source files and the completeness of the inventory they came
+/// from. An incomplete inventory still yields the files it lists.
 pub fn collect_jsts_files(
     analyzer: &dyn JsTsSource,
     language: Language,
-) -> Option<Vec<ProjectFile>> {
-    let inventory = analyzer.source_file_inventory();
-    if !inventory.complete {
-        return None;
-    }
+) -> (Vec<ProjectFile>, IndexInventory) {
+    let mut inventory = analyzer.source_file_inventory();
+    // Delegates and parallel walks can repeat a cause in any order.
+    inventory.incomplete_reasons.sort();
+    inventory.incomplete_reasons.dedup();
+    let completion = if inventory.complete {
+        IndexInventory::Complete
+    } else {
+        IndexInventory::Incomplete(inventory.incomplete_reasons)
+    };
     let mut result: Vec<_> = inventory
         .rows
         .into_iter()
@@ -721,7 +771,7 @@ pub fn collect_jsts_files(
         .collect();
     result.sort();
     result.dedup();
-    Some(result)
+    (result, completion)
 }
 
 /// The default tree-sitter grammar for a JS/TS language, or `None` for anything else.

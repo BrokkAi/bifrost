@@ -365,6 +365,8 @@ pub enum ResolutionBinderKind {
 /// The lexical interval in which one declaration participates in lookup.
 /// For Alias, `declaration` identifies the alias site and its Alias identifier;
 /// the target remains the only declaration and keeps its original scope.
+/// Repeated facts for one declaration describe disjoint activation intervals,
+/// in deterministic interval order. Interval zero retains its legacy identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ResolutionBinderFact {
     pub declaration: ResolutionSiteId,
@@ -770,6 +772,40 @@ labelled_enum! {
     }
 }
 
+labelled_enum! {
+    ResolutionBinaryOperator, ALL_RESOLUTION_BINARY_OPERATORS {
+        Add => "add",
+        Sub => "sub",
+        Mul => "mul",
+        Div => "div",
+        Rem => "rem",
+        BitAnd => "bit_and",
+        BitOr => "bit_or",
+        BitXor => "bit_xor",
+        Shl => "shl",
+        Shr => "shr",
+    }
+}
+
+labelled_enum! {
+    ResolutionBinaryReference, ALL_RESOLUTION_BINARY_REFERENCES {
+        Unknown => "unknown",
+        Shared => "shared",
+        Mutable => "mutable",
+    }
+}
+
+/// A runtime binary operation. Operand order is semantic; only the requesting
+/// language provider can prove the result type from the two operand values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResolutionBinaryOperationFact {
+    pub output: ResolutionTypeSlotId,
+    pub left: ResolutionTypeSlotId,
+    pub right: ResolutionTypeSlotId,
+    pub operator: ResolutionBinaryOperator,
+    pub right_reference: ResolutionBinaryReference,
+}
+
 /// A type constructor that produces its output after its element slot resolves.
 /// The length preserves the written literal token and is present only for arrays.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -778,6 +814,19 @@ pub struct ResolutionTypeProductionFact {
     pub element: ResolutionTypeSlotId,
     pub constructor: ResolutionTypeConstructorKind,
     pub length: Option<String>,
+}
+
+/// An uncertified macro result candidate. Identity and element agreement are
+/// query-time obligations; source lowering never calls this a Vec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolutionMacroTypeCandidateFact {
+    /// Source-local import visibility; grants no selected macro identity.
+    pub lexical_import_shadow: bool,
+    pub reference: ResolutionSiteId,
+    pub site: ResolutionSiteId,
+    pub output: ResolutionTypeSlotId,
+    pub path: Vec<String>,
+    pub elements: Vec<ResolutionTypeSlotId>,
 }
 
 /// One edge from a structural type syntax slot to a component type syntax
@@ -1587,6 +1636,37 @@ pub struct ResolutionExternAliasFact {
     pub site: ResolutionSiteId,
     pub scope: ResolutionScopeId,
     pub name: ResolutionNameId,
+}
+
+/// Source evidence only: identity remains unresolved until selected-compilation
+/// attribute resolution. Keep all assembly attributes, including aliases whose
+/// written terminal name cannot identify InternalsVisibleTo locally.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolutionCSharpFriendAttributeFact {
+    pub site: ResolutionSiteId,
+    pub scope: ResolutionScopeId,
+    pub name_segments: Vec<String>,
+    pub argument: Option<String>,
+    pub parse_state: CSharpFriendArgumentState,
+    pub friend_name: Option<String>,
+    pub has_public_key: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CSharpFriendArgumentState {
+    Complete,
+    NonConstant,
+    InvalidDisplayName,
+}
+
+impl CSharpFriendArgumentState {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::NonConstant => "non_constant",
+            Self::InvalidDisplayName => "invalid_display_name",
+        }
+    }
 }
 
 /// A source import visible throughout the caller's own compilation.
@@ -2464,6 +2544,7 @@ pub struct FileResolutionFacts {
     pub import_route_segments: Vec<ResolutionImportRouteSegmentFact>,
     pub root_imports: Vec<ResolutionRootImportFact>,
     pub extern_aliases: Vec<ResolutionExternAliasFact>,
+    pub csharp_friend_attributes: Vec<ResolutionCSharpFriendAttributeFact>,
     pub compilation_imports: Vec<ResolutionCompilationImportFact>,
     pub root_import_segments: Vec<ResolutionRootImportSegmentFact>,
     pub root_import_demands: Vec<ResolutionRootImportDemandFact>,
@@ -2502,6 +2583,8 @@ pub struct FileResolutionFacts {
     pub local_writes: Vec<ResolutionLocalWriteFact>,
     pub type_components: Vec<ResolutionTypeComponentFact>,
     pub type_productions: Vec<ResolutionTypeProductionFact>,
+    pub binary_operations: Vec<ResolutionBinaryOperationFact>,
+    pub macro_type_candidates: Vec<ResolutionMacroTypeCandidateFact>,
     pub declared_type_arguments: Vec<ResolutionDeclaredTypeArgumentFact>,
     pub type_arguments: Vec<ResolutionTypeArgumentFact>,
     pub generic_type_alias_parameters: Vec<ResolutionGenericTypeAliasParameterFact>,
@@ -2909,6 +2992,7 @@ impl FileResolutionFacts {
             && self.import_route_segments.is_empty()
             && self.root_imports.is_empty()
             && self.extern_aliases.is_empty()
+            && self.csharp_friend_attributes.is_empty()
             && self.compilation_imports.is_empty()
             && self.root_import_segments.is_empty()
             && self.root_import_demands.is_empty()
@@ -2940,6 +3024,7 @@ impl FileResolutionFacts {
             && self.type_transfers.is_empty()
             && self.type_components.is_empty()
             && self.type_productions.is_empty()
+            && self.binary_operations.is_empty()
             && self.declared_type_arguments.is_empty()
             && self.type_arguments.is_empty()
             && self.generic_type_alias_parameters.is_empty()
@@ -3202,6 +3287,23 @@ impl FileResolutionFacts {
             .saturating_add(rows(&self.import_route_segments))
             .saturating_add(rows(&self.root_imports))
             .saturating_add(rows(&self.extern_aliases))
+            .saturating_add(rows(&self.csharp_friend_attributes))
+            .saturating_add(
+                self.csharp_friend_attributes
+                    .iter()
+                    .map(|fact| {
+                        rows(&fact.name_segments)
+                            .saturating_add(
+                                fact.name_segments
+                                    .iter()
+                                    .map(String::capacity)
+                                    .fold(0usize, usize::saturating_add),
+                            )
+                            .saturating_add(fact.argument.as_ref().map_or(0, String::capacity))
+                            .saturating_add(fact.friend_name.as_ref().map_or(0, String::capacity))
+                    })
+                    .fold(0usize, usize::saturating_add),
+            )
             .saturating_add(rows(&self.compilation_imports))
             .saturating_add(rows(&self.root_import_segments))
             .saturating_add(rows(&self.root_import_demands))
@@ -3243,6 +3345,7 @@ impl FileResolutionFacts {
             .saturating_add(rows(&self.type_transfers))
             .saturating_add(rows(&self.type_components))
             .saturating_add(rows(&self.type_productions))
+            .saturating_add(rows(&self.binary_operations))
             .saturating_add(
                 self.type_productions
                     .iter()

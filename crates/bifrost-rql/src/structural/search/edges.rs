@@ -389,6 +389,10 @@ impl EdgeTraversalCache {
                         continue;
                     }
                     diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                         incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                         related: Vec::new(),
                         source: None,
@@ -441,6 +445,10 @@ impl EdgeTraversalCache {
                         continue;
                     }
                     diagnostics.push(super::QueryExecutionState::diagnostic(analyzer, CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                         incompleteness: brokk_bifrost_rql::Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Provider),
                         related: Vec::new(),
                         source: None,
@@ -483,6 +491,10 @@ impl EdgeTraversalCache {
         }
         if !newly_reported_global.is_empty() {
             diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                 incompleteness: brokk_bifrost_rql::Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Provider),
                 related: Vec::new(),
                 source: None,
@@ -491,8 +503,14 @@ impl EdgeTraversalCache {
                 impact: CodeQueryDiagnosticImpact::Incomplete,
                 branch: Vec::new(),
                 language: language.config_label(),
-                message: format!(
-                    "selected Java inverse index generation {generation} is incomplete ({newly_reported_global:?}); it does not cover every requested reference-edge axis"
+                message: brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+                    format_args!(
+                        "selected Java inverse index generation {generation} is incomplete ({newly_reported_global:?}); it does not cover every requested reference-edge axis"
+                    ),
+                    format_args!(
+                        "selected Java inverse index generation {generation} is incomplete; it does not cover every requested reference-edge axis"
+                    ),
+                    newly_reported_global.iter(),
                 ),
                 withheld_rows_path: None,
             }));
@@ -504,6 +522,10 @@ impl EdgeTraversalCache {
                 .insert((declaration.clone(), code))
             {
                 diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                 incompleteness: brokk_bifrost_rql::Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Provider),
                 related: Vec::new(),
                 source: None,
@@ -512,8 +534,14 @@ impl EdgeTraversalCache {
                     impact: CodeQueryDiagnosticImpact::Incomplete,
                     branch: Vec::new(),
                     language: language.config_label(),
-                    message: format!(
-                        "{subject} has an incomplete selected Java inverse-index derivation ({subject_local:?}); it does not cover every requested reference-edge axis"
+                    message: brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+                        format_args!(
+                            "{subject} has an incomplete selected Java inverse-index derivation ({subject_local:?}); it does not cover every requested reference-edge axis"
+                        ),
+                        format_args!(
+                            "{subject} has an incomplete selected Java inverse-index derivation; it does not cover every requested reference-edge axis"
+                        ),
+                        subject_local.iter(),
                     ),
                     withheld_rows_path: None,
                 }));

@@ -1,6 +1,6 @@
 use brokk_bifrost_semantic::analyzer::semantic_model::model::{
     AssociatedTypeBinding, GenericParameterDefault, GenericTraitBound, GenericTraitImplFact,
-    ImplementedTraitFact, RustSelfForm, RustSelfPattern,
+    GuardVersion, ImplementedTraitFact, RustSelfForm, RustSelfPattern, RustStability,
 };
 use std::collections::{HashMap as RandomHashMap, HashSet as RandomHashSet, VecDeque};
 
@@ -142,11 +142,14 @@ use brokk_bifrost_core::hash::HashMap;
 use brokk_bifrost_core::hash::HashSet;
 
 const ARTIFACT_LOCATOR_PATH: &str = "rustdoc/api.json";
-const RUSTDOC_FORMAT_VERSION: u32 = 61;
+pub(super) const RUSTDOC_FORMAT_VERSION: u32 = 61;
 const RUSTDOC_PRODUCER_CONTRACT: &str = "rustdoc-json-pack-producer/1";
-/// The highest authored schema this Rustdoc producer may write.
+/// The highest authored schema this Rustdoc producer may write. Stability
+/// certificates require schema 40, above trait-member `Self` at schema 39.
+/// Every generated pack is raised to this maximum, which also discharges the
+/// older conditional trait-Self schema raise without another uncancellable walk.
 pub(crate) const RUSTDOC_PACK_MAX_SCHEMA_VERSION: u32 =
-    brokk_bifrost_semantic::analyzer::semantic_model::ALIAS_TARGET_MIN_SCHEMA_VERSION;
+    brokk_bifrost_semantic::analyzer::semantic_model::model::RUST_STABILITY_MIN_SCHEMA_VERSION;
 
 fn assert_pack_schema_within_producer_max(pack: Option<&AuthoredSemanticModelPack>) {
     if let Some(pack) = pack {
@@ -276,6 +279,250 @@ impl RustdocJsonPackProducer {
     /// paths and bytes; this method only decodes the retained entries and
     /// combines their typed facts. `crates` is `(crate name, relative path)`
     /// in the pinned source-set specification.
+    #[allow(clippy::too_many_arguments)]
+    pub fn produce_verified_source_set(
+        &self,
+        request: &ArtifactProductionRequest,
+        limits: &ArtifactProducerLimits,
+        cancellation: Option<&CancellationToken>,
+        artifact: &ExactArtifact,
+        crates: &[(String, String)],
+        verified: &super::rustdoc_sysroot::VerifiedSysrootDocuments,
+    ) -> ArtifactProduction {
+        if verified.source_digest != artifact.sha256() {
+            return failed_artifact_production(
+                "rust.rustdoc.sysroot_input_mismatch",
+                "verified sysroot receipt belongs to another source set",
+                limits,
+            );
+        }
+        for receipt in &verified.receipts {
+            let toolchain = &receipt.provenance.toolchain;
+            let Ok(version) = semver::Version::parse(&toolchain.release) else {
+                return failed_artifact_production(
+                    "rust.rustdoc.sysroot_toolchain",
+                    "invalid sysroot release",
+                    limits,
+                );
+            };
+            let requirements = request
+                .compatibility
+                .toolchains
+                .iter()
+                .filter(|c| c.name == "rust")
+                .map(|c| c.requirement.as_str())
+                .chain(
+                    request
+                        .activation
+                        .iter()
+                        .filter_map(|s| s.toolchain.as_ref())
+                        .filter(|s| s.name == "rust")
+                        .filter_map(|s| s.version.as_deref()),
+                );
+            if requirements
+                .into_iter()
+                .any(|r| !semver::VersionReq::parse(r).is_ok_and(|r| r.matches(&version)))
+                || request.activation.iter().any(|s| {
+                    !s.targets.is_empty() && !s.targets.contains(&receipt.provenance.target)
+                })
+            {
+                return failed_artifact_production(
+                    "rust.rustdoc.sysroot_toolchain",
+                    "sysroot conflicts with selected toolchain or target",
+                    limits,
+                );
+            }
+        }
+        let baseline =
+            self.produce_loaded_source_set(request, limits, cancellation, artifact, crates);
+        let Some(pack) = &baseline.pack else {
+            return baseline;
+        };
+        let emitted = pack
+            .shards
+            .iter()
+            .filter_map(|s| match &s.payload {
+                AuthoredPayload::DeclarationFacts { types, .. } => Some(types.iter()),
+                _ => None,
+            })
+            .flatten()
+            .map(|ty| (ty.name.clone(), ty.id.clone()))
+            .collect::<RandomHashMap<_, _>>();
+        let owner_names = emitted
+            .iter()
+            .map(|(name, id)| (id.as_str(), name.as_str()))
+            .collect::<RandomHashMap<_, _>>();
+        let mut emitted_members = RandomHashMap::new();
+        for shard in &pack.shards {
+            if let AuthoredPayload::DeclarationFacts { members, .. } = &shard.payload {
+                for member in members {
+                    if let Some(owner) = owner_names.get(member.owner.as_str()) {
+                        let kind = if member.member_kind == MemberKind::Method {
+                            MemberKind::Function
+                        } else {
+                            member.member_kind
+                        };
+                        let key = (format!("{owner}.{}", member.name), kind as u8);
+                        emitted_members
+                            .entry(key)
+                            .or_insert_with(|| member.id.clone());
+                    }
+                }
+            }
+        }
+        let mut documents = RandomHashMap::new();
+        // A token may cover extra captured inputs. An unselected compiler
+        // document cannot lend authority to a selected dependency of that name.
+        for receipt in &verified.receipts {
+            let Some((expected_crate, _)) = crates.iter().find(|(_, path)| path == &receipt.path)
+            else {
+                continue;
+            };
+            let Some(entry) = artifact
+                .source_entries()
+                .iter()
+                .find(|s| s.relative_path() == receipt.path)
+            else {
+                continue;
+            };
+            let Ok(document) = decode_rustdoc_json_document(request, entry.bytes()) else {
+                continue;
+            };
+            if validated_document_root(request, &document, Some(expected_crate)).is_err() {
+                continue;
+            }
+            documents.insert(receipt.path.clone(), document);
+        }
+        // Index each defining document once. A duplicate canonical path/kind
+        // remains ambiguous even if only one duplicate was emitted.
+        let definitions = documents
+            .iter()
+            .map(|(path, document)| {
+                let root = &document.index[&document.root];
+                let mut index = RandomHashMap::new();
+                for (id, summary) in &document.paths {
+                    if summary.crate_id != root.crate_id
+                        || !document
+                            .index
+                            .get(id)
+                            .is_some_and(|item| item.crate_id == root.crate_id)
+                    {
+                        continue;
+                    }
+                    let key = (summary.path.clone(), summary.kind);
+                    let name = summary.path.join(".");
+                    let item = &document.index[id];
+                    let declared = if let Some(kind) = member_kind(&item.inner) {
+                        emitted_members.get(&(name, kind as u8))
+                    } else {
+                        emitted.get(&name)
+                    }
+                    .cloned()
+                    .map(|declared| (declared, *id));
+                    match index.entry(key) {
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            entry.insert(declared);
+                        }
+                        std::collections::hash_map::Entry::Occupied(mut entry) => {
+                            entry.insert(None);
+                        }
+                    }
+                }
+                (path.clone(), index)
+            })
+            .collect::<RandomHashMap<_, _>>();
+        let mut links = SourceSetLinks::default();
+        for source in &verified.receipts {
+            let Some(document) = documents.get(&source.path) else {
+                continue;
+            };
+            let mut resolved = HashMap::default();
+            for (id, summary) in &document.paths {
+                let Some(external) = document.external_crates.get(&summary.crate_id) else {
+                    continue;
+                };
+                if !matches!(
+                    external.name.as_str(),
+                    "core" | "alloc" | "std" | "proc_macro" | "test"
+                ) {
+                    continue;
+                }
+                let candidates = verified
+                    .receipts
+                    .iter()
+                    .filter(|target| {
+                        target.provenance.toolchain == source.provenance.toolchain
+                            && target.provenance.component == source.provenance.component
+                            && target.provenance.target == source.provenance.target
+                            && target.provenance.archive_sha256 == source.provenance.archive_sha256
+                            && documents.get(&target.path).is_some_and(|doc| {
+                                doc.index
+                                    .get(&doc.root)
+                                    .and_then(|item| item.name.as_deref())
+                                    == Some(external.name.as_str())
+                            })
+                    })
+                    .collect::<Vec<_>>();
+                let [target] = candidates.as_slice() else {
+                    continue;
+                };
+                if let Some(Some(declared)) =
+                    definitions[&target.path].get(&(summary.path.clone(), summary.kind))
+                {
+                    resolved.insert(
+                        *id,
+                        ProvenRustdocItem {
+                            declaration_id: declared.0.clone(),
+                            source_path: target.path.clone(),
+                            item_id: declared.1,
+                        },
+                    );
+                }
+            }
+            links
+                .proven_sysroot_ids
+                .insert(source.path.clone(), resolved);
+        }
+        let mut result = self.produce_source_set_with_links(
+            request,
+            limits,
+            cancellation,
+            artifact,
+            crates,
+            links,
+        );
+        if let Some(pack) = &mut result.pack {
+            let final_ids = pack
+                .shards
+                .iter()
+                .filter_map(|s| match &s.payload {
+                    AuthoredPayload::DeclarationFacts { types, .. } => {
+                        Some(types.iter().map(|ty| ty.id.as_str()))
+                    }
+                    _ => None,
+                })
+                .flatten()
+                .collect::<RandomHashSet<_>>();
+            if emitted.values().any(|id| !final_ids.contains(id.as_str())) {
+                return failed_artifact_production(
+                    "rust.rustdoc.sysroot_declaration_limit",
+                    "sysroot correspondence target was discarded by production limits",
+                    limits,
+                );
+            }
+            pack.schema_version = RUSTDOC_PACK_MAX_SCHEMA_VERSION;
+            if let Some(extraction) = &mut pack.extraction {
+                extraction.verified_sysroot = verified
+                    .receipts
+                    .iter()
+                    .filter(|receipt| documents.contains_key(&receipt.path))
+                    .cloned()
+                    .collect();
+            }
+        }
+        result
+    }
+
     pub fn produce_loaded_source_set(
         &self,
         request: &ArtifactProductionRequest,
@@ -283,6 +530,26 @@ impl RustdocJsonPackProducer {
         cancellation: Option<&CancellationToken>,
         artifact: &ExactArtifact,
         crates: &[(String, String)],
+    ) -> ArtifactProduction {
+        self.produce_source_set_with_links(
+            request,
+            limits,
+            cancellation,
+            artifact,
+            crates,
+            SourceSetLinks::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn produce_source_set_with_links(
+        &self,
+        request: &ArtifactProductionRequest,
+        limits: &ArtifactProducerLimits,
+        cancellation: Option<&CancellationToken>,
+        artifact: &ExactArtifact,
+        crates: &[(String, String)],
+        mut links: SourceSetLinks,
     ) -> ArtifactProduction {
         if request.artifact_kind != ExternalArtifactKind::RustdocJsonSet {
             return failed_artifact_production(
@@ -330,7 +597,6 @@ impl RustdocJsonPackProducer {
             .map(|entry| (entry.relative_path().to_owned(), entry.bytes()))
             .collect::<RandomHashMap<_, _>>();
         let mut productions = Vec::with_capacity(ordered.len());
-        let mut links = SourceSetLinks::default();
         // Index only declaration binders before projecting cross-document impls.
         // This request-local metadata is bounded by the authenticated source set;
         // the join still decides whether an owner was actually emitted.
@@ -415,7 +681,7 @@ impl RustdocJsonPackProducer {
                 &mut links,
             );
             if production_record_count(&production) > remaining {
-                links.declarations_interrupted = true;
+                links.declarations_interrupted = DeclarationInterruptions::Global;
             }
             limit_production_records(&mut production, remaining, limits);
             for diagnostic in &mut production.diagnostics {
@@ -428,7 +694,14 @@ impl RustdocJsonPackProducer {
             }
             productions.push(production);
         }
-        merge_source_set_productions(request, limits, artifact.sha256(), productions, &links)
+        merge_source_set_productions(
+            request,
+            limits,
+            artifact.sha256(),
+            productions,
+            &links,
+            cancellation,
+        )
     }
 }
 
@@ -438,7 +711,8 @@ fn produce_loaded_document(
     cancellation: Option<&CancellationToken>,
     artifact: &ExactArtifact,
 ) -> ArtifactProduction {
-    produce_loaded_json_document(
+    let mut links = SourceSetLinks::default();
+    let mut production = produce_loaded_json_document(
         request,
         limits,
         cancellation,
@@ -446,8 +720,31 @@ fn produce_loaded_document(
         None,
         None,
         artifact.bytes(),
-        &mut SourceSetLinks::default(),
-    )
+        &mut links,
+    );
+    if let Some(pack) = production.pack.as_mut() {
+        let Ok(certificates) = links.rust_stability_graph.evaluate(cancellation) else {
+            return cancelled_stability_production(limits);
+        };
+        for shard in &mut pack.shards {
+            if let AuthoredPayload::DeclarationFacts { types, members, .. } = &mut shard.payload
+                && assign_stability_certificates(
+                    types,
+                    members,
+                    &certificates,
+                    &links.rust_stability_graph,
+                    cancellation,
+                )
+                .is_err()
+            {
+                return cancelled_stability_production(limits);
+            }
+        }
+    }
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return cancelled_stability_production(limits);
+    }
+    production
 }
 
 fn decode_rustdoc_json_document(
@@ -475,7 +772,7 @@ fn decode_rustdoc_json_document(
         CONVERTED_FIELDS_CONSUMED,
     )
     .map_err(|message| ("rust.rustdoc.uncertified_conversion", message.to_owned()))?;
-    let document: RustdocCrate = serde_json::from_slice(bytes).map_err(|error| {
+    let mut document: RustdocCrate = serde_json::from_slice(bytes).map_err(|error| {
         (
             "rust.rustdoc.invalid_json",
             format!(
@@ -484,6 +781,13 @@ fn decode_rustdoc_json_document(
             ),
         )
     })?;
+    // Converted legacy documents cannot certify stability, even if supplied
+    // bytes contain a value. Native format 61 alone owns this typed field.
+    if envelope.conversion.is_some() {
+        for item in document.index.values_mut() {
+            item.stability = None;
+        }
+    }
     let requested_versions = request
         .activation
         .iter()
@@ -568,7 +872,7 @@ fn produce_loaded_json_document(
             if let AuthoredPayload::DeclarationFacts { types, .. } = &mut shard.payload {
                 retain_available_alias_targets(types);
                 if types.iter().any(|ty| ty.alias_target.is_some()) {
-                    pack.schema_version = RUSTDOC_PACK_MAX_SCHEMA_VERSION;
+                    pack.schema_version = brokk_bifrost_semantic::analyzer::semantic_model::ALIAS_TARGET_MIN_SCHEMA_VERSION;
                 }
             }
         }
@@ -645,6 +949,9 @@ fn produce_loaded_json_document(
             "rust.external_reexports.unsupported_surface",
             "public local module aliases or unsupported glob targets leave Rust facade routes incomplete; missing routes are missing evidence, not absence".to_owned(),
         );
+    }
+    if let Some(pack) = production.pack.as_mut() {
+        pack.schema_version = RUSTDOC_PACK_MAX_SCHEMA_VERSION;
     }
     assert_pack_schema_within_producer_max(production.pack.as_ref());
     production
@@ -1042,8 +1349,120 @@ struct ImplMemberPresentation {
     origin: ImplMemberOrigin,
 }
 
+type ModuleFunctionRoute = (String, String);
+type ExportLocation = (Option<Box<str>>, String);
+
+/// Extraction gaps keep implementation inventories open. Callable-family
+/// certification can exclude an unknown self only by its complete trait item
+/// names, never by the self type's spelling or an assumed defining owner.
+#[derive(Default)]
+enum DeclarationInterruptions {
+    #[default]
+    Clear,
+    TraitCallableNames(RandomHashSet<String>),
+    Global,
+}
+
+impl DeclarationInterruptions {
+    fn any(&self) -> bool {
+        !matches!(self, Self::Clear)
+    }
+
+    fn blocks_callable_name(&self, name: &str) -> bool {
+        match self {
+            Self::Clear => false,
+            Self::TraitCallableNames(names) => names.contains(name),
+            Self::Global => true,
+        }
+    }
+
+    fn interrupt_impl(&mut self, implementation: &rustdoc_types::Impl, document: &RustdocCrate) {
+        // Rust permits an impl to supply only its trait's own items. Missing
+        // definitions or item rows cannot bound that set, so they stay global.
+        let names = if implementation.blanket_impl.is_none() {
+            complete_trait_callable_names(implementation, document)
+        } else {
+            // Presentation copies are handled before this classifier. An
+            // unsupported blanket that reaches it has no bounded owner set.
+            None
+        };
+        match (self, names) {
+            (Self::Global, _) => {}
+            (current, None) => *current = Self::Global,
+            (Self::TraitCallableNames(existing), Some(names)) => existing.extend(names),
+            (current @ Self::Clear, Some(names)) => *current = Self::TraitCallableNames(names),
+        }
+    }
+}
+
+// Both global and owner-local interruptions use this one inventory proof.
+fn complete_trait_callable_names(
+    implementation: &rustdoc_types::Impl,
+    document: &RustdocCrate,
+) -> Option<RandomHashSet<String>> {
+    let path = implementation.trait_.as_ref()?;
+    normalized_path(path, document)?;
+    let ItemEnum::Trait(trait_) = &document.index.get(&path.id)?.inner else {
+        return None;
+    };
+    let names = callable_item_names(&trait_.items, document)?;
+    let mut implemented = callable_item_names(&implementation.items, document)?;
+    implemented.extend(implementation.provided_trait_methods.iter().cloned());
+    // A stripped definition cannot bound either explicit required items or
+    // inherited provided names. Unknown trait arguments do not change names.
+    implemented.is_subset(&names).then_some(names)
+}
+
+// Primitive presentation groups can contain many unrelated structural self
+// types. Only a nominal declaration, or the exact scalar primitive itself,
+// proves one owner. Never infer this from the assigned presentation name.
+fn impl_proves_single_owner(
+    implementation: &rustdoc_types::Impl,
+    document: &RustdocCrate,
+    owner: &str,
+) -> bool {
+    match &implementation.for_ {
+        Type::ResolvedPath(path) => {
+            matches!(
+                document.index.get(&path.id).map(|item| &item.inner),
+                Some(ItemEnum::Struct(_) | ItemEnum::Enum(_) | ItemEnum::Union(_))
+            ) && normalized_path(path, document).as_deref() == Some(owner)
+        }
+        Type::Primitive(name) => {
+            (super::call_conversion::primitive_for_spelling(name).is_some()
+                || matches!(name.as_str(), "f16" | "f128"))
+                && owner.strip_prefix("core.primitive.") == Some(name.as_str())
+        }
+        _ => false,
+    }
+}
+
+fn callable_item_names(items: &[Id], document: &RustdocCrate) -> Option<RandomHashSet<String>> {
+    let mut names = RandomHashSet::default();
+    for id in items {
+        let item = document.index.get(id)?;
+        match &item.inner {
+            ItemEnum::Function(_) => {
+                names.insert(item.name.clone()?);
+            }
+            ItemEnum::AssocConst { .. } | ItemEnum::AssocType { .. } => {}
+            // An unexpanded macro cannot establish an exhaustive callable set.
+            _ => return None,
+        }
+    }
+    Some(names)
+}
+
+struct ProvenRustdocItem {
+    declaration_id: String,
+    source_path: String,
+    item_id: Id,
+}
+
 #[derive(Default)]
 struct SourceSetLinks {
+    rust_stability_graph: RustStabilityGraph,
+    proven_sysroot_ids: RandomHashMap<String, HashMap<Id, ProvenRustdocItem>>,
     owner_parameters: RandomHashMap<String, Vec<String>>,
     impl_member_presentations: RandomHashMap<String, RandomHashMap<String, ImplMemberPresentation>>,
     reexports: Vec<CrossDocumentReexport>,
@@ -1051,10 +1470,20 @@ struct SourceSetLinks {
     generic_trait_impls: Vec<(String, GenericTraitImplFact)>,
     concrete_trait_impls: Vec<(String, ImplementedTraitFact)>,
     callable_impl_members: RandomHashSet<String>,
+    // Free functions whose parent item is a module, and the (module id, name)
+    // pairs where any same-named declaration reported a decoding diagnostic.
+    callable_module_members: RandomHashSet<String>,
+    incomplete_module_functions: RandomHashSet<(String, String)>,
+    incomplete_module_exports: RandomHashSet<String>,
+    pending_module_exports: Vec<(ExportLocation, ModuleFunctionRoute)>,
     incomplete_callable_owner_refs: Vec<TypeRef>,
+    incomplete_owner_callable_names: RandomHashMap<String, RandomHashSet<String>>,
     pending_external_members: Vec<(String, ProducerDiagnostic)>,
-    declarations_interrupted: bool,
+    declarations_interrupted: DeclarationInterruptions,
     incomplete_implementation_owners: RandomHashSet<String>,
+    incomplete_implementation_owner_ids: RandomHashSet<String>,
+    unknown_trait_implementations: bool,
+    unknown_implementation_owners: bool,
     incomplete_generic_traits: RandomHashSet<String>,
     auto_traits: RandomHashSet<String>,
 }
@@ -1062,10 +1491,19 @@ struct SourceSetLinks {
 // Like the JVM producer's selective certification, decoding failures block an
 // owner's families without making unrelated owners incomplete. Source-set
 // trait membership is checked after all documents have been joined.
+//
+// A module-owned free function is certified by the same flag. Rust has no
+// overloading, but one module and name can still hold several declarations
+// when joined documents carry cfg alternatives, so the family is every
+// declaration of that name in the module whatever its arity. It is complete
+// only when every one of them decoded without a diagnostic; one undecoded
+// alternative leaves all of them uncertified. A diagnostic blocks only the
+// function it names: a module's other functions are unrelated declarations.
 fn certify_callable_families(
     types: &[TypeFact],
     members: &mut [MemberFact],
     links: &SourceSetLinks,
+    resolved_exports: &RandomHashSet<ExportLocation>,
 ) {
     let owners = types
         .iter()
@@ -1077,6 +1515,65 @@ fn certify_callable_families(
         })
         .map(|ty| (&ty.id, &ty.name))
         .collect::<RandomHashMap<_, _>>();
+    let module_ids = types
+        .iter()
+        .filter(|ty| ty.type_kind == TypeKind::Module)
+        .map(|ty| ty.id.as_str())
+        .collect::<RandomHashSet<_>>();
+    let module_routes = types
+        .iter()
+        .filter(|ty| ty.type_kind == TypeKind::Module)
+        .flat_map(|ty| {
+            std::iter::once(&ty.name)
+                .chain(ty.aliases.iter())
+                .map(move |name| (name.as_str(), &ty.id))
+        })
+        .collect::<RandomHashMap<_, _>>();
+    // Routes of one declaration share one legacy certificate. Propagate
+    // decode/enumeration gaps across the route graph before certifying any
+    // competing declaration at the same public spelling.
+    let mut incomplete_functions = links.incomplete_module_functions.clone();
+    incomplete_functions.extend(
+        links
+            .pending_module_exports
+            .iter()
+            .filter(|(location, _)| !resolved_exports.contains(location))
+            .map(|(_, route)| route.clone()),
+    );
+    let mut edges: RandomHashMap<ModuleFunctionRoute, Vec<ModuleFunctionRoute>> =
+        RandomHashMap::default();
+    for member in members
+        .iter()
+        .filter(|member| links.callable_module_members.contains(&member.id))
+    {
+        let defining = (member.owner.clone(), member.name.clone());
+        edges.entry(defining.clone()).or_default();
+        for (id, name) in member.aliases.iter().filter_map(|alias| {
+            let (owner, name) = alias.rsplit_once('.')?;
+            Some((module_routes.get(owner)?, name))
+        }) {
+            let alias = ((*id).clone(), name.to_owned());
+            edges
+                .entry(defining.clone())
+                .or_default()
+                .push(alias.clone());
+            edges.entry(alias).or_default().push(defining.clone());
+        }
+    }
+    incomplete_functions.extend(
+        edges
+            .keys()
+            .filter(|(owner, _)| links.incomplete_module_exports.contains(owner))
+            .cloned(),
+    );
+    let mut pending = incomplete_functions.iter().cloned().collect::<Vec<_>>();
+    while let Some(route) = pending.pop() {
+        for next in edges.get(&route).into_iter().flatten() {
+            if incomplete_functions.insert(next.clone()) {
+                pending.push(next.clone());
+            }
+        }
+    }
     let trait_ids = types
         .iter()
         .filter(|ty| ty.type_kind == TypeKind::Trait)
@@ -1095,10 +1592,15 @@ fn certify_callable_families(
             member.name.clone(),
             member.is_static,
             serde_json::to_string(&member.self_form).expect("serializable Rust self form"),
-            member
-                .signature
-                .as_ref()
-                .map(|signature| signature.parameters.len()),
+            // Module functions of one name form a single family at any arity.
+            (!links.callable_module_members.contains(&member.id))
+                .then(|| {
+                    member
+                        .signature
+                        .as_ref()
+                        .map(|signature| signature.parameters.len())
+                })
+                .flatten(),
         )
     };
     let incomplete_ids = links
@@ -1119,11 +1621,14 @@ fn certify_callable_families(
         .collect::<RandomHashSet<_>>();
     let mut families = RandomHashMap::new();
     for member in members.iter() {
-        let eligible = !links.declarations_interrupted
-            && links.callable_impl_members.contains(&member.id)
+        let eligible_impl_member = links.callable_impl_members.contains(&member.id)
             && owners.get(&member.owner).is_some_and(|name| {
                 !incomplete_ids.contains(member.owner.as_str())
                     && !incomplete_names.contains(name.as_str())
+                    && !links
+                        .incomplete_owner_callable_names
+                        .get(name.as_str())
+                        .is_some_and(|names| names.contains(&member.name))
             })
             && member
                 .implemented_trait
@@ -1133,6 +1638,13 @@ fn certify_callable_families(
                     TypeRef::Named { name, .. } => trait_names.contains(name.as_str()),
                     _ => false,
                 });
+        let eligible_module_function = links.callable_module_members.contains(&member.id)
+            && module_ids.contains(member.owner.as_str())
+            && !incomplete_functions.contains(&(member.owner.clone(), member.name.clone()));
+        let eligible = !links
+            .declarations_interrupted
+            .blocks_callable_name(&member.name)
+            && (eligible_impl_member || eligible_module_function);
         families
             .entry(family_key(member))
             .and_modify(|complete| *complete &= eligible)
@@ -1390,7 +1902,7 @@ fn exact_alias_target(
                     arguments: existing,
                     ..
                 } => *existing = arguments,
-                _ => unreachable!("path projection produces a declared or named reference"),
+                _ => return None,
             }
             target
         }
@@ -1684,6 +2196,7 @@ fn implemented_trait_fact(
         .collect::<Vec<_>>();
     associated_types.sort_by(|a, b| a.name.cmp(&b.name));
     ImplementedTraitFact {
+        rust_stability: None,
         is_negative: false,
         type_parameters: Vec::new(),
         self_pattern: None,
@@ -1707,51 +2220,76 @@ fn generic_trait_bounds(
                 trait_, modifier, ..
             } = bound
             {
-                let associated_types =
-                    if let Some(GenericArgs::AngleBracketed { constraints, .. }) =
-                        trait_.args.as_deref()
-                    {
-                        constraints
-                            .iter()
-                            .filter_map(|constraint| {
-                                if let rustdoc_types::AssocItemConstraintKind::Equality(
-                                    Term::Type(ty),
-                                ) = &constraint.binding
-                                {
-                                    Some(AssociatedTypeBinding {
-                                        name: constraint.name.clone(),
-                                        r#type: contract_type_ref(
-                                            ty,
-                                            document,
-                                            type_ids,
-                                            limits,
-                                            diagnostics,
-                                            0,
-                                        ),
-                                    })
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
+                let mut trait_type = contract_type_ref(
+                    &Type::ResolvedPath(trait_.clone()),
+                    document,
+                    type_ids,
+                    limits,
+                    diagnostics,
+                    0,
+                );
+                let associated_types = match trait_.args.as_deref() {
+                    Some(GenericArgs::AngleBracketed { constraints, .. }) => constraints
+                        .iter()
+                        .filter_map(|constraint| {
+                            if let rustdoc_types::AssocItemConstraintKind::Equality(Term::Type(
+                                ty,
+                            )) = &constraint.binding
+                            {
+                                Some(AssociatedTypeBinding {
+                                    name: constraint.name.clone(),
+                                    r#type: contract_type_ref(
+                                        ty,
+                                        document,
+                                        type_ids,
+                                        limits,
+                                        diagnostics,
+                                        0,
+                                    ),
+                                })
+                            } else {
+                                None
+                            }
+                        })
+                        .collect(),
+                    // Fn sugar: `F: FnMut(A, B) -> R` is `FnMut<(A, B)>` with
+                    // `Output = R`; a missing `-> R` is the empty tuple. Today the
+                    // only caller is impl conditions, which
+                    // `implementation_conditions_supported` keeps unreviewed, so this
+                    // encoding is read by nothing yet; its consumer is D1b
+                    // (`Signature.bounds`, #12733).
+                    Some(GenericArgs::Parenthesized { inputs, output }) => {
+                        let mut project = |ty: &Type| {
+                            contract_type_ref(ty, document, type_ids, limits, diagnostics, 0)
+                        };
+                        let elements = inputs.iter().map(&mut project).collect();
+                        let output = output.as_ref().map_or(
+                            TypeRef::Tuple {
+                                elements: Vec::new(),
+                            },
+                            &mut project,
+                        );
+                        if let TypeRef::Named { arguments, .. }
+                        | TypeRef::Declared { arguments, .. } = &mut trait_type
+                        {
+                            *arguments = vec![TypeRef::Tuple { elements }];
+                        }
+                        vec![AssociatedTypeBinding {
+                            name: "Output".to_owned(),
+                            r#type: output,
+                        }]
+                    }
+                    _ => Vec::new(),
+                };
                 bounds.push(GenericTraitBound {
                     subject: contract_type_ref(subject, document, type_ids, limits, diagnostics, 0),
                     bound: ImplementedTraitFact {
+                        rust_stability: None,
                         is_negative: false,
                         type_parameters: Vec::new(),
                         self_pattern: None,
                         bounds: Vec::new(),
-                        trait_type: contract_type_ref(
-                            &Type::ResolvedPath(trait_.clone()),
-                            document,
-                            type_ids,
-                            limits,
-                            diagnostics,
-                            0,
-                        ),
+                        trait_type,
                         associated_types,
                     },
                     maybe: *modifier == rustdoc_types::TraitBoundModifier::Maybe,
@@ -1785,7 +2323,7 @@ fn generic_trait_bounds(
         let has_sized_bound = |bounds: &[GenericBound]| {
             bounds.iter().any(|bound| {
                 matches!(bound, GenericBound::TraitBound { trait_, .. }
-                if normalized_path(trait_, document) == "core.marker.Sized")
+                if normalized_path(trait_, document).as_deref() == Some("core.marker.Sized"))
             })
         };
         let inline_sized = matches!(&parameter.kind,
@@ -1799,6 +2337,7 @@ fn generic_trait_bounds(
         bounds.push(GenericTraitBound {
             subject,
             bound: ImplementedTraitFact {
+                rust_stability: None,
                 is_negative: false,
                 type_parameters: Vec::new(),
                 self_pattern: None,
@@ -1831,6 +2370,12 @@ fn implementation_conditions_supported(generics: &Generics) -> bool {
                                 )
                             })
                         }
+                        // Fn sugar stays unreviewed: `ModelApplicability::positive_bounds`
+                        // checks only that a type implements the bound's trait owner,
+                        // not the bound's type arguments or associated `Output`, so an
+                        // impl requiring `F: Fn(u8) -> u8` would apply to an `F`
+                        // implementing `Fn(String) -> String`. Reviewed impls must
+                        // fail closed until applicability checks the full bound.
                         Some(
                             GenericArgs::ReturnTypeNotation | GenericArgs::Parenthesized { .. },
                         ) => false,
@@ -1923,12 +2468,61 @@ fn self_pattern(
     }
 }
 
+fn cancelled_stability_production(limits: &ArtifactProducerLimits) -> ArtifactProduction {
+    failed_artifact_production(
+        "artifact.cancelled",
+        "rustdoc stability production was cancelled",
+        limits,
+    )
+}
+
+fn assign_stability_certificates(
+    types: &mut [TypeFact],
+    members: &mut [MemberFact],
+    certificates: &RandomHashMap<&str, RustStability>,
+    graph: &RustStabilityGraph,
+    cancellation: Option<&CancellationToken>,
+) -> Result<(), ()> {
+    for fact in types {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Err(());
+        }
+        for implementation in &mut fact.implemented_traits {
+            if let Some(pattern) = implementation.self_pattern.clone() {
+                graph.assign_implementation(&pattern, implementation, certificates);
+            }
+        }
+        for implementation in &mut fact.generic_trait_impls {
+            graph.assign_generic_implementation(implementation, certificates);
+        }
+        fact.rust_stability = Some(
+            certificates
+                .get(fact.id.as_str())
+                .cloned()
+                .unwrap_or(RustStability::Uncertified),
+        );
+    }
+    for fact in members {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Err(());
+        }
+        fact.rust_stability = Some(
+            certificates
+                .get(fact.id.as_str())
+                .cloned()
+                .unwrap_or(RustStability::Uncertified),
+        );
+    }
+    Ok(())
+}
+
 fn merge_source_set_productions(
     request: &ArtifactProductionRequest,
     limits: &ArtifactProducerLimits,
     artifact_sha256: &str,
     productions: Vec<ArtifactProduction>,
     links: &SourceSetLinks,
+    cancellation: Option<&CancellationToken>,
 ) -> ArtifactProduction {
     let mut diagnostics = Vec::new();
     let mut suppressed_diagnostics = SuppressedDiagnostics::default();
@@ -1937,6 +2531,12 @@ fn merge_source_set_productions(
     let mut relations = Vec::new();
     let mut completeness = Completeness::Complete;
     let mut all_documents_decoded = true;
+    let Ok(certificates) = links.rust_stability_graph.evaluate(cancellation) else {
+        return cancelled_stability_production(limits);
+    };
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return cancelled_stability_production(limits);
+    }
     for production in productions {
         completeness = if production.completeness == Completeness::Complete {
             completeness
@@ -1976,6 +2576,19 @@ fn merge_source_set_productions(
             completeness = Completeness::Partial;
             continue;
         };
+        let mut shard_types = shard_types;
+        let mut shard_members = shard_members;
+        if assign_stability_certificates(
+            &mut shard_types,
+            &mut shard_members,
+            &certificates,
+            &links.rust_stability_graph,
+            cancellation,
+        )
+        .is_err()
+        {
+            return cancelled_stability_production(limits);
+        }
         types.extend(shard_types);
         members.extend(shard_members);
         relations.extend(shard_relations);
@@ -2008,6 +2621,13 @@ fn merge_source_set_productions(
     for fact in types {
         if let Some(&position) = type_positions.get(&fact.id) {
             let existing: &mut TypeFact = &mut merged_types[position];
+            existing.rust_stability = Some(alternative_stability(
+                existing
+                    .rust_stability
+                    .take()
+                    .unwrap_or(RustStability::Uncertified),
+                fact.rust_stability.unwrap_or(RustStability::Uncertified),
+            ));
             union_facts(&mut existing.aliases, fact.aliases);
             union_facts(&mut existing.hierarchy, fact.hierarchy);
             union_facts(&mut existing.implemented_traits, fact.implemented_traits);
@@ -2090,6 +2710,16 @@ fn merge_source_set_productions(
             .or_default()
             .insert(members[duplicate].id.clone());
         dropped_member_ids.insert(members[duplicate].id.clone());
+        members[local].rust_stability = Some(alternative_stability(
+            members[local]
+                .rust_stability
+                .take()
+                .unwrap_or(RustStability::Uncertified),
+            members[duplicate]
+                .rust_stability
+                .clone()
+                .unwrap_or(RustStability::Uncertified),
+        ));
         let aliases = std::mem::take(&mut members[duplicate].aliases);
         union_facts(&mut members[local].aliases, aliases);
     }
@@ -2131,12 +2761,24 @@ fn merge_source_set_productions(
     });
     for (owner, fact) in &links.generic_trait_impls {
         if let Some(trait_) = types.iter_mut().find(|ty| &ty.name == owner) {
-            union_facts(&mut trait_.generic_trait_impls, vec![fact.clone()]);
+            let mut fact = fact.clone();
+            links
+                .rust_stability_graph
+                .assign_generic_implementation(&mut fact, &certificates);
+            union_facts(&mut trait_.generic_trait_impls, vec![fact]);
         }
     }
     for (owner, fact) in &links.concrete_trait_impls {
         if let Some(ty) = types.iter_mut().find(|ty| &ty.name == owner) {
-            union_facts(&mut ty.implemented_traits, vec![fact.clone()]);
+            let mut fact = fact.clone();
+            if let Some(pattern) = fact.self_pattern.clone() {
+                links.rust_stability_graph.assign_implementation(
+                    &pattern,
+                    &mut fact,
+                    &certificates,
+                );
+            }
+            union_facts(&mut ty.implemented_traits, vec![fact]);
         }
     }
     let mut merged_members: Vec<MemberFact> = Vec::new();
@@ -2144,6 +2786,13 @@ fn merge_source_set_productions(
     for fact in members {
         if let Some(&position) = member_positions.get(&fact.id) {
             let existing: &mut MemberFact = &mut merged_members[position];
+            existing.rust_stability = Some(alternative_stability(
+                existing
+                    .rust_stability
+                    .take()
+                    .unwrap_or(RustStability::Uncertified),
+                fact.rust_stability.unwrap_or(RustStability::Uncertified),
+            ));
             union_facts(&mut existing.aliases, fact.aliases);
         } else {
             member_positions.insert(fact.id.clone(), merged_members.len());
@@ -2152,15 +2801,18 @@ fn merge_source_set_productions(
     }
     let mut members = merged_members;
     if all_documents_decoded {
-        certify_callable_families(&types, &mut members, links);
-        if !links.declarations_interrupted {
+        certify_callable_families(&types, &mut members, links, &resolved_locations);
+        if !links.declarations_interrupted.any() {
             for ty in &mut types {
                 ty.implemented_traits_complete =
                     !matches!(
                         ty.type_kind,
                         TypeKind::Module | TypeKind::Trait | TypeKind::TypeAlias
-                    ) && !links.incomplete_implementation_owners.contains(&ty.name);
+                    ) && !links.incomplete_implementation_owners.contains(&ty.name)
+                        && !links.unknown_implementation_owners
+                        && !links.incomplete_implementation_owner_ids.contains(&ty.id);
                 ty.generic_trait_impls_complete = ty.type_kind == TypeKind::Trait
+                    && !links.unknown_trait_implementations
                     && !links.incomplete_generic_traits.contains(&ty.name)
                     && !links.auto_traits.contains(&ty.name);
             }
@@ -2199,6 +2851,9 @@ fn merge_source_set_productions(
     // The source-set digest identifies extraction inputs, not the installed
     // toolchain. Applicability remains the caller's authored selectors.
     let activation = request.activation.clone();
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return cancelled_stability_production(limits);
+    }
     let pack = (!types.is_empty()).then(|| AuthoredSemanticModelPack {
         extraction: Some(
             brokk_bifrost_semantic::analyzer::semantic_model::ArtifactExtraction::source_set(
@@ -2206,13 +2861,7 @@ fn merge_source_set_productions(
                 artifact_sha256,
             ),
         ),
-        schema_version: if types.iter().any(|ty| ty.alias_target.is_some()) {
-            RUSTDOC_PACK_MAX_SCHEMA_VERSION
-        } else if request.provenance.rust_artifact_approximation.is_some() {
-            brokk_bifrost_semantic::analyzer::semantic_model::model::RUST_ARTIFACT_APPROXIMATION_MIN_SCHEMA_VERSION
-        } else {
-            crate::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION
-        },
+        schema_version: RUSTDOC_PACK_MAX_SCHEMA_VERSION,
         pack_id: request.pack_id.clone(),
         version: request.pack_version.clone(),
         producer: Producer {
@@ -2240,6 +2889,9 @@ fn merge_source_set_productions(
             &links.private_modules,
         ),
     });
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return cancelled_stability_production(limits);
+    }
     assert_pack_schema_within_producer_max(pack.as_ref());
     ArtifactProduction {
         artifact_sha256: Some(artifact_sha256.to_owned()),
@@ -2501,6 +3153,20 @@ fn produce_document(
             diagnostics,
         );
     };
+    if links
+        .rust_stability_graph
+        .add_document(
+            document,
+            source_relative_path,
+            &ordered_items,
+            &parents,
+            source_relative_path.and_then(|path| links.proven_sysroot_ids.get(path)),
+            cancellation,
+        )
+        .is_err()
+    {
+        return cancelled_stability_production(limits);
+    }
     let mut names = match item_names(document, root, cancellation) {
         Ok(names) => names,
         Err(NameIndexError::Cancelled) => {
@@ -2562,6 +3228,14 @@ fn produce_document(
         );
     };
 
+    // A public function, constant, static or macro can be defined in a private
+    // module and reach the public API only through a re-export (`std::io::stdin`
+    // is defined in the private `std::io::stdio`). The member keeps its
+    // defining-module identity, so that module must be an emitted declaration
+    // for the member to have an owner; the re-export then adds the public alias.
+    let defining_modules =
+        reexported_member_modules(&ordered_items, root, &parents, document, &visible, &names);
+
     let mut type_ids = HashMap::default();
     for item in &ordered_items {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
@@ -2579,7 +3253,9 @@ fn produce_document(
                 diagnostics,
             );
         }
-        if item.crate_id == root.crate_id && visible.contains(&item.id) && is_type_item(&item.inner)
+        if item.crate_id == root.crate_id
+            && (visible.contains(&item.id) || defining_modules.contains(&item.id))
+            && is_type_item(&item.inner)
         {
             let Some(name) = names.get(&item.id) else {
                 diagnostics.warning(
@@ -2617,6 +3293,17 @@ fn produce_document(
         .map(|(item, name)| (name.clone(), *item))
         .collect::<RandomHashMap<_, _>>();
 
+    // This is a structured join inside a proven crate, not the global
+    // spelling lookup removed by #12073. Only verified referring documents
+    // can obtain IDs, and target IDs must survive final production limits.
+    if let Some(proven) = source_relative_path.and_then(|path| links.proven_sysroot_ids.get(path)) {
+        for (id, declared) in proven {
+            type_ids
+                .entry(*id)
+                .or_insert_with(|| declared.declaration_id.clone());
+        }
+    }
+
     for item in &ordered_items {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             diagnostics.error(
@@ -2627,7 +3314,7 @@ fn produce_document(
             break;
         }
         if item.crate_id != root.crate_id
-            || !visible.contains(&item.id)
+            || !(visible.contains(&item.id) || defining_modules.contains(&item.id))
             || !is_type_item(&item.inner)
         {
             continue;
@@ -2744,9 +3431,19 @@ fn produce_document(
                 Vec::new()
             },
             extension_surfaces: Vec::new(),
+            rust_stability: None,
             guard: None,
             locator: Locator::artifact(source_relative_path.unwrap_or(ARTIFACT_LOCATOR_PATH), name),
         });
+        let stability_node = links
+            .rust_stability_graph
+            .item(source_relative_path, item.id);
+        links
+            .rust_stability_graph
+            .declarations
+            .entry(id.clone())
+            .or_default()
+            .push(stability_node);
         push_generic_relations(id, generics, document, &type_ids, &mut relations);
         if let ItemEnum::TypeAlias(alias) = &item.inner {
             push_type_relations(id, &alias.type_, document, &type_ids, &mut relations);
@@ -2761,6 +3458,7 @@ fn produce_document(
     }
 
     let projection = RustdocProjectionIndex {
+        source: source_relative_path,
         document,
         visible: &visible,
         parents: &parents,
@@ -2785,7 +3483,7 @@ fn produce_document(
     );
 
     let mut member_position = HashMap::default();
-    let mut impl_identities: HashMap<Id, String> = HashMap::default();
+    let mut impl_identities: HashMap<Id, Option<String>> = HashMap::default();
     for item in &ordered_items {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             diagnostics.error(
@@ -2941,22 +3639,39 @@ fn produce_document(
             .and_then(|owner| type_position.get(owner))
             .map(|position| types[*position].type_parameters.as_slice())
             .unwrap_or(owner_parameters);
-        let self_type = implementation.map(|implementation| {
-            RustdocTypeProjection {
-                document,
-                type_ids: &type_ids,
-                canonical_owner,
-                parameter_bindings: &parameter_bindings,
-                owner_type_parameters: if external_owner {
-                    &[]
-                } else {
-                    owner_type_parameters
-                },
-                self_type: None,
-                limits,
-            }
-            .project(&implementation.for_, &mut diagnostics, 0)
-        });
+        let callable_type_parameters = match &item.inner {
+            ItemEnum::Function(function) => generic_names(&function.generics),
+            _ => Vec::new(),
+        };
+        let in_trait = parents
+            .get(&item.id)
+            .and_then(|parent| document.index.get(parent))
+            .is_some_and(|parent| matches!(parent.inner, ItemEnum::Trait(_)));
+        // `Self` is the implemented type in an impl and stays the trait's own
+        // `Self` parameter in a trait declaration.
+        let self_type = if in_trait {
+            Some(TypeRef::TypeParameter {
+                name: "Self".to_owned(),
+            })
+        } else {
+            implementation.map(|implementation| {
+                RustdocTypeProjection {
+                    document,
+                    type_ids: &type_ids,
+                    canonical_owner,
+                    parameter_bindings: &parameter_bindings,
+                    owner_type_parameters: if external_owner {
+                        &[]
+                    } else {
+                        owner_type_parameters
+                    },
+                    callable_type_parameters: &[],
+                    self_type: None,
+                    limits,
+                }
+                .project(&implementation.for_, &mut diagnostics, 0)
+            })
+        };
         let projection = RustdocTypeProjection {
             document,
             type_ids: &type_ids,
@@ -2967,6 +3682,7 @@ fn produce_document(
             } else {
                 owner_type_parameters
             },
+            callable_type_parameters: &callable_type_parameters,
             self_type: self_type.as_ref(),
             limits,
         };
@@ -3015,6 +3731,22 @@ fn produce_document(
                     .or_insert_with(|| trait_impl_identity(implementation, document))
                     .clone()
             });
+        if implementation_identity
+            .as_ref()
+            .is_some_and(Option::is_none)
+        {
+            links.declarations_interrupted.interrupt_impl(
+                implementation.expect("implementation identity has an impl"),
+                document,
+            );
+            diagnostics.warning(
+                "rust.rustdoc.missing_impl_path",
+                Some(format!("item.{}", item.id.0)),
+                "implementation identity contains a path without a structured summary",
+            );
+            continue;
+        }
+        let implementation_identity = implementation_identity.flatten();
         let mut member_id = member_declaration_id(MemberIdentity {
             owner_id: &owner_item_id,
             kind: member_kind,
@@ -3026,6 +3758,7 @@ fn produce_document(
                 .map_or(0, |signature| signature.type_parameters.len()),
             parameter_types: &parameter_types,
             parameter_variadics: &[],
+            extension_receiver: None,
             return_type: signature
                 .as_ref()
                 .and_then(|signature| signature.returns.as_ref()),
@@ -3093,6 +3826,14 @@ fn produce_document(
         {
             links.callable_impl_members.insert(member_id.clone());
         }
+        let module_function = member_kind == MemberKind::Function
+            && parents
+                .get(&item.id)
+                .and_then(|id| document.index.get(id))
+                .is_some_and(|parent| matches!(parent.inner, ItemEnum::Module(_)));
+        if module_function {
+            links.callable_module_members.insert(member_id.clone());
+        }
         if external_extension && !type_id_by_name.contains_key(&owner_name) {
             links.pending_external_members.push((
                 member_id.clone(),
@@ -3110,6 +3851,7 @@ fn produce_document(
         members.push(MemberFact {
             implemented_trait: trait_implementation.map(|implementation| {
                 let mut fact = ImplementedTraitFact {
+                    rust_stability: None,
                     is_negative: false,
                     type_parameters: Vec::new(),
                     self_pattern: None,
@@ -3181,13 +3923,28 @@ fn produce_document(
             extension_receiver: None,
             extension_receiver_constraints: Vec::new(),
             aliases: Vec::new(),
+            rust_stability: None,
             guard: None,
             locator: Locator::artifact(
                 source_relative_path.unwrap_or(ARTIFACT_LOCATOR_PATH),
                 format!("{path}#{member_id}"),
             ),
         });
-        if diagnostics.total() != diagnostics_before {
+        let stability_node = links
+            .rust_stability_graph
+            .item(source_relative_path, item.id);
+        links
+            .rust_stability_graph
+            .declarations
+            .entry(member_id.clone())
+            .or_default()
+            .push(stability_node);
+        if diagnostics.total() != diagnostics_before && module_function {
+            let declared = members.last().expect("member was just pushed");
+            links
+                .incomplete_module_functions
+                .insert((declared.owner.clone(), declared.name.clone()));
+        } else if diagnostics.total() != diagnostics_before {
             links.incomplete_callable_owner_refs.push(TypeRef::Named {
                 name: owner_name,
                 arguments: Vec::new(),
@@ -3217,6 +3974,39 @@ fn produce_document(
             member_aliases_seen: &mut member_aliases_seen,
         },
     );
+    // Retain enumeration gaps independently of bounded diagnostics. A glob
+    // can introduce any name; an unavailable explicit export blocks its name.
+    // Keep this veto across document joins, which may otherwise discard a
+    // same-id alternative before final family certification.
+    for item in &ordered_items {
+        let ItemEnum::Use(import) = &item.inner else {
+            continue;
+        };
+        if !visible.contains(&item.id) {
+            continue;
+        }
+        let Some(owner) = parents
+            .get(&item.id)
+            .and_then(|parent| names.get(parent))
+            .and_then(|name| type_id_by_name.get(name))
+        else {
+            continue;
+        };
+        if import.is_glob {
+            links.incomplete_module_exports.insert(owner.clone());
+        } else if import.id.is_none_or(|target| {
+            !projection.type_position.contains_key(&target)
+                && !member_position.contains_key(&target)
+        }) {
+            links.pending_module_exports.push((
+                (
+                    source_relative_path.map(Into::into),
+                    format!("item.{}", item.id.0),
+                ),
+                (owner.clone(), import.name.clone()),
+            ));
+        }
+    }
     types.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
     members.sort_by(|left, right| {
         left.owner
@@ -3238,9 +4028,12 @@ fn produce_document(
             ),
         );
     }
-    links.declarations_interrupted |= relations_limited
+    if relations_limited
         || types.len().saturating_add(members.len()) >= limits.max_records
-        || cancellation.is_some_and(CancellationToken::is_cancelled);
+        || cancellation.is_some_and(CancellationToken::is_cancelled)
+    {
+        links.declarations_interrupted = DeclarationInterruptions::Global;
+    }
     // Resolve local decode vetoes in the document that reported them. External
     // references remain pending until the joined source set supplies the owner.
     for owner in &mut links.incomplete_callable_owner_refs[decode_veto_start..] {
@@ -3254,7 +4047,7 @@ fn produce_document(
             };
         }
     }
-    certify_callable_families(&types, &mut members, links);
+    certify_callable_families(&types, &mut members, links, &RandomHashSet::default());
     finish(
         request,
         artifact_sha256,
@@ -3263,6 +4056,45 @@ fn produce_document(
         relations,
         diagnostics,
     )
+}
+
+/// Private modules that directly define a visible non-type item.
+///
+/// Rustdoc marks such an item visible only through a public `use` of it, so
+/// its parent module is not itself public API. Returning those parents lets
+/// the producer declare them as owners without making their other children
+/// visible or treating their own `use` items as exports.
+fn reexported_member_modules(
+    items: &[&Item],
+    root: &Item,
+    parents: &HashMap<Id, Id>,
+    document: &RustdocCrate,
+    visible: &HashSet<Id>,
+    names: &HashMap<Id, String>,
+) -> HashSet<Id> {
+    let mut modules = HashSet::default();
+    for item in items {
+        if item.crate_id != root.crate_id
+            || !visible.contains(&item.id)
+            || is_type_item(&item.inner)
+            || member_kind(&item.inner).is_none()
+        {
+            continue;
+        }
+        let Some(parent) = parents.get(&item.id) else {
+            continue;
+        };
+        if !visible.contains(parent)
+            && names.contains_key(parent)
+            && document
+                .index
+                .get(parent)
+                .is_some_and(|item| matches!(item.inner, ItemEnum::Module(_)))
+        {
+            modules.insert(*parent);
+        }
+    }
+    modules
 }
 
 fn parent_index(
@@ -3380,6 +4212,13 @@ fn insert_bounded_name(
     Ok(())
 }
 
+fn public_structural_child(parent: &Item, child: &Item) -> bool {
+    matches!(child.visibility, RustVisibility::Public)
+        || matches!(parent.inner, ItemEnum::Trait(_) | ItemEnum::Enum(_))
+        || matches!(&parent.inner, ItemEnum::Impl(implementation) if implementation.trait_.is_some())
+        || matches!(child.inner, ItemEnum::Impl(_))
+}
+
 fn visible_items(
     document: &RustdocCrate,
     items: &[&Item],
@@ -3402,10 +4241,7 @@ fn visible_items(
             let Some(child_item) = document.index.get(&child) else {
                 continue;
             };
-            let inherited = matches!(item.inner, ItemEnum::Trait(_) | ItemEnum::Enum(_))
-                || matches!(&item.inner, ItemEnum::Impl(implementation) if implementation.trait_.is_some());
-            let structural = matches!(child_item.inner, ItemEnum::Impl(_));
-            if matches!(child_item.visibility, RustVisibility::Public) || inherited || structural {
+            if public_structural_child(item, child_item) {
                 queue.push_back(child);
             }
             if let ItemEnum::Use(import) = &child_item.inner
@@ -3429,6 +4265,532 @@ fn visible_items(
         }
     }
     Some(visible)
+}
+
+fn restrict_stability(left: RustStability, right: RustStability) -> RustStability {
+    match (left, right) {
+        (RustStability::Uncertified, _) | (_, RustStability::Uncertified) => {
+            RustStability::Uncertified
+        }
+        (RustStability::Unstable { features: mut a }, RustStability::Unstable { features: b }) => {
+            a.extend(b);
+            a.sort();
+            a.dedup();
+            RustStability::unstable(a)
+        }
+        (u @ RustStability::Unstable { .. }, _) | (_, u @ RustStability::Unstable { .. }) => u,
+        (RustStability::Stable { since: a }, RustStability::Stable { since: b }) => {
+            RustStability::Stable { since: a.max(b) }
+        }
+    }
+}
+
+/// Prefer a usable route; a later or unstable alias cannot weaken another route.
+fn alternative_stability(left: RustStability, right: RustStability) -> RustStability {
+    match (left, right) {
+        (RustStability::Stable { since: a }, RustStability::Stable { since: b }) => {
+            RustStability::Stable { since: a.min(b) }
+        }
+        (stable @ RustStability::Stable { .. }, _) | (_, stable @ RustStability::Stable { .. }) => {
+            stable
+        }
+        (RustStability::Uncertified, _) | (_, RustStability::Uncertified) => {
+            RustStability::Uncertified
+        }
+        (RustStability::Unstable { features: a }, RustStability::Unstable { features: b }) => {
+            let chosen = if (a.len(), &a) <= (b.len(), &b) { a } else { b };
+            RustStability::unstable(chosen)
+        }
+    }
+}
+
+enum StabilityReference {
+    Item(usize),
+    Proven {
+        source: String,
+        item: Id,
+        member: Option<String>,
+    },
+    Missing,
+}
+
+struct StabilityNode {
+    source: usize,
+    identity: StabilityReference,
+    local: RustStability,
+    root: bool,
+    routes: Vec<StabilityReference>,
+    constraints: Vec<StabilityReference>,
+}
+
+/// This graph lives for one artifact/source-set production query. Foreign
+/// references retain exact source/item coordinates from verified sysroot proofs.
+#[derive(Default)]
+struct RustStabilityGraph {
+    nodes: Vec<StabilityNode>,
+    documents: RandomHashMap<String, StabilityDocument>,
+    uses: Vec<(StabilityReference, usize)>,
+    declarations: RandomHashMap<String, Vec<usize>>,
+    // Exact structured fact/pattern keys keep delayed assignment private to this query.
+    implementations: RandomHashMap<(RustSelfPattern, ImplementedTraitFact), String>,
+}
+
+struct StabilityDocument {
+    items: HashMap<Id, usize>,
+    trait_members: HashMap<Id, RandomHashMap<String, Option<usize>>>,
+}
+
+fn item_stability(item: &Item) -> RustStability {
+    match item.stability.as_deref() {
+        Some(rustdoc_types::Stability {
+            feature,
+            level: rustdoc_types::StabilityLevel::Unstable,
+        }) => RustStability::unstable(vec![feature.clone()]),
+        Some(rustdoc_types::Stability {
+            level: rustdoc_types::StabilityLevel::Stable { since: Some(since) },
+            ..
+        }) => semver::Version::parse(since)
+            .ok()
+            .filter(|version| version.pre.is_empty() && version.build.is_empty())
+            .map_or(RustStability::Uncertified, |version| {
+                RustStability::Stable {
+                    since: GuardVersion::of(&version),
+                }
+            }),
+        _ => RustStability::Uncertified,
+    }
+}
+
+impl RustStabilityGraph {
+    fn generic_implementation_key(fact: &GenericTraitImplFact) -> ImplementedTraitFact {
+        let mut key = fact.implementation.clone();
+        key.type_parameters = fact.type_parameters.clone();
+        key.self_pattern = Some(fact.self_pattern.clone());
+        key.bounds = fact.bounds.clone();
+        key
+    }
+
+    fn assign_generic_implementation(
+        &self,
+        fact: &mut GenericTraitImplFact,
+        certificates: &RandomHashMap<&str, RustStability>,
+    ) {
+        let mut key = Self::generic_implementation_key(fact);
+        self.assign_implementation(&fact.self_pattern, &mut key, certificates);
+        fact.implementation.rust_stability = key.rust_stability;
+    }
+
+    fn record_implementation(
+        &mut self,
+        source: Option<&str>,
+        item: Id,
+        pattern: &RustSelfPattern,
+        fact: &ImplementedTraitFact,
+    ) {
+        let node = self.item(source, item);
+        let next = self.implementations.len();
+        let id = self
+            .implementations
+            .entry((pattern.clone(), fact.clone()))
+            .or_insert_with(|| format!("rustdoc-impl-certificate:{next}"));
+        self.declarations.entry(id.clone()).or_default().push(node);
+    }
+
+    fn assign_implementation(
+        &self,
+        pattern: &RustSelfPattern,
+        fact: &mut ImplementedTraitFact,
+        certificates: &RandomHashMap<&str, RustStability>,
+    ) {
+        let mut key = (pattern.clone(), fact.clone());
+        key.1.rust_stability = None;
+        fact.rust_stability = Some(
+            self.implementations
+                .get(&key)
+                .and_then(|id| {
+                    let nodes = &self.declarations[id];
+                    if nodes.len() > 1 {
+                        // Projection can erase distinct impls. Alternatives must
+                        // not let one impl's stability vouch for another.
+                        let identity = self.resolve(&self.nodes[nodes[0]].identity);
+                        if identity.is_none()
+                            || nodes
+                                .iter()
+                                .any(|node| self.resolve(&self.nodes[*node].identity) != identity)
+                        {
+                            return None;
+                        }
+                    }
+                    certificates.get(id.as_str())
+                })
+                .cloned()
+                .unwrap_or(RustStability::Uncertified),
+        );
+    }
+
+    fn add_document(
+        &mut self,
+        document: &RustdocCrate,
+        source: Option<&str>,
+        items: &[&Item],
+        parents: &HashMap<Id, Id>,
+        proven: Option<&HashMap<Id, ProvenRustdocItem>>,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<(), ()> {
+        let source_index = self.documents.len();
+        let mut trait_members: HashMap<Id, RandomHashMap<String, Option<usize>>> =
+            HashMap::default();
+        let mut ids = HashMap::default();
+        for (offset, item) in items.iter().enumerate() {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return Err(());
+            }
+            ids.insert(item.id, self.nodes.len() + offset);
+        }
+        let foreign_reference = |id: Id| {
+            proven.and_then(|proven| proven.get(&id)).map_or(
+                StabilityReference::Missing,
+                |target| StabilityReference::Proven {
+                    source: target.source_path.clone(),
+                    item: target.item_id,
+                    member: None,
+                },
+            )
+        };
+        let root_crate_id = document.index[&document.root].crate_id;
+        let reference = |id: Id| {
+            // Inlined foreign items are presentations, not defining-document
+            // authority. Their IDs require the same verified correspondence as
+            // foreign references absent from this document's index.
+            if document
+                .index
+                .get(&id)
+                .is_some_and(|item| item.crate_id == root_crate_id)
+            {
+                ids.get(&id).map_or(StabilityReference::Missing, |index| {
+                    StabilityReference::Item(*index)
+                })
+            } else {
+                foreign_reference(id)
+            }
+        };
+        for item in items {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return Err(());
+            }
+            let index = ids[&item.id];
+            let parent = parents.get(&item.id).and_then(|id| document.index.get(id));
+            let mut routes = Vec::new();
+            if let Some(parent) = parent
+                && public_structural_child(parent, item)
+            {
+                routes.push(reference(parent.id));
+            }
+            // Only an unannotated inherent impl adds no gate of its own.
+            // A trait impl may have been added after both its trait and Self type.
+            let optional_impl = matches!(&item.inner, ItemEnum::Impl(i) if i.trait_.is_none())
+                && item.stability.is_none();
+            let mut local = if optional_impl {
+                RustStability::Stable {
+                    since: GuardVersion::new(0, 0, 0),
+                }
+            } else {
+                item_stability(item)
+            };
+            let mut constraints = Vec::new();
+            if let ItemEnum::Impl(implementation) = &item.inner {
+                if let Some(trait_) = &implementation.trait_ {
+                    constraints.push(reference(trait_.id));
+                }
+                let mut self_type = &implementation.for_;
+                while let Type::BorrowedRef { type_, .. } = self_type {
+                    self_type = type_;
+                }
+                match self_type {
+                    Type::ResolvedPath(path) => constraints.push(reference(path.id)),
+                    Type::Primitive(_) => {
+                        if let Some(trait_) = &implementation.trait_
+                            && parent.is_some_and(|parent| {
+                                matches!(parent.inner, ItemEnum::Primitive(_))
+                            })
+                        {
+                            // The primitive display owner is not a Self-type
+                            // constraint; the trait supplies this rooted route.
+                            routes.clear();
+                            routes.push(reference(trait_.id));
+                        }
+                    }
+                    Type::Generic(name)
+                        if implementation.generics.params.iter().any(|parameter| {
+                            parameter.name == *name
+                                && matches!(
+                                    parameter.kind,
+                                    rustdoc_types::GenericParamDefKind::Type { .. }
+                                )
+                        }) => {}
+                    _ => local = restrict_stability(local, RustStability::Uncertified),
+                }
+            }
+            if let Some(Item {
+                inner: ItemEnum::Impl(implementation),
+                ..
+            }) = parent
+                && let Some(trait_) = &implementation.trait_
+            {
+                let name = item.name.as_ref();
+                if let Some(Item {
+                    inner: ItemEnum::Trait(trait_item),
+                    crate_id,
+                    ..
+                }) = document.index.get(&trait_.id)
+                    && *crate_id == root_crate_id
+                {
+                    let matching = trait_item
+                        .items
+                        .iter()
+                        .filter(|id| {
+                            document.index.get(id).and_then(|item| item.name.as_ref()) == name
+                        })
+                        .copied()
+                        .collect::<Vec<_>>();
+                    if matching.is_empty() {
+                        constraints.push(StabilityReference::Missing);
+                    }
+                    constraints.extend(matching.into_iter().map(reference));
+                } else if let Some(name) = name {
+                    let member = match foreign_reference(trait_.id) {
+                        StabilityReference::Proven { source, item, .. } => {
+                            StabilityReference::Proven {
+                                source,
+                                item,
+                                member: Some(name.clone()),
+                            }
+                        }
+                        _ => StabilityReference::Missing,
+                    };
+                    constraints.push(member);
+                } else {
+                    constraints.push(StabilityReference::Missing);
+                }
+            }
+            let identity = if item.crate_id != document.index[&document.root].crate_id {
+                // A proven foreign definition supplies another route. Foreign
+                // constraints also resolve through that defining document.
+                let target = foreign_reference(item.id);
+                if matches!(target, StabilityReference::Proven { .. }) {
+                    self.uses.push((target, index));
+                }
+                foreign_reference(item.id)
+            } else {
+                StabilityReference::Item(index)
+            };
+            if let Some(parent) = parent
+                && matches!(parent.inner, ItemEnum::Trait(_))
+                && let Some(name) = &item.name
+            {
+                trait_members
+                    .entry(parent.id)
+                    .or_default()
+                    .entry(name.clone())
+                    .and_modify(|member| *member = None)
+                    .or_insert(Some(index));
+            }
+            if let ItemEnum::Use(import) = &item.inner
+                && matches!(item.visibility, RustVisibility::Public)
+                && let Some(target) = import.id
+            {
+                self.uses.push((reference(target), index));
+            }
+            self.nodes.push(StabilityNode {
+                source: source_index,
+                identity,
+                local,
+                root: item.id == document.root,
+                routes,
+                constraints,
+            });
+        }
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Err(());
+        }
+        self.documents.insert(
+            source.unwrap_or_default().to_owned(),
+            StabilityDocument {
+                items: ids,
+                trait_members,
+            },
+        );
+        Ok(())
+    }
+
+    fn item(&self, source: Option<&str>, id: Id) -> usize {
+        self.documents[source.unwrap_or_default()].items[&id]
+    }
+
+    fn resolve(&self, reference: &StabilityReference) -> Option<usize> {
+        match reference {
+            StabilityReference::Item(index) => Some(*index),
+            StabilityReference::Proven {
+                source,
+                item,
+                member,
+            } => {
+                let document = self.documents.get(source)?;
+                if let Some(name) = member {
+                    document
+                        .trait_members
+                        .get(item)?
+                        .get(name)
+                        .copied()
+                        .flatten()
+                } else {
+                    document.items.get(item).copied()
+                }
+            }
+            StabilityReference::Missing => None,
+        }
+    }
+
+    fn declaration_certificates(
+        &self,
+        certificates: &[Option<RustStability>],
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<RandomHashMap<&str, RustStability>, ()> {
+        let mut declarations = RandomHashMap::with_capacity(self.declarations.len());
+        for (id, nodes) in &self.declarations {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return Err(());
+            }
+            let first = nodes.first().expect("declaration has graph nodes");
+            let identity = self.resolve(&self.nodes[*first].identity);
+            let cross_document = nodes
+                .iter()
+                .any(|node| self.nodes[*node].source != self.nodes[*first].source);
+            let certificate = if cross_document
+                && (identity.is_none()
+                    || nodes
+                        .iter()
+                        .any(|node| self.resolve(&self.nodes[*node].identity) != identity))
+            {
+                RustStability::Uncertified
+            } else {
+                nodes
+                    .iter()
+                    .map(|index| {
+                        certificates[*index]
+                            .clone()
+                            .unwrap_or(RustStability::Uncertified)
+                    })
+                    .reduce(alternative_stability)
+                    .expect("declaration has graph nodes")
+            };
+            declarations.insert(id.as_str(), certificate);
+        }
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Err(());
+        }
+        Ok(declarations)
+    }
+
+    fn evaluate(
+        &self,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<RandomHashMap<&str, RustStability>, ()> {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Err(());
+        }
+        let mut routes = Vec::with_capacity(self.nodes.len());
+        let mut constraints = Vec::with_capacity(self.nodes.len());
+        for node in &self.nodes {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return Err(());
+            }
+            routes.push(
+                node.routes
+                    .iter()
+                    .filter_map(|route| self.resolve(route))
+                    .collect::<Vec<_>>(),
+            );
+            constraints.push(
+                node.constraints
+                    .iter()
+                    .map(|constraint| self.resolve(constraint))
+                    .collect::<Vec<_>>(),
+            );
+        }
+        for (target, use_) in &self.uses {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return Err(());
+            }
+            if let Some(index) = self.resolve(target) {
+                routes[index].push(*use_);
+            } else {
+                // Missing/ambiguous correspondence is a constraint on the
+                // referring route, never an alternative for an arbitrary item.
+                constraints[*use_].push(None);
+            }
+        }
+        let mut dependents = vec![Vec::new(); self.nodes.len()];
+        for index in 0..self.nodes.len() {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return Err(());
+            }
+            for dependency in routes[index]
+                .iter()
+                .chain(constraints[index].iter().flatten())
+            {
+                dependents[*dependency].push(index);
+            }
+        }
+        let mut certificates: Vec<Option<RustStability>> = vec![None; self.nodes.len()];
+        let mut queue = (0..self.nodes.len()).collect::<VecDeque<_>>();
+        let mut queued = vec![true; self.nodes.len()];
+        let mut updates = vec![0; self.nodes.len()];
+        while let Some(index) = queue.pop_front() {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return Err(());
+            }
+            queued[index] = false;
+            let route = if self.nodes[index].root {
+                Some(RustStability::Stable {
+                    since: GuardVersion::new(0, 0, 0),
+                })
+            } else {
+                routes[index]
+                    .iter()
+                    .filter_map(|parent| certificates[*parent].clone())
+                    .reduce(alternative_stability)
+            };
+            let mut next =
+                route.map(|route| restrict_stability(self.nodes[index].local.clone(), route));
+            for constraint in &constraints[index] {
+                let value = constraint.map_or(Some(RustStability::Uncertified), |dependency| {
+                    certificates[dependency].clone()
+                });
+                next = next
+                    .zip(value)
+                    .map(|(left, right)| restrict_stability(left, right));
+            }
+            if certificates[index] != next {
+                updates[index] += 1;
+                // No route enumeration: one monotone certificate per node.
+                // 1024 improvements allow far more release bounds than std has;
+                // pathological cycles/inputs fail closed for this production query.
+                if updates[index] > 1024 {
+                    certificates.fill(None);
+                    return self.declaration_certificates(&certificates, cancellation);
+                }
+                certificates[index] = next;
+                for dependent in &dependents[index] {
+                    if !queued[*dependent] {
+                        queued[*dependent] = true;
+                        queue.push_back(*dependent);
+                    }
+                }
+            }
+        }
+        self.declaration_certificates(&certificates, cancellation)
+    }
 }
 
 fn child_ids(inner: &ItemEnum) -> Vec<Id> {
@@ -3561,6 +4923,16 @@ fn nominal_hierarchy_fact(
             }
             TypeRef::TypeParameter { .. } | TypeRef::Unknown => {}
         }
+    }
+    // The compiled hierarchy contract forbids Unknown anywhere in a target,
+    // including arguments of an otherwise known nominal root (#12213).
+    if target.contains_unknown() {
+        diagnostics.warning(
+            "rust.rustdoc.nonconcrete_hierarchy_unprojected",
+            Some(format!("item.{}", item.0)),
+            format!("hierarchy {hierarchy_kind:?} has unknown type arguments: {target:?}"),
+        );
+        return None;
     }
     Some(HierarchyFact {
         hierarchy_kind,
@@ -3713,6 +5085,7 @@ fn rust_type_ref(
         canonical_owner: None,
         parameter_bindings: &[],
         owner_type_parameters: &[],
+        callable_type_parameters: &[],
         self_type: None,
         limits,
     }
@@ -3725,6 +5098,9 @@ struct RustdocTypeProjection<'a> {
     canonical_owner: Option<(Id, &'a str)>,
     parameter_bindings: &'a [(String, String)],
     owner_type_parameters: &'a [String],
+    /// The projected function's own generics. They shadow every other binder
+    /// and stay `TypeParameter` references to the signature's `type_parameters`.
+    callable_type_parameters: &'a [String],
     self_type: Option<&'a TypeRef>,
     limits: &'a ArtifactProducerLimits,
 }
@@ -3754,8 +5130,11 @@ impl RustdocTypeProjection<'_> {
             // that are not present in the projected declaration's signature.
             // Preserve the uncertainty without producing an invalid pack whose
             // type parameter references cannot be resolved by the compiler.
+            Type::Generic(name) if self.callable_type_parameters.contains(name) => {
+                TypeRef::TypeParameter { name: name.clone() }
+            }
             Type::Generic(name) if name == "Self" && self.self_type.is_some() => {
-                self.self_type.expect("impl self type").clone()
+                self.self_type.expect("impl or trait self type").clone()
             }
             Type::Generic(name)
                 if self
@@ -3859,11 +5238,7 @@ impl RustdocTypeProjection<'_> {
                 nullable: false,
             }
         } else {
-            TypeRef::Named {
-                name: normalized_path(path, self.document),
-                arguments,
-                nullable: false,
-            }
+            TypeRef::Unknown
         }
     }
 
@@ -3910,23 +5285,23 @@ fn path_type_ref(
         canonical_owner: None,
         parameter_bindings: &[],
         owner_type_parameters: &[],
+        callable_type_parameters: &[],
         self_type: None,
         limits,
     }
     .path(path, diagnostics, depth)
 }
 
-fn normalized_path(path: &RustdocPath, document: &RustdocCrate) -> String {
+fn normalized_path(path: &RustdocPath, document: &RustdocCrate) -> Option<String> {
     document
         .paths
         .get(&path.id)
         .map(|summary| summary.path.join("."))
-        .unwrap_or_else(|| path.path.replace("::", "."))
 }
 
 fn resolved_type_name(ty: &Type, document: &RustdocCrate) -> Option<String> {
     match ty {
-        Type::ResolvedPath(path) => Some(normalized_path(path, document)),
+        Type::ResolvedPath(path) => normalized_path(path, document),
         Type::Primitive(name) => Some(format!("core.primitive.{name}")),
         Type::Slice(_) => Some("core.primitive.slice".to_owned()),
         Type::Array { .. } => Some("core.primitive.array".to_owned()),
@@ -3953,7 +5328,10 @@ fn owner_name(
 
 // Impl identity must retain trait arguments and the structured self pattern:
 // Extend<T> and Extend<&T> can have otherwise identical method signatures.
-fn trait_impl_identity(implementation: &rustdoc_types::Impl, document: &RustdocCrate) -> String {
+fn trait_impl_identity(
+    implementation: &rustdoc_types::Impl,
+    document: &RustdocCrate,
+) -> Option<String> {
     let mut contract = serde_json::to_value((
         &implementation.for_,
         &implementation.trait_,
@@ -3976,7 +5354,7 @@ fn trait_impl_identity(implementation: &rustdoc_types::Impl, document: &RustdocC
                     };
                     fields.insert(
                         "path".to_owned(),
-                        serde_json::Value::String(normalized_path(&path, document)),
+                        serde_json::Value::String(normalized_path(&path, document)?),
                     );
                     fields.remove("id");
                 }
@@ -3986,9 +5364,9 @@ fn trait_impl_identity(implementation: &rustdoc_types::Impl, document: &RustdocC
             _ => {}
         }
     }
-    lower_hex_string(&sha256_bytes(
+    Some(lower_hex_string(&sha256_bytes(
         &serde_json::to_vec(&contract).expect("normalized impl contract is JSON serializable"),
-    ))
+    )))
 }
 
 fn semantic_visibility(visibility: &RustVisibility) -> Visibility {
@@ -4001,6 +5379,7 @@ fn semantic_visibility(visibility: &RustVisibility) -> Visibility {
 }
 
 struct RustdocProjectionIndex<'a> {
+    source: Option<&'a str>,
     document: &'a RustdocCrate,
     visible: &'a HashSet<Id>,
     parents: &'a HashMap<Id, Id>,
@@ -4036,6 +5415,13 @@ fn apply_impl_hierarchy(
         if !projection.visible.contains(&item.id) {
             continue;
         }
+        if matches!(&implementation.for_, Type::ResolvedPath(path)
+            if normalized_path(path, projection.document).is_none())
+        {
+            links
+                .declarations_interrupted
+                .interrupt_impl(implementation, projection.document);
+        }
         let diagnostics_before = diagnostics.total();
         project_impl_hierarchy(
             item,
@@ -4054,11 +5440,26 @@ fn apply_impl_hierarchy(
                 .cloned()
                 .or_else(|| resolved_type_name(&implementation.for_, projection.document))
         {
-            links.incomplete_callable_owner_refs.push(TypeRef::Named {
-                name: owner,
-                arguments: Vec::new(),
-                nullable: false,
-            });
+            links.incomplete_implementation_owners.insert(owner.clone());
+            // Keep the broad implementation inventory open, but a complete
+            // local trait definition bounds which callable names this one
+            // nominal owner can gain. Other decode vetoes remain owner-wide.
+            let names = impl_proves_single_owner(implementation, projection.document, &owner)
+                .then(|| complete_trait_callable_names(implementation, projection.document))
+                .flatten();
+            if let Some(names) = names {
+                links
+                    .incomplete_owner_callable_names
+                    .entry(owner)
+                    .or_default()
+                    .extend(names);
+            } else {
+                links.incomplete_callable_owner_refs.push(TypeRef::Named {
+                    name: owner,
+                    arguments: Vec::new(),
+                    nullable: false,
+                });
+            }
         }
         project_impl_contract(
             item,
@@ -4081,11 +5482,13 @@ fn compiler_derived_trait_impl(
             matches!(document.index.get(&trait_.id).map(|item| &item.inner),
             Some(ItemEnum::Trait(ty)) if ty.is_auto)
                 || matches!(
-                    normalized_path(trait_, document).as_str(),
-                    "core.marker.Send"
-                        | "core.marker.Sync"
-                        | "core.marker.Unpin"
-                        | "core.marker.Sized"
+                    normalized_path(trait_, document).as_deref(),
+                    Some(
+                        "core.marker.Send"
+                            | "core.marker.Sync"
+                            | "core.marker.Unpin"
+                            | "core.marker.Sized"
+                    )
                 )
         })
 }
@@ -4180,7 +5583,15 @@ fn project_impl_contract(
         return;
     }
     if let Some(trait_) = &implementation.trait_ {
-        let trait_name = normalized_path(trait_, projection.document);
+        let Some(trait_name) = normalized_path(trait_, projection.document) else {
+            links.declarations_interrupted = DeclarationInterruptions::Global;
+            diagnostics.warning(
+                "rust.rustdoc.missing_trait_path",
+                Some(format!("item.{}", item.id.0)),
+                "implementation trait has no structured rustdoc summary",
+            );
+            return;
+        };
         if compiler_derived_trait_impl(implementation, projection.document) {
             links.auto_traits.insert(trait_name);
             return;
@@ -4214,6 +5625,28 @@ fn project_impl_contract(
             diagnostics,
             0,
         );
+        // An erased self owner can correspond to any declaration. Preserve both
+        // open inventories and a trait-owned rule even for a non-generic impl
+        // whose external path summary supplies a spelling.
+        let mut unknown_self = false;
+        brokk_bifrost_semantic::analyzer::semantic::common::visit_type_refs([&self_type], |ty| {
+            unknown_self |= matches!(ty, TypeRef::Unknown)
+        });
+        if unknown_self {
+            links.unknown_implementation_owners = true;
+            links.incomplete_generic_traits.insert(trait_name.clone());
+        }
+        if implementation_fact.trait_type == TypeRef::Unknown {
+            // An unproven trait may be any trait, including one reached through
+            // a different re-export path. Only declaration IDs can localize the
+            // owning inventory; an unproven self type leaves every owner open.
+            links.unknown_trait_implementations = true;
+            if let TypeRef::Declared { id, .. } = &self_type {
+                links.incomplete_implementation_owner_ids.insert(id.clone());
+            } else {
+                links.unknown_implementation_owners = true;
+            }
+        }
         // Unsupported predicates and erased types cannot justify negative
         // evidence or a closed inventory. Keep other owners independently usable.
         let mut reviewed = implementation_conditions_supported(&implementation.generics);
@@ -4292,7 +5725,7 @@ fn project_impl_contract(
             }
         }
         if !reviewed || !pattern_reviewed {
-            // The list remains exhaustive; applicability is explicitly open.
+            // Retain this implementation as open applicability evidence.
             // Unknown is not an impossible condition, including for negatives.
             if !pattern_reviewed {
                 pattern = Some(RustSelfPattern::Constructor {
@@ -4303,6 +5736,7 @@ fn project_impl_contract(
             bounds = vec![GenericTraitBound {
                 subject: TypeRef::Unknown,
                 bound: ImplementedTraitFact {
+                    rust_stability: None,
                     is_negative: false,
                     type_parameters: Vec::new(),
                     self_pattern: None,
@@ -4315,7 +5749,7 @@ fn project_impl_contract(
             for binding in &mut implementation_fact.associated_types {
                 binding.r#type = TypeRef::Unknown;
             }
-            // A Path always retains the trait's identity even if its arguments
+            // A known nominal trait keeps its identity when only its arguments
             // cannot be represented. Erase arguments rather than its owner.
             if let TypeRef::Declared { arguments, .. } | TypeRef::Named { arguments, .. } =
                 &mut implementation_fact.trait_type
@@ -4330,11 +5764,20 @@ fn project_impl_contract(
         }
         // Lifetime-only and non-nominal targets still need a trait-owned
         // rule when no concrete declaration can carry their applicability.
-        let needs_rule = !implementation.generics.params.is_empty() || owner_name.is_none();
+        let needs_rule =
+            unknown_self || !implementation.generics.params.is_empty() || owner_name.is_none();
         let mut concrete = implementation_fact.clone();
         concrete.type_parameters = parameters.clone();
         concrete.self_pattern = pattern.clone();
         concrete.bounds = bounds.clone();
+        if let Some(pattern) = &concrete.self_pattern {
+            links.rust_stability_graph.record_implementation(
+                projection.source,
+                item.id,
+                pattern,
+                &concrete,
+            );
+        }
         if let Some(owner_item) = owner_name
             .as_ref()
             .and_then(|name| projection.type_item_by_name.get(name))
@@ -4346,13 +5789,19 @@ fn project_impl_contract(
             // document. Its defining type need not be repeated locally.
             links.concrete_trait_impls.push((owner, concrete));
         }
-        if needs_rule {
+        if needs_rule && implementation_fact.trait_type != TypeRef::Unknown {
             let fact = GenericTraitImplFact {
                 type_parameters: parameters,
                 self_pattern: pattern.expect("reviewed generic self pattern"),
                 bounds,
                 implementation: implementation_fact,
             };
+            links.rust_stability_graph.record_implementation(
+                projection.source,
+                item.id,
+                &fact.self_pattern,
+                &RustStabilityGraph::generic_implementation_key(&fact),
+            );
             if let Some(position) = projection.type_position.get(&trait_.id) {
                 union_facts(&mut types[*position].generic_trait_impls, vec![fact]);
             } else {
@@ -4890,7 +6339,7 @@ fn hashmap_insert_flow(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::path::Path;
 
     use crate::analyzer::rust::test_support::rustdoc_item as item;
@@ -4900,9 +6349,30 @@ mod tests {
     #[test]
     fn uncertified_fields_are_not_read_by_current_producer() {
         let source = include_str!("rustdoc_artifact.rs");
-        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let production = source
+            .split_once("#[cfg(test)]\npub(super) mod tests")
+            .unwrap()
+            .0;
         let external = include_str!("external.rs");
-        for (_, field_read, _, _) in conversion_contract::UNCERTIFIED_FIELD_READS {
+        for (field, field_read, _, _) in conversion_contract::UNCERTIFIED_FIELD_READS {
+            if *field == "Item::stability" {
+                assert!(
+                    !external.contains(field_read),
+                    "undeclared stability read in external producer"
+                );
+                assert!(production.contains("if envelope.conversion.is_some()"));
+                // Declared native Item reads; route evaluation uses the typed graph.
+                let guarded_reads = [("item.stability", 3)];
+                for (read, count) in guarded_reads {
+                    assert_eq!(
+                        production.matches(read).count(),
+                        count,
+                        "undeclared read of {read}"
+                    );
+                }
+                assert_eq!(production.matches(".stability").count(), 3);
+                continue;
+            }
             assert!(
                 !production.contains(field_read),
                 "new read of {field_read} needs a contract update"
@@ -5397,7 +6867,7 @@ mod tests {
             .expect("zero retained routes still publish a pack");
         assert!(zero.rust_external_reexports.is_empty());
         assert!(zero.rust_external_reexports_truncated);
-        assert_eq!(zero.schema_version, brokk_bifrost_semantic::analyzer::semantic_model::RUST_EXTERNAL_REEXPORTS_MIN_SCHEMA_VERSION);
+        assert_eq!(zero.schema_version, RUSTDOC_PACK_MAX_SCHEMA_VERSION);
     }
 
     #[test]
@@ -5468,7 +6938,7 @@ mod tests {
         let pack = product
             .pack
             .unwrap_or_else(|| panic!("{:#?}", product.diagnostics));
-        assert_eq!(pack.schema_version, 29);
+        assert_eq!(pack.schema_version, RUSTDOC_PACK_MAX_SCHEMA_VERSION);
         assert!(!pack.rust_external_reexports.is_empty());
         let mut old = pack.clone();
         old.schema_version = 28;
@@ -5618,7 +7088,7 @@ mod tests {
             None,
         );
         let pack = production.pack.unwrap();
-        assert_eq!(pack.schema_version, 32);
+        assert_eq!(pack.schema_version, RUSTDOC_PACK_MAX_SCHEMA_VERSION);
         let AuthoredPayload::DeclarationFacts { types, .. } = &pack.shards[0].payload else {
             unreachable!()
         };
@@ -5808,8 +7278,9 @@ mod tests {
                     _ => None,
                 })
                 .unwrap();
-            assert_eq!(alias.alias_target.is_some(), include_core);
-            assert_eq!(pack.schema_version == 32, include_core);
+            // #12213: selected source files do not prove dependency correspondence.
+            assert!(alias.alias_target.is_none());
+            assert_eq!(pack.schema_version, RUSTDOC_PACK_MAX_SCHEMA_VERSION);
             if include_core {
                 compile_pack(&pack, &CompilerOptions::default()).unwrap();
             }
@@ -6078,6 +7549,450 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12734: erased impl identities shared stability; borrowed Self lost constraints"
+    )]
+    fn native_artifact_effective_stability() {
+        // The fixture crosses the real JSON decoder and authored model boundary.
+        // It uses the format-61 typed fixture, serialized to an artifact on disk.
+        let stable = serde_json::json!({"feature":"base", "level":{"stable":{"since":"1.0.0"}}});
+        let unstable = serde_json::json!({"feature":"experimental", "level":"unstable"});
+        for case in 0..21 {
+            let mut json = serde_json::to_value(hashmap_document("std")).unwrap();
+            for item in json["index"].as_object_mut().unwrap().values_mut() {
+                item["stability"] = stable.clone();
+            }
+            let expected = match case {
+                0 | 7 | 9 | 18 | 19 => RustStability::Stable {
+                    since: GuardVersion::new(1, 0, 0),
+                },
+                1 | 3 | 6 | 11 | 13 | 16 => RustStability::Uncertified,
+                2 | 8 | 10 | 12 | 20 => RustStability::unstable(vec!["experimental".into()]),
+                4 => RustStability::Stable {
+                    since: GuardVersion::new(1, 75, 0),
+                },
+                5 => RustStability::Stable {
+                    since: GuardVersion::new(1, 0, 0),
+                },
+                17 => RustStability::Stable {
+                    since: GuardVersion::new(1, 90, 0),
+                },
+                14 => RustStability::unstable(vec!["a".into(), "b".into()]),
+                15 => RustStability::unstable(vec!["a".into()]),
+                _ => unreachable!(),
+            };
+            match case {
+                1 => {
+                    json["index"]["3"]["stability"] =
+                        serde_json::json!({"feature":"base", "level":{"stable":{"since":null}}})
+                }
+                2 => json["index"]["3"]["stability"] = unstable.clone(),
+                3 => json["index"]["3"]["stability"] = serde_json::Value::Null,
+                4 => {
+                    json["index"]["2"]["stability"]["level"]["stable"]["since"] =
+                        serde_json::json!("1.75.0")
+                }
+                5 => json["index"]["2"]["stability"] = serde_json::Value::Null,
+                6 | 8 | 12 | 13 | 17 | 18 | 19 | 20 => {
+                    if case == 6 {
+                        json["index"]["2"]["stability"] = serde_json::Value::Null;
+                    }
+                    json["index"]["2"]["inner"]["impl"]["trait"] =
+                        serde_json::json!({"path":"std::Example", "id":20, "args":null});
+                    let mut trait_item = json["index"]["1"].clone();
+                    trait_item["id"] = serde_json::json!(20);
+                    trait_item["name"] = serde_json::json!("Example");
+                    trait_item["inner"] = serde_json::json!({"trait":{
+                        "is_auto":false,"is_unsafe":false,"is_dyn_compatible":true,
+                        "items":[21],"generics":{"params":[],"where_predicates":[]},
+                        "bounds":[],"implementations":[2]
+                    }});
+                    let mut member = json["index"]["3"].clone();
+                    member["id"] = serde_json::json!(21);
+                    json["paths"]["20"] =
+                        serde_json::json!({"crate_id":0,"path":["std","Example"],"kind":"trait"});
+                    if matches!(case, 6 | 12 | 13) {
+                        json["index"]["1"]["stability"]["level"]["stable"]["since"] =
+                            serde_json::json!("1.75.0");
+                    }
+                    if case == 17 {
+                        json["index"]["1"]["stability"]["level"]["stable"]["since"] =
+                            serde_json::json!("1.75.0");
+                        json["index"]["2"]["stability"]["level"]["stable"]["since"] =
+                            serde_json::json!("1.90.0");
+                    }
+                    if case == 12 {
+                        trait_item["stability"] = unstable.clone();
+                    }
+                    json["index"]["20"] = trait_item;
+                    json["index"]["21"] = member;
+                    json["index"]["0"]["inner"]["module"]["items"] = serde_json::json!([1, 20]);
+                    if case == 13 {
+                        // A matching foreign path without correspondence is no proof.
+                        json["index"].as_object_mut().unwrap().remove("20");
+                        json["index"].as_object_mut().unwrap().remove("21");
+                        json["index"]["0"]["inner"]["module"]["items"] = serde_json::json!([1]);
+                        json["paths"]["20"]["crate_id"] = serde_json::json!(1);
+                    }
+                    if case == 19 {
+                        json["index"]["2"]["inner"]["impl"]["generics"] = serde_json::json!({
+                            "params":[{"name":"T","kind":{"type":{
+                                "bounds":[{"trait_bound":{"trait":{"path":"std::Example","id":20,"args":null},"generic_params":[],"modifier":"none"}}],
+                                "default":null,"is_synthetic":false
+                            }}}],"where_predicates":[]
+                        });
+                        let reference = serde_json::json!({"borrowed_ref":{"lifetime":null,"is_mutable":false,"type":{"generic":"T"}}});
+                        json["index"]["2"]["inner"]["impl"]["for"] = reference;
+                        json["index"]["1"]["inner"]["struct"]["impls"] = serde_json::json!([]);
+                        for id in ["3", "21"] {
+                            json["index"][id]["inner"]["function"]["sig"]["inputs"] =
+                                serde_json::json!([]);
+                            json["index"][id]["inner"]["function"]["sig"]["output"] =
+                                serde_json::Value::Null;
+                        }
+                    }
+                    if case == 20 {
+                        // Root through the stable trait; only inner Self adds a gate.
+                        json["index"]["1"]["inner"]["struct"]["impls"] = serde_json::json!([]);
+                        let inner = json["index"]["2"]["inner"]["impl"]["for"].clone();
+                        json["index"]["2"]["inner"]["impl"]["for"] = serde_json::json!({"borrowed_ref":{"lifetime":null,"is_mutable":false,"type":inner}});
+                        json["index"]["1"]["stability"] = unstable.clone();
+                    }
+                    if case == 18 {
+                        // Different predicates erase to the same unknown bound.
+                        json["index"]["2"]["inner"]["impl"]["generics"]["where_predicates"] = serde_json::json!([
+                            {"eq_predicate":{"lhs":{"primitive":"u8"},"rhs":{"type":{"primitive":"u16"}}}}
+                        ]);
+                        let mut other = json["index"]["2"].clone();
+                        other["id"] = serde_json::json!(22);
+                        other["stability"] = unstable.clone();
+                        other["inner"]["impl"]["items"] = serde_json::json!([]);
+                        other["inner"]["impl"]["generics"]["where_predicates"][0]["eq_predicate"]
+                            ["rhs"]["type"]["primitive"] = serde_json::json!("u32");
+                        json["index"]["22"] = other;
+                        json["index"]["1"]["inner"]["struct"]["impls"] = serde_json::json!([2, 22]);
+                        json["index"]["20"]["inner"]["trait"]["implementations"] =
+                            serde_json::json!([2, 22]);
+                    }
+                    if case == 8 {
+                        // Trait id 1 wins parent_index over Self type id 40.
+                        // Both list impl 2; its stable member must still see
+                        // the implementing type's explicit instability.
+                        let mut self_type = json["index"]["1"].take();
+                        self_type["id"] = serde_json::json!(40);
+                        self_type["stability"] = unstable.clone();
+                        let mut trait_item = json["index"]["20"].take();
+                        trait_item["id"] = serde_json::json!(1);
+                        json["index"]["1"] = trait_item;
+                        json["index"]["40"] = self_type;
+                        json["index"].as_object_mut().unwrap().remove("20");
+                        json["paths"]["40"] = json["paths"]["1"].take();
+                        json["paths"]["1"] = json["paths"]["20"].take();
+                        json["paths"].as_object_mut().unwrap().remove("20");
+                        json["index"]["2"]["inner"]["impl"]["trait"]["id"] = serde_json::json!(1);
+                        json["index"]["2"]["inner"]["impl"]["for"]["resolved_path"]["id"] =
+                            serde_json::json!(40);
+                        json["index"]["0"]["inner"]["module"]["items"] = serde_json::json!([1, 40]);
+                    }
+                }
+                7 | 9 | 10 | 11 => {
+                    let mut module = json["index"]["0"].clone();
+                    module["id"] = serde_json::json!(30);
+                    module["name"] = serde_json::json!("experimental");
+                    module["visibility"] = serde_json::json!("public");
+                    module["stability"] = unstable.clone();
+                    module["inner"]["module"]["is_crate"] = serde_json::json!(false);
+                    module["inner"]["module"]["items"] = serde_json::json!([31]);
+                    let mut export = module.clone();
+                    export["id"] = serde_json::json!(31);
+                    export["name"] = serde_json::json!("Map");
+                    export["stability"] = stable.clone();
+                    export["inner"] = serde_json::json!({"use":{"source":"std::HashMap","name":"Map","id":1,"is_glob":false}});
+                    json["index"]["30"] = module;
+                    json["index"]["31"] = export;
+                    json["index"]["0"]["inner"]["module"]["items"] = serde_json::json!([1, 30]);
+                    if case == 9 {
+                        json["index"]["30"]["stability"] = serde_json::json!({"feature":"later", "level":{"stable":{"since":"1.75.0"}}});
+                    }
+                    if matches!(case, 10 | 11) {
+                        let mut private = json["index"]["30"].clone();
+                        private["id"] = serde_json::json!(40);
+                        private["name"] = serde_json::json!("private");
+                        private["visibility"] = serde_json::json!("default");
+                        private["stability"] = stable.clone();
+                        private["inner"]["module"]["items"] = serde_json::json!([1]);
+                        json["index"]["40"] = private;
+                        json["index"]["0"]["inner"]["module"]["items"] =
+                            serde_json::json!([30, 40]);
+                    }
+                    if case == 11 {
+                        let mut unknown = json["index"]["30"].clone();
+                        unknown["id"] = serde_json::json!(50);
+                        unknown["name"] = serde_json::json!("unknown");
+                        unknown["stability"] = serde_json::Value::Null;
+                        unknown["inner"]["module"]["items"] = serde_json::json!([51]);
+                        let mut export = json["index"]["31"].clone();
+                        export["id"] = serde_json::json!(51);
+                        json["index"]["50"] = unknown;
+                        json["index"]["51"] = export;
+                        json["index"]["0"]["inner"]["module"]["items"] =
+                            serde_json::json!([30, 40, 50]);
+                    }
+                }
+                14 | 16 => {
+                    json["index"]["3"]["stability"] =
+                        serde_json::json!({"feature":"a","level":"unstable"});
+                    json["index"]["2"]["stability"] = if case == 14 {
+                        serde_json::json!({"feature":"b","level":"unstable"})
+                    } else {
+                        serde_json::Value::Null
+                    };
+                    if case == 16 {
+                        json["index"]["1"]["stability"] = serde_json::Value::Null;
+                    }
+                }
+                15 => {
+                    let mut defining = json["index"]["0"].clone();
+                    defining["id"] = serde_json::json!(40);
+                    defining["name"] = serde_json::json!("defining");
+                    defining["visibility"] = serde_json::json!("public");
+                    defining["stability"] = serde_json::json!({"feature":"a","level":"unstable"});
+                    defining["inner"]["module"]["is_crate"] = serde_json::json!(false);
+                    defining["inner"]["module"]["items"] = serde_json::json!([1]);
+                    json["index"]["40"] = defining;
+                    let mut module = json["index"]["0"].clone();
+                    module["id"] = serde_json::json!(30);
+                    module["name"] = serde_json::json!("alternative");
+                    module["visibility"] = serde_json::json!("public");
+                    module["stability"] = serde_json::json!({"feature":"b","level":"unstable"});
+                    module["inner"]["module"]["is_crate"] = serde_json::json!(false);
+                    module["inner"]["module"]["items"] = serde_json::json!([31]);
+                    let mut export = module.clone();
+                    export["id"] = serde_json::json!(31);
+                    export["name"] = serde_json::json!("Map");
+                    export["stability"] = serde_json::json!({"feature":"c","level":"unstable"});
+                    export["inner"] = serde_json::json!({"use":{"source":"std::HashMap","name":"Map","id":1,"is_glob":false}});
+                    json["index"]["30"] = module;
+                    json["index"]["31"] = export;
+                    json["index"]["0"]["inner"]["module"]["items"] = serde_json::json!([40, 30]);
+                }
+                _ => {}
+            }
+            let file = tempfile::NamedTempFile::new().unwrap();
+            fs::write(file.path(), serde_json::to_vec(&json).unwrap()).unwrap();
+            let request = hashmap_request(file.path().to_path_buf(), "std");
+            let product =
+                RustdocJsonPackProducer.produce(&request, &ArtifactProducerLimits::default(), None);
+            let pack = product
+                .pack
+                .unwrap_or_else(|| panic!("case {case}: {:?}", product.diagnostics));
+            if !matches!(case, 19 | 20) {
+                let found = pack
+                    .shards
+                    .iter()
+                    .flat_map(|shard| match &shard.payload {
+                        AuthoredPayload::DeclarationFacts { members, .. } => {
+                            members.iter().collect::<Vec<_>>()
+                        }
+                        _ => Vec::new(),
+                    })
+                    .find(|member| {
+                        member.name == "insert"
+                            && (!matches!(case, 6 | 8 | 12 | 13 | 17)
+                                || member.implemented_trait.is_some())
+                    })
+                    .expect("insert member");
+                assert_eq!(
+                    found.rust_stability.as_ref(),
+                    Some(&expected),
+                    "case {case}"
+                );
+            }
+            if case == 18 {
+                let implementations = pack
+                    .shards
+                    .iter()
+                    .flat_map(|shard| match &shard.payload {
+                        AuthoredPayload::DeclarationFacts { types, .. } => types
+                            .iter()
+                            .flat_map(|ty| {
+                                ty.implemented_traits.iter().chain(
+                                    ty.generic_trait_impls
+                                        .iter()
+                                        .map(|rule| &rule.implementation),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                        _ => Vec::new(),
+                    })
+                    .collect::<Vec<_>>();
+                assert!(!implementations.is_empty());
+                for implementation in implementations {
+                    assert_eq!(
+                        implementation.rust_stability,
+                        Some(RustStability::Uncertified),
+                        "erased distinct implementations must not share a usable certificate"
+                    );
+                }
+            }
+            if matches!(case, 6 | 8 | 12 | 13 | 17 | 19 | 20) {
+                let implementation = pack
+                    .shards
+                    .iter()
+                    .flat_map(|shard| match &shard.payload {
+                        AuthoredPayload::DeclarationFacts { types, .. } => types
+                            .iter()
+                            .flat_map(|ty| {
+                                ty.implemented_traits.iter().chain(
+                                    ty.generic_trait_impls
+                                        .iter()
+                                        .map(|rule| &rule.implementation),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                        _ => Vec::new(),
+                    })
+                    .next()
+                    .expect("implemented trait fact");
+                assert_eq!(
+                    implementation.rust_stability.as_ref(),
+                    Some(&expected),
+                    "implementation case {case}"
+                );
+            }
+            if matches!(case, 7 | 9 | 10 | 11) {
+                let directory = tempfile::tempdir().unwrap();
+                let mut definition = json.clone();
+                let mut facade = json.clone();
+                facade["index"]
+                    .as_object_mut()
+                    .unwrap()
+                    .retain(|id, _| matches!(id.as_str(), "0" | "30" | "31" | "50" | "51"));
+                facade["index"]["0"]["name"] = serde_json::json!("facade");
+                facade["index"]["0"]["inner"]["module"]["items"] = if case == 11 {
+                    serde_json::json!([50])
+                } else {
+                    serde_json::json!([30])
+                };
+                facade["paths"] = serde_json::json!({"200":{"crate_id":1,"path":["std","collections","HashMap"],"kind":"struct"}});
+                facade["external_crates"] = serde_json::json!({"1":{"name":"std","html_root_url":null,"path":directory.path().join("libstd.rmeta")}});
+                if case == 11 {
+                    facade["index"].as_object_mut().unwrap().remove("30");
+                    facade["index"].as_object_mut().unwrap().remove("31");
+                    facade["index"]["51"]["inner"]["use"]["id"] = serde_json::json!(200);
+                    definition["index"].as_object_mut().unwrap().remove("50");
+                    definition["index"].as_object_mut().unwrap().remove("51");
+                    definition["index"]["0"]["inner"]["module"]["items"] =
+                        serde_json::json!([30, 40]);
+                } else if case == 10 {
+                    facade["index"]["31"]["inner"]["use"]["id"] = serde_json::json!(200);
+                } else {
+                    facade["index"]["31"]["inner"]["use"]["id"] = serde_json::json!(200);
+                    definition["index"].as_object_mut().unwrap().remove("30");
+                    definition["index"].as_object_mut().unwrap().remove("31");
+                    definition["index"]["0"]["inner"]["module"]["items"] = serde_json::json!([1]);
+                }
+                if matches!(case, 7 | 9) {
+                    // Rustdoc can repeat one impl in multiple source documents.
+                    // The duplicate member is a route alternative too.
+                    facade["index"]["2"] = definition["index"]["2"].clone();
+                    facade["index"]["3"] = definition["index"]["3"].clone();
+                    facade["index"]["2"]["inner"]["impl"]["for"]["resolved_path"]["id"] =
+                        serde_json::json!(200);
+                    facade["index"]["2"]["inner"]["impl"]["items"] = serde_json::json!([3]);
+                    facade["index"]["2"]["stability"] = facade["index"]["30"]["stability"].clone();
+                    facade["index"]["0"]["inner"]["module"]["items"] = serde_json::json!([2, 30]);
+                }
+                fs::write(
+                    directory.path().join("std.json"),
+                    serde_json::to_vec(&definition).unwrap(),
+                )
+                .unwrap();
+                fs::write(
+                    directory.path().join("facade.json"),
+                    serde_json::to_vec(&facade).unwrap(),
+                )
+                .unwrap();
+                let limits = ArtifactProducerLimits::default();
+                let paths = ["std.json", "facade.json"].map(std::path::PathBuf::from);
+                let artifact =
+                    read_exact_source_set(directory.path(), &paths, 2, 8, &limits).unwrap();
+                let mut request = hashmap_request(directory.path().join("stdlib"), "std");
+                request.artifact_kind = ExternalArtifactKind::RustdocJsonSet;
+                request.activation[0].package = None;
+                request.activation[0].module = None;
+                let production = RustdocJsonPackProducer.produce_loaded_source_set(
+                    &request,
+                    &limits,
+                    None,
+                    &artifact,
+                    &[
+                        ("std".into(), "std.json".into()),
+                        ("facade".into(), "facade.json".into()),
+                    ],
+                );
+                let pack = production.pack.unwrap_or_else(|| {
+                    panic!("cross-document case {case}: {:?}", production.diagnostics)
+                });
+                assert!(pack.shards.iter().any(|shard| matches!(&shard.payload,
+                    AuthoredPayload::DeclarationFacts { types, .. } if types.iter().any(|fact| fact.name == "facade")
+                )), "facade must participate in cross-document case {case}");
+                let found = pack
+                    .shards
+                    .iter()
+                    .flat_map(|shard| match &shard.payload {
+                        AuthoredPayload::DeclarationFacts { members, .. } => {
+                            members.iter().collect::<Vec<_>>()
+                        }
+                        _ => Vec::new(),
+                    })
+                    .find(|member| member.name == "insert")
+                    .expect("cross-document insert");
+                assert_eq!(
+                    found.rust_stability.as_ref(),
+                    Some(&if matches!(case, 7 | 9) {
+                        RustStability::Uncertified
+                    } else {
+                        RustStability::unstable(vec!["experimental".into()])
+                    }),
+                    "unproven cross-document case {case}"
+                );
+            }
+            // Legacy certificates cannot turn even present metadata into a
+            // native stability proof. The uncertified table remains intact.
+            json["_bifrost_conversion"] = serde_json::json!({
+                "producer_contract": RUSTDOC_PRODUCER_CONTRACT,
+                "uncertified_fields": ["Item::stability"]
+            });
+            fs::write(file.path(), serde_json::to_vec(&json).unwrap()).unwrap();
+            let converted = RustdocJsonPackProducer
+                .produce(&request, &ArtifactProducerLimits::default(), None)
+                .pack
+                .unwrap();
+            for shard in &converted.shards {
+                if let AuthoredPayload::DeclarationFacts { types, members, .. } = &shard.payload {
+                    assert!(
+                        types
+                            .iter()
+                            .all(|fact| fact.rust_stability == Some(RustStability::Uncertified))
+                    );
+                    assert!(
+                        members
+                            .iter()
+                            .all(|fact| fact.rust_stability == Some(RustStability::Uncertified))
+                    );
+                    assert!(
+                        types
+                            .iter()
+                            .flat_map(|ty| &ty.implemented_traits)
+                            .all(|fact| fact.rust_stability == Some(RustStability::Uncertified))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn conversion_certificate_is_parser_and_pack_neutral() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let request = hashmap_request(file.path().to_path_buf(), "std");
@@ -6111,6 +8026,577 @@ mod tests {
             }
         }
         assert_eq!(converted_pack, plain_pack);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12357: unselected sysroot archive members were decompressed without byte accounting"
+    )]
+    fn sysroot_archive_unselected_bytes_count_against_the_limit() {
+        use super::super::rustdoc_sysroot::VerifiedSysrootDocuments;
+        use brokk_bifrost_semantic::analyzer::semantic_model::model::{
+            RustSysrootProvenance, RustToolchainChannel, RustToolchainIdentity, RustdocComponent,
+        };
+        // The selected documents total under 30 KiB and the archive is under
+        // 3 KiB, but an unselected 1 MiB member of zeros must still count.
+        let archive: &[u8] =
+            include_bytes!("../../../tests/fixtures/rustdoc-sysroot/unselected-padding.tar.xz");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("core.json"), b"{}").unwrap();
+        let artifact = read_exact_source_set(
+            dir.path(),
+            &[std::path::PathBuf::from("core.json")],
+            1,
+            8,
+            &ArtifactProducerLimits::default(),
+        )
+        .unwrap();
+        let pins = vec![(
+            "core.json".to_owned(),
+            RustSysrootProvenance {
+                toolchain: RustToolchainIdentity {
+                    release: "1.0.0".into(),
+                    channel: RustToolchainChannel::Stable,
+                    date: "2026-08-23".into(),
+                    commit: "0".repeat(40),
+                },
+                component: RustdocComponent::RustDocsJsonPreview,
+                target: "x86_64-unknown-linux-gnu".into(),
+                archive_sha256: lower_hex_string(&sha256_bytes(archive)),
+                archive_member: "dist/rust-docs-json-preview/share/doc/rust/json/core.json".into(),
+            },
+        )];
+        let limits = ArtifactProducerLimits {
+            max_artifact_bytes: 64 * 1024,
+            ..ArtifactProducerLimits::default()
+        };
+        let Err(error) = VerifiedSysrootDocuments::verify(archive, &artifact, &pins, &limits)
+        else {
+            panic!("an archive that decompresses past the limit must be refused");
+        };
+        assert!(error.contains("exceed byte limit"), "{error}");
+        let count = error
+            .split_whitespace()
+            .find_map(|word| word.parse::<u64>().ok())
+            .unwrap_or_else(|| panic!("the refusal reports its byte count: {error}"));
+        assert!(count > limits.max_artifact_bytes, "{error}");
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12734: inlined foreign IDs bypassed verified defining-document correspondence"
+    )]
+    fn stability_links_require_selected_sysroot_correspondence() {
+        use super::super::rustdoc_sysroot::VerifiedSysrootDocuments;
+        use brokk_bifrost_semantic::analyzer::semantic_model::model::{
+            RustSysrootProvenance, RustToolchainChannel, RustToolchainIdentity, RustdocComponent,
+        };
+        use std::io::Write;
+
+        let stable = serde_json::json!({"feature":"base","level":{"stable":{"since":"1.0.0"}}});
+        for (proven, selected_stable, inlined) in [
+            (false, false, false),
+            (true, false, false),
+            (true, true, false),
+            (false, false, true),
+            (true, false, true),
+            (true, true, true),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut core = serde_json::to_value(hashmap_document("core")).unwrap();
+            let mut client = serde_json::to_value(hashmap_document("std")).unwrap();
+            for document in [&mut core, &mut client] {
+                for item in document["index"].as_object_mut().unwrap().values_mut() {
+                    item["stability"] = stable.clone();
+                }
+                document["index"]
+                    .as_object_mut()
+                    .unwrap()
+                    .retain(|id, _| matches!(id.as_str(), "0" | "1" | "2" | "3"));
+                document["paths"]
+                    .as_object_mut()
+                    .unwrap()
+                    .retain(|id, _| matches!(id.as_str(), "1" | "3"));
+            }
+            let generics = core["index"]["1"]["inner"]["struct"]["generics"].clone();
+            core["index"].as_object_mut().unwrap().remove("2");
+            core["index"]["1"]["name"] = serde_json::json!("Traverse");
+            core["index"]["1"]["inner"] = serde_json::json!({"trait":{
+                "is_auto":false,"is_unsafe":false,"is_dyn_compatible":true,
+                "items":[3],"generics":generics,"bounds":[],"implementations":[]
+            }});
+            core["paths"]["1"] =
+                serde_json::json!({"crate_id":0,"path":["core","Traverse"],"kind":"trait"});
+            core["paths"]["3"] = serde_json::json!({"crate_id":0,"path":["core","Traverse","insert"],"kind":"function"});
+            if !selected_stable {
+                core["index"]["1"]["stability"] =
+                    serde_json::json!({"feature":"chosen_gate","level":"unstable"});
+            }
+            client["index"]["1"]["name"] = serde_json::json!("Widget");
+            client["paths"]["1"]["path"] = serde_json::json!(["std", "Widget"]);
+            client["paths"]["3"]["path"] = serde_json::json!(["std", "Widget", "insert"]);
+            client["index"]["2"]["inner"]["impl"]["items"] = serde_json::json!([3]);
+            client["index"]["2"]["inner"]["impl"]["for"]["resolved_path"]["path"] =
+                serde_json::json!("std::Widget");
+            let mut trait_path =
+                client["index"]["2"]["inner"]["impl"]["for"]["resolved_path"].clone();
+            trait_path["id"] = serde_json::json!(200);
+            trait_path["path"] = serde_json::json!("core::Traverse");
+            client["index"]["2"]["inner"]["impl"]["trait"] = trait_path;
+            client["paths"]["200"] =
+                serde_json::json!({"crate_id":1,"path":["core","Traverse"],"kind":"trait"});
+            client["external_crates"] = serde_json::json!({"1":{"name":"core","html_root_url":null,"path":directory.path().join("libcore.rmeta")}});
+
+            if inlined {
+                let mut trait_item = core["index"]["1"].clone();
+                trait_item["id"] = serde_json::json!(200);
+                trait_item["crate_id"] = serde_json::json!(1);
+                trait_item["stability"] = stable.clone();
+                trait_item["inner"]["trait"]["items"] = serde_json::json!([201]);
+                let mut member = core["index"]["3"].clone();
+                member["id"] = serde_json::json!(201);
+                member["crate_id"] = serde_json::json!(1);
+                member["stability"] =
+                    serde_json::json!({"feature":"inline_decoy","level":"unstable"});
+                client["index"]["200"] = trait_item;
+                client["index"]["201"] = member;
+            }
+
+            // This unrelated dependency has a different version and a colliding
+            // qualified trait path. It has no compiler-distribution receipt.
+            let mut decoy = core.clone();
+            decoy["index"]["0"]["name"] = serde_json::json!("alloc");
+            decoy["crate_version"] = serde_json::json!("2.0.0");
+            decoy["index"]["1"]["stability"] = if selected_stable {
+                serde_json::json!({"feature":"decoy_gate","level":"unstable"})
+            } else {
+                stable.clone()
+            };
+            // A free function is visible only through std's verified reexport.
+            let mut function = core["index"]["3"].clone();
+            function["id"] = serde_json::json!(50);
+            function["name"] = serde_json::json!("exchange");
+            function["inner"]["function"]["sig"]["inputs"] = serde_json::json!([]);
+            function["stability"] = core["index"]["1"]["stability"].clone();
+            core["index"]["50"] = function.clone();
+            core["paths"]["50"] = serde_json::json!({"crate_id":0,"path":["core","uncertain","exchange"],"kind":"function"});
+            let mut uncertain_module = core["index"]["0"].clone();
+            uncertain_module["id"] = serde_json::json!(60);
+            uncertain_module["name"] = serde_json::json!("uncertain");
+            uncertain_module["visibility"] = serde_json::json!("public");
+            uncertain_module["stability"] = serde_json::Value::Null;
+            uncertain_module["inner"]["module"]["is_crate"] = serde_json::json!(false);
+            uncertain_module["inner"]["module"]["items"] = serde_json::json!([50]);
+            core["index"]["60"] = uncertain_module;
+            core["index"]["0"]["inner"]["module"]["items"] = serde_json::json!([1, 60]);
+
+            decoy["index"]["50"] = function;
+            decoy["index"]["50"]["stability"] = decoy["index"]["1"]["stability"].clone();
+            decoy["paths"]["50"] = core["paths"]["50"].clone();
+            let mut export = client["index"]["0"].clone();
+            export["id"] = serde_json::json!(51);
+            export["name"] = serde_json::json!("exchange");
+            export["visibility"] = serde_json::json!("public");
+            export["inner"] = serde_json::json!({"use":{"source":"core::uncertain::exchange","name":"exchange","id":250,"is_glob":false}});
+            client["index"]["51"] = export;
+            client["paths"]["250"] = serde_json::json!({"crate_id":1,"path":["core","uncertain","exchange"],"kind":"function"});
+            client["index"]["0"]["inner"]["module"]["items"] = serde_json::json!([1, 51]);
+            let documents = [("core", core), ("std", client), ("alloc", decoy)];
+            let mut source_bytes = Vec::new();
+            for (name, document) in documents {
+                let bytes = serde_json::to_vec(&document).unwrap();
+                fs::write(directory.path().join(format!("{name}.json")), &bytes).unwrap();
+                source_bytes.push((name, bytes));
+            }
+            let mut archive = tar::Builder::new(Vec::new());
+            let metadata = [
+                ("dist/version", b"1.0.0 (000000000 2026-08-23)".as_slice()),
+                (
+                    "dist/git-commit-hash",
+                    b"0000000000000000000000000000000000000000".as_slice(),
+                ),
+                ("dist/components", b"rust-docs-json-preview\n".as_slice()),
+            ];
+            for (name, bytes) in metadata
+                .into_iter()
+                .map(|(name, bytes)| (name.to_owned(), bytes))
+                .chain(
+                    source_bytes
+                        .iter()
+                        .filter(|(name, _)| *name != "alloc")
+                        .map(|(name, bytes)| {
+                            (
+                                format!(
+                                    "dist/rust-docs-json-preview/share/doc/rust/json/{name}.json"
+                                ),
+                                bytes.as_slice(),
+                            )
+                        }),
+                )
+            {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(bytes.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                archive.append_data(&mut header, name, bytes).unwrap();
+            }
+            let tar_bytes = archive.into_inner().unwrap();
+            let mut encoder =
+                lzma_rust2::XzWriter::new(Vec::new(), lzma_rust2::XzOptions::default()).unwrap();
+            encoder.write_all(&tar_bytes).unwrap();
+            let archive = encoder.finish().unwrap();
+            let archive_sha256 = lower_hex_string(&sha256_bytes(&archive));
+            let limits = ArtifactProducerLimits::default();
+            let paths = ["core.json", "std.json", "alloc.json"].map(std::path::PathBuf::from);
+            let artifact = read_exact_source_set(directory.path(), &paths, 3, 8, &limits).unwrap();
+            let pins = ["core", "std"].map(|name| {
+                (
+                    format!("{name}.json"),
+                    RustSysrootProvenance {
+                        toolchain: RustToolchainIdentity {
+                            release: "1.0.0".into(),
+                            channel: RustToolchainChannel::Stable,
+                            date: "2026-08-23".into(),
+                            commit: "0".repeat(40),
+                        },
+                        component: RustdocComponent::RustDocsJsonPreview,
+                        target: "x86_64-unknown-linux-gnu".into(),
+                        archive_sha256: archive_sha256.clone(),
+                        archive_member: format!(
+                            "dist/rust-docs-json-preview/share/doc/rust/json/{name}.json"
+                        ),
+                    },
+                )
+            });
+            let verified =
+                VerifiedSysrootDocuments::verify(&archive, &artifact, &pins, &limits).unwrap();
+            let crates =
+                ["core", "std", "alloc"].map(|name| (name.to_owned(), format!("{name}.json")));
+            let mut request = hashmap_request(directory.path().join("stdlib"), "std");
+            request.artifact_kind = ExternalArtifactKind::RustdocJsonSet;
+            request.activation[0].package = None;
+            request.activation[0].module = None;
+            let production = if proven {
+                RustdocJsonPackProducer.produce_verified_source_set(
+                    &request, &limits, None, &artifact, &crates, &verified,
+                )
+            } else {
+                RustdocJsonPackProducer
+                    .produce_loaded_source_set(&request, &limits, None, &artifact, &crates)
+            };
+            let pack = production.pack.unwrap_or_else(|| {
+                panic!(
+                    "proof={proven}, selected={selected_stable}: {:?}",
+                    production.diagnostics
+                )
+            });
+            let member = pack
+                .shards
+                .iter()
+                .flat_map(|shard| match &shard.payload {
+                    AuthoredPayload::DeclarationFacts { members, .. } => {
+                        members.iter().collect::<Vec<_>>()
+                    }
+                    _ => Vec::new(),
+                })
+                .find(|member| member.name == "insert" && member.implemented_trait.is_some())
+                .expect("impl member");
+            let expected = if !proven {
+                RustStability::Uncertified
+            } else if selected_stable {
+                RustStability::Stable {
+                    since: GuardVersion::new(1, 0, 0),
+                }
+            } else {
+                RustStability::unstable(vec!["chosen_gate".into()])
+            };
+            let function = pack
+                .shards
+                .iter()
+                .flat_map(|shard| match &shard.payload {
+                    AuthoredPayload::DeclarationFacts { members, .. } => {
+                        members.iter().collect::<Vec<_>>()
+                    }
+                    _ => Vec::new(),
+                })
+                .find(|member| member.name == "exchange")
+                .expect("free function");
+            assert_eq!(
+                function.rust_stability.as_ref(),
+                Some(&expected),
+                "free function proof={proven}, selected={selected_stable}"
+            );
+            assert_eq!(
+                member.rust_stability.as_ref(),
+                Some(&expected),
+                "proof={proven}, selected={selected_stable}"
+            );
+            let implementation = pack
+                .shards
+                .iter()
+                .flat_map(|shard| match &shard.payload {
+                    AuthoredPayload::DeclarationFacts { types, .. } => types
+                        .iter()
+                        .flat_map(|ty| &ty.implemented_traits)
+                        .collect::<Vec<_>>(),
+                    _ => Vec::new(),
+                })
+                .next()
+                .expect("proven implementation fact");
+            assert_eq!(
+                implementation.rust_stability.as_ref(),
+                Some(&expected),
+                "impl proof={proven}, selected={selected_stable}"
+            );
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12213: sysroot trait roots lost cross-document identity"
+    )]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12213: known hierarchy roots with Unknown arguments produced unpublishable stdlib packs"
+    )]
+    fn verified_sysroot_correspondence_boundary() {
+        use super::super::rustdoc_sysroot::VerifiedSysrootDocuments;
+        use brokk_bifrost_semantic::analyzer::semantic_model::model::{
+            RustSysrootProvenance, RustToolchainChannel, RustToolchainIdentity, RustdocComponent,
+        };
+        use std::io::Read;
+        for scenario in [
+            "verified",
+            "dependency_core",
+            "ambiguous",
+            "toolchain_mismatch",
+            "unselected_core_proof",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let archive: &[u8] = if scenario == "ambiguous" {
+                include_bytes!("../../../tests/fixtures/rustdoc-sysroot/ambiguous.tar.xz")
+            } else {
+                include_bytes!("../../../tests/fixtures/rustdoc-sysroot/verified.tar.xz")
+            };
+            let crates =
+                ["core", "alloc", "std"].map(|name| (name.to_owned(), format!("{name}.json")));
+            for entry in tar::Archive::new(lzma_rust2::XzReader::new(
+                std::io::Cursor::new(archive),
+                false,
+            ))
+            .entries()
+            .unwrap()
+            {
+                let mut entry = entry.unwrap();
+                let path = entry.path().unwrap().to_string_lossy().into_owned();
+                let Some(name) =
+                    path.strip_prefix("dist/rust-docs-json-preview/share/doc/rust/json/")
+                else {
+                    continue;
+                };
+                let mut bytes = Vec::new();
+                entry.read_to_end(&mut bytes).unwrap();
+                std::fs::write(dir.path().join(name), bytes).unwrap();
+            }
+            let digest = lower_hex_string(&sha256_bytes(archive));
+            let limits = ArtifactProducerLimits::default();
+            let mut paths = crates
+                .iter()
+                .map(|(_, path)| std::path::PathBuf::from(path))
+                .collect::<Vec<_>>();
+            if scenario == "unselected_core_proof" {
+                let original = std::fs::read(dir.path().join("core.json")).unwrap();
+                std::fs::write(dir.path().join("genuine-core.json"), &original).unwrap();
+                let mut dependency: serde_json::Value = serde_json::from_slice(&original).unwrap();
+                dependency["crate_version"] = serde_json::json!("2.0.0");
+                std::fs::write(
+                    dir.path().join("core.json"),
+                    serde_json::to_vec(&dependency).unwrap(),
+                )
+                .unwrap();
+                paths.push(std::path::PathBuf::from("genuine-core.json"));
+            }
+            let artifact = read_exact_source_set(dir.path(), &paths, 4, 8, &limits).unwrap();
+            let mut pins = crates
+                .iter()
+                .filter(|(name, _)| scenario != "dependency_core" || name != "core")
+                .map(|(name, path)| {
+                    (
+                        path.clone(),
+                        RustSysrootProvenance {
+                            toolchain: RustToolchainIdentity {
+                                release: "1.0.0".into(),
+                                channel: RustToolchainChannel::Stable,
+                                date: "2026-08-23".into(),
+                                commit: "0".repeat(40),
+                            },
+                            component: RustdocComponent::RustDocsJsonPreview,
+                            target: "x86_64-unknown-linux-gnu".into(),
+                            archive_sha256: digest.clone(),
+                            archive_member: format!(
+                                "dist/rust-docs-json-preview/share/doc/rust/json/{name}.json"
+                            ),
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            if scenario == "unselected_core_proof" {
+                pins.iter_mut()
+                    .find(|(path, _)| path == "core.json")
+                    .unwrap()
+                    .0 = "genuine-core.json".into();
+            }
+            let verified =
+                VerifiedSysrootDocuments::verify(archive, &artifact, &pins, &limits).unwrap();
+            let mut request = request(dir.path().join("stdlib"));
+            request.artifact_kind = ExternalArtifactKind::RustdocJsonSet;
+            request.activation[0].package = None;
+            if scenario == "toolchain_mismatch" {
+                request.compatibility.toolchains.push(
+                    brokk_bifrost_semantic::analyzer::semantic_model::model::VersionConstraint {
+                        name: "rust".into(),
+                        requirement: "=2.0.0".into(),
+                    },
+                );
+            }
+            let production = RustdocJsonPackProducer.produce_verified_source_set(
+                &request, &limits, None, &artifact, &crates, &verified,
+            );
+            if scenario == "toolchain_mismatch" {
+                assert!(production.pack.is_none());
+                continue;
+            }
+            let pack = production.pack.unwrap();
+            let types = pack
+                .shards
+                .iter()
+                .filter_map(|s| match &s.payload {
+                    AuthoredPayload::DeclarationFacts { types, .. } => Some(types.iter()),
+                    _ => None,
+                })
+                .flatten()
+                .collect::<Vec<_>>();
+            let traverse = types.iter().find(|t| t.name == "core.Traverse").unwrap();
+            let cross = types.iter().filter(|t| !t.name.starts_with("core.")).flat_map(|t| &t.implemented_traits)
+                .any(|implementation| matches!(&implementation.trait_type, TypeRef::Declared { id, .. } if id == &traverse.id));
+            assert_eq!(
+                cross,
+                scenario == "verified",
+                "{scenario}: {:#?}",
+                production.diagnostics
+            );
+            let compiled = compile_pack(&pack, &CompilerOptions::default()).unwrap();
+            assert_eq!(
+                compiled.manifest.schema_version,
+                RUSTDOC_PACK_MAX_SCHEMA_VERSION
+            );
+            let mut inconsistent = pack.clone();
+            inconsistent.extraction.as_mut().unwrap().verified_sysroot[0]
+                .provenance
+                .toolchain
+                .channel = RustToolchainChannel::Nightly;
+            assert!(compile_pack(&inconsistent, &CompilerOptions::default()).is_err());
+            let mut inconsistent_manifest = compiled.manifest.clone();
+            inconsistent_manifest
+                .extraction
+                .as_mut()
+                .unwrap()
+                .verified_sysroot[0]
+                .provenance
+                .toolchain
+                .channel = RustToolchainChannel::Nightly;
+            assert!(brokk_bifrost_semantic::analyzer::semantic_model::artifact::decode_manifest(
+                &serde_json::to_vec(&inconsistent_manifest).unwrap(),
+                &brokk_bifrost_semantic::analyzer::semantic_model::artifact::DecodeLimits::default()).is_err());
+            let mut curated = pack.clone();
+            curated.producer.name = "curated".into();
+            assert!(compile_pack(&curated, &CompilerOptions::default()).is_err());
+            let mut forged_manifest = compiled.manifest.clone();
+            forged_manifest.producer.name = "curated".into();
+            assert!(brokk_bifrost_semantic::analyzer::semantic_model::artifact::decode_manifest(
+                &serde_json::to_vec(&forged_manifest).unwrap(),
+                &brokk_bifrost_semantic::analyzer::semantic_model::artifact::DecodeLimits::default()).is_err());
+            assert_eq!(
+                compiled
+                    .manifest
+                    .extraction
+                    .as_ref()
+                    .unwrap()
+                    .verified_sysroot
+                    .len(),
+                pins.iter()
+                    .filter(|(path, _)| crates.iter().any(|(_, selected)| selected == path))
+                    .count()
+            );
+            let mut authored = serde_json::to_value(&pack).unwrap();
+            authored["extraction"] = serde_json::to_value(&pack.extraction).unwrap();
+            assert!(
+                serde_json::from_value::<AuthoredSemanticModelPack>(authored).is_err(),
+                "forged receipt must not deserialize"
+            );
+            let mut forged = pins.clone();
+            forged[0].1.archive_sha256 = "f".repeat(64);
+            assert!(
+                VerifiedSysrootDocuments::verify(archive, &artifact, &forged, &limits).is_err()
+            );
+        }
+
+        // A nominal trait root is insufficient when its arguments are unknown.
+        // Exercise production and compilation, retaining the unresolved fact and
+        // the owner's open inventory while withholding an invalid hierarchy edge.
+        let mut document = serde_json::to_value(document(false)).unwrap();
+        document["index"]["2"]["inner"]["trait"]["generics"]["params"] = serde_json::json!([{
+            "name":"A", "kind":{"type":{"bounds":[],"default":{"primitive":"u8"},"is_synthetic":false}}
+        }]);
+        document["index"]["7"]["inner"]["impl"]["trait"]["args"] = serde_json::json!({
+            "angle_bracketed":{"args":[{"type":{"resolved_path":{"path":"outside::Foreign","id":999,"args":null}}}],"constraints":[]}
+        });
+        document["paths"]["999"] =
+            serde_json::json!({"crate_id":1,"path":["outside","Foreign"],"kind":"struct"});
+        document["external_crates"]["1"] =
+            serde_json::json!({"name":"outside","html_root_url":null,"path":"outside.rlib"});
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("widget.json"),
+            serde_json::to_vec(&document).unwrap(),
+        )
+        .unwrap();
+        let limits = ArtifactProducerLimits::default();
+        let artifact =
+            read_exact_source_set(dir.path(), &["widget.json".into()], 1, 8, &limits).unwrap();
+        let mut request = request(dir.path().join("widget"));
+        request.artifact_kind = ExternalArtifactKind::RustdocJsonSet;
+        let production = RustdocJsonPackProducer.produce_loaded_source_set(
+            &request,
+            &limits,
+            None,
+            &artifact,
+            &[("widget".into(), "widget.json".into())],
+        );
+        assert!(
+            production
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "rust.rustdoc.nonconcrete_hierarchy_unprojected")
+        );
+        let pack = production.pack.unwrap();
+        compile_pack(&pack, &CompilerOptions::default()).unwrap();
+        let widget = pack
+            .shards
+            .iter()
+            .find_map(|shard| {
+                let AuthoredPayload::DeclarationFacts { types, .. } = &shard.payload else {
+                    return None;
+                };
+                types.iter().find(|fact| fact.name == "widget.Widget")
+            })
+            .unwrap();
+        assert!(widget.hierarchy.is_empty());
+        assert!(!widget.implemented_traits_complete);
+        assert!(widget.implemented_traits.iter().any(|fact| matches!(
+            fact.trait_type,
+            TypeRef::Declared { .. }
+        )
+            && fact.trait_type.contains_unknown()));
     }
 
     #[test]
@@ -6171,14 +8657,11 @@ mod tests {
         assert!(!pack.rust_external_reexports_truncated);
         assert!(!pack.rust_external_reexports_glob_incomplete);
         assert!(pack.rust_external_reexports.is_empty());
-        assert_eq!(
-            pack.schema_version,
-            crate::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION
-        );
+        assert_eq!(pack.schema_version, RUSTDOC_PACK_MAX_SCHEMA_VERSION);
         let compiled = compile_pack(&pack, &CompilerOptions::default()).unwrap();
         assert_eq!(
             lowest_schema_version(&pack, &CompilerOptions::default()).unwrap(),
-            19
+            RUSTDOC_PACK_MAX_SCHEMA_VERSION
         );
         assert_eq!(compiled.shards.len(), 1, "small modules share one shard");
         // Source production, schema-29 production relabeling, the schema-28
@@ -6188,6 +8671,17 @@ mod tests {
         for schema_version in [19, 22, 28, 29] {
             let mut relabelled = pack.clone();
             relabelled.schema_version = schema_version;
+            // Legacy-schema comparison deliberately excludes the new certificate.
+            for shard in &mut relabelled.shards {
+                if let brokk_bifrost_semantic::analyzer::semantic_model::AuthoredPayload::DeclarationFacts { types, members, .. } = &mut shard.payload {
+                    for ty in types {
+                        ty.rust_stability = None;
+                        for implementation in &mut ty.implemented_traits { implementation.rust_stability = None; }
+                        for implementation in &mut ty.generic_trait_impls { implementation.implementation.rust_stability = None; }
+                    }
+                    for member in members { member.rust_stability = None; }
+                }
+            }
             let compiled = compile_pack(&relabelled, &CompilerOptions::default()).unwrap();
             assert!(compiled.manifest.rust_external_reexports.is_empty());
             assert!(
@@ -6307,17 +8801,18 @@ mod tests {
                 },
             }]
         );
+        // #12213: cross-document types require pinned dependency correspondence
+        // metadata. These synthetic bytes have no verified sysroot origin.
         assert!(
             widget
                 .implemented_traits
                 .iter()
-                .any(|fact| fact.type_parameters.is_empty()
-                    && matches!(&fact.trait_type,
-                TypeRef::Named { name, .. } if name == "core.Traverse")),
-            "a concrete impl in alloc joins its owner from core"
+                .any(|fact| fact.type_parameters.is_empty() && fact.trait_type == TypeRef::Unknown)
         );
-        assert!(widget.implemented_traits_complete);
-        assert!(traverse.generic_trait_impls_complete);
+        // #12213: the unproven trait and self roots cannot exclude any owner
+        // or trait, so neither inventory supports absence claims.
+        assert!(!widget.implemented_traits_complete);
+        assert!(!traverse.generic_trait_impls_complete);
         let forbidden = types.iter().find(|ty| ty.name == "core.Forbidden").unwrap();
         let blanket = types.iter().find(|ty| ty.name == "core.Blanket").unwrap();
         let auto = types
@@ -6341,8 +8836,19 @@ mod tests {
             |_| Some(true),
             |_| None
         ));
-        // Both exhaustive inventories are needed to dismiss an absent rival.
-        assert!(provably_does_not_implement(
+        // Even an incorrectly closed transport flag cannot make an Unknown
+        // trait root evidence of absence for a differently named trait.
+        let mut incorrectly_closed = widget.clone();
+        std::sync::Arc::make_mut(&mut incorrectly_closed).implemented_traits_complete = true;
+        let mut closed_blanket = blanket.clone();
+        std::sync::Arc::make_mut(&mut closed_blanket).generic_trait_impls_complete = true;
+        assert!(!provably_does_not_implement(
+            &incorrectly_closed,
+            &closed_blanket,
+            |_| Some(false),
+            |_| Some(false)
+        ));
+        assert!(!provably_does_not_implement(
             widget,
             blanket,
             |_| Some(false),
@@ -6491,7 +8997,7 @@ mod tests {
             projected.signature.as_ref().unwrap().returns,
             Some(TypeRef::Projection {
                 owner: Box::new(TypeRef::TypeParameter { name: "I".into() }),
-                trait_type: Some(Box::new(TypeRef::named("core.Traverse"))),
+                trait_type: Some(Box::new(TypeRef::Unknown)),
                 name: "Item".into(),
                 arguments: vec![TypeRef::named("u8")],
             })
@@ -6544,7 +9050,7 @@ mod tests {
                 declaration_ordinal: None,
             })
         );
-        assert!(!production.diagnostics.iter().any(|diagnostic| {
+        assert!(production.diagnostics.iter().any(|diagnostic| {
             diagnostic.code == "rust.rustdoc.nonconcrete_hierarchy_unprojected"
         }));
         // A projected member return remains intact, but cannot itself name a
@@ -6576,33 +9082,17 @@ mod tests {
             hierarchy_diagnostics[0].location.as_deref(),
             Some("item.123")
         );
-        let forwarding = traverse
-            .generic_trait_impls
-            .iter()
-            .find(|fact| matches!(fact.self_pattern, RustSelfPattern::Reference { .. }))
-            .unwrap();
-        assert_eq!(
-            forwarding.self_pattern,
-            RustSelfPattern::Reference {
-                mutable: true,
-                inner: Box::new(RustSelfPattern::Parameter { name: "I".into() }),
-            }
-        );
-        assert_eq!(forwarding.bounds.len(), 2);
-        assert!(forwarding.bounds[1].maybe);
-        assert_eq!(
-            forwarding.implementation.associated_types,
-            [AssociatedTypeBinding {
-                name: "Item".into(),
-                r#type: TypeRef::Projection {
-                    owner: Box::new(TypeRef::TypeParameter { name: "I".into() }),
-                    trait_type: Some(Box::new(TypeRef::named("core.Traverse"))),
-                    name: "Item".into(),
-                    arguments: vec![],
-                },
-            }]
+        // #12213: an Unknown trait root cannot attach a generic rule to a
+        // retained trait by its summary spelling, including a negative rule.
+        assert!(
+            !traverse
+                .generic_trait_impls
+                .iter()
+                .any(|fact| matches!(fact.self_pattern, RustSelfPattern::Reference { .. }))
         );
         assert_eq!(pack.completeness, Completeness::Partial);
+        // #12213: an unproven trait hierarchy leaves every family on this
+        // primitive owner open, including its otherwise healthy methods.
         for name in ["len", "bytes", "source_only", "external_core"] {
             let family = members
                 .iter()
@@ -6610,7 +9100,7 @@ mod tests {
                 .collect::<Vec<_>>();
             assert!(!family.is_empty(), "certified family {name} was produced");
             assert!(
-                family.iter().all(|fact| fact.callable_family_complete),
+                family.iter().all(|fact| !fact.callable_family_complete),
                 "{name}: {family:?}"
             );
         }
@@ -6650,8 +9140,8 @@ mod tests {
         assert!(
             members.iter().any(|fact| fact.owner == widget.id
                 && fact.name == "consume"
-                && fact.callable_family_complete),
-            "a joined external impl owner does not poison the defining owner's families"
+                && !fact.callable_family_complete),
+            "#12213: the unproven trait leaves the defining owner's families open"
         );
         assert!(
             members.iter().any(|fact| fact.owner == widget.id
@@ -6693,7 +9183,7 @@ mod tests {
                 .iter()
                 .any(|fact| fact.owner == primitive[0].id
                     && fact.name == "len"
-                    && fact.callable_family_complete)
+                    && !fact.callable_family_complete)
         );
         assert!(suppressed_members.iter().any(|fact| fact.owner == broken.id
             && fact.name == "healthy"
@@ -6743,7 +9233,7 @@ mod tests {
         assert!(!pack.rust_external_reexports_truncated);
         assert!(pack.rust_external_reexports.is_empty());
         assert!(!pack.rust_external_reexports_glob_incomplete);
-        assert!(pack.schema_version < brokk_bifrost_semantic::analyzer::semantic_model::RUST_EXTERNAL_REEXPORTS_MIN_SCHEMA_VERSION);
+        assert_eq!(pack.schema_version, RUSTDOC_PACK_MAX_SCHEMA_VERSION);
         // Master already projects this in-set alias as an ordinary fact.
         assert!(pack.shards.iter().any(|shard| {
             match &shard.payload {
@@ -7421,7 +9911,8 @@ mod tests {
         assert!(
             matches!(&external_only.locator, Locator::Artifact { path, .. } if path == "aaa.json")
         );
-        assert!(external_only.callable_family_complete);
+        // #12213: the external trait root no longer proves a closed family.
+        assert!(!external_only.callable_family_complete);
 
         // Signature-depth failures must still veto the owner after the join,
         // for both a local declaration and an externally implemented owner.
@@ -7467,6 +9958,537 @@ mod tests {
                     .filter(|member| member.owner == owner_id("alloc.Widget")
                         && member.name == "render")
                     .all(|member| member.callable_family_complete)
+            );
+        }
+    }
+
+    fn unknown_self_trait_document() -> RustdocCrate {
+        let mut document = document(false);
+        document.index.clear();
+        document.paths.clear();
+        document.index.insert(
+            Id(0),
+            item(
+                0,
+                Some("widget"),
+                RustVisibility::Default,
+                ItemEnum::Module(Module {
+                    is_crate: true,
+                    items: vec![Id(1), Id(2), Id(30), Id(40)],
+                    is_stripped: false,
+                }),
+            ),
+        );
+        for (owner, owner_name, impl_id, first) in [(1, "Widget", 20, 21), (30, "Other", 31, 32)] {
+            document.index.insert(
+                Id(owner),
+                item(
+                    owner,
+                    Some(owner_name),
+                    RustVisibility::Public,
+                    ItemEnum::Struct(Struct {
+                        kind: StructKind::Unit,
+                        generics: generics(),
+                        impls: vec![Id(impl_id)],
+                    }),
+                ),
+            );
+            document.index.insert(
+                Id(impl_id),
+                item(
+                    impl_id,
+                    None,
+                    RustVisibility::Default,
+                    ItemEnum::Impl(Impl {
+                        is_unsafe: false,
+                        generics: generics(),
+                        provided_trait_methods: Vec::new(),
+                        trait_: None,
+                        for_: Type::ResolvedPath(path(owner, owner_name)),
+                        items: (first..first + 3).map(Id).collect(),
+                        is_negative: false,
+                        is_synthetic: false,
+                        blanket_impl: None,
+                    }),
+                ),
+            );
+            for (ordinal, name) in ["clone", "clone_from", "unwrap_or_default"]
+                .into_iter()
+                .enumerate()
+            {
+                let id = first + ordinal as u32;
+                document.index.insert(
+                    Id(id),
+                    item(
+                        id,
+                        Some(name),
+                        RustVisibility::Public,
+                        ItemEnum::Function(function(
+                            vec![(
+                                "self".to_owned(),
+                                Type::BorrowedRef {
+                                    lifetime: None,
+                                    is_mutable: false,
+                                    type_: Box::new(Type::Generic("Self".to_owned())),
+                                },
+                            )],
+                            None,
+                            generics(),
+                        )),
+                    ),
+                );
+            }
+        }
+        document.index.insert(
+            Id(2),
+            item(
+                2,
+                Some("Clone"),
+                RustVisibility::Public,
+                ItemEnum::Trait(Trait {
+                    is_auto: false,
+                    is_unsafe: false,
+                    is_dyn_compatible: true,
+                    items: vec![Id(9), Id(10)],
+                    generics: generics(),
+                    bounds: Vec::new(),
+                    implementations: vec![Id(40)],
+                }),
+            ),
+        );
+        for (id, name, provided) in [(9, "clone", false), (10, "clone_from", true)] {
+            let mut callable = function(
+                vec![(
+                    "self".to_owned(),
+                    Type::BorrowedRef {
+                        lifetime: None,
+                        is_mutable: false,
+                        type_: Box::new(Type::Generic("Self".to_owned())),
+                    },
+                )],
+                None,
+                generics(),
+            );
+            callable.has_body = provided;
+            document.index.insert(
+                Id(id),
+                item(
+                    id,
+                    Some(name),
+                    RustVisibility::Default,
+                    ItemEnum::Function(callable),
+                ),
+            );
+        }
+        let mut implemented_clone = document.index[&Id(9)].clone();
+        implemented_clone.id = Id(41);
+        let ItemEnum::Function(callable) = &mut implemented_clone.inner else {
+            unreachable!()
+        };
+        callable.has_body = true;
+        document.index.insert(Id(41), implemented_clone);
+        document.index.insert(
+            Id(40),
+            item(
+                40,
+                None,
+                RustVisibility::Default,
+                ItemEnum::Impl(Impl {
+                    is_unsafe: false,
+                    generics: generics(),
+                    provided_trait_methods: vec!["clone_from".to_owned()],
+                    trait_: Some(path(2, "widget::Clone")),
+                    for_: Type::ResolvedPath(path(999, "Hidden")),
+                    items: vec![Id(41)],
+                    is_negative: false,
+                    is_synthetic: false,
+                    blanket_impl: None,
+                }),
+            ),
+        );
+        for (id, name, kind) in [
+            (0, "widget", ItemKind::Module),
+            (1, "Widget", ItemKind::Struct),
+            (2, "Clone", ItemKind::Trait),
+            (30, "Other", ItemKind::Struct),
+        ] {
+            document.paths.insert(
+                Id(id),
+                ItemSummary {
+                    crate_id: 0,
+                    path: if id == 0 {
+                        vec![name.to_owned()]
+                    } else {
+                        vec!["widget".to_owned(), name.to_owned()]
+                    },
+                    kind,
+                },
+            );
+        }
+        document
+    }
+
+    fn produce_scoped_fence_pack(document: &RustdocCrate) -> AuthoredSemanticModelPack {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("widget.json");
+        fs::write(&path, serde_json::to_vec(document).unwrap()).unwrap();
+        let production = RustdocJsonPackProducer.produce(
+            &request(path),
+            &ArtifactProducerLimits::default(),
+            None,
+        );
+        let pack = production
+            .pack
+            .unwrap_or_else(|| panic!("{:?}", production.diagnostics));
+        compile_pack(&pack, &CompilerOptions::default())
+            .unwrap_or_else(|errors| panic!("{errors:#?}"));
+        pack
+    }
+
+    fn scoped_fence_members(pack: &AuthoredSemanticModelPack) -> Vec<&MemberFact> {
+        pack.shards
+            .iter()
+            .flat_map(|shard| match &shard.payload {
+                AuthoredPayload::DeclarationFacts { members, .. } => {
+                    members.iter().collect::<Vec<_>>()
+                }
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    fn scoped_fence_struct_methods(pack: &AuthoredSemanticModelPack) -> Vec<&MemberFact> {
+        let owners = pack
+            .shards
+            .iter()
+            .flat_map(|shard| match &shard.payload {
+                AuthoredPayload::DeclarationFacts { types, .. } => types
+                    .iter()
+                    .filter(|ty| ty.type_kind == TypeKind::Struct)
+                    .map(|ty| ty.id.as_str())
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .collect::<RandomHashSet<_>>();
+        scoped_fence_members(pack)
+            .into_iter()
+            .filter(|member| owners.contains(member.owner.as_str()))
+            .collect()
+    }
+
+    fn known_owner_trait_gap_document() -> RustdocCrate {
+        let mut doc = unknown_self_trait_document();
+        let ItemEnum::Impl(implementation) = &mut doc.index.get_mut(&Id(40)).unwrap().inner else {
+            unreachable!()
+        };
+        implementation.for_ = Type::ResolvedPath(path(1, "widget::Widget"));
+        // A known local trait with an unavailable argument cannot publish its
+        // hierarchy edge, but its complete item list still bounds names.
+        let Type::ResolvedPath(trait_path) = typed_path(
+            Id(2),
+            "widget::Clone",
+            vec![Type::ResolvedPath(path(999, "Unavailable"))],
+        ) else {
+            unreachable!()
+        };
+        implementation.trait_ = Some(trait_path);
+        doc
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12484: known-owner hierarchy gaps vetoed unrelated String as_bytes families"
+    )]
+    fn known_owner_trait_gap_scopes_names_and_keeps_other_owner_complete() {
+        let mut doc = known_owner_trait_gap_document();
+        for (id, name) in [
+            (2, "SpecToString"),
+            (9, "spec_to_string"),
+            (41, "spec_to_string"),
+            (21, "as_str"),
+            (22, "as_bytes"),
+            (23, "spec_to_string"),
+        ] {
+            doc.index.get_mut(&Id(id)).unwrap().name = Some(name.into());
+        }
+        let ItemEnum::Trait(trait_) = &mut doc.index.get_mut(&Id(2)).unwrap().inner else {
+            unreachable!()
+        };
+        trait_.items = vec![Id(9)];
+        let ItemEnum::Impl(implementation) = &mut doc.index.get_mut(&Id(40)).unwrap().inner else {
+            unreachable!()
+        };
+        implementation.provided_trait_methods.clear();
+        let pack = produce_scoped_fence_pack(&doc);
+        let owner = type_declaration_id(TypeIdentity {
+            ecosystem: "cargo",
+            name: "widget.Widget",
+        });
+        assert!(
+            scoped_fence_struct_methods(&pack)
+                .iter()
+                .any(|member| member.owner == owner && member.name == "as_bytes")
+        );
+        for member in scoped_fence_struct_methods(&pack) {
+            let expected = member.owner != owner || member.name != "spec_to_string";
+            assert_eq!(member.callable_family_complete, expected, "{member:?}");
+        }
+        let mut incomplete = doc;
+        incomplete.index.remove(&Id(9));
+        let pack = produce_scoped_fence_pack(&incomplete);
+        assert!(
+            scoped_fence_struct_methods(&pack)
+                .into_iter()
+                .filter(|member| member.owner == owner)
+                .all(|member| !member.callable_family_complete)
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12484: structural primitive presentation owners cannot bound one concrete self"
+    )]
+    fn primitive_owner_gap_scopes_only_exact_scalar_self() {
+        for (name, self_type, expected) in [
+            ("u8", Type::Primitive("u8".into()), true),
+            (
+                "slice",
+                Type::Slice(Box::new(Type::Primitive("u8".into()))),
+                false,
+            ),
+        ] {
+            let mut doc = known_owner_trait_gap_document();
+            doc.index.get_mut(&Id(1)).unwrap().inner =
+                ItemEnum::Primitive(rustdoc_types::Primitive {
+                    name: name.into(),
+                    impls: vec![Id(20), Id(40)],
+                });
+            for id in [20, 40] {
+                let ItemEnum::Impl(implementation) = &mut doc.index.get_mut(&Id(id)).unwrap().inner
+                else {
+                    unreachable!()
+                };
+                implementation.for_ = self_type.clone();
+            }
+            let pack = produce_scoped_fence_pack(&doc);
+            let family = scoped_fence_struct_methods(&pack)
+                .into_iter()
+                .filter(|member| {
+                    member.name == "unwrap_or_default" && member.owner.contains("primitive")
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(family.len(), 1, "{name}");
+            assert_eq!(family[0].callable_family_complete, expected, "{name}");
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12484: unsupported blankets reaching the interruption classifier stay global"
+    )]
+    fn unsupported_blanket_interruption_is_global() {
+        let doc = unknown_self_trait_document();
+        let ItemEnum::Impl(mut implementation) = doc.index[&Id(40)].inner.clone() else {
+            unreachable!()
+        };
+        implementation.blanket_impl = Some(Type::Generic("T".into()));
+        let mut interruptions = DeclarationInterruptions::default();
+        interruptions.interrupt_impl(&implementation, &doc);
+        assert!(matches!(interruptions, DeclarationInterruptions::Global));
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12425: an unknown-self Clone impl globally interrupted unrelated method families"
+    )]
+    fn unknown_self_trait_fence_interrupts_clone_on_every_owner() {
+        let pack = produce_scoped_fence_pack(&unknown_self_trait_document());
+        let members = scoped_fence_struct_methods(&pack);
+        for name in ["clone", "unwrap_or_default"] {
+            let family = members
+                .iter()
+                .filter(|member| member.member_kind == MemberKind::Method && member.name == name)
+                .collect::<Vec<_>>();
+            assert_eq!(family.len(), 2);
+            assert!(
+                family
+                    .iter()
+                    .all(|member| member.callable_family_complete == (name == "unwrap_or_default")),
+                "{family:?}"
+            );
+        }
+        for shard in &pack.shards {
+            if let AuthoredPayload::DeclarationFacts { types, .. } = &shard.payload {
+                assert!(
+                    types
+                        .iter()
+                        .all(|ty| !ty.implemented_traits_complete
+                            && !ty.generic_trait_impls_complete)
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12425: impl item lists omit provided trait methods and cannot bound the fence"
+    )]
+    fn unknown_self_trait_fence_includes_provided_method_names() {
+        let pack = produce_scoped_fence_pack(&unknown_self_trait_document());
+        let members = scoped_fence_struct_methods(&pack);
+        let provided = members
+            .iter()
+            .filter(|member| {
+                member.member_kind == MemberKind::Method && member.name == "clone_from"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(provided.len(), 2);
+        assert!(
+            provided
+                .iter()
+                .all(|member| !member.callable_family_complete)
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12425: an unknown-self inherent impl has no trait name bound"
+    )]
+    fn unknown_self_inherent_impl_keeps_global_callable_fence() {
+        let mut document = unknown_self_trait_document();
+        let ItemEnum::Impl(implementation) = &mut document.index.get_mut(&Id(40)).unwrap().inner
+        else {
+            unreachable!()
+        };
+        implementation.trait_ = None;
+        let pack = produce_scoped_fence_pack(&document);
+        assert!(
+            scoped_fence_members(&pack)
+                .iter()
+                .all(|member| !member.callable_family_complete)
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12425: missing trait identity must not bind the name Clone by spelling"
+    )]
+    fn unknown_trait_path_keeps_global_callable_fence() {
+        let mut document = unknown_self_trait_document();
+        let ItemEnum::Impl(implementation) = &mut document.index.get_mut(&Id(40)).unwrap().inner
+        else {
+            unreachable!()
+        };
+        implementation.trait_ = Some(path(998, "widget::Clone"));
+        let pack = produce_scoped_fence_pack(&document);
+        assert!(
+            scoped_fence_members(&pack)
+                .iter()
+                .all(|member| !member.callable_family_complete)
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12425: an unavailable or incomplete trait definition cannot enumerate callable names"
+    )]
+    fn unavailable_trait_definition_keeps_global_callable_fence() {
+        for gap in [
+            "definition",
+            "item",
+            "macro",
+            "unlisted_provided",
+            "unlisted_required",
+            "impl_item",
+        ] {
+            let mut document = unknown_self_trait_document();
+            match gap {
+                "definition" => {
+                    document.index.remove(&Id(2));
+                }
+                "item" => {
+                    document.index.remove(&Id(10));
+                }
+                "macro" => {
+                    document.index.get_mut(&Id(10)).unwrap().inner =
+                        ItemEnum::Macro("unexpanded".to_owned());
+                }
+                "unlisted_provided" => {
+                    let ItemEnum::Trait(trait_) =
+                        &mut document.index.get_mut(&Id(2)).unwrap().inner
+                    else {
+                        unreachable!()
+                    };
+                    trait_.items.retain(|id| *id != Id(10));
+                }
+                "unlisted_required" => {
+                    let ItemEnum::Trait(trait_) =
+                        &mut document.index.get_mut(&Id(2)).unwrap().inner
+                    else {
+                        unreachable!()
+                    };
+                    trait_.items.retain(|id| *id != Id(9));
+                }
+                "impl_item" => {
+                    document.index.remove(&Id(41));
+                }
+                _ => unreachable!(),
+            }
+            let pack = produce_scoped_fence_pack(&document);
+            let methods = scoped_fence_struct_methods(&pack);
+            assert_eq!(methods.len(), 6, "{gap}");
+            assert!(
+                methods
+                    .iter()
+                    .all(|member| !member.callable_family_complete),
+                "{gap}"
+            );
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12425: generated output under rust-pack-8 must miss after the producer certificate change"
+    )]
+    fn scoped_fence_producer_version_misses_old_generated_pack() {
+        use brokk_bifrost_analysis::analyzer::semantic_model::catalog::SemanticPackCatalog;
+        use brokk_bifrost_semantic::analyzer::semantic_model::{
+            CatalogOptions, GeneratedProductionKey,
+        };
+        // Both the global-fence predecessor and the owner-wide predecessor
+        // must miss the new generated-production key (#12425, #12484, #12733).
+        for old_version in [
+            concat!(env!("CARGO_PKG_VERSION"), "+rust-pack-8"),
+            concat!(env!("CARGO_PKG_VERSION"), "+rust-pack-9"),
+            concat!(env!("CARGO_PKG_VERSION"), "+rust-pack-10"),
+        ] {
+            let document = known_owner_trait_gap_document();
+            let input = lower_hex_string(&sha256_bytes(&serde_json::to_vec(&document).unwrap()));
+            let mut old_pack = produce_scoped_fence_pack(&document);
+            old_pack.producer.version = old_version.to_owned();
+            let old_key = GeneratedProductionKey::new(
+                &input,
+                &old_pack.producer.name,
+                &old_pack.producer.version,
+                old_pack.schema_version,
+            )
+            .unwrap();
+            let current_key = GeneratedProductionKey::new(
+                &input,
+                &old_pack.producer.name,
+                super::super::external::RUST_PACK_PRODUCER_VERSION,
+                old_pack.schema_version,
+            )
+            .unwrap();
+            let compiled = compile_pack(&old_pack, &CompilerOptions::default()).unwrap();
+            let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+            catalog.install_generated(&old_key, &compiled).unwrap();
+            assert!(catalog.generated_production(&old_key).unwrap().is_some());
+            assert!(
+                catalog
+                    .generated_production(&current_key)
+                    .unwrap()
+                    .is_none()
             );
         }
     }
@@ -7605,9 +10627,12 @@ mod tests {
             &ArtifactProducerLimits::default(),
         );
         let pack = production.pack.expect("unchanged rustdoc produces a pack");
-        assert_eq!(pack.schema_version, 22);
+        assert_eq!(pack.schema_version, RUSTDOC_PACK_MAX_SCHEMA_VERSION);
         let serialized = serde_json::to_value(&pack).unwrap();
-        assert_eq!(serialized["schema_version"], 22);
+        assert_eq!(
+            serialized["schema_version"],
+            RUSTDOC_PACK_MAX_SCHEMA_VERSION
+        );
         let mut type_count = 0;
         for shard in serialized["shards"].as_array().unwrap() {
             for ty in shard["payload"]["types"].as_array().unwrap() {
@@ -7676,6 +10701,596 @@ mod tests {
             .find(|fact| fact.name == "widget.Display")
             .unwrap();
         assert!(relations.iter().any(|relation| relation.to == display.id));
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11777: a public function defined in a private module is declared at its re-export path"
+    )]
+    fn reexported_function_in_private_module_keeps_defining_identity() {
+        let mut document = document(false);
+        let ItemEnum::Module(root) = &mut document.index.get_mut(&Id(0)).unwrap().inner else {
+            unreachable!()
+        };
+        root.items.extend([Id(20), Id(22)]);
+        let mut private_module = item(
+            20,
+            Some("internal"),
+            RustVisibility::Restricted {
+                parent: Id(0),
+                path: "::".to_owned(),
+            },
+            ItemEnum::Module(Module {
+                is_crate: false,
+                items: vec![Id(21), Id(23)],
+                is_stripped: false,
+            }),
+        );
+        private_module.crate_id = 0;
+        document.index.insert(Id(20), private_module);
+        document.index.insert(
+            Id(21),
+            item(
+                21,
+                Some("read"),
+                RustVisibility::Public,
+                ItemEnum::Function(function(Vec::new(), None, generics())),
+            ),
+        );
+        // A public function that nothing re-exports stays out of the catalog.
+        document.index.insert(
+            Id(23),
+            item(
+                23,
+                Some("unreachable"),
+                RustVisibility::Public,
+                ItemEnum::Function(function(Vec::new(), None, generics())),
+            ),
+        );
+        document.index.insert(
+            Id(22),
+            item(
+                22,
+                Some("read"),
+                RustVisibility::Public,
+                ItemEnum::Use(Use {
+                    source: "internal::read".to_owned(),
+                    name: "read".to_owned(),
+                    id: Some(Id(21)),
+                    is_glob: false,
+                }),
+            ),
+        );
+        for (id, path, kind) in [
+            (20, vec!["widget", "internal"], ItemKind::Module),
+            (21, vec!["widget", "internal", "read"], ItemKind::Function),
+            (
+                23,
+                vec!["widget", "internal", "unreachable"],
+                ItemKind::Function,
+            ),
+        ] {
+            document.paths.insert(
+                Id(id),
+                ItemSummary {
+                    crate_id: 0,
+                    path: path.into_iter().map(str::to_owned).collect(),
+                    kind,
+                },
+            );
+        }
+        let file = tempfile::NamedTempFile::new().unwrap();
+        fs::write(file.path(), serde_json::to_vec(&document).unwrap()).unwrap();
+        let production = RustdocJsonPackProducer.produce_exact_artifact(
+            &request(file.path().to_path_buf()),
+            &ArtifactProducerLimits::default(),
+        );
+        let pack = production.pack.unwrap();
+        compile_pack(&pack, &CompilerOptions::default()).unwrap();
+        let AuthoredPayload::DeclarationFacts { types, members, .. } = &pack.shards[0].payload
+        else {
+            panic!("expected declaration facts")
+        };
+        let module = types
+            .iter()
+            .find(|fact| fact.name == "widget.internal")
+            .expect("the defining module owns the re-exported function");
+        let read = members
+            .iter()
+            .find(|fact| fact.name == "read")
+            .expect("re-exported function is declared");
+        assert_eq!(read.owner, module.id);
+        assert_eq!(read.member_kind, MemberKind::Function);
+        assert_eq!(read.aliases, ["widget.read"]);
+        assert!(members.iter().all(|fact| fact.name != "unreachable"));
+        // The module is only an owner: its own children are not public API.
+        assert!(
+            types
+                .iter()
+                .filter(|fact| fact.name.starts_with("widget.internal"))
+                .count()
+                == 1
+        );
+    }
+
+    /// Declarations of module `widget` for the free-function certification
+    /// tests: `(item id, name, parameter count, parameter nesting depth)`.
+    fn module_function_families(
+        declarations: &[(u32, &str, usize, usize)],
+        max_signature_depth: usize,
+    ) -> Vec<(String, usize, bool)> {
+        module_function_families_with_export(declarations, max_signature_depth, None)
+    }
+
+    fn module_function_families_with_export(
+        declarations: &[(u32, &str, usize, usize)],
+        max_signature_depth: usize,
+        export: Option<(bool, bool)>,
+    ) -> Vec<(String, usize, bool)> {
+        let pack = module_function_pack_with_export(declarations, max_signature_depth, export);
+        compile_pack(&pack, &CompilerOptions::default()).unwrap();
+        let AuthoredPayload::DeclarationFacts { types, members, .. } = &pack.shards[0].payload
+        else {
+            panic!("expected declaration facts")
+        };
+        assert!(
+            types
+                .iter()
+                .any(|fact| fact.name == "widget" && fact.type_kind == TypeKind::Module)
+        );
+        let module_ids = types
+            .iter()
+            .filter(|fact| fact.type_kind == TypeKind::Module)
+            .map(|fact| &fact.id)
+            .collect::<RandomHashSet<_>>();
+        members
+            .iter()
+            .filter(|member| module_ids.contains(&member.owner))
+            .filter(|member| {
+                declarations
+                    .iter()
+                    .any(|(_, name, _, _)| *name == member.name)
+            })
+            .map(|member| {
+                (
+                    member.name.clone(),
+                    member.signature.as_ref().unwrap().parameters.len(),
+                    member.callable_family_complete,
+                )
+            })
+            .collect()
+    }
+
+    fn module_function_pack_with_export(
+        declarations: &[(u32, &str, usize, usize)],
+        max_signature_depth: usize,
+        export: Option<(bool, bool)>,
+    ) -> AuthoredSemanticModelPack {
+        let mut document = document(false);
+        let ItemEnum::Module(root) = &mut document.index.get_mut(&Id(0)).unwrap().inner else {
+            unreachable!()
+        };
+        root.items
+            .extend(declarations.iter().map(|(id, ..)| Id(*id)));
+        for (id, name, parameters, depth) in declarations {
+            let mut nested = Type::Primitive("u8".to_owned());
+            for _ in 0..*depth {
+                nested = Type::Slice(Box::new(nested));
+            }
+            document.index.insert(
+                Id(*id),
+                item(
+                    *id,
+                    Some(name),
+                    RustVisibility::Public,
+                    ItemEnum::Function(function(
+                        (0..*parameters)
+                            .map(|index| (format!("p{index}"), nested.clone()))
+                            .collect(),
+                        None,
+                        generics(),
+                    )),
+                ),
+            );
+        }
+        if let Some((is_glob, add_alias)) = export {
+            let ItemEnum::Module(root) = &mut document.index.get_mut(&Id(0)).unwrap().inner else {
+                unreachable!()
+            };
+            root.items.push(Id(99));
+            if add_alias {
+                let ItemEnum::Module(root) = &mut document.index.get_mut(&Id(0)).unwrap().inner
+                else {
+                    unreachable!()
+                };
+                root.items.push(Id(98));
+                root.items.retain(|id| *id != Id(31));
+                root.items.push(Id(97));
+                document.index.insert(
+                    Id(97),
+                    item(
+                        97,
+                        Some("inner"),
+                        RustVisibility::Public,
+                        ItemEnum::Module(Module {
+                            is_crate: false,
+                            items: vec![Id(31)],
+                            is_stripped: false,
+                        }),
+                    ),
+                );
+                document.index.insert(
+                    Id(98),
+                    item(
+                        98,
+                        Some("read"),
+                        RustVisibility::Public,
+                        ItemEnum::Use(rustdoc_types::Use {
+                            source: "widget::inner::sleep".into(),
+                            name: "read".into(),
+                            id: Some(Id(31)),
+                            is_glob: false,
+                        }),
+                    ),
+                );
+            }
+            document.index.insert(
+                Id(99),
+                item(
+                    99,
+                    Some("read"),
+                    RustVisibility::Public,
+                    ItemEnum::Use(rustdoc_types::Use {
+                        source: "missing::read".into(),
+                        name: "read".into(),
+                        id: None,
+                        is_glob,
+                    }),
+                ),
+            );
+        }
+        let file = tempfile::NamedTempFile::new().unwrap();
+        fs::write(file.path(), serde_json::to_vec(&document).unwrap()).unwrap();
+        let production = RustdocJsonPackProducer.produce_exact_artifact(
+            &request(file.path().to_path_buf()),
+            &ArtifactProducerLimits {
+                max_signature_depth,
+                ..ArtifactProducerLimits::default()
+            },
+        );
+        production.pack.unwrap()
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11777: module-owned free functions were never certified, so the partial stdlib pack could not bind std::fs::exists"
+    )]
+    fn module_owned_free_functions_are_certified_per_name() {
+        // Two cfg alternatives of `read` (0 and 1 parameters) and an unrelated `sleep`.
+        let clean = module_function_families(
+            &[(30, "read", 0, 0), (31, "read", 1, 0), (32, "sleep", 1, 0)],
+            64,
+        );
+        assert_eq!(clean.len(), 3);
+        assert!(clean.iter().all(|(_, _, complete)| *complete), "{clean:?}");
+
+        // The one-parameter alternative nests deeper than the signature limit
+        // and reports a diagnostic. Neither `read` alternative is certified,
+        // whatever its arity, but the module's other functions still are.
+        let one_bad = module_function_families(
+            &[(30, "read", 0, 0), (31, "read", 1, 3), (32, "sleep", 1, 0)],
+            2,
+        );
+        assert_eq!(one_bad.len(), 3);
+        for (name, parameters, complete) in &one_bad {
+            assert_eq!(
+                *complete,
+                name == "sleep",
+                "{name}/{parameters} in {one_bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unresolved_module_exports_do_not_certify_direct_alternatives() {
+        for glob in [false, true] {
+            let families = module_function_families_with_export(
+                &[(30, "read", 0, 0), (31, "sleep", 1, 0)],
+                64,
+                Some((glob, false)),
+            );
+            assert_eq!(families.len(), 2);
+            for (name, _, complete) in families {
+                assert_eq!(complete, !glob && name == "sleep", "{name}, glob={glob}");
+            }
+        }
+    }
+
+    #[test]
+    fn unresolved_exports_veto_reexported_function_aliases() {
+        for glob in [false, true] {
+            let families = module_function_families_with_export(
+                &[(31, "sleep", 1, 0)],
+                64,
+                Some((glob, true)),
+            );
+            assert_eq!(families.len(), 1);
+            assert!(
+                !families[0].2,
+                "alias must retain the export gap, glob={glob}"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_alternative_vetoes_shared_public_alias() {
+        let mut pack =
+            module_function_pack_with_export(&[(30, "good", 0, 0), (31, "bad", 1, 3)], 2, None);
+        let AuthoredPayload::DeclarationFacts { types, members, .. } = &mut pack.shards[0].payload
+        else {
+            unreachable!()
+        };
+        let mut links = SourceSetLinks::default();
+        for member in members
+            .iter_mut()
+            .filter(|m| matches!(m.name.as_str(), "good" | "bad"))
+        {
+            links.callable_module_members.insert(member.id.clone());
+            member.aliases.push("widget.shared".into());
+            if member.name == "bad" {
+                assert!(!member.callable_family_complete);
+                links
+                    .incomplete_module_functions
+                    .insert((member.owner.clone(), member.name.clone()));
+            }
+        }
+        certify_callable_families(types, members, &links, &RandomHashSet::default());
+        assert!(
+            members
+                .iter()
+                .filter(|m| matches!(m.name.as_str(), "good" | "bad"))
+                .all(|m| !m.callable_family_complete)
+        );
+    }
+
+    #[test]
+    fn resolved_source_set_export_releases_only_its_provisional_veto() {
+        let mut pack = module_function_pack_with_export(&[(30, "read", 0, 0)], 64, None);
+        let AuthoredPayload::DeclarationFacts { types, members, .. } = &mut pack.shards[0].payload
+        else {
+            unreachable!()
+        };
+        let read = members.iter().find(|m| m.name == "read").unwrap();
+        let mut links = SourceSetLinks::default();
+        links.callable_module_members.insert(read.id.clone());
+        let location = (Some(Box::<str>::from("facade.json")), "item.99".to_owned());
+        links
+            .pending_module_exports
+            .push((location.clone(), (read.owner.clone(), read.name.clone())));
+        certify_callable_families(types, members, &links, &RandomHashSet::default());
+        assert!(
+            !members
+                .iter()
+                .find(|m| m.name == "read")
+                .unwrap()
+                .callable_family_complete
+        );
+        certify_callable_families(
+            types,
+            members,
+            &links,
+            &RandomHashSet::from_iter([location]),
+        );
+        assert!(
+            members
+                .iter()
+                .find(|m| m.name == "read")
+                .unwrap()
+                .callable_family_complete
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12073: a known trait implemented for an unknown self type let another owner be proven not to implement it"
+    )]
+    fn unknown_self_keeps_known_trait_inventories_open() {
+        use brokk_bifrost_semantic::analyzer::semantic_model::provably_does_not_implement;
+        for unknown in [false, true] {
+            let mut doc = document(false);
+            let mut other = doc.index[&Id(1)].clone();
+            other.id = Id(100);
+            other.name = Some("Other".into());
+            let ItemEnum::Struct(owner) = &mut other.inner else {
+                unreachable!()
+            };
+            owner.impls.clear();
+            doc.index.insert(Id(100), other);
+            let ItemEnum::Module(root) = &mut doc.index.get_mut(&Id(0)).unwrap().inner else {
+                unreachable!()
+            };
+            root.items.push(Id(100));
+            doc.paths.insert(
+                Id(100),
+                ItemSummary {
+                    crate_id: 0,
+                    path: vec!["widget".into(), "Other".into()],
+                    kind: ItemKind::Struct,
+                },
+            );
+            if unknown {
+                doc.paths.insert(
+                    Id(900),
+                    ItemSummary {
+                        crate_id: 1,
+                        path: vec!["external".into(), "External".into()],
+                        kind: ItemKind::Struct,
+                    },
+                );
+                let ItemEnum::Impl(implementation) = &mut doc.index.get_mut(&Id(7)).unwrap().inner
+                else {
+                    unreachable!()
+                };
+                implementation.for_ = Type::ResolvedPath(path(900, "external::External"));
+            }
+            let root = tempfile::tempdir().unwrap();
+            fs::write(
+                root.path().join("widget.json"),
+                serde_json::to_vec(&doc).unwrap(),
+            )
+            .unwrap();
+            let limits = ArtifactProducerLimits::default();
+            let artifact =
+                read_exact_source_set(root.path(), &["widget.json".into()], 1, 8, &limits).unwrap();
+            let mut request = request(root.path().join("stdlib"));
+            request.artifact_kind = ExternalArtifactKind::RustdocJsonSet;
+            let production = RustdocJsonPackProducer.produce_loaded_source_set(
+                &request,
+                &limits,
+                None,
+                &artifact,
+                &[("widget".into(), "widget.json".into())],
+            );
+            let pack = production.pack.unwrap();
+            let types = pack
+                .shards
+                .iter()
+                .flat_map(|shard| {
+                    let AuthoredPayload::DeclarationFacts { types, .. } = &shard.payload else {
+                        unreachable!()
+                    };
+                    types
+                })
+                .collect::<Vec<_>>();
+            let owner = types.iter().find(|ty| ty.name == "widget.Other").unwrap();
+            let trait_ = types.iter().find(|ty| ty.name == "widget.Display").unwrap();
+            assert_eq!(owner.implemented_traits_complete, !unknown);
+            assert_eq!(trait_.generic_trait_impls_complete, !unknown);
+            assert_eq!(
+                provably_does_not_implement(owner, trait_, |_| Some(false), |_| None),
+                !unknown
+            );
+            assert_eq!(trait_.generic_trait_impls.is_empty(), !unknown);
+        }
+    }
+
+    // Test-only artifact shared with the real modeled conversion reader.
+    pub(crate) fn missing_identity_pack() -> AuthoredSemanticModelPack {
+        let mut doc = document(false);
+        for (id, name, output) in [
+            (
+                100,
+                "missing_widget",
+                Type::ResolvedPath(path(900, "widget::Widget")),
+            ),
+            (
+                101,
+                "summary_widget",
+                Type::ResolvedPath(path(901, "widget::Widget")),
+            ),
+            (102, "missing_u8", Type::ResolvedPath(path(902, "u8"))),
+            (103, "primitive_u8", Type::Primitive("u8".into())),
+        ] {
+            doc.index.insert(
+                Id(id),
+                item(
+                    id,
+                    Some(name),
+                    RustVisibility::Public,
+                    ItemEnum::Function(function(vec![], Some(output), generics())),
+                ),
+            );
+            let ItemEnum::Module(root) = &mut doc.index.get_mut(&doc.root).unwrap().inner else {
+                unreachable!()
+            };
+            root.items.push(Id(id));
+        }
+        doc.paths.insert(
+            Id(901),
+            ItemSummary {
+                crate_id: 1,
+                path: vec!["widget".into(), "Widget".into()],
+                kind: ItemKind::Struct,
+            },
+        );
+        doc.index.insert(
+            Id(104),
+            item(
+                104,
+                Some("UnprovenAlias"),
+                RustVisibility::Public,
+                ItemEnum::TypeAlias(rustdoc_types::TypeAlias {
+                    type_: Type::ResolvedPath(path(900, "widget::Widget")),
+                    generics: generics(),
+                }),
+            ),
+        );
+        let ItemEnum::Module(root) = &mut doc.index.get_mut(&doc.root).unwrap().inner else {
+            unreachable!()
+        };
+        root.items.push(Id(104));
+        let file = tempfile::NamedTempFile::new().unwrap();
+        fs::write(file.path(), serde_json::to_vec(&doc).unwrap()).unwrap();
+        let mut pack = RustdocJsonPackProducer
+            .produce_exact_artifact(
+                &request(file.path().to_path_buf()),
+                &ArtifactProducerLimits::default(),
+            )
+            .pack
+            .unwrap();
+        for shard in &mut pack.shards {
+            for selector in &mut shard.activation {
+                selector.package = None;
+                selector.targets.clear();
+                selector.configurations.clear();
+            }
+        }
+        pack
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12073: unresolved rustdoc IDs bound retained names and primitives"
+    )]
+    fn missing_rustdoc_identity_stays_unknown_across_pack_boundary() {
+        use brokk_bifrost_semantic::analyzer::semantic_model::artifact::{
+            DecodeLimits, decode_shard,
+        };
+        let pack = missing_identity_pack();
+        let compiled = compile_pack(&pack, &CompilerOptions::default()).unwrap();
+        let shard = &compiled.shards[0];
+        let decoded =
+            decode_shard(&shard.descriptor, &shard.bytes, &DecodeLimits::default()).unwrap();
+        let brokk_bifrost_semantic::analyzer::semantic_model::artifact::CompiledPayload::DeclarationFacts { types, members, .. } = decoded.payload else {
+            panic!("expected declaration facts")
+        };
+        assert!(types.iter().any(|ty| ty.name == "widget.Widget"));
+        for name in ["missing_widget", "summary_widget", "missing_u8"] {
+            assert_eq!(
+                members
+                    .iter()
+                    .find(|member| member.name == name)
+                    .unwrap()
+                    .signature
+                    .as_ref()
+                    .unwrap()
+                    .returns,
+                Some(TypeRef::Unknown),
+                "{name}"
+            );
+        }
+        assert!(
+            types
+                .iter()
+                .find(|ty| ty.name == "widget.UnprovenAlias")
+                .unwrap()
+                .alias_target
+                .is_none()
+        );
+        assert!(
+            matches!(members.iter().find(|member| member.name == "primitive_u8").unwrap()
+            .signature.as_ref().unwrap().returns.as_ref(), Some(TypeRef::Named { name, .. }) if name == "u8")
+        );
     }
 
     #[test]
@@ -8041,6 +11656,46 @@ mod tests {
             item_names(&document, &document.index[&document.root], None),
             Err(NameIndexError::Limit)
         ));
+    }
+
+    #[test]
+    fn cancellation_after_projection_refuses_source_set_pack() {
+        let directory = tempfile::tempdir().unwrap();
+        let bytes = serde_json::to_vec(&hashmap_document("std")).unwrap();
+        fs::write(directory.path().join("std.json"), &bytes).unwrap();
+        let limits = ArtifactProducerLimits::default();
+        let artifact =
+            read_exact_source_set(directory.path(), &["std.json".into()], 1, 8, &limits).unwrap();
+        let mut request = hashmap_request(directory.path().join("stdlib"), "std");
+        request.artifact_kind = ExternalArtifactKind::RustdocJsonSet;
+        let mut links = SourceSetLinks::default();
+        let projected = produce_loaded_json_document(
+            &request,
+            &limits,
+            None,
+            artifact.sha256(),
+            Some("std"),
+            Some("std.json"),
+            &bytes,
+            &mut links,
+        );
+        assert!(
+            projected.pack.is_some(),
+            "projection must finish before cancellation: {:?}",
+            projected.diagnostics
+        );
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let production = merge_source_set_productions(
+            &request,
+            &limits,
+            artifact.sha256(),
+            vec![projected],
+            &links,
+            Some(&cancellation),
+        );
+        assert!(production.pack.is_none());
+        assert_eq!(production.diagnostics[0].code, "artifact.cancelled");
     }
 
     #[test]

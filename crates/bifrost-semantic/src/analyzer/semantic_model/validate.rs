@@ -153,6 +153,7 @@ pub(crate) fn validate_pack_internal(
         procedure_ids: HashSet::new(),
         procedure_targets: HashMap::new(),
         type_parameters_by_id: HashMap::new(),
+        trait_ids: HashSet::new(),
         pack_completeness: pack.completeness,
         pack_id_bytes: pack.pack_id.len(),
         schema_version: pack.schema_version,
@@ -283,6 +284,8 @@ struct Validator {
     procedure_ids: HashSet<String>,
     procedure_targets: HashMap<(String, String), String>,
     type_parameters_by_id: HashMap<String, Vec<String>>,
+    /// Declarations of Rust traits: their members' signatures may name `Self`.
+    trait_ids: HashSet<String>,
     pack_completeness: Completeness,
     pack_id_bytes: usize,
     schema_version: u32,
@@ -429,11 +432,33 @@ impl Validator {
             }
         }
         if let Some(extraction) = &pack.extraction {
+            if !extraction.verified_sysroot.is_empty()
+                && (self.predates_schema(RUST_SYSROOT_RECEIPT_MIN_SCHEMA_VERSION)
+                    || pack.producer.name != "bifrost-rustdoc-json"
+                    || extraction.kind != ArtifactExtractionKind::RustdocJsonSet)
+            {
+                self.error(
+                    "extraction.sysroot_authority",
+                    "$.extraction",
+                    "verified sysroot receipts require schema 38 and Rustdoc source-set production",
+                );
+            }
             if self.predates_schema(19) {
                 self.error(
                     "extraction.schema_version",
                     "$.extraction",
                     "artifact extraction requires schema 19",
+                );
+            }
+            if extraction
+                .verified_sysroot
+                .iter()
+                .any(|receipt| !receipt.provenance.toolchain.release_channel_is_consistent())
+            {
+                self.error(
+                    "extraction.sysroot_toolchain",
+                    "$.extraction",
+                    "sysroot release and channel disagree",
                 );
             }
             if !brokk_bifrost_core::analyzer::canonical_hash::is_lower_sha256(extraction.digest()) {
@@ -632,6 +657,12 @@ impl Validator {
                     members
                         .iter()
                         .map(|fact| (fact.id.clone(), fact.implicit_operation.clone())),
+                );
+                self.trait_ids.extend(
+                    types
+                        .iter()
+                        .filter(|fact| fact.type_kind == TypeKind::Trait)
+                        .map(|fact| fact.id.clone()),
                 );
                 self.type_parameters_by_id.extend(types.iter().map(|fact| {
                     let mut parameters = fact.type_parameters.clone();
@@ -2319,6 +2350,7 @@ impl Validator {
                             surface,
                         );
                     }
+                    self.rust_stability(&fact_path, fact.rust_stability.as_ref());
                     self.declaration_guard(&fact_path, fact.guard.as_ref());
                     self.locator(&format!("{fact_path}.locator"), &fact.locator);
                 }
@@ -2576,11 +2608,46 @@ impl Validator {
                         }
                     }
                     if let Some(signature) = &fact.signature {
-                        let owner_parameters = self
+                        let mut owner_parameters = self
                             .type_parameters_by_id
                             .get(&fact.owner)
                             .cloned()
                             .unwrap_or_default();
+                        // A Rust trait member's signature may name the trait's
+                        // implicit `Self` (the impl and trait-member contracts
+                        // above already scope it), from the schema that
+                        // introduced it.
+                        if self.language == "rust" && self.trait_ids.contains(&fact.owner) {
+                            owner_parameters.push("Self".to_owned());
+                            let mut names_self = false;
+                            crate::analyzer::semantic::common::visit_type_refs(
+                                signature
+                                    .parameters
+                                    .iter()
+                                    .map(|parameter| &parameter.r#type)
+                                    .chain(&signature.returns),
+                                |ty| {
+                                    names_self |= matches!(ty, TypeRef::TypeParameter { name } if name == "Self")
+                                },
+                            );
+                            // Authored packs may still declare `Self` as an
+                            // explicit callable type parameter at any schema.
+                            if names_self
+                                && !signature
+                                    .type_parameters
+                                    .iter()
+                                    .any(|parameter| parameter == "Self")
+                                && self.predates_schema(TRAIT_SELF_SIGNATURE_MIN_SCHEMA_VERSION)
+                            {
+                                self.error(
+                                    "signature.trait_self_schema_version",
+                                    format!("{fact_path}.signature"),
+                                    format!(
+                                        "a trait member signature naming Self requires schema version {TRAIT_SELF_SIGNATURE_MIN_SCHEMA_VERSION}"
+                                    ),
+                                );
+                            }
+                        }
                         self.signature(
                             &format!("{fact_path}.signature"),
                             signature,
@@ -2590,6 +2657,7 @@ impl Validator {
                     for (alias_index, alias) in fact.aliases.iter().enumerate() {
                         self.qualified_name(&format!("{fact_path}.aliases[{alias_index}]"), alias);
                     }
+                    self.rust_stability(&fact_path, fact.rust_stability.as_ref());
                     self.declaration_guard(&fact_path, fact.guard.as_ref());
                 }
                 for (index, relation) in relations.iter().enumerate() {
@@ -3592,7 +3660,10 @@ impl Validator {
 
         let identity_return = summary.transfers.iter().any(|transfer| {
             transfer.exit_kind == AuthoredSummaryExitKind::Normal
-                && matches!(transfer.output, AuthoredSummaryOutput::NormalReturn {})
+                && matches!(
+                    transfer.output,
+                    AuthoredSummaryOutput::NormalReturn { path: None }
+                )
                 && matches!(
                     transfer.value_transfer.as_ref().map(|value| &value.kind),
                     Some(SummaryValueTransferKind::Conversion {
@@ -3605,7 +3676,7 @@ impl Validator {
                 matches!(
                     effect,
                     AuthoredSummaryEffect::Allocation {
-                        output: AuthoredSummaryOutput::NormalReturn {},
+                        output: AuthoredSummaryOutput::NormalReturn { .. },
                         ..
                     }
                 )
@@ -3769,11 +3840,11 @@ impl Validator {
                 if matches!(
                     effect,
                     AuthoredSummaryEffect::Allocation {
-                        output: AuthoredSummaryOutput::NormalReturn {}
+                        output: AuthoredSummaryOutput::NormalReturn { .. }
                             | AuthoredSummaryOutput::IndexedNormalReturn { .. },
                         ..
                     } | AuthoredSummaryEffect::Sanitize {
-                        output: AuthoredSummaryOutput::NormalReturn {}
+                        output: AuthoredSummaryOutput::NormalReturn { .. }
                             | AuthoredSummaryOutput::IndexedNormalReturn { .. },
                         ..
                     }
@@ -3993,12 +4064,12 @@ impl Validator {
 
         for (index, transfer) in summary.transfers.iter().enumerate() {
             let transfer_path = format!("{path}.transfers[{index}]");
-            self.summary_input(
+            self.summary_transfer_input(
                 &format!("{transfer_path}.input"),
                 &transfer.input,
                 &summary.target,
             );
-            self.summary_output(
+            self.summary_transfer_output(
                 &format!("{transfer_path}.output"),
                 &transfer.output,
                 &locations,
@@ -4009,10 +4080,10 @@ impl Validator {
                 (&transfer.exit_kind, &transfer.output),
                 (
                     AuthoredSummaryExitKind::Normal,
-                    AuthoredSummaryOutput::ExceptionalReturn {}
+                    AuthoredSummaryOutput::ExceptionalReturn { .. }
                 ) | (
                     AuthoredSummaryExitKind::Exceptional,
-                    AuthoredSummaryOutput::NormalReturn {}
+                    AuthoredSummaryOutput::NormalReturn { .. }
                         | AuthoredSummaryOutput::IndexedNormalReturn { .. }
                 )
             ) {
@@ -4041,19 +4112,73 @@ impl Validator {
         }
     }
 
+    fn summary_projection_path(&mut self, path: &str, steps: &SummaryEndpointPath) {
+        use crate::analyzer::semantic::PatternProjectionStep;
+        if self.predates_schema(SUMMARY_ENDPOINT_PROJECTION_MIN_SCHEMA_VERSION) {
+            self.error(
+                "summary.endpoint_projection_schema_version",
+                format!("{path}.path"),
+                "summary endpoint projections require schema version 35",
+            );
+        }
+        if steps.is_empty() || steps.len() > 16 {
+            self.error("summary.invalid_endpoint_projection", format!("{path}.path"), "a projection path must contain between 1 and 16 steps; omit it for the whole value");
+        }
+        for (index, step) in steps.iter().enumerate() {
+            let step_path = format!("{path}.path[{index}]");
+            match step {
+                PatternProjectionStep::Variant { declaration } => {
+                    self.stable_reference(&format!("{step_path}.variant.declaration"), declaration)
+                }
+                PatternProjectionStep::Named(name) => {
+                    self.language_identifier(&format!("{step_path}.named"), name)
+                }
+                PatternProjectionStep::Element => {
+                    if self.predates_schema(SUMMARY_ELEMENT_PROJECTION_MIN_SCHEMA_VERSION) {
+                        self.error(
+                            "summary.element_projection_schema_version",
+                            step_path,
+                            "element endpoint projections require schema version 37",
+                        );
+                    }
+                }
+                PatternProjectionStep::Tuple(_) => {}
+            }
+        }
+    }
+
     fn summary_input(
         &mut self,
         path: &str,
         input: &AuthoredSummaryInput,
         target: &AuthoredProcedureTarget,
     ) {
+        if input.path().is_some() {
+            self.error(
+                "summary.endpoint_projection_outside_transfer",
+                format!("{path}.path"),
+                "component paths are supported only on transfer endpoints",
+            );
+        }
+        self.summary_transfer_input(path, input, target);
+    }
+
+    fn summary_transfer_input(
+        &mut self,
+        path: &str,
+        input: &AuthoredSummaryInput,
+        target: &AuthoredProcedureTarget,
+    ) {
+        if let Some(component_path) = input.path() {
+            self.summary_projection_path(path, component_path);
+        }
         match input {
-            AuthoredSummaryInput::Receiver {} if !target.has_receiver => self.error(
+            AuthoredSummaryInput::Receiver { .. } if !target.has_receiver => self.error(
                 "summary.receiver_unavailable",
                 path,
                 "procedure target does not declare a receiver",
             ),
-            AuthoredSummaryInput::Parameter { ordinal }
+            AuthoredSummaryInput::Parameter { ordinal, .. }
                 if *ordinal > MAX_PROCEDURE_SUMMARY_ORDINAL
                     || *ordinal >= target.parameter_count =>
             {
@@ -4066,7 +4191,7 @@ impl Validator {
                     ),
                 );
             }
-            AuthoredSummaryInput::Parameter { ordinal }
+            AuthoredSummaryInput::Parameter { ordinal, .. }
                 if target.variadic && target.parameter_count.checked_sub(1) == Some(*ordinal) =>
             {
                 self.error(
@@ -4075,7 +4200,7 @@ impl Validator {
                     "semantic claims cannot yet reference a variadic tail formal",
                 );
             }
-            AuthoredSummaryInput::Receiver {} | AuthoredSummaryInput::Parameter { .. } => {}
+            AuthoredSummaryInput::Receiver { .. } | AuthoredSummaryInput::Parameter { .. } => {}
         }
     }
 
@@ -4149,7 +4274,7 @@ impl Validator {
                         // call result to bind at the spawn site.
                         if !matches!(
                             timer,
-                            AuthoredSummaryOutput::NormalReturn {}
+                            AuthoredSummaryOutput::NormalReturn { .. }
                                 | AuthoredSummaryOutput::IndexedNormalReturn { .. }
                         ) {
                             self.error(
@@ -4221,7 +4346,7 @@ impl Validator {
                     // has no call result to bind at the construction site.
                     if !matches!(
                         condition,
-                        AuthoredSummaryOutput::NormalReturn {}
+                        AuthoredSummaryOutput::NormalReturn { .. }
                             | AuthoredSummaryOutput::IndexedNormalReturn { .. }
                     ) {
                         self.error(
@@ -4372,7 +4497,7 @@ impl Validator {
                 );
                 if !matches!(
                     output,
-                    AuthoredSummaryOutput::NormalReturn {}
+                    AuthoredSummaryOutput::NormalReturn { .. }
                         | AuthoredSummaryOutput::IndexedNormalReturn { .. }
                 ) {
                     self.error(
@@ -4465,10 +4590,14 @@ impl Validator {
                 };
                 let target_ordinal = match channel {
                     AuthoredSummaryPort::Output {
-                        output: AuthoredSummaryOutput::NormalReturn {},
+                        output: AuthoredSummaryOutput::NormalReturn { .. },
                     } => Some(0),
                     AuthoredSummaryPort::Output {
-                        output: AuthoredSummaryOutput::IndexedNormalReturn { ordinal },
+                        output:
+                            AuthoredSummaryOutput::IndexedNormalReturn {
+                                ordinal,
+                                path: None,
+                            },
                     } => Some(*ordinal),
                     _ => None,
                 };
@@ -4506,7 +4635,7 @@ impl Validator {
                 AuthoredSummaryEffect::Allocation {
                     output:
                         AuthoredSummaryOutput::Capture { .. }
-                        | AuthoredSummaryOutput::Receiver {}
+                        | AuthoredSummaryOutput::Receiver { .. }
                         | AuthoredSummaryOutput::Heap { .. },
                     ..
                 } => Some("an allocation into ordinary storage is not unchanged"),
@@ -4543,7 +4672,7 @@ impl Validator {
             if matches!(
                 &transfer.output,
                 AuthoredSummaryOutput::Capture { .. }
-                    | AuthoredSummaryOutput::Receiver {}
+                    | AuthoredSummaryOutput::Receiver { .. }
                     | AuthoredSummaryOutput::Heap { .. }
             ) {
                 self.error(
@@ -4615,14 +4744,35 @@ impl Validator {
         target: &AuthoredProcedureTarget,
         normal_result_count: Option<u32>,
     ) {
+        if output.path().is_some() {
+            self.error(
+                "summary.endpoint_projection_outside_transfer",
+                format!("{path}.path"),
+                "component paths are supported only on transfer endpoints",
+            );
+        }
+        self.summary_transfer_output(path, output, locations, target, normal_result_count);
+    }
+
+    fn summary_transfer_output(
+        &mut self,
+        path: &str,
+        output: &AuthoredSummaryOutput,
+        locations: &HashMap<&str, (AuthoredSummaryLocationKind, String)>,
+        target: &AuthoredProcedureTarget,
+        normal_result_count: Option<u32>,
+    ) {
+        if let Some(component_path) = output.path() {
+            self.summary_projection_path(path, component_path);
+        }
         let (location, expected_kind) = match output {
-            AuthoredSummaryOutput::Capture { location } => {
+            AuthoredSummaryOutput::Capture { location, .. } => {
                 (Some(location), Some(AuthoredSummaryLocationKind::Capture))
             }
-            AuthoredSummaryOutput::Heap { location } => {
+            AuthoredSummaryOutput::Heap { location, .. } => {
                 (Some(location), Some(AuthoredSummaryLocationKind::Heap))
             }
-            AuthoredSummaryOutput::Receiver {} if !target.has_receiver => {
+            AuthoredSummaryOutput::Receiver { .. } if !target.has_receiver => {
                 self.error(
                     "summary.receiver_unavailable",
                     path,
@@ -4630,7 +4780,7 @@ impl Validator {
                 );
                 (None, None)
             }
-            AuthoredSummaryOutput::IndexedNormalReturn { ordinal } => {
+            AuthoredSummaryOutput::IndexedNormalReturn { ordinal, .. } => {
                 if normal_result_count.is_none() {
                     self.error(
                         "summary.result_count_required",
@@ -4648,9 +4798,9 @@ impl Validator {
                 }
                 (None, None)
             }
-            AuthoredSummaryOutput::NormalReturn {}
-            | AuthoredSummaryOutput::Receiver {}
-            | AuthoredSummaryOutput::ExceptionalReturn {} => (None, None),
+            AuthoredSummaryOutput::NormalReturn { .. }
+            | AuthoredSummaryOutput::Receiver { .. }
+            | AuthoredSummaryOutput::ExceptionalReturn { .. } => (None, None),
         };
         let Some(location) = location else {
             return;
@@ -5047,7 +5197,7 @@ impl Validator {
                 if matches!(
                     effect,
                     AuthoredSummaryEffect::Escape {
-                        input: AuthoredSummaryInput::Receiver {},
+                        input: AuthoredSummaryInput::Receiver { .. },
                         ..
                     } | AuthoredSummaryEffect::Call { .. }
                         | AuthoredSummaryEffect::UnknownCall { .. }
@@ -5062,8 +5212,8 @@ impl Validator {
                 }
             }
             for (index, transfer) in summary.transfers.iter().enumerate() {
-                if matches!(transfer.input, AuthoredSummaryInput::Receiver {})
-                    && !matches!(transfer.output, AuthoredSummaryOutput::Receiver {})
+                if matches!(transfer.input, AuthoredSummaryInput::Receiver { .. })
+                    && !matches!(transfer.output, AuthoredSummaryOutput::Receiver { .. })
                     && !matches!(
                         transfer.value_transfer.as_ref().map(|v| &v.kind),
                         Some(SummaryValueTransferKind::Conversion {
@@ -5078,12 +5228,13 @@ impl Validator {
                     );
                 }
             }
-            let is_receiver =
-                |input: &AuthoredSummaryInput| matches!(input, AuthoredSummaryInput::Receiver {});
+            let is_receiver = |input: &AuthoredSummaryInput| {
+                matches!(input, AuthoredSummaryInput::Receiver { .. })
+            };
             let port_is_receiver = |port: &AuthoredSummaryPort| match port {
                 AuthoredSummaryPort::Input { input } => is_receiver(input),
                 AuthoredSummaryPort::Output { output } => {
-                    matches!(output, AuthoredSummaryOutput::Receiver {})
+                    matches!(output, AuthoredSummaryOutput::Receiver { .. })
                 }
             };
             for (index, effect) in summary.concurrency_effects.iter().enumerate() {
@@ -5102,7 +5253,8 @@ impl Validator {
                         is_receiver(map) || key.as_ref().is_some_and(is_receiver)
                     }
                     AuthoredConcurrencyEffect::CondBind { condition, lock } => {
-                        matches!(condition, AuthoredSummaryOutput::Receiver {}) || is_receiver(lock)
+                        matches!(condition, AuthoredSummaryOutput::Receiver { .. })
+                            || is_receiver(lock)
                     }
                     AuthoredConcurrencyEffect::ChannelClose { channel, .. }
                     | AuthoredConcurrencyEffect::ChannelCloseAsync { channel, .. } => {
@@ -5376,7 +5528,19 @@ impl Validator {
                     for (precondition_index, precondition) in preconditions.iter().enumerate() {
                         let precondition_path =
                             format!("{member_path}.preconditions[{precondition_index}]");
-                        if let AuthoredSummaryInput::Parameter { ordinal } = &precondition.input {
+                        if let Some(component_path) = precondition.input.path() {
+                            self.summary_projection_path(
+                                &format!("{precondition_path}.input"),
+                                component_path,
+                            );
+                            self.error(
+                                "summary.endpoint_projection_outside_transfer",
+                                format!("{precondition_path}.input.path"),
+                                "component paths are supported only on transfer endpoints",
+                            );
+                        }
+                        if let AuthoredSummaryInput::Parameter { ordinal, .. } = &precondition.input
+                        {
                             if *ordinal > MAX_PROCEDURE_SUMMARY_ORDINAL {
                                 self.error(
                                     "summary.invalid_parameter_ordinal",
@@ -5983,6 +6147,35 @@ impl Validator {
         }
     }
 
+    fn rust_stability(&mut self, path: &str, stability: Option<&RustStability>) {
+        if stability.is_some() && self.language != "rust" {
+            self.error(
+                "declaration.rust_stability_language",
+                path,
+                "rust_stability requires language rust",
+            );
+        }
+        if stability.is_some() && self.predates_schema(RUST_STABILITY_MIN_SCHEMA_VERSION) {
+            self.error(
+                "declaration.rust_stability_schema_version",
+                path,
+                "rust_stability requires schema version 40",
+            );
+        }
+        if let Some(RustStability::Unstable { features }) = stability {
+            if features.is_empty() || !features.windows(2).all(|pair| pair[0] < pair[1]) {
+                self.error(
+                    "declaration.rust_stability_features",
+                    path,
+                    "stability features must be non-empty, sorted and unique",
+                );
+            }
+            for (index, feature) in features.iter().enumerate() {
+                self.text(&format!("{path}.rust_stability.features[{index}]"), feature);
+            }
+        }
+    }
+
     fn implemented_trait(
         &mut self,
         path: &str,
@@ -5991,6 +6184,7 @@ impl Validator {
     ) {
         let mut pending = vec![(fact, parameters.to_vec(), 1usize)];
         while let Some((fact, outer_parameters, depth)) = pending.pop() {
+            self.rust_stability(path, fact.rust_stability.as_ref());
             self.census.max_depth = self.census.max_depth.max(depth);
             if depth > self.limits.max_depth {
                 self.error(

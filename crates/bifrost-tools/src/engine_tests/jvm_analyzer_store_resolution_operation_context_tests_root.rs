@@ -827,7 +827,7 @@ mod context_path_tests {
                 for provider in ["left", "right"] {
                     connection
                         .execute(
-                            "INSERT INTO jvm_external_owners VALUES (?1, ?2, 1, 1, 1, 1)",
+                            "INSERT INTO jvm_external_owners(provider_id,owner_fqn,callables_complete,values_complete,types_complete,supertypes_complete) VALUES (?1, ?2, 1, 1, 1, 1)",
                             rusqlite::params![provider, owner],
                         )
                         .unwrap();
@@ -962,7 +962,7 @@ mod context_path_tests {
         let fixture = crate::selection_fixture_support::JvmSelectionFixture::new(1);
         fixture.store.conn.execute(|connection| {
             connection.execute(
-                "INSERT INTO jvm_external_owners VALUES ('selected-string', 'java.lang.String', 0, 0, 0, 0)",
+                "INSERT INTO jvm_external_owners(provider_id,owner_fqn,callables_complete,values_complete,types_complete,supertypes_complete) VALUES ('selected-string', 'java.lang.String', 0, 0, 0, 0)",
                 [],
             ).unwrap();
         });

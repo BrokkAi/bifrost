@@ -1,7 +1,6 @@
 //! Scoped selected reads for route questions on the current thread.
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use brokk_bifrost_semantic::analyzer::semantic::derivation::UnavailableCause;
 use brokk_bifrost_store::analyzer::store::WorkspaceSnapshotId;
@@ -50,7 +49,15 @@ struct FrameEntry {
 thread_local! {
     static FRAMES: RefCell<Vec<FrameEntry>> = const { RefCell::new(Vec::new()) };
 }
-static UNFRAMED_ROUTE_QUESTIONS: AtomicUsize = AtomicUsize::new(0);
+// Test-support only: how many route questions this thread has opened without
+// a read frame. It is per thread because the tests that read it assert that a
+// question *they* ask does or does not open one, and a process-wide count let a
+// test running beside them move it when the suite ran threaded. Production
+// never reads it, so production does not keep it either.
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static UNFRAMED_ROUTE_QUESTIONS: Cell<usize> = const { Cell::new(0) };
+}
 
 pub fn active() -> bool {
     FRAMES.with(|frames| !frames.borrow().is_empty())
@@ -58,7 +65,7 @@ pub fn active() -> bool {
 
 #[cfg(any(test, feature = "test-support"))]
 pub fn unframed_route_questions_for_test() -> usize {
-    UNFRAMED_ROUTE_QUESTIONS.load(Ordering::Relaxed)
+    UNFRAMED_ROUTE_QUESTIONS.with(Cell::get)
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -171,7 +178,7 @@ where
                 let lease = match unsafe { &*ptr }.derivation_read() {
                     Ok(lease) => lease,
                     Err(error) => {
-                        let cause = UnavailableCause::Failed(error.to_string().into());
+                        let cause = binding_unavailable(error);
                         *self.failed.borrow_mut() = Some(cause.clone());
                         return Err(cause);
                     }
@@ -230,7 +237,7 @@ impl<'store> OperationReadFrame<'store> {
         let ptr = Rc::as_ptr(&inventory);
         let lease = unsafe { &*ptr }
             .derivation_read()
-            .map_err(|error| UnavailableCause::Failed(error.to_string().into()))?
+            .map_err(binding_unavailable)?
             .map(|lease| unsafe {
                 std::mem::transmute::<
                     DerivationReadLease<'_, '_>,
@@ -260,6 +267,168 @@ pub fn with_operation_read_frame<T>(
 ) -> Result<T, UnavailableCause> {
     let _frame = OperationReadFrame::enter(identity, operation)?;
     Ok(f())
+}
+
+/// Lend an explicitly opened Main inventory while an owner prefills needed files.
+/// This must run before entering the unit's selected operation.
+pub fn with_main_route_read_frame<T>(
+    identity: ReadFrameIdentity,
+    inventory: &SelectedResolutionMountInventory<'_>,
+    run: impl FnOnce() -> T,
+) -> Result<T, UnavailableCause> {
+    if rust_selected_operation_active() {
+        return Err(UnavailableCause::MissingOperationReadFrame);
+    }
+    let _lease = inventory.derivation_read().map_err(binding_unavailable)?;
+    if !inventory
+        .derivation_reader_binding()
+        .map_err(binding_unavailable)?
+        .proves_main_selection()
+    {
+        return Err(UnavailableCause::ValidationFailed);
+    }
+    let _frame = DemandFrame::enter(identity, inventory);
+    Ok(run())
+}
+
+/// Preserve typed request cancellation at selected-reader and binding boundaries.
+#[doc(hidden)]
+pub fn binding_unavailable(
+    error: brokk_bifrost_store::analyzer::store::StoreError,
+) -> UnavailableCause {
+    if error.is_cancelled() {
+        UnavailableCause::Cancelled
+    } else {
+        UnavailableCause::Failed(error.to_string().into())
+    }
+}
+
+// Only this private constructor grants the three named Main bridges:
+// file_routes, certified package_question, and local-glob name absence.
+// A distinct pooled Main reader uses the operation's identical pinned snapshots
+// and empty masks/content mounts. Its stacked frame is popped before returning;
+// the operation's TEMP scope is never changed. Main reads are captured separately
+// by the caller and only their certified receipt is replayed into the operation.
+struct MainRouteBridgeFrame {
+    _frame: DemandFrame,
+}
+thread_local! {
+    static MAIN_ROUTE_BRIDGE_ACTIVE: Cell<bool> = const { Cell::new(false) };
+    static PACKAGE_TOPOLOGY_BRIDGE_ACTIVE: Cell<bool> = const { Cell::new(false) };
+    static LOCAL_GLOB_NAME_ABSENCE_BRIDGE_ACTIVE: Cell<bool> = const { Cell::new(false) };
+}
+impl MainRouteBridgeFrame {
+    fn enter(
+        identity: ReadFrameIdentity,
+        inventory: &SelectedResolutionMountInventory<'_>,
+    ) -> Result<Self, UnavailableCause> {
+        MAIN_ROUTE_BRIDGE_ACTIVE.with(|active| assert!(!active.get(), "nested Main route bridge"));
+        assert_eq!(
+            inventory.store_identity(),
+            identity.store,
+            "Main bridge store identity"
+        );
+        assert_eq!(
+            super::selected_rust_snapshot(inventory).ok(),
+            identity.snapshot,
+            "Main bridge pinned revision"
+        );
+        let binding = inventory
+            .derivation_reader_binding()
+            .map_err(binding_unavailable)?;
+        if !binding.proves_main_selection() {
+            return Err(UnavailableCause::Failed(
+                format!("Main route reader binding rejected: {binding:?}; identity={identity:?}")
+                    .into(),
+            ));
+        }
+        let frame = DemandFrame::enter(identity, inventory);
+        MAIN_ROUTE_BRIDGE_ACTIVE.with(|active| active.set(true));
+        Ok(Self { _frame: frame })
+    }
+}
+impl Drop for MainRouteBridgeFrame {
+    fn drop(&mut self) {
+        MAIN_ROUTE_BRIDGE_ACTIVE.with(|active| active.set(false));
+    }
+}
+
+/// The file_routes entry point of the shared private bridge. The other named
+/// entry points are package_question and local-glob name absence. All three
+/// require their selected-content gate before Main and defer receipt replay.
+pub fn with_file_routes_main_bridge<T>(
+    identity: ReadFrameIdentity,
+    inventory: &SelectedResolutionMountInventory<'_>,
+    compute: impl FnOnce() -> T,
+) -> Result<T, UnavailableCause> {
+    let _lease = inventory.derivation_read().map_err(binding_unavailable)?;
+    let _bridge = MainRouteBridgeFrame::enter(identity, inventory)?;
+    Ok(compute())
+}
+
+/// The package_question entry point, limited to its three topology demands.
+/// File/source macro identity reads stay outside this bridge. Incomplete or
+/// uncovered questions must refuse; callers replay only the certified receipt.
+pub fn with_package_topology_main_bridge<T>(
+    identity: ReadFrameIdentity,
+    inventory: &SelectedResolutionMountInventory<'_>,
+    compute: impl FnOnce() -> T,
+) -> Result<T, UnavailableCause> {
+    let _lease = inventory.derivation_read().map_err(binding_unavailable)?;
+    let _bridge = MainRouteBridgeFrame::enter(identity, inventory)?;
+    struct PackageTopologyGuard;
+    impl Drop for PackageTopologyGuard {
+        fn drop(&mut self) {
+            PACKAGE_TOPOLOGY_BRIDGE_ACTIVE.with(|active| active.set(false));
+        }
+    }
+    PACKAGE_TOPOLOGY_BRIDGE_ACTIVE.with(|active| {
+        assert!(!active.replace(true), "nested package topology bridge");
+    });
+    let _package = PackageTopologyGuard;
+    Ok(compute())
+}
+
+/// The local-glob name-absence entry point. The caller requires exact selected
+/// content for every input before opening Main, and replays only the receipt
+/// of this named question after the operation's frame has been restored.
+pub fn with_local_glob_name_absence_main_bridge<T>(
+    identity: ReadFrameIdentity,
+    inventory: &SelectedResolutionMountInventory<'_>,
+    compute: impl FnOnce() -> T,
+) -> Result<T, UnavailableCause> {
+    if MAIN_ROUTE_BRIDGE_ACTIVE.with(Cell::get) {
+        return Err(UnavailableCause::ValidationFailed);
+    }
+    let _lease = inventory.derivation_read().map_err(binding_unavailable)?;
+    let _bridge = MainRouteBridgeFrame::enter(identity, inventory)?;
+    struct LocalGlobGuard;
+    impl Drop for LocalGlobGuard {
+        fn drop(&mut self) {
+            LOCAL_GLOB_NAME_ABSENCE_BRIDGE_ACTIVE.with(|active| active.set(false));
+        }
+    }
+    LOCAL_GLOB_NAME_ABSENCE_BRIDGE_ACTIVE
+        .with(|active| assert!(!active.replace(true), "nested local-glob bridge"));
+    let _local_glob = LocalGlobGuard;
+    Ok(compute())
+}
+
+pub(super) fn named_main_bridge_allows(
+    kind: brokk_bifrost_semantic::analyzer::semantic::derivation::DerivationKindId,
+) -> bool {
+    let package_allowed = PACKAGE_TOPOLOGY_BRIDGE_ACTIVE.with(|active| {
+        !active.get()
+            || matches!(
+                kind.0,
+                "derivation:rust_package_units:v1"
+                    | "derivation:rust_file_units:v1"
+                    | "derivation:rust_unit_package_rows:v1"
+            )
+    });
+    package_allowed
+        && LOCAL_GLOB_NAME_ABSENCE_BRIDGE_ACTIVE
+            .with(|active| !active.get() || kind.0 == "derivation:rust_local_glob_name_absence:v1")
 }
 
 pub fn with_query_read_frame<'store, T, F>(
@@ -310,9 +479,10 @@ pub fn with_read_frame<'store, T>(
         return Ok(f(unsafe { &*inventory }));
     }
     if rust_selected_operation_active() {
-        return Err(UnavailableCause::ValidationFailed);
+        return Err(UnavailableCause::MissingOperationReadFrame);
     }
-    UNFRAMED_ROUTE_QUESTIONS.fetch_add(1, Ordering::Relaxed);
+    #[cfg(any(test, feature = "test-support"))]
+    UNFRAMED_ROUTE_QUESTIONS.with(|count| count.set(count.get() + 1));
     let inventory = open()?;
     if identity
         .selection
@@ -321,8 +491,6 @@ pub fn with_read_frame<'store, T>(
     {
         return Err(UnavailableCause::ValidationFailed);
     }
-    let _lease = inventory
-        .derivation_read()
-        .map_err(|error| UnavailableCause::Failed(error.to_string().into()))?;
+    let _lease = inventory.derivation_read().map_err(binding_unavailable)?;
     Ok(f(&inventory))
 }

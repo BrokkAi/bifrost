@@ -21,10 +21,11 @@ use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use crate::analyzer::Language;
 use crate::hash::HashMap;
+use crate::retention_budget::ProcessRequiredMemory;
 
 /// The components a legacy `separator`-joined qualified-name string contributes
 /// to an [`FqName`]: every non-empty run between separators.
@@ -592,6 +593,24 @@ type Entry = (&'static str, SegmentKind);
 /// allocated on demand and never moved.
 type EntryChunks = [OnceLock<Box<[OnceLock<Entry>]>>; ENTRY_CHUNK_COUNT];
 
+/// A count-only snapshot of the process-local segment interner.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SegmentInternerSnapshot {
+    /// Number of interned `(text, kind)` pairs.
+    pub entries: usize,
+    /// Number of distinct segment strings, irrespective of kind.
+    pub unique_texts: usize,
+    /// Exact UTF-8 payload bytes leaked for interned entries (one copy per
+    /// `(text, kind)` pair).
+    pub text_bytes: usize,
+    /// Estimated interner-retained bytes: leaked text payloads, owned map-key
+    /// string capacities, spilled kind-vector capacities, estimated map
+    /// buckets, initialized entry-chunk backing, and the fixed interner
+    /// structure. Allocator metadata and hash-table control bytes are excluded.
+    /// The thread-local recent-intern slots are also outside this interner.
+    pub estimated_retained_bytes: usize,
+}
+
 const RECENT_INTERN_SLOTS: usize = 256;
 
 #[derive(Clone, Copy)]
@@ -632,6 +651,51 @@ struct Shard {
     /// Number of entries published in `entries`. Guarded by the same lock, so
     /// the next local index is decided by whichever writer holds it.
     len: usize,
+    /// Exact leaked UTF-8 payload bytes, one text allocation per pair.
+    text_bytes: usize,
+    /// Owned String key capacities, one per distinct text.
+    map_key_bytes: usize,
+    /// Heap backing for spilled per-text kind vectors.
+    kind_vector_bytes: usize,
+    /// Estimated HashMap bucket storage, excluding control bytes.
+    map_bucket_bytes: usize,
+    /// Initialized entry-chunk cell backing.
+    entry_chunk_bytes: usize,
+}
+
+impl Shard {
+    fn estimated_retained_bytes(&self) -> usize {
+        self.text_bytes
+            .saturating_add(self.map_key_bytes)
+            .saturating_add(self.kind_vector_bytes)
+            .saturating_add(self.map_bucket_bytes)
+            .saturating_add(self.entry_chunk_bytes)
+    }
+}
+
+type ByTextValue = SmallVec<[(SegmentKind, SegmentId); 2]>;
+const MAP_BUCKET_ESTIMATE_BYTES: usize = std::mem::size_of::<(String, ByTextValue)>();
+
+fn map_bucket_estimate(capacity: usize) -> usize {
+    let buckets = if capacity == 0 {
+        0
+    } else {
+        capacity
+            .saturating_add(1)
+            .checked_next_power_of_two()
+            .unwrap_or(usize::MAX)
+    };
+    buckets.saturating_mul(MAP_BUCKET_ESTIMATE_BYTES)
+}
+
+fn kind_vector_heap_bytes(slots: &ByTextValue) -> usize {
+    if slots.spilled() {
+        slots
+            .capacity()
+            .saturating_mul(std::mem::size_of::<(SegmentKind, SegmentId)>())
+    } else {
+        0
+    }
 }
 
 /// Sharded, concurrent interner of `(text, kind)` pairs.
@@ -645,6 +709,8 @@ struct Shard {
 /// chromium probe phase inside it).
 pub struct SegmentInterner {
     identity: u64,
+    process_owner: OnceLock<Arc<ProcessRequiredMemory>>,
+    pending_bytes: AtomicU64,
     shards: [RwLock<Shard>; SHARD_COUNT],
     /// Per-shard entry table. Written only under the shard's write lock; read
     /// without any lock. `OnceLock` is what makes that safe: a chunk is
@@ -661,14 +727,47 @@ impl SegmentInterner {
         assert_ne!(identity, 0, "segment interner identity space exhausted");
         SegmentInterner {
             identity,
+            process_owner: OnceLock::new(),
+            pending_bytes: AtomicU64::new(std::mem::size_of::<Self>() as u64),
             shards: std::array::from_fn(|_| {
                 RwLock::new(Shard {
                     by_text: HashMap::default(),
                     len: 0,
+                    text_bytes: 0,
+                    map_key_bytes: 0,
+                    kind_vector_bytes: 0,
+                    map_bucket_bytes: 0,
+                    entry_chunk_bytes: 0,
                 })
             }),
             entries: std::array::from_fn(|_| std::array::from_fn(|_| OnceLock::new())),
         }
+    }
+
+    /// A bound interner has process lifetime, just like its leaked text.
+    fn bind_process_owner(&'static self, owner: Arc<ProcessRequiredMemory>) {
+        if let Err(owner) = self.process_owner.set(owner) {
+            assert_eq!(
+                self.process_owner.get().unwrap().owner_id(),
+                owner.owner_id(),
+                "an interner cannot change its process required-memory owner"
+            );
+        }
+        // Publish before draining. Only writers that initially observed no
+        // binding contribute to pending; each adds before reloading binding.
+        // If that reload still sees None, the later binder swap takes it.
+        // Otherwise the binder or a writer swap takes it exactly once. Atomic
+        // exchanges partition additions, including concurrent same-owner binds.
+        // If a writer adds after this swap, its AcqRel read-modify-write sees
+        // the swap and thus the published binding before its reload. If it
+        // adds first, this swap takes its bytes. Both sides must use RMWs;
+        // a plain load followed by clearing would not establish that ordering.
+        // A pre-binding transfer may remain in flight after another writer
+        // returns; its guarantee is exact backfill once those writers finish.
+        self.process_owner
+            .get()
+            .unwrap()
+            .grow(self.pending_bytes.swap(0, Ordering::AcqRel));
     }
 
     fn text_hash(text: &str) -> u64 {
@@ -787,11 +886,15 @@ impl SegmentInterner {
                 }
             }
         }
+        let before_bytes = shard.estimated_retained_bytes();
         let local = shard.len;
         let id = Self::encode(shard_idx, local);
         let leaked: &'static str = Box::leak(text.to_owned().into_boxed_str());
         let (chunk, offset) = entry_slot(local);
         let slots = self.entries[shard_idx][chunk].get_or_init(|| {
+            shard.entry_chunk_bytes = shard.entry_chunk_bytes.saturating_add(
+                entry_chunk_len(chunk).saturating_mul(std::mem::size_of::<OnceLock<Entry>>()),
+            );
             (0..entry_chunk_len(chunk))
                 .map(|_| OnceLock::new())
                 .collect()
@@ -800,13 +903,68 @@ impl SegmentInterner {
             .set((leaked, kind))
             .expect("a segment entry slot is filled exactly once");
         shard.len = local + 1;
-        shard
-            .by_text
-            .entry(text.to_owned())
-            .or_default()
-            .push((kind, id));
+        shard.text_bytes = shard.text_bytes.saturating_add(text.len());
+        let is_new_text = !shard.by_text.contains_key(text);
+        let old_map_capacity = shard.by_text.capacity();
+        let key = text.to_owned();
+        let key_capacity = key.capacity();
+        let (old_vector_bytes, new_vector_bytes) = {
+            let slots = shard.by_text.entry(key).or_default();
+            let old_vector_bytes = kind_vector_heap_bytes(slots);
+            slots.push((kind, id));
+            (old_vector_bytes, kind_vector_heap_bytes(slots))
+        };
+        if is_new_text {
+            shard.map_key_bytes = shard.map_key_bytes.saturating_add(key_capacity);
+        }
+        shard.kind_vector_bytes = shard
+            .kind_vector_bytes
+            .saturating_add(new_vector_bytes)
+            .saturating_sub(old_vector_bytes);
+        let new_map_capacity = shard.by_text.capacity();
+        shard.map_bucket_bytes = shard
+            .map_bucket_bytes
+            .saturating_add(map_bucket_estimate(new_map_capacity))
+            .saturating_sub(map_bucket_estimate(old_map_capacity));
+        let growth = shard.estimated_retained_bytes() - before_bytes;
+        drop(shard);
+        // No process-account or budget operation runs under an interner lock.
+        // A bound writer charges its OWN delta before returning, without a
+        // pending swap that could hand its delta to an in-flight flusher.
+        if let Some(owner) = self.process_owner.get() {
+            owner.grow(growth as u64);
+        } else {
+            // Only the pre-binding cohort uses pending. Add before reloading
+            // binding so either this writer or the publish-then-swap binder
+            // transfers the delta exactly once. Never use load instead of swap.
+            self.pending_bytes
+                .fetch_add(growth as u64, Ordering::AcqRel);
+            if let Some(owner) = self.process_owner.get() {
+                owner.grow(self.pending_bytes.swap(0, Ordering::AcqRel));
+            }
+        }
         self.remember(recent_slot, id);
         id
+    }
+
+    /// Return a count-only snapshot without walking interned names. Counters
+    /// are updated only for new `(text, kind)` pairs under the existing shard
+    /// write lock; snapshotting takes one read lock per shard.
+    pub fn snapshot(&self) -> SegmentInternerSnapshot {
+        let mut snapshot = SegmentInternerSnapshot {
+            estimated_retained_bytes: std::mem::size_of_val(self),
+            ..SegmentInternerSnapshot::default()
+        };
+        for shard_lock in &self.shards {
+            let shard = shard_lock.read().unwrap();
+            snapshot.entries = snapshot.entries.saturating_add(shard.len);
+            snapshot.unique_texts = snapshot.unique_texts.saturating_add(shard.by_text.len());
+            snapshot.text_bytes = snapshot.text_bytes.saturating_add(shard.text_bytes);
+            snapshot.estimated_retained_bytes = snapshot
+                .estimated_retained_bytes
+                .saturating_add(shard.estimated_retained_bytes());
+        }
+        snapshot
     }
 
     pub fn resolve(&self, id: SegmentId) -> (&'static str, SegmentKind) {
@@ -855,10 +1013,23 @@ impl SegmentInterner {
 /// The process-global interner.
 ///
 /// A single process-global interner avoids threading workspace-local interners
-/// through every extractor. Entries are tiny, grow-only, and text-deduplicated.
+/// through every extractor. #9737 measured 388,438 estimated bytes on Bat on
+/// 2026-11-10 (about 0.0362% of 1 GiB), not a bound; larger repositories are
+/// unmeasured. Keep global identities while accounting their required growth.
+/// The structural estimate excludes allocator metadata, hash control bytes,
+/// thread-local recent slots and allocations owned by individual FqName holders.
 pub fn segment_interner() -> &'static SegmentInterner {
-    static INTERNER: OnceLock<SegmentInterner> = OnceLock::new();
-    INTERNER.get_or_init(SegmentInterner::new)
+    static INTERNER: OnceLock<&'static SegmentInterner> = OnceLock::new();
+    INTERNER.get_or_init(|| {
+        let interner: &'static SegmentInterner = Box::leak(Box::new(SegmentInterner::new()));
+        // The required account only increments an atomic: no callbacks or
+        // recursion into this initializer. Publish only after fixed-size and
+        // prior growth backfill completes. Every production writer therefore
+        // starts bound and charges its own delta before returning. Global hits
+        // perform no binding, owner Arc clone or transfer operation.
+        interner.bind_process_owner(ProcessRequiredMemory::global());
+        interner
+    })
 }
 
 /// Per-thread counts of interner traffic, so a test can pin how much identity
@@ -1045,6 +1216,131 @@ mod tests {
             first.intern("same", SegmentKind::Unknown),
             unknown,
             "eviction from the recent set must fall back to the authoritative interner"
+        );
+    }
+
+    #[test]
+    fn process_owner_backfills_once_and_hits_charge_nothing() {
+        let interner: &'static SegmentInterner = Box::leak(Box::new(SegmentInterner::new()));
+        let owner = ProcessRequiredMemory::for_tests();
+        let id = interner.intern("shared", SegmentKind::Unknown);
+        interner.intern("shared", SegmentKind::Package);
+        assert_eq!(owner.bytes(), 0);
+        interner.bind_process_owner(owner.clone());
+        assert_eq!(
+            owner.bytes(),
+            interner.snapshot().estimated_retained_bytes as u64
+        );
+        let before = owner.bytes();
+        interner.bind_process_owner(owner.clone());
+        assert_eq!(interner.intern("shared", SegmentKind::Unknown), id);
+        assert_eq!(owner.bytes(), before);
+        interner.intern("shared", SegmentKind::Member);
+        assert!(owner.bytes() > before, "third kind spills its vector");
+        assert_eq!(
+            owner.bytes(),
+            interner.snapshot().estimated_retained_bytes as u64
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "an interner cannot change its process required-memory owner")]
+    fn process_owner_rebinding_rejects_a_different_owner() {
+        let interner: &'static SegmentInterner = Box::leak(Box::new(SegmentInterner::new()));
+        interner.bind_process_owner(ProcessRequiredMemory::for_tests());
+        interner.bind_process_owner(ProcessRequiredMemory::for_tests());
+    }
+
+    #[test]
+    fn process_owner_binding_races_duplicate_and_chunk_growth() {
+        use std::sync::Barrier;
+
+        let interner: &'static SegmentInterner = Box::leak(Box::new(SegmentInterner::new()));
+        let owner = ProcessRequiredMemory::for_tests();
+        interner.intern("before-binding", SegmentKind::Unknown);
+        // Keep 160 distinct names in one shard to cross two chunk boundaries.
+        let names: Vec<_> = (0usize..)
+            .map(|i| format!("process-account-{i}"))
+            .filter(|name| SegmentInterner::shard_of_hash(SegmentInterner::text_hash(name)) == 0)
+            .take(160)
+            .collect();
+        let barrier = Barrier::new(5);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let names = &names;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    for name in names {
+                        for kind in [
+                            SegmentKind::Unknown,
+                            SegmentKind::Package,
+                            SegmentKind::Member,
+                        ] {
+                            interner.intern(name, kind);
+                        }
+                    }
+                });
+            }
+            barrier.wait();
+            interner.bind_process_owner(owner.clone());
+        });
+        assert_eq!(interner.snapshot().entries, 1 + names.len() * 3);
+        assert_eq!(
+            owner.bytes(),
+            interner.snapshot().estimated_retained_bytes as u64
+        );
+        std::thread::scope(|scope| {
+            for worker in 0..4 {
+                let owner = &owner;
+                scope.spawn(move || {
+                    for index in 0..64 {
+                        let name = format!("bound-writer-{worker}-{index}");
+                        let before = owner.bytes();
+                        interner.intern(&name, SegmentKind::Unknown);
+                        assert!(owner.bytes() >= before + name.len() as u64);
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            owner.bytes(),
+            interner.snapshot().estimated_retained_bytes as u64
+        );
+        let before = owner.bytes();
+        interner.bind_process_owner(owner.clone());
+        for name in &names {
+            interner.intern(name, SegmentKind::Member);
+        }
+        assert_eq!(owner.bytes(), before);
+    }
+
+    #[test]
+    fn snapshot_accounts_for_duplicate_text_across_kinds() {
+        let interner = SegmentInterner::new();
+        let before = interner.snapshot();
+        interner.intern("shared", SegmentKind::Unknown);
+        interner.intern("shared", SegmentKind::Package);
+        let before_spill = interner.snapshot();
+        interner.intern("shared", SegmentKind::Unknown);
+        assert_eq!(interner.snapshot(), before_spill);
+
+        assert_eq!(before.entries, 0);
+        assert_eq!(before.unique_texts, 0);
+        assert_eq!(before.text_bytes, 0);
+        assert_eq!(before_spill.entries, 2);
+        assert_eq!(before_spill.unique_texts, 1);
+        assert_eq!(before_spill.text_bytes, "shared".len() * 2);
+
+        interner.intern("shared", SegmentKind::Member);
+        let after_spill = interner.snapshot();
+        assert_eq!(after_spill.entries, 3);
+        assert_eq!(after_spill.unique_texts, 1);
+        assert_eq!(after_spill.text_bytes, "shared".len() * 3);
+        assert_eq!(
+            after_spill.estimated_retained_bytes - before_spill.estimated_retained_bytes,
+            "shared".len() + 4 * std::mem::size_of::<(SegmentKind, SegmentId)>(),
+            "the third kind adds one leaked string and the spilled kind-vector backing"
         );
     }
 

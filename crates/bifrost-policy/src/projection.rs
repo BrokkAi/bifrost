@@ -19,10 +19,10 @@ use super::definition::{PolicyAnalysisType, PolicyId, PolicyReportOptions};
 use super::finding::{
     BoundedWitness, FindingCertainty, FindingCompleteness, FindingIncompleteReason,
     MAX_MODEL_ATTRIBUTION_CONTRIBUTORS, ModelAttribution, PolicyDiagnostic, PolicyDiagnosticCode,
-    PolicyDiagnosticImpact, PolicyDiagnosticSeverity, PolicyFailureReason, PolicyIncompleteReason,
-    PolicyLocationRelationship, PolicyRunCompletion, PolicySourceLocation, PolicyWorkReport,
-    ProofMetadata, ProofState, RelatedPolicyLocation, insert_policy_diagnostic_bounded,
-    normalize_policy_diagnostics_bounded,
+    PolicyDiagnosticImpact, PolicyDiagnosticSeverity, PolicyDiagnostics, PolicyFailureReason,
+    PolicyIncompleteReason, PolicyLocationRelationship, PolicyRunCompletion, PolicySourceLocation,
+    PolicyWorkReport, ProofMetadata, ProofState, RelatedPolicyLocation,
+    insert_policy_diagnostic_bounded, normalize_policy_diagnostics_bounded,
 };
 use super::finding_identity::{
     AnalysisEventRef, AnalysisFindingId, AnalysisSubjectRef, EvidenceRef, FindingIdentityStability,
@@ -40,6 +40,7 @@ use super::resolved::{
     LoadedPolicy, ResolvedEndpointIdentity, ResolvedTaintPolicySpec, ResolvedTypestateEventTrigger,
     ResolvedTypestatePolicySpec, ResolvedTypestateTerminalTrigger,
 };
+use super::retained::{RetainedSize, retained_extra, retained_size_with_extras};
 
 pub(crate) fn retain_related_location(
     related: &mut Vec<RelatedPolicyLocation>,
@@ -49,10 +50,14 @@ pub(crate) fn retain_related_location(
     limit: usize,
     omitted: &mut u64,
 ) -> Result<(), String> {
-    if &location == primary
-        || related
-            .iter()
-            .any(|retained| retained.location() == &location)
+    // Source attribution is a semantic role, even when a direct source and
+    // sink share coordinates. Do not erase it through display deduplication.
+    if (&location == primary && relationship != PolicyLocationRelationship::Source)
+        || related.iter().any(|retained| {
+            retained.location() == &location
+                && (relationship != PolicyLocationRelationship::Source
+                    || retained.relationship() == PolicyLocationRelationship::Source)
+        })
     {
         return Ok(());
     }
@@ -74,6 +79,7 @@ pub(crate) fn failed_projection_diagnostic(message: &str) -> PolicyDiagnostic {
         PolicyDiagnosticImpact::RunFailed,
         message,
     )
+    .with_policy_execution_cause(crate::finding::PolicyDiagnosticExecutionCause::Other)
 }
 
 /// The sealing supertraits are crate-visible so #824 can implement an adapter,
@@ -308,6 +314,8 @@ impl EffectiveReportLimits {
 pub(crate) struct ProjectedFindingReport {
     #[serde(skip_serializing_if = "crate::ValueTypeBarrierNotes::is_empty")]
     pub(crate) value_type_barrier_notes: crate::ValueTypeBarrierNotes,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) evaluation_location: Option<PolicySourceLocation>,
     pub(crate) primary: PolicySourceLocation,
     pub(crate) certainty: FindingCertainty,
     pub(crate) completeness: FindingCompleteness,
@@ -321,6 +329,24 @@ pub(crate) struct ProjectedFindingReport {
     pub(crate) witnesses_truncated: bool,
     pub(crate) omitted_witnesses_lower_bound: u64,
     pub(crate) display_path: Option<super::display_path::TaintDisplayPath>,
+}
+
+impl RetainedSize for ProjectedFindingReport {
+    fn retained_size(&self) -> usize {
+        retained_size_with_extras(
+            self,
+            [
+                retained_extra(&self.value_type_barrier_notes),
+                retained_extra(&self.primary),
+                retained_extra(&self.certainty),
+                retained_extra(&self.completeness),
+                retained_extra(&self.related),
+                retained_extra(&self.proof),
+                retained_extra(&self.witnesses),
+                retained_extra(&self.display_path),
+            ],
+        )
+    }
 }
 
 /// One adapter-established taint origin. It is intentionally not final report
@@ -390,6 +416,23 @@ pub(crate) struct TypestateProjectedFinding {
     pub(crate) report: ProjectedFindingReport,
 }
 
+impl RetainedSize for TypestateProjectedFinding {
+    fn retained_size(&self) -> usize {
+        retained_size_with_extras(
+            self,
+            [
+                retained_extra(&self.facts),
+                retained_extra(&self.analysis_finding_id),
+                retained_extra(&self.anchor),
+                retained_extra(&self.subject),
+                retained_extra(&self.witness_refs),
+                retained_extra(&self.model_attribution),
+                retained_extra(&self.report),
+            ],
+        )
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Reading a typestate root unit's projections back
 // ---------------------------------------------------------------------------
@@ -412,6 +455,8 @@ impl<'de> Deserialize<'de> for ProjectedFindingReport {
         struct Wire {
             #[serde(default)]
             value_type_barrier_notes: crate::ValueTypeBarrierNotes,
+            #[serde(default)]
+            evaluation_location: Option<PolicySourceLocation>,
             primary: PolicySourceLocation,
             certainty: FindingCertainty,
             completeness: FindingCompleteness,
@@ -445,6 +490,7 @@ impl<'de> Deserialize<'de> for ProjectedFindingReport {
         }
         Ok(Self {
             value_type_barrier_notes: wire.value_type_barrier_notes,
+            evaluation_location: wire.evaluation_location,
             primary: wire.primary,
             certainty: wire.certainty,
             completeness: wire.completeness,
@@ -597,7 +643,7 @@ pub(crate) struct TaintProjectionPayload {
     pub(crate) scope: Option<crate::PolicyRunScope>,
     pub(crate) projections: Vec<TaintProjectedFinding>,
     pub(crate) completion: PolicyRunCompletion,
-    pub(crate) diagnostics: Vec<PolicyDiagnostic>,
+    pub(crate) diagnostics: PolicyDiagnostics,
     pub(crate) diagnostics_truncated: bool,
     pub(crate) work: PolicyWorkReport,
     pub(crate) authored_arm_closures: Vec<crate::AuthoredArmClosureEvidence>,
@@ -608,7 +654,7 @@ pub(crate) struct TaintProjectionPayload {
 pub(crate) struct TypestateProjectionPayload {
     pub(crate) projections: Vec<TypestateProjectedFinding>,
     pub(crate) completion: PolicyRunCompletion,
-    pub(crate) diagnostics: Vec<PolicyDiagnostic>,
+    pub(crate) diagnostics: PolicyDiagnostics,
     pub(crate) diagnostics_truncated: bool,
     pub(crate) work: PolicyWorkReport,
     /// Per-site subject verdicts, present only when the compile succeeded.
@@ -628,7 +674,7 @@ pub(crate) struct TaintProjectionBatch {
     pub(crate) scope: Option<crate::PolicyRunScope>,
     projections: Vec<TaintProjectedFinding>,
     completion: PolicyRunCompletion,
-    diagnostics: Vec<PolicyDiagnostic>,
+    diagnostics: PolicyDiagnostics,
     diagnostics_truncated: bool,
     work: PolicyWorkReport,
     authored_arm_closures: Vec<crate::AuthoredArmClosureEvidence>,
@@ -639,16 +685,28 @@ pub(crate) struct TypestateProjectionBatch {
     seal: ProjectionSeal,
     projections: Vec<TypestateProjectedFinding>,
     completion: PolicyRunCompletion,
-    diagnostics: Vec<PolicyDiagnostic>,
+    diagnostics: PolicyDiagnostics,
     diagnostics_truncated: bool,
     work: PolicyWorkReport,
     subjects: Option<crate::finding::PolicySubjectVerdicts>,
 }
 
+impl TaintProjectionBatch {
+    pub(crate) fn omitted_diagnostic_summary(&self) -> PolicyDiagnostics {
+        self.diagnostics.omitted_summary()
+    }
+}
+
+impl TypestateProjectionBatch {
+    pub(crate) fn omitted_diagnostic_summary(&self) -> PolicyDiagnostics {
+        self.diagnostics.omitted_summary()
+    }
+}
+
 pub(crate) struct ValidatedTaintProjectionBatch {
     pub(crate) projections: Vec<ValidatedTaintPairProjection>,
     pub(crate) completion: PolicyRunCompletion,
-    pub(crate) diagnostics: Vec<PolicyDiagnostic>,
+    pub(crate) diagnostics: PolicyDiagnostics,
     pub(crate) diagnostics_truncated: bool,
     pub(crate) work: PolicyWorkReport,
     pub(crate) authored_arm_closures: Vec<crate::AuthoredArmClosureEvidence>,
@@ -657,7 +715,7 @@ pub(crate) struct ValidatedTaintProjectionBatch {
 pub(crate) struct ValidatedTypestateProjectionBatch {
     pub(crate) projections: Vec<ValidatedTypestateProjection>,
     pub(crate) completion: PolicyRunCompletion,
-    pub(crate) diagnostics: Vec<PolicyDiagnostic>,
+    pub(crate) diagnostics: PolicyDiagnostics,
     pub(crate) diagnostics_truncated: bool,
     pub(crate) work: PolicyWorkReport,
     pub(crate) subjects: Option<crate::finding::PolicySubjectVerdicts>,
@@ -665,6 +723,7 @@ pub(crate) struct ValidatedTypestateProjectionBatch {
 
 #[derive(Debug)]
 pub(crate) struct ValidatedTaintPairProjection {
+    report_detail_omitted: bool,
     pub(crate) facts: TaintPolicyProjectionFacts,
     pub(crate) analysis_finding_id: AnalysisFindingId,
     pub(crate) anchor: TaintFindingAnchor,
@@ -679,6 +738,7 @@ pub(crate) struct ValidatedTaintPairProjection {
 
 #[derive(Debug)]
 pub(crate) struct ValidatedTypestateProjection {
+    report_detail_omitted: bool,
     pub(crate) facts: TypestatePolicyProjectionFacts,
     pub(crate) analysis_finding_id: AnalysisFindingId,
     pub(crate) anchor: TypestateFindingAnchor,
@@ -698,9 +758,11 @@ pub(crate) fn validate_taint_batch(
         return Err(ProjectionAuthorityError::AuthorityMismatch);
     }
     let mut completion = batch.completion;
+    batch.work.record_diagnostic_refusals(&batch.diagnostics);
     let mut diagnostics = batch.diagnostics;
     let mut diagnostics_truncated = batch.diagnostics_truncated;
     if normalize_policy_diagnostics_bounded(&mut diagnostics, budget.max_diagnostics()) {
+        batch.work.record_budget_refusal("policy/diagnostics");
         diagnostics_truncated = true;
         completion.mark_inconclusive(PolicyIncompleteReason::ReportRetentionBudget);
     }
@@ -730,8 +792,14 @@ pub(crate) fn validate_taint_batch(
     let mut projections = Vec::with_capacity(raw_projection_count.min(processing_limit));
     let bounded_omissions = batch.projections.len() > processing_limit;
     let mut omitted_finding_ids = duplicate_finding_ids;
+    let mut retention_omitted_finding_ids = HashSet::new();
+    let mut retention_omitted_records = 0_u64;
     for projection in batch.projections.iter().skip(processing_limit) {
-        omitted_finding_ids.extend(taint_projection_finding_ids(authority, projection));
+        let ids = taint_projection_finding_ids(authority, projection);
+        retention_omitted_records = retention_omitted_records
+            .saturating_add(u64::try_from(projection.pairs.len()).unwrap_or(u64::MAX));
+        retention_omitted_finding_ids.extend(ids.iter().copied());
+        omitted_finding_ids.extend(ids);
     }
     if had_duplicate_projections {
         record_rejection(
@@ -755,10 +823,14 @@ pub(crate) fn validate_taint_batch(
     }
     let report_limits = EffectiveReportLimits::new(authority.report, budget);
     for projection in batch.projections.into_iter().take(processing_limit) {
+        let candidate_record_count = u64::try_from(projection.pairs.len()).unwrap_or(u64::MAX);
         let candidate_finding_ids = taint_projection_finding_ids(authority, &projection);
         match validate_taint_projection(authority, projection, budget, report_limits) {
             Ok(validated) => {
+                retention_omitted_records =
+                    retention_omitted_records.saturating_add(validated.retention_omitted_records);
                 omitted_finding_ids.extend(validated.omitted_finding_ids);
+                retention_omitted_finding_ids.extend(validated.retention_omitted_finding_ids);
                 for error in validated.rejections {
                     record_rejection(
                         error,
@@ -782,6 +854,8 @@ pub(crate) fn validate_taint_batch(
                         );
                         if projections.len() >= budget.max_findings() {
                             omitted_finding_ids.insert(finding_id);
+                            retention_omitted_records = retention_omitted_records.saturating_add(1);
+                            retention_omitted_finding_ids.insert(finding_id);
                             record_rejection(
                                 ProjectionAuthorityError::ProjectionCountBudget {
                                     max_items: budget.max_findings(),
@@ -792,6 +866,15 @@ pub(crate) fn validate_taint_batch(
                                 budget,
                             );
                             continue;
+                        }
+                        if projection.report_detail_omitted {
+                            completion
+                                .mark_inconclusive(PolicyIncompleteReason::ReportRetentionBudget);
+                            diagnostics.record_typed_cause(
+                                &PolicyDiagnosticCode::ReportRetentionBudget,
+                                PolicyDiagnosticImpact::RunIncomplete,
+                                crate::finding::PolicyDiagnosticExecutionCause::DetailRetention,
+                            );
                         }
                         if projection.anchor.stability() == FindingIdentityStability::Weak {
                             record_weak_anchor(
@@ -806,6 +889,11 @@ pub(crate) fn validate_taint_batch(
                 }
             }
             Err(error) => {
+                if error.is_retention_budget_loss() {
+                    retention_omitted_records =
+                        retention_omitted_records.saturating_add(candidate_record_count);
+                    retention_omitted_finding_ids.extend(candidate_finding_ids.iter().copied());
+                }
                 omitted_finding_ids.extend(candidate_finding_ids);
                 record_rejection(
                     error,
@@ -826,13 +914,19 @@ pub(crate) fn validate_taint_batch(
             &projection.anchor,
         ));
     }
+    retention_omitted_finding_ids.retain(|id| omitted_finding_ids.contains(id));
+    let semantic_omitted = omitted_finding_ids
+        .difference(&retention_omitted_finding_ids)
+        .count();
     let mut work = batch.work;
     work.set_retention(
         0,
         work.omitted_findings_lower_bound()
-            .saturating_add(u64::try_from(omitted_finding_ids.len()).unwrap_or(u64::MAX)),
+            .saturating_add(u64::try_from(semantic_omitted).unwrap_or(u64::MAX)),
         0,
     );
+    // A surviving sibling ID cannot cancel an actual refused record.
+    work.add_retention_omitted_findings(retention_omitted_records);
     Ok(ValidatedTaintProjectionBatch {
         projections,
         completion,
@@ -852,24 +946,40 @@ pub(crate) fn validate_typestate_batch(
         return Err(ProjectionAuthorityError::AuthorityMismatch);
     }
     let mut completion = batch.completion;
+    batch.work.record_diagnostic_refusals(&batch.diagnostics);
     let mut diagnostics = batch.diagnostics;
     let mut diagnostics_truncated = batch.diagnostics_truncated;
     if normalize_policy_diagnostics_bounded(&mut diagnostics, budget.max_diagnostics()) {
+        batch.work.record_budget_refusal("policy/diagnostics");
         diagnostics_truncated = true;
         completion.mark_inconclusive(PolicyIncompleteReason::ReportRetentionBudget);
     }
     let (unique_projections, conflicting_projections) =
         reject_duplicate_typestate_envelopes(authority, batch.projections);
     batch.projections = unique_projections;
+    let mut original_counts = HashMap::new();
+    if batch.subjects.is_some() {
+        for projection in &batch.projections {
+            *original_counts
+                .entry(PolicyFindingId::from_typestate_anchor(
+                    &authority.seal.policy_id,
+                    &projection.anchor,
+                ))
+                .or_default() += 1;
+        }
+    }
     let processing_limit = budget.max_findings();
     let mut projections = Vec::with_capacity(batch.projections.len().min(processing_limit));
     let bounded_omissions = batch.projections.len() > processing_limit;
     let mut omitted_finding_ids = HashSet::new();
+    let mut retention_omitted_finding_ids = HashSet::new();
+    let mut retention_omitted_records = 0_u64;
     for projection in batch.projections.iter().skip(processing_limit) {
-        omitted_finding_ids.insert(PolicyFindingId::from_typestate_anchor(
-            &authority.seal.policy_id,
-            &projection.anchor,
-        ));
+        let id =
+            PolicyFindingId::from_typestate_anchor(&authority.seal.policy_id, &projection.anchor);
+        omitted_finding_ids.insert(id);
+        retention_omitted_records = retention_omitted_records.saturating_add(1);
+        retention_omitted_finding_ids.insert(id);
     }
     for error in conflicting_projections {
         record_rejection(
@@ -895,8 +1005,17 @@ pub(crate) fn validate_typestate_batch(
     for projection in batch.projections.into_iter().take(processing_limit) {
         let candidate_finding_id =
             PolicyFindingId::from_typestate_anchor(&authority.seal.policy_id, &projection.anchor);
-        match validate_typestate_projection(authority, projection, budget, report_limits) {
+        match validate_typestate_projection_for_report(authority, projection, budget, report_limits)
+        {
             Ok(projection) if projections.len() < budget.max_findings() => {
+                if projection.report_detail_omitted {
+                    completion.mark_inconclusive(PolicyIncompleteReason::ReportRetentionBudget);
+                    diagnostics.record_typed_cause(
+                        &PolicyDiagnosticCode::ReportRetentionBudget,
+                        PolicyDiagnosticImpact::RunIncomplete,
+                        crate::finding::PolicyDiagnosticExecutionCause::DetailRetention,
+                    );
+                }
                 if projection.anchor.stability() == FindingIdentityStability::Weak {
                     record_weak_anchor(
                         &mut diagnostics,
@@ -909,6 +1028,8 @@ pub(crate) fn validate_typestate_batch(
             }
             Ok(_) => {
                 omitted_finding_ids.insert(candidate_finding_id);
+                retention_omitted_records = retention_omitted_records.saturating_add(1);
+                retention_omitted_finding_ids.insert(candidate_finding_id);
                 record_rejection(
                     ProjectionAuthorityError::ProjectionCountBudget {
                         max_items: budget.max_findings(),
@@ -920,6 +1041,10 @@ pub(crate) fn validate_typestate_batch(
                 );
             }
             Err(error) => {
+                if error.is_retention_budget_loss() {
+                    retention_omitted_records = retention_omitted_records.saturating_add(1);
+                    retention_omitted_finding_ids.insert(candidate_finding_id);
+                }
                 omitted_finding_ids.insert(candidate_finding_id);
                 record_rejection(
                     error,
@@ -940,13 +1065,31 @@ pub(crate) fn validate_typestate_batch(
             &projection.anchor,
         ));
     }
+    retention_omitted_finding_ids.retain(|id| omitted_finding_ids.contains(id));
+    let semantic_omitted = omitted_finding_ids
+        .difference(&retention_omitted_finding_ids)
+        .count();
     let mut work = batch.work;
     work.set_retention(
         0,
         work.omitted_findings_lower_bound()
-            .saturating_add(u64::try_from(omitted_finding_ids.len()).unwrap_or(u64::MAX)),
+            .saturating_add(u64::try_from(semantic_omitted).unwrap_or(u64::MAX)),
         0,
     );
+    // Keep the ID-set semantic lower bound separate from counted record loss.
+    work.add_retention_omitted_findings(retention_omitted_records);
+    if let Some(subjects) = &mut batch.subjects {
+        let mut retained_counts = HashMap::new();
+        for projection in &projections {
+            *retained_counts
+                .entry(PolicyFindingId::from_typestate_anchor(
+                    &authority.seal.policy_id,
+                    &projection.anchor,
+                ))
+                .or_default() += 1;
+        }
+        subjects.retain_finding_counts(&original_counts, &retained_counts);
+    }
     Ok(ValidatedTypestateProjectionBatch {
         projections,
         completion,
@@ -1167,6 +1310,8 @@ fn validate_taint_projection(
         .map(|pair| (pair.source_endpoint.clone(), pair))
         .collect::<HashMap<_, _>>();
     let mut omitted_finding_ids = HashSet::new();
+    let mut retention_omitted_finding_ids = HashSet::new();
+    let mut retention_omitted_records = 0_u64;
     for source_endpoint in invalid_source_endpoints {
         if let Some(pair) = pairs_by_endpoint.remove(&source_endpoint) {
             omitted_finding_ids.insert(PolicyFindingId::from_taint_anchor(
@@ -1180,6 +1325,8 @@ fn validate_taint_projection(
             value: None,
             rejections,
             omitted_finding_ids,
+            retention_omitted_finding_ids,
+            retention_omitted_records,
         });
     };
     let mut retained_endpoints = validated_facts
@@ -1257,9 +1404,13 @@ fn validate_taint_projection(
             budget,
         )
         .map_err(ProjectionAuthorityError::InvalidProjectionFacts)?;
-        match validate_taint_pair(pair_facts, pair, budget, report_limits) {
+        match validate_taint_pair_for_report(pair_facts, pair, budget, report_limits) {
             Ok(pair) => validated_pairs.push(pair),
             Err(error) => {
+                if error.is_retention_budget_loss() {
+                    retention_omitted_records = retention_omitted_records.saturating_add(1);
+                    retention_omitted_finding_ids.insert(finding_id);
+                }
                 omitted_finding_ids.insert(finding_id);
                 rejections.push(error);
             }
@@ -1269,14 +1420,245 @@ fn validate_taint_projection(
         value: (!validated_pairs.is_empty()).then_some(validated_pairs),
         rejections,
         omitted_finding_ids,
+        retention_omitted_finding_ids,
+        retention_omitted_records,
     })
 }
 
+fn projected_evidence_refs(
+    report: &ProjectedFindingReport,
+    mut refs: HashSet<EvidenceRef>,
+) -> HashSet<EvidenceRef> {
+    refs.extend(report.proof.evidence_refs().iter().cloned());
+    refs.extend(
+        report
+            .related
+            .iter()
+            .flat_map(|site| site.evidence_refs().iter().cloned()),
+    );
+    refs.extend(
+        report
+            .witnesses
+            .iter()
+            .flat_map(|witness| witness.steps())
+            .flat_map(|step| step.evidence_refs().iter().cloned()),
+    );
+    refs
+}
+
+fn require_projected_reason(report: &mut ProjectedFindingReport, reason: FindingIncompleteReason) {
+    let mut reasons = report.completeness.reasons().to_vec();
+    reasons.push(reason);
+    reasons.sort();
+    reasons.dedup();
+    report.completeness =
+        FindingCompleteness::partial(reasons).expect("typed report detail omissions are canonical");
+}
+
+fn omit_projected_report_detail(report: &mut ProjectedFindingReport) -> bool {
+    let refs_before = projected_evidence_refs(report, HashSet::new());
+    let related = report.related.len() as u64;
+    let witnesses = report.witnesses.len() as u64;
+    let notes_omitted = report.value_type_barrier_notes.omit_optional_detail();
+    let changed = related > 0 || witnesses > 0 || report.display_path.is_some() || notes_omitted;
+    report.display_path = None;
+    report.related = Vec::new();
+    report.related_truncated |= related > 0;
+    report.omitted_related_locations_lower_bound = report
+        .omitted_related_locations_lower_bound
+        .saturating_add(related);
+    report.witnesses = Vec::new();
+    report.witnesses_truncated |= witnesses > 0;
+    report.omitted_witnesses_lower_bound = report
+        .omitted_witnesses_lower_bound
+        .saturating_add(witnesses);
+    let after = projected_evidence_refs(report, HashSet::new());
+    let refs = refs_before.difference(&after).count() as u64;
+    report.evidence_refs_truncated |= refs > 0;
+    report.omitted_evidence_refs_lower_bound = report
+        .omitted_evidence_refs_lower_bound
+        .saturating_add(refs);
+    if related > 0 {
+        require_projected_reason(report, FindingIncompleteReason::RelatedLocationsTruncated);
+    }
+    if witnesses > 0 {
+        require_projected_reason(report, FindingIncompleteReason::WitnessTruncated);
+    }
+    if refs > 0 {
+        require_projected_reason(report, FindingIncompleteReason::EvidenceTruncated);
+    }
+    changed
+}
+
+fn validate_taint_pair_budget(
+    projection: &ValidatedTaintPairProjection,
+    budget: &PolicyBudget,
+    limits: EffectiveReportLimits,
+) -> Result<(), ProjectionAuthorityError> {
+    for (field, count, limit) in [
+        (
+            "origins",
+            projection.origins.len(),
+            limits.origins_per_finding,
+        ),
+        (
+            "witness_references",
+            projection.witness_refs.len(),
+            limits.witnesses_per_finding,
+        ),
+    ] {
+        if count > limit {
+            return Err(ProjectionAuthorityError::ReportBudgetExceeded { field, limit });
+        }
+    }
+    let mut refs = HashSet::new();
+    for origin in &projection.origins {
+        if origin.evidence_refs().len() > budget.max_evidence_refs_per_finding() {
+            return Err(ProjectionAuthorityError::ReportBudgetExceeded {
+                field: "origin_evidence_refs",
+                limit: budget.max_evidence_refs_per_finding(),
+            });
+        }
+        refs.extend(origin.evidence_refs().iter().cloned());
+    }
+    validate_projected_evidence_ref_budget(&projection.report, refs, budget, limits)
+}
+
+#[cfg(test)]
 fn validate_taint_pair(
     facts: TaintPolicyProjectionFacts,
-    mut pair: TaintPairProjection,
+    pair: TaintPairProjection,
     budget: &PolicyBudget,
-    report_limits: EffectiveReportLimits,
+    limits: EffectiveReportLimits,
+) -> Result<ValidatedTaintPairProjection, ProjectionAuthorityError> {
+    let projection = validate_taint_pair_shape(facts, pair)?;
+    validate_taint_pair_budget(&projection, budget, limits)?;
+    Ok(projection)
+}
+
+fn validate_taint_pair_for_report(
+    facts: TaintPolicyProjectionFacts,
+    pair: TaintPairProjection,
+    budget: &PolicyBudget,
+    limits: EffectiveReportLimits,
+) -> Result<ValidatedTaintPairProjection, ProjectionAuthorityError> {
+    let mut projection = validate_taint_pair_shape(facts, pair)?;
+    if let Err(error) = validate_taint_pair_budget(&projection, budget, limits) {
+        if !error.is_retention_budget_loss() {
+            return Err(error);
+        }
+        let refs_before = projected_evidence_refs(
+            &projection.report,
+            projection
+                .origins
+                .iter()
+                .flat_map(|origin| origin.evidence_refs().iter().cloned())
+                .collect(),
+        );
+        let prior_omitted_refs = projection.report.omitted_evidence_refs_lower_bound;
+        let origins = projection.origins.len();
+        projection.origins = Vec::new();
+        projection.origins_truncated |= origins > 0;
+        projection.witness_refs_truncated |= !projection.witness_refs.is_empty();
+        projection.witness_refs = Vec::new();
+        projection.model_attribution = projection
+            .model_attribution
+            .map(|value| value.without_detail());
+        omit_projected_report_detail(&mut projection.report);
+        if origins > 0 {
+            require_projected_reason(
+                &mut projection.report,
+                FindingIncompleteReason::OriginsTruncated,
+            );
+        }
+        let after = projected_evidence_refs(&projection.report, HashSet::new());
+        let all_removed = refs_before.difference(&after).count() as u64;
+        let already_removed = projection
+            .report
+            .omitted_evidence_refs_lower_bound
+            .saturating_sub(prior_omitted_refs);
+        let extra = all_removed.saturating_sub(already_removed);
+        if extra > 0 {
+            projection.report.evidence_refs_truncated = true;
+            projection.report.omitted_evidence_refs_lower_bound = projection
+                .report
+                .omitted_evidence_refs_lower_bound
+                .saturating_add(extra);
+            require_projected_reason(
+                &mut projection.report,
+                FindingIncompleteReason::EvidenceTruncated,
+            );
+        }
+        projection.report_detail_omitted = true;
+        validate_taint_pair_budget(&projection, budget, limits)?;
+    }
+    Ok(projection)
+}
+
+fn validate_typestate_projection_budget(
+    projection: &ValidatedTypestateProjection,
+    budget: &PolicyBudget,
+    limits: EffectiveReportLimits,
+) -> Result<(), ProjectionAuthorityError> {
+    if projection.witness_refs.len() > limits.witnesses_per_finding {
+        return Err(ProjectionAuthorityError::ReportBudgetExceeded {
+            field: "witness_references",
+            limit: limits.witnesses_per_finding,
+        });
+    }
+    validate_projected_evidence_ref_budget(&projection.report, HashSet::new(), budget, limits)
+}
+
+#[cfg(test)]
+fn validate_typestate_projection(
+    authority: &TypestateProjectionAuthority<'_>,
+    projection: TypestateProjectedFinding,
+    budget: &PolicyBudget,
+    limits: EffectiveReportLimits,
+) -> Result<ValidatedTypestateProjection, ProjectionAuthorityError> {
+    let projection = validate_typestate_projection_shape(authority, projection, budget)?;
+    validate_typestate_projection_budget(&projection, budget, limits)?;
+    Ok(projection)
+}
+
+fn validate_typestate_projection_for_report(
+    authority: &TypestateProjectionAuthority<'_>,
+    projection: TypestateProjectedFinding,
+    budget: &PolicyBudget,
+    limits: EffectiveReportLimits,
+) -> Result<ValidatedTypestateProjection, ProjectionAuthorityError> {
+    let mut projection = validate_typestate_projection_shape(authority, projection, budget)?;
+    if let Err(error) = validate_typestate_projection_budget(&projection, budget, limits) {
+        if !error.is_retention_budget_loss() {
+            return Err(error);
+        }
+        projection.witness_refs_truncated |= !projection.witness_refs.is_empty();
+        projection.witness_refs = Vec::new();
+        projection.model_attribution = projection
+            .model_attribution
+            .map(|value| value.without_detail());
+        omit_projected_report_detail(&mut projection.report);
+        projection.report_detail_omitted = true;
+        validate_typestate_projection_budget(&projection, budget, limits)?;
+    }
+    Ok(projection)
+}
+
+#[cfg(test)]
+fn validate_projected_report(
+    report: ProjectedFindingReport,
+    reasons: Vec<FindingIncompleteReason>,
+    budget: &PolicyBudget,
+    limits: EffectiveReportLimits,
+) -> Result<ProjectedFindingReport, ProjectionAuthorityError> {
+    let report = validate_projected_report_shape(report, reasons)?;
+    validate_report_related_and_witness_budgets(&report, budget, limits)?;
+    Ok(report)
+}
+
+fn validate_taint_pair_shape(
+    facts: TaintPolicyProjectionFacts,
+    mut pair: TaintPairProjection,
 ) -> Result<ValidatedTaintPairProjection, ProjectionAuthorityError> {
     if pair.source_endpoint != facts.source_facts[0].source_endpoint {
         return Err(ProjectionAuthorityError::FindingEnvelopeMismatch {
@@ -1305,30 +1687,6 @@ fn validate_taint_pair(
         });
     }
 
-    if pair.origins.len() > report_limits.origins_per_finding {
-        return Err(ProjectionAuthorityError::ReportBudgetExceeded {
-            field: "origins",
-            limit: report_limits.origins_per_finding,
-        });
-    }
-    let mut distinct_evidence_refs = HashSet::new();
-    for origin in &pair.origins {
-        if origin.evidence_refs.len() > budget.max_evidence_refs_per_finding() {
-            return Err(ProjectionAuthorityError::ReportBudgetExceeded {
-                field: "origin_evidence_refs",
-                limit: budget.max_evidence_refs_per_finding(),
-            });
-        }
-        for reference in &origin.evidence_refs {
-            distinct_evidence_refs.insert(reference.clone());
-        }
-    }
-    validate_projected_evidence_ref_budget(
-        &pair.report,
-        distinct_evidence_refs,
-        budget,
-        report_limits,
-    )?;
     let mut expected_origin_memberships = facts
         .source_facts
         .iter()
@@ -1401,11 +1759,10 @@ fn validate_taint_pair(
             field: "taint_origin_coverage",
         });
     }
-    validate_witness_references(
+    validate_witness_references_shape(
         &pair.witness_refs,
         pair.witness_refs_truncated,
         &pair.report,
-        report_limits,
     )?;
     if pair
         .model_attribution
@@ -1426,8 +1783,9 @@ fn validate_taint_pair(
     if pair.witness_refs_truncated {
         required_reasons.push(FindingIncompleteReason::WitnessTruncated);
     }
-    pair.report = validate_projected_report(pair.report, required_reasons, budget, report_limits)?;
+    pair.report = validate_projected_report_shape(pair.report, required_reasons)?;
     Ok(ValidatedTaintPairProjection {
+        report_detail_omitted: false,
         facts,
         analysis_finding_id: pair.analysis_finding_id,
         anchor: pair.anchor,
@@ -1441,23 +1799,16 @@ fn validate_taint_pair(
     })
 }
 
-fn validate_typestate_projection(
+fn validate_typestate_projection_shape(
     authority: &TypestateProjectionAuthority<'_>,
     mut projection: TypestateProjectedFinding,
     budget: &PolicyBudget,
-    report_limits: EffectiveReportLimits,
 ) -> Result<ValidatedTypestateProjection, ProjectionAuthorityError> {
     if !projection.report.value_type_barrier_notes.is_empty() {
         return Err(ProjectionAuthorityError::FindingEnvelopeMismatch {
             field: "value_type_barrier_notes",
         });
     }
-    validate_projected_evidence_ref_budget(
-        &projection.report,
-        HashSet::new(),
-        budget,
-        report_limits,
-    )?;
     let facts = validate_typestate_facts(authority, projection.facts, budget)?;
     if let Some(anchor) = projection.anchor.strong_fields()
         && (anchor.protocol_hash() != facts.protocol_hash
@@ -1481,11 +1832,10 @@ fn validate_typestate_projection(
             field: "typestate_primary_site",
         });
     }
-    validate_witness_references(
+    validate_witness_references_shape(
         &projection.witness_refs,
         projection.witness_refs_truncated,
         &projection.report,
-        report_limits,
     )?;
     if projection
         .model_attribution
@@ -1503,9 +1853,9 @@ fn validate_typestate_projection(
     if projection.witness_refs_truncated {
         required_reasons.push(FindingIncompleteReason::WitnessTruncated);
     }
-    projection.report =
-        validate_projected_report(projection.report, required_reasons, budget, report_limits)?;
+    projection.report = validate_projected_report_shape(projection.report, required_reasons)?;
     Ok(ValidatedTypestateProjection {
+        report_detail_omitted: false,
         facts,
         analysis_finding_id: projection.analysis_finding_id,
         anchor: projection.anchor,
@@ -1576,14 +1926,31 @@ fn validate_report_related_and_witness_budgets(
             limit: report_limits.witnesses_per_finding,
         });
     }
+    if report
+        .witnesses
+        .iter()
+        .any(|witness| witness.steps().len() > report_limits.witness_steps)
+    {
+        return Err(ProjectionAuthorityError::ReportBudgetExceeded {
+            field: "witness_steps",
+            limit: report_limits.witness_steps,
+        });
+    }
+    if report.witnesses.iter().any(|witness| {
+        usize::try_from(witness.retained_bytes()).unwrap_or(usize::MAX)
+            > report_limits.witness_bytes
+    }) {
+        return Err(ProjectionAuthorityError::ReportBudgetExceeded {
+            field: "witness_bytes",
+            limit: report_limits.witness_bytes,
+        });
+    }
     Ok(())
 }
 
-fn validate_projected_report(
+fn validate_projected_report_shape(
     mut report: ProjectedFindingReport,
     mut required_reasons: Vec<FindingIncompleteReason>,
-    budget: &PolicyBudget,
-    report_limits: EffectiveReportLimits,
 ) -> Result<ProjectedFindingReport, ProjectionAuthorityError> {
     report.value_type_barrier_notes.validate().map_err(|_| {
         ProjectionAuthorityError::FindingEnvelopeMismatch {
@@ -1603,26 +1970,6 @@ fn validate_projected_report(
     if report.witnesses_truncated != (report.omitted_witnesses_lower_bound > 0) {
         return Err(ProjectionAuthorityError::FindingEnvelopeMismatch {
             field: "witness_truncation",
-        });
-    }
-    validate_report_related_and_witness_budgets(&report, budget, report_limits)?;
-    if report
-        .witnesses
-        .iter()
-        .any(|witness| witness.steps().len() > report_limits.witness_steps)
-    {
-        return Err(ProjectionAuthorityError::ReportBudgetExceeded {
-            field: "witness_steps",
-            limit: report_limits.witness_steps,
-        });
-    }
-    if report.witnesses.iter().any(|witness| {
-        usize::try_from(witness.retained_bytes()).unwrap_or(usize::MAX)
-            > report_limits.witness_bytes
-    }) {
-        return Err(ProjectionAuthorityError::ReportBudgetExceeded {
-            field: "witness_bytes",
-            limit: report_limits.witness_bytes,
         });
     }
     let mut witness_ids = report
@@ -1673,18 +2020,11 @@ fn validate_projected_report(
     Ok(report)
 }
 
-fn validate_witness_references(
+fn validate_witness_references_shape(
     witness_refs: &[WitnessId],
     witness_refs_truncated: bool,
     report: &ProjectedFindingReport,
-    report_limits: EffectiveReportLimits,
 ) -> Result<(), ProjectionAuthorityError> {
-    if witness_refs.len() > report_limits.witnesses_per_finding {
-        return Err(ProjectionAuthorityError::ReportBudgetExceeded {
-            field: "witness_references",
-            limit: report_limits.witnesses_per_finding,
-        });
-    }
     let mut refs = witness_refs.to_vec();
     refs.sort();
     let mut retained = report
@@ -1709,6 +2049,8 @@ struct PartialProjection<T> {
     value: Option<T>,
     rejections: Vec<ProjectionAuthorityError>,
     omitted_finding_ids: HashSet<PolicyFindingId>,
+    retention_omitted_finding_ids: HashSet<PolicyFindingId>,
+    retention_omitted_records: u64,
 }
 
 struct PartialTaintFacts {
@@ -1987,7 +2329,7 @@ fn validate_typestate_violation(
 
 fn record_rejection(
     error: ProjectionAuthorityError,
-    diagnostics: &mut Vec<PolicyDiagnostic>,
+    diagnostics: &mut PolicyDiagnostics,
     diagnostics_truncated: &mut bool,
     completion: &mut PolicyRunCompletion,
     budget: &PolicyBudget,
@@ -2000,6 +2342,11 @@ fn record_rejection(
         *completion = PolicyRunCompletion::Failed {
             reasons: vec![PolicyFailureReason::InternalInvariant],
         };
+        diagnostics.record_typed_cause(
+            &PolicyDiagnosticCode::EvaluationFailure,
+            PolicyDiagnosticImpact::RunFailed,
+            crate::finding::PolicyDiagnosticExecutionCause::Other,
+        );
         let diagnostic = PolicyDiagnostic::try_new_in_family(
             PolicyDiagnosticCode::EvaluationFailure,
             PolicyDiagnosticSeverity::Error,
@@ -2008,11 +2355,15 @@ fn record_rejection(
             format!("analysis projection rejected: {error}"),
             None,
             Vec::new(),
+            crate::RelatedLocationOmissions::Known(0),
         );
         if let Ok(diagnostic) = diagnostic {
+            let diagnostic = diagnostic
+                .with_policy_execution_cause(crate::finding::PolicyDiagnosticExecutionCause::Other);
             *diagnostics_truncated |=
                 insert_policy_diagnostic_bounded(diagnostics, diagnostic, budget.max_diagnostics());
         } else {
+            diagnostics.record_omitted_severity(PolicyDiagnosticSeverity::Error);
             *diagnostics_truncated = true;
         }
         return;
@@ -2048,6 +2399,23 @@ fn record_rejection(
         ) => PolicyDiagnosticCode::ProjectionScenarioMembershipBudget,
         _ => PolicyDiagnosticCode::EvaluationFailure,
     };
+    let execution_cause = match incomplete_reason {
+        PolicyIncompleteReason::ReportRetentionBudget => {
+            crate::finding::PolicyDiagnosticExecutionCause::FindingRetention
+        }
+        PolicyIncompleteReason::BatchFindingLimit
+        | PolicyIncompleteReason::ProjectionScenarioMembershipBudget => {
+            crate::finding::PolicyDiagnosticExecutionCause::Known(Some(
+                brokk_bifrost_rql::DiagnosticExecutionCause::Budget,
+            ))
+        }
+        _ => crate::finding::PolicyDiagnosticExecutionCause::Other,
+    };
+    diagnostics.record_typed_cause(
+        &code,
+        PolicyDiagnosticImpact::RunIncomplete,
+        execution_cause,
+    );
     let diagnostic = PolicyDiagnostic::try_new_in_family(
         code,
         PolicyDiagnosticSeverity::Warning,
@@ -2056,17 +2424,20 @@ fn record_rejection(
         format!("analysis projection rejected: {error}"),
         None,
         Vec::new(),
+        crate::RelatedLocationOmissions::Known(0),
     );
     if let Ok(diagnostic) = diagnostic {
+        let diagnostic = diagnostic.with_policy_execution_cause(execution_cause);
         *diagnostics_truncated |=
             insert_policy_diagnostic_bounded(diagnostics, diagnostic, budget.max_diagnostics());
     } else {
+        diagnostics.record_omitted_severity(PolicyDiagnosticSeverity::Warning);
         *diagnostics_truncated = true;
     }
 }
 
 fn record_weak_anchor(
-    diagnostics: &mut Vec<PolicyDiagnostic>,
+    diagnostics: &mut PolicyDiagnostics,
     diagnostics_truncated: &mut bool,
     completion: &mut PolicyRunCompletion,
     budget: &PolicyBudget,
@@ -2090,14 +2461,23 @@ fn record_weak_anchor(
 fn record_projection_diagnostic(
     code: PolicyDiagnosticCode,
     message: &str,
-    diagnostics: &mut Vec<PolicyDiagnostic>,
+    diagnostics: &mut PolicyDiagnostics,
     diagnostics_truncated: &mut bool,
     budget: &PolicyBudget,
 ) {
+    diagnostics.record_typed_cause(
+        &code,
+        PolicyDiagnosticImpact::RunIncomplete,
+        crate::finding::PolicyDiagnosticExecutionCause::Known(None),
+    );
     if let Some(diagnostic) = super::evaluator::incomplete_run_diagnostic(code, message) {
-        *diagnostics_truncated |=
-            insert_policy_diagnostic_bounded(diagnostics, diagnostic, budget.max_diagnostics());
+        *diagnostics_truncated |= insert_policy_diagnostic_bounded(
+            diagnostics,
+            diagnostic.with_execution_cause(None),
+            budget.max_diagnostics(),
+        );
     } else {
+        diagnostics.record_omitted_severity(PolicyDiagnosticSeverity::Warning);
         *diagnostics_truncated = true;
     }
 }
@@ -2129,6 +2509,17 @@ pub(crate) enum ProjectionAuthorityError {
 }
 
 impl ProjectionAuthorityError {
+    fn is_retention_budget_loss(&self) -> bool {
+        matches!(
+            self,
+            Self::ProjectionCountBudget { .. }
+                | Self::ReportBudgetExceeded { .. }
+                | Self::InvalidProjectionFacts(
+                    FutureEvidenceError::ProjectionScenarioMembershipBudget { .. }
+                )
+        )
+    }
+
     /// The rejection's reason family: the part that repeats across findings,
     /// without the exact limit value or the analysis error text that makes one
     /// rejection unique. A capped diagnostic list is folded on this, so it must
@@ -2268,6 +2659,7 @@ mod tests {
     use crate::registry::PolicyRegistry;
     use crate::resolved::{ResolvedTaintEndpoint, ResolvedTaintSourceDefinition};
     use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
+    use brokk_bifrost_test_macros::hardwon;
     use sha2::Digest;
 
     fn taint_policy(id: &str) -> String {
@@ -2369,7 +2761,7 @@ mod tests {
         authority: &TaintProjectionAuthority<'_>,
         projections: Vec<TaintProjectedFinding>,
         completion: PolicyRunCompletion,
-        diagnostics: Vec<PolicyDiagnostic>,
+        diagnostics: PolicyDiagnostics,
         diagnostics_truncated: bool,
         work: PolicyWorkReport,
     ) -> TaintProjectionBatch {
@@ -2469,7 +2861,7 @@ mod tests {
             &wrong_authority,
             Vec::new(),
             PolicyRunCompletion::Complete,
-            Vec::new(),
+            Vec::new().into(),
             false,
             PolicyWorkReport::default(),
         );
@@ -2590,7 +2982,7 @@ mod tests {
                 vec![alpha_pair, beta_pair],
             )],
             PolicyRunCompletion::Complete,
-            Vec::new(),
+            Vec::new().into(),
             false,
             PolicyWorkReport::default(),
         );
@@ -2695,7 +3087,7 @@ mod tests {
                     &authority,
                     projections,
                     PolicyRunCompletion::Complete,
-                    Vec::new(),
+                    Vec::new().into(),
                     false,
                     PolicyWorkReport::default(),
                 ),
@@ -2753,7 +3145,7 @@ mod tests {
             &authority,
             vec![duplicate.clone(), duplicate.clone(), duplicate],
             PolicyRunCompletion::Complete,
-            Vec::new(),
+            Vec::new().into(),
             false,
             PolicyWorkReport::default(),
         );
@@ -2781,7 +3173,7 @@ mod tests {
             &authority,
             vec![taint_projection_envelope(facts, vec![pair])],
             PolicyRunCompletion::Complete,
-            Vec::new(),
+            Vec::new().into(),
             false,
             PolicyWorkReport::default(),
         );
@@ -3106,7 +3498,7 @@ mod tests {
         let batch = authority.seal_batch(TypestateProjectionPayload {
             projections: vec![duplicate.clone(), duplicate.clone(), duplicate],
             completion: PolicyRunCompletion::Complete,
-            diagnostics: Vec::new(),
+            diagnostics: Vec::new().into(),
             diagnostics_truncated: false,
             work: PolicyWorkReport::default(),
             subjects: None,
@@ -3158,7 +3550,7 @@ mod tests {
         let batch = authority.seal_batch(TypestateProjectionPayload {
             projections: vec![make("second"), make("first")],
             completion: PolicyRunCompletion::Complete,
-            diagnostics: Vec::new(),
+            diagnostics: Vec::new().into(),
             diagnostics_truncated: false,
             work: PolicyWorkReport::default(),
             subjects: None,
@@ -3200,7 +3592,7 @@ mod tests {
         let batch = authority.seal_batch(TypestateProjectionPayload {
             projections: vec![conflicting, first],
             completion: PolicyRunCompletion::Complete,
-            diagnostics: Vec::new(),
+            diagnostics: Vec::new().into(),
             diagnostics_truncated: false,
             work: PolicyWorkReport::default(),
             subjects: None,
@@ -3248,7 +3640,7 @@ mod tests {
                 ),
             ],
             PolicyRunCompletion::Complete,
-            Vec::new(),
+            Vec::new().into(),
             false,
             PolicyWorkReport::default(),
         );
@@ -3355,5 +3747,238 @@ mod tests {
                 limit: 0
             })
         ));
+    }
+
+    #[test]
+    #[hardwon("#12105: projection report limits dropped identities before optional evidence")]
+    fn projection_sheds_optional_detail_before_dropping_a_finding() {
+        let registry = registry(&[("test:target", taint_policy("test.target"))]);
+        let policy = registry.policies().next().unwrap();
+        let authority = TaintProjectionAuthority::from_loaded(policy).unwrap();
+        let facts = taint_meeting(
+            authority.spec,
+            vec![source_fact(&authority.spec.sources[0], "alpha")],
+            None,
+        );
+        let pair = taint_pair(&facts, 0, "call:sink");
+        let anchor_bytes = serde_json::to_vec(&pair.anchor).unwrap();
+        let budget = PolicyBudget::builder()
+            .with_max_origins_per_finding(0)
+            .unwrap()
+            .with_max_evidence_refs_per_finding(0)
+            .unwrap()
+            .build()
+            .unwrap();
+        let limits = EffectiveReportLimits::new(authority.report, &budget);
+        let projected =
+            validate_taint_pair_for_report(facts.clone(), pair, &budget, limits).unwrap();
+        assert_eq!(serde_json::to_vec(&projected.anchor).unwrap(), anchor_bytes);
+        assert!(projected.report_detail_omitted);
+        assert!(projected.origins.is_empty());
+        assert!(projected.origins_truncated);
+        assert_eq!(projected.report.omitted_evidence_refs_lower_bound, 1);
+        assert!(
+            projected
+                .report
+                .completeness
+                .reasons()
+                .contains(&FindingIncompleteReason::OriginsTruncated)
+        );
+
+        let make_batch = |pair| {
+            taint_batch(
+                &authority,
+                vec![taint_projection_envelope(facts.clone(), vec![pair])],
+                PolicyRunCompletion::Complete,
+                PolicyDiagnostics::default(),
+                false,
+                PolicyWorkReport::default(),
+            )
+        };
+        let detail = validate_taint_batch(
+            &authority,
+            make_batch(taint_pair(&facts, 0, "call:sink")),
+            &budget,
+        )
+        .unwrap();
+        assert_eq!(detail.projections.len(), 1);
+        assert_eq!(detail.work.omitted_findings_lower_bound(), 0);
+        assert!(
+            detail
+                .diagnostics
+                .causes()
+                .iter()
+                .any(|cause| cause.execution_cause()
+                    == crate::finding::PolicyDiagnosticExecutionCause::DetailRetention)
+        );
+
+        // Proof references are required evidence. If those alone exceed the
+        // host cap after all optional detail is gone, count a real finding loss.
+        let mut pair = taint_pair(&facts, 0, "call:sink");
+        pair.report.proof = crate::finding::ProofMetadata::try_new(
+            ProofState::Proven,
+            vec![ProofReason::DataflowWitness],
+            vec![EvidenceRef::try_new("test", "required-proof").unwrap()],
+        )
+        .unwrap();
+        let rejected = validate_taint_batch(&authority, make_batch(pair), &budget).unwrap();
+        assert!(rejected.projections.is_empty());
+        assert_eq!(rejected.work.retention_omitted_findings_lower_bound(), 1);
+        assert_eq!(rejected.work.semantic_omitted_findings_lower_bound(), 0);
+        assert!(
+            rejected
+                .diagnostics
+                .causes()
+                .iter()
+                .any(|cause| cause.execution_cause()
+                    == crate::finding::PolicyDiagnosticExecutionCause::FindingRetention)
+        );
+
+        // A malformed anchor cannot be laundered through the budget fallback.
+        let mut pair = taint_pair(&facts, 0, "call:sink");
+        pair.origins[0].source_label = TaintLabel::new("forged").unwrap();
+        assert!(matches!(
+            validate_taint_pair_for_report(facts, pair, &budget, limits),
+            Err(ProjectionAuthorityError::FindingEnvelopeMismatch { .. })
+        ));
+    }
+    #[test]
+    // Hard-won: #12089 interaction: a finding-ID collision crossed retention accounting.
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12089: interaction: a surviving projection ID cancelled a counted record omission"
+    )]
+    fn projection_retention_counts_refused_collision_despite_surviving_id() {
+        let registry = registry(&[(
+            "test:typestate",
+            crate::test_support::typestate_policy_source(
+                "test.typestate-authority",
+                "Typestate authority",
+            ),
+        )]);
+        let policy = registry.policies().next().unwrap();
+        let authority = TypestateProjectionAuthority::from_loaded_compilation(
+            policy,
+            TypestateProtocolHash::from_canonical_bytes(b"protocol"),
+            TypestateBindingPlanHash::from_canonical_bytes(b"bindings"),
+        )
+        .unwrap();
+        let mut first = typestate_projected_finding(&authority);
+        first.anchor = TypestateFindingAnchor::weak(
+            crate::finding_identity::OpaqueFindingKey::try_new("test", "colliding").unwrap(),
+        );
+        let mut second = first.clone();
+        let site = StableSemanticIdentity::protocol_violation_site(
+            "test",
+            WorkspaceRelativePath::new("src/test.rs").unwrap(),
+            "another-exit",
+        )
+        .unwrap();
+        second.facts =
+            typestate_projection_facts(&authority, authority.protocol_hash(), Some(site)).0;
+        assert_ne!(first.facts.semantic_hash, second.facts.semantic_hash);
+        assert_eq!(
+            typestate_envelope_sort_key(&authority, &first).1,
+            typestate_envelope_sort_key(&authority, &second).1
+        );
+        use crate::finding::{
+            FurtherFindingsAbsent, PolicySubjectVerdict, PolicySubjectVerdicts, SubjectEnumeration,
+            SubjectSelectorEnumeration, SubjectVerdict,
+        };
+        let id = typestate_envelope_sort_key(&authority, &first).1;
+        let subjects = PolicySubjectVerdicts::new(
+            vec![SubjectSelectorEnumeration {
+                selector: "src".to_owned(),
+                enumeration: SubjectEnumeration::Certified,
+            }],
+            vec![PolicySubjectVerdict {
+                selector: "src".to_owned(),
+                location: first.report.primary.clone(),
+                verdict: SubjectVerdict::Selected {
+                    bindings: 1,
+                    subject_keys: vec![first.subject.clone()],
+                    findings: vec![id],
+                    further_findings_absent: FurtherFindingsAbsent::Complete,
+                    finding_location_bound: None,
+                },
+            }],
+        );
+        let batch = authority.seal_batch(TypestateProjectionPayload {
+            projections: vec![first, second],
+            completion: PolicyRunCompletion::Complete,
+            diagnostics: Vec::new().into(),
+            diagnostics_truncated: false,
+            work: PolicyWorkReport::default(),
+            subjects: Some(subjects),
+        });
+        let budget = PolicyBudget::builder()
+            .with_max_findings(1)
+            .unwrap()
+            .build()
+            .unwrap();
+        let validated = validate_typestate_batch(&authority, batch, &budget).unwrap();
+        assert_eq!(validated.projections.len(), 1);
+        assert_eq!(validated.work.retention_omitted_findings_lower_bound(), 1);
+        assert_eq!(validated.work.semantic_omitted_findings_lower_bound(), 0);
+        assert_eq!(validated.work.omitted_findings_lower_bound(), 1);
+        assert!(matches!(&validated.subjects.unwrap().entries[0].verdict,
+            SubjectVerdict::Selected { findings,
+                further_findings_absent: FurtherFindingsAbsent::Partial { reasons }, ..
+            } if findings == &[id] && reasons == &["findings_truncated"]));
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12089: interaction: whole-envelope refusal counted colliding pairs as one record"
+    )]
+    fn whole_taint_envelope_refusal_counts_each_colliding_pair() {
+        let registry = registry(&[("test:target", taint_policy("test.target"))]);
+        let policy = registry.policies().next().unwrap();
+        let authority = TaintProjectionAuthority::from_loaded(policy).unwrap();
+        let facts = taint_meeting(
+            authority.spec,
+            vec![
+                source_fact(&authority.spec.sources[0], "alpha"),
+                source_fact(&authority.spec.sources[1], "beta"),
+            ],
+            None,
+        );
+        let mut pairs = vec![
+            taint_pair(&facts, 0, "call:sink"),
+            taint_pair(&facts, 1, "call:sink"),
+        ];
+        for pair in &mut pairs {
+            pair.anchor = TaintFindingAnchor::weak(
+                crate::finding_identity::OpaqueFindingKey::try_new("test", "same-record-id")
+                    .unwrap(),
+            );
+        }
+        let envelope = taint_projection_envelope(facts, pairs);
+        let run = |budget: &PolicyBudget| {
+            validate_taint_batch(
+                &authority,
+                taint_batch(
+                    &authority,
+                    vec![envelope.clone()],
+                    PolicyRunCompletion::Complete,
+                    Vec::new().into(),
+                    false,
+                    PolicyWorkReport::default(),
+                ),
+                budget,
+            )
+            .unwrap()
+        };
+        let full = run(&PolicyBudget::default());
+        assert_eq!(full.projections.len(), 2);
+        let budget = PolicyBudget::builder()
+            .with_max_findings(0)
+            .unwrap()
+            .build()
+            .unwrap();
+        let refused = run(&budget);
+        assert_eq!(refused.projections.len(), 0);
+        assert_eq!(refused.work.retention_omitted_findings_lower_bound(), 2);
+        assert_eq!(refused.work.semantic_omitted_findings_lower_bound(), 0);
+        assert_eq!(refused.work.omitted_findings_lower_bound(), 2);
     }
 }

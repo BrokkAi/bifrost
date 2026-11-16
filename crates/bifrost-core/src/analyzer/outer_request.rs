@@ -11,6 +11,15 @@ use super::project::{Project, ProjectViewStamp};
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RequestEntryKey {
+    /// One capture-safe value-flow registration authority per outer request.
+    ValueFlowRetention,
+    /// One budget-bound selected-source factory for this outer request.
+    SelectedSourceEntries,
+    /// The source allocation is retained by the entry's value, so its address
+    /// cannot be reused while this request owns its selection.
+    WorkspaceSelection {
+        owner: usize,
+    },
     JvmCatalogReader(JvmCatalogReaderKey),
     /// An activation by its model-set hash and the digest of its request-owned
     /// active shards: the hash ignores which physical shards were selected.
@@ -96,6 +105,52 @@ impl OuterRequest {
 
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    /// Capture an immutable workspace selection once, when its query opens.
+    /// The concrete selection belongs to analysis; core only owns its lifetime.
+    pub fn bind_workspace_selection<T: Any + Send + Sync>(
+        &self,
+        owner: usize,
+        capture: impl FnOnce() -> T,
+    ) {
+        self.entries
+            .lock()
+            .expect("outer request map poisoned")
+            .entry(RequestEntryKey::WorkspaceSelection { owner })
+            .or_insert_with(|| Arc::new(capture()));
+    }
+
+    /// Read an already bound selection. A reader cannot capture one here.
+    pub fn workspace_selection<T: Any + Send + Sync>(&self, owner: usize) -> Option<Arc<T>> {
+        self.entries
+            .lock()
+            .expect("outer request map poisoned")
+            .get(&RequestEntryKey::WorkspaceSelection { owner })
+            .map(|selection| {
+                Arc::downcast(Arc::clone(selection))
+                    .expect("workspace selection owner has one answer type")
+            })
+    }
+
+    /// Borrow an already opened resource without allocating a slot or invoking
+    /// its constructor. Match resource()'s lock order and closed-request gate.
+    pub fn resource_if_present<R: RequestResource>(&self, key: &RequestEntryKey) -> Option<Arc<R>> {
+        let slot = {
+            let resources = self.resources.lock().expect("request resources poisoned");
+            if resources.closed {
+                return None;
+            }
+            Arc::clone(&resources.slots.get(key)?.0)
+        };
+        let slot =
+            Arc::downcast::<Mutex<Option<Arc<R>>>>(slot).expect("resource key has one answer type");
+        let resource = slot.lock().expect("resource slot poisoned").clone()?;
+        if self.is_closed() {
+            None
+        } else {
+            Some(resource)
+        }
     }
 
     pub fn resource<R: RequestResource, E>(
@@ -350,6 +405,12 @@ mod tests {
     #[test]
     fn resources_share_fills_retry_failures_and_close_once() {
         let request = OuterRequest::new();
+        assert!(
+            request
+                .resource_if_present::<TestResource>(&resource_key(1))
+                .is_none()
+        );
+        assert!(request.resources.lock().unwrap().slots.is_empty());
         let fills = AtomicUsize::new(0);
         std::thread::scope(|threads| {
             let first = threads.spawn(|| {
@@ -366,6 +427,12 @@ mod tests {
             });
             let a = first.join().unwrap().unwrap();
             let b = second.join().unwrap().unwrap();
+            assert!(Arc::ptr_eq(
+                &a,
+                &request
+                    .resource_if_present::<TestResource>(&resource_key(1))
+                    .unwrap()
+            ));
             assert!(Arc::ptr_eq(&a, &b));
             assert_eq!(fills.load(Ordering::SeqCst), 1);
             assert!(matches!(
@@ -377,8 +444,18 @@ mod tests {
                     Ok::<_, ()>(Arc::new(TestResource(AtomicUsize::new(0))))
                 })
                 .unwrap();
+            assert!(
+                request
+                    .resource_if_present::<TestResource>(&resource_key(2))
+                    .is_some()
+            );
             request.close();
             request.close();
+            assert!(
+                request
+                    .resource_if_present::<TestResource>(&resource_key(1))
+                    .is_none()
+            );
             assert_eq!(a.0.load(Ordering::SeqCst), 1);
             assert_eq!(retried.0.load(Ordering::SeqCst), 1);
             assert!(matches!(

@@ -284,6 +284,9 @@ impl RenderText for SummaryResult {
         blocks.extend(self.too_broad.iter().map(render_too_broad_scope));
         if !self.complete {
             let notice = match self.incomplete_reason {
+                Some(SummaryIncompleteReason::SemanticModelsPending) => {
+                    "semantic models selected but not published"
+                }
                 Some(SummaryIncompleteReason::Cancelled) => {
                     "summary lookup was cancelled before all selectors reached a verdict"
                 }
@@ -327,6 +330,10 @@ fn render_symbol_sources_incomplete(items: &[SymbolSourcesIncomplete]) -> String
                 SymbolSourcesIncompleteReason::ReadIncomplete => {
                     item.detail.as_deref().unwrap_or("read incomplete")
                 }
+                SymbolSourcesIncompleteReason::SourceUnavailable => item
+                    .detail
+                    .as_deref()
+                    .unwrap_or("source content was unavailable"),
                 SymbolSourcesIncompleteReason::InsideUnclosedConstruct => {
                     "inside a construct its file's parse never closed"
                 }
@@ -1331,6 +1338,7 @@ mod tests {
     fn symbol_sources_renders_incomplete_targets_without_not_found_claim() {
         let result = SymbolSourcesResult {
             sources: vec![SourceBlock {
+                origin: crate::searchtools::sources::SourceOrigin::Workspace,
                 label: "Ready".to_string(),
                 path: "src/Ready.java".to_string(),
                 start_line: 1,

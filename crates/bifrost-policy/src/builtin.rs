@@ -24,7 +24,7 @@ use std::sync::{Arc, OnceLock};
 use brokk_bifrost_analysis::analyzer::IAnalyzer;
 use brokk_bifrost_analysis::analyzer::canonical_hash::is_lower_sha256;
 use brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelProvenance;
-use brokk_bifrost_analysis::workspace_document::WorkspaceRoot;
+use brokk_bifrost_analysis::workspace_document::{WorkspaceDirectoryEntry, WorkspaceRoot};
 use brokk_bifrost_rql::structural::identifier_typos::IdentifierTypoTable;
 use serde::{Deserialize, Serialize};
 
@@ -566,11 +566,222 @@ pub struct PolicyCatalogFile {
 
 /// The deterministic multi-pack catalog returned by CLI and MCP policy
 /// listing. Entries are ordered by stable pack ID.
+///
+/// `schema_version` is the pack manifest schema version every loaded pack
+/// declares, so the listing has no version of its own.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BuiltInPolicyCatalogManifest {
     pub schema_version: u32,
     pub packs: Vec<BuiltInPolicyPackManifest>,
+    /// Root entries and supplied packs that did not join the catalog, in load
+    /// order. Omitted when every pack loaded, so a clean catalog keeps its
+    /// document and digest.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rejected_packs: Vec<RejectedPolicyPack>,
+    /// Policies of loaded packs that did not join the catalog, in load
+    /// order. Omitted when every policy of every loaded pack loaded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rejected_policies: Vec<RejectedPolicy>,
+}
+
+/// One policy of a loaded pack that the catalog did not load. The rest of
+/// its pack loads (#10941).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RejectedPolicy {
+    pub pack: String,
+    pub id: String,
+    pub path: String,
+    /// The manifest's category and activation, which decide whether a
+    /// pack, category or default selection would have included it.
+    pub category: String,
+    pub activation: PolicyActivation,
+    pub reason: PolicyRejection,
+    pub message: String,
+}
+
+/// Why a policy of a loaded pack did not join the catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum PolicyRejection {
+    /// The source's authored or resolved identity is not the one the
+    /// manifest records, as when the engine's identity of the policy changed
+    /// after the pack was pinned.
+    StalePolicyPin,
+    /// The source does not load in this engine.
+    InvalidPolicySource,
+}
+
+impl PolicyRejection {
+    /// The wire name, as `rejected_policies` lists it.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::StalePolicyPin => "stale-policy-pin",
+            Self::InvalidPolicySource => "invalid-policy-source",
+        }
+    }
+}
+
+impl fmt::Display for RejectedPolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "policy `{}` of pack `{}` ({}): {}",
+            self.id,
+            self.pack,
+            self.reason.label(),
+            self.message
+        )
+    }
+}
+
+/// A rejected pack or policy of the built-in catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BuiltInRejection {
+    Pack(RejectedPolicyPack),
+    Policy(RejectedPolicy),
+}
+
+impl fmt::Display for BuiltInRejection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pack(rejection) => write!(formatter, "pack {rejection}"),
+            Self::Policy(rejection) => rejection.fmt(formatter),
+        }
+    }
+}
+
+/// One policy pack root entry, or one supplied pack, that the catalog did not
+/// load. Every other pack loads without it (#10941).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RejectedPolicyPack {
+    /// The root entry name, or the manifest ID of a supplied pack
+    /// (`#<position>` when its manifest does not parse).
+    pub pack: String,
+    pub reason: PolicyPackRejection,
+    pub message: String,
+    /// The run data the rejected pack may have supplied.
+    #[serde(skip)]
+    pub(crate) may_supply: PackSupplies,
+    /// The policy IDs its manifest declared; empty when the manifest did
+    /// not load. A selection that names one of them is ambiguous.
+    #[serde(skip)]
+    pub(crate) declared_policy_ids: Vec<String>,
+}
+
+/// The policy IDs a manifest declares.
+fn declared_policy_ids(manifest: &BuiltInPolicyPackManifest) -> Vec<String> {
+    manifest
+        .policies
+        .iter()
+        .map(|entry| entry.id.clone())
+        .collect()
+}
+
+/// The run data a pack supplies beside its policies, which every run reads
+/// as a union over the loaded packs. A rejected pack's share is missing from
+/// that union.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PackSupplies {
+    pub(crate) identifier_typos: bool,
+    pub(crate) catalogs: bool,
+}
+
+impl PackSupplies {
+    /// A pack whose manifest did not load may have supplied anything.
+    const UNKNOWN: Self = Self {
+        identifier_typos: true,
+        catalogs: true,
+    };
+
+    fn declared_by(manifest: &BuiltInPolicyPackManifest) -> Self {
+        Self {
+            identifier_typos: manifest.identifier_typos.is_some(),
+            catalogs: !manifest.catalogs.is_empty(),
+        }
+    }
+}
+
+/// Why a pack did not join the catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum PolicyPackRejection {
+    /// A root entry without `manifest.json`. The pack release contract
+    /// defines a pack by its manifest, so the entry declares no policy and
+    /// none is lost.
+    NotAPack,
+    /// A root entry the loader does not follow or cannot name: a symlink, or
+    /// a name that is not UTF-8. It may hold a pack.
+    UnsupportedEntry,
+    /// The manifest is unreadable, malformed, of an unsupported schema, or
+    /// declares a pack ID other than its directory name.
+    InvalidManifest,
+    /// A file the manifest declares is missing or unreadable, or a policy
+    /// does not match its recorded identity.
+    InvalidContent,
+    /// The pack ID, a policy ID, or the identifier typo table conflicts with
+    /// a pack loaded earlier.
+    Conflict,
+}
+
+impl PolicyPackRejection {
+    /// Whether the rejected entry may have held policies. Only an entry that
+    /// declares no pack holds none.
+    pub const fn may_lose_policies(self) -> bool {
+        !matches!(self, Self::NotAPack)
+    }
+
+    /// The wire name, as `rejected_packs` lists it.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::NotAPack => "not-a-pack",
+            Self::UnsupportedEntry => "unsupported-entry",
+            Self::InvalidManifest => "invalid-manifest",
+            Self::InvalidContent => "invalid-content",
+            Self::Conflict => "conflict",
+        }
+    }
+}
+
+/// One rejection as messages show it: the entry, its reason as
+/// `rejected_packs` lists it, and the message.
+impl fmt::Display for RejectedPolicyPack {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "`{}` ({}): {}",
+            self.pack,
+            self.reason.label(),
+            self.message
+        )
+    }
+}
+
+/// Every rejection in `rejections`, in order, for one message.
+fn describe_rejections<'a>(rejections: impl IntoIterator<Item = &'a RejectedPolicyPack>) -> String {
+    let items = rejections
+        .into_iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+        format_args!("{}", items.join("; ")),
+        format_args!("rejected policy packs"),
+        items.iter(),
+    )
+}
+
+/// A rejected pack or policy as one built-in selection must report it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuiltInRejectionNotice {
+    pub rejection: BuiltInRejection,
+    /// The selection may be missing what was rejected: under a selection
+    /// that names no policy ID, a pack that may have held policies when the
+    /// selection spans the catalog, or a default-activation policy that its
+    /// packs and categories would have included. A report gives such a
+    /// notice error severity.
+    pub selection_incomplete: bool,
 }
 
 /// How a shipped policy joins a run. `Default` policies join every pack and
@@ -687,6 +898,9 @@ pub struct EmbeddedPolicyPack {
     manifest: String,
     sources: Vec<(String, String)>,
     identifier_typos: Option<String>,
+    /// The configured policy pack root this pack was read from. Each policy
+    /// run reads the pack's catalog documents from it again.
+    root: Option<PathBuf>,
 }
 
 impl EmbeddedPolicyPack {
@@ -695,6 +909,7 @@ impl EmbeddedPolicyPack {
             manifest: manifest.into(),
             sources: Vec::new(),
             identifier_typos: None,
+            root: None,
         }
     }
 
@@ -872,6 +1087,8 @@ pub struct BuiltInPolicyCatalog {
     digest: String,
     /// The union of every pack's identifier typo table.
     identifier_typos: Option<Arc<IdentifierTypoTable>>,
+    /// The configured root of each loaded pack read from one, keyed by pack ID.
+    pack_roots: HashMap<String, PathBuf>,
 }
 
 impl BuiltInPolicyCatalog {
@@ -881,6 +1098,10 @@ impl BuiltInPolicyCatalog {
     /// The variable holds one root or an OS path list (the `PATH` syntax), so a
     /// host can activate catalog releases it acquired separately as one
     /// catalog. Pack and policy ids stay unique across roots.
+    ///
+    /// A root that cannot be read fails the whole catalog, because no pack in
+    /// it can load. An entry of a readable root that fails is rejected alone
+    /// and listed in the catalog document (#10941).
     fn load() -> Result<Self, BuiltInPolicyError> {
         if let Some(roots) = configured_policy_pack_roots()? {
             let roots = std::env::split_paths(&roots).collect::<Vec<_>>();
@@ -890,10 +1111,13 @@ impl BuiltInPolicyCatalog {
                 )));
             }
             let mut packs = Vec::new();
+            let mut rejected = Vec::new();
             for root in &roots {
-                packs.extend(load_external_policy_packs(root)?);
+                let (root_packs, root_rejected) = load_external_policy_packs(root)?;
+                packs.extend(root_packs);
+                rejected.extend(root_rejected);
             }
-            return Self::from_embedded_packs(packs);
+            return Ok(Self::from_packs(packs, rejected));
         }
 
         // Test-support is explicitly enabled by repository regression suites,
@@ -901,11 +1125,11 @@ impl BuiltInPolicyCatalog {
         #[cfg(any(test, feature = "test-support"))]
         return Self::load_regression_fixture();
         #[cfg(not(any(test, feature = "test-support")))]
-        Self::without_rules()
+        Ok(Self::without_rules())
     }
 
     /// Construct the core engine's empty catalog, before a host supplies rules.
-    pub fn without_rules() -> Result<Self, BuiltInPolicyError> {
+    pub fn without_rules() -> Self {
         Self::from_embedded_packs(Vec::new())
     }
 
@@ -919,9 +1143,15 @@ impl BuiltInPolicyCatalog {
             // downstream test-support build still defaults to an empty core.
             let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("policy-packs");
             if !root.is_dir() {
-                return Self::without_rules();
+                return Ok(Self::without_rules());
             }
             let catalog = load_external_policy_catalog(&root)?;
+            if !catalog.document.rejected_packs.is_empty() {
+                return Err(BuiltInPolicyError::new(format!(
+                    "regression fixture packs were rejected: {:?}",
+                    catalog.document.rejected_packs
+                )));
+            }
             let packs = [
                 CODE_SMELLS_PACK_ID,
                 CORRECTNESS_PACK_ID,
@@ -947,7 +1177,13 @@ impl BuiltInPolicyCatalog {
                 ))
             })
             .collect::<Result<Vec<_>, BuiltInPolicyError>>()?;
-            Self::from_embedded_packs(packs)
+            let catalog = Self::from_embedded_packs(packs);
+            assert!(
+                catalog.document.rejected_packs.is_empty(),
+                "re-embedded regression fixture packs were rejected: {:?}",
+                catalog.document.rejected_packs
+            );
+            Ok(catalog)
         }
         #[cfg(test)]
         {
@@ -967,7 +1203,13 @@ impl BuiltInPolicyCatalog {
                     )
                 })
                 .collect();
-            Self::from_embedded_packs(packs)
+            let catalog = Self::from_embedded_packs(packs);
+            assert!(
+                catalog.document.rejected_packs.is_empty(),
+                "retained regression fixture packs were rejected: {:?}",
+                catalog.document.rejected_packs
+            );
+            Ok(catalog)
         }
     }
 
@@ -979,112 +1221,122 @@ impl BuiltInPolicyCatalog {
     /// `resolved_semantic_hash`; a source with a deferred locator must leave
     /// that field absent, because its executable meaning depends on the
     /// workspace's pinned active model.
-    pub fn from_embedded_packs(packs: Vec<EmbeddedPolicyPack>) -> Result<Self, BuiltInPolicyError> {
-        let mut parsed = Vec::with_capacity(packs.len());
-        let mut pack_ids = HashSet::new();
+    ///
+    /// A pack that fails these checks, or conflicts with a pack before it, is
+    /// listed in [`BuiltInPolicyCatalogManifest::rejected_packs`] and the
+    /// others still load.
+    pub fn from_embedded_packs(packs: Vec<EmbeddedPolicyPack>) -> Self {
+        Self::from_packs(packs, Vec::new())
+    }
+
+    /// Admit `packs` in order after the root entries already `rejected`.
+    fn from_packs(
+        packs: Vec<EmbeddedPolicyPack>,
+        mut rejected_packs: Vec<RejectedPolicyPack>,
+    ) -> Self {
+        let mut accepted = Vec::<BuiltInPolicyPackManifest>::with_capacity(packs.len());
+        let mut rejected_policies = Vec::new();
+        let mut source_by_policy_id = HashMap::new();
         let mut identifier_typos = None::<IdentifierTypoTable>;
-        for pack in packs {
-            let manifest = serde_json::from_str::<BuiltInPolicyPackManifest>(pack.manifest())
-                .map_err(|error| {
-                    BuiltInPolicyError::new(format!("invalid built-in manifest: {error}"))
-                })?;
-            validate_manifest_shape(&manifest)?;
-            if !pack_ids.insert(manifest.id.clone()) {
-                return Err(BuiltInPolicyError::new(format!(
-                    "built-in manifest id `{}` is declared more than once",
+        let mut pack_roots = HashMap::new();
+        // The catalog documents of the packs accepted so far, in the order
+        // every policy run registers them; dropped once the catalog loads.
+        let mut catalog_documents = Vec::new();
+        for (position, pack) in packs.into_iter().enumerate() {
+            let (manifest, pack_typos, pack_rejected_policies) =
+                match admit_policy_pack(position, &pack) {
+                    Ok(admitted) => admitted,
+                    Err(rejection) => {
+                        rejected_packs.push(rejection);
+                        continue;
+                    }
+                };
+            // Every policy ID the manifest declared, including those rejected
+            // one by one and already removed from `manifest`, for a rejection
+            // of the whole pack below.
+            let declared_ids = declared_policy_ids(&manifest)
+                .into_iter()
+                .chain(
+                    pack_rejected_policies
+                        .iter()
+                        .map(|rejected| rejected.id.clone()),
+                )
+                .collect::<Vec<_>>();
+            let conflict = |message: String| RejectedPolicyPack {
+                pack: manifest.id.clone(),
+                reason: PolicyPackRejection::Conflict,
+                message,
+                may_supply: PackSupplies::declared_by(&manifest),
+                declared_policy_ids: declared_ids.clone(),
+            };
+            if accepted.iter().any(|earlier| earlier.id == manifest.id) {
+                rejected_packs.push(conflict(format!(
+                    "built-in manifest id `{}` is declared by an earlier pack",
                     manifest.id
                 )));
+                continue;
             }
-            let manifest_paths = manifest
+            if let Some(entry) = manifest
                 .policies
                 .iter()
-                .map(|entry| entry.path.as_str())
-                .collect::<BTreeSet<_>>();
-            let embedded_paths = pack
-                .sources()
-                .iter()
-                .map(|(path, _)| path.as_str())
-                .collect::<BTreeSet<_>>();
-            if manifest_paths != embedded_paths {
-                return Err(BuiltInPolicyError::new(format!(
-                    "built-in manifest `{}` paths do not exactly match embedded policy sources",
-                    manifest.id
+                .find(|entry| source_by_policy_id.contains_key(&entry.id))
+            {
+                let earlier = accepted
+                    .iter()
+                    .find(|earlier| earlier.policies.iter().any(|other| other.id == entry.id))
+                    .expect("every loaded policy ID belongs to an accepted pack");
+                rejected_packs.push(conflict(format!(
+                    "built-in policy id `{}` is already declared by pack `{}`",
+                    entry.id, earlier.id
                 )));
+                continue;
             }
-            let pack_typos = pack_identifier_typos(&manifest, &pack)?;
-            identifier_typos = match (identifier_typos, pack_typos) {
-                (Some(left), Some(right)) => Some(left.merged(&right).map_err(|error| {
-                    BuiltInPolicyError::new(format!(
-                        "built-in manifest `{}` identifier typos cannot be merged: {error}",
-                        manifest.id
-                    ))
-                })?),
-                (left, right) => left.or(right),
+            let merged_typos = match (identifier_typos.as_ref(), pack_typos) {
+                // The union is symmetric, so the new pack's table absorbs the
+                // accumulated one and a refused merge leaves that one intact.
+                (Some(left), Some(right)) => match right.merged(left) {
+                    Ok(merged) => Some(merged),
+                    Err(error) => {
+                        rejected_packs.push(conflict(format!(
+                            "identifier typos cannot be merged with earlier packs: {error}"
+                        )));
+                        continue;
+                    }
+                },
+                (None, right) => right,
+                (Some(_), None) => None,
             };
-            parsed.push((manifest, pack));
+            if let Some(root) = &pack.root
+                && let Err(mut rejection) =
+                    check_pack_catalogs(root, &manifest, &mut catalog_documents)
+            {
+                rejection.declared_policy_ids = declared_ids;
+                rejected_packs.push(rejection);
+                continue;
+            }
+            if merged_typos.is_some() {
+                identifier_typos = merged_typos;
+            }
+            for entry in &manifest.policies {
+                let (_, source) = pack
+                    .sources()
+                    .iter()
+                    .find(|(path, _)| path == &entry.path)
+                    .expect("admitted manifest paths exactly match embedded sources");
+                source_by_policy_id.insert(entry.id.clone(), source.clone());
+            }
+            rejected_policies.extend(pack_rejected_policies);
+            if let Some(root) = pack.root {
+                pack_roots.insert(manifest.id.clone(), root);
+            }
+            accepted.push(manifest);
         }
         let document = BuiltInPolicyCatalogManifest {
             schema_version: BUILT_IN_MANIFEST_SCHEMA_VERSION,
-            packs: parsed
-                .iter()
-                .map(|(manifest, _)| manifest.clone())
-                .collect(),
+            packs: accepted,
+            rejected_packs,
+            rejected_policies,
         };
-
-        let mut source_by_policy_id = HashMap::new();
-        for (manifest, pack) in &parsed {
-            for (path, source) in pack.sources() {
-                let identity =
-                    PolicySourceIdentity::new(format!("builtin:{}/{}", manifest.id, path));
-                let entry = manifest
-                    .policies
-                    .iter()
-                    .find(|entry| &entry.path == path)
-                    .expect("manifest paths exactly match embedded sources");
-                let authored_hash = authored_identity(&identity, source)?;
-                if authored_hash != entry.authored_hash {
-                    return Err(BuiltInPolicyError::new(format!(
-                        "built-in policy `{path}` has authored hash `{authored_hash}` but the \
-                         manifest records `{}`",
-                        entry.authored_hash
-                    )));
-                }
-                match resolved_identity(&identity, source) {
-                    Ok(resolved_hash) => {
-                        if let Some(recorded) = &entry.resolved_semantic_hash
-                            && recorded != &resolved_hash
-                        {
-                            return Err(BuiltInPolicyError::new(format!(
-                                "built-in policy `{path}` resolves to `{resolved_hash}` but the \
-                                 manifest records `{recorded}`"
-                            )));
-                        }
-                    }
-                    Err(rejection) if is_deferred_rejection(&rejection) => {
-                        if entry.resolved_semantic_hash.is_some() {
-                            return Err(BuiltInPolicyError::new(format!(
-                                "built-in policy `{path}` defers catalog or workspace resolution and cannot \
-                                 record a resolved semantic hash before activation"
-                            )));
-                        }
-                    }
-                    Err(rejection) => {
-                        return Err(BuiltInPolicyError::new(format!(
-                            "failed to load built-in policy `{path}`: {rejection}"
-                        )));
-                    }
-                }
-                if source_by_policy_id
-                    .insert(entry.id.clone(), source.clone())
-                    .is_some()
-                {
-                    return Err(BuiltInPolicyError::new(format!(
-                        "built-in policy id `{}` is declared by more than one pack",
-                        entry.id
-                    )));
-                }
-            }
-        }
 
         let digest = {
             use sha2::{Digest, Sha256};
@@ -1100,12 +1352,13 @@ impl BuiltInPolicyCatalog {
                 .collect()
         };
 
-        Ok(Self {
+        Self {
             document,
             source_by_policy_id,
             digest,
             identifier_typos: identifier_typos.map(Arc::new),
-        })
+            pack_roots,
+        }
     }
 
     pub fn document(&self) -> &BuiltInPolicyCatalogManifest {
@@ -1156,8 +1409,19 @@ impl BuiltInPolicyCatalog {
 
         for pack in &selection.packs {
             if self.pack_manifest(pack).is_none() {
+                if let Some(rejected) = self
+                    .document
+                    .rejected_packs
+                    .iter()
+                    .find(|rejected| &rejected.pack == pack)
+                {
+                    return Err(BuiltInPolicyError::new(format!(
+                        "built-in policy pack `{pack}` was rejected: {rejected}"
+                    )));
+                }
                 return Err(BuiltInPolicyError::new(format!(
-                    "unknown built-in policy pack `{pack}`"
+                    "unknown built-in policy pack `{pack}`{}",
+                    self.lost_pack_context()
                 )));
             }
         }
@@ -1171,15 +1435,27 @@ impl BuiltInPolicyCatalog {
                 .any(|entry| &entry.category == category);
             if !known {
                 return Err(BuiltInPolicyError::new(format!(
-                    "unknown built-in policy category `{category}`"
+                    "unknown built-in policy category `{category}`{}",
+                    self.lost_pack_context()
                 )));
             }
         }
 
         for policy_id in &selection.policy_ids {
             if !self.source_by_policy_id.contains_key(policy_id) {
+                if let Some(rejected) = self
+                    .document
+                    .rejected_policies
+                    .iter()
+                    .find(|rejected| &rejected.id == policy_id)
+                {
+                    return Err(BuiltInPolicyError::new(format!(
+                        "built-in policy `{policy_id}` was rejected: {rejected}"
+                    )));
+                }
                 return Err(BuiltInPolicyError::new(format!(
-                    "unknown built-in policy id `{policy_id}`"
+                    "unknown built-in policy id `{policy_id}`{}",
+                    self.lost_pack_context()
                 )));
             }
         }
@@ -1272,10 +1548,333 @@ impl BuiltInPolicyCatalog {
         }
         Ok(remaining)
     }
+
+    /// The rejections a run of `selection` reports. A selection that names policy IDs selects
+    /// only those, and [`Self::select`] has already resolved each to a loaded policy, so a
+    /// rejection leaves it incomplete only when the rejected pack or policy also declared a
+    /// named ID that is not excluded, which makes that ID ambiguous. Otherwise a rejected pack
+    /// that may have held policies leaves it incomplete when the selection names no pack, every
+    /// loaded pack, or that pack, and a rejected policy does when the selection's packs and
+    /// categories admit it and it is not opt-in. What a rejected pack supplied beside its
+    /// policies is judged per consumer policy by [`catalog_identifier_typos_gap`] and
+    /// [`catalog_registry_gap`].
+    pub fn rejection_notices(
+        &self,
+        selection: &BuiltInPolicySelection,
+    ) -> Vec<BuiltInRejectionNotice> {
+        let names_policy_ids = !selection.policy_ids.is_empty();
+        // A selection that names every loaded pack, as a default run does or
+        // a caller that takes its pack list from the listing, spans the whole
+        // catalog, so a rejected pack could have been part of it. A selection
+        // of some packs could not have included a pack it does not name; one
+        // it names, rejected as a duplicate of a loaded pack, it could.
+        let spans_catalog = self
+            .document
+            .packs
+            .iter()
+            .all(|pack| selection.packs.contains(&pack.id))
+            || selection.packs.is_empty();
+        let packs = self
+            .document
+            .rejected_packs
+            .iter()
+            .map(|rejection| BuiltInRejectionNotice {
+                rejection: BuiltInRejection::Pack(rejection.clone()),
+                // Every nonempty dimension constrains the selection, so a pack
+                // the selection could not include loses it nothing, even for an
+                // ID the pack declared. A rejected pack's own categories are
+                // unknown, so a category constraint never excludes it: unknown
+                // is not excluded.
+                selection_incomplete: rejection.reason.may_lose_policies()
+                    && (spans_catalog || selection.packs.contains(&rejection.pack))
+                    && (!names_policy_ids
+                        || selection
+                            .policy_ids
+                            .iter()
+                            .filter(|id| !selection.excluded_policy_ids.contains(id))
+                            .any(|id| rejection.declared_policy_ids.contains(id))),
+            });
+        let policies =
+            self.document
+                .rejected_policies
+                .iter()
+                .map(|rejection| BuiltInRejectionNotice {
+                    rejection: BuiltInRejection::Policy(rejection.clone()),
+                    // An excluded ID does not run, so it is neither missing
+                    // nor ambiguous. A policy outside the selected packs or
+                    // categories could not have run either, even when its ID
+                    // was requested: its pack and category are recorded.
+                    selection_incomplete: !selection.excluded_policy_ids.contains(&rejection.id)
+                        && (selection.packs.is_empty()
+                            || selection.packs.contains(&rejection.pack))
+                        && (selection.categories.is_empty()
+                            || selection.categories.contains(&rejection.category))
+                        && (selection.policy_ids.contains(&rejection.id)
+                            || !names_policy_ids
+                                && rejection.activation == PolicyActivation::Default),
+                });
+        packs.chain(policies).collect()
+    }
+
+    /// Error context naming the rejected packs and policies that may have
+    /// declared an unknown selector.
+    fn lost_pack_context(&self) -> String {
+        let lost = self
+            .document
+            .rejected_packs
+            .iter()
+            .filter(|rejected| rejected.reason.may_lose_policies())
+            .map(ToString::to_string)
+            .chain(
+                self.document
+                    .rejected_policies
+                    .iter()
+                    .map(ToString::to_string),
+            )
+            .collect::<Vec<_>>();
+        if lost.is_empty() {
+            return String::new();
+        }
+        brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+            format_args!(
+                "; these rejected packs and policies may have declared it: {}",
+                lost.join("; ")
+            ),
+            format_args!("; these rejected packs and policies may have declared it"),
+            lost.iter(),
+        )
+    }
 }
 
 const MAX_EXTERNAL_POLICY_DIRECTORY_ENTRIES: usize = 4096;
 const MAX_EXTERNAL_POLICY_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Check one pack on its own: its manifest, its sources against their
+/// recorded identities, and its identifier typo table. A source that does
+/// not match its recorded identity rejects that policy only; the returned
+/// manifest no longer lists it. Conflicts with other packs are checked by
+/// the caller.
+fn admit_policy_pack(
+    position: usize,
+    pack: &EmbeddedPolicyPack,
+) -> Result<
+    (
+        BuiltInPolicyPackManifest,
+        Option<IdentifierTypoTable>,
+        Vec<RejectedPolicy>,
+    ),
+    RejectedPolicyPack,
+> {
+    let mut manifest =
+        serde_json::from_str::<BuiltInPolicyPackManifest>(pack.manifest()).map_err(|error| {
+            RejectedPolicyPack {
+                pack: format!("#{position}"),
+                reason: PolicyPackRejection::InvalidManifest,
+                message: format!("invalid built-in manifest: {error}"),
+                may_supply: PackSupplies::UNKNOWN,
+                declared_policy_ids: Vec::new(),
+            }
+        })?;
+    let reject = |reason, error: BuiltInPolicyError| RejectedPolicyPack {
+        pack: manifest.id.clone(),
+        reason,
+        message: error.to_string(),
+        may_supply: PackSupplies::declared_by(&manifest),
+        declared_policy_ids: declared_policy_ids(&manifest),
+    };
+    validate_manifest_shape(&manifest)
+        .map_err(|error| reject(PolicyPackRejection::InvalidManifest, error))?;
+    let manifest_paths = manifest
+        .policies
+        .iter()
+        .map(|entry| entry.path.as_str())
+        .collect::<BTreeSet<_>>();
+    let embedded_paths = pack
+        .sources()
+        .iter()
+        .map(|(path, _)| path.as_str())
+        .collect::<BTreeSet<_>>();
+    if manifest_paths != embedded_paths {
+        return Err(reject(
+            PolicyPackRejection::InvalidContent,
+            BuiltInPolicyError::new(format!(
+                "built-in manifest `{}` paths do not exactly match embedded policy sources",
+                manifest.id
+            )),
+        ));
+    }
+    let typos = pack_identifier_typos(&manifest, pack)
+        .map_err(|error| reject(PolicyPackRejection::InvalidContent, error))?;
+    let mut rejected_policies = Vec::new();
+    for (path, source) in pack.sources() {
+        let entry = manifest
+            .policies
+            .iter()
+            .find(|entry| &entry.path == path)
+            .expect("manifest paths exactly match embedded sources");
+        if let Err((reason, message)) = check_policy_source_identity(&manifest.id, entry, source) {
+            rejected_policies.push(RejectedPolicy {
+                pack: manifest.id.clone(),
+                id: entry.id.clone(),
+                path: entry.path.clone(),
+                category: entry.category.clone(),
+                activation: entry.activation,
+                reason,
+                message,
+            });
+        }
+    }
+    manifest.policies.retain(|entry| {
+        !rejected_policies
+            .iter()
+            .any(|rejected| rejected.path == entry.path)
+    });
+    Ok((manifest, typos, rejected_policies))
+}
+
+/// Check that one embedded source has the identities its manifest entry
+/// records.
+fn check_policy_source_identity(
+    pack_id: &str,
+    entry: &BuiltInPolicyManifestEntry,
+    source: &str,
+) -> Result<(), (PolicyRejection, String)> {
+    let path = &entry.path;
+    let identity = PolicySourceIdentity::new(format!("builtin:{pack_id}/{path}"));
+    let authored_hash = authored_identity(&identity, source)
+        .map_err(|error| (PolicyRejection::InvalidPolicySource, error.to_string()))?;
+    if authored_hash != entry.authored_hash {
+        return Err((
+            PolicyRejection::StalePolicyPin,
+            format!(
+                "built-in policy `{path}` has authored hash `{authored_hash}` but the \
+                 manifest records `{}`",
+                entry.authored_hash
+            ),
+        ));
+    }
+    match resolved_identity(&identity, source) {
+        Ok(resolved_hash) => {
+            if let Some(recorded) = &entry.resolved_semantic_hash
+                && recorded != &resolved_hash
+            {
+                return Err((
+                    PolicyRejection::StalePolicyPin,
+                    format!(
+                        "built-in policy `{path}` resolves to `{resolved_hash}` but the \
+                         manifest records `{recorded}`"
+                    ),
+                ));
+            }
+        }
+        Err(rejection) if is_deferred_rejection(&rejection) => {
+            if entry.resolved_semantic_hash.is_some() {
+                return Err((
+                    PolicyRejection::StalePolicyPin,
+                    format!(
+                        "built-in policy `{path}` defers catalog or workspace resolution and \
+                         cannot record a resolved semantic hash before activation"
+                    ),
+                ));
+            }
+        }
+        Err(rejection) => {
+            return Err((
+                PolicyRejection::InvalidPolicySource,
+                format!("failed to load built-in policy `{path}`: {rejection}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// One catalog document of an accepted pack, kept only while the catalog
+/// loads.
+struct LoadedCatalogDocument {
+    entry: PolicyCatalogFile,
+    identity: String,
+    source: String,
+}
+
+/// Read and check the catalog documents that a pack read from `root`
+/// declares. A document that is missing, malformed or not the pinned one, or
+/// that cannot join the catalogs of the packs in `accepted` (a collision or a
+/// registry limit), rejects the pack; at run time it would fail every
+/// catalog-dependent policy (#10941). The pack's documents join `accepted`
+/// only when all of them register, so a rejected pack takes no capacity and
+/// causes no collision for a later pack.
+fn check_pack_catalogs(
+    root: &Path,
+    manifest: &BuiltInPolicyPackManifest,
+    accepted: &mut Vec<LoadedCatalogDocument>,
+) -> Result<(), RejectedPolicyPack> {
+    let reject = |reason, message: String| RejectedPolicyPack {
+        pack: manifest.id.clone(),
+        reason,
+        message,
+        may_supply: PackSupplies::declared_by(manifest),
+        declared_policy_ids: declared_policy_ids(manifest),
+    };
+    if manifest.catalogs.is_empty() {
+        return Ok(());
+    }
+    let capability = WorkspaceRoot::open(root).map_err(|error| {
+        reject(
+            PolicyPackRejection::InvalidContent,
+            format!("cannot open the policy pack root: {error}"),
+        )
+    })?;
+    let mut own = TaintCatalogRegistry::new_without_workspace(CatalogRegistryLimits::default());
+    let mut documents = Vec::with_capacity(manifest.catalogs.len());
+    for catalog in &manifest.catalogs {
+        let path = Path::new(&manifest.id).join(&catalog.path);
+        let document = brokk_bifrost_analysis::workspace_document::read_workspace_document(
+            &capability,
+            &path,
+            &["json"],
+            super::catalog::MAX_CATALOG_JSON_BYTES as u64,
+        )
+        .map_err(|error| reject(PolicyPackRejection::InvalidContent, error.to_string()))?;
+        let identity = format!("pack:{}/{}", manifest.id, catalog.path);
+        register_pack_catalog(&mut own, catalog, &identity, document.source())
+            .map_err(|error| reject(PolicyPackRejection::InvalidContent, error.to_string()))?;
+        documents.push(LoadedCatalogDocument {
+            entry: catalog.clone(),
+            identity,
+            source: document.source().to_owned(),
+        });
+    }
+    // Register the accepted documents and then this pack's into a fresh
+    // registry with a run's limits, in a run's order. A failure leaves
+    // `accepted` unchanged.
+    let mut combined =
+        TaintCatalogRegistry::new_without_workspace(CatalogRegistryLimits::default());
+    for document in accepted.iter() {
+        register_pack_catalog(
+            &mut combined,
+            &document.entry,
+            &document.identity,
+            &document.source,
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "accepted catalog `{}` registered with the same documents before: {error}",
+                document.identity
+            )
+        });
+    }
+    for document in &documents {
+        register_pack_catalog(
+            &mut combined,
+            &document.entry,
+            &document.identity,
+            &document.source,
+        )
+        .map_err(|error| reject(PolicyPackRejection::Conflict, error.to_string()))?;
+    }
+    accepted.extend(documents);
+    Ok(())
+}
 
 /// Parse the identifier typo table a pack ships and check it against the
 /// digest its manifest pins. A pack that names a table must supply it, and a
@@ -1312,37 +1911,16 @@ fn pack_identifier_typos(
 
 #[cfg(any(test, feature = "test-support"))]
 fn load_external_policy_catalog(root: &Path) -> Result<BuiltInPolicyCatalog, BuiltInPolicyError> {
-    BuiltInPolicyCatalog::from_embedded_packs(load_external_policy_packs(root)?)
+    let (packs, rejected) = load_external_policy_packs(root)?;
+    Ok(BuiltInPolicyCatalog::from_packs(packs, rejected))
 }
 
-fn load_external_policy_packs(root: &Path) -> Result<Vec<EmbeddedPolicyPack>, BuiltInPolicyError> {
-    let (workspace_root, manifests) = load_external_policy_manifests(root)?;
-    let mut packs = Vec::with_capacity(manifests.len());
-    for (manifest_source, manifest) in manifests {
-        let mut pack = EmbeddedPolicyPack::new(manifest_source);
-        for policy in &manifest.policies {
-            validate_external_policy_path(&policy.path)?;
-            let source_path = PathBuf::from(&manifest.id).join(&policy.path);
-            let policy_source =
-                read_external_policy_document(&workspace_root, &source_path, "rqlp")?;
-            pack = pack.with_source(policy.path.clone(), policy_source);
-        }
-        if let Some(typos) = &manifest.identifier_typos {
-            let source_path = PathBuf::from(&manifest.id).join(&typos.path);
-            pack = pack.with_identifier_typos(read_external_policy_document(
-                &workspace_root,
-                &source_path,
-                "txt",
-            )?);
-        }
-        packs.push(pack);
-    }
-    Ok(packs)
-}
-
-fn load_external_policy_manifests(
+/// Read every entry of one configured policy pack root. The error is for a
+/// root that cannot be read; an entry that fails is returned as a rejection
+/// and the other entries still load.
+fn load_external_policy_packs(
     root: &Path,
-) -> Result<(WorkspaceRoot, Vec<(String, BuiltInPolicyPackManifest)>), BuiltInPolicyError> {
+) -> Result<(Vec<EmbeddedPolicyPack>, Vec<RejectedPolicyPack>), BuiltInPolicyError> {
     let metadata = fs::symlink_metadata(root).map_err(|error| {
         BuiltInPolicyError::new(format!(
             "cannot inspect configured policy pack root `{}`: {error}",
@@ -1368,7 +1946,7 @@ fn load_external_policy_manifests(
         ))
     })?;
 
-    let mut directories = fs::read_dir(&root)
+    let mut entries = fs::read_dir(&root)
         .map_err(|error| {
             BuiltInPolicyError::new(format!(
                 "cannot list configured policy pack root `{}`: {error}",
@@ -1383,63 +1961,134 @@ fn load_external_policy_manifests(
                 root.display()
             ))
         })?;
-    if directories.len() > MAX_EXTERNAL_POLICY_DIRECTORY_ENTRIES {
+    if entries.len() > MAX_EXTERNAL_POLICY_DIRECTORY_ENTRIES {
         return Err(BuiltInPolicyError::new(format!(
             "configured policy pack root `{}` contains more than {MAX_EXTERNAL_POLICY_DIRECTORY_ENTRIES} entries",
             root.display()
         )));
     }
-    directories.sort_by_key(|entry| entry.file_name());
-    if directories.is_empty() {
+    entries.sort_by_key(|entry| entry.file_name());
+    if entries.is_empty() {
         return Err(BuiltInPolicyError::new(format!(
             "configured policy pack root `{}` contains no policy packs",
             root.display()
         )));
     }
 
-    let mut manifests = Vec::with_capacity(directories.len());
-    for directory in directories {
-        let pack_id = directory.file_name().into_string().map_err(|_| {
-            BuiltInPolicyError::new(format!(
-                "configured policy pack directory `{}` has a non-UTF-8 name",
-                directory.path().display()
-            ))
-        })?;
-        let metadata = fs::symlink_metadata(directory.path()).map_err(|error| {
-            BuiltInPolicyError::new(format!(
-                "cannot inspect configured policy pack directory `{}`: {error}",
-                directory.path().display()
-            ))
-        })?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(BuiltInPolicyError::new(format!(
-                "configured policy pack root contains a non-directory or symlink `{}`",
-                directory.path().display()
-            )));
+    let mut packs = Vec::with_capacity(entries.len());
+    let mut rejected = Vec::new();
+    for entry in &entries {
+        match load_external_policy_pack(&workspace_root, &root, entry) {
+            Ok(pack) => packs.push(pack),
+            Err(rejection) => rejected.push(rejection),
         }
+    }
+    Ok((packs, rejected))
+}
 
-        let manifest_path = PathBuf::from(&pack_id).join("manifest.json");
-        let manifest_source =
-            read_external_policy_document(&workspace_root, &manifest_path, "json")?;
-        let manifest = serde_json::from_str::<BuiltInPolicyPackManifest>(&manifest_source)
-            .map_err(|error| {
-                BuiltInPolicyError::new(format!(
-                    "invalid configured policy manifest `{}`: {error}",
-                    directory.path().join("manifest.json").display()
-                ))
-            })?;
-        validate_manifest_shape(&manifest)?;
-        if manifest.id != pack_id {
-            return Err(BuiltInPolicyError::new(format!(
-                "configured policy pack directory `{pack_id}` does not match manifest id `{}`",
-                manifest.id
-            )));
-        }
-
-        manifests.push((manifest_source, manifest));
+/// Read one entry of a configured policy pack root: `<pack id>/manifest.json`
+/// and the files it declares. Under the pack release contract a pack is a
+/// directory with a manifest, so an entry without one declares nothing.
+fn load_external_policy_pack(
+    workspace_root: &WorkspaceRoot,
+    root: &Path,
+    entry: &fs::DirEntry,
+) -> Result<EmbeddedPolicyPack, RejectedPolicyPack> {
+    let name = entry.file_name();
+    let Some(pack_id) = name.to_str() else {
+        return Err(RejectedPolicyPack {
+            pack: name.to_string_lossy().into_owned(),
+            reason: PolicyPackRejection::UnsupportedEntry,
+            message: "the entry name is not UTF-8".to_owned(),
+            may_supply: PackSupplies::UNKNOWN,
+            declared_policy_ids: Vec::new(),
+        });
+    };
+    // Before the manifest loads, any pack the entry holds is unknown, and so
+    // is what it supplies; an entry that declares no pack supplies nothing.
+    let reject = |reason: PolicyPackRejection, message: String| RejectedPolicyPack {
+        pack: pack_id.to_owned(),
+        reason,
+        message,
+        may_supply: if reason.may_lose_policies() {
+            PackSupplies::UNKNOWN
+        } else {
+            PackSupplies::default()
+        },
+        declared_policy_ids: Vec::new(),
+    };
+    let metadata = fs::symlink_metadata(entry.path()).map_err(|error| {
+        reject(
+            PolicyPackRejection::UnsupportedEntry,
+            format!("cannot inspect the entry: {error}"),
+        )
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(reject(
+            PolicyPackRejection::UnsupportedEntry,
+            "the entry is a symlink; a policy pack must be a real directory".to_owned(),
+        ));
+    }
+    if !metadata.is_dir() {
+        return Err(reject(
+            PolicyPackRejection::NotAPack,
+            "the entry is not a directory".to_owned(),
+        ));
     }
 
-    Ok((workspace_root, manifests))
+    let manifest_path = Path::new(pack_id).join("manifest.json");
+    let manifest_entry = find_external_policy_entry(workspace_root, &manifest_path)
+        .map_err(|error| reject(PolicyPackRejection::InvalidManifest, error.to_string()))?
+        .ok_or_else(|| {
+            reject(
+                PolicyPackRejection::NotAPack,
+                "the directory has no manifest.json, so it declares no policy pack".to_owned(),
+            )
+        })?;
+    let manifest_source = read_external_policy_entry(&manifest_path, manifest_entry, "json")
+        .map_err(|error| reject(PolicyPackRejection::InvalidManifest, error.to_string()))?;
+    let manifest =
+        serde_json::from_str::<BuiltInPolicyPackManifest>(&manifest_source).map_err(|error| {
+            reject(
+                PolicyPackRejection::InvalidManifest,
+                format!("invalid configured policy manifest `{pack_id}/manifest.json`: {error}"),
+            )
+        })?;
+    let reject = |reason, message: String| RejectedPolicyPack {
+        pack: pack_id.to_owned(),
+        reason,
+        message,
+        may_supply: PackSupplies::declared_by(&manifest),
+        declared_policy_ids: declared_policy_ids(&manifest),
+    };
+    validate_manifest_shape(&manifest)
+        .map_err(|error| reject(PolicyPackRejection::InvalidManifest, error.to_string()))?;
+    if manifest.id != pack_id {
+        return Err(reject(
+            PolicyPackRejection::InvalidManifest,
+            format!(
+                "configured policy pack directory `{pack_id}` does not match manifest id `{}`",
+                manifest.id
+            ),
+        ));
+    }
+
+    let mut pack = EmbeddedPolicyPack::new(manifest_source);
+    pack.root = Some(root.to_path_buf());
+    for policy in &manifest.policies {
+        let source_path = Path::new(pack_id).join(&policy.path);
+        let source = validate_external_policy_path(&policy.path)
+            .and_then(|()| read_external_policy_document(workspace_root, &source_path, "rqlp"))
+            .map_err(|error| reject(PolicyPackRejection::InvalidContent, error.to_string()))?;
+        pack = pack.with_source(policy.path.clone(), source);
+    }
+    if let Some(typos) = &manifest.identifier_typos {
+        let source_path = Path::new(pack_id).join(&typos.path);
+        let document = read_external_policy_document(workspace_root, &source_path, "txt")
+            .map_err(|error| reject(PolicyPackRejection::InvalidContent, error.to_string()))?;
+        pack = pack.with_identifier_typos(document);
+    }
+    Ok(pack)
 }
 
 fn validate_external_policy_path(value: &str) -> Result<(), BuiltInPolicyError> {
@@ -1479,6 +2128,21 @@ fn read_external_policy_document(
     relative_path: &Path,
     extension: &str,
 ) -> Result<String, BuiltInPolicyError> {
+    let entry = find_external_policy_entry(root, relative_path)?.ok_or_else(|| {
+        BuiltInPolicyError::new(format!(
+            "configured policy source `{}` does not exist",
+            relative_path.display()
+        ))
+    })?;
+    read_external_policy_entry(relative_path, entry, extension)
+}
+
+/// Find the entry named by `relative_path` beneath a configured root without
+/// following symlinks. `None` means its directory has no entry of that name.
+fn find_external_policy_entry(
+    root: &WorkspaceRoot,
+    relative_path: &Path,
+) -> Result<Option<WorkspaceDirectoryEntry>, BuiltInPolicyError> {
     let parent = relative_path
         .parent()
         .expect("policy files have a parent directory");
@@ -1510,15 +2174,16 @@ fn read_external_policy_document(
                 parent.display()
             ))
         })?;
-    let entry = entries
+    Ok(entries
         .into_iter()
-        .find(|entry| entry.relative_path().file_name() == Some(filename))
-        .ok_or_else(|| {
-            BuiltInPolicyError::new(format!(
-                "configured policy source `{}` does not exist",
-                relative_path.display()
-            ))
-        })?;
+        .find(|entry| entry.relative_path().file_name() == Some(filename)))
+}
+
+fn read_external_policy_entry(
+    relative_path: &Path,
+    entry: WorkspaceDirectoryEntry,
+    extension: &str,
+) -> Result<String, BuiltInPolicyError> {
     let document = entry
         .read_document(&[extension], MAX_EXTERNAL_POLICY_SOURCE_BYTES)
         .map_err(|error| {
@@ -1794,9 +2459,12 @@ fn validate_manifest_shape(manifest: &BuiltInPolicyPackManifest) -> Result<(), B
                 entry.id
             )));
         }
+        // An empty `required_capabilities` states that the policy needs no
+        // optional engine capability, the meaning the coordinator and the
+        // pack release contract give it (#10941). The field itself is
+        // required: a manifest that omits it does not parse.
         if entry.category.is_empty()
             || entry.supported_languages.is_empty()
-            || entry.required_capabilities.is_empty()
             || entry.severity_rationale.is_empty()
             || entry.remediation.is_empty()
         {
@@ -1830,14 +2498,128 @@ pub fn built_in_policy_catalog() -> Result<&'static BuiltInPolicyCatalog, BuiltI
     Ok(BUILT_IN_CATALOG.get_or_init(|| catalog))
 }
 
-/// The identifier typo table supplied by the active built-in pack catalog.
-///
-/// A catalog that fails to load fails every built-in selection on its own; a
-/// run of workspace policies or an explanation only goes without a table.
-pub(crate) fn catalog_identifier_typos() -> Option<&'static Arc<IdentifierTypoTable>> {
-    built_in_policy_catalog()
-        .ok()
-        .and_then(BuiltInPolicyCatalog::identifier_typos)
+/// The identifier typo table supplied by the active built-in pack catalog:
+/// `Ok(None)` when no loaded pack supplies one, an error when the catalog
+/// failed to load. [`catalog_identifier_typos_gap`] says whether the table is
+/// the complete union.
+pub(crate) fn catalog_identifier_typos()
+-> Result<Option<&'static Arc<IdentifierTypoTable>>, BuiltInPolicyError> {
+    Ok(built_in_policy_catalog()?.identifier_typos())
+}
+
+/// Why the catalog's identifier typo table may be incomplete: the catalog
+/// failed to load, or it rejected packs that may have supplied typos. `None`
+/// when the table is the union of every configured pack's. Only a policy
+/// that reads the table ([`policy_reads_identifier_typos`]) is affected
+/// (#10941).
+pub(crate) fn catalog_identifier_typos_gap() -> Option<String> {
+    let catalog = match built_in_policy_catalog() {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            return Some(format!(
+                "the built-in policy catalog failed to load: {error}"
+            ));
+        }
+    };
+    let lost = catalog
+        .document
+        .rejected_packs
+        .iter()
+        .filter(|rejected| rejected.may_supply.identifier_typos)
+        .collect::<Vec<_>>();
+    (!lost.is_empty()).then(|| {
+        format!(
+            "the built-in policy catalog rejected packs that may have supplied identifier typos: {}",
+            describe_rejections(lost)
+        )
+    })
+}
+
+/// Whether a loaded policy reads the identifier typo table: some query in
+/// its plan applies the `js/misspelled-identifier` language rule. The
+/// canonical plan is the policy's executable identity, so every query that
+/// can affect its answer appears in it.
+pub(crate) fn policy_reads_identifier_typos(policy: &LoadedPolicy) -> bool {
+    let label = brokk_bifrost_rql::query::JsRule::MisspelledIdentifier.label();
+    let plan = policy.to_canonical_semantic_json();
+    let mut pending = vec![&plan];
+    while let Some(value) = pending.pop() {
+        match value {
+            serde_json::Value::Object(object) => {
+                if object
+                    .get("language_rule")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(label)
+                {
+                    return true;
+                }
+                pending.extend(object.values());
+            }
+            serde_json::Value::Array(items) => pending.extend(items),
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Whether a loaded policy may read every registered catalog: one of its
+/// taint-shaped endpoint sets includes `(catalog :any-registered true ...)`.
+/// The canonical plan keeps only the entries a wildcard resolved to, so the
+/// authored sets are read; endpoint-set closure merges each imported file's
+/// `include_sets` into them, so an imported wildcard is seen too. An import
+/// that a deferred closure left unresolved counts as a reader. A named
+/// catalog that is not registered fails resolution instead.
+pub(crate) fn policy_reads_any_registered_catalog(policy: &LoadedPolicy) -> bool {
+    let Some(spec) = policy.definition().analysis.taint_shaped_spec() else {
+        return false;
+    };
+    let wildcard = [
+        &spec.sources.include_sets,
+        &spec.sinks.include_sets,
+        &spec.sanitizers.include_sets,
+        &spec.transforms.include_sets,
+        &spec.external_models.include_sets,
+    ]
+    .into_iter()
+    .flatten()
+    .any(|reference| matches!(reference, super::CatalogRef::AnyRegistered { .. }));
+    let imports = [
+        &spec.sources.include_files,
+        &spec.sinks.include_files,
+        &spec.sanitizers.include_files,
+        &spec.transforms.include_files,
+        &spec.external_models.include_files,
+    ]
+    .into_iter()
+    .any(|files| !files.is_empty());
+    wildcard || imports
+}
+
+/// Why the pack catalogs a run registers may be incomplete: the catalog
+/// failed to load, or it rejected packs that may have supplied catalogs.
+/// Only a policy that reads every registered catalog
+/// ([`policy_reads_any_registered_catalog`]) is affected (#10941).
+pub(crate) fn catalog_registry_gap() -> Option<String> {
+    let catalog = match built_in_policy_catalog() {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            return Some(format!(
+                "the built-in policy catalog failed to load: {error}"
+            ));
+        }
+    };
+    let lost = catalog
+        .document
+        .rejected_packs
+        .iter()
+        .filter(|rejected| rejected.may_supply.catalogs)
+        .collect::<Vec<_>>();
+    (!lost.is_empty()).then(|| {
+        format!(
+            "the built-in policy catalog rejected packs that may have supplied catalogs: {}",
+            describe_rejections(lost)
+        )
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2086,31 +2868,40 @@ fn read_verified_policy_bundle(
 
 /// Read catalog documents through capabilities rooted at the installed pack,
 /// independently for every policy run. No catalog bytes enter process caches.
+/// Only packs the loaded catalog accepted contribute, with the catalog pins
+/// their verified manifests record.
 pub(crate) fn register_run_catalogs(
     registry: &mut TaintCatalogRegistry,
 ) -> Result<(), BuiltInPolicyError> {
-    if let Some(roots) = configured_policy_pack_roots()? {
-        for root in std::env::split_paths(&roots) {
-            let (capability, manifests) = load_external_policy_manifests(&root)?;
-            for (_, manifest) in manifests {
-                for catalog in &manifest.catalogs {
-                    let path = Path::new(&manifest.id).join(&catalog.path);
-                    let document =
-                        brokk_bifrost_analysis::workspace_document::read_workspace_document(
-                            &capability,
-                            &path,
-                            &["json"],
-                            super::catalog::MAX_CATALOG_JSON_BYTES as u64,
-                        )
-                        .map_err(|error| BuiltInPolicyError::new(error.to_string()))?;
-                    register_pack_catalog(
-                        registry,
-                        catalog,
-                        &format!("pack:{}/{}", manifest.id, catalog.path),
-                        document.source(),
-                    )?;
-                }
-            }
+    let built_in = built_in_policy_catalog()?;
+    for manifest in &built_in.document.packs {
+        let Some(root) = built_in.pack_roots.get(&manifest.id) else {
+            continue;
+        };
+        if manifest.catalogs.is_empty() {
+            continue;
+        }
+        let capability = WorkspaceRoot::open(root).map_err(|error| {
+            BuiltInPolicyError::new(format!(
+                "cannot open configured policy pack root `{}`: {error}",
+                root.display()
+            ))
+        })?;
+        for catalog in &manifest.catalogs {
+            let path = Path::new(&manifest.id).join(&catalog.path);
+            let document = brokk_bifrost_analysis::workspace_document::read_workspace_document(
+                &capability,
+                &path,
+                &["json"],
+                super::catalog::MAX_CATALOG_JSON_BYTES as u64,
+            )
+            .map_err(|error| BuiltInPolicyError::new(error.to_string()))?;
+            register_pack_catalog(
+                registry,
+                catalog,
+                &format!("pack:{}/{}", manifest.id, catalog.path),
+                document.source(),
+            )?;
         }
     }
     if let Some(roots) = configured_policy_bundle_roots()? {
@@ -2203,7 +2994,7 @@ mod tests {
 
     #[test]
     fn core_without_host_rules_has_no_policy_content() {
-        let catalog = BuiltInPolicyCatalog::without_rules().expect("empty core catalog");
+        let catalog = BuiltInPolicyCatalog::without_rules();
         assert!(catalog.document().packs.is_empty());
         assert!(catalog.source_by_policy_id.is_empty());
         assert!(
@@ -2280,7 +3071,7 @@ mod tests {
     ) -> Result<BuiltInPolicyCatalog, BuiltInPolicyError> {
         let identity = PolicySourceIdentity::new("builtin:test.issue-3316/policies/deferred.rqlp");
         let authored = authored_identity(&identity, DEFERRED_QUALIFIED_POLICY)?;
-        BuiltInPolicyCatalog::from_embedded_packs(vec![
+        Ok(BuiltInPolicyCatalog::from_embedded_packs(vec![
             EmbeddedPolicyPack::new(pack_manifest(
                 &authored,
                 resolved_semantic_hash,
@@ -2288,7 +3079,7 @@ mod tests {
                 "test.issue-3316.deferred",
             ))
             .with_source("policies/deferred.rqlp", DEFERRED_QUALIFIED_POLICY),
-        ])
+        ]))
     }
 
     #[test]
@@ -2407,7 +3198,7 @@ mod tests {
 
     #[test]
     fn a_wrong_authored_hash_is_refused() {
-        let error = BuiltInPolicyCatalog::from_embedded_packs(vec![
+        let catalog = BuiltInPolicyCatalog::from_embedded_packs(vec![
             EmbeddedPolicyPack::new(pack_manifest(
                 &"0".repeat(64),
                 None,
@@ -2415,9 +3206,19 @@ mod tests {
                 "test.issue-3316.deferred",
             ))
             .with_source("policies/deferred.rqlp", DEFERRED_QUALIFIED_POLICY),
-        ])
-        .expect_err("a stale authored hash is a catalog defect");
-        assert!(error.to_string().contains("authored hash"), "{error}");
+        ]);
+        // The pack loads; only its policy with the stale pin is rejected.
+        let [pack] = catalog.document().packs.as_slice() else {
+            panic!("the pack loads: {:?}", catalog.document());
+        };
+        assert!(pack.policies.is_empty(), "{pack:?}");
+        assert!(catalog.document().rejected_packs.is_empty());
+        let [rejected] = catalog.document().rejected_policies.as_slice() else {
+            panic!("a stale authored hash rejects its policy");
+        };
+        assert_eq!(rejected.id, "test.issue-3316.deferred");
+        assert_eq!(rejected.reason, PolicyRejection::StalePolicyPin);
+        assert!(rejected.message.contains("authored hash"), "{rejected:?}");
     }
 
     fn selected_ids(selection: &BuiltInPolicySelection) -> Result<Vec<String>, String> {
@@ -2646,6 +3447,22 @@ mod external_policy_runtime_tests {
         (root, pack_root)
     }
 
+    /// The rejection of the fixture's only pack, which must not load.
+    fn only_rejection(root: &Path, reason: PolicyPackRejection) -> String {
+        let catalog = load_external_policy_catalog(root).expect("a readable rules root loads");
+        assert!(
+            catalog.document().packs.is_empty(),
+            "{:?}",
+            catalog.document()
+        );
+        let [rejected] = catalog.document().rejected_packs.as_slice() else {
+            panic!("one rejected pack: {:?}", catalog.document());
+        };
+        assert_eq!(rejected.pack, PACK_ID);
+        assert_eq!(rejected.reason, reason, "{rejected:?}");
+        rejected.message.clone()
+    }
+
     #[test]
     fn external_rules_root_loads_serialized_embedded_manifest_and_sources() {
         let (root, _) = external_fixture();
@@ -2690,13 +3507,13 @@ mod external_policy_runtime_tests {
         assert!(typos.known_misspelling("lenght", 0, 6));
 
         write_manifest(&"0".repeat(64));
-        let error = load_external_policy_catalog(root.path()).expect_err("a wrong pin fails");
-        assert!(error.to_string().contains("content hash"), "{error}");
+        let error = only_rejection(root.path(), PolicyPackRejection::InvalidContent);
+        assert!(error.contains("content hash"), "{error}");
 
         fs::remove_file(pack_root.join("data/identifier-typos.txt")).expect("remove table");
         write_manifest(&pinned);
-        let error = load_external_policy_catalog(root.path()).expect_err("a missing table fails");
-        assert!(error.to_string().contains("does not exist"), "{error}");
+        let error = only_rejection(root.path(), PolicyPackRejection::InvalidContent);
+        assert!(error.contains("does not exist"), "{error}");
     }
 
     #[test]
@@ -2704,8 +3521,8 @@ mod external_policy_runtime_tests {
         let (root, pack_root) = external_fixture();
         fs::remove_file(pack_root.join("policies/resource-lifecycle.rqlp"))
             .expect("remove declared source");
-        let error = load_external_policy_catalog(root.path()).expect_err("missing source fails");
-        assert!(error.to_string().contains("does not exist"), "{error}");
+        let error = only_rejection(root.path(), PolicyPackRejection::InvalidContent);
+        assert!(error.contains("does not exist"), "{error}");
     }
 
     #[test]
@@ -2713,11 +3530,9 @@ mod external_policy_runtime_tests {
         let (root, pack_root) = external_fixture();
         fs::write(pack_root.join("policies/resource-lifecycle.rqlp"), [0xff])
             .expect("corrupt serialized source");
-        let error = load_external_policy_catalog(root.path()).expect_err("corrupt source fails");
+        let error = only_rejection(root.path(), PolicyPackRejection::InvalidContent);
         assert!(
-            error
-                .to_string()
-                .contains("cannot read configured policy source"),
+            error.contains("cannot read configured policy source"),
             "{error}"
         );
     }
@@ -2736,11 +3551,9 @@ mod external_policy_runtime_tests {
             serde_json::to_vec(&manifest).expect("serialize altered manifest"),
         )
         .expect("write altered manifest");
-        let error = load_external_policy_catalog(root.path()).expect_err("traversal fails");
+        let error = only_rejection(root.path(), PolicyPackRejection::InvalidContent);
         assert!(
-            error
-                .to_string()
-                .contains("invalid or unsafe configured policy path"),
+            error.contains("invalid or unsafe configured policy path"),
             "{error}"
         );
     }
@@ -2758,11 +3571,9 @@ mod external_policy_runtime_tests {
         fs::remove_file(&source).expect("remove original source");
         symlink(&outside_source, &source).expect("create source symlink");
 
-        let error = load_external_policy_catalog(root.path()).expect_err("source symlink fails");
+        let error = only_rejection(root.path(), PolicyPackRejection::InvalidContent);
         assert!(
-            error
-                .to_string()
-                .contains("cannot read configured policy source"),
+            error.contains("cannot read configured policy source"),
             "{error}"
         );
     }

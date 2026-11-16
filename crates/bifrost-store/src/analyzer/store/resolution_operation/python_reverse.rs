@@ -1,6 +1,8 @@
 //! Python exposure rules for the production reverse nomination worklist.
 mod construction;
-use super::super::python_unit_summaries::PythonSelectedEnvironment;
+use super::super::python_unit_summaries::{
+    PythonSelectedEnvironment, PythonSummaryCoverage, PythonUncoveredCause,
+};
 use super::reverse_candidates::{
     REVERSE_LOOKUP_IDENTITY_ARM_SQL, ReverseCandidateKey, ReverseContextWitness,
 };
@@ -50,6 +52,10 @@ impl PythonReverseRequest<'_> {
         }
     }
 }
+
+pub(crate) const PYTHON_PROVIDER_BLOB_SQL: &str = "SELECT selected.blob_id FROM python_unit_summary_providers provider JOIN temp.selected_unit_member_mounts selected ON selected.summary_id=provider.summary_id AND selected.member_ordinal=provider.member_ordinal WHERE provider.summary_id=?1 AND provider.container_path=?2 AND provider.state<>'shadowed'";
+
+pub(crate) const PYTHON_AUTHORED_MEMBER_SQL: &str = "SELECT provider.container_path,slots.name,slots.scope,scopes.parent_scope FROM resolution_binding_events events INDEXED BY resolution_binding_events_authored JOIN resolution_binding_slots slots ON slots.blob_id=events.blob_id AND slots.slot=events.slot JOIN resolution_binding_scopes scopes ON scopes.blob_id=slots.blob_id AND scopes.scope=slots.scope CROSS JOIN temp.selected_unit_member_mounts selected ON selected.blob_id=events.blob_id AND selected.summary_id=?1 CROSS JOIN resolution_unit_summary_members member ON member.summary_id=selected.summary_id AND member.member_ordinal=selected.member_ordinal CROSS JOIN python_unit_summary_providers provider ON provider.summary_id=member.summary_id AND provider.member_ordinal=member.member_ordinal WHERE events.blob_id=?2 AND events.authored=?3 AND member.rel_path=?4 AND provider.state<>'shadowed'";
 
 /// Python's root reads have no Rust namespace-prefix restriction. Qualified
 /// routes still use the shared source-lookup arm; positioned spelling uses the
@@ -106,6 +112,24 @@ const NAMESPACES: [ResolutionNamespace; 6] = [
     ResolutionNamespace::Package,
 ];
 
+/// The selected environment's header, valid only while its recorded member inputs
+/// equal those of the blobs this operation selected at the Python revision.
+static PYTHON_REVERSE_HEADER_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let selected = |column: &str| {
+        format!("(SELECT {column} FROM temp.selected_workspace_revisions WHERE lang='python')")
+    };
+    format!(
+        "SELECT unit_key,hex(summary_digest),hex(output_digest),complete FROM resolution_unit_summaries WHERE summary_id=?1 AND lang='python' AND publication_state='complete' AND {}",
+        super::super::surface_relations::members_current_sql(
+            "python",
+            "resolution_unit_summaries.summary_id",
+            &selected("workspace_id"),
+            &selected("generation"),
+            &selected("revision"),
+        )
+    )
+});
+
 /// Selected independently of candidate hits. The summary is the exact retained
 /// profile/revision selected by the native publication entry. Provider rows
 /// include shadowed alternatives as domain evidence, never positive seeds.
@@ -120,20 +144,31 @@ struct PythonReverseView {
     mutation_guard: super::python_members::operations::PythonMutationReadGuard,
 }
 impl PythonReverseView {
+    /// `None` when the summary no longer matches the selected blobs: a repair kept
+    /// a member's OID but changed its surface, so the environment is unavailable
+    /// until the next reconcile re-derives it.
     fn select(
         operation: &SelectedResolutionOperation<'_, '_>,
-        summary: i64,
+        environment: &PythonSelectedEnvironment,
         cancellation: &CancellationToken,
-    ) -> Result<Self> {
+    ) -> Result<Option<Self>> {
+        let summary = environment.summary;
         let conn = operation.ready.inventory.connection();
-        let (mut unit, digest, output, complete): (Vec<u8>,String,String,bool) = conn.prepare_cached("SELECT unit_key,hex(summary_digest),hex(output_digest),complete FROM resolution_unit_summaries WHERE summary_id=?1 AND lang='python' AND publication_state='complete'")?.query_row( [summary],
-            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?;
+        let Some((mut unit, digest, output, complete)): Option<(Vec<u8>, String, String, bool)> =
+            conn.prepare_cached(&PYTHON_REVERSE_HEADER_SQL)?
+                .query_row([summary], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })
+                .optional()?
+        else {
+            return Ok(None);
+        };
         let mut domains = vec![format!(
             "environment complete={complete} summary={digest} output={output}"
         )];
         for row in conn.prepare_cached("SELECT root_slot,root_path,authority,ordered,observation,hex(target_digest) FROM python_unit_summary_roots WHERE summary_id=?1 ORDER BY root_slot")?
             .query_map([summary], |row| Ok(format!("root {} {:?} {} ordered={} observation={} target={}", row.get::<_,i64>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,bool>(3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?)))? { domains.push(row?); }
-        for row in conn.prepare_cached("SELECT provider.container_path,provider.module_name,provider.kind,provider.state,provider.rel_path,source.format, mounts.mount_ordinal FROM python_unit_summary_providers provider LEFT JOIN resolution_unit_summary_members member ON member.summary_id=provider.summary_id AND member.member_ordinal=provider.member_ordinal LEFT JOIN python_binding_source source ON source.blob_id=member.blob_id LEFT JOIN temp.selected_resolution_mounts mounts ON mounts.blob_id=member.blob_id AND mounts.persisted_relative_path=member.rel_path AND mounts.storage_language='python' WHERE provider.summary_id=?1 ORDER BY provider.container_path,mounts.mount_ordinal")?
+        for row in conn.prepare_cached("SELECT provider.container_path,provider.module_name,provider.kind,provider.state,provider.rel_path,source.format, mounts.mount_ordinal FROM python_unit_summary_providers provider LEFT JOIN resolution_unit_summary_members member ON member.summary_id=provider.summary_id AND member.member_ordinal=provider.member_ordinal LEFT JOIN python_binding_source source ON source.blob_id=(SELECT selected.blob_id FROM temp.selected_unit_member_mounts selected WHERE selected.summary_id=member.summary_id AND selected.member_ordinal=member.member_ordinal) LEFT JOIN temp.selected_resolution_mounts mounts ON mounts.blob_id=(SELECT selected.blob_id FROM temp.selected_unit_member_mounts selected WHERE selected.summary_id=member.summary_id AND selected.member_ordinal=member.member_ordinal) AND mounts.persisted_relative_path=member.rel_path AND mounts.storage_language='python' WHERE provider.summary_id=?1 ORDER BY provider.container_path,mounts.mount_ordinal")?
             .query_map([summary], |row| Ok(format!("provider {:?} module={:?} kind={} state={} path={:?} source={} selected={}",row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?,row.get::<_,Option<i64>>(5)?==Some(super::super::python_binding_rows::NATIVE_SOURCE_FORMAT),row.get::<_,Option<u32>>(6)?.is_some())))? {domains.push(row?);}
         for row in conn.prepare_cached("SELECT container_path,surface,policy FROM python_unit_summary_surfaces WHERE summary_id=?1 ORDER BY container_path,surface")?
             .query_map([summary],|row| Ok(format!("surface {:?} {} {}",row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?)))? {domains.push(row?);}
@@ -210,6 +245,7 @@ impl PythonReverseView {
             let reason = operation.ready.context_identities.named_semantic(
                 hash.finish(),
                 "python_reverse_environment_gap",
+                crate::analyzer::resolution::ReasonDeterminism::Unaudited,
                 &label,
             );
             obligations.push(PythonReverseObligation {
@@ -221,10 +257,23 @@ impl PythonReverseView {
                 coverage: PythonReverseCoverage::Enumeration,
             });
         }
+        // The persisted summary does not describe these overlay members, and any of
+        // them can change other members' imports or global absence. The obligation
+        // is environment-wide: it reaches every required context, never a subset.
+        for (path, cause) in environment.coverage.unusable() {
+            let (label, reason) = operation.python_uncovered_reason(path, cause);
+            domains.push(format!("uncovered {path:?} {cause}"));
+            obligations.push(PythonReverseObligation {
+                completion: ResolutionCompletion::incomplete([reason]),
+                label,
+                caller: None,
+                coverage: PythonReverseCoverage::CandidatesAndEnumeration,
+            });
+        }
         // Activation and unacquired providers are already stated by the
         // query-wide environment obligation. Only a missing relative context
         // is a caller-local loss inside the selected workspace.
-        for row in conn.prepare_cached("SELECT DISTINCT members.rel_path,imports.import_site,imports.state FROM python_unit_summary_imports imports JOIN resolution_unit_summary_members members ON members.summary_id=imports.summary_id AND members.member_ordinal=imports.member_ordinal WHERE imports.summary_id=?1 AND imports.state='relative_context_open' ORDER BY members.rel_path,imports.import_site")?
+        for row in conn.prepare_cached("SELECT DISTINCT members.rel_path,site.dense_id,imports.state FROM python_unit_summary_imports imports JOIN resolution_unit_summary_members members ON members.summary_id=imports.summary_id AND members.member_ordinal=imports.member_ordinal JOIN temp.selected_unit_member_mounts selected ON selected.summary_id=members.summary_id AND selected.member_ordinal=members.member_ordinal CROSS JOIN temp.surface_dense site ON site.blob_id=selected.blob_id AND site.id_space=1 AND site.surface_ordinal=imports.import_surface_ordinal WHERE imports.summary_id=?1 AND imports.state='relative_context_open' ORDER BY members.rel_path,site.dense_id")?
             .query_map([summary], |row| Ok((row.get::<_,String>(0)?,row.get::<_,u32>(1)?,row.get::<_,String>(2)?)))? {
             let (caller, site, state) = row?;
             let (completion, label) = super::python_demand::import_route_obligation(&operation.ready, summary, &caller, site, &state)?;
@@ -249,7 +298,7 @@ impl PythonReverseView {
             mutation_guard,
         };
         view.validate_current_use(operation, cancellation)?;
-        Ok(view)
+        Ok(Some(view))
     }
 
     fn validate_current_use(
@@ -527,7 +576,7 @@ impl PythonReverseHooks<'_, '_, '_> {
              JOIN python_unit_summary_providers provider
                ON provider.summary_id=?1 AND provider.container_path=evidence.container
               AND provider.state<>'shadowed'
-             JOIN resolution_unit_summary_members member
+             JOIN temp.selected_unit_member_mounts member
                ON member.summary_id=provider.summary_id AND member.member_ordinal=provider.member_ordinal
              WHERE evidence.kind='receiver-namespace'",
         )?.query_map([self.view.summary], |row| row.get::<_, String>(0))?
@@ -692,7 +741,8 @@ impl ReverseNominationHooks for PythonReverseHooks<'_, '_, '_> {
             let providers = self.conn().prepare_cached(
                 "SELECT provider.container_path FROM python_unit_summary_providers provider
                  JOIN resolution_unit_summary_members member ON member.summary_id=provider.summary_id AND member.member_ordinal=provider.member_ordinal
-                 WHERE provider.summary_id=?1 AND member.blob_id=?2 AND member.rel_path=?3
+                 JOIN temp.selected_unit_member_mounts selected ON selected.summary_id=member.summary_id AND selected.member_ordinal=member.member_ordinal
+                 WHERE provider.summary_id=?1 AND selected.blob_id=?2 AND member.rel_path=?3
                    AND provider.kind IN ('module','package') AND provider.state<>'shadowed'",
             )?.query_map(params![self.view.summary, blob, selected_path_key(target.source().rel_path())], |row| row.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -708,7 +758,7 @@ impl ReverseNominationHooks for PythonReverseHooks<'_, '_, '_> {
                 exposures.push(self.exposure(container, target.identifier().to_owned(), None, 0));
             }
         }
-        let mut statement=self.conn().prepare_cached("SELECT provider.container_path,slots.name,slots.scope,scopes.parent_scope FROM resolution_binding_events events INDEXED BY resolution_binding_events_authored JOIN resolution_binding_slots slots ON slots.blob_id=events.blob_id AND slots.slot=events.slot JOIN resolution_binding_scopes scopes ON scopes.blob_id=slots.blob_id AND scopes.scope=slots.scope CROSS JOIN resolution_unit_summary_members member INDEXED BY resolution_unit_summary_members_blob ON member.blob_id=events.blob_id AND member.summary_id=?1 CROSS JOIN python_unit_summary_providers provider ON provider.summary_id=member.summary_id AND provider.member_ordinal=member.member_ordinal WHERE events.blob_id=?2 AND events.authored=?3 AND member.rel_path=?4 AND provider.state<>'shadowed'")?;
+        let mut statement = self.conn().prepare_cached(PYTHON_AUTHORED_MEMBER_SQL)?;
         for row in statement.query_map(
             params![
                 self.view.summary,
@@ -760,7 +810,13 @@ impl ReverseNominationHooks for PythonReverseHooks<'_, '_, '_> {
             sources: Vec::new(),
             successors: Vec::new(),
         };
-        let blob=self.conn().prepare_cached("SELECT member.blob_id FROM python_unit_summary_providers provider JOIN resolution_unit_summary_members member ON member.summary_id=provider.summary_id AND member.member_ordinal=provider.member_ordinal WHERE provider.summary_id=?1 AND provider.container_path=?2 AND provider.state<>'shadowed'")?.query_row(params![self.view.summary,exposure.module],|row|row.get::<_,i64>(0)).optional()?;
+        let blob = self
+            .conn()
+            .prepare_cached(PYTHON_PROVIDER_BLOB_SQL)?
+            .query_row(params![self.view.summary, exposure.module], |row| {
+                row.get::<_, i64>(0)
+            })
+            .optional()?;
         if let Some(blob) = blob {
             if let Some(scope) = exposure.scope {
                 self.record(
@@ -820,7 +876,7 @@ impl ReverseNominationHooks for PythonReverseHooks<'_, '_, '_> {
             return Ok(step);
         }
         // Only from-imports rename a member; module imports bind its container.
-        for row in self.conn().prepare_cached("SELECT imports.importer_container,imports.bound_name,imports.form,imports.import_site,member.blob_id,coalesce(binding_slot.scope,root.root_scope),policy.policy,EXISTS(SELECT 1 FROM python_unit_summary_export_names names WHERE names.summary_id=imports.summary_id AND names.container_path=imports.target_container AND names.surface='wildcard' AND names.name=?3) FROM python_unit_summary_imports imports INDEXED BY python_unit_summary_imports_reverse JOIN resolution_unit_summary_members member ON member.summary_id=imports.summary_id AND member.member_ordinal=imports.member_ordinal JOIN python_unit_summary_providers importer ON importer.summary_id=imports.summary_id AND importer.container_path=imports.importer_container AND importer.state<>'shadowed' JOIN resolution_root_imports root ON root.blob_id=member.blob_id AND root.import_site=imports.import_site LEFT JOIN python_binding_imports source_import ON source_import.blob_id=member.blob_id AND source_import.import_site=imports.import_site LEFT JOIN resolution_binding_events binding_event ON binding_event.blob_id=member.blob_id AND binding_event.event=source_import.binding_event LEFT JOIN resolution_binding_slots binding_slot ON binding_slot.blob_id=member.blob_id AND binding_slot.slot=binding_event.slot LEFT JOIN python_unit_summary_surfaces policy ON policy.summary_id=imports.summary_id AND policy.container_path=imports.target_container AND policy.surface='wildcard' WHERE imports.summary_id=?1 AND imports.target_container=?2 AND ((imports.form='from' AND imports.requested_name=?3) OR imports.form='star' OR (?4 AND imports.form='module')) ORDER BY imports.member_ordinal,imports.import_site,imports.importer_container")?.query_map(params![self.view.summary,exposure.module,exposure.name,target_surface],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,i64>(3)?,row.get::<_,i64>(4)?,row.get::<_,u32>(5)?,row.get::<_,Option<String>>(6)?,row.get::<_,bool>(7)?)))? {
+        for row in self.conn().prepare_cached("SELECT imports.importer_container,imports.bound_name,imports.form,site.dense_id,selected.blob_id,coalesce(binding_slot.scope,root.root_scope),policy.policy,EXISTS(SELECT 1 FROM python_unit_summary_export_names names WHERE names.summary_id=imports.summary_id AND names.container_path=imports.target_container AND names.surface='wildcard' AND names.name=?3) FROM python_unit_summary_imports imports INDEXED BY python_unit_summary_imports_reverse JOIN temp.selected_unit_member_mounts selected ON selected.summary_id=imports.summary_id AND selected.member_ordinal=imports.member_ordinal CROSS JOIN temp.surface_dense site ON site.blob_id=selected.blob_id AND site.id_space=1 AND site.surface_ordinal=imports.import_surface_ordinal JOIN python_unit_summary_providers importer ON importer.summary_id=imports.summary_id AND importer.container_path=imports.importer_container AND importer.state<>'shadowed' JOIN resolution_root_imports root ON root.blob_id=selected.blob_id AND root.import_site=site.dense_id LEFT JOIN python_binding_imports source_import ON source_import.blob_id=selected.blob_id AND source_import.import_site=site.dense_id LEFT JOIN resolution_binding_events binding_event ON binding_event.blob_id=selected.blob_id AND binding_event.event=source_import.binding_event LEFT JOIN resolution_binding_slots binding_slot ON binding_slot.blob_id=selected.blob_id AND binding_slot.slot=binding_event.slot LEFT JOIN python_unit_summary_surfaces policy ON policy.summary_id=imports.summary_id AND policy.container_path=imports.target_container AND policy.surface='wildcard' WHERE imports.summary_id=?1 AND imports.target_container=?2 AND ((imports.form='from' AND imports.requested_name=?3) OR imports.form='star' OR (?4 AND imports.form='module')) ORDER BY imports.member_ordinal,site.dense_id,imports.importer_container")?.query_map(params![self.view.summary,exposure.module,exposure.name,target_surface],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,i64>(3)?,row.get::<_,i64>(4)?,row.get::<_,u32>(5)?,row.get::<_,Option<String>>(6)?,row.get::<_,bool>(7)?)))? {
             let(module,bound,form,site,blob,scope,policy,listed)=row?;
             // A named export from a surface names a member, not its module.
             if module_surface && form == "from" { continue; }
@@ -959,6 +1015,133 @@ impl ReverseNominationHooks for PythonReverseHooks<'_, '_, '_> {
     }
 }
 impl SelectedResolutionOperation<'_, '_> {
+    /// The shared mount relation owns coverage for every mount, with no blob
+    /// equality shortcut. Header validation has already proved unchanged members
+    /// current; classify only the overlay delta, retaining added/removed masks.
+    #[doc(hidden)]
+    pub fn python_summary_coverage(&self, summary: i64) -> Result<PythonSummaryCoverage> {
+        use super::super::unit_summaries::member_input_selected;
+        let conn = self.ready.inventory.connection();
+        let paths = conn.prepare_cached(
+            "SELECT persisted_relative_path,intent='removal' FROM temp.selected_resolution_overlay_masks WHERE storage_language='python' ORDER BY persisted_relative_path")?
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut retained = Vec::new();
+        let mut uncovered = Vec::new();
+        for (path, removal) in paths {
+            // This reader deliberately keeps the persisted blob: it classifies
+            // an uncovered input, rather than reading selected content facts.
+            let persisted: Option<(i64, String)> = conn
+                .prepare_cached("SELECT blob_id,blob_oid FROM temp.selected_unit_member_blobs WHERE summary_id=?1 AND rel_path=?2")?
+                .query_row(params![summary, path], |row| Ok((row.get(0)?, row.get(1)?)))
+                .optional()?;
+            let covered: bool = conn.prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM temp.selected_unit_member_mounts WHERE summary_id=?1 AND rel_path=?2)")?
+                .query_row(params![summary, path], |row| row.get(0))?;
+            let mounted = self
+                .ready
+                .inventory
+                .mount_record_for_path("python", &path)?;
+            let cause = match (persisted, mounted) {
+                _ if removal => Some(PythonUncoveredCause::Removed),
+                (None, _) => Some(PythonUncoveredCause::Added),
+                (_, mounted) if covered => {
+                    // The shared witness joins a mount to cover a member.
+                    debug_assert!(mounted.is_some(), "covered without a mount: {path:?}");
+                    None
+                }
+                (Some((persisted_blob, persisted_oid)), Some(mounted)) => {
+                    let before =
+                        member_input_selected(conn, "python", persisted_blob, &persisted_oid)?;
+                    let after = member_input_selected(
+                        conn,
+                        "python",
+                        mounted.blob_id(),
+                        &mounted.blob_oid().to_string(),
+                    )?;
+                    Some(match (&before, &after) {
+                        (Some(before), Some(after)) => {
+                            // A selected summary is current, so its recorded
+                            // input equals `before`; an equal `after` would
+                            // have satisfied the shared witness.
+                            debug_assert_ne!(
+                                before, after,
+                                "uncovered although the member input is unchanged: {path:?}"
+                            );
+                            PythonUncoveredCause::InputChanged
+                        }
+                        _ => PythonUncoveredCause::InputUnproved,
+                    })
+                }
+                _ => Some(PythonUncoveredCause::InputUnproved),
+            };
+            match cause {
+                Some(cause) => uncovered.push((path, cause)),
+                None => retained.push(path),
+            }
+        }
+        Ok(PythonSummaryCoverage::new(retained, uncovered))
+    }
+
+    /// The typed reason that one uncovered member leaves summary-dependent answers
+    /// open. The label is also the reverse obligation, so both directions agree.
+    pub(super) fn python_uncovered_reason(
+        &self,
+        path: &str,
+        cause: &str,
+    ) -> (String, ResolutionIncompleteReason) {
+        let label = format!("python_summary_uncovered:{path}:{cause}");
+        let mut hash = CanonicalHasher::new(b"python-summary-uncovered:v1");
+        hash.field("label", label.as_bytes());
+        let reason = self.ready.context_identities.named_semantic(
+            hash.finish(),
+            "python_summary_uncovered",
+            crate::analyzer::resolution::ReasonDeterminism::Unaudited,
+            &label,
+        );
+        (
+            label,
+            ResolutionIncompleteReason::UnsupportedSemantic(reason),
+        )
+    }
+
+    /// The labels of the typed reasons in `python_coverage_completion`, for
+    /// diagnostics that carry text instead of a completion.
+    pub(super) fn python_coverage_labels(
+        &self,
+        environment: &PythonSelectedEnvironment,
+    ) -> Vec<String> {
+        environment
+            .coverage
+            .unusable()
+            .into_iter()
+            .map(|(path, cause)| self.python_uncovered_reason(path, cause).0)
+            .collect()
+    }
+
+    /// Forward answers read summary rows for imports, providers and global
+    /// absence. An uncovered member can change any of them for other members, so
+    /// every forward binding of the request stays incomplete (never empty) until a
+    /// normal refresh derives a summary that describes the overlay.
+    pub(super) fn python_coverage_completion(
+        &self,
+        environment: &PythonSelectedEnvironment,
+    ) -> ResolutionCompletion {
+        let reasons = environment
+            .coverage
+            .unusable()
+            .into_iter()
+            .map(|(path, cause)| self.python_uncovered_reason(path, cause).1)
+            .collect::<Vec<_>>();
+        if reasons.is_empty() {
+            ResolutionCompletion::Complete
+        } else {
+            ResolutionCompletion::incomplete(reasons)
+        }
+    }
+}
+
+impl SelectedResolutionOperation<'_, '_> {
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-support"))]
     pub fn python_native_reverse_confirmation(
@@ -972,6 +1155,7 @@ impl SelectedResolutionOperation<'_, '_> {
             &PythonSelectedEnvironment {
                 summary,
                 python_version,
+                coverage: self.python_summary_coverage(summary)?,
             },
             targets,
             PythonReverseRequest {
@@ -987,20 +1171,23 @@ impl SelectedResolutionOperation<'_, '_> {
 
     /// Graph consumers share the reverse inventory's selected-environment loss
     /// evidence, without nominating targets or confirming reverse references.
-    /// Returns obligation labels and the callers with unknown placement.
+    /// Returns obligation labels and the callers with unknown placement, or
+    /// `None` when the selected environment no longer matches the selected blobs.
     #[doc(hidden)]
     pub fn python_graph_input_evidence(
         &self,
         environment: &PythonSelectedEnvironment,
         cancellation: &CancellationToken,
-    ) -> Result<(Vec<String>, Vec<String>)> {
-        let view = PythonReverseView::select(self, environment.summary, cancellation)?;
+    ) -> Result<Option<(Vec<String>, Vec<String>)>> {
+        let Some(view) = PythonReverseView::select(self, environment, cancellation)? else {
+            return Ok(None);
+        };
         view.validate_current_use(self, cancellation)?;
         let mut labels = view.query_obligations;
         for obligation in view.obligations {
             labels.push(obligation.label);
         }
-        Ok((labels, view.unplaced))
+        Ok(Some((labels, view.unplaced)))
     }
 
     /// Classify a selected relative import only when this admitted reference
@@ -1039,10 +1226,12 @@ impl SelectedResolutionOperation<'_, '_> {
         let blob = mount.blob_id();
         let conn = self.ready.inventory.connection();
         let mut statement = conn.prepare_cached(
-            "SELECT DISTINCT authored.relative_level,authored.module_segments,json(authored.route),route.state,route.import_site
+            "SELECT DISTINCT authored.relative_level,authored.module_segments,json(authored.route),route.state,site.dense_id
              FROM python_binding_imports authored
-             JOIN resolution_unit_summary_members member ON member.summary_id=?2 AND member.blob_id=authored.blob_id AND member.rel_path=?3
-             JOIN python_unit_summary_imports route ON route.summary_id=member.summary_id AND route.member_ordinal=member.member_ordinal AND route.import_site=authored.import_site
+             JOIN temp.selected_unit_member_mounts selected ON selected.summary_id=?2 AND selected.blob_id=authored.blob_id
+             JOIN resolution_unit_summary_members member ON member.summary_id=selected.summary_id AND member.member_ordinal=selected.member_ordinal AND member.rel_path=?3
+             JOIN python_unit_summary_imports route ON route.summary_id=member.summary_id AND route.member_ordinal=member.member_ordinal
+             CROSS JOIN temp.surface_dense site ON site.blob_id=selected.blob_id AND site.id_space=1 AND site.surface_ordinal=route.import_surface_ordinal AND site.dense_id=authored.import_site
              WHERE authored.blob_id=?1
                AND authored.relative_level>0 AND route.importer_container<>'' AND route.target_container=''
                AND route.state IN ('provider_open','relative_context_open')",
@@ -1059,6 +1248,24 @@ impl SelectedResolutionOperation<'_, '_> {
                 ))
             },
         )?;
+        // A from-import's bound name is the import's own reference site, not a
+        // demand for the route. Only a different reference proves it is used.
+        let mut bound_name_references = HashMap::<u32, Vec<u32>>::default();
+        for row in conn
+            .prepare_cached(
+                "SELECT import_site,target_reference FROM resolution_root_import_demands \
+                 WHERE blob_id=?1 AND target_reference IS NOT NULL",
+            )?
+            .query_map([blob], |row| {
+                Ok((row.get::<_, u32>(0)?, row.get::<_, u32>(1)?))
+            })?
+        {
+            let (import_site, reference) = row?;
+            bound_name_references
+                .entry(import_site)
+                .or_default()
+                .push(reference);
+        }
         let mut routes = Vec::new();
         for row in rows {
             let (level, segments, route, state, site) = row?;
@@ -1090,7 +1297,13 @@ impl SelectedResolutionOperation<'_, '_> {
                 })
                 .filter_map(|answer| answer.site_metadata())
                 .collect::<Vec<_>>();
-            let used = matching.iter().any(|metadata| metadata.site_kind() != brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteKind::ModuleReference);
+            let own_binding = bound_name_references.get(&site);
+            let used = matching.iter().any(|metadata| {
+                metadata.site_kind()
+                    != brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteKind::ModuleReference
+                    && !own_binding
+                        .is_some_and(|references| references.contains(&metadata.site().get()))
+            });
             let mut route: Vec<String> = serde_json::from_str(&route).map_err(|error| {
                 StoreError::corrupt(format!("invalid Python import route: {error}"))
             })?;
@@ -1165,10 +1378,7 @@ impl SelectedResolutionOperation<'_, '_> {
         targets: &[CodeUnit],
         request: PythonReverseRequest<'_>,
     ) -> Result<PythonNativeReverseResult> {
-        let PythonSelectedEnvironment {
-            summary,
-            python_version,
-        } = *environment;
+        let python_version = environment.python_version;
         let cancel = request.cancellation;
         if let Some(reason) = request.stop_reason(0) {
             return Ok(PythonNativeReverseResult {
@@ -1233,7 +1443,23 @@ impl SelectedResolutionOperation<'_, '_> {
                 .inventory
                 .account_committed_request_changes(changed as u64);
         }
-        let view = PythonReverseView::select(self, summary, cancel)?;
+        let Some(view) = PythonReverseView::select(self, environment, cancel)? else {
+            return Ok(PythonNativeReverseResult {
+                targets: Vec::new(),
+                unavailable: targets
+                    .iter()
+                    .cloned()
+                    .map(|target| PythonNativeReverseUnavailableTarget {
+                        target,
+                        reason: "python_environment_unavailable".into(),
+                    })
+                    .collect(),
+                inventory: String::new(),
+                query_obligations: Vec::new(),
+                nominated_paths: Vec::new(),
+                unprocessed: Vec::new(),
+            });
+        };
         view.validate_current_use(self, cancel)?;
         let mut output = view.inventory.join("\n");
         output.push('\n');
@@ -1374,6 +1600,7 @@ impl SelectedResolutionOperation<'_, '_> {
             let candidates = super::reverse_nomination::ReverseCandidateSet {
                 locators,
                 names: Vec::new(),
+                completion: ResolutionCompletion::Complete,
             };
             output.push_str(&format!("nominations={}\n", candidates.locators.len()));
             for locator in &candidates.locators {
@@ -1417,8 +1644,12 @@ impl SelectedResolutionOperation<'_, '_> {
                 .extend(constructions.obligations.iter().cloned());
             // Required contexts are selected before checking surviving hits,
             // including admitted callers with no ordinary references.
-            let contexts = conn.prepare_cached("SELECT mounts.mount_ordinal,mounts.blob_id,mounts.persisted_relative_path FROM temp.selected_resolution_mounts mounts JOIN resolution_unit_summary_members members ON members.summary_id=?1 AND members.blob_id=mounts.blob_id AND members.rel_path=mounts.persisted_relative_path WHERE mounts.storage_language='python' ORDER BY mounts.mount_ordinal")?
-                .query_map([summary], |row| Ok((row.get::<_,u32>(0)?,row.get::<_,i64>(1)?,row.get::<_,String>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            // The selected mount inventory owns membership, so this enumeration and
+            // the nominations below read the same set. Summary coverage is separate
+            // evidence (an obligation above); an overlay member the persisted
+            // summary does not contain stays here with that obligation.
+            let contexts = conn.prepare_cached("SELECT mounts.mount_ordinal,mounts.blob_id,mounts.persisted_relative_path FROM temp.selected_resolution_mounts mounts WHERE mounts.storage_language='python' ORDER BY mounts.mount_ordinal")?
+                .query_map([], |row| Ok((row.get::<_,u32>(0)?,row.get::<_,i64>(1)?,row.get::<_,String>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
             for (mount, blob, path) in contexts {
                 if request.scope.is_some_and(|scope| {
                     !scope.allows(&ProjectFile::new(self.ready.project.root(), &path))
@@ -2161,7 +2392,9 @@ impl PythonFieldIdentity<'_, '_, '_> {
                   AND provider.state IN ('selected','alternative')
                  JOIN resolution_unit_summary_members provider_member ON provider_member.summary_id=provider.summary_id
                   AND provider_member.member_ordinal=provider.member_ordinal
-                 WHERE imports.summary_id=?1 AND caller.blob_id=?2 AND caller.rel_path=?3 AND imports.import_site=?4")?.query_row(
+                 JOIN temp.selected_unit_member_mounts selected ON selected.summary_id=caller.summary_id AND selected.member_ordinal=caller.member_ordinal
+                 CROSS JOIN temp.surface_dense site ON site.blob_id=selected.blob_id AND site.id_space=1 AND site.surface_ordinal=imports.import_surface_ordinal
+                 WHERE imports.summary_id=?1 AND selected.blob_id=?2 AND caller.rel_path=?3 AND site.dense_id=?4")?.query_row(
                 params![self.summary, caller_blob, caller, site, field.path], |row| row.get(0),
             )?;
             if provider_matches != Some(true) {
@@ -2442,6 +2675,8 @@ impl reverse::ReverseScopedLifecycle for PythonReverseLifecycle<'_, '_, '_> {
                                                 ResolutionIncompleteReason::ReceiverBudgetExhausted(_) => "receiver_budget_exhausted".into(),
                                                 ResolutionIncompleteReason::TimeBudgetExceeded(_) => "time_budget_exceeded".into(),
                                                 ResolutionIncompleteReason::UnmountedFile {..} => "unmounted_file".into(),
+                                                ResolutionIncompleteReason::Unclassified(_) => "unclassified".into(),
+                                                ResolutionIncompleteReason::OverlayFrontierUnknown(_) => "overlay_frontier_unknown".into(),
                                             };
                                             obligations.push(label);
                                         }
@@ -2710,6 +2945,7 @@ impl PythonReverseFiles<'_, '_, '_> {
                 let reason = self.operation.ready.context_identities.named_semantic(
                     hash.finish(),
                     "python_reverse_locator_missing",
+                    crate::analyzer::resolution::ReasonDeterminism::Unaudited,
                     &label,
                 );
                 for &context in &required {
@@ -2744,6 +2980,7 @@ impl PythonReverseFiles<'_, '_, '_> {
                 let reason = self.operation.ready.context_identities.named_semantic(
                     hash.finish(),
                     "python_unknown_member_name",
+                    crate::analyzer::resolution::ReasonDeterminism::Unaudited,
                     &label,
                 );
                 rendered
@@ -2838,6 +3075,7 @@ impl PythonReverseFiles<'_, '_, '_> {
                 let open_reason = self.operation.ready.context_identities.named_semantic(
                     hash.finish(),
                     "python_named_argument_open",
+                    crate::analyzer::resolution::ReasonDeterminism::Unaudited,
                     locator.relative_path(),
                 );
                 ResolutionCompletion::incomplete([ResolutionIncompleteReason::UnsupportedSemantic(
@@ -3080,6 +3318,7 @@ impl reverse::ReverseFileHooks<Vec<SelectedSemanticLocator>> for PythonReverseFi
                 let reason = self.operation.ready.context_identities.named_semantic(
                     hash.finish(),
                     "python_resolution_budget_exceeded",
+                    crate::analyzer::resolution::ReasonDeterminism::Unaudited,
                     label,
                 );
                 (

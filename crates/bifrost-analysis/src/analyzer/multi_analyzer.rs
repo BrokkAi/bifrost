@@ -81,6 +81,7 @@ pub trait LanguageAnalyzer:
     fn test_detection_provider(&self) -> Option<&dyn TestDetectionProvider>;
     /// `listing` is the workspace listing read the enclosing update already
     /// took, handed to the delegate so it certifies without a second walk.
+    /// Supplied paths have already been resolved against that listing.
     fn update(
         &self,
         changed_files: &BTreeSet<ProjectFile>,
@@ -94,6 +95,7 @@ pub trait LanguageAnalyzer:
         language_for_file(file) == language
             || self.analyzer().is_analyzed(file)
             || is_language_configuration_input(language, file)
+            || is_language_signature_input(language, file)
             || self.read_configuration_file(file)
     }
     /// Whether this snapshot read `file` as configuration while answering
@@ -106,6 +108,15 @@ pub trait LanguageAnalyzer:
     fn update_all_with_progress(
         &self,
         progress: Option<BuildProgress>,
+    ) -> Box<dyn LanguageAnalyzer>;
+    fn update_all_with_membership(
+        &self,
+        progress: Option<BuildProgress>,
+        membership: Arc<crate::analyzer::tree_sitter_analyzer::GenerationWorkspaceMembership>,
+    ) -> Box<dyn LanguageAnalyzer>;
+    fn with_generation_membership(
+        &self,
+        membership: Arc<crate::analyzer::tree_sitter_analyzer::GenerationWorkspaceMembership>,
     ) -> Box<dyn LanguageAnalyzer>;
     fn as_any(&self) -> &dyn std::any::Any;
     fn clone_box(&self) -> Box<dyn LanguageAnalyzer>;
@@ -184,12 +195,23 @@ impl AnalyzerDelegate {
         LanguageAnalyzer::should_receive_changed_file(self.inner.as_ref(), language, file)
     }
 
-    pub(crate) fn update_all_with_progress(&self, progress: Option<BuildProgress>) -> Self {
+    pub(crate) fn update_all_with_membership(
+        &self,
+        progress: Option<BuildProgress>,
+        membership: Arc<crate::analyzer::tree_sitter_analyzer::GenerationWorkspaceMembership>,
+    ) -> Self {
         Self {
-            inner: LanguageAnalyzer::update_all_with_progress(self.inner.as_ref(), progress),
+            inner: self.inner.update_all_with_membership(progress, membership),
         }
     }
-
+    fn with_generation_membership(
+        &self,
+        membership: Arc<crate::analyzer::tree_sitter_analyzer::GenerationWorkspaceMembership>,
+    ) -> Self {
+        Self {
+            inner: self.inner.with_generation_membership(membership),
+        }
+    }
     pub fn as_any(&self) -> &dyn std::any::Any {
         LanguageAnalyzer::as_any(self.inner.as_ref())
     }
@@ -210,6 +232,10 @@ pub(crate) fn build_language_delegate(
     // delegates share the store and generation identities.
     store_context.live_paths =
         Arc::new(crate::analyzer::store::liveness::LivePathMap::trust_filesystem_generation());
+    // The workspace captured this generation's membership before the fan-out.
+    // Mark it prepared so construction shares that listing instead of
+    // enumerating the worktree again for every delegate.
+    store_context.prepared_membership = store_context.membership.clone();
     crate::analyzer::languages::language_support_for_hook(language, "build_analyzer")
         .expect("Language::None is filtered before delegate build")
         .build_analyzer(project, config, store_context, progress)
@@ -234,6 +260,8 @@ pub struct WorkspaceBuildContext {
     #[cfg(any(test, feature = "test-support"))]
     startup_oid_batches: Option<Arc<AtomicUsize>>,
     requested_languages: Option<BTreeSet<Language>>,
+    pub(crate) activation_catalog:
+        Arc<std::sync::Mutex<Option<crate::analyzer::packs_document::WorkspaceActivationCatalog>>>,
 }
 
 impl WorkspaceBuildContext {
@@ -250,6 +278,7 @@ impl WorkspaceBuildContext {
             #[cfg(any(test, feature = "test-support"))]
             startup_oid_batches: None,
             requested_languages: requested_languages.filter(|languages| !languages.is_empty()),
+            activation_catalog: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -490,7 +519,7 @@ impl WorkspaceBuildContext {
                 .is_none_or(|languages| languages.contains(&language))
     }
 
-    fn allowed_languages_for_files<'file>(
+    pub(crate) fn allowed_languages_for_files<'file>(
         &self,
         files: impl Iterator<Item = &'file ProjectFile>,
     ) -> BTreeSet<Language> {
@@ -511,14 +540,6 @@ impl WorkspaceBuildContext {
         )
     }
 
-    pub(crate) fn project_languages(&self) -> BTreeSet<Language> {
-        let files = self
-            .project
-            .all_files_shared()
-            .expect("failed to list workspace files while refreshing analyzer languages");
-        self.allowed_languages_for_files(files.iter())
-    }
-
     /// The workspace listing read an update takes once: the languages it keeps
     /// alive come from its files, and its delegates certify from the whole of it.
     pub(crate) fn project_listing(
@@ -526,6 +547,17 @@ impl WorkspaceBuildContext {
     ) -> std::io::Result<(BTreeSet<Language>, SharedWorkspaceFileListing)> {
         let listing = self.project.all_files_with_omissions()?;
         Ok((self.allowed_languages_for_files(listing.0.iter()), listing))
+    }
+
+    pub(crate) fn with_membership(
+        &self,
+        membership: Arc<crate::analyzer::tree_sitter_analyzer::GenerationWorkspaceMembership>,
+    ) -> Arc<Self> {
+        let mut next = self.clone();
+        next.store_context.workspace_listing_complete = membership.listing().is_ok();
+        next.store_context.membership = Some(membership);
+        next.store_context.workspace_snapshot = None;
+        Arc::new(next)
     }
 
     pub(crate) fn build_delegate(
@@ -568,6 +600,28 @@ pub fn is_language_configuration_input(language: Language, file: &ProjectFile) -
         )
 }
 
+/// Whether `file` is a workspace signature file of `language`, such as a
+/// Ruby `sig/**/*.rbs` file (#12967). It is not a source and not a
+/// configuration input: the delegate publishes its facts and updates its
+/// signature inventory without a rebuild. The workspace analyzer routes an
+/// edit to one to the delegate, and the MCP file watcher watches every
+/// directory that holds one.
+pub fn is_language_signature_input(language: Language, file: &ProjectFile) -> bool {
+    crate::analyzer::languages::language_support_for_hook(language, "is_signature_input")
+        .is_some_and(|support| support.is_signature_input(file))
+}
+
+/// The workspace-relative directory a file watcher watches recursively for
+/// the signature input `file` of `language`; see
+/// [`is_language_signature_input`].
+pub fn language_signature_input_root(
+    language: Language,
+    file: &ProjectFile,
+) -> Option<std::path::PathBuf> {
+    crate::analyzer::languages::language_support_for_hook(language, "signature_input_root")
+        .and_then(|support| support.signature_input_root(file))
+}
+
 fn group_files_by_language(
     files: &[ProjectFile],
     mut language_for: impl FnMut(&ProjectFile) -> Language,
@@ -596,6 +650,8 @@ where
 
 pub struct MultiAnalyzer {
     pub(crate) pending_updates: BTreeSet<ProjectFile>,
+    // A failed full capture owes all changes, including paths no watcher reported.
+    pub(crate) full_refresh_pending: bool,
     update_error: Option<crate::analyzer::store::StoreError>,
     delegates: BTreeMap<Language, AnalyzerDelegate>,
     build_context: Option<Arc<WorkspaceBuildContext>>,
@@ -644,6 +700,7 @@ impl Clone for MultiAnalyzer {
     fn clone(&self) -> Self {
         Self {
             pending_updates: self.pending_updates.clone(),
+            full_refresh_pending: self.full_refresh_pending,
             update_error: self.update_error.clone(),
             delegates: self.delegates.clone(),
             build_context: self.build_context.clone(),
@@ -691,9 +748,45 @@ impl MultiAnalyzer {
             let _maintenance = brokk_bifrost_core::analyzer::carried_context::push(None);
             let carried_context =
                 brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();
+            let project = self
+                .build_context
+                .as_ref()
+                .map(|context| context.project.as_ref())
+                .or_else(|| {
+                    self.delegates
+                        .values()
+                        .next()
+                        .map(|delegate| delegate.analyzer().project())
+                });
+            if let Some(project) = project {
+                project.invalidate_cached_file_listing();
+            }
+            let listing = match project
+                .map(|project| project.all_files_with_omissions())
+                .transpose()
+            {
+                Ok(listing) => listing,
+                Err(error) => {
+                    let mut failed = self.failed_update(error, &BTreeSet::new());
+                    failed.full_refresh_pending = true;
+                    return failed;
+                }
+            };
+            let membership =
+                crate::analyzer::tree_sitter_analyzer::GenerationWorkspaceMembership::new(
+                    listing,
+                    self.snapshot_caches.retention_budget(),
+                );
+            let build_context = self
+                .build_context
+                .as_ref()
+                .map(|context| context.with_membership(Arc::clone(&membership)));
             let mut delegates = self.delegates.clone();
-            if let Some(context) = &self.build_context {
-                let active_languages = context.project_languages();
+            if let Some(context) = &build_context {
+                let active_languages = membership
+                    .listing()
+                    .map(|listing| context.allowed_languages_for_files(listing.0.iter()))
+                    .unwrap_or_default();
                 delegates.retain(|language, _| active_languages.contains(language));
                 for language in active_languages {
                     if let std::collections::btree_map::Entry::Vacant(entry) =
@@ -717,18 +810,21 @@ impl MultiAnalyzer {
                         without_project_reads(|| {
                             (
                                 *language,
-                                delegate.update_all_with_progress(progress.clone()),
+                                if self.delegates.contains_key(language) {
+                                    delegate.update_all_with_membership(
+                                        progress.clone(),
+                                        Arc::clone(&membership),
+                                    )
+                                } else {
+                                    delegate.clone()
+                                },
                             )
                         })
                     })
                 })
                 .collect();
-            Self::new_with_build_context(
-                delegates,
-                self.derived_layer_budget_bytes,
-                self.build_context.clone(),
-            )
-            .with_snapshot_caches(self.snapshot_caches.carry_content_keyed_values_forward())
+            Self::new_with_build_context(delegates, self.derived_layer_budget_bytes, build_context)
+                .with_snapshot_caches(self.snapshot_caches.carry_content_keyed_values_forward())
         })
     }
 
@@ -805,6 +901,9 @@ impl MultiAnalyzer {
         };
         Self {
             pending_updates: BTreeSet::new(),
+            full_refresh_pending: build_context
+                .as_ref()
+                .is_some_and(|context| !context.store_context.workspace_listing_complete),
             update_error: None,
             delegates,
             build_context: build_context.clone(),
@@ -844,6 +943,10 @@ impl MultiAnalyzer {
         self.pending_updates.clear();
     }
 
+    pub(crate) fn has_update_failure(&self) -> bool {
+        self.update_error.is_some()
+    }
+
     pub(crate) fn failed_update(
         &self,
         error: std::io::Error,
@@ -876,6 +979,7 @@ impl MultiAnalyzer {
         };
         Self {
             pending_updates: self.pending_updates.clone(),
+            full_refresh_pending: self.full_refresh_pending,
             update_error: self.update_error.clone(),
             delegates: self
                 .delegates
@@ -1265,6 +1369,7 @@ impl ImportAnalysisProvider for MultiAnalyzer {
         let grouped = group_files_by_language(files, |file| self.dispatch_language(file));
         let mut out: HashMap<ProjectFile, HashSet<ProjectFile>> = HashMap::default();
         let mut complete = true;
+        let mut membership_cause = None;
         for (language, group) in grouped {
             if cancellation.is_cancelled() {
                 return None;
@@ -1285,14 +1390,22 @@ impl ImportAnalysisProvider for MultiAnalyzer {
                 continue;
             };
             complete &= outcome.complete;
+            if let Some(cause) = outcome.membership_cause {
+                // This is one workspace's C# membership fact. Delegates that
+                // forward it must agree; a conflicting cause is a broken view.
+                if let Some(previous) = membership_cause {
+                    assert_eq!(previous, cause, "conflicting delegate membership causes");
+                }
+                membership_cause = Some(cause);
+            }
             for (file, targets) in outcome.dependencies {
                 out.entry(file).or_default().extend(targets);
             }
         }
-        Some(if complete {
-            AdditionalFileDependencies::complete(out)
-        } else {
-            AdditionalFileDependencies::incomplete(out)
+        Some(AdditionalFileDependencies {
+            dependencies: out,
+            complete,
+            membership_cause,
         })
     }
 
@@ -1427,7 +1540,9 @@ impl MultiAnalyzer {
         descendants.edges.sort();
         descendants.edges.dedup();
         if !descendants.is_complete() {
-            crate::analyzer::record_descendant_query_failure(self);
+            // Typed open answers retain definite edges. Do not poison later
+            // steps of the same walk with content uncertainty (#12141).
+            self.record_unattributed_read();
             return Ok(descendants);
         }
         if crate::analyzer::read_attribution_records_reads(|| IAnalyzer::read_ledger_attached(self))
@@ -1562,7 +1677,7 @@ impl HierarchyQuery for UnenteredHierarchyQuery<'_> {
     fn direct_ancestors(&mut self, unit: &CodeUnit) -> HierarchyAnswer {
         self.provider(unit)
             .map(|provider| provider.get_direct_ancestors(unit))
-            .unwrap_or_default()
+            .unwrap_or_else(|| HierarchyAnswer::incomplete(brokk_bifrost_core::analyzer::capabilities::HierarchyOpenReason::DescendantIndexUnavailable))
     }
     fn direct_descendants(&mut self, unit: &CodeUnit) -> HierarchyAnswer {
         let cancellation = crate::cancellation::CancellationToken::new();
@@ -1581,7 +1696,7 @@ impl HierarchyQuery for UnenteredHierarchyQuery<'_> {
     ) -> Result<HierarchyAnswer, Cancelled> {
         self.provider(unit)
             .map(|provider| provider.get_direct_ancestors_within(unit, scope))
-            .unwrap_or_else(|| Ok(HierarchyAnswer::default()))
+            .unwrap_or_else(|| Ok(HierarchyAnswer::incomplete(brokk_bifrost_core::analyzer::capabilities::HierarchyOpenReason::DescendantIndexUnavailable)))
     }
     fn direct_descendants_within(
         &mut self,
@@ -1591,7 +1706,7 @@ impl HierarchyQuery for UnenteredHierarchyQuery<'_> {
         match self.provider(unit) {
             Some(provider) => provider.get_direct_descendants_within(unit, scope),
             None if scope.cancellation().is_cancelled() => Err(Cancelled),
-            None => Ok(HierarchyAnswer { open: vec![brokk_bifrost_core::analyzer::capabilities::HierarchyOpenReason::DescendantIndexUnavailable], ..Default::default() }),
+            None => Ok(HierarchyAnswer { open: vec![brokk_bifrost_core::analyzer::capabilities::HierarchyOpenReason::DescendantIndexUnavailable], ..HierarchyAnswer::complete(Vec::new()) }),
         }
     }
 }
@@ -1692,7 +1807,7 @@ impl TypeHierarchyProvider for MultiAnalyzer {
         self.delegate_for_code_unit(code_unit)
             .and_then(AnalyzerDelegate::type_hierarchy_provider)
             .map(|provider| provider.get_direct_ancestors(code_unit))
-            .unwrap_or_default()
+            .unwrap_or_else(|| HierarchyAnswer::incomplete(brokk_bifrost_core::analyzer::capabilities::HierarchyOpenReason::DescendantIndexUnavailable))
     }
 
     fn member_family_ancestors(
@@ -1774,7 +1889,7 @@ impl TypeHierarchyProvider for MultiAnalyzer {
             .and_then(AnalyzerDelegate::type_hierarchy_provider)
         {
             Some(provider) => provider.get_direct_ancestors_within(code_unit, scope),
-            None => Ok(HierarchyAnswer::default()),
+            None => Ok(HierarchyAnswer::incomplete(brokk_bifrost_core::analyzer::capabilities::HierarchyOpenReason::DescendantIndexUnavailable)),
         }
     }
 
@@ -1793,7 +1908,7 @@ impl TypeHierarchyProvider for MultiAnalyzer {
             None if scope.cancellation().is_cancelled() => {
                 return Err(brokk_bifrost_core::analyzer::capabilities::Cancelled);
             }
-            None => HierarchyAnswer { open: vec![brokk_bifrost_core::analyzer::capabilities::HierarchyOpenReason::DescendantIndexUnavailable], ..HierarchyAnswer::default() },
+            None => HierarchyAnswer { open: vec![brokk_bifrost_core::analyzer::capabilities::HierarchyOpenReason::DescendantIndexUnavailable], ..HierarchyAnswer::complete(Vec::new()) },
         };
         self.complete_workspace_descendants(code_unit, scope, token, descendants)
     }
@@ -1992,7 +2107,15 @@ impl CodeUnitIndex for MultiAnalyzer {
                     Ok(files) => (*permit.publish_complete(files)).clone(),
                     Err(files) => {
                         receipt.replay();
-                        (*permit.publish_request_owned(files)).clone()
+                        if receipt.store_failed() {
+                            // Concurrent waiters must not take this listing:
+                            // dropping the permit sends each to read for
+                            // itself and record its own store failure.
+                            drop(permit);
+                            files
+                        } else {
+                            (*permit.publish_request_owned(files)).clone()
+                        }
                     }
                 }
             }
@@ -2018,6 +2141,22 @@ impl CodeUnitIndex for MultiAnalyzer {
         self.delegate_for_code_unit(code_unit)
             .map(|delegate| delegate.analyzer().location_ranges(code_unit))
             .unwrap_or_default()
+    }
+
+    fn owns_source_file(&self, file: &ProjectFile) -> bool {
+        self.delegates
+            .values()
+            .any(|delegate| delegate.analyzer().owns_source_file(file))
+    }
+
+    fn indexed_source_files(&self) -> crate::analyzer::QueryBatch<ProjectFile> {
+        let mut inventory = crate::analyzer::QueryBatch::complete(Vec::new(), 0);
+        for delegate in self.delegates.values() {
+            inventory = inventory.merge(delegate.analyzer().indexed_source_files());
+        }
+        let mut seen = std::collections::HashSet::new();
+        inventory.rows.retain(|file| seen.insert(file.clone()));
+        inventory
     }
 
     fn indexed_blob_oid(&self, file: &ProjectFile) -> Option<git2::Oid> {
@@ -2330,6 +2469,22 @@ impl CodeUnitIndex for MultiAnalyzer {
 }
 
 impl IAnalyzer for MultiAnalyzer {
+    #[cfg(feature = "test-support")]
+    fn retention_census_for_test(
+        &self,
+        census: &mut brokk_bifrost_core::retention_census::RetentionCensus,
+    ) {
+        for delegate in self.delegates.values() {
+            delegate.analyzer().retention_census_for_test(census);
+        }
+        census.record_unknown(
+            "analyzer.multi_generation",
+            brokk_bifrost_core::retention_census::FamilyLifetime::Persistent,
+            brokk_bifrost_core::retention_census::UnknownKind::Coverage,
+            "delegate_map_and_merged_projections_not_structurally_walked",
+        );
+    }
+
     fn certify_selected_configuration(
         &self,
         language: Language,
@@ -2436,15 +2591,22 @@ impl IAnalyzer for MultiAnalyzer {
                     .analyzer()
                     .statement_assessments_for(workspace, procedure, cancellation)
             }
-            None => Arc::new(brokk_bifrost_core::retention_budget::Accounted::uncharged(
-                crate::analyzer::semantic::statement_entries::AccountedStatementAssessments(
+            None => {
+                // No memo captures this build; its verdict joins the current
+                // captures, where its ambient marks went.
+                let (assessments, reuse) =
                     crate::analyzer::semantic::statement_entries::build_statement_assessments(
                         workspace,
                         procedure,
                         cancellation,
+                    );
+                self.join_reuse_verdict(reuse);
+                Arc::new(brokk_bifrost_core::retention_budget::Accounted::uncharged(
+                    crate::analyzer::semantic::statement_entries::AccountedStatementAssessments::new(
+                        assessments,
                     ),
-                ),
-            )),
+                ))
+            }
         }
     }
 
@@ -2459,9 +2621,10 @@ impl IAnalyzer for MultiAnalyzer {
     fn statement_source_facts(
         &self,
         file: &ProjectFile,
+        reuse: &mut brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict,
     ) -> Option<Arc<brokk_bifrost_core::analyzer::statement_facts::StatementFactRows>> {
         self.delegate_for_file(file)
-            .and_then(|delegate| delegate.analyzer().statement_source_facts(file))
+            .and_then(|delegate| delegate.analyzer().statement_source_facts(file, reuse))
     }
 
     fn cpp_class_source_facts(
@@ -2647,7 +2810,6 @@ impl IAnalyzer for MultiAnalyzer {
             .lock()
             .expect("multi-analyzer query context mutex poisoned");
         if !contexts.iter().any(|active| Arc::ptr_eq(active, context)) {
-            crate::analyzer::i_analyzer::inherit_query_incompleteness(context);
             contexts.push(Arc::clone(context));
             if context.read_ledger().is_some() {
                 self.attached_read_ledgers.fetch_add(1, Ordering::Relaxed);
@@ -2717,6 +2879,10 @@ impl IAnalyzer for MultiAnalyzer {
     /// delegates is not lost. Broadcast uses the composite registry. Forwarding
     /// as well would only re-record the same key, which a set-valued ledger
     /// would drop anyway.
+    fn supports_selected_read_recording(&self) -> bool {
+        true
+    }
+
     fn record_read(&self, key: crate::analyzer::read_ledger::ReadKey) {
         self.record_read_obligation(&key);
         if crate::analyzer::i_analyzer::record_read_on_attribution_frame(&key)
@@ -2813,6 +2979,22 @@ impl IAnalyzer for MultiAnalyzer {
         );
     }
 
+    fn join_reuse_verdict(
+        &self,
+        verdict: brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict,
+    ) {
+        crate::analyzer::i_analyzer::record_reuse_verdict(
+            verdict,
+            || IAnalyzer::read_ledger_attached(self),
+            || {
+                self.query_contexts
+                    .lock()
+                    .expect("multi-analyzer query context mutex poisoned")
+                    .clone()
+            },
+        );
+    }
+
     fn record_budget_dependences(&self, count: usize) {
         crate::analyzer::i_analyzer::record_budget_dependence(
             count,
@@ -2876,6 +3058,23 @@ impl IAnalyzer for MultiAnalyzer {
         crate::analyzer::i_analyzer::current_query_context_value(|context| {
             context.cancellation().cloned()
         })
+    }
+
+    fn active_query_semantic_model_overlay_read(
+        &self,
+    ) -> Option<crate::analyzer::semantic_model::runtime::SemanticModelOverlayRead> {
+        let contexts = self
+            .query_contexts
+            .lock()
+            .expect("multi-analyzer query context mutex poisoned");
+        crate::analyzer::i_analyzer::registered_query_context_value(
+            |context| {
+                contexts
+                    .iter()
+                    .any(|registered| Arc::ptr_eq(registered, context))
+            },
+            |context| context.semantic_model_overlay_read_override_for_current_thread(),
+        )
     }
 
     fn active_query_semantic_model_overlay(
@@ -3005,11 +3204,29 @@ impl IAnalyzer for MultiAnalyzer {
             .workspace_file_index_cell()
     }
 
+    fn workspace_file_inventory_cell(&self) -> Option<crate::analyzer::WorkspaceFileInventoryCell> {
+        self.delegates
+            .values()
+            .next()?
+            .analyzer()
+            .workspace_file_inventory_cell()
+    }
+
     /// The first delegate's memo, for the same reason as the cell above, and
     /// safely shared with lookups built directly over that delegate: every memo
     /// key names the language its answer was resolved in, and a
     /// language-scoped relational request is projected to exactly that
     /// delegate.
+    fn owned_lookup_memo(
+        &self,
+    ) -> Option<std::sync::Arc<crate::analyzer::read_verification::OwnedLookupMemo>> {
+        self.delegates
+            .values()
+            .next()?
+            .analyzer()
+            .owned_lookup_memo()
+    }
+
     fn definition_lookup_memo(
         &self,
     ) -> Option<std::sync::Arc<crate::analyzer::DefinitionLookupMemo>> {
@@ -3023,10 +3240,6 @@ impl IAnalyzer for MultiAnalyzer {
     /// Record once on the current scope and its enclosing chain. Delegates
     /// share those contexts, and an empty workspace needs the same recording
     /// path even though it has no delegate.
-    fn record_query_failure(&self, error: crate::analyzer::store::StoreError) {
-        crate::analyzer::i_analyzer::record_store_error_on_current_contexts(error);
-    }
-
     fn current_query_read_completion(&self) -> Result<(), QueryReadIncomplete> {
         crate::analyzer::i_analyzer::current_domain_read_completion()
     }
@@ -3090,7 +3303,14 @@ impl IAnalyzer for MultiAnalyzer {
         changed_files: &BTreeSet<ProjectFile>,
         supplied_listing: Option<&SharedWorkspaceFileListing>,
     ) -> Self {
-        let pending_changes = super::pending_update_paths(changed_files, &self.pending_updates);
+        if self.full_refresh_pending {
+            return self.update_all_with_progress(None);
+        }
+        let pending_changes = if supplied_listing.is_some() {
+            changed_files.clone()
+        } else {
+            super::pending_update_paths(changed_files, &self.pending_updates)
+        };
         let changed_files = &pending_changes;
         // Refresh inputs belong to no product, even when a query triggered it.
         // The outer scope covers serial discovery; each worker enters its own.
@@ -3101,12 +3321,14 @@ impl IAnalyzer for MultiAnalyzer {
             let carried_context =
                 brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();
             let mut delegates = self.delegates.clone();
-            if let Some(context) = &self.build_context {
+            if supplied_listing.is_none()
+                && let Some(context) = &self.build_context
+            {
                 context.project.revalidate_symlink_omissions(changed_files);
             }
             // The one listing read of this update: it names the live languages and
             // reaches every delegate, so none of them walks the workspace again.
-            let (active_languages, listing) = match &self.build_context {
+            let (mut active_languages, mut listing) = match &self.build_context {
                 Some(context) => {
                     let captured = match supplied_listing {
                         Some(listing) => (
@@ -3123,8 +3345,64 @@ impl IAnalyzer for MultiAnalyzer {
                     };
                     (Some(captured.0), Some(captured.1))
                 }
-                None => (None, None),
+                None => {
+                    let listing = match supplied_listing {
+                        Some(listing) => Some(listing.clone()),
+                        None => match self.delegates.values().next() {
+                            Some(delegate) => {
+                                match delegate.analyzer().project().all_files_with_omissions() {
+                                    Ok(listing) => Some(listing),
+                                    Err(error) => {
+                                        listing_read_error = Some(error.into());
+                                        return self.clone();
+                                    }
+                                }
+                            }
+                            None => None,
+                        },
+                    };
+                    (None, listing)
+                }
             };
+            // WorkspaceAnalyzer supplies already resolved paths. A direct
+            // IAnalyzer update owns that step before sharing its listing too.
+            let resolved_files = match (supplied_listing, &mut listing) {
+                (None, Some(listing)) => {
+                    match brokk_bifrost_core::analyzer::project::resolve_update_paths_with_refresh(
+                        self.project(),
+                        changed_files,
+                        listing,
+                        &|file| {
+                            self.delegates.keys().any(|language| {
+                                super::is_language_configuration_input(*language, file)
+                            })
+                        },
+                    ) {
+                        Ok(files) => {
+                            if let Some(context) = &self.build_context {
+                                active_languages =
+                                    Some(context.allowed_languages_for_files(listing.0.iter()));
+                            }
+                            files
+                        }
+                        Err(error) => {
+                            listing_read_error = Some(error.into());
+                            return self.clone();
+                        }
+                    }
+                }
+                _ => changed_files.clone(),
+            };
+            let changed_files = &resolved_files;
+            let membership =
+                crate::analyzer::tree_sitter_analyzer::GenerationWorkspaceMembership::new(
+                    listing.clone(),
+                    self.snapshot_caches.retention_budget(),
+                );
+            let build_context = self
+                .build_context
+                .as_ref()
+                .map(|context| context.with_membership(Arc::clone(&membership)));
             let missing_languages = self
                 .build_context
                 .as_ref()
@@ -3134,8 +3412,7 @@ impl IAnalyzer for MultiAnalyzer {
                 .filter(|language| !delegates.contains_key(language))
                 .collect::<BTreeSet<_>>();
             for language in missing_languages.iter().copied() {
-                let delegate = self
-                    .build_context
+                let delegate = build_context
                     .as_ref()
                     .expect("missing languages require a workspace build context")
                     .build_delegate(language)
@@ -3177,6 +3454,7 @@ impl IAnalyzer for MultiAnalyzer {
                                 && crate::analyzer::tree_sitter_analyzer::listing_may_withdraw_proof(
                                     delegate.analyzer().project(),
                                     listing.as_ref(),
+                                    *language,
                                 )
                                 .unwrap_or(true);
                             if relevant.is_empty()
@@ -3187,7 +3465,7 @@ impl IAnalyzer for MultiAnalyzer {
                             } else {
                                 (
                                     *language,
-                                    delegate.update(&relevant, listing.as_ref()),
+                                    delegate.with_generation_membership(Arc::clone(&membership)).update(&relevant, listing.as_ref()),
                                     true,
                                 )
                             }
@@ -3199,7 +3477,12 @@ impl IAnalyzer for MultiAnalyzer {
                 !missing_languages.is_empty() || updated.iter().any(|(_, _, changed)| *changed);
             let delegates = updated
                 .into_iter()
-                .map(|(language, delegate, _)| (language, delegate))
+                .map(|(language, delegate, _)| {
+                    (
+                        language,
+                        delegate.with_generation_membership(Arc::clone(&membership)),
+                    )
+                })
                 .filter(|(language, _)| {
                     active_languages
                         .as_ref()
@@ -3211,7 +3494,7 @@ impl IAnalyzer for MultiAnalyzer {
                 return Self::new_with_build_context(
                     delegates,
                     self.derived_layer_budget_bytes,
-                    self.build_context.clone(),
+                    build_context.clone(),
                 )
                 // The derived layers and usage graphs are keyed by workspace
                 // content (#2449), so a delegate change cannot make one of them
@@ -3226,10 +3509,15 @@ impl IAnalyzer for MultiAnalyzer {
             // stale can be served through them either way.
             Self {
                 pending_updates: self.pending_updates.clone(),
+                full_refresh_pending: self.full_refresh_pending,
                 update_error: self.update_error.clone(),
                 delegates,
-                build_context: self.build_context.clone(),
-                snapshot_caches: Arc::clone(&self.snapshot_caches),
+                build_context: build_context.clone(),
+                // Metadata-only generations carry derived products, while
+                // activation publication starts fresh for their new owner.
+                snapshot_caches: Arc::new(
+                    self.snapshot_caches.carry_content_keyed_values_forward(),
+                ),
                 derived_layer_budget_bytes: self.derived_layer_budget_bytes,
                 query_contexts: Arc::new(Mutex::new(Vec::new())),
                 attached_read_ledgers: Arc::new(AtomicUsize::new(0)),
@@ -3552,6 +3840,25 @@ impl IAnalyzer for MultiAnalyzer {
             .values()
             .flat_map(|delegate| delegate.analyzer().structural_fact_providers())
             .collect()
+    }
+
+    fn generation_membership(
+        &self,
+    ) -> &Arc<crate::analyzer::tree_sitter_analyzer::GenerationWorkspaceMembership> {
+        if let Some(context) = &self.build_context {
+            return context.store_context.membership.as_ref().unwrap_or_else(|| crate::analyzer::tree_sitter_analyzer::GenerationWorkspaceMembership::unavailable());
+        }
+        // Test-only manual assembly can join delegates from different snapshots.
+        // It owns a generation listing only after all delegates share one record.
+        if let Some(first) = self.delegates.values().next() {
+            let membership = first.analyzer().generation_membership();
+            if self.delegates.values().all(|delegate| {
+                Arc::ptr_eq(membership, delegate.analyzer().generation_membership())
+            }) {
+                return membership;
+            }
+        }
+        crate::analyzer::tree_sitter_analyzer::GenerationWorkspaceMembership::unavailable()
     }
 
     fn snapshot_caches(&self) -> Option<&crate::analyzer::AnalyzerSnapshotCaches> {
@@ -4066,14 +4373,23 @@ impl IAnalyzer for MultiAnalyzer {
             .is_some_and(|delegate| delegate.analyzer().contains_tests_for_changed_file(file))
     }
 
-    fn in_test_region(&self, code_unit: &CodeUnit) -> bool {
+    fn in_test_region(
+        &self,
+        code_unit: &CodeUnit,
+    ) -> Result<bool, crate::analyzer::QueryReadIncomplete> {
         self.delegate_for_file(code_unit.source())
-            .is_some_and(|delegate| delegate.analyzer().in_test_region(code_unit))
+            .map_or(Ok(false), |delegate| {
+                delegate.analyzer().in_test_region(code_unit)
+            })
     }
 
-    fn file_is_test_only(&self, file: &ProjectFile) -> bool {
-        self.delegate_for_file(file)
-            .is_some_and(|delegate| delegate.analyzer().file_is_test_only(file))
+    fn file_is_test_only(
+        &self,
+        file: &ProjectFile,
+    ) -> Result<bool, crate::analyzer::QueryReadIncomplete> {
+        self.delegate_for_file(file).map_or(Ok(false), |delegate| {
+            delegate.analyzer().file_is_test_only(file)
+        })
     }
 
     fn get_test_modules(&self, files: &[ProjectFile]) -> Vec<String> {

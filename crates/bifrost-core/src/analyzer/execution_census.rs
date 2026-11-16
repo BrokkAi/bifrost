@@ -32,6 +32,7 @@ static CAPTURES: AtomicU64 = AtomicU64::new(0);
 static CAPTURES_KEPT: AtomicU64 = AtomicU64::new(0);
 static CAPTURES_EXECUTION_DEPENDENT: AtomicU64 = AtomicU64::new(0);
 static CAPTURES_LATCH_EXTRA: AtomicU64 = AtomicU64::new(0);
+static CAPTURES_EXPLICIT_WEAKER: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     // The entry point that is marking on this thread. A ledger that receives
@@ -102,7 +103,12 @@ pub fn stop_observations() -> u64 {
 /// A capture closed. `kept` is whether today's channels let it be reused
 /// (no unattributed read, no reuse refusal, no execution dependence);
 /// `execution_dependent` is whether the ambient channel marked it.
-pub fn record_capture_closed(opened_at_stops: u64, kept: bool, execution_dependent: bool) {
+pub fn record_capture_closed(
+    opened_at_stops: u64,
+    kept: bool,
+    execution_dependent: bool,
+    explicit_weaker: bool,
+) {
     if !crate::profiling::enabled() {
         return;
     }
@@ -110,6 +116,9 @@ pub fn record_capture_closed(opened_at_stops: u64, kept: bool, execution_depende
     CAPTURES.fetch_add(1, Ordering::Relaxed);
     if execution_dependent {
         CAPTURES_EXECUTION_DEPENDENT.fetch_add(1, Ordering::Relaxed);
+    }
+    if explicit_weaker {
+        CAPTURES_EXPLICIT_WEAKER.fetch_add(1, Ordering::Relaxed);
     }
     if kept {
         CAPTURES_KEPT.fetch_add(1, Ordering::Relaxed);
@@ -129,6 +138,9 @@ pub struct Snapshot {
     pub captures_execution_dependent: u64,
     /// Kept captures a process-wide token latch would have refused.
     pub captures_latch_extra: u64,
+    /// Captures whose explicit reuse verdict was weaker than the ambient one:
+    /// a producer inside them has not migrated yet.
+    pub captures_explicit_weaker: u64,
 }
 
 pub fn snapshot() -> Snapshot {
@@ -147,6 +159,7 @@ pub fn snapshot() -> Snapshot {
         captures_kept: CAPTURES_KEPT.load(Ordering::Relaxed),
         captures_execution_dependent: CAPTURES_EXECUTION_DEPENDENT.load(Ordering::Relaxed),
         captures_latch_extra: CAPTURES_LATCH_EXTRA.load(Ordering::Relaxed),
+        captures_explicit_weaker: CAPTURES_EXPLICIT_WEAKER.load(Ordering::Relaxed),
     }
 }
 
@@ -170,12 +183,13 @@ fn register_exit_dump() {
         };
         let census = snapshot();
         let mut text = format!(
-            "captures\t{}\t{}\t{}\t{}\t{}\n",
+            "captures\t{}\t{}\t{}\t{}\t{}\t{}\n",
             census.captures,
             census.captures_kept,
             census.captures_execution_dependent,
             census.captures_latch_extra,
-            census.stop_observations
+            census.stop_observations,
+            census.captures_explicit_weaker
         );
         for (site, route, count) in &census.origins {
             text.push_str(&format!("origin\t{site}\t{route}\t{count}\n"));

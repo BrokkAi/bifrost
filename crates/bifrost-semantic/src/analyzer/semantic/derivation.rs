@@ -1,5 +1,6 @@
 //! Demand-driven, budgeted derivations with recorded input verification.
 use std::any::Any;
+use std::fmt;
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::ops::Deref;
@@ -8,7 +9,8 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
 use brokk_bifrost_core::analyzer::model::Language;
-use brokk_bifrost_core::hash::HashMap;
+use brokk_bifrost_core::analyzer::reuse_verdict::{ExecutionCause, ReuseVerdict};
+use brokk_bifrost_core::hash::{HashMap, HashSet};
 use brokk_bifrost_core::retention_budget::{
     BudgetRegion, BudgetedValue, RequestOwned, Retained, RetainedBytes, RetentionBudget,
 };
@@ -61,8 +63,14 @@ pub enum UnavailableCause {
     StratumViolation,
     ChildUnavailable,
     ValidationFailed,
+    /// Configuration-only facts cannot answer a configuration overlay or stage.
+    ConfigurationOverlaid,
+    /// An active selected operation was queried without its matching read frame.
+    MissingOperationReadFrame,
     Cancelled,
     Failed(Arc<str>),
+    /// Main file membership cannot certify changed Rust source content.
+    RustMembershipOverlaid,
 }
 
 pub enum Handle<O> {
@@ -114,6 +122,9 @@ pub enum Computed<O> {
         value: O,
         complete: bool,
         validity: ReuseValidity,
+        /// The computation's own reuse verdict. Shadows `validity`'s
+        /// execution causes until every producer returns one.
+        reuse: ReuseVerdict,
     },
     Unavailable(UnavailableCause),
 }
@@ -147,6 +158,19 @@ pub trait DerivationKind: Send + Sync + 'static {
     fn output_projection(value: &Self::Output, hash: &mut CanonicalHasher);
 }
 
+/// Transient incompleteness evidence owned by a running flight (#11525).
+///
+/// An unstable reason refuses reuse, so its follower computes independently.
+/// The engine retains this evidence only to distinguish a cancelled leader
+/// from a follower whose own request is still live. It is never an entry's
+/// retained dependency proof.
+pub trait UnstableReasons: Send + Sync + fmt::Debug {
+    /// Whether a reason concerns the leader's request, not the question
+    /// (cancellation). A follower with a live request recomputes instead of
+    /// adopting it.
+    fn belongs_to_leader_request(&self) -> bool;
+}
+
 pub struct CaptureReceipt {
     pub reads: Vec<ReadKey>,
     pub unattributed: usize,
@@ -154,12 +178,22 @@ pub struct CaptureReceipt {
     pub reuse_refusals: Vec<NotReusableCause>,
     pub persistence_refusals: usize,
     pub stable_reasons: Vec<String>,
+    /// Present when at least one reason has no stable string. This preserves
+    /// the leader's cancellation classification and refuses retained reuse;
+    /// followers compute independently and record their own typed reasons.
+    /// [`Entry`] never holds this transient evidence.
+    pub unstable_reasons: Option<Arc<dyn UnstableReasons>>,
+    /// The verdict the work inside the capture returned explicitly.
+    pub explicit_verdict: ReuseVerdict,
 }
 pub trait CaptureHook<R, A>: Send + Sync {
     /// Opens a non-forwarding capture around `work`.
     fn capture(&self, revision: &R, authority: &A, work: &mut dyn FnMut()) -> CaptureReceipt;
     fn report_unattributed(&self);
     fn report_execution_dependence(&self, cause: NotReusableCause);
+    /// Join an explicit verdict into the enclosing capture, with the routing
+    /// of [`Self::report_execution_dependence`].
+    fn report_verdict(&self, verdict: ReuseVerdict);
     fn report_reuse_refusal(&self, cause: NotReusableCause);
     fn report_persistence_refusals(&self, count: usize);
     fn replay_reasons(&self, reasons: &[String]);
@@ -171,6 +205,9 @@ pub trait CaptureHook<R, A>: Send + Sync {
         false
     }
 }
+/// Every own keyed input is checked even when a reader revision is equal.
+/// SQL-only derivations and closed child outputs can use the revision fast
+/// path; a new kind must record every dependency on independent live state.
 pub trait BaseInputs<R, A>: Send + Sync {
     /// Return false when evidence is missing or the selected input changed.
     fn unchanged(&self, read: &ReadKey, since: &R, at: &R, authority: &A) -> bool;
@@ -187,6 +224,47 @@ pub trait BaseInputs<R, A>: Send + Sync {
     }
 }
 
+/// A changed or unsupported input is a miss; malformed dependency evidence is
+/// distinguished so the owning engine can retain its existing refusal counter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecordedReadError {
+    Changed,
+    InvalidDependencyEvidence,
+}
+
+/// The shared per-read validity rule. A successful result says whether this
+/// input's proof is closed over the selected revision. Ordinary keyed inputs
+/// remain independent even when their live answer is unchanged.
+pub fn verify_recorded_read(
+    read: &ReadKey,
+    mut child_answer: impl FnMut(
+        DerivationKindId,
+        &DerivationQuestion,
+    ) -> Result<(OutputIdentity, bool), RecordedReadError>,
+    mut base_unchanged: impl FnMut(&ReadKey) -> bool,
+) -> Result<bool, RecordedReadError> {
+    match read {
+        ReadKey::Lookup {
+            kind: LookupKind::Derivation(child),
+            question,
+            digest,
+        } => {
+            let LookupQuestion::Derivation(question) = question else {
+                return Err(RecordedReadError::InvalidDependencyEvidence);
+            };
+            let (identity, revision_closed) = child_answer(*child, question)?;
+            if identity.0 == *digest {
+                Ok(revision_closed)
+            } else {
+                Err(RecordedReadError::Changed)
+            }
+        }
+        _ => base_unchanged(read)
+            .then_some(false)
+            .ok_or(RecordedReadError::Changed),
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct EntryKey {
     kind: DerivationKindId,
@@ -195,11 +273,36 @@ struct EntryKey {
 impl RetainedBytes for EntryKey {
     fn retained_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
-            + self.kind.0.len()
-            + self.question.rel_path.as_ref().map_or(0, |v| v.len())
-            + self.question.name.as_ref().map_or(0, |v| v.len())
+            + self.question.rel_path.as_ref().map_or(0, |v| {
+                brokk_bifrost_core::allocation_size::allocation_size(v.len())
+            })
+            + self.question.name.as_ref().map_or(0, |v| {
+                brokk_bifrost_core::allocation_size::allocation_size(v.len())
+            })
     }
 }
+#[derive(Clone)]
+struct VerifiedStamp<R, A> {
+    revision: R,
+    authority: A,
+    revision_closed: bool,
+}
+impl<R: RetainedBytes, A: RetainedBytes> VerifiedStamp<R, A> {
+    fn retained_bytes_for(revision: &R, authority: &A) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(
+                revision
+                    .retained_bytes()
+                    .saturating_sub(std::mem::size_of::<R>()),
+            )
+            .saturating_add(
+                authority
+                    .retained_bytes()
+                    .saturating_sub(std::mem::size_of::<A>()),
+            )
+    }
+}
+
 struct Entry {
     output: Arc<dyn Any + Send + Sync>,
     output_bytes: usize,
@@ -216,17 +319,25 @@ impl RetainedBytes for Entry {
         std::mem::size_of::<Self>()
             + self.verified_bytes
             + self.output_bytes
-            + self.reads.capacity() * std::mem::size_of::<ReadKey>()
+            + brokk_bifrost_core::allocation_size::allocation_size(
+                self.reads.capacity() * std::mem::size_of::<ReadKey>(),
+            )
             + self
                 .reads
                 .iter()
                 .map(|read| {
-                    read.retained_bytes()
+                    read.allocated_retained_bytes()
                         .saturating_sub(std::mem::size_of::<ReadKey>())
                 })
                 .sum::<usize>()
-            + self.reasons.capacity() * std::mem::size_of::<String>()
-            + self.reasons.iter().map(|s| s.capacity()).sum::<usize>()
+            + brokk_bifrost_core::allocation_size::allocation_size(
+                self.reasons.capacity() * std::mem::size_of::<String>(),
+            )
+            + self
+                .reasons
+                .iter()
+                .map(|s| brokk_bifrost_core::allocation_size::allocation_size(s.capacity()))
+                .sum::<usize>()
     }
 }
 
@@ -249,6 +360,7 @@ struct ComputedEntry {
     projection: [u8; 32],
     complete: bool,
     validity: ReuseValidity,
+    reuse: ReuseVerdict,
 }
 impl<D, R, A> Registered<R, A> for Kind<D>
 where
@@ -277,12 +389,13 @@ where
         question: &DerivationQuestion,
     ) -> Result<ComputedEntry, UnavailableCause> {
         let key = D::key_from_question(question).ok_or(UnavailableCause::ValidationFailed)?;
-        let (value, complete, validity) = match self.0.compute(frame, &key) {
+        let (value, complete, validity, reuse) = match self.0.compute(frame, &key) {
             Computed::Available {
                 value,
                 complete,
                 validity,
-            } => (value, complete, validity),
+                reuse,
+            } => (value, complete, validity, reuse),
             Computed::Unavailable(cause) => return Err(cause),
         };
         let mut hash = CanonicalHasher::new(b"bifrost-derivation-output:v1");
@@ -294,6 +407,7 @@ where
             projection: hash.finish(),
             complete,
             validity,
+            reuse,
         })
     }
 }
@@ -314,6 +428,8 @@ pub struct KindCounters {
 struct FlightOutcome {
     answer: ErasedDemand,
     effects: FlightEffects,
+    // Proof for this outcome's revision, not a later mutable entry stamp.
+    revision_closed: bool,
 }
 #[derive(Clone, Default)]
 struct FlightEffects {
@@ -322,6 +438,10 @@ struct FlightEffects {
     reuse_refusals: Vec<NotReusableCause>,
     persistence_refusals: usize,
     stable_reasons: Vec<String>,
+    // Transient leader-request evidence; never replayed as a reuse proof.
+    unstable_reasons: Option<Arc<dyn UnstableReasons>>,
+    // The explicit verdict a follower joins, as the leader forwarded it.
+    verdict: ReuseVerdict,
 }
 impl FlightEffects {
     fn cause(&mut self, cause: NotReusableCause) {
@@ -329,16 +449,27 @@ impl FlightEffects {
             NotReusableCause::UnattributedRead => self.unattributed += 1,
             NotReusableCause::Cancelled
             | NotReusableCause::LimitReached
-            | NotReusableCause::ExecutionDependent => self.execution_dependences.push(cause),
+            | NotReusableCause::ExecutionDependent => {
+                self.execution_dependences.push(cause);
+                self.verdict
+                    .join_in(ReuseVerdict::ExecutionDependent(ExecutionCause::Other));
+            }
             _ => self.reuse_refusals.push(cause),
         }
     }
     fn replay<R, A>(&self, capture: &dyn CaptureHook<R, A>) {
+        assert!(
+            self.unstable_reasons.is_none(),
+            "an unstable flight must be recomputed before effect replay"
+        );
         for _ in 0..self.unattributed {
             capture.report_unattributed();
         }
         for &cause in &self.execution_dependences {
             capture.report_execution_dependence(cause);
+        }
+        if !self.verdict.is_content() {
+            capture.report_verdict(self.verdict);
         }
         for &cause in &self.reuse_refusals {
             capture.report_reuse_refusal(cause);
@@ -358,6 +489,11 @@ impl FlightOutcome {
             .effects
             .execution_dependences
             .contains(&NotReusableCause::Cancelled)
+            || self
+                .effects
+                .unstable_reasons
+                .as_ref()
+                .is_some_and(|unstable| unstable.belongs_to_leader_request())
     }
 }
 struct Flight {
@@ -383,6 +519,10 @@ pub struct DerivationEngine<R, A> {
     evictions: Mutex<HashMap<DerivationKindId, Arc<AtomicU64>>>,
     capture: Arc<dyn CaptureHook<R, A>>,
     base: Arc<dyn BaseInputs<R, A>>,
+    /// Threads that joined another thread's flight, so a test can release a
+    /// leader only once a follower is waiting.
+    #[cfg(any(test, feature = "test-support"))]
+    followers_joined: std::sync::atomic::AtomicUsize,
 }
 impl<R, A> DerivationEngine<R, A>
 where
@@ -395,7 +535,10 @@ where
             NotReusableCause::Cancelled
             | NotReusableCause::LimitReached
             | NotReusableCause::ExecutionDependent => {
-                self.capture.report_execution_dependence(cause)
+                self.capture.report_execution_dependence(cause);
+                // Dual write: the engine's own causes are explicit verdicts too.
+                self.capture
+                    .report_verdict(ReuseVerdict::ExecutionDependent(ExecutionCause::Other));
             }
             NotReusableCause::InvalidDependencyEvidence
             | NotReusableCause::ChildNotReusable
@@ -410,6 +553,9 @@ where
         }
         for &cause in &receipt.execution_dependences {
             self.capture.report_execution_dependence(cause);
+        }
+        if !receipt.explicit_verdict.is_content() {
+            self.capture.report_verdict(receipt.explicit_verdict);
         }
         for &cause in &receipt.reuse_refusals {
             self.capture.report_reuse_refusal(cause);
@@ -432,7 +578,14 @@ where
             evictions: Mutex::new(HashMap::default()),
             capture,
             base,
+            #[cfg(any(test, feature = "test-support"))]
+            followers_joined: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+    /// How many demands have joined another demand's flight as followers.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn followers_joined(&self) -> usize {
+        self.followers_joined.load(Ordering::SeqCst)
     }
     pub fn registered_question_shapes(&self) -> Vec<super::read_ledger::PersistedDerivationFamily> {
         self.kinds
@@ -441,6 +594,15 @@ where
             .values()
             .map(|kind| kind.question_shape())
             .collect()
+    }
+    /// Inspect the actual engine registration without demanding its answer.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn registered_verification_for_test(&self, kind: DerivationKindId) -> Option<Verification> {
+        self.kinds
+            .lock()
+            .expect("kind registry poisoned")
+            .get(&kind)
+            .map(|kind| kind.verification())
     }
     pub fn register<D: DerivationKind>(&self, kind: D) {
         let mut kinds = self.kinds.lock().expect("kind registry poisoned");
@@ -496,7 +658,7 @@ where
     ) -> Demanded<D::Output> {
         let question = D::question(key);
         let outcome = self.demand_erased(D::ID, question.clone(), revision, authority, None);
-        self.record_demand(D::ID, question, &outcome.answer);
+        self.record_demand(Self::dependency_read(D::ID, question, &outcome.answer));
         outcome.answer.typed::<D::Output>()
     }
     pub fn replay(
@@ -516,7 +678,11 @@ where
             return ReplayedDemand::Unavailable(UnavailableCause::ValidationFailed);
         }
         let outcome = self.demand_erased(kind, question.clone(), revision, authority, None);
-        self.record_demand(kind, question.clone(), &outcome.answer);
+        self.record_demand(Self::dependency_read(
+            kind,
+            question.clone(),
+            &outcome.answer,
+        ));
         match outcome.answer {
             ErasedDemand::Retained(entry) => ReplayedDemand::Available {
                 identity: entry.identity,
@@ -540,10 +706,51 @@ where
         authority: A,
     ) -> Option<Demanded<D::Output>> {
         let question = D::question(key);
-        let answer = self.try_reuse_erased(D::ID, question.clone(), &revision, &authority, None)?;
-        self.record_demand(D::ID, question, &answer);
+        let (answer, _) =
+            self.try_reuse_erased(D::ID, question.clone(), &revision, &authority, None)?;
+        let ErasedDemand::Retained(entry) = &answer else {
+            unreachable!("noncomputing reuse only returns a retained entry");
+        };
+        self.capture.replay_reasons(&entry.reasons);
+        self.capture
+            .report_persistence_refusals(entry.persistence_refusals);
+        self.record_demand(Self::dependency_read(D::ID, question, &answer));
         Some(answer.typed::<D::Output>())
     }
+
+    /// Verify an erased recorded question without computing or replaying its
+    /// entry's evidence. Host scopes must contain any diagnostics emitted by
+    /// base-input checks. Counters and the checked entry's stamp may advance.
+    pub fn verify_erased(
+        &self,
+        kind: DerivationKindId,
+        question: &DerivationQuestion,
+        revision: R,
+        authority: A,
+    ) -> Option<OutputIdentity> {
+        if self.capture.cancelled() {
+            return None;
+        }
+        let registered = self
+            .kinds
+            .lock()
+            .expect("kind registry poisoned")
+            .get(&kind)
+            .cloned()?;
+        if !registered.accepts_question(question) {
+            return None;
+        }
+        let (answer, _) =
+            self.try_reuse_erased(kind, question.clone(), &revision, &authority, None)?;
+        if self.capture.cancelled() {
+            return None;
+        }
+        let ErasedDemand::Retained(entry) = answer else {
+            unreachable!("noncomputing reuse only returns a retained entry");
+        };
+        Some(entry.identity)
+    }
+
     fn try_reuse_erased(
         &self,
         kind: DerivationKindId,
@@ -551,7 +758,7 @@ where
         revision: &R,
         authority: &A,
         parent: Option<(DerivationKindId, u16)>,
-    ) -> Option<ErasedDemand> {
+    ) -> Option<(ErasedDemand, bool)> {
         let kinds = self.kinds.lock().expect("kind registry poisoned");
         let registered = kinds.get(&kind)?.clone();
         if let Some((parent_id, parent_stratum)) = parent {
@@ -566,104 +773,168 @@ where
         }
         drop(kinds);
         let key = EntryKey { kind, question };
-        // Values live only in memory. Replay persists read keys and identity
-        // digests, not values, so a cold process has nothing to reuse here.
         let entry = self.region.get(&key).or_else(|| self.region.revive(&key))?;
-        let (since, old_authority) = entry
+        let revision_closed = self.verify_entry(
+            &key,
+            &entry,
+            revision,
+            authority,
+            registered.as_ref(),
+            |child, question| {
+                let (answer, closed) = self.try_reuse_erased(
+                    child,
+                    question,
+                    revision,
+                    authority,
+                    Some((kind, registered.stratum())),
+                )?;
+                match answer {
+                    ErasedDemand::Retained(value) => Some((value.identity, closed)),
+                    _ => None,
+                }
+            },
+            |read, since| {
+                self.base
+                    .unchanged_without_stage(read, since, revision, authority)
+            },
+        )?;
+        Some((ErasedDemand::Retained(entry), revision_closed))
+    }
+
+    fn dependency_read(
+        kind: DerivationKindId,
+        question: DerivationQuestion,
+        answer: &ErasedDemand,
+    ) -> Option<ReadKey> {
+        let identity = match answer {
+            ErasedDemand::Retained(entry) => entry.identity,
+            ErasedDemand::RequestOwned { entry, .. } => entry.identity,
+            ErasedDemand::Unavailable(_) => return None,
+        };
+        Some(ReadKey::lookup(
+            LookupKind::Derivation(kind),
+            LookupQuestion::Derivation(question),
+            identity.0,
+        ))
+    }
+
+    fn record_demand(&self, read: Option<ReadKey>) {
+        if let Some(read) = read {
+            self.capture.record(read);
+        }
+    }
+
+    fn declared_child(&self, parent: &dyn Registered<R, A>, child: DerivationKindId) -> bool {
+        self.kinds
+            .lock()
+            .expect("kind registry poisoned")
+            .get(&child)
+            .is_some_and(|kind| {
+                kind.stratum() < parent.stratum()
+                    && parent.children().contains(&(child, kind.stratum()))
+            })
+    }
+
+    fn invalid_dependency_verification(&self, kind: DerivationKindId) {
+        let mut state = self.state.lock().expect("engine state poisoned");
+        let counters = state.counters.entry(kind).or_default();
+        counters.not_retainable += 1;
+        *counters
+            .not_retainable_by_cause
+            .entry(NotReusableCause::InvalidDependencyEvidence)
+            .or_default() += 1;
+    }
+
+    /// The one validity rule for computing hits, noncomputing reuse and flight
+    /// followers. Child recursion strictly decreases registered strata.
+    #[allow(clippy::too_many_arguments)]
+    fn verify_entry(
+        &self,
+        key: &EntryKey,
+        entry: &Entry,
+        revision: &R,
+        authority: &A,
+        kind: &dyn Registered<R, A>,
+        mut child_answer: impl FnMut(
+            DerivationKindId,
+            DerivationQuestion,
+        ) -> Option<(OutputIdentity, bool)>,
+        mut base_unchanged: impl FnMut(&ReadKey, &R) -> bool,
+    ) -> Option<bool> {
+        let stamp = entry
             .verified
             .lock()
             .expect("verification poisoned")
-            .downcast_ref::<(R, A)>()?
+            .downcast_ref::<VerifiedStamp<R, A>>()?
             .clone();
         if !revision.is_established()
-            || !since.is_established()
+            || !stamp.revision.is_established()
             || authority.retention_refusal().is_some()
-            || old_authority != *authority
+            || stamp.authority != *authority
         {
             return None;
         }
-        let current = since == *revision;
-        if !current {
-            if registered.verification() != Verification::BaseInputs {
-                return None;
-            }
+        let current = stamp.revision == *revision;
+        if !current && kind.verification() != Verification::BaseInputs {
+            return None;
+        }
+        let revision_closed = if current && stamp.revision_closed {
+            true
+        } else {
             let mut unchanged = true;
-            let _receipt = self.capture.capture(revision, authority, &mut || {
+            let mut closed = true;
+            // Verification's inputs/effects belong to neither the hit nor a
+            // later recomputation. Never forward child model reads upward.
+            let _verification = self.capture.capture(revision, authority, &mut || {
                 for read in &entry.reads {
-                    let valid = match read {
-                        ReadKey::Lookup {
-                            kind: LookupKind::Derivation(child),
-                            question: LookupQuestion::Derivation(q),
-                            digest,
-                        } => self
-                            .try_reuse_erased(
-                                *child,
-                                q.clone(),
-                                revision,
-                                authority,
-                                Some((kind, registered.stratum())),
-                            )
-                            .is_some_and(|answer| match answer {
-                                ErasedDemand::Retained(value) => value.identity.0 == *digest,
-                                _ => false,
-                            }),
-                        _ => self
-                            .base
-                            .unchanged_without_stage(read, &since, revision, authority),
-                    };
-                    if !valid {
-                        unchanged = false;
-                        break;
+                    let valid = verify_recorded_read(
+                        read,
+                        |child, question| {
+                            if !self.declared_child(kind, child) {
+                                return Err(RecordedReadError::InvalidDependencyEvidence);
+                            }
+                            child_answer(child, question.clone()).ok_or(RecordedReadError::Changed)
+                        },
+                        |read| base_unchanged(read, &stamp.revision),
+                    );
+                    match valid {
+                        Ok(input_closed) => closed &= input_closed,
+                        Err(error) => {
+                            if error == RecordedReadError::InvalidDependencyEvidence {
+                                self.invalid_dependency_verification(key.kind);
+                            }
+                            unchanged = false;
+                            break;
+                        }
                     }
                 }
             });
             if !unchanged {
                 return None;
             }
-            let mut state = self.state.lock().expect("engine state poisoned");
-            if revision
-                .retained_bytes()
-                .saturating_add(authority.retained_bytes())
-                <= entry.verified_bytes
-            {
-                *entry.verified.lock().expect("verification poisoned") =
-                    Box::new((revision.clone(), authority.clone()));
-            }
-            state.counters.entry(kind).or_default().verified_unchanged += 1;
-        } else {
-            self.state
-                .lock()
-                .expect("engine state poisoned")
-                .counters
-                .entry(kind)
-                .or_default()
-                .current_hits += 1;
-        }
-        // Replay what a lead hit replays: an entry's persistence refusals
-        // travel with it, so a reused entry cannot make a ledger persistable
-        // that the computing demand refused.
-        self.capture.replay_reasons(&entry.reasons);
-        self.capture
-            .report_persistence_refusals(entry.persistence_refusals);
-        Some(ErasedDemand::Retained(entry))
-    }
-    fn record_demand(
-        &self,
-        kind: DerivationKindId,
-        question: DerivationQuestion,
-        answer: &ErasedDemand,
-    ) {
-        let identity = match answer {
-            ErasedDemand::Retained(entry) => entry.identity,
-            ErasedDemand::RequestOwned { entry, .. } => entry.identity,
-            ErasedDemand::Unavailable(_) => return,
+            closed
         };
-        self.capture.record(ReadKey::lookup(
-            LookupKind::Derivation(kind),
-            LookupQuestion::Derivation(question),
-            identity.0,
-        ));
+        // Apply the verdict only to this checked entry, never a replacement.
+        if (!current || stamp.revision_closed != revision_closed)
+            && VerifiedStamp::<R, A>::retained_bytes_for(revision, authority)
+                <= entry.verified_bytes
+        {
+            *entry.verified.lock().expect("verification poisoned") = Box::new(VerifiedStamp {
+                revision: revision.clone(),
+                authority: authority.clone(),
+                revision_closed,
+            });
+        }
+        let mut state = self.state.lock().expect("engine state poisoned");
+        let counters = state.counters.entry(key.kind).or_default();
+        if current {
+            counters.current_hits += 1;
+        } else {
+            counters.verified_unchanged += 1;
+        }
+        Some(revision_closed)
     }
+
     fn demand_erased(
         &self,
         kind: DerivationKindId,
@@ -686,6 +957,7 @@ where
             return FlightOutcome {
                 answer: ErasedDemand::Unavailable(UnavailableCause::ValidationFailed),
                 effects,
+                revision_closed: false,
             };
         };
         let declared = parent.is_none_or(|(parent_id, _)| {
@@ -719,65 +991,137 @@ where
             return FlightOutcome {
                 answer: ErasedDemand::Unavailable(UnavailableCause::StratumViolation),
                 effects,
+                revision_closed: false,
             };
         }
         let key = EntryKey { kind, question };
+        if !revision.is_established() {
+            return self.run_direct_lead(&key, &revision, &authority, registered.as_ref());
+        }
         let flight_key = (key.clone(), revision.clone(), authority.clone());
-        loop {
-            let (flight, leader) = {
-                let mut state = self.state.lock().expect("engine state poisoned");
-                if let Some(flight) = state.flights.get(&flight_key) {
-                    (flight.clone(), false)
-                } else {
-                    let flight = Arc::new(Flight::new());
-                    state.flights.insert(flight_key.clone(), flight.clone());
-                    (flight, true)
-                }
+        let (flight, leader) = {
+            let mut state = self.state.lock().expect("engine state poisoned");
+            if let Some(flight) = state.flights.get(&flight_key) {
+                (flight.clone(), false)
+            } else {
+                let flight = Arc::new(Flight::new());
+                state.flights.insert(flight_key.clone(), flight.clone());
+                (flight, true)
+            }
+        };
+        if !leader {
+            #[cfg(any(test, feature = "test-support"))]
+            self.followers_joined.fetch_add(1, Ordering::SeqCst);
+            let mut completed = flight.completed.lock().expect("flight poisoned");
+            while completed.is_none() {
+                completed = flight.wake.wait(completed).expect("flight poisoned");
+            }
+            let mut outcome = completed.as_ref().expect("completed flight").clone();
+            drop(completed);
+            if outcome.cancelled() && !self.capture.cancelled() {
+                return self.run_direct_lead(&key, &revision, &authority, registered.as_ref());
+            }
+            let carried = match &outcome.answer {
+                ErasedDemand::Retained(entry) => Some(&**entry),
+                ErasedDemand::RequestOwned {
+                    entry,
+                    validity: ReuseValidity::Reusable,
+                } => Some(&**entry),
+                _ => None,
             };
-            if !leader {
-                let mut completed = flight.completed.lock().expect("flight poisoned");
-                while completed.is_none() {
-                    completed = flight.wake.wait(completed).expect("flight poisoned");
-                }
-                let outcome = completed.as_ref().expect("completed flight").clone();
-                drop(completed);
-                // The leader's cancellation says nothing about this request.
-                // The leader retained nothing, so compute the answer here.
-                if outcome.cancelled() && !self.capture.cancelled() {
-                    continue;
-                }
-                outcome.effects.replay(self.capture.as_ref());
-                return outcome;
-            }
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.lead(&key, &revision, &authority, registered.as_ref())
-            }));
-            let outcome = match &result {
-                Ok(outcome) => outcome.clone(),
-                Err(_) => {
-                    let mut effects = FlightEffects::default();
-                    effects.cause(NotReusableCause::InvalidDependencyEvidence);
-                    FlightOutcome {
-                        answer: ErasedDemand::Unavailable(UnavailableCause::Failed(Arc::from(
-                            "derivation computation panicked",
-                        ))),
-                        effects,
-                    }
-                }
+            let checked = carried
+                .filter(|_| outcome.effects.unattributed == 0)
+                .and_then(|entry| {
+                    self.verify_entry(
+                        &key,
+                        entry,
+                        &revision,
+                        &authority,
+                        registered.as_ref(),
+                        |child, question| {
+                            let result = self.demand_erased(
+                                child,
+                                question,
+                                revision.clone(),
+                                authority.clone(),
+                                Some((key.kind, registered.stratum())),
+                            );
+                            let closed = result.revision_closed;
+                            match result.answer {
+                                ErasedDemand::Retained(value) => Some((value.identity, closed)),
+                                ErasedDemand::RequestOwned {
+                                    entry,
+                                    validity: ReuseValidity::Reusable,
+                                } => Some((entry.identity, closed)),
+                                _ => None,
+                            }
+                        },
+                        |read, since| self.base.unchanged(read, since, &revision, &authority),
+                    )
+                });
+            let Some(closed) = checked else {
+                // Do not rejoin: competing scopes cannot starve this demand.
+                // No leader effects or lookup have been replayed yet.
+                return self.run_direct_lead(&key, &revision, &authority, registered.as_ref());
             };
-            // Keep the flight discoverable until its result is visible to all followers.
-            {
-                let mut state = self.state.lock().expect("engine state poisoned");
-                *flight.completed.lock().expect("flight poisoned") = Some(outcome.clone());
-                flight.wake.notify_all();
-                state.flights.remove(&flight_key);
-            }
-            if let Err(panic) = result {
-                std::panic::resume_unwind(panic);
-            }
+            outcome.revision_closed = closed;
+            outcome.effects.replay(self.capture.as_ref());
             return outcome;
         }
+        let result = self.caught_lead(&key, &revision, &authority, registered.as_ref());
+        let outcome = match &result {
+            Ok(outcome) => outcome.clone(),
+            Err(_) => {
+                let mut effects = FlightEffects::default();
+                effects.cause(NotReusableCause::InvalidDependencyEvidence);
+                FlightOutcome {
+                    answer: ErasedDemand::Unavailable(UnavailableCause::Failed(Arc::from(
+                        "derivation computation panicked",
+                    ))),
+                    effects,
+                    revision_closed: false,
+                }
+            }
+        };
+        // Keep the flight discoverable until its result is visible to all followers.
+        {
+            let mut state = self.state.lock().expect("engine state poisoned");
+            *flight.completed.lock().expect("flight poisoned") = Some(outcome.clone());
+            flight.wake.notify_all();
+            state.flights.remove(&flight_key);
+        }
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+        outcome
     }
+    fn caught_lead(
+        &self,
+        key: &EntryKey,
+        revision: &R,
+        authority: &A,
+        kind: &dyn Registered<R, A>,
+    ) -> std::thread::Result<FlightOutcome> {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.lead(key, revision, authority, kind)
+        }));
+        if result.is_err() {
+            self.report_cause(NotReusableCause::InvalidDependencyEvidence);
+        }
+        result
+    }
+
+    fn run_direct_lead(
+        &self,
+        key: &EntryKey,
+        revision: &R,
+        authority: &A,
+        kind: &dyn Registered<R, A>,
+    ) -> FlightOutcome {
+        self.caught_lead(key, revision, authority, kind)
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    }
+
     fn lead(
         &self,
         key: &EntryKey,
@@ -787,113 +1131,44 @@ where
     ) -> FlightOutcome {
         let mut effects = FlightEffects::default();
         let old = self.region.get(key).or_else(|| self.region.revive(key));
-        if let Some(entry) = &old {
-            let verified = entry
-                .verified
-                .lock()
-                .expect("verification poisoned")
-                .downcast_ref::<(R, A)>()
-                .cloned();
-            if let Some((since, old_authority)) = verified
-                && revision.is_established()
-                && since.is_established()
-                && authority.retention_refusal().is_none()
-            {
-                if since == revision.clone() && old_authority == authority.clone() {
-                    self.capture.replay_reasons(&entry.reasons);
-                    self.capture
-                        .report_persistence_refusals(entry.persistence_refusals);
-                    effects.persistence_refusals = entry.persistence_refusals;
-                    effects.stable_reasons = entry.reasons.clone();
-                    let outcome = FlightOutcome {
-                        answer: ErasedDemand::Retained(entry.clone()),
-                        effects,
-                    };
-                    if matches!(outcome.answer, ErasedDemand::Retained(_)) {
-                        self.state
-                            .lock()
-                            .expect("engine state poisoned")
-                            .counters
-                            .entry(key.kind)
-                            .or_default()
-                            .current_hits += 1;
+        if let Some(entry) = &old
+            && let Some(revision_closed) = self.verify_entry(
+                key,
+                entry,
+                revision,
+                authority,
+                kind,
+                |child, question| {
+                    let result = self.demand_erased(
+                        child,
+                        question,
+                        revision.clone(),
+                        authority.clone(),
+                        Some((key.kind, kind.stratum())),
+                    );
+                    let closed = result.revision_closed;
+                    match result.answer {
+                        ErasedDemand::Retained(value) => Some((value.identity, closed)),
+                        ErasedDemand::RequestOwned {
+                            entry,
+                            validity: ReuseValidity::Reusable,
+                        } => Some((entry.identity, closed)),
+                        _ => None,
                     }
-                    return outcome;
-                }
-                let mut unchanged = old_authority == authority.clone()
-                    && kind.verification() == Verification::BaseInputs;
-                // Verification is provisional. Its child effects belong to neither a hit
-                // nor the recomputation that follows a miss.
-                if unchanged {
-                    let _verification = self.capture.capture(revision, authority, &mut || {
-                        // Verification is not the kind's compute; its reads need their own evidence.
-                        // Worklist is explicit; nested derived checks descend through lower strata.
-                        let mut pending = entry.reads.iter().rev().collect::<Vec<_>>();
-                        while let Some(read) = pending.pop() {
-                            match read {
-                                ReadKey::Lookup {
-                                    kind: LookupKind::Derivation(child),
-                                    question: LookupQuestion::Derivation(q),
-                                    digest,
-                                } => {
-                                    let child_outcome = self.demand_erased(
-                                        *child,
-                                        q.clone(),
-                                        revision.clone(),
-                                        authority.clone(),
-                                        Some((key.kind, kind.stratum())),
-                                    );
-                                    match child_outcome.answer {
-                                        ErasedDemand::Retained(value)
-                                            if value.identity.0 == *digest => {}
-                                        ErasedDemand::RequestOwned {
-                                            entry,
-                                            validity: ReuseValidity::Reusable,
-                                        } if entry.identity.0 == *digest => {}
-                                        _ => {
-                                            unchanged = false;
-                                            break;
-                                        }
-                                    }
-                                }
-                                _ => {
-                                    if !self.base.unchanged(read, &since, revision, authority) {
-                                        unchanged = false;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    });
-                }
-                if unchanged {
-                    let mut state = self.state.lock().expect("engine state poisoned");
-                    if revision.is_established()
-                        && revision
-                            .retained_bytes()
-                            .saturating_add(authority.retained_bytes())
-                            <= entry.verified_bytes
-                    {
-                        *entry.verified.lock().expect("verification poisoned") =
-                            Box::new((revision.clone(), authority.clone()));
-                    }
-                    state
-                        .counters
-                        .entry(key.kind)
-                        .or_default()
-                        .verified_unchanged += 1;
-                    drop(state);
-                    self.capture.replay_reasons(&entry.reasons);
-                    self.capture
-                        .report_persistence_refusals(entry.persistence_refusals);
-                    effects.persistence_refusals = entry.persistence_refusals;
-                    effects.stable_reasons = entry.reasons.clone();
-                    return FlightOutcome {
-                        answer: ErasedDemand::Retained(entry.clone()),
-                        effects,
-                    };
-                }
-            }
+                },
+                |read, since| self.base.unchanged(read, since, revision, authority),
+            )
+        {
+            self.capture.replay_reasons(&entry.reasons);
+            self.capture
+                .report_persistence_refusals(entry.persistence_refusals);
+            effects.persistence_refusals = entry.persistence_refusals;
+            effects.stable_reasons = entry.reasons.clone();
+            return FlightOutcome {
+                answer: ErasedDemand::Retained(entry.clone()),
+                effects,
+                revision_closed,
+            };
         }
         let mut result = None;
         let mut frame = DerivationFrame {
@@ -904,7 +1179,9 @@ where
             kind_id: key.kind,
             child_validity: ReuseValidity::Reusable,
             child_unavailable: false,
+            child_complete: true,
             request_owned_child: false,
+            closed_children: HashSet::default(),
             marker: PhantomData,
         };
         let receipt = self.capture.capture(revision, authority, &mut || {
@@ -922,9 +1199,11 @@ where
         }
         effects.unattributed = receipt.unattributed;
         effects.execution_dependences = receipt.execution_dependences.clone();
+        effects.verdict = receipt.explicit_verdict;
         effects.reuse_refusals = receipt.reuse_refusals.clone();
         effects.persistence_refusals = receipt.persistence_refusals;
         effects.stable_reasons = receipt.stable_reasons.clone();
+        effects.unstable_reasons = receipt.unstable_reasons.clone();
         self.forward_capture_refusals(&receipt);
         self.capture.replay_reasons(&receipt.stable_reasons);
         let computed = match result.expect("capture hook must run the computation") {
@@ -941,20 +1220,49 @@ where
                 let refusal = match &cause {
                     UnavailableCause::Cancelled => NotReusableCause::Cancelled,
                     UnavailableCause::ChildUnavailable => NotReusableCause::ChildNotReusable,
-                    _ => NotReusableCause::InvalidDependencyEvidence,
+                    // Both overlay causes belong to this request, never to a retained value.
+                    UnavailableCause::ConfigurationOverlaid
+                    | UnavailableCause::RustMembershipOverlaid => {
+                        NotReusableCause::InvalidDependencyEvidence
+                    }
+                    UnavailableCause::StratumViolation
+                    | UnavailableCause::ValidationFailed
+                    | UnavailableCause::MissingOperationReadFrame
+                    | UnavailableCause::Failed(_) => NotReusableCause::InvalidDependencyEvidence,
                 };
                 self.report_cause(refusal);
                 effects.cause(refusal);
                 return FlightOutcome {
                     answer: ErasedDemand::Unavailable(cause),
                     effects,
+                    revision_closed: false,
                 };
             }
         };
+        let invalid_child = receipt.reads.iter().any(|read| match read {
+            ReadKey::Lookup {
+                kind: LookupKind::Derivation(child),
+                question,
+                ..
+            } => {
+                !matches!(question, LookupQuestion::Derivation(_))
+                    || !self.declared_child(kind, *child)
+            }
+            _ => false,
+        });
+        let revision_closed = revision.is_established()
+            && receipt
+                .reads
+                .iter()
+                .all(|read| frame.closed_children.contains(read));
         let mut validity = computed.validity;
         if let ReuseValidity::NotReusable(cause) = computed.validity {
             self.report_cause(cause);
             effects.cause(cause);
+        }
+        if !computed.reuse.is_content() {
+            self.capture.report_verdict(computed.reuse);
+            effects.verdict.join_in(computed.reuse);
         }
         if receipt.unattributed > 0 {
             validity = ReuseValidity::NotReusable(NotReusableCause::UnattributedRead);
@@ -962,6 +1270,8 @@ where
             validity = ReuseValidity::NotReusable(*cause);
         } else if let Some(cause) = receipt.reuse_refusals.first() {
             validity = ReuseValidity::NotReusable(*cause);
+        } else if invalid_child {
+            validity = ReuseValidity::NotReusable(NotReusableCause::InvalidDependencyEvidence);
         } else if frame.child_unavailable {
             validity = ReuseValidity::NotReusable(NotReusableCause::ChildNotReusable);
         } else if let ReuseValidity::NotReusable(cause) = frame.child_validity {
@@ -970,9 +1280,19 @@ where
         let mut reasons = receipt.stable_reasons;
         reasons.sort();
         reasons.dedup();
+        // An unstable reason is an incompleteness the string reasons cannot
+        // name, so fail closed on it as on a stable one.
+        let complete = computed.complete
+            && frame.child_complete
+            && reasons.is_empty()
+            && receipt.unstable_reasons.is_none();
+        assert!(
+            receipt.unstable_reasons.is_none() || matches!(validity, ReuseValidity::NotReusable(_)),
+            "an unstable reason must refuse reuse, or a retained entry would drop it"
+        );
         let mut hash = CanonicalHasher::new(b"bifrost-derivation-identity:v1");
         hash.value(&computed.projection);
-        hash.value(&[u8::from(computed.complete)]);
+        hash.value(&[u8::from(complete)]);
         hash.sequence("reasons", &reasons, |h, reason| h.value(reason.as_bytes()));
         let entry = Entry {
             output: computed.output,
@@ -981,11 +1301,13 @@ where
             reads: receipt.reads,
             reasons,
             persistence_refusals: receipt.persistence_refusals,
-            complete: computed.complete,
-            verified: Mutex::new(Box::new((revision.clone(), authority.clone()))),
-            verified_bytes: revision
-                .retained_bytes()
-                .saturating_add(authority.retained_bytes()),
+            complete,
+            verified: Mutex::new(Box::new(VerifiedStamp {
+                revision: revision.clone(),
+                authority: authority.clone(),
+                revision_closed,
+            })),
+            verified_bytes: VerifiedStamp::<R, A>::retained_bytes_for(revision, authority),
         };
         let mut state = self.state.lock().expect("engine state poisoned");
         let counters = state.counters.entry(key.kind).or_default();
@@ -1030,6 +1352,7 @@ where
                     validity,
                 },
                 effects,
+                revision_closed: false,
             };
         }
         if frame.request_owned_child {
@@ -1040,6 +1363,7 @@ where
                     validity,
                 },
                 effects,
+                revision_closed: false,
             };
         }
         self.region.invalidate(key);
@@ -1069,15 +1393,21 @@ where
                     reasons: value.reasons.clone(),
                     persistence_refusals: value.persistence_refusals,
                     complete: value.complete,
-                    verified: Mutex::new(Box::new((revision.clone(), authority.clone()))),
-                    verified_bytes: revision
-                        .retained_bytes()
-                        .saturating_add(authority.retained_bytes()),
+                    verified: Mutex::new(Box::new(VerifiedStamp {
+                        revision: revision.clone(),
+                        authority: authority.clone(),
+                        revision_closed,
+                    })),
+                    verified_bytes: VerifiedStamp::<R, A>::retained_bytes_for(revision, authority),
                 }),
                 validity,
             },
         };
-        FlightOutcome { answer, effects }
+        FlightOutcome {
+            answer,
+            effects,
+            revision_closed,
+        }
     }
 }
 
@@ -1089,7 +1419,10 @@ pub struct DerivationFrame<'a, R, A> {
     kind_id: DerivationKindId,
     child_validity: ReuseValidity,
     child_unavailable: bool,
+    child_complete: bool,
     request_owned_child: bool,
+    // Query-local proof, dropped after the computing capture. No retained set.
+    closed_children: HashSet<ReadKey>,
     marker: PhantomData<&'a ()>,
 }
 impl<R, A> DerivationFrame<'_, R, A>
@@ -1097,6 +1430,33 @@ where
     R: DerivationRevision,
     A: DerivationAuthority,
 {
+    /// Check the engine-owned kind and selected revision/authority without a demand.
+    pub fn authorizes_selected_input(
+        &mut self,
+        owner: DerivationKindId,
+        matches_inventory: impl FnOnce(&R, &A) -> bool,
+    ) -> bool {
+        let registered = self
+            .engine
+            .kinds
+            .lock()
+            .expect("kind registry poisoned")
+            .get(&owner)
+            .is_some_and(|kind| kind.verification() == Verification::Recompute);
+        let allowed = self.kind_id == owner
+            && registered
+            && self.revision.is_established()
+            && matches_inventory(&self.revision, &self.authority);
+        if !allowed {
+            self.child_unavailable = true;
+        }
+        allowed
+    }
+    /// A failed input cannot become a successful reusable parent when caught.
+    pub fn selected_input_unavailable(&mut self) {
+        self.child_unavailable = true;
+    }
+
     pub fn demand<D: DerivationKind>(&mut self, key: &D::Key) -> Demanded<D::Output> {
         let q = D::question(key);
         let outcome = self.engine.demand_erased(
@@ -1106,11 +1466,17 @@ where
             self.authority.clone(),
             Some((self.kind_id, self.stratum)),
         );
+        let revision_closed = outcome.revision_closed;
         let answer = outcome.answer;
-        self.engine.record_demand(D::ID, q, &answer);
+        let read = DerivationEngine::<R, A>::dependency_read(D::ID, q, &answer);
+        if revision_closed && let Some(read) = &read {
+            self.closed_children.insert(read.clone());
+        }
+        self.engine.record_demand(read);
         match &answer {
-            ErasedDemand::Retained(_) => {}
-            ErasedDemand::RequestOwned { validity, .. } => {
+            ErasedDemand::Retained(entry) => self.child_complete &= entry.complete,
+            ErasedDemand::RequestOwned { validity, entry } => {
+                self.child_complete &= entry.complete;
                 self.request_owned_child = true;
                 if matches!(validity, ReuseValidity::NotReusable(_)) {
                     self.child_validity = *validity;
@@ -1172,6 +1538,408 @@ mod derivation_properties {
     use proptest::prelude::*;
     use std::cell::RefCell;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    mod random_dag {
+        use super::*;
+        use std::sync::atomic::AtomicU64;
+
+        const INPUTS: usize = 6;
+        const LEVELS: usize = 3;
+        const NODE_COUNTS: [usize; LEVELS] = [3, 3, 3];
+        const OFFSETS: [usize; LEVELS] = [0, 3, 6];
+        const NODE_TOTAL: usize = 9;
+
+        #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+        struct NodeKey(u32);
+        impl RetainedBytes for NodeKey {
+            fn retained_bytes(&self) -> usize {
+                std::mem::size_of::<Self>()
+            }
+        }
+
+        #[derive(Clone)]
+        struct Node {
+            level: usize,
+            inputs: Vec<usize>,
+            children: Vec<usize>,
+        }
+        struct Graph {
+            nodes: Vec<Node>,
+            calls: Vec<AtomicU64>,
+            inputs: Arc<Inputs>,
+        }
+        impl Graph {
+            fn new(nodes: Vec<Node>, inputs: Arc<Inputs>) -> Arc<Self> {
+                assert_eq!(nodes.len(), NODE_TOTAL);
+                Arc::new(Self {
+                    nodes,
+                    calls: (0..NODE_TOTAL).map(|_| AtomicU64::new(0)).collect(),
+                    inputs,
+                })
+            }
+            fn direct_values(&self, inputs: &[u8; INPUTS]) -> Vec<u64> {
+                let mut values = vec![0; NODE_TOTAL];
+                for (index, node) in self.nodes.iter().enumerate() {
+                    let own = node
+                        .inputs
+                        .iter()
+                        .map(|&input| u64::from(inputs[input]))
+                        .sum::<u64>();
+                    values[index] = own.wrapping_add(
+                        node.children
+                            .iter()
+                            .map(|&child| values[child])
+                            .sum::<u64>(),
+                    );
+                }
+                values
+            }
+            fn transitive_inputs(&self, root: usize) -> [bool; INPUTS] {
+                let mut found = [false; INPUTS];
+                let mut visited = [false; NODE_TOTAL];
+                let mut pending = vec![root];
+                while let Some(node_id) = pending.pop() {
+                    if visited[node_id] {
+                        continue;
+                    }
+                    visited[node_id] = true;
+                    let node = &self.nodes[node_id];
+                    for &input in &node.inputs {
+                        found[input] = true;
+                    }
+                    pending.extend(node.children.iter().copied());
+                }
+                found
+            }
+        }
+
+        thread_local! { static READS: RefCell<Vec<Vec<ReadKey>>> = const { RefCell::new(Vec::new()) }; }
+        struct Capture;
+        impl Capture {
+            fn input(index: usize) {
+                READS.with(|reads| {
+                    reads
+                        .borrow_mut()
+                        .last_mut()
+                        .expect("outside derivation capture")
+                        .push(ReadKey::Index {
+                            family: IndexFamily::DefinitionExact,
+                            key: vec![0xD1, index as u8].into_boxed_slice(),
+                        })
+                });
+            }
+        }
+        impl CaptureHook<u64, u64> for Capture {
+            fn capture(&self, _: &u64, _: &u64, work: &mut dyn FnMut()) -> CaptureReceipt {
+                READS.with(|reads| reads.borrow_mut().push(Vec::new()));
+                work();
+                CaptureReceipt {
+                    reads: READS.with(|reads| reads.borrow_mut().pop().unwrap()),
+                    unattributed: 0,
+                    execution_dependences: Vec::new(),
+                    reuse_refusals: Vec::new(),
+                    persistence_refusals: 0,
+                    stable_reasons: Vec::new(),
+                    unstable_reasons: None,
+                    explicit_verdict: ReuseVerdict::Content,
+                }
+            }
+            fn report_unattributed(&self) {}
+            fn report_execution_dependence(&self, _: NotReusableCause) {}
+            fn report_verdict(&self, _: ReuseVerdict) {}
+            fn report_reuse_refusal(&self, _: NotReusableCause) {}
+            fn report_persistence_refusals(&self, _: usize) {}
+            fn replay_reasons(&self, _: &[String]) {}
+            fn record(&self, read: ReadKey) {
+                READS.with(|reads| {
+                    if let Some(frame) = reads.borrow_mut().last_mut() {
+                        frame.push(read);
+                    }
+                });
+            }
+        }
+
+        struct Inputs {
+            revisions: Mutex<HashMap<u64, [u8; INPUTS]>>,
+        }
+        impl BaseInputs<u64, u64> for Inputs {
+            fn unchanged(&self, read: &ReadKey, since: &u64, at: &u64, _: &u64) -> bool {
+                let ReadKey::Index { key, .. } = read else {
+                    return false;
+                };
+                if key.len() != 2 || key[0] != 0xD1 {
+                    return false;
+                }
+                let revisions = self.revisions.lock().unwrap();
+                revisions
+                    .get(since)
+                    .zip(revisions.get(at))
+                    .is_some_and(|(before, after)| {
+                        before[usize::from(key[1])] == after[usize::from(key[1])]
+                    })
+            }
+        }
+
+        fn question(key: &NodeKey) -> DerivationQuestion {
+            DerivationQuestion {
+                language: None,
+                subject: None,
+                rel_path: None,
+                name: Some(key.0.to_string().into_boxed_str()),
+            }
+        }
+        fn key_from_question(question: &DerivationQuestion) -> Option<NodeKey> {
+            if question.language.is_some()
+                || question.subject.is_some()
+                || question.rel_path.is_some()
+            {
+                return None;
+            }
+            question.name.as_ref()?.parse().ok().map(NodeKey)
+        }
+        fn compute_level<const LEVEL: usize, R: DerivationRevision, A: DerivationAuthority>(
+            graph: &Graph,
+            frame: &mut DerivationFrame<'_, R, A>,
+            key: &NodeKey,
+        ) -> Computed<u64> {
+            let node_id = key.0 as usize;
+            let node = &graph.nodes[node_id];
+            assert_eq!(node.level, LEVEL);
+            graph.calls[node_id].fetch_add(1, Ordering::Relaxed);
+            let own = node
+                .inputs
+                .iter()
+                .map(|&input| {
+                    Capture::input(input);
+                    let revisions = CURRENT_INPUTS.with(|values| *values.borrow());
+                    u64::from(revisions[input])
+                })
+                .sum::<u64>();
+            let mut total = own;
+            for &child in &node.children {
+                let child_value = match graph.nodes[child].level {
+                    0 => match frame.demand::<Level0>(&NodeKey(child as u32)) {
+                        Demanded::Available { value, .. } => *value,
+                        _ => return Computed::Unavailable(UnavailableCause::ChildUnavailable),
+                    },
+                    1 => match frame.demand::<Level1>(&NodeKey(child as u32)) {
+                        Demanded::Available { value, .. } => *value,
+                        _ => return Computed::Unavailable(UnavailableCause::ChildUnavailable),
+                    },
+                    _ => unreachable!("DAG edges only point downward"),
+                };
+                total = total.wrapping_add(child_value);
+            }
+            Computed::Available {
+                value: total,
+                complete: true,
+                validity: ReuseValidity::Reusable,
+                reuse: ReuseVerdict::Content,
+            }
+        }
+        thread_local! { static CURRENT_INPUTS: RefCell<[u8; INPUTS]> = const { RefCell::new([0; INPUTS]) }; }
+
+        struct Level0(Arc<Graph>);
+        struct Level1(Arc<Graph>);
+        struct Level2(Arc<Graph>);
+        macro_rules! kind_impl {
+            ($ty:ty, $id:literal, $level:literal, $children:expr) => {
+                impl DerivationKind for $ty {
+                    type Key = NodeKey;
+                    type Output = u64;
+                    const ID: DerivationKindId = DerivationKindId($id);
+                    const STRATUM: u16 = $level;
+                    const CHILDREN: &'static [(DerivationKindId, u16)] = $children;
+                    fn question(key: &NodeKey) -> DerivationQuestion {
+                        question(key)
+                    }
+                    fn key_from_question(q: &DerivationQuestion) -> Option<NodeKey> {
+                        key_from_question(q)
+                    }
+                    fn compute<R: DerivationRevision, A: DerivationAuthority>(
+                        &self,
+                        frame: &mut DerivationFrame<'_, R, A>,
+                        key: &NodeKey,
+                    ) -> Computed<u64> {
+                        compute_level::<$level, R, A>(&self.0, frame, key)
+                    }
+                    fn output_projection(value: &u64, hash: &mut CanonicalHasher) {
+                        hash.value(&value.to_le_bytes());
+                    }
+                }
+            };
+        }
+        kind_impl!(Level0, "derivation:random_dag_level0:v1", 0, &[]);
+        kind_impl!(
+            Level1,
+            "derivation:random_dag_level1:v1",
+            1,
+            &[(Level0::ID, 0)]
+        );
+        kind_impl!(
+            Level2,
+            "derivation:random_dag_level2:v1",
+            2,
+            &[(Level0::ID, 0), (Level1::ID, 1)]
+        );
+
+        fn register(engine: &DerivationEngine<u64, u64>, graph: Arc<Graph>) {
+            engine.register(Level0(graph.clone()));
+            engine.register(Level1(graph.clone()));
+            engine.register(Level2(graph));
+        }
+        fn demand_node(
+            engine: &DerivationEngine<u64, u64>,
+            graph: &Graph,
+            node: usize,
+            revision: u64,
+        ) -> u64 {
+            let current = graph.inputs.revisions.lock().unwrap()[&revision];
+            CURRENT_INPUTS.with(|values| *values.borrow_mut() = current);
+            let key = NodeKey(node as u32);
+            let result = match graph.nodes[node].level {
+                0 => engine.demand::<Level0>(&key, revision, 0),
+                1 => engine.demand::<Level1>(&key, revision, 0),
+                2 => engine.demand::<Level2>(&key, revision, 0),
+                _ => unreachable!(),
+            };
+            match result {
+                Demanded::Available { value, .. } => *value,
+                Demanded::Unavailable(cause) => panic!("random DAG node unavailable: {cause:?}"),
+            }
+        }
+
+        fn graph_from(seed: &[u8], inputs: Arc<Inputs>) -> Graph {
+            let mut cursor = 0usize;
+            let mut next = || {
+                let value = seed[cursor % seed.len()];
+                cursor += 1;
+                value
+            };
+            let mut nodes = Vec::with_capacity(NODE_TOTAL);
+            for level in 0..LEVELS {
+                for _ in 0..NODE_COUNTS[level] {
+                    let input_count = usize::from(next() % 3);
+                    let mut inputs = Vec::new();
+                    for _ in 0..input_count {
+                        inputs.push(usize::from(next()) % INPUTS);
+                    }
+                    let mut children = Vec::new();
+                    if level > 0 {
+                        let lower_end = OFFSETS[level];
+                        let count = usize::from(next() % 4);
+                        for _ in 0..count {
+                            children.push(usize::from(next()) % lower_end);
+                        }
+                    }
+                    nodes.push(Node {
+                        level,
+                        inputs,
+                        children,
+                    });
+                }
+            }
+            Graph {
+                nodes,
+                calls: (0..NODE_TOTAL).map(|_| AtomicU64::new(0)).collect(),
+                inputs,
+            }
+        }
+
+        fn engine(graph: Arc<Graph>) -> DerivationEngine<u64, u64> {
+            let engine = DerivationEngine::new(
+                &RetentionBudget::for_test_capacity(1_000_000),
+                Arc::new(Capture),
+                graph.inputs.clone(),
+            );
+            register(&engine, graph);
+            engine
+        }
+
+        fn graph_copy(graph: &Graph) -> Arc<Graph> {
+            Graph::new(graph.nodes.clone(), graph.inputs.clone())
+        }
+
+        fn run_all(engine: &DerivationEngine<u64, u64>, graph: &Graph, revision: u64) -> Vec<u64> {
+            let mut answers = vec![0; NODE_TOTAL];
+            for node in (0..NODE_TOTAL).rev() {
+                answers[node] = demand_node(engine, graph, node, revision);
+            }
+            answers
+        }
+
+        fn call_counts(graph: &Graph) -> [u64; NODE_TOTAL] {
+            std::array::from_fn(|node| graph.calls[node].load(Ordering::Relaxed))
+        }
+
+        fn generated_graph(seed: &[u8], inputs: Arc<Inputs>) -> Graph {
+            let mut graph = graph_from(seed, inputs);
+            // A guaranteed equal-output path: node 0 sums inputs 0 and 1,
+            // node 3 consumes it, and node 6 consumes node 3.
+            graph.nodes[0].inputs = vec![0, 1];
+            graph.nodes[3].inputs.clear();
+            graph.nodes[6].inputs.clear();
+            graph.nodes[3].children = vec![0];
+            graph.nodes[6].children = vec![3];
+            graph
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(8))]
+            #[test]
+            fn random_stratified_dag_matches_direct_values_and_reuses_unchanged_inputs(
+                graph_seed in prop::collection::vec(any::<u8>(), 1..40),
+                edits in prop::collection::vec((0usize..INPUTS, 0u8..4), 0..10),
+            ) {
+                let initial = [1, 1, 0, 0, 0, 0];
+                let inputs = Arc::new(Inputs { revisions: Mutex::new(HashMap::from_iter([(0, initial)])) });
+                let graph = Arc::new(generated_graph(&graph_seed, inputs.clone()));
+                let warm = engine(graph.clone());
+                prop_assert_eq!(run_all(&warm, &graph, 0), graph.direct_values(&initial));
+                let mut previous = initial;
+                let mut revision = 0u64;
+                // Keep at least one equal-output update in every generated
+                // case, then apply arbitrary edits (including no-ops).
+                let mut sequence = vec![(usize::MAX, 0)];
+                sequence.extend(edits);
+                for (input, new_value) in sequence {
+                    revision += 1;
+                    let mut current = previous;
+                    if input == usize::MAX {
+                        current[0] = 2;
+                        current[1] = 0;
+                    } else {
+                        current[input] = new_value;
+                    }
+                    inputs.revisions.lock().unwrap().insert(revision, current);
+                    let before = call_counts(&graph);
+                    let warm_answers = run_all(&warm, &graph, revision);
+                    let direct = graph.direct_values(&current);
+                    prop_assert_eq!(&warm_answers, &direct);
+
+                    let cold_graph = graph_copy(&graph);
+                    let cold = engine(cold_graph.clone());
+                    prop_assert_eq!(warm_answers, run_all(&cold, &cold_graph, revision));
+
+                    let after = call_counts(&graph);
+                    for node in 0..NODE_TOTAL {
+                        let transitive = graph.transitive_inputs(node);
+                        let unchanged = (0..INPUTS).all(|i| !transitive[i] || previous[i] == current[i]);
+                        if unchanged {
+                            prop_assert_eq!(after[node] - before[node], 0, "unchanged node {} recomputed at revision {}", node, revision);
+                        }
+                    }
+                    if revision == 1 {
+                        prop_assert_eq!(direct[0], graph.direct_values(&previous)[0], "balanced edit must preserve child output");
+                        prop_assert_eq!(after[0] - before[0], 1, "changed inputs must recompute the leaf");
+                        prop_assert_eq!(after[3] - before[3], 0, "equal child output must cut off its parent");
+                        prop_assert_eq!(after[6] - before[6], 0, "equal child output must cut off the upper parent");
+                    }
+                    previous = current;
+                }
+            }
+        }
+    }
 
     type ToyCaptureFrame = (
         u64,
@@ -1311,7 +2079,7 @@ mod derivation_properties {
                     0,
                 ))
             });
-            work();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
             let (
                 _,
                 reads,
@@ -1321,6 +2089,9 @@ mod derivation_properties {
                 execution_dependences,
                 persistence_refusals,
             ) = STACK.with(|s| s.borrow_mut().pop().unwrap());
+            if let Err(panic) = result {
+                std::panic::resume_unwind(panic);
+            }
             CaptureReceipt {
                 reads,
                 unattributed,
@@ -1328,6 +2099,8 @@ mod derivation_properties {
                 reuse_refusals,
                 persistence_refusals,
                 stable_reasons,
+                unstable_reasons: None,
+                explicit_verdict: ReuseVerdict::Content,
             }
         }
         fn report_unattributed(&self) {
@@ -1344,6 +2117,7 @@ mod derivation_properties {
                 }
             });
         }
+        fn report_verdict(&self, _: ReuseVerdict) {}
         fn report_reuse_refusal(&self, cause: NotReusableCause) {
             STACK.with(|s| {
                 if let Some(top) = s.borrow_mut().last_mut() {
@@ -1436,7 +2210,7 @@ mod derivation_properties {
                 entered.wait();
                 release.wait();
             }
-            assert_eq!(self.state.panic_after_gate.load(Ordering::SeqCst), 0);
+            assert_eq!(self.state.panic_after_gate.swap(0, Ordering::SeqCst), 0);
             let delay = self.state.delay_ms.load(Ordering::SeqCst);
             if delay > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(delay as u64));
@@ -1475,6 +2249,7 @@ mod derivation_properties {
                     .copied()
                     .unwrap_or(false),
                 validity,
+                reuse: ReuseVerdict::Content,
             }
         }
         fn output_projection(value: &Value, hash: &mut CanonicalHasher) {
@@ -1513,12 +2288,246 @@ mod derivation_properties {
                 value: Value(a.0.wrapping_add(b.0)),
                 complete: true,
                 validity: ReuseValidity::Reusable,
+                reuse: ReuseVerdict::Content,
             }
         }
         fn output_projection(value: &Value, hash: &mut CanonicalHasher) {
             hash.value(&[value.0]);
         }
     }
+    #[test]
+    #[hardwon("#13102: equal child output must refresh a parent's independent-input closure")]
+    fn equal_output_refreshes_child_closure_and_preserves_readless_fast_hits() {
+        struct Inputs {
+            model: AtomicUsize,
+            checks: AtomicUsize,
+            child_calls: AtomicUsize,
+            parent_calls: AtomicUsize,
+        }
+        impl BaseInputs<u64, u64> for Inputs {
+            fn unchanged(&self, read: &ReadKey, _: &u64, _: &u64, _: &u64) -> bool {
+                self.checks.fetch_add(1, Ordering::Relaxed);
+                matches!(read, ReadKey::Models(digest) if *digest ==
+                    StableDigest::sha256([self.model.load(Ordering::Relaxed) as u8]))
+            }
+            fn unchanged_without_stage(
+                &self,
+                read: &ReadKey,
+                since: &u64,
+                at: &u64,
+                authority: &u64,
+            ) -> bool {
+                self.unchanged(read, since, at, authority)
+            }
+        }
+        struct ChangingChild(Arc<Inputs>);
+        impl DerivationKind for ChangingChild {
+            type Key = Key;
+            type Output = Value;
+            const ID: DerivationKindId = DerivationKindId("test:changing_input_closure:v1");
+            const STRATUM: u16 = 0;
+            const VERIFY: Verification = Verification::Recompute;
+            const CHILDREN: &'static [(DerivationKindId, u16)] = &[];
+            fn question(key: &Key) -> DerivationQuestion {
+                question(key)
+            }
+            fn key_from_question(question: &DerivationQuestion) -> Option<Key> {
+                from_question(question)
+            }
+            fn compute<R: DerivationRevision, A: DerivationAuthority>(
+                &self,
+                _: &mut DerivationFrame<'_, R, A>,
+                _: &Key,
+            ) -> Computed<Value> {
+                self.0.child_calls.fetch_add(1, Ordering::Relaxed);
+                // The selected revision represents the SQL flag that enables
+                // this input, rather than an unrecorded model-absence probe.
+                let revision = STACK.with(|stack| stack.borrow().last().unwrap().0);
+                let value = if revision == 0 {
+                    1
+                } else {
+                    let value = self.0.model.load(Ordering::Relaxed) as u8;
+                    ToyCapture.record(ReadKey::Models(StableDigest::sha256([value])));
+                    value
+                };
+                Computed::Available {
+                    value: Value(value),
+                    complete: true,
+                    validity: ReuseValidity::Reusable,
+                    reuse: ReuseVerdict::Content,
+                }
+            }
+            fn output_projection(value: &Value, hash: &mut CanonicalHasher) {
+                Leaf::output_projection(value, hash);
+            }
+        }
+        struct ClosureParent(Arc<Inputs>);
+        impl DerivationKind for ClosureParent {
+            type Key = Key;
+            type Output = Value;
+            const ID: DerivationKindId = DerivationKindId("test:changing_input_parent:v1");
+            const STRATUM: u16 = 1;
+            const CHILDREN: &'static [(DerivationKindId, u16)] = &[(ChangingChild::ID, 0)];
+            fn question(key: &Key) -> DerivationQuestion {
+                question(key)
+            }
+            fn key_from_question(question: &DerivationQuestion) -> Option<Key> {
+                from_question(question)
+            }
+            fn compute<R: DerivationRevision, A: DerivationAuthority>(
+                &self,
+                frame: &mut DerivationFrame<'_, R, A>,
+                key: &Key,
+            ) -> Computed<Value> {
+                self.0.parent_calls.fetch_add(1, Ordering::Relaxed);
+                match frame.demand::<ChangingChild>(key) {
+                    Demanded::Available { value, .. } => Computed::Available {
+                        value: Value(value.0),
+                        complete: true,
+                        validity: ReuseValidity::Reusable,
+                        reuse: ReuseVerdict::Content,
+                    },
+                    Demanded::Unavailable(cause) => Computed::Unavailable(cause),
+                }
+            }
+            fn output_projection(value: &Value, hash: &mut CanonicalHasher) {
+                Leaf::output_projection(value, hash);
+            }
+        }
+        let inputs = Arc::new(Inputs {
+            model: AtomicUsize::new(1),
+            checks: AtomicUsize::new(0),
+            child_calls: AtomicUsize::new(0),
+            parent_calls: AtomicUsize::new(0),
+        });
+        let engine = DerivationEngine::new(
+            &RetentionBudget::for_test_capacity(1_000_000),
+            Arc::new(ToyCapture),
+            inputs.clone(),
+        );
+        engine.register(ChangingChild(inputs.clone()));
+        engine.register(ClosureParent(inputs.clone()));
+        let demand = |revision| match engine.demand::<ClosureParent>(&Key(0), revision, 0) {
+            Demanded::Available { value, .. } => value.0,
+            Demanded::Unavailable(cause) => panic!("parent unavailable: {cause:?}"),
+        };
+        assert_eq!(demand(0), 1);
+        for _ in 0..8 {
+            assert_eq!(demand(0), 1);
+            assert!(engine.try_reuse::<ClosureParent>(&Key(0), 0, 0).is_some());
+        }
+        assert_eq!(inputs.checks.load(Ordering::Relaxed), 0);
+        assert_eq!(inputs.child_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(inputs.parent_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(engine.counters(ChangingChild::ID).current_hits, 0);
+        assert_eq!(engine.counters(ClosureParent::ID).current_hits, 16);
+        assert!(engine.try_reuse::<ChangingChild>(&Key(0), 0, 0).is_some());
+        assert_eq!(inputs.checks.load(Ordering::Relaxed), 0);
+
+        assert_eq!(demand(1), 1);
+        assert_eq!(inputs.child_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(inputs.parent_calls.load(Ordering::Relaxed), 1);
+        assert!(engine.try_reuse::<ClosureParent>(&Key(0), 1, 0).is_some());
+        let checks = inputs.checks.load(Ordering::Relaxed);
+        assert!(checks > 0);
+        // Early cutoff kept the parent's output, but must replace its old
+        // revision-closed proof with the child's new model dependency.
+        inputs.model.store(2, Ordering::Relaxed);
+        assert!(engine.try_reuse::<ClosureParent>(&Key(0), 1, 0).is_none());
+        assert!(inputs.checks.load(Ordering::Relaxed) > checks);
+        assert_eq!(inputs.child_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(demand(1), 2);
+        assert_eq!(inputs.child_calls.load(Ordering::Relaxed), 3);
+        assert_eq!(inputs.parent_calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    #[hardwon("#13102: undeclared child receipt evidence must visibly refuse retention")]
+    fn invalid_child_receipts_are_not_retained_or_silently_accepted() {
+        struct InvalidEvidence;
+        impl DerivationKind for InvalidEvidence {
+            type Key = Key;
+            type Output = Value;
+            const ID: DerivationKindId = DerivationKindId("test:invalid_child_receipt:v1");
+            const STRATUM: u16 = 1;
+            const CHILDREN: &'static [(DerivationKindId, u16)] = &[];
+            fn question(key: &Key) -> DerivationQuestion {
+                question(key)
+            }
+            fn key_from_question(question: &DerivationQuestion) -> Option<Key> {
+                from_question(question)
+            }
+            fn compute<R: DerivationRevision, A: DerivationAuthority>(
+                &self,
+                _: &mut DerivationFrame<'_, R, A>,
+                key: &Key,
+            ) -> Computed<Value> {
+                let child = match key.0 {
+                    0 => Leaf::ID, // Registered and lower, but not declared.
+                    1 => Self::ID, // Registered at the same stratum.
+                    2 => DerivationKindId("test:unregistered_child:v1"),
+                    _ => unreachable!(),
+                };
+                ToyCapture.record(ReadKey::Lookup {
+                    kind: LookupKind::Derivation(child),
+                    question: LookupQuestion::Derivation(question(&Key(0))),
+                    digest: StableDigest::sha256(b"invalid child evidence"),
+                });
+                Computed::Available {
+                    value: Value(1),
+                    complete: true,
+                    validity: ReuseValidity::Reusable,
+                    reuse: ReuseVerdict::Content,
+                }
+            }
+            fn output_projection(value: &Value, hash: &mut CanonicalHasher) {
+                Leaf::output_projection(value, hash);
+            }
+        }
+        let state = ToyState::new();
+        let engine = engine(
+            1_000_000,
+            state,
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        engine.register(InvalidEvidence);
+        for key in 0..3 {
+            for _ in 0..2 {
+                let receipt = ToyCapture.capture(&0, &0, &mut || {
+                    assert!(matches!(
+                        engine.demand::<InvalidEvidence>(&Key(key), 0, 0),
+                        Demanded::Available {
+                            validity: ReuseValidity::NotReusable(
+                                NotReusableCause::InvalidDependencyEvidence
+                            ),
+                            ..
+                        }
+                    ));
+                });
+                assert!(
+                    receipt
+                        .reuse_refusals
+                        .contains(&NotReusableCause::InvalidDependencyEvidence),
+                    "refusals={:?}",
+                    receipt.reuse_refusals
+                );
+            }
+            assert!(
+                engine
+                    .try_reuse::<InvalidEvidence>(&Key(key), 0, 0)
+                    .is_none()
+            );
+        }
+        let counters = engine.counters(InvalidEvidence::ID);
+        assert_eq!(counters.recomputed, 6);
+        assert_eq!(counters.current_hits, 0);
+        assert_eq!(
+            counters.not_retainable_by_cause[&NotReusableCause::InvalidDependencyEvidence],
+            6
+        );
+    }
+
     struct RecomputeLeaf(Leaf);
     impl DerivationKind for RecomputeLeaf {
         type Key = Key;
@@ -1570,6 +2579,7 @@ mod derivation_properties {
                     value: Value(value.0),
                     complete: true,
                     validity: ReuseValidity::Reusable,
+                    reuse: ReuseVerdict::Content,
                 },
                 Demanded::Unavailable(cause) => Computed::Unavailable(cause),
             }
@@ -1586,7 +2596,7 @@ mod derivation_properties {
         let leaf_calls = Arc::new(AtomicUsize::new(0));
         let parent_calls = Arc::new(AtomicUsize::new(0));
         let engine = DerivationEngine::new(
-            &RetentionBudget::new(1_000_000),
+            &RetentionBudget::for_test_capacity(1_000_000),
             Arc::new(ToyCapture),
             state.clone(),
         );
@@ -1611,6 +2621,67 @@ mod derivation_properties {
         ));
         assert_eq!(leaf_calls.load(Ordering::SeqCst), 3);
     }
+    #[test]
+    fn selected_read_frame_rejects_another_owner_revision_or_authority() {
+        let state = ToyState::new();
+        let engine = engine(
+            1_000_000,
+            state.clone(),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        engine.register(RecomputeLeaf(Leaf {
+            state,
+            calls: Arc::new(AtomicUsize::new(0)),
+        }));
+        for (owner, revision, authority, allowed) in [
+            (RecomputeLeaf::ID, 1, 0, true),
+            (Leaf::ID, 1, 0, false),
+            (RecomputeLeaf::ID, 2, 0, false),
+            (RecomputeLeaf::ID, 1, 2, false),
+            (RecomputeLeaf::ID, u64::MAX, 0, false),
+        ] {
+            let mut frame = DerivationFrame {
+                engine: &engine,
+                revision,
+                authority,
+                stratum: 0,
+                kind_id: RecomputeLeaf::ID,
+                child_validity: ReuseValidity::Reusable,
+                child_unavailable: false,
+                child_complete: true,
+                request_owned_child: false,
+                closed_children: HashSet::default(),
+                marker: PhantomData,
+            };
+            assert_eq!(
+                frame.authorizes_selected_input(owner, |revision, authority| *revision == 1
+                    && *authority == 0),
+                allowed
+            );
+            assert_eq!(frame.child_unavailable, !allowed);
+            if allowed {
+                frame.selected_input_unavailable();
+                assert!(frame.child_unavailable);
+            }
+        }
+        // A matching name still needs an engine registration with recompute verification.
+        let mut frame = DerivationFrame {
+            engine: &engine,
+            revision: 1,
+            authority: 0,
+            stratum: 0,
+            kind_id: Leaf::ID,
+            child_validity: ReuseValidity::Reusable,
+            child_unavailable: false,
+            child_complete: true,
+            request_owned_child: false,
+            closed_children: HashSet::default(),
+            marker: PhantomData,
+        };
+        assert!(!frame.authorizes_selected_input(Leaf::ID, |_, _| true));
+    }
+
     fn engine(
         budget: u64,
         state: Arc<ToyState>,
@@ -1618,7 +2689,7 @@ mod derivation_properties {
         parent_calls: Arc<AtomicUsize>,
     ) -> DerivationEngine<u64, u64> {
         let engine = DerivationEngine::new(
-            &RetentionBudget::new(budget),
+            &RetentionBudget::for_test_capacity(budget),
             Arc::new(ToyCapture),
             state.clone(),
         );
@@ -1645,13 +2716,14 @@ mod derivation_properties {
         // parent must carry that refusal on its first demand and on a hit.
         let state = ToyState::new();
         state.values.lock().unwrap().insert(1, [1, 2]);
+        state
+            .reasons
+            .lock()
+            .unwrap()
+            .insert(0, "stable child reason".into());
+        let leaf_calls = Arc::new(AtomicUsize::new(0));
         let parent_calls = Arc::new(AtomicUsize::new(0));
-        let engine = engine(
-            1_000_000,
-            state,
-            Arc::new(AtomicUsize::new(0)),
-            parent_calls.clone(),
-        );
+        let engine = engine(1_000_000, state, leaf_calls.clone(), parent_calls.clone());
         for _ in 0..2 {
             let receipt = ToyCapture.capture(&0, &0, &mut || {
                 assert!(matches!(
@@ -1660,8 +2732,43 @@ mod derivation_properties {
                 ));
             });
             assert_eq!(receipt.persistence_refusals, 1);
+            assert!(!receipt.stable_reasons.is_empty());
+            assert!(
+                receipt
+                    .stable_reasons
+                    .iter()
+                    .all(|reason| reason == "stable child reason"),
+                "{:?}",
+                receipt.stable_reasons
+            );
         }
+        let quiet = ToyCapture.capture(&0, &0, &mut || {
+            assert!(
+                engine
+                    .verify_erased(Parent::ID, &Parent::question(&Key(0)), 0, 0)
+                    .is_some()
+            );
+        });
+        assert!(quiet.reads.is_empty(), "{:?}", quiet.reads);
+        assert!(
+            quiet.stable_reasons.is_empty(),
+            "{:?}",
+            quiet.stable_reasons
+        );
+        assert_eq!(quiet.persistence_refusals, 0);
+        assert!(
+            quiet.reuse_refusals.is_empty(),
+            "{:?}",
+            quiet.reuse_refusals
+        );
+        let typed = ToyCapture.capture(&0, &0, &mut || {
+            assert!(engine.try_reuse::<Parent>(&Key(0), 0, 0).is_some());
+        });
+        assert_eq!(typed.reads.len(), 1);
+        assert_eq!(typed.stable_reasons, ["stable child reason"]);
+        assert_eq!(typed.persistence_refusals, 1);
         assert_eq!(parent_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(leaf_calls.load(Ordering::SeqCst), 2);
         let leaf_receipt = ToyCapture.capture(&0, &0, &mut || {
             assert!(matches!(
                 engine.demand::<Leaf>(&Key(0), 0, 0),
@@ -1773,7 +2880,7 @@ mod derivation_properties {
         let state = ToyState::new();
         let calls = Arc::new(AtomicUsize::new(0));
         let engine = DerivationEngine::new(
-            &RetentionBudget::new(1_000_000),
+            &RetentionBudget::for_test_capacity(1_000_000),
             Arc::new(ToyCapture),
             state.clone(),
         );
@@ -2267,7 +3374,7 @@ mod derivation_properties {
     }
 
     #[test]
-    fn single_flight_follower_replays_receipt_into_own_capture() {
+    fn single_flight_follower_recomputes_unverifiable_leader_receipt() {
         let state = ToyState::new();
         state.reasons.lock().unwrap().insert(0, "partial".into());
         state.unattributed.lock().unwrap().insert(0, true);
@@ -2281,7 +3388,7 @@ mod derivation_properties {
         let calls = Arc::new(AtomicUsize::new(0));
         let engine = Arc::new(engine(
             1_000_000,
-            state,
+            state.clone(),
             calls.clone(),
             Arc::new(AtomicUsize::new(0)),
         ));
@@ -2296,7 +3403,9 @@ mod derivation_properties {
                     kind_id: Parent::ID,
                     child_validity: ReuseValidity::Reusable,
                     child_unavailable: false,
+                    child_complete: true,
                     request_owned_child: false,
+                    closed_children: HashSet::default(),
                     marker: PhantomData,
                 };
                 let _ = frame.demand::<Leaf>(&Key(0));
@@ -2314,7 +3423,9 @@ mod derivation_properties {
                     kind_id: Parent::ID,
                     child_validity: ReuseValidity::Reusable,
                     child_unavailable: false,
+                    child_complete: true,
                     request_owned_child: false,
+                    closed_children: HashSet::default(),
                     marker: PhantomData,
                 };
                 let _ = frame.demand::<Leaf>(&Key(0));
@@ -2336,10 +3447,13 @@ mod derivation_properties {
             }
             std::thread::yield_now();
         }
+        // Missing attribution cannot prove the follower shares the leader's
+        // inputs. Its direct computation must not wait at the old gate.
+        *state.gate.lock().unwrap() = None;
         release.wait();
         let leader_receipt = leader.join().unwrap();
         let follower_receipt = follower.join().unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(
             follower_receipt.stable_reasons,
             leader_receipt.stable_reasons
@@ -2431,8 +3545,10 @@ mod derivation_properties {
     }
 
     #[test]
-    #[hardwon("#9737: panicking flight leader left follower capture without a refusal")]
-    fn panicking_leader_reports_refusal_to_follower() {
+    #[hardwon(
+        "#9737: a panicking leader requires refusal or independently proved follower recomputation (#13102)"
+    )]
+    fn panicking_leader_does_not_poison_follower_recomputation() {
         let state = ToyState::new();
         let entered = Arc::new(std::sync::Barrier::new(2));
         let release = Arc::new(std::sync::Barrier::new(2));
@@ -2440,7 +3556,7 @@ mod derivation_properties {
         state.panic_after_gate.store(1, Ordering::SeqCst);
         let engine = Arc::new(engine(
             1_000_000,
-            state,
+            state.clone(),
             Arc::new(AtomicUsize::new(0)),
             Arc::new(AtomicUsize::new(0)),
         ));
@@ -2469,13 +3585,45 @@ mod derivation_properties {
             }
             std::thread::yield_now();
         }
+        *state.gate.lock().unwrap() = None;
         release.wait();
         assert!(leader.join().is_err());
         let (answer, receipt) = follower.join().unwrap();
-        assert!(matches!(
-            answer,
-            Demanded::Unavailable(UnavailableCause::Failed(_))
-        ));
+        let Demanded::Available {
+            value, validity, ..
+        } = answer
+        else {
+            panic!("the follower must compute its own answer");
+        };
+        assert_eq!(value.0, 1);
+        assert_eq!(validity, ReuseValidity::Reusable);
+        assert!(
+            receipt.reuse_refusals.is_empty(),
+            "{:?}",
+            receipt.reuse_refusals
+        );
+    }
+
+    #[test]
+    #[hardwon("#13102: direct unestablished computation must preserve the caller's panic refusal")]
+    fn unestablished_panic_refuses_reuse_in_the_callers_capture() {
+        let state = ToyState::new();
+        state.panic_after_gate.store(1, Ordering::SeqCst);
+        let engine = engine(
+            1_000_000,
+            state,
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let mut panicked = false;
+        let receipt = ToyCapture.capture(&u64::MAX, &0, &mut || {
+            panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                engine.demand::<Leaf>(&Key(0), u64::MAX, 0)
+            }))
+            .is_err();
+        });
+        assert!(panicked);
+        assert!(receipt.reads.is_empty());
         assert_eq!(
             receipt.reuse_refusals,
             [NotReusableCause::InvalidDependencyEvidence]
@@ -2599,7 +3747,7 @@ mod derivation_properties {
         let entered = Arc::new(std::sync::Barrier::new(2));
         let release = Arc::new(std::sync::Barrier::new(2));
         let engine = Arc::new(DerivationEngine::new(
-            &RetentionBudget::new(1_000_000),
+            &RetentionBudget::for_test_capacity(1_000_000),
             Arc::new(ToyCapture),
             Arc::new(PausingInputs {
                 state: state.clone(),
@@ -2653,7 +3801,12 @@ mod derivation_properties {
             .unwrap();
         assert_eq!(current.identity, b_identity);
         let verified = current.verified.lock().unwrap();
-        assert_eq!(verified.downcast_ref::<(u64, u64)>(), Some(&(2, 0)));
+        assert_eq!(
+            verified
+                .downcast_ref::<VerifiedStamp<u64, u64>>()
+                .map(|stamp| (stamp.revision, stamp.authority)),
+            Some((2, 0)),
+        );
     }
 
     #[test]
@@ -2742,6 +3895,58 @@ mod derivation_properties {
         assert_eq!(calls.load(Ordering::SeqCst), 3); // A replaced B; B must recompute.
     }
 
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#13110: equal unestablished revisions let unrelated inputs share one derivation flight"
+    )]
+    fn unestablished_demands_compute_in_their_own_input_state() {
+        let state = ToyState::new();
+        state.values.lock().unwrap().insert(u64::MAX, [1, 2]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let engine = Arc::new(engine(
+            1_000_000,
+            state.clone(),
+            calls.clone(),
+            Arc::new(AtomicUsize::new(0)),
+        ));
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let leading = engine.clone();
+        let gate = (entered.clone(), release.clone());
+        let leader = std::thread::spawn(move || {
+            // Pause after the first input was read, before flight publication.
+            PAUSE_REPLAY.with(|pause| *pause.borrow_mut() = Some(gate));
+            leading.demand::<Leaf>(&Key(0), u64::MAX, 0)
+        });
+        entered.wait();
+        state.values.lock().unwrap().insert(u64::MAX, [9, 2]);
+        let following = engine.clone();
+        let follower = std::thread::spawn(move || following.demand::<Leaf>(&Key(0), u64::MAX, 0));
+        // Both old and fixed implementations reach a deterministic milestone:
+        // an incorrect follower joins, or its own computation starts. Release
+        // the leader before assertions so a failing control cannot deadlock.
+        while calls.load(Ordering::SeqCst) < 2
+            && engine.followers_joined.load(Ordering::SeqCst) == 0
+            && !follower.is_finished()
+        {
+            std::thread::yield_now();
+        }
+        release.wait();
+        let Demanded::Available { value: first, .. } = leader.join().unwrap() else {
+            panic!("first unestablished demand unavailable");
+        };
+        let Demanded::Available { value: second, .. } = follower.join().unwrap() else {
+            panic!("second unestablished demand unavailable");
+        };
+        assert_eq!(first.0, 1);
+        assert_eq!(
+            second.0, 9,
+            "an unestablished revision proves no shared input identity"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(engine.followers_joined.load(Ordering::SeqCst), 0);
+    }
+
     struct BadLeaf;
     impl DerivationKind for BadLeaf {
         type Key = Key;
@@ -2769,6 +3974,7 @@ mod derivation_properties {
                 value: Value(0),
                 complete: true,
                 validity: ReuseValidity::Reusable,
+                reuse: ReuseVerdict::Content,
             }
         }
         fn output_projection(value: &Value, hash: &mut CanonicalHasher) {

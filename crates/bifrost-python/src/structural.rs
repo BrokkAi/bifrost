@@ -560,7 +560,7 @@ pub fn python_comparison_shape(node: Node<'_>) -> PythonComparisonShape<'_> {
 }
 
 /// Shared grammar-field traversal for singular roles and transient domains.
-fn visit_python_comparison_children<'tree>(
+pub(crate) fn visit_python_comparison_children<'tree>(
     node: Node<'tree>,
     mut visit: impl FnMut(Node<'tree>, bool) -> bool,
 ) -> bool {

@@ -51,6 +51,7 @@ fn evaluated_report(policy_id: &str, source: &str) -> PolicyReportDocument {
         .evaluate(
             policy,
             &PolicyEvaluationContext {
+                acceptance_hint: None,
                 analyzer: &analyzer,
                 workspace: None,
                 flow_state: &brokk_bifrost_flow::FlowWorkspaceState::new(),
@@ -242,6 +243,7 @@ fn folded_diagnostic_count_and_related_locations_survive_rendering() {
         "two source diagnostics",
         None,
         related,
+        crate::RelatedLocationOmissions::Known(0),
     )
     .unwrap()
     .with_family_count(2);
@@ -271,6 +273,7 @@ fn concise_selector_gap_caps_sites_and_counts_one_unlisted() {
         "selector discovery incomplete",
         None,
         Vec::new(),
+        crate::RelatedLocationOmissions::Known(0),
     )
     .unwrap()
     .with_selector_gap(PolicySelectorGapSummary::new(

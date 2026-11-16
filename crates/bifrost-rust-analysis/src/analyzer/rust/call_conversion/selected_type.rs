@@ -261,6 +261,147 @@ pub(crate) fn expand_alias_head(
     expand_alias_head_with_work(analyzer, expression, cancellation, depth, strict, None)
 }
 
+/// Alias hops one expansion follows, and the bound for the selected path's
+/// demand walk, which must not outrun what the expansion can consume.
+pub(crate) const MAX_ALIAS_DEPTH: usize = 8;
+
+/// Syntax of one file, as either reader acquires it.
+pub(crate) enum AliasSyntax {
+    Prepared(Arc<brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree>),
+    Conversion(Arc<brokk_bifrost_analysis::analyzer::usages::call_conversion::ConversionSource>),
+}
+
+impl AliasSyntax {
+    fn source(&self) -> &str {
+        match self {
+            Self::Prepared(prepared) => prepared.source(),
+            Self::Conversion(source) => &source.source,
+        }
+    }
+
+    fn tree(&self) -> &tree_sitter::Tree {
+        match self {
+            Self::Prepared(prepared) => prepared.tree(),
+            Self::Conversion(source) => &source.tree,
+        }
+    }
+}
+
+/// What differs between expanding aliases for analysis and for a selected
+/// operation. The expansion itself (parameter binding, defaults, the nominal
+/// versus alias split and the budgets) is shared.
+pub(crate) trait AliasHeadRoute {
+    fn syntax(&self, file: &ProjectFile) -> Result<AliasSyntax, ExternalRoute>;
+    /// Where the head written at `node` leads.
+    fn route(&self, file: &ProjectFile, source: &Arc<str>, node: Node<'_>) -> ExternalRoute;
+    /// An alias declaration was selected. Analysis lookups can consult
+    /// unrecorded inventories (#10952); selected answers are recorded reads.
+    fn alias_selected(&self) {}
+}
+
+/// Analysis expansion: structural syntax and the definition resolver.
+pub(crate) struct AnalysisAliasRoute<'a> {
+    pub(crate) analyzer: &'a dyn IAnalyzer,
+    pub(crate) cancellation: &'a brokk_bifrost_core::cancellation::CancellationToken,
+}
+
+impl AliasHeadRoute for AnalysisAliasRoute<'_> {
+    fn syntax(&self, file: &ProjectFile) -> Result<AliasSyntax, ExternalRoute> {
+        let prepared = self
+            .analyzer
+            .structural_fact_providers()
+            .into_iter()
+            .find(|provider| provider.structural_language() == Language::Rust)
+            .map(|provider| {
+                provider.structural_syntax_limited(file, 1_048_576, Some(self.cancellation))
+            });
+        match prepared {
+            Some(StructuralSyntaxLimitedOutcome::Available(syntax)) => {
+                Ok(AliasSyntax::Prepared(syntax.into_inner()))
+            }
+            Some(
+                StructuralSyntaxLimitedOutcome::Cancelled
+                | StructuralSyntaxLimitedOutcome::Exceeded { .. },
+            ) => Err(ExternalRoute::Unavailable),
+            _ => Err(ExternalRoute::Rejected),
+        }
+    }
+
+    fn route(&self, file: &ProjectFile, source: &Arc<str>, node: Node<'_>) -> ExternalRoute {
+        selected_external_route(self.analyzer, file, source, node, self.cancellation)
+    }
+
+    fn alias_selected(&self) {
+        self.analyzer.refuse_read_reuse();
+    }
+}
+
+/// Selected expansion: only answers the enclosing scheduler already
+/// completed. It never starts a resolution, so an absent, incomplete or
+/// ambiguous answer is `Unavailable` and the caller stays Unknown.
+pub(crate) struct SelectedAliasRoute<'a> {
+    pub(crate) source:
+        &'a dyn brokk_bifrost_analysis::analyzer::store::language_support::SelectedTypeHeadSource,
+    pub(crate) sources:
+        &'a brokk_bifrost_analysis::analyzer::usages::call_conversion::CallConversionContext<'a>,
+    pub(crate) analyzer: &'a dyn IAnalyzer,
+    pub(crate) cancellation: &'a brokk_bifrost_core::cancellation::CancellationToken,
+}
+
+impl AliasHeadRoute for SelectedAliasRoute<'_> {
+    fn syntax(&self, file: &ProjectFile) -> Result<AliasSyntax, ExternalRoute> {
+        self.sources
+            .source(self.analyzer, file)
+            .map(AliasSyntax::Conversion)
+            .ok_or(ExternalRoute::Unavailable)
+    }
+
+    fn route(&self, file: &ProjectFile, _source: &Arc<str>, node: Node<'_>) -> ExternalRoute {
+        use brokk_bifrost_analysis::analyzer::store::language_support::{
+            SelectedNominalHead, SelectedTypeEvaluationRead, SelectedTypeOwner,
+        };
+        if self.cancellation.is_cancelled() {
+            return ExternalRoute::Unavailable;
+        }
+        // A primitive or a path keyword names no declaration to select.
+        let Some(leaf) = lookup_leaf(node) else {
+            return ExternalRoute::Rejected;
+        };
+        let range = leaf.byte_range();
+        if let Ok(SelectedTypeEvaluationRead::Available(head)) =
+            self.source
+                .nominal_head_identity(SelectedNominalHead::Reference {
+                    file,
+                    range: range.clone(),
+                })
+        {
+            return ExternalRoute::LocalDefinition(head.declaration);
+        }
+        // Not a source declaration. A completed model or external owner is a
+        // final head, exactly as an unindexed boundary is for analysis. Anything
+        // else is a missing answer, never a negative one.
+        let Ok(Some(reference)) = self.source.type_reference(file, range, self.cancellation) else {
+            return ExternalRoute::Unavailable;
+        };
+        match self
+            .source
+            .resolved_type_owner(reference, self.cancellation)
+        {
+            Ok(Some(SelectedTypeOwner::Source(_))) | Ok(None) | Err(_) => {
+                ExternalRoute::Unavailable
+            }
+            Ok(Some(_)) => ExternalRoute::Rejected,
+        }
+    }
+}
+
+/// The range a type name is looked up by: its leaf, as `resolve_declaration`
+/// reads it. The resolver locates a reference at the leaf; a whole scoped path
+/// (`m::Alias`) locates nothing.
+pub(crate) fn reference_range(node: Node<'_>) -> std::ops::Range<usize> {
+    lookup_leaf(node).map_or_else(|| node.byte_range(), |leaf| leaf.byte_range())
+}
+
 // Both consumers use this walk. The outer-route contract retains its per-hop
 // syntax bound; canonical projection supplies one operation-wide work budget.
 pub(super) fn expand_alias_head_with_work(
@@ -269,219 +410,219 @@ pub(super) fn expand_alias_head_with_work(
     cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
     depth: usize,
     strict: bool,
+    work: Option<&mut usize>,
+) -> Result<AliasTypeExpr, ExternalRoute> {
+    expand_alias_head_via(
+        &AnalysisAliasRoute {
+            analyzer,
+            cancellation,
+        },
+        analyzer,
+        expression,
+        cancellation,
+        depth,
+        strict,
+        work,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn expand_alias_head_via(
+    route: &dyn AliasHeadRoute,
+    analyzer: &dyn IAnalyzer,
+    mut expression: AliasTypeExpr,
+    cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+    mut depth: usize,
+    strict: bool,
     mut work: Option<&mut usize>,
 ) -> Result<AliasTypeExpr, ExternalRoute> {
-    if cancellation.is_cancelled() {
-        return Err(ExternalRoute::Unavailable);
-    }
-    let AliasTypeExpr::Constructor { site, arguments } = expression else {
-        return Ok(expression);
-    };
-    let prepared = analyzer
-        .structural_fact_providers()
-        .into_iter()
-        .find(|provider| provider.structural_language() == Language::Rust)
-        .map(|provider| {
-            provider.structural_syntax_limited(&site.file, 1_048_576, Some(cancellation))
-        });
-    let prepared = match prepared {
-        Some(StructuralSyntaxLimitedOutcome::Available(syntax)) => syntax.into_inner(),
-        Some(
-            StructuralSyntaxLimitedOutcome::Cancelled
-            | StructuralSyntaxLimitedOutcome::Exceeded { .. },
-        ) => return Err(ExternalRoute::Unavailable),
-        _ => return Err(ExternalRoute::Rejected),
-    };
-    if prepared.source() != site.source.as_ref() {
-        return Err(ExternalRoute::Rejected);
-    }
-    let node = match exact_node(
-        prepared.tree().root_node(),
-        &site.kind,
-        site.start,
-        site.end,
-    ) {
-        Ok(Some(node)) => node,
-        Ok(None) => return Err(ExternalRoute::Rejected),
-        Err(()) => return Err(ExternalRoute::Unavailable),
-    };
-    match selected_external_route(analyzer, &site.file, &site.source, node, cancellation) {
-        ExternalRoute::LocalDefinition(definition) => {
-            let alias_file = definition.source().clone();
-            let prepared = analyzer
-                .structural_fact_providers()
-                .into_iter()
-                .find(|provider| provider.structural_language() == Language::Rust)
-                .map(|provider| {
-                    provider.structural_syntax_limited(&alias_file, 1_048_576, Some(cancellation))
-                });
-            let prepared = match prepared {
-                Some(StructuralSyntaxLimitedOutcome::Available(syntax)) => syntax.into_inner(),
-                Some(
-                    StructuralSyntaxLimitedOutcome::Cancelled
-                    | StructuralSyntaxLimitedOutcome::Exceeded { .. },
-                ) => return Err(ExternalRoute::Unavailable),
-                _ => return Err(ExternalRoute::Rejected),
-            };
-            if alias_file == site.file && prepared.source() != site.source.as_ref() {
-                return Err(ExternalRoute::Rejected);
-            }
-            let (ranges, _, incomplete) = analyzer.ranges_with_limit(&definition, 8, cancellation);
-            if cancellation.is_cancelled() {
-                return Err(ExternalRoute::Unavailable);
-            }
-            if incomplete {
-                return Err(ExternalRoute::Unavailable);
-            }
-            if ranges.len() != 1 {
-                return Err(ExternalRoute::Rejected);
-            }
-            let range = ranges[0];
-            let Some(mut alias) = prepared
-                .tree()
-                .root_node()
-                .named_descendant_for_byte_range(range.start_byte, range.end_byte)
-            else {
-                return Err(ExternalRoute::Rejected);
-            };
-            let nominal = matches!(alias.kind(), "struct_item" | "enum_item" | "union_item");
-            while !nominal && alias.kind() != "type_item" {
-                let Some(parent) = alias.parent() else {
+    // Each hop replaces the head with the alias's target, so the walk is a loop.
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(ExternalRoute::Unavailable);
+        }
+        let AliasTypeExpr::Constructor { site, arguments } = expression else {
+            return Ok(expression);
+        };
+        let prepared = route.syntax(&site.file)?;
+        if prepared.source() != site.source.as_ref() {
+            return Err(ExternalRoute::Rejected);
+        }
+        let node = match exact_node(
+            prepared.tree().root_node(),
+            &site.kind,
+            site.start,
+            site.end,
+        ) {
+            Ok(Some(node)) => node,
+            Ok(None) => return Err(ExternalRoute::Rejected),
+            Err(()) => return Err(ExternalRoute::Unavailable),
+        };
+        match route.route(&site.file, &site.source, node) {
+            ExternalRoute::LocalDefinition(definition) => {
+                let alias_file = definition.source().clone();
+                let prepared = route.syntax(&alias_file)?;
+                if alias_file == site.file && prepared.source() != site.source.as_ref() {
                     return Err(ExternalRoute::Rejected);
-                };
-                alias = parent;
-            }
-            if !nominal {
-                // The selected declaration and its syntax are recorded reads.
-                // Further alias-specific target/import lookups can consult
-                // unrecorded inventories (#10952); keep those products out of
-                // retained caches without changing plain nominal reuse.
-                analyzer.refuse_read_reuse();
-                // Count actual alias steps, independently of conversion depth.
-                if depth >= 8 {
+                }
+                let (ranges, _, incomplete) =
+                    analyzer.ranges_with_limit(&definition, 8, cancellation);
+                if cancellation.is_cancelled() {
                     return Err(ExternalRoute::Unavailable);
                 }
-            }
-            let Some(name) = alias.child_by_field_name("name") else {
-                return Err(ExternalRoute::Rejected);
-            };
-            if prepared.source().get(name.start_byte()..name.end_byte())
-                != Some(definition.terminal_name())
-            {
-                return Err(ExternalRoute::Rejected);
-            }
-            let alias_source = Arc::<str>::from(prepared.source());
-            let mut local_remaining = 256;
-            let remaining = work.as_deref_mut().unwrap_or(&mut local_remaining);
-            let mut bindings = HashMap::new();
-            let mut supplied = arguments.into_iter().peekable();
-            let mut instantiated = Vec::new();
-            if let Some(parameter_list) = alias.child_by_field_name("type_parameters") {
-                let mut cursor = parameter_list.walk();
-                for parameter in parameter_list
-                    .named_children(&mut cursor)
-                    .filter(|parameter| !parameter.is_extra() && parameter.kind() != "attributes")
-                {
-                    match parameter.kind() {
-                        "type_parameter" => {
-                            let Some(name) = parameter.child_by_field_name("name") else {
-                                return Err(ExternalRoute::Rejected);
-                            };
-                            let Some(spelling) =
-                                alias_source.get(name.start_byte()..name.end_byte())
-                            else {
-                                return Err(ExternalRoute::Rejected);
-                            };
-                            let spelling = spelling.strip_prefix("r#").unwrap_or(spelling);
-                            let argument = match supplied.next() {
-                                Some(AliasTypeExpr::Lifetime) => {
-                                    return Err(ExternalRoute::Rejected);
-                                }
-                                Some(argument) => argument,
-                                None => {
-                                    let Some(default) =
-                                        parameter.child_by_field_name("default_type")
-                                    else {
-                                        return Err(ExternalRoute::Rejected);
-                                    };
-                                    let Some(default) = alias_type_expr(
-                                        default,
-                                        &alias_file,
-                                        &alias_source,
-                                        remaining,
-                                    ) else {
-                                        return Err(ExternalRoute::Unavailable);
-                                    };
-                                    let Some(expanded) =
-                                        substitute_alias_type(&default, &bindings, remaining)
-                                    else {
-                                        return Err(ExternalRoute::Unavailable);
-                                    };
-                                    expanded
-                                }
-                            };
-                            if nominal {
-                                let instance = if strict {
-                                    clone_alias_type(&argument, remaining)
-                                        .ok_or(ExternalRoute::Unavailable)?
-                                } else {
-                                    argument.clone()
-                                };
-                                instantiated.push(instance);
-                            }
-                            if bindings.insert(spelling.to_owned(), argument).is_some() {
-                                return Err(ExternalRoute::Rejected);
-                            }
-                        }
-                        "lifetime" | "lifetime_parameter" => {
-                            // Rust elides lifetime arguments at a type use.
-                            // Consume one only when the next supplied syntax
-                            // is actually a lifetime.
-                            if matches!(supplied.peek(), Some(AliasTypeExpr::Lifetime)) {
-                                supplied.next();
-                            }
-                        }
-                        "const_parameter" => {
-                            if strict {
-                                return Err(ExternalRoute::Rejected);
-                            }
-                            let has_default = parameter.child_by_field_name("value").is_some();
-                            match supplied.next() {
-                                Some(AliasTypeExpr::Lifetime) => {
-                                    return Err(ExternalRoute::Rejected);
-                                }
-                                Some(_) => {}
-                                None if !has_default => return Err(ExternalRoute::Rejected),
-                                None => {}
-                            }
-                        }
-                        _ => return Err(ExternalRoute::Rejected),
+                if incomplete {
+                    return Err(ExternalRoute::Unavailable);
+                }
+                if ranges.len() != 1 {
+                    return Err(ExternalRoute::Rejected);
+                }
+                let range = ranges[0];
+                let Some(mut alias) = prepared
+                    .tree()
+                    .root_node()
+                    .named_descendant_for_byte_range(range.start_byte, range.end_byte)
+                else {
+                    return Err(ExternalRoute::Rejected);
+                };
+                let nominal = matches!(alias.kind(), "struct_item" | "enum_item" | "union_item");
+                while !nominal && alias.kind() != "type_item" {
+                    let Some(parent) = alias.parent() else {
+                        return Err(ExternalRoute::Rejected);
+                    };
+                    alias = parent;
+                }
+                if !nominal {
+                    route.alias_selected();
+                    // Count actual alias steps, independently of conversion depth.
+                    if depth >= MAX_ALIAS_DEPTH {
+                        return Err(ExternalRoute::Unavailable);
                     }
                 }
+                let Some(name) = alias.child_by_field_name("name") else {
+                    return Err(ExternalRoute::Rejected);
+                };
+                if prepared.source().get(name.start_byte()..name.end_byte())
+                    != Some(definition.terminal_name())
+                {
+                    return Err(ExternalRoute::Rejected);
+                }
+                let alias_source = Arc::<str>::from(prepared.source());
+                let mut local_remaining = 256;
+                let remaining = work.as_deref_mut().unwrap_or(&mut local_remaining);
+                let mut bindings = HashMap::new();
+                let mut supplied = arguments.into_iter().peekable();
+                let mut instantiated = Vec::new();
+                if let Some(parameter_list) = alias.child_by_field_name("type_parameters") {
+                    let mut cursor = parameter_list.walk();
+                    for parameter in
+                        parameter_list
+                            .named_children(&mut cursor)
+                            .filter(|parameter| {
+                                !parameter.is_extra() && parameter.kind() != "attributes"
+                            })
+                    {
+                        match parameter.kind() {
+                            "type_parameter" => {
+                                let Some(name) = parameter.child_by_field_name("name") else {
+                                    return Err(ExternalRoute::Rejected);
+                                };
+                                let Some(spelling) =
+                                    alias_source.get(name.start_byte()..name.end_byte())
+                                else {
+                                    return Err(ExternalRoute::Rejected);
+                                };
+                                let spelling = spelling.strip_prefix("r#").unwrap_or(spelling);
+                                let argument = match supplied.next() {
+                                    Some(AliasTypeExpr::Lifetime) => {
+                                        return Err(ExternalRoute::Rejected);
+                                    }
+                                    Some(argument) => argument,
+                                    None => {
+                                        let Some(default) =
+                                            parameter.child_by_field_name("default_type")
+                                        else {
+                                            return Err(ExternalRoute::Rejected);
+                                        };
+                                        let Some(default) = alias_type_expr(
+                                            default,
+                                            &alias_file,
+                                            &alias_source,
+                                            remaining,
+                                        ) else {
+                                            return Err(ExternalRoute::Unavailable);
+                                        };
+                                        let Some(expanded) =
+                                            substitute_alias_type(&default, &bindings, remaining)
+                                        else {
+                                            return Err(ExternalRoute::Unavailable);
+                                        };
+                                        expanded
+                                    }
+                                };
+                                if nominal {
+                                    let instance = if strict {
+                                        clone_alias_type(&argument, remaining)
+                                            .ok_or(ExternalRoute::Unavailable)?
+                                    } else {
+                                        argument.clone()
+                                    };
+                                    instantiated.push(instance);
+                                }
+                                if bindings.insert(spelling.to_owned(), argument).is_some() {
+                                    return Err(ExternalRoute::Rejected);
+                                }
+                            }
+                            "lifetime" | "lifetime_parameter" => {
+                                // Rust elides lifetime arguments at a type use.
+                                // Consume one only when the next supplied syntax
+                                // is actually a lifetime.
+                                if matches!(supplied.peek(), Some(AliasTypeExpr::Lifetime)) {
+                                    supplied.next();
+                                }
+                            }
+                            "const_parameter" => {
+                                if strict {
+                                    return Err(ExternalRoute::Rejected);
+                                }
+                                let has_default = parameter.child_by_field_name("value").is_some();
+                                match supplied.next() {
+                                    Some(AliasTypeExpr::Lifetime) => {
+                                        return Err(ExternalRoute::Rejected);
+                                    }
+                                    Some(_) => {}
+                                    None if !has_default => return Err(ExternalRoute::Rejected),
+                                    None => {}
+                                }
+                            }
+                            _ => return Err(ExternalRoute::Rejected),
+                        }
+                    }
+                }
+                if supplied.next().is_some() {
+                    return Err(ExternalRoute::Rejected);
+                }
+                if nominal {
+                    return Ok(AliasTypeExpr::Constructor {
+                        site,
+                        arguments: instantiated,
+                    });
+                }
+                let Some(target) = alias.child_by_field_name("type") else {
+                    return Err(ExternalRoute::Rejected);
+                };
+                let Some(target) = alias_type_expr(target, &alias_file, &alias_source, remaining)
+                else {
+                    return Err(ExternalRoute::Unavailable);
+                };
+                let Some(expanded) = substitute_alias_type(&target, &bindings, remaining) else {
+                    return Err(ExternalRoute::Unavailable);
+                };
+                expression = expanded;
+                depth += 1;
             }
-            if supplied.next().is_some() {
-                return Err(ExternalRoute::Rejected);
-            }
-            if nominal {
-                return Ok(AliasTypeExpr::Constructor {
-                    site,
-                    arguments: instantiated,
-                });
-            }
-            let Some(target) = alias.child_by_field_name("type") else {
-                return Err(ExternalRoute::Rejected);
-            };
-            let Some(target) = alias_type_expr(target, &alias_file, &alias_source, remaining)
-            else {
-                return Err(ExternalRoute::Unavailable);
-            };
-            let Some(expanded) = substitute_alias_type(&target, &bindings, remaining) else {
-                return Err(ExternalRoute::Unavailable);
-            };
-            expand_alias_head_with_work(analyzer, expanded, cancellation, depth + 1, strict, work)
+            ExternalRoute::Unavailable => return Err(ExternalRoute::Unavailable),
+            _ => return Ok(AliasTypeExpr::Constructor { site, arguments }),
         }
-        ExternalRoute::Unavailable => Err(ExternalRoute::Unavailable),
-        _ => Ok(AliasTypeExpr::Constructor { site, arguments }),
     }
 }
 
@@ -627,9 +768,8 @@ pub(crate) fn selected_external_route(
             .expect("Rust selected types require a Rust analyzer");
             let caches = rust.inner.adapter().lexical_caches();
             let root = brokk_bifrost_core::analyzer::tree_walk::root_node(node);
-            let scope = brokk_bifrost_rust::lexical_scope::rust_lexical_scope_index_with(
-                caches, root, source,
-            );
+            let scope =
+                brokk_bifrost_rust::lexical_scope::rust_lexical_scope_index_with(caches, source);
             // Parent-module items are not inherited by child modules. The
             // index compares the stored module identity as well as block bounds.
             // Globs are omitted by the import helper: under the #11036 compiling-

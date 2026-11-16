@@ -46,7 +46,9 @@ pub struct FunctionSource {
     pub end_line: usize,
     pub start_byte: usize,
     pub end_byte: usize,
-    pub is_test: bool,
+    /// Null when the test classification was unavailable; a request that
+    /// excludes tests then reports the reason as incompleteness (#11385).
+    pub is_test: Option<bool>,
     /// Exact indexed text, extended backwards to attached comments.
     pub source: String,
 }
@@ -84,7 +86,7 @@ pub fn list_function_sources(
     let paths = params
         .paths
         .map(|paths| paths.into_iter().collect::<HashSet<_>>());
-    let mut by_file: HashMap<ProjectFile, Vec<(CodeUnit, bool)>> = HashMap::new();
+    let mut by_file: HashMap<ProjectFile, Vec<(CodeUnit, Option<bool>)>> = HashMap::new();
     for unit in analyzer.all_declarations() {
         if unit.is_synthetic() || !unit.is_function() {
             continue;
@@ -98,9 +100,23 @@ pub fn list_function_sources(
             continue;
         }
         let language = Language::from_path(file.rel_path());
-        let is_test =
-            analyzer.in_test_region(&unit) || test_paths::is_test_like_path(&rel_path, language);
-        if is_test && !params.include_tests {
+        // An unclassified function is kept with an unknown status: it belongs
+        // to the inventory either way. Only a request that excludes tests
+        // depends on the verdict, so only that one is incomplete.
+        let is_test = if test_paths::is_test_like_path(&rel_path, language) {
+            Some(true)
+        } else {
+            match analyzer.in_test_region(&unit) {
+                Ok(value) => Some(value),
+                Err(reason) => {
+                    if !params.include_tests {
+                        analyzer.record_query_incomplete(reason);
+                    }
+                    None
+                }
+            }
+        };
+        if is_test == Some(true) && !params.include_tests {
             continue;
         }
         by_file
@@ -238,7 +254,7 @@ mod tests {
             result
                 .records
                 .iter()
-                .any(|record| record.name == "inline_test" && record.is_test)
+                .any(|record| record.name == "inline_test" && record.is_test == Some(true))
         );
         for record in &result.records {
             let original = if record.rel_path == "Methods.java" {
@@ -284,7 +300,7 @@ mod tests {
             filtered
                 .records
                 .iter()
-                .all(|record| !record.is_test && record.rel_path == "src/lib.rs")
+                .all(|record| record.is_test == Some(false) && record.rel_path == "src/lib.rs")
         );
         assert!(
             list_function_sources(

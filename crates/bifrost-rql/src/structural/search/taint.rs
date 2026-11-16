@@ -1,3 +1,4 @@
+use super::EXECUTION_DEPENDENT;
 use super::{
     CodeQueryDiagnostic, CodeQueryDiagnosticCode, CodeQueryResultRef, CodeQueryTaintFinding,
     CodeQueryTaintLimits, SemanticProcedureValue, incomplete_diagnostic,
@@ -9,12 +10,15 @@ use crate::structural::analysis_context::{
     QueryAnalysisContext, QueryAnalysisContextError, RegisteredTaintResult, TaintBudgetStop,
     TaintBudgetStopLane, TaintResultRef,
 };
+use brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict;
 
 #[derive(Default)]
 pub(super) struct TaintQueryState {
     diagnostics: Vec<CodeQueryDiagnostic>,
     emitted_findings: usize,
     projected_bytes: usize,
+    /// The execution dependences these findings marked.
+    pub(super) reuse: ReuseVerdict,
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +81,7 @@ impl TaintQueryState {
                     )
                 });
                 workspace.analyzer().mark_execution_dependent();
+                self.reuse.join_in(EXECUTION_DEPENDENT);
                 self.push_context_error(error);
                 return Vec::new();
             }
@@ -280,7 +285,8 @@ impl TaintQueryState {
             self.push_diagnostic(
                 code,
                 Incompleteness::Operational(cause),
-                format!(
+                brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+                    format_args!(
                     "the {} {effect} at {} anchors ({}{}); {consequence}",
                     lane.limit_name(),
                     anchors.len(),
@@ -290,6 +296,9 @@ impl TaintQueryState {
                     } else {
                         format!(", and {more} more")
                     },
+                ),
+                    format_args!("the {} {effect} at {} anchors; execution_cause={cause:?}; detail_kind=Anchor; omitted_source_context_items=1", lane.limit_name(), anchors.len()),
+                    anchors.iter(),
                 ),
             );
         }

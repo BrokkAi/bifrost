@@ -21,6 +21,7 @@ use super::super::qualified_paths::{
 };
 use super::super::routes::IdentityAxis;
 use super::DerivationExecutionCause;
+use super::EXECUTION_DEPENDENT;
 use super::results::{
     CodeQueryDiagnostic, CodeQueryDiagnosticCode, CodeQueryDiagnosticImpact, CodeQueryPathSegment,
     CodeQueryQualifiedPath, CodeQueryRange,
@@ -30,6 +31,7 @@ use crate::analyzer::{IAnalyzer, ProjectFile};
 use crate::cancellation::CancellationToken;
 use crate::hash::HashMap;
 use brokk_bifrost_analysis::analyzer::workspace_authority::{CaptureScopedMemo, memo_attribution};
+use brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict;
 use std::sync::Arc;
 
 /// Domain separator for a qualified-path row's stable id.
@@ -43,6 +45,9 @@ const SEGMENT_ID_DOMAIN: &[u8] = b"bifrost.code_query.path_segment.v1";
 pub(super) struct PathTraversalCache {
     rows_only: CaptureScopedMemo<HashMap<ProjectFile, Arc<QualifiedPathsFileResult>>>,
     resolved: CaptureScopedMemo<HashMap<ProjectFile, Arc<QualifiedPathsFileResult>>>,
+    /// The execution dependences marked through this cache; the query joins it
+    /// into its reuse verdict.
+    pub(super) reuse: ReuseVerdict,
 }
 
 impl PathTraversalCache {
@@ -74,7 +79,7 @@ impl PathTraversalCache {
         };
         let derived = Arc::new(
             qualified_paths_for_file(analyzer, file, options, &token)
-                .inspect_err(|error| { brokk_bifrost_core::profiling::note_with(|| format!("policy.units unbounded origin={}:{} cause=qualified_paths_error detail={error:?}", file!(), line!())); analyzer.mark_execution_dependent(); })
+                .inspect_err(|error| { brokk_bifrost_core::profiling::note_with(|| format!("policy.units unbounded origin={}:{} cause=qualified_paths_error detail={error:?}", file!(), line!())); analyzer.mark_execution_dependent(); self.reuse.join_in(EXECUTION_DEPENDENT); })
                 .ok()?,
         );
         if let QualifiedPathCompleteness::Incomplete { reasons, .. } = &derived.completeness
@@ -94,6 +99,7 @@ impl PathTraversalCache {
                 )
             });
             analyzer.mark_execution_dependent();
+            self.reuse.join_in(EXECUTION_DEPENDENT);
         }
         let cache = if resolved {
             &mut self.resolved
@@ -131,6 +137,10 @@ impl PathTraversalCache {
                 // An unsupported axis is a property of the adapter, so it is
                 // repeated identically for every item and normalized later.
                 diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                    has_non_utf8_refusal: false,
+                    refusal_sites: Default::default(),
+                    call_relation_facts: None,
+                    uses_omissions: Vec::new(),
                     incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                     related: Vec::new(),
                     source: None,
@@ -162,6 +172,10 @@ impl PathTraversalCache {
                 None
             };
             diagnostics.push(super::QueryExecutionState::diagnostic(analyzer, CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                 incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                 related: Vec::new(),
                 source: None,

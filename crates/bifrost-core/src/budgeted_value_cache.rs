@@ -288,7 +288,7 @@ mod tests {
     )]
     #[test]
     fn published_shared_allocation_revives_for_ready_lookup_after_eviction() {
-        let budget = RetentionBudget::new(10_000);
+        let budget = RetentionBudget::for_test_capacity(10_000);
         let cache = BudgetedValueCache::new(
             budget.region::<Key, SharedAllocation<Shared>>("shared-cache-revival", None),
         );
@@ -363,7 +363,7 @@ mod tests {
     )]
     #[test]
     fn cancelled_follower_returns_while_leader_remains_live() {
-        let budget = RetentionBudget::new(4_000);
+        let budget = RetentionBudget::for_test_capacity(4_000);
         let cache = BudgetedValueCache::new(budget.region::<Key, Key>("cancelled-follower", None));
         let key = Key(1);
         let (BudgetedValueAcquisition::Leader { permit }, _) =

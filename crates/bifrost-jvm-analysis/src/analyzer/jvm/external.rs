@@ -1,3 +1,16 @@
+#[cfg(any(test, feature = "test-support"))]
+use brokk_bifrost_analysis::analyzer::semantic::call_binding::FixedArrayInvocation;
+
+#[cfg(any(test, feature = "test-support"))]
+type JavaExternalInvocationSelection<'a> = (&'a JvmExternalCallShape, Option<FixedArrayInvocation>);
+
+#[cfg(any(test, feature = "test-support"))]
+type JavaExternalInvocationDiagnostics = (
+    Result<(u32, Option<FixedArrayInvocation>), JavaExternalInvocationFailure>,
+    Option<Box<ProjectedNativeModelMemberSelection>>,
+);
+
+use crate::analyzer::jvm::dependency_evidence::MavenVersion;
 use crate::analyzer::jvm::equivalent_java_type_identity;
 use crate::analyzer::jvm::selection_codec as codec;
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::ProjectedNativeModelMember;
@@ -217,7 +230,19 @@ const MAX_ARTIFACT_MEMBERS: usize = 32_768;
 /// An indexed hierarchy comes from class files that were compiled separately
 /// and may disagree, so a cycle is possible; the visited set already stops one,
 /// and this bounds the work of a wide but acyclic hierarchy as well.
+// #11912: a read-only census of 50,785 classes in JDK 25 and five large
+// Kotlin/CodeQL tool archives found a maximum owner closure of 34. Keep 64
+// with measured headroom, and expose reaching it as a deterministic limit.
 const MAX_MEMBER_SURFACE_OWNERS: usize = 64;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OwnerWalkCompletion {
+    Complete,
+    IncompleteHierarchy,
+    Cycle,
+    FixedLimit,
+}
+
 // #10470: the dispatch identity binds the full attributed lookup gap set.
 // v4: master moved this domain to v3 (fd6c7963fd); max of both sides + 1.
 const JVM_EXTERNAL_DISPATCH_BEHAVIOR_DOMAIN: &[u8] = b"bifrost-jvm-external-dispatch-behavior/v4";
@@ -307,7 +332,11 @@ impl IndexGap {
     /// message is never read.
     pub(crate) fn attribution(&self) -> GapAttribution {
         let code = self.diagnostic.code.as_str();
-        if code == super::producer_codes::JVM_DEPENDENCY_UNRESOLVED.code
+        if [
+            super::producer_codes::JVM_DEPENDENCY_UNRESOLVED.code,
+            super::producer_codes::JVM_DEPENDENCY_UNAVAILABLE.code,
+        ]
+        .contains(&code)
             && self.dependency_id.is_some()
         {
             GapAttribution::Dependency
@@ -359,6 +388,19 @@ impl IndexGap {
     }
 }
 
+#[derive(Clone, Copy)]
+struct LookupContext<'a> {
+    file: &'a brokk_bifrost_analysis::analyzer::ProjectFile,
+    span: (usize, usize),
+    name: LookupName<'a>,
+    tier: &'static str,
+}
+#[derive(Clone, Copy)]
+enum LookupName<'a> {
+    Text(&'a str),
+    Java(&'a brokk_bifrost_jvm::java::graph_support::JavaTypeName),
+}
+
 /// The sink a Java, Kotlin or Scala lookup reports the index's gaps to.
 ///
 /// It wraps the analyzer only to reach the current query contexts: gaps go to
@@ -368,6 +410,7 @@ impl IndexGap {
 #[derive(Clone, Copy)]
 pub(crate) struct QueryGapRecorder<'a> {
     sink: GapSink<'a>,
+    lookup: Option<LookupContext<'a>>,
 }
 
 #[derive(Clone, Copy)]
@@ -379,9 +422,46 @@ enum GapSink<'a> {
 }
 
 impl<'a> QueryGapRecorder<'a> {
+    pub(crate) fn at_lookup<'b>(
+        &'b self,
+        file: &'b brokk_bifrost_analysis::analyzer::ProjectFile,
+        span: std::ops::Range<usize>,
+        name: &'b str,
+        tier: &'static str,
+    ) -> QueryGapRecorder<'b> {
+        QueryGapRecorder {
+            sink: self.sink,
+            lookup: Some(LookupContext {
+                file,
+                span: (span.start, span.end),
+                name: LookupName::Text(name),
+                tier,
+            }),
+        }
+    }
+
+    pub(crate) fn at_type_lookup<'b>(
+        &'b self,
+        file: &'b brokk_bifrost_analysis::analyzer::ProjectFile,
+        span: std::ops::Range<usize>,
+        name: &'b brokk_bifrost_jvm::java::graph_support::JavaTypeName,
+        tier: &'static str,
+    ) -> QueryGapRecorder<'b> {
+        QueryGapRecorder {
+            sink: self.sink,
+            lookup: Some(LookupContext {
+                file,
+                span: (span.start, span.end),
+                name: LookupName::Java(name),
+                tier,
+            }),
+        }
+    }
+
     pub(crate) fn new(analyzer: &'a dyn brokk_bifrost_analysis::analyzer::IAnalyzer) -> Self {
         Self {
             sink: GapSink::Analyzer(analyzer),
+            lookup: None,
         }
     }
 
@@ -391,6 +471,7 @@ impl<'a> QueryGapRecorder<'a> {
     ) -> Self {
         Self {
             sink: GapSink::Collect(reasons),
+            lookup: None,
         }
     }
 
@@ -409,6 +490,25 @@ impl<'a> QueryGapRecorder<'a> {
     }
 
     fn record_reason(&self, reason: brokk_bifrost_analysis::analyzer::QueryReadIncomplete) {
+        let reason = match self.lookup {
+            Some(LookupContext {
+                file,
+                span: (start, end),
+                name,
+                tier,
+            }) => reason.attributed(
+                brokk_bifrost_analysis::analyzer::i_analyzer::QueryLookupProvenance {
+                    file: file.clone(),
+                    byte_span: start..end,
+                    name: match name {
+                        LookupName::Text(name) => name.into(),
+                        LookupName::Java(name) => name.render().into_boxed_str(),
+                    },
+                    tier,
+                },
+            ),
+            None => reason,
+        };
         match self.sink {
             GapSink::Analyzer(analyzer) => analyzer.record_query_incomplete(reason),
             #[cfg(test)]
@@ -481,9 +581,13 @@ pub(crate) fn get_or_build_external_declaration_index(
         brokk_bifrost_analysis::analyzer::WorkspaceFactFamily,
     ),
     config: &JvmAnalyzerConfig,
-    project: &dyn Project,
     store: &brokk_bifrost_analysis::analyzer::store::AnalyzerStore,
 ) -> Arc<JvmExternalDeclarationIndex> {
+    let generation_project =
+        brokk_bifrost_analysis::analyzer::workspace::generation_dependency_discovery_project(
+            analyzer,
+        );
+    let project = generation_project.as_ref();
     slot.get_or_build(analyzer, authority, || {
         #[cfg(any(test, feature = "test-support"))]
         EXTERNAL_INDEX_BUILDS.set(EXTERNAL_INDEX_BUILDS.get() + 1);
@@ -588,6 +692,15 @@ struct JvmIndexedOwnerSurface {
     /// artifact half of the pack half's `SemanticModelOverlay::owner_surface`
     /// closure.
     supertypes: Vec<String>,
+    /// The owner's direct supertype edges with their type arguments: the same
+    /// inventory edges the pack half walks for this class file, including the
+    /// erased roots a parsed hierarchy leaves out. An edge from an unreadable
+    /// signature holds only the erased name.
+    hierarchy: Vec<HierarchyFact>,
+    /// The ordered type parameters `hierarchy` is written against. `None` when
+    /// two reads of this owner declared different lists, so no argument
+    /// position can be trusted.
+    type_parameters: Option<Vec<String>>,
     hierarchy_complete: bool,
 }
 
@@ -649,6 +762,15 @@ impl JavaArtifactFacts {
                 None => hierarchy_type_names(&fact.hierarchy),
             })
             .unwrap_or_default();
+        let hierarchy = self
+            .types
+            .get(owner_fqn)
+            .map(|fact| inventory_hierarchy(&fact.hierarchy, fact.jvm_inventory.as_ref()))
+            .unwrap_or_default();
+        let type_parameters = self
+            .types
+            .get(owner_fqn)
+            .map(|fact| fact.type_parameters.clone());
         let hierarchy_complete = self
             .types
             .get(owner_fqn)
@@ -666,6 +788,7 @@ impl JavaArtifactFacts {
                 semantic_visibility(fact.visibility),
                 is_static,
                 fact.signature.as_ref(),
+                fact.is_abstract,
                 fact.non_overridable,
             );
             let shapes_incomplete = callable_shape_is_incomplete(
@@ -695,6 +818,8 @@ impl JavaArtifactFacts {
         JvmIndexedOwnerSurface {
             members,
             supertypes,
+            hierarchy,
+            type_parameters,
             hierarchy_complete,
         }
     }
@@ -741,11 +866,44 @@ impl MemberBudget {
 fn hierarchy_type_names(hierarchy: &[HierarchyFact]) -> Vec<String> {
     hierarchy
         .iter()
-        .filter_map(|relation| match &relation.target {
-            TypeRef::Named { name, .. } => (!name.is_empty()).then(|| name.clone()),
-            _ => None,
-        })
+        .filter_map(hierarchy_type_name)
+        .map(str::to_owned)
         .collect()
+}
+
+fn hierarchy_type_name(relation: &HierarchyFact) -> Option<&str> {
+    match &relation.target {
+        TypeRef::Named { name, .. } => (!name.is_empty()).then_some(name.as_str()),
+        _ => None,
+    }
+}
+
+/// The edges one owner keeps for type-argument projection: the inventory's
+/// when the artifact has one, otherwise the declared edges a source jar
+/// records. This is what the pack half reads for the same class file, so both
+/// halves see one path.
+fn inventory_hierarchy(
+    hierarchy: &[HierarchyFact],
+    inventory: Option<&brokk_bifrost_analysis::analyzer::semantic_model::JvmOwnerInventory>,
+) -> Vec<HierarchyFact> {
+    inventory.map_or_else(
+        || hierarchy.to_vec(),
+        |inventory| inventory.supertypes.clone(),
+    )
+}
+
+/// What one walk over the read owner surfaces found.
+struct OwnerSurfaceWalk<T> {
+    /// What `select` answered, and the owners the walk crossed to the one that
+    /// answered, both ends included.
+    selected: Option<(T, Vec<String>)>,
+    /// How far the walk can speak for the read surfaces. A supertype with no
+    /// read surface does not lower it: it is listed in `unread`, and each
+    /// caller decides what an unread owner means for its question.
+    completion: OwnerWalkCompletion,
+    /// The path to each named supertype with no read surface. Each ends at that
+    /// owner, which proves nothing about what the owner itself extends.
+    unread: Vec<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1013,12 +1171,8 @@ fn resolve_jvm_semantic_pack_dependencies_traced(
     cancellation: Option<&CancellationToken>,
     mut trace: Option<&mut DependencyDiscoveryTrace>,
 ) -> DependencyDiscoveryOutcome {
-    use brokk_bifrost_analysis::analyzer::dependency_support::{
-        refuse_external_discovery_reads, report_external_discovery_read,
-    };
-    use brokk_bifrost_analysis::analyzer::semantic_model::{
-        ExternalDiscoveryRead, UnverifiableDiscoveryRead,
-    };
+    use brokk_bifrost_analysis::analyzer::dependency_support::report_external_discovery_read;
+    use brokk_bifrost_analysis::analyzer::semantic_model::ExternalDiscoveryRead;
     for name in [
         "JAVA_HOME",
         "HOME",
@@ -1032,11 +1186,15 @@ fn resolve_jvm_semantic_pack_dependencies_traced(
         report_external_discovery_read(ExternalDiscoveryRead::Environment {
             name: name.into(),
             value: std::env::var_os(name),
+            working_directory: None,
         });
     }
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
         return cancelled_discovery("JVM dependency discovery was cancelled");
     }
+    let missing_membership = inputs.files().err().is_some_and(|error| {
+        error.get_ref().is_some_and(|error| error.is::<brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::GenerationListingUnavailable>())
+    });
     let mut dependencies = config.external_dependencies.clone();
     // What the build files *declare*, kept beside the coordinates themselves:
     // scope and declaring target are properties of the declaration, and the
@@ -1058,9 +1216,53 @@ fn resolve_jvm_semantic_pack_dependencies_traced(
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
         return cancelled_discovery("JVM dependency discovery was cancelled");
     }
-    if config.dependency_discovery.mode == JvmDependencyDiscoveryMode::OfflineBuildTools {
+    if !missing_membership
+        && config.dependency_discovery.mode == JvmDependencyDiscoveryMode::OfflineBuildTools
+    {
         discover_build_tools(inputs, &config.dependency_discovery).merge_into(&mut dependencies);
     }
+    let mut outcome = resolve_declared_dependencies(
+        config,
+        project.root(),
+        dependencies,
+        &declarations,
+        limits,
+        cancellation,
+        trace,
+    );
+    if missing_membership {
+        let unavailable =
+            DependencyDiscoveryOutcome::generation_listing_unavailable(&CancellationToken::new());
+        outcome.complete = false;
+        outcome.incomplete_reason = unavailable.incomplete_reason;
+        outcome.diagnostics.extend(unavailable.diagnostics);
+    }
+    outcome
+}
+
+/// Resolve the dependencies the manifests declared in this environment. This is
+/// the environment half of discovery: it reads no manifest, only the Maven
+/// repository, the Gradle cache, the process environment and the JDK, so a
+/// recorded coordinate set can be resolved again without the tree that declared
+/// it (#11607).
+fn resolve_declared_dependencies(
+    config: &JvmAnalyzerConfig,
+    project_root: &Path,
+    dependencies: JvmExternalDependencies,
+    declarations: &brokk_bifrost_core::hash::HashMap<
+        JvmMavenCoordinate,
+        super::dependency_discovery::JvmDependencyDeclaration,
+    >,
+    limits: &DependencyPackLimits,
+    cancellation: Option<&CancellationToken>,
+    mut trace: Option<&mut DependencyDiscoveryTrace>,
+) -> DependencyDiscoveryOutcome {
+    use brokk_bifrost_analysis::analyzer::dependency_support::{
+        refuse_external_discovery_reads, report_external_discovery_read,
+    };
+    use brokk_bifrost_analysis::analyzer::semantic_model::{
+        ExternalDiscoveryRead, UnverifiableDiscoveryRead,
+    };
     if !dependencies.coordinates.is_empty() {
         // Coordinate lookup traverses the Maven repository and Gradle cache.
         report_external_discovery_read(ExternalDiscoveryRead::Unverifiable(
@@ -1082,17 +1284,17 @@ fn resolve_jvm_semantic_pack_dependencies_traced(
         for artifact in &dependencies.artifact_paths {
             trace
                 .explicit_paths
-                .push(resolve_path(project.root(), &artifact.artifact_path));
+                .push(resolve_path(project_root, &artifact.artifact_path));
             if let Some(source) = &artifact.source_artifact_path {
                 trace
                     .explicit_paths
-                    .push(resolve_path(project.root(), source));
+                    .push(resolve_path(project_root, source));
             }
         }
     }
-    let resolved = resolve_configured_artifacts_traced(
+    let (resolved, unavailable_coordinates) = resolve_configured_artifacts_traced(
         &dependencies,
-        project.root(),
+        project_root,
         trace
             .as_deref_mut()
             .map(|trace| &mut trace.resolution_steps),
@@ -1108,15 +1310,26 @@ fn resolve_jvm_semantic_pack_dependencies_traced(
         if !resolved_coordinates.contains(coordinate) {
             diagnostics.push(DependencyPackDiagnostic {
                 severity: DependencyPackDiagnosticSeverity::Error,
-                code: super::producer_codes::JVM_DEPENDENCY_UNRESOLVED
-                    .code
-                    .to_owned(),
+                code: if unavailable_coordinates.contains(&jvm_coordinate_id(coordinate)) {
+                    super::producer_codes::JVM_DEPENDENCY_UNAVAILABLE
+                } else {
+                    super::producer_codes::JVM_DEPENDENCY_UNRESOLVED
+                }
+                .code
+                .to_owned(),
                 dependency_id: Some(jvm_coordinate_id(coordinate)),
                 location: None,
-                message: format!(
-                    "exact local artifact was not found for {}",
-                    jvm_coordinate_id(coordinate)
-                ),
+                message: if unavailable_coordinates.contains(&jvm_coordinate_id(coordinate)) {
+                    format!(
+                        "local artifact acquisition failed for {}",
+                        jvm_coordinate_id(coordinate)
+                    )
+                } else {
+                    format!(
+                        "exact local artifact was not found for {}",
+                        jvm_coordinate_id(coordinate)
+                    )
+                },
             });
         }
     }
@@ -1192,7 +1405,7 @@ fn resolve_jvm_semantic_pack_dependencies_traced(
         trace.unresolved_coordinates.dedup();
     }
     let dependency_diagnostic_count = diagnostics.len();
-    let jdk_discovery = discover_configured_jdk(config, project.root());
+    let jdk_discovery = discover_configured_jdk(config, project_root);
     metadata_inputs_considered =
         metadata_inputs_considered.saturating_add(jdk_discovery.inputs_considered);
     resolved.extend(jdk_discovery.dependencies);
@@ -1260,6 +1473,7 @@ fn resolve_jvm_semantic_pack_dependencies_traced(
     let (diagnostics, bounded_suppressed) = bounded.finish();
     suppressed_diagnostics += bounded_suppressed;
     DependencyDiscoveryOutcome {
+        incomplete_reason: None,
         profile: DependencyDiscoveryProfile {
             metadata_inputs_considered,
             dependencies_resolved: resolved.len(),
@@ -2393,7 +2607,7 @@ fn resolved_semantic_pack_dependency_while(
         .as_ref()
         .map(|coordinate| CatalogCoordinate {
             name: format!("{}:{}", coordinate.group_id, coordinate.artifact_id),
-            version: Version::parse(&coordinate.version).ok(),
+            version: maven_coordinate_version(&coordinate.version),
         });
     let mut provenance = vec![DependencyProvenance {
         key: "origin".to_owned(),
@@ -2497,7 +2711,7 @@ fn resolved_semantic_pack_dependency_while(
                 version: artifact
                     .coordinate
                     .as_ref()
-                    .and_then(|coordinate| Version::parse(&coordinate.version).ok()),
+                    .and_then(|coordinate| maven_coordinate_version(&coordinate.version)),
             }),
             target: Some("jvm".to_owned()),
             configuration: None,
@@ -2508,6 +2722,16 @@ fn resolved_semantic_pack_dependency_while(
         scope: DependencyScope::Unknown,
         declared_by: None,
     }
+}
+
+/// The semver activation coordinate of the exact Maven version the resolver
+/// selected. Maven versions are not semver (`2.6`, `32.1.2-jre`), so a strict
+/// semver parse left every such row without a version and no version-ranged
+/// workspace model could activate (#11371).
+fn maven_coordinate_version(version: &str) -> Option<Version> {
+    MavenVersion::parse(version)
+        .ok()
+        .and_then(|version| version.coordinate_version())
 }
 
 fn is_scala_library_coordinate(coordinate: &JvmMavenCoordinate) -> bool {
@@ -3253,6 +3477,107 @@ impl JdkInputsConsumed {
     }
 }
 
+/// What the manifests of `project` declare: the tree part of a dependency
+/// selection (#11607). `None` when the declaration cannot be recorded as
+/// coordinates alone: build tools run, a manifest was read only in part, or a
+/// manifest names an artifact path, which resolves against the tree.
+pub(crate) fn jvm_dependency_basis(
+    config: &JvmAnalyzerConfig,
+    project: &dyn Project,
+) -> Option<brokk_bifrost_core::analyzer::external_selection::JvmDependencyBasis> {
+    use brokk_bifrost_core::analyzer::external_selection::{
+        JvmDependencyBasis, JvmDependencyBasisEntry,
+    };
+    let mode = config.dependency_discovery.mode;
+    if mode == JvmDependencyDiscoveryMode::OfflineBuildTools {
+        return None;
+    }
+    let mut dependencies = config.external_dependencies.clone();
+    let mut declarations = brokk_bifrost_core::hash::HashMap::default();
+    let mut platform_override = false;
+    if mode != JvmDependencyDiscoveryMode::Disabled {
+        let inputs = LiveDiscoveryInputs(project);
+        let discovered = discover_metadata(&inputs);
+        if !discovered.partial_manifests.is_empty() || !discovered.artifact_paths.is_empty() {
+            return None;
+        }
+        declarations.clone_from(&discovered.declarations);
+        discovered.merge_into(&mut dependencies);
+        platform_override = super::dependency_discovery::maven_platform_override_visible(&inputs);
+    }
+    let mut entries = dependencies
+        .coordinates
+        .iter()
+        .map(|coordinate| {
+            let declaration = declarations.get(coordinate);
+            JvmDependencyBasisEntry {
+                group_id: coordinate.group_id.clone(),
+                artifact_id: coordinate.artifact_id.clone(),
+                version: coordinate.version.clone(),
+                scope: declaration
+                    .map_or(DependencyScope::Unknown, |declaration| declaration.scope)
+                    .label()
+                    .to_owned(),
+                declared_by: declaration.and_then(|declaration| declaration.declared_by.clone()),
+            }
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| {
+        (
+            &left.group_id,
+            &left.artifact_id,
+            &left.version,
+            &left.declared_by,
+        )
+            .cmp(&(
+                &right.group_id,
+                &right.artifact_id,
+                &right.version,
+                &right.declared_by,
+            ))
+    });
+    entries.dedup();
+    Some(JvmDependencyBasis {
+        entries,
+        platform_override,
+    })
+}
+
+/// The tree part of a dependency selection as the dependencies and declarations
+/// that discovery would have produced from the manifests. `None` when the
+/// recorded scope is unknown to this engine.
+fn declared_dependencies_of_basis(
+    config: &JvmAnalyzerConfig,
+    basis: &brokk_bifrost_core::analyzer::external_selection::JvmDependencyBasis,
+) -> Option<(
+    JvmExternalDependencies,
+    brokk_bifrost_core::hash::HashMap<
+        JvmMavenCoordinate,
+        super::dependency_discovery::JvmDependencyDeclaration,
+    >,
+)> {
+    let mut discovered = super::dependency_discovery::DiscoveredJvmDependencies::default();
+    for entry in &basis.entries {
+        let coordinate = JvmMavenCoordinate::new(
+            entry.group_id.clone(),
+            entry.artifact_id.clone(),
+            entry.version.clone(),
+        );
+        discovered.declarations.insert(
+            coordinate.clone(),
+            super::dependency_discovery::JvmDependencyDeclaration {
+                scope: DependencyScope::from_label(&entry.scope)?,
+                declared_by: entry.declared_by.clone(),
+            },
+        );
+        discovered.coordinates.push(coordinate);
+    }
+    let declarations = discovered.declarations.clone();
+    let mut dependencies = config.external_dependencies.clone();
+    discovered.merge_into(&mut dependencies);
+    Some((dependencies, declarations))
+}
+
 /// The query-local sink that dependency discovery fills when its caller
 /// records a selection.
 #[derive(Debug, Default)]
@@ -3579,6 +3904,44 @@ impl JvmExternalDeclarationIndex {
                 None,
             )
         };
+        // The Maven compiler configuration is read from the same build files
+        // discovery reads. Gradle compile options are not read (#10492).
+        let platform_override = config.dependency_discovery.mode
+            != JvmDependencyDiscoveryMode::Disabled
+            && super::dependency_discovery::maven_platform_override_visible(&LiveDiscoveryInputs(
+                project,
+            ));
+        Self::build_from_discovery(discovery, platform_override)
+    }
+
+    /// The index the dependencies a recorded tree part declared produce in
+    /// this environment, read from no manifest (#11607). `None` when the
+    /// recorded scope is unknown to this engine.
+    pub(crate) fn build_under_basis(
+        config: &JvmAnalyzerConfig,
+        project_root: &Path,
+        basis: &brokk_bifrost_core::analyzer::external_selection::JvmDependencyBasis,
+    ) -> Option<Arc<Self>> {
+        let (dependencies, declarations) = declared_dependencies_of_basis(config, basis)?;
+        let discovery = resolve_declared_dependencies(
+            config,
+            project_root,
+            dependencies,
+            &declarations,
+            &DependencyPackLimits::default(),
+            None,
+            None,
+        );
+        Some(Self::build_from_discovery(
+            discovery,
+            basis.platform_override,
+        ))
+    }
+
+    fn build_from_discovery(
+        discovery: DependencyDiscoveryOutcome,
+        platform_override: bool,
+    ) -> Arc<Self> {
         let artifacts: Vec<ResolvedJvmArtifact> = discovery
             .dependencies
             .iter()
@@ -3609,13 +3972,6 @@ impl JvmExternalDeclarationIndex {
                 .into(),
             );
         }
-        // The Maven compiler configuration is read from the same build files
-        // discovery reads. Gradle compile options are not read (#10492).
-        let platform_override = config.dependency_discovery.mode
-            != JvmDependencyDiscoveryMode::Disabled
-            && super::dependency_discovery::maven_platform_override_visible(&LiveDiscoveryInputs(
-                project,
-            ));
         let key = external_index_memo_key(&artifacts, &diagnostics, platform_override);
         let memo = external_index_memo();
         if let Some(index) = memo.lock().expect("external index memo poisoned").get(&key) {
@@ -3650,7 +4006,7 @@ impl JvmExternalDeclarationIndex {
         config: &JvmAnalyzerConfig,
         project: &dyn Project,
         inputs: &dyn DiscoveryInputs,
-        mut visit: impl FnMut(SelectedExternalArtifact) -> Result<(), E>,
+        visit: impl FnMut(SelectedExternalArtifact) -> Result<(), E>,
     ) -> Result<ExternalInventorySelection, E> {
         let mut trace = DependencyDiscoveryTrace::default();
         let discovery = resolve_jvm_semantic_pack_dependencies_traced(
@@ -3661,6 +4017,37 @@ impl JvmExternalDeclarationIndex {
             None,
             Some(&mut trace),
         );
+        Self::select_from_discovery(config, discovery, trace, visit)
+    }
+
+    /// The selection the dependencies a recorded tree part declared produce in
+    /// this environment, read from no manifest (#11607).
+    pub(super) fn select_under_basis<E>(
+        config: &JvmAnalyzerConfig,
+        project_root: &Path,
+        basis: &brokk_bifrost_core::analyzer::external_selection::JvmDependencyBasis,
+        visit: impl FnMut(SelectedExternalArtifact) -> Result<(), E>,
+    ) -> Option<Result<ExternalInventorySelection, E>> {
+        let (dependencies, declarations) = declared_dependencies_of_basis(config, basis)?;
+        let mut trace = DependencyDiscoveryTrace::default();
+        let discovery = resolve_declared_dependencies(
+            config,
+            project_root,
+            dependencies,
+            &declarations,
+            &DependencyPackLimits::default(),
+            None,
+            Some(&mut trace),
+        );
+        Some(Self::select_from_discovery(config, discovery, trace, visit))
+    }
+
+    fn select_from_discovery<E>(
+        config: &JvmAnalyzerConfig,
+        discovery: DependencyDiscoveryOutcome,
+        trace: DependencyDiscoveryTrace,
+        mut visit: impl FnMut(SelectedExternalArtifact) -> Result<(), E>,
+    ) -> Result<ExternalInventorySelection, E> {
         let DependencyDiscoveryTrace {
             coordinates,
             partial_manifests,
@@ -4063,6 +4450,16 @@ impl JvmExternalDeclarationIndex {
                     digest.push(b"supertype");
                     digest.push(supertype.as_bytes());
                 }
+                // Java conversion reads the complete edge terms. Supertype names
+                // would alias two jars that differ only in a type argument.
+                digest.push(
+                    &serde_json::to_vec(&surface.type_parameters)
+                        .expect("type parameter names serialize"),
+                );
+                digest.push(
+                    &serde_json::to_vec(&surface.hierarchy)
+                        .expect("structured hierarchy edges serialize"),
+                );
 
                 let mut members = surface.members.iter().collect::<Vec<_>>();
                 members.sort_unstable_by_key(|(name, _)| *name);
@@ -4106,6 +4503,7 @@ impl JvmExternalDeclarationIndex {
                         digest.push(&[u8::from(shape.has_type_parameters)]);
                         digest.push(&[shape.visibility as u8]);
                         digest.push(&[u8::from(shape.non_overridable.is_some())]);
+                        digest.push(&[u8::from(shape.is_abstract)]);
                         digest.push(if shape.is_static {
                             b"static-shape"
                         } else {
@@ -4150,48 +4548,67 @@ impl JvmExternalDeclarationIndex {
     /// never read, both contribute nothing rather than proving anything: this
     /// returns `None` for "not declared here" and for "never read" alike, and a
     /// caller that finds nothing keeps the status it had.
-    fn member(&self, owner_fqn: &str, member_name: &str) -> Option<&JvmExternalMember> {
-        self.walk_owner_surfaces(owner_fqn, |_, surface| surface.members.get(member_name))
-            .0
+    fn member(
+        &self,
+        owner_fqn: &str,
+        member_name: &str,
+    ) -> (Option<&JvmExternalMember>, OwnerWalkCompletion) {
+        let walk = self.walk_owner_surfaces(
+            owner_fqn,
+            |surface| surface.supertypes.iter().map(String::as_str).collect(),
+            |_, surface| surface.members.get(member_name),
+        );
+        (walk.selected.map(|(member, _)| member), walk.completion)
     }
 
+    /// Walk the read surfaces breadth first from `owner_fqn`, following the
+    /// supertypes `parents` names, until `select` answers.
     fn walk_owner_surfaces<'a, T>(
         &'a self,
         owner_fqn: &str,
+        parents: impl Fn(&'a JvmIndexedOwnerSurface) -> Vec<&'a str>,
         mut select: impl FnMut(&str, &'a JvmIndexedOwnerSurface) -> Option<T>,
-    ) -> (Option<T>, bool) {
+    ) -> OwnerSurfaceWalk<T> {
+        let mut walk = OwnerSurfaceWalk {
+            selected: None,
+            completion: OwnerWalkCompletion::Complete,
+            unread: Vec::new(),
+        };
         let mut visited = brokk_bifrost_core::hash::HashSet::default();
         let mut queue =
             std::collections::VecDeque::from([(owner_fqn.to_owned(), Vec::<String>::new())]);
-        let mut complete = true;
         while let Some((owner, mut path)) = queue.pop_front() {
             if path.contains(&owner) {
-                complete = false;
+                walk.completion = OwnerWalkCompletion::Cycle;
                 continue;
             }
             if !visited.insert(owner.clone()) {
                 continue;
             }
             if visited.len() > MAX_MEMBER_SURFACE_OWNERS {
-                return (None, false);
-            }
-            let Some(surface) = self.members_by_owner.get(&owner) else {
-                complete = false;
-                continue;
-            };
-            complete &= surface.hierarchy_complete;
-            if let Some(selected) = select(&owner, surface) {
-                return (Some(selected), complete);
+                walk.completion = OwnerWalkCompletion::FixedLimit;
+                return walk;
             }
             path.push(owner);
+            let owner = path.last().expect("the owner was just pushed");
+            let Some(surface) = self.members_by_owner.get(owner) else {
+                walk.unread.push(path);
+                continue;
+            };
+            if !surface.hierarchy_complete {
+                walk.completion = OwnerWalkCompletion::IncompleteHierarchy;
+            }
+            if let Some(selected) = select(owner, surface) {
+                walk.selected = Some((selected, path));
+                return walk;
+            }
             queue.extend(
-                surface
-                    .supertypes
-                    .iter()
-                    .map(|parent| (parent.clone(), path.clone())),
+                parents(surface)
+                    .into_iter()
+                    .map(|parent| (parent.to_owned(), path.clone())),
             );
         }
-        (None, complete)
+        walk
     }
 
     pub(crate) fn resolve_explicit_import(
@@ -4286,6 +4703,7 @@ impl JvmExternalDeclarationIndex {
                 artifact_path,
                 "MAX_ARCHIVE_ENTRIES",
                 MAX_ARCHIVE_ENTRIES as u64,
+                super::producer_codes::JVM_INDEX_CAPPED_ENTRIES,
             );
         }
         let mut member_budget = MemberBudget::new();
@@ -4311,14 +4729,26 @@ impl JvmExternalDeclarationIndex {
                 MAX_TOTAL_ARCHIVE_BYTES.min(index_byte_budget),
                 &mut total_bytes,
             ) {
-                let (name, limit) = if entry.size() > max_entry_bytes {
-                    ("max_entry_bytes", max_entry_bytes)
+                let (name, limit, code) = if entry.size() > max_entry_bytes {
+                    (
+                        "max_entry_bytes",
+                        max_entry_bytes,
+                        super::producer_codes::JVM_INDEX_CAPPED_ENTRIES,
+                    )
                 } else if index_byte_budget < MAX_TOTAL_ARCHIVE_BYTES {
-                    ("MAX_TOTAL_INDEX_BYTES (remaining)", index_byte_budget)
+                    (
+                        "MAX_TOTAL_INDEX_BYTES (remaining)",
+                        index_byte_budget,
+                        super::producer_codes::JVM_INDEX_BUDGET,
+                    )
                 } else {
-                    ("MAX_TOTAL_ARCHIVE_BYTES", MAX_TOTAL_ARCHIVE_BYTES)
+                    (
+                        "MAX_TOTAL_ARCHIVE_BYTES",
+                        MAX_TOTAL_ARCHIVE_BYTES,
+                        super::producer_codes::JVM_INDEX_CAPPED_ENTRIES,
+                    )
                 };
-                self.note_entry_cap(artifact_path, name, limit);
+                self.note_entry_cap(artifact_path, name, limit, code);
                 continue;
             }
             if matches!(language, SourceJarLanguage::Scala) {
@@ -4348,7 +4778,12 @@ impl JvmExternalDeclarationIndex {
                 continue;
             }
             if source.len() as u64 > max_entry_bytes {
-                self.note_entry_cap(artifact_path, "max_entry_bytes", max_entry_bytes);
+                self.note_entry_cap(
+                    artifact_path,
+                    "max_entry_bytes",
+                    max_entry_bytes,
+                    super::producer_codes::JVM_INDEX_CAPPED_ENTRIES,
+                );
                 continue;
             }
             let external_types = language.source_types(artifact_path, &source_path, &source);
@@ -4394,6 +4829,7 @@ impl JvmExternalDeclarationIndex {
                 artifact_path,
                 "MAX_ARCHIVE_ENTRIES",
                 MAX_ARCHIVE_ENTRIES as u64,
+                super::producer_codes::JVM_INDEX_CAPPED_ENTRIES,
             );
         }
         let mut member_budget = MemberBudget::new();
@@ -4422,14 +4858,26 @@ impl JvmExternalDeclarationIndex {
                 MAX_TOTAL_ARCHIVE_BYTES.min(index_byte_budget),
                 &mut total_bytes,
             ) {
-                let (name, limit) = if entry.size() > MAX_CLASS_ENTRY_BYTES {
-                    ("MAX_CLASS_ENTRY_BYTES", MAX_CLASS_ENTRY_BYTES)
+                let (name, limit, code) = if entry.size() > MAX_CLASS_ENTRY_BYTES {
+                    (
+                        "MAX_CLASS_ENTRY_BYTES",
+                        MAX_CLASS_ENTRY_BYTES,
+                        super::producer_codes::JVM_INDEX_CAPPED_ENTRIES,
+                    )
                 } else if index_byte_budget < MAX_TOTAL_ARCHIVE_BYTES {
-                    ("MAX_TOTAL_INDEX_BYTES (remaining)", index_byte_budget)
+                    (
+                        "MAX_TOTAL_INDEX_BYTES (remaining)",
+                        index_byte_budget,
+                        super::producer_codes::JVM_INDEX_BUDGET,
+                    )
                 } else {
-                    ("MAX_TOTAL_ARCHIVE_BYTES", MAX_TOTAL_ARCHIVE_BYTES)
+                    (
+                        "MAX_TOTAL_ARCHIVE_BYTES",
+                        MAX_TOTAL_ARCHIVE_BYTES,
+                        super::producer_codes::JVM_INDEX_CAPPED_ENTRIES,
+                    )
                 };
-                self.note_entry_cap(artifact_path, name, limit);
+                self.note_entry_cap(artifact_path, name, limit, code);
                 continue;
             }
             let class_entry = name.into_owned();
@@ -4447,6 +4895,7 @@ impl JvmExternalDeclarationIndex {
                     artifact_path,
                     "MAX_CLASS_ENTRY_BYTES",
                     MAX_CLASS_ENTRY_BYTES,
+                    super::producer_codes::JVM_INDEX_CAPPED_ENTRIES,
                 );
                 continue;
             }
@@ -4531,6 +4980,7 @@ impl JvmExternalDeclarationIndex {
                     semantic_visibility(member.visibility),
                     is_static,
                     member.signature.as_ref(),
+                    member.is_abstract,
                     member.non_overridable,
                 );
                 let shapes_incomplete = callable_shape_is_incomplete(
@@ -4580,6 +5030,11 @@ impl JvmExternalDeclarationIndex {
                         Some(inventory) => hierarchy_type_names(&inventory.supertypes),
                         None => hierarchy_type_names(&surface.hierarchy),
                     },
+                    hierarchy: inventory_hierarchy(
+                        &surface.hierarchy,
+                        surface.jvm_inventory.as_deref(),
+                    ),
+                    type_parameters: Some(surface.type_parameters),
                     hierarchy_complete: surface
                         .jvm_inventory
                         .as_ref()
@@ -4635,6 +5090,29 @@ impl JvmExternalDeclarationIndex {
                         existing.supertypes.push(supertype);
                     }
                 }
+                // Two reads that disagree on the parameters or on the edges
+                // prove no argument: the edge arguments of one read were
+                // written against that read's own parameters. The union below
+                // still serves erased reachability.
+                let same_edges = |left: &[HierarchyFact], right: &[HierarchyFact]| {
+                    left.iter()
+                        .all(|edge| right.iter().any(|other| other.target == edge.target))
+                };
+                if existing.type_parameters != surface.type_parameters
+                    || !same_edges(&existing.hierarchy, &surface.hierarchy)
+                    || !same_edges(&surface.hierarchy, &existing.hierarchy)
+                {
+                    existing.type_parameters = None;
+                }
+                for edge in surface.hierarchy {
+                    if !existing
+                        .hierarchy
+                        .iter()
+                        .any(|retained| retained.target == edge.target)
+                    {
+                        existing.hierarchy.push(edge);
+                    }
+                }
             }
             None => {
                 self.members_by_owner.insert(owner_fqn.to_owned(), surface);
@@ -4652,11 +5130,17 @@ impl JvmExternalDeclarationIndex {
     /// finished reading it" -- instead of `external_unknown`. One diagnostic
     /// per artifact keeps the record bounded no matter how many entries an
     /// artifact skipped.
-    fn note_entry_cap(&mut self, artifact_path: &Path, cap: &str, limit: u64) {
+    fn note_entry_cap(
+        &mut self,
+        artifact_path: &Path,
+        cap: &str,
+        limit: u64,
+        code: super::producer_codes::JvmProducerCode,
+    ) {
         let location = artifact_path.to_string_lossy().into_owned();
         let message = format!("index read reached {cap} = {limit}; entries remain unindexed");
         if self.production_diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == super::producer_codes::JVM_INDEX_CAPPED_ENTRIES.code
+            diagnostic.code == code.code
                 && diagnostic.location.as_ref() == Some(&location)
                 && diagnostic.message == message
         }) {
@@ -4666,9 +5150,7 @@ impl JvmExternalDeclarationIndex {
             ProducerDiagnostic {
                 severity: ProducerDiagnosticSeverity::Warning,
                 source_entry: None,
-                code: super::producer_codes::JVM_INDEX_CAPPED_ENTRIES
-                    .code
-                    .to_owned(),
+                code: code.code.to_owned(),
                 location: Some(location),
                 declaration: None,
                 message,
@@ -5226,43 +5708,216 @@ impl<'a> JvmExternalDeclarations<'a> {
             JavaHierarchyIncomplete::MissingHierarchy => ConversionUnknown::IncompleteHierarchy,
             JavaHierarchyIncomplete::GenericSubstitution => ConversionUnknown::GenericSubstitution,
             JavaHierarchyIncomplete::Ambiguous => ConversionUnknown::AmbiguousBinding,
-            JavaHierarchyIncomplete::BudgetExhausted => ConversionUnknown::BudgetExhausted,
+            JavaHierarchyIncomplete::BudgetExhausted => ConversionUnknown::FixedLimit,
             JavaHierarchyIncomplete::Cancelled => ConversionUnknown::Cancelled,
         }
     }
 
+    /// The positions of the actual's type arguments that a witness's last owner
+    /// receives, composed along the witness's edges.
     #[cfg(any(test, feature = "test-support"))]
     fn project_java_arguments(
         witness: &brokk_bifrost_analysis::analyzer::semantic_model::JavaHierarchyWitness,
         actual_count: usize,
     ) -> Option<Vec<usize>> {
         debug_assert_eq!(witness.type_parameters.len(), witness.edges.len() + 1);
-        let parameters = witness.type_parameters.first()?.as_ref()?;
-        if parameters.len() != actual_count {
-            return None;
-        }
-        let mut positions: Vec<usize> = (0..actual_count).collect();
-        for (edge, parameters) in witness.edges.iter().zip(&witness.type_parameters) {
-            let parameters = parameters.as_ref()?;
-            let arguments = match &edge.target {
-                TypeRef::Named { arguments, .. } | TypeRef::Declared { arguments, .. } => arguments,
-                _ => return None,
-            };
-            positions = arguments
+        compose_java_positions(
+            actual_count,
+            witness
+                .edges
                 .iter()
-                .map(|argument| {
-                    let TypeRef::TypeParameter { name } = argument else {
-                        return None;
-                    };
-                    let index = parameters.iter().position(|parameter| parameter == name)?;
-                    positions.get(index).copied()
-                })
-                .collect::<Option<Vec<_>>>()?;
+                .zip(&witness.type_parameters)
+                .map(|(edge, parameters)| (parameters.as_deref(), &edge.target)),
+            witness
+                .type_parameters
+                .last()
+                .and_then(|last| last.as_deref()),
+        )
+    }
+
+    /// The positions of the actual's type arguments that every route from
+    /// `source` to `target` through the read jar surfaces, and then through
+    /// the activated packs, gives the target.
+    ///
+    /// Each owner has one state, unset, `Some(positions)` or `Open`, and a
+    /// worklist pushes each read owner's edges through the same hop step
+    /// [`Self::project_java_arguments`] uses. Two routes that reach one owner
+    /// with different positions, which separately compiled jars can produce,
+    /// make it `Open`, and an `Open` owner proves nothing. States only move
+    /// unset -> `Some` -> `Open`, so the worklist ends. The answer needs at
+    /// least one route into the target and every route to agree.
+    #[cfg(any(test, feature = "test-support"))]
+    fn project_java_artifact_arguments(
+        &self,
+        source: &str,
+        target: &str,
+        actual_count: usize,
+    ) -> Result<Vec<usize>, ConversionUnknown> {
+        use std::collections::hash_map::Entry;
+        // None is Open.
+        type State = Option<Vec<usize>>;
+        let owners = &self.artifacts.members_by_owner;
+        let mut states = brokk_bifrost_core::hash::HashMap::<String, State>::default();
+        let first = owners
+            .get(source)
+            .and_then(|surface| surface.type_parameters.as_deref())
+            .filter(|parameters| parameters.len() == actual_count)
+            .map(|_| (0..actual_count).collect());
+        states.insert(source.to_owned(), first);
+        let mut pending = std::collections::VecDeque::from([source.to_owned()]);
+        while let Some(owner) = pending.pop_front() {
+            let Some(surface) = owners.get(&owner) else {
+                continue;
+            };
+            for edge in &surface.hierarchy {
+                let Some(parent) = hierarchy_type_name(edge) else {
+                    continue;
+                };
+                let candidate: State = states[&owner].as_deref().and_then(|positions| {
+                    project_java_hop(positions, surface.type_parameters.as_deref(), &edge.target)
+                });
+                let changed = match states.entry(parent.to_owned()) {
+                    Entry::Vacant(slot) => {
+                        slot.insert(candidate);
+                        true
+                    }
+                    // An Open owner stays Open, so nothing changes there.
+                    Entry::Occupied(mut slot)
+                        if slot.get().is_some() && *slot.get() != candidate =>
+                    {
+                        slot.insert(None);
+                        true
+                    }
+                    Entry::Occupied(_) => false,
+                };
+                if states.len() > MAX_MEMBER_SURFACE_OWNERS {
+                    return Err(ConversionUnknown::FixedLimit);
+                }
+                if changed && owners.contains_key(parent) && !pending.iter().any(|p| p == parent) {
+                    pending.push_back(parent.to_owned());
+                }
+            }
         }
-        if witness.type_parameters.last()?.is_none() {
-            return None;
+        let mut candidates: Vec<State> = Vec::new();
+        for (owner, state) in &states {
+            if let Some(surface) = owners.get(owner) {
+                if owner == target {
+                    candidates.push(state.as_ref().and_then(|positions| {
+                        let parameters = surface.type_parameters.as_deref()?;
+                        (parameters.len() == positions.len()).then(|| positions.clone())
+                    }));
+                } else if !surface.hierarchy_complete {
+                    // An edge this surface did not record may reach the
+                    // target with other arguments.
+                    candidates.push(None);
+                }
+            } else if owner == "java.lang.Object" && owner != target {
+                // The root declares no supertype, so it reaches nothing.
+            } else if self.pack_declaration(owner).is_some()
+                && self.pack_declaration(target).is_some()
+            {
+                // The pack supplies the parameters the target is written
+                // against, whether the path ends at this owner or continues.
+                match self.java_hierarchy_answer(&TypeRef::named(owner), &TypeRef::named(target)) {
+                    Ok(Some(answer)) => match (answer.witness, answer.incomplete.first()) {
+                        // A witness beside an unread or ambiguous branch is one
+                        // route, not every route.
+                        (Some(_), Some(_)) | (None, Some(_)) => candidates.push(None),
+                        (Some(witness), None) => {
+                            candidates.push(state.as_deref().and_then(|positions| {
+                                let projected =
+                                    Self::project_java_arguments(&witness, positions.len())?;
+                                projected
+                                    .into_iter()
+                                    .map(|position| positions.get(position).copied())
+                                    .collect()
+                            }))
+                        }
+                        (None, None) => {}
+                    },
+                    Ok(None) | Err(_) => candidates.push(None),
+                }
+            } else {
+                // Nothing read says where this owner leads, so a route through
+                // it may reach the target with other arguments. An unread
+                // target that no pack declares has no known parameters either.
+                candidates.push(None);
+            }
         }
-        Some(positions)
+        match candidates.first() {
+            Some(Some(first)) if candidates.iter().all(|c| c.as_ref() == Some(first)) => {
+                Ok(first.clone())
+            }
+            _ => Err(ConversionUnknown::GenericSubstitution),
+        }
+    }
+
+    /// Whether `source`, which the jar index declares, reaches `target`.
+    ///
+    /// It follows the edges each read surface names. A parent no jar read ends
+    /// that path: when it and the target are both pack declarations (the JDK
+    /// lives in the model overlay) the activated packs continue the path, when
+    /// it is the target the edge itself proves the path, and when it is
+    /// `java.lang.Object` it declares no supertype to read. `Ok(false)` is a
+    /// conclusive absence; anything unread that could change the answer is an
+    /// error.
+    #[cfg(any(test, feature = "test-support"))]
+    fn java_artifact_route(&self, source: &str, target: &str) -> Result<bool, ConversionUnknown> {
+        let walk = self.artifacts.walk_owner_surfaces(
+            source,
+            |surface| {
+                surface
+                    .hierarchy
+                    .iter()
+                    .filter_map(hierarchy_type_name)
+                    .collect()
+            },
+            |owner, _| (owner == target).then_some(()),
+        );
+        if walk.selected.is_some() {
+            return Ok(true);
+        }
+        let mut open = match walk.completion {
+            OwnerWalkCompletion::Complete => None,
+            OwnerWalkCompletion::FixedLimit => Some(ConversionUnknown::FixedLimit),
+            OwnerWalkCompletion::IncompleteHierarchy | OwnerWalkCompletion::Cycle => {
+                Some(ConversionUnknown::IncompleteHierarchy)
+            }
+        };
+        for artifact_path in walk.unread {
+            let owner = artifact_path.last().expect("an unread path ends at it");
+            // The root declares no supertype, so reading it could add nothing.
+            if owner == "java.lang.Object" && owner != target {
+                continue;
+            }
+            // A parent the jars did not read may be declared by an activated
+            // pack, the way the JDK is.
+            if self.pack_declaration(owner).is_some() && self.pack_declaration(target).is_some() {
+                match self.java_hierarchy_answer(&TypeRef::named(owner), &TypeRef::named(target)) {
+                    Ok(Some(answer)) => {
+                        if answer.witness.is_some() {
+                            return Ok(true);
+                        }
+                        if let Some(reason) = answer.incomplete.first() {
+                            open.get_or_insert(Self::java_hierarchy_incomplete_cause(*reason));
+                        }
+                    }
+                    Ok(None) => {
+                        open.get_or_insert(ConversionUnknown::IncompleteHierarchy);
+                    }
+                    Err(cause) => {
+                        open.get_or_insert(cause);
+                    }
+                }
+                continue;
+            }
+            // The edge itself names the target, so the erased path exists.
+            if owner == target {
+                return Ok(true);
+            }
+            open.get_or_insert(ConversionUnknown::IncompleteHierarchy);
+        }
+        open.map_or(Ok(false), Err)
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -5285,18 +5940,9 @@ impl<'a> JvmExternalDeclarations<'a> {
                     Err(Self::java_hierarchy_incomplete_cause(answer.incomplete[0]))
                 }
             }
-            _ => {
-                let (found, complete) = self
-                    .artifacts
-                    .walk_owner_surfaces(source, |owner, _| (owner == target).then_some(()));
-                if found.is_some() {
-                    Ok(true)
-                } else if complete {
-                    Ok(false)
-                } else {
-                    Err(ConversionUnknown::IncompleteHierarchy)
-                }
-            }
+            // Every reference type widens to Object, whatever a hierarchy names.
+            None if target == "java.lang.Object" => Ok(true),
+            None => self.java_artifact_route(source, target),
         };
         // An incompatible erased owner cannot be repaired by generic arguments.
         // A positive nominal path still needs substitution, except for a raw
@@ -5318,6 +5964,8 @@ impl<'a> JvmExternalDeclarations<'a> {
         }
     }
 
+    /// Where the actual's type arguments land in the formal's owner, decided
+    /// by the same position composition whichever half read the actual's class.
     #[cfg(any(test, feature = "test-support"))]
     fn java_different_owner_arguments(
         &self,
@@ -5325,16 +5973,16 @@ impl<'a> JvmExternalDeclarations<'a> {
         formal: &TypeRef,
     ) -> Result<brokk_bifrost_jvm::java::conversion::JavaDifferentOwner, ConversionUnknown> {
         use brokk_bifrost_jvm::java::conversion::JavaDifferentOwner;
+        let actual_count = || match actual {
+            TypeRef::Named { arguments, .. } | TypeRef::Declared { arguments, .. } => {
+                Ok(arguments.len())
+            }
+            _ => Err(ConversionUnknown::GenericSubstitution),
+        };
         match self.java_hierarchy_answer(actual, formal)? {
             Some(answer) => {
                 if let Some(witness) = answer.witness {
-                    let count = match actual {
-                        TypeRef::Named { arguments, .. } | TypeRef::Declared { arguments, .. } => {
-                            arguments.len()
-                        }
-                        _ => return Err(ConversionUnknown::GenericSubstitution),
-                    };
-                    return Self::project_java_arguments(&witness, count)
+                    return Self::project_java_arguments(&witness, actual_count()?)
                         .map(JavaDifferentOwner::Projected)
                         .ok_or(ConversionUnknown::GenericSubstitution);
                 }
@@ -5344,11 +5992,19 @@ impl<'a> JvmExternalDeclarations<'a> {
                     Err(Self::java_hierarchy_incomplete_cause(answer.incomplete[0]))
                 }
             }
-            None => match self.java_nominal_widening(actual, formal) {
-                Ok(false) => Ok(JavaDifferentOwner::Incompatible),
-                Ok(true) => Err(ConversionUnknown::GenericSubstitution),
-                Err(cause) => Err(cause),
-            },
+            None => {
+                let (source, target) = (
+                    java_external_reference_name(actual)
+                        .ok_or(ConversionUnknown::UnresolvedSourceType)?,
+                    java_external_reference_name(formal)
+                        .ok_or(ConversionUnknown::UnresolvedTargetType)?,
+                );
+                if !self.java_artifact_route(source, target)? {
+                    return Ok(JavaDifferentOwner::Incompatible);
+                }
+                self.project_java_artifact_arguments(source, target, actual_count()?)
+                    .map(JavaDifferentOwner::Projected)
+            }
         }
     }
 
@@ -5398,6 +6054,24 @@ impl<'a> JvmExternalDeclarations<'a> {
         }
         // JvmExternalGaps remains the retained index's set. The admitted
         // incomplete selection refuses reuse, so these extra gaps cannot go stale.
+    }
+
+    /// Whether the surface carries no gap at all: no recorded production
+    /// diagnostic and no dependency coordinate with an unresolved artifact. A
+    /// lookup that finds nothing in a gap-free surface proves the name absent
+    /// from every dependency, which is the fact [`Self::record_dependency_gaps`]
+    /// withholds from an answer whose classpath is incomplete. Reads, and
+    /// records, nothing; an open overlay read counts as a gap.
+    pub(crate) fn carries_no_gaps(&self) -> bool {
+        self.artifacts
+            .production_diagnostics
+            .iter()
+            .all(|gap| !gap.is_recorded())
+            && self.packs.as_ref().is_none_or(|overlay| {
+                overlay
+                    .jvm_unresolved_coordinates()
+                    .is_ok_and(|coordinates| coordinates.is_empty())
+            })
     }
 
     /// Records every gap the index carries, for an outcome that depends on the
@@ -5627,7 +6301,7 @@ impl<'a> JvmExternalDeclarations<'a> {
         access_package: &str,
     ) -> Option<JvmExternalMember> {
         self.record_dependency_gaps(recorder);
-        self.artifact_member(owner, member_name)
+        self.artifact_member(recorder, owner, member_name)
             .or_else(|| self.pack_member(owner, member_name))
             .and_then(|member| member.accessible_from_package(access_package))
     }
@@ -5807,13 +6481,23 @@ impl<'a> JvmExternalDeclarations<'a> {
     /// silence rather than a negative answer.
     fn artifact_member(
         &self,
+        recorder: &QueryGapRecorder<'_>,
         owner: &JvmExternalType,
         member_name: &str,
     ) -> Option<JvmExternalMember> {
         match owner.source {
             JvmExternalDeclarationSource::SourceJar { .. }
             | JvmExternalDeclarationSource::ClassFile { .. } => {
-                self.artifacts.member(&owner.fqn, member_name).cloned()
+                let (member, completion) = self.artifacts.member(&owner.fqn, member_name);
+                if completion == OwnerWalkCompletion::FixedLimit {
+                    recorder.record_reason(
+                        brokk_bifrost_analysis::analyzer::QueryReadIncomplete::ProofStopped {
+                            reason: "fixed_limit",
+                            cause: None,
+                        },
+                    );
+                }
+                member.cloned()
             }
             JvmExternalDeclarationSource::SemanticPack { .. } => None,
         }
@@ -5919,6 +6603,20 @@ impl<'a> JvmExternalDeclarations<'a> {
                     })
                     .collect::<Vec<_>>();
                 let member = matched.first()?.clone();
+                let mut fields = matched.iter().filter(|symbol| {
+                    matches!(
+                        symbol.kind,
+                        brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelSymbolKind::Field
+                            | brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelSymbolKind::Constant
+                    )
+                });
+                let field_type = match (fields.next(), fields.next()) {
+                    (Some(field), None) if field.visibility == Visibility::Public => field
+                        .structured_signature
+                        .as_ref()
+                        .and_then(|signature| signature.returns.clone()),
+                    _ => None,
+                };
                 let mut call_shapes = Vec::new();
                 let mut unshaped_model_records = Vec::new();
                 let mut call_shapes_incomplete = false;
@@ -5960,6 +6658,7 @@ impl<'a> JvmExternalDeclarations<'a> {
                         model_record: Some(Box::new(record)),
         inventory_identity: None,
                         non_overridable: symbol.non_overridable,
+                        is_abstract: symbol.declaration_is_abstract,
                         parameter_count,
                         has_type_parameters: !signature.type_parameters.is_empty(),
                         type_parameters: signature.type_parameters.clone(),
@@ -6003,6 +6702,7 @@ impl<'a> JvmExternalDeclarations<'a> {
                     is_static: member.is_static,
                     is_constant: member.kind
                         == brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelSymbolKind::Constant,
+                    field_type,
                     jdk_artifact_sha256: (member.provenance.activation.matched_evidence.ecosystem
                         == "jdk")
                         .then(|| {
@@ -6070,6 +6770,12 @@ pub(crate) struct JvmExternalMember {
     /// constant" should require both, so a producer that ever set one flag
     /// without the other fails closed instead of over-claiming.
     is_constant: bool,
+    /// The declared type of the one public field this name denotes, read from
+    /// the field's own declaration. `returns` cannot answer this: it is the
+    /// first declaration of the collapsed name, which may be a same-named
+    /// method. `None` when no single public field declaration writes a type,
+    /// which includes every artifact-derived field (#12136).
+    field_type: Option<TypeRef>,
     /// Exact JDK declaration artifact. The Java source's selected toolchain is
     /// separate evidence and cannot turn an arbitrary library call into a JDK call.
     jdk_artifact_sha256: Option<String>,
@@ -6098,6 +6804,7 @@ struct JvmExternalCallShape {
         Option<brokk_bifrost_analysis::analyzer::resolution::fact_source::ExternalMemberIdentity>,
     non_overridable:
         Option<brokk_bifrost_analysis::analyzer::semantic_model::NonOverridableEvidence>,
+    is_abstract: bool,
     parameter_count: u32,
     parameters: Vec<TypeRef>,
     has_type_parameters: bool,
@@ -6125,6 +6832,11 @@ impl JvmExternalMember {
             .and_then(|shape| shape.non_overridable)
     }
 
+    pub(crate) fn abstract_at(&self, value_receiver: bool, arity: usize) -> Option<bool> {
+        self.applicable_shape(value_receiver, arity)
+            .map(|shape| shape.is_abstract)
+    }
+
     pub(crate) fn jdk_artifact_sha256(&self) -> Option<&str> {
         self.jdk_artifact_sha256.as_deref()
     }
@@ -6150,6 +6862,12 @@ impl JvmExternalMember {
     /// it fails at the next rung rather than here.
     pub(crate) fn declared_return_type_fqn(&self) -> Option<&str> {
         named_return_type_fqn(self.returns.as_ref())
+    }
+
+    /// The declared type of the public field this member name denotes, when
+    /// one field declaration writes it.
+    pub(crate) fn declared_field_type(&self) -> Option<&TypeRef> {
+        self.field_type.as_ref()
     }
 
     fn accessible_from_package(mut self, package_name: &str) -> Option<Self> {
@@ -6218,7 +6936,7 @@ impl JvmExternalMember {
     ) -> Option<u32> {
         self.invocation_for_argument_types_bound(instance_receiver, actuals, surface, None)
             .ok()
-            .map(|shape| shape.parameter_count)
+            .map(|(shape, _)| shape.parameter_count)
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -6238,8 +6956,29 @@ impl JvmExternalMember {
             owner_bindings,
         )
         .ok()?
+        .0
         .non_overridable
         .as_ref()
+    }
+
+    /// Abstract status belongs to the overload selected with the same bound
+    /// argument conversions as the exact call proof.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn abstract_for_argument_types(
+        &self,
+        instance_receiver: bool,
+        actuals: &[TypeRef],
+        surface: Option<&JvmExternalDeclarations<'_>>,
+        owner_bindings: Option<&std::collections::HashMap<String, TypeRef>>,
+    ) -> Option<bool> {
+        self.invocation_for_argument_types_bound(
+            instance_receiver,
+            actuals,
+            surface,
+            owner_bindings,
+        )
+        .ok()
+        .map(|(shape, _)| shape.is_abstract)
     }
 
     /// Reuse the writer's owner-member order for the overload selected by the
@@ -6261,6 +7000,7 @@ impl JvmExternalMember {
             owner_bindings,
         )
         .ok()?
+        .0
         .inventory_identity
         .clone()
     }
@@ -6278,7 +7018,7 @@ impl JvmExternalMember {
         use brokk_bifrost_analysis::analyzer::resolution::fact_source::ExternalMemberIdentity;
 
         use brokk_bifrost_analysis::analyzer::resolution::fact_source::ExternalOwnerIdentity;
-        let shape = self
+        let (shape, _) = self
             .invocation_for_argument_types_bound(
                 instance_receiver,
                 actuals,
@@ -6446,7 +7186,7 @@ impl JvmExternalMember {
         owner_bindings: &std::collections::HashMap<String, TypeRef>,
     ) -> Option<brokk_bifrost_analysis::analyzer::usages::get_definition::ExternalCallTypeBindings>
     {
-        let shape = self
+        let (shape, _) = self
             .invocation_for_argument_types_bound(
                 instance_receiver,
                 actuals,
@@ -6474,10 +7214,7 @@ impl JvmExternalMember {
         instance_receiver: bool,
         actuals: &[TypeRef],
         surface: Option<&JvmExternalDeclarations<'_>>,
-    ) -> (
-        Result<u32, JavaExternalInvocationFailure>,
-        Option<Box<ProjectedNativeModelMemberSelection>>,
-    ) {
+    ) -> JavaExternalInvocationDiagnostics {
         self.invocation_with_bound_diagnostics(instance_receiver, actuals, surface, None)
     }
 
@@ -6488,17 +7225,14 @@ impl JvmExternalMember {
         actuals: &[TypeRef],
         surface: Option<&JvmExternalDeclarations<'_>>,
         owner_bindings: Option<&std::collections::HashMap<String, TypeRef>>,
-    ) -> (
-        Result<u32, JavaExternalInvocationFailure>,
-        Option<Box<ProjectedNativeModelMemberSelection>>,
-    ) {
+    ) -> JavaExternalInvocationDiagnostics {
         match self.invocation_for_argument_types_bound(
             instance_receiver,
             actuals,
             surface,
             owner_bindings,
         ) {
-            Ok(shape) => (Ok(shape.parameter_count), None),
+            Ok((shape, fixed)) => (Ok((shape.parameter_count, fixed)), None),
             Err(failure) => (
                 Err(failure.cause),
                 self.invocation_diagnostic_family(instance_receiver, &failure),
@@ -6573,11 +7307,11 @@ impl JvmExternalMember {
         actuals: &[TypeRef],
         surface: Option<&JvmExternalDeclarations<'_>>,
         owner_bindings: Option<&std::collections::HashMap<String, TypeRef>>,
-    ) -> Result<&JvmExternalCallShape, JavaExternalInvocationAssessment> {
+    ) -> Result<JavaExternalInvocationSelection<'_>, JavaExternalInvocationAssessment> {
         // Formals equal to every actual's static type mention no owner type
         // variable, so receiver bindings cannot change this exact selection.
         if let Some(selected) = self.exact_shape_for_argument_types(instance_receiver, actuals) {
-            return Ok(selected);
+            return Ok((selected, None));
         }
         let wants_static = !instance_receiver;
         if self.call_shapes_incomplete {
@@ -6645,7 +7379,12 @@ impl JvmExternalMember {
                 applicability,
             }
         })?;
-        Ok(candidates[selected.0])
+        Ok((
+            candidates[selected.0],
+            (selected.1 != JavaExternalInvocationPhase::Variable
+                && candidates[selected.0].variadic)
+                .then_some(FixedArrayInvocation),
+        ))
     }
 }
 
@@ -6659,6 +7398,64 @@ enum JavaExternalInvocationPhase {
 
 #[cfg(any(test, feature = "test-support"))]
 use brokk_bifrost_semantic::analyzer::semantic::call_conversion::ConversionUnknown;
+
+/// Classify semantic-model arguments for the shared position algebra.
+#[cfg(any(test, feature = "test-support"))]
+fn java_hop_arguments(
+    parameters: Option<&[String]>,
+    target: &TypeRef,
+) -> Option<Vec<Option<usize>>> {
+    let (TypeRef::Named { arguments, .. } | TypeRef::Declared { arguments, .. }) = target else {
+        return None;
+    };
+    Some(
+        arguments
+            .iter()
+            .map(|argument| {
+                let TypeRef::TypeParameter { name } = argument else {
+                    return None;
+                };
+                parameters?.iter().position(|parameter| parameter == name)
+            })
+            .collect(),
+    )
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn project_java_hop(
+    positions: &[usize],
+    parameters: Option<&[String]>,
+    target: &TypeRef,
+) -> Option<Vec<usize>> {
+    let arguments = java_hop_arguments(parameters, target);
+    brokk_bifrost_jvm::java::type_projection::project_java_hop(
+        positions,
+        parameters.map(<[String]>::len),
+        arguments.as_deref(),
+    )
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn compose_java_positions<'a>(
+    actual_count: usize,
+    hops: impl IntoIterator<Item = (Option<&'a [String]>, &'a TypeRef)>,
+    last_parameters: Option<&[String]>,
+) -> Option<Vec<usize>> {
+    let hops = hops
+        .into_iter()
+        .map(|(parameters, target)| {
+            (
+                parameters.map(<[String]>::len),
+                java_hop_arguments(parameters, target),
+            )
+        })
+        .collect::<Vec<_>>();
+    brokk_bifrost_jvm::java::type_projection::compose_java_positions(
+        actual_count,
+        hops.iter().map(|(count, args)| (*count, args.as_deref())),
+        last_parameters.map(<[String]>::len),
+    )
+}
 
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6940,7 +7737,7 @@ pub(crate) fn java_external_same_static_type(left: &TypeRef, right: &TypeRef) ->
 }
 
 #[cfg(any(test, feature = "test-support"))]
-fn java_known_ground_type(ty: &TypeRef) -> bool {
+pub(crate) fn java_known_ground_type(ty: &TypeRef) -> bool {
     java_external_open_type_cause(ty, ConversionUnknown::UnresolvedSourceType).is_none()
 }
 
@@ -7289,6 +8086,7 @@ fn external_call_shape(
     visibility: JvmVisibility,
     is_static: bool,
     signature: Option<&Signature>,
+    is_abstract: bool,
     non_overridable: Option<
         brokk_bifrost_analysis::analyzer::semantic_model::NonOverridableEvidence,
     >,
@@ -7303,6 +8101,7 @@ fn external_call_shape(
         model_record: None,
         inventory_identity: None,
         non_overridable,
+        is_abstract,
         parameter_count,
         has_type_parameters: !signature.type_parameters.is_empty(),
         type_parameters: signature.type_parameters.clone(),
@@ -7360,6 +8159,7 @@ fn retain_external_member(
                 returns: retained.returns,
                 is_static: retained.is_static,
                 is_constant: retained.is_constant,
+                field_type: None,
                 jdk_artifact_sha256: None,
                 unshaped_model_records: Vec::new(),
                 call_shapes: retained.shape.into_iter().collect(),
@@ -7563,14 +8363,18 @@ fn resolve_configured_artifacts(
     config: &JvmExternalDependencies,
     project_root: &Path,
 ) -> Vec<ResolvedJvmArtifact> {
-    resolve_configured_artifacts_traced(config, project_root, None)
+    resolve_configured_artifacts_traced(config, project_root, None).0
 }
 
 fn resolve_configured_artifacts_traced(
     config: &JvmExternalDependencies,
     project_root: &Path,
     mut trace: Option<&mut Vec<ExternalPathProbe>>,
-) -> Vec<ResolvedJvmArtifact> {
+) -> (
+    Vec<ResolvedJvmArtifact>,
+    brokk_bifrost_core::hash::HashSet<String>,
+) {
+    let mut unavailable_coordinates = brokk_bifrost_core::hash::HashSet::default();
     let mut artifacts = Vec::new();
     for artifact in &config.artifact_paths {
         let resolved = resolve_explicit_artifact(artifact, project_root);
@@ -7588,10 +8392,11 @@ fn resolve_configured_artifacts_traced(
     let repository_roots = repository_roots(config);
     let gradle_cache_roots = gradle_cache_roots(config);
     for coordinate in &config.coordinates {
+        let mut coordinate_steps = Vec::new();
         let mut resolved = false;
         for root in &repository_roots {
             if let Some(artifact) =
-                resolve_coordinate_traced(root, coordinate, trace.as_deref_mut())
+                resolve_coordinate_traced(root, coordinate, Some(&mut coordinate_steps))
             {
                 artifacts.push(artifact);
                 resolved = true;
@@ -7601,12 +8406,21 @@ fn resolve_configured_artifacts_traced(
         if !resolved {
             for root in &gradle_cache_roots {
                 let gradle_artifacts =
-                    resolve_gradle_coordinate_traced(root, coordinate, trace.as_deref_mut());
+                    resolve_gradle_coordinate_traced(root, coordinate, Some(&mut coordinate_steps));
                 if !gradle_artifacts.is_empty() {
                     artifacts.extend(gradle_artifacts);
                     break;
                 }
             }
+        }
+        if coordinate_steps
+            .iter()
+            .any(|step| matches!(step.outcome, ExternalProbeOutcome::Unreadable))
+        {
+            unavailable_coordinates.insert(jvm_coordinate_id(coordinate));
+        }
+        if let Some(steps) = trace.as_deref_mut() {
+            steps.extend(coordinate_steps);
         }
     }
 
@@ -7617,7 +8431,7 @@ fn resolve_configured_artifacts_traced(
             artifact.source_artifact_path.clone(),
         ))
     });
-    artifacts
+    (artifacts, unavailable_coordinates)
 }
 
 fn resolve_explicit_artifact(
@@ -7737,17 +8551,15 @@ fn resolve_coordinate_traced(
     if !artifact_path.starts_with(&repository_root) {
         return None;
     }
-    let binary_is_file = artifact_path.is_file();
+    let metadata = fs::metadata(&artifact_path);
+    let binary_is_file = metadata.as_ref().is_ok_and(|metadata| metadata.is_file());
     if let Some(steps) = trace.as_deref_mut() {
-        steps.push(ExternalPathProbe {
-            path: artifact_path.clone(),
-            operation: ExternalProbeOperation::File,
-            outcome: if binary_is_file {
-                ExternalProbeOutcome::Found
-            } else {
-                ExternalProbeOutcome::Absent
-            },
-        });
+        record_external_probe(
+            steps,
+            &artifact_path,
+            ExternalProbeOperation::File,
+            &metadata,
+        );
     }
     if !binary_is_file {
         return None;
@@ -8461,11 +9273,73 @@ pub fn probe_registry_base_class_files() -> [TestClassFile<'static>; 2] {
 /// method table entry per method with no attributes. There is no bytecode,
 /// because nothing here executes; `jclassfile` parses it exactly as it parses a
 /// compiled class, which is what the index reads.
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 pub(crate) fn test_class_file_bytes(class: &TestClassFile<'_>) -> Vec<u8> {
-    const ACC_PUBLIC_CLASS: u16 = 0x0021; // ACC_PUBLIC | ACC_SUPER
-    const ACC_PUBLIC_METHOD: u16 = 0x0001;
-    const ACC_STATIC_METHOD: u16 = 0x0008;
+    let methods = class
+        .methods
+        .iter()
+        .map(|method| if method.is_static { 0x0009 } else { 0x0001 })
+        .collect::<Vec<_>>();
+    test_class_file_bytes_with_access(
+        class,
+        TestClassAccess {
+            class: 0x0021,
+            methods: &methods,
+            interfaces: &[],
+        },
+    )
+}
+
+/// Class-file header values for a deterministic binary fixture. These are
+/// declaration data, including abstract/interface bits, rather than inferred
+/// from the presence or absence of bytecode.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub struct TestClassAccess<'a> {
+    pub class: u16,
+    pub methods: &'a [u16],
+    pub interfaces: &'a [&'a str],
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn test_class_file_bytes_with_access(
+    class: &TestClassFile<'_>,
+    access: TestClassAccess<'_>,
+) -> Vec<u8> {
+    test_class_file_bytes_with_signatures(class, access, None, &[])
+}
+
+/// What a generic declaration adds to a [`TestClassFile`]: the attributes and
+/// tables javac writes for `Concrete extends ListLike<String>` and that the
+/// class-file hierarchy producer reads. Signatures are JVMS 4.7.9.1 strings and
+/// are written verbatim, so a fixture can also carry a malformed one.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+#[derive(Clone, Copy, Default)]
+pub struct TestClassGenerics<'a> {
+    #[doc(hidden)]
+    pub is_interface: bool,
+    #[doc(hidden)]
+    pub interfaces: &'a [&'a str],
+    #[doc(hidden)]
+    pub signature: Option<&'a str>,
+    /// The `Signature` attribute of each method, parallel to `methods`. Shorter
+    /// than `methods` means the remaining methods have none.
+    #[doc(hidden)]
+    pub method_signatures: &'a [&'a str],
+}
+
+/// [`test_class_file_bytes_with_access`] with a class `Signature` attribute and
+/// one per method (the first `method_signatures.len()` methods).
+#[cfg(any(test, feature = "test-support"))]
+fn test_class_file_bytes_with_signatures(
+    class: &TestClassFile<'_>,
+    access: TestClassAccess<'_>,
+    signature: Option<&str>,
+    method_signatures: &[&str],
+) -> Vec<u8> {
+    assert_eq!(class.methods.len(), access.methods.len());
     const CONSTANT_UTF8: u8 = 1;
     const CONSTANT_CLASS: u8 = 7;
     const CLASS_FILE_MAJOR_VERSION: u16 = 52; // Java 8
@@ -8509,9 +9383,25 @@ pub(crate) fn test_class_file_bytes(class: &TestClassFile<'_>) -> Vec<u8> {
         let descriptor_index = utf8_index(&mut pool, &mut next_index, method.descriptor);
         method_indexes.push((name_index, descriptor_index));
     }
+    let mut interfaces = Vec::with_capacity(access.interfaces.len());
+    for name in access.interfaces {
+        let name_index = utf8_index(&mut pool, &mut next_index, name);
+        pool.push(CONSTANT_CLASS);
+        pool.extend_from_slice(&name_index.to_be_bytes());
+        interfaces.push(next_index);
+        next_index += 1;
+    }
+    let method_signature_indexes = method_signatures
+        .iter()
+        .map(|signature| utf8_index(&mut pool, &mut next_index, signature))
+        .collect::<Vec<_>>();
     let inner_classes_index = class
         .private_nested
         .then(|| utf8_index(&mut pool, &mut next_index, "InnerClasses"));
+    let signature_name_index = (signature.is_some() || !method_signatures.is_empty())
+        .then(|| utf8_index(&mut pool, &mut next_index, "Signature"));
+    let class_signature_index =
+        signature.map(|signature| utf8_index(&mut pool, &mut next_index, signature));
 
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&0xCAFE_BABEu32.to_be_bytes());
@@ -8519,39 +9409,53 @@ pub(crate) fn test_class_file_bytes(class: &TestClassFile<'_>) -> Vec<u8> {
     bytes.extend_from_slice(&CLASS_FILE_MAJOR_VERSION.to_be_bytes());
     bytes.extend_from_slice(&next_index.to_be_bytes());
     bytes.extend_from_slice(&pool);
-    bytes.extend_from_slice(&ACC_PUBLIC_CLASS.to_be_bytes());
+    bytes.extend_from_slice(&access.class.to_be_bytes());
     bytes.extend_from_slice(&this_class_index.to_be_bytes());
     bytes.extend_from_slice(&super_class_index.to_be_bytes());
-    bytes.extend_from_slice(&0u16.to_be_bytes());
+    bytes.extend_from_slice(&(interfaces.len() as u16).to_be_bytes());
+    for interface in interfaces {
+        bytes.extend_from_slice(&interface.to_be_bytes());
+    }
     bytes.extend_from_slice(&0u16.to_be_bytes());
     bytes.extend_from_slice(&(class.methods.len() as u16).to_be_bytes());
-    for (method, (name_index, descriptor_index)) in class.methods.iter().zip(method_indexes) {
-        let flags = if method.is_static {
-            ACC_PUBLIC_METHOD | ACC_STATIC_METHOD
-        } else {
-            ACC_PUBLIC_METHOD
-        };
+    let signature_attribute = |bytes: &mut Vec<u8>, signature_index: u16| {
+        let name_index = signature_name_index.expect("a signature interned its attribute name");
+        bytes.extend_from_slice(&name_index.to_be_bytes());
+        bytes.extend_from_slice(&2u32.to_be_bytes());
+        bytes.extend_from_slice(&signature_index.to_be_bytes());
+    };
+    for (ordinal, (flags, (name_index, descriptor_index))) in
+        access.methods.iter().zip(method_indexes).enumerate()
+    {
         bytes.extend_from_slice(&flags.to_be_bytes());
         bytes.extend_from_slice(&name_index.to_be_bytes());
         bytes.extend_from_slice(&descriptor_index.to_be_bytes());
-        bytes.extend_from_slice(&0u16.to_be_bytes());
-    }
-    match inner_classes_index {
-        // One `InnerClasses` entry naming this very class as a private nested
-        // class: inner class, no outer, no simple name, `ACC_PRIVATE`.
-        Some(name_index) => {
-            const ACC_PRIVATE_NESTED: u16 = 0x0002;
-
-            bytes.extend_from_slice(&1u16.to_be_bytes());
-            bytes.extend_from_slice(&name_index.to_be_bytes());
-            bytes.extend_from_slice(&10u32.to_be_bytes());
-            bytes.extend_from_slice(&1u16.to_be_bytes());
-            bytes.extend_from_slice(&this_class_index.to_be_bytes());
-            bytes.extend_from_slice(&0u16.to_be_bytes());
-            bytes.extend_from_slice(&0u16.to_be_bytes());
-            bytes.extend_from_slice(&ACC_PRIVATE_NESTED.to_be_bytes());
+        match method_signature_indexes.get(ordinal) {
+            Some(signature_index) => {
+                bytes.extend_from_slice(&1u16.to_be_bytes());
+                signature_attribute(&mut bytes, *signature_index);
+            }
+            None => bytes.extend_from_slice(&0u16.to_be_bytes()),
         }
-        None => bytes.extend_from_slice(&0u16.to_be_bytes()),
+    }
+    let attribute_count =
+        u16::from(inner_classes_index.is_some()) + u16::from(class_signature_index.is_some());
+    bytes.extend_from_slice(&attribute_count.to_be_bytes());
+    if let Some(signature_index) = class_signature_index {
+        signature_attribute(&mut bytes, signature_index);
+    }
+    // One `InnerClasses` entry naming this very class as a private nested
+    // class: inner class, no outer, no simple name, `ACC_PRIVATE`.
+    if let Some(name_index) = inner_classes_index {
+        const ACC_PRIVATE_NESTED: u16 = 0x0002;
+
+        bytes.extend_from_slice(&name_index.to_be_bytes());
+        bytes.extend_from_slice(&10u32.to_be_bytes());
+        bytes.extend_from_slice(&1u16.to_be_bytes());
+        bytes.extend_from_slice(&this_class_index.to_be_bytes());
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+        bytes.extend_from_slice(&ACC_PRIVATE_NESTED.to_be_bytes());
     }
     bytes
 }
@@ -8561,19 +9465,53 @@ pub(crate) fn test_class_file_bytes(class: &TestClassFile<'_>) -> Vec<u8> {
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub fn write_test_class_jar(path: &Path, classes: &[TestClassFile<'_>]) {
+    let classes = classes
+        .iter()
+        .map(|class| (class, TestClassGenerics::default()))
+        .collect::<Vec<_>>();
+    write_test_generic_class_jar(path, &classes);
+}
+
+/// [`write_test_class_jar`] for classes that carry generic attributes.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn write_test_generic_class_jar(
+    path: &Path,
+    classes: &[(&TestClassFile<'_>, TestClassGenerics<'_>)],
+) {
     use std::io::Write;
 
     let file = File::create(path).expect("create the fixture class jar");
     let mut jar = zip::ZipWriter::new(file);
-    for class in classes {
+    for (class, generics) in classes {
         jar.start_file(
             format!("{}.class", class.internal_name),
             zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored),
         )
         .expect("start a fixture class entry");
-        jar.write_all(&test_class_file_bytes(class))
-            .expect("write a fixture class entry");
+        let methods = class
+            .methods
+            .iter()
+            .map(|method| if method.is_static { 0x0009 } else { 0x0001 })
+            .collect::<Vec<_>>();
+        let access = TestClassAccess {
+            // ACC_PUBLIC | ACC_SUPER, or ACC_PUBLIC | ACC_INTERFACE | ACC_ABSTRACT.
+            class: if generics.is_interface {
+                0x0601
+            } else {
+                0x0021
+            },
+            methods: &methods,
+            interfaces: generics.interfaces,
+        };
+        jar.write_all(&test_class_file_bytes_with_signatures(
+            class,
+            access,
+            generics.signature,
+            generics.method_signatures,
+        ))
+        .expect("write a fixture class entry");
     }
     jar.finish().expect("finish the fixture class jar");
 }
@@ -8685,7 +9623,7 @@ pub(crate) fn select_java_external_model_invocation(
     actuals: &[TypeRef],
     signatures: &[brokk_bifrost_analysis::analyzer::semantic_model::Signature],
     surface: &JvmExternalDeclarations<'_>,
-) -> Option<(usize, Vec<TypeRef>)> {
+) -> Option<brokk_bifrost_analysis::analyzer::usages::call_conversion::ModelInvocationSelection> {
     let parameters = signatures
         .iter()
         .map(|signature| {
@@ -8718,7 +9656,7 @@ pub(crate) fn select_java_external_model_invocation(
         return exact
             .next()
             .is_none()
-            .then(|| (selected, parameters[selected].clone()));
+            .then(|| (selected, parameters[selected].clone(), None));
     }
     // Method inference is not a ground-formal conversion. Keep its candidate
     // visible rather than erasing method type parameters from applicability.
@@ -8746,15 +9684,20 @@ pub(crate) fn select_java_external_model_invocation(
     } else {
         formals.clone()
     };
-    Some((selected, layout))
+    Some((
+        selected,
+        layout,
+        (phase != JavaExternalInvocationPhase::Variable && shapes[selected].variadic)
+            .then_some(FixedArrayInvocation),
+    ))
 }
 
 /// A budget-charged digest cache for tests that run JDK discovery with no store.
 #[cfg(test)]
 pub(super) fn test_digests() -> ContentDigestCache {
-    ContentDigestCache::new(&brokk_bifrost_core::retention_budget::RetentionBudget::new(
-        64 << 20,
-    ))
+    ContentDigestCache::new(
+        &brokk_bifrost_core::retention_budget::RetentionBudget::for_test_capacity(64 << 20),
+    )
 }
 
 /// JDK discovery followed by the pinning step, as activation and the JDK
@@ -8773,6 +9716,133 @@ fn discover_and_pin_jdk(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11902: missing generation metadata must not discard explicit JVM artifacts"
+    )]
+    fn native_missing_membership_preserves_explicit_artifacts() {
+        let root = tempfile::tempdir().unwrap();
+        let jar = root.path().join("explicit.jar");
+        write_test_class_jar(
+            &jar,
+            &[TestClassFile {
+                internal_name: "example/Explicit",
+                super_internal_name: "java/lang/Object",
+                methods: &[],
+                private_nested: false,
+            }],
+        );
+        let host = brokk_bifrost_analysis::analyzer::WorkspaceAnalyzer::Empty(
+            brokk_bifrost_analysis::analyzer::workspace::EmptyAnalyzer::new(Arc::new(
+                TestProject::new(root.path(), Language::Java),
+            )),
+        );
+        let view =
+            brokk_bifrost_analysis::analyzer::workspace::generation_dependency_discovery_project(
+                host.analyzer(),
+            );
+        let mut config = JvmAnalyzerConfig::default();
+        config
+            .external_dependencies
+            .artifact_paths
+            .push(JvmExternalArtifact {
+                artifact_path: jar,
+                source_artifact_path: None,
+                coordinate: None,
+                origin: JvmExternalArtifactOrigin::Explicit,
+            });
+        let outcome = resolve_jvm_semantic_pack_dependencies(
+            &config,
+            view.as_ref(),
+            &test_digests(),
+            &DependencyPackLimits::default(),
+            None,
+        );
+        assert!(!outcome.complete);
+        assert_eq!(outcome.incomplete_reason, Some(brokk_bifrost_analysis::analyzer::semantic_model::DependencyDiscoveryIncompleteReason::GenerationListingUnavailable));
+        assert!(!outcome.dependencies.is_empty());
+        let index = JvmExternalDeclarationIndex::build_for_project(&config, view.as_ref());
+        assert!(
+            index
+                .resolve_explicit_import("example.Explicit", "app")
+                .is_some()
+        );
+    }
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11902: a cold native JVM index discovered manifests outside its generation"
+    )]
+    fn native_discovery_keeps_generation_membership() {
+        use brokk_bifrost_analysis::analyzer::IAnalyzer;
+        use brokk_bifrost_core::analyzer::project::Project;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("App.java"), "class App {} ").unwrap();
+        let mut config = brokk_bifrost_core::analyzer::config::AnalyzerConfig::default();
+        config.jvm.dependency_discovery.mode =
+            brokk_bifrost_core::analyzer::config::JvmDependencyDiscoveryMode::Metadata;
+        let project = Arc::new(TestProject::new(root.path(), Language::Java));
+        let control =
+            crate::analyzer::JavaAnalyzer::new_with_config(project.clone(), config.clone());
+        let cold = crate::analyzer::JavaAnalyzer::new_with_config(project.clone(), config);
+        let expected = control.external_declaration_index();
+        std::fs::create_dir(root.path().join("nested")).unwrap();
+        std::fs::write(root.path().join("nested/pom.xml"), "<project><dependencies><dependency><groupId>missing</groupId><artifactId>late</artifactId><version>1</version></dependency></dependencies></project>").unwrap();
+        project.invalidate_cached_file_listing();
+        let observed = cold.external_declaration_index();
+        assert_eq!(expected.gap_identity(), observed.gap_identity());
+        assert_eq!(
+            expected.dispatch_behavior_identity(),
+            observed.dispatch_behavior_identity()
+        );
+        let view =
+            brokk_bifrost_analysis::analyzer::workspace::generation_dependency_discovery_project(
+                &cold,
+            );
+        assert_eq!(
+            view.all_files_shared().unwrap().as_ref(),
+            cold.generation_membership().listing().unwrap().0.as_ref()
+        );
+    }
+    #[test]
+    fn owner_surface_fixed_limit_is_distinct_from_cycle_and_missing_hierarchy() {
+        fn supertype_names(surface: &super::JvmIndexedOwnerSurface) -> Vec<&str> {
+            surface.supertypes.iter().map(String::as_str).collect()
+        }
+        let mut index = super::JvmExternalDeclarationIndex::default();
+        for owner in 0..=super::MAX_MEMBER_SURFACE_OWNERS {
+            index.members_by_owner.insert(
+                owner.to_string(),
+                super::JvmIndexedOwnerSurface {
+                    supertypes: if owner < super::MAX_MEMBER_SURFACE_OWNERS {
+                        vec![(owner + 1).to_string()]
+                    } else {
+                        vec![]
+                    },
+                    hierarchy_complete: true,
+                    ..Default::default()
+                },
+            );
+        }
+        for _ in 0..2 {
+            let walk = index.walk_owner_surfaces("0", supertype_names, |_, _| None::<()>);
+            assert!(walk.selected.is_none());
+            assert_eq!(walk.completion, super::OwnerWalkCompletion::FixedLimit);
+        }
+        index.members_by_owner.get_mut("0").unwrap().supertypes = vec!["0".into()];
+        assert_eq!(
+            index
+                .walk_owner_surfaces("0", supertype_names, |_, _| None::<()>)
+                .completion,
+            super::OwnerWalkCompletion::Cycle
+        );
+        // An owner nobody read is listed with its path, and it does not lower
+        // the completion of the surfaces that were read.
+        let walk = index.walk_owner_surfaces("missing", supertype_names, |_, _| None::<()>);
+        assert_eq!(walk.completion, super::OwnerWalkCompletion::Complete);
+        assert_eq!(walk.unread, vec![vec!["missing".to_owned()]]);
+    }
+
     #[test]
     fn java_supertype_argument_projection_table() {
         use super::*;
@@ -8819,10 +9889,20 @@ mod tests {
                 2,
                 Some(vec![1, 0]),
             ),
+            // A raw edge to a parent that declares a parameter, and a parent
+            // read with more parameters than the edge passes, prove nothing.
             (
                 witness(vec![names(&["E"]), names(&["E"])], vec![edge(vec![])]),
                 1,
-                Some(vec![]),
+                None,
+            ),
+            (
+                witness(
+                    vec![names(&["E"]), names(&["A", "B"]), names(&["T"])],
+                    vec![edge(vec![parameter("E")]), edge(vec![parameter("A")])],
+                ),
+                1,
+                None,
             ),
             (
                 witness(
@@ -9696,6 +10776,7 @@ mod tests {
             returns: None,
             is_static: true,
             is_constant: false,
+            field_type: None,
             jdk_artifact_sha256: None,
             unshaped_model_records: Vec::new(),
             call_shapes: vec![
@@ -9704,6 +10785,7 @@ mod tests {
                     JvmVisibility::Public,
                     true,
                     Some(&signature),
+                    false,
                     None,
                 )
                 .expect("call shape"),
@@ -9790,6 +10872,7 @@ mod tests {
             returns: Some(named("void")),
             is_static: true,
             is_constant: false,
+            field_type: None,
             jdk_artifact_sha256: None,
             unshaped_model_records: Vec::new(),
             call_shapes: signatures
@@ -9800,6 +10883,7 @@ mod tests {
                         JvmVisibility::Public,
                         true,
                         Some(signature),
+                        false,
                         None,
                     )
                     .expect("test method signature")
@@ -9858,6 +10942,7 @@ mod tests {
             returns: Some(returned.clone()),
             is_static: true,
             is_constant: false,
+            field_type: None,
             jdk_artifact_sha256: None,
             unshaped_model_records: Vec::new(),
             call_shapes: vec![JvmExternalCallShape {
@@ -9865,6 +10950,7 @@ mod tests {
                 model_record: None,
                 inventory_identity: None,
                 non_overridable: None,
+                is_abstract: false,
                 parameter_count: 0,
                 parameters: Vec::new(),
                 has_type_parameters: false,
@@ -9986,6 +11072,944 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Parameterized conversions over class-file owners (#10194).
+    // -----------------------------------------------------------------------
+
+    const OBJECT_CLASS: &str = "java/lang/Object";
+
+    /// One fixture class: binary name, superclass, interfaces, class signature.
+    type GenericFixtureClass<'a> = (&'a str, &'a str, &'a [&'a str], Option<&'a str>);
+
+    fn generic_class_jar(path: &Path, classes: &[GenericFixtureClass<'_>]) {
+        let files = classes
+            .iter()
+            .map(|(internal_name, super_internal_name, _, _)| TestClassFile {
+                internal_name,
+                super_internal_name,
+                methods: &[],
+                private_nested: false,
+            })
+            .collect::<Vec<_>>();
+        let entries = files
+            .iter()
+            .zip(classes)
+            .map(|(file, (_, _, interfaces, signature))| {
+                (
+                    file,
+                    TestClassGenerics {
+                        interfaces,
+                        signature: *signature,
+                        ..TestClassGenerics::default()
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        write_test_generic_class_jar(path, &entries);
+    }
+
+    /// Stub JDK classes, for a jar that answers without any JDK on the machine.
+    const STUB_JDK_CLASSES: &[GenericFixtureClass<'_>] = &[
+        (
+            "java/lang/Iterable",
+            OBJECT_CLASS,
+            &[],
+            Some("<T:Ljava/lang/Object;>Ljava/lang/Object;"),
+        ),
+        ("java/lang/CharSequence", OBJECT_CLASS, &[], None),
+        (
+            "java/lang/String",
+            OBJECT_CLASS,
+            &["java/lang/CharSequence"],
+            None,
+        ),
+        ("java/lang/Integer", OBJECT_CLASS, &[], None),
+    ];
+
+    /// The shape Guava has: every edge passes the owner's own parameters on
+    /// (`Concrete<E> extends Mid<E>`, `Mid<E> extends ListLike<E>`,
+    /// `ListLike<T> implements Iterable<T>`), plus one fixture for each edge
+    /// that proves no argument position.
+    const DEPENDENCY_CLASSES: &[GenericFixtureClass<'_>] = &[
+        (
+            "dep/ListLike",
+            OBJECT_CLASS,
+            &["java/lang/Iterable"],
+            Some("<T:Ljava/lang/Object;>Ljava/lang/Object;Ljava/lang/Iterable<TT;>;"),
+        ),
+        (
+            "dep/Mid",
+            "dep/ListLike",
+            &[],
+            Some("<E:Ljava/lang/Object;>Ldep/ListLike<TE;>;"),
+        ),
+        (
+            "dep/Concrete",
+            "dep/Mid",
+            &[],
+            Some("<E:Ljava/lang/Object;>Ldep/Mid<TE;>;"),
+        ),
+        (
+            "dep/Entry",
+            OBJECT_CLASS,
+            &[],
+            Some("<K:Ljava/lang/Object;V:Ljava/lang/Object;>Ljava/lang/Object;"),
+        ),
+        (
+            "dep/Swap",
+            "dep/Entry",
+            &[],
+            Some("<A:Ljava/lang/Object;B:Ljava/lang/Object;>Ldep/Entry<TB;TA;>;"),
+        ),
+        // A ground edge argument: reachable, but #7643 composes only bare
+        // parameters, so no position is proven.
+        (
+            "dep/GroundKid",
+            "dep/ListLike",
+            &[],
+            Some("Ldep/ListLike<Ljava/lang/String;>;"),
+        ),
+        // A compound edge argument.
+        (
+            "dep/Nested",
+            "dep/ListLike",
+            &[],
+            Some("<T:Ljava/lang/Object;>Ldep/ListLike<Ldep/ListLike<TT;>;>;"),
+        ),
+        ("dep/RawKid", "dep/ListLike", &[], None),
+        (
+            "dep/BadSignature",
+            "dep/ListLike",
+            &[],
+            Some("this is not a class signature"),
+        ),
+        (
+            "dep/AfterBad",
+            "dep/BadSignature",
+            &[],
+            Some("<E:Ljava/lang/Object;>Ldep/BadSignature<TE;>;"),
+        ),
+        (
+            "dep/Orphan",
+            "dep/Missing",
+            &[],
+            Some("<E:Ljava/lang/Object;>Ldep/Missing<TE;>;"),
+        ),
+        (
+            "dep/UndeclaredVariable",
+            "dep/ListLike",
+            &[],
+            Some("Ldep/ListLike<TX;>;"),
+        ),
+        // A diamond whose two routes agree: both pass the parameter on.
+        (
+            "dep/LeftOne",
+            "dep/ListLike",
+            &[],
+            Some("<X:Ljava/lang/Object;>Ldep/ListLike<TX;>;"),
+        ),
+        (
+            "dep/RightOne",
+            "dep/ListLike",
+            &[],
+            Some("<Y:Ljava/lang/Object;>Ldep/ListLike<TY;>;"),
+        ),
+        (
+            "dep/Dia",
+            OBJECT_CLASS,
+            &["dep/LeftOne", "dep/RightOne"],
+            Some("<E:Ljava/lang/Object;>Ljava/lang/Object;Ldep/LeftOne<TE;>;Ldep/RightOne<TE;>;"),
+        ),
+        // A diamond whose two routes swap the positions.
+        (
+            "dep/Pair",
+            OBJECT_CLASS,
+            &[],
+            Some("<P:Ljava/lang/Object;Q:Ljava/lang/Object;>Ljava/lang/Object;"),
+        ),
+        (
+            "dep/LeftPair",
+            OBJECT_CLASS,
+            &["dep/Pair"],
+            Some("<X:Ljava/lang/Object;Y:Ljava/lang/Object;>Ljava/lang/Object;Ldep/Pair<TX;TY;>;"),
+        ),
+        (
+            "dep/RightPair",
+            OBJECT_CLASS,
+            &["dep/Pair"],
+            Some("<X:Ljava/lang/Object;Y:Ljava/lang/Object;>Ljava/lang/Object;Ldep/Pair<TX;TY;>;"),
+        ),
+        (
+            "dep/Conflict",
+            OBJECT_CLASS,
+            &["dep/LeftPair", "dep/RightPair"],
+            Some(
+                "<A:Ljava/lang/Object;B:Ljava/lang/Object;>Ljava/lang/Object;Ldep/LeftPair<TA;TB;>;Ldep/RightPair<TB;TA;>;",
+            ),
+        ),
+        // A found route plus a parent no jar read: that parent may lead to the
+        // target with other arguments.
+        (
+            "dep/Split",
+            "dep/ListLike",
+            &["dep/Missing"],
+            Some("<E:Ljava/lang/Object;>Ldep/ListLike<TE;>;Ldep/Missing<TE;>;"),
+        ),
+        // A hop whose parent is read with more parameters than the edge passes.
+        (
+            "dep/TwoParameters",
+            OBJECT_CLASS,
+            &["java/lang/Iterable"],
+            Some(
+                "<A:Ljava/lang/Object;B:Ljava/lang/Object;>Ljava/lang/Object;Ljava/lang/Iterable<TA;>;",
+            ),
+        ),
+        (
+            "dep/WrongArity",
+            "dep/TwoParameters",
+            &[],
+            Some("<T:Ljava/lang/Object;>Ldep/TwoParameters<TT;>;"),
+        ),
+    ];
+
+    fn generic_class_index(
+        directory: &tempfile::TempDir,
+        name: &str,
+        classes: &[&[GenericFixtureClass<'_>]],
+    ) -> JvmExternalDeclarationIndex {
+        let jar = directory.path().join(name);
+        generic_class_jar(&jar, &classes.concat());
+        probe_index(&jar)
+    }
+
+    fn named(name: &str) -> TypeRef {
+        TypeRef::named(name)
+    }
+
+    fn applied(name: &str, arguments: &[TypeRef]) -> TypeRef {
+        TypeRef::Named {
+            name: name.into(),
+            arguments: arguments.to_vec(),
+            nullable: false,
+        }
+    }
+
+    fn wildcard(
+        variance: brokk_bifrost_analysis::analyzer::semantic_model::WildcardVariance,
+        bound: Option<TypeRef>,
+    ) -> TypeRef {
+        TypeRef::Wildcard {
+            variance,
+            bound: bound.map(Box::new),
+        }
+    }
+
+    fn extends(bound: TypeRef) -> TypeRef {
+        use brokk_bifrost_analysis::analyzer::semantic_model::WildcardVariance::Extends;
+        wildcard(Extends, Some(bound))
+    }
+
+    fn superbound(bound: TypeRef) -> TypeRef {
+        use brokk_bifrost_analysis::analyzer::semantic_model::WildcardVariance::Super;
+        wildcard(Super, Some(bound))
+    }
+
+    fn any_argument() -> TypeRef {
+        use brokk_bifrost_analysis::analyzer::semantic_model::WildcardVariance::Any;
+        wildcard(Any, None)
+    }
+
+    fn iterable(argument: TypeRef) -> TypeRef {
+        applied("java.lang.Iterable", &[argument])
+    }
+
+    /// The `Iterable` conversions of the bare-parameter chains, the JDK classes
+    /// and the dependency classes coming from whichever half the surface reads.
+    fn assert_projected_iterable_conversions(surface: &JvmExternalDeclarations<'_>) {
+        use JavaExternalConversion::{Inapplicable, Strict};
+        let string = || named("java.lang.String");
+        let integer = || named("java.lang.Integer");
+        let chars = || named("java.lang.CharSequence");
+        let concrete = applied("dep.Concrete", &[string()]);
+        let mid_of_integer = applied("dep.Mid", &[integer()]);
+        for (actual, formal, expected) in [
+            // Three hops: Concrete<E> -> Mid<E> -> ListLike<E> -> Iterable<E>.
+            (&concrete, iterable(extends(chars())), Strict),
+            (&concrete, iterable(string()), Strict),
+            (&concrete, iterable(any_argument()), Strict),
+            (&concrete, iterable(superbound(string())), Strict),
+            (&concrete, iterable(integer()), Inapplicable),
+            (&concrete, iterable(extends(integer())), Inapplicable),
+            (&concrete, iterable(superbound(chars())), Inapplicable),
+            (&concrete, named("java.lang.Iterable"), Strict),
+            (&concrete, named("java.lang.Object"), Strict),
+            (&mid_of_integer, iterable(integer()), Strict),
+            (&mid_of_integer, iterable(extends(chars())), Inapplicable),
+            // Two routes that agree on every position still project.
+            (
+                &applied("dep.Dia", &[string()]),
+                iterable(extends(chars())),
+                Strict,
+            ),
+            (
+                &applied("dep.Dia", &[string()]),
+                iterable(integer()),
+                Inapplicable,
+            ),
+            // The positions of the supertype's arguments are composed, not
+            // matched by parameter name.
+            (
+                &applied("dep.Swap", &[string(), integer()]),
+                applied("dep.Entry", &[integer(), string()]),
+                Strict,
+            ),
+            (
+                &applied("dep.Swap", &[string(), integer()]),
+                applied("dep.Entry", &[string(), integer()]),
+                Inapplicable,
+            ),
+        ] {
+            assert_eq!(
+                java_external_conversion_in(actual, &formal, Some(surface)),
+                expected,
+                "{actual:?} -> {formal:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn class_file_owner_edges_project_type_arguments_through_every_hop() {
+        let directory = tempfile::tempdir().unwrap();
+        let index = generic_class_index(
+            &directory,
+            "generic.jar",
+            &[STUB_JDK_CLASSES, DEPENDENCY_CLASSES],
+        );
+        let surface = JvmExternalDeclarations::new(&index, None);
+        assert_projected_iterable_conversions(&surface);
+    }
+
+    #[test]
+    fn class_file_edges_without_proven_arguments_only_establish_reachability() {
+        use JavaExternalConversion::{Inapplicable, Strict, Unknown};
+        let directory = tempfile::tempdir().unwrap();
+        let index = generic_class_index(
+            &directory,
+            "generic.jar",
+            &[STUB_JDK_CLASSES, DEPENDENCY_CLASSES],
+        );
+        let surface = JvmExternalDeclarations::new(&index, None);
+        let string = || named("java.lang.String");
+        let generic = Unknown(ConversionUnknown::GenericSubstitution);
+        for (actual, formal, expected) in [
+            // A ground or compound edge argument, a raw parent, an edge from a
+            // malformed signature and a variable no scope declares all keep
+            // the erased path and prove no argument.
+            (named("dep.GroundKid"), iterable(string()), generic),
+            (
+                applied("dep.Nested", &[string()]),
+                iterable(applied("dep.ListLike", &[string()])),
+                generic,
+            ),
+            (named("dep.RawKid"), iterable(string()), generic),
+            (named("dep.RawKid"), named("java.lang.Iterable"), Strict),
+            (
+                applied("dep.AfterBad", &[string()]),
+                iterable(string()),
+                generic,
+            ),
+            (
+                named("dep.BadSignature"),
+                named("java.lang.Iterable"),
+                Strict,
+            ),
+            (named("dep.UndeclaredVariable"), iterable(string()), generic),
+            // A bare actual may be a local whose arguments were erased in
+            // transport, so it proves nothing either.
+            (named("dep.Concrete"), iterable(string()), generic),
+            (
+                named("dep.ListLike"),
+                applied("dep.ListLike", &[string()]),
+                Strict,
+            ),
+            // Routes that disagree on the positions prove none, whichever the
+            // search meets first.
+            (
+                applied("dep.Conflict", &[string(), named("java.lang.Integer")]),
+                applied("dep.Pair", &[string(), named("java.lang.Integer")]),
+                generic,
+            ),
+            // The erased path is proven, the arguments are not.
+            (named("dep.Split"), named("java.lang.Iterable"), Strict),
+            (
+                applied("dep.Split", &[string()]),
+                iterable(extends(named("java.lang.CharSequence"))),
+                generic,
+            ),
+            // The edge passes one argument to a parent read with two
+            // parameters, so the parent's own edge has no position to read.
+            (
+                applied("dep.WrongArity", &[string()]),
+                iterable(string()),
+                generic,
+            ),
+            // The actual's argument count must be the first owner's.
+            (
+                applied("dep.Mid", &[string(), string()]),
+                iterable(string()),
+                generic,
+            ),
+            // A missing erased path is a conclusive negative whatever the
+            // arguments say.
+            (named("dep.RawKid"), named("dep.Entry"), Inapplicable),
+            (
+                applied("dep.Concrete", &[string()]),
+                applied("dep.Entry", &[string(), string()]),
+                Inapplicable,
+            ),
+        ] {
+            assert_eq!(
+                java_external_conversion_in(&actual, &formal, Some(&surface)),
+                expected,
+                "{actual:?} -> {formal:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_intermediate_owner_with_an_unclosed_hierarchy_proves_no_arguments() {
+        use JavaExternalConversion::{Inapplicable, Strict, Unknown};
+        let directory = tempfile::tempdir().unwrap();
+        let mut index = generic_class_index(
+            &directory,
+            "generic.jar",
+            &[STUB_JDK_CLASSES, DEPENDENCY_CLASSES],
+        );
+        let concrete = applied("dep.Concrete", &[named("java.lang.String")]);
+        let chars = iterable(extends(named("java.lang.CharSequence")));
+        let integer = iterable(named("java.lang.Integer"));
+        let surface = JvmExternalDeclarations::new(&index, None);
+        assert_eq!(
+            java_external_conversion_in(&concrete, &chars, Some(&surface)),
+            Strict
+        );
+        assert_eq!(
+            java_external_conversion_in(&concrete, &integer, Some(&surface)),
+            Inapplicable
+        );
+        // Mid did not record every edge it has, so another edge may reach
+        // Iterable with other arguments.
+        index
+            .members_by_owner
+            .get_mut("dep.Mid")
+            .expect("the jar read dep.Mid")
+            .hierarchy_complete = false;
+        let surface = JvmExternalDeclarations::new(&index, None);
+        for formal in [&chars, &integer] {
+            assert_eq!(
+                java_external_conversion_in(&concrete, formal, Some(&surface)),
+                Unknown(ConversionUnknown::GenericSubstitution),
+                "{formal:?}"
+            );
+        }
+        // The erased path is still proven.
+        assert_eq!(
+            java_external_conversion_in(
+                &named("dep.Concrete"),
+                &named("java.lang.Iterable"),
+                Some(&surface)
+            ),
+            Strict
+        );
+    }
+
+    #[test]
+    fn an_absent_owner_stays_open_until_its_own_name_answers() {
+        use JavaExternalConversion::Unknown;
+        let directory = tempfile::tempdir().unwrap();
+        let index = generic_class_index(
+            &directory,
+            "generic.jar",
+            &[STUB_JDK_CLASSES, DEPENDENCY_CLASSES],
+        );
+        let surface = JvmExternalDeclarations::new(&index, None);
+        let string = || named("java.lang.String");
+        let orphan = applied("dep.Orphan", &[string()]);
+        for (formal, expected) in [
+            // Nothing read past dep.Missing, so Iterable is neither proved nor
+            // refuted, and the unread parent is not reported as a negative.
+            (
+                iterable(string()),
+                Unknown(ConversionUnknown::IncompleteHierarchy),
+            ),
+            (
+                named("java.lang.Iterable"),
+                Unknown(ConversionUnknown::IncompleteHierarchy),
+            ),
+            // The edge names the unread owner, so the path exists, but with no
+            // read parameters for it the arguments are unproven.
+            (
+                applied("dep.Missing", &[string()]),
+                Unknown(ConversionUnknown::GenericSubstitution),
+            ),
+        ] {
+            assert_eq!(
+                java_external_conversion_in(&orphan, &formal, Some(&surface)),
+                expected,
+                "{formal:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_reads_of_one_owner_that_disagree_prove_no_arguments() {
+        use JavaExternalConversion::{Strict, Unknown};
+        let directory = tempfile::tempdir().unwrap();
+        let shared: &[GenericFixtureClass<'_>] = &[(
+            "dep/Base",
+            OBJECT_CLASS,
+            &[],
+            Some("<T:Ljava/lang/Object;>Ljava/lang/Object;"),
+        )];
+        // Both jars read B, C and G alike; only A's parent differs.
+        let routed: &[GenericFixtureClass<'_>] = &[
+            (
+                "dep/G",
+                OBJECT_CLASS,
+                &[],
+                Some("<Z:Ljava/lang/Object;>Ljava/lang/Object;"),
+            ),
+            (
+                "dep/B",
+                "dep/G",
+                &[],
+                Some("<X:Ljava/lang/Object;>Ldep/G<TX;>;"),
+            ),
+            (
+                "dep/C",
+                "dep/G",
+                &[],
+                Some("<Y:Ljava/lang/Object;>Ldep/G<TY;>;"),
+            ),
+        ];
+        let first = directory.path().join("first.jar");
+        let second = directory.path().join("second.jar");
+        generic_class_jar(
+            &first,
+            &[
+                shared,
+                routed,
+                &[
+                    (
+                        "dep/A",
+                        "dep/B",
+                        &[],
+                        Some("<T:Ljava/lang/Object;U:Ljava/lang/Object;>Ldep/B<TT;>;"),
+                    ),
+                    // Two edges naming one parent are ambiguous, whatever
+                    // their arguments are.
+                    (
+                        "dep/Twice",
+                        "dep/Base",
+                        &[],
+                        Some("<E:Ljava/lang/Object;>Ldep/Base<TE;>;"),
+                    ),
+                    (
+                        "dep/Shape",
+                        "dep/Base",
+                        &[],
+                        Some("<T:Ljava/lang/Object;>Ldep/Base<TT;>;"),
+                    ),
+                ],
+            ]
+            .concat(),
+        );
+        generic_class_jar(
+            &second,
+            &[
+                shared,
+                routed,
+                &[
+                    // The same parameters as the first read, another parent.
+                    (
+                        "dep/A",
+                        "dep/C",
+                        &[],
+                        Some("<T:Ljava/lang/Object;U:Ljava/lang/Object;>Ldep/C<TU;>;"),
+                    ),
+                    (
+                        "dep/Twice",
+                        "dep/Base",
+                        &[],
+                        Some("<E:Ljava/lang/Object;>Ldep/Base<Ldep/Base<TE;>;>;"),
+                    ),
+                    // Another parameter list for the same class.
+                    (
+                        "dep/Shape",
+                        "dep/Base",
+                        &[],
+                        Some("<A:Ljava/lang/Object;B:Ljava/lang/Object;>Ldep/Base<TA;>;"),
+                    ),
+                ],
+            ]
+            .concat(),
+        );
+        let read = |artifact_path: &Path| ResolvedJvmArtifact {
+            artifact_path: artifact_path.to_path_buf(),
+            source_artifact_path: None,
+            coordinate: None,
+            origin: JvmDependencyOrigin::ExplicitPath,
+        };
+        let index =
+            JvmExternalDeclarationIndex::build_from_artifacts(vec![read(&first), read(&second)]);
+        let surface = JvmExternalDeclarations::new(&index, None);
+        let string = || named("java.lang.String");
+        let base = applied("dep.Base", &[string()]);
+        let generic = Unknown(ConversionUnknown::GenericSubstitution);
+        for (actual, expected) in [
+            (applied("dep.Twice", &[string()]), generic),
+            (applied("dep.Shape", &[string()]), generic),
+            (named("dep.Shape"), generic),
+        ] {
+            assert_eq!(
+                java_external_conversion_in(&actual, &base, Some(&surface)),
+                expected,
+                "{actual:?}"
+            );
+        }
+        assert_eq!(
+            java_external_conversion_in(&named("dep.Twice"), &named("dep.Base"), Some(&surface)),
+            Strict
+        );
+        // Same parameters, different parents: one read passes T on and the
+        // other passes U, so neither position is proven for G.
+        assert_eq!(
+            java_external_conversion_in(
+                &applied("dep.A", &[string(), named("java.lang.Integer")]),
+                &applied("dep.G", &[string()]),
+                Some(&surface)
+            ),
+            generic
+        );
+        assert_eq!(
+            java_external_conversion_in(&named("dep.A"), &named("dep.G"), Some(&surface)),
+            Strict
+        );
+    }
+
+    #[test]
+    fn a_class_file_owner_widens_to_the_erased_roots_its_inventory_names() {
+        use JavaExternalConversion::{Inapplicable, Strict};
+        let directory = tempfile::tempdir().unwrap();
+        let index = generic_class_index(
+            &directory,
+            "roots.jar",
+            &[&[
+                ("dep/Plain", OBJECT_CLASS, &[], None),
+                ("dep/Point", "java/lang/Record", &[], None),
+                ("dep/Marker", OBJECT_CLASS, &[], None),
+            ]],
+        );
+        let surface = JvmExternalDeclarations::new(&index, None);
+        for (actual, formal, expected) in [
+            ("dep.Plain", "java.lang.Object", Strict),
+            ("dep.Point", "java.lang.Record", Strict),
+            ("dep.Point", "java.lang.Object", Strict),
+            ("dep.Plain", "dep.Point", Inapplicable),
+            ("dep.Plain", "dep.Marker", Inapplicable),
+        ] {
+            assert_eq!(
+                java_external_conversion_in(&named(actual), &named(formal), Some(&surface)),
+                expected,
+                "{actual} -> {formal}"
+            );
+        }
+    }
+
+    /// Activate `types` as a test-only JDK declaration pack and read it through
+    /// a surface whose artifact half is `artifacts`.
+    fn surface_over_model_types<'a>(
+        artifacts: &'a JvmExternalDeclarationIndex,
+        types: Vec<serde_json::Value>,
+    ) -> JvmExternalDeclarations<'a> {
+        use brokk_bifrost_analysis::analyzer::semantic_model::catalog::{
+            SemanticPackCatalog, SessionPackSource, SessionPackSourceKind,
+        };
+        use brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay;
+        use brokk_bifrost_analysis::analyzer::semantic_model::runtime::{
+            SemanticModelResolutionOutcome, resolve_active_semantic_models,
+        };
+        use brokk_bifrost_analysis::analyzer::semantic_model::{
+            CatalogCoordinate, CatalogOptions, SemanticModelActivationEvidence,
+            SemanticModelActivationRequest, SemanticModelRuntimeLimits,
+        };
+        use brokk_bifrost_semantic::analyzer::semantic_model::compiler::{
+            CompilerOptions, compile_source,
+        };
+        use brokk_bifrost_semantic::analyzer::semantic_model::source::SourceFormat;
+
+        let document = serde_json::json!({
+            "schema_version": 2, "pack_id": "test.issue-10194-jdk", "version": "1.0.0",
+            "producer": {"name": "bifrost-test", "version": "1.0.0"},
+            "language": "java", "ecosystem": "jdk",
+            "compatibility": {"bifrost": ">=0.8.0, <1.0.0", "toolchains": [{
+                "name": "jdk", "requirement": ">=17.0.0"
+            }]},
+            "provenance": {"source": "test:inline", "revision": "issue-10194"},
+            "license": "Apache-2.0", "completeness": "complete",
+            "safety": {"generated_code_only": false, "review_required": false},
+            "shards": [{"id": "decls", "activation": [{
+                "toolchain": {"name": "jdk", "version": ">=17.0.0"},
+                "targets": ["jvm"], "configurations": []
+            }], "payload": {
+                "kind": "declaration_facts", "types": types, "members": [], "relations": []
+            }}]
+        });
+        let pack = compile_source(
+            SourceFormat::Json,
+            &serde_json::to_vec(&document).expect("fixture JSON"),
+            &CompilerOptions::default(),
+        )
+        .expect("compile test-only declarations");
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
+            .expect("fixture catalog");
+        catalog
+            .register_session_pack(
+                &pack,
+                &SessionPackSource {
+                    kind: SessionPackSourceKind::Embedded,
+                    source_id: "test:issue-10194".into(),
+                },
+            )
+            .expect("register declarations");
+        let request = SemanticModelActivationRequest {
+            approximate_standard_libraries: Vec::new(),
+            bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION"))
+                .expect("crate version"),
+            evidence: vec![SemanticModelActivationEvidence {
+                language: "java".into(),
+                ecosystem: "jdk".into(),
+                package: None,
+                module: None,
+                toolchain: Some(CatalogCoordinate {
+                    name: "jdk".into(),
+                    version: Some(semver::Version::new(21, 0, 0)),
+                }),
+                target: Some("jvm".into()),
+                configuration: None,
+                artifact_sha256: None,
+            }],
+            controls: Vec::new(),
+            limits: SemanticModelRuntimeLimits::default(),
+        };
+        let cancellation = CancellationToken::default();
+        let active = match resolve_active_semantic_models(&catalog, &request, &cancellation) {
+            SemanticModelResolutionOutcome::Ready(active) => Arc::new(active),
+            other => panic!("fixture activation must be ready: {other:#?}"),
+        };
+        let root = tempfile::tempdir().expect("isolated Java project");
+        let analyzer = crate::analyzer::java::JavaAnalyzer::from_project(
+            brokk_bifrost_core::analyzer::project::TestProject::new(
+                root.path(),
+                brokk_bifrost_core::analyzer::model::Language::Java,
+            ),
+        );
+        let overlay = Arc::new(
+            SemanticModelOverlay::build(
+                &analyzer,
+                &active,
+                &cancellation,
+                64 << 20,
+                &brokk_bifrost_core::retention_budget::RetentionBudget::for_tests(),
+            )
+            .expect("fixture overlay"),
+        );
+        JvmExternalDeclarations::new(artifacts, Some(overlay)).with_active_models(Some(active))
+    }
+
+    /// A JDK type with the supertype inventory a real JMOD pack carries.
+    fn model_type(
+        name: &str,
+        type_parameters: &[&str],
+        supertypes: &[TypeRef],
+    ) -> serde_json::Value {
+        let edges = supertypes
+            .iter()
+            .map(|target| serde_json::json!({"hierarchy_kind": "implements", "target": target}))
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "id": format!("type.{}", name.to_lowercase()), "name": name, "type_kind": "class",
+            "visibility": "public", "is_abstract": false, "is_sealed": false,
+            "jvm_inventory": {
+                "callables_complete": false, "values_complete": false, "types_complete": false,
+                "supertypes_complete": true, "supertypes": edges, "nested_types": [],
+                "additional_members": []
+            },
+            "has_explicit_type_terms": true, "type_parameters": type_parameters,
+            "type_parameter_constraints": [], "embedded_types": [], "hierarchy": edges,
+            "aliases": [], "extension_surfaces": [],
+            "locator": {"kind": "artifact", "path": format!("{name}.class"), "symbol": name}
+        })
+    }
+
+    fn jdk_model_types() -> Vec<serde_json::Value> {
+        let object = || named("java.lang.Object");
+        let parameter = |name: &str| TypeRef::TypeParameter { name: name.into() };
+        vec![
+            model_type("java.lang.Object", &[], &[]),
+            model_type("java.lang.CharSequence", &[], &[object()]),
+            model_type(
+                "java.lang.String",
+                &[],
+                &[object(), named("java.lang.CharSequence")],
+            ),
+            model_type("java.lang.Integer", &[], &[object()]),
+            model_type("java.lang.Iterable", &["T"], &[object()]),
+            model_type(
+                "java.util.Collection",
+                &["E"],
+                &[object(), iterable(parameter("E"))],
+            ),
+            model_type(
+                "java.util.ArrayList",
+                &["E"],
+                &[object(), applied("java.util.Collection", &[parameter("E")])],
+            ),
+        ]
+    }
+
+    #[test]
+    fn jar_owner_edges_continue_through_the_jdk_model_overlay() {
+        use JavaExternalConversion::{Inapplicable, Strict, Unknown};
+        let directory = tempfile::tempdir().unwrap();
+        let index = generic_class_index(
+            &directory,
+            "generic.jar",
+            &[
+                DEPENDENCY_CLASSES,
+                &[(
+                    "dep/ViaCollection",
+                    OBJECT_CLASS,
+                    &["java/util/Collection"],
+                    Some("<V:Ljava/lang/Object;>Ljava/lang/Object;Ljava/util/Collection<TV;>;"),
+                )],
+            ],
+        );
+        let surface = surface_over_model_types(&index, jdk_model_types());
+        assert_projected_iterable_conversions(&surface);
+
+        // A pack answer that has a witness but also an owner with an unclosed
+        // hierarchy is one route, not every route.
+        let mut unclosed = jdk_model_types();
+        for model in &mut unclosed {
+            if model["name"] == "java.util.Collection" {
+                model["jvm_inventory"]["supertypes_complete"] = false.into();
+            }
+        }
+        let unclosed_surface = surface_over_model_types(&index, unclosed);
+        assert_eq!(
+            java_external_conversion_in(
+                &applied("dep.ViaCollection", &[named("java.lang.String")]),
+                &iterable(extends(named("java.lang.CharSequence"))),
+                Some(&unclosed_surface)
+            ),
+            Unknown(ConversionUnknown::GenericSubstitution)
+        );
+
+        let (string, integer) = (named("java.lang.String"), named("java.lang.Integer"));
+        let chars = named("java.lang.CharSequence");
+        let via = applied("dep.ViaCollection", std::slice::from_ref(&string));
+        let array_list = applied("java.util.ArrayList", std::slice::from_ref(&string));
+        for (actual, formal, expected) in [
+            // Jar edge, then a model edge that has its own type parameter.
+            (&via, iterable(extends(chars.clone())), Strict),
+            (&via, iterable(integer.clone()), Inapplicable),
+            (&via, iterable(extends(integer.clone())), Inapplicable),
+            (&via, named("java.lang.Iterable"), Strict),
+            // The packs cannot exhaust a path to a type only the jar declares.
+            (
+                &via,
+                named("dep.ListLike"),
+                Unknown(ConversionUnknown::IncompleteHierarchy),
+            ),
+            // A pack-declared source composes the same way.
+            (&array_list, iterable(extends(chars.clone())), Strict),
+            (&array_list, iterable(string.clone()), Strict),
+            (&array_list, iterable(integer.clone()), Inapplicable),
+            // Raw use of a generic source through a parent: reachable only.
+            (
+                &named("java.util.ArrayList"),
+                iterable(string.clone()),
+                Unknown(ConversionUnknown::GenericSubstitution),
+            ),
+            // The same unread parent the jar-only surface reported stays open.
+            (
+                &applied("dep.Orphan", std::slice::from_ref(&string)),
+                iterable(string.clone()),
+                Unknown(ConversionUnknown::IncompleteHierarchy),
+            ),
+        ] {
+            assert_eq!(
+                java_external_conversion_in(actual, &formal, Some(&surface)),
+                expected,
+                "{actual:?} -> {formal:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn one_jar_answers_the_same_through_either_branch() {
+        let directory = tempfile::tempdir().unwrap();
+        let jar = directory.path().join("generic.jar");
+        generic_class_jar(&jar, &[STUB_JDK_CLASSES, DEPENDENCY_CLASSES].concat());
+        let as_class_files = probe_index(&jar);
+        let class_file_surface = JvmExternalDeclarations::new(&as_class_files, None);
+
+        // The same class files, published as pack declarations by the producer
+        // dependency packs use, with no artifact index behind them.
+        let production =
+            JvmDependencyPackAdapter::read_jar_declarations(&jar).expect("read the fixture jar");
+        let pack = production.pack.expect("the producer publishes a pack");
+        let types = pack
+            .shards
+            .iter()
+            .flat_map(|shard| match &shard.payload {
+                AuthoredPayload::DeclarationFacts { types, .. } => types.as_slice(),
+                _ => &[],
+            })
+            .map(|fact| serde_json::to_value(fact).expect("a type fact serializes"))
+            // The inventory names this root, which a fixture jar cannot declare.
+            .chain([model_type("java.lang.Object", &[], &[])])
+            .collect::<Vec<_>>();
+        let no_artifacts = JvmExternalDeclarationIndex::default();
+        let pack_surface = surface_over_model_types(&no_artifacts, types);
+        for surface in [&class_file_surface, &pack_surface] {
+            assert_projected_iterable_conversions(surface);
+        }
+        let string = || named("java.lang.String");
+        for (actual, formal) in [
+            (named("dep.RawKid"), iterable(string())),
+            (named("dep.RawKid"), named("java.lang.Iterable")),
+            (named("dep.BadSignature"), iterable(string())),
+            (applied("dep.AfterBad", &[string()]), iterable(string())),
+            (named("dep.Mid"), iterable(string())),
+            (named("dep.GroundKid"), iterable(string())),
+            (
+                applied("dep.Nested", &[string()]),
+                iterable(applied("dep.ListLike", &[string()])),
+            ),
+            (applied("dep.Orphan", &[string()]), iterable(string())),
+            (named("dep.Concrete"), named("dep.Entry")),
+            (named("dep.ListLike"), applied("dep.ListLike", &[string()])),
+        ] {
+            assert_eq!(
+                java_external_conversion_in(&actual, &formal, Some(&class_file_surface)),
+                java_external_conversion_in(&actual, &formal, Some(&pack_surface)),
+                "{actual:?} -> {formal:?}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // The artifact half of the JVM external member surface (#1900).
     // -----------------------------------------------------------------------
 
@@ -10022,6 +12046,46 @@ mod tests {
             coordinate: None,
             origin: JvmDependencyOrigin::ExplicitPath,
         }])
+    }
+
+    #[test]
+    #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only: real JDK 21")]
+    fn java_indexed_jdk_generic_surfaces_project_to_store() {
+        let home = PathBuf::from(std::env::var_os("BIFROST_JDK_HOME").expect("real JDK 21"));
+        let production = JvmDependencyPackAdapter::read_jdk_jmod_declarations(&home).unwrap();
+        let pack = production.pack.expect("JDK declaration pack");
+        let store =
+            brokk_bifrost_analysis::analyzer::store::AnalyzerStore::open_ephemeral().unwrap();
+        for shard in pack.shards {
+            if let AuthoredPayload::DeclarationFacts { types, members, .. } = shard.payload {
+                store
+                    .publish_jvm_external_inventory_facts(
+                        "jdk-generics".into(),
+                        &types,
+                        &members,
+                        true,
+                    )
+                    .unwrap();
+            }
+        }
+        let conn = store.read_conn().unwrap();
+        let member: String = conn.query_row("SELECT json(type_parameters_jsonb) FROM jvm_external_owner_members WHERE owner_fqn='java.util.Collections' AND member_name='unmodifiableList'", [], |row| row.get(0)).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&member).unwrap(),
+            serde_json::json!([{"name":"T","bounds":{"state":"unknown"}}])
+        );
+        let owner: String = conn.query_row("SELECT json(type_parameters_jsonb) FROM jvm_external_owners WHERE owner_fqn='java.util.ArrayList'", [], |row| row.get(0)).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&owner).unwrap(),
+            serde_json::json!([{"name":"E","bounds":{"state":"unknown"}}])
+        );
+        let arguments: String = conn.query_row("SELECT json(type_arguments_jsonb) FROM jvm_external_owner_supertypes WHERE owner_fqn='java.util.ArrayList' AND supertype_fqn='java.util.AbstractList'", [], |row| row.get(0)).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Vec<TypeRef>>(&arguments).unwrap(),
+            vec![TypeRef::TypeParameter { name: "E".into() }]
+        );
+        let ordinary: String = conn.query_row("SELECT json(type_parameters_jsonb) FROM jvm_external_owner_members WHERE owner_fqn='java.util.ArrayList' AND member_name='size'", [], |row| row.get(0)).unwrap();
+        assert_eq!(ordinary, "[]");
     }
 
     #[test]
@@ -10171,6 +12235,7 @@ mod tests {
         assert!(
             index
                 .member("com.example.probe.Registry", "register")
+                .0
                 .is_none(),
             "a refused entry declares no member surface"
         );
@@ -10190,9 +12255,13 @@ mod tests {
         assert!(
             diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.code == "jvm.index.capped_entries"),
+                .any(|diagnostic| diagnostic.code == "jvm.index.runtime_budget"),
             "a refused read must be recorded, not silently look complete: {diagnostics:?}"
         );
+        assert!(gaps.borrow().iter().any(|reason| {
+            reason.execution_cause() == Some(brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause::Budget)
+                && reason.stable_replay_reason().is_none()
+        }), "shared index allowance must remain operational: {:?}", gaps.borrow());
         assert!(index.production_diagnostic_count() > 0);
     }
 
@@ -12986,7 +15055,7 @@ mod tests {
         // A source jar has no complete inventory, so its hierarchy stays
         // incomplete, but member lookup still follows the declared edge.
         assert!(
-            index.member("com.example.dep.Sub", "run").is_some(),
+            index.member("com.example.dep.Sub", "run").0.is_some(),
             "{:?}",
             index
                 .members_by_owner
@@ -13627,6 +15696,44 @@ trait RefreshedNeighbor {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_coordinate_probe_preserves_provider_cause() {
+        use brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause;
+        let root = tempfile::tempdir().unwrap();
+        let repository = root.path().join("repository");
+        std::os::unix::fs::symlink(&repository, &repository).unwrap();
+        let project = TestProject::new(root.path(), Language::Java);
+        let mut config = JvmAnalyzerConfig::default();
+        config.external_dependencies.coordinates = vec![JvmMavenCoordinate {
+            group_id: "org.bifrost.io.testing".into(),
+            artifact_id: "unavailable".into(),
+            version: "1".into(),
+        }];
+        config.external_dependencies.repository_roots = vec![repository];
+        config.dependency_discovery.mode = JvmDependencyDiscoveryMode::Disabled;
+        config.standard_library_discovery.discover_java_home = false;
+        let discovery = resolve_jvm_semantic_pack_dependencies(
+            &config,
+            &project,
+            &test_digests(),
+            &DependencyPackLimits::default(),
+            None,
+        );
+        let diagnostic = discovery
+            .diagnostics
+            .into_iter()
+            .find(|d| d.code == "jvm.dependency_unavailable")
+            .expect("a failed acquisition is not certified absence");
+        let reason =
+            crate::analyzer::jvm::producer_codes::classify(&IndexGap::from_discovery(diagnostic));
+        assert_eq!(
+            reason.execution_cause(),
+            Some(DerivationExecutionCause::Provider)
+        );
+        assert!(reason.stable_replay_reason().is_none());
+    }
+
     #[test]
     fn unresolved_jvm_coordinate_is_actionable_incomplete_discovery() {
         use brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackLimits;
@@ -14093,6 +16200,71 @@ trait RefreshedNeighbor {
                 .iter()
                 .all(|file| !file.rel_path().to_string_lossy().contains(".jar"))
         );
+    }
+    /// A recorded tree part resolves again to the answer the live discovery
+    /// gave, and follows the environment: a Maven repository artifact that
+    /// disappears, or an explicit artifact path inside the workspace that is
+    /// replaced, changes it (#11607). The gap identity folds no path, so
+    /// nothing about the root the answer was first computed under enters it.
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11607: a dependency selection recorded over an export could not be checked against a head that differed from its tree"
+    )]
+    fn a_recorded_tree_part_resolves_again_in_the_environment() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        fs::create_dir_all(root.join("libs")).unwrap();
+        fs::write(root.join("libs/a.jar"), b"not a jar").unwrap();
+        fs::write(
+            root.join("pom.xml"),
+            r#"<project><modelVersion>4.0.0</modelVersion><groupId>g</groupId><artifactId>app</artifactId><version>1</version>
+<dependencies><dependency><groupId>com.example</groupId><artifactId>lib</artifactId><version>1.0</version><scope>test</scope></dependency></dependencies></project>"#,
+        )
+        .unwrap();
+        let repository = root.join("repo");
+        let jar = repository.join("com/example/lib/1.0/lib-1.0.jar");
+        fs::create_dir_all(jar.parent().unwrap()).unwrap();
+        fs::write(&jar, b"not a jar either").unwrap();
+        let project = TestProject::new(&root, Language::Java);
+        let config = JvmAnalyzerConfig {
+            external_dependencies: JvmExternalDependencies {
+                artifact_paths: vec![JvmExternalArtifact {
+                    artifact_path: PathBuf::from("libs/a.jar"),
+                    ..JvmExternalArtifact::default()
+                }],
+                repository_roots: vec![repository],
+                ..JvmExternalDependencies::default()
+            },
+            standard_library_discovery:
+                brokk_bifrost_core::analyzer::config::JvmStandardLibraryDiscoveryConfig {
+                    discover_java_home: false,
+                    ..Default::default()
+                },
+            ..JvmAnalyzerConfig::default()
+        };
+        let basis = jvm_dependency_basis(&config, &project).expect("a recordable tree part");
+        assert_eq!(
+            basis
+                .entries
+                .iter()
+                .map(|entry| (entry.artifact_id.as_str(), entry.scope.as_str()))
+                .collect::<Vec<_>>(),
+            [("lib", "test")]
+        );
+        let live = JvmExternalDeclarationIndex::build_for_project(&config, &project).gap_identity();
+        let again = || {
+            JvmExternalDeclarationIndex::build_under_basis(&config, &root, &basis)
+                .expect("known scope")
+                .gap_identity()
+        };
+        assert_eq!(again(), live);
+        fs::remove_file(&jar).unwrap();
+        let live_without_jar =
+            JvmExternalDeclarationIndex::build_for_project(&config, &project).gap_identity();
+        assert_ne!(live_without_jar, live);
+        assert_eq!(again(), live_without_jar);
+        fs::remove_file(root.join("libs/a.jar")).unwrap();
+        assert_ne!(again(), live_without_jar);
     }
 }
 

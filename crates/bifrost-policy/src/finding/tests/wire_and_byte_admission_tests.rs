@@ -1,6 +1,43 @@
 use super::*;
 
 #[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#10984: omission counts must reject absent and malformed wire values"
+)]
+fn related_location_omissions_has_strict_unsigned_and_unknown_wire_forms() {
+    assert_eq!(
+        serde_json::to_value(RelatedLocationOmissions::Known(7)).unwrap(),
+        json!(7)
+    );
+    assert_eq!(
+        serde_json::to_value(RelatedLocationOmissions::Unknown).unwrap(),
+        json!({"kind": "unknown"})
+    );
+    assert_eq!(
+        serde_json::from_value::<RelatedLocationOmissions>(json!(u64::MAX)).unwrap(),
+        RelatedLocationOmissions::Known(u64::MAX)
+    );
+    assert_eq!(
+        serde_json::from_value::<RelatedLocationOmissions>(json!({"kind": "unknown"})).unwrap(),
+        RelatedLocationOmissions::Unknown
+    );
+    for invalid in [
+        json!(null),
+        json!(true),
+        json!(-1),
+        json!(1.0),
+        json!({}),
+        json!({"kind": "unknown", "extra": 1}),
+        json!({"kind": "known", "count": 1}),
+    ] {
+        assert!(
+            serde_json::from_value::<RelatedLocationOmissions>(invalid.clone()).is_err(),
+            "accepted invalid omission value {invalid}"
+        );
+    }
+}
+
+#[test]
 fn stored_completion_preserves_summary_and_proven_subset() {
     for completion in [
         PolicyRunCompletion::ProvenBySummary,

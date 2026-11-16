@@ -95,12 +95,12 @@ use brokk_bifrost_core::path_utils::rel_path_string;
 
 pub(crate) struct PhpTypeFlowAdapter;
 
-fn php_analyzer(workspace: &WorkspaceAnalyzer) -> &PhpAnalyzer {
+pub(super) fn php_analyzer(workspace: &WorkspaceAnalyzer) -> &PhpAnalyzer {
     crate::analyzer::php::resolve_php_analyzer(workspace)
         .expect("PhpTypeFlowAdapter serves only workspaces that analyze PHP")
 }
 
-fn prepared_for_procedure(
+pub(super) fn prepared_for_procedure(
     workspace: &WorkspaceAnalyzer,
     procedure: &ProcedureHandle,
     file: &ProjectFile,
@@ -122,7 +122,7 @@ fn prepared_for_locator(
     Some(prepared_for_procedure(workspace, procedure, &file))
 }
 
-fn current_indexed_prepared(
+pub(super) fn current_indexed_prepared(
     php: &PhpAnalyzer,
     file: &ProjectFile,
 ) -> Option<Arc<PreparedSyntaxTree>> {
@@ -165,7 +165,7 @@ fn nearest_callable(node: Node<'_>) -> Option<Node<'_>> {
     None
 }
 
-fn declaration_node<'tree>(
+pub(super) fn declaration_node<'tree>(
     php: &PhpAnalyzer,
     prepared: &'tree PreparedSyntaxTree,
     unit: &CodeUnit,
@@ -236,7 +236,11 @@ fn identity_from_lookup(
         [] => {
             let mut cache = ExternalClassCache::default();
             Ok(external_class_identity(
-                workspace.analyzer().semantic_model_overlay().as_deref(),
+                workspace
+                    .analyzer()
+                    .semantic_model_overlay_read()
+                    .published()
+                    .as_deref(),
                 Language::Php,
                 &lookup.fqn,
                 lookup.semantic_model_id.as_deref(),
@@ -264,7 +268,7 @@ fn reference_site(
     )
 }
 
-fn resolve_constructor(
+pub(super) fn resolve_constructor(
     workspace: &WorkspaceAnalyzer,
     procedure: &ProcedureHandle,
     file: &ProjectFile,
@@ -351,7 +355,11 @@ fn nominal_identity(workspace: &WorkspaceAnalyzer, fqn: &str) -> NominalIdentity
         [] => {
             let mut cache = ExternalClassCache::default();
             external_class_identity(
-                workspace.analyzer().semantic_model_overlay().as_deref(),
+                workspace
+                    .analyzer()
+                    .semantic_model_overlay_read()
+                    .published()
+                    .as_deref(),
                 Language::Php,
                 fqn,
                 None,
@@ -528,7 +536,10 @@ fn resolved_external_bases(
     unit: &CodeUnit,
     workspace_ancestors: &[CodeUnit],
 ) -> (Vec<ClassIdentity>, bool) {
-    let overlay = workspace.analyzer().semantic_model_overlay();
+    let overlay = workspace
+        .analyzer()
+        .semantic_model_overlay_read()
+        .published();
     let mut external_cache = ExternalClassCache::default();
     let mut external = Vec::new();
     let mut unresolved = false;
@@ -741,7 +752,10 @@ fn workspace_member_lookup(
     if workspace_magic_present(php, &all_workspace_owners, kind) {
         return MemberLookup::Unknown(UnknownReason::DynamicAttributes);
     }
-    let overlay = workspace.analyzer().semantic_model_overlay();
+    let overlay = workspace
+        .analyzer()
+        .semantic_model_overlay_read()
+        .published();
     for base in external_bases {
         let ClassIdentity::External { symbol_id, .. } = base else {
             unreachable!("resolved external bases retain external identities")
@@ -1021,7 +1035,11 @@ impl TypeFlowAdapter for PhpTypeFlowAdapter {
                 workspace_member_lookup(workspace, unit, kind, member)
             }
             ClassIdentity::External { symbol_id, .. } => {
-                let Some(overlay) = workspace.analyzer().semantic_model_overlay() else {
+                let Some(overlay) = workspace
+                    .analyzer()
+                    .semantic_model_overlay_read()
+                    .published()
+                else {
                     return MemberLookup::Unknown(UnknownReason::ExternalNotModeled);
                 };
                 external_member_lookup(&overlay, symbol_id, kind, member)
@@ -1076,7 +1094,11 @@ impl TypeFlowAdapter for PhpTypeFlowAdapter {
         let mut dynamic_attributes =
             workspace_magic_present(php, &workspace_owners, MemberAccessKind::Call)
                 || workspace_magic_present(php, &workspace_owners, MemberAccessKind::Load);
-        if let Some(overlay) = workspace.analyzer().semantic_model_overlay() {
+        if let Some(overlay) = workspace
+            .analyzer()
+            .semantic_model_overlay_read()
+            .published()
+        {
             for external in &external_ancestors {
                 let ClassIdentity::External { symbol_id, .. } = external else {
                     unreachable!("external ancestors retain external identities")
@@ -1103,7 +1125,11 @@ impl TypeFlowAdapter for PhpTypeFlowAdapter {
                 });
             }
         }
-        let descendants = workspace_class_is_final(php, unit).then(Vec::new);
+        let descendants = if workspace_class_is_final(php, unit) {
+            brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer::complete(Vec::new())
+        } else {
+            brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer::incomplete(brokk_bifrost_core::analyzer::capabilities::HierarchyOpenReason::DescendantIndexUnavailable)
+        };
         let mut ancestors = workspace_ancestors
             .into_iter()
             .map(ClassIdentity::Workspace)
@@ -1212,8 +1238,9 @@ mod tests {
         };
 
         let open = PhpTypeFlowAdapter.class_hierarchy(&workspace, &one_class("OpenClass"));
-        assert_eq!(open.descendants, None);
+        assert!(!open.descendants.is_complete());
         let final_class = PhpTypeFlowAdapter.class_hierarchy(&workspace, &one_class("FinalClass"));
-        assert_eq!(final_class.descendants, Some(Vec::new()));
+        assert!(final_class.descendants.is_complete());
+        assert!(final_class.descendants.edges.is_empty());
     }
 }

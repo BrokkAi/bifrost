@@ -30,6 +30,37 @@ use brokk_bifrost_core::analyzer::structural::callable::{
     CallKind, CallShapeCoverage, CalleeProvenance, CalleeProvenanceFact, CalleeTypeShape,
 };
 
+/// Acquire a step-local semantic context only for shapes requiring admission.
+pub(super) fn has_candidate_macro_input(analyzer: &dyn IAnalyzer, rows: &[PipelineRow]) -> bool {
+    rows.iter().any(|row| {
+        let (file, range, facts) = match &row.value {
+            PipelineValue::StructuralMatch(seed) => (
+                &seed.file,
+                seed.facts.node(seed.fact_match.node).range,
+                Some(Arc::clone(&seed.facts)),
+            ),
+            PipelineValue::Occurrence(value) => (value.file(), value.row.range, None),
+            PipelineValue::CallSite(site) => (&site.0.file, site.0.range, None),
+            _ => return false,
+        };
+        let Some(facts) = facts.or_else(|| {
+            analyzer
+                .structural_fact_providers()
+                .into_iter()
+                .find_map(|provider| provider.structural_facts(file))
+        }) else {
+            return false;
+        };
+        innermost_call_for_range(&facts, range)
+            .and_then(|id| {
+                crate::analyzer::usages::call_shape::call_shape_for_call(&facts, file, id, None)
+            })
+            .is_some_and(|report| {
+                report.outcome.coverage == CallShapeCoverage::CandidateMacroDerived
+            })
+    })
+}
+
 /// Derive call-shape expansions for one pipeline input position.
 ///
 /// `known_facts` short-circuits the facts lookup when the input already
@@ -39,7 +70,7 @@ use brokk_bifrost_core::analyzer::structural::callable::{
 #[allow(clippy::too_many_arguments)]
 pub(super) fn call_shape_expansions_for_input(
     analyzer: &dyn IAnalyzer,
-    semantic: Option<&mut SemanticQueryContext<'_>>,
+    mut semantic: Option<&mut SemanticQueryContext<'_>>,
     traces: &[PipelineTrace],
     file: &ProjectFile,
     range: Range,
@@ -55,6 +86,7 @@ pub(super) fn call_shape_expansions_for_input(
     cache_profile: &mut Option<QueryCacheProfile>,
     shared_budget_exhausted: &mut bool,
 ) -> Vec<PipelineExpansion> {
+    let mut refusals = Vec::new();
     let facts = match known_facts {
         Some(facts) => Arc::clone(facts),
         None => match receiver::receiver_facts_for_pipeline_row(
@@ -101,11 +133,41 @@ pub(super) fn call_shape_expansions_for_input(
         let Some(call_id) = call_id else {
             return Vec::new();
         };
-        let Some(report) =
-            crate::analyzer::usages::call_shape::call_shape_for_call(&facts, file, call_id)
+        let Some(mut report) =
+            crate::analyzer::usages::call_shape::call_shape_for_call(&facts, file, call_id, None)
         else {
             return Vec::new();
         };
+        if report.outcome.coverage == CallShapeCoverage::CandidateMacroDerived
+            && semantic.as_mut().is_some_and(|semantic| {
+                semantic.admitted_intrinsic_at_source(
+                    file,
+                    facts.node(call_id).range,
+                    facts.source_identity(),
+                )
+            })
+        {
+            // An admitted intrinsic is control flow and values, not a call.
+            return Vec::new();
+        }
+        if report.outcome.coverage == CallShapeCoverage::CandidateMacroDerived
+            && let Some((selected, evidence)) = semantic.as_mut().and_then(|semantic| {
+                semantic.exact_call_site_at_source(
+                    file,
+                    facts.node(call_id).range,
+                    facts.source_identity(),
+                )
+            })
+        {
+            refusals = evidence;
+            report = crate::analyzer::usages::call_shape::call_shape_for_call(
+                &facts,
+                file,
+                call_id,
+                Some(selected.procedure()),
+            )
+            .expect("the structurally selected call has a shape");
+        }
         (call_id, report)
     };
     // Go's sole written call argument may supply several producer-proven
@@ -231,6 +293,10 @@ pub(super) fn call_shape_expansions_for_input(
         && reported_suppressed_shapes.insert(outcome.site_ast_id.clone())
     {
         diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
             incompleteness: Incompleteness::Content,
             related: Vec::new(),
             source: None,
@@ -238,12 +304,30 @@ pub(super) fn call_shape_expansions_for_input(
             impact: CodeQueryDiagnosticImpact::Incomplete,
             branch: Vec::new(),
             language: crate::analyzer::common::language_for_file(&outcome.file).config_label(),
-            message: format!(
-                "call_shape coverage is {} at {}:{} (site_ast_id={}), so the argument-group, argument and binding rows this shape heads were suppressed rather than emitted empty",
-                outcome.coverage.label(),
-                crate::path_utils::workspace_relative_slash_path(outcome.file.rel_path()),
-                outcome.range.start_line,
-                outcome.site_ast_id,
+            message: brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+                format_args!(
+                    "call_shape coverage is {} at {}:{} (site_ast_id={}), so the argument-group, argument and binding rows this shape heads were suppressed rather than emitted empty{}",
+                    outcome.coverage.label(),
+                    crate::path_utils::workspace_relative_slash_path(outcome.file.rel_path()),
+                    outcome.range.start_line,
+                    outcome.site_ast_id,
+                    if refusals.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            "; candidate macro refusals: {}",
+                            crate::analyzer::semantic::service::candidate_macro_refusal_detail(&refusals)
+                        )
+                    },
+                ),
+                format_args!(
+                    "call_shape coverage is {} at {}:{} (site_ast_id={}); candidate macro refusals",
+                    outcome.coverage.label(),
+                    crate::path_utils::workspace_relative_slash_path(outcome.file.rel_path()),
+                    outcome.range.start_line,
+                    outcome.site_ast_id
+                ),
+                refusals.iter(),
             ),
         exhausted_roots: Vec::new(),
             withheld_rows_path: None,
@@ -254,6 +338,7 @@ pub(super) fn call_shape_expansions_for_input(
         seed: traces.first().map(|trace| Arc::clone(&trace.seed)),
         facts: Some(facts),
         resolved_external_callee: None,
+        fixed_array_invocation: None,
     };
     vec![pipeline_expansion(PipelineValue::CallShape(value))]
 }
@@ -276,15 +361,27 @@ pub(super) fn exact_external_callee_expansions(
                 cancellation,
             )
         }),
-        Language::Rust if outcome.coverage == CallShapeCoverage::ExactMacroDerived => bindings
-            .resolved_external_call_dispatch(analyzer, &outcome.file, outcome.range, cancellation)
-            .map(|target| {
-                format!(
-                    "{}.{}",
-                    target.identity().owner_fqn(),
-                    target.identity().member()
+        Language::Rust
+            if matches!(
+                outcome.coverage,
+                CallShapeCoverage::ExactMacroDerived | CallShapeCoverage::AdmittedCandidateMacro
+            ) =>
+        {
+            bindings
+                .resolved_external_call_dispatch(
+                    analyzer,
+                    &outcome.file,
+                    outcome.range,
+                    cancellation,
                 )
-            }),
+                .map(|target| {
+                    format!(
+                        "{}.{}",
+                        target.identity().owner_fqn(),
+                        target.identity().member()
+                    )
+                })
+        }
         _ => None,
     };
     let mut value = value.clone();

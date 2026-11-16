@@ -13,7 +13,7 @@ use crate::analyzer::java::semantic::numeric::{
 
 use crate::analyzer::java::semantic::syntax::*;
 
-use crate::analyzer::java::semantic::values::java_declaration_inventory;
+use crate::analyzer::java::semantic::values::JavaDeclarationInventory;
 
 use crate::analyzer::java::semantic::*;
 
@@ -129,6 +129,7 @@ pub(in crate::analyzer::java::semantic) fn lower_procedure<'tree, 'targets>(
     spec: &ProcedureSpec<'tree>,
     procedure_targets: &'targets HashMap<usize, NestedProcedureTarget<'tree>>,
     structural_node_index: &'targets StructuralNodeIndex,
+    declaration_inventory: &'targets JavaDeclarationInventory<'tree>,
     budget: &SemanticBudget,
     cancellation: &'targets CancellationToken,
 ) -> Result<(ProcedureSemanticsParts, SemanticWork), JavaLoweringError> {
@@ -149,7 +150,6 @@ pub(in crate::analyzer::java::semantic) fn lower_procedure<'tree, 'targets>(
         exceptional_exit,
         function_scope,
     } = ProcedureLoweringSession::start(parts, budget, cancellation)?;
-    let declaration_inventory = java_declaration_inventory(prepared);
     let mut context = LoweringContext {
         prepared,
         structural_node_index,
@@ -157,17 +157,18 @@ pub(in crate::analyzer::java::semantic) fn lower_procedure<'tree, 'targets>(
         return_type: spec.callable.child_by_field_name("type"),
         expression_values: HashMap::default(),
         constant_index_values: HashMap::default(),
-        field_declaration_anchors: declaration_inventory.field_anchors,
-        source_type_nodes: declaration_inventory.type_nodes,
-        type_name_roots: declaration_inventory.type_roots,
+        field_declaration_anchors: &declaration_inventory.field_anchors,
+        source_type_nodes: &declaration_inventory.type_nodes,
+        type_name_roots: &declaration_inventory.type_roots,
         local_types: HashMap::default(),
         local_type_nodes: HashMap::default(),
         constant_locals: HashMap::default(),
         array_values: HashSet::default(),
         non_null_values: HashSet::default(),
+        written_bindings: HashSet::default(),
         catch_binders: HashMap::default(),
         yield_results: HashMap::default(),
-        pattern_variable_names: declaration_inventory.pattern_names,
+        pattern_variable_names: &declaration_inventory.pattern_names,
         parameters: HashMap::default(),
         locals: HashMap::default(),
         implicit_field_values: HashMap::default(),
@@ -331,21 +332,15 @@ pub(in crate::analyzer::java::semantic) fn lower_procedure<'tree, 'targets>(
                 FootprintDisposition::Excluded(FootprintExclusion::NoInstance)
             },
         );
-        // The current producer does not tie the broad DynamicDispatch gap to
-        // its target-resolution gap, and may omit class initialization.
-        for class in [
-            FootprintClass::CallTarget,
+        // Class initialization and conversions remain outside this slice.
+        context.session.footprint_class(
             FootprintClass::ConversionInitialization,
-        ] {
-            context.session.footprint_class(
-                class,
-                if has_call {
-                    FootprintDisposition::Refused(FootprintRefusal::RelevantGap)
-                } else {
-                    FootprintDisposition::Excluded(FootprintExclusion::NoInstance)
-                },
-            );
-        }
+            if has_call {
+                FootprintDisposition::Refused(FootprintRefusal::RelevantGap)
+            } else {
+                FootprintDisposition::Excluded(FootprintExclusion::NoInstance)
+            },
+        );
     }
 
     // #2553: "source-order composition across initializer fragments" is the
@@ -467,6 +462,32 @@ pub(in crate::analyzer::java::semantic) fn lower_procedure<'tree, 'targets>(
             ],
         );
     }
+    if footprint_method {
+        let mut pending = vec![spec.body];
+        let mut has_call = false;
+        let mut claimed = true;
+        while let Some(node) = pending.pop() {
+            if node.kind() == "method_invocation" {
+                has_call = true;
+                claimed &= node
+                    .child_by_field_name("object")
+                    .is_none_or(|receiver| context.session.footprint_subtree_claimed(receiver));
+            }
+            if !matches!(node.kind(), "lambda_expression" | "class_declaration") {
+                pending.extend(named_children(node));
+            }
+        }
+        context.session.footprint_class(
+            FootprintClass::CallTarget,
+            if !has_call {
+                FootprintDisposition::Excluded(FootprintExclusion::NoInstance)
+            } else if claimed {
+                FootprintDisposition::Represented
+            } else {
+                FootprintDisposition::Refused(FootprintRefusal::UnaccountedSourceNode)
+            },
+        );
+    }
     context
         .session
         .assemble_footprint(&mut parts, spec.callable, java_call_control_branch);
@@ -585,25 +606,46 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         );
         let right = required_field(node, "right")?;
         let lexical_target = self.lexical_reference_binding(left);
-        if left.kind() == "identifier"
-            && lexical_target
-                .and_then(|(target, _)| self.local_type_nodes.get(&target))
-                .is_some_and(|ty| self.footprint_conversion_is_identity(*ty, right))
-        {
+        let target_type = match left.kind() {
+            "identifier" => {
+                lexical_target.and_then(|(target, _)| self.local_type_nodes.get(&target).copied())
+            }
+            "field_access" => self
+                .source_field_declaration(left)
+                .filter(|(_, field)| !field.is_static)
+                .and_then(|(_, field)| java_binding_type(field.declaration)),
+            "array_access" => self.compound_declared_type(left),
+            _ => None,
+        };
+        if target_type.is_some_and(|ty| self.footprint_conversion_is_identity(ty, right)) {
             self.session
                 .footprint_register(node, BoundaryDisposition::Lowered);
-            self.session
-                .footprint_consume_subtree(left, BranchClass::Identifier);
+            if left.kind() == "identifier" {
+                self.session
+                    .footprint_consume_subtree(left, BranchClass::Identifier);
+            }
         }
         let terminal = self.point(builder, node, Vec::new())?;
-        // putstatic initializes after the RHS and writes only on success.
-        let evaluation_terminal = if self.static_field_may_initialize(left) {
+        // Initialization and store checks follow the RHS; only success writes.
+        let instance_field_can_fault = left.kind() == "field_access"
+            && self.static_field_locator(left).is_none()
+            && !self.expression_is_non_null(required_field(left, "object")?);
+        let (evaluation_terminal, store_abort) = if self.static_field_may_initialize(left)
+            || instance_field_can_fault
+            || left.kind() == "array_access"
+        {
             let initialize = self.point(builder, left, Vec::new())?;
             self.edge(builder, initialize, EdgeTarget::normal(terminal))?;
-            self.implicit_abort_edge(builder, left, initialize, scope, None, stack)?;
-            initialize
+            let carried = if left.kind() == "array_access" {
+                Some(self.index_value(builder, required_field(left, "index")?)?)
+            } else {
+                None
+            };
+            let abort =
+                self.implicit_abort_edge(builder, left, initialize, scope, carried, stack)?;
+            (initialize, Some(abort))
         } else {
-            terminal
+            (terminal, None)
         };
         let kind = lexical_target
             .map(|(target, _)| self.assignment_literal_kind(target, right))
@@ -618,12 +660,6 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 value,
             },
         )?;
-        if let Some((target, flow)) = lexical_target
-            && matches!(flow, ValueFlowKind::Local)
-            && self.expression_is_non_null(right)
-        {
-            self.non_null_values.insert(target);
-        }
         if let Some((target, carrier)) = self.assignment_target(builder, terminal, left)? {
             match target {
                 CompoundAssignmentTarget::Binding {
@@ -655,6 +691,29 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                             value,
                         },
                     )?;
+                    if kind != MemoryAccessKind::Static
+                        && matches!(left.kind(), "field_access" | "array_access")
+                    {
+                        self.session.record_implicit_access(
+                            builder,
+                            left,
+                            terminal,
+                            instance_field_can_fault || left.kind() == "array_access",
+                        );
+                        if left.kind() == "field_access" {
+                            self.session.footprint_consume_subtree(
+                                required_field(left, "field")?,
+                                BranchClass::Identifier,
+                            );
+                        }
+                        if let Some(abort) = store_abort {
+                            self.session.record_implicit_access_abort(
+                                left,
+                                evaluation_terminal,
+                                abort,
+                            );
+                        }
+                    }
                 }
             }
             if let Some(carrier) = carrier {
@@ -841,7 +900,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             if let Some(carrier) = carrier {
                 self.assign_implicit_field_carrier(builder, write, carrier, computed)?;
             }
-            if can_throw {
+            let store_can_throw = left.kind() == "array_access"
+                && operator == "+="
+                && matches!(left_type, JavaCompoundType::Unknown);
+            if can_throw || store_can_throw {
                 self.implicit_abort_edge(builder, node, operation, scope, None, stack)?;
             }
         } else {
@@ -2903,6 +2965,19 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         result,
                     },
                 )?;
+                if kind != MemoryAccessKind::Static {
+                    self.session.record_implicit_access(
+                        builder,
+                        node,
+                        access,
+                        !self.expression_is_non_null(object),
+                    );
+                    // The field name is syntax and cannot call.
+                    self.session.footprint_consume_subtree(
+                        required_field(node, "field")?,
+                        BranchClass::Identifier,
+                    );
+                }
                 self.edge(builder, access, next)?;
                 if (kind == MemoryAccessKind::Static && self.static_field_may_initialize(node))
                     || (kind != MemoryAccessKind::Static && !self.expression_is_non_null(object))
@@ -2945,6 +3020,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         result,
                     },
                 )?;
+                self.session
+                    .record_implicit_access(builder, node, access, true);
                 self.edge(builder, access, next)?;
                 // NullPointerException carries nothing, but the message of an
                 // ArrayIndexOutOfBoundsException embeds the offending index,
@@ -3245,7 +3322,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     SemanticGapKind::Unknown,
                     "string template processor invocation is not yet lowered as a call",
                 )?;
-                self.implicit_abort_edge(builder, node, terminal, scope, None, stack)
+                self.implicit_abort_edge(builder, node, terminal, scope, None, stack)?;
+                Ok(())
             }
             kind if is_runtime_leaf(kind) => self.edge(builder, entry, next),
             _ => self.unhandled_control_syntax(builder, node, entry),
@@ -4410,18 +4488,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         // The call's thrown value binds a catch parameter that handles it,
         // like any other throw.
         self.abrupt_throw(builder, exceptional, scope, thrown, stack)?;
-        self.resolution_gaps(builder, invoke, callee, call_site, &resolution)?;
-
-        if node.kind() == "method_invocation" {
-            self.add_gap(
-                builder,
-                invoke,
-                SemanticGapSubject::CallSite(call_site),
-                SemanticCapability::DynamicDispatch,
-                SemanticGapKind::Unknown,
-                "method invocation may select an override; static/final dispatch and complete override coverage require type-hierarchy refinement",
-            )?;
-        }
+        self.session.add_callable_resolution_gaps_with_dispatch(
+            builder,
+            invoke,
+            callee,
+            call_site,
+            &resolution,
+            self.call_dispatch(node),
+            "callable target requires whole-program dispatch refinement",
+            "call target requires whole-program dispatch refinement",
+        )?;
 
         // Java evaluates the receiver or the enclosing-instance qualifier
         // before the argument list.
@@ -4801,41 +4877,26 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         scope: ScopeFrameId,
         carried: Option<ValueId>,
         stack: &mut Vec<Work<'tree>>,
-    ) -> Result<(), JavaLoweringError> {
-        let Some((route, abort)) = self.session.prepare_implicit_abort(builder, node, scope)?
+    ) -> Result<ProgramPointId, JavaLoweringError> {
+        let Some((route, abort)) = self.session.implicit_abort_edge(
+            builder,
+            node,
+            operation,
+            scope,
+            carried,
+            |route| {
+                self.catch_binders
+                    .get(&route.destination().target())
+                    .copied()
+            },
+        )?
         else {
             return Err(JavaLoweringError::Invalid(
                 "implicit abort has no matching structured continuation".into(),
             ));
         };
-        if let Some(binder) = self
-            .catch_binders
-            .get(&route.destination().target())
-            .copied()
-        {
-            let thrown = self.value(builder, abort, SemanticValueKind::Exception)?;
-            if let Some(carried) = carried {
-                self.append_effect(
-                    builder,
-                    abort,
-                    SemanticEffect::ValueFlow {
-                        kind: ValueFlowKind::Local,
-                        source: carried,
-                        target: thrown,
-                    },
-                )?;
-            }
-            self.bind_catch_parameter(builder, abort, binder, thrown)?;
-        }
-        self.edge(
-            builder,
-            operation,
-            EdgeTarget {
-                point: abort,
-                kind: ControlEdgeKind::Exceptional,
-            },
-        )?;
-        self.route(builder, abort, &route, stack)
+        self.route(builder, abort, &route, stack)?;
+        Ok(abort)
     }
 
     fn unhandled_control_syntax(
@@ -5083,9 +5144,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     /// the typestate engine binds it to the tracked subject identity instead
     /// of to the spelled resource variable.
     ///
-    /// Every close site is anchored at the try statement, which is the source
-    /// fact the resource-lifecycle selector names for the construct, and each
-    /// publishes the close operation's own normal and exceptional
+    /// Every cleanup point is anchored at the try statement, which is the
+    /// source fact the resource-lifecycle selector names for the construct,
+    /// while each specialized close call site receives its own occurrence-aware
+    /// exact mapping on the individual resource for dispatch and call-site
+    /// identity, and publishes the close operation's own normal and exceptional
     /// continuations. A close that throws still released its resource, so its
     /// exceptional continuation enters the *next* close in the chain, and only
     /// the last release in the chain propagates from the enclosing scope: an
@@ -5133,7 +5196,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         for (index, value_node) in values.into_iter().enumerate() {
             let invoke = invokes[index];
             // The cleanup point remains anchored to the try statement for
-            // ResourceRelease selectors. Dispatch needs the individual resource.
+            // ResourceRelease selectors. Dispatch needs the individual
+            // resource, and each route's specialization needs its own
+            // occurrence-aware call-site locator.
             let resource = value_node
                 .parent()
                 .filter(|parent| {
@@ -5147,7 +5212,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 ),
                 "an implicit close anchor must not alias its initializer call"
             );
-            let call_metadata = self.session.add_value_mapping(builder, resource)?;
+            let call_metadata = self.mapping(builder, resource)?;
             let normal = self.point(builder, node, Vec::new())?;
             let exceptional = self.point(builder, node, Vec::new())?;
             let receiver =

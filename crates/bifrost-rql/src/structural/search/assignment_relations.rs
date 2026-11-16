@@ -219,6 +219,10 @@ fn ordinary_assignment_relation_expansions<'a>(
     }
     if !unsupported.is_empty() {
         diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            has_non_utf8_refusal: false,
+            refusal_sites: Default::default(),
+            call_relation_facts: None,
+            uses_omissions: Vec::new(),
             incompleteness: brokk_bifrost_rql::Incompleteness::Content,
             related: Vec::new(),
             source: procedure.diagnostic_source(),
@@ -263,10 +267,15 @@ fn ordinary_assignment_relation_expansions<'a>(
                 )
             });
             workspace.analyzer().mark_execution_dependent();
+            semantic.join_reuse(EXECUTION_DEPENDENT);
         }
         diagnostics.push(super::QueryExecutionState::diagnostic(
             workspace.analyzer(),
             CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                 incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                 related: Vec::new(),
                 source: procedure.diagnostic_source(),
@@ -434,7 +443,10 @@ fn ordinary_assignment_relation_expansions<'a>(
     };
 
     let uncancelled = CancellationToken::new();
-    let mut request = FlowStateRequest::new(cancellation.unwrap_or(&uncancelled));
+    let mut request = FlowStateRequest::new(
+        cancellation.unwrap_or(&uncancelled),
+        brokk_bifrost_flow::flow_state::FlowStateRequestMemos::new(workspace.retention_budget()),
+    );
     let mut definitions = NonbindingDefinitions::default();
     let mut deferred = Vec::new();
     let mut expansions = if self_selected {
@@ -581,6 +593,10 @@ fn dead_write_expansions<'a>(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     procedure: &semantic::SemanticProcedureValue,
 ) -> Vec<PipelineExpansion> {
+    let Some(ownership) = semantic.ownership_procedure(procedure) else {
+        return Vec::new();
+    };
+    let procedure = &ownership;
     let infeasible_edges =
         brokk_bifrost_analysis::analyzer::semantic::rust_infeasible_control_edges(
             workspace,
@@ -619,6 +635,16 @@ fn dead_write_expansions<'a>(
     let derivation = semantic
         .materialized_outcome(procedure.file())
         .and_then(|outcome| {
+            debug_assert_eq!(
+                outcome
+                    .available_value()
+                    .expect("retained file artifact")
+                    .key(),
+                procedure.handle.artifact().key(),
+            );
+            // Keep the file outcome's completeness, but derive from the exact
+            // admitted ownership arena that minted this procedure handle.
+            let outcome = outcome.map(|_| procedure.handle.artifact().clone());
             flow_state_cache
                 .for_materialized_procedure(
                     workspace,
@@ -767,7 +793,46 @@ fn dead_write_expansions<'a>(
         index
     });
     let uncancelled = CancellationToken::new();
-    let mut request = FlowStateRequest::new(cancellation.unwrap_or(&uncancelled));
+    let mut request = FlowStateRequest::new(
+        cancellation.unwrap_or(&uncancelled),
+        brokk_bifrost_flow::flow_state::FlowStateRequestMemos::new(workspace.retention_budget()),
+    );
+    if dialect.language() == Language::Rust {
+        use crate::analyzer::semantic::workspace_oracle::value_flow::{
+            GapDischargeVerdict, logical_gap_is_discharged,
+        };
+        use crate::analyzer::semantic::{SemanticBudget, SemanticRequest};
+        let mut budget = SemanticBudget::default();
+        let mut cleanup_request = SemanticRequest::new(&mut budget, request.cancellation);
+        let mut inert = None;
+        let mut discharged = HashSet::default();
+        for gap in procedure.handle.semantics().gaps() {
+            let mut all_discharged = true;
+            let mut has_obligation = false;
+            for logical in procedure.handle.semantics().logical_gaps_of(gap) {
+                has_obligation = true;
+                // An unavailable proof keeps the stored gap open. In
+                // particular, one inert owner never closes its siblings.
+                match logical_gap_is_discharged(
+                    &workspace.semantic_oracle_provider(),
+                    logical,
+                    &procedure.handle,
+                    &mut cleanup_request,
+                    &mut inert,
+                ) {
+                    Ok(GapDischargeVerdict::Discharged) => {}
+                    Ok(_) | Err(_) => {
+                        all_discharged = false;
+                        break;
+                    }
+                }
+            }
+            if has_obligation && all_discharged && !cleanup_request.stop_observed() {
+                discharged.insert(gap.id);
+            }
+        }
+        request = request.with_discharged_observation_gaps(procedure.handle.clone(), discharged);
+    }
     let mut expansions = Vec::with_capacity(candidates.rows.len());
     for candidate in candidates.rows {
         let mut reasons = Vec::new();
@@ -873,6 +938,18 @@ fn dead_write_expansions<'a>(
             unreachable!()
         };
         value.relation_kind = "dead_write";
+        value.open_reasons = reasons
+            .iter()
+            .map(|reason| write_liveness_open_reason(procedure, reason))
+            .collect();
+        value.open_reasons.sort_by_cached_key(|reason| {
+            serde_json::to_string(reason).expect("typed reason serialization")
+        });
+        value.reason_codes = value
+            .open_reasons
+            .iter()
+            .map(|reason| reason.code().to_owned())
+            .collect();
         if verdict == "live" {
             value.read_event = read_witness;
         }
@@ -902,6 +979,10 @@ fn overwritten_unread_expansions<'a>(
     );
     if !supports_relation(dialect, AssignmentRelationKind::OverwrittenUnread) {
         diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            has_non_utf8_refusal: false,
+            refusal_sites: Default::default(),
+            call_relation_facts: None,
+            uses_omissions: Vec::new(),
             incompleteness: brokk_bifrost_rql::Incompleteness::Content,
             related: Vec::new(),
             source: procedure.diagnostic_source(),
@@ -978,10 +1059,15 @@ fn overwritten_unread_expansions<'a>(
                 )
             });
             workspace.analyzer().mark_execution_dependent();
+            semantic.join_reuse(EXECUTION_DEPENDENT);
         }
         diagnostics.push(super::QueryExecutionState::diagnostic(
             workspace.analyzer(),
             CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                 incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                 related: Vec::new(),
                 source: procedure.diagnostic_source(),
@@ -1067,7 +1153,10 @@ fn overwritten_unread_expansions<'a>(
         diagnostics,
     );
     let uncancelled = CancellationToken::new();
-    let mut request = FlowStateRequest::new(cancellation.unwrap_or(&uncancelled));
+    let mut request = FlowStateRequest::new(
+        cancellation.unwrap_or(&uncancelled),
+        brokk_bifrost_flow::flow_state::FlowStateRequestMemos::new(workspace.retention_budget()),
+    );
     let mut expansions = Vec::with_capacity(candidates.rows.len());
     for candidate in candidates.rows {
         match candidate.verdict {
@@ -1176,10 +1265,15 @@ fn overwritten_unread_expansions<'a>(
                             )
                         });
                         workspace.analyzer().mark_execution_dependent();
+                        semantic.join_reuse(EXECUTION_DEPENDENT);
                     }
                     diagnostics.push(super::QueryExecutionState::diagnostic(
                         workspace.analyzer(),
                         CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                            has_non_utf8_refusal: false,
+                            refusal_sites: Default::default(),
+                            call_relation_facts: None,
+                            uses_omissions: Vec::new(),
                             incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                             related: procedure.related_flow_reasons(&reasons),
                             source: procedure.diagnostic_source(),
@@ -1187,10 +1281,18 @@ fn overwritten_unread_expansions<'a>(
                             impact: CodeQueryDiagnosticImpact::Incomplete,
                             branch: Vec::new(),
                             language: dialect.language().config_label(),
-                            message: format!(
-                                "{} has open overwritten-unread proof at {:?}: {reasons:?}",
-                                procedure.wire_id(),
-                                candidate.range,
+                            message: brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+                                format_args!(
+                                    "{} has open overwritten-unread proof at {:?}: {reasons:?}",
+                                    procedure.wire_id(),
+                                    candidate.range,
+                                ),
+                                format_args!(
+                                    "{} has open overwritten-unread proof at {:?}",
+                                    procedure.wire_id(),
+                                    candidate.range
+                                ),
+                                reasons.iter(),
                             ),
                             exhausted_roots: Vec::new(),
                             withheld_rows_path: Some(rel_path_string(procedure.file())),
@@ -1367,9 +1469,16 @@ fn report_open_candidates(
                 .language()
                 .language()
                 .config_label(),
-            format!(
-                "{} has open assignment-relation candidates: {open_reasons:?}",
-                procedure.wire_id()
+            brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+                format_args!(
+                    "{} has open assignment-relation candidates: {open_reasons:?}",
+                    procedure.wire_id()
+                ),
+                format_args!(
+                    "{} has open assignment-relation candidates",
+                    procedure.wire_id()
+                ),
+                open_reasons.iter(),
             ),
             Vec::new(),
         );
@@ -1391,6 +1500,77 @@ fn report_open_candidates(
             .collect();
         diagnostic.withheld_rows_path = Some(rel_path_string(procedure.file()));
         diagnostics.push(diagnostic);
+    }
+}
+
+fn write_liveness_open_reason(
+    procedure: &semantic::SemanticProcedureValue,
+    reason: &FlowStateIncompleteReason,
+) -> CodeQueryWriteLivenessOpenReason {
+    use CodeQueryWriteLivenessOpenReason as Out;
+    use FlowStateIncompleteReason::*;
+    match reason {
+        AxisUnsupported(axis) => Out::AxisUnsupported { axis: axis.label() },
+        NoSemanticProvider => Out::NoSemanticProvider,
+        SemanticProviderFailed { detail } => Out::SemanticProviderFailed {
+            detail: detail.clone(),
+        },
+        SemanticAnalysisPartial { detail } => Out::SemanticAnalysisPartial {
+            detail: detail.clone(),
+        },
+        Cancelled => Out::Cancelled,
+        SourceGenerationChanged => Out::SourceGenerationChanged,
+        BindingScopeLivenessUnavailable { detail } => Out::BindingScopeLivenessUnavailable {
+            detail: detail.clone(),
+        },
+        ControlProjectionRejected { detail } => Out::ControlProjectionRejected {
+            detail: detail.clone(),
+        },
+        ModeledControlProjectionIncomplete { detail } => Out::ModeledControlProjectionIncomplete {
+            detail: detail.clone(),
+        },
+        NoStructuralFacts => Out::NoStructuralFacts,
+        LoweringGap {
+            capability,
+            kind,
+            detail,
+            gaps,
+        } => Out::LoweringGap {
+            capability: capability.label(),
+            kind: kind.label(),
+            detail: detail.clone(),
+            gap_ids: gaps.iter().map(|gap| gap.get()).collect(),
+            sources: gaps
+                .iter()
+                .flat_map(|id| {
+                    let gap = procedure
+                        .handle
+                        .semantics()
+                        .gap(*id)
+                        .expect("reason gap belongs to procedure");
+                    procedure.related_gaps(std::iter::once(gap))
+                })
+                .collect(),
+        },
+        BudgetExhausted { axis, detail } => Out::BudgetExhausted {
+            axis: axis.label(),
+            detail: detail.clone(),
+        },
+        BindingStateNotClosed { binding } => Out::BindingStateNotClosed {
+            binding_value_id: u64::from(binding.get()),
+        },
+        // The dead-write proof selects binding and reaching reasons and
+        // explicitly removes BindingWithoutEstablishment. Property-only
+        // reasons cannot pass that construction boundary.
+        PropertyBaseNotCanonical { .. }
+        | SelectedPropertyEndpointUnavailable { .. }
+        | BindingWithoutEstablishment { .. }
+        | PropertyProviderUnavailable
+        | PropertyProviderFailed { .. }
+        | PropertyAnalysisPartial { .. }
+        | PropertyReaching { .. } => {
+            unreachable!("dead-write proof returned a nonbinding reason: {reason:?}")
+        }
     }
 }
 
@@ -2105,13 +2285,12 @@ fn binding_identities_are_closed(
     !procedure
         .handle
         .semantics()
-        .gaps()
-        .iter()
-        .any(|gap| match gap.subject {
-            _ if gap.capability == SemanticCapability::Assignments => true,
+        .logical_gaps()
+        .any(|gap| match gap.subject() {
+            _ if gap.base.capability == SemanticCapability::Assignments => true,
             SemanticGapSubject::Value(value) => {
                 bindings.contains(&value)
-                    && !(gap.capability == SemanticCapability::Values
+                    && !(gap.base.capability == SemanticCapability::Values
                         && origins.unique_binding_origin(value) == Some(value))
             }
             SemanticGapSubject::Procedure => true,
@@ -2418,6 +2597,8 @@ fn row(
             proof,
             coverage,
             reason: reason.or((candidate.reason != "qualified").then_some(candidate.reason)),
+            reason_codes: Vec::new(),
+            open_reasons: Vec::new(),
             replacement_events: Vec::new(),
             read_event: None,
         },
@@ -2479,7 +2660,12 @@ mod tests {
             .unwrap();
         let mut definitions = NonbindingDefinitions::default();
         let cancellation = CancellationToken::new();
-        let mut request = FlowStateRequest::new(&cancellation);
+        let mut request = FlowStateRequest::new(
+            &cancellation,
+            brokk_bifrost_flow::flow_state::FlowStateRequestMemos::new(
+                workspace.retention_budget(),
+            ),
+        );
         let ordinary = qualify_candidate(
             &workspace,
             &mut definitions,

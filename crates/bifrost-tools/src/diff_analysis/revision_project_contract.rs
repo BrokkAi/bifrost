@@ -71,8 +71,8 @@ fn committed_revision_ignore_rules_have_distinct_digests() {
     .expect("after image");
     let (before, _) = before.project();
     let (after, _) = after.project();
-    assert!(!before.is_bifrostignored(Path::new("main.rs")));
-    assert!(after.is_bifrostignored(Path::new("main.rs")));
+    assert!(!before.is_bifrostignored(Path::new("main.rs")).unwrap());
+    assert!(after.is_bifrostignored(Path::new("main.rs")).unwrap());
     assert_ne!(
         before.ignore_rules_digest().unwrap(),
         after.ignore_rules_digest().unwrap()

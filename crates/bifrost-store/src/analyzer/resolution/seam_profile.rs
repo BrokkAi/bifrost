@@ -44,6 +44,14 @@
 //! [`TOTALS_INTERVAL`] and at the end of every request, so a process killed by
 //! `timeout` (the warm `usage_graph` workload does not finish) still leaves its
 //! counts behind. The digest reads the last `totals` line.
+//!
+//! A JVM selected-resolution operation writes one `jvm_operation_reads` line
+//! when it is dropped, with its id (`op`), its `status`, its `reads` (empty for
+//! a known-empty operation) and one attribution fixed when it opened:
+//! `request` (the open request's `seq`), `unattributed` or `overlapped`. A
+//! `request` line carries `seq` and `jvm_operations: {first, next, completed}`,
+//! so the ids in `[first, next)` are the operations that opened during it and a
+//! validator can tell a missing line from a known-empty one.
 
 /// Every added observation has its own independent differential counter.
 #[derive(Clone, Copy, Debug)]
@@ -127,7 +135,6 @@ use std::path::PathBuf;
 
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
-use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use std::sync::Mutex;
@@ -144,7 +151,7 @@ use crate::analyzer::store::Result as StoreResult;
 
 use crate::hash::HashSet;
 
-use super::LoweredTypeProduction;
+use super::{LoweredBinaryOperation, LoweredTypeProduction};
 
 use super::batch::BatchCandidateCompletionOutcome;
 use super::batch::BatchCandidateMatch;
@@ -346,14 +353,23 @@ seam_methods! {
     SelectionAuthority => "selection_authority", "BatchResolutionFragmentSource";
     AdmitsReverseReference => "admits_reverse_reference", "BatchResolutionFragmentSource";
     ScopeReverseInventoryCompletion => "scope_reverse_inventory_completion", "BatchResolutionFragmentSource";
+    ClassAliasSource => "class_alias_source", "SelectedTypedFactSource";
+    BasePreservationReferenceComplete => "base_preservation_reference_complete", "SelectedTypedFactSource";
+    BasePreservationMembers => "base_preservation_members", "SelectedTypedFactSource";
+    BasePreservationTerminalReference => "base_preservation_terminal_reference", "SelectedTypedFactSource";
+    BasePreservationTerminalOwner => "base_preservation_terminal_owner", "SelectedTypedFactSource";
     ImplicitBaseInputs => "implicit_base_inputs", "SelectedTypedFactSource";
+    ImplicitAppendedBase => "implicit_appended_base", "SelectedTypedFactSource";
     JvmExternalOwnerIsIndexed => "jvm_external_owner_is_indexed", "SelectedTypedFactSource";
+    BinaryOperationTypeProvider => "binary_operation_type_provider", "SelectedTypedFactSource";
+    SelectedTypeHeads => "selected_type_heads", "SelectedTypedFactSource";
     SelectedBlobGapReasonProvenance => "selected_blob_gap_reason_provenance", "SelectedTypedFactSource";
     SelectedBlobForFragment => "selected_blob_for_fragment", "SelectedTypedFactSource";
     SelectedModelLanguage => "selected_model_language", "SelectedTypedFactSource";
     SelectedModelProjection => "selected_model_projection", "SelectedTypedFactSource";
     SupportsConditionalTypeSeeds => "supports_conditional_type_seeds", "SelectedTypedFactSource";
     ConditionalTypeSeeds => "conditional_type_seeds", "SelectedTypedFactSource";
+    ConditionalTypeProductions => "conditional_type_productions", "SelectedTypedFactSource";
     JvmIntrinsicOwnerIsUnshadowed => "jvm_intrinsic_owner_is_unshadowed", "SelectedTypedFactSource";
     SelectedJvmDeclarationOwner => "selected_jvm_declaration_owner", "SelectedTypedFactSource";
     GeneratedItemsCannotShadowBindings => "generated_items_cannot_shadow_bindings", "SelectedTypedFactSource";
@@ -397,6 +413,7 @@ seam_methods! {
     RustTraitNameableAt => "rust_trait_nameable_at", "SelectedTypedFactSource";
     RustImplementedTraitsNameableAt => "rust_implemented_traits_nameable_at", "SelectedTypedFactSource";
     RustImplItemTraits => "rust_impl_item_traits", "SelectedTypedFactSource";
+    RustBuiltinDeriveMember => "rust_builtin_derive_member", "SelectedTypedFactSource";
     SelectionHasJavaSemantics => "selection_has_java_semantics", "SelectedTypedFactSource";
     LookupNamespace => "lookup_namespace", "SelectedTypedFactSource";
     SelectionHasJvmSemantics => "selection_has_jvm_semantics", "SelectedTypedFactSource";
@@ -441,6 +458,7 @@ seam_methods! {
     VisitTypeTransferPagesFromSources => "visit_type_transfer_pages_from_sources", "SelectedTypedFactSource";
     VisitTypeTransferPagesToTargets => "visit_type_transfer_pages_to_targets", "SelectedTypedFactSource";
     VisitTypeProductionPagesForOutputs => "visit_type_production_pages_for_outputs", "SelectedTypedFactSource";
+    VisitBinaryOperationPagesForOutputs => "visit_binary_operation_pages_for_outputs", "SelectedTypedFactSource";
     VisitTypeComponentPagesForContainers => "visit_type_component_pages_for_containers", "SelectedTypedFactSource";
     VisitDeclaredTypeArgumentPagesForOwners => "visit_declared_type_argument_pages_for_owners", "SelectedTypedFactSource";
     VisitTypeArgumentPagesForApplications => "visit_type_argument_pages_for_applications", "SelectedTypedFactSource";
@@ -678,11 +696,34 @@ struct Profile {
     root_source_bounded: AtomicU64,
     root_source_universal: AtomicU64,
     requests: AtomicU64,
-    /// Nonzero while a request boundary is open. The per-request deltas are a
-    /// difference of two process-wide snapshots, which is exact only while one
-    /// request is open at a time; a line taken while this was above one says so.
-    in_flight: AtomicUsize,
+    /// The open request boundaries and the JVM operation counters. See
+    /// [`OperationLedger`].
+    ledger: Mutex<OperationLedger>,
     dirty: AtomicBool,
+}
+
+/// Request and JVM operation identities, kept under one lock so that an
+/// operation's id and its attribution are decided in one step.
+///
+/// The per-request deltas of the other counters are a difference of two
+/// process-wide snapshots, which is exact only while one request is open at a
+/// time; `open_requests` is what says whether that held. A request records the
+/// operation counter when it opens and when it closes, so its half-open range
+/// holds exactly the operations that opened while it was open. The lock is held
+/// for a few integer operations, never across I/O.
+#[derive(Default)]
+struct OperationLedger {
+    /// The requests whose boundary is open now: sequence number, and whether
+    /// another request has been open at any time since it opened. The earlier
+    /// of two overlapping requests is marked when the later one opens, so it
+    /// also reports that its deltas include work it did not start.
+    open_requests: Vec<(u64, bool)>,
+    next_request: u64,
+    next_operation: u64,
+    /// Operations whose line has been written. It is advanced after the write,
+    /// so a request line that counts an operation comes after that operation's
+    /// line in the file.
+    completed_operations: u64,
 }
 
 impl Profile {
@@ -699,7 +740,7 @@ impl Profile {
                 resolution_work: std::array::from_fn(|_| AtomicU64::new(0)),
                 output: Mutex::new(output),
                 requests: AtomicU64::new(0),
-                in_flight: AtomicUsize::new(0),
+                ledger: Mutex::default(),
                 dirty: AtomicBool::new(true),
             }),
             Err(error) => {
@@ -782,10 +823,67 @@ fn profile() -> Option<&'static Profile> {
         .as_ref()
 }
 
+/// How a JVM operation ended, as far as its drop can tell.
+///
+/// There is no cancelled status: the operation does not hold its cancellation
+/// token, so a drop cannot tell a cancelled operation from a completed one.
+#[derive(Clone, Copy)]
+pub(crate) enum JvmOperationStatus {
+    Completed,
+    /// The operation was dropped while its thread was unwinding, so its reads
+    /// are partial.
+    Panicked,
+}
+
+/// Which request an operation opened under, decided when it opened.
+#[derive(Clone, Copy, Debug)]
+enum OperationAttribution {
+    /// Exactly one request boundary was open.
+    Request(u64),
+    /// No request boundary was open.
+    Unattributed,
+    /// More than one request boundary was open, so the operation belongs to
+    /// none of them in particular.
+    Overlapped,
+}
+
+/// The identity of one JVM operation. It is assigned when the operation opens
+/// and is consumed by its single completion line.
+pub(crate) struct JvmOperation {
+    id: u64,
+    attribution: OperationAttribution,
+}
+
+/// Give a JVM operation its id and attribution, or `None` when the instrument
+/// is off. The id is the process-wide count of JVM operations opened so far,
+/// so a request's operations are exactly the ids in its `jvm_operations`
+/// range; it says nothing about which operation asked which question, because
+/// operations open concurrently on worker threads.
+pub(crate) fn open_jvm_operation() -> Option<JvmOperation> {
+    let profile = profile()?;
+    let mut ledger = profile.ledger.lock().expect("seam ledger poisoned");
+    let id = ledger.next_operation;
+    ledger.next_operation += 1;
+    let attribution = match ledger.open_requests.as_slice() {
+        [] => OperationAttribution::Unattributed,
+        [(request, _)] => OperationAttribution::Request(*request),
+        _ => OperationAttribution::Overlapped,
+    };
+    Some(JvmOperation { id, attribution })
+}
+
 /// Exact-input invocation counts from one selected JVM operation. The caller
 /// owns the keyed ledger and drops it with the query; the profile retains only
 /// the rendered diagnostic line.
-pub(crate) fn record_jvm_operation_reads(reads: serde_json::Value) {
+///
+/// An operation that opened under the profile always writes one line, with an
+/// empty `reads` when it read nothing, so a known-empty operation is
+/// distinguishable from one that never reported.
+pub(crate) fn record_jvm_operation_reads(
+    operation: Option<JvmOperation>,
+    status: JvmOperationStatus,
+    reads: serde_json::Value,
+) {
     #[cfg(any(test, feature = "test-support"))]
     if let Some(reads) = reads.as_array() {
         let builds: u64 = reads
@@ -800,15 +898,30 @@ pub(crate) fn record_jvm_operation_reads(reads: serde_json::Value) {
         JVM_CONTEXT_BUILD_COUNT.with(|count| count.set(count.get() + builds));
     }
 
-    if let Some(profile) = profile() {
-        profile.write_line(
-            &serde_json::json!({
-                "kind": "jvm_operation_reads",
-                "reads": reads,
-            })
-            .to_string(),
-        );
+    let Some(operation) = operation else {
+        return;
+    };
+    let profile = profile().expect("an operation id implies a profile");
+    let mut line = serde_json::json!({
+        "kind": "jvm_operation_reads",
+        "op": operation.id,
+        "status": match status {
+            JvmOperationStatus::Completed => "completed",
+            JvmOperationStatus::Panicked => "panicked",
+        },
+        "reads": reads,
+    });
+    match operation.attribution {
+        OperationAttribution::Request(request) => line["request"] = request.into(),
+        OperationAttribution::Unattributed => line["unattributed"] = true.into(),
+        OperationAttribution::Overlapped => line["overlapped"] = true.into(),
     }
+    profile.write_line(&line.to_string());
+    profile
+        .ledger
+        .lock()
+        .expect("seam ledger poisoned")
+        .completed_operations += 1;
 }
 
 /// Offered and admitted frame pairs expose seek over-inclusion without
@@ -1105,6 +1218,9 @@ pub struct RequestScope {
 
 struct OpenRequest {
     tool: String,
+    seq: u64,
+    operations_first: u64,
+    operations_completed_before: u64,
     started: Instant,
     before: Vec<(u64, u64, u64)>,
     sql_before: Option<(u64, u64, u128)>,
@@ -1112,7 +1228,6 @@ struct OpenRequest {
     candidate_before: [[u64; 2]; 2],
     go_reverse_before: [u64; 18],
     rename_phase_before: [[u64; 5]; 4],
-    overlapped: bool,
 }
 
 /// Open a request boundary for one MCP tool call. A no-op when the instrument
@@ -1121,10 +1236,23 @@ pub fn request_scope(tool: &str) -> RequestScope {
     let Some(profile) = profile() else {
         return RequestScope { inner: None };
     };
-    let overlapped = profile.in_flight.fetch_add(1, Ordering::Relaxed) > 0;
+    let (seq, operations_first, operations_completed_before) = {
+        let mut ledger = profile.ledger.lock().expect("seam ledger poisoned");
+        let overlaps_open_request = !ledger.open_requests.is_empty();
+        for (_, other_overlapped) in &mut ledger.open_requests {
+            *other_overlapped = true;
+        }
+        let seq = ledger.next_request;
+        ledger.next_request += 1;
+        ledger.open_requests.push((seq, overlaps_open_request));
+        (seq, ledger.next_operation, ledger.completed_operations)
+    };
     RequestScope {
         inner: Some(OpenRequest {
             tool: tool.to_string(),
+            seq,
+            operations_first,
+            operations_completed_before,
             started: Instant::now(),
             before: profile.snapshot(),
             sql_before: brokk_bifrost_core::cache_db::sql_profile::totals_with_rows(),
@@ -1135,7 +1263,6 @@ pub fn request_scope(tool: &str) -> RequestScope {
             candidate_before: profile.candidate_admission_snapshot(),
             go_reverse_before: profile.go_reverse_snapshot(),
             rename_phase_before: profile.rename_phase_snapshot(),
-            overlapped,
         }),
     }
 }
@@ -1146,16 +1273,38 @@ impl Drop for RequestScope {
             return;
         };
         let profile = profile().expect("an open request scope implies a profile");
-        let overlapped = open.overlapped || profile.in_flight.fetch_sub(1, Ordering::Relaxed) > 1;
+        let (overlapped, operations_next, operations_completed) = {
+            let mut ledger = profile.ledger.lock().expect("seam ledger poisoned");
+            let position = ledger
+                .open_requests
+                .iter()
+                .position(|&(seq, _)| seq == open.seq)
+                .expect("an open request scope is in the ledger");
+            let (_, overlapped) = ledger.open_requests.swap_remove(position);
+            (
+                overlapped,
+                ledger.next_operation,
+                ledger.completed_operations,
+            )
+        };
         let now = profile.snapshot();
         let go_reverse_now = profile.go_reverse_snapshot();
         let rename_phase_now = profile.rename_phase_snapshot();
         profile.requests.fetch_add(1, Ordering::Relaxed);
         let mut line = serde_json::json!({
             "kind": "request",
+            "seq": open.seq,
             "tool": open.tool,
             "wall_ms": open.started.elapsed().as_secs_f64() * 1000.0,
             "overlapped": overlapped,
+            // The JVM operations that opened while this request was open are
+            // the ids in [first, next); `completed` counts the operations
+            // whose line was written in that window.
+            "jvm_operations": {
+                "first": open.operations_first,
+                "next": operations_next,
+                "completed": operations_completed - open.operations_completed_before,
+            },
             "methods": method_object(&now, Some(&open.before)),
         });
         let candidate_now = profile.candidate_admission_snapshot();
@@ -1432,7 +1581,7 @@ where
         &self,
         reference: SemanticId,
         cancellation: &CancellationToken,
-    ) -> StoreResult<Option<super::universe::UniverseEntry>> {
+    ) -> StoreResult<Option<crate::analyzer::resolution::SelectedUniverseEntry>> {
         self.inner.selected_universe_entry(reference, cancellation)
     }
 
@@ -1826,6 +1975,76 @@ impl<T: ?Sized> SelectedTypedFactSource for SeamProfiled<'_, T>
 where
     T: SelectedTypedFactSource,
 {
+    fn binary_operation_type_provider(
+        &self,
+    ) -> Option<&dyn crate::analyzer::store::language_support::BinaryOperationTypeProvider> {
+        record_call(SeamMethod::BinaryOperationTypeProvider, 0);
+        self.inner.binary_operation_type_provider()
+    }
+    fn selected_type_heads(
+        &self,
+    ) -> Option<&dyn crate::analyzer::store::language_support::SelectedTypeHeadSource> {
+        record_call(SeamMethod::SelectedTypeHeads, 0);
+        self.inner.selected_type_heads()
+    }
+    fn class_alias_source(
+        &self,
+        definition: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<SemanticId>> {
+        record_call(SeamMethod::ClassAliasSource, 1);
+        let result = self.inner.class_alias_source(definition, cancellation);
+        if let Ok(Some(_)) = &result {
+            record_rows(SeamMethod::ClassAliasSource, 1);
+        }
+        result
+    }
+    fn base_preservation_reference_complete(
+        &self,
+        reference: SemanticId,
+        cancellation: &CancellationToken,
+        work: &mut dyn FnMut() -> bool,
+    ) -> StoreResult<bool> {
+        record_call(SeamMethod::BasePreservationReferenceComplete, 1);
+        self.inner
+            .base_preservation_reference_complete(reference, cancellation, work)
+    }
+    fn base_preservation_members(
+        &self,
+        owner: SemanticId,
+        members: &[&str],
+        cancellation: &CancellationToken,
+        work: &mut dyn FnMut() -> bool,
+    ) -> StoreResult<Option<super::BasePreservationMembers>> {
+        record_call(SeamMethod::BasePreservationMembers, 1);
+        let result = self
+            .inner
+            .base_preservation_members(owner, members, cancellation, work);
+        if let Ok(Some(members)) = &result {
+            record_rows(SeamMethod::BasePreservationMembers, members.names.len());
+        }
+        result
+    }
+    fn base_preservation_terminal_reference(
+        &self,
+        reference: SemanticId,
+        terminal: &str,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<bool> {
+        record_call(SeamMethod::BasePreservationTerminalReference, 1);
+        self.inner
+            .base_preservation_terminal_reference(reference, terminal, cancellation)
+    }
+    fn base_preservation_terminal_owner(
+        &self,
+        owner: SemanticId,
+        terminal: &str,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<bool> {
+        record_call(SeamMethod::BasePreservationTerminalOwner, 1);
+        self.inner
+            .base_preservation_terminal_owner(owner, terminal, cancellation)
+    }
     fn selected_blob_for_fragment(
         &self,
         fragment: BindingFragmentId,
@@ -1867,6 +2086,19 @@ where
         }
         result
     }
+    fn conditional_type_productions(
+        &self,
+        slots: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Vec<super::fact_source::ConditionalTypeProduction>> {
+        record_call(SeamMethod::ConditionalTypeProductions, slots.len());
+        let result = self.inner.conditional_type_productions(slots, cancellation);
+        if let Ok(rows) = &result {
+            record_rows(SeamMethod::ConditionalTypeProductions, rows.len());
+        }
+        result
+    }
+
     fn supports_conditional_type_seeds(&self) -> bool {
         let supported = self.inner.supports_conditional_type_seeds();
         // Keep default-language lifecycle counters byte-identical.
@@ -1925,6 +2157,22 @@ where
             record_call(SeamMethod::QualifiedMemberRegistrations, 0);
         }
         registrations
+    }
+
+    fn implicit_appended_base(
+        &self,
+        owner: SemanticId,
+        written_targets: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<super::fact_source::ImplicitAppendedBase>> {
+        record_call(SeamMethod::ImplicitAppendedBase, 1);
+        let outcome = self
+            .inner
+            .implicit_appended_base(owner, written_targets, cancellation);
+        if let Ok(Some(_)) = &outcome {
+            record_rows(SeamMethod::ImplicitAppendedBase, 1);
+        }
+        outcome
     }
 
     fn implicit_base_inputs(
@@ -2129,6 +2377,17 @@ where
             self.inner
                 .rust_trait_nameable_at(owner, reference, cancellation)
         })
+    }
+
+    fn rust_builtin_derive_member(
+        &self,
+        owner: SemanticId,
+        lookup: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<super::RustBuiltinDeriveMember> {
+        record_call(SeamMethod::RustBuiltinDeriveMember, 1);
+        self.inner
+            .rust_builtin_derive_member(owner, lookup, cancellation)
     }
 
     fn rust_impl_item_traits(
@@ -2418,13 +2677,14 @@ where
     fn model_member_callable_result(
         &self,
         member: &crate::analyzer::semantic_model::overlay::ModelSymbolRef,
+        owner_language: super::ExternalOwnerLanguage,
         cancellation: &CancellationToken,
     ) -> StoreResult<Option<Option<super::fact_source::ModelCallableResultDeclaration>>> {
         let _key_scope = brokk_bifrost_core::cache_db::sql_profile::key_scope(1);
         record_call(SeamMethod::ModelMemberCallableResult, 1);
         let outcome = self
             .inner
-            .model_member_callable_result(member, cancellation);
+            .model_member_callable_result(member, owner_language, cancellation);
         if let Ok(Some(Some(_))) = &outcome {
             record_rows(SeamMethod::ModelMemberCallableResult, 1);
         }
@@ -2612,6 +2872,12 @@ where
         VisitTypeProductionPagesForOutputs,
         SemanticId,
         SelectedTypedRow<LoweredTypeProduction>
+    );
+    counted_typed_pages!(
+        visit_binary_operation_pages_for_outputs,
+        VisitBinaryOperationPagesForOutputs,
+        SemanticId,
+        SelectedTypedRow<LoweredBinaryOperation>
     );
     counted_typed_pages!(
         visit_type_component_pages_for_containers,
@@ -2914,8 +3180,11 @@ mod tests {
         // #5671: the root-inventory admission session is forwarded and counted too.
         // #7708: supports_exact_type_argument_links is forwarded and counted too.
         assert_eq!(batch.len(), 41, "BatchResolutionFragmentSource: {batch:?}");
-        // #7654, #5658, #9002 add readers.
-        assert_eq!(typed.len(), 104, "SelectedTypedFactSource: {typed:?}");
+        // #7654, #5658, #9002, #11325 and #5658 2b.1 add readers; #12241 adds
+        // the operator provider, selected type heads and binary-operation page
+        // reader; #12159 adds the conditional nominal-constructor reader;
+        // #12070 adds the trailing implicit-base read.
+        assert_eq!(typed.len(), 115, "SelectedTypedFactSource: {typed:?}");
 
         let forwarded = SeamMethod::ALL
             .iter()
@@ -2947,7 +3216,12 @@ mod tests {
         // #7619 adds two readers; #5671 profiles the root-inventory session accessor.
         // #7654, #5658, #9002 add profiled readers.
         // #7708 profiles supports_exact_type_argument_links.
-        assert_eq!(METHOD_COUNT, 143);
+        // #11325 profiles rust_builtin_derive_member; #5658 2b.1 profiles five
+        // hierarchy readers; #12241 profiles the operator provider, selected
+        // type heads and binary-operation page reader; #12159 profiles the
+        // conditional nominal-constructor reader; #12070 profiles the trailing
+        // implicit-base read.
+        assert_eq!(METHOD_COUNT, 154);
     }
 
     #[cfg(test)]

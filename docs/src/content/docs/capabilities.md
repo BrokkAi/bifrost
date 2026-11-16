@@ -44,7 +44,7 @@ Some language behavior limits what the index contains:
 
 - C# `#if` chains: Bifrost parses one branch of each chain, the first one whose condition is not the literal `false`. It does not model defined symbols. Declarations in other branches are not indexed, and the file's semantic diagnostics are marked incomplete.
 - Go build constraints are not evaluated. Bifrost indexes every `.go` file, including files that only build on some platforms.
-- Bifrost does not analyze `.vue`, `.svelte`, `.razor`, or `.cshtml` templates, or extensions outside the supported list such as `.pyi` and `.mts`. `scan_usages` adds a note when template files are present.
+- Bifrost does not analyze `.vue`, `.svelte`, `.razor`, `.cshtml`, or `.erb` templates, or extensions outside the supported list such as `.pyi` and `.mts`. `scan_usages` adds a note when template files are present, and a CodeQuery over the template's language reports each one as incomplete coverage.
 - Build topology steps (`target_of`, `source_set_of`, `topology_edges_of`) read Maven `pom.xml` files only. Gradle builds are not read for topology.
 
 ### Bounded Receiver Provenance

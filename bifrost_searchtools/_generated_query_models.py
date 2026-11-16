@@ -165,7 +165,14 @@ class CodeQueryDiagnosticCode(StrEnum):
     USES_PARSER_UNSUPPORTED = 'uses_parser_unsupported'
     USES_CANDIDATE_LIMIT = 'uses_candidate_limit'
     USES_TARGETS_AMBIGUOUS = 'uses_targets_ambiguous'
-    USES_CANDIDATES_OMITTED = 'uses_candidates_omitted'
+    USES_CANDIDATE_UNAVAILABLE = 'uses_candidate_unavailable'
+    USES_CANDIDATE_INCOMPLETE = 'uses_candidate_incomplete'
+    USES_CANDIDATE_UNRESOLVED = 'uses_candidate_unresolved'
+    USES_REFERENCE_PROJECTION_MISSING = 'uses_reference_projection_missing'
+    USES_DEFINITION_PROJECTION_MISSING = 'uses_definition_projection_missing'
+    USES_INVERSE_UNCONFIRMED = 'uses_inverse_unconfirmed'
+    USES_INDEXED_SOURCE_UNAVAILABLE = 'uses_indexed_source_unavailable'
+    USES_TARGET_RANGE_UNAVAILABLE = 'uses_target_range_unavailable'
     EXECUTION_BUDGET_EXHAUSTED = 'execution_budget_exhausted'
     PIPELINE_BUDGET_EXHAUSTED = 'pipeline_budget_exhausted'
     IMPORT_GRAPH_BUDGET_EXHAUSTED = 'import_graph_budget_exhausted'
@@ -177,6 +184,7 @@ class CodeQueryDiagnosticCode(StrEnum):
     MATERIALIZATION_DERIVATION_INCOMPLETE = 'materialization_derivation_incomplete'
     MATERIALIZATION_ROW_BUDGET_EXHAUSTED = 'materialization_row_budget_exhausted'
     ENVIRONMENT_DERIVATION_INCOMPLETE = 'environment_derivation_incomplete'
+    ENVIRONMENT_BOUNDED_WORK_LIMIT = 'environment_bounded_work_limit'
     ENVIRONMENT_ROW_BUDGET_EXHAUSTED = 'environment_row_budget_exhausted'
     RESOLUTION_TRACE_INCOMPLETE = 'resolution_trace_incomplete'
     PYTHON_HIERARCHY_DERIVATION_INCOMPLETE = 'python_hierarchy_derivation_incomplete'
@@ -271,6 +279,11 @@ class CodeQuerySemanticProof(StrEnum):
     UNPROVEN = 'unproven'
 
 
+class CodeQueryStableOwnerDerivation(StrEnum):
+    CANONICAL_AST_IDENTITY = 'canonical_ast_identity'
+    SEMANTIC_WIRE_ID = 'semantic_wire_id'
+
+
 class CodeQueryTypestateCertainty(StrEnum):
     MAY = 'may'
     MUST = 'must'
@@ -335,6 +348,7 @@ class ConversionUnknownVariant1(StrEnum):
     UNSUPPORTED_CONVERSION = 'unsupported_conversion'
     UNSUPPORTED_EXPRESSION = 'unsupported_expression'
     INCOMPLETE_HIERARCHY = 'incomplete_hierarchy'
+    FIXED_LIMIT = 'fixed_limit'
     BUDGET_EXHAUSTED = 'budget_exhausted'
     CANCELLED = 'cancelled'
 
@@ -343,6 +357,17 @@ class DepthBoundStatus(StrEnum):
     REACHED = 'reached'
     NOT_REACHED = 'not_reached'
     UNKNOWN = 'unknown'
+
+
+class DerivationExecutionCause(StrEnum):
+    CANCELLED = 'cancelled'
+    BUDGET = 'budget'
+    SNAPSHOT = 'snapshot'
+    PROVIDER = 'provider'
+
+
+class IncompletenessVariant1(StrEnum):
+    CONTENT = 'content'
 
 
 class JavaAnnotationTypeStatus(StrEnum):
@@ -354,6 +379,11 @@ class JavaAnnotationTypeStatus(StrEnum):
     CANCELLED = 'cancelled'
 
 
+class OmissionExactness(StrEnum):
+    EXACT = 'exact'
+    LOWER_BOUND = 'lower_bound'
+
+
 class ParameterPassingMode(StrEnum):
     POSITIONAL_ONLY = 'positional_only'
     POSITIONAL_OR_NAMED = 'positional_or_named'
@@ -362,6 +392,16 @@ class ParameterPassingMode(StrEnum):
 
 class ParameterRole(StrEnum):
     REQUEST = 'request'
+
+
+class RustToolchainChannel(StrEnum):
+    STABLE = 'stable'
+    BETA = 'beta'
+    NIGHTLY = 'nightly'
+
+
+class RustdocComponent(StrEnum):
+    RUST_DOCS_JSON_PREVIEW = 'rust_docs_json_preview'
 
 
 class SemanticModelCompleteness(StrEnum):
@@ -399,6 +439,7 @@ class WildcardVariance(StrEnum):
 class ArtifactExtraction:
     inputs: ArtifactExtractionInputsVariant1 | ArtifactExtractionInputsVariant2
     kind: ArtifactExtractionKindVariant1 | str
+    verified_sysroot: list[VerifiedSysrootReceipt]
 
     @classmethod
     def from_dict(cls, data: Any) -> ArtifactExtraction:
@@ -478,12 +519,14 @@ class CodeQueryAssignmentRelation:
     coverage: str
     id: str
     language: str
+    open_reasons: list[CodeQueryWriteLivenessOpenReasonVariant1 | CodeQueryWriteLivenessOpenReasonVariant2 | CodeQueryWriteLivenessOpenReasonVariant3 | CodeQueryWriteLivenessOpenReasonVariant4 | CodeQueryWriteLivenessOpenReasonVariant5 | CodeQueryWriteLivenessOpenReasonVariant6 | CodeQueryWriteLivenessOpenReasonVariant7 | CodeQueryWriteLivenessOpenReasonVariant8 | CodeQueryWriteLivenessOpenReasonVariant9 | CodeQueryWriteLivenessOpenReasonVariant10 | CodeQueryWriteLivenessOpenReasonVariant11 | CodeQueryWriteLivenessOpenReasonVariant12 | CodeQueryWriteLivenessOpenReasonVariant13]
     path: str
     procedure_id: str
     proof: str
     range: CodeQueryRange
     read_event: CodeQueryStateEventRef | None
     reason: str | None
+    reason_codes: list[str]
     relation_kind: str
     replacement_events: list[CodeQueryStateEventRef]
     rhs_value_id: int | None
@@ -1504,7 +1547,9 @@ class CodeQueryDiagnostic:
     branch: list[int]
     code: CodeQueryDiagnosticCode
     exhausted_roots: list[CodeQueryExhaustedRoot]
+    has_non_utf8_refusal: bool
     impact: CodeQueryDiagnosticImpact
+    incompleteness: IncompletenessVariant1 | str | IncompletenessVariant3
     language: str
     message: str
     related: list[CodeQueryRelatedSource]
@@ -1568,6 +1613,16 @@ class CodeQueryDispatchTarget:
 
 
 @dataclass(frozen=True)
+class CodeQueryExhaustedBudget:
+    consumed: int
+    limit: int
+
+    @classmethod
+    def from_dict(cls, data: Any) -> CodeQueryExhaustedBudget:
+        return _decode_code_query_exhausted_budget(data, 'CodeQueryExhaustedBudget')
+
+
+@dataclass(frozen=True)
 class CodeQueryExhaustedCharge:
     attempted: int
     limit: int
@@ -1579,6 +1634,7 @@ class CodeQueryExhaustedCharge:
 
 @dataclass(frozen=True)
 class CodeQueryExhaustedRoot:
+    budget: CodeQueryExhaustedBudget | None
     charge: CodeQueryExhaustedCharge | None
     feedback_iteration: int | None
     lane: str
@@ -2908,6 +2964,7 @@ class CodeQueryPythonRuleFact:
     distinct_tuple_arities: int | None
     docstring_present: bool | None
     docstring_value: str | None
+    entry_point: str | None
     exception_class: str | None
     expected_exception: str | None
     explicit_return_statements: int | None
@@ -3647,6 +3704,7 @@ class CodeQueryResultRefVariant3:
     path: str
     procedure_kind: str
     range: CodeQueryRange
+    source_owner: CodeQueryStableOwnerCandidateVariant1 | CodeQueryStableOwnerCandidateVariant2 | None
 
     @classmethod
     def from_dict(cls, data: Any) -> CodeQueryResultRefVariant3:
@@ -4676,6 +4734,8 @@ class CodeQueryRustPointerFinding:
     range: CodeQueryRange
     reason: str | None
     relation: str
+    source_ranges: list[CodeQuerySourceSpan]
+    source_ranges_omitted: OmissionCount
     strength: str
     provenance: list[CodeQueryProvenance]
     provenance_truncated: bool
@@ -4752,6 +4812,27 @@ class CodeQuerySourceSpan:
     @classmethod
     def from_dict(cls, data: Any) -> CodeQuerySourceSpan:
         return _decode_code_query_source_span(data, 'CodeQuerySourceSpan')
+
+
+@dataclass(frozen=True)
+class CodeQueryStableOwnerCandidateVariant1:
+    id: str
+    namespace: str
+
+    @classmethod
+    def from_dict(cls, data: Any) -> CodeQueryStableOwnerCandidateVariant1:
+        return _decode_code_query_stable_owner_candidate_variant1(data, 'CodeQueryStableOwnerCandidateVariant1')
+
+
+@dataclass(frozen=True)
+class CodeQueryStableOwnerCandidateVariant2:
+    derivation: CodeQueryStableOwnerDerivation
+    namespace: str
+    semantic_key: str
+
+    @classmethod
+    def from_dict(cls, data: Any) -> CodeQueryStableOwnerCandidateVariant2:
+        return _decode_code_query_stable_owner_candidate_variant2(data, 'CodeQueryStableOwnerCandidateVariant2')
 
 
 @dataclass(frozen=True)
@@ -5071,6 +5152,112 @@ class CodeQueryTypestateWitnessStepKindVariant3:
 
 
 @dataclass(frozen=True)
+class CodeQueryWriteLivenessOpenReasonVariant1:
+    axis: str
+
+    @classmethod
+    def from_dict(cls, data: Any) -> CodeQueryWriteLivenessOpenReasonVariant1:
+        return _decode_code_query_write_liveness_open_reason_variant1(data, 'CodeQueryWriteLivenessOpenReasonVariant1')
+
+
+@dataclass(frozen=True)
+class CodeQueryWriteLivenessOpenReasonVariant10:
+    pass
+
+
+@dataclass(frozen=True)
+class CodeQueryWriteLivenessOpenReasonVariant11:
+    capability: str
+    detail: str
+    gap_ids: list[int]
+    kind: str
+    sources: list[CodeQueryRelatedSource]
+
+    @classmethod
+    def from_dict(cls, data: Any) -> CodeQueryWriteLivenessOpenReasonVariant11:
+        return _decode_code_query_write_liveness_open_reason_variant11(data, 'CodeQueryWriteLivenessOpenReasonVariant11')
+
+
+@dataclass(frozen=True)
+class CodeQueryWriteLivenessOpenReasonVariant12:
+    axis: str
+    detail: str
+
+    @classmethod
+    def from_dict(cls, data: Any) -> CodeQueryWriteLivenessOpenReasonVariant12:
+        return _decode_code_query_write_liveness_open_reason_variant12(data, 'CodeQueryWriteLivenessOpenReasonVariant12')
+
+
+@dataclass(frozen=True)
+class CodeQueryWriteLivenessOpenReasonVariant13:
+    binding_value_id: int
+
+    @classmethod
+    def from_dict(cls, data: Any) -> CodeQueryWriteLivenessOpenReasonVariant13:
+        return _decode_code_query_write_liveness_open_reason_variant13(data, 'CodeQueryWriteLivenessOpenReasonVariant13')
+
+
+@dataclass(frozen=True)
+class CodeQueryWriteLivenessOpenReasonVariant2:
+    pass
+
+
+@dataclass(frozen=True)
+class CodeQueryWriteLivenessOpenReasonVariant3:
+    detail: str
+
+    @classmethod
+    def from_dict(cls, data: Any) -> CodeQueryWriteLivenessOpenReasonVariant3:
+        return _decode_code_query_write_liveness_open_reason_variant3(data, 'CodeQueryWriteLivenessOpenReasonVariant3')
+
+
+@dataclass(frozen=True)
+class CodeQueryWriteLivenessOpenReasonVariant4:
+    detail: str
+
+    @classmethod
+    def from_dict(cls, data: Any) -> CodeQueryWriteLivenessOpenReasonVariant4:
+        return _decode_code_query_write_liveness_open_reason_variant4(data, 'CodeQueryWriteLivenessOpenReasonVariant4')
+
+
+@dataclass(frozen=True)
+class CodeQueryWriteLivenessOpenReasonVariant5:
+    pass
+
+
+@dataclass(frozen=True)
+class CodeQueryWriteLivenessOpenReasonVariant6:
+    pass
+
+
+@dataclass(frozen=True)
+class CodeQueryWriteLivenessOpenReasonVariant7:
+    detail: str
+
+    @classmethod
+    def from_dict(cls, data: Any) -> CodeQueryWriteLivenessOpenReasonVariant7:
+        return _decode_code_query_write_liveness_open_reason_variant7(data, 'CodeQueryWriteLivenessOpenReasonVariant7')
+
+
+@dataclass(frozen=True)
+class CodeQueryWriteLivenessOpenReasonVariant8:
+    detail: str
+
+    @classmethod
+    def from_dict(cls, data: Any) -> CodeQueryWriteLivenessOpenReasonVariant8:
+        return _decode_code_query_write_liveness_open_reason_variant8(data, 'CodeQueryWriteLivenessOpenReasonVariant8')
+
+
+@dataclass(frozen=True)
+class CodeQueryWriteLivenessOpenReasonVariant9:
+    detail: str
+
+    @classmethod
+    def from_dict(cls, data: Any) -> CodeQueryWriteLivenessOpenReasonVariant9:
+        return _decode_code_query_write_liveness_open_reason_variant9(data, 'CodeQueryWriteLivenessOpenReasonVariant9')
+
+
+@dataclass(frozen=True)
 class ConfigurationContribution:
     evidence: ConfigurationEvidenceIdentity
     key: ConfigurationResolutionKey
@@ -5229,6 +5416,15 @@ class ConfigurationRouteSelectorVariant2:
 
 
 @dataclass(frozen=True)
+class IncompletenessVariant3:
+    operational: DerivationExecutionCause
+
+    @classmethod
+    def from_dict(cls, data: Any) -> IncompletenessVariant3:
+        return _decode_incompleteness_variant3(data, 'IncompletenessVariant3')
+
+
+@dataclass(frozen=True)
 class JavaAnnotationArtifactVariant1:
     artifact_path: str
     source_path: str
@@ -5267,6 +5463,16 @@ class ModelProvider:
     @classmethod
     def from_dict(cls, data: Any) -> ModelProvider:
         return _decode_model_provider(data, 'ModelProvider')
+
+
+@dataclass(frozen=True)
+class OmissionCount:
+    count: int
+    exactness: OmissionExactness
+
+    @classmethod
+    def from_dict(cls, data: Any) -> OmissionCount:
+        return _decode_omission_count(data, 'OmissionCount')
 
 
 @dataclass(frozen=True)
@@ -5313,6 +5519,31 @@ class PythonRuntimeBaseClaim:
     @classmethod
     def from_dict(cls, data: Any) -> PythonRuntimeBaseClaim:
         return _decode_python_runtime_base_claim(data, 'PythonRuntimeBaseClaim')
+
+
+@dataclass(frozen=True)
+class RustSysrootProvenance:
+    archive_member: str
+    archive_sha256: str
+    component: RustdocComponent
+    target: str
+    toolchain: RustToolchainIdentity
+
+    @classmethod
+    def from_dict(cls, data: Any) -> RustSysrootProvenance:
+        return _decode_rust_sysroot_provenance(data, 'RustSysrootProvenance')
+
+
+@dataclass(frozen=True)
+class RustToolchainIdentity:
+    channel: RustToolchainChannel
+    commit: str
+    date: str
+    release: str
+
+    @classmethod
+    def from_dict(cls, data: Any) -> RustToolchainIdentity:
+        return _decode_rust_toolchain_identity(data, 'RustToolchainIdentity')
 
 
 @dataclass(frozen=True)
@@ -5529,12 +5760,23 @@ class TypeRefVariant9:
     def from_dict(cls, data: Any) -> TypeRefVariant9:
         return _decode_type_ref_variant9(data, 'TypeRefVariant9')
 
+
+@dataclass(frozen=True)
+class VerifiedSysrootReceipt:
+    path: str
+    provenance: RustSysrootProvenance
+
+    @classmethod
+    def from_dict(cls, data: Any) -> VerifiedSysrootReceipt:
+        return _decode_verified_sysroot_receipt(data, 'VerifiedSysrootReceipt')
+
 def _decode_artifact_extraction(value: Any, prefix: str = 'ArtifactExtraction') -> ArtifactExtraction:
     if not isinstance(value, dict):
         raise TypeDecoderError(f"{prefix}: expected object")
     expected = {
         'inputs',
         'kind',
+        'verified_sysroot',
     }
     actual = set(value)
     unexpected = actual - expected
@@ -5549,9 +5791,14 @@ def _decode_artifact_extraction(value: Any, prefix: str = 'ArtifactExtraction') 
         raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
     inputs_value = _decode_defs_artifact_extraction_inputs(value['inputs'], f"{prefix}.inputs")
     kind_value = _decode_defs_artifact_extraction_kind(value['kind'], f"{prefix}.kind")
+    if 'verified_sysroot' in value:
+        verified_sysroot_value = _decode_defs_artifact_extraction_properties_verified_sysroot(value['verified_sysroot'], f"{prefix}.verified_sysroot")
+    else:
+        verified_sysroot_value = _decode_defs_artifact_extraction_properties_verified_sysroot([], f"{prefix}.verified_sysroot")
     return ArtifactExtraction(
         inputs=inputs_value,
         kind=kind_value,
+        verified_sysroot=verified_sysroot_value,
     )
 
 def _decode_artifact_extraction_inputs_variant1(value: Any, prefix: str = 'ArtifactExtractionInputsVariant1') -> ArtifactExtractionInputsVariant1:
@@ -5785,12 +6032,14 @@ def _decode_code_query_assignment_relation(value: Any, prefix: str = 'CodeQueryA
         'coverage',
         'id',
         'language',
+        'open_reasons',
         'path',
         'procedure_id',
         'proof',
         'range',
         'read_event',
         'reason',
+        'reason_codes',
         'relation_kind',
         'replacement_events',
         'rhs_value_id',
@@ -5812,6 +6061,7 @@ def _decode_code_query_assignment_relation(value: Any, prefix: str = 'CodeQueryA
         'procedure_id',
         'proof',
         'range',
+        'reason_codes',
         'relation_kind',
         'storage_kind',
         'verdict',
@@ -5830,6 +6080,10 @@ def _decode_code_query_assignment_relation(value: Any, prefix: str = 'CodeQueryA
     coverage_value = _decode_string(value['coverage'], f"{prefix}.coverage")
     id_value = _decode_string(value['id'], f"{prefix}.id")
     language_value = _decode_string(value['language'], f"{prefix}.language")
+    if 'open_reasons' in value:
+        open_reasons_value = _decode_defs_code_query_result_item_union_40_properties_open_reasons(value['open_reasons'], f"{prefix}.open_reasons")
+    else:
+        open_reasons_value = _decode_defs_code_query_result_item_union_40_properties_open_reasons([], f"{prefix}.open_reasons")
     path_value = _decode_string(value['path'], f"{prefix}.path")
     procedure_id_value = _decode_string(value['procedure_id'], f"{prefix}.procedure_id")
     proof_value = _decode_string(value['proof'], f"{prefix}.proof")
@@ -5842,6 +6096,7 @@ def _decode_code_query_assignment_relation(value: Any, prefix: str = 'CodeQueryA
         reason_value = _decode_defs_code_query_result_item_union_40_properties_reason(value['reason'], f"{prefix}.reason")
     else:
         reason_value = None
+    reason_codes_value = _decode_defs_code_query_result_item_union_40_properties_reason_codes(value['reason_codes'], f"{prefix}.reason_codes")
     relation_kind_value = _decode_string(value['relation_kind'], f"{prefix}.relation_kind")
     if 'replacement_events' in value:
         replacement_events_value = _decode_defs_code_query_result_item_union_40_properties_replacement_events(value['replacement_events'], f"{prefix}.replacement_events")
@@ -5871,12 +6126,14 @@ def _decode_code_query_assignment_relation(value: Any, prefix: str = 'CodeQueryA
         coverage=coverage_value,
         id=id_value,
         language=language_value,
+        open_reasons=open_reasons_value,
         path=path_value,
         procedure_id=procedure_id_value,
         proof=proof_value,
         range=range_value,
         read_event=read_event_value,
         reason=reason_value,
+        reason_codes=reason_codes_value,
         relation_kind=relation_kind_value,
         replacement_events=replacement_events_value,
         rhs_value_id=rhs_value_id_value,
@@ -9908,7 +10165,9 @@ def _decode_code_query_diagnostic(value: Any, prefix: str = 'CodeQueryDiagnostic
         'branch',
         'code',
         'exhausted_roots',
+        'has_non_utf8_refusal',
         'impact',
+        'incompleteness',
         'language',
         'message',
         'related',
@@ -9922,6 +10181,7 @@ def _decode_code_query_diagnostic(value: Any, prefix: str = 'CodeQueryDiagnostic
     required = {
         'code',
         'impact',
+        'incompleteness',
         'language',
         'message',
     }
@@ -9937,7 +10197,12 @@ def _decode_code_query_diagnostic(value: Any, prefix: str = 'CodeQueryDiagnostic
         exhausted_roots_value = _decode_defs_code_query_diagnostic_properties_exhausted_roots(value['exhausted_roots'], f"{prefix}.exhausted_roots")
     else:
         exhausted_roots_value = _decode_defs_code_query_diagnostic_properties_exhausted_roots([], f"{prefix}.exhausted_roots")
+    if 'has_non_utf8_refusal' in value:
+        has_non_utf8_refusal_value = _decode_boolean(value['has_non_utf8_refusal'], f"{prefix}.has_non_utf8_refusal")
+    else:
+        has_non_utf8_refusal_value = _decode_boolean(False, f"{prefix}.has_non_utf8_refusal")
     impact_value = _decode_defs_code_query_diagnostic_impact(value['impact'], f"{prefix}.impact")
+    incompleteness_value = _decode_defs_incompleteness(value['incompleteness'], f"{prefix}.incompleteness")
     language_value = _decode_string(value['language'], f"{prefix}.language")
     message_value = _decode_string(value['message'], f"{prefix}.message")
     if 'related' in value:
@@ -9956,7 +10221,9 @@ def _decode_code_query_diagnostic(value: Any, prefix: str = 'CodeQueryDiagnostic
         branch=branch_value,
         code=code_value,
         exhausted_roots=exhausted_roots_value,
+        has_non_utf8_refusal=has_non_utf8_refusal_value,
         impact=impact_value,
+        incompleteness=incompleteness_value,
         language=language_value,
         message=message_value,
         related=related_value,
@@ -10164,6 +10431,31 @@ def _decode_code_query_dispatch_target(value: Any, prefix: str = 'CodeQueryDispa
         provenance_truncated=provenance_truncated_value,
     )
 
+def _decode_code_query_exhausted_budget(value: Any, prefix: str = 'CodeQueryExhaustedBudget') -> CodeQueryExhaustedBudget:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'consumed',
+        'limit',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'consumed',
+        'limit',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    consumed_value = _decode_defs_code_query_exhausted_budget_properties_consumed(value['consumed'], f"{prefix}.consumed")
+    limit_value = _decode_defs_code_query_exhausted_budget_properties_limit(value['limit'], f"{prefix}.limit")
+    return CodeQueryExhaustedBudget(
+        consumed=consumed_value,
+        limit=limit_value,
+    )
+
 def _decode_code_query_exhausted_charge(value: Any, prefix: str = 'CodeQueryExhaustedCharge') -> CodeQueryExhaustedCharge:
     if not isinstance(value, dict):
         raise TypeDecoderError(f"{prefix}: expected object")
@@ -10193,6 +10485,7 @@ def _decode_code_query_exhausted_root(value: Any, prefix: str = 'CodeQueryExhaus
     if not isinstance(value, dict):
         raise TypeDecoderError(f"{prefix}: expected object")
     expected = {
+        'budget',
         'charge',
         'feedback_iteration',
         'lane',
@@ -10211,6 +10504,10 @@ def _decode_code_query_exhausted_root(value: Any, prefix: str = 'CodeQueryExhaus
     missing = required - actual
     if missing:
         raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    if 'budget' in value:
+        budget_value = _decode_defs_code_query_exhausted_root_properties_budget(value['budget'], f"{prefix}.budget")
+    else:
+        budget_value = None
     if 'charge' in value:
         charge_value = _decode_defs_code_query_exhausted_root_properties_charge(value['charge'], f"{prefix}.charge")
     else:
@@ -10230,6 +10527,7 @@ def _decode_code_query_exhausted_root(value: Any, prefix: str = 'CodeQueryExhaus
     else:
         stage_value = None
     return CodeQueryExhaustedRoot(
+        budget=budget_value,
         charge=charge_value,
         feedback_iteration=feedback_iteration_value,
         lane=lane_value,
@@ -14815,6 +15113,7 @@ def _decode_code_query_python_rule_fact(value: Any, prefix: str = 'CodeQueryPyth
         'distinct_tuple_arities',
         'docstring_present',
         'docstring_value',
+        'entry_point',
         'exception_class',
         'expected_exception',
         'explicit_return_statements',
@@ -14984,6 +15283,10 @@ def _decode_code_query_python_rule_fact(value: Any, prefix: str = 'CodeQueryPyth
         docstring_value_value = _decode_defs_code_query_result_item_union_75_properties_docstring_value(value['docstring_value'], f"{prefix}.docstring_value")
     else:
         docstring_value_value = None
+    if 'entry_point' in value:
+        entry_point_value = _decode_defs_code_query_result_item_union_75_properties_entry_point(value['entry_point'], f"{prefix}.entry_point")
+    else:
+        entry_point_value = None
     if 'exception_class' in value:
         exception_class_value = _decode_defs_code_query_result_item_union_75_properties_exception_class(value['exception_class'], f"{prefix}.exception_class")
     else:
@@ -15273,6 +15576,7 @@ def _decode_code_query_python_rule_fact(value: Any, prefix: str = 'CodeQueryPyth
         distinct_tuple_arities=distinct_tuple_arities_value,
         docstring_present=docstring_present_value,
         docstring_value=docstring_value_value,
+        entry_point=entry_point_value,
         exception_class=exception_class_value,
         expected_exception=expected_exception_value,
         explicit_return_statements=explicit_return_statements_value,
@@ -17531,6 +17835,7 @@ def _decode_code_query_result_ref_variant3(value: Any, prefix: str = 'CodeQueryR
         'path',
         'procedure_kind',
         'range',
+        'source_owner',
     }
     actual = set(value)
     unexpected = actual - expected
@@ -17549,11 +17854,16 @@ def _decode_code_query_result_ref_variant3(value: Any, prefix: str = 'CodeQueryR
     path_value = _decode_string(value['path'], f"{prefix}.path")
     procedure_kind_value = _decode_string(value['procedure_kind'], f"{prefix}.procedure_kind")
     range_value = _decode_code_query_range(value['range'], f"{prefix}.range")
+    if 'source_owner' in value:
+        source_owner_value = _decode_defs_code_query_result_ref_union_2_properties_source_owner(value['source_owner'], f"{prefix}.source_owner")
+    else:
+        source_owner_value = None
     return CodeQueryResultRefVariant3(
         id=id_value,
         path=path_value,
         procedure_kind=procedure_kind_value,
         range=range_value,
+        source_owner=source_owner_value,
     )
 
 def _decode_code_query_result_ref_variant30(value: Any, prefix: str = 'CodeQueryResultRefVariant30') -> CodeQueryResultRefVariant30:
@@ -20655,6 +20965,8 @@ def _decode_code_query_rust_pointer_finding(value: Any, prefix: str = 'CodeQuery
         'range',
         'reason',
         'relation',
+        'source_ranges',
+        'source_ranges_omitted',
         'strength',
         'provenance',
         'provenance_truncated',
@@ -20676,6 +20988,8 @@ def _decode_code_query_rust_pointer_finding(value: Any, prefix: str = 'CodeQuery
         'proof',
         'range',
         'relation',
+        'source_ranges',
+        'source_ranges_omitted',
         'strength',
     }
     missing = required - actual
@@ -20713,6 +21027,8 @@ def _decode_code_query_rust_pointer_finding(value: Any, prefix: str = 'CodeQuery
     else:
         reason_value = None
     relation_value = _decode_string(value['relation'], f"{prefix}.relation")
+    source_ranges_value = _decode_defs_code_query_result_item_union_77_properties_source_ranges(value['source_ranges'], f"{prefix}.source_ranges")
+    source_ranges_omitted_value = _decode_omission_count(value['source_ranges_omitted'], f"{prefix}.source_ranges_omitted")
     strength_value = _decode_string(value['strength'], f"{prefix}.strength")
     if 'provenance' in value:
         provenance_value = _decode_defs_code_query_result_item_union_77_properties_provenance(value['provenance'], f"{prefix}.provenance")
@@ -20740,6 +21056,8 @@ def _decode_code_query_rust_pointer_finding(value: Any, prefix: str = 'CodeQuery
         range=range_value,
         reason=reason_value,
         relation=relation_value,
+        source_ranges=source_ranges_value,
+        source_ranges_omitted=source_ranges_omitted_value,
         strength=strength_value,
         provenance=provenance_value,
         provenance_truncated=provenance_truncated_value,
@@ -20962,6 +21280,60 @@ def _decode_code_query_source_span(value: Any, prefix: str = 'CodeQuerySourceSpa
         path=path_value,
         range=range_value,
         start_byte=start_byte_value,
+    )
+
+def _decode_code_query_stable_owner_candidate_variant1(value: Any, prefix: str = 'CodeQueryStableOwnerCandidateVariant1') -> CodeQueryStableOwnerCandidateVariant1:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'id',
+        'namespace',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'id',
+        'namespace',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    id_value = _decode_string(value['id'], f"{prefix}.id")
+    namespace_value = _decode_string(value['namespace'], f"{prefix}.namespace")
+    return CodeQueryStableOwnerCandidateVariant1(
+        id=id_value,
+        namespace=namespace_value,
+    )
+
+def _decode_code_query_stable_owner_candidate_variant2(value: Any, prefix: str = 'CodeQueryStableOwnerCandidateVariant2') -> CodeQueryStableOwnerCandidateVariant2:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'derivation',
+        'namespace',
+        'semantic_key',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'derivation',
+        'namespace',
+        'semantic_key',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    derivation_value = _decode_defs_code_query_stable_owner_derivation(value['derivation'], f"{prefix}.derivation")
+    namespace_value = _decode_string(value['namespace'], f"{prefix}.namespace")
+    semantic_key_value = _decode_string(value['semantic_key'], f"{prefix}.semantic_key")
+    return CodeQueryStableOwnerCandidateVariant2(
+        derivation=derivation_value,
+        namespace=namespace_value,
+        semantic_key=semantic_key_value,
     )
 
 def _decode_code_query_state_event(value: Any, prefix: str = 'CodeQueryStateEvent') -> CodeQueryStateEvent:
@@ -22076,6 +22448,275 @@ def _decode_code_query_typestate_witness_step_kind_variant3(value: Any, prefix: 
         return_kind=return_kind_value,
     )
 
+def _decode_code_query_write_liveness_open_reason_variant1(value: Any, prefix: str = 'CodeQueryWriteLivenessOpenReasonVariant1') -> CodeQueryWriteLivenessOpenReasonVariant1:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'axis',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'axis',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    axis_value = _decode_string(value['axis'], f"{prefix}.axis")
+    return CodeQueryWriteLivenessOpenReasonVariant1(
+        axis=axis_value,
+    )
+
+def _decode_code_query_write_liveness_open_reason_variant10(value: Any, prefix: str = 'CodeQueryWriteLivenessOpenReasonVariant10') -> CodeQueryWriteLivenessOpenReasonVariant10:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = set()
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = set()
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    return CodeQueryWriteLivenessOpenReasonVariant10(
+    )
+
+def _decode_code_query_write_liveness_open_reason_variant11(value: Any, prefix: str = 'CodeQueryWriteLivenessOpenReasonVariant11') -> CodeQueryWriteLivenessOpenReasonVariant11:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'capability',
+        'detail',
+        'gap_ids',
+        'kind',
+        'sources',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'capability',
+        'detail',
+        'gap_ids',
+        'kind',
+        'sources',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    capability_value = _decode_string(value['capability'], f"{prefix}.capability")
+    detail_value = _decode_string(value['detail'], f"{prefix}.detail")
+    gap_ids_value = _decode_defs_code_query_write_liveness_open_reason_union_10_properties_gap_ids(value['gap_ids'], f"{prefix}.gap_ids")
+    kind_value = _decode_string(value['kind'], f"{prefix}.kind")
+    sources_value = _decode_defs_code_query_write_liveness_open_reason_union_10_properties_sources(value['sources'], f"{prefix}.sources")
+    return CodeQueryWriteLivenessOpenReasonVariant11(
+        capability=capability_value,
+        detail=detail_value,
+        gap_ids=gap_ids_value,
+        kind=kind_value,
+        sources=sources_value,
+    )
+
+def _decode_code_query_write_liveness_open_reason_variant12(value: Any, prefix: str = 'CodeQueryWriteLivenessOpenReasonVariant12') -> CodeQueryWriteLivenessOpenReasonVariant12:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'axis',
+        'detail',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'axis',
+        'detail',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    axis_value = _decode_string(value['axis'], f"{prefix}.axis")
+    detail_value = _decode_string(value['detail'], f"{prefix}.detail")
+    return CodeQueryWriteLivenessOpenReasonVariant12(
+        axis=axis_value,
+        detail=detail_value,
+    )
+
+def _decode_code_query_write_liveness_open_reason_variant13(value: Any, prefix: str = 'CodeQueryWriteLivenessOpenReasonVariant13') -> CodeQueryWriteLivenessOpenReasonVariant13:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'binding_value_id',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'binding_value_id',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    binding_value_id_value = _decode_defs_code_query_write_liveness_open_reason_union_12_properties_binding_value_id(value['binding_value_id'], f"{prefix}.binding_value_id")
+    return CodeQueryWriteLivenessOpenReasonVariant13(
+        binding_value_id=binding_value_id_value,
+    )
+
+def _decode_code_query_write_liveness_open_reason_variant2(value: Any, prefix: str = 'CodeQueryWriteLivenessOpenReasonVariant2') -> CodeQueryWriteLivenessOpenReasonVariant2:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = set()
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = set()
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    return CodeQueryWriteLivenessOpenReasonVariant2(
+    )
+
+def _decode_code_query_write_liveness_open_reason_variant3(value: Any, prefix: str = 'CodeQueryWriteLivenessOpenReasonVariant3') -> CodeQueryWriteLivenessOpenReasonVariant3:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'detail',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'detail',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    detail_value = _decode_string(value['detail'], f"{prefix}.detail")
+    return CodeQueryWriteLivenessOpenReasonVariant3(
+        detail=detail_value,
+    )
+
+def _decode_code_query_write_liveness_open_reason_variant4(value: Any, prefix: str = 'CodeQueryWriteLivenessOpenReasonVariant4') -> CodeQueryWriteLivenessOpenReasonVariant4:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'detail',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'detail',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    detail_value = _decode_string(value['detail'], f"{prefix}.detail")
+    return CodeQueryWriteLivenessOpenReasonVariant4(
+        detail=detail_value,
+    )
+
+def _decode_code_query_write_liveness_open_reason_variant5(value: Any, prefix: str = 'CodeQueryWriteLivenessOpenReasonVariant5') -> CodeQueryWriteLivenessOpenReasonVariant5:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = set()
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = set()
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    return CodeQueryWriteLivenessOpenReasonVariant5(
+    )
+
+def _decode_code_query_write_liveness_open_reason_variant6(value: Any, prefix: str = 'CodeQueryWriteLivenessOpenReasonVariant6') -> CodeQueryWriteLivenessOpenReasonVariant6:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = set()
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = set()
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    return CodeQueryWriteLivenessOpenReasonVariant6(
+    )
+
+def _decode_code_query_write_liveness_open_reason_variant7(value: Any, prefix: str = 'CodeQueryWriteLivenessOpenReasonVariant7') -> CodeQueryWriteLivenessOpenReasonVariant7:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'detail',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'detail',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    detail_value = _decode_string(value['detail'], f"{prefix}.detail")
+    return CodeQueryWriteLivenessOpenReasonVariant7(
+        detail=detail_value,
+    )
+
+def _decode_code_query_write_liveness_open_reason_variant8(value: Any, prefix: str = 'CodeQueryWriteLivenessOpenReasonVariant8') -> CodeQueryWriteLivenessOpenReasonVariant8:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'detail',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'detail',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    detail_value = _decode_string(value['detail'], f"{prefix}.detail")
+    return CodeQueryWriteLivenessOpenReasonVariant8(
+        detail=detail_value,
+    )
+
+def _decode_code_query_write_liveness_open_reason_variant9(value: Any, prefix: str = 'CodeQueryWriteLivenessOpenReasonVariant9') -> CodeQueryWriteLivenessOpenReasonVariant9:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'detail',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'detail',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    detail_value = _decode_string(value['detail'], f"{prefix}.detail")
+    return CodeQueryWriteLivenessOpenReasonVariant9(
+        detail=detail_value,
+    )
+
 def _decode_configuration_contribution(value: Any, prefix: str = 'ConfigurationContribution') -> ConfigurationContribution:
     if not isinstance(value, dict):
         raise TypeDecoderError(f"{prefix}: expected object")
@@ -22540,6 +23181,14 @@ def _decode_defs_artifact_extraction_kind_union_3(value: Any, prefix: str = "con
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
 
+def _decode_defs_artifact_extraction_properties_verified_sysroot(value: Any, prefix: str = "array") -> list[VerifiedSysrootReceipt]:
+    if not isinstance(value, list):
+        raise TypeDecoderError(f"{prefix}: expected array")
+    return [
+        _decode_verified_sysroot_receipt(item, f"{prefix}[{index}]")
+        for index, item in enumerate(value)
+    ]
+
 def _decode_defs_channel_direction(value: Any, prefix: str = 'ChannelDirection') -> ChannelDirection:
     values_repr = "['bidirectional', 'receive', 'send']"
     if value not in ('bidirectional', 'receive', 'send'):
@@ -22937,8 +23586,8 @@ def _decode_defs_code_query_declaration_properties_start_line(value: Any, prefix
     return value
 
 def _decode_defs_code_query_diagnostic_code(value: Any, prefix: str = 'CodeQueryDiagnosticCode') -> CodeQueryDiagnosticCode:
-    values_repr = "['policy_declared_proven_subset', 'invalid_plan', 'cancelled', 'unsupported_structural_feature', 'qualifying_type_unresolved', 'structural_role_coverage_incomplete', 'missing_structural_adapter', 'recovered_syntax_incomplete', 'unsupported_import_analysis', 'dynamic_import_target', 'hierarchy_incomplete', 'semantic_results_omitted', 'semantic_workspace_required', 'no_enclosing_procedure', 'semantic_capability_unsupported', 'semantic_analysis_partial', 'call_binding_dispatch_partial', 'call_binding_selector_rejected', 'semantic_budget_exhausted', 'semantic_provider_failed', 'semantic_pack_acquisition_pending', 'semantic_pack_activation_failed', 'workspace_semantic_models_not_loaded', 'unresolved_protocol_reference', 'typestate_registration_stale', 'typestate_handle_stale', 'typestate_root_mismatch', 'typestate_capability_unsupported', 'typestate_analysis_partial', 'typestate_provider_failed', 'typestate_solver_budget_exhausted', 'typestate_finding_budget_exhausted', 'typestate_witness_truncated', 'unresolved_value_flow_plan_reference', 'value_flow_registration_stale', 'value_flow_handle_stale', 'value_flow_root_mismatch', 'value_flow_capability_unsupported', 'value_flow_analysis_partial', 'value_flow_provider_failed', 'value_flow_solver_budget_exhausted', 'value_flow_witness_truncated', 'type_flow_witness_truncated', 'type_flow_witness_unavailable', 'unresolved_taint_result_reference', 'taint_registration_stale', 'taint_handle_stale', 'taint_root_mismatch', 'taint_plan_report_mismatch', 'taint_projection_failed', 'taint_finding_truncated', 'receiver_analysis_partial', 'receiver_analysis_failed', 'call_relation_budget_exhausted', 'call_relation_parse_failed', 'call_relation_candidates_omitted', 'call_relation_targets_ambiguous', 'call_relation_candidate_limit', 'call_relation_analysis_failed', 'rendered_captures_truncated', 'reference_source_bytes_truncated', 'reference_candidate_files_truncated', 'reference_candidates_omitted', 'reference_targets_ambiguous', 'reference_callsite_limit', 'reference_analysis_failed', 'reference_kind_undecided', 'enclosing_pattern_undecided', 'identical_captures_open', 'row_predicate_undecided', 'member_form_undecided', 'uses_parser_unsupported', 'uses_candidate_limit', 'uses_targets_ambiguous', 'uses_candidates_omitted', 'execution_budget_exhausted', 'pipeline_budget_exhausted', 'import_graph_budget_exhausted', 'occurrence_role_unsupported', 'occurrence_resolution_incomplete', 'occurrence_row_budget_exhausted', 'environment_axis_unsupported', 'materialization_axis_unsupported', 'materialization_derivation_incomplete', 'materialization_row_budget_exhausted', 'environment_derivation_incomplete', 'environment_row_budget_exhausted', 'resolution_trace_incomplete', 'python_hierarchy_derivation_incomplete', 'edge_axis_unsupported', 'edge_derivation_incomplete', 'flow_state_axis_unsupported', 'flow_state_derivation_incomplete', 'rewrite_domain_unsupported', 'rewrite_path_derivation_incomplete', 'control_relation_derivation_incomplete', 'branch_relation_derivation_incomplete', 'loop_relation_derivation_incomplete', 'failure_handler_derivation_incomplete', 'statement_reachability_derivation_incomplete', 'pending_cleanup_flow_derivation_incomplete', 'control_relation_exit_partition_partial', 'topology_derivation_incomplete', 'topology_ownership_ambiguous', 'identity_axis_unsupported', 'path_derivation_incomplete', 'effect_derivation_incomplete', 'result_contract_derivation_incomplete', 'result_obligation_derivation_incomplete', 'effect_budget_exhausted', 'call_shape_coverage_incomplete', 'jsx_projection_incomplete', 'cross_domain_binding_unproven', 'cross_domain_key_unsupported', 'cross_domain_document_incomplete', 'cross_domain_correlation_ambiguous', 'result_limit_reached', 'broad_query']"
-    if value not in ('policy_declared_proven_subset', 'invalid_plan', 'cancelled', 'unsupported_structural_feature', 'qualifying_type_unresolved', 'structural_role_coverage_incomplete', 'missing_structural_adapter', 'recovered_syntax_incomplete', 'unsupported_import_analysis', 'dynamic_import_target', 'hierarchy_incomplete', 'semantic_results_omitted', 'semantic_workspace_required', 'no_enclosing_procedure', 'semantic_capability_unsupported', 'semantic_analysis_partial', 'call_binding_dispatch_partial', 'call_binding_selector_rejected', 'semantic_budget_exhausted', 'semantic_provider_failed', 'semantic_pack_acquisition_pending', 'semantic_pack_activation_failed', 'workspace_semantic_models_not_loaded', 'unresolved_protocol_reference', 'typestate_registration_stale', 'typestate_handle_stale', 'typestate_root_mismatch', 'typestate_capability_unsupported', 'typestate_analysis_partial', 'typestate_provider_failed', 'typestate_solver_budget_exhausted', 'typestate_finding_budget_exhausted', 'typestate_witness_truncated', 'unresolved_value_flow_plan_reference', 'value_flow_registration_stale', 'value_flow_handle_stale', 'value_flow_root_mismatch', 'value_flow_capability_unsupported', 'value_flow_analysis_partial', 'value_flow_provider_failed', 'value_flow_solver_budget_exhausted', 'value_flow_witness_truncated', 'type_flow_witness_truncated', 'type_flow_witness_unavailable', 'unresolved_taint_result_reference', 'taint_registration_stale', 'taint_handle_stale', 'taint_root_mismatch', 'taint_plan_report_mismatch', 'taint_projection_failed', 'taint_finding_truncated', 'receiver_analysis_partial', 'receiver_analysis_failed', 'call_relation_budget_exhausted', 'call_relation_parse_failed', 'call_relation_candidates_omitted', 'call_relation_targets_ambiguous', 'call_relation_candidate_limit', 'call_relation_analysis_failed', 'rendered_captures_truncated', 'reference_source_bytes_truncated', 'reference_candidate_files_truncated', 'reference_candidates_omitted', 'reference_targets_ambiguous', 'reference_callsite_limit', 'reference_analysis_failed', 'reference_kind_undecided', 'enclosing_pattern_undecided', 'identical_captures_open', 'row_predicate_undecided', 'member_form_undecided', 'uses_parser_unsupported', 'uses_candidate_limit', 'uses_targets_ambiguous', 'uses_candidates_omitted', 'execution_budget_exhausted', 'pipeline_budget_exhausted', 'import_graph_budget_exhausted', 'occurrence_role_unsupported', 'occurrence_resolution_incomplete', 'occurrence_row_budget_exhausted', 'environment_axis_unsupported', 'materialization_axis_unsupported', 'materialization_derivation_incomplete', 'materialization_row_budget_exhausted', 'environment_derivation_incomplete', 'environment_row_budget_exhausted', 'resolution_trace_incomplete', 'python_hierarchy_derivation_incomplete', 'edge_axis_unsupported', 'edge_derivation_incomplete', 'flow_state_axis_unsupported', 'flow_state_derivation_incomplete', 'rewrite_domain_unsupported', 'rewrite_path_derivation_incomplete', 'control_relation_derivation_incomplete', 'branch_relation_derivation_incomplete', 'loop_relation_derivation_incomplete', 'failure_handler_derivation_incomplete', 'statement_reachability_derivation_incomplete', 'pending_cleanup_flow_derivation_incomplete', 'control_relation_exit_partition_partial', 'topology_derivation_incomplete', 'topology_ownership_ambiguous', 'identity_axis_unsupported', 'path_derivation_incomplete', 'effect_derivation_incomplete', 'result_contract_derivation_incomplete', 'result_obligation_derivation_incomplete', 'effect_budget_exhausted', 'call_shape_coverage_incomplete', 'jsx_projection_incomplete', 'cross_domain_binding_unproven', 'cross_domain_key_unsupported', 'cross_domain_document_incomplete', 'cross_domain_correlation_ambiguous', 'result_limit_reached', 'broad_query'):
+    values_repr = "['policy_declared_proven_subset', 'invalid_plan', 'cancelled', 'unsupported_structural_feature', 'qualifying_type_unresolved', 'structural_role_coverage_incomplete', 'missing_structural_adapter', 'recovered_syntax_incomplete', 'unsupported_import_analysis', 'dynamic_import_target', 'hierarchy_incomplete', 'semantic_results_omitted', 'semantic_workspace_required', 'no_enclosing_procedure', 'semantic_capability_unsupported', 'semantic_analysis_partial', 'call_binding_dispatch_partial', 'call_binding_selector_rejected', 'semantic_budget_exhausted', 'semantic_provider_failed', 'semantic_pack_acquisition_pending', 'semantic_pack_activation_failed', 'workspace_semantic_models_not_loaded', 'unresolved_protocol_reference', 'typestate_registration_stale', 'typestate_handle_stale', 'typestate_root_mismatch', 'typestate_capability_unsupported', 'typestate_analysis_partial', 'typestate_provider_failed', 'typestate_solver_budget_exhausted', 'typestate_finding_budget_exhausted', 'typestate_witness_truncated', 'unresolved_value_flow_plan_reference', 'value_flow_registration_stale', 'value_flow_handle_stale', 'value_flow_root_mismatch', 'value_flow_capability_unsupported', 'value_flow_analysis_partial', 'value_flow_provider_failed', 'value_flow_solver_budget_exhausted', 'value_flow_witness_truncated', 'type_flow_witness_truncated', 'type_flow_witness_unavailable', 'unresolved_taint_result_reference', 'taint_registration_stale', 'taint_handle_stale', 'taint_root_mismatch', 'taint_plan_report_mismatch', 'taint_projection_failed', 'taint_finding_truncated', 'receiver_analysis_partial', 'receiver_analysis_failed', 'call_relation_budget_exhausted', 'call_relation_parse_failed', 'call_relation_candidates_omitted', 'call_relation_targets_ambiguous', 'call_relation_candidate_limit', 'call_relation_analysis_failed', 'rendered_captures_truncated', 'reference_source_bytes_truncated', 'reference_candidate_files_truncated', 'reference_candidates_omitted', 'reference_targets_ambiguous', 'reference_callsite_limit', 'reference_analysis_failed', 'reference_kind_undecided', 'enclosing_pattern_undecided', 'identical_captures_open', 'row_predicate_undecided', 'member_form_undecided', 'uses_parser_unsupported', 'uses_candidate_limit', 'uses_targets_ambiguous', 'uses_candidate_unavailable', 'uses_candidate_incomplete', 'uses_candidate_unresolved', 'uses_reference_projection_missing', 'uses_definition_projection_missing', 'uses_inverse_unconfirmed', 'uses_indexed_source_unavailable', 'uses_target_range_unavailable', 'execution_budget_exhausted', 'pipeline_budget_exhausted', 'import_graph_budget_exhausted', 'occurrence_role_unsupported', 'occurrence_resolution_incomplete', 'occurrence_row_budget_exhausted', 'environment_axis_unsupported', 'materialization_axis_unsupported', 'materialization_derivation_incomplete', 'materialization_row_budget_exhausted', 'environment_derivation_incomplete', 'environment_bounded_work_limit', 'environment_row_budget_exhausted', 'resolution_trace_incomplete', 'python_hierarchy_derivation_incomplete', 'edge_axis_unsupported', 'edge_derivation_incomplete', 'flow_state_axis_unsupported', 'flow_state_derivation_incomplete', 'rewrite_domain_unsupported', 'rewrite_path_derivation_incomplete', 'control_relation_derivation_incomplete', 'branch_relation_derivation_incomplete', 'loop_relation_derivation_incomplete', 'failure_handler_derivation_incomplete', 'statement_reachability_derivation_incomplete', 'pending_cleanup_flow_derivation_incomplete', 'control_relation_exit_partition_partial', 'topology_derivation_incomplete', 'topology_ownership_ambiguous', 'identity_axis_unsupported', 'path_derivation_incomplete', 'effect_derivation_incomplete', 'result_contract_derivation_incomplete', 'result_obligation_derivation_incomplete', 'effect_budget_exhausted', 'call_shape_coverage_incomplete', 'jsx_projection_incomplete', 'cross_domain_binding_unproven', 'cross_domain_key_unsupported', 'cross_domain_document_incomplete', 'cross_domain_correlation_ambiguous', 'result_limit_reached', 'broad_query']"
+    if value not in ('policy_declared_proven_subset', 'invalid_plan', 'cancelled', 'unsupported_structural_feature', 'qualifying_type_unresolved', 'structural_role_coverage_incomplete', 'missing_structural_adapter', 'recovered_syntax_incomplete', 'unsupported_import_analysis', 'dynamic_import_target', 'hierarchy_incomplete', 'semantic_results_omitted', 'semantic_workspace_required', 'no_enclosing_procedure', 'semantic_capability_unsupported', 'semantic_analysis_partial', 'call_binding_dispatch_partial', 'call_binding_selector_rejected', 'semantic_budget_exhausted', 'semantic_provider_failed', 'semantic_pack_acquisition_pending', 'semantic_pack_activation_failed', 'workspace_semantic_models_not_loaded', 'unresolved_protocol_reference', 'typestate_registration_stale', 'typestate_handle_stale', 'typestate_root_mismatch', 'typestate_capability_unsupported', 'typestate_analysis_partial', 'typestate_provider_failed', 'typestate_solver_budget_exhausted', 'typestate_finding_budget_exhausted', 'typestate_witness_truncated', 'unresolved_value_flow_plan_reference', 'value_flow_registration_stale', 'value_flow_handle_stale', 'value_flow_root_mismatch', 'value_flow_capability_unsupported', 'value_flow_analysis_partial', 'value_flow_provider_failed', 'value_flow_solver_budget_exhausted', 'value_flow_witness_truncated', 'type_flow_witness_truncated', 'type_flow_witness_unavailable', 'unresolved_taint_result_reference', 'taint_registration_stale', 'taint_handle_stale', 'taint_root_mismatch', 'taint_plan_report_mismatch', 'taint_projection_failed', 'taint_finding_truncated', 'receiver_analysis_partial', 'receiver_analysis_failed', 'call_relation_budget_exhausted', 'call_relation_parse_failed', 'call_relation_candidates_omitted', 'call_relation_targets_ambiguous', 'call_relation_candidate_limit', 'call_relation_analysis_failed', 'rendered_captures_truncated', 'reference_source_bytes_truncated', 'reference_candidate_files_truncated', 'reference_candidates_omitted', 'reference_targets_ambiguous', 'reference_callsite_limit', 'reference_analysis_failed', 'reference_kind_undecided', 'enclosing_pattern_undecided', 'identical_captures_open', 'row_predicate_undecided', 'member_form_undecided', 'uses_parser_unsupported', 'uses_candidate_limit', 'uses_targets_ambiguous', 'uses_candidate_unavailable', 'uses_candidate_incomplete', 'uses_candidate_unresolved', 'uses_reference_projection_missing', 'uses_definition_projection_missing', 'uses_inverse_unconfirmed', 'uses_indexed_source_unavailable', 'uses_target_range_unavailable', 'execution_budget_exhausted', 'pipeline_budget_exhausted', 'import_graph_budget_exhausted', 'occurrence_role_unsupported', 'occurrence_resolution_incomplete', 'occurrence_row_budget_exhausted', 'environment_axis_unsupported', 'materialization_axis_unsupported', 'materialization_derivation_incomplete', 'materialization_row_budget_exhausted', 'environment_derivation_incomplete', 'environment_bounded_work_limit', 'environment_row_budget_exhausted', 'resolution_trace_incomplete', 'python_hierarchy_derivation_incomplete', 'edge_axis_unsupported', 'edge_derivation_incomplete', 'flow_state_axis_unsupported', 'flow_state_derivation_incomplete', 'rewrite_domain_unsupported', 'rewrite_path_derivation_incomplete', 'control_relation_derivation_incomplete', 'branch_relation_derivation_incomplete', 'loop_relation_derivation_incomplete', 'failure_handler_derivation_incomplete', 'statement_reachability_derivation_incomplete', 'pending_cleanup_flow_derivation_incomplete', 'control_relation_exit_partition_partial', 'topology_derivation_incomplete', 'topology_ownership_ambiguous', 'identity_axis_unsupported', 'path_derivation_incomplete', 'effect_derivation_incomplete', 'result_contract_derivation_incomplete', 'result_obligation_derivation_incomplete', 'effect_budget_exhausted', 'call_shape_coverage_incomplete', 'jsx_projection_incomplete', 'cross_domain_binding_unproven', 'cross_domain_key_unsupported', 'cross_domain_document_incomplete', 'cross_domain_correlation_ambiguous', 'result_limit_reached', 'broad_query'):
         raise DecoderError(f"{prefix}: expected one of {values_repr}")
     return CodeQueryDiagnosticCode(value)
 
@@ -23000,6 +23649,18 @@ def _decode_defs_code_query_diagnostic_properties_withheld_rows_path(value: Any,
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
+def _decode_defs_code_query_exhausted_budget_properties_consumed(value: Any, prefix: str = 'int') -> int:
+    value = _decode_integer(value, prefix)
+    if value < 0:
+        raise DecoderError(f"{prefix}: value is below the minimum")
+    return value
+
+def _decode_defs_code_query_exhausted_budget_properties_limit(value: Any, prefix: str = 'int') -> int:
+    value = _decode_integer(value, prefix)
+    if value < 0:
+        raise DecoderError(f"{prefix}: value is below the minimum")
+    return value
+
 def _decode_defs_code_query_exhausted_charge_properties_attempted(value: Any, prefix: str = 'int') -> int:
     value = _decode_integer(value, prefix)
     if value < 0:
@@ -23011,6 +23672,18 @@ def _decode_defs_code_query_exhausted_charge_properties_limit(value: Any, prefix
     if value < 0:
         raise DecoderError(f"{prefix}: value is below the minimum")
     return value
+
+def _decode_defs_code_query_exhausted_root_properties_budget(value: Any, prefix: str = "union") -> CodeQueryExhaustedBudget | None:
+    errors = []
+    try:
+        return _decode_code_query_exhausted_budget(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    try:
+        return _decode_null(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
 def _decode_defs_code_query_exhausted_root_properties_charge(value: Any, prefix: str = "union") -> CodeQueryExhaustedCharge | None:
     errors = []
@@ -27594,6 +28267,14 @@ def _decode_defs_code_query_result_item_union_40_properties_ast_id(value: Any, p
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
+def _decode_defs_code_query_result_item_union_40_properties_open_reasons(value: Any, prefix: str = "array") -> list[CodeQueryWriteLivenessOpenReasonVariant1 | CodeQueryWriteLivenessOpenReasonVariant2 | CodeQueryWriteLivenessOpenReasonVariant3 | CodeQueryWriteLivenessOpenReasonVariant4 | CodeQueryWriteLivenessOpenReasonVariant5 | CodeQueryWriteLivenessOpenReasonVariant6 | CodeQueryWriteLivenessOpenReasonVariant7 | CodeQueryWriteLivenessOpenReasonVariant8 | CodeQueryWriteLivenessOpenReasonVariant9 | CodeQueryWriteLivenessOpenReasonVariant10 | CodeQueryWriteLivenessOpenReasonVariant11 | CodeQueryWriteLivenessOpenReasonVariant12 | CodeQueryWriteLivenessOpenReasonVariant13]:
+    if not isinstance(value, list):
+        raise TypeDecoderError(f"{prefix}: expected array")
+    return [
+        _decode_defs_code_query_write_liveness_open_reason(item, f"{prefix}[{index}]")
+        for index, item in enumerate(value)
+    ]
+
 def _decode_defs_code_query_result_item_union_40_properties_provenance(value: Any, prefix: str = "array") -> list[CodeQueryProvenance]:
     if not isinstance(value, list):
         raise TypeDecoderError(f"{prefix}: expected array")
@@ -27623,6 +28304,14 @@ def _decode_defs_code_query_result_item_union_40_properties_reason(value: Any, p
     except DecoderError as error:
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_item_union_40_properties_reason_codes(value: Any, prefix: str = "array") -> list[str]:
+    if not isinstance(value, list):
+        raise TypeDecoderError(f"{prefix}: expected array")
+    return [
+        _decode_string(item, f"{prefix}[{index}]")
+        for index, item in enumerate(value)
+    ]
 
 def _decode_defs_code_query_result_item_union_40_properties_replacement_events(value: Any, prefix: str = "array") -> list[CodeQueryStateEventRef]:
     if not isinstance(value, list):
@@ -31012,6 +31701,16 @@ def _decode_defs_code_query_result_item_union_75_properties_docstring_value(valu
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
+def _decode_defs_code_query_result_item_union_75_properties_entry_point(value: Any, prefix: str = "union") -> str | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_string(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
 def _decode_defs_code_query_result_item_union_75_properties_exception_class(value: Any, prefix: str = "union") -> str | None:
     if value is None:
         return None
@@ -31853,6 +32552,14 @@ def _decode_defs_code_query_result_item_union_77_properties_result_type(value: A
     if value != 'rust_pointer_finding':
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
+
+def _decode_defs_code_query_result_item_union_77_properties_source_ranges(value: Any, prefix: str = "array") -> list[CodeQuerySourceSpan]:
+    if not isinstance(value, list):
+        raise TypeDecoderError(f"{prefix}: expected array")
+    return [
+        _decode_code_query_source_span(item, f"{prefix}[{index}]")
+        for index, item in enumerate(value)
+    ]
 
 def _decode_defs_code_query_result_item_union_78_properties_classes_value(value: Any, prefix: str = "union") -> int | None:
     if value is None:
@@ -33128,6 +33835,18 @@ def _decode_defs_code_query_result_ref_union_2_properties_result_type(value: Any
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
 
+def _decode_defs_code_query_result_ref_union_2_properties_source_owner(value: Any, prefix: str = "union") -> CodeQueryStableOwnerCandidateVariant1 | CodeQueryStableOwnerCandidateVariant2 | None:
+    errors = []
+    try:
+        return _decode_defs_code_query_stable_owner_candidate(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    try:
+        return _decode_null(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
 def _decode_defs_code_query_result_ref_union_30_properties_origin_id(value: Any, prefix: str = "union") -> str | None:
     if value is None:
         return None
@@ -33992,6 +34711,24 @@ def _decode_defs_code_query_source_span_properties_start_byte(value: Any, prefix
         raise DecoderError(f"{prefix}: value is below the minimum")
     return value
 
+def _decode_defs_code_query_stable_owner_candidate(value: Any, prefix: str = "union") -> CodeQueryStableOwnerCandidateVariant1 | CodeQueryStableOwnerCandidateVariant2:
+    errors = []
+    try:
+        return _decode_code_query_stable_owner_candidate_variant1(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    try:
+        return _decode_code_query_stable_owner_candidate_variant2(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_stable_owner_derivation(value: Any, prefix: str = 'CodeQueryStableOwnerDerivation') -> CodeQueryStableOwnerDerivation:
+    values_repr = "['canonical_ast_identity', 'semantic_wire_id']"
+    if value not in ('canonical_ast_identity', 'semantic_wire_id'):
+        raise DecoderError(f"{prefix}: expected one of {values_repr}")
+    return CodeQueryStableOwnerDerivation(value)
+
 def _decode_defs_code_query_state_event_ref_properties_ast_id(value: Any, prefix: str = "union") -> str | None:
     if value is None:
         return None
@@ -34168,6 +34905,128 @@ def _decode_defs_code_query_typestate_witness_step_properties_target(value: Any,
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
+class CodeQueryWriteLivenessOpenReason(metaclass=_TaggedUnionMeta):
+    @classmethod
+    def from_dict(cls, data: Any) -> CodeQueryWriteLivenessOpenReason:
+        if not isinstance(data, dict):
+            raise TypeDecoderError("expected tagged object")
+        if 'code' not in data:
+            raise DecoderError(f"missing discriminator 'code'")
+        tag_value = data['code']
+        decoder = _code_query_write_liveness_open_reason_decoders.get(tag_value)
+        if decoder is None:
+            raise DecoderError(f"unknown discriminator {tag_value!r}")
+        return decoder(data)
+
+def _decode_defs_code_query_write_liveness_open_reason(value: Any, prefix: str = 'CodeQueryWriteLivenessOpenReason') -> CodeQueryWriteLivenessOpenReasonVariant1 | CodeQueryWriteLivenessOpenReasonVariant2 | CodeQueryWriteLivenessOpenReasonVariant3 | CodeQueryWriteLivenessOpenReasonVariant4 | CodeQueryWriteLivenessOpenReasonVariant5 | CodeQueryWriteLivenessOpenReasonVariant6 | CodeQueryWriteLivenessOpenReasonVariant7 | CodeQueryWriteLivenessOpenReasonVariant8 | CodeQueryWriteLivenessOpenReasonVariant9 | CodeQueryWriteLivenessOpenReasonVariant10 | CodeQueryWriteLivenessOpenReasonVariant11 | CodeQueryWriteLivenessOpenReasonVariant12 | CodeQueryWriteLivenessOpenReasonVariant13:
+    return CodeQueryWriteLivenessOpenReason.from_dict(value)
+
+def _decode_defs_code_query_write_liveness_open_reason_union_0_properties_code(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'axis_unsupported'"
+    if value != 'axis_unsupported':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
+def _decode_defs_code_query_write_liveness_open_reason_union_10_properties_code(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'lowering_gap'"
+    if value != 'lowering_gap':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
+def _decode_defs_code_query_write_liveness_open_reason_union_10_properties_gap_ids(value: Any, prefix: str = "array") -> list[int]:
+    if not isinstance(value, list):
+        raise TypeDecoderError(f"{prefix}: expected array")
+    return [
+        _decode_defs_code_query_write_liveness_open_reason_union_10_properties_gap_ids_items(item, f"{prefix}[{index}]")
+        for index, item in enumerate(value)
+    ]
+
+def _decode_defs_code_query_write_liveness_open_reason_union_10_properties_gap_ids_items(value: Any, prefix: str = 'int') -> int:
+    value = _decode_integer(value, prefix)
+    if value < 0:
+        raise DecoderError(f"{prefix}: value is below the minimum")
+    return value
+
+def _decode_defs_code_query_write_liveness_open_reason_union_10_properties_sources(value: Any, prefix: str = "array") -> list[CodeQueryRelatedSource]:
+    if not isinstance(value, list):
+        raise TypeDecoderError(f"{prefix}: expected array")
+    return [
+        _decode_code_query_related_source(item, f"{prefix}[{index}]")
+        for index, item in enumerate(value)
+    ]
+
+def _decode_defs_code_query_write_liveness_open_reason_union_11_properties_code(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'budget_exhausted'"
+    if value != 'budget_exhausted':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
+def _decode_defs_code_query_write_liveness_open_reason_union_12_properties_binding_value_id(value: Any, prefix: str = 'int') -> int:
+    value = _decode_integer(value, prefix)
+    if value < 0:
+        raise DecoderError(f"{prefix}: value is below the minimum")
+    return value
+
+def _decode_defs_code_query_write_liveness_open_reason_union_12_properties_code(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'binding_state_not_closed'"
+    if value != 'binding_state_not_closed':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
+def _decode_defs_code_query_write_liveness_open_reason_union_1_properties_code(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'no_semantic_provider'"
+    if value != 'no_semantic_provider':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
+def _decode_defs_code_query_write_liveness_open_reason_union_2_properties_code(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'semantic_provider_failed'"
+    if value != 'semantic_provider_failed':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
+def _decode_defs_code_query_write_liveness_open_reason_union_3_properties_code(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'semantic_analysis_partial'"
+    if value != 'semantic_analysis_partial':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
+def _decode_defs_code_query_write_liveness_open_reason_union_4_properties_code(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'cancelled'"
+    if value != 'cancelled':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
+def _decode_defs_code_query_write_liveness_open_reason_union_5_properties_code(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'source_generation_changed'"
+    if value != 'source_generation_changed':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
+def _decode_defs_code_query_write_liveness_open_reason_union_6_properties_code(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'binding_scope_liveness_unavailable'"
+    if value != 'binding_scope_liveness_unavailable':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
+def _decode_defs_code_query_write_liveness_open_reason_union_7_properties_code(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'control_projection_rejected'"
+    if value != 'control_projection_rejected':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
+def _decode_defs_code_query_write_liveness_open_reason_union_8_properties_code(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'modeled_control_projection_incomplete'"
+    if value != 'modeled_control_projection_incomplete':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
+def _decode_defs_code_query_write_liveness_open_reason_union_9_properties_code(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'no_structural_facts'"
+    if value != 'no_structural_facts':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
+
 def _decode_defs_configuration_incomplete_reason(value: Any, prefix: str = 'ConfigurationIncompleteReason') -> ConfigurationIncompleteReason:
     values_repr = "['Conflict', 'UnresolvedInterpolation', 'UnavailableEnvironment', 'UnknownProfile', 'MissingInclude', 'ParserLimitation', 'Cancellation', 'ContributionBudgetExhausted', 'PrecedenceBudgetExhausted']"
     if value not in ('Conflict', 'UnresolvedInterpolation', 'UnavailableEnvironment', 'UnknownProfile', 'MissingInclude', 'ParserLimitation', 'Cancellation', 'ContributionBudgetExhausted', 'PrecedenceBudgetExhausted'):
@@ -34327,8 +35186,8 @@ def _decode_defs_conversion_unknown(value: Any, prefix: str = "union") -> Conver
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
 def _decode_defs_conversion_unknown_union_0(value: Any, prefix: str = 'ConversionUnknownVariant1') -> ConversionUnknownVariant1:
-    values_repr = "['unsupported_language', 'unresolved_signature', 'unresolved_source_type', 'unresolved_target_type', 'ambiguous_binding', 'generic_substitution', 'unsupported_conversion', 'unsupported_expression', 'incomplete_hierarchy', 'budget_exhausted', 'cancelled']"
-    if value not in ('unsupported_language', 'unresolved_signature', 'unresolved_source_type', 'unresolved_target_type', 'ambiguous_binding', 'generic_substitution', 'unsupported_conversion', 'unsupported_expression', 'incomplete_hierarchy', 'budget_exhausted', 'cancelled'):
+    values_repr = "['unsupported_language', 'unresolved_signature', 'unresolved_source_type', 'unresolved_target_type', 'ambiguous_binding', 'generic_substitution', 'unsupported_conversion', 'unsupported_expression', 'incomplete_hierarchy', 'fixed_limit', 'budget_exhausted', 'cancelled']"
+    if value not in ('unsupported_language', 'unresolved_signature', 'unresolved_source_type', 'unresolved_target_type', 'ambiguous_binding', 'generic_substitution', 'unsupported_conversion', 'unsupported_expression', 'incomplete_hierarchy', 'fixed_limit', 'budget_exhausted', 'cancelled'):
         raise DecoderError(f"{prefix}: expected one of {values_repr}")
     return ConversionUnknownVariant1(value)
 
@@ -34343,6 +35202,40 @@ def _decode_defs_depth_bound_status(value: Any, prefix: str = 'DepthBoundStatus'
     if value not in ('reached', 'not_reached', 'unknown'):
         raise DecoderError(f"{prefix}: expected one of {values_repr}")
     return DepthBoundStatus(value)
+
+def _decode_defs_derivation_execution_cause(value: Any, prefix: str = 'DerivationExecutionCause') -> DerivationExecutionCause:
+    values_repr = "['cancelled', 'budget', 'snapshot', 'provider']"
+    if value not in ('cancelled', 'budget', 'snapshot', 'provider'):
+        raise DecoderError(f"{prefix}: expected one of {values_repr}")
+    return DerivationExecutionCause(value)
+
+def _decode_defs_incompleteness(value: Any, prefix: str = "union") -> IncompletenessVariant1 | str | IncompletenessVariant3:
+    errors = []
+    try:
+        return _decode_defs_incompleteness_union_0(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    try:
+        return _decode_defs_incompleteness_union_1(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    try:
+        return _decode_incompleteness_variant3(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_incompleteness_union_0(value: Any, prefix: str = 'IncompletenessVariant1') -> IncompletenessVariant1:
+    values_repr = "['content']"
+    if value not in ('content',):
+        raise DecoderError(f"{prefix}: expected one of {values_repr}")
+    return IncompletenessVariant1(value)
+
+def _decode_defs_incompleteness_union_1(value: Any, prefix: str = "const") -> str:
+    expected_repr = "'configured_cap'"
+    if value != 'configured_cap':
+        raise DecoderError(f"{prefix}: expected {expected_repr}")
+    return value
 
 class JavaAnnotationArtifact(metaclass=_TaggedUnionMeta):
     @classmethod
@@ -34417,6 +35310,18 @@ def _decode_defs_java_annotation_type_status(value: Any, prefix: str = 'JavaAnno
     if value not in ('resolved', 'ambiguous', 'blocked', 'incomplete', 'unsupported', 'cancelled'):
         raise DecoderError(f"{prefix}: expected one of {values_repr}")
     return JavaAnnotationTypeStatus(value)
+
+def _decode_defs_omission_count_properties_count(value: Any, prefix: str = 'int') -> int:
+    value = _decode_integer(value, prefix)
+    if value < 0:
+        raise DecoderError(f"{prefix}: value is below the minimum")
+    return value
+
+def _decode_defs_omission_exactness(value: Any, prefix: str = 'OmissionExactness') -> OmissionExactness:
+    values_repr = "['exact', 'lower_bound']"
+    if value not in ('exact', 'lower_bound'):
+        raise DecoderError(f"{prefix}: expected one of {values_repr}")
+    return OmissionExactness(value)
 
 def _decode_defs_parameter_passing_mode(value: Any, prefix: str = 'ParameterPassingMode') -> ParameterPassingMode:
     values_repr = "['positional_only', 'positional_or_named', 'named_only']"
@@ -34499,6 +35404,18 @@ def _decode_defs_python_runtime_base_claim_properties_declared_bases(value: Any,
         _decode_defs_type_ref_14(item, f"{prefix}[{index}]")
         for index, item in enumerate(value)
     ]
+
+def _decode_defs_rust_toolchain_channel(value: Any, prefix: str = 'RustToolchainChannel') -> RustToolchainChannel:
+    values_repr = "['stable', 'beta', 'nightly']"
+    if value not in ('stable', 'beta', 'nightly'):
+        raise DecoderError(f"{prefix}: expected one of {values_repr}")
+    return RustToolchainChannel(value)
+
+def _decode_defs_rustdoc_component(value: Any, prefix: str = 'RustdocComponent') -> RustdocComponent:
+    values_repr = "['rust_docs_json_preview']"
+    if value not in ('rust_docs_json_preview',):
+        raise DecoderError(f"{prefix}: expected one of {values_repr}")
+    return RustdocComponent(value)
 
 def _decode_defs_semantic_model_completeness(value: Any, prefix: str = 'SemanticModelCompleteness') -> SemanticModelCompleteness:
     values_repr = "['partial', 'complete']"
@@ -34816,6 +35733,27 @@ def _decode_defs_wildcard_variance(value: Any, prefix: str = 'WildcardVariance')
         raise DecoderError(f"{prefix}: expected one of {values_repr}")
     return WildcardVariance(value)
 
+def _decode_incompleteness_variant3(value: Any, prefix: str = 'IncompletenessVariant3') -> IncompletenessVariant3:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'operational',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'operational',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    operational_value = _decode_defs_derivation_execution_cause(value['operational'], f"{prefix}.operational")
+    return IncompletenessVariant3(
+        operational=operational_value,
+    )
+
 def _decode_java_annotation_artifact_variant1(value: Any, prefix: str = 'JavaAnnotationArtifactVariant1') -> JavaAnnotationArtifactVariant1:
     if not isinstance(value, dict):
         raise TypeDecoderError(f"{prefix}: expected object")
@@ -34918,6 +35856,31 @@ def _decode_model_provider(value: Any, prefix: str = 'ModelProvider') -> ModelPr
         pack_digest=pack_digest_value,
         pack_id=pack_id_value,
         pack_version=pack_version_value,
+    )
+
+def _decode_omission_count(value: Any, prefix: str = 'OmissionCount') -> OmissionCount:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'count',
+        'exactness',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'count',
+        'exactness',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    count_value = _decode_defs_omission_count_properties_count(value['count'], f"{prefix}.count")
+    exactness_value = _decode_defs_omission_exactness(value['exactness'], f"{prefix}.exactness")
+    return OmissionCount(
+        count=count_value,
+        exactness=exactness_value,
     )
 
 def _decode_parameter(value: Any, prefix: str = 'Parameter') -> Parameter:
@@ -35092,6 +36055,76 @@ def _decode_python_runtime_base_claim(value: Any, prefix: str = 'PythonRuntimeBa
         declared_bases=declared_bases_value,
         declared_class=declared_class_value,
         provenance=provenance_value,
+    )
+
+def _decode_rust_sysroot_provenance(value: Any, prefix: str = 'RustSysrootProvenance') -> RustSysrootProvenance:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'archive_member',
+        'archive_sha256',
+        'component',
+        'target',
+        'toolchain',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'archive_member',
+        'archive_sha256',
+        'component',
+        'target',
+        'toolchain',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    archive_member_value = _decode_string(value['archive_member'], f"{prefix}.archive_member")
+    archive_sha256_value = _decode_string(value['archive_sha256'], f"{prefix}.archive_sha256")
+    component_value = _decode_defs_rustdoc_component(value['component'], f"{prefix}.component")
+    target_value = _decode_string(value['target'], f"{prefix}.target")
+    toolchain_value = _decode_rust_toolchain_identity(value['toolchain'], f"{prefix}.toolchain")
+    return RustSysrootProvenance(
+        archive_member=archive_member_value,
+        archive_sha256=archive_sha256_value,
+        component=component_value,
+        target=target_value,
+        toolchain=toolchain_value,
+    )
+
+def _decode_rust_toolchain_identity(value: Any, prefix: str = 'RustToolchainIdentity') -> RustToolchainIdentity:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'channel',
+        'commit',
+        'date',
+        'release',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'channel',
+        'commit',
+        'date',
+        'release',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    channel_value = _decode_defs_rust_toolchain_channel(value['channel'], f"{prefix}.channel")
+    commit_value = _decode_string(value['commit'], f"{prefix}.commit")
+    date_value = _decode_string(value['date'], f"{prefix}.date")
+    release_value = _decode_string(value['release'], f"{prefix}.release")
+    return RustToolchainIdentity(
+        channel=channel_value,
+        commit=commit_value,
+        date=date_value,
+        release=release_value,
     )
 
 def _decode_semantic_model_activation_provenance(value: Any, prefix: str = 'SemanticModelActivationProvenance') -> SemanticModelActivationProvenance:
@@ -35700,6 +36733,31 @@ def _decode_type_ref_variant9(value: Any, prefix: str = 'TypeRefVariant9') -> Ty
     element_value = _decode_defs_type_ref_14(value['element'], f"{prefix}.element")
     return TypeRefVariant9(
         element=element_value,
+    )
+
+def _decode_verified_sysroot_receipt(value: Any, prefix: str = 'VerifiedSysrootReceipt') -> VerifiedSysrootReceipt:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'path',
+        'provenance',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'path',
+        'provenance',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    path_value = _decode_string(value['path'], f"{prefix}.path")
+    provenance_value = _decode_rust_sysroot_provenance(value['provenance'], f"{prefix}.provenance")
+    return VerifiedSysrootReceipt(
+        path=path_value,
+        provenance=provenance_value,
     )
 
 TAGGED_UNION_VARIANTS = {}
@@ -36315,6 +37373,41 @@ TAGGED_UNION_VARIANTS['CodeQueryTypestateWitnessStepKind'] = (
         'seed': CodeQueryTypestateWitnessStepKindVariant1,
         'edge': CodeQueryTypestateWitnessStepKindVariant2,
         'end_summary_gap': CodeQueryTypestateWitnessStepKindVariant3,
+    },
+)
+
+_code_query_write_liveness_open_reason_decoders = {
+    'axis_unsupported': lambda data: _decode_tagged_variant(_decode_code_query_write_liveness_open_reason_variant1, data, 'code', 'CodeQueryWriteLivenessOpenReasonVariant1'),
+    'no_semantic_provider': lambda data: _decode_tagged_variant(_decode_code_query_write_liveness_open_reason_variant2, data, 'code', 'CodeQueryWriteLivenessOpenReasonVariant2'),
+    'semantic_provider_failed': lambda data: _decode_tagged_variant(_decode_code_query_write_liveness_open_reason_variant3, data, 'code', 'CodeQueryWriteLivenessOpenReasonVariant3'),
+    'semantic_analysis_partial': lambda data: _decode_tagged_variant(_decode_code_query_write_liveness_open_reason_variant4, data, 'code', 'CodeQueryWriteLivenessOpenReasonVariant4'),
+    'cancelled': lambda data: _decode_tagged_variant(_decode_code_query_write_liveness_open_reason_variant5, data, 'code', 'CodeQueryWriteLivenessOpenReasonVariant5'),
+    'source_generation_changed': lambda data: _decode_tagged_variant(_decode_code_query_write_liveness_open_reason_variant6, data, 'code', 'CodeQueryWriteLivenessOpenReasonVariant6'),
+    'binding_scope_liveness_unavailable': lambda data: _decode_tagged_variant(_decode_code_query_write_liveness_open_reason_variant7, data, 'code', 'CodeQueryWriteLivenessOpenReasonVariant7'),
+    'control_projection_rejected': lambda data: _decode_tagged_variant(_decode_code_query_write_liveness_open_reason_variant8, data, 'code', 'CodeQueryWriteLivenessOpenReasonVariant8'),
+    'modeled_control_projection_incomplete': lambda data: _decode_tagged_variant(_decode_code_query_write_liveness_open_reason_variant9, data, 'code', 'CodeQueryWriteLivenessOpenReasonVariant9'),
+    'no_structural_facts': lambda data: _decode_tagged_variant(_decode_code_query_write_liveness_open_reason_variant10, data, 'code', 'CodeQueryWriteLivenessOpenReasonVariant10'),
+    'lowering_gap': lambda data: _decode_tagged_variant(_decode_code_query_write_liveness_open_reason_variant11, data, 'code', 'CodeQueryWriteLivenessOpenReasonVariant11'),
+    'budget_exhausted': lambda data: _decode_tagged_variant(_decode_code_query_write_liveness_open_reason_variant12, data, 'code', 'CodeQueryWriteLivenessOpenReasonVariant12'),
+    'binding_state_not_closed': lambda data: _decode_tagged_variant(_decode_code_query_write_liveness_open_reason_variant13, data, 'code', 'CodeQueryWriteLivenessOpenReasonVariant13'),
+}
+CodeQueryWriteLivenessOpenReason._variant_types = (CodeQueryWriteLivenessOpenReasonVariant1, CodeQueryWriteLivenessOpenReasonVariant2, CodeQueryWriteLivenessOpenReasonVariant3, CodeQueryWriteLivenessOpenReasonVariant4, CodeQueryWriteLivenessOpenReasonVariant5, CodeQueryWriteLivenessOpenReasonVariant6, CodeQueryWriteLivenessOpenReasonVariant7, CodeQueryWriteLivenessOpenReasonVariant8, CodeQueryWriteLivenessOpenReasonVariant9, CodeQueryWriteLivenessOpenReasonVariant10, CodeQueryWriteLivenessOpenReasonVariant11, CodeQueryWriteLivenessOpenReasonVariant12, CodeQueryWriteLivenessOpenReasonVariant13,)
+TAGGED_UNION_VARIANTS['CodeQueryWriteLivenessOpenReason'] = (
+    'code',
+    {
+        'axis_unsupported': CodeQueryWriteLivenessOpenReasonVariant1,
+        'no_semantic_provider': CodeQueryWriteLivenessOpenReasonVariant2,
+        'semantic_provider_failed': CodeQueryWriteLivenessOpenReasonVariant3,
+        'semantic_analysis_partial': CodeQueryWriteLivenessOpenReasonVariant4,
+        'cancelled': CodeQueryWriteLivenessOpenReasonVariant5,
+        'source_generation_changed': CodeQueryWriteLivenessOpenReasonVariant6,
+        'binding_scope_liveness_unavailable': CodeQueryWriteLivenessOpenReasonVariant7,
+        'control_projection_rejected': CodeQueryWriteLivenessOpenReasonVariant8,
+        'modeled_control_projection_incomplete': CodeQueryWriteLivenessOpenReasonVariant9,
+        'no_structural_facts': CodeQueryWriteLivenessOpenReasonVariant10,
+        'lowering_gap': CodeQueryWriteLivenessOpenReasonVariant11,
+        'budget_exhausted': CodeQueryWriteLivenessOpenReasonVariant12,
+        'binding_state_not_closed': CodeQueryWriteLivenessOpenReasonVariant13,
     },
 )
 

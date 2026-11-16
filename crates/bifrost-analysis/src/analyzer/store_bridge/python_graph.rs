@@ -91,7 +91,7 @@ impl GraphStageAdapter for PythonGraphStageAdapter<'_> {
     ) -> Result<SelectedResolutionOperationOutcome<(Self::Payload, FactResolutionBatchSummary)>>
     {
         let mut rules = PythonGraphUnitRules {
-            environment: self.environment,
+            environment: self.environment.clone(),
             context: Some(operation.empty_contexts(&ResolutionCompletion::Complete)?),
         };
         let mut batches = Vec::new();

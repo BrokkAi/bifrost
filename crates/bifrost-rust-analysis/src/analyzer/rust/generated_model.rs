@@ -1,5 +1,7 @@
 //! Source scopes for declarations emitted by explicitly activated Rust models.
 
+use brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelNamespace;
+
 use brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix;
 use std::sync::Arc;
 use tree_sitter::Node;
@@ -241,7 +243,10 @@ pub fn resolve_generated_functions(
     let file_routes = rust.map(|rust| rust.file_routes(file, None)).transpose()?;
     let mut matches = Vec::new();
     for route in routes {
-        for symbol in overlay.symbols_named_in_family(&route, "rust").records {
+        for symbol in overlay
+            .symbols_named_in_family(&route, "rust", SemanticModelNamespace::Unknown)
+            .records
+        {
             let Some(scope) = &symbol.rust_generated_scope else {
                 continue;
             };

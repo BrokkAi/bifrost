@@ -23,6 +23,7 @@ pub mod analyzer {
         pub use brokk_bifrost_core::analyzer::structural::*;
     }
     pub mod read_ledger;
+    pub(crate) mod span_index;
     // Preserve the resolution module lint policy from its engine declaration.
     #[allow(dead_code, unused_imports)]
     pub mod resolution;

@@ -21,6 +21,7 @@ use brokk_bifrost_core::analyzer::rust_facts::{
 use brokk_bifrost_core::analyzer::source_facts::SourceDeclarationId;
 use brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix;
 use brokk_bifrost_core::hash::HashMap as CargoHashMap;
+use brokk_bifrost_core::path_utils::workspace_relative_slash_path;
 use git2::{ObjectType, Oid};
 
 use crate::cargo_config::RustCargoConfiguration;
@@ -37,9 +38,13 @@ mod broad_discovery;
 mod crate_inventory;
 mod target_discovery;
 pub use broad_discovery::{
-    rust_broad_target_discovery_complete, rust_directory_omission_affects_cargo,
+    rust_broad_target_discovery_completeness, rust_directory_omission_affects_cargo,
 };
-pub use crate_inventory::{RustCrateDependency, RustCrateTarget, rust_crate_targets};
+pub use crate_inventory::{
+    DevDependencyCycleEdgeDropped, RustCrateDependency, RustCrateTarget, RustFeatureActivation,
+    RustTargetConfiguration, merge_rust_configuration_atoms, rust_crate_targets,
+    rust_target_configuration,
+};
 
 pub fn cargo_dependency_tables_with_kind(
     manifest: &RustCargoManifestDocument,
@@ -619,7 +624,7 @@ impl RustSelectedManifestMount {
         Self::from_document(relative_path, document)
     }
 
-    fn from_document(
+    pub fn from_document(
         relative_path: impl Into<PathBuf>,
         document: RustCargoManifestDocument,
     ) -> Result<Self, String> {
@@ -1366,24 +1371,44 @@ pub fn rust_selected_workspace_profiles_from_prepared_with_progress(
     input: &RustSelectedTopologyInput,
     progress: &mut impl FnMut(RustSelectedContextWork) -> bool,
 ) -> Result<RustSelectedBuildOutcome<RustSelectedWorkspaceProfiles>, String> {
+    let paths = input.sources.keys().map(PathBuf::as_path).collect();
+    rust_workspace_profiles_from_paths_with_progress(&paths, &input.manifests, progress)
+}
+
+/// Enumerate Cargo unit roots from indexed paths and exact manifest documents.
+/// Source bytes and content OIDs cannot affect target-kind discovery.
+pub fn rust_selected_workspace_profiles_from_paths(
+    paths: &BTreeSet<PathBuf>,
+    manifests: &BTreeMap<PathBuf, RustSelectedManifestMount>,
+) -> Result<RustSelectedWorkspaceProfiles, String> {
+    let paths = paths.iter().map(PathBuf::as_path).collect();
+    with_always_live_progress(|progress| {
+        rust_workspace_profiles_from_paths_with_progress(&paths, manifests, progress)
+    })
+}
+
+fn rust_workspace_profiles_from_paths_with_progress(
+    source_paths_for_check: &BTreeSet<&Path>,
+    manifests: &BTreeMap<PathBuf, RustSelectedManifestMount>,
+    progress: &mut impl FnMut(RustSelectedContextWork) -> bool,
+) -> Result<RustSelectedBuildOutcome<RustSelectedWorkspaceProfiles>, String> {
     let mut source_paths = BTreeSet::new();
-    let mut sources_by_target_directory = HashMap::<&Path, Vec<&RustSelectedSourceMount>>::new();
-    let source_paths_for_check: BTreeSet<&Path> = input
-        .sources
-        .values()
-        .map(|s| s.relative_path.as_path())
-        .collect();
-    let reasons =
-        target_discovery::target_discovery_reasons(&input.manifests, &source_paths_for_check);
+    let mut sources_by_target_directory = HashMap::<&Path, Vec<&Path>>::new();
+    let reasons = target_discovery::target_discovery_reasons(
+        manifests,
+        source_paths_for_check,
+        &Default::default(),
+        &target_discovery::cargo_manifest_documents(manifests),
+    );
     // The inventory is complete exactly when nothing names a gap, so every
     // way to leave it incomplete has to say why.
-    let mut incomplete_reasons = reasons;
-    for source in input.sources.values() {
+    let mut incomplete_reasons = reasons.into_values().flatten().collect::<BTreeSet<_>>();
+    for &source in source_paths_for_check {
         if !progress(RustSelectedContextWork::ScopeNode) {
             return Ok(RustSelectedBuildOutcome::Stopped);
         }
-        source_paths.insert(source.relative_path.as_path());
-        let mut directory = source.relative_path.parent();
+        source_paths.insert(source);
+        let mut directory = source.parent();
         for _ in 0..AUTO_TARGET_MAX_DEPTH {
             if !progress(RustSelectedContextWork::ScopeNode) {
                 return Ok(RustSelectedBuildOutcome::Stopped);
@@ -1400,7 +1425,7 @@ pub fn rust_selected_workspace_profiles_from_prepared_with_progress(
     }
 
     let mut profiles = Vec::new();
-    for manifest in input.manifests.values() {
+    for manifest in manifests.values() {
         if !progress(RustSelectedContextWork::ScopeNode) {
             return Ok(RustSelectedBuildOutcome::Stopped);
         }
@@ -1409,11 +1434,7 @@ pub fn rust_selected_workspace_profiles_from_prepared_with_progress(
         };
         let directory = manifest.relative_path.parent().unwrap_or(Path::new(""));
         let RustSelectedBuildOutcome::Ready(excluded) =
-            cargo_package_is_excluded_from_selected_workspace(
-                manifest,
-                &input.manifests,
-                progress,
-            )?
+            cargo_package_is_excluded_from_selected_workspace(manifest, manifests, progress)?
         else {
             return Ok(RustSelectedBuildOutcome::Stopped);
         };
@@ -1421,7 +1442,7 @@ pub fn rust_selected_workspace_profiles_from_prepared_with_progress(
             continue;
         }
         let RustSelectedBuildOutcome::Ready(edition) =
-            effective_cargo_edition(&manifest.relative_path, &input.manifests, progress)?
+            effective_cargo_edition(&manifest.relative_path, manifests, progress)?
         else {
             return Ok(RustSelectedBuildOutcome::Stopped);
         };
@@ -1496,7 +1517,6 @@ pub fn rust_selected_workspace_profiles_from_prepared_with_progress(
                 return Ok(RustSelectedBuildOutcome::Stopped);
             }
             let target_root = source
-                .relative_path
                 .strip_prefix(directory)
                 .expect("target-directory grouping keeps sources below the directory");
             let kind = auto_cargo_target_kind(
@@ -2288,8 +2308,14 @@ fn build_rust_selected_context_from_maps_with_progress(
             sources.contains_key(&caller_root),
             "a detached selected Rust caller root is a mounted source: {caller_root:?}"
         );
+        // This builder receives only successfully acquired manifest mounts and
+        // has no channel for failed acquisitions, so an enclosing manifest that
+        // failed to acquire reads here as no manifest. No production code calls
+        // the selected builders; the persisted reconciliation, which does, passes
+        // its real acquisition failures. #12950 tracks removing this builder or
+        // giving it the failure channel.
         let RustSelectedBuildOutcome::Ready(edition) =
-            detached_caller_edition(&profile.manifest_path, manifests, progress)?
+            rust_detached_edition(&caller_root, manifests, &BTreeMap::new(), progress)?
         else {
             return Ok(RustSelectedBuildOutcome::Stopped);
         };
@@ -3197,35 +3223,92 @@ pub fn build_rust_selected_topology_context_from_prepared_with_progress(
     Ok(RustSelectedBuildOutcome::Ready(context))
 }
 
-/// The edition a detached Rust file is read under.
-///
-/// A detached file belongs to no Cargo target, so no package edition applies to
-/// it directly. The nearest enclosing manifest still states the edition the
-/// surrounding sources are written in, so use that when the manifest declares a
-/// package edition or a workspace package edition. With no enclosing manifest,
-/// use the current default edition, which is what rust-analyzer reads a
-/// detached file under.
-fn detached_caller_edition(
-    manifest_path: &Path,
+/// Resolve a detached file's edition from the acquired enclosing Cargo view.
+/// Failed acquisitions must remain in `unavailable_manifests`: absence from the
+/// successful mount map alone cannot distinguish missing bytes from no manifest.
+/// Package editions use the same validated inheritance as ordinary Cargo units.
+pub fn rust_detached_edition(
+    source: &Path,
     manifests: &BTreeMap<PathBuf, RustSelectedManifestMount>,
+    unavailable_manifests: &BTreeMap<PathBuf, String>,
     progress: &mut impl FnMut(RustSelectedContextWork) -> bool,
 ) -> Result<RustSelectedBuildOutcome<RustCargoEdition>, String> {
-    let Some(manifest) = manifests.get(manifest_path) else {
-        return Ok(RustSelectedBuildOutcome::Ready(DETACHED_DEFAULT_EDITION));
-    };
-    if manifest.facts.package.is_some() {
-        return effective_cargo_edition(manifest_path, manifests, progress);
+    for directory in source.parent().into_iter().flat_map(Path::ancestors) {
+        if !progress(RustSelectedContextWork::ScopeNode) {
+            return Ok(RustSelectedBuildOutcome::Stopped);
+        }
+        let path = directory.join("Cargo.toml");
+        if let Some(cause) = unavailable_manifests.get(&path) {
+            // Joined and normalized paths carry the platform separator; render
+            // the workspace-relative spelling so the prose is the same on Windows.
+            return Err(format!(
+                "detached Rust edition unavailable at {:?}: {cause}",
+                workspace_relative_slash_path(&path)
+            ));
+        }
+        let Some(manifest) = manifests.get(&path) else {
+            continue;
+        };
+        if let Some(package) = &manifest.facts.package {
+            if package.edition == RustCargoPackageEdition::Workspace {
+                if let Some(workspace_path) = package.workspace_path.as_deref() {
+                    // An explicit workspace cannot be superseded by an ancestor.
+                    // Resolve it exactly as cargo_edition_workspace does.
+                    let workspace_directory = normalize_selected_path(directory, workspace_path)
+                        .ok_or_else(|| "detached Rust edition unavailable: Cargo package workspace path escapes selected inventory".to_owned())?;
+                    let workspace_manifest = workspace_directory.join("Cargo.toml");
+                    if let Some(cause) = unavailable_manifests.get(&workspace_manifest) {
+                        return Err(format!(
+                            "detached Rust edition unavailable at {:?}: {cause}",
+                            workspace_relative_slash_path(&workspace_manifest)
+                        ));
+                    }
+                } else {
+                    let RustSelectedBuildOutcome::Ready(workspace) =
+                        cargo_edition_workspace(&path, manifests, progress).map_err(|cause| {
+                            format!("detached Rust edition unavailable: {cause}")
+                        })?
+                    else {
+                        return Ok(RustSelectedBuildOutcome::Stopped);
+                    };
+                    // An unacquired nearer manifest may establish the governing
+                    // workspace. Do not inherit a distant workspace's edition past it.
+                    for ancestor in directory.ancestors() {
+                        if !progress(RustSelectedContextWork::ScopeNode) {
+                            return Ok(RustSelectedBuildOutcome::Stopped);
+                        }
+                        let ancestor_manifest = ancestor.join("Cargo.toml");
+                        if let Some(cause) = unavailable_manifests.get(&ancestor_manifest) {
+                            return Err(format!(
+                                "detached Rust edition unavailable at {:?}: {cause}",
+                                workspace_relative_slash_path(&ancestor_manifest)
+                            ));
+                        }
+                        if workspace
+                            .is_some_and(|workspace| workspace.relative_path == ancestor_manifest)
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+            return effective_cargo_edition(&path, manifests, progress)
+                .map_err(|cause| format!("detached Rust edition unavailable: {cause}"));
+        }
+        if manifest.facts.is_workspace {
+            return Ok(RustSelectedBuildOutcome::Ready(
+                manifest
+                    .facts
+                    .workspace_package_edition
+                    .unwrap_or(DETACHED_DEFAULT_EDITION),
+            ));
+        }
     }
-    Ok(RustSelectedBuildOutcome::Ready(
-        manifest
-            .facts
-            .workspace_package_edition
-            .unwrap_or(DETACHED_DEFAULT_EDITION),
-    ))
+    Ok(RustSelectedBuildOutcome::Ready(DETACHED_DEFAULT_EDITION))
 }
 
-/// The edition a detached Rust file is read under when no manifest encloses it.
-const DETACHED_DEFAULT_EDITION: RustCargoEdition = RustCargoEdition::Rust2024;
+/// Engine policy for detached files without an enclosing edition (rust-analyzer).
+pub const DETACHED_DEFAULT_EDITION: RustCargoEdition = RustCargoEdition::Rust2024;
 
 fn effective_cargo_edition(
     manifest_path: &Path,
@@ -3247,6 +3330,33 @@ fn effective_cargo_edition(
         }
         RustCargoPackageEdition::Workspace => {}
     }
+    let RustSelectedBuildOutcome::Ready(workspace) =
+        cargo_edition_workspace(manifest_path, manifests, progress)?
+    else {
+        return Ok(RustSelectedBuildOutcome::Stopped);
+    };
+    let workspace = workspace.ok_or_else(|| {
+        format!("workspace-inherited Cargo edition has no selected workspace: {manifest_path:?}")
+    })?;
+    workspace
+        .facts
+        .workspace_package_edition
+        .ok_or_else(|| format!("workspace-inherited Cargo edition is absent: {manifest_path:?}"))
+        .map(RustSelectedBuildOutcome::Ready)
+}
+
+/// The acquired workspace that supplies a package's inherited edition.
+/// Detached reads also need its boundary to check intervening acquisitions.
+fn cargo_edition_workspace<'a>(
+    manifest_path: &Path,
+    manifests: &'a BTreeMap<PathBuf, RustSelectedManifestMount>,
+    progress: &mut impl FnMut(RustSelectedContextWork) -> bool,
+) -> Result<RustSelectedBuildOutcome<Option<&'a RustSelectedManifestMount>>, String> {
+    let package = manifests[manifest_path]
+        .facts
+        .package
+        .as_ref()
+        .expect("edition inheritance has package facts");
     let package_directory = manifest_path.parent().unwrap_or(Path::new(""));
     let workspace = if let Some(workspace_path) = package.workspace_path.as_deref() {
         let directory = normalize_selected_path(package_directory, workspace_path)
@@ -3274,15 +3384,8 @@ fn effective_cargo_edition(
             }
         }
         selected.map(|(_, manifest)| manifest)
-    }
-    .ok_or_else(|| {
-        format!("workspace-inherited Cargo edition has no selected workspace: {manifest_path:?}")
-    })?;
-    workspace
-        .facts
-        .workspace_package_edition
-        .ok_or_else(|| format!("workspace-inherited Cargo edition is absent: {manifest_path:?}"))
-        .map(RustSelectedBuildOutcome::Ready)
+    };
+    Ok(RustSelectedBuildOutcome::Ready(workspace))
 }
 
 /// Whether one `[workspace]` manifest claims the package in `package_directory`.
@@ -4388,6 +4491,131 @@ mod tests {
             })
             .collect();
         (sources, vec![manifest])
+    }
+
+    #[test]
+    #[hardwon(
+        "#12830: a failed enclosing manifest acquisition must not select the detached default edition"
+    )]
+    fn detached_edition_missing_acquisition_remains_unknown() {
+        let unavailable = BTreeMap::from([(
+            PathBuf::from("Cargo.toml"),
+            "retained manifest source is missing".to_owned(),
+        )]);
+        let error = rust_detached_edition(
+            Path::new("nested/detached.rs"),
+            &BTreeMap::new(),
+            &unavailable,
+            &mut |_| true,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("retained manifest source is missing"),
+            "{error}"
+        );
+        // A successfully acquired nearer package establishes its own edition;
+        // failure outside that package must not change the explicit choice.
+        let manifests = BTreeMap::from([(
+            PathBuf::from("nested/Cargo.toml"),
+            RustSelectedManifestMount::from_source(
+                "nested/Cargo.toml",
+                "[package]\nname='nested'\nedition='2018'\n",
+            )
+            .unwrap(),
+        )]);
+        assert!(matches!(
+            rust_detached_edition(
+                Path::new("nested/detached.rs"),
+                &manifests,
+                &unavailable,
+                &mut |_| true,
+            )
+            .unwrap(),
+            RustSelectedBuildOutcome::Ready(RustCargoEdition::Rust2018)
+        ));
+    }
+
+    #[test]
+    #[hardwon(
+        "#12830: inherited detached edition skipped a failed intermediate workspace acquisition"
+    )]
+    fn detached_inherited_edition_stops_at_failed_workspace_acquisition() {
+        let mut manifests: BTreeMap<_, _> = [
+            (
+                "outer/Cargo.toml",
+                "[workspace]\n[workspace.package]\nedition='2021'\n",
+            ),
+            (
+                "outer/middle/package/Cargo.toml",
+                "[package]\nname='member'\nedition.workspace=true\n",
+            ),
+        ]
+        .into_iter()
+        .map(|(path, source)| {
+            (
+                PathBuf::from(path),
+                RustSelectedManifestMount::from_source(path, source).unwrap(),
+            )
+        })
+        .collect();
+        let source = Path::new("outer/middle/package/detached.rs");
+        let mut unavailable = BTreeMap::from([(
+            PathBuf::from("Cargo.toml"),
+            "unavailable beyond governing workspace".to_owned(),
+        )]);
+        // Do not inspect acquisitions beyond the successfully selected root.
+        assert!(matches!(
+            rust_detached_edition(source, &manifests, &unavailable, &mut |_| true).unwrap(),
+            RustSelectedBuildOutcome::Ready(RustCargoEdition::Rust2021)
+        ));
+        unavailable.insert(
+            Path::new("outer/middle").join("Cargo.toml"),
+            "retained manifest source is missing".to_owned(),
+        );
+        let error =
+            rust_detached_edition(source, &manifests, &unavailable, &mut |_| true).unwrap_err();
+        assert_eq!(
+            error,
+            "detached Rust edition unavailable at \"outer/middle/Cargo.toml\": retained manifest source is missing"
+        );
+
+        // Explicit sibling workspaces bypass unavailable ancestors entirely.
+        manifests.insert(
+            PathBuf::from("outer/middle/package/Cargo.toml"),
+            RustSelectedManifestMount::from_source(
+                "outer/middle/package/Cargo.toml",
+                "[package]\nname='member'\nedition.workspace=true\nworkspace='../workspace'\n",
+            )
+            .unwrap(),
+        );
+        let explicit_manifest = Path::new("outer/middle/workspace").join("Cargo.toml");
+        manifests.insert(
+            explicit_manifest.clone(),
+            RustSelectedManifestMount::from_source(
+                &explicit_manifest,
+                "[workspace]\n[workspace.package]\nedition='2024'\n",
+            )
+            .unwrap(),
+        );
+        assert!(matches!(
+            rust_detached_edition(source, &manifests, &unavailable, &mut |_| true).unwrap(),
+            RustSelectedBuildOutcome::Ready(RustCargoEdition::Rust2024)
+        ));
+
+        // The explicitly named workspace's own acquisition remains required.
+        manifests.remove(&explicit_manifest).unwrap();
+        unavailable.insert(
+            explicit_manifest,
+            "explicit workspace source is missing".to_owned(),
+        );
+        let error =
+            rust_detached_edition(source, &manifests, &unavailable, &mut |_| true).unwrap_err();
+        // The diagnostic names the manifest in its workspace-relative spelling,
+        // not the platform separators that joining and normalization produced.
+        assert_eq!(
+            error,
+            "detached Rust edition unavailable at \"outer/middle/workspace/Cargo.toml\": explicit workspace source is missing"
+        );
     }
 
     #[test]

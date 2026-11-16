@@ -9,175 +9,490 @@ projection and its commit history does not contain every source commit.
 
 ### Added
 
-- RQL configuration filters can match decoded values with `value_regex`.
-  Structural patterns can capture matches across descendants with `each`
-  and filter arguments by passing mode. C# queries can distinguish fields
-  from properties and find initializers on target-typed `new()` (#10773,
-  #10810, #10699, #10856).
-- Semantic-model schema 30 lets pack authors describe Rust tuple-struct
-  fields. Rust taint policies can recognize Poem `Query` and `Path`
-  parameter bindings when the selected model proves the field. SQLx facade
-  calls can use models for the re-exported `sqlx_core` function (#10177,
-  #10693, #10258).
-- Depth-bounded call-graph queries report whether traversal reached the
-  limit, stopped short, or could not establish either outcome. RQL policies
-  can keep proven findings and mark the search inconclusive (#10410).
-- Ruby analysis now includes Gemfiles, Rakefiles, Guardfiles, Rack
-  configuration, Rake tasks and gem specifications (#10666).
-- Rust unused-variable policies can distinguish shadowed bindings and report
-  a directly selected binding once across pattern alternatives (#10389).
-- Ruby analysis generates API declarations from vendored Bundler gem archives
-  and can activate version-specific models for four-part versions such as
-  `7.0.8.1` (#10331).
-- Kotlin property reads such as `url.host` can resolve to Java getter calls
-  such as `getHost()`. External JVM member lookup accounts for access from
-  the caller’s package when selecting a getter (#10359, #10417).
-- Scala resolves companion `apply` and library methods from selected source
-  JARs. Imported names can also lead to external JVM members and resolve
-  overloaded calls when their argument conversions are proven. A parameter
-  no longer shadows a package name used in its own type (#10260, #10296,
-  #10430, #10445, #10454).
-- Python type analysis recognizes the outer class of subscripted annotations
-  and the members of union annotations. Proven classmethod receivers and
-  method results carry fewer spurious type gaps (#10407, #10422, #10467).
+- Rust async bodies are analyzed. Locals survive `.await`, and shared or
+  escaped memory becomes unknown after an await unless Rust ownership facts
+  prove it exclusive. Python, C# and JavaScript/TypeScript treat an await as
+  a possible memory interference the same way (#12128).
+- Structural queries treat Java `this(...)` and `super(...)` (including
+  `outer.super(...)`) and C# `: this(...)` and `: base(...)` as constructor
+  calls with their written arguments, keeping C# `ref`, `out`, `in` and named
+  arguments. A `call` or argument query over a file that contains them no
+  longer leaves them out and reports the answer complete (#10319).
+- A match policy's report carries the work metric
+  `query.match.candidate_sites`: the number of distinct sites its pattern's
+  anchor selected before any filter ran. A run with no findings can now show
+  whether it examined candidates. It is identical for cold and warm runs and
+  is absent, not zero, when it was not measured (#12581).
 
 ### Changed
 
-- Rust analysis keeps calls incomplete when argument conversion could run
-  user code. It can rule this out for supported generic method results,
-  operator results and formatting operands of the verified `log` crate
-  (#10848, #10954, #10957, #10955).
-- Source admission now accepts long lines of parser-identified data across
-  supported languages, so a long string literal alone need not exclude a
-  source file (#10724).
-- RQL queries identify what truncated their results. When a policy exhausts
-  its semantic budget, it retains findings from completed outputs and
-  reports which outputs stopped (#10805, #10688).
-- Taint policies retry only the outputs that hit their own resident memory
-  budget. Conditional sanitizers check calls within their owning procedure,
-  avoiding repeated binding work on other procedures in the file (#10859,
-  #10924, #10834).
-- Semantic models rank candidates within the queried language family, so
-  a pack for another language cannot hide a matching declaration. C#
-  lookups respect per-type and per-member completeness recorded by .NET
-  packs (#10721, #10809).
-- Policies retain possible flows from an external overload family when its
-  members share one owner and pack but its completeness is unproven. A
-  qualified locator for a language with no source files no longer prevents
-  an otherwise applicable policy from running (#10891, #10868).
-- Java reuses the workspace class hierarchy across calls to external types
-  in the same snapshot, avoiding repeated database reads when analyzing
-  virtual calls (#10682).
-- JVM dependency discovery verifies selected JDK modules and source archives
-  by content. On filesystems without trusted file identity, each selection
-  re-reads the archives (#10576, #10613).
-- Python workspaces without a declared interpreter version assume CPython
-  3.13.5 for standard-library models. Python type-flow queries now use
-  native type and definition answers, including for constructor calls
-  (#10519, #10653). Taint models also bind supported keyword calls that
-  skip an optional positional argument, such as `urlopen(url, timeout=5)`
-  (#10575).
-- Policy diagnostics name failed semantic-pack activation in `query_code`
-  and identify the gaps behind inconclusive typestate runs (#10520, #10522).
-  Findings that use a close-match Rust dependency model retain that
-  attribution (#10409).
-- A warm `run_policy` can use its previous evaluation as the base across
-  edits when no diff base is specified. Rust checks on a committed revision
-  now report the files actually omitted from the source listing (#10656,
-  #10680). Diff-based checks also distinguish uncommitted manifest and
-  lockfile edits from the committed baseline (#10634, #10646).
-- Incremental taint runs can reuse unaffected outputs when another output
-  needs recomputation. An abandoned attempt no longer consumes the fallback
-  run’s budget (#10481, #10584, #10657).
-- JavaScript misspelled-identifier checks use a policy pack's typo table and
-  skip intrinsic JSX tag names. A missing table yields incomplete coverage
-  (#10402, #10414).
-- Composed taint analysis can reuse findings and diagnostics from an unchanged
-  content-incomplete result. Edits to a dependency that determined a cached
-  call target invalidate its dependent results (#10283, #10475).
+- Policy reports share their retention budget across policies to keep large
+  result sets from crowding out smaller ones. The 10,000-finding batch cap is
+  removed, while byte limits still apply. Retention cuts preserve acceptance
+  and suppression-audit candidates before ordinary findings (#12498, #12560).
+
+- The Rust analyzer enables all declared Cargo features and the test
+  configuration for workspace members, including code outside the default
+  feature set (#12335). When two enabled configurations select different
+  declarations, the answer is ambiguous instead of a guess (#12164).
+- Rust analysis tracks local value flow inside async bodies across an
+  `await`. It treats shared or escaped memory as uncertain across suspension
+  and distinguishes constructing a future from running its body (#12251).
+- A failed listing read in a workspace without analyzers reports an
+  incomplete answer instead of an empty one (#12040).
 
 ### Fixed
 
-- C#, C++ and PHP usage searches visit files in path order, making capped
-  results reproducible (#10876). Java control-flow analysis excludes the
-  unreachable branch when a comparison can be decided from constant
-  `int` or `long` values (#10905).
-- TypeScript library selection explains why a tsconfig or its parent could
-  not be used, including cycles, unreadable files and read limits (#10779).
-- Batched definition and declaration lookups report incomplete reads only
-  on the affected lookup. An unrelated missing JAR no longer makes an
-  unshadowed, explicitly imported `java.*` JDK type incomplete (#10932, #10894).
-- Java model binding uses argument types to select the most specific
-  supported overload. The JDK source reader can certify complete callable
-  families, and Java usage searches find references to Scala classes
-  (#10755, #10839, #10902, #10875).
-- C# project analysis evaluates MSBuild property conditions in assignment
-  order and recognizes the Razor SDK’s default compile files. Generated
-  Razor sources can still be unknown. Search, definition and usage tools
-  report when a conditional branch has not been analyzed (#10825, #10897,
-  #10896, #10888).
-- Taint analysis follows nested reads after a store through a reference and
-  follows uncaught exceptions through intermediate calls. Typestate analysis
-  retains possible leaks when a call cannot be resolved (#10737, #10790,
-  #10826).
-- Go analysis distinguishes values copied into interface parameters from
-  arguments that retain their identity. A single refused source file no
-  longer discards the whole workspace graph (#10685, #10823).
-- Incremental Rust analysis invalidates affected cached answers when edits
-  can change trait implementations, import aliases or macro references
-  used by those answers (#10970).
-- Rust analysis reads crate names and target layouts from the manifests
-  selected for the snapshot. Rustdoc models retain methods whose owner is
-  declared in another document of the same source set (#10804, #10730,
-  #10830, #10945). Rust tail expressions now report gaps for individual unproven
-  values, so supported expressions can produce complete results (#10457).
-- Workspace updates recognize changed files supplied through an alias for
-  the project root. The watcher ignores writes to the configured workspace
-  pack catalog, and upgrading a populated pre-273 cache preserves the
-  existing index (#10722, #10706, #10857).
-- RQL configuration filters decode values according to the document format,
-  including TOML scalars, JSON primitives and XML CDATA. An undecodable
-  value now makes an absence check incomplete (#10668).
-- PHP taint analysis follows values through array literals and binds omitted
-  trailing arguments to supported defaults. Go taint analysis follows
-  elements stored in slice and map literals and preserves origins through
-  supported assignment conversions (#10549, #10677, #10573, #10577).
-- Java resolves overloaded external constructors when argument types select a
-  target. Scala and Kotlin definition lookup follows the receiver of a
-  member selection even when a local has the same name (#10558, #10506).
-- C# tracks member accesses through qualified types declared in the same
-  file when the type can be resolved unambiguously (#10625).
-- Rust treats a module path that matches a selected file only by letter case
-  as unresolved, avoiding false reports of a missing module (#10631).
-- Version-specific crates.io models activate only when Cargo lockfile evidence
-  selects one version. Go keeps calls in build-constrained files unresolved when
-  `go list` fails and file selection cannot be proven (#10608, #10675, #10622).
-- Value-flow analysis preserves alternatives that reach the same target in
-  one event. Composed taint analysis attaches modeled transformations to
-  the call that produces their result (#10592, #10599). Partial-flow queries
-  preserve truncation in stored results and distinguish an unproven return
-  member from a budget limit (#10488, #10546).
-- C# analysis returns a partial result when a struct copy exceeds the
-  32-slot limit, preserving the rest of the semantic analysis (#10395).
-- JVM analysis now limits declaration-specific warnings to queries that use
-  the affected declaration. Artifact-wide warnings still apply to the whole
-  query (#10388).
-- On Windows, the Ruby and JavaScript analyzers can reuse unchanged gem and
-  npm discovery results across edits when the paths are canonical (#10383).
-- Shared value-flow analysis preserves members of copied aggregates across
-  branch joins, allowing taint to flow through the returned value (#10196).
-- Capped taint policy runs retain findings from completed sink sites when a
-  later site exhausts the budget. Findings suppressed by `without-flow` no
-  longer consume the finding allowance (#10439).
-- Go analysis preserves supported result identities by position in typed
-  multi-result variable declarations. A written standard-library type with
-  no source or active model stays incomplete (#10287, #10452, #10474).
-- Python inheritance diagnostics recognize classes imported from external
-  modules, avoiding false definite failures for bases such as
-  `unittest.TestCase` (#10442).
-- Rust closure analysis preserves a tentative capture when a pattern name
-  shadows an import, avoiding a missing capture while retaining uncertainty
-  about the binding (#10471).
+- PHP secret scanning recognizes single-line literal credentials in
+  double-quoted strings and heredoc or nowdoc assignments (#12433).
+
+- Ruby dependency analysis marks a declared gem as indexed only when that
+  gem's declaration pack is active (#12459).
+
+- Taint analysis retains selector gaps when failed evidence hides source or
+  sink endpoints, keeping the result incomplete (#12590).
+- Rust Poem taint analysis recognizes certified Query and Path tuple fields
+  as sources and retains evidence from each source (#12300).
+- Rust call binding proves standard `Deref` coercions for supported call
+  arguments (#12431).
+- Rust data-flow analysis checks each selected-payload return arm, allowing
+  supported procedures with multiple returns to retain their payload proof
+  (#12457).
+- C# `uses()` queries report incomplete coverage when unsupported syntax
+  prevents reference enumeration (#12461).
+- Semantic-pack catalog upgrades preserve installed and custom packs for
+  offline use and report failures when an older catalog cannot be imported
+  (#12475).
+- Symbol search accepts qualified names using each language's separators,
+  including PHP namespaces and nested Java and C# types (#12443).
+- MCP progress notifications finish before the corresponding response or
+  terminal task result. Redundant file-watcher events no longer leave
+  `query_code` waiting after a workspace refresh (#12775, #12452).
+- Go standard-library packs can be selected from the `go.mod` version when
+  a Go toolchain is unavailable, using compatible packs as approximate
+  standard-library evidence (#12529).
+- Rust inference determines the type of a standard `vec!` result when its
+  elements agree on a primitive type (#12370).
+- Java native call analysis follows generic return types through calls such
+  as `Map<String, String>.get(...).trim()` (#12532).
+- Rust indexing handles conditional expressions used as binary operands
+  without panicking (#12780).
+- Rust dependency discovery preserves configured targets when activating
+  standard-library packs and handles absent Cargo configuration under
+  symlinked workspace roots. Legal Cargo development-dependency cycles no
+  longer make unrelated crate routes incomplete (#12364, #12692, #12762, #12463).
+- Python analysis recognizes the implicit `typing.Generic` base of PEP 695
+  classes and binds a modeled class and its matching same-named factory as
+  one name (#12716, #12721).
+
+- Call reachability evaluates sink predicates at reachable call sites, so
+  unrelated sink matches no longer exhaust the query before reachable paths
+  can be checked. Incomplete traversals retain their encountered diagnostics
+  and remain incomplete (#12351).
+- Java call analysis resolves explicit `super` receivers against the direct
+  superclass and can bind generic constructors with explicit class type
+  arguments. JDK call analysis also recognizes the String overloads of
+  `PrintWriter.print` and `println` and the locale-taking overloads of
+  `printf` and `format` (#12334, #12336, #12214).
+- Go data-flow analysis distinguishes a value copied into an interface
+  parameter from a pointer passed through that interface (#12192).
+- Python hierarchy queries keep proven descendants when other possible
+  descendants are unresolved and exclude the queried class from its own
+  descendants (#12198, #12379).
+- Usage search reads the indexed version of each source file. Rust usage
+  search under an editor overlay retains known references when it cannot
+  establish complete coverage (#12242, #12231).
+- Rust go-to-definition navigates to the selected declaration when several
+  macro definitions or conditionally compiled items share a name. An inactive
+  macro definition no longer shadows an active one, and resolution stays
+  ambiguous when no unique declaration remains (#12365, #12317, #12240).
+- Rust resolution follows chained associated types through their intermediate
+  declarations. Rust ownership analysis checks for destructors across the
+  crate and verifies that unqualified `Copy`, `Clone` and `Drop` refer to
+  the standard traits before relying on them. Inert-value proofs check a typed
+  Drop inventory instead of assuming no drop glue when no `impl Drop` is
+  nearby (#12279, #11940, #12359, #12249, #10879).
+- Scala source-JAR analysis recognizes when an object's generic method shadows
+  an inherited static forwarder, even if their type parameter names differ
+  (#12387).
+- Rust, Go and Java rename diagnostics now identify uncertain references by
+  readable target name and workspace-relative location (#12361).
+- Workspace graph queries retain partial results when source coverage is
+  incomplete, and dead-code reports withhold findings that depend on proving
+  a reference is absent (#12340).
+
+- JavaScript and TypeScript usage analysis proves the receiver of a factory
+  call only when every reachable exit of the factory returns it. A path that
+  reaches the end of the body now leaves the call site unproven, and a
+  `finally` block that always exits replaces the returns it guards (#7239).
+- The C# RQL `supertypes` step no longer drops a base class or interface that
+  has no indexed declaration, such as `System.ICloneable` read from an
+  assembly, while reporting a complete answer. The answer keeps every indexed
+  ancestor and is incomplete with an `ancestor_external_unindexed` diagnostic
+  that names the type and is located at the type declaration (or partial
+  part) whose base list names it, so a match policy that depends on it is
+  inconclusive rather than clean. Ambiguous and unreadable base clauses also
+  make the answer incomplete. An explicit `object` base and an enum's underlying
+  type are not ancestors and stay closed. C# member families that reach such
+  a base name it as an unread ancestor (#7363).
+
+## [0.15.3] - 2026-11-12
+
+### Breaking
+
+- Policy finding IDs no longer depend on Bifrost's internal semantic
+  identifiers or on source positions, so an engine upgrade, or lines added
+  above a declaration, do not change them for unchanged code. Two findings
+  that share an ID are both reported with a `duplicate_finding_id` advisory
+  instead of failing the run. This changes some IDs once. Baseline and
+  suppression entries for those findings no longer match after the upgrade;
+  accept the current findings again to replace them (#12029). The affected
+  findings are those of every relational assertion rule (60 in the open
+  rule packs), of `bifrost.rust-codeql-quality.ctor-initialization`, which
+  matches dispatch-target rows, and typestate findings whose subject is a
+  runtime object read. On the open rule packs' own fixtures, 79 of 626
+  strong finding IDs change, all from relational assertion rules:
+  `bifrost.cpp-jsf` `av-rule-108` (1), `av-rule-110` (1), `av-rule-159` (3);
+  `bifrost.csharp-codeql-quality` `call-to-gc` (2),
+  `catch-nullreferenceexception` (2), `catch-of-all-exceptions` (4),
+  `console-output` (2), `path-combine` (3), `random-used-once` (9),
+  `rethrown-exception-variable` (4), `self-assignment` (9),
+  `stringbuilder-initialized-with-character` (2), `use-of-file-upload` (5),
+  `use-of-html-input-hidden` (4), `useless-if-statement` (2);
+  `bifrost.effects.php.selected-boundary-no-network-io` (3);
+  `bifrost.javascript-codeql-quality.file-system-race` (2);
+  `bifrost.python-codeql-quality` `call-wrong-named-argument` (6),
+  `call-wrong-named-class-argument` (5); `bifrost.security.csharp`
+  `signedxml-embedded-key-trust` (5), `xmldocument-url-resolver` (5).
+- Policy reports use schema 20, up from 7 in 0.15.2. The version appears in
+  the JSON report, the `report` returned by MCP `run_policy`, and SARIF
+  `bifrost.policyReportSchemaVersion`. Readers that pin the version must
+  accept 20. New fields include finding `evaluation_location`, per-run
+  `diagnostic_causes`, `worst_omitted_diagnostic_severity` and
+  `budget_refusals`, `evaluation.budget`, and
+  `omitted_related_locations_exactness`. New diagnostic codes include
+  `builtin-policy-pack-rejected`, `builtin-policy-rejected` and
+  `internal_error`. The execution causes `detail_retention` and
+  `finding_retention` separate a report that dropped optional detail from
+  one that dropped findings to stay within its size limits (#11388, #11420,
+  #10941, #11750, #11615, #11896, #12105).
+- Python client: `CyclomaticComplexityFunction.is_test`,
+  `CyclomaticComplexityChange.in_test_context` and `CommitSymbol.is_test`
+  are `bool | None`. `None` means the file's test status is unknown
+  (#11385).
+- Rust library: `complete_members`, `MemberCompletionCandidate`,
+  `MemberCompletionResult`, `LanguageSupport::imported_package_at_range`,
+  `go_http_handler_dispatch`, `GoHttpHandlerDispatch` and
+  `GoHttpHandlerOpenReason` are removed (#11678).
+  `BuiltInPolicyCatalog::without_rules` and `from_embedded_packs` return the
+  catalog instead of a `Result`, and record rejected packs and policies in
+  it. `BuiltInPolicyCatalogManifest` has `rejected_packs` and
+  `rejected_policies` fields (#11640). `CodeQueryBudgetedWork::step_outputs`
+  is `Option<Vec<u64>>`, so `max_step_outputs()` returns `Option<u64>`
+  (#11741). `AnalyzerConfig::store_cache_budget_bytes` is removed.
+
+### Added
+
+- Semantic-model schema 39 (working number) lets a Rust trait member's
+  signature name the trait's `Self`. Rustdoc packs now write a method's own
+  generics and a trait's `Self` as type parameters instead of unknown types,
+  and keep impls whose conditions use `Fn` sugar (#12733).
+- Semantic-model schema 38 records verified Rust toolchain sysroot provenance
+  for rustdoc source sets, so cross-document `core`, `alloc`, and `std` IDs
+  resolve only from a verified sysroot archive (#12213).
+- RQL `call-reachability` returns certified call paths between source and
+  sink queries. Packs using it declare `rql-call-reachability`. An incomplete
+  search retains paths it has already proved (#11790).
+- Semantic-model schema 35 lets a summary transfer a selected receiver or
+  argument component to a selected return component, and schema 37 adds
+  indexed `element` path steps for arrays, slices and iterators. Taint
+  policies can mark just the successful payload of a Rust `Result` as a
+  source. Existing policies keep their identities across additive schema
+  changes (#11572, #11880, #11844).
+- Python documentation queries expose test scope and script entry points.
+  Ruby CodeQuery reports incomplete structural coverage for ERB templates
+  it cannot analyze (#11705, #11774).
+- RQL dead-write queries and the Python query client expose the reasons
+  an assignment's liveness could not be determined (#11314, #11467).
+- Policy reports tie typestate partial diagnostics to individual acquisition
+  sites, and list the possible finding locations when they are proven.
+  Reports name rejected policy packs and policies and report incomplete
+  identifier-typo tables and pack-catalog reads. JVM dependency diagnostics
+  identify the lookup site and report omitted evidence (#11420, #11642,
+  #10941).
+- Policy documents are no longer limited to 4,096 syntax nodes. The existing
+  256 KiB source and 128-level depth limits still bound them (#11757).
+
+- Rust reference storage is tracked through coercions, cleanup and returns.
+  A pointer to a named local or inline field keeps its storage origin, so a
+  raw-pointer access after the base binding ends can be reported (#4318).
+- A bare Rust call bound only by an external glob import, such as
+  `stdout()` under `use std::io::*;`, resolves to the modeled standard
+  library function when exactly one glob module declares it and every other
+  glob is proven not to (#9949).
+- Native Java binds calls on parameterized results, such as
+  `hm.keySet().contains("k")` and `ls.iterator().next().trim()`, and
+  creations with explicit type arguments, such as
+  `new ArrayList<String>(al)` (#7860).
+- Go call bindings model the boxing of an argument passed to an interface
+  parameter, including the predeclared `error`, so value and pointer flow no
+  longer treat the boxed copy as the caller's own storage (#10561, #10436).
+- C# treats `new T()` as a fresh object when `T` resolves to a class or
+  record class in the same file (#9506).
+
+### Changed
+
+- Java and C# policy diffs can reuse a cached base evaluation after edits
+  when the relevant dependency environment still matches (#11891).
+- The analyzer shares one parse thread pool across languages, reducing
+  the number of threads used to index mixed-language workspaces (#11893).
+- Documentation builds now use `bifrost.slopcop.com` for canonical links
+  and sitemaps, including versioned documentation (#11776).
+- With `BIFROST_TIMING=1`, service requests, workspace updates and policy
+  runs report memory held by each cache region and its shared retention
+  budget (#11309).
+- A file whose test status cannot be decided is no longer treated as
+  production code. Diff symbols report `is_test: null`. Score, missing-test
+  and complexity diffs show the status as unknown, with the cause, and the
+  result is marked incomplete where it depends on that status. Usage and
+  policy results that exclude tests become incomplete instead of counting
+  the file. For Rust diffs this affects most changed files that are not
+  crate roots: the diff image holds only the changed files, so the parent
+  module that decides whether a file is test-only is missing. On one
+  measured commit that changed eight such files, 17 of 43 changed symbols
+  became unknown, 26 stayed test and none stayed production. #11436
+  tracks restoring definite answers (#11385).
+- Policy findings in the human, JSON and SARIF reports are ordered by
+  workspace-relative path, line and column, then policy ID. Finding contents
+  are unchanged. When a finding cap truncates a run, the retained findings
+  are the first ones in this order (#12068).
+- RQL call-shape and call-binding diagnostics, and policy selectors that use
+  them, name the reason each candidate macro invocation was refused
+  (#11514).
+- Rust lowers deeply nested generic type arguments in linear time; a type
+  nested 300 levels deep previously took about 14 seconds. Bounded
+  qualified-name lookups in Python, Go and Rust skip unrelated modules
+  before reading them, and Rust taint queries reuse modeled trait-owner
+  discovery within a query (#11435, #11457, #11969).
+
+- The dead-code smell report carries a `completion` field. Graph and
+  dead-code results keep partial rows and withhold absence findings when
+  source-inventory coverage is incomplete (#12278).
+- Callers and callees diagnostics carry typed facts. Their messages no
+  longer contain process-local identifiers, so the same input gives the
+  same text on every run (#8407, #12269).
+- Cold C# indexing no longer slows down quadratically with the number of
+  files: at 1,500 files of dotnet/aspnetcore it scans about 256 times fewer
+  rows (#12143).
+- Usage search for Java, Kotlin, Scala, Python, C#, C++, JavaScript,
+  TypeScript, PHP and Ruby reads the indexed source instead of the working
+  tree, and analysis serves only source bytes that match the indexed
+  content. An unreadable candidate makes the answer incomplete instead of
+  being dropped, and taint evidence selection reports an incomplete run
+  instead of panicking (#12160, #12162).
+- Rust, Go and Java query-time proofs count the declaration sources they
+  read against the request's source budget, so a request cannot exceed its
+  budget and still report a complete answer (#12272).
+- Incomplete rename evidence uses workspace-relative paths and readable
+  target names instead of absolute paths and internal identifiers (#12260).
+
+### Fixed
+
+- Fixes a 0.15.2 regression in which a Rust field store that re-reads its
+  own field made cold indexing slow. For serde_json, the cold build went
+  from about 12 seconds to more than 190, and the first MCP requests timed
+  out waiting for the workspace. Data-flow analysis now bounds these
+  repeated field paths, reports truncated coverage and continues with
+  unrelated operations. Cached partial flows retain their original
+  incompleteness (#11503, #11644).
+- Java models bind again to overloaded JDK methods that 0.15.2 left unbound,
+  restoring lost findings. This covers fixed-arity overloads with a varargs
+  sibling, such as `Files.newBufferedWriter(path, charset)`, and calls whose
+  arguments are casts, such as `Files.copy((Path) x, ...)` (#12093).
+- Java taint policies no longer resolve every external supertype again for
+  each call, fixing a 0.15.2 slowdown that roughly doubled policy CPU time
+  on a large Java workspace (#12113).
+- Policy runs no longer exit without a report when a Rust crate records a
+  module gap in its flat form, as happened on Tokio, or when a deadline
+  stops a run. They also stay inconclusive instead of crashing when the
+  workspace gap sweep and a procedure classify a gap differently (#11352,
+  #11908, #11741).
+- The policy catalog loads valid packs and policies even when a sibling is
+  rejected, and `--list-policies` lists the rejected ones in
+  `rejected_packs` and `rejected_policies`. Policy runs can write a report
+  after a deadline and retain other policies' results when one encounters a
+  store error. A recovered syntax error withholds taint endpoints only in
+  its own file (#11640, #11741, #11750, #11915).
+- When a taint source query is incomplete, literal, identifier and field
+  sources stay possible sources. Earlier versions dropped them without a
+  diagnostic. Rust lookups report an unrecognized stored stop reason as a
+  separate provider diagnostic (#11701, #11718).
+- JavaScript and TypeScript models can activate from npm lockfiles and
+  bind named imports and destructured `require` calls. JVM models with
+  version ranges use the selected Maven version, and Go policy queries can
+  match a vendored function to its active module model (#11821, #11806,
+  #11872).
+- Java data-flow analysis tracks values by key in supported local maps.
+  Scala dead-code analysis recognizes Scala types referenced from Java
+  or Kotlin (#11337, #11875).
+- C# flow analysis passes an extension method's receiver to the modeled
+  first parameter. Ruby models bind keyword arguments, attribute writers
+  and element access. Python constructor queries can bind a declared
+  initializer in a partial model (#11695, #11693, #11717, #11805, #11815).
+- Rust lookup resolves types through imported module paths, interprets
+  leading `::` paths using the crate edition and dependency names, and
+  resolves built-in derive methods to their standard traits. Rustdoc models
+  expose public re-exports of functions from private modules and can certify complete
+  free-function families in a partial pack (#11878, #11899, #11924, #11810,
+  #11865).
+- Python reverse lookups handle unsaved edits after indexing without
+  panicking. Rust module queries use the edited module layout and report
+  uncertainty when a new module's placement is unproven (#11737, #11694,
+  #11719, #11779).
+- Taint queries keep source and sink identities stable across processes
+  for unchanged inputs (#11697). Rust taint analysis keeps a discarded
+  success payload from a `?` expression out of unrelated return values (#11944).
+- Cached data-flow results are invalidated when a semantic pack they
+  depend on is activated or deactivated (#11958).
+- Rust resolution snapshots give ambiguous candidates a stable order
+  across processes. Affected tool diagnostics identify declarations by
+  name, identity and relative path (#11624).
+- Java call analysis distinguishes concrete calls from interface and
+  abstract dispatch. Concrete override expansion stays opt-in, while
+  incomplete interface searches retain known implementors (#11148).
+- Batched navigation keeps incomplete lookups scoped to the affected
+  rows. Cached usage searches preserve coverage and cancellation, and
+  respect the current request's limits (#11550, #11600).
+- Taint findings highlight the sink operand and literal source while
+  preserving finding IDs, SARIF fingerprints and baseline matches. Inline
+  `bifrost: ignore` directives match either the operand or the enclosing
+  call's line. Rust pointer findings retain related source ranges and report
+  when evidence was omitted (#11388, #11489).
+- Python unused-variable checks recognize reads on the next loop
+  iteration. Go workspaces select the same analysis profile on initial
+  indexing and refresh, and update declaration locations after edits. Go
+  function-value analysis recognizes proven package-variable bindings in
+  grouped declarations (#11429, #11543, #11625).
+- C# project analysis evaluates compile items and conditional metadata per
+  target framework. C# record structs are recognized as value types during
+  constructor lookup (#11261, #11293).
+- Rust crate-rooted lookups through a file excluded by the active build
+  configuration report incomplete coverage. In path calls, a macro alias
+  no longer hides a same-named module (#11616, #11601).
+- Typestate findings keep stable IDs across cold and cached runs when
+  several candidates share the same acquisition site (#11602).
+- Rust test exclusions recognize custom Cargo test targets and their
+  modules, including test targets outside conventional directories (#11613).
+- Rust analysis models imported logging macros when their crate identity
+  is proven, and resolves modeled return types on inferred generic
+  receivers. Lookup without source text preserves bindings inside supported
+  macro operands. Dead-code checks recognize unreachable short-circuit operands
+  and limit uncertainty from opaque macros to bindings in scope
+  (#11386, #11522, #11508, #11287, #11315).
+- Rust lookup reports incomplete macro coverage when it cannot locate an
+  unexpanded item macro. Policy reports identify which lexical binding limit
+  was reached and give its configured and observed values (#12003, #11949).
+- Rust analysis treats calls to candidate non-standard macros as opaque
+  until the workspace proves their identity (#11242).
+- Rust dead-code checks recognize closure captures read in struct literal
+  values, such as `Foo { f: Some(x) }`, and closure parameters inside
+  macros. They also no longer treat the variant in a pattern such as
+  `Err(E::V)` as a new binding. Configured Rust models bind generic calls
+  such as `text.parse::<usize>()`. Partial standard-library packs bind
+  uniquely identified inherent methods such as `String::as_str`. Calls such
+  as `String::from(s).as_str()` keep their receiver type when every
+  candidate returns the same type (#11960, #11456, #11419, #11312, #12069,
+  #11959).
+- RQL `resolved-call :proof exact` treats a call bound exactly to a
+  different declaration as a clean miss, so the run is not inconclusive
+  (#11773).
+- A Cargo manifest that is not a workspace member, such as a test fixture
+  that names a missing build script, no longer makes every Rust crate's
+  route answers incomplete. Each crate now considers only the manifests
+  Cargo reads to build it (#12042).
+- Ruby analysis types hash and array literals as `Hash` and `Array`
+  receivers, so modeled calls such as `{...}.fetch(...)` and `a[0]` can bind
+  (#12099).
+- A dropped workspace analyzer no longer keeps its caches, and the
+  semantic-pack catalog's database, alive through its project. On Windows
+  this had left the workspace's temporary directory undeletable (#11109).
+- Policy requests that reuse the default analyzer no longer rescan the Git
+  index and dirty working tree for npm dependency discovery, and repeated
+  requests reuse a complete dependency-pack activation instead of
+  republishing the packs (#11890, #11902).
+- Analyzing Java with annotated type bounds, such as
+  `class C<E extends @Nullable Object>`, and the Scala 3 standard library
+  source JAR no longer panics. Scala 3 extensions that differ only in their
+  receiver keep distinct identities (#12120, #5997).
+- Rust lowering no longer leaves values without a producer for opaque macro
+  payloads, `self` receivers captured by closures, and callables nested in
+  macros (#12076).
+- A Rust `use` binds names only in its own module, not in nested inline
+  `mod` items (#12163).
+- A file-backed `mod x;` whose `cfg` the selected build decides is false no
+  longer makes unqualified lookups at its crate root incomplete (#11834).
+- Native Java analysis projects generic type arguments through supertypes
+  read from dependency class files, so a dependency's `Concrete<String>`
+  can convert to a parameter such as `Iterable<? extends CharSequence>`
+  (#10194).
+- Incremental policy runs no longer recompute the same caller expansion on
+  every base and head evaluation (#11836).
+- The Rust usage walk reads each crate owner's manifest once, which removes
+  repeated naming-cache rebuilds on large repositories (#11799).
+- JavaScript and TypeScript usage analysis proves the receiver of a factory
+  call only when every reachable exit of the factory returns it. A path that
+  reaches the end of the body now leaves the call site unproven, and a
+  `finally` block that always exits replaces the returns it guards (#7239).
+- The C# RQL `supertypes` step no longer drops a base class or interface that
+  has no indexed declaration, such as `System.ICloneable` read from an
+  assembly, while reporting a complete answer. The answer keeps every indexed
+  ancestor and is incomplete with an `ancestor_external_unindexed` diagnostic
+  that names the type and is located at the type declaration (or partial
+  part) whose base list names it, so a match policy that depends on it is
+  inconclusive rather than clean. Ambiguous and unreadable base clauses also
+  make the answer incomplete. An explicit `object` base and an enum's
+  underlying type are not ancestors and stay closed. C# member families that
+  reach such a base name it as an unread ancestor (#7363).
+- Cache garbage collection no longer fails with `FOREIGN KEY constraint
+  failed` after a scoped session ends, which had let the cache grow without
+  bound (#11197).
+- Rust usages under an editor overlay no longer return a false Success when
+  the overlay adds a module or include edge into an already held file, or a
+  Failure that discards known usages when an importer adds a module edge.
+  Both answers are Incomplete with the known hits (#12203, #12186).
+- A syntax-invalid Cargo manifest no longer makes unrelated Rust files
+  report incomplete usages (#11799).
+- Rust imports guarded by `#[cfg]` keep their external identity when one
+  alternative is definitely disabled, as in a `cfg(feature)` and
+  `cfg(not(feature))` pair of `use` items. A cfg-disabled later
+  `macro_rules!` no longer shadows the active definition (#11825, #12239).
+- A Rust path-qualified unit-struct value, such as `types::Marker` defined in
+  another file, no longer leaves flows that carry it open. A chained
+  qualified projection such as `<Factory as Producer>::Output::get()`
+  resolves against the intermediate associated type instead of giving a
+  missing or wrong-owner answer (#12210, #12267).
+- Rustdoc models never bind a declaration identity by spelling. A
+  cross-document reference no longer attaches to a same-named declaration;
+  some references that bound that way are now unknown (#12073).
+- Go declaration extraction no longer panics on a type under parser
+  recovery; the file is reported with a syntax gap (#12125).
+- Java `super.m()`, `super.f` and `super::m` read the direct superclass, so
+  an override calling `super.m()` no longer gets a proven edge to itself or
+  candidates among unrelated methods (#9703).
+- A Java creation of a source class is typed only when one of its
+  constructors applies, so `new Box(1).foo()` no longer binds when no `Box`
+  constructor accepts an `int` (#10089).
+- Java `print(String)`, `println(String)` and Locale-first `printf` and
+  `format` calls bind against JDK declarations, which recovers 96 OWASP
+  BenchmarkJava XSS cases that were not analyzed (#12136).
+- A Java call on a `var` local whose initializer has a JDK or dependency
+  type binds to the external method, as a call on an explicitly typed
+  local already did. For example, the typestate policy
+  `objectinputstream-read-without-filter` ended inconclusive on
+  `var in = new ObjectInputStream(...); in.readObject()` (#12509).
+- A policy run with `--sources` over a C# repository no longer exits with
+  "selected source version unavailable" when a committed `.cs` file is
+  not selected. The run completes and writes its report (#12508).
 
 ## [0.15.2] - 2026-11-06
 
@@ -269,6 +584,51 @@ projection and its commit history does not contain every source commit.
   claims, the `Fenced` completeness state (read as `Partial` for now) and
   rustdoc approximation provenance. Ordinary packs stay at schema 22 (#9431,
   #10052, #10034).
+- RQL configuration filters can match decoded values with `value_regex`.
+  Structural patterns can capture matches across descendants with `each`
+  and filter arguments by passing mode. C# queries can distinguish fields
+  from properties and find initializers on target-typed `new()` (#10773,
+  #10810, #10699, #10856).
+- Semantic-model schema 30 lets pack authors describe Rust tuple-struct
+  fields. Rust taint policies can recognize Poem `Query` and `Path`
+  parameter bindings when the selected model proves the field. SQLx facade
+  calls can use models for the re-exported `sqlx_core` function (#10177,
+  #10693, #10258).
+- Depth-bounded call-graph queries report whether traversal reached the
+  limit, stopped short, or could not establish either outcome. RQL policies
+  can keep proven findings and mark the search inconclusive (#10410).
+- Ruby analysis now includes Gemfiles, Rakefiles, Guardfiles, Rack
+  configuration, Rake tasks and gem specifications (#10666).
+- Rust unused-variable policies can distinguish shadowed bindings and report
+  a directly selected binding once across pattern alternatives (#10389).
+- Ruby analysis generates API declarations from vendored Bundler gem archives
+  and can activate version-specific models for four-part versions such as
+  `7.0.8.1` (#10331).
+- Kotlin property reads such as `url.host` can resolve to Java getter calls
+  such as `getHost()`. External JVM member lookup accounts for access from
+  the caller’s package when selecting a getter (#10359, #10417).
+- Scala resolves companion `apply` and library methods from selected source
+  JARs. Imported names can also lead to external JVM members and resolve
+  overloaded calls when their argument conversions are proven. A parameter
+  no longer shadows a package name used in its own type (#10260, #10296,
+  #10430, #10445, #10454).
+- Python type analysis recognizes the outer class of subscripted annotations
+  and the members of union annotations. Proven classmethod receivers and
+  method results carry fewer spurious type gaps (#10407, #10422, #10467).
+- Policy findings can be accepted in source comments with
+  `bifrost: ignore[policy.id]`. A directive on its own line covers the next
+  line of code. A blanket directive requires a reason (#11104).
+- RQL configuration queries read HOCON keys, dotted paths and scalar values.
+  Includes and substitutions remain unresolved, and unsupported object or
+  array concatenations make the document incomplete (#11029).
+- RQL can match Rust associated calls by the qualifying type and its generic
+  arguments through proven aliases. Semantic-model schema 32 supports
+  structured alias targets that rustdoc packs can supply. Schema 31 adds
+  reviewed Rust destruction effects for library types (#10980, #11050,
+  #11081, #11101, #11130).
+- Policy reports tie typestate results to individual acquisition sites,
+  including proven local absences and undecided sites in an inconclusive run
+  (#11125, #11241).
 
 ### Changed
 
@@ -313,6 +673,61 @@ projection and its commit history does not contain every source commit.
   for; unproven Go, Rust and Java closures stay inconclusive (#9550).
 - Partial procedure summaries apply their declared transfers but never prove
   absence (#9937).
+- Rust analysis keeps calls incomplete when argument conversion could run
+  user code. It can rule this out for supported generic method results,
+  operator results and formatting operands of the verified `log` crate
+  (#10848, #10954, #10957, #10955).
+- Source admission now accepts long lines of parser-identified data across
+  supported languages, so a long string literal alone need not exclude a
+  source file (#10724).
+- RQL queries identify what truncated their results. When a policy exhausts
+  its semantic budget, it retains findings from completed outputs and
+  reports which outputs stopped (#10805, #10688).
+- Taint policies retry only the outputs that hit their own resident memory
+  budget. Conditional sanitizers check calls within their owning procedure,
+  avoiding repeated binding work on other procedures in the file (#10859,
+  #10924, #10834).
+- Semantic models rank candidates within the queried language family, so
+  a pack for another language cannot hide a matching declaration. C#
+  lookups respect per-type and per-member completeness recorded by .NET
+  packs (#10721, #10809).
+- Policies retain possible flows from an external overload family when its
+  members share one owner and pack but its completeness is unproven. A
+  qualified locator for a language with no source files no longer prevents
+  an otherwise applicable policy from running (#10891, #10868).
+- Java reuses the workspace class hierarchy across calls to external types
+  in the same snapshot, avoiding repeated database reads when analyzing
+  virtual calls (#10682).
+- JVM dependency discovery verifies selected JDK modules and source archives
+  by content. On filesystems without trusted file identity, each selection
+  re-reads the archives (#10576, #10613).
+- Python workspaces without a declared interpreter version assume CPython
+  3.13.5 for standard-library models. Python type-flow queries now use
+  native type and definition answers, including for constructor calls
+  (#10519, #10653). Taint models also bind supported keyword calls that
+  skip an optional positional argument, such as `urlopen(url, timeout=5)`
+  (#10575).
+- Policy diagnostics name failed semantic-pack activation in `query_code`
+  and identify the gaps behind inconclusive typestate runs (#10520, #10522).
+  Findings that use a close-match Rust dependency model retain that
+  attribution (#10409).
+- A warm `run_policy` can use its previous evaluation as the base across
+  edits when no diff base is specified. Rust checks on a committed revision
+  now report the files actually omitted from the source listing (#10656,
+  #10680). Diff-based checks also distinguish uncommitted manifest and
+  lockfile edits from the committed baseline (#10634, #10646).
+- Incremental taint runs can reuse unaffected outputs when another output
+  needs recomputation. An abandoned attempt no longer consumes the fallback
+  run’s budget (#10481, #10584, #10657).
+- JavaScript misspelled-identifier checks use a policy pack's typo table and
+  skip intrinsic JSX tag names. A missing table yields incomplete coverage
+  (#10402, #10414).
+- Composed taint analysis can reuse findings and diagnostics from an unchanged
+  content-incomplete result. Edits to a dependency that determined a cached
+  call target invalidate its dependent results (#10283, #10475).
+- The MCP server answers `initialize` while open packs are still being
+  acquired, so a slow pack download no longer holds up the client
+  handshake (#11048).
 
 ### Fixed
 
@@ -421,6 +836,127 @@ projection and its commit history does not contain every source commit.
 - PHP builtin functions are complete callable families (#9337).
 - Kotlin parses comments before annotated constructors.
 - Go records channel direction in type identity (#7509).
+- C#, C++ and PHP usage searches visit files in path order, making capped
+  results reproducible (#10876). Java control-flow analysis excludes the
+  unreachable branch when a comparison can be decided from constant
+  `int` or `long` values (#10905).
+- TypeScript library selection explains why a tsconfig or its parent could
+  not be used, including cycles, unreadable files and read limits (#10779).
+- Batched definition and declaration lookups report incomplete reads only
+  on the affected lookup. An unrelated missing JAR no longer makes an
+  unshadowed, explicitly imported `java.*` JDK type incomplete (#10932, #10894).
+- Java model binding uses argument types to select the most specific
+  supported overload. The JDK source reader can certify complete callable
+  families, and Java usage searches find references to Scala classes
+  (#10755, #10839, #10902, #10875).
+- C# project analysis evaluates MSBuild property conditions in assignment
+  order and recognizes the Razor SDK’s default compile files. Generated
+  Razor sources can still be unknown. Search, definition and usage tools
+  report when a conditional branch has not been analyzed (#10825, #10897,
+  #10896, #10888).
+- Taint analysis follows nested reads after a store through a reference and
+  follows uncaught exceptions through intermediate calls. Typestate analysis
+  retains possible leaks when a call cannot be resolved (#10737, #10790,
+  #10826).
+- Go analysis distinguishes values copied into interface parameters from
+  arguments that retain their identity. A single refused source file no
+  longer discards the whole workspace graph (#10685, #10823).
+- Incremental Rust analysis invalidates affected cached answers when edits
+  can change trait implementations, import aliases or macro references
+  used by those answers (#10970).
+- Rust analysis reads crate names and target layouts from the manifests
+  selected for the snapshot. Rustdoc models retain methods whose owner is
+  declared in another document of the same source set (#10804, #10730,
+  #10830, #10945). Rust tail expressions now report gaps for individual unproven
+  values, so supported expressions can produce complete results (#10457).
+- Workspace updates recognize changed files supplied through an alias for
+  the project root. The watcher ignores writes to the configured workspace
+  pack catalog, and upgrading a populated pre-273 cache preserves the
+  existing index (#10722, #10706, #10857).
+- RQL configuration filters decode values according to the document format,
+  including TOML scalars, JSON primitives and XML CDATA. An undecodable
+  value now makes an absence check incomplete (#10668).
+- PHP taint analysis follows values through array literals and binds omitted
+  trailing arguments to supported defaults. Go taint analysis follows
+  elements stored in slice and map literals and preserves origins through
+  supported assignment conversions (#10549, #10677, #10573, #10577).
+- Java resolves overloaded external constructors when argument types select a
+  target. Scala and Kotlin definition lookup follows the receiver of a
+  member selection even when a local has the same name (#10558, #10506).
+- C# tracks member accesses through qualified types declared in the same
+  file when the type can be resolved unambiguously (#10625).
+- Rust treats a module path that matches a selected file only by letter case
+  as unresolved, avoiding false reports of a missing module (#10631).
+- Version-specific crates.io models activate only when Cargo lockfile evidence
+  selects one version. Go keeps calls in build-constrained files unresolved when
+  `go list` fails and file selection cannot be proven (#10608, #10675, #10622).
+- Value-flow analysis preserves alternatives that reach the same target in
+  one event. Composed taint analysis attaches modeled transformations to
+  the call that produces their result (#10592, #10599). Partial-flow queries
+  preserve truncation in stored results and distinguish an unproven return
+  member from a budget limit (#10488, #10546).
+- C# analysis returns a partial result when a struct copy exceeds the
+  32-slot limit, preserving the rest of the semantic analysis (#10395).
+- JVM analysis now limits declaration-specific warnings to queries that use
+  the affected declaration. Artifact-wide warnings still apply to the whole
+  query (#10388).
+- On Windows, the Ruby and JavaScript analyzers can reuse unchanged gem and
+  npm discovery results across edits when the paths are canonical (#10383).
+- Shared value-flow analysis preserves members of copied aggregates across
+  branch joins, allowing taint to flow through the returned value (#10196).
+- Capped taint policy runs retain findings from completed sink sites when a
+  later site exhausts the budget. Findings suppressed by `without-flow` no
+  longer consume the finding allowance (#10439).
+- Go analysis preserves supported result identities by position in typed
+  multi-result variable declarations. A written standard-library type with
+  no source or active model stays incomplete (#10287, #10452, #10474).
+- Python inheritance diagnostics recognize classes imported from external
+  modules, avoiding false definite failures for bases such as
+  `unittest.TestCase` (#10442).
+- Rust closure analysis preserves a tentative capture when a pattern name
+  shadows an import, avoiding a missing capture while retaining uncertainty
+  about the binding (#10471).
+- Java try-with-resources resolves an implicit `close()` against its
+  resource type. Java and Kotlin dispatch can find workspace overrides
+  through external intermediate supertypes, keeping known candidates when
+  part of the hierarchy is missing (#11054, #11245). Typestate analysis
+  can use supported Java instance methods with return values as protocol
+  summaries (#11044).
+- C# taint analysis can follow proven cross-file members and indexers.
+  Modeled calls can select an exact overload by argument type and bind
+  visible extension methods written in receiver form. Taint analysis also
+  follows supported property chains and typed locals whose types come from
+  a model or indexed assembly (#11038, #11058, #11075, #11115).
+- C# model lookup resolves nested external types through a visible
+  `using` directive (#11059). C# projects evaluate framework symbols per
+  target and preserve uncertainty for configuration-dependent symbols
+  when the build configuration is unknown (#11121, #11223).
+- Rust dependency lookup reads target-specific Cargo dependency tables and
+  honors the library name of a path dependency. On unpinned workspaces,
+  compatible toolchain-specific companion packs can use the same assumed
+  Rust version as the standard library (#10974, #11164).
+- Rust analysis can prove when `?` needs no user-defined error conversion
+  through generic type aliases and directly awaited async functions. It
+  also preserves values returned by labeled breaks and recognizes glob-
+  imported constants and unit structs in patterns (#11051, #11209, #10704,
+  #11039).
+- Rust policy queries can identify a method callee as declared when its
+  concrete receiver resolves uniquely. Policy evaluation also preserves a
+  proven qualifying-type match when another query branch is inconclusive
+  (#11214, #11146).
+- RQL row filters preserve uncertainty when an enum field has an undecided
+  value, avoiding a definite nonmatch on partial evidence (#11181).
+- Cache eviction no longer deadlocks when releasing an entry triggers
+  another eviction under the same retention budget. Reusing a cached
+  semantic result now checks the transient memory its computation required
+  (#11097, #11077).
+- Workspace updates preserve the listed spelling of files on
+  case-insensitive volumes and detect changes to ignored configuration
+  files the analyzer reads explicitly. Failed input synchronization is
+  reported as incomplete dependency evidence (#11191, #11239, #11028).
+- Rust tools report incomplete crate routing when it affects a result,
+  including when a local name shadows the `log` dependency (#10959, #11057,
+  #11142).
 
 ## [0.15.1] - 2026-11-03
 

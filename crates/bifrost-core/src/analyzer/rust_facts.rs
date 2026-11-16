@@ -74,6 +74,22 @@ pub enum RustCfgInstruction {
     Unknown,
 }
 
+impl RustVisibility {
+    /// Owned buffers for pure cache charges; source-admission estimates stay raw.
+    pub fn allocated_retained_bytes(&self) -> usize {
+        match self {
+            Self::InPath(segments) => {
+                crate::hash::allocated_vec_slot_bytes(segments)
+                    + segments
+                        .iter()
+                        .map(|s| crate::allocation_size::allocation_size(s.capacity()))
+                        .sum::<usize>()
+            }
+            _ => 0,
+        }
+    }
+}
+
 impl RustCfgCondition {
     pub fn instructions(&self) -> Vec<RustCfgInstruction> {
         match self {
@@ -110,16 +126,24 @@ impl RustCfgCondition {
     }
 
     pub fn estimated_retained_bytes(&self) -> usize {
+        self.retained_bytes_with(|bytes| bytes)
+    }
+
+    pub fn allocated_retained_bytes(&self) -> usize {
+        self.retained_bytes_with(crate::allocation_size::allocation_size)
+    }
+
+    fn retained_bytes_with(&self, allocation: fn(usize) -> usize) -> usize {
         match self {
-            Self::Atom(atom) | Self::NotAtom(atom) => atom.capacity(),
+            Self::Atom(atom) | Self::NotAtom(atom) => allocation(atom.capacity()),
             Self::Expression(instructions) => {
-                std::mem::size_of_val(instructions.as_ref())
+                allocation(std::mem::size_of_val(instructions.as_ref()))
                     + instructions
                         .iter()
                         .map(|instruction| match instruction {
-                            RustCfgInstruction::Atom(atom) => atom.capacity(),
+                            RustCfgInstruction::Atom(atom) => allocation(atom.capacity()),
                             RustCfgInstruction::KeyValue { key, value } => {
-                                key.capacity() + value.capacity()
+                                allocation(key.capacity()) + allocation(value.capacity())
                             }
                             _ => 0,
                         })
@@ -216,6 +240,10 @@ pub struct RustDeclarationPropertyFact {
     /// binders remain exact even when an attribute macro binds a name.
     /// NULL means this declaration has no conditional derive-helper names.
     pub derive_helper_attributes: Option<Vec<String>>,
+    /// The bare built-in derive names (`Clone`, `Default`, ..) when they are
+    /// this item's only generated surface; NULL otherwise (#11325). Crate
+    /// lookup must prove each name falls through to the prelude.
+    pub builtin_derives: Option<Vec<String>>,
     /// This declaration has a derive or attribute macro surface whose
     /// generated output the source producer does not expand.
     pub generated_surface: bool,
@@ -288,6 +316,34 @@ pub struct RustGenericArgumentsSourceFact {
 }
 
 impl RustTypeSourceFact {
+    /// Owned buffers for a pure cache; source-admission estimates remain raw.
+    pub fn allocated_retained_bytes(&self) -> usize {
+        use crate::allocation_size::allocation_size;
+        use crate::hash::allocated_vec_slot_bytes;
+        allocated_vec_slot_bytes(&self.wrappers)
+            + match &self.shape {
+                RustTypeSourceShape::Path { segments, .. } => {
+                    allocated_vec_slot_bytes(segments)
+                        + segments
+                            .iter()
+                            .map(|segment| {
+                                allocation_size(segment.name.capacity())
+                                    + segment
+                                        .generic_arguments
+                                        .as_ref()
+                                        .map_or(0, |a| allocated_vec_slot_bytes(&a.arguments))
+                            })
+                            .sum::<usize>()
+                }
+                RustTypeSourceShape::Compound { children, .. } => {
+                    allocated_vec_slot_bytes(children)
+                }
+                RustTypeSourceShape::Unsupported { syntax_kind, .. } => {
+                    allocation_size(syntax_kind.capacity())
+                }
+            }
+    }
+
     /// Heap bytes owned below the containing `Vec<RustTypeSourceFact>`. The
     /// containing vector accounts for each fact's inline `size_of` separately.
     pub fn estimated_retained_bytes(&self) -> usize {
@@ -340,6 +396,33 @@ impl RustDeclarationPropertyFact {
                 std::mem::size_of::<RustValueConstructorProperties>()
                     .saturating_add(constructor.estimated_retained_bytes())
             }))
+    }
+
+    /// Owned allocations for a pure cache, leaving source/admission censuses raw.
+    pub fn allocated_retained_bytes(&self) -> usize {
+        use crate::allocation_size::allocation_size;
+        let names = |values: &Option<Vec<String>>| {
+            values.as_ref().map_or(0, |values| {
+                crate::hash::allocated_vec_slot_bytes(values)
+                    + values
+                        .iter()
+                        .map(|s| allocation_size(s.capacity()))
+                        .sum::<usize>()
+            })
+        };
+        self.visibility.allocated_retained_bytes()
+            + self.cfg_condition.allocated_retained_bytes()
+            + self.value_constructor.as_deref().map_or(0, |constructor| {
+                allocation_size(std::mem::size_of::<RustValueConstructorProperties>())
+                    + crate::hash::allocated_vec_slot_bytes(&constructor.field_visibilities)
+                    + constructor
+                        .field_visibilities
+                        .iter()
+                        .map(RustVisibility::allocated_retained_bytes)
+                        .sum::<usize>()
+            })
+            + names(&self.derive_helper_attributes)
+            + names(&self.builtin_derives)
     }
 }
 
@@ -425,6 +508,7 @@ pub fn decode_rust_cfg_condition(encoded: &str) -> Option<RustCfgCondition> {
 /// expanded to a `mod` declaration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RustRulesItemMacroDefinition {
+    pub cfg_condition: RustCfgCondition,
     pub declaration: SourceDeclarationId,
     pub name: String,
     /// Materialized from the canonical declaration occurrence on readback.
@@ -1030,6 +1114,48 @@ pub struct RustModuleRouteFacts {
 }
 
 impl RustModuleRouteFacts {
+    /// Owned buffers of the cached materialized route facts.
+    pub fn allocated_retained_bytes(&self) -> usize {
+        use crate::allocation_size::allocation_size;
+        use crate::hash::allocated_vec_slot_bytes;
+        let string = |s: &String| allocation_size(s.capacity());
+        allocated_vec_slot_bytes(&self.scopes)
+            + self
+                .scopes
+                .iter()
+                .map(|s| {
+                    string(&s.module_name)
+                        + s.path_attribute.as_ref().map_or(0, string)
+                        + s.visibility.allocated_retained_bytes()
+                })
+                .sum::<usize>()
+            + allocated_vec_slot_bytes(&self.routes)
+            + self
+                .routes
+                .iter()
+                .map(|r| {
+                    string(&r.module_name)
+                        + r.path_attribute.as_ref().map_or(0, string)
+                        + r.visibility.allocated_retained_bytes()
+                        + r.cfg_condition.allocated_retained_bytes()
+                        + allocated_vec_slot_bytes(&r.gates)
+                        + r.gates.iter().map(|g| string(&g.macro_name)).sum::<usize>()
+                })
+                .sum::<usize>()
+            + allocated_vec_slot_bytes(&self.item_macros)
+            + self
+                .item_macros
+                .iter()
+                .map(|m| {
+                    string(&m.name)
+                        + m.cfg_condition.allocated_retained_bytes()
+                        + m.decoration
+                            .as_ref()
+                            .map_or(0, RustCfgCondition::allocated_retained_bytes)
+                })
+                .sum::<usize>()
+    }
+
     /// The file's own byte extent, recorded on the root scope.
     ///
     /// `None` only for facts that were never extracted, which the route index
@@ -1510,6 +1636,57 @@ pub struct RustMacroInvocationInputSourceFact {
     pub tree: RustMacroTokenTree,
 }
 
+impl RustMacroInvocationInputSourceFact {
+    /// Full allocation charge for a pure cache. The trait implementation below
+    /// stays raw because source-admission censuses also use it.
+    pub fn allocated_retained_bytes(&self) -> usize {
+        use crate::allocation_size::allocation_size;
+        use crate::hash::allocated_vec_slot_bytes;
+        std::mem::size_of_val(self)
+            + self
+                .macro_name
+                .as_ref()
+                .map_or(0, |s| allocation_size(s.capacity()))
+            + self.cfg_condition.allocated_retained_bytes()
+            + allocated_vec_slot_bytes(&self.occurrences)
+            + allocation_size(self.tree.source.capacity())
+            + allocated_vec_slot_bytes(&self.tree.tokens)
+            + self
+                .tree
+                .tokens
+                .iter()
+                .map(|t| allocation_size(t.syntax_kind.capacity()))
+                .sum::<usize>()
+    }
+}
+
+impl crate::retention_budget::RetainedBytes for RustMacroInvocationInputSourceFact {
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of_val(self)
+            .saturating_add(self.macro_name.as_ref().map_or(0, String::capacity))
+            .saturating_add(self.cfg_condition.estimated_retained_bytes())
+            .saturating_add(
+                self.occurrences
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<SourceOccurrenceId>()),
+            )
+            .saturating_add(self.tree.source.capacity())
+            .saturating_add(
+                self.tree
+                    .tokens
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<RustMacroInputToken>()),
+            )
+            .saturating_add(
+                self.tree
+                    .tokens
+                    .iter()
+                    .map(|token| token.syntax_kind.capacity())
+                    .fold(0usize, usize::saturating_add),
+            )
+    }
+}
+
 /// An immutable AST snapshot of invocation input. Byte ranges stay in the
 /// original source; the one retained text slice begins at `start_byte`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1580,31 +1757,9 @@ impl RustItemSourceFacts {
                 self.macro_inputs
                     .iter()
                     .map(|input| {
-                        input
-                            .tree
-                            .source
-                            .capacity()
-                            .saturating_add(input.cfg_condition.estimated_retained_bytes())
-                            .saturating_add(
-                                input
-                                    .occurrences
-                                    .capacity()
-                                    .saturating_mul(std::mem::size_of::<SourceOccurrenceId>()),
-                            )
-                            .saturating_add(
-                                input
-                                    .tree
-                                    .tokens
-                                    .capacity()
-                                    .saturating_mul(std::mem::size_of::<RustMacroInputToken>()),
-                            )
-                            .saturating_add(
-                                input
-                                    .tree
-                                    .tokens
-                                    .iter()
-                                    .map(|token| token.syntax_kind.capacity())
-                                    .fold(0usize, usize::saturating_add),
+                        crate::retention_budget::RetainedBytes::retained_bytes(input)
+                            .saturating_sub(
+                                std::mem::size_of::<RustMacroInvocationInputSourceFact>(),
                             )
                     })
                     .fold(0usize, usize::saturating_add),

@@ -246,7 +246,7 @@ def run(code):
 
 | Kind | Grammar node types |
 | --- | --- |
-| `call` | `method_invocation`, `method_reference`, `object_creation_expression` |
+| `call` | `method_invocation`, `method_reference`, `object_creation_expression`, `explicit_constructor_invocation` |
 | `resource_release` | `try_with_resources_statement` |
 | `field_access` | `field_access` |
 | `method` | `method_declaration` |
@@ -274,7 +274,7 @@ def run(code):
 
 A `variable_declarator` becomes an `assignment` fact only when it has a value.
 
-Roles: the `name` field of `method_invocation` is the `callee`, the `object` field is the `receiver`, and the `arguments` field supplies positional `args`. `object_creation_expression` uses its `type` field as the call target. `import_declaration` carries a `module` role. `annotation` and `marker_annotation` nodes under modifiers become `decorators`. Java has no keyword arguments.
+Roles: the `name` field of `method_invocation` is the `callee`, the `object` field is the `receiver`, and the `arguments` field supplies positional `args`. `object_creation_expression` uses its `type` field as the call target. For an `explicit_constructor_invocation` the `this` or `super` keyword is the `callee`; the qualifier of `outer.super(...)` has no role. `import_declaration` carries a `module` role. `annotation` and `marker_annotation` nodes under modifiers become `decorators`. Java has no keyword arguments.
 
 Toy shape:
 
@@ -569,7 +569,7 @@ object App {
 
 | Kind | Grammar node types |
 | --- | --- |
-| `call` | `invocation_expression`, `object_creation_expression` |
+| `call` | `invocation_expression`, `object_creation_expression`, `implicit_object_creation_expression`, `constructor_initializer` |
 | `field_access` | `member_access_expression`, `conditional_access_expression` (only when it has a member binding) |
 | `function` | `local_function_statement` |
 | `method` | `method_declaration` |
@@ -597,7 +597,7 @@ object App {
 
 A namespace is a `module` fact named by the last segment of a qualified namespace name. A `switch` statement is an `if` fact. A `variable_declarator` becomes an `assignment` fact only when it has a value.
 
-Roles: invocation `function` targets and object-creation `type` targets are the `callee`. Member and conditional access targets provide `receiver`, `object`, and `field`. Arguments are positional `args` or named `kwargs`. Attributes are `decorators`, and `using` aliases are import `module` names.
+Roles: invocation `function` targets and object-creation `type` targets are the `callee`. For a `constructor_initializer` the `base` or `this` keyword is the `callee`. Member and conditional access targets provide `receiver`, `object`, and `field`. Arguments are positional `args` or named `kwargs`. Attributes are `decorators`, and `using` aliases are import `module` names.
 
 Toy shape:
 

@@ -1,11 +1,29 @@
 //! Cargo-only preparation for persisted crate derivation. All state is request-local.
 use super::*;
+use std::collections::HashSet;
 
 #[derive(Clone, Debug)]
 pub struct RustCrateDependency {
     pub extern_name: String,
     pub kind: RustCargoDependencyKind,
     pub manifest_path: Option<PathBuf>,
+}
+
+/// A local dev edge omitted to keep the target graph acyclic. This affects
+/// only test-cfg lookups that need this extern name, never target completeness.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DevDependencyCycleEdgeDropped {
+    pub from_manifest: PathBuf,
+    pub to_manifest: PathBuf,
+    pub extern_name: String,
+}
+
+/// Discovery's independent feature output for one directly consumed package.
+#[derive(Clone, Debug)]
+pub struct RustFeatureActivation {
+    pub manifest_path: PathBuf,
+    pub features: BTreeSet<String>,
+    pub complete: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -17,7 +35,12 @@ pub struct RustCrateTarget {
     pub edition: RustCargoEdition,
     pub cfg_atoms: BTreeSet<String>,
     pub features: BTreeSet<String>,
+    /// Whether discovery established the feature activation independently of target inventory.
+    pub features_complete: bool,
+    pub feature_projection: Vec<RustFeatureActivation>,
+    pub configuration_directory: PathBuf,
     pub dependencies: Vec<RustCrateDependency>,
+    pub dropped_dev_dependencies: Vec<DevDependencyCycleEdgeDropped>,
     pub inventory_complete: bool,
     pub inventory_error: Option<String>,
 }
@@ -28,7 +51,7 @@ pub struct RustCrateTarget {
 /// `configuration` is the workspace's Cargo configuration files. Each target
 /// takes the cfg set and patches of the levels its Cargo workspace root reads.
 /// Placement describes one fixed build per workspace: `cargo tree --workspace`
-/// with default features and every target kind (including tests, examples
+/// with all member features and every target kind (including tests, examples
 /// and benches). `default-members` does not narrow it. Normal and development
 /// requests unify; resolver-2 host build/proc-macro requests resolve separately.
 /// The target platform is Cargo configuration's `build.target` when it is set
@@ -51,27 +74,18 @@ pub fn rust_crate_targets(
         manifests,
     )?;
     let inventory = rust_selected_workspace_profiles_from_prepared(&input)?;
-    // Cargo's own dependency lookup, `[patch]` and workspace inheritance
-    // included, reads manifests by package directory.
-    let cargo_manifests = input
-        .manifests
-        .values()
-        .map(|manifest| {
-            (
-                manifest
-                    .relative_path
-                    .parent()
-                    .unwrap_or(Path::new(""))
-                    .to_path_buf(),
-                manifest.document.clone(),
-            )
-        })
-        .collect::<CargoHashMap<_, _>>();
+    let source_paths = input.sources.keys().cloned().collect();
+    // Share the directory index with feature placement and all context folds.
+    let cargo_manifests = super::target_discovery::cargo_manifest_documents(&input.manifests);
+    let discovery_complete = super::broad_discovery::manifest_discovery_completeness(
+        &input.manifests,
+        &source_paths,
+        configuration,
+        &cargo_manifests,
+    );
     let features = fixed_build_features(&input.manifests, &cargo_manifests, configuration)?;
     let mut targets = Vec::new();
     let mut seen = BTreeSet::new();
-    let mut cfg_atoms_by_workspace =
-        BTreeMap::<(PathBuf, FeaturePlatform), BTreeSet<String>>::new();
     for profile in inventory.profiles {
         if !seen.insert((
             profile.manifest_path.clone(),
@@ -148,47 +162,13 @@ pub fn rust_crate_targets(
                 }
             })
         };
-        let mut dependencies: Vec<_> = manifest
-            .facts
-            .dependencies
-            .iter()
-            .filter(|dependency| {
-                dependency_available(dependency.kind, kind, kind != RustCallerTargetKind::Build)
-            })
-            .map(|fact| {
-                let manifest_path = dependency_manifest(
-                    &profile.manifest_path,
-                    fact,
-                    &input.manifests,
-                    &cargo_manifests,
-                    configuration,
-                );
-                let renamed = crate::cargo_routes::effective_cargo_dependency(
-                    Path::new(""),
-                    profile.manifest_path.parent().unwrap_or(Path::new("")),
-                    &manifest.document,
-                    &fact.manifest_name,
-                    fact.source_value(&manifest.document),
-                    &cargo_manifests,
-                )
-                .is_some_and(|(value, _)| value.contains_key("package"));
-                let extern_name = if renamed {
-                    None
-                } else {
-                    manifest_path
-                        .as_ref()
-                        .and_then(|path| input.manifests.get(path))
-                        .and_then(|manifest| manifest.facts.package.as_ref())
-                        .map(|package| package.library_name.clone())
-                }
-                .unwrap_or_else(|| fact.exposed_name.clone());
-                RustCrateDependency {
-                    extern_name,
-                    kind: fact.kind,
-                    manifest_path,
-                }
-            })
-            .collect();
+        let mut dependencies = configuration_dependencies(
+            &profile.manifest_path,
+            kind,
+            &input.manifests,
+            &cargo_manifests,
+            configuration,
+        );
         if same_package_library_root(&profile, package, &input.sources)?.is_some() {
             dependencies.push(RustCrateDependency {
                 extern_name: package.library_name.clone(),
@@ -211,32 +191,33 @@ pub fn rust_crate_targets(
         // Rows are keyed by extern name. Normal sorts before development and
         // already grants every non-build target that can use the dev route.
         dependencies.dedup_by(|left, right| left.extern_name == right.extern_name);
-        // Cargo reads its configuration from where the workspace build runs.
-        let manifest_directory = profile.manifest_path.parent().unwrap_or(Path::new(""));
-        let workspace = cargo_workspace_manifest_directory(
-            Path::new(""),
-            manifest_directory,
-            &manifest.document,
+        let (cfg_atoms, configuration_directory) = configuration_atoms(
+            &profile.manifest_path,
+            kind,
+            &input.manifests,
             &cargo_manifests,
-        )
-        .unwrap_or_else(|| manifest_directory.to_path_buf());
-        let mut cfg_atoms = cfg_atoms_by_workspace
-            .entry((
-                workspace,
-                if kind == RustCallerTargetKind::Build {
-                    FeaturePlatform::Host
-                } else {
-                    manifest_feature_platform(&manifest.document)
-                },
-            ))
-            .or_insert_with_key(|(workspace, platform)| match platform {
-                FeaturePlatform::Host => configuration.host_cfg_atoms(workspace),
-                FeaturePlatform::Target => configuration.cfg_atoms(workspace),
+            configuration,
+            &features,
+        );
+        // Only direct activations belong here. Further effects flow through
+        // the direct dependency's consumed summary output, with early cutoff.
+        let mut projected_paths = BTreeSet::from([profile.manifest_path.clone()]);
+        projected_paths.extend(
+            dependencies
+                .iter()
+                .filter_map(|dependency| dependency.manifest_path.clone()),
+        );
+        let feature_projection = projected_paths
+            .into_iter()
+            .map(|path| {
+                let activation = &features[&path];
+                RustFeatureActivation {
+                    manifest_path: path,
+                    features: activation.enabled.clone(),
+                    complete: activation.complete,
+                }
             })
-            .clone();
-        if !features[&profile.manifest_path].complete {
-            cfg_atoms.insert(crate::cfg::INCOMPLETE_FEATURES_ATOM.to_string());
-        }
+            .collect();
         targets.push(RustCrateTarget {
             root_path: normalize_selected_path(
                 profile.manifest_path.parent().unwrap_or(Path::new("")),
@@ -249,17 +230,295 @@ pub fn rust_crate_targets(
             edition,
             cfg_atoms,
             features: features[&profile.manifest_path].enabled.clone(),
+            features_complete: features[&profile.manifest_path].complete,
+            feature_projection,
+            configuration_directory,
             dependencies,
+            dropped_dev_dependencies: Vec::new(),
             inventory_error: (!conflicts.is_empty())
                 .then(|| format!("conflicting target-specific destinations for {conflicts:?}")),
             inventory_complete: conflicts.is_empty()
-                && inventory.target_inventory_complete
-                && features[&profile.manifest_path].complete,
+                && discovery_complete[&profile.manifest_path]
+                && features[&profile.manifest_path].inventory_complete,
         });
     }
+    reject_cyclic_dev_dependencies(&mut targets, &input.manifests);
     Ok(targets)
 }
 
+/// Configuration facts for an already selected target. This does not discover targets or read sources.
+#[derive(Clone, Debug)]
+pub struct RustTargetConfiguration {
+    pub cfg_atoms: BTreeSet<String>,
+    pub features: BTreeSet<String>,
+    pub edition: RustCargoEdition,
+    pub extern_names: BTreeSet<String>,
+    pub rustflags_extern: bool,
+    pub complete: bool,
+}
+
+fn reject_cyclic_dev_dependencies(
+    targets: &mut [RustCrateTarget],
+    manifests: &BTreeMap<PathBuf, RustSelectedManifestMount>,
+) {
+    let libraries: std::collections::HashMap<_, _> = targets
+        .iter()
+        .enumerate()
+        .filter(|(_, target)| target.kind == RustCallerTargetKind::Library)
+        .map(|(id, target)| (target.manifest_path.clone(), id))
+        .collect();
+    let mut edges = vec![Vec::new(); targets.len()];
+    let mut development = Vec::new();
+    for (owner, target) in targets.iter().enumerate() {
+        for (ordinal, dependency) in target.dependencies.iter().enumerate() {
+            let Some(to) = dependency
+                .manifest_path
+                .as_ref()
+                .and_then(|path| libraries.get(path))
+                .copied()
+            else {
+                continue;
+            };
+            if dependency.kind == RustCargoDependencyKind::Development {
+                development.push((owner, ordinal, to));
+            } else {
+                edges[owner].push(to);
+            }
+        }
+    }
+    // Cargo package identity, then target identity and extern name, determine
+    // which dev edge is retained. Neither discovery nor hash iteration decides.
+    development.sort_by(
+        |&(left, left_edge, left_to), &(right, right_edge, right_to)| {
+            let identity = |id: usize| {
+                let target = &targets[id];
+                (
+                    &target.manifest_path,
+                    &manifests[&target.manifest_path]
+                        .facts
+                        .package
+                        .as_ref()
+                        .expect("target owns a package")
+                        .package_name,
+                    &target.name,
+                    target.kind,
+                    &target.root_path,
+                )
+            };
+            (
+                identity(left),
+                identity(left_to),
+                &targets[left].dependencies[left_edge].extern_name,
+            )
+                .cmp(&(
+                    identity(right),
+                    identity(right_to),
+                    &targets[right].dependencies[right_edge].extern_name,
+                ))
+        },
+    );
+    let mut dropped = HashSet::new();
+    for (owner, ordinal, to) in development {
+        let mut stack = vec![to];
+        let mut seen = HashSet::new();
+        let mut cyclic = false;
+        while let Some(next) = stack.pop() {
+            if next == owner {
+                cyclic = true;
+                break;
+            }
+            if seen.insert(next) {
+                stack.extend(edges[next].iter().copied());
+            }
+        }
+        if cyclic {
+            targets[owner]
+                .dropped_dev_dependencies
+                .push(DevDependencyCycleEdgeDropped {
+                    from_manifest: targets[owner].manifest_path.clone(),
+                    to_manifest: targets[to].manifest_path.clone(),
+                    extern_name: targets[owner].dependencies[ordinal].extern_name.clone(),
+                });
+            dropped.insert((owner, ordinal));
+        } else {
+            edges[owner].push(to);
+        }
+    }
+    for (owner, target) in targets.iter_mut().enumerate() {
+        let mut ordinal = 0;
+        target.dependencies.retain(|_| {
+            let keep = !dropped.contains(&(owner, ordinal));
+            ordinal += 1;
+            keep
+        });
+    }
+}
+
+pub fn rust_target_configuration(
+    manifest_path: &Path,
+    kind: RustCallerTargetKind,
+    manifests: Vec<RustSelectedManifestMount>,
+    configuration: &RustCargoConfiguration,
+) -> Result<RustTargetConfiguration, String> {
+    let manifests = manifests
+        .into_iter()
+        .map(|m| (m.relative_path.clone(), m))
+        .collect::<BTreeMap<_, _>>();
+    if !manifests.contains_key(manifest_path) {
+        return Err(format!("missing manifest {manifest_path:?}"));
+    }
+    let cargo_manifests = manifests
+        .values()
+        .map(|m| {
+            (
+                m.relative_path
+                    .parent()
+                    .unwrap_or(Path::new(""))
+                    .to_path_buf(),
+                m.document.clone(),
+            )
+        })
+        .collect::<CargoHashMap<_, _>>();
+    let features = fixed_build_features(&manifests, &cargo_manifests, configuration)?;
+    let (cfg_atoms, workspace) = configuration_atoms(
+        manifest_path,
+        kind,
+        &manifests,
+        &cargo_manifests,
+        configuration,
+        &features,
+    );
+    let RustSelectedBuildOutcome::Ready(edition) =
+        effective_cargo_edition(manifest_path, &manifests, &mut |_| true)?
+    else {
+        unreachable!()
+    };
+    let mut extern_names: BTreeSet<_> = configuration_dependencies(
+        manifest_path,
+        kind,
+        &manifests,
+        &cargo_manifests,
+        configuration,
+    )
+    .into_iter()
+    .map(|d| d.extern_name)
+    .collect();
+    // The parsed package fact owns Cargo's [lib].name / normalized package-name
+    // rule, also used above by the membership-proved same-package library edge.
+    // Configuration cannot discover src/lib.rs, so every non-library target
+    // conservatively treats that name as a potential extern.
+    if kind != RustCallerTargetKind::Library {
+        let package = manifests[manifest_path]
+            .facts
+            .package
+            .as_ref()
+            .ok_or_else(|| format!("target manifest has no package: {manifest_path:?}"))?;
+        extern_names.insert(package.library_name.clone());
+    }
+    Ok(RustTargetConfiguration {
+        cfg_atoms: merge_rust_configuration_atoms(&cfg_atoms, &features[manifest_path].enabled),
+        features: features[manifest_path].enabled.clone(),
+        edition,
+        extern_names,
+        rustflags_extern: configuration.has_extern_rustflags(&workspace),
+        complete: features[manifest_path].inventory_complete,
+    })
+}
+
+/// The same feature-atom encoding used by persisted crate contexts.
+pub fn merge_rust_configuration_atoms(
+    cfg: &BTreeSet<String>,
+    features: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut atoms = cfg.clone();
+    atoms.extend(
+        features
+            .iter()
+            .map(|feature| format!("feature = {feature:?}")),
+    );
+    atoms
+}
+
+fn configuration_atoms(
+    manifest_path: &Path,
+    kind: RustCallerTargetKind,
+    manifests: &BTreeMap<PathBuf, RustSelectedManifestMount>,
+    cargo_manifests: &CargoHashMap<PathBuf, RustCargoManifestDocument>,
+    configuration: &RustCargoConfiguration,
+    features: &BTreeMap<PathBuf, BuildFeatures>,
+) -> (BTreeSet<String>, PathBuf) {
+    let manifest = &manifests[manifest_path];
+    let directory = manifest_path.parent().unwrap_or(Path::new(""));
+    let workspace = cargo_workspace_manifest_directory(
+        Path::new(""),
+        directory,
+        &manifest.document,
+        cargo_manifests,
+    )
+    .unwrap_or_else(|| directory.to_path_buf());
+    let mut atoms = if kind == RustCallerTargetKind::Build
+        || manifest_feature_platform(&manifest.document) == FeaturePlatform::Host
+    {
+        configuration.host_cfg_atoms(&workspace)
+    } else {
+        configuration.cfg_atoms(&workspace)
+    };
+    if !features[manifest_path].complete {
+        atoms.insert(crate::cfg::INCOMPLETE_FEATURES_ATOM.to_string());
+    }
+    (atoms, workspace)
+}
+
+fn configuration_dependencies(
+    manifest_path: &Path,
+    kind: RustCallerTargetKind,
+    manifests: &BTreeMap<PathBuf, RustSelectedManifestMount>,
+    cargo_manifests: &CargoHashMap<PathBuf, RustCargoManifestDocument>,
+    configuration: &RustCargoConfiguration,
+) -> Vec<RustCrateDependency> {
+    let manifest = &manifests[manifest_path];
+    manifest
+        .facts
+        .dependencies
+        .iter()
+        .filter(|dependency| {
+            dependency_available(dependency.kind, kind, kind != RustCallerTargetKind::Build)
+        })
+        .map(|fact| {
+            let dependency_path = dependency_manifest(
+                manifest_path,
+                fact,
+                manifests,
+                cargo_manifests,
+                configuration,
+            );
+            let renamed = crate::cargo_routes::effective_cargo_dependency(
+                Path::new(""),
+                manifest_path.parent().unwrap_or(Path::new("")),
+                &manifest.document,
+                &fact.manifest_name,
+                fact.source_value(&manifest.document),
+                cargo_manifests,
+            )
+            .is_some_and(|(value, _)| value.contains_key("package"));
+            let extern_name = if renamed {
+                None
+            } else {
+                dependency_path
+                    .as_ref()
+                    .and_then(|path| manifests.get(path))
+                    .and_then(|manifest| manifest.facts.package.as_ref())
+                    .map(|package| package.library_name.clone())
+            }
+            .unwrap_or_else(|| fact.exposed_name.clone());
+            RustCrateDependency {
+                extern_name,
+                kind: fact.kind,
+                manifest_path: dependency_path,
+            }
+        })
+        .collect()
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum FeaturePlatform {
     Target,
@@ -289,14 +548,38 @@ struct FeatureUnit {
 struct BuildFeatures {
     enabled: BTreeSet<String>,
     complete: bool,
+    inventory_complete: bool,
 }
 
-// One inventory request owns these maps. No activation graph survives it.
-fn fixed_build_features(
+// Shared by parsed member discovery and expected-but-unparsed identities.
+pub(super) fn workspace_member_pattern_matches(
+    workspace: &Path,
+    member: &Path,
+    directory: &Path,
+) -> bool {
+    normalize_selected_path(workspace, member).is_none_or(|member| {
+        member == directory
+            || member.to_str().is_none_or(|pattern| {
+                glob::Pattern::new(pattern).map_or(true, |pattern| {
+                    pattern.matches_path_with(
+                        directory,
+                        glob::MatchOptions {
+                            require_literal_separator: true,
+                            ..Default::default()
+                        },
+                    )
+                })
+            })
+    })
+}
+
+// Shared Cargo workspace membership, including optional path dependencies and
+// exclusions. Discovery must use the same membership as feature unification.
+pub(super) fn workspace_member_manifests(
     manifests: &BTreeMap<PathBuf, RustSelectedManifestMount>,
     cargo_manifests: &CargoHashMap<PathBuf, RustCargoManifestDocument>,
     configuration: &RustCargoConfiguration,
-) -> Result<BTreeMap<PathBuf, BuildFeatures>, String> {
+) -> BTreeMap<PathBuf, BTreeSet<PathBuf>> {
     use crate::cargo_routes::cargo_dependency_tables_with_kind;
     let mut roots = BTreeMap::<PathBuf, BTreeSet<PathBuf>>::new();
     for (path, manifest) in manifests.iter().filter(|(_, m)| m.facts.package.is_some()) {
@@ -325,22 +608,7 @@ fn fixed_build_features(
                 .facts
                 .workspace_members
                 .iter()
-                .any(|member| {
-                    normalize_selected_path(&workspace, member).is_some_and(|member| {
-                        member == directory
-                            || member.to_str().is_some_and(|pattern| {
-                                glob::Pattern::new(pattern).is_ok_and(|pattern| {
-                                    pattern.matches_path_with(
-                                        directory,
-                                        glob::MatchOptions {
-                                            require_literal_separator: true,
-                                            ..Default::default()
-                                        },
-                                    )
-                                })
-                            })
-                    })
-                });
+                .any(|member| workspace_member_pattern_matches(&workspace, member, directory));
         if member {
             roots.entry(workspace).or_default().insert(path.clone());
         }
@@ -387,20 +655,54 @@ fn fixed_build_features(
             }
         }
     }
+    roots
+}
+
+fn dependency_feature_suppressed(feature_table: Option<&toml::Table>, dependency: &str) -> bool {
+    feature_table.is_some_and(|table| {
+        table
+            .values()
+            .filter_map(toml::Value::as_array)
+            .flatten()
+            .any(|value| value.as_str() == Some(&format!("dep:{dependency}")))
+    })
+}
+
+// One inventory request owns these maps. No activation graph survives it.
+fn fixed_build_features(
+    manifests: &BTreeMap<PathBuf, RustSelectedManifestMount>,
+    cargo_manifests: &CargoHashMap<PathBuf, RustCargoManifestDocument>,
+    configuration: &RustCargoConfiguration,
+) -> Result<BTreeMap<PathBuf, BuildFeatures>, String> {
+    use crate::cargo_routes::cargo_dependency_tables_with_kind;
+    let roots = workspace_member_manifests(manifests, cargo_manifests, configuration);
     let mut results = BTreeMap::<PathBuf, Vec<BuildFeatures>>::new();
+    let mut member_features = BTreeMap::new();
     for (workspace, members) in roots {
         let platform = |path: &Path| manifest_feature_platform(&manifests[path].document);
         let mut units = BTreeMap::<(PathBuf, FeaturePlatform), FeatureUnit>::new();
         for path in &members {
             let unit = units.entry((path.clone(), platform(path))).or_default();
-            if manifests[path]
-                .document
-                .get("features")
-                .and_then(|table| table.get("default"))
-                .is_some()
-            {
-                unit.enabled.insert("default".to_string());
+            let manifest = &manifests[path].document;
+            let feature_table = manifest.get("features").and_then(toml::Value::as_table);
+            unit.enabled.extend(
+                feature_table
+                    .into_iter()
+                    .flat_map(|table| table.keys())
+                    .cloned(),
+            );
+            // Cargo's optional dependency names are features unless dep:name
+            // explicitly suppresses them anywhere in the feature table.
+            for (_, _, dependencies) in cargo_dependency_tables_with_kind(manifest) {
+                for (name, raw) in dependencies {
+                    if raw.get("optional").and_then(toml::Value::as_bool) == Some(true)
+                        && !dependency_feature_suppressed(feature_table, name)
+                    {
+                        unit.enabled.insert(name.clone());
+                    }
+                }
             }
+            member_features.insert(path.clone(), unit.enabled.clone());
         }
         let mut complete = true;
         loop {
@@ -429,15 +731,8 @@ fn fixed_build_features(
                                 let dependency = dependency.trim_end_matches('?');
                                 if !weak {
                                     enabled_dependencies.insert(dependency.to_string());
-                                    let suppressed = feature_table.is_some_and(|table| {
-                                        table
-                                            .values()
-                                            .filter_map(toml::Value::as_array)
-                                            .flatten()
-                                            .any(|value| {
-                                                value.as_str() == Some(&format!("dep:{dependency}"))
-                                            })
-                                    });
+                                    let suppressed =
+                                        dependency_feature_suppressed(feature_table, dependency);
                                     let optional =
                                         cargo_dependency_tables_with_kind(&manifest.document)
                                             .iter()
@@ -484,7 +779,7 @@ fn fixed_build_features(
                         if kind == crate::cargo_routes::RustCargoDependencyKind::Build
                             || *context == FeaturePlatform::Host
                         {
-                            crate::cargo_config::host_dependency_predicate(predicate)
+                            configuration.host_dependency_predicate(predicate)
                         } else {
                             configuration.dependency_predicate(&workspace, predicate)
                         }
@@ -620,6 +915,7 @@ fn fixed_build_features(
             results.entry(path).or_default().push(BuildFeatures {
                 enabled: unit.enabled,
                 complete,
+                inventory_complete: complete,
             });
         }
     }
@@ -637,12 +933,27 @@ fn fixed_build_features(
                 && configurations
                     .iter()
                     .all(|features| features.complete && features.enabled == enabled);
-            (path.clone(), BuildFeatures { enabled, complete })
+            // A member's all-features selection certifies its own feature
+            // universe even when an outgoing dependency is missing. Preserve
+            // the separate topology incompleteness and host/target disagreement.
+            let inventory_complete = complete;
+            let (enabled, complete) = member_features
+                .remove(path)
+                .map(|enabled| (enabled, true))
+                .unwrap_or((enabled, complete));
+            (
+                path.clone(),
+                BuildFeatures {
+                    enabled,
+                    complete,
+                    inventory_complete,
+                },
+            )
         })
         .collect())
 }
 
-fn inventory_dependency_manifest(
+pub(super) fn inventory_dependency_manifest(
     path: &Path,
     name: &str,
     value: &toml::Value,
@@ -690,7 +1001,41 @@ fn dependency_manifest(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11825: scoped operations refused configuration-only derivations as UnprovedStage"
+    )]
+    fn configuration_bin_includes_same_package_library_extern() {
+        let manifest = RustSelectedManifestMount::from_source(
+            "Cargo.toml",
+            "[package]\nname = \"library-name\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let configuration = RustCargoConfiguration::default();
+        let targets = rust_crate_targets(
+            [
+                (PathBuf::from("src/lib.rs"), Oid::zero()),
+                (PathBuf::from("src/main.rs"), Oid::zero()),
+            ],
+            vec![manifest.clone()],
+            &configuration,
+        )
+        .unwrap();
+        let binary = targets
+            .iter()
+            .find(|target| target.kind == RustCallerTargetKind::Binary)
+            .unwrap();
+        let facts = rust_target_configuration(
+            &binary.manifest_path,
+            binary.kind,
+            vec![manifest],
+            &configuration,
+        )
+        .unwrap();
+        assert!(facts.extern_names.contains("library_name"));
+    }
     use super::*;
+    use brokk_bifrost_core::analyzer::rust_facts::RustCfgInstruction;
     use brokk_bifrost_test_macros::hardwon;
 
     /// A registry dependency that the workspace manifest patches to a member
@@ -835,13 +1180,21 @@ mod tests {
             ),
         ] {
             let optional = label != "nonoptional edge";
+            // Dev requests belong to workspace members. Other cases exercise
+            // request-driven dependency features rather than all-features roots.
+            let workspace = if extra.is_empty() {
+                "[workspace]\nresolver=\"2\"\nmembers=[\"driver\"]\nexclude=[\"a\",\"b\"]\n"
+            } else {
+                "[workspace]\nresolver=\"2\"\nmembers=[\"a\"]\nexclude=[\"driver\",\"b\"]\n"
+            };
             let manifests = vec![
-                RustSelectedManifestMount::from_source("Cargo.toml", "[workspace]\nresolver=\"2\"\nmembers=[\"a\",\"b\"]\ndefault-members=[\"a\"]\n").unwrap(),
+                RustSelectedManifestMount::from_source("Cargo.toml", workspace).unwrap(),
+                RustSelectedManifestMount::from_source("driver/Cargo.toml", "[package]\nname=\"driver\"\nedition=\"2021\"\n[dependencies]\na={path=\"../a\"}\n").unwrap(),
                 RustSelectedManifestMount::from_source("a/Cargo.toml", &format!("[package]\nname=\"a\"\nedition=\"2021\"\n[dependencies]\nb={{path=\"../b\",optional={optional}}}\n[features]\n{a_features}\n{extra}\n")).unwrap(),
                 RustSelectedManifestMount::from_source("b/Cargo.toml", "[package]\nname=\"b\"\nedition=\"2021\"\n[features]\non=[]\nother=[]\n").unwrap(),
             ];
             let targets = rust_crate_targets(
-                ["a/src/lib.rs", "b/src/lib.rs"]
+                ["driver/src/lib.rs", "a/src/lib.rs", "b/src/lib.rs"]
                     .into_iter()
                     .map(|p| (PathBuf::from(p), Oid::zero())),
                 manifests,
@@ -854,7 +1207,7 @@ mod tests {
                 expected_b,
                 "{label}: {targets:?}"
             );
-            assert!(b.inventory_complete, "{label}: {targets:?}");
+            assert_eq!(b.inventory_complete, expected_b, "{label}: {targets:?}");
             if label == "normal edge" {
                 assert!(b.features.contains("other"), "{targets:?}");
             }
@@ -875,12 +1228,12 @@ mod tests {
     fn crate_inventory_fixed_build_activation_boundaries() {
         for (label, dependency, b_features, b_library, expected, complete) in [
             (
-                "excluded optional",
+                "optional activated by all features",
                 "[dependencies]\nb={path=\"../b\",optional=true}",
                 "default=[\"on\"]\non=[]",
                 "",
-                false,
-                false,
+                true,
+                true,
             ),
             (
                 "excluded enabled without defaults",
@@ -1038,6 +1391,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(targets.len(), 4);
+        // Acyclic dev edges remain available even in the merged library unit.
+        assert!(
+            targets
+                .iter()
+                .all(|target| target.dropped_dev_dependencies.is_empty())
+        );
         for target in targets
             .iter()
             .filter(|target| target.manifest_path == Path::new("a/Cargo.toml"))
@@ -1127,6 +1486,177 @@ mod tests {
     }
 
     #[test]
+    fn crate_inventory_all_features_survives_missing_dependency() {
+        let manifests = vec![RustSelectedManifestMount::from_source(
+            "Cargo.toml",
+            "[package]\nname=\"root\"\nedition=\"2021\"\n[dependencies]\nmissing=\"1\"\noptional_dep={version=\"1\",optional=true}\nsecret={version=\"1\",optional=true}\n[features]\nleft=[]\nright=[]\nsuppressed=[\"dep:secret\"]\n",
+        ).unwrap()];
+        let targets = rust_crate_targets(
+            [(PathBuf::from("src/lib.rs"), Oid::zero())],
+            manifests,
+            &RustCargoConfiguration::default(),
+        )
+        .unwrap();
+        let root = targets.iter().find(|target| target.name == "root").unwrap();
+        assert_eq!(
+            root.features,
+            BTreeSet::from([
+                "left".into(),
+                "right".into(),
+                "suppressed".into(),
+                "optional_dep".into(),
+            ])
+        );
+        assert!(
+            !root.inventory_complete,
+            "missing dependency inventory: {root:?}"
+        );
+        assert!(
+            !root
+                .cfg_atoms
+                .contains(crate::cfg::INCOMPLETE_FEATURES_ATOM)
+        );
+        let atoms = merge_rust_configuration_atoms(&root.cfg_atoms, &root.features);
+        assert_eq!(
+            crate::cfg::crate_activation(
+                &atoms,
+                &RustCfgCondition::Atom("feature = \"absent\"".into())
+            ),
+            RustSelectedActivation::Inactive
+        );
+        assert_eq!(
+            crate::cfg::crate_activation(&atoms, &RustCfgCondition::Atom("loom".into())),
+            RustSelectedActivation::Unknown
+        );
+    }
+
+    /// #12748: an unknown Cargo configuration acquisition must not turn
+    /// `cfg(test)` or `cfg(debug_assertions)` into certain falsehoods. An atom
+    /// is unknown there exactly when its known derivation reads configuration.
+    /// The known derivation gives `test` and `debug_assertions` to every
+    /// non-build, non-host target (a lib target included), so the unknown
+    /// derivation must agree target by target.
+    #[test]
+    #[hardwon(
+        "#12748: unknown Cargo configuration acquisition made cfg(test) certainly inactive in every target"
+    )]
+    fn unknown_acquisition_keeps_configuration_free_atoms_and_unknowns_the_rest() {
+        let manifest = RustSelectedManifestMount::from_source(
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        let targets = |configuration: &RustCargoConfiguration| {
+            rust_crate_targets(
+                ["src/lib.rs", "tests/x.rs"]
+                    .into_iter()
+                    .map(|path| (PathBuf::from(path), Oid::zero())),
+                vec![manifest.clone()],
+                configuration,
+            )
+            .unwrap()
+        };
+        let known = targets(&RustCargoConfiguration::default());
+        let unknown = targets(&RustCargoConfiguration::unknown_acquired());
+        let activation = |atoms: &BTreeSet<String>, condition: &RustCfgCondition| {
+            crate::cfg::crate_activation(atoms, condition)
+        };
+        let atom_condition = |atom: &str| RustCfgCondition::Atom(atom.to_string());
+        let target_os_condition = |value: &str| {
+            RustCfgCondition::Expression(
+                vec![RustCfgInstruction::KeyValue {
+                    key: "target_os".into(),
+                    value: value.into(),
+                }]
+                .into_boxed_slice(),
+            )
+        };
+        // A target value is a KeyValue predicate; as a bare atom it is
+        // Unknown outside the host whose value it names.
+        let (host_os, _) =
+            crate::cargo_config::builtin_target_platform(crate::cargo_config::host_target_triple())
+                .expect("the host triple is a built-in target");
+        let other_os = if host_os == "linux" { "macos" } else { "linux" };
+        for kind in [RustCallerTargetKind::Library, RustCallerTargetKind::Test] {
+            let known = known.iter().find(|target| target.kind == kind).unwrap();
+            let unknown = unknown.iter().find(|target| target.kind == kind).unwrap();
+            for atom in ["test", "debug_assertions"] {
+                assert_eq!(
+                    activation(&known.cfg_atoms, &atom_condition(atom)),
+                    RustSelectedActivation::Active
+                );
+                assert_eq!(
+                    activation(&unknown.cfg_atoms, &atom_condition(atom)),
+                    activation(&known.cfg_atoms, &atom_condition(atom)),
+                    "{kind:?} {atom}: {:?}",
+                    unknown.cfg_atoms
+                );
+            }
+            // The known derivation reads build.target to describe the target,
+            // so the unknown one cannot say what the target is.
+            for atom in ["unix", "windows"] {
+                assert_ne!(
+                    activation(&known.cfg_atoms, &atom_condition(atom)),
+                    RustSelectedActivation::Unknown,
+                    "{atom}"
+                );
+                assert_eq!(
+                    activation(&unknown.cfg_atoms, &atom_condition(atom)),
+                    RustSelectedActivation::Unknown,
+                    "{kind:?} {atom}: {:?}",
+                    unknown.cfg_atoms
+                );
+            }
+            assert_eq!(
+                activation(&known.cfg_atoms, &target_os_condition(host_os)),
+                RustSelectedActivation::Active,
+                "host target_os = {host_os:?}: {:?}",
+                known.cfg_atoms
+            );
+            assert_eq!(
+                activation(&known.cfg_atoms, &target_os_condition(other_os)),
+                RustSelectedActivation::Inactive,
+                "other target_os = {other_os:?}: {:?}",
+                known.cfg_atoms
+            );
+            for value in [host_os, other_os] {
+                assert_eq!(
+                    activation(&unknown.cfg_atoms, &target_os_condition(value)),
+                    RustSelectedActivation::Unknown,
+                    "{kind:?} target_os = {value:?}: {:?}",
+                    unknown.cfg_atoms
+                );
+            }
+            // Feature atoms stay unproven: the marker is in the unknown set.
+            assert!(
+                unknown
+                    .cfg_atoms
+                    .contains(crate::cfg::INCOMPLETE_FEATURES_ATOM)
+            );
+            // A `--cfg` rustflag reaches the known set only through
+            // configuration, so the unknown set cannot say it is false.
+            let flagged = RustCargoConfiguration::from_files([(
+                PathBuf::from(".cargo/config.toml"),
+                crate::cargo_config::RustCargoConfigDocument::from_source_bytes(
+                    b"[build]\nrustflags = [\"--cfg\", \"from_rustflags\"]\n",
+                )
+                .unwrap(),
+            )]);
+            let flagged = targets(&flagged);
+            let flagged = flagged.iter().find(|target| target.kind == kind).unwrap();
+            assert_eq!(
+                activation(&flagged.cfg_atoms, &atom_condition("from_rustflags")),
+                RustSelectedActivation::Active
+            );
+            assert_eq!(
+                activation(&unknown.cfg_atoms, &atom_condition("from_rustflags")),
+                RustSelectedActivation::Unknown
+            );
+        }
+        assert_eq!(known.len(), unknown.len());
+    }
+
+    #[test]
     fn crate_inventory_unifies_features_and_has_one_row_per_target() {
         let manifests = vec![
             RustSelectedManifestMount::from_source("Cargo.toml", "[workspace]\nmembers = [\"a\", \"b\"]\n").unwrap(),
@@ -1165,5 +1695,108 @@ mod tests {
             ])
         );
         assert!(b.cfg_atoms.contains("test"));
+    }
+    #[test]
+    #[hardwon(
+        "#12358: legal dev-dependency cycles forced library crates incomplete and made every Rust route partial"
+    )]
+    fn dev_cycles_drop_canonical_edges_without_losing_test_target_dependencies() {
+        let package = |name: &str, dependencies: &str| {
+            RustSelectedManifestMount::from_source(
+                format!("{name}/Cargo.toml"),
+                &format!(
+                    "[package]\nname={name:?}\nversion=\"0.1.0\"\nedition=\"2021\"\n{dependencies}"
+                ),
+            )
+            .unwrap()
+        };
+        let manifests = vec![
+            RustSelectedManifestMount::from_source(
+                "Cargo.toml",
+                "[workspace]\nmembers=[\"a\",\"b\",\"c\"]\n",
+            )
+            .unwrap(),
+            package(
+                "a",
+                "[dev-dependencies]\nb={path=\"../b\"}\nc={path=\"../c\"}\n",
+            ),
+            package("b", "[dependencies]\na={path=\"../a\"}\n"),
+            package(
+                "c",
+                "[dev-dependencies]\na={path=\"../a\"}\nb={path=\"../b\"}\n",
+            ),
+        ];
+        let paths = [
+            "a/src/lib.rs",
+            "a/tests/check.rs",
+            "b/src/lib.rs",
+            "c/src/lib.rs",
+        ];
+        let inventory = |manifests| {
+            rust_crate_targets(
+                paths.iter().map(|path| (PathBuf::from(path), Oid::zero())),
+                manifests,
+                &RustCargoConfiguration::default(),
+            )
+            .unwrap()
+        };
+        let first = inventory(manifests.clone());
+        let mut reversed = manifests;
+        reversed.reverse();
+        let second = inventory(reversed);
+        let normalized = |targets: &[RustCrateTarget]| {
+            let mut dropped = targets
+                .iter()
+                .flat_map(|target| {
+                    target.dropped_dev_dependencies.iter().map(|gap| {
+                        (
+                            gap.from_manifest.clone(),
+                            gap.to_manifest.clone(),
+                            gap.extern_name.clone(),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            dropped.sort();
+            dropped
+        };
+        assert_eq!(normalized(&first), normalized(&second));
+        assert_eq!(
+            normalized(&first),
+            vec![
+                (
+                    PathBuf::from("a/Cargo.toml"),
+                    PathBuf::from("b/Cargo.toml"),
+                    "b".into()
+                ),
+                (
+                    PathBuf::from("c/Cargo.toml"),
+                    PathBuf::from("a/Cargo.toml"),
+                    "a".into()
+                ),
+                (
+                    PathBuf::from("c/Cargo.toml"),
+                    PathBuf::from("b/Cargo.toml"),
+                    "b".into()
+                )
+            ]
+        );
+        assert!(first.iter().all(|target| target.inventory_complete));
+        let test = first
+            .iter()
+            .find(|target| target.kind == RustCallerTargetKind::Test)
+            .unwrap();
+        assert!(
+            test.dependencies
+                .iter()
+                .any(|dependency| dependency.extern_name == "b")
+        );
+        assert!(test.dropped_dev_dependencies.is_empty());
+        let b = first.iter().find(|target| target.name == "b").unwrap();
+        assert!(
+            b.dependencies
+                .iter()
+                .any(|dependency| dependency.extern_name == "a")
+        );
     }
 }

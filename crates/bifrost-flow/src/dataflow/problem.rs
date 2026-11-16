@@ -4,7 +4,8 @@ use std::hash::Hash;
 
 use crate::analyzer::semantic::{
     CallSiteHandle, CallTransfer, DispatchBoundaryKind, EvidenceCompleteness, IcfgEdgeId,
-    IcfgEdgeKind, IcfgNodeId, IcfgSnapshot, OracleCallContext, ProgramPointHandle, ProofStatus,
+    IcfgEdgeKind, IcfgNodeId, IcfgSnapshot, OracleCallContext, ProcedureIcfgEdge,
+    ProgramPointHandle, ProofStatus,
 };
 use brokk_bifrost_core::analyzer::dense_id::define_dense_id;
 
@@ -76,6 +77,24 @@ pub struct DataflowEdge<'graph, Fact = ()> {
     summary_entry_fact: Option<Fact>,
     call_context: Option<&'graph OracleCallContext>,
     snapshot_edge: Option<IcfgEdgeId>,
+}
+
+/// A monitored call observation stays in the caller rather than entering the callee.
+pub(crate) fn call_observation_edge(
+    point: &ProgramPointHandle,
+    origin: &CallSiteHandle,
+    proof: &ProofStatus,
+    completeness: &EvidenceCompleteness,
+) -> ProcedureIcfgEdge {
+    ProcedureIcfgEdge {
+        source: point.clone(),
+        target: point.clone(),
+        kind: IcfgEdgeKind::CallToNormalContinuation,
+        origin: Some(origin.clone()),
+        proof: proof.clone(),
+        completeness: completeness.clone(),
+        boundary: None,
+    }
 }
 
 impl<'graph, Fact> DataflowEdge<'graph, Fact> {

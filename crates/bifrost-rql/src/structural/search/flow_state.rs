@@ -19,6 +19,7 @@ use super::super::flow_state::{
     flow_state_for_materialized_artifact_with_provider,
     flow_state_for_materialized_procedure_with_provider, flow_state_for_selected_property,
 };
+use super::EXECUTION_DEPENDENT;
 use super::Incompleteness;
 use super::results::{
     CodeQueryBindingInitializerCall, CodeQueryDiagnostic, CodeQueryDiagnosticCode,
@@ -37,6 +38,7 @@ use crate::analyzer::{IAnalyzer, Language, ProjectFile, WorkspaceAnalyzer};
 use crate::cancellation::CancellationToken;
 use crate::hash::HashMap;
 use brokk_bifrost_analysis::analyzer::workspace_authority::{CaptureScopedMemo, memo_attribution};
+use brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict;
 use brokk_bifrost_rql::{FlowRelationFilter, StateEventFilter};
 use std::sync::Arc;
 
@@ -55,6 +57,9 @@ pub(super) struct FlowStateTraversalCache<'a> {
     files: CaptureScopedMemo<HashMap<FlowStateCacheKey, CachedFileFlowState>>,
     nonreturn_provider: Option<WorkspaceIcfgProvider<'a>>,
     nonreturn_discovery_cache: NonreturnDiscoveryCache,
+    /// The execution dependences marked while deriving flow state; the query
+    /// joins it into its reuse verdict.
+    pub(super) reuse: ReuseVerdict,
 }
 
 #[derive(Clone)]
@@ -77,7 +82,10 @@ struct FlowStateCacheKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum FlowStateCacheScope {
     File,
-    Procedure(ProcedureId),
+    Procedure(
+        ProcedureId,
+        crate::analyzer::semantic::ProcedureInterpretation,
+    ),
 }
 
 /// The parts of a semantic outcome that shape flow-state completeness.
@@ -155,6 +163,7 @@ impl<'a> FlowStateTraversalCache<'a> {
             files: CaptureScopedMemo::default(),
             nonreturn_provider: None,
             nonreturn_discovery_cache: NonreturnDiscoveryCache::default(),
+            reuse: ReuseVerdict::Content,
         }
     }
 
@@ -261,7 +270,7 @@ impl<'a> FlowStateTraversalCache<'a> {
             workspace.analyzer(),
             file,
             outcome,
-            FlowStateCacheScope::Procedure(procedure.id()),
+            FlowStateCacheScope::Procedure(procedure.id(), procedure.interpretation()),
             cancellation,
             |outcome, request, provider| {
                 flow_state_for_materialized_procedure_with_provider(
@@ -285,12 +294,17 @@ impl<'a> FlowStateTraversalCache<'a> {
         let state =
             self.for_materialized_procedure(workspace, file, outcome, procedure, cancellation);
         let token = cancellation.cloned().unwrap_or_default();
-        let mut request = FlowStateRequest::new(&token)
-            .with_nonreturn_discovery_cache(&self.nonreturn_discovery_cache)
-            .with_active_semantic_model_snapshot(
-                self.active_semantic_model_snapshot
-                    .read(&memo_attribution(workspace.analyzer()), Clone::clone),
-            );
+        let mut request = FlowStateRequest::new(
+            &token,
+            brokk_bifrost_flow::flow_state::FlowStateRequestMemos::new(
+                workspace.retention_budget(),
+            ),
+        )
+        .with_nonreturn_discovery_cache(&self.nonreturn_discovery_cache)
+        .with_active_semantic_model_snapshot(
+            self.active_semantic_model_snapshot
+                .read(&memo_attribution(workspace.analyzer()), Clone::clone),
+        );
         let derived = Arc::new(flow_state_for_selected_property(
             workspace,
             file,
@@ -301,6 +315,7 @@ impl<'a> FlowStateTraversalCache<'a> {
         ));
         if request.refusal_count() > 0 {
             workspace.analyzer().mark_execution_dependent();
+            self.reuse.join_in(EXECUTION_DEPENDENT);
         }
         derived
     }
@@ -352,12 +367,17 @@ impl<'a> FlowStateTraversalCache<'a> {
                     .read(&memo_attribution(analyzer), Clone::clone),
             )
         });
-        let mut request = FlowStateRequest::new(&token)
-            .with_nonreturn_discovery_cache(&self.nonreturn_discovery_cache)
-            .with_active_semantic_model_snapshot(
-                self.active_semantic_model_snapshot
-                    .read(&memo_attribution(analyzer), Clone::clone),
-            );
+        let mut request = FlowStateRequest::new(
+            &token,
+            brokk_bifrost_flow::flow_state::FlowStateRequestMemos::new(
+                workspace.retention_budget(),
+            ),
+        )
+        .with_nonreturn_discovery_cache(&self.nonreturn_discovery_cache)
+        .with_active_semantic_model_snapshot(
+            self.active_semantic_model_snapshot
+                .read(&memo_attribution(analyzer), Clone::clone),
+        );
         let derived = Arc::new(derive(outcome, &mut request, provider));
         if request.refusal_count() > 0 {
             brokk_bifrost_core::profiling::note_with(|| {
@@ -368,6 +388,7 @@ impl<'a> FlowStateTraversalCache<'a> {
                 )
             });
             analyzer.mark_execution_dependent();
+            self.reuse.join_in(EXECUTION_DEPENDENT);
         }
         self.files.read_mut(&memo_attribution(analyzer), |files| {
             files.insert(
@@ -436,6 +457,10 @@ impl<'a> FlowStateTraversalCache<'a> {
                 .map(|axis| axis.label())
                 .collect::<Vec<_>>();
             diagnostics.push(super::QueryExecutionState::diagnostic(analyzer, CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                 incompleteness: match cause { Some(cause) => Incompleteness::Operational(cause), None => Incompleteness::Content },
                 related,
                 source,
@@ -605,7 +630,7 @@ fn property_execution_cause(
         CandidateCoverage(crate::analyzer::semantic::CandidateCoverage::Truncated) => {
             Some(DerivationExecutionCause::Budget)
         }
-        SelectedSemanticGap { gap }
+        SelectedSemanticGap { gap } | SelectedCleanupMemberGap { gap, .. }
             if gap.kind == crate::analyzer::semantic::SemanticGapKind::ExceededBudget =>
         {
             Some(DerivationExecutionCause::Budget)
@@ -625,6 +650,7 @@ fn property_execution_cause(
         | SelectedAncestorStore { .. }
         | SelectedAliasClosureUnavailable { .. }
         | SelectedSemanticGap { .. }
+        | SelectedCleanupMemberGap { .. }
         | CandidateCoverage(_)
         | UnsupportedLocation { .. }
         | DurableIdentityUnavailable { .. }

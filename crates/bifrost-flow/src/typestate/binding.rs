@@ -11,8 +11,8 @@ use crate::analyzer::semantic::{
     AbstractObject, AccessPathRoot, CallSiteHandle, CandidateCoverage, ControlEdgeKind,
     DeclarationLocator, DurableCallContext, DurableObjectIdentity, DurablePortIdentity,
     DurableValueIdentity, EvidenceCompleteness, ObjectCardinality, OracleCallContext,
-    ProcedureHandle, ProcedureId, ProgramPointHandle, ProofStatus, SemanticArtifact,
-    SemanticArtifactKey, SemanticLocator, SourceAnchor,
+    ProcedureHandle, ProgramPointHandle, ProofStatus, SemanticArtifact, SemanticArtifactKey,
+    SemanticLocator, SourceAnchor,
 };
 use brokk_bifrost_core::analyzer::dense_id::define_dense_id;
 
@@ -204,6 +204,54 @@ impl TypestateSubjectKey {
             &canonical_subject_key(self),
             "canonical typestate subject identities are serializable",
         )
+    }
+
+    /// The subject identity a policy finding id hashes, and whether it omitted
+    /// a runtime object's refinement identity.
+    ///
+    /// It is [`Self::public_canonical_rendering`] without the refinement
+    /// identity of any runtime object. That digest folds the procedure
+    /// artifact's public fingerprint, which a cache-identity lever token
+    /// rotates with no change to the code, and the read's byte range, so a
+    /// finding id that kept it would change across an engine upgrade or an
+    /// edit above the read (#12029). The refinement told distinct
+    /// acquisitions apart; when it is omitted, the caller names the
+    /// acquisition observation by its position-free site key instead.
+    pub fn finding_identity_rendering(&self) -> (String, bool) {
+        let mut key = canonical_subject_key(self);
+        let omitted = omit_refinement_identities(&mut key.object);
+        (
+            canonical_json(
+                &key,
+                "canonical typestate subject identities are serializable",
+            ),
+            omitted,
+        )
+    }
+}
+
+/// Clear the refinement identity of every runtime object in `key`, and say
+/// whether there was one.
+fn omit_refinement_identities(mut key: &mut CanonicalObjectKey<'_>) -> bool {
+    loop {
+        match key {
+            CanonicalObjectKey::FieldPath { base, .. }
+            | CanonicalObjectKey::CallSubstitution { base, .. } => key = base,
+            CanonicalObjectKey::RuntimeObject {
+                refinement_identity,
+                ..
+            } => return refinement_identity.take().is_some(),
+            CanonicalObjectKey::Value { .. }
+            | CanonicalObjectKey::CallResult { .. }
+            | CanonicalObjectKey::ProcedurePort { .. }
+            | CanonicalObjectKey::Allocation { .. }
+            | CanonicalObjectKey::Static { .. }
+            | CanonicalObjectKey::LexicalCell { .. }
+            | CanonicalObjectKey::CaptureSlot { .. }
+            | CanonicalObjectKey::TypeSummary { .. }
+            | CanonicalObjectKey::ModuleObject { .. }
+            | CanonicalObjectKey::External { .. } => return false,
+        }
     }
 }
 
@@ -582,7 +630,7 @@ pub enum TypestateEventPort {
 pub struct TypestateSelectedOperand {
     call: CallSiteHandle,
     port: TypestateEventPort,
-    selected_target: Option<(SemanticArtifactKey, ProcedureId)>,
+    selected_target: Option<crate::analyzer::semantic::DurableProcedureKey>,
 }
 
 impl TypestateSelectedOperand {
@@ -594,12 +642,15 @@ impl TypestateSelectedOperand {
         }
     }
 
-    pub fn with_selected_target(mut self, target: (SemanticArtifactKey, ProcedureId)) -> Self {
+    pub fn with_selected_target(
+        mut self,
+        target: crate::analyzer::semantic::DurableProcedureKey,
+    ) -> Self {
         self.selected_target = Some(target);
         self
     }
 
-    pub fn selected_target(&self) -> Option<&(SemanticArtifactKey, ProcedureId)> {
+    pub fn selected_target(&self) -> Option<&crate::analyzer::semantic::DurableProcedureKey> {
         self.selected_target.as_ref()
     }
 
@@ -1415,30 +1466,26 @@ impl TypestateBindingPlan {
             });
         }
 
+        // Open and exhaustive evidence at one observation remain distinct
+        // groups. Canonicalize their contents before the group key so visit
+        // order cannot change binding identity; do not coalesce the evidence.
+        for group in &mut coverage_candidate_groups {
+            group.candidates.sort_by_cached_key(|candidate| {
+                canonical_json(
+                    &canonical_coverage_candidate(candidate),
+                    "coverage candidate is serializable",
+                )
+            });
+        }
         coverage_candidate_groups.sort_by_cached_key(|group| {
             canonical_json(
-                &(
-                    canonical_subject_key(&group.subject),
-                    canonical_site(&group.site),
-                    group.phase,
-                ),
+                &canonical_coverage_candidate_group(group),
                 "coverage candidate group key is serializable",
             )
         });
         let compiled_coverage_groups = coverage_candidate_groups
-            .iter_mut()
+            .iter()
             .map(|group| {
-                group.candidates.sort_by_cached_key(|candidate| {
-                    canonical_json(
-                        &(
-                            &candidate.event,
-                            &candidate.semantic_effect,
-                            candidate.alias_derived,
-                            canonical_quality(&candidate.quality),
-                        ),
-                        "coverage candidate is serializable",
-                    )
-                });
                 Ok(CoverageCandidateGroup {
                     subject: subject_id(&subject_ids, &group.subject)?,
                     site: group.site.clone(),
@@ -1523,21 +1570,7 @@ impl TypestateBindingPlan {
             event_set: event_set.as_ref(),
             coverage_candidate_groups: coverage_candidate_groups
                 .iter()
-                .map(|group| CanonicalCoverageCandidateGroup {
-                    subject: canonical_subject_key(&group.subject),
-                    site: canonical_site(&group.site),
-                    phase: group.phase,
-                    candidates: group
-                        .candidates
-                        .iter()
-                        .map(|candidate| CanonicalCoverageCandidate {
-                            event: &candidate.event,
-                            semantic_effect: candidate.semantic_effect.as_deref(),
-                            quality: canonical_quality(&candidate.quality),
-                            alias_derived: candidate.alias_derived,
-                        })
-                        .collect(),
-                })
+                .map(canonical_coverage_candidate_group)
                 .collect(),
             coverage_decisions: coverage_decisions
                 .iter()
@@ -1646,6 +1679,31 @@ impl TypestateBindingPlan {
             summary_hashes,
             empty_summary_hash,
         })
+    }
+
+    /// The full pre-solve domain of possible finding-primary sites. Templates
+    /// are subject-specific before solving; no root, context, quality or call
+    /// closure filter is admissible here. This bounds the sealed production
+    /// pipeline's locations, not event discovery or real-world findings.
+    pub fn finding_primary_sites(
+        &self,
+    ) -> impl Iterator<Item = (TypestateSubjectId, &SemanticLocator)> {
+        self.event_bindings
+            .iter()
+            .chain(self.event_templates.iter())
+            .map(|event| (event.subject(), event.site().identity()))
+            .chain(
+                self.terminal_bindings
+                    .iter()
+                    .map(|terminal| (terminal.subject(), terminal.site().identity())),
+            )
+            .chain(self.unproven_relations.iter().map(|relation| {
+                (
+                    self.subject_id(&relation.subject)
+                        .expect("compiled relation names a bound subject"),
+                    relation.site.identity(),
+                )
+            }))
     }
 
     pub fn subjects(&self) -> &[BoundTypestateSubject] {
@@ -3239,7 +3297,10 @@ enum CanonicalObjectKey<'a> {
         exposure_id: &'a str,
         container_member: &'a str,
         state_boundary: &'a str,
-        refinement_identity: crate::analyzer::semantic::StableDigest,
+        /// Always present in the public rendering; omitted only by
+        /// [`TypestateSubjectKey::finding_identity_rendering`].
+        #[serde(skip_serializing_if = "Option::is_none")]
+        refinement_identity: Option<crate::analyzer::semantic::StableDigest>,
         active_model_set_hash: &'a str,
         manifest_digest: &'a str,
         shard_id: &'a str,
@@ -3323,6 +3384,7 @@ struct CanonicalSelectedOperand<'a> {
 struct CanonicalSelectedTarget {
     artifact: String,
     procedure: u32,
+    interpretation: crate::analyzer::semantic::ProcedureInterpretation,
 }
 
 fn canonical_selected_operand(
@@ -3334,16 +3396,42 @@ fn canonical_selected_operand(
         .map(|operand| CanonicalSelectedOperand {
             call: canonical_site(&binding.site),
             port: operand.port,
-            selected_target: operand
-                .selected_target
-                .as_ref()
-                .map(|(artifact, procedure)| CanonicalSelectedTarget {
+            selected_target: operand.selected_target.as_ref().map(
+                |(artifact, procedure, interpretation)| CanonicalSelectedTarget {
                     // Checkout-independent: a diff base evaluated from another mount
                     // must produce the same plan identity for the same content.
                     artifact: artifact.public_fingerprint().to_string(),
                     procedure: procedure.get(),
-                }),
+                    interpretation: *interpretation,
+                },
+            ),
         })
+}
+
+fn canonical_coverage_candidate(
+    candidate: &CoverageCandidateSpec,
+) -> CanonicalCoverageCandidate<'_> {
+    CanonicalCoverageCandidate {
+        event: &candidate.event,
+        semantic_effect: candidate.semantic_effect.as_deref(),
+        quality: canonical_quality(&candidate.quality),
+        alias_derived: candidate.alias_derived,
+    }
+}
+
+fn canonical_coverage_candidate_group(
+    group: &CoverageCandidateGroupSpec,
+) -> CanonicalCoverageCandidateGroup<'_> {
+    CanonicalCoverageCandidateGroup {
+        subject: canonical_subject_key(&group.subject),
+        site: canonical_site(&group.site),
+        phase: group.phase,
+        candidates: group
+            .candidates
+            .iter()
+            .map(canonical_coverage_candidate)
+            .collect(),
+    }
 }
 
 #[derive(Serialize)]
@@ -3611,7 +3699,7 @@ fn canonical_object_key(key: &TypestateObjectKey) -> CanonicalObjectKey<'_> {
             exposure_id,
             container_member,
             state_boundary,
-            refinement_identity: *refinement_identity,
+            refinement_identity: Some(*refinement_identity),
             active_model_set_hash,
             manifest_digest,
             shard_id,
@@ -3797,6 +3885,182 @@ mod tests {
     use brokk_bifrost_test_macros::hardwon;
 
     use super::*;
+
+    #[test]
+    fn canonical_selected_target_retains_each_body_interpretation() {
+        use crate::analyzer::semantic::ProcedureInterpretation;
+        let mut encodings = Vec::new();
+        for interpretation in [
+            ProcedureInterpretation::Base,
+            ProcedureInterpretation::CandidateAlternate,
+            ProcedureInterpretation::ExecutableAlternate,
+        ] {
+            let target = CanonicalSelectedTarget {
+                artifact: "same-selected-artifact".to_owned(),
+                procedure: 0,
+                interpretation,
+            };
+            let encoded = serde_json::to_value(target).unwrap();
+            assert!(
+                !encodings.contains(&encoded),
+                "a selected body must not alias another target"
+            );
+            encodings.push(encoded);
+        }
+        assert_eq!(encodings.len(), 3);
+    }
+
+    #[test]
+    #[hardwon(
+        "#12029: a typestate finding id hashed a runtime object's refinement identity, which folds the lever-scoped artifact fingerprint"
+    )]
+    fn runtime_object_finding_rendering_omits_only_the_refinement_identity() {
+        let span = source_anchor(0, 10, 0);
+        let member = SemanticLocator::new(
+            WorkspaceMountId::hash_bytes(b"/tmp/workspace"),
+            WorkspaceRelativePath::new("res.go").expect("path"),
+            SemanticLanguage::Standard(Language::Go),
+            DeclarationLocator::new(vec![
+                DeclarationSegment::named(DeclarationSegmentKind::File, "res.go", span, 0)
+                    .expect("file segment"),
+            ])
+            .expect("declaration"),
+            SemanticRole::Procedure,
+            span,
+        );
+        let runtime_object = |refinement: &[u8]| TypestateSubjectKey {
+            class: TypestateSubjectClassKey::new("connection").unwrap(),
+            object: TypestateObjectKey::FieldPath {
+                base: Box::new(TypestateObjectKey::RuntimeObject {
+                    runtime_profile_digest: "profile".to_owned(),
+                    realm: "realm".to_owned(),
+                    exposure_id: "exposure".to_owned(),
+                    container_member: "member".to_owned(),
+                    state_boundary: "boundary".to_owned(),
+                    refinement_identity: crate::analyzer::semantic::ids::StableDigest::sha256(
+                        refinement,
+                    ),
+                    active_model_set_hash: "models".to_owned(),
+                    manifest_digest: "manifest".to_owned(),
+                    shard_id: "shard".to_owned(),
+                    behavior_id: "behavior".to_owned(),
+                    activation_source: "source".to_owned(),
+                }),
+                member: member.clone(),
+            },
+        };
+        // A lever rotation changes the refinement identity and nothing else.
+        let before = runtime_object(b"before-rotation");
+        let after = runtime_object(b"after-rotation");
+        assert_ne!(
+            before.public_canonical_rendering(),
+            after.public_canonical_rendering(),
+            "the public rendering keeps the refinement identity"
+        );
+        let (rendering, omitted) = before.finding_identity_rendering();
+        assert!(omitted);
+        assert!(!rendering.contains("refinement_identity"), "{rendering}");
+        assert!(rendering.contains("exposure"), "{rendering}");
+        assert_eq!(after.finding_identity_rendering(), (rendering, true));
+    }
+
+    #[test]
+    #[hardwon("#11577: tied coverage groups changed binding identity with input order")]
+    fn tied_coverage_groups_have_canonical_binding_identity() {
+        use crate::analyzer::semantic::{CancellationToken, SemanticBudget, SemanticRequest};
+        let project = crate::inline_project::InlineTestProject::with_language(Language::Rust)
+            .file("main.rs", "pub fn root() { let value = 1; }")
+            .build();
+        let workspace = project.workspace_analyzer(Default::default());
+        let cancellation = CancellationToken::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &project.file("main.rs"),
+                &mut SemanticRequest::new(&mut SemanticBudget::default(), &cancellation),
+            )
+            .unwrap()
+            .available_value()
+            .cloned()
+            .unwrap();
+        let procedure = artifact
+            .procedure_handle(artifact.procedures()[0].id())
+            .unwrap();
+        let site = TypestateObservationSite::program_point(
+            procedure
+                .point_handle(procedure.semantics().entry_point())
+                .unwrap(),
+            TypestateBindingContext::root(),
+        );
+        let subject = BoundTypestateSubjectSpec::new(
+            "resource".parse().unwrap(),
+            AbstractObject::new(
+                AccessPathRoot::Value(
+                    procedure
+                        .value_handle(procedure.semantics().values()[0].id)
+                        .unwrap(),
+                ),
+                ObjectCardinality::Singleton,
+            )
+            .unwrap(),
+            TypestateBindingQuality::proven_unique(),
+        );
+        let protocol = super::super::ProtocolSpec::from_json(
+            br#"{
+            "schema_version":1,"states":["open"],"initial_state":"open",
+            "accepting_states":["open"],"error_states":[],"events":[],
+            "transitions":[],"terminal_expectations":[],
+            "semantics":{"analysis_mode":"may","unmatched_event":"preserve_state",
+                "uncertainty":{"ambiguous_dispatch":"abstain","unknown_call":"abstain",
+                    "external_call":"abstain","escape":"abstain","incomplete_analysis":"abstain"}}
+        }"#,
+        )
+        .unwrap()
+        .compile()
+        .unwrap();
+        let groups = [CandidateCoverage::Exhaustive, CandidateCoverage::Open].map(|coverage| {
+            CoverageCandidateGroupSpec {
+                subject: subject.key().clone(),
+                site: site.clone(),
+                phase: CoverageCandidatePhase::AfterNormalReturn,
+                candidates: vec![CoverageCandidateSpec {
+                    event: "close".into(),
+                    semantic_effect: None,
+                    quality: TypestateBindingQuality::new(
+                        ProofStatus::Proven,
+                        EvidenceCompleteness::Complete,
+                        TypestateBindingMultiplicity {
+                            coverage,
+                            retained: 1,
+                        },
+                    ),
+                    alias_derived: false,
+                }],
+            }
+        });
+        let build = |groups| {
+            TypestateBindingPlan::try_new_with_coverage(
+                &protocol,
+                vec![subject.clone()],
+                vec![],
+                TypestateEventBindings {
+                    events: vec![],
+                    templates: vec![],
+                },
+                vec![],
+                vec![],
+                TypestateCoverageSpec {
+                    candidate_groups: groups,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        };
+        let forward = build(groups.to_vec());
+        let reverse = build(groups.into_iter().rev().collect());
+        assert_eq!(forward.hash(), reverse.hash());
+        assert_eq!(forward.canonical_bytes(), reverse.canonical_bytes());
+        assert_eq!(forward.coverage_candidate_groups().len(), 2);
+    }
 
     /// One `res.go` declaration, named by its declaration path and its own
     /// span, with the whole file's span on the enclosing `file` segment.

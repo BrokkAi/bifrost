@@ -195,6 +195,129 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#12812: vec macro certification omitted unit input reads from the request receipt")]
+    fn rust_macro_type_certification_records_closure_inputs() {
+        use brokk_bifrost_analysis::analyzer::i_analyzer::{IAnalyzer, capture_query_reads};
+        use brokk_bifrost_analysis::analyzer::read_ledger::{LookupKind, LookupQuestion, ReadKey};
+        let source = "pub fn probe() { let bytes = vec![1u8]; bytes; }";
+        let fixture = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname=\"macro_receipt\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[dependencies]\nhelper={path=\"helper\"}\n",
+        )
+        .file("helper/Cargo.toml", "[package]\nname=\"helper\"\nversion=\"0.1.0\"\nedition=\"2021\"\n")
+        .file("helper/src/lib.rs", "pub fn helper() {}")
+        .file("src/lib.rs", "mod child;")
+        .file("src/child.rs", source)
+        .build();
+        let store = Arc::new(
+            brokk_bifrost_analysis::analyzer::store::AnalyzerStore::open_ephemeral().unwrap(),
+        );
+        let project = fixture.project_dyn();
+        let context =
+            brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::revision_image_store_context(
+                project.as_ref(),
+                store.clone(),
+            );
+        let analyzer = RustAnalyzer::new_with_config_store_context(
+            project,
+            brokk_bifrost_core::analyzer::config::AnalyzerConfig::default(),
+            context,
+            None,
+        )
+        .unwrap();
+        assert!(analyzer.all_declarations().next().is_some());
+        let file = fixture.file("src/child.rs");
+        let site = rust_shadow_site(source, "bytes");
+        let tree = rust_shadow_tree(source);
+        let query = BoundedReceiverQuery {
+            analyzer: &analyzer,
+            file: &file,
+            source,
+            tree: Some(&tree),
+            site: &site,
+            budget: Default::default(),
+            cancellation: None,
+        };
+        let _scope = AnalyzerQueryScope::new(&analyzer);
+        let (answer, reads) =
+            capture_query_reads(&analyzer, || RustSupport.resolve_type_bounded(query));
+
+        assert!(
+            reads.keys().into_iter().any(|read| matches!(read,
+                ReadKey::Lookup {
+                    kind: LookupKind::Derivation(kind),
+                    question: LookupQuestion::Derivation(question), ..
+                } if kind.0 == "derivation:rust_file_units:v1"
+                    && question.rel_path.as_deref() == Some("src/child.rs")
+            )),
+            "{reads:?}"
+        );
+        let inputs = reads
+            .keys()
+            .into_iter()
+            .filter_map(|read| match read {
+                ReadKey::Lookup {
+                    kind: LookupKind::Derivation(kind),
+                    question: LookupQuestion::Derivation(question),
+                    ..
+                } if kind.0 == "derivation:rust_unit_inputs:v2" => question.subject,
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            inputs.len(),
+            2,
+            "macro certification must record its unit closure: {reads:?}; answer: {answer:?}"
+        );
+        let (kind, question, digest) = reads
+            .keys()
+            .into_iter()
+            .find_map(|read| match read {
+                ReadKey::Lookup {
+                    kind: LookupKind::Derivation(kind),
+                    question: LookupQuestion::Derivation(question),
+                    digest,
+                } if kind.0 == "derivation:rust_file_units:v1"
+                    && question.rel_path.as_deref() == Some("src/child.rs") =>
+                {
+                    Some((kind, question, digest))
+                }
+                _ => None,
+            })
+            .unwrap();
+        drop(_scope);
+        std::fs::write(
+            fixture.root().join("src/main.rs"),
+            "#![no_implicit_prelude]\nmod child;\nfn main() {}\n",
+        )
+        .unwrap();
+        let project = fixture.project_dyn();
+        let context =
+            brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::revision_image_store_context(
+                project.as_ref(),
+                store,
+            );
+        let reopened = RustAnalyzer::new_with_config_store_context(
+            project,
+            brokk_bifrost_core::analyzer::config::AnalyzerConfig::default(),
+            context,
+            None,
+        )
+        .unwrap();
+        assert!(reopened.all_declarations().next().is_some());
+        assert_ne!(
+            IAnalyzer::derivations(&reopened)
+                .unwrap()
+                .replay(&reopened, kind, &question),
+            brokk_bifrost_analysis::analyzer::derivation_host::ReplayResult::Identity(
+                brokk_bifrost_semantic::analyzer::semantic::derivation::OutputIdentity(digest)
+            ),
+            "adding a target must invalidate the retained membership answer"
+        );
+    }
+
+    #[test]
     #[hardwon(
         "#4488: additive derive metadata falsely opened unrelated authored reverse inventory"
     )]
@@ -501,6 +624,11 @@ mod tests {
                         assert_eq!(edit.new_text, "renamed");
                     }
                 }
+                Err(error) if label == "module declaration" => {
+                    assert!(error.contains("OverlayFrontierUnknown"), "{error}");
+                    assert!(error.contains("overlay adds a module edge"), "{error}");
+                    assert!(error.contains("#12219"), "{error}");
+                }
                 Err(error) => failures.push((label, error)),
             }
         }
@@ -515,6 +643,7 @@ mod tests {
     // reviewable outcome; a rename built on partial references silently edits
     // some call sites and leaves others behind.
     #[test]
+    #[hardwon("#12260: incomplete rename evidence dumped interner IDs and absolute paths")]
     fn native_rename_refuses_an_unprovable_reference_inventory() {
         let fixture = InlineTestProject::with_language(Language::Rust)
             .file(
@@ -545,6 +674,22 @@ mod tests {
         assert!(
             error.contains("incomplete or ambiguous"),
             "the refusal must name the evidence it lacked: {error}"
+        );
+        assert!(
+            error.contains("src/lib.rs"),
+            "the evidence must identify its workspace-relative site: {error}"
+        );
+        assert!(
+            !error.contains("SegmentId("),
+            "the evidence must not expose interner IDs: {error}"
+        );
+        assert!(
+            !error.contains("ast_id"),
+            "the evidence must not expose AST digests: {error}"
+        );
+        assert!(
+            !error.contains(&fixture.root().to_string_lossy().to_string()),
+            "the evidence must not expose the absolute project root: {error}"
         );
     }
 
@@ -1046,6 +1191,83 @@ mod tests {
         assert_unrelated_item_keeps_local_call_proven(
             "enum Mode { Exact }\nfn unrelated() { use Mode as Alias; }",
         );
+    }
+
+    #[test]
+    #[hardwon(
+        "#12203: the rename binding world certified completeness under an overlay-added module edge"
+    )]
+    fn rename_binding_world_overlay_frontier() {
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname='overlay_control'\nversion='0.1.0'\nedition='2021'\n",
+            )
+            .file("src/lib.rs", "pub mod caller;\npub fn target() {}\n")
+            .file("src/caller.rs", "pub fn caller() { crate::target(); }\n")
+            .build();
+        let disk = RustAnalyzer::new(fixture.project_dyn());
+        assert!(!disk.declarations(&fixture.file("src/lib.rs")).is_empty());
+        for (source, complete) in [
+            (
+                "pub fn caller() { crate::target(); let _body = 1; }\n",
+                true,
+            ),
+            (
+                "#[path = \"../not-yet-written.rs\"] mod added;\npub fn caller() { crate::target(); }\n",
+                false,
+            ),
+        ] {
+            let overlay = Arc::new(brokk_bifrost_core::analyzer::project::OverlayProject::new(
+                fixture.project_dyn(),
+            ));
+            let caller = fixture.file("src/caller.rs");
+            assert!(overlay.set(caller.abs_path(), source.to_owned()));
+            let analyzer = disk.clone_with_project(Arc::new(overlay.snapshot()));
+            assert!(!analyzer.declarations(&caller).is_empty());
+            let target = analyzer
+                .declarations(&fixture.file("src/lib.rs"))
+                .into_iter()
+                .find(|unit| unit.identifier() == "target")
+                .expect("target");
+            let snapshots = analyzer.inner.selected_workspace_snapshots();
+            let SelectedResolutionOverlayInputsOutcome::Ready {
+                masks,
+                content_mounts,
+                ..
+            } = analyzer
+                .inner
+                .selected_rust_resolution_overlay_inputs(
+                    snapshots.as_ref(),
+                    &CancellationToken::default(),
+                )
+                .unwrap()
+            else {
+                panic!("overlay inputs must be available");
+            };
+            let result = selected_rust_binding_world(
+                &analyzer,
+                snapshots.as_ref(),
+                RustBindingTargetProof::Current(&target),
+                &masks,
+                content_mounts,
+                &CancellationToken::default(),
+            );
+            let RustBindingWorldOutcome::Ready(world) = result else {
+                panic!("binding world must be available: {result:?}");
+            };
+            assert_eq!(
+                world.completion() == &ResolutionCompletion::Complete,
+                complete,
+                "{world:?}"
+            );
+            if !complete {
+                assert!(
+                    format!("{:?}", world.completion()).contains("OverlayFrontierUnknown"),
+                    "{world:?}"
+                );
+            }
+        }
     }
 
     fn partition_binding_world(source: &str) -> SelectedRustBindingWorld {
@@ -1926,6 +2148,1520 @@ impl SearchToolsService {
     }
 
     #[test]
+    #[hardwon("#11546: root topology overlays certify callers from the hidden disk module graph")]
+    fn production_reference_index_root_topology_overlays_fail_closed() {
+        let mut failures = Vec::new();
+        for (case, source) in [
+            ("removed", "mod api;\n"),
+            (
+                "retargeted",
+                "mod api;\n#[path = \"other.rs\"] mod caller;\n",
+            ),
+            ("gated", "mod api;\n#[cfg(any())] mod caller;\n"),
+        ] {
+            let fixture = InlineTestProject::with_language(Language::Rust)
+                .file("Cargo.toml", "[package]\nname = \"root_topology_overlay\"\nversion = \"0.1.0\"\nedition = \"2024\"\n")
+                .file("src/lib.rs", "mod api; mod caller;\n")
+                .file("src/api.rs", "pub fn target() {}\n")
+                .file("src/caller.rs", "pub fn caller() { crate::api::target(); }\n")
+                .file("src/other.rs", "pub fn other() {}\n")
+                .build();
+            let disk = RustAnalyzer::new(fixture.project_dyn());
+            let target = disk
+                .all_declarations()
+                .find(|unit| unit.identifier() == "target")
+                .expect("disk target");
+            let RustSelectedReferenceIndexOutcome::Ready(index) =
+                build_rust_selected_reference_index(&disk, &CancellationToken::default())
+            else {
+                panic!("{case}: disk index unavailable")
+            };
+            let baseline = index.inverse_for(&target);
+            assert_eq!(baseline.edges.len(), 1, "{case}: disk {baseline:?}");
+            let overlay = Arc::new(brokk_bifrost_core::analyzer::project::OverlayProject::new(
+                fixture.project_dyn(),
+            ));
+            let root = fixture.file("src/lib.rs");
+            assert!(overlay.set(root.abs_path(), source.to_owned()));
+            let selected = disk.clone_with_project(Arc::new(overlay.snapshot()));
+            match build_rust_selected_reference_index(&selected, &CancellationToken::default()) {
+                RustSelectedReferenceIndexOutcome::Ready(index) => {
+                    let answer = index.inverse_for(&target);
+                    eprintln!("{case}: {answer:?}");
+                    if answer.completeness == EdgeCompleteness::Complete
+                        && answer.edges.iter().any(|edge| {
+                            edge.site.file == fixture.file("src/caller.rs")
+                                && edge.proof == UsageProof::Proven
+                        })
+                    {
+                        failures.push(case);
+                    }
+                }
+                RustSelectedReferenceIndexOutcome::Unavailable(detail)
+                | RustSelectedReferenceIndexOutcome::Stale(detail)
+                | RustSelectedReferenceIndexOutcome::StoreError(detail) => {
+                    panic!("{case}: unexpected index failure: {detail}");
+                }
+                RustSelectedReferenceIndexOutcome::Cancelled => panic!("{case}: cancelled"),
+            }
+            assert!(overlay.clear(&root.abs_path()));
+            let cleared = selected.clone_with_project(Arc::new(overlay.snapshot()));
+            let RustSelectedReferenceIndexOutcome::Ready(index) =
+                build_rust_selected_reference_index(&cleared, &CancellationToken::default())
+            else {
+                panic!("{case}: cleared index unavailable")
+            };
+            let restored = index.inverse_for(&target);
+            eprintln!("{case} cleared: {restored:?}");
+            assert_eq!(restored.edges.len(), 1, "{case}: cleared disk answer");
+        }
+        assert!(failures.is_empty(), "stale complete callers: {failures:?}");
+    }
+
+    // The nested, unchanged-overlay and forward companions of the root-topology
+    // repro above. `caller/mod.rs` declares `deep`, whose file calls the target.
+    fn root_topology_fixture() -> crate::inline_project::BuiltInlineTestProject {
+        InlineTestProject::with_language(Language::Rust)
+            .file("Cargo.toml", "[package]\nname = \"root_topology_overlay\"\nversion = \"0.1.0\"\nedition = \"2024\"\n")
+            .file("src/lib.rs", "mod api; mod caller;\n")
+            .file("src/api.rs", "pub fn target() {}\n")
+            .file("src/caller/mod.rs", "mod deep;\n")
+            .file("src/caller/deep.rs", "pub fn caller() { crate::api::target(); }\n")
+            .build()
+    }
+
+    /// Whether the selected index proves a complete caller in `src/caller/deep.rs`.
+    fn deep_caller_is_proven_complete(
+        selected: &RustAnalyzer,
+        target: &CodeUnit,
+        deep: &brokk_bifrost_core::analyzer::model::ProjectFile,
+    ) -> bool {
+        match build_rust_selected_reference_index(selected, &CancellationToken::default()) {
+            RustSelectedReferenceIndexOutcome::Ready(index) => {
+                let answer = index.inverse_for(target);
+                answer.completeness == EdgeCompleteness::Complete
+                    && answer
+                        .edges
+                        .iter()
+                        .any(|edge| edge.site.file == *deep && edge.proof == UsageProof::Proven)
+            }
+            other => panic!(
+                "selected index unavailable: {}",
+                match other {
+                    RustSelectedReferenceIndexOutcome::Unavailable(d)
+                    | RustSelectedReferenceIndexOutcome::Stale(d)
+                    | RustSelectedReferenceIndexOutcome::StoreError(d) => d,
+                    _ => "cancelled".to_owned(),
+                }
+            ),
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#11546: removing a module declaration left its descendants placed from the persisted module graph"
+    )]
+    fn production_reference_index_root_topology_overlay_unplaces_descendants_and_keeps_unchanged_edges()
+     {
+        let fixture = root_topology_fixture();
+        let disk = RustAnalyzer::new(fixture.project_dyn());
+        let target = disk
+            .all_declarations()
+            .find(|unit| unit.identifier() == "target")
+            .expect("disk target");
+        let deep = fixture.file("src/caller/deep.rs");
+        assert!(
+            deep_caller_is_proven_complete(&disk, &target, &deep),
+            "disk answer"
+        );
+        let root = fixture.file("src/lib.rs");
+        let overlay = Arc::new(brokk_bifrost_core::analyzer::project::OverlayProject::new(
+            fixture.project_dyn(),
+        ));
+        // `deep.rs` is two edges below the edited root: only the removed
+        // `mod caller;` edge changed, so the worklist must reach it.
+        assert!(overlay.set(root.abs_path(), "mod api;\n".to_owned()));
+        let removed = disk.clone_with_project(Arc::new(overlay.snapshot()));
+        assert!(
+            !deep_caller_is_proven_complete(&removed, &target, &deep),
+            "a descendant of a removed module stayed proven"
+        );
+        // A comment-only edit and a byte-identical overlay keep the edge.
+        for source in [
+            "mod api; mod caller;\n// edited\n",
+            "mod api; mod caller;\n",
+        ] {
+            assert!(overlay.set(root.abs_path(), source.to_owned()));
+            let kept = disk.clone_with_project(Arc::new(overlay.snapshot()));
+            assert!(
+                deep_caller_is_proven_complete(&kept, &target, &deep),
+                "an unchanged edge lost its placement: {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#11546: an include! edge removed, retargeted or gated in a changed host left the included file and its modules placed"
+    )]
+    fn production_reference_index_root_topology_overlay_unplaces_include_edges() {
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file("Cargo.toml", "[package]\nname = \"root_topology_overlay\"\nversion = \"0.1.0\"\nedition = \"2024\"\n")
+            .file("src/lib.rs", "mod api;\ninclude!(\"splice.rs\");\n")
+            .file("src/api.rs", "pub fn target() {}\n")
+            .file("src/splice.rs", "pub fn spliced() { crate::api::target(); }\nmod nested;\n")
+            .file("src/nested.rs", "pub fn nested_caller() { crate::api::target(); }\n")
+            .file("src/other.rs", "pub fn other() {}\n")
+            .build();
+        let disk = RustAnalyzer::new(fixture.project_dyn());
+        let target = disk
+            .all_declarations()
+            .find(|unit| unit.identifier() == "target")
+            .expect("disk target");
+        let splice = fixture.file("src/splice.rs");
+        let nested = fixture.file("src/nested.rs");
+        assert!(
+            deep_caller_is_proven_complete(&disk, &target, &splice),
+            "disk answer for the included file"
+        );
+        assert!(
+            deep_caller_is_proven_complete(&disk, &target, &nested),
+            "disk answer for the module the included file declares"
+        );
+        let root = fixture.file("src/lib.rs");
+        let overlay = Arc::new(brokk_bifrost_core::analyzer::project::OverlayProject::new(
+            fixture.project_dyn(),
+        ));
+        for (case, source) in [
+            ("removed", "mod api;\n"),
+            ("retargeted", "mod api;\ninclude!(\"other.rs\");\n"),
+            (
+                "gated",
+                "mod api;\n#[cfg(any())]\nmod gated {\n    include!(\"splice.rs\");\n}\n",
+            ),
+        ] {
+            assert!(overlay.set(root.abs_path(), source.to_owned()));
+            let selected = disk.clone_with_project(Arc::new(overlay.snapshot()));
+            let RustSelectedReferenceIndexOutcome::Ready(index) =
+                build_rust_selected_reference_index(&selected, &CancellationToken::default())
+            else {
+                panic!("{case}: index unavailable")
+            };
+            let answer = index.inverse_for(&target);
+            for file in [&splice, &nested] {
+                assert!(
+                    !answer
+                        .edges
+                        .iter()
+                        .any(|edge| edge.site.file == *file && edge.proof == UsageProof::Proven),
+                    "{case}: {} stayed proven through the dead include edge: {answer:?}",
+                    file.rel_path().display()
+                );
+            }
+        }
+        // A comment-only edit keeps the include edge and both placements. The
+        // search over an edited include host reports its own inventory gap, so
+        // the check is that the included files still carry proven callers.
+        assert!(overlay.set(
+            root.abs_path(),
+            "mod api;\ninclude!(\"splice.rs\");\n// edited\n".to_owned()
+        ));
+        let kept = disk.clone_with_project(Arc::new(overlay.snapshot()));
+        let RustSelectedReferenceIndexOutcome::Ready(index) =
+            build_rust_selected_reference_index(&kept, &CancellationToken::default())
+        else {
+            panic!("kept include host: index unavailable")
+        };
+        let answer = index.inverse_for(&target);
+        for file in [&splice, &nested] {
+            assert!(
+                answer
+                    .edges
+                    .iter()
+                    .any(|edge| edge.site.file == *file && edge.proof == UsageProof::Proven),
+                "an unchanged include edge lost {}: {answer:?}",
+                file.rel_path().display()
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#11546: an inline module removed by an overlay stayed placed for readers of the persisted view"
+    )]
+    fn production_reference_index_root_topology_overlay_unplaces_a_removed_inline_module() {
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file("Cargo.toml", "[package]\nname = \"root_topology_overlay\"\nversion = \"0.1.0\"\nedition = \"2024\"\n")
+            .file(
+                "src/lib.rs",
+                "mod api;\nmod m {\n    pub fn inline_caller() { crate::api::target(); }\n    mod child;\n}\n",
+            )
+            .file("src/api.rs", "pub fn target() {}\n")
+            .file("src/m/child.rs", "pub fn child_caller() { crate::api::target(); }\n")
+            .build();
+        let disk = RustAnalyzer::new(fixture.project_dyn());
+        let target = disk
+            .all_declarations()
+            .find(|unit| unit.identifier() == "target")
+            .expect("disk target");
+        let root = fixture.file("src/lib.rs");
+        let child = fixture.file("src/m/child.rs");
+        assert!(
+            deep_caller_is_proven_complete(&disk, &target, &root),
+            "disk answer for the inline caller"
+        );
+        assert!(
+            deep_caller_is_proven_complete(&disk, &target, &child),
+            "disk answer for the module the inline module declares"
+        );
+        let overlay = Arc::new(brokk_bifrost_core::analyzer::project::OverlayProject::new(
+            fixture.project_dyn(),
+        ));
+        // Removed, and renamed (the old module scope has no counterpart, so its
+        // persisted placement must not survive for any reader).
+        for (case, source) in [
+            ("removed", "mod api;\n"),
+            (
+                "renamed",
+                "mod api;\nmod n {\n    pub fn inline_caller() { crate::api::target(); }\n    mod child;\n}\n",
+            ),
+        ] {
+            assert!(overlay.set(root.abs_path(), source.to_owned()));
+            let selected = disk.clone_with_project(Arc::new(overlay.snapshot()));
+            for file in [&root, &child] {
+                assert!(
+                    !deep_caller_is_proven_complete(&selected, &target, file),
+                    "{case}: {} stayed proven after the inline module changed",
+                    file.rel_path().display()
+                );
+            }
+        }
+    }
+
+    /// Whether the selected index holds a proven caller edge in `file`, whatever
+    /// the answer's completeness (an edited include host reports its own gap).
+    fn has_proven_caller_edge(
+        selected: &RustAnalyzer,
+        target: &CodeUnit,
+        file: &brokk_bifrost_core::analyzer::model::ProjectFile,
+    ) -> bool {
+        let RustSelectedReferenceIndexOutcome::Ready(index) =
+            build_rust_selected_reference_index(selected, &CancellationToken::default())
+        else {
+            panic!("selected index unavailable")
+        };
+        let answer = index.inverse_for(target);
+        answer
+            .edges
+            .iter()
+            .any(|edge| edge.site.file == *file && edge.proof == UsageProof::Proven)
+    }
+
+    #[test]
+    #[hardwon(
+        "#11546: an overlay dropping one of two include! edges to a file unplaced it for the host that still includes it"
+    )]
+    fn production_reference_index_root_topology_overlay_keeps_a_file_another_host_still_includes() {
+        // lib.rs and host_b.rs both include shared.rs in the crate root module.
+        // The persisted walk collapses the two routes into one placement of
+        // shared.rs, so it dies only when no host keeps an edge to it. The
+        // changed host is the crate root: an overlay on an included file is a
+        // separate macro-stage limitation.
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file("Cargo.toml", "[package]\nname = \"root_topology_overlay\"\nversion = \"0.1.0\"\nedition = \"2024\"\n")
+            .file(
+                "src/lib.rs",
+                "mod api;\ninclude!(\"shared.rs\");\ninclude!(\"host_b.rs\");\n",
+            )
+            .file("src/api.rs", "pub fn target() {}\n")
+            .file("src/host_b.rs", "include!(\"shared.rs\");\n")
+            .file(
+                "src/shared.rs",
+                "pub fn shared_caller() { crate::api::target(); }\n",
+            )
+            .build();
+        let disk = RustAnalyzer::new(fixture.project_dyn());
+        let target = disk
+            .all_declarations()
+            .find(|unit| unit.identifier() == "target")
+            .expect("disk target");
+        let shared = fixture.file("src/shared.rs");
+        assert!(
+            has_proven_caller_edge(&disk, &target, &shared),
+            "disk answer"
+        );
+        let overlay = Arc::new(brokk_bifrost_core::analyzer::project::OverlayProject::new(
+            fixture.project_dyn(),
+        ));
+        let root = fixture.file("src/lib.rs");
+        assert!(overlay.set(
+            root.abs_path(),
+            "mod api;\ninclude!(\"host_b.rs\");\n".to_owned()
+        ));
+        let one_dropped = disk.clone_with_project(Arc::new(overlay.snapshot()));
+        assert!(
+            has_proven_caller_edge(&one_dropped, &target, &shared),
+            "host_b.rs still includes shared.rs, so its placement must survive"
+        );
+        // No host reaches shared.rs any more: host_b.rs is unplaced with the
+        // include that mounted it, and shared.rs with it.
+        assert!(overlay.set(root.abs_path(), "mod api;\n".to_owned()));
+        let none_left = disk.clone_with_project(Arc::new(overlay.snapshot()));
+        assert!(
+            !has_proven_caller_edge(&none_left, &target, &shared),
+            "no host includes shared.rs any more, so it must be unplaced"
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#11546: a comment-only overlay unplaced the children of a #[path] inline module, whose scope the edge check skipped"
+    )]
+    fn production_reference_index_root_topology_overlay_keeps_children_of_a_path_inline_module() {
+        let lib = |path: &str, tail: &str| {
+            format!("mod api;\n#[path = \"{path}\"]\nmod m {{\n    mod child;\n}}\n{tail}")
+        };
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file("Cargo.toml", "[package]\nname = \"root_topology_overlay\"\nversion = \"0.1.0\"\nedition = \"2024\"\n")
+            .file("src/lib.rs", lib("alternate", ""))
+            .file("src/api.rs", "pub fn target() {}\n")
+            .file(
+                "src/alternate/child.rs",
+                "pub fn child_caller() { crate::api::target(); }\n",
+            )
+            .build();
+        let disk = RustAnalyzer::new(fixture.project_dyn());
+        let target = disk
+            .all_declarations()
+            .find(|unit| unit.identifier() == "target")
+            .expect("disk target");
+        let child = fixture.file("src/alternate/child.rs");
+        assert!(
+            deep_caller_is_proven_complete(&disk, &target, &child),
+            "disk answer for the child of the #[path] inline module"
+        );
+        let overlay = Arc::new(brokk_bifrost_core::analyzer::project::OverlayProject::new(
+            fixture.project_dyn(),
+        ));
+        let root = fixture.file("src/lib.rs");
+        assert!(overlay.set(root.abs_path(), lib("alternate", "// edited\n")));
+        let comment_only = disk.clone_with_project(Arc::new(overlay.snapshot()));
+        assert!(
+            deep_caller_is_proven_complete(&comment_only, &target, &child),
+            "a comment-only edit unplaced the child of a #[path] inline module"
+        );
+        // The inline #[path] moves where `mod child;` resolves, so a changed
+        // attribute retargets the child and the persisted placement is dead.
+        assert!(overlay.set(root.abs_path(), lib("elsewhere", "")));
+        let retargeted = disk.clone_with_project(Arc::new(overlay.snapshot()));
+        assert!(
+            !deep_caller_is_proven_complete(&retargeted, &target, &child),
+            "a retargeted inline #[path] left the old child placed"
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#11546: removing an included file unplaced its whole host container, including unrelated sibling modules"
+    )]
+    fn selected_rust_removed_included_file_unplaces_only_itself() {
+        use brokk_bifrost_analysis::CancellationToken;
+        use brokk_bifrost_analysis::analyzer::store::resolution_selection::{
+            SelectedResolutionLanguage, SelectedResolutionMountInventoryOutcome,
+            SelectedResolutionOverlayMask,
+        };
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file("Cargo.toml", "[package]\nname = \"root_topology_overlay\"\nversion = \"0.1.0\"\nedition = \"2024\"\n")
+            .file("src/lib.rs", "mod api;\ninclude!(\"splice.rs\");\n")
+            .file("src/api.rs", "pub fn target() {}\n")
+            .file("src/splice.rs", "mod nested;\n")
+            .file("src/nested.rs", "pub fn nested() {}\n")
+            .build();
+        let analyzer = fixture.workspace_analyzer(Default::default());
+        let store = analyzer.store().unwrap();
+        let workspace = {
+            let conn = store.conn.lock().unwrap();
+            brokk_bifrost_analysis::analyzer::store::WorkspaceId(
+                conn.query_row(
+                    "SELECT workspace_id FROM workspace_heads WHERE lang='rust'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            )
+        };
+        let snapshots = store
+            .workspace_snapshots_for_current_languages(&workspace, &["rust".into()])
+            .unwrap();
+        let SelectedResolutionMountInventoryOutcome::Ready(selection) = store
+            .open_selected_resolution_mount_inventory(
+                &workspace,
+                &snapshots,
+                &[SelectedResolutionLanguage::new("rust", Language::Rust)],
+                &[SelectedResolutionOverlayMask::removal(
+                    "rust",
+                    "src/splice.rs",
+                )],
+                &CancellationToken::default(),
+            )
+            .unwrap()
+        else {
+            panic!("complete selection");
+        };
+        let conn = selection.connection();
+        let placed_files = |sql: &str| -> Vec<String> {
+            conn.prepare(sql)
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        // Only the included file and the module it declares are unplaced; the
+        // host container's other members keep their placements.
+        assert_eq!(
+            placed_files(
+                "SELECT DISTINCT member.rel_path FROM temp.selected_rust_unplaced_placements AS unplaced
+                 JOIN main.resolution_unit_summary_members AS member
+                   ON member.summary_id=unplaced.summary_id AND member.member_ordinal=unplaced.member_ordinal
+                 ORDER BY 1"
+            ),
+            ["src/nested.rs", "src/splice.rs"]
+        );
+        assert_eq!(
+            placed_files(
+                "SELECT DISTINCT member.rel_path FROM temp.rust_unit_summary_placements AS placement
+                 JOIN main.resolution_unit_summary_members AS member
+                   ON member.summary_id=placement.summary_id AND member.member_ordinal=placement.member_ordinal
+                 ORDER BY 1"
+            ),
+            ["src/api.rs", "src/lib.rs"]
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#11546: forward resolution followed a module edge the selected root no longer declares"
+    )]
+    fn selected_rust_forward_does_not_resolve_through_a_removed_module_edge() {
+        let fixture = root_topology_fixture();
+        let disk = RustAnalyzer::new(fixture.project_dyn());
+        assert!(
+            disk.all_declarations()
+                .any(|unit| unit.identifier() == "target")
+        );
+        let overlay = Arc::new(brokk_bifrost_core::analyzer::project::OverlayProject::new(
+            fixture.project_dyn(),
+        ));
+        assert!(overlay.set(
+            fixture.file("src/lib.rs").abs_path(),
+            "mod api;\n".to_owned()
+        ));
+        let selected = disk.clone_with_project(Arc::new(overlay.snapshot()));
+        let source = "pub fn caller() { crate::api::target(); }\n";
+        let file = fixture.file("src/caller/deep.rs");
+        let site = rust_shadow_site(source, "target");
+        let tree = rust_shadow_tree(source);
+        let query = BoundedReceiverQuery {
+            analyzer: &selected,
+            file: &file,
+            source,
+            tree: Some(&tree),
+            site: &site,
+            budget: Default::default(),
+            cancellation: None,
+        };
+        // The unplaced file compiles in no selected crate: a typed non-answer,
+        // never a resolved definition and never an empty "complete" one.
+        match selected_rust_definition_shadow_result(&selected, query) {
+            RustDefinitionShadowResult::UnsupportedCallerProfile { .. }
+            | RustDefinitionShadowResult::Incomplete { .. } => {}
+            other => panic!("an unplaced caller must not resolve: {other:?}"),
+        }
+    }
+
+    /// `api.rs` calls `helper`, which `caller.rs` declares. The overlay removes
+    /// `mod caller;`, so `caller.rs` is unplaced in the selected root.
+    fn unplaced_declaration_fixture() -> crate::inline_project::BuiltInlineTestProject {
+        InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"unplaced_signal\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file("src/lib.rs", "mod api; mod caller;\n")
+            .file("src/api.rs", "pub fn call() { crate::caller::helper(); }\n")
+            .file("src/caller.rs", "pub fn helper() {}\n")
+            .build()
+    }
+
+    #[test]
+    #[hardwon(
+        "#11546: a declaration in an overlay-unplaced file reported a complete caller set from its same-blob uses"
+    )]
+    fn selected_rust_reverse_of_a_declaration_in_an_unplaced_file_is_incomplete() {
+        let fixture = unplaced_declaration_fixture();
+        let disk = RustAnalyzer::new(fixture.project_dyn());
+        let helper = disk
+            .all_declarations()
+            .find(|unit| unit.identifier() == "helper")
+            .expect("disk helper");
+        let RustSelectedReferenceIndexOutcome::Ready(index) =
+            build_rust_selected_reference_index(&disk, &CancellationToken::default())
+        else {
+            panic!("disk index unavailable")
+        };
+        let baseline = index.inverse_for(&helper);
+        assert_eq!(baseline.edges.len(), 1, "disk {baseline:?}");
+        assert_eq!(baseline.completeness, EdgeCompleteness::Complete);
+        let overlay = Arc::new(brokk_bifrost_core::analyzer::project::OverlayProject::new(
+            fixture.project_dyn(),
+        ));
+        assert!(overlay.set(
+            fixture.file("src/lib.rs").abs_path(),
+            "mod api;\n".to_owned()
+        ));
+        let selected = disk.clone_with_project(Arc::new(overlay.snapshot()));
+        match build_rust_selected_reference_index(&selected, &CancellationToken::default()) {
+            RustSelectedReferenceIndexOutcome::Ready(index) => {
+                let answer = index.inverse_for(&helper);
+                assert_ne!(
+                    answer.completeness,
+                    EdgeCompleteness::Complete,
+                    "an unplaced declaration's caller set cannot be complete: {answer:?}"
+                );
+            }
+            RustSelectedReferenceIndexOutcome::Unavailable(_)
+            | RustSelectedReferenceIndexOutcome::Stale(_)
+            | RustSelectedReferenceIndexOutcome::StoreError(_) => {
+                // A typed non-answer is also fail closed.
+            }
+            RustSelectedReferenceIndexOutcome::Cancelled => panic!("cancelled"),
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#11546: a definition lookup through an overlay-unplaced module answered complete from the missing module"
+    )]
+    fn selected_rust_definition_through_an_unplaced_module_is_incomplete() {
+        let fixture = unplaced_declaration_fixture();
+        let disk = RustAnalyzer::new(fixture.project_dyn());
+        let overlay = Arc::new(brokk_bifrost_core::analyzer::project::OverlayProject::new(
+            fixture.project_dyn(),
+        ));
+        let source = "pub fn call() { crate::caller::helper(); }\n";
+        let file = fixture.file("src/api.rs");
+        let lookup = |analyzer: &RustAnalyzer| {
+            let site = rust_shadow_site(source, "helper");
+            let tree = rust_shadow_tree(source);
+            selected_rust_definition_shadow_result(
+                analyzer,
+                BoundedReceiverQuery {
+                    analyzer,
+                    file: &file,
+                    source,
+                    tree: Some(&tree),
+                    site: &site,
+                    budget: Default::default(),
+                    cancellation: None,
+                },
+            )
+        };
+        match lookup(&disk) {
+            RustDefinitionShadowResult::Complete { definitions, .. } => assert!(
+                definitions.iter().any(|unit| unit.identifier() == "helper"),
+                "{definitions:?}"
+            ),
+            other => panic!("disk lookup must resolve: {other:?}"),
+        }
+        assert!(overlay.set(
+            fixture.file("src/lib.rs").abs_path(),
+            "mod api;\n".to_owned()
+        ));
+        let selected = disk.clone_with_project(Arc::new(overlay.snapshot()));
+        if let RustDefinitionShadowResult::Complete { definitions, .. } = lookup(&selected) {
+            panic!(
+                "the selected root no longer mounts caller.rs, yet the lookup is complete: {definitions:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon("#11546: a cfg-inactive sibling `mod` kept a removed module placed")]
+    fn selected_rust_cfg_inactive_include_sibling_does_not_keep_module_placed() {
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"include_sibling\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file(
+                "src/lib.rs",
+                "include!(\"extra.rs\");\n#[cfg(any())] mod child;\nmod caller;\npub fn root() {}\n",
+            )
+            .file("src/extra.rs", "mod child;\n")
+            .file("src/child.rs", "pub fn f() { crate::root(); }\n")
+            .file("src/caller.rs", "pub fn caller() { crate::child::f(); }\n")
+            .build();
+        let disk = RustAnalyzer::new(fixture.project_dyn());
+        let root_function = disk
+            .all_declarations()
+            .find(|unit| unit.identifier() == "root")
+            .expect("root function");
+        let RustSelectedReferenceIndexOutcome::Ready(disk_index) =
+            build_rust_selected_reference_index(&disk, &CancellationToken::default())
+        else {
+            panic!("disk reverse index unavailable")
+        };
+        let disk_answer = disk_index.inverse_for(&root_function);
+        assert_eq!(disk_answer.completeness, EdgeCompleteness::Complete);
+        assert!(
+            disk_answer.edges.iter().any(|edge| {
+                edge.target == root_function
+                    && edge.site.file == fixture.file("src/child.rs")
+                    && edge.proof == UsageProof::Proven
+            }),
+            "disk caller edge: {disk_answer:?}"
+        );
+
+        let overlay = Arc::new(brokk_bifrost_core::analyzer::project::OverlayProject::new(
+            fixture.project_dyn(),
+        ));
+        assert!(overlay.set(
+            fixture.file("src/extra.rs").abs_path(),
+            "// removed `mod child;`\n".to_owned()
+        ));
+        let selected = disk.clone_with_project(Arc::new(overlay.snapshot()));
+        let lookup_source = "pub fn caller() { crate::child::f(); }\n";
+        let file = fixture.file("src/caller.rs");
+        let site = brokk_bifrost_analysis::test_support::resolved_reference_site(
+            "src/caller.rs".to_owned(),
+            "f".to_owned(),
+            Range {
+                start_byte: lookup_source.rfind('f').expect("f call"),
+                end_byte: lookup_source.rfind('f').expect("f call") + 1,
+                start_line: 1,
+                end_line: 1,
+            },
+        );
+        let tree = rust_shadow_tree(lookup_source);
+        let lookup = |analyzer: &RustAnalyzer| {
+            selected_rust_definition_shadow_result(
+                analyzer,
+                BoundedReceiverQuery {
+                    analyzer,
+                    file: &file,
+                    source: lookup_source,
+                    tree: Some(&tree),
+                    site: &site,
+                    budget: Default::default(),
+                    cancellation: None,
+                },
+            )
+        };
+        assert!(matches!(
+            lookup(&disk),
+            RustDefinitionShadowResult::Complete { .. }
+        ));
+        let forward = lookup(&selected);
+        assert!(
+            !matches!(forward, RustDefinitionShadowResult::Complete { .. }),
+            "an unchanged caller resolved through the removed child module: {forward:?}"
+        );
+
+        match build_rust_selected_reference_index(&selected, &CancellationToken::default()) {
+            RustSelectedReferenceIndexOutcome::Ready(index) => {
+                let answer = index.inverse_for(&root_function);
+                assert_ne!(
+                    answer.completeness,
+                    EdgeCompleteness::Complete,
+                    "unplaced child caller cannot form a complete reverse answer: {answer:?}"
+                );
+            }
+            RustSelectedReferenceIndexOutcome::Unavailable(detail)
+            | RustSelectedReferenceIndexOutcome::Stale(detail)
+            | RustSelectedReferenceIndexOutcome::StoreError(detail) => {
+                panic!("selected reverse index unavailable: {detail}")
+            }
+            RustSelectedReferenceIndexOutcome::Cancelled => {
+                panic!("selected reverse index cancelled")
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon("#11546: a glob re-export of an overlay-unplaced module answered a lookup complete")]
+    fn selected_rust_definition_through_a_glob_of_an_unplaced_module_is_incomplete() {
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"unplaced_glob\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file("src/lib.rs", "mod api; mod caller; mod user;\n")
+            .file("src/api.rs", "pub use crate::caller::*;\n")
+            .file("src/caller.rs", "pub fn helper() {}\n")
+            .file(
+                "src/user.rs",
+                "use crate::api::*;\npub fn call() { helper(); }\n",
+            )
+            .build();
+        let disk = RustAnalyzer::new(fixture.project_dyn());
+        let source = "use crate::api::*;\npub fn call() { helper(); }\n";
+        let file = fixture.file("src/user.rs");
+        let lookup = |analyzer: &RustAnalyzer| {
+            let site = rust_shadow_site(source, "helper");
+            let tree = rust_shadow_tree(source);
+            selected_rust_definition_shadow_result(
+                analyzer,
+                BoundedReceiverQuery {
+                    analyzer,
+                    file: &file,
+                    source,
+                    tree: Some(&tree),
+                    site: &site,
+                    budget: Default::default(),
+                    cancellation: None,
+                },
+            )
+        };
+        match lookup(&disk) {
+            RustDefinitionShadowResult::Complete { definitions, .. } => assert!(
+                definitions.iter().any(|unit| unit.identifier() == "helper"),
+                "{definitions:?}"
+            ),
+            other => panic!("disk lookup must resolve: {other:?}"),
+        }
+        let overlay = Arc::new(brokk_bifrost_core::analyzer::project::OverlayProject::new(
+            fixture.project_dyn(),
+        ));
+        assert!(overlay.set(
+            fixture.file("src/lib.rs").abs_path(),
+            "mod api; mod user;\n".to_owned()
+        ));
+        let selected = disk.clone_with_project(Arc::new(overlay.snapshot()));
+        if let RustDefinitionShadowResult::Complete { definitions, .. } = lookup(&selected) {
+            panic!(
+                "the selected root no longer mounts caller.rs, yet the glob lookup is complete: {definitions:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon("#11666: a missing name through a glob of an unplaced module answered NoDefinition")]
+    fn selected_rust_missing_name_through_a_glob_of_an_unplaced_module_is_incomplete() {
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"unplaced_glob_missing\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file("src/lib.rs", "mod api; mod caller; mod user;\n")
+            .file("src/api.rs", "pub use crate::caller::*;\n")
+            .file("src/caller.rs", "pub fn helper() {}\n")
+            .file(
+                "src/user.rs",
+                "use crate::api::*;\npub fn call() { missing(); }\n",
+            )
+            .build();
+        let disk = RustAnalyzer::new(fixture.project_dyn());
+        let source = "use crate::api::*;\npub fn call() { missing(); }\n";
+        let file = fixture.file("src/user.rs");
+        let lookup = |analyzer: &RustAnalyzer| {
+            let site = rust_shadow_site(source, "missing");
+            let tree = rust_shadow_tree(source);
+            selected_rust_definition_shadow_result(
+                analyzer,
+                BoundedReceiverQuery {
+                    analyzer,
+                    file: &file,
+                    source,
+                    tree: Some(&tree),
+                    site: &site,
+                    budget: Default::default(),
+                    cancellation: None,
+                },
+            )
+        };
+        // Without an overlay the glob source is placed, so the absence is
+        // proven: a complete empty answer.
+        match lookup(&disk) {
+            RustDefinitionShadowResult::Complete { definitions, .. } => {
+                assert!(definitions.is_empty(), "{definitions:?}")
+            }
+            other => panic!("disk lookup of a missing name must be a complete miss: {other:?}"),
+        }
+        let overlay = Arc::new(brokk_bifrost_core::analyzer::project::OverlayProject::new(
+            fixture.project_dyn(),
+        ));
+        assert!(overlay.set(
+            fixture.file("src/lib.rs").abs_path(),
+            "mod api; mod user;\n".to_owned()
+        ));
+        let selected = disk.clone_with_project(Arc::new(overlay.snapshot()));
+        if let RustDefinitionShadowResult::Complete { definitions, .. } = lookup(&selected) {
+            panic!(
+                "the glob source caller.rs is unplaced, so its missing name is not proven absent: {definitions:?}"
+            );
+        }
+    }
+
+    const API_WITH_OWN: &str = "pub use crate::caller::*;\npub fn own() {}\n";
+
+    /// Looks `name` up at its last spelling in `lookup_source`, the content of
+    /// `lookup_file`, in a crate whose `api.rs` is `api` and whose `mid.rs` globs `caller`,
+    /// once on disk and once with a root that no longer mounts `caller.rs` and
+    /// that also applies `edits` (relative path, content): `(disk, selected)`.
+    fn lookup_beside_an_unplaced_glob_source(
+        api: &str,
+        lookup_file: &str,
+        lookup_source: &str,
+        name: &str,
+        edits: &[(&str, &str)],
+    ) -> (RustDefinitionShadowResult, RustDefinitionShadowResult) {
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"unplaced_glob_shadow\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file("src/lib.rs", "mod api; mod caller; mod mid; mod user;\n")
+            .file("src/api.rs", api)
+            .file("src/caller.rs", "pub fn helper() {}\n")
+            .file("src/mid.rs", "pub use crate::caller::*;\n")
+            .file(
+                "src/user.rs",
+                format!("use crate::api::*;\npub fn call() {{ {name}(); }}\n"),
+            )
+            .build();
+        let disk = RustAnalyzer::new(fixture.project_dyn());
+        let file = fixture.file(lookup_file);
+        let lookup = |analyzer: &RustAnalyzer| {
+            let site = rust_shadow_site(lookup_source, name);
+            let tree = rust_shadow_tree(lookup_source);
+            selected_rust_definition_shadow_result(
+                analyzer,
+                BoundedReceiverQuery {
+                    analyzer,
+                    file: &file,
+                    source: lookup_source,
+                    tree: Some(&tree),
+                    site: &site,
+                    budget: Default::default(),
+                    cancellation: None,
+                },
+            )
+        };
+        let before = lookup(&disk);
+        let overlay = Arc::new(brokk_bifrost_core::analyzer::project::OverlayProject::new(
+            fixture.project_dyn(),
+        ));
+        assert!(overlay.set(
+            fixture.file("src/lib.rs").abs_path(),
+            "mod api; mod mid; mod user;\n".to_owned()
+        ));
+        for (path, content) in edits {
+            assert!(overlay.set(fixture.file(path).abs_path(), (*content).to_owned()));
+        }
+        let selected = disk.clone_with_project(Arc::new(overlay.snapshot()));
+        (before, lookup(&selected))
+    }
+
+    /// `lookup_beside_an_unplaced_glob_source` for a call of `name` in `user.rs`,
+    /// which globs `api`.
+    fn lookup_through_an_api_that_globs_an_unplaced_caller(
+        name: &str,
+        edits: &[(&str, &str)],
+    ) -> (RustDefinitionShadowResult, RustDefinitionShadowResult) {
+        lookup_beside_an_unplaced_glob_source(
+            API_WITH_OWN,
+            "src/user.rs",
+            &format!("use crate::api::*;\npub fn call() {{ {name}(); }}\n"),
+            name,
+            edits,
+        )
+    }
+
+    #[test]
+    #[hardwon("#11666: an explicitly declared name was made incomplete by an unplaced glob source")]
+    fn selected_rust_explicit_name_beside_an_unplaced_glob_source_stays_complete() {
+        let (disk, selected) = lookup_through_an_api_that_globs_an_unplaced_caller("own", &[]);
+        for (which, result) in [("disk", disk), ("selected", selected)] {
+            match result {
+                RustDefinitionShadowResult::Complete { definitions, .. } => assert!(
+                    definitions.iter().any(|unit| unit.identifier() == "own"),
+                    "{which}: {definitions:?}"
+                ),
+                other => panic!(
+                    "{which}: api.rs declares `own`, so no glob source can change it: {other:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#11666: a stale persisted binding of an overlay-edited module stopped the glob walk"
+    )]
+    fn selected_rust_overlay_removed_explicit_name_beside_an_unplaced_glob_source_is_incomplete() {
+        // The overlay deletes `own` from api.rs, so the persisted binding is
+        // stale and the unplaced `caller` could now supply the name.
+        let (disk, selected) = lookup_through_an_api_that_globs_an_unplaced_caller(
+            "own",
+            &[("src/api.rs", "pub use crate::caller::*;\n")],
+        );
+        assert!(
+            matches!(disk, RustDefinitionShadowResult::Complete { ref definitions, .. } if !definitions.is_empty()),
+            "{disk:?}"
+        );
+        if let RustDefinitionShadowResult::Complete { definitions, .. } = selected {
+            panic!("api.rs no longer declares `own`, so the lookup is not proven: {definitions:?}");
+        }
+    }
+
+    #[test]
+    fn selected_rust_undeclared_name_beside_an_unplaced_glob_source_is_incomplete() {
+        let (disk, selected) = lookup_through_an_api_that_globs_an_unplaced_caller("missing", &[]);
+        assert!(
+            matches!(disk, RustDefinitionShadowResult::Complete { ref definitions, .. } if definitions.is_empty()),
+            "{disk:?}"
+        );
+        if let RustDefinitionShadowResult::Complete { definitions, .. } = selected {
+            panic!("`missing` could come from the unplaced glob source: {definitions:?}");
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#11546: Cargo-route surfaces keep the disk module graph under a root topology overlay"
+    )]
+    fn cargo_route_surfaces_root_topology_overlays_fail_closed() {
+        use brokk_bifrost_analysis::analyzer::IAnalyzer;
+        use brokk_bifrost_rust::graph_support::RustSource;
+
+        let mut stale = Vec::new();
+        for (case, source) in [
+            ("disk", "mod api; mod caller;\n"),
+            ("removed", "mod api;\n"),
+            (
+                "retargeted",
+                "mod api;\n#[path = \"other.rs\"] mod caller;\n",
+            ),
+            ("gated", "mod api;\n#[cfg(any())] mod caller;\n"),
+        ] {
+            let fixture = InlineTestProject::with_language(Language::Rust)
+                .file("Cargo.toml", "[package]\nname = \"root_topology_overlay\"\nversion = \"0.1.0\"\nedition = \"2024\"\n")
+                .file("src/lib.rs", "mod api; mod caller;\n")
+                .file("src/api.rs", "pub fn target() {}\n")
+                .file("src/caller.rs", "pub fn caller() { crate::api::target(); }\n")
+                .file("src/other.rs", "pub fn other() {}\n")
+                .build();
+            let disk = RustAnalyzer::new(fixture.project_dyn());
+            let caller_file = fixture.file("src/caller.rs");
+            let root = fixture.file("src/lib.rs");
+            let api = fixture.file("src/api.rs");
+            let other_file = fixture.file("src/other.rs");
+            let caller_unit = disk
+                .all_declarations()
+                .find(|unit| unit.identifier() == "caller")
+                .expect("disk caller");
+            let overlay = Arc::new(brokk_bifrost_core::analyzer::project::OverlayProject::new(
+                fixture.project_dyn(),
+            ));
+            let surfaces = |label: &str, analyzer: &RustAnalyzer| {
+                let mut out: Vec<(String, String, bool)> = Vec::new();
+                let scope = AnalyzerQueryScope::new(analyzer);
+                let routes =
+                    <RustAnalyzer as RustSource>::file_routes(analyzer, &caller_file, None);
+                match &routes {
+                    Ok(routes) => {
+                        out.push((
+                            "file_routes.target_roots".into(),
+                            format!("{:?}", routes.target_roots(&caller_file)),
+                            routes.is_complete(),
+                        ));
+                        out.push((
+                            "file_routes.is_in_target".into(),
+                            format!("{}", routes.is_in_target(&caller_file)),
+                            routes.is_complete(),
+                        ));
+                        let targeting = routes.module_declarations_targeting(&caller_file);
+                        out.push((
+                            "file_routes.module_declarations_targeting".into(),
+                            format!("{:?}", targeting),
+                            routes.is_complete(),
+                        ));
+                        let declared = routes.module_declarations_declared_in(&root);
+                        out.push((
+                            "file_routes.declared_in(lib.rs) start bytes".into(),
+                            format!(
+                                "{:?}",
+                                declared
+                                    .declarations
+                                    .iter()
+                                    .map(|d| (
+                                        d.declaration_start_byte,
+                                        d.target_file.rel_path().display().to_string()
+                                    ))
+                                    .collect::<Vec<_>>()
+                            ),
+                            routes.is_complete(),
+                        ));
+                        out.push((
+                            "file_routes.production_witness".into(),
+                            format!("{}", routes.file_has_production_witness(&caller_file)),
+                            routes.is_complete(),
+                        ));
+                    }
+                    Err(error) => {
+                        out.push(("file_routes".into(), format!("error {error:?}"), false))
+                    }
+                }
+                // A file no persisted unit holds: under an overlay a declaration
+                // the persisted units do not carry may place it, so the answer
+                // is a typed gap rather than a complete "not in a target".
+                match <RustAnalyzer as RustSource>::file_routes(analyzer, &other_file, None) {
+                    Ok(routes) => out.push((
+                        "file_routes(other.rs).target_roots".into(),
+                        format!("{:?}", routes.target_roots(&other_file)),
+                        routes.is_complete(),
+                    )),
+                    Err(error) => out.push((
+                        "file_routes(other.rs).target_roots".into(),
+                        format!("error {error:?}"),
+                        false,
+                    )),
+                }
+                let test_only = IAnalyzer::file_is_test_only(analyzer, &caller_file);
+                out.push((
+                    "file_is_test_only".into(),
+                    format!("{test_only:?}"),
+                    test_only.is_ok(),
+                ));
+                let in_test = IAnalyzer::in_test_region(analyzer, &caller_unit);
+                out.push((
+                    "in_test_region".into(),
+                    format!("{in_test:?}"),
+                    in_test.is_ok(),
+                ));
+                let declared = analyzer.declarations(&caller_file);
+                out.push((
+                    "declarations(caller.rs)".into(),
+                    format!(
+                        "{:?}",
+                        declared
+                            .iter()
+                            .map(|unit| unit.fq_name().to_string())
+                            .collect::<Vec<_>>()
+                    ),
+                    true,
+                ));
+                let contains = <RustAnalyzer as RustSource>::package_contains(
+                    analyzer,
+                    scope.token(),
+                    &caller_file,
+                    None,
+                );
+                out.push((
+                    "package_contains(caller.rs)".into(),
+                    format!("{:?}", contains.as_ref().map(|a| a.value)),
+                    contains.as_ref().is_ok_and(|a| a.complete),
+                ));
+                for package in ["root_topology_overlay", "caller", "crate::caller"] {
+                    let files = <RustAnalyzer as RustSource>::package_files_of(
+                        analyzer,
+                        scope.token(),
+                        package,
+                        None,
+                    );
+                    out.push((
+                        format!("package_files_of({package})"),
+                        format!(
+                            "{:?}",
+                            files.as_ref().map(|a| {
+                                let mut v = a
+                                    .value
+                                    .iter()
+                                    .map(|f| f.rel_path().display().to_string())
+                                    .collect::<Vec<_>>();
+                                v.sort();
+                                v
+                            })
+                        ),
+                        files.as_ref().is_ok_and(|a| a.complete),
+                    ));
+                }
+                let crates = <RustAnalyzer as RustSource>::crate_package_names(
+                    analyzer,
+                    scope.token(),
+                    "root_topology_overlay",
+                    None,
+                );
+                out.push((
+                    "crate_package_names".into(),
+                    format!("{:?}", crates.as_ref().map(|a| a.value.clone())),
+                    crates.as_ref().is_ok_and(|a| a.complete),
+                ));
+                let reaching = <RustAnalyzer as RustSource>::files_that_can_reference_target_of(
+                    analyzer, &api, None,
+                );
+                out.push((
+                    "files_that_can_reference_target_of(api.rs)".into(),
+                    format!(
+                        "{:?}",
+                        reaching.as_ref().map(|a| {
+                            let mut v = a
+                                .value
+                                .iter()
+                                .map(|f| f.rel_path().display().to_string())
+                                .collect::<Vec<_>>();
+                            v.sort();
+                            v
+                        })
+                    ),
+                    reaching.as_ref().is_ok_and(|a| a.complete),
+                ));
+                for (surface, answer, complete) in &out {
+                    eprintln!("SURFACE {case} [{label}] {surface} complete={complete} :: {answer}");
+                }
+                out
+            };
+            let baseline = surfaces("disk", &disk);
+            assert!(overlay.set(root.abs_path(), source.to_owned()));
+            let selected = disk.clone_with_project(Arc::new(overlay.snapshot()));
+            // Routes asked before any selected operation hydrated the buffer.
+            let cold = surfaces("overlay-cold", &selected);
+            // Routes asked after a selected operation hydrated the buffer, as
+            // a product request that first resolves a reference would.
+            let hot = disk.clone_with_project(Arc::new(overlay.snapshot()));
+            assert!(matches!(
+                build_rust_selected_reference_index(&hot, &CancellationToken::default()),
+                RustSelectedReferenceIndexOutcome::Ready(_)
+            ));
+            let under = surfaces("overlay-hot", &hot);
+            assert!(overlay.clear(&root.abs_path()));
+            let cleared = selected.clone_with_project(Arc::new(overlay.snapshot()));
+            let restored = surfaces("cleared", &cleared);
+            // Surfaces whose right answer under the overlay is the disk answer,
+            // with the contract that says so:
+            // - declaration names come from the Cargo manifest and the file's
+            //   path (`crate_naming`), never from the `mod` edges;
+            // - a package name no crate has is empty in every state;
+            // - a file outside every module tree is never classified test-only
+            //   (`RustCargoRouteIndex::file_is_test_only`);
+            // - the route index evaluates no profile, so a `cfg` other than
+            //   `test` leaves a declaration routing (`cargo_routes.rs`, the
+            //   decoration comment in the module-child builder).
+            let unchanged_by_contract = |surface: &str| {
+                matches!(
+                    surface,
+                    "declarations(caller.rs)"
+                        | "package_files_of(caller)"
+                        | "package_files_of(crate::caller)"
+                ) || (case != "disk" && matches!(surface, "file_is_test_only" | "in_test_region"))
+                    || (case == "gated"
+                        && matches!(
+                            surface,
+                            "file_routes.target_roots"
+                                | "file_routes.is_in_target"
+                                | "file_routes.production_witness"
+                                | "files_that_can_reference_target_of(api.rs)"
+                        ))
+            };
+            if case != "disk" {
+                for (label, under) in [("cold", &cold), ("hot", &under)] {
+                    for ((surface, base_answer, _), (_, answer, complete)) in
+                        baseline.iter().zip(under)
+                    {
+                        if *complete && answer == base_answer && !unchanged_by_contract(surface) {
+                            stale.push(format!("{case} [{label}]: {surface}"));
+                        }
+                    }
+                    // The overlay moved the edge, so the declaring file's own
+                    // declarations are the overlay's, not the disk's.
+                    let declared = |rows: &[(String, String, bool)]| {
+                        rows.iter()
+                            .find(|(surface, _, _)| surface.starts_with("file_routes.declared_in"))
+                            .map(|(_, answer, _)| answer.clone())
+                    };
+                    assert_ne!(
+                        declared(under),
+                        declared(&baseline),
+                        "{case} [{label}]: the overlaid root's declarations are the disk's"
+                    );
+                    if case != "gated" {
+                        for (surface, answer, _) in under {
+                            match surface.as_str() {
+                                "file_routes.target_roots" => {
+                                    assert_eq!(answer, "[]", "{case} [{label}]: {surface}")
+                                }
+                                "file_routes.is_in_target" | "file_routes.production_witness" => {
+                                    assert_eq!(answer, "false", "{case} [{label}]: {surface}")
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+            for ((surface, base_answer, _), (_, answer, _)) in baseline.iter().zip(&restored) {
+                assert_eq!(answer, base_answer, "{case}: cleared {surface}");
+            }
+        }
+        assert!(stale.is_empty(), "stale complete surfaces: {stale:#?}");
+    }
+
+    #[test]
+    #[hardwon(
+        "#11546: Cargo-route derivations hashed the revision's file content, so an overlay moved no unit's route inputs"
+    )]
+    fn cargo_route_body_edit_overlay_moves_only_the_edited_units_inputs() {
+        use brokk_bifrost_analysis::analyzer::IAnalyzer;
+        use brokk_bifrost_rust::graph_support::RustSource;
+        use brokk_bifrost_semantic::analyzer::semantic::derivation::DerivationKindId;
+
+        let manifest = |name: &str| {
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n")
+        };
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"left\", \"right\"]\nresolver = \"2\"\n",
+            )
+            .file("left/Cargo.toml", manifest("left"))
+            .file("left/src/lib.rs", "mod leaf;\n")
+            .file("left/src/leaf.rs", "pub fn leaf() {}\n")
+            .file("right/Cargo.toml", manifest("right"))
+            .file("right/src/lib.rs", "mod leaf;\n")
+            .file("right/src/leaf.rs", "pub fn leaf() {}\n")
+            .build();
+        let disk = RustAnalyzer::new(fixture.project_dyn());
+        let left_leaf = fixture.file("left/src/leaf.rs");
+        let right_leaf = fixture.file("right/src/leaf.rs");
+        let routes_asked = |analyzer: &RustAnalyzer| {
+            let _scope = AnalyzerQueryScope::new(analyzer);
+            [&left_leaf, &right_leaf].map(|file| {
+                let routes = <RustAnalyzer as RustSource>::file_routes(analyzer, file, None)
+                    .expect("file routes");
+                (routes.target_roots(file), routes.is_complete())
+            })
+        };
+        let tokens = |analyzer: &RustAnalyzer| {
+            [
+                analyzer
+                    .route_unit_input_tokens_for_test("left/src/leaf.rs")
+                    .expect("left unit token"),
+                analyzer
+                    .route_unit_input_tokens_for_test("right/src/leaf.rs")
+                    .expect("right unit token"),
+            ]
+        };
+        let on_disk = routes_asked(&disk);
+        for (roots, complete) in &on_disk {
+            assert!(*complete && roots.len() == 1, "disk routes: {on_disk:?}");
+        }
+        let disk_tokens = tokens(&disk);
+        assert!(disk_tokens.iter().all(|units| units.len() == 1));
+
+        let overlay = Arc::new(brokk_bifrost_core::analyzer::project::OverlayProject::new(
+            fixture.project_dyn(),
+        ));
+        // A body edit: the module declarations and the member set are
+        // unchanged, so the routes are the disk routes and stay definite.
+        assert!(overlay.set(
+            left_leaf.abs_path(),
+            "pub fn leaf() { let _edited = 1; }\n".to_owned()
+        ));
+        let selected = disk.clone_with_project(Arc::new(overlay.snapshot()));
+        assert_eq!(
+            routes_asked(&selected),
+            on_disk,
+            "a body edit keeps the routes definite and equal"
+        );
+        // The route derivations are keyed by these tokens, so only the edited
+        // unit's derivations are re-derived under the overlay.
+        let overlay_tokens = tokens(&selected);
+        assert_eq!(
+            overlay_tokens[0][0].0, disk_tokens[0][0].0,
+            "same left unit"
+        );
+        assert_ne!(
+            overlay_tokens[0][0].1, disk_tokens[0][0].1,
+            "the edited unit's route inputs see the overlay content"
+        );
+        assert_eq!(
+            overlay_tokens[1], disk_tokens[1],
+            "the untouched unit's route inputs are the disk's"
+        );
+        // The derivation engine is per analyzer, and an overlay's derivations
+        // are not retained, so the clone recomputes what it is asked.
+        let counters = |analyzer: &RustAnalyzer| {
+            IAnalyzer::snapshot_caches(analyzer)
+                .expect("snapshot caches")
+                .derivations()
+                .counters(DerivationKindId("derivation:rust_unit_routes:v1"))
+        };
+        eprintln!("ROUTE COUNTERS disk: {:?}", counters(&disk));
+        eprintln!("ROUTE COUNTERS overlay: {:?}", counters(&selected));
+    }
+
+    #[test]
+    #[hardwon("#12202: review found an overlay mod declaration missed by persisted placements")]
+    fn cargo_route_overlay_added_placement_does_not_certify_old_units() {
+        use brokk_bifrost_rust::graph_support::RustSource;
+
+        let manifest = |name: &str| {
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n")
+        };
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"left\", \"right\"]\nresolver = \"2\"\n",
+            )
+            .file("left/Cargo.toml", manifest("left"))
+            .file("left/src/lib.rs", "mod leaf;\n")
+            .file("left/src/leaf.rs", "pub fn leaf() {}\n")
+            .file("right/Cargo.toml", manifest("right"))
+            .file("right/src/lib.rs", "pub fn right() {}\n")
+            .build();
+        let disk = RustAnalyzer::new(fixture.project_dyn());
+        let leaf = fixture.file("left/src/leaf.rs");
+        {
+            let _scope = AnalyzerQueryScope::new(&disk);
+            let routes = <RustAnalyzer as RustSource>::file_routes(&disk, &leaf, None)
+                .expect("disk file routes");
+            assert!(routes.is_complete());
+            assert_eq!(routes.target_roots(&leaf).len(), 1);
+        }
+        let overlay = Arc::new(brokk_bifrost_core::analyzer::project::OverlayProject::new(
+            fixture.project_dyn(),
+        ));
+        assert!(overlay.set(
+            fixture.file("right/src/lib.rs").abs_path(),
+            "#[path = \"../../left/src/leaf.rs\"] mod shared;\npub fn right() {}\n".to_owned(),
+        ));
+        let selected = disk.clone_with_project(Arc::new(overlay.snapshot()));
+        let _scope = AnalyzerQueryScope::new(&selected);
+        if let Ok(routes) = <RustAnalyzer as RustSource>::file_routes(&selected, &leaf, None) {
+            assert!(
+                !routes.is_complete() || routes.target_roots(&leaf).len() == 2,
+                "persisted units omitted the placement introduced by the overlay"
+            );
+        }
+    }
+
+    /// An overlay request re-derives the routes of the units it touches, and
+    /// nothing else: the work does not grow with the crates around them. The
+    /// workspace is a chain of crates, each depending on the one before it; one
+    /// body edit lands in a middle crate, and the route question asked is that
+    /// crate's own. The same edit and question in a workspace twice as large
+    /// does the same work, and only the edited unit's route inputs move.
+    #[test]
+    fn cargo_route_overlay_recompute_is_bounded_by_the_touched_unit() {
+        use brokk_bifrost_analysis::analyzer::IAnalyzer;
+        use brokk_bifrost_rust::graph_support::RustSource;
+        use brokk_bifrost_semantic::analyzer::semantic::derivation::DerivationKindId;
+
+        const TOUCHED: usize = 2;
+        // The kinds a route question can demand, by their registered ids.
+        const KINDS: [&str; 5] = [
+            "derivation:rust_unit_routes:v1",
+            "derivation:rust_unit_inputs:v2",
+            "derivation:rust_unit_naming:v1",
+            "derivation:rust_unit_package_rows:v1",
+            "derivation:rust_broad_file_units:v1",
+        ];
+        // Per kind: (recomputed, not retainable) on the overlay request.
+        let overlay_work = |crates: usize| -> Vec<(&'static str, u64, u64)> {
+            let members = (0..crates)
+                .map(|index| format!("\"c{index}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut project = InlineTestProject::with_language(Language::Rust).file(
+                "Cargo.toml",
+                format!("[workspace]\nmembers = [{members}]\nresolver = \"2\"\n"),
+            );
+            for index in 0..crates {
+                let dependency = if index == 0 {
+                    String::new()
+                } else {
+                    format!("c{} = {{ path = \"../c{}\" }}\n", index - 1, index - 1)
+                };
+                project = project
+                    .file(
+                        format!("c{index}/Cargo.toml"),
+                        format!(
+                            "[package]\nname = \"c{index}\"\nversion = \"0.1.0\"\n\
+                             edition = \"2024\"\n[dependencies]\n{dependency}"
+                        ),
+                    )
+                    .file(format!("c{index}/src/lib.rs"), "mod leaf;\n")
+                    .file(format!("c{index}/src/leaf.rs"), "pub fn leaf() {}\n");
+            }
+            let fixture = project.build();
+            let disk = RustAnalyzer::new(fixture.project_dyn());
+            let leaf_path = |index: usize| format!("c{index}/src/leaf.rs");
+            let touched_leaf = fixture.file(leaf_path(TOUCHED));
+            let tokens = |analyzer: &RustAnalyzer| {
+                (0..crates)
+                    .map(|index| {
+                        analyzer
+                            .route_unit_input_tokens_for_test(&leaf_path(index))
+                            .expect("unit token")
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let disk_tokens = tokens(&disk);
+
+            let overlay = Arc::new(brokk_bifrost_core::analyzer::project::OverlayProject::new(
+                fixture.project_dyn(),
+            ));
+            assert!(overlay.set(
+                touched_leaf.abs_path(),
+                "pub fn leaf() { let _edited = 1; }\n".to_owned()
+            ));
+            let selected = disk.clone_with_project(Arc::new(overlay.snapshot()));
+            // Key side: only the edited unit's route inputs move.
+            let overlay_tokens = tokens(&selected);
+            for index in 0..crates {
+                assert_eq!(
+                    overlay_tokens[index] != disk_tokens[index],
+                    index == TOUCHED,
+                    "unit c{index}: only the edited unit's route inputs may move"
+                );
+            }
+            // Work side: the route question of the touched crate.
+            let routes = {
+                let _scope = AnalyzerQueryScope::new(&selected);
+                <RustAnalyzer as RustSource>::file_routes(&selected, &touched_leaf, None)
+                    .expect("file routes")
+            };
+            assert!(
+                routes.is_complete() && routes.target_roots(&touched_leaf).len() == 1,
+                "a body edit keeps the touched crate's routes definite"
+            );
+            let derivations = IAnalyzer::snapshot_caches(&selected)
+                .expect("snapshot caches")
+                .derivations();
+            KINDS
+                .into_iter()
+                .map(|kind| {
+                    let counters = derivations.counters(DerivationKindId(kind));
+                    eprintln!("OVERLAY WORK crates={crates} {kind}: {counters:?}");
+                    (kind, counters.recomputed, counters.not_retainable)
+                })
+                .collect()
+        };
+        let small = overlay_work(6);
+        let large = overlay_work(12);
+        assert_eq!(
+            small[0],
+            ("derivation:rust_unit_routes:v1", 1, 1),
+            "the overlay request re-derives the touched unit's routes only: {small:?}"
+        );
+        assert_eq!(
+            small, large,
+            "doubling the unrelated crates must not change the overlay request's work"
+        );
+    }
+
+    #[test]
     #[hardwon("a359fa9c0331: the selected Rust index refused a new open source on its first query")]
     fn production_reference_index_answers_an_unprepared_new_source_overlay() {
         let fixture = InlineTestProject::with_language(Language::Rust)
@@ -2457,5 +4193,818 @@ impl SearchToolsService {
             matches!(result, RustDefinitionShadowResult::Stale(_)),
             "{result:?}"
         );
+    }
+
+    // #11682: overlays that ADD a module, include or cfg-activated edge.
+    //
+    // The mirror of the #11546 tests above. The selected placement relation is
+    // filled from persisted placements, so a module the overlay adds has no
+    // placement; the fill records it in temp.selected_rust_added_edges and the
+    // gap view reports it.
+
+    /// `fixture` with the `edits` laid over it as an overlay.
+    fn overlay_selected(
+        fixture: &crate::inline_project::BuiltInlineTestProject,
+        disk: &RustAnalyzer,
+        edits: &[(&str, &str)],
+    ) -> RustAnalyzer {
+        let overlay = Arc::new(brokk_bifrost_core::analyzer::project::OverlayProject::new(
+            fixture.project_dyn(),
+        ));
+        for (path, source) in edits {
+            assert!(overlay.set(fixture.file(path).abs_path(), (*source).to_owned()));
+        }
+        disk.clone_with_project(Arc::new(overlay.snapshot()))
+    }
+
+    /// The definition lookup of the last `spelling` in `source`, which the
+    /// overlay holds as `rel`.
+    fn overlay_lookup(
+        analyzer: &RustAnalyzer,
+        fixture: &crate::inline_project::BuiltInlineTestProject,
+        rel: &str,
+        source: &str,
+        spelling: &str,
+    ) -> RustDefinitionShadowResult {
+        let file = fixture.file(rel);
+        let site = rust_shadow_site(source, spelling);
+        let tree = rust_shadow_tree(source);
+        selected_rust_definition_shadow_result(
+            analyzer,
+            BoundedReceiverQuery {
+                analyzer,
+                file: &file,
+                source,
+                tree: Some(&tree),
+                site: &site,
+                budget: Default::default(),
+                cancellation: None,
+            },
+        )
+    }
+
+    #[test]
+    #[hardwon("#11834: a decided-true cfg module must retain its module and names")]
+    fn selected_cfg_active_module_keeps_names() {
+        let source = "#[cfg(unix)] mod gated; fn run() { let _: gated::Gated; }";
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname='placement'\nversion='0.1.0'\nedition='2021'\n",
+            )
+            .file(
+                ".cargo/config.toml",
+                "[build]\ntarget='x86_64-unknown-linux-gnu'\n",
+            )
+            .file("src/lib.rs", source)
+            .file("src/gated.rs", "pub struct Gated;")
+            .build();
+        let rust = RustAnalyzer::new(fixture.project_dyn());
+        let result = overlay_lookup(&rust, &fixture, "src/lib.rs", source, "Gated");
+        let definitions = match result {
+            RustDefinitionShadowResult::Complete { definitions, .. }
+            | RustDefinitionShadowResult::Incomplete { definitions, .. } => definitions,
+            other => panic!("active module: {other:?}"),
+        };
+        assert!(
+            definitions.iter().any(|unit| unit.short_name() == "Gated"),
+            "{definitions:?}"
+        );
+    }
+
+    /// A lookup that the overlay answers `Complete` with no definition is the
+    /// fail-open answer: it certifies an absence the disk workspace refutes.
+    fn complete_miss(result: &RustDefinitionShadowResult) -> bool {
+        matches!(result, RustDefinitionShadowResult::Complete { definitions, .. } if definitions.is_empty())
+    }
+
+    #[test]
+    #[hardwon("#11682: a path through a module the overlay adds answered a complete NoDefinition")]
+    fn selected_rust_bare_path_through_an_added_module_is_not_a_complete_miss() {
+        let mut failures = Vec::new();
+        for foo_on_disk in [false, true] {
+            for spelling in ["crate::foo::bar", "self::foo::bar", "foo::bar"] {
+                let mut project = InlineTestProject::with_language(Language::Rust)
+                    .file("Cargo.toml", "[package]\nname = \"added_bare\"\nversion = \"0.1.0\"\nedition = \"2024\"\n")
+                    .file("src/lib.rs", "mod api;\n")
+                    .file("src/api.rs", "pub fn f() {}\n");
+                if foo_on_disk {
+                    project = project.file("src/foo.rs", "pub fn bar() {}\n");
+                }
+                let fixture = project.build();
+                let disk = RustAnalyzer::new(fixture.project_dyn());
+                let source = format!("mod api;\nmod foo;\npub fn call() {{ {spelling}(); }}\n");
+                let mut edits = vec![("src/lib.rs", source.as_str())];
+                if !foo_on_disk {
+                    edits.push(("src/foo.rs", "pub fn bar() {}\n"));
+                }
+                let selected = overlay_selected(&fixture, &disk, &edits);
+                let result = overlay_lookup(&selected, &fixture, "src/lib.rs", &source, "bar");
+                eprintln!("on_disk={foo_on_disk} {spelling}: {result:?}");
+                if complete_miss(&result) {
+                    failures.push((foo_on_disk, spelling));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "complete misses: {failures:?}");
+    }
+
+    /// Lib files for the glob tests: `bar` is declared in files that no edge
+    /// mounts (`foo.rs`, `gone.rs` behind a false cfg, `extra.rs`), and the
+    /// glob importers `user.rs` (direct) and `user2.rs` (through `hub.rs`, which
+    /// re-exports the crate root's glob) are never changed.
+    fn added_edge_glob_fixture() -> crate::inline_project::BuiltInlineTestProject {
+        InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"added_glob\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file(
+                "src/lib.rs",
+                "mod user; mod user2; mod hub;\n#[cfg(any())] mod gone;\n",
+            )
+            .file("src/user.rs", "use crate::*;\npub fn call() { bar(); }\n")
+            .file("src/hub.rs", "pub use crate::*;\n")
+            .file(
+                "src/user2.rs",
+                "use crate::hub::*;\npub fn call() { bar(); }\n",
+            )
+            .file("src/foo.rs", "pub fn bar() {}\n")
+            .file("src/gone.rs", "pub fn bar() {}\n")
+            .file("src/extra.rs", "pub fn bar() {}\n")
+            .build()
+    }
+
+    #[test]
+    #[hardwon(
+        "#11682: a glob of a module whose inventory the overlay grew answered a complete NoDefinition"
+    )]
+    fn selected_rust_glob_of_a_module_with_an_added_edge_is_not_a_complete_miss() {
+        let fixture = added_edge_glob_fixture();
+        let disk = RustAnalyzer::new(fixture.project_dyn());
+        let mut failures = Vec::new();
+        for (kind, lib) in [
+            (
+                "added mod",
+                "mod user; mod user2; mod hub;\n#[cfg(any())] mod gone;\nmod foo;\npub use foo::bar;\n",
+            ),
+            (
+                "gate removed",
+                "mod user; mod user2; mod hub;\nmod gone;\npub use gone::bar;\n",
+            ),
+            (
+                "added include",
+                "mod user; mod user2; mod hub;\n#[cfg(any())] mod gone;\ninclude!(\"extra.rs\");\n",
+            ),
+        ] {
+            let selected = overlay_selected(&fixture, &disk, &[("src/lib.rs", lib)]);
+            // The importers are unchanged files: only the root's edges moved.
+            for (rel, source) in [
+                ("src/user.rs", "use crate::*;\npub fn call() { bar(); }\n"),
+                (
+                    "src/user2.rs",
+                    "use crate::hub::*;\npub fn call() { bar(); }\n",
+                ),
+            ] {
+                let result = overlay_lookup(&selected, &fixture, rel, source, "bar");
+                eprintln!("{kind} {rel}: {result:?}");
+                if complete_miss(&result) {
+                    failures.push((kind, rel));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "complete misses: {failures:?}");
+    }
+
+    #[test]
+    #[hardwon("#11682: a #[path] retarget left the parent inventory closed")]
+    fn selected_rust_path_attribute_retarget_opens_the_parent_inventory_and_a_kept_edge_does_not() {
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"added_retarget\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file("src/lib.rs", "#[path = \"x.rs\"] mod foo;\nmod user;\n")
+            .file("src/x.rs", "pub fn bar() {}\n")
+            .file("src/y.rs", "pub fn bar() {}\n")
+            .file(
+                "src/user.rs",
+                "use crate::*;\npub fn call() { missing(); }\n",
+            )
+            .build();
+        let disk = RustAnalyzer::new(fixture.project_dyn());
+        let user = "use crate::*;\npub fn call() { missing(); }\n";
+        let lookup = |lib: &str| {
+            let selected = overlay_selected(&fixture, &disk, &[("src/lib.rs", lib)]);
+            overlay_lookup(&selected, &fixture, "src/user.rs", user, "missing")
+        };
+        // The same edge, the same target file: the persisted topology stands.
+        let kept = lookup("// edited\n#[path = \"x.rs\"] mod foo;\nmod user;\n");
+        assert!(
+            complete_miss(&kept),
+            "a byte-changed root that keeps its edge must stay a proven absence: {kept:?}"
+        );
+        // Another target file under the same module name is a new edge.
+        let retargeted = lookup("#[path = \"y.rs\"] mod foo;\nmod user;\n");
+        assert!(
+            !complete_miss(&retargeted),
+            "a retargeted #[path] edge names a file no persisted placement holds: {retargeted:?}"
+        );
+    }
+
+    /// An inline `mod foo { .. }` the overlay adds needs no edge: the changed
+    /// declaring file's own selected facts declare the module and its items, so
+    /// point lookups resolve it, and a glob from an unchanged file finds it.
+    #[test]
+    fn selected_rust_inline_module_added_in_a_changed_file_resolves() {
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"added_inline\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file("src/lib.rs", "mod user;\n")
+            .file("src/user.rs", "use crate::*;\npub fn call() { bar(); }\n")
+            .build();
+        let disk = RustAnalyzer::new(fixture.project_dyn());
+        let lib = "mod user;\nmod inline_foo { pub fn bar() {} }\npub use inline_foo::bar;\n\
+                   pub fn call() { inline_foo::bar(); crate::inline_foo::bar(); }\n";
+        let selected = overlay_selected(&fixture, &disk, &[("src/lib.rs", lib)]);
+        let user = "use crate::*;\npub fn call() { bar(); }\n";
+        let mut answers = vec![overlay_lookup(
+            &selected,
+            &fixture,
+            "src/user.rs",
+            user,
+            "bar",
+        )];
+        answers.push(overlay_lookup(
+            &selected,
+            &fixture,
+            "src/lib.rs",
+            lib,
+            "bar",
+        ));
+        for answer in &answers {
+            eprintln!("inline module: {answer:?}");
+            assert!(!complete_miss(answer), "{answer:?}");
+        }
+    }
+
+    /// `#[macro_use] mod macros;` on an added edge moves macro scope into the
+    /// parent. The textual macro walk reads child modules from persisted
+    /// placements, so the macro name must not come back a complete miss.
+    #[test]
+    #[hardwon(
+        "#11682: a macro defined in a #[macro_use] module the overlay adds answered NoDefinition"
+    )]
+    fn selected_rust_macro_use_module_added_by_an_overlay_is_not_a_complete_miss() {
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"added_macro_use\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file("src/lib.rs", "pub fn call() {}\n")
+            .file("src/macros.rs", "macro_rules! m { () => {}; }\n")
+            .build();
+        let disk = RustAnalyzer::new(fixture.project_dyn());
+        let lib = "#[macro_use]\nmod macros;\npub fn call() { m!(); }\n";
+        let selected = overlay_selected(&fixture, &disk, &[("src/lib.rs", lib)]);
+        let answer = overlay_lookup(&selected, &fixture, "src/lib.rs", lib, "m");
+        eprintln!("macro_use: {answer:?}");
+        assert!(!complete_miss(&answer), "{answer:?}");
+    }
+
+    /// A macro the persisted walk already resolves is no proof once an overlay
+    /// adds a `#[macro_use] mod` or an include before the call: the added file
+    /// can define a later macro of the same name, which shadows the earlier one
+    /// in textual scope. A Complete answer holding only the old target is stale.
+    #[test]
+    #[hardwon(
+        "#11682: a macro call that already resolved stayed Complete after an overlay added a shadowing macro_use module or include"
+    )]
+    fn selected_rust_added_macro_scope_edge_reopens_a_macro_that_already_resolves() {
+        let mut stale = Vec::new();
+        for (kind, edge) in [
+            ("macro_use mod", "#[macro_use]\nmod macros;\n"),
+            ("include", "include!(\"macros.rs\");\n"),
+        ] {
+            let fixture = InlineTestProject::with_language(Language::Rust)
+                .file(
+                    "Cargo.toml",
+                    "[package]\nname = \"added_macro_shadow\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+                )
+                .file(
+                    "src/lib.rs",
+                    "macro_rules! m { () => {}; }\npub fn call() { m!(); }\n",
+                )
+                .file("src/macros.rs", "macro_rules! m { () => {}; }\n")
+                .build();
+            let disk = RustAnalyzer::new(fixture.project_dyn());
+            let before = "macro_rules! m { () => {}; }\npub fn call() { m!(); }\n";
+            let on_disk = overlay_lookup(&disk, &fixture, "src/lib.rs", before, "m");
+            assert!(
+                matches!(on_disk, RustDefinitionShadowResult::Complete { ref definitions, .. } if !definitions.is_empty()),
+                "{kind}: the macro resolves before the overlay: {on_disk:?}"
+            );
+            let lib =
+                format!("macro_rules! m {{ () => {{}}; }}\n{edge}pub fn call() {{ m!(); }}\n");
+            let selected = overlay_selected(&fixture, &disk, &[("src/lib.rs", lib.as_str())]);
+            let result = overlay_lookup(&selected, &fixture, "src/lib.rs", &lib, "m");
+            eprintln!("{kind}: {result:?}");
+            if matches!(result, RustDefinitionShadowResult::Complete { .. }) {
+                stale.push(kind);
+            }
+        }
+        assert!(
+            stale.is_empty(),
+            "Complete answers with the old target: {stale:?}"
+        );
+    }
+
+    /// An overlay that adds a module behind a cfg the selected configuration
+    /// cannot decide (`my_flag` is a custom atom, and an incomplete Cargo feature
+    /// set reads the same way) leaves the edge unknown. The persisted topology
+    /// has no gap for an edge it never held, so the reverse set must not come
+    /// back Complete without the caller that edge may mount.
+    #[test]
+    #[hardwon("#11682: an overlay-added edge under an unknown cfg was dropped, not opened")]
+    fn selected_rust_reverse_references_do_not_miss_a_caller_behind_an_unknown_cfg_edge() {
+        for (case, lib_added, extra_files) in [
+            (
+                "mod",
+                "pub fn top() {}\n#[cfg(my_flag)] mod caller;\n",
+                vec![("src/caller.rs", "pub fn call() { crate::top(); }\n")],
+            ),
+            (
+                "enclosing inline cfg",
+                "pub fn top() {}\n#[cfg(my_flag)] mod wrap { mod caller; }\n",
+                vec![("src/wrap/caller.rs", "pub fn call() { crate::top(); }\n")],
+            ),
+            (
+                "include under cfg",
+                "pub fn top() {}\n#[cfg(my_flag)] mod wrap { include!(\"caller.rs\"); }\n",
+                vec![("src/caller.rs", "pub fn call() { crate::top(); }\n")],
+            ),
+        ] {
+            let mut project = InlineTestProject::with_language(Language::Rust).file(
+                "Cargo.toml",
+                "[package]\nname = \"added_unknown\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file("src/lib.rs", "pub fn top() {}\n");
+            for (path, source) in &extra_files {
+                project = project.file(*path, *source);
+            }
+            let fixture = project.build();
+            let disk = RustAnalyzer::new(fixture.project_dyn());
+            let target = disk
+                .all_declarations()
+                .find(|unit| unit.identifier() == "top")
+                .expect("disk target");
+            let caller = fixture.file(extra_files[0].0);
+            let added = overlay_selected(&fixture, &disk, &[("src/lib.rs", lib_added)]);
+            assert!(
+                !reverse_misses_caller(&added, &target, &caller),
+                "{case}: the overlay adds an edge that may mount the caller, yet the reverse set is complete without it"
+            );
+        }
+    }
+
+    /// The files whose persisted placements the selection unplaces when the
+    /// overlay removes `removed` from `fixture`, read from the fill's own relation.
+    fn unplaced_files_after_removing(
+        fixture: &crate::inline_project::BuiltInlineTestProject,
+        removed: &str,
+    ) -> Vec<String> {
+        use brokk_bifrost_analysis::analyzer::store::resolution_selection::{
+            SelectedResolutionLanguage, SelectedResolutionMountInventoryOutcome,
+            SelectedResolutionOverlayMask,
+        };
+        let analyzer = fixture.workspace_analyzer(Default::default());
+        let store = analyzer.store().unwrap();
+        let workspace = {
+            let conn = store.conn.lock().unwrap();
+            brokk_bifrost_analysis::analyzer::store::WorkspaceId(
+                conn.query_row(
+                    "SELECT workspace_id FROM workspace_heads WHERE lang='rust'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            )
+        };
+        let snapshots = store
+            .workspace_snapshots_for_current_languages(&workspace, &["rust".into()])
+            .unwrap();
+        let SelectedResolutionMountInventoryOutcome::Ready(selection) = store
+            .open_selected_resolution_mount_inventory(
+                &workspace,
+                &snapshots,
+                &[SelectedResolutionLanguage::new("rust", Language::Rust)],
+                &[SelectedResolutionOverlayMask::removal("rust", removed)],
+                &CancellationToken::default(),
+            )
+            .unwrap()
+        else {
+            panic!("complete selection");
+        };
+        selection
+            .connection()
+            .prepare(
+                "SELECT DISTINCT member.rel_path FROM temp.selected_rust_unplaced_placements AS unplaced
+                 JOIN main.resolution_unit_summary_members AS member
+                   ON member.summary_id=unplaced.summary_id AND member.member_ordinal=unplaced.member_ordinal
+                 ORDER BY 1",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    /// `host_b.rs` includes `shared.rs`, and so does the root. A removed host
+    /// kills the files it alone includes, but a file that a live host still
+    /// includes keeps its placement: the dead host's edge is not the file's.
+    #[test]
+    #[hardwon("#11752: removing one host's include unplaced a file the root still includes")]
+    fn selected_rust_removed_include_host_unplaces_only_what_no_live_host_includes() {
+        let fixture = |lib: &str| {
+            InlineTestProject::with_language(Language::Rust)
+                .file("Cargo.toml", "[package]\nname = \"shared_include\"\nversion = \"0.1.0\"\nedition = \"2024\"\n")
+                .file("src/lib.rs", lib)
+                .file("src/host_b.rs", "include!(\"shared.rs\");\n")
+                .file("src/shared.rs", "pub fn shared() {}\n")
+                .build()
+        };
+        // The root includes shared.rs itself: only host_b.rs goes.
+        assert_eq!(
+            unplaced_files_after_removing(
+                &fixture("include!(\"shared.rs\");\ninclude!(\"host_b.rs\");\n"),
+                "src/host_b.rs"
+            ),
+            ["src/host_b.rs"]
+        );
+        // Control: host_b.rs alone includes shared.rs, so both go.
+        assert_eq!(
+            unplaced_files_after_removing(&fixture("include!(\"host_b.rs\");\n"), "src/host_b.rs"),
+            ["src/host_b.rs", "src/shared.rs"]
+        );
+    }
+
+    /// Whether the reverse set of `target` is `Complete` and holds no edge from
+    /// `caller`: the answer the disk workspace refutes once `caller` is mounted.
+    fn reverse_misses_caller(
+        selected: &RustAnalyzer,
+        target: &CodeUnit,
+        caller: &brokk_bifrost_core::analyzer::model::ProjectFile,
+    ) -> bool {
+        match build_rust_selected_reference_index(selected, &CancellationToken::default()) {
+            RustSelectedReferenceIndexOutcome::Ready(index) => {
+                let answer = index.inverse_for(target);
+                answer.completeness == EdgeCompleteness::Complete
+                    && !answer.edges.iter().any(|edge| edge.site.file == *caller)
+            }
+            // A typed non-answer is also fail closed.
+            RustSelectedReferenceIndexOutcome::Unavailable(_)
+            | RustSelectedReferenceIndexOutcome::Stale(_)
+            | RustSelectedReferenceIndexOutcome::StoreError(_) => false,
+            RustSelectedReferenceIndexOutcome::Cancelled => panic!("cancelled"),
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#11682: reverse references missed a caller in a file the overlay mounted or re-activated"
+    )]
+    fn selected_rust_reverse_references_do_not_miss_a_caller_in_an_added_module() {
+        for (case, lib_disk, lib_added, lib_control) in [
+            (
+                "re-activated",
+                "pub fn top() {}\n#[cfg(any())] mod caller;\n",
+                "pub fn top() {}\nmod caller;\n",
+                "pub fn top() {}\n// edited\n#[cfg(any())] mod caller;\n",
+            ),
+            (
+                "orphan on disk",
+                "pub fn top() {}\n",
+                "pub fn top() {}\nmod caller;\n",
+                "pub fn top() {}\n// edited\n",
+            ),
+        ] {
+            let fixture = InlineTestProject::with_language(Language::Rust)
+                .file("Cargo.toml", "[package]\nname = \"added_reverse\"\nversion = \"0.1.0\"\nedition = \"2024\"\n")
+                .file("src/lib.rs", lib_disk)
+                .file("src/caller.rs", "pub fn call() { crate::top(); }\n")
+                .build();
+            let disk = RustAnalyzer::new(fixture.project_dyn());
+            let target = disk
+                .all_declarations()
+                .find(|unit| unit.identifier() == "top")
+                .expect("disk target");
+            let caller = fixture.file("src/caller.rs");
+            // A file that no edge mounts is in no crate: Complete with no caller is right.
+            let control = overlay_selected(&fixture, &disk, &[("src/lib.rs", lib_control)]);
+            assert!(
+                reverse_misses_caller(&control, &target, &caller),
+                "{case}: an unmounted caller is correctly absent from a complete set"
+            );
+            let added = overlay_selected(&fixture, &disk, &[("src/lib.rs", lib_added)]);
+            assert!(
+                !reverse_misses_caller(&added, &target, &caller),
+                "{case}: the overlay mounts the caller, yet the reverse set is complete without it"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon("#11682: package_contains denied a file an overlay mounted")]
+    fn selected_rust_package_contains_is_incomplete_for_an_added_edge_target() {
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"added_package_member\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file("src/lib.rs", "pub fn root() {}\n")
+            .build();
+        let disk = RustAnalyzer::new(fixture.project_dyn());
+        let selected = overlay_selected(
+            &fixture,
+            &disk,
+            &[
+                ("src/lib.rs", "include!(\"foo.rs\");\npub fn root() {}\n"),
+                ("src/foo.rs", "pub fn added() {}\n"),
+                ("src/orphan.rs", "pub fn orphan() {}\n"),
+            ],
+        );
+        let _scope = AnalyzerQueryScope::new(&selected);
+
+        let added = selected
+            .package_view()
+            .contains(&fixture.file("src/foo.rs"), None)
+            .expect("added target membership");
+        assert!(!added.value, "new file has no persisted package row");
+        assert!(!added.complete, "the overlay edge makes absence unknown");
+
+        let orphan = selected
+            .package_view()
+            .contains(&fixture.file("src/orphan.rs"), None)
+            .expect("orphan membership");
+        assert!(!orphan.value, "orphan has no package membership");
+        assert!(orphan.complete, "no overlay edge targets the orphan");
+    }
+
+    /// A file included inside an inline module belongs to that inline module,
+    /// whose container has no opening file of its own. A `mod foo;` added to
+    /// such a file must still be an added edge: with its directories unknown
+    /// the edge keeps a NULL target, and with the host's directories known the
+    /// target files are named by the walk's rule (the including file's module
+    /// directory plus the inline chain).
+    #[test]
+    #[hardwon(
+        "#11682: a mod added in a file included inside an inline module produced no added edge"
+    )]
+    fn selected_rust_mod_added_in_a_file_included_in_an_inline_module_is_an_added_edge() {
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"added_in_included\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file("src/lib.rs", "mod inl { include!(\"d.rs\"); }\nmod user;\n")
+            .file("src/d.rs", "pub fn d() {}\n")
+            .file("src/user.rs", "pub fn call() { crate::inl::foo::x(); }\n")
+            .build();
+        let disk = RustAnalyzer::new(fixture.project_dyn());
+        let user = "pub fn call() { crate::inl::foo::x(); }\n";
+        let selected = overlay_selected(
+            &fixture,
+            &disk,
+            &[
+                ("src/d.rs", "mod foo;\npub fn d() {}\n"),
+                ("src/inl/foo.rs", "pub fn x() {}\n"),
+            ],
+        );
+        let result = overlay_lookup(&selected, &fixture, "src/user.rs", user, "x");
+        eprintln!("added in included-in-inline: {result:?}");
+        assert!(
+            !complete_miss(&result),
+            "the included file mounts crate::inl::foo, so the lookup is not a proven absence: {result:?}"
+        );
+        let _scope = AnalyzerQueryScope::new(&selected);
+        let contains = selected
+            .package_view()
+            .contains(&fixture.file("src/inl/foo.rs"), None)
+            .expect("membership");
+        assert!(!contains.value && !contains.complete, "{contains:?}");
+    }
+
+    /// The inline step of the directory derivation matches a placement to its own
+    /// declaration by scope identity: one file can declare same-named inline
+    /// modules under different parents with different `#[path]` values, and only
+    /// the including module's directory is a candidate.
+    #[test]
+    #[hardwon(
+        "#11682: same-named inline modules in one file under different parents leaked each other's #[path] into an added edge's candidates"
+    )]
+    fn selected_rust_added_mod_in_an_inline_module_uses_only_its_own_declaration_path() {
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"same_named_inline\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file(
+                "src/lib.rs",
+                "mod a {\n    #[path = \"pa\"]\n    mod common { include!(\"d.rs\"); }\n}\n\
+                 mod b {\n    #[path = \"pb\"]\n    mod common {}\n}\n",
+            )
+            .file("src/d.rs", "pub fn d() {}\n")
+            .build();
+        let disk = RustAnalyzer::new(fixture.project_dyn());
+        let selected = overlay_selected(
+            &fixture,
+            &disk,
+            &[
+                ("src/d.rs", "mod foo;\npub fn d() {}\n"),
+                ("src/a/pa/foo.rs", "pub fn x() {}\n"),
+                ("src/a/pb/foo.rs", "pub fn y() {}\n"),
+                ("src/b/pb/foo.rs", "pub fn z() {}\n"),
+            ],
+        );
+        let _scope = AnalyzerQueryScope::new(&selected);
+        let contains = |rel: &str| {
+            let answer = selected
+                .package_view()
+                .contains(&fixture.file(rel), None)
+                .expect("membership");
+            assert!(!answer.value, "{rel}: no persisted package row");
+            answer.complete
+        };
+        assert!(
+            !contains("src/a/pa/foo.rs"),
+            "the including module's own directory"
+        );
+        assert!(
+            contains("src/a/pb/foo.rs"),
+            "the other `common`'s #[path] is not a candidate"
+        );
+        assert!(
+            contains("src/b/pb/foo.rs"),
+            "nor is a file below the other parent"
+        );
+    }
+
+    /// `contains` reads the added-edge relation directly and records no read of
+    /// it. That is safe because every reuse of its answer is bound to one
+    /// selection: the request memo is replaced at each outermost query scope
+    /// (`RustRouteRequestMemo`), the engine caches only the unit-row derivations
+    /// that `contains` composes with a fresh read of the relation (an overlay
+    /// authority retains no derivation: `derivation_host/authority.rs`
+    /// `retention_refusal`), and a recorded derivation read cannot be replayed
+    /// against an overlay head (`AnalyzerDerivations::replay` answers
+    /// `Missing`, which `read_verification.rs` turns into
+    /// `ReverseDependencyEvidenceMissing`).
+    /// This test follows the sequence the review asked about: the target is
+    /// queried while absent from every edge, then another file gains the edge,
+    /// on the same long-lived analyzer family, and the answer matches a fresh
+    /// analyzer's; the negative recorded first must not replay as unchanged.
+    #[test]
+    fn selected_rust_package_contains_follows_an_edge_another_file_gains_later() {
+        use brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer;
+        use brokk_bifrost_analysis::analyzer::read_ledger::{
+            LookupKind, LookupQuestion, ReadKey, ReadLedger,
+        };
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"added_package_replay\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file("src/lib.rs", "pub fn root() {}\n")
+            .build();
+        let disk = RustAnalyzer::new(fixture.project_dyn());
+        let foo = ("src/foo.rs", "pub fn foo() {}\n");
+        let edge = ("src/lib.rs", "mod foo;\npub fn root() {}\n");
+        let unmounted = overlay_selected(&fixture, &disk, &[foo]);
+        let mounted = overlay_selected(&fixture, &disk, &[edge, foo]);
+        let target = fixture.file("src/foo.rs");
+        let ledger = Arc::new(ReadLedger::new());
+        let first = {
+            let _scope = AnalyzerQueryScope::with_read_ledger(&unmounted, ledger.clone());
+            unmounted.package_view().contains(&target, None).unwrap()
+        };
+        assert!(
+            !first.value && first.complete,
+            "no edge reaches foo.rs: {first:?}"
+        );
+        // The same family, later: lib.rs gains `mod foo;`.
+        let later = {
+            let _scope = AnalyzerQueryScope::new(&mounted);
+            mounted.package_view().contains(&target, None).unwrap()
+        };
+        let fresh_disk = RustAnalyzer::new(fixture.project_dyn());
+        let fresh = overlay_selected(&fixture, &fresh_disk, &[edge, foo]);
+        let from_scratch = {
+            let _scope = AnalyzerQueryScope::new(&fresh);
+            fresh.package_view().contains(&target, None).unwrap()
+        };
+        assert!(
+            !later.complete,
+            "the added edge makes absence unknown: {later:?}"
+        );
+        assert_eq!(
+            (later.value, later.complete),
+            (from_scratch.value, from_scratch.complete),
+            "incremental and from-scratch answers agree"
+        );
+        // The negative recorded first names the file-units derivation; the overlay
+        // head cannot replay it, so a consumer that recorded it is invalidated.
+        let (kind, question, digest) = ledger
+            .keys()
+            .into_iter()
+            .find_map(|read| match read {
+                ReadKey::Lookup {
+                    kind: LookupKind::Derivation(kind),
+                    question: LookupQuestion::Derivation(question),
+                    digest,
+                } if kind.0 == "derivation:rust_file_units:v1" => Some((kind, question, digest)),
+                _ => None,
+            })
+            .expect("the negative records the file-units derivation");
+        let replayed = IAnalyzer::derivations(&mounted)
+            .expect("derivation host")
+            .replay(&mounted, kind, &question);
+        assert_ne!(
+            replayed,
+            brokk_bifrost_analysis::analyzer::derivation_host::ReplayResult::Identity(
+                brokk_bifrost_semantic::analyzer::semantic::derivation::OutputIdentity(digest)
+            ),
+            "an overlay head must not replay the recorded negative as unchanged"
+        );
+    }
+
+    /// An added `mod x;` has no target file in any persisted row either, so the
+    /// fill names each file it can mount by the module walk's own path rule:
+    /// `x.rs` and `x/mod.rs` below the declaring module's directory, or the
+    /// `#[path]` value below the declaring file's directory.
+    #[test]
+    #[hardwon(
+        "#11682: package membership of a file mounted by an overlay-added `mod x;` was a complete negative"
+    )]
+    fn selected_rust_package_contains_is_incomplete_for_an_added_module_edge_target() {
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"added_package_module\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file("src/lib.rs", "mod api;\nmod nested;\npub fn root() {}\n")
+            .file("src/api.rs", "pub fn api() {}\n")
+            .file("src/nested/mod.rs", "pub fn nested() {}\n")
+            .build();
+        let disk = RustAnalyzer::new(fixture.project_dyn());
+        let selected = overlay_selected(
+            &fixture,
+            &disk,
+            &[
+                (
+                    "src/lib.rs",
+                    "mod api;\nmod nested;\nmod foo;\n#[path = \"x/y.rs\"]\nmod z;\npub fn root() {}\n",
+                ),
+                // A file module (`api.rs`) and a `mod.rs` module both open their
+                // children below their own module directory.
+                ("src/api.rs", "mod child;\npub fn api() {}\n"),
+                ("src/nested/mod.rs", "mod inner;\npub fn nested() {}\n"),
+                ("src/foo.rs", "pub fn foo() {}\n"),
+                ("src/x/y.rs", "pub fn y() {}\n"),
+                ("src/api/child.rs", "pub fn child() {}\n"),
+                ("src/nested/inner.rs", "pub fn inner() {}\n"),
+                ("src/orphan.rs", "pub fn orphan() {}\n"),
+                // `#[path]` replaces the name rule: `z.rs` is not a candidate.
+                ("src/z.rs", "pub fn z() {}\n"),
+            ],
+        );
+        let _scope = AnalyzerQueryScope::new(&selected);
+        let contains = |rel: &str| {
+            let answer = selected
+                .package_view()
+                .contains(&fixture.file(rel), None)
+                .expect("membership");
+            assert!(!answer.value, "{rel}: no persisted package row");
+            answer.complete
+        };
+        for mounted in [
+            "src/foo.rs",
+            "src/foo/mod.rs",
+            "src/x/y.rs",
+            "src/api/child.rs",
+            "src/api/child/mod.rs",
+            "src/nested/inner.rs",
+            "src/nested/inner/mod.rs",
+        ] {
+            assert!(!contains(mounted), "{mounted}: an added `mod` can mount it");
+        }
+        for unmounted in ["src/orphan.rs", "src/z.rs", "src/api/orphan.rs"] {
+            assert!(
+                contains(unmounted),
+                "{unmounted}: no added edge can mount it"
+            );
+        }
     }
 }

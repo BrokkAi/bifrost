@@ -254,10 +254,15 @@ impl<'source> RustDeclarationPropertyCollector<'source> {
             trait_impl_member,
             derive_helper_attributes:
                 crate::resolution::rust_item_conditional_derive_helper_attributes(node, self.source),
+            builtin_derives: crate::resolution::rust_item_builtin_derives(node, self.source),
+            // Built-in derives keep their surface on the declaration-site gap,
+            // which the crate route closes once each derive name is proven;
+            // they are not a route boundary of their own (#11325).
             generated_surface: crate::resolution::rust_item_has_generated_surface_boundary(
                 node,
                 self.source,
-            ),
+            ) && crate::resolution::rust_item_builtin_derives(node, self.source)
+                .is_none(),
         };
         let index = self.rows.len();
         assert!(

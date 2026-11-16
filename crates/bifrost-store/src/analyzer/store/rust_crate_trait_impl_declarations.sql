@@ -21,10 +21,14 @@
 -- `cr_reexport_steps` and `cr_glob_steps`, already hold this crate's own
 -- steps, private ones included, and the steps the derived crates published.
 --
--- A half whose chase ends at more than one file names no single declaration.
--- Rust rejects such a name as ambiguous, so the half binds nothing here and
--- its impl is recorded as bound without a declaration.
-INSERT OR IGNORE INTO cr_impl_declarations
+-- A half whose chase ends at more than one placement names no single
+-- declaration: more than one file, or one file that declares a distinct type at
+-- each module path or crate that places it (a file included twice, or shared by
+-- two crates, reached through two globs). Rust rejects such a name as
+-- ambiguous, so the half binds nothing here and its impl is recorded as bound
+-- without a declaration; the name form a row carries is never a first match.
+INSERT INTO cr_impl_declarations
+SELECT * FROM (
 WITH RECURSIVE chase(blob_id, relation_key, module_path, side, declaration_blob_id,
                      declaration_site, crate_key, at_module, at_name) AS (
   SELECT binding.blob_id, binding.relation_key, binding.module_path, binding.side,
@@ -65,9 +69,11 @@ WITH RECURSIVE chase(blob_id, relation_key, module_path, side, declaration_blob_
                      AND declared.origin='declaration')
 ),
 placements(blob_id, relation_key, module_path, side, declaration_blob_id,
-           declaration_site, rel_path) AS (
+           declaration_site, rel_path, declaring_unit_key, declaring_module_path,
+           declaring_name) AS (
   SELECT chase.blob_id, chase.relation_key, chase.module_path, chase.side,
-         chase.declaration_blob_id, chase.declaration_site, member.rel_path
+         chase.declaration_blob_id, chase.declaration_site, member.rel_path,
+         chase.crate_key, chase.at_module, chase.at_name
   FROM chase
   CROSS JOIN cr_identity AS identity ON identity.crate_key=chase.crate_key
   CROSS JOIN cr_exports AS declared ON declared.crate_key=chase.crate_key
@@ -80,7 +86,8 @@ placements(blob_id, relation_key, module_path, side, declaration_blob_id,
     AND declared.declaration_site=chase.declaration_site
   UNION
   SELECT chase.blob_id, chase.relation_key, chase.module_path, chase.side,
-         chase.declaration_blob_id, chase.declaration_site, source.rel_path
+         chase.declaration_blob_id, chase.declaration_site, source.rel_path,
+         chase.crate_key, chase.at_module, chase.at_name
   FROM chase
   CROSS JOIN cr_foreign AS dependency ON dependency.crate_key=chase.crate_key
   CROSS JOIN rust_crate_exports AS declared ON declared.topology_id=dependency.topology_id
@@ -93,9 +100,15 @@ placements(blob_id, relation_key, module_path, side, declaration_blob_id,
   WHERE declared.origin='declaration'
     AND declared.declaration_blob_id=chase.declaration_blob_id
     AND declared.declaration_site=chase.declaration_site
+),
+reached AS (
+  -- `placements` is a UNION, so each row is a distinct placement.
+  SELECT placements.*,
+         count(*) OVER (PARTITION BY blob_id, relation_key, module_path, side) AS placement_count
+  FROM placements
 )
 SELECT blob_id, relation_key, module_path, side, declaration_blob_id, declaration_site,
-       min(rel_path)
-FROM placements
-GROUP BY blob_id, relation_key, module_path, side
-HAVING count(DISTINCT rel_path) = 1;
+       rel_path, declaring_unit_key, declaring_module_path, declaring_name
+FROM reached
+WHERE placement_count = 1
+) WHERE true ON CONFLICT DO NOTHING;

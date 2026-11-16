@@ -99,7 +99,7 @@ fn context_package_candidates_admit_only_matching_and_open_prefixes() {
             .unzip();
         connection.execute(
             "INSERT INTO temp.selected_resolution_context_paths(context_id,host_ordinal,path,start_node,end_node,start_lead_key,start_lead_shared,end_lead_key,end_lead_shared,body,start_fixed_key,start_open_tail,end_fixed_key,end_open_tail) VALUES(1,0,?1,?2,?2,?3,?4,?3,?4,jsonb(?5),?6,?7,?6,?7)",
-            rusqlite::params![codec::encode_path_id(PartialPathId::context_local(i as u64)), codec::encode_node(candidate.node()), key, shared, codec::encode_path(&path),fixed,open_tail],
+            rusqlite::params![codec::encode_path_id(PartialPathId::context_local(i as u64)), codec::encode_node(candidate.node()), key, shared, codec::encode_path(&path).unwrap(),fixed,open_tail],
         ).unwrap();
     }
     for (request_endpoint, expected) in [

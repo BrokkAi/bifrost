@@ -3,6 +3,7 @@ use crate::cancellation::CancellationToken;
 use brokk_bifrost_test_macros::hardwon;
 
 #[test]
+#[hardwon("#11321: execution refusal omitted the dimension and tested grant")]
 fn public_request_honors_exact_file_budget() {
     let project = InlineTestProject::with_language(Language::Python)
         .file("first.py", "def first():\n    pass\n")
@@ -23,6 +24,24 @@ fn public_request_honors_exact_file_budget() {
         let result = response.result().unwrap();
         assert_eq!(result.results.len(), maximum, "{result:?}");
         assert_eq!(result.truncated, maximum == 1, "{result:?}");
+        if maximum == 1 {
+            let roots = result
+                .diagnostics
+                .iter()
+                .flat_map(|diagnostic| &diagnostic.exhausted_roots)
+                .collect::<Vec<_>>();
+            assert!(
+                roots.iter().any(|root| root.lane == "query/scanned_files"),
+                "{roots:?}"
+            );
+            assert!(
+                roots
+                    .iter()
+                    .filter_map(|root| root.charge)
+                    .any(|charge| charge.limit == 1 && charge.attempted > charge.limit),
+                "{roots:?}"
+            );
+        }
     }
 }
 
@@ -266,4 +285,179 @@ fn registered_failure_depth_status_obeys_consumer_gate() {
             }
         }
     }
+}
+
+#[test]
+#[hardwon(
+    "#11321: a spent file allowance was mislabeled as refused when source bytes refused the next file"
+)]
+fn budget_telemetry_distinguishes_spent_files_from_refused_bytes() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("first.py", "def first():\n    pass\n")
+        .file("second.py", "def second():\n    pass\n")
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let query = CodeQuery::from_json(&json!({"match": {"kind": "function"}})).unwrap();
+    let response = execute_request_with_limits(
+        &analyzer,
+        &query,
+        CodeQueryExecutionLimits {
+            max_scanned_files: 2,
+            max_scanned_source_bytes: 32,
+            ..CodeQueryExecutionLimits::default()
+        },
+    );
+    let result = response.result().unwrap();
+    assert!(result.truncated);
+    let lanes = result
+        .diagnostics
+        .iter()
+        .flat_map(|diagnostic| &diagnostic.exhausted_roots)
+        .map(|root| root.lane.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(lanes, ["query/scanned_source_bytes"]);
+    let root = &result
+        .diagnostics
+        .iter()
+        .flat_map(|diagnostic| &diagnostic.exhausted_roots)
+        .next()
+        .unwrap();
+    assert_eq!(
+        root.budget.unwrap().consumed,
+        "def first():\n    pass\n".len()
+    );
+    assert_eq!(root.budget.unwrap().limit, 32);
+    assert!(root.stage.is_some());
+}
+
+#[test]
+#[hardwon("#11321: repeated budget refusals must retain bounded witnesses and every refused lane")]
+fn budget_telemetry_merges_skipped_unit_refusals() {
+    let limits = CodeQueryExecutionLimits {
+        max_fact_nodes: 1,
+        ..CodeQueryExecutionLimits::default()
+    };
+    let work = CodeQueryExecutionWork {
+        fact_nodes: 1,
+        ..CodeQueryExecutionWork::default()
+    };
+    let mut diagnostics = Vec::new();
+    for _ in 0..2 {
+        push_unit_budget_diagnostic(
+            &mut diagnostics,
+            limits,
+            &work,
+            &CodeQueryBudgetedWork::default(),
+        );
+    }
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].exhausted_roots.len(), 1);
+
+    // Each refused source file has a different charge, but only its lane's
+    // first admission witness is needed. Preserve other refused lanes too.
+    for attempted in 2..10_002 {
+        super::super::render::push_call_relation_budget_diagnostics(
+            &mut diagnostics,
+            &CodeQueryExecutionBudget::default(),
+            limits,
+            &CodeQueryExecutionBudget::default(),
+            &[
+                CallRelationBudgetRefusal::SourceBytes {
+                    consumed: 0,
+                    attempted,
+                    limit: 1,
+                },
+                CallRelationBudgetRefusal::Files {
+                    consumed: 1,
+                    limit: 1,
+                },
+            ],
+        );
+    }
+    assert_eq!(diagnostics.len(), 1);
+    let roots = &diagnostics[0].exhausted_roots;
+    assert_eq!(
+        roots
+            .iter()
+            .map(|root| root.lane.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "query/fact_nodes",
+            "query/scanned_source_bytes",
+            "query/scanned_files"
+        ]
+    );
+    assert_eq!(roots[1].budget.unwrap().consumed, 0);
+    assert_eq!(roots[1].charge.unwrap().attempted, 2);
+    assert_eq!(roots[1].charge.unwrap().limit, 1);
+}
+
+#[test]
+#[hardwon("#11321: relation-local refusal counts hid work already charged by the query")]
+fn budget_telemetry_offsets_call_relation_refusals() {
+    let limits = CodeQueryExecutionLimits {
+        max_scanned_files: 10,
+        max_scanned_source_bytes: 100,
+        max_fact_nodes: 100,
+        ..CodeQueryExecutionLimits::default()
+    };
+    let relation_start = CodeQueryExecutionBudget {
+        scanned_files: 9,
+        scanned_source_bytes: 90,
+        fact_nodes: 70,
+        examined_references: 20,
+        ..CodeQueryExecutionBudget::default()
+    };
+    let charged = CodeQueryExecutionBudget {
+        scanned_files: 10,
+        scanned_source_bytes: 95,
+        examined_references: 30,
+        ..relation_start
+    };
+    let mut diagnostics = Vec::new();
+    super::super::render::push_call_relation_budget_diagnostics(
+        &mut diagnostics,
+        &charged,
+        limits,
+        &relation_start,
+        &[
+            CallRelationBudgetRefusal::Files {
+                consumed: 1,
+                limit: 1,
+            },
+            CallRelationBudgetRefusal::SourceBytes {
+                consumed: 5,
+                attempted: 11,
+                limit: 10,
+            },
+            CallRelationBudgetRefusal::Candidates {
+                consumed: 10,
+                limit: 10,
+            },
+        ],
+    );
+    assert_eq!(diagnostics.len(), 1);
+    let roots = &diagnostics[0].exhausted_roots;
+    assert_eq!(roots.len(), 3);
+    for (root, lane, consumed, limit) in [
+        (&roots[0], "query/scanned_files", 10, 10),
+        (&roots[1], "query/scanned_source_bytes", 95, 100),
+        (&roots[2], "query/fact_nodes", 100, 100),
+    ] {
+        assert_eq!(root.lane, lane);
+        assert_eq!(root.stage.as_deref(), Some("call_relation"));
+        assert_eq!(
+            root.budget,
+            Some(CodeQueryExhaustedBudget { consumed, limit })
+        );
+    }
+    assert!(roots[0].charge.is_none());
+    assert_eq!(
+        roots[1].charge,
+        Some(CodeQueryExhaustedCharge {
+            attempted: 101,
+            limit: 100,
+        })
+    );
+    assert!(roots[2].charge.is_none());
 }

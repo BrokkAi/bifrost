@@ -438,6 +438,17 @@ impl<'request> CfgAlgorithmRequest<'request> {
         self.visit_node()
     }
 
+    /// Precharge a dense relation's cell count before allocating its matrices.
+    pub fn visit_pairs<Node>(&mut self, count: usize) -> Result<(), CfgAlgorithmError<Node>> {
+        self.checkpoint()?;
+        self.budget
+            .charge(CfgAlgorithmWork {
+                node_visits: count,
+                edge_visits: 0,
+            })
+            .map_err(CfgAlgorithmError::ExceededBudget)
+    }
+
     #[doc(hidden)]
     pub fn visit_edge<Node>(&mut self) -> Result<(), CfgAlgorithmError<Node>> {
         self.checkpoint()?;
@@ -459,6 +470,13 @@ pub struct Reachability<Node> {
 }
 
 impl<Node: Copy> Reachability<Node> {
+    /// Allocator-rounded owned membership storage.
+    pub fn allocated_heap_bytes(&self) -> usize {
+        brokk_bifrost_core::allocation_size::allocation_size(std::mem::size_of_val(
+            &*self.membership,
+        ))
+    }
+
     pub fn contains<G>(&self, graph: &G, node: Node) -> bool
     where
         G: DenseBidirectionalGraph<Node = Node>,
@@ -506,7 +524,28 @@ where
 {
     reachability(
         graph,
-        start,
+        [start],
+        Direction::Forward,
+        &|_| false,
+        &|_| true,
+        &|_| true,
+        &|_| (&[], &[]),
+        request,
+    )
+}
+
+/// Forward closure from all starts, sharing one charged traversal.
+pub fn forward_reachability_from_all<G>(
+    graph: &G,
+    starts: impl IntoIterator<Item = G::Node>,
+    request: &mut CfgAlgorithmRequest<'_>,
+) -> Result<Reachability<G::Node>, CfgAlgorithmError<G::Node>>
+where
+    G: DenseBidirectionalGraph,
+{
+    reachability(
+        graph,
+        starts,
         Direction::Forward,
         &|_| false,
         &|_| true,
@@ -555,7 +594,7 @@ where
 {
     reachability(
         graph,
-        start,
+        [start],
         Direction::Forward,
         &|_| false,
         &continue_from,
@@ -575,7 +614,7 @@ where
 {
     reachability(
         graph,
-        start,
+        [start],
         Direction::Reverse,
         &|_| false,
         &|_| true,
@@ -604,7 +643,7 @@ where
 {
     reachability(
         graph,
-        start,
+        [start],
         Direction::Forward,
         &avoid,
         &|_| true,
@@ -618,7 +657,7 @@ where
 #[allow(clippy::too_many_arguments)]
 fn reachability<'a, G>(
     graph: &G,
-    start: G::Node,
+    starts: impl IntoIterator<Item = G::Node>,
     direction: Direction,
     avoid: &impl Fn(G::Node) -> bool,
     continue_from: &impl Fn(G::Node) -> bool,
@@ -632,20 +671,18 @@ where
 {
     request.checkpoint()?;
     let started = request.budget.used();
-    let start_index = graph
-        .node_index(start)
-        .ok_or(CfgAlgorithmError::InvalidNode(start))?;
     let mut membership = vec![false; graph.node_count()];
-    if avoid(start) {
-        return Ok(Reachability {
-            membership: membership.into_boxed_slice(),
-            work: request.budget.used().saturating_sub(started),
-            node: std::marker::PhantomData,
-        });
+    let mut stack = Vec::new();
+    for start in starts {
+        let index = graph
+            .node_index(start)
+            .ok_or(CfgAlgorithmError::InvalidNode(start))?;
+        if !avoid(start) && !membership[index] {
+            membership[index] = true;
+            request.visit_node()?;
+            stack.push(start);
+        }
     }
-    membership[start_index] = true;
-    request.visit_node()?;
-    let mut stack = vec![start];
 
     while let Some(node) = stack.pop() {
         request.checkpoint()?;
@@ -844,7 +881,7 @@ where
     strongly_connected_components_with_order(graph, request).map(|(components, _)| components)
 }
 
-fn strongly_connected_components_with_order<G>(
+pub fn strongly_connected_components_with_order<G>(
     graph: &G,
     request: &mut CfgAlgorithmRequest<'_>,
 ) -> AlgorithmResult<ComponentsWithOrder<G::Node, G::Edge>, G::Node>
@@ -1918,6 +1955,13 @@ where
 pub struct LiveValueSets(ReachingSets);
 
 impl LiveValueSets {
+    /// Allocator-rounded owned dataflow storage.
+    pub fn allocated_heap_bytes(&self) -> usize {
+        brokk_bifrost_core::allocation_size::allocation_size(std::mem::size_of_val(
+            &*self.0.entry_sets,
+        ))
+    }
+
     pub fn live_in(&self, node_index: usize, value: usize) -> bool {
         self.0.reaches_in(node_index, value)
     }
@@ -2038,7 +2082,7 @@ pub fn value_liveness_facts(
                 // classify_snapshot_openness permits only call-target gaps in
                 // Refinable snapshots, whose receiver/argument uses are lowered
                 // independently of target resolution. Other gaps disable pruning.
-                SemanticEffect::Gap { .. } => {}
+                SemanticEffect::Gap { .. } | SemanticEffect::MemoryInterference => {}
                 SemanticEffect::Assignment { target, value } => {
                     uses.push(*value);
                     definitions.push(*target);

@@ -119,6 +119,87 @@ pub fn note_with(label: impl FnOnce() -> String) {
     note(label());
 }
 
+/// Report owner-wide occupancy when this boundary finishes. Disabled timing
+/// does not enumerate regions, settle maintenance, or format diagnostics.
+/// Concurrent requests share these observations and cumulative counters. Region
+/// rows are local; the process-required account is shared across independent
+/// owners, so adding owner reports does not give physical memory usage.
+pub fn retention_scope<'a>(
+    budget: &'a crate::retention_budget::RetentionBudget,
+    boundary: &'static str,
+    operation: &'a str,
+) -> RetentionScope<'a> {
+    RetentionScope {
+        budget: enabled().then_some(budget),
+        boundary,
+        operation,
+    }
+}
+
+pub struct RetentionScope<'a> {
+    budget: Option<&'a crate::retention_budget::RetentionBudget>,
+    boundary: &'static str,
+    operation: &'a str,
+}
+
+impl Drop for RetentionScope<'_> {
+    fn drop(&mut self) {
+        let Some(budget) = self.budget else {
+            return;
+        };
+        // Ensure the process interner has bound its required account before
+        // settling and sampling this owner. The disabled path returns above.
+        let interner = crate::analyzer::fq_name::segment_interner().snapshot();
+        let snapshot = budget.snapshot();
+        let owner = snapshot.owner_id;
+        let sample = snapshot.sample_sequence;
+        let budget_process_owner = snapshot.process_required_owner_id;
+        let process_owner = crate::retention_budget::ProcessRequiredMemory::global().owner_id();
+        let boundary = self.boundary;
+        let operation = self.operation;
+        for region in &snapshot.regions {
+            let stats = region.stats;
+            note_with(|| {
+                format!(
+                    "retention_region owner={owner} sample={sample} boundary={boundary} operation={operation} region={} namespace={} entries={} accounted_bytes={} deferred_bytes={} evictions={} refused_admissions={}",
+                    region.name,
+                    region.namespace,
+                    stats.entries,
+                    stats.accounted_bytes,
+                    stats.deferred_bytes,
+                    stats.evictions,
+                    stats.refused_admissions,
+                )
+            });
+        }
+        note_with(|| {
+            format!(
+                "retention_total owner={owner} sample={sample} boundary={boundary} operation={operation} capacity_bytes={} local_retained_bytes={} process_required_owner={budget_process_owner} process_required_bytes={} occupied_bytes={} over_capacity_bytes={}",
+                snapshot.capacity_bytes,
+                snapshot.accounted_bytes,
+                snapshot.process_required_bytes,
+                snapshot.occupied_bytes,
+                snapshot
+                    .occupied_bytes
+                    .saturating_sub(snapshot.capacity_bytes),
+            )
+        });
+        // This estimate belongs to the global process owner. Production budgets
+        // include that owner in occupancy; an isolated test owner may differ.
+        // Samples can differ after settlement or concurrent insertion; neither
+        // is an allocator measurement or a sum across service owners.
+        note_with(|| {
+            format!(
+                "fq_name_interner owner={owner} sample={sample} boundary={boundary} operation={operation} scope=process process_required_owner={process_owner} accounting=process_required entries={} unique_texts={} text_bytes={} estimated_retained_bytes={}",
+                interner.entries,
+                interner.unique_texts,
+                interner.text_bytes,
+                interner.estimated_retained_bytes,
+            )
+        });
+    }
+}
+
 /// Cumulative CPU time consumed by the calling thread, for profiling samples.
 /// Callers should sample only when profiling is enabled.
 #[cfg(unix)]

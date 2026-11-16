@@ -594,7 +594,10 @@ mod rust_manifest_update_tests {
     }
 
     /// Comments and keys analysis does not read reach no crate row, so editing
-    /// them stays incremental, and the store still retains the new bytes.
+    /// them stays incremental, and the store still retains the new bytes. Every
+    /// key here is one the source-effect classification knows (`[build]
+    /// target-dir`, `[term]`, `[alias]`, a linker), so the acquired meaning
+    /// stays the same; an unknown key would change it and rebuild (#12654).
     #[test]
     fn an_unread_cargo_configuration_edit_changes_nothing() {
         assert_edit_is_incremental(
@@ -611,8 +614,8 @@ mod rust_manifest_update_tests {
             ],
             ".cargo/config.toml",
             "# a comment\n[alias]\nb = \"build\"\n\
-         [build]\njobs = 4\nrustflags   =   [ \"--cfg\", \"fast_path\" ]\n\
-         [env]\nRUST_LOG = \"debug\"\n\
+         [build]\ntarget-dir = \"elsewhere\"\nrustflags   =   [ \"--cfg\", \"fast_path\" ]\n\
+         [term]\ncolor = \"never\"\n\
          [target.x86_64-unknown-linux-gnu]\nlinker = \"clang\"\n",
         );
     }

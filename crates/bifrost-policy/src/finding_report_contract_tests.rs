@@ -205,10 +205,7 @@ fn bulky_work() -> PolicyWorkReport {
     PolicyWorkReport::try_new(0, 0, 0, 0, 0, 0, 0, 0, metrics).unwrap()
 }
 
-fn report_outcome(
-    finding: &PolicyFinding,
-    cap: usize,
-) -> Option<crate::report::PolicyRetentionOutcome> {
+fn report_outcome(finding: &PolicyFinding, cap: usize) -> Option<crate::PolicyReportDocument> {
     use crate::budget::PolicyBatchBudget;
     use crate::report::{PolicyReportBuilder, PolicyRuleDescriptor};
 
@@ -242,14 +239,14 @@ fn report_outcome(
     builder
         .register_policy(PolicyRuleDescriptor::from_loaded(&loaded), run)
         .ok()?;
-    builder.retain_finding(finding.clone()).ok()
+    builder
+        .retain_policy_findings(vec![vec![finding.clone()]])
+        .ok()?;
+    builder.finish().ok()
 }
 
 fn report_admits(finding: &PolicyFinding, cap: usize) -> bool {
-    matches!(
-        report_outcome(finding, cap),
-        Some(crate::report::PolicyRetentionOutcome::Retained)
-    )
+    report_outcome(finding, cap).is_some_and(|report| report.runs()[0].findings().len() == 1)
 }
 
 fn minimum_report_cap(finding: &PolicyFinding) -> usize {
@@ -267,10 +264,8 @@ fn minimum_report_cap(finding: &PolicyFinding) -> usize {
     assert!(report_admits(finding, high));
     assert!(!report_admits(finding, high - 1));
     assert!(matches!(
-        report_outcome(finding, high - 1),
-        Some(crate::report::PolicyRetentionOutcome::Omitted {
-            reason: PolicyIncompleteReason::ReportRetentionBudget
-        })
+        report_outcome(finding, high - 1).as_ref().map(|report| report.runs()[0].completion()),
+        Some(PolicyRunCompletion::Inconclusive { reasons, .. }) if reasons.contains(&PolicyIncompleteReason::ReportRetentionBudget)
     ));
     high
 }
@@ -349,7 +344,10 @@ fn related_labels_count_toward_report_bytes() {
             .with_label("a".repeat(120))
             .unwrap(),
     ];
-    assert!(minimum_report_cap(&long) >= minimum_report_cap(&short) + 110);
+    assert!(long.retained_size() >= short.retained_size() + 110);
+    // Optional detail is still charged when present, but the last-resort
+    // admission floor is independent of detail that can be omitted safely.
+    assert_eq!(minimum_report_cap(&long), minimum_report_cap(&short));
 }
 
 #[test]
@@ -372,7 +370,10 @@ fn store_identity_bytes_count_toward_report_bytes() {
     short.witnesses = vec![witness("a")];
     let mut long = short.clone();
     long.witnesses = vec![witness(&"a".repeat(120))];
-    assert!(minimum_report_cap(&long) >= minimum_report_cap(&short) + 110);
+    assert!(long.retained_size() >= short.retained_size() + 110);
+    // Optional detail is still charged when present, but the last-resort
+    // admission floor is independent of detail that can be omitted safely.
+    assert_eq!(minimum_report_cap(&long), minimum_report_cap(&short));
 }
 
 #[test]
@@ -410,7 +411,10 @@ fn store_read_model_counts_toward_report_bytes() {
     short.witnesses = vec![witness("a")];
     let mut long = short.clone();
     long.witnesses = vec![witness(&"a".repeat(120))];
-    assert!(minimum_report_cap(&long) >= minimum_report_cap(&short) + 110);
+    assert!(long.retained_size() >= short.retained_size() + 110);
+    // Optional detail is still charged when present, but the last-resort
+    // admission floor is independent of detail that can be omitted safely.
+    assert_eq!(minimum_report_cap(&long), minimum_report_cap(&short));
 }
 
 fn obligation_run(root: &str, group: &str, group_key: &str) -> PolicyRun {

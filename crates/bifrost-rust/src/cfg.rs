@@ -1,5 +1,6 @@
 //! Cfg activation over a selected cfg atom set. Source producers never consult
-//! this module.
+//! this module for an atom set. `blob_activation` and `is_unsatisfiable` read
+//! no atom set, so a producer's facts stay independent of the build.
 //!
 //! An atom set spells each enabled cfg as source predicates do: `name`, or
 //! `name = "value"`. It comes from `cargo_config`: the build target's values,
@@ -14,6 +15,46 @@ use std::sync::OnceLock;
 use brokk_bifrost_core::analyzer::rust_facts::{RustCfgCondition, RustCfgInstruction};
 
 use crate::selected_context::{RustCallerTargetProfile, RustSelectedActivation};
+
+/// Result of walking textual definitions from nearest/latest to farthest/earliest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RustMacroDefinitionOutcome<T> {
+    Resolved(T),
+    Ambiguous,
+    UnprovenActivation,
+    Missing,
+}
+
+/// Select only after activation proves which visible definition shadows the rest.
+/// Candidates must be ordered from nearest/latest to farthest/earliest.
+pub fn select_textual_macro<T>(
+    candidates: impl IntoIterator<Item = T>,
+    mut activation: impl FnMut(&T) -> RustSelectedActivation,
+) -> RustMacroDefinitionOutcome<T> {
+    for candidate in candidates {
+        match activation(&candidate) {
+            RustSelectedActivation::Inactive => continue,
+            RustSelectedActivation::Active => {
+                return RustMacroDefinitionOutcome::Resolved(candidate);
+            }
+            RustSelectedActivation::Unknown => {
+                return RustMacroDefinitionOutcome::UnprovenActivation;
+            }
+        }
+    }
+    RustMacroDefinitionOutcome::Missing
+}
+
+/// Profile-independent activation for source producers.
+pub fn blob_activation(condition: &RustCfgCondition) -> RustSelectedActivation {
+    if condition == &RustCfgCondition::Always {
+        RustSelectedActivation::Active
+    } else if is_unsatisfiable(condition) {
+        RustSelectedActivation::Inactive
+    } else {
+        RustSelectedActivation::Unknown
+    }
+}
 
 /// Internal annotation in a persisted cfg atom set: retained Cargo manifests
 /// do not establish the complete feature set. When present, an absent
@@ -167,6 +208,127 @@ pub fn detached_site_cfg_activation(
         |name| atoms.contains(name),
         |_| RustSelectedActivation::Unknown,
     )
+}
+
+/// The most distinct atoms `is_unsatisfiable` enumerates: 2^12 assignments.
+const UNSATISFIABLE_ATOM_LIMIT: usize = 12;
+/// The most formula nodes `is_unsatisfiable` evaluates, which bounds the
+/// memory of its truth tables to 4096 nodes of 4096 bits each.
+const UNSATISFIABLE_NODE_LIMIT: usize = 4096;
+
+/// Whether no assignment of cfg atoms satisfies `condition`, such as `any()` or
+/// `all(a, not(a))`. The answer is a fact about the predicate alone, so it does
+/// not depend on a selected atom set.
+///
+/// A source producer calls this for every cfg-gated file-backed module, so its
+/// cost is bounded: only the atoms that survive constant simplification are
+/// enumerated, and a predicate with more than `UNSATISFIABLE_ATOM_LIMIT` of them
+/// or more than `UNSATISFIABLE_NODE_LIMIT` nodes is not proven unsatisfiable.
+/// So is a predicate whose structure could not be established. "Not proven"
+/// is the safe answer: the caller keeps its gap.
+///
+/// The evaluation is a truth table per node, in node order (a node's operands
+/// precede it), so it needs no recursion.
+pub fn is_unsatisfiable(condition: &RustCfgCondition) -> bool {
+    let Some((formula, root)) = cfg_formula(condition, |_| RustSelectedActivation::Unknown) else {
+        return false;
+    };
+    let mut reachable = vec![false; formula.nodes.len()];
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if std::mem::replace(&mut reachable[node], true) {
+            continue;
+        }
+        match &formula.nodes[node] {
+            CfgFormulaNode::Constant(_) | CfgFormulaNode::Literal(_) => {}
+            CfgFormulaNode::Not(child) => pending.push(*child),
+            CfgFormulaNode::All(children) | CfgFormulaNode::Any(children) => {
+                pending.extend(children.iter().copied());
+            }
+        }
+    }
+    let nodes = (0..formula.nodes.len())
+        .filter(|node| reachable[*node])
+        .collect::<Vec<_>>();
+    if nodes.len() > UNSATISFIABLE_NODE_LIMIT {
+        return false;
+    }
+    let mut variables = Vec::new();
+    for &node in &nodes {
+        if let CfgFormulaNode::Literal(variable) = &formula.nodes[node]
+            && !variables.contains(variable)
+        {
+            variables.push(*variable);
+        }
+    }
+    if variables.len() > UNSATISFIABLE_ATOM_LIMIT {
+        return false;
+    }
+
+    // Bit `a` of a table is the node's value under the assignment whose
+    // variable `i` is bit `i` of `a`.
+    const LOW_VARIABLES: [u64; 6] = [
+        0xAAAA_AAAA_AAAA_AAAA,
+        0xCCCC_CCCC_CCCC_CCCC,
+        0xF0F0_F0F0_F0F0_F0F0,
+        0xFF00_FF00_FF00_FF00,
+        0xFFFF_0000_FFFF_0000,
+        0xFFFF_FFFF_0000_0000,
+    ];
+    let assignments = 1_usize << variables.len();
+    let words = assignments.div_ceil(64);
+    let mut tables: Vec<Vec<u64>> = vec![Vec::new(); formula.nodes.len()];
+    for &node in &nodes {
+        let table = match &formula.nodes[node] {
+            CfgFormulaNode::Constant(value) => vec![if *value { u64::MAX } else { 0 }; words],
+            CfgFormulaNode::Literal(variable) => {
+                let bit = variables
+                    .iter()
+                    .position(|candidate| candidate == variable)
+                    .expect("a reachable literal is a counted variable");
+                (0..words)
+                    .map(|word| {
+                        if bit < 6 {
+                            LOW_VARIABLES[bit]
+                        } else if (word >> (bit - 6)) & 1 == 1 {
+                            u64::MAX
+                        } else {
+                            0
+                        }
+                    })
+                    .collect()
+            }
+            CfgFormulaNode::Not(child) => tables[*child].iter().map(|word| !word).collect(),
+            CfgFormulaNode::All(children) => {
+                children
+                    .iter()
+                    .fold(vec![u64::MAX; words], |mut table, child| {
+                        table
+                            .iter_mut()
+                            .zip(&tables[*child])
+                            .for_each(|(a, b)| *a &= b);
+                        table
+                    })
+            }
+            CfgFormulaNode::Any(children) => {
+                children.iter().fold(vec![0; words], |mut table, child| {
+                    table
+                        .iter_mut()
+                        .zip(&tables[*child])
+                        .for_each(|(a, b)| *a |= b);
+                    table
+                })
+            }
+        };
+        tables[node] = table;
+    }
+    // Fewer than 64 assignments leave the high bits of the one word unused.
+    let valid = if assignments < 64 {
+        (1_u64 << assignments) - 1
+    } else {
+        u64::MAX
+    };
+    tables[root].iter().all(|word| word & valid == 0)
 }
 
 /// Evaluate a candidate condition in the world selected for its reference
@@ -728,7 +890,9 @@ fn cfg_literal_activation(
 
 #[cfg(test)]
 mod tests {
-    use super::{CfgLiteral, RustSelectedActivation, detached_site_cfg_activation};
+    use super::{
+        CfgLiteral, RustSelectedActivation, detached_site_cfg_activation, is_unsatisfiable,
+    };
     use brokk_bifrost_core::analyzer::rust_facts::{RustCfgCondition, RustCfgInstruction};
     use brokk_bifrost_test_macros::hardwon;
     use std::collections::BTreeSet;
@@ -749,6 +913,60 @@ mod tests {
         }
         instructions.push(RustCfgInstruction::Any(count));
         expression(instructions)
+    }
+
+    fn atoms(names: impl IntoIterator<Item = String>) -> Vec<RustCfgInstruction> {
+        names.into_iter().map(RustCfgInstruction::Atom).collect()
+    }
+
+    /// `all(..)` over `count` operands that `instructions` leaves on the stack.
+    fn all_of(mut instructions: Vec<RustCfgInstruction>, count: usize) -> RustCfgCondition {
+        instructions.push(RustCfgInstruction::All(count));
+        expression(instructions)
+    }
+
+    #[test]
+    #[hardwon("#11786: an inactive cfg(any()) module made an unrelated alias lookup incomplete")]
+    fn unsatisfiable_predicates_are_proven_only_within_the_atom_bound() {
+        let name = |index: usize| format!("b{index}");
+        let contradiction = |extra: usize| {
+            let mut operands = atoms(["a".to_owned()]);
+            operands.push(RustCfgInstruction::Atom("a".to_owned()));
+            operands.push(RustCfgInstruction::Not);
+            operands.extend(atoms((0..extra).map(name)));
+            all_of(operands, 2 + extra)
+        };
+        // `any()` and `not(all())` simplify to a constant false.
+        assert!(is_unsatisfiable(&expression(vec![
+            RustCfgInstruction::Any(0)
+        ])));
+        assert!(is_unsatisfiable(&expression(vec![
+            RustCfgInstruction::All(0),
+            RustCfgInstruction::Not,
+        ])));
+        // `all(a, not(a), b0..)` has 1 + extra atoms: within the bound, including
+        // one that spans several table words.
+        assert!(is_unsatisfiable(&contradiction(0)));
+        assert!(is_unsatisfiable(&contradiction(7)));
+        assert!(is_unsatisfiable(&contradiction(11)));
+        // Past the bound the predicate is not proven unsatisfiable, so the
+        // caller keeps its gap, and the answer is immediate.
+        assert!(!is_unsatisfiable(&contradiction(12)));
+        assert!(!is_unsatisfiable(&contradiction(20)));
+        // Satisfiable predicates, and one whose structure is unknown.
+        assert!(!is_unsatisfiable(&RustCfgCondition::Always));
+        assert!(!is_unsatisfiable(&RustCfgCondition::Atom(
+            "feature".to_owned()
+        )));
+        assert!(!is_unsatisfiable(&RustCfgCondition::NotAtom(
+            "test".to_owned()
+        )));
+        assert!(!is_unsatisfiable(&all_of(
+            atoms(["unix".to_owned(), "windows".to_owned()]),
+            2
+        )));
+        assert!(!is_unsatisfiable(&all_of(atoms((0..9).map(name)), 9)));
+        assert!(!is_unsatisfiable(&RustCfgCondition::Unknown));
     }
 
     #[test]

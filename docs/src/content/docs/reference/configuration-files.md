@@ -48,7 +48,9 @@ root. `BIFROST_CACHE_ROOT` and `BIFROST_CACHE_DIR` move it; see
 | Entry | Purpose |
 | --- | --- |
 | `bifrost_cache.v<N>.db` and its `-wal` and `-shm` files | SQLite analyzer database. `<N>` is the cache schema version that the running build reads. Different Bifrost versions use different files in the same directory. Collection preserves the running build's file and chooses at most one other by most recent use. Extra versioned files are removed regardless of age; the retained other file is removed after two weeks without use. A busy store stays until a later collection. |
-| `bifrost_cache.v<N>.db.initial-build.lock` | Lock file that serializes the first build of a database. |
+| `bifrost_cache.v<N>.db.initial-build.lock` | Lock file that serializes every persisted build and collection of a database. A process that waits for it says so on stderr. |
+| `bifrost_cache.v<N>.db.initial-build.holder` | Who holds the lock: process ID, host, purpose, start time and Bifrost version. Bifrost shows it to waiting processes only while the process that wrote it still holds the lock. It is for display only. |
+| `bifrost_cache.v<N>.db.initial-build.holder.lock` | Lock file that marks the holder record as current while its writer holds the build lock. |
 | `semantic-pack-catalog.v<N>/` | Semantic-pack catalog: packs that were installed, embedded, or generated for this repository. `BIFROST_SEMANTIC_PACK_CACHE_ROOT` moves it. |
 | `.gitignore` | Contains `*`, so Git ignores the directory. |
 

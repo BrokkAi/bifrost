@@ -930,8 +930,17 @@ fn write_gap(writer: &mut dyn fmt::Write, gap: &SemanticGap) -> fmt::Result {
 fn write_gap_subject(writer: &mut dyn fmt::Write, subject: SemanticGapSubject) -> fmt::Result {
     write!(writer, "(subject :kind {}", quoted(subject.label()))?;
     match subject {
-        SemanticGapSubject::Procedure | SemanticGapSubject::Point => {}
+        SemanticGapSubject::Procedure
+        | SemanticGapSubject::Point
+        | SemanticGapSubject::FutureConstruction
+        | SemanticGapSubject::FutureActivation => {}
         SemanticGapSubject::Value(value) => write!(writer, " :value {value}")?,
+        SemanticGapSubject::CleanupOwners(segment) => write!(
+            writer,
+            " :head {:?} :stop {:?}",
+            segment.head.map(|node| node.index()),
+            segment.stop.map(|node| node.index())
+        )?,
         SemanticGapSubject::MemoryLocation(location) => {
             write!(writer, " :memory-location {location}")?;
         }
@@ -1013,7 +1022,10 @@ fn write_event(writer: &mut dyn fmt::Write, index: usize, event: &SemanticEvent)
         quoted(event.effect.label())
     )?;
     match &event.effect {
-        SemanticEffect::Entry | SemanticEffect::NormalExit | SemanticEffect::ExceptionalExit => {}
+        SemanticEffect::Entry
+        | SemanticEffect::NormalExit
+        | SemanticEffect::ExceptionalExit
+        | SemanticEffect::MemoryInterference => {}
         SemanticEffect::Assignment { target, value } => {
             write!(writer, " :target {target} :value {value}")?;
         }

@@ -14,26 +14,35 @@ WITH selected AS MATERIALIZED (
   LEFT JOIN rust_resolution_unit_summary_contexts AS c ON c.summary_id = u.summary_id
   WHERE u.unit_key = ?1
 ), members AS MATERIALIZED (
-  SELECT m.summary_id, m.member_ordinal, m.rel_path, m.blob_id,
+  SELECT m.summary_id, m.member_ordinal, m.rel_path,
+         m.blob_id AS retained_blob_id, blob.id AS blob_id,
          blob.blob_oid, f.publication_state AS source_state,
-         (live.file_version_id IS NULL OR live.blob_oid <> blob.blob_oid) AS live_mismatch,
+         (blob.id IS NULL OR live.file_version_id IS NULL OR live.blob_oid <> blob.blob_oid) AS live_mismatch,
          i.facts_version,
          census.census_version, census.impl_count, census.boundary_count,
+         /* Rust-only derived-from blob until #11183 M3 converts Rust child rows */
          (SELECT count(*) FROM source_rust_impl_items AS impl
           WHERE impl.blob_id = m.blob_id) AS actual_impl_count,
+         /* Rust-only derived-from blob until #11183 M3 converts Rust child rows */
          (SELECT count(*) FROM source_rust_impl_census_boundaries AS boundary
           WHERE boundary.blob_id = m.blob_id) AS actual_boundary_count
   FROM selected AS s
   CROSS JOIN resolution_unit_summary_members AS m ON m.summary_id = s.summary_id
-  JOIN blobs AS blob ON blob.id = m.blob_id
   LEFT JOIN workspace_file_versions AS live
     ON live.workspace_id = s.workspace_id AND live.lang = s.lang
    AND live.generation = s.generation AND live.rel_path = m.rel_path
    AND live.input_kind = 'source' AND live.valid_from <= s.revision
    AND (live.valid_until IS NULL OR s.revision < live.valid_until)
-  LEFT JOIN source_fact_manifests AS f ON f.blob_id = m.blob_id
-  LEFT JOIN source_rust_item_manifests AS i ON i.blob_id = m.blob_id
-  LEFT JOIN source_rust_impl_census_files AS census ON census.blob_id = m.blob_id
+  LEFT JOIN blobs AS blob
+    ON blob.id = (
+      SELECT attachment.blob_id
+      FROM temp.selected_unit_member_blobs AS attachment
+      WHERE attachment.summary_id = m.summary_id
+        AND attachment.member_ordinal = m.member_ordinal
+    )
+  LEFT JOIN source_fact_manifests AS f ON f.blob_id = blob.id
+  LEFT JOIN source_rust_item_manifests AS i ON i.blob_id = blob.id
+  LEFT JOIN source_rust_impl_census_files AS census ON census.blob_id = blob.id
 ), pairs AS MATERIALIZED (
   SELECT subject.summary_id, subject.member_ordinal,
          subject.owner_module_path, subject.source_relation_key,
@@ -69,10 +78,11 @@ WITH selected AS MATERIALIZED (
     ON target_member.summary_id = target_unit.summary_id
    AND target_member.member_ordinal = target_export.declaration_member_ordinal
   LEFT JOIN resolution_rust_declaration_authorities AS target_authority
+    /* Rust-only derived-from blob until #11183 M3 converts Rust child rows */
     ON target_authority.blob_id = target_member.blob_id
    AND target_authority.source_site = target_export.declaration_site
   LEFT JOIN source_rust_declaration_properties AS subject_kind
-    ON subject_kind.blob_id = target_member.blob_id
+    ON subject_kind.blob_id = target_authority.blob_id
    AND subject_kind.declaration_id = target_authority.declaration
   WHERE subject.endpoint_role = 'subject'
 )
@@ -99,74 +109,90 @@ UNION ALL
 SELECT 2, m.rel_path, hex(m.blob_oid), b.ordinal, b.kind, b.start_byte,
        NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
 FROM members AS m
-JOIN source_rust_impl_census_boundaries AS b ON b.blob_id = m.blob_id
+/* Rust-only derived-from blob until #11183 M3 converts Rust child rows */
+JOIN source_rust_impl_census_boundaries AS b ON b.blob_id = m.retained_blob_id
 UNION ALL
 SELECT 3, m.rel_path, hex(m.blob_oid), impl.declaration_id,
        impl.trait_type_occurrence_id IS NOT NULL,
+       /* Rust-only derived-from blob until #11183 M3 converts Rust child rows */
        (SELECT count(*) FROM pairs AS p
         WHERE p.summary_id = m.summary_id AND p.member_ordinal = m.member_ordinal
           AND p.impl_declaration_id = impl.declaration_id),
-       (SELECT count(*) FROM rust_crate_inherent_impls AS h
-        JOIN selected AS s ON s.topology_id = h.topology_id
-        WHERE h.impl_blob_id = m.blob_id
+       (SELECT count(*) FROM rust_resolution_unit_summary_inherent_impls AS h
+        WHERE h.summary_id = m.summary_id AND h.impl_member_ordinal = m.member_ordinal
           AND h.impl_declaration_id = impl.declaration_id),
-       (SELECT count(*) FROM rust_crate_unresolved_inherent_impls AS h
-        JOIN selected AS s ON s.topology_id = h.topology_id
-        WHERE h.impl_blob_id = m.blob_id
+       (SELECT count(*) FROM rust_resolution_unit_summary_unresolved_inherent_impls AS h
+        WHERE h.summary_id = m.summary_id AND h.impl_member_ordinal = m.member_ordinal
           AND h.impl_declaration_id = impl.declaration_id),
        NULL, NULL, NULL, NULL, NULL, NULL
 FROM members AS m
-JOIN source_rust_impl_items AS impl ON impl.blob_id = m.blob_id
+/* Rust-only derived-from blob until #11183 M3 converts Rust child rows */
+JOIN source_rust_impl_items AS impl ON impl.blob_id = m.retained_blob_id
 UNION ALL
 SELECT 4, m.rel_path, hex(m.blob_oid), p.impl_declaration_id,
        p.owner_module_path, p.source_relation_key, p.subject_state,
        p.subject_unit, p.subject_module, p.subject_identity,
        p.subject_kind, p.trait_state, p.trait_identity,
+       /* Rust-only derived-from blob until #11183 M3 converts Rust child rows */
        (SELECT count(*) FROM source_rust_impl_items AS impl
-        WHERE impl.blob_id = m.blob_id AND impl.declaration_id = p.impl_declaration_id)
+        WHERE impl.blob_id = m.retained_blob_id
+          AND impl.declaration_id = p.impl_declaration_id)
 FROM members AS m
+/* Rust-only derived-from blob until #11183 M3 converts Rust child rows */
 JOIN pairs AS p ON p.summary_id = m.summary_id
  AND p.member_ordinal = m.member_ordinal
 UNION ALL
 SELECT 9, m.rel_path, hex(m.blob_oid), h.impl_declaration_id,
-       h.subject_declaration_site, property.declaration_kind,
-       h.subject_rel_path,
+       COALESCE(h.subject_site, target_export.declaration_site), property.declaration_kind,
+       COALESCE(local_member.rel_path, target_member.rel_path),
        (SELECT count(*) FROM resolution_rust_declaration_authorities AS bridge
-        WHERE bridge.blob_id = h.subject_declaration_blob_id
-          AND bridge.source_site = h.subject_declaration_site),
+        WHERE bridge.blob_id = COALESCE(local_member.blob_id, target_member.blob_id)
+          AND bridge.source_site = COALESCE(h.subject_site, target_export.declaration_site)),
        NULL, NULL, NULL, NULL, NULL, NULL
 FROM members AS m
-JOIN selected AS s ON s.summary_id = m.summary_id
-JOIN rust_crate_inherent_impls AS h
-  ON h.topology_id = s.topology_id AND h.impl_blob_id = m.blob_id
+CROSS JOIN rust_resolution_unit_summary_inherent_impls AS h
+  ON h.summary_id = m.summary_id AND h.impl_member_ordinal = m.member_ordinal
+-- A subject in this unit is a member and a site. A subject in another unit is a
+-- name form, and it names one declaration only when exactly one export carries it.
+LEFT JOIN resolution_unit_summary_members AS local_member
+  ON local_member.summary_id = h.summary_id AND local_member.member_ordinal = h.subject_member_ordinal
+LEFT JOIN selected_rust_unit_summaries AS target_unit
+  ON h.subject_form = 'foreign' AND target_unit.unit_key = h.subject_unit_key
+LEFT JOIN rust_resolution_unit_summary_exports AS target_export
+  INDEXED BY rust_summary_decl_export_endpoint
+  ON target_export.summary_id = target_unit.summary_id
+ AND target_export.module_path = h.subject_module_path
+ AND target_export.namespace = h.subject_namespace AND target_export.name = h.subject_name
+ AND target_export.origin = 'declaration'
+ AND (SELECT count(*) FROM rust_resolution_unit_summary_exports AS same_name
+      INDEXED BY rust_summary_decl_export_endpoint
+      WHERE same_name.summary_id = target_unit.summary_id
+        AND same_name.module_path = h.subject_module_path
+        AND same_name.namespace = h.subject_namespace AND same_name.name = h.subject_name
+        AND same_name.origin = 'declaration') = 1
+LEFT JOIN resolution_unit_summary_members AS target_member
+  ON target_member.summary_id = target_export.summary_id
+ AND target_member.member_ordinal = target_export.declaration_member_ordinal
 LEFT JOIN resolution_rust_declaration_authorities AS authority
-  ON authority.blob_id = h.subject_declaration_blob_id
- AND authority.source_site = h.subject_declaration_site
+  ON authority.blob_id = COALESCE(local_member.blob_id, target_member.blob_id)
+ AND authority.source_site = COALESCE(h.subject_site, target_export.declaration_site)
 LEFT JOIN source_rust_declaration_properties AS property
   ON property.blob_id = authority.blob_id AND property.declaration_id = authority.declaration
 UNION ALL
 SELECT 5, g.gap_kind, g.subject, NULL, NULL, NULL, NULL,
        NULL, NULL, NULL, NULL, NULL, NULL, NULL
 FROM selected AS s
-JOIN rust_crate_gaps AS g ON g.topology_id = s.topology_id
-UNION ALL
-SELECT 7, source.rel_path, NULL, NULL, NULL, NULL, NULL,
-       NULL, NULL, NULL, NULL, NULL, NULL, NULL
-FROM selected AS s
-CROSS JOIN rust_crate_container_sources AS source
-  ON source.topology_id = s.topology_id
-WHERE NOT EXISTS (
-  SELECT 1 FROM resolution_unit_summary_members AS m
-  WHERE m.summary_id = s.summary_id AND m.blob_id = source.blob_id
-    AND m.rel_path = source.rel_path)
+JOIN rust_resolution_unit_summary_all_gaps AS g ON g.summary_id = s.summary_id
 UNION ALL
 SELECT 8, e.owner_module_path, e.source_relation_key,
        e.impl_declaration_id, e.endpoint_role, NULL, NULL,
        NULL, NULL, NULL, NULL, NULL, NULL, NULL
 FROM selected AS s
+/* Rust-only derived-from blob until #11183 M3 converts Rust child rows */
 CROSS JOIN rust_resolution_unit_summary_trait_endpoints AS e
   ON e.summary_id = s.summary_id AND e.endpoint_role = 'trait'
 WHERE NOT EXISTS (
+  /* Rust-only derived-from blob until #11183 M3 converts Rust child rows */
   SELECT 1 FROM rust_resolution_unit_summary_trait_endpoints AS subject
   WHERE subject.summary_id = e.summary_id
     AND subject.member_ordinal = e.member_ordinal

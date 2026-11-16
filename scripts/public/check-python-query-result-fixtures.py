@@ -161,6 +161,32 @@ def _check_python_hierarchy_contract(hierarchy: object) -> None:
             raise AssertionError("the partial model/activation provenance was lost or strengthened")
 
 
+def _check_pointer_source_contract(pointer_raw: dict) -> None:
+    # #11267: source evidence and omission exactness must survive Rust/Python transport.
+    pointer = _decode_result_item(pointer_raw)
+    if ([(span.path, span.start_byte, span.end_byte) for span in pointer.source_ranges]
+            != [("source.rs", 4, 8)]
+            or pointer.source_ranges_omitted.count != 1
+            or pointer.source_ranges_omitted.exactness.value != "lower_bound"):
+        raise AssertionError("pointer source evidence or omission exactness was lost")
+    for invalid_count in (-1, True):
+        invalid = dict(pointer_raw, source_ranges_omitted={"count": invalid_count, "exactness": "exact"})
+        try:
+            _decode_result_item(invalid)
+        except models._generated_query_models.DecoderError:
+            pass
+        else:
+            raise AssertionError("Python accepted an invalid pointer omission count")
+    invalid = dict(pointer_raw, source_ranges_omitted={"count": 1, "exactness": "guessed"})
+    try:
+        _decode_result_item(invalid)
+    except models._generated_query_models.DecoderError:
+        pass
+    else:
+        raise AssertionError("Python accepted an unknown pointer omission guarantee")
+
+
+
 def main() -> None:
     document = json.load(sys.stdin)
     decoded = models.CodeQueryResult.from_dict(document)
@@ -209,6 +235,8 @@ def main() -> None:
         if isinstance(result, models.CodeQueryPythonHierarchyFact)
     )
     _check_python_hierarchy_contract(hierarchy)
+
+    _check_pointer_source_contract(raw_by_type["rust_pointer_finding"])
 
     configuration = raw_by_type["configuration_fact"]
     if "fact_provenance" not in configuration:

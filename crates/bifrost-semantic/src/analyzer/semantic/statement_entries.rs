@@ -49,6 +49,9 @@ use brokk_bifrost_core::analyzer::model::ProjectFile;
 
 use brokk_bifrost_core::analyzer::model::Range;
 
+use brokk_bifrost_core::analyzer::reuse_verdict::{
+    CarriesReuseVerdict, ExecutionCause, ReuseVerdict,
+};
 use brokk_bifrost_core::hash::HashMap;
 use brokk_bifrost_core::hash::HashSet;
 use std::collections::VecDeque;
@@ -59,6 +62,17 @@ use std::sync::Arc;
 pub enum StatementEntryOpen {
     SourceSnapshotMismatch,
     MissingProducerSite,
+}
+
+/// A snapshot mismatch means the prepared source moved under the artifact, an
+/// execution state; a missing producer site is a property of the artifact.
+impl CarriesReuseVerdict for StatementEntryOpen {
+    fn reuse_verdict(&self) -> ReuseVerdict {
+        match self {
+            Self::SourceSnapshotMismatch => ReuseVerdict::ExecutionDependent(ExecutionCause::Other),
+            Self::MissingProducerSite => ReuseVerdict::Content,
+        }
+    }
 }
 
 /// An exact span-to-entry index for one procedure and one prepared source.
@@ -180,7 +194,8 @@ pub struct StatementAssessment {
 pub struct StatementAssessments {
     pub rows: Vec<StatementAssessment>,
     pub complete: bool,
-    pub reason: Option<&'static str>,
+    pub reason: Option<String>,
+    pub execution_cause: Option<super::derivation_cause::DerivationExecutionCause>,
 }
 
 #[doc(hidden)]
@@ -188,7 +203,8 @@ pub fn unavailable(reason: &'static str) -> StatementAssessments {
     StatementAssessments {
         rows: Vec::new(),
         complete: false,
-        reason: Some(reason),
+        reason: Some(reason.to_owned()),
+        execution_cause: super::derivation_cause::DerivationExecutionCause::from_reason(reason),
     }
 }
 
@@ -331,8 +347,9 @@ pub fn scan_control_evidence(
         evidence.proof == ProofStatus::Proven
             && evidence.completeness == EvidenceCompleteness::Complete
     };
-    for gap in semantics.gaps() {
+    for logical in semantics.logical_gaps() {
         request.visit_node::<ProgramPointId>()?;
+        let gap = logical.base;
         if candidate_evidence.contains(&gap.evidence) {
             continue;
         }
@@ -342,7 +359,7 @@ pub fn scan_control_evidence(
         // cleanup code and never resumes this procedure, so neither can make
         // a statement reachable.
         if matches!(
-            gap.discharge,
+            gap.control_flow_discharge(),
             SemanticGapDischarge::RetainedControlTopology
                 | SemanticGapDischarge::NonRejoiningExceptionalExit
         ) {
@@ -356,7 +373,7 @@ pub fn scan_control_evidence(
                 | SemanticCapability::NonLocalControl
                 | SemanticCapability::GuardFacts
                 | SemanticCapability::SwitchFacts
-        ) && (gap.subject == SemanticGapSubject::Procedure
+        ) && (logical.subject() == SemanticGapSubject::Procedure
             || reachable.contains(semantics, gap.point))
         {
             return Ok(Some(reason::CONTROL_EVIDENCE_INCOMPLETE));

@@ -1564,9 +1564,14 @@ impl RustSourceStorage for AnalyzerStore {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
             let mut declarations = Vec::new();
+            let mut declaration_spans = Vec::new();
+            let mut lexical_identifiers = Vec::new();
             let mut statement = tx.prepare_cached(
-                "SELECT declaration_id, occurrence_id, name_occurrence_id
-                   FROM source_declarations WHERE blob_id = ?1 ORDER BY declaration_id",
+                "SELECT d.declaration_id, d.occurrence_id, d.name_occurrence_id,
+                        json_extract(a.spans, '$[' || d.occurrence_id || '][0]'),
+                        json_extract(a.spans, '$[' || d.occurrence_id || '][1]'), d.lexical_identifier
+                   FROM source_declarations d JOIN source_occurrence_arenas a USING(blob_id)
+                  WHERE d.blob_id = ?1 ORDER BY d.declaration_id",
             )?;
             let mut rows = statement.query([blob_id])?;
             while let Some(row) = rows.next()? {
@@ -1579,6 +1584,10 @@ impl RustSourceStorage for AnalyzerStore {
                         "non-dense hierarchy declaration {declaration:?}: declarations={declarations:?}"
                     )));
                 }
+                if let Some(identifier) = row.get::<_, Option<String>>(5)? {
+                    lexical_identifiers.push((declaration, identifier));
+                }
+                declaration_spans.push((nonnegative_usize(row.get(3)?, "declaration start")?, nonnegative_usize(row.get(4)?, "declaration end")?));
                 declarations.push(SourceDeclaration {
                     occurrence: source_occurrence(row.get(1)?, "hierarchy declaration")?,
                     name: row
@@ -1668,6 +1677,8 @@ impl RustSourceStorage for AnalyzerStore {
                 items: item_facts,
                 types,
                 declarations,
+                declaration_spans,
+                lexical_identifiers,
                 declaration_units,
                 module_names,
                 imports,

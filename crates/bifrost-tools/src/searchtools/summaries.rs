@@ -63,6 +63,7 @@ pub enum SummaryIncompleteReason {
     TimeBudget,
     StructureUnavailable,
     SemanticEvidenceUnavailable,
+    SemanticModelsPending,
     ArtifactUnavailable,
     SemanticEvidenceGap,
     StoreFailure,
@@ -73,12 +74,31 @@ fn summary_read_reason(
     reason: QueryReadIncomplete,
     cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
 ) -> SummaryIncompleteReason {
+    // A proof stop keeps its execution cause, so a budget stop is reported as
+    // the time budget rather than through the generic label.
+    if let QueryReadIncomplete::ProofStopped { cause, .. } = &reason {
+        use brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause;
+        return match cause {
+            None => SummaryIncompleteReason::SemanticEvidenceGap,
+            Some(DerivationExecutionCause::Cancelled)
+                if cancellation.is_some_and(|token| token.is_timed_out()) =>
+            {
+                SummaryIncompleteReason::TimeBudget
+            }
+            Some(DerivationExecutionCause::Cancelled) => SummaryIncompleteReason::Cancelled,
+            Some(DerivationExecutionCause::Budget) => SummaryIncompleteReason::TimeBudget,
+            Some(DerivationExecutionCause::Provider | DerivationExecutionCause::Snapshot) => {
+                SummaryIncompleteReason::SemanticEvidenceUnavailable
+            }
+        };
+    }
     match reason.label() {
         "cancelled" if cancellation.is_some_and(|token| token.is_timed_out()) => {
             SummaryIncompleteReason::TimeBudget
         }
         "cancelled" => SummaryIncompleteReason::Cancelled,
         "structure_unavailable" => SummaryIncompleteReason::StructureUnavailable,
+        "semantic_models_pending" => SummaryIncompleteReason::SemanticModelsPending,
         "semantic_evidence_unavailable" => SummaryIncompleteReason::SemanticEvidenceUnavailable,
         "artifact_unavailable" => SummaryIncompleteReason::ArtifactUnavailable,
         "semantic_evidence_gap" => SummaryIncompleteReason::SemanticEvidenceGap,
@@ -929,7 +949,7 @@ fn summary_block_for_file_with_cancellation(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
-) -> Result<Option<SummaryBlock>, ()> {
+) -> std::io::Result<Option<SummaryBlock>> {
     if cancellation.is_some_and(brokk_bifrost_core::cancellation::CancellationToken::is_cancelled) {
         return Ok(None);
     }
@@ -1026,7 +1046,7 @@ type SummaryFallback = (Vec<SummaryElement>, Option<String>);
 pub(crate) fn summary_fallback_for_file(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
-) -> Result<Option<SummaryFallback>, ()> {
+) -> std::io::Result<Option<SummaryFallback>> {
     let include_elements = include_fallback_elements(analyzer, file)?;
     if !include_elements.is_empty() {
         return Ok(Some((
@@ -1041,7 +1061,7 @@ pub(crate) fn summary_fallback_for_file(
 pub(crate) fn include_fallback_elements(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
-) -> Result<Vec<SummaryElement>, ()> {
+) -> std::io::Result<Vec<SummaryElement>> {
     let include_lines: Vec<_> = analyzer
         .import_statements(file)
         .iter()
@@ -1052,9 +1072,7 @@ pub(crate) fn include_fallback_elements(
         return Ok(Vec::new());
     }
 
-    let Ok(content) = analyzer.project().read_source(file) else {
-        return Err(());
-    };
+    let content = analyzer.project().read_source(file)?;
     let path = rel_path_string(file);
     let physical_lines: Vec<&str> = content.lines().collect();
     let normalized_lines: Vec<String> = physical_lines
@@ -1461,8 +1479,10 @@ fn most_relevant_files_with_ranker(
             // verdict `classify_test_files` would give it. Bounded by `limit`
             // entries.
             files.push(MostRelevantFile {
-                test: crate::searchtools::scan_usages::classify_resolved_test_file(analyzer, &file)
-                    .kind,
+                test: crate::searchtools::scan_usages::classify_resolved_test_file(
+                    analyzer, &file,
+                )?
+                .kind,
                 path: rel_path_string(&file),
             });
         }
@@ -1558,12 +1578,16 @@ pub fn most_relevant_files_history_only(
     );
     let files = ranked
         .into_iter()
-        .map(|file| MostRelevantFile {
-            test: crate::searchtools::scan_usages::classify_resolved_test_file(analyzer, &file)
+        .map(|file| {
+            Ok(MostRelevantFile {
+                test: crate::searchtools::scan_usages::classify_resolved_test_file(
+                    analyzer, &file,
+                )?
                 .kind,
-            path: rel_path_string(&file),
+                path: rel_path_string(&file),
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, String>>()?;
     let (complete, incomplete_reason) = match history_status {
         crate::relevance::HistoryRankingStatus::Complete => (true, None),
         crate::relevance::HistoryRankingStatus::HistoryUnavailable => (
@@ -2071,7 +2095,8 @@ mod selected_java_outer_relevance_tests {
             crate::searchtools::scan_usages::ClassifyTestFilesParams {
                 file_paths: vec!["src/test/java/p/TargetHelper.java".to_string()],
             },
-        );
+        )
+        .expect("test file classification");
         assert_eq!(
             classification.classifications["src/test/java/p/TargetHelper.java"].kind,
             first.files[0].test
@@ -2340,6 +2365,23 @@ mod issue_1304_tests {
     use crate::searchtools::summaries::*;
     use brokk_bifrost_test_macros::hardwon;
     use std::time::Duration;
+
+    #[test]
+    #[hardwon("#11145: cancelled proof stops under a timed-out token report time_budget")]
+    fn summary_cancelled_proof_reports_time_budget() {
+        use brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause;
+        let token = brokk_bifrost_core::cancellation::CancellationToken::default()
+            .with_timeout(Duration::ZERO);
+        assert!(token.is_cancelled());
+        let reason = summary_read_reason(
+            QueryReadIncomplete::ProofStopped {
+                reason: "test proof stopped",
+                cause: Some(DerivationExecutionCause::Cancelled),
+            },
+            Some(&token),
+        );
+        assert_eq!(serde_json::to_value(reason).unwrap(), "time_budget");
+    }
 
     #[test]
     #[hardwon("d57e0ee72ded: timeout and explicit cancellation have distinct reasons")]

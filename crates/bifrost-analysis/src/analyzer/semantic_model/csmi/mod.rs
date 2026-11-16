@@ -392,6 +392,7 @@ pub(crate) mod tests {
             hierarchy: Vec::new(),
             aliases: Vec::new(),
             extension_surfaces: Vec::new(),
+            rust_stability: None,
             guard: None,
             locator: Locator::Artifact {
                 path: "api.go".to_owned(),
@@ -439,6 +440,7 @@ pub(crate) mod tests {
             extension_receiver: None,
             extension_receiver_constraints: Vec::new(),
             aliases: Vec::new(),
+            rust_stability: None,
             guard: None,
             locator: Locator::Artifact {
                 path: "api.go".to_owned(),
@@ -1906,6 +1908,7 @@ pub(crate) mod tests {
             hierarchy: Vec::new(),
             aliases: Vec::new(),
             extension_surfaces: Vec::new(),
+            rust_stability: None,
             guard: None,
             locator: Locator::Artifact {
                 path: "java/lang/String.class".to_owned(),
@@ -1936,9 +1939,12 @@ pub(crate) mod tests {
                     normal_result_count: None,
                     locations: Vec::new(),
                     transfers: vec![AuthoredSummaryTransfer {
-                        input: AuthoredSummaryInput::Parameter { ordinal: 0 },
+                        input: AuthoredSummaryInput::Parameter {
+                            ordinal: 0,
+                            path: None,
+                        },
                         exit_kind: AuthoredSummaryExitKind::Normal,
-                        output: AuthoredSummaryOutput::NormalReturn {},
+                        output: AuthoredSummaryOutput::NormalReturn { path: None },
                         value_transfer: None,
                     }],
                     transfer_partitions: Vec::new(),
@@ -2804,7 +2810,10 @@ pub(crate) mod tests {
         summaries[0]
             .concurrency_effects
             .push(AuthoredConcurrencyEffect::TaskSpawn {
-                callable: AuthoredSummaryInput::Parameter { ordinal: 0 },
+                callable: AuthoredSummaryInput::Parameter {
+                    ordinal: 0,
+                    path: None,
+                },
                 group: None,
                 condition: None,
                 timer: None,

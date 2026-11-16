@@ -447,6 +447,16 @@ pub(crate) struct LoweredImplHeaderPath {
     pub(crate) terminal: SemanticId,
 }
 
+/// A nonnominal Rust impl, nominated by its written trait name.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct LoweredRustStructuralTraitImpl {
+    pub(crate) relation: SemanticId,
+    pub(crate) trait_terminal: SemanticId,
+    pub(crate) impl_site: u32,
+    pub(crate) impl_start_byte: usize,
+    pub(crate) impl_end_byte: usize,
+}
+
 /// One `impl Trait for Type`, in the shape build-time crate derivation reads.
 ///
 /// The relation fact names type slots and reference sites, not spellings, and
@@ -593,6 +603,8 @@ pub struct LoweredPackageObjectExport {
 pub struct LoweredSharedLanguageFacts {
     pub(crate) aliases: Vec<LoweredJvmAlias>,
     pub(crate) extern_aliases: Vec<(u32, u32, String)>,
+    pub(crate) csharp_friend_attributes:
+        Vec<brokk_bifrost_core::analyzer::resolution_facts::ResolutionCSharpFriendAttributeFact>,
     pub(crate) compilation_imports:
         Vec<brokk_bifrost_core::analyzer::resolution_facts::ResolutionCompilationImportFact>,
     pub(crate) call_argument_lists: Vec<LoweredCallArgumentList>,
@@ -767,6 +779,7 @@ pub struct LoweredCommonFacts {
     pub go_package_imports: Vec<LoweredGoPackageImport>,
     pub(crate) reference_lookup_identities: Vec<LoweredReferenceLookupIdentity>,
     pub(crate) rust_reverse_gap_candidates: Vec<LoweredRustReverseGapCandidate>,
+    pub(crate) structural_trait_impls: Vec<LoweredRustStructuralTraitImpl>,
     pub(crate) trait_implementations: Vec<LoweredTraitImplementation>,
     pub(crate) inherent_implementations: Vec<LoweredInherentImplementation>,
     #[doc(hidden)]
@@ -797,6 +810,7 @@ impl LoweredCommonFacts {
         mut go_package_imports: Vec<LoweredGoPackageImport>,
         mut reference_lookup_identities: Vec<LoweredReferenceLookupIdentity>,
         mut rust_reverse_gap_candidates: Vec<LoweredRustReverseGapCandidate>,
+        mut structural_trait_impls: Vec<LoweredRustStructuralTraitImpl>,
         mut trait_implementations: Vec<LoweredTraitImplementation>,
         mut inherent_implementations: Vec<LoweredInherentImplementation>,
         shared_language: LoweredSharedLanguageFacts,
@@ -871,6 +885,7 @@ impl LoweredCommonFacts {
         rust_reverse_gap_candidates.sort_unstable();
         rust_reverse_gap_candidates.dedup();
 
+        structural_trait_impls.sort_unstable();
         trait_implementations.sort_unstable();
         inherent_implementations.sort_unstable();
         assert!(
@@ -970,6 +985,7 @@ impl LoweredCommonFacts {
             go_package_imports,
             reference_lookup_identities,
             rust_reverse_gap_candidates,
+            structural_trait_impls,
             trait_implementations,
             inherent_implementations,
             shared_language,
@@ -1416,6 +1432,7 @@ fn lower_shared_language_facts(
 
     LoweredSharedLanguageFacts {
         aliases: lowered_aliases,
+        csharp_friend_attributes: facts.csharp_friend_attributes.clone(),
         extern_aliases: facts
             .extern_aliases
             .iter()
@@ -1868,6 +1885,35 @@ pub(crate) fn lower_common_resolution_facts(
             })
             .collect::<Vec<_>>();
         identifiers_by_start.sort_unstable_by_key(|(source, _)| source.start_byte);
+        let routes_by_span = crate::analyzer::span_index::SpanIndex::new(
+            facts
+                .root_references
+                .iter()
+                .enumerate()
+                .flat_map(|(index, route)| {
+                    let sites = &sites;
+                    std::iter::once(route.reference)
+                        .chain(route.prefix_reference)
+                        .map(move |site| {
+                            let span = sites[&site];
+                            (span.start_byte, span.end_byte, index)
+                        })
+                }),
+        );
+        let mut segments_by_reference = BTreeMap::<_, Vec<_>>::new();
+        for segment in &facts.root_reference_segments {
+            segments_by_reference
+                .entry(segment.reference)
+                .or_default()
+                .push(segment);
+        }
+        let mut gap_routes = BTreeMap::new();
+        for gap in &facts.gaps {
+            // Preserve find_map's first nonempty route at each site.
+            if let Some(route) = gap.route() {
+                gap_routes.entry(gap.site).or_insert(route);
+            }
+        }
         let mut gap_candidates =
             BTreeMap::<ResolutionSiteId, BTreeSet<(String, Option<ResolutionNamespace>)>>::new();
         for gap_site in &gap_sites {
@@ -1875,9 +1921,7 @@ pub(crate) fn lower_common_resolution_facts(
                 .get(gap_site)
                 .unwrap_or_else(|| panic!("reverse inventory gap names unknown site {gap_site}"));
             let candidates = gap_candidates.entry(*gap_site).or_default();
-            if let Some(route) = facts.gaps.iter().find_map(|gap| {
-                (gap.site == *gap_site).then(|| gap.route()).flatten()
-            }) && let brokk_bifrost_core::analyzer::resolution_facts::ResolutionRouteGap::OmittedReference { terminal, namespace, .. } = route {
+            if let Some(route) = gap_routes.get(gap_site).cloned() && let brokk_bifrost_core::analyzer::resolution_facts::ResolutionRouteGap::OmittedReference { terminal, namespace, .. } = route {
                 // The omitted route's terminal is stronger evidence than any
                 // other positioned identifiers retained inside its syntax.
                 // No known terminal keeps the wildcard nomination, not a list
@@ -1904,30 +1948,22 @@ pub(crate) fn lower_common_resolution_facts(
                     Some(identifier.namespace),
                 ));
             }
-            for route in facts.root_references.iter().filter(|route| {
-                let terminal = sites.get(&route.reference).unwrap_or_else(|| {
-                    panic!("root route names unknown site {:?}", route.reference)
-                });
-                let terminal_is_contained = gap_span.start_byte <= terminal.start_byte
-                    && terminal.end_byte <= gap_span.end_byte;
-                let prefix_is_contained = route.prefix_reference.is_some_and(|prefix| {
-                    let prefix = sites.get(&prefix).unwrap_or_else(|| {
-                        panic!("root route names unknown prefix site {:?}", prefix)
-                    });
-                    gap_span.start_byte <= prefix.start_byte && prefix.end_byte <= gap_span.end_byte
-                });
-                terminal_is_contained || prefix_is_contained
-            }) {
+            let matching_routes = routes_by_span
+                .contained(gap_span.start_byte, gap_span.end_byte)
+                .copied()
+                .collect::<BTreeSet<_>>();
+            for index in matching_routes {
+                let route = &facts.root_references[index];
                 if let Some(prefix) = route.prefix_reference {
                     candidates.insert((
                         names[&identifiers[&prefix].name].to_owned(),
                         Some(ResolutionNamespace::Type),
                     ));
                 }
-                for segment in facts
-                    .root_reference_segments
-                    .iter()
-                    .filter(|segment| segment.reference == route.reference)
+                for segment in segments_by_reference
+                    .get(&route.reference)
+                    .into_iter()
+                    .flatten()
                 {
                     candidates.insert((
                         names[&segment.name].to_owned(),
@@ -1965,6 +2001,7 @@ pub(crate) fn lower_common_resolution_facts(
     } else {
         Vec::new()
     };
+    let mut structural_trait_impls = Vec::new();
     let mut trait_implementations = Vec::new();
     let mut inherent_implementations = Vec::new();
     for fact in &facts.declared_type_relations {
@@ -1976,10 +2013,13 @@ pub(crate) fn lower_common_resolution_facts(
             continue;
         }
         let subject_site = slot_sites[&fact.subject];
-        // A subject or trait the producer lowered without a positioned
-        // identifier has no nominal path to walk: a generic parameter, a
-        // primitive seed or unsupported type syntax. Trait routes retain the
-        // producer's gap; inherent routes also persist an unresolved impl row.
+        // A subject the producer lowered without a positioned identifier has no
+        // nominal path to walk: a generic parameter, a primitive seed or
+        // unsupported type syntax (a reference, slice, tuple or `dyn` object).
+        // Such an impl still exists, so it is kept with no subject: an
+        // inherent route persists an unresolved impl row, and a trait route
+        // persists a structural impl row, which is how inventories that
+        // nominate files by trait spelling find `impl Trait for u16` (#12956).
         let subject = spelled_impl_header_path(
             subject_site,
             &identifiers,
@@ -2000,9 +2040,6 @@ pub(crate) fn lower_common_resolution_facts(
             });
             continue;
         }
-        let Some(subject) = subject else {
-            continue;
-        };
         let trait_site = fact
             .target_reference
             .expect("a trait implementation retains its trait reference");
@@ -2015,6 +2052,19 @@ pub(crate) fn lower_common_resolution_facts(
             identities,
             language,
         ) else {
+            continue;
+        };
+        let Some(subject) = subject else {
+            if language != Language::Rust {
+                continue;
+            }
+            structural_trait_impls.push(LoweredRustStructuralTraitImpl {
+                relation: identities.semantic(type_relation_semantic_identity(fact.id)),
+                trait_terminal: implemented_trait.terminal,
+                impl_site: subject_site.get(),
+                impl_start_byte: start_byte,
+                impl_end_byte: end_byte,
+            });
             continue;
         };
         trait_implementations.push(LoweredTraitImplementation {
@@ -2088,6 +2138,7 @@ pub(crate) fn lower_common_resolution_facts(
         go_package_imports,
         reference_lookup_identities,
         rust_reverse_gap_candidates,
+        structural_trait_impls,
         trait_implementations,
         inherent_implementations,
         shared_language,
@@ -2559,10 +2610,11 @@ mod tests {
         );
         assert_eq!(lowered.trait_implementations.len(), 1);
         let implementation = &lowered.trait_implementations[0];
+        let subject = &implementation.subject;
         assert_eq!(
             (
-                implementation.subject.segments.as_slice(),
-                implementation.subject.terminal,
+                subject.segments.as_slice(),
+                subject.terminal,
                 implementation.implemented_trait.segments.as_slice(),
                 implementation.implemented_trait.terminal,
                 implementation.impl_site,

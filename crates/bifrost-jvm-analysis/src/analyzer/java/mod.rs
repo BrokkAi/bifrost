@@ -118,6 +118,8 @@ use brokk_bifrost_analysis::analyzer::languages::PatternBindingNameProvider;
 
 use brokk_bifrost_analysis::analyzer::languages::ProcedureSyntaxRoles;
 
+use brokk_bifrost_analysis::analyzer::languages::{HeaderBinder, ScopeHeader};
+
 use brokk_bifrost_analysis::analyzer::languages::analyzable_file_count;
 
 use brokk_bifrost_analysis::analyzer::languages::build_fqn_bulk_edges;
@@ -673,7 +675,6 @@ impl JavaAnalyzer {
                 brokk_bifrost_analysis::analyzer::WorkspaceFactFamily::JavaExternalDeclarations,
             ),
             &self.java_config,
-            self.inner.project(),
             self.inner.analyzer_store(),
         )
     }
@@ -773,6 +774,15 @@ type JavaFileClassIndexEntry = (
 );
 
 impl JavaSource for JavaAnalyzer {
+    fn creation_constructor_refused(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+        creation: tree_sitter::Node<'_>,
+    ) -> bool {
+        call_conversion::java_source_creation_refused(self, file, source, creation)
+    }
+
     fn resolve_imported_type_name(
         &self,
         token: QueryToken<'_>,
@@ -874,7 +884,7 @@ impl JavaSource for JavaAnalyzer {
                     .cloned();
                 match cached {
                     Some(index) => {
-                        brokk_bifrost_analysis::analyzer::common::replay_query_cache_stable_reasons(
+                        brokk_bifrost_analysis::analyzer::common::replay_query_read_incompleteness(
                             &index.1,
                         );
                         return index.0.unique_class(fqn);
@@ -1050,6 +1060,11 @@ impl CodeUnitIndex for JavaAnalyzer {
     }
 
     delegate_inner_methods! {
+        fn owns_source_file(&self, file: &ProjectFile) -> bool;
+        fn indexed_source_files(&self) -> brokk_bifrost_analysis::analyzer::QueryBatch<ProjectFile>;
+    }
+
+    delegate_inner_methods! {
         fn indexed_blob_oid(&self, file: &ProjectFile) -> Option<brokk_bifrost_analysis::analyzer::Oid>;
     }
 
@@ -1187,6 +1202,7 @@ impl IAnalyzer for JavaAnalyzer {
     fn statement_source_facts(
         &self,
         file: &ProjectFile,
+        reuse: &mut brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict,
     ) -> Option<Arc<brokk_bifrost_core::analyzer::statement_facts::StatementFactRows>> {
         use crate::analyzer::usages::get_definition::java::{
             JavaResolutionSession, java_type_from_node_with_context, resolve_java_type_reference,
@@ -1212,6 +1228,7 @@ impl IAnalyzer for JavaAnalyzer {
             .overlay_content()
             .map(|content| content.digest());
         let key = (oid, file.clone(), overlay);
+        let mut fill_reuse = brokk_bifrost_analysis::analyzer::reuse_verdict::ReuseVerdict::Content;
         let result = self.memo_caches.statement_facts.read(
             &brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution(self),
             |cache, capture| {
@@ -1351,7 +1368,12 @@ impl IAnalyzer for JavaAnalyzer {
             cacheable = scope.captured_read_incompleteness().is_empty()
                 && self.project().analysis_generation() == generation;
             if self.project().analysis_generation() != generation {
-                self.mark_execution_dependent();
+                // An uncacheable fill: its verdict joins the memo's capture
+                // beside the ambient mark, and reaches the caller's sink.
+                brokk_bifrost_analysis::analyzer::i_analyzer::join_execution_dependence(self);
+                fill_reuse = brokk_bifrost_analysis::analyzer::reuse_verdict::ReuseVerdict::ExecutionDependent(
+                    brokk_bifrost_analysis::analyzer::reuse_verdict::ExecutionCause::Other,
+                );
             }
             let rows = Arc::new(rows);
             let bytes = rows.estimated_retained_bytes()
@@ -1364,6 +1386,7 @@ impl IAnalyzer for JavaAnalyzer {
                 Ok(entry)
             },
         ).ok()?;
+        reuse.join_in(fill_reuse);
         Some(Arc::clone(&result))
     }
 
@@ -1456,11 +1479,8 @@ impl IAnalyzer for JavaAnalyzer {
     }
 
     delegate_inner_methods! {
-        fn record_query_failure(&self, error: brokk_bifrost_analysis::analyzer::store::StoreError);
-    }
-
-    delegate_inner_methods! {
         fn workspace_file_index_cell(&self) -> Option<brokk_bifrost_analysis::analyzer::WorkspaceFileIndexCell>;
+        fn workspace_file_inventory_cell(&self) -> Option<brokk_bifrost_analysis::analyzer::WorkspaceFileInventoryCell>;
     }
 
     delegate_inner_methods! {
@@ -1534,6 +1554,13 @@ impl IAnalyzer for JavaAnalyzer {
         fn structural_fact_providers(
         &self,
     ) -> Vec<&dyn brokk_bifrost_analysis::analyzer::structural::StructuralFactProvider>;
+    }
+
+    fn generation_membership(
+        &self,
+    ) -> &Arc<brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::GenerationWorkspaceMembership>
+    {
+        IAnalyzer::generation_membership(&self.inner)
     }
 
     fn snapshot_caches(
@@ -1683,7 +1710,10 @@ impl IAnalyzer for JavaAnalyzer {
         fn contains_tests(&self, file: &ProjectFile) -> bool;
     }
 
-    fn in_test_region(&self, code_unit: &brokk_bifrost_core::analyzer::model::CodeUnit) -> bool {
+    fn in_test_region(
+        &self,
+        code_unit: &brokk_bifrost_core::analyzer::model::CodeUnit,
+    ) -> Result<bool, brokk_bifrost_analysis::analyzer::QueryReadIncomplete> {
         self.inner.in_test_region(code_unit)
     }
 
@@ -1980,6 +2010,8 @@ impl brokk_bifrost_analysis::analyzer::multi_analyzer::LanguageAnalyzer for Java
         Box::new(JavaAnalyzer::update_all_with_progress(self, progress))
     }
 
+    brokk_bifrost_analysis::delegate_generation_membership_updates!(JavaAnalyzer);
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -2020,7 +2052,60 @@ fn java_branch_reference_site(
     })
 }
 
+/// Java statements whose header declares variables outside the body block
+/// (JLS 6.3). A try-with-resources variable is visible in the resources after
+/// it and in the try block, not in the catch or finally blocks. Its own
+/// initializer reads the outer binding, as the native Java resolver answers
+/// (#2771); javac rejects such a read as uninitialized. A resource that only
+/// names an existing variable, `try (r)`, declares nothing. A catch parameter
+/// is visible in its catch block, and an enhanced-for variable in the loop
+/// body only, not in the iterated expression.
+fn java_scope_header<'tree>(statement: tree_sitter::Node<'tree>) -> Option<ScopeHeader<'tree>> {
+    let mut cursor = statement.walk();
+    match statement.kind() {
+        "try_with_resources_statement" => {
+            let resources = statement.child_by_field_name("resources")?;
+            let body = statement.child_by_field_name("body")?;
+            let binders = resources
+                .named_children(&mut cursor)
+                .filter(|resource| resource.kind() == "resource")
+                .filter_map(|resource| {
+                    Some(HeaderBinder {
+                        declaration: resource,
+                        pattern: resource.child_by_field_name("name")?,
+                    })
+                })
+                .collect();
+            Some(ScopeHeader::new(statement, binders, body, Some(resources)))
+        }
+        "catch_clause" => {
+            let parameter = statement
+                .named_children(&mut cursor)
+                .find(|child| child.kind() == "catch_formal_parameter")?;
+            let binder = HeaderBinder {
+                declaration: parameter,
+                pattern: parameter.child_by_field_name("name")?,
+            };
+            let body = statement.child_by_field_name("body")?;
+            Some(ScopeHeader::new(statement, vec![binder], body, None))
+        }
+        "enhanced_for_statement" => {
+            let binder = HeaderBinder {
+                declaration: statement,
+                pattern: statement.child_by_field_name("name")?,
+            };
+            let body = statement.child_by_field_name("body")?;
+            Some(ScopeHeader::new(statement, vec![binder], body, None))
+        }
+        _ => None,
+    }
+}
+
 impl LanguageSupport for JavaSupport {
+    fn locals_are_definitely_assigned(&self) -> bool {
+        true
+    }
+
     fn dispatch_special_call_site(
         &self,
         request: brokk_bifrost_analysis::analyzer::usages::call_relations::CallDispatchLanguageRequest<'_>,
@@ -2108,6 +2193,7 @@ impl LanguageSupport for JavaSupport {
         target: &brokk_bifrost_analysis::analyzer::semantic::ProcedureHandle,
         target_ordinal: u32,
         request: &mut brokk_bifrost_analysis::analyzer::semantic::SemanticRequest<'_>,
+        reuse: &mut brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict,
     ) -> Result<
         brokk_bifrost_analysis::analyzer::languages::SelectedIdentityConversion,
         brokk_bifrost_analysis::analyzer::semantic::SemanticProviderError,
@@ -2118,6 +2204,7 @@ impl LanguageSupport for JavaSupport {
             target,
             target_ordinal,
             request,
+            reuse,
         )
     }
 
@@ -2182,6 +2269,50 @@ impl LanguageSupport for JavaSupport {
             );
         }
         workspace_facts::answer(analyzer, family, language, subject)
+    }
+
+    fn workspace_fact_basis(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        family: brokk_bifrost_analysis::analyzer::WorkspaceFactFamily,
+        language: Language,
+        subject: &brokk_bifrost_analysis::analyzer::FactSubject,
+        answer: brokk_bifrost_analysis::analyzer::semantic::StableDigest,
+    ) -> Option<brokk_bifrost_core::analyzer::external_selection::JvmDependencyBasis> {
+        let (config, _) = external_gaps_context(analyzer, family, language, subject)?;
+        let generation_project =
+            brokk_bifrost_analysis::analyzer::workspace::generation_dependency_discovery_project(
+                analyzer,
+            );
+        generation_project.all_files_shared().ok()?;
+        let project = generation_project.as_ref();
+        let basis = crate::analyzer::jvm::external::jvm_dependency_basis(config, project)?;
+        let under = crate::analyzer::jvm::external::JvmExternalDeclarationIndex::build_under_basis(
+            config,
+            project.root(),
+            &basis,
+        )?
+        .gap_identity();
+        (under == answer).then_some(basis)
+    }
+
+    fn workspace_fact_answer_under_basis(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        family: brokk_bifrost_analysis::analyzer::WorkspaceFactFamily,
+        language: Language,
+        subject: &brokk_bifrost_analysis::analyzer::FactSubject,
+        basis: &brokk_bifrost_core::analyzer::external_selection::JvmDependencyBasis,
+    ) -> Option<brokk_bifrost_analysis::analyzer::semantic::StableDigest> {
+        let (config, project) = external_gaps_context(analyzer, family, language, subject)?;
+        Some(
+            crate::analyzer::jvm::external::JvmExternalDeclarationIndex::build_under_basis(
+                config,
+                project.root(),
+                basis,
+            )?
+            .gap_identity(),
+        )
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -2298,7 +2429,7 @@ impl LanguageSupport for JavaSupport {
         file: &ProjectFile,
         range: Range,
         input: brokk_bifrost_analysis::analyzer::usages::receiver_query::ReceiverQueryInput,
-        budget: brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget,
+        ledger: &mut brokk_bifrost_analysis::analyzer::usages::receiver_query::ReceiverWorkLedger,
         cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
         indexed_source: Option<String>,
     ) -> Option<
@@ -2313,7 +2444,7 @@ impl LanguageSupport for JavaSupport {
             file,
             range,
             input,
-            budget,
+            ledger,
             cancellation,
             indexed_source,
         ))
@@ -2557,6 +2688,13 @@ impl LanguageSupport for JavaSupport {
         Some(brokk_bifrost_jvm::java::structural::java_pattern_binding_name)
     }
 
+    fn scope_header<'tree>(
+        &self,
+        statement: tree_sitter::Node<'tree>,
+    ) -> Option<ScopeHeader<'tree>> {
+        java_scope_header(statement)
+    }
+
     fn call_argument_conversion_prover(
         &self,
     ) -> Option<&'static dyn brokk_bifrost_analysis::analyzer::usages::call_conversion::CallArgumentConversionProver>
@@ -2599,7 +2737,7 @@ impl LanguageSupport for JavaSupport {
         };
         java.resolve_member_name_with_external(
             scope.token(),
-            analyzer.semantic_model_overlay(),
+            analyzer.semantic_model_overlay_read().published(),
             file,
             spelling,
         )
@@ -2772,6 +2910,7 @@ impl LanguageSupport for JavaSupport {
         file: brokk_bifrost_core::analyzer::model::ProjectFile,
         source: std::sync::Arc<str>,
         cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
+        reuse: &mut brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict,
     ) -> Option<brokk_bifrost_analysis::analyzer::native_points::NativePointBatch> {
         std::env::var_os("BIFROST_TRIAL_NATIVE_JAVA")?;
         let java = brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<
@@ -2786,7 +2925,9 @@ impl LanguageSupport for JavaSupport {
         ) {
             Ok(batch) => batch,
             Err(error) => {
-                analyzer.mark_execution_dependent();
+                reuse.join_in(
+                    brokk_bifrost_analysis::analyzer::i_analyzer::execution_dependent(analyzer),
+                );
                 brokk_bifrost_core::profiling::note_with(|| {
                     format!("native_point.memo batch unavailable: {error}")
                 });
@@ -2848,6 +2989,7 @@ impl LanguageSupport for JavaSupport {
         token: brokk_bifrost_core::analyzer::query_token::QueryToken<'_>,
         file: &brokk_bifrost_core::analyzer::model::ProjectFile,
         name: &str,
+        _reuse: &mut brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict,
     ) -> Option<(
         brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus,
         Option<String>,
@@ -2856,7 +2998,12 @@ impl LanguageSupport for JavaSupport {
 
         use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
         resolve_analyzer::<JavaAnalyzer>(analyzer).map(|java| {
-            java.external_boundary_evidence(token, analyzer.semantic_model_overlay(), file, name)
+            java.external_boundary_evidence(
+                token,
+                analyzer.semantic_model_overlay_read().published(),
+                file,
+                name,
+            )
         })
     }
 
@@ -2866,6 +3013,7 @@ impl LanguageSupport for JavaSupport {
         token: brokk_bifrost_core::analyzer::query_token::QueryToken<'_>,
         file: &brokk_bifrost_core::analyzer::model::ProjectFile,
         canonical_callee: &str,
+        _reuse: &mut brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict,
     ) -> Option<(
         brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus,
         Option<String>,
@@ -2876,7 +3024,7 @@ impl LanguageSupport for JavaSupport {
         resolve_analyzer::<JavaAnalyzer>(analyzer).map(|java| {
             java.resolved_callee_boundary_evidence(
                 token,
-                analyzer.semantic_model_overlay(),
+                analyzer.semantic_model_overlay_read().published(),
                 file,
                 canonical_callee,
             )
@@ -3122,6 +3270,43 @@ impl brokk_bifrost_analysis::analyzer::usages::member_family::MemberFamilyProvid
     ) -> brokk_bifrost_analysis::analyzer::usages::member_family::ExternalMemberFamilyAnswer {
         self.resolve_external_member_family(self, identity, max_visits, cancellation)
     }
+}
+
+/// The configuration and project the JVM external index of `analyzer` is built
+/// from, for the fact that names its gaps (#11607).
+fn external_gaps_context<'a>(
+    analyzer: &'a dyn IAnalyzer,
+    family: brokk_bifrost_analysis::analyzer::WorkspaceFactFamily,
+    language: Language,
+    subject: &brokk_bifrost_analysis::analyzer::FactSubject,
+) -> Option<(
+    &'a brokk_bifrost_core::analyzer::config::JvmAnalyzerConfig,
+    &'a dyn Project,
+)> {
+    if family != brokk_bifrost_analysis::analyzer::WorkspaceFactFamily::JvmExternalGaps
+        || language != Language::None
+        || !matches!(
+            subject,
+            brokk_bifrost_analysis::analyzer::FactSubject::Whole
+        )
+    {
+        return None;
+    }
+    use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
+    if let Some(java) = resolve_analyzer::<JavaAnalyzer>(analyzer) {
+        return Some((&java.java_config, java.inner().project()));
+    }
+    if let Some(kotlin) = resolve_analyzer::<crate::analyzer::kotlin::KotlinAnalyzer>(analyzer) {
+        return Some((
+            kotlin.jvm_selection_config(),
+            kotlin.tree_sitter_analyzer().project(),
+        ));
+    }
+    let scala = resolve_analyzer::<crate::analyzer::scala::ScalaAnalyzer>(analyzer)?;
+    Some((
+        scala.jvm_selection_config(),
+        scala.tree_sitter_analyzer().project(),
+    ))
 }
 
 mod receiver_query;

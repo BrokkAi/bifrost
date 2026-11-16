@@ -120,7 +120,7 @@ fn node_cells(node: BindingNodeId, kind: BindingNodeKind) -> Value {
 pub fn prepare_lexical_fragment(
     fragment: &LoweredResolutionFragment,
     cancellation: &CancellationToken,
-) -> Option<PreparedStageLexical> {
+) -> Result<Option<PreparedStageLexical>> {
     let mut result = PreparedStageLexical {
         fragment: fragment.fragment(),
         language: fragment.language(),
@@ -131,18 +131,22 @@ pub fn prepare_lexical_fragment(
     };
     for &(node, kind) in fragment.nodes() {
         if cancellation.is_cancelled() {
-            return None;
+            return Ok(None);
         }
         result.nodes.push(node_cells(node, kind));
     }
     for (id, path) in fragment.paths() {
         if cancellation.is_cancelled() {
-            return None;
+            return Ok(None);
         }
+        let body = codec::encode_path(path)?;
         let start = endpoint_lead(path.start());
         let end = endpoint_lead(path.end());
         let root = path.end().node() == BindingNodeId::universal_root();
-        let (fixed, tail) = root_endpoint_key(path.end(), cancellation)?.unzip();
+        let Some(key) = root_endpoint_key(path.end(), cancellation) else {
+            return Ok(None);
+        };
+        let (fixed, tail) = key.unzip();
         let terminal = if root && path.end().symbols().fixed().len() >= 3 {
             path.end()
                 .symbols()
@@ -168,7 +172,7 @@ pub fn prepare_lexical_fragment(
             fixed,
             tail,
             terminal,
-            codec::encode_path(path)
+            body
         ]));
     }
     // A producer publishes one semantic origin per node. Hydration joins on
@@ -180,7 +184,7 @@ pub fn prepare_lexical_fragment(
             "one semantic origin per staged producer node: {semantic:?}"
         );
         if cancellation.is_cancelled() {
-            return None;
+            return Ok(None);
         }
         let (key, shared) = semantic_cells(semantic.semantic());
         let metadata = semantic.site_metadata();
@@ -225,7 +229,7 @@ pub fn prepare_lexical_fragment(
     }
     for (ordinal, gap) in fragment.gaps().iter().enumerate() {
         if cancellation.is_cancelled() {
-            return None;
+            return Ok(None);
         }
         let (covers, subject, endpoint, lookup) = match gap.frontier() {
             LoweringCoverageFrontier::Fragment => {
@@ -284,11 +288,11 @@ pub fn prepare_lexical_fragment(
             resolution_rows::gap_origin_code(gap.origin())
         ]));
     }
-    if cancellation.is_cancelled() {
+    Ok(if cancellation.is_cancelled() {
         None
     } else {
         Some(result)
-    }
+    })
 }
 
 impl PreparedStageLexical {

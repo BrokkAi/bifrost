@@ -521,7 +521,7 @@ fn resolve_php_with_session(
     // The activated packs, read once for this reference. A workspace with no
     // active pack holds `None` here, which is what keeps every PHP boundary
     // outcome below byte-identical to the #2030 behavior.
-    let overlay = analyzer.semantic_model_overlay();
+    let overlay = analyzer.semantic_model_overlay_read().published();
     let overlay = overlay.as_deref();
     let Some(tree) = tree else {
         return no_definition("php_parse_failed", "PHP source could not be parsed");

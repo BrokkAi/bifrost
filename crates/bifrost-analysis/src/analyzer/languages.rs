@@ -376,6 +376,71 @@ pub struct LocalDeclarationBindingScope<'tree> {
     pub visibility: LocalDeclarationVisibility,
 }
 
+/// The binders a statement declares in a header outside its body block, and
+/// the parts of the statement where they are visible. A JavaScript catch
+/// parameter is visible in its catch body only. A Java try-with-resources
+/// variable is visible in the resources after it and in the try block, and
+/// not in the catch or finally blocks or after the statement.
+///
+/// The shared lexical lookup reports a header binder only through
+/// [`LanguageSupport::scope_header`] of its statement, and never through an
+/// ordinary scan of an enclosing block.
+#[derive(Clone, Debug)]
+#[doc(hidden)]
+pub struct ScopeHeader<'tree> {
+    pub(crate) binders: Vec<HeaderBinder<'tree>>,
+    pub(crate) body: tree_sitter::Node<'tree>,
+    pub(crate) sequential_header: Option<tree_sitter::Node<'tree>>,
+}
+
+/// One binder of a [`ScopeHeader`].
+#[derive(Clone, Copy, Debug)]
+#[doc(hidden)]
+pub struct HeaderBinder<'tree> {
+    /// The node reported as the declaration. Its kind selects the declaration
+    /// kind of the lexical answer.
+    pub declaration: tree_sitter::Node<'tree>,
+    /// The identifier or destructuring pattern whose binding leaves are the
+    /// names this binder declares.
+    pub pattern: tree_sitter::Node<'tree>,
+}
+
+impl<'tree> ScopeHeader<'tree> {
+    /// `binders` are in source order, inside `statement`. Every binder is
+    /// visible in `body`. When `sequential_header` is the child of
+    /// `statement` that holds the binders, a binder is also visible in that
+    /// child after its own declaration ends, so in the binders after it; with
+    /// `None`, binders are visible in `body` only.
+    pub fn new(
+        statement: tree_sitter::Node<'tree>,
+        binders: Vec<HeaderBinder<'tree>>,
+        body: tree_sitter::Node<'tree>,
+        sequential_header: Option<tree_sitter::Node<'tree>>,
+    ) -> Self {
+        debug_assert_eq!(body.parent(), Some(statement), "{statement:?} {body:?}");
+        debug_assert!(
+            sequential_header.is_none_or(|header| header.parent() == Some(statement)
+                && header.id() != body.id()),
+            "{statement:?} {sequential_header:?}"
+        );
+        debug_assert!(
+            binders.iter().all(|binder| {
+                statement
+                    .byte_range()
+                    .contains(&binder.declaration.start_byte())
+                    && binder.declaration.start_byte() <= binder.pattern.start_byte()
+                    && binder.pattern.end_byte() <= binder.declaration.end_byte()
+            }) && binders.is_sorted_by_key(|binder| binder.pattern.start_byte()),
+            "{statement:?} {binders:?}"
+        );
+        Self {
+            binders,
+            body,
+            sequential_header,
+        }
+    }
+}
+
 /// Language-owned proof that a package-scope callable value keeps its
 /// function-literal initializer at every reference.
 #[derive(Debug, Clone)]
@@ -575,6 +640,19 @@ pub struct AdmittedTupleBinding {
     pub reads: SelectedTupleBindingReads,
 }
 
+/// Query-only geometry of a selected field source within a guarded pattern.
+/// Concatenating the two paths must reproduce the candidate's recorded path.
+/// In particular the root whole value need not be an instance of the selected
+/// constructor. Neither path is an admitted value transfer.
+#[derive(Debug, Clone)]
+pub struct SelectedPatternSource {
+    pub constructor: crate::analyzer::semantic::SourceSpan,
+    pub field: crate::analyzer::semantic::SourceSpan,
+    pub root_to_constructor: Box<[crate::analyzer::semantic::PatternProjectionStep]>,
+    pub constructor_to_binding: Box<[crate::analyzer::semantic::PatternProjectionStep]>,
+    pub binding: AdmittedTupleBinding,
+}
+
 /// Why a selected tuple admission produced no decision. Only `Cancelled`
 /// means the run was interrupted; a limit names the bound that stopped this
 /// one candidate, and the others are still decided on their own.
@@ -601,11 +679,93 @@ impl SelectedBindingUnavailable {
 #[derive(Debug, Clone)]
 pub enum SelectedTupleBinding {
     Admitted(AdmittedTupleBinding),
+    /// The canonical field pattern is a source for this existing binding
+    /// observation. This does not prove the root-to-binder value projection,
+    /// binding ownership, or any gap discharge.
+    Observed(SelectedPatternSource),
     Rejected {
         reason: &'static str,
         reads: SelectedTupleBindingReads,
     },
     Unavailable(SelectedBindingUnavailable),
+}
+
+/// Count the owned path slice and named selectors, excluding its slice handle.
+pub(crate) fn retained_pattern_path(
+    path: &[crate::analyzer::semantic::PatternProjectionStep],
+    heap: &mut crate::analyzer::store::cache_budget::RetainedHeap,
+) {
+    heap.slice(path);
+    for step in path {
+        if let crate::analyzer::semantic::PatternProjectionStep::Named(name) = step {
+            heap.add_allocation(name.len());
+        }
+    }
+}
+
+impl SelectedTupleBinding {
+    pub(crate) fn retained_heap(
+        &self,
+        heap: &mut crate::analyzer::store::cache_budget::RetainedHeap,
+    ) {
+        let binding = match self {
+            Self::Admitted(binding) => binding,
+            Self::Observed(source) => {
+                retained_pattern_path(&source.root_to_constructor, heap);
+                retained_pattern_path(&source.constructor_to_binding, heap);
+                &source.binding
+            }
+            Self::Rejected { reads, .. } => {
+                reads.retained_heap(heap);
+                return;
+            }
+            Self::Unavailable(_) => return,
+        };
+        heap.add_allocation(binding.field_id.capacity());
+        crate::analyzer::store::semantic_composition::charge_type_refs(
+            vec![&binding.field_type],
+            heap,
+        );
+        binding.reads.retained_heap(heap);
+    }
+}
+
+impl SelectedTupleBindingReads {
+    fn retained_heap(&self, heap: &mut crate::analyzer::store::cache_budget::RetainedHeap) {
+        for value in [
+            &self.constructor,
+            &self.formal_constructor,
+            &self.selected_constructor,
+            &self.selected_pack_digest,
+            &self.selected_record_id,
+            &self.model_set_hash,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            heap.add_allocation(value.capacity());
+        }
+        heap.vec(&self.import_chain);
+        for name in &self.import_chain {
+            heap.add_allocation(name.capacity());
+        }
+        if let Some(layout) = &self.layout {
+            heap.vec(&layout.fields);
+            let mut types = Vec::new();
+            for field in &layout.fields {
+                if let crate::analyzer::semantic_model::model::TupleFieldSlot::Public {
+                    id,
+                    r#type,
+                    ..
+                } = field
+                {
+                    heap.add_allocation(id.capacity());
+                    types.push(r#type);
+                }
+            }
+            crate::analyzer::store::semantic_composition::charge_type_refs(types, heap);
+        }
+    }
 }
 
 /// Caller-owned language-specific state, valid for one prepared syntax tree.
@@ -621,6 +781,76 @@ impl MemberDeclarationMemo {
     }
 }
 
+/// How a guarded alternate realizes one candidate invocation (#11251).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateMacroRealization {
+    /// Runtime actuals realized by the guarded lowering, checked against the proven layout.
+    RuntimeCall { runtime_argument_count: usize },
+    /// Control flow and values; the alternate has no call for the invocation.
+    Intrinsic,
+    /// The same logical call, with a proof that the invocation introduces no items.
+    LexicalNoItemsIntroduced,
+}
+
+/// A candidate selected structurally from a procedure's guarded alternate.
+pub struct CandidateMacroInvocation {
+    pub realization: CandidateMacroRealization,
+    /// The base call the invocation replaces: the position-free identity that
+    /// answers, digests and receipts use. Records nested in an opaque
+    /// candidate's operands share their enclosing base call.
+    pub region: crate::analyzer::semantic::CallSiteId,
+    /// A lookup index into the source only; never part of a digest or receipt.
+    pub anchor: crate::analyzer::semantic::CandidateAnchor,
+}
+
+/// Selected context for a batch of procedure-local admission proofs.
+pub struct CandidateMacroAdmissionRequest<'a> {
+    pub analyzer: &'a dyn IAnalyzer,
+    pub token: QueryToken<'a>,
+    pub file: &'a ProjectFile,
+    pub head: &'a crate::analyzer::semantic::SemanticArtifactKey,
+    pub procedure: crate::analyzer::semantic::ProcedureId,
+    pub candidates: &'a [CandidateMacroInvocation],
+    pub syntax: &'a brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree,
+    pub cancellation: &'a CancellationToken,
+}
+
+pub use crate::analyzer::semantic::service::CandidateMacroRefusal;
+
+#[derive(Debug, Clone)]
+pub enum CandidateMacroDecision {
+    Admitted { package_identity_digest: [u8; 32] },
+    Refused(CandidateMacroRefusal),
+}
+
+/// The receipt remains available to persisted consumers for direct forwarding.
+#[derive(Debug, Clone)]
+pub struct CandidateMacroAdmissionAnswer {
+    pub region: crate::analyzer::semantic::CallSiteId,
+    pub decision: CandidateMacroDecision,
+    pub answer_digest: [u8; 32],
+    pub reads: crate::analyzer::i_analyzer::QueryReadReceipt,
+}
+
+impl CandidateMacroAdmissionAnswer {
+    pub fn new(
+        region: crate::analyzer::semantic::CallSiteId,
+        decision: CandidateMacroDecision,
+        reads: crate::analyzer::i_analyzer::QueryReadReceipt,
+    ) -> Self {
+        let mut digest = brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher::new(
+            b"candidate-macro-admission-answer:v1",
+        );
+        digest.value(format!("{decision:?}").as_bytes());
+        Self {
+            region,
+            decision,
+            answer_digest: digest.finish(),
+            reads,
+        }
+    }
+}
+
 /// Whether a call receiver depends on an enclosing type parameter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReceiverTypeParameterDependency {
@@ -629,7 +859,192 @@ pub enum ReceiverTypeParameterDependency {
     Unknown,
 }
 
+/// The formal shape of an external callable the language itself defines, so
+/// that no semantic pack records it (#11325): positional formals without
+/// names, defaults or variadics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntrinsicExternalSignature {
+    /// Whether the callable takes a `self` receiver.
+    pub receiver: bool,
+    /// The parameter count, excluding the receiver.
+    pub parameters: usize,
+}
+
 pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send + Sync {
+    /// Select query-only payload relations using the active declaration provider.
+    /// Blob lowering remains independent of the selected models.
+    fn selected_payload_projection(
+        &self,
+        _workspace: &crate::analyzer::workspace::WorkspaceAnalyzer,
+        _procedure: &crate::analyzer::semantic::ProcedureHandle,
+        _snapshot: Option<&crate::analyzer::semantic_model::ActiveSemanticModelSnapshot>,
+        _request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+    ) -> Result<
+        crate::analyzer::semantic::SemanticOutcome<
+            crate::analyzer::semantic::SelectedPayloadProjection,
+        >,
+        crate::analyzer::semantic::SemanticProviderError,
+    > {
+        Ok(crate::analyzer::semantic::SemanticOutcome::Complete {
+            value: Default::default(),
+            work: Default::default(),
+        })
+    }
+
+    /// The signature of an exact external callee whose formals the language
+    /// defines, such as a trait item a compiler-implemented derive supplies.
+    /// `None` leaves the formals to semantic packs.
+    fn intrinsic_external_signature(
+        &self,
+        _callee: &crate::analyzer::semantic::ResolverOwnedExternalCalleeIdentity,
+    ) -> Option<IntrinsicExternalSignature> {
+        None
+    }
+
+    /// Interpret one admitted summary component using the language's ordinary
+    /// field identity. Shared summary code owns path composition.
+    fn summary_endpoint_projection_selector(
+        &self,
+        _procedure: &crate::analyzer::semantic::SemanticLocator,
+        _step: &crate::analyzer::semantic::PatternProjectionStep,
+    ) -> Option<crate::analyzer::semantic::partial_flow::HeapSelector> {
+        None
+    }
+
+    /// Whether this adapter publishes guarded candidate-macro alternatives.
+    fn publishes_candidate_macro_alternates(&self) -> bool {
+        false
+    }
+
+    /// Reconstruct a request-local native file once; each target replays its
+    /// preparation receipt independently under its own budget.
+    fn ownership_file_base(
+        &self,
+        _workspace: &crate::analyzer::workspace::WorkspaceAnalyzer,
+        _base: &crate::analyzer::semantic::ProcedureHandle,
+        _request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+    ) -> Result<
+        crate::analyzer::semantic::SemanticOutcome<
+            Option<crate::analyzer::semantic::service::OwnershipFileBuild>,
+        >,
+        crate::analyzer::semantic::SemanticProviderError,
+    > {
+        Ok(crate::analyzer::semantic::SemanticOutcome::Complete {
+            value: None,
+            work: Default::default(),
+        })
+    }
+
+    /// Build and admit a request-local ownership interpretation. Ordinary
+    /// materialization and executable selection never call this boundary.
+    /// None means the base procedure needs no language-owned refinement.
+    /// Admit the already-frozen first target without rebuilding it.
+    fn admit_ownership_procedure(
+        &self,
+        _workspace: &crate::analyzer::workspace::WorkspaceAnalyzer,
+        _base: &crate::analyzer::semantic::ProcedureHandle,
+        _built: &crate::analyzer::semantic::service::OwnershipProcedureBuild,
+        _request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+    ) -> Result<
+        crate::analyzer::semantic::SemanticOutcome<
+            Option<crate::analyzer::semantic::service::OwnershipProcedureSelection>,
+        >,
+        crate::analyzer::semantic::SemanticProviderError,
+    > {
+        Ok(crate::analyzer::semantic::SemanticOutcome::Complete {
+            value: None,
+            work: Default::default(),
+        })
+    }
+
+    fn ownership_procedure_interpretation(
+        &self,
+        _workspace: &crate::analyzer::workspace::WorkspaceAnalyzer,
+        _base: &crate::analyzer::semantic::ProcedureHandle,
+        _shared: &crate::analyzer::semantic::service::OwnershipFileBase,
+        _request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+    ) -> Result<
+        crate::analyzer::semantic::SemanticOutcome<
+            Option<crate::analyzer::semantic::service::OwnershipProcedureSelection>,
+        >,
+        crate::analyzer::semantic::SemanticProviderError,
+    > {
+        Ok(crate::analyzer::semantic::SemanticOutcome::Complete {
+            value: None,
+            work: Default::default(),
+        })
+    }
+
+    /// Cheap necessary condition for a executable refinement. This
+    /// question grants no interpretation or certificate on its own.
+    fn executable_procedure_may_refine(
+        &self,
+        _base: &crate::analyzer::semantic::ProcedureHandle,
+    ) -> bool {
+        false
+    }
+
+    /// Prepare a native file for a executable target. Refuse lexical
+    /// guards before macro auditing or lowering; never build a lexical target.
+    fn executable_file_base(
+        &self,
+        _workspace: &crate::analyzer::workspace::WorkspaceAnalyzer,
+        _base: &crate::analyzer::semantic::ProcedureHandle,
+        _request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+    ) -> Result<
+        crate::analyzer::semantic::SemanticOutcome<
+            Option<crate::analyzer::semantic::service::OwnershipFileBuild>,
+        >,
+        crate::analyzer::semantic::SemanticProviderError,
+    > {
+        Ok(crate::analyzer::semantic::SemanticOutcome::Complete {
+            value: None,
+            work: Default::default(),
+        })
+    }
+
+    /// Build only a certified executable body. Semantic lack of a proof returns
+    /// Complete(None) with its observed reasons; missing required evidence is
+    /// Unknown, and cancellation/budget remain stopped outcomes.
+    fn executable_procedure_interpretation(
+        &self,
+        _workspace: &crate::analyzer::workspace::WorkspaceAnalyzer,
+        _base: &crate::analyzer::semantic::ProcedureHandle,
+        _shared: &crate::analyzer::semantic::service::OwnershipFileBase,
+        _rules: &mut crate::analyzer::semantic::service::ExecutableRuleContext<'_>,
+        _request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+    ) -> Result<
+        crate::analyzer::semantic::SemanticOutcome<
+            Option<crate::analyzer::semantic::service::ExecutableProcedureBuild>,
+        >,
+        crate::analyzer::semantic::SemanticProviderError,
+    > {
+        Ok(crate::analyzer::semantic::SemanticOutcome::Complete {
+            value: None,
+            work: Default::default(),
+        })
+    }
+
+    /// Return one ordered answer per candidate, including refusals and their reads.
+    fn admit_candidate_macros(
+        &self,
+        context: CandidateMacroAdmissionRequest<'_>,
+    ) -> Vec<CandidateMacroAdmissionAnswer> {
+        context
+            .candidates
+            .iter()
+            .map(|candidate| {
+                let (_, reads) =
+                    crate::analyzer::i_analyzer::QueryReadReceipt::capture(context.analyzer, || ());
+                CandidateMacroAdmissionAnswer::new(
+                    candidate.region,
+                    CandidateMacroDecision::Refused(CandidateMacroRefusal::UnsupportedLanguage),
+                    reads,
+                )
+            })
+            .collect()
+    }
+
     /// Semantic lowerer selected by this binary, independent of workspace files.
     fn policy_lowering_identity(
         &self,
@@ -667,6 +1082,20 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
                 layout_complete: false,
             },
         })
+    }
+    /// Admit an exact field-pattern source using an existing guarded candidate.
+    /// Grammar hooks must verify the selected field and both path segments
+    /// against the source snapshot and the complete recorded projection path.
+    fn admit_selected_pattern_source(
+        &self,
+        workspace: &crate::analyzer::workspace::WorkspaceAnalyzer,
+        procedure: &crate::analyzer::semantic::ProcedureHandle,
+        candidate: &crate::analyzer::semantic::GuardedPatternProjection,
+        _field: std::ops::Range<usize>,
+        snapshot: Option<&crate::analyzer::semantic_model::ActiveSemanticModelSnapshot>,
+        request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+    ) -> Result<SelectedTupleBinding, crate::analyzer::semantic::SemanticProviderError> {
+        self.admit_selected_tuple_binding(workspace, procedure, candidate, snapshot, request)
     }
     /// The caller proves a unique Object row, exact source mapping, and a
     /// complete selected-callee flow before asking this language rule.
@@ -721,6 +1150,7 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
         _ordinal: u32,
         _actual: crate::analyzer::semantic::ValueId,
         _request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+        _reuse: &mut brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict,
     ) -> Result<SelectedCallResultOwnership, crate::analyzer::semantic::SemanticProviderError> {
         Ok(SelectedCallResultOwnership::Unknown)
     }
@@ -734,6 +1164,13 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
         _request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
     ) -> Result<bool, crate::analyzer::semantic::SemanticProviderError> {
         Ok(false)
+    }
+
+    /// Every local read is preceded on every path by an assignment in code
+    /// accepted by the compiler (Rust's initialization check; Java JLS 16).
+    /// Code with a definite-assignment error has no runtime behavior.
+    fn locals_are_definitely_assigned(&self) -> bool {
+        false
     }
 
     fn requires_selected_receiver_witness(&self) -> bool {
@@ -756,6 +1193,7 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
 
     /// Certify a selected normal result's direct pointer category and its
     /// whole by-value transport to one selected destination formal.
+    #[allow(clippy::too_many_arguments)]
     fn identity_conversion_from_call_result(
         &self,
         _workspace: &crate::analyzer::workspace::WorkspaceAnalyzer,
@@ -764,6 +1202,7 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
         _target: &crate::analyzer::semantic::ProcedureHandle,
         _target_ordinal: u32,
         _request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+        _reuse: &mut brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict,
     ) -> Result<SelectedIdentityConversion, crate::analyzer::semantic::SemanticProviderError> {
         Ok(SelectedIdentityConversion::Unknown)
     }
@@ -778,6 +1217,7 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
         _captured: crate::analyzer::semantic::ValueId,
         _origin_result: crate::analyzer::semantic::ValueId,
         _request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+        _reuse: &mut brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict,
     ) -> Result<bool, crate::analyzer::semantic::SemanticProviderError> {
         Ok(false)
     }
@@ -793,6 +1233,7 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
         _callee: &crate::analyzer::semantic::ProcedureHandle,
         _result_ordinal: u32,
         _request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+        _reuse: &mut brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict,
     ) -> Result<bool, crate::analyzer::semantic::SemanticProviderError> {
         Ok(false)
     }
@@ -806,6 +1247,7 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
         _target: &crate::analyzer::semantic::ProcedureHandle,
         _target_ordinal: u32,
         _request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+        _reuse: &mut brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict,
     ) -> Result<SelectedIdentityConversion, crate::analyzer::semantic::SemanticProviderError> {
         Ok(SelectedIdentityConversion::Unknown)
     }
@@ -1117,9 +1559,32 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
         progress: Option<crate::analyzer::BuildProgress>,
     ) -> Result<crate::analyzer::multi_analyzer::AnalyzerDelegate, crate::analyzer::store::StoreError>;
 
+    /// Whether a workspace path the listing omitted is one this language's own
+    /// files could live at, so that a listing without it cannot prove the
+    /// language's inventory complete (see [`omission_hides_source`]). The
+    /// default is every path the language claims; a language whose certificate
+    /// covers more names overrides it.
+    fn is_listing_path(&self, path: &std::path::Path) -> bool {
+        Language::from_path(path) == self.knowledge().language()
+    }
+
     /// Inputs that cause a workspace delegate to receive an incremental update.
     fn is_configuration_input(&self, file: &ProjectFile) -> bool {
         self.is_configuration_input_path(file.rel_path())
+    }
+
+    /// Workspace signature files the language's adapter reads (see
+    /// `WorkspaceSignatureProducer`); an edit to one is routed to the
+    /// delegate as an incremental update.
+    fn is_signature_input(&self, _file: &ProjectFile) -> bool {
+        false
+    }
+
+    /// The workspace-relative directory that holds the signature input
+    /// `file` and every sibling signature file it belongs with (Ruby's
+    /// `sig/`), which a file watcher watches recursively.
+    fn signature_input_root(&self, _file: &ProjectFile) -> Option<std::path::PathBuf> {
+        None
     }
 
     fn workspace_member_family_capability(
@@ -1404,7 +1869,7 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
         Ok(())
     }
 
-    /// Reconcile source-owned build membership after a workspace revision changes.
+    /// Reconcile source-owned build membership after construction or a revision change.
     fn reconcile_workspace_build_context(
         &self,
         _workspace: &crate::analyzer::WorkspaceAnalyzer,
@@ -1445,15 +1910,33 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
             },
             |store| store.content_digests(),
         );
+        let project = match workspace.dependency_discovery_project() {
+            Ok(project) => project,
+            Err(_) => return crate::analyzer::semantic_model::DependencyDiscoveryOutcome::generation_listing_unavailable(cancellation),
+        };
         self.dependency_pack_resolver()
             .expect("dependency ecosystem resolver")
             .resolve(
                 config,
-                workspace.analyzer().project(),
+                project.as_ref(),
                 &digests,
                 limits,
                 Some(cancellation),
             )
+    }
+
+    /// Whether `file` is the vendored copy of the dependency module that
+    /// `evidence` activated a semantic model for: the same module at the same
+    /// selected version (#11322). A qualified call locator then treats the
+    /// file's declaration and the model's record for it as one callable.
+    /// Code the workspace owns is never such a copy, even when a model names
+    /// a declaration with the same qualified name.
+    fn is_vendored_copy_of(
+        &self,
+        _file: &ProjectFile,
+        _evidence: &crate::analyzer::semantic_model::SemanticModelMatchedEvidence,
+    ) -> bool {
+        false
     }
 
     /// Bind prepared dependency artifacts to configured source toolchains.
@@ -1537,6 +2020,7 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
         _byte: usize,
         budget: crate::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget,
         cancellation: Option<&CancellationToken>,
+        _reuse: &mut brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict,
     ) -> crate::analyzer::usages::get_definition::BoundedResolution<Option<CodeUnit>> {
         crate::analyzer::usages::get_definition::ResolutionSession::bounded(budget, cancellation)
             .finish(None)
@@ -1568,6 +2052,7 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
         _file: crate::analyzer::ProjectFile,
         _source: std::sync::Arc<str>,
         _cancellation: Option<&CancellationToken>,
+        _reuse: &mut brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict,
     ) -> Option<crate::analyzer::native_points::NativePointBatch> {
         None
     }
@@ -1642,6 +2127,7 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
         primary_tree: Option<tree_sitter::Tree>,
         preparation: Option<&crate::analyzer::usages::get_definition::PreparedDefinitionSource>,
         cancellation: Option<&crate::cancellation::CancellationToken>,
+        _reuse: &mut brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict,
     ) -> Vec<crate::analyzer::usages::get_definition::CallTargetLookupOutcome> {
         crate::analyzer::usages::get_definition::resolve_generic_call_target_batch(
             analyzer,
@@ -1768,6 +2254,48 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
         unreachable!("unsupported language handled before definition dispatch")
     }
 
+    /// Whether this language's receiver typer honors a receiver hypothesis
+    /// (`workspace_oracle::receiver_hypothesis`) and implements
+    /// [`Self::receiver_class_of_expression`], so effect derivation can
+    /// discharge a parameter-receiver call with the class a caller passes
+    /// (#12968). Other languages skip those questions entirely.
+    fn honors_receiver_hypotheses(&self) -> bool {
+        false
+    }
+
+    /// Whether the argument spanning `span`, the unchanged value of one of
+    /// the caller's own parameters, may carry on the receiver class the
+    /// caller's context proves for that parameter: nothing between the
+    /// caller's entry and this call can have changed what the class claims
+    /// (#12968). `false` forwards nothing.
+    fn argument_forwards_receiver_class(
+        &self,
+        _source: &str,
+        _tree: &tree_sitter::Tree,
+        _span: std::ops::Range<usize>,
+    ) -> bool {
+        false
+    }
+
+    /// The class the expression spanning `span` in `file` is proven to be an
+    /// instance of, named in this language's own class vocabulary: the name a
+    /// receiver hypothesis carries back to the same language's receiver
+    /// typer (see `WorkspaceSemanticOracle::argument_classes`). A typer that
+    /// honors a hypothesis consults
+    /// `workspace_oracle::receiver_hypothesis` before typing a call's
+    /// receiver. `None` proves nothing.
+    fn receiver_class_of_expression(
+        &self,
+        _analyzer: &dyn crate::analyzer::IAnalyzer,
+        _file: &ProjectFile,
+        _source: &str,
+        _tree: &tree_sitter::Tree,
+        _span: std::ops::Range<usize>,
+        _cancellation: Option<&crate::cancellation::CancellationToken>,
+    ) -> Option<Box<str>> {
+        None
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn analyze_receiver_query(
         &self,
@@ -1776,7 +2304,7 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
         _file: &ProjectFile,
         _range: crate::analyzer::Range,
         _input: crate::analyzer::usages::receiver_query::ReceiverQueryInput,
-        _budget: crate::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget,
+        _ledger: &mut crate::analyzer::usages::receiver_query::ReceiverWorkLedger,
         _cancellation: Option<&crate::CancellationToken>,
         _indexed_source: Option<String>,
     ) -> Option<
@@ -1821,6 +2349,7 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
         _token: crate::analyzer::QueryToken<'_>,
         _file: &crate::analyzer::ProjectFile,
         _name: &str,
+        _reuse: &mut brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict,
     ) -> Option<(
         crate::analyzer::structural::resolution::BoundaryStatus,
         Option<String>,
@@ -1842,11 +2371,12 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
         token: crate::analyzer::QueryToken<'_>,
         file: &crate::analyzer::ProjectFile,
         canonical_callee: &str,
+        reuse: &mut brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict,
     ) -> Option<(
         crate::analyzer::structural::resolution::BoundaryStatus,
         Option<String>,
     )> {
-        self.definition_boundary_evidence(analyzer, token, file, canonical_callee)
+        self.definition_boundary_evidence(analyzer, token, file, canonical_callee, reuse)
     }
 
     fn allocation_binds_by_reference_at_offset(
@@ -2099,11 +2629,14 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
         false
     }
 
-    /// Query-time conversion proof from retained static IR classes.
+    /// Query-time conversion proof from retained static IR classes. The
+    /// structured value kind distinguishes untyped null from an unresolved
+    /// source type without parsing source syntax at the binding boundary.
     fn static_class_argument_conversion(
         &self,
         _formal: crate::analyzer::semantic::StaticTypeClass,
         _actual: crate::analyzer::semantic::StaticTypeClass,
+        _actual_kind: &crate::analyzer::semantic::SemanticValueKind,
     ) -> Option<
         Result<
             Option<crate::analyzer::semantic::ValueTransfer>,
@@ -2124,6 +2657,21 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
         None
     }
 
+    /// Record the owning language's selected build authority on this consumer.
+    /// Recording may cover a superset of the question, never a subset. A hook
+    /// requiring narrower recording must receive the question explicitly.
+    fn record_selected_build_dependency(
+        &self,
+        _analyzer: &dyn IAnalyzer,
+        _family: crate::analyzer::semantic::read_ledger::WorkspaceFactFamily,
+        _snapshot: &crate::analyzer::store::WorkspaceSnapshotId,
+        _base_profile: [u8; 32],
+    ) -> crate::analyzer::store::Result<()> {
+        Err(crate::analyzer::store::StoreError::new(
+            "language has no selected build recorder",
+        ))
+    }
+
     /// The head's answer to one `WorkspaceFact` question about a workspace
     /// authority this language owns, as the digest the capture recorded.
     ///
@@ -2141,6 +2689,33 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
         None
     }
 
+    /// The tree part of a `Split` workspace fact: what the analyzer's manifests
+    /// declare, recorded beside an aggregate evaluation's read (#11607). Returned
+    /// only when resolving it again reproduces `answer`.
+    fn workspace_fact_basis(
+        &self,
+        _analyzer: &dyn IAnalyzer,
+        _family: crate::analyzer::semantic::read_ledger::WorkspaceFactFamily,
+        _language: Language,
+        _subject: &crate::analyzer::semantic::read_ledger::FactSubject,
+        _answer: crate::analyzer::semantic::ids::StableDigest,
+    ) -> Option<brokk_bifrost_core::analyzer::external_selection::JvmDependencyBasis> {
+        None
+    }
+
+    /// The answer of a `Split` workspace fact when its tree part is `basis` and
+    /// the environment is the analyzer's, read from no manifest (#11607).
+    fn workspace_fact_answer_under_basis(
+        &self,
+        _analyzer: &dyn IAnalyzer,
+        _family: crate::analyzer::semantic::read_ledger::WorkspaceFactFamily,
+        _language: Language,
+        _subject: &crate::analyzer::semantic::read_ledger::FactSubject,
+        _basis: &brokk_bifrost_core::analyzer::external_selection::JvmDependencyBasis,
+    ) -> Option<crate::analyzer::semantic::ids::StableDigest> {
+        None
+    }
+
     /// Replay a language-owned lookup through the same reader that recorded it.
     /// None refuses reuse when the selected answer is unavailable or incomplete.
     fn replay_owned_lookup(
@@ -2149,6 +2724,7 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
         _kind: crate::analyzer::semantic::read_ledger::LookupKind,
         _question: &crate::analyzer::semantic::read_ledger::LookupQuestion,
         _row_budget: usize,
+        _memo: &crate::analyzer::read_verification::OwnedLookupMemo,
     ) -> Option<StableDigest> {
         None
     }
@@ -2277,6 +2853,20 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
         false
     }
 
+    /// Prove the selected value gaps of one procedure using recorded resolution.
+    /// The shared sweep memoizes the result for that procedure. Languages
+    /// without a proof keep all Values gaps open by default.
+    fn selected_value_gaps(
+        &self,
+        _workspace: &super::WorkspaceAnalyzer,
+        _procedure: &super::semantic::ProcedureHandle,
+        _file: &ProjectFile,
+        _source: &Arc<str>,
+        _request: &mut super::semantic::SemanticRequest<'_>,
+    ) -> Result<Vec<super::semantic::SemanticGapId>, super::semantic::SemanticProviderError> {
+        Ok(Vec::new())
+    }
+
     /// The field- and index-memory identity gaps of `procedure` that the
     /// workspace resolver retires (#9402).
     ///
@@ -2296,21 +2886,77 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
         Vec::new()
     }
 
-    /// Whether dropping every parameter and every `let` binding of the
-    /// procedure whose callable spans `callable` in `source` provably runs no
-    /// user code (#3757).
+    /// The allocation resource-lifetime gaps of `procedure` that the
+    /// workspace resolver retires (#11428).
+    ///
+    /// Lowering is per file, so an allocation of a class declared in another
+    /// file keeps an `Unknown` `ResourceManagement` gap at its call: the file
+    /// cannot show whether releasing the object runs a destructor. An
+    /// implementation retires such a gap only when the allocated class
+    /// resolves to exactly one source declaration whose release provably runs
+    /// no user code, and it reads every declaration through a funnel that
+    /// records the read, so a kept answer misses when one of them changes.
+    ///
+    /// A retired gap answers its whole question, so the consumers on the
+    /// taint path drop it: the value-flow gap sweep, call bindings, the ICFG
+    /// exit profile and call transfers, and the taint composition's
+    /// invocation inventory. Typestate and flow-state consumers do not ask
+    /// yet, so they keep the gap open. The shared caller loads no source for
+    /// this question, so the default reads nothing and retires nothing.
+    ///
+    /// An implementation charges every declaration its proof reads to the
+    /// request budget. A refusal keeps the gap and surfaces as a request
+    /// stop, so no fill stores the partial answer as a finished one.
+    fn resolved_allocation_lifetime_gaps(
+        &self,
+        _workspace: &super::WorkspaceAnalyzer,
+        _procedure: &super::semantic::ProcedureHandle,
+        _request: &mut super::semantic::SemanticRequest<'_>,
+    ) -> Vec<super::semantic::SemanticGapId> {
+        Vec::new()
+    }
+
+    /// Whether every drop in the callable provably runs no user code.
+    fn procedure_drops_run_no_user_code(
+        &self,
+        _workspace: &crate::analyzer::workspace::WorkspaceAnalyzer,
+        _request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+        _file: &ProjectFile,
+        _source: &Arc<str>,
+        _callable: std::ops::Range<usize>,
+    ) -> bool {
+        false
+    }
+
+    /// Whether dropping the exact value mapped to `callable` in `source`
+    /// provably runs no user code. Type nodes denote written formal types;
+    /// binding nodes denote their binding type, and expressions their result.
     ///
     /// The workspace oracle uses this to discharge a gap whose declared
     /// obligation is `SemanticGapDischarge::InertDropGlue`. The default is
     /// `false`, which keeps every such gap. An implementation must answer
     /// `true` only from structured type evidence and resolver proof, never
     /// from spelling.
-    fn procedure_drops_run_no_user_code(
+    fn value_drop_runs_no_user_code(
         &self,
-        _analyzer: &dyn IAnalyzer,
+        _workspace: &crate::analyzer::workspace::WorkspaceAnalyzer,
+        _request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
         _file: &ProjectFile,
         _source: &Arc<str>,
         _callable: std::ops::Range<usize>,
+    ) -> bool {
+        false
+    }
+
+    /// Whether the residual of the exact try expression drops no user code.
+    /// This question is distinct from the expression's successful value.
+    fn try_residual_drop_runs_no_user_code(
+        &self,
+        _workspace: &crate::analyzer::workspace::WorkspaceAnalyzer,
+        _request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+        _file: &ProjectFile,
+        _source: &Arc<str>,
+        _expression: std::ops::Range<usize>,
     ) -> bool {
         false
     }
@@ -2447,18 +3093,6 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
         None
     }
 
-    /// Resolve an expression that denotes an imported package namespace.
-    fn imported_package_at_range(
-        &self,
-        _analyzer: &dyn IAnalyzer,
-        _file: &ProjectFile,
-        _source: &str,
-        _start_byte: usize,
-        _end_byte: usize,
-    ) -> Option<String> {
-        None
-    }
-
     /// Refine a selector call with the language's receiver method-set evidence.
     #[allow(clippy::too_many_arguments)]
     fn refine_selector_call_target(
@@ -2472,6 +3106,7 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
         _callee_range: &Range,
         _cancellation: Option<&CancellationToken>,
         _member_selection: Option<&crate::analyzer::semantic::DeferredMemberSelection>,
+        _reuse: &mut brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict,
     ) {
     }
 
@@ -2727,6 +3362,17 @@ pub trait LanguageSupport: crate::analyzer::store::StoreLanguageSupport + Send +
         &self,
         _node: tree_sitter::Node<'tree>,
     ) -> Option<LocalDeclarationBindingScope<'tree>> {
+        None
+    }
+
+    /// The header binders of `statement` when it declares bindings outside its body
+    /// block, such as a catch parameter or a try-with-resources variable. `None` for
+    /// every other node. The default keeps the framework's scan of enclosing blocks,
+    /// which reads a header declaration like any other local of that block.
+    fn scope_header<'tree>(
+        &self,
+        _statement: tree_sitter::Node<'tree>,
+    ) -> Option<ScopeHeader<'tree>> {
         None
     }
 
@@ -3458,11 +4104,6 @@ pub fn fqn_has_multiple_function_definitions(
 /// Language-owned mutable state whose lifetime is one receiver-query request.
 #[doc(hidden)]
 pub trait ReceiverRequest {
-    /// Whether the retained reader must be dropped before other store access.
-    fn reader_excludes_store_access(&self) -> bool {
-        false
-    }
-
     fn resolve_type(
         &mut self,
         query: BoundedReceiverQuery<'_>,
@@ -3900,6 +4541,44 @@ pub fn language_support_for_hook(
         language_support(language)
             .unwrap_or_else(|| panic!("unregistered language {language:?} for hook {hook}")),
     )
+}
+
+/// Whether an omission keeps a listing from proving the inventory of source
+/// files of `language` complete: the omission can hide a source of any language
+/// (a directory the listing did not enter, an unreadable path, an unknown
+/// cause), or it names a path this language's own files could live at (a file
+/// symlink or a file a bounded image left out). A proof that belongs to one
+/// language (the Rust listing certificate, a delegate's listing proof, the C#
+/// guard) asks this question; [`omission_hides_workspace_source`] is its
+/// workspace-level counterpart.
+#[doc(hidden)]
+pub fn omission_hides_source(
+    language: Language,
+    omission: &brokk_bifrost_core::analyzer::project::WorkspaceFileOmission,
+) -> bool {
+    brokk_bifrost_core::analyzer::project::omission_may_hide_source(omission.reason)
+        || language_support(language).is_some_and(|support| support.is_listing_path(&omission.path))
+}
+
+/// Whether an omission keeps the whole-workspace source inventory from being
+/// complete, given the languages the workspace holds (`present`). The inventory
+/// spans every language, so an omitted file of ANY analyzable language is a
+/// source the listing hid, present or not: a `.js` link in a TypeScript
+/// workspace is a JavaScript source. A present language can additionally adopt
+/// paths `Language::from_path` does not classify (C++ adopts files by include),
+/// which its `is_listing_path` states, so that adoption applies only when the
+/// language is present. The inventory and the identity fold read this one rule.
+#[doc(hidden)]
+pub fn omission_hides_workspace_source(
+    present: impl IntoIterator<Item = Language>,
+    omission: &brokk_bifrost_core::analyzer::project::WorkspaceFileOmission,
+) -> bool {
+    brokk_bifrost_core::analyzer::project::omission_may_hide_source(omission.reason)
+        || Language::from_path(&omission.path) != Language::None
+        || present.into_iter().any(|language| {
+            language_support(language)
+                .is_some_and(|support| support.is_listing_path(&omission.path))
+        })
 }
 
 #[doc(hidden)]

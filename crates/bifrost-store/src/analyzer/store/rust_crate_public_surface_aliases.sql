@@ -2,7 +2,8 @@
 -- A crate-root/self alias need not have a declaration-backed export row.
 -- Other named aliases enter here only when the existing route closure proves
 -- that they name a container. An existing type winner always shadows them.
-INSERT OR IGNORE INTO {output}
+INSERT INTO {output}
+SELECT * FROM (
 SELECT {owner_columns}demand.crate_key, routes.module_path, routes.bound_name{origin_column}
 FROM {frontier} AS demand
 CROSS JOIN cr_reexports AS routes ON routes.module_path = demand.module_path {name_predicate}
@@ -37,4 +38,5 @@ WHERE routes.visibility = 'public'
       ON target.crate_key = named.target_crate_key
      AND target.container_path = named.target_container_path
     WHERE named.crate_key = demand.crate_key AND named.module_path = routes.module_path
-      AND named.bound_name = routes.bound_name));
+      AND named.bound_name = routes.bound_name))
+) WHERE true ON CONFLICT DO NOTHING;

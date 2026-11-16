@@ -6,7 +6,7 @@ use crate::analyzer::java::imports::JavaTypeResolution;
 
 use crate::analyzer::jvm::external::JvmExternalDeclarationSource;
 
-use crate::analyzer::java::unshadowed::UseSite;
+use crate::analyzer::java::unshadowed::{UseSite, enclosing_class_units_at};
 use crate::analyzer::jvm::external::JvmExternalType;
 use crate::analyzer::jvm::external::QueryGapRecorder;
 use brokk_bifrost_jvm::java::graph_support::JavaTypeName;
@@ -28,6 +28,7 @@ use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
 use brokk_bifrost_analysis::analyzer::semantic::LengthDelimitedDigest;
 use brokk_bifrost_analysis::analyzer::semantic::StableDigest;
 use brokk_bifrost_analysis::analyzer::semantic_model::TypeRef;
+use brokk_bifrost_analysis::analyzer::semantic_model::universal_root_name_for_language;
 
 use brokk_bifrost_analysis::analyzer::usages::call_conversion::ArgumentTypeConversion;
 
@@ -41,6 +42,7 @@ use brokk_bifrost_analysis::analyzer::usages::call_conversion::ExternalConversio
 
 use brokk_bifrost_analysis::analyzer::usages::call_conversion::ExternalConversionProvenance;
 
+use brokk_bifrost_jvm::java::conversion::{JavaConversion, primitive_to_named_reference};
 use brokk_bifrost_jvm::java::primitives::JavaPrimitive;
 
 use brokk_bifrost_analysis::analyzer::usages::call_conversion::ModelArgumentApplicability;
@@ -52,6 +54,11 @@ use crate::analyzer::usages::get_definition::java::JavaResolutionSession;
 use crate::analyzer::usages::get_definition::java::JavaSourceInvocationReturn;
 
 use crate::analyzer::usages::get_definition::java::java_external_constructor;
+
+use crate::analyzer::usages::get_definition::java::java_external_field_type;
+use crate::analyzer::usages::get_definition::java::{
+    JavaConstructorSelection, java_constructor_selection, java_modeled_constructor_exists,
+};
 
 use crate::analyzer::usages::get_definition::java::java_external_invocation_return_type;
 
@@ -82,9 +89,14 @@ use brokk_bifrost_core::analyzer::model::ProjectFile;
 use brokk_bifrost_core::analyzer::query_token::QueryScope;
 use brokk_bifrost_core::analyzer::tree_walk::root_node as root_of;
 use brokk_bifrost_core::analyzer::tree_walk::unwrap_parenthesized_expression;
-use brokk_bifrost_jvm::java::declarations::node_text;
+use brokk_bifrost_jvm::java::declarations::{
+    explicit_java_source_visibility, java_modifier_keywords, node_text,
+};
 use brokk_bifrost_jvm::java::graph::return_type::java_type_name_components;
-use brokk_bifrost_jvm::java::graph_support::java_type_parameter_in_scope;
+use brokk_bifrost_jvm::java::graph_support::{
+    java_has_anonymous_class_body, java_object_creation_enclosing_expression,
+    java_type_parameter_in_scope,
+};
 use tree_sitter::Node;
 
 /// Prove a selected Java constructor result is the exact external class of a
@@ -98,6 +110,7 @@ pub(super) fn modeled_result_formal_identity(
     target: &brokk_bifrost_analysis::analyzer::semantic::ProcedureHandle,
     target_ordinal: u32,
     request: &mut brokk_bifrost_analysis::analyzer::semantic::SemanticRequest<'_>,
+    reuse: &mut brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict,
 ) -> Result<
     brokk_bifrost_analysis::analyzer::languages::SelectedIdentityConversion,
     brokk_bifrost_analysis::analyzer::semantic::SemanticProviderError,
@@ -148,24 +161,16 @@ pub(super) fn modeled_result_formal_identity(
     )) else {
         return unknown();
     };
-    let Some(source) = workspace.current_program_semantics_artifact_source(
-        &source_file,
-        request.budget.limits().source_bytes,
-    )?
+    let Some(source) = workspace
+        .held_program_semantics_artifact_source(&source_file, request)?
+        .held_or_refused()?
     else {
-        request
-            .budget
-            .note_external_stop(SemanticBudgetDimension::SourceBytes);
         return unknown();
     };
-    let Some(formal_source) = workspace.current_program_semantics_artifact_source(
-        &formal_file,
-        request.budget.limits().source_bytes,
-    )?
+    let Some(formal_source) = workspace
+        .held_program_semantics_artifact_source(&formal_file, request)?
+        .held_or_refused()?
     else {
-        request
-            .budget
-            .note_external_stop(SemanticBudgetDimension::SourceBytes);
         return unknown();
     };
     if source.key() != origin.call.procedure().artifact().key()
@@ -190,7 +195,9 @@ pub(super) fn modeled_result_formal_identity(
     let _model_scope = match AnalyzerQueryScope::pin_selected_model_snapshot(analyzer) {
         Ok(scope) => scope,
         Err(_) => {
-            analyzer.mark_execution_dependent();
+            reuse.join_in(
+                brokk_bifrost_analysis::analyzer::i_analyzer::execution_dependent(analyzer),
+            );
             return unknown();
         }
     };
@@ -270,7 +277,7 @@ pub(super) fn modeled_result_formal_identity(
     {
         return unknown();
     }
-    let Some(overlay) = analyzer.semantic_model_overlay() else {
+    let Some(overlay) = analyzer.semantic_model_overlay_read().published() else {
         return unknown();
     };
     let selected_callable = overlay.callable_for_target(SemanticModelCallableKey::new(
@@ -458,16 +465,52 @@ pub(crate) fn prove_argument(
         resolve_analyzer::<JavaAnalyzer>(analyzer).ok_or(ConversionUnknown::UnsupportedLanguage)?;
     let scope = AnalyzerQueryScope::new(java);
     let token = scope.token();
-    let packs = analyzer.semantic_model_overlay();
+    let packs = analyzer.semantic_model_overlay_read().published();
 
-    let target = resolve_formal_type(
-        java,
-        token,
-        packs.clone(),
-        formal_file,
-        formal,
-        formal_source,
-    )?;
+    let target = if sources.fixed_array_invocation.is_some() && formal.kind() == "spread_parameter"
+    {
+        let type_node = brokk_bifrost_jvm::java::declarations::spread_parameter_type_node(formal)
+            .ok_or(ConversionUnknown::UnresolvedTargetType)?;
+        let (element, rank) = java_type_node_shape(type_node)?;
+        let rank = rank
+            .checked_add(1)
+            .filter(|rank| *rank <= JAVA_ARRAY_RANK_LIMIT)
+            .ok_or(ConversionUnknown::BudgetExhausted)?;
+        let element = resolve_type_node(
+            java,
+            token,
+            packs.clone(),
+            formal_file,
+            element,
+            formal_source,
+        )
+        .map_err(TypeResolutionFailure::target)?;
+        array_java_type(element, rank)
+    } else {
+        JavaConversionType::Value(resolve_formal_type(
+            java,
+            token,
+            packs.clone(),
+            formal_file,
+            formal,
+            formal_source,
+        )?)
+    };
+    // Native selection has certified the implicit array formal. Render its
+    // conversion with the same selected static-type classifier used by model
+    // formals, including null and covariant arrays.
+    #[cfg(any(test, feature = "test-support"))]
+    if sources.fixed_array_invocation.is_some() && formal.kind() == "spread_parameter" {
+        let target =
+            java_conversion_type_ref(target).ok_or(ConversionUnknown::UnresolvedTargetType)?;
+        return match native_argument_applicability(analyzer, java, file, actual, source, &target) {
+            ModelArgumentApplicability::Applicable(conversion) => Ok(*conversion),
+            ModelArgumentApplicability::Inapplicable => {
+                Err(ConversionUnknown::UnsupportedConversion)
+            }
+            ModelArgumentApplicability::Unknown(reason) => Err(reason),
+        };
+    }
     let source_type = resolve_actual_type_bounded(
         Some(sources),
         java,
@@ -479,12 +522,7 @@ pub(crate) fn prove_argument(
         JAVA_EXPRESSION_DEPTH_LIMIT,
     )?;
 
-    classify_java_conversion_with_hierarchy(
-        java,
-        packs.as_deref(),
-        source_type,
-        JavaConversionType::Value(target),
-    )
+    classify_java_conversion_with_hierarchy(java, packs.as_deref(), source_type, target)
 }
 
 /// Resolver-backed conversion for one exact local binding write.
@@ -726,7 +764,7 @@ impl<'a> JavaLocalAssignmentConversionProver<'a> {
         }
         let scope = AnalyzerQueryScope::new(java);
         let token = scope.token();
-        let packs = self.analyzer.semantic_model_overlay();
+        let packs = self.analyzer.semantic_model_overlay_read().published();
         let type_node =
             declared_type_node(declaration).ok_or(ConversionUnknown::UnresolvedTargetType)?;
         if declaration_declares_array(declaration, type_node) {
@@ -764,7 +802,7 @@ impl<'a> JavaLocalAssignmentConversionProver<'a> {
             use brokk_bifrost_analysis::analyzer::semantic_model::JavaHierarchyIncomplete;
             return Err(match reason {
                 JavaHierarchyIncomplete::Cancelled => ConversionUnknown::Cancelled,
-                JavaHierarchyIncomplete::BudgetExhausted => ConversionUnknown::BudgetExhausted,
+                JavaHierarchyIncomplete::BudgetExhausted => ConversionUnknown::FixedLimit,
                 JavaHierarchyIncomplete::Ambiguous => ConversionUnknown::AmbiguousBinding,
                 JavaHierarchyIncomplete::GenericSubstitution => {
                     ConversionUnknown::GenericSubstitution
@@ -919,7 +957,7 @@ pub(crate) fn primitive_actual_type(
     let resolved = resolve_actual_type(
         java,
         scope.token(),
-        analyzer.semantic_model_overlay(),
+        analyzer.semantic_model_overlay_read().published(),
         file,
         actual,
         source,
@@ -1063,7 +1101,16 @@ impl CallArgumentConversionProver for JavaCallArgumentConversionProver {
         source: &str,
         formal_type: &TypeRef,
     ) -> Result<ArgumentTypeConversion, ConversionUnknown> {
-        match self.model_argument_applicability(analyzer, file, actual, source, formal_type) {
+        // A published proof types the actual for value transfer, which a
+        // cast's target type does not establish.
+        match java_model_argument_applicability(
+            analyzer,
+            file,
+            actual,
+            source,
+            formal_type,
+            resolve_actual_type,
+        ) {
             ModelArgumentApplicability::Applicable(conversion) => Ok(*conversion),
             ModelArgumentApplicability::Inapplicable => {
                 Err(ConversionUnknown::UnsupportedConversion)
@@ -1079,7 +1126,12 @@ impl CallArgumentConversionProver for JavaCallArgumentConversionProver {
         actuals: &[Node<'_>],
         source: &str,
         signatures: &[brokk_bifrost_analysis::analyzer::semantic_model::Signature],
-    ) -> Option<Result<(usize, Vec<TypeRef>), ConversionUnknown>> {
+    ) -> Option<
+        Result<
+            brokk_bifrost_analysis::analyzer::usages::call_conversion::ModelInvocationSelection,
+            ConversionUnknown,
+        >,
+    > {
         #[cfg(any(test, feature = "test-support"))]
         if std::env::var_os("BIFROST_TRIAL_NATIVE_JAVA").is_some() {
             return Some((|| {
@@ -1094,7 +1146,7 @@ impl CallArgumentConversionProver for JavaCallArgumentConversionProver {
                         .unwrap_or(TypeRef::Unknown)
                     })
                     .collect::<Vec<_>>();
-                let packs = analyzer.semantic_model_overlay();
+                let packs = analyzer.semantic_model_overlay_read().published();
                 let selected = java.selected_jdk_home_for_file(file).ok().and_then(|home| {
                     analyzer
                         .active_semantic_model_snapshot()?
@@ -1120,12 +1172,15 @@ impl CallArgumentConversionProver for JavaCallArgumentConversionProver {
         None
     }
 
-    /// JLS 15.12.2.5 for the non-generic overloads a model declares: a
-    /// fixed-arity method is more specific than another when each of its
-    /// formals is a subtype of the other's formal at the same position. A
-    /// variable-arity peer that the actual count does not fit applies only in
-    /// the variable-arity phase (15.12.2.4), after every fixed-arity
-    /// applicable method, so the fixed-arity one wins.
+    fn fixed_arity_invocation_precedes_variable_arity(&self) -> bool {
+        true
+    }
+
+    /// JLS 15.12.2.5 for the non-generic fixed-arity overloads a model
+    /// declares: a method is more specific than another when each of its
+    /// formals is a subtype of the other's formal at the same position. The
+    /// shared selector already applies the phases, so a variable-arity peer
+    /// never competes with a fixed-arity applicable method here.
     fn model_signature_more_specific(
         &self,
         analyzer: &dyn IAnalyzer,
@@ -1140,13 +1195,9 @@ impl CallArgumentConversionProver for JavaCallArgumentConversionProver {
             || specific.parameters.iter().any(|formal| formal.variadic)
             || !specific.type_parameters.is_empty()
             || !other.type_parameters.is_empty()
+            || other.parameters.iter().any(|formal| formal.variadic)
+            || other.parameters.len() != arity
         {
-            return false;
-        }
-        if other.parameters.iter().any(|formal| formal.variadic) {
-            return other.parameters.len() != arity;
-        }
-        if other.parameters.len() != arity {
             return false;
         }
         let Some(java) = resolve_analyzer::<JavaAnalyzer>(analyzer) else {
@@ -1154,7 +1205,7 @@ impl CallArgumentConversionProver for JavaCallArgumentConversionProver {
         };
         let scope = AnalyzerQueryScope::new(java);
         let token = scope.token();
-        let packs = analyzer.semantic_model_overlay();
+        let packs = analyzer.semantic_model_overlay_read().published();
         let mut differs = false;
         for (specific_formal, other_formal) in specific.parameters.iter().zip(&other.parameters) {
             if specific_formal.r#type == other_formal.r#type {
@@ -1184,47 +1235,118 @@ impl CallArgumentConversionProver for JavaCallArgumentConversionProver {
         source: &str,
         formal_type: &TypeRef,
     ) -> ModelArgumentApplicability {
-        if file.language() != Language::Java {
-            return ModelArgumentApplicability::Unknown(ConversionUnknown::UnsupportedLanguage);
-        }
-        let Some(java) = resolve_analyzer::<JavaAnalyzer>(analyzer) else {
-            return ModelArgumentApplicability::Unknown(ConversionUnknown::UnsupportedLanguage);
-        };
-        #[cfg(any(test, feature = "test-support"))]
-        if std::env::var_os("BIFROST_TRIAL_NATIVE_JAVA").is_some() {
-            return native_model_argument_applicability(
-                analyzer,
-                java,
-                file,
-                actual,
-                source,
-                formal_type,
-            );
-        }
-        let scope = AnalyzerQueryScope::new(java);
-        let token = scope.token();
-        let packs = analyzer.semantic_model_overlay();
-        let source_type =
-            match resolve_actual_type(java, token, packs.clone(), file, actual, source) {
-                Ok(source_type) => source_type,
-                Err(reason) => return ModelArgumentApplicability::Unknown(reason),
-            };
-        let target = match resolve_model_type_ref(
-            java,
-            token,
-            packs.clone(),
+        java_model_argument_applicability(
+            analyzer,
             file,
+            actual,
+            source,
             formal_type,
-            actual
-                .parent()
-                .and_then(|arguments| arguments.parent())
-                .map(|call| (call, source)),
-        ) {
-            Ok(target) => target,
-            Err(reason) => return ModelArgumentApplicability::Unknown(reason),
-        };
-        classify_java_conversion_applicability(java, packs.as_deref(), source_type, target)
+            resolve_selection_actual_type,
+        )
     }
+}
+
+/// Applicability of one actual to one model formal, with the actual typed by
+/// `actual_type`: selection typing for overload selection, value-transfer
+/// typing for a published conversion proof.
+fn java_model_argument_applicability(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    actual: Node<'_>,
+    source: &str,
+    formal_type: &TypeRef,
+    actual_type: JavaActualTyping,
+) -> ModelArgumentApplicability {
+    if file.language() != Language::Java {
+        return ModelArgumentApplicability::Unknown(ConversionUnknown::UnsupportedLanguage);
+    }
+    let Some(java) = resolve_analyzer::<JavaAnalyzer>(analyzer) else {
+        return ModelArgumentApplicability::Unknown(ConversionUnknown::UnsupportedLanguage);
+    };
+    #[cfg(any(test, feature = "test-support"))]
+    if std::env::var_os("BIFROST_TRIAL_NATIVE_JAVA").is_some() {
+        return native_argument_applicability(analyzer, java, file, actual, source, formal_type);
+    }
+    let scope = AnalyzerQueryScope::new(java);
+    let token = scope.token();
+    let packs = analyzer.semantic_model_overlay_read().published();
+    let source_type = match actual_type(java, token, packs.clone(), file, actual, source) {
+        Ok(source_type) => source_type,
+        Err(reason) => return ModelArgumentApplicability::Unknown(reason),
+    };
+    // An array's only supertypes are Object, Cloneable, Serializable and
+    // covariant arrays (JLS 4.10.3), none of them parameterized, so an array
+    // never converts to a parameterized formal such as Iterable<T>.
+    if matches!(source_type, JavaConversionType::Array(_))
+        && matches!(formal_type, TypeRef::Named { arguments, .. } if !arguments.is_empty())
+    {
+        return ModelArgumentApplicability::Inapplicable;
+    }
+    let target = match resolve_model_type_ref(
+        java,
+        token,
+        packs.clone(),
+        file,
+        formal_type,
+        actual
+            .parent()
+            .and_then(|arguments| arguments.parent())
+            .map(|call| (call, source)),
+    ) {
+        Ok(target) => target,
+        Err(reason) => return ModelArgumentApplicability::Unknown(reason),
+    };
+    classify_java_conversion_applicability(java, packs.as_deref(), source_type, target)
+}
+
+type JavaActualTyping = fn(
+    &JavaAnalyzer,
+    brokk_bifrost_core::analyzer::query_token::QueryToken<'_>,
+    Option<
+        std::sync::Arc<
+            brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay,
+        >,
+    >,
+    &ProjectFile,
+    Node<'_>,
+    &str,
+) -> Result<JavaConversionType, ConversionUnknown>;
+
+/// The static type of one actual for overload selection, which needs only
+/// the actual's type (JLS 15.12.2). A cast's static type is its target type
+/// (JLS 15.16), whatever its operand's type is, so it counts here as it does
+/// for primitive casts in [`primitive_actual_type`]. Like those, it is not a
+/// bounded source-type proof for value transfer: [`resolve_actual_type`]
+/// keeps a cast unsupported. An intersection cast names several types and
+/// stays unsupported.
+fn resolve_selection_actual_type(
+    java: &JavaAnalyzer,
+    token: brokk_bifrost_core::analyzer::query_token::QueryToken<'_>,
+    packs: Option<
+        std::sync::Arc<
+            brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay,
+        >,
+    >,
+    file: &ProjectFile,
+    actual: Node<'_>,
+    source: &str,
+) -> Result<JavaConversionType, ConversionUnknown> {
+    let expression = unwrap_parenthesized_expression(actual);
+    if expression.kind() != "cast_expression" || expression.has_error() {
+        return resolve_actual_type(java, token, packs, file, actual, source);
+    }
+    let mut cursor = expression.walk();
+    let mut types = expression.children_by_field_name("type", &mut cursor);
+    let (Some(type_node), None) = (types.next(), types.next()) else {
+        return Err(ConversionUnknown::UnsupportedExpression);
+    };
+    let (element, dimensions) = java_type_node_shape(type_node)?;
+    if dimensions > JAVA_ARRAY_RANK_LIMIT {
+        return Err(ConversionUnknown::BudgetExhausted);
+    }
+    let element = resolve_type_node(java, token, packs, file, element, source)
+        .map_err(TypeResolutionFailure::source)?;
+    Ok(array_java_type(element, dimensions))
 }
 
 fn resolve_formal_type(
@@ -1266,9 +1388,13 @@ pub(crate) fn legacy_static_argument_type(
         return Some(intrinsic);
     }
     let java = resolve_analyzer::<JavaAnalyzer>(analyzer)?;
-    let packs = analyzer.semantic_model_overlay();
+    let packs = analyzer.semantic_model_overlay_read().published();
     let scope = AnalyzerQueryScope::with_semantic_model_overlay(java, packs.clone());
-    let mut ty = resolve_actual_type(java, scope.token(), packs, file, actual, source).ok()?;
+    let ty = resolve_actual_type(java, scope.token(), packs, file, actual, source).ok()?;
+    java_conversion_type_ref(ty)
+}
+
+fn java_conversion_type_ref(mut ty: JavaConversionType) -> Option<TypeRef> {
     let mut rank = 0;
     while let JavaConversionType::Array(element) = ty {
         rank += 1;
@@ -1458,11 +1584,65 @@ fn resolve_actual_type_bounded(
                 }
             }
         }
+        // A static or instance read of an external field, such as
+        // `java.util.Locale.US`, has the field's declared type (#12136). A
+        // field access the external surface does not type stays unsupported.
+        "field_access" => {
+            let _model_scope = AnalyzerQueryScope::with_semantic_model_overlay(java, packs.clone());
+            let definitions = AnalyzerDefinitionLookup::new(java, Language::Java);
+            let cancellation = java.active_query_cancellation();
+            let session = JavaResolutionSession::bounded(
+                &definitions,
+                ReceiverAnalysisBudget::default(),
+                cancellation.as_ref(),
+            );
+            let declared =
+                java_external_field_type(java, token, &session, file, source, expression);
+            match session.finish(declared) {
+                BoundedResolution::Complete {
+                    value: Some(declared),
+                    ..
+                } => resolve_model_type_ref(java, token, packs, file, &declared, None).map_err(
+                    |reason| match reason {
+                        ConversionUnknown::UnresolvedTargetType => {
+                            ConversionUnknown::UnresolvedSourceType
+                        }
+                        other => other,
+                    },
+                ),
+                BoundedResolution::Complete { value: None, .. }
+                | BoundedResolution::Unavailable { .. } => {
+                    Err(ConversionUnknown::UnsupportedExpression)
+                }
+                BoundedResolution::Exceeded { .. } => Err(ConversionUnknown::BudgetExhausted),
+                BoundedResolution::Cancelled { .. } => Err(ConversionUnknown::Cancelled),
+            }
+        }
         "object_creation_expression" => {
             use brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelCallableKey;
             let nested_remaining = remaining
                 .checked_sub(1)
                 .ok_or(ConversionUnknown::BudgetExhausted)?;
+            match java_source_creation(
+                sources,
+                java,
+                token,
+                packs.clone(),
+                file,
+                expression,
+                source,
+                nested_remaining,
+            ) {
+                JavaSourceCreation::Applicable(owner) => {
+                    return workspace_type_identity(java, owner)
+                        .map(JavaConversionType::Value)
+                        .map_err(TypeResolutionFailure::source);
+                }
+                // An erroneous creation has no value type (JLS 15.9.3).
+                JavaSourceCreation::Refused => return Err(ConversionUnknown::UnresolvedSourceType),
+                JavaSourceCreation::Open(reason) => return Err(reason),
+                JavaSourceCreation::NotSource => {}
+            }
             let overlay = packs
                 .clone()
                 .ok_or(ConversionUnknown::UnresolvedSourceType)?;
@@ -1587,6 +1767,417 @@ fn resolve_actual_type_bounded(
         }
         _ => Err(ConversionUnknown::UnsupportedExpression),
     }
+}
+
+/// What a creation of a workspace class proves about its value (#10089).
+///
+/// A creation's value can type a receiver or an outer actual only when the
+/// creation's own constructor call has an applicable target. The external
+/// route applies the same rule through its exact constructor proof. A
+/// declared constructor applies when every actual converts to its formal by a
+/// proven conversion (JLS 15.9.3). The call is refused when no constructor
+/// takes its arity, or when every arity candidate rejects an actual by a
+/// proven inapplicable conversion. Any other answer stays open.
+pub(crate) enum JavaSourceCreation {
+    /// The creation is qualified, generic or anonymous, or its type is not a
+    /// workspace class. The caller keeps its existing route.
+    NotSource,
+    /// Exactly one constructor applies; the value has the owner's type.
+    Applicable(CodeUnit),
+    Refused,
+    Open(ConversionUnknown),
+}
+
+#[allow(clippy::too_many_arguments)] // Forward the exact source cache through bounded typing.
+pub(crate) fn java_source_creation(
+    sources: Option<
+        &brokk_bifrost_analysis::analyzer::usages::call_conversion::CallConversionContext<'_>,
+    >,
+    java: &JavaAnalyzer,
+    token: brokk_bifrost_core::analyzer::query_token::QueryToken<'_>,
+    packs: Option<
+        std::sync::Arc<
+            brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay,
+        >,
+    >,
+    file: &ProjectFile,
+    creation: Node<'_>,
+    source: &str,
+    remaining: usize,
+) -> JavaSourceCreation {
+    assert_eq!(creation.kind(), "object_creation_expression");
+    let Some(type_node) = creation.child_by_field_name("type") else {
+        return JavaSourceCreation::NotSource;
+    };
+    if creation.has_error()
+        || type_node.kind() == "generic_type"
+        || java_object_creation_enclosing_expression(creation, type_node).is_some()
+        || java_has_anonymous_class_body(creation)
+    {
+        return JavaSourceCreation::NotSource;
+    }
+    let Some(arguments) = creation.child_by_field_name("arguments") else {
+        return JavaSourceCreation::NotSource;
+    };
+    let mut cursor = arguments.walk();
+    let actuals = arguments
+        .named_children(&mut cursor)
+        .filter(|argument| !argument.is_extra())
+        .collect::<Vec<_>>();
+    let _model_scope = AnalyzerQueryScope::with_semantic_model_overlay(java, packs.clone());
+    let definitions = AnalyzerDefinitionLookup::new(java, Language::Java);
+    let cancellation = java.active_query_cancellation();
+    let session = JavaResolutionSession::bounded(
+        &definitions,
+        ReceiverAnalysisBudget::default(),
+        cancellation.as_ref(),
+    );
+    let selected = java_type_from_node_with_context(
+        java, token, java, &session, file, source, type_node,
+    )
+    .map(|owner| {
+        let arity = Some(actuals.len());
+        let selection = java_constructor_selection(java, java, &session, &owner, arity);
+        // Arity selection reads a model only when no declared constructor
+        // takes the arity, so a modeled constructor may still apply. `None` is
+        // a model whose member list is open.
+        let modeled = if matches!(selection, JavaConstructorSelection::Declared(_)) {
+            java_modeled_constructor_exists(java, &session, &owner, arity)
+        } else {
+            Some(false)
+        };
+        (owner, selection, modeled)
+    });
+    let (owner, selection, modeled) = match session.finish(selected) {
+        BoundedResolution::Complete {
+            value: Some(selected),
+            ..
+        } => selected,
+        BoundedResolution::Complete { value: None, .. } => return JavaSourceCreation::NotSource,
+        BoundedResolution::Exceeded { .. } => {
+            return JavaSourceCreation::Open(ConversionUnknown::BudgetExhausted);
+        }
+        BoundedResolution::Unavailable { .. } => {
+            return JavaSourceCreation::Open(ConversionUnknown::UnresolvedSourceType);
+        }
+        BoundedResolution::Cancelled { .. } => {
+            return JavaSourceCreation::Open(ConversionUnknown::Cancelled);
+        }
+    };
+    // A creation without a class body must name a class that is neither
+    // abstract nor an interface, enum or annotation type (JLS 15.9.1);
+    // otherwise it is erroneous and has no value.
+    let instantiable = java
+        .inner()
+        .prepared_syntax(token, owner.source())
+        .and_then(|declaring| {
+            let declaration = declaring
+                .declaration_node(&owner)
+                .filter(|declaration| !declaration.has_error())?;
+            match declaration.kind() {
+                "class_declaration" => {
+                    Some(!java_modifier_keywords(declaration).any(|keyword| keyword == "abstract"))
+                }
+                "record_declaration" => Some(true),
+                "interface_declaration" | "enum_declaration" | "annotation_type_declaration" => {
+                    Some(false)
+                }
+                _ => None,
+            }
+        });
+    match instantiable {
+        Some(true) => {}
+        Some(false) => return JavaSourceCreation::Refused,
+        None => return JavaSourceCreation::Open(ConversionUnknown::UnresolvedSourceType),
+    }
+    let constructors = match selection {
+        JavaConstructorSelection::Declared(constructors) => constructors,
+        JavaConstructorSelection::Implicit if actuals.is_empty() => {
+            return JavaSourceCreation::Applicable(owner);
+        }
+        // A record's canonical constructor takes formals this reader does not
+        // prove, and a modeled constructor has no source formals.
+        JavaConstructorSelection::Implicit
+        | JavaConstructorSelection::Modeled
+        | JavaConstructorSelection::Unavailable
+        | JavaConstructorSelection::ModelUnavailable => {
+            return JavaSourceCreation::Open(ConversionUnknown::UnresolvedSignature);
+        }
+        JavaConstructorSelection::NoneApplicable => return JavaSourceCreation::Refused,
+    };
+    let mut actual_types = Vec::with_capacity(actuals.len());
+    for actual in &actuals {
+        // Operand typing adds the numeric literal's own type (JLS 3.10), which
+        // a creation's constructor applicability needs.
+        match resolve_java_expression_operand_bounded(
+            sources,
+            java,
+            token,
+            packs.clone(),
+            file,
+            *actual,
+            source,
+            remaining,
+        ) {
+            Err(reason @ (ConversionUnknown::Cancelled | ConversionUnknown::BudgetExhausted)) => {
+                return JavaSourceCreation::Open(reason);
+            }
+            actual_type => actual_types.push(actual_type),
+        }
+    }
+    let mut applicable = 0usize;
+    let mut open = None;
+    'constructors: for constructor in &constructors {
+        let Some(declaring) = java.inner().prepared_syntax(token, constructor.source()) else {
+            open.get_or_insert(ConversionUnknown::UnresolvedSignature);
+            continue;
+        };
+        let formal_source = declaring.source();
+        let slots = declaring
+            .declaration_node(constructor)
+            .and_then(|declaration| {
+                formal_parameter_slots_for_owner_with_nodes(
+                    Language::Java,
+                    declaration,
+                    formal_source,
+                )
+            });
+        let Some(formals) = slots.map(|slots| {
+            slots
+                .into_iter()
+                .filter(|(slot, _)| !slot.receiver)
+                .collect::<Vec<_>>()
+        }) else {
+            open.get_or_insert(ConversionUnknown::UnresolvedSignature);
+            continue;
+        };
+        // Variable-arity applicability expands the actual list (JLS 15.12.2.4).
+        if formals.len() != actuals.len() || formals.iter().any(|(slot, _)| slot.variadic.is_some())
+        {
+            open.get_or_insert(ConversionUnknown::UnsupportedConversion);
+            continue;
+        }
+        // JLS 15.9.3 selects among the accessible constructors only. Only a
+        // proven access lets a constructor apply; an unreadable one stays open.
+        match java_constructor_access(
+            java,
+            file,
+            creation,
+            constructor,
+            declaring.declaration_node(constructor),
+        ) {
+            JavaConstructorAccess::Accessible => {}
+            JavaConstructorAccess::Inaccessible => continue,
+            JavaConstructorAccess::Undecided => {
+                open.get_or_insert(ConversionUnknown::UnresolvedSignature);
+                continue;
+            }
+        }
+        let mut constructor_open = None;
+        for (actual, (_, formal)) in actual_types.iter().zip(&formals) {
+            let applicability = match (
+                actual.clone(),
+                resolve_formal_type(
+                    java,
+                    token,
+                    packs.clone(),
+                    constructor.source(),
+                    *formal,
+                    formal_source,
+                ),
+            ) {
+                (Ok(actual), Ok(formal)) => classify_java_conversion_applicability(
+                    java,
+                    packs.as_deref(),
+                    actual,
+                    JavaConversionType::Value(formal),
+                ),
+                // No declaration of the formal's type is available, but the
+                // formal may still be named by Java's own import rules.
+                (
+                    Ok(JavaConversionType::Value(ResolvedConversionType::JavaPrimitive(primitive))),
+                    Err(ConversionUnknown::UnresolvedTargetType),
+                ) => match implicit_java_lang_formal_conversion(
+                    java,
+                    token,
+                    packs.clone(),
+                    constructor.source(),
+                    *formal,
+                    formal_source,
+                    primitive,
+                ) {
+                    Some(JavaConversion::Inapplicable) => ModelArgumentApplicability::Inapplicable,
+                    Some(_) => continue,
+                    None => {
+                        ModelArgumentApplicability::Unknown(ConversionUnknown::UnresolvedTargetType)
+                    }
+                },
+                (Err(reason), _) | (_, Err(reason)) => ModelArgumentApplicability::Unknown(reason),
+            };
+            match applicability {
+                ModelArgumentApplicability::Applicable(_) => {}
+                ModelArgumentApplicability::Inapplicable => continue 'constructors,
+                ModelArgumentApplicability::Unknown(
+                    reason @ (ConversionUnknown::Cancelled | ConversionUnknown::BudgetExhausted),
+                ) => return JavaSourceCreation::Open(reason),
+                ModelArgumentApplicability::Unknown(reason) => {
+                    constructor_open.get_or_insert(reason);
+                }
+            }
+        }
+        match constructor_open {
+            Some(reason) => {
+                open.get_or_insert(reason);
+            }
+            None => applicable += 1,
+        }
+    }
+    match (applicable, open) {
+        (0, None) if modeled != Some(false) => {
+            JavaSourceCreation::Open(ConversionUnknown::UnresolvedSignature)
+        }
+        (0, None) => JavaSourceCreation::Refused,
+        // A modeled constructor of the same arity, or an open model, may also
+        // apply or be more specific, so one source candidate is not unique.
+        (1, None) if modeled == Some(false) => JavaSourceCreation::Applicable(owner),
+        (_, None) => JavaSourceCreation::Open(ConversionUnknown::AmbiguousBinding),
+        (_, Some(reason)) => JavaSourceCreation::Open(reason),
+    }
+}
+
+/// The conversion of a primitive actual to a formal whose declaration is not
+/// available, when its type is a plain simple name that only Java's implicit
+/// `java.lang.*` import can bind (JLS 6.4.1, 7.3). The formal is then
+/// `java.lang.<name>` by that rule, and the shared classifier decides the
+/// names it knows: the primitive's wrapper and `Object` apply, `String` never
+/// does. Any other name, and any formal another import could bind, is `None`.
+fn implicit_java_lang_formal_conversion(
+    java: &JavaAnalyzer,
+    token: brokk_bifrost_core::analyzer::query_token::QueryToken<'_>,
+    packs: Option<
+        std::sync::Arc<
+            brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay,
+        >,
+    >,
+    file: &ProjectFile,
+    formal: Node<'_>,
+    source: &str,
+    primitive: JavaPrimitive,
+) -> Option<JavaConversion> {
+    let type_node = declared_type_node(formal)?;
+    if type_node.kind() != "type_identifier" {
+        return None;
+    }
+    let components = java_type_name_components(type_node, source)?;
+    let name = JavaTypeName::from_components(components)?;
+    java.names_only_through_implicit_java_lang(
+        token,
+        packs,
+        file,
+        &name,
+        &UseSite {
+            token,
+            source,
+            node: type_node,
+        },
+    )
+    .then(|| primitive_to_named_reference(primitive, &format!("java.lang.{}", name.first())))
+    .flatten()
+}
+
+/// Whether a creation site may invoke a declared constructor (JLS 6.6.1, 6.6.2).
+enum JavaConstructorAccess {
+    Accessible,
+    Inaccessible,
+    /// The modifiers, package or enclosing declarations cannot be read.
+    Undecided,
+}
+
+/// Classify a declared constructor's access from `creation`, which lies in
+/// `file`. A public constructor is accessible. A package-private or protected
+/// one is accessible inside its package: `java_source_creation` excludes an
+/// anonymous creation, the only `new` that reaches a protected constructor from
+/// another package. A private one is accessible inside the top-level type
+/// declaration that contains it. An enum or other non-class owner, an
+/// unreadable declaration and a mirrored copy of the owner stay undecided.
+fn java_constructor_access(
+    java: &JavaAnalyzer,
+    file: &ProjectFile,
+    creation: Node<'_>,
+    constructor: &CodeUnit,
+    declaration: Option<Node<'_>>,
+) -> JavaConstructorAccess {
+    use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
+    let Some(declaration) = declaration.filter(|declaration| {
+        !declaration.has_error()
+            && matches!(
+                declaration.kind(),
+                "constructor_declaration" | "compact_constructor_declaration"
+            )
+            && declaration
+                .parent()
+                .is_some_and(|body| body.kind() == "class_body")
+    }) else {
+        return JavaConstructorAccess::Undecided;
+    };
+    match explicit_java_source_visibility(declaration) {
+        Some(DeclaredVisibility::Public) => JavaConstructorAccess::Accessible,
+        Some(DeclaredVisibility::Private) => {
+            let outermost = |units: Vec<CodeUnit>| units.into_iter().next_back();
+            let site = outermost(enclosing_class_units_at(java, file, creation.start_byte()));
+            let owner = outermost(
+                brokk_bifrost_core::analyzer::usages::common::enclosing_owner_chain(
+                    constructor.clone(),
+                    |unit| java.parent_of(unit),
+                )
+                .filter(CodeUnit::is_class)
+                .collect(),
+            );
+            match (site, owner) {
+                (Some(site), Some(owner)) if site == owner => JavaConstructorAccess::Accessible,
+                (Some(site), Some(owner)) if site.fq_name() == owner.fq_name() => {
+                    JavaConstructorAccess::Undecided
+                }
+                (Some(_), Some(_)) => JavaConstructorAccess::Inaccessible,
+                _ => JavaConstructorAccess::Undecided,
+            }
+        }
+        // Protected constructors are accessible in their own package as well.
+        Some(DeclaredVisibility::Protected) | None => {
+            let package = |file: &ProjectFile| java.package_name_of(file).unwrap_or_default();
+            if package(file) == package(constructor.source()) {
+                JavaConstructorAccess::Accessible
+            } else {
+                JavaConstructorAccess::Inaccessible
+            }
+        }
+        Some(_) => JavaConstructorAccess::Undecided,
+    }
+}
+
+/// Whether a creation's own constructor call is proven to have no applicable
+/// target, so that the creation has no value type (#10089).
+pub(crate) fn java_source_creation_refused(
+    java: &JavaAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    creation: Node<'_>,
+) -> bool {
+    let packs = java.semantic_model_overlay_read().published();
+    let scope = AnalyzerQueryScope::with_semantic_model_overlay(java, packs.clone());
+    matches!(
+        java_source_creation(
+            None,
+            java,
+            scope.token(),
+            packs,
+            file,
+            creation,
+            source,
+            JAVA_EXPRESSION_DEPTH_LIMIT,
+        ),
+        JavaSourceCreation::Refused
+    )
 }
 
 #[allow(clippy::too_many_arguments)] // Forward the exact source cache through bounded typing.
@@ -1896,6 +2487,18 @@ fn resolve_lexical_actual_type(
             )
         })
         .ok_or(ConversionUnknown::UnresolvedSourceType)?;
+    // A declarator with no initializer (`String bar;`) spans exactly its name,
+    // so the range lookup lands on the name identifier. The declarator owns the
+    // declaration: its parent writes the type and it writes any `[]` (#12136).
+    let declaration = match declaration.parent() {
+        Some(declarator)
+            if declarator.kind() == "variable_declarator"
+                && declarator.child_by_field_name("name") == Some(declaration) =>
+        {
+            declarator
+        }
+        _ => declaration,
+    };
     let type_node =
         declared_type_node(declaration).ok_or(ConversionUnknown::UnresolvedSourceType)?;
     let (element_type_node, array_dimensions) = declared_java_type_shape(declaration, type_node)?;
@@ -1928,6 +2531,22 @@ fn declared_java_type_shape<'a>(
     if declaration.kind() == "spread_parameter" {
         return Err(ConversionUnknown::UnsupportedConversion);
     }
+    let (element, mut dimensions) = java_type_node_shape(type_node)?;
+    let declaration_dimensions = declaration
+        .child_by_field_name("dimensions")
+        .map_or(Ok(0), java_array_dimension_count_bounded)?;
+    dimensions = dimensions
+        .checked_add(declaration_dimensions)
+        .ok_or(ConversionUnknown::BudgetExhausted)?;
+    if dimensions > JAVA_ARRAY_RANK_LIMIT {
+        return Err(ConversionUnknown::BudgetExhausted);
+    }
+    Ok((element, dimensions))
+}
+
+/// The element type and array dimension count of one written type node, read
+/// from tree-sitter `array_type` element/dimensions fields.
+fn java_type_node_shape(type_node: Node<'_>) -> Result<(Node<'_>, usize), ConversionUnknown> {
     let mut element = type_node;
     let mut dimensions = 0usize;
     while element.kind() == "array_type" {
@@ -1940,15 +2559,6 @@ fn declared_java_type_shape<'a>(
         element = element
             .child_by_field_name("element")
             .ok_or(ConversionUnknown::UnresolvedSourceType)?;
-    }
-    let declaration_dimensions = declaration
-        .child_by_field_name("dimensions")
-        .map_or(Ok(0), java_array_dimension_count_bounded)?;
-    dimensions = dimensions
-        .checked_add(declaration_dimensions)
-        .ok_or(ConversionUnknown::BudgetExhausted)?;
-    if dimensions > JAVA_ARRAY_RANK_LIMIT {
-        return Err(ConversionUnknown::BudgetExhausted);
     }
     Ok((element, dimensions))
 }
@@ -2220,6 +2830,32 @@ fn classify_java_conversion_applicability(
         return ModelArgumentApplicability::Inapplicable;
     }
 
+    // Object is a supertype of every class and interface type (JLS 4.10.2),
+    // whether or not a declaration writes the implicit `extends Object` (JLS
+    // 8.1.4). Source-derived JDK declarations leave it out, so no hierarchy
+    // walk reaches Object and `String -> Object` stayed open, which left
+    // print(String) undecided against print(Object) (#12136).
+    if let (
+        JavaConversionType::Value(
+            source @ (ResolvedConversionType::External { .. }
+            | ResolvedConversionType::Declaration(_)),
+        ),
+        JavaConversionType::Value(
+            target @ ResolvedConversionType::External {
+                identity: target_identity,
+            },
+        ),
+    ) = (&source, &target)
+        && Some(target_identity.fqn()) == universal_root_name_for_language("java")
+    {
+        return ModelArgumentApplicability::Applicable(Box::new(ArgumentTypeConversion {
+            source: source.clone(),
+            target: target.clone(),
+            kind: ConversionKind::JavaReferenceWidening,
+            hierarchy: None,
+        }));
+    }
+
     let (
         JavaConversionType::Value(ResolvedConversionType::External {
             identity: source_identity,
@@ -2241,6 +2877,9 @@ fn classify_java_conversion_applicability(
         return ModelArgumentApplicability::Unknown(ConversionUnknown::IncompleteHierarchy);
     };
     let cancellation = java.active_query_cancellation();
+    // #11912: this fixed per-query allowance has over seven times the measured
+    // maximum owner closure (34 across 50,785 local class headers). Its stop is
+    // a deterministic limit; cancellation remains request-dependent.
     let mut hierarchy =
         overlay.java_reference_widening(&source_symbol, &target_symbol, 256, cancellation.as_ref());
     use brokk_bifrost_analysis::analyzer::semantic_model::JavaHierarchyIncomplete;
@@ -2250,7 +2889,11 @@ fn classify_java_conversion_applicability(
     // String's `Comparable<String>`, cannot leave `String -> File` open (#10000).
     // The owner's JVM supertype inventory is also the supertype authority: an
     // authored edge list that omits an inventoried supertype must not prove a
-    // non-conversion, so an erased witness overrides it (#9981).
+    // non-conversion, so an erased witness overrides it (#9981). An erased
+    // walk that exhausts certified supertype sets without a witness proves the
+    // non-conversion, as `java.util.Locale -> String` must for
+    // printf(Locale, String, Object...) to beat printf(String, Object...)
+    // (#12136).
     if hierarchy.witness.is_none()
         && let Some(snapshot) = java.active_semantic_model_snapshot()
     {
@@ -2262,6 +2905,7 @@ fn classify_java_conversion_applicability(
             cancellation.as_ref(),
         );
         if erased.witness.is_some()
+            || erased.incomplete.is_empty()
             || hierarchy
                 .incomplete
                 .contains(&JavaHierarchyIncomplete::GenericSubstitution)
@@ -2278,7 +2922,7 @@ fn classify_java_conversion_applicability(
     if let Some(reason) = terminal {
         return ModelArgumentApplicability::Unknown(match reason {
             JavaHierarchyIncomplete::Cancelled => ConversionUnknown::Cancelled,
-            JavaHierarchyIncomplete::BudgetExhausted => ConversionUnknown::BudgetExhausted,
+            JavaHierarchyIncomplete::BudgetExhausted => ConversionUnknown::FixedLimit,
             _ => unreachable!("only cancellation and budget are terminal"),
         });
     }
@@ -2306,7 +2950,7 @@ fn classify_java_conversion_applicability(
                 JavaHierarchyIncomplete::GenericSubstitution => {
                     ConversionUnknown::GenericSubstitution
                 }
-                JavaHierarchyIncomplete::BudgetExhausted => ConversionUnknown::BudgetExhausted,
+                JavaHierarchyIncomplete::BudgetExhausted => ConversionUnknown::FixedLimit,
                 JavaHierarchyIncomplete::Cancelled => ConversionUnknown::Cancelled,
             })
         })
@@ -2713,7 +3357,7 @@ pub(crate) fn declared_type_node(node: Node<'_>) -> Option<Node<'_>> {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-fn native_model_argument_applicability(
+fn native_argument_applicability(
     analyzer: &dyn IAnalyzer,
     java: &JavaAnalyzer,
     file: &ProjectFile,
@@ -2733,7 +3377,7 @@ fn native_model_argument_applicability(
     ) else {
         return ModelArgumentApplicability::Unknown(ConversionUnknown::UnresolvedSourceType);
     };
-    let packs = analyzer.semantic_model_overlay();
+    let packs = analyzer.semantic_model_overlay_read().published();
     let formal_type = normalize_jvm_model_type_ref(packs.as_deref(), formal_type);
     let selected = java.selected_jdk_home_for_file(file).ok().and_then(|home| {
         analyzer
@@ -2747,7 +3391,12 @@ fn native_model_argument_applicability(
     {
         Some(digest) => java.external_declarations_for_source_jdk(packs.clone(), digest),
         None => java.external_declarations(packs.clone()),
-    };
+    }
+    .with_active_models(
+        analyzer
+            .active_semantic_model_snapshot()
+            .map(|snapshot| std::sync::Arc::clone(snapshot.active_models())),
+    );
     let kind = match java_external_conversion_in(&actual_type, &formal_type, Some(&surface)) {
         JavaExternalConversion::Inapplicable => return ModelArgumentApplicability::Inapplicable,
         JavaExternalConversion::Unknown(cause) => {
@@ -2836,6 +3485,178 @@ fn native_model_argument_applicability(
 mod tests {
 
     use crate::analyzer::java::call_conversion::*;
+
+    #[test]
+    fn fixed_model_hierarchy_limit_covers_positive_and_negative_queries() {
+        use brokk_bifrost_analysis::analyzer::AnalyzerQueryScope;
+        use brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause;
+        use brokk_bifrost_analysis::analyzer::semantic_model::catalog::SemanticPackCatalog;
+        use brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay;
+        use brokk_bifrost_analysis::analyzer::semantic_model::runtime::{
+            SemanticModelResolutionOutcome, resolve_active_semantic_models,
+        };
+        use brokk_bifrost_analysis::analyzer::semantic_model::{
+            CatalogCoordinate, CatalogOptions, SemanticModelActivationEvidence,
+            SemanticModelActivationRequest, SemanticModelRuntimeLimits, SessionPackSource,
+            SessionPackSourceKind,
+        };
+        use brokk_bifrost_semantic::analyzer::semantic_model::compiler::{
+            CompilerOptions, compile_source,
+        };
+        use brokk_bifrost_semantic::analyzer::semantic_model::source::SourceFormat;
+        use std::sync::Arc;
+
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Java)
+            .file("App.java", "class App {}\n")
+            .build();
+        let java = JavaAnalyzer::from_project(fixture.project().clone());
+        // The graph independently establishes C0 <: C257 and C0 !<: Unrelated.
+        // Both questions need more than the fixed 256 visits; C0 <: C1 does not.
+        let names = (0..258)
+            .map(|n| format!("limit.C{n}"))
+            .chain(std::iter::once("limit.Unrelated".to_owned()))
+            .collect::<Vec<_>>();
+        let types = names.iter().enumerate().map(|(index, name)| {
+            let hierarchy = if index < 257 {
+                vec![serde_json::json!({"hierarchy_kind": "extends", "target": TypeRef::named(names[index + 1].clone())})]
+            } else { Vec::new() };
+            serde_json::json!({
+                "id": name.to_ascii_lowercase(), "name": name, "type_kind": "class", "visibility": "public",
+                "is_abstract": false, "is_sealed": false, "has_explicit_type_terms": false,
+                "type_parameters": [], "type_parameter_constraints": [], "embedded_types": [],
+                "hierarchy": hierarchy, "aliases": [], "extension_surfaces": [],
+                "jvm_inventory": {"callables_complete": true, "values_complete": true, "types_complete": true,
+                    "supertypes_complete": true, "supertypes": hierarchy, "nested_types": [], "additional_members": []},
+                "locator": {"kind": "artifact", "path": format!("{}.class", name.replace('.', "/")), "symbol": name}
+            })
+        }).collect::<Vec<_>>();
+        let document = serde_json::json!({
+            "schema_version": 2, "pack_id": "test.11912", "version": "1.0.0",
+            "producer": {"name": "bifrost-test", "version": "1.0.0"},
+            "language": "java", "ecosystem": "jdk",
+            "compatibility": {"bifrost": ">=0.8.0, <1.0.0", "toolchains": [{"name": "jdk", "requirement": ">=17.0.0"}]},
+            "provenance": {"source": "test:inline", "revision": "11912"},
+            "license": "Apache-2.0", "completeness": "complete",
+            "safety": {"generated_code_only": false, "review_required": false},
+            "shards": [{"id": "decls", "activation": [{"toolchain": {"name": "jdk", "version": ">=17.0.0"}, "targets": ["jvm"], "configurations": []}],
+                "payload": {"kind": "declaration_facts", "types": types, "members": [], "relations": []}}]
+        });
+        let pack = compile_source(
+            SourceFormat::Json,
+            &serde_json::to_vec(&document).unwrap(),
+            &CompilerOptions::default(),
+        )
+        .unwrap();
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        catalog
+            .register_session_pack(
+                &pack,
+                &SessionPackSource {
+                    kind: SessionPackSourceKind::Embedded,
+                    source_id: "test:11912-query-limit".into(),
+                },
+            )
+            .unwrap();
+        let request = SemanticModelActivationRequest {
+            approximate_standard_libraries: Vec::new(),
+            bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+            evidence: vec![SemanticModelActivationEvidence {
+                language: "java".into(),
+                ecosystem: "jdk".into(),
+                package: None,
+                module: None,
+                toolchain: Some(CatalogCoordinate {
+                    name: "jdk".into(),
+                    version: Some(semver::Version::new(21, 0, 0)),
+                }),
+                target: Some("jvm".into()),
+                configuration: None,
+                artifact_sha256: None,
+            }],
+            controls: Vec::new(),
+            limits: SemanticModelRuntimeLimits::default(),
+        };
+        let cancellation = brokk_bifrost_core::cancellation::CancellationToken::default();
+        let active = match resolve_active_semantic_models(&catalog, &request, &cancellation) {
+            SemanticModelResolutionOutcome::Ready(active) => Arc::new(active),
+            other => panic!("fixture activation: {other:?}"),
+        };
+        let overlay = Arc::new(
+            SemanticModelOverlay::build(
+                &java,
+                &active,
+                &cancellation,
+                64 << 20,
+                &brokk_bifrost_core::retention_budget::RetentionBudget::for_tests(),
+            )
+            .unwrap(),
+        );
+        let _models = AnalyzerQueryScope::with_semantic_model_overlay(&java, Some(overlay.clone()));
+        let ty = |name: &str| {
+            JavaConversionType::Value(ResolvedConversionType::External {
+                identity: ExternalConversionIdentity::from_provenance(
+                    name,
+                    ExternalConversionProvenance::SemanticPack {
+                        pack_id: "test.11912".into(),
+                        declaration_id: name.to_ascii_lowercase(),
+                    },
+                    true,
+                    StableDigest::sha256(b"11912-query-fixture"),
+                    Some(StableDigest::sha256(
+                        overlay.active_model_set_hash().as_bytes(),
+                    )),
+                )
+                .unwrap(),
+            })
+        };
+        assert!(matches!(
+            classify_java_conversion_applicability(
+                &java,
+                Some(&overlay),
+                ty("limit.C0"),
+                ty("limit.C1")
+            ),
+            ModelArgumentApplicability::Applicable(_)
+        ));
+        for target in ["limit.C257", "limit.Unrelated"] {
+            match classify_java_conversion_applicability(
+                &java,
+                Some(&overlay),
+                ty("limit.C0"),
+                ty(target),
+            ) {
+                ModelArgumentApplicability::Unknown(reason) => {
+                    assert_eq!(reason, ConversionUnknown::FixedLimit, "target {target}");
+                    assert_eq!(DerivationExecutionCause::from_reason(reason.label()), None);
+                }
+                _ => panic!("a capped positive or negative question must stay unknown: {target}"),
+            }
+        }
+        assert!(matches!(
+            classify_java_conversion_applicability(
+                &java,
+                Some(&overlay),
+                ty("limit.C257"),
+                ty("limit.Unrelated")
+            ),
+            ModelArgumentApplicability::Inapplicable
+        ));
+        cancellation.cancel();
+        let _cancelled = AnalyzerQueryScope::with_cancellation(&java, &cancellation);
+        assert!(matches!(
+            classify_java_conversion_applicability(
+                &java,
+                Some(&overlay),
+                ty("limit.C0"),
+                ty("limit.C1")
+            ),
+            ModelArgumentApplicability::Unknown(ConversionUnknown::Cancelled)
+        ));
+        assert_eq!(
+            DerivationExecutionCause::from_reason(ConversionUnknown::Cancelled.label()),
+            Some(DerivationExecutionCause::Cancelled)
+        );
+    }
 
     #[test]
     fn local_assignment_primitive_identity_is_not_reference_identity() {

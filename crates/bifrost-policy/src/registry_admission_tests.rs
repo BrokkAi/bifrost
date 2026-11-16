@@ -776,7 +776,7 @@ fn catalog_and_match_selectors_preserve_resolved_locator_evidence() {
         TaintCatalogRegistry::new_without_workspace(CatalogRegistryLimits::default());
     catalogs
         .register(TaintCatalogDefinition {
-            schema_version: 1,
+            schema_version: crate::definition::POLICY_DOCUMENT_SCHEMA_VERSION,
             name: PolicyId::new("test.catalog").unwrap(),
             version: 1,
             categories: source.categories.clone(),

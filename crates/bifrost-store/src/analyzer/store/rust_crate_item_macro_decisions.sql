@@ -67,7 +67,18 @@
 -- in the innermost inline module around it or else the whole file. They then
 -- scope like the mounting file's own definitions, down into files it mounts
 -- later and onto its own invocations.
+-- Preserve each exported definition's textual order below its mount. Fixed-width
+-- byte offsets compare lexically; recursive mounts prefix their child's order.
+-- Filtering only activation 0 before ranking is the shared three-valued fold:
+-- the latest remaining unknown blocks every earlier active definition.
 WITH RECURSIVE
+macros AS NOT MATERIALIZED (
+  SELECT macro.*, property.cfg_condition,
+         cr_cfg(property.cfg_condition, ?3) AS activation
+  FROM rust_item_macros AS macro
+  JOIN source_rust_declaration_properties AS property
+    ON property.blob_id=macro.blob_id AND property.declaration_id=macro.declaration_id
+),
 mounts(child_blob, mount_blob, mount_start) AS (
   SELECT edge.value ->> 0, edge.value ->> 1, edge.value ->> 2 FROM json_each(?1) AS edge
 ),
@@ -93,35 +104,35 @@ macro_use_mounts(child_blob, mount_blob, visible_after, scope_start, scope_end) 
    AND module.body_occurrence_id IS NULL AND module.macro_use = 1
 ),
 exported(blob_id, macro_name, passthrough, decoration_cfg, scope_start, scope_end,
-         visible_after, depth) AS (
+         visible_after, shadow_order, activation, depth) AS (
   SELECT use_mount.mount_blob, macro.macro_name, macro.passthrough, macro.decoration_cfg,
-         use_mount.scope_start, use_mount.scope_end, use_mount.visible_after, 1
+         use_mount.scope_start, use_mount.scope_end, use_mount.visible_after, printf('%016x', macro.visible_after), macro.activation, 1
   FROM macro_use_mounts AS use_mount
-  CROSS JOIN rust_item_macros AS macro ON macro.blob_id = use_mount.child_blob
+  CROSS JOIN macros AS macro ON macro.blob_id = use_mount.child_blob
   WHERE EXISTS (SELECT 1 FROM source_rust_item_contexts AS root
                 WHERE root.blob_id = macro.blob_id AND root.context_kind = 0
                   AND root.parent_occurrence_id IS NULL
                   AND root.start_byte = macro.scope_start AND root.end_byte = macro.scope_end)
   UNION ALL
   SELECT use_mount.mount_blob, child.macro_name, child.passthrough, child.decoration_cfg,
-         use_mount.scope_start, use_mount.scope_end, use_mount.visible_after, child.depth + 1
+         use_mount.scope_start, use_mount.scope_end, use_mount.visible_after, printf('%016x', child.visible_after) || child.shadow_order, child.activation, child.depth + 1
   FROM exported AS child
   CROSS JOIN macro_use_mounts AS use_mount ON use_mount.child_blob = child.blob_id
   WHERE child.depth < 256
 ),
 inherited(blob_id, macro_name, passthrough, decoration_cfg, scope_start, visible_after,
-          distance) AS (
+          shadow_order, activation, distance) AS (
   SELECT mount.child_blob, macro.macro_name, macro.passthrough, macro.decoration_cfg,
-         macro.scope_start, macro.visible_after, 1
+         macro.scope_start, macro.visible_after, '' AS shadow_order, macro.activation, 1
   FROM mounts AS mount
-  CROSS JOIN rust_item_macros AS macro
+  CROSS JOIN macros AS macro
     ON macro.blob_id = mount.mount_blob
    AND macro.visible_after <= mount.mount_start
    AND macro.scope_start <= mount.mount_start
    AND mount.mount_start < macro.scope_end
   UNION ALL
   SELECT mount.child_blob, macro.macro_name, macro.passthrough, macro.decoration_cfg,
-         macro.scope_start, macro.visible_after, 1
+         macro.scope_start, macro.visible_after, macro.shadow_order, macro.activation, 1
   FROM mounts AS mount
   CROSS JOIN exported AS macro
     ON macro.blob_id = mount.mount_blob
@@ -130,7 +141,7 @@ inherited(blob_id, macro_name, passthrough, decoration_cfg, scope_start, visible
    AND mount.mount_start < macro.scope_end
   UNION ALL
   SELECT mount.child_blob, ancestor.macro_name, ancestor.passthrough, ancestor.decoration_cfg,
-         ancestor.scope_start, ancestor.visible_after, ancestor.distance + 1
+         ancestor.scope_start, ancestor.visible_after, ancestor.shadow_order, ancestor.activation, ancestor.distance + 1
   FROM inherited AS ancestor
   CROSS JOIN mounts AS mount ON mount.mount_blob = ancestor.blob_id
   WHERE ancestor.distance < 256
@@ -147,9 +158,9 @@ invocations AS (
 ),
 visible AS (
   SELECT invocations.blob_id, invocations.invocation_occurrence_id, macro.passthrough,
-         macro.decoration_cfg, 0 AS distance, macro.scope_start, macro.visible_after
+         macro.decoration_cfg, 0 AS distance, macro.scope_start, macro.visible_after, '' AS shadow_order, macro.activation
   FROM invocations
-  CROSS JOIN rust_item_macros AS macro
+  CROSS JOIN macros AS macro
     ON macro.blob_id = invocations.blob_id
    AND macro.macro_name = invocations.macro_name
    AND macro.visible_after <= invocations.invocation_start_byte
@@ -157,7 +168,7 @@ visible AS (
    AND invocations.invocation_start_byte < macro.scope_end
   UNION ALL
   SELECT invocations.blob_id, invocations.invocation_occurrence_id, macro.passthrough,
-         macro.decoration_cfg, 0 AS distance, macro.scope_start, macro.visible_after
+         macro.decoration_cfg, 0 AS distance, macro.scope_start, macro.visible_after, macro.shadow_order, macro.activation
   FROM invocations
   CROSS JOIN exported AS macro
     ON macro.blob_id = invocations.blob_id
@@ -167,17 +178,17 @@ visible AS (
    AND invocations.invocation_start_byte < macro.scope_end
   UNION ALL
   SELECT invocations.blob_id, invocations.invocation_occurrence_id, ancestor.passthrough,
-         ancestor.decoration_cfg, ancestor.distance, ancestor.scope_start, ancestor.visible_after
+         ancestor.decoration_cfg, ancestor.distance, ancestor.scope_start, ancestor.visible_after, ancestor.shadow_order, ancestor.activation
   FROM invocations
   CROSS JOIN inherited AS ancestor
     ON ancestor.blob_id = invocations.blob_id
    AND ancestor.macro_name = invocations.macro_name
 ),
 chosen AS (
-  SELECT blob_id, invocation_occurrence_id, passthrough, decoration_cfg,
+  SELECT blob_id, invocation_occurrence_id, passthrough, decoration_cfg, activation,
          row_number() OVER (PARTITION BY blob_id, invocation_occurrence_id
-                            ORDER BY distance, scope_start DESC, visible_after DESC) AS rank
-  FROM visible
+                            ORDER BY distance, scope_start DESC, visible_after DESC, shadow_order DESC) AS rank
+  FROM visible WHERE activation<>0
 ), cfg_if AS (
   -- The producer accepts this spelling only with the documented structural
   -- arm grammar, reparses just the item interiors, and attaches ordered cfg
@@ -208,7 +219,7 @@ chosen AS (
     AND NOT EXISTS (SELECT 1 FROM chosen
                     WHERE chosen.blob_id=invocation.blob_id
                       AND chosen.invocation_occurrence_id=invocation.invocation_occurrence_id
-                      AND chosen.rank=1 AND chosen.passthrough=1)
+                      AND chosen.rank=1 AND (chosen.activation=-1 OR chosen.passthrough=1))
   UNION
   -- A same-named local macro_rules definition is not enough to make an
   -- invocation visible. Keep unknown external and prelude macros open.
@@ -250,7 +261,7 @@ chosen AS (
     )
 )
 SELECT blob_id, invocation_occurrence_id, decoration_cfg, 0 AS no_route FROM chosen
-WHERE rank=1 AND passthrough=1 AND decoration_cfg IS NOT NULL
+WHERE rank=1 AND activation=1 AND passthrough=1 AND decoration_cfg IS NOT NULL
 UNION ALL
 SELECT blob_id, invocation_occurrence_id, decoration_cfg, no_route FROM cfg_if
 UNION ALL

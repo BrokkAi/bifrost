@@ -193,6 +193,13 @@ pub fn install_semantic_model_catalog_bootstrap(
         .map_err(|_| "semantic-model catalog bootstrap is already configured")
 }
 
+/// Whether the host currently selects its shipped-pack provider. This probe
+/// performs no registration, acquisition, or catalog access, so update proofs
+/// can assemble the same intrinsic evidence as activation.
+pub fn semantic_model_catalog_bootstrap_configured() -> bool {
+    SEMANTIC_MODEL_CATALOG_BOOTSTRAP.get().is_some()
+}
+
 /// Register reviewed shipped packs when the facade installed a provider;
 /// `None` means no provider is installed.
 pub fn bootstrap_semantic_model_catalog(
@@ -712,6 +719,7 @@ pub struct WorkspacePacksActivation {
     /// discovery order. Empty when the workspace-local route did not run or
     /// `.bifrost/semantic-models/` is absent.
     pub workspace_models: Vec<RegisteredWorkspaceSemanticModel>,
+    pub registration_evidence: Vec<SemanticModelActivationEvidence>,
     pub outcome: DependencyPackActivationOutcome,
 }
 
@@ -811,6 +819,14 @@ pub fn activate_workspace_packs(
     }
 }
 
+/// One catalog owned by the host build context, shared across its generations.
+pub(crate) struct WorkspaceActivationCatalog {
+    source: (PathBuf, Option<PathBuf>, Vec<Option<std::ffi::OsString>>),
+    catalog: SemanticPackCatalog,
+    database_path: PathBuf,
+    database: same_file::Handle,
+}
+
 /// Activate every semantic source selected for one workspace, as one transaction.
 ///
 /// The dependency, reviewed workspace-local, and reviewed intrinsic routes feed
@@ -841,9 +857,36 @@ pub fn activate_workspace_semantic_sources(
     if ecosystems.is_empty() && !workspace_models_present && !sources.intrinsic_shipped_models {
         return Ok(None);
     }
-    let catalog = {
+    let source = (
+        sources.catalog_root.to_path_buf(),
+        sources
+            .config
+            .and_then(WorkspacePacksConfig::catalog)
+            .map(Path::to_path_buf),
+        [SEMANTIC_PACK_CACHE_ROOT_ENV, CACHE_DIR_ENV, CACHE_ROOT_ENV]
+            .into_iter()
+            .map(std::env::var_os)
+            .collect(),
+    );
+    let local = std::sync::Mutex::new(None);
+    let owner = workspace.activation_catalog_owner().unwrap_or(&local);
+    // Serialize activation through the host-owned catalog. Its SQLite connection
+    // is also shared behind Arc<Mutex<Connection>>, so individual SQL operations
+    // are serialized, not pooled. External writers remain independent; the
+    // activation identity checks data_version before and after publication.
+    let mut owned = owner
+        .lock()
+        .expect("workspace activation catalog mutex poisoned");
+    if owned.as_ref().is_none_or(|owned| {
+        owned.source != source
+            || !same_file::Handle::from_path(&owned.database_path)
+                .is_ok_and(|database| database == owned.database)
+    }) {
+        // A path and data_version identify changes within one opened database,
+        // not replacement of that file. Close the old owner before reopening.
+        *owned = None;
         let _scope = crate::profiling::scope("semantic_pack.open_catalog");
-        match sources.config.and_then(WorkspacePacksConfig::catalog) {
+        let catalog = match sources.config.and_then(WorkspacePacksConfig::catalog) {
             Some(relative) => SemanticPackCatalog::open(
                 &sources.catalog_root.join(relative),
                 CatalogOpenMode::ReadWrite,
@@ -854,12 +897,29 @@ pub fn activate_workspace_semantic_sources(
                 sources.catalog_root,
                 CatalogOptions::default(),
             )?,
-        }
-    };
+        };
+        // The primary catalog file is native-path capable; Connection::path()
+        // exposes only UTF-8 and cannot represent every supported root.
+        let database_path = catalog.root().join("catalog.db");
+        let database =
+            same_file::Handle::from_path(&database_path).map_err(|source| CatalogError::Io {
+                operation: "identify activation catalog database",
+                source,
+            })?;
+        *owned = Some(WorkspaceActivationCatalog {
+            source,
+            catalog,
+            database_path,
+            database,
+        });
+    }
     activate_workspace_semantic_sources_in_catalog(
         workspace,
         analyzer_config,
-        &catalog,
+        &owned
+            .as_ref()
+            .expect("initialized activation catalog")
+            .catalog,
         sources,
         &[],
         cancellation,
@@ -974,6 +1034,7 @@ pub fn activate_selected_workspace_semantic_sources_in_catalog(
     cancellation: &crate::CancellationToken,
     selected_ecosystems: &[DependencyPackEcosystem],
 ) -> Result<Option<WorkspacePacksActivation>, WorkspaceActivationError> {
+    let before = catalog.cache_identity()?;
     let Some(prelude) = workspace_activation_prelude(
         workspace,
         catalog,
@@ -988,6 +1049,7 @@ pub fn activate_selected_workspace_semantic_sources_in_catalog(
     let WorkspaceActivationPrelude {
         ecosystems,
         workspace_models,
+        registration_evidence,
         evidence,
         controls,
         leases,
@@ -1012,12 +1074,21 @@ pub fn activate_selected_workspace_semantic_sources_in_catalog(
         },
         Some(&activation),
     );
+    let after = catalog.cache_identity()?;
+    if before.sqlite_data_version != after.sqlite_data_version
+        && let Some(caches) = workspace.analyzer().snapshot_caches()
+    {
+        // Include prelude registration/selection reads in the external-writer
+        // check, not only dependency discovery and runtime publication.
+        caches.semantic_models().clear_dependency_activation();
+    }
     catalog
         .release_leases(&leases)
         .map_err(WorkspaceActivationError::Catalog)?;
     Ok(Some(WorkspacePacksActivation {
         ecosystems,
         workspace_models,
+        registration_evidence,
         outcome,
     }))
 }
@@ -1117,6 +1188,7 @@ pub fn activate_selected_installed_workspace_semantic_sources_in_catalog(
     let WorkspaceActivationPrelude {
         ecosystems,
         workspace_models,
+        registration_evidence,
         evidence,
         controls,
         leases,
@@ -1145,6 +1217,7 @@ pub fn activate_selected_installed_workspace_semantic_sources_in_catalog(
         activation: WorkspacePacksActivation {
             ecosystems,
             workspace_models,
+            registration_evidence,
             outcome: installed.outcome,
         },
         pending: installed.pending,
@@ -1158,6 +1231,7 @@ pub fn activate_selected_installed_workspace_semantic_sources_in_catalog(
 struct WorkspaceActivationPrelude {
     ecosystems: Vec<DependencyPackEcosystem>,
     workspace_models: Vec<RegisteredWorkspaceSemanticModel>,
+    registration_evidence: Vec<SemanticModelActivationEvidence>,
     evidence: Vec<SemanticModelActivationEvidence>,
     controls: Vec<SemanticModelActivationControl>,
     leases: Vec<crate::analyzer::semantic_model::CatalogLeaseToken>,
@@ -1252,37 +1326,17 @@ fn workspace_activation_prelude(
             .map_err(WorkspaceActivationError::Catalog)?;
         return Ok(None);
     }
-    // A pack declaring `safety.review_required` needs an explicit compatible
-    // `Enable` control keyed by pack id --
-    // matching evidence alone leaves it selected but inactive
-    // (`ReviewRequired`). The document's `enable` list is that control,
-    // matching the in-process control build in `owasp_benchmark.rs` (#1937).
-    // A reviewed workspace-local pack id is nameable there too.
-    let controls = sources
-        .config
-        .map(WorkspacePacksConfig::enable)
-        .unwrap_or_default()
-        .iter()
-        .map(|pack_id| SemanticModelActivationControl {
-            scope: SemanticModelControlScope::Workspace,
-            action: SemanticModelControlAction::Enable,
-            selector: SemanticModelPackSelector {
-                pack_id: pack_id.clone(),
-                version: None,
-                manifest_digest: None,
-            },
-        })
-        .collect();
-    let mut evidence = additional_evidence.to_vec();
-    evidence.extend(registration.evidence);
-    if shipped_models {
-        evidence.extend(intrinsic_language_evidence(workspace));
-        evidence.extend(node_runtime_evidence(workspace));
-        evidence.extend(python_process_input_evidence(workspace));
-    }
+    let (evidence, controls) = assemble_workspace_activation_evidence(
+        workspace,
+        sources,
+        additional_evidence,
+        &registration.evidence,
+        shipped_models,
+    );
     Ok(Some(WorkspaceActivationPrelude {
         ecosystems,
         workspace_models: registration.models,
+        registration_evidence: registration.evidence,
         evidence,
         controls,
         leases,
@@ -1439,6 +1493,182 @@ impl fmt::Display for WorkspacePacksValidationError {
 
 impl std::error::Error for WorkspacePacksValidationError {}
 
+/// Assemble request values without acquiring packs, registering models, or writing the catalog.
+fn assemble_workspace_activation_evidence(
+    workspace: &WorkspaceAnalyzer,
+    sources: &WorkspaceActivationSources<'_>,
+    additional_evidence: &[SemanticModelActivationEvidence],
+    registration_evidence: &[SemanticModelActivationEvidence],
+    shipped_models: bool,
+) -> (
+    Vec<SemanticModelActivationEvidence>,
+    Vec<SemanticModelActivationControl>,
+) {
+    // A pack declaring `safety.review_required` needs an explicit compatible
+    // `Enable` control keyed by pack id --
+    // matching evidence alone leaves it selected but inactive
+    // (`ReviewRequired`). The document's `enable` list is that control,
+    // matching the in-process control build in `owasp_benchmark.rs` (#1937).
+    // A reviewed workspace-local pack id is nameable there too.
+    let controls = sources
+        .config
+        .map(WorkspacePacksConfig::enable)
+        .unwrap_or_default()
+        .iter()
+        .map(|pack_id| SemanticModelActivationControl {
+            scope: SemanticModelControlScope::Workspace,
+            action: SemanticModelControlAction::Enable,
+            selector: SemanticModelPackSelector {
+                pack_id: pack_id.clone(),
+                version: None,
+                manifest_digest: None,
+            },
+        })
+        .collect();
+    let mut evidence = additional_evidence.to_vec();
+    if sources.workspace_model_root.is_some() {
+        evidence.extend_from_slice(registration_evidence);
+    }
+    if shipped_models {
+        evidence.extend(intrinsic_language_evidence(workspace));
+        evidence.extend(node_runtime_evidence(workspace));
+        evidence.extend(python_process_input_evidence(workspace));
+    }
+    (evidence, controls)
+}
+
+/// Fresh host inputs for an update. Registration evidence is usable only after
+/// the owner proves no model file changed since the successful publication.
+#[derive(Clone, Copy)]
+pub struct WorkspaceUpdateActivationContext<'a> {
+    pub config: &'a AnalyzerConfig,
+    pub sources: WorkspaceActivationSources<'a>,
+    pub additional_evidence: &'a [SemanticModelActivationEvidence],
+    pub registration_evidence: &'a [SemanticModelActivationEvidence],
+    pub catalog: &'a SemanticPackCatalog,
+    pub persistence:
+        Option<crate::analyzer::semantic_model::SemanticModelActivationPersistence<'a>>,
+    pub cancellation: &'a crate::CancellationToken,
+}
+
+impl WorkspaceUpdateActivationContext<'_> {
+    pub(crate) fn prospective_inputs(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        prepared_dependencies: &[SemanticModelActivationEvidence],
+    ) -> ActivationInputs {
+        let (evidence, controls) = assemble_workspace_activation_evidence(
+            workspace,
+            &self.sources,
+            self.additional_evidence,
+            self.registration_evidence,
+            self.sources.intrinsic_shipped_models,
+        );
+        let mut activation =
+            ActivationInputs::from(semantic_model_activation_request(evidence, controls));
+        if let Some(verified) = workspace.carried_activation_inputs() {
+            let ecosystems = workspace_pack_ecosystems(workspace, self.sources.config);
+            activation.request.evidence.extend(
+                prepared_dependencies
+                    .iter()
+                    .filter(|entry| {
+                        ecosystems
+                            .iter()
+                            .any(|ecosystem| entry.ecosystem == ecosystem.label())
+                    })
+                    .cloned(),
+            );
+            activation.request.approximate_standard_libraries =
+                verified.request.approximate_standard_libraries;
+            activation.rust_cargo_graph = verified.rust_cargo_graph;
+        }
+        activation.finalize_request();
+        activation
+    }
+
+    pub(crate) fn activation_config<'a>(
+        &'a self,
+        workspace: &WorkspaceAnalyzer,
+    ) -> Cow<'a, AnalyzerConfig> {
+        activation_config_with_source_toolchains(workspace, self.config, self.sources.config)
+    }
+}
+
+/// Host-owned catalog capability and compiled registration proof. Fresh host
+/// selection/configuration/evidence are supplied separately for every update.
+pub struct WorkspaceActivationUpdateSource {
+    catalog: std::sync::Arc<SemanticPackCatalog>,
+    registration_evidence: Vec<SemanticModelActivationEvidence>,
+    configured_catalog: Option<PathBuf>,
+    database: same_file::Handle,
+    _charge: brokk_bifrost_core::retention_budget::AllocationCharge,
+}
+
+impl fmt::Debug for WorkspaceActivationUpdateSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkspaceActivationUpdateSource")
+            .field("configured_catalog", &self.configured_catalog)
+            .finish_non_exhaustive()
+    }
+}
+
+impl WorkspaceActivationUpdateSource {
+    pub fn new(
+        catalog: std::sync::Arc<SemanticPackCatalog>,
+        registration_evidence: Vec<SemanticModelActivationEvidence>,
+        config: Option<&WorkspacePacksConfig>,
+        budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
+    ) -> Result<Self, CatalogError> {
+        let charge = brokk_bifrost_core::retention_budget::AllocationCharge::acquire_required(
+            budget,
+            std::mem::size_of::<Self>()
+                + format!("{registration_evidence:?}").len().saturating_mul(8),
+        );
+        let database =
+            same_file::Handle::from_path(catalog.root().join("catalog.db")).map_err(|source| {
+                CatalogError::Io {
+                    operation: "identify update catalog database",
+                    source,
+                }
+            })?;
+        Ok(Self {
+            catalog,
+            registration_evidence,
+            database,
+            _charge: charge,
+            configured_catalog: config
+                .and_then(WorkspacePacksConfig::catalog)
+                .map(Path::to_path_buf),
+        })
+    }
+
+    pub fn context<'a>(
+        &'a self,
+        config: &'a AnalyzerConfig,
+        sources: WorkspaceActivationSources<'a>,
+        additional_evidence: &'a [SemanticModelActivationEvidence],
+        cancellation: &'a crate::CancellationToken,
+    ) -> Option<WorkspaceUpdateActivationContext<'a>> {
+        if sources.config.and_then(WorkspacePacksConfig::catalog)
+            != self.configured_catalog.as_deref()
+            || !same_file::Handle::from_path(self.catalog.root().join("catalog.db"))
+                .is_ok_and(|database| database == self.database)
+        {
+            return None;
+        }
+        Some(WorkspaceUpdateActivationContext {
+            config,
+            sources,
+            additional_evidence,
+            registration_evidence: &self.registration_evidence,
+            catalog: &self.catalog,
+            persistence: None,
+            cancellation,
+        })
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -1526,10 +1756,10 @@ pub(crate) mod tests {
             _: &BTreeSet<crate::ProjectFile>,
             _listing: Option<&brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing>,
         ) -> Self {
-            unimplemented!()
+            self.clone()
         }
         fn update_all(&self) -> Self {
-            unimplemented!()
+            self.clone()
         }
         fn is_access_expression(&self, _: &crate::ProjectFile, _: usize, _: usize) -> bool {
             unimplemented!()
@@ -1606,13 +1836,26 @@ pub(crate) mod tests {
             _: &BTreeSet<crate::ProjectFile>,
             _: Option<&brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing>,
         ) -> Box<dyn crate::analyzer::multi_analyzer::LanguageAnalyzer> {
-            unimplemented!()
+            Box::new(self.clone())
         }
         fn update_all_with_progress(
             &self,
             _: Option<crate::analyzer::BuildProgress>,
         ) -> Box<dyn crate::analyzer::multi_analyzer::LanguageAnalyzer> {
-            unimplemented!()
+            Box::new(self.clone())
+        }
+        fn update_all_with_membership(
+            &self,
+            _: Option<crate::analyzer::BuildProgress>,
+            _: std::sync::Arc<crate::analyzer::tree_sitter_analyzer::GenerationWorkspaceMembership>,
+        ) -> Box<dyn crate::analyzer::multi_analyzer::LanguageAnalyzer> {
+            Box::new(self.clone())
+        }
+        fn with_generation_membership(
+            &self,
+            _: std::sync::Arc<crate::analyzer::tree_sitter_analyzer::GenerationWorkspaceMembership>,
+        ) -> Box<dyn crate::analyzer::multi_analyzer::LanguageAnalyzer> {
+            Box::new(self.clone())
         }
         fn as_any(&self) -> &dyn std::any::Any {
             self
@@ -1621,7 +1864,7 @@ pub(crate) mod tests {
             Box::new(self.clone())
         }
     }
-    fn workspace_at(root: &Path, config: AnalyzerConfig) -> WorkspaceAnalyzer {
+    pub(crate) fn workspace_at(root: &Path, config: AnalyzerConfig) -> WorkspaceAnalyzer {
         use crate::analyzer::multi_analyzer::{
             AnalyzerDelegate, MultiAnalyzer, WorkspaceBuildContext,
         };

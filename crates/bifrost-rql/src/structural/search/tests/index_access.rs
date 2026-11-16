@@ -82,6 +82,7 @@ fn semantic_projection_rejects_a_newer_source_than_the_retained_scan_seed() {
         CodeQueryExecutionLimits::default().semantic,
     );
     let composed_row = PipelineRow {
+        call_path_evidence: None,
         value: PipelineValue::Declaration(declaration),
         traces: vec![PipelineTrace {
             window_order: None,

@@ -585,10 +585,11 @@ fn port_sink(
 /// The argument-level projection of an input carrier.
 fn authored_input(carrier: &ValueFlowCarrier) -> Option<AuthoredSummaryInput> {
     match root_port(carrier)? {
-        ValueFlowPortKey::Receiver => Some(AuthoredSummaryInput::Receiver {}),
-        ValueFlowPortKey::Parameter { ordinal } => {
-            Some(AuthoredSummaryInput::Parameter { ordinal })
-        }
+        ValueFlowPortKey::Receiver => Some(AuthoredSummaryInput::Receiver { path: None }),
+        ValueFlowPortKey::Parameter { ordinal } => Some(AuthoredSummaryInput::Parameter {
+            ordinal,
+            path: None,
+        }),
         _ => None,
     }
 }
@@ -599,15 +600,18 @@ fn authored_output(
 ) -> Option<(AuthoredSummaryOutput, AuthoredSummaryExitKind)> {
     match root_port(carrier)? {
         ValueFlowPortKey::NormalReturn => Some((
-            AuthoredSummaryOutput::NormalReturn {},
+            AuthoredSummaryOutput::NormalReturn { path: None },
             AuthoredSummaryExitKind::Normal,
         )),
         ValueFlowPortKey::IndexedNormalReturn { ordinal } => Some((
-            AuthoredSummaryOutput::IndexedNormalReturn { ordinal },
+            AuthoredSummaryOutput::IndexedNormalReturn {
+                ordinal,
+                path: None,
+            },
             AuthoredSummaryExitKind::Normal,
         )),
         ValueFlowPortKey::ExceptionalReturn => Some((
-            AuthoredSummaryOutput::ExceptionalReturn {},
+            AuthoredSummaryOutput::ExceptionalReturn { path: None },
             AuthoredSummaryExitKind::Exceptional,
         )),
         _ => None,

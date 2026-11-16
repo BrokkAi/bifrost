@@ -323,18 +323,25 @@ fn execute_native_usages_with<Sets: AsRef<[RustReverseCandidateSet]>>(
                         {
                             let target_index = target_start + batch_offset;
                             if let EdgeCompleteness::Incomplete { reasons } = &answer.completeness {
+                                let frontier = candidate_sets[target_index].completion();
+                                let reason = if frontier != &brokk_bifrost_analysis::analyzer::resolution::ResolutionCompletion::Complete {
+                                    format!("selected reference enumeration is incomplete: {reasons:?}; frontier: {}",
+                                        brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::public_completion_details(frontier, |_| target.fq_name().to_string()))
+                                } else {
+                                    format!("selected reference enumeration is incomplete: {reasons:?}")
+                                };
                                 pending.diagnostics.push(DIAGNOSTICS.diagnostic(
                                     target,
                                     if reasons.contains(
                                         &brokk_bifrost_analysis::analyzer::structural::reference_edges::EdgeIncompleteReason::TimeBudgetExceeded,
                                     ) {
                                         "time_budget"
+                                    } else if frontier != &brokk_bifrost_analysis::analyzer::resolution::ResolutionCompletion::Complete {
+                                        "native_reverse_frontier_incomplete"
                                     } else {
                                         "native_reference_inventory_incomplete"
                                     },
-                                    format!(
-                                        "selected reference enumeration is incomplete: {reasons:?}"
-                                    ),
+                                    reason,
                                 ));
                             }
                             if let ControlFlow::Break(()) = pending

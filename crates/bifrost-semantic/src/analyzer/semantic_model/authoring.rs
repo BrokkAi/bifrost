@@ -835,10 +835,17 @@ impl WorkspaceSemanticModelRegistrationError {
 impl std::fmt::Display for WorkspaceSemanticModelRegistrationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            // Name only the errors that refused the directory. A warning does
+            // not stop discovery, so listing one here, possibly from a valid
+            // sibling model, hides the cause among non-causes (#11873).
             Self::DiscoveryIncomplete { report } => {
+                let is_error = |diagnostic: &&AuthoringDiagnostic| {
+                    diagnostic.severity == AuthoringDiagnosticSeverity::Error
+                };
                 let diagnostics = report
                     .diagnostics
                     .iter()
+                    .filter(is_error)
                     .map(|diagnostic| {
                         format!(
                             "{} {}: {}",
@@ -846,7 +853,7 @@ impl std::fmt::Display for WorkspaceSemanticModelRegistrationError {
                         )
                     })
                     .chain(report.files.iter().flat_map(|file| {
-                        file.diagnostics.iter().map(|diagnostic| {
+                        file.diagnostics.iter().filter(is_error).map(|diagnostic| {
                             format!(
                                 "{} {} {}: {}",
                                 file.path, diagnostic.path, diagnostic.code, diagnostic.message

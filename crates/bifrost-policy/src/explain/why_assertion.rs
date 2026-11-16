@@ -14,7 +14,7 @@
 //! | explanation field | retained source |
 //! | --- | --- |
 //! | assertion id | the anchor's `assert_id` |
-//! | group key | the anchor's `subject_ast_id`, which holds the rendered key |
+//! | group key | the evidence's `observed`, which renders the key |
 //! | group | the evidence's `expected_class` |
 //! | cardinality | the evidence's `expectation` |
 //! | aggregate and observed value | the evidence's `observed` |
@@ -158,16 +158,15 @@ fn assertion_root(
 /// the evaluator kept as the reason.
 fn assertion_node(finding: &PolicyFinding, evidence: &AssertionFindingEvidence) -> RawNode {
     let assert_id = evidence.anchor().assert_id();
-    let key = evidence.anchor().subject_ast_id();
     let relational = evidence.assert_kind() == RELATIONAL_ASSERT_KIND;
     let mut node = RawNode::new(
         ExplanationNodeKind::Assertion,
         ExplanationOutcome::Failed,
         assert_id,
     )
-    .with_expected(if relational && !key.is_empty() {
+    .with_expected(if relational {
         format!(
-            "{} `{}` over group `{}` at key `{key}` requires {}",
+            "{} `{}` over group `{}` requires {}",
             evidence.assert_kind(),
             evidence.asserted_role(),
             evidence.expected_class(),
@@ -199,7 +198,7 @@ fn assertion_node(finding: &PolicyFinding, evidence: &AssertionFindingEvidence) 
         )
         .with_expected("a contributing row at the finding anchor")
         .with_actual(format!(
-            "the group key `{}` is anchored here",
+            "the finding anchor subject `{}` is here",
             evidence.anchor().subject_ast_id()
         ))
         .with_location(Some(finding.primary().clone())),

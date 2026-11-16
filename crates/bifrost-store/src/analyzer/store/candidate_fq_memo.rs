@@ -238,21 +238,10 @@ impl<'a> CandidateFqBatch<'a> {
         memo: &'a CandidateFqMemo,
         generations: &'a HashMap<String, GenerationId>,
     ) -> Result<Self> {
-        // The nonce names one database lineage, and a copy of the file keeps
-        // it. Stores open versioned files and migrate them before opening;
-        // replacing a cache file that live queries are reading is outside the
-        // supported access contract. So equal nonces mean one lineage.
-        let nonce: Vec<u8> = tx
-            .prepare_cached(
-                "SELECT store_nonce FROM blob_publication_witness_sequence WHERE id = 1",
-            )?
-            .query_row([], |row| row.get(0))?;
-        let store_nonce = <[u8; 16]>::try_from(nonce.as_slice()).map_err(|_| {
-            StoreError::new(format!(
-                "analyzer store publication witness nonce has {} bytes, expected 16",
-                nonce.len()
-            ))
-        })?;
+        // Reopen keeps lineage; a versioned import from a still-live source
+        // constructs a distinct namespace before publishing its destination.
+        let store_nonce =
+            brokk_bifrost_core::cache_db::publication_lineage::require_publication_nonce(tx)?;
         let staged = memo
             .entries
             .lock()

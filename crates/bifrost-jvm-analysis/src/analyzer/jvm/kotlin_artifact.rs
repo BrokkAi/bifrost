@@ -574,6 +574,7 @@ fn entry_facts(
                 .collect(),
             aliases: Vec::new(),
             extension_surfaces: Vec::new(),
+            rust_stability: None,
             guard: None,
             locator: Locator::Source {
                 path: entry.to_owned(),
@@ -728,6 +729,7 @@ fn entry_facts(
                     .map_or(0, |value| value.type_parameters.len()),
                 parameter_types: &identity_types,
                 parameter_variadics: &[],
+                extension_receiver: None,
                 return_type: signature.as_ref().and_then(|value| value.returns.as_ref()),
             });
             members.push(MemberFact {
@@ -754,6 +756,7 @@ fn entry_facts(
                 extension_receiver,
                 extension_receiver_constraints,
                 aliases: Vec::new(),
+                rust_stability: None,
                 guard: None,
                 locator: Locator::Source {
                     path: entry.to_owned(),
@@ -797,6 +800,7 @@ fn package_fact(entry: &str, name: &str) -> TypeFact {
         hierarchy: Vec::new(),
         aliases: vec![KOTLIN_PACKAGE_MARKER.to_owned()],
         extension_surfaces: Vec::new(),
+        rust_stability: None,
         guard: None,
         locator: Locator::Source {
             path: entry.to_owned(),

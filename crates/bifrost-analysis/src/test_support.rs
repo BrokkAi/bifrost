@@ -1387,3 +1387,81 @@ impl AnalyzerFixture {
         self.analyzer.analyzer().project().root().to_path_buf()
     }
 }
+
+/// Source acquisition phase selected by a scoped provider-failure probe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceAcquisitionPhase {
+    DefinitionLocator,
+}
+
+struct SourceAcquisitionProbe {
+    path: PathBuf,
+    oid: git2::Oid,
+    phase: SourceAcquisitionPhase,
+    armed: std::sync::atomic::AtomicBool,
+    hits: std::sync::atomic::AtomicUsize,
+}
+
+static SOURCE_ACQUISITION_PROBES: std::sync::Mutex<Vec<std::sync::Arc<SourceAcquisitionProbe>>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// A path/OID/phase-scoped fault, also counting healthy acquisitions after disarming.
+/// Dropping the guard removes the probe even if the test panics.
+pub struct SourceAcquisitionGuard(std::sync::Arc<SourceAcquisitionProbe>);
+
+impl SourceAcquisitionGuard {
+    pub fn arm(path: PathBuf, oid: git2::Oid, phase: SourceAcquisitionPhase) -> Self {
+        let probe = std::sync::Arc::new(SourceAcquisitionProbe {
+            path,
+            oid,
+            phase,
+            armed: std::sync::atomic::AtomicBool::new(true),
+            hits: std::sync::atomic::AtomicUsize::new(0),
+        });
+        SOURCE_ACQUISITION_PROBES
+            .lock()
+            .expect("source probes poisoned")
+            .push(probe.clone());
+        Self(probe)
+    }
+
+    pub fn disarm(&self) {
+        self.0
+            .armed
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn hits(&self) -> usize {
+        self.0.hits.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for SourceAcquisitionGuard {
+    fn drop(&mut self) {
+        SOURCE_ACQUISITION_PROBES
+            .lock()
+            .expect("source probes poisoned")
+            .retain(|probe| !std::sync::Arc::ptr_eq(probe, &self.0));
+    }
+}
+
+pub(crate) fn source_acquisition_refused(
+    analyzer: &dyn crate::analyzer::IAnalyzer,
+    file: &ProjectFile,
+    phase: SourceAcquisitionPhase,
+) -> bool {
+    let probes = SOURCE_ACQUISITION_PROBES
+        .lock()
+        .expect("source probes poisoned");
+    let mut refused = false;
+    for probe in probes
+        .iter()
+        .filter(|probe| probe.phase == phase && probe.path == file.rel_path())
+    {
+        if analyzer.indexed_blob_oid(file) == Some(probe.oid) {
+            probe.hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            refused |= probe.armed.load(std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    refused
+}

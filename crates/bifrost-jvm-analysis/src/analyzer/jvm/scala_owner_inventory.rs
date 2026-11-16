@@ -134,10 +134,15 @@ pub(super) fn attach_scala_owner_inventories(
         .map(|alias| (alias.name.as_str(), alias))
         .collect::<HashMap<_, _>>();
     let qualify = |member: &mut MemberFact| {
-        if let (Some(scope), Some(signature)) = (
-            signature_scopes_by_owner.get(member.owner.as_str()),
-            member.signature.as_mut(),
-        ) {
+        let Some(scope) = signature_scopes_by_owner.get(member.owner.as_str()) else {
+            return;
+        };
+        // An extension receiver is spelled in the same scope as the
+        // signature, so it is qualified the same way.
+        if let Some(receiver) = &mut member.extension_receiver {
+            qualify_type(&names, &aliases_by_name, scope, receiver);
+        }
+        if let Some(signature) = &mut member.signature {
             for parameter in &mut signature.parameters {
                 qualify_type(&names, &aliases_by_name, scope, &mut parameter.r#type);
             }
@@ -399,28 +404,120 @@ fn qualify_type(
     }
 }
 
-/// A term's kind and parameter types; `None` when the member has no signature.
-type TermKey<'facts> = (MemberKind, Option<Vec<&'facts TypeRef>>);
+/// A term's identity for shadowing: its kind, the arity of its type parameters,
+/// its extension receiver and its parameter types. Each type parameter the
+/// member's signature binds is spelled by its position in `type_parameters`,
+/// the extension clause's parameters leading, so a renamed type parameter is
+/// the same term. The receiver and parameter types are `None` when the member
+/// has no signature.
+///
+/// Scala 3 extensions that differ only in their receivers are distinct
+/// overloads, so one does not shadow the other.
+#[derive(PartialEq)]
+struct TermKey {
+    kind: MemberKind,
+    generic_arity: usize,
+    receiver: Option<TypeRef>,
+    parameters: Option<Vec<TypeRef>>,
+}
 
-/// The terms seen so far, identified by name, kind and parameter types.
+/// The type parameters a member's signature binds. A member without a signature
+/// binds none, so its type parameter names keep their spelling.
+fn bound_type_parameters(member: &MemberFact) -> &[String] {
+    member
+        .signature
+        .as_ref()
+        .map_or(&[][..], |signature| signature.type_parameters.as_slice())
+}
+
+impl TermKey {
+    fn new(member: &MemberFact) -> Self {
+        let type_parameters = bound_type_parameters(member);
+        Self {
+            kind: member.member_kind,
+            generic_arity: type_parameters.len(),
+            receiver: member
+                .extension_receiver
+                .as_ref()
+                .map(|receiver| positional_type(receiver, type_parameters)),
+            parameters: member.signature.as_ref().map(|signature| {
+                signature
+                    .parameters
+                    .iter()
+                    .map(|parameter| positional_type(&parameter.r#type, type_parameters))
+                    .collect()
+            }),
+        }
+    }
+}
+
+/// `reference` with each type parameter that `type_parameters` names replaced
+/// by that parameter's position. A name the list does not bind keeps its
+/// spelling and so still compares by name.
+fn positional_type(reference: &TypeRef, type_parameters: &[String]) -> TypeRef {
+    let mut positional = reference.clone();
+    bind_positions(&mut positional, type_parameters);
+    positional
+}
+
+/// Replace the bound type parameters of `reference` by their positions. An
+/// explicit stack keeps a deeply nested type off the call stack.
+fn bind_positions(reference: &mut TypeRef, type_parameters: &[String]) {
+    let mut pending = vec![reference];
+    while let Some(reference) = pending.pop() {
+        match reference {
+            TypeRef::TypeParameter { name } => {
+                if let Some(position) = type_parameters
+                    .iter()
+                    .position(|parameter| parameter.as_str() == name.as_str())
+                {
+                    *name = position.to_string();
+                }
+            }
+            TypeRef::Named { arguments, .. } | TypeRef::Declared { arguments, .. } => {
+                pending.extend(arguments.iter_mut());
+            }
+            TypeRef::Projection {
+                owner,
+                trait_type,
+                arguments,
+                ..
+            } => {
+                pending.push(owner.as_mut());
+                pending.extend(trait_type.as_deref_mut());
+                pending.extend(arguments.iter_mut());
+            }
+            TypeRef::Array { element }
+            | TypeRef::ByRef { element, .. }
+            | TypeRef::Pointer { element }
+            | TypeRef::Slice { element }
+            | TypeRef::FixedArray { element, .. }
+            | TypeRef::Channel { element, .. } => pending.push(element.as_mut()),
+            TypeRef::Map { key, value } => {
+                pending.push(key.as_mut());
+                pending.push(value.as_mut());
+            }
+            TypeRef::Wildcard { bound, .. } => pending.extend(bound.as_deref_mut()),
+            TypeRef::Tuple { elements } => pending.extend(elements.iter_mut()),
+            TypeRef::Function { parameters, result } => {
+                pending.extend(parameters.iter_mut().map(|parameter| &mut parameter.r#type));
+                pending.extend(result.as_deref_mut());
+            }
+            TypeRef::Unknown => {}
+        }
+    }
+}
+
+/// The terms seen so far, identified by name and by [`TermKey`].
 #[derive(Default)]
 struct TermKeys<'facts> {
-    by_name: HashMap<&'facts str, Vec<TermKey<'facts>>>,
+    by_name: HashMap<&'facts str, Vec<TermKey>>,
 }
 
 impl<'facts> TermKeys<'facts> {
     /// Record `member`'s term, returning whether it was new.
     fn insert(&mut self, member: &'facts MemberFact) -> bool {
-        let key = (
-            member.member_kind,
-            member.signature.as_ref().map(|signature| {
-                signature
-                    .parameters
-                    .iter()
-                    .map(|parameter| &parameter.r#type)
-                    .collect()
-            }),
-        );
+        let key = TermKey::new(member);
         let seen = self.by_name.entry(&member.name).or_default();
         if seen.contains(&key) {
             return false;
@@ -492,19 +589,26 @@ fn module_forwarders<'facts>(
 
 /// The static forwarder of an inherited instance term on `owner`, keeping the
 /// declaring member's signature and source locator.
+///
+/// Its identity hashes the positional form of the term, as [`TermKey`] does.
+/// A spelled identity would give an inherited overload the id of an own
+/// overload whose type parameters are spelled alike but placed differently,
+/// so the two would collide while both are real overloads.
 fn static_forwarder(member: &MemberFact, owner: &TypeFact) -> MemberFact {
-    let parameter_types = member
-        .signature
-        .iter()
-        .flat_map(|signature| &signature.parameters)
-        .map(|parameter| parameter.r#type.clone())
-        .collect::<Vec<_>>();
+    let type_parameters = bound_type_parameters(member);
+    let key = TermKey::new(member);
     let parameter_variadics = member
         .signature
         .iter()
         .flat_map(|signature| &signature.parameters)
         .map(|parameter| parameter.variadic)
         .collect::<Vec<_>>();
+    let return_type = member
+        .signature
+        .as_ref()
+        .and_then(|signature| signature.returns.as_ref())
+        .map(|returns| positional_type(returns, type_parameters));
+    let parameter_types = key.parameters.unwrap_or_default();
     let mut forwarder = member.clone();
     forwarder.id = member_declaration_id(MemberIdentity {
         owner_id: &owner.id,
@@ -512,16 +616,11 @@ fn static_forwarder(member: &MemberFact, owner: &TypeFact) -> MemberFact {
         is_static: true,
         parameter_arity: parameter_types.len(),
         name: &member.name,
-        generic_arity: member
-            .signature
-            .as_ref()
-            .map_or(0, |signature| signature.type_parameters.len()),
+        generic_arity: key.generic_arity,
         parameter_types: &parameter_types,
         parameter_variadics: &parameter_variadics,
-        return_type: member
-            .signature
-            .as_ref()
-            .and_then(|signature| signature.returns.as_ref()),
+        extension_receiver: key.receiver.as_ref(),
+        return_type: return_type.as_ref(),
     });
     forwarder.owner = owner.id.clone();
     forwarder.is_static = true;

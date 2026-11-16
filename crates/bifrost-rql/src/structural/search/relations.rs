@@ -24,11 +24,12 @@ pub(super) fn direct_member_expansions(
     let mut expansions = Vec::new();
     let mut exhausted = false;
     for unit in children {
-        if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+        if brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
             budget.pipeline_rows,
             max_pipeline_rows,
         )
-        .allows(1)
+        .try_allow(1)
+        .is_err()
         {
             exhausted = true;
             break;
@@ -49,33 +50,119 @@ pub(super) fn direct_member_expansions(
     (expansions, exhausted)
 }
 
-/// Enumerate exact Rust call facts owned by this callable. Target resolution is
+/// Legacy call-sites-from retains its existing work and ancestor exclusion.
+/// The new operator meters the nearest-callable ownership inventory explicitly.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum SourceCallInventoryMode {
+    Legacy,
+    Reachability,
+}
+
+/// Request-local lexical ownership inventory; the memo captures its fact read receipt.
+pub(super) struct SourceCallInventory {
+    facts: Arc<FileFacts>,
+    owners: HashMap<(usize, usize), Vec<u32>>,
+}
+
+/// Enumerate exact structured call facts owned by this callable. Target resolution is
 /// per site, using the same dispatcher as `dispatch-targets`; a missing
 /// indexed callee never removes the source call from the relation.
-fn rust_source_call_site_expansions(
+#[allow(clippy::too_many_arguments)]
+pub(super) fn source_call_site_expansions(
     analyzer: &dyn IAnalyzer,
     declaration: &DeclarationValue,
     filter: &CallSiteTraversalFilter,
+    cache: &mut CallTraversalCache,
+    budget: &mut CodeQueryExecutionBudget,
+    limits: CodeQueryExecutionLimits,
     max_outputs: usize,
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     semantic: &mut Option<SemanticQueryContext<'_>>,
+    mode: SourceCallInventoryMode,
 ) -> (Vec<PipelineExpansion>, bool) {
     let file = declaration.unit.source();
-    let Some(facts) = analyzer
-        .structural_fact_providers()
-        .into_iter()
-        .find(|provider| provider.structural_language() == Language::Rust)
-        .and_then(|provider| provider.structural_facts(file))
-    else {
+    let reuse = &mut cache.reuse;
+    let metered = mode == SourceCallInventoryMode::Reachability;
+    let read_facts = || {
+        analyzer
+            .structural_fact_providers()
+            .into_iter()
+            .find(|provider| {
+                provider.structural_language() == crate::analyzer::common::language_for_file(file)
+            })
+            .and_then(|provider| provider.structural_facts(file))
+    };
+    let inventory = if metered {
+        cache
+            .source_call_inventory
+            .read_mut(&memo_attribution(analyzer), |inventories| {
+                if let Some(inventory) = inventories.get(file) {
+                    return Some(inventory.clone());
+                }
+                let facts = read_facts()?;
+                let mut owners: HashMap<(usize, usize), Vec<u32>> = HashMap::default();
+                for (id, node) in facts.nodes().iter().enumerate() {
+                    if cancellation.is_some_and(CancellationToken::is_cancelled)
+                        || budget.fact_nodes.saturating_add(budget.examined_references)
+                            >= limits.max_fact_nodes
+                    {
+                        analyzer.mark_execution_dependent();
+                        reuse.join_in(EXECUTION_DEPENDENT);
+                        return None;
+                    }
+                    budget.fact_nodes += 1;
+                    if !node.kind.satisfies(NormalizedKind::Call) {
+                        continue;
+                    }
+                    let mut parent = node.parent;
+                    while let Some(parent_id) = parent {
+                        if budget.fact_nodes.saturating_add(budget.examined_references)
+                            >= limits.max_fact_nodes
+                        {
+                            analyzer.mark_execution_dependent();
+                            reuse.join_in(EXECUTION_DEPENDENT);
+                            return None;
+                        }
+                        budget.fact_nodes += 1;
+                        let owner = facts.node(parent_id);
+                        if owner.kind.satisfies(NormalizedKind::Callable) {
+                            owners
+                                .entry((owner.range.start_byte, owner.range.end_byte))
+                                .or_default()
+                                .push(u32::try_from(id).expect("fact ids fit"));
+                            break;
+                        }
+                        parent = owner.parent;
+                    }
+                }
+                let inventory = Arc::new(SourceCallInventory { facts, owners });
+                inventories.insert(file.clone(), inventory.clone());
+                Some(inventory)
+            })
+    } else {
+        // Preserve master's legacy enumeration, including calls in non-callable
+        // declarations. It must neither populate nor bypass the metered memo.
+        read_facts().map(|facts| {
+            Arc::new(SourceCallInventory {
+                facts,
+                owners: HashMap::default(),
+            })
+        })
+    };
+    let Some(inventory) = inventory else {
         diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            has_non_utf8_refusal: false,
+            refusal_sites: Default::default(),
+            call_relation_facts: None,
+            uses_omissions: Vec::new(),
             incompleteness: Incompleteness::Content,
             related: Vec::new(),
             source: None,
             code: CodeQueryDiagnosticCode::CallRelationParseFailed,
             impact: CodeQueryDiagnosticImpact::Incomplete,
             branch: Vec::new(),
-            language: "rust",
+            language: crate::analyzer::common::language_for_file(file).config_label(),
             message: format!(
                 "call-sites-from could not read call facts for {}",
                 declaration.unit.fq_name()
@@ -91,46 +178,62 @@ fn rust_source_call_site_expansions(
     let mut expansions = Vec::new();
     let mut seen = HashSet::default();
     let mut exhausted = false;
-    for (node_index, node) in facts.nodes().iter().enumerate() {
+    let facts = &inventory.facts;
+    let legacy_ids = 0..if metered { 0 } else { facts.nodes().len() };
+    let owned_ids = inventory
+        .owners
+        .get(&(declaration.range.start_byte, declaration.range.end_byte))
+        .into_iter()
+        .flatten()
+        .copied();
+    for node_index in legacy_ids
+        .map(|id| u32::try_from(id).expect("fact ids fit"))
+        .chain(owned_ids)
+    {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             exhausted = true;
             break;
         }
-        if !node.kind.satisfies(NormalizedKind::Call)
-            || node.range.start_byte < declaration.range.start_byte
-            || node.range.end_byte > declaration.range.end_byte
-        {
-            continue;
-        }
-        // A call inside a closure or nested function belongs to that callable,
-        // not its lexical outer function, until a call edge reaches it.
-        let mut parent = node.parent;
-        let mut nested_callable = false;
-        while let Some(parent_id) = parent {
-            let owner = facts.node(parent_id);
-            if owner.kind.satisfies(NormalizedKind::Callable)
-                && (owner.range.start_byte != declaration.range.start_byte
-                    || owner.range.end_byte != declaration.range.end_byte)
+        let node = facts.node(node_index);
+        if !metered {
+            if !node.kind.satisfies(NormalizedKind::Call)
+                || node.range.start_byte < declaration.range.start_byte
+                || node.range.end_byte > declaration.range.end_byte
             {
-                nested_callable = true;
-                break;
+                continue;
             }
-            parent = owner.parent;
-        }
-        if nested_callable {
-            continue;
+            let mut parent = node.parent;
+            let mut nested_callable = false;
+            while let Some(parent_id) = parent {
+                let owner = facts.node(parent_id);
+                if owner.kind.satisfies(NormalizedKind::Callable)
+                    && (owner.range.start_byte != declaration.range.start_byte
+                        || owner.range.end_byte != declaration.range.end_byte)
+                {
+                    nested_callable = true;
+                    break;
+                }
+                parent = owner.parent;
+            }
+            if nested_callable {
+                continue;
+            }
         }
         if node.construct.as_deref() == Some("rust_macro_invocation") {
             // The invocation is a source call, but its token tree can hide
             // further calls that the structural inventory cannot enumerate.
             diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                 incompleteness: Incompleteness::Content,
                 related: Vec::new(),
                 source: None,
                 code: CodeQueryDiagnosticCode::CallRelationAnalysisFailed,
                 impact: CodeQueryDiagnosticImpact::Incomplete,
                 branch: Vec::new(),
-                language: "rust",
+                language: crate::analyzer::common::language_for_file(file).config_label(),
                 message: format!(
                     "call-sites-from cannot enumerate calls inside Rust macro invocation at byte {}",
                     node.range.start_byte
@@ -139,11 +242,9 @@ fn rust_source_call_site_expansions(
                 withheld_rows_path: None,
             }));
         }
-        let Some(shape) = crate::analyzer::usages::call_shape::call_shape_for_call(
-            &facts,
-            file,
-            u32::try_from(node_index).expect("facts IDs fit u32"),
-        ) else {
+        let Some(shape) =
+            crate::analyzer::usages::call_shape::call_shape_for_call(facts, file, node_index, None)
+        else {
             exhausted = true;
             continue;
         };
@@ -153,6 +254,13 @@ fn rust_source_call_site_expansions(
         }
         let (answer, cause) = semantic.dispatch_at_source_with_cause(file, range);
         let semantic_identity = semantic.call_site_identity_at_source(file, range);
+        let lookup = cache
+            .bindings
+            .read_mut(&memo_attribution(analyzer), |bindings| {
+                shape.outcome.callee_range.and_then(|callee| {
+                    bindings.resolved_call_target(analyzer, file, callee, cancellation)
+                })
+            });
         if cause.execution_cause().is_some() {
             exhausted = true;
         }
@@ -211,6 +319,7 @@ fn rust_source_call_site_expansions(
             emit(
                 None,
                 CallSiteTargetEvidence {
+                    static_proof: None,
                     target_id: None,
                     target_fq_name: None,
                     boundary_kind: Some("unresolved"),
@@ -231,6 +340,15 @@ fn rust_source_call_site_expansions(
             emit(
                 arm.target_unit.clone(),
                 CallSiteTargetEvidence {
+                    static_proof: (node.construct.as_deref() != Some("rust_macro_invocation"))
+                        .then(|| {
+                            super::call_reachability::static_call_proof(
+                                lookup.as_ref(),
+                                arm,
+                                shape.outcome.receiver_range.is_none(),
+                            )
+                        })
+                        .flatten(),
                     target_id: Some(arm.target_id.clone()),
                     target_fq_name: arm
                         .external_callee_identity
@@ -287,14 +405,18 @@ pub(super) fn call_site_expansions(
     if !incoming
         && crate::analyzer::common::language_for_file(declaration.unit.source()) == Language::Rust
     {
-        return rust_source_call_site_expansions(
+        return source_call_site_expansions(
             analyzer,
             declaration,
             filter,
+            cache,
+            budget,
+            limits,
             max_outputs,
             cancellation,
             diagnostics,
             semantic,
+            SourceCallInventoryMode::Legacy,
         );
     }
     let result = cached_call_relation(
@@ -330,7 +452,8 @@ pub(super) fn call_site_expansions(
                 .read_mut(&memo_attribution(analyzer), |memo| {
                     bind_call_site_arguments(analyzer, &mut site, memo)
                 });
-            let identity_facts = call_site_identity_facts(analyzer, &site, cancellation);
+            let identity_facts =
+                call_site_identity_facts(analyzer, &site, cancellation, &mut cache.reuse);
             if recursive_equals_identity_is_incomplete(&site, &identity_facts)
                 && !diagnostics.iter().any(|diagnostic| {
                     diagnostic.code == CodeQueryDiagnosticCode::SemanticResultsOmitted
@@ -341,6 +464,10 @@ pub(super) fn call_site_expansions(
                 })
             {
                 diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                    has_non_utf8_refusal: false,
+                    refusal_sites: Default::default(),
+                    call_relation_facts: None,
+                    uses_omissions: Vec::new(),
                     incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                     related: Vec::new(),
                     source: None,
@@ -391,6 +518,7 @@ fn call_site_identity_facts(
     analyzer: &dyn IAnalyzer,
     site: &CallSite,
     cancellation: Option<&CancellationToken>,
+    reuse: &mut ReuseVerdict,
 ) -> CallSiteIdentityFacts {
     let language = crate::analyzer::common::language_for_file(&site.file);
     let mut facts = CallSiteIdentityFacts {
@@ -415,6 +543,7 @@ fn call_site_identity_facts(
     );
     if parsed.is_err() {
         analyzer.mark_execution_dependent();
+        reuse.join_in(EXECUTION_DEPENDENT);
     }
     let Ok(Some(tree)) = parsed else {
         return facts;
@@ -550,8 +679,190 @@ fn strip_csharp_argument_wrappers(mut node: Node<'_>) -> Option<Node<'_>> {
     }
 }
 
+// Physical scans are operational work. Include both lanes in the user's query
+// limit, without adding call scans to answer-determined content admission.
+pub(super) fn remaining_call_scan_limits(
+    budget: &CodeQueryExecutionBudget,
+    limits: CodeQueryExecutionLimits,
+) -> CallRelationLimits {
+    CallRelationLimits {
+        max_files: limits.max_scanned_files.saturating_sub(
+            budget
+                .scanned_files
+                .saturating_add(budget.call_scanned_files),
+        ),
+        max_source_bytes: limits.max_scanned_source_bytes.saturating_sub(
+            budget
+                .scanned_source_bytes
+                .saturating_add(budget.call_scanned_source_bytes),
+        ),
+        max_candidates: limits.max_fact_nodes,
+    }
+}
+
+pub(super) struct IncomingCallScanGrants {
+    pub provider: CallRelationLimits,
+    user: CallRelationLimits,
+}
+
+impl IncomingCallScanGrants {
+    pub fn remaining(budget: &CodeQueryExecutionBudget, limits: CodeQueryExecutionLimits) -> Self {
+        let user = remaining_call_scan_limits(budget, limits);
+        Self {
+            provider: CallRelationLimits {
+                max_files: user.max_files.min(
+                    limits
+                        .max_call_scanned_files
+                        .saturating_sub(budget.callers_scanned_files),
+                ),
+                max_source_bytes: user.max_source_bytes.min(
+                    limits
+                        .max_call_scanned_source_bytes
+                        .saturating_sub(budget.callers_scanned_source_bytes),
+                ),
+                max_candidates: user.max_candidates,
+            },
+            user,
+        }
+    }
+
+    pub fn user_refused(&self, result: &CallRelationResult) -> bool {
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| match diagnostic.code {
+                CallRelationDiagnosticCode::ScanGrantRefused(CallRelationScanLimit::Files) => {
+                    self.provider.max_files == self.user.max_files
+                }
+                CallRelationDiagnosticCode::ScanGrantRefused(
+                    CallRelationScanLimit::SourceBytes,
+                ) => self.provider.max_source_bytes == self.user.max_source_bytes,
+                _ => false,
+            })
+    }
+}
+
+pub(super) fn call_scan_budget_exceeded(
+    budget: &CodeQueryExecutionBudget,
+    limits: CodeQueryExecutionLimits,
+) -> bool {
+    budget
+        .scanned_files
+        .saturating_add(budget.call_scanned_files)
+        > limits.max_scanned_files
+        || budget
+            .scanned_source_bytes
+            .saturating_add(budget.call_scanned_source_bytes)
+            > limits.max_scanned_source_bytes
+}
+
+pub(super) fn push_call_scan_budget_diagnostic(
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    file: &ProjectFile,
+) {
+    diagnostics.push(incomplete_diagnostic(
+        CodeQueryDiagnosticCode::SemanticBudgetExhausted,
+        Incompleteness::Operational(DiagnosticExecutionCause::Budget),
+        "callers",
+        format!(
+            "callers expansion physical-scan allowance exhausted at {}",
+            file
+        ),
+        Vec::new(),
+    ));
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn cached_call_relation(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    unit: &CodeUnit,
+    incoming: bool,
+    cache: &mut CallTraversalCache,
+    budget: &mut CodeQueryExecutionBudget,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    cache_profile: &mut Option<QueryCacheProfile>,
+) -> CallRelationResult {
+    if budget
+        .call_declarations
+        .saturating_add(budget.call_sites)
+        .saturating_add(budget.call_terminals)
+        >= limits.max_call_answers
+    {
+        push_spent_budget_diagnostic(diagnostics, budget, limits, 5);
+        return CallRelationResult {
+            truncated: true,
+            ..CallRelationResult::default()
+        };
+    }
+    let result = unadmitted_call_relation(
+        analyzer,
+        token,
+        unit,
+        incoming,
+        cache,
+        budget,
+        limits,
+        cancellation,
+        diagnostics,
+        cache_profile,
+    );
+    admit_call_relation(result, budget, limits, diagnostics)
+}
+
+pub(super) fn admit_call_relation(
+    result: CallRelationResult,
+    budget: &mut CodeQueryExecutionBudget,
+    limits: CodeQueryExecutionLimits,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+) -> CallRelationResult {
+    if budget
+        .call_declarations
+        .saturating_add(budget.call_sites)
+        .saturating_add(budget.call_terminals)
+        >= limits.max_call_answers
+    {
+        push_spent_budget_diagnostic(diagnostics, budget, limits, 5);
+        return CallRelationResult {
+            truncated: true,
+            ..CallRelationResult::default()
+        };
+    }
+    budget.call_declarations = budget.call_declarations.saturating_add(1);
+    let mut result = result;
+    // Keep the memo answer whole; admit a canonical prefix within the allowance.
+    let remaining = limits.max_call_answers.saturating_sub(
+        budget
+            .call_declarations
+            .saturating_add(budget.call_sites)
+            .saturating_add(budget.call_terminals),
+    );
+    let sites = result.sites.len().min(remaining);
+    let terminals = result.external_terminal_sites.len().min(remaining - sites);
+    if sites < result.sites.len() || terminals < result.external_terminal_sites.len() {
+        let used = budget
+            .call_declarations
+            .saturating_add(budget.call_sites)
+            .saturating_add(budget.call_terminals);
+        let attempted = used
+            .saturating_add(result.sites.len())
+            .saturating_add(result.external_terminal_sites.len());
+        let mut refused = *budget;
+        refused.refused_lane = Some((5, used, attempted, limits.max_call_answers));
+        result.sites.truncate(sites);
+        result.external_terminal_sites.truncate(terminals);
+        result.truncated = true;
+        push_budget_diagnostic(diagnostics, &refused, limits, Some(budget), "call_relation");
+    }
+    budget.call_sites = budget.call_sites.saturating_add(sites);
+    budget.call_terminals = budget.call_terminals.saturating_add(terminals);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn unadmitted_call_relation(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
     unit: &CodeUnit,
@@ -588,23 +899,38 @@ pub(super) fn cached_call_relation(
             if let Some(layer) = layer {
                 layer.record_miss();
             }
-            let relation_limits = CallRelationLimits {
-                max_files: limits
-                    .max_scanned_files
-                    .saturating_sub(budget.scanned_files)
-                    .min(DEFAULT_MAX_FILES),
-                max_source_bytes: limits
-                    .max_scanned_source_bytes
-                    .saturating_sub(budget.scanned_source_bytes),
-                max_candidates: limits
-                    .max_fact_nodes
-                    .saturating_sub(budget.fact_nodes.saturating_add(budget.examined_references)),
-            };
-            let result = if relation_limits.max_files == 0
-                || relation_limits.max_source_bytes == 0
-                || relation_limits.max_candidates == 0
+            let relation_start = *budget;
+            let relation_limits = remaining_call_scan_limits(budget, limits);
+            if relation_limits.max_files == 0 || relation_limits.max_source_bytes == 0 {
+                push_spent_budget_diagnostic(
+                    diagnostics,
+                    budget,
+                    limits,
+                    if relation_limits.max_files == 0 { 0 } else { 1 },
+                );
+                return CallRelationResult {
+                    truncated: true,
+                    ..CallRelationResult::default()
+                };
+            }
+            if incoming
+                && (budget.callers_scanned_files >= limits.max_call_scanned_files
+                    || budget.callers_scanned_source_bytes >= limits.max_call_scanned_source_bytes)
             {
-                push_budget_diagnostic(diagnostics, budget);
+                push_call_scan_budget_diagnostic(diagnostics, unit.source());
+                return CallRelationResult {
+                    truncated: true,
+                    ..CallRelationResult::default()
+                };
+            }
+            let incoming_grants = IncomingCallScanGrants::remaining(budget, limits);
+            let relation_limits = if incoming {
+                incoming_grants.provider
+            } else {
+                relation_limits
+            };
+            let result = if relation_limits.max_candidates == 0 {
+                push_spent_budget_diagnostic(diagnostics, budget, limits, 2);
                 CallRelationResult {
                     truncated: true,
                     ..CallRelationResult::default()
@@ -626,18 +952,29 @@ pub(super) fn cached_call_relation(
                     cancellation,
                 )
             };
-            let budget_exhausted = charge_reference_scan(
-                budget,
-                limits,
-                result.work.scanned_files,
-                result.work.scanned_source_bytes,
-                result.work.examined_candidates,
+            debug_assert!(
+                result.work.scanned_files <= relation_limits.max_files
+                    && result.work.scanned_source_bytes <= relation_limits.max_source_bytes,
+                "call provider exceeded its physical scan grant: {result:?} {relation_limits:?}"
             );
-            let mut result = result;
-            result.truncated |= budget_exhausted;
-            if budget_exhausted {
-                push_budget_diagnostic(diagnostics, budget);
+            if incoming {
+                budget.callers_scanned_files = budget
+                    .callers_scanned_files
+                    .saturating_add(result.work.scanned_files);
+                budget.callers_scanned_source_bytes = budget
+                    .callers_scanned_source_bytes
+                    .saturating_add(result.work.scanned_source_bytes);
             }
+            // Match the original work accounting: a memo hit performs no scan.
+            budget.call_scanned_files = budget
+                .call_scanned_files
+                .saturating_add(result.work.scanned_files);
+            budget.call_scanned_source_bytes = budget
+                .call_scanned_source_bytes
+                .saturating_add(result.work.scanned_source_bytes);
+            budget.call_examined_references = budget
+                .call_examined_references
+                .saturating_add(result.work.examined_candidates);
             if let Some(profile) = cache_profile {
                 let layer = if incoming {
                     &mut profile.incoming_call
@@ -646,7 +983,54 @@ pub(super) fn cached_call_relation(
                 };
                 layer.record_build(Some(call_relation_result_complete(&result, incoming)));
             }
-            results.insert(unit.clone(), result.clone());
+            // Cancellation keeps the provider's partial sites and diagnostics.
+            // Neither cancellation nor a refused scan grant is memoized.
+            if !result.cancelled {
+                // A provider can refuse the user's residual scan grant before
+                // charging work. Only its typed refusal establishes that cause.
+                if call_scan_budget_exceeded(budget, limits) || result.scan_grant_refused() {
+                    if call_scan_budget_exceeded(budget, limits)
+                        || !incoming
+                        || !result.scan_grant_refused()
+                        || incoming_grants.user_refused(&result)
+                    {
+                        push_call_relation_budget_diagnostics(
+                            diagnostics,
+                            budget,
+                            limits,
+                            &relation_start,
+                            &result.budget_refusals,
+                        );
+                    } else {
+                        push_call_scan_budget_diagnostic(diagnostics, unit.source());
+                    }
+                    return CallRelationResult {
+                        truncated: true,
+                        ..CallRelationResult::default()
+                    };
+                }
+                if incoming
+                    && (budget.callers_scanned_files > limits.max_call_scanned_files
+                        || budget.callers_scanned_source_bytes
+                            > limits.max_call_scanned_source_bytes)
+                {
+                    push_call_scan_budget_diagnostic(diagnostics, unit.source());
+                    return CallRelationResult {
+                        truncated: true,
+                        ..CallRelationResult::default()
+                    };
+                }
+                if !result.budget_refusals.is_empty() {
+                    push_call_relation_budget_diagnostics(
+                        diagnostics,
+                        budget,
+                        limits,
+                        &relation_start,
+                        &result.budget_refusals,
+                    );
+                }
+                results.insert(unit.clone(), result.clone());
+            }
             result
         };
         let reported = if incoming {
@@ -663,6 +1047,10 @@ pub(super) fn cached_call_relation(
                 && !result.cancelled
             {
                 diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                    has_non_utf8_refusal: false,
+                    refusal_sites: Default::default(),
+                    call_relation_facts: None,
+                    uses_omissions: Vec::new(),
                     incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                     related: Vec::new(),
                     source: None,
@@ -711,7 +1099,7 @@ pub(super) fn mark_proven_call_ambiguity_incomplete(
     {
         for diagnostic in diagnostics.iter_mut().filter(|diagnostic| {
             diagnostic.code == CodeQueryDiagnosticCode::CallRelationTargetsAmbiguous
-                && diagnostic.message == source.message
+                && diagnostic.call_relation_facts.as_deref() == Some(&source.facts)
         }) {
             diagnostic.impact = CodeQueryDiagnosticImpact::Incomplete;
         }
@@ -734,7 +1122,8 @@ pub(super) fn map_call_relation_diagnostic_code(
     code: CallRelationDiagnosticCode,
 ) -> (CodeQueryDiagnosticCode, CodeQueryDiagnosticImpact) {
     match code {
-        CallRelationDiagnosticCode::BudgetExhausted => (
+        CallRelationDiagnosticCode::BudgetExhausted
+        | CallRelationDiagnosticCode::ScanGrantRefused(_) => (
             CodeQueryDiagnosticCode::CallRelationBudgetExhausted,
             CodeQueryDiagnosticImpact::Incomplete,
         ),
@@ -776,6 +1165,10 @@ pub(super) fn map_call_relation_diagnostic(
     );
     let (code, impact) = map_call_relation_diagnostic_code(diagnostic.code);
     CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        has_non_utf8_refusal: false,
+        refusal_sites: Default::default(),
+        call_relation_facts: Some(Box::new(diagnostic.facts.clone())),
+        uses_omissions: Vec::new(),
         incompleteness: brokk_bifrost_rql::Incompleteness::Operational(
             brokk_bifrost_rql::DiagnosticExecutionCause::Provider,
         ),
@@ -785,7 +1178,7 @@ pub(super) fn map_call_relation_diagnostic(
         impact,
         branch: Vec::new(),
         language,
-        message: diagnostic.message,
+        message: diagnostic.message(),
         exhausted_roots: Vec::new(),
         withheld_rows_path: None,
     })
@@ -858,6 +1251,7 @@ pub(super) fn charge_reference_scan(
     scanned_source_bytes: usize,
     examined_references: usize,
 ) -> bool {
+    let before = *budget;
     budget.scanned_files = budget.scanned_files.saturating_add(scanned_files);
     budget.scanned_source_bytes = budget
         .scanned_source_bytes
@@ -865,21 +1259,40 @@ pub(super) fn charge_reference_scan(
     budget.examined_references = budget
         .examined_references
         .saturating_add(examined_references);
-    !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
-        budget.scanned_files,
-        limits.max_scanned_files,
-    )
-    .allows(0)
-        || !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
-            budget.scanned_source_bytes,
+    let refused = [
+        (
+            0,
+            before
+                .scanned_files
+                .saturating_add(before.call_scanned_files),
+            budget
+                .scanned_files
+                .saturating_add(budget.call_scanned_files),
+            limits.max_scanned_files,
+        ),
+        (
+            1,
+            before
+                .scanned_source_bytes
+                .saturating_add(before.call_scanned_source_bytes),
+            budget
+                .scanned_source_bytes
+                .saturating_add(budget.call_scanned_source_bytes),
             limits.max_scanned_source_bytes,
-        )
-        .allows(0)
-        || !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+        ),
+        (
+            2,
+            before.fact_nodes.saturating_add(before.examined_references),
             budget.fact_nodes.saturating_add(budget.examined_references),
             limits.max_fact_nodes,
-        )
-        .allows(0)
+        ),
+    ]
+    .into_iter()
+    .find(|(_, _, attempted, limit)| attempted > limit);
+    if let Some(refusal) = refused {
+        budget.refused_lane = Some(refusal);
+    }
+    refused.is_some()
 }
 
 pub(super) fn classified_reference_kind_matches(
@@ -925,6 +1338,10 @@ pub(super) fn report_unclassified_reference_kinds(
         .collect();
     kinds.sort();
     diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
         incompleteness: brokk_bifrost_rql::Incompleteness::Content,
         related: Vec::new(),
         source: None,
@@ -932,8 +1349,14 @@ pub(super) fn report_unclassified_reference_kinds(
         impact: CodeQueryDiagnosticImpact::Incomplete,
         branch: Vec::new(),
         language: language.config_label(),
-        message: format!(
-            "reference sites without a classified kind could not be excluded for requested kinds {kinds:?}: {unclassified:?}"
+        message: brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+            format_args!(
+                "reference sites without a classified kind could not be excluded for requested kinds {kinds:?}: {unclassified:?}"
+            ),
+            format_args!(
+                "reference sites without a classified kind could not be excluded for requested kinds {kinds:?}"
+            ),
+            unclassified.iter(),
         ),
         exhausted_roots: Vec::new(),
         withheld_rows_path: None,
@@ -951,6 +1374,10 @@ fn report_undecided_enclosing_patterns(
     sites.sort();
     sites.dedup();
     diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        has_non_utf8_refusal: false,
+        refusal_sites: Default::default(),
+        call_relation_facts: None,
+        uses_omissions: Vec::new(),
         incompleteness: brokk_bifrost_rql::Incompleteness::Content,
         related: Vec::new(),
         source: None,
@@ -958,7 +1385,11 @@ fn report_undecided_enclosing_patterns(
         impact: CodeQueryDiagnosticImpact::Incomplete,
         branch: Vec::new(),
         language: language.config_label(),
-        message: format!("enclosing declaration patterns were undecidable at sites {sites:?}"),
+        message: brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+            format_args!("enclosing declaration patterns were undecidable at sites {sites:?}"),
+            format_args!("enclosing declaration patterns were undecidable at sites"),
+            sites.iter(),
+        ),
         exhausted_roots: Vec::new(),
         withheld_rows_path: None,
     }));
@@ -1192,7 +1623,20 @@ impl<'a> EnclosingPatternEvaluator<'a> {
         if (budget_stopped && !matched)
             || examined > u64::try_from(limits.max_fact_nodes).unwrap_or(u64::MAX)
         {
-            push_budget_diagnostic(diagnostics, budget);
+            if budget_stopped {
+                push_matcher_budget_diagnostic(diagnostics, budget, &incomplete);
+                return None;
+            }
+            let mut refused = *budget;
+            let used = budget.fact_nodes.saturating_add(budget.examined_references);
+            refused.refused_lane = Some((2, used, used, limits.max_fact_nodes));
+            push_budget_diagnostic(
+                diagnostics,
+                &refused,
+                limits,
+                Some(budget),
+                "structural_verification",
+            );
             return None;
         }
         if incomplete.cancelled.get() {
@@ -1324,10 +1768,14 @@ pub(super) fn outbound_reference_expansions(
         diagnostics
             .retain(|diagnostic| diagnostic.code != CodeQueryDiagnosticCode::UsesTargetsAmbiguous);
         diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+            uses_omissions: vec![UsesOmissionSite { range: None, evidence: UsesOmissionEvidence::TargetRangeUnavailable }],
             incompleteness: brokk_bifrost_rql::Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Provider),
             related: Vec::new(),
             source: None,
-            code: CodeQueryDiagnosticCode::UsesCandidatesOmitted,
+            code: CodeQueryDiagnosticCode::UsesTargetRangeUnavailable,
             impact: CodeQueryDiagnosticImpact::Incomplete,
             branch: Vec::new(),
             language: crate::analyzer::common::language_for_file(declaration.unit.source())
@@ -1467,8 +1915,11 @@ fn expand_hierarchy_in_query(
             QueryStep::Subtypes(_) => query.direct_descendants(&work.unit),
             _ => unreachable!("hierarchy expansion requires a hierarchy step"),
         };
+        // Each diagnostic sits at the declaration whose supertype clauses
+        // left the answer open: the part the reason names, or else the type
+        // whose direct relation this step read.
         for reason in &answer.open {
-            diagnostics.push(incomplete_diagnostic(
+            let mut diagnostic = incomplete_diagnostic(
                 CodeQueryDiagnosticCode::HierarchyIncomplete,
                 brokk_bifrost_rql::Incompleteness::Content,
                 crate::analyzer::common::language_for_file(work.unit.source()).config_label(),
@@ -1478,7 +1929,10 @@ fn expand_hierarchy_in_query(
                     reason.description()
                 ),
                 Vec::new(),
-            ));
+            );
+            diagnostic.source =
+                declaration_source_span(analyzer, reason.declared_by().unwrap_or(&work.unit));
+            diagnostics.push(diagnostic);
         }
         for group in &answer.ambiguous {
             let mut diagnostic = incomplete_diagnostic(
@@ -1491,39 +1945,25 @@ fn expand_hierarchy_in_query(
                 ),
                 Vec::new(),
             );
-            for unit in group {
-                if let Some(range) = analyzer.ranges_of(unit).first() {
-                    diagnostic.related.push(CodeQueryRelatedSource {
-                        source: CodeQuerySourceSpan {
-                            path: unit
-                                .source()
-                                .rel_path()
-                                .to_string_lossy()
-                                .replace('\\', "/"),
-                            range: render::render_source_range(
-                                analyzer,
-                                unit.source(),
-                                range,
-                                &mut PipelineRenderCache::default(),
-                            ),
-                            start_byte: range.start_byte,
-                            end_byte: range.end_byte,
-                        },
-                        label: unit.fq_name().to_string(),
-                    });
-                }
-            }
+            diagnostic.source = declaration_source_span(analyzer, &work.unit);
+            diagnostic.related.extend(group.iter().filter_map(|unit| {
+                Some(CodeQueryRelatedSource {
+                    source: declaration_source_span(analyzer, unit)?,
+                    label: unit.fq_name().to_string(),
+                })
+            }));
             diagnostics.push(diagnostic);
         }
         let mut related = answer.edges;
         related.sort();
         related.dedup();
         for unit in related {
-            if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+            if brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
                 budget.pipeline_rows,
                 max_pipeline_rows,
             )
-            .allows(1)
+            .try_allow(1)
+            .is_err()
             {
                 return (expansions, true);
             }
@@ -1546,11 +1986,12 @@ fn expand_hierarchy_in_query(
                 continue;
             };
             let next_depth = work.depth + 1;
-            if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+            if brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
                 budget.provenance_steps,
                 max_pipeline_rows,
             )
-            .allows(next_depth)
+            .try_allow(next_depth)
+            .is_err()
             {
                 return (expansions, true);
             }
@@ -1566,6 +2007,7 @@ fn expand_hierarchy_in_query(
                     .into_iter()
                     .map(|value| (value, None))
                     .collect(),
+                call_path_evidence: None,
                 budgeted: true,
             });
 
@@ -1579,6 +2021,30 @@ fn expand_hierarchy_in_query(
         }
     }
     (expansions, exhausted)
+}
+
+/// The first indexed range of `unit`, as a diagnostic source.
+fn declaration_source_span(
+    analyzer: &dyn IAnalyzer,
+    unit: &CodeUnit,
+) -> Option<CodeQuerySourceSpan> {
+    let ranges = analyzer.ranges_of(unit);
+    let range = ranges.first()?;
+    Some(CodeQuerySourceSpan {
+        path: unit
+            .source()
+            .rel_path()
+            .to_string_lossy()
+            .replace('\\', "/"),
+        range: render::render_source_range(
+            analyzer,
+            unit.source(),
+            range,
+            &mut PipelineRenderCache::default(),
+        ),
+        start_byte: range.start_byte,
+        end_byte: range.end_byte,
+    })
 }
 
 pub(super) fn project_hierarchy_declaration(
@@ -1947,6 +2413,8 @@ fn match_instantiated_type(
             declaration.declaration_id().to_string(),
             arguments.as_slice(),
         ),
+        // An intrinsic proves std coercion, not a model declaration identity.
+        RustProjectedType::StdIntrinsic { .. } => return (None, reads),
         RustProjectedType::Model {
             symbol, arguments, ..
         } => (
@@ -2268,6 +2736,73 @@ pub(super) fn enclosing_declaration_value(
             .map(|declaration| attach_exact_structural_kind(seed, declaration)),
         declarations.projection_omitted,
     )
+}
+
+/// Resolve a source's actual structured callable owner. Certification cannot
+/// borrow an outer indexed declaration when the true owner has no projection.
+pub(super) fn certified_source_declaration_value(
+    analyzer: &dyn IAnalyzer,
+    seed: &SeedMatch,
+    declarations_by_file: &mut HashMap<ProjectFile, EnclosingDeclarationIndex>,
+    budget: &mut CodeQueryExecutionBudget,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+    reuse: &mut ReuseVerdict,
+) -> Option<DeclarationValue> {
+    let mut charge = || {
+        if cancellation.is_some_and(CancellationToken::is_cancelled)
+            || budget.fact_nodes.saturating_add(budget.examined_references) >= limits.max_fact_nodes
+        {
+            analyzer.mark_execution_dependent();
+            reuse.join_in(EXECUTION_DEPENDENT);
+            return false;
+        }
+        budget.fact_nodes += 1;
+        true
+    };
+    let declarations = declaration_index_for_seed(analyzer, seed, declarations_by_file);
+    let fact = seed.facts.node(seed.fact_match.node);
+    let owner = if fact.kind == NormalizedKind::Decorator {
+        let mut owner: Option<Range> = None;
+        for (id, callable) in seed.facts.nodes().iter().enumerate() {
+            if !charge() {
+                return None;
+            }
+            if !callable.kind.satisfies(NormalizedKind::Callable) {
+                continue;
+            }
+            for target in seed
+                .facts
+                .role_targets(u32::try_from(id).expect("fact ids fit"), Role::Decorator)
+            {
+                if !charge() {
+                    return None;
+                }
+                if target.node == Some(seed.fact_match.node) {
+                    if owner.is_some_and(|previous| previous != callable.range) {
+                        return None;
+                    }
+                    owner = Some(callable.range);
+                }
+            }
+        }
+        owner?
+    } else {
+        let mut node = Some(seed.fact_match.node);
+        loop {
+            if !charge() {
+                return None;
+            }
+            let fact = seed.facts.node(node?);
+            if fact.kind.satisfies(NormalizedKind::Callable) {
+                break fact.range;
+            }
+            node = fact.parent;
+        }
+    };
+    declarations
+        .exact(owner)
+        .filter(|declaration| declaration.unit.is_callable() && !declaration.unit.is_synthetic())
 }
 
 pub(super) fn exact_callable_declaration_value(

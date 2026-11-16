@@ -1146,7 +1146,7 @@ mod tests {
                     .into_iter()
                     .map(|category| PolicyCategoryId::new(category).unwrap())
                     .collect(),
-                schema_version: 1,
+                schema_version: crate::definition::POLICY_DOCUMENT_SCHEMA_VERSION,
                 name: catalog_name,
                 version: 1,
                 sources: Vec::new(),
@@ -1157,7 +1157,7 @@ mod tests {
                     selector: selector("clean"),
                     kind: crate::definition::TaintSanitizerKind::Transfer {
                         input: PolicyPort::ArgumentIndex { index: 0 },
-                        output: PolicyPort::ReturnValue,
+                        output: PolicyPort::ReturnValue { path: None },
                     },
                     removes: vec![TaintLabel::new("user-controlled").unwrap()],
                 }],

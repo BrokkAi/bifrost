@@ -1,3 +1,4 @@
+pub(crate) mod ignore_inputs;
 use super::project_reads::{
     ProjectReadReceipt, ProjectReadSlot, ReadCapability, listing_read, publish_directory,
     publish_file_set, publish_git_ignore_presence_only, publish_ignore_rules, publish_receipt,
@@ -15,7 +16,7 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Default upper bound (8 MiB) on the size of a single in-memory overlay.
 /// Picked to cover all hand-written source comfortably while bounding the
@@ -82,6 +83,105 @@ const OVERLAY_REJECTION_LOG_THROTTLE: Duration = Duration::from_secs(60);
 /// if that doesn't reclaim enough, the rest are dropped wholesale (worst
 /// case: a few paths emit one redundant log line each).
 const OVERLAY_REJECTION_LOG_MAX_ENTRIES: usize = 256;
+
+/// The operation whose failure prevented an ignore observation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IgnoreObservationOperation {
+    Listing,
+    Matcher,
+}
+
+/// An observation failure is neither an ignored nor a visible answer.
+#[derive(Clone, Debug)]
+pub struct IgnoreObservationError {
+    pub path: PathBuf,
+    pub operation: IgnoreObservationOperation,
+    pub cause: Arc<io::Error>,
+}
+
+impl IgnoreObservationError {
+    pub fn new(
+        path: impl Into<PathBuf>,
+        operation: IgnoreObservationOperation,
+        cause: io::Error,
+    ) -> Self {
+        if let Some(error) = cause
+            .get_ref()
+            .and_then(|cause| cause.downcast_ref::<Self>())
+        {
+            return error.clone();
+        }
+        Self {
+            path: path.into(),
+            operation,
+            cause: Arc::new(cause),
+        }
+    }
+}
+impl std::fmt::Display for IgnoreObservationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ignore {:?} observation for {}: {}",
+            self.operation,
+            self.path.display(),
+            self.cause
+        )
+    }
+}
+impl std::error::Error for IgnoreObservationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.cause.as_ref())
+    }
+}
+impl From<IgnoreObservationError> for io::Error {
+    fn from(error: IgnoreObservationError) -> Self {
+        Self::new(error.cause.kind(), error)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+ static IGNORE_FAILURE_LOGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+ static MATCHER_ACQUISITIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn capture_ignore_matcher(
+    root: &Path,
+    files: &BTreeSet<ProjectFile>,
+) -> Result<Arc<BifrostIgnoreMatcher>, IgnoreObservationError> {
+    BifrostIgnoreMatcher::build(root, files)
+        .map(Arc::new)
+        .map_err(|cause| {
+            let error =
+                IgnoreObservationError::new(root, IgnoreObservationOperation::Matcher, cause);
+            eprintln!("workspace ignore observation incomplete: {error}");
+            #[cfg(test)]
+            IGNORE_FAILURE_LOGS.with(|count| count.set(count.get() + 1));
+            error
+        })
+}
+
+fn ignore_matcher_receipt(
+    matcher: &Result<Arc<BifrostIgnoreMatcher>, IgnoreObservationError>,
+    files: &BTreeSet<ProjectFile>,
+) -> ProjectReadReceipt {
+    match matcher {
+        Ok(matcher) => matcher.receipt_for(files),
+        Err(cause) => ProjectReadReceipt {
+            incomplete: Some(cause.clone()),
+            ..ProjectReadReceipt::default()
+        },
+    }
+}
+
+/// Decisions and selection captured together for a supplied listing.
+#[derive(Debug)]
+pub struct IgnoreObservation {
+    pub ignored: Vec<bool>,
+    pub selected: BTreeSet<ProjectFile>,
+    pub rules_digest: [u8; 32],
+}
 
 pub const BIFROST_IGNORE_FILE_NAME: &str = ".bifrostignore";
 
@@ -260,6 +360,11 @@ impl BifrostIgnoreMatcher {
     /// The complete listing certificate built beside these same rule inputs.
     pub fn listing_receipt(&self) -> ProjectReadReceipt {
         self.listing_receipt.clone()
+    }
+
+    /// Whether `directory` (absolute) contributed an ignore file to these rules.
+    fn has_rules_directory(&self, directory: &Path) -> bool {
+        self.by_directory.contains_key(directory)
     }
 
     fn receipt_for(&self, files: &BTreeSet<ProjectFile>) -> ProjectReadReceipt {
@@ -511,12 +616,26 @@ impl<T: Project> AsProject for T {
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum RetainedIgnoreObservation {
+    Unavailable,
+    NotListed,
+    Ok,
+    Failed(IgnoreObservationError),
+}
+
 pub trait Project: AsProject + Send + Sync {
     fn project_read_slot(&self) -> Option<&ProjectReadSlot> {
         None
     }
     fn install_read_recorder(&self, _capability: ReadCapability) -> bool {
         false
+    }
+
+    /// For callers that must refuse success when the current listing could not
+    /// be certified. Reads retained state only; never refreshes or re-stats.
+    fn retained_ignore_observation(&self) -> RetainedIgnoreObservation {
+        RetainedIgnoreObservation::Unavailable
     }
 
     fn ignore_rules_digest(&self) -> io::Result<[u8; 32]> {
@@ -749,12 +868,44 @@ pub trait Project: AsProject + Send + Sync {
     /// Whether `.bifrostignore` excludes this path from code intelligence.
     /// Unlike [`Project::is_gitignored`], this does not describe membership in
     /// [`Project::all_files`]: matching paths remain in the file-tool view.
-    fn is_bifrostignored(&self, _rel_path: &Path) -> bool {
+    fn is_bifrostignored(&self, _rel_path: &Path) -> Result<bool, IgnoreObservationError> {
         let _project_read = self
             .project_read_slot()
             .map(|slot| slot.ignore_rules(self.as_project()));
         publish_ignore_rules(BifrostIgnoreMatcher::empty_rules_digest());
-        false
+        Ok(false)
+    }
+
+    /// Observe custom selection and per-path overrides without assuming filesystem rules.
+    fn ignore_observation_for_files(
+        &self,
+        files: &BTreeSet<ProjectFile>,
+    ) -> Result<IgnoreObservation, IgnoreObservationError> {
+        let ignored = files
+            .iter()
+            .map(|file| self.is_bifrostignored(file.rel_path()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut selected = BTreeSet::new();
+        for language in Language::ANALYZABLE {
+            selected.extend(
+                self.analyzable_files_from(files, language)
+                    .map_err(|cause| {
+                        IgnoreObservationError::new(
+                            self.root(),
+                            IgnoreObservationOperation::Listing,
+                            cause,
+                        )
+                    })?,
+            );
+        }
+        let rules_digest = self.ignore_rules_digest().map_err(|cause| {
+            IgnoreObservationError::new(self.root(), IgnoreObservationOperation::Matcher, cause)
+        })?;
+        Ok(IgnoreObservation {
+            ignored,
+            selected,
+            rules_digest,
+        })
     }
 
     /// Drop any cached whole-workspace file listing so the next `all_files`
@@ -785,6 +936,12 @@ pub trait Project: AsProject + Send + Sync {
     /// project cannot decide that path alone, and the caller then invalidates
     /// the listing instead. Projects without a listing cache return `false`.
     fn update_cached_listing_for_path(&self, _rel_path: &Path) -> bool {
+        false
+    }
+
+    /// Remove confirmed missing paths in one cached-listing update. Returns
+    /// false when omissions or directory membership require a fresh listing.
+    fn update_cached_listing_for_removed_paths(&self, _files: &[ProjectFile]) -> bool {
         false
     }
 
@@ -897,6 +1054,33 @@ pub trait Project: AsProject + Send + Sync {
         answer
     }
 
+    /// Pin, in one atomic step, every source overlay this project layers over
+    /// its files. The view is immutable: later edits to the project never reach
+    /// it, and it answers overlay content only, never disk or a delegate.
+    ///
+    /// A request calls this while it holds its own entry map, so an
+    /// implementation must not publish to the project-read receipt or call back
+    /// into a query. A project that advertises no overlay gets an empty view.
+    /// One that advertises overlays and cannot pin them fails closed with
+    /// `ErrorKind::Unsupported` rather than pin a partial set.
+    ///
+    /// The view is a captured request input. Its identity and content metadata
+    /// name what the request will read; they are never a validation receipt,
+    /// certificate or proof that anything was checked.
+    fn capture_source_overlays(&self) -> io::Result<Arc<PinnedSourceOverlayView>> {
+        // The probe runs in its own suppressed frame: a nested read depth keeps
+        // every recorder callback from firing, and the caller's open project-read
+        // receipt is saved and restored, so the probe's `publish_overlays` cannot
+        // overwrite it.
+        match super::project_reads::with_project_read_suppression(true, || self.overlay_content()) {
+            Some(content) if !content.entries().is_empty() => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "project layers source overlays but cannot pin them as one immutable view",
+            )),
+            _ => Ok(PinnedSourceOverlayView::empty()),
+        }
+    }
+
     /// Monotonic process-local generation for source that can change behind
     /// an analyzer. Every analyzer memo relies on this invariant: content the
     /// analyzer can observe changes only with a new analyzer, a replaced memo
@@ -997,7 +1181,60 @@ pub fn resolve_update_paths_with_refresh(
 ) -> io::Result<BTreeSet<ProjectFile>> {
     let (resolved, mut refresh, explicit_inputs) =
         resolve_update_paths_with_explicit_inputs(project, changed, &listing.0, explicitly_read)?;
+    // Patch watcher deletions before capture so removed configuration inputs
+    // leave cached membership without walking the workspace again.
     let mut patched = false;
+    let mut removed = Vec::new();
+    for file in &resolved {
+        if !listing.0.contains(file) || project.has_overlay(file) {
+            continue;
+        }
+        // Inspect the entry itself, not its target. Only a regular file stays
+        // listed; symlinks and every other non-regular entry need a walk.
+        match file.abs_path().symlink_metadata() {
+            Ok(metadata) if !metadata.file_type().is_file() => refresh = true,
+            Ok(_) => {}
+            // A former child of a directory that became a file is gone too.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                removed.push(file.clone())
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    if !removed.is_empty() {
+        if project.update_cached_listing_for_removed_paths(&removed) {
+            patched = true;
+        } else {
+            refresh = true;
+        }
+    }
+    let removed_paths = removed
+        .iter()
+        .map(|file| file.rel_path())
+        .collect::<BTreeSet<_>>();
+    for file in resolved.iter().filter(|file| {
+        !listing.0.contains(*file) && !explicit_inputs.contains(*file) && !project.has_overlay(file)
+    }) {
+        // A directory deletion or replacement may name only the directory.
+        // Its former children are not in `resolved`, so re-list unless the
+        // batch already accounts for every child. Omissions have no batch
+        // removal and always need enumeration.
+        if listing.0.iter().any(|listed| {
+            listed.rel_path().starts_with(file.rel_path())
+                && !removed_paths.contains(listed.rel_path())
+        }) || listing
+            .1
+            .iter()
+            .any(|omission| omission.path.starts_with(file.rel_path()))
+        {
+            refresh = true;
+        }
+    }
     for file in resolved.iter().filter(|file| {
         !listing.0.contains(*file) && file.exists() && !explicit_inputs.contains(*file)
     }) {
@@ -1433,6 +1670,7 @@ pub struct WorkspaceFileListingCache {
     generation: AtomicU64,
     walks: AtomicUsize,
     cached: Mutex<Option<CachedFileListing>>,
+    failed_listing: Mutex<Option<(u64, IgnoreObservationError)>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1443,11 +1681,180 @@ struct CachedFileListing {
     /// The resolved target of each symlink in `omissions`, for
     /// [`WorkspaceFileListingCache::revalidate_symlink_omissions`].
     symlinks: Arc<SymlinkTargets>,
-    matcher: Arc<BifrostIgnoreMatcher>,
+    matcher: Result<Arc<BifrostIgnoreMatcher>, IgnoreObservationError>,
     receipt: ProjectReadReceipt,
+    ignore_inputs: ignore_inputs::InputReceipt,
 }
 
 impl WorkspaceFileListingCache {
+    /// Observe only retained listing storage. A cold cache stays cold.
+    #[cfg(feature = "test-support")]
+    pub fn retention_census_for_test(
+        self: &Arc<Self>,
+        census: &mut crate::retention_census::RetentionCensus,
+    ) {
+        use crate::retention_census::{
+            AllocationAccounting, FamilyLifetime, ResidentWeightUnit, UnknownKind,
+        };
+        let family = "cached_workspace_file_listing";
+        let lifetime = FamilyLifetime::Persistent;
+        let accounting = AllocationAccounting::OutsideBudget;
+        let cached = self
+            .cached
+            .lock()
+            .expect("workspace file listing cache poisoned")
+            .clone();
+        census.record_arc_allocation(
+            Arc::clone(self),
+            family,
+            lifetime,
+            "workspace_file_listing_cache_container",
+            (std::mem::size_of::<Self>()
+                + self.root.capacity()
+                + cached
+                    .as_ref()
+                    .and_then(|cached| cached.ignore_inputs.as_ref().err())
+                    .map_or(0, |error| error.path.capacity())) as u64,
+            accounting,
+        );
+        census.record_resident_reading(
+            family,
+            lifetime,
+            cached.as_ref().map_or(0, |cached| cached.files.len()) as u64,
+            cached.as_ref().map_or(0, |cached| cached.files.len()) as u64,
+            ResidentWeightUnit::Entries,
+        );
+        census.record_unknown(
+            family,
+            lifetime,
+            UnknownKind::Coverage,
+            "allocator_and_arc_control_bytes_not_estimated",
+        );
+        let Some(cached) = cached else {
+            return;
+        };
+        // Every captured payload is immutable; the mutable cache lock is gone.
+        // BTreeSet exposes its entry count, not allocated node capacities.
+        census.record_arc_allocation(
+            Arc::clone(&cached.files),
+            family,
+            lifetime,
+            "workspace_listing_file_set_header",
+            std::mem::size_of_val(cached.files.as_ref()) as u64,
+            accounting,
+        );
+        census.record_unknown(
+            family,
+            lifetime,
+            UnknownKind::Coverage,
+            "btree_node_capacity_and_shared_project_file_backing_unavailable",
+        );
+        let omissions = std::mem::size_of_val(cached.omissions.as_ref())
+            + cached.omissions.capacity() * std::mem::size_of::<WorkspaceFileOmission>()
+            + cached
+                .omissions
+                .iter()
+                .map(|omission| omission.path.capacity())
+                .sum::<usize>();
+        census.record_arc_allocation(
+            Arc::clone(&cached.omissions),
+            family,
+            lifetime,
+            "workspace_listing_omissions",
+            omissions as u64,
+            accounting,
+        );
+        if let Ok(inputs) = &cached.ignore_inputs {
+            census.record_arc_allocation(
+                Arc::clone(inputs),
+                family,
+                lifetime,
+                "workspace_listing_ignore_inputs",
+                inputs.bytes() as u64,
+                accounting,
+            );
+        }
+        if let Err(error) = &cached.ignore_inputs {
+            census.record_arc_allocation(
+                Arc::clone(&error.cause),
+                family,
+                lifetime,
+                "workspace_listing_ignore_input_failure",
+                std::mem::size_of::<io::Error>() as u64,
+                accounting,
+            );
+            census.record_unknown(
+                family,
+                lifetime,
+                UnknownKind::Coverage,
+                "ignore_input_failure_io_error_payload_capacity_unavailable",
+            );
+        }
+        let symlinks = cached.symlinks.as_ref();
+        let bytes = std::mem::size_of_val(symlinks)
+            + symlinks.canonical_root.capacity()
+            + symlinks.links.capacity() * std::mem::size_of::<SymlinkRecord>()
+            + symlinks
+                .links
+                .iter()
+                .map(|link| {
+                    link.path.capacity()
+                        + match &link.target {
+                            SymlinkTarget::Inside(path) => path.capacity(),
+                            _ => 0,
+                        }
+                })
+                .sum::<usize>()
+            + symlinks.by_path.capacity() * std::mem::size_of::<(PathBuf, Vec<usize>)>()
+            + symlinks
+                .by_path
+                .iter()
+                .map(|(path, indices)| {
+                    path.capacity() + indices.capacity() * std::mem::size_of::<usize>()
+                })
+                .sum::<usize>()
+            + symlinks.always.capacity() * std::mem::size_of::<usize>();
+        census.record_arc_allocation(
+            Arc::clone(&cached.symlinks),
+            family,
+            lifetime,
+            "workspace_listing_symlink_targets",
+            bytes as u64,
+            accounting,
+        );
+        if let Ok(matcher_arc) = &cached.matcher {
+            let matcher = matcher_arc.as_ref();
+            let bytes = std::mem::size_of_val(matcher)
+                + matcher.root.capacity()
+                + matcher.by_directory.capacity() * std::mem::size_of::<(PathBuf, Gitignore)>()
+                + matcher
+                    .by_directory
+                    .keys()
+                    .map(PathBuf::capacity)
+                    .sum::<usize>();
+            census.record_arc_allocation(
+                Arc::clone(matcher_arc),
+                family,
+                lifetime,
+                "workspace_listing_ignore_matcher_partial_capacity",
+                bytes as u64,
+                accounting,
+            );
+            census.record_unknown(
+                family,
+                lifetime,
+                UnknownKind::Coverage,
+                "compiled_ignore_rules_receipts_and_hash_control_storage_not_walked",
+            );
+        }
+        census.record_unknown(
+            family,
+            lifetime,
+            UnknownKind::ActivePins,
+            "external_listing_bundle_leases_are_not_enumerable",
+        );
+    }
+
     pub fn new(root: PathBuf) -> Self {
         assert!(
             root.is_absolute(),
@@ -1464,6 +1871,7 @@ impl WorkspaceFileListingCache {
             generation: AtomicU64::new(0),
             walks: AtomicUsize::new(0),
             cached: Mutex::new(None),
+            failed_listing: Mutex::new(None),
         }
     }
 
@@ -1480,6 +1888,10 @@ impl WorkspaceFileListingCache {
             .lock()
             .expect("workspace file listing cache poisoned");
         *slot = None;
+        *self
+            .failed_listing
+            .lock()
+            .expect("listing failure lock poisoned") = None;
         self.generation.fetch_add(1, Ordering::Release);
     }
 
@@ -1512,10 +1924,11 @@ impl WorkspaceFileListingCache {
         if cached.generation != self.generation.load(Ordering::Acquire) {
             return None;
         }
+        let matcher = cached.matcher.as_ref().ok()?;
         Some(
             files_for_language(files, language, ProjectFile::language)
                 .into_iter()
-                .filter(|file| !cached.matcher.is_ignored(file))
+                .filter(|file| !matcher.is_ignored(file))
                 .collect(),
         )
     }
@@ -1542,13 +1955,37 @@ impl WorkspaceFileListingCache {
                 publish_receipt(cached.receipt.clone());
                 return Ok((Arc::clone(&cached.files), Arc::clone(&cached.omissions)));
             }
+            let mut failure = self
+                .failed_listing
+                .lock()
+                .expect("listing failure lock poisoned");
+            if let Some((failed_generation, error)) = &*failure
+                && *failed_generation == generation
+            {
+                return Err(io::Error::from(error.clone()));
+            }
             self.walks.fetch_add(1, Ordering::Relaxed);
-            let listing = collect_workspace_files_with_omissions(&self.root)?;
+            let listing = match collect_workspace_files_with_omissions(&self.root) {
+                Ok(listing) => {
+                    *failure = None;
+                    listing
+                }
+                Err(cause) => {
+                    let error = IgnoreObservationError::new(
+                        &self.root,
+                        IgnoreObservationOperation::Listing,
+                        cause,
+                    );
+                    eprintln!("workspace ignore observation incomplete: {error}");
+                    *failure = Some((generation, error.clone()));
+                    return Err(error.into());
+                }
+            };
             let files = Arc::new(listing.files);
             let omissions = Arc::new(listing.omissions);
             let symlinks = Arc::new(listing.symlinks);
-            let matcher = Arc::new(BifrostIgnoreMatcher::build(&self.root, &files)?);
-            let receipt = matcher.listing_receipt();
+            let matcher = listing.matcher.expect("listing captured its matcher");
+            let receipt = ignore_matcher_receipt(&matcher, &files);
             let generation = self.generation.fetch_add(1, Ordering::Release) + 1;
             *slot = Some(CachedFileListing {
                 generation,
@@ -1557,6 +1994,7 @@ impl WorkspaceFileListingCache {
                 symlinks,
                 matcher,
                 receipt: receipt.clone(),
+                ignore_inputs: listing.ignore_inputs,
             });
             publish_receipt(receipt);
             Ok((files, omissions))
@@ -1564,6 +2002,8 @@ impl WorkspaceFileListingCache {
     }
 
     fn matcher(&self) -> io::Result<Arc<BifrostIgnoreMatcher>> {
+        #[cfg(test)]
+        MATCHER_ACQUISITIONS.with(|count| count.set(count.get() + 1));
         // Recheck the generation while holding the same lock as the listing.
         loop {
             self.files()?;
@@ -1574,12 +2014,12 @@ impl WorkspaceFileListingCache {
             if let Some(cached) = slot.as_ref()
                 && cached.generation == self.generation.load(Ordering::Acquire)
             {
-                return Ok(Arc::clone(&cached.matcher));
+                return cached.matcher.clone().map_err(io::Error::from);
             }
         }
     }
 
-    /// Invalidate cached omissions whose symlink targets changed since listing.
+    /// Validate the listing's stat-only ignore inputs, then recheck symlink omissions.
     ///
     /// A target can change with no event on the link, so a link is rechecked
     /// when a path in `changed` equals its target or one of the ancestors of
@@ -1588,10 +2028,41 @@ impl WorkspaceFileListingCache {
     /// workspace, or did not resolve, has no workspace event to wait for and is
     /// rechecked on every update (two `stat` calls and a `canonicalize`). Every
     /// other link costs nothing. A link that is itself a changed
-    /// path invalidates through [`Self::update_path`]. The check holds no cache
-    /// lock. A target outside the workspace that changes with no update at all
+    /// path invalidates through [`Self::update_path`]. The symlink check holds
+    /// no cache lock. A target outside the workspace that changes with no update at all
     /// is seen at the next update, like any other unwatched input.
     pub fn revalidate_symlink_omissions(&self, changed: &BTreeSet<ProjectFile>) {
+        if self
+            .failed_listing
+            .lock()
+            .expect("listing failure lock poisoned")
+            .take()
+            .is_some()
+        {
+            self.generation.fetch_add(1, Ordering::Release);
+        }
+        // One outer update owns validation. Nested consumers receive its listing.
+        let mut slot = self
+            .cached
+            .lock()
+            .expect("workspace file listing cache poisoned");
+        let stale = slot
+            .as_ref()
+            .is_some_and(|cached| match &cached.ignore_inputs {
+                Ok(inputs) => match inputs.valid() {
+                    Ok(valid) => !valid,
+                    Err(cause) => {
+                        eprintln!("workspace ignore input validation incomplete: {cause}");
+                        true
+                    }
+                },
+                Err(_) => true,
+            });
+        if stale {
+            *slot = None;
+            self.generation.fetch_add(1, Ordering::Release);
+        }
+        drop(slot);
         let (omissions, symlinks) = {
             let slot = self
                 .cached
@@ -1671,6 +2142,84 @@ impl WorkspaceFileListingCache {
         self.update_resolved_path(file, listed)
     }
 
+    fn removal_empties_rule_directory(
+        matcher: &BifrostIgnoreMatcher,
+        files: &BTreeSet<ProjectFile>,
+        removed: &[ProjectFile],
+    ) -> bool {
+        removed.iter().any(|file| {
+            let mut directory = file.rel_path().parent();
+            while let Some(dir) = directory.filter(|dir| !dir.as_os_str().is_empty()) {
+                if matcher.has_rules_directory(&file.root().join(dir))
+                    && !files
+                        .range(file.with_rel_path(dir)..)
+                        .next()
+                        .is_some_and(|next| next.rel_path().starts_with(dir))
+                {
+                    return true;
+                }
+                directory = dir.parent();
+            }
+            false
+        })
+    }
+
+    /// Remove confirmed missing files with one set copy and one receipt rebuild.
+    fn remove_paths(&self, removed: &[ProjectFile]) -> bool {
+        // Removing an ignore file can admit paths it used to exclude, which a
+        // removal cannot add, so the caller re-lists instead.
+        if removed.iter().any(|file| {
+            file.rel_path().to_str().is_none()
+                || file
+                    .rel_path()
+                    .file_name()
+                    .is_some_and(|name| name == BIFROST_IGNORE_FILE_NAME || name == ".gitignore")
+        }) {
+            return false;
+        }
+        let mut slot = self
+            .cached
+            .lock()
+            .expect("workspace file listing cache poisoned");
+        let generation = self.generation.load(Ordering::Acquire);
+        let Some(cached) = slot
+            .as_mut()
+            .filter(|cached| cached.generation == generation)
+        else {
+            return true;
+        };
+        for file in removed {
+            // A listed file cannot also be a directory. Only unlisted paths
+            // need the prefix check that refuses directory removals.
+            if !cached.files.contains(file)
+                && cached
+                    .files
+                    .iter()
+                    .any(|listed| listed.rel_path().starts_with(file.rel_path()))
+            {
+                return false;
+            }
+        }
+        let mut files = (*cached.files).clone();
+        for file in removed {
+            files.remove(file);
+        }
+        // A directory's ignore rules are compiled only while a listed file lies
+        // under it. Emptying a rule-bearing directory changes the rules a fresh
+        // listing builds, so re-list.
+        let Ok(matcher) = &cached.matcher else {
+            return false;
+        };
+        if Self::removal_empties_rule_directory(matcher, &files, removed) {
+            return false;
+        }
+        let files = Arc::new(files);
+        cached.receipt = matcher.receipt_for(&files);
+        cached.files = files;
+        cached.generation = self.generation.fetch_add(1, Ordering::Release) + 1;
+        true
+    }
+
     fn update_resolved_path(&self, file: &ProjectFile, listed: bool) -> bool {
         // A point update cannot certify an omission's cause. Re-list when a
         // watcher sees a path whose metadata may be skipped by enumeration.
@@ -1722,6 +2271,14 @@ impl WorkspaceFileListingCache {
         } else {
             files.remove(file);
         }
+        let Ok(matcher) = &cached.matcher else {
+            return false;
+        };
+        if !listed
+            && Self::removal_empties_rule_directory(matcher, &files, std::slice::from_ref(file))
+        {
+            return false;
+        }
         if listed
             && !cached
                 .files
@@ -1731,7 +2288,7 @@ impl WorkspaceFileListingCache {
             return false;
         }
         let files = Arc::new(files);
-        let receipt = cached.matcher.receipt_for(&files);
+        let receipt = matcher.receipt_for(&files);
         cached.files = files;
         cached.receipt = receipt;
         let next = self.generation.fetch_add(1, Ordering::Release) + 1;
@@ -1749,7 +2306,7 @@ impl WorkspaceFileListingCache {
 
 #[derive(Debug)]
 struct IgnoreRulesSnapshot {
-    matcher: Arc<BifrostIgnoreMatcher>,
+    matcher: Result<Arc<BifrostIgnoreMatcher>, IgnoreObservationError>,
     receipt: ProjectReadReceipt,
 }
 
@@ -1806,7 +2363,10 @@ impl FilesystemProject {
                 omissions: Arc::new(Vec::new()),
                 epoch: 0,
             })),
-            bifrost_ignore: Arc::new(Mutex::new(Some(IgnoreRulesSnapshot { matcher, receipt }))),
+            bifrost_ignore: Arc::new(Mutex::new(Some(IgnoreRulesSnapshot {
+                matcher: Ok(matcher),
+                receipt,
+            }))),
         }
     }
 
@@ -1884,11 +2444,16 @@ impl FilesystemProject {
             .lock()
             .expect("Bifrost ignore matcher lock poisoned");
         if slot.is_none() {
-            let matcher = Arc::new(BifrostIgnoreMatcher::build(&self.root, files)?);
-            let receipt = matcher.listing_receipt();
+            let matcher = capture_ignore_matcher(&self.root, files);
+            let receipt = ignore_matcher_receipt(&matcher, files);
             *slot = Some(IgnoreRulesSnapshot { matcher, receipt });
         }
-        let matcher = Arc::clone(&slot.as_ref().expect("built matcher").matcher);
+        let matcher = slot
+            .as_ref()
+            .expect("built matcher")
+            .matcher
+            .clone()
+            .map_err(io::Error::from)?;
         publish_ignore_rules(matcher.rules_digest());
         Ok(matcher)
     }
@@ -1921,8 +2486,9 @@ impl FilesystemProject {
             return Ok(None);
         };
         publish_receipt(snapshot.receipt.clone());
-        publish_ignore_rules(snapshot.matcher.rules_digest());
-        Ok(Some(Arc::clone(&snapshot.matcher)))
+        let matcher = snapshot.matcher.clone().map_err(io::Error::from)?;
+        publish_ignore_rules(matcher.rules_digest());
+        Ok(Some(matcher))
     }
 
     fn take_initial_listing(&self) -> Option<SharedWorkspaceFileListing> {
@@ -1948,6 +2514,30 @@ impl FilesystemProject {
 }
 
 impl Project for FilesystemProject {
+    fn retained_ignore_observation(&self) -> RetainedIgnoreObservation {
+        let Some(cache) = &self.cached_listing else {
+            return RetainedIgnoreObservation::Unavailable;
+        };
+        let retained = cache
+            .cached
+            .lock()
+            .expect("workspace listing mutex poisoned");
+        let Some(listing) = retained
+            .as_ref()
+            .filter(|listing| listing.generation == cache.generation.load(Ordering::Acquire))
+        else {
+            return RetainedIgnoreObservation::NotListed;
+        };
+        match listing
+            .matcher
+            .as_ref()
+            .map(|_| ())
+            .and_then(|()| listing.ignore_inputs.as_ref().map(|_| ()))
+        {
+            Ok(()) => RetainedIgnoreObservation::Ok,
+            Err(cause) => RetainedIgnoreObservation::Failed(cause.clone()),
+        }
+    }
     fn has_exact_directory_entry(&self, file: &ProjectFile) -> io::Result<bool> {
         disk_has_exact_directory_entry(file)
     }
@@ -2082,6 +2672,13 @@ impl Project for FilesystemProject {
             Some((files, omissions)) => (files, omissions, false),
             None => {
                 let listing = collect_workspace_files_with_omissions(&self.root)?;
+                let matcher = listing.matcher.expect("listing matcher captured");
+                let receipt = ignore_matcher_receipt(&matcher, &listing.files);
+                *self
+                    .bifrost_ignore
+                    .lock()
+                    .expect("Bifrost ignore matcher lock poisoned") =
+                    Some(IgnoreRulesSnapshot { matcher, receipt });
                 (Arc::new(listing.files), Arc::new(listing.omissions), true)
             }
         };
@@ -2101,13 +2698,13 @@ impl Project for FilesystemProject {
                     // Keep the matcher until explicit invalidation, but
                     // certify this walk's files using the rules that will
                     // filter them.
-                    snapshot.receipt = snapshot.matcher.receipt_for(&files);
+                    snapshot.receipt = ignore_matcher_receipt(&snapshot.matcher, &files);
                 }
                 snapshot.receipt.clone()
             }
             None => {
-                let matcher = Arc::new(BifrostIgnoreMatcher::build(&self.root, &files)?);
-                let receipt = matcher.listing_receipt();
+                let matcher = capture_ignore_matcher(&self.root, &files);
+                let receipt = ignore_matcher_receipt(&matcher, &files);
                 *slot = Some(IgnoreRulesSnapshot {
                     matcher,
                     receipt: receipt.clone(),
@@ -2130,6 +2727,12 @@ impl Project for FilesystemProject {
         self.cached_listing
             .as_ref()
             .is_some_and(|cache| cache.update_resolved_path(file, true))
+    }
+
+    fn update_cached_listing_for_removed_paths(&self, files: &[ProjectFile]) -> bool {
+        self.cached_listing
+            .as_ref()
+            .is_some_and(|cache| cache.remove_paths(files))
     }
 
     fn update_cached_listing_for_path(&self, rel_path: &Path) -> bool {
@@ -2226,6 +2829,24 @@ impl Project for FilesystemProject {
             .collect())
     }
 
+    fn ignore_observation_for_files(
+        &self,
+        files: &BTreeSet<ProjectFile>,
+    ) -> Result<IgnoreObservation, IgnoreObservationError> {
+        let matcher = self.bifrost_ignore_matcher(files).map_err(|cause| {
+            IgnoreObservationError::new(&self.root, IgnoreObservationOperation::Matcher, cause)
+        })?;
+        Ok(IgnoreObservation {
+            ignored: files.iter().map(|file| matcher.is_ignored(file)).collect(),
+            selected: files
+                .iter()
+                .filter(|file| file.language() != Language::None && !matcher.is_ignored(file))
+                .cloned()
+                .collect(),
+            rules_digest: matcher.rules_digest(),
+        })
+    }
+
     fn file_by_rel_path(&self, rel_path: &Path) -> Option<ProjectFile> {
         let _project_read = self
             .project_read_slot()
@@ -2255,7 +2876,7 @@ impl Project for FilesystemProject {
             .unwrap_or(false)
     }
 
-    fn is_bifrostignored(&self, rel_path: &Path) -> bool {
+    fn is_bifrostignored(&self, rel_path: &Path) -> Result<bool, IgnoreObservationError> {
         let _project_read = self
             .project_read_slot()
             .map(|slot| slot.ignore_rules(self.as_project()));
@@ -2273,7 +2894,13 @@ impl Project for FilesystemProject {
             });
         matcher
             .map(|matcher| matcher.is_ignored_path(rel_path))
-            .unwrap_or(false)
+            .map_err(|cause| {
+                IgnoreObservationError::new(
+                    self.root.join(rel_path),
+                    IgnoreObservationOperation::Matcher,
+                    cause,
+                )
+            })
     }
 }
 
@@ -2287,6 +2914,7 @@ pub struct FileSetProject {
     project_reads: ProjectReadSlot,
     root: PathBuf,
     files: BTreeSet<ProjectFile>,
+    omissions: Arc<Vec<WorkspaceFileOmission>>,
     receipt: ProjectReadReceipt,
     languages: BTreeSet<Language>,
 }
@@ -2296,7 +2924,37 @@ impl FileSetProject {
     /// given project-relative paths. Analyzer languages are inferred from the
     /// file extensions; files of unsupported types stay listed but contribute
     /// no language (and so are never parsed).
+    ///
+    /// The files are a subset of a workspace whose remainder is unknown, so the
+    /// listing carries the fail-closed `Unknown` omission and a consumer cannot
+    /// prove an absence from it. [`Self::from_listing`] states a complete
+    /// listing instead.
     pub fn new(root: impl Into<PathBuf>, rel_paths: impl IntoIterator<Item = PathBuf>) -> Self {
+        Self::from_listing(
+            root,
+            rel_paths,
+            vec![WorkspaceFileOmission {
+                path: PathBuf::new(),
+                reason: WorkspaceFileOmissionReason::Unknown,
+            }],
+        )
+    }
+
+    /// Build a project over an authoritative listing: `rel_paths` are every file
+    /// of the workspace and `omissions` are the only entries it left out.
+    pub fn from_listing(
+        root: impl Into<PathBuf>,
+        rel_paths: impl IntoIterator<Item = PathBuf>,
+        omissions: Vec<WorkspaceFileOmission>,
+    ) -> Self {
+        Self::build(root, rel_paths, omissions)
+    }
+
+    fn build(
+        root: impl Into<PathBuf>,
+        rel_paths: impl IntoIterator<Item = PathBuf>,
+        omissions: Vec<WorkspaceFileOmission>,
+    ) -> Self {
         let root = root.into().normalize();
         let files: BTreeSet<ProjectFile> = rel_paths
             .into_iter()
@@ -2310,6 +2968,7 @@ impl FileSetProject {
             project_reads: ProjectReadSlot::default(),
             root,
             files,
+            omissions: Arc::new(omissions),
             receipt,
             languages,
         }
@@ -2379,6 +3038,11 @@ impl Project for FileSetProject {
             .map(|slot| slot.inventory(self.as_project()));
         publish_receipt(self.receipt.clone());
         Ok(self.files.clone())
+    }
+
+    fn all_files_with_omissions(&self) -> io::Result<SharedWorkspaceFileListing> {
+        self.all_files_shared()
+            .map(|files| (files, Arc::clone(&self.omissions)))
     }
 
     fn analyzable_files(&self, language: Language) -> io::Result<BTreeSet<ProjectFile>> {
@@ -2503,6 +3167,17 @@ impl MultiRootProject {
 }
 
 impl Project for MultiRootProject {
+    fn retained_ignore_observation(&self) -> RetainedIgnoreObservation {
+        let mut result = RetainedIgnoreObservation::Ok;
+        for root in &self.roots {
+            match root.retained_ignore_observation() {
+                failed @ RetainedIgnoreObservation::Failed(_) => return failed,
+                RetainedIgnoreObservation::Ok => {}
+                other => result = other,
+            }
+        }
+        result
+    }
     fn ignore_rules_digest(&self) -> io::Result<[u8; 32]> {
         let _project_read = self
             .project_read_slot()
@@ -2807,19 +3482,21 @@ impl Project for MultiRootProject {
         }
     }
 
-    fn is_bifrostignored(&self, rel_path: &Path) -> bool {
+    fn is_bifrostignored(&self, rel_path: &Path) -> Result<bool, IgnoreObservationError> {
         let _project_read = self
             .project_read_slot()
             .map(|slot| slot.ignore_rules(self.as_project()));
         let abs_path = self.root.join(rel_path);
-        let ignored = self.roots.iter().any(|root| {
-            abs_path
-                .strip_prefix(root.root())
-                .is_ok_and(|root_rel_path| root.is_bifrostignored(root_rel_path))
-        });
-        self.ignore_rules_digest()
-            .expect("workspace roots have readable rule inputs");
-        ignored
+        let mut ignored = false;
+        for root in &self.roots {
+            if let Ok(root_rel_path) = abs_path.strip_prefix(root.root()) {
+                ignored |= root.is_bifrostignored(root_rel_path)?;
+            }
+        }
+        self.ignore_rules_digest().map_err(|cause| {
+            IgnoreObservationError::new(&self.root, IgnoreObservationOperation::Matcher, cause)
+        })?;
+        Ok(ignored)
     }
 
     fn persistence_root(&self) -> Option<&Path> {
@@ -2954,6 +3631,9 @@ pub struct WorkspaceFileListing {
     pub omissions: Vec<WorkspaceFileOmission>,
     /// Where each symlink omission resolved when the listing was built.
     pub symlinks: SymlinkTargets,
+    /// Err means input enumeration was unavailable: every outer update re-lists.
+    pub(crate) ignore_inputs: ignore_inputs::InputReceipt,
+    matcher: Option<Result<Arc<BifrostIgnoreMatcher>, IgnoreObservationError>>,
 }
 
 /// The resolved target of every symlink omission of one listing, kept beside
@@ -3032,7 +3712,7 @@ impl SymlinkTargets {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct SymlinkRecord {
     path: PathBuf,
     reason: WorkspaceFileOmissionReason,
@@ -3040,7 +3720,7 @@ struct SymlinkRecord {
 }
 
 /// Where a symlink resolves, chains included.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum SymlinkTarget {
     /// The canonical target, relative to the canonical workspace root.
     Inside(PathBuf),
@@ -3054,15 +3734,37 @@ enum SymlinkTarget {
     Unresolved,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct WorkspaceFileOmission {
     pub path: PathBuf,
     pub reason: WorkspaceFileOmissionReason,
 }
 
+/// Serde's `PathBuf` implementation fails on the non-UTF-8 paths `NonUtf8GitPath`
+/// records. The path is displayed through `workspace_relative_slash_path`, and
+/// `lossy` is set when that display replaced bytes, so two different paths can
+/// share a display. Identity and digests use the raw path, never this string.
+impl serde::Serialize for WorkspaceFileOmission {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let lossy = self.path.to_str().is_none();
+        let mut state =
+            serializer.serialize_struct("WorkspaceFileOmission", 2 + usize::from(lossy))?;
+        state.serialize_field(
+            "path",
+            &crate::path_utils::workspace_relative_slash_path(&self.path),
+        )?;
+        state.serialize_field("reason", &self.reason)?;
+        if lossy {
+            state.serialize_field("lossy", &true)?;
+        }
+        state.end()
+    }
+}
+
 pub type SharedWorkspaceFileListing = (Arc<BTreeSet<ProjectFile>>, Arc<Vec<WorkspaceFileOmission>>);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 pub enum WorkspaceFileOmissionReason {
     Unknown,
     /// A regular file at a known path that this listing deliberately does not
@@ -3080,6 +3782,26 @@ pub enum WorkspaceFileOmissionReason {
     UnreadableSymlink,
     NonRegular,
     NonUtf8Name,
+}
+
+/// Whether an omission can hide a workspace source for any language. A walk
+/// error, an undecodable Git path, or a project that cannot say why
+/// (`Unknown`, which is also the default listing's single row) may drop a
+/// source this analyzer should have indexed. So may a symbolic link to a
+/// directory, which the listing does not descend into, or an unreadable
+/// symbolic link. Ignore rules, configured excludes and other non-regular
+/// entries are outside the analyzer's universe. A file at a known path
+/// (`NotSupplied`, a file `Symlink`) hides a source only for a consumer whose
+/// own files could live at that path; the language hook decides that.
+pub fn omission_may_hide_source(reason: WorkspaceFileOmissionReason) -> bool {
+    matches!(
+        reason,
+        WorkspaceFileOmissionReason::WalkError
+            | WorkspaceFileOmissionReason::NonUtf8GitPath
+            | WorkspaceFileOmissionReason::Unknown
+            | WorkspaceFileOmissionReason::SymlinkToDirectory
+            | WorkspaceFileOmissionReason::UnreadableSymlink
+    )
 }
 
 /// The omission reason and resolved target of the symbolic link at `absolute`
@@ -3135,11 +3857,235 @@ impl SymlinkRecord {
     }
 }
 
+/// The workspace listing under `root` that one Git membership describes.
+///
+/// `active_paths` and `non_utf8_paths` are relative to `canonical_workdir`, as
+/// [`crate::gitblob::working_tree_paths_with_non_utf8`] and
+/// [`crate::gitblob::WorkingTreeIdentity::working_tree_paths`] return them.
+/// Paths outside `canonical_root` and analyzer-owned paths are dropped, and
+/// every symbolic link and non-regular entry is classified the same way the
+/// walk classifies it.
+///
+/// `None` means Git names no file under the root: an ancestor repository's
+/// ignore rules hide the whole selected subtree, so Git cannot represent the
+/// workspace and the caller must walk it.
+fn git_workspace_listing(
+    root: &Path,
+    canonical_root: &Path,
+    canonical_workdir: &Path,
+    active_paths: impl IntoIterator<Item = String>,
+    non_utf8_paths: impl IntoIterator<Item = PathBuf>,
+) -> Option<WorkspaceFileListing> {
+    let owned_paths = AnalyzerOwnedPaths::new(root);
+    let mut files = BTreeSet::new();
+    let mut symlinks = Vec::new();
+    let mut omissions: Vec<_> = non_utf8_paths
+        .into_iter()
+        .filter_map(|path| {
+            canonical_workdir
+                .join(path)
+                .strip_prefix(canonical_root)
+                .ok()
+                .map(|rel| WorkspaceFileOmission {
+                    path: rel.to_path_buf(),
+                    reason: WorkspaceFileOmissionReason::NonUtf8GitPath,
+                })
+        })
+        .collect();
+    for rel in active_paths {
+        let absolute = canonical_workdir.join(rel);
+        let Ok(project_rel) = absolute.strip_prefix(canonical_root) else {
+            continue;
+        };
+        if owned_paths.contains(&absolute) {
+            continue;
+        }
+        if let Ok(metadata) = absolute.symlink_metadata() {
+            let reason = if metadata.file_type().is_symlink() {
+                let record = classify_symlink(canonical_root, &absolute, project_rel.to_path_buf());
+                let reason = record.reason;
+                symlinks.push(record);
+                Some(reason)
+            } else if !metadata.file_type().is_file() {
+                Some(WorkspaceFileOmissionReason::NonRegular)
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                omissions.push(WorkspaceFileOmission {
+                    path: project_rel.to_path_buf(),
+                    reason,
+                });
+                // Git lists every symlink so that it reaches this
+                // classification. Only a link to a regular file is read as a
+                // file. A link to a directory, to a FIFO or device, or to
+                // nothing readable has no content to analyze, and neither has
+                // a non-regular entry.
+                if reason != WorkspaceFileOmissionReason::Symlink {
+                    continue;
+                }
+            }
+        }
+        files.insert(ProjectFile::new(
+            root.to_path_buf(),
+            project_rel.to_path_buf(),
+        ));
+    }
+    (!files.is_empty()).then(|| WorkspaceFileListing {
+        files,
+        omissions,
+        symlinks: SymlinkTargets::new(canonical_root.to_path_buf(), symlinks),
+        ignore_inputs: Err(ignore_inputs::unavailable(
+            root,
+            "identity scan has no ignore inputs",
+        )),
+        matcher: None,
+    })
+}
+
+/// The listing `project` serves, taken from a working-tree identity scan that
+/// is already in hand instead of from another `git status`.
+///
+/// A built analyzer took one [`crate::gitblob::WorkingTreeIdentity`] scan for
+/// its generation. A consumer that needs only the workspace's membership, such
+/// as dependency discovery looking for manifests inside a host policy request,
+/// reads it here rather than listing the worktree again (#11890). The
+/// membership is the one [`collect_workspace_files_with_omissions`] computes,
+/// through the same Git-branch classification, and the source overlays
+/// `project` layers on top are added by [`OverlayProject`]'s own rule: a
+/// buffer is listed only where no file is on disk.
+///
+/// `Ok(None)` means the scan cannot reproduce `project`'s listing, and the
+/// caller must ask `project` itself:
+/// - `project` exposes an explicit subset of the workspace, which a worktree
+///   scan knows nothing about;
+/// - the scan holds a gitlink (see
+///   [`crate::gitblob::WorkingTreeIdentity::working_tree_paths`]);
+/// - Git names no file under the root, the case where the listing walks the
+///   selected root instead.
+pub fn workspace_listing_from_identity(
+    project: &dyn Project,
+    identity: &crate::gitblob::WorkingTreeIdentity,
+) -> io::Result<Option<SharedWorkspaceFileListing>> {
+    if project.coverage().subset().is_some() {
+        return Ok(None);
+    }
+    let root = project.root();
+    let canonical_root = root.canonicalize()?.normalize();
+    let canonical_workdir = identity.workdir();
+    let Some((active_paths, non_utf8_paths)) = identity.working_tree_paths(
+        crate::gitblob::subtree_pathspec(canonical_workdir, &canonical_root).as_deref(),
+    ) else {
+        return Ok(None);
+    };
+    let Some(listing) = git_workspace_listing(
+        root,
+        &canonical_root,
+        canonical_workdir,
+        active_paths,
+        non_utf8_paths,
+    ) else {
+        return Ok(None);
+    };
+    let mut files = listing.files;
+    if let Some(overlays) = project.capture_source_overlays()?.content() {
+        let buffers: Vec<ProjectFile> = OverlayProject::buffers_missing_from(
+            overlays.entries().iter().map(|(file, _)| file.clone()),
+            &files,
+        )
+        .collect();
+        files.extend(buffers);
+    }
+    Ok(Some((Arc::new(files), Arc::new(listing.omissions))))
+}
+
 pub fn collect_workspace_files_with_omissions(root: &Path) -> io::Result<WorkspaceFileListing> {
+    let first = collect_workspace_files_once(root)?;
+    let Ok(before) = &first.ignore_inputs else {
+        return Ok(first);
+    };
+    if !before.needs_confirmation() {
+        return Ok(first);
+    }
+    // One confirmation, never a retry loop. Keep the second observation even
+    // on disagreement so this request returns the freshest complete listing.
+    let mut second = collect_workspace_files_once(root)?;
+    if let Ok(after) = &second.ignore_inputs {
+        let same_matcher = match (
+            first
+                .matcher
+                .as_ref()
+                .expect("one-pass listing captures its matcher"),
+            second
+                .matcher
+                .as_ref()
+                .expect("one-pass listing captures its matcher"),
+        ) {
+            (Ok(left), Ok(right)) => {
+                left.root == right.root && left.rules_digest == right.rules_digest
+            }
+            (Err(error), _) | (_, Err(error)) => {
+                // Retain the complete first error even if the second matcher
+                // succeeds. A second matcher error also remains in its field.
+                second.ignore_inputs = Err(error.clone());
+                return Ok(second);
+            }
+        };
+        let same_listing = first.files == second.files
+            && first.omissions.iter().collect::<BTreeSet<_>>()
+                == second.omissions.iter().collect::<BTreeSet<_>>()
+            && first.symlinks.canonical_root == second.symlinks.canonical_root
+            && first.symlinks.links.iter().collect::<BTreeSet<_>>()
+                == second.symlinks.links.iter().collect::<BTreeSet<_>>()
+            && same_matcher;
+        if !same_listing || !before.same_inputs(after) {
+            second.ignore_inputs = Err(ignore_inputs::unavailable(
+                root,
+                "workspace listing or ignore input identities changed during confirmation",
+            ));
+        }
+    }
+    Ok(second)
+}
+
+fn collect_workspace_files_once(root: &Path) -> io::Result<WorkspaceFileListing> {
+    let mut listing = collect_workspace_listing(root)?;
+    // Include unreadable link paths in rule discovery; they can be the only
+    // entry beneath a directory with a .bifrostignore. Apply this same captured
+    // matcher to their OWN paths, never their targets (#12889).
+    let mut matcher_files = listing.files.clone();
+    matcher_files.extend(
+        listing
+            .symlinks
+            .links
+            .iter()
+            .map(|link| ProjectFile::new(root, &link.path)),
+    );
+    let matcher = capture_ignore_matcher(root, &matcher_files);
+    if let Ok(matcher) = &matcher {
+        listing.omissions.retain(|omission| {
+            omission.reason != WorkspaceFileOmissionReason::UnreadableSymlink
+                || !matcher.is_ignored_path(&omission.path)
+        });
+    }
+    // Receipt refusal is a performance fallback. Preserve its full typed error
+    // in ignore_inputs for callers; it is not a CLI stderr diagnostic.
+    listing.matcher = Some(matcher);
+    Ok(listing)
+}
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_WALK_IGNORE_INPUT_SAMPLE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static BEFORE_IGNORE_INPUT_CAPTURE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+fn collect_workspace_listing(root: &Path) -> io::Result<WorkspaceFileListing> {
+    // Before Git reads any rules, or WalkBuilder constructs its ignore layers.
+    let started = SystemTime::now();
     #[cfg(any(test, feature = "test-support"))]
     super::project_reads::count_project_io(super::project_reads::ProjectIo::Walk);
     let _scope = crate::profiling::scope("project::collect_workspace_files");
-    let owned_paths = AnalyzerOwnedPaths::new(root);
     let mut apply_parent_ignores = true;
     if let Some(repo) = crate::gitblob::discover(root) {
         let workdir = repo
@@ -3148,85 +4094,52 @@ pub fn collect_workspace_files_with_omissions(root: &Path) -> io::Result<Workspa
         let canonical_root = root.canonicalize()?.normalize();
         let canonical_workdir = workdir.canonicalize()?.normalize();
         // An ancestor repository can own this root. The `strip_prefix` filter
-        // below already discards everything outside it, so scoping the
-        // enumeration to the subtree yields the same listing at a cost
-        // proportional to the workspace instead of the ancestor repository.
-        let (active_paths, non_utf8_paths) =
-            match crate::gitblob::subtree_pathspec(&canonical_workdir, &canonical_root) {
-                Some(subtree) => {
-                    crate::gitblob::working_tree_paths_with_non_utf8(&repo, Some(&subtree))
-                }
-                None => crate::gitblob::working_tree_paths_with_non_utf8(&repo, None),
+        // in `git_workspace_listing` already discards everything outside it,
+        // so scoping the enumeration to the subtree yields the same listing at
+        // a cost proportional to the workspace instead of the ancestor
+        // repository.
+        // Capture fixed inputs before native Git status applies them. Path-only
+        // Git enumerations do not need this receipt or its config subprocesses.
+        let pre_inputs = ignore_inputs::git_pre_inputs(workdir).map_err(|error| error.to_string());
+        let scan = crate::gitblob::working_tree_listing_with_inputs(
+            &repo,
+            crate::gitblob::subtree_pathspec(&canonical_workdir, &canonical_root).as_deref(),
+        )
+        .map_err(io::Error::other)?;
+        #[cfg(test)]
+        BEFORE_IGNORE_INPUT_CAPTURE.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
             }
-            .map_err(io::Error::other)?;
-        let mut files = BTreeSet::new();
-        let mut symlinks = Vec::new();
-        let mut omissions: Vec<_> = non_utf8_paths
-            .into_iter()
-            .filter_map(|path| {
-                canonical_workdir
-                    .join(path)
-                    .strip_prefix(&canonical_root)
-                    .ok()
-                    .map(|rel| WorkspaceFileOmission {
-                        path: rel.to_path_buf(),
-                        reason: WorkspaceFileOmissionReason::NonUtf8GitPath,
-                    })
-            })
-            .collect();
-        for rel in active_paths {
-            let absolute = canonical_workdir.join(rel);
-            let Ok(project_rel) = absolute.strip_prefix(&canonical_root) else {
-                continue;
-            };
-            if owned_paths.contains(&absolute) {
-                continue;
-            }
-            if let Ok(metadata) = absolute.symlink_metadata() {
-                let reason = if metadata.file_type().is_symlink() {
-                    let record =
-                        classify_symlink(&canonical_root, &absolute, project_rel.to_path_buf());
-                    let reason = record.reason;
-                    symlinks.push(record);
-                    Some(reason)
-                } else if !metadata.file_type().is_file() {
-                    Some(WorkspaceFileOmissionReason::NonRegular)
-                } else {
-                    None
-                };
-                if let Some(reason) = reason {
-                    omissions.push(WorkspaceFileOmission {
-                        path: project_rel.to_path_buf(),
-                        reason,
-                    });
-                    // Git lists every symlink so that it reaches this
-                    // classification. Only a link to a regular file is read as
-                    // a file. A link to a directory, to a FIFO or device, or to
-                    // nothing readable has no content to analyze, and neither
-                    // has a non-regular entry.
-                    if reason != WorkspaceFileOmissionReason::Symlink {
-                        continue;
-                    }
-                }
-            }
-            files.insert(ProjectFile::new(
-                root.to_path_buf(),
-                project_rel.to_path_buf(),
-            ));
+        });
+        if let Some(listing) = git_workspace_listing(
+            root,
+            &canonical_root,
+            &canonical_workdir,
+            scan.paths,
+            scan.non_utf8,
+        ) {
+            let mut listing = listing;
+            listing.ignore_inputs =
+                ignore_inputs::git_receipt(root, pre_inputs, scan.directories, started);
+            return Ok(listing);
         }
         // An ancestor repository can discover this root while its ignore rules
         // hide the complete subtree. In that case, Git cannot represent the
         // explicitly selected workspace. Walk the selected root instead.
-        if !files.is_empty() {
-            return Ok(WorkspaceFileListing {
-                files,
-                omissions,
-                symlinks: SymlinkTargets::new(canonical_root, symlinks),
-            });
-        }
         apply_parent_ignores = false;
     }
 
+    let mut inputs = ignore_inputs::IgnoreInputs::default();
+    let initial_inputs = ignore_inputs::walk_globals(root, &mut inputs).map(|()| inputs);
+    #[cfg(test)]
+    AFTER_WALK_IGNORE_INPUT_SAMPLE.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+    let walk_inputs = Arc::new(Mutex::new(initial_inputs));
+    let owned_paths = AnalyzerOwnedPaths::new(root);
     let canonical_root = root.canonicalize()?.normalize();
     let walker = WalkBuilder::new(root)
         .hidden(false)
@@ -3287,7 +4200,12 @@ pub fn collect_workspace_files_with_omissions(root: &Path) -> io::Result<Workspa
         WorkspaceFileListing {
             files,
             omissions,
-            symlinks: SymlinkTargets::new(collector_root, links),
+            symlinks: SymlinkTargets::new(collector_root.clone(), links),
+            ignore_inputs: Err(ignore_inputs::unavailable(
+                &collector_root,
+                "walk inputs not captured yet",
+            )),
+            matcher: None,
         }
     });
     let first_error: Arc<Mutex<Option<io::Error>>> = Arc::new(Mutex::new(None));
@@ -3295,6 +4213,7 @@ pub fn collect_workspace_files_with_omissions(root: &Path) -> io::Result<Workspa
         let tx = tx.clone();
         let canonical_root = canonical_root.clone();
         let first_error = Arc::clone(&first_error);
+        let walk_inputs = Arc::clone(&walk_inputs);
         Box::new(move |result| {
             let entry = match result {
                 Ok(entry) => entry,
@@ -3323,6 +4242,22 @@ pub fn collect_workspace_files_with_omissions(root: &Path) -> io::Result<Workspa
                     return WalkState::Continue;
                 }
             };
+            if entry.file_type().is_some_and(|kind| kind.is_dir()) {
+                let mut slot = walk_inputs.lock().expect("walk input lock poisoned");
+                if let Ok(inputs) = slot.as_mut() {
+                    let captured = (|| {
+                        if entry.path() != root && entry.path().join(".git").exists() {
+                            return Err(io::Error::other("nested repository in fallback walk"));
+                        }
+                        inputs.record(entry.path().join(".gitignore"))?;
+                        inputs.record(entry.path().join(".ignore"))?;
+                        inputs.record(entry.path().join(".bifrostignore"))
+                    })();
+                    if let Err(error) = captured {
+                        *slot = Err(error);
+                    }
+                }
+            }
             if entry
                 .file_type()
                 .is_some_and(|file_type| file_type.is_file())
@@ -3370,7 +4305,21 @@ pub fn collect_workspace_files_with_omissions(root: &Path) -> io::Result<Workspa
     // walker thread's clone has also been dropped.
     drop(tx);
 
-    let listing = collector.join().expect("file-collector thread panicked");
+    let mut listing = collector.join().expect("file-collector thread panicked");
+    #[cfg(test)]
+    BEFORE_IGNORE_INPUT_CAPTURE.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+    listing.ignore_inputs = Arc::try_unwrap(walk_inputs)
+        .expect("walk visitors finished")
+        .into_inner()
+        .expect("walk input lock poisoned")
+        .and_then(|inputs| inputs.finish(started))
+        .map_err(|error| {
+            IgnoreObservationError::new(root, IgnoreObservationOperation::Listing, error)
+        });
 
     if let Some(error) = first_error.lock().expect("walk error lock poisoned").take() {
         return Err(io::Error::other(PartialWorkspaceListing {
@@ -3485,6 +4434,106 @@ impl WorkspaceOverlayContent {
     }
 }
 
+/// Process-monotonic identity of one [`PinnedSourceOverlayView`]. It comes from
+/// the project-view counter, is never reused, and is neither an address nor a
+/// content hash, so equal identities mean the same captured view. It names a
+/// captured request input, not a validation receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PinnedSourceOverlayViewId(u64);
+
+/// An immutable, overlay-only capture of a project's source overlays, taken by
+/// [`Project::capture_source_overlays`]. It holds the overlays' shared entries
+/// as they were at capture, so neither a later edit to the project nor a
+/// replacement of an overlay changes what it answers, and reading it never
+/// decodes or hashes source again.
+///
+/// This is a captured request input and nothing more. Its identity, content
+/// metadata and source are what the request reads; they are never a validation
+/// receipt, certificate or proof, and must not be converted into one.
+pub struct PinnedSourceOverlayView {
+    id: PinnedSourceOverlayViewId,
+    content: Option<Arc<WorkspaceOverlayContent>>,
+    entries: HashMap<PathBuf, Arc<OverlayEntry>>,
+}
+
+impl PinnedSourceOverlayView {
+    fn new(
+        content: Option<Arc<WorkspaceOverlayContent>>,
+        entries: HashMap<PathBuf, Arc<OverlayEntry>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            id: PinnedSourceOverlayViewId(next_project_view_id()),
+            content,
+            entries,
+        })
+    }
+
+    fn empty() -> Arc<Self> {
+        Self::new(None, HashMap::new())
+    }
+
+    pub fn identity(&self) -> PinnedSourceOverlayViewId {
+        self.id
+    }
+
+    /// The content identity of the pinned overlay set, or `None` when the
+    /// project has no overlay concept. For a chain of overlay projects it
+    /// covers the inherited and the outer overlays together (the outer one
+    /// winning a shared path), unlike a single project's `overlay_content()`,
+    /// which lists its own overlays only. An overlay outside the project root
+    /// is pinned for `source_snapshot` but has no workspace path to list here.
+    pub fn content(&self) -> Option<Arc<WorkspaceOverlayContent>> {
+        self.content.clone()
+    }
+
+    /// The pinned overlay of `file` with its text, original blob identity and
+    /// overlay revision, or `None` when `file` was not overlaid. Disk and
+    /// delegate content are never consulted.
+    pub fn source_snapshot(&self, file: &ProjectFile) -> Option<ProjectSourceSnapshot> {
+        self.entries
+            .get(&file.abs_path())
+            .map(|entry| entry.snapshot())
+    }
+}
+
+/// Complete metadata, never source: the identity, the content identity and each
+/// overlay's path, revision, blob identity and content digest in path order.
+impl std::fmt::Debug for PinnedSourceOverlayView {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut overlays = self
+            .entries
+            .iter()
+            .map(|(path, entry)| (path, entry.revision, entry.blob_id, entry.content_digest))
+            .collect::<Vec<_>>();
+        overlays.sort();
+        formatter
+            .debug_struct("PinnedSourceOverlayView")
+            .field("id", &self.id)
+            .field("content", &self.content)
+            .field("overlays", &overlays)
+            .finish()
+    }
+}
+
+/// The content identity of the overlays in `overlays`, keyed by workspace
+/// relative path; an overlay outside `root` has no workspace path and is left
+/// out, as it is from the project's own overlay content.
+fn overlay_content_for(
+    root: &Path,
+    overlays: &HashMap<PathBuf, Arc<OverlayEntry>>,
+) -> Arc<WorkspaceOverlayContent> {
+    Arc::new(WorkspaceOverlayContent::new(overlays.iter().filter_map(
+        |(abs_path, entry)| {
+            let rel_path = abs_path.strip_prefix(root).ok()?;
+            Some((
+                ProjectFile::new(root.to_path_buf(), rel_path),
+                entry.content_digest,
+                entry.blob_id,
+            ))
+        },
+    )))
+}
+
 /// A [`Project`] wrapper that layers an in-memory content overlay on top of a
 /// delegate project. Reads consult the overlay first and fall back to the
 /// delegate. Used by the LSP server to feed `textDocument/did{Open,Change}`
@@ -3515,6 +4564,12 @@ pub struct OverlayProject {
     /// only; it never enters the identity.
     overlay_content: Mutex<Option<(u64, Arc<WorkspaceOverlayContent>)>>,
     delegate: Arc<dyn Project>,
+    /// Lock order: when overlay projects are nested, this map's lock is taken
+    /// before the delegate's (outer, then inner). `view_stamp` and
+    /// `capture_source_overlays` hold this guard while they call the delegate,
+    /// and any path that holds both locks must follow that order. The delegate
+    /// must never call back into this project or into a query while it is
+    /// called under this lock.
     overlays: Arc<RwLock<HashMap<PathBuf, Arc<OverlayEntry>>>>,
     /// Process-local allocator shared by every snapshot descended from this
     /// view. Entry revisions must remain unique even when the live view and an
@@ -3596,16 +4651,7 @@ impl OverlayProject {
         let overlays = self.overlays.read().expect("overlay lock poisoned");
         let frozen_overlays = overlays.clone();
         let frozen_generation = self.published_generation.load(Ordering::Acquire);
-        let content = Arc::new(WorkspaceOverlayContent::new(
-            frozen_overlays.iter().filter_map(|(path, entry)| {
-                let rel_path = path.strip_prefix(self.delegate.root()).ok()?;
-                Some((
-                    ProjectFile::new(self.delegate.root().to_path_buf(), rel_path),
-                    entry.content_digest,
-                    entry.blob_id,
-                ))
-            }),
-        ));
+        let content = overlay_content_for(self.delegate.root(), &frozen_overlays);
         super::project_reads::publish_overlays(&Some(content));
         Self {
             project_reads: ProjectReadSlot::default(),
@@ -3757,16 +4803,21 @@ impl OverlayProject {
         language: Language,
         candidates: impl IntoIterator<Item = ProjectFile>,
         analyzable: &mut BTreeSet<ProjectFile>,
-    ) {
-        let additions: Vec<ProjectFile> = Self::buffers_missing_from(
+    ) -> io::Result<()> {
+        let additions = Self::buffers_missing_from(
             candidates
                 .into_iter()
                 .filter(|file| file.language() == language),
             analyzable,
         )
-        .filter(|file| !self.delegate.is_bifrostignored(file.rel_path()))
-        .collect();
-        analyzable.extend(additions);
+        .map(|file| {
+            self.delegate
+                .is_bifrostignored(file.rel_path())
+                .map(|ignored| (!ignored).then_some(file))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+        analyzable.extend(additions.into_iter().flatten());
+        Ok(())
     }
 
     /// Emit a single stderr line reporting that `abs_path` was rejected, but
@@ -3792,6 +4843,9 @@ impl OverlayProject {
 }
 
 impl Project for OverlayProject {
+    fn retained_ignore_observation(&self) -> RetainedIgnoreObservation {
+        self.delegate.retained_ignore_observation()
+    }
     fn directory_entries(&self, parent: &Path) -> io::Result<BTreeSet<ProjectFile>> {
         self.delegate.directory_entries(parent)
     }
@@ -3964,7 +5018,7 @@ impl Project for OverlayProject {
                 .into_iter()
                 .filter(|file| files.contains(file)),
             &mut analyzable,
-        );
+        )?;
         publish_file_set(self, files)?;
         Ok(analyzable)
     }
@@ -4009,7 +5063,21 @@ impl Project for OverlayProject {
         self.delegate.is_gitignored(rel_path)
     }
 
-    fn is_bifrostignored(&self, rel_path: &Path) -> bool {
+    fn ignore_observation_for_files(
+        &self,
+        files: &BTreeSet<ProjectFile>,
+    ) -> Result<IgnoreObservation, IgnoreObservationError> {
+        let mut observation = self.delegate.ignore_observation_for_files(files)?;
+        let overlays = self.overlay_project_files();
+        for (file, ignored) in files.iter().zip(&observation.ignored) {
+            if !ignored && file.language() != Language::None && overlays.contains(file) {
+                observation.selected.insert(file.clone());
+            }
+        }
+        Ok(observation)
+    }
+
+    fn is_bifrostignored(&self, rel_path: &Path) -> Result<bool, IgnoreObservationError> {
         let _project_read = self
             .project_read_slot()
             .map(|slot| slot.ignore_rules(self.as_project()));
@@ -4034,6 +5102,10 @@ impl Project for OverlayProject {
 
     fn update_cached_listing_for_path(&self, rel_path: &Path) -> bool {
         self.delegate.update_cached_listing_for_path(rel_path)
+    }
+
+    fn update_cached_listing_for_removed_paths(&self, files: &[ProjectFile]) -> bool {
+        self.delegate.update_cached_listing_for_removed_paths(files)
     }
 
     fn read_source(&self, file: &ProjectFile) -> io::Result<String> {
@@ -4133,22 +5205,36 @@ impl Project for OverlayProject {
             {
                 break 'answer Some(Arc::clone(content));
             }
-            let root = self.delegate.root();
-            let content = Arc::new(WorkspaceOverlayContent::new(overlays.iter().filter_map(
-                |(abs_path, entry)| {
-                    let rel_path = abs_path.strip_prefix(root).ok()?;
-                    Some((
-                        ProjectFile::new(root.to_path_buf(), rel_path),
-                        entry.content_digest,
-                        entry.blob_id,
-                    ))
-                },
-            )));
+            let content = overlay_content_for(self.delegate.root(), &overlays);
             *memo = Some((revision, Arc::clone(&content)));
             Some(content)
         };
         super::project_reads::publish_overlays(&answer);
         answer
+    }
+
+    fn capture_source_overlays(&self) -> io::Result<Arc<PinnedSourceOverlayView>> {
+        // One instant across the chain. This project's read guard is held while
+        // the delegate is captured (lock order outer, then inner; the delegate
+        // never calls back into this project), so no edit to this project
+        // interleaves with the delegate capture and both pin together. An
+        // unsupported delegate fails the capture here rather than yield a view
+        // that silently lacks its overlays.
+        let overlays = self.overlays.read().expect("overlay lock poisoned");
+        let beneath = self.delegate.capture_source_overlays()?;
+        // Inherited entries first, then this project's, which win a shared
+        // path. Entries are immutable shared allocations: cloning them reads
+        // and hashes no source, and nothing is published to the project-read
+        // receipt, because a request calls this while it holds its entry map.
+        let mut entries = beneath.entries.clone();
+        entries.extend(
+            overlays
+                .iter()
+                .map(|(path, entry)| (path.clone(), Arc::clone(entry))),
+        );
+        drop(overlays);
+        let content = overlay_content_for(self.delegate.root(), &entries);
+        Ok(PinnedSourceOverlayView::new(Some(content), entries))
     }
 
     fn analysis_generation(&self) -> u64 {
@@ -4184,8 +5270,1284 @@ pub fn is_rust_target_layout_main(path: &Path) -> bool {
         })
 }
 
+// nextest isolates each test in a process; these variables are restored
+// before the temporary home is removed. Never invoke git config --global.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub struct IgnoreTestEnvironment(Vec<(&'static str, Option<std::ffi::OsString>)>);
+#[cfg(any(test, feature = "test-support"))]
+impl IgnoreTestEnvironment {
+    pub fn new(home: &Path) -> Self {
+        std::fs::create_dir_all(home.join("xdg/git")).unwrap();
+        let mut saved = Vec::new();
+        for (name, value) in [
+            ("HOME", home.to_path_buf()),
+            ("XDG_CONFIG_HOME", home.join("xdg")),
+            ("GIT_CONFIG_GLOBAL", home.join(".gitconfig")),
+            ("GIT_CONFIG_SYSTEM", home.join("system-config")),
+            ("GIT_CONFIG_NOSYSTEM", PathBuf::from("0")),
+        ] {
+            saved.push((name, std::env::var_os(name)));
+            unsafe {
+                std::env::set_var(name, value);
+            }
+        }
+        Self(saved)
+    }
+}
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for IgnoreTestEnvironment {
+    fn drop(&mut self) {
+        for (name, value) in &self.0 {
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+}
+
+/// Establish old ignore-input timestamps inside an owned temporary parent.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn age_ignore_test_inputs(root: &Path) {
+    // Callers own root's temporary parent and every child below it.
+    let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+    // Timestamps only need a handle, not write access: on Unix the owner may
+    // set them through a read-only handle, and on Windows FILE_WRITE_ATTRIBUTES
+    // (with FILE_FLAG_BACKUP_SEMANTICS for directories) suffices. Opening for
+    // write would fail on read-only files such as git loose objects (#13358).
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.access_mode(0x100).custom_flags(0x02000000);
+    }
+    let mut pending = vec![root.parent().unwrap().to_path_buf()];
+    while let Some(path) = pending.pop() {
+        for entry in std::fs::read_dir(&path).unwrap() {
+            let entry = entry.unwrap();
+            let kind = entry.file_type().unwrap();
+            if kind.is_dir() {
+                pending.push(entry.path());
+            } else if kind.is_file() && entry.metadata().unwrap().modified().unwrap() != old {
+                options
+                    .open(entry.path())
+                    .unwrap()
+                    .set_modified(old)
+                    .unwrap();
+            }
+        }
+        if std::fs::metadata(&path).unwrap().modified().unwrap() != old {
+            options.open(path).unwrap().set_modified(old).unwrap();
+        }
+    }
+    // Unix ctime cannot be backdated; establish a quiet capture window.
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12752: global exclude origins and unset defaults escaped listing validation"
+    )]
+    fn ignore_receipt_global_origin_and_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let _env = IgnoreTestEnvironment::new(&home);
+        let root = temp.path().join("repo");
+        git2::Repository::init(&root).unwrap();
+        std::fs::write(root.join("visible.rs"), "fn f() {}\n").unwrap();
+        age_ignore_test_inputs(&root);
+        let cache = WorkspaceFileListingCache::new(root.clone());
+        {
+            age_ignore_test_inputs(cache.root());
+            cache.files().unwrap()
+        };
+        std::fs::write(home.join("xdg/git/ignore"), "visible.rs\n").unwrap();
+        receipt_update(&cache);
+        assert_eq!(cache.walk_count(), 2);
+        let rules = home.join("rules with spaces");
+        std::fs::write(&rules, "# empty\n").unwrap();
+        std::fs::write(
+            home.join(".gitconfig"),
+            format!("[core]\nexcludesFile = {}\n", git_config_path(&rules)),
+        )
+        .unwrap();
+        receipt_update(&cache);
+        assert_eq!(
+            cache.walk_count(),
+            3,
+            "creating the origin config invalidates an unset key"
+        );
+        assert!(
+            cache
+                .cached
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .ignore_inputs
+                .is_ok()
+        );
+        std::fs::write(&rules, "visible.rs\n").unwrap();
+        receipt_update(&cache);
+        assert_eq!(cache.walk_count(), 4);
+        std::fs::write(
+            home.join(".gitconfig"),
+            "[core]\nexcludesFile = nonexistent\n",
+        )
+        .unwrap();
+        receipt_update(&cache);
+        assert_eq!(cache.walk_count(), 5);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12752: nested repository ignore inputs were silently certified"
+    )]
+    fn ignore_receipt_nested_repository_is_uncertified() {
+        let temp = tempfile::tempdir().unwrap();
+        let _env = IgnoreTestEnvironment::new(&temp.path().join("home"));
+        let root = temp.path().join("repo");
+        git2::Repository::init(&root).unwrap();
+        git2::Repository::init(root.join("nested")).unwrap();
+        std::fs::write(root.join("visible.rs"), "fn f() {}\n").unwrap();
+        std::fs::write(root.join("nested/file.rs"), "fn f() {}\n").unwrap();
+        age_ignore_test_inputs(&root);
+        let cache = WorkspaceFileListingCache::new(root.clone());
+        {
+            age_ignore_test_inputs(cache.root());
+            cache.files().unwrap()
+        };
+        assert!(
+            cache
+                .cached
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .ignore_inputs
+                .is_err()
+        );
+        receipt_update(&cache);
+        assert_eq!(cache.walk_count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12752: an unreadable ignore input was mistaken for an absent candidate"
+    )]
+    fn ignore_receipt_unreadable_input_is_not_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        let _env = IgnoreTestEnvironment::new(&temp.path().join("home"));
+        let root = temp.path().join("repo");
+        git2::Repository::init(&root).unwrap();
+        std::fs::write(root.join("visible.rs"), "fn f() {}\n").unwrap();
+        std::os::unix::fs::symlink("missing-rules", root.join(".gitignore")).unwrap();
+        age_ignore_test_inputs(&root);
+        let cache = WorkspaceFileListingCache::new(root.clone());
+        {
+            age_ignore_test_inputs(cache.root());
+            cache.files().unwrap()
+        };
+        let slot = cache.cached.lock().unwrap();
+        assert_eq!(
+            slot.as_ref()
+                .unwrap()
+                .ignore_inputs
+                .as_ref()
+                .unwrap_err()
+                .cause
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        drop(slot);
+        receipt_update(&cache);
+        receipt_update(&cache);
+        assert_eq!(
+            cache.walk_count(),
+            3,
+            "unreadable input has no receipt and retries on each update"
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12752: included config origins and absent include candidates escaped stat validation"
+    )]
+    fn ignore_receipt_included_config_inputs() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let _env = IgnoreTestEnvironment::new(&home);
+        let root = temp.path().join("repo");
+        git2::Repository::init(&root).unwrap();
+        std::fs::write(root.join("visible.rs"), "fn f() {}\n").unwrap();
+        std::fs::write(home.join(".gitconfig"), "[include]\npath = extra-config\n").unwrap();
+        age_ignore_test_inputs(&root);
+        let cache = WorkspaceFileListingCache::new(root.clone());
+        {
+            age_ignore_test_inputs(cache.root());
+            cache.files().unwrap()
+        };
+        assert!(
+            cache
+                .cached
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .ignore_inputs
+                .is_ok()
+        );
+        std::fs::write(
+            home.join("extra-config"),
+            "[core]\nexcludesFile = nonexistent\n",
+        )
+        .unwrap();
+        receipt_update(&cache);
+        assert_eq!(cache.walk_count(), 2);
+        std::fs::write(
+            home.join("extra-config"),
+            "[core]\nexcludesFile = other-nonexistent\n",
+        )
+        .unwrap();
+        receipt_update(&cache);
+        assert_eq!(cache.walk_count(), 3);
+        receipt_update(&cache);
+        assert_eq!(cache.walk_count(), 3);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12752: subtree listings stat-ed relative excludes against the workspace instead of Git workdir"
+    )]
+    fn ignore_receipt_subtree_relative_global_excludes() {
+        let temp = tempfile::tempdir().unwrap();
+        let _env = IgnoreTestEnvironment::new(&temp.path().join("home"));
+        let root = temp.path().join("repo");
+        let repo = git2::Repository::init(&root).unwrap();
+        let subtree = root.join("subtree");
+        std::fs::create_dir_all(&subtree).unwrap();
+        std::fs::write(subtree.join("visible.rs"), "fn f() {}\n").unwrap();
+        std::fs::write(subtree.join("anchor.txt"), "keep Git listing nonempty\n").unwrap();
+        std::fs::write(root.join("local-ignore"), "# initially visible\n").unwrap();
+        repo.config()
+            .unwrap()
+            .set_str("core.excludesFile", "local-ignore")
+            .unwrap();
+        age_ignore_test_inputs(&root);
+        let cache = WorkspaceFileListingCache::new(subtree.clone());
+        assert!(
+            cache
+                .files()
+                .unwrap()
+                .contains(&ProjectFile::new(&subtree, "visible.rs"))
+        );
+        assert!(
+            cache
+                .cached
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .ignore_inputs
+                .is_ok()
+        );
+        std::fs::write(root.join("local-ignore"), "visible.rs\n").unwrap();
+        receipt_update(&cache);
+        assert_eq!(cache.walk_count(), 2);
+        assert!(
+            !cache
+                .files()
+                .unwrap()
+                .contains(&ProjectFile::new(&subtree, "visible.rs"))
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12752: a rule changed after Git read it was certified with its new stat identity"
+    )]
+    fn ignore_receipt_enumeration_race_retries_next_update() {
+        let temp = tempfile::tempdir().unwrap();
+        let _env = IgnoreTestEnvironment::new(&temp.path().join("home"));
+        let root = temp.path().join("repo");
+        git2::Repository::init(&root).unwrap();
+        std::fs::write(root.join("visible.rs"), "fn f() {}\n").unwrap();
+        std::fs::write(root.join("anchor.txt"), "anchor\n").unwrap();
+        std::fs::write(root.join(".gitignore"), "# visible\n").unwrap();
+        age_ignore_test_inputs(&root);
+        let rule = root.join(".gitignore");
+        BEFORE_IGNORE_INPUT_CAPTURE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                std::fs::write(rule, "visible.rs\n").unwrap();
+            }))
+        });
+        age_ignore_test_inputs(&root);
+        let cache = WorkspaceFileListingCache::new(root.clone());
+        assert!(
+            cache
+                .files()
+                .unwrap()
+                .contains(&ProjectFile::new(&root, "visible.rs"))
+        );
+        assert!(
+            cache
+                .cached
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .ignore_inputs
+                .is_err()
+        );
+        receipt_update(&cache);
+        assert_eq!(cache.walk_count(), 2);
+        assert!(
+            !cache
+                .files()
+                .unwrap()
+                .contains(&ProjectFile::new(&root, "visible.rs"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12752: mtime-preserving rule writes escaped receipt validation"
+    )]
+    fn ignore_receipt_preserved_mtime_write_invalidates() {
+        let temp = tempfile::tempdir().unwrap();
+        let _env = IgnoreTestEnvironment::new(&temp.path().join("home"));
+        let root = temp.path().join("repo");
+        git2::Repository::init(&root).unwrap();
+        std::fs::write(root.join("visible.rs"), "fn f() {}").unwrap();
+        let rule = root.join(".gitignore");
+        std::fs::write(&rule, "#visible.rs\n").unwrap();
+        age_ignore_test_inputs(&root);
+        let cache = WorkspaceFileListingCache::new(root.clone());
+        cache.files().unwrap();
+        let old = std::fs::metadata(&rule).unwrap().modified().unwrap();
+        std::fs::write(&rule, "visible.rs \n").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(rule)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        cache.revalidate_symlink_omissions(&BTreeSet::new());
+        assert!(
+            !cache
+                .files()
+                .unwrap()
+                .contains(&ProjectFile::new(&root, "visible.rs"))
+        );
+        assert_eq!(cache.walk_count(), 2);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12752: an exclude deleted before capture appeared absent twice and certified stale membership"
+    )]
+    fn ignore_receipt_deleted_exclude_during_enumeration_retries() {
+        let temp = tempfile::tempdir().unwrap();
+        let _env = IgnoreTestEnvironment::new(&temp.path().join("home"));
+        let root = temp.path().join("repo");
+        let repo = git2::Repository::init(&root).unwrap();
+        std::fs::write(root.join("hidden.rs"), "fn f() {}\n").unwrap();
+        std::fs::write(root.join("anchor.txt"), "anchor\n").unwrap();
+        let exclude = repo.commondir().join("info/exclude");
+        std::fs::write(&exclude, "hidden.rs\n").unwrap();
+        age_ignore_test_inputs(&root);
+        BEFORE_IGNORE_INPUT_CAPTURE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                std::fs::remove_file(exclude).unwrap();
+            }));
+        });
+        let cache = WorkspaceFileListingCache::new(root.clone());
+        assert!(
+            !cache
+                .files()
+                .unwrap()
+                .contains(&ProjectFile::new(&root, "hidden.rs"))
+        );
+        assert!(
+            cache
+                .cached
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .ignore_inputs
+                .is_err()
+        );
+        receipt_update(&cache);
+        assert_eq!(cache.walk_count(), 2);
+        assert!(
+            cache
+                .files()
+                .unwrap()
+                .contains(&ProjectFile::new(&root, "hidden.rs"))
+        );
+        assert!(
+            cache
+                .cached
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .ignore_inputs
+                .is_ok()
+        );
+        // Unrelated churn after capture is not part of receipt validation.
+        std::fs::write(root.join(".git/info/unrelated"), "churn").unwrap();
+        cache.revalidate_symlink_omissions(&BTreeSet::new());
+        cache.files().unwrap();
+        assert_eq!(cache.walk_count(), 2);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12752: creating an absent system config could change excludes without invalidating the listing"
+    )]
+    fn ignore_receipt_system_config_creation_invalidates() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let _env = IgnoreTestEnvironment::new(&home);
+        let root = temp.path().join("repo");
+        git2::Repository::init(&root).unwrap();
+        std::fs::write(root.join("visible.rs"), "fn f() {}\n").unwrap();
+        std::fs::write(root.join("anchor.txt"), "anchor\n").unwrap();
+        let rules = home.join("system-ignore");
+        std::fs::write(&rules, "visible.rs\n").unwrap();
+        age_ignore_test_inputs(&root);
+        age_ignore_test_inputs(&root);
+        let cache = WorkspaceFileListingCache::new(root.clone());
+        cache.files().unwrap();
+        assert!(
+            cache
+                .cached
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .ignore_inputs
+                .is_ok()
+        );
+        std::fs::write(
+            home.join("system-config"),
+            format!("[core]\nexcludesFile = {}\n", git_config_path(&rules)),
+        )
+        .unwrap();
+        receipt_update(&cache);
+        assert_eq!(cache.walk_count(), 2);
+        assert!(
+            !cache
+                .files()
+                .unwrap()
+                .contains(&ProjectFile::new(&root, "visible.rs"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12752: lossy non-UTF-8 ignored directory names produced a falsely complete census"
+    )]
+    fn ignore_receipt_non_utf8_ignored_directory_is_uncertified() {
+        use std::os::unix::ffi::OsStringExt;
+        let temp = tempfile::tempdir().unwrap();
+        let _env = IgnoreTestEnvironment::new(&temp.path().join("home"));
+        let root = temp.path().join("repo");
+        git2::Repository::init(&root).unwrap();
+        let directory = root.join(std::ffi::OsString::from_vec(b"dir-\xff".to_vec()));
+        match std::fs::create_dir(&directory) {
+            Ok(()) => {}
+            // APFS refuses non-UTF-8 names with EILSEQ (#10379). Such a
+            // filesystem cannot hold the name this test needs, so nothing
+            // remains to check there.
+            Err(error) if error.raw_os_error() == Some(libc::EILSEQ) => return,
+            Err(error) => panic!("non-UTF-8 directory: {error:?}"),
+        }
+        std::fs::write(directory.join("hidden.tmp"), "hidden").unwrap();
+        std::fs::write(root.join(".gitignore"), "*.tmp\n").unwrap();
+        std::fs::write(root.join("visible.rs"), "fn f() {}\n").unwrap();
+        age_ignore_test_inputs(&root);
+        age_ignore_test_inputs(&root);
+        let cache = WorkspaceFileListingCache::new(root.clone());
+        cache.files().unwrap();
+        assert!(
+            cache
+                .cached
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .ignore_inputs
+                .is_err()
+        );
+        receipt_update(&cache);
+        assert_eq!(cache.walk_count(), 2);
+    }
+
+    // nextest isolates each test in a process; these variables are restored
+    // before the temporary home is removed. Never invoke git config --global.
+
+    fn capture_with_pre_known_change(
+        change: impl FnOnce(PathBuf) + 'static,
+    ) -> WorkspaceFileListing {
+        let temp = tempfile::tempdir().unwrap();
+        // Symlinked temp roots (macOS /var) keep the parent proxy by design.
+        // Normalize the canonical root: on Windows it is verbatim (`\\?\C:\`),
+        // and Git for Windows cannot open HOME or GIT_CONFIG_* paths with
+        // that prefix, so git status fails before the capture is observed.
+        let home = temp.path().canonicalize().unwrap().normalize().join("home");
+        let _env = IgnoreTestEnvironment::new(&home);
+        let root = temp.path().join("repo");
+        git2::Repository::init(&root).unwrap();
+        write_file(&root, "visible.rs", "fn f() {}\n");
+        write_file(&home, "system-config", "");
+        write_file(&home, "ignore", "*.tmp\n");
+        write_file(
+            &home,
+            ".gitconfig",
+            &format!(
+                "[core]\nexcludesFile = {}\n",
+                git_config_path(&home.join("ignore"))
+            ),
+        );
+        age_ignore_test_inputs(&root);
+        BEFORE_IGNORE_INPUT_CAPTURE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || change(home)));
+        });
+        collect_workspace_listing(&root).unwrap()
+    }
+
+    fn quiet_proxy_test_directory(case: &str) -> TempDir {
+        // Certification needs stable ancestors too. Parallel tests churn the
+        // default temp directory; use the existing quiet receipt-test tree.
+        #[cfg(unix)]
+        let base = PathBuf::from("/var/tmp/bifrost-ignore-receipt-tests/13309");
+        #[cfg(windows)]
+        let base = std::env::temp_dir()
+            .parent()
+            .expect("temporary directory has a parent")
+            .join("bifrost-ignore-receipt-tests/13309");
+        // Initialize every case before any capture so another case starting
+        // does not change an ancestor shared with an active walk.
+        for name in [
+            "recent-parent",
+            "parent-churn",
+            "ancestor-change",
+            "restored-mtime",
+            "transient-rule",
+            "harmless-rule",
+        ] {
+            std::fs::create_dir_all(base.join(name)).unwrap();
+        }
+        tempfile::Builder::new()
+            .prefix("bifrost-receipt-test-")
+            .tempdir_in(base.join(case))
+            .unwrap()
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#13309: churn in a workspace's parent directory refused the ignore-input receipt and printed to stderr"
+    )]
+    fn ignore_receipt_recent_stable_parent_certifies() {
+        let temp = quiet_proxy_test_directory("recent-parent");
+        let parent = temp.path().canonicalize().unwrap();
+        let _env = IgnoreTestEnvironment::new(&parent.join("home"));
+        let root = parent.join("workspace");
+        write_file(&root, "visible.rs", "fn f() {}\n");
+        age_ignore_test_inputs(&root);
+        // Churn ends immediately before the pre-walk sample: recent is safe
+        // when stable, whereas the previous two-second cutoff refused this.
+        let sibling = parent.join("sibling");
+        std::thread::spawn(move || {
+            for _ in 0..100 {
+                std::fs::write(&sibling, "churn").unwrap();
+                std::fs::remove_file(&sibling).unwrap();
+            }
+        })
+        .join()
+        .unwrap();
+        let modified = std::fs::metadata(&parent).unwrap().modified().unwrap();
+        assert!(modified.elapsed().unwrap() < Duration::from_secs(2));
+        let listing = collect_workspace_files_with_omissions(&root).unwrap();
+        assert!(listing.ignore_inputs.is_ok(), "{:?}", listing.ignore_inputs);
+    }
+
+    #[test]
+    fn ignore_receipt_parent_churn_during_capture_is_typed_refusal() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let temp = quiet_proxy_test_directory("parent-churn");
+        let parent = temp.path().canonicalize().unwrap();
+        let _env = IgnoreTestEnvironment::new(&parent.join("home"));
+        let root = parent.join("workspace");
+        write_file(&root, "visible.rs", "fn f() {}\n");
+        age_ignore_test_inputs(&root);
+        let stop = Arc::new(AtomicBool::new(false));
+        let cycles = Arc::new(AtomicUsize::new(0));
+        let worker_stop = Arc::clone(&stop);
+        let worker_cycles = Arc::clone(&cycles);
+        let sibling = parent.join("sibling");
+        let worker = std::thread::spawn(move || {
+            while !worker_stop.load(Ordering::SeqCst) {
+                std::fs::write(&sibling, "churn").unwrap();
+                std::fs::remove_file(&sibling).unwrap();
+                worker_cycles.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        while cycles.load(Ordering::SeqCst) == 0 {
+            std::thread::yield_now();
+        }
+        BEFORE_IGNORE_INPUT_CAPTURE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let before = cycles.load(Ordering::SeqCst);
+                // Cross even coarse timestamp ticks after the pre-walk sample.
+                std::thread::sleep(Duration::from_millis(2100));
+                assert!(cycles.load(Ordering::SeqCst) > before);
+            }));
+        });
+        let result = collect_workspace_files_with_omissions(&root);
+        stop.store(true, Ordering::SeqCst);
+        worker.join().unwrap();
+        let listing = result.unwrap();
+        let error = listing.ignore_inputs.unwrap_err();
+        assert_eq!(error.operation, IgnoreObservationOperation::Listing);
+        assert!(
+            error
+                .to_string()
+                .contains("directory changed during capture"),
+            "{error}"
+        );
+    }
+
+    fn capture_transient_ancestor_rule(case: &str, rule: &'static str) -> WorkspaceFileListing {
+        let temp = quiet_proxy_test_directory(case);
+        let parent = temp.path().canonicalize().unwrap();
+        let _env = IgnoreTestEnvironment::new(&parent.join("home"));
+        let root = parent.join("workspace");
+        write_file(&root, "visible.rs", "fn f() {}\n");
+        age_ignore_test_inputs(&root);
+        // The proxy is recent, yet the original candidate sample sees absence.
+        let sibling = parent.join("recent-churn");
+        std::fs::write(&sibling, "churn").unwrap();
+        std::fs::remove_file(sibling).unwrap();
+        let modified =
+            filetime::FileTime::from_last_modification_time(&std::fs::metadata(&parent).unwrap());
+        let _coarse_tick = ignore_inputs::coarse_proxy_for_test(&parent);
+        let ignore = parent.join(".gitignore");
+        let delete_ignore = ignore.clone();
+        AFTER_WALK_IGNORE_INPUT_SAMPLE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                // Built-in .ignore is disabled; .gitignore is an applied
+                // ancestor source in the product's require_git(false) walk.
+                std::fs::write(ignore, rule).unwrap();
+            }));
+        });
+        BEFORE_IGNORE_INPUT_CAPTURE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                std::fs::remove_file(delete_ignore).unwrap();
+                filetime::set_file_mtime(parent, modified).unwrap();
+            }));
+        });
+        collect_workspace_files_with_omissions(&root).unwrap()
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#13309: a transient ancestor ignore rule read during capture was certified on a coarse-ctime filesystem"
+    )]
+    fn ignore_receipt_transient_ancestor_rule_returns_second_listing_uncertified() {
+        let listing = capture_transient_ancestor_rule("transient-rule", "visible.rs\n");
+        assert!(
+            listing
+                .files
+                .iter()
+                .any(|file| file.rel_path() == Path::new("visible.rs"))
+        );
+        let error = listing.ignore_inputs.unwrap_err();
+        assert_eq!(error.operation, IgnoreObservationOperation::Listing);
+        assert!(
+            error.to_string().contains("changed during confirmation"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn ignore_receipt_harmless_transient_ancestor_rule_can_certify() {
+        let listing = capture_transient_ancestor_rule("harmless-rule", "does-not-exist\n");
+        assert!(
+            listing
+                .files
+                .iter()
+                .any(|file| file.rel_path() == Path::new("visible.rs"))
+        );
+        assert!(listing.ignore_inputs.is_ok(), "{:?}", listing.ignore_inputs);
+    }
+
+    #[test]
+    fn ignore_receipt_ancestor_ignore_created_deleted_during_walk_refuses() {
+        let temp = quiet_proxy_test_directory("ancestor-change");
+        let parent = temp.path().canonicalize().unwrap();
+        let _env = IgnoreTestEnvironment::new(&parent.join("home"));
+        let root = parent.join("workspace");
+        write_file(&root, "visible.rs", "fn f() {}\n");
+        age_ignore_test_inputs(&root);
+        BEFORE_IGNORE_INPUT_CAPTURE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                // The hook is between the pre-walk sample and finish.
+                std::thread::sleep(Duration::from_millis(2100));
+                let ignore = parent.join(".ignore");
+                std::fs::write(&ignore, "*.rs\n").unwrap();
+                std::fs::remove_file(ignore).unwrap();
+            }));
+        });
+        assert!(
+            collect_workspace_files_with_omissions(&root)
+                .unwrap()
+                .ignore_inputs
+                .is_err()
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#13309: a same-tick candidate creation hidden by an unchanged proxy mtime must still invalidate"
+    )]
+    fn ignore_receipt_candidate_creation_with_restored_proxy_mtime_invalidates() {
+        let temp = quiet_proxy_test_directory("restored-mtime");
+        let parent = temp.path().canonicalize().unwrap();
+        let _env = IgnoreTestEnvironment::new(&parent.join("home"));
+        let root = parent.join("workspace");
+        write_file(&root, "visible.rs", "fn f() {}\n");
+        age_ignore_test_inputs(&root);
+        let receipt = collect_workspace_files_with_omissions(&root)
+            .unwrap()
+            .ignore_inputs
+            .unwrap();
+        let before =
+            filetime::FileTime::from_last_modification_time(&std::fs::metadata(&parent).unwrap());
+        std::fs::write(parent.join(".ignore"), "*.rs\n").unwrap();
+        filetime::set_file_mtime(&parent, before).unwrap();
+        assert_eq!(
+            filetime::FileTime::from_last_modification_time(&std::fs::metadata(&parent).unwrap()),
+            before
+        );
+        assert!(!receipt.valid().unwrap());
+    }
+
+    #[test]
+    fn ignore_receipt_pre_known_config_modified_during_capture() {
+        let listing = capture_with_pre_known_change(|home| {
+            std::fs::write(home.join(".gitconfig"), "[core]\nexcludesFile = other\n").unwrap();
+        });
+        assert!(listing.ignore_inputs.is_err());
+    }
+
+    #[test]
+    fn ignore_receipt_pre_known_config_replaced_during_capture() {
+        let listing = capture_with_pre_known_change(|home| {
+            let config = home.join(".gitconfig");
+            std::fs::copy(&config, home.join("replacement")).unwrap();
+            std::fs::rename(home.join("replacement"), config).unwrap();
+        });
+        assert!(listing.ignore_inputs.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12752: a symlinked config redirected and restored during capture was certified"
+    )]
+    fn ignore_receipt_symlinked_config_redirected_during_capture() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap().join("home");
+        let _env = IgnoreTestEnvironment::new(&home);
+        let root = temp.path().join("repo");
+        git2::Repository::init(&root).unwrap();
+        write_file(&root, "visible.rs", "fn f() {}\n");
+        write_file(&home, "system-config", "");
+        write_file(&home, "ignore", "*.tmp\n");
+        write_file(
+            &home,
+            "real-config",
+            &format!(
+                "[core]\nexcludesFile = {}\n",
+                git_config_path(&home.join("ignore"))
+            ),
+        );
+        write_file(&home, "other-config", "[core]\nexcludesFile = other\n");
+        let config = home.join(".gitconfig");
+        std::os::unix::fs::symlink(home.join("real-config"), &config).unwrap();
+        age_ignore_test_inputs(&root);
+        // Redirect the link and restore it after the reader ran: the final
+        // file's identity is unchanged, so only the link's directory shows it.
+        BEFORE_IGNORE_INPUT_CAPTURE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                std::fs::remove_file(&config).unwrap();
+                std::os::unix::fs::symlink(home.join("other-config"), &config).unwrap();
+                std::fs::remove_file(&config).unwrap();
+                std::os::unix::fs::symlink(home.join("real-config"), &config).unwrap();
+            }));
+        });
+        let listing = collect_workspace_listing(&root).unwrap();
+        assert!(listing.ignore_inputs.is_err());
+    }
+
+    #[test]
+    fn ignore_receipt_pre_known_config_renamed_aside_and_back_during_capture() {
+        // The original inode returns, but rename moves its ctime, which the
+        // identity compares.
+        let listing = capture_with_pre_known_change(|home| {
+            let config = home.join(".gitconfig");
+            std::fs::rename(&config, home.join("aside")).unwrap();
+            std::fs::write(&config, "[core]\nexcludesFile = other\n").unwrap();
+            std::fs::rename(home.join("aside"), &config).unwrap();
+        });
+        assert!(listing.ignore_inputs.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12752: an excludes file reached through a redirected ancestor symlink was certified"
+    )]
+    fn ignore_receipt_ancestor_symlink_redirected_during_capture() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap().join("home");
+        let _env = IgnoreTestEnvironment::new(&home);
+        let root = temp.path().join("repo");
+        git2::Repository::init(&root).unwrap();
+        write_file(&root, "visible.rs", "fn f() {}\n");
+        write_file(&home, "system-config", "");
+        write_file(&home.join("real"), "ignore", "*.tmp\n");
+        write_file(&home.join("other"), "ignore", "*.rs\n");
+        let links = home.join("links");
+        std::os::unix::fs::symlink(home.join("real"), &links).unwrap();
+        write_file(
+            &home,
+            ".gitconfig",
+            &format!(
+                "[core]\nexcludesFile = {}\n",
+                git_config_path(&links.join("ignore"))
+            ),
+        );
+        age_ignore_test_inputs(&root);
+        // Only HOME, which contains the link, shows the redirect; the input's
+        // own parent resolves to the unchanged target directory.
+        BEFORE_IGNORE_INPUT_CAPTURE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                std::fs::remove_file(&links).unwrap();
+                std::os::unix::fs::symlink(home.join("other"), &links).unwrap();
+                std::fs::remove_file(&links).unwrap();
+                std::os::unix::fs::symlink(home.join("real"), &links).unwrap();
+            }));
+        });
+        let listing = collect_workspace_listing(&root).unwrap();
+        assert!(listing.ignore_inputs.is_err());
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon("#12752: HOME churn made every receipt capture Unknown")]
+    fn ignore_receipt_pre_known_config_survives_home_churn() {
+        let listing = capture_with_pre_known_change(|home| {
+            std::fs::write(home.join("unrelated"), "churn").unwrap();
+            std::fs::write(home.join("unrelated"), "more churn").unwrap();
+        });
+        assert!(listing.ignore_inputs.is_ok(), "{:?}", listing.ignore_inputs);
+    }
+
+    #[test]
+    fn ignore_receipt_absent_pre_known_config_created_read_deleted_during_capture() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let _env = IgnoreTestEnvironment::new(&home);
+        let root = temp.path().join("repo");
+        git2::Repository::init(&root).unwrap();
+        write_file(&root, "visible.rs", "fn f() {}\n");
+        age_ignore_test_inputs(&root);
+        BEFORE_IGNORE_INPUT_CAPTURE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let config = home.join(".gitconfig");
+                std::fs::write(&config, "[core]\nexcludesFile = ignore\n").unwrap();
+                assert!(!std::fs::read(&config).unwrap().is_empty());
+                std::fs::remove_file(config).unwrap();
+            }));
+        });
+        assert!(
+            collect_workspace_listing(&root)
+                .unwrap()
+                .ignore_inputs
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    fn refill_until_ignore_receipt_certified(cache: &Arc<WorkspaceFileListingCache>) {
+        let project =
+            FilesystemProject::with_cached_listing(cache.root(), Arc::clone(cache)).unwrap();
+        for attempt in 1..=5 {
+            cache.invalidate();
+            cache.listing().unwrap();
+            match project.retained_ignore_observation() {
+                RetainedIgnoreObservation::Ok => return,
+                RetainedIgnoreObservation::Failed(cause) => {
+                    assert!(
+                        attempt < 5,
+                        "ignore receipt never certified after {attempt} fills: {cause}"
+                    );
+                }
+                observation => panic!("filled listing has no ignore receipt: {observation:?}"),
+            }
+            // #13114: absent ancestor inputs still use shared directory mtimes.
+            // Let sibling activity age beyond the receipt's two-second window.
+            std::thread::sleep(Duration::from_millis(2100));
+        }
+    }
+
+    /// Spell `path` as a quoted Git config value. Git and libgit2 read a
+    /// backslash in a value as an escape and reject `\U`, so an unquoted
+    /// Windows path makes the whole config file unparseable.
+    fn git_config_path(path: &Path) -> String {
+        let path = path.to_str().expect("test paths are UTF-8");
+        format!("\"{}\"", path.replace('\\', "\\\\").replace('"', "\\\""))
+    }
+
+    fn receipt_update(cache: &WorkspaceFileListingCache) {
+        age_ignore_test_inputs(cache.root());
+        cache.revalidate_symlink_omissions(&BTreeSet::new());
+        cache.files().unwrap();
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12752: ignore rule edits without watcher events retained stale membership"
+    )]
+    fn ignore_receipt_git_inputs_edit_create_delete() {
+        let temp = tempfile::tempdir().unwrap();
+        let _env = IgnoreTestEnvironment::new(&temp.path().join("home"));
+        let root = temp.path().join("repo");
+        let repo = git2::Repository::init(&root).unwrap();
+        std::fs::create_dir_all(root.join("nested/deep")).unwrap();
+        std::fs::write(root.join("visible.rs"), "fn f() {}\n").unwrap();
+        std::fs::write(root.join("nested/deep/hide.rs"), "fn f() {}\n").unwrap();
+        let global = temp.path().join("global-ignore");
+        repo.config()
+            .unwrap()
+            .set_str("core.excludesFile", global.to_str().unwrap())
+            .unwrap();
+        let cache = WorkspaceFileListingCache::new(root.clone());
+        for input in [
+            root.join(".gitignore"),
+            root.join("nested/.gitignore"),
+            repo.path().join("info/exclude"),
+            global,
+        ] {
+            if input.exists() {
+                std::fs::remove_file(&input).unwrap();
+            }
+            cache.invalidate();
+            age_ignore_test_inputs(cache.root());
+            cache.files().unwrap();
+            assert!(
+                cache
+                    .cached
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .ignore_inputs
+                    .is_ok()
+            );
+            let walks = cache.walk_count();
+            std::fs::write(&input, "hide.rs\n").unwrap();
+            receipt_update(&cache);
+            assert_eq!(cache.walk_count(), walks + 1, "create {}", input.display());
+            std::fs::write(&input, "# reveal all files again\n").unwrap();
+            receipt_update(&cache);
+            assert_eq!(cache.walk_count(), walks + 2, "edit {}", input.display());
+            std::fs::remove_file(&input).unwrap();
+            receipt_update(&cache);
+            assert_eq!(cache.walk_count(), walks + 3, "delete {}", input.display());
+            receipt_update(&cache);
+            assert_eq!(cache.walk_count(), walks + 3, "plain update");
+        }
+        let walks = cache.walk_count();
+        repo.config()
+            .unwrap()
+            .set_str(
+                "core.excludesFile",
+                temp.path().join("different-ignore").to_str().unwrap(),
+            )
+            .unwrap();
+        receipt_update(&cache);
+        assert_eq!(cache.walk_count(), walks + 1, "origin config edit");
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12752: ignored nested rule files and intermediate absent candidates escaped the census"
+    )]
+    fn ignore_receipt_ignored_rules_and_intermediate_ancestors() {
+        let temp = tempfile::tempdir().unwrap();
+        let _env = IgnoreTestEnvironment::new(&temp.path().join("home"));
+        let root = temp.path().join("repo");
+        git2::Repository::init(&root).unwrap();
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        std::fs::create_dir_all(root.join("middle/deep")).unwrap();
+        std::fs::create_dir_all(root.join("excluded")).unwrap();
+        std::fs::write(root.join(".gitignore"), ".gitignore\nexcluded/\n").unwrap();
+        std::fs::write(root.join("nested/.gitignore"), "*.tmp\n").unwrap();
+        std::fs::write(root.join("nested/hidden.tmp"), "hidden").unwrap();
+        std::fs::write(root.join("middle/deep/visible.rs"), "fn f() {}\n").unwrap();
+        std::fs::write(root.join("excluded/hidden.rs"), "hidden").unwrap();
+        let cache = WorkspaceFileListingCache::new(root.clone());
+        age_ignore_test_inputs(cache.root());
+        let files = cache.files().unwrap();
+        assert_eq!(
+            files.len(),
+            1,
+            "ignored entries never become members: {files:?}"
+        );
+        assert!(
+            cache
+                .cached
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .ignore_inputs
+                .is_ok()
+        );
+        let walks = cache.walk_count();
+        std::fs::write(root.join("excluded/.gitignore"), "*\n").unwrap();
+        receipt_update(&cache);
+        assert_eq!(
+            cache.walk_count(),
+            walks,
+            "rules below collapsed ignored directory are not applied"
+        );
+        std::fs::write(root.join("nested/.gitignore"), "*.tmp\n# changed\n").unwrap();
+        receipt_update(&cache);
+        assert_eq!(cache.walk_count(), walks + 1);
+        std::fs::write(root.join("middle/.gitignore"), "*.rs\n").unwrap();
+        receipt_update(&cache);
+        assert_eq!(
+            cache.walk_count(),
+            walks + 2,
+            "intermediate ancestor has no direct files"
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12752: submodule ignore inputs were certified without an enumerable scope"
+    )]
+    fn ignore_receipt_submodule_has_no_receipt_and_relists() {
+        let temp = tempfile::tempdir().unwrap();
+        let _env = IgnoreTestEnvironment::new(&temp.path().join("home"));
+        let root = temp.path().join("repo");
+        let repo = git2::Repository::init(&root).unwrap();
+        std::fs::write(root.join("visible.rs"), "fn f() {}\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index
+            .add(&git2::IndexEntry {
+                ctime: git2::IndexTime::new(0, 0),
+                mtime: git2::IndexTime::new(0, 0),
+                dev: 0,
+                ino: 0,
+                mode: 0o160000,
+                uid: 0,
+                gid: 0,
+                file_size: 0,
+                id: git2::Oid::from_str("1111111111111111111111111111111111111111").unwrap(),
+                flags: 0,
+                flags_extended: 0,
+                path: b"submodule".to_vec(),
+            })
+            .unwrap();
+        index.write().unwrap();
+        let cache = WorkspaceFileListingCache::new(root.clone());
+        age_ignore_test_inputs(cache.root());
+        cache.files().unwrap();
+        assert!(
+            cache
+                .cached
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .ignore_inputs
+                .is_err()
+        );
+        receipt_update(&cache);
+        receipt_update(&cache);
+        assert_eq!(cache.walk_count(), 3);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12752: fallback directory ignore candidates were not validated on explicit updates"
+    )]
+    fn ignore_receipt_walk_inputs_and_global_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let _env = IgnoreTestEnvironment::new(&home);
+        let root = temp.path().join("tree");
+        std::fs::create_dir_all(root.join("middle/deep")).unwrap();
+        std::fs::write(root.join("middle/deep/visible.rs"), "fn f() {}\n").unwrap();
+        let cache = WorkspaceFileListingCache::new(root.clone());
+        age_ignore_test_inputs(cache.root());
+        cache.files().unwrap();
+        for (n, input) in [
+            root.join("middle/.gitignore"),
+            root.join("middle/.ignore"),
+            home.join("xdg/git/ignore"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            std::fs::write(input, "# candidate created\n").unwrap();
+            receipt_update(&cache);
+            assert_eq!(cache.walk_count(), n + 2);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12889: ignored broken links emitted omissions while target ignores hid visible links"
+    )]
+    fn ignore_receipt_broken_link_own_path_suppresses_omission() {
+        let temp = tempfile::tempdir().unwrap();
+        let temp_root = temp.path().canonicalize().unwrap();
+        let _env = IgnoreTestEnvironment::new(&temp_root.join("home"));
+        let root = temp_root.join("tree");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(".bifrostignore"), "hidden-link\nignored/\n").unwrap();
+        std::os::unix::fs::symlink("missing", root.join("hidden-link")).unwrap();
+        let cache = Arc::new(WorkspaceFileListingCache::new(root.clone()));
+        let project = FilesystemProject::with_cached_listing(&root, Arc::clone(&cache)).unwrap();
+        let (files, omissions) = project.all_files_with_omissions().unwrap();
+        assert!(omissions.is_empty(), "{omissions:?}");
+        assert!(
+            super::super::project_reads::file_set_receipt(&project, &files)
+                .unwrap()
+                .incomplete
+                .is_none()
+        );
+        std::os::unix::fs::symlink("ignored/missing", root.join("visible-link")).unwrap();
+        cache.invalidate();
+        let (_, omissions) = project.all_files_with_omissions().unwrap();
+        assert_eq!(omissions.len(), 1);
+        assert_eq!(omissions[0].path, Path::new("visible-link"));
+        assert_eq!(
+            omissions[0].reason,
+            WorkspaceFileOmissionReason::UnreadableSymlink
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12889: receipt construction reacquired the matcher for every file"
+    )]
+    fn ignore_receipt_bulk_acquires_once_without_walking() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        for n in 0..128 {
+            std::fs::write(root.join(format!("file{n}.rs")), "fn f() {}\n").unwrap();
+        }
+        let cache = Arc::new(WorkspaceFileListingCache::new(root.clone()));
+        let project = FilesystemProject::with_cached_listing(&root, Arc::clone(&cache)).unwrap();
+        let files = cache.files().unwrap();
+        let walks = cache.walk_count();
+        let acquisitions = MATCHER_ACQUISITIONS.with(std::cell::Cell::get);
+        let receipt = super::super::project_reads::file_set_receipt(&project, &files).unwrap();
+        assert!(receipt.listing.is_some());
+        assert_eq!(
+            MATCHER_ACQUISITIONS.with(std::cell::Cell::get) - acquisitions,
+            1
+        );
+        assert_eq!(cache.walk_count(), walks);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12752: retained ignore failures could not be inspected without refreshing"
+    )]
+    fn ignore_receipt_retained_failure_never_walks() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let cache = Arc::new(WorkspaceFileListingCache::new(root.clone()));
+        let project = FilesystemProject::with_cached_listing(&root, Arc::clone(&cache)).unwrap();
+        std::fs::write(root.join(".bifrostignore"), "[z-a]\n").unwrap();
+        project.invalidate_cached_file_listing();
+        assert!(project.is_bifrostignored(Path::new("a.rs")).is_err());
+        let walks = cache.walk_count();
+        for _ in 0..3 {
+            let RetainedIgnoreObservation::Failed(cause) = project.retained_ignore_observation()
+            else {
+                panic!("missing retained failure")
+            };
+            assert_eq!(cause.operation, IgnoreObservationOperation::Matcher);
+            assert!(!cause.cause.to_string().is_empty());
+        }
+        assert_eq!(cache.walk_count(), walks);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12889: failed matcher acquisition retried and logged for every path"
+    )]
+    fn ignore_receipt_failure_logs_once_per_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("a.rs"), "fn a() {}\n").unwrap();
+        let cache = Arc::new(WorkspaceFileListingCache::new(root.clone()));
+        let project = FilesystemProject::with_cached_listing(&root, Arc::clone(&cache)).unwrap();
+        std::fs::write(root.join(".bifrostignore"), "[z-a]\n").unwrap();
+        let before = IGNORE_FAILURE_LOGS.with(std::cell::Cell::get);
+        for generation in 1..=2 {
+            project.invalidate_cached_file_listing();
+            for _ in 0..8 {
+                assert!(project.is_bifrostignored(Path::new("a.rs")).is_err());
+            }
+            assert_eq!(
+                IGNORE_FAILURE_LOGS.with(std::cell::Cell::get) - before,
+                generation
+            );
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn retention_census_does_not_populate_a_cold_workspace_listing() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = Arc::new(WorkspaceFileListingCache::new(root.path().to_path_buf()));
+        let mut census = crate::retention_census::RetentionCensus::new();
+        cache.retention_census_for_test(&mut census);
+        let report = census.finish();
+        assert_eq!(cache.walks.load(Ordering::Relaxed), 0);
+        assert!(cache.cached.lock().unwrap().is_none());
+        assert_eq!(report.resident_readings[0].count, 0);
+        assert!(
+            !report
+                .allocation_groups
+                .iter()
+                .any(|group| group.kind == Some("workspace_listing_file_set_header"))
+        );
+    }
+
     use super::*;
     use crate::test_support::write_file;
     use std::sync::mpsc;
@@ -4302,8 +6664,19 @@ mod tests {
         "#10321: a multi-root project never rechecked its children's symlinks after a target-only change"
     )]
     fn multi_root_revalidation_reaches_the_child_that_owns_the_changed_target() {
-        let temp = TempDir::new().unwrap();
-        let root = temp.path().canonicalize().unwrap();
+        // #13114: non-git walks still proxy absent ancestor inputs. Keep
+        // these roots off the busy default temporary directory.
+        let quiet_parent = Path::new("/var/tmp/bifrost-ignore-receipt-tests");
+        // Initialize both stable parents before capture to reduce sibling
+        // churn. Certification retries below handle shared ancestor activity.
+        for name in ["multi-root", "symlinks"] {
+            std::fs::create_dir_all(quiet_parent.join(name)).unwrap();
+        }
+        let temp = TempDir::new_in(quiet_parent.join("multi-root")).unwrap();
+        let root = temp.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let _env = IgnoreTestEnvironment::new(&temp.path().join("home"));
         let mut children = Vec::new();
         let mut caches = Vec::new();
         for name in ["first", "second"] {
@@ -4323,6 +6696,12 @@ mod tests {
             languages: BTreeSet::new(),
             persistence_dir: None,
         };
+
+        // Allow the discovered inputs and absent ancestor proxies to age.
+        age_ignore_test_inputs(&root);
+        for cache in &caches {
+            refill_until_ignore_receipt_certified(cache);
+        }
 
         // The changed path is named from the common root; the second child
         // and a path under no child are not affected by it.
@@ -4399,6 +6778,36 @@ mod tests {
             project.0.workspace_file_listing_count(),
             1,
             "language filtering and listing receipts must reuse the caller's one listing"
+        );
+    }
+
+    #[test]
+    fn file_set_constructors_state_what_their_listing_omits() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let omissions = |project: &FileSetProject| {
+            project
+                .all_files_with_omissions()
+                .unwrap()
+                .1
+                .iter()
+                .map(|omission| omission.reason)
+                .collect::<Vec<_>>()
+        };
+        let files = || ["a.ts"].map(PathBuf::from);
+        // A subset fails closed: it cannot show what the rest of the workspace holds.
+        assert_eq!(
+            omissions(&FileSetProject::new(&root, files())),
+            [WorkspaceFileOmissionReason::Unknown]
+        );
+        // An authoritative listing states its own.
+        let linked = WorkspaceFileOmission {
+            path: PathBuf::from("linked"),
+            reason: WorkspaceFileOmissionReason::SymlinkToDirectory,
+        };
+        assert_eq!(
+            omissions(&FileSetProject::from_listing(&root, files(), vec![linked])),
+            [WorkspaceFileOmissionReason::SymlinkToDirectory]
         );
     }
 
@@ -4518,6 +6927,8 @@ mod tests {
         struct CustomSourceProject {
             delegate: TestProject,
             reads: AtomicUsize,
+            advertised: Mutex<Option<Arc<WorkspaceOverlayContent>>>,
+            probe_frames: Mutex<Vec<(bool, bool)>>,
         }
 
         impl Project for CustomSourceProject {
@@ -4552,6 +6963,14 @@ mod tests {
                 let source = self.read_source(file)?;
                 Ok((source.len() <= max_bytes).then_some(source))
             }
+            // Advertises what the test sets and records the frame it is probed in.
+            fn overlay_content(&self) -> Option<Arc<WorkspaceOverlayContent>> {
+                self.probe_frames.lock().unwrap().push((
+                    crate::analyzer::project_reads::project_reads_suppressed(),
+                    crate::analyzer::project_reads::project_getter_in_progress(),
+                ));
+                self.advertised.lock().unwrap().clone()
+            }
         }
 
         let temp = TempDir::new().unwrap();
@@ -4560,6 +6979,8 @@ mod tests {
         let project = CustomSourceProject {
             delegate: TestProject::new(&root, Language::Java),
             reads: AtomicUsize::new(0),
+            advertised: Mutex::new(None),
+            probe_frames: Mutex::new(Vec::new()),
         };
         let expected = ProjectSourceSnapshot::disk("class Custom {}");
         // Pin the snapshot's fields against independent values first, so the
@@ -4586,6 +7007,40 @@ mod tests {
             Some(expected)
         );
         assert_eq!(project.reads.load(Ordering::Relaxed), 2);
+
+        // Default overlay capture of a custom project. Nothing advertised pins
+        // an empty view; an advertised set it cannot pin fails closed. The
+        // probe runs in a suppressed, nested read frame, and an outer read's
+        // receipt survives it (the sentinel is cached in the receipt, so only a
+        // wiped or replaced receipt would recompute it from the now-absent path).
+        use crate::analyzer::project_reads::{WorkspacePathKind, observed_path_kind};
+        let sentinel = write_file(&root, "sentinel.txt", "present").abs_path();
+        assert_eq!(observed_path_kind(&sentinel), WorkspacePathKind::File);
+        std::fs::remove_file(&sentinel).unwrap();
+        let empty = project.capture_source_overlays().unwrap();
+        assert!(empty.content().is_none() && empty.source_snapshot(&file).is_none());
+        *project.advertised.lock().unwrap() = Some(Arc::new(WorkspaceOverlayContent::new([(
+            file.clone(),
+            [7; 32],
+            Oid::hash_object(ObjectType::Blob, b"class Overlay {}").unwrap(),
+        )])));
+        let error = project.capture_source_overlays().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert_eq!(
+            *project.probe_frames.lock().unwrap(),
+            [(true, true), (true, true)],
+            "each probe is suppressed and nested, so no recorder callback can fire"
+        );
+        assert!(
+            !crate::analyzer::project_reads::project_reads_suppressed()
+                && !crate::analyzer::project_reads::project_getter_in_progress(),
+            "the caller's read frame is restored"
+        );
+        assert_eq!(
+            observed_path_kind(&sentinel),
+            WorkspacePathKind::File,
+            "the outer read's receipt survives the probe"
+        );
     }
 
     #[test]
@@ -4784,8 +7239,19 @@ mod tests {
     )]
     fn symlink_revalidation_rechecks_only_links_a_change_can_affect() {
         use super::super::project_reads::measure_project_io;
-        let temp = TempDir::new().unwrap();
-        let root = temp.path().canonicalize().unwrap();
+        // #13114: non-git walks still proxy absent ancestor inputs. Keep
+        // these roots off the busy default temporary directory.
+        let quiet_parent = Path::new("/var/tmp/bifrost-ignore-receipt-tests");
+        // Initialize both stable parents before capture to reduce sibling
+        // churn. Certification retries below handle shared ancestor activity.
+        for name in ["multi-root", "symlinks"] {
+            std::fs::create_dir_all(quiet_parent.join(name)).unwrap();
+        }
+        let temp = TempDir::new_in(quiet_parent.join("symlinks")).unwrap();
+        let root = temp.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let _env = IgnoreTestEnvironment::new(&temp.path().join("home"));
         let outside = TempDir::new().unwrap();
         write_file(&root, "unrelated.txt", "unrelated\n");
         write_file(&root, "sub/inner.txt", "inner\n");
@@ -4804,8 +7270,11 @@ mod tests {
             root.join("external.link"),
         )
         .unwrap();
-        let cache = WorkspaceFileListingCache::new(root.clone());
+        let cache = Arc::new(WorkspaceFileListingCache::new(root.clone()));
         cache.listing().unwrap();
+        // Allow the discovered inputs and absent ancestor proxies to age.
+        age_ignore_test_inputs(&root);
+        refill_until_ignore_receipt_certified(&cache);
         let changed = |paths: &[&str]| -> BTreeSet<ProjectFile> {
             paths
                 .iter()
@@ -4962,6 +7431,268 @@ mod tests {
         }));
     }
 
+    #[cfg(unix)]
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12447: a listed file replaced by a dangling symlink was patched out as a deletion, losing its omission"
+    )]
+    fn listed_file_replaced_by_dangling_symlink_relists_with_its_omission() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        write_file(&root, "kept.rs", "fn kept() {}\n");
+        write_file(&root, "replaced.rs", "fn replaced() {}\n");
+        let cache = Arc::new(WorkspaceFileListingCache::new(root.clone()));
+        let project = FilesystemProject::with_cached_listing(&root, Arc::clone(&cache)).unwrap();
+        let mut listing = project.all_files_with_omissions().unwrap();
+        assert_eq!(cache.walk_count(), 1);
+
+        let replaced = ProjectFile::new(&root, "replaced.rs");
+        std::fs::remove_file(replaced.abs_path()).unwrap();
+        std::os::unix::fs::symlink(root.join("missing.rs"), replaced.abs_path()).unwrap();
+        resolve_update_paths_with_refresh(
+            &project,
+            &BTreeSet::from([replaced.clone()]),
+            &mut listing,
+            &|_| false,
+        )
+        .unwrap();
+
+        assert_eq!(cache.walk_count(), 2, "a new symlink needs enumeration");
+        assert!(!listing.0.contains(&replaced));
+        assert!(listing.1.iter().any(|omission| {
+            omission.path == Path::new("replaced.rs")
+                && omission.reason == WorkspaceFileOmissionReason::UnreadableSymlink
+        }));
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12447: a listed file replaced by a directory stayed a member after a point update"
+    )]
+    fn listed_file_replaced_by_directory_relists() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        write_file(&root, "kept.rs", "fn kept() {}\n");
+        write_file(&root, "replaced.rs", "fn replaced() {}\n");
+        let cache = Arc::new(WorkspaceFileListingCache::new(root.clone()));
+        let project = FilesystemProject::with_cached_listing(&root, Arc::clone(&cache)).unwrap();
+        let mut listing = project.all_files_with_omissions().unwrap();
+        assert_eq!(cache.walk_count(), 1);
+
+        let replaced = ProjectFile::new(&root, "replaced.rs");
+        std::fs::remove_file(replaced.abs_path()).unwrap();
+        std::fs::create_dir(replaced.abs_path()).unwrap();
+        write_file(&root, "replaced.rs/nested.rs", "fn nested() {}\n");
+        resolve_update_paths_with_refresh(
+            &project,
+            &BTreeSet::from([replaced.clone()]),
+            &mut listing,
+            &|_| false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            cache.walk_count(),
+            2,
+            "a directory replacement needs enumeration"
+        );
+        assert!(!listing.0.contains(&replaced));
+        assert!(
+            listing
+                .0
+                .contains(&ProjectFile::new(&root, "replaced.rs/nested.rs"))
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12447: a directory replaced by a file aborted the update instead of removing its children"
+    )]
+    fn directory_replaced_by_file_patches_children_out_without_walking() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        write_file(&root, "kept.rs", "fn kept() {}\n");
+        write_file(&root, "old/child.rs", "fn child() {}\n");
+        let cache = Arc::new(WorkspaceFileListingCache::new(root.clone()));
+        let project = FilesystemProject::with_cached_listing(&root, Arc::clone(&cache)).unwrap();
+        let mut listing = project.all_files_with_omissions().unwrap();
+        assert_eq!(cache.walk_count(), 1);
+
+        let child = ProjectFile::new(&root, "old/child.rs");
+        let replacement = ProjectFile::new(&root, "old");
+        std::fs::remove_dir_all(root.join("old")).unwrap();
+        write_file(&root, "old", "now a file\n");
+        resolve_update_paths_with_refresh(
+            &project,
+            &BTreeSet::from([child.clone(), replacement.clone()]),
+            &mut listing,
+            &|_| false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            cache.walk_count(),
+            1,
+            "the replacement and its removed children are patched in place"
+        );
+        assert!(!listing.0.contains(&child));
+        assert!(listing.0.contains(&replacement));
+        assert!(listing.0.contains(&ProjectFile::new(&root, "kept.rs")));
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12447: a directory deletion reported without its children left every former child listed"
+    )]
+    fn removed_directory_reported_without_children_relists() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        write_file(&root, "kept.rs", "fn kept() {}\n");
+        write_file(&root, "old/child.rs", "fn child() {}\n");
+        let cache = Arc::new(WorkspaceFileListingCache::new(root.clone()));
+        let project = FilesystemProject::with_cached_listing(&root, Arc::clone(&cache)).unwrap();
+        let mut listing = project.all_files_with_omissions().unwrap();
+        assert_eq!(cache.walk_count(), 1);
+
+        let child = ProjectFile::new(&root, "old/child.rs");
+        std::fs::remove_dir_all(root.join("old")).unwrap();
+        resolve_update_paths_with_refresh(
+            &project,
+            &BTreeSet::from([ProjectFile::new(&root, "old")]),
+            &mut listing,
+            &|_| false,
+        )
+        .unwrap();
+
+        assert_eq!(cache.walk_count(), 2, "a directory removal needs a walk");
+        assert!(!listing.0.contains(&child));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12447: deleting a directory with only an omitted symlink left its stale omission"
+    )]
+    fn removed_directory_with_only_omitted_symlink_relists() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        write_file(&root, "kept.rs", "fn kept() {}\n");
+        std::fs::create_dir(root.join("old")).unwrap();
+        std::os::unix::fs::symlink(root.join("missing.rs"), root.join("old/link.rs")).unwrap();
+        let cache = Arc::new(WorkspaceFileListingCache::new(root.clone()));
+        let project = FilesystemProject::with_cached_listing(&root, Arc::clone(&cache)).unwrap();
+        let mut listing = project.all_files_with_omissions().unwrap();
+        assert_eq!(cache.walk_count(), 1);
+        assert!(
+            listing
+                .1
+                .iter()
+                .any(|omission| omission.path == Path::new("old/link.rs"))
+        );
+
+        std::fs::remove_dir_all(root.join("old")).unwrap();
+        resolve_update_paths_with_refresh(
+            &project,
+            &BTreeSet::from([ProjectFile::new(&root, "old")]),
+            &mut listing,
+            &|_| false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            cache.walk_count(),
+            2,
+            "a removed omission needs enumeration"
+        );
+        assert!(
+            !listing
+                .1
+                .iter()
+                .any(|omission| omission.path.starts_with("old"))
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12447: removing the last listed file under a .bifrostignore kept its rules, so the receipt differed from a fresh listing"
+    )]
+    fn removing_last_file_under_ignore_rules_relists() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        write_file(&root, ".gitignore", "sub/.bifrostignore\n");
+        write_file(&root, "sub/.bifrostignore", "ignored.rs\n");
+        write_file(&root, "sub/a.rs", "fn a() {}\n");
+        write_file(&root, "plain/b.rs", "fn b() {}\n");
+        write_file(&root, "plain/c.rs", "fn c() {}\n");
+        let cache = Arc::new(WorkspaceFileListingCache::new(root.clone()));
+        let project = FilesystemProject::with_cached_listing(&root, Arc::clone(&cache)).unwrap();
+        let mut listing = project.all_files_with_omissions().unwrap();
+        assert_eq!(cache.walk_count(), 1);
+        assert!(
+            !listing
+                .0
+                .contains(&ProjectFile::new(&root, "sub/.bifrostignore"))
+        );
+
+        // A directory without rules is patched in place.
+        let plain = ProjectFile::new(&root, "plain/b.rs");
+        std::fs::remove_file(plain.abs_path()).unwrap();
+        resolve_update_paths_with_refresh(
+            &project,
+            &BTreeSet::from([plain]),
+            &mut listing,
+            &|_| false,
+        )
+        .unwrap();
+        assert_eq!(cache.walk_count(), 1);
+
+        // Emptying the rule-bearing directory re-lists.
+        let last = ProjectFile::new(&root, "sub/a.rs");
+        std::fs::remove_file(last.abs_path()).unwrap();
+        resolve_update_paths_with_refresh(
+            &project,
+            &BTreeSet::from([last.clone()]),
+            &mut listing,
+            &|_| false,
+        )
+        .unwrap();
+        assert_eq!(cache.walk_count(), 2);
+        assert!(!listing.0.contains(&last));
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12447: a watcher point deletion kept ignore rules that a fresh listing drops"
+    )]
+    fn point_removal_of_last_file_under_ignore_rules_relists() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let repo = crate::gitblob::test_repo::init_repo(&root);
+        write_file(&root, "kept.rs", "fn kept() {}\n");
+        write_file(&root, ".gitignore", "sub/.bifrostignore\n");
+        write_file(&root, "sub/.bifrostignore", "ignored.rs\n");
+        write_file(&root, "sub/a.rs", "fn a() {}\n");
+        crate::gitblob::test_repo::commit_all(&repo, "track point removal");
+        let cache = Arc::new(WorkspaceFileListingCache::new(root.clone()));
+        let project = FilesystemProject::with_cached_listing(&root, Arc::clone(&cache)).unwrap();
+        project.all_files_with_omissions().unwrap();
+        assert_eq!(cache.walk_count(), 1);
+        let before = project.ignore_rules_digest().unwrap();
+
+        std::fs::remove_file(root.join("sub/a.rs")).unwrap();
+        assert!(
+            !project.update_cached_listing_for_path(Path::new("sub/a.rs")),
+            "a point removal that empties a rule-bearing directory must re-list"
+        );
+        project.invalidate_cached_file_listing();
+        let fresh = FilesystemProject::new(&root).unwrap();
+        assert_ne!(before, fresh.ignore_rules_digest().unwrap());
+        assert_eq!(
+            project.ignore_rules_digest().unwrap(),
+            fresh.ignore_rules_digest().unwrap()
+        );
+    }
+
     #[test]
     fn collect_project_files_maps_tracked_ignored_files_into_subdirectory_workspace() {
         let temp = TempDir::new().unwrap();
@@ -5073,6 +7804,141 @@ mod tests {
         assert!(cache.files().unwrap().contains(&generated));
     }
 
+    fn omissions_by_path(
+        omissions: &[WorkspaceFileOmission],
+    ) -> Vec<(PathBuf, WorkspaceFileOmissionReason)> {
+        let mut omissions: Vec<_> = omissions
+            .iter()
+            .map(|omission| (omission.path.clone(), omission.reason))
+            .collect();
+        omissions.sort_by(|left, right| left.0.cmp(&right.0));
+        omissions
+    }
+
+    fn identity_of(root: &Path) -> crate::gitblob::WorkingTreeIdentity {
+        crate::gitblob::working_tree_identity(&git2::Repository::open(root).unwrap()).unwrap()
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11890: a Windows verbatim identity workdir made the identity listing empty"
+    )]
+    fn identity_listing_matches_the_workspace_listing() {
+        // The project root is the plain normalized spelling. The identity is
+        // opened through the temporary directory's own spelling, which is a
+        // symbolic link on macOS and canonicalizes to a verbatim `\\?\` path
+        // on Windows; the two must still describe the same files.
+        let temp = TempDir::new().unwrap();
+        #[cfg(windows)]
+        assert!(
+            temp.path()
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(r"\\?\"),
+            "Windows canonicalizes to a verbatim path, the spelling this test pins"
+        );
+        let repo = crate::gitblob::test_repo::init_repo(temp.path());
+        write_file(temp.path(), "package.json", "{}\n");
+        write_file(temp.path(), "package-lock.json", "{}\n");
+        write_file(temp.path(), "deleted.json", "{}\n");
+        write_file(temp.path(), ".gitignore", "ignored/\n");
+        write_file(temp.path(), "ignored/package.json", "{}\n");
+        crate::gitblob::test_repo::commit_all(&repo, "init");
+        write_file(temp.path(), "package.json", "{\"changed\":true}\n");
+        std::fs::remove_file(temp.path().join("deleted.json")).unwrap();
+        write_file(temp.path(), "untracked.json", "{}\n");
+        write_file(temp.path(), ".bifrost/cache/package.json", "{}\n");
+        #[cfg(unix)]
+        {
+            std::fs::create_dir_all(temp.path().join("dir")).unwrap();
+            std::os::unix::fs::symlink("dir", temp.path().join("dir-link")).unwrap();
+            std::os::unix::fs::symlink("package.json", temp.path().join("file-link")).unwrap();
+        }
+        let project = FilesystemProject::new(temp.path()).unwrap();
+        let identity = identity_of(temp.path());
+
+        let assert_agrees = |context: &str| {
+            let (files, omissions) = workspace_listing_from_identity(&project, &identity)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{context}: the identity describes this root"));
+            let walked = collect_workspace_files_with_omissions(project.root()).unwrap();
+            assert_eq!(*files, walked.files, "{context}");
+            assert_eq!(
+                omissions_by_path(&omissions),
+                omissions_by_path(&walked.omissions),
+                "{context}"
+            );
+        };
+        assert_agrees("at the scan");
+
+        // A later explicit invalidation adds membership the scan cannot know
+        // about, and a removed invalidated path loses it.
+        write_file(temp.path(), "added.json", "{}\n");
+        std::fs::remove_file(temp.path().join("untracked.json")).unwrap();
+        identity.invalidate_paths(["added.json".to_owned(), "untracked.json".to_owned()]);
+        assert_agrees("after invalidation");
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11890: the identity listing dropped an unsaved overlay-only package.json"
+    )]
+    fn identity_listing_keeps_an_overlay_project_s_unsaved_buffers() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap().normalize();
+        let repo = crate::gitblob::test_repo::init_repo(&root);
+        write_file(&root, "src/index.js", "export {};\n");
+        write_file(&root, ".gitignore", "ignored/\n");
+        write_file(&root, "ignored/package.json", "{}\n");
+        crate::gitblob::test_repo::commit_all(&repo, "init");
+        let overlay = OverlayProject::new(Arc::new(FilesystemProject::new(&root).unwrap()));
+        // A new manifest that exists only in the editor, and a buffer over an
+        // ignored file, which a buffer does not bring into the workspace.
+        let unsaved = ProjectFile::new(root.clone(), "package.json");
+        assert!(overlay.set(unsaved.abs_path(), "{\"name\":\"app\"}\n".to_string()));
+        assert!(overlay.set(root.join("ignored/package.json"), "{}\n".to_string()));
+
+        let (files, _) = workspace_listing_from_identity(&overlay, &identity_of(&root))
+            .unwrap()
+            .expect("the identity describes this root");
+        assert!(files.contains(&unsaved));
+        assert_eq!(files, overlay.all_files_with_omissions().unwrap().0);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11890: the identity listing emptied an ignored root and widened a subset project"
+    )]
+    fn identity_listing_defers_to_a_project_it_cannot_describe() {
+        let temp = TempDir::new().unwrap();
+        let ancestor = temp.path().canonicalize().unwrap().normalize();
+        let repo = crate::gitblob::test_repo::init_repo(&ancestor);
+        write_file(&ancestor, ".gitignore", "workspace/\n");
+        write_file(&ancestor, "tracked.rs", "fn tracked() {}\n");
+        crate::gitblob::test_repo::commit_all(&repo, "init");
+        write_file(&ancestor, "workspace/package.json", "{}\n");
+        let identity = identity_of(&ancestor);
+
+        // The ancestor's ignore rules hide the whole selected root, so Git
+        // names nothing there; the project's listing walks the root instead.
+        let ignored = FilesystemProject::new(ancestor.join("workspace")).unwrap();
+        assert!(!ignored.all_files().unwrap().is_empty());
+        assert!(
+            workspace_listing_from_identity(&ignored, &identity)
+                .unwrap()
+                .is_none()
+        );
+
+        // A subset project lists its explicit files, not the worktree.
+        let subset = FileSetProject::new(ancestor.clone(), [PathBuf::from("tracked.rs")]);
+        assert!(
+            workspace_listing_from_identity(&subset, &identity)
+                .unwrap()
+                .is_none()
+        );
+    }
+
     #[brokk_bifrost_test_macros::hardwon(
         "#2542: cached constructor listings hid newly added Kotlin source after invalidation"
     )]
@@ -5116,7 +7982,7 @@ mod tests {
         let vendored = write_file(&root, "vendor/x.rs", "fn x() {}\n");
         let project = FilesystemProject::new(&root).unwrap();
 
-        assert!(project.is_bifrostignored(Path::new("vendor/x.rs")));
+        assert!(project.is_bifrostignored(Path::new("vendor/x.rs")).unwrap());
         assert_eq!(
             BTreeSet::from([kept.clone()]),
             project.analyzable_files(Language::Rust).unwrap()
@@ -5125,8 +7991,8 @@ mod tests {
         write_file(&root, ".bifrostignore", "a.rs\n");
         project.invalidate_cached_file_listing();
 
-        assert!(!project.is_bifrostignored(Path::new("vendor/x.rs")));
-        assert!(project.is_bifrostignored(Path::new("a.rs")));
+        assert!(!project.is_bifrostignored(Path::new("vendor/x.rs")).unwrap());
+        assert!(project.is_bifrostignored(Path::new("a.rs")).unwrap());
         assert_eq!(
             BTreeSet::from([vendored]),
             project.analyzable_files(Language::Rust).unwrap()
@@ -5152,8 +8018,12 @@ mod tests {
         // The discovery fill already compiled the matcher. Probes must use
         // those same rules without asking for another listing.
         for _ in 0..8 {
-            assert!(project.is_bifrostignored(Path::new("vendor/skipped.rs")));
-            assert!(!project.is_bifrostignored(Path::new("kept.rs")));
+            assert!(
+                project
+                    .is_bifrostignored(Path::new("vendor/skipped.rs"))
+                    .unwrap()
+            );
+            assert!(!project.is_bifrostignored(Path::new("kept.rs")).unwrap());
         }
 
         assert_eq!(
@@ -5267,7 +8137,7 @@ mod tests {
         let project = FilesystemProject::new(&root).unwrap();
         let disagreements: Vec<(&str, bool)> = TREE
             .iter()
-            .map(|rel| (*rel, project.is_bifrostignored(Path::new(rel))))
+            .map(|rel| (*rel, project.is_bifrostignored(Path::new(rel)).unwrap()))
             .filter(|(rel, ignored)| *ignored == git_kept.contains(Path::new(rel)))
             .collect();
         assert!(
@@ -5295,18 +8165,18 @@ mod tests {
     /// UTF-8, so here Bifrost deliberately differs from Git. Rules that cannot
     /// be read must not be taken for "no rules": the analyzable listing fails
     /// with the read error instead of analyzing files the user excluded. The
-    /// single-path probe returns a bool and answers "not ignored", which is its
-    /// documented fail-open choice; answering "ignored" would make an overlay
-    /// drop every buffer.
+    /// single-path probe must preserve the same failure rather than classify
+    /// the path as visible or ignored.
     #[test]
-    fn unreadable_bifrostignore_fails_listing_and_ignores_nothing() {
+    #[brokk_bifrost_test_macros::hardwon("#12889: unreadable rules classified paths as visible")]
+    fn ignore_receipt_unreadable_bifrostignore_fails_selection_and_classification() {
         let temp = TempDir::new().unwrap();
         let root = temp.path().canonicalize().unwrap().normalize();
         write_file(&root, "a.rs", "fn a() {}\n");
         let project = FilesystemProject::new(&root).unwrap();
         std::fs::write(root.join(BIFROST_IGNORE_FILE_NAME), b"vendor/\n\xff\xfe\n").unwrap();
         project.invalidate_cached_file_listing();
-        assert!(!project.is_bifrostignored(Path::new("a.rs")));
+        assert!(project.is_bifrostignored(Path::new("a.rs")).is_err());
         let error = project.analyzable_files(Language::Rust).unwrap_err();
         assert_eq!(io::ErrorKind::InvalidData, error.kind(), "{error}");
         // Construction also fills the listing and reads its rule inputs.
@@ -5598,6 +8468,18 @@ mod tests {
             ProjectSourceOrigin::Overlay(revision) => revision,
             ProjectSourceOrigin::Disk => panic!("snapshot should retain its overlay"),
         };
+        let other = write_file(&root, "other.rs", "fn other() {}\n");
+        let pinned = (&overlay as &dyn Project)
+            .capture_source_overlays()
+            .unwrap();
+        let again = (&overlay as &dyn Project)
+            .capture_source_overlays()
+            .unwrap();
+        assert_ne!(pinned.identity(), again.identity());
+        assert_eq!(
+            pinned.content().unwrap().digest(),
+            snapshot.overlay_content().unwrap().digest()
+        );
         assert!(overlay.set(file.abs_path(), "fn second() {}\n".to_string()));
 
         assert_eq!(snapshot.read_source(&file).unwrap(), "fn first() {}\n");
@@ -5612,6 +8494,246 @@ mod tests {
             snapshot.read_source_snapshot(&file).unwrap().origin(),
             ProjectSourceOrigin::Overlay(frozen_revision)
         );
+
+        // The pinned view kept the replaced overlay's text, revision and
+        // identity, answers overlays only, and a project with none pins none.
+        let captured = pinned.source_snapshot(&file).unwrap();
+        assert_eq!(captured.source(), "fn first() {}\n");
+        assert_eq!(
+            captured.origin(),
+            ProjectSourceOrigin::Overlay(frozen_revision)
+        );
+        assert_eq!(
+            captured.oid(),
+            Oid::hash_object(ObjectType::Blob, b"fn first() {}\n").unwrap(),
+            "the pinned overlay keeps the original blob identity"
+        );
+        // A capture after the replacement sees the replacement, with its own
+        // revision and identity; the earlier view is untouched.
+        let fresh = (&overlay as &dyn Project)
+            .capture_source_overlays()
+            .unwrap();
+        assert_ne!(fresh.identity(), pinned.identity());
+        let replaced = fresh.source_snapshot(&file).unwrap();
+        assert_eq!(replaced.source(), "fn second() {}\n");
+        assert_ne!(replaced.origin(), captured.origin());
+        assert_ne!(replaced.oid(), captured.oid());
+        assert_eq!(pinned.source_snapshot(&file).unwrap(), captured);
+        assert!(pinned.source_snapshot(&other).is_none());
+        let disk = FilesystemProject::new(&root).unwrap();
+        let empty = disk.capture_source_overlays().unwrap();
+        assert!(empty.content().is_none());
+        assert!(empty.source_snapshot(&file).is_none());
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9737: a nested overlay capture pinned the inner and outer overlays from different instants"
+    )]
+    fn overlay_chain_capture_is_coherent_and_deadlock_free_under_concurrent_edits() {
+        const ROUNDS: usize = 300;
+        type Views = Vec<Arc<PinnedSourceOverlayView>>;
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let shared = write_file(&root, "shared.rs", "fn disk() {}\n");
+        let inner_only = write_file(&root, "inner.rs", "fn disk() {}\n");
+        let outer_only = write_file(&root, "outer.rs", "fn disk() {}\n");
+        let beyond = TempDir::new().unwrap();
+        let outside = ProjectFile::new(beyond.path().canonicalize().unwrap(), "outside.rs");
+        let inner = Arc::new(OverlayProject::new(Arc::new(
+            FilesystemProject::new(&root).unwrap(),
+        )));
+        let outer = Arc::new(OverlayProject::new(inner.clone()));
+        let text = |owner: &str, version: usize| format!("fn {owner}_{version}() {{}}\n");
+        for (project, file, owner) in [
+            (&inner, &shared, "inner"),
+            (&inner, &inner_only, "inner"),
+            (&inner, &outside, "inner"),
+            (&outer, &shared, "outer"),
+            (&outer, &outer_only, "outer"),
+        ] {
+            assert!(project.set(file.abs_path(), text(owner, 0)));
+        }
+
+        // Lock order. With the delegate's map write-locked, the capture waits
+        // on it while holding this project's read guard, so an outer edit
+        // queued meanwhile lands after the pinned instant.
+        let inner_guard = inner.overlays.write().unwrap();
+        let capturing = {
+            let outer = Arc::clone(&outer);
+            thread::spawn(move || outer.capture_source_overlays())
+        };
+        let waiting = Instant::now();
+        while outer.overlays.try_write().is_ok() {
+            assert!(
+                !capturing.is_finished(),
+                "capture ended while its delegate was locked"
+            );
+            assert!(
+                waiting.elapsed() < Duration::from_secs(10),
+                "capture did not acquire the outer map before waiting for its delegate"
+            );
+            thread::yield_now();
+        }
+        let late = {
+            let outer = Arc::clone(&outer);
+            let path = outer_only.abs_path();
+            thread::spawn(move || outer.set(path, "fn outer_late() {}\n".to_string()))
+        };
+        drop(inner_guard);
+        let pinned = capturing.join().unwrap().unwrap();
+        assert!(late.join().unwrap());
+        assert_eq!(
+            pinned.source_snapshot(&outer_only).unwrap().source(),
+            text("outer", 0),
+            "an edit that waited for the capture is not in the view"
+        );
+        assert_eq!(
+            outer.read_source(&outer_only).unwrap(),
+            "fn outer_late() {}\n"
+        );
+
+        assert!(outer.set(outer_only.abs_path(), text("outer", 0)));
+
+        // Independent writers while captures loop. The sequential writer keeps
+        // the inner version one behind or level with the outer one, which a
+        // view pinned from two instants breaks.
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let (done_tx, done_rx) = mpsc::channel::<(&'static str, thread::Result<Views>)>();
+        let run = |name: &'static str, body: Box<dyn FnOnce() -> Views + Send>| {
+            let barrier = Arc::clone(&barrier);
+            let done_tx = done_tx.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+                done_tx.send((name, outcome)).unwrap();
+            })
+        };
+        let sequential = run("sequential writer", {
+            let (inner, outer) = (Arc::clone(&inner), Arc::clone(&outer));
+            let (inner_only, outer_only) = (inner_only.abs_path(), outer_only.abs_path());
+            Box::new(move || {
+                for version in 1..=ROUNDS {
+                    assert!(outer.set(outer_only.clone(), text("outer", version)));
+                    assert!(inner.set(inner_only.clone(), text("inner", version)));
+                }
+                Vec::new()
+            })
+        });
+        let inner_writer = run("inner writer", {
+            let inner = Arc::clone(&inner);
+            let (shared, outside) = (shared.abs_path(), outside.abs_path());
+            Box::new(move || {
+                for version in 1..=ROUNDS {
+                    assert!(inner.set(shared.clone(), text("inner", version)));
+                    assert!(inner.set(outside.clone(), text("inner", version)));
+                }
+                Vec::new()
+            })
+        });
+        let outer_writer = run("outer writer", {
+            let outer = Arc::clone(&outer);
+            let shared = shared.abs_path();
+            Box::new(move || {
+                for version in 1..=ROUNDS {
+                    assert!(outer.set(shared.clone(), text("outer", version)));
+                }
+                Vec::new()
+            })
+        });
+        let capture_loop = run("capturing", {
+            let outer = Arc::clone(&outer);
+            Box::new(move || {
+                (0..ROUNDS)
+                    .map(|_| outer.capture_source_overlays().unwrap())
+                    .collect()
+            })
+        });
+        let mut views = Vec::new();
+        for _ in 0..4 {
+            let (name, outcome) = done_rx
+                .recv_timeout(Duration::from_secs(60))
+                .expect("a writer or the capturing thread deadlocked");
+            match outcome {
+                Ok(found) => views.extend(found),
+                Err(panic) => {
+                    eprintln!("{name} panicked");
+                    std::panic::resume_unwind(panic)
+                }
+            }
+        }
+
+        for worker in [sequential, inner_writer, outer_writer, capture_loop] {
+            worker.join().unwrap();
+        }
+        // Fixture identities name each version without interpreting source syntax.
+        let versions = (0..=ROUNDS)
+            .flat_map(|version| [("inner", version), ("outer", version)])
+            .map(|(owner, version)| {
+                let source = text(owner, version);
+                (
+                    Oid::hash_object(ObjectType::Blob, source.as_bytes()).unwrap(),
+                    (owner, version),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let version = |snapshot: ProjectSourceSnapshot, owner: &str| -> usize {
+            let (actual_owner, version) = versions
+                .get(&snapshot.oid())
+                .expect("capture contains one of the fixture's actual input versions");
+            assert_eq!(*actual_owner, owner);
+            assert_eq!(snapshot.source(), text(owner, *version));
+            *version
+        };
+        assert_eq!(views.len(), ROUNDS);
+        assert!(
+            views
+                .windows(2)
+                .all(|pair| pair[0].identity() < pair[1].identity()),
+            "view identities are strictly increasing"
+        );
+        for view in &views {
+            // The outer overlay wins the shared path; inherited and
+            // outside-root entries are pinned.
+            version(view.source_snapshot(&shared).unwrap(), "outer");
+            version(view.source_snapshot(&outside).unwrap(), "inner");
+            let (outer_version, inner_version) = (
+                version(view.source_snapshot(&outer_only).unwrap(), "outer"),
+                version(view.source_snapshot(&inner_only).unwrap(), "inner"),
+            );
+            assert!(
+                inner_version == outer_version || inner_version + 1 == outer_version,
+                "inner {inner_version} and outer {outer_version} were pinned at different instants"
+            );
+            // The content metadata is the combined map's, minus what has no
+            // workspace path, and each listed blob is its entry's.
+            let content = view.content().unwrap();
+            let listed = content
+                .entries_with_blob_ids()
+                .map(|(file, _, blob)| (file.rel_path().to_path_buf(), blob))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                listed
+                    .iter()
+                    .map(|(path, _)| path.as_path())
+                    .collect::<Vec<_>>(),
+                [
+                    Path::new("inner.rs"),
+                    Path::new("outer.rs"),
+                    Path::new("shared.rs")
+                ]
+            );
+            for (path, blob) in listed {
+                let snapshot = view
+                    .source_snapshot(&ProjectFile::new(&root, path))
+                    .unwrap();
+                assert_eq!(snapshot.oid(), blob);
+                assert_eq!(
+                    blob,
+                    Oid::hash_object(ObjectType::Blob, snapshot.source().as_bytes()).unwrap()
+                );
+            }
+        }
     }
 
     #[test]

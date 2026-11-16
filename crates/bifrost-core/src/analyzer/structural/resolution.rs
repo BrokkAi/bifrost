@@ -454,6 +454,9 @@ labelled_enum! {
         Private => "private",
         CrateOrModule => "crate_or_module",
         Unknown => "unknown",
+        // Persisted ordinal codes are append-only across all languages.
+        ProtectedInternal => "protected_internal",
+        PrivateProtected => "private_protected",
     }
 }
 

@@ -76,6 +76,63 @@ impl std::fmt::Debug for FieldSlotIndexCache {
     }
 }
 
+impl FieldSlotIndexCache {
+    #[cfg(feature = "test-support")]
+    pub(crate) fn retention_census_for_test(
+        &self,
+        census: &mut brokk_bifrost_core::retention_census::RetentionCensus<'_>,
+        family: &'static str,
+    ) {
+        use brokk_bifrost_core::retention_census::{
+            AllocationAccounting, FamilyLifetime, ResidentWeightUnit, UnknownKind,
+        };
+
+        const LIFETIME: FamilyLifetime = FamilyLifetime::Persistent;
+        let (count, weight) = self.complete.visit_ready_passively_for_test(|key, index| {
+            let estimated = index
+                .retained_bytes()
+                .saturating_add(std::mem::size_of::<FieldSlotIndexCacheKey>());
+            census.record_arc_allocation(
+                Arc::clone(index),
+                family,
+                LIFETIME,
+                "field-slot-index-estimate",
+                estimated as u64,
+                AllocationAccounting::OutsideBudget,
+            );
+            // Persistent artifact references are represented as replay
+            // rows here; the backing itself remains in the semantic
+            // artifact owner's accounting and is not part of this value.
+            let _ = key;
+        });
+        census.record_resident_reading(
+            family,
+            LIFETIME,
+            count,
+            weight,
+            ResidentWeightUnit::BytesEstimate,
+        );
+        census.record_unknown(
+            family,
+            LIFETIME,
+            UnknownKind::NativeBytes,
+            "moka_table_key_and_container_capacity_unavailable",
+        );
+        census.record_unknown(
+            family,
+            LIFETIME,
+            UnknownKind::Coverage,
+            "field_slot_retained_estimate_omits_some_diagnostic_and_key_payloads",
+        );
+        census.record_unknown(
+            family,
+            LIFETIME,
+            UnknownKind::ActivePins,
+            "evicted_live_value_or_external_index_pins_not_enumerated",
+        );
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldSlot {
     pub class: ClassIdentity,
@@ -439,7 +496,9 @@ impl FieldSlotIndex {
                                     }
                                     let index = Arc::new(index);
                                     *semantic_budget = staged_budget;
-                                    permit.publish_complete(Arc::clone(&index));
+                                    if !Self::store_failed_under_acquisition(workspace) {
+                                        permit.publish_complete(Arc::clone(&index));
+                                    }
                                     return Ok(FieldSlotIndexAcquisition {
                                         index,
                                         kind: FieldSlotIndexAcquisitionKind::PersistentHit,
@@ -504,7 +563,9 @@ impl FieldSlotIndex {
                         return Err(TypeFlowPlanError::Cancelled);
                     }
                     *semantic_budget = winner_budget;
-                    permit.publish_complete(Arc::clone(&winner));
+                    if !Self::store_failed_under_acquisition(workspace) {
+                        permit.publish_complete(Arc::clone(&winner));
+                    }
                     return Ok(FieldSlotIndexAcquisition {
                         index: winner,
                         // This caller performed a build after an exact miss.
@@ -552,7 +613,10 @@ impl FieldSlotIndex {
                         return Err(TypeFlowPlanError::Cancelled);
                     }
                 }
-                if index.memory_shareable && shared_publish_eligible && !cancellation.is_cancelled()
+                if index.memory_shareable
+                    && shared_publish_eligible
+                    && !Self::store_failed_under_acquisition(workspace)
+                    && !cancellation.is_cancelled()
                 {
                     permit.publish_complete(Arc::clone(&index));
                 }
@@ -564,6 +628,19 @@ impl FieldSlotIndex {
                 })
             }
         }
+    }
+
+    /// Whether a store read failed under the capture this acquisition runs in.
+    /// The explicit checks above cover the reads this function makes itself;
+    /// the index build and hydration read the store through the analyzer, which
+    /// records its failure on the ledger. A failed leader publishes nothing, so
+    /// its followers (other policies of the same request) read for themselves
+    /// and own their own failure (#11534).
+    fn store_failed_under_acquisition(workspace: &WorkspaceAnalyzer) -> bool {
+        workspace
+            .analyzer()
+            .current_thread_read_ledger()
+            .is_some_and(|ledger| ledger.store_failed())
     }
 
     fn recover_persisted_winner(
@@ -892,9 +969,7 @@ impl FieldSlotIndex {
                 .clone();
             let mut related = vec![class.clone()];
             related.extend(hierarchy.ancestors.iter().cloned());
-            if let Some(descendants) = &hierarchy.descendants {
-                related.extend(descendants.iter().cloned());
-            }
+            related.extend(hierarchy.descendants.edges.iter().cloned());
             related.sort_by(class_order);
             related.dedup();
             let has_related_store = collected.stores.keys().any(|(owner, stored_member)| {
@@ -913,7 +988,7 @@ impl FieldSlotIndex {
 
             let mut atoms = Vec::new();
             let mut incomplete = collected.globally_incomplete
-                || hierarchy.descendants.is_none()
+                || !hierarchy.descendants.is_complete()
                 || hierarchy.unresolved_base
                 || hierarchy.dynamic_attributes
                 || has_related_dynamic_effect
@@ -928,7 +1003,7 @@ impl FieldSlotIndex {
                     .entry(owner.clone())
                     .or_insert_with(|| adapter.class_hierarchy(workspace, owner));
                 if matches!(owner, ClassIdentity::External { .. })
-                    || owner_hierarchy.descendants.is_none()
+                    || !owner_hierarchy.descendants.is_complete()
                     || owner_hierarchy.unresolved_base
                     || owner_hierarchy.dynamic_attributes
                 {

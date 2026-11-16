@@ -9,7 +9,7 @@ use brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResol
 use brokk_bifrost_analysis::analyzer::store::resolution_stage::codec::{
     encode_node, encode_semantic,
 };
-use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::single_connection_store_context_for_test;
+use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::ephemeral_store_context;
 use brokk_bifrost_analysis::analyzer::{AnalyzerConfig, WorkspaceAnalyzer};
 use brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace;
 use brokk_bifrost_core::{analyzer::Language, cancellation::CancellationToken};
@@ -39,7 +39,7 @@ fn csharp_namespace_members_use_selected_names_and_exact_levels() {
         .file("Hidden/Hidden.cs", "namespace A.B { class X {} }")
         .file("App/Global.cs", "class X {}")
         .build();
-    let context = single_connection_store_context_for_test(fixture.project_dyn().as_ref()).unwrap();
+    let context = ephemeral_store_context(fixture.project_dyn().as_ref()).unwrap();
     let workspace_id = context.workspace_id.clone();
     let store = std::sync::Arc::clone(&context.store);
     let workspace = WorkspaceAnalyzer::build_with_store_context_for_test(

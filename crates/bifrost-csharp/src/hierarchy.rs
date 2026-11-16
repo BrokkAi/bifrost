@@ -12,8 +12,9 @@ use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::hash::HashSet;
 
 use crate::graph_support::{
-    self, CSharpSource, logical_type_count, partial_type_parts, sort_type_candidates,
-    supertype_candidates, usage_partial_type_parts,
+    self, CSharpSource, LogicalDirectAncestors, UnindexedClause, is_csharp_object_root,
+    logical_type_count, partial_type_parts, sort_type_candidates, supertype_candidates,
+    usage_partial_type_parts,
 };
 use crate::syntax::csharp_normalize_full_name;
 
@@ -193,7 +194,7 @@ fn attribute_class_evidence(
                 if normalized_raw == ATTRIBUTE_FQN {
                     return AttributeClassEvidence::Proven;
                 }
-                if matches!(normalized_raw.as_str(), "object" | "System.Object") {
+                if is_csharp_object_root(&normalized_raw) {
                     decisive_non_attribute_base = true;
                     continue;
                 }
@@ -225,7 +226,7 @@ pub fn usage_direct_ancestors(
     token: QueryToken<'_>,
     code_unit: &CodeUnit,
 ) -> Vec<CodeUnit> {
-    logical_direct_ancestors(source, token, code_unit, true)
+    logical_direct_ancestors(source, token, code_unit, true).resolved
 }
 
 pub fn logical_direct_ancestors(
@@ -233,7 +234,7 @@ pub fn logical_direct_ancestors(
     token: QueryToken<'_>,
     code_unit: &CodeUnit,
     usage: bool,
-) -> Vec<CodeUnit> {
+) -> LogicalDirectAncestors {
     let mut parts = if usage {
         usage_partial_type_parts(source, token, code_unit)
     } else {
@@ -244,9 +245,81 @@ pub fn logical_direct_ancestors(
     }
     graph_support::logical_direct_ancestors(
         parts,
-        |part| Some(source.raw_supertypes_of(part).to_vec()),
+        |part| Some(source.declared_raw_supertypes(part)),
         |part, raw| Some(supertype_candidates(source, token, part, raw, usage)),
         |_| Some(()),
     )
-    .unwrap_or_default()
+    .expect("an unbounded ancestor walk never stops")
+}
+
+/// Settle what each unresolved clause of a hierarchy answer means: drop a
+/// clause that spells the imported `Object` root, and record for the rest
+/// whether the clause is proven to name a type outside the index (#7363).
+pub fn classify_unindexed_clauses(
+    source: &dyn CSharpSource,
+    token: QueryToken<'_>,
+    ancestors: &mut LogicalDirectAncestors,
+) {
+    for clause in &mut ancestors.unindexed {
+        clause.may_name_indexed = clause_may_name_indexed(source, clause);
+    }
+    // Only a clause proven not to name an indexed type can be the root: an
+    // inherited nested `Object` the lookup missed is a real indexed base.
+    ancestors.unindexed.retain(|clause| {
+        clause.may_name_indexed || !names_imported_object_root(source, token, clause)
+    });
+}
+
+/// Whether an unresolved clause spells `Object` where `using System;` (file
+/// or global) imports it and no alias rebinds it. The caller has proven that
+/// no indexed type is named `Object`, and a second imported `Object` would
+/// make the base ambiguous (CS0104), so the clause names the root.
+fn names_imported_object_root(
+    source: &dyn CSharpSource,
+    token: QueryToken<'_>,
+    clause: &UnindexedClause,
+) -> bool {
+    const SYSTEM: &str = "System";
+    let file = clause.declared_by.source();
+    csharp_normalize_full_name(&clause.name) == "Object"
+        && !source.using_aliases_of(file).contains_key("Object")
+        && (source
+            .file_using_namespaces_of(token, file)
+            .iter()
+            .any(|namespace| namespace == SYSTEM)
+            || source
+                .sorted_global_using_namespaces()
+                .iter()
+                .any(|namespace| namespace == SYSTEM))
+}
+
+/// Whether a clause the lookup did not resolve may still name an indexed
+/// type. The lookup does not search every scope C# allows (an inherited
+/// nested type, for example), so a failed lookup alone proves nothing. The
+/// clause is proven to name a type outside the index only when no indexed
+/// type declares its identifier and the clause is not a using alias.
+fn clause_may_name_indexed(source: &dyn CSharpSource, clause: &UnindexedClause) -> bool {
+    let normalized = csharp_normalize_full_name(&clause.name);
+    // An extern-alias qualifier (`Ext::Name`) hides the identifier from the
+    // dotted form, so such a clause stays unproven.
+    if normalized.contains("::") {
+        return true;
+    }
+    let Some(identifier) = normalized.rsplit('.').next() else {
+        return true;
+    };
+    if identifier == normalized
+        && source
+            .using_aliases_of(clause.declared_by.source())
+            .contains_key(identifier)
+    {
+        return true;
+    }
+    let written = clause.name.rsplit('.').next().unwrap_or(identifier);
+    [identifier, written].into_iter().any(|spelling| {
+        source
+            .declaration_candidates_by_identifier(spelling)
+            .iter()
+            .any(CodeUnit::is_class)
+    })
 }

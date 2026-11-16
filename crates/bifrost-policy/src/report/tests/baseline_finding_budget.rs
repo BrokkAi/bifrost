@@ -74,10 +74,9 @@ fn admitted(loaded: &LoadedPolicy, finding: PolicyFinding, bytes: usize) -> bool
     {
         return false;
     }
-    matches!(
-        builder.retain_finding(finding),
-        Ok(PolicyRetentionOutcome::Retained)
-    )
+    builder
+        .retain_policy_findings(vec![vec![finding]])
+        .is_ok_and(|omitted| omitted.is_empty())
 }
 
 #[test]

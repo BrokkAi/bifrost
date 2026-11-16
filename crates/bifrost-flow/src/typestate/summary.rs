@@ -2557,6 +2557,7 @@ fn project_complete_protocol_summaries(
             receipt.channels.unattributed_reads |= converted.channels.unattributed_reads;
             receipt.channels.execution_dependences |= converted.channels.execution_dependences;
             receipt.channels.reuse_refused |= converted.channels.reuse_refused;
+            receipt.channels.store_failed |= converted.channels.store_failed;
         }
         if !complete_receipt {
             receipt_refused = true;

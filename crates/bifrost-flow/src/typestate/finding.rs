@@ -153,7 +153,7 @@ pub fn composed_terminal_finding(
         failing_proven,
         all_paths_definitive,
     )?;
-    Some(TypestateFinding {
+    let finding = TypestateFinding {
         subject: binding.subject(),
         site: binding.site().identity().clone(),
         kind: TypestateFindingKind::TerminalExpectation {
@@ -172,7 +172,9 @@ pub fn composed_terminal_finding(
         omitted_witnesses: failing_paths.saturating_sub(witnesses.len()),
         witnesses: witnesses.into_boxed_slice(),
         relation_sites: relation_sites.into_boxed_slice(),
-    })
+    };
+    assert_constructed_finding_domain(bindings, &finding);
+    Some(finding)
 }
 
 pub fn composed_error_finding(
@@ -230,13 +232,16 @@ pub fn composed_error_finding(
             });
         }
     }
+    if admitted_paths == 0 {
+        return None;
+    }
     let aggregate = ViolationAggregate {
         uncertainty,
         abstained,
         has_definite_proven_path: proven,
         has_definite_proven_complete_path: proven_complete,
     };
-    (admitted_paths > 0).then_some(TypestateFinding {
+    let finding = TypestateFinding {
         subject: binding.subject(),
         site: binding.site().identity().clone(),
         kind: TypestateFindingKind::ErrorTransition {
@@ -261,7 +266,34 @@ pub fn composed_error_finding(
         witnesses: witnesses.into_boxed_slice(),
         omitted_witnesses: admitted_paths.saturating_sub(MAX_TYPESTATE_WITNESSES_PER_FINDING),
         relation_sites: relation_sites.into_boxed_slice(),
-    })
+    };
+    assert_constructed_finding_domain(bindings, &finding);
+    Some(finding)
+}
+
+// Observe actual constructed outputs, independently of report admission and
+// persisted-product checks. The explicit corpus-auditing switch keeps the full
+// binding census out of ordinary debug/test finding construction. It retains
+// no state between requests and does not change the report.
+fn assert_constructed_finding_domain(bindings: &TypestateBindingPlan, finding: &TypestateFinding) {
+    #[cfg(any(test, debug_assertions))]
+    {
+        if std::env::var_os("BIFROST_TYPESTATE_DOMAIN_OBSERVATIONS").is_none() {
+            return;
+        }
+        let domain = bindings
+            .finding_primary_sites()
+            .filter(|(subject, _)| *subject == finding.subject)
+            .map(|(_, site)| site)
+            .collect::<HashSet<_>>();
+        assert!(
+            domain.contains(&finding.site),
+            "constructed finding escaped its full compiled subject domain: {finding:?}"
+        );
+        eprintln!("typestate_domain constructed=1 sites={}", domain.len());
+    }
+    #[cfg(not(any(test, debug_assertions)))]
+    let _ = (bindings, finding);
 }
 
 pub const MAX_TYPESTATE_FINDINGS: usize = 4_096;
@@ -674,7 +706,6 @@ pub fn collect_summary_findings_with_limits(
     if result.reached().len() > limits.max_reached_rows {
         return Err(TypestateFlowProblemError::FindingBudgetExceeded);
     }
-    let analysis_complete = typestate_result.is_complete();
     let mut violations = HashMap::<ViolationKey, ViolationAggregate>::default();
     let mut non_violations = HashSet::<EventOutcomeKey>::default();
     let mut violation_outcome_counts = HashMap::<EventOutcomeKey, usize>::default();
@@ -685,6 +716,8 @@ pub fn collect_summary_findings_with_limits(
         vec![None; bindings.terminal_bindings().len()];
     let mut needed_states = HashSet::<StateKey>::default();
     let mut retained_candidates = 0usize;
+    // Callee seeds can propagate state back to this root. Collect every
+    // terminal binding; only actual state rows establish a required join.
     for binding in bindings.terminal_bindings() {
         let terminal = protocol
             .terminal_expectation(binding.expectation())
@@ -814,6 +847,11 @@ pub fn collect_summary_findings_with_limits(
         }
     }
 
+    let needed_state_identities = needed_states
+        .iter()
+        .map(|key| (key.point.durable_key(), key.subject))
+        .collect::<HashSet<_>>();
+    let mut durable_reached_states = HashSet::default();
     let mut reached_states = HashMap::<StateKey, ObservationAggregate>::default();
     for (index, reached) in result.reached().iter().enumerate() {
         check_cancellation(cancellation, index)?;
@@ -823,6 +861,13 @@ pub fn collect_summary_findings_with_limits(
         let Some((subject, state, uncertainty, abstained)) = fact.state_observation() else {
             continue;
         };
+        // Only a state row for this subject establishes an expected join.
+        // Zero/control reachability alone does not mean the subject is active.
+        // Durable identity diagnoses a stale join; it never remaps handles.
+        let identity = (reached.point().durable_key(), subject);
+        if needed_state_identities.contains(&identity) {
+            durable_reached_states.insert(identity);
+        }
         let key = StateKey {
             point: reached.point().clone(),
             subject,
@@ -851,6 +896,16 @@ pub fn collect_summary_findings_with_limits(
             );
         }
     }
+
+    // A subject may never reach an exit that control flow reaches. Require a
+    // live observation only when this solve actually has a state row for the
+    // same subject at that durable point, but the allocation-sensitive join
+    // loses it. Absence of any such state is not evidence of a stale join.
+    let analysis_complete = typestate_result.is_complete()
+        && needed_states.iter().all(|key| {
+            !durable_reached_states.contains(&(key.point.durable_key(), key.subject))
+                || reached_states.contains_key(key)
+        });
 
     let mut findings = Vec::with_capacity(
         violations
@@ -1093,7 +1148,7 @@ pub fn collect_summary_findings_with_limits(
     let omitted = findings.len().saturating_sub(MAX_TYPESTATE_FINDINGS);
     findings.truncate(MAX_TYPESTATE_FINDINGS);
     let (findings, witness_expansions, witness_bytes) =
-        materialize_findings(findings, result, limits, cancellation)?;
+        materialize_findings(findings, bindings, result, limits, cancellation)?;
     Ok(TypestateFindingReport {
         findings: findings.into_boxed_slice(),
         omitted,
@@ -1538,6 +1593,7 @@ const fn merge_finding_certainty(
 
 fn materialize_findings(
     findings: Vec<PendingTypestateFinding>,
+    bindings: &TypestateBindingPlan,
     result: &crate::dataflow::SummaryDataflowResult<TypestateFact>,
     limits: TypestateFindingLimits,
     cancellation: &CancellationToken,
@@ -1592,7 +1648,7 @@ fn materialize_findings(
                 ),
             });
         }
-        materialized.push(TypestateFinding {
+        let finding = TypestateFinding {
             subject: finding.subject,
             site: finding.site,
             kind: finding.kind,
@@ -1601,7 +1657,9 @@ fn materialize_findings(
             witnesses: witnesses.into_boxed_slice(),
             omitted_witnesses: finding.omitted_witnesses,
             relation_sites: Box::new([]),
-        });
+        };
+        assert_constructed_finding_domain(bindings, &finding);
+        materialized.push(finding);
     }
     Ok((materialized, retained_expansions, retained_bytes))
 }

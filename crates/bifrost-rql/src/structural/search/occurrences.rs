@@ -27,6 +27,8 @@ use crate::analyzer::{IAnalyzer, Language, ProjectFile};
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_analysis::analyzer::capture_query_reads;
+use brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadReceipt;
+use brokk_bifrost_analysis::analyzer::structural::provider::StructuralSyntaxLimitedOutcome;
 use brokk_bifrost_analysis::analyzer::workspace_authority::{CaptureScopedMemo, memo_attribution};
 use brokk_bifrost_rql::OccurrenceFilter;
 use std::sync::{Arc, Mutex};
@@ -65,6 +67,40 @@ impl OccurrenceTraversalStore {
     }
 }
 
+/// Sorted macro ranges and their prefix maximum ends make visibility overlap
+/// queries logarithmic even when many disjoint macros precede a binding.
+#[derive(Clone)]
+pub(super) struct RustMacroRanges {
+    ranges: Vec<(usize, usize)>,
+    prefix_max_ends: Vec<usize>,
+}
+
+impl RustMacroRanges {
+    fn new(mut ranges: Vec<(usize, usize)>) -> Self {
+        ranges.sort_unstable();
+        ranges.dedup();
+        let mut max_end = 0;
+        let prefix_max_ends = ranges
+            .iter()
+            .map(|(_, end)| {
+                max_end = max_end.max(*end);
+                max_end
+            })
+            .collect();
+        Self {
+            ranges,
+            prefix_max_ends,
+        }
+    }
+
+    pub(super) fn overlaps(&self, start: usize, end: usize) -> bool {
+        let prefix = self
+            .ranges
+            .partition_point(|(macro_start, _)| *macro_start < end);
+        start < end && prefix > 0 && self.prefix_max_ends[prefix - 1] > start
+    }
+}
+
 /// Per-request memo of derived occurrence rows plus the diagnostics already
 /// reported, so one file is derived once and one capability gap is reported
 /// once no matter how many pipeline rows touch it.
@@ -77,48 +113,180 @@ pub(super) struct OccurrenceTraversalCache {
     selected_ast_ids: Option<Arc<std::collections::HashSet<String>>>,
     reported: HashSet<(Language, OccurrenceRole, CodeQueryDiagnosticCode)>,
     reported_files: HashSet<(ProjectFile, CodeQueryDiagnosticCode)>,
-    /// One macro-presence scan per Rust callable (or non-callable file scope)
-    /// in this request. A cancellation never enters the cache.
-    rust_macro_scopes: HashMap<(ProjectFile, u32), bool>,
+    /// One syntax inventory per Rust file in this request. Binding visibility
+    /// is decided by the existing lexical environment, not another scope tree.
+    /// A cancelled inventory never enters the cache.
+    rust_macro_ranges: HashMap<ProjectFile, RustMacroRanges>,
+    rust_macro_syntax: CaptureScopedMemo<HashMap<ProjectFile, CachedRustMacroSyntax>>,
+    rust_macro_access:
+        CaptureScopedMemo<HashMap<(ProjectFile, usize, usize), CachedRustMacroAccess>>,
+    rust_macro_index: CaptureScopedMemo<HashMap<ProjectFile, Arc<RustMacroAccessIndex>>>,
+    #[cfg(test)]
+    pub(super) rust_macro_proof_evaluations: usize,
+    #[cfg(test)]
+    pub(super) rust_macro_index_builds: usize,
     #[cfg(test)]
     pub(super) rust_macro_scope_scans: usize,
+    #[cfg(test)]
+    pub(super) rust_macro_definition_builds: usize,
     /// What this execution asked occurrence derivation for. One choice per
     /// execution, so a memoized file is never replayed to a consumer that
     /// needed more of it than the first consumer asked for.
     options: OccurrenceDerivationOptions,
 }
 
+struct CachedRustMacroSyntax {
+    outcome: Arc<StructuralSyntaxLimitedOutcome>,
+    exported: Option<Arc<brokk_bifrost_rust_analysis::analyzer::MacroDefinitionInventory>>,
+    reads: QueryReadReceipt,
+}
+
+struct CachedRustMacroAccess {
+    proof: Option<brokk_bifrost_rust_analysis::analyzer::RustMacroBindingAccess>,
+    reads: QueryReadReceipt,
+}
+
+/// A file-wide union of invocation proofs, queried without visiting macros for
+/// each binding. Receipts include every invocation, even unrelated ones, so a
+/// hit replays the same conservative dependency set as the fill.
+pub(super) struct RustMacroAccessIndex {
+    all: RustMacroRanges,
+    opaque: RustMacroRanges,
+    named: HashMap<String, RustMacroRanges>,
+    reads: QueryReadReceipt,
+}
+
+impl RustMacroAccessIndex {
+    pub(super) fn may_access(&self, start: usize, end: usize, name: &str) -> bool {
+        let name = brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix(name);
+        // ASCII is already NFC. A non-ASCII binding keeps every overlapping
+        // macro open, including proved invocations with no captured names.
+        if !name.is_ascii() {
+            return self.all.overlaps(start, end);
+        }
+        self.opaque.overlaps(start, end)
+            || self
+                .named
+                .get(name)
+                .is_some_and(|ranges| ranges.overlaps(start, end))
+    }
+}
+
 impl OccurrenceTraversalCache {
-    pub(super) fn rust_scope_has_macro(
+    pub(super) fn rust_macro_access_index(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        facts: &crate::analyzer::structural::FileFacts,
+        cancellation: Option<&CancellationToken>,
+    ) -> Option<Arc<RustMacroAccessIndex>> {
+        self.rust_macro_ranges(file, facts, cancellation)?;
+        let ranges = self.rust_macro_ranges.get(file).expect("inventoried file");
+        let attribution = memo_attribution(analyzer);
+        let index = self.rust_macro_index.read_mut(&attribution, |indexes| {
+            Arc::clone(indexes.entry(file.clone()).or_insert_with(|| {
+                #[cfg(test)]
+                { self.rust_macro_index_builds += 1; }
+                // Bind all scoped memos in the enclosing capture. Receipt
+                // captures below replay reads without accessing another memo.
+                let (syntax, inventory, syntax_reads) = self.rust_macro_syntax.read_mut(&attribution, |syntax| {
+                    let cached = syntax.entry(file.clone()).or_insert_with(|| {
+                        let ((outcome, inventory), reads) = QueryReadReceipt::capture(analyzer, || {
+                            let outcome = analyzer.structural_fact_providers().into_iter()
+                                .find(|provider| provider.structural_language() == Language::Rust)
+                                .map_or(StructuralSyntaxLimitedOutcome::Unavailable, |provider| {
+                                    provider.structural_syntax_limited(file, usize::MAX, cancellation)
+                                });
+                            let inventory = match &outcome {
+                                StructuralSyntaxLimitedOutcome::Available(syntax) => {
+                                    #[cfg(test)]
+                                    { self.rust_macro_definition_builds += 1; }
+                                    brokk_bifrost_rust_analysis::analyzer::MacroDefinitionInventory::build(
+                                        syntax.prepared().tree(), syntax.prepared().source(),
+                                        &|| !cancellation.is_some_and(CancellationToken::is_cancelled),
+                                    ).ok().map(Arc::new)
+                                }
+                                _ => None,
+                            };
+                            (outcome, inventory)
+                        });
+                        CachedRustMacroSyntax { outcome: Arc::new(outcome), exported: inventory, reads }
+                    });
+                    (Arc::clone(&cached.outcome), cached.exported.clone(), cached.reads.clone())
+                });
+                let mut opaque = Vec::new();
+                let mut named: HashMap<String, Vec<(usize, usize)>> = HashMap::default();
+                let mut receipts = Vec::new();
+                self.rust_macro_access.read_mut(&attribution, |access| {
+                    for &range in &ranges.ranges {
+                        let cached = access.entry((file.clone(), range.0, range.1)).or_insert_with(|| {
+                            #[cfg(test)]
+                            { self.rust_macro_proof_evaluations += 1; }
+                            let (proof, reads) = QueryReadReceipt::capture(analyzer, || {
+                                syntax_reads.replay(analyzer);
+                                let StructuralSyntaxLimitedOutcome::Available(syntax) = syntax.as_ref() else { return None; };
+                                brokk_bifrost_rust_analysis::analyzer::rust_macro_binding_access(
+                                    analyzer, file, syntax.prepared(), inventory.as_deref()?, range.0..range.1,
+                                    &|| !cancellation.is_some_and(CancellationToken::is_cancelled),
+                                )
+                            });
+                            CachedRustMacroAccess { proof, reads }
+                        });
+                        match &cached.proof {
+                            None => opaque.push(range),
+                            Some(proof) => {
+                                for name in proof.accessed_names() {
+                                    named.entry(name.to_owned()).or_default().push(range);
+                                }
+                            }
+                        }
+                        receipts.push(cached.reads.clone());
+                    }
+                });
+                let (_, reads) = QueryReadReceipt::capture(analyzer, || {
+                    syntax_reads.replay(analyzer);
+                    for receipt in receipts { receipt.replay(analyzer); }
+                });
+                Arc::new(RustMacroAccessIndex {
+                    all: ranges.clone(),
+                    opaque: RustMacroRanges::new(opaque),
+                    named: named.into_iter().map(|(name, ranges)| (name, RustMacroRanges::new(ranges))).collect(),
+                    reads,
+                })
+            }))
+        });
+        index.reads.replay(analyzer);
+        Some(index)
+    }
+
+    pub(super) fn rust_macro_ranges(
         &mut self,
         file: &ProjectFile,
         facts: &crate::analyzer::structural::FileFacts,
-        scope: Option<u32>,
         cancellation: Option<&CancellationToken>,
-    ) -> Option<bool> {
+    ) -> Option<&RustMacroRanges> {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return None;
         }
-        let key = (file.clone(), scope.unwrap_or(u32::MAX));
-        if let Some(&found) = self.rust_macro_scopes.get(&key) {
-            return Some(found);
-        }
-        let (start, end) = scope.map_or((0, facts.nodes().len()), |index| {
-            (index as usize + 1, facts.node(index).subtree_end as usize)
-        });
-        let mut found = false;
-        for node in &facts.nodes()[start..end] {
-            if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                return None;
+        match self.rust_macro_ranges.entry(file.clone()) {
+            std::collections::hash_map::Entry::Occupied(entry) => Some(entry.into_mut()),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let mut positions = Vec::new();
+                for node in facts.nodes() {
+                    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                        return None;
+                    }
+                    if node.construct.as_deref() == Some("rust_macro_invocation") {
+                        positions.push((node.range.start_byte, node.range.end_byte));
+                    }
+                }
+                #[cfg(test)]
+                {
+                    self.rust_macro_scope_scans += 1;
+                }
+                Some(entry.insert(RustMacroRanges::new(positions)))
             }
-            found |= node.construct.as_deref() == Some("rust_macro_invocation");
         }
-        #[cfg(test)]
-        {
-            self.rust_macro_scope_scans += 1;
-        }
-        self.rust_macro_scopes.insert(key, found);
-        Some(found)
     }
 
     pub(super) fn with_options(options: OccurrenceDerivationOptions) -> Self {
@@ -443,6 +611,10 @@ impl OccurrenceTraversalCache {
                             .message(),
                     };
                     diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                        has_non_utf8_refusal: false,
+                        refusal_sites: Default::default(),
+                        call_relation_facts: None,
+                        uses_omissions: Vec::new(),
                         incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                         related: Vec::new(),
                         source: None,
@@ -468,6 +640,10 @@ impl OccurrenceTraversalCache {
                         _ => "has no structural facts in this workspace",
                     };
                     diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                        has_non_utf8_refusal: false,
+                        refusal_sites: Default::default(),
+                        call_relation_facts: None,
+                        uses_omissions: Vec::new(),
                         incompleteness: match reason {
                             OccurrenceIncompleteReason::NoStructuralAdapter => {
                                 brokk_bifrost_rql::Incompleteness::Content

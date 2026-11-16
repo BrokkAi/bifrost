@@ -266,7 +266,8 @@ pub fn activate_fixture_catalog(
         fixture
             .workspace
             .analyzer()
-            .semantic_model_overlay()
+            .semantic_model_overlay_read()
+            .published()
             .is_some(),
         "activation publishes an overlay"
     );

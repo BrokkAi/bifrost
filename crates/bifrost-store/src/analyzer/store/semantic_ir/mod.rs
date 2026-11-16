@@ -12,6 +12,8 @@
 
 mod codes;
 mod decode;
+#[doc(hidden)]
+pub use decode::GuardedProcedure;
 mod encode;
 #[cfg(test)]
 pub(crate) mod tests;
@@ -35,59 +37,15 @@ use crate::analyzer::semantic::{
 };
 use codes::RowCode;
 
-/// The row encoding's own version, folded into the producer epoch. Bump it
-/// when the encoder or decoder changes what a row means, and when the
-/// partial-flow derivation changes: the port table, the kill rules, or the
-/// fixpoint. Partial-flow rows are published under the same head as the IR
-/// rows, so this is their only version.
-///
-/// Version 2: the fixpoint keeps facts on a call's result and thrown carriers
-/// across the call, as the solver does (partial-flow rule 4).
-/// Version 3: each flow records the call sites its paths crossed (`crossed`).
-/// Version 4: each head records whether every relation of the procedure is
-/// proven complete (`relations_complete`).
-/// Version 6: exact Rust field member gaps retain no default memory impacts.
-/// Version 7: partial-flow propagation borrows successor facts and skips
-/// redundant crossed-call set reduction, processing points in reverse postorder.
-/// Version 8: unseeded forward single-predecessor points consume entry state;
-/// merges, retreating-edge targets and seeded points retain it. Partial-flow
-/// propagation has a facts-visited traversal cap.
-/// Version 9: call rows retain deferred member selection, its receiver place
-/// and static pointer depth, instead of requiring a pre-resolved member kind.
-/// Version 10: normal-return member content is published as Heap output ports,
-/// and relation completeness also certifies boundary member port coverage.
-/// Version 11 (#8940): post-call heap input ports and indirect formal-store
-/// incompleteness alter the persisted partial-flow rows.
-/// Version 13 (#9162): every builtin seed of one port shares one seed key, so
-/// two relations naming one post-call or entry heap port publish one flow row
-/// per (from, to). Version 12 is retired (coordinator ruling, 2026-11-02).
-/// Version 14 (#8388, coordinator-assigned; 12 retired, 13 is #9186): a formal's direct stores are
-/// separated from stores into its local copy, and post-call storage sharing
-/// is asked only for members the callee writes. Both can change persisted
-/// partial-flow coverage and ICFG-backed call-rule projection.
-// #8386: Rust receiver mode is stored on the receiver value row.
-// Version 16 (#9183): each procedure publishes a typed footprint witness.
-// Version 18 was held by #9925 before later master rows landed.
-// Version 19 (#9794): value-flow rows can carry the ByValueCapture kind.
-// Version 20 (#10095): scoped call coverage includes identifier-receiver selectors.
-// Version 21 (#10200): Rust zero-parameter callable cleanup coverage.
-// Version 22 (#9925, coordinator-assigned): OwnershipUnknown follows ByValueCapture
-// in the persisted ValueFlowKind tag order.
-// Version 23 (#10461): a parse-time head whose candidate set was truncated by a
-// constant limit is stored as Truncated instead of Complete.
-// Version 24 (#10466): a rejected return member is a content gap (coverage Open),
-// so its head is stored Complete and open, not Truncated.
-// Version 25 (#10539): the parse-time fixpoint joins the alternatives of one
-// event instead of letting each kill the last, so stored heads gain flows.
-// Version 26 (#10582): scalar static classes and relational declared result classes
-// (above #10539, which takes 25).
-// Version 27 (#10563): stored partial-flow heads change for a procedure with a store
-// through a reference prefix followed by a read through that cell (above #10582, which
-// takes 26).
-// Version 28 (#10683): a procedure whose initialized let copies a nested initializer
-// stored a Truncated head; an identity prefix store no longer cycles, so the head is
-// Complete with its flows (above #10563, which takes 27).
-const SEMANTIC_IR_ROWS_VERSION: u32 = 28;
+/// The semantic IR rows lever (#11570): the row encoding's own version, folded
+/// into the producer epoch, one change name per line in
+/// `levers/semantic-ir-rows.tokens`. Add a line when the encoder or decoder
+/// changes what a row means, and when the partial-flow derivation changes: the
+/// port table, the kill rules, or the fixpoint. Partial-flow rows are published
+/// under the same head as the IR rows, so this is their only version.
+fn semantic_ir_rows_version() -> &'static str {
+    brokk_bifrost_core::lever_label!("semantic-ir-rows", "semantic-ir-rows.tokens")
+}
 
 /// What a parse-time lowerer produced for one blob.
 #[derive(Debug)]
@@ -122,6 +80,9 @@ pub struct PreparedSemanticIr {
     /// JSON array of builtin names, stored as JSONB.
     go_predeclared_builtins: String,
     rows: encode::EncodedRows,
+    candidate_rows: encode::EncodedRows,
+    /// One (procedure, record) pair per guarded candidate row.
+    candidates: Vec<(u32, crate::analyzer::semantic::CandidateRecord)>,
 }
 
 impl PreparedSemanticIr {
@@ -132,6 +93,25 @@ impl PreparedSemanticIr {
     pub fn prepare(
         outcome: SemanticIrLoweringOutcome,
         partial_flows: Option<&[ProcedurePartialFlows]>,
+        producer_epoch: &str,
+        content: ContentIdentity,
+        source_bytes: usize,
+    ) -> Self {
+        Self::prepare_with_candidate_flows(
+            outcome,
+            partial_flows,
+            &[],
+            producer_epoch,
+            content,
+            source_bytes,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn prepare_with_candidate_flows(
+        outcome: SemanticIrLoweringOutcome,
+        partial_flows: Option<&[ProcedurePartialFlows]>,
+        candidate_flows: &[crate::analyzer::semantic::partial_flow::fixpoint::CandidateMacroPartialFlows],
         producer_epoch: &str,
         content: ContentIdentity,
         source_bytes: usize,
@@ -148,6 +128,8 @@ impl PreparedSemanticIr {
         let mut procedure_count = 0;
         let mut go_predeclared_builtins = "[]".to_owned();
         let mut rows = encode::EncodedRows::default();
+        let mut candidate_rows = encode::EncodedRows::default();
+        let mut candidates = Vec::new();
         match outcome {
             SemanticIrLoweringOutcome::Complete { mut parts } => {
                 for procedure in &mut parts {
@@ -173,6 +155,8 @@ impl PreparedSemanticIr {
                     }
                 }
                 procedure_count = parts.len();
+                (candidate_rows, candidates) =
+                    encode::encode_candidates(&parts, candidate_flows, content);
                 let encoded = encode::encode(&parts, partial_flows, content);
                 go_predeclared_builtins = encoded.go_predeclared_builtins;
                 rows = encoded.rows;
@@ -195,6 +179,8 @@ impl PreparedSemanticIr {
             procedure_count,
             go_predeclared_builtins,
             rows,
+            candidate_rows,
+            candidates,
         }
     }
 
@@ -206,7 +192,7 @@ impl PreparedSemanticIr {
     /// The head row plus every child row.
     #[doc(hidden)]
     pub fn logical_rows(&self) -> usize {
-        1 + self.rows.row_count()
+        1 + self.rows.row_count() + self.candidate_rows.row_count() + self.candidates.len()
     }
 
     /// An estimate: 4 bytes per integer cell plus the bytes of every text
@@ -219,13 +205,16 @@ impl PreparedSemanticIr {
             + self.detail.as_ref().map_or(0, String::len)
             + self.go_predeclared_builtins.len();
         head + self.rows.payload_bytes()
+            + self.candidate_rows.payload_bytes()
+            + self.candidates.len()
+                * std::mem::size_of::<(u32, crate::analyzer::semantic::CandidateRecord)>()
     }
 
     /// Rows and estimated payload bytes per child table.
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn table_census(&self) -> Vec<(&'static str, usize, usize)> {
-        Table::ALL
+        let mut census: Vec<_> = Table::ALL
             .iter()
             .map(|table| {
                 (
@@ -234,7 +223,26 @@ impl PreparedSemanticIr {
                     self.rows.table_payload_bytes(*table),
                 )
             })
-            .collect()
+            .collect();
+        for &table in Table::ALL {
+            let rows = self.candidate_rows.rows(table);
+            if rows > 0 {
+                census.push((
+                    table.candidate_spec().name,
+                    rows,
+                    self.candidate_rows.table_payload_bytes(table),
+                ));
+            }
+        }
+        if !self.candidates.is_empty() {
+            census.push((
+                "candidate_macro_semantic_ir_candidates",
+                self.candidates.len(),
+                self.candidates.len()
+                    * std::mem::size_of::<(u32, crate::analyzer::semantic::CandidateRecord)>(),
+            ));
+        }
+        census
     }
 }
 
@@ -316,29 +324,56 @@ pub fn insert_semantic_ir_tx(
         usize_to_i64(prepared.payload_bytes()),
         prepared.go_predeclared_builtins,
     ])?;
-    for &table in Table::ALL {
-        let spec = table.spec();
-        let cells = prepared.rows.cells(table);
-        if cells.is_empty() {
-            continue;
+    for (specs, rows) in [
+        (Table::spec as fn(Table) -> TableSpec, &prepared.rows),
+        (
+            Table::candidate_spec as fn(Table) -> TableSpec,
+            &prepared.candidate_rows,
+        ),
+    ] {
+        for &table in Table::ALL {
+            let spec = specs(table);
+            let cells = rows.cells(table);
+            if cells.is_empty() {
+                continue;
+            }
+            let blob = Value::Integer(blob_id);
+            let arity = spec.columns.len() + 1;
+            let mut values =
+                Vec::<&dyn ToSql>::with_capacity(cells.len() / spec.columns.len() * arity);
+            for row in cells.chunks_exact(spec.columns.len()) {
+                values.push(&blob);
+                values.extend(row.iter().map(|value| value as &dyn ToSql));
+            }
+            if !super::row_batch::insert_rows(
+                tx,
+                &spec.insert_prefix(),
+                &spec.row_sql(),
+                arity,
+                &values,
+                cancellation,
+            )? {
+                return Ok(false);
+            }
         }
-        let blob = Value::Integer(blob_id);
-        let arity = spec.columns.len() + 1;
-        let mut values = Vec::<&dyn ToSql>::with_capacity(cells.len() / spec.columns.len() * arity);
-        for row in cells.chunks_exact(spec.columns.len()) {
-            values.push(&blob);
-            values.extend(row.iter().map(|value| value as &dyn ToSql));
-        }
-        if !super::row_batch::insert_rows(
-            tx,
-            &spec.insert_prefix(),
-            &spec.row_sql(),
-            arity,
-            &values,
-            cancellation,
-        )? {
-            return Ok(false);
-        }
+    }
+    for &(procedure, record) in &prepared.candidates {
+        use crate::analyzer::semantic::CandidateRealization;
+        let (realization, alternate_call) = match record.realization {
+            CandidateRealization::RuntimeCall(call) => ("call", Some(call.get())),
+            CandidateRealization::Intrinsic => ("intrinsic", None),
+            CandidateRealization::LexicalNoItemsIntroduced => ("lexical_no_items_introduced", None),
+        };
+        tx.prepare_cached("INSERT INTO candidate_macro_semantic_ir_candidates(blob_id, procedure, anchor_start, anchor_end, base_call, realization, alternate_call) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)")?
+            .execute(params![
+                blob_id,
+                procedure,
+                record.anchor.start_byte,
+                record.anchor.end_byte,
+                record.base_call.get(),
+                realization,
+                alternate_call
+            ])?;
     }
     if cancellation.is_cancelled() {
         return Ok(false);
@@ -379,7 +414,7 @@ pub fn reseal_publication_for_test(conn: &mut rusqlite::Connection, blob_id: i64
 /// row. Per-cell updates made sealing a large share of parse-time
 /// publication: a corpus of a few hundred million cells became billions of
 /// tiny SHA-256 updates (#10379).
-fn sealed_publication_digest(tx: &rusqlite::Transaction<'_>, blob_id: i64) -> Result<StableDigest> {
+fn sealed_publication_digest(tx: &rusqlite::Connection, blob_id: i64) -> Result<StableDigest> {
     let mut digest = LengthDelimitedDigest::new(b"bifrost-semantic-ir-sealed-publication-rows-v2");
     let head_columns = [
         "lang",
@@ -420,11 +455,38 @@ fn sealed_publication_digest(tx: &rusqlite::Transaction<'_>, blob_id: i64) -> Re
         );
         hash_stored_rows(tx, &sql, blob_id, spec.columns, &mut digest)?;
     }
+    for &table in Table::ALL {
+        let spec = table.candidate_spec();
+        let name = spec.name;
+        digest.push(name.as_bytes());
+        let sql = format!(
+            "SELECT {} FROM {} WHERE blob_id = ?1 ORDER BY {}",
+            spec.columns.join(", "),
+            name,
+            spec.order_by
+        );
+        hash_stored_rows(tx, &sql, blob_id, spec.columns, &mut digest)?;
+    }
+    digest.push(b"candidate_macro_semantic_ir_candidates");
+    hash_stored_rows(
+        tx,
+        "SELECT procedure, anchor_start, anchor_end, base_call, realization, alternate_call FROM candidate_macro_semantic_ir_candidates WHERE blob_id = ?1 ORDER BY procedure, base_call, anchor_start, anchor_end",
+        blob_id,
+        &[
+            "procedure",
+            "anchor_start",
+            "anchor_end",
+            "base_call",
+            "realization",
+            "alternate_call",
+        ],
+        &mut digest,
+    )?;
     Ok(digest.finish())
 }
 
 fn hash_stored_rows(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &rusqlite::Connection,
     sql: &str,
     blob_id: i64,
     columns: &[&str],
@@ -480,7 +542,7 @@ pub fn semantic_ir_producer_epoch(identity: &SemanticAdapterIdentity) -> String 
     digest.push(identity.adapter.fingerprint().as_bytes());
     digest.push(SemanticIrVersion::current().as_bytes());
     digest.push(identity.configuration.as_bytes());
-    digest.push(&SEMANTIC_IR_ROWS_VERSION.to_le_bytes());
+    digest.push(semantic_ir_rows_version().as_bytes());
     digest.finish().to_string()
 }
 
@@ -687,7 +749,66 @@ pub(super) const SEMANTIC_IR_PUBLICATION_SQL: &str = "SELECT publications.blob_i
    AND publications.publication_state = 'complete'
    AND publications.producer_epoch = epochs.producer_epoch";
 
+/// Base and guarded procedure rows decoded from one publication snapshot.
+pub type GuardedSemanticIrParts = (Vec<ProcedureSemanticsParts>, Vec<GuardedProcedure>);
+
 impl AnalyzerStore {
+    /// Test guarded membership without decoding executable rows.
+    pub fn semantic_ir_candidate_macro_presence(
+        &self,
+        key: &super::BlobKey,
+        procedure: ProcedureId,
+    ) -> Result<(SemanticIrHeadObservation, Option<bool>)> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        let observation = observe_semantic_ir_head(&tx, key)?;
+        let present = match &observation {
+            SemanticIrHeadObservation::Present { blob_id, .. } => Some(tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM candidate_macro_semantic_ir_candidates WHERE blob_id = ?1 AND procedure = ?2)",
+                rusqlite::params![blob_id, procedure.get()],
+                |row| row.get(0),
+            )?),
+            _ => None,
+        };
+        tx.commit()?;
+        Ok((observation, present))
+    }
+
+    /// Decode guarded candidate-macro alternatives for one published blob.
+    /// This is the sole public seam for the semantic owner that selects them.
+    #[doc(hidden)]
+    pub fn semantic_ir_candidate_macro_alternate(
+        &self,
+        key: &super::BlobKey,
+        scope: &SemanticIrMountScope,
+    ) -> Result<(SemanticIrHeadObservation, Option<GuardedSemanticIrParts>)> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        let observation = observe_semantic_ir_head(&tx, key)?;
+        let parts = match &observation {
+            SemanticIrHeadObservation::Present { blob_id, .. } => {
+                let stored: Vec<u8> = tx.query_row(
+                    "SELECT row_digest FROM semantic_ir_publications WHERE blob_id = ?1",
+                    [blob_id],
+                    |row| row.get(0),
+                )?;
+                let actual = sealed_publication_digest(&tx, *blob_id)?;
+                if stored.as_slice() != actual.as_bytes() {
+                    return Err(StoreError::corrupt(format!(
+                        "guarded semantic IR blob {blob_id}: sealing digest mismatch"
+                    )));
+                }
+                match decode::read_and_decode(&tx, *blob_id, scope)? {
+                    Some(base) => Some((base, decode::read_guarded(&tx, *blob_id, scope)?)),
+                    None => None,
+                }
+            }
+            _ => None,
+        };
+        tx.commit()?;
+        Ok((observation, parts))
+    }
+
     /// Decode a whole publication under the content observed in this snapshot.
     #[doc(hidden)]
     pub fn read_semantic_ir_with_observed_scope(
@@ -1124,6 +1245,12 @@ impl TableSpec {
 
 macro_rules! tables {
     ($($variant:ident => $name:literal [$($column:literal),+ $(,)?] jsonb [$($jsonb:literal),*] order $order:literal;)+) => {
+        /// Exact guarded relation names; SQL access stays inside this module.
+        pub(in crate::analyzer::store) const GUARDED_ROW_RELATIONS: &[&str] = &[
+            "candidate_macro_semantic_ir_candidates",
+            $(concat!("candidate_macro_", $name)),+
+        ];
+
         /// Every child table of a blob's semantic IR.
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub(super) enum Table {
@@ -1133,6 +1260,12 @@ macro_rules! tables {
         impl Table {
             pub(super) const ALL: &'static [Table] = &[$(Table::$variant),+];
             pub(super) const COUNT: usize = Self::ALL.len();
+
+            pub(super) const fn candidate_spec(self) -> TableSpec {
+                let mut spec = self.spec();
+                spec.name = match self { $(Table::$variant => concat!("candidate_macro_", $name)),+ };
+                spec
+            }
 
             pub(super) const fn spec(self) -> TableSpec {
                 match self {
@@ -1211,10 +1344,13 @@ tables! {
         "procedure", "evidence", "proof", "proof_reason", "completeness",
         "completeness_reason", "sources",
     ] jsonb ["sources"] order "procedure, evidence";
+    CleanupNodes => "semantic_ir_cleanup_nodes" [
+        "procedure", "node", "parent", "region",
+    ] jsonb [] order "procedure, node";
     Gaps => "semantic_ir_gaps" [
         "procedure", "gap", "point", "subject", "subject_a", "subject_b", "capability",
         "impacts", "kind", "budget_dimension", "budget_limit", "budget_attempted", "discharge",
-        "detail", "source", "evidence",
+        "detail", "source", "evidence", "segment_head", "segment_stop",
     ] jsonb [] order "procedure, gap";
     Blocks => "semantic_ir_blocks" [
         "procedure", "block", "points", "source", "evidence",
@@ -1298,11 +1434,26 @@ tables! {
     ] jsonb ["receiver_type"] order "procedure, call_site";
     GuardedPatternProjections => "semantic_ir_guarded_pattern_projections" [
         "procedure", "ordinal", "point", "whole_value", "binder", "pattern_source",
-        "binder_source", "path_len", "status",
+        "binder_source", "path_len", "status", "gap",
     ] jsonb [] order "procedure, ordinal";
     GuardedPatternSteps => "semantic_ir_guarded_pattern_steps" [
         "procedure", "candidate", "step", "kind", "tuple_ordinal", "named_text",
     ] jsonb [] order "procedure, candidate, step";
+    CleanupActions => "semantic_ir_cleanup_actions" [
+        "procedure", "node", "ordinal", "kind", "place_kind", "place_locator", "place_location", "behavior", "destructor_resolution", "destructor_targets", "source", "evidence", "reason_domain", "reason", "incomplete_evidence",
+    ] jsonb [] order "procedure, node, ordinal";
+    CleanupOwners => "semantic_ir_cleanup_owners" [
+        "procedure", "node", "ordinal", "value", "place_kind", "place_locator", "place_location", "lifecycle", "target_kind", "target_value", "target_origin", "invalidation_cause", "invalidation_strength", "source", "evidence",
+    ] jsonb [] order "procedure, node, ordinal";
+    CleanupProjections => "semantic_ir_cleanup_projections" [
+        "procedure", "projection",
+    ] jsonb [] order "procedure, projection";
+    CleanupProjectionMembers => "semantic_ir_cleanup_projection_members" [
+        "procedure", "projection", "ordinal", "node", "action_ordinal",
+    ] jsonb [] order "procedure, projection, ordinal";
+    CleanupAnchors => "semantic_ir_cleanup_anchors" [
+        "procedure", "anchor", "point", "head", "stop", "destination", "destination_kind", "edge_kind", "drop_offset", "scope_end_offset", "incomplete_offset", "pointer_invalidation_offset", "projection", "purpose",
+    ] jsonb [] order "procedure, anchor";
     PartialPorts => "semantic_ir_ports" [
         "procedure", "port", "kind", "a", "b", "root", "selectors", "tail",
     ] jsonb ["selectors"] order "procedure, port";

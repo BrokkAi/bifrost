@@ -314,6 +314,106 @@ fn inventory_candidates_cover_every_key_the_visitor_emits() {
     );
 }
 
+/// Identical blobs need distinct mounted names, and a missing inventory proof
+/// must preserve the unfiltered structured lookup rather than prove absence.
+#[test]
+#[hardwon("#10555: full-name lookup hydrated every mount of an identical Python blob")]
+fn bounded_fqn_mount_constraints_preserve_unknown_inventory_and_limits() {
+    use brokk_bifrost_analysis::analyzer::i_analyzer::capture_query_reads;
+    use brokk_bifrost_analysis::analyzer::read_ledger::ReadKey;
+
+    let source = "class C:\n    pass\n";
+    let (_temp, python) = project(
+        Language::Python,
+        &[
+            ("pkg/a.py", source),
+            ("pkg/b.py", source),
+            ("pkg/__init__.py", ""),
+        ],
+    );
+    let first = ProjectFile::new(python.root().to_path_buf(), "pkg/a.py");
+    let analyzer = listed(persisted(python, PythonAdapter::for_test_file(&first)));
+    let candidates = index_candidates(
+        &analyzer,
+        "python",
+        IndexFamily::DefinitionExact,
+        b"pkg.a.C",
+    )
+    .expect("the per-mount name rows prove inventory despite NULL content names");
+    assert_eq!(candidates.len(), 1, "{candidates:?}");
+    assert_eq!(candidates[0].mounted_path, PathBuf::from("pkg/a.py"));
+    let mut remaining = 100;
+    let mut checks = 0;
+    let stopped = analyzer
+        .analyzer_store()
+        .index_blob_candidates_for_key_at_limited(
+            &analyzer.workspace_listing_proof(),
+            "python",
+            IndexFamily::DefinitionExact,
+            b"pkg.a.C",
+            &mut remaining,
+            || {
+                checks += 1;
+                checks < 7
+            },
+        )
+        .unwrap();
+    assert!(
+        stopped.is_none(),
+        "a stopped stream cannot constrain mounts: {stopped:?}"
+    );
+    assert!(
+        remaining < 100 && remaining > 0,
+        "stop after reading a row, before exhaustion: {remaining}"
+    );
+
+    for known in [true, false] {
+        if !known {
+            make_legacy(&analyzer, "python", "pkg/b.py");
+            assert!(
+                index_candidates(
+                    &analyzer,
+                    "python",
+                    IndexFamily::DefinitionExact,
+                    b"pkg.a.C",
+                )
+                .is_none()
+            );
+        }
+        for fqn in ["pkg.a.C", "pkg.b.C", "pkg.absent.C"] {
+            for limit in [0, 1, 2, 3, 100] {
+                // The old full-name algorithm was the bounded identifier
+                // result with exact-name filtering only on complete answers.
+                let mut expected = analyzer.lookup_non_module_declarations_by_identifier_limited(
+                    "C",
+                    limit,
+                    || true,
+                );
+                if expected.complete {
+                    expected.rows.retain(|unit| unit.fq_name() == fqn);
+                }
+                let (actual, reads) = capture_query_reads(&analyzer, || {
+                    analyzer.lookup_non_module_declarations_by_fqn_limited(fqn, limit, || true)
+                });
+                assert_eq!(actual, expected, "known={known}, {fqn}, limit={limit}");
+                if limit == 100 {
+                    let keys = reads.keys();
+                    for key in [
+                        ReadKey::index(IndexFamily::DefinitionIdentifier, "C"),
+                        ReadKey::index(IndexFamily::DefinitionExact, fqn),
+                    ] {
+                        assert!(keys.contains(&key), "missing {key:?} in {keys:?}");
+                    }
+                }
+            }
+        }
+        let cancelled =
+            analyzer.lookup_non_module_declarations_by_fqn_limited("pkg.a.C", 100, || false);
+        assert!(!cancelled.complete, "{cancelled:?}");
+        assert!(cancelled.rows.is_empty(), "{cancelled:?}");
+    }
+}
+
 fn commit_all(root: &std::path::Path, paths: &[&str]) {
     let repo = git2::Repository::init(root).unwrap();
     let mut index = repo.index().unwrap();
@@ -771,7 +871,9 @@ fn siblings_of_an_unpublished_blob_become_known_on_the_next_full_sync() {
 /// enumerator returns None for a language with an open refusal at its selected
 /// revision, and for a listing the analyzer knows was incomplete.
 #[test]
-#[hardwon("#10325: a refused or unlisted source was invisible to the absence proof")]
+#[hardwon(
+    "#10325+#12296: a refused or unlisted source was invisible to the absence proof; an incomplete listing produced a complete inventory"
+)]
 fn refused_sources_and_incomplete_listings_make_the_inventory_unknown() {
     let long_line = format!("class Big {{ int {} = 0; }}\n", "x".repeat(20_000));
     let files = [
@@ -853,6 +955,18 @@ fn refused_sources_and_incomplete_listings_make_the_inventory_unknown() {
         "every file is known; only the listing is not"
     );
     assert!(candidates(&incomplete).is_none());
+    let bounded_names = |analyzer: &TreeSitterAnalyzer<JavaAdapter>| {
+        ["pkg.Alpha", "missing.Alpha"].map(|fqn| {
+            let actual = analyzer.lookup_declarations_by_fqn_limited(fqn, 100, || true);
+            assert!(actual.complete, "{actual:?}");
+            actual
+                .rows
+                .into_iter()
+                .map(|unit| unit.fq_name())
+                .collect::<Vec<_>>()
+        })
+    };
+    assert_eq!(bounded_names(&control), bounded_names(&incomplete));
 }
 
 #[test]
@@ -955,9 +1069,12 @@ fn an_unchanged_reopen_reads_unit_tails_only_for_files_it_refills() {
 
 #[test]
 #[hardwon("#10325: a listing walk error kept the inventory listing complete")]
+#[hardwon(
+    "#12280: a file symlink or an unsupplied file at a source path left the inventory proof intact"
+)]
 fn listing_omissions_that_can_hide_a_source_make_the_inventory_unknown() {
-    let omission = |reason| WorkspaceFileOmission {
-        path: PathBuf::from("pkg/Hidden.java"),
+    let omission = |path: &str, reason| WorkspaceFileOmission {
+        path: PathBuf::from(path),
         reason,
     };
     let provable = |analyzer: &TreeSitterAnalyzer<JavaAdapter>| {
@@ -974,33 +1091,50 @@ fn listing_omissions_that_can_hide_a_source_make_the_inventory_unknown() {
     // The constructor used by `persisted` captures the initial clean listing.
     // Each case changes the omissions and then rebuilds, so the full update
     // observes the project's new listing.
-    let rebuilt = |reason| {
+    let rebuilt = |path: &str, reason| {
         let (_temp, project) = omitting_project(Language::Java, files);
         let analyzer = persisted(Arc::new(project.clone()), JavaAdapter);
-        project.set_omissions(vec![omission(reason)]);
+        project.set_omissions(vec![omission(path, reason)]);
         let rebuilt = analyzer.update_all();
         assert!(all_known(&rebuilt), "every listed file is known");
         (_temp, rebuilt)
     };
 
-    // Omissions outside the analyzer's universe do not withhold the proof.
+    // Omissions of a file no Java source could be do not withhold the proof.
     for reason in [
         WorkspaceFileOmissionReason::Symlink,
+        WorkspaceFileOmissionReason::NotSupplied,
         WorkspaceFileOmissionReason::NonRegular,
         WorkspaceFileOmissionReason::NonUtf8Name,
     ] {
-        let (_temp, analyzer) = rebuilt(reason);
+        let (_temp, analyzer) = rebuilt("pkg/notes.txt", reason);
         assert!(provable(&analyzer), "{reason:?} is outside the universe");
     }
 
-    // The three that can drop a source do.
+    // The ones that can drop a source do, whatever the path.
     for reason in [
         WorkspaceFileOmissionReason::WalkError,
         WorkspaceFileOmissionReason::NonUtf8GitPath,
         WorkspaceFileOmissionReason::Unknown,
+        WorkspaceFileOmissionReason::SymlinkToDirectory,
+        WorkspaceFileOmissionReason::UnreadableSymlink,
     ] {
-        let (_temp, analyzer) = rebuilt(reason);
+        let (_temp, analyzer) = rebuilt("pkg/notes.txt", reason);
         assert!(!provable(&analyzer), "{reason:?} may hide a source");
+    }
+
+    // A file at a Java source path is a source the listing did not give: the
+    // path scopes the omission to this language, as it does for Rust (#10670).
+    for reason in [
+        WorkspaceFileOmissionReason::Symlink,
+        WorkspaceFileOmissionReason::NotSupplied,
+        WorkspaceFileOmissionReason::NonRegular,
+    ] {
+        let (_temp, analyzer) = rebuilt("pkg/Hidden.java", reason);
+        assert!(
+            !provable(&analyzer),
+            "{reason:?} at a .java path hides a source"
+        );
     }
 
     // The standalone constructor captures the project's real enumeration:
@@ -1022,7 +1156,10 @@ fn listing_omissions_that_can_hide_a_source_make_the_inventory_unknown() {
     let alpha = ProjectFile::new(project.root().to_path_buf(), "pkg/Alpha.java");
     let unchanged = analyzer.update(&BTreeSet::from([alpha.clone()]));
     assert!(provable(&unchanged), "a clean listing keeps the proof");
-    project.set_omissions(vec![omission(WorkspaceFileOmissionReason::WalkError)]);
+    project.set_omissions(vec![omission(
+        "pkg/Hidden.java",
+        WorkspaceFileOmissionReason::WalkError,
+    )]);
     let walked = unchanged.update(&BTreeSet::from([alpha.clone()]));
     assert!(all_known(&walked), "only the listing changed");
     assert!(!provable(&walked), "a new walk error withholds the proof");

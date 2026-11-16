@@ -723,17 +723,26 @@ fn cancellation_after_path_classification_discards_dirty_reference_candidates() 
     assert_eq!(analyzer.state.dirty_snapshot().len(), 1);
     let identifiers = ["Needle".to_owned()].into_iter().collect();
     let empty = Default::default();
+    let live_files = analyzer.live_snapshot().all_paths().count();
+    assert_eq!(live_files, 2);
     classifications.store(0, Ordering::SeqCst);
     assert_eq!(
         analyzer.reverse_reference_candidates(&empty, &empty, &identifiers, &token),
         [clean, dirty].into_iter().collect()
     );
-    let total = classifications.load(Ordering::SeqCst);
-    assert!(total >= 2);
+    assert!(classifications.load(Ordering::SeqCst) >= live_files);
     classifications.store(0, Ordering::SeqCst);
-    cancel_at.store(total, Ordering::SeqCst);
+    // A cold pass can classify extra times while retrying the dirty parse
+    // (#11490). Cancel after each live path has been classified once; that
+    // count is reached in the second pass independently of any retry or
+    // fallback work.
+    cancel_at.store(live_files, Ordering::SeqCst);
     let candidates = analyzer.reverse_reference_candidates(&empty, &empty, &identifiers, &token);
-    assert!(token.is_cancelled());
+    assert!(
+        token.is_cancelled(),
+        "second pass classified {} of {live_files} live files before cancellation",
+        classifications.load(Ordering::SeqCst)
+    );
     assert!(candidates.is_empty(), "{candidates:?}");
 }
 
@@ -1006,4 +1015,232 @@ fn retained_fill_reads_the_ordinary_file_state_snapshot_and_records_the_read() {
         reads_file(&reads.keys(), &primed),
         "the retained fill receipt must include its snapshot read: {reads:?}"
     );
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#11385: unavailable test-file routes were classified as production"
+)]
+fn unavailable_production_descendant_index_reports_open_answer() {
+    use brokk_bifrost_analysis::IAnalyzer;
+    use brokk_bifrost_analysis::analyzer::common::{
+        complete_descendant_query, new_replayable_descendant_memo,
+    };
+    use brokk_bifrost_core::analyzer::capabilities::{
+        DescendantIndexScope, HierarchyOpenReason, SourceExclusionUnavailable,
+        build_direct_descendant_index,
+    };
+    use brokk_bifrost_cpp_analysis::CppAnalyzer;
+    let fixture = crate::inline_project::InlineTestProject::with_language(Language::Cpp)
+        .file("base.cpp", "struct Base {}; struct Derived : Base {};\n")
+        .build();
+    let analyzer = CppAnalyzer::from_project(fixture.project().clone());
+    let base = analyzer
+        .get_all_declarations()
+        .into_iter()
+        .find(|unit| unit.identifier() == "Base")
+        .unwrap();
+    let cancellation = CancellationToken::default();
+    let excluded = |file: &brokk_bifrost_core::analyzer::ProjectFile| {
+        analyzer.record_query_incomplete(
+            brokk_bifrost_analysis::analyzer::QueryReadIncomplete::StructureUnavailable(
+                file.clone(),
+            ),
+        );
+        Err(SourceExclusionUnavailable)
+    };
+    let scope = DescendantIndexScope::excluding_sources(&cancellation, &excluded);
+    let memo = new_replayable_descendant_memo();
+    for _ in 0..2 {
+        let answer = complete_descendant_query(
+            &analyzer,
+            &scope,
+            &base,
+            &memo,
+            || {
+                let index = build_direct_descendant_index(&analyzer, &analyzer, &scope);
+                assert!(
+                    index.is_none(),
+                    "failed classification must stop the builder"
+                );
+                index
+            },
+            |_| panic!("unavailable index must never report a complete read"),
+        )
+        .unwrap();
+        assert!(!answer.is_complete());
+        assert!(
+            answer
+                .open
+                .iter()
+                .any(|reason| matches!(reason, HierarchyOpenReason::DescendantIndexUnavailable))
+        );
+    }
+}
+
+/// Wraps a real C++ analyzer and replaces one class's ancestor answer.
+struct ReplacedAncestorProvider<'a> {
+    analyzer: &'a brokk_bifrost_cpp_analysis::CppAnalyzer,
+    replaced: &'static str,
+    answer: fn(base: &CodeUnit) -> brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer,
+}
+
+impl brokk_bifrost_core::analyzer::capabilities::TypeHierarchyProvider
+    for ReplacedAncestorProvider<'_>
+{
+    fn get_direct_ancestors(
+        &self,
+        code_unit: &CodeUnit,
+    ) -> brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer {
+        let real = self.analyzer.get_direct_ancestors(code_unit);
+        if code_unit.identifier() == self.replaced {
+            (self.answer)(&real.edges[0])
+        } else {
+            real
+        }
+    }
+
+    fn get_direct_descendants(
+        &self,
+        code_unit: &CodeUnit,
+    ) -> brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer {
+        self.analyzer.get_direct_descendants(code_unit)
+    }
+}
+
+#[test]
+fn open_ancestor_candidates_are_carried_not_refused() {
+    use brokk_bifrost_analysis::analyzer::AnalyzerQueryScope;
+    use brokk_bifrost_analysis::analyzer::common::{
+        complete_descendant_query, new_replayable_descendant_memo,
+    };
+    use brokk_bifrost_core::analyzer::capabilities::{
+        DescendantIndexScope, HierarchyAnswer, HierarchyOpenReason, UnreadMemberFamilyAncestor,
+        build_direct_descendant_index,
+    };
+    use brokk_bifrost_core::analyzer::structural::resolution::MemberFamilyReason;
+    use brokk_bifrost_cpp_analysis::CppAnalyzer;
+    let fixture = crate::inline_project::InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "base.cpp",
+            "struct Base {}; struct Derived : Base {}; struct Open : Base, Mystery {};\n",
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(fixture.project().clone());
+    let base = analyzer
+        .get_all_declarations()
+        .into_iter()
+        .find(|unit| unit.identifier() == "Base")
+        .unwrap();
+    let cancellation = CancellationToken::default();
+    let scope = DescendantIndexScope::whole_workspace(&cancellation);
+
+    // A finished but open ancestor answer: its definite edge stays in the
+    // index, and the candidate is named instead of the index being refused.
+    let open_provider = ReplacedAncestorProvider {
+        analyzer: &analyzer,
+        replaced: "Open",
+        answer: |base| HierarchyAnswer {
+            edges: vec![base.clone()],
+            open: vec![HierarchyOpenReason::UnreadAncestor(
+                UnreadMemberFamilyAncestor {
+                    name: "Mystery".into(),
+                    inventory: None,
+                },
+            )],
+            ..HierarchyAnswer::complete(Vec::new())
+        },
+    };
+    let memo = new_replayable_descendant_memo();
+    let reader = AnalyzerQueryScope::new(&analyzer);
+    let answer = complete_descendant_query(
+        &analyzer,
+        &scope,
+        &base,
+        &memo,
+        || build_direct_descendant_index(&analyzer, &open_provider, &scope),
+        |_| panic!("an index with open candidates must never report a complete read"),
+    )
+    .unwrap();
+    let mut identifiers: Vec<_> = answer.edges.iter().map(CodeUnit::identifier).collect();
+    identifiers.sort();
+    assert_eq!(identifiers, ["Derived", "Open"]);
+    let [HierarchyOpenReason::OpenAncestorCandidates(candidates)] = answer.open.as_slice() else {
+        panic!("expected the open candidates, got {:?}", answer.open);
+    };
+    assert_eq!(
+        candidates
+            .iter()
+            .map(CodeUnit::identifier)
+            .collect::<Vec<_>>(),
+        ["Open"]
+    );
+    assert!(!answer.is_complete());
+    // The query is not poisoned: a second lookup (as in a transitive walk)
+    // still returns its definite row.
+    assert_eq!(reader.read_completion(), Ok(()));
+    let again = complete_descendant_query(
+        &analyzer,
+        &scope,
+        &base,
+        &memo,
+        || panic!("the index is memoized"),
+        |_| panic!("an index with open candidates must never report a complete read"),
+    )
+    .unwrap();
+    assert_eq!(again.edges.len(), 2, "{again:?}");
+    drop(reader);
+
+    // An answer whose work stopped short keeps the index available (#12735):
+    // it contributes no proven edge and makes its class an unbounded open
+    // candidate, so the answer stays incomplete instead of refusing.
+    let stopped_provider = ReplacedAncestorProvider {
+        analyzer: &analyzer,
+        replaced: "Open",
+        answer: |_| HierarchyAnswer {
+            open: vec![HierarchyOpenReason::MemberFamily(
+                MemberFamilyReason::HierarchyTruncated,
+            )],
+            ..HierarchyAnswer::complete(Vec::new())
+        },
+    };
+    let memo = new_replayable_descendant_memo();
+    let answer = complete_descendant_query(
+        &analyzer,
+        &scope,
+        &base,
+        &memo,
+        || build_direct_descendant_index(&analyzer, &stopped_provider, &scope),
+        |_| panic!("an index with a stopped candidate must never report a complete read"),
+    )
+    .unwrap();
+    let identifiers: Vec<_> = answer.edges.iter().map(CodeUnit::identifier).collect();
+    assert_eq!(identifiers, ["Derived"]);
+    let [HierarchyOpenReason::OpenAncestorCandidates(candidates)] = answer.open.as_slice() else {
+        panic!(
+            "expected the stopped class as an open candidate, got {:?}",
+            answer.open
+        );
+    };
+    assert_eq!(
+        candidates
+            .iter()
+            .map(CodeUnit::identifier)
+            .collect::<Vec<_>>(),
+        ["Open"]
+    );
+    assert!(!answer.is_complete());
+
+    // Without an open candidate the answer is the complete one.
+    let memo = new_replayable_descendant_memo();
+    let answer = complete_descendant_query(
+        &analyzer,
+        &scope,
+        &base,
+        &memo,
+        || build_direct_descendant_index(&analyzer, &analyzer, &scope),
+        |_| {},
+    )
+    .unwrap();
+    assert!(answer.is_complete(), "{answer:?}");
 }

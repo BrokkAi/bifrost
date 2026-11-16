@@ -1,0 +1,9 @@
+# The rust-source-listing-derivation lever (#11570).
+#
+# Invalidates Rust source listing certificates and their failure rows.
+# Add one `<issue>-<slug>` line when these derivation rules change.
+# Git merges this file with merge=union. Never edit or remove a token line.
+# See .agents/docs/cache-identity-levers.md.
+#
+# Replaced the literal: RUST_SOURCE_LISTING_DERIVATION_VERSION = 3.
+11570-slice2b-derivation-identity

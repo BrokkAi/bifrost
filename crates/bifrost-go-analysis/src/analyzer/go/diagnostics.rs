@@ -72,7 +72,7 @@ pub(crate) fn collect_go_semantic_diagnostics(
             }
         };
     let external = AnalyzerGoExternalEvidence {
-        overlay: analyzer.semantic_model_overlay(),
+        overlay: analyzer.semantic_model_overlay_read().published(),
         discovery: analyzer.dependency_discovery_evidence(Language::Go),
     };
     let cancellation = CancellationToken::new();

@@ -252,14 +252,27 @@ fn macro_arguments(node: Node<'_>) -> Option<Node<'_>> {
     crate::declarations::rust_macro_invocation_arguments(node)
 }
 
+fn attach_macro_operand(sink: &mut RoleSink<'_>, invocation: Node<'_>, range: Span) {
+    let target = invocation
+        .descendant_for_byte_range(range.start_byte, range.end_byte)
+        .expect("a macro operand lies inside its invocation");
+    if target.byte_range() == (range.start_byte..range.end_byte) {
+        sink.argument_maybe_named(target, None, false);
+    } else {
+        sink.argument_span(range);
+    }
+}
+
 fn rust_modeled_sink_macro_layout(
     node: Node<'_>,
     source: &str,
 ) -> Option<crate::format_args::RustMacroRuntimeLayout> {
-    crate::format_args::rust_macro_runtime_layout_for_path(
+    let layout = crate::format_args::rust_macro_runtime_layout_for_path(
         node.child_by_field_name("macro")?,
         source,
-    )
+    )?;
+    // #10972: runtime arguments require non-std identity admission.
+    (layout.owner != "log.__private_api").then_some(layout)
 }
 
 pub const RUST_KIND_TABLE: &[(&str, NormalizedKind)] = &[
@@ -641,27 +654,19 @@ fn rust_attribute_preserves_body(
                     }
                     let name = crate::declarations::rust_node_text(attribute.path[0], source);
                     if name == "test" {
-                        let mut work = 0usize;
-                        let mut charge = |amount: usize| -> Result<(), ()> {
-                            work = work.saturating_add(amount);
-                            (work <= 100_000).then_some(()).ok_or(())
-                        };
                         let unshadowed = owner_scope.is_some_and(|scope| {
                             if let Some(context) = context {
-                                let mut current = Some(scope);
-                                while let Some(node) = current {
-                                    if !context.test_attribute_scope_unshadowed(node.id()) {
-                                        return false;
-                                    }
-                                    current = node.parent();
-                                }
-                                true
+                                // Canonical preparation folds the complete ancestor
+                                // proof once. Replaying the chain here would make
+                                // deeply nested test owners quadratic again.
+                                context.test_attribute_scope_unshadowed(scope.id())
                             } else {
                                 crate::lexical_scope::rust_test_attribute_unshadowed_bounded(
                                     scope,
                                     source,
-                                    &mut charge,
-                                ) == Ok(true)
+                                    &mut |_| Ok::<(), std::convert::Infallible>(()),
+                                )
+                                .expect("uncapped test-attribute proof")
                             }
                         });
                         if !unshadowed {
@@ -768,7 +773,8 @@ static RUST_OCCURRENCE_ROLE_SUPPORT: OccurrenceRoleSupport = OccurrenceRoleSuppo
     .supported(OccurrenceRole::ReceiverPosition)
     .supported(OccurrenceRole::MemberPosition)
     .supported(OccurrenceRole::PatternPosition)
-    .supported(OccurrenceRole::ValueReference);
+    .supported(OccurrenceRole::ValueReference)
+    .supported(OccurrenceRole::CalleePosition);
 
 const RUST_DECLARATION_HEADS: &[&str] = &[
     "function_item",
@@ -813,6 +819,44 @@ fn rust_is_in_use_tree(node: Node<'_>) -> bool {
 /// `identifier` token, so `let r#type = ...` reaches the same binder arm as any
 /// other let pattern. Stripping the `r#` prefix is a spelling concern, not a
 /// role concern.
+// Grammar-only pattern roles, shared by direct extraction and the linear
+// canonical context walk (whose cursor already supplies the parent field).
+fn rust_pattern_occurrence_role(
+    parent_kind: &str,
+    field: Option<&str>,
+    direct: bool,
+    shorthand: bool,
+) -> Option<OccurrenceRole> {
+    Some(match parent_kind {
+        "parameter" | "let_declaration" | "let_condition" | "for_expression"
+            if field == Some("pattern") =>
+        {
+            OccurrenceRole::Binder
+        }
+        "closure_parameters" | "ref_pattern" | "reference_pattern" | "mut_pattern"
+        | "or_pattern" | "tuple_pattern" | "slice_pattern" | "captured_pattern" => {
+            if direct {
+                OccurrenceRole::Binder
+            } else {
+                OccurrenceRole::PatternPosition
+            }
+        }
+        "match_pattern" if field == Some("condition") => OccurrenceRole::ValueReference,
+        "match_pattern" if direct => OccurrenceRole::Binder,
+        "match_pattern" => OccurrenceRole::PatternPosition,
+        "field_pattern" if field == Some("pattern") => OccurrenceRole::Binder,
+        "field_pattern" if shorthand => OccurrenceRole::Binder,
+        "field_pattern" if field == Some("name") => OccurrenceRole::MemberPosition,
+        "tuple_struct_pattern" => match field {
+            Some("type") => OccurrenceRole::PatternPosition,
+            _ if !direct => OccurrenceRole::PatternPosition,
+            _ => OccurrenceRole::Binder,
+        },
+        "struct_pattern" if field == Some("type") => OccurrenceRole::PatternPosition,
+        _ => return None,
+    })
+}
+
 pub(crate) fn rust_occurrence_role(node: Node<'_>) -> Option<OccurrenceRole> {
     if !matches!(
         node.kind(),
@@ -839,8 +883,31 @@ pub(crate) fn rust_occurrence_role(node: Node<'_>) -> Option<OccurrenceRole> {
         parent = anchor.parent()?;
     }
 
+    // Only the terminal path identifier is a callee. Qualifiers retain their
+    // existing role and namespace. This includes local closure/function-pointer
+    // callees without declaration resolution, and excludes generic arguments.
+    let mut callee = anchor;
+    while let Some(parent) = callee.parent() {
+        match parent.kind() {
+            "generic_function" if is_field_of(parent, callee, "function") => callee = parent,
+            "parenthesized_expression" => callee = parent,
+            "call_expression" if is_field_of(parent, callee, "function") => {
+                return Some(OccurrenceRole::CalleePosition);
+            }
+            _ => break,
+        }
+    }
+
     let field = field_name_in_parent(parent, anchor);
     let parent_kind = parent.kind();
+    if let Some(role) = rust_pattern_occurrence_role(
+        parent_kind,
+        field,
+        anchor.id() == node.id(),
+        node.kind() == "shorthand_field_identifier",
+    ) {
+        return Some(role);
+    }
     let role = match parent_kind {
         "use_as_clause" if field == Some("alias") => OccurrenceRole::ImportAlias,
         "scoped_use_list" if field == Some("path") => OccurrenceRole::PathSegment,
@@ -848,30 +915,7 @@ pub(crate) fn rust_occurrence_role(node: Node<'_>) -> Option<OccurrenceRole> {
         _ if field == Some("name") && RUST_DECLARATION_HEADS.contains(&parent_kind) => {
             OccurrenceRole::DeclarationName
         }
-        "parameter" | "let_declaration" | "let_condition" | "for_expression"
-            if field == Some("pattern") =>
-        {
-            OccurrenceRole::Binder
-        }
-        "closure_parameters" | "ref_pattern" | "reference_pattern" | "mut_pattern"
-        | "or_pattern" | "tuple_pattern" | "slice_pattern" | "captured_pattern" => {
-            if anchor.id() == node.id() {
-                OccurrenceRole::Binder
-            } else {
-                OccurrenceRole::PatternPosition
-            }
-        }
-        "match_pattern" if field == Some("condition") => OccurrenceRole::ValueReference,
-        "match_pattern" if anchor.id() == node.id() => OccurrenceRole::Binder,
-        "match_pattern" => OccurrenceRole::PatternPosition,
-        "field_pattern" if field == Some("pattern") => OccurrenceRole::Binder,
-        "field_pattern" if node.kind() == "shorthand_field_identifier" => OccurrenceRole::Binder,
-        "field_pattern" if field == Some("name") => OccurrenceRole::MemberPosition,
-        "tuple_struct_pattern" => match field {
-            Some("type") => OccurrenceRole::PatternPosition,
-            _ => OccurrenceRole::Binder,
-        },
-        "struct_pattern" if field == Some("type") => OccurrenceRole::PatternPosition,
+
         "field_expression" => match field {
             Some("field") => OccurrenceRole::MemberPosition,
             Some("value") => OccurrenceRole::ReceiverPosition,
@@ -971,6 +1015,35 @@ fn rust_binding_activation(binder: Node<'_>, scope: Range) -> Option<BindingActi
     }
 }
 
+/// Per-file structural hooks borrowing the caller's sole lexical projection.
+pub struct RustStructuralFileHooks<'scope, 'tree> {
+    pub scope: &'scope crate::lexical_scope::RustPlainScope<'tree>,
+}
+
+impl<'tree> brokk_bifrost_core::analyzer::structural::spec::StructuralFileHooks<'tree>
+    for RustStructuralFileHooks<'_, 'tree>
+{
+    fn callee_provenance(
+        &self,
+        node: Node<'tree>,
+        source: &str,
+        charge: &mut dyn FnMut(
+            usize,
+        ) -> Result<
+            (),
+            brokk_bifrost_core::analyzer::structural::collector::StructuralFactCollectorStop,
+        >,
+    ) -> Result<
+        Option<CalleeProvenanceFact>,
+        brokk_bifrost_core::analyzer::structural::collector::StructuralFactCollectorStop,
+    > {
+        rust_callee_provenance_with(node, source, charge, &mut |site, charge| {
+            self.scope.local_binding_at(site, charge)
+        })
+        .map(Some)
+    }
+}
+
 // Provenance depends only on this blob's syntax, unlike dispatch or models.
 // Keep it on the persisted structural node array alongside other call facts:
 // every call-shape read already loads that node, avoiding another join or a
@@ -979,6 +1052,20 @@ fn rust_callee_provenance<E>(
     call: Node<'_>,
     source: &str,
     charge: &mut dyn FnMut(usize) -> Result<(), E>,
+) -> Result<CalleeProvenanceFact, E> {
+    rust_callee_provenance_with(call, source, charge, &mut |site, charge| {
+        crate::lexical_scope::rust_value_binding_at_bounded(site, source, charge)
+    })
+}
+
+fn rust_callee_provenance_with<'tree, E>(
+    call: Node<'tree>,
+    source: &str,
+    charge: &mut dyn FnMut(usize) -> Result<(), E>,
+    lookup: &mut impl FnMut(
+        Node<'tree>,
+        &mut dyn FnMut(usize) -> Result<(), E>,
+    ) -> Result<Option<Node<'tree>>, E>,
 ) -> Result<CalleeProvenanceFact, E> {
     let Some(function) = call.child_by_field_name("function") else {
         return Ok(rust_unknown_callee_provenance());
@@ -1006,9 +1093,7 @@ fn rust_callee_provenance<E>(
         if !matches!(callee.kind(), "identifier" | "self") {
             return Ok(rust_unknown_callee_provenance());
         }
-        let Some(binding) =
-            crate::lexical_scope::rust_value_binding_at_bounded(callee, source, charge)?
-        else {
+        let Some(binding) = lookup(callee, charge)? else {
             break None;
         };
         if let Some((alias, _)) = aliases.last() {
@@ -1037,7 +1122,7 @@ fn rust_callee_provenance<E>(
     // initializer and the call, including from a later loop iteration.
     aliases.extend(binding.map(|binding| (binding, callee)));
     for (binding, occurrence) in aliases {
-        if rust_binding_may_be_written(binding, occurrence, source, charge)? {
+        if rust_binding_may_be_written_with(binding, occurrence, source, charge, lookup)? {
             return Ok(rust_unknown_callee_provenance());
         }
     }
@@ -1087,13 +1172,28 @@ fn rust_callee_value<'tree, E>(
 /// immutable binding needs no scan. A use of a mutable one in its scope is
 /// a write when it may assign, mutably borrow or autoref it, and the scan
 /// re-resolves each such use so a shadowing binding's writes do not count.
-fn rust_binding_may_be_written<E>(
-    binding: Node<'_>,
-    occurrence: Node<'_>,
+pub fn rust_binding_may_be_written<'tree, E>(
+    binding: Node<'tree>,
+    occurrence: Node<'tree>,
     source: &str,
     charge: &mut dyn FnMut(usize) -> Result<(), E>,
 ) -> Result<bool, E> {
-    let mutable = match binding.kind() {
+    rust_binding_may_be_written_with(binding, occurrence, source, charge, &mut |site, charge| {
+        crate::lexical_scope::rust_value_binding_at_bounded(site, source, charge)
+    })
+}
+
+fn rust_binding_may_be_written_with<'tree, E>(
+    binding: Node<'tree>,
+    occurrence: Node<'tree>,
+    source: &str,
+    charge: &mut dyn FnMut(usize) -> Result<(), E>,
+    lookup: &mut impl FnMut(
+        Node<'tree>,
+        &mut dyn FnMut(usize) -> Result<(), E>,
+    ) -> Result<Option<Node<'tree>>, E>,
+) -> Result<bool, E> {
+    let mut mutable = match binding.kind() {
         // `&mut self` borrows mutably; only `mut self` is a mutable binding.
         "self_parameter" => binding
             .child(0)
@@ -1109,6 +1209,18 @@ fn rust_binding_may_be_written<E>(
                     .any(|child| child.kind() == "mutable_specifier")
         }
     };
+    if !mutable && let Some(pattern) = binding.child_by_field_name("pattern") {
+        let mut patterns = vec![pattern];
+        while let Some(node) = patterns.pop() {
+            charge(1)?;
+            if matches!(node.kind(), "mut_pattern" | "mutable_specifier") {
+                mutable = true;
+                break;
+            }
+            let mut cursor = node.walk();
+            patterns.extend(node.named_children(&mut cursor));
+        }
+    }
     if !mutable {
         return Ok(false);
     }
@@ -1147,10 +1259,11 @@ fn rust_binding_may_be_written<E>(
         if named_use
             && crate::declarations::rust_node_text(node, source) == name
             && rust_occurrence_may_write(node, charge)?
-            && crate::lexical_scope::rust_value_binding_at_bounded(node, source, charge)?
-                .is_some_and(|selected| selected.id() == binding.id())
         {
-            return Ok(true);
+            match lookup(node, charge)? {
+                Some(selected) if selected.id() != binding.id() => {}
+                _ => return Ok(true),
+            }
         }
         let mut cursor = node.walk();
         stack.extend(node.named_children(&mut cursor));
@@ -1545,10 +1658,74 @@ fn rust_callee_bound_paths<E>(
     Ok(result)
 }
 
+// The canonical builder has no query-work stop in its return type. In
+// particular, cancellation cannot be mistaken for a semantic Open verdict.
+fn prepare_rust_call_site_context(
+    root: Node<'_>,
+    source: &str,
+    cancellation: Option<&brokk_bifrost_core::CancellationToken>,
+) -> Result<CallSiteContext, crate::lexical_scope::RustPreparationCancelled> {
+    use crate::lexical_scope::{RustCanonicalPatternIndex, RustPatternName, RustPreparationWork};
+    use brokk_bifrost_core::analyzer::structural::spec::BindingCandidateVerdict;
+    let mut work = RustPreparationWork::new(cancellation);
+    let index = RustCanonicalPatternIndex::prepare(root, source, &mut work)?;
+    let mut verdicts = brokk_bifrost_core::hash::HashMap::default();
+    let mut stack = vec![(root, false, false)];
+    while let Some((node, inherited_strict, binder)) = stack.pop() {
+        work.charge(1)?;
+        let shorthand = node.kind() == "shorthand_field_identifier";
+        if binder && (inherited_strict || shorthand) {
+            let verdict = match index.classify(node) {
+                RustPatternName::Binding => BindingCandidateVerdict::Binding,
+                RustPatternName::ValueItem => BindingCandidateVerdict::ValueItem,
+                RustPatternName::Unknown => BindingCandidateVerdict::Open,
+            };
+            verdicts.insert(node.id(), verdict);
+        }
+        // This is the same boundary rule as rust_binding_needs_strict_selection,
+        // folded once per ancestor rather than walked anew by each binder.
+        let child_strict = match node.kind() {
+            "let_declaration" => node.child_by_field_name("alternative").is_some(),
+            "or_pattern" | "reference_pattern" | "match_pattern" | "match_arm"
+            | "let_condition" => true,
+            "parameter" | "closure_parameters" | "for_expression" => false,
+            _ => inherited_strict,
+        };
+        let mut cursor = node.walk();
+        if cursor.goto_first_child() {
+            loop {
+                work.charge(1)?;
+                let child = cursor.node();
+                if child.is_named() {
+                    let binder = matches!(
+                        child.kind(),
+                        "identifier"
+                            | "field_identifier"
+                            | "type_identifier"
+                            | "shorthand_field_identifier"
+                    ) && rust_pattern_occurrence_role(
+                        node.kind(),
+                        cursor.field_name(),
+                        true,
+                        child.kind() == "shorthand_field_identifier",
+                    ) == Some(OccurrenceRole::Binder);
+                    stack.push((child, child_strict, binder));
+                }
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
+    }
+    work.charge(0)?;
+    Ok(CallSiteContext::with_binding_candidate_verdicts(verdicts)
+        .with_test_attribute_scopes(index.test_scopes))
+}
+
 impl StructuralSpec for RustStructuralSpec {
     fn call_site_context(&self, root: Node<'_>, source: &str) -> CallSiteContext {
-        self.call_site_context_limited(root, source, usize::MAX, None)
-            .expect("unbounded Rust syntax preparation")
+        prepare_rust_call_site_context(root, source, None)
+            .expect("canonical Rust preparation without cancellation")
     }
 
     fn call_site_context_limited(
@@ -1556,154 +1733,15 @@ impl StructuralSpec for RustStructuralSpec {
         root: Node<'_>,
         source: &str,
         _max_work_items: usize,
-        cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
+        cancellation: Option<&brokk_bifrost_core::CancellationToken>,
     ) -> Result<
         CallSiteContext,
         brokk_bifrost_core::analyzer::structural::collector::StructuralFactCollectorStop,
     > {
-        use brokk_bifrost_core::analyzer::structural::collector::StructuralFactCollectorStop;
-        let mut binders = Vec::new();
-        let mut test_scopes_to_prepare = Vec::new();
-        let mut stack = vec![root];
-        let mut work = 0usize;
-        // This is a preparation budget, not the collector's fact-node budget:
-        // raw Rust syntax can contain many nodes that never become facts.
-        // Fixed per-file work allowance: identical bytes always persist the
-        // same verdicts regardless of request budget or cache history.
-        const PREPARATION_LIMIT: usize = 100_000;
-        while let Some(node) = stack.pop() {
-            if cancellation.is_some_and(|token| token.is_cancelled()) {
-                return Err(StructuralFactCollectorStop::Cancelled);
-            }
-            work = work.saturating_add(1);
-            if work > PREPARATION_LIMIT {
-                return Ok(CallSiteContext::with_open_binding_candidates());
-            }
-            if let Some(role) = rust_occurrence_role(node)
-                && rust_occurrence_needs_binding_verdict(node, role)
-            {
-                binders.push(node);
-            }
-            if node.kind() == "attribute_item"
-                && crate::resolution::rust_effective_attributes(std::iter::once(node), source)
-                    .is_some_and(|attributes| {
-                        attributes.into_iter().any(|attribute| {
-                            attribute.path.len() == 1
-                                && crate::declarations::rust_node_text(attribute.path[0], source)
-                                    == "test"
-                        })
-                    })
-                && let Some(scope) = node
-                    .parent()
-                    .and_then(|attributes| attributes.parent())
-                    .and_then(|owner| owner.parent())
-            {
-                test_scopes_to_prepare.push(scope);
-            }
-            for index in (0..node.named_child_count()).rev() {
-                stack.push(node.named_child(index).expect("named child"));
-            }
-        }
-        // Classification is a second bounded phase. The index scans each
-        // lexical scope once; charge each candidate before entering it.
-        if work.saturating_add(binders.len()) > PREPARATION_LIMIT {
-            return Ok(CallSiteContext::with_open_binding_candidates());
-        }
-        if cancellation.is_some_and(|token| token.is_cancelled()) {
-            return Err(StructuralFactCollectorStop::Cancelled);
-        }
-        let mut index = crate::lexical_scope::RustStrictPatternIndex::default();
-        let mut answers = Vec::with_capacity(binders.len());
-        for &binder in &binders {
-            if cancellation.is_some_and(|token| token.is_cancelled()) {
-                return Err(StructuralFactCollectorStop::Cancelled);
-            }
-            work += 1;
-            if work > PREPARATION_LIMIT {
-                return Ok(CallSiteContext::with_open_binding_candidates());
-            }
-            let verdict = if rust_binding_needs_strict_selection(binder) {
-                let mut charge = |amount: usize| {
-                    if cancellation.is_some_and(|token| token.is_cancelled()) {
-                        return Err(StructuralFactCollectorStop::Cancelled);
-                    }
-                    work = work.saturating_add(amount);
-                    if work > PREPARATION_LIMIT {
-                        return Err(StructuralFactCollectorStop::Exceeded);
-                    }
-                    Ok(())
-                };
-                let classification =
-                    match index.classify_with_budget(root, source, binder, &mut charge) {
-                        Ok(classification) => classification,
-                        Err(StructuralFactCollectorStop::Cancelled) => {
-                            return Err(StructuralFactCollectorStop::Cancelled);
-                        }
-                        Err(StructuralFactCollectorStop::Exceeded) => {
-                            return Ok(CallSiteContext::with_open_binding_candidates());
-                        }
-                    };
-                match classification {
-                    crate::lexical_scope::RustPatternName::Binding => {
-                        brokk_bifrost_core::analyzer::structural::spec::BindingCandidateVerdict::Binding
-                    }
-                    crate::lexical_scope::RustPatternName::ValueItem => {
-                        brokk_bifrost_core::analyzer::structural::spec::BindingCandidateVerdict::ValueItem
-                    }
-                    crate::lexical_scope::RustPatternName::Unknown => {
-                        brokk_bifrost_core::analyzer::structural::spec::BindingCandidateVerdict::Open
-                    }
-                }
-            } else {
-                brokk_bifrost_core::analyzer::structural::spec::BindingCandidateVerdict::Binding
-            };
-            answers.push(verdict);
-        }
-        let verdicts = binders
-            .into_iter()
-            .zip(answers)
-            .map(|(binder, verdict)| (binder.id(), verdict))
-            .collect();
-        let mut test_scopes = brokk_bifrost_core::hash::HashMap::default();
-        for owner_scope in test_scopes_to_prepare {
-            let mut current = Some(owner_scope);
-            while let Some(scope) = current {
-                if cancellation.is_some_and(|token| token.is_cancelled()) {
-                    return Err(StructuralFactCollectorStop::Cancelled);
-                }
-                if let std::collections::hash_map::Entry::Vacant(entry) =
-                    test_scopes.entry(scope.id())
-                {
-                    let mut charge = |amount: usize| {
-                        if cancellation.is_some_and(|token| token.is_cancelled()) {
-                            return Err(StructuralFactCollectorStop::Cancelled);
-                        }
-                        work = work.saturating_add(amount);
-                        if work > PREPARATION_LIMIT {
-                            return Err(StructuralFactCollectorStop::Exceeded);
-                        }
-                        Ok(())
-                    };
-                    let unshadowed = match crate::lexical_scope::rust_test_scope_unshadowed_bounded(
-                        scope,
-                        source,
-                        &mut charge,
-                    ) {
-                        Ok(value) => value,
-                        Err(StructuralFactCollectorStop::Cancelled) => {
-                            return Err(StructuralFactCollectorStop::Cancelled);
-                        }
-                        Err(StructuralFactCollectorStop::Exceeded) => {
-                            return Ok(CallSiteContext::with_open_binding_candidates());
-                        }
-                    };
-                    entry.insert(unshadowed);
-                }
-                current = scope.parent();
-            }
-        }
-        Ok(CallSiteContext::with_binding_candidate_verdicts(verdicts)
-            .with_test_attribute_scopes(test_scopes))
+        // The surrounding query collector owns its allowance. Rust syntax
+        // preparation is complete and can stop only for cancellation.
+        prepare_rust_call_site_context(root, source, cancellation)
+            .map_err(|crate::lexical_scope::RustPreparationCancelled| brokk_bifrost_core::analyzer::structural::collector::StructuralFactCollectorStop::Cancelled)
     }
 
     fn supports_unsafe_context(&self) -> bool {
@@ -1906,9 +1944,32 @@ impl StructuralSpec for RustStructuralSpec {
             return None;
         }
         let coverage = if rust_modeled_sink_macro_layout(node, source).is_some()
-            && crate::format_args::rust_format_macro_arguments(node, source).is_ok()
-        {
+            && if rust_modeled_sink_macro_layout(node, source)
+                .is_some_and(|layout| layout.owner == "alloc")
+            {
+                crate::format_args::rust_vec_macro_arguments(node, source).is_ok()
+            } else {
+                crate::format_args::rust_format_macro_arguments(node, source).is_ok()
+            } {
             CallShapeCoverage::ExactMacroDerived
+        } else if node
+            .child_by_field_name("macro")
+            .and_then(|path| crate::format_args::rust_macro_runtime_layout_for_path(path, source))
+            .is_some_and(|layout| layout.owner == "log.__private_api")
+            && crate::format_args::rust_format_macro_arguments(node, source).is_ok_and(
+                |arguments| {
+                    crate::format_args::rust_logging_format_operand(node, source, &arguments)
+                        .is_some()
+                },
+            )
+        {
+            CallShapeCoverage::CandidateMacroDerived
+        } else if crate::macro_matcher::invocation_names_matches(node, source)
+            && crate::macro_matcher::parse_macro_operands(node, source).is_some()
+        {
+            // #11251: a matches! with native operands is a candidate for the
+            // intrinsic alternate; its identity is proved at query time.
+            CallShapeCoverage::CandidateMacroDerived
         } else {
             CallShapeCoverage::UnknownMacroDerived
         };
@@ -2065,28 +2126,7 @@ impl StructuralSpec for RustStructuralSpec {
         source: &str,
         binder: Node<'_>,
     ) -> brokk_bifrost_core::analyzer::structural::spec::BindingCandidateVerdict {
-        use crate::lexical_scope::RustPatternName;
-        use brokk_bifrost_core::analyzer::structural::spec::BindingCandidateVerdict;
-        // Parameter patterns are irrefutable. A binder beneath `&` remains
-        // a binding unless this lexical check proves a competing value item.
-        if !rust_binding_needs_strict_selection(binder) {
-            return BindingCandidateVerdict::Binding;
-        }
-        let mut work = 0usize;
-        let mut charge = |amount: usize| -> Result<(), ()> {
-            work = work.saturating_add(amount);
-            (work <= 100_000).then_some(()).ok_or(())
-        };
-        match crate::lexical_scope::rust_pattern_name_strict_bounded(
-            root,
-            source,
-            binder,
-            &mut charge,
-        ) {
-            Ok(RustPatternName::Binding) => BindingCandidateVerdict::Binding,
-            Ok(RustPatternName::ValueItem) => BindingCandidateVerdict::ValueItem,
-            Ok(RustPatternName::Unknown) | Err(()) => BindingCandidateVerdict::Open,
-        }
+        self.binding_candidate_verdicts(root, source, &[binder])[0]
     }
 
     fn binding_candidate_verdicts(
@@ -2137,6 +2177,44 @@ impl StructuralSpec for RustStructuralSpec {
             .0
             .into_iter()
             .map(|anchor| anchor.map(|anchor| (anchor.start_byte, anchor.end_byte)))
+            .collect()
+    }
+
+    fn logical_binding_anchor_checked(
+        &self,
+        binder: Node<'_>,
+        source: &str,
+    ) -> Result<
+        Option<(usize, usize)>,
+        brokk_bifrost_core::analyzer::structural::spec::BindingWorkLimit,
+    > {
+        crate::binding_identity::rust_binding_anchor_checked(binder, source)
+            .map(|answer| answer.map(|anchor| (anchor.start_byte, anchor.end_byte)))
+    }
+
+    fn logical_binding_anchors_checked(
+        &self,
+        binders: &[Node<'_>],
+        source: &str,
+    ) -> Vec<
+        Result<
+            Option<(usize, usize)>,
+            brokk_bifrost_core::analyzer::structural::spec::BindingWorkLimit,
+        >,
+    > {
+        let Some(first) = binders.first() else {
+            return Vec::new();
+        };
+        let mut root = *first;
+        while let Some(parent) = root.parent() {
+            root = parent;
+        }
+        crate::binding_identity::rust_binding_anchors_checked(root, source, binders)
+            .0
+            .into_iter()
+            .map(|answer| {
+                answer.map(|answer| answer.map(|anchor| (anchor.start_byte, anchor.end_byte)))
+            })
             .collect()
     }
 
@@ -2288,12 +2366,31 @@ impl StructuralSpec for RustStructuralSpec {
                     }
                     let modeled_sink =
                         rust_modeled_sink_macro_layout(node, source).and_then(|layout| {
-                            let arguments =
+                            let arguments = if layout.owner == "alloc" {
+                                crate::format_args::rust_vec_macro_arguments(node, source)
+                                    .map(crate::format_args::RustVecMacroArguments::into_operands)
+                            } else {
                                 crate::format_args::rust_format_macro_arguments(node, source)
-                                    .ok()?;
+                            }
+                            .ok()?;
                             Some((layout, arguments))
                         });
                     if let Some((layout, arguments)) = modeled_sink {
+                        if layout.owner == "alloc" {
+                            for argument in &arguments {
+                                if !sink.should_continue() {
+                                    break;
+                                }
+                                attach_macro_operand(
+                                    sink,
+                                    node,
+                                    Span {
+                                        start_byte: argument.range.start_byte,
+                                        end_byte: argument.range.end_byte,
+                                    },
+                                );
+                            }
+                        }
                         for role in layout.arguments {
                             if !sink.should_continue() {
                                 break;
@@ -2306,22 +2403,36 @@ impl StructuralSpec for RustStructuralSpec {
                                 }
                                 RustMacroRuntimeArgument::BorrowedOperand(index) => Some(index),
                                 RustMacroRuntimeArgument::DebugOperand => Some(0),
-                                RustMacroRuntimeArgument::AssertionKind => None,
+                                RustMacroRuntimeArgument::LogMessage => {
+                                    arguments.iter().position(|argument| {
+                                        argument.role
+                                            == Some(
+                                                crate::macro_matcher::RustLogOperandRole::Format,
+                                            )
+                                    })
+                                }
+                                RustMacroRuntimeArgument::LogOperand(role) => arguments
+                                    .iter()
+                                    .position(|argument| argument.role == Some(role)),
+                                RustMacroRuntimeArgument::AssertionKind
+                                | RustMacroRuntimeArgument::Synthetic
+                                | RustMacroRuntimeArgument::LogKeyValues => None,
                             };
                             // Synthetic arguments without written operands stay
                             // anchored to their invocation.
-                            let target = written_index
+                            let range = written_index
                                 .and_then(|index| arguments.get(index))
-                                .map_or(node, |argument| {
-                                    node.descendant_for_byte_range(
-                                        argument.range.start_byte,
-                                        argument.range.end_byte,
-                                    )
-                                    .expect(
-                                        "a format argument range lies inside its macro invocation",
-                                    )
+                                .map_or(node.byte_range(), |argument| {
+                                    argument.range.start_byte..argument.range.end_byte
                                 });
-                            sink.argument_maybe_named(target, None, false);
+                            attach_macro_operand(
+                                sink,
+                                node,
+                                Span {
+                                    start_byte: range.start,
+                                    end_byte: range.end,
+                                },
+                            );
                         }
                     } else if let Some(arguments) = macro_arguments(node) {
                         for index in 0..arguments.named_child_count() {
@@ -2541,8 +2652,9 @@ fn collection_elements_exclude_attributes_and_target_expression_payloads() {
                     brokk_bifrost_core::analyzer::structural::spec::PendingRoleTargetKind::Node(
                         id,
                     ) => id,
-                    brokk_bifrost_core::analyzer::structural::spec::PendingRoleTargetKind::Span =>
-                        panic!("call argument has a node target"),
+                    brokk_bifrost_core::analyzer::structural::spec::PendingRoleTargetKind::Span(
+                        _,
+                    ) => panic!("call argument has a node target"),
                 })
                 .collect::<Vec<_>>(),
             calls.into_iter().map(|(_, id)| id).collect::<Vec<_>>()
@@ -2957,6 +3069,8 @@ fn macro_access() {
             "const C: i32 = 1; struct P { C: i32 } fn f(v: P) { match v { P { C } => {} } }",
             "const C: i32 = 1; fn f(v: i32) { use dep::*; match v { C => {}, x => {} } }",
             "fn f(&x: &i32, &(a, b): &(i32, i32)) { let _ = (x, a, b); }",
+            "use dep::x; fn f(x: i32) { let x = 1; let _ = x; }",
+            "const C: i32 = 0; use dep::*; fn f(C: i32) { let C = 1; for C in [] {} let _ = |C| C; }",
         ] {
             let tree = parse_rust_tree_for_test(source).unwrap();
             let root = tree.root_node();
@@ -2978,6 +3092,13 @@ fn macro_access() {
                         extraction_context.binding_candidate_verdict_at(binder.id()),
                         Some(verdict),
                         "{source}"
+                    );
+                } else {
+                    assert_eq!(verdict, brokk_bifrost_core::analyzer::structural::spec::BindingCandidateVerdict::Binding);
+                    assert_eq!(
+                        extraction_context.binding_candidate_verdict_at(binder.id()),
+                        None,
+                        "irrefutable binders must bypass strict selection: {source}"
                     );
                 }
             }
@@ -3059,7 +3180,7 @@ fn macro_access() {
             .unwrap();
         assert_eq!(
             context.binding_candidate_verdict_at(first.id()),
-            Some(brokk_bifrost_core::analyzer::structural::spec::BindingCandidateVerdict::Open)
+            Some(brokk_bifrost_core::analyzer::structural::spec::BindingCandidateVerdict::Binding)
         );
         assert_eq!(
             context.binding_candidate_verdict_at(first.id()),
@@ -3276,7 +3397,7 @@ fn macro_access() {
                 &huge,
                 &context
             ),
-            Some("rust_opaque_attribute")
+            Some("rust_body_preserving_attribute")
         );
     }
 
@@ -3392,6 +3513,37 @@ fn macro_access() {
 mod parameter_tests {
     use super::*;
     use crate::test_helpers::{occurrence_text, parse_rust_fixture};
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11397: qualified variant inside tuple-struct pattern is not a binder"
+    )]
+    fn qualified_variant_in_tuple_struct_pattern_is_not_a_binding() {
+        let source = "enum E { V } fn f(x: Result<(), E>) { match x { Err(E::V) => {}, Err(e) => {}, _ => {} } }";
+        let parsed = parse_rust_fixture(source);
+        let source_facts = parsed.source_facts.as_ref().unwrap();
+        let facts = &source_facts.structural;
+        for (marker, offset, expected) in [
+            ("E::V)", 3, OccurrenceRole::PatternPosition),
+            ("Err(e)", 4, OccurrenceRole::Binder),
+        ] {
+            let start = source.find(marker).unwrap() + offset;
+            let node = facts
+                .nodes()
+                .iter()
+                .position(|node| {
+                    let range = source_facts.occurrences.occurrence(node.occurrence).range;
+                    range.start_byte == start && range.end_byte == start + 1
+                })
+                .unwrap() as u32;
+            let roles = facts.occurrence_roles(node);
+            assert!(roles.contains(&expected), "{marker}: {roles:?}");
+            assert_eq!(
+                roles.contains(&OccurrenceRole::Binder),
+                expected == OccurrenceRole::Binder
+            );
+        }
+    }
 
     #[test]
     fn parameters_are_named_structural_facts() {
@@ -4079,4 +4231,50 @@ fn parse_rust_tree_for_test(source: &str) -> Option<tree_sitter::Tree> {
         &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing(),
     );
     crate::lexical_scope::parse_rust_tree_with(&caches, source)
+}
+
+#[cfg(test)]
+mod callee_role_grammar_boundary {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#11988: function-name tokens seeded duplicate sensitive-variable sources")]
+    fn callee_paths_arguments_and_method_names() {
+        let source = "fn example() { a::b(arg); T::new(); let f = || {}; f(); obj.foo(arg); direct::<Ty>(arg); Wrapper::<Outer>::make::<Inner>(); (wrapped)(); (modu::nested)(); }";
+        let tree = crate::test_helpers::parse_rust(source);
+        assert!(!tree.root_node().has_error());
+        let mut pending = vec![tree.root_node()];
+        while let Some(node) = pending.pop() {
+            let text = node.utf8_text(source.as_bytes()).unwrap();
+            let expected = match text {
+                "b" | "new" | "direct" | "make" | "wrapped" | "nested" => {
+                    Some(OccurrenceRole::CalleePosition)
+                }
+                "f" if node.parent().unwrap().kind() == "call_expression" => {
+                    Some(OccurrenceRole::CalleePosition)
+                }
+                "a" | "T" | "modu" => Some(OccurrenceRole::PathSegment),
+                "Wrapper" => Some(OccurrenceRole::TypeOperand),
+                "arg" => Some(OccurrenceRole::ValueReference),
+                "obj" => Some(OccurrenceRole::ReceiverPosition),
+                "foo" => Some(OccurrenceRole::MemberPosition),
+                "Ty" | "Outer" | "Inner" => Some(OccurrenceRole::TypeOperand),
+                _ => None,
+            };
+            if let Some(expected) = expected {
+                assert_eq!(rust_occurrence_role(node), Some(expected), "{text}");
+                if text == "a" {
+                    use brokk_bifrost_core::analyzer::structural::occurrences::{
+                        Namespace, default_occurrence_namespace,
+                    };
+                    assert_eq!(
+                        default_occurrence_namespace(expected, None),
+                        Some(Namespace::PathPrefix)
+                    );
+                }
+            }
+            pending.extend(node.named_children(&mut node.walk()));
+        }
+    }
 }

@@ -64,8 +64,11 @@ placements AS (
   SELECT attribute.placement, attribute.source_kind
   FROM temp.selected_resolution_mounts AS mount
   CROSS JOIN main.resolution_unit_summary_members AS member
-    INDEXED BY resolution_unit_summary_members_blob
-    ON member.blob_id=mount.blob_id AND member.rel_path=mount.persisted_relative_path
+    INDEXED BY resolution_unit_summary_members_path
+    ON member.rel_path=mount.persisted_relative_path
+  CROSS JOIN temp.selected_unit_member_blobs AS attachment
+    ON attachment.summary_id=member.summary_id AND attachment.member_ordinal=member.member_ordinal
+    AND attachment.blob_id=mount.blob_id
   CROSS JOIN selected_rust_unit_summaries AS unit
     ON unit.summary_id=member.summary_id
   LEFT JOIN main.rust_resolution_unit_summary_placement_attributes AS attribute

@@ -897,6 +897,7 @@ impl AnalyzerStore {
         }
         let base_snapshot = base_snapshot.clone();
         let cancellation = cancellation.clone();
+        let csharp_rule_budget = self.retention_budget().clone();
         self.conn.execute(move |conn| -> Result<PythonRuntimeProviderPublication> {
             if cancellation.is_cancelled() {
                 return Err(StoreError::new("Python runtime provider publication cancelled"));
@@ -971,6 +972,7 @@ impl AnalyzerStore {
                     let replacements = [(WorkspaceInputKind::Configuration, &replacement)];
                     (snapshot, _) = workspace_inputs::publish_workspace_input_changes(
                         &tx,
+                        &csharp_rule_budget,
                         &base_snapshot.workspace_id,
                         &base_snapshot.lang,
                         base_snapshot.generation,
@@ -978,6 +980,7 @@ impl AnalyzerStore {
                         &closed,
                         &replacements,
                         &Default::default(),
+                        None,
                     )?;
                 }
             }

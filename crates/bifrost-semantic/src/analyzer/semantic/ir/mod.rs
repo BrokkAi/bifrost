@@ -10,9 +10,11 @@
 
 #[doc(hidden)]
 pub mod artifact;
+mod cleanup;
 #[doc(hidden)]
 pub mod model;
 mod validation;
+pub use cleanup::*;
 
 pub use crate::analyzer::semantic::ir::artifact::*;
 
@@ -20,3 +22,14 @@ pub use crate::analyzer::semantic::ir::model::*;
 
 #[doc(hidden)]
 pub use validation::measure_procedure_work;
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use validation::control_edge_validation_work_for_test;
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use validation::construction_membership_work_for_test;
+
+#[doc(hidden)]
+pub use validation::validate_guarded_pattern_projections;

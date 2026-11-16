@@ -32,7 +32,7 @@ use crate::declarations::{
 use crate::imports::{
     PythonImportDetails, python_import_details, python_namespace_binding_module,
     python_namespace_binding_name, resolve_exported_fqn, resolve_import_bindings,
-    resolve_python_relative_module,
+    resolve_python_module_specifier,
 };
 
 /// The analyzer-resident products Python's language logic resolves through, on
@@ -362,7 +362,7 @@ impl PythonModuleSpellings {
     /// resolve to a workspace's own `seaborn._core.typing`.
     pub fn suffix_candidates(&self, module_fq: &str) -> Vec<PythonSourceRootModule> {
         // A leading dot makes the specifier relative to the importing file's own
-        // package, which `resolve_python_relative_module` resolves before any
+        // package, which `resolve_python_module_specifier` resolves before any
         // lookup; no `sys.path` entry takes part in it.
         if module_fq.starts_with('.') {
             return Vec::new();
@@ -860,7 +860,7 @@ fn record_single_reexport_event(
         .map(|path| path.declaration_start_byte)
         .unwrap_or(usize::MAX);
     let resolved_module = if module.starts_with('.') {
-        resolve_python_relative_module(python.project(), file, &module)
+        resolve_python_module_specifier(python.project(), file, &module)
     } else {
         Some(module.clone())
     };
@@ -952,7 +952,7 @@ pub fn import_bindings_from_imports(
                 ..
             } => {
                 let resolved_module = if module.starts_with('.') {
-                    resolve_python_relative_module(python.project(), file, &module)
+                    resolve_python_module_specifier(python.project(), file, &module)
                 } else {
                     Some(module.clone())
                 };

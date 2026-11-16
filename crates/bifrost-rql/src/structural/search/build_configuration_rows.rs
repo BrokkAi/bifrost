@@ -112,6 +112,7 @@ fn report(
     cache: &mut TopologyTraversalCache,
     language: Language,
     subject: String,
+
     incompleteness: brokk_bifrost_rql::Incompleteness,
     message: String,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
@@ -120,6 +121,10 @@ fn report(
         return;
     }
     diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        has_non_utf8_refusal: false,
+        refusal_sites: Default::default(),
+        call_relation_facts: None,
+        uses_omissions: Vec::new(),
         incompleteness,
         related: Vec::new(),
         source: None,

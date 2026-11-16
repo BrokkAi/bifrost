@@ -1,0 +1,9 @@
+# The csharp-compilation-derivation lever (#11570).
+#
+# Invalidates C# compilation sets and their derived compilation facts.
+# Add one `<issue>-<slug>` line when these derivation rules change.
+# Git merges this file with merge=union. Never edit or remove a token line.
+# See .agents/docs/cache-identity-levers.md.
+#
+# Replaced the literal: DERIVATION_VERSION = 22.
+11570-slice2b-derivation-identity

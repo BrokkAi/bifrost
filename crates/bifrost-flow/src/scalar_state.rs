@@ -678,6 +678,13 @@ pub enum ScalarBindingType {
     /// A fixed-width integer binding. An integer write takes this domain, and
     /// a value outside it is not representable here and becomes unknown.
     MachineInteger(ScalarIntegerDomain),
+    /// A built-in integer binding whose width and signedness the language
+    /// infers from later uses, as Rust does for an unsuffixed literal. Only
+    /// an exact value that every integer type can represent is kept: 0
+    /// through 127. Any other value, range, or arithmetic fact can change
+    /// with the inferred width or an overflowing-literal wrap, so it becomes
+    /// unknown. There is no static domain: a guard cannot assume a width.
+    InferredInteger,
     /// An IEEE binary64 binding. An integer write within 2^53 converts
     /// exactly to a floating range; a larger one may round and is unknown.
     Binary64,
@@ -775,7 +782,9 @@ impl ScalarBindingType {
                 Some(ScalarFact::Float(ScalarFloatRange::any()))
             }
             ScalarBindingType::Boolean => Some(ScalarFact::EitherBoolean),
-            ScalarBindingType::DynamicBinary64 | ScalarBindingType::UnknownNumeric => None,
+            ScalarBindingType::DynamicBinary64
+            | ScalarBindingType::InferredInteger
+            | ScalarBindingType::UnknownNumeric => None,
         }
     }
 
@@ -815,6 +824,14 @@ impl ScalarBindingType {
             (ScalarBindingType::DynamicBinary64, ScalarFact::NonExactInteger) => {
                 ScalarFact::Unknown
             }
+            (ScalarBindingType::InferredInteger, ScalarFact::Integer(interval)) => interval
+                .exact_value()
+                .filter(|value| !value.negative() && value.magnitude() <= 127)
+                .map_or(ScalarFact::Unknown, |_| ScalarFact::Integer(interval)),
+            (
+                ScalarBindingType::InferredInteger,
+                ScalarFact::NonExactInteger | ScalarFact::Float(_),
+            ) => ScalarFact::Unknown,
             (
                 ScalarBindingType::UnknownNumeric,
                 ScalarFact::Integer(_) | ScalarFact::NonExactInteger | ScalarFact::Float(_),
@@ -1186,10 +1203,13 @@ pub fn java_scalar_seeds(
 }
 
 /// Derive [`ScalarSeeds`] from the declared types of a procedure's bindings
-/// (see `brokk_bifrost_analysis::analyzer::declared_scalar`). Every binding
-/// without an entry keeps no numeric fact, because its integer width is
-/// unknown. A typed formal starts in its full domain: the producer does not
-/// box a value of a type that has an entry.
+/// (see `brokk_bifrost_analysis::analyzer::declared_scalar`). A binding whose
+/// initializer is an unsuffixed integer literal keeps an exact value that
+/// every integer type can represent even though its width and signedness are
+/// inferred from later uses. Every binding without an entry keeps no numeric
+/// fact, because its integer width is unknown. A typed formal starts in its
+/// full domain: the producer does not box a value of a type that has an
+/// entry.
 pub fn declared_scalar_seeds(
     procedure: &ProcedureHandle,
     declared: Vec<(ValueId, DeclaredScalarType)>,
@@ -1199,6 +1219,7 @@ pub fn declared_scalar_seeds(
     let mut bindings = Vec::new();
     for (target, scalar_type) in declared {
         let binding_type = match scalar_type {
+            DeclaredScalarType::UnknownInteger => ScalarBindingType::InferredInteger,
             DeclaredScalarType::Signed(bits) => {
                 ScalarBindingType::MachineInteger(ScalarIntegerDomain::signed(bits))
             }
@@ -1216,7 +1237,7 @@ pub fn declared_scalar_seeds(
                 target,
                 fact: binding_type
                     .static_domain()
-                    .expect("a declared scalar type has a static domain"),
+                    .expect("a typed formal has a static domain"),
             });
         }
     }
@@ -1684,9 +1705,10 @@ fn closed_scalar_cells(
                     return false;
                 }
                 match gap.subject {
-                    SemanticGapSubject::Procedure
+                    SemanticGapSubject::FutureConstruction | SemanticGapSubject::FutureActivation | SemanticGapSubject::Procedure
                     | SemanticGapSubject::Point
                     | SemanticGapSubject::AsyncContinuation { .. } => true,
+                    SemanticGapSubject::CleanupOwners(segment) => std::iter::once(binding).chain(aliases.iter().copied()).any(|value| semantics.cleanup_chains().contains_owner(segment, value)),
                     SemanticGapSubject::Value(value) => {
                         value == binding || aliases.contains(&value)
                     }
@@ -1860,6 +1882,7 @@ fn transfer_point(
             SemanticEffect::ValueFlow {
                 kind:
                     ValueFlowKind::Local
+                    | ValueFlowKind::AddressOf
                     | ValueFlowKind::OwnershipUnknown
                     | ValueFlowKind::BackingStore { .. }
                     | ValueFlowKind::Parameter
@@ -1937,19 +1960,22 @@ fn transfer_point(
             }
             SemanticEffect::ValueFlow {
                 kind:
-                    ValueFlowKind::LanguageDefined
+                    ValueFlowKind::MemoryLoad { .. }
+                    | ValueFlowKind::LanguageDefined
                     | ValueFlowKind::ByValueCapture
                     | ValueFlowKind::ReferenceBoxing
                     | ValueFlowKind::ReferenceUnboxing
                     | ValueFlowKind::BackingStoreAlternative { .. },
                 target,
                 ..
+            } => {
+                release_external_writers(state);
+                state.set(target.index(), ScalarFact::Unknown);
             }
-            | SemanticEffect::AsyncResume {
+            SemanticEffect::AsyncResume {
                 result: Some(target),
                 ..
             } => {
-                release_external_writers(state);
                 state.set(target.index(), ScalarFact::Unknown);
             }
             SemanticEffect::MemoryLoad {
@@ -2077,10 +2103,12 @@ fn transfer_point(
                 let gap = semantics
                     .gap(gap)
                     .expect("validated scalar gap effect resolves");
-                if gap.impacts.contains(SemanticGapImpact::ValueFlow)
-                    && let SemanticGapSubject::Value(value) = gap.subject
-                {
-                    state.set(value.index(), ScalarFact::Unknown);
+                if gap.impacts.contains(SemanticGapImpact::ValueFlow) {
+                    for logical in semantics.logical_gaps_of(gap) {
+                        if let SemanticGapSubject::Value(value) = logical.subject() {
+                            state.set(value.index(), ScalarFact::Unknown);
+                        }
+                    }
                 }
                 // #6409: hidden calls release the same retained writers as Invoke.
                 // This suffices only when address-taking for everything the
@@ -2108,10 +2136,9 @@ fn transfer_point(
             | SemanticEffect::CallContinuation { .. }
             | SemanticEffect::ProcedureReturn { .. }
             | SemanticEffect::Throw { .. } => {}
+            SemanticEffect::MemoryInterference => release_external_writers(state),
             SemanticEffect::AsyncSuspend { .. }
-            | SemanticEffect::AsyncResume { result: None, .. } => {
-                release_external_writers(state);
-            }
+            | SemanticEffect::AsyncResume { result: None, .. } => {}
         }
     }
 }
@@ -2909,34 +2936,36 @@ fn run() -> bool {{
                 escaped.contains(&binding),
                 "borrow must escape into the guard: {semantics:#?}"
             );
+            // #10879: implicit-drop omission gaps are scoped to the dropped value
             assert!(
                 semantics
-                    .gaps()
-                    .iter()
-                    .any(|gap| gap.capability == SemanticCapability::Calls
-                        && gap.subject == SemanticGapSubject::Point),
+                    .logical_gaps()
+                    .any(|gap| gap.base.capability == SemanticCapability::Calls
+                        && matches!(gap.subject(), SemanticGapSubject::Value(_))),
                 "implicit release point must exist"
             );
             // #6409: these real producer facts retain their cross-consumer
             // meaning. Relevance must not rely on narrowed impact rows.
             let cleanup = semantics
-                .gaps()
-                .iter()
+                .logical_gaps()
                 .find(|gap| {
-                    gap.capability == SemanticCapability::CleanupControlFlow
-                        && gap.subject == SemanticGapSubject::Point
+                    gap.base.capability == SemanticCapability::CleanupControlFlow
+                        && matches!(gap.subject(), SemanticGapSubject::Value(_))
                 })
                 .expect("cleanup fact");
             assert!(
-                cleanup.impacts.contains(SemanticGapImpact::ValueFlow)
-                    && cleanup.impacts.contains(SemanticGapImpact::ReturnTransfer)
+                cleanup.base.impacts.contains(SemanticGapImpact::ValueFlow)
+                    && cleanup
+                        .base
+                        .impacts
+                        .contains(SemanticGapImpact::ReturnTransfer)
             );
             assert!(
-                semantics.gaps().iter().any(|gap| gap.capability
+                semantics.logical_gaps().any(|gap| gap.base.capability
                     == SemanticCapability::ResourceManagement
-                    && gap.subject == SemanticGapSubject::Point
-                    && gap.point == cleanup.point
-                    && gap.impacts.contains(SemanticGapImpact::CallEvaluation)),
+                    && matches!(gap.subject(), SemanticGapSubject::Value(_))
+                    && gap.base.point == cleanup.base.point
+                    && gap.base.impacts.contains(SemanticGapImpact::CallEvaluation)),
                 "the resource fact at cleanup must retain CallEvaluation"
             );
             let scalar = ScalarStateDerivation::derive(&fixture.procedure);

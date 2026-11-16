@@ -178,7 +178,11 @@ fn reference_site(file: &ProjectFile, node: Node<'_>, source: &str) -> ResolvedR
 fn open_external_seed(workspace: &WorkspaceAnalyzer, name: &str) -> ClassSeed {
     let mut cache = ExternalClassCache::default();
     external_class_identity(
-        workspace.analyzer().semantic_model_overlay().as_deref(),
+        workspace
+            .analyzer()
+            .semantic_model_overlay_read()
+            .published()
+            .as_deref(),
         Language::Ruby,
         name,
         None,
@@ -436,7 +440,11 @@ impl TypeFlowAdapter for RubyTypeFlowAdapter {
             }
             TypeLookupStatus::Ambiguous => ClassSeed::Unknown(UnknownReason::AmbiguousCallee),
             TypeLookupStatus::Resolved => match class_seed_from_lookup_types(
-                workspace.analyzer().semantic_model_overlay().as_deref(),
+                workspace
+                    .analyzer()
+                    .semantic_model_overlay_read()
+                    .published()
+                    .as_deref(),
                 Language::Ruby,
                 &outcome.types,
             ) {
@@ -602,7 +610,8 @@ impl TypeFlowAdapter for RubyTypeFlowAdapter {
             ClassIdentity::Workspace(unit) => workspace_member_lookup(workspace, unit, member),
             ClassIdentity::External { symbol_id, .. } => workspace
                 .analyzer()
-                .semantic_model_overlay()
+                .semantic_model_overlay_read()
+                .published()
                 .map(|overlay| external_member_lookup(&overlay, kind, symbol_id, member))
                 .unwrap_or(MemberLookup::Unknown(UnknownReason::ExternalNotModeled)),
             ClassIdentity::Intrinsic { .. } => {
@@ -651,7 +660,7 @@ impl TypeFlowAdapter for RubyTypeFlowAdapter {
                 .into_iter()
                 .map(ClassIdentity::Workspace)
                 .collect(),
-            descendants: None,
+            descendants: brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer::incomplete(brokk_bifrost_core::analyzer::capabilities::HierarchyOpenReason::DescendantIndexUnavailable),
             unresolved_base: false,
             dynamic_attributes: true,
         }

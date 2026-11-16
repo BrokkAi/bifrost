@@ -346,9 +346,51 @@ pub fn bind_active_unmaterialized_procedure_summaries(
     root_artifact: &SemanticArtifactKey,
     compatibility: ExternalSummaryCompatibilityKey,
 ) -> Result<Option<ExternalSemanticSummarySet>, ProcedureSummaryBindingError> {
+    bind_unmaterialized_summary_matches(
+        active,
+        targets,
+        root_artifact,
+        compatibility,
+        |target| {
+            crate::analyzer::semantic_model::endpoint_projections::refuse_unvalidated_summary_match(
+                active.procedure_summaries_for_external_target(target),
+            )
+        },
+        crate::analyzer::semantic_model::endpoint_projections::refuse_unvalidated_summary_record,
+    )
+}
+
+/// Bind paths only through the same immutable publication that admitted them.
+pub fn bind_snapshot_unmaterialized_procedure_summaries(
+    snapshot: &crate::analyzer::semantic_model::ActiveSemanticModelSnapshot,
+    targets: &[UnmaterializedExternalTarget],
+    root_artifact: &SemanticArtifactKey,
+    compatibility: ExternalSummaryCompatibilityKey,
+) -> Result<Option<ExternalSemanticSummarySet>, ProcedureSummaryBindingError> {
+    bind_unmaterialized_summary_matches(
+        snapshot.active_models(),
+        targets,
+        root_artifact,
+        compatibility,
+        |target| snapshot.procedure_summaries_for_external_target(target),
+        |shard, record| snapshot.admit_procedure_summary(shard, record),
+    )
+}
+
+fn bind_unmaterialized_summary_matches(
+    active: &ResolvedActiveSemanticModels,
+    targets: &[UnmaterializedExternalTarget],
+    root_artifact: &SemanticArtifactKey,
+    compatibility: ExternalSummaryCompatibilityKey,
+    select: impl Fn(&UnmaterializedExternalTarget) -> ProcedureSummaryMatch,
+    admit: impl Fn(
+        &crate::analyzer::semantic_model::ActiveSemanticModelShard,
+        &Arc<CompiledProcedureSummary>,
+    ) -> Arc<CompiledProcedureSummary>,
+) -> Result<Option<ExternalSemanticSummarySet>, ProcedureSummaryBindingError> {
     let mut families = HashMap::<usize, SelectedUnmaterializedSummaryFamily>::default();
     for target in targets {
-        let matched = active.procedure_summaries_for_external_target(target);
+        let matched = select(target);
         let Some(selected) = select_unmaterialized_flow_summary(&matched)? else {
             continue;
         };
@@ -381,6 +423,10 @@ pub fn bind_active_unmaterialized_procedure_summaries(
         else {
             continue;
         };
+        let payload = payload
+            .iter()
+            .map(|record| admit(&family.shard, record))
+            .collect::<Vec<_>>();
         let by_id = payload
             .iter()
             .map(|summary| (summary.id.as_str(), summary))
@@ -440,7 +486,7 @@ pub fn bind_active_unmaterialized_procedure_summaries(
                     && target.has_receiver() == summary.target.has_receiver
                     && member == target.member()
             }) {
-                let matched = active.procedure_summaries_for_external_target(target);
+                let matched = select(target);
                 let Some(selected) = select_unmaterialized_flow_summary(&matched)? else {
                     continue;
                 };
@@ -1153,8 +1199,19 @@ fn lower_transfer(
     let output = lower_output(summary, binding, locations, &transfer.output)?;
     let exit =
         SummaryExit::try_new(kind, output).map_err(|source| invalid_summary(summary, source))?;
-    SummaryTransfer::try_new(input, exit, evidence.clone())
-        .map_err(|source| invalid_summary(summary, source))
+    let lowered = SummaryTransfer::try_new(input, exit, evidence.clone())
+        .map_err(|source| invalid_summary(summary, source))?;
+    Ok(
+        if transfer
+            .value_transfer
+            .as_ref()
+            .is_some_and(|profile| profile.kind.preserves_member_contents())
+        {
+            lowered.with_preserved_member_contents()
+        } else {
+            lowered
+        },
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1264,7 +1321,7 @@ fn lower_concurrency_effect(
         lower_model_port(summary, binding, locations, port).map(SummaryConcurrencyAccessPath::port)
     };
     let identity = |input: &CompiledSummaryInput| match input {
-        CompiledSummaryInput::Receiver {} => SummaryConcurrencySubjectIdentity::Backing,
+        CompiledSummaryInput::Receiver { .. } => SummaryConcurrencySubjectIdentity::Backing,
         CompiledSummaryInput::Parameter { .. } => SummaryConcurrencySubjectIdentity::Value,
     };
     let effect = match effect {
@@ -1526,11 +1583,11 @@ fn lower_input(
     binding: &ExactProcedureSummaryTargetBinding,
     input: &CompiledSummaryInput,
 ) -> Result<SummaryPort, ProcedureSummaryBindingError> {
-    match input {
-        CompiledSummaryInput::Receiver {} if binding.boundary.receiver().is_some() => {
+    let root = match input {
+        CompiledSummaryInput::Receiver { .. } if binding.boundary.receiver().is_some() => {
             Ok(SummaryPort::Receiver)
         }
-        CompiledSummaryInput::Parameter { ordinal }
+        CompiledSummaryInput::Parameter { ordinal, .. }
             if binding
                 .boundary
                 .parameters()
@@ -1539,12 +1596,13 @@ fn lower_input(
         {
             Ok(SummaryPort::Parameter(*ordinal))
         }
-        CompiledSummaryInput::Receiver {} | CompiledSummaryInput::Parameter { .. } => {
+        CompiledSummaryInput::Receiver { .. } | CompiledSummaryInput::Parameter { .. } => {
             Err(ProcedureSummaryBindingError::TargetMismatch {
                 summary_id: summary.id.clone(),
             })
         }
-    }
+    }?;
+    Ok(root.projected(input.path()))
 }
 
 fn lower_output(
@@ -1553,33 +1611,36 @@ fn lower_output(
     locations: &HashMap<&str, (CompiledSummaryLocationKind, SummaryLocationKey)>,
     output: &CompiledSummaryOutput,
 ) -> Result<SummaryPort, ProcedureSummaryBindingError> {
-    match output {
-        CompiledSummaryOutput::NormalReturn {} => Ok(SummaryPort::NormalReturn),
-        CompiledSummaryOutput::IndexedNormalReturn { ordinal } => {
+    let root = match output {
+        CompiledSummaryOutput::NormalReturn { .. } => Ok(SummaryPort::NormalReturn),
+        CompiledSummaryOutput::IndexedNormalReturn { ordinal, .. } => {
             Ok(SummaryPort::IndexedNormalReturn(*ordinal))
         }
-        CompiledSummaryOutput::ExceptionalReturn {} => Ok(SummaryPort::ExceptionalReturn),
-        CompiledSummaryOutput::Receiver {} if binding.boundary.receiver().is_some() => {
+        CompiledSummaryOutput::ExceptionalReturn { .. } => Ok(SummaryPort::ExceptionalReturn),
+        CompiledSummaryOutput::Receiver { .. } if binding.boundary.receiver().is_some() => {
             Ok(SummaryPort::Receiver)
         }
-        CompiledSummaryOutput::Receiver {} => Err(ProcedureSummaryBindingError::TargetMismatch {
-            summary_id: summary.id.clone(),
-        }),
-        CompiledSummaryOutput::Capture { location } => lower_location(
+        CompiledSummaryOutput::Receiver { .. } => {
+            Err(ProcedureSummaryBindingError::TargetMismatch {
+                summary_id: summary.id.clone(),
+            })
+        }
+        CompiledSummaryOutput::Capture { location, .. } => lower_location(
             summary,
             locations,
             location,
             CompiledSummaryLocationKind::Capture,
         )
         .map(SummaryPort::Capture),
-        CompiledSummaryOutput::Heap { location } => lower_location(
+        CompiledSummaryOutput::Heap { location, .. } => lower_location(
             summary,
             locations,
             location,
             CompiledSummaryLocationKind::Heap,
         )
         .map(SummaryPort::Heap),
-    }
+    }?;
+    Ok(root.projected(output.path()))
 }
 
 fn lower_model_port(
@@ -1836,4 +1897,50 @@ impl DenseBidirectionalGraph for ProcedureDependencyGraph {
             edge,
         )
     }
+}
+
+/// Lower an admitted endpoint through the language's existing field identity.
+/// No path interpretation is duplicated in policy or individual solvers.
+pub fn project_summary_endpoint(
+    procedure: &crate::analyzer::semantic::SemanticLocator,
+    root: crate::analyzer::semantic::partial_flow::PartialFlowPort,
+    path: Option<&crate::analyzer::semantic_model::SummaryEndpointPath>,
+) -> Option<crate::analyzer::semantic::partial_flow::PartialFlowPort> {
+    let Some(path) = path else {
+        return Some(root);
+    };
+    let support = crate::analyzer::languages::language_support(procedure.language().language())?;
+    let selectors = path
+        .iter()
+        .map(|step| support.summary_endpoint_projection_selector(procedure, step))
+        .collect::<Option<Vec<_>>>()?;
+    let tail = if selectors.iter().any(|selector| {
+        matches!(
+            selector,
+            crate::analyzer::semantic::partial_flow::HeapSelector::AnyIndex
+        )
+    }) {
+        crate::analyzer::semantic::AccessPathTail::Summary
+    } else {
+        crate::analyzer::semantic::AccessPathTail::Exact
+    };
+    Some(
+        crate::analyzer::semantic::partial_flow::PartialFlowPort::Heap {
+            root: Box::new(root),
+            selectors: selectors.into_boxed_slice(),
+            tail,
+        },
+    )
+}
+
+/// Replace an exact component prefix while retaining the relative suffix.
+/// The backward model reader and forward plan admission share this operation.
+pub(crate) fn substitute_projection_prefix<T: Clone + PartialEq>(
+    observed: &[T],
+    from: &[T],
+    to: &[T],
+) -> Option<Vec<T>> {
+    observed
+        .strip_prefix(from)
+        .map(|suffix| to.iter().chain(suffix).cloned().collect())
 }

@@ -24,8 +24,6 @@ use std::sync::Arc;
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::atomic::AtomicUsize;
 
-use brokk_bifrost_semantic::analyzer::semantic::ids::StableDigest;
-
 use brokk_bifrost_analysis::analyzer::cache_weight::estimate_code_unit;
 
 use brokk_bifrost_analysis::analyzer::cache_weight::estimate_project_file;
@@ -140,7 +138,9 @@ where
     }
 }
 
-type AncestorMemoEntry = Arc<ReplayingMemoEntry<Arc<Vec<CodeUnit>>, ReadKey>>;
+type AncestorMemoEntry = Arc<
+    ReplayingMemoEntry<Arc<brokk_bifrost_csharp::graph_support::LogicalDirectAncestors>, ReadKey>,
+>;
 type StatementFactsEntry = Arc<
     ReplayingMemoEntry<
         Arc<brokk_bifrost_core::analyzer::statement_facts::StatementFactRows>,
@@ -230,10 +230,12 @@ pub(crate) struct CSharpMemoCaches {
     /// hierarchy facts before coarse graph construction enters its parallel
     /// edge-resolution pass.
     pub(crate) hierarchy_test_files: WorkspaceAuthorityMemo<PoolSafeMemo<HashSet<ProjectFile>>>,
-    /// One fixed-size digest of the generation's build configuration, for
-    /// snapshot cache identity. Published only when the identity is known.
+    /// Fixed-size configuration fact, listed-input and workspace-content
+    /// digests for the generation, plus whether covered configuration inputs
+    /// may be hidden, and exhaustive membership discovery evidence.
+    /// The typed membership evidence is process-local and never serialized.
     pub(crate) compilation_config_digest:
-        WorkspaceAuthorityMemo<PoolSafeMemo<(StableDigest, StableDigest)>>,
+        WorkspaceAuthorityMemo<PoolSafeMemo<super::compilation::CompilationConfigIdentities>>,
     /// Real source files that declare at least one `global using` directive.
     /// The coarse graph factors workspace-global visibility through these
     /// configuration files instead of expanding every directive in every file.
@@ -456,12 +458,29 @@ fn estimate_code_unit_set(values: &HashSet<CodeUnit>) -> u64 {
     )
 }
 
-pub(super) fn estimate_code_unit_vec(values: &[CodeUnit]) -> u64 {
+fn estimate_code_unit_vec(values: &[CodeUnit]) -> u64 {
     estimate_collection_bytes(
         size_of::<Vec<CodeUnit>>() as u64,
         values,
         estimate_code_unit,
     )
+}
+
+pub(super) fn estimate_direct_ancestors(
+    ancestors: &brokk_bifrost_csharp::graph_support::LogicalDirectAncestors,
+) -> u64 {
+    estimate_code_unit_vec(&ancestors.resolved)
+        + ancestors
+            .ambiguous
+            .iter()
+            .map(|group| estimate_code_unit_vec(group))
+            .sum::<u64>()
+        + ancestors
+            .unindexed
+            .iter()
+            .map(|clause| estimate_code_unit(&clause.declared_by) + clause.name.capacity() as u64)
+            .sum::<u64>()
+        + estimate_code_unit_vec(&ancestors.unread)
 }
 
 fn estimate_project_file_set(files: &HashSet<ProjectFile>) -> u64 {

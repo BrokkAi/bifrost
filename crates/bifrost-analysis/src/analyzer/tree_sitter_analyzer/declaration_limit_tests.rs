@@ -70,12 +70,15 @@ impl LanguageAdapter for PythonAdapter {
         _analyzer: &TreeSitterAnalyzer<Self>,
         owner: &CodeUnit,
         _limit: usize,
-    ) -> Option<Vec<(CodeUnit, Option<crate::analyzer::Range>)>> {
+    ) -> Option<crate::analyzer::tree_sitter_analyzer::CrossFileChildren> {
         (owner.identifier() == "Owner").then(|| {
-            vec![(
-                unit(&owner.source().clone(), "child", CodeUnitType::Function),
-                None,
-            )]
+            crate::analyzer::tree_sitter_analyzer::CrossFileChildren {
+                children: vec![(
+                    unit(&owner.source().clone(), "child", CodeUnitType::Function),
+                    None,
+                )],
+                complete: true,
+            }
         })
     }
 
@@ -117,6 +120,45 @@ fn analyzer(sources: &[(&str, &str)]) -> (tempfile::TempDir, TreeSitterAnalyzer<
         temp,
         TreeSitterAnalyzer::new(project, PythonAdapter::default()),
     )
+}
+
+#[test]
+#[hardwon("#10979: a query selected a publication after its request scope had already opened")]
+fn request_workspace_selection_is_bound_before_the_first_read() {
+    use crate::analyzer::AnalyzerQueryScope;
+
+    let _rules =
+        crate::analyzer::store::language_support::neutral_fixture::neutral_rules_fixture(&[
+            Language::Python,
+        ]);
+    let (_temp, analyzer) = analyzer(&[("sample.py", "value = 1\n")]);
+    let first = analyzer.selected_workspace_snapshots();
+    assert!(first.contains_key("python"));
+    let mut successor = first.as_ref().clone();
+    successor.get_mut("python").unwrap().revision += 1;
+    let successor = Arc::new(successor);
+    {
+        let _request = AnalyzerQueryScope::new(&analyzer);
+        // Only the publication pointer moves: this tests ownership/transport,
+        // not whether independently opened database transactions are coherent.
+        analyzer
+            .relational_workspace_snapshots
+            .store(Arc::clone(&successor));
+        assert!(Arc::ptr_eq(
+            &analyzer.request_workspace_snapshots().unwrap(),
+            &first
+        ));
+        let _nested = AnalyzerQueryScope::new(&analyzer);
+        assert!(Arc::ptr_eq(
+            &analyzer.request_workspace_snapshots().unwrap(),
+            &first
+        ));
+    }
+    let _next = AnalyzerQueryScope::new(&analyzer);
+    assert!(Arc::ptr_eq(
+        &analyzer.request_workspace_snapshots().unwrap(),
+        &successor
+    ));
 }
 
 #[test]
@@ -489,7 +531,7 @@ fn candidate_alias_walk_stops_at_the_caller_budget() {
         )),
     };
 
-    let result = analyzer.resolve_candidate_rows_limited(vec![row], 1, || true);
+    let result = analyzer.resolve_candidate_rows_limited(vec![row], None, 1, || true);
     assert!(!result.complete);
     assert_eq!(result.inspected, 1);
     assert!(result.inspected <= 1);
@@ -743,5 +785,97 @@ fn failed_package_class_build_is_not_published_to_a_later_request() {
     assert!(
         keeper.read_completion().is_err(),
         "nested failure stays with its parent"
+    );
+}
+
+#[test]
+#[hardwon(
+    "#11098: the project's parse-variant reader held the analyzer's retention budget, so a dropped workspace kept its catalog files open"
+)]
+fn project_read_recorder_does_not_retain_the_analyzer_budget() {
+    let _rules =
+        crate::analyzer::store::language_support::neutral_fixture::neutral_rules_fixture(&[
+            Language::Python,
+        ]);
+    let (_temp, analyzer) = analyzer(&[("main.py", "x = 1\n")]);
+    // A project routinely outlives the analyzers built over it.
+    let project = Arc::clone(&analyzer.project);
+    let overlay_variants = analyzer.overlay_variants.downgrade();
+    drop(analyzer);
+    assert!(
+        overlay_variants.upgrade().is_none(),
+        "the project's read slot still holds the analyzer's budget region"
+    );
+    drop(project);
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn retention_census_deduplicates_file_states_across_generation_roots() {
+    use brokk_bifrost_core::retention_census::RetentionCensus;
+    let temp = tempfile::tempdir().unwrap();
+    let file = ProjectFile::new(temp.path().to_path_buf(), "retained.py");
+    let key = TreeSitterAnalyzer::<PythonAdapter>::transient_cache_key(Oid::zero(), &file);
+    let state = Arc::new(TreeSitterAnalyzer::<PythonAdapter>::file_state_from_parsed(
+        "retained source".repeat(64),
+        ParsedFile::new(String::new()),
+        false,
+        None,
+        true,
+    ));
+    let estimate = state.estimated_retained_bytes() as u64;
+    let transient = Arc::new(Mutex::new(FileStateCache::new(usize::MAX)));
+    transient
+        .lock()
+        .unwrap()
+        .insert(key.clone(), Arc::clone(&state));
+    let source = Arc::new(HashMap::from_iter([(key, Arc::clone(&state))]));
+    let stats = transient.lock().unwrap().stats;
+    let pins = Arc::strong_count(&state);
+    let mut census = RetentionCensus::new();
+    super::retention_census_support::transient(&transient, &mut census);
+    super::retention_census_support::source_index(&source, &mut census);
+    let report = census.finish();
+    let states = report
+        .allocation_groups
+        .iter()
+        .filter(|group| group.kind == Some("file_state_structural_estimate"))
+        .collect::<Vec<_>>();
+    assert_eq!(states.len(), 1, "{report:?}");
+    assert_eq!(states[0].estimated_bytes, Some(estimate));
+    assert_eq!(
+        states[0].families,
+        [
+            "analyzer.source_snapshot_file_states",
+            "analyzer.transient_file_states"
+        ]
+    );
+    assert_eq!(transient.lock().unwrap().stats, stats);
+    assert_eq!(Arc::strong_count(&state), pins);
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn retention_census_does_not_fill_cold_file_state_roots() {
+    use brokk_bifrost_core::retention_census::RetentionCensus;
+    let transient = Arc::new(Mutex::new(FileStateCache::new(1024)));
+    let source = Arc::new(HashMap::default());
+    let mut census = RetentionCensus::new();
+    super::retention_census_support::transient(&transient, &mut census);
+    super::retention_census_support::source_index(&source, &mut census);
+    let report = census.finish();
+    assert!(transient.lock().unwrap().entries.is_empty());
+    assert!(source.is_empty());
+    assert!(
+        report
+            .resident_readings
+            .iter()
+            .all(|reading| reading.count == 0 && reading.weight == 0)
+    );
+    assert!(
+        !report
+            .allocation_groups
+            .iter()
+            .any(|group| group.kind == Some("file_state_structural_estimate"))
     );
 }

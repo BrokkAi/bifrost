@@ -132,46 +132,44 @@ impl Typed<'_, '_, '_, '_> {
     // including attributes used as types rather than runtime values.
     fn attribute_root(&mut self, object: Node<'_>, reference: ResolutionSiteId) {
         let object = python_unwrap_type(object);
-        // Only identifier-rooted attribute chains have a lexical route. Calls,
-        // subscripts and other expressions retain their typed receiver handling.
-        if crate::syntax::python_static_attribute_path(object).is_none() {
+        // Only identifier-rooted attribute chains, including transparent
+        // parentheses, have a lexical route. Calls, subscripts and other
+        // expressions retain their typed receiver handling.
+        let Some(path) = crate::syntax::python_static_value_path_bounded(object, || true)
+            .expect("unbounded static value path completes")
+        else {
             return;
-        }
-        let token = match object.kind() {
-            "identifier" => Some(object),
-            "attribute" => object.child_by_field_name("attribute"),
-            _ => None,
         };
-        if let Some(token) = token {
-            let Some(&prefix_reference) =
-                self.references.get(&(token.start_byte(), token.end_byte()))
-            else {
-                // A recovered operand without a structured reference retains
-                // its expression gap; it cannot supply a module continuation.
-                return;
-            };
-            // The route's first segment is the prefix identifier's semantic
-            // name, including Python's class-private name mangling.
-            let name = self.p.semantic_name(token);
-            self.p
-                .facts
-                .root_references
-                .push(ResolutionRootReferenceFact {
-                    reference,
-                    root_scope: ResolutionScopeId::new(0),
-                    anchor: ResolutionRootImportAnchor::Lexical,
-                    prefix_reference: Some(prefix_reference),
-                    owner_continued: false,
-                });
-            self.p
-                .facts
-                .root_reference_segments
-                .push(ResolutionRootReferenceSegmentFact {
-                    reference,
-                    position: 0,
-                    name,
-                });
-        }
+        let token = *path
+            .last()
+            .expect("static value path contains an identifier");
+        let Some(&prefix_reference) = self.references.get(&(token.start_byte(), token.end_byte()))
+        else {
+            // A recovered operand without a structured reference retains
+            // its expression gap; it cannot supply a module continuation.
+            return;
+        };
+        // The route's first segment is the prefix identifier's semantic
+        // name, including Python's class-private name mangling.
+        let name = self.p.semantic_name(token);
+        self.p
+            .facts
+            .root_references
+            .push(ResolutionRootReferenceFact {
+                reference,
+                root_scope: ResolutionScopeId::new(0),
+                anchor: ResolutionRootImportAnchor::Lexical,
+                prefix_reference: Some(prefix_reference),
+                owner_continued: false,
+            });
+        self.p
+            .facts
+            .root_reference_segments
+            .push(ResolutionRootReferenceSegmentFact {
+                reference,
+                position: 0,
+                name,
+            });
     }
 
     /// The member reference of `object.attribute`, qualified by the object's
@@ -1362,8 +1360,43 @@ pub(super) fn produce(
         }
         if node.kind() == "class_definition" {
             let class = declarations[&node.id()];
-            let mut metaclass_expression = None;
             let mut hierarchy_incomplete = node.has_error();
+            if let Some(parameters) = python_type_parameters(node) {
+                let parameters = named_children_iter(parameters)
+                    .filter(|formal| !formal.is_extra())
+                    .map(|formal| {
+                        let binder = python_type_parameter_binder_node(formal)?;
+                        t.p.facts
+                            .identifiers
+                            .iter()
+                            .find(|identifier| {
+                                let site = &t.p.facts.sites[identifier.site.index()];
+                                identifier.role == ResolutionIdentifierRole::Declaration
+                                    && identifier.namespace == ResolutionNamespace::Type
+                                    && site.start_byte == binder.start_byte()
+                                    && site.end_byte == binder.end_byte()
+                            })
+                            .map(|parameter| parameter.site)
+                    })
+                    .collect::<Option<Vec<_>>>();
+                if let Some(parameters) = parameters {
+                    let unique = parameters.iter().copied().collect::<HashSet<_>>();
+                    if unique.len() == parameters.len() {
+                        for (ordinal, parameter) in parameters.into_iter().enumerate() {
+                            t.p.facts.add_generic_formal(
+                                class,
+                                dense_ordinal(ordinal, "Python class generic formal"),
+                                parameter,
+                            );
+                        }
+                    } else {
+                        hierarchy_incomplete = true;
+                    }
+                } else {
+                    hierarchy_incomplete = true;
+                }
+            }
+            let mut metaclass_expression = None;
             if let Some(bases) = node.child_by_field_name("superclasses") {
                 let mut ordinal = 0;
                 for (written_ordinal, operand) in named_children_iter(bases).enumerate() {

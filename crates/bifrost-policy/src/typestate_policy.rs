@@ -4,6 +4,7 @@
 //! the closed [`ResolvedTypestatePolicySpec`] boundary and lowers only typed,
 //! source-backed values into the diagnostic-neutral typestate engine.
 
+use crate::finding::PolicyDiagnostics;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -31,9 +32,9 @@ use crate::finding::{
     PolicyWorkUnit, ProofMetadata, ProofReason, ProofState, WitnessStepKind,
 };
 use crate::finding::{
-    FindingLocationBound, FurtherFindingsAbsent, PolicyByteSpan, PolicySourceLocation,
-    PolicySubjectVerdict, PolicySubjectVerdicts, SubjectEnumeration, SubjectSelectorEnumeration,
-    SubjectVerdict,
+    FindingLocationBound, FurtherFindingsAbsent, MAX_FINDING_LOCATION_SITES, PolicyByteSpan,
+    PolicyCodeQueryDiagnostic, PolicySourceLocation, PolicySubjectVerdict, PolicySubjectVerdicts,
+    SubjectEnumeration, SubjectSelectorEnumeration, SubjectVerdict, TypestatePartialScope,
 };
 use crate::finding_identity::{
     AnalysisFindingId, AnalysisSubjectRef, StableSemanticIdentity, TypestateScenarioId, WitnessId,
@@ -51,6 +52,7 @@ use crate::resolved::{
     ResolvedTypestateBinding, ResolvedTypestateEventTrigger, ResolvedTypestatePolicySpec,
     ResolvedTypestateTerminalTrigger,
 };
+use crate::retained::RetainedSize;
 use crate::selector_compiler::{
     PolicySemanticPeaks, ReceiverBindingApplicability, parameter_names_match,
 };
@@ -64,6 +66,7 @@ use crate::units::{
 use brokk_bifrost_analysis::CancellationToken;
 use brokk_bifrost_analysis::analyzer::common::language_for_file;
 use brokk_bifrost_analysis::analyzer::lexical_definitions::formal_parameter_slots;
+use brokk_bifrost_analysis::analyzer::reuse_verdict::CarriesReuseVerdict;
 use brokk_bifrost_analysis::analyzer::semantic::SemanticLanguage;
 use brokk_bifrost_analysis::analyzer::semantic::cfg_algorithms::{
     CfgAlgorithmBudget, CfgAlgorithmError, CfgAlgorithmRequest, forward_reachability_avoiding,
@@ -78,14 +81,14 @@ use brokk_bifrost_analysis::analyzer::semantic::{
     CallSiteId, CallTransferSet, CandidateCoverage, DispatchOracle, DispatchResult,
     EvidenceCompleteness, FreshObjectPublicationKind, FreshObjectPublicationQuery, HeapOracle,
     IcfgExitProfile, IcfgProvider, IcfgProviderBehaviorIdentity, IcfgSnapshot, IcfgSnapshotLimits,
-    ObservationPhase, OracleCallContext, OracleLimits, ProcedureHandle, ProcedureId,
-    ProcedurePortHandle, ProcedurePortKind, ProgramPointHandle, ProgramPointId, ProofStatus,
-    SemanticArtifact, SemanticArtifactCollector, SemanticArtifactKey, SemanticArtifactLeaseChild,
-    SemanticArtifactLeaseError, SemanticBudget, SemanticBudgetDimension,
-    SemanticBudgetScopeSnapshot, SemanticEffect, SemanticExecutionBudget, SemanticExecutionWork,
-    SemanticLocator, SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticValueKind,
-    SemanticWork, ValueAtPoint, ValueFlowEndpoint, ValueFlowOracle, ValueFlowRelationKind,
-    ValueHandle, WorkspaceIcfgProvider,
+    ObservationPhase, OracleCallContext, OracleLimits, ProcedureHandle, ProcedurePortHandle,
+    ProcedurePortKind, ProgramPointHandle, ProgramPointId, ProofStatus, SemanticArtifact,
+    SemanticArtifactCollector, SemanticArtifactLeaseChild, SemanticArtifactLeaseError,
+    SemanticBudget, SemanticBudgetDimension, SemanticBudgetScopeSnapshot, SemanticEffect,
+    SemanticExecutionBudget, SemanticExecutionWork, SemanticLocator, SemanticOutcome,
+    SemanticProviderError, SemanticRequest, SemanticValueKind, SemanticWork, ValueAtPoint,
+    ValueFlowEndpoint, ValueFlowKind, ValueFlowOracle, ValueFlowRelationKind, ValueHandle,
+    WorkspaceIcfgProvider,
 };
 use brokk_bifrost_analysis::analyzer::semantic_model::{
     ActivatedProcedureSummary, ActiveSemanticModelSnapshot, AuthoredCoverageSubject,
@@ -123,7 +126,7 @@ use brokk_bifrost_flow::typestate::{
     TypestateFinding, TypestateFindingCertainty, TypestateFindingKind, TypestateFindingLimits,
     TypestateFlowProblemError, TypestateInitialSeedSpec, TypestateObjectKey, TypestateObjectRole,
     TypestateObservationSite, TypestateProductionCacheStatus, TypestateSelectedOperand,
-    TypestateSubjectClassKey, TypestateSubjectKey, TypestateSummaryResult,
+    TypestateSubjectClassKey, TypestateSubjectId, TypestateSubjectKey, TypestateSummaryResult,
     TypestateTerminalBindingId, TypestateTerminalBindingSpec, TypestateUncertainty,
     UnprovenEventRelation, collect_summary_findings_with_limits, direct_scalar_source,
     project_workspace_root_call_closure, solve_typestate_with_production_summaries,
@@ -324,6 +327,51 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static UNOWNED_FINISH_GAP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Inject a structured request-local gap after real root products are merged.
+/// The gap never enters a cached product. Restore the hook even on unwind.
+#[cfg(any(test, feature = "test-support"))]
+pub fn with_unowned_typestate_finish_gap_for_test<T>(run: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            UNOWNED_FINISH_GAP.set(self.0);
+        }
+    }
+    let restore = Restore(UNOWNED_FINISH_GAP.replace(true));
+    let result = run();
+    drop(restore);
+    result
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static ATTRIBUTION_BYTE_ALLOWANCE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Restrict only request-local attribution scratch; analysis and cached
+/// products keep their real allowances and identities.
+#[cfg(any(test, feature = "test-support"))]
+pub fn with_typestate_attribution_allowance_for_test<T>(
+    bytes: usize,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<usize>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ATTRIBUTION_BYTE_ALLOWANCE.set(self.0);
+        }
+    }
+    let restore = Restore(ATTRIBUTION_BYTE_ALLOWANCE.replace(Some(bytes)));
+    let result = run();
+    drop(restore);
+    result
+}
+
 /// Force either evaluator for one thread and restore its previous selection.
 #[cfg(any(test, feature = "test-support"))]
 pub fn with_typestate_engine_for_test<T>(
@@ -424,6 +472,7 @@ pub(crate) struct CompiledTypestatePolicy {
 struct TypestateEvaluationFailure {
     message: String,
     work: PolicyWorkReport,
+    diagnostic_summary: PolicyDiagnostics,
 }
 
 struct TypestateWorkMeasurements {
@@ -454,6 +503,35 @@ struct UndecidedSelectorSite {
     reasons: Vec<super::selector_compiler::candidate_enumeration::CandidateReason>,
 }
 
+// Lookup provenance has structured locations below; keep the full original
+// cause collection in the message without exposing process-local file roots.
+struct SelectorCauses<'a>(&'a [super::selector_compiler::candidate_enumeration::CandidateReason]);
+
+impl std::fmt::Debug for SelectorCauses<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use super::selector_compiler::candidate_enumeration::CandidateReason;
+        struct Cause<'a>(&'a CandidateReason);
+        impl std::fmt::Debug for Cause<'_> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                match self.0 {
+                    CandidateReason::Read(read) => {
+                        f.debug_tuple("Read").field(read.base_cause()).finish()
+                    }
+                    reason => std::fmt::Debug::fmt(reason, f),
+                }
+            }
+        }
+        f.debug_list().entries(self.0.iter().map(Cause)).finish()
+    }
+}
+
+type SelectorDiagnosticProjection = (
+    String,
+    Option<PolicySourceLocation>,
+    Vec<crate::finding::RelatedPolicyLocation>,
+    crate::RelatedLocationOmissions,
+);
+
 impl std::fmt::Display for UndecidedSelectorSite {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -466,9 +544,149 @@ impl std::fmt::Display for UndecidedSelectorSite {
                 .iter()
                 .map(|reason| reason.label())
                 .collect::<Vec<_>>(),
-            self.reasons
+            SelectorCauses(&self.reasons)
         )
     }
+}
+
+impl UndecidedSelectorSite {
+    fn diagnostic_projection(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        locations: &mut super::semantic_identity::FileSpanLocations,
+        available: &mut usize,
+        admit_scan: &mut dyn FnMut(usize) -> bool,
+    ) -> Result<SelectorDiagnosticProjection, String> {
+        use super::selector_compiler::candidate_enumeration::CandidateReason;
+        use crate::finding::{RelatedLocationOmissions, RelatedPolicyLocation};
+        use std::fmt::Write as _;
+        let primary = locations.bounded_location(
+            workspace,
+            &self.file,
+            &self.span,
+            available,
+            &mut *admit_scan,
+        )?;
+        let mut retained = Vec::with_capacity(64);
+        let mut related = Vec::with_capacity(64);
+        let mut omitted = if self.reasons.iter().any(|reason| {
+            matches!(reason,
+            CandidateReason::Read(read) if read.lookup_provenance().is_none())
+        }) {
+            RelatedLocationOmissions::Unknown
+        } else {
+            RelatedLocationOmissions::Known(0)
+        };
+        for reason in &self.reasons {
+            let CandidateReason::Read(read) = reason else {
+                continue;
+            };
+            let Some(lookup) = read.lookup_provenance() else {
+                omitted = RelatedLocationOmissions::Unknown;
+                continue;
+            };
+            if retained.contains(&lookup) {
+                continue;
+            }
+            if retained.len() == 64 {
+                if omitted != RelatedLocationOmissions::Unknown {
+                    omitted = RelatedLocationOmissions::Known(1);
+                }
+                break;
+            }
+            let location = locations.bounded_location(
+                workspace,
+                &lookup.file,
+                &lookup.byte_span,
+                available,
+                &mut *admit_scan,
+            )?;
+            let label = format!("{} [{}]: {}", lookup.name, lookup.tier, read.label());
+            related.push(
+                RelatedPolicyLocation::try_new(
+                    PolicyLocationRelationship::Evidence,
+                    location,
+                    Vec::new(),
+                )
+                .map_err(|error| error.to_string())?
+                .with_label(label)
+                .map_err(|error| error.to_string())?,
+            );
+            retained.push(lookup);
+        }
+        let (bytes, _) = self.omission_text_census();
+        let mut message = String::with_capacity(
+            bytes.saturating_add("typestate endpoint binding omitted: ".len()),
+        );
+        write!(&mut message, "typestate endpoint binding omitted: {self}")
+            .expect("String formatter is infallible");
+        Ok((message, Some(primary), related, omitted))
+    }
+
+    fn omission_text_census(&self) -> (usize, usize) {
+        // Slash normalization changes no byte lengths. Count the lossy path
+        // display without allocating rel_path_string, and borrow reason labels
+        // rather than building the Display implementation's Vec<String>.
+        let path_bytes = formatted_bytes(format_args!("{}", self.file.rel_path().display()));
+        let label_bytes = self.reasons.iter().fold(0usize, |bytes, reason| {
+            let (prefix, label) = reason.label_parts();
+            bytes
+                .saturating_add(prefix.len())
+                .saturating_add(label.len())
+        });
+        // The registered labels contain no escapes. Debug lists add quotes,
+        // brackets and comma-space separators around those actual labels.
+        let labels_display_bytes = label_bytes
+            .saturating_add(self.reasons.len().saturating_mul("\"\"".len()))
+            .saturating_add(
+                self.reasons
+                    .len()
+                    .saturating_sub(1)
+                    .saturating_mul(", ".len()),
+            )
+            .saturating_add("[]".len());
+        let text_bytes = self
+            .selector
+            .len()
+            .saturating_add(path_bytes)
+            .saturating_add(formatted_bytes(format_args!("{:?}", self.span)))
+            .saturating_add(labels_display_bytes)
+            .saturating_add(formatted_bytes(format_args!(
+                "{:?}",
+                SelectorCauses(&self.reasons)
+            )))
+            .saturating_add(":::  ()".len());
+        // Conservative upper census of the existing formatter's transient
+        // normalized/lossy path strings and owned reason-label vector. This
+        // may refuse earlier than an exact peak, but never allocates to count.
+        let formatting_bytes = path_bytes
+            // Include spare growth in a lossy conversion plus the normalized
+            // copy. Invalid bytes produce a replacement of at least 3 bytes;
+            // this also covers the small String growth minimum.
+            .saturating_mul(4)
+            .saturating_add(label_bytes.saturating_mul(2))
+            .saturating_add(
+                self.reasons
+                    .len()
+                    .saturating_mul(std::mem::size_of::<String>()),
+            );
+        (text_bytes, formatting_bytes)
+    }
+}
+
+struct FormattedByteCount(usize);
+
+impl fmt::Write for FormattedByteCount {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        self.0 = self.0.saturating_add(text.len());
+        Ok(())
+    }
+}
+
+fn formatted_bytes(arguments: std::fmt::Arguments<'_>) -> usize {
+    let mut counter = FormattedByteCount(0);
+    std::fmt::write(&mut counter, arguments).expect("byte counter is infallible");
+    counter.0
 }
 
 pub(crate) struct TypestatePolicyCompiler<'a> {
@@ -505,18 +723,18 @@ pub(crate) struct TypestatePolicyCompiler<'a> {
 /// `ProcedurePortHandle` owns the exact semantic artifact that supplied it.
 /// Formal-name resolution is scalar, so caching that handle after its bounded
 /// lease window closes would retain an uncharged artifact. The procedure
-/// locator includes the workspace mount and the port kind includes the formal
-/// ordinal, which is the complete durable identity this cache needs.
+/// identity includes exact frozen contents and interpretation; the port kind
+/// includes the formal ordinal. Neither key retains an artifact allocation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct FormalPortKey {
-    procedure: SemanticLocator,
+    procedure: brokk_bifrost_analysis::analyzer::semantic::ExactProcedureIdentity,
     kind: ProcedurePortKind,
 }
 
 impl FormalPortKey {
     fn of(formal: &ProcedurePortHandle) -> Self {
         Self {
-            procedure: formal.procedure().semantics().locator().clone(),
+            procedure: formal.procedure().exact_identity(),
             kind: formal.kind(),
         }
     }
@@ -1031,7 +1249,7 @@ impl TypestatePolicyEvaluator for ProductionTypestatePolicyEvaluator {
                     .lock()
                     .expect("typestate unit attempts mutex poisoned")
                     .insert(policy_id.clone(), (attempt, None));
-                failed_projection_payload(&failure.message, failure.work)
+                failed_projection_with_summary(failure)
             }
             RootsPass::Widen(reason) => {
                 self.attempt
@@ -1131,7 +1349,7 @@ impl ProductionTypestatePolicyEvaluator {
             units,
         ) {
             RootsPass::Complete(payload) => payload,
-            RootsPass::Failed(failure) => failed_projection_payload(&failure.message, failure.work),
+            RootsPass::Failed(failure) => failed_projection_with_summary(failure),
             RootsPass::Widen(_) => unreachable!(
                 "a pass with no units has nothing to reuse and never asks to be widened"
             ),
@@ -1428,6 +1646,9 @@ fn compiled_typestate_work_report(compiled: &CompiledTypestatePolicy) -> PolicyW
 /// nor failure: it is the statement that this pass cannot be merged into the
 /// bytes a whole evaluation would have produced, and the caller answers it by
 /// evaluating the policy in full.
+// Keep the finite cause inventory inline: even a refused detail admission
+// must return this transient payload without allocating a box.
+#[allow(clippy::large_enum_variant)]
 enum RootsPass {
     Complete(TypestateProjectionPayload),
     Widen(WidenReason),
@@ -1441,8 +1662,8 @@ enum RootsPass {
 /// and the count of what the attempt did with them.
 const COMPOSITION_ROOT_ENGINE_DOMAIN: &[u8] = b"bifrost-policy-typestate-composition-root/v1";
 
-type TemplateTarget = (SemanticArtifactKey, ProcedureId);
-type TemplateCallKey = (TemplateTarget, CallSiteId);
+type TemplateTarget = brokk_bifrost_analysis::analyzer::semantic::DurableProcedureKey;
+type TemplateCallKey = brokk_bifrost_analysis::analyzer::semantic::ExactCallSiteKey;
 
 struct RootUnits<'a> {
     reuse: UnitReuse<'a>,
@@ -1647,6 +1868,26 @@ pub(crate) enum TypestateGap {
     },
 }
 
+impl RetainedSize for TypestateGap {
+    fn retained_size(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(match self {
+            Self::SolveUncertain { uncertainty, .. } => uncertainty
+                .retained_size()
+                .saturating_sub(std::mem::size_of_val(uncertainty)),
+            Self::UnprovenEventRelation {
+                event,
+                phase,
+                reason,
+            } => event
+                .capacity()
+                .saturating_add(phase.capacity())
+                .saturating_add(reason.capacity()),
+            Self::BindingOmitted { omission } => omission.capacity(),
+            _ => 0,
+        })
+    }
+}
+
 impl TypestateGap {
     /// A gap of a shared budget or of the whole request: no root's own solve
     /// can be complete while it stands.
@@ -1717,78 +1958,100 @@ impl TypestateGap {
     }
 
     fn message(&self) -> String {
+        let mut message = String::with_capacity(self.message_bytes());
+        self.write_message(&mut message)
+            .expect("String formatter is infallible");
+        message
+    }
+
+    fn message_bytes(&self) -> usize {
+        let mut counter = FormattedByteCount(0);
+        self.write_message(&mut counter)
+            .expect("byte counter is infallible");
+        counter.0
+    }
+
+    fn message_steps(&self) -> usize {
         match self {
-            Self::Cancelled => "typestate evaluation was cancelled".to_owned(),
+            Self::SolveUncertain { uncertainty, .. } => uncertainty.len().saturating_add(1),
+            _ => 1,
+        }
+    }
+
+    fn write_message(&self, output: &mut dyn fmt::Write) -> fmt::Result {
+        match self {
+            Self::Cancelled => output.write_str("typestate evaluation was cancelled"),
             Self::SolverBudgetExhausted => {
-                "typestate solver work budget was exhausted before a fixed point".to_owned()
+                output.write_str("typestate solver work budget was exhausted before a fixed point")
             }
             Self::FindingBudgetExhausted => {
-                "typestate finding budget was exhausted, so findings were omitted".to_owned()
+                output.write_str("typestate finding budget was exhausted, so findings were omitted")
             }
             Self::FindingAnalysisIncomplete => {
-                "typestate finding collection could not complete its analysis".to_owned()
+                output.write_str("typestate finding collection could not complete its analysis")
             }
             Self::ExecutionBudgetExhausted => {
-                "typestate semantic execution budget was exhausted".to_owned()
+                output.write_str("typestate semantic execution budget was exhausted")
             }
             Self::SemanticArtifactCapacity => {
-                "typestate semantic artifact capacity was exhausted".to_owned()
+                output.write_str("typestate semantic artifact capacity was exhausted")
             }
             Self::CallClosureBudgetStop => {
-                "typestate root call closure stopped at the semantic budget".to_owned()
+                output.write_str("typestate root call closure stopped at the semantic budget")
             }
             Self::CallControlCoverageRefused => {
-                "scoped call/control coverage was refused, so the summaries a root consumes are \
-                 not proven complete"
-                    .to_owned()
+                output.write_str("scoped call/control coverage was refused, so the summaries a root consumes are not proven complete")
             }
             Self::SummaryProjectionRefused => {
-                "typestate summary projection was refused at a call/control boundary".to_owned()
+                output.write_str("typestate summary projection was refused at a call/control boundary")
             }
             Self::BindingsIncomplete => {
-                "typestate subject or event bindings did not cover every candidate".to_owned()
+                output.write_str("typestate subject or event bindings did not cover every candidate")
             }
             Self::SolveUncertain {
                 uncertainty,
                 abstained,
             } => {
-                let mut message = "typestate solve kept uncertain facts".to_owned();
+                output.write_str("typestate solve kept uncertain facts")?;
                 if !uncertainty.is_empty() {
-                    message.push_str(&format!(": {}", uncertainty.join(", ")));
+                    output.write_str(": ")?;
+                    for (index, code) in uncertainty.iter().enumerate() {
+                        if index > 0 { output.write_str(", ")?; }
+                        output.write_str(code)?;
+                    }
                 }
                 if *abstained {
-                    message.push_str(" (some facts abstained)");
+                    output.write_str(" (some facts abstained)")?;
                 }
                 if uncertainty.iter().any(|code| {
                     code == "typestate-unknown-call" || code == "typestate-external-call"
                 }) {
-                    message.push_str(
+                    output.write_str(
                         "; an unmodeled or unresolved call needs a complete summary or model \
                          before the solve can be complete",
-                    );
+                    )?;
                 }
-                message
+                Ok(())
             }
             Self::SolveResultIncomplete => {
-                "typestate solve did not cover its result, and no reviewed binding closed it"
-                    .to_owned()
+                output.write_str("typestate solve did not cover its result, and no reviewed binding closed it")
             }
             Self::UnprovenEventRelation {
                 event,
                 phase,
                 reason,
-            } => format!(
+            } => write!(output,
                 "event `{event}` ({phase}) may observe the subject in a procedure the root's call \
                  closure does not exclude: {reason}"
             ),
             Self::CompositionJudgmentIncomplete => {
-                "typestate composition could not judge every terminal root".to_owned()
+                output.write_str("typestate composition could not judge every terminal root")
             }
             Self::CompositionAdmissionIncomplete => {
-                "typestate composition could not admit every composed finding".to_owned()
+                output.write_str("typestate composition could not admit every composed finding")
             }
             Self::BindingOmitted { omission } => {
-                format!("typestate endpoint binding omitted: {omission}")
+                write!(output, "typestate endpoint binding omitted: {omission}")
             }
         }
     }
@@ -1876,7 +2139,10 @@ struct RootPassState {
     replayed_artifact_lease_bytes: usize,
     projections: Vec<TypestateProjectedFinding>,
     gaps: Vec<TypestateGap>,
-    root_gaps: HashMap<ProcedureHandle, Vec<TypestateGap>>,
+    root_gaps: HashMap<
+        brokk_bifrost_analysis::analyzer::semantic::ExactProcedureIdentity,
+        Vec<TypestateGap>,
+    >,
     reached_rows: u64,
     subject_rows: u64,
     terminal_rows: u64,
@@ -1956,7 +2222,10 @@ impl RootPassState {
         let cache_work = ProductionSummaryLifecycleCounters::default();
         let limits = inputs.limits;
         let solver_budget = SolverBudget::new(limits.solver_work);
-        let semantic_budget = if inputs.compiled.roots.is_empty() {
+        let semantic_budget = if inputs.compiled.roots.is_empty()
+            && inputs.compiled.undecided_sites.is_empty()
+            && inputs.compiled.binding_omissions.is_empty()
+        {
             None
         } else {
             Some(SemanticBudget::new_carved_child(
@@ -2633,7 +2902,7 @@ impl RootPassState {
             .then_some(WidenReason::MergedLimitReached)
     }
 
-    fn finish(mut self, inputs: &RootPassInputs<'_>) -> RootsPass {
+    fn work_report(&self, inputs: &RootPassInputs<'_>) -> PolicyWorkReport {
         let final_evaluation_execution_work = self.evaluation_execution_budget.work();
         let evaluation_materialized_files = final_evaluation_execution_work
             .materialized_files
@@ -2641,43 +2910,6 @@ impl RootPassState {
         let evaluation_traversal_steps = final_evaluation_execution_work
             .traversal_steps
             .saturating_sub(self.initial_evaluation_execution_work.traversal_steps);
-        let completed_evaluation = self.evaluation_error.is_none();
-        if completed_evaluation && final_evaluation_execution_work.exhausted {
-            self.gaps.push(TypestateGap::ExecutionBudgetExhausted);
-        }
-        // The gaps no single root owns, which every subject site depends on:
-        // cancellation and the shared budgets always, and any other gap no
-        // recorded root names. A root's gaps reach the evaluation's list more
-        // than once (the solve and the product merge both add them), so
-        // ownership is by value, not by count. Undecided candidates and
-        // binding omissions are added below and enter the verdicts per site.
-        let global_gaps = self
-            .gaps
-            .iter()
-            .filter(|gap| {
-                gap.is_evaluation_wide() || !self.root_gaps.values().any(|gaps| gaps.contains(gap))
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        // Unproven event relations are decided per root: each engine records
-        // an unproven-relation gap unless the root's complete call closure
-        // excludes the relation's observing procedure. A policy-wide check
-        // here would override that exclusion for relations every root rules
-        // out.
-        if completed_evaluation {
-            self.gaps
-                .extend(inputs.compiled.undecided_sites.iter().map(|site| {
-                    TypestateGap::BindingOmitted {
-                        omission: site.to_string(),
-                    }
-                }));
-            self.gaps
-                .extend(inputs.compiled.binding_omissions.iter().map(|omission| {
-                    TypestateGap::BindingOmitted {
-                        omission: omission.clone(),
-                    }
-                }));
-        }
         let semantic_evaluation_work = self
             .semantic_budget
             .as_ref()
@@ -2691,7 +2923,7 @@ impl RootPassState {
                 self.evaluation_artifact_retained_peak,
                 final_evaluation_execution_work.traversal_steps,
             );
-        let work = typestate_work_report(
+        typestate_work_report(
             inputs.compiled,
             &TypestateWorkMeasurements {
                 cache_work: self.cache_work,
@@ -2721,71 +2953,306 @@ impl RootPassState {
                 terminal_rows: self.terminal_rows,
                 retained_analysis_findings: self.retained_analysis_findings,
                 omitted_analysis_findings: self.omitted_analysis_findings,
-                retained_findings: if completed_evaluation {
+                retained_findings: if self.evaluation_error.is_none() {
                     u64::try_from(self.projections.len()).unwrap_or(u64::MAX)
                 } else {
                     0
                 },
             },
-        );
-        if let Some(message) = self.evaluation_error {
-            return RootsPass::Failed(TypestateEvaluationFailure { message, work });
+        )
+    }
+
+    fn completion(&self, inputs: &RootPassInputs<'_>) -> PolicyRunCompletion {
+        let mut reasons = Vec::with_capacity(2);
+        for gap in &self.gaps {
+            let reason = gap.reason();
+            if !reasons.contains(&reason) {
+                reasons.push(reason);
+            }
         }
-        self.gaps.sort();
-        self.gaps.dedup();
-        let mut reasons = self
-            .gaps
-            .iter()
-            .map(TypestateGap::reason)
-            .collect::<Vec<_>>();
+        if (!inputs.compiled.undecided_sites.is_empty()
+            || !inputs.compiled.binding_omissions.is_empty())
+            && !reasons.contains(&PolicyIncompleteReason::PartialDiscovery)
+        {
+            reasons.push(PolicyIncompleteReason::PartialDiscovery);
+        }
         reasons.sort();
-        reasons.dedup();
-        let completion = if reasons.is_empty() {
+        if reasons.is_empty() {
             PolicyRunCompletion::Complete
         } else {
-            PolicyRunCompletion::inconclusive(reasons)
-                .expect("deduplicated typestate incomplete reasons are canonical")
+            PolicyRunCompletion::inconclusive(reasons).expect("canonical gap reasons")
+        }
+    }
+
+    fn record_compiler_omissions(gaps: &mut Vec<TypestateGap>, inputs: &RootPassInputs<'_>) {
+        let omissions = inputs.compiled.binding_omissions.len();
+        if omissions == 0 {
+            return;
+        }
+        // AttributionScratch admitted this complete backing allocation before
+        // any omission is rendered or cloned. Moving old gaps retains their
+        // existing strings instead of making another owned copy.
+        let mut combined = Vec::with_capacity(gaps.len().saturating_add(omissions));
+        combined.append(gaps);
+        combined.extend(inputs.compiled.binding_omissions.iter().map(|omission| {
+            TypestateGap::BindingOmitted {
+                omission: omission.clone(),
+            }
+        }));
+        *gaps = combined;
+    }
+
+    fn finish_without_attribution(
+        self,
+        inputs: &RootPassInputs<'_>,
+        mut completion: PolicyRunCompletion,
+        work: PolicyWorkReport,
+    ) -> RootsPass {
+        // Compiler omissions already make completion inconclusive. Their
+        // storage and formatting were not admitted, so do not clone them on
+        // the refusal path just to emit more diagnostics.
+        completion.mark_inconclusive(PolicyIncompleteReason::ReportRetentionBudget);
+        let available = inputs
+            .budget
+            .max_retained_report_bytes()
+            .saturating_sub(std::mem::size_of::<crate::finding::PolicyRun>())
+            .saturating_sub(inputs.policy.definition().metadata.id.retained_size())
+            .saturating_sub(self.projections.retained_size())
+            .saturating_sub(work.retained_size())
+            .saturating_sub(completion.retained_size());
+        let diagnostics = attribution_refusal_diagnostics(
+            &self.gaps,
+            &inputs.compiled.undecided_sites,
+            &inputs.compiled.binding_omissions,
+            inputs.budget.max_diagnostics(),
+            available,
+        );
+        RootsPass::Complete(TypestateProjectionPayload {
+            projections: self.projections,
+            completion,
+            diagnostics,
+            diagnostics_truncated: true,
+            work,
+            subjects: None,
+        })
+    }
+
+    fn finish(mut self, inputs: &RootPassInputs<'_>) -> RootsPass {
+        #[cfg(any(test, feature = "test-support"))]
+        if UNOWNED_FINISH_GAP.get() {
+            let gap = TypestateGap::CompositionAdmissionIncomplete;
+            assert!(
+                self.root_gaps.values().all(|gaps| !gaps.contains(&gap)),
+                "finish probe must have no root owner"
+            );
+            self.gaps.push(gap);
+        }
+        let final_evaluation_execution_work = self.evaluation_execution_budget.work();
+        let completed_evaluation = self.evaluation_error.is_none();
+        if completed_evaluation && final_evaluation_execution_work.exhausted {
+            self.gaps.push(TypestateGap::ExecutionBudgetExhausted);
+        }
+        let work = self.work_report(inputs);
+        if let Some(message) = self.evaluation_error.take() {
+            return RootsPass::Failed(TypestateEvaluationFailure {
+                message,
+                work,
+                diagnostic_summary: typestate_omission_summary(&self.gaps, inputs),
+            });
+        }
+        let completion = self.completion(inputs);
+        let compiler_omissions = CompilerOmissionCensus::new(
+            &inputs.compiled.undecided_sites,
+            &inputs.compiled.binding_omissions,
+        );
+        let attribution_admitted = !self.gaps.is_empty() || compiler_omissions.rows != 0;
+        let scratch = if attribution_admitted {
+            AttributionScratch::new(
+                &self.gaps,
+                &self.root_gaps,
+                &inputs.compiled.subjects,
+                compiler_omissions,
+                inputs.budget.max_diagnostics(),
+            )
+        } else {
+            // Only a genuine no-gap, no-omission Complete solve skips work.
+            AttributionScratch::default()
         };
-        // Every gap is a diagnostic, so an inconclusive run names what it
-        // could not conclude.
-        let diagnostics_truncated = self.gaps.len() > inputs.budget.max_diagnostics();
-        let diagnostics = self
-            .gaps
-            .iter()
-            .take(inputs.budget.max_diagnostics())
-            .map(|gap| {
-                PolicyDiagnostic::try_new(
-                    PolicyDiagnosticCode::CodeQuery {
-                        code: gap.diagnostic_code(),
-                    },
-                    PolicyDiagnosticSeverity::Warning,
-                    PolicyDiagnosticImpact::RunIncomplete,
-                    gap.message(),
-                    None,
-                    Vec::new(),
-                )
-                .map_err(|error| error.to_string())
-            })
-            .collect::<Result<Vec<_>, _>>();
-        let diagnostics = match diagnostics {
+        let available = inputs
+            .budget
+            .max_retained_report_bytes()
+            .saturating_sub(std::mem::size_of::<crate::finding::PolicyRun>())
+            .saturating_sub(inputs.policy.definition().metadata.id.retained_size())
+            .saturating_sub(self.projections.retained_size())
+            .saturating_sub(work.retained_size())
+            .saturating_sub(completion.retained_size());
+        #[cfg(any(test, feature = "test-support"))]
+        let available = ATTRIBUTION_BYTE_ALLOWANCE
+            .get()
+            .map_or(available, |limit| available.min(limit));
+        if attribution_admitted
+            && !scratch.admit(
+                available,
+                &self.evaluation_execution_budget,
+                self.semantic_budget.as_mut(),
+            )
+        {
+            return self.finish_without_attribution(inputs, completion, work);
+        }
+        // The gaps no single root owns, which every subject site depends on:
+        // cancellation and the shared budgets always, and any other gap no
+        // recorded root names. A root's gaps reach the evaluation's list more
+        // than once (the solve and the product merge both add them), so
+        // ownership is by value, not by count. Undecided candidates and
+        // binding omissions are added below and enter the verdicts per site.
+        let owned_gaps = if self.gaps.is_empty() {
+            Vec::new()
+        } else {
+            for gaps in self.root_gaps.values_mut() {
+                gaps.sort_unstable();
+                gaps.dedup();
+            }
+            owned_root_gaps(&self.root_gaps, scratch.root_rows)
+        };
+        let mut global_gaps = Vec::with_capacity(self.gaps.len());
+        global_gaps.extend(
+            self.gaps
+                .iter()
+                .filter(|gap| gap_is_global(gap, &owned_gaps))
+                .cloned(),
+        );
+        // Unproven event relations are decided per root: each engine records
+        // an unproven-relation gap unless the root's complete call closure
+        // excludes the relation's observing procedure. A policy-wide check
+        // here would override that exclusion for relations every root rules
+        // out.
+        if completed_evaluation {
+            Self::record_compiler_omissions(&mut self.gaps, inputs);
+        }
+        self.gaps.sort_unstable();
+        self.gaps.dedup();
+        let scoped_diagnostics = match scoped_gap_diagnostics(
+            &self.gaps,
+            &self.root_gaps,
+            &owned_gaps,
+            &inputs.compiled.subjects,
+            &inputs.compiled.undecided_sites,
+            scratch.input_slots,
+        ) {
             Ok(diagnostics) => diagnostics,
             Err(message) => {
                 return RootsPass::Failed(TypestateEvaluationFailure {
                     message,
-                    work: work.clone(),
+                    work,
+                    diagnostic_summary: typestate_omission_summary(&self.gaps, inputs),
                 });
             }
         };
-        let subjects =
-            match subject_verdicts(inputs, &self.root_gaps, &global_gaps, &self.projections) {
-                Ok(subjects) => subjects,
-                Err(message) => {
+        let diagnostics_truncated = scoped_diagnostics.truncated;
+        // The census admits this exact output buffer and every expanded
+        // message/family allocation while the borrowed input buffer is live.
+        let mut diagnostics = scoped_diagnostics.causes;
+        diagnostics.reserve_exact(scoped_diagnostics.inputs.len());
+        let mut locations = super::semantic_identity::FileSpanLocations::default();
+        let mut coordinate_allowance = available.saturating_sub(scratch.bytes);
+        let mut projection_refused = false;
+        for (input, code) in scoped_diagnostics.inputs {
+            let (message, primary, related, omitted) = match input {
+                DiagnosticInput::Gap(gap) => (
+                    gap.message(),
+                    None,
+                    Vec::new(),
+                    crate::RelatedLocationOmissions::Known(0),
+                ),
+                DiagnosticInput::Undecided(site) => match site.diagnostic_projection(
+                    inputs.workspace,
+                    &mut locations,
+                    &mut coordinate_allowance,
+                    &mut |bytes| {
+                        admit_typestate_report_work(
+                            bytes,
+                            0,
+                            &self.evaluation_execution_budget,
+                            self.semantic_budget
+                                .as_mut()
+                                .expect("admitted attribution budget"),
+                        )
+                    },
+                ) {
+                    Ok(parts) => parts,
+                    Err(_) => {
+                        projection_refused = true;
+                        break;
+                    }
+                },
+            };
+            match PolicyDiagnostic::try_new(
+                PolicyDiagnosticCode::CodeQuery { code },
+                PolicyDiagnosticSeverity::Warning,
+                PolicyDiagnosticImpact::RunIncomplete,
+                message,
+                primary,
+                related,
+                omitted,
+            ) {
+                Ok(diagnostic) => diagnostics.push(diagnostic),
+                Err(error) => {
                     return RootsPass::Failed(TypestateEvaluationFailure {
-                        message,
+                        message: error.to_string(),
                         work: work.clone(),
+                        diagnostic_summary: {
+                            diagnostics.record_omitted_severity(PolicyDiagnosticSeverity::Warning);
+                            diagnostics.omitted_summary()
+                        },
                     });
                 }
-            };
+            }
+        }
+        drop(locations);
+        if projection_refused {
+            drop(diagnostics);
+            drop(owned_gaps);
+            return self.finish_without_attribution(inputs, completion, work);
+        }
+        drop(owned_gaps);
+        // Census the complete current payload, including spare Vec capacity,
+        // work metrics and the eventual run's inline/policy-ID envelope. Later
+        // classification/presentation additions still pass exact run retention.
+        let report_payload_bytes = std::mem::size_of::<crate::finding::PolicyRun>()
+            .saturating_add(inputs.policy.definition().metadata.id.retained_size())
+            .saturating_add(self.projections.retained_size())
+            .saturating_add(diagnostics.retained_size())
+            .saturating_add(completion.retained_size())
+            .saturating_add(work.retained_size())
+            .saturating_add(global_gaps.retained_size());
+        let subjects = match subject_verdicts(inputs, &mut self, &global_gaps, report_payload_bytes)
+        {
+            Ok(subjects) => subjects,
+            Err(message) => {
+                return RootsPass::Failed(TypestateEvaluationFailure {
+                    message,
+                    work: work.clone(),
+                    diagnostic_summary: diagnostics.omitted_summary(),
+                });
+            }
+        };
+        drop(global_gaps);
+        if attribution_admitted {
+            self.semantic_budget
+                .as_mut()
+                .expect("admitted attribution budget")
+                .release_admission(SemanticWork {
+                    nested_entries: scratch.nested_entries,
+                    ..SemanticWork::default()
+                });
+        }
+        // Optional report work cannot change solve completion or attribution.
+        // Its numeric counters change, but the fixed metric schema owns the
+        // same slots/strings already reserved by report_payload_bytes.
+        let report_work_bytes = work.retained_size();
+        drop(work);
+        let work = self.work_report(inputs);
+        debug_assert_eq!(work.retained_size(), report_work_bytes);
         RootsPass::Complete(TypestateProjectionPayload {
             projections: self.projections,
             completion,
@@ -2795,6 +3262,680 @@ impl RootPassState {
             subjects: Some(subjects),
         })
     }
+}
+
+/// Allocation and scan census for exact request-local attribution.
+#[derive(Clone, Copy, Default)]
+struct CompilerOmissionCensus {
+    rows: usize,
+    bytes: usize,
+    nested_entries: usize,
+    traversal_steps: usize,
+    max_message_bytes: usize,
+}
+
+impl CompilerOmissionCensus {
+    fn new(undecided: &[UndecidedSelectorSite], bindings: &[String]) -> Self {
+        let mut census = Self {
+            rows: bindings.len(),
+            bytes: bindings.iter().fold(0usize, |bytes, omission| {
+                bytes.saturating_add(omission.len())
+            }),
+            nested_entries: bindings.len(),
+            traversal_steps: bindings.len(),
+            max_message_bytes: bindings.iter().map(String::len).max().map_or(0, |bytes| {
+                bytes.saturating_add("typestate endpoint binding omitted: ".len())
+            }),
+        };
+        for site in undecided {
+            let (text_bytes, formatting_bytes) = site.omission_text_census();
+            // All retained related slots, the bounded borrowed identity buffer,
+            // and path/label formatting peaks coexist with the input buffer.
+            census.bytes = census.bytes.saturating_add(64usize.saturating_mul(
+                2 * std::mem::size_of::<crate::finding::RelatedPolicyLocation>()
+                    + std::mem::size_of::<
+                        &brokk_bifrost_analysis::analyzer::i_analyzer::QueryLookupProvenance,
+                    >(),
+            ));
+            for file in
+                std::iter::once(&site.file).chain(site.reasons.iter().filter_map(|reason| {
+                    match reason {
+                        super::selector_compiler::candidate_enumeration::CandidateReason::Read(
+                            read,
+                        ) => read.lookup_provenance().map(|lookup| &lookup.file),
+                        _ => None,
+                    }
+                }))
+            {
+                census.bytes = census.bytes.saturating_add(
+                    formatted_bytes(format_args!("{}", file.rel_path().display()))
+                        .saturating_mul(8),
+                );
+            }
+            for reason in &site.reasons {
+                if let super::selector_compiler::candidate_enumeration::CandidateReason::Read(
+                    read,
+                ) = reason
+                {
+                    census.bytes = census.bytes.saturating_add(read.retained_payload_bytes());
+                    if let Some(lookup) = read.lookup_provenance() {
+                        census.bytes = census.bytes.saturating_add(
+                            lookup
+                                .name
+                                .len()
+                                .saturating_add(lookup.tier.len())
+                                .saturating_add(read.label().len())
+                                .saturating_add(16)
+                                .saturating_mul(4),
+                        );
+                    }
+                }
+            }
+            census.traversal_steps = census
+                .traversal_steps
+                .saturating_add(site.reasons.len().saturating_mul(65));
+
+            census.rows = census.rows.saturating_add(1);
+            census.bytes = census
+                .bytes
+                .saturating_add(text_bytes)
+                .saturating_add(formatting_bytes);
+            census.nested_entries = census
+                .nested_entries
+                .saturating_add(128)
+                .saturating_add(1)
+                .saturating_add(site.reasons.len());
+            census.traversal_steps = census
+                .traversal_steps
+                .saturating_add(1)
+                .saturating_add(site.reasons.len());
+            census.max_message_bytes = census
+                .max_message_bytes
+                .max(text_bytes.saturating_add("typestate endpoint binding omitted: ".len()));
+        }
+        census
+    }
+}
+
+#[derive(Default)]
+struct AttributionScratch {
+    root_rows: usize,
+    input_slots: usize,
+    bytes: usize,
+    traversal_steps: usize,
+    nested_entries: usize,
+}
+
+impl AttributionScratch {
+    fn new(
+        gaps: &[TypestateGap],
+        root_gaps: &HashMap<
+            brokk_bifrost_analysis::analyzer::semantic::ExactProcedureIdentity,
+            Vec<TypestateGap>,
+        >,
+        subjects: &[CompiledTypestateSubject],
+        compiler_omissions: CompilerOmissionCensus,
+        max_diagnostics: usize,
+    ) -> Self {
+        let root_rows = root_gaps
+            .values()
+            .fold(0usize, |rows, gaps| rows.saturating_add(gaps.len()));
+        let root_entries = subjects.iter().fold(0usize, |rows, subject| {
+            rows.saturating_add(
+                root_gaps
+                    .get(&subject.root.exact_identity())
+                    .map_or(0, Vec::len),
+            )
+        });
+        let input_slots = gaps
+            .len()
+            .saturating_add(compiler_omissions.rows)
+            .saturating_add(root_entries)
+            .min(max_diagnostics);
+        let root_refs = root_entries.min(input_slots);
+        let mut max_message_bytes = compiler_omissions.max_message_bytes;
+        let mut max_family_bytes = if compiler_omissions.rows == 0 {
+            0
+        } else {
+            "code_query/".len()
+                + CodeQueryDiagnosticCode::SemanticCapabilityUnsupported
+                    .as_str()
+                    .len()
+        };
+        let mut max_message_steps = usize::from(compiler_omissions.rows != 0);
+        for gap in gaps.iter().chain(root_gaps.values().flatten()) {
+            max_message_bytes = max_message_bytes.max(gap.message_bytes());
+            max_family_bytes =
+                max_family_bytes.max("code_query/".len() + gap.diagnostic_code().as_str().len());
+            max_message_steps = max_message_steps.max(gap.message_steps());
+        }
+        // Each retained subject may own another diagnostic for the same root
+        // gap. Bound the full expansion, not just the raw gap strings. The
+        // family upper includes formatting/shrink temporaries; messages use
+        // the exact fixed-capacity shared renderer above.
+        let diagnostic_bytes = input_slots.saturating_mul(
+            std::mem::size_of::<PolicyDiagnostic>()
+                .saturating_add(max_message_bytes)
+                .saturating_add(max_family_bytes.saturating_mul(4)),
+        );
+        let global_bytes = gaps.iter().fold(
+            gaps.len()
+                .saturating_mul(std::mem::size_of::<TypestateGap>()),
+            |bytes, gap| {
+                bytes.saturating_add(
+                    gap.retained_size()
+                        .saturating_sub(std::mem::size_of::<TypestateGap>()),
+                )
+            },
+        );
+        let bytes = root_rows
+            .saturating_mul(std::mem::size_of::<&TypestateGap>())
+            .saturating_add(input_slots.saturating_mul(std::mem::size_of::<(
+                DiagnosticInput<'_>,
+                PolicyCodeQueryDiagnostic,
+            )>()))
+            .saturating_add(root_refs.saturating_mul(PUBLIC_SUBJECT_REF_BYTES))
+            .saturating_add(global_bytes)
+            .saturating_add(compiler_omissions.bytes)
+            .saturating_add(diagnostic_bytes)
+            .saturating_add(if compiler_omissions.rows == 0 {
+                0
+            } else {
+                // record_compiler_omissions moves old gaps into this exact
+                // backing allocation before rendering any new strings.
+                gaps.len()
+                    .saturating_add(compiler_omissions.rows)
+                    .saturating_mul(std::mem::size_of::<TypestateGap>())
+            });
+        let traversal_steps = root_gaps
+            .len()
+            .saturating_add(root_rows)
+            .saturating_add(gaps.len())
+            .saturating_add(compiler_omissions.traversal_steps)
+            .saturating_add(subjects.len())
+            .saturating_add(root_entries)
+            .saturating_add(input_slots.saturating_mul(max_message_steps));
+        Self {
+            root_rows,
+            input_slots,
+            bytes,
+            traversal_steps,
+            nested_entries: root_rows
+                .saturating_add(input_slots)
+                .saturating_add(root_refs)
+                .saturating_add(gaps.len())
+                .saturating_add(compiler_omissions.nested_entries)
+                .saturating_add(input_slots.saturating_mul(2)),
+        }
+    }
+
+    fn admit(
+        &self,
+        available: usize,
+        execution: &SemanticExecutionBudget,
+        semantic: Option<&mut SemanticBudget>,
+    ) -> bool {
+        if self.bytes > available {
+            return false;
+        }
+        let Some(semantic) = semantic else {
+            return false;
+        };
+        admit_typestate_report_work(
+            self.traversal_steps,
+            self.nested_entries,
+            execution,
+            semantic,
+        )
+    }
+}
+
+/// A failed projection omits every gap and compiler/site diagnostic.
+fn typestate_omission_summary(
+    gaps: &[TypestateGap],
+    inputs: &RootPassInputs<'_>,
+) -> PolicyDiagnostics {
+    let mut summary = typestate_compiler_omission_summary(
+        &inputs.compiled.undecided_sites,
+        &inputs.compiled.binding_omissions,
+    );
+    for gap in gaps {
+        summary.record_query_cause(gap.diagnostic_code(), PolicyDiagnosticImpact::RunIncomplete);
+    }
+    if !gaps.is_empty() {
+        summary.record_omitted_severity(PolicyDiagnosticSeverity::Warning);
+    }
+    summary
+}
+
+fn typestate_compiler_omission_summary(
+    undecided_sites: &[UndecidedSelectorSite],
+    binding_omissions: &[String],
+) -> PolicyDiagnostics {
+    let mut summary = PolicyDiagnostics::new();
+    if !undecided_sites.is_empty() {
+        summary.record_query_cause(
+            CodeQueryDiagnosticCode::TypestateAnalysisPartial,
+            PolicyDiagnosticImpact::RunIncomplete,
+        );
+    }
+    if !binding_omissions.is_empty() {
+        summary.record_query_cause(
+            CodeQueryDiagnosticCode::SemanticCapabilityUnsupported,
+            PolicyDiagnosticImpact::RunIncomplete,
+        );
+    }
+    if !undecided_sites.is_empty() || !binding_omissions.is_empty() {
+        summary.record_omitted_severity(PolicyDiagnosticSeverity::Warning);
+    }
+    summary
+}
+
+fn attribution_refusal_diagnostics(
+    gaps: &[TypestateGap],
+    undecided_sites: &[UndecidedSelectorSite],
+    binding_omissions: &[String],
+    max_diagnostics: usize,
+    mut available: usize,
+) -> PolicyDiagnostics {
+    enum Message<'a> {
+        Gap(&'a TypestateGap),
+        Text(&'static str),
+    }
+    impl Message<'_> {
+        fn bytes(&self) -> usize {
+            match self {
+                Self::Gap(gap) => gap.message_bytes(),
+                Self::Text(text) => text.len(),
+            }
+        }
+        fn materialize(self) -> String {
+            match self {
+                Self::Gap(gap) => gap.message(),
+                Self::Text(text) => text.to_owned(),
+            }
+        }
+    }
+    let mut diagnostics = typestate_compiler_omission_summary(undecided_sites, binding_omissions);
+    for gap in gaps {
+        diagnostics
+            .record_query_cause(gap.diagnostic_code(), PolicyDiagnosticImpact::RunIncomplete);
+        // Local partial gaps require ownership to project a valid scope; the
+        // refusal renderer below can retain only evaluation-wide partials.
+        if gap.diagnostic_code() == CodeQueryDiagnosticCode::TypestateAnalysisPartial
+            && !gap.is_evaluation_wide()
+        {
+            diagnostics.record_omitted_severity(PolicyDiagnosticSeverity::Warning);
+        }
+    }
+    diagnostics.record_cause(
+        &PolicyDiagnosticCode::ReportRetentionBudget,
+        PolicyDiagnosticImpact::RunIncomplete,
+    );
+    let mut admit = |code: PolicyDiagnosticCode, message: Message<'_>| {
+        if diagnostics.len() >= max_diagnostics {
+            diagnostics.record_omitted_severity(PolicyDiagnosticSeverity::Warning);
+            return false;
+        }
+        let old_capacity = diagnostics.capacity();
+        let new_capacity = if diagnostics.len() == old_capacity {
+            if old_capacity == 0 {
+                1
+            } else {
+                old_capacity.saturating_mul(2).min(max_diagnostics)
+            }
+        } else {
+            old_capacity
+        };
+        let growth = new_capacity
+            .saturating_sub(old_capacity)
+            .saturating_mul(std::mem::size_of::<PolicyDiagnostic>());
+        let family_bytes = match &code {
+            PolicyDiagnosticCode::CodeQuery { code } => "code_query/".len() + code.as_str().len(),
+            PolicyDiagnosticCode::ReportRetentionBudget => "report_retention_budget".len(),
+            _ => unreachable!("attribution refusal emits only query and report-budget codes"),
+        };
+        let heap_bound = message
+            .bytes()
+            .saturating_add(family_bytes.saturating_mul(4))
+            .saturating_add(
+                code.retained_size()
+                    .saturating_sub(std::mem::size_of_val(&code)),
+            );
+        // A growth allocation can coexist with the old backing buffer until
+        // reallocation finishes. Admit the whole new buffer before creating
+        // the diagnostic; charge only final growth after the old one drops.
+        let backing_allocation = if new_capacity > old_capacity {
+            new_capacity.saturating_mul(std::mem::size_of::<PolicyDiagnostic>())
+        } else {
+            0
+        };
+        if backing_allocation.saturating_add(heap_bound) > available {
+            diagnostics.record_omitted_severity(PolicyDiagnosticSeverity::Warning);
+            return false;
+        }
+        let Ok(diagnostic) = PolicyDiagnostic::try_new(
+            code,
+            PolicyDiagnosticSeverity::Warning,
+            PolicyDiagnosticImpact::RunIncomplete,
+            message.materialize(),
+            None,
+            Vec::new(),
+            crate::RelatedLocationOmissions::Known(0),
+        ) else {
+            // Unrepresentable diagnostics are omitted under the mandatory
+            // truncation flag; findings still survive.
+            diagnostics.record_omitted_severity(PolicyDiagnosticSeverity::Warning);
+            return false;
+        };
+        let heap = diagnostic
+            .retained_size()
+            .saturating_sub(std::mem::size_of::<PolicyDiagnostic>());
+        assert!(
+            heap <= heap_bound,
+            "admitted diagnostic exceeded its storage census"
+        );
+        if new_capacity > old_capacity {
+            diagnostics.reserve_exact(new_capacity - old_capacity);
+            assert_eq!(diagnostics.capacity(), new_capacity);
+        }
+        available -= growth + heap;
+        diagnostics.push(diagnostic);
+        true
+    };
+    for gap in gaps.iter().filter(|gap| {
+        gap.is_evaluation_wide()
+            && gap.diagnostic_code() == CodeQueryDiagnosticCode::TypestateAnalysisPartial
+    }) {
+        if !admit(
+            PolicyDiagnosticCode::CodeQuery {
+                code: PolicyCodeQueryDiagnostic::TypestatePartial {
+                    scope: TypestatePartialScope::Evaluation,
+                },
+            },
+            Message::Gap(gap),
+        ) {
+            return diagnostics;
+        }
+    }
+    if !admit(
+        PolicyDiagnosticCode::ReportRetentionBudget,
+        Message::Text("typestate diagnostic attribution exceeded the request report allowance"),
+    ) {
+        return diagnostics;
+    }
+    for gap in gaps
+        .iter()
+        .filter(|gap| gap.diagnostic_code() != CodeQueryDiagnosticCode::TypestateAnalysisPartial)
+    {
+        let code = gap
+            .diagnostic_code()
+            .try_into()
+            .expect("non-partial refusal diagnostic");
+        if !admit(PolicyDiagnosticCode::CodeQuery { code }, Message::Gap(gap)) {
+            break;
+        }
+    }
+    diagnostics
+}
+
+/// One request-local ownership index avoids rescanning every root for each
+/// diagnostic or repeated subject. It borrows unchanged raw gap values.
+fn owned_root_gaps(
+    root_gaps: &HashMap<
+        brokk_bifrost_analysis::analyzer::semantic::ExactProcedureIdentity,
+        Vec<TypestateGap>,
+    >,
+    capacity: usize,
+) -> Vec<&TypestateGap> {
+    let mut gaps = Vec::with_capacity(capacity);
+    gaps.extend(root_gaps.values().flatten());
+    gaps.sort_unstable();
+    gaps.dedup();
+    gaps
+}
+
+/// Evaluation ownership wins even when a replayed root also names a gap.
+/// The absence of any root owner is independently evaluation-wide.
+fn gap_is_global(gap: &TypestateGap, owned_gaps: &[&TypestateGap]) -> bool {
+    gap.is_evaluation_wide() || owned_gaps.binary_search(&gap).is_err()
+}
+
+enum DiagnosticInput<'g> {
+    Gap(&'g TypestateGap),
+    Undecided(&'g UndecidedSelectorSite),
+}
+
+struct ScopedGapDiagnostics<'g> {
+    inputs: Vec<(DiagnosticInput<'g>, PolicyCodeQueryDiagnostic)>,
+    causes: PolicyDiagnostics,
+    truncated: bool,
+}
+
+fn scoped_gap_diagnostics<'g>(
+    gaps: &'g [TypestateGap],
+    root_gaps: &'g HashMap<
+        brokk_bifrost_analysis::analyzer::semantic::ExactProcedureIdentity,
+        Vec<TypestateGap>,
+    >,
+    owned_gaps: &[&TypestateGap],
+    subjects: &[CompiledTypestateSubject],
+    undecided: &'g [UndecidedSelectorSite],
+    max_diagnostics: usize,
+) -> Result<ScopedGapDiagnostics<'g>, String> {
+    let mut causes = PolicyDiagnostics::new();
+    for gap in gaps {
+        causes.record_query_cause(gap.diagnostic_code(), PolicyDiagnosticImpact::RunIncomplete);
+    }
+    if !undecided.is_empty() {
+        causes.record_query_cause(
+            CodeQueryDiagnosticCode::TypestateAnalysisPartial,
+            PolicyDiagnosticImpact::RunIncomplete,
+        );
+    }
+    if gaps.is_empty() && undecided.is_empty() {
+        return Ok(ScopedGapDiagnostics {
+            inputs: Vec::new(),
+            causes,
+            truncated: false,
+        });
+    }
+    // Every gap is a diagnostic, so an inconclusive run names what it
+    // could not conclude.
+    // Expand attribution before allocation, retaining a deterministic prefix.
+    // Evaluation attribution is first and is never folded into Root scope.
+    let mut diagnostic_inputs = Vec::with_capacity(max_diagnostics);
+    let mut diagnostics_truncated = false;
+    let mut admit = |gap: &'g TypestateGap, scope: Option<TypestatePartialScope>| {
+        if diagnostic_inputs.len() >= max_diagnostics {
+            causes.record_omitted_severity(PolicyDiagnosticSeverity::Warning);
+            diagnostics_truncated = true;
+            return false;
+        }
+        let code = match scope {
+            Some(scope) => PolicyCodeQueryDiagnostic::TypestatePartial { scope },
+            None => gap
+                .diagnostic_code()
+                .try_into()
+                .expect("non-partial gap code"),
+        };
+        diagnostic_inputs.push((DiagnosticInput::Gap(gap), code));
+        true
+    };
+    // Preserve Evaluation partial attribution before any other global or
+    // root diagnostic can consume the cap. A zero cap still abstains.
+    for gap in gaps.iter().filter(|gap| {
+        gap_is_global(gap, owned_gaps)
+            && gap.diagnostic_code() == CodeQueryDiagnosticCode::TypestateAnalysisPartial
+    }) {
+        if !admit(gap, Some(TypestatePartialScope::Evaluation)) {
+            return Ok(ScopedGapDiagnostics {
+                inputs: diagnostic_inputs,
+                causes,
+                truncated: diagnostics_truncated,
+            });
+        }
+    }
+    for gap in gaps
+        .iter()
+        .filter(|gap| gap.diagnostic_code() != CodeQueryDiagnosticCode::TypestateAnalysisPartial)
+    {
+        if !admit(gap, None) {
+            return Ok(ScopedGapDiagnostics {
+                inputs: diagnostic_inputs,
+                causes,
+                truncated: diagnostics_truncated,
+            });
+        }
+    }
+    for site in undecided {
+        if diagnostic_inputs.len() >= max_diagnostics {
+            causes.record_omitted_severity(PolicyDiagnosticSeverity::Warning);
+            diagnostics_truncated = true;
+            break;
+        }
+        diagnostic_inputs.push((
+            DiagnosticInput::Undecided(site),
+            CodeQueryDiagnosticCode::SemanticCapabilityUnsupported
+                .try_into()
+                .expect("non-partial compiler omission"),
+        ));
+    }
+    if owned_gaps.is_empty() {
+        return Ok(ScopedGapDiagnostics {
+            inputs: diagnostic_inputs,
+            causes,
+            truncated: diagnostics_truncated,
+        });
+    }
+    // Compilation already orders subjects by key. Preserve that deterministic
+    // order and the adjacent identity dedup without allocating another list.
+    debug_assert!(subjects.windows(2).all(|pair| pair[0].key <= pair[1].key));
+    'subjects: for (position, subject) in subjects.iter().enumerate() {
+        if position > 0
+            && subjects[position - 1].key == subject.key
+            && subjects[position - 1].root == subject.root
+        {
+            continue;
+        }
+        if let Some(gaps) = root_gaps.get(&subject.root.exact_identity()) {
+            debug_assert!(gaps.windows(2).all(|pair| pair[0] < pair[1]));
+            for gap in gaps {
+                if gap.diagnostic_code() == CodeQueryDiagnosticCode::TypestateAnalysisPartial
+                    && !gap_is_global(gap, owned_gaps)
+                {
+                    // Only retained diagnostics own reference strings.
+                    if diagnostic_inputs.len() >= max_diagnostics {
+                        causes.record_omitted_severity(PolicyDiagnosticSeverity::Warning);
+                        diagnostics_truncated = true;
+                        break 'subjects;
+                    }
+                    let subject_key = public_subject_ref(&subject.key)?;
+                    diagnostic_inputs.push((
+                        DiagnosticInput::Gap(gap),
+                        PolicyCodeQueryDiagnostic::TypestatePartial {
+                            scope: TypestatePartialScope::Root { subject_key },
+                        },
+                    ));
+                }
+            }
+        }
+    }
+    Ok(ScopedGapDiagnostics {
+        inputs: diagnostic_inputs,
+        causes,
+        truncated: diagnostics_truncated,
+    })
+}
+
+const PUBLIC_SUBJECT_REF_BYTES: usize = "bifrost:".len() + 64;
+
+fn public_subject_ref(key: &TypestateSubjectKey) -> Result<AnalysisSubjectRef, String> {
+    // One existing subject-key rendering is an uncounted transient, hashed and dropped here.
+    let reference = AnalysisSubjectRef::try_new(
+        "bifrost",
+        super::semantic_identity::stable_hex(key.public_canonical_rendering().as_bytes()),
+    )
+    .map_err(|error| error.to_string())?;
+    debug_assert_eq!(reference.as_str().len(), PUBLIC_SUBJECT_REF_BYTES);
+    Ok(reference)
+}
+
+/// Request-only references over the full pre-solve binding domain. Sorting by
+/// subject permits range lookups without rescanning the binding table per site.
+struct FindingPrimaryIndex<'a> {
+    sites: Vec<(TypestateSubjectId, &'a SemanticLocator)>,
+}
+
+impl<'a> FindingPrimaryIndex<'a> {
+    fn new(
+        inputs: &'a RootPassInputs<'_>,
+        execution: &SemanticExecutionBudget,
+        semantic: &mut SemanticBudget,
+        max_bytes: usize,
+    ) -> Option<Self> {
+        let plan = &inputs.compiled.bindings;
+        let rows = plan.event_bindings().len()
+            + plan.event_templates().len()
+            + plan.terminal_bindings().len()
+            + plan.unproven_relations().len();
+        let bytes = rows
+            .saturating_mul(std::mem::size_of::<(TypestateSubjectId, &SemanticLocator)>())
+            .saturating_add(
+                (MAX_FINDING_LOCATION_SITES + 1) * std::mem::size_of::<&SemanticLocator>(),
+            );
+        if bytes > max_bytes
+            || !admit_typestate_report_work(
+                rows,
+                rows.saturating_add(MAX_FINDING_LOCATION_SITES + 1),
+                execution,
+                semantic,
+            )
+        {
+            return None;
+        }
+        let mut sites = Vec::with_capacity(rows);
+        sites.extend(plan.finding_primary_sites());
+        sites.sort_unstable_by_key(|(subject, _)| *subject);
+        Some(Self { sites })
+    }
+
+    fn subject_sites(
+        &self,
+        subject: TypestateSubjectId,
+    ) -> impl Iterator<Item = &'a SemanticLocator> + '_ {
+        let start = self.sites.partition_point(|(id, _)| *id < subject);
+        self.sites[start..]
+            .iter()
+            .take_while(move |(id, _)| *id == subject)
+            .map(|(_, site)| *site)
+    }
+}
+
+/// This optional report census must never record a refused analysis charge.
+/// All root solving has joined before finish; these ledgers are exclusively
+/// charged here, so successful preflight must make both debits succeed.
+fn admit_typestate_report_work(
+    traversal_steps: usize,
+    nested_entries: usize,
+    execution: &SemanticExecutionBudget,
+    semantic: &mut SemanticBudget,
+) -> bool {
+    // This SemanticWork debits exactly one dimension. check_admission also
+    // records refusals, so read its exact remaining dimension instead.
+    if !execution.external_query_work_fits(0, traversal_steps)
+        || nested_entries > semantic.remaining().nested_entries
+    {
+        return false;
+    }
+    assert!(execution.charge_traversal(traversal_steps));
+    semantic
+        .admit(SemanticWork {
+            nested_entries,
+            ..SemanticWork::default()
+        })
+        .expect("exclusive optional report admission was preflighted");
+    true
 }
 
 /// One completed evaluation's verdict for every subject site (#10985).
@@ -2808,11 +3949,13 @@ impl RootPassState {
 /// through the gaps its roots recorded.
 fn subject_verdicts(
     inputs: &RootPassInputs<'_>,
-    root_gaps: &HashMap<ProcedureHandle, Vec<TypestateGap>>,
+    state: &mut RootPassState,
     global_gaps: &[TypestateGap],
-    projections: &[TypestateProjectedFinding],
+    report_payload_bytes: usize,
 ) -> Result<PolicySubjectVerdicts, String> {
     use super::selector_compiler::candidate_enumeration::WhitelistedCallSelector;
+    let root_gaps = &state.root_gaps;
+    let projections = &state.projections;
     let compiled = inputs.compiled;
     let policy_id = &inputs.policy.definition().metadata.id;
     // The enumeration status follows the selector's shape, never a unit, so
@@ -2846,16 +3989,13 @@ fn subject_verdicts(
             enumeration,
         });
     }
-    let mut findings_by_subject: HashMap<&AnalysisSubjectRef, Vec<PolicyFindingId>> =
+    let mut findings_by_subject: HashMap<&AnalysisSubjectRef, Vec<&TypestateProjectedFinding>> =
         HashMap::new();
     for projection in projections {
         findings_by_subject
             .entry(&projection.subject)
             .or_default()
-            .push(PolicyFindingId::from_typestate_anchor(
-                policy_id,
-                &projection.anchor,
-            ));
+            .push(projection);
     }
     type SiteKey = (String, String, Option<PolicyByteSpan>);
     struct SiteGroup<'c> {
@@ -2866,6 +4006,7 @@ fn subject_verdicts(
     let mut groups: HashMap<SiteKey, SiteGroup<'_>> = HashMap::new();
     // A subject selected at several sites reports its findings at the first.
     let mut subject_sites: HashMap<&TypestateSubjectKey, SiteKey> = HashMap::new();
+    let mut shared_subjects = HashSet::new();
     for subject in compiled.subjects.iter() {
         let spec_subject = inputs
             .spec
@@ -2883,6 +4024,9 @@ fn subject_verdicts(
             subject_sites
                 .entry(&subject.key)
                 .and_modify(|first| {
+                    if key != *first {
+                        shared_subjects.insert(&subject.key);
+                    }
                     if key < *first {
                         *first = key.clone();
                     }
@@ -2892,13 +4036,17 @@ fn subject_verdicts(
                 location,
                 subjects: Vec::new(),
             });
-            if !group.subjects.iter().any(|known| known.key == subject.key) {
+            if !group
+                .subjects
+                .iter()
+                .any(|known| known.key == subject.key && known.root == subject.root)
+            {
                 group.subjects.push(subject);
             }
         }
     }
     let mut entries = Vec::with_capacity(groups.len() + compiled.undecided_sites.len());
-    for (key, group) in groups {
+    for (key, group) in &groups {
         let mut findings = Vec::new();
         let mut reasons: Vec<String> = global_gaps
             .iter()
@@ -2910,25 +4058,22 @@ fn subject_verdicts(
         if !compiled.binding_omissions.is_empty() {
             reasons.push("binding_incomplete".to_owned());
         }
+        let mut subject_keys = Vec::new();
         for subject in &group.subjects {
-            if subject_sites.get(&subject.key) != Some(&key) {
+            let subject_ref = public_subject_ref(&subject.key)?;
+            subject_keys.push(subject_ref.clone());
+            if subject_sites.get(&subject.key) != Some(key) {
                 // This subject's findings are reported at its first site.
                 reasons.push("subject_shared_with_other_site".to_owned());
             } else {
-                // The same reference project_finding mints for this subject.
-                let subject_ref = AnalysisSubjectRef::try_new(
-                    "bifrost",
-                    super::semantic_identity::stable_hex(
-                        subject.key.public_canonical_rendering().as_bytes(),
-                    ),
-                )
-                .map_err(|error| error.to_string())?;
                 findings.extend(
                     findings_by_subject
                         .get(&subject_ref)
                         .into_iter()
                         .flatten()
-                        .copied(),
+                        .map(|projection| {
+                            PolicyFindingId::from_typestate_anchor(policy_id, &projection.anchor)
+                        }),
                 );
             }
             if compiled.binding_omission_subjects.contains(&subject.key) {
@@ -2939,19 +4084,22 @@ fn subject_verdicts(
             }
         }
         for root in roots {
-            match root_gaps.get(root) {
+            match root_gaps.get(&root.exact_identity()) {
                 Some(gaps) => reasons.extend(gaps.iter().map(|gap| gap.label().to_owned())),
                 None => reasons.push("root_unfinished".to_owned()),
             }
         }
+        subject_keys.sort();
+        subject_keys.dedup();
         findings.sort_unstable();
         findings.dedup();
         let partial = !reasons.is_empty();
         entries.push(PolicySubjectVerdict {
-            selector: key.0,
-            location: group.location,
+            selector: key.0.clone(),
+            location: group.location.clone(),
             verdict: SubjectVerdict::Selected {
-                bindings: u32::try_from(group.subjects.len()).unwrap_or(u32::MAX),
+                bindings: u32::try_from(subject_keys.len()).unwrap_or(u32::MAX),
+                subject_keys,
                 findings,
                 further_findings_absent: if partial {
                     FurtherFindingsAbsent::partial(reasons)
@@ -3018,6 +4166,219 @@ fn subject_verdicts(
         .omitted
         .selected
         .saturating_add(u64::try_from(unbound_selected_sites).unwrap_or(u64::MAX));
+    // Complete initial selected membership and binding proof is independent
+    // of a locally partial solve. Global gaps, compiler omissions and shared
+    // ownership cannot mint Sites. Retained Undecided candidates also leave
+    // initial membership incomplete, independently of omission counters.
+    if global_gaps.is_empty()
+        && compiled.binding_omissions.is_empty()
+        && compiled.undecided_sites.is_empty()
+        && unbound_selected_sites == 0
+        && verdicts.omitted.selected == 0
+        && verdicts.omitted.undecided == 0
+    {
+        let mut available = inputs
+            .budget
+            .max_retained_report_bytes()
+            .saturating_sub(report_payload_bytes)
+            .saturating_sub(verdicts.retained_size())
+            .saturating_sub(locations.retained_heap_bytes());
+        let mut primary_index = None;
+        let mut sites = Vec::new();
+        for entry in &mut verdicts.entries {
+            let SubjectVerdict::Selected {
+                finding_location_bound: Some(bound),
+                subject_keys,
+                ..
+            } = &mut entry.verdict
+            else {
+                continue;
+            };
+            let group = &groups[&(
+                entry.selector.clone(),
+                entry.location.path().to_owned(),
+                entry.location.byte_span(),
+            )];
+            if group.subjects.iter().any(|subject| {
+                subject.selected_sites.len() != 1
+                    || shared_subjects.contains(&subject.key)
+                    || compiled.binding_omission_subjects.contains(&subject.key)
+                    || !root_gaps.contains_key(&subject.root.exact_identity())
+            }) {
+                continue;
+            }
+            // Only the first retained, ownership-proven partial entry needs
+            // the shared index. Refusal only leaves its bounds Unbounded.
+            if primary_index.is_none() {
+                let Some(index) = FindingPrimaryIndex::new(
+                    inputs,
+                    &state.evaluation_execution_budget,
+                    state
+                        .semantic_budget
+                        .as_mut()
+                        .expect("a bound root has a semantic budget"),
+                    available,
+                ) else {
+                    break;
+                };
+                let scratch_bytes =
+                    (MAX_FINDING_LOCATION_SITES + 1) * std::mem::size_of::<&SemanticLocator>();
+                let index_bytes = index.sites.capacity()
+                    * std::mem::size_of::<(TypestateSubjectId, &SemanticLocator)>();
+                assert!(index_bytes.saturating_add(scratch_bytes) <= available);
+                available -= index_bytes + scratch_bytes;
+                sites = Vec::with_capacity(MAX_FINDING_LOCATION_SITES + 1);
+                primary_index = Some(index);
+            }
+            let index = primary_index.as_ref().expect("index just admitted");
+            sites.clear();
+            let mut admitted = true;
+            for subject in &group.subjects {
+                let Some(id) = compiled.bindings.subject_id(&subject.key) else {
+                    admitted = false;
+                    break;
+                };
+                for site in index.subject_sites(id) {
+                    if !sites.contains(&site) {
+                        sites.push(site);
+                        if sites.len() > MAX_FINDING_LOCATION_SITES {
+                            admitted = false;
+                            break;
+                        }
+                    }
+                }
+                if !admitted {
+                    break;
+                }
+            }
+            #[cfg(debug_assertions)]
+            if std::env::var_os("BIFROST_TYPESTATE_DOMAIN_OBSERVATIONS").is_some() {
+                eprintln!(
+                    "typestate_domain report=1 sites={} cap_hit={}",
+                    sites.len(),
+                    usize::from(sites.len() > MAX_FINDING_LOCATION_SITES)
+                );
+            }
+            if !admitted {
+                continue;
+            }
+            // Refuse malformed/replayed primaries without dropping findings.
+            if subject_keys
+                .iter()
+                .flat_map(|key| findings_by_subject.get(key).into_iter().flatten())
+                .any(|finding| {
+                    !sites.iter().any(|site| {
+                        let span = site.anchor().span();
+                        finding.report.primary.path() == site.path().as_str()
+                            && finding.report.primary.byte_span()
+                                == PolicyByteSpan::new(
+                                    u64::from(span.start_byte()),
+                                    u64::from(span.end_byte()),
+                                )
+                                .ok()
+                    })
+                })
+            {
+                continue;
+            }
+            let bytes = sites.iter().fold(0usize, |total, site| {
+                total.saturating_add(
+                    std::mem::size_of::<PolicySourceLocation>() + site.path().as_str().len(),
+                )
+            });
+            if bytes > available {
+                continue;
+            }
+            // Reserve final location storage before the coordinate cache can
+            // consume any more of the same allowance. One cache/read refusal
+            // stops further materialization; findings and verdicts survive.
+            available -= bytes;
+            let mut domain_locations = Vec::with_capacity(sites.len());
+            // Account for actual capacity before any coordinate-cache growth.
+            // A fallible collect has no exact lower hint and can double slots.
+            let spare_bytes = domain_locations
+                .capacity()
+                .saturating_sub(sites.len())
+                .saturating_mul(std::mem::size_of::<PolicySourceLocation>());
+            if spare_bytes > available {
+                break;
+            }
+            available -= spare_bytes;
+            for site in &sites {
+                let root = inputs.workspace.analyzer().project().root();
+                let path = site.path().as_path();
+                let file = if let Some(file) = locations.cached_file(root, path) {
+                    file.clone()
+                } else {
+                    let Some(work) = compiled
+                        .artifact_leases
+                        .len()
+                        .checked_add(locations.len())
+                        .and_then(|work| work.checked_add(1))
+                    else {
+                        admitted = false;
+                        break;
+                    };
+                    if !admit_typestate_report_work(
+                        work,
+                        0,
+                        &state.evaluation_execution_budget,
+                        state
+                            .semantic_budget
+                            .as_mut()
+                            .expect("a bound root has a semantic budget"),
+                    ) {
+                        admitted = false;
+                        break;
+                    }
+                    let Some(file) = compiled.artifact_leases.retained_file(root, path) else {
+                        admitted = false;
+                        break;
+                    };
+                    file.clone()
+                };
+                let Ok(location) = locations.locator_location(
+                    inputs.workspace,
+                    &file,
+                    site,
+                    &mut available,
+                    &mut |bytes| {
+                        admit_typestate_report_work(
+                            bytes,
+                            0,
+                            &state.evaluation_execution_budget,
+                            state
+                                .semantic_budget
+                                .as_mut()
+                                .expect("admitted attribution budget"),
+                        )
+                    },
+                ) else {
+                    admitted = false;
+                    break;
+                };
+                domain_locations.push(location);
+            }
+            if !admitted {
+                break;
+            }
+            domain_locations.sort_unstable();
+            domain_locations.dedup();
+            *bound = FindingLocationBound::Sites {
+                locations: domain_locations,
+            };
+        }
+    }
+    debug_assert!(
+        global_gaps.is_empty()
+            || verdicts.entries.iter().all(|entry| !matches!(
+                &entry.verdict,
+                SubjectVerdict::Selected {
+                    finding_location_bound: Some(FindingLocationBound::Sites { .. }),
+                    ..
+                }
+            ))
+    );
     Ok(verdicts)
 }
 
@@ -3075,7 +4436,9 @@ fn evaluate_compiled_typestate(
         state.begin_root();
         match state.solve_root(&inputs, root) {
             RootStep::Solved { product, .. } => {
-                state.root_gaps.insert(root.clone(), product.gaps.clone());
+                state
+                    .root_gaps
+                    .insert(root.exact_identity(), product.gaps.clone());
                 state.gaps.extend(product.gaps);
                 state.projections.extend(product.findings);
             }
@@ -3244,12 +4607,16 @@ impl<'r> UnitSlice for TypestateRootSlice<'_, '_, 'r> {
         for product in products {
             match product {
                 RootOutcome::Reused(root, product) => {
-                    state.root_gaps.insert(root, product.gaps.clone());
+                    state
+                        .root_gaps
+                        .insert(root.exact_identity(), product.gaps.clone());
                     state.gaps.extend(product.gaps);
                     state.projections.extend(product.findings);
                 }
                 RootOutcome::Solved { root, product, .. } => {
-                    state.root_gaps.insert(root, product.gaps.clone());
+                    state
+                        .root_gaps
+                        .insert(root.exact_identity(), product.gaps.clone());
                     state.gaps.extend(product.gaps);
                     state.projections.extend(product.findings);
                 }
@@ -3351,9 +4718,19 @@ fn project_finding(
     let site_identity =
         StableSemanticIdentity::protocol_violation_site(site_namespace, site_path, &site_key)
             .map_err(|error| error.to_string())?;
-    let subject_key = super::semantic_identity::stable_hex(
-        bound_subject.key().public_canonical_rendering().as_bytes(),
-    );
+    // A runtime object's refinement identity is lever-scoped and positional,
+    // so the finding hashes the acquisition observation's position-free site
+    // key in its place; that key's occurrence tells acquisitions at one site
+    // apart (#12029).
+    let (mut subject_rendering, refinement_omitted) =
+        bound_subject.key().finding_identity_rendering();
+    if refinement_omitted {
+        subject_rendering.push_str(&super::semantic_identity::semantic_site_key(
+            workspace,
+            subject_locator,
+        ));
+    }
+    let subject_key = super::semantic_identity::stable_hex(subject_rendering.as_bytes());
     let subject_identity =
         StableSemanticIdentity::protocol_subject(subject_namespace, subject_path, &subject_key)
             .map_err(|error| error.to_string())?;
@@ -3411,8 +4788,7 @@ fn project_finding(
             analysis_finding_id: AnalysisFindingId::try_new("bifrost", &finding_key)
                 .map_err(|error| error.to_string())?,
             anchor,
-            subject: AnalysisSubjectRef::try_new("bifrost", &subject_key)
-                .map_err(|error| error.to_string())?,
+            subject: public_subject_ref(bound_subject.key())?,
             witness_refs,
             witness_refs_truncated: witnesses_truncated,
             model_attribution: None,
@@ -3692,6 +5068,7 @@ fn projected_report(
     }
     Ok((
         ProjectedFindingReport {
+            evaluation_location: None,
             value_type_barrier_notes: Default::default(),
             primary,
             certainty,
@@ -3767,13 +5144,27 @@ fn certainty_reasons(
     Ok(reasons)
 }
 
+fn failed_projection_with_summary(
+    failure: TypestateEvaluationFailure,
+) -> TypestateProjectionPayload {
+    let mut payload = failed_projection_payload(&failure.message, failure.work);
+    payload
+        .diagnostics
+        .merge_omitted_summary(&failure.diagnostic_summary);
+    payload.diagnostics_truncated |= payload
+        .diagnostics
+        .worst_omitted_diagnostic_severity()
+        .is_some();
+    payload
+}
+
 fn failed_projection_payload(message: &str, work: PolicyWorkReport) -> TypestateProjectionPayload {
     let completion = PolicyRunCompletion::failed(vec![PolicyFailureReason::InternalInvariant])
         .expect("one failure reason is canonical");
     TypestateProjectionPayload {
         projections: Vec::new(),
         completion,
-        diagnostics: vec![super::projection::failed_projection_diagnostic(message)],
+        diagnostics: vec![super::projection::failed_projection_diagnostic(message)].into(),
         diagnostics_truncated: false,
         work,
         subjects: None,
@@ -3871,9 +5262,11 @@ fn typestate_selector_error(
     error: super::selector_compiler::PolicySelectorSessionError,
 ) -> TypestatePolicyCompileError {
     match error {
-        super::selector_compiler::PolicySelectorSessionError::Incomplete { completion, detail } => {
-            TypestatePolicyCompileError::QueryIncomplete { completion, detail }
-        }
+        super::selector_compiler::PolicySelectorSessionError::Incomplete {
+            completion,
+            detail,
+            reuse: _,
+        } => TypestatePolicyCompileError::QueryIncomplete { completion, detail },
         super::selector_compiler::PolicySelectorSessionError::Unavailable(detail) => {
             TypestatePolicyCompileError::SemanticUnavailable(detail)
         }
@@ -4693,7 +6086,7 @@ impl<'a> TypestatePolicyCompiler<'a> {
                                 )
                             })?;
                         let selector = selector(&selectors, dependency.selector_path())?;
-                        let binding = SelectorBinding::from_endpoint(&dependency.model().binding);
+                        let binding = SelectorBinding::from_endpoint(&dependency.model().binding)?;
                         for selection in self.select(selector, &binding)? {
                             for resolved in
                                 self.resolve_selection(selection, &binding, Some(*phase))?
@@ -5269,7 +6662,7 @@ impl<'a> TypestatePolicyCompiler<'a> {
                                 "event endpoint dependency is missing".to_owned(),
                             )
                         })?;
-                    let binding = SelectorBinding::from_endpoint(&dependency.model().binding);
+                    let binding = SelectorBinding::from_endpoint(&dependency.model().binding)?;
                     for selection in
                         self.select(selector(selectors, dependency.selector_path())?, &binding)?
                     {
@@ -5310,7 +6703,20 @@ impl<'a> TypestatePolicyCompiler<'a> {
         } else {
             self.selectors.select_subject_candidates(selector)
         }
-        .map_err(typestate_selector_error)?;
+        .map_err(|error| {
+            // A candidate classification's own refusal ends here: no capture
+            // encloses a typestate compile, so its verdict has no ledger to
+            // join, and neither does the ambient mark it repeats. A caller
+            // that opens one must carry the verdict to it instead.
+            debug_assert!(
+                error.reuse_verdict().is_content()
+                    || !brokk_bifrost_analysis::analyzer::read_attribution_records_reads(|| {
+                        self.selectors.workspace().analyzer().read_ledger_attached()
+                    }),
+                "typestate subject selection refused under a capture: {error:?}"
+            );
+            typestate_selector_error(error)
+        })?;
         // Selected subjects already enter the compilation through the
         // canonical bindings hash; the undecided candidates do not, so their
         // identities and reason classes extend the fingerprint roots key on.
@@ -5580,13 +6986,17 @@ impl<'a> TypestatePolicyCompiler<'a> {
             Some(
                 self.selectors
                     .continue_semantic(|request| {
-                        let value = brokk_bifrost_flow::typestate::ordered::selected_owned_receiver_event_object(
-                            &discovery,
-                            &procedure,
-                            &call,
-                            at_point.context(),
-                            request,
-                        )?;
+                        let value =
+                            brokk_bifrost_flow::typestate::ordered::selected_receiver_event_object(
+                                &discovery,
+                                &procedure,
+                                &call,
+                                at_point.context(),
+                                protocol_observation_phase(
+                                    phase.expect("receiver continuation requires a return phase"),
+                                ),
+                                request,
+                            )?;
                         Ok(SemanticOutcome::Complete {
                             value,
                             work: SemanticWork::default(),
@@ -6996,7 +8406,7 @@ impl<'a> TypestatePolicyCompiler<'a> {
                                 .iter()
                                 .flat_map(|point| &point.events)
                                 .filter(|event| {
-                                    matches!(event.effect, SemanticEffect::Assignment { target, .. } if target == actual.id())
+                                    matches!(event.effect, SemanticEffect::Assignment { target, .. } | SemanticEffect::ValueFlow { kind: ValueFlowKind::AddressOf, target, .. } if target == actual.id())
                                 });
                             match (associations.next(), associations.next()) {
                                 (Some(event), None)
@@ -7010,9 +8420,14 @@ impl<'a> TypestatePolicyCompiler<'a> {
                                             )
                                         }) =>
                                 {
-                                    let SemanticEffect::Assignment { value, .. } = event.effect
-                                    else {
-                                        unreachable!("selected assignment has an assignment effect")
+                                    let value = match event.effect {
+                                        SemanticEffect::Assignment { value, .. }
+                                        | SemanticEffect::ValueFlow {
+                                            kind: ValueFlowKind::AddressOf,
+                                            source: value,
+                                            ..
+                                        } => value,
+                                        _ => unreachable!("selected address association"),
                                     };
                                     call.procedure().value_handle(value)
                                 }
@@ -7224,15 +8639,23 @@ impl SelectorBinding {
         }
     }
 
-    fn from_endpoint(binding: &PolicyEndpointBinding) -> Self {
-        match binding {
+    fn from_endpoint(binding: &PolicyEndpointBinding) -> Result<Self, TypestatePolicyCompileError> {
+        if matches!(
+            binding,
+            PolicyEndpointBinding::ReturnValue { path: Some(_) }
+        ) {
+            return Err(TypestatePolicyCompileError::UnsupportedBinding(
+                "projected return-value endpoints are not supported by typestate".to_owned(),
+            ));
+        }
+        Ok(match binding {
             PolicyEndpointBinding::MatchedValue => Self::MatchedValue,
             PolicyEndpointBinding::Receiver => Self::Receiver,
-            PolicyEndpointBinding::ReturnValue => Self::ReturnValue,
+            PolicyEndpointBinding::ReturnValue { .. } => Self::ReturnValue,
             PolicyEndpointBinding::ResultIndex { index } => Self::ResultIndex(*index),
             PolicyEndpointBinding::ArgumentIndex { index } => Self::ArgumentIndex(*index),
             PolicyEndpointBinding::ArgumentName { name } => Self::ArgumentName(name.clone()),
-        }
+        })
     }
 }
 
@@ -7314,7 +8737,7 @@ fn evaluate_argument_condition(
     let semantics = call.procedure().semantics();
     let call_row = semantics.call_site(call.id())?;
     let argument = call_row.arguments.get(condition.index as usize)?;
-    match direct_scalar_source(semantics, argument.value) {
+    match direct_scalar_source(call.procedure(), argument.value) {
         Some(DirectScalarSource::Boolean(value)) => Some(value == condition.equals),
         Some(DirectScalarSource::Port(_))
         | Some(DirectScalarSource::UnsignedInteger(_))
@@ -7417,8 +8840,11 @@ impl<'a> TypestatePolicyCompiler<'a> {
     fn selected_template_target(
         &mut self,
         call: &CallSiteHandle,
-    ) -> Result<Option<(SemanticArtifactKey, ProcedureId)>, TypestatePolicyCompileError> {
-        let key = call.durable_key();
+    ) -> Result<
+        Option<brokk_bifrost_analysis::analyzer::semantic::DurableProcedureKey>,
+        TypestatePolicyCompileError,
+    > {
+        let key = call.exact_key();
         if let Some(target) = self.selected_template_targets.get(&key) {
             return Ok(target.clone());
         }
@@ -7583,7 +9009,7 @@ impl<'a> TypestatePolicyCompiler<'a> {
                 matches!(
                     effect,
                     CompiledSummaryEffect::Allocation {
-                        output: CompiledSummaryOutput::NormalReturn {},
+                        output: CompiledSummaryOutput::NormalReturn { path: None },
                         ..
                     }
                 )
@@ -7605,10 +9031,14 @@ impl<'a> TypestatePolicyCompiler<'a> {
         let summary = &summary.record;
         let receiver_identity = summary.transfers.iter().any(|transfer| {
             transfer.exit_kind == CompiledSummaryExitKind::Normal
-                && matches!(transfer.input, CompiledSummaryInput::Receiver {})
+                && matches!(
+                    transfer.input,
+                    CompiledSummaryInput::Receiver { path: None }
+                )
                 && matches!(
                     transfer.output,
-                    CompiledSummaryOutput::NormalReturn {} | CompiledSummaryOutput::Receiver {}
+                    CompiledSummaryOutput::NormalReturn { path: None }
+                        | CompiledSummaryOutput::Receiver { path: None }
                 )
         });
         let modeled_behavior = receiver_identity
@@ -8864,6 +10294,290 @@ mod tests {
         plan_hash: String,
     }
 
+    #[test]
+    #[hardwon(
+        "#11250: diagnostic ownership scratch allocated beyond the remaining request allowance"
+    )]
+    fn attribution_scratch_admission_and_refusal_are_bounded() {
+        let gaps = [
+            TypestateGap::CompositionAdmissionIncomplete,
+            TypestateGap::ExecutionBudgetExhausted,
+        ];
+        let scratch = AttributionScratch::new(
+            &gaps,
+            &HashMap::new(),
+            &[],
+            CompilerOmissionCensus::default(),
+            8,
+        );
+        for (bytes, traversal, nested) in [
+            (
+                scratch.bytes - 1,
+                scratch.traversal_steps,
+                scratch.nested_entries,
+            ),
+            (
+                scratch.bytes,
+                scratch.traversal_steps - 1,
+                scratch.nested_entries,
+            ),
+            (
+                scratch.bytes,
+                scratch.traversal_steps,
+                scratch.nested_entries - 1,
+            ),
+        ] {
+            let execution = SemanticExecutionBudget::for_fixpoint(traversal);
+            let mut semantic = SemanticBudget::new(SemanticWork {
+                nested_entries: nested,
+                ..SemanticWork::uniform(1024)
+            })
+            .unwrap();
+            let before = execution.snapshot();
+            assert!(!scratch.admit(bytes, &execution, Some(&mut semantic)));
+            assert_eq!(execution.snapshot(), before);
+            assert_eq!(semantic.used(), SemanticWork::default());
+            assert_eq!(semantic.refusal_count(), 0);
+            assert!(semantic.first_refusal().is_none());
+        }
+        let execution = SemanticExecutionBudget::for_fixpoint(scratch.traversal_steps);
+        let mut semantic = SemanticBudget::new(SemanticWork {
+            nested_entries: scratch.nested_entries,
+            ..SemanticWork::uniform(1024)
+        })
+        .unwrap();
+        assert!(scratch.admit(scratch.bytes, &execution, Some(&mut semantic)));
+        assert_eq!(execution.work().traversal_steps, scratch.traversal_steps);
+        assert!(!execution.work().exhausted);
+        assert_eq!(semantic.used().nested_entries, scratch.nested_entries);
+        let diagnostics = attribution_refusal_diagnostics(&gaps, &[], &[], 8, 1024 * 1024);
+        assert!(diagnostics.iter().any(|diagnostic| matches!(
+            diagnostic.code(),
+            PolicyDiagnosticCode::ReportRetentionBudget
+        )));
+        assert!(diagnostics.iter().any(|diagnostic| matches!(diagnostic.code(), PolicyDiagnosticCode::CodeQuery { code } if code.raw_code() == CodeQueryDiagnosticCode::ExecutionBudgetExhausted)));
+        assert!(diagnostics.iter().all(|diagnostic| !matches!(
+            diagnostic.code(),
+            PolicyDiagnosticCode::CodeQuery {
+                code: PolicyCodeQueryDiagnostic::TypestatePartial { .. }
+            }
+        )));
+        assert!(attribution_refusal_diagnostics(&gaps, &[], &[], 0, 1024 * 1024).is_empty());
+        assert!(attribution_refusal_diagnostics(&gaps, &[], &[], 8, 0).is_empty());
+    }
+
+    #[test]
+    #[hardwon("#11321: retained attribution-refusal gaps were falsely counted as omitted warnings")]
+    fn attribution_refusal_omitted_severity_tracks_actual_losses() {
+        let retained = [TypestateGap::ExecutionBudgetExhausted];
+        let diagnostics = attribution_refusal_diagnostics(&retained, &[], &[], 8, 1024 * 1024);
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(diagnostics.worst_omitted_diagnostic_severity(), None);
+        for diagnostics in [
+            attribution_refusal_diagnostics(&retained, &[], &[], 0, 1024 * 1024),
+            attribution_refusal_diagnostics(&retained, &[], &[], 8, 0),
+            attribution_refusal_diagnostics(
+                &[TypestateGap::CompositionAdmissionIncomplete],
+                &[],
+                &[],
+                8,
+                1024 * 1024,
+            ),
+            attribution_refusal_diagnostics(
+                &retained,
+                &[],
+                &["unprojected compiler omission".to_owned()],
+                8,
+                1024 * 1024,
+            ),
+        ] {
+            assert_eq!(
+                diagnostics.worst_omitted_diagnostic_severity(),
+                Some(PolicyDiagnosticSeverity::Warning)
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon("#11250: compiler-only omissions bypassed attribution storage admission")]
+    fn compiler_omission_census_covers_owned_text_before_allocation() {
+        use crate::selector_compiler::candidate_enumeration::CandidateReason;
+        let root = tempfile::tempdir().unwrap();
+        let file = ProjectFile::new(root.path(), std::path::Path::new("src").join("input.java"));
+        let undecided = [UndecidedSelectorSite {
+            selector: "/analysis/subjects/resource/selector".to_owned(),
+            file: file.clone(),
+            span: 12..345,
+            reasons: vec![
+                CandidateReason::Read(
+                    brokk_bifrost_analysis::analyzer::QueryReadIncomplete::SemanticEvidenceGap(
+                        "quoted \"reason\"\nwith escapes".into(),
+                    ),
+                ),
+                CandidateReason::SilentDrop,
+                CandidateReason::IncompleteQuery(CodeQueryCompletion::Cancelled),
+                CandidateReason::Disagreement { file, span: 6..9 },
+            ],
+        }];
+        let bindings = ["an omitted binding with retained detail; ".repeat(128)];
+        let (text_bytes, formatting_bytes) = undecided[0].omission_text_census();
+        assert_eq!(text_bytes, undecided[0].to_string().len());
+        assert!(formatting_bytes > 0);
+        let compiler = CompilerOmissionCensus::new(&undecided, &bindings);
+        assert_eq!(compiler.rows, 2);
+        assert!(compiler.bytes >= text_bytes + formatting_bytes + bindings[0].len());
+        let root_gaps = [TypestateGap::CompositionAdmissionIncomplete];
+        for gaps in [&[][..], root_gaps.as_slice()] {
+            let scratch = AttributionScratch::new(gaps, &HashMap::new(), &[], compiler, 8);
+            assert!(
+                scratch.bytes
+                    >= compiler.bytes
+                        + (gaps.len() + compiler.rows) * std::mem::size_of::<TypestateGap>()
+            );
+            assert_eq!(scratch.input_slots, gaps.len() + compiler.rows);
+            let execution = SemanticExecutionBudget::for_fixpoint(scratch.traversal_steps);
+            let mut semantic = SemanticBudget::new(SemanticWork {
+                nested_entries: scratch.nested_entries,
+                ..SemanticWork::uniform(1024)
+            })
+            .unwrap();
+            let before = execution.snapshot();
+            assert!(!scratch.admit(scratch.bytes - 1, &execution, Some(&mut semantic)));
+            assert_eq!(execution.snapshot(), before);
+            assert_eq!(semantic.used(), SemanticWork::default());
+            assert_eq!(semantic.refusal_count(), 0);
+            assert!(scratch.admit(scratch.bytes, &execution, Some(&mut semantic)));
+        }
+    }
+
+    #[test]
+    #[hardwon("#11250: expanded diagnostic messages and objects escaped attribution admission")]
+    fn diagnostic_expansion_census_covers_actual_owned_output() {
+        for count in [1, 16] {
+            let gaps = (0..count)
+                .map(|index| TypestateGap::UnprovenEventRelation {
+                    event: format!("close{index}"),
+                    phase: "AfterNormalReturn".to_owned(),
+                    reason: "retained relation detail; ".repeat(128),
+                })
+                .collect::<Vec<_>>();
+            let scratch = AttributionScratch::new(
+                &gaps,
+                &HashMap::new(),
+                &[],
+                CompilerOmissionCensus::default(),
+                count,
+            );
+            let mut diagnostics = Vec::with_capacity(count);
+            for gap in &gaps {
+                let message = gap.message();
+                assert_eq!(message.len(), gap.message_bytes());
+                assert_eq!(message.capacity(), message.len());
+                diagnostics.push(
+                    PolicyDiagnostic::try_new(
+                        PolicyDiagnosticCode::CodeQuery {
+                            code: PolicyCodeQueryDiagnostic::TypestatePartial {
+                                scope: TypestatePartialScope::Evaluation,
+                            },
+                        },
+                        PolicyDiagnosticSeverity::Warning,
+                        PolicyDiagnosticImpact::RunIncomplete,
+                        message,
+                        None,
+                        Vec::new(),
+                        crate::RelatedLocationOmissions::Known(0),
+                    )
+                    .unwrap(),
+                );
+            }
+            let output_bytes = diagnostics
+                .retained_size()
+                .saturating_sub(std::mem::size_of_val(&diagnostics));
+            assert!(
+                scratch.bytes >= output_bytes,
+                "all expanded output must be admitted"
+            );
+            let execution = SemanticExecutionBudget::for_fixpoint(scratch.traversal_steps);
+            let mut semantic = SemanticBudget::new(SemanticWork {
+                nested_entries: scratch.nested_entries,
+                ..SemanticWork::uniform(1024)
+            })
+            .unwrap();
+            let before = execution.snapshot();
+            assert!(!scratch.admit(output_bytes - 1, &execution, Some(&mut semantic)));
+            assert_eq!(execution.snapshot(), before);
+            assert_eq!(semantic.used(), SemanticWork::default());
+            assert_eq!(semantic.refusal_count(), 0);
+            assert!(scratch.admit(scratch.bytes, &execution, Some(&mut semantic)));
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#11250: optional finding-primary index admission exhausted completed analysis budgets"
+    )]
+    fn optional_primary_index_refusal_preserves_analysis_budget_channels() {
+        let rows = 2;
+        let nested_entries = rows + MAX_FINDING_LOCATION_SITES + 1;
+        for (traversal, nested) in [(rows - 1, nested_entries), (rows, nested_entries - 1)] {
+            let execution = SemanticExecutionBudget::for_fixpoint(traversal);
+            let mut semantic = SemanticBudget::new(SemanticWork {
+                nested_entries: nested,
+                ..SemanticWork::uniform(1024)
+            })
+            .unwrap();
+            let before = execution.snapshot();
+            let used = semantic.used();
+            assert!(!admit_typestate_report_work(
+                rows,
+                nested_entries,
+                &execution,
+                &mut semantic
+            ));
+            assert_eq!(execution.snapshot(), before);
+            assert!(!execution.work().exhausted);
+            assert_eq!(semantic.used(), used);
+            assert_eq!(semantic.refusal_count(), 0);
+            assert!(semantic.first_refusal().is_none());
+        }
+        let execution = SemanticExecutionBudget::for_fixpoint(rows);
+        let mut semantic = SemanticBudget::new(SemanticWork {
+            nested_entries,
+            ..SemanticWork::uniform(1024)
+        })
+        .unwrap();
+        assert!(admit_typestate_report_work(
+            rows,
+            nested_entries,
+            &execution,
+            &mut semantic
+        ));
+        assert_eq!(execution.work().traversal_steps, rows);
+        assert!(!execution.work().exhausted);
+        assert_eq!(semantic.used().nested_entries, nested_entries);
+        assert_eq!(semantic.refusal_count(), 0);
+    }
+
+    #[test]
+    fn diagnostic_cap_preserves_evaluation_partial_before_other_global_gaps() {
+        let gaps = [
+            TypestateGap::Cancelled,
+            TypestateGap::CompositionAdmissionIncomplete,
+        ];
+        let root_gaps = HashMap::new();
+        let diagnostics = scoped_gap_diagnostics(&gaps, &root_gaps, &[], &[], &[], 1).unwrap();
+        assert!(diagnostics.truncated);
+        assert_eq!(diagnostics.inputs.len(), 1);
+        assert!(matches!(
+            &diagnostics.inputs[0].1,
+            PolicyCodeQueryDiagnostic::TypestatePartial {
+                scope: TypestatePartialScope::Evaluation
+            }
+        ));
+        let empty = scoped_gap_diagnostics(&gaps[1..], &root_gaps, &[], &[], &[], 0).unwrap();
+        assert!(empty.truncated && empty.inputs.is_empty());
+    }
+
     fn compile_reviewed_coverage_case(case: CoverageCompileCase) -> CoverageCompileObservation {
         use brokk_bifrost_analysis::analyzer::AnalyzerQueryScope;
         use brokk_bifrost_analysis::analyzer::semantic_model::{
@@ -9671,6 +11385,21 @@ mod tests {
         // Exercise the marker through the policy evaluator, including its
         // exact-result cache. Each compile gets a fresh execution allowance;
         // the repository is shared across cold, warm, and replayed solves.
+        // Scope ownership is a request-time interpretation of unchanged raw
+        // gaps. Absence of an owner is independently global, and Evaluation
+        // wins even when a root (including a replayed root) also names it.
+        let mut owners = HashMap::new();
+        let partial = TypestateGap::CompositionAdmissionIncomplete;
+        assert!(gap_is_global(&partial, &owned_root_gaps(&owners, 2)));
+        owners.insert(
+            whole.roots[0].exact_identity(),
+            vec![partial.clone(), TypestateGap::FindingBudgetExhausted],
+        );
+        assert!(!gap_is_global(&partial, &owned_root_gaps(&owners, 2)));
+        assert!(gap_is_global(
+            &TypestateGap::FindingBudgetExhausted,
+            &owned_root_gaps(&owners, 2)
+        ));
         let marked_bindings = Arc::new(with_marker);
         let summaries = ProductionTypestateSummaryRepository::new(
             brokk_bifrost_analysis::analyzer::workspace_authority::workspace_memo_attribution(
@@ -10254,6 +11983,42 @@ func MissingClose() {
             compiled.bindings.hash(),
         )
         .expect("compiled fixture mints projection authority");
+        // #11321: the final refusal path must not count retained gaps as lost.
+        assert!(compiled.undecided_sites.is_empty());
+        assert!(compiled.binding_omissions.is_empty());
+        let summaries = ProductionTypestateSummaryRepository::new(
+            brokk_bifrost_analysis::analyzer::workspace_authority::workspace_memo_attribution(
+                &workspace,
+            ),
+        );
+        let inputs = RootPassInputs {
+            engine: compiled.engine.clone(),
+            authority: &authority,
+            policy,
+            spec,
+            workspace: &workspace,
+            cancellation: &cancellation,
+            budget: &budget,
+            compiled: &compiled,
+            summaries: &summaries,
+            active_semantic_model_snapshot: None,
+            limits: budget.query_limits().typestate,
+        };
+        let mut state = RootPassState::new(&inputs);
+        state.gaps.push(TypestateGap::ExecutionBudgetExhausted);
+        let completion = state.completion(&inputs);
+        let work = state.work_report(&inputs);
+        let RootsPass::Complete(refusal) =
+            state.finish_without_attribution(&inputs, completion, work)
+        else {
+            panic!("attribution refusal preserves a completed projection payload");
+        };
+        assert_eq!(refusal.diagnostics.len(), 2);
+        assert_eq!(
+            refusal.diagnostics.worst_omitted_diagnostic_severity(),
+            None
+        );
+
         let mut mismatched_spec = spec.clone();
         mismatched_spec.subjects.clear();
 
@@ -10307,7 +12072,8 @@ func MissingClose() {
         );
         assert_eq!(work.retained_findings(), 0);
 
-        let payload = failed_projection_payload(&failure.message, failure.work);
+        let expected_message = failure.message.clone();
+        let payload = failed_projection_with_summary(failure);
         assert!(payload.projections.is_empty());
         assert!(matches!(
             payload.completion,
@@ -10315,7 +12081,7 @@ func MissingClose() {
         ));
         assert_eq!(payload.work, work);
         assert_eq!(payload.diagnostics.len(), 1);
-        assert_eq!(payload.diagnostics[0].message(), failure.message);
+        assert_eq!(payload.diagnostics[0].message(), expected_message);
     }
 
     #[test]
@@ -10493,19 +12259,51 @@ func MissingClose() {
 
     #[test]
     fn formal_port_cache_key_is_allocation_independent_and_arc_free() {
-        let (first_artifact, first_scope) = scoped_root_fixture("same formal source");
-        let (second_artifact, second_scope) = scoped_root_fixture("same formal source");
+        use brokk_bifrost_analysis::analyzer::semantic::ProcedureId;
+        let build = || {
+            let (empty, scope) = scoped_root_fixture("same formal source");
+            let locator = scope.locator();
+            let locator = SemanticLocator::new(
+                locator.mount(),
+                locator.path().clone(),
+                locator.language(),
+                locator.declaration().clone(),
+                SemanticRole::Procedure,
+                locator.anchor(),
+            );
+            let parts = brokk_bifrost_analysis::test_support::minimal_semantic_procedure(
+                ProcedureId::new(0),
+                locator,
+                brokk_bifrost_analysis::analyzer::semantic::ProcedureKind::Function,
+            );
+            Arc::new(
+                SemanticArtifact::try_new(
+                    empty.key().clone(),
+                    brokk_bifrost_analysis::test_support::complete_semantic_capabilities(&[]),
+                    vec![parts],
+                )
+                .unwrap(),
+            )
+        };
+        let first_artifact = build();
+        let second_artifact = build();
         assert_eq!(first_artifact.key(), second_artifact.key());
         assert!(!Arc::ptr_eq(&first_artifact, &second_artifact));
 
         let first_strong_count = Arc::strong_count(&first_artifact);
         let second_strong_count = Arc::strong_count(&second_artifact);
         let first = FormalPortKey {
-            procedure: first_scope.locator().clone(),
+            procedure: first_artifact
+                .procedure_handle(ProcedureId::new(0))
+                .unwrap()
+                .exact_identity(),
             kind: ProcedurePortKind::Parameter { ordinal: 2 },
         };
         let second = FormalPortKey {
-            procedure: second_scope.locator().clone(),
+            procedure: second_artifact
+                .procedure_handle(ProcedureId::new(0))
+                .unwrap()
+                .exact_identity(),
             kind: ProcedurePortKind::Parameter { ordinal: 2 },
         };
         assert_eq!(first, second);
@@ -10513,7 +12311,10 @@ func MissingClose() {
         assert_eq!(Arc::strong_count(&second_artifact), second_strong_count);
 
         let different_ordinal = FormalPortKey {
-            procedure: second_scope.locator().clone(),
+            procedure: second_artifact
+                .procedure_handle(ProcedureId::new(0))
+                .unwrap()
+                .exact_identity(),
             kind: ProcedurePortKind::Parameter { ordinal: 3 },
         };
         assert_ne!(first, different_ordinal);

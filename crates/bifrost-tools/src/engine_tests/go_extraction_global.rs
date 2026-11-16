@@ -1282,6 +1282,9 @@ mod go_extraction_tests_global {
                 focus_end_byte: 12,
             };
             let outcome = |status| DefinitionLookupOutcome {
+                selected_sites: Vec::new(),
+                inventory_evidence: None,
+                incomplete_evidence: None,
                 modeled_definitions: Vec::new(),
                 status,
                 reference: Some(reference.clone()),
@@ -4211,7 +4214,13 @@ mod go_extraction_tests_global {
             "#7509: native Go Implements missed promoted receivers and returned a complete negative"
         )]
         fn go_method_family_closes_promoted_receiver_forms() {
+            use brokk_bifrost_analysis::analyzer::resolution::ResolutionTypeRef;
+            use brokk_bifrost_analysis::analyzer::resolution::fact_resolution::go_methods::GoMethodSatisfaction;
             use brokk_bifrost_analysis::analyzer::resolution::model::SemanticId;
+            use brokk_bifrost_analysis::analyzer::store::resolution_operation::go_hierarchy::GoStrictPositiveStopProbe;
+            use brokk_bifrost_core::analyzer::usages::receiver_analysis::{
+                ReceiverAnalysisBudget, ReceiverBudgetLimit,
+            };
             use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
             use rusqlite::params;
 
@@ -4249,6 +4258,13 @@ type pointerEmbed struct { *v }
 type definedPointer *v
 type Alias = v
 type aliasEmbed struct { Alias }
+type mixed struct{}
+func (mixed) A() {}
+func (*mixed) B() {}
+type pointerMixed struct { *mixed }
+type valueMixed struct { mixed }
+type MixedAlias = mixed
+type aliasPointerMixed struct { *MixedAlias }
 "#,
                 "package provider; type Decoy struct{}",
             ]);
@@ -4280,7 +4296,7 @@ type aliasEmbed struct { Alias }
             let interface = method("I", "A");
             // Every returned method ID is checked, including the absence of a
             // promoted owner behind shadowing and equal-depth ambiguity.
-            for owner in ["m", "p", "v", "D", "shadow", "left", "right"] {
+            for owner in ["m", "p", "v", "D", "shadow", "left", "right", "mixed"] {
                 let concrete = method(owner, "A");
                 let forward = operation
                     .go_native_method_family(
@@ -4302,7 +4318,42 @@ type aliasEmbed struct { Alias }
                     assert!(forward.implements.open_reasons.contains(
                         &"promoted method selection does not certify earlier formal IDs"
                     ));
+                } else if owner == "p" {
+                    assert!(
+                        !forward.implements.open_reasons.contains(
+                            &"promoted method selection does not certify earlier formal IDs"
+                        ),
+                        "{forward:?}"
+                    );
                 }
+            }
+            // The matching promoted proof still withholds earlier formal IDs
+            // when the next operation encounters the first budget stop.
+            let bounded = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), None);
+            {
+                let probe = GoStrictPositiveStopProbe::arm_matching_selection(
+                    operation.go_static_member_lookup("A"),
+                    method("m", "A"),
+                );
+                let stopped = operation
+                    .go_native_method_family(
+                        context,
+                        "go",
+                        method("m", "A"),
+                        &cancellation,
+                        &bounded,
+                    )
+                    .unwrap();
+                assert_eq!(probe.fired_limit(), Some(ReceiverBudgetLimit::ScopeNodes));
+                assert!(stopped.implements.methods.is_empty(), "{stopped:?}");
+                assert!(!stopped.implements.is_complete(), "{stopped:?}");
+                assert!(
+                    stopped
+                        .implements
+                        .open_reasons
+                        .contains(&"promoted method selection does not certify earlier formal IDs"),
+                    "{stopped:?}"
+                );
             }
             let inverse = operation
                 .go_native_method_family(
@@ -4313,7 +4364,7 @@ type aliasEmbed struct { Alias }
                     &ResolutionSession::unbounded(),
                 )
                 .unwrap();
-            let mut expected = ["m", "p", "v", "D", "shadow"]
+            let mut expected = ["m", "p", "v", "D", "shadow", "mixed"]
                 .into_iter()
                 .map(|owner| method(owner, "A"))
                 .collect::<Vec<_>>();
@@ -4334,6 +4385,35 @@ type aliasEmbed struct { Alias }
                 .unwrap();
             assert!(!stopped.implements.is_complete(), "{stopped:?}");
             assert!(!stopped.implemented_by.is_complete(), "{stopped:?}");
+            let interface_type = go_hierarchy_declaration(conn, GO_ROOT_PROVIDER_PATH, "I");
+            // A value embedding promotes pointer methods only into *S. An
+            // embedded *T promotes both T and *T methods into S and *S.
+            for (name, value_satisfies) in [
+                ("mixed", false),
+                ("pointerMixed", true),
+                ("valueMixed", false),
+                ("aliasPointerMixed", true),
+            ] {
+                let definition = go_hierarchy_declaration(conn, GO_ROOT_PROVIDER_PATH, name);
+                for indirection in [0, 1] {
+                    let proof = operation
+                        .go_selected_type_satisfaction_for_test(
+                            context,
+                            "go",
+                            ResolutionTypeRef::new(definition, indirection),
+                            interface_type,
+                            &cancellation,
+                            &ResolutionSession::unbounded(),
+                        )
+                        .unwrap();
+                    let expected = if value_satisfies || indirection == 1 {
+                        GoMethodSatisfaction::Satisfies
+                    } else {
+                        GoMethodSatisfaction::DoesNotSatisfy
+                    };
+                    assert_eq!(proof, Some(expected), "{name} indirection={indirection}");
+                }
+            }
             let interface_subtypes = operation
                 .go_direct_subtypes(
                     context,
@@ -4352,6 +4432,8 @@ type aliasEmbed struct { Alias }
                 "pointerEmbed",
                 "aliasEmbed",
                 "lower",
+                "pointerMixed",
+                "aliasPointerMixed",
             ]
             .into_iter()
             .map(|name| go_hierarchy_declaration(conn, GO_ROOT_PROVIDER_PATH, name))
@@ -4607,12 +4689,11 @@ type aliasEmbed struct { Alias }
                 .find(|(name, _)| name.ends_with("::UNIT_ALIAS_EXPORTS_SQL"))
                 .unwrap()
                 .1;
-            let begin = sql.find("     -- Filter the join view").unwrap();
-            let end = sql.find("       ON target_occurrence.blob_id").unwrap();
-            let old = format!(
-                "{}     LEFT JOIN main.source_occurrences AS target_occurrence\n{}",
-                &sql[..begin],
-                &sql[end..]
+            let join = "LEFT JOIN surface_go_occurrences AS target_occurrence";
+            assert_eq!(sql.matches(join).count(), 1, "{sql}");
+            let old = sql.replace(
+                join,
+                "LEFT JOIN main.source_occurrences AS target_occurrence",
             );
             let generation = fixture.snapshots["go"].generation.get();
             let epoch: String = conn
@@ -5748,6 +5829,68 @@ type aliasEmbed struct { Alias }
                 matches!(dispatch, ImplementorTargets::Unproven { .. }),
                 "{dispatch:?}"
             );
+        }
+
+        #[test]
+        #[brokk_bifrost_test_macros::hardwon(
+            "#10588: a later stop discarded finalized Go inverse targets before delayed hydration"
+        )]
+        fn go_family_strict_positive_stop_retains_only_projected_edges() {
+            use brokk_bifrost_analysis::analyzer::store::resolution_operation::go_hierarchy::GoStrictPositiveStopProbe;
+            if std::env::var_os("BIFROST_10588_STRICT_SEAM_CHILD").is_none() {
+                let qualified = concat!(
+                    module_path!(),
+                    "::go_family_strict_positive_stop_retains_only_projected_edges"
+                );
+                let test_name = qualified.split_once("::").unwrap().1;
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([test_name, "--exact", "--nocapture", "--test-threads=1"])
+                    .env("BIFROST_10588_STRICT_SEAM_CHILD", "1")
+                    .env("BIFROST_TRIAL_NATIVE_GO_HIERARCHY", "1")
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{output:?}");
+                assert!(
+                    String::from_utf8_lossy(&output.stdout)
+                        .contains("test result: ok. 1 passed; 0 failed;"),
+                    "{output:?}"
+                );
+                return;
+            }
+            let (project, go) = fixture();
+            let interface = member(&go, &project, "I");
+            let _scope = AnalyzerQueryScope::new(&go);
+            let probe = GoStrictPositiveStopProbe::arm();
+            let (family, reads) = capture_query_reads(&go, || go.member_family(&interface, None));
+            assert_eq!(probe.fired_limit(), Some(ReceiverBudgetLimit::ScopeNodes));
+            assert!(reads.execution_dependences() > 0, "{reads:?}");
+            assert_eq!(
+                family.reason,
+                Some(MemberFamilyReason::HierarchyTruncated),
+                "{family:?}"
+            );
+            assert_eq!(
+                family.outcome,
+                MemberFamilyOutcome::Incomplete,
+                "{family:?}"
+            );
+            assert_eq!(
+                family.descendants.outcome,
+                MemberFamilyOutcome::Incomplete,
+                "{family:?}"
+            );
+            assert_eq!(
+                family.descendants.reason,
+                Some(MemberFamilyReason::HierarchyTruncated),
+                "{family:?}"
+            );
+            let positives = family
+                .edges
+                .iter()
+                .filter(|edge| edge.relation == MethodFamilyRelation::ImplementedBy)
+                .count();
+            assert_eq!(positives, 1, "{family:?}");
+            assert!(member_family_id(&go, &family).is_none());
         }
 
         #[test]

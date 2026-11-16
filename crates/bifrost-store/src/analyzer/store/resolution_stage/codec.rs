@@ -250,7 +250,11 @@ fn endpoint_from_cells(node: BindingNodeId, cells: &[Value]) -> EndpointSignatur
 }
 
 #[doc(hidden)]
-pub fn encode_path(path: &PartialPath) -> String {
+pub fn encode_path(path: &PartialPath) -> crate::analyzer::store::Result<String> {
+    reject_unclassified_completion(path.completion())?;
+    for record in path.lexical_choices() {
+        reject_unclassified_reason(&record.reason)?;
+    }
     let mut variables = HashMap::default();
     let mut cells = endpoint_cells(path.start(), &mut variables);
     cells.extend(endpoint_cells(path.end(), &mut variables));
@@ -308,7 +312,7 @@ pub fn encode_path(path: &PartialPath) -> String {
         path.addressed_lexical_choice(),
         path.segment_count(),
     ]));
-    serde_json::to_string(&cells).expect("a structured stage path serializes to JSON")
+    Ok(serde_json::to_string(&cells).expect("a structured stage path serializes to JSON"))
 }
 
 #[doc(hidden)]
@@ -457,6 +461,32 @@ pub fn decode_path(start: i64, end: i64, body: &str) -> PartialPath {
 // Tags 0..=3 retain the durable reason vocabulary's order. The four additional
 // tags are private stage vocabulary, not new durable completion kinds. Tags are
 // appended and never renumbered; the decoder rejects an unknown tag.
+fn reject_unclassified_reason(
+    reason: &ResolutionIncompleteReason,
+) -> crate::analyzer::store::Result<()> {
+    if matches!(
+        reason,
+        ResolutionIncompleteReason::Unclassified(_)
+            | ResolutionIncompleteReason::OverlayFrontierUnknown(_)
+    ) {
+        return Err(crate::analyzer::store::StoreError::new(
+            "reader-local Unclassified completion cannot be staged",
+        ));
+    }
+    Ok(())
+}
+
+fn reject_unclassified_completion(
+    completion: &ResolutionCompletion,
+) -> crate::analyzer::store::Result<()> {
+    if let ResolutionCompletion::Incomplete(reasons) = completion {
+        for reason in reasons.iter() {
+            reject_unclassified_reason(reason)?;
+        }
+    }
+    Ok(())
+}
+
 fn completion_cell(completion: &ResolutionCompletion) -> Value {
     let ResolutionCompletion::Incomplete(reasons) = completion else {
         return Value::Null;
@@ -465,6 +495,10 @@ fn completion_cell(completion: &ResolutionCompletion) -> Value {
         reasons
             .iter()
             .map(|reason| match reason {
+                ResolutionIncompleteReason::Unclassified(_)
+                | ResolutionIncompleteReason::OverlayFrontierUnknown(_) => {
+                    unreachable!("Unclassified is rejected before stage encoding")
+                }
                 ResolutionIncompleteReason::Cancelled => {
                     panic!("cancellation is not publishable stage completion")
                 }
@@ -559,12 +593,15 @@ fn completion_from_cell(cell: &Value) -> ResolutionCompletion {
 
 pub(in crate::analyzer::store) fn encode_completion(
     completion: &ResolutionCompletion,
-) -> Option<String> {
+) -> crate::analyzer::store::Result<Option<String>> {
+    reject_unclassified_completion(completion)?;
     let cell = completion_cell(completion);
     if cell.is_null() {
-        return None;
+        return Ok(None);
     }
-    Some(serde_json::to_string(&cell).expect("a structured stage completion serializes to JSON"))
+    Ok(Some(serde_json::to_string(&cell).expect(
+        "a structured stage completion serializes to JSON",
+    )))
 }
 
 pub(in crate::analyzer::store) fn decode_completion(body: Option<&str>) -> ResolutionCompletion {

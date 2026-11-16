@@ -12,11 +12,12 @@ mod csharp_extraction_tests {
     )]
     #[test]
     fn csharp_warm_usage_scan_reuses_request_reads_across_membership_scopes() {
+        // This regression now runs on the pooled store.
         use crate::searchtools::{ScanUsagesByReferenceParams, scan_usages_by_reference};
         use brokk_bifrost_analysis::analyzer::store::resolution_operation::selected_sql_trace::{
             begin_production_selected_sql_trace, finish_production_selected_sql_trace,
         };
-        use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::single_connection_store_context_for_test;
+        use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::ephemeral_store_context;
 
         let fixture = InlineTestProject::new()
             .file("Base.cs", "namespace Example; public class Base { public virtual int Run() { return 1; } }")
@@ -24,7 +25,7 @@ mod csharp_extraction_tests {
             .file("Consumer.cs", "namespace Example; public class Consumer { public Service Make(Service service) { service.Run(); return new Service(); } public int Call(Base value) { return value.Run(); } }")
             .build();
         let project = fixture.project_dyn();
-        let context = single_connection_store_context_for_test(project.as_ref()).unwrap();
+        let context = ephemeral_store_context(project.as_ref()).unwrap();
         let workspace = WorkspaceAnalyzer::build_with_store_context_for_test(
             project,
             AnalyzerConfig::default(),

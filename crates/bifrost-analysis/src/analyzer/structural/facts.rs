@@ -30,7 +30,7 @@ use crate::analyzer::semantic::ids::StableDigest;
 use crate::compact_graph::{CompactRows, CompactRowsBuilder};
 use crate::text_utils::compute_line_starts;
 use brokk_bifrost_core::analyzer::structural::callable::{
-    CallKind, CallShapeCoverage, CallSiteFacts,
+    CallKind, CallShapeCoverage, CallSiteFacts, CalleeSpelling,
 };
 
 use brokk_bifrost_core::analyzer::structural::code::VocabularyCode;
@@ -544,6 +544,7 @@ impl FileFacts {
                         coverage: facts.coverage.code(),
                         continues_callee_groups: facts.continues_callee_groups,
                         callee_provenance: facts.callee_provenance.clone(),
+                        callee_spelling: facts.callee_spelling.code(),
                     }),
                 })
             })
@@ -782,6 +783,13 @@ impl FileFacts {
                         )?,
                         continues_callee_groups: facts.continues_callee_groups,
                         callee_provenance: facts.callee_provenance.clone(),
+                        callee_spelling: CalleeSpelling::from_code(facts.callee_spelling)
+                            .ok_or_else(|| {
+                                StructuralFactsPersistenceError::invalid(format!(
+                                    "unknown structural callee spelling {}",
+                                    facts.callee_spelling
+                                ))
+                            })?,
                     })
                 })
                 .transpose()?;
@@ -1026,6 +1034,31 @@ impl FileFacts {
         &self.nodes[id as usize]
     }
 
+    /// The callee name call `id` derives from its recorded name token, when
+    /// its spelling is not the written token itself: `attr=` for a Ruby
+    /// attribute writer, `[]` or `[]=` for an element access. `None` for a
+    /// written callee and for every non-call fact.
+    pub fn spelled_callee_name(&self, id: u32) -> Option<String> {
+        let node = self.node(id);
+        let spelling = node.call_site.as_ref()?.callee_spelling;
+        if spelling == CalleeSpelling::Written {
+            return None;
+        }
+        Some(spelling.callee_name(node.name?.text(self.source())))
+    }
+
+    /// The name fact `id` answers to: its recorded name token, or a spelled
+    /// call's derived callee name ([`Self::spelled_callee_name`]).
+    pub fn node_name_text(&self, id: u32) -> Option<std::borrow::Cow<'_, str>> {
+        match self.spelled_callee_name(id) {
+            Some(name) => Some(std::borrow::Cow::Owned(name)),
+            None => self
+                .node(id)
+                .name
+                .map(|span| std::borrow::Cow::Borrowed(span.text(self.source()))),
+        }
+    }
+
     /// Semantic role edges for `id`, in their original source order.
     pub fn roles(&self, id: u32) -> &[RoleTarget] {
         self.roles.row(id as usize)
@@ -1110,53 +1143,61 @@ impl FileFacts {
     }
 
     /// Rough heap footprint for the facts-cache weigher; exactness doesn't
-    /// matter, monotonicity with actual size does.
+    /// matter, monotonicity with actual size does. Each owned buffer is
+    /// rounded to what the allocator hands out.
     pub fn estimated_bytes(&self) -> u64 {
-        (self.source.capacity() as u64)
-            .saturating_add(
-                (self.line_starts.capacity() as u64)
-                    .saturating_mul(std::mem::size_of::<usize>() as u64),
-            )
-            .saturating_add(
-                (self.nodes.capacity() as u64)
-                    .saturating_mul(std::mem::size_of::<NormalizedNode>() as u64),
-            )
+        use brokk_bifrost_core::allocation_size::allocation_size;
+        use brokk_bifrost_core::hash::allocated_vec_slot_bytes;
+        let text = |value: &String| allocation_size(value.capacity()) as u64;
+        (allocation_size(self.source.capacity()) as u64)
+            .saturating_add(allocated_vec_slot_bytes(&self.line_starts) as u64)
+            .saturating_add(allocated_vec_slot_bytes(&self.nodes) as u64)
             .saturating_add(
                 self.nodes
                     .iter()
                     .filter_map(|node| node.declaration_attributes.as_ref())
                     .map(|attributes| {
-                        (attributes.modifiers.capacity() * std::mem::size_of::<String>()) as u64
-                            + attributes
-                                .modifiers
-                                .iter()
-                                .map(|word| word.capacity() as u64)
-                                .sum::<u64>()
-                            + attributes
-                                .type_kind
-                                .as_ref()
-                                .map_or(0, |kind| kind.capacity() as u64)
+                        allocated_vec_slot_bytes(&attributes.modifiers) as u64
+                            + attributes.modifiers.iter().map(text).sum::<u64>()
+                            + attributes.type_kind.as_ref().map_or(0, text)
                     })
                     .sum::<u64>(),
             )
-            .saturating_add(self.roles.estimated_bytes())
-            .saturating_add(self.occurrence_roles.estimated_bytes())
+            .saturating_add(self.roles.allocated_estimated_bytes())
+            .saturating_add(self.occurrence_roles.allocated_estimated_bytes())
+            .saturating_add(allocated_vec_slot_bytes(&self.recovered_regions) as u64)
+            .saturating_add(allocated_vec_slot_bytes(&self.role_coverage) as u64)
             .saturating_add(
-                (self.recovered_regions.capacity() as u64)
-                    .saturating_mul(std::mem::size_of::<RecoveredRegion>() as u64),
+                self.nodes
+                    .iter()
+                    .filter_map(|n| n.integer_literal_value.as_ref())
+                    .filter_map(|i| i.decimal.as_ref())
+                    .map(text)
+                    .sum::<u64>(),
+            )
+            .saturating_add(
+                self.nodes
+                    .iter()
+                    .filter_map(|n| n.call_site.as_ref())
+                    .filter_map(|call| call.callee_provenance.as_ref())
+                    .map(|p| {
+                        allocated_vec_slot_bytes(&p.bounds) as u64
+                            + p.bounds.iter().map(text).sum::<u64>()
+                    })
+                    .sum::<u64>(),
             )
             .saturating_add(
                 self.nodes
                     .iter()
                     .filter_map(|node| node.construct.as_ref())
-                    .map(|construct| construct.capacity() as u64)
+                    .map(text)
                     .sum::<u64>(),
             )
             .saturating_add(
                 self.nodes
                     .iter()
                     .filter_map(|node| node.string_value.as_ref())
-                    .map(|value| value.capacity() as u64)
+                    .map(text)
                     .sum::<u64>(),
             )
     }
@@ -1174,7 +1215,7 @@ mod tests {
     use crate::analyzer::structural::occurrences::OccurrenceRole;
     use crate::compact_graph::{CompactRows, CompactRowsBuilder};
     use brokk_bifrost_core::analyzer::structural::callable::{
-        CallKind, CallShapeCoverage, CallSiteFacts,
+        CallKind, CallShapeCoverage, CallSiteFacts, CalleeSpelling,
     };
 
     use brokk_bifrost_core::analyzer::structural::code::VocabularyCode;
@@ -1257,6 +1298,7 @@ mod tests {
                     call_kind: Some(CallKind::Method),
                     coverage: CallShapeCoverage::Partial,
                     continues_callee_groups: true,
+                    callee_spelling: CalleeSpelling::AttributeWriter,
                 }),
             },
             NormalizedNode {
@@ -1783,16 +1825,18 @@ mod tests {
                 .filter_map(|node| node.construct.as_ref())
                 .map(|construct| construct.capacity() as u64)
                 .sum::<u64>();
-        let capacity_based = facts.source.capacity() as u64
-            + (facts.line_starts.capacity() * std::mem::size_of::<usize>()) as u64
-            + (facts.nodes.capacity() * std::mem::size_of::<NormalizedNode>()) as u64
-            + facts.roles.estimated_bytes()
-            + facts.occurrence_roles.estimated_bytes()
+        use brokk_bifrost_core::allocation_size::allocation_size;
+        use brokk_bifrost_core::hash::allocated_vec_slot_bytes;
+        let capacity_based = allocation_size(facts.source.capacity()) as u64
+            + allocated_vec_slot_bytes(&facts.line_starts) as u64
+            + allocated_vec_slot_bytes(&facts.nodes) as u64
+            + facts.roles.allocated_estimated_bytes()
+            + facts.occurrence_roles.allocated_estimated_bytes()
             + facts
                 .nodes
                 .iter()
                 .filter_map(|node| node.construct.as_ref())
-                .map(|construct| construct.capacity() as u64)
+                .map(|construct| allocation_size(construct.capacity()) as u64)
                 .sum::<u64>();
 
         assert!(capacity_based > source_length_based);

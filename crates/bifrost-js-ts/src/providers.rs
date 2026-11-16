@@ -123,6 +123,20 @@ pub trait JsTsSource: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyProv
     /// The memo cell behind it is a `PoolSafeMemo` on the analysis-side cache
     /// bucket; this is the product, not the cell.
     fn usage_index(&self, cancellation: Option<&CancellationToken>) -> Option<Arc<JsTsUsageIndex>>;
+
+    /// The index only when it was built under a complete source inventory.
+    ///
+    /// An answer that is an absence (no export candidate, no ancestor, no
+    /// boundary) is sound only then: a source the inventory missed may hold the
+    /// target. These callers treat an incomplete index as unavailable, as they
+    /// did before the index could be built over an incomplete inventory.
+    fn complete_usage_index(
+        &self,
+        cancellation: Option<&CancellationToken>,
+    ) -> Option<Arc<JsTsUsageIndex>> {
+        self.usage_index(cancellation)
+            .filter(|index| index.inventory.is_complete())
+    }
 }
 
 pub(crate) fn with_usage_definitions<R>(
@@ -288,7 +302,7 @@ pub fn module_import_skeleton(host: &dyn JsTsSource, code_unit: &CodeUnit) -> Op
 ///
 /// The uncached body behind `TypeHierarchyProvider::get_direct_ancestors`.
 pub fn compute_direct_ancestors(host: &dyn JsTsSource, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-    let Some(index) = host.usage_index(None) else {
+    let Some(index) = host.complete_usage_index(None) else {
         return Vec::new();
     };
     resolve_direct_ancestors(

@@ -9,10 +9,10 @@ use crate::analyzer::WorkspaceAnalyzer;
 use crate::analyzer::semantic::partial_flow::PartialFlowPort;
 use crate::analyzer::semantic::{
     CallBinding, CallBindings, CallSiteHandle, CandidateCoverage, ControlContinuation, ControlEdge,
-    ControlEdgeHandle, DispatchResult, DropFact, EvidenceCompleteness, HeapOracle, MoveOutFact,
-    ObservationPhase, ProcedureHandle, ProcedureSemanticsParts, ProgramPointId, ProofStatus,
-    SemanticCallSite, SemanticEffect, SemanticEvent, SemanticOutcome, SemanticProviderError,
-    SemanticValueKind, ValueAtPoint, procedure_parts_retained_bytes,
+    ControlEdgeHandle, DispatchResult, EvidenceCompleteness, ExactProcedureIdentity, HeapOracle,
+    MoveOutFact, ObservationPhase, ProcedureHandle, ProcedureSemanticsParts, ProgramPointId,
+    ProofStatus, SemanticCallSite, SemanticEffect, SemanticEvent, SemanticOutcome,
+    SemanticProviderError, SemanticValueKind, ValueAtPoint, procedure_parts_retained_bytes,
 };
 use crate::analyzer::workspace_authority::{
     OwnedMemoCapability, ReplayingMemo, ReplayingMemoEntry, workspace_memo_attribution,
@@ -38,7 +38,7 @@ const MAX_LOCAL_PATHS: usize = 1_024;
 const MAX_LOCAL_VISITS: usize = 4_096;
 
 type BypassKey = (
-    DurableProcedureKey,
+    ExactProcedureIdentity,
     TypestateBindingContext,
     Option<PartialFlowPort>,
 );
@@ -79,7 +79,7 @@ pub struct OrderedProcedure<'a> {
     pub events: Vec<OrderedEvent<'a>>,
     pub call_stages: Vec<OrderedCallStage<'a>>,
     pub edges: &'a [ControlEdge],
-    pub drops: &'a [DropFact],
+    pub drop_points: std::collections::HashSet<ProgramPointId>,
     pub moves: &'a [MoveOutFact],
 }
 
@@ -115,7 +115,7 @@ pub fn project_ordered_procedure(parts: &ProcedureSemanticsParts) -> OrderedProc
         events,
         call_stages,
         edges: &parts.control_edges,
-        drops: &parts.drops,
+        drop_points: parts.logical_drops().map(|drop| drop.point).collect(),
         moves: &parts.move_outs,
     }
 }
@@ -131,12 +131,12 @@ pub struct TypestateOrderedRelations<'a> {
     protocol: &'a CompiledProtocol,
     subject: TypestateSubjectId,
     bindings: &'a TypestateBindingPlan,
-    parts: OrderedMemo<DurableProcedureKey, Option<ProcedureSemanticsParts>>,
-    inert_drops: OrderedMemo<DurableProcedureKey, bool>,
+    parts: OrderedMemo<ExactProcedureIdentity, Option<ProcedureSemanticsParts>>,
+    inert_drops: OrderedMemo<ExactProcedureIdentity, std::collections::HashSet<ProgramPointId>>,
     bypasses: OrderedMemo<BypassKey, HashMap<ProgramPointId, CallBypass>>,
     relations: HashMap<
         (
-            DurableProcedureKey,
+            ExactProcedureIdentity,
             TypestateBindingContext,
             PartialFlowPort,
             PartialFlowPort,
@@ -166,8 +166,8 @@ impl<'a> TypestateOrderedRelations<'a> {
         &mut self,
         procedure: &ProcedureHandle,
         request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
-    ) -> Result<bool, SemanticProviderError> {
-        let key = procedure.durable_key();
+    ) -> Result<std::collections::HashSet<ProgramPointId>, SemanticProviderError> {
+        let key = procedure.exact_identity();
         let entry = self.inert_drops.read(
             &self.attribution.capability(),
             |memo, capture| -> Result<_, SemanticProviderError> {
@@ -175,11 +175,45 @@ impl<'a> TypestateOrderedRelations<'a> {
                     return Ok(entry);
                 }
                 let entry = capture.try_build_weighted(|| {
-                    let inert = self
-                        .workspace
-                        .semantic_oracle_provider()
-                        .procedure_drops_proven_inert(procedure, request)?;
-                    Ok::<_, SemanticProviderError>((inert, std::mem::size_of::<bool>()))
+                    let mut by_point = HashMap::<ProgramPointId, bool>::default();
+                    let mut memo = None;
+                    let oracle = self.workspace.semantic_oracle_provider();
+                    for logical in procedure.semantics().logical_gaps().filter(|logical| {
+                        matches!(logical.base.control_flow_discharge(),
+                            crate::analyzer::semantic::SemanticGapDischarge::InertDropGlue
+                            | crate::analyzer::semantic::SemanticGapDischarge::ImplicitDropExecution)
+                    }) {
+                        let proven = by_point.entry(logical.base.point).or_insert(true);
+                        if logical.base.control_flow_discharge() == crate::analyzer::semantic::SemanticGapDischarge::ImplicitDropExecution {
+                            *proven = false;
+                        } else if *proven {
+                            *proven = crate::analyzer::semantic::workspace_oracle::value_flow::logical_gap_is_discharged(
+                                &oracle, logical, procedure, request, &mut memo,
+                            )? == crate::analyzer::semantic::workspace_oracle::value_flow::GapDischargeVerdict::Discharged;
+                        }
+                    }
+                    let mut inert = std::collections::HashSet::new();
+                    let mut gapless = None;
+                    for drop in procedure.semantics().logical_drops() {
+                        let proven = match by_point.get(&drop.point) {
+                            Some(proven) => *proven,
+                            None => {
+                                // A gapless point has its drop represented or proved by lowering.
+                                // Retain its existing procedure-proof requirement for now.
+                                match gapless {
+                                    Some(proven) => proven,
+                                    None => {
+                                        let proven = oracle.procedure_drops_proven_inert(procedure, request)?;
+                                        gapless = Some(proven);
+                                        proven
+                                    }
+                                }
+                            }
+                        };
+                        if proven { inert.insert(drop.point); }
+                    }
+                    let bytes = inert.len() * std::mem::size_of::<ProgramPointId>();
+                    Ok::<_, SemanticProviderError>((inert, bytes))
                 })?;
                 Ok(admit_composition_entry(
                     memo,
@@ -190,7 +224,7 @@ impl<'a> TypestateOrderedRelations<'a> {
                 ))
             },
         )?;
-        Ok(*entry)
+        Ok((*entry).clone())
     }
 
     fn parts(
@@ -204,7 +238,7 @@ impl<'a> TypestateOrderedRelations<'a> {
         >,
         SemanticProviderError,
     > {
-        let key = procedure.durable_key();
+        let key = procedure.exact_identity();
         self.parts.read(
             &self.attribution.capability(),
             |memo, capture| -> Result<_, SemanticProviderError> {
@@ -263,7 +297,7 @@ impl<'a> TypestateOrderedRelations<'a> {
     ) -> Result<(TypestateComposeFunction, HopQuality), SemanticProviderError> {
         let inert_drops = self.inert_drops(procedure, request)?;
         let key = (
-            procedure.durable_key(),
+            procedure.exact_identity(),
             context.clone(),
             from.clone(),
             to.clone(),
@@ -313,7 +347,7 @@ impl<'a> TypestateOrderedRelations<'a> {
             self.bindings,
             self.protocol,
             self.subject,
-            false,
+            Default::default(),
         );
         let (Some(start), Some(end)) = (solve.port_point(from), solve.port_point(to)) else {
             return Ok(false);
@@ -341,7 +375,7 @@ impl<'a> TypestateOrderedRelations<'a> {
     ) -> Result<Option<(TypestateComposeFunction, HopQuality)>, SemanticProviderError> {
         let (from, to) = endpoints;
         let inert_drops = self.inert_drops(procedure, request)?;
-        let key = procedure.durable_key();
+        let key = procedure.exact_identity();
         let parts_entry = self.parts(procedure, Some(request))?;
         let Some(parts) = parts_entry.as_ref() else {
             return Ok(None);
@@ -355,7 +389,7 @@ impl<'a> TypestateOrderedRelations<'a> {
             self.subject,
             inert_drops,
         );
-        let bypass_key = (key.clone(), context.clone(), tracked_formal.cloned());
+        let bypass_key = (key, context.clone(), tracked_formal.cloned());
         let bypass_entry = self.bypasses.read(
             &self.attribution.capability(),
             |memo, capture| -> Result<_, SemanticProviderError> {
@@ -732,7 +766,7 @@ pub struct OrderedRelationCache<'a> {
     protocol: &'a CompiledProtocol,
     subject: TypestateSubjectId,
     ordered: OrderedProcedure<'a>,
-    inert_drops: bool,
+    inert_drops: std::collections::HashSet<ProgramPointId>,
     call_bypasses: HashMap<ProgramPointId, CallBypass>,
     relations: HashMap<(ProgramPointId, ProgramPointId), (TypestateComposeFunction, HopQuality)>,
 }
@@ -745,7 +779,7 @@ impl<'a> OrderedRelationCache<'a> {
         bindings: &'a TypestateBindingPlan,
         protocol: &'a CompiledProtocol,
         subject: TypestateSubjectId,
-        inert_drops: bool,
+        inert_drops: std::collections::HashSet<ProgramPointId>,
     ) -> Self {
         assert_eq!(
             parts.id,
@@ -962,12 +996,8 @@ impl<'a> OrderedRelationCache<'a> {
                         .then(TypestateComposeFunction::event(event.id()));
                 }
             }
-            if (!self.inert_drops
-                && self
-                    .ordered
-                    .drops
-                    .iter()
-                    .any(|drop| drop.point == path.point))
+            if (!self.inert_drops.contains(&path.point)
+                && self.ordered.drop_points.contains(&path.point))
                 || self
                     .ordered
                     .moves
@@ -1119,7 +1149,7 @@ fn root_result_move_into_actual(
     let Some((kind, local, evidence)) = reads.next() else {
         return Ok(false);
     };
-    if kind != ValueFlowKind::Local
+    if !matches!(kind, ValueFlowKind::Local | ValueFlowKind::AddressOf)
         || !semantics
             .evidence_row(evidence)
             .is_some_and(|e| e.proof.establishes_complete_evidence(&e.completeness))
@@ -1160,6 +1190,19 @@ fn root_result_move_into_actual(
 /// A formal-entry summary may consume its own formal, independently of any
 /// caller. A single filtered Parameter edge is insufficient: inspect every
 /// origin of the actual and every write to the formal before accepting it.
+/// Run one language hook that reports a reuse verdict. The ordered typestate
+/// answers built from it cannot carry a verdict, so it joins the current
+/// captures, where the hook's ambient mark went.
+fn with_hook_verdict<T>(
+    workspace: &WorkspaceAnalyzer,
+    hook: impl FnOnce(&mut crate::analyzer::reuse_verdict::ReuseVerdict) -> T,
+) -> T {
+    let mut reuse = crate::analyzer::reuse_verdict::ReuseVerdict::Content;
+    let value = hook(&mut reuse);
+    workspace.analyzer().join_reuse_verdict(reuse);
+    value
+}
+
 fn formal_ownership_into_actual(
     workspace: &WorkspaceAnalyzer,
     procedure: &ProcedureHandle,
@@ -1168,7 +1211,7 @@ fn formal_ownership_into_actual(
     request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
 ) -> Result<Option<crate::analyzer::languages::SelectedCallResultOwnership>, SemanticProviderError>
 {
-    use crate::analyzer::semantic::{SemanticIncompleteSubject, ValueFlowKind};
+    use crate::analyzer::semantic::{LogicalIncompleteSubject, ValueFlowKind};
     let Some(PartialFlowPort::Parameter { ordinal }) = tracked_formal else {
         return Ok(None);
     };
@@ -1193,7 +1236,7 @@ fn formal_ownership_into_actual(
         .map(|point| point.events.len())
         .fold(0usize, usize::saturating_add);
     let work = crate::analyzer::semantic::SemanticWork {
-        events: event_count.saturating_add(semantics.incomplete_facts().len()),
+        events: event_count.saturating_add(semantics.logical_incomplete_facts().count()),
         ..Default::default()
     };
     if request.budget.check_admission(work).is_err() {
@@ -1235,11 +1278,10 @@ fn formal_ownership_into_actual(
             })
         || formal_write
         || semantics
-            .incomplete_facts()
-            .iter()
+            .logical_incomplete_facts()
             .any(|fact| match fact.subject {
-                SemanticIncompleteSubject::Procedure => true,
-                SemanticIncompleteSubject::Value(value) => value == actual,
+                LogicalIncompleteSubject::Procedure => true,
+                LogicalIncompleteSubject::Value(value) => value == actual,
                 _ => false,
             })
     {
@@ -1248,8 +1290,9 @@ fn formal_ownership_into_actual(
     let Some(support) = crate::analyzer::languages::language_support(language) else {
         return Ok(None);
     };
-    let class =
-        support.ownership_class_of_formal(workspace, procedure, *ordinal, actual, request)?;
+    let class = with_hook_verdict(workspace, |reuse| {
+        support.ownership_class_of_formal(workspace, procedure, *ordinal, actual, request, reuse)
+    })?;
     Ok((!request.stop_observed()).then_some(class))
 }
 
@@ -1480,38 +1523,47 @@ fn selected_reference_binding(
         match origin {
             SelectedCallResultOrigin::Local { callee, ordinal } => (
                 preserves_reference_identity
-                    && support.identity_conversion_from_call_result(
-                        discovery.workspace(),
-                        &callee,
-                        ordinal,
-                        mapping.formal().procedure(),
-                        target_ordinal,
-                        request,
-                    )? == crate::analyzer::languages::SelectedIdentityConversion::Identity,
+                    && with_hook_verdict(discovery.workspace(), |reuse| {
+                        support.identity_conversion_from_call_result(
+                            discovery.workspace(),
+                            &callee,
+                            ordinal,
+                            mapping.formal().procedure(),
+                            target_ordinal,
+                            request,
+                            reuse,
+                        )
+                    })? == crate::analyzer::languages::SelectedIdentityConversion::Identity,
                 false,
             ),
             SelectedCallResultOrigin::Modeled(external) => {
                 let joined = preserves_reference_identity
-                    && support.identity_conversion_from_modeled_call_result(
-                        discovery.workspace(),
-                        &external,
-                        mapping.formal().procedure(),
-                        target_ordinal,
-                        request,
-                    )? == crate::analyzer::languages::SelectedIdentityConversion::Identity;
+                    && with_hook_verdict(discovery.workspace(), |reuse| {
+                        support.identity_conversion_from_modeled_call_result(
+                            discovery.workspace(),
+                            &external,
+                            mapping.formal().procedure(),
+                            target_ordinal,
+                            request,
+                            reuse,
+                        )
+                    })? == crate::analyzer::languages::SelectedIdentityConversion::Identity;
                 (joined, joined)
             }
         }
     };
     if !source_identity
         || (!modeled_formal_reference
-            && support.ownership_class_of_formal(
-                discovery.workspace(),
-                mapping.formal().procedure(),
-                target_ordinal,
-                actual,
-                request,
-            )? != crate::analyzer::languages::SelectedCallResultOwnership::Reference)
+            && with_hook_verdict(discovery.workspace(), |reuse| {
+                support.ownership_class_of_formal(
+                    discovery.workspace(),
+                    mapping.formal().procedure(),
+                    target_ordinal,
+                    actual,
+                    request,
+                    reuse,
+                )
+            })? != crate::analyzer::languages::SelectedCallResultOwnership::Reference)
         || request.stop_observed()
     {
         return Ok(false);
@@ -1539,11 +1591,14 @@ fn identity_preserving_origin_edge(
     kind: crate::analyzer::semantic::ValueFlowKind,
     static_reference_result: bool,
 ) -> bool {
-    matches!(kind, crate::analyzer::semantic::ValueFlowKind::Local)
-        || (matches!(
-            kind,
-            crate::analyzer::semantic::ValueFlowKind::ByValueCapture
-        ) && static_reference_result)
+    matches!(
+        kind,
+        crate::analyzer::semantic::ValueFlowKind::Local
+            | crate::analyzer::semantic::ValueFlowKind::AddressOf
+    ) || (matches!(
+        kind,
+        crate::analyzer::semantic::ValueFlowKind::ByValueCapture
+    ) && static_reference_result)
 }
 
 fn selected_call_result_origin(
@@ -1556,7 +1611,7 @@ fn selected_call_result_origin(
     request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
 ) -> Result<Option<SelectedCallResultOrigin>, SemanticProviderError> {
     use crate::analyzer::semantic::{
-        AccessPathRoot, SemanticGapImpact, SemanticGapSubject, SemanticIncompleteSubject,
+        AccessPathRoot, LogicalIncompleteSubject, SemanticGapImpact, SemanticGapSubject,
     };
     let modeled_value = match subject.object().identity() {
         AccessPathRoot::Value(value) if value.procedure() == procedure => Some(value.clone()),
@@ -1738,13 +1793,16 @@ fn selected_call_result_origin(
             procedure.artifact().key().language().language(),
         )
     }) {
-        Some(support) => support.captured_value_static_type_is_reference(
-            discovery.workspace(),
-            procedure,
-            actual,
-            result.id(),
-            request,
-        )?,
+        Some(support) => with_hook_verdict(discovery.workspace(), |reuse| {
+            support.captured_value_static_type_is_reference(
+                discovery.workspace(),
+                procedure,
+                actual,
+                result.id(),
+                request,
+                reuse,
+            )
+        })?,
         None => false,
     };
     let capture_predecessors = if let Some(point) = capture_point {
@@ -1927,8 +1985,8 @@ fn selected_call_result_origin(
         .sum::<usize>();
     let work = crate::analyzer::semantic::SemanticWork {
         events: semantics
-            .incomplete_facts()
-            .len()
+            .logical_incomplete_facts()
+            .count()
             .saturating_add(semantics.gaps().len()),
         ..Default::default()
     };
@@ -1966,7 +2024,9 @@ fn selected_call_result_origin(
                         .flat_map(|point| point.events.iter())
                         .filter_map(|event| match event.effect {
                             SemanticEffect::ValueFlow {
-                                kind: crate::analyzer::semantic::ValueFlowKind::Local,
+                                kind:
+                                    crate::analyzer::semantic::ValueFlowKind::Local
+                                    | crate::analyzer::semantic::ValueFlowKind::AddressOf,
                                 source,
                                 target,
                             } if source == *converted => Some(target),
@@ -1976,15 +2036,18 @@ fn selected_call_result_origin(
                         && let Some(support) = crate::analyzer::languages::language_support(
                             procedure.artifact().key().language().language(),
                         )
-                        && support.assignment_conversion_preserves_identity(
-                            discovery.workspace(),
-                            procedure,
-                            *converted,
-                            target,
-                            callee,
-                            *ordinal,
-                            request,
-                        )?
+                        && with_hook_verdict(discovery.workspace(), |reuse| {
+                            support.assignment_conversion_preserves_identity(
+                                discovery.workspace(),
+                                procedure,
+                                *converted,
+                                target,
+                                callee,
+                                *ordinal,
+                                request,
+                                reuse,
+                            )
+                        })?
                     {
                         accepted_conversions.insert((result.id(), *converted));
                     }
@@ -1994,23 +2057,36 @@ fn selected_call_result_origin(
     }
     let mut current = actual;
     let mut seen = std::collections::HashSet::new();
+    let mut inert_drop = None;
+    let mut discharged_gaps = std::collections::HashSet::new();
     loop {
         if !seen.insert(current) || request.stop_observed() {
             return Ok(None);
         }
-        if semantics.incomplete_facts().iter().any(|fact| matches!(fact.subject,
-            SemanticIncompleteSubject::Procedure)
-            || matches!(fact.subject, SemanticIncompleteSubject::Value(value) if value == current))
-            || semantics.gaps().iter().any(|gap| {
-                (gap.impacts.contains(SemanticGapImpact::ValueFlow)
-                    || gap.impacts.contains(SemanticGapImpact::CallEvaluation)
-                    || gap.impacts.contains(SemanticGapImpact::ReturnTransfer))
-                    && (matches!(gap.subject, SemanticGapSubject::Procedure)
-                        || matches!(gap.subject, SemanticGapSubject::Value(value) if value == current)
-                        || matches!(gap.subject, SemanticGapSubject::Point))
-            })
+        if semantics.logical_incomplete_facts().any(|fact| matches!(fact.subject,
+            LogicalIncompleteSubject::Procedure)
+            || matches!(fact.subject, LogicalIncompleteSubject::Value(value) if value == current))
+
         {
             return Ok(None);
+        }
+        for logical in semantics.logical_gaps().filter(|logical| {
+            let gap = logical.base;
+            (gap.impacts.contains(SemanticGapImpact::ValueFlow)
+                || gap.impacts.contains(SemanticGapImpact::CallEvaluation)
+                || gap.impacts.contains(SemanticGapImpact::ReturnTransfer))
+                && (matches!(gap.subject, SemanticGapSubject::Procedure)
+                    || matches!(logical.subject(), SemanticGapSubject::Value(value) if value == current)
+                    || matches!(gap.subject, SemanticGapSubject::Point))
+        }) {
+            // Cleanup omissions do not destroy this value's identity when its
+            // exact drop obligation proves that no user code runs.
+            if crate::analyzer::semantic::workspace_oracle::value_flow::logical_gap_is_discharged(
+                &discovery.workspace().semantic_oracle_provider(), logical, procedure, request, &mut inert_drop,
+            )? != crate::analyzer::semantic::workspace_oracle::value_flow::GapDischargeVerdict::Discharged {
+                return Ok(None);
+            }
+            discharged_gaps.insert(logical.key());
         }
         let scan = crate::analyzer::semantic::SemanticWork {
             events: event_count,
@@ -2106,6 +2182,7 @@ fn selected_call_result_origin(
                 }
             },
             reaches_write,
+            |gap| discharged_gaps.contains(&gap),
             request.cancellation,
             |work| {
                 request.budget.admit(work).map_err(
@@ -2121,6 +2198,44 @@ fn selected_call_result_origin(
         }
     }
     Ok((!request.stop_observed()).then_some(origin))
+}
+
+/// The receiver mode the callee declares (by value, `&self` or `&mut self`).
+fn declared_receiver_mode(
+    procedure: &ProcedureHandle,
+) -> Option<crate::analyzer::semantic::ReceiverMode> {
+    procedure
+        .semantics()
+        .values()
+        .iter()
+        .find_map(|value| match value.kind {
+            SemanticValueKind::Receiver { mode, .. } => Some(mode),
+            _ => None,
+        })
+}
+
+/// The receiver formal of the one proven-complete receiver binding of `actual`,
+/// or None when there is no such binding or more than one.
+fn unique_proven_receiver_formal(
+    selected: &CallBindings,
+    actual: crate::analyzer::semantic::ValueId,
+) -> Option<&crate::analyzer::semantic::ProcedurePortHandle> {
+    let mut receivers = selected.bindings().iter().filter_map(|binding| {
+        let CallBinding::Receiver {
+            relation,
+            actual: bound,
+            formal,
+        } = binding
+        else {
+            return None;
+        };
+        (bound.id() == actual
+            && relation.record().is_proven_complete()
+            && formal.kind() == crate::analyzer::semantic::ProcedurePortKind::Receiver)
+            .then_some(formal)
+    });
+    let formal = receivers.next()?;
+    receivers.next().is_none().then_some(formal)
 }
 
 /// One selected receiver and its written actual share a single certificate
@@ -2173,41 +2288,16 @@ fn selected_receiver_binding(
     {
         return Ok(Unknown);
     }
-    let mut receivers = selected.bindings().iter().filter_map(|binding| {
-        let CallBinding::Receiver {
-            relation,
-            actual: bound,
-            formal,
-        } = binding
-        else {
-            return None;
-        };
-        (bound.id() == actual
-            && relation.record().is_proven_complete()
-            && formal.kind() == crate::analyzer::semantic::ProcedurePortKind::Receiver)
-            .then_some(formal)
-    });
-    let Some(formal) = receivers.next() else {
+    let Some(formal) = unique_proven_receiver_formal(selected, actual) else {
         return Ok(Unknown);
     };
-    if receivers.next().is_some() {
-        return Ok(Unknown);
-    }
     let Some(support) = crate::analyzer::languages::language_support(language) else {
         return Ok(Unknown);
     };
     if request.stop_observed() {
         return Ok(Unknown);
     }
-    let declared_mode = selected
-        .callee()
-        .semantics()
-        .values()
-        .iter()
-        .find_map(|value| match value.kind {
-            SemanticValueKind::Receiver { mode, .. } => Some(mode),
-            _ => None,
-        });
+    let declared_mode = declared_receiver_mode(selected.callee());
     match preparation {
         Some(Preparation::Reference | Preparation::AddressOfPlace) => {
             if language == crate::analyzer::Language::Rust {
@@ -2266,14 +2356,15 @@ fn selected_receiver_binding(
     }
 }
 
-/// Identify a consumed Rust receiver for an authored after-return event.
+/// Identify a Rust receiver for an authored normal-return event.
 /// The same selected handoff and subject map used by composition must prove
 /// the exact pre-call object in this query's call context.
-pub fn selected_owned_receiver_event_object(
+pub fn selected_receiver_event_object(
     discovery: &crate::composition::WorkspaceCompositionDiscovery<'_>,
     procedure: &ProcedureHandle,
     call: &CallSiteHandle,
     context: &crate::analyzer::semantic::OracleCallContext,
+    phase: ProtocolObservationPhase,
     request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
 ) -> Result<
     Option<(
@@ -2328,21 +2419,6 @@ pub fn selected_owned_receiver_event_object(
     );
     let subject =
         BoundTypestateSubject::receiver_event_probe(candidate.value().clone(), quality.clone());
-    if selected_receiver_binding(
-        MoveBindingQuery {
-            discovery,
-            procedure,
-            call: site,
-            context,
-            subject: &subject,
-            tracked_formal: None,
-            actual,
-        },
-        request,
-    )? != CallObjectContinuity::Move
-    {
-        return Ok(None);
-    }
     let dispatch = discovery.resolve_call(call, request)?;
     let Some(targets) = dispatch.available_value() else {
         return Ok(None);
@@ -2355,6 +2431,41 @@ pub fn selected_owned_receiver_event_object(
         return Ok(None);
     };
     if !exact_selected_call_binding(&dispatch, &binding_outcome, bindings, call) {
+        return Ok(None);
+    }
+    // An authored normal-return event models the state of the written place.
+    // This witness is event-specific; ordinary call handoffs remain unchanged.
+    // The callee must mutate that place's own object. A Direct owner means the
+    // method belongs to the written receiver's own type. A method reached by
+    // autoderef, for example through a user DerefMut, has a Promoted owner and
+    // mutates the dereferenced object instead.
+    let mutable_place = phase == ProtocolObservationPhase::AfterNormalReturn
+        && site.invocation_mode == crate::analyzer::semantic::CallInvocationMode::Ordinary
+        && site.execution_timing.is_synchronous()
+        && !context.was_truncated()
+        && target.receiver_owner_relation()
+            == crate::analyzer::semantic::ReceiverOwnerRelation::Direct
+        && declared_receiver_mode(bindings.callee())
+            == Some(crate::analyzer::semantic::ReceiverMode::MutableBorrow)
+        && unique_proven_receiver_formal(bindings, actual).is_some()
+        && rust_written_receiver_is_place(procedure, actual, request);
+    let continuity = if mutable_place {
+        CallObjectContinuity::Reference
+    } else {
+        selected_receiver_binding(
+            MoveBindingQuery {
+                discovery,
+                procedure,
+                call: site,
+                context,
+                subject: &subject,
+                tracked_formal: None,
+                actual,
+            },
+            request,
+        )?
+    };
+    if !mutable_place && continuity != CallObjectContinuity::Move {
         return Ok(None);
     }
     let from = PartialFlowPort::CallReceiver { call: call.id() };
@@ -2370,7 +2481,7 @@ pub fn selected_owned_receiver_event_object(
             context,
             port_query: Some(&observation),
             port_objects: Some(result),
-            continuity: CallObjectContinuity::Move,
+            continuity,
             tracked_formal: None,
             exact_owned_origin: false,
         },
@@ -2419,7 +2530,7 @@ fn rust_written_receiver_is_place(
     };
     associations.next().is_none()
         && matches!(association.effect,
-            SemanticEffect::ValueFlow { kind: ValueFlowKind::Local | ValueFlowKind::Parameter | ValueFlowKind::Receiver, source, target }
+            SemanticEffect::ValueFlow { kind: ValueFlowKind::Local | ValueFlowKind::AddressOf | ValueFlowKind::Parameter | ValueFlowKind::Receiver, source, target }
                 if target == actual && semantics.value(source).is_some_and(|value|
                     matches!(value.kind, SemanticValueKind::Local | SemanticValueKind::Parameter { .. } | SemanticValueKind::Receiver { .. })))
         && semantics
@@ -2825,7 +2936,7 @@ pub(crate) fn call_actual_continuity(
     if address {
         let mut associations = procedure.semantics().points().iter()
                     .flat_map(|point| &point.events)
-                    .filter(|event| matches!(event.effect, SemanticEffect::Assignment { target, .. } if target == actual));
+                    .filter(|event| matches!(event.effect, SemanticEffect::Assignment { target, .. } | SemanticEffect::ValueFlow { kind: crate::analyzer::semantic::ValueFlowKind::AddressOf, target, .. } if target == actual));
         match (associations.next(), associations.next()) {
             (Some(event), None)
                 if procedure
@@ -2837,8 +2948,14 @@ pub(crate) fn call_actual_continuity(
                             .establishes_complete_evidence(&evidence.completeness)
                     }) =>
             {
-                let SemanticEffect::Assignment { value: source, .. } = event.effect else {
-                    unreachable!()
+                let source = match event.effect {
+                    SemanticEffect::Assignment { value, .. }
+                    | SemanticEffect::ValueFlow {
+                        kind: crate::analyzer::semantic::ValueFlowKind::AddressOf,
+                        source: value,
+                        ..
+                    } => value,
+                    _ => unreachable!("selected address association"),
                 };
                 value = source;
             }
@@ -3415,7 +3532,11 @@ mod tests {
             alternate_mapping.conversion()
         );
         assert!(!alternate_mapping.preserves_reference_identity());
-        let selected_overlay = workspace.analyzer().semantic_model_overlay().unwrap();
+        let selected_overlay = workspace
+            .analyzer()
+            .semantic_model_overlay_read()
+            .published()
+            .unwrap();
         let selected_other_provider =
             selected_overlay.symbols_with_id("type.other-provider-handle");
         let [selected_other_provider] = selected_other_provider.records.as_slice() else {
@@ -3511,7 +3632,11 @@ mod tests {
             matches!(duplicate_runtime, SemanticModelRuntimeOutcome::Ready { .. }),
             "{duplicate_runtime:?}"
         );
-        let duplicate_overlay = workspace.analyzer().semantic_model_overlay().unwrap();
+        let duplicate_overlay = workspace
+            .analyzer()
+            .semantic_model_overlay_read()
+            .published()
+            .unwrap();
         let same_fqn = duplicate_overlay.symbols_with_id("type.handle");
         assert_eq!(
             same_fqn.disposition,

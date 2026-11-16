@@ -65,9 +65,14 @@ pub(super) fn coverage(
             return Err(StoreError::new("selected Python coverage cancelled"));
         }
     };
-    let (obligations, _) = request
+    let Some((obligations, _)) = request
         .operation
-        .python_graph_input_evidence(&request.environment, &cancellation)?;
+        .python_graph_input_evidence(&request.environment, &cancellation)?
+    else {
+        return Err(StoreError::new(
+            "python_environment_unavailable: the selected environment no longer matches the selected files",
+        ));
+    };
     let components = obligations
         .iter()
         .filter(|label| {
@@ -90,7 +95,11 @@ pub(super) fn coverage(
                 (SELECT json_group_array(spelling) FROM python_member_operation_names names WHERE names.operation=op.id)
          FROM temp.selected_resolution_mounts mounts
          JOIN resolution_unit_summary_members member ON member.summary_id=?1
-          AND member.blob_id=mounts.blob_id AND member.rel_path=mounts.persisted_relative_path
+          AND member.rel_path=mounts.persisted_relative_path
+         JOIN temp.selected_unit_member_paths selected_member
+          ON selected_member.summary_id=member.summary_id
+         AND selected_member.member_ordinal=member.member_ordinal
+         AND selected_member.mount_blob_id=mounts.blob_id
          JOIN python_member_operations op ON op.blob_id=mounts.blob_id AND op.effect=0 AND op.name_kind<>0
          JOIN python_member_sites site ON site.blob_id=op.blob_id AND site.site=op.site
          WHERE mounts.storage_language='python'

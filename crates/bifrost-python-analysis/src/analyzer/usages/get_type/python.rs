@@ -3,7 +3,6 @@ use crate::analyzer::usages::get_definition::python::PythonDefinitionProvider;
 use crate::analyzer::usages::get_definition::python::PythonTypeLookupTarget;
 use crate::analyzer::usages::get_definition::python::python_type_lookup_resolution_bounded;
 use brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer;
-use brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery;
 use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
 use brokk_bifrost_analysis::analyzer::usages::get_type::TypeLookupOutcome;
 use brokk_bifrost_analysis::analyzer::usages::get_type::candidates_outcome_with_target_kind;
@@ -18,30 +17,6 @@ use brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution;
 use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
 use brokk_bifrost_core::cancellation::CancellationToken;
 use tree_sitter::Tree;
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn resolve_python_type_bounded(
-    analyzer: &dyn IAnalyzer,
-    _token: QueryToken<'_>,
-    file: &ProjectFile,
-    source: &str,
-    tree: Option<&Tree>,
-    site: &ResolvedReferenceSite,
-    budget: ReceiverAnalysisBudget,
-    cancellation: Option<&CancellationToken>,
-) -> BoundedResolution<TypeLookupOutcome> {
-    crate::analyzer::python::native_request::definition_lookup::resolve_type_bounded(
-        BoundedReceiverQuery {
-            analyzer,
-            file,
-            source,
-            tree,
-            site,
-            budget,
-            cancellation,
-        },
-    )
-}
 
 /// The legacy structural type lookup. The native request answers every site
 /// first; it keeps this answer only where the native answer is open for a

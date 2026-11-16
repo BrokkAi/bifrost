@@ -322,6 +322,8 @@ pub struct CallDispatchLookup {
 /// resolver-owned call proof; incomplete or ambiguous lookups remain absent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolverOwnedExternalCallDispatch {
+    /// Exact selected implicit instance receiver route, when established.
+    pub implicit_receiver: bool,
     #[doc(hidden)]
     pub identity: ResolverOwnedExternalCalleeIdentity,
     #[doc(hidden)]
@@ -381,6 +383,7 @@ impl CallDispatchLookup {
         };
         let proof = self.exact_external_call.as_ref()?;
         Some(ResolverOwnedExternalCallDispatch {
+            implicit_receiver: proof.has_receiver() && proof.implicit_receiver,
             identity: identity.clone(),
             parameter_count: proof.parameter_count(),
             has_receiver: proof.has_receiver(),
@@ -407,6 +410,7 @@ pub struct CallDispatchLanguageRequest<'a> {
     pub source: &'a str,
     #[doc(hidden)]
     pub tree: &'a tree_sitter::Tree,
+    pub macro_inventory: Option<&'a brokk_bifrost_rust::macro_matcher::MacroDefinitionInventory>,
     #[doc(hidden)]
     pub call_span: &'a Range,
     /// Adapter-authored selection for a call without a written callee.
@@ -425,6 +429,7 @@ use brokk_bifrost_core::analyzer::structural::spec::EmbeddedSyntaxStop;
 struct CallDispatchSyntax {
     primary: tree_sitter::Tree,
     forest: EmbeddedSyntaxForest,
+    macro_inventories: HashMap<usize, brokk_bifrost_rust::macro_matcher::MacroDefinitionInventory>,
 }
 
 impl CallDispatchSyntax {
@@ -441,7 +446,25 @@ impl CallDispatchSyntax {
             .expect("a parsed language has a structural specification");
         let forest =
             EmbeddedSyntaxForest::parse(spec, primary.root_node(), source, 200_000, cancellation)?;
-        Ok(Some(Self { primary, forest }))
+        let mut macro_inventories = HashMap::default();
+        if language == Language::Rust {
+            for tree in std::iter::once(&primary)
+                .chain(forest.trees().iter().map(|fragment| &fragment.tree))
+            {
+                let inventory = brokk_bifrost_rust::macro_matcher::MacroDefinitionInventory::build(
+                    tree,
+                    source,
+                    &|| !cancellation.is_some_and(CancellationToken::is_cancelled),
+                )
+                .map_err(|_| EmbeddedSyntaxStop::Cancelled)?;
+                macro_inventories.insert(tree.root_node().id(), inventory);
+            }
+        }
+        Ok(Some(Self {
+            primary,
+            forest,
+            macro_inventories,
+        }))
     }
 
     fn tree(&self, range: &Range) -> &tree_sitter::Tree {
@@ -515,7 +538,7 @@ pub struct CallDispatchSession {
 
 const MAX_CPP_DISPATCH_PREFETCH_SITES: usize = 1024;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CallRelationLimits {
     pub max_files: usize,
     pub max_source_bytes: usize,
@@ -547,9 +570,17 @@ pub fn request_for_callee_range(file: &ProjectFile, range: Range) -> DefinitionL
 
 pub use crate::analyzer::semantic::call_relations::CallRelationWork;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CallRelationScanLimit {
+    Files,
+    SourceBytes,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CallRelationDiagnosticCode {
     BudgetExhausted,
+    /// The supplied file or source-byte scan grant refused required work.
+    ScanGrantRefused(CallRelationScanLimit),
     ParseFailed,
     CandidatesOmitted,
     TargetsAmbiguous,
@@ -558,44 +589,1305 @@ pub enum CallRelationDiagnosticCode {
     ExternalBoundary,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+/// Presentation coordinates are deliberately excluded from answer identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallRelationDiagnosticLocation {
+    pub file: ProjectFile,
+    pub range: Option<Range>,
+}
+
+/// A failure whose upstream API supplies no structured detail. Free text is
+/// neither displayed nor treated as semantic evidence (#8407).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CallRelationFailure {
+    Unavailable,
+    Stale,
+    StoreError,
+    InputUnavailable,
+    Upstream { kind: String },
+}
+
+/// Portable declaration/name evidence. The payload boundary accepts neither
+/// SemanticId nor CodeUnit, so runtime aliases and source positions cannot be
+/// retained accidentally in a hashed diagnostic (#8407).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CallRelationCanonicalTarget {
+    Declaration {
+        name: String,
+        signature: Option<String>,
+        path: String,
+    },
+    Named {
+        name: String,
+    },
+    /// Structured projection found no declaration or intrinsic name.
+    Unavailable,
+}
+impl From<&CodeUnit> for CallRelationCanonicalTarget {
+    fn from(unit: &CodeUnit) -> Self {
+        Self::Declaration {
+            name: unit.fq_name(),
+            signature: unit.signature().map(str::to_owned),
+            path: crate::path_utils::rel_path_string(unit.source()),
+        }
+    }
+}
+impl CallRelationCanonicalTarget {
+    pub fn from_projection(
+        definition: &crate::analyzer::store::resolution_operation::native_units::SelectedDiagnosticIdentity,
+    ) -> Self {
+        use crate::analyzer::store::resolution_operation::native_units::SelectedDiagnosticIdentity;
+        match definition {
+            SelectedDiagnosticIdentity::Declaration(unit) => unit.into(),
+            SelectedDiagnosticIdentity::Lexical {
+                canonical_name,
+                source_file,
+            } => match source_file {
+                Some(file) => Self::Declaration {
+                    name: canonical_name.clone(),
+                    signature: None,
+                    path: crate::path_utils::rel_path_string(file),
+                },
+                None => Self::Named {
+                    name: canonical_name.clone(),
+                },
+            },
+            SelectedDiagnosticIdentity::Named { canonical_name } => Self::Named {
+                name: canonical_name.clone(),
+            },
+            SelectedDiagnosticIdentity::Unavailable => Self::Unavailable,
+        }
+    }
+}
+
+/// Aliases are used only while projecting evidence inside the selected query.
+/// The returned canonical payloads never retain them.
+pub fn call_relation_completion_semantics(
+    completion: &crate::analyzer::resolution::model::ResolutionCompletion,
+) -> Vec<crate::analyzer::resolution::model::SemanticId> {
+    use crate::analyzer::resolution::model::ResolutionCompletion;
+    let ResolutionCompletion::Incomplete(reasons) = completion else {
+        return Vec::new();
+    };
+    let mut semantics = reasons
+        .iter()
+        .filter_map(|reason| {
+            crate::analyzer::store::resolution_operation::native_units::public_reason_details(
+                reason,
+            )
+            .1
+        })
+        .collect::<Vec<_>>();
+    semantics.sort();
+    semantics.dedup();
+    semantics
+}
+pub fn call_relation_diagnostic_semantics(
+    answer: &crate::analyzer::resolution::fact_resolution::FactResolutionAnswer,
+) -> Vec<crate::analyzer::resolution::model::SemanticId> {
+    let mut semantics = call_relation_completion_semantics(&answer.call_target_completion());
+    semantics.extend_from_slice(answer.binding().targets());
+    semantics.extend(
+        answer
+            .callable_receiver_dispositions()
+            .iter()
+            .map(|item| item.target()),
+    );
+    semantics.sort();
+    semantics.dedup();
+    semantics
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CallRelationCompletionReasonKind {
+    Cancelled,
+    CyclicExpansion,
+    CyclicPrefixDependency,
+    InconsistentPrecedence,
+    OpenBoundary,
+    UnsupportedSemantic,
+    ReceiverBudgetExhausted,
+    TimeBudgetExceeded,
+    UnmountedFile,
+    ReceiverSubclassObligation,
+    Unclassified,
+    OverlayFrontierUnknown,
+}
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CallRelationCompletionReason {
+    pub kind: CallRelationCompletionReasonKind,
+    pub target: Option<CallRelationCanonicalTarget>,
+    pub boundary: Option<brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CallRelationCompletion {
+    Complete,
+    Incomplete(Vec<CallRelationCompletionReason>),
+}
+impl CallRelationCompletion {
+    pub fn from_resolution(
+        completion: &crate::analyzer::resolution::model::ResolutionCompletion,
+        mut project: impl FnMut(
+            crate::analyzer::resolution::model::SemanticId,
+        ) -> CallRelationCanonicalTarget,
+    ) -> Self {
+        use crate::analyzer::resolution::model::{
+            ResolutionCompletion, ResolutionIncompleteReason,
+        };
+        let ResolutionCompletion::Incomplete(reasons) = completion else {
+            return Self::Complete;
+        };
+        let mut reasons = reasons
+            .iter()
+            .map(|reason| {
+                use CallRelationCompletionReasonKind as Kind;
+                let (kind, semantic, boundary) = match *reason {
+                    ResolutionIncompleteReason::Cancelled => (Kind::Cancelled, None, None),
+                    ResolutionIncompleteReason::CyclicExpansion(_) => {
+                        (Kind::CyclicExpansion, None, None)
+                    }
+                    ResolutionIncompleteReason::CyclicPrefixDependency(id) => {
+                        (Kind::CyclicPrefixDependency, Some(id), None)
+                    }
+                    ResolutionIncompleteReason::InconsistentPrecedence(id) => {
+                        (Kind::InconsistentPrecedence, Some(id), None)
+                    }
+                    ResolutionIncompleteReason::OpenBoundary { semantic, status } => {
+                        (Kind::OpenBoundary, Some(semantic), Some(status))
+                    }
+                    ResolutionIncompleteReason::UnsupportedSemantic(id) => {
+                        (Kind::UnsupportedSemantic, Some(id), None)
+                    }
+                    ResolutionIncompleteReason::ReceiverBudgetExhausted(id) => {
+                        (Kind::ReceiverBudgetExhausted, Some(id), None)
+                    }
+                    ResolutionIncompleteReason::TimeBudgetExceeded(id) => {
+                        (Kind::TimeBudgetExceeded, Some(id), None)
+                    }
+                    ResolutionIncompleteReason::UnmountedFile { .. } => {
+                        (Kind::UnmountedFile, None, None)
+                    }
+                    ResolutionIncompleteReason::ReceiverSubclassObligation(id) => {
+                        (Kind::ReceiverSubclassObligation, Some(id), None)
+                    }
+                    ResolutionIncompleteReason::Unclassified(id) => {
+                        (Kind::Unclassified, Some(id), None)
+                    }
+                    ResolutionIncompleteReason::OverlayFrontierUnknown(id) => {
+                        (Kind::OverlayFrontierUnknown, Some(id), None)
+                    }
+                };
+                CallRelationCompletionReason {
+                    kind,
+                    target: semantic.map(&mut project),
+                    boundary,
+                }
+            })
+            .collect::<Vec<_>>();
+        reasons.sort();
+        reasons.dedup();
+        Self::Incomplete(reasons)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CallRelationReceiverChannels {
+    None,
+    SelfReceiver,
+    External,
+    SelfAndExternal,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CallRelationReceiverGap {
+    MissingOrigin,
+    UnresolvedReceiver,
+    AmbiguousReceiver,
+}
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CallRelationReceiverDisposition {
+    pub target: CallRelationCanonicalTarget,
+    pub channels: CallRelationReceiverChannels,
+    pub gap: Option<CallRelationReceiverGap>,
+}
+impl CallRelationReceiverDisposition {
+    pub fn from_resolution(
+        dispositions: &[crate::analyzer::resolution::fact_resolution::FactCallableReceiverTargetDisposition],
+        mut project: impl FnMut(
+            crate::analyzer::resolution::model::SemanticId,
+        ) -> CallRelationCanonicalTarget,
+    ) -> Vec<Self> {
+        use crate::analyzer::resolution::fact_resolution::{
+            FactCallableReceiverChannels as Channels, FactReferenceReceiverGap as Gap,
+        };
+        let mut result = dispositions
+            .iter()
+            .map(|item| Self {
+                target: project(item.target()),
+                channels: match item.disposition().channels() {
+                    Channels::None => CallRelationReceiverChannels::None,
+                    Channels::SelfReceiver => CallRelationReceiverChannels::SelfReceiver,
+                    Channels::External => CallRelationReceiverChannels::External,
+                    Channels::SelfAndExternal => CallRelationReceiverChannels::SelfAndExternal,
+                },
+                gap: item.disposition().gap().map(|gap| match gap {
+                    Gap::MissingOrigin => CallRelationReceiverGap::MissingOrigin,
+                    Gap::UnresolvedReceiver => CallRelationReceiverGap::UnresolvedReceiver,
+                    Gap::AmbiguousReceiver => CallRelationReceiverGap::AmbiguousReceiver,
+                }),
+            })
+            .collect::<Vec<_>>();
+        result.sort();
+        result.dedup();
+        result
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CallRelationInventoryReason {
+    AxisUnsupported(brokk_bifrost_core::analyzer::structural::edges::EdgeAxis),
+    NoStructuralAdapter,
+    UsageListingTruncated,
+    UsageAnalysisFailed {
+        kind: String,
+    },
+    Cancelled,
+    TimeBudgetExceeded,
+    OccurrenceRowsIncomplete {
+        uncovered_roles: Vec<brokk_bifrost_core::analyzer::structural::occurrences::OccurrenceRole>,
+    },
+    ReferenceEnumerationIncomplete,
+    ForwardResolutionIncomplete,
+    ForwardAdmissionIncomplete,
+    ForwardMetadataIncomplete,
+    InverseIndexReferenceEnumerationIncomplete,
+    InverseIndexResolutionIncomplete,
+    InverseIndexQueryObligationsOutstanding,
+    InverseIndexAdmissionIncomplete,
+    InverseIndexMetadataIncomplete,
+    InverseIndexTargetUncovered,
+    SelectedInverseUnavailable {
+        kind: String,
+    },
+}
+impl From<&crate::analyzer::structural::reference_edges::EdgeIncompleteReason>
+    for CallRelationInventoryReason
+{
+    fn from(reason: &crate::analyzer::structural::reference_edges::EdgeIncompleteReason) -> Self {
+        use crate::analyzer::structural::reference_edges::EdgeIncompleteReason as Reason;
+        match reason {
+            Reason::AxisUnsupported(axis) => Self::AxisUnsupported(*axis),
+            Reason::NoStructuralAdapter => Self::NoStructuralAdapter,
+            Reason::UsageListingTruncated => Self::UsageListingTruncated,
+            Reason::UsageAnalysisFailed { reason_kind, .. } => Self::UsageAnalysisFailed {
+                kind: reason_kind.clone(),
+            },
+            Reason::Cancelled => Self::Cancelled,
+            Reason::TimeBudgetExceeded => Self::TimeBudgetExceeded,
+            Reason::OccurrenceRowsIncomplete { uncovered_roles } => {
+                let mut roles = uncovered_roles.clone();
+                roles.sort();
+                roles.dedup();
+                Self::OccurrenceRowsIncomplete {
+                    uncovered_roles: roles,
+                }
+            }
+            Reason::ReferenceEnumerationIncomplete => Self::ReferenceEnumerationIncomplete,
+            Reason::ForwardResolutionIncomplete => Self::ForwardResolutionIncomplete,
+            Reason::ForwardAdmissionIncomplete => Self::ForwardAdmissionIncomplete,
+            Reason::ForwardMetadataIncomplete => Self::ForwardMetadataIncomplete,
+            Reason::InverseIndexReferenceEnumerationIncomplete => {
+                Self::InverseIndexReferenceEnumerationIncomplete
+            }
+            Reason::InverseIndexResolutionIncomplete => Self::InverseIndexResolutionIncomplete,
+            Reason::InverseIndexQueryObligationsOutstanding => {
+                Self::InverseIndexQueryObligationsOutstanding
+            }
+            Reason::InverseIndexAdmissionIncomplete => Self::InverseIndexAdmissionIncomplete,
+            Reason::InverseIndexMetadataIncomplete => Self::InverseIndexMetadataIncomplete,
+            Reason::InverseIndexTargetUncovered => Self::InverseIndexTargetUncovered,
+            Reason::SelectedInverseIndexUnavailable { reason_kind, .. } => {
+                Self::SelectedInverseUnavailable {
+                    kind: reason_kind.clone(),
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CallRelationSelectionReason {
+    CatalogInputUnavailable,
+    NativeDemandUnavailable {
+        language: String,
+        path: String,
+    },
+    JvmContextUnavailable {
+        language: String,
+        path: String,
+    },
+    GoContextUnavailable {
+        path: String,
+    },
+    MissingWorkspaceSnapshot {
+        language: String,
+    },
+    MissingProducerEpoch {
+        language: String,
+    },
+    MissingBlob {
+        language: String,
+        path: String,
+    },
+    BlobGenerationMismatch {
+        language: String,
+        path: String,
+    },
+    IncompleteParsedBlob {
+        language: String,
+        path: String,
+    },
+    MissingInterior {
+        language: String,
+        path: String,
+    },
+    IncompleteInterior {
+        language: String,
+        path: String,
+    },
+    InteriorOwnershipMismatch {
+        language: String,
+        path: String,
+    },
+    MissingTransientReplacement {
+        language: String,
+        path: String,
+    },
+    MissingTransientOverlayInput {
+        language: String,
+        path: String,
+    },
+    MissingDefinitionUnit {
+        reason: CallRelationMissingDefinition,
+        language: String,
+        path: String,
+    },
+    NativeContextPublication {
+        language: String,
+    },
+    WorkspaceRevision {
+        language: String,
+    },
+    AnalysisGeneration {
+        language: String,
+    },
+    ProducerEpoch {
+        language: String,
+    },
+    MountInventoryChanged,
+    TransientAnalysisGeneration,
+    TransientOverlayChanged {
+        language: String,
+        path: String,
+    },
+}
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CallRelationMissingDefinition {
+    Unprojected {
+        paths: Vec<String>,
+    },
+    Uncertified,
+    /// Only fixed language-universe targets, pending the consumer shadow proof.
+    Universe,
+    Unplaced,
+}
+impl From<&crate::analyzer::store::resolution_selection::SelectedResolutionUnavailable>
+    for CallRelationSelectionReason
+{
+    fn from(
+        reason: &crate::analyzer::store::resolution_selection::SelectedResolutionUnavailable,
+    ) -> Self {
+        use crate::analyzer::store::resolution_selection::{
+            MissingDefinitionReason, SelectedResolutionUnavailable as Reason,
+        };
+        match reason {
+            Reason::CatalogInputUnavailable { .. } => Self::CatalogInputUnavailable,
+            Reason::NativeDemandUnavailable {
+                storage_language,
+                persisted_relative_path,
+            } => Self::NativeDemandUnavailable {
+                language: storage_language.clone(),
+                path: persisted_relative_path.clone(),
+            },
+            Reason::JvmContextUnavailable {
+                storage_language,
+                persisted_relative_path,
+            } => Self::JvmContextUnavailable {
+                language: storage_language.clone(),
+                path: persisted_relative_path.clone(),
+            },
+            Reason::GoContextUnavailable {
+                persisted_relative_path,
+            } => Self::GoContextUnavailable {
+                path: persisted_relative_path.clone(),
+            },
+            Reason::MissingWorkspaceSnapshot { storage_language } => {
+                Self::MissingWorkspaceSnapshot {
+                    language: storage_language.clone(),
+                }
+            }
+            Reason::MissingProducerEpoch { storage_language } => Self::MissingProducerEpoch {
+                language: storage_language.clone(),
+            },
+            Reason::MissingBlob {
+                storage_language,
+                persisted_relative_path,
+            } => Self::MissingBlob {
+                language: storage_language.clone(),
+                path: persisted_relative_path.clone(),
+            },
+            Reason::BlobGenerationMismatch {
+                storage_language,
+                persisted_relative_path,
+            } => Self::BlobGenerationMismatch {
+                language: storage_language.clone(),
+                path: persisted_relative_path.clone(),
+            },
+            Reason::IncompleteParsedBlob {
+                storage_language,
+                persisted_relative_path,
+            } => Self::IncompleteParsedBlob {
+                language: storage_language.clone(),
+                path: persisted_relative_path.clone(),
+            },
+            Reason::MissingInterior {
+                storage_language,
+                persisted_relative_path,
+            } => Self::MissingInterior {
+                language: storage_language.clone(),
+                path: persisted_relative_path.clone(),
+            },
+            Reason::IncompleteInterior {
+                storage_language,
+                persisted_relative_path,
+            } => Self::IncompleteInterior {
+                language: storage_language.clone(),
+                path: persisted_relative_path.clone(),
+            },
+            Reason::InteriorOwnershipMismatch {
+                storage_language,
+                persisted_relative_path,
+            } => Self::InteriorOwnershipMismatch {
+                language: storage_language.clone(),
+                path: persisted_relative_path.clone(),
+            },
+            Reason::MissingTransientReplacement {
+                storage_language,
+                persisted_relative_path,
+            } => Self::MissingTransientReplacement {
+                language: storage_language.clone(),
+                path: persisted_relative_path.clone(),
+            },
+            Reason::MissingTransientOverlayInput {
+                storage_language,
+                persisted_relative_path,
+            } => Self::MissingTransientOverlayInput {
+                language: storage_language.clone(),
+                path: persisted_relative_path.clone(),
+            },
+            Reason::MissingDefinitionUnit {
+                reason,
+                storage_language,
+                persisted_relative_path,
+            } => Self::MissingDefinitionUnit {
+                reason: match reason {
+                    MissingDefinitionReason::UnprojectedDefinition { target_files } => {
+                        let mut paths = target_files
+                            .iter()
+                            .map(|(path, _)| path.clone())
+                            .collect::<Vec<_>>();
+                        paths.sort();
+                        paths.dedup();
+                        CallRelationMissingDefinition::Unprojected { paths }
+                    }
+                    MissingDefinitionReason::UncertifiedDefinition => {
+                        CallRelationMissingDefinition::Uncertified
+                    }
+                    MissingDefinitionReason::UniverseDefinition => {
+                        CallRelationMissingDefinition::Universe
+                    }
+                    MissingDefinitionReason::UnplacedDefinition => {
+                        CallRelationMissingDefinition::Unplaced
+                    }
+                },
+                language: storage_language.clone(),
+                path: persisted_relative_path.clone(),
+            },
+        }
+    }
+}
+impl From<&crate::analyzer::store::resolution_selection::SelectedResolutionStale>
+    for CallRelationSelectionReason
+{
+    fn from(
+        reason: &crate::analyzer::store::resolution_selection::SelectedResolutionStale,
+    ) -> Self {
+        use crate::analyzer::store::resolution_selection::SelectedResolutionStale as Reason;
+        match reason {
+            Reason::NativeContextPublication { storage_language } => {
+                Self::NativeContextPublication {
+                    language: storage_language.clone(),
+                }
+            }
+            Reason::WorkspaceRevision { storage_language } => Self::WorkspaceRevision {
+                language: storage_language.clone(),
+            },
+            Reason::AnalysisGeneration { storage_language } => Self::AnalysisGeneration {
+                language: storage_language.clone(),
+            },
+            Reason::ProducerEpoch { storage_language } => Self::ProducerEpoch {
+                language: storage_language.clone(),
+            },
+            Reason::MountInventoryChanged => Self::MountInventoryChanged,
+            Reason::TransientAnalysisGeneration { .. } => Self::TransientAnalysisGeneration,
+            Reason::TransientOverlayChanged {
+                storage_language,
+                persisted_relative_path,
+                ..
+            } => Self::TransientOverlayChanged {
+                language: storage_language.clone(),
+                path: persisted_relative_path.clone(),
+            },
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct CallRelationUsageFailure {
+    pub fq_name: String,
+    pub strategy: String,
+    pub reason_kind: String,
+}
+impl std::fmt::Debug for CallRelationUsageFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UsageAnalysisDiagnostic")
+            .field("fq_name", &self.fq_name)
+            .field("strategy", &self.strategy)
+            .field("reason_kind", &self.reason_kind)
+            .finish()
+    }
+}
+
+/// Typed evidence owned by the producer. No rendered message is an input.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CallRelationDiagnosticPayload {
+    BudgetOmitted {
+        subject: String,
+    },
+    BudgetFileOmitted,
+    IncomingScanGrantRefused {
+        target: String,
+        path: String,
+        limit: CallRelationScanLimit,
+    },
+    SourceBudgetRefused {
+        target: String,
+    },
+    SourceBudgetTruncated {
+        target: String,
+    },
+    FileBudgetTruncated {
+        target: String,
+    },
+    RetainedCandidates {
+        target: String,
+        limit: usize,
+    },
+    NavigationTruncated {
+        target: String,
+    },
+    ParseFailed,
+    IndexedSourceUnavailable,
+    DeclarationRangeUnavailable {
+        target: String,
+    },
+    OutgoingAmbiguous {
+        target: String,
+        count: usize,
+    },
+    OutgoingOmitted {
+        target: String,
+        count: usize,
+    },
+    IncomingOmitted {
+        target: String,
+        count: usize,
+    },
+    UnprovenOmitted {
+        target: String,
+        count: usize,
+    },
+    TooManyCandidates {
+        target: String,
+        total: usize,
+        limit: usize,
+    },
+    IncomingAmbiguous {
+        target: String,
+        signature: Option<String>,
+    },
+    IncomingUnproven {
+        target: String,
+        signature: Option<String>,
+    },
+    UsageIncomplete {
+        diagnostics: Vec<CallRelationUsageFailure>,
+    },
+    Failure {
+        reason: CallRelationFailure,
+    },
+    RustInventory {
+        completion: CallRelationCompletion,
+    },
+    RustShape {
+        coverage: brokk_bifrost_core::analyzer::structural::callable::CallShapeCoverage,
+    },
+    GoShape {
+        coverage: brokk_bifrost_core::analyzer::structural::callable::CallShapeCoverage,
+    },
+    RustStructuredReferenceUnavailable,
+    RustReferenceUnavailable,
+    RustCanonicalOwnerUnavailable,
+    RustTargetUnavailable,
+    GoStructuredReferenceUnavailable,
+    GoSelectedReferenceUnavailable,
+    GoCanonicalOwnerUnavailable,
+    GoTargetUnavailable,
+    GoNoWorkspaceTarget {
+        site_kind: brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteKind,
+        namespace: brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace,
+        targets: Vec<CallRelationCanonicalTarget>,
+        completion: CallRelationCompletion,
+    },
+    NativeUnavailable {
+        reason: CallRelationSelectionReason,
+    },
+    NativeStale {
+        reason: CallRelationSelectionReason,
+    },
+    RustAmbiguous {
+        targets: Vec<CallRelationCanonicalTarget>,
+    },
+    RustSelectedAmbiguous {
+        targets: Vec<CallRelationCanonicalTarget>,
+    },
+    RustIncomplete {
+        completion: CallRelationCompletion,
+        receivers: Vec<CallRelationReceiverDisposition>,
+    },
+    RustSelectedIncomplete {
+        completion: CallRelationCompletion,
+        receivers: Vec<CallRelationReceiverDisposition>,
+    },
+    RustExternalTerminal,
+    RustCandidateBound {
+        limit: usize,
+    },
+    RustBudget {
+        limit: brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit,
+    },
+    GoBudget {
+        limit: brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit,
+    },
+    RustIncomingBudget {
+        limits: CallRelationLimits,
+    },
+    RustIncomingOmitted {
+        lane: String,
+        count: usize,
+    },
+    RustTargetNotCallable {
+        target: CallRelationCanonicalTarget,
+    },
+    GoAmbiguous {
+        targets: Vec<CallRelationCanonicalTarget>,
+    },
+    GoCandidateBound {
+        limit: usize,
+    },
+    GoIncomplete {
+        completion: CallRelationCompletion,
+        receivers: Vec<CallRelationReceiverDisposition>,
+    },
+    GoExternalReceiver {
+        target: String,
+    },
+    GoIncomingBudget {
+        target: String,
+    },
+    JavaIncomingBudget {
+        target: String,
+    },
+    RustFactsUnavailable,
+    GoFactsUnavailable,
+    JavaFactsUnavailable,
+    RustOwnerUnavailable {
+        enclosing: Option<CallRelationCanonicalTarget>,
+    },
+    GoOwnerUnavailable {
+        enclosing: Option<CallRelationCanonicalTarget>,
+    },
+    JavaOwnerUnavailable {
+        enclosing: Option<CallRelationCanonicalTarget>,
+    },
+    GoSourceUnavailable,
+    GoSourceStale,
+    GoStructuralSourceStale,
+    JavaSourceUnavailable,
+    JavaSourceStale,
+    JavaStructuralSourceStale,
+    JavaParseFailed,
+    JavaDispatchUnenumerable {
+        target: String,
+    },
+    JavaWithoutInvocation {
+        target: String,
+    },
+    JavaBindingCount {
+        count: Option<usize>,
+        enclosing: Option<CallRelationCanonicalTarget>,
+    },
+    JavaCallerIncomplete {
+        kind: String,
+    },
+    RustInventoryIncomplete {
+        target: String,
+        reason: CallRelationInventoryReason,
+    },
+    GoInventoryIncomplete {
+        target: String,
+        reason: CallRelationInventoryReason,
+    },
+    JavaInventoryIncomplete {
+        target: String,
+        reason: CallRelationInventoryReason,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CallRelationDiagnosticFacts {
+    pub subject: String,
+    pub scan_limits: Option<CallRelationLimits>,
+    pub payload: CallRelationDiagnosticPayload,
+    pub omitted_count: Option<usize>,
+    pub ambiguous_count: Option<usize>,
+    pub configured_limit: Option<usize>,
+}
+
+/// Numeric primitives have a fixed byte order and width even on 32-bit hosts.
+/// Hash's derive traverses typed variants/fields; no Debug or presentation
+/// string participates. Locations cannot cross this boundary (they lack Hash).
+struct CallRelationFactHasher(crate::analyzer::canonical_hash::CanonicalHasher);
+impl std::hash::Hasher for CallRelationFactHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        self.0.value(bytes);
+    }
+    fn write_usize(&mut self, value: usize) {
+        self.write(&(value as u64).to_be_bytes());
+    }
+    fn write_isize(&mut self, value: isize) {
+        self.write(&(value as i64).to_be_bytes());
+    }
+    fn write_u8(&mut self, value: u8) {
+        self.write(&value.to_be_bytes());
+    }
+    fn write_u16(&mut self, value: u16) {
+        self.write(&value.to_be_bytes());
+    }
+    fn write_u32(&mut self, value: u32) {
+        self.write(&value.to_be_bytes());
+    }
+    fn write_u64(&mut self, value: u64) {
+        self.write(&value.to_be_bytes());
+    }
+    fn write_u128(&mut self, value: u128) {
+        self.write(&value.to_be_bytes());
+    }
+    fn write_i8(&mut self, value: i8) {
+        self.write(&value.to_be_bytes());
+    }
+    fn write_i16(&mut self, value: i16) {
+        self.write(&value.to_be_bytes());
+    }
+    fn write_i32(&mut self, value: i32) {
+        self.write(&value.to_be_bytes());
+    }
+    fn write_i64(&mut self, value: i64) {
+        self.write(&value.to_be_bytes());
+    }
+    fn write_i128(&mut self, value: i128) {
+        self.write(&value.to_be_bytes());
+    }
+    fn finish(&self) -> u64 {
+        unreachable!("call fact hashing consumes the full SHA-256 digest")
+    }
+}
+impl CallRelationDiagnosticFacts {
+    fn answer_digest(&self) -> [u8; 32] {
+        let mut hasher =
+            CallRelationFactHasher(crate::analyzer::canonical_hash::CanonicalHasher::new(
+                b"bifrost-call-diagnostic-facts:v1",
+            ));
+        std::hash::Hash::hash(self, &mut hasher);
+        hasher.0.finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallRelationDiagnostic {
     pub code: CallRelationDiagnosticCode,
-    pub message: String,
-    /// Stable producer context for debugging without parsing the message.
+    pub facts: CallRelationDiagnosticFacts,
+    pub location: Vec<CallRelationDiagnosticLocation>,
     pub context: String,
-    /// Structured usage-analysis reason when this originated below the call
-    /// relation layer.
     pub reason_kind: Option<String>,
-    /// Structured omission or ambiguity count when the producer reports one.
     pub semantic_count: Option<usize>,
 }
 
+// Diagnostics remain sortable for deterministic emission. Debug here is only
+// an ordering of typed values, never a source of semantic facts.
+impl Ord for CallRelationDiagnostic {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (
+            self.code,
+            self.message(),
+            &self.context,
+            &self.reason_kind,
+            self.semantic_count,
+        )
+            .cmp(&(
+                other.code,
+                other.message(),
+                &other.context,
+                &other.reason_kind,
+                other.semantic_count,
+            ))
+            .then_with(|| format!("{self:?}").cmp(&format!("{other:?}")))
+    }
+}
+impl PartialOrd for CallRelationDiagnostic {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Construction input keeps presentation coordinates out of semantic payloads.
+#[derive(Debug, Clone)]
+pub struct LocatedCallRelationDiagnostic {
+    payload: CallRelationDiagnosticPayload,
+    location: Vec<CallRelationDiagnosticLocation>,
+}
+impl From<CallRelationDiagnosticPayload> for LocatedCallRelationDiagnostic {
+    fn from(payload: CallRelationDiagnosticPayload) -> Self {
+        Self {
+            payload,
+            location: Vec::new(),
+        }
+    }
+}
+impl CallRelationDiagnosticPayload {
+    pub fn at(self, file: &ProjectFile, range: Option<Range>) -> LocatedCallRelationDiagnostic {
+        LocatedCallRelationDiagnostic::from(self).at(file, range)
+    }
+}
+impl LocatedCallRelationDiagnostic {
+    pub fn at(mut self, file: &ProjectFile, range: Option<Range>) -> Self {
+        self.location.push(CallRelationDiagnosticLocation {
+            file: file.clone(),
+            range,
+        });
+        self
+    }
+    pub fn at_locations(
+        mut self,
+        locations: impl IntoIterator<Item = CallRelationDiagnosticLocation>,
+    ) -> Self {
+        self.location.extend(locations);
+        self
+    }
+}
+
 impl CallRelationDiagnostic {
-    #[doc(hidden)]
-    pub fn new(code: CallRelationDiagnosticCode, message: String, context: String) -> Self {
+    pub fn new(
+        code: CallRelationDiagnosticCode,
+        payload: impl Into<LocatedCallRelationDiagnostic>,
+        context: String,
+    ) -> Self {
+        let LocatedCallRelationDiagnostic { payload, location } = payload.into();
+        let (omitted_count, ambiguous_count, configured_limit) = match &payload {
+            CallRelationDiagnosticPayload::OutgoingAmbiguous { count, .. } => {
+                (None, Some(*count), None)
+            }
+            CallRelationDiagnosticPayload::IncomingAmbiguous { .. } => (
+                None,
+                Some(
+                    location
+                        .len()
+                        .checked_sub(1)
+                        .expect("incoming ambiguity has a target location"),
+                ),
+                None,
+            ),
+            CallRelationDiagnosticPayload::OutgoingOmitted { count, .. }
+            | CallRelationDiagnosticPayload::IncomingOmitted { count, .. }
+            | CallRelationDiagnosticPayload::UnprovenOmitted { count, .. }
+            | CallRelationDiagnosticPayload::RustIncomingOmitted { count, .. } => {
+                (Some(*count), None, None)
+            }
+            CallRelationDiagnosticPayload::TooManyCandidates { total, limit, .. } => {
+                (Some(total.saturating_sub(*limit)), None, Some(*limit))
+            }
+            CallRelationDiagnosticPayload::JavaBindingCount { count, .. }
+                if code == CallRelationDiagnosticCode::TargetsAmbiguous =>
+            {
+                (None, *count, None)
+            }
+            CallRelationDiagnosticPayload::RetainedCandidates { limit, .. }
+            | CallRelationDiagnosticPayload::RustCandidateBound { limit }
+            | CallRelationDiagnosticPayload::GoCandidateBound { limit } => {
+                (None, None, Some(*limit))
+            }
+            _ => (None, None, None),
+        };
         Self {
             code,
-            message,
+            facts: CallRelationDiagnosticFacts {
+                subject: context.clone(),
+                scan_limits: None,
+                payload,
+                omitted_count,
+                ambiguous_count,
+                configured_limit,
+            },
+            location,
             context,
             reason_kind: None,
             semantic_count: None,
         }
     }
 
-    fn with_count(mut self, count: usize) -> Self {
-        self.semantic_count = Some(count);
+    pub fn at(mut self, file: &ProjectFile, range: Option<Range>) -> Self {
+        self.location.push(CallRelationDiagnosticLocation {
+            file: file.clone(),
+            range,
+        });
         self
     }
 
-    #[doc(hidden)]
-    pub fn analysis_failed(message: String, context: String, reason_kind: String) -> Self {
-        Self {
-            code: CallRelationDiagnosticCode::AnalysisFailed,
-            message,
-            context,
-            reason_kind: Some(reason_kind),
-            semantic_count: None,
+    pub fn with_count(mut self, count: usize) -> Self {
+        self.semantic_count = Some(count);
+        match self.code {
+            CallRelationDiagnosticCode::TargetsAmbiguous => {
+                self.facts.ambiguous_count = Some(count)
+            }
+            _ => self.facts.omitted_count = Some(count),
+        }
+        self
+    }
+
+    pub fn with_scan_limits(mut self, limits: CallRelationLimits) -> Self {
+        self.facts.scan_limits = Some(limits);
+        self
+    }
+
+    pub fn with_limit(mut self, limit: usize) -> Self {
+        self.facts.configured_limit = Some(limit);
+        self
+    }
+
+    pub fn analysis_failed(
+        payload: impl Into<LocatedCallRelationDiagnostic>,
+        context: String,
+        reason_kind: String,
+    ) -> Self {
+        let mut diagnostic =
+            Self::new(CallRelationDiagnosticCode::AnalysisFailed, payload, context);
+        diagnostic.reason_kind = Some(reason_kind);
+        diagnostic
+    }
+
+    pub fn message(&self) -> String {
+        use CallRelationDiagnosticPayload::*;
+        let loc = || {
+            self.location
+                .first()
+                .expect("diagnostic presentation location")
+        };
+        let range = || loc().range.expect("diagnostic presentation range");
+        match &self.facts.payload {
+            IncomingScanGrantRefused {
+                target,
+                path,
+                limit,
+            } => format!("incoming call scan grant refused {limit:?} for {target} in {path}"),
+            BudgetFileOmitted => format!("call relation budget omitted {}", loc().file),
+            BudgetOmitted { subject } => format!("call relation budget omitted {subject}"),
+            SourceBudgetRefused { target } => format!(
+                "call relation source-byte budget refused {} for {target}",
+                loc().file.rel_path().display()
+            ),
+            SourceBudgetTruncated { target } => {
+                format!("call relation source-byte budget truncated candidate files for {target}")
+            }
+            FileBudgetTruncated { target } => {
+                format!("call relation file budget truncated candidate files for {target}")
+            }
+            RetainedCandidates { target, limit } => {
+                format!("call relation retained the first {limit} call candidates for {target}")
+            }
+            NavigationTruncated { target } => {
+                format!("call relation target navigation was truncated for {target}")
+            }
+            ParseFailed => format!("failed to parse {}", loc().file),
+            IndexedSourceUnavailable => format!("indexed source is unavailable for {}", loc().file),
+            DeclarationRangeUnavailable { target } => {
+                format!("declaration range is unavailable for {target}")
+            }
+            OutgoingAmbiguous { target, count } => format!(
+                "call targets for {target} were ambiguous at {count} candidate site{}; all candidates are unproven",
+                if *count == 1 { "" } else { "s" }
+            ),
+            OutgoingOmitted { target, count } => format!(
+                "omitted {count} unresolved call candidate{} for {target}",
+                if *count == 1 { "" } else { "s" }
+            ),
+            IncomingOmitted { target, count } => format!(
+                "omitted {count} incoming call candidate{} for {target} because exact caller or call syntax was unavailable",
+                if *count == 1 { "" } else { "s" }
+            ),
+            UnprovenOmitted { target, count } => {
+                format!("omitted {count} unproven call candidates for {target}")
+            }
+            TooManyCandidates {
+                target,
+                total,
+                limit,
+            } => format!("found {total} call candidates for {target}, retaining the first {limit}"),
+            IncomingAmbiguous { target, signature } | IncomingUnproven { target, signature } => {
+                let target_file = loc().file.rel_path().to_string_lossy().replace('\\', "/");
+                let sites = self
+                    .location
+                    .iter()
+                    .skip(1)
+                    .map(|location| {
+                        (
+                            crate::path_utils::rel_path_string(&location.file),
+                            location.range.expect("call range"),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if matches!(&self.facts.payload, IncomingAmbiguous { .. }) {
+                    format!(
+                        "incoming call target identity was ambiguous for {target} {signature:?} in {target_file} at {sites:?}; all candidates are unproven"
+                    )
+                } else {
+                    format!(
+                        "incoming call target identity was unproven for {target} {signature:?} in {target_file} at {sites:?}"
+                    )
+                }
+            }
+            UsageIncomplete { diagnostics } => {
+                format!("Usage analysis is incomplete: {diagnostics:?}")
+            }
+            Failure { reason } => match reason {
+                CallRelationFailure::Unavailable => "selected call relation is unavailable".into(),
+                CallRelationFailure::Stale => "selected call relation is stale".into(),
+                CallRelationFailure::StoreError => "selected call relation failed".into(),
+                CallRelationFailure::InputUnavailable => {
+                    "call relation input is unavailable".into()
+                }
+                CallRelationFailure::Upstream { kind } => {
+                    format!("call relation analysis failed: {kind}")
+                }
+            },
+            RustInventory { completion } => {
+                format!("caller source reference inventory: {completion:?}")
+            }
+            RustShape { coverage } => format!("call shape is {coverage:?} at {:?}", range()),
+            GoShape { coverage } => format!("Go call shape is {coverage:?} at {:?}", range()),
+            RustStructuredReferenceUnavailable => {
+                format!("call has no structured callee reference at {:?}", range())
+            }
+            RustReferenceUnavailable => format!("call has no native reference at {:?}", range()),
+            RustCanonicalOwnerUnavailable => {
+                format!("call has no canonical owner at {:?}", range())
+            }
+            RustTargetUnavailable => format!(
+                "call at {:?} has no complete callable unit projection",
+                range()
+            ),
+            GoStructuredReferenceUnavailable => format!(
+                "Go call has no structured callee reference at {:?}",
+                range()
+            ),
+            GoSelectedReferenceUnavailable => {
+                format!("call has no selected native reference at {:?}", loc().range)
+            }
+            GoCanonicalOwnerUnavailable => format!(
+                "call has no canonical owner at {}..{}",
+                range().start_byte,
+                range().end_byte
+            ),
+            GoTargetUnavailable => format!(
+                "call at {}..{} has one or more targets without a callable workspace unit",
+                range().start_byte,
+                range().end_byte
+            ),
+            GoNoWorkspaceTarget {
+                site_kind,
+                namespace,
+                targets,
+                completion,
+            } => format!(
+                "call at {}..{} has no workspace target and no exact external proof; site kind {site_kind:?}, namespace {namespace:?}, targets {targets:?}, completion {completion:?}",
+                range().start_byte,
+                range().end_byte
+            ),
+            NativeUnavailable { reason } => format!("{reason:?}"),
+            NativeStale { reason } => format!("{reason:?}"),
+            RustAmbiguous { targets } => format!(
+                "native call at {:?} has ambiguous canonical targets: {targets:?}",
+                range()
+            ),
+            RustSelectedAmbiguous { targets } => {
+                format!(
+                    "selected Rust call for {} at {} {:?} has ambiguous targets: {targets:?}",
+                    self.context,
+                    crate::path_utils::rel_path_string(&loc().file),
+                    range()
+                )
+            }
+            RustIncomplete {
+                completion,
+                receivers,
+            } => format!(
+                "call resolution at {:?}: {completion:?}; receiver dispositions: {receivers:?}",
+                range()
+            ),
+            RustSelectedIncomplete {
+                completion,
+                receivers,
+            } => format!(
+                "selected Rust call for {} at {} {:?} has incomplete call-target evidence: {completion:?}; receiver dispositions: {receivers:?}",
+                self.context,
+                crate::path_utils::rel_path_string(&loc().file),
+                range()
+            ),
+            RustExternalTerminal => format!(
+                "native call at {:?} reaches a declared external terminal",
+                range()
+            ),
+            RustCandidateBound { .. } => {
+                format!("call at {:?} exceeds its candidate bound", range())
+            }
+            RustBudget { limit } => format!("native outgoing resolution exceeded {limit:?}"),
+            GoBudget { limit } => format!("native Go outgoing resolution exceeded {limit:?}"),
+            RustIncomingBudget { limits } => {
+                format!("selected Rust incoming call projection exceeded limits {limits:?}")
+            }
+            RustIncomingOmitted { lane, count } => format!(
+                "{count} incoming call sites kept unproven because the {lane} budget stopped their binding recheck"
+            ),
+            RustTargetNotCallable { target } => {
+                format!("native call target is not callable: {target:?}")
+            }
+            GoAmbiguous { targets } => format!(
+                "Go call at {}..{} has ambiguous canonical targets: {targets:?}",
+                range().start_byte,
+                range().end_byte
+            ),
+            GoCandidateBound { .. } => format!(
+                "Go call at {}..{} exceeds its candidate bound",
+                range().start_byte,
+                range().end_byte
+            ),
+            GoIncomplete {
+                completion,
+                receivers,
+            } => format!(
+                "call resolution at {}..{}: {completion:?}; receiver dispositions: {receivers:?}",
+                range().start_byte,
+                range().end_byte
+            ),
+            GoExternalReceiver { target } => {
+                format!("external Go receiver member {target} has no indexed declaration")
+            }
+            GoIncomingBudget { target } => {
+                format!("native Go incoming-call budget omitted {target}")
+            }
+            JavaIncomingBudget { target } => {
+                format!("native Java incoming-call budget omitted {target}")
+            }
+            RustFactsUnavailable => {
+                format!("structured Rust facts are unavailable in {}", loc().file)
+            }
+            GoFactsUnavailable => {
+                format!("Go structural call facts are unavailable: {}", loc().file)
+            }
+            JavaFactsUnavailable => {
+                format!("Java structural call facts are unavailable: {}", loc().file)
+            }
+            RustOwnerUnavailable { enclosing }
+            | GoOwnerUnavailable { enclosing }
+            | JavaOwnerUnavailable { enclosing } => {
+                let language = match &self.facts.payload {
+                    RustOwnerUnavailable { .. } => "Rust",
+                    GoOwnerUnavailable { .. } => "Go",
+                    _ => "Java",
+                };
+                format!(
+                    "selected {language} call at {} {:?} has no callable owner; enclosing: {enclosing:?}",
+                    crate::path_utils::rel_path_string(&loc().file),
+                    range()
+                )
+            }
+            GoSourceUnavailable => {
+                format!("selected Go call source is unavailable: {}", loc().file)
+            }
+            GoSourceStale => format!("selected Go call source changed: {}", loc().file),
+            GoStructuralSourceStale => {
+                format!("selected Go structural source changed: {}", loc().file)
+            }
+            JavaSourceUnavailable => {
+                format!("selected Java call source is unavailable: {}", loc().file)
+            }
+            JavaSourceStale => format!("selected Java call source changed: {}", loc().file),
+            JavaStructuralSourceStale => {
+                format!("selected Java structural source changed: {}", loc().file)
+            }
+            JavaParseFailed => format!("cannot parse selected Java call source: {}", loc().file),
+            JavaDispatchUnenumerable { target } => {
+                format!("Java dispatch can reach {target} without a selected inverse row")
+            }
+            JavaWithoutInvocation { target } => {
+                format!("no projected Java invocation certifies callers of {target}")
+            }
+            JavaBindingCount { count, enclosing } => format!(
+                "selected Java binding target count is {count:?} at {} {:?}; enclosing: {enclosing:?}",
+                crate::path_utils::rel_path_string(&loc().file),
+                range()
+            ),
+            JavaCallerIncomplete { kind } => format!(
+                "Java caller identity is incomplete at {:?}: {kind}",
+                range()
+            ),
+            RustInventoryIncomplete { target, reason } => format!(
+                "selected Rust reverse call inventory for {target} is incomplete: {reason:?}"
+            ),
+            GoInventoryIncomplete { target, reason } => format!(
+                "selected Go incoming-call inventory is incomplete for {target}: {reason:?}"
+            ),
+            JavaInventoryIncomplete { target, reason } => format!(
+                "selected Java incoming-call inventory is incomplete for {target}: {reason:?}"
+            ),
         }
     }
 }
@@ -607,6 +1899,59 @@ pub enum CallerInventoryCoverage {
     Unknown,
     Complete,
     Incomplete,
+}
+
+/// A refused admission, separate from work that was actually performed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallRelationBudgetRefusal {
+    Files {
+        consumed: usize,
+        limit: usize,
+    },
+    SourceBytes {
+        consumed: usize,
+        attempted: usize,
+        limit: usize,
+    },
+    Candidates {
+        consumed: usize,
+        limit: usize,
+    },
+}
+
+impl CallRelationBudgetRefusal {
+    /// Name the first zero admission allowance before a provider starts work.
+    pub fn preflight(limits: CallRelationLimits) -> Option<Self> {
+        if limits.max_files == 0 {
+            Some(Self::Files {
+                consumed: 0,
+                limit: 0,
+            })
+        } else if limits.max_source_bytes == 0 {
+            Some(Self::SourceBytes {
+                consumed: 0,
+                attempted: 0,
+                limit: 0,
+            })
+        } else if limits.max_candidates == 0 {
+            Some(Self::Candidates {
+                consumed: 0,
+                limit: 0,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Keep one real refusal per dimension; later files need not grow telemetry.
+    pub fn record(self, refusals: &mut Vec<Self>) {
+        if !refusals
+            .iter()
+            .any(|known| std::mem::discriminant(known) == std::mem::discriminant(&self))
+        {
+            refusals.push(self);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -630,6 +1975,38 @@ pub struct CallRelationResult {
     /// registered provider's answer is stamped with that provider's authority.
     pub proof_authority: UsageProofAuthority,
     pub work: CallRelationWork,
+    /// Request-local telemetry; a refusal need not consume any work.
+    pub budget_refusals: Vec<CallRelationBudgetRefusal>,
+}
+
+impl CallRelationResult {
+    /// A scan provider, rather than a downstream consumer, refused the grant.
+    pub fn scan_grant_refused(&self) -> bool {
+        self.diagnostics.iter().any(|diagnostic| {
+            matches!(
+                diagnostic.code,
+                CallRelationDiagnosticCode::ScanGrantRefused(_)
+            )
+        })
+    }
+}
+
+impl CallRelationResult {
+    /// Only cap-bearing evidence records the scan grant. Ordinary complete
+    /// answers remain independent of unused allowance.
+    pub fn with_diagnostic_limits(mut self, limits: CallRelationLimits) -> Self {
+        for diagnostic in &mut self.diagnostics {
+            if matches!(
+                diagnostic.code,
+                CallRelationDiagnosticCode::BudgetExhausted
+                    | CallRelationDiagnosticCode::ScanGrantRefused(_)
+                    | CallRelationDiagnosticCode::CandidateLimit
+            ) {
+                diagnostic.facts.scan_limits = Some(limits);
+            }
+        }
+        self
+    }
 }
 
 /// A language-owned call relation authority. Once registered, both directions
@@ -693,7 +2070,7 @@ pub trait CallRelationProvider: Send + Sync {
 }
 
 /// Domain for the digest of one call-relation answer.
-const CALL_RELATION_ANSWER_DOMAIN: &[u8] = b"bifrost-read-ledger:call-relation-answer:v1";
+const CALL_RELATION_ANSWER_DOMAIN: &[u8] = b"bifrost-read-ledger:call-relation-answer:v3";
 
 /// Record the callers or callees answer for one declaration.
 ///
@@ -721,6 +2098,17 @@ fn record_call_relation_read(
     for (file, _) in &result.external_terminal_sites {
         crate::analyzer::record_position_read(analyzer, file);
     }
+    // Semantic call answers ignore coordinates. A consumer retaining rendered
+    // diagnostic coordinates still owes the same presentation read as a site.
+    for location in result
+        .diagnostics
+        .iter()
+        .flat_map(|diagnostic| &diagnostic.location)
+    {
+        if location.range.is_some() {
+            crate::analyzer::record_position_read(analyzer, &location.file);
+        }
+    }
     analyzer.record_read(crate::analyzer::read_ledger::ReadKey::lookup(
         kind,
         crate::analyzer::read_ledger::LookupQuestion::declaration(subject),
@@ -730,10 +2118,10 @@ fn record_call_relation_read(
 
 /// The canonical digest of one call-relation answer.
 ///
-/// Public to the crate because verification replays the same funnel against
-/// the head workspace and must compute the answer digest with this function
-/// rather than a second copy of it.
-pub(crate) fn call_relation_answer_digest(
+/// Verification and real-producer regression fixtures share this codec rather
+/// than maintaining a second implementation.
+#[doc(hidden)]
+pub fn call_relation_answer_digest(
     result: &CallRelationResult,
 ) -> crate::analyzer::semantic::ids::StableDigest {
     let mut sites = result
@@ -746,6 +2134,10 @@ pub(crate) fn call_relation_answer_digest(
                 site.range.end_byte,
                 site.caller.fq_name(),
                 site.callee.fq_name(),
+                match site.proof {
+                    UsageProof::Proven => 0_u8,
+                    UsageProof::Unproven => 1_u8,
+                },
             )
         })
         .collect::<Vec<_>>();
@@ -766,6 +2158,13 @@ pub(crate) fn call_relation_answer_digest(
     external_terminal_sites.dedup();
     let mut hasher =
         crate::analyzer::canonical_hash::CanonicalHasher::new(CALL_RELATION_ANSWER_DOMAIN);
+    hasher.field(
+        "proof_authority",
+        &[match result.proof_authority {
+            UsageProofAuthority::Legacy => 0,
+            UsageProofAuthority::Native => 1,
+        }],
+    );
     // A truncated or cancelled answer is a different fact about the workspace
     // from a complete one that happens to hold the same sites.
     hasher.field("truncated", &[u8::from(result.truncated)]);
@@ -778,9 +2177,7 @@ pub(crate) fn call_relation_answer_digest(
             CallerInventoryCoverage::Incomplete => 2,
         }],
     );
-    // #8407 will replace diagnostic text with structured semantic payloads.
-    // Until then keep the text: it exposes counts, targets and other observable
-    // facts even when incomplete or ambiguous diagnostics also carry positions.
+    // Presentation coordinates never participate in semantic read identity (#8407).
     let mut diagnostics = result
         .diagnostics
         .iter()
@@ -789,17 +2186,28 @@ pub(crate) fn call_relation_answer_digest(
                 diagnostic.code,
                 diagnostic.reason_kind.as_deref(),
                 diagnostic.context.as_str(),
-                diagnostic.message.as_str(),
+                diagnostic.facts.answer_digest(),
                 diagnostic.semantic_count,
             )
         })
         .collect::<Vec<_>>();
     diagnostics.sort();
-    for (code, reason, context, message, count) in diagnostics {
-        hasher.field("diagnostic", format!("{code:?}").as_bytes());
+    for (code, reason, context, facts, count) in diagnostics {
+        let tag = match code {
+            CallRelationDiagnosticCode::BudgetExhausted => 0,
+            CallRelationDiagnosticCode::ParseFailed => 1,
+            CallRelationDiagnosticCode::CandidatesOmitted => 2,
+            CallRelationDiagnosticCode::TargetsAmbiguous => 3,
+            CallRelationDiagnosticCode::CandidateLimit => 4,
+            CallRelationDiagnosticCode::AnalysisFailed => 5,
+            CallRelationDiagnosticCode::ExternalBoundary => 6,
+            CallRelationDiagnosticCode::ScanGrantRefused(CallRelationScanLimit::Files) => 7,
+            CallRelationDiagnosticCode::ScanGrantRefused(CallRelationScanLimit::SourceBytes) => 8,
+        };
+        hasher.field("diagnostic", &[tag]);
         hasher.field("reason", reason.unwrap_or("").as_bytes());
         hasher.field("context", context.as_bytes());
-        hasher.field("message", message.as_bytes());
+        hasher.field("facts", &facts);
         hasher.field(
             "count",
             &count
@@ -808,10 +2216,11 @@ pub(crate) fn call_relation_answer_digest(
                 .to_be_bytes(),
         );
     }
-    for (rank, (path, _, _, caller, callee)) in sites.into_iter().enumerate() {
+    for (rank, (path, _, _, caller, callee, proof)) in sites.into_iter().enumerate() {
         hasher.field(&path, &(rank as u64).to_be_bytes());
         hasher.field("caller", caller.as_bytes());
         hasher.field("callee", callee.as_bytes());
+        hasher.field("proof", &[proof]);
     }
     for (path, start, end) in external_terminal_sites {
         hasher.field("external_path", path.as_bytes());
@@ -969,13 +2378,26 @@ impl CallBindingCache {
         operation: impl FnOnce(&mut Self) -> T,
     ) -> T {
         let previous = self.reads.take();
-        let (value, reads) = super::common::capture_memo_reads(analyzer, || {
-            if let Some(previous) = previous {
-                crate::analyzer::usages::common::replay_memo_reads(&previous, analyzer);
-            }
-            operation(self)
-        });
-        self.reads = Some(reads);
+        let (value, reads) = super::common::capture_mutable_memo_reads(
+            super::common::QueryMemoOwner::CallBinding,
+            analyzer,
+            self,
+            previous.as_ref(),
+            |cache| {
+                let shared = cache.shared_call_targets.take();
+                if let Some(shared) = &shared {
+                    shared
+                        .prefetches
+                        .lock()
+                        .expect("call-target outcome cache lock poisoned")
+                        .clear();
+                }
+                *cache = Self::default();
+                cache.shared_call_targets = shared;
+            },
+            |cache| operation(cache),
+        );
+        self.reads = reads;
         value
     }
 
@@ -998,7 +2420,7 @@ impl CallBindingCache {
         caller_source: Option<(&ProjectFile, &str)>,
         candidates: &[(String, crate::analyzer::semantic_model::Signature)],
     ) -> Result<
-        Option<(String, crate::analyzer::semantic_model::Signature)>,
+        Option<crate::analyzer::usages::call_conversion::ModelSignatureSelection>,
         crate::analyzer::usages::call_conversion::ConversionUnknown,
     > {
         self.with_read_capture(analyzer, |cache| {
@@ -1033,7 +2455,7 @@ impl CallBindingCache {
         caller_source: Option<(&ProjectFile, &str)>,
         candidates: &[(String, crate::analyzer::semantic_model::Signature)],
     ) -> Result<
-        Option<(String, crate::analyzer::semantic_model::Signature)>,
+        Option<crate::analyzer::usages::call_conversion::ModelSignatureSelection>,
         crate::analyzer::usages::call_conversion::ConversionUnknown,
     > {
         self.conversions
@@ -1580,15 +3002,20 @@ impl CallBindingCache {
                     && let Some(tree) = parse_tree_for_language(&file, Language::Python, &source)
                 {
                     let evidence = ExternalCalleeFileEvidence::default();
+                    let mut definition_session =
+                        super::get_definition::ScalarCallTargetSession::new(analyzer);
                     for (range, outcome) in ranges.iter().zip(&mut outcomes) {
                         *outcome = expand_python_call_target_identity(
                             analyzer,
                             &file,
-                            &source,
-                            &tree,
-                            *range,
-                            &evidence,
+                            &ExternalCalleeSite {
+                                source: &source,
+                                tree: &tree,
+                                callee_start_byte: range.start_byte,
+                                file_evidence: &evidence,
+                            },
                             outcome.clone(),
+                            &mut definition_session,
                         );
                     }
                 }
@@ -1713,15 +3140,20 @@ impl CallBindingCache {
                 && let Some(tree) = parse_tree_for_language(file, Language::Python, &source)
             {
                 let file_evidence = ExternalCalleeFileEvidence::default();
+                let mut definition_session =
+                    super::get_definition::ScalarCallTargetSession::new(analyzer);
                 for (range, outcome) in ranges.iter().zip(&mut outcomes) {
                     *outcome = expand_python_call_target_identity(
                         analyzer,
                         file,
-                        &source,
-                        &tree,
-                        *range,
-                        &file_evidence,
+                        &ExternalCalleeSite {
+                            source: &source,
+                            tree: &tree,
+                            callee_start_byte: range.start_byte,
+                            file_evidence: &file_evidence,
+                        },
                         outcome.clone(),
+                        &mut definition_session,
                     );
                 }
             }
@@ -1871,25 +3303,26 @@ fn append_outgoing_candidate_diagnostics(
     // the completeness-bearing outcome and we must not claim all candidates
     // were emitted as unproven.
     if ambiguous > 0 && retained_ambiguous == ambiguous {
-        diagnostics.push(CallRelationDiagnostic::new(
-            CallRelationDiagnosticCode::TargetsAmbiguous,
-            format!(
-                "call targets for {} were ambiguous at {ambiguous} candidate site{}; all candidates are unproven",
-                caller.fq_name(),
-                if ambiguous == 1 { "" } else { "s" }
-            ),
-            caller.fq_name().to_string(),
-        ).with_count(ambiguous));
+        diagnostics.push(
+            CallRelationDiagnostic::new(
+                CallRelationDiagnosticCode::TargetsAmbiguous,
+                CallRelationDiagnosticPayload::OutgoingAmbiguous {
+                    target: caller.fq_name().to_string(),
+                    count: ambiguous,
+                },
+                caller.fq_name().to_string(),
+            )
+            .with_count(ambiguous),
+        );
     }
     if omitted > 0 {
         diagnostics.push(
             CallRelationDiagnostic::new(
                 CallRelationDiagnosticCode::CandidatesOmitted,
-                format!(
-                    "omitted {omitted} unresolved call candidate{} for {}",
-                    if omitted == 1 { "" } else { "s" },
-                    caller.fq_name()
-                ),
+                CallRelationDiagnosticPayload::OutgoingOmitted {
+                    target: caller.fq_name().to_string(),
+                    count: omitted,
+                },
                 caller.fq_name().to_string(),
             )
             .with_count(omitted),
@@ -2038,23 +3471,33 @@ fn refine_incoming_call_targets(
         // Reverse-caller consumers must be able to retain all these edges.
         diagnostics.push(CallRelationDiagnostic::new(
             CallRelationDiagnosticCode::TargetsAmbiguous,
-            format!(
-                "incoming call target identity was ambiguous for {} {:?} in {} at {ambiguous_sites:?}; all candidates are unproven",
-                target.fq_name(),
-                target.signature(),
-                crate::path_utils::rel_path_string(target.source())
-            ),
+            CallRelationDiagnosticPayload::IncomingAmbiguous {
+                target: target.fq_name().to_string(),
+                signature: target.signature().map(str::to_owned),
+            }
+            .at(target.source(), None)
+            .at_locations(ambiguous_sites.iter().map(|(path, range)| {
+                CallRelationDiagnosticLocation {
+                    file: ProjectFile::new(target.source().root().to_path_buf(), path),
+                    range: Some(*range),
+                }
+            })),
             target.fq_name().to_string(),
         ));
     }
     if !unproven_sites.is_empty() {
         diagnostics.push(CallRelationDiagnostic::analysis_failed(
-            format!(
-                "incoming call target identity was unproven for {} {:?} in {} at {unproven_sites:?}",
-                target.fq_name(),
-                target.signature(),
-                crate::path_utils::rel_path_string(target.source())
-            ),
+            CallRelationDiagnosticPayload::IncomingUnproven {
+                target: target.fq_name().to_string(),
+                signature: target.signature().map(str::to_owned),
+            }
+            .at(target.source(), None)
+            .at_locations(unproven_sites.iter().map(|(path, range)| {
+                CallRelationDiagnosticLocation {
+                    file: ProjectFile::new(target.source().root().to_path_buf(), path),
+                    range: Some(*range),
+                }
+            })),
             target.fq_name().to_string(),
             "incoming_call_target_unproven".to_string(),
         ));
@@ -2076,15 +3519,17 @@ pub fn append_incoming_projection_omission(
     // that advisory for this incoming scan.
     diagnostics
         .retain(|diagnostic| diagnostic.code != CallRelationDiagnosticCode::TargetsAmbiguous);
-    diagnostics.push(CallRelationDiagnostic::new(
-        CallRelationDiagnosticCode::CandidatesOmitted,
-        format!(
-            "omitted {omitted} incoming call candidate{} for {} because exact caller or call syntax was unavailable",
-            if omitted == 1 { "" } else { "s" },
-            target.fq_name()
-        ),
-        target.fq_name().to_string(),
-    ).with_count(omitted));
+    diagnostics.push(
+        CallRelationDiagnostic::new(
+            CallRelationDiagnosticCode::CandidatesOmitted,
+            CallRelationDiagnosticPayload::IncomingOmitted {
+                target: target.fq_name().to_string(),
+                count: omitted,
+            },
+            target.fq_name().to_string(),
+        )
+        .with_count(omitted),
+    );
 }
 
 impl CallDispatchSession {
@@ -2245,9 +3690,14 @@ impl CallDispatchSession {
         call_span: &Range,
         max_candidates: usize,
         cancellation: Option<&CancellationToken>,
-        mut definition_session: Option<&mut super::get_definition::ScalarCallTargetSession<'a>>,
+        definition_session: Option<&mut super::get_definition::ScalarCallTargetSession<'a>>,
         member_selection: Option<&crate::analyzer::semantic::DeferredMemberSelection>,
     ) -> CallDispatchLookup {
+        let mut fallback_session = super::get_definition::ScalarCallTargetSession::new(analyzer);
+        let mut definition_session = Some(match definition_session {
+            Some(session) => session,
+            None => &mut fallback_session,
+        });
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return CallDispatchLookup {
                 cancelled: true,
@@ -2328,6 +3778,7 @@ impl CallDispatchSession {
             file: &self.file,
             source: &self.exact_source,
             tree,
+            macro_inventory: syntax.macro_inventories.get(&tree.root_node().id()),
             call_span,
             member_selection,
             cancellation,
@@ -2469,7 +3920,7 @@ impl CallDispatchSession {
                 outcome,
                 Some(&site),
                 self.prefetched_expansions.get(&callee_key),
-                definition_session,
+                definition_session.as_deref_mut(),
             ),
             max_candidates,
             self.language,
@@ -2482,6 +3933,7 @@ impl CallDispatchSession {
             token,
             &self.file,
             &site,
+            definition_session,
         );
         refine_selector_call_target_at_call(
             &mut lookup,
@@ -2513,6 +3965,7 @@ fn refine_selector_call_target_at_call(
     if let Some(support) =
         language_support_for_hook(language_for_file(file), "refine_selector_call_target")
     {
+        let mut reuse = crate::analyzer::reuse_verdict::ReuseVerdict::Content;
         support.refine_selector_call_target(
             lookup,
             analyzer,
@@ -2523,7 +3976,11 @@ fn refine_selector_call_target_at_call(
             callee_range,
             cancellation,
             member_selection,
+            &mut reuse,
         );
+        // The dispatch lookup cannot carry a verdict; it joins the current
+        // captures, where the hook's ambient mark went.
+        analyzer.join_reuse_verdict(reuse);
     }
 }
 
@@ -2649,6 +4106,7 @@ impl CallRelationService {
                         file,
                         source: &exact_source,
                         tree,
+                        macro_inventory: syntax.macro_inventories.get(&tree.root_node().id()),
                         call_span,
                         member_selection: None,
                         cancellation,
@@ -2677,6 +4135,10 @@ impl CallRelationService {
             .iter()
             .map(|(_, range)| *range)
             .collect::<Vec<_>>();
+        // One session holds the language's batch operation for the whole file,
+        // so each call's expansion and refinement read through the operation
+        // that resolved it, as `CallDispatchSession` does.
+        let mut definition_session = super::get_definition::ScalarCallTargetSession::new(analyzer);
         let batch = resolve_call_references_with_source(
             analyzer,
             token,
@@ -2686,7 +4148,7 @@ impl CallRelationService {
             &syntax.primary,
             &references,
             cancellation,
-            None,
+            Some(&mut definition_session),
         );
         // One memo for the whole file: every site below classifies its callee
         // against the same exact source and admitted syntax forest.
@@ -2710,12 +4172,27 @@ impl CallRelationService {
             apply_call_target_outcome(
                 Some(analyzer),
                 &mut lookup,
-                expand_imported_external_callee(analyzer, file, outcome, Some(&site)),
+                expand_imported_external_callee_with_prefetched(
+                    analyzer,
+                    file,
+                    outcome,
+                    Some(&site),
+                    None,
+                    Some(&mut definition_session),
+                ),
                 limits.max_candidates,
                 language,
                 Some(&site),
             );
-            refine_resolved_call_target_proofs(&mut lookup, language, analyzer, token, file, &site);
+            refine_resolved_call_target_proofs(
+                &mut lookup,
+                language,
+                analyzer,
+                token,
+                file,
+                &site,
+                Some(&mut definition_session),
+            );
             if language == Language::Go {
                 refine_selector_call_target_at_call(
                     &mut lookup,
@@ -2861,7 +4338,9 @@ impl CallRelationService {
             .iter()
             .zip(answers)
             .map(|(target, answer)| {
-                let result = answer.expect("every incoming target has an answer");
+                let result = answer
+                    .expect("every incoming target has an answer")
+                    .with_diagnostic_limits(limits);
                 record_call_relation_read(
                     analyzer,
                     crate::analyzer::read_ledger::LookupKind::Callers,
@@ -2883,14 +4362,25 @@ impl CallRelationService {
         if !is_call_relation_unit(target) {
             return Some(CallRelationResult::default());
         }
-        if limits.max_files == 0 || limits.max_source_bytes == 0 || limits.max_candidates == 0 {
+        if let Some(budget_refusal) = CallRelationBudgetRefusal::preflight(limits) {
             let context = target.fq_name().to_string();
             return Some(CallRelationResult {
                 caller_inventory: CallerInventoryCoverage::Incomplete,
                 truncated: true,
+                budget_refusals: vec![budget_refusal],
                 diagnostics: vec![CallRelationDiagnostic::new(
-                    CallRelationDiagnosticCode::BudgetExhausted,
-                    format!("call relation budget omitted {}", target.fq_name()),
+                    if limits.max_files == 0 {
+                        CallRelationDiagnosticCode::ScanGrantRefused(CallRelationScanLimit::Files)
+                    } else if limits.max_source_bytes == 0 {
+                        CallRelationDiagnosticCode::ScanGrantRefused(
+                            CallRelationScanLimit::SourceBytes,
+                        )
+                    } else {
+                        CallRelationDiagnosticCode::BudgetExhausted
+                    },
+                    CallRelationDiagnosticPayload::BudgetOmitted {
+                        subject: target.fq_name().to_string(),
+                    },
                     context,
                 )],
                 ..CallRelationResult::default()
@@ -2952,10 +4442,15 @@ impl CallRelationService {
             // Admit bytes before deriving occurrences or resolving the file.
             // As in the reverse projection, a refused source has no sites and
             // consumes no file, byte, or candidate work.
-            let source_exceeds_budget = !cancellation.is_some_and(CancellationToken::is_cancelled)
-                && analyzer
+            let refused_source_bytes = if cancellation.is_some_and(CancellationToken::is_cancelled)
+            {
+                None
+            } else {
+                analyzer
                     .indexed_source(file)
-                    .is_some_and(|source| source.len() > limits.max_source_bytes);
+                    .map(|source| source.len())
+                    .filter(|&bytes| bytes > limits.max_source_bytes)
+            };
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 for index in indices {
                     answers[index] = Some(CallRelationResult {
@@ -2968,19 +4463,25 @@ impl CallRelationService {
                     provider, targets, answers, limits,
                 ));
             }
-            if source_exceeds_budget {
+            if let Some(attempted) = refused_source_bytes {
                 for index in indices {
                     let target = &targets[index];
                     answers[index] = Some(CallRelationResult {
                         caller_inventory: CallerInventoryCoverage::Incomplete,
                         truncated: true,
+                        budget_refusals: vec![CallRelationBudgetRefusal::SourceBytes {
+                            consumed: 0,
+                            attempted,
+                            limit: limits.max_source_bytes,
+                        }],
                         diagnostics: vec![CallRelationDiagnostic::new(
-                            CallRelationDiagnosticCode::BudgetExhausted,
-                            format!(
-                                "call relation source-byte budget refused {} for {}",
-                                file.rel_path().display(),
-                                target.fq_name()
+                            CallRelationDiagnosticCode::ScanGrantRefused(
+                                CallRelationScanLimit::SourceBytes,
                             ),
+                            CallRelationDiagnosticPayload::SourceBudgetRefused {
+                                target: target.fq_name().to_string(),
+                            }
+                            .at(file, None),
                             target.fq_name().to_string(),
                         )],
                         ..CallRelationResult::default()
@@ -3045,7 +4546,7 @@ impl CallRelationService {
                 if Self::incoming_preflight(target, limits).is_none() {
                     answer.proof_authority = provider.proof_authority();
                 }
-                answer
+                answer.with_diagnostic_limits(limits)
             })
             .collect()
     }
@@ -3078,6 +4579,22 @@ impl CallRelationService {
         cancellation: Option<&CancellationToken>,
         query: super::finder::QueryResult,
     ) -> CallRelationResult {
+        let mut budget_refusals = Vec::new();
+        if query.candidate_files_budget_exhausted {
+            CallRelationBudgetRefusal::Files {
+                consumed: limits.max_files,
+                limit: limits.max_files,
+            }
+            .record(&mut budget_refusals);
+        }
+        if let Some((consumed, attempted, limit)) = query.source_byte_refusal {
+            CallRelationBudgetRefusal::SourceBytes {
+                consumed,
+                attempted,
+                limit,
+            }
+            .record(&mut budget_refusals);
+        }
         let mut work = CallRelationWork {
             scanned_files: query.candidate_files.len(),
             scanned_source_bytes: query.scanned_source_bytes,
@@ -3087,21 +4604,19 @@ impl CallRelationService {
         let (mut hits, mut truncated, mut diagnostics) = call_hits(query.result, target);
         if query.source_bytes_truncated {
             diagnostics.push(CallRelationDiagnostic::new(
-                CallRelationDiagnosticCode::BudgetExhausted,
-                format!(
-                    "call relation source-byte budget truncated candidate files for {}",
-                    target.fq_name()
-                ),
+                CallRelationDiagnosticCode::ScanGrantRefused(CallRelationScanLimit::SourceBytes),
+                CallRelationDiagnosticPayload::SourceBudgetTruncated {
+                    target: target.fq_name().to_string(),
+                },
                 target.fq_name().to_string(),
             ));
         }
-        if query.candidate_files_truncated {
+        if query.candidate_files_budget_exhausted {
             diagnostics.push(CallRelationDiagnostic::new(
-                CallRelationDiagnosticCode::BudgetExhausted,
-                format!(
-                    "call relation file budget truncated candidate files for {}",
-                    target.fq_name()
-                ),
+                CallRelationDiagnosticCode::ScanGrantRefused(CallRelationScanLimit::Files),
+                CallRelationDiagnosticPayload::FileBudgetTruncated {
+                    target: target.fq_name().to_string(),
+                },
                 target.fq_name().to_string(),
             ));
         }
@@ -3126,15 +4641,22 @@ impl CallRelationService {
         });
         if hits.len() > limits.max_candidates {
             truncated = true;
-            diagnostics.push(CallRelationDiagnostic::new(
-                CallRelationDiagnosticCode::CandidateLimit,
-                format!(
-                    "call relation retained the first {} call candidates for {}",
-                    limits.max_candidates,
-                    target.fq_name()
-                ),
-                target.fq_name().to_string(),
-            ));
+            CallRelationBudgetRefusal::Candidates {
+                consumed: limits.max_candidates,
+                limit: limits.max_candidates,
+            }
+            .record(&mut budget_refusals);
+            diagnostics.push(
+                CallRelationDiagnostic::new(
+                    CallRelationDiagnosticCode::CandidateLimit,
+                    CallRelationDiagnosticPayload::RetainedCandidates {
+                        target: target.fq_name().to_string(),
+                        limit: limits.max_candidates,
+                    },
+                    target.fq_name().to_string(),
+                )
+                .with_count(hits.len().saturating_sub(limits.max_candidates)),
+            );
         }
         hits.truncate(limits.max_candidates);
         for (hit, proof) in hits {
@@ -3204,6 +4726,9 @@ impl CallRelationService {
                 cancellation,
             );
             work.add(recursive.work);
+            for refusal in recursive.budget_refusals {
+                refusal.record(&mut budget_refusals);
+            }
             truncated |= recursive.truncated;
             cancelled |= recursive.cancelled;
             diagnostics.extend(recursive.diagnostics);
@@ -3217,17 +4742,25 @@ impl CallRelationService {
 
         sort_and_dedup_sites(&mut sites);
         if sites.len() > limits.max_candidates {
+            let omitted = sites.len().saturating_sub(limits.max_candidates);
             sites.truncate(limits.max_candidates);
             truncated = true;
-            diagnostics.push(CallRelationDiagnostic::new(
-                CallRelationDiagnosticCode::CandidateLimit,
-                format!(
-                    "call relation retained the first {} call candidates for {}",
-                    limits.max_candidates,
-                    target.fq_name()
-                ),
-                target.fq_name().to_string(),
-            ));
+            CallRelationBudgetRefusal::Candidates {
+                consumed: limits.max_candidates,
+                limit: limits.max_candidates,
+            }
+            .record(&mut budget_refusals);
+            diagnostics.push(
+                CallRelationDiagnostic::new(
+                    CallRelationDiagnosticCode::CandidateLimit,
+                    CallRelationDiagnosticPayload::RetainedCandidates {
+                        target: target.fq_name().to_string(),
+                        limit: limits.max_candidates,
+                    },
+                    target.fq_name().to_string(),
+                )
+                .with_count(omitted),
+            );
         }
         diagnostics.sort();
         diagnostics.dedup();
@@ -3240,6 +4773,7 @@ impl CallRelationService {
             caller_inventory: CallerInventoryCoverage::Unknown,
             proof_authority: UsageProofAuthority::Legacy,
             work,
+            budget_refusals,
         }
     }
 
@@ -3265,7 +4799,8 @@ impl CallRelationService {
         limits: CallRelationLimits,
         cancellation: Option<&CancellationToken>,
     ) -> CallRelationResult {
-        let result = Self::outgoing_bounded_inner(analyzer, token, caller, limits, cancellation);
+        let result = Self::outgoing_bounded_inner(analyzer, token, caller, limits, cancellation)
+            .with_diagnostic_limits(limits);
         record_call_relation_read(
             analyzer,
             crate::analyzer::read_ledger::LookupKind::Callees,
@@ -3293,13 +4828,24 @@ impl CallRelationService {
             answer.proof_authority = provider.proof_authority();
             return answer;
         }
-        if limits.max_files == 0 || limits.max_source_bytes == 0 || limits.max_candidates == 0 {
+        if let Some(refusal) = CallRelationBudgetRefusal::preflight(limits) {
             let context = caller.fq_name().to_string();
             return CallRelationResult {
                 truncated: true,
+                budget_refusals: vec![refusal],
                 diagnostics: vec![CallRelationDiagnostic::new(
-                    CallRelationDiagnosticCode::BudgetExhausted,
-                    format!("call relation budget omitted {}", caller.fq_name()),
+                    if limits.max_files == 0 {
+                        CallRelationDiagnosticCode::ScanGrantRefused(CallRelationScanLimit::Files)
+                    } else if limits.max_source_bytes == 0 {
+                        CallRelationDiagnosticCode::ScanGrantRefused(
+                            CallRelationScanLimit::SourceBytes,
+                        )
+                    } else {
+                        CallRelationDiagnosticCode::BudgetExhausted
+                    },
+                    CallRelationDiagnosticPayload::BudgetOmitted {
+                        subject: caller.fq_name().to_string(),
+                    },
                     context,
                 )],
                 ..CallRelationResult::default()
@@ -3318,7 +4864,8 @@ impl CallRelationService {
         else {
             return CallRelationResult {
                 diagnostics: vec![CallRelationDiagnostic::analysis_failed(
-                    format!("indexed source is unavailable for {}", caller.source()),
+                    CallRelationDiagnosticPayload::IndexedSourceUnavailable
+                        .at(caller.source(), None),
                     caller.fq_name().to_string(),
                     "indexed_source_unavailable".to_string(),
                 )],
@@ -3326,12 +4873,19 @@ impl CallRelationService {
             };
         };
         if source.len() > limits.max_source_bytes || limits.max_files == 0 {
-            let context = caller.source().to_string();
+            let context = caller.fq_name().to_string();
             return CallRelationResult {
                 truncated: true,
+                budget_refusals: vec![CallRelationBudgetRefusal::SourceBytes {
+                    consumed: 0,
+                    attempted: source.len(),
+                    limit: limits.max_source_bytes,
+                }],
                 diagnostics: vec![CallRelationDiagnostic::new(
-                    CallRelationDiagnosticCode::BudgetExhausted,
-                    format!("call relation budget omitted {}", caller.source()),
+                    CallRelationDiagnosticCode::ScanGrantRefused(
+                        CallRelationScanLimit::SourceBytes,
+                    ),
+                    CallRelationDiagnosticPayload::BudgetFileOmitted.at(caller.source(), None),
                     context,
                 )],
                 ..CallRelationResult::default()
@@ -3342,8 +4896,8 @@ impl CallRelationService {
             return CallRelationResult {
                 diagnostics: vec![CallRelationDiagnostic::new(
                     CallRelationDiagnosticCode::ParseFailed,
-                    format!("failed to parse {}", caller.source()),
-                    caller.source().to_string(),
+                    CallRelationDiagnosticPayload::ParseFailed.at(caller.source(), None),
+                    caller.fq_name().to_string(),
                 )],
                 ..CallRelationResult::default()
             };
@@ -3352,7 +4906,9 @@ impl CallRelationService {
         else {
             return CallRelationResult {
                 diagnostics: vec![CallRelationDiagnostic::analysis_failed(
-                    format!("declaration range is unavailable for {}", caller.fq_name()),
+                    CallRelationDiagnosticPayload::DeclarationRangeUnavailable {
+                        target: caller.fq_name().to_string(),
+                    },
                     caller.fq_name().to_string(),
                     "declaration_range_unavailable".to_string(),
                 )],
@@ -3363,17 +4919,25 @@ impl CallRelationService {
         let candidates =
             call_reference_ranges_in_tree(&tree, language, &caller_range, candidate_limit);
         let mut truncated = candidates.len() > limits.max_candidates;
+        let budget_refusals = if truncated {
+            vec![CallRelationBudgetRefusal::Candidates {
+                consumed: limits.max_candidates,
+                limit: limits.max_candidates,
+            }]
+        } else {
+            Vec::new()
+        };
         let mut diagnostics = truncated
             .then(|| {
                 CallRelationDiagnostic::new(
                     CallRelationDiagnosticCode::CandidateLimit,
-                    format!(
-                        "call relation retained the first {} call candidates for {}",
-                        limits.max_candidates,
-                        caller.fq_name()
-                    ),
+                    CallRelationDiagnosticPayload::RetainedCandidates {
+                        target: caller.fq_name().to_string(),
+                        limit: limits.max_candidates,
+                    },
                     caller.fq_name().to_string(),
                 )
+                .with_count(candidates.len().saturating_sub(limits.max_candidates))
             })
             .into_iter()
             .collect::<Vec<_>>();
@@ -3398,8 +4962,10 @@ impl CallRelationService {
         let mut retained_ambiguous = 0usize;
         let mut omitted = 0usize;
         let mut navigation_truncated = false;
+        let mut cancelled = batch.cancelled;
         for (candidate, outcome) in batch.resolved {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                cancelled = true;
                 break;
             }
             if outcome.exact_external_call.is_some() {
@@ -3466,10 +5032,9 @@ impl CallRelationService {
         {
             diagnostics.push(CallRelationDiagnostic::new(
                 CallRelationDiagnosticCode::CandidateLimit,
-                format!(
-                    "call relation target navigation was truncated for {}",
-                    caller.fq_name()
-                ),
+                CallRelationDiagnosticPayload::NavigationTruncated {
+                    target: caller.fq_name().to_string(),
+                },
                 caller.fq_name().to_string(),
             ));
         }
@@ -3485,7 +5050,7 @@ impl CallRelationService {
             sites,
             external_terminal_sites: Vec::new(),
             truncated,
-            cancelled: batch.cancelled,
+            cancelled,
             diagnostics,
             caller_inventory: CallerInventoryCoverage::Unknown,
             proof_authority: UsageProofAuthority::Legacy,
@@ -3494,6 +5059,7 @@ impl CallRelationService {
                 scanned_source_bytes: source.len(),
                 examined_candidates: candidates.len(),
             },
+            budget_refusals,
         }
     }
 }
@@ -3814,6 +5380,9 @@ fn expand_imported_external_callee_with_prefetched(
                     DefinitionLookupStatus::Incomplete
                 }
             };
+            outcome.outcome.add_incomplete_reason(
+                crate::analyzer::usages::get_definition::DefinitionLookupReason::Execution(cause),
+            );
             outcome.source_member_evidence = None;
             return ExpandedExternalCallee::unproven(outcome);
         }
@@ -3867,19 +5436,19 @@ fn expand_imported_external_callee_with_prefetched(
 fn expand_python_call_target_identity(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
-    source: &str,
-    tree: &tree_sitter::Tree,
-    callee_range: Range,
-    file_evidence: &ExternalCalleeFileEvidence,
+    site: &ExternalCalleeSite<'_>,
     outcome: CallTargetLookupOutcome,
+    definition_session: &mut super::get_definition::ScalarCallTargetSession<'_>,
 ) -> CallTargetLookupOutcome {
-    let site = ExternalCalleeSite {
-        source,
-        tree,
-        callee_start_byte: callee_range.start_byte,
-        file_evidence,
-    };
-    expand_imported_external_callee(analyzer, file, outcome, Some(&site)).outcome
+    expand_imported_external_callee_with_prefetched(
+        analyzer,
+        file,
+        outcome,
+        Some(site),
+        None,
+        Some(definition_session),
+    )
+    .outcome
 }
 
 fn python_callee_text<'a>(site: &ExternalCalleeSite<'a>) -> Option<&'a str> {
@@ -3984,6 +5553,7 @@ fn apply_call_target_outcome(
         .map(|(_, reason)| Box::<str>::from(reason));
     let CallTargetLookupOutcome {
         source_member_evidence,
+        fixed_array_source: _,
         native_resolution,
         model_member_selection,
         outcome,
@@ -4098,6 +5668,9 @@ fn apply_dispatch_outcome_with_flags(
     normalized_static_owner: Option<Box<str>>,
 ) {
     let DefinitionLookupOutcome {
+        selected_sites: _,
+        inventory_evidence: _,
+        incomplete_evidence: _,
         modeled_definitions,
         status,
         mut definitions,
@@ -4319,7 +5892,8 @@ fn apply_dispatch_outcome_with_flags(
                 normalized_static_owner,
             )),
         },
-        DefinitionLookupStatus::UnsupportedLanguage
+        DefinitionLookupStatus::NotAReference
+        | DefinitionLookupStatus::UnsupportedLanguage
         | DefinitionLookupStatus::Unavailable
         | DefinitionLookupStatus::Incomplete
         | DefinitionLookupStatus::Cancelled
@@ -4342,13 +5916,20 @@ fn refine_resolved_call_target_proofs(
     token: QueryToken<'_>,
     file: &ProjectFile,
     site: &ExternalCalleeSite<'_>,
+    definition_session: Option<&mut super::get_definition::ScalarCallTargetSession<'_>>,
 ) {
     if lookup.status != Some(DefinitionLookupStatus::Resolved) || lookup.targets.is_empty() {
         return;
     }
-    language_support_for_hook(language, "refine_resolved_call_targets")
-        .expect("every resolved call language has registered support")
-        .refine_resolved_call_targets(analyzer, token, file, site, &mut lookup.targets);
+    match definition_session {
+        // The retained operation's resolver refines through its own receipt.
+        Some(session) => {
+            session.refine_resolved_call_targets(token, file, site, &mut lookup.targets);
+        }
+        None => language_support_for_hook(language, "refine_resolved_call_targets")
+            .expect("every resolved call language has registered support")
+            .refine_resolved_call_targets(analyzer, token, file, site, &mut lookup.targets),
+    }
 }
 
 /// The canonical owner of a Java method-invocation object that the definition
@@ -4408,7 +5989,12 @@ fn csharp_normalized_static_owner(
     let (owner, member) =
         crate::analyzer::semantic::split_canonical_qualified_callee(callee_text, language)?;
     let is_static = language_support_for_hook(language, "external_member_is_static")?
-        .external_member_is_static(analyzer, analyzer.semantic_model_overlay(), &owner, &member);
+        .external_member_is_static(
+            analyzer,
+            analyzer.semantic_model_overlay_read().published(),
+            &owner,
+            &member,
+        );
     is_static
         .is_some_and(|is_static| is_static)
         .then(|| owner.into_boxed_str())
@@ -4504,7 +6090,16 @@ fn call_hits(
     let semantic_diagnostics = match &result {
         FuzzyResult::Incomplete { diagnostics, .. } => {
             vec![CallRelationDiagnostic::analysis_failed(
-                format!("Usage analysis is incomplete: {diagnostics:?}"),
+                CallRelationDiagnosticPayload::UsageIncomplete {
+                    diagnostics: diagnostics
+                        .iter()
+                        .map(|diagnostic| CallRelationUsageFailure {
+                            fq_name: diagnostic.fq_name.clone(),
+                            strategy: diagnostic.strategy.clone(),
+                            reason_kind: diagnostic.reason_kind.clone(),
+                        })
+                        .collect(),
+                },
                 target.fq_name().to_string(),
                 "semantic_incomplete".to_string(),
             )]
@@ -4542,10 +6137,10 @@ fn call_hits(
                 .then(|| {
                     CallRelationDiagnostic::new(
                         CallRelationDiagnosticCode::CandidatesOmitted,
-                        format!(
-                            "omitted {omitted} unproven call candidates for {}",
-                            target.fq_name()
-                        ),
+                        CallRelationDiagnosticPayload::UnprovenOmitted {
+                            target: target.fq_name().to_string(),
+                            count: omitted,
+                        },
                         target.fq_name().to_string(),
                     )
                     .with_count(omitted)
@@ -4569,22 +6164,23 @@ fn call_hits(
             true,
             vec![CallRelationDiagnostic::new(
                 CallRelationDiagnosticCode::CandidateLimit,
-                format!(
-                    "found {total_callsites} call candidates for {}, retaining the first {limit}",
-                    target.fq_name()
-                ),
+                CallRelationDiagnosticPayload::TooManyCandidates {
+                    target: target.fq_name().to_string(),
+                    total: total_callsites,
+                    limit,
+                },
                 target.fq_name().to_string(),
             )],
         ),
-        FuzzyResult::Failure {
-            reason_kind,
-            reason,
-            ..
-        } => (
+        FuzzyResult::Failure { reason_kind, .. } => (
             Vec::new(),
             false,
             vec![CallRelationDiagnostic::analysis_failed(
-                reason,
+                CallRelationDiagnosticPayload::Failure {
+                    reason: CallRelationFailure::Upstream {
+                        kind: reason_kind.clone(),
+                    },
+                },
                 target.fq_name().to_string(),
                 reason_kind,
             )],
@@ -5261,7 +6857,13 @@ pub mod registry_fixture_support {
             else {
                 panic!("Kotlin declaration fixture must activate");
             };
-            assert!(analyzer.analyzer().semantic_model_overlay().is_some());
+            assert!(
+                analyzer
+                    .analyzer()
+                    .semantic_model_overlay_read()
+                    .published()
+                    .is_some()
+            );
 
             Self {
                 _temp: temp,
@@ -5337,11 +6939,19 @@ pub fn native_incoming_preflight(
         });
     }
     if limits.max_files == 0 || limits.max_source_bytes == 0 || limits.max_candidates == 0 {
+        let mut diagnostic = budget_diagnostic();
+        if limits.max_files == 0 {
+            diagnostic.code =
+                CallRelationDiagnosticCode::ScanGrantRefused(CallRelationScanLimit::Files);
+        } else if limits.max_source_bytes == 0 {
+            diagnostic.code =
+                CallRelationDiagnosticCode::ScanGrantRefused(CallRelationScanLimit::SourceBytes);
+        }
         return Some(CallRelationResult {
             truncated: true,
             caller_inventory: CallerInventoryCoverage::Incomplete,
             proof_authority: UsageProofAuthority::Native,
-            diagnostics: vec![budget_diagnostic()],
+            diagnostics: vec![diagnostic.with_scan_limits(limits)],
             ..CallRelationResult::default()
         });
     }
@@ -5364,6 +6974,21 @@ mod tests {
     use std::collections::BTreeSet;
 
     #[test]
+    fn call_relation_answer_digest_has_v3_domain() {
+        use crate::analyzer::canonical_hash::CanonicalHasher;
+        let mut legacy_domain =
+            CanonicalHasher::new(b"bifrost-read-ledger:call-relation-answer:v2");
+        legacy_domain.field("proof_authority", &[0]);
+        legacy_domain.field("truncated", &[0]);
+        legacy_domain.field("cancelled", &[0]);
+        legacy_domain.field("caller_inventory", &[0]);
+        assert_ne!(
+            call_relation_answer_digest(&CallRelationResult::default()),
+            crate::analyzer::semantic::ids::StableDigest::from_array(legacy_domain.finish()),
+        );
+    }
+
+    #[test]
     fn split_prefetch_refuses_a_merged_only_cache_hit() {
         use crate::analyzer::{AnalyzerConfig, TestProject, WorkspaceAnalyzer};
         let root = tempfile::tempdir().expect("temporary workspace");
@@ -5382,7 +7007,10 @@ mod tests {
         let mut cache = CallBindingCache::default();
         cache.call_targets.insert((file.clone(), range), CallTargetLookupOutcome::from_resolution(
             crate::analyzer::usages::get_definition::DefinitionResolution::from(DefinitionLookupOutcome {
-                status: crate::analyzer::usages::get_definition::DefinitionLookupStatus::NotFound,
+                selected_sites: Vec::new(),
+                inventory_evidence: None,
+                incomplete_evidence: None,
+        status: crate::analyzer::usages::get_definition::DefinitionLookupStatus::NotFound,
                 modeled_definitions: Vec::new(), reference: None, definitions: Vec::new(), lexical_definition: None, diagnostics: Vec::new(),
             })
         ));
@@ -5432,7 +7060,7 @@ mod tests {
             diagnostics[0].code,
             CallRelationDiagnosticCode::AnalysisFailed
         );
-        assert!(diagnostics[0].message.contains("unsupported_reference"));
+        assert!(diagnostics[0].message().contains("unsupported_reference"));
     }
 
     #[test]
@@ -5448,6 +7076,7 @@ mod tests {
             "method",
         );
         let mut outcome = CallTargetLookupOutcome {
+            fixed_array_source: None,
             source_member_evidence: Some(
                 vec![
                     crate::analyzer::usages::get_definition::SourceMemberCallEvidence {
@@ -5466,6 +7095,9 @@ mod tests {
             native_resolution: None,
             model_member_selection: None,
             outcome: DefinitionLookupOutcome {
+                selected_sites: Vec::new(),
+                inventory_evidence: None,
+                incomplete_evidence: None,
                 modeled_definitions: Vec::new(),
                 status: DefinitionLookupStatus::Resolved,
                 reference: None,
@@ -5506,9 +7138,13 @@ mod tests {
         );
         let outcome = |status, structure_unavailable, truncated| CallTargetLookupOutcome {
             source_member_evidence: None,
+            fixed_array_source: None,
             native_resolution: None,
             model_member_selection: None,
             outcome: DefinitionLookupOutcome {
+                selected_sites: Vec::new(),
+                inventory_evidence: None,
+                incomplete_evidence: None,
                 modeled_definitions: Vec::new(),
                 status,
                 reference: None,
@@ -5599,6 +7235,9 @@ mod tests {
         apply_dispatch_outcome(
             &mut ambiguous,
             DefinitionLookupOutcome {
+                selected_sites: Vec::new(),
+                inventory_evidence: None,
+                incomplete_evidence: None,
                 modeled_definitions: Vec::new(),
                 status: DefinitionLookupStatus::Ambiguous,
                 reference: None,
@@ -5639,6 +7278,9 @@ mod tests {
         apply_dispatch_outcome(
             &mut partial_ambiguous,
             DefinitionLookupOutcome {
+                selected_sites: Vec::new(),
+                inventory_evidence: None,
+                incomplete_evidence: None,
                 modeled_definitions: Vec::new(),
                 status: DefinitionLookupStatus::Ambiguous,
                 reference: None,
@@ -5677,6 +7319,9 @@ mod tests {
         apply_dispatch_outcome(
             &mut empty_ambiguous,
             DefinitionLookupOutcome {
+                selected_sites: Vec::new(),
+                inventory_evidence: None,
+                incomplete_evidence: None,
                 modeled_definitions: Vec::new(),
                 status: DefinitionLookupStatus::Ambiguous,
                 reference: None,
@@ -5702,6 +7347,9 @@ mod tests {
         apply_dispatch_outcome(
             &mut external,
             DefinitionLookupOutcome {
+                selected_sites: Vec::new(),
+                inventory_evidence: None,
+                incomplete_evidence: None,
                 modeled_definitions: Vec::new(),
                 status: DefinitionLookupStatus::UnresolvableImportBoundary,
                 reference: None,
@@ -5731,6 +7379,9 @@ mod tests {
             apply_dispatch_outcome(
                 &mut unresolved,
                 DefinitionLookupOutcome {
+                    selected_sites: Vec::new(),
+                    inventory_evidence: None,
+                    incomplete_evidence: None,
                     modeled_definitions: Vec::new(),
                     status,
                     reference: None,
@@ -5771,6 +7422,9 @@ mod tests {
         apply_dispatch_outcome(
             &mut named,
             DefinitionLookupOutcome {
+                selected_sites: Vec::new(),
+                inventory_evidence: None,
+                incomplete_evidence: None,
                 modeled_definitions: Vec::new(),
                 status: DefinitionLookupStatus::NotFound,
                 reference: Some(canonical_reference),
@@ -5794,6 +7448,9 @@ mod tests {
         apply_dispatch_outcome(
             &mut unnamed,
             DefinitionLookupOutcome {
+                selected_sites: Vec::new(),
+                inventory_evidence: None,
+                incomplete_evidence: None,
                 modeled_definitions: Vec::new(),
                 status: DefinitionLookupStatus::NotFound,
                 reference: None,
@@ -5862,3 +7519,8 @@ mod tests {
         );
     }
 }
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+#[path = "owner_memo_tests.rs"]
+pub mod owner_memo_tests;

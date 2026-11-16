@@ -413,6 +413,50 @@ pub mod external { pub fn call() { exported!(); } }\n";
 }
 
 #[test]
+#[hardwon("#11281: narrowing module-walk facts dropped include import precedence")]
+fn included_imports_keep_explicit_precedence_over_globs() {
+    let source = r#"mod explicit { pub fn pick() {} }
+mod glob { pub fn pick() {} pub fn via_glob() {} }
+include!("imports.rs");
+pub fn run() { pick(); via_glob(); }
+"#;
+    let fixture = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"include_imports\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .file("src/lib.rs", source)
+        .file(
+            "src/imports.rs",
+            "use crate::glob::*; use crate::explicit::pick;\n",
+        )
+        .build();
+    let analyzer = RustAnalyzer::new(fixture.project_dyn());
+    for (spelling, suffix) in [("pick", ".explicit.pick"), ("via_glob", ".glob.via_glob")] {
+        let site = reference_site(source, spelling);
+        let answers = resolve_point_answers(&analyzer, &fixture.file("src/lib.rs"), &site);
+        assert_eq!(answers.len(), 1);
+        let answer = &answers[0];
+        assert_eq!(
+            answer.resolution.completion(),
+            &ResolutionCompletion::Complete
+        );
+        assert_eq!(answer.resolution.binding().targets().len(), 1);
+        assert_eq!(
+            answer.definition_names.len(),
+            1,
+            "{:?}",
+            answer.definition_names
+        );
+        assert!(
+            answer.definition_names[0].1.ends_with(suffix),
+            "{:?}",
+            answer.definition_names
+        );
+    }
+}
+
+#[test]
 fn rust_2018_macro_reexport_import_binds_exact_declaration() {
     let (fixture, other) = rust_2018_macro_reexport_project();
     let analyzer = RustAnalyzer::new(fixture.project_dyn());
@@ -579,7 +623,7 @@ fn native_definition_withdraws_only_the_alternative_that_has_no_unit() {
                 without_unit(),
                 (
                     SemanticId::for_test("native-points-unit"),
-                    SelectedRustSourceDefinition::Unit(unit.clone()),
+                    SelectedRustSourceDefinition::Unit(unit.clone(), None),
                 ),
             ]),
         ),
@@ -1297,7 +1341,35 @@ fn native_open_export_inventory_carries_macro_evidence() {
             project = project.file("src/aaa.rs", "pub fn probe() { absent(); }");
         }
         let fixture = project.file("src/lib.rs", source).build();
-        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        let context =
+            brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::ephemeral_store_context(
+                fixture.project_dyn().as_ref(),
+            )
+            .unwrap();
+        if unrelated_first {
+            // Blob row ids are store-local and allocated as max(id) + 1. Reserve
+            // a high id before the build so this store's src/lib.rs blob id
+            // cannot coincide with the other store's, whatever order parallel
+            // indexing allocates in. The row's language is read by no analyzer.
+            context
+                .store
+                .conn
+                .lock()
+                .unwrap()
+                .execute(
+                    "INSERT INTO blobs(id, blob_oid, lang, generation) \
+                     VALUES(1000, '0000000000000000000000000000000000000001', 'shift_test', 0)",
+                    [],
+                )
+                .unwrap();
+        }
+        let analyzer = RustAnalyzer::new_with_config_store_context(
+            fixture.project_dyn(),
+            brokk_bifrost_core::analyzer::config::AnalyzerConfig::default(),
+            context,
+            None,
+        )
+        .unwrap();
         if unrelated_first {
             let unrelated_source = "pub fn probe() { absent(); }";
             let unrelated_file = fixture.file("src/aaa.rs");
@@ -2886,6 +2958,7 @@ fn an_unmounted_macro_gated_module_file_is_an_explicit_boundary() {
     "#4460: a module excluded by the selected Cargo feature was reported as an unplaced crate route"
 )]
 fn an_inactive_cfg_module_file_is_an_explicit_boundary() {
+    // Members activate every declared feature (#12164), so enterprise stays undeclared.
     let outcome = definition_in_workspace(
         &[
             (
@@ -2894,7 +2967,7 @@ fn an_inactive_cfg_module_file_is_an_explicit_boundary() {
             ),
             (
                 "app/Cargo.toml",
-                "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[features]\ndefault = []\nenterprise = []\n",
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[features]\ndefault = []\n",
             ),
             (
                 "app/src/lib.rs",
@@ -2928,6 +3001,72 @@ fn an_inactive_cfg_module_file_is_an_explicit_boundary() {
             .all(|diagnostic| diagnostic.kind != "UnplacedRoutePrefix"),
         "{outcome:#?}"
     );
+}
+
+/// A file whose only placement is under an inactive `cfg` is not compiled in
+/// the selected configuration, so a crate-rooted path out of it cannot be a
+/// proved absence, and cannot be proved bound either.
+#[test]
+#[hardwon("#11405: a crate-rooted lookup in an inactive-cfg file answered NoDefinition")]
+fn a_crate_rooted_lookup_in_an_inactive_cfg_file_is_an_explicit_boundary() {
+    for (lib, inactive, needle, selection) in [
+        (
+            "#[cfg(any())] mod inactive;\n",
+            "fn caller() { crate::missing(); }\n",
+            "crate::missing()",
+            "missing",
+        ),
+        (
+            "#[cfg(any())] mod inactive;\n",
+            "fn caller() { self::missing(); }\n",
+            "self::missing()",
+            "missing",
+        ),
+        (
+            "#[cfg(any())] mod inactive;\n",
+            "fn caller() { super::missing(); }\n",
+            "super::missing()",
+            "missing",
+        ),
+        (
+            "#[cfg(any())] mod inactive;\npub fn present() {}\n",
+            "fn caller() { crate::present(); }\n",
+            "crate::present()",
+            "present",
+        ),
+        (
+            "#[cfg(any())] mod inactive;\n",
+            "fn caller() { Unknown::missing(); }\n",
+            "Unknown::missing()",
+            "missing",
+        ),
+    ] {
+        let outcome = definition_in_workspace(
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                ),
+                ("src/lib.rs", lib),
+                ("src/inactive.rs", inactive),
+            ],
+            "src/inactive.rs",
+            needle,
+            selection,
+        );
+        assert_ne!(
+            outcome.status,
+            DefinitionLookupStatus::NoDefinition,
+            "{needle}: {outcome:#?}"
+        );
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.kind == "InactiveCfgPlacement"),
+            "{needle}: {outcome:#?}"
+        );
+    }
 }
 
 #[test]
@@ -4328,13 +4467,14 @@ pub mod helpers {
     pub fn last_target() {}
 }
 "#;
+    // Members activate every declared feature (#12164), so inactive alternatives use undeclared features.
     for (features, selected) in [
-        ("[\"first\", \"second\"]", "first"),
-        ("[\"second\"]", "second"),
-        ("[]", "last"),
+        ("first = []\nsecond = []", "first"),
+        ("second = []", "second"),
+        ("", "last"),
     ] {
         let manifest = format!(
-            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[features]\ndefault = {features}\nfirst = []\nsecond = []\n"
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[features]\n{features}\n"
         );
         for name in ["first", "second", "last"] {
             let outcome = definition_in_workspace(
@@ -4617,7 +4757,7 @@ fn rust_definition_batch_reuses_one_selected_operation_per_file() {
 }
 
 #[test]
-#[hardwon("#8410: repeated Rust macro points rebuilt the same frontier across policy units")]
+#[hardwon("#11281+#8410: projected macro inputs lost import bindings and repeated frontier work")]
 fn repeated_macro_point_reads_match_unshared_preparation() {
     use brokk_bifrost_analysis::analyzer::ReadLedger;
     use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
@@ -4629,8 +4769,8 @@ fn repeated_macro_point_reads_match_unshared_preparation() {
     };
 
     let source = "macro_rules! identity { ($value:expr) => { $value }; } \
-                  pub struct Item; pub fn run() { \
-                  let _first = identity!(Item); let _second = identity!(Item); }";
+                  use identity as renamed; pub struct Item; pub fn run() { \
+                  let _first = renamed!(Item); let _second = renamed!(Item); }";
     let (project, _) = rust_source_project(source);
     let workspace =
         project.workspace_analyzer(brokk_bifrost_core::analyzer::config::AnalyzerConfig::default());
@@ -4954,11 +5094,11 @@ fn incomplete_macro_frontier_clears_and_reuses_reader() {
 
 #[test]
 #[hardwon("#9239: a failed post-copy macro cap returned grown TEMP pages to the reader pool")]
-fn macro_post_copy_cap_failure_discards_reader() {
+fn macro_admission_refusal_preserves_answer_without_shadow_pages() {
     use brokk_bifrost_analysis::analyzer::ReadLedger;
     use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
     use brokk_bifrost_analysis::analyzer::store::resolution_operation::{
-        set_macro_post_copy_cap_failure_for_test, take_macro_reader_discards_for_test,
+        set_macro_admission_refusal_for_test, take_macro_reader_discards_for_test,
     };
     use brokk_bifrost_analysis::analyzer::usages::get_definition::{
         DefinitionLookupRequest, resolve_definition_batch_with_source,
@@ -4978,7 +5118,7 @@ fn macro_post_copy_cap_failure_discards_reader() {
     );
     let start = source.rfind("Item").unwrap();
     let _ = take_macro_reader_discards_for_test();
-    set_macro_post_copy_cap_failure_for_test(true);
+    set_macro_admission_refusal_for_test(true);
     let answer = resolve_definition_batch_with_source(
         analyzer,
         vec![DefinitionLookupRequest {
@@ -4991,11 +5131,902 @@ fn macro_post_copy_cap_failure_discards_reader() {
         file,
         Arc::from(source),
     );
-    set_macro_post_copy_cap_failure_for_test(false);
+    set_macro_admission_refusal_for_test(false);
     assert_eq!(
         answer[0].status,
         DefinitionLookupStatus::Resolved,
         "{answer:#?}"
     );
-    assert_eq!(take_macro_reader_discards_for_test(), 1);
+    assert_eq!(
+        take_macro_reader_discards_for_test(),
+        0,
+        "admission refusal creates no retained TEMP shadow"
+    );
+}
+#[test]
+#[hardwon("#11408: unclassified definition lookups refused deterministic derivations")]
+fn native_lookup_content_stop_is_classified_at_observation() {
+    use brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause;
+    use brokk_bifrost_analysis::analyzer::{AnalyzerQueryScope, QueryReadIncomplete};
+
+    const SOURCE: &str = "macro_rules! probe { () => { self::thing() }; }";
+    let (fixture, _) = rust_source_project(SOURCE);
+    let workspace = fixture.certified_workspace_analyzer(
+        brokk_bifrost_core::analyzer::config::AnalyzerConfig::default(),
+    );
+    let file = fixture.file("src/lib.rs");
+    let tree = rust_tree(SOURCE);
+    let site = reference_site(SOURCE, "self");
+    for cancelled in [false, true] {
+        let token = CancellationToken::default();
+        if cancelled {
+            token.cancel();
+        }
+        let outcome = resolve_rust_definition_bounded(BoundedReceiverQuery {
+            analyzer: workspace.analyzer(),
+            file: &file,
+            source: SOURCE,
+            tree: Some(&tree),
+            site: &site,
+            budget: ReceiverAnalysisBudget::default(),
+            cancellation: Some(&token),
+        });
+        if cancelled {
+            assert!(matches!(outcome, BoundedResolution::Cancelled { .. }));
+        } else {
+            let BoundedResolution::Complete { ref value, .. } = outcome else {
+                panic!("unexpected lookup: {outcome:?}");
+            };
+            assert_eq!(value.status, DefinitionLookupStatus::Incomplete);
+        }
+        let scope = AnalyzerQueryScope::capturing_read_incompleteness(workspace.analyzer());
+        let proof_scope = AnalyzerQueryScope::capturing_proof_completion(workspace.analyzer());
+        crate::analyzer::rust::std_types::observe_proof_resolution(&outcome);
+        drop(proof_scope);
+        assert_eq!(
+            scope.captured_read_incompleteness(),
+            [QueryReadIncomplete::ProofStopped {
+                reason: if cancelled {
+                    "cancelled"
+                } else {
+                    "resolution_macro_expansion_context_required"
+                },
+                cause: if cancelled {
+                    Some(DerivationExecutionCause::Cancelled)
+                } else {
+                    Some(DerivationExecutionCause::Provider)
+                },
+            }]
+        );
+    }
+}
+
+#[test]
+#[hardwon("#11945: foreign missing projections must record every deciding target file")]
+fn unprojected_definition_records_foreign_selected_files() {
+    use brokk_bifrost_analysis::analyzer::read_ledger::ReadKey;
+    use brokk_bifrost_analysis::analyzer::store::resolution_operation::unprojected_rows_reason;
+    use brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionUnavailable;
+    use brokk_bifrost_analysis::analyzer::{ReadLedger, i_analyzer::AnalyzerQueryScope};
+    let source = "mod a; mod b; pub fn run() {}";
+    let fixture = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"projection_reads\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .file("src/lib.rs", source)
+        .file("src/a.rs", "pub enum A { Variant }")
+        .file("src/b.rs", "pub enum B { Variant }")
+        .build();
+    let analyzer = RustAnalyzer::new(fixture.project_dyn());
+    let cancellation = CancellationToken::default();
+    let factory = RustDefinitionOperationFactory::new(&analyzer, &cancellation).unwrap();
+    let SelectedResolutionOperationOpenOutcome::Ready(operation) =
+        factory.open(&cancellation).unwrap()
+    else {
+        panic!("selected fixture operation");
+    };
+    // Inject the parser/store boundary shape rather than relying on a source
+    // construct that happens to lack CodeUnits in the current Rust adapter.
+    let rows = ["src/a.rs", "src/b.rs"]
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, path)| {
+            (
+                SemanticId::operation_local(ordinal as u64 + 1),
+                SelectedRustSourceDefinition::WithoutUnit {
+                    source_file: fixture.file(path),
+                    declaration_range: None,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    let reason = unprojected_rows_reason(operation.mount_table(), &rows).unwrap();
+    let ledger = Arc::new(ReadLedger::new());
+    let _scope = AnalyzerQueryScope::with_policy_unit_read_ledger(
+        &analyzer,
+        ledger.clone(),
+        "policy=test.projection-reads".to_owned(),
+    );
+    let file = fixture.file("src/lib.rs");
+    let tree = rust_tree(source);
+    let site = reference_site(source, "run");
+    let query = crate::analyzer::rust::test_support::bounded_receiver_query(
+        &analyzer,
+        &file,
+        source,
+        Some(&tree),
+        &site,
+        ReceiverAnalysisBudget::default(),
+        None,
+    );
+    let outcome = adapt_definition_value(
+        &query,
+        SelectedRustCallerReferenceOutcome::Operation(
+            SelectedResolutionOperationOutcome::Unavailable(
+                SelectedResolutionUnavailable::MissingDefinitionUnit {
+                    reason,
+                    storage_language: "rust".to_owned(),
+                    persisted_relative_path: "src/lib.rs".to_owned(),
+                },
+            ),
+        ),
+        &mut CallEvidence::default(),
+        &cancellation,
+        &operation,
+    );
+    assert!(matches!(
+        outcome.incomplete_evidence.unwrap().reasons.as_slice(),
+        [DefinitionLookupReason::UnprojectedDefinition { .. }]
+    ));
+    for path in ["src/a.rs", "src/b.rs"] {
+        let oid = operation
+            .mount_table()
+            .blob_oid_for_path("rust", path)
+            .unwrap()
+            .unwrap();
+        assert!(
+            ledger.keys().contains(&ReadKey::file(
+                Language::Rust,
+                path.to_owned(),
+                oid,
+                brokk_bifrost_core::gitblob::ParseVariant::Empty
+            )),
+            "{path}: {:?}",
+            ledger.keys()
+        );
+    }
+}
+
+#[test]
+#[hardwon("#11950: a primitive's missing definition unit was an operational stop")]
+fn primitive_universe_certificate_records_own_reads_and_refuses_shadows() {
+    use brokk_bifrost_analysis::analyzer::read_ledger::ReadKey;
+    use brokk_bifrost_analysis::analyzer::{IAnalyzer, ReadLedger, i_analyzer::AnalyzerQueryScope};
+    for (prefix, root_source, config, certifies) in [
+        ("", "mod mysql;", "", true),
+        (
+            "#[allow(dead_code)] struct Allowed;",
+            "mod mysql;",
+            "",
+            true,
+        ),
+        ("type str = u8;", "mod mysql;", "", false),
+        ("mod str {}", "mod mysql;", "", false),
+        ("use other::Thing as str;", "mod mysql;", "", false),
+        ("use other::Thing as r#str;", "mod mysql;", "", false),
+        ("", "extern crate x as r#str; mod mysql;", "", false),
+        ("", "make_extern!(); mod mysql;", "", false),
+        (
+            "",
+            "mod mysql;",
+            "[build]\nrustflags = [\"--extern=str=missing.rlib\"]",
+            false,
+        ),
+        (
+            "",
+            "mod mysql;",
+            "[build]\nrustflags = [\"-C\", \"opt-level=0\"]",
+            true,
+        ),
+        (
+            "use core::str; fn decode(b: &[u8]) { let _ = str::from_utf8(b); }",
+            "mod mysql;",
+            "",
+            false,
+        ),
+        ("use other::*;", "mod mysql;", "", false),
+        ("fn nested<str>() {}", "mod mysql;", "", false),
+        ("fn nested() { type str = u8; }", "mod mysql;", "", false),
+        ("macro_rules! make { () => {} }", "mod mysql;", "", false),
+        ("include!(\"generated.rs\");", "mod mysql;", "", false),
+        (
+            "#[derive(Unknown)] struct Derived;",
+            "mod mysql;",
+            "",
+            false,
+        ),
+        ("#[unknown] struct Attributed;", "mod mysql;", "", false),
+        (
+            "#[cfg_attr(test, unknown)] struct Attributed;",
+            "mod mysql;",
+            "",
+            false,
+        ),
+        ("#[tokio::main] fn attributed() {}", "mod mysql;", "", false),
+        ("", "extern crate x as str; mod mysql;", "", false),
+        ("", "pub extern crate x as str; mod mysql;", "", false),
+        ("", "extern crate x as harmless; mod mysql;", "", true),
+        (
+            "",
+            "mod mysql;",
+            "[build]\nrustflags = [\"--extern\", \"str=missing.rlib\"]",
+            false,
+        ),
+    ] {
+        let source =
+            format!("{prefix}\nfn sink(_: &str) {{}}\npub fn query(sql: &str) {{ sink(sql); }}");
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file("Cargo.toml", "[package]\nname = \"primitive_proof\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\nx = \"1\"\n")
+            .file("src/lib.rs", root_source)
+            .file("src/mysql.rs", &source)
+            .file(".cargo/config.toml", config)
+            .build();
+        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        let cancellation = CancellationToken::default();
+        let factory = RustDefinitionOperationFactory::new(&analyzer, &cancellation).unwrap();
+        let SelectedResolutionOperationOpenOutcome::Ready(operation) =
+            factory.open(&cancellation).unwrap()
+        else {
+            panic!("selected operation")
+        };
+        let ledger = Arc::new(ReadLedger::new());
+        let _scope = AnalyzerQueryScope::with_policy_unit_read_ledger(
+            &analyzer,
+            ledger.clone(),
+            "policy=test.primitive-proof".to_owned(),
+        );
+        let file = fixture.file("src/mysql.rs");
+        let tree = rust_tree(&source);
+        let site = reference_site(&source, "str");
+        let query = crate::analyzer::rust::test_support::bounded_receiver_query(
+            &analyzer,
+            &file,
+            &source,
+            Some(&tree),
+            &site,
+            ReceiverAnalysisBudget::default(),
+            None,
+        );
+        let reason = primitive_universe_reason(&query, &operation, &cancellation);
+        assert_eq!(
+            reason.is_ok(),
+            certifies,
+            "{prefix:?} {root_source:?} {config:?}; reason={reason:?}; keys={:?}",
+            ledger.keys()
+        );
+        if certifies {
+            assert!(
+                !matches!(
+                    reason,
+                    Err(PrimitiveUniverseRefusal::ConfigurationIncomplete)
+                ),
+                "feature incompleteness cannot refuse the extern-name superset"
+            );
+            // The registry dependency has no retained manifest. This pins the
+            // exact distinction: incomplete features, certified extern absence.
+            let _frame = analyzer.operation_read_frame(&operation).unwrap();
+            let targets = operation
+                .rust_file_configuration_targets(file.rel_path(), &cancellation)
+                .unwrap();
+            for target in targets.targets {
+                let key = super::super::configuration_kinds::RustUnitConfigurationKey {
+                    manifest_path: target.manifest_path,
+                    target_kind: target.target_kind,
+                    target_name: target.target_name,
+                };
+                assert!(matches!(
+                    analyzer.inner.derivations().unwrap().demand_in_operation::<
+                        super::super::configuration_kinds::RustUnitConfiguration
+                    >(&analyzer, &operation, &key),
+                    brokk_bifrost_semantic::analyzer::semantic::derivation::Demanded::Available {
+                        complete: false, ..
+                    }
+                ));
+            }
+            assert_eq!(
+                ledger.persistence_refusals(),
+                0,
+                "certification must not refuse its consumer's publication: {:?}",
+                ledger.keys()
+            );
+            use brokk_bifrost_analysis::analyzer::read_ledger::{IndexFamily, LookupKind};
+            use brokk_bifrost_semantic::analyzer::semantic::derivation::DerivationKind;
+            for family in [
+                IndexFamily::DefinitionIdentifier,
+                IndexFamily::DefinitionExact,
+                IndexFamily::DefinitionNormalizedTail,
+            ] {
+                assert!(
+                    ledger.keys().contains(&ReadKey::index(family, "str")),
+                    "missing primitive probe: {:?}",
+                    ledger.keys()
+                );
+            }
+            assert!(ledger.keys().iter().any(|key| matches!(key, ReadKey::Lookup { kind: LookupKind::Derivation(id), .. } if id.0 == crate::analyzer::rust::configuration_kinds::RustUnitConfiguration::ID.0)), "missing target configuration: {:?}", ledger.keys());
+            for path in ["src/mysql.rs", "src/lib.rs"] {
+                let oid = operation
+                    .mount_table()
+                    .blob_oid_for_path("rust", path)
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    ledger.keys().contains(&ReadKey::file(
+                        Language::Rust,
+                        path.to_owned(),
+                        oid,
+                        brokk_bifrost_core::gitblob::ParseVariant::Empty
+                    )),
+                    "own ledger missing {path}: {:?}",
+                    ledger.keys()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[hardwon("#11950: a primitive certificate must not mix selected imports with different AST bytes")]
+fn primitive_universe_certificate_refuses_unselected_ast_content() {
+    use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
+    let source = "pub fn query(sql: &str) { let _ = str::len(sql); }\n";
+    let fixture = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"primitive_source_pin\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .file("src/lib.rs", "mod mysql;\n")
+        .file("src/mysql.rs", source)
+        .build();
+    let analyzer = RustAnalyzer::new(fixture.project_dyn());
+    let cancellation = CancellationToken::default();
+    let factory = RustDefinitionOperationFactory::new(&analyzer, &cancellation).unwrap();
+    let SelectedResolutionOperationOpenOutcome::Ready(operation) =
+        factory.open(&cancellation).unwrap()
+    else {
+        panic!("selected primitive operation");
+    };
+    let file = fixture.file("src/mysql.rs");
+    let lookup = |text: &str| {
+        let _scope = AnalyzerQueryScope::new(&analyzer);
+        let tree = rust_tree(text);
+        let site = reference_site(text, "str");
+        let query = crate::analyzer::rust::test_support::bounded_receiver_query(
+            &analyzer,
+            &file,
+            text,
+            Some(&tree),
+            &site,
+            ReceiverAnalysisBudget::default(),
+            None,
+        );
+        primitive_universe_reason(&query, &operation, &cancellation)
+    };
+    assert!(lookup(source).is_ok(), "selected source certifies");
+    assert!(
+        lookup(&format!("// different reference AST\n{source}")).is_err(),
+        "an AST from an unselected referencing source cannot certify"
+    );
+    // Keep the referencing file and selected operation unchanged. The new root
+    // has no shadow either, but its AST cannot certify the selected old root.
+    std::fs::write(
+        fixture.file("src/lib.rs").abs_path(),
+        "// edited root\nmod mysql;\n",
+    )
+    .unwrap();
+    assert!(
+        lookup(source).is_err(),
+        "a live root edit cannot certify an old selection"
+    );
+}
+
+#[test]
+#[hardwon(
+    "#12453: empty fronts in one operation seeded a cross-history hit on a later pristine front"
+)]
+fn empty_fronts_in_one_operation_do_not_seed_cross_history_hits() {
+    use brokk_bifrost_analysis::analyzer::i_analyzer::capture_query_reads;
+    use brokk_bifrost_analysis::analyzer::store::resolution_operation::{
+        SelectedResolutionOperation, SelectedResolutionStageOutcome,
+        take_macro_frontier_cache_counts_for_test,
+    };
+    let fixture = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname=\"empty_front_history\"\nversion=\"0.1.0\"\nedition=\"2024\"\n",
+        )
+        .file("src/lib.rs", "mod a; mod b;")
+        .file("src/a.rs", "pub struct A;")
+        .file("src/b.rs", "pub struct B;")
+        .build();
+    let rust = RustAnalyzer::new(fixture.project_dyn());
+    let analyzer: &dyn brokk_bifrost_analysis::analyzer::IAnalyzer = &rust;
+    let cancellation = CancellationToken::new();
+    let open = || {
+        let report = rust.open_selected_rust_operation(&cancellation);
+        let SelectedResolutionOperationOpenOutcome::Ready(operation) = report.outcome.unwrap()
+        else {
+            panic!("fixture operation must open");
+        };
+        let operation = (*operation).with_macro_frontier_reads(Box::new(analyzer));
+        assert!(
+            operation
+                .ensure_selected_rust_inputs(&cancellation)
+                .unwrap()
+        );
+        operation
+    };
+    let prepare = |operation: &SelectedResolutionOperation<'_, '_>, file: &str| {
+        let (_, reads) = capture_query_reads(analyzer, || {
+            assert!(matches!(
+                operation
+                    .prepare_selected_macro_frontiers_for_files(&[Path::new(file)], &cancellation)
+                    .unwrap(),
+                SelectedResolutionStageOutcome::Ready
+            ));
+        });
+        operation.observe_macro_retention_result(true);
+        (
+            operation.macro_front_state_digest_for_test().unwrap(),
+            format!("{:?}", reads.keys()),
+            reads.channels(),
+        )
+    };
+    let sequence = open();
+    prepare(&sequence, "src/a.rs");
+    prepare(&sequence, "src/b.rs");
+    drop(sequence);
+
+    let warm = open();
+    take_macro_frontier_cache_counts_for_test();
+    let warm_b = prepare(&warm, "src/b.rs");
+    let warm_counts = take_macro_frontier_cache_counts_for_test();
+    warm.evict_macro_fronts_for_test();
+    drop(warm);
+    let cold = open();
+    let cold_b = prepare(&cold, "src/b.rs");
+    assert_eq!(
+        warm_b, cold_b,
+        "a later pristine B must not inherit A's checked-file bookkeeping"
+    );
+    assert_eq!(
+        warm_counts.0, 0,
+        "B after A was not a pristine input and must not seed a retained B"
+    );
+}
+
+#[test]
+fn pristine_macro_fronts_keep_file_sets_and_isolate_reader_histories() {
+    use brokk_bifrost_analysis::analyzer::i_analyzer::capture_query_reads;
+    use brokk_bifrost_analysis::analyzer::store::resolution_operation::{
+        SelectedResolutionStageOutcome, take_macro_front_legacy_drops_for_test,
+        take_macro_frontier_cache_counts_for_test,
+    };
+    use brokk_bifrost_analysis::analyzer::store::resolution_selection::set_force_macro_reader_close_for_test;
+    let fixture = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname=\"front_sets\"\nversion=\"0.1.0\"\nedition=\"2024\"\n",
+        )
+        .file("src/lib.rs", "mod a; mod b; mod empty;")
+        .file(
+            "src/a.rs",
+            "macro_rules! a { () => { pub struct A; }; } a!();",
+        )
+        .file(
+            "src/b.rs",
+            "macro_rules! b { () => { pub struct B; }; } b!();",
+        )
+        .file("src/empty.rs", "pub struct Empty;")
+        .build();
+    let rust = RustAnalyzer::new(fixture.project_dyn());
+    let analyzer: &dyn brokk_bifrost_analysis::analyzer::IAnalyzer = &rust;
+    let cancellation = CancellationToken::new();
+    let open = || {
+        let report = rust.open_selected_rust_operation(&cancellation);
+        let SelectedResolutionOperationOpenOutcome::Ready(operation) = report.outcome.unwrap()
+        else {
+            panic!("fixture operation must open");
+        };
+        let operation = (*operation).with_macro_frontier_reads(Box::new(analyzer));
+        assert!(
+            operation
+                .ensure_selected_rust_inputs(&cancellation)
+                .unwrap()
+        );
+        operation
+    };
+    let prepare_set = |operation: &brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<'_, '_>, files: &[&str]| {
+        let paths = files.iter().map(Path::new).collect::<Vec<_>>();
+        let (_, reads) = capture_query_reads(analyzer, || {
+            assert!(matches!(operation.prepare_selected_macro_frontiers_for_files(&paths, &cancellation).unwrap(), SelectedResolutionStageOutcome::Ready));
+        });
+        operation.observe_macro_retention_result(true);
+        (operation.macro_front_state_digest_for_test().unwrap(), format!("{:?}", reads.keys()), reads.channels())
+    };
+    let prepare = |operation: &brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<'_, '_>, file: &str| prepare_set(operation,&[file]);
+    // Publish lazy capsules before the cold/warm comparison; close this reader
+    // so both reader histories below start at the same data_version origin.
+    let setup = open();
+    for file in ["src/a.rs", "src/b.rs", "src/empty.rs"] {
+        prepare(&setup, file);
+    }
+    set_force_macro_reader_close_for_test(true);
+    drop(setup);
+    set_force_macro_reader_close_for_test(false);
+
+    let first = open();
+    let second = open();
+    assert_ne!(
+        first.pooled_reader_serial_for_test(),
+        second.pooled_reader_serial_for_test()
+    );
+    assert_eq!(
+        first.macro_front_data_version_for_test().unwrap(),
+        second.macro_front_data_version_for_test().unwrap()
+    );
+    take_macro_frontier_cache_counts_for_test();
+    let cold_a = prepare(&first, "src/a.rs");
+    let cold_b = prepare(&second, "src/b.rs");
+    assert_eq!(
+        take_macro_frontier_cache_counts_for_test().0,
+        0,
+        "distinct reader histories cannot share fronts"
+    );
+    assert_ne!(cold_a.0, cold_b.0);
+    take_macro_front_legacy_drops_for_test();
+    first.observe_macro_retention_result(false); // downstream incomplete
+    let cancelled_consumer = BoundedResolution::Cancelled {
+        work: Default::default(),
+    };
+    second.observe_macro_retention_result(macro_retention_complete(&cancelled_consumer));
+    drop(second);
+    let after_cancelled = open();
+    assert_eq!(prepare(&after_cancelled, "src/b.rs"), cold_b);
+    assert_eq!(
+        take_macro_frontier_cache_counts_for_test().0,
+        1,
+        "a cancelled downstream consumer does not invalidate its certified front"
+    );
+    drop(after_cancelled);
+    drop(first); // first is most recently pooled, so the sequence stays on it.
+
+    assert!(
+        take_macro_front_legacy_drops_for_test() >= 2,
+        "the old gate would discard both certified fronts"
+    );
+    let a = open();
+    assert_eq!(prepare(&a, "src/a.rs"), cold_a);
+    assert_eq!(take_macro_frontier_cache_counts_for_test().0, 1);
+    // A non-pristine stage is a plain miss, even for the identical set.
+    prepare(&a, "src/a.rs");
+    assert_eq!(take_macro_frontier_cache_counts_for_test().0, 0);
+    drop(a);
+    let b = open();
+    let same_reader_b = prepare(&b, "src/b.rs");
+    assert_eq!(same_reader_b, cold_b);
+    drop(b);
+    let a = open();
+    assert_eq!(prepare(&a, "src/a.rs"), cold_a);
+    assert_eq!(
+        take_macro_frontier_cache_counts_for_test().0,
+        1,
+        "A survives B on one reader"
+    );
+    a.evict_macro_fronts_for_test();
+    drop(a);
+    let a = open();
+    assert_eq!(prepare(&a, "src/a.rs"), cold_a);
+    assert_eq!(
+        take_macro_frontier_cache_counts_for_test().0,
+        0,
+        "eviction recomputes the same front"
+    );
+    drop(a);
+    let empty = open();
+    let cold_empty = prepare(&empty, "src/empty.rs");
+    drop(empty);
+    let empty = open();
+    take_macro_frontier_cache_counts_for_test();
+    assert_eq!(prepare(&empty, "src/empty.rs"), cold_empty);
+    assert_eq!(
+        take_macro_frontier_cache_counts_for_test().0,
+        1,
+        "empty fronts are retained"
+    );
+    drop(empty);
+    let restore = open();
+    let pristine = restore.macro_front_state_digest_for_test().unwrap();
+    brokk_bifrost_analysis::analyzer::store::resolution_operation::set_macro_restore_failure_for_test(true);
+    let failure =
+        restore.prepare_selected_macro_frontiers_for_files(&[Path::new("src/a.rs")], &cancellation);
+    brokk_bifrost_analysis::analyzer::store::resolution_operation::set_macro_restore_failure_for_test(false);
+    assert!(failure.is_err());
+    assert!(
+        brokk_bifrost_analysis::analyzer::store::resolution_operation::macro_restored_rows_for_test(
+        ) > 0,
+        "the rollback follows actual copied rows"
+    );
+    assert_eq!(
+        restore.macro_front_state_digest_for_test().unwrap(),
+        pristine,
+        "failed restoration rolls all rows back"
+    );
+    assert_eq!(
+        prepare(&restore, "src/a.rs"),
+        cold_a,
+        "the immutable front survives rollback"
+    );
+    drop(restore);
+    let union = open();
+    let cold_union = prepare_set(&union, &["src/a.rs", "src/b.rs"]);
+    drop(union);
+    take_macro_frontier_cache_counts_for_test();
+    let reordered = open();
+    assert_eq!(
+        prepare_set(&reordered, &["src/b.rs", "src/a.rs", "src/a.rs"]),
+        cold_union
+    );
+    assert_eq!(
+        take_macro_frontier_cache_counts_for_test().0,
+        1,
+        "canonical file sets admit reordered duplicate paths"
+    );
+}
+
+#[test]
+fn transient_macro_fronts_bypass_retention_and_match_cold_answers() {
+    use brokk_bifrost_analysis::analyzer::i_analyzer::capture_query_reads;
+    use brokk_bifrost_analysis::analyzer::store::resolution_operation::take_macro_frontier_cache_counts_for_test;
+    use brokk_bifrost_analysis::analyzer::usages::get_definition::{
+        DefinitionLookupRequest, resolve_definition_batch_with_source,
+    };
+    let source = "macro_rules! identity { ($v:expr) => { $v }; } pub struct Item; pub fn f() { let _ = identity!(Item); let _ = Item; }";
+    let (project, _) = rust_source_project(source);
+    let disk = RustAnalyzer::new(project.project_dyn());
+    let file = project.file("src/lib.rs");
+    let lookup =
+        |analyzer: &dyn brokk_bifrost_analysis::analyzer::IAnalyzer, source: &str, name: &str| {
+            let start = source.rfind(name).unwrap();
+            let (answer, reads) = capture_query_reads(analyzer, || {
+                resolve_definition_batch_with_source(
+                    analyzer,
+                    vec![DefinitionLookupRequest {
+                        file: file.clone(),
+                        line: None,
+                        column: None,
+                        start_byte: Some(start),
+                        end_byte: Some(start + name.len()),
+                    }],
+                    file.clone(),
+                    Arc::from(source),
+                )
+            });
+            assert_eq!(
+                answer[0].status,
+                DefinitionLookupStatus::Resolved,
+                "{answer:#?}"
+            );
+            assert_eq!(answer[0].definitions[0].terminal_name(), name);
+            (
+                format!("{answer:?}"),
+                format!("{:?}", reads.keys()),
+                reads.channels(),
+            )
+        };
+    lookup(&disk, source, "Item");
+    let changed = source.replace("Item", "Other");
+    let overlay = Arc::new(OverlayProject::new(project.project_dyn()));
+    assert!(overlay.set(file.abs_path(), changed.clone()));
+    let live = disk.clone_with_project(Arc::new(overlay.snapshot()) as Arc<dyn Project>);
+    set_macro_frontier_cache_disabled_for_test(true);
+    let cold = lookup(&live, &changed, "Other");
+    set_macro_frontier_cache_disabled_for_test(false);
+    take_macro_frontier_cache_counts_for_test();
+    assert_eq!(lookup(&live, &changed, "Other"), cold);
+    assert_eq!(lookup(&live, &changed, "Other"), cold);
+    assert_eq!(
+        take_macro_frontier_cache_counts_for_test().0,
+        0,
+        "a transient source never reads or seeds a warm front"
+    );
+}
+
+struct MacroBoundaryReads<'a> {
+    analyzer: &'a dyn brokk_bifrost_analysis::analyzer::IAnalyzer,
+    before: Box<dyn Fn() + Send + Sync + 'a>,
+    after: Box<dyn Fn() + Send + Sync + 'a>,
+    reusable: bool,
+}
+impl brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedMacroFrontierReads
+    for MacroBoundaryReads<'_>
+{
+    fn capture(&self, prepare: &mut dyn FnMut() -> brokk_bifrost_analysis::analyzer::store::Result<brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionStageOutcome>) -> (brokk_bifrost_analysis::analyzer::store::Result<brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionStageOutcome>, Box<dyn std::any::Any + Send + Sync>){
+        use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedMacroFrontierReads;
+        (self.before)();
+        let result = SelectedMacroFrontierReads::capture(&self.analyzer, prepare);
+        (self.after)();
+        result
+    }
+    fn replay(&self, receipt: &(dyn std::any::Any + Send + Sync)) {
+        brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedMacroFrontierReads::replay(&self.analyzer,receipt);
+    }
+    fn receipt_bytes(&self, receipt: &(dyn std::any::Any + Send + Sync)) -> usize {
+        brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedMacroFrontierReads::receipt_bytes(&self.analyzer,receipt)
+    }
+    fn receipt_is_reusable(&self, receipt: &(dyn std::any::Any + Send + Sync)) -> bool {
+        self.reusable && brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedMacroFrontierReads::receipt_is_reusable(&self.analyzer,receipt)
+    }
+    fn policy_unit_label(&self) -> Option<String> {
+        None
+    }
+}
+
+struct MacroGenerationProject {
+    delegate: Arc<dyn Project>,
+    epoch: Arc<std::sync::atomic::AtomicU64>,
+}
+impl Project for MacroGenerationProject {
+    fn root(&self) -> &Path {
+        self.delegate.root()
+    }
+    fn analyzer_languages(&self) -> std::collections::BTreeSet<Language> {
+        self.delegate.analyzer_languages()
+    }
+    fn all_files(
+        &self,
+    ) -> std::io::Result<std::collections::BTreeSet<brokk_bifrost_core::analyzer::model::ProjectFile>>
+    {
+        self.delegate.all_files()
+    }
+    fn analyzable_files(
+        &self,
+        language: Language,
+    ) -> std::io::Result<std::collections::BTreeSet<brokk_bifrost_core::analyzer::model::ProjectFile>>
+    {
+        self.delegate.analyzable_files(language)
+    }
+    fn file_by_rel_path(
+        &self,
+        path: &Path,
+    ) -> Option<brokk_bifrost_core::analyzer::model::ProjectFile> {
+        self.delegate.file_by_rel_path(path)
+    }
+    fn ignore_rules_digest(&self) -> std::io::Result<[u8; 32]> {
+        self.delegate.ignore_rules_digest()
+    }
+    fn analysis_generation(&self) -> u64 {
+        self.epoch.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+#[test]
+fn macro_front_terminal_states_precede_optional_receipt_admission() {
+    use brokk_bifrost_analysis::analyzer::store::resolution_operation::{
+        SelectedResolutionStageOutcome, take_macro_frontier_cache_counts_for_test,
+    };
+    for scenario in [
+        "cancel_in_builder",
+        "cancel_after_ready",
+        "generation_after_ready",
+    ] {
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file("Cargo.toml","[package]\nname=\"front_terminal\"\nversion=\"0.1.0\"\nedition=\"2024\"\n")
+            .file("src/lib.rs", "macro_rules! identity { ($v:expr) => {$v}; } pub struct Item; pub fn f() { let _ = identity!(Item); }").build();
+        let epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let project = Arc::new(MacroGenerationProject {
+            delegate: fixture.project_dyn(),
+            epoch: epoch.clone(),
+        });
+        let rust = RustAnalyzer::new(project);
+        let analyzer: &dyn brokk_bifrost_analysis::analyzer::IAnalyzer = &rust;
+        let cancellation = CancellationToken::new();
+        let report = rust.open_selected_rust_operation(&cancellation);
+        let SelectedResolutionOperationOpenOutcome::Ready(operation) = report.outcome.unwrap()
+        else {
+            panic!("fixture opens")
+        };
+        let before_cancel = cancellation.clone();
+        let after_cancel = cancellation.clone();
+        let operation = (*operation).with_macro_frontier_reads(Box::new(MacroBoundaryReads {
+            analyzer,
+            before: Box::new(move || {
+                if scenario == "cancel_in_builder" {
+                    before_cancel.cancel();
+                }
+            }),
+            after: Box::new(move || {
+                if scenario == "cancel_after_ready" {
+                    after_cancel.cancel();
+                }
+                if scenario == "generation_after_ready" {
+                    epoch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }),
+            reusable: false,
+        }));
+        assert!(
+            operation
+                .ensure_selected_rust_inputs(&cancellation)
+                .unwrap()
+        );
+        take_macro_frontier_cache_counts_for_test();
+        let result = operation
+            .prepare_selected_macro_frontiers_for_files(&[Path::new("src/lib.rs")], &cancellation)
+            .unwrap();
+        if scenario == "generation_after_ready" {
+            assert!(matches!(result, SelectedResolutionStageOutcome::Stale(_)));
+        } else {
+            assert!(matches!(result, SelectedResolutionStageOutcome::Cancelled));
+        }
+        assert_eq!(take_macro_frontier_cache_counts_for_test().0, 0);
+    }
+}
+
+#[test]
+fn macro_front_owned_publication_is_ready_then_retains_the_second_build() {
+    use brokk_bifrost_analysis::analyzer::store::resolution_operation::{
+        SelectedResolutionStageOutcome, take_macro_frontier_cache_counts_for_test,
+    };
+    let fixture = InlineTestProject::with_language(Language::Rust)
+        .file("Cargo.toml", "[package]\nname=\"front_publication\"\nversion=\"0.1.0\"\nedition=\"2024\"\n")
+        .file("src/defs.rs", "macro_rules! dispatch { ($($path:ident)::* ($dt:expr) ($($args:expr),*)) => {{ match $dt { 0 => $($path)::*::<i8>($($args),*), _ => $($path)::*::<i16>($($args),*), } }}; }")
+        .file("src/lib.rs", "#[macro_use] mod defs; pub struct Tensor; impl Tensor { pub fn datum_type(&self) -> u8 {0} } pub fn permute<T>(_dt:u8,_t:&Tensor) {} pub fn caller(t:&Tensor) { let _x = dispatch!(permute(t.datum_type())(t)); }")
+        .build();
+    let rust = RustAnalyzer::new(fixture.project_dyn());
+    let analyzer: &dyn brokk_bifrost_analysis::analyzer::IAnalyzer = &rust;
+    let cancellation = CancellationToken::new();
+    let open = || {
+        let report = rust.open_selected_rust_operation(&cancellation);
+        let SelectedResolutionOperationOpenOutcome::Ready(operation) = report.outcome.unwrap()
+        else {
+            panic!("fixture opens")
+        };
+        let operation = (*operation).with_macro_frontier_reads(Box::new(analyzer));
+        assert!(
+            operation
+                .ensure_selected_rust_inputs(&cancellation)
+                .unwrap()
+        );
+        operation
+    };
+    let prepare=|operation:&brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<'_, '_>| {
+        assert!(matches!(operation.prepare_selected_macro_frontiers_for_files(&[Path::new("src/lib.rs")],&cancellation).unwrap(),SelectedResolutionStageOutcome::Ready));
+        operation.observe_macro_retention_result(true);
+        operation.macro_front_state_digest_for_test().unwrap()
+    };
+    let first = open();
+    let before = first.macro_front_data_version_for_test().unwrap();
+    let cold = prepare(&first);
+    assert_eq!(brokk_bifrost_analysis::analyzer::store::resolution_operation::macro_front_last_reason_for_test(), Some("unretained_data_version_advanced_during_build"));
+    let after = first.macro_front_data_version_for_test().unwrap();
+    assert_ne!(
+        before, after,
+        "the builder publishes its own immutable capsule"
+    );
+    drop(first);
+    take_macro_frontier_cache_counts_for_test();
+    let second = open();
+    assert_eq!(prepare(&second), cold);
+    drop(second);
+    let (hits, builds) = take_macro_frontier_cache_counts_for_test();
+    assert_eq!(hits, 0);
+    assert_eq!(builds, 1);
+    let third = open();
+    assert_eq!(prepare(&third), cold);
+    assert_eq!(
+        take_macro_frontier_cache_counts_for_test().0,
+        1,
+        "the second build was retained"
+    );
 }

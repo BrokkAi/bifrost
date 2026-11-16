@@ -54,6 +54,13 @@ pub enum ReferenceOmission {
 /// selected operation can authorize publication after its final authority check.
 #[doc(hidden)]
 pub trait SelectedRustReverseQueries {
+    /// Canonical declarations and intrinsic names, in input order. None stops
+    /// publication; a missing per-item projection remains explicit evidence.
+    fn diagnostic_definitions(
+        &mut self,
+        definitions: &[SemanticId],
+    ) -> Result<Option<Vec<native_units::SelectedDiagnosticIdentity>>>;
+
     /// Whether an implementation member has callers outside the named inverse.
     fn unenumerable_member_dispatch(&mut self, target: &CodeUnit) -> Result<Option<bool>>;
     /// The project's analysis generation, as this operation captured it when

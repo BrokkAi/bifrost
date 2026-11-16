@@ -74,6 +74,10 @@ pub struct LabelFunctionId(u32);
 impl LabelFunctionId {
     /// Every table interns the identity first.
     pub const IDENTITY: Self = Self(0);
+
+    pub(super) const fn index(self) -> usize {
+        self.0 as usize
+    }
 }
 
 /// The label functions of one search, interned so that path keys and hops
@@ -98,6 +102,11 @@ impl<L: ComposeLabels> LabelFunctions<L> {
         let identity = table.labels.identity();
         assert_eq!(table.intern(identity), LabelFunctionId::IDENTITY);
         table
+    }
+
+    /// Move the existing function pool without retaining the borrowed algebra.
+    pub(super) fn into_functions(self) -> Vec<L::Function> {
+        self.functions
     }
 
     pub const fn labels(&self) -> &L {

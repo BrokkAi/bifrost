@@ -1722,6 +1722,13 @@ pub enum ResolutionIncompleteReason {
     /// It is appended last so the derived order and hash of the other reasons
     /// do not move.
     ReceiverSubclassObligation(SemanticId),
+    /// A stored Rust gap reason this reader does not understand. This is
+    /// reader-local evidence, never a lowered or persisted completion kind.
+    /// Append it so existing reason ordering and hashes remain unchanged.
+    Unclassified(SemanticId),
+    /// Selected overlay edges can introduce module ownership outside the
+    /// persisted placements. Request-local only; never a persisted reason.
+    OverlayFrontierUnknown(SemanticId),
 }
 
 impl ResolutionIncompleteReason {
@@ -1735,11 +1742,16 @@ impl ResolutionIncompleteReason {
                 | Self::CyclicPrefixDependency(_)
                 | Self::ReceiverBudgetExhausted(_)
                 | Self::TimeBudgetExceeded(_)
+                | Self::Unclassified(_)
         )
     }
 
     pub const fn kind(self) -> ResolutionCompletionReasonKind {
         match self {
+            Self::OverlayFrontierUnknown(_) => panic!("overlay frontier is request-local"),
+            Self::Unclassified(_) => {
+                panic!("a reader-local unclassified reason has no persisted kind")
+            }
             Self::Cancelled => {
                 panic!("operation-local cancellation has no persisted completion-reason kind")
             }
@@ -1810,6 +1822,12 @@ pub(crate) fn content_ordered_completion_debug(
             ResolutionIncompleteReason::ReceiverSubclassObligation(semantic) => {
                 (9, Some((*semantic).into()), "")
             }
+            ResolutionIncompleteReason::OverlayFrontierUnknown(semantic) => {
+                (11, Some((*semantic).into()), "")
+            }
+            ResolutionIncompleteReason::Unclassified(semantic) => {
+                (10, Some((*semantic).into()), "")
+            }
         };
         let digest = identity.map(&mut content).unwrap_or([0; 32]);
         let label = match kind {
@@ -1823,6 +1841,8 @@ pub(crate) fn content_ordered_completion_debug(
             7 => "TimeBudgetExceeded",
             8 => "UnmountedFile",
             9 => "ReceiverSubclassObligation",
+            10 => "Unclassified",
+            11 => "OverlayFrontierUnknown",
             _ => unreachable!(),
         };
         let mut value = String::new();
@@ -2128,6 +2148,10 @@ impl ResolutionCompletion {
     #[doc(hidden)]
     pub fn contains_reason(&self, reason: ResolutionIncompleteReason) -> bool {
         matches!(self, Self::Incomplete(reasons) if reasons.contains(&reason))
+    }
+
+    pub fn has_reason(&self, predicate: impl FnMut(&ResolutionIncompleteReason) -> bool) -> bool {
+        matches!(self, Self::Incomplete(reasons) if reasons.iter().any(predicate))
     }
 
     /// Rebuild already-canonical reasons without sorting them again.
@@ -2602,8 +2626,11 @@ impl TypeTransferRule {
 }
 
 /// The value alternatives at one point where binding hands work to type flow.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypedFrontierState {
+    /// Evaluation-local edge evidence; excluded from published frontier hashes.
+    #[doc(hidden)]
+    pub declared_type_edges: std::collections::BTreeMap<SemanticId, ResolutionCompletion>,
     #[doc(hidden)]
     pub unindexed_external: Box<[UnindexedExternalFrontier]>,
     #[doc(hidden)]
@@ -2627,6 +2654,7 @@ impl TypedFrontierState {
         Self {
             slot,
             unindexed_external: Box::new([]),
+            declared_type_edges: Default::default(),
             possible_values: possible_values.into_boxed_slice(),
             completion,
         }
@@ -2692,7 +2720,18 @@ impl TypedFrontierState {
             completion: value_obligation_completion(slot, &possible_values, completion),
             possible_values,
             unindexed_external: Box::new([]),
+            declared_type_edges: Default::default(),
         })
+    }
+}
+
+// Edge evidence belongs to the fixed point, not to persisted answer identity.
+impl std::hash::Hash for TypedFrontierState {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&self.unindexed_external, state);
+        std::hash::Hash::hash(&self.slot, state);
+        std::hash::Hash::hash(&self.possible_values, state);
+        std::hash::Hash::hash(&self.completion, state);
     }
 }
 
@@ -4451,6 +4490,7 @@ mod tests {
                 ResolutionIncompleteReason::UnsupportedSemantic(identities.named_semantic(
                     digest,
                     "go-import-incomplete",
+                    crate::analyzer::resolution::ReasonDeterminism::Unaudited,
                     "provider",
                 ))
             });

@@ -112,6 +112,8 @@ const DISPATCH_SITE_ID_DOMAIN: &[u8] = b"bifrost.code_query.dispatch_site.v1";
 const DISPATCH_TARGET_ID_DOMAIN: &[u8] = b"bifrost.code_query.dispatch_target.v1";
 /// Domain separator for one dispatch arm's semantic target identity.
 const DISPATCH_TARGET_IDENTITY_DOMAIN: &[u8] = b"bifrost.code_query.dispatch_target_identity.v1";
+/// Domain separator for one dispatch arm's lever-independent selection key.
+const DISPATCH_TARGET_SELECTION_DOMAIN: &[u8] = b"bifrost.code_query.dispatch_target_selection.v1";
 
 /// One bounded-dispatch answer for one exact source position, shared by the
 /// site's outcome row and each of its target rows.
@@ -121,6 +123,10 @@ pub(super) struct DispatchSiteValue {
     pub(super) range: Range,
     pub(super) site_id: String,
     pub(super) site_ast_id: Option<String>,
+    /// The innermost declaration enclosing the site. A policy finding on one
+    /// of the site's target rows is owned by it, so the finding id names the
+    /// site by declaration and occurrence, never by byte position (#12029).
+    pub(super) enclosing: Option<CodeUnit>,
     pub(super) answer: Arc<DispatchSiteAnswer>,
 }
 
@@ -153,6 +159,31 @@ impl DispatchTargetValue {
         digest.push(self.site.site_id.as_bytes());
         digest.push(&self.ordinal.to_le_bytes());
         digest.push(self.arm().target_id.as_bytes());
+        digest.finish().to_string()
+    }
+
+    /// The arm's target as the source names it: its semantic locator.
+    ///
+    /// Unlike [`Self::id`], it leaves out the site, the arm ordinal and the
+    /// target's artifact fingerprint. The fingerprint folds the adapter
+    /// semantics and semantic IR versions, so a cache-identity lever token
+    /// rotates it with no change to the analyzed code, and the site id hashes
+    /// the site's byte range. A policy finding anchored on this arm keeps its
+    /// id across both: it names the site by its enclosing declaration, its
+    /// source text and its occurrence there instead (#12029).
+    pub(super) fn selection_key(&self) -> String {
+        let arm = self.arm();
+        let mut digest = LengthDelimitedDigest::new(DISPATCH_TARGET_SELECTION_DOMAIN);
+        match &arm.target_locator {
+            Some(locator) => {
+                digest.push(b"locator");
+                semantic::push_locator_bytes(&mut digest, locator);
+            }
+            None => {
+                digest.push(b"path");
+                digest.push(arm.target_path.as_bytes());
+            }
+        }
         digest.finish().to_string()
     }
 }
@@ -254,6 +285,7 @@ impl DispatchSiteAnswer {
 pub(super) struct DispatchArm {
     pub(super) call_context: usize,
     /// Exact source-backed target retained without pinning its artifact.
+    pub(super) target_kind: Option<crate::analyzer::semantic::ProcedureKind>,
     pub(super) target_procedure: Option<brokk_bifrost_flow::value_flow::DurableProcedureKey>,
     /// The exact selected semantic locator. A local source procedure has no
     /// indexed CodeUnit, so its durable key and locator remain the typed join.
@@ -393,12 +425,14 @@ pub(super) fn dispatch_expansions_for_input(
     let (answer, incompleteness) = semantic.dispatch_at_source_with_cause(file, range);
     if incompleteness.execution_cause().is_some() {
         analyzer.mark_execution_dependent();
+        semantic.join_reuse(EXECUTION_DEPENDENT);
     }
     let site = DispatchSiteValue {
         file: file.clone(),
         range,
         site_id,
         site_ast_id: known_ast_id.or(derived_ast_id),
+        enclosing: analyzer.enclosing_code_unit(file, &range),
         answer: Arc::new(answer),
     };
     if !targets {

@@ -13,6 +13,8 @@ pub(super) struct PythonImportCycleContext<'a> {
     pub(super) access_failure: &'a mut Option<String>,
     pub(super) limits: CodeQueryExecutionLimits,
     pub(super) cancellation: Option<&'a CancellationToken>,
+    /// The step's reuse verdict, joined at each execution dependence marked.
+    pub(super) reuse: &'a mut ReuseVerdict,
 }
 
 #[derive(Default)]
@@ -59,7 +61,7 @@ pub(super) fn reverse_import_reachability(
     result.files.insert(imported_file.clone());
     let mut frontier = vec![imported_file.clone()];
     if charge_import_file(context).is_none() {
-        report_budget_exhausted(diagnostics, "file");
+        report_budget_exhausted(diagnostics, "file", context);
         result.complete = false;
         return result;
     }
@@ -112,7 +114,7 @@ pub(super) fn reverse_import_reachability(
                     .insert(target.clone());
                 if result.files.insert(importer.clone()) {
                     if charge_import_file(context).is_none() {
-                        report_budget_exhausted(diagnostics, "file");
+                        report_budget_exhausted(diagnostics, "file", context);
                         result.complete = false;
                         break;
                     }
@@ -125,6 +127,7 @@ pub(super) fn reverse_import_reachability(
         }
         if !context.analyzer.workspace_content_matches(identity) {
             context.analyzer.mark_execution_dependent();
+            context.reuse.join_in(EXECUTION_DEPENDENT);
             report_incomplete(
                 diagnostics,
                 Incompleteness::Operational(DerivationExecutionCause::Snapshot),
@@ -134,7 +137,7 @@ pub(super) fn reverse_import_reachability(
             break;
         }
         if adjacency.exhausted {
-            report_budget_exhausted(diagnostics, "edge");
+            report_budget_exhausted(diagnostics, "edge", context);
             result.complete = false;
             break;
         }
@@ -205,7 +208,7 @@ pub(super) fn annotate_import_site(
     let mut incomplete = false;
 
     if charge_import_file(context).is_none() {
-        report_budget_exhausted(diagnostics, "file");
+        report_budget_exhausted(diagnostics, "file", context);
         summarize_cycle_state(site);
         return;
     }
@@ -269,6 +272,7 @@ pub(super) fn annotate_import_site(
 
         if !context.analyzer.workspace_content_matches(content_identity) {
             context.analyzer.mark_execution_dependent();
+            context.reuse.join_in(EXECUTION_DEPENDENT);
             report_incomplete(
                 diagnostics,
                 Incompleteness::Operational(DerivationExecutionCause::Snapshot),
@@ -280,14 +284,14 @@ pub(super) fn annotate_import_site(
             break;
         }
         if adjacency.exhausted {
-            report_budget_exhausted(diagnostics, "edge");
+            report_budget_exhausted(diagnostics, "edge", context);
             traversal_incompleteness =
                 Incompleteness::Operational(DerivationExecutionCause::Budget);
             incomplete = true;
             break;
         }
         if incomplete {
-            report_budget_exhausted(diagnostics, "file");
+            report_budget_exhausted(diagnostics, "file", context);
             break;
         }
         next_frontier.sort();
@@ -407,6 +411,7 @@ pub(super) fn read_reverse_adjacency(
         }
         Ok(Some(_)) => {
             context.analyzer.mark_execution_dependent();
+            context.reuse.join_in(EXECUTION_DEPENDENT);
             report_incomplete(
                 diagnostics,
                 Incompleteness::Operational(DerivationExecutionCause::Snapshot), "workspace content changed during Python import cycle read.",
@@ -424,7 +429,7 @@ pub(super) fn read_reverse_adjacency(
                 .max_pipeline_rows
                 .saturating_sub(context.budget.import_edges_resolved);
             if max_files == 0 {
-                report_budget_exhausted(diagnostics, "file");
+                report_budget_exhausted(diagnostics, "file", context);
                 return None;
             }
             match context.analyzer.refresh_persisted_import_graph(
@@ -444,6 +449,7 @@ pub(super) fn read_reverse_adjacency(
                         .saturating_add(refresh.recomputed_edges);
                     if !context.analyzer.workspace_content_matches(identity) {
                         context.analyzer.mark_execution_dependent();
+                        context.reuse.join_in(EXECUTION_DEPENDENT);
                         report_incomplete(
                             diagnostics,
                             Incompleteness::Operational(DerivationExecutionCause::Snapshot), "workspace content changed while refreshing the Python import graph.",
@@ -468,6 +474,7 @@ pub(super) fn read_reverse_adjacency(
                         }
                         Ok(Some(_)) => {
                             context.analyzer.mark_execution_dependent();
+                            context.reuse.join_in(EXECUTION_DEPENDENT);
                             report_incomplete(
                                 diagnostics,
                                 Incompleteness::Operational(DerivationExecutionCause::Snapshot), "workspace content changed during Python import cycle read.",
@@ -518,11 +525,12 @@ pub(super) fn read_reverse_adjacency(
 }
 
 pub(super) fn charge_import_file(context: &mut PythonImportCycleContext<'_>) -> Option<()> {
-    if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+    if brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
         context.budget.import_files_resolved,
         context.limits.max_scanned_files,
     )
-    .allows(1)
+    .try_allow(1)
+    .is_err()
     {
         return None;
     }
@@ -548,15 +556,42 @@ fn summarize_cycle_state(site: &mut CodeQueryPythonImportSite) {
     );
 }
 
-pub(super) fn report_budget_exhausted(diagnostics: &mut Vec<CodeQueryDiagnostic>, dimension: &str) {
-    // Persisted adjacency reports its row cap after the bounded store read.
+pub(super) fn report_budget_exhausted(
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    dimension: &str,
+    context: &mut PythonImportCycleContext<'_>,
+) {
     brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
-    push_cycle_diagnostic(
-        diagnostics,
+    // Persisted adjacency reports its row cap after the bounded store read.
+    context.reuse.join_in(EXECUTION_DEPENDENT);
+    let mut diagnostic = incomplete_diagnostic(
         CodeQueryDiagnosticCode::ImportGraphBudgetExhausted,
         Incompleteness::Operational(DerivationExecutionCause::Budget),
+        "python",
         format!("Python import-cycle {dimension} budget was exhausted."),
+        Vec::new(),
     );
+    let (lane, charge) = match dimension {
+        "file" => (
+            "query/scanned_files",
+            Some(CodeQueryExhaustedCharge {
+                attempted: context.budget.import_files_resolved.saturating_add(1),
+                limit: context.limits.max_scanned_files,
+            }),
+        ),
+        "edge" => ("query/pipeline_rows", None),
+        _ => unreachable!("import cycle budgets are file or edge allowances"),
+    };
+    diagnostic.exhausted_roots.push(CodeQueryExhaustedRoot {
+        path: ".".to_string(),
+        procedure: None,
+        lane: lane.to_string(),
+        stage: Some("python_import_cycles".to_string()),
+        budget: None,
+        charge,
+        feedback_iteration: None,
+    });
+    merge_budget_diagnostic(diagnostics, diagnostic);
 }
 
 pub(super) fn report_incomplete(
@@ -606,6 +641,10 @@ fn push_cycle_diagnostic(
         return;
     }
     diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        has_non_utf8_refusal: false,
+        refusal_sites: Default::default(),
+        call_relation_facts: None,
+        uses_omissions: Vec::new(),
         incompleteness,
         related: Vec::new(),
         source: None,

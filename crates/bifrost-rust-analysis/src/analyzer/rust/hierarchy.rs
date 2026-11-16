@@ -105,7 +105,7 @@ impl TypeHierarchyProvider for RustAnalyzer {
                     open: vec![HierarchyOpenReason::MemberFamily(
                         MemberFamilyReason::HierarchyTruncated,
                     )],
-                    ..HierarchyAnswer::default()
+                    ..HierarchyAnswer::complete(Vec::new())
                 }
             }
         };
@@ -146,7 +146,7 @@ impl TypeHierarchyProvider for RustAnalyzer {
                 self.record_hierarchy_error(error);
                 Ok(HierarchyAnswer {
                     open: vec![HierarchyOpenReason::DescendantIndexUnavailable],
-                    ..HierarchyAnswer::default()
+                    ..HierarchyAnswer::complete(Vec::new())
                 })
             }
         }
@@ -557,6 +557,7 @@ mod tests {
                 &analyzer,
                 scope.token(),
                 &owner,
+                &[owner.identifier().to_owned()],
                 &|| false
             ),
             Err(RustCargoRouteError::Cancelled)
@@ -566,6 +567,7 @@ mod tests {
                 &analyzer,
                 scope.token(),
                 &owner,
+                &[owner.identifier().to_owned()],
                 &|| true
             )
             .unwrap(),
@@ -707,6 +709,7 @@ generate! { struct Generated; impl Contract for Generated {} }
                 &analyzer,
                 scope.token(),
                 &definition(&analyzer, "Contract"),
+                &["Contract".to_owned()],
                 &|| true,
             )
             .unwrap(),
@@ -817,6 +820,7 @@ mod other {
                 &analyzer,
                 scope.token(),
                 &definition(&analyzer, "source.Contract"),
+                &["Contract".to_owned()],
                 &|| true,
             )
             .unwrap(),
@@ -837,6 +841,7 @@ mod other {
                 &analyzer,
                 scope.token(),
                 &owner,
+                &[owner.identifier().to_owned()],
                 &|| true
             )
             .is_err()
@@ -935,6 +940,7 @@ impl Contract for Item {
                 &analyzer,
                 scope.token(),
                 &owner,
+                &[owner.identifier().to_owned()],
                 &|| true,
             )
             .unwrap(),
@@ -944,10 +950,16 @@ impl Contract for Item {
             brokk_bifrost_rust::graph_support::rust_trait_member_implementations(
                 &analyzer,
                 scope.token(),
-                &member
+                &member,
+                &|owner| vec![owner.identifier().to_owned()],
             )
             .unwrap(),
-            Some(vec![implementation])
+            Some(
+                brokk_bifrost_rust::graph_support::RustTraitMemberImplementations {
+                    implementations: vec![implementation],
+                    gaps: vec![]
+                }
+            )
         );
         assert!(scope.store_error().is_none());
     }

@@ -2117,7 +2117,7 @@ pub(crate) fn execute_reverse_partitions<A: WorkerAnswer>(
 ) -> Result<Vec<ReversePartitionResult<A>>> {
     let partitions = confirmation_partitions(admitted);
     let worker_count = crate::analyzer::default_parallelism().min(partitions.len().max(1));
-    if worker_count == 1 || selected.worker_store().uses_single_connection_reads() {
+    if worker_count == 1 {
         return Ok(vec![ReversePartitionResult {
             range: 0..admitted.len(),
             outcome: if cancellation.soft_deadline_passed() {

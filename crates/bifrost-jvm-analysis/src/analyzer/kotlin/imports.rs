@@ -496,8 +496,8 @@ mod tests {
                 assert!(!Arc::ptr_eq(&outer, &own));
                 own.store(7, Ordering::Relaxed);
                 assert_eq!(java.inner().retained_fill_domain_count_for_test(), 1);
-                // An execution-dependent reason, because fills inherit only that
-                // class (#8618); stable content gaps stay with their own answer.
+                // Reasons propagate upward from the scope that read them; they
+                // do not pass down into a nested peer scope (#11701).
                 kotlin.record_query_incomplete(
                     brokk_bifrost_analysis::analyzer::QueryReadIncomplete::SemanticEvidenceUnavailable(
                         "own fill".into(),
@@ -505,8 +505,8 @@ mod tests {
                 );
                 let nested = AnalyzerQueryScope::capturing_read_incompleteness(&java);
                 assert!(
-                    !nested.captured_read_incompleteness().is_empty(),
-                    "a lazily accessed peer must inherit its actual same-domain parent"
+                    nested.captured_read_incompleteness().is_empty(),
+                    "a lazily accessed peer reports only its own reads"
                 );
             }
             // The shared domain lives as long as its request.

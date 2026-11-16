@@ -2883,7 +2883,10 @@ pub(in crate::analyzer::semantic_model::csmi) fn transfer_to_csmi(
     let source = input_to_csmi(&transfer.input)?;
     let destination = output_to_csmi(&transfer.output)?;
     if transfer.exit_kind == CompiledSummaryExitKind::Exceptional
-        && !matches!(transfer.output, CompiledSummaryOutput::ExceptionalReturn {})
+        && !matches!(
+            transfer.output,
+            CompiledSummaryOutput::ExceptionalReturn { path: None }
+        )
     {
         return Err(CsmiExportError::Unsupported {
             path: "procedureSummaries.transfers".to_owned(),
@@ -2989,14 +2992,21 @@ fn type_ref_symbol(
 }
 
 fn input_to_csmi(input: &CompiledSummaryInput) -> Result<CsmiInputLocation, CsmiExportError> {
+    if input.path().is_some() {
+        return Err(CsmiExportError::Unsupported {
+            path: "procedureSummaries.transfers.input".to_owned(),
+            semantic: "typed summary endpoint projections are not representable in CSMI core"
+                .to_owned(),
+        });
+    }
     let root = match input {
-        CompiledSummaryInput::Receiver {} => {
+        CompiledSummaryInput::Receiver { .. } => {
             CsmiInputBoundaryRoot::Receiver(CsmiInputReceiverRoot {
                 phase: CsmiInputPhase::Input,
                 role: CsmiReceiverRootRole::Receiver,
             })
         }
-        CompiledSummaryInput::Parameter { ordinal } => {
+        CompiledSummaryInput::Parameter { ordinal, .. } => {
             CsmiInputBoundaryRoot::Parameter(CsmiInputParameterRoot {
                 phase: CsmiInputPhase::Input,
                 role: CsmiParameterRootRole::Parameter,
@@ -3011,28 +3021,35 @@ fn input_to_csmi(input: &CompiledSummaryInput) -> Result<CsmiInputLocation, Csmi
 }
 
 fn output_to_csmi(output: &CompiledSummaryOutput) -> Result<CsmiOutputLocation, CsmiExportError> {
+    if output.path().is_some() {
+        return Err(CsmiExportError::Unsupported {
+            path: "procedureSummaries.transfers.output".to_owned(),
+            semantic: "typed summary endpoint projections are not representable in CSMI core"
+                .to_owned(),
+        });
+    }
     let root = match output {
-        CompiledSummaryOutput::NormalReturn {} => {
+        CompiledSummaryOutput::NormalReturn { .. } => {
             CsmiOutputBoundaryRoot::Result(CsmiOutputResultRoot {
                 phase: CsmiOutputPhase::Output,
                 role: CsmiResultRootRole::Result,
                 position: 0,
             })
         }
-        CompiledSummaryOutput::IndexedNormalReturn { ordinal } => {
+        CompiledSummaryOutput::IndexedNormalReturn { ordinal, .. } => {
             CsmiOutputBoundaryRoot::Result(CsmiOutputResultRoot {
                 phase: CsmiOutputPhase::Output,
                 role: CsmiResultRootRole::Result,
                 position: *ordinal,
             })
         }
-        CompiledSummaryOutput::Receiver {} => {
+        CompiledSummaryOutput::Receiver { .. } => {
             CsmiOutputBoundaryRoot::Receiver(CsmiOutputReceiverRoot {
                 phase: CsmiOutputPhase::Output,
                 role: CsmiReceiverRootRole::Receiver,
             })
         }
-        CompiledSummaryOutput::ExceptionalReturn {} => {
+        CompiledSummaryOutput::ExceptionalReturn { .. } => {
             CsmiOutputBoundaryRoot::Exception(CsmiOutputExceptionRoot {
                 phase: CsmiOutputPhase::Output,
                 role: CsmiExceptionRootRole::Exception,

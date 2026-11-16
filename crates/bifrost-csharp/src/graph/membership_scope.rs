@@ -429,6 +429,7 @@ impl<'a> MembershipScopedSource<'a> {
             rows: self.admit_vec(batch.rows),
             inspected: batch.inspected,
             complete: batch.complete,
+            incomplete_reasons: batch.incomplete_reasons,
         }
     }
 }
@@ -984,7 +985,8 @@ impl TypeHierarchyProvider for MembershipScopedSource<'_> {
         &self,
         code_unit: &CodeUnit,
     ) -> brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer {
-        let mut answer = brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer::default();
+        let mut answer =
+            brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer::complete(Vec::new());
         for part in self.physical_parts(code_unit) {
             answer.merge(self.inner.get_direct_descendants(&part));
         }
@@ -1008,7 +1010,8 @@ impl TypeHierarchyProvider for MembershipScopedSource<'_> {
         brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer,
         brokk_bifrost_core::analyzer::capabilities::Cancelled,
     > {
-        let mut answer = brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer::default();
+        let mut answer =
+            brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer::complete(Vec::new());
         for part in self.physical_parts(code_unit) {
             answer.merge(self.inner.get_direct_descendants_within(&part, scope)?);
         }
@@ -1207,12 +1210,12 @@ impl CSharpSource for MembershipScopedSource<'_> {
             .workspace_import_info_limited(limit, continue_query)
     }
 
-    fn raw_supertypes_of(&self, code_unit: &CodeUnit) -> Vec<String> {
-        let raw = self.inner.raw_supertypes_of(code_unit);
-        if self.admit_supertypes(code_unit, &raw) {
+    fn declared_raw_supertypes(&self, code_unit: &CodeUnit) -> Option<Vec<String>> {
+        let raw = self.inner.declared_raw_supertypes(code_unit);
+        if self.admit_supertypes(code_unit, raw.as_deref().unwrap_or_default()) {
             raw
         } else {
-            Vec::new()
+            Some(Vec::new())
         }
     }
 

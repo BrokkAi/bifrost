@@ -307,6 +307,10 @@ mod tests {
     use crate::inline_project::InlineTestProject;
     use brokk_bifrost_analysis::analyzer::Language;
     use brokk_bifrost_analysis::analyzer::WorkspaceAnalyzer;
+    use brokk_bifrost_analysis::analyzer::store::python_unit_summaries::{
+        PythonSummaryCoverage, PythonUncoveredCause,
+    };
+    use brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupStatus;
     use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
 
     #[test]
@@ -555,5 +559,582 @@ mod tests {
             ),
             "{reasons:?}"
         );
+    }
+
+    /// What a reverse query for `model.pick` reports after unsaved edits.
+    struct OverlayReverse {
+        coverage: PythonSummaryCoverage,
+        complete: bool,
+        obligations: Vec<String>,
+        /// Paths of every retained (not excluded) site, sorted.
+        sites: Vec<String>,
+        positions: Vec<String>,
+    }
+
+    fn overlay_fixture() -> crate::inline_project::BuiltInlineTestProject {
+        InlineTestProject::with_language(Language::Python)
+            .file("model.py", "def pick(): pass\n")
+            .file(
+                "client.py",
+                "from model import pick\ndef run():\n    pick()\n",
+            )
+            .file(
+                "other.py",
+                "from model import pick\ndef run():\n    pick()\n",
+            )
+            .build()
+    }
+
+    fn reverse_pick(workspace: &WorkspaceAnalyzer, root: &std::path::Path) -> OverlayReverse {
+        let python = resolve_analyzer::<PythonAnalyzer>(workspace.analyzer()).unwrap();
+        let target = python
+            .top_level_declarations(&ProjectFile::new(root, "model.py"))
+            .into_iter()
+            .find(|target| target.short_name() == "pick")
+            .unwrap();
+        let cancellation = CancellationToken::new();
+        let PythonNativeOpen::Ready(request) =
+            open_python_native_request(python, &cancellation).unwrap()
+        else {
+            panic!("native fixture must open");
+        };
+        let files = python.analyzed_files().into_iter().collect();
+        let scope = UsageScanScope::with_cancellation(&files, &cancellation);
+        let result = request
+            .operation
+            .python_reverse_targets(
+                &request.environment,
+                std::slice::from_ref(&target),
+                &scope,
+                PythonReverseLimits::default(),
+                &ResolutionSession::unbounded(),
+            )
+            .unwrap();
+        let answer = &result.targets[0];
+        let mut sites = answer
+            .sites
+            .iter()
+            .filter(|site| !site.excluded)
+            .map(|site| site.path.clone())
+            .collect::<Vec<_>>();
+        sites.sort();
+        sites.dedup();
+        let mut positions = answer
+            .sites
+            .iter()
+            .filter(|site| !site.excluded)
+            .map(|site| format!("{}:{}..{}", site.path, site.start, site.end))
+            .collect::<Vec<_>>();
+        positions.sort();
+        OverlayReverse {
+            positions,
+            coverage: request.environment.coverage.clone(),
+            complete: answer.complete,
+            obligations: answer.obligations.clone(),
+            sites,
+        }
+    }
+
+    fn overlay_reverse(edits: &[(&str, &str)]) -> OverlayReverse {
+        use brokk_bifrost_core::analyzer::project::OverlayProject;
+        let fixture = overlay_fixture();
+        let base =
+            WorkspaceAnalyzer::build_ephemeral_footgun(fixture.project_dyn(), Default::default())
+                .unwrap();
+        let overlay = Arc::new(OverlayProject::new(fixture.project_dyn()));
+        for (name, source) in edits {
+            assert!(overlay.set(fixture.file(name).abs_path(), (*source).to_owned()));
+        }
+        let workspace = base.clone_with_project(Arc::new(overlay.snapshot()));
+        reverse_pick(&workspace, fixture.root())
+    }
+
+    fn mentions(answer: &OverlayReverse, label: &str) -> bool {
+        answer
+            .obligations
+            .iter()
+            .any(|obligation| obligation.contains(label))
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11536: an overlay replacement absent from the persisted Python summary panicked reverse nomination"
+    )]
+    fn overlay_surface_change_stays_a_required_context_and_reports_the_uncovered_member() {
+        let answer = overlay_reverse(&[(
+            "client.py",
+            "from model import pick\ndef run():\n    pick()\ndef added(): pass\n",
+        )]);
+        assert_eq!(
+            answer.coverage.uncovered(),
+            [("client.py".to_owned(), PythonUncoveredCause::InputChanged)]
+        );
+        assert!(answer.coverage.retained().is_empty());
+        assert!(!answer.complete);
+        assert!(
+            mentions(&answer, "python_summary_uncovered:client.py:input_changed"),
+            "{:?}",
+            answer.obligations
+        );
+        // Both callers stay represented: the replaced one is nominated and keeps
+        // its context, the unchanged one is not dropped.
+        assert_eq!(answer.sites, ["client.py", "other.py"]);
+    }
+
+    #[test]
+    fn overlay_with_equal_member_input_is_retained_and_joinable() {
+        let answer = overlay_reverse(&[(
+            "client.py",
+            "from model import pick\ndef run():\n    pick()\n    pick()\n",
+        )]);
+        assert_eq!(answer.coverage.retained(), ["client.py"]);
+        assert!(answer.coverage.uncovered().is_empty());
+        assert!(answer.complete, "{:?}", answer.obligations);
+        assert!(answer.coverage.unusable().is_empty());
+        assert_eq!(answer.sites, ["client.py", "other.py"]);
+    }
+
+    #[test]
+    fn covered_comment_overlay_matches_cold_edited_content() {
+        use brokk_bifrost_core::analyzer::project::OverlayProject;
+        let fixture = overlay_fixture();
+        let base =
+            WorkspaceAnalyzer::build_ephemeral_footgun(fixture.project_dyn(), Default::default())
+                .unwrap();
+        let edited = "# moved positions\n\nfrom model import pick\ndef run():\n    pick()\n";
+        let overlay = Arc::new(OverlayProject::new(fixture.project_dyn()));
+        assert!(overlay.set(fixture.file("client.py").abs_path(), edited.to_owned()));
+        let snapshot: Arc<dyn brokk_bifrost_core::analyzer::project::Project> =
+            Arc::new(overlay.snapshot());
+        let warm = base.clone_with_project(Arc::clone(&snapshot));
+        let cold =
+            WorkspaceAnalyzer::build_ephemeral_footgun(snapshot, Default::default()).unwrap();
+        let warm = reverse_pick(&warm, fixture.root());
+        let cold = reverse_pick(&cold, fixture.root());
+        assert_eq!(warm.coverage.retained(), ["client.py"]);
+        let start = edited.rfind("pick()").unwrap();
+        assert!(
+            warm.positions
+                .contains(&format!("client.py:{start}..{}", start + 4)),
+            "{:?}",
+            warm.positions
+        );
+        assert!(warm.complete, "{:?}", warm.obligations);
+        assert_eq!(
+            (warm.complete, warm.sites, warm.positions),
+            (cold.complete, cold.sites, cold.positions)
+        );
+
+        // A function-local import is a row of the member's surface (the
+        // imports relation), so adding one inside a body changes the
+        // MemberInput fingerprint: the replacement is not covered, and the
+        // answer stays incomplete instead of reusing the persisted rows,
+        // which do not list the new import.
+        let edited = "from model import pick\ndef run():\n    pick()\n    from model import pick\n    pick()\n";
+        let overlay = Arc::new(OverlayProject::new(fixture.project_dyn()));
+        assert!(overlay.set(fixture.file("client.py").abs_path(), edited.to_owned()));
+        let snapshot: Arc<dyn brokk_bifrost_core::analyzer::project::Project> =
+            Arc::new(overlay.snapshot());
+        let warm = reverse_pick(&base.clone_with_project(snapshot), fixture.root());
+        assert!(
+            warm.coverage.retained().is_empty(),
+            "a new function-local import must not be covered: {:?}",
+            warm.coverage.retained()
+        );
+        assert!(!warm.complete, "{:?} {:?}", warm.sites, warm.obligations);
+    }
+
+    #[test]
+    fn overlay_added_file_is_represented_and_incomplete() {
+        let answer = overlay_reverse(&[(
+            "added.py",
+            "from model import pick\ndef run():\n    pick()\n",
+        )]);
+        assert_eq!(
+            answer.coverage.uncovered(),
+            [("added.py".to_owned(), PythonUncoveredCause::Added)]
+        );
+        assert!(!answer.complete);
+        assert!(mentions(&answer, "python_summary_uncovered:added.py:added"));
+        assert_eq!(answer.sites, ["added.py", "client.py", "other.py"]);
+    }
+
+    #[test]
+    fn removed_path_keeps_the_mask_obligation() {
+        use brokk_bifrost_analysis::analyzer::store::resolution_operation::{
+            SelectedResolutionOperationInput, SelectedResolutionOperationOpenOutcome,
+        };
+        use brokk_bifrost_analysis::analyzer::store::resolution_selection::{
+            SelectedResolutionLanguage, SelectedResolutionOverlayMask,
+        };
+        let fixture = overlay_fixture();
+        let workspace =
+            WorkspaceAnalyzer::build_ephemeral_footgun(fixture.project_dyn(), Default::default())
+                .unwrap();
+        let python = resolve_analyzer::<PythonAnalyzer>(workspace.analyzer()).unwrap();
+        let cancellation = CancellationToken::new();
+        let mut environment = {
+            let PythonNativeOpen::Ready(request) =
+                open_python_native_request(python, &cancellation).unwrap()
+            else {
+                panic!("native fixture must open")
+            };
+            request.environment
+        };
+        let snapshots = python.inner.selected_workspace_snapshots();
+        let languages = [SelectedResolutionLanguage::new("python", Language::Python)];
+        let masks = [SelectedResolutionOverlayMask::removal(
+            "python",
+            "client.py",
+        )];
+        let input = SelectedResolutionOperationInput::new(
+            python.inner.project(),
+            python.inner.workspace_id(),
+            snapshots.as_ref(),
+            &languages,
+            &masks,
+        )
+        .with_analyzer(python);
+        let SelectedResolutionOperationOpenOutcome::Ready(operation) = python
+            .inner
+            .analyzer_store()
+            .open_selected_resolution_operation(input, &cancellation)
+            .unwrap()
+        else {
+            panic!("removal selection must open")
+        };
+        environment.coverage = operation
+            .python_summary_coverage(environment.summary)
+            .unwrap();
+        assert_eq!(
+            environment.coverage.uncovered(),
+            [("client.py".to_owned(), PythonUncoveredCause::Removed)]
+        );
+        assert_eq!(environment.coverage.unusable(), [("client.py", "removed")]);
+        let target = python
+            .top_level_declarations(&fixture.file("model.py"))
+            .into_iter()
+            .find(|target| target.short_name() == "pick")
+            .unwrap();
+        let files = python.analyzed_files().into_iter().collect();
+        let scope = UsageScanScope::with_cancellation(&files, &cancellation);
+        let result = operation
+            .python_reverse_targets(
+                &environment,
+                &[target],
+                &scope,
+                PythonReverseLimits::default(),
+                &ResolutionSession::unbounded(),
+            )
+            .unwrap();
+        assert!(!result.targets[0].complete);
+        assert!(
+            result.targets[0]
+                .obligations
+                .iter()
+                .any(|reason| reason.contains("python_summary_uncovered:client.py:removed")),
+            "{:?}",
+            result.targets[0].obligations
+        );
+    }
+
+    /// Definition of the `pick()` call in `client.py` after unsaved edits:
+    /// (targets, binding is complete, named reason details).
+    fn overlay_definition(edits: &[(&str, &str)]) -> (usize, bool, Vec<String>) {
+        use brokk_bifrost_analysis::analyzer::store::resolution_operation::{
+            SelectedResolutionLocated, SelectedResolutionOperationOutcome,
+        };
+        use brokk_bifrost_core::analyzer::project::OverlayProject;
+        use brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution;
+        let fixture = overlay_fixture();
+        let base =
+            WorkspaceAnalyzer::build_ephemeral_footgun(fixture.project_dyn(), Default::default())
+                .unwrap();
+        let overlay = Arc::new(OverlayProject::new(fixture.project_dyn()));
+        let mut client = "from model import pick\ndef run():\n    pick()\n".to_owned();
+        for (name, source) in edits {
+            assert!(overlay.set(fixture.file(name).abs_path(), (*source).to_owned()));
+            if *name == "client.py" {
+                client = (*source).to_owned();
+            }
+        }
+        let workspace = base.clone_with_project(Arc::new(overlay.snapshot()));
+        let python = resolve_analyzer::<PythonAnalyzer>(workspace.analyzer()).unwrap();
+        let cancellation = CancellationToken::new();
+        let PythonNativeOpen::Ready(mut request) =
+            open_python_native_request(python, &cancellation).unwrap()
+        else {
+            panic!("native fixture must open");
+        };
+        let start = client.rfind("pick()").unwrap();
+        let outcome = request
+            .operation
+            .python_definition_at(
+                &request.environment,
+                &ProjectFile::new(fixture.root(), "client.py"),
+                start..start + "pick".len(),
+                &ResolutionSession::unbounded(),
+            )
+            .unwrap();
+        let BoundedResolution::Complete {
+            value:
+                SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Found(answer)),
+            ..
+        } = outcome
+        else {
+            panic!("the definition query answers");
+        };
+        let binding = answer.reference.answer.binding();
+        (
+            binding.targets().len(),
+            binding.completion()
+                == &brokk_bifrost_analysis::analyzer::resolution::ResolutionCompletion::Complete,
+            answer
+                .reference
+                .named_reasons
+                .iter()
+                .map(|(kind, detail)| format!("{kind}:{detail}"))
+                .collect(),
+        )
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11536: a definition query in an overlay-replaced file answered Complete with no definition"
+    )]
+    fn definition_in_an_overlay_replaced_file_is_incomplete_not_absent() {
+        let (targets, complete, _) = overlay_definition(&[]);
+        assert_eq!((targets, complete), (1, true), "control: no overlay");
+        let (targets, complete, reasons) = overlay_definition(&[(
+            "client.py",
+            "# comment\nfrom model import pick\ndef run():\n    pick()\n",
+        )]);
+        assert_eq!((targets, complete), (1, true), "{reasons:?}");
+        let (_, complete, reasons) = overlay_definition(&[(
+            "client.py",
+            "from model import pick\ndef added(): pass\ndef run():\n    pick()\n",
+        )]);
+        assert!(!complete, "an uncovered file cannot answer Complete");
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.contains("python_summary_uncovered:client.py:input_changed")),
+            "{reasons:?}"
+        );
+    }
+
+    /// The product definition entry for the `pick()` call in `client.py`.
+    fn overlay_definition_status(edit: Option<&str>) -> (DefinitionLookupStatus, usize) {
+        use super::super::native_request::definition_lookup::PythonReceiverRequest;
+        use brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery;
+        use brokk_bifrost_core::analyzer::project::OverlayProject;
+        use brokk_bifrost_core::analyzer::usages::receiver_analysis::INTERACTIVE_TYPE_LOOKUP_BUDGET;
+        use brokk_bifrost_core::analyzer::usages::reference_site::ResolvedReferenceSite;
+        use brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution;
+        let fixture = overlay_fixture();
+        let base =
+            WorkspaceAnalyzer::build_ephemeral_footgun(fixture.project_dyn(), Default::default())
+                .unwrap();
+        let overlay = Arc::new(OverlayProject::new(fixture.project_dyn()));
+        let mut client = "from model import pick\ndef run():\n    pick()\n".to_owned();
+        if let Some(edit) = edit {
+            assert!(overlay.set(fixture.file("client.py").abs_path(), edit.to_owned()));
+            client = edit.to_owned();
+        }
+        let workspace = base.clone_with_project(Arc::new(overlay.snapshot()));
+        let python = resolve_analyzer::<PythonAnalyzer>(workspace.analyzer()).unwrap();
+        let cancellation = CancellationToken::new();
+        let file = ProjectFile::new(fixture.root(), "client.py");
+        let start = client.rfind("pick()").unwrap();
+        let site = ResolvedReferenceSite {
+            path: "client.py".into(),
+            text: "pick".into(),
+            range: brokk_bifrost_core::analyzer::Range {
+                start_byte: start,
+                end_byte: start + 4,
+                start_line: 1,
+                end_line: 1,
+            },
+            focus_start_byte: start,
+            focus_end_byte: start + 4,
+        };
+        let mut request = PythonReceiverRequest::open(python, &cancellation);
+        let BoundedResolution::Complete {
+            value: (outcome, _),
+            ..
+        } = request.resolve_definition_with_call_evidence_bounded(BoundedReceiverQuery {
+            analyzer: workspace.analyzer(),
+            file: &file,
+            source: &client,
+            tree: None,
+            site: &site,
+            budget: INTERACTIVE_TYPE_LOOKUP_BUDGET,
+            cancellation: Some(&cancellation),
+        })
+        else {
+            panic!("the definition lookup answers");
+        };
+        (outcome.status, outcome.definitions.len())
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11536: the product definition lookup in an overlay-replaced file reported a resolved or empty answer"
+    )]
+    fn product_definition_lookup_in_an_overlay_replaced_file_is_not_resolved() {
+        let (status, definitions) = overlay_definition_status(None);
+        assert_eq!((status, definitions), (DefinitionLookupStatus::Resolved, 1));
+        let (status, definitions) = overlay_definition_status(Some(
+            "from model import pick\ndef added(): pass\ndef run():\n    pick()\n",
+        ));
+        assert_eq!(
+            (status, definitions),
+            (DefinitionLookupStatus::Incomplete, 0)
+        );
+    }
+
+    /// The store-level definition answer for the last `needle` in `client.py` after
+    /// unsaved edits of other files: (binding complete, keyword outcome,
+    /// selected external imports, definitions).
+    fn definition_with_overlay(
+        files: &[(&str, &str)],
+        edits: &[(&str, &str)],
+        needle: &str,
+    ) -> (bool, &'static str, usize, usize) {
+        use brokk_bifrost_analysis::analyzer::store::resolution_operation::{
+            SelectedNativeDefinitions, SelectedNativeNamedArgument, SelectedResolutionLocated,
+            SelectedResolutionOperationOutcome,
+        };
+        use brokk_bifrost_core::analyzer::project::OverlayProject;
+        use brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution;
+        let mut builder = InlineTestProject::with_language(Language::Python);
+        for (name, source) in files {
+            builder = builder.file(*name, *source);
+        }
+        let fixture = builder.build();
+        let base =
+            WorkspaceAnalyzer::build_ephemeral_footgun(fixture.project_dyn(), Default::default())
+                .unwrap();
+        let overlay = Arc::new(OverlayProject::new(fixture.project_dyn()));
+        for (name, source) in edits {
+            assert!(overlay.set(fixture.file(name).abs_path(), (*source).to_owned()));
+        }
+        let workspace = base.clone_with_project(Arc::new(overlay.snapshot()));
+        let python = resolve_analyzer::<PythonAnalyzer>(workspace.analyzer()).unwrap();
+        let cancellation = CancellationToken::new();
+        let PythonNativeOpen::Ready(mut request) =
+            open_python_native_request(python, &cancellation).unwrap()
+        else {
+            panic!("native fixture must open");
+        };
+        let client = files
+            .iter()
+            .find(|(name, _)| *name == "client.py")
+            .unwrap()
+            .1;
+        let start = client.rfind(needle).unwrap();
+        let outcome = request
+            .operation
+            .python_definition_at(
+                &request.environment,
+                &ProjectFile::new(fixture.root(), "client.py"),
+                start..start + needle.len(),
+                &ResolutionSession::unbounded(),
+            )
+            .unwrap();
+        let BoundedResolution::Complete {
+            value:
+                SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Found(answer)),
+            ..
+        } = outcome
+        else {
+            panic!("the definition query answers");
+        };
+        let keyword = match &answer.reference.named_argument {
+            None => "none",
+            Some(SelectedNativeNamedArgument::Resolved(..)) => "resolved",
+            Some(SelectedNativeNamedArgument::Incomplete(_)) => "incomplete",
+            Some(SelectedNativeNamedArgument::Absent(_)) => "absent",
+        };
+        let definitions = match &answer.reference.definitions {
+            SelectedNativeDefinitions::Ready(units) => units.len(),
+            _ => usize::MAX,
+        };
+        (
+            answer.reference.answer.binding().completion()
+                == &brokk_bifrost_analysis::analyzer::resolution::ResolutionCompletion::Complete,
+            keyword,
+            answer.selected_external_imports.len(),
+            definitions,
+        )
+    }
+
+    // Another file's new surface leaves the summary stale for every consumer.
+    const OTHER: (&str, &str) = ("other.py", "x = 1\n");
+    const OTHER_EDIT: (&str, &str) = ("other.py", "x = 1\ny = 2\n");
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11536: a keyword argument definition bypassed the coverage obligation"
+    )]
+    fn keyword_definition_carries_the_coverage_obligation() {
+        let files = [
+            ("model.py", "def pick(option=1): pass\n"),
+            (
+                "client.py",
+                "from model import pick\ndef run():\n    pick(option=1)\n",
+            ),
+            OTHER,
+        ];
+        let (complete, keyword, _, definitions) = definition_with_overlay(&files, &[], "option");
+        assert_eq!(
+            (complete, keyword, definitions),
+            (true, "resolved", 0),
+            "control"
+        );
+        let (complete, keyword, _, _) = definition_with_overlay(&files, &[OTHER_EDIT], "option");
+        assert!(!complete);
+        assert_eq!(
+            keyword, "incomplete",
+            "a keyword definition is never Resolved or Absent"
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11536: an uncovered summary still admitted an external import identity"
+    )]
+    fn external_import_definition_carries_the_coverage_obligation() {
+        let files = [("client.py", "import numpy\nnumpy.array()\n"), OTHER];
+        let (_, _, imports, _) = definition_with_overlay(&files, &[], "numpy");
+        assert_eq!(
+            imports, 1,
+            "control: the unchanged provider-open import is admitted"
+        );
+        let (complete, _, imports, _) = definition_with_overlay(&files, &[OTHER_EDIT], "numpy");
+        assert!(!complete);
+        assert_eq!(
+            imports, 0,
+            "an uncovered summary cannot admit an external identity"
+        );
+    }
+
+    #[test]
+    fn refreshing_the_edited_file_recovers_summary_coverage() {
+        let fixture = overlay_fixture();
+        let base =
+            WorkspaceAnalyzer::build_ephemeral_footgun(fixture.project_dyn(), Default::default())
+                .unwrap();
+        let before = reverse_pick(&base, fixture.root());
+        assert!(before.coverage.unusable().is_empty());
+        let edited = "from model import pick\ndef run():\n    pick()\ndef added(): pass\n";
+        std::fs::write(fixture.file("client.py").abs_path(), edited).unwrap();
+        let refreshed = base.update(&std::collections::BTreeSet::from([
+            fixture.file("client.py")
+        ]));
+        let after = reverse_pick(&refreshed, fixture.root());
+        assert!(after.coverage.unusable().is_empty());
+        assert!(!mentions(&after, "python_summary_uncovered"));
+        assert_eq!(after.sites, before.sites);
     }
 }

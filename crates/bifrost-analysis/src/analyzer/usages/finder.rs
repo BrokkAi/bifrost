@@ -61,7 +61,9 @@ pub(super) fn execute_graph_usage_query_in_scope(
 /// `'static`: `scan_usages`' filter classifies test files on demand against
 /// the live analyzer, instead of pre-classifying the whole workspace into an
 /// owned set before the query starts (see `searchtools::scan_usages`).
-type FileFilter<'a> = Box<dyn Fn(&ProjectFile) -> bool + Send + Sync + 'a>;
+type FileFilter<'a> = Box<
+    dyn Fn(&ProjectFile) -> Result<bool, crate::analyzer::QueryReadIncomplete> + Send + Sync + 'a,
+>;
 
 pub const DEFAULT_MAX_FILES: usize = 1000;
 pub const DEFAULT_MAX_USAGES: usize = 1000;
@@ -75,10 +77,19 @@ pub enum UsageQueryCompletion {
 }
 
 pub struct QueryResult {
+    /// Actual file-cap refusal, not the broader omitted-file flag.
+    #[doc(hidden)]
+    pub candidate_files_budget_exhausted: bool,
     pub completion: UsageQueryCompletion,
     pub candidate_files: HashSet<ProjectFile>,
     pub candidate_files_truncated: bool,
     pub source_bytes_truncated: bool,
+    /// Request-local evidence from the source admission guard; never serialized.
+    #[doc(hidden)]
+    pub source_byte_refusal: Option<(usize, usize, usize)>,
+    /// Sources whose indexed contents were unavailable, independently of caps.
+    #[doc(hidden)]
+    pub unavailable_sources: Vec<ProjectFile>,
     pub scanned_source_bytes: usize,
     pub candidate_files_sample: Option<CandidateFilesSample>,
     pub result: FuzzyResult,
@@ -86,6 +97,117 @@ pub struct QueryResult {
     /// read the proof tiers correctly without naming a language.
     pub proof_authority: UsageProofAuthority,
     pub graph_failure: Option<crate::analyzer::usages::model::UsageAnalysisDiagnostic>,
+}
+
+impl QueryResult {
+    /// Convenience callers cannot carry execution coverage, so cancellation
+    /// must remain a failure rather than exposing partial positives as Success.
+    pub(crate) fn into_fuzzy_result(self, overloads: &[CodeUnit]) -> FuzzyResult {
+        if self.completion == UsageQueryCompletion::Cancelled {
+            return FuzzyResult::Failure {
+                fq_name: overloads
+                    .iter()
+                    .map(|target| target.fq_name().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                reason_kind: "cancelled".into(),
+                reason: "Usage query cancelled".into(),
+            };
+        }
+        if self.has_complete_coverage() {
+            return self.result;
+        }
+        let (hits_by_overload, unproven_by_overload, unproven_total_by_overload, mut diagnostics) =
+            match self.result {
+                FuzzyResult::Success {
+                    hits_by_overload,
+                    unproven_by_overload,
+                    unproven_total_by_overload,
+                } => (
+                    hits_by_overload,
+                    unproven_by_overload,
+                    unproven_total_by_overload,
+                    Vec::new(),
+                ),
+                FuzzyResult::Incomplete {
+                    hits_by_overload,
+                    unproven_by_overload,
+                    unproven_total_by_overload,
+                    diagnostics,
+                } => (
+                    hits_by_overload,
+                    unproven_by_overload,
+                    unproven_total_by_overload,
+                    diagnostics,
+                ),
+                terminal => return terminal,
+            };
+        let causes = [
+            (
+                self.candidate_files_budget_exhausted
+                    || self.completion == UsageQueryCompletion::CandidateFilesBudgetExhausted,
+                "candidate_files_budget_exhausted",
+            ),
+            (
+                self.source_bytes_truncated
+                    || self.source_byte_refusal.is_some()
+                    || self.completion == UsageQueryCompletion::SourceBytesBudgetExhausted,
+                "source_bytes_budget_exhausted",
+            ),
+            (
+                !self.unavailable_sources.is_empty(),
+                "indexed_source_unavailable",
+            ),
+        ];
+        let fq_name = overloads
+            .iter()
+            .map(|target| target.fq_name().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        for reason_kind in causes
+            .iter()
+            .filter_map(|(observed, kind)| observed.then_some(*kind))
+            .chain(
+                (diagnostics.is_empty() && !causes.iter().any(|(observed, _)| *observed))
+                    .then_some("unavailable_canonical_facts"),
+            )
+        {
+            if diagnostics.iter().any(|diagnostic| {
+                diagnostic.strategy == "source_admission" && diagnostic.reason_kind == reason_kind
+            }) {
+                continue;
+            }
+            diagnostics.push(crate::analyzer::usages::model::UsageAnalysisDiagnostic {
+                fq_name: fq_name.clone(),
+                strategy: "source_admission".to_string(),
+                reason_kind: reason_kind.to_string(),
+                reason: format!(
+                    "usage coverage is incomplete: completion={:?}, candidate_files_truncated={}, candidate_files_budget_exhausted={}, source_bytes_truncated={}, source_byte_refusal={:?}, unavailable_sources={:?}, graph_failure={:?}",
+                    self.completion, self.candidate_files_truncated, self.candidate_files_budget_exhausted,
+                    self.source_bytes_truncated, self.source_byte_refusal, self.unavailable_sources, self.graph_failure
+                ),
+            });
+        }
+        FuzzyResult::Incomplete {
+            hits_by_overload,
+            unproven_by_overload,
+            unproven_total_by_overload,
+            diagnostics,
+        }
+    }
+
+    /// Whether candidate discovery and scanning finished without an execution gap.
+    /// Semantic completeness and native proof tiers must also be checked before
+    /// this inventory can certify absence.
+    pub fn has_complete_coverage(&self) -> bool {
+        self.completion == UsageQueryCompletion::Complete
+            && !self.candidate_files_truncated
+            && !self.source_bytes_truncated
+            && !self.candidate_files_budget_exhausted
+            && self.source_byte_refusal.is_none()
+            && self.unavailable_sources.is_empty()
+            && self.graph_failure.is_none()
+    }
 }
 
 pub struct CandidateFilesSample {
@@ -105,13 +227,23 @@ pub struct AdmittedUsageQuery {
     pub candidate_files_budget_exhausted: bool,
     #[doc(hidden)]
     pub source_bytes_truncated: bool,
+    /// Request-local evidence from the source admission guard; never serialized.
+    #[doc(hidden)]
+    pub source_byte_refusal: Option<(usize, usize, usize)>,
+    /// Sources whose indexed contents were unavailable, independently of caps.
+    #[doc(hidden)]
+    pub unavailable_sources: Vec<ProjectFile>,
     #[doc(hidden)]
     pub scanned_source_bytes: usize,
     #[doc(hidden)]
     pub candidate_files_sample: Option<CandidateFilesSample>,
 }
 
-type AdmittedUsagePlan = (AdmittedUsageQuery, Option<Box<dyn PreparedUsageQuery>>);
+type AdmittedUsagePlan = (
+    AdmittedUsageQuery,
+    Option<Box<dyn PreparedUsageQuery>>,
+    Vec<crate::analyzer::QueryReadIncomplete>,
+);
 
 /// The common reference engine.
 ///
@@ -173,7 +305,10 @@ impl<'a> ReferenceEngine<'a> {
 
     pub fn with_file_filter<F>(mut self, filter: F) -> Self
     where
-        F: Fn(&ProjectFile) -> bool + Send + Sync + 'a,
+        F: Fn(&ProjectFile) -> Result<bool, crate::analyzer::QueryReadIncomplete>
+            + Send
+            + Sync
+            + 'a,
     {
         self.file_filter = Some(Box::new(filter));
         self
@@ -190,7 +325,10 @@ impl<'a> ReferenceEngine<'a> {
     /// whole-workspace index and let the retain do the work.
     pub fn with_test_file_exclusion<F>(mut self, excludes: F) -> Self
     where
-        F: Fn(&ProjectFile) -> bool + Send + Sync + 'a,
+        F: Fn(&ProjectFile) -> Result<bool, crate::analyzer::QueryReadIncomplete>
+            + Send
+            + Sync
+            + 'a,
     {
         self.excluded_test_files = Some(Box::new(excludes));
         self
@@ -255,7 +393,7 @@ impl<'a> ReferenceEngine<'a> {
         max_source_bytes: Option<usize>,
     ) -> QueryResult {
         let _query_scope = AnalyzerQueryScope::with_cancellation(analyzer, &self.cancellation);
-        let (admitted_query, prepared) = match self.admit_query(
+        let (admitted_query, prepared, classification_failures) = match self.admit_query(
             analyzer,
             overloads,
             explicit_provider,
@@ -290,7 +428,10 @@ impl<'a> ReferenceEngine<'a> {
             prepared.as_deref(),
             max_usages,
         );
-        finalize_graph_usage_query(outcome, &self.cancellation, admitted_query, strategy)
+        let mut query =
+            finalize_graph_usage_query(outcome, &self.cancellation, admitted_query, strategy);
+        record_classification_failures(&mut query, target, classification_failures);
+        query
     }
 
     fn admit_query(
@@ -312,7 +453,10 @@ impl<'a> ReferenceEngine<'a> {
                 completion: UsageQueryCompletion::Complete,
                 candidate_files: HashSet::default(),
                 candidate_files_truncated: false,
+                candidate_files_budget_exhausted: false,
                 source_bytes_truncated: false,
+                source_byte_refusal: None,
+                unavailable_sources: Vec::new(),
                 scanned_source_bytes: 0,
                 candidate_files_sample: None,
                 result: FuzzyResult::empty_success(),
@@ -326,8 +470,16 @@ impl<'a> ReferenceEngine<'a> {
         }
 
         let target = &overloads[0];
+        let classification_failures = std::cell::RefCell::new(Vec::new());
+        let excluded = |file: &ProjectFile| {
+            self.excluded_test_files.as_ref().expect("exclusion filter")(file).map_err(|reason| {
+                analyzer.record_query_incomplete(reason.clone());
+                classification_failures.borrow_mut().push(reason);
+                brokk_bifrost_core::analyzer::capabilities::SourceExclusionUnavailable
+            })
+        };
         let hierarchy_scope = match self.excluded_test_files.as_deref() {
-            Some(excluded) => DescendantIndexScope::excluding_sources(&self.cancellation, excluded),
+            Some(_) => DescendantIndexScope::excluding_sources(&self.cancellation, &excluded),
             None => DescendantIndexScope::whole_workspace(&self.cancellation),
         };
         let _cand_scope = crate::profiling::scope("usages::candidate_discovery");
@@ -400,8 +552,20 @@ impl<'a> ReferenceEngine<'a> {
         candidates.extend(supplemental);
 
         if let Some(filter) = self.file_filter.as_ref() {
-            candidates.retain(|file| !self.cancellation.is_cancelled() && filter(file));
-            protected_candidates.retain(|file| !self.cancellation.is_cancelled() && filter(file));
+            candidates.retain(|file| {
+                if self.cancellation.is_cancelled() {
+                    return false;
+                }
+                match filter(file) {
+                    Ok(admitted) => admitted,
+                    Err(reason) => {
+                        analyzer.record_query_incomplete(reason.clone());
+                        classification_failures.borrow_mut().push(reason);
+                        false
+                    }
+                }
+            });
+            protected_candidates.retain(|file| candidates.contains(file));
         }
         if self.cancellation.is_cancelled() {
             return Err(Box::new(cancelled_query_result()));
@@ -421,18 +585,17 @@ impl<'a> ReferenceEngine<'a> {
         if candidate_files_budget_exhausted {
             candidates = truncate_candidates(candidates, &protected_candidates, max_files);
         }
-        let (admitted, scanned_source_bytes, source_bytes_truncated, source_admission_cancelled) =
-            admit_candidates_by_source_bytes(
-                analyzer,
-                candidates,
-                &protected_candidates,
-                max_source_bytes,
-                &self.cancellation,
-            );
-        if source_admission_cancelled {
+        let admission = admit_candidates_by_source_bytes(
+            analyzer,
+            candidates,
+            &protected_candidates,
+            max_source_bytes,
+            &self.cancellation,
+        );
+        if admission.cancelled {
             return Err(Box::new(cancelled_query_result()));
         }
-        candidates = admitted;
+        candidates = admission.files;
         let candidate_files_truncated = candidates.len() < all_candidates.len();
         let candidate_files_sample =
             candidate_files_truncated.then(|| candidate_files_sample(&all_candidates, &candidates));
@@ -441,12 +604,18 @@ impl<'a> ReferenceEngine<'a> {
             candidate_files: candidates,
             candidate_files_truncated,
             candidate_files_budget_exhausted,
-            source_bytes_truncated,
-            scanned_source_bytes,
+            source_bytes_truncated: admission.byte_refusal.is_some(),
+            source_byte_refusal: admission.byte_refusal,
+            unavailable_sources: admission.unavailable_sources,
+            scanned_source_bytes: admission.scanned_source_bytes,
             candidate_files_sample,
         };
 
-        Ok((admitted_query, prepared))
+        Ok((
+            admitted_query,
+            prepared,
+            classification_failures.into_inner(),
+        ))
     }
 
     /// Independent target queries sharing a language's file walk when supported.
@@ -481,16 +650,18 @@ impl<'a> ReferenceEngine<'a> {
         for (language, admitted) in groups {
             let queries: Vec<_> = admitted
                 .iter()
-                .map(|(target_index, (query, prepared))| GraphUsageBatchQuery {
-                    overloads: std::slice::from_ref(&targets[*target_index]),
-                    scope: UsageScanScope::with_cancellation(
-                        &query.candidate_files,
-                        &self.cancellation,
-                    )
-                    .with_test_inclusion(self.excluded_test_files.is_none())
-                    .with_unproven_limit(self.max_unproven),
-                    prepared: prepared.as_deref(),
-                })
+                .map(
+                    |(target_index, (query, prepared, _))| GraphUsageBatchQuery {
+                        overloads: std::slice::from_ref(&targets[*target_index]),
+                        scope: UsageScanScope::with_cancellation(
+                            &query.candidate_files,
+                            &self.cancellation,
+                        )
+                        .with_test_inclusion(self.excluded_test_files.is_none())
+                        .with_unproven_limit(self.max_unproven),
+                        prepared: prepared.as_deref(),
+                    },
+                )
                 .collect();
             let outcomes = match language_support_for_hook(language, "reference_plugin") {
                 Some(support) => support
@@ -512,15 +683,19 @@ impl<'a> ReferenceEngine<'a> {
                     .collect(),
             };
             assert_eq!(outcomes.len(), admitted.len());
-            for ((target_index, (query, _)), outcome) in admitted.into_iter().zip(outcomes) {
+            for ((target_index, (query, _, classification_failures)), outcome) in
+                admitted.into_iter().zip(outcomes)
+            {
                 let strategy = language_support_for_hook(language, "reference_plugin")
                     .map(|support| support.reference_plugin().target_strategy());
-                answers[target_index] = Some(finalize_graph_usage_query(
-                    outcome,
-                    &self.cancellation,
-                    query,
-                    strategy,
-                ));
+                let mut result =
+                    finalize_graph_usage_query(outcome, &self.cancellation, query, strategy);
+                record_classification_failures(
+                    &mut result,
+                    &targets[target_index],
+                    classification_failures,
+                );
+                answers[target_index] = Some(result);
             }
         }
         answers
@@ -537,7 +712,7 @@ impl<'a> ReferenceEngine<'a> {
         max_usages: usize,
     ) -> FuzzyResult {
         self.query(analyzer, overloads, max_files, max_usages)
-            .result
+            .into_fuzzy_result(overloads)
     }
 
     pub fn find_usages_default(
@@ -546,6 +721,48 @@ impl<'a> ReferenceEngine<'a> {
         overloads: &[CodeUnit],
     ) -> FuzzyResult {
         self.find_usages(analyzer, overloads, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES)
+    }
+}
+
+fn record_classification_failures(
+    query: &mut QueryResult,
+    target: &CodeUnit,
+    classification_failures: Vec<crate::analyzer::QueryReadIncomplete>,
+) {
+    for reason in classification_failures {
+        let diagnostic = crate::analyzer::usages::model::UsageAnalysisDiagnostic {
+            fq_name: target.fq_name().to_string(),
+            strategy: "candidate_admission".to_string(),
+            reason_kind: reason.label().to_string(),
+            reason: format!("{reason:?}"),
+        };
+        query.result = match std::mem::replace(&mut query.result, FuzzyResult::empty_success()) {
+            FuzzyResult::Success {
+                hits_by_overload,
+                unproven_by_overload,
+                unproven_total_by_overload,
+            } => FuzzyResult::Incomplete {
+                hits_by_overload,
+                unproven_by_overload,
+                unproven_total_by_overload,
+                diagnostics: vec![diagnostic],
+            },
+            FuzzyResult::Incomplete {
+                hits_by_overload,
+                unproven_by_overload,
+                unproven_total_by_overload,
+                mut diagnostics,
+            } => {
+                diagnostics.push(diagnostic);
+                FuzzyResult::Incomplete {
+                    hits_by_overload,
+                    unproven_by_overload,
+                    unproven_total_by_overload,
+                    diagnostics,
+                }
+            }
+            result => result,
+        };
     }
 }
 
@@ -576,6 +793,41 @@ pub fn finalize_graph_usage_query(
             }
         }
     };
+    let result = if admitted_query.unavailable_sources.is_empty() {
+        result
+    } else {
+        let diagnostic =
+            crate::analyzer::usages::model::UsageAnalysisDiagnostic::indexed_source_unavailable(
+                &admitted_query.unavailable_sources,
+            );
+        match result {
+            FuzzyResult::Success {
+                hits_by_overload,
+                unproven_by_overload,
+                unproven_total_by_overload,
+            } => FuzzyResult::Incomplete {
+                hits_by_overload,
+                unproven_by_overload,
+                unproven_total_by_overload,
+                diagnostics: vec![diagnostic],
+            },
+            FuzzyResult::Incomplete {
+                hits_by_overload,
+                unproven_by_overload,
+                unproven_total_by_overload,
+                mut diagnostics,
+            } => {
+                diagnostics.push(diagnostic);
+                FuzzyResult::Incomplete {
+                    hits_by_overload,
+                    unproven_by_overload,
+                    unproven_total_by_overload,
+                    diagnostics,
+                }
+            }
+            already_incomplete => already_incomplete,
+        }
+    };
     // A cancelled graph scan may still have established individual hits. Keep
     // those positives while marking the request's coverage incomplete.
     QueryResult {
@@ -588,6 +840,9 @@ pub fn finalize_graph_usage_query(
         } else {
             UsageQueryCompletion::Complete
         },
+        candidate_files_budget_exhausted: admitted_query.candidate_files_budget_exhausted,
+        source_byte_refusal: admitted_query.source_byte_refusal,
+        unavailable_sources: admitted_query.unavailable_sources,
         candidate_files: admitted_query.candidate_files,
         candidate_files_truncated: admitted_query.candidate_files_truncated,
         source_bytes_truncated: admitted_query.source_bytes_truncated,
@@ -607,7 +862,10 @@ fn cancelled_query_result() -> QueryResult {
         completion: UsageQueryCompletion::Cancelled,
         candidate_files: HashSet::default(),
         candidate_files_truncated: false,
+        candidate_files_budget_exhausted: false,
         source_bytes_truncated: false,
+        source_byte_refusal: None,
+        unavailable_sources: Vec::new(),
         scanned_source_bytes: 0,
         candidate_files_sample: None,
         result: FuzzyResult::empty_success(),
@@ -617,39 +875,66 @@ fn cancelled_query_result() -> QueryResult {
     }
 }
 
+#[derive(Default)]
+struct SourceAdmission {
+    files: HashSet<ProjectFile>,
+    scanned_source_bytes: usize,
+    cancelled: bool,
+    byte_refusal: Option<(usize, usize, usize)>,
+    unavailable_sources: Vec<ProjectFile>,
+}
+
 fn admit_candidates_by_source_bytes(
     analyzer: &dyn IAnalyzer,
     candidates: HashSet<ProjectFile>,
     protected_candidates: &HashSet<ProjectFile>,
     max_source_bytes: Option<usize>,
     cancellation: &CancellationToken,
-) -> (HashSet<ProjectFile>, usize, bool, bool) {
+) -> SourceAdmission {
     if cancellation.is_cancelled() {
-        return (HashSet::default(), 0, false, true);
+        return SourceAdmission {
+            cancelled: true,
+            ..SourceAdmission::default()
+        };
     }
     let mut ordered = candidates.iter().cloned().collect::<Vec<_>>();
     analyzer.prefetch_parse_variants(&ordered);
-    let Some(max_source_bytes) = max_source_bytes else {
-        return (candidates, 0, false, false);
-    };
+    let max_source_bytes = max_source_bytes.unwrap_or(usize::MAX);
 
     ordered.sort_by_key(|file| (!protected_candidates.contains(file), file.clone()));
     let mut admitted = HashSet::default();
     let mut scanned_source_bytes = 0usize;
+    let mut source_byte_refusal = None;
+    let mut unavailable_sources = Vec::new();
     for file in ordered {
         if cancellation.is_cancelled() {
-            return (HashSet::default(), 0, false, true);
+            return SourceAdmission {
+                cancelled: true,
+                ..SourceAdmission::default()
+            };
         }
         let Some(source_bytes) = analyzer.indexed_source(&file).map(|source| source.len()) else {
+            unavailable_sources.push(file);
             continue;
         };
         if scanned_source_bytes.saturating_add(source_bytes) <= max_source_bytes {
             scanned_source_bytes += source_bytes;
             admitted.insert(file);
+        } else {
+            source_byte_refusal.get_or_insert((
+                scanned_source_bytes,
+                scanned_source_bytes.saturating_add(source_bytes),
+                max_source_bytes,
+            ));
         }
     }
-    let truncated = admitted.len() < candidates.len();
-    (admitted, scanned_source_bytes, truncated, false)
+    SourceAdmission {
+        files: admitted,
+        scanned_source_bytes,
+        cancelled: false,
+        byte_refusal: source_byte_refusal,
+        unavailable_sources,
+    }
 }
 
 impl Default for ReferenceEngine<'_> {
@@ -780,6 +1065,109 @@ mod tests {
     use brokk_bifrost_test_macros::hardwon;
     use std::path::PathBuf;
     use std::sync::Arc;
+
+    #[test]
+    #[hardwon("#11321: an unavailable indexed source was mislabeled as a source-byte budget cut")]
+    fn source_admission_unavailable_is_not_a_budget_refusal() {
+        let root = std::env::temp_dir();
+        let file = ProjectFile::new(root.clone(), PathBuf::from("missing.java"));
+        let project: Arc<dyn Project> =
+            Arc::new(FileSetProject::new(root, std::iter::empty::<PathBuf>()));
+        let analyzer = EmptyAnalyzer::new(project);
+        let cancellation = CancellationToken::new();
+        let admission = admit_candidates_by_source_bytes(
+            &analyzer,
+            [file.clone()].into_iter().collect(),
+            &HashSet::default(),
+            Some(100),
+            &cancellation,
+        );
+        assert!(admission.files.is_empty());
+        assert_eq!(admission.scanned_source_bytes, 0);
+        assert!(!admission.cancelled);
+        assert!(admission.byte_refusal.is_none());
+        assert_eq!(admission.unavailable_sources, [file]);
+        let query = finalize_graph_usage_query(
+            GraphUsageOutcome::Resolved(FuzzyResult::empty_success()),
+            &cancellation,
+            AdmittedUsageQuery {
+                candidate_files: admission.files,
+                candidate_files_truncated: true,
+                candidate_files_budget_exhausted: false,
+                source_bytes_truncated: admission.byte_refusal.is_some(),
+                source_byte_refusal: admission.byte_refusal,
+                unavailable_sources: admission.unavailable_sources,
+                scanned_source_bytes: admission.scanned_source_bytes,
+                candidate_files_sample: None,
+            },
+            None,
+        );
+        assert_eq!(query.completion, UsageQueryCompletion::Complete);
+        assert!(!query.candidate_files_budget_exhausted && !query.source_bytes_truncated);
+        assert!(
+            matches!(query.result, FuzzyResult::Incomplete { ref diagnostics, .. }
+            if diagnostics.iter().any(|d| d.reason_kind == "indexed_source_unavailable"))
+        );
+    }
+
+    #[test]
+    #[hardwon("#11321: refused usage admission became a complete convenience answer")]
+    fn admission_witnesses_never_publish_complete_usage_answers() {
+        let root = std::env::temp_dir();
+        let file = ProjectFile::new(root, PathBuf::from("missing.java"));
+        let target = CodeUnit::new(file.clone(), CodeUnitType::Class, "Target", "Target");
+        for (candidate_cut, byte_refusal, unavailable, complete_expected) in [
+            (false, None, Vec::new(), true),
+            (true, None, Vec::new(), false),
+            (false, Some((0, 1, 2)), Vec::new(), false),
+            (false, None, vec![file.clone()], false),
+            (true, Some((0, 1, 2)), Vec::new(), false),
+            (true, Some((0, 1, 2)), vec![file.clone()], false),
+        ] {
+            let mut expected_causes = BTreeSet::new();
+            if candidate_cut {
+                expected_causes.insert("candidate_files_budget_exhausted");
+            }
+            if byte_refusal.is_some() {
+                expected_causes.insert("source_bytes_budget_exhausted");
+            }
+            if !unavailable.is_empty() {
+                expected_causes.insert("indexed_source_unavailable");
+            }
+            let query = finalize_graph_usage_query(
+                GraphUsageOutcome::Resolved(FuzzyResult::empty_success()),
+                &CancellationToken::new(),
+                AdmittedUsageQuery {
+                    candidate_files: HashSet::default(),
+                    candidate_files_truncated: !complete_expected,
+                    candidate_files_budget_exhausted: candidate_cut,
+                    source_bytes_truncated: byte_refusal.is_some(),
+                    source_byte_refusal: byte_refusal,
+                    unavailable_sources: unavailable,
+                    scanned_source_bytes: 0,
+                    candidate_files_sample: None,
+                },
+                None,
+            );
+            assert_eq!(query.has_complete_coverage(), complete_expected);
+            assert_eq!(query.complete_answer(&target).is_some(), complete_expected);
+            assert_eq!(
+                super::super::reusable_usage_answer_digest(&query, &target).is_some(),
+                complete_expected
+            );
+            let result = query.into_fuzzy_result(std::slice::from_ref(&target));
+            assert_eq!(
+                matches!(result, FuzzyResult::Success { .. }),
+                complete_expected
+            );
+            if let FuzzyResult::Incomplete { diagnostics, .. } = result {
+                let actual: BTreeSet<_> =
+                    diagnostics.iter().map(|d| d.reason_kind.as_str()).collect();
+                assert_eq!(actual, expected_causes);
+                assert_eq!(diagnostics.len(), expected_causes.len());
+            }
+        }
+    }
 
     struct PanicCandidateProvider;
 

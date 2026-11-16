@@ -13,6 +13,7 @@
 //! the cross-file composition is a memoized walk (`usage_walks.rs`), so
 //! nothing workspace-sized is built or retained.
 
+use brokk_bifrost_core::allocation_size::allocation_size;
 use brokk_bifrost_core::analyzer::model::Language;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path;
@@ -255,13 +256,14 @@ impl ModuleKey {
 
     /// Heap bytes this key owns, for the memo cache's byte budget.
     pub fn weight_bytes(&self) -> usize {
-        self.crate_root.len()
+        std::mem::size_of::<Self>()
+            + allocation_size(self.crate_root.capacity())
+            + allocation_size(self.components.capacity() * std::mem::size_of::<String>())
             + self
                 .components
                 .iter()
-                .map(|component| component.len() + std::mem::size_of::<String>())
+                .map(|component| allocation_size(component.capacity()))
                 .sum::<usize>()
-            + std::mem::size_of::<Self>()
     }
 
     pub fn parent(&self) -> Option<Self> {
@@ -307,8 +309,8 @@ impl Domain {
         std::mem::size_of::<Self>()
             + match self {
                 Self::Public => 0,
-                Self::Crate(crate_root) => crate_root.len(),
-                Self::Module(module) => module.weight_bytes(),
+                Self::Crate(crate_root) => allocation_size(crate_root.capacity()),
+                Self::Module(module) => module.weight_bytes() - std::mem::size_of::<ModuleKey>(),
             }
     }
 
@@ -609,7 +611,7 @@ impl RustBindingSeeds {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RustModuleAliasRoute {
     pub target_file: ProjectFile,
     pub target_module: ModuleKey,

@@ -294,7 +294,7 @@ fn endpoint_dependency_charges_all_origin_storage() {
             EndpointRole::Source,
             display_name,
             Vec::new(),
-            PolicyEndpointBinding::ReturnValue,
+            PolicyEndpointBinding::ReturnValue { path: None },
             None,
             Vec::new(),
         ),
@@ -476,6 +476,7 @@ fn report_serializes_related_source_range_end() {
             range: 4..9,
             message: "related source".into(),
         }],
+        crate::RelatedLocationOmissions::Known(0),
     )
     .unwrap();
     let mut builder = PolicyReportBuilder::new(PolicyBatchBudget::default(), 1).unwrap();
@@ -501,6 +502,7 @@ fn report_diagnostic_text_obeys_exact_byte_limit_and_safe_characters() {
             None,
             None,
             Vec::new(),
+            crate::RelatedLocationOmissions::Known(0),
         )
     };
     assert!(diagnostic("a".repeat(MAX_REPORT_TEXT_BYTES)).is_ok());

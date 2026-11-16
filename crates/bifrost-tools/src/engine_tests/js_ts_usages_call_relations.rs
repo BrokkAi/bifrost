@@ -453,7 +453,7 @@ export function caller(): void { moduleFunction(); }
         let target = CodeUnit::new(file, CodeUnitType::Function, "", "target");
         let mut diagnostics = vec![CallRelationDiagnostic::new(
             CallRelationDiagnosticCode::TargetsAmbiguous,
-            "ambiguous".to_string(),
+            brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationDiagnosticPayload::OutgoingAmbiguous { target: target.fq_name().to_string(), count: 1 },
             target.fq_name().to_string(),
         )];
 

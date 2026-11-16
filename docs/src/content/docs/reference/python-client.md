@@ -279,6 +279,7 @@ method:
 
 | MCP tool | Use instead |
 | --- | --- |
+| `relation_brief` | The CLI (`bifrost --tool relation_brief`), MCP, or Rust `SearchToolsService`. |
 | `score_diff` | The CLI (`bifrost --tool score_diff`), MCP, or Rust `SearchToolsService`. |
 | `list_policies` | The CLI (`bifrost --list-policies` or `bifrost --tool list_policies`), MCP, or Rust. |
 | `run_policy` | The CLI (`bifrost --policy ...` or `bifrost --tool run_policy`), MCP, or Rust. |
@@ -364,7 +365,7 @@ Some result fields use a `Literal` type instead of an enum:
 | --- | --- |
 | `CodeQueryExecutionMode` (exported) | `results`, `explain`, `profile` |
 | `MostRelevantFilesIncompleteReasonValue` | `cancelled`, `time_budget` |
-| `SymbolSourcesIncompleteReasonValue` | `cancelled` |
+| `SymbolSourcesIncompleteReasonValue` | `cancelled`, `inside_unclosed_construct`, `read_incomplete`, `source_unavailable` |
 | `DefinitionLookupIncompleteReasonValue` (models only) | `cancelled`, `time_budget`, `resolution_budget`, `analysis_failure`, `structure_unavailable`, `navigation_targets` |
 | `TooBroadMatchValue` (models only) | `files`, `declarations` |
 | `TestFileKindValue` | `test`, `test_support`, `production`, `ambiguous` |

@@ -36,7 +36,8 @@ pub use semantic_summary::{
     ExactProcedureSummaryBoundary, ExactProcedureSummaryParameter, ExactProcedureSummaryReceiver,
     ExactProcedureSummaryTargetBinding, ProcedureSummaryBindingError,
     bind_active_unmaterialized_procedure_summaries, bind_compiled_procedure_summaries,
-    bind_compiled_receiver_adjustment_summary,
+    bind_compiled_receiver_adjustment_summary, bind_snapshot_unmaterialized_procedure_summaries,
+    project_summary_endpoint,
 };
 
 /// Reusable flow caches owned by one logical workspace.
@@ -97,5 +98,23 @@ impl FlowWorkspaceState {
         Arc::new(self.semantic_summaries.reader(
             analyzer::workspace_authority::workspace_memo_attribution(workspace),
         ))
+    }
+
+    /// Observe the state reachable from this workspace owner for an explicit
+    /// test-support census. This method is passive: it does not settle cache
+    /// maintenance or alter retention. Allocation pins live only until the
+    /// caller finishes this census.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn retention_census_for_test(
+        &self,
+        census: &mut brokk_bifrost_core::retention_census::RetentionCensus<'_>,
+    ) {
+        self.value_flow.retention_census_for_test(census);
+        self.semantic_summaries
+            .retention_census_for_test(census, "flow.semantic_summaries");
+        self.type_flow_summaries.retention_census_for_test(census);
+        self.typestate_summaries
+            .retention_census_for_test(census, "flow.typestate");
     }
 }

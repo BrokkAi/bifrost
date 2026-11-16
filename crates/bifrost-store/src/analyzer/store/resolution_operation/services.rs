@@ -46,6 +46,32 @@ pub enum ConfigurationCertificate {
 pub trait SelectedAnalyzerServices:
     brokk_bifrost_core::analyzer::memo_attribution::ReadReuseRefusal
 {
+    fn selected_read_recorder(
+        &self,
+    ) -> Option<super::super::selected_read::SelectedReadRecorder<'_>>;
+    fn record_selected_dependency(
+        &self,
+        dependency: &super::super::selected_read::SelectedDependency,
+    ) -> super::super::Result<()>;
+
+    /// Report failure even when this analyzer cannot issue recorded receipts.
+    fn selected_read_failed(&self, _error: &super::super::StoreError, _cancelled: bool) {
+        self.refuse_read_reuse();
+    }
+
+    /// The recorded-read route for selected typed sources. Demand the existing
+    /// registered derivation on this exact inventory; its engine records the
+    /// canonical Lookup identity and replays captured reads on memo hits.
+    /// A service unable to certify it must refuse retained receipt reuse.
+    fn record_selected_derivation(
+        &self,
+        _inventory: &super::super::resolution_selection::SelectedResolutionMountInventory<'_>,
+        _kind: crate::analyzer::semantic::derivation::DerivationKindId,
+        _question: &crate::analyzer::semantic::derivation::DerivationQuestion,
+    ) {
+        self.refuse_read_reuse();
+    }
+
     fn certify_selected_configuration(
         &self,
         _language: Language,
@@ -69,7 +95,27 @@ pub trait SelectedAnalyzerServices:
     fn external_inventory_providers(&self) -> Vec<String>;
     fn active_models(&self) -> Option<Arc<ResolvedActiveSemanticModels>>;
     fn model_authority(&self) -> Option<Arc<dyn SelectedModelAuthority + Send + Sync>>;
+    /// The selected operation read this source file. A consumer that cannot
+    /// name the file must record an unattributed read instead, never reuse.
+    fn record_source_read(&self, _file: &ProjectFile) {}
     fn record_model_authority_read(&self, _hash: &str) {}
+    /// Record the canonical selected inventory answer in this operation's
+    /// enclosing read frame. A service without attribution cannot authorize it.
+    fn record_selected_rust_inventory(
+        &self,
+        _kind: crate::analyzer::read_ledger::LookupKind,
+        _question: crate::analyzer::read_ledger::LookupQuestion,
+        _digest: crate::analyzer::semantic::ids::StableDigest,
+    ) -> bool {
+        self.refuse_read_reuse();
+        false
+    }
+    fn record_rust_macro_invocations(
+        &self,
+        _question: crate::analyzer::read_ledger::LookupQuestion,
+        _digest: crate::analyzer::semantic::ids::StableDigest,
+    ) {
+    }
 }
 
 /// The store owns selected TEMP rows, while the engine owns read attribution.
@@ -86,6 +132,9 @@ pub trait SelectedMacroFrontierReads: Send + Sync {
     fn replay(&self, receipt: &(dyn std::any::Any + Send + Sync));
 
     fn receipt_bytes(&self, receipt: &(dyn std::any::Any + Send + Sync)) -> usize;
+
+    /// The front's own capture must be complete independently of its consumer.
+    fn receipt_is_reusable(&self, receipt: &(dyn std::any::Any + Send + Sync)) -> bool;
 
     fn policy_unit_label(&self) -> Option<String>;
 }

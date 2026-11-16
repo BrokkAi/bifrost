@@ -20,8 +20,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 
 use super::unit_summaries::{
-    ConsumedDependency, UnitDependency, UnitExport, UnitGap, UnitImport, UnitInputs, UnitMember,
-    UnitOutputs, UnitRead, UnitSummaryLanguage,
+    ConsumedDependency, ForeignReader, UnitCoordinate, UnitDependency, UnitExport, UnitGap,
+    UnitImport, UnitInputs, UnitMember, UnitOutputs, UnitRead, UnitSummaryLanguage,
 };
 use super::{Result, StoreError, WorkspaceSnapshotId};
 use crate::analyzer::canonical_hash::CanonicalHasher;
@@ -29,7 +29,16 @@ use crate::analyzer::canonical_hash::CanonicalHasher;
 /// Version 6 records imports from every source role included in a test unit.
 // Version 8 consumes the anonymous/local declaration inventory (#5074).
 #[doc(hidden)]
-pub const GO_UNIT_SUMMARY_DERIVATION_VERSION: i64 = 8;
+// Version 10 uses surface fingerprints in the input key.
+pub fn go_unit_summary_derivation_identity() -> [u8; 32] {
+    static IDENTITY: std::sync::LazyLock<[u8; 32]> = std::sync::LazyLock::new(|| {
+        brokk_bifrost_core::lever_tokens::lever_identity(
+            "go-unit-summary-derivation",
+            brokk_bifrost_core::lever_file!("go-unit-summary-derivation.tokens"),
+        )
+    });
+    *IDENTITY
+}
 
 fn go_provider_gap_detail(gaps_json: &str) -> Option<String> {
     let mut gaps: Value =
@@ -60,7 +69,7 @@ fn go_provider_gap_detail(gaps_json: &str) -> Option<String> {
 /// source-inventory profile. `profile` is that context's profile digest; it is
 /// recorded in each summary's read ledger, so a reader matches the summary of the
 /// profile its request selected. (The publication digest cannot be recorded: it
-/// folds file mtimes and moves on every edit.)
+/// folds the selected inventory and moves on content edits.)
 #[doc(hidden)]
 pub struct GoUnitSummaries {
     pub context_id: i64,
@@ -173,7 +182,7 @@ const TESTED_PACKAGE_SQL: &str =
      WHERE tested.package_id = ?1";
 
 // The unit's slice of the tool publication: its own import rows.
-const UNIT_IMPORT_ROWS_SQL: &str = "SELECT imports.import_role, imports.source_spelling, targets.tool_import_path, targets.for_test, imports.complete
+const UNIT_IMPORT_ROWS_SQL: &str = "SELECT imports.import_role, imports.source_spelling, targets.tool_import_path, targets.for_test, imports.complete, targets.package_name
      FROM main.go_package_imports AS imports
      LEFT JOIN main.go_package_instances AS targets ON targets.package_id = imports.target_package_id
      WHERE imports.importer_package_id = ?1 AND imports.import_role IN ('go', ?2)
@@ -187,10 +196,39 @@ pub(crate) const MEMBERS_WITHOUT_BUNDLE_SQL: &str = "SELECT files.rel_path
        ON blobs.blob_oid = files.blob_oid AND blobs.lang = 'go' AND blobs.parse_variant=x'' AND blobs.generation = ?4
      WHERE files.context_id = ?1 AND files.package_id = ?2 AND files.source_role IN ('go', ?3)
        AND NOT EXISTS (
-         SELECT 1 FROM main.resolution_fragment_interiors AS interiors
+         SELECT 1 FROM temp.surface_go_admitted AS interiors
          WHERE interiors.blob_id = blobs.id AND interiors.publication_state = 'complete'
            AND interiors.producer_epoch = ?5)
      ORDER BY files.rel_path";
+
+// A generated surface view is a join of its source, the surface set and the id
+// map. SQLite never flattens a join that is the right operand of a LEFT JOIN,
+// so it materializes the whole view, for every blob in the store, and joins it
+// back through an automatic index each time the statement runs. A statement
+// that LEFT JOINs a surface view therefore declares it as a MATERIALIZED CTE of
+// the same name restricted to the unit's selected blobs (#5658): the
+// materialized rows follow the unit, not the store, and the native plan gate
+// accepts a materialization that the SQL declares. An inner JOIN needs no such
+// CTE; SQLite flattens it.
+macro_rules! selected_blobs_cte {
+    ($view:literal) => {
+        concat!(
+            $view,
+            " AS MATERIALIZED (SELECT surface_row.* FROM temp.",
+            $view,
+            " AS surface_row
+       WHERE surface_row.blob_id IN (
+         SELECT selected_blob.id
+         FROM temp.go_summary_source_files AS selected_file
+         JOIN main.blobs AS selected_blob
+           ON selected_blob.blob_oid = selected_file.blob_oid
+          AND selected_blob.lang = 'go' AND selected_blob.generation = ?4
+          AND selected_blob.parse_variant = x''
+         WHERE selected_file.context_id = ?1 AND selected_file.package_id = ?2
+           AND selected_file.source_role IN ('go', ?3)))"
+        )
+    };
+}
 
 // Package-scope members of every member file's bundle: the relation the
 // same-package peer reader (`ORDINARY_MEMBERS_BY_MOUNT`) reads per mount.
@@ -200,11 +238,11 @@ pub(crate) const UNIT_EXPORTS_SQL: &str =
      FROM temp.go_summary_source_files AS files
      JOIN main.blobs AS blobs
        ON blobs.blob_oid = files.blob_oid AND blobs.lang = 'go' AND blobs.parse_variant=x'' AND blobs.generation = ?4
-     JOIN main.resolution_fragment_interiors AS interiors
+     JOIN temp.surface_go_admitted AS interiors
        ON interiors.blob_id = blobs.id AND interiors.publication_state = 'complete'
       AND interiors.producer_epoch = ?5
-     JOIN main.resolution_package_members AS members ON members.blob_id = blobs.id
-     JOIN main.resolution_semantic_catalog AS catalog
+     JOIN temp.surface_go_members AS members ON members.blob_id = blobs.id
+     JOIN temp.surface_go_catalog AS catalog
        ON catalog.blob_id = members.blob_id AND catalog.local_key = members.lookup_key
      JOIN main.resolution_identities AS identities ON identities.id = catalog.shared_identity
      WHERE files.context_id = ?1 AND files.package_id = ?2 AND files.source_role IN ('go', ?3)
@@ -214,67 +252,67 @@ pub(crate) const UNIT_EXPORTS_SQL: &str =
 // target identity. An alias whose RHS has no named identity remains an ordinary
 // declaration export. The target path is selected from sealed source
 // occurrences and resolution rows; no source text is inspected.
-pub(crate) const UNIT_ALIAS_EXPORTS_SQL: &str =
-    "SELECT DISTINCT blobs.id, members.source_site, aliases.name,
+pub(crate) const UNIT_ALIAS_EXPORTS_SQL: &str = concat!(
+    "WITH ",
+    selected_blobs_cte!("surface_go_types"),
+    ",\n     ",
+    selected_blobs_cte!("surface_go_occurrences"),
+    ",\n     ",
+    selected_blobs_cte!("surface_go_type_names"),
+    ",\n     ",
+    selected_blobs_cte!("surface_go_alias_target_sites"),
+    ",\n     ",
+    selected_blobs_cte!("surface_go_paths"),
+    ",\n     ",
+    selected_blobs_cte!("surface_go_imports"),
+    "
+     SELECT DISTINCT blobs.id, members.source_site, aliases.name,
        CASE WHEN terminal_name.name IS NOT NULL THEN qualifier.name END,
        target_identity.id, target_identity.identity_digest,
        imported.import_id, target_type.kind
      FROM temp.go_summary_source_files AS files
      JOIN main.blobs AS blobs
        ON blobs.blob_oid = files.blob_oid AND blobs.lang = 'go' AND blobs.parse_variant=x'' AND blobs.generation = ?4
-     JOIN main.resolution_fragment_interiors AS interiors
+     JOIN temp.surface_go_admitted AS interiors
        ON interiors.blob_id = blobs.id AND interiors.publication_state = 'complete'
       AND interiors.producer_epoch = ?5
-     JOIN main.source_go_aliases AS aliases
+     JOIN temp.surface_go_aliases AS aliases
        ON aliases.blob_id = blobs.id
-     JOIN main.resolution_package_members AS members
+     JOIN temp.surface_go_members AS members
        ON members.blob_id = aliases.blob_id AND members.namespace = 'type'
-     JOIN main.resolution_semantic_catalog AS alias_name
+     JOIN temp.surface_go_catalog AS alias_name
        ON alias_name.blob_id = members.blob_id AND alias_name.local_key = members.lookup_key
      JOIN main.resolution_identities AS alias_identity
        ON alias_identity.id = alias_name.shared_identity
       AND alias_identity.spelling = aliases.name
-     LEFT JOIN main.source_go_types AS target_type
+     LEFT JOIN surface_go_types AS target_type
        ON target_type.blob_id = aliases.blob_id AND target_type.type_id = aliases.target_type_id
-     -- Filter the join view before the LEFT JOIN: SQLite otherwise materializes
-     -- occurrences for every blob in the store (#5658).
-     LEFT JOIN (
-       SELECT occurrence.* FROM main.source_occurrences AS occurrence
-       WHERE occurrence.blob_id IN (
-         SELECT selected_blob.id
-         FROM temp.go_summary_source_files AS selected_file
-         JOIN main.blobs AS selected_blob
-           ON selected_blob.blob_oid = selected_file.blob_oid
-          AND selected_blob.lang = 'go' AND selected_blob.generation = ?4
-          AND selected_blob.parse_variant = x''
-         WHERE selected_file.context_id = ?1 AND selected_file.package_id = ?2
-           AND selected_file.source_role IN ('go', ?3)
-       )
-     ) AS target_occurrence
+     LEFT JOIN surface_go_occurrences AS target_occurrence
        ON target_occurrence.blob_id = target_type.blob_id
       AND target_occurrence.occurrence_id = target_type.occurrence_id
-     LEFT JOIN main.source_go_type_names AS qualifier
+     LEFT JOIN surface_go_type_names AS qualifier
        ON qualifier.blob_id = target_type.blob_id AND qualifier.type_id = target_type.type_id
       AND qualifier.ordinal = 0
-     LEFT JOIN main.source_go_type_names AS terminal_name
+     LEFT JOIN surface_go_type_names AS terminal_name
        ON terminal_name.blob_id = target_type.blob_id AND terminal_name.type_id = target_type.type_id
       AND terminal_name.ordinal = 1
-     LEFT JOIN main.resolution_sites AS target_site
-       ON target_site.blob_id = blobs.id AND target_site.role = 0
-      AND target_site.start_byte >= target_occurrence.start_byte
-      AND target_site.end_byte <= target_occurrence.end_byte
-     LEFT JOIN main.resolution_paths AS target_path
+     LEFT JOIN surface_go_alias_target_sites AS target_site
+       ON target_site.blob_id = blobs.id
+      AND target_site.occurrence_id = target_occurrence.occurrence_id
+     LEFT JOIN surface_go_paths AS target_path
        ON target_path.blob_id = target_site.blob_id AND target_path.start_node = target_site.site
      LEFT JOIN main.resolution_identities AS target_identity
        ON target_identity.id = CASE WHEN target_path.end_node = -1
                                     THEN target_path.root_terminal
                                     ELSE target_path.end_lead_identity END
       AND target_identity.spelling = COALESCE(terminal_name.name, qualifier.name)
-     LEFT JOIN main.source_imports AS imported
+     LEFT JOIN surface_go_imports AS imported
        ON imported.blob_id = blobs.id
       AND EXISTS (
         SELECT 1
-        FROM main.resolution_go_package_imports AS binding
+        FROM temp.surface_go_import_binding_pairs AS pair
+        JOIN temp.surface_go_import_bindings AS binding
+          ON binding.blob_id=pair.blob_id AND binding.definition_key=pair.definition_key
         JOIN main.go_package_imports AS selected_import
           ON selected_import.importer_package_id = files.package_id
          AND selected_import.import_role = files.source_role
@@ -282,7 +320,7 @@ pub(crate) const UNIT_ALIAS_EXPORTS_SQL: &str =
            SELECT group_concat(path_segment.segment, '/')
            FROM (
              SELECT segment
-             FROM main.source_import_segments
+             FROM temp.surface_go_import_segments
              WHERE blob_id = imported.blob_id AND import_id = imported.import_id
              ORDER BY ordinal
            ) AS path_segment)
@@ -290,35 +328,44 @@ pub(crate) const UNIT_ALIAS_EXPORTS_SQL: &str =
           ON target_package.context_id = files.context_id
          AND target_package.package_id = selected_import.target_package_id
         WHERE binding.blob_id = imported.blob_id
-          AND binding.start_byte = imported.declaration_start_byte
-          AND binding.end_byte = imported.declaration_end_byte
+          AND pair.import_id = imported.import_id
           AND binding.kind = 'named'
           AND ((imported.alias IS NOT NULL AND imported.alias NOT IN ('.', '_')
                 AND imported.alias = qualifier.name)
             OR (imported.alias IS NULL AND target_package.package_name = qualifier.name))
       )
      WHERE files.context_id = ?1 AND files.package_id = ?2 AND files.source_role IN ('go', ?3)
-     ORDER BY blobs.id, members.source_site, (target_identity.id IS NULL), target_path.root_terminal";
+     ORDER BY blobs.id, members.source_site, (target_identity.id IS NULL), target_path.root_terminal"
+    );
 
 // One row per path segment of every import declaration, in declaration order.
 // Every import declaration has a `source_imports` row; a named or blank import
 // also has a `resolution_go_package_imports` row, and a dot import (alias ".")
 // has none. The spelling the tool resolves is the segments joined by '/', as
 // `go_import_binding_context_for_selection` joins them.
-pub(crate) const UNIT_IMPORTS_SQL: &str = "SELECT blobs.id, files.source_role, source_imports.import_id, source_imports.alias,
+pub(crate) const UNIT_IMPORTS_SQL: &str = concat!(
+    "WITH ",
+    selected_blobs_cte!("surface_go_import_binding_pairs"),
+    ",\n     ",
+    selected_blobs_cte!("surface_go_import_bindings"),
+    ",\n     ",
+    selected_blobs_cte!("surface_go_import_segments"),
+    "
+     SELECT blobs.id, files.source_role, source_imports.import_id, source_imports.alias,
        imports.definition_key, imports.kind, segments.segment
      FROM temp.go_summary_source_files AS files
      JOIN main.blobs AS blobs
        ON blobs.blob_oid = files.blob_oid AND blobs.lang = 'go' AND blobs.parse_variant=x'' AND blobs.generation = ?4
-     JOIN main.source_imports AS source_imports ON source_imports.blob_id = blobs.id
-     LEFT JOIN main.resolution_go_package_imports AS imports
-       ON imports.blob_id = source_imports.blob_id
-      AND imports.start_byte = source_imports.declaration_start_byte
-      AND imports.end_byte = source_imports.declaration_end_byte
-     LEFT JOIN main.source_import_segments AS segments
+     JOIN temp.surface_go_imports AS source_imports ON source_imports.blob_id = blobs.id
+     LEFT JOIN surface_go_import_binding_pairs AS pairs
+       ON pairs.blob_id=source_imports.blob_id AND pairs.import_id=source_imports.import_id
+     LEFT JOIN surface_go_import_bindings AS imports
+       ON imports.blob_id = pairs.blob_id AND imports.definition_key=pairs.definition_key
+     LEFT JOIN surface_go_import_segments AS segments
        ON segments.blob_id = source_imports.blob_id AND segments.import_id = source_imports.import_id
      WHERE files.context_id = ?1 AND files.package_id = ?2 AND files.source_role IN ('go', ?3)
-     ORDER BY blobs.id, files.source_role, source_imports.import_id, segments.ordinal";
+     ORDER BY blobs.id, files.source_role, source_imports.import_id, segments.ordinal"
+);
 
 // The tool's binding of each import spelling of this unit, as
 // `IMPORT_PACKAGE_NAME` reads it.
@@ -332,16 +379,28 @@ const UNIT_IMPORT_TARGETS_SQL: &str = "SELECT imports.import_role, imports.sourc
      JOIN main.go_package_instances AS targets ON targets.package_id = imports.target_package_id
      WHERE imports.importer_package_id = ?1 AND imports.import_role IN ('go', ?2)";
 
-/// The Go validity predicate: the shared one plus the profile match. The read
-/// ledger records which context profile each summary derives from (key
-/// `go-context-profile` of the unit). Its version interval is selected by the
-/// same profile, so publishing another profile cannot replace this one.
-pub(crate) const GO_LIVE_SUMMARY_SQL: &str = concat!(
-    super::unit_summaries::live_summary_select!("?9"),
-    " AND EXISTS (SELECT 1 FROM resolution_unit_summary_reads AS profile
-       WHERE profile.summary_id = versions.summary_id
-         AND profile.key_digest = ?8 AND profile.digest = ?9)"
-);
+/// The Go validity predicate: the shared one plus the recorded member inputs and
+/// the profile match. The read ledger records which context profile each summary
+/// derives from (key `go-context-profile` of the unit). Its version interval is
+/// selected by the same profile, so publishing another profile cannot replace this
+/// one.
+pub(crate) static GO_LIVE_SUMMARY_SQL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| {
+        format!(
+            "{} AND {}
+             AND EXISTS (SELECT 1 FROM resolution_unit_summary_reads AS profile
+               WHERE profile.summary_id = versions.summary_id
+                 AND profile.key_digest = ?8 AND profile.digest = ?9)",
+            super::unit_summaries::live_summary_select!("?9"),
+            super::surface_relations::members_current_sql(
+                "go",
+                "versions.summary_id",
+                "?1",
+                "?3",
+                "?5"
+            )
+        )
+    });
 
 /// The read-ledger key under which a Go summary records its context profile.
 #[doc(hidden)]
@@ -361,7 +420,7 @@ pub fn go_live_summary(
     profile: &[u8; 32],
 ) -> Result<Option<(i64, Vec<u8>)>> {
     Ok(conn
-        .prepare_cached(GO_LIVE_SUMMARY_SQL)?
+        .prepare_cached(&GO_LIVE_SUMMARY_SQL)?
         .query_row(
             params![
                 snapshot.workspace_id.as_str(),
@@ -370,7 +429,7 @@ pub fn go_live_summary(
                 unit_key.as_slice(),
                 snapshot.revision,
                 producer_epoch,
-                GO_UNIT_SUMMARY_DERIVATION_VERSION,
+                go_unit_summary_derivation_identity(),
                 go_profile_read_key(unit_key).as_slice(),
                 profile.as_slice()
             ],
@@ -432,16 +491,56 @@ fn read_key(name: &str, unit_key: Option<&[u8; 32]>) -> [u8; 32] {
     hash.finish()
 }
 
+/// Two declarations of one name in one namespace cannot both compile, but
+/// build-constrained siblings or a partial tool selection can publish them;
+/// both are kept and the unit says so. The subject names the identity by its
+/// content digest: the surrogate `identity_id` follows insertion order, which
+/// parallel ingestion varies between runs, and the subject feeds the output
+/// digest (#12904). The Go reverse readers build the same subject in SQL.
+fn conflicting_name_gaps(exports: &[UnitExport]) -> Vec<UnitGap> {
+    let mut by_name: std::collections::HashMap<(&str, [u8; 32]), usize> =
+        std::collections::HashMap::new();
+    for export in exports {
+        *by_name
+            .entry((export.namespace.as_str(), export.identity_digest))
+            .or_default() += 1;
+    }
+    let mut conflicts: Vec<_> = by_name
+        .into_iter()
+        .filter(|(_, count)| *count > 1)
+        .collect();
+    conflicts.sort_unstable();
+    conflicts
+        .into_iter()
+        .map(|((namespace, identity), count)| UnitGap {
+            kind: "conflicting_names",
+            subject: format!(
+                "{namespace}:{}",
+                crate::analyzer::canonical_hash::lower_hex_string(&identity)
+            ),
+            detail: format!("{{\"declarations\":{count}}}"),
+        })
+        .collect()
+}
+
 fn digest_of(bytes: Vec<u8>) -> Result<[u8; 32]> {
     bytes
         .try_into()
         .map_err(|bytes: Vec<u8>| StoreError::corrupt(format!("digest is {} bytes", bytes.len())))
 }
 
+pub(crate) fn install_go_summary_surface_views(conn: &Connection) -> Result<()> {
+    use super::surface_relations::{GO_RELATIONS, create_surface_views, list_digest};
+    create_surface_views(conn, GO_RELATIONS)?;
+    conn.execute_batch(&format!("DROP VIEW IF EXISTS temp.surface_go_admitted; CREATE TEMP VIEW surface_go_admitted AS SELECT blob_id, producer_epoch, 'complete' AS publication_state FROM main.surface_sets WHERE list_digest=x'{}'", brokk_bifrost_core::analyzer::canonical_hash::lower_hex_string(&list_digest(GO_RELATIONS))))?;
+    Ok(())
+}
+
 struct UnitInstance {
     package_id: i64,
     source_role: String,
     tool_import_path: String,
+    package_name: String,
     for_test: String,
     provider_digest: [u8; 32],
     complete: bool,
@@ -450,24 +549,34 @@ struct UnitInstance {
 
 impl GoUnitSummaries {
     fn instance(&self, conn: &Connection, unit_id: i64) -> Result<UnitInstance> {
-        let (package_id, source_role, tool_import_path, _name, for_test, digest, complete, gaps) =
-            conn.prepare_cached(UNIT_INSTANCE_SQL)?
-                .query_row([unit_id], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, Vec<u8>>(5)?,
-                        row.get::<_, bool>(6)?,
-                        row.get::<_, String>(7)?,
-                    ))
-                })?;
+        let (
+            package_id,
+            source_role,
+            tool_import_path,
+            package_name,
+            for_test,
+            digest,
+            complete,
+            gaps,
+        ) = conn
+            .prepare_cached(UNIT_INSTANCE_SQL)?
+            .query_row([unit_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, bool>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            })?;
         Ok(UnitInstance {
             package_id,
             source_role,
             tool_import_path,
+            package_name,
             for_test,
             provider_digest: digest_of(digest)?,
             complete,
@@ -485,8 +594,8 @@ impl UnitSummaryLanguage for GoUnitSummaries {
         "go_package"
     }
 
-    fn derivation_version(&self) -> i64 {
-        GO_UNIT_SUMMARY_DERIVATION_VERSION
+    fn derivation_identity(&self) -> [u8; 32] {
+        go_unit_summary_derivation_identity()
     }
 
     fn profile_digest(&self) -> [u8; 32] {
@@ -545,6 +654,7 @@ impl UnitSummaryLanguage for GoUnitSummaries {
         snapshot: &WorkspaceSnapshotId,
         unit_id: i64,
     ) -> Result<UnitInputs> {
+        install_go_summary_surface_views(conn)?;
         let instance = self.instance(conn, unit_id)?;
         let unit_key = go_unit_key(
             &instance.tool_import_path,
@@ -581,6 +691,10 @@ impl UnitSummaryLanguage for GoUnitSummaries {
                     source_role: row.get(3)?,
                 });
             }
+        }
+
+        for member in &members {
+            super::unit_summaries::member_surface_fingerprint(conn, "go", member.blob_id)?;
         }
 
         let mut dependencies = Vec::new();
@@ -649,11 +763,12 @@ impl UnitSummaryLanguage for GoUnitSummaries {
         }
 
         // The unit's slice of the tool publication. The publication digest folds
-        // every workspace file's mtime, so it moves on every edit; the slice moves
+        // the selected source inventory, so it moves on content edits; the slice moves
         // only when this package's own instance row or import rows move.
         let mut slice = CanonicalHasher::new(b"bifrost-go-unit-context-slice:v1");
         slice.field("tool-import-path", instance.tool_import_path.as_bytes());
         slice.field("for-test", instance.for_test.as_bytes());
+        slice.field("package-name", instance.package_name.as_bytes());
         slice.field("source-role", instance.source_role.as_bytes());
         slice.field("provider", &instance.provider_digest);
         slice.field("complete", &[u8::from(instance.complete)]);
@@ -677,6 +792,12 @@ impl UnitSummaryLanguage for GoUnitSummaries {
                         .as_bytes(),
                 );
                 slice.field("import-complete", &[u8::from(row.get::<_, bool>(4)?)]);
+                slice.field(
+                    "import-target-package-name",
+                    row.get::<_, Option<String>>(5)?
+                        .unwrap_or_default()
+                        .as_bytes(),
+                );
             }
         }
         Ok(UnitInputs {
@@ -687,6 +808,7 @@ impl UnitSummaryLanguage for GoUnitSummaries {
             unit_key,
             label,
             members,
+            input_files: Vec::new(),
             reads: vec![
                 UnitRead {
                     kind: "context_publication",
@@ -714,6 +836,7 @@ impl UnitSummaryLanguage for GoUnitSummaries {
         unit: &UnitInputs,
         dependencies: &[ConsumedDependency],
         producer_epoch: &str,
+        _consumed: &mut ForeignReader<'_>,
     ) -> Result<UnitOutputs> {
         let instance = {
             // The unit id is the temp table's own row id; the instance row is
@@ -774,9 +897,10 @@ impl UnitSummaryLanguage for GoUnitSummaries {
                 let spelling: String = row.get(5)?;
                 let exported = spelling.chars().next().is_some_and(char::is_uppercase);
                 exports.push(UnitExport {
+                    declaration_unit_key: unit.unit_key,
                     declaration_blob_id: row.get(0)?,
-                    declaration_site: row.get(1)?,
-                    declaration_key: row.get(2)?,
+                    declaration_site: UnitCoordinate::Surface(row.get(1)?),
+                    declaration_key: UnitCoordinate::Surface(row.get(2)?),
                     namespace: row.get(3)?,
                     identity_id: row.get(4)?,
                     identity_digest: digest_of(row.get(6)?)?,
@@ -788,31 +912,7 @@ impl UnitSummaryLanguage for GoUnitSummaries {
                 });
             }
         }
-        // Two declarations of one name in one namespace cannot both compile, but
-        // build-constrained siblings or a partial tool selection can publish
-        // them; both are kept and the unit says so.
-        {
-            let mut by_name: std::collections::HashMap<(i64, &str), usize> =
-                std::collections::HashMap::new();
-            for export in &exports {
-                *by_name
-                    .entry((export.identity_id, export.namespace.as_str()))
-                    .or_default() += 1;
-            }
-            let mut conflicts: Vec<_> = by_name
-                .into_iter()
-                .filter(|(_, count)| *count > 1)
-                .map(|((identity, namespace), count)| (identity, namespace.to_owned(), count))
-                .collect();
-            conflicts.sort_unstable();
-            for (identity, namespace, count) in conflicts {
-                gaps.push(UnitGap {
-                    kind: "conflicting_names",
-                    subject: format!("{namespace}:{identity}"),
-                    detail: format!("{{\"declarations\":{count}}}"),
-                });
-            }
-        }
+        gaps.extend(conflicting_name_gaps(&exports));
 
         let mut targets: std::collections::HashMap<(String, String), [u8; 32]> =
             std::collections::HashMap::new();
@@ -873,9 +973,9 @@ impl UnitSummaryLanguage for GoUnitSummaries {
                 };
                 imports.push(UnitImport {
                     blob_id: pending.blob_id,
-                    import_id: pending.import_id,
+                    import_id: UnitCoordinate::Surface(pending.import_id),
                     kind: pending.kind,
-                    definition_key: pending.definition_key,
+                    definition_key: pending.definition_key.map(UnitCoordinate::Surface),
                     spelling,
                     dependency_ordinal,
                     state,
@@ -932,7 +1032,7 @@ impl UnitSummaryLanguage for GoUnitSummaries {
             finish(current.take())?;
         }
         {
-            let mut by_import: std::collections::HashMap<(i64, i64), Option<usize>> =
+            let mut by_import: std::collections::HashMap<(i64, UnitCoordinate), Option<usize>> =
                 std::collections::HashMap::new();
             for import in &imports {
                 by_import.insert(
@@ -963,7 +1063,7 @@ impl UnitSummaryLanguage for GoUnitSummaries {
                 let alias_dependency_ordinal = match (qualifier, import_id) {
                     (None, None) => Some(None),
                     (Some(_), Some(import_id)) => by_import
-                        .get(&(blob_id, import_id))
+                        .get(&(blob_id, UnitCoordinate::Surface(import_id)))
                         .copied()
                         .flatten()
                         .map(Some),
@@ -991,7 +1091,7 @@ impl UnitSummaryLanguage for GoUnitSummaries {
                     .iter_mut()
                     .find(|export| {
                         export.declaration_blob_id == blob_id
-                            && export.declaration_site == declaration_site
+                            && export.declaration_site == UnitCoordinate::Surface(declaration_site)
                     })
                     .expect("every Go type alias has a package-member export row");
                 export.origin = "alias";
@@ -1041,6 +1141,59 @@ pub(crate) fn install_go_summary_sources(conn: &Connection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::go_provider_gap_detail;
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12904: the Go conflicting_names gap subject embedded a surrogate identity id, so output_digest changed between runs"
+    )]
+    fn conflicting_name_gaps_ignore_surrogate_identity_numbering() {
+        use super::super::unit_summaries::{UnitCoordinate, UnitExport};
+        let export = |identity_id: i64, digest: u8, namespace: &str, site: i64| UnitExport {
+            identity_id,
+            identity_digest: [digest; 32],
+            namespace: namespace.to_owned(),
+            visibility: "exported",
+            origin: "declaration",
+            alias_dependency_ordinal: None,
+            alias_identity_id: None,
+            alias_identity_digest: None,
+            declaration_unit_key: [9; 32],
+            declaration_blob_id: site,
+            declaration_site: UnitCoordinate::Surface(site),
+            declaration_key: UnitCoordinate::Surface(site),
+        };
+        // Two runs publish the same declarations; parallel ingestion numbered
+        // the identities in a different order.
+        let run = |f: i64, g: i64| {
+            super::conflicting_name_gaps(&[
+                export(f, 1, "callable", 1),
+                export(f, 1, "callable", 2),
+                export(g, 2, "callable", 3),
+                export(g, 2, "callable", 4),
+                export(g, 2, "type", 5),
+            ])
+            .into_iter()
+            .map(|gap| (gap.kind, gap.subject, gap.detail))
+            .collect::<Vec<_>>()
+        };
+        let first = run(2049, 7);
+        assert_eq!(first, run(1950, 3));
+        assert_eq!(
+            first,
+            vec![
+                (
+                    "conflicting_names",
+                    format!("callable:{}", "01".repeat(32)),
+                    "{\"declarations\":2}".to_owned()
+                ),
+                (
+                    "conflicting_names",
+                    format!("callable:{}", "02".repeat(32)),
+                    "{\"declarations\":2}".to_owned()
+                ),
+            ]
+        );
+    }
 
     #[test]
     #[brokk_bifrost_test_macros::hardwon(

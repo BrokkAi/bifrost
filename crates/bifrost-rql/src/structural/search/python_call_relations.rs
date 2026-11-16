@@ -1770,7 +1770,8 @@ fn call_sites_for_declaration(
         let Some(method) = enclosing_method(analyzer, facts, node_id, &methods) else {
             continue;
         };
-        let Some(shape) = call_shape_for_call(facts, declaration.unit.source(), node_id) else {
+        let Some(shape) = call_shape_for_call(facts, declaration.unit.source(), node_id, None)
+        else {
             continue;
         };
         if !seen.insert(shape.outcome.site_ast_id.clone()) {
@@ -1996,6 +1997,7 @@ fn super_call_receiver(
                     facts,
                     file,
                     u32::try_from(index).expect("normalized node ids fit u32"),
+                    None,
                 )
             })
             .flatten()
@@ -2164,120 +2166,68 @@ fn init_calls_subclass_facts(
     if methods.is_empty() {
         return Vec::new();
     }
-    let Some(provider) = analyzer.type_hierarchy_provider() else {
-        return vec![fact_expansion(
-            root,
-            root_id,
-            "call_lifecycle",
-            "incomplete",
-            Some("incomplete_hierarchy"),
-            "open",
-            None,
-            Some(root.range),
-            methods.first().cloned(),
-            Some(owner.clone()),
-            None,
-            None,
-            Some("init_calls_subclass".to_owned()),
-            None,
-        )];
-    };
-    let token = cancellation.cloned().unwrap_or_default();
-    let scope = DescendantIndexScope::whole_workspace(&token);
-    let direct = provider.get_direct_descendants_within(owner, &scope);
-    let direct_reason = if direct.is_err() {
-        "visit_limit"
-    } else {
-        "incomplete_hierarchy"
-    };
-    let Some(direct_descendants) = direct.ok().filter(|answer| answer.is_complete()) else {
-        return vec![fact_expansion(
-            root,
-            root_id,
-            "call_lifecycle",
-            "incomplete",
-            Some(direct_reason),
-            "open",
-            None,
-            Some(root.range),
-            methods.first().cloned(),
-            Some(owner.clone()),
-            None,
-            None,
-            Some("init_calls_subclass".to_owned()),
-            None,
-        )];
-    };
-    let mut descendants = Vec::new();
-    let mut pending = direct_descendants.definite().to_vec();
-    let mut seen = HashSet::default();
-    while let Some(class) = pending.pop() {
-        if !seen.insert(class.clone()) {
-            continue;
-        }
-        if seen.len() > DESCENDANT_VISIT_LIMIT {
-            return vec![fact_expansion(
-                root,
-                root_id,
-                "call_lifecycle",
-                "incomplete",
-                Some("visit_limit"),
-                "open",
-                None,
-                Some(root.range),
-                methods.first().cloned(),
-                Some(owner.clone()),
-                None,
-                None,
-                Some("init_calls_subclass".to_owned()),
-                None,
-            )];
-        }
-        descendants.push(class.clone());
-        let next = provider.get_direct_descendants_within(&class, &scope);
-        let reason = if next.is_err() {
-            "visit_limit"
-        } else {
-            "incomplete_hierarchy"
+    // The subclass walk is the only part that needs descendants. A call that
+    // is conditional, has an unsupported shape or an unproven receiver or
+    // dispatch is reported for that call whether or not the descendants are
+    // known, so an unknown descendant set adds one root-level row and never
+    // replaces those reasons.
+    let descendants = (|| {
+        let provider = analyzer.type_hierarchy_provider().ok_or((
+            "incomplete_hierarchy",
+            Incompleteness::Operational(DerivationExecutionCause::Provider),
+        ))?;
+        let token = cancellation.cloned().unwrap_or_default();
+        let scope = DescendantIndexScope::whole_workspace(&token);
+        let read = |class: &CodeUnit| {
+            let answer = provider
+                .get_direct_descendants_within(class, &scope)
+                .map_err(|_| {
+                    (
+                        "visit_limit",
+                        Incompleteness::Operational(DerivationExecutionCause::Budget),
+                    )
+                })?;
+            if answer.is_complete() {
+                Ok(answer.edges)
+            } else {
+                Err((
+                    "incomplete_hierarchy",
+                    super::python_class_hierarchy::descendant_answer_incompleteness(&answer),
+                ))
+            }
         };
-        if let Some(next) = next.ok().filter(|answer| answer.is_complete()) {
-            pending.extend(next.definite().iter().cloned());
-        } else {
-            return vec![fact_expansion(
-                root,
-                root_id,
-                "call_lifecycle",
-                "incomplete",
-                Some(reason),
-                "open",
-                None,
-                Some(root.range),
-                methods.first().cloned(),
-                Some(owner.clone()),
-                None,
-                None,
-                Some("init_calls_subclass".to_owned()),
-                None,
-            )];
+        let mut descendants = Vec::new();
+        let mut pending = read(owner)?;
+        let mut seen = HashSet::default();
+        while let Some(class) = pending.pop() {
+            if !seen.insert(class.clone()) {
+                continue;
+            }
+            if seen.len() > DESCENDANT_VISIT_LIMIT {
+                return Err((
+                    "visit_limit",
+                    Incompleteness::Operational(DerivationExecutionCause::Budget),
+                ));
+            }
+            descendants.push(class.clone());
+            pending.extend(read(&class)?);
         }
-    }
-    let Some(python_provider) = analyzer.python_class_hierarchy_provider_for(owner) else {
-        return vec![fact_expansion(
-            root,
-            root_id,
-            "call_lifecycle",
-            "incomplete",
-            Some("incomplete_hierarchy"),
-            "open",
-            None,
-            Some(root.range),
-            methods.first().cloned(),
-            Some(owner.clone()),
-            None,
-            None,
-            Some("init_calls_subclass".to_owned()),
-            None,
-        )];
+        Ok(descendants)
+    })();
+    let python_provider = analyzer.python_class_hierarchy_provider_for(owner);
+    let descendant_gap = match (&descendants, &python_provider) {
+        (Err(reason), _) => Some(*reason),
+        (Ok(_), None) => Some((
+            "incomplete_hierarchy",
+            Incompleteness::Operational(DerivationExecutionCause::Provider),
+        )),
+        (Ok(_), Some(_)) => None,
+    };
+    // Without both the descendant set and the override provider there is
+    // nothing to walk; the gap row below reports that.
+    let descendants = match (&descendants, &python_provider) {
+        (Ok(descendants), Some(_)) => descendants.as_slice(),
+        _ => &[],
     };
     let mut output = Vec::new();
     for method in &methods {
@@ -2360,6 +2310,7 @@ fn init_calls_subclass_facts(
                 .dispatch_at_source_with_cause(&call.shape.outcome.file, call.shape.outcome.range);
             if dispatch_incompleteness.execution_cause().is_some() {
                 semantic.analyzer().mark_execution_dependent();
+                semantic.join_reuse(EXECUTION_DEPENDENT);
             }
             let dispatch_reason = if !dispatch.coverage.is_exhaustive()
                 || dispatch.arms.len() != 1
@@ -2402,13 +2353,16 @@ fn init_calls_subclass_facts(
                 ));
                 continue;
             };
-            for descendant in &descendants {
+            for descendant in descendants {
                 let Some(descendant_method) =
                     direct_methods(analyzer, descendant, name).first().cloned()
                 else {
                     continue;
                 };
-                let answer = python_provider.method_override(&descendant_method, cancellation);
+                let answer = python_provider
+                    .as_ref()
+                    .expect("descendants are empty without a provider")
+                    .method_override(&descendant_method, cancellation);
                 let Some(premise) = override_premise(analyzer, &descendant_method, &answer) else {
                     output.push(unavailable_fact(analyzer, root, "incomplete_hierarchy"));
                     continue;
@@ -2485,6 +2439,28 @@ fn init_calls_subclass_facts(
                 ));
             }
         }
+    }
+    if let Some((reason, incompleteness)) = descendant_gap {
+        let mut expansion = fact_expansion(
+            root,
+            root_id,
+            "call_lifecycle",
+            "incomplete",
+            Some(reason),
+            "open",
+            None,
+            Some(root.range),
+            methods.first().cloned(),
+            Some(owner.clone()),
+            None,
+            None,
+            Some("init_calls_subclass".to_owned()),
+            None,
+        );
+        if let PipelineValue::PythonHierarchyFact(value) = &mut expansion.value {
+            value.incompleteness = incompleteness;
+        }
+        output.push(expansion);
     }
     output
 }
@@ -2737,6 +2713,7 @@ fn context_facts(
             .dispatch_at_source_with_cause(&call.shape.outcome.file, call.shape.outcome.range);
         if dispatch_incompleteness.execution_cause().is_some() {
             semantic.analyzer().mark_execution_dependent();
+            semantic.join_reuse(EXECUTION_DEPENDENT);
         }
         let exact = answer.coverage.is_exhaustive()
             && !answer.arms.is_empty()

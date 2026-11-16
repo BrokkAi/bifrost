@@ -24,7 +24,7 @@ use super::resolver::{
     is_module_type_reference, is_non_type_module_reference, is_record_pattern_type_reference,
     java_callable_arity, method_reference_parts, node_text, resolve_field_access_type,
     resolve_full_type_from_node, resolve_nested_type_for_owner, resolve_non_nested_type_for_graph,
-    resolve_type_segments,
+    resolve_type_segments, super_member_is_accessible, super_receiver_superclass,
 };
 use super::return_type::{
     FileReturnCache, JavaReturnTypeContext, METHOD_RECEIVER_CHAIN_LIMIT,
@@ -33,7 +33,9 @@ use super::return_type::{
 };
 use crate::java::declarations::{JavaScopeDeclaration, java_scope_declarations};
 use crate::java::graph_support::{JavaSource, resolve_java_usage_type_components_in};
-use crate::java::hierarchy::{JavaHierarchyFactError, java_nearest_declaring_ancestors};
+use crate::java::hierarchy::{
+    JavaHierarchyFactError, JavaSuperclass, java_nearest_declaring_ancestors,
+};
 use brokk_bifrost_core::analyzer::model::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
@@ -109,6 +111,16 @@ impl JavaScan<'_> {
     /// Resolve the nominal identity carried by a structured type node to its fqn.
     fn resolve_type_fqn(&self, token: QueryToken<'_>, node: Node<'_>) -> Option<String> {
         self.resolve_type(token, node).map(|unit| unit.fq_name())
+    }
+
+    /// The fqn of an object creation's value type. An erroneous creation, whose
+    /// own constructor call has no applicable target, has no value (#10089).
+    fn creation_value_type_fqn(&self, token: QueryToken<'_>, creation: Node<'_>) -> Option<String> {
+        let resolved = self.resolve_type_fqn(token, creation.child_by_field_name("type")?)?;
+        (!self
+            .java
+            .creation_constructor_refused(self.file, self.source, creation))
+        .then_some(resolved)
     }
 
     fn resolve_type(&self, token: QueryToken<'_>, node: Node<'_>) -> Option<CodeUnit> {
@@ -373,9 +385,23 @@ fn record_reference(
                     // node -- so the call left the graph entirely (#2044:
                     // Guava's `ImmutableSupplier.get` and
                     // `ImmutableList.internalArray`).
+                    let object = node.child_by_field_name("object");
                     match method_owner_fqn(node, token, ctx, bindings) {
                         Some(owner) => match method_callee(&owner, name, ctx) {
-                            MethodCallee::Resolved(callee) => ctx.record(callee, name_node),
+                            MethodCallee::Resolved(callee) => {
+                                let arity = argument_list_arity(node);
+                                if object.is_none_or(|object| {
+                                    receiver_binds_callee(object, &callee, ctx, |unit| {
+                                        unit.is_function()
+                                            && java_callable_arity(ctx.java, unit)
+                                                .is_none_or(|declared| declared.accepts(arity))
+                                    })
+                                }) {
+                                    ctx.record(callee, name_node);
+                                } else {
+                                    ctx.record_unproven(name, name_node);
+                                }
+                            }
                             // No workspace declaration answers the name: the
                             // receiver's type is known, but the method comes
                             // from outside the workspace. Keeping the nominal
@@ -413,6 +439,7 @@ fn record_reference(
             // no receiver-typed call to attribute to an outside declaration.
             if let Some(owner) = receiver_type_fqn(receiver, token, ctx, bindings)
                 && let MethodCallee::Resolved(callee) = method_callee(&owner, member, ctx)
+                && receiver_binds_callee(receiver, &callee, ctx, CodeUnit::is_function)
             {
                 ctx.record(callee, member_node);
             } else {
@@ -430,7 +457,12 @@ fn record_reference(
             if !field.is_empty()
                 && let Some(owner) = receiver_type_fqn(object, token, ctx, bindings)
             {
-                ctx.record(format!("{owner}.{field}"), field_node);
+                let callee = format!("{owner}.{field}");
+                if receiver_binds_callee(object, &callee, ctx, CodeUnit::is_field) {
+                    ctx.record(callee, field_node);
+                } else {
+                    ctx.record_unproven(field, field_node);
+                }
             } else if !field.is_empty() {
                 ctx.record_unproven(field, field_node);
             }
@@ -538,6 +570,10 @@ fn method_callee(owner_fq_name: &str, member: &str, ctx: &JavaScan<'_>) -> Metho
 /// unqualified (implicit-this) call, an explicit `this` receiver, or the owner
 /// type itself for an own-type static call. A `super` receiver, or a call
 /// through a differently-named variable/type, stays external (#1014 facet B).
+///
+/// A `super` receiver is never same-owner: it reads the direct superclass of
+/// the class body holding the call (JLS 15.12.1, #9703), and a class cannot
+/// extend itself, so the callee is always another type's member.
 fn method_invocation_receiver_is_same_owner(
     node: Node<'_>,
     token: QueryToken<'_>,
@@ -624,10 +660,11 @@ fn receiver_type_fqn_at_depth(
                     .flatten()
             })
         }
-        "this" | "super" => ctx
+        "this" => ctx
             .class_ranges
             .enclosing(object.start_byte())
             .map(str::to_string),
+        "super" => superclass_fqn(object, ctx),
         "type_identifier" | "scoped_identifier" | "scoped_type_identifier" | "generic_type" => {
             ctx.resolve_type_fqn(token, object)
         }
@@ -646,9 +683,7 @@ fn receiver_type_fqn_at_depth(
             |owner, name| ctx.resolve_nested_type(owner, name),
         )
         .map(|owner| owner.fq_name()),
-        "object_creation_expression" => object
-            .child_by_field_name("type")
-            .and_then(|type_node| ctx.resolve_type_fqn(token, type_node)),
+        "object_creation_expression" => ctx.creation_value_type_fqn(token, object),
         "method_invocation" => {
             match receiver_type_outcome_at_depth(object, token, ctx, bindings, depth) {
                 ReceiverAnalysisOutcome::Precise(values) if values.len() == 1 => {
@@ -664,6 +699,60 @@ fn receiver_type_fqn_at_depth(
         }
         _ => None,
     }
+}
+
+/// The fqn of the class an explicit `super` receiver reads (#9703).
+///
+/// `super.m()`, `super.f` and `super::m` read the direct superclass of the
+/// class body that lexically contains them (JLS 15.11.2, 15.12.1, 15.13.1),
+/// never the enclosing class itself. `java.lang.Object`, `java.lang.Enum`,
+/// `java.lang.Record` and a superclass declared outside the workspace name no
+/// class whose members this workspace can attribute, so they type nothing.
+fn superclass_fqn(object: Node<'_>, ctx: &JavaScan<'_>) -> Option<String> {
+    let site_class = ctx.class_ranges.enclosing_unit(object.start_byte())?;
+    let hierarchy = ctx.graph.hierarchy?;
+    match super_receiver_superclass(object, site_class, ctx.graph.index, hierarchy)? {
+        JavaSuperclass::Indexed(superclass) => Some(superclass.fq_name()),
+        JavaSuperclass::Implicit | JavaSuperclass::Open => None,
+    }
+}
+
+/// Whether the receiver at `receiver` binds `callee_fqn` as a proven callee
+/// (#9703).
+///
+/// A `super` receiver reads the direct superclass of the class body that holds
+/// it (JLS 15.12.1, 15.13.1), and JLS 6.6.1 still decides what that body may
+/// name: an inaccessible nearest declaration is not a callee the site binds, so
+/// the edge stays unproven instead of proven. Every other receiver is
+/// unchanged, and so is a callee the workspace indexes no declaration for -- a
+/// nominal callee that names no node is dropped anyway, so only a declaration
+/// that really exists and really is inaccessible turns into unproven evidence.
+///
+/// This graph names a callee by its fqn, so every overload of the name is the
+/// same callee here. `applicable` keeps the declarations the site could select
+/// (a call's arity, a method reference's methods, a field access's fields), and
+/// the site binds the callee only when every one of them is accessible. With a
+/// public `m()` and a private `m(int)`, `super.m()` is proven and `super.m(1)`
+/// is not; an applicable set that mixes accessible and inaccessible overloads
+/// stays unproven instead of depending on index order (the per-seed scan
+/// checks the exact declaration it seeds).
+fn receiver_binds_callee(
+    receiver: Node<'_>,
+    callee_fqn: &str,
+    ctx: &JavaScan<'_>,
+    applicable: impl Fn(&CodeUnit) -> bool,
+) -> bool {
+    if receiver.kind() != "super" {
+        return true;
+    }
+    let Some(site_class) = ctx.class_ranges.enclosing_unit(receiver.start_byte()) else {
+        return false;
+    };
+    ctx.graph
+        .index
+        .definitions(callee_fqn)
+        .filter(|member| applicable(member))
+        .all(|member| super_member_is_accessible(ctx.graph.index, &member, site_class))
 }
 
 fn seed_declarations(
@@ -796,9 +885,8 @@ fn receiver_type_outcome_at_depth(
         };
     }
     match expression.kind() {
-        "object_creation_expression" => expression
-            .child_by_field_name("type")
-            .and_then(|type_node| ctx.resolve_type_fqn(token, type_node))
+        "object_creation_expression" => ctx
+            .creation_value_type_fqn(token, expression)
             .map(|fqn| ReceiverAnalysisOutcome::Precise(vec![fqn]))
             .unwrap_or(ReceiverAnalysisOutcome::Unknown),
         "method_invocation" => {

@@ -1,4 +1,7 @@
-use crate::analyzer::csharp::dependency_discovery::project_assets_files;
+use crate::analyzer::csharp::dependency_discovery::{
+    MAX_PROJECT_OUTPUT_DEPTH, MAX_PROJECT_OUTPUTS, TraversalEvent, TraversalStatus,
+    project_assets_files,
+};
 mod targeting_packs;
 
 use brokk_bifrost_core::cancellation::CancellationToken;
@@ -156,7 +159,6 @@ const MAX_SIGNATURE_DEPTH: usize = 64;
 const MAX_SIGNATURE_PARAMETERS: usize = 4_096;
 const MAX_ARRAY_RANK: usize = 64;
 const MAX_DECODED_METADATA_BYTES: usize = 64 * 1024 * 1024;
-const MAX_PROJECT_OUTPUTS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CSharpExternalTypeKind {
@@ -1776,6 +1778,7 @@ pub fn resolve_csharp_semantic_pack_dependencies(
         report_external_discovery_read(ExternalDiscoveryRead::Environment {
             name: name.into(),
             value: std::env::var_os(name),
+            working_directory: None,
         });
     }
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
@@ -1799,13 +1802,14 @@ pub fn resolve_csharp_semantic_pack_dependencies(
             framework_reference: None,
         })
         .collect();
-    let assets_files = project_assets_files(project.root());
+    let (assets_files, traversal) = project_assets_files(project.root());
     let sdk_roots = targeting_packs::approved_sdk_roots(project.root());
     let metadata_inputs_considered = config
         .assembly_paths
         .len()
         .saturating_add(assets_files.len());
-    let mut diagnostic_messages = Vec::new();
+    let mut diagnostic_messages: Vec<_> =
+        traversal.diagnostic(project.root()).into_iter().collect();
     for assets in assets_files {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return csharp_cancelled_discovery();
@@ -1866,6 +1870,7 @@ pub fn resolve_csharp_semantic_pack_dependencies(
         diagnostics.truncate(limits.max_diagnostics);
     }
     DependencyDiscoveryOutcome {
+        incomplete_reason: None,
         profile: DependencyDiscoveryProfile {
             metadata_inputs_considered,
             dependencies_resolved: dependencies.len(),
@@ -2250,6 +2255,7 @@ impl CSharpAssemblyPackProducer {
                 hierarchy,
                 aliases: Vec::new(),
                 extension_surfaces: Vec::new(),
+                rust_stability: None,
                 guard: None,
                 locator: Locator::Artifact {
                     path: locator_path.clone(),
@@ -2342,6 +2348,7 @@ impl CSharpAssemblyPackProducer {
                     generic_arity: member.generic_arity,
                     parameter_types: &parameter_types,
                     parameter_variadics: &[],
+                    extension_receiver: None,
                     return_type: returns.as_ref(),
                 });
                 members.push(MemberFact {
@@ -2382,6 +2389,7 @@ impl CSharpAssemblyPackProducer {
                     extension_receiver: None,
                     extension_receiver_constraints: Vec::new(),
                     aliases: Vec::new(),
+                    rust_stability: None,
                     guard: None,
                     locator: Locator::Artifact {
                         path: locator_path.clone(),
@@ -3050,15 +3058,15 @@ fn assemblies_from_assets(path: &Path, sdk_roots: &[PathBuf]) -> CSharpAssetsRes
                                     .map(Path::to_path_buf)
                                     .unwrap_or_default()
                             };
-                            out.extend(
-                                project_output_candidates(
-                                    &project_root,
-                                    relative.file_name(),
-                                    root,
-                                    target_name,
-                                )
-                                .into_iter()
-                                .map(|(path, configuration)| ResolvedCSharpAssembly {
+                            let (outputs, traversal) = project_output_candidates(
+                                &project_root,
+                                relative.file_name(),
+                                root,
+                                target_name,
+                            );
+                            diagnostics.extend(traversal.diagnostic(&project_root.join("bin")));
+                            out.extend(outputs.into_iter().map(|(path, configuration)| {
+                                ResolvedCSharpAssembly {
                                     path,
                                     package_name: Some(package_name.clone()),
                                     package_version: (!package_version.is_empty())
@@ -3069,8 +3077,8 @@ fn assemblies_from_assets(path: &Path, sdk_roots: &[PathBuf]) -> CSharpAssetsRes
                                     project_reference: true,
                                     assembly_name: None,
                                     framework_reference: None,
-                                }),
-                            );
+                                }
+                            }));
                         }
                     }
                     if out.len() == out_start {
@@ -3147,64 +3155,192 @@ fn project_output_candidates(
     filename: Option<&std::ffi::OsStr>,
     workspace_root: &Path,
     target: &str,
-) -> Vec<(PathBuf, Option<String>)> {
+) -> (Vec<(PathBuf, Option<String>)>, TraversalStatus) {
     let Some(filename) = filename else {
-        return Vec::new();
+        return (Vec::new(), TraversalStatus::default());
     };
     let bin = project_root.join("bin");
-    if !bin.is_dir() {
-        return Vec::new();
+    // Follow the caller's chosen bin root, then retain canonical containment
+    // checks for selected outputs. Only links below that root are omissions.
+    match std::fs::metadata(&bin) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return (Vec::new(), TraversalStatus::default()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return (Vec::new(), TraversalStatus::default());
+        }
+        Err(error) => {
+            return (
+                Vec::new(),
+                TraversalStatus::incomplete(TraversalEvent::IoError {
+                    path: bin,
+                    error: error.to_string(),
+                }),
+            );
+        }
     }
-    let Ok(bin) = bin.canonicalize() else {
-        return Vec::new();
+    let bin = match bin.canonicalize() {
+        Ok(bin) => bin,
+        Err(error) => {
+            return (
+                Vec::new(),
+                TraversalStatus::incomplete(TraversalEvent::IoError {
+                    path: bin,
+                    error: error.to_string(),
+                }),
+            );
+        }
     };
-    let Ok(workspace_root) = workspace_root.canonicalize() else {
-        return Vec::new();
+    let workspace_root = match workspace_root.canonicalize() {
+        Ok(root) => root,
+        Err(error) => {
+            return (
+                Vec::new(),
+                TraversalStatus::incomplete(TraversalEvent::IoError {
+                    path: workspace_root.to_owned(),
+                    error: error.to_string(),
+                }),
+            );
+        }
     };
-    let mut candidates: Vec<_> = WalkDir::new(&bin)
+    let entries = WalkDir::new(&bin)
         .follow_links(false)
-        .max_depth(5)
+        .follow_root_links(true)
+        .sort_by_file_name()
+        .max_depth(MAX_PROJECT_OUTPUT_DEPTH)
         .into_iter()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_file() && entry.file_name() == filename)
-        .filter_map(|entry| entry.into_path().canonicalize().ok())
-        .filter(|candidate| candidate.starts_with(&workspace_root))
-        .filter(|candidate| project_output_matches_target(&bin, candidate, target))
-        .map(|candidate| {
-            let configuration = candidate
-                .strip_prefix(&bin)
-                .ok()
-                .and_then(|relative| relative.components().next())
-                .and_then(|component| match component {
-                    std::path::Component::Normal(value) => {
-                        Some(value.to_string_lossy().into_owned())
-                    }
-                    _ => None,
-                });
-            (candidate, configuration)
+        .filter_entry(|entry| {
+            (!entry.file_type().is_dir() && !entry.file_type().is_symlink())
+                || project_output_entry_selected(
+                    &bin,
+                    entry.path(),
+                    entry.file_type(),
+                    filename,
+                    &workspace_root,
+                    target,
+                )
         })
-        .collect();
+        .map(|entry| entry.map_err(|error| TraversalEvent::walk_error(error, &bin)));
+    project_outputs_from_entries(&bin, filename, &workspace_root, target, entries)
+}
+
+fn project_outputs_from_entries(
+    bin: &Path,
+    filename: &std::ffi::OsStr,
+    workspace_root: &Path,
+    target: &str,
+    entries: impl IntoIterator<Item = Result<walkdir::DirEntry, TraversalEvent>>,
+) -> (Vec<(PathBuf, Option<String>)>, TraversalStatus) {
+    let mut candidates = Vec::new();
+    let mut status = TraversalStatus::default();
+    let selected = |path: &Path, file_type| {
+        project_output_entry_selected(bin, path, file_type, filename, workspace_root, target)
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                status.record(error);
+                continue;
+            }
+        };
+        if !selected(entry.path(), entry.file_type()) {
+            continue;
+        }
+        if entry.depth() > 0 && status.skip_symlink(&entry, selected) {
+            continue;
+        }
+        // Conservatively refuse a directory at the depth frontier: its contents
+        // have not been inspected, even when it happens to be empty.
+        if entry.depth() == MAX_PROJECT_OUTPUT_DEPTH && entry.file_type().is_dir() {
+            status.record(TraversalEvent::DepthLimit {
+                path: entry.path().to_owned(),
+            });
+        }
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let candidate = match entry.path().canonicalize() {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                status.record(TraversalEvent::IoError {
+                    path: entry.into_path(),
+                    error: error.to_string(),
+                });
+                continue;
+            }
+        };
+        if !selected(&candidate, entry.file_type()) {
+            continue;
+        }
+        let configuration = candidate
+            .strip_prefix(bin)
+            .ok()
+            .and_then(|relative| relative.components().next())
+            .and_then(|component| match component {
+                std::path::Component::Normal(value) => Some(value.to_string_lossy().into_owned()),
+                _ => None,
+            });
+        candidates.push((candidate, configuration));
+        // Exact-at-cap is conservatively incomplete, as for the assets cap.
+        if candidates.len() == MAX_PROJECT_OUTPUTS {
+            status.record(TraversalEvent::OutputLimit);
+            break;
+        }
+    }
     candidates.sort();
-    candidates.truncate(MAX_PROJECT_OUTPUTS);
-    candidates
+    status.sort(bin);
+    (candidates, status)
+}
+
+fn project_output_entry_selected(
+    bin: &Path,
+    path: &Path,
+    file_type: std::fs::FileType,
+    filename: &std::ffi::OsStr,
+    workspace_root: &Path,
+    target: &str,
+) -> bool {
+    if file_type.is_dir() || file_type.is_symlink() {
+        project_output_target_match(bin, path, target) != OutputTargetMatch::Mismatch
+    } else {
+        file_type.is_file()
+            && path.file_name() == Some(filename)
+            && path.starts_with(workspace_root)
+            && project_output_matches_target(bin, path, target)
+    }
+}
+
+#[derive(PartialEq, Eq)]
+enum OutputTargetMatch {
+    Mismatch,
+    Prefix,
+    Match,
+}
+
+fn project_output_target_match(bin: &Path, path: &Path, target: &str) -> OutputTargetMatch {
+    let Ok(relative) = path.strip_prefix(bin) else {
+        return OutputTargetMatch::Mismatch;
+    };
+    let mut components = relative.components();
+    // Configuration is unconstrained. Framework and optional runtime must
+    // agree once present; an unfinished compatible path can still contain it.
+    match components.next() {
+        None => return OutputTargetMatch::Prefix,
+        Some(std::path::Component::Normal(_)) => {}
+        Some(_) => return OutputTargetMatch::Mismatch,
+    }
+    for required in target.split('/').take(2) {
+        match components.next() {
+            None => return OutputTargetMatch::Prefix,
+            Some(std::path::Component::Normal(value)) if value == required => {}
+            Some(_) => return OutputTargetMatch::Mismatch,
+        }
+    }
+    OutputTargetMatch::Match
 }
 
 fn project_output_matches_target(bin: &Path, candidate: &Path, target: &str) -> bool {
-    let mut target_parts = target.split('/');
-    let framework = target_parts.next().unwrap_or_default();
-    let runtime = target_parts.next();
-    let mut components = candidate
-        .strip_prefix(bin)
-        .ok()
-        .into_iter()
-        .flat_map(Path::components)
-        .filter_map(|component| match component {
-            std::path::Component::Normal(value) => Some(value.to_string_lossy()),
-            _ => None,
-        });
-    let _configuration = components.next();
-    components.next().as_deref() == Some(framework)
-        && runtime.is_none_or(|runtime| components.next().as_deref() == Some(runtime))
+    project_output_target_match(bin, candidate, target) == OutputTargetMatch::Match
 }
 
 fn safe_relative_path(value: &str) -> Option<&Path> {

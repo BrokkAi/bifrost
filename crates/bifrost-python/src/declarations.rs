@@ -882,7 +882,7 @@ where
 {
     pub fn visit_container(
         &mut self,
-        node: Node<'_>,
+        node: Node<'structural>,
         scope: &[Scope],
         module_control_depth: usize,
     ) {
@@ -988,7 +988,7 @@ where
         }
     }
 
-    fn admit_structural(&mut self, node: Node<'_>, parent: Option<u32>) -> Option<u32> {
+    fn admit_structural(&mut self, node: Node<'structural>, parent: Option<u32>) -> Option<u32> {
         if !node.is_named() {
             return parent;
         }
@@ -3037,6 +3037,83 @@ mod primary_tests {
         assert!(!manyargs.label().contains('\r'));
         assert_eq!(parameter_names("keyword_only"), ["positional", "required"]);
         assert_eq!(parameter_names("Service.tabbed"), ["first", "second"]);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10621: parenthesized attribute roots lost their lexical prefix reference"
+    )]
+    fn attribute_roots_publish_transparent_lexical_prefixes() {
+        use brokk_bifrost_core::analyzer::resolution_facts::{
+            ResolutionRootImportAnchor, ResolutionSiteKind, ResolutionTypeTransferKind,
+        };
+
+        for (expression, prefix) in [
+            ("models.Widget()", Some("models")),
+            ("(models).Widget()", Some("models")),
+            ("(((models))).Widget()", Some("models")),
+            ("(models # transparent comment\n).Widget()", Some("models")),
+            ("((alias)).Widget()", Some("alias")),
+            ("((package.models)).Widget()", Some("models")),
+            ("((package).models).Widget()", Some("models")),
+            ("models().Widget()", None),
+            ("(models()).Widget()", None),
+            ("models[0].Widget()", None),
+            ("(models[0]).Widget()", None),
+            ("(models,).Widget()", None),
+        ] {
+            let source = format!("import models\nimport models as alias\n{expression}\n");
+            let parsed = parse(&source);
+            let facts = &parsed.resolution_facts;
+            let member = facts
+                .sites
+                .iter()
+                .find(|site| {
+                    site.kind == ResolutionSiteKind::MemberReference
+                        && &source[site.start_byte..site.end_byte] == "Widget"
+                })
+                .expect("callee member reference");
+            let routes = facts
+                .root_references
+                .iter()
+                .filter(|route| route.reference == member.id)
+                .collect::<Vec<_>>();
+            if let Some(prefix) = prefix {
+                let [route] = routes.as_slice() else {
+                    panic!("{expression}: expected one lexical route, got {routes:?}");
+                };
+                assert_eq!(route.anchor, ResolutionRootImportAnchor::Lexical);
+                let token = &facts.sites[route.prefix_reference.expect("lexical prefix").index()];
+                assert_eq!(
+                    &source[token.start_byte..token.end_byte],
+                    prefix,
+                    "{expression}"
+                );
+                let segments = facts
+                    .root_reference_segments
+                    .iter()
+                    .filter(|segment| segment.reference == member.id)
+                    .collect::<Vec<_>>();
+                assert_eq!(segments.len(), 1, "{expression}: {segments:?}");
+                assert_eq!(segments[0].position, 0);
+                assert_eq!(facts.names[segments[0].name.index()].spelling, prefix);
+            } else {
+                assert!(routes.is_empty(), "{expression}: {routes:?}");
+            }
+            let identifier = facts
+                .identifiers
+                .iter()
+                .find(|id| id.site == member.id)
+                .unwrap();
+            let receiver = identifier.qualifier.expect("retain the typed receiver");
+            assert!(
+                facts.type_transfers.iter().any(|transfer| {
+                    transfer.output == receiver
+                        && transfer.kind == ResolutionTypeTransferKind::Receiver
+                }),
+                "{expression}: retain the receiver transfer"
+            );
+        }
     }
 
     #[test]

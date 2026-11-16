@@ -1743,6 +1743,19 @@ mod tests {
         ) -> Box<dyn crate::analyzer::multi_analyzer::LanguageAnalyzer> {
             unimplemented!()
         }
+        fn update_all_with_membership(
+            &self,
+            _: Option<crate::analyzer::BuildProgress>,
+            _: std::sync::Arc<crate::analyzer::tree_sitter_analyzer::GenerationWorkspaceMembership>,
+        ) -> Box<dyn crate::analyzer::multi_analyzer::LanguageAnalyzer> {
+            unimplemented!()
+        }
+        fn with_generation_membership(
+            &self,
+            _: std::sync::Arc<crate::analyzer::tree_sitter_analyzer::GenerationWorkspaceMembership>,
+        ) -> Box<dyn crate::analyzer::multi_analyzer::LanguageAnalyzer> {
+            unimplemented!()
+        }
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }

@@ -16,6 +16,10 @@ use brokk_bifrost_core::analyzer::code_unit_index::CodeUnitIndex;
 
 use crate::analyzer::GoAnalyzer;
 
+use crate::analyzer::go::execution_dependent;
+
+use brokk_bifrost_analysis::analyzer::reuse_verdict::ReuseVerdict;
+
 use brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer;
 
 use brokk_bifrost_core::analyzer::model::Language;
@@ -385,19 +389,32 @@ pub(crate) fn go_predeclared_type_name_is_exact_bounded(
     }
 }
 
-/// Native static type proof for an exact explicit binding. Prepared syntax is
-/// shared with the analyzer request; type text is never parsed or resolved here.
+/// Native static type proof for an exact explicit binding, with the reuse
+/// verdict of the work that produced it. Prepared syntax is shared with the
+/// analyzer request; type text is never parsed or resolved here.
 pub fn go_explicit_binding_type_identity(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     source: &str,
     binding: Range,
     cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
-) -> brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution<
-    Option<brokk_bifrost_analysis::analyzer::resolution::CanonicalTypeIdentity>,
-> {
-    go_explicit_binding_declared_type(analyzer, file, source, binding, cancellation)
-        .map(|selected| selected.canonical)
+) -> (
+    brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution<
+        Option<brokk_bifrost_analysis::analyzer::resolution::CanonicalTypeIdentity>,
+    >,
+    ReuseVerdict,
+) {
+    let mut reuse = ReuseVerdict::Content;
+    let answer = go_explicit_binding_declared_type(
+        analyzer,
+        file,
+        source,
+        binding,
+        cancellation,
+        &mut reuse,
+    )
+    .map(|selected| selected.canonical);
+    (answer, reuse)
 }
 
 /// Both sides must have a selected canonical identity before the conversion
@@ -409,7 +426,8 @@ pub fn go_assignment_conversion_types_identical(
     result.is_some() && result == binding
 }
 
-/// Select the emitted call result slot at the requested ordinal for exact type proof.
+/// Select the emitted call result slot at the requested ordinal for exact type
+/// proof. `reuse` joins the verdict of the work.
 pub fn go_call_result_type_identity(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
@@ -417,6 +435,7 @@ pub fn go_call_result_type_identity(
     call: Range,
     ordinal: u32,
     cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+    reuse: &mut ReuseVerdict,
 ) -> brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution<
     Option<brokk_bifrost_analysis::analyzer::resolution::CanonicalTypeIdentity>,
 > {
@@ -432,7 +451,7 @@ pub fn go_call_result_type_identity(
     let _model_scope = match AnalyzerQueryScope::pin_selected_model_snapshot(analyzer) {
         Ok(scope) => scope,
         Err(_) => {
-            analyzer.mark_execution_dependent();
+            reuse.join_in(execution_dependent(analyzer));
             return unknown();
         }
     };
@@ -456,7 +475,7 @@ pub fn go_call_result_type_identity(
     let opened = match GoNativePointRequest::open_for_file(
         go,
         file,
-        analyzer.semantic_model_overlay(),
+        analyzer.semantic_model_overlay_read().published(),
         cancellation,
     ) {
         Ok(opened) => opened,
@@ -483,7 +502,7 @@ pub fn go_call_result_type_identity(
             work: Default::default(),
         },
         GoNativePointRequestOpen::Unavailable { .. } => {
-            analyzer.mark_execution_dependent();
+            reuse.join_in(execution_dependent(analyzer));
             unknown()
         }
     }
@@ -507,6 +526,7 @@ pub(crate) fn go_explicit_binding_declared_type(
     source: &str,
     binding: Range,
     cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+    reuse: &mut ReuseVerdict,
 ) -> brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution<
     GoExplicitBindingDeclaredType,
 > {
@@ -517,6 +537,7 @@ pub(crate) fn go_explicit_binding_declared_type(
         binding,
         cancellation,
         super::native_points::no_application_source,
+        reuse,
     )
 }
 
@@ -526,6 +547,7 @@ pub(crate) fn go_explicit_binding_application_type(
     source: &str,
     binding: Range,
     cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+    reuse: &mut ReuseVerdict,
 ) -> brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution<
     GoExplicitBindingDeclaredType,
 > {
@@ -536,6 +558,7 @@ pub(crate) fn go_explicit_binding_application_type(
         binding,
         cancellation,
         super::native_points::read_application_source,
+        reuse,
     )
 }
 
@@ -551,6 +574,7 @@ fn go_explicit_binding_declared_type_with_source(
         &ProjectFile,
         &str,
     ) -> Option<GoSelectedApplicationSource>,
+    reuse: &mut ReuseVerdict,
 ) -> brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution<
     GoExplicitBindingDeclaredType,
 > {
@@ -575,7 +599,7 @@ fn go_explicit_binding_declared_type_with_source(
     let _model_scope = match AnalyzerQueryScope::pin_selected_model_snapshot(analyzer) {
         Ok(scope) => scope,
         Err(_) => {
-            analyzer.mark_execution_dependent();
+            reuse.join_in(execution_dependent(analyzer));
             return unknown();
         }
     };
@@ -599,7 +623,7 @@ fn go_explicit_binding_declared_type_with_source(
     let opened = match GoNativePointRequest::open_for_file(
         go,
         file,
-        analyzer.semantic_model_overlay(),
+        analyzer.semantic_model_overlay_read().published(),
         cancellation,
     ) {
         Ok(opened) => opened,
@@ -626,54 +650,55 @@ fn go_explicit_binding_declared_type_with_source(
             work: Default::default(),
         },
         GoNativePointRequestOpen::Unavailable { .. } => {
-            analyzer.mark_execution_dependent();
+            reuse.join_in(execution_dependent(analyzer));
             unknown()
         }
     }
 }
 
-/// Lower one provider-pinned callable once and export only canonical scalars.
+/// Lower one provider-pinned callable once and export only canonical scalars,
+/// with the reuse verdict of the lowering.
 #[allow(clippy::type_complexity)]
 pub fn go_selected_callable_result_type_identities(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     member: &brokk_bifrost_analysis::analyzer::semantic_model::overlay::ModelSymbolRef,
     cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
-) -> Option<(
-    Vec<Option<brokk_bifrost_analysis::analyzer::resolution::CanonicalTypeIdentity>>,
-    usize,
-)> {
+) -> (
+    Option<(
+        Vec<Option<brokk_bifrost_analysis::analyzer::resolution::CanonicalTypeIdentity>>,
+        usize,
+    )>,
+    ReuseVerdict,
+) {
     use super::native_points::{GoNativePointRequest, GoNativePointRequestOpen};
-    let go = resolve_analyzer::<GoAnalyzer>(analyzer)?;
+    let Some(go) = resolve_analyzer::<GoAnalyzer>(analyzer) else {
+        return (None, ReuseVerdict::Content);
+    };
     let _model_scope = match AnalyzerQueryScope::pin_selected_model_snapshot(analyzer) {
         Ok(scope) => scope,
-        Err(_) => {
-            analyzer.mark_execution_dependent();
-            return None;
-        }
+        Err(_) => return (None, execution_dependent(analyzer)),
     };
     let opened = GoNativePointRequest::open_for_file(
         go,
         file,
-        analyzer.semantic_model_overlay(),
+        analyzer.semantic_model_overlay_read().published(),
         cancellation,
     );
     let opened = match opened {
         Ok(opened) => opened,
         Err(error) => {
             analyzer.record_query_failure(error);
-            return None;
+            return (None, ReuseVerdict::Content);
         }
     };
     match opened {
-        GoNativePointRequestOpen::Ready(request) => {
-            request.selected_callable_result_type_identities(member, cancellation)
-        }
-        GoNativePointRequestOpen::Cancelled => None,
-        GoNativePointRequestOpen::Unavailable { .. } => {
-            analyzer.mark_execution_dependent();
-            None
-        }
+        GoNativePointRequestOpen::Ready(request) => (
+            request.selected_callable_result_type_identities(member, cancellation),
+            ReuseVerdict::Content,
+        ),
+        GoNativePointRequestOpen::Cancelled => (None, ReuseVerdict::Content),
+        GoNativePointRequestOpen::Unavailable { .. } => (None, execution_dependent(analyzer)),
     }
 }
 
@@ -684,11 +709,27 @@ fn go_shadow_step_limit(source: &str) -> usize {
         .clamp(1, GO_NATIVE_ERROR_OBLIGATION_MAX_STEPS)
 }
 
-pub(super) fn explicit_binding_type_node(
+/// Pair an exact syntax binder with the source unit selected by native facts.
+/// Unit ranges can cover all names in one grouped var_spec.
+pub(crate) fn selected_unit_binding_is_exact(
+    unit: &CodeUnit,
+    file: &ProjectFile,
+    source: &str,
+    binding: Range,
+    ranges: &[Range],
+) -> bool {
+    unit.source() == file
+        && source.get(binding.start_byte..binding.end_byte) == Some(unit.terminal_name())
+        && ranges.iter().any(|range| {
+            range.start_byte <= binding.start_byte && binding.end_byte <= range.end_byte
+        })
+}
+
+pub(crate) fn explicit_binding_type_nodes(
     root: Node<'_>,
     binding: Range,
     mut scope_step: impl FnMut() -> bool,
-) -> Option<Node<'_>> {
+) -> Option<(Node<'_>, Node<'_>)> {
     if binding.start_byte >= binding.end_byte {
         return None;
     }
@@ -708,8 +749,6 @@ pub(super) fn explicit_binding_type_node(
     if !matches!(declaration.kind(), "var_spec" | "parameter_declaration")
         || declaration.has_error()
         || !node_has_field_child(declaration, "name", name)
-        || (declaration.kind() == "parameter_declaration"
-            && parameter_has_generic_callable_context(declaration, &mut scope_step))
     {
         return None;
     }
@@ -717,10 +756,10 @@ pub(super) fn explicit_binding_type_node(
     if type_node.has_error() {
         return None;
     }
-    (name.end_byte() <= type_node.start_byte()).then_some(type_node)
+    (name.end_byte() <= type_node.start_byte()).then_some((name, type_node))
 }
 
-fn parameter_has_generic_callable_context(
+pub(super) fn parameter_has_generic_callable_context(
     parameter: Node<'_>,
     scope_step: &mut impl FnMut() -> bool,
 ) -> bool {

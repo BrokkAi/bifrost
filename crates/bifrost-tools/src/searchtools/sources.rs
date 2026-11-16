@@ -95,6 +95,7 @@ pub struct SymbolSourcesResult {
 pub enum SymbolSourcesIncompleteReason {
     Cancelled,
     ReadIncomplete,
+    SourceUnavailable,
     /// The declaration lies inside a construct its file's parse never closed,
     /// so its scope and nesting are a recovery claim (#3501).
     InsideUnclosedConstruct,
@@ -108,8 +109,17 @@ pub struct SymbolSourcesIncomplete {
     pub detail: Option<String>,
 }
 
+/// Provenance used to decide whether a source can be refreshed from the workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceOrigin {
+    Workspace,
+    SemanticModel,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SourceBlock {
+    #[serde(skip)]
+    pub origin: SourceOrigin,
     pub label: String,
     pub path: String,
     pub start_line: usize,
@@ -143,6 +153,12 @@ pub(crate) enum SourceLookupOutcome {
     /// verdict at all. Keep it separate from not-found: a cancellation is not
     /// evidence that the selector is absent.
     Cancelled(SymbolSourcesIncomplete),
+    /// At least one file target hit a fallback source read failure, while any
+    /// readable siblings remain valid results (#8711).
+    Partial {
+        blocks: Vec<SourceBlock>,
+        incomplete: Vec<SymbolSourcesIncomplete>,
+    },
 }
 
 /// The fan-out and cancellation budget one `get_symbol_sources` symbol
@@ -271,7 +287,11 @@ pub fn symbol_source_candidate_files(
     let resolver = WorkspaceFileResolver::for_analyzer(analyzer);
     let mut files = BTreeSet::new();
 
-    for source in &result.sources {
+    for source in result
+        .sources
+        .iter()
+        .filter(|source| source.origin == SourceOrigin::Workspace)
+    {
         if let Some(rel_path) = workspace_rel_path(&source.path) {
             files.insert(ProjectFile::new(
                 analyzer.project().root().to_path_buf(),
@@ -714,21 +734,26 @@ fn get_symbol_sources_with_budget(
                     max_files_per_target,
                 ));
             }
-            let sources = match source_blocks_for_files_with_budget(
+            let extracted = match source_blocks_for_files_with_budget(
                 analyzer,
                 file_matches.files,
                 source_budget,
             ) {
-                Ok(sources) => sources,
+                Ok(extracted) => extracted,
                 Err(_) => return SourceLookupOutcome::BudgetExceeded,
             };
             if !keep_going() {
                 return cancelled_source_outcome(&symbol);
             }
-            return if sources.is_empty() {
+            return if !extracted.incomplete.is_empty() {
+                SourceLookupOutcome::Partial {
+                    blocks: extracted.blocks,
+                    incomplete: extracted.incomplete,
+                }
+            } else if extracted.blocks.is_empty() {
                 SourceLookupOutcome::NotFound(renderable_not_found_input(symbol))
             } else {
-                SourceLookupOutcome::Found(sources)
+                SourceLookupOutcome::Found(extracted.blocks)
             };
         }
 
@@ -846,22 +871,16 @@ fn get_symbol_sources_with_budget(
     for outcome in outcomes {
         match outcome {
             SourceLookupOutcome::Found(blocks) => {
-                for block in &blocks {
-                    if block.inside_unclosed_construct.is_some()
-                        && !incomplete.iter().any(|item: &SymbolSourcesIncomplete| {
-                            item.target == block.label
-                                && item.reason
-                                    == SymbolSourcesIncompleteReason::InsideUnclosedConstruct
-                        })
-                    {
-                        incomplete.push(SymbolSourcesIncomplete {
-                            target: block.label.clone(),
-                            reason: SymbolSourcesIncompleteReason::InsideUnclosedConstruct,
-                            detail: None,
-                        });
-                    }
+                push_found_source_blocks(&mut sources, &mut incomplete, blocks);
+            }
+            SourceLookupOutcome::Partial {
+                blocks,
+                incomplete: partial_incomplete,
+            } => {
+                push_found_source_blocks(&mut sources, &mut incomplete, blocks);
+                for item in partial_incomplete {
+                    push_unique_incomplete(&mut incomplete, item);
                 }
-                sources.extend(dedup_source_blocks(blocks));
             }
             SourceLookupOutcome::NotFound(symbol) => not_found.push(symbol),
             SourceLookupOutcome::Ambiguous(item) => ambiguous.push(item),
@@ -871,7 +890,7 @@ fn get_symbol_sources_with_budget(
                 let _scope = brokk_bifrost_core::profiling::scope(
                     "get_symbol_sources.cancellation_partial_completion",
                 );
-                incomplete.push(item);
+                push_unique_incomplete(&mut incomplete, item);
             }
             SourceLookupOutcome::BudgetExceeded => {
                 return Err(SymbolSourcesBudgetExceeded {
@@ -883,7 +902,12 @@ fn get_symbol_sources_with_budget(
 
     if let Err(reason) = analyzer_query.read_completion() {
         match reason {
-            brokk_bifrost_analysis::analyzer::QueryReadIncomplete::Cancelled => {
+            ref reason
+                if matches!(
+                    reason.base_cause(),
+                    brokk_bifrost_analysis::analyzer::QueryReadIncomplete::Cancelled
+                ) =>
+            {
                 if !incomplete
                     .iter()
                     .any(|item| item.reason == SymbolSourcesIncompleteReason::Cancelled)
@@ -933,7 +957,7 @@ fn semantic_model_source_outcome_with_anchor(
     required_path: Option<&str>,
     source_budget: &SourceByteBudget,
 ) -> Option<SourceLookupOutcome> {
-    let overlay = analyzer.semantic_model_overlay()?;
+    let overlay = analyzer.semantic_model_overlay_read().published()?;
     let mut matched = if symbol.starts_with("bifrost-model://") {
         overlay.symbols_at_uri(symbol)
     } else {
@@ -1000,6 +1024,8 @@ fn semantic_model_source_outcome_with_anchor(
                         source_budget,
                     ) {
                         Ok(sources) if !sources.is_empty() => {
+                            // Workspace-backed text retains workspace origin
+                            // and its source freshness checks.
                             Some(SourceLookupOutcome::Found(sources))
                         }
                         Ok(_) => {
@@ -1214,6 +1240,7 @@ fn source_blocks_for_code_unit_with_cache(
 
         let start_line = find_line_index_for_offset(&line_starts, start_byte) + 1;
         blocks.push(SourceBlock {
+            origin: SourceOrigin::Workspace,
             label: display_symbol_for_target(analyzer, code_unit),
             path: rel_path_string(code_unit.source()),
             start_line,
@@ -1247,34 +1274,84 @@ fn reserve_source_blocks(
     Ok(())
 }
 
+struct FileSourceBlocks {
+    blocks: Vec<SourceBlock>,
+    incomplete: Vec<SymbolSourcesIncomplete>,
+}
+
+fn push_unique_incomplete(
+    incomplete: &mut Vec<SymbolSourcesIncomplete>,
+    item: SymbolSourcesIncomplete,
+) {
+    if !incomplete
+        .iter()
+        .any(|existing| existing.target == item.target && existing.reason == item.reason)
+    {
+        incomplete.push(item);
+    }
+}
+
+fn push_found_source_blocks(
+    sources: &mut Vec<SourceBlock>,
+    incomplete: &mut Vec<SymbolSourcesIncomplete>,
+    blocks: Vec<SourceBlock>,
+) {
+    for block in &blocks {
+        if block.inside_unclosed_construct.is_some() {
+            push_unique_incomplete(
+                incomplete,
+                SymbolSourcesIncomplete {
+                    target: block.label.clone(),
+                    reason: SymbolSourcesIncompleteReason::InsideUnclosedConstruct,
+                    detail: None,
+                },
+            );
+        }
+    }
+    sources.extend(dedup_source_blocks(blocks));
+}
+
 fn source_blocks_for_files_with_budget(
     analyzer: &dyn IAnalyzer,
     files: Vec<ProjectFile>,
     source_budget: &SourceByteBudget,
-) -> Result<Vec<SourceBlock>, SymbolSourcesBudgetExceeded> {
+) -> Result<FileSourceBlocks, SymbolSourcesBudgetExceeded> {
     let _scope = brokk_bifrost_core::profiling::scope("get_symbol_sources.source_extraction");
-    let blocks = files
-        .into_iter()
-        .filter_map(|file| {
-            if let Some(block) = file_outline_source_block(
-                analyzer,
-                &file,
-                file_outline_source_note(&file),
-                None,
-                None,
-            ) {
-                return Some(block);
-            }
+    let mut blocks = Vec::new();
+    let mut incomplete = Vec::new();
+    for file in files {
+        if let Some(block) =
+            file_outline_source_block(analyzer, &file, file_outline_source_note(&file), None, None)
+        {
+            blocks.push(block);
+            continue;
+        }
 
-            if let Some(block) = include_fallback_source_block(analyzer, &file) {
-                return Some(block);
+        match include_fallback_source_block(analyzer, &file) {
+            Ok(Some(block)) => {
+                blocks.push(block);
+                continue;
             }
+            Ok(None) => {}
+            Err(err) => {
+                // Keep the include-fallback read failure typed so the caller
+                // marks the answer incomplete rather than falling through to
+                // an excerpt or a false not-found verdict (#8711).
+                incomplete.push(SymbolSourcesIncomplete {
+                    target: rel_path_string(&file),
+                    reason: SymbolSourcesIncompleteReason::SourceUnavailable,
+                    detail: Some(err.to_string()),
+                });
+                continue;
+            }
+        }
 
-            excerpt_fallback_source_block(analyzer, &file)
-        })
-        .collect::<Vec<_>>();
+        if let Some(block) = excerpt_fallback_source_block(analyzer, &file) {
+            blocks.push(block);
+        }
+    }
     reserve_source_blocks(source_budget, &blocks)?;
-    Ok(blocks)
+    Ok(FileSourceBlocks { blocks, incomplete })
 }
 
 pub(crate) fn file_outline_source_block(
@@ -1291,6 +1368,7 @@ pub(crate) fn file_outline_source_block(
     let end_line = text.lines().count().max(1);
     let path = rel_path_string(file);
     Some(SourceBlock {
+        origin: SourceOrigin::Workspace,
         label: label.unwrap_or_else(|| path.clone()),
         path,
         start_line: 1,
@@ -1318,10 +1396,10 @@ pub(crate) fn file_outline_source_note(file: &ProjectFile) -> String {
 pub(crate) fn include_fallback_source_block(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
-) -> Option<SourceBlock> {
-    let elements = include_fallback_elements(analyzer, file).unwrap_or_default();
+) -> std::io::Result<Option<SourceBlock>> {
+    let elements = include_fallback_elements(analyzer, file)?;
     if elements.is_empty() {
-        return None;
+        return Ok(None);
     }
     let start_line = elements
         .iter()
@@ -1339,7 +1417,8 @@ pub(crate) fn include_fallback_source_block(
         .collect::<Vec<_>>()
         .join("\n");
     let path = rel_path_string(file);
-    Some(SourceBlock {
+    Ok(Some(SourceBlock {
+        origin: SourceOrigin::Workspace,
         label: path.clone(),
         path,
         start_line,
@@ -1354,7 +1433,7 @@ pub(crate) fn include_fallback_source_block(
         ),
         semantic_model: None,
         inside_unclosed_construct: None,
-    })
+    }))
 }
 
 pub(crate) fn excerpt_fallback_source_block(
@@ -1364,6 +1443,7 @@ pub(crate) fn excerpt_fallback_source_block(
     let (elements, note) = excerpt_fallback_elements(analyzer, file)?;
     let sampled = elements.into_iter().next()?;
     Some(SourceBlock {
+        origin: SourceOrigin::Workspace,
         label: sampled.path.clone(),
         path: sampled.path,
         start_line: sampled.start_line,
@@ -1424,6 +1504,7 @@ pub(crate) fn module_file_listing_blocks(
             .unwrap_or_else(|| {
                 let path = rel_path_string(&file);
                 SourceBlock {
+                    origin: SourceOrigin::Workspace,
                     label,
                     path,
                     start_line: 1,
@@ -1483,6 +1564,7 @@ fn semantic_model_source_block(
     );
     let range = symbol.location.range();
     SourceBlock {
+        origin: SourceOrigin::SemanticModel,
         label: symbol.qualified_name.clone(),
         path: symbol.location.identity().to_string(),
         start_line: range.start_line,

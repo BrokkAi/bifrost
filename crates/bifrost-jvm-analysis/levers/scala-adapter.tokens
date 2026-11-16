@@ -1,0 +1,14 @@
+# The scala semantic adapter lever (#11570).
+#
+# Add one `<issue>-<slug>` line when a change alters the value semantics the
+# scala lowerer publishes for unchanged source: its identity is hashed into
+# every semantic artifact key, every public id derived from the adapter
+# fingerprint, the lowered-IR producer epoch and the policy lowering identity.
+# No other language's identity moves. Git merges this file with merge=union, so
+# two branches that each add a line keep both. Never edit or remove a line;
+# compaction replaces a prefix with a checkpoint line and keeps the identity.
+# See .agents/docs/cache-identity-levers.md.
+#
+# Replaced the numbered literal `scala-value-semantics-v30`.
+11570-slice2a-token-files
+12965-scala-store-fault-gaps

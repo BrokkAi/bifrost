@@ -25,7 +25,7 @@ pub(in crate::engine_tests) mod tests {
 
     use git2::Oid;
 
-    use brokk_bifrost_analysis::analyzer::store::rust_crates::RUST_CRATE_DERIVATION_VERSION;
+    use brokk_bifrost_analysis::analyzer::store::rust_crates::derivation_identity_before_last_token;
 
     use brokk_bifrost_analysis::analyzer::store::Result;
 
@@ -43,13 +43,13 @@ pub(in crate::engine_tests) mod tests {
 
     use brokk_bifrost_analysis::analyzer::store::rust_crates::derivation;
 
-    use brokk_bifrost_analysis::analyzer::store::rust_crates::derivation_version;
+    use brokk_bifrost_analysis::analyzer::store::rust_crates::derivation_identity;
 
     use rusqlite::params;
 
     use brokk_bifrost_analysis::analyzer::store::rust_crates::prepare_pin_context;
 
-    use brokk_bifrost_analysis::analyzer::store::rust_crates::set_derivation_version;
+    use brokk_bifrost_analysis::analyzer::store::rust_crates::set_derivation_identity;
 
     use brokk_bifrost_analysis::analyzer::store::unit_schedule;
 
@@ -177,6 +177,247 @@ pub(in crate::engine_tests) mod tests {
         fn ignore_rules_digest(&self) -> std::io::Result<[u8; 32]> {
             self.delegate.ignore_rules_digest()
         }
+    }
+
+    #[test]
+    #[hardwon(
+        "#13016: a #[macro_export] macro inside a function body was missing from the crate's exports"
+    )]
+    fn body_local_macro_export_is_not_a_complete_absence() {
+        for (source, activation) in [
+            (
+                "pub fn setup() { #[macro_export] macro_rules! shout { () => {} } }",
+                1,
+            ),
+            (
+                "pub fn setup() {} fn hidden() { #[cfg(feature=\"off\")] #[macro_export] macro_rules! shout { () => {} } }",
+                0,
+            ),
+            (
+                "pub fn setup() {} #[cfg(feature=\"off\")] fn hidden() { #[macro_export] macro_rules! shout { () => {} } }",
+                0,
+            ),
+            (
+                "pub fn setup() {} #[cfg(feature=\"off\")] mod hidden { fn inside() { #[macro_export] macro_rules! shout { () => {} } } }",
+                0,
+            ),
+            (
+                "pub fn setup() {} #[cfg(unknown_build_flag)] fn hidden() { #[macro_export] macro_rules! shout { () => {} } }",
+                -1,
+            ),
+        ] {
+            let open = activation != 0;
+            // Members use all features. A is a path dependency so its declared
+            // `off` feature is genuinely disabled in this selected build.
+            let fixture = InlineTestProject::new()
+            .file("Cargo.toml", "[workspace]\nmembers=['b']\nexclude=['a']\nresolver='2'\n")
+            .file("a/Cargo.toml", "[package]\nname='a'\nversion='0.1.0'\nedition='2021'\n[features]\noff=[]\n")
+            .file("b/Cargo.toml", "[package]\nname='b'\nversion='0.1.0'\nedition='2021'\n[dependencies]\na={path='../a'}\n")
+            .file("a/src/lib.rs", format!("{source}\nfn local() {{ crate::shout!(); crate::missing(); let _: crate::Missing; }}\n"))
+            .file("b/src/lib.rs", "use a::{shout, missing, Missing};\nfn consumer() { a::shout!(); }\n")
+            .build();
+            let analyzer = fixture.workspace_analyzer(AnalyzerConfig::default());
+            let conn = analyzer
+                .store()
+                .unwrap()
+                .read_conn_for_workspace(&Default::default())
+                .unwrap();
+            brokk_bifrost_analysis::analyzer::store::planner_statistics::pinned_plans::prepare_pin_context(
+            &conn,
+        );
+            conn.execute("INSERT INTO selected_workspace_revisions SELECT workspace_id,lang,generation,revision FROM workspace_heads WHERE lang='rust'", []).unwrap();
+            brokk_bifrost_analysis::analyzer::store::fill_selected_rust_units(&conn).unwrap();
+            let a: i64 = conn
+                .query_row(
+                    "SELECT topology_id FROM selected_rust_crates WHERE crate_name='a'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let b: i64 = conn
+                .query_row(
+                    "SELECT topology_id FROM selected_rust_crates WHERE crate_name='b'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            brokk_bifrost_analysis::analyzer::store::rust_crates::register_point_export_functions(
+                &conn,
+            )
+            .unwrap();
+            let recorded_activation: i64 = conn.query_row("SELECT cr_cfg(properties.cfg_condition, json(topology.cfg_atoms)) FROM source_rust_declaration_properties properties CROSS JOIN selected_rust_crates topology WHERE topology.topology_id=?1 AND properties.macro_exported=1", [a], |row| row.get(0)).unwrap();
+            assert_eq!(
+                recorded_activation, activation,
+                "selected activation of {source:?}"
+            );
+            use brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_crate_context::PUBLISHED_OPEN_INVENTORY;
+            // These are the same inventory reads used by crate_binding_inventory:
+            // the defining root, reached from the dependency or from its own crate.
+            for requester in [b, a] {
+                let details = conn
+                    .prepare(PUBLISHED_OPEN_INVENTORY)
+                    .unwrap()
+                    .query_map(
+                        params![a, "crate", "macro", "shout", requester, "crate"],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                if !open {
+                    assert!(
+                        details.is_empty(),
+                        "inactive macro leaves a complete root inventory: source={source:?}, requester={requester}, details={details:?}"
+                    );
+                }
+                let evidence: Vec<serde_json::Value> = details
+                    .iter()
+                    .map(|detail| serde_json::from_str::<serde_json::Value>(detail).unwrap())
+                    .flat_map(|detail| detail["evidence"].as_array().unwrap().clone())
+                    .collect();
+                assert_eq!(
+                    evidence
+                        .iter()
+                        .any(|item| item["reason"] == "UnloweredDeclaration"
+                            && item["namespace"] == "macro"),
+                    open,
+                    "source={source:?}, requester {requester}: macro inventory activation: {details:?}"
+                );
+            }
+            for (namespace, name) in [("value", "missing"), ("type", "Missing")] {
+                let details = conn
+                    .prepare(PUBLISHED_OPEN_INVENTORY)
+                    .unwrap()
+                    .query_map(params![a, "crate", namespace, name, b, "crate"], |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                assert!(
+                    details.is_empty(),
+                    "absent {namespace} binding must stay complete: {details:?}"
+                );
+                let complete: bool = conn.query_row("SELECT certificate.complete FROM selected_rust_unit_summaries unit JOIN rust_resolution_unit_summary_binding_owners owner ON owner.summary_id=unit.summary_id AND owner.kind='module' AND owner.module_path='crate' JOIN rust_resolution_unit_summary_binding_names certificate ON certificate.summary_id=owner.summary_id AND certificate.owner_handle=owner.owner_handle WHERE unit.topology_id=?1 AND certificate.namespace=?2 AND certificate.name=?3", params![a,namespace,name], |row| row.get(0)).unwrap();
+                assert!(
+                    complete,
+                    "absent {namespace} name {name} needs a complete binding certificate"
+                );
+            }
+            let function_inventory = conn
+                .prepare(PUBLISHED_OPEN_INVENTORY)
+                .unwrap()
+                .query_map(params![a, "crate", "value", "setup", a, "crate"], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert!(
+                function_inventory.is_empty(),
+                "function inventory stays complete: {function_inventory:?}"
+            );
+            let function_complete: bool = conn.query_row("SELECT name.complete FROM selected_rust_unit_summaries unit JOIN rust_resolution_unit_summary_binding_owners owner ON owner.summary_id=unit.summary_id AND owner.kind='module' AND owner.module_path='crate' JOIN rust_resolution_unit_summary_binding_names name ON name.summary_id=owner.summary_id AND name.owner_handle=owner.owner_handle WHERE unit.topology_id=?1 AND name.namespace='value' AND name.name='setup'", [a], |row| row.get(0)).unwrap();
+            assert!(
+                function_complete,
+                "the public function retains its complete binding certificate"
+            );
+            let gaps = conn.prepare("SELECT subject,json(detail) FROM rust_crate_gaps WHERE topology_id=?1 AND gap_kind='open_export_inventory'").unwrap()
+            .query_map([a], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+            assert_eq!(
+                gaps.iter().any(|(subject, detail)| subject == "crate"
+                    && detail.contains("UnloweredDeclaration")),
+                open,
+                "source={source:?}: {gaps:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon("#13016: an overlay adding a body-local exported macro claimed a complete absence")]
+    fn body_local_macro_export_overlay_opens_selected_inventory() {
+        use brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_crate_context::{
+            PUBLISHED_OPEN_INVENTORY, SELECTED_MODULE_PLACEMENTS_FILL_SQL,
+        };
+        let fixture = InlineTestProject::new()
+            .file("Cargo.toml", "[workspace]\nmembers=['a','b']\nresolver='2'\n")
+            .file("a/Cargo.toml", "[package]\nname='a'\nversion='0.1.0'\nedition='2021'\n")
+            .file("b/Cargo.toml", "[package]\nname='b'\nversion='0.1.0'\nedition='2021'\n[dependencies]\na={path='../a'}\n")
+            .file("a/src/lib.rs", "pub fn setup() {} fn local() { crate::shout!(); }")
+            .file("a/src/overlay.rs", "pub fn setup() { #[macro_export] macro_rules! shout { () => {} } } fn local() { crate::shout!(); }")
+            .file("b/src/lib.rs", "use a::shout; fn consumer() { a::shout!(); }")
+            .build();
+        let analyzer = fixture.workspace_analyzer(AnalyzerConfig::default());
+        let conn = analyzer
+            .store()
+            .unwrap()
+            .read_conn_for_workspace(&Default::default())
+            .unwrap();
+        brokk_bifrost_analysis::analyzer::store::planner_statistics::pinned_plans::prepare_pin_context(
+            &conn,
+        );
+        brokk_bifrost_analysis::analyzer::store::rust_crates::register_point_export_functions(
+            &conn,
+        )
+        .unwrap();
+        conn.execute("INSERT INTO selected_workspace_revisions SELECT workspace_id,lang,generation,revision FROM workspace_heads WHERE lang='rust'", []).unwrap();
+        brokk_bifrost_analysis::analyzer::store::fill_selected_rust_units(&conn).unwrap();
+        let a: i64 = conn
+            .query_row(
+                "SELECT topology_id FROM selected_rust_crates WHERE crate_name='a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let b: i64 = conn
+            .query_row(
+                "SELECT topology_id FROM selected_rust_crates WHERE crate_name='b'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let before: i64 = conn
+            .query_row("SELECT count(*) FROM rust_crate_topologies", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let query = |requester| {
+            conn.prepare(PUBLISHED_OPEN_INVENTORY)
+                .unwrap()
+                .query_map(
+                    params![a, "crate", "macro", "shout", requester, "crate"],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        for requester in [a, b] {
+            assert!(query(requester).is_empty());
+        }
+        let edited: i64 = conn.query_row("SELECT blob.id FROM selected_workspace_file_versions file JOIN blobs blob ON blob.lang=file.lang AND blob.blob_oid=file.blob_oid AND blob.parse_variant=x'' WHERE file.lang='rust' AND file.rel_path='a/src/overlay.rs'", [], |row| row.get(0)).unwrap();
+        conn.execute("INSERT INTO selected_resolution_mounts(mount_ordinal,blob_id,storage_language,semantic_language,persisted_relative_path) VALUES(0,?1,'rust','rust','a/src/lib.rs')", [edited]).unwrap();
+        conn.execute("INSERT INTO selected_resolution_overlay_masks(storage_language,persisted_relative_path,intent) VALUES('rust','a/src/lib.rs','replacement')", []).unwrap();
+        conn.execute_batch(SELECTED_MODULE_PLACEMENTS_FILL_SQL)
+            .unwrap();
+        for requester in [a, b] {
+            let details = query(requester);
+            assert!(
+                details
+                    .iter()
+                    .any(|detail| detail.contains("UnloweredDeclaration")),
+                "selected root macro inventory must be incomplete: {details:?}"
+            );
+        }
+        assert_eq!(
+            before,
+            conn.query_row("SELECT count(*) FROM rust_crate_topologies", [], |row| row
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            "overlay lookup must not rebuild the crate"
+        );
     }
 
     #[test]
@@ -528,10 +769,16 @@ pub(in crate::engine_tests) mod tests {
         use brokk_bifrost_core::analyzer::project::{FilesystemProject, WorkspaceFileListingCache};
 
         let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
+        let _env = brokk_bifrost_core::analyzer::project::IgnoreTestEnvironment::new(
+            &temp.path().join("home"),
+        );
+        let root = temp.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
         write(&root, "src/lib.rs", "pub fn existing() {}\n");
         let repo = brokk_bifrost_core::gitblob::test_repo::init_repo(&root);
         brokk_bifrost_core::gitblob::test_repo::commit_all(&repo, "initial");
+        brokk_bifrost_core::analyzer::project::age_ignore_test_inputs(&root);
         let cache = std::sync::Arc::new(WorkspaceFileListingCache::new(root.clone()));
         let project = std::sync::Arc::new(
             FilesystemProject::with_cached_listing(&root, cache.clone()).unwrap(),
@@ -1464,7 +1711,7 @@ pub(in crate::engine_tests) mod tests {
         "#10953: warm stores retained dropped target-table dependencies and key-named path dependencies across producer upgrade"
     )]
     fn warm_dependency_name_upgrade_rederives_crates() {
-        if run_derivation_version_child() {
+        if run_derivation_identity_child() {
             return;
         }
         use brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer;
@@ -1482,12 +1729,10 @@ pub(in crate::engine_tests) mod tests {
         );
         let build =
             || WorkspaceAnalyzer::build_persisted(filesystem.clone(), AnalyzerConfig::default());
-        let old = RUST_CRATE_DERIVATION_VERSION
-            .split_once("-10953-target-dependencies-and-lib-names")
-            .map_or(RUST_CRATE_DERIVATION_VERSION, |(old, _)| old);
-        set_derivation_version(Some(old));
+        let old = derivation_identity_before_last_token();
+        set_derivation_identity(Some(old));
         let first = build();
-        set_derivation_version(None);
+        set_derivation_identity(None);
         let first = first.unwrap();
         first
             .store()
@@ -1526,12 +1771,12 @@ pub(in crate::engine_tests) mod tests {
                 },
             )
             .unwrap();
-        set_derivation_version(Some(old));
+        set_derivation_identity(Some(old));
         let summaries = first
             .store()
             .unwrap()
             .reconcile_rust_unit_summaries(&snapshot);
-        set_derivation_version(None);
+        set_derivation_identity(None);
         assert!(summaries.unwrap().failed.is_empty());
         let names = |analyzer: &WorkspaceAnalyzer| {
             analyzer
@@ -1581,7 +1826,7 @@ pub(in crate::engine_tests) mod tests {
     // The store override is process-wide, including background writers. Run
     // each override test alone in a child harness so ordinary workspace builds
     // in the parent process always see the real derivation version.
-    fn run_derivation_version_child() -> bool {
+    fn run_derivation_identity_child() -> bool {
         const CHILD_TEST: &str = "BIFROST_DERIVATION_VERSION_CHILD_TEST";
         let thread = std::thread::current();
         let name = thread
@@ -1609,7 +1854,7 @@ pub(in crate::engine_tests) mod tests {
     pub(in crate::engine_tests) fn overwrite_rust_listing_certificate(
         store: &AnalyzerStore,
         snapshot: &WorkspaceSnapshotId,
-        version: i64,
+        version: [u8; 32],
         failures: Vec<(String, String)>,
     ) {
         let snapshot = snapshot.clone();
@@ -1627,7 +1872,7 @@ pub(in crate::engine_tests) mod tests {
             .unwrap();
             conn.execute(
                 "INSERT INTO rust_source_listing_certificates
-                 (workspace_id,lang,generation,revision,derivation_version,complete)
+                 (workspace_id,lang,generation,revision,derivation_identity,complete)
                  VALUES (?1,'rust',?2,?3,?4,?5)",
                 params![
                     snapshot.workspace_id.as_str(),
@@ -1728,6 +1973,18 @@ pub(in crate::engine_tests) mod tests {
             .build()
     }
 
+    // Use only where the test needs a decided-off gate: dep receives app's
+    // requested on feature, instead of being an all-features workspace root.
+    fn fixture_with_decided_off_dependency() -> BuiltInlineTestProject {
+        let project = fixture();
+        write(
+            project.root(),
+            "Cargo.toml",
+            "[workspace]\nmembers=[\"app\",\"helper\"]\nexclude=[\"dep\"]\nresolver=\"2\"\n",
+        );
+        project
+    }
+
     #[test]
     #[hardwon(
         "#9918: a glob cycle and its alias chain made valid same-crate re-exports unresolved imports"
@@ -1807,8 +2064,13 @@ pub(in crate::engine_tests) mod tests {
                 let external_imports: i64 = conn
                     .query_row(
                         "SELECT count(*) FROM resolution_unit_summary_imports AS imports
+                     JOIN resolution_unit_summary_members AS member
+                       ON member.summary_id=imports.summary_id AND member.member_ordinal=imports.member_ordinal
+                     /* Rust-only derived-from blob until #11183 M3 converts Rust child rows */
+                     JOIN temp.surface_dense AS dense ON dense.blob_id=member.blob_id
+                       AND dense.id_space=4 AND dense.surface_ordinal=imports.import_surface_ordinal
                      JOIN source_import_segments AS segment
-                       ON segment.blob_id=imports.blob_id AND segment.import_id=imports.import_id
+                       ON segment.blob_id=member.blob_id AND segment.import_id=dense.dense_id
                      WHERE segment.segment='Y' AND imports.state='resolved'
                        AND imports.dependency_ordinal IS NOT NULL",
                         [],
@@ -1860,7 +2122,8 @@ pub(in crate::engine_tests) mod tests {
             manifest.replace("\"helper\"]", "\"helper\", \"noise*\"]"),
         )
         .unwrap();
-        for i in 0..12 {
+        // Keep the wrong-index scan witness large when all features absorb off.rs.
+        for i in 0..16 {
             write(
                 project.root(),
                 &format!("noise{i}/Cargo.toml"),
@@ -1869,7 +2132,12 @@ pub(in crate::engine_tests) mod tests {
             write(
                 project.root(),
                 &format!("noise{i}/src/lib.rs"),
-                "pub fn noise() {}\n",
+                "#[cfg(any())] mod off;\npub fn noise() {}\n",
+            );
+            write(
+                project.root(),
+                &format!("noise{i}/src/off.rs"),
+                "pub fn inactive() {}\n",
             );
         }
         let manifest_path = project.root().join("app/Cargo.toml");
@@ -1922,7 +2190,7 @@ pub(in crate::engine_tests) mod tests {
             SelectedResolutionMountInventoryOutcome::Ready(i) => i,
             _ => panic!("selection unavailable"),
         };
-        let host = AnalyzerDerivations::new(&RetentionBudget::new(1_000_000));
+        let host = AnalyzerDerivations::new(&RetentionBudget::for_test_capacity(1_000_000));
         let keys=inventory.connection().prepare("SELECT DISTINCT unit_key FROM resolution_unit_summary_versions WHERE workspace_id=?1 AND lang='rust' AND generation=?2 AND valid_from<=?3 AND (valid_until IS NULL OR ?3<valid_until)").unwrap().query_map(params![snapshot.workspace_id.as_str(),snapshot.generation.0,snapshot.revision],|r|r.get::<_,Vec<u8>>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
         let mut expected_files = std::collections::BTreeMap::<String, Vec<[u8; 32]>>::new();
         let mut expected_deps =
@@ -1974,6 +2242,10 @@ pub(in crate::engine_tests) mod tests {
                             .collect::<HashSet<_>>();
                         let mut expected = Vec::new();
                         for root in &roots {
+                            let noise_inactive =
+                                brokk_bifrost_core::path_utils::workspace_relative_slash_path(
+                                    &root.rel_path().with_file_name("off.rs"),
+                                );
                             expected.extend(
                                 // Slash-separated, so the keys also match on Windows.
                                 match brokk_bifrost_core::path_utils::rel_path_string(root)
@@ -2008,7 +2280,9 @@ pub(in crate::engine_tests) mod tests {
                                         "app/tests/x.rs",
                                         "helper/src/lib.rs",
                                     ],
-                                    other if other.starts_with("noise") => vec![other],
+                                    other if other.starts_with("noise") => {
+                                        vec![other, noise_inactive.as_str()]
+                                    }
                                     other => panic!("unexpected fixture root {other}"),
                                 }
                                 .into_iter()
@@ -2170,6 +2444,12 @@ pub(in crate::engine_tests) mod tests {
             let conn = store.conn.lock().unwrap();
             brokk_bifrost_analysis::analyzer::store::ensure_revisioned_workspace_views(&conn)
                 .unwrap();
+            // The placement question joins the selected mounts, so the plan
+            // pins need the (empty) selected-resolution temp tables.
+            conn.execute_batch(
+                brokk_bifrost_analysis::analyzer::store::resolution_selection::selected_resolution_temp_schema_sql(),
+            )
+            .unwrap();
             conn.execute("DELETE FROM selected_workspace_revisions", [])
                 .unwrap();
             conn.execute(
@@ -2196,7 +2476,7 @@ pub(in crate::engine_tests) mod tests {
                 );
                 let sql = brokk_bifrost_analysis::analyzer::store::rust_unit_summaries::rust_crate_name_units_sql();
                 let mut stmt = conn.prepare(&sql).unwrap();
-                let rows = stmt.query_map(params![brokk_bifrost_analysis::analyzer::store::rust_unit_summaries::RUST_UNIT_SUMMARY_DERIVATION_VERSION, "dep"], |_| Ok(())).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+                let rows = stmt.query_map(params![brokk_bifrost_analysis::analyzer::store::rust_unit_summaries::rust_unit_summary_derivation_identity(), "dep"], |_| Ok(())).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
                 let scans = stmt.get_status(rusqlite::StatementStatus::FullscanStep);
                 eprintln!(
                     "{state:?} crate-name rows={} fullscan_steps={scans}",
@@ -2209,13 +2489,109 @@ pub(in crate::engine_tests) mod tests {
                     "rust_resolution_unit_summary_contexts_live",
                 );
                 let mut wrong_stmt = conn.prepare(&wrong).unwrap();
-                wrong_stmt.query_map(params![brokk_bifrost_analysis::analyzer::store::rust_unit_summaries::RUST_UNIT_SUMMARY_DERIVATION_VERSION, "dep"], |_| Ok(())).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+                wrong_stmt.query_map(params![brokk_bifrost_analysis::analyzer::store::rust_unit_summaries::rust_unit_summary_derivation_identity(), "dep"], |_| Ok(())).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
                 let wrong_scans = wrong_stmt.get_status(rusqlite::StatementStatus::FullscanStep);
                 eprintln!("{state:?} wrong-index fullscan_steps={wrong_scans}");
                 assert!(
                     wrong_scans >= 12,
                     "{state:?}: wrong-index fullscan_steps={wrong_scans}"
                 );
+                // Candidate-first broad paths must stay bounded as unrelated units grow.
+                let broad_sql = brokk_bifrost_analysis::analyzer::store::rust_unit_summaries::rust_broad_file_units_sql();
+                for path in ["dep/src/lib.rs", "dep/src/off.rs"] {
+                    let plan = conn.prepare(&format!("EXPLAIN QUERY PLAN {broad_sql}")).unwrap()
+                        .query_map(params![brokk_bifrost_analysis::analyzer::store::rust_unit_summaries::rust_unit_summary_derivation_identity(), path], |r| r.get::<_, String>(3)).unwrap()
+                        .collect::<rusqlite::Result<Vec<_>>>().unwrap();
+                    eprintln!("{state:?} broad-file {path}: {plan:?}");
+                    // Placements may be sought by either (summary_id, member_ordinal, ...)
+                    // index; the pin is that the member arm is a keyed search.
+                    assert!(
+                        plan.iter().any(|p| p.starts_with("SEARCH p USING")
+                            && p.contains("resolution_unit_summary_placements_")
+                            && p.contains("summary_id=? AND member_ordinal=?")),
+                        "{state:?}: placements not sought by member: {plan:?}"
+                    );
+                    for index in [
+                        "resolution_unit_summary_members_path",
+                        "resolution_unit_summary_input_files_path",
+                        "rust_summary_inactive_input",
+                    ] {
+                        assert!(
+                            plan.iter()
+                                .any(|p| p.contains("SEARCH") && p.contains(index)),
+                            "{state:?}: missing {index}: {plan:?}"
+                        );
+                    }
+                    assert!(
+                        !plan.iter().any(|p| p.starts_with("SCAN m")
+                            || p.starts_with("SCAN i")
+                            || p.contains("MATERIALIZE live")),
+                        "{state:?}: {plan:?}"
+                    );
+                    let mut stmt = conn.prepare(&broad_sql).unwrap();
+                    let rows = stmt.query_map(params![brokk_bifrost_analysis::analyzer::store::rust_unit_summaries::rust_unit_summary_derivation_identity(), path], |_| Ok(())).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+                    let scans = stmt.get_status(rusqlite::StatementStatus::FullscanStep);
+                    eprintln!(
+                        "{state:?} broad-file {path}: rows={} scans={scans}",
+                        rows.len()
+                    );
+                    assert!(!rows.is_empty());
+                    assert!(scans < 12, "{state:?}: {path}: scans={scans}");
+                    for (right, wrong) in [
+                        (
+                            "m INDEXED BY resolution_unit_summary_members_path",
+                            "m INDEXED BY resolution_unit_summary_members_blob",
+                        ),
+                        (
+                            "i INDEXED BY resolution_unit_summary_input_files_path",
+                            "i INDEXED BY sqlite_autoindex_resolution_unit_summary_input_files_2",
+                        ),
+                    ] {
+                        let wrong_sql = broad_sql.replace(right, wrong);
+                        assert_ne!(wrong_sql, broad_sql);
+                        let mut stmt = conn.prepare(&wrong_sql).unwrap();
+                        stmt.query_map(params![brokk_bifrost_analysis::analyzer::store::rust_unit_summaries::rust_unit_summary_derivation_identity(), path], |_| Ok(())).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+                        let scans = stmt.get_status(rusqlite::StatementStatus::FullscanStep);
+                        eprintln!("{state:?} broad-file wrong {right}: scans={scans}");
+                        assert!(scans >= 12, "{state:?}: {right}: scans={scans}");
+                    }
+                }
+                let placement_sql = brokk_bifrost_analysis::analyzer::store::rust_unit_summaries::rust_broad_placement_rows_sql();
+                let unit: Vec<u8> = conn.query_row("SELECT v.unit_key FROM resolution_unit_summary_versions v JOIN resolution_unit_summary_members m ON m.summary_id=v.summary_id WHERE m.rel_path='dep/src/lib.rs' LIMIT 1", [], |r| r.get(0)).unwrap();
+                let plan = conn.prepare(&format!("EXPLAIN QUERY PLAN {placement_sql}")).unwrap().query_map(params![brokk_bifrost_analysis::analyzer::store::rust_unit_summaries::rust_unit_summary_derivation_identity(), &unit], |r| r.get::<_, String>(3)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+                eprintln!("{state:?} broad-placement: {plan:?}");
+                assert!(
+                    !plan.iter().any(|p| p.starts_with("SCAN m")
+                        || p.starts_with("SCAN i")
+                        || p.contains("MATERIALIZE live")),
+                    "{state:?}: {plan:?}"
+                );
+                for expected in [
+                    "SEARCH p USING COVERING INDEX resolution_unit_summary_placements_member (summary_id=?)",
+                    "SEARCH p USING PRIMARY KEY (summary_id=?)",
+                    "SEARCH f USING INDEX sqlite_autoindex_selected_resolution_mounts_3 (storage_language=? AND persisted_relative_path=?)",
+                ] {
+                    assert!(
+                        plan.iter().any(|p| p.contains(expected)),
+                        "{state:?}: missing {expected}: {plan:?}"
+                    );
+                }
+                assert!(
+                    !plan
+                        .iter()
+                        .any(|p| p.contains("MATERIALIZE selected_resolution_mounts")
+                            || p.starts_with("SCAN f")),
+                    "{state:?}: {plan:?}"
+                );
+                let mut stmt = conn.prepare(&placement_sql).unwrap();
+                let rows = stmt.query_map(params![brokk_bifrost_analysis::analyzer::store::rust_unit_summaries::rust_unit_summary_derivation_identity(), &unit], |_| Ok(())).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+                let scans = stmt.get_status(rusqlite::StatementStatus::FullscanStep);
+                eprintln!(
+                    "{state:?} broad-placement: rows={} scans={scans}",
+                    rows.len()
+                );
+                assert!(!rows.is_empty());
+                assert!(scans < 12, "{state:?}: scans={scans}");
                 for (kind, index) in [
                     ("dependents", "resolution_unit_summary_dependencies_unit"),
                     ("file_units", "resolution_unit_summary_members_path"),
@@ -2465,8 +2841,9 @@ pub(in crate::engine_tests) mod tests {
         };
         use brokk_bifrost_semantic::analyzer::semantic::derivation::{Demanded, DerivationKind};
 
-        let project = fixture();
-        let budget = RetentionBudget::new(1_000_000);
+        // This historical-placement control requires the off feature to be decided off.
+        let project = fixture_with_decided_off_dependency();
+        let budget = RetentionBudget::for_test_capacity(1_000_000);
         let host = AnalyzerDerivations::new(&budget);
         let observe =
             |analyzer: &brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer,
@@ -2913,7 +3290,7 @@ pub(in crate::engine_tests) mod tests {
                 )
                 .file("b/src/lib.rs", "pub fn b() {}")
                 .build();
-            let budget = RetentionBudget::new(1_000_000);
+            let budget = RetentionBudget::for_test_capacity(1_000_000);
             let host = AnalyzerDerivations::new(&budget);
             let initial = project.certified_workspace_analyzer(AnalyzerConfig::default());
             let before_files: &[&str] = if matches!(edit, Edit::SharedRename | Edit::SharedVersion)
@@ -3073,7 +3450,8 @@ pub(in crate::engine_tests) mod tests {
                     );
                 }
                 Edit::AddDependency => {
-                    assert_ne!(before.1, after.1, "{edit:?} target input");
+                    // The caller's dependency edit leaves the target's own inputs equal.
+                    assert_eq!(before.1, after.1, "{edit:?} target input");
                     assert_ne!(before.2, after.2, "{edit:?} dependents");
                     assert!(
                         new_counts.0 > counts.0,
@@ -3121,6 +3499,103 @@ pub(in crate::engine_tests) mod tests {
                 assert!(host.counters(RustTargetReachability::ID).recomputed > new_counts.1);
             }
         }
+    }
+
+    /// The reader move's pins: summary context and topology disagree, and
+    /// route-input completeness must follow the summary (every other fixture
+    /// holds equal values, so reading the topology would pass them); a stale
+    /// topology still closes package completeness.
+    #[test]
+    fn rust_unit_inputs_follow_summary_context_completeness() {
+        use brokk_bifrost_analysis::analyzer::store::resolution_selection::{
+            SelectedResolutionLanguage, SelectedResolutionMountInventoryOutcome,
+        };
+        use brokk_bifrost_analysis::analyzer::store::rust_unit_summaries::rust_file_units;
+        use brokk_bifrost_core::CancellationToken;
+        use brokk_bifrost_core::analyzer::model::Language;
+
+        let project = cycle_fixture();
+        let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+        let store = analyzer.store().unwrap();
+        let (workspace, generation, revision) = store
+            .read_conn()
+            .unwrap()
+            .query_row(
+                "SELECT workspace_id,generation,revision FROM workspace_heads WHERE lang='rust'",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        let snapshot = WorkspaceSnapshotId {
+            workspace_id: brokk_bifrost_analysis::analyzer::store::WorkspaceId(workspace),
+            lang: "rust".into(),
+            generation: brokk_bifrost_analysis::analyzer::store::GenerationId::from_persisted(
+                generation,
+            ),
+            revision,
+        };
+        let snapshots =
+            std::iter::once(("rust".into(), snapshot.clone())).collect::<WorkspaceSnapshots>();
+        let open = || match store
+            .open_selected_resolution_mount_inventory(
+                &snapshot.workspace_id,
+                &snapshots,
+                &[SelectedResolutionLanguage::new(
+                    "rust".to_string(),
+                    Language::Rust,
+                )],
+                &[],
+                &CancellationToken::default(),
+            )
+            .unwrap()
+        {
+            SelectedResolutionMountInventoryOutcome::Ready(i) => i,
+            _ => panic!("selection unavailable"),
+        };
+        let inventory = open();
+        let unit =
+            rust_file_units(inventory.connection(), &snapshot, "config/src/lib.rs").unwrap()[0];
+        drop(inventory);
+        store.conn.execute_fixture(move |conn| {
+            conn.execute("UPDATE rust_crate_topologies SET broad_complete=1 WHERE topology_id IN (SELECT topology_id FROM rust_resolution_unit_summary_versions WHERE unit_key=?1)", [unit.as_slice()])?;
+            conn.execute("UPDATE rust_resolution_unit_summary_contexts SET broad_complete=0 WHERE summary_id IN (SELECT summary_id FROM resolution_unit_summary_versions WHERE unit_key=?1)", [unit.as_slice()])
+        }).unwrap();
+        let inventory = open();
+        let after = brokk_bifrost_analysis::analyzer::store::rust_unit_summaries::rust_unit_inputs(
+            inventory.connection(),
+            &snapshot,
+            &unit,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!after.1, "summary context controls completeness");
+        drop(inventory);
+
+        // The topology join stays the reconcile-currency guard until M4: a
+        // summary whose topology is from another producer epoch must not report
+        // its package listing's completeness.
+        store
+            .conn
+            .execute_fixture(move |conn| {
+                conn.execute("UPDATE rust_crate_topologies SET producer_epoch='stale-epoch' WHERE topology_id IN (SELECT topology_id FROM rust_resolution_unit_summary_versions WHERE unit_key=?1)", [unit.as_slice()])
+            })
+            .unwrap();
+        let inventory = open();
+        assert!(
+            brokk_bifrost_analysis::analyzer::store::rust_unit_summaries::rust_unit_package_rows(
+                inventory.connection(),
+                &snapshot,
+                &unit,
+            )
+            .is_err(),
+            "a stale topology keeps package completeness closed"
+        );
     }
 
     #[test]
@@ -3184,7 +3659,7 @@ pub(in crate::engine_tests) mod tests {
         };
         let unit =
             rust_file_units(inventory.connection(), &snapshot, "config/src/lib.rs").unwrap()[0];
-        let host = AnalyzerDerivations::new(&RetentionBudget::new(1_000_000));
+        let host = AnalyzerDerivations::new(&RetentionBudget::for_test_capacity(1_000_000));
         assert!(matches!(
             host.demand::<RustUnitInputs>(analyzer.analyzer(), &inventory, &unit),
             Demanded::Available {
@@ -3236,7 +3711,7 @@ pub(in crate::engine_tests) mod tests {
             [], |row| row.get(0),
         ).unwrap();
         store.drop_rust_route_witness_for_blob_for_test("rust", Oid::from_str(&oid).unwrap());
-        let missing_host = AnalyzerDerivations::new(&RetentionBudget::new(1_000_000));
+        let missing_host = AnalyzerDerivations::new(&RetentionBudget::for_test_capacity(1_000_000));
         assert!(matches!(
             missing_host.demand::<RustUnitRoutes>(
                 analyzer.analyzer(),
@@ -3431,7 +3906,7 @@ pub(in crate::engine_tests) mod tests {
         crate_name: &str,
     ) -> Vec<(&'static str, Option<bool>)> {
         let host = brokk_bifrost_analysis::analyzer::derivation_host::AnalyzerDerivations::new(
-            &brokk_bifrost_core::retention_budget::RetentionBudget::new(1_000_000),
+            &brokk_bifrost_core::retention_budget::RetentionBudget::for_test_capacity(1_000_000),
         );
         route_question_availability(analyzer, file, crate_name, &host)
     }
@@ -3526,7 +4001,7 @@ pub(in crate::engine_tests) mod tests {
             .unwrap();
         assert!(!inventory_complete);
         let host = brokk_bifrost_analysis::analyzer::derivation_host::AnalyzerDerivations::new(
-            &brokk_bifrost_core::retention_budget::RetentionBudget::new(1_000_000),
+            &brokk_bifrost_core::retention_budget::RetentionBudget::for_test_capacity(1_000_000),
         );
         assert_eq!(
             route_question_availability(&analyzer, "src/lib.rs", "open_inventory", &host),
@@ -3659,7 +4134,7 @@ pub(in crate::engine_tests) mod tests {
                 SelectedResolutionMountInventoryOutcome::Ready(i) => i,
                 _ => panic!("selection unavailable"),
             };
-            let host = AnalyzerDerivations::new(&RetentionBudget::new(1_000_000));
+            let host = AnalyzerDerivations::new(&RetentionBudget::for_test_capacity(1_000_000));
             let name =
                 rust_crate_name_units(inventory.connection(), &snapshot, "borrowed").unwrap();
             let a = rust_file_units(inventory.connection(), &snapshot, "a/src/shared.rs").unwrap();
@@ -3710,11 +4185,13 @@ pub(in crate::engine_tests) mod tests {
     /// through a dev-dependency, because lib targets carry their
     /// dev-dependencies, and `relay` and `app` depend on the cycle from
     /// outside it. `app` reaches `config` only through `relay`'s re-export.
+    // Synthetic normal-dependency cycle: Cargo rejects it, but the scheduler
+    // must retain its forced handling. Legal dev cycles have separate coverage.
     fn cycle_fixture() -> BuiltInlineTestProject {
         InlineTestProject::new()
             .file("Cargo.toml", "[workspace]\nmembers = [\"config\", \"macros\", \"relay\", \"app\"]\nresolver = \"2\"\n")
             .file("config/Cargo.toml", "[package]\nname = \"config\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nmacros = { path = \"../macros\" }\n")
-            .file("macros/Cargo.toml", "[package]\nname = \"macros\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dev-dependencies]\nconfig = { path = \"../config\" }\n")
+            .file("macros/Cargo.toml", "[package]\nname = \"macros\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nconfig = { path = \"../config\" }\n")
             .file("relay/Cargo.toml", "[package]\nname = \"relay\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nconfig = { path = \"../config\" }\n")
             .file("app/Cargo.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nrelay = { path = \"../relay\" }\n")
             .file("config/src/lib.rs", "pub mod inner { pub struct Name; } pub fn body() {}")
@@ -3733,7 +4210,7 @@ pub(in crate::engine_tests) mod tests {
     #[test]
     #[hardwon("#10774+#10830: warm stores retained target-layout manifest gaps")]
     fn warm_manifest_gap_upgrade_rederives_detached_crate() {
-        if run_derivation_version_child() {
+        if run_derivation_identity_child() {
             return;
         }
         use brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer;
@@ -3751,13 +4228,10 @@ pub(in crate::engine_tests) mod tests {
         );
         let build =
             || WorkspaceAnalyzer::build_persisted(filesystem.clone(), AnalyzerConfig::default());
-        let old = RUST_CRATE_DERIVATION_VERSION
-            .split_once("-10774-manifests-only-cargo-toml")
-            .unwrap()
-            .0;
-        set_derivation_version(Some(old));
+        let old = derivation_identity_before_last_token();
+        set_derivation_identity(Some(old));
         let first = build();
-        set_derivation_version(None);
+        set_derivation_identity(None);
         let first = first.unwrap();
         // Reproduce the pre-fix detached topology, including its retained gap.
         // Its digest and reconciliation marker were built under the old version.
@@ -3816,12 +4290,12 @@ pub(in crate::engine_tests) mod tests {
                 )
             })
             .unwrap();
-        set_derivation_version(Some(old));
+        set_derivation_identity(Some(old));
         let summaries = first
             .store()
             .unwrap()
             .reconcile_rust_unit_summaries(&old_snapshots["rust"]);
-        set_derivation_version(None);
+        set_derivation_identity(None);
         assert!(summaries.unwrap().failed.is_empty());
         let binding_complete = |analyzer: &WorkspaceAnalyzer| {
             let rows = analyzer
@@ -4342,6 +4816,137 @@ pub(in crate::engine_tests) mod tests {
         conn.prepare("SELECT t.crate_key,t.topology_digest,t.export_surface_digest FROM rust_crate_versions v JOIN rust_crate_topologies t USING(topology_id) WHERE v.valid_until IS NULL ORDER BY t.crate_key").unwrap().query_map([], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
     }
 
+    /// The export surface digest hashes name-level columns, never a dense
+    /// coordinate: no declaration order, import ordinal, scope ordinal or
+    /// fn-local item reaches it.
+    #[test]
+    #[hardwon("#11764: reordering items or pub-use lines moved the topology digest")]
+    fn the_topology_surface_digest_ignores_dense_coordinates() {
+        const LIB: &str = "pub mod a;\n\
+use std::collections::HashMap;\n\
+use std::fmt::Debug;\n\
+pub use a::{one, two};\n\
+pub use a::glob_target::*;\n\
+pub struct S;\n\
+pub struct T;\n\
+pub fn f() { struct L1; use std::fmt::Display; }\n\
+pub fn g() { struct L2; }\n";
+        const A: &str = "pub fn one() {}\npub fn two() {}\npub mod glob_target { pub fn x() {} }\n";
+        let digest = |lib: &str, a: &str| -> Vec<u8> {
+            let fixture = InlineTestProject::new()
+                .file(
+                    "Cargo.toml",
+                    "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                )
+                .file("src/lib.rs", lib)
+                .file("src/a.rs", a)
+                .build();
+            let workspace = fixture.workspace_analyzer(AnalyzerConfig::default());
+            workspace
+                .store()
+                .unwrap()
+                .read_conn()
+                .unwrap()
+                .query_row(
+                    "SELECT t.export_surface_digest FROM rust_crate_versions v
+                     JOIN rust_crate_topologies t USING(topology_id)
+                     WHERE v.valid_until IS NULL AND t.target_kind='lib'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        let base = digest(LIB, A);
+        assert_eq!(base, digest(LIB, A), "the digest is deterministic");
+
+        for (label, lib, a) in [
+            (
+                "swap two structs",
+                LIB.replace(
+                    "pub struct S;\npub struct T;\n",
+                    "pub struct T;\npub struct S;\n",
+                ),
+                A.to_owned(),
+            ),
+            (
+                "swap two fns holding local items",
+                LIB.replace(
+                    "pub fn f() { struct L1; use std::fmt::Display; }\npub fn g() { struct L2; }\n",
+                    "pub fn g() { struct L2; }\npub fn f() { struct L1; use std::fmt::Display; }\n",
+                ),
+                A.to_owned(),
+            ),
+            (
+                "swap two items of a module file",
+                LIB.to_owned(),
+                "pub fn two() {}\npub fn one() {}\npub mod glob_target { pub fn x() {} }\n"
+                    .to_owned(),
+            ),
+            (
+                "swap two pub use lines",
+                LIB.replace(
+                    "pub use a::{one, two};\npub use a::glob_target::*;\n",
+                    "pub use a::glob_target::*;\npub use a::{one, two};\n",
+                ),
+                A.to_owned(),
+            ),
+            (
+                "swap names inside one use",
+                LIB.replace("{one, two}", "{two, one}"),
+                A.to_owned(),
+            ),
+            (
+                "swap two private uses",
+                LIB.replace(
+                    "use std::collections::HashMap;\nuse std::fmt::Debug;\n",
+                    "use std::fmt::Debug;\nuse std::collections::HashMap;\n",
+                ),
+                A.to_owned(),
+            ),
+            // Controls: no name-level output moves.
+            (
+                "edit a body",
+                LIB.replace("struct L2;", "struct L2; let _x = 1;"),
+                A.to_owned(),
+            ),
+            (
+                "edit a comment",
+                format!(
+                    "// header\n{}",
+                    LIB.replace("use std::collections", "// c\nuse std::collections")
+                ),
+                A.to_owned(),
+            ),
+        ] {
+            assert_eq!(base, digest(&lib, &a), "{label} must keep the digest");
+        }
+
+        for (label, lib, a) in [
+            (
+                "rename an item",
+                LIB.replace("two", "three"),
+                A.replace("two", "three"),
+            ),
+            (
+                "add a pub item",
+                LIB.replace("pub struct T;", "pub struct T; pub struct U;"),
+                A.to_owned(),
+            ),
+            (
+                "remove a re-export",
+                LIB.replace("pub use a::glob_target::*;\n", ""),
+                A.to_owned(),
+            ),
+            (
+                "add a private item",
+                LIB.replace("pub fn g()", "fn h() {}\npub fn g()"),
+                A.to_owned(),
+            ),
+        ] {
+            assert_ne!(base, digest(&lib, &a), "{label} must move the digest");
+        }
+    }
+
     /// A scoped reconcile publishes what the from-scratch pass would.
     ///
     /// Gate 13: one changed file costs its own crates, not the workspace. The
@@ -4356,7 +4961,8 @@ pub(in crate::engine_tests) mod tests {
     /// `app` again.
     #[test]
     fn a_scoped_reconcile_publishes_what_the_full_pass_would() {
-        let fixture = fixture();
+        // This reconcile oracle requires an inactive file to retain a broad placement.
+        let fixture = fixture_with_decided_off_dependency();
         let mut analyzer = fixture.certified_workspace_analyzer(AnalyzerConfig::default());
 
         let head = |store: &AnalyzerStore| {
@@ -4392,6 +4998,20 @@ pub(in crate::engine_tests) mod tests {
                     "SELECT t.topology_digest FROM rust_crate_versions v
                      JOIN rust_crate_topologies t USING(topology_id)
                      WHERE v.valid_until IS NULL AND t.crate_name='app' AND t.target_kind='lib'",
+                    [],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .unwrap()
+        };
+
+        let dep_digest = |store: &AnalyzerStore| -> Vec<u8> {
+            store
+                .read_conn()
+                .unwrap()
+                .query_row(
+                    "SELECT t.topology_digest FROM rust_crate_versions v
+                     JOIN rust_crate_topologies t USING(topology_id)
+                     WHERE v.valid_until IS NULL AND t.crate_name='dep' AND t.target_kind='lib'",
                     [],
                     |row| row.get::<_, Vec<u8>>(0),
                 )
@@ -4443,8 +5063,23 @@ pub(in crate::engine_tests) mod tests {
                 "pub fn enabled(_added: u8) {} pub fn appeared() {}",
                 true,
             ),
+            // Fn-local items name their own lookups in the module's demands, so
+            // adding them moves the surface.
+            (
+                "dep/src/on.rs",
+                "pub fn enabled(_added: u8) { struct L1; } pub fn appeared() { struct L2; }",
+                true,
+            ),
+            // Reordering two fns that hold local items (#11764): `dep` is
+            // derived again, but nothing name-level moved, so `app` is not.
+            (
+                "dep/src/on.rs",
+                "pub fn appeared() { struct L2; } pub fn enabled(_added: u8) { struct L1; }",
+                false,
+            ),
         ] {
             let before = app_digest(analyzer.store().unwrap().as_ref());
+            let dep_before = dep_digest(analyzer.store().unwrap().as_ref());
             let file = fixture.file(path);
             file.write(contents).unwrap();
             analyzer = analyzer.update(&BTreeSet::from([file]));
@@ -4458,6 +5093,13 @@ pub(in crate::engine_tests) mod tests {
                 dep_broad,
                 "the edited dep retains its broad certificate: {path}"
             );
+            if path.ends_with("on.rs") {
+                assert_ne!(
+                    dep_digest(store.as_ref()),
+                    dep_before,
+                    "{path}: the edited unit is derived again"
+                );
+            }
             assert_eq!(
                 app_digest(store.as_ref()) != before,
                 reaches_dependents,
@@ -4714,11 +5356,18 @@ pub(in crate::engine_tests) mod tests {
                 .collect::<rusqlite::Result<_>>()
                 .unwrap()
         };
-        let marker = |analyzer: &WorkspaceAnalyzer| {
-            read(
-                analyzer,
-                "SELECT revision, derivation_version FROM rust_crate_reconciliations",
-            )
+        let marker = |analyzer: &WorkspaceAnalyzer| -> Vec<(i64, [u8; 32])> {
+            analyzer
+                .store()
+                .unwrap()
+                .read_conn()
+                .unwrap()
+                .prepare("SELECT revision, derivation_identity FROM rust_crate_reconciliations")
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
         };
         let current = |analyzer: &WorkspaceAnalyzer| {
             read(
@@ -4726,7 +5375,7 @@ pub(in crate::engine_tests) mod tests {
                 "SELECT revision, '' FROM workspace_heads WHERE lang = 'rust'",
             )
             .into_iter()
-            .map(|(revision, _)| (revision, RUST_CRATE_DERIVATION_VERSION.to_owned()))
+            .map(|(revision, _)| (revision, derivation_identity()))
             .collect::<Vec<_>>()
         };
         let open_versions = |analyzer: &WorkspaceAnalyzer| {
@@ -4741,7 +5390,13 @@ pub(in crate::engine_tests) mod tests {
                 .store()
                 .unwrap()
                 .conn
-                .execute(move |conn| conn.execute(sql, []))
+                .execute(move |conn| {
+                    let _fixture =
+                        brokk_bifrost_analysis::analyzer::store::sealed_families::Fixture::new(
+                            conn,
+                        );
+                    conn.execute(sql, [])
+                })
                 .unwrap()
         };
 
@@ -5127,6 +5782,8 @@ pub(in crate::engine_tests) mod tests {
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .unwrap()
         }
+        // Both declared member features are active, so off is mounted and exported
+        // instead of leaving an inactive-placement gap and a detached summary.
         let exports = strings(
             conn,
             "SELECT t.crate_name || ' ' || t.target_kind || ' ' || e.module_path || ' ' || e.namespace || ' ' || e.name || ' ' || e.origin || ' ' || e.visibility FROM rust_crate_exports e JOIN rust_crate_topologies t USING(topology_id) ORDER BY t.crate_name,t.target_kind,e.module_path,e.namespace,e.name",
@@ -5154,10 +5811,11 @@ pub(in crate::engine_tests) mod tests {
                 "app lib crate::shared value shared declaration public",
                 "app lib crate::tests value test_only declaration public",
                 "dep lib crate type X declaration public",
+                "dep lib crate type off declaration public",
                 "dep lib crate type on declaration public",
                 "dep lib crate value X declaration public",
+                "dep lib crate::off value disabled declaration public",
                 "dep lib crate::on value enabled declaration public",
-                "dep/src/off.rs detached crate value disabled declaration public",
                 "detached.rs detached crate value detached declaration public",
                 "helper lib crate type H declaration public",
                 "helper lib crate value H declaration public",
@@ -5178,8 +5836,8 @@ pub(in crate::engine_tests) mod tests {
             "app/lib crate::shared app/src/shared.rs path_attribute 0",
             "app/lib crate::tests app/src/lib.rs inline 2",
             "dep/lib crate dep/src/lib.rs root 0",
+            "dep/lib crate::off dep/src/off.rs mod_declaration 0",
             "dep/lib crate::on dep/src/on.rs mod_declaration 0",
-            "dep/src/off.rs/detached crate dep/src/off.rs root 0",
             "detached.rs/detached crate detached.rs root 0",
             "helper/lib crate helper/src/lib.rs root 0",
             "x/test crate app/tests/x.rs root 0",
@@ -5244,7 +5902,7 @@ pub(in crate::engine_tests) mod tests {
                 conn,
                 "SELECT t.crate_name || ' ' || g.gap_kind || ' ' || g.subject FROM rust_crate_gaps g JOIN rust_crate_topologies t USING(topology_id) ORDER BY 1"
             ),
-            ["dep inactive_placement crate::off"]
+            Vec::<String>::new()
         );
         assert_eq!(
             strings(
@@ -5255,23 +5913,30 @@ pub(in crate::engine_tests) mod tests {
                 "app/bin app/Cargo.toml",
                 "app/lib app/Cargo.toml",
                 "dep/lib dep/Cargo.toml",
-                "dep/src/off.rs/detached detached",
                 "detached.rs/detached detached",
                 "helper/lib helper/Cargo.toml",
                 "x/test app/Cargo.toml"
             ]
         );
         let topologies = conn.prepare("SELECT crate_name, json(cfg_atoms), edition, inventory_complete, publication_state, length(topology_digest), length(export_surface_digest) FROM rust_crate_topologies").unwrap().query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, bool>(3)?, row.get::<_, String>(4)?, row.get::<_, i64>(5)?, row.get::<_, i64>(6)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
-        assert_eq!(topologies.len(), 7);
+        assert_eq!(topologies.len(), 6);
         for (name, cfg, edition, complete, state, topology_bytes, surface_bytes) in topologies {
             let mut expected_cfg = brokk_bifrost_rust::cfg::default_cfg_atoms();
             if name == "dep" {
                 expected_cfg.insert("feature = \"on\"".into());
+                expected_cfg.insert("feature = \"off\"".into());
             }
             assert_eq!(
                 serde_json::from_str::<BTreeSet<String>>(&cfg).unwrap(),
                 expected_cfg
             );
+            // The virtual workspace declares no edition for detached.rs, so
+            // #12830 uses the detached 2024 fallback. Member packages declare 2021.
+            let expected_edition = if name == "detached.rs" {
+                "2024"
+            } else {
+                "2021"
+            };
             assert_eq!(
                 (
                     edition.as_str(),
@@ -5280,7 +5945,8 @@ pub(in crate::engine_tests) mod tests {
                     topology_bytes,
                     surface_bytes
                 ),
-                ("2021", true, "complete", 32, 32)
+                (expected_edition, true, "complete", 32, 32),
+                "topology for {name}"
             );
         }
         assert_eq!(
@@ -5739,8 +6405,8 @@ pub(in crate::engine_tests) mod tests {
                 .unwrap();
         }
         conn.execute_batch("INSERT INTO temp.rust_schedule_targets
-            (unit_id,crate_key,manifest_path,root_path,target_kind,crate_name,edition,cfg,features,inventory_complete,pending)
-            SELECT topology_id,crate_key,'','',target_kind,crate_name,edition,json(cfg_atoms),'[]',inventory_complete,1
+            (unit_id,crate_key,manifest_path,root_path,target_kind,crate_name,edition,cfg,features,inventory_complete,pending,features_complete)
+            SELECT topology_id,crate_key,'','',target_kind,crate_name,edition,json(cfg_atoms),'[]',inventory_complete,1,1
             FROM rust_crate_topologies WHERE topology_id IN (SELECT topology_id FROM rust_crate_versions WHERE valid_until IS NULL);
             INSERT INTO temp.rust_schedule_dependencies
             SELECT targets.crate_key, row_number() OVER (PARTITION BY targets.crate_key ORDER BY deps.extern_name), deps.extern_name, deps.dependency_kind, deps.dependency_crate_key
@@ -5787,7 +6453,9 @@ pub(in crate::engine_tests) mod tests {
                         "rust_crate_module_walk" => {
                             vec![text("app/src/lib.rs"), text(&cfg), text("[]")]
                         }
-                        "rust_crate_item_macro_decisions" => vec![text("[]"), text("[]")],
+                        "rust_crate_item_macro_decisions" => {
+                            vec![text("[]"), text("[]"), text("[]")]
+                        }
                         "rust_crate_source_declarations"
                         | "rust_crate_macro_items"
                         | "rust_crate_derivation_sql_cr_source_imports_5"
@@ -5897,7 +6565,7 @@ pub(in crate::engine_tests) mod tests {
                         "rust_crate_reconcile_sql_reconciliation_previous" => vec![
                             text(&workspace),
                             Integer(generation),
-                            text(derivation_version()),
+                            Blob(derivation_identity().to_vec()),
                         ],
                         "rust_crate_reconcile_sql_workspace_file_changes_between" => vec![
                             text(&workspace),
@@ -5994,10 +6662,18 @@ pub(in crate::engine_tests) mod tests {
                             Integer(2),
                             text("src/lib.rs"),
                             Integer(0),
+                            Null,
+                            Null,
+                            Null,
+                            Null,
+                            Null,
+                            Null,
                         ],
                         "rust_crate_inherent_impls_insert" => vec![
                             Integer(id), Integer(root_blob), Integer(0), text("src/lib.rs"),
                             Integer(root_blob), Integer(2), text("src/lib.rs"), Integer(0),
+                            Blob(key.clone()), text("crate"), text("declaration"), text("type"),
+                            text("S"), text("declaration"),
                         ],
                         "rust_crate_unresolved_inherent_impls_insert" => vec![
                             Integer(id), text("Unbound"), Integer(root_blob), Integer(3),
@@ -6020,6 +6696,9 @@ pub(in crate::engine_tests) mod tests {
                             Null,
                             Null,
                             text("crate"),
+                            Null,
+                            Null,
+                            Null,
                         ],
                         "rust_crate_root_references_insert" => vec![
                             Integer(id),
@@ -6768,6 +7447,7 @@ mod outer {
     }
 
     #[test]
+    #[hardwon("#11629: a blocker reached through a name lost its evidence file")]
     fn crate_point_rows_distinguish_open_and_closed_export_inventories() {
         let mut evidence = Vec::new();
         // The fourth and fifth cases write the second case's invocation under
@@ -6897,7 +7577,14 @@ mod outer {
                 )
                 .file(
                     "src/lib.rs",
-                    format!("{root_macro}pub mod provider;\nuse crate::provider::Target;\n"),
+                    format!(
+                        "{root_macro}pub mod provider;\nuse crate::provider::Target;\n{}",
+                        if root_macro.is_empty() && provider == "generate!();\n" {
+                            "pub fn existing() {}\n#[cfg(unknown_build_flag)] pub use crate::provider::Target as existing;\n"
+                        } else {
+                            ""
+                        }
+                    ),
                 )
                 .file("src/provider.rs", provider)
                 .build();
@@ -6913,6 +7600,57 @@ mod outer {
                     |row| row.get(0),
                 )
                 .unwrap();
+            if root_macro.is_empty() && provider == "generate!();\n" {
+                let blockers = conn
+                    .prepare(
+                        "SELECT evidence_rel_path,evidence_module_path
+                         FROM rust_crate_binding_owners owner
+                         JOIN rust_crate_binding_blockers blocker USING(owner_id)
+                         WHERE owner.topology_id=?1 AND blocker.reason='UnsupportedMacroGeneratedModule'
+                           AND blocker.name<>''
+                         ORDER BY namespace",
+                    )
+                    .unwrap()
+                    .query_map([topology], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                assert_eq!(
+                    blockers,
+                    [
+                        ("src/provider.rs".to_owned(), "crate::provider".to_owned()),
+                        ("src/provider.rs".to_owned(), "crate::provider".to_owned()),
+                        ("src/provider.rs".to_owned(), "crate::provider".to_owned()),
+                    ]
+                );
+                let conditional = conn
+                    .prepare(
+                        "SELECT blocker.evidence_module_path,blocker.evidence_rel_path
+                         FROM rust_crate_binding_owners owner
+                         JOIN rust_crate_binding_blockers blocker USING(owner_id)
+                         WHERE owner.topology_id=?1 AND owner.module_path='crate'
+                           AND blocker.name='existing' AND blocker.reason='unknown_activation'
+                         ORDER BY blocker.namespace",
+                    )
+                    .unwrap()
+                    .query_map([topology], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                assert_eq!(
+                    conditional,
+                    [
+                        ("crate".to_owned(), "src/lib.rs".to_owned()),
+                        ("crate".to_owned(), "src/lib.rs".to_owned()),
+                        ("crate".to_owned(), "src/lib.rs".to_owned()),
+                    ],
+                    "a binding-level activation gap belongs to the owner's module and file"
+                );
+            }
             let gaps = conn.prepare("SELECT gap_kind,subject,json(detail) FROM rust_crate_gaps WHERE topology_id=?1 ORDER BY gap_kind,subject").unwrap().query_map([topology], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
             let names = conn.prepare("SELECT module_path,namespace,name FROM rust_crate_exports WHERE topology_id=?1 ORDER BY module_path,namespace,name").unwrap().query_map([topology], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
             let macro_count: i64 = conn.query_row("SELECT count(*) FROM rust_crate_container_sources AS source CROSS JOIN source_rust_macro_invocations AS invocation ON invocation.blob_id=source.blob_id WHERE source.topology_id=?1 AND source.container_path='crate::provider'", [topology], |row| row.get(0)).unwrap();
@@ -7133,7 +7871,10 @@ mod outer {
     }
 
     #[test]
-    #[hardwon("#5658: an owner's unsupported item macro left its bound names certified complete")]
+    #[hardwon("#5658: an owner's unsupported item macro left macro bindings certified complete")]
+    #[hardwon(
+        "#12014: an unrelated module frontier voided own explicit type and value certificates"
+    )]
     fn owner_gap_voids_published_binding_certificates() {
         let project = InlineTestProject::new()
             .file(
@@ -7160,7 +7901,7 @@ mod outer {
                  JOIN rust_crate_binding_names certificate USING(owner_id)
                  WHERE owner.module_path='crate' AND owner.kind='module'
                    AND (certificate.namespace, certificate.name) IN
-                       (VALUES ('macro','make'), ('type','a'), ('value','probe'))
+                       (VALUES ('macro','make'), ('type','T'), ('type','a'), ('value','probe'))
                  ORDER BY 1, 2",
             )
             .unwrap()
@@ -7174,8 +7915,11 @@ mod outer {
             rows,
             [
                 ("macro".to_owned(), "make".to_owned(), false, true),
-                ("type".to_owned(), "a".to_owned(), false, true),
-                ("value".to_owned(), "probe".to_owned(), false, true),
+                // T imports through the still-open x route; owning an import
+                // alone does not certify that route.
+                ("type".to_owned(), "T".to_owned(), false, true),
+                ("type".to_owned(), "a".to_owned(), true, true),
+                ("value".to_owned(), "probe".to_owned(), true, true),
             ]
         );
     }
@@ -7398,13 +8142,17 @@ mod outer {
     #[hardwon(
         "a48b9658c627: crate derivation changes reused stale Rust unit summaries on warm start"
     )]
-    fn warm_derivation_version_rotation_replaces_same_revision_versions() {
-        if run_derivation_version_child() {
+    fn warm_derivation_identity_rotation_replaces_same_revision_versions() {
+        if run_derivation_identity_child() {
             return;
         }
         use brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer;
         type VersionRow = (Vec<u8>, i64, Option<i64>, Vec<u8>);
         let project = fixture();
+        // Keep representative gap rows without assuming a member feature is off.
+        let lib = project.root().join("app/src/lib.rs");
+        let source = std::fs::read_to_string(&lib).unwrap();
+        std::fs::write(lib, format!("{source}\npub use missing::Absent;\n")).unwrap();
         let build =
             || WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default());
         let head = |analyzer: &WorkspaceAnalyzer| -> i64 {
@@ -7443,7 +8191,7 @@ mod outer {
         // rather than changing metadata on a current summary digest.
         use brokk_bifrost_analysis::analyzer::store::rust_unit_summaries::RustUnitSummaries;
         use brokk_bifrost_analysis::analyzer::store::unit_summaries::{
-            ConsumedDependency, UnitInputs, UnitOutputs, UnitSummaryLanguage,
+            ConsumedDependency, ForeignReader, UnitInputs, UnitOutputs, UnitSummaryLanguage,
         };
         struct PreviousCfgSummaryReads;
         impl UnitSummaryLanguage for PreviousCfgSummaryReads {
@@ -7453,8 +8201,8 @@ mod outer {
             fn unit_kind(&self) -> &'static str {
                 "rust_crate"
             }
-            fn derivation_version(&self) -> i64 {
-                RustUnitSummaries.derivation_version()
+            fn derivation_identity(&self) -> [u8; 32] {
+                RustUnitSummaries.derivation_identity()
             }
             fn stage(&self, conn: &Connection, snapshot: &WorkspaceSnapshotId) -> Result<()> {
                 RustUnitSummaries.stage(conn, snapshot)
@@ -7487,8 +8235,16 @@ mod outer {
                 unit: &UnitInputs,
                 dependencies: &[ConsumedDependency],
                 producer_epoch: &str,
+                consumed: &mut ForeignReader<'_>,
             ) -> Result<UnitOutputs> {
-                RustUnitSummaries.derive(conn, snapshot, unit, dependencies, producer_epoch)
+                RustUnitSummaries.derive(
+                    conn,
+                    snapshot,
+                    unit,
+                    dependencies,
+                    producer_epoch,
+                    consumed,
+                )
             }
             fn write_language_rows(
                 &self,
@@ -7497,6 +8253,7 @@ mod outer {
                 unit: &UnitInputs,
                 dependencies: &[ConsumedDependency],
                 summary_id: i64,
+                reader: &mut ForeignReader<'_>,
             ) -> Result<usize> {
                 RustUnitSummaries.write_language_rows(
                     conn,
@@ -7504,6 +8261,7 @@ mod outer {
                     unit,
                     dependencies,
                     summary_id,
+                    reader,
                 )
             }
             fn write_language_version(
@@ -7516,11 +8274,8 @@ mod outer {
                 RustUnitSummaries.write_language_version(conn, snapshot, unit, summary_id)
             }
         }
-        let old_version = RUST_CRATE_DERIVATION_VERSION
-            .split_once("-absent-feature-cfg-inactive-v1")
-            .expect("the upgrade starts with the previous crate derivation version")
-            .0;
-        set_derivation_version(Some(old_version));
+        let old_version = derivation_identity_before_last_token();
+        set_derivation_identity(Some(old_version));
         let first = build().expect("the first build succeeds");
         let first_revision = head(&first);
         drop(first);
@@ -7595,13 +8350,13 @@ mod outer {
         );
 
         // The rotation, and the oracle derived under the same version.
-        set_derivation_version(None);
+        set_derivation_identity(None);
         let rotated = build();
         let scratch = WorkspaceAnalyzer::build_ephemeral_footgun(
             project.project_dyn(),
             AnalyzerConfig::default(),
         );
-        set_derivation_version(None);
+        set_derivation_identity(None);
         let rotated = rotated.expect("a derivation-version rotation on a warm store rebuilds");
         let scratch = scratch.expect("a from-scratch build under the new version succeeds");
         assert_eq!(
@@ -7720,7 +8475,7 @@ mod outer {
         "#9737: a manifest-only dependency rename left a stale manifest link in the crate row"
     )]
     fn warm_manifest_currency_upgrade_rederives_crates() {
-        if run_derivation_version_child() {
+        if run_derivation_identity_child() {
             return;
         }
         use brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer;
@@ -7729,16 +8484,8 @@ mod outer {
             WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default())
                 .unwrap()
         };
-        let old = RUST_CRATE_DERIVATION_VERSION
-            .strip_suffix("-11111-certified-absent-module-topology")
-            .unwrap()
-            .strip_suffix("-11060-unplaced-module-topology")
-            .unwrap()
-            .strip_suffix("-10987-scoped-symlink-omissions")
-            .unwrap()
-            .strip_suffix("-9737-crate-manifest-currency")
-            .unwrap();
-        set_derivation_version(Some(old));
+        let old = derivation_identity_before_last_token();
+        set_derivation_identity(Some(old));
         let first = build();
         let row = |a: &WorkspaceAnalyzer| -> (i64, i64, i64) {
             a.store()
@@ -7773,7 +8520,7 @@ mod outer {
         }).unwrap();
         assert_eq!(row(&edited).2, 0);
         drop(edited);
-        set_derivation_version(None);
+        set_derivation_identity(None);
         let upgraded = build();
         assert_eq!(row(&upgraded).2, 1);
         let WorkspaceAnalyzer::Multi(multi) = &upgraded else {
@@ -7797,8 +8544,8 @@ mod outer {
     }
 
     #[test]
-    fn crate_topology_digests_follow_the_derivation_version() {
-        if run_derivation_version_child() {
+    fn crate_topology_digests_follow_the_derivation_identity() {
+        if run_derivation_identity_child() {
             return;
         }
         let project = fixture();
@@ -7835,7 +8582,7 @@ mod outer {
         // computed already published. It used to clear the version rows first,
         // because a same-revision rebind could not close and reopen a row at
         // its own revision; that limitation was the defect, and
-        // `warm_derivation_version_rotation_replaces_same_revision_versions`
+        // `warm_derivation_identity_rotation_replaces_same_revision_versions`
         // is the test that holds it closed.
         let rebind = |store: &AnalyzerStore| {
             store.reconcile_rust_crates(&snapshot).unwrap();
@@ -7855,9 +8602,9 @@ mod outer {
             "an unchanged derivation version reuses every published topology"
         );
 
-        set_derivation_version(Some("crate-derivation-version-test"));
+        set_derivation_identity(Some(brokk_bifrost_analysis::analyzer::store::rust_crates::derivation_identity_before_last_token()));
         rebind(store);
-        set_derivation_version(None);
+        set_derivation_identity(None);
 
         let after = current_crate_digests(&store.read_conn().unwrap());
         assert_eq!(
@@ -7880,9 +8627,9 @@ mod outer {
 
         // The first reconcile derived rows under the new version; this second
         // reconcile must reuse those rows rather than derive them again.
-        set_derivation_version(Some("crate-derivation-version-test"));
+        set_derivation_identity(Some(brokk_bifrost_analysis::analyzer::store::rust_crates::derivation_identity_before_last_token()));
         rebind(store);
-        set_derivation_version(None);
+        set_derivation_identity(None);
         assert_eq!(
             (
                 current_crate_digests(&store.read_conn().unwrap()),
@@ -7949,6 +8696,24 @@ mod outer {
         let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
         let store = analyzer.store().unwrap();
         let conn = store.read_conn().unwrap();
+        let (workspace_id, generation, revision): (String, i64, i64) = conn
+            .query_row(
+                "SELECT workspace_id, generation, revision FROM workspace_heads WHERE lang='rust'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let snapshots: WorkspaceSnapshots = WorkspaceSnapshots::from_iter([(
+            "rust".to_owned(),
+            WorkspaceSnapshotId {
+                workspace_id: brokk_bifrost_analysis::analyzer::store::WorkspaceId(workspace_id),
+                lang: "rust".into(),
+                generation: brokk_bifrost_analysis::analyzer::store::GenerationId::from_persisted(
+                    generation,
+                ),
+                revision,
+            },
+        )]);
         let app: i64 = conn
             .query_row(
                 "SELECT topology_id FROM rust_crate_topologies WHERE crate_name='app' AND target_kind='lib'",
@@ -8069,6 +8834,7 @@ mod outer {
             .unwrap();
         let actual_impl_rows = store
             .rust_trait_impl_rows(
+                &snapshots,
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(placed_trait.0, "rust"),
                 placed_trait.1,
                 &placed_trait.2,
@@ -8106,6 +8872,7 @@ mod outer {
         );
         let actual_trait_spellings = store
             .rust_trait_impl_spellings(
+                &snapshots,
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(placed_trait.0, "rust"),
                 placed_trait.1,
                 &placed_trait.2,
@@ -8139,6 +8906,7 @@ mod outer {
         );
         let actual_types = store
             .rust_types_implementing(
+                &snapshots,
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(placed_trait.0, "rust"),
                 placed_trait.1,
                 &placed_trait.2,
@@ -8175,6 +8943,7 @@ mod outer {
         );
         let actual_traits = store
             .rust_traits_implemented_by(
+                &snapshots,
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(placed_foo.0, "rust"),
                 placed_foo.1,
                 &placed_foo.2,
@@ -8237,6 +9006,7 @@ mod outer {
             .unwrap();
         let actual_impl_traits = store
             .rust_traits_of_impl(
+                &snapshots,
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(
                     Oid::from_str(&impl_oid).unwrap(),
                     "rust",
@@ -8302,7 +9072,7 @@ mod outer {
                 // The current source-fact producer assigns site 36 to this
                 // unresolved impl header in the fixture.
                 "{\"evidence\":[{\"side\":\"trait\",\"spelling\":\"Absent\",\"impl_site\":36,\
-                 \"reason\":\"unbound\",\"target_module_path\":\"crate::im\"}]}"
+                 \"reason\":\"unbound_external\",\"target_module_path\":\"crate::im\"}]}"
                     .replace(" ", "")
             )],
             "a half that reaches no declaration names the half, the spelling, why it \
@@ -8401,7 +9171,7 @@ mod outer {
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
         let actual_unresolved_files = store
-            .rust_unresolved_trait_impl_files("Absent")
+            .rust_unresolved_trait_impl_files(&snapshots, "Absent")
             .unwrap()
             .into_iter()
             .map(|(blob, path, declaration)| (blob.to_string(), path, declaration))
@@ -8410,13 +9180,54 @@ mod outer {
             actual_unresolved_files, expected_unresolved_files,
             "the live-summary spelling seek preserves the legacy unresolved trait candidates"
         );
+        // #12956: `impl Trait for &crate::ty::Foo` has no nominal subject, so
+        // it persists in the structural impl family. Both the legacy store reader and
+        // the selected inventory nominate its file by the trait's spelling.
+        let legacy_structural = store
+            .rust_unresolved_trait_impl_files(&snapshots, "Trait")
+            .unwrap()
+            .into_iter()
+            .map(|(blob, path, _)| (blob.to_string(), path))
+            .collect::<BTreeSet<_>>();
+        assert!(
+            legacy_structural
+                .iter()
+                .any(|(_, path)| path == "app/src/im.rs"),
+            "the legacy reader nominates the reference-subject impl's file: {legacy_structural:?}"
+        );
+        let brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer::Multi(multi) =
+            &analyzer
+        else {
+            panic!("no analyzer")
+        };
+        let rust = multi
+            .delegates()
+            .get(&brokk_bifrost_core::analyzer::model::Language::Rust)
+            .unwrap()
+            .analyzer();
+        let rust = (rust as &dyn std::any::Any)
+            .downcast_ref::<brokk_bifrost_rust_analysis::analyzer::rust::RustAnalyzer>()
+            .unwrap();
+        let _scope = brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::new(rust);
+        let selected_structural =
+            brokk_bifrost_rust::graph_support::RustFactSource::rust_unresolved_trait_impl_files(
+                rust, "Trait",
+            )
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.impl_blob.to_string(), row.impl_rel_path.to_string()))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            selected_structural, legacy_structural,
+            "the selected inventory and the legacy reader nominate the same files"
+        );
     }
 
     /// Every Rust unit-summary reader observes the summary the writer just
     /// published.
     ///
     /// A derivation-version bump is what broke this: PR #5242 raised
-    /// `RUST_UNIT_SUMMARY_DERIVATION_VERSION` to 8 and left five reader
+    /// `rust_unit_summary_derivation_identity()` to 8 and left five reader
     /// predicates at 7, so every freshly derived Rust crate summary became
     /// invisible to them and summary-backed lookups came back empty (#5249).
     /// Each reader now binds the writer's constant, and this test reads one
@@ -8424,7 +9235,7 @@ mod outer {
     /// predicate, so a reader that stops agreeing with the writer about which
     /// summaries exist fails here instead of silently returning nothing.
     #[test]
-    #[hardwon("#5249: five readers kept derivation_version=7 after the writer moved to 8")]
+    #[hardwon("#5249: five readers kept derivation_identity=7 after the writer moved to 8")]
     fn every_rust_unit_summary_reader_observes_a_freshly_published_summary() {
         let project = InlineTestProject::new()
             .file(
@@ -8486,8 +9297,8 @@ mod outer {
             .query_row(
                 "SELECT count(*) FROM resolution_unit_summaries
                  WHERE lang='rust' AND unit_kind='rust_crate'
-                   AND publication_state='complete' AND derivation_version=?1",
-                [brokk_bifrost_analysis::analyzer::store::rust_unit_summaries::RUST_UNIT_SUMMARY_DERIVATION_VERSION],
+                   AND publication_state='complete' AND derivation_identity=?1",
+                [brokk_bifrost_analysis::analyzer::store::rust_unit_summaries::rust_unit_summary_derivation_identity()],
                 |row| row.get(0),
             )
             .unwrap();
@@ -8578,7 +9389,7 @@ mod outer {
 
         let oids = package_rows
             .iter()
-            .map(|row| Oid::from_str(&row.blob_oid).unwrap())
+            .map(|row| Oid::from_str(row.blob_oid.as_deref().unwrap()).unwrap())
             .collect::<Vec<_>>();
         let key = brokk_bifrost_core::gitblob::BlobKey::unvaried(oids[0], "rust");
         let whole = store
@@ -8648,6 +9459,7 @@ mod outer {
         let trait_oid = Oid::from_str(&trait_oid).unwrap();
         let impl_rows = store
             .rust_trait_impl_rows(
+                &snapshots,
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(trait_oid, "rust"),
                 trait_declaration,
                 "app/src/tr.rs",
@@ -8661,6 +9473,7 @@ mod outer {
         );
         let spellings = store
             .rust_trait_impl_spellings(
+                &snapshots,
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(trait_oid, "rust"),
                 trait_declaration,
                 "app/src/tr.rs",
@@ -8671,7 +9484,9 @@ mod outer {
             "the live-summary reader observes the trait spelling: {spellings:?}"
         );
 
-        let unresolved = store.rust_unresolved_trait_impl_files("Absent").unwrap();
+        let unresolved = store
+            .rust_unresolved_trait_impl_files(&snapshots, "Absent")
+            .unwrap();
         assert!(
             unresolved
                 .iter()
@@ -9057,6 +9872,21 @@ mod outer {
 
     #[test]
     fn crate_textual_macro_shadowing_requires_source_visibility_rows() {
+        // #12239: exported candidates keep the child's textual shadowing order.
+        for (guard, admitted) in [("custom_build_cfg", false), ("any()", true)] {
+            let project = InlineTestProject::new()
+                .file("Cargo.toml", "[package]\nname='exported_shadow'\nversion='0.1.0'\nedition='2021'\n")
+                .file("src/lib.rs", "#[macro_use] mod macros;\nm! { pub mod generated; }\n")
+                .file("src/macros.rs", format!("macro_rules! m {{ ($($item:item)*) => {{ $($item)* }}; }}\n#[cfg({guard})] macro_rules! m {{ ($($t:tt)*) => {{}}; }}\n"))
+                .file("src/generated.rs", "pub struct Generated;\n")
+                .build();
+            let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+            let conn = analyzer.store().unwrap().read_conn().unwrap();
+            let published: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM rust_crate_exports WHERE module_path='crate::generated' AND name='Generated')",
+                [], |row| row.get(0)).unwrap();
+            assert_eq!(published, admitted, "later cfg {guard}");
+        }
         let project = InlineTestProject::new()
             .file(
                 "Cargo.toml",
@@ -9470,9 +10300,7 @@ pub mod second;
                 Value::Blob(unit_key.clone()),
                 Value::Integer(revision),
                 Value::Text(epoch.clone()),
-                Value::Integer(
-                    brokk_bifrost_analysis::analyzer::store::rust_unit_summaries::RUST_UNIT_SUMMARY_DERIVATION_VERSION,
-                ),
+                rusqlite::types::Value::Blob(brokk_bifrost_analysis::analyzer::store::rust_unit_summaries::rust_unit_summary_derivation_identity().to_vec()),
             ];
             let plan = explain_pin(&conn, &live);
             assert!(
@@ -9495,7 +10323,9 @@ pub mod second;
             let plan = explain_pin(&conn, &export);
             assert!(
                 plan.iter().any(|row| row.starts_with("SEARCH")
-                    && row.contains("resolution_unit_summary_exports USING PRIMARY KEY")),
+                    && row.contains(
+                        "exports USING PRIMARY KEY (summary_id=? AND identity_id=? AND namespace=?)"
+                    )),
                 "export seek with {state_name}: {plan:?}"
             );
 
@@ -9701,6 +10531,109 @@ pub mod second;
         assert_eq!(containers, 1);
     }
     #[test]
+    fn incremental_workspace_glob_discovers_new_member_before_unit_selection() {
+        use brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer;
+
+        let manifest = "[workspace]\nmembers = [\"crates/*\"]\nresolver = \"2\"\n";
+        let app_manifest = "[package]\nname='app'\nversion='0.1.0'\nedition='2021'\n";
+        let fixture = InlineTestProject::new()
+            .file("Cargo.toml", manifest)
+            .file("crates/app/Cargo.toml", app_manifest)
+            .file("crates/app/src/lib.rs", "pub struct Existing;\n")
+            .build();
+        let analyzer = fixture.certified_workspace_analyzer(AnalyzerConfig::default());
+        let live_units = |workspace: &WorkspaceAnalyzer| {
+            let conn = workspace.store().unwrap().read_conn().unwrap();
+            conn.prepare(
+                "SELECT DISTINCT context.crate_name, member.rel_path
+                 FROM resolution_unit_summary_versions version
+                 JOIN rust_resolution_unit_summary_contexts context USING(summary_id)
+                 JOIN resolution_unit_summary_members member USING(summary_id)
+                 JOIN workspace_heads head ON head.workspace_id=version.workspace_id
+                   AND head.lang=version.lang AND head.generation=version.generation
+                 WHERE version.lang='rust' AND version.valid_from<=head.revision
+                   AND (version.valid_until IS NULL OR head.revision<version.valid_until)
+                 ORDER BY 1,2",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+        };
+        assert_eq!(
+            live_units(&analyzer),
+            vec![("app".into(), "crates/app/src/lib.rs".into())]
+        );
+        // Discover the new member with no edits to any existing file.
+        write(
+            fixture.root(),
+            "crates/c/Cargo.toml",
+            "[package]\nname='c'\nversion='0.1.0'\nedition='2021'\n",
+        );
+        write(fixture.root(), "crates/c/src/lib.rs", "pub struct Thing;\n");
+        let discovered = analyzer.update(&BTreeSet::from([
+            fixture.file("crates/c/Cargo.toml"),
+            fixture.file("crates/c/src/lib.rs"),
+        ]));
+        let expected_units = vec![
+            ("app".into(), "crates/app/src/lib.rs".into()),
+            ("c".into(), "crates/c/src/lib.rs".into()),
+        ];
+        assert_eq!(live_units(&discovered), expected_units);
+        assert_eq!(
+            live_units(&discovered),
+            live_units(&fixture.certified_workspace_analyzer(AnalyzerConfig::default()))
+        );
+        assert_eq!(
+            std::fs::read(fixture.root().join("Cargo.toml")).unwrap(),
+            manifest.as_bytes()
+        );
+        // Only after discovery, add a dependency and query across that edge.
+        write(
+            fixture.root(),
+            "crates/app/Cargo.toml",
+            &format!("{app_manifest}[dependencies]\nc={{path='../c'}}\n"),
+        );
+        write(
+            fixture.root(),
+            "crates/app/src/lib.rs",
+            "pub use c::Thing;\n",
+        );
+        let updated = discovered.update(&BTreeSet::from([
+            fixture.file("crates/app/Cargo.toml"),
+            fixture.file("crates/app/src/lib.rs"),
+        ]));
+        assert_eq!(
+            std::fs::read(fixture.root().join("Cargo.toml")).unwrap(),
+            manifest.as_bytes()
+        );
+        assert_eq!(live_units(&updated), expected_units);
+        let lookup = |workspace: &WorkspaceAnalyzer| {
+            let answer = crate::searchtools::get_definitions_by_location(
+                workspace.analyzer(),
+                crate::searchtools::GetDefinitionParams {
+                    references: vec![crate::searchtools::DefinitionReferenceQuery {
+                        path: "crates/app/src/lib.rs".into(),
+                        line: Some(1),
+                        column: Some(12),
+                    }],
+                },
+            );
+            assert_eq!(answer.results[0].status, "resolved", "{answer:?}");
+            assert_eq!(answer.results[0].definitions.len(), 1, "{answer:?}");
+            assert_eq!(answer.results[0].definitions[0].path, "crates/c/src/lib.rs");
+            serde_json::to_value(answer).unwrap()
+        };
+        let incremental_answer = lookup(&updated);
+        let fresh = fixture.certified_workspace_analyzer(AnalyzerConfig::default());
+        assert_eq!(live_units(&updated), live_units(&fresh));
+        assert_eq!(incremental_answer, lookup(&fresh));
+    }
+
+    #[test]
     fn crate_rows_reconcile_cargo_modules_and_body_update() {
         let fixture = fixture();
         let analyzer = fixture.workspace_analyzer(AnalyzerConfig::default());
@@ -9719,8 +10652,9 @@ pub mod second;
                 )),
                 "{modules:?}"
             );
+            // A member's non-default feature is ON under all-features activation.
             assert!(
-                !modules
+                modules
                     .iter()
                     .any(|row| row.0 == "dep" && row.2 == "crate::off"),
                 "{modules:?}"
@@ -9793,6 +10727,8 @@ pub mod second;
 
         use brokk_bifrost_analysis::analyzer::store::unit_summaries::ConsumedDependency;
 
+        use brokk_bifrost_analysis::analyzer::store::unit_summaries::ForeignReader;
+
         use brokk_bifrost_analysis::analyzer::store::unit_summaries::UnitInputs;
 
         use brokk_bifrost_analysis::analyzer::store::unit_summaries::UnitOutputs;
@@ -9809,8 +10745,8 @@ pub mod second;
             fn unit_kind(&self) -> &'static str {
                 "rust_crate"
             }
-            fn derivation_version(&self) -> i64 {
-                8
+            fn derivation_identity(&self) -> [u8; 32] {
+                [8; 32]
             }
             fn stage(&self, conn: &Connection, snapshot: &WorkspaceSnapshotId) -> Result<()> {
                 RustUnitSummaries.stage(conn, snapshot)
@@ -9833,9 +10769,16 @@ pub mod second;
                 unit: &UnitInputs,
                 dependencies: &[ConsumedDependency],
                 producer_epoch: &str,
+                consumed: &mut ForeignReader<'_>,
             ) -> Result<UnitOutputs> {
-                let mut outputs =
-                    RustUnitSummaries.derive(conn, snapshot, unit, dependencies, producer_epoch)?;
+                let mut outputs = RustUnitSummaries.derive(
+                    conn,
+                    snapshot,
+                    unit,
+                    dependencies,
+                    producer_epoch,
+                    consumed,
+                )?;
                 outputs.gaps.retain(|gap| {
                     gap.kind != "unknown_activation" || gap.subject != "crate::selected"
                 });
@@ -9848,6 +10791,7 @@ pub mod second;
                 unit: &UnitInputs,
                 dependencies: &[ConsumedDependency],
                 summary_id: i64,
+                reader: &mut ForeignReader<'_>,
             ) -> Result<usize> {
                 let written = RustUnitSummaries.write_language_rows(
                     conn,
@@ -9855,6 +10799,7 @@ pub mod second;
                     unit,
                     dependencies,
                     summary_id,
+                    reader,
                 )?;
                 let removed = conn.execute(
                     "DELETE FROM rust_resolution_unit_summary_gaps
@@ -9985,7 +10930,7 @@ pub mod second;
         );
     }
     fn rust_listing_certificate(root: &std::path::Path) -> bool {
-        use crate::analyzer::store::{RUST_SOURCE_LISTING_DERIVATION_VERSION, WorkspaceId};
+        use crate::analyzer::store::{WorkspaceId, rust_source_listing_derivation_identity};
         use brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer;
         use brokk_bifrost_core::analyzer::project::FilesystemProject;
         use std::sync::Arc;
@@ -10001,11 +10946,11 @@ pub mod second;
         let snapshot = snapshots.get("rust").expect("published Rust revision");
         assert!(
             !store
-                .rust_source_listing_complete(snapshot, RUST_SOURCE_LISTING_DERIVATION_VERSION + 1)
+                .rust_source_listing_complete(snapshot, brokk_bifrost_rust::cargo_routes::rust_source_listing_derivation_identity_before_last_token())
                 .unwrap()
         );
         store
-            .rust_source_listing_complete(snapshot, RUST_SOURCE_LISTING_DERIVATION_VERSION)
+            .rust_source_listing_complete(snapshot, rust_source_listing_derivation_identity())
             .unwrap()
     }
 
@@ -10366,9 +11311,7 @@ pub mod second;
 
     #[test]
     fn stale_listing_certificate_scopes_edits_and_module_creation() {
-        use brokk_bifrost_analysis::analyzer::store::{
-            GenerationId, RUST_SOURCE_LISTING_DERIVATION_VERSION, WorkspaceId,
-        };
+        use brokk_bifrost_analysis::analyzer::store::{GenerationId, WorkspaceId};
         let fixture = InlineTestProject::new()
             .file("Cargo.toml", "[package]\nname='app'\nversion='0.1.0'")
             .file("src/lib.rs", "pub fn app() {}")
@@ -10393,7 +11336,7 @@ pub mod second;
         overwrite_rust_listing_certificate(
             store,
             &snapshot,
-            RUST_SOURCE_LISTING_DERIVATION_VERSION - 1,
+            brokk_bifrost_rust::cargo_routes::rust_source_listing_derivation_identity_before_last_token(),
             vec![],
         );
         store.reconcile_rust_crates(&snapshot).unwrap();
@@ -10527,6 +11470,97 @@ pub mod second;
             live_crate_rows(&analyzer.store().unwrap().read_conn().unwrap()),
             live_crate_rows(&fresh.store().unwrap().read_conn().unwrap())
         );
+    }
+
+    #[test]
+    #[hardwon("#11799: unrelated required target deletion changed fresh context completeness only")]
+    fn unrelated_target_deletion_preserves_warm_and_fresh_context_completeness() {
+        let fixture = InlineTestProject::new()
+            .file("Cargo.toml", "[workspace]\nmembers=['app','other']")
+            .file(
+                "app/Cargo.toml",
+                "[package]\nname='app'\nversion='0.1.0'\n[lib]\npath='custom.rs'",
+            )
+            .file("app/custom.rs", "pub fn app() {}")
+            .file(
+                "other/Cargo.toml",
+                "[package]\nname='other'\nversion='0.1.0'",
+            )
+            .file("other/src/lib.rs", "pub fn other() {}")
+            .build();
+        let mut warm = fixture.certified_workspace_analyzer(AnalyzerConfig::default());
+        let file = fixture.file("app/custom.rs");
+        std::fs::remove_file(file.abs_path()).unwrap();
+        warm = warm.update(&BTreeSet::from([file]));
+        let fresh = fixture.certified_workspace_analyzer(AnalyzerConfig::default());
+        let completeness =
+            |analyzer: &brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer| {
+                analyzer.store().unwrap().read_conn().unwrap().query_row(
+                "SELECT min(t.inventory_complete), min(t.broad_complete) FROM rust_crate_versions v JOIN rust_crate_topologies t USING(topology_id) WHERE v.valid_until IS NULL AND t.crate_name='other'",
+                [], |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?)),
+            ).unwrap()
+            };
+        assert_eq!(completeness(&warm), completeness(&fresh));
+        assert_eq!(completeness(&fresh), (true, true));
+    }
+
+    #[test]
+    #[hardwon("#11799: an escaping target gap missed a source owned across package boundaries")]
+    fn escaping_target_taints_cross_package_module_owners() {
+        let fixture = InlineTestProject::new()
+            .file("Cargo.toml", "[workspace]\nmembers=['app','shared','runner']")
+            .file("app/Cargo.toml", "[package]\nname='app'\nversion='0.1.0'")
+            .file("app/src/lib.rs", "#[path = \"../../shared/src/model.rs\"] mod imported; pub fn app() { imported::main(); }")
+            .file("shared/Cargo.toml", "[package]\nname='shared'\nversion='0.1.0'")
+            .file("shared/src/lib.rs", "mod model; pub fn shared() { model::main(); }")
+            .file("shared/src/model.rs", "pub fn main() {}")
+            .file("runner/Cargo.toml", "[package]\nname='runner'\nversion='0.1.0'\nautobins=false\n[[bin]]\nname='runner'\npath='../shared/src/model.rs'")
+            .build();
+        let analyzer = fixture.certified_workspace_analyzer(AnalyzerConfig::default());
+        let conn = analyzer.store().unwrap().read_conn().unwrap();
+        let flags = conn.prepare(
+            "SELECT t.crate_name, t.inventory_complete, t.broad_complete FROM rust_crate_versions v JOIN rust_crate_topologies t USING(topology_id) WHERE v.valid_until IS NULL AND t.target_kind='lib' AND t.crate_name IN ('app','shared') ORDER BY 1",
+        ).unwrap().query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?, row.get::<_, bool>(2)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        assert_eq!(
+            flags,
+            vec![
+                ("app".to_owned(), false, false),
+                ("shared".to_owned(), false, false)
+            ]
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#11799: selected completeness reused a topology whose broad flag was already partial"
+    )]
+    fn selected_completeness_changes_a_topology_already_broad_incomplete() {
+        let fixture = InlineTestProject::new()
+            .file(
+                "Cargo.toml",
+                "[package]\nname='app'\nversion='0.1.0'\n[[bin]]\nname='helper'\npath='helper.rs'",
+            )
+            .file("src/lib.rs", "pub fn app() {}")
+            .file("helper.rs", "fn main() {}")
+            .file("oversized.rs", " ".repeat(1024 * 1024 + 1))
+            .build();
+        // A refused source keeps the broad inventory partial independently
+        // of the declared library and bin roots.
+        let mut warm = fixture.certified_workspace_analyzer(AnalyzerConfig::default());
+        let completeness =
+            |analyzer: &brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer| {
+                analyzer.store().unwrap().read_conn().unwrap().query_row(
+                "SELECT t.inventory_complete, t.broad_complete FROM rust_crate_versions v JOIN rust_crate_topologies t USING(topology_id) WHERE v.valid_until IS NULL AND t.crate_name='app' AND t.target_kind='lib'",
+                [], |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?)),
+            ).unwrap()
+            };
+        assert_eq!(completeness(&warm), (true, false));
+        let file = fixture.file("helper.rs");
+        std::fs::remove_file(file.abs_path()).unwrap();
+        warm = warm.update(&BTreeSet::from([file]));
+        let fresh = fixture.certified_workspace_analyzer(AnalyzerConfig::default());
+        assert_eq!(completeness(&warm), completeness(&fresh));
+        assert_eq!(completeness(&fresh), (false, false));
     }
 
     #[test]
@@ -10777,7 +11811,7 @@ pub mod second;
         analyzer: &brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer,
     ) -> (bool, Vec<(String, String)>) {
         use crate::analyzer::store::{
-            GenerationId, RUST_SOURCE_LISTING_DERIVATION_VERSION, WorkspaceId,
+            GenerationId, WorkspaceId, rust_source_listing_derivation_identity,
         };
         let store = analyzer.store().unwrap();
         let (workspace_id, generation, revision): (String, i64, i64) = store
@@ -10797,10 +11831,10 @@ pub mod second;
         };
         (
             store
-                .rust_source_listing_complete(&snapshot, RUST_SOURCE_LISTING_DERIVATION_VERSION)
+                .rust_source_listing_complete(&snapshot, rust_source_listing_derivation_identity())
                 .unwrap(),
             store
-                .rust_source_listing_failures(&snapshot, RUST_SOURCE_LISTING_DERIVATION_VERSION)
+                .rust_source_listing_failures(&snapshot, rust_source_listing_derivation_identity())
                 .unwrap()
                 .unwrap(),
         )
@@ -10925,7 +11959,7 @@ pub mod second;
                     revision,
                 };
                 let version =
-                    brokk_bifrost_analysis::analyzer::store::RUST_SOURCE_LISTING_DERIVATION_VERSION;
+                    brokk_bifrost_analysis::analyzer::store::rust_source_listing_derivation_identity();
                 (
                     store
                         .rust_source_listing_complete(&snapshot, version)
@@ -11087,7 +12121,7 @@ pub mod second;
                 ),
                 revision,
             },
-            brokk_bifrost_analysis::analyzer::store::RUST_SOURCE_LISTING_DERIVATION_VERSION,
+            brokk_bifrost_analysis::analyzer::store::rust_source_listing_derivation_identity(),
             vec![(String::new(), "listing unavailable".to_string())],
         );
         assert_eq!(
@@ -11138,9 +12172,7 @@ pub mod second;
             ),
             revision,
         };
-        let version =
-            brokk_bifrost_analysis::analyzer::store::RUST_SOURCE_LISTING_DERIVATION_VERSION;
-        overwrite_rust_listing_certificate(store, &stale, version - 1, vec![]);
+        overwrite_rust_listing_certificate(store, &stale, brokk_bifrost_rust::cargo_routes::rust_source_listing_derivation_identity_before_last_token(), vec![]);
         store.take_parsed_blob_membership_keys_for_test();
         let existing = fixture.file("src/lib.rs");
         existing
@@ -11200,7 +12232,7 @@ pub mod second;
     #[hardwon("#9737: a stored listing-unavailable certificate was never recomputed")]
     fn incremental_rust_listing_certificate_recovers_when_listing_becomes_readable() {
         use brokk_bifrost_analysis::analyzer::store::{
-            GenerationId, RUST_SOURCE_LISTING_DERIVATION_VERSION, WorkspaceId,
+            GenerationId, WorkspaceId, rust_source_listing_derivation_identity,
         };
         use brokk_bifrost_core::analyzer::project::{FilesystemProject, WorkspaceFileListingCache};
         use std::sync::Arc;
@@ -11242,7 +12274,7 @@ pub mod second;
         overwrite_rust_listing_certificate(
             store,
             &head,
-            RUST_SOURCE_LISTING_DERIVATION_VERSION,
+            rust_source_listing_derivation_identity(),
             vec![(String::new(), "listing unavailable".to_string())],
         );
         assert!(!rust_head_listing_certificate(&analyzer).0);
@@ -11529,7 +12561,7 @@ pub mod second;
     #[hardwon("#10321: a listing-only change rewrote the certificate of an existing revision")]
     fn incremental_rust_listing_certificate_agrees_for_directory_symlinks() {
         use brokk_bifrost_analysis::analyzer::store::{
-            GenerationId, RUST_SOURCE_LISTING_DERIVATION_VERSION, WorkspaceId,
+            GenerationId, WorkspaceId, rust_source_listing_derivation_identity,
         };
         use brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer;
         use brokk_bifrost_core::analyzer::project::{FilesystemProject, WorkspaceFileListingCache};
@@ -11577,10 +12609,16 @@ pub mod second;
                 .unwrap();
             (
                 store
-                    .rust_source_listing_complete(&snapshot, RUST_SOURCE_LISTING_DERIVATION_VERSION)
+                    .rust_source_listing_complete(
+                        &snapshot,
+                        rust_source_listing_derivation_identity(),
+                    )
                     .unwrap(),
                 store
-                    .rust_source_listing_failures(&snapshot, RUST_SOURCE_LISTING_DERIVATION_VERSION)
+                    .rust_source_listing_failures(
+                        &snapshot,
+                        rust_source_listing_derivation_identity(),
+                    )
                     .unwrap()
                     .unwrap()
                     .into_iter()
@@ -11651,10 +12689,16 @@ pub mod second;
             };
             (
                 store
-                    .rust_source_listing_complete(&snapshot, RUST_SOURCE_LISTING_DERIVATION_VERSION)
+                    .rust_source_listing_complete(
+                        &snapshot,
+                        rust_source_listing_derivation_identity(),
+                    )
                     .unwrap(),
                 store
-                    .rust_source_listing_failures(&snapshot, RUST_SOURCE_LISTING_DERIVATION_VERSION)
+                    .rust_source_listing_failures(
+                        &snapshot,
+                        rust_source_listing_derivation_identity(),
+                    )
                     .unwrap(),
             )
         };
@@ -11821,7 +12865,7 @@ pub mod second;
     #[hardwon("#10321: a point update opened an extra revision for its certificate")]
     fn point_update_certifies_only_its_last_revision() {
         use brokk_bifrost_analysis::analyzer::store::{
-            GenerationId, RUST_SOURCE_LISTING_DERIVATION_VERSION, WorkspaceId,
+            GenerationId, WorkspaceId, rust_source_listing_derivation_identity,
         };
         use brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer;
         use brokk_bifrost_core::analyzer::project::{FilesystemProject, WorkspaceFileListingCache};
@@ -11861,7 +12905,7 @@ pub mod second;
             analyzer
                 .store()
                 .unwrap()
-                .rust_source_listing_failures(snapshot, RUST_SOURCE_LISTING_DERIVATION_VERSION)
+                .rust_source_listing_failures(snapshot, rust_source_listing_derivation_identity())
                 .unwrap()
         };
         let start = head(&analyzer);
@@ -11950,7 +12994,7 @@ pub mod second;
         let analyzer =
             WorkspaceAnalyzer::build_ephemeral_footgun(project.clone(), AnalyzerConfig::default())
                 .unwrap();
-        let host = AnalyzerDerivations::new(&RetentionBudget::new(1_000_000));
+        let host = AnalyzerDerivations::new(&RetentionBudget::for_test_capacity(1_000_000));
         assert_eq!(
             route_question_availability(&analyzer, "src/lib.rs", "app", &host),
             all_route_questions(Some(true))
@@ -12019,9 +13063,11 @@ pub mod second;
         let unreadable = temp.path().join("unreadable");
         std::fs::create_dir(&unreadable).unwrap();
         std::fs::write(unreadable.join("nested.rs"), "fn nested() {}\n").unwrap();
-        let store =
-            AnalyzerStore::open_for_workspace(temp.path(), &RetentionBudget::new(1_000_000))
-                .unwrap();
+        let store = AnalyzerStore::open_for_workspace(
+            temp.path(),
+            &RetentionBudget::for_test_capacity(1_000_000),
+        )
+        .unwrap();
         std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
         let result = FilesystemProject::new(temp.path());
         std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -12845,10 +13891,33 @@ replay! { replay! { mod doubly_replayed; } }
                             declaration: &str,
                             visibility_declaration: Option<&str>| {
                     let declaration_start = source.find(declaration).expect("fixture route");
+                    // Each merged `mod` item creates the module it names below
+                    // the inline modules that hold it.
+                    let chain = match declaring_module {
+                        "routes.outer.relocated_scope" => "outer::relocated_scope::",
+                        "routes.outer.inner" => "outer::inner::",
+                        _ => "",
+                    };
+                    let mut declared_modules = std::iter::once(declaration)
+                        .chain(visibility_declaration)
+                        .map(|text| {
+                            let name = text
+                                .trim_start_matches("pub ")
+                                .trim_start_matches("mod ")
+                                .trim_end_matches(';');
+                            brokk_bifrost_rust::cargo_routes::RustCargoDeclaredModule {
+                                module_suffix: format!("{chain}{name}"),
+                                test_gated,
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    declared_modules.sort();
+                    declared_modules.dedup();
                     RustCargoModuleDeclaration {
                         declaring_file: file.clone(),
                         target_file: ProjectFile::new(root.clone(), path),
                         declaring_module: declaring_module.to_string(),
+                        declared_modules,
                         visibility,
                         imports_macros,
                         test_gated,
@@ -13132,10 +14201,11 @@ replay! { replay! { mod doubly_replayed; } }
 
     #[test]
     fn cargo_boundary_discovered_routes_follow_manifest_dependency_kinds() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../bifrost-rust/tests/fixtures/cargo-matrix")
-            .canonicalize()
-            .unwrap();
+        let fixture = crate::scratch_cache::FixtureCorpus::copied_from(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../bifrost-rust/tests/fixtures/cargo-matrix"),
+        );
+        let root = fixture.root().to_path_buf();
         with_certified_rust_routes(&root, |rust| {
             for (caller, alias, target) in [
                 ("app/src/lib.rs", "dep_alias", Some("dep/src/lib.rs")),
@@ -13356,9 +14426,12 @@ replay! { replay! { mod doubly_replayed; } }
             );
             let test_helper = ProjectFile::new(root.clone(), "engine/src/tests/helpers.rs");
             let helper_routes = routes(&test_helper);
-            // Incomplete production routes conservatively never narrow to test-only.
-            assert!(!helper_routes.is_complete());
-            assert!(!helper_routes.file_is_test_only(&test_helper));
+            // engine's dev edge to app used to force this legal cycle. The
+            // merged library still owns the helper, now with complete routes.
+            // Its only ancestry is #[cfg(test)] mod tests -> mod helpers, so
+            // complete routes also certify the previously uncertain test kind.
+            assert!(helper_routes.is_complete());
+            assert!(helper_routes.file_is_test_only(&test_helper));
             // Corrected with the pin above: an explicit `[[bin]]` on a 2015 crate
             // disables the implicit binary, example, test and bench targets, and
             // leaves the library alone (Cargo 1.96, `cargo metadata --no-deps`).
@@ -13390,5 +14463,306 @@ replay! { replay! { mod doubly_replayed; } }
                 "and as a module when it is reached through the file that declares it"
             );
         });
+    }
+
+    // kernel_a and kernel_b each publish a module `event`; `mid` globs both, so
+    // `mid::event` is ambiguous (rustc E0659). `top` reaches it through `mid`.
+    const AMBIGUOUS_KERNEL: &str = "pub mod event { pub struct Event; }";
+
+    fn ambiguous_glob_workspace(mid_lib: &str, top_lib: &str) -> BuiltInlineTestProject {
+        ambiguous_glob_kernels(AMBIGUOUS_KERNEL, AMBIGUOUS_KERNEL, mid_lib, top_lib)
+    }
+
+    fn ambiguous_glob_kernels(
+        kernel_a: &str,
+        kernel_b: &str,
+        mid_lib: &str,
+        top_lib: &str,
+    ) -> BuiltInlineTestProject {
+        InlineTestProject::new()
+            .file(
+                "Cargo.toml",
+                "[workspace]\nmembers=[\"kernel_a\",\"kernel_b\",\"mid\",\"top\"]\nresolver=\"2\"\n",
+            )
+            .file("kernel_a/Cargo.toml", "[package]\nname=\"kernel_a\"\nversion=\"0.1.0\"\nedition=\"2021\"\n")
+            .file("kernel_b/Cargo.toml", "[package]\nname=\"kernel_b\"\nversion=\"0.1.0\"\nedition=\"2021\"\n")
+            .file("mid/Cargo.toml", "[package]\nname=\"mid\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[dependencies]\nkernel_a={path=\"../kernel_a\"}\nkernel_b={path=\"../kernel_b\"}\n")
+            .file("top/Cargo.toml", "[package]\nname=\"top\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[dependencies]\nmid={path=\"../mid\"}\n")
+            .file("kernel_a/src/lib.rs", kernel_a)
+            .file("kernel_b/src/lib.rs", kernel_b)
+            .file("mid/src/lib.rs", mid_lib)
+            .file("top/src/lib.rs", top_lib)
+            .build()
+    }
+
+    /// The export rows and gaps the topology publishes for `top`.
+    fn top_rows(project: &BuiltInlineTestProject) -> (Vec<String>, Vec<String>) {
+        let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+        let conn = analyzer.store().unwrap().read_conn().unwrap();
+        let collect = |sql: &str| {
+            conn.prepare(sql)
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        (
+            collect(
+                "SELECT export.namespace || ':' || export.name || ' -> ' || target.crate_name || '::' ||
+                        export.target_module_path || '::' || export.target_name
+                 FROM rust_crate_exports export
+                 JOIN rust_crate_topologies owner USING(topology_id)
+                 JOIN rust_crate_topologies target ON target.crate_key=export.target_crate_key
+                 WHERE owner.crate_name='top' AND export.module_path='crate' AND export.origin<>'declaration' ORDER BY 1",
+            ),
+            collect(
+                "SELECT gap.gap_kind || ' ' || gap.subject FROM rust_crate_gaps gap
+                 JOIN rust_crate_topologies owner USING(topology_id)
+                 WHERE owner.crate_name='top' ORDER BY 1",
+            ),
+        )
+    }
+
+    // `top` re-exports through `mid::event`, so the re-export proves nothing:
+    // no export row and an unresolved_reexport gap. With one glob the same
+    // shape publishes one target.
+    #[test]
+    #[hardwon(
+        "#11732: topology published one re-export with two canonical targets through an ambiguous glob"
+    )]
+    fn crate_reexport_through_an_ambiguous_glob_module_is_unproven() {
+        let project = ambiguous_glob_workspace(
+            "pub use kernel_a::*; pub use kernel_b::*;",
+            "pub use mid::event::Event;",
+        );
+        let (rows, gaps) = top_rows(&project);
+        assert!(rows.is_empty(), "{rows:#?}");
+        // The open_export_inventory gap keeps `Event` from reading as absent
+        // from a closed inventory; unresolved_reexport records the proof.
+        assert_eq!(
+            gaps,
+            [
+                "open_export_inventory crate::Event",
+                "unresolved_reexport crate::Event"
+            ]
+        );
+        let (rows, gaps) = top_rows(&ambiguous_glob_workspace(
+            "pub use kernel_a::*;",
+            "pub use mid::event::Event;",
+        ));
+        assert_eq!(
+            rows,
+            [
+                "type:Event -> kernel_a::crate::event::Event",
+                "value:Event -> kernel_a::crate::event::Event"
+            ]
+        );
+        assert!(gaps.is_empty(), "{gaps:#?}");
+    }
+
+    // A glob through the ambiguous module proves no names: the importing
+    // module publishes no glob-expanded row, its inventory is open, and a
+    // name looked up in it, present in a kernel or missing everywhere, is not
+    // a Complete answer. A glob through an unambiguous module stays exact.
+    #[test]
+    #[hardwon(
+        "#11732: review found the topology expanded a glob through an ambiguous module into rows from both modules"
+    )]
+    fn crate_glob_through_an_ambiguous_glob_module_is_unproven() {
+        use brokk_bifrost_analysis::analyzer::usages::get_definition::{
+            DefinitionLookupRequest, DefinitionLookupStatus,
+            trace::resolve_definition_batch_with_trace,
+        };
+        const CALLER: &str = "fn caller(_: Event, _: Missing) {}";
+        // Each case: the importing items, then the gaps the topology must
+        // carry. The last two read the ambiguous glob through a named import
+        // in another module, which must be unproven at its own importer.
+        for (glob, expected) in [
+            (
+                "pub use mid::event::*;",
+                [
+                    "open_export_inventory crate",
+                    "unresolved_reexport crate::*",
+                ],
+            ),
+            (
+                "use mid::event::*;",
+                ["open_export_inventory crate", "unresolved_import crate::*"],
+            ),
+            (
+                "pub mod inner { pub use mid::event::*; }\npub use inner::Event;",
+                [
+                    "open_export_inventory crate::inner",
+                    "unresolved_reexport crate::Event",
+                ],
+            ),
+            (
+                "pub mod inner { pub use mid::event::*; }\nuse inner::Event;",
+                [
+                    "open_export_inventory crate::inner",
+                    "unresolved_import crate::Event",
+                ],
+            ),
+        ] {
+            let top_lib = format!("{glob}\n{CALLER}");
+            let project =
+                ambiguous_glob_workspace("pub use kernel_a::*; pub use kernel_b::*;", &top_lib);
+            let (rows, gaps) = top_rows(&project);
+            assert!(rows.is_empty(), "{glob}: {rows:#?}");
+            // The ambiguous glob opens the importing module's inventory;
+            // binding and public-surface evidence may accompany it.
+            for expected in expected {
+                assert!(
+                    gaps.iter().any(|gap| gap == expected),
+                    "{glob}: {expected} in {gaps:#?}"
+                );
+            }
+            let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+            let file = project.file("top/src/lib.rs");
+            // `Missing` is a proved absence in a root that holds no glob; only
+            // a glob in the root itself can hide it.
+            let names: &[&str] = if glob.starts_with("pub mod inner") {
+                &["Event"]
+            } else {
+                &["Event", "Missing"]
+            };
+            for name in names {
+                let start = top_lib.find(&format!("_: {name}")).unwrap() + "_: ".len();
+                let outcome = resolve_definition_batch_with_trace(
+                    analyzer.analyzer(),
+                    vec![DefinitionLookupRequest {
+                        file: file.clone(),
+                        line: None,
+                        column: None,
+                        start_byte: Some(start),
+                        end_byte: Some(start + name.len()),
+                    }],
+                    file.clone(),
+                    std::sync::Arc::<str>::from(top_lib.as_str()),
+                    &brokk_bifrost_core::cancellation::CancellationToken::new(),
+                );
+                assert!(
+                    matches!(
+                        outcome[0].0.status,
+                        DefinitionLookupStatus::Incomplete | DefinitionLookupStatus::Ambiguous
+                    ) && outcome[0].0.incomplete_evidence.is_some(),
+                    "{glob}: {name} through an ambiguous glob is not a Complete answer: {:#?}",
+                    outcome[0].0
+                );
+            }
+        }
+        // A glob through an alias of an unproven path proves nothing either,
+        // although the glob itself has one candidate at its own hop: only
+        // kernel_a's `event` has `inner`.
+        let alias_top = "use mid::event::inner as ev;\npub use ev::*;\nfn caller(_: Missing) {}";
+        let alias = ambiguous_glob_kernels(
+            "pub mod event { pub struct Event; pub mod inner { pub struct Deep; } }",
+            AMBIGUOUS_KERNEL,
+            "pub use kernel_a::*; pub use kernel_b::*;",
+            alias_top,
+        );
+        let (rows, gaps) = top_rows(&alias);
+        assert!(rows.is_empty(), "{rows:#?}");
+        assert!(
+            gaps.iter().any(|gap| gap == "open_export_inventory crate"),
+            "the alias glob's importer carries the inventory gap: {gaps:#?}"
+        );
+        let analyzer = alias.workspace_analyzer(AnalyzerConfig::default());
+        let file = alias.file("top/src/lib.rs");
+        let start = alias_top.find("_: Missing").unwrap() + "_: ".len();
+        let outcome = resolve_definition_batch_with_trace(
+            analyzer.analyzer(),
+            vec![DefinitionLookupRequest {
+                file: file.clone(),
+                line: None,
+                column: None,
+                start_byte: Some(start),
+                end_byte: Some(start + "Missing".len()),
+            }],
+            file,
+            std::sync::Arc::<str>::from(alias_top),
+            &brokk_bifrost_core::cancellation::CancellationToken::new(),
+        );
+        assert!(
+            matches!(
+                outcome[0].0.status,
+                DefinitionLookupStatus::Incomplete | DefinitionLookupStatus::Ambiguous
+            ) && outcome[0].0.incomplete_evidence.is_some(),
+            "a name missing behind an alias of an ambiguous path is not a proved absence: {:#?}",
+            outcome[0].0
+        );
+        // An independent sound provider keeps an endpoint the ambiguous route
+        // would otherwise erase: root globs `inner` (ambiguous source) and
+        // also `mid::kernel_a_event`, an unambiguous alias of kernel_a's
+        // module. kernel_a's Event stays published; kernel_b's, supplied
+        // only through the ambiguous route, does not.
+        let (rows, _) = top_rows(&ambiguous_glob_workspace(
+            "pub use kernel_a::*; pub use kernel_b::*; pub use kernel_a::event as kernel_a_event;",
+            "pub mod inner { pub use mid::event::*; }\npub use inner::*;\npub use mid::kernel_a_event::*;",
+        ));
+        assert_eq!(
+            rows,
+            [
+                "type:Event -> kernel_a::crate::event::Event",
+                "value:Event -> kernel_a::crate::event::Event"
+            ]
+        );
+        let (rows, gaps) = top_rows(&ambiguous_glob_workspace(
+            "pub use kernel_a::*;",
+            "pub use mid::event::*;",
+        ));
+        assert_eq!(
+            rows,
+            [
+                "type:Event -> kernel_a::crate::event::Event",
+                "value:Event -> kernel_a::crate::event::Event"
+            ]
+        );
+        assert!(gaps.is_empty(), "{gaps:#?}");
+    }
+    #[test]
+    #[hardwon(
+        "#12358: legal dev-dependency cycles forced library crates incomplete and made every Rust route partial"
+    )]
+    fn rust_crate_dev_cycle_keeps_inventories_complete() {
+        let fixture = InlineTestProject::new()
+            .file("Cargo.toml", "[workspace]\nmembers=['a','b']\nresolver='2'\n")
+            .file("a/Cargo.toml", "[package]\nname='a'\nversion='0.1.0'\nedition='2021'\n[dev-dependencies]\nb={path='../b'}\n")
+            .file("b/Cargo.toml", "[package]\nname='b'\nversion='0.1.0'\nedition='2021'\n[dependencies]\na={path='../a'}\n")
+            .file("a/src/lib.rs", "pub fn alpha() {}\n#[cfg(test)] mod tests { fn check() { b::beta(); } }\n")
+            .file("a/tests/check.rs", "#[test] fn check() { b::beta(); }\n")
+            .file("b/src/lib.rs", "pub fn beta() { a::alpha(); }\n")
+            .build();
+        let workspace = fixture.certified_workspace_analyzer(AnalyzerConfig::default());
+        let conn = workspace.store().unwrap().read_conn().unwrap();
+        let units = conn.prepare("SELECT crate_name,target_kind,inventory_complete,broad_complete FROM rust_crate_topologies ORDER BY crate_name,target_kind").unwrap()
+            .query_map([],|row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,bool>(2)?,row.get::<_,bool>(3)?))).unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        assert_eq!(units.len(), 3, "{units:?}");
+        assert!(units.iter().all(|unit| unit.2 && unit.3), "{units:?}");
+        let gaps = conn.prepare("SELECT top.crate_name,top.target_kind,gap.subject,json(gap.detail) FROM rust_crate_gaps gap JOIN rust_crate_topologies top USING(topology_id) WHERE gap_kind='dev_dependency_cycle_edge_dropped'").unwrap()
+            .query_map([],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?))).unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert_eq!((&*gaps[0].0, &*gaps[0].1, &*gaps[0].2), ("a", "lib", "b"));
+        let detail: serde_json::Value = serde_json::from_str(&gaps[0].3).unwrap();
+        assert_eq!(detail["from"], "a/Cargo.toml");
+        assert_eq!(detail["to"], "b/Cargo.toml");
+        let edges=conn.prepare("SELECT owner.crate_name,owner.target_kind,dependency.extern_name FROM rust_crate_dependencies dependency JOIN rust_crate_topologies owner USING(topology_id) ORDER BY 1,2,3").unwrap()
+            .query_map([],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?))).unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        assert!(
+            edges.contains(&("b".into(), "lib".into(), "a".into())),
+            "{edges:?}"
+        );
+        assert!(
+            edges.contains(&("check".into(), "test".into(), "b".into())),
+            "{edges:?}"
+        );
+        assert!(
+            !edges.contains(&("a".into(), "lib".into(), "b".into())),
+            "{edges:?}"
+        );
     }
 }

@@ -34,33 +34,56 @@ pub(crate) const DEFINITION_SITE_SQL: &str = super::reverse_nomination::REVERSE_
 #[doc(hidden)]
 pub const SAME_BLOB_TYPE_EXPORT_KEYS_SQL: &str = r#"
 SELECT DISTINCT sites.semantic_key
-FROM main.resolution_unit_summary_members AS candidate
-  INDEXED BY resolution_unit_summary_members_blob
-CROSS JOIN selected_rust_unit_summaries AS owner
-  ON owner.summary_id=candidate.summary_id
-CROSS JOIN main.rust_resolution_unit_summary_exports AS exports
-  INDEXED BY rust_resolution_unit_summary_exports_declaration
-  ON exports.summary_id=owner.summary_id
- AND exports.declaration_member_ordinal=candidate.member_ordinal
- AND exports.origin='declaration'
-CROSS JOIN source_native_declaration_bridges AS export_bridge
-  ON export_bridge.blob_id=candidate.blob_id
- AND export_bridge.source_site=exports.declaration_site
+FROM source_native_declaration_bridges AS export_bridge
 CROSS JOIN source_declaration_units AS export_unit
   ON export_unit.blob_id=export_bridge.blob_id
  AND export_unit.declaration_id=export_bridge.declaration_id
 CROSS JOIN source_native_declaration_bridges AS target_bridge
-  ON target_bridge.blob_id=candidate.blob_id AND target_bridge.source_site=?3
+  ON target_bridge.blob_id=?1 AND target_bridge.source_site=?3
 CROSS JOIN source_declaration_units AS target_unit
   ON target_unit.blob_id=target_bridge.blob_id
  AND target_unit.declaration_id=target_bridge.declaration_id
  AND target_unit.unit_key=export_unit.unit_key
+CROSS JOIN main.resolution_unit_summary_members AS candidate
+  INDEXED BY resolution_unit_summary_members_path
+  ON candidate.rel_path=?4
+ AND EXISTS(SELECT 1 FROM temp.selected_unit_member_blobs AS attachment
+            WHERE attachment.summary_id=candidate.summary_id
+              AND attachment.member_ordinal=candidate.member_ordinal
+              AND attachment.blob_id=?1)
+CROSS JOIN selected_rust_unit_summaries AS owner
+  ON owner.summary_id=candidate.summary_id
+-- Rust-only derived-from blob until #11183 M3 converts Rust child rows
+CROSS JOIN main.rust_resolution_unit_summary_exports AS exports
+  INDEXED BY rust_resolution_unit_summary_exports_declaration
+  ON exports.summary_id=candidate.summary_id
+ AND exports.declaration_member_ordinal=candidate.member_ordinal
+ AND exports.declaration_site=export_bridge.source_site
+ AND exports.origin='declaration'
+LEFT JOIN main.resolution_unit_summary_exports AS shared_export
+  INDEXED BY resolution_unit_summary_exports_surface_lookup
+  ON shared_export.summary_id=owner.summary_id
+ AND shared_export.declaration_member_ordinal=(
+     SELECT min(shared_member.member_ordinal)
+     FROM main.resolution_unit_summary_members AS shared_member
+     WHERE shared_member.summary_id=candidate.summary_id
+       AND shared_member.blob_id=candidate.blob_id)
+ AND shared_export.site_surface_ordinal=(
+     SELECT export_site.surface_ordinal
+     FROM temp.surface_dense AS export_site
+     WHERE export_site.blob_id=?1 AND export_site.id_space=0
+       AND export_site.dense_id=export_bridge.source_site)
+ AND shared_export.identity_id=exports.identity_id
+ AND shared_export.namespace=exports.namespace
+ AND shared_export.target_kind='own'
 CROSS JOIN resolution_semantic_sites AS sites
-  ON sites.blob_id=candidate.blob_id
- AND sites.source_site=exports.declaration_site
+  ON sites.blob_id=?1
+ AND sites.source_site=export_bridge.source_site
  AND sites.semantic_role='definition'
-WHERE candidate.blob_id=?1 AND exports.namespace='type' AND exports.name=?2
-  AND exports.declaration_site<>?3
+WHERE export_bridge.blob_id=?1
+  AND exports.namespace='type' AND exports.name=?2
+  AND export_bridge.source_site<>?3
+  AND (exports.visibility<>'public' OR shared_export.identity_id IS NOT NULL)
 "#;
 #[doc(hidden)]
 pub const BASE_TARGET_ACTIVATION_SQL: &str = r#"
@@ -191,7 +214,7 @@ WITH source(blob_id,persisted_relative_path) AS (
 )
 SELECT DISTINCT roots.rel_path, owner.workspace_id, owner.generation, owner.topology_id,
  owner.unit_key, owner.summary_id, authority.summary_digest, authority.output_digest,
- authority.producer_epoch, authority.derivation_version,
+ authority.producer_epoch, authority.derivation_identity,
  source_placement.member_ordinal, source_placement.module_path,
  source_placement.source_kind, source_placement.scope_ordinal,
  root_placement.member_ordinal, root_placement.module_path,
@@ -205,10 +228,10 @@ CROSS JOIN selected_rust_unit_summaries AS owner
   ON owner.summary_id=source_members.summary_id
 CROSS JOIN main.rust_resolution_unit_summary_contexts AS owner_context
   ON owner_context.summary_id=owner.summary_id
-CROSS JOIN main.rust_unit_summary_placements AS source_placement
+CROSS JOIN temp.rust_unit_summary_placements AS source_placement
   ON source_placement.summary_id=owner.summary_id
  AND source_placement.member_ordinal=source_members.member_ordinal
-CROSS JOIN main.rust_unit_summary_placements AS root_placement
+CROSS JOIN temp.rust_unit_summary_placements AS root_placement
   ON root_placement.summary_id=owner.summary_id
  AND root_placement.module_path='crate'
  AND root_placement.source_kind='declared'
@@ -227,7 +250,7 @@ WHERE owner_context.target_kind<>'detached'
      CROSS JOIN main.rust_resolution_unit_summary_contexts AS container_context
        ON container_context.summary_id=container.summary_id
       AND container_context.target_kind='detached'
-     CROSS JOIN main.rust_unit_summary_placements AS parent_placement
+     CROSS JOIN temp.rust_unit_summary_placements AS parent_placement
        ON parent_placement.summary_id=parent_member.summary_id
       AND parent_placement.member_ordinal=parent_member.member_ordinal
       AND parent_placement.module_path<>'crate'
@@ -260,14 +283,39 @@ pub(crate) const MEMBER_OWNER_SITE_SQL: &str = "SELECT DISTINCT owner_site.sourc
  WHERE member_site.blob_id=?1 AND member_site.source_site=?2 \
   AND member_site.semantic_role='definition'";
 
+/// Selected rename sites together with the frontier's request-local evidence.
+pub type RustRowBindingCandidates = (
+    Vec<(PathBuf, SelectedSemanticLocator)>,
+    crate::analyzer::resolution::ResolutionCompletion,
+);
+
 pub use super::reverse_nomination::ReverseCandidateSet as RustReverseCandidateSet;
 use super::reverse_nomination::{
     ReverseExposure, ReverseExposureSeeds, ReverseExposureStep, ReverseLookupSource,
     ReverseNominationHooks, ReverseSourceLookup, group_reverse_inputs, merged_locators,
-    nominate_reverse_target,
 };
 
 pub(crate) const EXPORTS_SQL: &str = include_str!("../rust_reverse_exports.sql");
+/// A removed placement makes the definition unavailable. Added edges are a
+/// separate frontier gap: persisted placements cannot confirm ownership in the
+/// newly opened module, even when its target file already has another owner.
+pub(crate) const UNPLACED_DECLARING_FILE_SQL: &str = "SELECT 1
+ FROM temp.selected_rust_unplaced_placements AS removed
+ CROSS JOIN selected_rust_unit_summaries AS unit ON unit.summary_id=removed.summary_id
+ WHERE removed.rel_path=?1
+ AND NOT EXISTS (
+  SELECT 1 FROM main.resolution_unit_summary_members AS held
+   INDEXED BY resolution_unit_summary_members_path
+  CROSS JOIN selected_rust_unit_summaries AS holder ON holder.summary_id=held.summary_id
+  CROSS JOIN temp.rust_unit_summary_placements AS placement
+   ON placement.summary_id=held.summary_id AND placement.member_ordinal=held.member_ordinal
+  WHERE held.rel_path=?1)";
+
+/// Request-local unknown reach. Include edges into held files, notably a
+/// detached root opening a Cargo source file, must not escape this guard.
+/// Until selected placements can extend into those files, any added edge can
+/// introduce ownership and routes not represented by the persisted inventory.
+const OVERLAY_FRONTIER_SQL: &str = "SELECT 1 FROM temp.selected_rust_added_edges LIMIT 1";
 // A cfg-alternative definition can share one CodeUnit with its active sibling
 // while only the sibling has a selected export row. Keep the sibling routes
 // available to reverse discovery; forward confirmation checks each candidate.
@@ -275,39 +323,61 @@ pub(crate) const EXPORTS_SQL: &str = include_str!("../rust_reverse_exports.sql")
 pub const SAME_BLOB_TYPE_EXPORTS_SQL: &str = r#"
 SELECT owner.topology_id, owner.unit_key, exports.module_path, 'type',
        exports.name, exports.visibility, 0
-FROM main.resolution_unit_summary_members AS candidate
-  INDEXED BY resolution_unit_summary_members_blob
-CROSS JOIN selected_rust_unit_summaries AS owner
-  ON owner.summary_id=candidate.summary_id
-CROSS JOIN main.rust_unit_summary_placements AS placement
-  ON placement.summary_id=owner.summary_id
- AND placement.member_ordinal=candidate.member_ordinal
-CROSS JOIN main.rust_resolution_unit_summary_exports AS exports
-  INDEXED BY rust_resolution_unit_summary_exports_declaration
-  ON exports.summary_id=owner.summary_id
- AND exports.declaration_member_ordinal=candidate.member_ordinal
- AND exports.module_path=placement.module_path
- AND exports.origin='declaration'
-CROSS JOIN source_native_declaration_bridges AS export_bridge
-  ON export_bridge.blob_id=candidate.blob_id
- AND export_bridge.source_site=exports.declaration_site
+FROM source_native_declaration_bridges AS export_bridge
 CROSS JOIN source_declaration_units AS export_unit
   ON export_unit.blob_id=export_bridge.blob_id
  AND export_unit.declaration_id=export_bridge.declaration_id
 CROSS JOIN source_native_declaration_bridges AS target_bridge
-  ON target_bridge.blob_id=candidate.blob_id AND target_bridge.source_site=?3
+  ON target_bridge.blob_id=?1 AND target_bridge.source_site=?3
 CROSS JOIN source_declaration_units AS target_unit
   ON target_unit.blob_id=target_bridge.blob_id
  AND target_unit.declaration_id=target_bridge.declaration_id
  AND target_unit.unit_key=export_unit.unit_key
-WHERE candidate.blob_id=?1 AND candidate.rel_path=?4
+CROSS JOIN main.resolution_unit_summary_members AS candidate
+  INDEXED BY resolution_unit_summary_members_path
+  ON candidate.rel_path=?4
+ AND EXISTS(SELECT 1 FROM temp.selected_unit_member_blobs AS attachment
+            WHERE attachment.summary_id=candidate.summary_id
+              AND attachment.member_ordinal=candidate.member_ordinal
+              AND attachment.blob_id=?1)
+CROSS JOIN selected_rust_unit_summaries AS owner
+  ON owner.summary_id=candidate.summary_id
+CROSS JOIN temp.rust_unit_summary_placements AS placement
+  ON placement.summary_id=owner.summary_id
+ AND placement.member_ordinal=candidate.member_ordinal
+-- Rust-only derived-from blob until #11183 M3 converts Rust child rows
+CROSS JOIN main.rust_resolution_unit_summary_exports AS exports
+  INDEXED BY rust_resolution_unit_summary_exports_declaration
+  ON exports.summary_id=candidate.summary_id
+ AND exports.declaration_member_ordinal=candidate.member_ordinal
+ AND exports.declaration_site=export_bridge.source_site
+ AND exports.module_path=placement.module_path
+ AND exports.origin='declaration'
+LEFT JOIN main.resolution_unit_summary_exports AS shared_export
+  INDEXED BY resolution_unit_summary_exports_surface_lookup
+  ON shared_export.summary_id=owner.summary_id
+ AND shared_export.declaration_member_ordinal=(
+     SELECT min(shared_member.member_ordinal)
+     FROM main.resolution_unit_summary_members AS shared_member
+     WHERE shared_member.summary_id=candidate.summary_id
+       AND shared_member.blob_id=candidate.blob_id)
+ AND shared_export.site_surface_ordinal=(
+     SELECT export_site.surface_ordinal
+     FROM temp.surface_dense AS export_site
+     WHERE export_site.blob_id=?1 AND export_site.id_space=0
+       AND export_site.dense_id=export_bridge.source_site)
+ AND shared_export.identity_id=exports.identity_id
+ AND shared_export.namespace=exports.namespace
+ AND shared_export.target_kind='own'
+WHERE export_bridge.blob_id=?1
   AND exports.namespace='type' AND exports.name=?2
-  AND exports.declaration_site<>?3
+  AND export_bridge.source_site<>?3
+  AND (exports.visibility<>'public' OR shared_export.identity_id IS NOT NULL)
 "#;
 #[doc(hidden)]
-pub const IMPORTS_SQL: &str = "SELECT DISTINCT sources.blob_id, route.bound_name, CASE WHEN sources.blob_id=bound_member.blob_id THEN route.binder_scope END, owner.topology_id, owner.unit_key, route.module_path FROM main.rust_resolution_unit_summary_import_routes AS route INDEXED BY rust_resolution_unit_summary_import_routes_target_identity CROSS JOIN selected_rust_unit_summaries AS owner ON owner.summary_id=route.summary_id CROSS JOIN main.resolution_unit_summary_members AS bound_member ON bound_member.summary_id=route.summary_id AND bound_member.member_ordinal=route.member_ordinal CROSS JOIN main.rust_unit_summary_placements AS placement ON placement.summary_id=route.summary_id AND placement.module_path=route.module_path CROSS JOIN main.resolution_unit_summary_members AS sources ON sources.summary_id=placement.summary_id AND sources.member_ordinal=placement.member_ordinal WHERE route.target_unit_key=?1 AND route.target_module_path=?2 AND route.target_name=?3";
+pub const IMPORTS_SQL: &str = "SELECT DISTINCT sources.blob_id, route.bound_name, CASE WHEN sources.blob_id=bound_member.blob_id THEN route.binder_scope END, owner.topology_id, owner.unit_key, route.module_path FROM main.rust_resolution_unit_summary_import_routes AS route INDEXED BY rust_resolution_unit_summary_import_routes_target_identity CROSS JOIN selected_rust_unit_summaries AS owner ON owner.summary_id=route.summary_id CROSS JOIN main.resolution_unit_summary_members AS bound_member ON bound_member.summary_id=route.summary_id AND bound_member.member_ordinal=route.member_ordinal CROSS JOIN temp.rust_unit_summary_placements AS placement ON placement.summary_id=route.summary_id AND placement.module_path=route.module_path CROSS JOIN main.resolution_unit_summary_members AS sources ON sources.summary_id=placement.summary_id AND sources.member_ordinal=placement.member_ordinal WHERE route.target_unit_key=?1 AND route.target_module_path=?2 AND route.target_name=?3";
 #[doc(hidden)]
-pub const GLOBS_SQL: &str = "SELECT DISTINCT sources.blob_id, CASE WHEN sources.blob_id=bound_member.blob_id THEN route.binder_scope END, owner.topology_id, owner.unit_key, route.module_path FROM main.rust_resolution_unit_summary_glob_imports AS route INDEXED BY rust_resolution_unit_summary_glob_imports_target_identity CROSS JOIN selected_rust_unit_summaries AS owner ON owner.summary_id=route.summary_id CROSS JOIN main.resolution_unit_summary_members AS bound_member ON bound_member.summary_id=route.summary_id AND bound_member.member_ordinal=route.member_ordinal CROSS JOIN main.rust_unit_summary_placements AS placement ON placement.summary_id=route.summary_id AND placement.module_path=route.module_path CROSS JOIN main.resolution_unit_summary_members AS sources ON sources.summary_id=placement.summary_id AND sources.member_ordinal=placement.member_ordinal WHERE route.target_unit_key=?1 AND route.target_module_path=?2";
+pub const GLOBS_SQL: &str = "SELECT DISTINCT sources.blob_id, CASE WHEN sources.blob_id=bound_member.blob_id THEN route.binder_scope END, owner.topology_id, owner.unit_key, route.module_path FROM main.rust_resolution_unit_summary_glob_imports AS route INDEXED BY rust_resolution_unit_summary_glob_imports_target_identity CROSS JOIN selected_rust_unit_summaries AS owner ON owner.summary_id=route.summary_id CROSS JOIN main.resolution_unit_summary_members AS bound_member ON bound_member.summary_id=route.summary_id AND bound_member.member_ordinal=route.member_ordinal CROSS JOIN temp.rust_unit_summary_placements AS placement ON placement.summary_id=route.summary_id AND placement.module_path=route.module_path CROSS JOIN main.resolution_unit_summary_members AS sources ON sources.summary_id=placement.summary_id AND sources.member_ordinal=placement.member_ordinal WHERE route.target_unit_key=?1 AND route.target_module_path=?2";
 #[doc(hidden)]
 pub const MODULE_SOURCES_SQL: &str = r#"
 SELECT members.blob_id
@@ -1516,9 +1586,15 @@ impl SelectedResolutionOperation<'_, '_> {
         {
             let alternatives = conn
                 .prepare_cached(SAME_BLOB_TYPE_EXPORT_KEYS_SQL)?
-                .query_map(params![blob, target.identifier(), site], |row| {
-                    row.get::<_, i64>(0)
-                })?
+                .query_map(
+                    params![
+                        blob,
+                        target.identifier(),
+                        site,
+                        crate::path_utils::rel_path_string(target.source())
+                    ],
+                    |row| row.get::<_, i64>(0),
+                )?
                 .map(|row| {
                     let local_key = u32::try_from(row?)
                         .expect("a semantic site key fits the local identity payload");
@@ -1589,7 +1665,7 @@ impl SelectedResolutionOperation<'_, '_> {
         extra_names: &[String],
         seeds: &[SelectedSemanticLocator],
         cancellation: &CancellationToken,
-    ) -> Result<Option<Vec<(PathBuf, SelectedSemanticLocator)>>> {
+    ) -> Result<Option<RustRowBindingCandidates>> {
         let unit = match target {
             SelectedRustBindingDefinition::Stable(semantic) => {
                 match self.project_rust_definitions(&[*semantic], cancellation)? {
@@ -1606,6 +1682,11 @@ impl SelectedResolutionOperation<'_, '_> {
         else {
             return Ok(None);
         };
+        // The candidate set's frontier completion (for example an overlay-added
+        // module edge, #12203) must reach the binding world: the enumerated
+        // sites alone cannot show references in an ownership frontier the
+        // selection does not place.
+        let frontier = candidate_set.completion().clone();
         let locators = candidate_set.into_seeded_locators(seeds);
         let mut candidates = Vec::new();
         for locator in locators {
@@ -1625,7 +1706,7 @@ impl SelectedResolutionOperation<'_, '_> {
                     .map(|root| (PathBuf::from(root), locator.clone())),
             );
         }
-        Ok(Some(candidates))
+        Ok(Some((candidates, frontier)))
     }
 
     fn overlay_reverse_locators(
@@ -1754,9 +1835,24 @@ impl SelectedResolutionOperation<'_, '_> {
         extra_names: &[String],
         cancellation: &CancellationToken,
     ) -> Result<Option<RustReverseCandidateSet>> {
+        Ok(self
+            .rust_reverse_candidate_set_with_reason(target, extra_names, cancellation)?
+            .ok())
+    }
+    fn rust_reverse_candidate_set_with_reason(
+        &self,
+        target: &CodeUnit,
+        extra_names: &[String],
+        cancellation: &CancellationToken,
+    ) -> Result<
+        std::result::Result<
+            RustReverseCandidateSet,
+            crate::analyzer::store::resolution_selection::MissingDefinitionReason,
+        >,
+    > {
         #[cfg(any(test, feature = "test-support"))]
         CANDIDATE_SET_ENUMERATIONS.with(|count| count.set(count.get() + 1));
-        nominate_reverse_target(
+        super::reverse_nomination::nominate_reverse_target_with_reason(
             self,
             &RustReverseNominationHooks(self),
             target,
@@ -1797,6 +1893,30 @@ impl ReverseNominationHooks for RustReverseNominationHooks<'_, '_, '_> {
         cancellation: &CancellationToken,
     ) -> Result<Vec<SelectedSemanticLocator>> {
         self.0.overlay_reverse_locators(mount, name, cancellation)
+    }
+    fn target_frontier(
+        &self,
+        target: &CodeUnit,
+        definition: SemanticId,
+    ) -> Result<super::reverse_nomination::ReverseTargetFrontier> {
+        use super::reverse_nomination::ReverseTargetFrontier;
+        let conn = self.0.ready.inventory.connection();
+        if conn
+            .prepare_cached(UNPLACED_DECLARING_FILE_SQL)?
+            .exists([crate::path_utils::rel_path_string(target.source())])?
+        {
+            return Ok(ReverseTargetFrontier::Unavailable(
+                crate::analyzer::store::resolution_selection::MissingDefinitionReason::UnplacedDefinition,
+            ));
+        }
+        let completion = if conn.prepare_cached(OVERLAY_FRONTIER_SQL)?.exists([])? {
+            ResolutionCompletion::incomplete([ResolutionIncompleteReason::OverlayFrontierUnknown(
+                definition,
+            )])
+        } else {
+            ResolutionCompletion::Complete
+        };
+        Ok(ReverseTargetFrontier::Placed(completion))
     }
     fn exposure_seeds(
         &self,
@@ -2113,7 +2233,7 @@ struct RustReverseOwner {
     summary_digest: [u8; 32],
     output_digest: [u8; 32],
     producer_epoch: String,
-    derivation_version: i64,
+    derivation_identity: [u8; 32],
     source_member: i64,
     source_module: String,
     source_kind: String,
@@ -2212,7 +2332,7 @@ fn required_reverse_domain(
             summary_digest: row.get(6)?,
             output_digest: row.get(7)?,
             producer_epoch: row.get(8)?,
-            derivation_version: row.get(9)?,
+            derivation_identity: row.get(9)?,
             source_member: row.get(10)?,
             source_module: row.get(11)?,
             source_kind: row.get(12)?,
@@ -2797,8 +2917,13 @@ struct RustReverseQueries<'a, 'store, 'input> {
 impl RustReverseQueries<'_, '_, '_> {
     /// Record why a target has no selected definition, and return it. The
     /// enclosing operation reports it as its outcome.
-    fn missing_definition_unit(&mut self, target: &CodeUnit) -> SelectedResolutionUnavailable {
+    fn missing_definition_unit(
+        &mut self,
+        target: &CodeUnit,
+        reason: crate::analyzer::store::resolution_selection::MissingDefinitionReason,
+    ) -> SelectedResolutionUnavailable {
         let reason = SelectedResolutionUnavailable::MissingDefinitionUnit {
+            reason,
             storage_language: "rust".into(),
             persisted_relative_path: crate::path_utils::rel_path_string(target.source()),
         };
@@ -3080,6 +3205,7 @@ fn prepare_reference_partition(
         SelectedRustDefinitionSemanticOutcome::Missing => {
             return Ok(SelectedResolutionOperationOutcome::Unavailable(
                 SelectedResolutionUnavailable::MissingDefinitionUnit {
+            reason: crate::analyzer::store::resolution_selection::MissingDefinitionReason::UncertifiedDefinition,
                     storage_language: "rust".to_owned(),
                     persisted_relative_path: crate::path_utils::rel_path_string(
                         retention.target.source(),
@@ -3560,6 +3686,35 @@ impl RustReverseQueries<'_, '_, '_> {
         }
     }
 
+    /// Whether a type-prefix answer's only remaining doubt is a request-minted
+    /// external member boundary. A built-in derive's trait item lives in
+    /// unindexed `core`, but the derive proves the item and the prefix's
+    /// binding to the target type. The member body is the terminal's own
+    /// binding doubt, not a gap in which type references this file can name.
+    fn type_prefix_has_only_external_member_boundaries(
+        selected: &SelectedResolutionOperation<'_, '_>,
+        completion: &ResolutionCompletion,
+    ) -> bool {
+        let ResolutionCompletion::Incomplete(reasons) = completion else {
+            return false;
+        };
+        !reasons.is_empty()
+            && reasons.iter().all(|reason| {
+                matches!(
+                    reason,
+                    ResolutionIncompleteReason::OpenBoundary {
+                        semantic,
+                        status:
+                            crate::analyzer::structural::BoundaryStatus::ExternalDeclaredUnindexed,
+                    } if selected
+                        .ready
+                        .context_identities
+                        .named_reason(*semantic)
+                        .is_some_and(|(kind, _)| kind == "rust_builtin_derive_member")
+                )
+            })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn classify_confirmed_answer(
         selected: &mut SelectedResolutionOperation<'_, '_>,
@@ -3838,7 +3993,13 @@ impl RustReverseQueries<'_, '_, '_> {
             completion = ResolutionCompletion::Complete;
         }
         let concrete_prefix = (wrong_target_dependency || !answer_targets.is_empty())
-            && completion == ResolutionCompletion::Complete;
+            && (completion == ResolutionCompletion::Complete
+                || (answer_bound
+                    && type_prefix_references.contains(&reference)
+                    && Self::type_prefix_has_only_external_member_boundaries(
+                        selected,
+                        &completion,
+                    )));
         // A complete empty binding can close local applicability,
         // but does not prove an unresolved qualified route absent.
         // Require evidence in every root before closing that
@@ -4026,14 +4187,26 @@ impl RustReverseQueries<'_, '_, '_> {
         &mut self,
         targets: &[CodeUnit],
     ) -> Result<Option<Vec<RustReverseCandidateSet>>> {
+        let mut missing_reason = crate::analyzer::store::resolution_selection::MissingDefinitionReason::UncertifiedDefinition;
         match group_reverse_inputs(targets, |target| {
-            self.selected
-                .rust_reverse_candidate_set(target, &[], self.cancellation)
+            Ok(
+                match self.selected.rust_reverse_candidate_set_with_reason(
+                    target,
+                    &[],
+                    self.cancellation,
+                )? {
+                    Ok(set) => Some(set),
+                    Err(reason) => {
+                        missing_reason = reason;
+                        None
+                    }
+                },
+            )
         })? {
             std::ops::ControlFlow::Continue(sets) => Ok(Some(sets)),
             std::ops::ControlFlow::Break(ordinal) => {
                 if !self.cancellation.is_cancelled() {
-                    self.missing_definition_unit(&targets[ordinal]);
+                    self.missing_definition_unit(&targets[ordinal], missing_reason);
                 }
                 Ok(None)
             }
@@ -4079,7 +4252,7 @@ impl RustReverseQueries<'_, '_, '_> {
                 }
                 SelectedRustDefinitionSemanticOutcome::Missing => {
                     return Ok(SelectedRustReverseBatchOutcome::Unavailable(
-                        self.missing_definition_unit(target),
+                        self.missing_definition_unit(target, crate::analyzer::store::resolution_selection::MissingDefinitionReason::UncertifiedDefinition),
                     ));
                 }
             };
@@ -4683,23 +4856,30 @@ impl RustReverseQueries<'_, '_, '_> {
                     {
                         return Ok(None);
                     }
-                    let open_surface = ResolutionIncompleteReason::OpenBoundary {
-                        semantic: dependency.dependent,
-                        status:
-                            crate::analyzer::structural::BoundaryStatus::ExternalDeclaredUnindexed,
-                    };
                     let local_reasons = dependency
                         .prerequisites
                         .iter()
                         .flat_map(|prefix| local_prefix_reasons.get(prefix).into_iter().flatten())
                         .copied()
                         .collect::<HashSet<_>>();
+                    // A proven prerequisite proves the terminal's prefix is
+                    // the target. The terminal's external member boundaries
+                    // describe the member's unindexed body, not a gap in the
+                    // type-reference inventory; the site's binding row keeps
+                    // that doubt.
                     Ok(Some(
                         dependency
                             .proof
                             .iter()
                             .filter(|(reason, _)| {
-                                *reason == open_surface || local_reasons.contains(reason)
+                                matches!(
+                                    reason,
+                                    ResolutionIncompleteReason::OpenBoundary {
+                                        status: crate::analyzer::structural::BoundaryStatus::
+                                            ExternalDeclaredUnindexed,
+                                        ..
+                                    }
+                                ) || local_reasons.contains(reason)
                             })
                             .map(|(_, handle)| handle.clone())
                             .collect(),
@@ -4850,6 +5030,7 @@ impl RustReverseQueries<'_, '_, '_> {
                 &inventory_completion,
                 self.cancellation,
             )?;
+            let inventory_completion = inventory_completion.combine(&candidate_set.completion);
             if inventory_completion.contains_reason(ResolutionIncompleteReason::Cancelled) {
                 return Ok(SelectedRustReverseBatchOutcome::Cancelled);
             }
@@ -5007,6 +5188,17 @@ impl RustReverseQueries<'_, '_, '_> {
 /// The callback reads through the operation's reader while holding its read
 /// frame. Product stores supply independent pooled readers for ordinary reads.
 impl SelectedRustReverseQueries for RustReverseQueries<'_, '_, '_> {
+    fn diagnostic_definitions(
+        &mut self,
+        definitions: &[SemanticId],
+    ) -> Result<Option<Vec<native_units::SelectedDiagnosticIdentity>>> {
+        native_units::diagnostic_definition_units(
+            &self.selected.ready,
+            definitions,
+            self.cancellation,
+        )
+    }
+
     fn unenumerable_member_dispatch(&mut self, target: &CodeUnit) -> Result<Option<bool>> {
         let definition = match self
             .selected
@@ -5227,7 +5419,8 @@ mod tests {
     #[test]
     #[hardwon("#9755: reverse confirmation attached a second trace on one connection")]
     fn reverse_sql_trace_attaches_once_per_connection() {
-        let connection = brokk_bifrost_core::cache_db::open_in_memory_store_connection().unwrap();
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        brokk_bifrost_core::cache_db::sql_profile::install_catalog_session(&connection);
         attach_reverse_sql_work_trace(&connection);
         attach_reverse_sql_work_trace(&connection);
         assert_eq!(REVERSE_SQL_GUARD.with(|slot| slot.borrow().len()), 1);
@@ -5276,9 +5469,10 @@ mod tests {
                 "{state:?}: reverse dependency closure must seek live child summaries by unit key: {plan:?}"
             );
             assert!(
-                plan.iter()
-                    .any(|line| { line.contains("SEARCH a USING PRIMARY KEY (mount_ordinal=?)") }),
-                "{state:?}: selected module placements must seek materialized rows by mount: {plan:?}"
+                plan.iter().any(|line| {
+                    line.contains("SEARCH mount USING PRIMARY KEY (mount_ordinal=?)")
+                }),
+                "{state:?}: selected module placements must seek the mount by ordinal: {plan:?}"
             );
             assert!(
                 plan.iter().any(|line| {
@@ -5453,7 +5647,7 @@ mod tests {
                 "SEARCH context USING PRIMARY KEY (blob_id=? AND occurrence_id=?)",
                 "source_rust_item_macro_expansions_fk_context_occurrence_id (context_occurrence_id=? AND blob_id=?)",
                 "source_rust_macro_definitions_fk_context_occurrence_id (context_occurrence_id=? AND blob_id=?)",
-                "SEARCH member USING INDEX resolution_unit_summary_members_blob",
+                "resolution_unit_summary_members_path (rel_path=?)",
             ] {
                 assert!(
                     plan.iter().any(|line| line.contains(required)),

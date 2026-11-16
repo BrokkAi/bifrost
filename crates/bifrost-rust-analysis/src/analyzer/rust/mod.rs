@@ -1,3 +1,4 @@
+use brokk_bifrost_analysis::analyzer::QueryReadIncomplete;
 use brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport;
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::{
     SelectedResolutionOperationInput, SelectedResolutionOperationOpenOutcome,
@@ -14,8 +15,12 @@ use crate::analyzer::rust::source_storage::RustSourceStorage;
 #[doc(hidden)]
 pub mod adapter;
 mod call_conversion;
+mod candidate_macro_admission;
+mod cargo_configuration_acquisition;
 mod cargo_routes;
 mod clones;
+mod closure_captures;
+mod configuration_kinds;
 #[doc(hidden)]
 pub mod crate_identity;
 mod dependency_discovery;
@@ -32,6 +37,7 @@ pub mod generated_model;
 mod graph_support;
 mod hierarchy;
 mod imports;
+pub mod macro_binding_access;
 mod modeled_members;
 pub(crate) mod native_call_projection;
 #[doc(hidden)]
@@ -46,13 +52,17 @@ pub mod native_usages;
 mod pattern_admission;
 #[doc(hidden)]
 pub mod route_kinds;
+pub mod toolchain;
 mod toolchain_evidence;
 mod trait_applicability;
+mod type_proof_source;
 mod value_type_barriers;
 
 pub use crate::analyzer::rust::native_usages::RustNativeUsageStrategy;
 pub(crate) mod prefetch;
 mod rustdoc_artifact;
+mod rustdoc_sysroot;
+pub use rustdoc_sysroot::VerifiedSysrootDocuments;
 pub(crate) mod selected_projection;
 #[doc(hidden)]
 pub mod selected_reverse;
@@ -200,6 +210,21 @@ fn standard_deref_trait(evidence: &SelectedTypeHeadEvidence<'_>) -> bool {
 }
 
 impl brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport for RustSupport {
+    fn publish_native_source_rows(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        blob: i64,
+        facts: &brokk_bifrost_core::analyzer::resolution_facts::FileResolutionFacts,
+        cancellation: &brokk_bifrost_analysis::CancellationToken,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<()> {
+        brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_macro_types::publish(
+            tx,
+            blob,
+            facts,
+            cancellation,
+        )
+    }
+
     fn demand_installer(
         &self,
     ) -> Option<brokk_bifrost_analysis::analyzer::store::resolution_operation::NativeDemandInstaller>
@@ -539,6 +564,102 @@ impl brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport for RustSuppo
             _ => None,
         }
     }
+    fn acquire_configuration_inputs(
+        &self,
+        project: &dyn Project,
+        inputs: &mut Vec<brokk_bifrost_analysis::analyzer::store::WorkspaceConfigurationInput>,
+    ) -> std::io::Result<()> {
+        use brokk_bifrost_analysis::analyzer::store::WorkspaceConfigurationInput;
+        // Lossy local input is not supplied as exact text. Acquisition reads
+        // its snapshot and records Unknown; ignored legacy-masked files do not
+        // poison otherwise complete configuration.
+        let selected = inputs
+            .iter()
+            .filter(|input| input.file_present)
+            .filter_map(|input| {
+                std::str::from_utf8(input.source_bytes())
+                    .ok()
+                    .map(|source| {
+                        (
+                            ProjectFile::new(project.root(), input.relative_path()),
+                            brokk_bifrost_analysis::analyzer::ProjectSourceSnapshot::disk(source),
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+        let acquired =
+            cargo_configuration_acquisition::acquire(project, &selected, &Default::default());
+        let mut merged = inputs
+            .drain(..)
+            .filter(|input| {
+                !brokk_bifrost_rust::cargo_config::is_cargo_configuration_path(
+                    std::path::Path::new(input.relative_path()),
+                ) || acquired
+                    .local
+                    .contains_key(std::path::Path::new(input.relative_path()))
+            })
+            .map(|input| (input.relative_path().to_owned(), input))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        for (path, (source, present)) in acquired.local {
+            let path = path.to_string_lossy().replace('\\', "/");
+            merged.insert(
+                path.clone(),
+                if present {
+                    WorkspaceConfigurationInput::new(path, source.source().as_bytes().into())
+                } else {
+                    WorkspaceConfigurationInput::absent(path)
+                },
+            );
+        }
+        inputs.extend(merged.into_values());
+        WorkspaceConfigurationInput::attach_rust_cargo_external_reads(
+            inputs,
+            acquired.external_reads,
+        );
+        WorkspaceConfigurationInput::attach_rust_cargo_acquisition(inputs, acquired.view);
+        Ok(())
+    }
+
+    fn selected_dependency_file_evidence_with_rust_config(
+        &self,
+        root: &std::path::Path,
+        selected: &[(
+            ProjectFile,
+            brokk_bifrost_analysis::analyzer::ProjectSourceSnapshot,
+            Option<bool>,
+        )],
+        acquired: Option<&brokk_bifrost_rust::cargo_config::acquired::RustCargoAcquiredConfigView>,
+        limits: &brokk_bifrost_analysis::analyzer::semantic_model::DependencyFileEvidenceLimits,
+    ) -> brokk_bifrost_analysis::analyzer::semantic_model::DependencyFileEvidence {
+        let configuration = acquired
+            .map(|view| {
+                brokk_bifrost_rust::cargo_config::RustCargoConfiguration::from_acquired_view(
+                    view,
+                    selected.iter().map(|(file, source, present)| {
+                        (
+                            file.rel_path(),
+                            source.oid(),
+                            *present,
+                            source.source().as_bytes(),
+                        )
+                    }),
+                )
+            })
+            .unwrap_or_default();
+        let present = selected
+            .iter()
+            .filter(|(_, _, present)| *present != Some(false))
+            .map(|(file, source, _)| (file.clone(), source.clone()))
+            .collect::<Vec<_>>();
+        file_dependency_evidence::rust_file_dependency_evidence_with_config_view(
+            root,
+            &present,
+            &configuration,
+            limits,
+            None,
+        )
+    }
+
     fn selected_dependency_file_evidence(
         &self,
         root: &std::path::Path,
@@ -551,6 +672,7 @@ impl brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport for RustSuppo
     ) -> brokk_bifrost_analysis::analyzer::semantic_model::DependencyFileEvidence {
         let selected = selected
             .iter()
+            .filter(|(_, _, present)| *present != Some(false))
             .map(|(file, source, _)| (file.clone(), source.clone()))
             .collect::<Vec<_>>();
         rust_file_dependency_evidence(root, &selected, limits, None)
@@ -566,6 +688,9 @@ pub mod source_publication;
 #[doc(hidden)]
 pub mod source_storage;
 pub(crate) mod std_types;
+
+#[doc(hidden)]
+pub use std_types::normalize_std_model_type;
 
 pub use crate::analyzer::rust::std_types::RustNativeObligationProof;
 
@@ -651,7 +776,7 @@ use brokk_bifrost_core::analyzer::model::Range;
 
 use brokk_bifrost_core::analyzer::model::SignatureMetadata;
 
-use brokk_bifrost_core::analyzer::model::StructuredImportPath;
+use brokk_bifrost_core::analyzer::model::{StructuredImportPath, StructuredImportPathKind};
 
 use brokk_bifrost_core::analyzer::model::TestAssertionSmell;
 
@@ -718,8 +843,29 @@ thread_local! {
 /// for one query. They scale with the workspace, so they live in the query
 /// scope's request memos and are dropped with the outermost scope; no analyzer
 /// field holds them.
+struct RustRouteReplayRecipe {
+    selection: [u8; 32],
+    scope: [u8; 32],
+    stage: (u64, u64),
+    content: Vec<
+        brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedContentComparison,
+    >,
+}
+
+#[cfg(test)]
+thread_local! {
+    static ROUTE_TOPOLOGY_BLOB_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Default)]
 struct RustRouteRequestMemo {
+    // The OIDs compared for this operation, re-read before each route replay.
+    route_replay_recipe: std::sync::Mutex<Option<RustRouteReplayRecipe>>,
+    /// (Main blob OID, overlay blob OID) pairs whose published route topology
+    /// is proven equal. Published facts of a blob never change, so a proven
+    /// pair stays proven; only successes are kept.
+    route_topology_kept: std::sync::Mutex<HashSet<(String, String)>>,
+    declaration_facts: KeyedPoolSafeMemo<String, RustRouteMemoEntry<Arc<RustDeclarationFacts>>>,
     package_files: brokk_bifrost_core::analyzer::pool_memo::PoolSafeMemo<
         RustRouteMemoEntry<RustWholePackageIndex>,
     >,
@@ -731,18 +877,24 @@ struct RustRouteRequestMemo {
     /// reasons the demand recorded. The map lives in `QueryRequestMemos`, which
     /// `reset_request_caches` replaces at each outermost scope transition: an
     /// answer is never served to another request. An entry holds no read frame,
-    /// no inventory and no revision; the frame that built it is closed when the
+    /// no inventory; its key retains certified Main lineage and revision; the frame that built it is closed when the
     /// build returns, and a later consumer opens its own.
-    file_routes: KeyedPoolSafeMemo<String, RustRouteMemoEntry<RustFileRoutes>>,
+    file_routes: KeyedPoolSafeMemo<RustRouteQuestionKey, RustRouteMemoEntry<RustFileRoutes>>,
     /// Declaration facts by workspace-relative path, including incomplete fills.
     /// The whole receipt replays reads and stable gaps on hits, and entries die
     /// with the request just like `file_routes`.
-    declaration_facts: KeyedPoolSafeMemo<String, RustRouteMemoEntry<Arc<RustDeclarationFacts>>>,
     /// The package questions of [`RustPackageView`], by package name.
     package_files_of:
         KeyedPoolSafeMemo<String, RustRouteMemoEntry<RustRoutedAnswer<Vec<ProjectFile>>>>,
-    /// Whether a file is a member of any package, by workspace-relative path.
     package_membership: KeyedPoolSafeMemo<String, RustRouteMemoEntry<RustRoutedAnswer<bool>>>,
+    /// Strict Main proofs have separate memos from selected, possibly partial answers.
+    certified_package_files_of: KeyedPoolSafeMemo<
+        RustRouteQuestionKey,
+        RustRouteMemoEntry<RustRoutedAnswer<Vec<ProjectFile>>>,
+    >,
+    /// Whether a file is a member of any package, by workspace-relative path.
+    certified_package_membership:
+        KeyedPoolSafeMemo<RustRouteQuestionKey, RustRouteMemoEntry<RustRoutedAnswer<bool>>>,
     /// The packages a crate name's library and binary roots sit in, by
     /// normalized crate name.
     crate_package_names:
@@ -789,35 +941,64 @@ impl RustPackageView<'_> {
             package.to_owned(),
             progress,
             |derivations, inventory, incomplete| {
-                let (units, mut complete) = source.demanded::<route_kinds::RustPackageUnits>(
-                    derivations,
-                    inventory,
-                    &package.to_owned(),
-                )?;
-                let root = source.inner.project().root().to_path_buf();
-                let mut files = Vec::new();
-                for (unit, _) in units.iter() {
-                    let (rows, rows_complete) = source
-                        .demanded::<route_kinds::RustUnitPackageRows>(
-                            derivations,
-                            inventory,
-                            unit,
-                        )?;
-                    complete &= source.note_incomplete_unit(unit, rows_complete, incomplete);
-                    files.extend(
-                        rows.iter()
-                            .filter(|row| row.package_components.join(".") == package)
-                            .map(|row| ProjectFile::new(root.clone(), &row.rel_path)),
-                    );
-                }
-                files.sort();
-                files.dedup();
-                Ok(RustRoutedAnswer {
-                    value: files,
-                    complete,
-                })
+                self.compose_package_files(package, derivations, inventory, incomplete)
             },
         )
+    }
+
+    /// A closed Main proof of the package file inventory.
+    pub fn certified_files_in_package(
+        &self,
+        package: &str,
+        progress: Option<&dyn Fn() -> bool>,
+    ) -> Result<RustRoutedAnswer<Vec<ProjectFile>>, RustCargoRouteError> {
+        let source = self.source;
+        source.certified_package_question(
+            |memo| &memo.certified_package_files_of,
+            package.to_owned(),
+            progress,
+            |derivations, inventory, incomplete| {
+                self.compose_package_files(package, derivations, inventory, incomplete)
+            },
+        )
+    }
+
+    fn compose_package_files(
+        &self,
+        package: &str,
+        derivations: &brokk_bifrost_analysis::analyzer::derivation_host::AnalyzerDerivations,
+        inventory: &brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionMountInventory<'_>,
+        incomplete: &mut Vec<[u8; 32]>,
+    ) -> Result<RustRoutedAnswer<Vec<ProjectFile>>, UnavailableCause> {
+        let source = self.source;
+        {
+            let (units, mut complete) = source.demanded::<route_kinds::RustPackageUnits>(
+                derivations,
+                inventory,
+                &package.to_owned(),
+            )?;
+            let root = source.inner.project().root().to_path_buf();
+            let mut files = Vec::new();
+            for (unit, _) in units.iter() {
+                let (rows, rows_complete) = source.demanded::<route_kinds::RustUnitPackageRows>(
+                    derivations,
+                    inventory,
+                    unit,
+                )?;
+                complete &= source.note_incomplete_unit(unit, rows_complete, incomplete);
+                files.extend(
+                    rows.iter()
+                        .filter(|row| row.package_components.join(".") == package)
+                        .map(|row| ProjectFile::new(root.clone(), &row.rel_path)),
+                );
+            }
+            files.sort();
+            files.dedup();
+            Ok(RustRoutedAnswer {
+                value: files,
+                complete,
+            })
+        }
     }
 
     /// Whether `file` is a member of some unit's package listing. `false` is
@@ -837,6 +1018,7 @@ impl RustPackageView<'_> {
                 let (units, mut complete) =
                     source.demanded::<route_kinds::RustFileUnits>(derivations, inventory, &path)?;
                 let mut found = false;
+                let mut compiled = false;
                 for unit in units.iter() {
                     let (rows, rows_complete) = source
                         .demanded::<route_kinds::RustUnitPackageRows>(
@@ -845,7 +1027,110 @@ impl RustPackageView<'_> {
                             unit,
                         )?;
                     complete &= source.note_incomplete_unit(unit, rows_complete, incomplete);
-                    found |= rows.iter().any(|row| row.rel_path == path);
+                    for row in rows.iter().filter(|row| row.rel_path == path) {
+                        found = true;
+                        // A file no target compiles gets a synthetic detached
+                        // unit that holds only it. That unit does not compile
+                        // it either.
+                        compiled |= row.target_kind != "detached";
+                    }
+                }
+                // Only a detached unit lists the file. When a real unit places
+                // it solely under an inactive or unknown `cfg`, no build
+                // compiles it, so the listing does not prove it a member
+                // (#11639).
+                if found && !compiled {
+                    let (placed, placed_complete) = source
+                        .demanded::<route_kinds::RustBroadFileUnits>(
+                            derivations,
+                            inventory,
+                            &path,
+                        )?;
+                    complete &= placed_complete;
+                    for unit in placed.iter() {
+                        let (fragment, fragment_complete) = source
+                            .demanded::<route_kinds::RustUnitRoutes>(
+                                derivations,
+                                inventory,
+                                unit,
+                            )?;
+                        complete &=
+                            source.note_incomplete_unit(unit, fragment_complete, incomplete);
+                        if fragment.inactive.contains(file) {
+                            complete = false;
+                            incomplete.push(*unit.key());
+                        }
+                    }
+                }
+                if !found
+                    && brokk_bifrost_analysis::analyzer::store::rust_unit_summaries::rust_added_edge_targets_path(
+                        inventory.connection(),
+                        &path,
+                    )
+                    .map_err(|error| {
+                        source.inner.record_store_error(error);
+                        UnavailableCause::Failed("reading selected Rust added-edge targets".into())
+                    })?
+                {
+                    complete = false;
+                }
+                Ok(RustRoutedAnswer {
+                    value: found,
+                    complete,
+                })
+            },
+        )
+    }
+
+    /// Whether `file` is a member of some unit's package listing. `false` is
+    /// only a proof of absence when the answer is complete.
+    /// Strict Main membership; detached-only listings cannot close this proof.
+    pub fn certified_contains(
+        &self,
+        file: &ProjectFile,
+        progress: Option<&dyn Fn() -> bool>,
+    ) -> Result<RustRoutedAnswer<bool>, RustCargoRouteError> {
+        let source = self.source;
+        let path = brokk_bifrost_core::path_utils::workspace_relative_slash_path(file.rel_path());
+        source.certified_package_question(
+            |memo| &memo.certified_package_membership,
+            path.clone(),
+            progress,
+            |derivations, inventory, incomplete| {
+                let (units, mut complete) =
+                    source.demanded::<route_kinds::RustFileUnits>(derivations, inventory, &path)?;
+                let mut found = false;
+                let mut compiled = false;
+                for unit in units.iter() {
+                    let (rows, rows_complete) = source
+                        .demanded::<route_kinds::RustUnitPackageRows>(
+                            derivations,
+                            inventory,
+                            unit,
+                        )?;
+                    complete &= source.note_incomplete_unit(unit, rows_complete, incomplete);
+                    for row in rows.iter().filter(|row| row.rel_path == path) {
+                        found = true;
+                        // A file no target compiles gets a synthetic detached
+                        // unit that holds only it. That unit does not compile
+                        // it either.
+                        compiled |= row.target_kind != "detached";
+                    }
+                }
+                // Detached-only membership needs broader route demands. It is
+                // available to general queries, but cannot certify this proof.
+                complete &= !found || compiled;
+                if !found
+                    && brokk_bifrost_analysis::analyzer::store::rust_unit_summaries::rust_added_edge_targets_path(
+                        inventory.connection(),
+                        &path,
+                    )
+                    .map_err(|error| {
+                        source.inner.record_store_error(error);
+                        UnavailableCause::Failed("reading selected Rust added-edge targets".into())
+                    })?
+                {
+                    complete = false;
                 }
                 Ok(RustRoutedAnswer {
                     value: found,
@@ -904,6 +1189,20 @@ impl RustPackageView<'_> {
 /// consumer in the same outer scope (another policy unit) replays the receipt,
 /// so its ledger holds every read the fill recorded, such as the file key of a
 /// refused member, and not only the stable incompleteness reasons.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RustRouteQuestionKey {
+    nonce: [u8; 16],
+    snapshot: brokk_bifrost_analysis::analyzer::store::WorkspaceSnapshotId,
+    subject: String,
+}
+impl std::hash::Hash for RustRouteQuestionKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&self.nonce, state);
+        std::hash::Hash::hash(&self.snapshot.revision, state);
+        std::hash::Hash::hash(&self.subject, state);
+    }
+}
+
 struct RustRouteMemoEntry<T> {
     value: Arc<T>,
     receipt: brokk_bifrost_analysis::analyzer::common::QueryCacheBuildReceipt,
@@ -1008,7 +1307,7 @@ impl brokk_bifrost_core::retention_budget::RetainedBytes for RustDeclarationFact
         };
         std::mem::size_of::<Self>()
             .saturating_add(facts)
-            .saturating_add(self.value.retained_receipt_bytes())
+            .saturating_add(self.value.allocated_receipt_bytes())
     }
 
     fn eviction_bytes(&self) -> usize {
@@ -1018,12 +1317,13 @@ impl brokk_bifrost_core::retention_budget::RetainedBytes for RustDeclarationFact
         };
         std::mem::size_of::<Self>()
             .saturating_add(facts)
-            .saturating_add(self.value.retained_receipt_bytes())
+            .saturating_add(self.value.allocated_receipt_bytes())
     }
 }
 
 #[derive(Clone)]
 pub struct RustAnalyzer {
+    toolchain_observation: toolchain::ToolchainAuthority,
     #[doc(hidden)]
     pub inner: TreeSitterAnalyzer<RustAdapter>,
     _retention_budget: brokk_bifrost_core::retention_budget::RetentionBudget,
@@ -1079,14 +1379,50 @@ pub(crate) struct RustSelectedOperationOpenReport<'analyzer> {
     pub(crate) store_open_attempted: bool,
 }
 
+/// A persisted unit key and its route-input token.
+#[cfg(any(test, feature = "test-support"))]
+pub type RustUnitInputToken = ([u8; 32], [u8; 32]);
+
 impl RustAnalyzer {
+    pub fn prepared_toolchain_observation(&self) -> Option<Arc<toolchain::PreparedToolchain>> {
+        self.toolchain_observation.prepared()
+    }
+    // Keep language services on the shared input path for every Rust surface.
+    pub(crate) fn selected_resolution_operation_input<'project: 'selection, 'selection>(
+        &'project self,
+        snapshots: &'selection brokk_bifrost_analysis::analyzer::store::WorkspaceSnapshots,
+        languages: &'selection [brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionLanguage],
+        masks: &'selection [brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionOverlayMask],
+    ) -> SelectedResolutionOperationInput<'project, 'selection> {
+        SelectedResolutionOperationInput::new(
+            self.inner.project(),
+            self.inner.workspace_id(),
+            snapshots,
+            languages,
+            masks,
+        )
+        .with_rust_read_attribution(Arc::new(
+            brokk_bifrost_analysis::analyzer::selected_services::AnalyzerSelectedServices(self),
+        ))
+        .with_binary_operation_type_provider(Arc::new(
+            call_conversion::RustBinaryOperationTypeProvider {
+                analyzer: self,
+                cache: Default::default(),
+            },
+        ))
+    }
+
     pub(crate) fn update_all_with_progress(
         &self,
         progress: Option<brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::BuildProgress>,
     ) -> Self {
         brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
             let inner = self.inner.update_all_with_progress(progress);
-            Self::from_inner(inner)
+            let mut updated = Self::from_inner(inner);
+            updated.toolchain_observation = self
+                .toolchain_observation
+                .clone_for_project(updated.inner.shared_project());
+            updated
         })
     }
 
@@ -1095,17 +1431,24 @@ impl RustAnalyzer {
     ) -> brokk_bifrost_analysis::analyzer::store::Result<
         Option<Arc<brokk_bifrost_analysis::analyzer::store::dependency_file_evidence::ScopedDependencyEvidence>>,
     >{
-        brokk_bifrost_analysis::analyzer::store::dependency_file_evidence::publish_overlay(
+        let refresh = !inner.configuration_acquisition_inputs_complete()
+            || inner
+                .configuration_external_reads()
+                .iter()
+                .any(|read| !read.still_matches());
+        brokk_bifrost_analysis::analyzer::store::dependency_file_evidence::publish_overlay_with_rust_refresh(
             inner.analyzer_store(),
             &inner.selected_workspace_snapshots(),
             inner.project(),
             Language::Rust,
+            refresh,
         )
     }
 
     fn from_inner(inner: TreeSitterAnalyzer<RustAdapter>) -> Self {
         let budget = inner.analyzer_store().retention_budget().clone();
         Self {
+            toolchain_observation: toolchain::ToolchainAuthority::new(inner.shared_project()),
             dependency_evidence_overlay: Self::capture_dependency_overlay(&inner),
             _retention_budget: budget.clone(),
             inner,
@@ -1167,6 +1510,7 @@ impl RustAnalyzer {
                         cancellation,
                     )?;
                 if let SelectedResolutionMountInventoryOutcome::Ready(inventory) = &outcome {
+                    inventory.capture_project_overlay_oids(self.project())?;
                     inventory.stamp_declared_rust_route_recipe();
                 }
                 Ok(outcome)
@@ -1186,7 +1530,7 @@ impl RustAnalyzer {
     /// The read frame a route question needs while this thread owns `operation`.
     ///
     /// A route question asked inside a selected operation must borrow that
-    /// operation's selection (`with_read_frame` answers `ValidationFailed`
+    /// operation's selection (`with_read_frame` answers `MissingOperationReadFrame`
     /// otherwise, and nothing falls back to opening another one). Every site
     /// that opens a Rust selected operation and runs analyzer code under it holds
     /// this frame while it does. The frame owns a clone of the operation's
@@ -1206,6 +1550,9 @@ impl RustAnalyzer {
         let mut identity = rust_route_question_identity(self, self.analyzer_store(), snapshot);
         identity.selection = Some(operation.ready.inventory.fingerprint());
         identity.operation = Some(operation as *const _ as usize);
+        // This frame is entered after the caller has selected its unit scope.
+        // Certify configuration reads against that scope and its exact OIDs.
+        operation.ready.inventory.stamp_declared_rust_route_recipe();
         OperationReadFrame::enter(identity, operation).map_err(|cause| {
             brokk_bifrost_analysis::analyzer::store::StoreError::new(format!(
                 "Rust operation read frame unavailable: {cause:?}"
@@ -1217,13 +1564,17 @@ impl RustAnalyzer {
         &self,
         file: &ProjectFile,
         exposed: &str,
-    ) -> Option<String> {
+    ) -> Result<String, String> {
         use brokk_bifrost_semantic::analyzer::semantic::derivation::Demanded;
-        let derivations = self.inner.derivations()?;
+        let derivations = self
+            .inner
+            .derivations()
+            .ok_or_else(|| "dependency derivations unavailable".to_owned())?;
         let snapshot = self
             .inner
             .selected_workspace_snapshots()
-            .get("rust")?
+            .get("rust")
+            .ok_or_else(|| "selected Rust snapshot unavailable".to_owned())?
             .clone();
         self.with_rust_route_inventory(snapshot, |inventory| {
             Ok((|| {
@@ -1237,7 +1588,7 @@ impl RustAnalyzer {
                     ..
                 } = unit_answer
                 else {
-                    return None;
+                    return Err("selected file units unavailable or incomplete".to_owned());
                 };
                 let mut selected = None;
                 for unit in units.iter() {
@@ -1251,33 +1602,30 @@ impl RustAnalyzer {
                         unit.key(),
                     )
                     else {
-                        return None;
+                        return Err("selected dependency identities unavailable or incomplete".to_owned());
                     };
                     let nearest = identities
                         .iter()
                         .filter(|(_, name, _)| name == exposed)
                         .collect::<Vec<_>>();
                     if nearest.is_empty() {
-                        return None;
+                        return Err(format!("selected dependency {exposed:?} unavailable"));
                     }
                     for (_, _, package) in nearest {
-                        if package.is_empty() {
-                            return None;
-                        }
+                        let package = package.0.as_ref().map_err(Clone::clone)?;
                         if selected
                             .as_ref()
                             .is_some_and(|previous| previous != package)
                         {
-                            return None;
+                            return Err(format!("selected dependency identity ambiguous: {selected:?} and {package:?}"));
                         }
                         selected = Some(package.clone());
                     }
                 }
-                selected
+                selected.ok_or_else(|| "selected file has no package identity".to_owned())
             })())
         })
-        .ok()
-        .flatten()
+        .map_err(|cause| format!("selected dependency inventory unavailable: {cause:?}"))?
     }
 
     /// Run `f` on the selected Rust inventory of `snapshot`: the active read
@@ -1361,7 +1709,16 @@ impl RustAnalyzer {
                 let roots = match derivations
                     .demand::<route_kinds::RustBroadFileUnits>(self, inventory, &path)
                 {
-                    Demanded::Available { value, .. } => value,
+                    Demanded::Available {
+                        value, complete, ..
+                    } => {
+                        if !complete {
+                            self.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceGap(
+                                "Rust broad file unit listing is incomplete".into(),
+                            ));
+                        }
+                        value
+                    }
                     Demanded::Unavailable(cause) => return Err(cause),
                 };
                 let closure = inventory
@@ -1403,14 +1760,9 @@ impl RustAnalyzer {
                 masks,
                 content_mounts,
             }) => {
-                let input = SelectedResolutionOperationInput::new(
-                    self.inner.project(),
-                    self.inner.workspace_id(),
-                    snapshots.as_ref(),
-                    &languages,
-                    &masks,
-                )
-                .with_content_mounts(content_mounts);
+                let input = self
+                    .selected_resolution_operation_input(snapshots.as_ref(), &languages, &masks)
+                    .with_content_mounts(content_mounts);
                 (
                     self.inner
                         .analyzer_store()
@@ -1891,6 +2243,9 @@ impl RustAnalyzer {
     pub fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         let mut clone = self.clone();
         clone.inner = clone.inner.clone_with_project(project);
+        clone.toolchain_observation = self
+            .toolchain_observation
+            .clone_for_project(clone.inner.shared_project());
         clone.dependency_evidence_overlay = Self::capture_dependency_overlay(&clone.inner);
         clone.imported_code_units = clone
             .inner
@@ -1935,6 +2290,9 @@ impl RustAnalyzer {
     pub(crate) fn clone_for_index_warm(&self, project: Arc<dyn Project>) -> Self {
         let mut clone = self.clone();
         clone.inner = clone.inner.clone_with_project(project);
+        clone.toolchain_observation = self
+            .toolchain_observation
+            .clone_for_project(clone.inner.shared_project());
         clone.dependency_evidence_overlay = Self::capture_dependency_overlay(&clone.inner);
         clone
     }
@@ -2014,6 +2372,230 @@ impl RustAnalyzer {
         }
     }
 
+    /// A preparation probe has no effect on the consumer's completeness.
+    fn main_route_content(
+        &self,
+        recorded: &[brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedContentComparison],
+        inventory: &brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionMountInventory<'_>,
+    ) -> Result<Vec<brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedContentComparison>, UnavailableCause>{
+        use brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedContentComparison;
+        let content = inventory
+            .selected_content_comparisons(recorded, |path| {
+                brokk_bifrost_rust::cargo_routes::is_rust_source_path(path)
+                    || RustSupport.is_configuration_input_path(path)
+            })
+            .map_err(|error| UnavailableCause::Failed(error.to_string().into()))?;
+        for compared in &content {
+            if !SelectedContentComparison::unchanged(compared) {
+                return Err(
+                    if compared.path.as_ref().is_some_and(|path| {
+                        RustSupport.is_configuration_input_path(Path::new(path))
+                    }) {
+                        UnavailableCause::ConfigurationOverlaid
+                    } else {
+                        UnavailableCause::RustMembershipOverlaid
+                    },
+                );
+            }
+        }
+        Ok(content)
+    }
+
+    /// Persisted broad-file placements remain authoritative only when every
+    /// changed source retains its published route topology. Configuration
+    /// stays an OID-level gate: no configuration edit is route-irrelevant.
+    fn selected_route_content(
+        &self,
+        inventory: &brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionMountInventory<'_>,
+        progress: Option<&dyn Fn() -> bool>,
+    ) -> Result<(), UnavailableCause> {
+        let configuration = inventory
+            .selected_content_comparisons(&[], |path| RustSupport.is_configuration_input_path(path))
+            .map_err(|error| UnavailableCause::Failed(error.to_string().into()))?;
+        let cause = if configuration.iter().any(|row| !row.unchanged()) {
+            UnavailableCause::ConfigurationOverlaid
+        } else if self.selected_route_topology_kept(inventory, progress)? {
+            return Ok(());
+        } else {
+            UnavailableCause::RustMembershipOverlaid
+        };
+        self.record_query_incomplete(QueryReadIncomplete::ProofStopped {
+            reason: if cause == UnavailableCause::ConfigurationOverlaid {
+                "ConfigurationOverlaid"
+            } else {
+                "RustMembershipOverlaid"
+            },
+            cause: Some(
+                brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause::Provider,
+            ),
+        });
+        Err(cause)
+    }
+
+    /// Whether every changed Rust source keeps its published route topology.
+    /// Each changed file is proven at most once per request, so N route reads
+    /// over N changed files hydrate facts O(N) times in total.
+    fn selected_route_topology_kept(
+        &self,
+        inventory: &brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionMountInventory<'_>,
+        progress: Option<&dyn Fn() -> bool>,
+    ) -> Result<bool, UnavailableCause> {
+        let failed = |error: brokk_bifrost_analysis::analyzer::store::StoreError| {
+            UnavailableCause::Failed(error.to_string().into())
+        };
+        let memo = self
+            .inner
+            .active_query_request_memo::<RustRouteRequestMemo>();
+        let content = inventory
+            .selected_content_comparisons(
+                &[],
+                brokk_bifrost_rust::cargo_routes::is_rust_source_path,
+            )
+            .map_err(failed)?;
+        for compared in content.iter().filter(|row| !row.unchanged()) {
+            if progress.is_some_and(|keep_going| !keep_going()) {
+                return Err(UnavailableCause::Cancelled);
+            }
+            if compared.path.is_none() || compared.removed {
+                return Ok(false);
+            }
+            let (Some(main), Some(selected)) = (&compared.main_oid, &compared.selected_oid) else {
+                return Ok(false);
+            };
+            let pair = (main.clone(), selected.clone());
+            let proven = |memo: &RustRouteRequestMemo| {
+                memo.route_topology_kept
+                    .lock()
+                    .expect("route topology memo mutex poisoned")
+                    .contains(&pair)
+            };
+            if memo.as_deref().is_some_and(proven) {
+                continue;
+            }
+            if !Self::blob_route_topology_equal(inventory, main, selected).map_err(failed)? {
+                return Ok(false);
+            }
+            if let Some(memo) = memo.as_deref() {
+                memo.route_topology_kept
+                    .lock()
+                    .expect("route topology memo mutex poisoned")
+                    .insert(pair);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Compare the published route topology of two blobs: module list, module
+    /// route scopes, include edges and inner attributes. Source ranges stay in
+    /// the comparison (conservatively refusing shifted module declarations),
+    /// except the file root's extent, which necessarily moves on a body edit.
+    fn blob_route_topology_equal(
+        inventory: &brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionMountInventory<'_>,
+        main: &str,
+        selected: &str,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<bool> {
+        use brokk_bifrost_analysis::analyzer::store::read_rust_usage_facts;
+        let (Ok(main), Ok(selected)) = (git2::Oid::from_str(main), git2::Oid::from_str(selected))
+        else {
+            return Ok(false);
+        };
+        let mut facts = Vec::new();
+        let mut attributes = Vec::new();
+        for oid in [main, selected] {
+            #[cfg(test)]
+            ROUTE_TOPOLOGY_BLOB_READS.with(|reads| reads.set(reads.get() + 1));
+            // An empty DTO without a publication witness proves nothing.
+            let published: bool = inventory.connection().query_row(
+                "SELECT EXISTS(SELECT 1 FROM rust_published_fact_blobs WHERE blob_oid=?1 AND lang='rust' AND parse_variant=x'')",
+                [oid.to_string()], |row| row.get(0))?;
+            if !published {
+                return Ok(false);
+            }
+            let mut fact = read_rust_usage_facts(
+                inventory.connection(),
+                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
+            )?;
+            let Some(root) = fact.module_routes.scopes.first_mut() else {
+                return Ok(false);
+            };
+            root.body_end = 0;
+            let Some(module) = fact.modules.first_mut() else {
+                return Ok(false);
+            };
+            if !module.module_name.is_empty() {
+                return Ok(false);
+            }
+            module.end_byte = 0;
+            facts.push((fact.modules, fact.module_routes, fact.include_edges));
+            // Inner attributes can change crate configuration without
+            // introducing a module declaration (for example cfg_attr).
+            let mut statement = inventory.connection().prepare_cached(
+                "SELECT attributes.name, attributes.arguments FROM source_rust_inner_attributes attributes JOIN blobs ON blobs.id=attributes.blob_id WHERE blobs.blob_oid=?1 AND blobs.lang='rust' AND blobs.parse_variant=x'' ORDER BY attributes.ordinal")?;
+            let rows = statement
+                .query_map([oid.to_string()], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            attributes.push(rows);
+        }
+        Ok(facts[0] == facts[1] && attributes[0] == attributes[1])
+    }
+
+    /// Check both content classes before replaying any Main route receipt.
+    /// Consumers share this gate, including external absolute-root lookup.
+    pub fn route_replay_content(
+        &self,
+        inventory: &brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionMountInventory<'_>,
+    ) -> Result<Vec<brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedContentComparison>, UnavailableCause>{
+        let checked = if let Some(memo) = self
+            .inner
+            .active_query_request_memo::<RustRouteRequestMemo>()
+        {
+            // Serialize proof updates so concurrent consumers retain every path
+            // already certified for the same selection, scope and stage epochs.
+            let mut recipe = memo
+                .route_replay_recipe
+                .lock()
+                .expect("route replay recipe mutex poisoned");
+            let selection = inventory.fingerprint();
+            let scope = inventory.scope_identity();
+            let stage = inventory.staged_read_epoch();
+            let recorded = recipe
+                .as_ref()
+                .filter(|previous| {
+                    previous.selection == selection
+                        && previous.scope == scope
+                        && previous.stage == stage
+                })
+                .map_or(&[][..], |previous| previous.content.as_slice());
+            let checked = self.main_route_content(recorded, inventory);
+            if let Ok(content) = &checked {
+                *recipe = Some(RustRouteReplayRecipe {
+                    selection,
+                    scope,
+                    stage,
+                    content: content.clone(),
+                });
+            }
+            checked
+        } else {
+            self.main_route_content(&[], inventory)
+        };
+        match checked {
+            Err(
+                cause @ (UnavailableCause::ConfigurationOverlaid
+                | UnavailableCause::RustMembershipOverlaid),
+            ) => {
+                self.record_query_incomplete(QueryReadIncomplete::ProofStopped {
+                    reason: if cause == UnavailableCause::ConfigurationOverlaid { "ConfigurationOverlaid" } else { "RustMembershipOverlaid" },
+                    cause: Some(brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause::Provider),
+                });
+                Err(cause)
+            }
+            other => other,
+        }
+    }
+
     /// The routes of the units that hold `file`: one `RustFileRoutes` composed
     /// from the per-unit kinds, memoized per file for the open query scope.
     fn file_routes(
@@ -2021,58 +2603,268 @@ impl RustAnalyzer {
         file: &ProjectFile,
         progress: Option<&dyn Fn() -> bool>,
     ) -> Result<RustFileRoutes, RustCargoRouteError> {
-        use brokk_bifrost_semantic::analyzer::semantic::derivation::Demanded;
+        let operation_active = brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_selected_operation_active();
+        let path = brokk_bifrost_core::path_utils::workspace_relative_slash_path(file.rel_path());
+        self.with_selected_route_demands(progress, |inventory| {
+            // Only an operation needs the private Main bridge. Ordinary selected
+            // reads must use their overlay facts and retain per-unit input keys.
+            if operation_active {
+                self.route_replay_content(inventory)?;
+            } else {
+                self.selected_route_content(inventory, progress)?;
+            }
+            let _classifier = brokk_bifrost_core::attribution::classifier_statements();
+            let nonce = brokk_bifrost_core::cache_db::publication_lineage::require_publication_nonce(inventory.connection())
+                .map_err(|error| UnavailableCause::Failed(error.to_string().into()))?;
+            let snapshots = inventory.languages()
+                .map_err(|error| UnavailableCause::Failed(error.to_string().into()))?
+                .iter().map(|language| (language.snapshot_id().lang.clone(), language.snapshot_id()))
+                .collect::<brokk_bifrost_analysis::analyzer::store::WorkspaceSnapshots>();
+            let key = RustRouteQuestionKey {
+                nonce,
+                snapshot: snapshots.get("rust").expect("Rust operation pins Rust").clone(),
+                subject: path,
+            };
+            // The language-level route error cannot hold UnavailableCause:
+            // bifrost-semantic depends on bifrost-rust. Failed fills are not
+            // memoized, so the Main bridge and the selected fill both retain
+            // their typed cause here through this invocation.
+            let mut selected_cause = None;
+            self.request_memoized(
+                |memo| &memo.file_routes,
+                key.clone(),
+                progress.unwrap_or(&|| true),
+                || {
+                    let cancellation = self.active_query_cancellation().unwrap_or_default();
+                    let routes = if operation_active {
+                        let (result, receipt) = brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadReceipt::capture_deferred(self, || {
+                            self.compute_main_file_routes(&key, &snapshots, file, progress, &cancellation)
+                        });
+                        receipt.replay(self);
+                        result
+                    } else {
+                        // Match the Main bridge's build-start check. The callback
+                        // records structure gaps, and a memo hit must replay them
+                        // before later listing gaps.
+                        if cancellation.is_cancelled()
+                            || progress.is_some_and(|keep_going| !keep_going())
+                        {
+                            return Err(RustCargoRouteError::Cancelled);
+                        }
+                        self.compute_selected_file_routes(inventory, &key.subject, file, progress, &cancellation)
+                    };
+                    routes.map_err(|cause| {
+                        if cause == UnavailableCause::Cancelled {
+                            RustCargoRouteError::Cancelled
+                        } else {
+                            selected_cause = Some(cause);
+                            RustCargoRouteError::Unavailable
+                        }
+                    })
+                },
+            ).map_err(|error| match error {
+                RustCargoRouteError::Cancelled => UnavailableCause::Cancelled,
+                RustCargoRouteError::Unavailable => {
+                    selected_cause.expect("an unavailable route fill retains its cause")
+                }
+            })
+        })
+    }
+
+    /// Open the identical pinned Main revision for the three named bridges.
+    /// Selection checks happen before this call; this never changes the
+    /// operation's TEMP scope or grants authority beyond the named question.
+    fn open_main_route_inventory(
+        &self,
+        expected_nonce: [u8; 16],
+        snapshots: &brokk_bifrost_analysis::analyzer::store::WorkspaceSnapshots,
+        cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+    ) -> Result<
+        Box<brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionMountInventory<'_>>,
+        UnavailableCause,
+    >{
+        use brokk_bifrost_analysis::analyzer::derivation_host::read_frame::binding_unavailable;
+        use brokk_bifrost_analysis::analyzer::store::resolution_selection::{
+            SelectedResolutionLanguage, SelectedResolutionMountInventoryOutcome,
+        };
+        let snapshot = snapshots.get("rust").expect("Rust bridge pins Rust");
+        let languages = [SelectedResolutionLanguage::new("rust", Language::Rust)];
+        let inventory = match self
+            .analyzer_store()
+            .open_selected_resolution_mount_inventory_with_content_mounts(
+                &snapshot.workspace_id,
+                snapshots,
+                &languages,
+                &[],
+                &[],
+                cancellation,
+            )
+            .map_err(binding_unavailable)?
+        {
+            SelectedResolutionMountInventoryOutcome::Ready(inventory) => inventory,
+            SelectedResolutionMountInventoryOutcome::Cancelled => {
+                return Err(UnavailableCause::Cancelled);
+            }
+            SelectedResolutionMountInventoryOutcome::Unavailable(reason) => {
+                return Err(UnavailableCause::Failed(
+                    format!("Main route inventory Unavailable({reason:?})").into(),
+                ));
+            }
+            SelectedResolutionMountInventoryOutcome::Stale(reason) => {
+                return Err(UnavailableCause::Failed(
+                    format!("Main route inventory Stale({reason:?})").into(),
+                ));
+            }
+        };
+        inventory.stamp_declared_rust_route_recipe();
+        let nonce = brokk_bifrost_core::cache_db::publication_lineage::require_publication_nonce(
+            inventory.connection(),
+        )
+        .map_err(|error| UnavailableCause::Failed(error.to_string().into()))?;
+        assert_eq!(
+            nonce, expected_nonce,
+            "Main bridge must retain operation store lineage"
+        );
+        Ok(inventory)
+    }
+
+    fn compute_main_file_routes(
+        &self,
+        key: &RustRouteQuestionKey,
+        snapshots: &brokk_bifrost_analysis::analyzer::store::WorkspaceSnapshots,
+        file: &ProjectFile,
+        progress: Option<&dyn Fn() -> bool>,
+        cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+    ) -> Result<RustFileRoutes, UnavailableCause> {
+        use brokk_bifrost_analysis::analyzer::derivation_host::{
+            read_frame, rust_route_question_identity,
+        };
+        let compute = || -> Result<RustFileRoutes, UnavailableCause> {
+            if cancellation.is_cancelled() || progress.is_some_and(|keep_going| !keep_going()) {
+                return Err(UnavailableCause::Cancelled);
+            }
+            let inventory = self.open_main_route_inventory(key.nonce, snapshots, cancellation)?;
+            let identity =
+                rust_route_question_identity(self, self.analyzer_store(), key.snapshot.clone());
+            read_frame::with_file_routes_main_bridge(identity, &inventory, || {
+                self.compute_selected_file_routes(
+                    &inventory,
+                    &key.subject,
+                    file,
+                    progress,
+                    cancellation,
+                )
+            })?
+        };
+        compute().map_err(|cause| {
+            // Preserve the query-boundary store failure before mapping the
+            // typed demand refusal to the route API. The deferred Main receipt
+            // carries it back to the operation after its frame is restored.
+            if cause != UnavailableCause::Cancelled {
+                self.inner.record_store_error(
+                    brokk_bifrost_analysis::analyzer::store::StoreError::new(format!(
+                        "Rust file routes unavailable: {cause:?}"
+                    )),
+                );
+            }
+            self.record_query_incomplete(QueryReadIncomplete::ProofStopped {
+                reason: if cause == UnavailableCause::Cancelled { "Cancelled" } else { "RustMainRouteBridgeUnavailable" },
+                cause: Some(brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause::Provider),
+            });
+            cause
+        })
+    }
+
+    fn compute_selected_file_routes(
+        &self,
+        inventory: &brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionMountInventory<'_>,
+        path: &String,
+        file: &ProjectFile,
+        progress: Option<&dyn Fn() -> bool>,
+        cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+    ) -> Result<RustFileRoutes, UnavailableCause> {
+        use brokk_bifrost_semantic::analyzer::semantic::derivation::{Demanded, DerivationKind};
         let derivations = self
             .inner
             .derivations()
-            .expect("the tree-sitter analyzer owns a derivation host");
-        let path = brokk_bifrost_core::path_utils::workspace_relative_slash_path(file.rel_path());
-        self.request_memoized(
-            |memo| &memo.file_routes,
-            path.clone(),
-            progress.unwrap_or(&|| true),
-            || {
-                self.with_selected_route_demands(progress, |inventory| {
-                    let (units, mut complete) = match derivations
-                        .demand::<route_kinds::RustBroadFileUnits>(self, inventory, &path)
+            .expect("Rust owns a derivation host");
+
+        let (units, mut complete) =
+            match derivations.demand::<route_kinds::RustBroadFileUnits>(self, inventory, path) {
+                Demanded::Available {
+                    value, complete, ..
+                } => (value, complete),
+                Demanded::Unavailable(cause) => {
+                    if cause != UnavailableCause::Cancelled {
+                        self.inner.record_store_error(
+                            brokk_bifrost_analysis::analyzer::store::StoreError::new(format!(
+                                "Rust file routes derivation {kind:?} unavailable: {cause:?}",
+                                kind = route_kinds::RustBroadFileUnits::ID,
+                            )),
+                        );
+                    }
+                    return Err(cause);
+                }
+            };
+        // The persisted units hold no route to this file. Under an
+        // overlay a declaration the persisted units do not carry may
+        // place it in a unit, so the absence is not a proof.
+        if units.is_empty()
+                        && complete
+                        && brokk_bifrost_analysis::analyzer::store::rust_unit_summaries::rust_selection_has_overlay(
+                            inventory.connection(),
+                        )
+                        .map_err(|error| UnavailableCause::Failed(error.to_string().into()))?
                     {
-                        Demanded::Available {
-                            value, complete, ..
-                        } => (value, complete),
-                        Demanded::Unavailable(cause) => return Err(cause),
-                    };
-                    let mut indexes = Vec::with_capacity(units.len());
-                    let mut incomplete = Vec::new();
-                    for unit in units.iter() {
-                        if progress.is_some_and(|p| !p()) {
-                            return Err(UnavailableCause::Cancelled);
-                        }
-                        match derivations
-                            .demand::<route_kinds::RustUnitRoutes>(self, inventory, unit)
-                        {
-                            Demanded::Available {
-                                value,
-                                complete: unit_complete,
-                                ..
-                            } => {
-                                complete &=
-                                    self.note_incomplete_unit(unit, unit_complete, &mut incomplete);
-                                indexes.push(Arc::clone(&value.index));
-                            }
-                            Demanded::Unavailable(cause) => return Err(cause),
-                        }
+                        complete = false;
                     }
-                    // Recorded inside the memoized build, so a hit replays it
-                    // and every consumer of a partial answer marks its result
-                    // incomplete. An incomplete listing makes every unit it
-                    // names incomplete, so they are all named here.
-                    if !complete {
-                        route_kinds::record_route_evidence_gap(self, &incomplete);
+        let mut indexes = Vec::with_capacity(units.len());
+        let mut incomplete = Vec::new();
+        for unit in units.iter() {
+            if progress.is_some_and(|p| !p()) {
+                return Err(UnavailableCause::Cancelled);
+            }
+            match derivations.demand::<route_kinds::RustUnitRoutes>(self, inventory, unit) {
+                Demanded::Available {
+                    value,
+                    complete: unit_complete,
+                    ..
+                } => {
+                    complete &= self.note_incomplete_unit(unit, unit_complete, &mut incomplete);
+                    indexes.push(Arc::clone(&value.index));
+                }
+                Demanded::Unavailable(cause) => {
+                    if cause != UnavailableCause::Cancelled {
+                        self.inner.record_store_error(
+                            brokk_bifrost_analysis::analyzer::store::StoreError::new(format!(
+                                "Rust file routes derivation {kind:?} unavailable: {cause:?}",
+                                kind = route_kinds::RustUnitRoutes::ID,
+                            )),
+                        );
                     }
-                    Ok(RustFileRoutes::with_completeness(indexes, complete))
-                })
-            },
-        )
+                    return Err(cause);
+                }
+            }
+        }
+        // Recorded inside the memoized build, so a hit replays it
+        // and every consumer of a partial answer marks its result
+        // incomplete. An incomplete listing makes every unit it
+        // names incomplete, so they are all named here.
+        if !complete {
+            route_kinds::record_route_evidence_gap(self, &incomplete);
+        }
+        if cancellation.is_cancelled() || progress.is_some_and(|keep_going| !keep_going()) {
+            return Err(UnavailableCause::Cancelled);
+        }
+        let routes = RustFileRoutes::with_completeness(indexes, complete);
+        // No selected build compiles a file whose every placement is
+        // inactive or unknown, so its routes name no definite
+        // target (#11639).
+        if routes.file_is_inactive(file) {
+            route_kinds::record_inactive_placement_gap(self, file);
+            return Ok(routes.into_incomplete());
+        }
+        Ok(routes)
     }
 
     /// An inverse query may find no sites in a detached file without asking
@@ -2261,6 +3053,276 @@ impl RustAnalyzer {
         )
     }
 
+    /// Admit only package membership/rows through the second named Main
+    /// bridge. The content gate is outside the memo so every hit rechecks it.
+    /// The Main bridge has exactly three named entries: file routes, this one
+    /// and the local-glob name-absence question. This one admits only
+    /// RustPackageUnits, RustFileUnits and RustUnitPackageRows. It refuses
+    /// changed Rust selection inputs of any path shape and incomplete package
+    /// answers. Source parsing, macro identity and other non-route reads never
+    /// run with Main authority.
+    fn certified_package_question<T>(
+        &self,
+        memo_of: fn(
+            &RustRouteRequestMemo,
+        ) -> &KeyedPoolSafeMemo<
+            RustRouteQuestionKey,
+            RustRouteMemoEntry<RustRoutedAnswer<T>>,
+        >,
+        key: String,
+        progress: Option<&dyn Fn() -> bool>,
+        compose: impl FnOnce(
+            &brokk_bifrost_analysis::analyzer::derivation_host::AnalyzerDerivations,
+            &brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionMountInventory<'_>,
+            &mut Vec<[u8; 32]>,
+        ) -> Result<RustRoutedAnswer<T>, UnavailableCause>,
+    ) -> Result<RustRoutedAnswer<T>, RustCargoRouteError>
+    where
+        T: Clone,
+    {
+        use brokk_bifrost_analysis::analyzer::derivation_host::{
+            read_frame, rust_route_question_identity,
+        };
+        let (nonce, snapshots) = self.with_selected_route_demands(progress, |inventory| {
+            // selected_route_content proves module topology, not the member
+            // blob translation required by these package questions. Their
+            // attachment joins also require the selected OID, parse variant
+            // and generation (surface_relations.rs::member_blob_translation_sql).
+            // Keep exact content equality instead of assuming route topology
+            // alone proves those joins remain available after a body edit.
+            self.route_replay_content(inventory)?;
+            // The source-listing predicate covers .rs paths. Package topology
+            // must also refuse changed selected inputs outside that class,
+            // such as a non-.rs target root or an as-yet unclassified input.
+            if inventory
+                .selected_content_comparisons(&[], |_| true)
+                .map_err(|error| UnavailableCause::Failed(error.to_string().into()))?
+                .iter()
+                .any(|input| !input.unchanged())
+            {
+                return Err(UnavailableCause::RustMembershipOverlaid);
+            }
+            let _classifier = brokk_bifrost_core::attribution::classifier_statements();
+            let nonce =
+                brokk_bifrost_core::cache_db::publication_lineage::require_publication_nonce(
+                    inventory.connection(),
+                )
+                .map_err(|error| UnavailableCause::Failed(error.to_string().into()))?;
+            let snapshots = inventory
+                .languages()
+                .map_err(|error| UnavailableCause::Failed(error.to_string().into()))?
+                .iter()
+                .map(|language| {
+                    let snapshot = language.snapshot_id();
+                    (snapshot.lang.clone(), snapshot)
+                })
+                .collect::<brokk_bifrost_analysis::analyzer::store::WorkspaceSnapshots>();
+            Ok((nonce, snapshots))
+        })?;
+        let key = RustRouteQuestionKey {
+            nonce,
+            snapshot: snapshots
+                .get("rust")
+                .expect("Rust package bridge pins Rust")
+                .clone(),
+            subject: key,
+        };
+        self.request_memoized(memo_of, key, progress.unwrap_or(&|| true), || {
+            let cancellation = self.active_query_cancellation().unwrap_or_default();
+            let (answer, receipt) =
+                brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadReceipt::capture_deferred(
+                    self,
+                    || {
+                        if cancellation.is_cancelled()
+                            || progress.is_some_and(|keep_going| !keep_going())
+                        {
+                            return Err(UnavailableCause::Cancelled);
+                        }
+                        let inventory =
+                            self.open_main_route_inventory(nonce, &snapshots, &cancellation)?;
+                        let identity = rust_route_question_identity(
+                            self,
+                            self.analyzer_store(),
+                            snapshots
+                                .get("rust")
+                                .expect("Rust package bridge pins Rust")
+                                .clone(),
+                        );
+                        read_frame::with_package_topology_main_bridge(identity, &inventory, || {
+                            let derivations =
+                                self.inner.derivations().expect("Rust owns derivations");
+                            let mut incomplete = Vec::new();
+                            let answer = compose(derivations, &inventory, &mut incomplete)?;
+                            if !answer.complete {
+                                // Unknown workspace membership, an uncertified source
+                                // listing or an unadmitted target is not a closed input.
+                                return Err(UnavailableCause::ValidationFailed);
+                            }
+                            if cancellation.is_cancelled()
+                                || progress.is_some_and(|keep_going| !keep_going())
+                            {
+                                return Err(UnavailableCause::Cancelled);
+                            }
+                            Ok(answer)
+                        })?
+                    },
+                );
+            // Restore the operation frame before attributing the certified
+            // topology reads to the primitive proof's own consumer ledger.
+            receipt.replay(self);
+            answer.map_err(|cause| {
+                if cause == UnavailableCause::Cancelled {
+                    RustCargoRouteError::Cancelled
+                } else {
+                    self.inner.record_store_error(
+                        brokk_bifrost_analysis::analyzer::store::StoreError::new(format!(
+                            "Rust package topology bridge unavailable: {cause:?}"
+                        )),
+                    );
+                    RustCargoRouteError::Unavailable
+                }
+            })
+        })
+    }
+
+    /// One local-glob question, with exact selected-content authority.
+    ///
+    /// Unlike file_routes, a body-only edit is not sufficient: it can add a
+    /// module export, macro invocation or include. Every changed selected input
+    /// that the glob's dependency closure lists (all target/reexport-hop files,
+    /// cycles included, their cfg, macro/include facts and generated inputs),
+    /// every changed Cargo manifest or configuration input, and any change
+    /// without a known identity refuse before Main. A change to a file outside
+    /// that closure cannot move the answer, so the answer is read from Main as
+    /// a fresh analysis of the same files would read it. Derived rows then
+    /// come only from the identical pinned, producer-certified publications of
+    /// those inputs.
+    fn local_glob_name_absence_question(
+        &self,
+        key: &(String, String),
+    ) -> Result<brokk_bifrost_rust::graph_support::RustGlobNameAbsence, RustCargoRouteError> {
+        use brokk_bifrost_analysis::analyzer::derivation_host::{
+            read_frame, rust_route_question_identity,
+        };
+        use brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadReceipt;
+        let (nonce, snapshots) = self.with_selected_route_demands(None, |inventory| {
+            // The answer is read from Main's published rows, so it stands for
+            // the selection exactly when no changed input can move it. A
+            // changed Cargo or other configuration input, or one whose
+            // identity is unknown, can move any answer. A changed source
+            // moves it only when the glob's dependency closure lists the
+            // file; the closure files' identities are the recorded unit
+            // inputs, so a later edit to them invalidates the answer.
+            let changed = inventory
+                .selected_content_comparisons(&[], |_| true)
+                .map_err(|error| UnavailableCause::Failed(error.to_string().into()))?
+                .into_iter()
+                .filter(|input| !input.unchanged())
+                .collect::<Vec<_>>();
+            let refusal = if changed.iter().any(|input| {
+                input.path.as_deref().is_none_or(|path| {
+                    RustSupport.is_configuration_input_path(Path::new(path))
+                })
+            }) {
+                Some(UnavailableCause::ConfigurationOverlaid)
+            } else if !changed.is_empty() {
+                let paths = changed
+                    .iter()
+                    .filter_map(|input| input.path.clone())
+                    .collect::<Vec<_>>();
+                brokk_bifrost_analysis::analyzer::store::rust_unit_summaries::rust_local_glob_closure_reads_paths(
+                    inventory.connection(),
+                    &key.0,
+                    &paths,
+                )
+                .map_err(|error| UnavailableCause::Failed(error.to_string().into()))?
+                .then_some(UnavailableCause::RustMembershipOverlaid)
+            } else {
+                None
+            };
+            if let Some(cause) = refusal {
+                self.record_query_incomplete(QueryReadIncomplete::ProofStopped {
+                    reason: if cause == UnavailableCause::ConfigurationOverlaid {
+                        "ConfigurationOverlaid"
+                    } else {
+                        "RustMembershipOverlaid"
+                    },
+                    cause: Some(
+                        brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause::Provider,
+                    ),
+                });
+                return Err(cause);
+            }
+            let _classifier = brokk_bifrost_core::attribution::classifier_statements();
+            let nonce =
+                brokk_bifrost_core::cache_db::publication_lineage::require_publication_nonce(
+                    inventory.connection(),
+                )
+                .map_err(|error| UnavailableCause::Failed(error.to_string().into()))?;
+            let snapshots = inventory
+                .languages()
+                .map_err(|error| UnavailableCause::Failed(error.to_string().into()))?
+                .iter()
+                .map(|language| {
+                    let snapshot = language.snapshot_id();
+                    (snapshot.lang.clone(), snapshot)
+                })
+                .collect::<brokk_bifrost_analysis::analyzer::store::WorkspaceSnapshots>();
+            Ok((nonce, snapshots))
+        })?;
+        let cancellation = self.active_query_cancellation().unwrap_or_default();
+        let (answer, receipt) = QueryReadReceipt::capture_deferred(self, || {
+            if cancellation.is_cancelled() {
+                return Err(UnavailableCause::Cancelled);
+            }
+            let inventory = self.open_main_route_inventory(nonce, &snapshots, &cancellation)?;
+            let identity = rust_route_question_identity(
+                self,
+                self.analyzer_store(),
+                snapshots
+                    .get("rust")
+                    .expect("local-glob bridge pins Rust")
+                    .clone(),
+            );
+            read_frame::with_local_glob_name_absence_main_bridge(identity, &inventory, || {
+                let host = self.inner.derivations().expect("Rust owns derivations");
+                let (answer, complete) =
+                    self.demanded::<route_kinds::RustLocalGlobNameAbsence>(host, &inventory, key)?;
+                if !complete {
+                    return Err(UnavailableCause::ValidationFailed);
+                }
+                if cancellation.is_cancelled() {
+                    return Err(UnavailableCause::Cancelled);
+                }
+                Ok(*answer)
+            })?
+        });
+        // Restore the consumer's operation frame before replay. A failed
+        // bridge cannot attribute an uncertified Main receipt to that consumer.
+        match answer {
+            Ok(answer) => {
+                receipt.replay(self);
+                Ok(answer)
+            }
+            Err(cause) => {
+                self.record_query_incomplete(QueryReadIncomplete::ProofStopped {
+                    reason: "RustLocalGlobNameAbsenceBridgeUnavailable",
+                    cause: Some(brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause::Provider),
+                });
+                if cause == UnavailableCause::Cancelled {
+                    Err(RustCargoRouteError::Cancelled)
+                } else {
+                    self.inner.record_store_error(
+                        brokk_bifrost_analysis::analyzer::store::StoreError::new(format!(
+                            "Rust local-glob name-absence bridge unavailable: {cause:?}"
+                        )),
+                    );
+                    Err(RustCargoRouteError::Unavailable)
+                }
+            }
+        }
+    }
+
     /// One package question: demand the units it names in the read frame,
     /// record the route evidence gap when the answer is incomplete, and
     /// memoize the answer for the open query scope. Recording happens inside
@@ -2406,6 +3468,43 @@ impl RustAnalyzer {
     pub fn reset_module_route_fact_fallback_count_for_test(&self) {
         self.module_route_fact_fallback_count
             .store(0, Ordering::Relaxed);
+    }
+
+    /// The route-input token of each persisted unit that holds `path` at this
+    /// analyzer's selection: the content key under which the unit's route
+    /// derivations are cached.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn route_unit_input_tokens_for_test(
+        &self,
+        path: &str,
+    ) -> Result<Vec<RustUnitInputToken>, String> {
+        use brokk_bifrost_analysis::analyzer::derivation_host::selected_rust_snapshot;
+        use brokk_bifrost_analysis::analyzer::store::rust_unit_summaries::{
+            rust_broad_file_units, rust_unit_inputs,
+        };
+        use brokk_bifrost_semantic::analyzer::semantic::derivation::UnavailableCause;
+        let snapshot = self
+            .inner
+            .selected_workspace_snapshots()
+            .get("rust")
+            .cloned()
+            .ok_or("no selected Rust snapshot")?;
+        self.with_rust_route_inventory(snapshot, |inventory| {
+            let failed = |error: String| UnavailableCause::Failed(error.into());
+            let selected = selected_rust_snapshot(inventory).map_err(failed)?;
+            let connection = inventory.connection();
+            rust_broad_file_units(connection, &selected, path)
+                .map_err(|error| failed(error.to_string()))?
+                .into_iter()
+                .map(|unit| {
+                    let (token, _) = rust_unit_inputs(connection, &selected, &unit)
+                        .map_err(|error| failed(error.to_string()))?
+                        .ok_or_else(|| failed(format!("unit {unit:02x?} is not live")))?;
+                    Ok((unit, token))
+                })
+                .collect()
+        })
+        .map_err(|cause| format!("{cause:?}"))
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -2706,6 +3805,25 @@ impl brokk_bifrost_rust::graph_support::RustSource for RustAnalyzer {
         self.package_view().contains(file, progress)
     }
 
+    fn certified_package_files_of(
+        &self,
+        _token: QueryToken<'_>,
+        package: &str,
+        progress: Option<&dyn Fn() -> bool>,
+    ) -> Result<RustRoutedAnswer<Vec<ProjectFile>>, RustCargoRouteError> {
+        self.package_view()
+            .certified_files_in_package(package, progress)
+    }
+
+    fn certified_package_contains(
+        &self,
+        _token: QueryToken<'_>,
+        file: &ProjectFile,
+        progress: Option<&dyn Fn() -> bool>,
+    ) -> Result<RustRoutedAnswer<bool>, RustCargoRouteError> {
+        self.package_view().certified_contains(file, progress)
+    }
+
     fn crate_package_names(
         &self,
         _token: QueryToken<'_>,
@@ -2781,6 +3899,44 @@ fn placed_declarations(rows: Vec<(git2::Oid, u32, String)>) -> Vec<RustPlacedDec
 /// inverted lookups, the live blob mapping, and the caches it owns.
 /// Publication preparation is deliberately not part of this query interface.
 impl RustFactSource for RustAnalyzer {
+    fn local_glob_name_absence(
+        &self,
+        file: &ProjectFile,
+        import: &brokk_bifrost_core::analyzer::model::ImportInfo,
+        namespace: brokk_bifrost_rust::graph_support::RustGlobNamespace,
+        name: &str,
+    ) -> brokk_bifrost_rust::graph_support::RustGlobNameAbsence {
+        use brokk_bifrost_rust::graph_support::RustGlobNameAbsence as Answer;
+        let Some(path) = &import.path else {
+            return Answer::Incomplete;
+        };
+        if self.inner.derivations().is_none() {
+            return Answer::Incomplete;
+        }
+        let key = (
+            brokk_bifrost_core::path_utils::workspace_relative_slash_path(file.rel_path()),
+            serde_json::to_string(&(
+                path.declaration_start_byte,
+                &path.segments,
+                namespace.as_str(),
+                name,
+            ))
+            .expect("glob question strings"),
+        );
+        match self.local_glob_name_absence_question(&key) {
+            Ok(answer) => answer,
+            Err(_) => Answer::Incomplete,
+        }
+    }
+
+    fn selected_dependency_package(
+        &self,
+        file: &ProjectFile,
+        exposed: &str,
+    ) -> Result<String, String> {
+        RustAnalyzer::selected_dependency_package(self, file, exposed)
+    }
+
     fn read_capability(&self) -> brokk_bifrost_core::analyzer::project_reads::ReadCapability {
         self.inner.read_capability()
     }
@@ -2870,6 +4026,7 @@ impl RustFactSource for RustAnalyzer {
         let result = self
             .analyzer_store()
             .rust_types_implementing(
+                self.inner.selected_workspace_snapshots().as_ref(),
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(declaration.blob, "rust"),
                 declaration.declaration,
                 &declaration.rel_path,
@@ -2922,6 +4079,7 @@ impl RustFactSource for RustAnalyzer {
         let result = self
             .analyzer_store()
             .rust_traits_of_impl(
+                self.inner.selected_workspace_snapshots().as_ref(),
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(impl_item.blob, "rust"),
                 impl_item.declaration,
                 &impl_item.rel_path,
@@ -3002,6 +4160,7 @@ impl RustFactSource for RustAnalyzer {
         declaration: &RustPlacedDeclaration,
     ) -> Result<Vec<String>, RustCargoRouteError> {
         let result = self.analyzer_store().rust_trait_impl_spellings(
+            self.inner.selected_workspace_snapshots().as_ref(),
             &brokk_bifrost_core::gitblob::BlobKey::unvaried(declaration.blob, "rust"),
             declaration.declaration,
             &declaration.rel_path,
@@ -3193,6 +4352,11 @@ impl CodeUnitIndex for RustAnalyzer {
     }
 
     delegate_inner_methods! {
+        fn owns_source_file(&self, file: &ProjectFile) -> bool;
+        fn indexed_source_files(&self) -> brokk_bifrost_analysis::analyzer::QueryBatch<ProjectFile>;
+    }
+
+    delegate_inner_methods! {
         fn indexed_blob_oid(&self, file: &ProjectFile) -> Option<brokk_bifrost_analysis::analyzer::Oid>;
     }
 
@@ -3331,6 +4495,12 @@ impl CodeUnitIndex for RustAnalyzer {
 }
 
 impl IAnalyzer for RustAnalyzer {
+    fn external_selection_authorities(
+        &self,
+    ) -> Vec<&dyn brokk_bifrost_core::analyzer::external_selection::ExternalSelectionAuthority>
+    {
+        vec![&self.toolchain_observation]
+    }
     delegate_inner_procedure_fact_methods!();
 
     fn dependency_file_locations(
@@ -3409,11 +4579,8 @@ impl IAnalyzer for RustAnalyzer {
     }
 
     delegate_inner_methods! {
-        fn record_query_failure(&self, error: crate::analyzer::store::StoreError);
-    }
-
-    delegate_inner_methods! {
         fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell>;
+        fn workspace_file_inventory_cell(&self) -> Option<crate::analyzer::WorkspaceFileInventoryCell>;
     }
 
     delegate_inner_methods! {
@@ -3458,14 +4625,28 @@ impl IAnalyzer for RustAnalyzer {
         brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
             // A failed listing read counts as a change, so the delegate's
             // update meets the same read and records the error.
-            if !self.inner.rust_listing_changed(listing).unwrap_or(true)
+            if self.toolchain_observation.selectors_unchanged()
+                && !self.inner.rust_listing_changed(listing).unwrap_or(true)
                 && rust_indexed_sources_unchanged(self, changed_files)
+                && !changed_files
+                    .iter()
+                    .any(|file| self.inner.selected_configuration_contains_input(file))
+                && self.inner.configuration_acquisition_inputs_complete()
+                && self
+                    .inner
+                    .configuration_external_reads()
+                    .iter()
+                    .all(|read| read.still_matches())
             {
                 return self.clone();
             }
 
             let inner = self.inner.update_with_listing(changed_files, listing);
-            Self::from_inner(inner)
+            let mut updated = Self::from_inner(inner);
+            updated.toolchain_observation = self
+                .toolchain_observation
+                .clone_for_project(updated.inner.shared_project());
+            updated
         })
     }
 
@@ -3539,6 +4720,13 @@ impl IAnalyzer for RustAnalyzer {
     ) -> Vec<&dyn crate::analyzer::structural::StructuralFactProvider>;
     }
 
+    fn generation_membership(
+        &self,
+    ) -> &Arc<brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::GenerationWorkspaceMembership>
+    {
+        IAnalyzer::generation_membership(&self.inner)
+    }
+
     fn snapshot_caches(
         &self,
     ) -> Option<&brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerSnapshotCaches> {
@@ -3568,24 +4756,56 @@ impl IAnalyzer for RustAnalyzer {
     /// Per-declaration taint, widened by the file-level verdict: every
     /// declaration in a `#[cfg(test)]`-only module is in a test region, even
     /// the plain helper functions that carry no attribute of their own (#1546).
-    fn in_test_region(&self, code_unit: &brokk_bifrost_core::analyzer::model::CodeUnit) -> bool {
-        self.inner.in_test_region(code_unit) || self.file_is_test_only(code_unit.source())
+    fn in_test_region(
+        &self,
+        code_unit: &brokk_bifrost_core::analyzer::model::CodeUnit,
+    ) -> Result<bool, brokk_bifrost_analysis::analyzer::QueryReadIncomplete> {
+        Ok(self.inner.in_test_region(code_unit)? || self.file_is_test_only(code_unit.source())?)
     }
 
-    /// `false` is not a proof of "not test-only" when the answer is partial:
-    /// `RustFileRoutes::file_is_test_only` is a universal claim over the file's
-    /// units. A partial answer records its route evidence gap on the query
-    /// scope, which marks the enclosing result incomplete.
-    fn file_is_test_only(&self, file: &ProjectFile) -> bool {
-        match self.file_routes(file, None) {
-            Ok(routes) => routes.file_is_test_only(file),
-            // This legacy boolean capability cannot carry availability. The
-            // route producer records the structured store failure on the query
-            // scope, which must reject the enclosing result; do not cache it.
-            Err(RustCargoRouteError::Unavailable) => false,
-            Err(RustCargoRouteError::Cancelled) => {
-                unreachable!("unbounded Cargo-route lookup cannot cancel")
+    /// Classify only when the selected Cargo routes prove the answer. A
+    /// production route from a target root proves "not test-only" even while
+    /// other units or files are unknown, as in a diff endpoint image that holds
+    /// only the changed paths; "test-only" needs the complete routes.
+    fn file_is_test_only(
+        &self,
+        file: &ProjectFile,
+    ) -> Result<bool, brokk_bifrost_analysis::analyzer::QueryReadIncomplete> {
+        use brokk_bifrost_analysis::analyzer::{AnalyzerQueryScope, QueryReadIncomplete};
+
+        let scope = AnalyzerQueryScope::new(self);
+        let routes = self.file_routes(file, None);
+        match routes {
+            Ok(routes) if routes.file_has_production_witness(file) => Ok(false),
+            // Compiled by no selected build: neither test code nor provably
+            // production, so there is no verdict (#11639).
+            Ok(routes) if routes.file_is_inactive(file) => {
+                Err(QueryReadIncomplete::SemanticEvidenceGap(
+                    route_kinds::inactive_placement_gap_text(file).into(),
+                ))
             }
+            // A unit places the file only under an undecided `cfg`, or an
+            // undecided `cfg` route may make it production: "not test-only"
+            // would claim production and "test-only" would ignore the route.
+            Ok(routes) if routes.file_test_verdict_uncertain(file) => {
+                Err(QueryReadIncomplete::SemanticEvidenceGap(
+                    route_kinds::uncertain_test_verdict_gap_text(file).into(),
+                ))
+            }
+            Ok(routes) if routes.is_complete() => {
+                scope.read_completion()?;
+                Ok(routes.file_is_test_only(file))
+            }
+            Ok(_) => Err(QueryReadIncomplete::SemanticEvidenceGap(
+                format!("incomplete Rust file routes for {file:?}").into_boxed_str(),
+            )),
+            Err(RustCargoRouteError::Unavailable) => {
+                scope.read_completion()?;
+                Err(QueryReadIncomplete::SemanticEvidenceUnavailable(
+                    format!("Rust file routes unavailable for {file:?}").into_boxed_str(),
+                ))
+            }
+            Err(RustCargoRouteError::Cancelled) => Err(QueryReadIncomplete::Cancelled),
         }
     }
 
@@ -3789,7 +5009,7 @@ pub(crate) fn expand_rust_imported_external_callee_attempt_with_operation<
     operation: &mut brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<'analyzer, 'selection>,
 ) -> std_types::RustProofAttempt<ImportedExternalCallee> {
     let cancellation = analyzer.active_query_cancellation().unwrap_or_default();
-    std_types::completed_proof(Some(&cancellation), || {
+    std_types::completed_proof(analyzer, Some(&cancellation), || {
         let site = site?;
         let callee = external_calls::call_path(site.tree, site.callee_start_byte)?;
         // The definition resolver owns receiver-call proofs.
@@ -3833,10 +5053,60 @@ pub(crate) fn expand_rust_imported_external_callee_attempt_with_operation<
                 brokk_bifrost_rust::declarations::rust_node_text(*binding_node, site.source);
             let written_member =
                 brokk_bifrost_rust::declarations::rust_node_text(*written_member, site.source);
+            // A leading `::` does not read the lexical binders around the call.
+            // In edition 2018 and later its head is an extern-prelude crate, and
+            // in edition 2015 it is a crate-root name: only an active top-level
+            // `use` of the crate root file can bind it, wherever the call is
+            // written, and the selected absolute root says whether one does.
+            let crate_root_only =
+                brokk_bifrost_rust::graph_support::rust_path_is_leading_absolute(*binding_node);
+            let scope = AnalyzerQueryScope::new(analyzer);
+            // The file that declares the candidate binders, with its syntax: the
+            // calling file, except that a crate-root import is read from the root.
+            let root_file;
+            let root_syntax;
+            let (import_file, import_source, import_tree) = if crate_root_only {
+                root_file = external_calls::crate_root_import_file(
+                    analyzer,
+                    operation,
+                    file,
+                    binding,
+                    if written_owner.is_empty() {
+                        brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace::Value
+                    } else {
+                        brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace::Type
+                    },
+                    Some(&cancellation),
+                )?;
+                if root_file == *file {
+                    (file, site.source, site.tree)
+                } else {
+                    root_syntax =
+                        brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<
+                            RustAnalyzer,
+                        >(analyzer)?
+                        .prepared_syntax(scope.token(), &root_file);
+                    let Some(prepared) = root_syntax.as_ref() else {
+                        std_types::operational_proof_stop(
+                            "crate_root_syntax_unavailable",
+                            brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause::Provider,
+                        );
+                        return None;
+                    };
+                    (&root_file, prepared.source(), prepared.tree())
+                }
+            } else {
+                (file, site.source, site.tree)
+            };
             if analyzer.import_analysis_provider_for_file(file).is_some() {
-                let scope = AnalyzerQueryScope::new(analyzer);
-                let imports =
-                    std_types::selected_import_infos(analyzer, operation, file, &cancellation)?;
+                let parameter_count =
+                    external_calls::rust_call_written_arity(site.tree, site.callee_start_byte)?;
+                let imports = std_types::selected_import_infos(
+                    analyzer,
+                    operation,
+                    import_file,
+                    &cancellation,
+                )?;
                 for import in &imports {
                     let binding_name = rust_import_binding_name(import);
                     if binding_name.is_glob()
@@ -3852,13 +5122,16 @@ pub(crate) fn expand_rust_imported_external_callee_attempt_with_operation<
                         Some(path) if path.segments.len() >= 2 => path,
                         _ => continue,
                     };
-                    // The binder is evidence only where the `use` declaration is in
-                    // scope. A module-owned `use` binds its name inside that module's
-                    // lexical extent -- which is exactly what `lexical_scopes` records --
-                    // so a binder written in a sibling module names nothing at this call,
-                    // and letting it answer would either veto a real identity or, when it
-                    // binds the same path, prove an identity the call never wrote.
-                    if !rust_import_binder_visible_at_byte(path, site.callee_start_byte) {
+                    // The shared scope check excludes sibling and nested modules,
+                    // while retaining imports through nested blocks and function items.
+                    // A crate-root binder must be top level, so it records no container;
+                    // its bytes belong to another file than the call's.
+                    let in_scope = if crate_root_only {
+                        path.lexical_scopes.is_empty()
+                    } else {
+                        rust_import_binder_visible_at_byte(path, site.callee_start_byte, site.tree)
+                    };
+                    if !in_scope {
                         continue;
                     }
                     // A single-segment callee takes the member from the binder's own
@@ -3885,8 +5158,10 @@ pub(crate) fn expand_rust_imported_external_callee_attempt_with_operation<
                     let proof = rust_import_binder_external_callee(
                         analyzer,
                         scope.token(),
-                        file,
-                        site,
+                        import_file,
+                        import_source,
+                        import_tree,
+                        parameter_count,
                         import,
                         &imports,
                         member,
@@ -3911,24 +5186,35 @@ pub(crate) fn expand_rust_imported_external_callee_attempt_with_operation<
     })
 }
 
-/// Whether the parser-derived `use` declaration behind `path` binds a name
-/// that is in scope at `call_start_byte`.
-///
-/// `lexical_scopes` records the containers the parser found around the
-/// declaration, outermost first, so a binder is in scope exactly where the
-/// innermost recorded container reaches. A module-owned `use` therefore names
-/// something only inside that module's body (and the modules nested in it,
-/// which is why containment, not equality, is the test). A top-level `use`
-/// records no container to constrain it and is visible anywhere in the file.
-///
-/// Without this filter a `use` written inside a sibling inline module answers
-/// for calls in other modules, where the name it binds is not in scope: the
-/// binder can then veto a real identity or, when it binds the same path, hand
-/// a call an identity it never wrote (#3484).
-fn rust_import_binder_visible_at_byte(path: &StructuredImportPath, call_start_byte: usize) -> bool {
-    path.lexical_scopes
+/// A `use` binds within its recorded lexical containers and its own module.
+/// Nested blocks and function items inherit it; nested modules do not (#12163).
+/// Crate-root `extern crate` declarations also populate the extern prelude.
+fn rust_import_binder_visible_at_byte(
+    path: &StructuredImportPath,
+    call_start_byte: usize,
+    tree: &tree_sitter::Tree,
+) -> bool {
+    if !path
+        .lexical_scopes
         .iter()
         .all(|scope| scope.start_byte <= call_start_byte && call_start_byte < scope.end_byte)
+    {
+        return false;
+    }
+    if path.kind == Some(StructuredImportPathKind::ExternCrate) && path.lexical_scopes.is_empty() {
+        return true;
+    }
+    let enclosing_module = |byte| {
+        let mut node = tree.root_node().named_descendant_for_byte_range(byte, byte);
+        while let Some(current) = node {
+            if current.kind() == "mod_item" {
+                return Some(current.id());
+            }
+            node = current.parent();
+        }
+        None
+    };
+    enclosing_module(path.declaration_start_byte) == enclosing_module(call_start_byte)
 }
 
 fn open_declared_rust_route_recipe(
@@ -3959,7 +5245,266 @@ fn open_declared_rust_route_recipe(
     }
 }
 
+fn with_drop_inventory<T>(
+    workspace: &brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer,
+    request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+    proof: impl FnOnce(&dyn Fn(&CodeUnit, &str, std::ops::Range<usize>) -> bool) -> T,
+) -> T {
+    let request = std::cell::RefCell::new(request);
+    let inventory = |unit: &CodeUnit, source: &str, range: std::ops::Range<usize>| {
+        let blob = git2::Oid::hash_object(git2::ObjectType::Blob, source.as_bytes())
+            .expect("source blob hashing succeeds");
+        let answer = semantic::rust_drop_inventory_proof(
+            workspace,
+            unit,
+            &blob,
+            range,
+            &mut request.borrow_mut(),
+        );
+        drop_inventory_answer_is_absent(workspace, answer, &request.borrow())
+    };
+    proof(&inventory)
+}
+
+fn drop_inventory_answer_is_absent(
+    workspace: &brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer,
+    answer: Result<
+        semantic::RustDropInventoryProof,
+        crate::analyzer::semantic::SemanticProviderError,
+    >,
+    request: &crate::analyzer::semantic::SemanticRequest<'_>,
+) -> bool {
+    use brokk_bifrost_analysis::analyzer::store::rust_drop_inventory::RustDropInventory;
+    use semantic::RustDropInventoryProof;
+    match answer {
+        Ok(RustDropInventoryProof::Answer(RustDropInventory::Absent { .. })) => true,
+        Ok(RustDropInventoryProof::Answer(_)) => {
+            std_types::incomplete_proof("drop_inventory_not_absent");
+            false
+        }
+        Ok(RustDropInventoryProof::Stopped(cause)) => {
+            std_types::operational_proof_stop("drop_inventory_unavailable", cause);
+            false
+        }
+        Err(error) => {
+            resolve_analyzer::<RustAnalyzer>(workspace.analyzer())
+                .expect("Rust Drop proof has a Rust analyzer")
+                .inner
+                .record_store_error(brokk_bifrost_analysis::analyzer::store::StoreError::new(
+                    format!("Drop inventory proof unavailable: {error:?}"),
+                ));
+            let cause = if request.cancellation.is_cancelled() {
+                crate::analyzer::read_ledger::DerivationExecutionCause::Cancelled
+            } else {
+                crate::analyzer::read_ledger::DerivationExecutionCause::Provider
+            };
+            std_types::operational_proof_stop("drop_inventory_failed", cause);
+            false
+        }
+    }
+}
+
 impl LanguageSupport for RustSupport {
+    fn locals_are_definitely_assigned(&self) -> bool {
+        true
+    }
+
+    fn is_listing_path(&self, path: &Path) -> bool {
+        brokk_bifrost_rust::cargo_routes::is_rust_listing_path(path)
+    }
+    fn resolve_workspace_dependencies(
+        &self,
+        workspace: &brokk_bifrost_analysis::analyzer::WorkspaceAnalyzer,
+        config: &brokk_bifrost_analysis::analyzer::AnalyzerConfig,
+        limits: &brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackLimits,
+        cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+    ) -> brokk_bifrost_analysis::analyzer::semantic_model::DependencyDiscoveryOutcome {
+        if let Some(rust) = resolve_analyzer::<RustAnalyzer>(workspace.analyzer()) {
+            rust.toolchain_observation.refresh(cancellation);
+        }
+        let project=match workspace.dependency_discovery_project() {
+            Ok(project)=>project,
+            Err(_)=>return brokk_bifrost_analysis::analyzer::semantic_model::DependencyDiscoveryOutcome::generation_listing_unavailable(cancellation),
+        };
+        use brokk_bifrost_analysis::analyzer::dependency_support::{
+            refuse_external_discovery_reads, report_external_discovery_read,
+        };
+        let overlay=brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<RustAnalyzer>(workspace.analyzer()).and_then(|rust| {
+            match &rust.dependency_evidence_overlay {
+                Ok(Some(publication))=>{
+                    for read in publication.cargo_external_reads() {report_external_discovery_read(read.clone());}
+                    if !publication.cargo_acquisition_inputs_complete() {refuse_external_discovery_reads();}
+                    match publication.acquired_rust_configuration() {
+                        Ok(Some(configuration))=>Some(configuration),
+                        _=>{refuse_external_discovery_reads();Some(brokk_bifrost_rust::cargo_config::RustCargoConfiguration::unknown_acquired())}
+                    }
+                }
+                Err(_)=>{refuse_external_discovery_reads();Some(brokk_bifrost_rust::cargo_config::RustCargoConfiguration::unknown_acquired())}
+                Ok(None)=>{
+                    for read in rust.inner.configuration_external_reads().iter() {report_external_discovery_read(read.clone());}
+                    if !rust.inner.configuration_acquisition_inputs_complete() {refuse_external_discovery_reads();}
+                    None
+                }
+            }
+        });
+        let recorded = overlay
+            .or_else(|| {
+                workspace
+                    .store()
+                    .zip(
+                        workspace
+                            .analyzer()
+                            .selected_workspace_snapshots_for_reads(),
+                    )
+                    .and_then(|(store, snapshots)| {
+                        snapshots.get("rust").and_then(|snapshot| {
+                            store.selected_rust_cargo_configuration(snapshot).ok()
+                        })
+                    })
+            })
+            .unwrap_or_else(
+                brokk_bifrost_rust::cargo_config::RustCargoConfiguration::unknown_acquired,
+            );
+        dependency_discovery::resolve_rust_semantic_pack_dependencies_with_configuration(
+            &config.rust,
+            project.as_ref(),
+            limits,
+            Some(cancellation),
+            Some(&recorded),
+        )
+    }
+
+    fn selected_payload_projection(
+        &self,
+        workspace: &brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer,
+        procedure: &brokk_bifrost_analysis::analyzer::semantic::ProcedureHandle,
+        snapshot: Option<
+            &brokk_bifrost_analysis::analyzer::semantic_model::ActiveSemanticModelSnapshot,
+        >,
+        request: &mut brokk_bifrost_analysis::analyzer::semantic::SemanticRequest<'_>,
+    ) -> Result<
+        brokk_bifrost_analysis::analyzer::semantic::SemanticOutcome<
+            brokk_bifrost_analysis::analyzer::semantic::SelectedPayloadProjection,
+        >,
+        brokk_bifrost_analysis::analyzer::semantic::SemanticProviderError,
+    > {
+        std_types::selected_payload_projection(workspace, procedure, snapshot, request)
+    }
+
+    /// A trait item of a built-in derive, as the resolver names it once the
+    /// derive is proven (#11325). The reviewed table states every item.
+    fn intrinsic_external_signature(
+        &self,
+        callee: &crate::analyzer::semantic::ResolverOwnedExternalCalleeIdentity,
+    ) -> Option<brokk_bifrost_analysis::analyzer::languages::IntrinsicExternalSignature> {
+        let derive = brokk_bifrost_rust::prelude::RUST_BUILTIN_DERIVES
+            .iter()
+            .find(|derive| {
+                callee.owner_fqn() == format!("core.{}.{}", derive.module, derive.name)
+            })?;
+        let item = derive
+            .items
+            .iter()
+            .find(|item| item.name == callee.member())?;
+        Some(
+            brokk_bifrost_analysis::analyzer::languages::IntrinsicExternalSignature {
+                receiver: item.receiver,
+                parameters: item.arity,
+            },
+        )
+    }
+
+    fn summary_endpoint_projection_selector(
+        &self,
+        procedure: &crate::analyzer::semantic::SemanticLocator,
+        step: &crate::analyzer::semantic::PatternProjectionStep,
+    ) -> Option<crate::analyzer::semantic::partial_flow::HeapSelector> {
+        use crate::analyzer::semantic::PatternProjectionStep;
+        use crate::analyzer::semantic::partial_flow::HeapSelector;
+        let key = match step {
+            PatternProjectionStep::Element => return Some(HeapSelector::AnyIndex),
+            PatternProjectionStep::Tuple(ordinal) => format!("tuple:{ordinal}"),
+            PatternProjectionStep::Named(name) => format!("named:{name}"),
+            PatternProjectionStep::Variant { declaration } => format!("variant:{declaration}"),
+        };
+        Some(HeapSelector::Field(
+            semantic::canonical_field_member_locator(procedure, &key),
+        ))
+    }
+
+    fn publishes_candidate_macro_alternates(&self) -> bool {
+        true
+    }
+
+    fn ownership_file_base(
+        &self,
+        workspace: &crate::analyzer::workspace::WorkspaceAnalyzer,
+        base: &crate::analyzer::semantic::ProcedureHandle,
+        request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+    ) -> Result<
+        crate::analyzer::semantic::SemanticOutcome<
+            Option<crate::analyzer::semantic::service::OwnershipFileBuild>,
+        >,
+        crate::analyzer::semantic::SemanticProviderError,
+    > {
+        semantic::ownership_file_base(workspace, base, request)
+    }
+
+    fn admit_ownership_procedure(
+        &self,
+        workspace: &crate::analyzer::workspace::WorkspaceAnalyzer,
+        base: &crate::analyzer::semantic::ProcedureHandle,
+        built: &crate::analyzer::semantic::service::OwnershipProcedureBuild,
+        request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+    ) -> Result<
+        crate::analyzer::semantic::SemanticOutcome<
+            Option<crate::analyzer::semantic::service::OwnershipProcedureSelection>,
+        >,
+        crate::analyzer::semantic::SemanticProviderError,
+    > {
+        semantic::admit_ownership_procedure(workspace, base, built, request).map(|outcome| {
+            outcome.map(|selected| {
+                selected.map(|selected| {
+                    crate::analyzer::semantic::service::OwnershipProcedureSelection::new(
+                        selected, None,
+                    )
+                })
+            })
+        })
+    }
+
+    fn ownership_procedure_interpretation(
+        &self,
+        workspace: &crate::analyzer::workspace::WorkspaceAnalyzer,
+        base: &crate::analyzer::semantic::ProcedureHandle,
+        shared: &crate::analyzer::semantic::service::OwnershipFileBase,
+        request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+    ) -> Result<
+        crate::analyzer::semantic::SemanticOutcome<
+            Option<crate::analyzer::semantic::service::OwnershipProcedureSelection>,
+        >,
+        crate::analyzer::semantic::SemanticProviderError,
+    > {
+        semantic::ownership_procedure_interpretation(workspace, base, shared, request).map(
+            |outcome| {
+                outcome.map(|selected| {
+                    selected.map(|selected| {
+                        crate::analyzer::semantic::service::OwnershipProcedureSelection::new(
+                            selected, None,
+                        )
+                    })
+                })
+            },
+        )
+    }
+
+    fn admit_candidate_macros(
+        &self,
+        context: brokk_bifrost_analysis::analyzer::languages::CandidateMacroAdmissionRequest<'_>,
+    ) -> Vec<brokk_bifrost_analysis::analyzer::languages::CandidateMacroAdmissionAnswer> {
+        candidate_macro_admission::admit_procedure_candidates(context)
+    }
+
     fn receiver_type_parameter_dependency(
         &self,
         analyzer: &dyn IAnalyzer,
@@ -4011,6 +5556,24 @@ impl LanguageSupport for RustSupport {
     > {
         pattern_admission::admit_selected_tuple_binding(
             workspace, procedure, candidate, snapshot, request,
+        )
+    }
+    fn admit_selected_pattern_source(
+        &self,
+        workspace: &brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer,
+        procedure: &brokk_bifrost_analysis::analyzer::semantic::ProcedureHandle,
+        candidate: &brokk_bifrost_analysis::analyzer::semantic::GuardedPatternProjection,
+        field: std::ops::Range<usize>,
+        snapshot: Option<
+            &brokk_bifrost_analysis::analyzer::semantic_model::ActiveSemanticModelSnapshot,
+        >,
+        request: &mut brokk_bifrost_analysis::analyzer::semantic::SemanticRequest<'_>,
+    ) -> Result<
+        brokk_bifrost_analysis::analyzer::languages::SelectedTupleBinding,
+        brokk_bifrost_analysis::analyzer::semantic::SemanticProviderError,
+    > {
+        pattern_admission::admit_selected_pattern_source(
+            workspace, procedure, candidate, field, snapshot, request,
         )
     }
     fn fresh_logical_instance(
@@ -4094,6 +5657,7 @@ impl LanguageSupport for RustSupport {
         kind: brokk_bifrost_analysis::analyzer::semantic::read_ledger::LookupKind,
         question: &brokk_bifrost_analysis::analyzer::LookupQuestion,
         row_budget: usize,
+        memo: &brokk_bifrost_analysis::analyzer::read_verification::OwnedLookupMemo,
     ) -> Option<brokk_bifrost_analysis::analyzer::semantic::ids::StableDigest> {
         use brokk_bifrost_analysis::analyzer::store::rust_copy_absence::RustCopyAbsence;
 
@@ -4101,6 +5665,18 @@ impl LanguageSupport for RustSupport {
         let store = head.store()?;
         let snapshots = analyzer.selected_workspace_snapshots_for_reads()?;
         let cancellation = analyzer.active_query_cancellation().unwrap_or_default();
+        if matches!(
+            question,
+            brokk_bifrost_analysis::analyzer::LookupQuestion::RustDropInventory { .. }
+                | brokk_bifrost_analysis::analyzer::LookupQuestion::RustDropSubject { .. }
+        ) {
+            return semantic::drop_inventory::replay_rust_drop_inventory(
+                head,
+                question,
+                row_budget,
+                &memo.get::<semantic::drop_inventory::RustDropInventoryMemo>(),
+            );
+        }
         if kind
             != brokk_bifrost_analysis::analyzer::semantic::read_ledger::LookupKind::RustCopyAbsence
         {
@@ -4125,16 +5701,8 @@ impl LanguageSupport for RustSupport {
             }
             return Some(answer.digest);
         }
-        let mut cut = false;
         match store
-            .rust_copy_absence_answer(
-                snapshots.as_ref(),
-                question,
-                &cancellation,
-                row_budget,
-                &mut cut,
-                || {},
-            )
+            .rust_copy_absence_answer(snapshots.as_ref(), question, &cancellation, || {})
             .ok()??
             .0
         {
@@ -4162,6 +5730,7 @@ impl LanguageSupport for RustSupport {
         ordinal: u32,
         actual: brokk_bifrost_analysis::analyzer::semantic::ValueId,
         request: &mut brokk_bifrost_analysis::analyzer::semantic::SemanticRequest<'_>,
+        _reuse: &mut brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict,
     ) -> Result<
         brokk_bifrost_analysis::analyzer::languages::SelectedCallResultOwnership,
         brokk_bifrost_analysis::analyzer::semantic::SemanticProviderError,
@@ -4279,6 +5848,24 @@ impl LanguageSupport for RustSupport {
 
     fn taint_uses_call_site_evidence(&self) -> bool {
         true
+    }
+
+    fn lexical_pattern_bindings(
+        &self,
+    ) -> Option<brokk_bifrost_analysis::analyzer::languages::LexicalPatternBindings> {
+        Some(
+            brokk_bifrost_analysis::analyzer::languages::LexicalPatternBindings {
+                declaration_for_name: closure_captures::pattern_binding_declaration,
+                is_scope: |kind| {
+                    matches!(
+                        kind,
+                        "if_expression" | "while_expression" | "match_arm" | "for_expression"
+                    )
+                },
+                visible_at: closure_captures::pattern_binding_visible,
+                bindings_may_escape_scope: |_| false,
+            },
+        )
     }
 
     fn lexical_definitions_are_authoritative(&self) -> bool {
@@ -4400,7 +5987,7 @@ impl LanguageSupport for RustSupport {
             SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Found(
                 answer,
             )) => adapt_assignment_value_probe(site, language, answer),
-            SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Missing) => {
+            SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Missing(_)) => {
                 unavailable_assignment_value_probe(
                     site,
                     "native_reference_unavailable",
@@ -4661,10 +6248,7 @@ impl LanguageSupport for RustSupport {
     }
 
     fn focus_resolves_lexically(&self, focus: tree_sitter::Node<'_>) -> bool {
-        matches!(
-            brokk_bifrost_rust::field_roles::classify_rust_field_name(focus),
-            brokk_bifrost_rust::field_roles::RustFieldNameRole::Other
-        )
+        brokk_bifrost_rust::field_roles::rust_focus_resolves_lexically(focus)
     }
 
     fn signature_metadata_limited(
@@ -4700,12 +6284,66 @@ impl LanguageSupport for RustSupport {
 
     fn procedure_drops_run_no_user_code(
         &self,
-        analyzer: &dyn IAnalyzer,
+        workspace: &brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer,
+        request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
         file: &ProjectFile,
         source: &Arc<str>,
         callable: std::ops::Range<usize>,
     ) -> bool {
-        std_types::procedure_drops_run_no_user_code(analyzer, file, source, callable)
+        // The shared structured proof accepts both callable and value nodes.
+        self.value_drop_runs_no_user_code(workspace, request, file, source, callable)
+    }
+
+    fn value_drop_runs_no_user_code(
+        &self,
+        workspace: &brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer,
+        request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+        file: &ProjectFile,
+        source: &Arc<str>,
+        callable: std::ops::Range<usize>,
+    ) -> bool {
+        with_drop_inventory(workspace, request, |inventory| {
+            std_types::procedure_drops_run_no_user_code(
+                workspace.analyzer(),
+                file,
+                source,
+                callable,
+                Some(inventory),
+            )
+        })
+    }
+
+    fn try_residual_drop_runs_no_user_code(
+        &self,
+        workspace: &brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer,
+        request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+        file: &ProjectFile,
+        source: &Arc<str>,
+        expression: std::ops::Range<usize>,
+    ) -> bool {
+        with_drop_inventory(workspace, request, |inventory| {
+            std_types::try_residual_drop_runs_no_user_code(
+                workspace.analyzer(),
+                file,
+                source,
+                expression,
+                inventory,
+            )
+        })
+    }
+
+    fn selected_value_gaps(
+        &self,
+        workspace: &brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer,
+        procedure: &brokk_bifrost_analysis::analyzer::semantic::ProcedureHandle,
+        file: &ProjectFile,
+        source: &Arc<str>,
+        request: &mut brokk_bifrost_analysis::analyzer::semantic::SemanticRequest<'_>,
+    ) -> Result<
+        Vec<brokk_bifrost_analysis::analyzer::semantic::SemanticGapId>,
+        brokk_bifrost_analysis::analyzer::semantic::SemanticProviderError,
+    > {
+        semantic::selected_unit_struct_value_gaps(workspace, procedure, file, source, request)
     }
 
     fn residual_conversion_runs_no_user_code(
@@ -4848,6 +6486,7 @@ impl LanguageSupport for RustSupport {
         _token: brokk_bifrost_core::analyzer::query_token::QueryToken<'_>,
         _file: &brokk_bifrost_core::analyzer::model::ProjectFile,
         name: &str,
+        _reuse: &mut brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict,
     ) -> Option<(
         brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus,
         Option<String>,
@@ -4864,7 +6503,7 @@ impl LanguageSupport for RustSupport {
             // is gated on its crate root, so a name reaching a crate the
             // workspace renamed away is unindexed here exactly as it is in
             // diagnostics (#1795).
-            let overlay = analyzer.semantic_model_overlay();
+            let overlay = analyzer.semantic_model_overlay_read().published();
             let crates =
                 crate::analyzer::rust::crate_identity::RustOverlayCrates::new(overlay.as_deref());
             if let Some(symbol) = crates.referenceable_symbol(name) {
@@ -4954,6 +6593,7 @@ impl LanguageSupport for RustSupport {
         _member_selection: Option<
             &brokk_bifrost_analysis::analyzer::semantic::DeferredMemberSelection,
         >,
+        _reuse: &mut brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict,
     ) {
         use brokk_bifrost_analysis::analyzer::semantic::ReceiverOwnerRelation;
         use brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupStatus;
@@ -5118,6 +6758,8 @@ impl brokk_bifrost_analysis::analyzer::multi_analyzer::LanguageAnalyzer for Rust
         Box::new(RustAnalyzer::update_all_with_progress(self, progress))
     }
 
+    brokk_bifrost_analysis::delegate_generation_membership_updates!(RustAnalyzer);
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -5159,6 +6801,14 @@ pub(super) mod dependency_packs {
                 || super::toolchain_evidence::rust_toolchain_input(rel_path)
         }
 
+        fn is_discovery_membership_candidate(&self, rel_path: &std::path::Path) -> bool {
+            // The stdlib host-unit census observes Rust source membership,
+            // including newly added build scripts and unowned source units.
+            self.is_discovery_candidate(rel_path)
+                || brokk_bifrost_core::analyzer::Language::from_path(rel_path)
+                    == brokk_bifrost_core::analyzer::Language::Rust
+        }
+
         fn adapter(&self) -> &'static dyn DependencyPackAdapter {
             &RustDependencyPackAdapter
         }
@@ -5185,7 +6835,7 @@ pub(super) mod dependency_packs {
 
     #[cfg(test)]
     #[test]
-    fn cargo_discovery_membership_tracks_only_candidate_paths() {
+    fn cargo_discovery_membership_tracks_census_without_reading_source_bodies() {
         use std::path::PathBuf;
         let resolver = CargoDependencyResolver;
         let same = [0u8; 32];
@@ -5198,7 +6848,20 @@ pub(super) mod dependency_packs {
                 &same,
             )
         };
-        assert!(check("src/new.rs"));
+        assert!(!check("src/new.rs"));
+        assert!(!check("src/new.RS"));
+        assert!(!check("build.rs"));
+        assert!(!resolver.is_discovery_candidate(std::path::Path::new("build.rs")));
+        assert!(check("README.md"));
+        assert!(
+            !brokk_bifrost_analysis::analyzer::semantic_model::discovery_membership_unchanged(
+                &resolver,
+                &[],
+                &[PathBuf::from("build.rs")],
+                &same,
+                &same,
+            )
+        );
         assert!(!check("crates/x/Cargo.toml"));
         assert!(!check("rust-toolchain.toml"));
     }
@@ -5399,6 +7062,74 @@ mod tests {
     use brokk_bifrost_rust::test_helpers::write_fixture_file as write;
     use std::collections::BTreeSet;
     use std::sync::Arc;
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12163: a parent module's use leaked into nested mod items"
+    )]
+    fn import_binders_stop_at_modules_but_inherit_block_item_scopes() {
+        let source = r#"use termio::stdout;
+fn root() { stdout(); }
+fn outer() { fn nested() { stdout(); } }
+mod child { use std::io::*; fn f() { stdout(); } }
+fn blocks() { use blockio::stdout; stdout();
+    fn nested() { stdout(); }
+    { stdout(); }
+    mod child { fn f() { stdout(); } }
+}
+fn sibling() { stdout(); }
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        assert!(!tree.root_node().has_error());
+        let mut imports = Vec::new();
+        let mut calls = Vec::new();
+        let mut pending = vec![tree.root_node()];
+        while let Some(node) = pending.pop() {
+            if node.kind() == "use_declaration" {
+                imports.extend(
+                    brokk_bifrost_rust::imports::rust_imports_from_use_declaration(node, source),
+                );
+            }
+            if node.kind() == "call_expression" {
+                calls.push((node.start_position().row + 1, node.start_byte()));
+            }
+            let mut cursor = node.walk();
+            pending.extend(node.named_children(&mut cursor));
+        }
+        let mut actual = calls
+            .into_iter()
+            .map(|(line, byte)| {
+                let mut owners = imports
+                    .iter()
+                    .filter_map(|import| {
+                        let path = import.path.as_ref().unwrap();
+                        super::rust_import_binder_visible_at_byte(path, byte, &tree)
+                            .then(|| path.segments[0].as_str())
+                    })
+                    .collect::<Vec<_>>();
+                owners.sort_unstable();
+                (line, owners)
+            })
+            .collect::<Vec<_>>();
+        actual.sort_unstable();
+        assert_eq!(
+            actual,
+            vec![
+                (2, vec!["termio"]),
+                (3, vec!["termio"]),
+                (4, vec!["std"]),
+                (5, vec!["blockio", "termio"]),
+                (6, vec!["blockio", "termio"]),
+                (7, vec!["blockio", "termio"]),
+                (8, vec![]),
+                (10, vec!["termio"]),
+            ]
+        );
+    }
 
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
@@ -5689,6 +7420,8 @@ mod tests {
             items: Default::default(),
             types: Vec::new(),
             declarations: Vec::new(),
+            lexical_identifiers: Vec::new(),
+            declaration_spans: Vec::new(),
             declaration_units,
             module_names: Default::default(),
             imports: Vec::new(),
@@ -5697,7 +7430,8 @@ mod tests {
         assert!(retained_bytes > (16 * 1024 * 1024));
         assert!(retained_bytes <= cache_budget as usize);
 
-        let budget = brokk_bifrost_core::retention_budget::RetentionBudget::new(cache_budget);
+        let budget =
+            brokk_bifrost_core::retention_budget::RetentionBudget::for_test_capacity(cache_budget);
         let cache = budget.region::<
             super::RustHierarchySourceFactsCacheKey,
             brokk_bifrost_core::retention_budget::SharedAllocation<

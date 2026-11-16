@@ -1,6 +1,6 @@
 use super::JavaGraphSource;
 use super::extractor::{MethodCallReturnCacheKey, ScanCtx};
-use super::hits::enclosing_context;
+use super::hits::{enclosing_context, enclosing_context_uncached};
 use super::return_type::{
     FileReturnCache, JavaReturnTypeContext, LexicalTypeResolution, METHOD_RECEIVER_CHAIN_LIMIT,
     MethodAnonymousReturnCache, MethodReturnCache, is_java_nominal_type_node,
@@ -12,8 +12,13 @@ use crate::java::graph_support::{
     JavaSource, java_callable_facts, java_method_reference_parts, normalize_java_type_text,
     resolve_java_usage_type_components_in,
 };
-use crate::java::hierarchy::{JavaHierarchyFactError, java_nearest_declaring_ancestors};
+use crate::java::hierarchy::{
+    JavaHierarchyFactError, JavaSuperclass, java_nearest_declaring_ancestors,
+    java_super_member_is_accessible, java_super_receiver_class, java_superclass_form,
+};
 use crate::java::imports::static_import_path;
+use brokk_bifrost_core::analyzer::CodeUnitIndex;
+use brokk_bifrost_core::analyzer::capabilities::TypeHierarchyProvider;
 use brokk_bifrost_core::analyzer::model::{
     CallableArity, CodeUnit, Language, ProjectFile, SignatureMetadata,
 };
@@ -301,11 +306,24 @@ pub fn receiver_matches_target(
                 .map(|resolved| receiver_type_matches_target(&resolved, token, ctx))
                 .unwrap_or(ReceiverTargetMatch::Unresolved)
         }
-        "object_creation_expression" => receiver
-            .child_by_field_name("type")
-            .and_then(|type_node| resolve_type_from_node(type_node, token, ctx))
-            .map(|resolved| receiver_type_matches_target(&resolved, token, ctx))
-            .unwrap_or(ReceiverTargetMatch::Unresolved),
+        "object_creation_expression" => {
+            let matched = receiver
+                .child_by_field_name("type")
+                .and_then(|type_node| resolve_type_from_node(type_node, token, ctx))
+                .map(|resolved| receiver_type_matches_target(&resolved, token, ctx))
+                .unwrap_or(ReceiverTargetMatch::Unresolved);
+            // An erroneous creation has no value, so it reaches no member
+            // of the type it names (#10089).
+            if matched == ReceiverTargetMatch::Matched
+                && ctx
+                    .java
+                    .creation_constructor_refused(ctx.file, ctx.source, receiver)
+            {
+                ReceiverTargetMatch::Incompatible
+            } else {
+                matched
+            }
+        }
         "method_invocation" => {
             let match_result = method_invocation_return_type(receiver, token, ctx)
                 .map(|resolved| receiver_type_matches_target(&resolved, token, ctx))
@@ -317,7 +335,7 @@ pub fn receiver_matches_target(
                     .unwrap_or(match_result)
             }
         }
-        "this" | "super" => {
+        "this" => {
             if owner_matches_target_context(receiver, token, ctx)
                 || anonymous_creation_context_matches_target(receiver, token, ctx)
             {
@@ -326,6 +344,7 @@ pub fn receiver_matches_target(
                 ReceiverTargetMatch::Unresolved
             }
         }
+        "super" => super_receiver_matches_target(receiver, token, ctx),
         "field_access" => field_access_receiver_type(receiver, token, ctx)
             .map(|resolved| receiver_type_matches_target(&resolved, token, ctx))
             .unwrap_or(ReceiverTargetMatch::Unresolved),
@@ -948,6 +967,126 @@ fn anonymous_creation_context_matches_target(
     false
 }
 
+/// The class a `super` receiver reads and the class body that reads it
+/// (#9703).
+pub(super) struct SuperReceiver {
+    /// The class whose body lexically holds the `super` node. It is never the
+    /// class the member is read from, and it owns the access rights of the
+    /// read (JLS 6.6.1).
+    pub site_class: CodeUnit,
+    /// The direct superclass that body reads.
+    pub superclass: JavaSuperclass,
+}
+
+impl SuperReceiver {
+    /// The workspace class `super` reads, or `None` when the superclass is
+    /// `java.lang.Object`-like or declared outside the workspace.
+    pub fn indexed_class(self) -> Option<CodeUnit> {
+        match self.superclass {
+            JavaSuperclass::Indexed(superclass) => Some(superclass),
+            JavaSuperclass::Implicit | JavaSuperclass::Open => None,
+        }
+    }
+}
+
+/// The class an explicit `super` receiver reads (#9703).
+///
+/// `super.m()`, `super.f` and `super::m` read the members of the direct
+/// superclass of the class body that lexically contains them (JLS 15.11.2,
+/// 15.12.1, 15.13.1), never those of the enclosing class itself: an override
+/// that calls `super.m()` calls the declaration it overrides, not itself. The
+/// tree names the form of that class body ([`java_superclass_form`]) and the
+/// hierarchy names the class the form resolves to
+/// ([`java_super_receiver_class`]).
+///
+/// `None` means the superclass is unknown -- no hierarchy provider, no
+/// enclosing class, or hierarchy metadata that cannot name one class -- so the
+/// caller must stay unproven. `JavaSuperclass::Open` is the known-unknown case
+/// where the written superclass names no workspace class.
+pub(super) fn super_receiver(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<SuperReceiver> {
+    let site_class = enclosing_context_uncached(node, ctx).owner?;
+    let provider = ctx.graph.hierarchy?;
+    let superclass = super_receiver_superclass(node, &site_class, ctx.graph.index, provider)?;
+    Some(SuperReceiver {
+        site_class,
+        superclass,
+    })
+}
+
+/// The superclass an explicit `super` reads from the class body `site_class`,
+/// for every caller that holds the file's index and hierarchy provider.
+pub(super) fn super_receiver_superclass(
+    node: Node<'_>,
+    site_class: &CodeUnit,
+    index: &dyn CodeUnitIndex,
+    hierarchy: &dyn TypeHierarchyProvider,
+) -> Option<JavaSuperclass> {
+    let form = java_superclass_form(node)?;
+    java_super_receiver_class(index, form, || {
+        let answer = hierarchy.get_direct_ancestors(site_class);
+        if answer.is_complete() {
+            Ok(answer.edges)
+        } else {
+            Err(JavaHierarchyFactError::MetadataUnavailable)
+        }
+    })
+    .ok()
+}
+
+/// Whether the `super` receiver at `node` reads the target member (#9703).
+///
+/// The receiver's static type is the direct superclass of the class body that
+/// holds it, so member lookup proceeds exactly as for a receiver of that type,
+/// and only a member that body may access is one the site can name (JLS
+/// 6.6.1). `Incompatible` means the superclass lookup does not reach the
+/// target at all, which suppresses the target outright; an inaccessible
+/// nearest declaration stays `Unresolved`, because the forward side keeps it
+/// as an unproven edge.
+pub(super) fn super_receiver_matches_target(
+    node: Node<'_>,
+    token: QueryToken<'_>,
+    ctx: &ScanCtx<'_>,
+) -> ReceiverTargetMatch {
+    let Some(receiver) = super_receiver(node, ctx) else {
+        return ReceiverTargetMatch::Unresolved;
+    };
+    let outcome = match &receiver.superclass {
+        JavaSuperclass::Indexed(superclass) => receiver_type_matches_target(superclass, token, ctx),
+        // `java.lang.Object`, `java.lang.Enum` and `java.lang.Record` declare
+        // no member this workspace indexes, so no target is the one `super`
+        // reads.
+        JavaSuperclass::Implicit => ReceiverTargetMatch::Incompatible,
+        // The written superclass names no workspace class, so the member the
+        // site reads stays unknown.
+        JavaSuperclass::Open => ReceiverTargetMatch::Unresolved,
+    };
+    if outcome != ReceiverTargetMatch::Matched {
+        return outcome;
+    }
+    if super_member_is_accessible(ctx.graph.index, &ctx.spec.target, &receiver.site_class) {
+        ReceiverTargetMatch::Matched
+    } else {
+        ReceiverTargetMatch::Unresolved
+    }
+}
+
+/// Whether a `super` receiver written in `site_class` may read `member`
+/// (#9703).
+///
+/// `super` selects the nearest *accessible* declaration (JLS 6.6.1), so one
+/// the site cannot access is not a target the site names. Visibility that
+/// cannot be read stays unproven rather than assumed accessible.
+pub(super) fn super_member_is_accessible(
+    index: &dyn CodeUnitIndex,
+    member: &CodeUnit,
+    site_class: &CodeUnit,
+) -> bool {
+    matches!(
+        java_super_member_is_accessible(index, member, site_class),
+        Ok(true)
+    )
+}
+
 pub fn argument_list_arity(node: Node<'_>) -> usize {
     let Some(arguments) = node.child_by_field_name("arguments") else {
         return 0;
@@ -1282,15 +1421,27 @@ pub fn resolve_nested_type_for_owner(
     })
 }
 
+/// The class of an object creation's value. An erroneous creation, whose own
+/// constructor call has no applicable target, has no value type (#10089).
+fn creation_value_type(
+    creation: Node<'_>,
+    token: QueryToken<'_>,
+    ctx: &ScanCtx<'_>,
+) -> Option<CodeUnit> {
+    let resolved = resolve_type_from_node(creation.child_by_field_name("type")?, token, ctx)?;
+    (!ctx
+        .java
+        .creation_constructor_refused(ctx.file, ctx.source, creation))
+    .then_some(resolved)
+}
+
 pub fn infer_type_from_value(
     node: Node<'_>,
     token: QueryToken<'_>,
     ctx: &ScanCtx<'_>,
 ) -> Option<CodeUnit> {
     match node.kind() {
-        "object_creation_expression" => node
-            .child_by_field_name("type")
-            .and_then(|type_node| resolve_type_from_node(type_node, token, ctx)),
+        "object_creation_expression" => creation_value_type(node, token, ctx),
         "method_invocation" => method_invocation_return_type(node, token, ctx),
         "identifier" => {
             let name = node_text(node, ctx.source);
@@ -1360,11 +1511,15 @@ fn receiver_type_from_node_at_depth(
         "type_identifier" | "scoped_type_identifier" | "generic_type" => {
             resolve_type_from_node(node, token, ctx)
         }
-        "object_creation_expression" => node
-            .child_by_field_name("type")
-            .and_then(|type_node| resolve_type_from_node(type_node, token, ctx)),
+        "object_creation_expression" => creation_value_type(node, token, ctx),
         "method_invocation" => method_invocation_return_type_at_depth(node, token, ctx, depth),
-        "this" | "super" => enclosing_owner(node, ctx),
+        "this" => enclosing_owner(node, ctx),
+        // A chain through `super` (`super.get().x()`) is typed by the member
+        // the direct superclass declares (#9703). `java.lang.Object`,
+        // `java.lang.Enum` and `java.lang.Record` declare no member this
+        // workspace can type, and an external superclass stays unknown, so
+        // neither types the chain.
+        "super" => super_receiver(node, ctx).and_then(SuperReceiver::indexed_class),
         "field_access" => field_access_value_type(node, token, ctx, depth),
         _ => None,
     }

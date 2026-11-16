@@ -779,7 +779,11 @@ impl SelectedResolutionTypedSource<'_, '_> {
                     owner.clone(),
                     LoweredSupertypeProperty::external(
                         definition, reference, reference, ordinal, target,
-                    ),
+                    )
+                    .with_external_arguments(row.get::<_, Option<String>>(3)?.as_deref())
+                    .map_err(|error| {
+                        invalid_fact(format!("external supertype arguments: {error}"))
+                    })?,
                 ))
             },
         )
@@ -802,6 +806,7 @@ pub(super) struct ExternalSignatureMemo {
         crate::hash::HashMap<SemanticId, SelectedTypedRow<LoweredDeclarationTypeProperty>>,
     pub(super) seeds: crate::hash::HashMap<SemanticId, SelectedTypedRow<LoweredIntrinsicSeed>>,
     parameter_slots: crate::hash::HashSet<SemanticId>,
+    generic_formals: crate::hash::HashMap<SemanticId, Vec<SelectedTypedRow<LoweredGenericFormal>>>,
     nominal_argument_reasons: crate::hash::HashSet<SemanticId>,
     formal_nominal_argument_reasons: crate::hash::HashMap<SemanticId, Vec<SemanticId>>,
     result_only_generic_reasons: crate::hash::HashMap<SemanticId, SemanticId>,
@@ -891,6 +896,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
                         row.get::<_, String>(3)?,
                         row.get::<_, Option<String>>(4)?,
                         row.get::<_, String>(5)?,
+                        row.get::<_, Option<String>>(6)?,
                     ));
                 }
                 Ok(Some(rows))
@@ -900,7 +906,11 @@ impl SelectedResolutionTypedSource<'_, '_> {
             };
             let mut decoded = Vec::new();
             let mut type_names = BTreeSet::new();
-            for (provider, owner, ordinal, parameters, result, kind) in rows {
+            for (provider, owner, ordinal, parameters, result, kind, type_parameters) in rows {
+                let type_parameters =
+                    super::super::jvm_external_inventory::decode_jvm_external_type_parameters(
+                        type_parameters.as_deref(),
+                    )?;
                 let parameters: Vec<Parameter> =
                     serde_json::from_str(&parameters).map_err(|error| {
                         invalid_fact(format!("external declaration parameters: {error}"))
@@ -985,6 +995,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
                     result,
                     generic,
                     generic_parameters,
+                    type_parameters,
                     kind,
                 ));
             }
@@ -1050,6 +1061,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
                 result,
                 generic,
                 generic_parameters,
+                type_parameters,
                 kind,
             ) in decoded
             {
@@ -1154,13 +1166,17 @@ impl SelectedResolutionTypedSource<'_, '_> {
                                 slot,
                                 if callable {
                                     DeclarationTypeRole::Return
+                                } else if kind == "nested_type" {
+                                    // A nested declaration denotes its declared owner type;
+                                    // definition lookup still retains the member identity.
+                                    DeclarationTypeRole::Identity
                                 } else {
                                     DeclarationTypeRole::Value
                                 },
                             ),
                         ),
                     );
-                    if !callable {
+                    if !callable && kind != "nested_type" {
                         memo.materialize_value_seed(slot);
                     }
                     result_types.push(LoweredCallableResultTypeProperty::new(0, slot));
@@ -1171,16 +1187,10 @@ impl SelectedResolutionTypedSource<'_, '_> {
                 let completion = if generic {
                     // No erased signature or unconstrained inference is a proof
                     // of an exact substitution for an external type variable.
-                    let mut hash =
-                        brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher::new(
-                            b"bifrost-jvm-external-generic-signature-obligation:v1",
-                        );
-                    hash.field("provider", owner.provider_id.as_bytes());
-                    hash.field("owner", owner.owner_fqn.as_bytes());
-                    hash.field("member", &ordinal.to_be_bytes());
                     let reason = self.context_identities.named_semantic(
-                        hash.finish(),
+                        member.jvm_generic_signature_obligation_digest(),
                         "UnsupportedExternalSignatureTypeVariable",
+                        crate::analyzer::resolution::ReasonDeterminism::Unaudited,
                         "The external declaration has an unproven type-variable substitution",
                     );
                     if !generic_parameters {
@@ -1192,14 +1202,43 @@ impl SelectedResolutionTypedSource<'_, '_> {
                 } else {
                     ResolutionCompletion::Complete
                 };
-                let signature =
-                    LoweredCallableSignatureProperty::new(definition, 0, properties, completion)
-                        .with_result_types(result_types)
-                        .with_applicability_shape(
-                            vec![0].into_boxed_slice(),
-                            applicability.into_boxed_slice(),
-                            None,
-                        );
+                // Allocate formal declaration identities after the old type slots so
+                // signature type identities and existing refusal reasons remain stable.
+                let own_count = type_parameters.as_ref().map_or(0, Vec::len);
+                let coordinate =
+                    crate::analyzer::resolution::ExternalMemberCoordinate::InventoryOrdinal(
+                        ordinal,
+                    );
+                let mut hooks = JvmTypeTermHooks {
+                    member: &member,
+                    coordinate: &coordinate,
+                    next_slot: &mut next_slot,
+                    names: &names,
+                    identities: &self.context_identities,
+                };
+                let formals = (0..own_count)
+                    .map(|position| {
+                        let (parameter, _) = hooks.allocate();
+                        hooks.wrap(LoweredGenericFormal::new(
+                            definition,
+                            u32::try_from(position).expect("external generic ordinal fits u32"),
+                            parameter,
+                        ))
+                    })
+                    .collect();
+                memo.generic_formals.insert(definition, formals);
+                let signature = LoweredCallableSignatureProperty::new(
+                    definition,
+                    u32::try_from(own_count).expect("external generic count fits u32"),
+                    properties,
+                    completion,
+                )
+                .with_result_types(result_types)
+                .with_applicability_shape(
+                    vec![0].into_boxed_slice(),
+                    applicability.into_boxed_slice(),
+                    None,
+                );
                 memo.signatures.insert(
                     definition,
                     Some(SelectedTypedRow::external_member(owner, ordinal, signature)),
@@ -1209,6 +1248,26 @@ impl SelectedResolutionTypedSource<'_, '_> {
         Ok(TypedFactReadOutcome::exhausted(
             ResolutionCompletion::Complete,
         ))
+    }
+
+    pub(super) fn visit_external_generic_formals(
+        &self,
+        owners: &[SemanticId],
+        cancellation: &CancellationToken,
+        visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredGenericFormal>>,
+    ) -> StoreResult<TypedFactReadOutcome> {
+        let outcome = self.materialize_external_declaration_types(owners, cancellation)?;
+        if !outcome.is_exhausted() {
+            return Ok(outcome);
+        }
+        let memo = self.external_signatures.borrow();
+        let rows = owners
+            .iter()
+            .filter_map(|owner| memo.generic_formals.get(owner))
+            .flatten()
+            .cloned()
+            .collect();
+        self.external_signature_rows(rows, cancellation, visitor)
     }
 
     pub(super) fn visit_external_declaration_types(
@@ -1359,13 +1418,14 @@ WITH requested AS (
     FROM json_each(?1)
 )
 SELECT DISTINCT member.provider_id,member.owner_fqn,member.ordinal,
-       json(member.parameters_jsonb),json(member.return_type_jsonb),member.member_kind
+       json(member.parameters_jsonb),json(member.return_type_jsonb),member.member_kind,json(member.type_parameters_jsonb)
 FROM requested
 JOIN jvm_external_owner_members selected USING(provider_id,owner_fqn,ordinal)
 JOIN jvm_external_owner_members member
   ON member.provider_id=selected.provider_id AND member.owner_fqn=selected.owner_fqn
  AND member.member_name=selected.member_name AND member.member_kind=selected.member_kind
-WHERE member.signature_present=1 AND member.member_kind IN ('method','function','constructor','field','constant')
+WHERE (member.signature_present=1 OR member.member_kind='nested_type')
+  AND member.member_kind IN ('method','function','constructor','field','constant','nested_type')
   AND member.provider_id IN (SELECT value FROM json_each(?2))
 ORDER BY member.provider_id,member.owner_fqn,member.ordinal
 "#;
@@ -1472,6 +1532,18 @@ pub(super) trait TypeTermHooks {
         None
     }
     fn pointer_element<'a>(&self, _term: &'a TypeRef) -> Option<&'a TypeRef> {
+        None
+    }
+    /// A generic application `Head<Arguments>` splits into the nominal head and
+    /// its arguments. The default reports no application, so a language
+    /// without generic type values keeps treating the whole term as a nominal
+    /// head whose arguments leave it incomplete. The lowerer resolves the
+    /// head through `nominal`; it does not yet produce argument slots, so a
+    /// hook that reports an application must keep `exact_nominal` false for it.
+    fn application_arguments<'a>(
+        &self,
+        _term: &'a TypeRef,
+    ) -> Option<(&'a TypeRef, &'a [TypeRef])> {
         None
     }
 }
@@ -1694,11 +1766,15 @@ pub(super) fn lower_type_term(
             pending.push((key, key_child, None));
             continue;
         }
-        let known = hooks.nominal(term, &memo.owners)?;
+        let head = hooks
+            .application_arguments(term)
+            .map_or(term, |(head, _arguments)| head);
+        let known = hooks.nominal(head, &memo.owners)?;
         let incomplete_type = || {
             let reason = identities.named_semantic(
                 digest,
                 "UnsupportedExternalSignatureType",
+                crate::analyzer::resolution::ReasonDeterminism::Unaudited,
                 "The external declaration type term has no proven exact native substitution",
             );
             ResolutionCompletion::incomplete([ResolutionIncompleteReason::UnsupportedSemantic(

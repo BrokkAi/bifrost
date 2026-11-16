@@ -20,8 +20,6 @@ use brokk_bifrost_analysis::analyzer::store::Result;
 
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionContextMetrics;
 
-use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperationInput;
-
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperationOpenOutcome;
 
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperationOutcome;
@@ -250,14 +248,9 @@ fn with_rust_graph_operation<T>(
             ))));
         }
     };
-    let input = SelectedResolutionOperationInput::new(
-        rust.inner.project(),
-        rust.inner.workspace_id(),
-        snapshots.as_ref(),
-        &languages,
-        &masks,
-    )
-    .with_content_mounts(content_mounts);
+    let input = rust
+        .selected_resolution_operation_input(snapshots.as_ref(), &languages, &masks)
+        .with_content_mounts(content_mounts);
     let operation = match rust
         .inner
         .analyzer_store()
@@ -406,6 +399,7 @@ fn project_rust_graph_in_operation(
         rust.inner.analyzer_config().parallelism(),
         cancellation,
         &mut SelectedResolutionContextMetrics,
+        &|operation| rust.operation_read_frame(operation),
         &mut stage,
     )? {
         SelectedResolutionOperationOutcome::Native(staged) => staged.summary,

@@ -1,9 +1,10 @@
 use super::JavaGraphSource;
+use crate::java::graph_support::java_has_anonymous_class_body;
 use crate::java::graph_support::{
     JavaSource, UniqueClassInFile, resolve_java_usage_type_components_in,
 };
 use crate::java::source_facts::JavaFileSourceFacts;
-use crate::java::source_types::{is_java_nested_return_scope, java_has_anonymous_class_body};
+use crate::java::source_types::is_java_nested_return_scope;
 use brokk_bifrost_core::analyzer::RelationalDefinitionFrontier;
 use brokk_bifrost_core::analyzer::java_facts::{JavaSourceTypeId, JavaTypeSyntaxShape};
 use brokk_bifrost_core::analyzer::memo_attribution::{ReplayingMemo, ReplayingMemoEntry};

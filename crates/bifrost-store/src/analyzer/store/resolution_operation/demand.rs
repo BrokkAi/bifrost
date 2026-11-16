@@ -1413,7 +1413,7 @@ impl BatchResolutionFragmentSource for ClosedForwardSource<'_> {
         &self,
         reference: SemanticId,
         cancellation: &CancellationToken,
-    ) -> Result<Option<crate::analyzer::resolution::UniverseEntry>> {
+    ) -> Result<Option<crate::analyzer::resolution::SelectedUniverseEntry>> {
         if cancellation.is_cancelled() {
             return Ok(None);
         }
@@ -1425,7 +1425,16 @@ impl BatchResolutionFragmentSource for ClosedForwardSource<'_> {
                 arena
                     .endpoints
                     .contains_key(owner)
-                    .then_some(*entry)
+                    .then(|| {
+                        entry.map(|entry| crate::analyzer::resolution::SelectedUniverseEntry {
+                            entry,
+                            completion: arena
+                                .endpoint_completions
+                                .get(owner)
+                                .cloned()
+                                .unwrap_or(ResolutionCompletion::Complete),
+                        })
+                    })
                     .flatten()
             }))
     }

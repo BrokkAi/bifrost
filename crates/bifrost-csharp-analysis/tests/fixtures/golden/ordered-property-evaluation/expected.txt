@@ -35,8 +35,26 @@ sdk-property:
 App/A.cs: unproven
 gap=open_default_glob "Directory.Build.props": EnableDefaultCompileItems assignment is conditioned, late or unknown: false
 true-guard:
+App/A.cs: outside
+same-fragment-defaults:
+App/A.cs: outside
+same-fragment-excludes:
+App/A.cs: outside
+default-before-import-disables:
 App/A.cs: unproven
-gap=open_default_glob "Directory.Build.props": EnableDefaultCompileItems assignment is conditioned, late or unknown: false
+gap=unsupported_project_items "App/App.csproj": unresolved Import: [("Project", "Defaults.props")]
+gap=open_default_glob "App/App.csproj": EnableDefaultCompileItems assignment is conditioned, late or unknown: true
+gap=unresolved_compilation_metadata "App/App.csproj": an unsupported configuration shape can change compilation metadata
+default-before-import-enables:
+App/A.cs: unproven
+gap=unsupported_project_items "App/App.csproj": unresolved Import: [("Project", "Defaults.props")]
+gap=open_default_glob "App/App.csproj": EnableDefaultCompileItems assignment is conditioned, late or unknown: false
+gap=unresolved_compilation_metadata "App/App.csproj": an unsupported configuration shape can change compilation metadata
+default-before-import-false-from-import:
+App/A.cs: unproven
+gap=open_default_glob "App/App.csproj": EnableDefaultCompileItems assignment is conditioned, late or unknown: false
+default-after-import-enables:
+App/A.cs: member
 group-entry:
 App/A.cs: member
 configuration-open: named-open=["DEBUG", "RELEASE"]

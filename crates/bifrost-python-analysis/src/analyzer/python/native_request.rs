@@ -349,12 +349,16 @@ pub fn open_python_native_request<'a>(
                 return Ok(PythonNativeOpen::Cancelled);
             }
         };
+    // Coverage needs the selected mounts, so it follows the common opening and
+    // reads only the overlay delta.
+    let coverage = operation.python_summary_coverage(summary)?;
     Ok(PythonNativeOpen::Ready(PythonNativeRequest {
         snapshot: snapshot.clone(),
         operation,
         environment: PythonSelectedEnvironment {
             summary,
             python_version: profile.python_version,
+            coverage,
         },
     }))
 }
@@ -380,6 +384,29 @@ impl brokk_bifrost_core::analyzer::memo_attribution::ReadReuseRefusal for Python
 impl brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedAnalyzerServices
     for PythonAnalyzer
 {
+    fn selected_read_failed(
+        &self,
+        error: &brokk_bifrost_analysis::analyzer::store::StoreError,
+        cancelled: bool,
+    ) {
+        brokk_bifrost_analysis::analyzer::selected_services::AnalyzerSelectedServices(self)
+            .selected_read_failed(error, cancelled);
+    }
+    fn selected_read_recorder(
+        &self,
+    ) -> Option<brokk_bifrost_analysis::analyzer::store::selected_read::SelectedReadRecorder<'_>>
+    {
+        Some(
+            brokk_bifrost_analysis::analyzer::store::selected_read::SelectedReadRecorder::new(self),
+        )
+    }
+    fn record_selected_dependency(
+        &self,
+        dependency: &brokk_bifrost_analysis::analyzer::store::selected_read::SelectedDependency,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<()> {
+        brokk_bifrost_analysis::analyzer::selected_services::AnalyzerSelectedServices(self)
+            .record_selected_dependency(dependency)
+    }
     fn admit_selected_external_binding(
         &self,
         request: &brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedExternalBindingRequest<'_>,
@@ -421,5 +448,50 @@ impl brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedAnal
     fn model_authority(&self) -> Option<std::sync::Arc<dyn brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedModelAuthority + Send + Sync>>{
         brokk_bifrost_analysis::analyzer::native_points::selected_analyzer_services(self)
             .model_authority()
+    }
+    fn record_source_read(&self, file: &brokk_bifrost_analysis::analyzer::ProjectFile) {
+        brokk_bifrost_analysis::analyzer::native_points::selected_analyzer_services(self)
+            .record_source_read(file)
+    }
+}
+
+impl brokk_bifrost_analysis::analyzer::store::selected_read::SelectedReadRecording
+    for PythonAnalyzer
+{
+    fn capture(
+        &self,
+        work: &mut dyn FnMut() -> brokk_bifrost_analysis::analyzer::store::Result<()>,
+    ) -> (
+        brokk_bifrost_analysis::analyzer::store::Result<()>,
+        std::sync::Arc<dyn std::any::Any + Send + Sync>,
+    ) {
+        brokk_bifrost_analysis::analyzer::selected_services::AnalyzerSelectedServices(self)
+            .capture(work)
+    }
+    fn replay(&self, receipt: &(dyn std::any::Any + Send + Sync)) {
+        brokk_bifrost_analysis::analyzer::selected_services::AnalyzerSelectedServices(self)
+            .replay(receipt);
+    }
+    fn reusable(&self, receipt: &(dyn std::any::Any + Send + Sync)) -> bool {
+        brokk_bifrost_analysis::analyzer::selected_services::AnalyzerSelectedServices(self)
+            .reusable(receipt)
+    }
+    fn receipt_bytes(&self, receipt: &(dyn std::any::Any + Send + Sync)) -> usize {
+        brokk_bifrost_analysis::analyzer::selected_services::AnalyzerSelectedServices(self)
+            .receipt_bytes(receipt)
+    }
+    fn failed(&self, error: &brokk_bifrost_analysis::analyzer::store::StoreError, cancelled: bool) {
+        brokk_bifrost_analysis::analyzer::selected_services::AnalyzerSelectedServices(self)
+            .failed(error, cancelled);
+    }
+    fn matches_frame(
+        &self,
+        owner: brokk_bifrost_analysis::analyzer::semantic::derivation::DerivationKindId,
+        revision: &dyn std::any::Any,
+        authority: &dyn std::any::Any,
+        inventory:&brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionMountInventory<'_>,
+    ) -> bool {
+        brokk_bifrost_analysis::analyzer::selected_services::AnalyzerSelectedServices(self)
+            .matches_frame(owner, revision, authority, inventory)
     }
 }

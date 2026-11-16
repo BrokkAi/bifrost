@@ -150,9 +150,8 @@ pub(crate) struct PreparedKotlinScanFile {
     pub(crate) parsed: brokk_bifrost_core::analyzer::usages::parsed_tree::ParsedTreeFile,
 }
 
-/// Read and parse each candidate once, preferring the indexed overlay text
-/// over the on-disk text exactly as the per-file scan did. Unreadable and
-/// empty files scan as nothing, so they prepare as nothing.
+/// Read and parse each candidate once from the analyzer's indexed source.
+/// The answer builder must account for candidates absent from this preparation.
 pub(crate) fn prepare_kotlin_scan_files(
     analyzer: &dyn IAnalyzer,
     files: &[ProjectFile],
@@ -164,9 +163,7 @@ pub(crate) fn prepare_kotlin_scan_files(
     files
         .iter()
         .filter_map(|file| {
-            let source = analyzer
-                .indexed_source(file)
-                .or_else(|| analyzer.project().read_source(file).ok())?;
+            let source = analyzer.indexed_source(file)?;
             let parsed = parse_tree_sitter_source(source, ParseSpec::whole(&language))?;
             Some(PreparedKotlinScanFile {
                 file: file.clone(),

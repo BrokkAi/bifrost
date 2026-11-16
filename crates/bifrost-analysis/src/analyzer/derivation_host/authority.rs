@@ -8,11 +8,25 @@ use brokk_bifrost_store::analyzer::store::reader_binding::ReaderBinding;
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum AnalyzerAuthority {
     Main,
+    ConfigurationOnly,
     Overlay,
     UnprovedStage,
 }
 
 impl AnalyzerAuthority {
+    pub fn for_kind(
+        binding: &ReaderBinding,
+        kind: brokk_bifrost_semantic::analyzer::semantic::derivation::DerivationKindId,
+    ) -> Self {
+        if kind.0 == "derivation:rust_unit_configuration:v1"
+            && binding.proves_configuration_selection()
+        {
+            Self::ConfigurationOnly
+        } else {
+            Self::for_binding(binding)
+        }
+    }
+
     pub fn for_binding(binding: &ReaderBinding) -> Self {
         if binding.proves_main_selection() {
             Self::Main
@@ -25,7 +39,7 @@ impl AnalyzerAuthority {
 impl DerivationAuthority for AnalyzerAuthority {
     fn retention_refusal(&self) -> Option<NotReusableCause> {
         match self {
-            Self::Main => None,
+            Self::Main | Self::ConfigurationOnly => None,
             Self::Overlay => Some(NotReusableCause::OverlayAuthority),
             Self::UnprovedStage => Some(NotReusableCause::UnprovedStage),
         }

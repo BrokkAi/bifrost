@@ -542,6 +542,7 @@ pub(crate) mod tests {
             ),
             kind: brokk_bifrost_analysis::analyzer::semantic::ir::SemanticGapKind::Unsupported,
             budget: None,
+            dispatch: Default::default(),
             discharge: brokk_bifrost_analysis::analyzer::semantic::ir::SemanticGapDischarge::None,
             detail,
             source,

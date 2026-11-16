@@ -122,6 +122,7 @@ impl RustAnalyzer {
             )));
             return Err(RustCargoRouteError::Unavailable);
         }
+        self.inner.rederive_rust_summaries_after_live_repair();
         Ok(())
     }
 
@@ -254,6 +255,11 @@ impl RustAnalyzer {
     fn verify_rust_fact_catch_up(&self) {
         let error = match self.rust_files_without_facts() {
             Ok(stale) if stale.is_empty() => {
+                // Every live file has published facts, so every unit member can
+                // publish the surface coordinates the summary writer needs.
+                // Derive the summaries the repair withdrew before reporting the
+                // generation ready.
+                self.inner.rederive_rust_summaries_after_live_repair();
                 self.set_rust_fact_readiness(RustFactReadiness::Ready);
                 return;
             }

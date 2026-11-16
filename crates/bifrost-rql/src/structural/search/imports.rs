@@ -15,6 +15,8 @@ pub(super) fn push_seed_provider_omission(
             line!()
         )
     });
+    // The execution-state diagnostic this pushes carries the dependence into
+    // the query's reuse verdict.
     analyzer.mark_execution_dependent();
     diagnostics.push(QueryExecutionState::diagnostic(
         analyzer,

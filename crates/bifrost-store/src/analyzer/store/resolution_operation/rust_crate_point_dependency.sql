@@ -28,12 +28,12 @@ dependency_keys(unit_key) AS (
  UNION
  SELECT dependency.dependency_unit_key
  FROM owner
- CROSS JOIN main.rust_unit_summary_placements AS placement
+ CROSS JOIN temp.rust_unit_summary_placements AS placement
   ON placement.summary_id=owner.summary_id AND placement.module_path='crate'
- CROSS JOIN main.resolution_unit_summary_members AS member
-  ON member.summary_id=placement.summary_id AND member.member_ordinal=placement.member_ordinal
  CROSS JOIN source_rust_import_targets AS import
-  ON import.blob_id=member.blob_id
+  ON import.blob_id=(SELECT member.blob_id FROM temp.selected_unit_member_blobs AS member
+                     WHERE member.summary_id=placement.summary_id
+                       AND member.member_ordinal=placement.member_ordinal)
  CROSS JOIN main.rust_unit_summary_dependency_names AS name
   ON name.summary_id=owner.summary_id AND name.extern_name=import.imported_name
  CROSS JOIN main.resolution_unit_summary_dependencies AS dependency

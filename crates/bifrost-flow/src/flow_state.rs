@@ -26,10 +26,15 @@
 //! -- is `brokk-bifrost-core`'s, because the RQL registries that spell those
 //! same values live below this crate and must not own a second spelling table.
 
+use crate::analyzer::reuse_verdict::{CarriesReuseVerdict, ExecutionCause, ReuseVerdict};
+use crate::analyzer::semantic::binding_initialization::{
+    BindingDefinitions, BindingEventKey, BindingInitializationEvent, invalidated_binding,
+};
 use crate::analyzer::semantic::cfg_algorithms::{
     CfgAlgorithmBudget, CfgAlgorithmError, CfgAlgorithmRequest, DenseBidirectionalGraph,
     Dominators, FeasibleSuccessors, GenKillFacts, LiveValueSets, Reachability, ReachingSets,
-    dominators, forward_reachability, live_values, reaching_definitions, reverse_reachability,
+    dominators, forward_reachability, forward_reachability_from_all, live_values,
+    reaching_definitions, reverse_reachability, strongly_connected_components_with_order,
 };
 use crate::analyzer::semantic::derive_property_reaching_over_graph;
 use crate::analyzer::semantic::statement_entries::CandidateControlRouteIndex;
@@ -46,7 +51,7 @@ use crate::analyzer::semantic::{
     SemanticGapDischarge, SemanticGapId, SemanticGapImpact, SemanticGapKind, SemanticGapSubject,
     SemanticOutcome, SemanticRequest, SemanticValueKind, SemanticWork, SourceMappingId,
     SourceMappingKind, SourceSpan, StableDigest, SynchronizationOperation, SynchronizationPayload,
-    TransferKind, ValueFlowKind, ValueFlowOracle, ValueId, ValueUseKind, WorkspaceIcfgProvider,
+    ValueFlowKind, ValueFlowOracle, ValueId, WorkspaceIcfgProvider,
 };
 use crate::analyzer::semantic_model::{
     ActiveSemanticModelSnapshot, ProcedureSummaryMemberKey, ResolvedActiveSemanticModels,
@@ -69,6 +74,11 @@ use brokk_bifrost_analysis::analyzer::structural::{
 };
 use brokk_bifrost_analysis::analyzer::usages::get_definition::parse_tree_for_language;
 use brokk_bifrost_core::profiling;
+use brokk_bifrost_core::{
+    hash::allocated_vec_slot_bytes,
+    request_memo::RequestMemo,
+    retention_budget::{RetainedBytes, RetentionBudget},
+};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, Weak};
 use tree_sitter::Node;
@@ -117,10 +127,24 @@ pub fn procedure_wire_id(handle: &ProcedureHandle) -> String {
 /// mount-independent artifact and structured-locator identity used by public
 /// semantic rows without decoding a rendered identifier.
 pub fn procedure_public_digest(handle: &ProcedureHandle) -> StableDigest {
-    crate::analyzer::semantic::SemanticProcedureReference::public_digest_for(
+    let base = crate::analyzer::semantic::SemanticProcedureReference::public_digest_for(
         handle.artifact().key(),
         handle.semantics().locator(),
-    )
+    );
+    let alternate = |domain: &'static [u8]| {
+        let mut digest = LengthDelimitedDigest::new(domain);
+        digest.push(base.as_bytes());
+        digest.finish()
+    };
+    match handle.interpretation() {
+        crate::analyzer::semantic::ProcedureInterpretation::Base => base,
+        crate::analyzer::semantic::ProcedureInterpretation::CandidateAlternate => {
+            alternate(b"bifrost-code-query-procedure-candidate-alternate-v1")
+        }
+        crate::analyzer::semantic::ProcedureInterpretation::ExecutableAlternate => {
+            alternate(b"bifrost-code-query-procedure-executable-v1")
+        }
+    }
 }
 
 /// Stable content-scoped identity for one semantic program point.
@@ -135,6 +159,15 @@ pub fn program_point_wire_id(handle: &ProgramPointHandle) -> String {
         .source_mapping(point.source)
         .expect("validated program point has a source mapping");
     let mut digest = LengthDelimitedDigest::new(b"bifrost-code-query-semantic-wire-id-v2");
+    match procedure.interpretation() {
+        crate::analyzer::semantic::ProcedureInterpretation::Base => {}
+        crate::analyzer::semantic::ProcedureInterpretation::CandidateAlternate => {
+            digest.push(b"candidate-alternate");
+        }
+        crate::analyzer::semantic::ProcedureInterpretation::ExecutableAlternate => {
+            digest.push(b"executable-alternate");
+        }
+    }
     digest.push(procedure.artifact().key().public_fingerprint().as_bytes());
     digest.push(b"program_point");
     procedure
@@ -520,6 +553,7 @@ fn property_reason_blocks(reason: &PropertyReachingIncompleteReason, axis: FlowS
         | SelectedAncestorStore { .. }
         | SelectedAliasClosureUnavailable { .. }
         | SelectedSemanticGap { .. }
+        | SelectedCleanupMemberGap { .. }
         | InputRelationBudgetExceeded { .. }
         | Cancelled
         | UnsupportedLocation { .. }
@@ -549,7 +583,7 @@ const fn property_axes() -> &'static [FlowStateAxis] {
 pub fn gap_has_exit_only_control(gap: &SemanticGap) -> bool {
     gap.capability == SemanticCapability::ExceptionalControlFlow
         && matches!(
-            gap.discharge,
+            gap.control_flow_discharge(),
             SemanticGapDischarge::NonRejoiningExceptionalExit
                 | SemanticGapDischarge::NonRejoiningExceptionalExitAfterInertDrops
                 | SemanticGapDischarge::ExitOnlyProcedureCompletion
@@ -561,7 +595,7 @@ pub fn gap_has_exit_only_control(gap: &SemanticGap) -> bool {
 /// state has no such proof and must leave that variant open.
 fn gap_has_unobserved_exceptional_exit(gap: &SemanticGap) -> bool {
     gap_has_exit_only_control(gap)
-        && gap.discharge == SemanticGapDischarge::NonRejoiningExceptionalExit
+        && gap.control_flow_discharge() == SemanticGapDischarge::NonRejoiningExceptionalExit
 }
 
 /// Cleanup can only continue its destination or unwind. Finally/recover
@@ -584,7 +618,7 @@ pub fn cleanup_has_retained_destination(
 
 fn cleanup_is_control_irrelevant(semantics: &ProcedureSemantics, gap: &SemanticGap) -> bool {
     matches!(semantics.locator().language(), brokk_bifrost_core::analyzer::model::LanguageDialect::Standard(language) if destructor_style_cleanup(language))
-        && gap.subject == SemanticGapSubject::Point
+        && gap.subject.is_point_or_value(semantics.cleanup_chains())
         && gap.capability == SemanticCapability::CleanupControlFlow
         && gap.impacts.iter().all(|impact| {
             matches!(
@@ -1239,7 +1273,7 @@ impl FlowStateDerivation {
             return true;
         }
         if gap.capability == SemanticCapability::ExceptionalControlFlow
-            && gap.discharge == SemanticGapDischarge::RetainedControlTopology
+            && gap.control_flow_discharge() == SemanticGapDischarge::RetainedControlTopology
             && self.dominance.as_ref().is_some_and(|dominance| {
                 with_control_graph!(semantics, &self.control_edge_mask, |graph| {
                     !dominance.dominates(graph, semantics.entry_point(), gap.point)
@@ -1250,15 +1284,17 @@ impl FlowStateDerivation {
         }
         // #6409: destructor-style cleanup cannot uninitialize a fresh scalar
         // local. Finally/recover cleanup can redirect control and stays open.
-        if cleanup_is_control_irrelevant(semantics, gap)
-            || (gap.capability == SemanticCapability::ResourceManagement
-                && (gap.impacts.iter().next().is_none()
-                    || (gap.subject == SemanticGapSubject::Point
-                        && matches!(semantics.locator().language(),
-                            brokk_bifrost_core::analyzer::model::LanguageDialect::Standard(language)
-                                if destructor_style_cleanup(language))
-                        && cleanup_has_retained_destination(semantics, gap.point))))
-        {
+        let cleanup_keeps_initialization = |gap: &SemanticGap| {
+            cleanup_is_control_irrelevant(semantics, gap)
+                || (gap.capability == SemanticCapability::ResourceManagement
+                    && (gap.impacts.iter().next().is_none()
+                        || (gap.subject.is_point_or_value(semantics.cleanup_chains())
+                            && matches!(semantics.locator().language(),
+                                brokk_bifrost_core::analyzer::model::LanguageDialect::Standard(language)
+                                    if destructor_style_cleanup(language))
+                            && cleanup_has_retained_destination(semantics, gap.point))))
+        };
+        if cleanup_keeps_initialization(gap) {
             return true;
         }
         let discharged = match gap.capability {
@@ -1267,7 +1303,8 @@ impl FlowStateDerivation {
                 // it uninitialized.
                 SemanticGapSubject::Value(value) => {
                     value != binding
-                        || gap.discharge == SemanticGapDischarge::RebindAtCallOrSuspension
+                        || gap.control_flow_discharge()
+                            == SemanticGapDischarge::RebindAtCallOrSuspension
                 }
                 SemanticGapSubject::Capture(capture) => {
                     semantics.capture(capture).is_some_and(|capture| {
@@ -1319,8 +1356,12 @@ impl FlowStateDerivation {
                 && semantics.gaps().iter().all(|other| {
                     !capability_axes_blocked_by(other.capability)
                         .contains(&FlowStateAxis::ReachingRelation)
+                        // #10879: value-scoped destructor gaps retain the same
+                        // control destinations as point-scoped cleanup. They
+                        // must not disable positional relevance of later gaps.
+                        || cleanup_keeps_initialization(other)
                         || gap_has_exit_only_control(other)
-                        || other.discharge == SemanticGapDischarge::RetainedControlTopology
+                        || other.control_flow_discharge() == SemanticGapDischarge::RetainedControlTopology
                 })
                 && !self.point_reaches(semantics, gap.point, read_point, true))
     }
@@ -1478,11 +1519,14 @@ impl FlowStateDerivation {
                 continue;
             }
             let relevant = match gap.subject {
-                SemanticGapSubject::Procedure => true,
+                SemanticGapSubject::FutureConstruction
+                | SemanticGapSubject::FutureActivation
+                | SemanticGapSubject::Procedure => true,
                 // A nested callable can rebind the binding only while this
                 // procedure calls out or suspends.
                 SemanticGapSubject::Value(value)
-                    if gap.discharge == SemanticGapDischarge::RebindAtCallOrSuspension =>
+                    if gap.control_flow_discharge()
+                        == SemanticGapDischarge::RebindAtCallOrSuspension =>
                 {
                     bindings.contains(&value)
                         && chain.iter().any(|point| {
@@ -1491,14 +1535,16 @@ impl FlowStateDerivation {
                                     matches!(
                                         event.effect,
                                         SemanticEffect::Invoke { .. }
-                                            | SemanticEffect::AsyncSuspend { .. }
-                                            | SemanticEffect::AsyncResume { .. }
+                                            | SemanticEffect::MemoryInterference
                                     )
                                 })
                             })
                         })
                 }
                 SemanticGapSubject::Value(value) => bindings.contains(&value),
+                SemanticGapSubject::CleanupOwners(segment) => bindings
+                    .iter()
+                    .any(|value| semantics.cleanup_chains().contains_owner(segment, *value)),
                 SemanticGapSubject::Capture(capture) => {
                     semantics.capture(capture).is_none_or(|capture| {
                         !matches!(
@@ -1585,6 +1631,7 @@ impl FlowStateDerivation {
         let mut reasons = observation_completeness
             .reasons()
             .iter()
+            .filter(|reason| !request.observation_reason_is_discharged(procedure, reason))
             .filter(|reason| {
                 !matches!(
                     reason,
@@ -1711,16 +1758,18 @@ impl FlowStateDerivation {
             semantics.value(binding).expect("binding exists").kind,
             SemanticValueKind::Local | SemanticValueKind::Parameter { .. }
         ));
-        let procedure_key = (
+        let procedure_key = DeadWriteProcedureKey(
             Arc::as_ptr(procedure.artifact()) as usize,
             procedure.id(),
+            procedure.interpretation(),
             self.generation,
         );
         let procedure_index = request
+            .memos
             .dead_write_procedure_cache
-            .entry(procedure_key)
-            .or_insert_with(|| Arc::new(dead_write_procedure_index(self, procedure)))
-            .clone();
+            .get_or_insert_with(procedure_key, || {
+                dead_write_procedure_index(self, procedure)
+            });
         let mut omitted_edges = self
             .control_edge_mask
             .omitted
@@ -1782,6 +1831,7 @@ impl FlowStateDerivation {
             .overwrite_observation_completeness(procedure)
             .reasons()
             .iter()
+            .filter(|reason| !request.observation_reason_is_discharged(procedure, reason))
             .filter(|reason| {
                 !matches!(
                     reason,
@@ -1822,30 +1872,68 @@ impl FlowStateDerivation {
         if procedure_index.escaped_bindings.contains(&binding) {
             reasons.push(FlowStateIncompleteReason::BindingStateNotClosed { binding });
         }
+        // A non-drop gap that can reach the establishment may remove the write
+        // from the configured program; a drop omission never removes code.
+        // One cached forward closure answers this for every write in the graph.
+        let mut prefix_candidates = reasons
+            .iter()
+            .filter_map(|reason| match reason {
+                FlowStateIncompleteReason::LoweringGap { gaps, .. } => Some(gaps),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|id| semantics.gap(*id))
+            .filter(|gap| !gap.is_implicit_drop_omission())
+            .map(|gap| gap.point)
+            .collect::<Vec<_>>();
+        if !prefix_candidates.is_empty() {
+            let entry = match self.cached_dead_write_reachability(
+                procedure,
+                procedure_key,
+                &omitted_edges,
+                infeasible_edges,
+                semantics.entry_point(),
+                request,
+            ) {
+                Ok(entry) => entry,
+                Err(error) => {
+                    push_algorithm_reason(error, FlowStateAxis::ReachingRelation, &mut reasons);
+                    return DeadWriteAnswer::Open { reasons };
+                }
+            };
+            prefix_candidates.retain(|point| entry.membership()[point.index()]);
+        }
+        prefix_candidates.sort_unstable();
+        prefix_candidates.dedup();
+        let blocking_prefix = if prefix_candidates.is_empty() {
+            false
+        } else {
+            match self.cached_dead_write_prefix_reachability(
+                procedure,
+                procedure_key,
+                &omitted_edges,
+                infeasible_edges,
+                &prefix_candidates,
+                request,
+            ) {
+                Ok(after_gaps) => after_gaps.membership()[origin.point.index()],
+                Err(error) => {
+                    push_algorithm_reason(error, FlowStateAxis::ReachingRelation, &mut reasons);
+                    return DeadWriteAnswer::Open { reasons };
+                }
+            }
+        };
         // The established overwrite proof already checked these same
         // binding events and places point-local gaps only in the value's
         // live region. A later gap after the replacement cannot read this
         // value. Reuse that complete certificate before applying this
         // relation's otherwise conservative procedure-wide gap gate.
         if !reasons.is_empty()
-            // The overwrite certificate starts at this establishment. An
-            // opaque macro reachable before it may return without executing
-            // the write at all; the suffix certificate cannot prove that
-            // source-level reachability. Keep that macro gap Open.
-            && !reasons.iter().any(|reason| {
-                let FlowStateIncompleteReason::LoweringGap { gaps, .. } = reason else {
-                    return false;
-                };
-                gaps.iter().any(|id| {
-                    semantics.gap(*id).is_some_and(|gap| {
-                        macro_sources.binary_search(&gap.source).is_ok()
-                            && entry_reachable.as_ref().is_some_and(|reachable|
-                                reachable.membership()[gap.point.index()])
-                            && gap_reachable.get(&gap.point).is_some_and(|reachable: &Arc<Reachability<ProgramPointId>>|
-                                reachable.membership()[origin.point.index()])
-                    })
-                })
-            })
+            && !procedure_index.escaped_bindings.contains(&binding)
+            // The overwrite certificate starts at this establishment. A
+            // non-drop gap before it may remove the write from the configured
+            // program. The suffix certificate cannot prove that reachability.
+            && !blocking_prefix
             && matches!(
                 self.overwritten_unread_local(procedure, establishment_event, request),
                 OverwrittenUnreadAnswer::Proven { .. }
@@ -1853,9 +1941,91 @@ impl FlowStateDerivation {
         {
             return DeadWriteAnswer::Dead;
         }
+        let mut certificate_edges = infeasible_edges.to_vec();
         if !reasons.is_empty() {
-            return DeadWriteAnswer::Open { reasons };
+            let mut gap_points = HashSet::default();
+            let located = reasons.iter().all(|reason| match reason {
+                FlowStateIncompleteReason::LoweringGap { gaps, .. } => {
+                    !gaps.is_empty()
+                        && gaps.iter().all(|id| {
+                            semantics.gap(*id).is_some_and(|gap| {
+                                if matches!(
+                                    gap.subject,
+                                    SemanticGapSubject::Procedure
+                                        | SemanticGapSubject::FutureConstruction
+                                        | SemanticGapSubject::FutureActivation
+                                ) {
+                                    return false;
+                                }
+                                if !gap.is_implicit_drop_omission()
+                                    && !(procedure.artifact().key().language().language()
+                                        == Language::Rust
+                                        && macro_sources.contains(&gap.source))
+                                {
+                                    return false;
+                                }
+                                gap_points.insert(gap.point);
+                                true
+                            })
+                        })
+                }
+                FlowStateIncompleteReason::SelectedPropertyEndpointUnavailable {
+                    point, ..
+                } => {
+                    gap_points.insert(*point);
+                    true
+                }
+                // These reasons do not identify all affected program points.
+                FlowStateIncompleteReason::AxisUnsupported(_)
+                | FlowStateIncompleteReason::NoSemanticProvider
+                | FlowStateIncompleteReason::SemanticProviderFailed { .. }
+                | FlowStateIncompleteReason::SemanticAnalysisPartial { .. }
+                | FlowStateIncompleteReason::Cancelled
+                | FlowStateIncompleteReason::SourceGenerationChanged
+                | FlowStateIncompleteReason::BindingScopeLivenessUnavailable { .. }
+                | FlowStateIncompleteReason::ControlProjectionRejected { .. }
+                | FlowStateIncompleteReason::ModeledControlProjectionIncomplete { .. }
+                | FlowStateIncompleteReason::NoStructuralFacts
+                | FlowStateIncompleteReason::BudgetExhausted { .. }
+                | FlowStateIncompleteReason::PropertyBaseNotCanonical { .. }
+                | FlowStateIncompleteReason::BindingWithoutEstablishment { .. }
+                | FlowStateIncompleteReason::BindingStateNotClosed { .. }
+                | FlowStateIncompleteReason::PropertyProviderUnavailable
+                | FlowStateIncompleteReason::PropertyProviderFailed { .. }
+                | FlowStateIncompleteReason::PropertyAnalysisPartial { .. }
+                | FlowStateIncompleteReason::PropertyReaching { .. } => false,
+            });
+            if !located
+                || blocking_prefix
+                || gap_points.contains(&origin.point)
+                || procedure_index.escaped_bindings.contains(&binding)
+            {
+                return DeadWriteAnswer::Open { reasons };
+            }
+            match self.dead_write_certificate_edges(
+                procedure,
+                procedure_key,
+                &omitted_edges,
+                infeasible_edges,
+                origin.point,
+                gap_points,
+                request,
+            ) {
+                Ok(edges) => certificate_edges.extend(edges),
+                Err(error) => {
+                    push_algorithm_reason(error, FlowStateAxis::ReachingRelation, &mut reasons);
+                    return DeadWriteAnswer::Open { reasons };
+                }
+            }
+            certificate_edges.sort_unstable();
+            certificate_edges.dedup();
+            omitted_edges.extend_from_slice(&certificate_edges);
+            omitted_edges.sort_unstable();
+            omitted_edges.dedup();
+            // Full-graph entry reachability cannot certify the reduced graph.
+            entry_reachable = None;
         }
+        let infeasible_edges = certificate_edges.as_slice();
         // All establishments of this binding share entry reachability,
         // ordered read/write events and the backward may-liveness solve.
         // Cache only within the request and retain its artifact identity.
@@ -1872,8 +2042,8 @@ impl FlowStateDerivation {
             },
             Ok,
         );
-        let key = (procedure_key, binding, omitted_edges);
-        let prepared = if let Some(entry) = request.dead_write_cache.get(&key) {
+        let key = DeadWriteBindingKey(procedure_key, binding, omitted_edges);
+        let prepared = if let Some(entry) = request.memos.dead_write_cache.get(&key) {
             entry.outcome.clone()
         } else {
             let outcome = reachable.and_then(|reachable| {
@@ -1896,7 +2066,7 @@ impl FlowStateDerivation {
                 })
                 .map(Arc::new)
             });
-            request.dead_write_cache.insert(
+            request.memos.dead_write_cache.insert(
                 key,
                 DeadWriteCacheEntry {
                     _artifact: Arc::clone(procedure.artifact()),
@@ -1920,6 +2090,16 @@ impl FlowStateDerivation {
                 )
             })
         });
+        if !reasons.is_empty() {
+            return match result {
+                Ok(answer @ DeadWriteAnswer::Live { .. }) => answer,
+                Ok(_) => DeadWriteAnswer::Open { reasons },
+                Err(error) => {
+                    push_algorithm_reason(error, FlowStateAxis::ReachingRelation, &mut reasons);
+                    DeadWriteAnswer::Open { reasons }
+                }
+            };
+        }
         match result {
             Ok(answer) => answer,
             Err(error) => {
@@ -1939,8 +2119,8 @@ impl FlowStateDerivation {
         start: ProgramPointId,
         request: &mut FlowStateRequest<'_>,
     ) -> Result<Arc<Reachability<ProgramPointId>>, CfgAlgorithmError<ProgramPointId>> {
-        let key = (procedure_key, omitted_edges.to_vec(), start);
-        if let Some(entry) = request.dead_write_reachability_cache.get(&key) {
+        let key = DeadWriteControlKey(procedure_key, omitted_edges.to_vec(), start);
+        if let Some(entry) = request.memos.dead_write_reachability_cache.get(&key) {
             return entry.outcome.clone();
         }
         let mut cfg_request =
@@ -1951,7 +2131,121 @@ impl FlowStateDerivation {
                 forward_reachability(graph, start, &mut cfg_request)
             })
             .map(Arc::new);
-        request.dead_write_reachability_cache.insert(
+        request.memos.dead_write_reachability_cache.insert(
+            key,
+            DeadWriteReachabilityCacheEntry {
+                _artifact: Arc::clone(procedure.artifact()),
+                outcome: outcome.clone(),
+            },
+        );
+        outcome
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dead_write_certificate_edges(
+        &self,
+        procedure: &ProcedureHandle,
+        procedure_key: DeadWriteProcedureKey,
+        omitted_edges: &[ControlEdgeId],
+        infeasible_edges: &[ControlEdgeId],
+        origin: ProgramPointId,
+        mut gap_points: HashSet<ProgramPointId>,
+        request: &mut FlowStateRequest<'_>,
+    ) -> Result<Vec<ControlEdgeId>, CfgAlgorithmError<ProgramPointId>> {
+        let order = self.cached_dead_write_component_order(
+            procedure,
+            procedure_key,
+            omitted_edges,
+            infeasible_edges,
+            request,
+        )?;
+        // Earlier components cannot be reached by the write. Later components
+        // cannot reach it. Same-component gaps may cut its loop entry paths.
+        gap_points.retain(|point| order[point.index()] >= order[origin.index()]);
+        // Read only the isolated points' own edges, so a write costs the
+        // degree of its gaps rather than a scan of the whole procedure.
+        let semantics = procedure.semantics();
+        let mut edges: Vec<ControlEdgeId> = gap_points
+            .iter()
+            .flat_map(|&point| {
+                semantics
+                    .successor_edges(point)
+                    .chain(semantics.predecessor_edges(point))
+                    .map(|(edge, _)| edge)
+            })
+            .collect();
+        edges.sort_unstable();
+        edges.dedup();
+        Ok(edges)
+    }
+
+    fn cached_dead_write_component_order(
+        &self,
+        procedure: &ProcedureHandle,
+        procedure_key: DeadWriteProcedureKey,
+        omitted_edges: &[ControlEdgeId],
+        infeasible_edges: &[ControlEdgeId],
+        request: &mut FlowStateRequest<'_>,
+    ) -> Result<Arc<[usize]>, CfgAlgorithmError<ProgramPointId>> {
+        let key = (procedure_key, omitted_edges.to_vec());
+        if let Some(entry) = request.dead_write_component_order_cache.get(&key) {
+            return entry.outcome.clone();
+        }
+        let mut cfg_request =
+            CfgAlgorithmRequest::new(&mut request.cfg_budget, request.cancellation);
+        let outcome =
+            with_control_graph!(procedure.semantics(), &self.control_edge_mask, |graph| {
+                let graph = &FeasibleSuccessors::new(graph, infeasible_edges.iter().copied());
+                let (components, dfs) =
+                    strongly_connected_components_with_order(graph, &mut cfg_request)?;
+                let mut ranks = vec![usize::MAX; components.components.len()];
+                let mut next = 0;
+                let mut order = vec![0; graph.node_count()];
+                for point in dfs.reverse_postorder {
+                    let component = components
+                        .component_of(graph, point)
+                        .expect("DFS point belongs to graph");
+                    if ranks[component] == usize::MAX {
+                        ranks[component] = next;
+                        next += 1;
+                    }
+                    order[point.index()] = ranks[component];
+                }
+                Ok(Arc::from(order))
+            });
+        request.dead_write_component_order_cache.insert(
+            key,
+            DeadWriteComponentOrderCacheEntry {
+                _artifact: Arc::clone(procedure.artifact()),
+                outcome: outcome.clone(),
+            },
+        );
+        outcome
+    }
+
+    /// The forward closure of retained non-drop gaps, shared by all writes.
+    fn cached_dead_write_prefix_reachability(
+        &self,
+        procedure: &ProcedureHandle,
+        procedure_key: DeadWriteProcedureKey,
+        omitted_edges: &[ControlEdgeId],
+        infeasible_edges: &[ControlEdgeId],
+        starts: &[ProgramPointId],
+        request: &mut FlowStateRequest<'_>,
+    ) -> Result<Arc<Reachability<ProgramPointId>>, CfgAlgorithmError<ProgramPointId>> {
+        let key = (procedure_key, omitted_edges.to_vec(), starts.to_vec());
+        if let Some(entry) = request.dead_write_prefix_reachability_cache.get(&key) {
+            return entry.outcome.clone();
+        }
+        let mut cfg_request =
+            CfgAlgorithmRequest::new(&mut request.cfg_budget, request.cancellation);
+        let outcome =
+            with_control_graph!(procedure.semantics(), &self.control_edge_mask, |graph| {
+                let graph = &FeasibleSuccessors::new(graph, infeasible_edges.iter().copied());
+                forward_reachability_from_all(graph, starts.iter().copied(), &mut cfg_request)
+            })
+            .map(Arc::new);
+        request.dead_write_prefix_reachability_cache.insert(
             key,
             DeadWriteReachabilityCacheEntry {
                 _artifact: Arc::clone(procedure.artifact()),
@@ -2086,7 +2380,7 @@ impl FlowStateDerivation {
                 )
                 && gap.impacts.contains(SemanticGapImpact::ValueFlow)
                 && matches!(
-                    gap.discharge,
+                    gap.control_flow_discharge(),
                     SemanticGapDischarge::None
                         | SemanticGapDischarge::CallResolution
                         | SemanticGapDischarge::CanonicalIndexIdentity
@@ -2567,7 +2861,7 @@ impl FlowStateDerivation {
                 scoped_axes_blocked_by(procedure.semantics(), gap)
                     .contains(&FlowStateAxis::DominanceRelation)
                     && !matches!(
-                        gap.discharge,
+                        gap.control_flow_discharge(),
                         SemanticGapDischarge::RetainedEvaluationOrder
                             | SemanticGapDischarge::RetainedControlTopology
                     )
@@ -2818,7 +3112,7 @@ impl FlowStateDerivation {
             .iter()
             .filter(|gap| {
                 scoped_axes_blocked_by(semantics, gap).contains(&FlowStateAxis::DominanceRelation)
-                    && gap.discharge != SemanticGapDischarge::RetainedControlTopology
+                    && gap.control_flow_discharge() != SemanticGapDischarge::RetainedControlTopology
             })
             .collect::<Vec<_>>();
         with_control_graph!(semantics, &self.control_edge_mask, |graph| {
@@ -2924,7 +3218,8 @@ impl FlowStateDerivation {
                                 &predicate_bindings,
                             )
                             && control_gaps.iter().all(|gap| {
-                                gap.discharge == SemanticGapDischarge::RetainedEvaluationOrder
+                                gap.control_flow_discharge()
+                                    == SemanticGapDischarge::RetainedEvaluationOrder
                                     || (gap.subject != SemanticGapSubject::Procedure
                                         && (dominance.dominates(
                                             graph,
@@ -2937,7 +3232,7 @@ impl FlowStateDerivation {
                                             // exit was not taken. Reject a
                                             // cycle: the exit marker is not a
                                             // general liveness discharge.
-                                            || (gap.discharge
+                                            || (gap.control_flow_discharge()
                                                 == SemanticGapDischarge::NonRejoiningExceptionalExit
                                                 && point_reaches(
                                                     graph,
@@ -3127,7 +3422,8 @@ impl FlowStateDerivation {
                     }
                     let point = semantics.point(current)?;
                     let event_is_barrier = point.events.iter().any(|event| match event.effect {
-                        SemanticEffect::Invoke { .. }
+                        SemanticEffect::MemoryInterference
+                        | SemanticEffect::Invoke { .. }
                         | SemanticEffect::AsyncSuspend { .. }
                         | SemanticEffect::AsyncResume { .. } => true,
                         SemanticEffect::CallContinuation { call_site, kind } => {
@@ -3238,7 +3534,7 @@ impl FlowStateDerivation {
             )
             .into_iter()
             .filter(|gap| {
-                gap.discharge != SemanticGapDischarge::RetainedEvaluationOrder
+                gap.control_flow_discharge() != SemanticGapDischarge::RetainedEvaluationOrder
                     || self.gap_contains_competing_binding_write(
                         semantics,
                         gap,
@@ -3310,7 +3606,7 @@ impl FlowStateDerivation {
                 scoped_axes_blocked_by(procedure.semantics(), gap)
                     .contains(&FlowStateAxis::DominanceRelation)
                     && !matches!(
-                        gap.discharge,
+                        gap.control_flow_discharge(),
                         SemanticGapDischarge::RetainedControlTopology
                             | SemanticGapDischarge::RetainedEvaluationOrder
                             | SemanticGapDischarge::NonRejoiningExceptionalExit
@@ -3360,7 +3656,7 @@ impl FlowStateDerivation {
                     &retained_read_values,
                     result_origins,
                 )
-                && match gap.discharge {
+                && match gap.control_flow_discharge() {
                     // Every source-local successor remains represented, so
                     // this marker cannot hide another static observation.
                     SemanticGapDischarge::RetainedControlTopology => false,
@@ -3389,7 +3685,8 @@ impl FlowStateDerivation {
                     // remains blocking here.
                     SemanticGapDischarge::CanonicalIndexIdentity
                     | SemanticGapDischarge::ExactFieldLayout => true,
-                    SemanticGapDischarge::ModeledEffectPartition => true,
+                    SemanticGapDischarge::ModeledEffectPartition
+                    | SemanticGapDischarge::DataDependency => true,
                     // Runtime-read discharge belongs to the activation-aware
                     // refinement, not this raw flow-state completeness proof.
                     SemanticGapDischarge::RuntimeReadBehavior => true,
@@ -3400,7 +3697,8 @@ impl FlowStateDerivation {
                     // raw flow-state proof does not have.
                     SemanticGapDischarge::InertDropGlue
                     | SemanticGapDischarge::NonRejoiningExceptionalExitAfterInertDrops => true,
-                    SemanticGapDischarge::None
+                    SemanticGapDischarge::ImplicitDropExecution
+                    | SemanticGapDischarge::None
                     | SemanticGapDischarge::ResidualConversion
                     | SemanticGapDischarge::CallResolution => true,
                 }
@@ -3552,7 +3850,7 @@ impl FlowStateDerivation {
         }
 
         !semantics.gaps().iter().any(|gap| {
-            gap.discharge == SemanticGapDischarge::RetainedEvaluationOrder
+            gap.control_flow_discharge() == SemanticGapDischarge::RetainedEvaluationOrder
                 && self.gap_contains_competing_binding_write(
                     semantics,
                     gap,
@@ -3591,7 +3889,7 @@ fn result_observation_gap_is_relevant(
     retained_read_values: &HashSet<ValueId>,
     result_origins: &[ProgramPointId],
 ) -> bool {
-    if gap.discharge == SemanticGapDischarge::ExitOnlyProcedureCompletion {
+    if gap.control_flow_discharge() == SemanticGapDischarge::ExitOnlyProcedureCompletion {
         // Completion may run arbitrary active cleanup/deferred code and can
         // therefore observe captured result values unrelated to the local
         // operation that triggered the exit. Its point/value subject scopes
@@ -3600,7 +3898,9 @@ fn result_observation_gap_is_relevant(
         return true;
     }
     match gap.subject {
-        SemanticGapSubject::Procedure => {
+        SemanticGapSubject::FutureConstruction
+        | SemanticGapSubject::FutureActivation
+        | SemanticGapSubject::Procedure => {
             // A procedure-wide capture gap accounts for values entering this
             // child from its lexical parent. It cannot hide another static
             // observation of a result established after the child entry. An
@@ -3611,6 +3911,9 @@ fn result_observation_gap_is_relevant(
         }
         SemanticGapSubject::Point => true,
         SemanticGapSubject::Value(value) => relevant_values.contains(&value),
+        SemanticGapSubject::CleanupOwners(segment) => relevant_values
+            .iter()
+            .any(|value| semantics.cleanup_chains().contains_owner(segment, *value)),
         SemanticGapSubject::MemoryLocation(location) => semantics
             .memory_location(location)
             .is_some_and(|memory| match memory.kind {
@@ -3773,6 +4076,10 @@ fn capture_gap_may_involve_bindings(
     };
     match gap.subject {
         SemanticGapSubject::Value(value) => value_may_involve_bindings(value),
+        SemanticGapSubject::CleanupOwners(segment) => semantics
+            .cleanup_chains()
+            .owners(segment)
+            .any(|owner| value_may_involve_bindings(owner.value)),
         SemanticGapSubject::MemoryLocation(location) => location_may_involve_bindings(location),
         SemanticGapSubject::Capture(capture) => {
             semantics
@@ -3786,7 +4093,9 @@ fn capture_gap_may_involve_bindings(
                     }
                 })
         }
-        SemanticGapSubject::Procedure
+        SemanticGapSubject::FutureConstruction
+        | SemanticGapSubject::FutureActivation
+        | SemanticGapSubject::Procedure
         | SemanticGapSubject::Point
         | SemanticGapSubject::CallSite(_)
         | SemanticGapSubject::CallContinuation { .. }
@@ -3829,7 +4138,9 @@ where
     }
     !semantics.gaps().iter().any(|gap| {
         gap.impacts.contains(SemanticGapImpact::ValueFlow)
-            && matches!(gap.subject, SemanticGapSubject::Value(value) if value == binding)
+            && gap
+                .subject
+                .contains_value(semantics.cleanup_chains(), binding)
             && point_reaches(graph, origin, gap.point, true)
             && point_reaches(graph, gap.point, observation, true)
     })
@@ -4121,7 +4432,7 @@ fn target_call_evaluation_is_open(
         || semantics.gaps().iter().any(|gap| {
             gap.subject == SemanticGapSubject::CallSite(target.id)
                 && gap.capability == SemanticCapability::DeferredExecution
-                && gap.discharge == SemanticGapDischarge::CallResolution
+                && gap.control_flow_discharge() == SemanticGapDischarge::CallResolution
         })
 }
 
@@ -4136,9 +4447,12 @@ fn target_call_has_call_evaluation_gap(
         SemanticGapSubject::Point if gap.point == target.point => {
             gap.impacts.contains(SemanticGapImpact::CallEvaluation)
         }
-        SemanticGapSubject::Procedure
+        SemanticGapSubject::FutureConstruction
+        | SemanticGapSubject::FutureActivation
+        | SemanticGapSubject::Procedure
         | SemanticGapSubject::Point
         | SemanticGapSubject::Value(_)
+        | SemanticGapSubject::CleanupOwners(_)
         | SemanticGapSubject::MemoryLocation(_)
         | SemanticGapSubject::Capture(_)
         | SemanticGapSubject::CallSite(_)
@@ -4170,11 +4484,11 @@ where
         .filter(|gap| {
             gap.subject != SemanticGapSubject::Procedure
                 && matches!(
-                    gap.discharge,
+                    gap.control_flow_discharge(),
                     SemanticGapDischarge::NonRejoiningExceptionalExit
                         | SemanticGapDischarge::ExitOnlyProcedureCompletion
                 )
-                && discharge_blocks(gap.discharge)
+                && discharge_blocks(gap.control_flow_discharge())
         })
         .map(|gap| gap.point)
         .collect::<Vec<_>>();
@@ -4194,14 +4508,15 @@ where
         .iter()
         .filter(|gap| {
             scoped_axes_blocked_by(semantics, gap).contains(&FlowStateAxis::DominanceRelation)
-                && discharge_blocks(gap.discharge)
+                && discharge_blocks(gap.control_flow_discharge())
                 && !(gap.subject != SemanticGapSubject::Procedure
                     && matches!(
-                        gap.discharge,
+                        gap.control_flow_discharge(),
                         SemanticGapDischarge::NonRejoiningExceptionalExit
                             | SemanticGapDischarge::ExitOnlyProcedureCompletion
                     )
-                    && (gap.discharge == SemanticGapDischarge::NonRejoiningExceptionalExit
+                    && (gap.control_flow_discharge()
+                        == SemanticGapDischarge::NonRejoiningExceptionalExit
                         || all_targets_are_ordinary)
                     && result_establishments.iter().all(|establishment| {
                         gap.point != *establishment
@@ -4434,7 +4749,7 @@ where
                     let candidate_precedes_gap =
                         dominance.dominates(graph, candidate.target, gap.point)
                             && !reachable_without_candidate[*index].contains(&gap.point);
-                    let non_rejoining_strictly_after_candidate = gap.discharge
+                    let non_rejoining_strictly_after_candidate = gap.control_flow_discharge()
                         == SemanticGapDischarge::NonRejoiningExceptionalExit
                         && strictly_later_non_rejoining_gaps
                             .contains(&(candidate_point, gap.point));
@@ -4496,7 +4811,7 @@ where
         .iter()
         .filter(|gap| {
             gap.subject != SemanticGapSubject::Procedure
-                && gap.discharge == SemanticGapDischarge::NonRejoiningExceptionalExit
+                && gap.control_flow_discharge() == SemanticGapDischarge::NonRejoiningExceptionalExit
         })
         .map(|gap| gap.point)
         .collect::<HashSet<_>>();
@@ -4532,7 +4847,7 @@ where
         .copied()
         .filter(|gap| {
             gap.subject != SemanticGapSubject::Procedure
-                && gap.discharge == SemanticGapDischarge::NonRejoiningExceptionalExit
+                && gap.control_flow_discharge() == SemanticGapDischarge::NonRejoiningExceptionalExit
         })
         .collect::<Vec<_>>();
     gaps_that_cannot_reach_targets(graph, targets, &gaps)
@@ -4553,7 +4868,7 @@ where
         .filter(|gap| {
             gap.subject != SemanticGapSubject::Procedure
                 && matches!(
-                    gap.discharge,
+                    gap.control_flow_discharge(),
                     SemanticGapDischarge::NonRejoiningExceptionalExit
                         | SemanticGapDischarge::ExitOnlyProcedureCompletion
                 )
@@ -4561,7 +4876,9 @@ where
         .collect::<Vec<_>>();
     let exit_only_gaps = gaps
         .iter()
-        .filter(|gap| gap.discharge == SemanticGapDischarge::ExitOnlyProcedureCompletion)
+        .filter(|gap| {
+            gap.control_flow_discharge() == SemanticGapDischarge::ExitOnlyProcedureCompletion
+        })
         .map(|gap| gap.id)
         .collect::<HashSet<_>>();
     let ordinary_body_points = ordinary_body_points(semantics, graph);
@@ -4787,6 +5104,10 @@ pub struct FileFlowState {
     /// `None` means the caller supplied no model snapshot; an activated empty
     /// set retains its real (non-`None`) hash.
     active_model_set_hash: Option<Box<str>>,
+    /// Whether this derivation is a function of the inputs it read. Every
+    /// execution stop that shaped it also marks the ambient channel until the
+    /// ambient marks are removed.
+    reuse: ReuseVerdict,
 }
 
 /// One exact procedure-local normal edge selected for request-local omission.
@@ -4851,12 +5172,14 @@ impl FileFlowState {
         reasons: Vec<FlowStateIncompleteReason>,
         generation: u64,
         active_model_set_hash: Option<Box<str>>,
+        reuse: ReuseVerdict,
     ) -> Self {
         Self {
             procedures: Vec::new(),
             completeness: FlowStateCompleteness::Incomplete { reasons },
             generation,
             active_model_set_hash,
+            reuse,
         }
     }
 
@@ -4866,17 +5189,95 @@ impl FileFlowState {
     }
 }
 
+impl CarriesReuseVerdict for FileFlowState {
+    fn reuse_verdict(&self) -> ReuseVerdict {
+        self.reuse
+    }
+}
+
+/// An execution stop of a flow-state derivation. Every flow-state stop marks
+/// the ambient channel as a non-budget dependence, including a semantic budget
+/// refusal, so its verdict is `Other`.
+const EXECUTION_STOP: ReuseVerdict = ReuseVerdict::ExecutionDependent(ExecutionCause::Other);
+
+/// The verdict of a semantic outcome whose variant is execution dependent by
+/// its shape: a cancellation or an exceeded budget.
+fn semantic_outcome_verdict<T>(outcome: &SemanticOutcome<T>) -> ReuseVerdict {
+    if matches!(
+        outcome,
+        SemanticOutcome::Cancelled { .. } | SemanticOutcome::ExceededBudget { .. }
+    ) {
+        EXECUTION_STOP
+    } else {
+        ReuseVerdict::Content
+    }
+}
+
 /// Borrowed controls for one derivation.
-type DeadWriteProcedureKey = (usize, ProcedureId, u64);
-type DeadWriteControlKey = (DeadWriteProcedureKey, Vec<ControlEdgeId>, ProgramPointId);
-type DeadWriteBindingKey = (DeadWriteProcedureKey, ValueId, Vec<ControlEdgeId>);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct DeadWriteProcedureKey(
+    usize,
+    ProcedureId,
+    crate::analyzer::semantic::ProcedureInterpretation,
+    u64,
+);
+impl RetainedBytes for DeadWriteProcedureKey {
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DeadWriteControlKey(DeadWriteProcedureKey, Vec<ControlEdgeId>, ProgramPointId);
+impl RetainedBytes for DeadWriteControlKey {
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + allocated_vec_slot_bytes(&self.1)
+    }
+}
+type DeadWritePrefixKey = (
+    DeadWriteProcedureKey,
+    Vec<ControlEdgeId>,
+    Vec<ProgramPointId>,
+);
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DeadWriteBindingKey(DeadWriteProcedureKey, ValueId, Vec<ControlEdgeId>);
+impl RetainedBytes for DeadWriteBindingKey {
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + allocated_vec_slot_bytes(&self.2)
+    }
+}
+
+/// Fresh private regions for one flow request, created by its analyzer owner.
+#[derive(Debug)]
+pub struct FlowStateRequestMemos {
+    // P-class request memos: eviction or refusal only causes recomputation.
+    // Each named region belongs to the analyzer owner and invalidates on Drop.
+    dead_write_procedure_cache: RequestMemo<DeadWriteProcedureKey, DeadWriteProcedureIndex>,
+    dead_write_reachability_cache:
+        RequestMemo<DeadWriteControlKey, DeadWriteReachabilityCacheEntry>,
+    dead_write_cache: RequestMemo<DeadWriteBindingKey, DeadWriteCacheEntry>,
+}
+
+impl FlowStateRequestMemos {
+    pub fn new(owner: &RetentionBudget) -> Self {
+        Self {
+            dead_write_procedure_cache: RequestMemo::new(owner, "flow.dead_write_procedure"),
+            dead_write_reachability_cache: RequestMemo::new(owner, "flow.dead_write_reachability"),
+            dead_write_cache: RequestMemo::new(owner, "flow.dead_write"),
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct FlowStateRequest<'request> {
     pub cancellation: &'request CancellationToken,
-    dead_write_procedure_cache: HashMap<DeadWriteProcedureKey, Arc<DeadWriteProcedureIndex>>,
-    dead_write_reachability_cache: HashMap<DeadWriteControlKey, DeadWriteReachabilityCacheEntry>,
-    dead_write_cache: HashMap<DeadWriteBindingKey, DeadWriteCacheEntry>,
+    discharged_observation_gaps: Option<(ProcedureHandle, HashSet<SemanticGapId>)>,
+    memos: FlowStateRequestMemos,
+    // #12910's shared prefix closure and component order. These two remain
+    // request-local maps until they move into owner-budget regions too.
+    dead_write_prefix_reachability_cache:
+        HashMap<DeadWritePrefixKey, DeadWriteReachabilityCacheEntry>,
+    dead_write_component_order_cache:
+        HashMap<(DeadWriteProcedureKey, Vec<ControlEdgeId>), DeadWriteComponentOrderCacheEntry>,
     /// The CFG-algorithm budget stays crate-private: it is this crate's own
     /// work vocabulary, and an out-of-crate caller configures a derivation
     /// through [`FlowStateRequest::new`], not by naming budget dimensions.
@@ -4891,16 +5292,46 @@ pub struct FlowStateRequest<'request> {
 }
 
 impl<'request> FlowStateRequest<'request> {
+    /// Install workspace-proven observation discharges for this exact artifact.
+    /// Every logical owner of a stored gap must have been discharged.
+    pub fn with_discharged_observation_gaps(
+        mut self,
+        procedure: ProcedureHandle,
+        gaps: HashSet<SemanticGapId>,
+    ) -> Self {
+        assert!(self.memos.dead_write_cache.is_unused());
+        self.discharged_observation_gaps = Some((procedure, gaps));
+        self
+    }
+
+    fn observation_reason_is_discharged(
+        &self,
+        procedure: &ProcedureHandle,
+        reason: &FlowStateIncompleteReason,
+    ) -> bool {
+        let Some((owner, discharged)) = &self.discharged_observation_gaps else {
+            return false;
+        };
+        if owner.id() != procedure.id() || !Arc::ptr_eq(owner.artifact(), procedure.artifact()) {
+            return false;
+        }
+        let FlowStateIncompleteReason::LoweringGap { gaps, .. } = reason else {
+            return false;
+        };
+        !gaps.is_empty() && gaps.iter().all(|gap| discharged.contains(gap))
+    }
+
     pub fn refusal_count(&self) -> usize {
         self.cfg_budget.refusal_count()
     }
 
-    pub fn new(cancellation: &'request CancellationToken) -> Self {
+    pub fn new(cancellation: &'request CancellationToken, memos: FlowStateRequestMemos) -> Self {
         Self {
             cancellation,
-            dead_write_procedure_cache: HashMap::default(),
-            dead_write_reachability_cache: HashMap::default(),
-            dead_write_cache: HashMap::default(),
+            discharged_observation_gaps: None,
+            memos,
+            dead_write_component_order_cache: HashMap::default(),
+            dead_write_prefix_reachability_cache: HashMap::default(),
             cfg_budget: CfgAlgorithmBudget::default(),
             candidate_routes: None,
             control_projection: None,
@@ -5658,7 +6089,7 @@ fn normal_return_gap_is_discharged(
     ) {
         return true;
     }
-    if gap.discharge != SemanticGapDischarge::CallResolution {
+    if gap.control_flow_discharge() != SemanticGapDischarge::CallResolution {
         return false;
     }
     debug_assert!(
@@ -6198,6 +6629,7 @@ fn derive_nonreturn_projection(
         });
         let discovery = cached.unwrap_or_else(|| {
             let (discovery, reads) = crate::analyzer::usages::common::capture_memo_reads(
+                crate::analyzer::usages::common::QueryMemoOwner::NonreturnDiscovery,
                 provider.workspace().analyzer(),
                 || {
                     discover_workspace_nonreturn_procedure(
@@ -6212,6 +6644,7 @@ fn derive_nonreturn_projection(
             );
             if let (Some(cache), WorkspaceNonreturnDiscovery::Complete { procedure, callees }) =
                 (discovery_cache, &discovery)
+                && let Some(reads) = reads.admitted()
                 && procedure.incomplete_detail.is_none()
                 && procedure.exact_call_resolutions.len()
                     == procedure
@@ -6374,9 +6807,13 @@ fn derive_nonreturn_projection(
             reasons.sort_unstable();
             derived.push_incomplete(
                 Some(procedure.handle.id()),
-                format!(
-                    "workspace non-return proof is incomplete: {}",
-                    reasons.join("; ")
+                brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+                    format_args!(
+                        "workspace non-return proof is incomplete: {}",
+                        reasons.join("; ")
+                    ),
+                    format_args!("workspace non-return proof is incomplete"),
+                    reasons.iter(),
                 ),
             );
         }
@@ -6441,6 +6878,7 @@ pub fn flow_state_for_file(
                 }],
                 generation,
                 active_model_set_hash,
+                EXECUTION_STOP,
             );
         }
     };
@@ -6465,6 +6903,7 @@ pub fn flow_state_for_file(
                 }],
                 generation,
                 active_model_set_hash,
+                EXECUTION_STOP,
             );
         }
     };
@@ -6492,8 +6931,11 @@ pub fn flow_state_for_file_with_snapshot(
     active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
 ) -> FileFlowState {
     let token = cancellation.cloned().unwrap_or_default();
-    let mut request = FlowStateRequest::new(&token)
-        .with_active_semantic_model_snapshot(active_semantic_model_snapshot);
+    let mut request = FlowStateRequest::new(
+        &token,
+        FlowStateRequestMemos::new(workspace.retention_budget()),
+    )
+    .with_active_semantic_model_snapshot(active_semantic_model_snapshot);
     flow_state_for_file(workspace, file, &mut request)
 }
 
@@ -6548,14 +6990,7 @@ pub fn flow_state_for_materialized_procedure(
         );
     }
 
-    flow_state_for_materialized_selection(
-        workspace,
-        file,
-        outcome,
-        Some(procedure.id()),
-        request,
-        None,
-    )
+    flow_state_for_materialized_selection(workspace, file, outcome, Some(procedure), request, None)
 }
 
 /// Derive one exact procedure while reusing one query's ICFG provider.
@@ -6574,7 +7009,7 @@ pub fn flow_state_for_materialized_procedure_with_provider(
         workspace,
         file,
         outcome,
-        Some(procedure.id()),
+        Some(procedure),
         request,
         Some(provider),
     )
@@ -6603,6 +7038,7 @@ pub fn flow_state_for_selected_property(
             }],
             state.generation,
             state.active_model_set_hash.clone(),
+            state.reuse,
         );
     };
     assert!(
@@ -6621,6 +7057,7 @@ pub fn flow_state_for_selected_property(
             AnalyzerQueryScope::with_active_semantic_model_snapshot(analyzer, snapshot.clone())
         });
     let mut reasons = state.completeness.reasons().to_vec();
+    let mut reuse = state.reuse;
     let selected_model_hash = request
         .active_semantic_model_snapshot
         .as_ref()
@@ -6635,6 +7072,7 @@ pub fn flow_state_for_selected_property(
             )
         });
         analyzer.mark_execution_dependent();
+        reuse.join_in(EXECUTION_STOP);
         reasons.push(FlowStateIncompleteReason::PropertyProviderFailed {
             detail: "selected property activation differs from the event projection".into(),
         });
@@ -6648,6 +7086,7 @@ pub fn flow_state_for_selected_property(
             )
         });
         analyzer.mark_execution_dependent();
+        reuse.join_in(EXECUTION_STOP);
         reasons.push(FlowStateIncompleteReason::SourceGenerationChanged);
     }
     // These are acquisition/control failures, independent of a property
@@ -6779,6 +7218,7 @@ pub fn flow_state_for_selected_property(
         completeness: FlowStateCompleteness::from_reasons(reasons),
         generation: state.generation,
         active_model_set_hash: state.active_model_set_hash.clone(),
+        reuse,
     }
 }
 
@@ -6786,7 +7226,7 @@ fn flow_state_for_materialized_selection(
     workspace: &WorkspaceAnalyzer,
     file: &ProjectFile,
     outcome: SemanticOutcome<Arc<SemanticArtifact>>,
-    requested_procedure: Option<ProcedureId>,
+    selected_procedure: Option<&ProcedureHandle>,
     request: &mut FlowStateRequest<'_>,
     provider: Option<&WorkspaceIcfgProvider<'_>>,
 ) -> FileFlowState {
@@ -6823,6 +7263,7 @@ fn flow_state_for_materialized_selection(
                 }],
                 generation,
                 active_model_set_hash,
+                EXECUTION_STOP,
             );
         }
     };
@@ -6831,7 +7272,7 @@ fn flow_state_for_materialized_selection(
         workspace,
         file,
         outcome,
-        requested_procedure,
+        selected_procedure,
         generation,
         active_snapshot,
         active_model_set_hash,
@@ -6846,7 +7287,7 @@ fn flow_state_for_materialized_outcome(
     workspace: &WorkspaceAnalyzer,
     file: &ProjectFile,
     outcome: SemanticOutcome<Arc<SemanticArtifact>>,
-    requested_procedure: Option<ProcedureId>,
+    selected_procedure: Option<&ProcedureHandle>,
     generation: u64,
     active_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
     active_model_set_hash: Option<Box<str>>,
@@ -6854,15 +7295,14 @@ fn flow_state_for_materialized_outcome(
     request: &mut FlowStateRequest<'_>,
     provider: Option<&WorkspaceIcfgProvider<'_>>,
 ) -> FileFlowState {
+    let requested_procedure = selected_procedure.map(ProcedureHandle::id);
     let analyzer = workspace.analyzer();
     let active_models = active_snapshot
         .as_ref()
         .map(|snapshot| snapshot.active_models().as_ref());
 
-    if matches!(
-        outcome,
-        SemanticOutcome::Cancelled { .. } | SemanticOutcome::ExceededBudget { .. }
-    ) {
+    let mut reuse = semantic_outcome_verdict(&outcome);
+    if !reuse.is_content() {
         brokk_bifrost_core::profiling::note_with(|| {
             format!(
                 "policy.units unbounded origin={}:{} cause={}",
@@ -6895,6 +7335,7 @@ fn flow_state_for_materialized_outcome(
             )
         });
         analyzer.mark_execution_dependent();
+        reuse.join_in(EXECUTION_STOP);
     }
     let mut file_reasons = Vec::new();
     match &outcome {
@@ -6921,7 +7362,7 @@ fn flow_state_for_materialized_outcome(
     }
     let Some(artifact) = outcome.available_value().cloned() else {
         file_reasons.push(FlowStateIncompleteReason::NoSemanticProvider);
-        return FileFlowState::incomplete(file_reasons, generation, active_model_set_hash);
+        return FileFlowState::incomplete(file_reasons, generation, active_model_set_hash, reuse);
     };
 
     let Some(facts) = structural_facts(analyzer, file) else {
@@ -6934,7 +7375,12 @@ fn flow_state_for_materialized_outcome(
         });
         analyzer.mark_execution_dependent();
         file_reasons.push(FlowStateIncompleteReason::NoStructuralFacts);
-        return FileFlowState::incomplete(file_reasons, generation, active_model_set_hash);
+        return FileFlowState::incomplete(
+            file_reasons,
+            generation,
+            active_model_set_hash,
+            reuse.join(EXECUTION_STOP),
+        );
     };
     if facts.source_identity() != artifact.key().revision().content() {
         brokk_bifrost_core::profiling::note_with(|| {
@@ -6946,7 +7392,12 @@ fn flow_state_for_materialized_outcome(
         });
         analyzer.mark_execution_dependent();
         file_reasons.push(FlowStateIncompleteReason::SourceGenerationChanged);
-        return FileFlowState::incomplete(file_reasons, generation, active_model_set_hash);
+        return FileFlowState::incomplete(
+            file_reasons,
+            generation,
+            active_model_set_hash,
+            reuse.join(EXECUTION_STOP),
+        );
     }
     let site_index = {
         let _scope = profiling::scope("flow.site_index");
@@ -7051,17 +7502,23 @@ fn flow_state_for_materialized_outcome(
         .procedures()
         .iter()
         .filter(|procedure| requested_procedure.is_none_or(|requested| procedure.id() == requested))
-        .map(|procedure| {
+        .map(|base| {
+            // Whole-artifact enumeration explicitly selects base interpretations.
+            let handle = selected_procedure.cloned().unwrap_or_else(|| {
+                artifact
+                    .procedure_handle(base.id())
+                    .expect("artifact owns procedure")
+            });
+            let procedure = handle.semantics();
             let procedure_reasons = procedure_projection_reasons
                 .remove(&procedure.id())
                 .map_or_else(
                     || file_reasons.clone(),
                     |reasons| file_reasons.iter().cloned().chain(reasons).collect(),
                 );
-            derive_procedure(
+            let (derivation, procedure_reuse) = derive_procedure(
                 workspace,
-                &artifact,
-                procedure,
+                &handle,
                 file,
                 &facts,
                 &site_index,
@@ -7073,7 +7530,9 @@ fn flow_state_for_materialized_outcome(
                     .unwrap_or_default(),
                 request,
                 budget,
-            )
+            );
+            reuse.join_in(procedure_reuse);
+            derivation
         })
         .collect();
     drop(derive_selected_procedures_scope);
@@ -7089,12 +7548,14 @@ fn flow_state_for_materialized_outcome(
             )
         });
         analyzer.mark_execution_dependent();
+        reuse.join_in(EXECUTION_STOP);
     }
     FileFlowState {
         procedures,
         completeness: FlowStateCompleteness::from_reasons(file_reasons),
         generation,
         active_model_set_hash,
+        reuse,
     }
 }
 
@@ -7366,8 +7827,7 @@ impl SiteIndex {
 #[allow(clippy::too_many_arguments)]
 fn derive_procedure(
     workspace: &WorkspaceAnalyzer,
-    artifact: &Arc<SemanticArtifact>,
-    procedure: &ProcedureSemantics,
+    procedure_handle: &ProcedureHandle,
     file: &ProjectFile,
     facts: &brokk_bifrost_analysis::analyzer::structural::facts::FileFacts,
     site_index: &SiteIndex,
@@ -7377,7 +7837,9 @@ fn derive_procedure(
     control_edge_mask: ControlEdgeMask,
     request: &mut FlowStateRequest<'_>,
     semantic_budget: &mut SemanticBudget,
-) -> FlowStateDerivation {
+) -> (FlowStateDerivation, ReuseVerdict) {
+    let artifact = procedure_handle.artifact();
+    let procedure = procedure_handle.semantics();
     let mut reasons = file_reasons.to_vec();
     collect_capability_reasons(artifact.capabilities(), &mut reasons);
     collect_gap_reasons(procedure, &mut reasons);
@@ -7387,18 +7849,16 @@ fn derive_procedure(
         .support(SemanticCapability::FieldMemory)
         != CapabilitySupport::Unsupported;
 
-    let procedure_handle = artifact
-        .procedure_handle(procedure.id())
-        .expect("a validated artifact owns every procedure it lists");
     let procedure_artifact = Arc::downgrade(procedure_handle.artifact());
-    let property_result = if properties_available {
-        match materialize_property_reaching(
+    let (property_result, reuse) = if properties_available {
+        let (property, reuse) = materialize_property_reaching(
             workspace,
-            &procedure_handle,
+            procedure_handle,
             &control_edge_mask,
             request,
             semantic_budget,
-        ) {
+        );
+        let property = match property {
             Ok(result) => {
                 for reason in result.incomplete_reasons() {
                     reasons.push(FlowStateIncompleteReason::PropertyReaching {
@@ -7411,9 +7871,10 @@ fn derive_procedure(
                 reasons.push(reason);
                 None
             }
-        }
+        };
+        (property, reuse)
     } else {
-        None
+        (None, ReuseVerdict::Content)
     };
     let mut builder = EventBuilder {
         procedure: procedure.id(),
@@ -7500,7 +7961,7 @@ fn derive_procedure(
             })
             .collect::<HashSet<_>>();
         match correlated_initialization_answers(
-            &procedure_handle,
+            procedure_handle,
             &events,
             &event_keys,
             &control_edge_mask,
@@ -7529,7 +7990,7 @@ fn derive_procedure(
         }
     }
 
-    FlowStateDerivation {
+    let derivation = FlowStateDerivation {
         procedure: procedure.id(),
         events,
         relations,
@@ -7540,7 +8001,8 @@ fn derive_procedure(
         control_edge_mask,
         binding_initialization,
         event_keys,
-    }
+    };
+    (derivation, reuse)
 }
 
 fn correlated_initialization_answers(
@@ -7815,25 +8277,33 @@ fn materialize_property_reaching(
     control_edge_mask: &ControlEdgeMask,
     request: &FlowStateRequest<'_>,
     semantic_budget: &mut SemanticBudget,
-) -> Result<PropertyReachingResult, FlowStateIncompleteReason> {
-    let outcome = workspace
-        .semantic_oracle_provider()
-        .procedure_relations(
-            procedure,
-            &OracleCallContext::empty(),
-            &mut SemanticRequest::new(semantic_budget, request.cancellation),
-        )
-        .map_err(|error| {
-            brokk_bifrost_core::profiling::note_with(|| format!("policy.units unbounded origin={}:{} cause=provider:property_relation detail={error:?}", file!(), line!()));
-            workspace.analyzer().mark_execution_dependent();
-            FlowStateIncompleteReason::PropertyProviderFailed {
-                detail: error.to_string(),
-            }
-        })?;
-    if matches!(
-        outcome,
-        SemanticOutcome::Cancelled { .. } | SemanticOutcome::ExceededBudget { .. }
+) -> (
+    Result<PropertyReachingResult, FlowStateIncompleteReason>,
+    ReuseVerdict,
+) {
+    let outcome = match workspace.semantic_oracle_provider().procedure_relations(
+        procedure,
+        &OracleCallContext::empty(),
+        &mut SemanticRequest::new(semantic_budget, request.cancellation),
     ) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            brokk_bifrost_core::profiling::note_with(|| {
+                format!(
+                    "policy.units unbounded origin={}:{} cause=provider:property_relation detail={error:?}",
+                    file!(),
+                    line!()
+                )
+            });
+            workspace.analyzer().mark_execution_dependent();
+            let reason = FlowStateIncompleteReason::PropertyProviderFailed {
+                detail: error.to_string(),
+            };
+            return (Err(reason), EXECUTION_STOP);
+        }
+    };
+    let mut reuse = semantic_outcome_verdict(&outcome);
+    if !reuse.is_content() {
         brokk_bifrost_core::profiling::note_with(|| {
             format!(
                 "policy.units unbounded origin={}:{} cause={}",
@@ -7849,27 +8319,28 @@ fn materialize_property_reaching(
         workspace.analyzer().mark_execution_dependent();
     }
     let Some(snapshot) = outcome.available_value() else {
-        return Err(FlowStateIncompleteReason::PropertyAnalysisPartial {
+        let reason = FlowStateIncompleteReason::PropertyAnalysisPartial {
             detail: format!(
                 "property value-flow snapshot outcome is `{}`",
                 outcome_label(&outcome)
             ),
-        });
+        };
+        return (Err(reason), reuse);
     };
-    let provider = workspace
-        .analyzer()
-        .property_reaching_provider()
-        .ok_or_else(|| {
-            brokk_bifrost_core::profiling::note_with(|| {
-                format!(
-                    "policy.units unbounded origin={}:{} cause=provider:property_relation",
-                    file!(),
-                    line!()
-                )
-            });
-            workspace.analyzer().mark_execution_dependent();
-            FlowStateIncompleteReason::PropertyProviderUnavailable
-        })?;
+    let Some(provider) = workspace.analyzer().property_reaching_provider() else {
+        brokk_bifrost_core::profiling::note_with(|| {
+            format!(
+                "policy.units unbounded origin={}:{} cause=provider:property_relation",
+                file!(),
+                line!()
+            )
+        });
+        workspace.analyzer().mark_execution_dependent();
+        return (
+            Err(FlowStateIncompleteReason::PropertyProviderUnavailable),
+            reuse.join(EXECUTION_STOP),
+        );
+    };
     let limits = PropertyReachingLimits {
         cfg_work: request.cfg_budget.limits(),
         ..PropertyReachingLimits::default()
@@ -7918,20 +8389,16 @@ fn materialize_property_reaching(
             )
         });
         workspace.analyzer().mark_execution_dependent();
+        reuse.join_in(EXECUTION_STOP);
     }
-    Ok(result)
+    (Ok(result), reuse)
 }
 
 /// The semantic identity of a projected event. This stays parallel to the
 /// public rows instead of widening `StateEventRow`: downstream RQL fixtures
 /// construct those rows directly, while structured property records need the
 /// source mapping and event ordinal to join without consulting spelling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct SemanticEventKey {
-    point: ProgramPointId,
-    event_index: u32,
-    source: SourceMappingId,
-}
+type SemanticEventKey = BindingEventKey;
 
 struct EventBuilder<'a> {
     procedure: ProcedureId,
@@ -8786,7 +9253,8 @@ where
         }
     };
 
-    let definitions = Definitions::build(procedure, events, event_keys);
+    let initialization_events = binding_initialization_events(events, event_keys);
+    let definitions = BindingDefinitions::build(procedure, &initialization_events);
     let facts = definitions.gen_kill(procedure);
     let reaching = match reaching_definitions(graph, entry, &facts, &mut algorithm_request) {
         Ok(reaching) => reaching,
@@ -8826,8 +9294,14 @@ where
             generation,
         ));
     }
-    let binding_initialization =
-        definitions.binding_initialization_facts(procedure, events, event_keys, &reaching);
+    let binding_initialization = BindingInitializationFacts {
+        uninitialized_before_event: definitions.uninitialized_before_event(
+            procedure,
+            &initialization_events,
+            &reaching,
+        ),
+        correlated_before_event: HashMap::default(),
+    };
     (relations, Some(dominance), Some(binding_initialization))
 }
 
@@ -9073,7 +9547,12 @@ fn initialization_gap_retains_topology(gap: &SemanticGap) -> bool {
     // ConcurrentSpawn retains parent successors but not the child's later
     // effects, so it intentionally does not match this positive-proof contract.
     matches!(
-        (gap.capability, gap.kind, gap.subject, gap.discharge),
+        (
+            gap.capability,
+            gap.kind,
+            gap.subject,
+            gap.control_flow_discharge()
+        ),
         (
             SemanticCapability::NormalControlFlow | SemanticCapability::ExceptionalControlFlow,
             SemanticGapKind::Unknown,
@@ -9085,7 +9564,12 @@ fn initialization_gap_retains_topology(gap: &SemanticGap) -> bool {
 
 fn initialization_gap_retains_order(gap: &SemanticGap) -> bool {
     matches!(
-        (gap.capability, gap.kind, gap.subject, gap.discharge),
+        (
+            gap.capability,
+            gap.kind,
+            gap.subject,
+            gap.control_flow_discharge()
+        ),
         (
             SemanticCapability::NormalControlFlow,
             SemanticGapKind::Unknown,
@@ -9137,8 +9621,27 @@ where
 // capture, deferred execution, resource lifetime and region/order obligations
 // (D1-D10). A point on those gaps need not be their complete execution scope.
 fn overwrite_gap_is_point_local(gap: &SemanticGap) -> bool {
+    if gap.subject == SemanticGapSubject::Point
+        && gap.capability == SemanticCapability::ExceptionalControlFlow
+        && gap.kind == SemanticGapKind::Unsupported
+        && matches!(
+            gap.control_flow_discharge(),
+            SemanticGapDischarge::ExitOnlyProcedureCompletion
+                | SemanticGapDischarge::NonRejoiningExceptionalExitAfterInertDrops
+        )
+    {
+        // This is an omitted exit at the operation, not a procedure-wide
+        // cleanup summary. Independent cleanup obligations remain checked.
+        // The overwrite walk stops before operations after replacement.
+        return true;
+    }
     matches!(
-        (gap.capability, gap.kind, gap.subject, gap.discharge),
+        (
+            gap.capability,
+            gap.kind,
+            gap.subject,
+            gap.control_flow_discharge()
+        ),
         // #7340 audit: PHP/Go/Python Point return gaps describe transfer at
         // the return boundary; named-result/defer Value gaps remain global.
         (
@@ -9183,14 +9686,9 @@ fn drop_omission_gap(semantics: &ProcedureSemantics, reason: &FlowStateIncomplet
     !gaps.is_empty()
         && gaps.iter().all(|id| {
             semantics.gap(*id).is_some_and(|gap| {
-                [
-                    "implicit Drop order and cleanup routing are not lowered",
-                    "resource release depends on inferred types and Drop implementations",
-                    "implicit Drop::drop invocations are not emitted as fabricated call sites",
-                    "destructor unwinding and destructor panic routing are not lowered",
-                ]
-                .iter()
-                .any(|suffix| gap.detail.ends_with(suffix))
+                // This relation excludes implicit destructor reads, not generic
+                // deferred or exit-only work that can observe the binding.
+                gap.is_implicit_drop_omission()
                     && matches!(
                         gap.capability,
                         SemanticCapability::CleanupControlFlow
@@ -9221,7 +9719,7 @@ fn nonrejoining_rust_abort_gap(
                     && gap.capability == SemanticCapability::ExceptionalControlFlow
                     && gap.kind == SemanticGapKind::Unsupported
                     && matches!(
-                        gap.discharge,
+                        gap.control_flow_discharge(),
                         SemanticGapDischarge::NonRejoiningExceptionalExit
                             | SemanticGapDischarge::NonRejoiningExceptionalExitAfterInertDrops
                             | SemanticGapDischarge::ExitOnlyProcedureCompletion
@@ -9268,6 +9766,12 @@ struct DeadWriteProcedureIndex {
     events_by_binding: HashMap<ValueId, Vec<usize>>,
     escaped_bindings: HashSet<ValueId>,
     macro_gap_points_by_source: HashMap<SourceMappingId, Vec<ProgramPointId>>,
+}
+
+#[derive(Debug)]
+struct DeadWriteComponentOrderCacheEntry {
+    _artifact: Arc<SemanticArtifact>,
+    outcome: Result<Arc<[usize]>, CfgAlgorithmError<ProgramPointId>>,
 }
 
 #[derive(Debug)]
@@ -9326,7 +9830,12 @@ fn dead_write_procedure_index(
         }
     }
     for event in semantics.points().iter().flat_map(|point| &point.events) {
-        if let SemanticEffect::Assignment { target, value } = event.effect
+        if let SemanticEffect::Assignment { target, value }
+        | SemanticEffect::ValueFlow {
+            kind: crate::analyzer::semantic::ValueFlowKind::AddressOf,
+            target,
+            source: value,
+        } = event.effect
             && semantics
                 .value(target)
                 .is_some_and(|target| target.kind == SemanticValueKind::Address)
@@ -9592,7 +10101,7 @@ where
                 found
                     || matches!(
                         event.effect,
-                        SemanticEffect::Assignment { target, value }
+                        SemanticEffect::Assignment { target, value } | SemanticEffect::ValueFlow { kind: crate::analyzer::semantic::ValueFlowKind::AddressOf, target, source: value }
                             if value == binding
                                 && semantics.value(target).is_some_and(|value| value.kind == SemanticValueKind::Address)
                     ),
@@ -10030,221 +10539,35 @@ where
     })
 }
 
-/// The dense definition identities the reaching fixed point is solved over:
-/// one per establishment event.
-fn invalidated_binding(effect: &SemanticEffect) -> Option<ValueId> {
-    match effect {
-        SemanticEffect::ValueFlow {
-            kind: ValueFlowKind::Transfer(transfer),
-            source,
-            ..
-        } if matches!(transfer.kind, TransferKind::Move { .. }) => Some(*source),
-        SemanticEffect::ValueUse {
-            kind: ValueUseKind::Unbind,
-            value,
-        } => Some(*value),
-        _ => None,
-    }
+/// Project only binding events into the shared IR transfer kernel.
+fn binding_initialization_events(
+    events: &[StateEventRow],
+    event_keys: &[SemanticEventKey],
+) -> Vec<BindingInitializationEvent> {
+    assert_eq!(events.len(), event_keys.len());
+    events
+        .iter()
+        .zip(event_keys)
+        .filter_map(|(event, key)| {
+            let FlowSubject::Binding { value: binding } = event.subject else {
+                return None;
+            };
+            matches!(
+                event.event_class,
+                StateEventClass::Read | StateEventClass::Establish
+            )
+            .then_some(BindingInitializationEvent {
+                event: event.event,
+                key: *key,
+                binding,
+                establishes: event.event_class == StateEventClass::Establish,
+            })
+        })
+        .collect()
 }
 
 fn binding_is_invalidated_by(effect: &SemanticEffect, binding: ValueId) -> bool {
     invalidated_binding(effect) == Some(binding)
-}
-
-struct Definitions {
-    /// Definition id -> event id.
-    events: Vec<usize>,
-    /// Definition id -> the dense program point index it is generated at.
-    points: Vec<usize>,
-    /// Definition id -> subject.
-    subjects: Vec<FlowSubject>,
-    /// A synthetic fact that reaches every executable point after entry.
-    reachable: usize,
-    /// One synthetic may-uninitialized fact per binding observed by a read or write.
-    uninitialized_by_binding: HashMap<ValueId, usize>,
-    /// Last initialization transition within each point, in semantic order.
-    last_uninitialized_by_point: HashMap<(usize, ValueId), bool>,
-}
-
-impl Definitions {
-    fn build(
-        procedure: &ProcedureSemantics,
-        events: &[StateEventRow],
-        event_keys: &[SemanticEventKey],
-    ) -> Self {
-        assert_eq!(events.len(), event_keys.len());
-        let mut definitions = Self {
-            events: Vec::new(),
-            points: Vec::new(),
-            subjects: Vec::new(),
-            reachable: 0,
-            uninitialized_by_binding: HashMap::default(),
-            last_uninitialized_by_point: HashMap::default(),
-        };
-        for event in events {
-            if event.event_class != StateEventClass::Establish
-                || matches!(&event.subject, FlowSubject::Property { .. })
-            {
-                continue;
-            }
-            definitions.events.push(event.event);
-            definitions.points.push(event.point.index());
-            definitions.subjects.push(event.subject.clone());
-        }
-        definitions.reachable = definitions.events.len();
-        let observed_bindings = events
-            .iter()
-            .filter(|event| {
-                matches!(
-                    event.event_class,
-                    StateEventClass::Read | StateEventClass::Establish
-                )
-            })
-            .filter_map(|event| match event.subject {
-                FlowSubject::Binding { value } => Some(value),
-                FlowSubject::Property { .. } => None,
-            })
-            .collect::<HashSet<_>>();
-        for value in procedure.values() {
-            if observed_bindings.contains(&value.id) && value.kind.is_binding() {
-                let definition =
-                    definitions.reachable + 1 + definitions.uninitialized_by_binding.len();
-                definitions
-                    .uninitialized_by_binding
-                    .insert(value.id, definition);
-            }
-        }
-
-        let projected_establishments = events
-            .iter()
-            .zip(event_keys)
-            .filter_map(|(event, key)| {
-                (event.event_class == StateEventClass::Establish
-                    && matches!(event.subject, FlowSubject::Binding { .. }))
-                .then_some((*key, event.subject.value()))
-            })
-            .collect::<HashMap<_, _>>();
-        for point in procedure.points() {
-            for (event_index, event) in point.events.iter().enumerate() {
-                let key = SemanticEventKey {
-                    point: point.id,
-                    event_index: event_index as u32,
-                    source: event.source,
-                };
-                if let Some(binding) = projected_establishments.get(&key)
-                    && definitions.uninitialized_by_binding.contains_key(binding)
-                {
-                    definitions
-                        .last_uninitialized_by_point
-                        .insert((point.id.index(), *binding), false);
-                }
-                if let Some(binding) = invalidated_binding(&event.effect)
-                    && definitions.uninitialized_by_binding.contains_key(&binding)
-                {
-                    definitions
-                        .last_uninitialized_by_point
-                        .insert((point.id.index(), binding), true);
-                }
-            }
-        }
-        definitions
-    }
-
-    fn gen_kill(&self, procedure: &ProcedureSemantics) -> GenKillFacts {
-        let entry = procedure.entry_point().index();
-        let mut facts = GenKillFacts::new(
-            procedure.points().len(),
-            self.reachable + 1 + self.uninitialized_by_binding.len(),
-        );
-        facts.record_generated(entry, self.reachable);
-        for (binding, definition) in &self.uninitialized_by_binding {
-            let value = procedure
-                .value(*binding)
-                .expect("read binding belongs to procedure");
-            if value.kind == SemanticValueKind::Local
-                && self.last_uninitialized_by_point.get(&(entry, *binding)) != Some(&false)
-            {
-                facts.record_generated(entry, *definition);
-            }
-        }
-        for (definition, point) in self.points.iter().copied().enumerate() {
-            facts.record_generated(point, definition);
-            for (other, subject) in self.subjects.iter().enumerate() {
-                if other != definition && *subject == self.subjects[definition] {
-                    facts.record_killed(point, other);
-                }
-            }
-        }
-        for ((point, binding), uninitialized) in &self.last_uninitialized_by_point {
-            let definition = self.uninitialized_by_binding[binding];
-            if *uninitialized {
-                facts.record_generated(*point, definition);
-            } else {
-                facts.record_killed(*point, definition);
-            }
-        }
-        facts
-    }
-
-    fn binding_initialization_facts(
-        &self,
-        procedure: &ProcedureSemantics,
-        events: &[StateEventRow],
-        event_keys: &[SemanticEventKey],
-        reaching: &ReachingSets,
-    ) -> BindingInitializationFacts {
-        let projected_events = events
-            .iter()
-            .zip(event_keys)
-            .filter_map(|(event, key)| {
-                (matches!(
-                    event.event_class,
-                    StateEventClass::Read | StateEventClass::Establish
-                ) && matches!(event.subject, FlowSubject::Binding { .. }))
-                .then_some((
-                    *key,
-                    (event.event, event.event_class, event.subject.value()),
-                ))
-            })
-            .collect::<HashMap<_, _>>();
-        let mut facts = BindingInitializationFacts::default();
-        for point in procedure.points() {
-            let index = point.id.index();
-            if point.id != procedure.entry_point() && !reaching.reaches_in(index, self.reachable) {
-                continue;
-            }
-            let mut state_at_point = HashMap::<ValueId, bool>::default();
-            for (event_index, semantic_event) in point.events.iter().enumerate() {
-                let key = SemanticEventKey {
-                    point: point.id,
-                    event_index: event_index as u32,
-                    source: semantic_event.source,
-                };
-                if let Some(&(event, class, binding)) = projected_events.get(&key) {
-                    let uninitialized = *state_at_point.entry(binding).or_insert_with(|| {
-                        let definition = self.uninitialized_by_binding[&binding];
-                        (point.id == procedure.entry_point()
-                            && procedure
-                                .value(binding)
-                                .is_some_and(|value| value.kind == SemanticValueKind::Local))
-                            || reaching.reaches_in(index, definition)
-                    });
-                    facts
-                        .uninitialized_before_event
-                        .insert(event, uninitialized);
-                    if class == StateEventClass::Establish {
-                        state_at_point.insert(binding, false);
-                    }
-                }
-                if let Some(binding) = invalidated_binding(&semantic_event.effect)
-                    && self.uninitialized_by_binding.contains_key(&binding)
-                {
-                    state_at_point.insert(binding, true);
-                }
-            }
-        }
-        facts
-    }
 }
 
 /// Reaching rows.
@@ -10259,7 +10582,7 @@ impl Definitions {
 fn reaching_relations<G>(
     graph: &G,
     events: &[StateEventRow],
-    definitions: &Definitions,
+    definitions: &BindingDefinitions,
     reaching: &ReachingSets,
     dominance: &Dominators<ProgramPointId>,
     generation: u64,
@@ -10276,12 +10599,12 @@ where
         let live = reaching
             .reaching_in(point)
             .filter(|definition| {
-                *definition < definitions.events.len()
-                    && definitions.subjects[*definition] == read.subject
+                *definition < definitions.events().len()
+                    && definitions.binding(*definition) == read.subject.value()
             })
             .collect::<Vec<_>>();
         for definition in live.iter().copied() {
-            let establishment = definitions.events[definition];
+            let establishment = definitions.events()[definition];
             let establishment_point = events[establishment].point;
             let certainty =
                 if live.len() == 1 && dominance.dominates(graph, establishment_point, read.point) {
@@ -10625,6 +10948,60 @@ impl EvaluationDependence {
 }
 
 #[cfg(test)]
+fn test_request(cancellation: &CancellationToken) -> FlowStateRequest<'_> {
+    FlowStateRequest::new(
+        cancellation,
+        FlowStateRequestMemos::new(&RetentionBudget::for_test_capacity(64 * 1024 * 1024)),
+    )
+}
+
+impl RetainedBytes for DeadWriteProcedureIndex {
+    fn retained_bytes(&self) -> usize {
+        let mut heap = crate::analyzer::store::cache_budget::RetainedHeap::allocated();
+        // Artifact backing is independently accounted by the semantic owner.
+        heap.map(&self.events_by_binding);
+        for events in self.events_by_binding.values() {
+            heap.vec(events);
+        }
+        heap.hash_set(&self.escaped_bindings);
+        heap.map(&self.macro_gap_points_by_source);
+        for points in self.macro_gap_points_by_source.values() {
+            heap.vec(points);
+        }
+        std::mem::size_of::<Self>() + heap.total()
+    }
+}
+impl RetainedBytes for DeadWriteReachabilityCacheEntry {
+    fn retained_bytes(&self) -> usize {
+        let mut heap = crate::analyzer::store::cache_budget::RetainedHeap::allocated();
+        if let Ok(value) = &self.outcome {
+            heap.arc(value, |value, heap| heap.add(value.allocated_heap_bytes()));
+        }
+        std::mem::size_of::<Self>() + heap.total()
+    }
+}
+impl RetainedBytes for DeadWriteCacheEntry {
+    fn retained_bytes(&self) -> usize {
+        let mut heap = crate::analyzer::store::cache_budget::RetainedHeap::allocated();
+        if let Ok(value) = &self.outcome {
+            heap.arc(value, |value, heap| {
+                heap.arc(&value.reachable, |reachable, heap| {
+                    heap.add(reachable.allocated_heap_bytes())
+                });
+                heap.vec(&value.ordered);
+                for events in &value.ordered {
+                    heap.vec(events);
+                }
+                heap.add(value.liveness.allocated_heap_bytes());
+                heap.vec(&value.distance_to_read);
+                heap.vec(&value.witness_by_point);
+            });
+        }
+        std::mem::size_of::<Self>() + heap.total()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::analyzer::semantic::ExecutionTiming;
@@ -10669,7 +11046,7 @@ mod tests {
             flow_state_for_file(
                 &self.workspace,
                 &self.files[index],
-                &mut FlowStateRequest::new(&cancellation),
+                &mut test_request(&cancellation),
             )
         }
 
@@ -10687,7 +11064,7 @@ mod tests {
 
         fn state_with_budget(&self, index: usize, budget: CfgAlgorithmBudget) -> FileFlowState {
             let cancellation = CancellationToken::default();
-            let mut request = FlowStateRequest::new(&cancellation);
+            let mut request = test_request(&cancellation);
             request.cfg_budget = budget;
             flow_state_for_file(&self.workspace, &self.files[index], &mut request)
         }
@@ -10698,8 +11075,7 @@ mod tests {
             projection: &FlowControlProjection,
         ) -> FileFlowState {
             let cancellation = CancellationToken::default();
-            let mut request =
-                FlowStateRequest::new(&cancellation).with_control_projection(projection);
+            let mut request = test_request(&cancellation).with_control_projection(projection);
             flow_state_for_file(&self.workspace, &self.files[index], &mut request)
         }
 
@@ -10709,7 +11085,7 @@ mod tests {
             snapshot: &Arc<ActiveSemanticModelSnapshot>,
         ) -> FileFlowState {
             let cancellation = CancellationToken::default();
-            let mut request = FlowStateRequest::new(&cancellation)
+            let mut request = test_request(&cancellation)
                 .with_active_semantic_model_snapshot(Some(Arc::clone(snapshot)));
             flow_state_for_file(&self.workspace, &self.files[index], &mut request)
         }
@@ -11415,7 +11791,7 @@ func update(raw string) {
             &fixture.workspace,
             &fixture.files[0],
             outcome.clone(),
-            &mut FlowStateRequest::new(&cancellation),
+            &mut test_request(&cancellation),
         );
         let artifact = outcome
             .available_value()
@@ -11541,7 +11917,7 @@ func first() int {
             &fixture.workspace,
             &fixture.files[0],
             outcome.clone(),
-            &mut FlowStateRequest::new(&cancellation),
+            &mut test_request(&cancellation),
         );
         let artifact = outcome
             .available_value()
@@ -12189,10 +12565,10 @@ class Sample {
             let answer = derivation.loop_body_reaches_own_repeat(
                 &procedure,
                 site,
-                &mut FlowStateRequest::new(&cancellation),
+                &mut test_request(&cancellation),
             );
             if method == "whileReturn" {
-                let mut bounded = FlowStateRequest::new(&cancellation);
+                let mut bounded = test_request(&cancellation);
                 bounded.cfg_budget = CfgAlgorithmBudget::uniform(1);
                 assert!(matches!(
                     derivation.loop_body_reaches_own_repeat(&procedure, site, &mut bounded),
@@ -12210,7 +12586,7 @@ class Sample {
                     derivation.loop_body_reaches_own_repeat(
                         &procedure,
                         site,
-                        &mut FlowStateRequest::new(&cancelled)
+                        &mut test_request(&cancelled)
                     ),
                     LoopRepeatAnswer::Open { reasons }
                         if reasons.contains(&LoopRepeatIncompleteReason::Flow(
@@ -12307,18 +12683,24 @@ class Sample {
             let answer = derivation.overwritten_unread_local(
                 &procedure,
                 first.event,
-                &mut FlowStateRequest::new(&cancellation),
+                &mut test_request(&cancellation),
             );
             if matches!(answer, OverwrittenUnreadAnswer::Proven { .. }) {
-                let dead = derivation.dead_write_local(
-                    &procedure,
-                    first.event,
-                    &mut FlowStateRequest::new(&cancellation),
-                );
-                assert!(
-                    matches!(dead, DeadWriteAnswer::Dead),
-                    "{method}: overwritten_unread must imply Dead, got {dead:?}"
-                );
+                for capacity in [64 * 1024 * 1024, 1] {
+                    let owner = RetentionBudget::for_test_capacity(capacity);
+                    let mut request =
+                        FlowStateRequest::new(&cancellation, FlowStateRequestMemos::new(&owner));
+                    for _ in 0..2 {
+                        let dead =
+                            derivation.dead_write_local(&procedure, first.event, &mut request);
+                        assert!(
+                            matches!(dead, DeadWriteAnswer::Dead),
+                            "{method}: overwritten_unread must imply Dead, got {dead:?}"
+                        );
+                    }
+                    drop(request);
+                    assert_eq!(owner.accounted_bytes(), 0);
+                }
             }
             let valid = match expected {
                 "proven" => matches!(answer, OverwrittenUnreadAnswer::Proven { .. }),
@@ -12393,7 +12775,7 @@ class Sample {
             let answer = derivation.overwritten_unread_local(
                 &procedure,
                 first.event,
-                &mut FlowStateRequest::new(&cancellation),
+                &mut test_request(&cancellation),
             );
             if overwritten {
                 assert!(
@@ -12448,7 +12830,7 @@ def deleted():
         let answer = derivation.overwritten_unread_local(
             &procedure,
             first.event,
-            &mut FlowStateRequest::new(&cancellation),
+            &mut test_request(&cancellation),
         );
         assert!(
             matches!(answer, OverwrittenUnreadAnswer::ReadBeforeOverwrite { .. }),
@@ -12480,12 +12862,12 @@ def deleted():
             .find(|gap| initialization_gap_retains_order(gap))
             .expect("the competing index read and call retain an order region");
         let cancellation = CancellationToken::default();
-        let mut request = FlowStateRequest::new(&cancellation);
+        let mut request = test_request(&cancellation);
         assert_eq!(
             derivation.binding_initialization_at_read(&procedure, read.event, &mut request),
             BindingInitializationAnswer::Proven
         );
-        let mut request = FlowStateRequest::new(&cancellation);
+        let mut request = test_request(&cancellation);
         request.cfg_budget = CfgAlgorithmBudget::uniform(1);
         let exhausted =
             derivation.binding_initialization_at_read(&procedure, read.event, &mut request);
@@ -12498,7 +12880,7 @@ def deleted():
         let cancelled_answer = derivation.binding_initialization_at_read(
             &procedure,
             read.event,
-            &mut FlowStateRequest::new(&cancelled),
+            &mut test_request(&cancelled),
         );
         assert!(
             matches!(cancelled_answer, BindingInitializationAnswer::Open { reasons }
@@ -12649,7 +13031,7 @@ fn add_scalar(mut low: usize) -> Option<usize> {
             let answer = derivation.binding_initialization_at_read(
                 &procedure,
                 read.event,
-                &mut FlowStateRequest::new(&CancellationToken::default()),
+                &mut test_request(&CancellationToken::default()),
             );
             if expected_open {
                 let BindingInitializationAnswer::Open { reasons } = answer else {
@@ -12730,7 +13112,7 @@ fn add_scalar(mut low: usize) -> Option<usize> {
             derivation.binding_initialization_at_read(
                 &procedure,
                 read.event,
-                &mut FlowStateRequest::new(&CancellationToken::default())
+                &mut test_request(&CancellationToken::default())
             ),
             BindingInitializationAnswer::Proven
         );
@@ -12780,7 +13162,7 @@ fn add_scalar(mut low: usize) -> Option<usize> {
                 derivation.binding_initialization_at_read(
                     &procedure,
                     read,
-                    &mut FlowStateRequest::new(&CancellationToken::default())
+                    &mut test_request(&CancellationToken::default())
                 ),
                 expected,
                 "{method}: {:?}",
@@ -12819,7 +13201,7 @@ function beforeVar() { c = 1; var c; c = 2; }
                 derivation.binding_initialization_before_establishment(
                     &procedure,
                     event,
-                    &mut FlowStateRequest::new(&CancellationToken::default())
+                    &mut test_request(&CancellationToken::default())
                 ),
                 expected,
                 "{spelling}: {:?}",
@@ -12841,7 +13223,7 @@ function beforeVar() { c = 1; var c; c = 2; }
                 .expect("plain assignment projects a binding establishment");
             let procedure = fixture.procedure(0, derivation.procedure);
             assert!(matches!(
-                derivation.binding_initialization_before_establishment(&procedure, event, &mut FlowStateRequest::new(&CancellationToken::default())),
+                derivation.binding_initialization_before_establishment(&procedure, event, &mut test_request(&CancellationToken::default())),
                 BindingInitializationAnswer::Open { reasons }
                     if reasons.iter().any(|reason| matches!(
                         reason,
@@ -12882,7 +13264,7 @@ def deleted():
             derivation.binding_initialization_at_read(
                 &procedure,
                 read,
-                &mut FlowStateRequest::new(&CancellationToken::default())
+                &mut test_request(&CancellationToken::default())
             ),
             BindingInitializationAnswer::MayBeUninitialized
         ));
@@ -12924,7 +13306,7 @@ def caller(flag):
             derivation.binding_initialization_at_read(
                 &procedure,
                 read,
-                &mut FlowStateRequest::new(&CancellationToken::default())
+                &mut test_request(&CancellationToken::default())
             ),
             BindingInitializationAnswer::Proven,
             "the constructor's exceptional-only body removes the caller's else continuation: {:?}",
@@ -13066,7 +13448,8 @@ class Sample {
             source: event.source,
         })
         .collect::<Vec<_>>();
-        let definitions = Definitions::build(procedure, &events, &keys);
+        let initialization_events = binding_initialization_events(&events, &keys);
+        let definitions = BindingDefinitions::build(procedure, &initialization_events);
         let cancellation = CancellationToken::default();
         let mut budget = CfgAlgorithmBudget::default();
         let reaching = reaching_definitions(
@@ -13076,9 +13459,10 @@ class Sample {
             &mut CfgAlgorithmRequest::new(&mut budget, &cancellation),
         )
         .expect("the bounded reaching solve completes");
-        let facts = definitions.binding_initialization_facts(procedure, &events, &keys, &reaching);
-        assert_eq!(facts.uninitialized_before_event.get(&0), Some(&true));
-        assert_eq!(facts.uninitialized_before_event.get(&2), Some(&false));
+        let facts =
+            definitions.uninitialized_before_event(procedure, &initialization_events, &reaching);
+        assert_eq!(facts.get(&0), Some(&true));
+        assert_eq!(facts.get(&2), Some(&false));
         let answer = overwritten_unread_over_graph(
             procedure,
             OverwrittenUnreadWalkInputs {
@@ -14528,7 +14912,7 @@ object Sample {
             &fixture.workspace,
             &fixture.files[0],
             outcome.clone(),
-            &mut FlowStateRequest::new(&cancellation),
+            &mut test_request(&cancellation),
         );
         let artifact = outcome
             .available_value()
@@ -14784,7 +15168,7 @@ fn unrelated_adjustment(mut receiver: Receiver, value: Option<i32>, guard: Guard
             &fixture.workspace,
             &fixture.files[0],
             outcome.clone(),
-            &mut FlowStateRequest::new(&cancellation),
+            &mut test_request(&cancellation),
         );
         let artifact = outcome
             .available_value()
@@ -14904,7 +15288,7 @@ fn unrelated_adjustment(mut receiver: Receiver, value: Option<i32>, guard: Guard
             &fixture.workspace,
             &fixture.files[0],
             outcome.clone(),
-            &mut FlowStateRequest::new(&cancellation),
+            &mut test_request(&cancellation),
         );
         let artifact = outcome
             .available_value()
@@ -16555,6 +16939,50 @@ func liveMutual(stop bool) { baseFirst(stop); value := 1; _ = value }
     }
 
     #[test]
+    #[hardwon(
+        "#11234: nonreturn discovery replay dropped typed completion and retained operational fills"
+    )]
+    fn nonreturn_memo_completion_conformance() {
+        use brokk_bifrost_analysis::analyzer::usages::common::{
+            QueryMemoOwner, assert_memo_owner_conformance_for_test,
+        };
+        let fixture = Fixture::new(
+            Language::Go,
+            &[("main.go", "package sample\nfunc never(){ for {} }\n")],
+        );
+        let artifact = fixture.materialized(0).available_value().cloned().unwrap();
+        let handle = artifact
+            .procedure_handle(artifact.procedures()[0].id())
+            .unwrap();
+        let provider =
+            WorkspaceIcfgProvider::with_active_semantic_model_snapshot(&fixture.workspace, None);
+        let cancellation = CancellationToken::new();
+        assert_memo_owner_conformance_for_test(
+            QueryMemoOwner::NonreturnDiscovery,
+            fixture.workspace.analyzer(),
+            NonreturnDiscoveryCache::default,
+            |cache| {
+                let derived = derive_nonreturn_projection(
+                    &provider,
+                    &artifact,
+                    vec![handle.clone()],
+                    &mut SemanticBudget::default(),
+                    &mut CfgAlgorithmBudget::default(),
+                    &cancellation,
+                    Some(cache),
+                );
+                let projection =
+                    continuation_projection_from_derivation(&handle, derived, &cancellation);
+                (
+                    projection.normal_return_absent,
+                    format!("{:?}", projection.reasons),
+                )
+            },
+            |cache| !cache.entries.lock().unwrap().is_empty(),
+        );
+    }
+
+    #[test]
     #[hardwon("#9015: shared Go nonreturn callees were rediscovered for every root")]
     fn shared_nonreturn_callee_across_go_roots() {
         const ROOTS: &str = "package sample\nfunc r0(){ shared() }\nfunc r1(){ shared() }\nfunc r2(){ shared() }\nfunc r3(){ shared() }\nfunc r4(){ shared() }\nfunc r5(){ shared() }\nfunc r6(){ shared() }\nfunc r7(){ shared() }\n";
@@ -16714,7 +17142,7 @@ func detached(helper func()) { go helper() }
         );
         let models = fixture.activate_exact_nonreturn_models();
         let cancellation = CancellationToken::default();
-        let mut request = FlowStateRequest::new(&cancellation)
+        let mut request = test_request(&cancellation)
             .with_active_semantic_model_snapshot(Some(Arc::clone(&models)));
         request.cfg_budget = CfgAlgorithmBudget::uniform(0);
         let starved = flow_state_for_file(&fixture.workspace, &fixture.files[0], &mut request);
@@ -17947,7 +18375,7 @@ func second(input int) int {
             &fixture.workspace,
             &fixture.files[0],
             outcome.clone(),
-            &mut FlowStateRequest::new(&cancellation),
+            &mut test_request(&cancellation),
         );
         assert!(
             full.procedures.len() >= 2,
@@ -17963,7 +18391,7 @@ func second(input int) int {
             &fixture.files[0],
             outcome,
             &procedure,
-            &mut FlowStateRequest::new(&cancellation),
+            &mut test_request(&cancellation),
         );
 
         let [derived] = scoped.procedures.as_slice() else {
@@ -17993,7 +18421,7 @@ func second(input int) int {
             &fixture.workspace,
             &fixture.files[0],
             outcome.clone(),
-            &mut FlowStateRequest::new(&cancellation),
+            &mut test_request(&cancellation),
         );
         let artifact = outcome
             .available_value()
@@ -18216,6 +18644,590 @@ func second(input int) int {
     }
 
     #[test]
+    fn cpp_dead_write_configuration_gaps_stay_open() {
+        for source in [
+            "int check() { if constexpr (false) { int x; x = 1; return x; } return 0; }",
+            "int check() {\n#if 0\nint x; x = 1; return x;\n#endif\nreturn 0; }",
+        ] {
+            let fixture = Fixture::new(Language::Cpp, &[("src/Case.cpp", source)]);
+            let state = fixture.state(0);
+            let original = procedure_containing(&state, |event| {
+                event.event_class == StateEventClass::Establish
+                    && spelling(source, event) == "x = 1"
+            });
+            let write = original
+                .events
+                .iter()
+                .find(|event| {
+                    event.event_class == StateEventClass::Establish
+                        && spelling(source, event) == "x = 1"
+                })
+                .expect("configured source retains the write");
+            let procedure = fixture.procedure(0, original.procedure);
+            eprintln!("source={source} gaps={:?}", procedure.semantics().gaps());
+            let cancellation = CancellationToken::default();
+            let mut request = test_request(&cancellation);
+            let answer = original.dead_write_local(&procedure, write.event, &mut request);
+            assert!(
+                matches!(answer, DeadWriteAnswer::Open { .. }),
+                "{source}: {answer:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dead_write_operand_order_gap_stays_open_and_prefix_walk_is_shared() {
+        const SOURCE: &str = r#"package sample
+type item struct { value int }
+func check() int {
+    x := &item{value: 1}
+    y := 2
+    z := 3
+    v0 := 4
+    v1 := 5
+    v2 := 6
+    v3 := 7
+    v4 := 8
+    v5 := 9
+    v6 := 10
+    v7 := 11
+    v8 := 12
+    v9 := 13
+    v10 := 14
+    v11 := 15
+    v12 := 16
+    v13 := 17
+    v14 := 18
+    v15 := 19
+    result := combine(next(), x.value)
+    return result + y + z + v0 + v1 + v2 + v3 + v4 + v5 + v6 + v7 + v8 + v9 + v10 + v11 + v12 + v13 + v14 + v15
+}"#;
+        let fixture = Fixture::new(Language::Go, &[("sample.go", SOURCE)]);
+        let state = fixture.state(0);
+        let cancellation = CancellationToken::default();
+        let mut checked = 0;
+        for derivation in &state.procedures {
+            let procedure = fixture.procedure(0, derivation.procedure);
+            let order_gap = procedure
+                .semantics()
+                .gaps()
+                .iter()
+                .find(|gap| gap.discharge == SemanticGapDischarge::RetainedEvaluationOrder)
+                .expect("Go records the operand order gap");
+            let mut reasons = Vec::new();
+            push_gap_reason(&mut reasons, order_gap);
+            let mut derivation = derivation.clone();
+            derivation.completeness = FlowStateCompleteness::from_reasons(reasons);
+            let mut request = test_request(&cancellation);
+            for write in derivation
+                .events
+                .iter()
+                .filter(|event| event.event_class == StateEventClass::Establish)
+            {
+                let answer = derivation.dead_write_local(&procedure, write.event, &mut request);
+                assert!(matches!(answer, DeadWriteAnswer::Open { .. }), "{answer:?}");
+                checked += 1;
+            }
+            assert_eq!(request.dead_write_prefix_reachability_cache.len(), 1);
+            assert_eq!(
+                request
+                    .dead_write_prefix_reachability_cache
+                    .keys()
+                    .next()
+                    .unwrap()
+                    .2
+                    .len(),
+                1
+            );
+            // All writes use the same cached pass, including its charged work.
+            let closure = &request
+                .dead_write_prefix_reachability_cache
+                .values()
+                .next()
+                .unwrap()
+                .outcome;
+            assert!(closure.is_ok());
+        }
+        assert!(checked >= 20);
+    }
+
+    #[test]
+    fn dead_write_live_certificate_respects_gap_points_and_escape() {
+        const SOURCE: &str = "fn check() -> i32 { let mut x; x = 1; unknown(); let y = x; y }";
+        let fixture = Fixture::new(Language::Rust, &[("sample.rs", SOURCE)]);
+        let state = fixture.state(0);
+        let original = procedure_containing(&state, |event| {
+            event.event_class == StateEventClass::Establish && spelling(SOURCE, event) == "x = 1"
+        });
+        let write = original
+            .events
+            .iter()
+            .find(|event| {
+                event.event_class == StateEventClass::Establish
+                    && spelling(SOURCE, event) == "x = 1"
+            })
+            .expect("write exists");
+        let read = original
+            .events
+            .iter()
+            .find(|event| {
+                event.event_class == StateEventClass::Read && event.subject == write.subject
+            })
+            .expect("read exists");
+        let procedure = fixture.procedure(0, original.procedure);
+        let semantics = procedure.semantics();
+        let later = semantics
+            .points()
+            .iter()
+            .find(|point| {
+                point
+                    .events
+                    .iter()
+                    .any(|event| event.effect == SemanticEffect::NormalExit)
+            })
+            .expect("normal exit exists");
+        let cancellation = CancellationToken::default();
+        for (point, escaped, live) in [
+            (later.id, false, true),
+            (semantics.call_sites()[0].point, false, false),
+            (read.point, false, false),
+            (later.id, true, false),
+            (write.point, false, false),
+        ] {
+            use crate::analyzer::semantic::{ProcedureSemanticsParts, SemanticGapImpacts};
+            let mut parts = ProcedureSemanticsParts::new(
+                semantics.id(),
+                semantics.locator().clone(),
+                semantics.kind(),
+                semantics.source(),
+                semantics.evidence(),
+            );
+            parts.properties = semantics.properties();
+            parts.cleanup_chains = semantics.cleanup_chains().clone();
+            parts.drops = semantics.drops().to_vec();
+            parts.move_outs = semantics.move_outs().to_vec();
+            parts.scope_ends = semantics.scope_ends().to_vec();
+            parts.values = semantics.values().to_vec();
+            parts.allocations = semantics.allocations().to_vec();
+            parts.memory_locations = semantics.memory_locations().to_vec();
+            parts.captures = semantics.captures().to_vec();
+            parts.call_sites = semantics.call_sites().to_vec();
+            parts.source_mappings = semantics.source_mappings().to_vec();
+            parts.evidence_rows = semantics.evidence_rows().to_vec();
+            parts.gaps = semantics.gaps().to_vec();
+            parts.blocks = semantics.blocks().to_vec();
+            parts.points = semantics.points().to_vec();
+            parts.control_edges = semantics.control_edges().to_vec();
+            let id = SemanticGapId::new(parts.gaps.len() as u32);
+            let site = semantics.point(point).expect("gap point exists");
+            parts.gaps.push(SemanticGap {
+                id,
+                point,
+                subject: SemanticGapSubject::Point,
+                capability: SemanticCapability::Assignments,
+                impacts: SemanticGapImpacts::for_gap(
+                    SemanticCapability::Assignments,
+                    SemanticGapSubject::Point,
+                ),
+                kind: SemanticGapKind::Unknown,
+                budget: None,
+                dispatch: Default::default(),
+                discharge: SemanticGapDischarge::None,
+                detail: "test-only point gap".into(),
+                source: site.source,
+                evidence: site.evidence,
+            });
+            let mut point_events = parts.points[point.index()].events.to_vec();
+            point_events.insert(
+                0,
+                crate::analyzer::semantic::SemanticEvent::new(
+                    SemanticEffect::Gap { gap: id },
+                    site.source,
+                    site.evidence,
+                ),
+            );
+            parts.points[point.index()].events = point_events.into_boxed_slice();
+            let artifact = Arc::new(
+                SemanticArtifact::try_new(
+                    procedure.artifact().key().clone(),
+                    procedure.artifact().capabilities().clone(),
+                    vec![parts],
+                )
+                .expect("injected gap preserves valid semantics"),
+            );
+            let procedure = artifact
+                .procedure_handle(semantics.id())
+                .expect("procedure exists");
+            let mut derivation = original.clone();
+            derivation.procedure_artifact = Arc::downgrade(&artifact);
+            let mut reasons = Vec::new();
+            push_gap_reason(
+                &mut reasons,
+                procedure.semantics().gap(id).expect("gap exists"),
+            );
+            derivation.completeness = FlowStateCompleteness::from_reasons(reasons);
+            let mut request = test_request(&cancellation);
+            if escaped {
+                let mut index = dead_write_procedure_index(&derivation, &procedure);
+                index.escaped_bindings.insert(write.subject.value());
+                request.memos.dead_write_procedure_cache.insert(
+                    DeadWriteProcedureKey(
+                        Arc::as_ptr(procedure.artifact()) as usize,
+                        procedure.id(),
+                        procedure.interpretation(),
+                        derivation.generation,
+                    ),
+                    index,
+                );
+            }
+            let answer = derivation.dead_write_local_with_macro_sources(
+                &procedure,
+                write.event,
+                &[site.source],
+                &[],
+                &mut request,
+            );
+            if live {
+                assert!(matches!(answer, DeadWriteAnswer::Live { .. }), "{answer:?}");
+            } else {
+                assert!(matches!(answer, DeadWriteAnswer::Open { .. }), "{answer:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn dead_write_component_order_is_shared_across_writes() {
+        let source = format!(
+            "fn check() -> i32 {{ let a = Vec::<i32>::new(); let b = Vec::<i32>::new(); let mut x; {} x }}",
+            "x = 1;".repeat(20)
+        );
+        let fixture = Fixture::new(Language::Rust, &[("sample.rs", &source)]);
+        let state = fixture.state(0);
+        let derivation = procedure_containing(&state, |event| {
+            event.event_class == StateEventClass::Establish && spelling(&source, event) == "x = 1"
+        });
+        let procedure = fixture.procedure(0, derivation.procedure);
+        assert!(procedure.semantics().gaps().len() >= 2);
+        let cancellation = CancellationToken::default();
+        let mut request = test_request(&cancellation);
+        let key = DeadWriteProcedureKey(
+            Arc::as_ptr(procedure.artifact()) as usize,
+            procedure.id(),
+            procedure.interpretation(),
+            derivation.generation,
+        );
+        let first = derivation
+            .cached_dead_write_component_order(&procedure, key, &[], &[], &mut request)
+            .unwrap();
+        let mut checked = 0;
+        for write in derivation
+            .events
+            .iter()
+            .filter(|event| event.event_class == StateEventClass::Establish)
+        {
+            let order = derivation
+                .cached_dead_write_component_order(&procedure, key, &[], &[], &mut request)
+                .unwrap();
+            assert!(Arc::ptr_eq(&first, &order));
+            let _answer = derivation.dead_write_local(&procedure, write.event, &mut request);
+            checked += 1;
+        }
+        assert!(checked >= 20);
+        assert_eq!(request.dead_write_component_order_cache.len(), 1);
+    }
+
+    #[test]
+    fn dead_write_unreachable_prefix_keeps_dead() {
+        const SOURCE: &str = "class Sample { int check(boolean flag) { int x; if (flag) { int y = 0; } x = 1; x = 2; return x; } }";
+        let fixture = Fixture::new(Language::Java, &[("Sample.java", SOURCE)]);
+        let state = fixture.state(0);
+        let original = procedure_containing(&state, |event| {
+            event.event_class == StateEventClass::Establish && spelling(SOURCE, event) == "x = 1"
+        });
+        let write = original
+            .events
+            .iter()
+            .find(|event| {
+                event.event_class == StateEventClass::Establish
+                    && spelling(SOURCE, event) == "x = 1"
+            })
+            .expect("write exists");
+        let procedure = fixture.procedure(0, original.procedure);
+        let semantics = procedure.semantics();
+        let cancellation = CancellationToken::default();
+        let point = original
+            .events
+            .iter()
+            .find(|event| {
+                event.event_class == StateEventClass::Establish
+                    && spelling(SOURCE, event).contains("y = 0")
+            })
+            .expect("branch establishment")
+            .point;
+        {
+            use crate::analyzer::semantic::{ProcedureSemanticsParts, SemanticGapImpacts};
+            let mut parts = ProcedureSemanticsParts::new(
+                semantics.id(),
+                semantics.locator().clone(),
+                semantics.kind(),
+                semantics.source(),
+                semantics.evidence(),
+            );
+            parts.properties = semantics.properties();
+            parts.cleanup_chains = semantics.cleanup_chains().clone();
+            parts.drops = semantics.drops().to_vec();
+            parts.move_outs = semantics.move_outs().to_vec();
+            parts.scope_ends = semantics.scope_ends().to_vec();
+            parts.values = semantics.values().to_vec();
+            parts.allocations = semantics.allocations().to_vec();
+            parts.memory_locations = semantics.memory_locations().to_vec();
+            parts.captures = semantics.captures().to_vec();
+            parts.call_sites = semantics.call_sites().to_vec();
+            parts.source_mappings = semantics.source_mappings().to_vec();
+            parts.evidence_rows = semantics.evidence_rows().to_vec();
+            parts.gaps = semantics.gaps().to_vec();
+            parts.blocks = semantics.blocks().to_vec();
+            parts.points = semantics.points().to_vec();
+            parts.control_edges = semantics.control_edges().to_vec();
+            let id = SemanticGapId::new(parts.gaps.len() as u32);
+            let site = semantics.point(point).expect("gap point exists");
+            parts.gaps.push(SemanticGap {
+                id,
+                point,
+                subject: SemanticGapSubject::Point,
+                capability: SemanticCapability::ReturnFlow,
+                impacts: SemanticGapImpacts::for_gap(
+                    SemanticCapability::ReturnFlow,
+                    SemanticGapSubject::Point,
+                ),
+                kind: SemanticGapKind::Unsupported,
+                budget: None,
+                dispatch: Default::default(),
+                discharge: SemanticGapDischarge::None,
+                detail: "test-only point gap".into(),
+                source: site.source,
+                evidence: site.evidence,
+            });
+            let mut point_events = parts.points[point.index()].events.to_vec();
+            point_events.insert(
+                0,
+                crate::analyzer::semantic::SemanticEvent::new(
+                    SemanticEffect::Gap { gap: id },
+                    site.source,
+                    site.evidence,
+                ),
+            );
+            parts.points[point.index()].events = point_events.into_boxed_slice();
+            let artifact = Arc::new(
+                SemanticArtifact::try_new(
+                    procedure.artifact().key().clone(),
+                    procedure
+                        .artifact()
+                        .capabilities()
+                        .iter()
+                        .fold(
+                            SemanticCapabilities::builder(),
+                            |builder, (capability, support)| builder.support(capability, support),
+                        )
+                        .partial(SemanticCapability::ReturnFlow)
+                        .build(),
+                    vec![parts],
+                )
+                .expect("injected gap preserves valid semantics"),
+            );
+            let procedure = artifact
+                .procedure_handle(semantics.id())
+                .expect("procedure exists");
+            let mut derivation = original.clone();
+            derivation.procedure_artifact = Arc::downgrade(&artifact);
+            let mut reasons = Vec::new();
+            push_gap_reason(
+                &mut reasons,
+                procedure.semantics().gap(id).expect("gap exists"),
+            );
+            derivation.completeness = FlowStateCompleteness::from_reasons(reasons);
+            let mut request = test_request(&cancellation);
+            let gap_point = original
+                .events
+                .iter()
+                .find(|event| {
+                    event.event_class == StateEventClass::Establish
+                        && spelling(SOURCE, event).contains("y = 0")
+                })
+                .expect("branch establishment")
+                .point;
+            derivation.control_edge_mask = ControlEdgeMask::new(
+                procedure.semantics(),
+                procedure
+                    .semantics()
+                    .control_edges()
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, edge)| edge.target_point == gap_point)
+                    .map(|(index, _)| ControlEdgeId::try_from_index(index).unwrap()),
+            );
+            let answer = derivation.dead_write_local_with_macro_sources(
+                &procedure,
+                write.event,
+                &[],
+                &[],
+                &mut request,
+            );
+            assert!(matches!(answer, DeadWriteAnswer::Dead), "{answer:?}");
+        }
+    }
+
+    #[test]
+    fn dead_write_loop_drop_gap_stays_open() {
+        const SOURCE: &str = "class Sample { int check(boolean flag) { int x; while (flag) { int y = 0; x = 1; int z = x; } return 0; } }";
+        let fixture = Fixture::new(Language::Java, &[("Sample.java", SOURCE)]);
+        let state = fixture.state(0);
+        let original = procedure_containing(&state, |event| {
+            event.event_class == StateEventClass::Establish && spelling(SOURCE, event) == "x = 1"
+        });
+        let write = original
+            .events
+            .iter()
+            .find(|event| {
+                event.event_class == StateEventClass::Establish
+                    && spelling(SOURCE, event) == "x = 1"
+            })
+            .expect("write exists");
+        let procedure = fixture.procedure(0, original.procedure);
+        let semantics = procedure.semantics();
+        let cancellation = CancellationToken::default();
+        let point = original
+            .events
+            .iter()
+            .find(|event| {
+                event.event_class == StateEventClass::Establish
+                    && spelling(SOURCE, event).contains("y = 0")
+            })
+            .expect("branch establishment")
+            .point;
+        {
+            use crate::analyzer::semantic::{ProcedureSemanticsParts, SemanticGapImpacts};
+            let mut parts = ProcedureSemanticsParts::new(
+                semantics.id(),
+                semantics.locator().clone(),
+                semantics.kind(),
+                semantics.source(),
+                semantics.evidence(),
+            );
+            parts.properties = semantics.properties();
+            parts.cleanup_chains = semantics.cleanup_chains().clone();
+            parts.drops = semantics.drops().to_vec();
+            parts.move_outs = semantics.move_outs().to_vec();
+            parts.scope_ends = semantics.scope_ends().to_vec();
+            parts.values = semantics.values().to_vec();
+            parts.allocations = semantics.allocations().to_vec();
+            parts.memory_locations = semantics.memory_locations().to_vec();
+            parts.captures = semantics.captures().to_vec();
+            parts.call_sites = semantics.call_sites().to_vec();
+            parts.source_mappings = semantics.source_mappings().to_vec();
+            parts.evidence_rows = semantics.evidence_rows().to_vec();
+            parts.gaps = Vec::new();
+            parts.blocks = semantics.blocks().to_vec();
+            parts.points = semantics.points().to_vec();
+            for point in &mut parts.points {
+                point.events = point
+                    .events
+                    .iter()
+                    .filter(|event| !matches!(event.effect, SemanticEffect::Gap { .. }))
+                    .cloned()
+                    .collect();
+            }
+            parts.control_edges = semantics.control_edges().to_vec();
+            let id = SemanticGapId::new(parts.gaps.len() as u32);
+            let site = semantics.point(point).expect("gap point exists");
+            parts.gaps.push(SemanticGap {
+                id,
+                point,
+                subject: SemanticGapSubject::Point,
+                capability: SemanticCapability::Calls,
+                impacts: SemanticGapImpacts::for_gap(
+                    SemanticCapability::Calls,
+                    SemanticGapSubject::Point,
+                ),
+                kind: SemanticGapKind::Unknown,
+                budget: None,
+                dispatch: Default::default(),
+                discharge: SemanticGapDischarge::ImplicitDropExecution,
+                detail: "implicit drop glue is not modeled".into(),
+                source: site.source,
+                evidence: site.evidence,
+            });
+            let mut point_events = parts.points[point.index()].events.to_vec();
+            point_events.insert(
+                0,
+                crate::analyzer::semantic::SemanticEvent::new(
+                    SemanticEffect::Gap { gap: id },
+                    site.source,
+                    site.evidence,
+                ),
+            );
+            parts.points[point.index()].events = point_events.into_boxed_slice();
+            let artifact = Arc::new(
+                SemanticArtifact::try_new(
+                    procedure.artifact().key().clone(),
+                    procedure.artifact().capabilities().clone(),
+                    vec![parts],
+                )
+                .expect("injected gap preserves valid semantics"),
+            );
+            let procedure = artifact
+                .procedure_handle(semantics.id())
+                .expect("procedure exists");
+            let mut derivation = original.clone();
+            derivation.procedure_artifact = Arc::downgrade(&artifact);
+            let mut reasons = Vec::new();
+            push_gap_reason(
+                &mut reasons,
+                procedure.semantics().gap(id).expect("gap exists"),
+            );
+            derivation.completeness = FlowStateCompleteness::from_reasons(reasons);
+            assert_eq!(procedure.semantics().gaps().len(), 1);
+            assert!(procedure.semantics().gaps()[0].is_implicit_drop_omission());
+            let mut request = test_request(&cancellation);
+            let key = DeadWriteProcedureKey(
+                Arc::as_ptr(procedure.artifact()) as usize,
+                procedure.id(),
+                procedure.interpretation(),
+                derivation.generation,
+            );
+            let order = derivation
+                .cached_dead_write_component_order(&procedure, key, &[], &[], &mut request)
+                .unwrap();
+            assert_eq!(order[point.index()], order[write.point.index()]);
+            // Bypass the surface's drop exemption and invoke its certificate
+            // directly with the sole drop gap retained. Cutting this loop's
+            // gap must prevent a Live witness by removing entry to the write.
+            let edges = derivation
+                .dead_write_certificate_edges(
+                    &procedure,
+                    key,
+                    &[],
+                    &[],
+                    write.point,
+                    [point].into_iter().collect(),
+                    &mut request,
+                )
+                .unwrap();
+            let reachable = derivation
+                .cached_dead_write_reachability(
+                    &procedure,
+                    key,
+                    &edges,
+                    &edges,
+                    procedure.semantics().entry_point(),
+                    &mut request,
+                )
+                .unwrap();
+            assert!(!reachable.membership()[write.point.index()]);
+        }
+    }
+
+    #[test]
     fn overwritten_unread_keeps_unlocated_observation_gaps_blocking() {
         const SOURCE: &str = "class Sample { int clean() { int x; x = 1; x = 2; return x; } }";
         let fixture = Fixture::new(Language::Java, &[("src/Sample.java", SOURCE)]);
@@ -18235,11 +19247,7 @@ func second(input int) int {
         let procedure = fixture.procedure(0, original.procedure);
         let cancellation = CancellationToken::default();
         assert!(matches!(
-            original.overwritten_unread_local(
-                &procedure,
-                event,
-                &mut FlowStateRequest::new(&cancellation)
-            ),
+            original.overwritten_unread_local(&procedure, event, &mut test_request(&cancellation)),
             OverwrittenUnreadAnswer::Proven { .. }
         ));
         let reason = FlowStateIncompleteReason::LoweringGap {
@@ -18254,7 +19262,7 @@ func second(input int) int {
             derivation.overwritten_unread_local(
                 &procedure,
                 event,
-                &mut FlowStateRequest::new(&cancellation)
+                &mut test_request(&cancellation)
             ),
             OverwrittenUnreadAnswer::Open {
                 reasons: vec![reason]
@@ -18332,6 +19340,7 @@ func second(input int) int {
             ),
             kind: SemanticGapKind::Unknown,
             budget: None,
+            dispatch: Default::default(),
             discharge: SemanticGapDischarge::None,
             detail: "test-only observation gap at the exceptional destination".into(),
             source: exit.source,
@@ -18485,7 +19494,7 @@ func second(input int) int {
             .expect("first establishment exists");
         let procedure = fixture.procedure(0, derivation.procedure);
         let cancellation = CancellationToken::default();
-        let mut request = FlowStateRequest::new(&cancellation);
+        let mut request = test_request(&cancellation);
         request.cfg_budget = CfgAlgorithmBudget::uniform(1);
         assert!(matches!(
             derivation.overwritten_unread_local(&procedure, first.event, &mut request),
@@ -18504,7 +19513,7 @@ func second(input int) int {
             derivation.overwritten_unread_local(
                 &procedure,
                 first.event,
-                &mut FlowStateRequest::new(&cancelled)
+                &mut test_request(&cancelled)
             ),
             OverwrittenUnreadAnswer::Open { reasons }
                 if reasons.contains(&FlowStateIncompleteReason::Cancelled)
@@ -18574,7 +19583,7 @@ def outer():
             .expect("the self-assignment RHS is a projected binding read");
         let procedure = fixture.procedure(0, derivation.procedure);
         assert!(matches!(
-            derivation.binding_initialization_at_read(&procedure, read, &mut FlowStateRequest::new(&CancellationToken::default())),
+            derivation.binding_initialization_at_read(&procedure, read, &mut test_request(&CancellationToken::default())),
             BindingInitializationAnswer::Open { reasons }
                 if reasons.iter().any(|reason| matches!(
                     reason,
@@ -18599,7 +19608,7 @@ def outer():
             &fixture.workspace,
             &fixture.files[0],
             outcome,
-            &mut FlowStateRequest::new(&token),
+            &mut test_request(&token),
         );
         let (index, read) = state.procedures.iter().enumerate().find_map(|(index, row)| {
             row.events.iter().find(|event| event.event_class == StateEventClass::Read
@@ -18616,7 +19625,7 @@ def outer():
             &state,
             &procedure,
             point,
-            &mut FlowStateRequest::new(&token),
+            &mut test_request(&token),
         );
         assert!(
             selected.procedures[0]
@@ -18662,8 +19671,10 @@ def outer():
                 .semantics()
                 .gaps()
                 .iter()
-                .filter(|gap| snapshot.gap_is_discharged(gap.id))
-                .map(|gap| gap.id)
+                .filter(|gap| {
+                    snapshot.gap_is_discharged(crate::analyzer::semantic::GapKey::Gap(gap.id))
+                })
+                .map(|gap| crate::analyzer::semantic::GapKey::Gap(gap.id))
                 .collect(),
         )
         .expect("retained rows still satisfy the oracle relation contract");
@@ -18708,7 +19719,7 @@ def outer():
             &missing,
             &procedure,
             point,
-            &mut FlowStateRequest::new(&token),
+            &mut test_request(&token),
         );
         assert!(selected.completeness.reasons().iter().any(|reason|
             matches!(reason, FlowStateIncompleteReason::SelectedPropertyEndpointUnavailable { point: missing, .. } if *missing == point)));
@@ -18717,7 +19728,7 @@ def outer():
                 .completeness
                 .covers(FlowStateAxis::PropertyReachingRelation)
         );
-        let mut limited = FlowStateRequest::new(&token);
+        let mut limited = test_request(&token);
         limited.cfg_budget = CfgAlgorithmBudget::uniform(0);
         let selected = flow_state_for_selected_property(
             &fixture.workspace,
@@ -18741,7 +19752,7 @@ def outer():
             &state,
             &procedure,
             point,
-            &mut FlowStateRequest::new(&cancelled),
+            &mut test_request(&cancelled),
         );
         assert!(
             !selected
@@ -18806,7 +19817,7 @@ def outer():
             &fixture.workspace,
             &fixture.files[0],
             outcome.clone(),
-            &mut FlowStateRequest::new(&cancellation),
+            &mut test_request(&cancellation),
         );
         let artifact = outcome
             .available_value()

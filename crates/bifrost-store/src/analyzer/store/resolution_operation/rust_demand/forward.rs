@@ -450,41 +450,10 @@ impl<'a, 'store, 'input> DemandRules for RustRules<'a, 'store, 'input> {
                 .iter()
                 .all(|placement| half.answered_placements.contains(&placement.placement))
         }));
-        use super::super::demand_closure::{BaseEligibility, ClosurePolicy, GeneratedContinuation};
-        let generated = facts
-            .generated
-            .iter()
-            .map(|(candidate, source)| {
-                let suppress = frame.halves.iter().any(|half| {
-                    let SelectedRootPathHalf::Reference {
-                        identity,
-                        token,
-                        demand,
-                        prefix_reference: Some(prefix),
-                        ..
-                    } = half
-                    else {
-                        return false;
-                    };
-                    identity.fragment() == source.fragment
-                        && *token == source.token
-                        && *demand == source.demand
-                        && facts.prefixes.entries.iter().any(|answer| {
-                            answer.key == DemandReferenceKey::caller(*prefix)
-                                && !answer.answer.binding().targets().is_empty()
-                        })
-                });
-                GeneratedContinuation {
-                    candidate: *candidate,
-                    source: *source,
-                    base: if suppress {
-                        BaseEligibility::Exclude
-                    } else {
-                        BaseEligibility::Retain
-                    },
-                }
-            })
-            .collect();
+        use super::super::demand_closure::{BaseEligibility, ClosurePolicy};
+        // Any resolved prefix target owns its members outside the base relation.
+        let generated =
+            facts.generated_continuations(&frame.halves, |targets| Ok(!targets.is_empty()))?;
         let mut policy = ClosurePolicy::new(
             ResolutionCompletion::Complete,
             BaseEligibility::Retain,
@@ -549,25 +518,14 @@ impl<'a, 'store, 'input> DemandRules for RustRules<'a, 'store, 'input> {
         let generated = self
             .arena
             .borrow()
-            .generated_base_completion(endpoint, self.session);
+            .generated_base_admission(endpoint, self.session);
         if self.cancellation.is_cancelled() || !self.session.observe_cancellation() {
             return Ok(Read::Cancelled(
                 self.stopped(&self.prepared.demand.completion),
             ));
         }
-        if let Some((completion, use_base)) = generated {
-            if use_base {
-                self.arena
-                    .borrow_mut()
-                    .base_ready
-                    .insert(DemandRelationKey::caller(endpoint.clone()));
-            } else {
-                self.arena
-                    .borrow_mut()
-                    .excluded_base
-                    .insert(DemandRelationKey::caller(endpoint.clone()));
-            }
-            return Ok(Read::ready(EndpointAdmission::Ready(completion)));
+        if let Some(admission) = generated {
+            return Ok(Read::ready(EndpointAdmission::Context(admission)));
         }
         Ok(Read::ready(EndpointAdmission::Discover))
     }

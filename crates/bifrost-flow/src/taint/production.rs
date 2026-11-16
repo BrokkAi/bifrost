@@ -185,6 +185,36 @@ impl ProductionTaintAnalysisResult {
         }
     }
 
+    /// Retain this actual immutable product in the caller's joint census.
+    /// Every recorded allocation remains pinned by this result and its fields.
+    pub fn retained_heap(
+        self: &Arc<Self>,
+        heap: &mut crate::analyzer::store::cache_budget::RetainedHeap,
+    ) -> bool {
+        use crate::analyzer::semantic::service::{
+            ArtifactRetentionVisitor, RetainedArtifactWalker,
+        };
+        heap.arc(self, |result, heap| {
+            heap.owned_slice(result.projection_scope.as_bytes());
+            heap.owned_slice(result.registration_digest.as_bytes());
+            heap.owned_slice(result.artifact_keys.as_ref());
+            heap.owned_slice(result.frontier_sources.as_ref());
+            heap.arc(&result.plan, |plan, heap| plan.retained_heap(heap));
+            heap.arc(&result.report, |report, heap| {
+                report.retained_inputs_heap(heap)
+            });
+            let mut census = RetainedArtifactWalker::new(heap);
+            for key in &result.artifact_keys {
+                census.artifact_key(key);
+            }
+            for event in &result.frontier_sources {
+                census.locator(event.site());
+            }
+            census.finish();
+        });
+        !heap.is_refused()
+    }
+
     pub fn plan(&self) -> &Arc<TaintAnalysisPlan> {
         &self.plan
     }

@@ -114,16 +114,12 @@ use crate::analyzer::scala::semantic_adaptation::scala_nominal_types_match;
 
 use crate::analyzer::scala::semantic_adaptation::type_identity as scala_type_identity;
 
-// Bumping this rotates every public wire id hashed from the adapter
-// fingerprint (`SemanticArtifactKey::push_environment_identity`). A checked-in
-// golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
-// change; the code-query tutorial pages elide such ids (#5016).
-// #8387: invalidate artifacts embedding ranked synthetic declaration identities.
-// #9438: decorator argument roles reach on-demand semantic lowering.
-// #9447: structured formal roles and refusal change semantic payloads.
-// #9479: parameterless member selections lower as bound-method call sites.
-// #10445: parameter activation changes Scala term-binding visibility in semantic adaptation.
-const ADAPTER_VERSION: &[u8] = b"scala-value-semantics-v30";
+/// The scala adapter lever (#11570): `levers/scala-adapter.tokens`. Add a line there
+/// when a change alters the semantics this lowerer publishes for unchanged
+/// source; see `.agents/docs/cache-identity-levers.md`.
+fn adapter_version() -> &'static [u8] {
+    brokk_bifrost_core::lever_label!("scala-value-semantics", "scala-adapter.tokens").as_bytes()
+}
 
 /// Procedure syntax roles used by source-backed assignment relations. The
 /// Scala lowering already publishes exact assignment effects; these roles
@@ -261,7 +257,7 @@ fn policy_lowering_identity_for_dependencies(
 ) -> SemanticAdapterIdentity {
     SemanticAdapterIdentity::for_adapter(
         "scala",
-        ADAPTER_VERSION,
+        adapter_version(),
         b"scala-intrafile-execution-defaults-v1",
         dependencies,
     )
@@ -3318,6 +3314,77 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
         Ok(())
     }
 
+    /// Prove non-null receivers from syntax and the visible local binding.
+    fn receiver_is_non_null(&self, object: Node<'tree>) -> bool {
+        if matches!(object.kind(), "this" | "super" | "instance_expression") {
+            return true;
+        }
+        if object.kind() != "identifier" {
+            return false;
+        }
+        let Some(name) = node_text(self.prepared.source(), object) else {
+            return false;
+        };
+        if matches!(name, "this" | "super") {
+            return true;
+        }
+        let Some(binding) = self.local_binding_at(name, object.start_byte()) else {
+            return false;
+        };
+        let root = compilation_unit_root(self.callable);
+        let Some(binder) = root.descendant_for_byte_range(
+            binding.declaration_start,
+            binding.declaration_start + name.len(),
+        ) else {
+            return false;
+        };
+        let Some(parent) = binder.parent() else {
+            return false;
+        };
+        // A local `val` proves non-null only when the binder is its whole
+        // pattern: a destructuring pattern can bind a null component.
+        if parent.kind() == "val_definition" {
+            return parent.child_by_field_name("pattern") == Some(binder)
+                && parent
+                    .child_by_field_name("value")
+                    .is_some_and(|value| value.kind() == "instance_expression");
+        }
+        // A catch binder proves non-null only when it binds the whole caught
+        // value (`case e =>`, `case e: T =>` or `case e @ p =>`): `throw null`
+        // throws a NullPointerException instead. A binder inside an extractor
+        // pattern can bind a null component of the exception.
+        let (pattern, container) = if (parent.kind() == "typed_pattern"
+            && parent.child_by_field_name("pattern") == Some(binder))
+            || (parent.kind() == "capture_pattern"
+                && parent.child_by_field_name("name") == Some(binder))
+        {
+            let Some(container) = parent.parent() else {
+                return false;
+            };
+            (parent, container)
+        } else {
+            (binder, parent)
+        };
+        if container.child_by_field_name("pattern") != Some(pattern) {
+            return false;
+        }
+        match container.kind() {
+            "catch_clause" => true,
+            "case_clause" => {
+                let mut enclosing = container.parent();
+                while let Some(node) = enclosing {
+                    match node.kind() {
+                        "catch_clause" => return true,
+                        "case_block" | "indented_cases" => enclosing = node.parent(),
+                        _ => return false,
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn assignment_expression(
         &mut self,
@@ -3415,6 +3482,46 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
             if !resolved {
                 self.add_field_identity_gap(builder, terminal, location)?;
             }
+            // Scala rejects overriding a concrete mutable variable (scalac
+            // 2.13: 'mutable variable cannot be overridden'; Scala 3 E164),
+            // but the generated setter `x_$eq` is an ordinary JVM method that
+            // a Java subclass can override. So the setter is the synthetic one
+            // only when no subclass can exist or override it: a `final var`,
+            // or a var of an `object` or a `final class`.
+            let synthetic_setter = resolved
+                && node_text(self.prepared.source(), field)
+                    .zip(self.expression_type_identity(object))
+                    .and_then(|(name, owner)| self.template_value_member(&owner, name))
+                    .is_some_and(|definition| {
+                        definition.kind() == "var_definition"
+                            && definition.child_by_field_name("value").is_some()
+                            && (scala_has_modifier(definition, "final")
+                                || scala_enclosing_template(definition).is_some_and(|template| {
+                                    template.kind() == "object_definition"
+                                        || (template.kind() == "class_definition"
+                                            && scala_has_modifier(template, "final"))
+                                }))
+                    });
+            if !synthetic_setter {
+                self.session.record_gap(
+                    builder,
+                    terminal,
+                    SemanticGapSubject::Point,
+                    SemanticCapability::Calls,
+                    SemanticGapKind::Unsupported,
+                    "assignment to a var member invokes its setter, which is not yet a call site",
+                )?;
+            }
+            if !self.receiver_is_non_null(object) {
+                self.session.record_gap(
+                    builder,
+                    terminal,
+                    SemanticGapSubject::Point,
+                    SemanticCapability::ExceptionalControlFlow,
+                    SemanticGapKind::Unsupported,
+                    "the null-receiver abort edge of a field store is not lowered",
+                )?;
+            }
             self.append_effect(
                 builder,
                 terminal,
@@ -3451,6 +3558,14 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
                     location,
                     value: source,
                 },
+            )?;
+            self.session.record_gap(
+                builder,
+                terminal,
+                SemanticGapSubject::Point,
+                SemanticCapability::ExceptionalControlFlow,
+                SemanticGapKind::Unsupported,
+                "the null, bounds, and array-store abort edges of an array element store are not lowered",
             )?;
             evaluations = vec![base_node, index_node, right];
         } else if let Some((base_node, index_node)) = self.map_update_access(left)
@@ -3650,6 +3765,16 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
                 SemanticCapability::ExceptionalControlFlow,
                 SemanticGapKind::Unknown,
                 "parameterless method selection or an implicit conversion may complete exceptionally",
+            )?;
+        }
+        if !self.receiver_is_non_null(object) {
+            self.session.record_gap(
+                builder,
+                access,
+                SemanticGapSubject::Point,
+                SemanticCapability::ExceptionalControlFlow,
+                SemanticGapKind::Unsupported,
+                "the null-receiver abort edge of a field read is not lowered",
             )?;
         }
         self.append_effect(
@@ -6281,7 +6406,9 @@ fn scala_literal_has_declared_identity_type(
         DeclaredScalarType::Signed(bits) => {
             let literal_bits = match literal_scalar {
                 DeclaredScalarType::Signed(bits) => bits,
-                DeclaredScalarType::Boolean | DeclaredScalarType::Unsigned(_) => return false,
+                DeclaredScalarType::Boolean
+                | DeclaredScalarType::Unsigned(_)
+                | DeclaredScalarType::UnknownInteger => return false,
             };
             if !matches!((bits, literal_bits), (64, 32 | 64) | (8 | 16 | 32, 32)) {
                 return false;
@@ -6303,7 +6430,7 @@ fn scala_literal_has_declared_identity_type(
             };
             (minimum..=maximum).contains(&value)
         }
-        DeclaredScalarType::Unsigned(_) => false,
+        DeclaredScalarType::Unsigned(_) | DeclaredScalarType::UnknownInteger => false,
     }
 }
 
@@ -6414,6 +6541,36 @@ fn scala_type_definitions_named<'tree>(
             "enum_definition",
         ],
     )
+}
+
+/// Whether a definition's `modifiers` child carries the keyword `keyword`.
+/// Modifier keywords are anonymous tokens of that node.
+fn scala_has_modifier(definition: Node<'_>, keyword: &str) -> bool {
+    let mut cursor = definition.walk();
+    definition
+        .children(&mut cursor)
+        .filter(|child| child.kind() == "modifiers")
+        .any(|modifiers| {
+            let mut cursor = modifiers.walk();
+            modifiers
+                .children(&mut cursor)
+                .any(|token| token.kind() == keyword)
+        })
+}
+
+/// The class, object or trait definition whose template declares `member`.
+fn scala_enclosing_template(member: Node<'_>) -> Option<Node<'_>> {
+    let mut ancestor = member.parent();
+    while let Some(node) = ancestor {
+        if matches!(
+            node.kind(),
+            "class_definition" | "object_definition" | "trait_definition"
+        ) {
+            return Some(node);
+        }
+        ancestor = node.parent();
+    }
+    None
 }
 
 fn unique_node<'tree>(mut nodes: Vec<Node<'tree>>) -> Option<Node<'tree>> {

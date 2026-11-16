@@ -6,7 +6,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use git2::{ObjectType, Oid};
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use super::go_unit_summaries::go_unit_key;
 use super::{AnalyzerStore, Result, WorkspaceConfigurationInput, WorkspaceSnapshotId};
@@ -15,7 +15,9 @@ use crate::analyzer::canonical_hash::CanonicalHasher;
 use crate::analyzer::{Language, Project};
 use crate::path_normalization::NormalizePath;
 use brokk_bifrost_core::analyzer::go_facts::GO_BUILD_SELECTION_FACTS_VERSION;
-use brokk_bifrost_go::package_discovery::{GoPackage, GoPackageDiscovery};
+use brokk_bifrost_go::package_discovery::{
+    GoPackage, GoPackageDiscovery, PER_INVOCATION_GO_ENV_KEYS,
+};
 
 /// Version 11 admits source-bearing dependencies as providers while keeping
 /// caller ownership with each discovery domain's main modules. Version 13
@@ -25,8 +27,29 @@ use brokk_bifrost_go::package_discovery::{GoPackage, GoPackageDiscovery};
 /// those contexts are never selected.
 /// Version 14 hashes an input by kind, path and content OID only; modified time and length no longer take part, so an unchanged save reuses the context.
 /// Version 15 resolves relative source imports outside module mode by importer directory.
+/// Version 16 folds the full `go env -json` capture of discovery's hardened
+/// context into the base profile (#11607). Version 15 pinned only GOTOOLCHAIN,
+/// so a Go default or home-derived setting that changes what `go list` reports
+/// (GOEXPERIMENT, GOAMD64, GOFLAGS and the rest) did not change the profile.
 #[doc(hidden)]
-pub const DERIVATION_VERSION: i64 = 15;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn derivation_identity_before_last_token() -> [u8; 32] {
+    brokk_bifrost_core::lever_tokens::lever_identity_before_last_token(
+        "go-context-derivation",
+        brokk_bifrost_core::lever_file!("go-context-derivation.tokens"),
+    )
+}
+
+pub fn derivation_identity() -> [u8; 32] {
+    static IDENTITY: std::sync::LazyLock<[u8; 32]> = std::sync::LazyLock::new(|| {
+        brokk_bifrost_core::lever_tokens::lever_identity(
+            "go-context-derivation",
+            brokk_bifrost_core::lever_file!("go-context-derivation.tokens"),
+        )
+    });
+    *IDENTITY
+}
 
 #[derive(Debug, Default)]
 #[doc(hidden)]
@@ -178,7 +201,7 @@ pub const PRIOR_HEADS_SQL: &str =
      FROM go_context_selections s JOIN go_context_publications p USING(selection_id)
      WHERE s.workspace_id=?1 AND s.lang='go' AND s.generation=?2
        AND p.valid_from<=?3 AND (p.valid_until IS NULL OR ?3<p.valid_until)
-       AND s.derivation_version=?4";
+       AND s.derivation_identity=?4";
 
 pub(crate) const CANONICAL_SOURCE_SQL: &str = "SELECT f.file_version_id,f.blob_oid,m.content_package,manifest.publication_state,manifest.facts_version
                              FROM workspace_file_versions f
@@ -193,7 +216,7 @@ pub(crate) const SELECT_CONTEXT_SQL: &str =
      FROM go_context_selections s JOIN go_context_publications p USING(selection_id)
      WHERE s.workspace_id=?1 AND s.lang='go' AND s.generation=?2
        AND p.valid_from<=?3 AND (p.valid_until IS NULL OR ?3<p.valid_until)
-       AND s.profile_digest=?4 AND s.derivation_version=?5";
+       AND s.profile_digest=?4 AND s.derivation_identity=?5";
 
 #[doc(hidden)]
 pub fn base_profile_digest(discovery: &GoPackageDiscovery) -> [u8; 32] {
@@ -211,6 +234,14 @@ pub fn base_profile_digest(discovery: &GoPackageDiscovery) -> [u8; 32] {
         ("gomodcache", &discovery.environment.gomodcache),
     ] {
         hash.field(key, value.as_os_str().as_encoded_bytes());
+    }
+    // Every other key of the one `go env -json` capture discovery ran `go list`
+    // under. BTreeMap order is the canonical order.
+    for (key, value) in &discovery.environment.settings {
+        if !PER_INVOCATION_GO_ENV_KEYS.contains(&key.as_str()) {
+            hash.field("setting", key.as_bytes());
+            hash.field("value", value.as_bytes());
+        }
     }
     for pattern in &discovery.workspace_patterns {
         hash.field("pattern", pattern.as_bytes());
@@ -578,7 +609,7 @@ impl AnalyzerStore {
                     snapshot.generation.get(),
                     snapshot.revision,
                     profile,
-                    DERIVATION_VERSION
+                    derivation_identity()
                 ],
                 |row| {
                     Ok(GoContextIdentity {
@@ -1272,10 +1303,10 @@ impl AnalyzerStore {
                         params![snapshot.workspace_id.as_str(),snapshot.generation.get()], |row|row.get(0),
                     ).optional()?;
                     if revision != Some(snapshot.revision) { return Ok(None); }
-            tx.prepare_cached("INSERT OR IGNORE INTO go_context_selections(workspace_id,lang,generation,base_profile_digest,domain_dir,gowork_path,profile_digest,derivation_version) VALUES(?1,'go',?2,?3,?4,?5,?6,?7)")?.execute(
-                params![snapshot.workspace_id.as_str(),snapshot.generation.get(),base_profile,domain.directory,domain.gowork_path,profile,DERIVATION_VERSION])?;
-            let selection_id: i64 = tx.prepare_cached("SELECT selection_id FROM go_context_selections WHERE workspace_id=?1 AND lang='go' AND generation=?2 AND base_profile_digest=?3 AND domain_dir=?4 AND gowork_path=?5 AND derivation_version=?6")?.query_row(
-                params![snapshot.workspace_id.as_str(),snapshot.generation.get(),base_profile,domain.directory,domain.gowork_path,DERIVATION_VERSION],|row|row.get(0))?;
+            tx.prepare_cached("INSERT OR IGNORE INTO go_context_selections(workspace_id,lang,generation,base_profile_digest,domain_dir,gowork_path,profile_digest,derivation_identity) VALUES(?1,'go',?2,?3,?4,?5,?6,?7)")?.execute(
+                params![snapshot.workspace_id.as_str(),snapshot.generation.get(),base_profile,domain.directory,domain.gowork_path,profile,derivation_identity()])?;
+            let selection_id: i64 = tx.prepare_cached("SELECT selection_id FROM go_context_selections WHERE workspace_id=?1 AND lang='go' AND generation=?2 AND base_profile_digest=?3 AND domain_dir=?4 AND gowork_path=?5 AND derivation_identity=?6")?.query_row(
+                params![snapshot.workspace_id.as_str(),snapshot.generation.get(),base_profile,domain.directory,domain.gowork_path,derivation_identity()],|row|row.get(0))?;
                     Ok(Some(selection_id))
                 },
                 |tx, selection_id| {
@@ -1333,7 +1364,10 @@ pub(crate) const MODULE_MANIFESTS_SQL: &str =
              AND input_kind='configuration' AND (rel_path='go.mod' OR rel_path GLOB '*/go.mod')
              AND valid_from<=?3 AND (valid_until IS NULL OR ?3<valid_until)";
 
-pub(crate) const SOURCE_INVENTORY_SQL: &str =
+// Both readers use the producer's exact projection; the point reader adds
+// only a changed-path predicate.
+macro_rules! source_inventory_rows_sql {
+    () => {
     "SELECT f.file_version_id,f.rel_path,f.blob_oid,a.package_name,b.id,m.content_package,
             manifest.publication_state,manifest.facts_version,m.is_complete,
             COALESCE(go_manifest.has_build_constraints,0),
@@ -1346,10 +1380,199 @@ pub(crate) const SOURCE_INVENTORY_SQL: &str =
      LEFT JOIN source_fact_manifests manifest ON manifest.blob_id=b.id
      LEFT JOIN source_go_manifests go_manifest ON go_manifest.blob_id=b.id
      WHERE f.workspace_id=?1 AND f.lang='go' AND f.generation=?2 AND f.input_kind='source'
-       AND f.valid_from<=?3 AND (f.valid_until IS NULL OR ?3<f.valid_until)
-     ORDER BY f.rel_path";
+       AND f.valid_from<=?3 AND (f.valid_until IS NULL OR ?3<f.valid_until)"
+    };
+}
+
+pub(crate) const SOURCE_INVENTORY_SQL: &str =
+    concat!(source_inventory_rows_sql!(), " ORDER BY f.rel_path");
+pub(crate) const SOURCE_INVENTORY_FILE_SQL: &str =
+    concat!(source_inventory_rows_sql!(), " AND f.rel_path=?4");
+
+#[derive(PartialEq, Eq)]
+enum SourceInventoryImport {
+    Known(Vec<String>),
+    Unavailable(usize),
+}
+
+// This is the inventory producer's normalized per-file input, not a second
+// interpretation of Go syntax. Coordinates and body contents are not inputs.
+#[derive(PartialEq, Eq)]
+struct SourceInventoryMembership {
+    anchor: String,
+    name: String,
+    role: &'static str,
+    constrained: bool,
+    build_selection_facts_version: i64,
+    imports: Vec<SourceInventoryImport>,
+    aliases: Vec<String>,
+}
+
+impl SourceInventoryMembership {
+    fn read(
+        conn: &Connection,
+        file: &rusqlite::Row<'_>,
+        root: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<Self>> {
+        let anchor: Option<String> = file.get(3)?;
+        let blob: Option<i64> = file.get(4)?;
+        let name: Option<String> = file.get(5)?;
+        let (Some(anchor), Some(blob), Some(name)) = (anchor, blob, name) else {
+            return Ok(None);
+        };
+        if file.get::<_, Option<String>>(6)?.as_deref() != Some("complete")
+            || file.get::<_, Option<i64>>(7)? != Some(super::source_facts::SOURCE_FACTS_VERSION)
+            || file.get::<_, Option<bool>>(8)? != Some(true)
+            || name.is_empty()
+        {
+            return Ok(None);
+        }
+        let source = crate::analyzer::ProjectFile::new(
+            root.to_path_buf(),
+            PathBuf::from(file.get::<_, String>(1)?),
+        );
+        let role = brokk_bifrost_go::packages::source_inventory_role(&source, &name);
+        let constrained =
+            brokk_bifrost_go::packages::source_file_has_build_constraints(&source, file.get(9)?);
+        let Some(imports) =
+            super::source_facts::read_source_imports(conn, blob, &|| !cancellation.is_cancelled())?
+        else {
+            return Ok(None);
+        };
+        let imports = imports
+            .into_iter()
+            .map(
+                |import| match import.path.filter(|path| !path.segments.is_empty()) {
+                    Some(path) => SourceInventoryImport::Known(path.segments),
+                    None => SourceInventoryImport::Unavailable(import.declaration.index()),
+                },
+            )
+            .collect();
+        let aliases = conn.prepare_cached("SELECT package_name FROM workspace_file_package_rows WHERE file_version_id=?1 ORDER BY package_name")?
+            .query_map([file.get::<_,i64>(0)?],|row|row.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok((!cancellation.is_cancelled()).then_some(Self {
+            anchor,
+            name,
+            role,
+            constrained,
+            build_selection_facts_version: file.get(10)?,
+            imports,
+            aliases,
+        }))
+    }
+}
+
+pub(crate) const SOURCE_INVENTORY_MEMBERSHIP_SQL: &str =
+    "SELECT count(*)>0 AND min(CASE WHEN old.membership_digest IS NOT NULL
+        AND new.membership_digest IS NOT NULL
+        AND old.membership_digest=new.membership_digest
+        AND old_meta.is_complete=1 AND new_meta.is_complete=1
+        AND old_facts.publication_state='complete' AND new_facts.publication_state='complete'
+        AND old_facts.facts_version=?6 AND new_facts.facts_version=?6
+        THEN 1 ELSE 0 END)=1,
+       count(*)>0 AND min(CASE WHEN old.membership_digest IS NOT NULL
+         AND new.membership_digest IS NOT NULL AND old_meta.is_complete=1
+         AND new_meta.is_complete=1 AND old_facts.publication_state='complete'
+         AND new_facts.publication_state='complete' AND old_facts.facts_version=?6
+         AND new_facts.facts_version=?6 THEN 1 ELSE 0 END)=1,
+       min(context.valid_from)
+     FROM go_context_publications context
+     CROSS JOIN workspace_file_versions current_file
+       ON current_file.workspace_id=context.workspace_id AND current_file.lang='go'
+       AND current_file.generation=context.generation AND current_file.input_kind='source'
+       AND current_file.rel_path=?4 AND current_file.valid_from<=?3
+       AND (current_file.valid_until IS NULL OR ?3<current_file.valid_until)
+     LEFT JOIN workspace_file_versions old_file
+       ON old_file.workspace_id=context.workspace_id AND old_file.lang='go'
+       AND old_file.generation=context.generation AND old_file.input_kind='source'
+       AND old_file.rel_path=?4 AND old_file.valid_from<=context.valid_from
+       AND (old_file.valid_until IS NULL OR context.valid_from<old_file.valid_until)
+     LEFT JOIN blobs old_blob ON old_blob.blob_oid=old_file.blob_oid
+       AND old_blob.lang='go' AND old_blob.parse_variant=x''
+       AND old_blob.generation=old_file.generation
+     LEFT JOIN source_go_manifests old ON old.blob_id=old_blob.id
+     LEFT JOIN blob_meta old_meta ON old_meta.blob_id=old_blob.id
+     LEFT JOIN source_fact_manifests old_facts ON old_facts.blob_id=old_blob.id
+     LEFT JOIN blobs current_blob ON current_blob.blob_oid=current_file.blob_oid
+       AND current_blob.lang='go' AND current_blob.parse_variant=x''
+       AND current_blob.generation=current_file.generation
+     LEFT JOIN source_go_manifests new ON new.blob_id=current_blob.id
+     LEFT JOIN blob_meta new_meta ON new_meta.blob_id=current_blob.id
+     LEFT JOIN source_fact_manifests new_facts ON new_facts.blob_id=current_blob.id
+     WHERE context.context_id=?5 AND context.workspace_id=?1 AND context.lang='go'
+       AND context.generation=?2 AND context.valid_from<=?3
+       AND (context.valid_until IS NULL OR ?3<context.valid_until)";
 
 impl AnalyzerStore {
+    /// Compare changed headers with source versions at the context's publication.
+    /// The context's immutable origin, rather than separately published summary
+    /// members, is the authority for reuse. Unknown membership requires refresh.
+    #[doc(hidden)]
+    pub fn go_source_inventory_membership_unchanged(
+        &self,
+        snapshot: &WorkspaceSnapshotId,
+        context_id: i64,
+        root: &Path,
+        paths: &[String],
+        cancellation: &CancellationToken,
+    ) -> Result<bool> {
+        let conn = self.read_conn()?;
+        let mut statement = conn.prepare_cached(SOURCE_INVENTORY_MEMBERSHIP_SQL)?;
+        let mut source = conn.prepare_cached(SOURCE_INVENTORY_FILE_SQL)?;
+        for path in paths {
+            if cancellation.is_cancelled() {
+                return Ok(false);
+            }
+            let (raw_equal, can_project, origin): (bool, bool, Option<i64>) = statement.query_row(
+                params![
+                    snapshot.workspace_id.as_str(),
+                    snapshot.generation.get(),
+                    snapshot.revision,
+                    path,
+                    context_id,
+                    super::source_facts::SOURCE_FACTS_VERSION
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            if raw_equal {
+                continue;
+            }
+            let Some(origin) = origin.filter(|_| can_project) else {
+                return Ok(false);
+            };
+            let mut memberships = Vec::with_capacity(2);
+            for revision in [origin, snapshot.revision] {
+                let mut rows = source.query(params![
+                    snapshot.workspace_id.as_str(),
+                    snapshot.generation.get(),
+                    revision,
+                    path
+                ])?;
+                let Some(file) = rows.next()? else {
+                    return Ok(false);
+                };
+                let Some(member) =
+                    SourceInventoryMembership::read(&conn, file, root, cancellation)?
+                else {
+                    return Ok(false);
+                };
+                if member
+                    .imports
+                    .iter()
+                    .any(|import| matches!(import, SourceInventoryImport::Unavailable(_)))
+                {
+                    return Ok(false);
+                }
+                memberships.push(member);
+            }
+            if memberships[0] != memberships[1] {
+                return Ok(false);
+            }
+        }
+        Ok(!cancellation.is_cancelled())
+    }
+
     /// Derive partial local evidence only from the selected immutable source
     /// publication. This service never reads live source or invokes the tool.
     #[doc(hidden)]
@@ -1427,7 +1650,6 @@ impl AnalyzerStore {
             if cancellation.is_cancelled() {
                 return Ok(None);
             }
-            let id: i64 = file.get(0)?;
             let path: String = file.get(1)?;
             if !admits(&root.join(&path)) {
                 continue;
@@ -1439,8 +1661,6 @@ impl AnalyzerStore {
             let state: Option<String> = file.get(6)?;
             let version: Option<i64> = file.get(7)?;
             let complete: Option<bool> = file.get(8)?;
-            let has_build_constraints: bool = file.get(9)?;
-            let build_selection_facts_version: i64 = file.get(10)?;
             let module_manifest = Path::new(&path)
                 .parent()
                 .expect("source file parent")
@@ -1451,7 +1671,7 @@ impl AnalyzerStore {
             let module_mode = module_manifest.is_some();
             publication.field("path", path.as_bytes());
 
-            let (Some(anchor), Some(blob), Some(name)) = (anchor, blob, name) else {
+            let (Some(_anchor), Some(_blob), Some(name)) = (anchor, blob, name) else {
                 gaps.push(json!({"code":"missing_source_package_authority","evidence":path}));
                 continue;
             };
@@ -1463,17 +1683,19 @@ impl AnalyzerStore {
                 gaps.push(json!({"code":"unavailable_source_publication","evidence":path}));
                 continue;
             }
+            let Some(SourceInventoryMembership {
+                anchor,
+                name,
+                role,
+                constrained: file_has_build_constraints,
+                build_selection_facts_version,
+                imports,
+                aliases: source_aliases,
+            }) = SourceInventoryMembership::read(&conn, file, root, cancellation)?
+            else {
+                return Ok(None);
+            };
             let directory = root.join(Path::new(&path).parent().unwrap_or(Path::new("")));
-            let source_file = crate::analyzer::ProjectFile::new(
-                root.to_path_buf(),
-                std::path::PathBuf::from(&path),
-            );
-            let role = brokk_bifrost_go::packages::source_inventory_role(&source_file, &name);
-            let file_has_build_constraints =
-                brokk_bifrost_go::packages::source_file_has_build_constraints(
-                    &source_file,
-                    has_build_constraints,
-                );
             publication.field("package", anchor.as_bytes());
             publication.field("name", name.as_bytes());
             publication.field("role", role.as_bytes());
@@ -1516,18 +1738,15 @@ impl AnalyzerStore {
                 );
             }
             package.files.push((path.clone(), role));
-            let Some(imports) = super::source_facts::read_source_imports(&conn, blob, &|| {
-                !cancellation.is_cancelled()
-            })?
-            else {
-                return Ok(None);
-            };
             for import in imports {
-                let Some(import_path) = import.path.filter(|path| !path.segments.is_empty()) else {
-                    gaps.push(json!({"code":"unavailable_source_import","evidence":{"path":path,"occurrence":import.declaration.index()}}));
-                    continue;
+                let import_path = match import {
+                    SourceInventoryImport::Known(segments) => segments,
+                    SourceInventoryImport::Unavailable(occurrence) => {
+                        gaps.push(json!({"code":"unavailable_source_import","evidence":{"path":path,"occurrence":occurrence}}));
+                        continue;
+                    }
                 };
-                let spelling = import_path.segments.join("/");
+                let spelling = import_path.join("/");
                 if spelling == "C" {
                     package.complete = false;
                     package.gaps.push(json!({
@@ -1540,10 +1759,10 @@ impl AnalyzerStore {
                 }
                 publication.field("import-role", role.as_bytes());
                 publication.field("import", spelling.as_bytes());
-                if matches!(import_path.segments[0].as_str(), "." | "..") {
+                if matches!(import_path[0].as_str(), "." | "..") {
                     let directory = crate::path_utils::normalize_relative_path_from(
                         Path::new(&path).parent().expect("source file parent"),
-                        &import_path.segments.iter().collect::<PathBuf>(),
+                        &import_path.iter().collect::<PathBuf>(),
                     );
                     publication.field("relative-import-module-mode", &[u8::from(module_mode)]);
                     if let Some(directory) = &directory {
@@ -1562,10 +1781,7 @@ impl AnalyzerStore {
                 }
                 package.imports.insert((role, spelling), None);
             }
-            let mut alias_query = conn.prepare_cached("SELECT package_name FROM workspace_file_package_rows WHERE file_version_id=?1 ORDER BY package_name")?;
-            let alias_rows = alias_query.query_map([id], |row| row.get::<_, String>(0))?;
-            for alias in alias_rows {
-                let alias = alias?;
+            for alias in source_aliases {
                 publication.field("alias", alias.as_bytes());
                 aliases.entry(alias).or_default().insert(anchor.clone());
             }
@@ -1874,46 +2090,9 @@ impl AnalyzerStore {
             [u8; 32],
         )>,
     > {
+        let rows = self.go_selected_file_rows(snapshot)?;
+        let inputs = go_configuration_inputs(&rows)?;
         let conn = self.read_conn()?;
-        let mut query = conn.prepare_cached(
-            "SELECT f.rel_path,f.blob_oid,f.input_kind,retained.source_bytes
-            FROM workspace_file_versions f LEFT JOIN workspace_input_sources retained
-              ON retained.content_oid=f.blob_oid AND f.input_kind='configuration'
-            WHERE f.workspace_id=?1 AND f.lang='go' AND f.generation=?2
-              AND f.valid_from<=?3 AND (f.valid_until IS NULL OR ?3<f.valid_until)
-            ORDER BY f.rel_path,f.input_kind",
-        )?;
-        let rows = query
-            .query_map(
-                params![
-                    snapshot.workspace_id.as_str(),
-                    snapshot.generation.get(),
-                    snapshot.revision
-                ],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, Option<Vec<u8>>>(3)?,
-                    ))
-                },
-            )?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let inputs = rows
-            .iter()
-            .filter(|(_, _, kind, _)| kind == "configuration")
-            .map(|(path, _, _, bytes)| {
-                let bytes = bytes.as_ref().ok_or_else(|| {
-                    super::StoreError::new(format!(
-                        "selected Go configuration bytes unavailable: {path}"
-                    ))
-                })?;
-                let source = String::from_utf8(bytes.clone())
-                    .map_err(|error| super::StoreError::new(error.to_string()))?;
-                Ok((PathBuf::from(path), source))
-            })
-            .collect::<Result<Vec<_>>>()?;
         let boundaries = inputs
             .iter()
             .filter(|(path, _)| path.file_name().is_some_and(|name| name == "go.mod"))
@@ -2052,7 +2231,7 @@ JOIN go_context_publications c ON c.context_id=p.context_id
 JOIN go_context_selections s ON s.selection_id=c.selection_id
 WHERE p.provider_kind='workspace' AND f.source_role<>'ignored'
   AND s.workspace_id=?1 AND s.lang='go' AND s.generation=?2
-  AND s.base_profile_digest=?4 AND s.derivation_version=?5
+  AND s.base_profile_digest=?4 AND s.derivation_identity=?5
   AND c.valid_from<=?3 AND (c.valid_until IS NULL OR ?3<c.valid_until)
 "#
     };
@@ -2082,7 +2261,7 @@ JOIN go_context_publications c ON c.context_id=p.context_id
 JOIN go_context_selections s ON s.selection_id=c.selection_id
 WHERE f.rel_path=?6 AND p.provider_kind='workspace' AND f.source_role<>'ignored'
   AND s.workspace_id=?1 AND s.lang='go' AND s.generation=?2
-  AND s.base_profile_digest=?4 AND s.derivation_version=?5
+  AND s.base_profile_digest=?4 AND s.derivation_identity=?5
   AND c.valid_from<=?3 AND (c.valid_until IS NULL OR ?3<c.valid_until)
   AND (p.provider_module_path IS NULL OR EXISTS(
     SELECT 1 FROM go_context_domain_modules m
@@ -2098,7 +2277,7 @@ JOIN go_context_publications c ON c.context_id=p.context_id
 JOIN go_context_selections s ON s.selection_id=c.selection_id
 WHERE f.rel_path=?6 AND p.provider_kind='workspace'
   AND s.workspace_id=?1 AND s.lang='go' AND s.generation=?2
-  AND s.base_profile_digest=?4 AND s.derivation_version=?5
+  AND s.base_profile_digest=?4 AND s.derivation_identity=?5
   AND c.valid_from<=?3 AND (c.valid_until IS NULL OR ?3<c.valid_until)
   AND (p.provider_module_path IS NULL OR EXISTS(
     SELECT 1 FROM go_context_domain_modules m
@@ -2153,7 +2332,7 @@ fn contexts_for_file_statement_on(
             snapshot.generation.get(),
             snapshot.revision,
             base,
-            DERIVATION_VERSION,
+            derivation_identity(),
             path
         ],
         |row| context_for_file_row(row, snapshot),
@@ -2182,7 +2361,354 @@ pub(crate) fn context_for_file_row(
     ))
 }
 
+/// The selected Go files of a snapshot: path, blob oid, input kind and, for a
+/// configuration file, its retained bytes.
+type GoSelectedFileRow = (String, String, String, Option<Vec<u8>>);
+
+/// The selected configuration files (`go.mod`, `go.work`) of those rows, with
+/// their exact bytes.
+fn go_configuration_inputs(rows: &[GoSelectedFileRow]) -> Result<Vec<(PathBuf, String)>> {
+    rows.iter()
+        .filter(|(_, _, kind, _)| kind == "configuration")
+        .map(|(path, _, _, bytes)| {
+            let bytes = bytes.as_ref().ok_or_else(|| {
+                super::StoreError::new(format!(
+                    "selected Go configuration bytes unavailable: {path}"
+                ))
+            })?;
+            let source = String::from_utf8(bytes.clone())
+                .map_err(|error| super::StoreError::new(error.to_string()))?;
+            Ok((PathBuf::from(path), source))
+        })
+        .collect()
+}
+
 impl AnalyzerStore {
+    fn go_selected_file_rows(
+        &self,
+        snapshot: &WorkspaceSnapshotId,
+    ) -> Result<Vec<GoSelectedFileRow>> {
+        let conn = self.read_conn()?;
+        let mut query = conn.prepare_cached(
+            "SELECT f.rel_path,f.blob_oid,f.input_kind,retained.source_bytes
+            FROM workspace_file_versions f LEFT JOIN workspace_input_sources retained
+              ON retained.content_oid=f.blob_oid AND f.input_kind='configuration'
+            WHERE f.workspace_id=?1 AND f.lang='go' AND f.generation=?2
+              AND f.valid_from<=?3 AND (f.valid_until IS NULL OR ?3<f.valid_until)
+            ORDER BY f.rel_path,f.input_kind",
+        )?;
+        Ok(query
+            .query_map(
+                params![
+                    snapshot.workspace_id.as_str(),
+                    snapshot.generation.get(),
+                    snapshot.revision
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<Vec<u8>>>(3)?,
+                    ))
+                },
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// The directories a go.work-free domain's module graph reads module
+    /// metadata from that the tree does not pin, because they lie outside the
+    /// checkout: the targets of the local `replace` directives of its `go.mod`,
+    /// whether or not any package was selected from them (#11607). See
+    /// [`brokk_bifrost_go::package_discovery::go_module_local_replacement_directories`].
+    /// A target inside the checkout is in the tree, so it needs no read. The
+    /// inner `Err` says why the domain's `go.mod` cannot be read or parsed.
+    #[doc(hidden)]
+    pub fn go_module_outside_replacement_directories(
+        &self,
+        snapshot: &WorkspaceSnapshotId,
+        root: &Path,
+        directory: &str,
+    ) -> Result<std::result::Result<Vec<Box<str>>, String>> {
+        let rows = self.go_selected_file_rows(snapshot)?;
+        let inputs = go_configuration_inputs(&rows)?;
+        let targets =
+            match brokk_bifrost_go::package_discovery::go_module_local_replacement_directories(
+                root, directory, &inputs,
+            ) {
+                Ok(targets) => targets,
+                Err(reason) => return Ok(Err(reason)),
+            };
+        // The checkout is the canonical root: a symlink inside it that leads out
+        // is outside. A target that does not exist cannot be located, so it is
+        // kept and the read of it fails.
+        let checkout = root.canonicalize().map_err(|error| {
+            super::StoreError::new(format!(
+                "workspace root {root:?} cannot be resolved: {error}"
+            ))
+        })?;
+        let mut outside = targets
+            .into_iter()
+            .filter(|target| {
+                target
+                    .canonicalize()
+                    .map_or(true, |target| !target.starts_with(&checkout))
+            })
+            .map(|target| {
+                target.to_str().map(Box::<str>::from).ok_or_else(|| {
+                    super::StoreError::new(format!("non-UTF-8 module directory {target:?}"))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        outside.sort();
+        outside.dedup();
+        Ok(Ok(outside))
+    }
+}
+
+/// Canonical text rows of one Go domain's discovery membership, one section per table.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GoDomainMembershipRows {
+    pub publications: Vec<Vec<Option<String>>>,
+    pub modules: Vec<Vec<Option<String>>>,
+    pub packages: Vec<Vec<Option<String>>>,
+    pub files: Vec<Vec<Option<String>>>,
+    pub imports: Vec<Vec<Option<String>>>,
+}
+
+/// The gap codes a publication, package or import row can carry that the
+/// selected tree, the build profile and the code decide. Any other code (the
+/// `tool_*` ones, `domain_discovery_failed`, import-provider gaps) reports what
+/// the Go command found in the environment, so a row carrying one cannot be
+/// replayed as a function of the tree (#11607). A new gap code is therefore
+/// environment-dependent until it is listed here.
+///
+/// - `cgo_build_selection_unavailable`: the package has cgo files in the
+///   tool's listing under the pinned CGO_ENABLED.
+/// - `source_admission_refused`, `unselected_source_input`,
+///   `package_source_identity_mismatch`, `test_variant_unselected`,
+///   `missing_selected_package_source`: the snapshot's source admission of the
+///   files the tool named.
+const TREE_DETERMINED_GAP_CODES: &[&str] = &[
+    "cgo_build_selection_unavailable",
+    "source_admission_refused",
+    "unselected_source_input",
+    "package_source_identity_mismatch",
+    "test_variant_unselected",
+    "missing_selected_package_source",
+];
+
+impl GoDomainMembershipRows {
+    // Column positions of the queries in `go_domain_membership_rows`.
+    const PACKAGE_IMPORT_PATH: usize = 0;
+    const PACKAGE_PROVIDER_KIND: usize = 3;
+    const PACKAGE_PROVIDER_DIRECTORY: usize = 4;
+    const PACKAGE_MODULE_PATH: usize = 6;
+    const PACKAGE_GAPS: usize = 10;
+    const IMPORT_GAPS: usize = 7;
+    const PUBLICATION_GAPS: usize = 1;
+
+    /// The directories of the module packages `go list` reported (external
+    /// modules and local replacements), sorted and deduplicated. They are outside
+    /// the checkout, so they are part of the environment of the membership.
+    #[doc(hidden)]
+    pub fn module_provider_directories(&self) -> Vec<Box<str>> {
+        self.provider_directories_of(|kind| kind == "module")
+    }
+
+    /// The directories of the standard-library packages `go list` reported,
+    /// sorted and deduplicated.
+    #[doc(hidden)]
+    pub fn standard_provider_directories(&self) -> Vec<Box<str>> {
+        self.provider_directories_of(|kind| kind == "standard")
+    }
+
+    fn provider_directories_of(&self, keep: impl Fn(&str) -> bool) -> Vec<Box<str>> {
+        let mut directories = self
+            .packages
+            .iter()
+            .filter(|row| {
+                keep(
+                    row[Self::PACKAGE_PROVIDER_KIND]
+                        .as_deref()
+                        .expect("a package row records its provider kind"),
+                )
+            })
+            .map(|row| {
+                row[Self::PACKAGE_PROVIDER_DIRECTORY]
+                    .as_deref()
+                    .expect("a module or standard provider row records its directory")
+                    .into()
+            })
+            .collect::<Vec<Box<str>>>();
+        directories.sort();
+        directories.dedup();
+        directories
+    }
+
+    /// The root directory of the module (or, for a standard-library package, of
+    /// `GOROOT/src`) of each module and standard-library package `go list`
+    /// reported, sorted and deduplicated. A root holds the `go.mod` and `go.sum`
+    /// the tool read for the provider, which can lie outside every package
+    /// directory. The root is the recorded package directory with the package's
+    /// import path below the module path removed, both recorded by discovery.
+    /// A replacement module's packages keep the original module path in their
+    /// import paths and live in the replacement directory, so this holds for
+    /// them as well. `None` when a directory does not end in its package's path
+    /// below the module, which discovery never records for a provider it read.
+    #[doc(hidden)]
+    pub fn provider_roots(&self) -> Option<Vec<Box<str>>> {
+        let mut roots = Vec::new();
+        for row in self
+            .packages
+            .iter()
+            .filter(|row| row[Self::PACKAGE_PROVIDER_KIND].as_deref() != Some("workspace"))
+        {
+            // A package recompiled for a test is named `path [owner.test]`.
+            let import_path = row[Self::PACKAGE_IMPORT_PATH].as_deref()?;
+            let import_path = import_path
+                .split_once(" [")
+                .map_or(import_path, |(path, _)| path);
+            let below_module = match row[Self::PACKAGE_MODULE_PATH].as_deref() {
+                Some(module) => import_path.strip_prefix(module)?,
+                None => import_path,
+            };
+            let mut root = std::path::Path::new(row[Self::PACKAGE_PROVIDER_DIRECTORY].as_deref()?);
+            for component in below_module.rsplit('/').filter(|part| !part.is_empty()) {
+                if root.file_name()? != component {
+                    return None;
+                }
+                root = root.parent()?;
+            }
+            roots.push(Box::<str>::from(root.to_str()?));
+        }
+        roots.sort();
+        roots.dedup();
+        Some(roots)
+    }
+
+    /// Whether every gap on every row is one the tree and the profile decide.
+    /// A row with a gap the environment can cause (a module missing from the
+    /// module cache, a failed `go list`) answers differently once the
+    /// environment changes, and the provider directories cannot show that.
+    #[doc(hidden)]
+    pub fn gaps_are_tree_determined(&self) -> bool {
+        #[derive(serde::Deserialize)]
+        struct Gap {
+            code: String,
+        }
+        [
+            (&self.publications, Self::PUBLICATION_GAPS),
+            (&self.packages, Self::PACKAGE_GAPS),
+            (&self.imports, Self::IMPORT_GAPS),
+        ]
+        .into_iter()
+        .flat_map(|(rows, column)| rows.iter().map(move |row| row[column].as_deref()))
+        .all(|gaps| {
+            let gaps = gaps.expect("the schema stores gaps as a JSON array");
+            serde_json::from_str::<Vec<Gap>>(gaps)
+                .expect("the schema checks gaps are JSON")
+                .iter()
+                .all(|gap| TREE_DETERMINED_GAP_CODES.contains(&gap.code.as_str()))
+        })
+    }
+}
+
+impl AnalyzerStore {
+    /// Keys of revision-selected domains. This includes domains with no packages.
+    #[doc(hidden)]
+    pub fn go_selected_domain_keys(
+        &self,
+        snapshot: &WorkspaceSnapshotId,
+        base: &[u8; 32],
+    ) -> Result<Vec<(String, String)>> {
+        let conn = self.read_conn()?;
+        let mut stmt = conn.prepare_cached("SELECT s.domain_dir,s.gowork_path FROM go_context_selections s JOIN go_context_publications c ON c.selection_id=s.selection_id WHERE s.workspace_id=?1 AND s.lang='go' AND s.generation=?2 AND s.base_profile_digest=?4 AND s.derivation_identity=?5 AND c.valid_from<=?3 AND (c.valid_until IS NULL OR ?3<c.valid_until) ORDER BY 1,2")?;
+        Ok(stmt
+            .query_map(
+                params![
+                    snapshot.workspace_id.as_str(),
+                    snapshot.generation.get(),
+                    snapshot.revision,
+                    base,
+                    derivation_identity()
+                ],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Every discovery output of one domain's selected publications that analysis
+    /// reads, as canonical text rows in a fixed order. Surrogate ids, unit keys,
+    /// publication and input digests and validity bounds are excluded: they are
+    /// derived or reconciliation-only. Gaps are read as json() so the stored JSONB
+    /// becomes canonical text. A package is named inside a publication by
+    /// (tool_import_path, for_test). A workspace provider's directory and digest
+    /// are excluded: they name the checkout, so the same tree materialized for a
+    /// diff base or a head would never agree. Module and standard providers live
+    /// outside the checkout, so their directory and digest are evidence.
+    /// Hashing belongs to Go's authority owner.
+    #[doc(hidden)]
+    pub fn go_domain_membership_rows(
+        &self,
+        snapshot: &WorkspaceSnapshotId,
+        base: &[u8; 32],
+        directory: &str,
+        work: &str,
+    ) -> Result<GoDomainMembershipRows> {
+        const SELECTED: &str = "FROM go_context_selections s JOIN go_context_publications c ON c.selection_id=s.selection_id";
+        const IN_DOMAIN: &str = "WHERE s.workspace_id=?1 AND s.lang='go' AND s.generation=?2 AND s.base_profile_digest=?4 AND s.derivation_identity=?5 AND c.valid_from<=?3 AND (c.valid_until IS NULL OR ?3<c.valid_until) AND s.domain_dir=?6 AND s.gowork_path=?7";
+        let conn = self.read_conn()?;
+        let params = params![
+            snapshot.workspace_id.as_str(),
+            snapshot.generation.get(),
+            snapshot.revision,
+            base,
+            derivation_identity(),
+            directory,
+            work
+        ];
+        let rows = |columns: &str, joins: &str, order: &str| -> Result<Vec<Vec<Option<String>>>> {
+            let mut stmt = conn.prepare_cached(&format!(
+                "SELECT {columns} {SELECTED} {joins} {IN_DOMAIN} ORDER BY {order}"
+            ))?;
+            let width = stmt.column_count();
+            Ok(stmt
+                .query_map(params, |row| {
+                    (0..width).map(|column| row.get(column)).collect()
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?)
+        };
+        Ok(GoDomainMembershipRows {
+            publications: rows(
+                "CAST(c.complete AS TEXT),CAST(json(c.gaps) AS TEXT)",
+                "",
+                "1,2",
+            )?,
+            modules: rows(
+                "m.module_dir,m.module_path",
+                "JOIN go_context_domain_modules m ON m.context_id=c.context_id",
+                "1,2",
+            )?,
+            packages: rows(
+                "p.tool_import_path,p.for_test,p.package_name,p.provider_kind,CASE WHEN p.provider_kind='workspace' THEN NULL ELSE p.provider_directory END,CASE WHEN p.provider_kind='workspace' THEN NULL ELSE hex(p.provider_digest) END,p.provider_module_path,p.provider_module_version,p.provider_provenance,CAST(p.complete AS TEXT),CAST(json(p.gaps) AS TEXT)",
+                "JOIN go_package_instances p ON p.context_id=c.context_id",
+                "1,2,3,4,5,6,7,8,9,10,11",
+            )?,
+            files: rows(
+                "p.tool_import_path,p.for_test,f.source_role,f.rel_path",
+                "JOIN go_package_instances p ON p.context_id=c.context_id JOIN go_package_files f ON f.package_id=p.package_id AND f.source_role<>'ignored'",
+                "1,2,3,4",
+            )?,
+            imports: rows(
+                "ip.tool_import_path,ip.for_test,i.import_role,i.source_spelling,tp.tool_import_path,tp.for_test,CAST(i.complete AS TEXT),CAST(json(i.gaps) AS TEXT)",
+                "JOIN go_package_imports i ON i.context_id=c.context_id JOIN go_package_instances ip ON ip.package_id=i.importer_package_id LEFT JOIN go_package_instances tp ON tp.package_id=i.target_package_id",
+                "1,2,3,4,5,6,7,8",
+            )?,
+        })
+    }
+
     /// All source files with no non-ignored membership in any selected context.
     #[doc(hidden)]
     pub fn go_files_outside_selected_build(
@@ -2198,7 +2724,7 @@ impl AnalyzerStore {
                 snapshot.generation.get(),
                 snapshot.revision,
                 base,
-                DERIVATION_VERSION
+                derivation_identity()
             ],
             |row| row.get(0),
         )?;
@@ -2243,6 +2769,109 @@ impl AnalyzerStore {
 mod tests {
 
     use super::*;
+
+    fn discovery_with(environment: serde_json::Value) -> GoPackageDiscovery {
+        GoPackageDiscovery {
+            domain: Default::default(),
+            input_digest: None,
+            failure: None,
+            packages: Vec::new(),
+            environment: serde_json::from_value(environment).unwrap(),
+            build_configuration: brokk_bifrost_go::package_discovery::GoBuildConfiguration {
+                goos: "linux".into(),
+                goarch: "amd64".into(),
+                cgo_enabled: false,
+                tags: Vec::new(),
+            },
+            workspace_patterns: vec!["./...".into()],
+            vendor: false,
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11607: base_profile_digest pinned only GOTOOLCHAIN, so a go env value outside its short list did not change the profile"
+    )]
+    fn the_base_profile_folds_every_go_env_key_but_the_per_invocation_ones() {
+        let capture = |extra: serde_json::Value| {
+            let mut environment = serde_json::json!({
+                "GOROOT": "/sdk", "GOPATH": "/gopath", "GOMODCACHE": "/gopath/pkg/mod",
+                "GOVERSION": "go1.24.0", "GOWORK": "off", "GOOS": "linux", "GOARCH": "amd64",
+                "GOFLAGS": "-buildvcs=false", "GOEXPERIMENT": "", "GOAMD64": "v1",
+                "GOMOD": "/checkout-a/go.mod", "GOGCCFLAGS": "-ffile-prefix-map=/tmp/go-build1",
+            });
+            environment
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            base_profile_digest(&discovery_with(environment))
+        };
+        let base = capture(serde_json::json!({}));
+        // A key that was not in the digest before, and one a newer Go adds.
+        for changed in [
+            // The toolchain and locations a PATH or HOME change reaches.
+            serde_json::json!({"GOVERSION": "go1.25.0"}),
+            serde_json::json!({"GOROOT": "/other-sdk"}),
+            serde_json::json!({"GOPATH": "/other-gopath"}),
+            serde_json::json!({"GOMODCACHE": "/other-modcache"}),
+            serde_json::json!({"GOEXPERIMENT": "aliastypeparams"}),
+            serde_json::json!({"GOAMD64": "v3"}),
+            serde_json::json!({"GOFLAGS": "-mod=mod"}),
+            serde_json::json!({"GONEWKEY": "1"}),
+        ] {
+            assert_ne!(base, capture(changed.clone()), "{changed}");
+        }
+        // The two keys that name a temporary directory or the checkout.
+        assert_eq!(
+            base,
+            capture(serde_json::json!({
+                "GOMOD": "/checkout-b/go.mod",
+                "GOGCCFLAGS": "-ffile-prefix-map=/tmp/go-build2",
+                "GOWORK": "/checkout-b/go.work",
+            }))
+        );
+    }
+
+    #[test]
+    fn membership_rows_split_the_environment_part_from_the_tree_part() {
+        let package = |kind: &str, directory: Option<&str>, gaps: &str| {
+            let mut row = vec![None; 11];
+            row[GoDomainMembershipRows::PACKAGE_PROVIDER_KIND] = Some(kind.into());
+            row[GoDomainMembershipRows::PACKAGE_PROVIDER_DIRECTORY] = directory.map(Into::into);
+            row[GoDomainMembershipRows::PACKAGE_GAPS] = Some(gaps.into());
+            row
+        };
+        let mut rows = GoDomainMembershipRows {
+            publications: vec![vec![Some("1".into()), Some("[]".into())]],
+            packages: vec![
+                package(
+                    "workspace",
+                    None,
+                    r#"[{"code":"cgo_build_selection_unavailable"}]"#,
+                ),
+                package("standard", Some("/sdk/src/fmt"), "[]"),
+                package("module", Some("/mod/dep@v1.0.0"), "[]"),
+                package("standard", Some("/sdk/src/fmt"), "[]"),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            rows.module_provider_directories(),
+            vec![Box::<str>::from("/mod/dep@v1.0.0")]
+        );
+        assert_eq!(
+            rows.standard_provider_directories(),
+            vec![Box::<str>::from("/sdk/src/fmt")]
+        );
+        assert!(rows.gaps_are_tree_determined());
+        // A module missing from the module cache is something the environment decided.
+        rows.packages.push(package(
+            "workspace",
+            None,
+            r#"[{"code":"tool_package_error","evidence":{}}]"#,
+        ));
+        assert!(!rows.gaps_are_tree_determined());
+    }
 
     #[test]
     fn go_domain_intervals_cut_off_and_revalidate_superseded_or_missing_paths() {
@@ -2310,6 +2939,122 @@ mod tests {
                 identity
             };
         let first = publish(snapshot.clone(), None, [3; 32], [4; 32]);
+        let membership = store
+            .go_domain_membership_rows(&snapshot, &[2; 32], "", "")
+            .unwrap();
+        // Same profile and selected publication, different discovery membership.
+        store.conn.execute(|conn| {
+            conn.execute("INSERT INTO go_package_files(package_id,rel_path,source_role) SELECT package_id,'added.go','go' FROM go_package_instances", []).unwrap();
+        });
+        assert_ne!(
+            membership,
+            store
+                .go_domain_membership_rows(&snapshot, &[2; 32], "", "")
+                .unwrap()
+        );
+        store.conn.execute(|conn| {
+            conn.execute("DELETE FROM go_package_files WHERE rel_path='added.go'", [])
+                .unwrap();
+        });
+        assert_eq!(
+            membership,
+            store
+                .go_domain_membership_rows(&snapshot, &[2; 32], "", "")
+                .unwrap()
+        );
+        // Same package and file names, different discovery state: every column
+        // analysis reads must move the membership rows (#11482).
+        store.conn.execute(|conn| {
+            conn.execute("INSERT INTO go_package_instances(context_id,tool_import_path,package_name,for_test,provider_directory,provider_digest,complete,gaps,provider_kind,unit_key) SELECT context_id,'example.test/other','other','','.',zeroblob(32),1,jsonb('[]'),'module',X'0100000000000000000000000000000000000000000000000000000000000000' FROM go_package_instances", []).unwrap();
+            conn.execute("INSERT INTO go_package_imports(context_id,importer_package_id,source_spelling,import_role,target_package_id,complete,gaps) SELECT context_id,min(package_id),'example.test/other','go',max(package_id),1,jsonb('[]') FROM go_package_instances GROUP BY context_id", []).unwrap();
+        });
+        let with_import = store
+            .go_domain_membership_rows(&snapshot, &[2; 32], "", "")
+            .unwrap();
+        assert_ne!(membership, with_import);
+        for (change, undo) in [
+            (
+                "UPDATE go_context_publications SET complete=0",
+                "UPDATE go_context_publications SET complete=1",
+            ),
+            (
+                "UPDATE go_context_publications SET gaps=jsonb('[{\"code\":\"g\"}]')",
+                "UPDATE go_context_publications SET gaps=jsonb('[]')",
+            ),
+            (
+                "UPDATE go_context_domain_modules SET module_path='example.test/moved'",
+                "UPDATE go_context_domain_modules SET module_path='example.test/root'",
+            ),
+            (
+                "UPDATE go_package_instances SET complete=0 WHERE tool_import_path='example.test/root'",
+                "UPDATE go_package_instances SET complete=1 WHERE tool_import_path='example.test/root'",
+            ),
+            (
+                "UPDATE go_package_instances SET gaps=jsonb('[{\"code\":\"g\"}]') WHERE tool_import_path='example.test/root'",
+                "UPDATE go_package_instances SET gaps=jsonb('[]') WHERE tool_import_path='example.test/root'",
+            ),
+            (
+                "UPDATE go_package_instances SET provider_module_version='v1.2.3' WHERE tool_import_path='example.test/root'",
+                "UPDATE go_package_instances SET provider_module_version=NULL WHERE tool_import_path='example.test/root'",
+            ),
+            (
+                "UPDATE go_package_instances SET provider_digest=X'0100000000000000000000000000000000000000000000000000000000000000' WHERE tool_import_path='example.test/other'",
+                "UPDATE go_package_instances SET provider_digest=zeroblob(32) WHERE tool_import_path='example.test/other'",
+            ),
+            (
+                "UPDATE go_package_imports SET target_package_id=importer_package_id",
+                "UPDATE go_package_imports SET target_package_id=(SELECT max(package_id) FROM go_package_instances)",
+            ),
+            (
+                "UPDATE go_package_imports SET complete=0",
+                "UPDATE go_package_imports SET complete=1",
+            ),
+        ] {
+            store.conn.execute(move |conn| {
+                conn.execute(change, []).unwrap();
+            });
+            assert_ne!(
+                with_import,
+                store
+                    .go_domain_membership_rows(&snapshot, &[2; 32], "", "")
+                    .unwrap(),
+                "{change}"
+            );
+            store.conn.execute(move |conn| {
+                conn.execute(undo, []).unwrap();
+            });
+            assert_eq!(
+                with_import,
+                store
+                    .go_domain_membership_rows(&snapshot, &[2; 32], "", "")
+                    .unwrap(),
+                "{undo}"
+            );
+        }
+        // A workspace provider's location is the checkout, not discovery state.
+        store.conn.execute(|conn| {
+            conn.execute("UPDATE go_package_instances SET provider_directory='/elsewhere',provider_digest=X'0200000000000000000000000000000000000000000000000000000000000000' WHERE tool_import_path='example.test/root'", []).unwrap();
+        });
+        assert_eq!(
+            with_import,
+            store
+                .go_domain_membership_rows(&snapshot, &[2; 32], "", "")
+                .unwrap()
+        );
+        store.conn.execute(|conn| {
+            conn.execute("DELETE FROM go_package_imports", []).unwrap();
+            conn.execute(
+                "DELETE FROM go_package_instances WHERE tool_import_path='example.test/other'",
+                [],
+            )
+            .unwrap();
+        });
+        assert_eq!(
+            membership,
+            store
+                .go_domain_membership_rows(&snapshot, &[2; 32], "", "")
+                .unwrap()
+        );
         let writes = store.conn.execute(|conn| conn.total_changes());
         assert_eq!(
             publish(snapshot.clone(), Some(first.clone()), [3; 32], [4; 32]),

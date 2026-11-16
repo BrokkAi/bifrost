@@ -5,7 +5,7 @@ pub mod read_frame;
 mod unit_kinds;
 pub use base_inputs::VerifyHeadIdentityBaseInputs;
 pub use capture::AnalyzerCapture;
-pub use unit_kinds::{RustUnitSetKind, UnitSummaryKind};
+pub use unit_kinds::UnitSummaryKind;
 
 use brokk_bifrost_core::retention_budget::RetentionBudget;
 use brokk_bifrost_semantic::analyzer::semantic::derivation::{
@@ -21,17 +21,15 @@ use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
 
 use crate::analyzer::IAnalyzer;
-use crate::analyzer::i_analyzer::{
-    AnalyzerQueryScope, QueryReadIncomplete, capture_query_reads_deferred,
-};
+use crate::analyzer::i_analyzer::{AnalyzerQueryScope, capture_query_reads_deferred};
 use authority::AnalyzerAuthority;
 use brokk_bifrost_core::analyzer::model::Language;
 use brokk_bifrost_core::attribution::{self, CoverageClass};
 use brokk_bifrost_store::analyzer::store::WorkspaceSnapshotId;
 use brokk_bifrost_store::analyzer::store::resolution::resolution_bundle_epoch;
-use brokk_bifrost_store::analyzer::store::rust_unit_summaries::RUST_UNIT_SUMMARY_DERIVATION_VERSION;
+use brokk_bifrost_store::analyzer::store::rust_unit_summaries::rust_unit_summary_derivation_identity;
 use brokk_bifrost_store::analyzer::store::unit_summaries::{
-    UnitLive, UnitSummaryReconciliation, live_rust_unit_set, live_unit_summary,
+    UnitLive, UnitSummaryReconciliation, live_unit_summary,
 };
 
 #[derive(Clone, Copy)]
@@ -253,9 +251,6 @@ impl AnalyzerDerivations {
             UnitSummaryKind {
                 read: Arc::new(read_unit_summary),
             },
-            RustUnitSetKind {
-                read: Arc::new(read_rust_unit_set),
-            },
         );
         let derivations = Self {
             engine,
@@ -364,28 +359,28 @@ impl AnalyzerDerivations {
             let Ok(binding) = inventory.derivation_reader_binding() else {
                 return;
             };
-            if !matches!(
-                AnalyzerAuthority::for_binding(&binding),
-                AnalyzerAuthority::Main
-            ) || !inventory.proves_declared_rust_route_recipe(&binding)
-            {
+            let authority = AnalyzerAuthority::for_kind(&binding, kind);
+            let proved = match authority {
+                AnalyzerAuthority::ConfigurationOnly => {
+                    inventory.proves_configuration_route_recipe(&binding)
+                }
+                AnalyzerAuthority::Main => inventory.proves_declared_rust_route_recipe(&binding),
+                _ => false,
+            };
+            if !proved {
                 return;
             }
             let _host = HostGuard::enter(analyzer, inventory, &binding);
             let ((answer, reasons), receipt) = capture_query_reads_deferred(analyzer, || {
                 let scope = AnalyzerQueryScope::capturing_read_incompleteness(analyzer);
-                let answer =
-                    self.engine
-                        .replay(kind, question, binding.clone(), AnalyzerAuthority::Main);
+                let answer = self
+                    .engine
+                    .replay(kind, question, binding.clone(), authority);
                 (answer, scope.captured_read_incompleteness())
             });
-            let unstable_reason = reasons.iter().any(|reason| {
-                !matches!(
-                    reason,
-                    QueryReadIncomplete::ArtifactUnavailable(_)
-                        | QueryReadIncomplete::SemanticEvidenceGap(_)
-                )
-            });
+            let unstable_reason = reasons
+                .iter()
+                .any(|reason| capture::stable_reason(reason).is_none());
             if receipt.reuse_refused()
                 || receipt.persistence_refusals() != 0
                 || receipt.unattributed_reads() != 0
@@ -423,6 +418,9 @@ impl AnalyzerDerivations {
         inventory: &SelectedResolutionMountInventory<'_>,
         key: &D::Key,
     ) -> Demanded<D::Output> {
+        if !read_frame::named_main_bridge_allows(D::ID) {
+            return Demanded::Unavailable(UnavailableCause::ValidationFailed);
+        }
         // The lease holds this demand's read snapshot; a store error opening
         // it, or reading the binding, makes the demand unavailable.
         let _lease = match inventory.derivation_read() {
@@ -437,23 +435,69 @@ impl AnalyzerDerivations {
                 return Demanded::Unavailable(UnavailableCause::Failed(error.to_string().into()));
             }
         };
-        let authority = AnalyzerAuthority::for_binding(&binding);
+        let authority = AnalyzerAuthority::for_kind(&binding, D::ID);
         let _host = HostGuard::enter(analyzer, inventory, &binding);
-        let admitted = matches!(authority, AnalyzerAuthority::Main)
-            && D::question(key).language.as_ref().is_some_and(|language| {
-                self.declared_route_recipes
-                    .lock()
-                    .expect("recipe registry poisoned")
-                    .iter()
-                    .any(|(registered, _)| registered == language)
-            })
-            && inventory.proves_declared_rust_route_recipe(&binding);
+        let admitted = matches!(
+            authority,
+            AnalyzerAuthority::Main | AnalyzerAuthority::ConfigurationOnly
+        ) && D::question(key).language.as_ref().is_some_and(|language| {
+            self.declared_route_recipes
+                .lock()
+                .expect("recipe registry poisoned")
+                .iter()
+                .any(|(registered, _)| registered == language)
+        }) && match authority {
+            AnalyzerAuthority::ConfigurationOnly => {
+                inventory.proves_configuration_route_recipe(&binding)
+            }
+            _ => inventory.proves_declared_rust_route_recipe(&binding),
+        };
         let answer = self.engine.demand::<D>(key, binding, authority);
         if matches!(&answer, Demanded::Available { value, .. } if !admitted || !matches!(value, Handle::Retained(_)))
         {
             crate::analyzer::i_analyzer::record_persistence_refusals(analyzer, 1);
         }
         answer
+    }
+
+    /// Demand a registered question against the caller's bound selection and
+    /// record its canonical identity in the current capture. Selected typed
+    /// sources use this route through SelectedAnalyzerServices; standalone
+    /// replay opens a different selection and cannot certify their SQL reads.
+    /// Kinds requiring the full operation cannot run on this inventory bridge.
+    pub fn demand_selected_question(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        inventory: &SelectedResolutionMountInventory<'_>,
+        kind: DerivationKindId,
+        question: &DerivationQuestion,
+    ) -> ReplayedDemand {
+        if brokk_bifrost_semantic::analyzer::semantic::read_ledger::PersistedDerivationFamily::of(
+            kind.0,
+        )
+        .is_some_and(|family| family.memory_only)
+        {
+            return ReplayedDemand::Unavailable(UnavailableCause::ValidationFailed);
+        }
+        let _lease = match inventory.derivation_read() {
+            Ok(lease) => lease,
+            Err(error) => {
+                return ReplayedDemand::Unavailable(UnavailableCause::Failed(
+                    error.to_string().into(),
+                ));
+            }
+        };
+        let binding = match inventory.derivation_reader_binding() {
+            Ok(binding) => binding,
+            Err(error) => {
+                return ReplayedDemand::Unavailable(UnavailableCause::Failed(
+                    error.to_string().into(),
+                ));
+            }
+        };
+        let authority = AnalyzerAuthority::for_kind(&binding, kind);
+        let _host = HostGuard::enter(analyzer, inventory, &binding);
+        self.engine.replay(kind, question, binding, authority)
     }
 
     pub fn demand_in_operation<D: DerivationKind>(
@@ -475,7 +519,7 @@ impl AnalyzerDerivations {
                 return Demanded::Unavailable(UnavailableCause::Failed(error.to_string().into()));
             }
         };
-        let authority = AnalyzerAuthority::for_binding(&binding);
+        let authority = AnalyzerAuthority::for_kind(&binding, D::ID);
         let _host = HostGuard::enter_operation(analyzer, operation, &binding);
         self.engine.demand::<D>(key, binding, authority)
     }
@@ -494,10 +538,77 @@ impl AnalyzerDerivations {
         self.engine.try_reuse::<D>(key, binding, authority)
     }
 
-    /// Forget the unit derivations a reconcile pass changed: every Rust unit
-    /// whose live output changed, appeared or closed, and the unit set when
-    /// membership changed. Correctness does not depend on it (the unit kinds
-    /// recompute on every new binding); it frees their entries early.
+    /// Check consumed inputs against the acquiring operation, without computing
+    /// a missing derivation or publishing the probe's reads and completion.
+    /// Success grants input currentness only; the consumer still owns receipt
+    /// replay and admission of its cached result.
+    pub fn verify_receipt_in_operation(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        operation: &SelectedResolutionOperation<'_, '_>,
+        receipt: &crate::analyzer::i_analyzer::QueryReadReceipt,
+    ) -> bool {
+        use crate::analyzer::i_analyzer::{QueryReadReceipt, ReadAttribution};
+        use brokk_bifrost_core::analyzer::carried_context::EvaluationExecution;
+        use brokk_bifrost_semantic::analyzer::semantic::derivation::{
+            BaseInputs, RecordedReadError, verify_recorded_read,
+        };
+
+        // Read attribution, completion and evaluation evidence have separate
+        // owners. Isolate all three, including acquisition of the read lease.
+        let _attribution = ReadAttribution::for_receipt_verification().install();
+        let evaluation = Arc::new(EvaluationExecution::default());
+        let _evaluation = evaluation.install();
+        let (current, probe) = QueryReadReceipt::capture_deferred(analyzer, || {
+            let inventory = &operation.ready.inventory;
+            let Some(_lease) = inventory.derivation_read().ok() else {
+                return false;
+            };
+            let Ok(binding) = inventory.derivation_reader_binding() else {
+                return false;
+            };
+            let _host = HostGuard::enter_operation(analyzer, operation, &binding);
+            let cancelled = || {
+                analyzer
+                    .active_query_cancellation()
+                    .is_some_and(|token| token.is_cancelled())
+            };
+            if cancelled() {
+                return false;
+            }
+            let authority = AnalyzerAuthority::for_binding(&binding);
+            let current = receipt.keys_satisfy(|read| {
+                !cancelled()
+                    && verify_recorded_read(
+                        read,
+                        |kind, question| {
+                            self.engine
+                                .verify_erased(
+                                    kind,
+                                    question,
+                                    binding.clone(),
+                                    AnalyzerAuthority::for_kind(&binding, kind),
+                                )
+                                // A receipt needs only the verified output identity;
+                                // it does not retain a revision-closure stamp.
+                                .map(|identity| (identity, false))
+                                .ok_or(RecordedReadError::Changed)
+                        },
+                        |read| {
+                            VerifyHeadIdentityBaseInputs
+                                .unchanged(read, &binding, &binding, &authority)
+                        },
+                    )
+                    .is_ok()
+            });
+            current && binding_remains_current() && !cancelled()
+        });
+        current && probe.reusable() && evaluation.verdict().is_content()
+    }
+
+    /// Forget Rust unit summaries a reconcile pass changed or closed.
+    /// Correctness does not depend on it (summaries recompute on every new
+    /// binding); it frees their entries early.
     pub fn forget_rust_units(&self, report: &UnitSummaryReconciliation) {
         let rust = |keys: &[(String, [u8; 32])]| {
             keys.iter()
@@ -513,9 +624,6 @@ impl AnalyzerDerivations {
             .chain(&closed)
         {
             self.engine.forget::<UnitSummaryKind>(key);
-        }
-        if !added.is_empty() || !closed.is_empty() {
-            self.engine.forget::<RustUnitSetKind>(&0);
         }
     }
 
@@ -562,38 +670,41 @@ fn read_unit_summary(key: &[u8; 32]) -> Result<UnitLive, String> {
             &selected_rust_snapshot(inventory)?,
             key,
             resolution_bundle_epoch(Language::Rust),
-            RUST_UNIT_SUMMARY_DERIVATION_VERSION,
+            rust_unit_summary_derivation_identity(),
         )
         .map_err(|error| error.to_string())
     })
 }
 
-fn read_rust_unit_set() -> Result<Vec<(String, [u8; 32])>, String> {
-    let _scope = attribution::enter_scope("rust_unit_set", CoverageClass::RecomputeOnCurrency);
-    with_bound_inventory(|inventory| {
-        live_rust_unit_set(
-            inventory.connection(),
-            &selected_rust_snapshot(inventory)?,
-            resolution_bundle_epoch(Language::Rust),
-        )
-        .map_err(|error| error.to_string())
-    })
-}
-
-/// Register the two Rust predicates in dependency order. Other languages wait
-/// until their question fields determine the exact live-summary predicate.
+/// Register Rust's live unit-summary predicate. Other languages wait until
+/// their question fields determine the exact live-summary predicate.
 pub fn register_rust_unit_kinds<R: DerivationRevision, A: DerivationAuthority>(
     engine: &DerivationEngine<R, A>,
     unit_summary: UnitSummaryKind,
-    unit_set: RustUnitSetKind,
 ) {
     engine.register(unit_summary);
-    engine.register(unit_set);
 }
 
 #[cfg(test)]
 mod integration_tests {
     use super::*;
+
+    #[test]
+    fn selected_query_derivation_owners_are_registered_for_recompute() {
+        use crate::analyzer::store::selected_read::registry::{QueryClass, queries};
+        use brokk_bifrost_semantic::analyzer::semantic::derivation::Verification;
+
+        let host = AnalyzerDerivations::new(&RetentionBudget::for_test_capacity(1_000_000));
+        for query in queries().filter(|query| query.class == QueryClass::DerivationInput) {
+            let owner = query.owner.expect("derivation-input query declares OWNER");
+            assert_eq!(
+                host.engine.registered_verification_for_test(owner),
+                Some(Verification::Recompute),
+                "{} requires a registered recompute OWNER: {owner:?}",
+                query.name,
+            );
+        }
+    }
 
     struct ModelsRead;
 
@@ -606,10 +717,10 @@ mod integration_tests {
         const CHILDREN: &'static [(DerivationKindId, u16)] = &[];
 
         fn question(_: &u8) -> DerivationQuestion {
-            RustUnitSetKind::question(&0)
+            UnitSummaryKind::question(&[7; 32])
         }
         fn key_from_question(q: &DerivationQuestion) -> Option<u8> {
-            RustUnitSetKind::key_from_question(q)
+            UnitSummaryKind::key_from_question(q).map(|_| 0)
         }
         fn compute<R: DerivationRevision, A: DerivationAuthority>(
             &self,
@@ -618,7 +729,8 @@ mod integration_tests {
         ) -> Computed<String> {
             let value = with_current_analyzer(|analyzer| {
                 analyzer
-                    .semantic_model_overlay()
+                    .semantic_model_overlay_read()
+                    .published()
                     .map(|overlay| overlay.active_model_set_hash().to_owned())
                     .unwrap_or_else(|| "no-models".to_owned())
             });
@@ -626,11 +738,369 @@ mod integration_tests {
                 value,
                 complete: true,
                 validity: ReuseValidity::Reusable,
+                reuse: brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::Content,
             }
         }
         fn output_projection(value: &String, hash: &mut CanonicalHasher) {
             hash.value(value.as_bytes());
         }
+    }
+
+    struct ModelsParent;
+    impl DerivationKind for ModelsParent {
+        type Key = u8;
+        type Output = String;
+        const ID: DerivationKindId = DerivationKindId("test:receipt_models_parent:v1");
+        const STRATUM: u16 = 1;
+        const VERIFY: Verification = Verification::BaseInputs;
+        const CHILDREN: &'static [(DerivationKindId, u16)] = &[(ModelsRead::ID, 0)];
+        fn question(key: &u8) -> DerivationQuestion {
+            ModelsRead::question(key)
+        }
+        fn key_from_question(question: &DerivationQuestion) -> Option<u8> {
+            ModelsRead::key_from_question(question)
+        }
+        fn compute<R: DerivationRevision, A: DerivationAuthority>(
+            &self,
+            frame: &mut DerivationFrame<'_, R, A>,
+            key: &u8,
+        ) -> Computed<String> {
+            match frame.demand::<ModelsRead>(key) {
+                Demanded::Available { value, .. } => Computed::Available {
+                    value: value.to_string(),
+                    complete: true,
+                    validity: ReuseValidity::Reusable,
+                    reuse: brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::Content,
+                },
+                Demanded::Unavailable(cause) => Computed::Unavailable(cause),
+            }
+        }
+        fn output_projection(value: &String, hash: &mut CanonicalHasher) {
+            ModelsRead::output_projection(value, hash);
+        }
+    }
+
+    #[test]
+    fn receipt_verification_checks_transitive_inputs_without_computing_or_replaying() {
+        use crate::analyzer::i_analyzer::QueryReadReceipt;
+        use crate::analyzer::read_ledger::{LookupKind, LookupQuestion, ReadKey};
+        use crate::analyzer::semantic::ids::StableDigest;
+        use crate::analyzer::semantic_model::{SemanticModelOverlay, runtime};
+
+        let fixture = SelectionFixture::with_blob_writer(
+            AnalyzerStore::open_ephemeral().unwrap(),
+            0,
+            "rust",
+            Language::Rust,
+            false,
+            false,
+            |_, _, _, _, _| {},
+        );
+        let project = crate::inline_project::InlineTestProject::new()
+            .file("main.rs", "fn main() {}\n")
+            .build();
+        let languages = [fixture.language()];
+        let operation = crate::analyzer::store_support::test_support::operation_fixture_support::open_ready_operation(
+            &fixture.store,
+            SelectedResolutionOperationInput::new(project.project(), &fixture.workspace_id, &fixture.snapshots, &languages, &[]),
+            &crate::CancellationToken::default(),
+        );
+        let _lease = operation.ready.inventory.derivation_read().unwrap();
+        assert!(_lease.is_some());
+        let binding = operation
+            .ready
+            .inventory
+            .derivation_reader_binding()
+            .unwrap();
+        let analyzer = MultiAnalyzer::default();
+        let budget = RetentionBudget::for_test_capacity(1_000_000);
+        let host = AnalyzerDerivations::new(&budget);
+        host.register(ModelsRead);
+        host.register(ModelsParent);
+        let (answer, captured) = QueryReadReceipt::capture_deferred(&analyzer, || {
+            host.demand_in_operation::<ModelsParent>(&analyzer, &operation, &0)
+        });
+        assert!(matches!(
+            answer,
+            Demanded::Available {
+                value: Handle::Retained(_),
+                ..
+            }
+        ));
+        let mut retained = captured.clone();
+        assert!(retained.retain_root().nested_entries > 0);
+        let calls = (
+            host.counters(ModelsRead::ID).recomputed,
+            host.counters(ModelsParent::ID).recomputed,
+        );
+        for receipt in [&captured, &retained] {
+            let (current, probe) = QueryReadReceipt::capture_deferred(&analyzer, || {
+                host.verify_receipt_in_operation(&analyzer, &operation, receipt)
+            });
+            assert!(current);
+            assert!(probe.keys_satisfy(|_| false));
+            assert!(probe.reusable());
+        }
+        let overlay = Arc::new(
+            SemanticModelOverlay::build(
+                &analyzer,
+                &Arc::new(runtime::resolved_active_models_fixture(
+                    "test:receipt-model-change",
+                    vec![],
+                )),
+                &crate::CancellationToken::default(),
+                u64::MAX,
+                &budget,
+            )
+            .unwrap(),
+        );
+        {
+            let _snapshot = AnalyzerQueryScope::with_active_semantic_model_snapshot(
+                &analyzer,
+                Some(runtime::snapshot_without_overlay_fixture(
+                    overlay.active_model_set_hash(),
+                )),
+            );
+            let _overlay =
+                AnalyzerQueryScope::with_semantic_model_overlay(&analyzer, Some(overlay));
+            for receipt in [&captured, &retained] {
+                assert!(!host.verify_receipt_in_operation(&analyzer, &operation, receipt));
+            }
+            assert_eq!(
+                (
+                    host.counters(ModelsRead::ID).recomputed,
+                    host.counters(ModelsParent::ID).recomputed
+                ),
+                calls
+            );
+        }
+        assert!(host.verify_receipt_in_operation(&analyzer, &operation, &captured));
+        // Neither an unsupported base key nor a malformed child question is
+        // evidence for a current receipt, and neither triggers a demand.
+        for key in [
+            ReadKey::Configuration(StableDigest::sha256(b"unsupported")),
+            ReadKey::Lookup {
+                kind: LookupKind::Derivation(ModelsParent::ID),
+                question: LookupQuestion::RustPlacedDeclaration {
+                    blob: [0; 20],
+                    declaration: 0,
+                    rel_path: "main.rs".into(),
+                },
+                digest: StableDigest::sha256(b"malformed"),
+            },
+        ] {
+            let (_, receipt) =
+                QueryReadReceipt::capture_deferred(&analyzer, || analyzer.record_read(key));
+            assert!(!host.verify_receipt_in_operation(&analyzer, &operation, &receipt));
+        }
+        let cancellation = crate::CancellationToken::default();
+        cancellation.cancel();
+        {
+            let _scope = AnalyzerQueryScope::with_cancellation(&analyzer, &cancellation);
+            assert!(!host.verify_receipt_in_operation(&analyzer, &operation, &captured));
+        }
+        assert_eq!(
+            operation
+                .ready
+                .inventory
+                .derivation_reader_binding()
+                .unwrap(),
+            binding
+        );
+        assert_eq!(
+            (
+                host.counters(ModelsRead::ID).recomputed,
+                host.counters(ModelsParent::ID).recomputed
+            ),
+            calls
+        );
+    }
+
+    #[test]
+    fn receipt_probe_contains_pending_models_variant_errors_and_file_changes() {
+        use crate::analyzer::i_analyzer::{QueryReadReceipt, current_model_set_read_digest};
+        use crate::analyzer::read_ledger::ReadKey;
+        use crate::analyzer::semantic::{SemanticBudget, SemanticWork};
+        use crate::analyzer::semantic_model::runtime::SemanticModelOverlayRead;
+        use crate::analyzer::workspace::EmptyAnalyzer;
+        use brokk_bifrost_core::analyzer::carried_context::EvaluationExecution;
+        use brokk_bifrost_core::analyzer::project::Project;
+        use brokk_bifrost_core::gitblob::ParseVariant;
+
+        let project = crate::inline_project::InlineTestProject::new()
+            .file("main.cs", "class C {}\n")
+            .build();
+        let analyzer = EmptyAnalyzer::new(project.project_dyn());
+        let fixture = SelectionFixture::with_blob_writer(
+            AnalyzerStore::open_ephemeral().unwrap(),
+            0,
+            "rust",
+            Language::Rust,
+            false,
+            false,
+            |_, _, _, _, _| {},
+        );
+        let languages = [fixture.language()];
+        let operation = crate::analyzer::store_support::test_support::operation_fixture_support::open_ready_operation(
+            &fixture.store,
+            SelectedResolutionOperationInput::new(project.project(), &fixture.workspace_id, &fixture.snapshots, &languages, &[]),
+            &crate::CancellationToken::default(),
+        );
+        let _lease = operation.ready.inventory.derivation_read().unwrap();
+        assert!(_lease.is_some());
+        let host = AnalyzerDerivations::new(&RetentionBudget::for_test_capacity(1_000_000));
+        let file = project.file("main.cs");
+        let snapshot = project.project().read_file_snapshot(&file).unwrap();
+        let (_, file_receipt) = QueryReadReceipt::capture_deferred(&analyzer, || {
+            analyzer.record_read(ReadKey::File {
+                language: Language::CSharp,
+                rel_path: "main.cs".into(),
+                blob: snapshot.oid(),
+                parse_variant: ParseVariant::Empty,
+            });
+        });
+        let model_analyzer = MultiAnalyzer::default();
+        let (_, models) = QueryReadReceipt::capture_deferred(&model_analyzer, || {
+            model_analyzer.record_read(ReadKey::Models(
+                current_model_set_read_digest(&model_analyzer).unwrap(),
+            ));
+        });
+        assert!(host.verify_receipt_in_operation(&analyzer, &operation, &file_receipt));
+        std::fs::write(project.root().join("main.cs"), "class Changed {}\n").unwrap();
+        assert!(!host.verify_receipt_in_operation(&analyzer, &operation, &file_receipt));
+        std::fs::write(project.root().join("main.cs"), "class C {}\n").unwrap();
+        assert!(host.verify_receipt_in_operation(&analyzer, &operation, &file_receipt));
+
+        let failed_analyzer = analyzer
+            .clone()
+            .with_csharp_parse_variant_error_for_test("receipt variant read failed");
+        {
+            let scope = AnalyzerQueryScope::for_advisory_read(&failed_analyzer);
+            assert!(failed_analyzer.selected_parse_variant(&file).is_none());
+            assert!(
+                scope.store_error().is_some(),
+                "the fixture really fails its variant read"
+            );
+        }
+
+        let mut semantic_budget = SemanticBudget::default();
+        semantic_budget.charge_work(SemanticWork {
+            nested_entries: 7,
+            ..Default::default()
+        });
+        let state = |budget: &SemanticBudget| {
+            (
+                budget.performed(),
+                budget.resident(),
+                budget.resident_peak(),
+                budget.refusal_count(),
+            )
+        };
+        let before = state(&semantic_budget);
+        let evaluation = Arc::new(EvaluationExecution::default());
+        let _evaluation = evaluation.install();
+        let (_, outer) = {
+            let _pending = AnalyzerQueryScope::with_frozen_semantic_model_overlay(
+                &model_analyzer,
+                SemanticModelOverlayRead::Pending(
+                    crate::analyzer::QueryReadIncomplete::SemanticModelsPending,
+                ),
+            );
+            // Confirm the real model owner before opening the evidence whose
+            // purity we check; the control getter is itself an ordinary read.
+            assert!(matches!(
+                model_analyzer.semantic_model_overlay_read(),
+                SemanticModelOverlayRead::Pending(_)
+            ));
+            QueryReadReceipt::capture_deferred(&model_analyzer, || {
+                let scope = AnalyzerQueryScope::capturing_read_incompleteness(&model_analyzer);
+                assert!(!host.verify_receipt_in_operation(&model_analyzer, &operation, &models));
+                assert!(scope.captured_read_incompleteness().is_empty());
+                assert!(scope.store_error().is_none());
+            })
+        };
+        assert!(outer.keys_satisfy(|_| false));
+        assert!(outer.reusable());
+        let (_, errors) = QueryReadReceipt::capture_deferred(&failed_analyzer, || {
+            let scope = AnalyzerQueryScope::capturing_read_incompleteness(&failed_analyzer);
+            assert!(!host.verify_receipt_in_operation(&failed_analyzer, &operation, &file_receipt));
+            assert!(scope.captured_read_incompleteness().is_empty());
+            assert!(scope.store_error().is_none());
+        });
+        assert!(errors.keys_satisfy(|_| false));
+        assert!(errors.reusable());
+        assert!(evaluation.verdict().is_content());
+        assert_eq!(state(&semantic_budget), before);
+        assert!(host.verify_receipt_in_operation(&analyzer, &operation, &file_receipt));
+        assert!(host.verify_receipt_in_operation(&model_analyzer, &operation, &models));
+    }
+
+    #[test]
+    #[hardwon(
+        "#13102: an equal reader binding replayed a derivation from an earlier nested model scope"
+    )]
+    fn same_reader_binding_does_not_hide_nested_model_changes() {
+        use crate::analyzer::semantic_model::SemanticModelOverlay;
+        use crate::analyzer::semantic_model::runtime::resolved_active_models_fixture;
+        let fixture = SelectionFixture::with_blob_writer(
+            AnalyzerStore::open_ephemeral().unwrap(),
+            0,
+            "rust",
+            Language::Rust,
+            false,
+            false,
+            |_, _, _, _, _| {},
+        );
+        let analyzer = MultiAnalyzer::default();
+        let budget = RetentionBudget::for_test_capacity(1_000_000);
+        let host = AnalyzerDerivations::new(&budget);
+        host.engine.register(ModelsRead);
+        let overlay = Arc::new(
+            SemanticModelOverlay::build(
+                &analyzer,
+                &Arc::new(resolved_active_models_fixture(
+                    "test:same-binding-models",
+                    vec![],
+                )),
+                &crate::CancellationToken::default(),
+                u64::MAX,
+                &budget,
+            )
+            .unwrap(),
+        );
+        let expected = overlay.active_model_set_hash().to_owned();
+        // Keep exactly one inventory/binding across these nested scopes. The
+        // older #9755 regression opened a fresh inventory for every demand.
+        let inventory = fixture.open_ready(&[]);
+        let _lease = inventory.derivation_read().unwrap();
+        assert!(
+            _lease.is_some(),
+            "this test owns one continuously live read lease"
+        );
+        let demand = |selected| {
+            let _scope = AnalyzerQueryScope::with_semantic_model_overlay(&analyzer, selected);
+            match host.demand::<ModelsRead>(&analyzer, &inventory, &0) {
+                Demanded::Available { value, .. } => value.to_string(),
+                Demanded::Unavailable(cause) => panic!("models read unavailable: {cause:?}"),
+            }
+        };
+        assert_eq!(demand(None), "no-models");
+        assert_eq!(demand(None), "no-models");
+        assert_eq!(
+            host.counters(ModelsRead::ID).current_hits,
+            1,
+            "the control actually reuses one reader binding"
+        );
+        assert_eq!(
+            demand(Some(overlay)),
+            expected,
+            "a different effective model input cannot use the old current hit"
+        );
+        assert_eq!(
+            demand(None),
+            "no-models",
+            "removing the effective model input also changes the answer"
+        );
     }
 
     #[test]
@@ -650,7 +1120,7 @@ mod integration_tests {
             |_, _, _, _, _| {},
         );
         let analyzer = MultiAnalyzer::default();
-        let budget = RetentionBudget::new(1_000_000);
+        let budget = RetentionBudget::for_test_capacity(1_000_000);
         let host = AnalyzerDerivations::new(&budget);
         host.engine.register(ModelsRead);
         let overlay = Arc::new(
@@ -766,7 +1236,7 @@ mod integration_tests {
         ) -> Computed<u8> {
             super::with_current_analyzer(|analyzer| {
                 if *key == 0 {
-                    assert!(analyzer.semantic_model_overlay().is_some());
+                    assert!(analyzer.semantic_model_overlay_read().published().is_some());
                 } else {
                     analyzer.record_read(crate::analyzer::read_ledger::ReadKey::Configuration(
                         crate::analyzer::semantic::ids::StableDigest::sha256("test:config"),
@@ -777,6 +1247,7 @@ mod integration_tests {
                 value: *key,
                 complete: true,
                 validity: ReuseValidity::Reusable,
+                reuse: brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::Content,
             }
         }
         fn output_projection(value: &u8, hash: &mut CanonicalHasher) {
@@ -789,7 +1260,7 @@ mod integration_tests {
         use crate::analyzer::semantic_model::SemanticModelOverlay;
         use crate::analyzer::semantic_model::runtime::resolved_active_models_fixture;
         let analyzer = MultiAnalyzer::default();
-        let budget = RetentionBudget::new(1_000_000);
+        let budget = RetentionBudget::for_test_capacity(1_000_000);
         let host = AnalyzerDerivations::new(&budget);
         host.register(BaseInputProbe);
         let fixture = SelectionFixture::with_blob_writer(
@@ -851,7 +1322,7 @@ mod integration_tests {
         use crate::analyzer::semantic_model::runtime::resolved_active_models_fixture;
         use brokk_bifrost_semantic::analyzer::semantic::derivation::BaseInputs;
         let analyzer = MultiAnalyzer::default();
-        let budget = RetentionBudget::new(1_000_000);
+        let budget = RetentionBudget::for_test_capacity(1_000_000);
         let fixture = SelectionFixture::with_blob_writer(
             AnalyzerStore::open_ephemeral().unwrap(),
             0,
@@ -934,10 +1405,10 @@ mod integration_tests {
             );
             let inventory = fixture.open_ready(&[]);
             inventory.stamp_declared_rust_route_recipe();
-            let host = AnalyzerDerivations::new(&RetentionBudget::new(1_000_000));
+            let host = AnalyzerDerivations::new(&RetentionBudget::for_test_capacity(1_000_000));
             host.register_declared_route_recipe(Language::Rust);
             assert!(matches!(
-                host.demand::<RustUnitSetKind>(analyzer.as_ref(), &inventory, &0),
+                host.demand::<UnitSummaryKind>(analyzer.as_ref(), &inventory, &[7; 32]),
                 Demanded::Available { .. }
             ));
         };
@@ -957,7 +1428,7 @@ mod integration_tests {
         assert!(ledger.keys().iter().any(|key| matches!(
             key,
             ReadKey::Lookup {
-                kind: LookupKind::Derivation(RustUnitSetKind::ID),
+                kind: LookupKind::Derivation(UnitSummaryKind::ID),
                 ..
             }
         )));
@@ -978,13 +1449,13 @@ mod integration_tests {
         );
         let inventory = fixture.open_ready(&[]);
         let analyzer = MultiAnalyzer::default();
-        let host = AnalyzerDerivations::new(&RetentionBudget::new(1_000_000));
+        let host = AnalyzerDerivations::new(&RetentionBudget::for_test_capacity(1_000_000));
         host.register_declared_route_recipe(Language::Rust);
         for _ in 0..2 {
             let ledger = Arc::new(ReadLedger::new());
             let _scope = AnalyzerQueryScope::with_read_ledger(&analyzer, ledger.clone());
             assert!(matches!(
-                host.demand::<RustUnitSetKind>(&analyzer, &inventory, &0),
+                host.demand::<UnitSummaryKind>(&analyzer, &inventory, &[7; 32]),
                 Demanded::Available { .. }
             ));
             assert!(!ledger.reuse_refused());
@@ -992,7 +1463,7 @@ mod integration_tests {
             assert!(ledger.keys().iter().any(|key| matches!(
                 key,
                 ReadKey::Lookup {
-                    kind: LookupKind::Derivation(RustUnitSetKind::ID),
+                    kind: LookupKind::Derivation(UnitSummaryKind::ID),
                     ..
                 }
             )));
@@ -1001,7 +1472,7 @@ mod integration_tests {
         let ledger = Arc::new(ReadLedger::new());
         let _scope = AnalyzerQueryScope::with_read_ledger(&analyzer, ledger.clone());
         assert!(matches!(
-            host.demand::<RustUnitSetKind>(&analyzer, &inventory, &0),
+            host.demand::<UnitSummaryKind>(&analyzer, &inventory, &[7; 32]),
             Demanded::Available { .. }
         ));
         assert!(!ledger.reuse_refused());
@@ -1009,7 +1480,7 @@ mod integration_tests {
         assert!(ledger.keys().iter().any(|key| matches!(
             key,
             ReadKey::Lookup {
-                kind: LookupKind::Derivation(RustUnitSetKind::ID),
+                kind: LookupKind::Derivation(UnitSummaryKind::ID),
                 ..
             }
         )));
@@ -1031,7 +1502,7 @@ mod integration_tests {
         );
         let inventory = fixture.open_ready(&[]);
         let analyzer = MultiAnalyzer::default();
-        let host = AnalyzerDerivations::new(&RetentionBudget::new(1_000_000));
+        let host = AnalyzerDerivations::new(&RetentionBudget::for_test_capacity(1_000_000));
         host.register_declared_route_recipe(Language::Rust);
         for _ in 0..2 {
             let outer = Arc::new(ReadLedger::new());
@@ -1040,7 +1511,7 @@ mod integration_tests {
             {
                 let _inner = AnalyzerQueryScope::with_read_ledger(&analyzer, inner.clone());
                 assert!(matches!(
-                    host.demand::<RustUnitSetKind>(&analyzer, &inventory, &0),
+                    host.demand::<UnitSummaryKind>(&analyzer, &inventory, &[7; 32]),
                     Demanded::Available { .. }
                 ));
             }
@@ -1067,13 +1538,13 @@ mod integration_tests {
         inventory.stamp_declared_rust_route_recipe();
         let _lease = inventory.derivation_read().unwrap().unwrap();
         let analyzer = MultiAnalyzer::default();
-        let host = AnalyzerDerivations::new(&RetentionBudget::new(1_000_000));
+        let host = AnalyzerDerivations::new(&RetentionBudget::for_test_capacity(1_000_000));
         host.register_declared_route_recipe(Language::Rust);
         for _ in 0..2 {
             let ledger = Arc::new(ReadLedger::new());
             let _scope = AnalyzerQueryScope::with_read_ledger(&analyzer, ledger.clone());
             assert!(matches!(
-                host.demand::<RustUnitSetKind>(&analyzer, &inventory, &0),
+                host.demand::<UnitSummaryKind>(&analyzer, &inventory, &[7; 32]),
                 Demanded::Available {
                     value: Handle::Retained(_),
                     ..
@@ -1084,12 +1555,12 @@ mod integration_tests {
             assert!(ledger.keys().iter().any(|key| matches!(
                 key,
                 ReadKey::Lookup {
-                    kind: LookupKind::Derivation(RustUnitSetKind::ID),
+                    kind: LookupKind::Derivation(UnitSummaryKind::ID),
                     ..
                 }
             )));
         }
-        let counters = host.counters(RustUnitSetKind::ID);
+        let counters = host.counters(UnitSummaryKind::ID);
         assert_eq!((counters.recomputed, counters.current_hits), (1, 1));
     }
 
@@ -1113,13 +1584,13 @@ mod integration_tests {
             })
             .unwrap();
         let analyzer = MultiAnalyzer::default();
-        let host = AnalyzerDerivations::new(&RetentionBudget::new(1_000_000));
+        let host = AnalyzerDerivations::new(&RetentionBudget::for_test_capacity(1_000_000));
         host.register_declared_route_recipe(Language::Rust);
         for _ in 0..2 {
             let ledger = Arc::new(ReadLedger::new());
             let _scope = AnalyzerQueryScope::with_read_ledger(&analyzer, ledger.clone());
             assert!(matches!(
-                host.demand::<RustUnitSetKind>(&analyzer, &inventory, &0),
+                host.demand::<UnitSummaryKind>(&analyzer, &inventory, &[7; 32]),
                 Demanded::Available { .. }
             ));
             assert_eq!(ledger.persistence_refusals(), 1);
@@ -1152,10 +1623,10 @@ mod integration_tests {
         const STRATUM: u16 = 1;
         const CHILDREN: &'static [(DerivationKindId, u16)] = &[(LeafRouteRead::ID, 0)];
         fn question(_: &u8) -> DerivationQuestion {
-            RustUnitSetKind::question(&0)
+            UnitSummaryKind::question(&[7; 32])
         }
         fn key_from_question(q: &DerivationQuestion) -> Option<u8> {
-            RustUnitSetKind::key_from_question(q)
+            UnitSummaryKind::key_from_question(q).map(|_| 0)
         }
         fn compute<R: DerivationRevision, A: DerivationAuthority>(
             &self,
@@ -1174,6 +1645,7 @@ mod integration_tests {
                 value,
                 complete: true,
                 validity: ReuseValidity::Reusable,
+                reuse: brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::Content,
             }
         }
         fn output_projection(value: &u8, hash: &mut CanonicalHasher) {
@@ -1195,7 +1667,7 @@ mod integration_tests {
         let inventory = fixture.open_ready(&[]);
         inventory.stamp_declared_rust_route_recipe();
         let analyzer = MultiAnalyzer::default();
-        let budget = RetentionBudget::new(1_000_000);
+        let budget = RetentionBudget::for_test_capacity(1_000_000);
         let inner = Arc::new(AnalyzerDerivations::new(&budget));
         inner.engine.register(LeafRouteRead);
         let outer = AnalyzerDerivations::new(&budget);
@@ -1235,7 +1707,7 @@ mod integration_tests {
         let inventory = fixture.open_ready(&[]);
         inventory.stamp_declared_rust_route_recipe();
         let analyzer = MultiAnalyzer::default();
-        let host = AnalyzerDerivations::new(&RetentionBudget::new(1));
+        let host = AnalyzerDerivations::new(&RetentionBudget::for_test_capacity(1));
         host.register_declared_route_recipe(Language::Rust);
         host.engine.register(LeafRouteRead);
         host.engine.register(NestedRouteRead);
@@ -1261,10 +1733,10 @@ mod integration_tests {
         const STRATUM: u16 = 0;
         const CHILDREN: &'static [(DerivationKindId, u16)] = &[];
         fn question(_: &u8) -> DerivationQuestion {
-            RustUnitSetKind::question(&0)
+            UnitSummaryKind::question(&[7; 32])
         }
         fn key_from_question(q: &DerivationQuestion) -> Option<u8> {
-            RustUnitSetKind::key_from_question(q)
+            UnitSummaryKind::key_from_question(q).map(|_| 0)
         }
         fn compute<R: DerivationRevision, A: DerivationAuthority>(
             &self,
@@ -1275,6 +1747,7 @@ mod integration_tests {
                 value: 1,
                 complete: true,
                 validity: ReuseValidity::Reusable,
+                reuse: brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::Content,
             }
         }
         fn output_projection(value: &u8, hash: &mut CanonicalHasher) {
@@ -1290,10 +1763,10 @@ mod integration_tests {
         const STRATUM: u16 = 1;
         const CHILDREN: &'static [(DerivationKindId, u16)] = &[(LeafRouteRead::ID, 0)];
         fn question(_: &u8) -> DerivationQuestion {
-            RustUnitSetKind::question(&0)
+            UnitSummaryKind::question(&[7; 32])
         }
         fn key_from_question(q: &DerivationQuestion) -> Option<u8> {
-            RustUnitSetKind::key_from_question(q)
+            UnitSummaryKind::key_from_question(q).map(|_| 0)
         }
         fn compute<R: DerivationRevision, A: DerivationAuthority>(
             &self,
@@ -1310,6 +1783,7 @@ mod integration_tests {
                 value,
                 complete: true,
                 validity: ReuseValidity::Reusable,
+                reuse: brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::Content,
             }
         }
         fn output_projection(value: &u8, hash: &mut CanonicalHasher) {
@@ -1325,10 +1799,10 @@ mod integration_tests {
         const STRATUM: u16 = 0;
         const CHILDREN: &'static [(DerivationKindId, u16)] = &[];
         fn question(_: &u8) -> DerivationQuestion {
-            RustUnitSetKind::question(&0)
+            UnitSummaryKind::question(&[7; 32])
         }
         fn key_from_question(q: &DerivationQuestion) -> Option<u8> {
-            RustUnitSetKind::key_from_question(q)
+            UnitSummaryKind::key_from_question(q).map(|_| 0)
         }
         fn compute<R: DerivationRevision, A: DerivationAuthority>(
             &self,
@@ -1346,6 +1820,7 @@ mod integration_tests {
                 value: count,
                 complete: true,
                 validity: ReuseValidity::Reusable,
+                reuse: brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::Content,
             }
         }
         fn output_projection(value: &u8, hash: &mut CanonicalHasher) {
@@ -1361,10 +1836,10 @@ mod integration_tests {
         const STRATUM: u16 = 0;
         const CHILDREN: &'static [(DerivationKindId, u16)] = &[];
         fn question(_: &u8) -> DerivationQuestion {
-            RustUnitSetKind::question(&0)
+            UnitSummaryKind::question(&[7; 32])
         }
         fn key_from_question(q: &DerivationQuestion) -> Option<u8> {
-            RustUnitSetKind::key_from_question(q)
+            UnitSummaryKind::key_from_question(q).map(|_| 0)
         }
         fn compute<R: DerivationRevision, A: DerivationAuthority>(
             &self,
@@ -1408,6 +1883,7 @@ mod integration_tests {
                 value: 1,
                 complete: true,
                 validity: ReuseValidity::Reusable,
+                reuse: brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::Content,
             }
         }
         fn output_projection(value: &u8, hash: &mut CanonicalHasher) {
@@ -1442,7 +1918,7 @@ mod integration_tests {
             &crate::CancellationToken::default(),
         );
         let analyzer = MultiAnalyzer::default();
-        let host = AnalyzerDerivations::new(&RetentionBudget::new(1_000_000));
+        let host = AnalyzerDerivations::new(&RetentionBudget::for_test_capacity(1_000_000));
         host.engine.register(OperationRead);
         assert!(
             matches!(host.demand_in_operation::<OperationRead>(&analyzer, &operation, &0), Demanded::Available { value, .. } if *value == 1)
@@ -1804,7 +2280,7 @@ mod integration_tests {
         let lease = inventory.derivation_read().unwrap().unwrap();
         let binding = inventory.reader_binding().unwrap();
         let analyzer = MultiAnalyzer::default();
-        let host = AnalyzerDerivations::new(&RetentionBudget::new(1_000_000));
+        let host = AnalyzerDerivations::new(&RetentionBudget::for_test_capacity(1_000_000));
         host.engine.register(StageRead);
         assert!(
             matches!(host.demand_in_operation::<StageRead>(&analyzer, &operation, &0), Demanded::Available { value, .. } if *value == 1)
@@ -1854,8 +2330,8 @@ mod integration_tests {
             AnalyzerAuthority::UnprovedStage
         );
         let analyzer = MultiAnalyzer::default();
-        let host = AnalyzerDerivations::new(&RetentionBudget::new(1_000_000));
-        let outcome = host.demand::<RustUnitSetKind>(&analyzer, inventory, &0);
+        let host = AnalyzerDerivations::new(&RetentionBudget::for_test_capacity(1_000_000));
+        let outcome = host.demand::<UnitSummaryKind>(&analyzer, inventory, &[7; 32]);
         let validity = match outcome {
             Demanded::Available { validity, .. } => validity,
             Demanded::Unavailable(_) => panic!("unavailable"),
@@ -1874,10 +2350,10 @@ mod integration_tests {
         const STRATUM: u16 = 0;
         const CHILDREN: &'static [(DerivationKindId, u16)] = &[];
         fn question(_: &u8) -> DerivationQuestion {
-            RustUnitSetKind::question(&0)
+            UnitSummaryKind::question(&[7; 32])
         }
         fn key_from_question(q: &DerivationQuestion) -> Option<u8> {
-            RustUnitSetKind::key_from_question(q)
+            UnitSummaryKind::key_from_question(q).map(|_| 0)
         }
         fn compute<R: DerivationRevision, A: DerivationAuthority>(
             &self,
@@ -1895,6 +2371,7 @@ mod integration_tests {
                 value: 1,
                 complete: true,
                 validity: ReuseValidity::Reusable,
+                reuse: brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::Content,
             }
         }
         fn output_projection(value: &u8, hash: &mut CanonicalHasher) {
@@ -1914,7 +2391,7 @@ mod integration_tests {
             |_, _, _, _, _| {},
         );
         let analyzer = MultiAnalyzer::default();
-        let host = AnalyzerDerivations::new(&RetentionBudget::new(1_000_000));
+        let host = AnalyzerDerivations::new(&RetentionBudget::for_test_capacity(1_000_000));
         host.engine.register(PauseRead);
         let read = fixture.open_ready(&[]);
         match host.demand::<PauseRead>(&analyzer, &read, &0) {
@@ -1936,10 +2413,10 @@ mod integration_tests {
         const STRATUM: u16 = 0;
         const CHILDREN: &'static [(DerivationKindId, u16)] = &[];
         fn question(_: &u8) -> DerivationQuestion {
-            RustUnitSetKind::question(&0)
+            UnitSummaryKind::question(&[7; 32])
         }
         fn key_from_question(q: &DerivationQuestion) -> Option<u8> {
-            RustUnitSetKind::key_from_question(q)
+            UnitSummaryKind::key_from_question(q).map(|_| 0)
         }
         fn compute<R: DerivationRevision, A: DerivationAuthority>(
             &self,
@@ -1966,6 +2443,7 @@ mod integration_tests {
                 value: 1,
                 complete: true,
                 validity: ReuseValidity::Reusable,
+                reuse: brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::Content,
             }
         }
         fn output_projection(value: &u8, hash: &mut CanonicalHasher) {
@@ -1986,7 +2464,7 @@ mod integration_tests {
             |_, _, _, _, _| {},
         );
         let analyzer = MultiAnalyzer::default();
-        let host = AnalyzerDerivations::new(&RetentionBudget::new(1_000_000));
+        let host = AnalyzerDerivations::new(&RetentionBudget::for_test_capacity(1_000_000));
         host.engine.register(DirectStageWriteRead);
         let read = fixture.open_ready(&[]);
         match host.demand::<DirectStageWriteRead>(&analyzer, &read, &0) {
@@ -2000,7 +2478,7 @@ mod integration_tests {
         }
     }
 
-    struct UnitSetParent {
+    struct UnitSummaryParent {
         gate: Option<Arc<Gate>>,
     }
     struct Gate {
@@ -2009,18 +2487,18 @@ mod integration_tests {
         release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
     }
 
-    impl DerivationKind for UnitSetParent {
+    impl DerivationKind for UnitSummaryParent {
         type Key = u8;
         type Output = [u8; 32];
-        const ID: DerivationKindId = DerivationKindId("test:rust_unit_set_parent:v1");
+        const ID: DerivationKindId = DerivationKindId("test:unit_summary_parent:v1");
         const STRATUM: u16 = 1;
         const CHILDREN: &'static [(DerivationKindId, u16)] =
-            &[(RustUnitSetKind::ID, RustUnitSetKind::STRATUM)];
+            &[(UnitSummaryKind::ID, UnitSummaryKind::STRATUM)];
         fn question(_: &u8) -> DerivationQuestion {
-            RustUnitSetKind::question(&0)
+            UnitSummaryKind::question(&[7; 32])
         }
         fn key_from_question(question: &DerivationQuestion) -> Option<u8> {
-            RustUnitSetKind::key_from_question(question)
+            UnitSummaryKind::key_from_question(question).map(|_| 0)
         }
         fn compute<R: DerivationRevision, A: DerivationAuthority>(
             &self,
@@ -2033,11 +2511,12 @@ mod integration_tests {
                 gate.entered.send(()).unwrap();
                 gate.release.lock().unwrap().recv().unwrap();
             }
-            match frame.demand::<RustUnitSetKind>(&0) {
+            match frame.demand::<UnitSummaryKind>(&[7; 32]) {
                 Demanded::Available { value, .. } => Computed::Available {
                     value: *value,
                     complete: true,
                     validity: ReuseValidity::Reusable,
+                    reuse: brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::Content,
                 },
                 Demanded::Unavailable(cause) => Computed::Unavailable(cause),
             }
@@ -2063,18 +2542,20 @@ mod integration_tests {
         let mut first = fixture();
         let second = fixture();
         let analyzer = MultiAnalyzer::default();
-        let budget = RetentionBudget::new(1_000_000);
+        let budget = RetentionBudget::for_test_capacity(1_000_000);
         let first_host = AnalyzerDerivations::new(&budget);
         let second_host = AnalyzerDerivations::new(&budget);
-        first_host.engine.register(UnitSetParent { gate: None });
+        first_host.engine.register(UnitSummaryParent { gate: None });
         first_host.register_declared_route_recipe(Language::Rust);
-        second_host.engine.register(UnitSetParent { gate: None });
+        second_host
+            .engine
+            .register(UnitSummaryParent { gate: None });
         second_host.register_declared_route_recipe(Language::Rust);
         let read = first.open_ready(&[]);
         read.stamp_declared_rust_route_recipe();
-        let initial = match first_host.demand::<UnitSetParent>(&analyzer, &read, &0) {
+        let initial = match first_host.demand::<UnitSummaryParent>(&analyzer, &read, &0) {
             Demanded::Available { value, .. } => *value,
-            Demanded::Unavailable(cause) => panic!("initial unit set unavailable: {cause:?}"),
+            Demanded::Unavailable(cause) => panic!("initial unit summary unavailable: {cause:?}"),
         };
         drop(read);
         // A main-database edit outside the selected Rust inputs moves currency.
@@ -2084,16 +2565,21 @@ mod integration_tests {
         });
         let read = first.open_ready(&[]);
         read.stamp_declared_rust_route_recipe();
-        let unchanged = match first_host.demand::<UnitSetParent>(&analyzer, &read, &0) {
+        let unchanged = match first_host.demand::<UnitSummaryParent>(&analyzer, &read, &0) {
             Demanded::Available { value, .. } => *value,
-            Demanded::Unavailable(cause) => panic!("unchanged unit set unavailable: {cause:?}"),
+            Demanded::Unavailable(cause) => panic!("unchanged unit summary unavailable: {cause:?}"),
         };
         assert_eq!(initial, unchanged);
-        let counters = first_host.counters(RustUnitSetKind::ID);
+        let counters = first_host.counters(UnitSummaryKind::ID);
         assert_eq!(counters.current_hits, 0);
         assert_eq!(counters.recomputed, 2);
-        assert_eq!(first_host.counters(UnitSetParent::ID).verified_unchanged, 1);
-        assert_eq!(first_host.counters(UnitSetParent::ID).recomputed, 1);
+        assert_eq!(
+            first_host
+                .counters(UnitSummaryParent::ID)
+                .verified_unchanged,
+            1
+        );
+        assert_eq!(first_host.counters(UnitSummaryParent::ID).recomputed, 1);
         drop(read);
         let generation = first.snapshots["rust"].generation.get();
         let epoch = resolution_bundle_epoch(Language::Rust).to_owned();
@@ -2103,9 +2589,9 @@ mod integration_tests {
             conn.execute("INSERT INTO workspace_revisions(workspace_id,lang,generation,revision) SELECT workspace_id,lang,generation,2 FROM workspace_revisions WHERE lang='rust' AND revision=1", []).unwrap();
             conn.execute("UPDATE workspace_heads SET revision=2 WHERE lang='rust'", []).unwrap();
             conn.execute(
-                "INSERT INTO resolution_unit_summaries(summary_id,lang,unit_kind,unit_key,summary_digest,producer_epoch,derivation_version,complete,output_digest,publication_state)
+                "INSERT INTO resolution_unit_summaries(summary_id,lang,unit_kind,unit_key,summary_digest,producer_epoch,derivation_identity,complete,output_digest,publication_state)
                  VALUES(1001,'rust','rust_crate',?1,?1,?2,?3,1,?1,'complete')",
-                params![unit_key, epoch, RUST_UNIT_SUMMARY_DERIVATION_VERSION],
+                params![unit_key, epoch, rust_unit_summary_derivation_identity()],
             ).unwrap();
             conn.execute(
                 "INSERT INTO resolution_unit_summary_versions(workspace_id,lang,generation,unit_key,valid_from,summary_id,profile_digest)
@@ -2126,13 +2612,13 @@ mod integration_tests {
         first.snapshots.get_mut("rust").unwrap().revision = 2;
         let changed = first.open_ready(&[]);
         changed.stamp_declared_rust_route_recipe();
-        let changed_digest = match first_host.demand::<UnitSetParent>(&analyzer, &changed, &0) {
+        let changed_digest = match first_host.demand::<UnitSummaryParent>(&analyzer, &changed, &0) {
             Demanded::Available { value, .. } => *value,
-            Demanded::Unavailable(cause) => panic!("changed unit set unavailable: {cause:?}"),
+            Demanded::Unavailable(cause) => panic!("changed unit summary unavailable: {cause:?}"),
         };
         assert_ne!(initial, changed_digest);
-        assert_eq!(first_host.counters(RustUnitSetKind::ID).recomputed, 3);
-        assert_eq!(first_host.counters(UnitSetParent::ID).recomputed, 2);
+        assert_eq!(first_host.counters(UnitSummaryKind::ID).recomputed, 3);
+        assert_eq!(first_host.counters(UnitSummaryParent::ID).recomputed, 2);
         drop(changed);
         let changed = first.open_ready(&[]);
         changed.stamp_declared_rust_route_recipe();
@@ -2152,9 +2638,8 @@ mod integration_tests {
         }
         first_host
             .engine
-            .demand::<RustUnitSetKind>(&0, binding.clone(), authority.clone());
+            .demand::<UnitSummaryKind>(&[7; 32], binding.clone(), authority.clone());
         let before_changed = first_host.counters(UnitSummaryKind::ID);
-        let before_set = first_host.counters(RustUnitSetKind::ID);
         let mut report = UnitSummaryReconciliation::default();
         report.output_changed = vec![("rust".to_string(), [7; 32])];
         report.closed = vec![("rust".to_string(), [9; 32])];
@@ -2169,29 +2654,24 @@ mod integration_tests {
                 Demanded::Available { .. }
             ));
         }
-        first_host
-            .engine
-            .demand::<RustUnitSetKind>(&0, binding, authority);
         let after_changed = first_host.counters(UnitSummaryKind::ID);
         assert_eq!(after_changed.recomputed, before_changed.recomputed + 1);
         assert_eq!(after_changed.current_hits, before_changed.current_hits + 1);
-        assert_eq!(
-            first_host.counters(RustUnitSetKind::ID).recomputed,
-            before_set.recomputed + 1
-        );
         drop(host);
         drop(lease);
         drop(changed);
         let other = second.open_ready(&[]);
         other.stamp_declared_rust_route_recipe();
         assert!(matches!(
-            second_host.demand::<UnitSetParent>(&analyzer, &other, &0),
+            second_host.demand::<UnitSummaryParent>(&analyzer, &other, &0),
             Demanded::Available { .. }
         ));
-        assert_eq!(second_host.counters(RustUnitSetKind::ID).current_hits, 0);
-        assert_eq!(second_host.counters(UnitSetParent::ID).recomputed, 1);
+        assert_eq!(second_host.counters(UnitSummaryKind::ID).current_hits, 0);
+        assert_eq!(second_host.counters(UnitSummaryParent::ID).recomputed, 1);
         assert_eq!(
-            second_host.counters(UnitSetParent::ID).verified_unchanged,
+            second_host
+                .counters(UnitSummaryParent::ID)
+                .verified_unchanged,
             0
         );
 
@@ -2203,7 +2683,7 @@ mod integration_tests {
             let ledger = Arc::new(ReadLedger::new());
             let _scope = AnalyzerQueryScope::with_read_ledger(&analyzer, ledger.clone());
             assert!(matches!(
-                first_host.demand::<RustUnitSetKind>(&analyzer, &overlay, &0),
+                first_host.demand::<UnitSummaryKind>(&analyzer, &overlay, &[7; 32]),
                 Demanded::Available {
                     value: Handle::RequestOwned(_),
                     ..
@@ -2239,15 +2719,15 @@ mod integration_tests {
             let unit_key = [7_u8; 32];
             conn.execute("INSERT INTO workspace_revisions(workspace_id,lang,generation,revision) SELECT workspace_id,lang,generation,2 FROM workspace_revisions WHERE lang='rust' AND revision=1", []).unwrap();
             conn.execute("UPDATE workspace_heads SET revision=2 WHERE lang='rust'", []).unwrap();
-            conn.execute("INSERT INTO resolution_unit_summaries(summary_id,lang,unit_kind,unit_key,summary_digest,producer_epoch,derivation_version,complete,output_digest,publication_state) VALUES(1001,'rust','rust_crate',?1,?1,?2,?3,1,?1,'complete')", params![unit_key, epoch, RUST_UNIT_SUMMARY_DERIVATION_VERSION]).unwrap();
+            conn.execute("INSERT INTO resolution_unit_summaries(summary_id,lang,unit_kind,unit_key,summary_digest,producer_epoch,derivation_identity,complete,output_digest,publication_state) VALUES(1001,'rust','rust_crate',?1,?1,?2,?3,1,?1,'complete')", params![unit_key, epoch, rust_unit_summary_derivation_identity()]).unwrap();
             conn.execute("INSERT INTO resolution_unit_summary_versions(workspace_id,lang,generation,unit_key,valid_from,summary_id,profile_digest) VALUES(?1,'rust',?2,?3,2,1001,zeroblob(32))", params![crate::analyzer::store_support::selection_test_support::WORKSPACE_ID, generation, unit_key]).unwrap();
             conn.execute("INSERT INTO rust_crate_topologies(topology_id,topology_digest,crate_key,producer_epoch,target_kind,crate_name,edition,prelude,cfg_atoms,inventory_complete,export_surface_digest,publication_state) VALUES(1001,?1,?1,'rust-resolution-epoch','lib','added','2021','std',jsonb('[]'),1,?1,'complete')", params![unit_key]).unwrap();
             conn.execute("INSERT INTO rust_resolution_unit_summary_versions(workspace_id,lang,generation,unit_key,valid_from,summary_id,manifest_file_version_id,topology_id) VALUES(?1,'rust',?2,?3,2,1001,NULL,1001)", params![crate::analyzer::store_support::selection_test_support::WORKSPACE_ID, generation, unit_key]).unwrap();
         });
         let analyzer = MultiAnalyzer::default();
-        let budget = RetentionBudget::new(1_000_000);
+        let budget = RetentionBudget::for_test_capacity(1_000_000);
         let host = AnalyzerDerivations::new(&budget);
-        host.engine.register(UnitSetParent { gate: None });
+        host.engine.register(UnitSummaryParent { gate: None });
         host.register_declared_route_recipe(Language::Rust);
         let open = |snapshots| match fixture
             .store
@@ -2268,7 +2748,7 @@ mod integration_tests {
         };
         let answer = |host: &AnalyzerDerivations, snapshots| {
             let reader = open(snapshots);
-            match host.demand::<UnitSetParent>(&analyzer, &reader, &0) {
+            match host.demand::<UnitSummaryParent>(&analyzer, &reader, &0) {
                 Demanded::Available {
                     value, identity, ..
                 } => (*value, identity),
@@ -2276,10 +2756,10 @@ mod integration_tests {
             }
         };
         let fresh_a = AnalyzerDerivations::new(&budget);
-        fresh_a.engine.register(UnitSetParent { gate: None });
+        fresh_a.engine.register(UnitSummaryParent { gate: None });
         fresh_a.register_declared_route_recipe(Language::Rust);
         let fresh_b = AnalyzerDerivations::new(&budget);
-        fresh_b.engine.register(UnitSetParent { gate: None });
+        fresh_b.engine.register(UnitSummaryParent { gate: None });
         fresh_b.register_declared_route_recipe(Language::Rust);
         let expected_a = answer(&fresh_a, &a);
         let expected_b = answer(&fresh_b, &b);
@@ -2287,14 +2767,14 @@ mod integration_tests {
         assert_eq!(answer(&host, &a), expected_a);
         assert_eq!(answer(&host, &b), expected_b);
         assert_eq!(answer(&host, &a), expected_a);
-        let parent = host.counters(UnitSetParent::ID);
+        let parent = host.counters(UnitSummaryParent::ID);
         assert_eq!(parent.recomputed, 3);
         assert_eq!(parent.current_hits, 0);
         assert_eq!(parent.verified_unchanged, 0);
         let reader = open(&a);
         let lease = reader.derivation_read().unwrap().unwrap();
-        let first = host.demand::<UnitSetParent>(&analyzer, &reader, &0);
-        let second = host.demand::<UnitSetParent>(&analyzer, &reader, &0);
+        let first = host.demand::<UnitSummaryParent>(&analyzer, &reader, &0);
+        let second = host.demand::<UnitSummaryParent>(&analyzer, &reader, &0);
         for result in [first, second] {
             match result {
                 Demanded::Available {
@@ -2303,7 +2783,7 @@ mod integration_tests {
                 Demanded::Unavailable(cause) => panic!("pinned A unavailable: {cause:?}"),
             }
         }
-        assert_eq!(host.counters(UnitSetParent::ID).current_hits, 1);
+        assert_eq!(host.counters(UnitSummaryParent::ID).current_hits, 1);
         drop(lease);
         drop(reader);
 
@@ -2311,7 +2791,7 @@ mod integration_tests {
         let (release_tx, release_rx) = mpsc::channel();
         let concurrent = AnalyzerDerivations::new(&budget);
         concurrent.register_declared_route_recipe(Language::Rust);
-        concurrent.engine.register(UnitSetParent {
+        concurrent.engine.register(UnitSummaryParent {
             gate: Some(Arc::new(Gate {
                 first: AtomicBool::new(true),
                 entered: entered_tx,
@@ -2326,12 +2806,12 @@ mod integration_tests {
             release_tx.send(()).unwrap();
             assert_eq!(a_thread.join().unwrap(), expected_a);
         });
-        let counters = concurrent.counters(UnitSetParent::ID);
+        let counters = concurrent.counters(UnitSummaryParent::ID);
         assert_eq!(counters.recomputed, 2);
         // A's late completion is retained at A. B's next demand sees A's
         // different child identity and recomputes at B.
         assert_eq!(counters.not_retainable, 0);
         assert_eq!(answer(&concurrent, &b), expected_b);
-        assert_eq!(concurrent.counters(UnitSetParent::ID).recomputed, 3);
+        assert_eq!(concurrent.counters(UnitSummaryParent::ID).recomputed, 3);
     }
 }

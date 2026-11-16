@@ -31,6 +31,8 @@ pub enum PythonHierarchyReason {
     UnresolvedBase,
     NonClassBase,
     ExternalBase,
+    ImplicitGenericUndecidedSourceBase,
+    ImplicitGenericUndecidedFactory,
     MissingRuntimeBases,
     ConflictingRuntimeBases,
     AmbiguousRuntimeBase,
@@ -51,6 +53,8 @@ impl PythonHierarchyReason {
             Self::UnresolvedBase => "unresolved_base",
             Self::NonClassBase => "non_class_base",
             Self::ExternalBase => "external_base",
+            Self::ImplicitGenericUndecidedSourceBase => "implicit_generic_undecided_source_base",
+            Self::ImplicitGenericUndecidedFactory => "implicit_generic_undecided_factory",
             Self::MissingRuntimeBases => "missing_runtime_bases",
             Self::ConflictingRuntimeBases => "conflicting_runtime_bases",
             Self::AmbiguousRuntimeBase => "ambiguous_runtime_base",
@@ -89,6 +93,9 @@ impl PythonBaseResolution {
 pub enum PythonBaseOrigin {
     Source,
     ImplicitObject,
+    ImplicitGeneric,
+    ImplicitGenericUndecided,
+    ImplicitGenericUndecidedFactory,
 }
 
 #[derive(Debug, Clone)]

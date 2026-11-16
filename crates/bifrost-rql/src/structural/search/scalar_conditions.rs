@@ -5,6 +5,7 @@
 //! or comparison-operator span. A missing scalar fact remains open.
 
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
+use brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict;
 use brokk_bifrost_core::analyzer::tree_walk::has_child_of_kind as has_direct_token;
 use brokk_bifrost_flow::scalar_state::{
     ScalarCallEffects, ScalarStateDerivation, ScalarTyping, declared_scalar_seeds, guard_decides,
@@ -15,6 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tree_sitter::Node;
 
+use super::EXECUTION_DEPENDENT;
 use crate::analyzer::declared_scalar::{
     csharp_declared_scalar_types, go_declared_scalar_types, rust_declared_scalar_types,
 };
@@ -728,6 +730,7 @@ pub(super) fn scalar_condition_outcomes(
     prepared: Arc<PreparedSyntaxTree>,
     cancellation: &CancellationToken,
     reference_receiver_calls: &[crate::analyzer::semantic::CallSiteId],
+    reuse: &mut ReuseVerdict,
 ) -> Result<ScalarConditionDerivation, ScalarConditionGap> {
     let result = derive_scalar_condition_outcomes(
         workspace,
@@ -736,6 +739,7 @@ pub(super) fn scalar_condition_outcomes(
         prepared,
         cancellation,
         reference_receiver_calls,
+        reuse,
     );
     let transient = |gap| {
         matches!(
@@ -760,6 +764,7 @@ pub(super) fn scalar_condition_outcomes(
             format!("policy.units unbounded origin={}:{} cause=scalar_condition gaps={gaps:?}", file!(), line!())
         });
         workspace.analyzer().mark_execution_dependent();
+        reuse.join_in(EXECUTION_DEPENDENT);
     }
     result
 }
@@ -771,6 +776,7 @@ fn derive_scalar_condition_outcomes(
     prepared: Arc<PreparedSyntaxTree>,
     cancellation: &CancellationToken,
     reference_receiver_calls: &[crate::analyzer::semantic::CallSiteId],
+    reuse: &mut ReuseVerdict,
 ) -> Result<ScalarConditionDerivation, ScalarConditionGap> {
     if cancellation.is_cancelled() {
         return Err(ScalarConditionGap::Cancelled);
@@ -780,19 +786,21 @@ fn derive_scalar_condition_outcomes(
             .map_err(|_| ScalarConditionGap::StaleSource)?;
     let language = prepared.dialect().language();
     let semantics = procedure.semantics();
-    if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+    if brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
         semantics
             .points()
             .len()
             .saturating_mul(semantics.values().len()),
         MAX_SCALAR_MATRIX_CELLS,
     )
-    .allows(0)
-        || !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+    .try_allow(0)
+    .is_err()
+        || brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
             semantics.control_edges().len(),
             MAX_SCALAR_CONTROL_EDGES,
         )
-        .allows(0)
+        .try_allow(0)
+        .is_err()
     {
         return Err(ScalarConditionGap::WorkLimit);
     }
@@ -828,6 +836,7 @@ fn derive_scalar_condition_outcomes(
             )
         });
         workspace.analyzer().mark_execution_dependent();
+        reuse.join_in(EXECUTION_DEPENDENT);
     }
     let before_exceptions = points_before_exit_only_exceptions(semantics);
     let vetoing_gaps = semantics
@@ -1073,11 +1082,12 @@ fn peel_parentheses(mut node: Node<'_>) -> Result<Node<'_>, ScalarConditionGap> 
     ) && node.named_child_count() == 1
     {
         layers += 1;
-        if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+        if brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
             layers,
             MAX_COMPOSED_NODES,
         )
-        .allows(0)
+        .try_allow(0)
+        .is_err()
         {
             return Err(ScalarConditionGap::WorkLimit);
         }
@@ -1658,11 +1668,12 @@ fn composed_leaves<'tree>(
     let mut visited = 0_usize;
     while let Some((node, entry)) = stack.pop() {
         visited += 1;
-        if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+        if brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
             visited,
             MAX_COMPOSED_NODES,
         )
-        .allows(0)
+        .try_allow(0)
+        .is_err()
         {
             return Err(ScalarConditionGap::WorkLimit);
         }
@@ -1715,11 +1726,12 @@ fn composed_leaves<'tree>(
             }
             ConditionShape::Leaf => leaves.push(ConditionLeaf { node, entry }),
         }
-        if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+        if brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
             stack.len().saturating_add(leaves.len()),
             MAX_COMPOSED_LEAVES,
         )
-        .allows(0)
+        .try_allow(0)
+        .is_err()
         {
             return Err(ScalarConditionGap::WorkLimit);
         }
@@ -1815,11 +1827,12 @@ impl ComposedConditions<'_> {
             let mut ascended = 0_usize;
             loop {
                 ascended += 1;
-                if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                if brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
                     ascended,
                     MAX_COMPOSED_NODES,
                 )
-                .allows(0)
+                .try_allow(0)
+                .is_err()
                 {
                     return Err(ScalarConditionGap::WorkLimit);
                 }
@@ -1840,11 +1853,12 @@ impl ComposedConditions<'_> {
                 };
                 ancestor = parent;
             }
-            if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+            if brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
                 groups.len(),
                 MAX_COMPOSED_CONDITIONS,
             )
-            .allows(0)
+            .try_allow(0)
+            .is_err()
             {
                 return Err(ScalarConditionGap::WorkLimit);
             }
@@ -2155,9 +2169,16 @@ mod gap_relevance_tests {
                 brokk_bifrost_core::analyzer::prepared_syntax::PreparedSourceOrigin::Disk,
                 None,
             ));
-            let derived =
-                scalar_condition_outcomes(&workspace, &file, &handle, prepared, &cancellation, &[])
-                    .expect("scalar conditions");
+            let derived = scalar_condition_outcomes(
+                &workspace,
+                &file,
+                &handle,
+                prepared,
+                &cancellation,
+                &[],
+                &mut ReuseVerdict::Content,
+            )
+            .expect("scalar conditions");
             assert_eq!(derived.outcomes.len(), 1, "{declaration}: {derived:?}");
             assert!(
                 matches!(
@@ -2224,6 +2245,7 @@ mod gap_relevance_tests {
                 .with(SemanticGapImpact::Aliasing),
             kind: SemanticGapKind::Unknown,
             budget: None,
+            dispatch: Default::default(),
             discharge: SemanticGapDischarge::None,
             detail: "test-only value uncertainty".into(),
             source: assignment.source,

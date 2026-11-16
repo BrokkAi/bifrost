@@ -196,6 +196,16 @@ pub trait JavaSource: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyProv
         unit: Option<&CodeUnit>,
         imports: &[ImportInfo],
     );
+
+    /// Whether `creation`'s own constructor call is proven to have no
+    /// applicable target. Such an erroneous creation has no value, so it
+    /// types no receiver (#10089). An undecided call is not refused.
+    fn creation_constructor_refused(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+        creation: Node<'_>,
+    ) -> bool;
 }
 
 // ---------------------------------------------------------------------------
@@ -1674,6 +1684,13 @@ pub fn java_callable_receiver_origin(node: Node<'_>) -> ResolutionCallableReceiv
             }
         }
     }
+}
+
+/// Whether a creation declares an anonymous class body.
+pub fn java_has_anonymous_class_body(node: Node<'_>) -> bool {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .any(|child| child.kind() == "class_body")
 }
 
 /// The enclosing instance of a qualified creation, selected from grammar children.

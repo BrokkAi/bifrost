@@ -30,7 +30,6 @@ use brokk_bifrost_analysis::analyzer::usages::get_type::TypeLookupStatus;
 use brokk_bifrost_analysis::analyzer::usages::get_type::TypeLookupType;
 
 use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
-
 use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisWork;
 
 use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit;
@@ -70,7 +69,7 @@ pub(crate) trait JavaReceiverQueryService {
         file: &ProjectFile,
         range: Range,
         input: ReceiverQueryInput,
-        budget: ReceiverAnalysisBudget,
+        ledger: &mut ReceiverWorkLedger,
         cancellation: Option<&CancellationToken>,
         indexed_source: Option<String>,
     ) -> Result<ReceiverQueryReport, ReceiverQueryError>;
@@ -84,7 +83,7 @@ impl JavaReceiverQueryService for ReceiverQueryService<'_> {
         file: &ProjectFile,
         range: Range,
         input: ReceiverQueryInput,
-        budget: ReceiverAnalysisBudget,
+        ledger: &mut ReceiverWorkLedger,
         cancellation: Option<&CancellationToken>,
         indexed_source: Option<String>,
     ) -> Result<ReceiverQueryReport, ReceiverQueryError> {
@@ -109,7 +108,6 @@ impl JavaReceiverQueryService for ReceiverQueryService<'_> {
             ));
         };
 
-        let mut ledger = ReceiverWorkLedger::new(budget);
         if !self.prepared_java_files.borrow().contains_key(file) {
             let Some(tree) = parse_tree_for_language(file, Language::Java, &source) else {
                 return Ok(unsupported_report(
@@ -177,7 +175,7 @@ impl JavaReceiverQueryService for ReceiverQueryService<'_> {
             range.start_byte,
             range.end_byte,
             cancellation,
-            &mut ledger,
+            ledger,
         )? {
             CompatibilityOutcome::Complete(Some(node)) => node,
             CompatibilityOutcome::Complete(None) => {
@@ -214,7 +212,7 @@ impl JavaReceiverQueryService for ReceiverQueryService<'_> {
             ReceiverQueryOperation::ReceiverTargets | ReceiverQueryOperation::MemberTargets
                 if input == ReceiverQueryInput::ContainingSite =>
             {
-                match java_receiver_at_site(input_node, cancellation, &mut ledger)? {
+                match java_receiver_at_site(input_node, cancellation, ledger)? {
                     CompatibilityOutcome::Complete(Some(receiver)) => receiver,
                     CompatibilityOutcome::Complete(None) => {
                         let mut report = unsupported_report(
@@ -265,7 +263,7 @@ impl JavaReceiverQueryService for ReceiverQueryService<'_> {
             }
         };
         let query_range = node_range(query_node);
-        let member_node = match java_member_node_at_site(input_node, cancellation, &mut ledger)? {
+        let member_node = match java_member_node_at_site(input_node, cancellation, ledger)? {
             CompatibilityOutcome::Complete(member) => member,
             CompatibilityOutcome::Exceeded(limit) => {
                 return Ok(budget_report(
@@ -310,7 +308,7 @@ impl JavaReceiverQueryService for ReceiverQueryService<'_> {
             ledger.remaining_budget(),
             cancellation,
         )?;
-        if let Some(limit) = charge_semantic_gate(&mut ledger, &semantic) {
+        if let Some(limit) = charge_semantic_gate(ledger, &semantic) {
             return Ok(budget_report(
                 operation,
                 site(
@@ -384,7 +382,7 @@ impl JavaReceiverQueryService for ReceiverQueryService<'_> {
                 ledger.remaining_budget(),
                 cancellation,
             );
-            let outcome = match charge_bounded_resolution(&mut ledger, outcome)? {
+            let outcome = match charge_bounded_resolution(ledger, outcome)? {
                 CompatibilityOutcome::Complete(outcome) => outcome,
                 CompatibilityOutcome::Exceeded(limit) => {
                     return Ok(budget_report(
@@ -445,7 +443,7 @@ impl JavaReceiverQueryService for ReceiverQueryService<'_> {
                 possible_candidates_suppressed: false,
                 points_to: None,
             };
-            report.cap_possible_candidates(ledger.remaining_budget().max_targets);
+            report.cap_possible_candidates(ledger);
             return Ok(report);
         }
 
@@ -458,7 +456,7 @@ impl JavaReceiverQueryService for ReceiverQueryService<'_> {
             ledger.remaining_budget(),
             cancellation,
         );
-        let mut type_outcome = match charge_bounded_resolution(&mut ledger, type_resolution)? {
+        let mut type_outcome = match charge_bounded_resolution(ledger, type_resolution)? {
             CompatibilityOutcome::Complete(outcome) => outcome,
             CompatibilityOutcome::Exceeded(limit) => {
                 return Ok(budget_report(
@@ -493,7 +491,7 @@ impl JavaReceiverQueryService for ReceiverQueryService<'_> {
         };
         if type_outcome.types.is_empty() {
             let receiver_owners =
-                current_receiver_owners(workspace, &points_to, cancellation, &mut ledger)?;
+                current_receiver_owners(workspace, &points_to, cancellation, ledger)?;
             let receiver_owners = match receiver_owners {
                 CompatibilityOutcome::Complete(owners) => owners,
                 CompatibilityOutcome::Exceeded(limit) => {
@@ -538,40 +536,39 @@ impl JavaReceiverQueryService for ReceiverQueryService<'_> {
             }
         }
         if type_outcome.types.is_empty() {
-            let context_node =
-                match java_contextual_type_node(query_node, cancellation, &mut ledger)? {
-                    CompatibilityOutcome::Complete(context_node) => context_node,
-                    CompatibilityOutcome::Exceeded(limit) => {
-                        return Ok(budget_report(
-                            operation,
-                            site(
-                                file,
-                                Language::Java,
-                                query_range,
-                                &prepared.source,
-                                query_node.kind(),
-                                member_name,
-                            ),
-                            ledger.work(),
-                            limit,
-                        ));
-                    }
-                    CompatibilityOutcome::Unavailable(reason) => {
-                        return Ok(unavailable_report(
-                            operation,
-                            site(
-                                file,
-                                Language::Java,
-                                query_range,
-                                &prepared.source,
-                                query_node.kind(),
-                                member_name,
-                            ),
-                            ledger.work(),
-                            reason,
-                        ));
-                    }
-                };
+            let context_node = match java_contextual_type_node(query_node, cancellation, ledger)? {
+                CompatibilityOutcome::Complete(context_node) => context_node,
+                CompatibilityOutcome::Exceeded(limit) => {
+                    return Ok(budget_report(
+                        operation,
+                        site(
+                            file,
+                            Language::Java,
+                            query_range,
+                            &prepared.source,
+                            query_node.kind(),
+                            member_name,
+                        ),
+                        ledger.work(),
+                        limit,
+                    ));
+                }
+                CompatibilityOutcome::Unavailable(reason) => {
+                    return Ok(unavailable_report(
+                        operation,
+                        site(
+                            file,
+                            Language::Java,
+                            query_range,
+                            &prepared.source,
+                            query_node.kind(),
+                            member_name,
+                        ),
+                        ledger.work(),
+                        reason,
+                    ));
+                }
+            };
             if let Some(context_node) = context_node {
                 let contextual = java_type_outcome_at(
                     self.analyzer,
@@ -582,7 +579,7 @@ impl JavaReceiverQueryService for ReceiverQueryService<'_> {
                     ledger.remaining_budget(),
                     cancellation,
                 );
-                type_outcome = match charge_bounded_resolution(&mut ledger, contextual)? {
+                type_outcome = match charge_bounded_resolution(ledger, contextual)? {
                     CompatibilityOutcome::Complete(outcome) => outcome,
                     CompatibilityOutcome::Exceeded(limit) => {
                         return Ok(budget_report(
@@ -636,7 +633,7 @@ impl JavaReceiverQueryService for ReceiverQueryService<'_> {
                 ledger.remaining_budget(),
                 cancellation,
             );
-            match charge_bounded_resolution(&mut ledger, factory_resolution)? {
+            match charge_bounded_resolution(ledger, factory_resolution)? {
                 CompatibilityOutcome::Complete(outcome) => (outcome.definitions.len() == 1)
                     .then(|| outcome.definitions.into_iter().next())
                     .flatten(),
@@ -684,7 +681,7 @@ impl JavaReceiverQueryService for ReceiverQueryService<'_> {
             ledger.remaining_budget(),
             cancellation,
         );
-        let type_reference = match charge_bounded_resolution(&mut ledger, type_resolution)? {
+        let type_reference = match charge_bounded_resolution(ledger, type_resolution)? {
             CompatibilityOutcome::Complete(outcome) => {
                 !outcome.definitions.is_empty()
                     && outcome.definitions.iter().all(CodeUnit::is_class)
@@ -731,7 +728,7 @@ impl JavaReceiverQueryService for ReceiverQueryService<'_> {
                     factory.as_slice(),
                     type_reference,
                     cancellation,
-                    &mut ledger,
+                    ledger,
                 )?;
                 let projection = match values {
                     CompatibilityOutcome::Complete(projection) => projection,
@@ -852,6 +849,9 @@ fn java_definition_at(
         budget,
         cancellation,
         DefinitionLookupOutcome {
+            selected_sites: Vec::new(),
+            inventory_evidence: None,
+            incomplete_evidence: None,
             modeled_definitions: Vec::new(),
             status: DefinitionLookupStatus::InvalidLocation,
             reference: None,
@@ -927,7 +927,15 @@ fn java_resolution_outcome_at<T>(
             work: ReceiverAnalysisWork::default(),
         };
     }
-    if budget.max_scope_nodes == 0 {
+    // Preprocessing charges one scope step. Its refusal is a budget stop like
+    // any other, so it marks this run's captures.
+    if brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+        0,
+        budget.max_scope_nodes,
+    )
+    .try_allow(1)
+    .is_err()
+    {
         return BoundedResolution::Exceeded {
             work: ReceiverAnalysisWork::default(),
             limit: ReceiverBudgetLimit::ScopeNodes,

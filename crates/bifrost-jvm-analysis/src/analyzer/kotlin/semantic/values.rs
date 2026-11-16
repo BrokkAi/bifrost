@@ -1028,6 +1028,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         member: Node<'tree>,
         source: Node<'tree>,
     ) -> KotlinAdaptationOutcome {
+        let base = self.bound_value(kotlin_unwrap_receiver(base));
+        self.receiver_member_adaptation(base, member, source)
+    }
+
+    /// The same carrier rule when the receiver is implicit in the syntax.
+    pub(in crate::analyzer::kotlin::semantic) fn receiver_member_adaptation(
+        &self,
+        base: Option<ValueId>,
+        member: Node<'tree>,
+        source: Node<'tree>,
+    ) -> KotlinAdaptationOutcome {
         let carried = self.expression_carrier(source);
         if carried.value_class().is_none() {
             return KotlinAdaptationOutcome::Unrelated;
@@ -1043,12 +1054,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
 
     /// The type the declaration behind `base`'s written type writes for
     /// `member`.
-    fn member_written_type(&self, base: Node<'tree>, member: Node<'tree>) -> Option<Node<'tree>> {
-        let base = kotlin_unwrap_receiver(base);
-        if base.kind() != "simple_identifier" {
-            return None;
-        }
-        let value = self.bound_value(base)?;
+    fn member_written_type(
+        &self,
+        base: Option<ValueId>,
+        member: Node<'tree>,
+    ) -> Option<Node<'tree>> {
+        let value = base?;
         let declared = self.declared_types.get(&value)?;
         let owner = self
             .value_classes

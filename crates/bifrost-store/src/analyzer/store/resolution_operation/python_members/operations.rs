@@ -163,12 +163,13 @@ impl<'query, 'store> PythonMutationQuery<'query, 'store> {
         })
     }
 
-    pub(crate) fn validate_current_use(&self) -> Result<()> {
+    /// Whether this operation still answers under its selected authority.
+    /// Reading the authority is not consuming mutation evidence, so this does
+    /// not certify the whole Python scope.
+    fn validate_current_authority(&self) -> Result<()> {
         if self.cancellation.is_cancelled() {
             return Err(StoreError::cancelled("Python mutation read cancelled"));
         }
-        self.read_reuse
-            .record_language_scope_read(brokk_bifrost_core::analyzer::Language::Python);
         let current = MutationAuthority::current(
             self.selection,
             self.authority.summary,
@@ -179,6 +180,13 @@ impl<'query, 'store> PythonMutationQuery<'query, 'store> {
                 "Python mutation inputs changed during the operation",
             ));
         }
+        Ok(())
+    }
+
+    pub(crate) fn validate_current_use(&self) -> Result<()> {
+        self.validate_current_authority()?;
+        self.read_reuse
+            .record_language_scope_read(brokk_bifrost_core::analyzer::Language::Python);
         Ok(())
     }
 
@@ -297,7 +305,8 @@ impl<'query, 'store> PythonMutationQuery<'query, 'store> {
                     containers=self.selection.connection().prepare_cached(
                         "SELECT provider.container_path FROM python_unit_summary_providers provider
                          JOIN resolution_unit_summary_members member ON member.summary_id=provider.summary_id AND member.member_ordinal=provider.member_ordinal
-                         WHERE provider.summary_id=?1 AND member.blob_id=?2 AND provider.state IN ('selected','alternative')")?
+ JOIN temp.selected_unit_member_mounts member_selected ON member_selected.summary_id=member.summary_id AND member_selected.member_ordinal=member.member_ordinal
+                         WHERE provider.summary_id=?1 AND member_selected.blob_id=?2 AND provider.state IN ('selected','alternative')")?
                         .query_map(rusqlite::params![self.authority.summary,mount.blob_id()],|row|row.get::<_,String>(0))?
                         .collect::<rusqlite::Result<Vec<_>>>()?;
                 }
@@ -374,6 +383,15 @@ impl<'query, 'store> PythonMutationQuery<'query, 'store> {
         })
     }
 
+    fn class_objects_may_be_mutated(&self, owners: &[SemanticId]) -> Result<bool> {
+        self.with_outcome(|outcome| {
+            Ok(outcome
+                .rows
+                .iter()
+                .any(|row| row.could_write_class_objects(owners)))
+        })
+    }
+
     pub(crate) fn preserves_import(
         &self,
         importer: &str,
@@ -433,9 +451,47 @@ impl crate::analyzer::store::resolution_typed::SelectedImplicitInputProvider
             return Err(StoreError::cancelled("implicit input read cancelled"));
         }
         if language == crate::analyzer::Language::Python {
-            self.mutations.validate_current_use()?;
+            self.mutations.validate_current_authority()?;
         }
         Ok(())
+    }
+
+    fn workspace_module_may_shadow(
+        &self,
+        name: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<bool> {
+        self.validate_current_use(Language::Python, cancellation)?;
+        self.mutations.validate_current_use()?;
+        // _Py_subscript_generic obtains typing._GenericAlias through normal
+        // import, despite using the interpreter's cached Generic object.
+        self.mutations.selection.connection().prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM python_unit_summary_providers
+             WHERE summary_id=?1 AND module_name=?2 AND state IN ('selected','alternative','open'))"
+        )?.query_row(rusqlite::params![self.environment(), name], |row| row.get(0))
+            .map_err(Into::into)
+    }
+
+    fn implicit_generic_factory_preserved(
+        &self,
+        factory: Option<SemanticId>,
+        cancellation: &CancellationToken,
+    ) -> Result<bool> {
+        self.validate_current_use(Language::Python, cancellation)?;
+        // CPython imports the factory by name; its implementation also reads
+        // Generic and Protocol from typing globals. Reuse mutation authority
+        // for both module bindings and the factory class object.
+        for name in ["_GenericAlias", "Generic", "Protocol"] {
+            if !self
+                .mutations
+                .preserves_import("typing", name, "typing", name)?
+            {
+                return Ok(false);
+            }
+        }
+        Ok(!self
+            .mutations
+            .class_objects_may_be_mutated(&factory.into_iter().collect::<Vec<_>>())?)
     }
 
     fn read_inputs(
@@ -585,7 +641,7 @@ impl ModuleMutation {
         if let Some(witness) = &self.witness {
             rules.mutations.validate_witness(witness)
         } else {
-            rules.mutations.validate_current_use()
+            rules.mutations.validate_current_authority()
         }
     }
 
@@ -681,11 +737,13 @@ pub(in crate::analyzer::store::resolution_operation) fn import_rows(
     blob: i64,
     site: u32,
 ) -> Result<Read<Vec<OperationRow>>> {
-    rules.mutations.validate_current_use()?;
+    rules.mutations.validate_current_authority()?;
     let imports=rules.ready.inventory.connection().prepare_cached(
         "SELECT imported.target_container,coalesce(imported.requested_name,'') FROM python_unit_summary_imports imported
          JOIN resolution_unit_summary_members member ON member.summary_id=imported.summary_id AND member.member_ordinal=imported.member_ordinal
-         WHERE imported.summary_id=?1 AND member.blob_id=?2 AND imported.import_site=?3")?
+ JOIN temp.selected_unit_member_mounts member_selected ON member_selected.summary_id=member.summary_id AND member_selected.member_ordinal=member.member_ordinal
+ JOIN temp.surface_dense imported_site ON imported_site.blob_id=member_selected.blob_id AND imported_site.id_space=1 AND imported_site.surface_ordinal=imported.import_surface_ordinal
+         WHERE imported.summary_id=?1 AND member_selected.blob_id=?2 AND imported_site.dense_id=?3")?
         .query_map(rusqlite::params![rules.summary,blob,site], |row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     rules.mutations.with_outcome(|outcome| {
@@ -1093,7 +1151,11 @@ impl StructuralMutation {
         owner: SemanticId,
         name: &str,
     ) -> bool {
-        self.matches_name(name) && (self.classes.contains(&owner) || self.open_receiver)
+        self.matches_name(name) && self.could_write_class_objects(&[owner])
+    }
+
+    fn could_write_class_objects(&self, owners: &[SemanticId]) -> bool {
+        self.open_receiver || owners.iter().any(|owner| self.classes.contains(owner))
     }
 
     fn operation(&self, owners: &[SemanticId], witness: MutationWitness) -> OperationRow {
@@ -1434,42 +1496,20 @@ fn read_structural_mutations(
                                 let selected = if let Some(cached) = selected_import_containers.get(&key) {
                                     cached.clone()
                                 } else {
+                                    // Bind one authored import before visiting providers. Otherwise the
+                                    // planner can multiply every provider by every import in the summary.
                                     let selected = connection.prepare_cached(
-                                    "SELECT DISTINCT provider.container_path FROM python_unit_summary_imports imported
-                                     JOIN resolution_unit_summary_members member ON member.summary_id=imported.summary_id AND member.member_ordinal=imported.member_ordinal
-                                     JOIN python_binding_imports authored ON authored.blob_id=member.blob_id AND authored.import_site=imported.import_site
-                                     JOIN resolution_import_selectors selector ON selector.blob_id=authored.blob_id AND selector.site=authored.import_site
-                                     JOIN python_unit_summary_providers provider ON provider.summary_id=imported.summary_id AND provider.state IN ('selected','alternative')
-                                     WHERE imported.summary_id=?1 AND member.blob_id=?2 AND (NOT EXISTS(SELECT 1 FROM python_unit_summary_roots root WHERE root.summary_id=?1 AND root.authority='workspace') OR member.rel_path=(SELECT persisted_relative_path FROM temp.selected_resolution_mounts WHERE mount_ordinal=?4)) AND imported.import_site=?3
-                                     AND (NOT EXISTS(SELECT 1 FROM python_unit_summary_roots root WHERE root.summary_id=?1 AND root.authority='workspace')
-                                      OR provider.root_slot=(SELECT root_slot FROM python_unit_summary_providers target WHERE target.summary_id=imported.summary_id AND target.container_path=imported.target_container)) AND (
-                                      (authored.form=0 AND (provider.module_name=CASE WHEN EXISTS(SELECT 1 FROM resolution_root_import_segments prefix WHERE prefix.blob_id=authored.blob_id AND prefix.import_site=authored.import_site) THEN imported.module_name ELSE selector.source_name END
-                                        OR EXISTS(SELECT 1 FROM python_unit_summary_spellings spelling JOIN python_unit_summary_spellings full_spelling ON full_spelling.summary_id=spelling.summary_id AND full_spelling.source_root=spelling.source_root
-                                          WHERE spelling.summary_id=imported.summary_id AND spelling.target_container=provider.container_path AND spelling.admitted AND full_spelling.admitted AND full_spelling.module_name=imported.module_name AND full_spelling.target_container=imported.target_container
-                                          AND spelling.module_name=CASE WHEN EXISTS(SELECT 1 FROM resolution_root_import_segments prefix WHERE prefix.blob_id=authored.blob_id AND prefix.import_site=authored.import_site) THEN imported.module_name ELSE selector.source_name END
-                                          AND NOT EXISTS(SELECT 1 FROM python_unit_summary_providers exact WHERE exact.summary_id=provider.summary_id AND exact.root_slot=provider.root_slot AND exact.module_name=spelling.module_name AND exact.state IN ('selected','alternative')))))
-                                      OR (authored.form=1 AND (provider.module_name=imported.module_name || '.' || imported.requested_name
-                                        OR EXISTS(SELECT 1 FROM python_unit_summary_spellings spelling JOIN python_unit_summary_spellings full_spelling ON full_spelling.summary_id=spelling.summary_id AND full_spelling.source_root=spelling.source_root
-                                          WHERE spelling.summary_id=imported.summary_id AND spelling.target_container=provider.container_path AND spelling.module_name=imported.module_name || '.' || imported.requested_name AND spelling.admitted
-                                            AND full_spelling.module_name=imported.module_name AND full_spelling.target_container=imported.target_container AND full_spelling.admitted))))"
+                                    PYTHON_STRUCTURAL_IMPORT_CONTAINERS_SQL
                                     )?.query_map(rusqlite::params![summary,blob,import.import_site.get(),mount], |row| row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
                                     selected_import_containers.insert(key, selected.clone());
                                     selected
                                 };
                                 let has_containers = !selected.is_empty();
                                 containers.extend(selected);
-                                let imported_builtins = connection.prepare_cached("SELECT EXISTS(SELECT 1 FROM python_unit_summary_imports imported
-                                     JOIN resolution_unit_summary_members member ON member.summary_id=imported.summary_id AND member.member_ordinal=imported.member_ordinal
-                                     WHERE imported.summary_id=?1 AND member.blob_id=?2 AND (NOT EXISTS(SELECT 1 FROM python_unit_summary_roots root WHERE root.summary_id=?1 AND root.authority='workspace') OR member.rel_path=(SELECT persisted_relative_path FROM temp.selected_resolution_mounts WHERE mount_ordinal=?4)) AND imported.import_site=?3 AND imported.module_name='builtins' AND imported.form='module')")?.query_row(
+                                let imported_builtins = connection.prepare_cached(PYTHON_STRUCTURAL_IMPORTED_BUILTINS_SQL)?.query_row(
                                     rusqlite::params![summary,blob,import.import_site.get(),mount], |row|row.get::<_,bool>(0))?;
                                 let cells=connection.prepare_cached(
-                                    "SELECT DISTINCT mounted.blob_id,mounted.mount_ordinal,imported.requested_name
-                                     FROM python_unit_summary_imports imported
-                                     JOIN resolution_unit_summary_members importer ON importer.summary_id=imported.summary_id AND importer.member_ordinal=imported.member_ordinal
-                                     JOIN python_unit_summary_providers provider ON provider.summary_id=imported.summary_id AND provider.container_path=imported.target_container AND provider.state IN ('selected','alternative')
-                                     JOIN resolution_unit_summary_members member ON member.summary_id=provider.summary_id AND member.member_ordinal=provider.member_ordinal
-                                     JOIN temp.selected_resolution_mounts mounted ON mounted.blob_id=member.blob_id AND mounted.persisted_relative_path=member.rel_path
-                                     WHERE imported.summary_id=?1 AND importer.blob_id=?2 AND (NOT EXISTS(SELECT 1 FROM python_unit_summary_roots root WHERE root.summary_id=?1 AND root.authority='workspace') OR importer.rel_path=(SELECT persisted_relative_path FROM temp.selected_resolution_mounts WHERE mount_ordinal=?4)) AND imported.import_site=?3 AND imported.form='from'")?
+                                    PYTHON_STRUCTURAL_IMPORTED_CELLS_SQL)?
                                     .query_map(rusqlite::params![summary,blob,import.import_site.get(),mount],|row|Ok(StructuralAlias::ModuleCell(row.get(0)?,row.get(1)?,row.get(2)?)))?
                                     .collect::<rusqlite::Result<Vec<_>>>()?;
                                 if !has_containers && !imported_builtins && cells.is_empty() {
@@ -1589,25 +1629,85 @@ pub(in crate::analyzer::store::resolution_operation) fn dynamic_receiver_obligat
     dynamic_receiver_query_obligation(mutations).map(|obligation| obligation.to_string())
 }
 
+pub(in crate::analyzer::store) const PYTHON_STRUCTURAL_IMPORT_CONTAINERS_SQL: &str = "WITH selected_import AS MATERIALIZED (
+                                     SELECT imported.summary_id, imported.target_container, imported.module_name, imported.requested_name,
+                                            authored.blob_id, authored.import_site, authored.form AS authored_form, selector.source_name
+                                     FROM python_binding_imports authored
+                                     CROSS JOIN resolution_import_selectors selector ON selector.blob_id=authored.blob_id AND selector.site=authored.import_site
+                                     CROSS JOIN temp.selected_unit_member_mounts member_selected ON member_selected.summary_id=?1 AND member_selected.blob_id=authored.blob_id
+                                     CROSS JOIN temp.surface_dense imported_site ON imported_site.blob_id=member_selected.blob_id AND imported_site.id_space=1 AND imported_site.dense_id=authored.import_site
+                                     CROSS JOIN python_unit_summary_imports imported ON imported.summary_id=member_selected.summary_id AND imported.member_ordinal=member_selected.member_ordinal AND imported.import_surface_ordinal=imported_site.surface_ordinal
+                                     WHERE authored.blob_id=?2 AND authored.import_site=?3
+                                       AND (NOT EXISTS(SELECT 1 FROM python_unit_summary_roots root WHERE root.summary_id=?1 AND root.authority='workspace') OR member_selected.rel_path=(SELECT persisted_relative_path FROM temp.selected_resolution_mounts WHERE mount_ordinal=?4))
+                                     )
+                                     SELECT DISTINCT provider.container_path FROM selected_import imported
+                                     CROSS JOIN python_unit_summary_providers provider ON provider.summary_id=imported.summary_id AND provider.state IN ('selected','alternative')
+                                     WHERE (NOT EXISTS(SELECT 1 FROM python_unit_summary_roots root WHERE root.summary_id=?1 AND root.authority='workspace')
+                                      OR provider.root_slot=(SELECT root_slot FROM python_unit_summary_providers target WHERE target.summary_id=imported.summary_id AND target.container_path=imported.target_container)) AND (
+                                      (imported.authored_form=0 AND (provider.module_name=CASE WHEN EXISTS(SELECT 1 FROM resolution_root_import_segments prefix WHERE prefix.blob_id=imported.blob_id AND prefix.import_site=imported.import_site) THEN imported.module_name ELSE imported.source_name END
+                                        OR EXISTS(SELECT 1 FROM python_unit_summary_spellings spelling JOIN python_unit_summary_spellings full_spelling ON full_spelling.summary_id=spelling.summary_id AND full_spelling.source_root=spelling.source_root
+                                          WHERE spelling.summary_id=imported.summary_id AND spelling.target_container=provider.container_path AND spelling.admitted AND full_spelling.admitted AND full_spelling.module_name=imported.module_name AND full_spelling.target_container=imported.target_container
+                                          AND spelling.module_name=CASE WHEN EXISTS(SELECT 1 FROM resolution_root_import_segments prefix WHERE prefix.blob_id=imported.blob_id AND prefix.import_site=imported.import_site) THEN imported.module_name ELSE imported.source_name END
+                                          AND NOT EXISTS(SELECT 1 FROM python_unit_summary_providers exact WHERE exact.summary_id=provider.summary_id AND exact.root_slot=provider.root_slot AND exact.module_name=spelling.module_name AND exact.state IN ('selected','alternative')))))
+                                      OR (imported.authored_form=1 AND (provider.module_name=imported.module_name || '.' || imported.requested_name
+                                        OR EXISTS(SELECT 1 FROM python_unit_summary_spellings spelling JOIN python_unit_summary_spellings full_spelling ON full_spelling.summary_id=spelling.summary_id AND full_spelling.source_root=spelling.source_root
+                                          WHERE spelling.summary_id=imported.summary_id AND spelling.target_container=provider.container_path AND spelling.module_name=imported.module_name || '.' || imported.requested_name AND spelling.admitted
+                                            AND full_spelling.module_name=imported.module_name AND full_spelling.target_container=imported.target_container AND full_spelling.admitted))))";
+
+pub(in crate::analyzer::store) const PYTHON_STRUCTURAL_IMPORTED_BUILTINS_SQL: &str = "WITH selected_import AS MATERIALIZED (
+                                     SELECT imported.module_name, imported.form
+                                     FROM temp.selected_unit_member_mounts member_selected
+                                     CROSS JOIN temp.surface_dense imported_site ON imported_site.blob_id=member_selected.blob_id AND imported_site.id_space=1 AND imported_site.dense_id=?3
+                                     CROSS JOIN python_unit_summary_imports imported ON imported.summary_id=member_selected.summary_id AND imported.member_ordinal=member_selected.member_ordinal AND imported.import_surface_ordinal=imported_site.surface_ordinal
+                                     WHERE member_selected.summary_id=?1 AND member_selected.blob_id=?2
+                                       AND (NOT EXISTS(SELECT 1 FROM python_unit_summary_roots root WHERE root.summary_id=?1 AND root.authority='workspace') OR member_selected.rel_path=(SELECT persisted_relative_path FROM temp.selected_resolution_mounts WHERE mount_ordinal=?4))
+                                     ) SELECT EXISTS(SELECT 1 FROM selected_import WHERE module_name='builtins' AND form='module')";
+
+pub(in crate::analyzer::store) const PYTHON_STRUCTURAL_IMPORTED_CELLS_SQL: &str = "WITH selected_import AS MATERIALIZED (
+                                     SELECT imported.summary_id, imported.target_container, imported.requested_name
+                                     FROM temp.selected_unit_member_mounts importer_selected
+                                     CROSS JOIN temp.surface_dense imported_site ON imported_site.blob_id=importer_selected.blob_id AND imported_site.id_space=1 AND imported_site.dense_id=?3
+                                     CROSS JOIN python_unit_summary_imports imported ON imported.summary_id=importer_selected.summary_id AND imported.member_ordinal=importer_selected.member_ordinal AND imported.import_surface_ordinal=imported_site.surface_ordinal
+                                     WHERE importer_selected.summary_id=?1 AND importer_selected.blob_id=?2
+                                       AND (NOT EXISTS(SELECT 1 FROM python_unit_summary_roots root WHERE root.summary_id=?1 AND root.authority='workspace') OR importer_selected.rel_path=(SELECT persisted_relative_path FROM temp.selected_resolution_mounts WHERE mount_ordinal=?4)) AND imported.form='from'
+                                     )
+                                     SELECT DISTINCT mounted.blob_id,mounted.mount_ordinal,imported.requested_name
+                                     FROM selected_import imported
+                                     CROSS JOIN python_unit_summary_providers provider ON provider.summary_id=imported.summary_id AND provider.container_path=imported.target_container AND provider.state IN ('selected','alternative')
+                                     CROSS JOIN resolution_unit_summary_members member ON member.summary_id=provider.summary_id AND member.member_ordinal=provider.member_ordinal
+                                     CROSS JOIN temp.selected_unit_member_mounts member_selected ON member_selected.summary_id=member.summary_id AND member_selected.member_ordinal=member.member_ordinal
+                                     CROSS JOIN temp.selected_resolution_mounts mounted ON mounted.blob_id=member_selected.blob_id AND mounted.persisted_relative_path=member.rel_path";
+
+// Keep both arms anchored to summary members before translating their blobs.
+// Otherwise SQLite can start with every blob in the selected generation.
 const ALL_STRUCTURAL_MUTATIONS_SQL: &str = "SELECT mounts.blob_id,op.receiver_reference,op.receiver_slot,op.name_kind,
                 (SELECT json_group_array(spelling) FROM python_member_operation_names WHERE operation=op.id),
                 mounts.mount_ordinal,op.site,op.form
-         FROM temp.selected_resolution_mounts mounts
-         JOIN resolution_unit_summary_members member ON member.summary_id=?1
-          AND member.blob_id=mounts.blob_id AND member.rel_path=mounts.persisted_relative_path
-         JOIN python_binding_source source ON source.blob_id=mounts.blob_id AND source.format=?2
-         JOIN python_member_operations op ON op.blob_id=mounts.blob_id AND op.effect IN (1,2)
+         FROM resolution_unit_summary_members member
+         CROSS JOIN temp.selected_unit_member_paths selected_member
+          ON member.summary_id=?1 AND selected_member.summary_id=member.summary_id
+         AND selected_member.member_ordinal=member.member_ordinal
+         CROSS JOIN temp.selected_resolution_mounts mounts
+          ON selected_member.mount_blob_id=mounts.blob_id
+         AND member.rel_path=mounts.persisted_relative_path
+         CROSS JOIN python_binding_source source ON source.blob_id=mounts.blob_id AND source.format=?2
+         CROSS JOIN python_member_operations op ON op.blob_id=mounts.blob_id AND op.effect IN (1,2)
          WHERE mounts.storage_language='python'
          UNION
          SELECT mounts.blob_id,receiver.source_site,writes.receiver,0,json_array(name.spelling),mounts.mount_ordinal,writes.site,7
-         FROM temp.selected_resolution_mounts mounts
-         JOIN resolution_unit_summary_members member ON member.summary_id=?1 AND member.blob_id=mounts.blob_id AND member.rel_path=mounts.persisted_relative_path
-         JOIN python_binding_source source ON source.blob_id=mounts.blob_id AND source.format=?2
-         JOIN python_member_receiver_writes writes ON writes.blob_id=mounts.blob_id
-         JOIN resolution_semantic_sites target ON target.blob_id=writes.blob_id AND target.source_site=writes.site AND target.semantic_role='reference'
-         JOIN resolution_reference_lookup_identities lookup ON lookup.blob_id=target.blob_id AND lookup.semantic_key=target.semantic_key
-         JOIN resolution_identities name ON name.id=lookup.identity_id
-         JOIN resolution_qualified_routes qualified ON qualified.blob_id=target.blob_id AND qualified.reference=target.semantic_key
+         FROM resolution_unit_summary_members member
+         CROSS JOIN temp.selected_unit_member_paths selected_member
+          ON member.summary_id=?1 AND selected_member.summary_id=member.summary_id
+         AND selected_member.member_ordinal=member.member_ordinal
+         CROSS JOIN temp.selected_resolution_mounts mounts
+          ON selected_member.mount_blob_id=mounts.blob_id
+         AND member.rel_path=mounts.persisted_relative_path
+         CROSS JOIN python_binding_source source ON source.blob_id=mounts.blob_id AND source.format=?2
+         CROSS JOIN python_member_receiver_writes writes ON writes.blob_id=mounts.blob_id
+         CROSS JOIN resolution_semantic_sites target ON target.blob_id=writes.blob_id AND target.source_site=writes.site AND target.semantic_role='reference'
+         CROSS JOIN resolution_reference_lookup_identities lookup ON lookup.blob_id=target.blob_id AND lookup.semantic_key=target.semantic_key
+         CROSS JOIN resolution_identities name ON name.id=lookup.identity_id
+         CROSS JOIN resolution_qualified_routes qualified ON qualified.blob_id=target.blob_id AND qualified.reference=target.semantic_key
          LEFT JOIN resolution_binding_projections projection ON projection.blob_id=qualified.blob_id AND projection.output_slot=qualified.qualifier_slot AND projection.kind<>2
          LEFT JOIN resolution_semantic_sites receiver ON receiver.blob_id=projection.blob_id AND receiver.semantic_key=projection.reference AND receiver.semantic_role='reference'
          WHERE mounts.storage_language='python'
@@ -1636,6 +1736,20 @@ mod tests {
         }
     }
     impl super::super::super::SelectedAnalyzerServices for MutationServices {
+        fn selected_read_recorder(
+            &self,
+        ) -> Option<crate::analyzer::store::selected_read::SelectedReadRecorder<'_>> {
+            None
+        }
+        fn record_selected_dependency(
+            &self,
+            _dependency: &crate::analyzer::store::selected_read::SelectedDependency,
+        ) -> crate::analyzer::store::Result<()> {
+            brokk_bifrost_core::analyzer::memo_attribution::ReadReuseRefusal::refuse_read_reuse(
+                self,
+            );
+            Ok(())
+        }
         fn declarations_named(
             &self,
             _: &crate::analyzer::ProjectFile,
@@ -1729,7 +1843,7 @@ mod tests {
             tx.execute("INSERT INTO python_member_operations(id,blob_id,site,name_site,form,effect,name_kind,receiver_reference) VALUES(9575,?1,100,101,1,1,0,102)", [blob]).unwrap();
             tx.execute("INSERT INTO python_member_operation_names(operation,ordinal,spelling) VALUES(9575,0,'before')", []).unwrap();
             tx.execute(
-                "INSERT INTO resolution_unit_summaries(summary_id,lang,unit_kind,unit_key,summary_digest,producer_epoch,derivation_version,complete,member_count,output_digest,publication_state) VALUES(9575,'python','python_environment',?1,?2,'9575-test',1,1,1,?3,'complete')",
+                "INSERT INTO resolution_unit_summaries(summary_id,lang,unit_kind,unit_key,summary_digest,producer_epoch,derivation_identity,complete,member_count,output_digest,publication_state) VALUES(9575,'python','python_environment',?1,?2,'9575-test',x'0101010101010101010101010101010101010101010101010101010101010101',1,1,?3,'complete')",
                 rusqlite::params![[3_u8;32].as_slice(),[4_u8;32].as_slice(),[5_u8;32].as_slice()],
             ).unwrap();
             tx.execute("INSERT INTO resolution_unit_summary_members(summary_id,member_ordinal,blob_id,rel_path,source_role) VALUES(9575,0,?1,'fixture.python','source')", [blob]).unwrap();

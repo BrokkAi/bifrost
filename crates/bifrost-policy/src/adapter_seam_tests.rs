@@ -32,7 +32,7 @@ impl TaintPolicyEvaluator for SiblingTaintAdapter {
             scope: None,
             projections: Vec::new(),
             completion: PolicyRunCompletion::Complete,
-            diagnostics: Vec::new(),
+            diagnostics: Vec::new().into(),
             diagnostics_truncated: false,
             work: PolicyWorkReport::default(),
             authored_arm_closures: Vec::new(),
@@ -70,7 +70,7 @@ impl TypestatePolicyEvaluator for SiblingTypestateAdapter {
         TypestateProjectionPayload {
             projections: Vec::new(),
             completion: PolicyRunCompletion::Complete,
-            diagnostics: Vec::new(),
+            diagnostics: Vec::new().into(),
             diagnostics_truncated: false,
             work: PolicyWorkReport::default(),
             subjects: None,

@@ -78,7 +78,7 @@ pub(crate) fn collect_csharp_semantic_diagnostics(
         analyzer,
         csharp,
         index: csharp.retained_external_index(),
-        overlay: analyzer.semantic_model_overlay(),
+        overlay: analyzer.semantic_model_overlay_read().published(),
         forward_sources_complete: OnceLock::new(),
         evidence: analyzer.dependency_discovery_evidence(Language::CSharp),
     };

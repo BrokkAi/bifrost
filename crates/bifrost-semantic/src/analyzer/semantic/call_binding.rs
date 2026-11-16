@@ -8,6 +8,27 @@ use crate::analyzer::semantic::CallArgumentExpansion;
 
 use crate::analyzer::semantic::SemanticCallArgument;
 
+/// Query-local proof emitted by a complete, unique invocation selection.
+/// Carriers must retain the selected callable and call identity with this proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FixedArrayInvocation;
+
+/// Specialize a declaration layout for the certified call only. No certificate
+/// means no change, including for languages with explicit variadic expansion.
+pub fn call_local_formal_layout(
+    mut layout: FormalParameterLayout,
+    fixed: Option<FixedArrayInvocation>,
+) -> FormalParameterLayout {
+    if fixed.is_some()
+        && let Some(slot) = layout.slots.last_mut()
+        && slot.variadic
+            == Some(crate::analyzer::semantic::lexical_definitions::FormalVariadicKind::Positional)
+    {
+        slot.variadic = None;
+    }
+    layout
+}
+
 /// The ordinary (non-receiver) formal slots of one callable, in declaration
 /// order, together with the rule that maps one actual onto one of them.
 ///

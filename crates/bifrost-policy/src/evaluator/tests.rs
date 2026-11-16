@@ -23,7 +23,7 @@ use serde_json::json;
 mod activated_flow_assertion;
 mod visible_policy_run;
 
-fn projected_binding_rows() -> (Vec<UnitRowItem>, Vec<UnitRowEvidence>) {
+pub(super) fn projected_binding_rows() -> (Vec<UnitRowItem>, Vec<UnitRowEvidence>) {
     use brokk_bifrost_rql::structural::search::{
         UnitRowItemProvenance, UnitRowItemProvenanceStep, UnitRowItemRef, UnitRowItemRefValue,
         UnitRowProvenanceRef, UnitRowProvenanceStep,
@@ -111,6 +111,7 @@ fn projected_binding_rows() -> (Vec<UnitRowItem>, Vec<UnitRowEvidence>) {
                 source_slice_sha256: Some([1; 32]),
             };
             let evidence = UnitRowEvidence {
+                call_path_evidence: None,
                 domain: DetailedCodeQueryDomain::Binding,
                 key: key.clone(),
                 rel_path: "main.rs".into(),
@@ -284,14 +285,7 @@ fn risk(rating: &str, refs: &[&str]) -> OrganizationalRiskAssessment {
     .unwrap()
 }
 
-fn classified_match_run(source: &str, budget: PolicyBudget) -> PolicyRun {
-    let temp = tempfile::tempdir().expect("temp dir");
-    let root = temp.path().canonicalize().expect("canonical root");
-    ProjectFile::new(root.clone(), "app.ts")
-        .write(source)
-        .expect("write source");
-    let analyzer = TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
-    let policy_source = r#"(policy
+const CLASSIFIED_MATCH_POLICY: &str = r#"(policy
           :id "test.classified-retention"
           :name "Classified retention"
           :message "Matched alpha"
@@ -305,9 +299,19 @@ fn classified_match_run(source: &str, budget: PolicyBudget) -> PolicyRun {
               (refinement
                 :when (analysis-type :is match)
                 :add [(classification-id :taxonomy "CWE" :id "CWE-1")])]))"#;
+
+fn classified_match_run(source: &str, budget: PolicyBudget) -> PolicyRun {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    ProjectFile::new(root.clone(), "app.ts")
+        .write(source)
+        .expect("write source");
+    let analyzer = TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+    let policy_source = CLASSIFIED_MATCH_POLICY;
     let registry = policy_registry("test:classified-retention", policy_source);
     let policy = registry.policies().next().unwrap();
     let context = PolicyEvaluationContext {
+        acceptance_hint: None,
         analyzer: &analyzer,
         workspace: None,
         flow_state: &brokk_bifrost_flow::FlowWorkspaceState::new(),
@@ -338,7 +342,7 @@ fn approximate_family_backstop_marks_every_match_finding_without_changing_identi
     let exact_bytes = serde_json::to_vec(&exact).unwrap();
     assert_eq!(
         serde_json::to_vec(
-            &mark_approximate_family_run(exact.clone(), Vec::new(), &budget).unwrap()
+            &mark_approximate_family_run(exact.clone(), Vec::new(), &budget, None,).unwrap()
         )
         .unwrap(),
         exact_bytes,
@@ -354,8 +358,9 @@ fn approximate_family_backstop_marks_every_match_finding_without_changing_identi
         selection_rule_id: "cargo-compatible-nearest".to_owned(),
         selection_rule_version: 1,
     };
-    let marked = mark_approximate_family_run(exact.clone(), vec![contributor.clone()], &budget)
-        .expect("the interim backstop fits its normal report budget");
+    let marked =
+        mark_approximate_family_run(exact.clone(), vec![contributor.clone()], &budget, None)
+            .expect("the interim backstop fits its normal report budget");
     assert_eq!(marked.completion(), exact.completion());
     assert_eq!(marked.findings().len(), exact.findings().len());
     for (marked, exact) in marked.findings().iter().zip(exact.findings()) {
@@ -370,9 +375,13 @@ fn approximate_family_backstop_marks_every_match_finding_without_changing_identi
         .unwrap()
         .build()
         .unwrap();
-    let detail_trimmed =
-        mark_approximate_family_run(exact.clone(), vec![contributor.clone()], &middle_budget)
-            .expect("zero-detail attribution fits with every finding retained");
+    let detail_trimmed = mark_approximate_family_run(
+        exact.clone(),
+        vec![contributor.clone()],
+        &middle_budget,
+        None,
+    )
+    .expect("zero-detail attribution fits with every finding retained");
     assert_eq!(detail_trimmed.findings().len(), exact.findings().len());
     assert_eq!(detail_trimmed.completion(), exact.completion());
     assert!(detail_trimmed.retained_size() <= middle_budget.max_retained_report_bytes());
@@ -403,9 +412,13 @@ fn approximate_family_backstop_marks_every_match_finding_without_changing_identi
         .unwrap()
         .build()
         .unwrap();
-    let fitting =
-        mark_approximate_family_run(exact.clone(), vec![contributor.clone()], &tight_budget)
-            .expect("retention keeps fitting marked findings");
+    let fitting = mark_approximate_family_run(
+        exact.clone(),
+        vec![contributor.clone()],
+        &tight_budget,
+        None,
+    )
+    .expect("retention keeps fitting marked findings");
     assert!(!fitting.findings().is_empty());
     assert!(fitting.findings().len() < exact.findings().len());
     assert!(fitting.work().omitted_findings_lower_bound() > 0);
@@ -424,7 +437,8 @@ fn approximate_family_backstop_marks_every_match_finding_without_changing_identi
         assert!(!attribution.contributors_complete);
         assert_eq!(attribution.omitted_at_least, 1);
     }
-    let marked_twice = mark_approximate_family_run(exact, vec![contributor], &budget).unwrap();
+    let marked_twice =
+        mark_approximate_family_run(exact, vec![contributor], &budget, None).unwrap();
     assert_eq!(
         serde_json::to_vec(&marked).unwrap(),
         serde_json::to_vec(&marked_twice).unwrap()
@@ -437,7 +451,7 @@ fn approximate_family_backstop_marks_every_match_finding_without_changing_identi
     causal.role = ModelAttributionRole::Declaration;
     causal.record_id = "selected-declaration".to_owned();
     let existing =
-        mark_approximate_family_run(marked_twice, vec![causal.clone()], &budget).unwrap();
+        mark_approximate_family_run(marked_twice, vec![causal.clone()], &budget, None).unwrap();
     assert!(existing.findings().iter().all(|finding| {
         let contributors = &finding.model_attribution().unwrap().contributors;
         contributors
@@ -477,9 +491,21 @@ fn pop_until_the_marked_run_fits(
             Err(_) => omitted += 1,
         }
     }
-    for _ in 0..omitted {
-        run.increment_omitted_findings();
+    // Independent slow oracle: try every finding with its marker first,
+    // then remove optional detail before the one-at-a-time drop loop.
+    run.replace_findings(retained.clone());
+    if run.validate_against_budget(budget).is_err() {
+        run.omit_optional_detail();
+        retained = run.take_findings();
     }
+    // Both prefix strategies clone the fixed shell before admitting a candidate;
+    // normalize its vector capacities so retained-byte accounting is comparable.
+    run = run.clone();
+    for _ in 0..omitted {
+        run.add_retention_omitted_findings(1);
+    }
+    // #12413: an unhinted attribution cut now keeps an ID-ordered prefix.
+    retained.sort_by_key(PolicyFinding::id);
     loop {
         run.replace_findings(retained.clone());
         if omitted > 0 {
@@ -494,16 +520,42 @@ fn pop_until_the_marked_run_fits(
             });
         }
         omitted += 1;
-        run.increment_omitted_findings();
+        run.add_retention_omitted_findings(1);
     }
 }
 
 #[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#12105: aggregate retention dropped findings before optional detail and obscured loss class"
+)]
 fn retention_fallback_keeps_the_longest_fitting_prefix_of_many_findings() {
     let source = "alpha();\n".repeat(120);
     let budget = PolicyBudget::default();
-    let exact = classified_match_run(&source, budget);
+    let mut exact = classified_match_run(&source, budget);
     assert_eq!(exact.findings().len(), 120);
+    // Exercise actual optional report detail, not only the mandatory match
+    // anchor. Round-trip through the strict reader to keep the fixture valid.
+    use serde::de::DeserializeSeed;
+    let detailed = exact
+        .take_findings()
+        .into_iter()
+        .map(|finding| {
+            let related = RelatedPolicyLocation::try_new(
+                PolicyLocationRelationship::Evidence,
+                finding.primary().clone(),
+                Vec::new(),
+            )
+            .unwrap()
+            .with_label("additional source context ".repeat(20))
+            .unwrap();
+            let mut wire = serde_json::to_value(&finding).unwrap();
+            wire["related"] = json!([related]);
+            crate::finding::PolicyFindingSeed::new(&budget)
+                .deserialize(wire)
+                .unwrap()
+        })
+        .collect();
+    exact.replace_findings(detailed);
     let contributor = read_dependency_contributor();
     let mut zero_detail = exact.clone();
     let zero_attribution = ModelAttribution::from_full(vec![contributor.clone()], 0);
@@ -518,32 +570,81 @@ fn retention_fallback_keeps_the_longest_fitting_prefix_of_many_findings() {
         .collect();
     zero_detail.replace_findings(marked);
     let full_size = zero_detail.retained_size();
+    let exact_ids = exact
+        .findings()
+        .iter()
+        .map(PolicyFinding::id)
+        .collect::<Vec<_>>();
     // Budgets from "one byte short of every finding" down to "about a third
     // of them" each need a different cut, and the cut must match the
     // one-at-a-time reference exactly.
+    let mut observed_detail_only = false;
+    let mut observed_finding_loss = false;
     for shortfall in [1, 7, full_size / 20, full_size / 3, full_size * 2 / 3] {
         let tight = PolicyBudget::builder()
             .with_max_retained_report_bytes(full_size - shortfall)
             .unwrap()
             .build()
             .unwrap();
-        let fitted = mark_approximate_family_run(exact.clone(), vec![contributor.clone()], &tight);
+        let fitted =
+            mark_approximate_family_run(exact.clone(), vec![contributor.clone()], &tight, None);
         let reference = pop_until_the_marked_run_fits(exact.clone(), &contributor, &tight);
         assert_eq!(fitted, reference, "shortfall {shortfall}");
         let fitted = fitted.unwrap();
-        assert!(fitted.findings().len() < exact.findings().len());
+        assert!(fitted.findings().len() <= exact.findings().len());
+        let causes = serde_json::to_value(fitted.diagnostic_causes()).unwrap();
+        let expected_cause = if fitted.work().omitted_findings_lower_bound() == 0 {
+            observed_detail_only = true;
+            assert_eq!(
+                serde_json::to_vec(
+                    &fitted
+                        .findings()
+                        .iter()
+                        .map(PolicyFinding::id)
+                        .collect::<Vec<_>>()
+                )
+                .unwrap(),
+                serde_json::to_vec(&exact_ids).unwrap(),
+                "detail truncation preserves every identity byte"
+            );
+            "detail_retention"
+        } else {
+            observed_finding_loss = true;
+            "finding_retention"
+        };
+        assert!(
+            causes
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|cause| cause["code"] == "report_retention_budget"
+                    && cause["execution_cause"] == expected_cause),
+            "{causes}"
+        );
         assert_eq!(
             fitted.work().omitted_findings_lower_bound(),
             (exact.findings().len() - fitted.findings().len()) as u64,
         );
-        assert!(
-            fitted
-                .findings()
-                .windows(2)
-                .all(|pair| pair[0].id() < pair[1].id())
-        );
+        // #12413: cut selection is ID-ordered; report rendering remains location-ordered.
+        let mut selected_ids = fitted
+            .findings()
+            .iter()
+            .map(PolicyFinding::id)
+            .collect::<Vec<_>>();
+        selected_ids.sort();
+        let mut ordered_ids = exact_ids.clone();
+        ordered_ids.sort();
+        assert_eq!(selected_ids, ordered_ids[..fitted.findings().len()]);
         assert!(fitted.retained_size() <= tight.max_retained_report_bytes());
     }
+    assert!(
+        observed_detail_only,
+        "a small shortfall must shed detail before findings"
+    );
+    assert!(
+        observed_finding_loss,
+        "a forced small budget must report finding loss"
+    );
 }
 
 #[test]
@@ -553,7 +654,7 @@ fn invalid_model_attribution_propagates_instead_of_dropping_findings() {
     assert!(!exact.findings().is_empty());
     let mut invalid = read_dependency_contributor();
     invalid.selection_rule_id = "unknown-rule".to_owned();
-    let error = mark_approximate_family_run(exact, vec![invalid], &budget).unwrap_err();
+    let error = mark_approximate_family_run(exact, vec![invalid], &budget, None).unwrap_err();
     assert!(
         matches!(&error, PolicyRunError::ModelAttributionRejected(message)
             if message.contains("InvalidModelAttribution")),
@@ -567,7 +668,7 @@ fn active_close_match_shard_marks_all_match_findings_and_keeps_completion() {
     let exact = classified_match_run("alpha();\nalpha();\n", budget);
     let exact_pack = crate::test_support::exact_rust_dependency_snapshot();
     let unchanged =
-        apply_approximate_family_backstop(exact.clone(), Some(exact_pack.as_ref()), &budget)
+        apply_approximate_family_backstop(exact.clone(), Some(exact_pack.as_ref()), &budget, None)
             .unwrap();
     assert_eq!(
         serde_json::to_vec(&unchanged).unwrap(),
@@ -576,7 +677,8 @@ fn active_close_match_shard_marks_all_match_findings_and_keeps_completion() {
     );
     let snapshot = crate::test_support::close_match_snapshot();
     let marked =
-        apply_approximate_family_backstop(exact.clone(), Some(snapshot.as_ref()), &budget).unwrap();
+        apply_approximate_family_backstop(exact.clone(), Some(snapshot.as_ref()), &budget, None)
+            .unwrap();
     assert_eq!(marked.completion(), exact.completion());
     assert_eq!(marked.findings().len(), exact.findings().len());
     for (before, after) in exact.findings().iter().zip(marked.findings()) {
@@ -592,7 +694,7 @@ fn active_close_match_shard_marks_all_match_findings_and_keeps_completion() {
     }
     let multi_y = crate::test_support::close_match_snapshot_with_versions(&["0.4.24", "0.4.25"]);
     let marked_multi_y =
-        apply_approximate_family_backstop(exact, Some(multi_y.as_ref()), &budget).unwrap();
+        apply_approximate_family_backstop(exact, Some(multi_y.as_ref()), &budget, None).unwrap();
     for finding in marked_multi_y.findings() {
         let attribution = finding.model_attribution().unwrap();
         assert_eq!(attribution.contributors.len(), 2);
@@ -797,11 +899,140 @@ impl TaintPolicyEvaluator for FakeTaintAdapter {
                 self.origins_truncated,
             )],
             completion: self.completion.clone(),
-            diagnostics: Vec::new(),
+            diagnostics: Vec::new().into(),
             diagnostics_truncated: false,
             work: PolicyWorkReport::default(),
             authored_arm_closures: Vec::new(),
         }
+    }
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#11829: direct evaluator and explanation dispatch bypassed policy-owned store failures"
+)]
+fn public_evaluator_owns_store_failure_and_recovers_in_a_new_evaluation() {
+    use brokk_bifrost_analysis::analyzer::i_analyzer::PolicyCompletionOwner;
+    use brokk_bifrost_analysis::analyzer::store::StoreError;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct FailingAdapter {
+        payload: FakeTaintAdapter,
+        fail_once: AtomicBool,
+        owners: Mutex<Vec<Option<Arc<PolicyCompletionOwner>>>>,
+    }
+    impl crate::projection::sealed::TaintAdapter for FailingAdapter {}
+    impl TaintPolicyEvaluator for FailingAdapter {
+        fn evaluate_taint(
+            &self,
+            authority: &TaintProjectionAuthority,
+            policy: &LoadedPolicy,
+            spec: &ResolvedTaintPolicySpec,
+            context: &PolicyEvaluationContext<'_>,
+            budget: &PolicyBudget,
+        ) -> TaintProjectionPayload {
+            self.owners
+                .lock()
+                .unwrap()
+                .push(PolicyCompletionOwner::current());
+            if self.fail_once.swap(false, Ordering::Relaxed) {
+                context
+                    .analyzer
+                    .record_query_failure(StoreError::new("first direct read"));
+                context
+                    .analyzer
+                    .record_query_failure(StoreError::new("second direct read"));
+            }
+            self.payload
+                .evaluate_taint(authority, policy, spec, context, budget)
+        }
+    }
+    let (_temp, analyzer) = assembly_analyzer();
+    let _request = brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::new(&analyzer);
+    assert!(PolicyCompletionOwner::current().is_none());
+    let registry = policy_registry("test:public-store-completion", taint_policy_source());
+    let policy = registry.policies().next().unwrap();
+    let flow_state = brokk_bifrost_flow::FlowWorkspaceState::new();
+    let context = PolicyEvaluationContext {
+        acceptance_hint: None,
+        analyzer: &analyzer,
+        workspace: None,
+        flow_state: &flow_state,
+        root_memo: None,
+        cancellation: None,
+        cvss_overlays: &[],
+        organizational_risk: &[],
+        incremental: None,
+        identifier_typos: None,
+    };
+    let payload = FakeTaintAdapter::complete(
+        "sink-direct-store",
+        vec![SourceScenarioId::try_new("test", "direct").unwrap()],
+        false,
+    );
+    let baseline = DefaultPolicyEvaluator::new()
+        .with_taint(&payload)
+        .evaluate(policy, &context, &mut PolicyBudget::default())
+        .unwrap();
+    assert!(baseline.completion().is_complete());
+    assert_eq!(baseline.findings().len(), 1);
+    let failing = FailingAdapter {
+        payload,
+        fail_once: AtomicBool::new(true),
+        owners: Mutex::default(),
+    };
+    let evaluator = DefaultPolicyEvaluator::new().with_taint(&failing);
+    let (failed, installations) = brokk_bifrost_analysis::analyzer::i_analyzer::with_policy_completion_install_counter_for_test(|| {
+        evaluator.evaluate(policy, &context, &mut PolicyBudget::default()).unwrap()
+    });
+    assert_eq!(installations, 1, "one owner for a direct evaluation");
+    assert!(matches!(
+        failed.completion(),
+        PolicyRunCompletion::Failed { .. }
+    ));
+    assert!(failed.findings().is_empty());
+    assert_eq!(failed.diagnostics().len(), 1);
+    assert!(
+        matches!(failed.diagnostics()[0].code(), PolicyDiagnosticCode::InternalError {
+        cause: crate::finding::PolicyInternalErrorCause::StoreRead, error, ..
+    } if error.contains("first direct read") && error.contains("second direct read"))
+    );
+    assert!(PolicyCompletionOwner::current().is_none());
+    let recovered = evaluator
+        .evaluate(policy, &context, &mut PolicyBudget::default())
+        .unwrap();
+    assert_eq!(
+        serde_json::to_vec(&recovered).unwrap(),
+        serde_json::to_vec(&baseline).unwrap()
+    );
+    let owners = failing.owners.lock().unwrap();
+    assert_eq!(owners.len(), 2);
+    let first = owners[0]
+        .as_ref()
+        .expect("the public entry owns the failed evaluation");
+    let second = owners[1]
+        .as_ref()
+        .expect("the public entry owns the healthy evaluation");
+    assert!(!Arc::ptr_eq(first, second));
+    assert_eq!(first.errors().len(), 2);
+    assert!(second.errors().is_empty());
+    drop(owners);
+    _request.record_store_error_for_test(StoreError::new("shared preparation before evaluation"));
+    for _ in 0..2 {
+        let failed = evaluator
+            .evaluate(policy, &context, &mut PolicyBudget::default())
+            .unwrap();
+        assert!(matches!(
+            failed.completion(),
+            PolicyRunCompletion::Failed { .. }
+        ));
+        assert!(failed.findings().is_empty());
+        assert!(
+            matches!(failed.diagnostics()[0].code(), PolicyDiagnosticCode::InternalError {
+            cause: crate::finding::PolicyInternalErrorCause::StoreRead, error, ..
+        } if error.contains("shared preparation before evaluation"))
+        );
     }
 }
 
@@ -812,6 +1043,7 @@ fn composed_taint_marks_all_findings_without_downgrading_complete_result() {
     let policy = registry.policies().next().unwrap();
     let flow_state = brokk_bifrost_flow::FlowWorkspaceState::new();
     let context = PolicyEvaluationContext {
+        acceptance_hint: None,
         analyzer: &analyzer,
         workspace: None,
         flow_state: &flow_state,
@@ -883,7 +1115,7 @@ impl TaintPolicyEvaluator for FailedBeforeProjectionTaintAdapter {
             completion: PolicyRunCompletion::Failed {
                 reasons: vec![PolicyFailureReason::InternalInvariant],
             },
-            diagnostics: vec![internal_failure_diagnostic("taint evaluation stopped")],
+            diagnostics: vec![internal_failure_diagnostic("taint evaluation stopped")].into(),
             diagnostics_truncated: false,
             work: PolicyWorkReport::default(),
             authored_arm_closures: Vec::new(),
@@ -915,6 +1147,7 @@ fn declared_subset_keeps_failed_match_and_taint_diagnostics() {
         &[],
         &[],
         &PolicyBudget::default(),
+        None,
     )
     .unwrap();
     assert!(matches!(
@@ -936,6 +1169,7 @@ fn declared_subset_keeps_failed_match_and_taint_diagnostics() {
     let taint_policy = taint_registry.policies().next().unwrap();
     let flow_state = brokk_bifrost_flow::FlowWorkspaceState::new();
     let context = PolicyEvaluationContext {
+        acceptance_hint: None,
         analyzer: &analyzer,
         workspace: None,
         flow_state: &flow_state,
@@ -1013,6 +1247,7 @@ fn typestate_compilation_incompleteness_remains_typed_and_non_clean() {
         .evaluate(
             policy,
             &PolicyEvaluationContext {
+                acceptance_hint: None,
                 analyzer: &analyzer,
                 workspace: None,
                 flow_state: &brokk_bifrost_flow::FlowWorkspaceState::new(),
@@ -1059,6 +1294,7 @@ fn active_close_match_shard_preserves_typestate_completion_and_exact_only_bytes(
     let adapter = IncompleteTypestateAdapter;
     let flow_state = brokk_bifrost_flow::FlowWorkspaceState::new();
     let context = PolicyEvaluationContext {
+        acceptance_hint: None,
         analyzer: &analyzer,
         workspace: None,
         flow_state: &flow_state,
@@ -1119,7 +1355,7 @@ fn duplicate_taint_projection_fails_but_preserves_unrelated_strong_positive() {
         scope: None,
         projections: vec![duplicate.clone(), unique, duplicate],
         completion: PolicyRunCompletion::Complete,
-        diagnostics: Vec::new(),
+        diagnostics: Vec::new().into(),
         diagnostics_truncated: false,
         work: PolicyWorkReport::default(),
         authored_arm_closures: Vec::new(),
@@ -1129,6 +1365,7 @@ fn duplicate_taint_projection_fails_but_preserves_unrelated_strong_positive() {
         &authority,
         batch,
         &PolicyEvaluationContext {
+            acceptance_hint: None,
             analyzer: &analyzer,
             workspace: None,
             flow_state: &brokk_bifrost_flow::FlowWorkspaceState::new(),
@@ -1166,6 +1403,7 @@ fn taint_assembly_keeps_cvss_scenario_display_joined_after_byte_truncation() {
     let adapter = FakeTaintAdapter::complete("sink-scenarios", scenarios, true);
     let evaluator = DefaultPolicyEvaluator::new().with_taint(&adapter);
     let context = PolicyEvaluationContext {
+        acceptance_hint: None,
         analyzer: &analyzer,
         workspace: None,
         flow_state: &brokk_bifrost_flow::FlowWorkspaceState::new(),
@@ -1219,6 +1457,9 @@ fn taint_assembly_keeps_cvss_scenario_display_joined_after_byte_truncation() {
 }
 
 #[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#12105: successful attribution detail shedding must retain a run-level cause"
+)]
 fn taint_finding_that_fits_sheds_attribution_detail_instead_of_dropping() {
     let (_temp, analyzer) = assembly_analyzer();
     let registry = policy_registry("test:taint-assembly", taint_policy_source());
@@ -1247,6 +1488,7 @@ fn taint_finding_that_fits_sheds_attribution_detail_instead_of_dropping() {
     assert_eq!(zero_detail.omitted_at_least, 3);
     zero_detail.validate().unwrap();
     let context = PolicyEvaluationContext {
+        acceptance_hint: None,
         analyzer: &analyzer,
         workspace: None,
         flow_state: &brokk_bifrost_flow::FlowWorkspaceState::new(),
@@ -1273,7 +1515,7 @@ fn taint_finding_that_fits_sheds_attribution_detail_instead_of_dropping() {
                 scope: None,
                 projections: vec![projection],
                 completion: PolicyRunCompletion::Complete,
-                diagnostics: Vec::new(),
+                diagnostics: Vec::new().into(),
                 diagnostics_truncated: false,
                 work: PolicyWorkReport::default(),
                 authored_arm_closures: Vec::new(),
@@ -1314,7 +1556,21 @@ fn taint_finding_that_fits_sheds_attribution_detail_instead_of_dropping() {
             .is_budget_limit_exceeded()
     );
     let run = assemble(Some(full), &budget);
-    assert_eq!(run.completion(), &PolicyRunCompletion::Complete);
+    assert!(
+        matches!(run.completion(), PolicyRunCompletion::Inconclusive { reasons, .. }
+        if reasons == &[PolicyIncompleteReason::ReportRetentionBudget])
+    );
+    assert!(
+        run.diagnostic_causes()
+            .iter()
+            .any(|cause| cause.execution_cause()
+                == crate::finding::PolicyDiagnosticExecutionCause::DetailRetention)
+    );
+    assert!(
+        run.budget_refusals()
+            .iter()
+            .any(|lane| lane == "policy/retained_report_bytes")
+    );
     assert_eq!(run.work().omitted_findings_lower_bound(), 0);
     assert_eq!(run.findings().len(), 1);
     assert_eq!(run.findings()[0].id(), base.id());
@@ -1352,12 +1608,13 @@ fn terminal_adapter_completion_survives_secondary_overlay_budget() {
             completion: PolicyRunCompletion::Failed {
                 reasons: vec![PolicyFailureReason::WorkspaceIo],
             },
-            diagnostics: Vec::new(),
+            diagnostics: Vec::new().into(),
             diagnostics_truncated: false,
             work: PolicyWorkReport::default(),
             authored_arm_closures: Vec::new(),
         }),
         &PolicyEvaluationContext {
+            acceptance_hint: None,
             analyzer: &analyzer,
             workspace: None,
             flow_state: &brokk_bifrost_flow::FlowWorkspaceState::new(),
@@ -1563,8 +1820,8 @@ fn classified_match_run_over_findings_cap_names_the_truncation() {
         run.diagnostics().iter().any(|diagnostic| matches!(
             diagnostic.code(),
             PolicyDiagnosticCode::CodeQuery {
-                code: CodeQueryDiagnosticCode::ResultLimitReached
-            }
+                code
+            } if code.raw_code() == CodeQueryDiagnosticCode::ResultLimitReached
         )),
         "diagnostics: {:?}",
         run.diagnostics()
@@ -1588,6 +1845,9 @@ fn scenario_display_prefix_selection_is_logarithmic_and_maximal() {
 }
 
 #[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#11321: refusal telemetry was added after selecting a byte-bounded run"
+)]
 fn aggregate_report_cap_omits_a_stable_finding_prefix() {
     let single_source = r#"export function run() {
     alpha();
@@ -1603,6 +1863,13 @@ fn aggregate_report_cap_omits_a_stable_finding_prefix() {
         .unwrap();
     let single = classified_match_run(single_source, single_budget);
     assert!(single.findings().is_empty());
+    assert!(single.retained_size() <= single_cap);
+    assert!(
+        single
+            .budget_refusals()
+            .iter()
+            .any(|lane| lane == "policy/retained_report_bytes")
+    );
     assert_eq!(single.work().omitted_findings_lower_bound(), 1);
 
     let multi_source = r#"export function run() {
@@ -1620,19 +1887,20 @@ fn aggregate_report_cap_omits_a_stable_finding_prefix() {
         .unwrap();
     let multi = classified_match_run(multi_source, multi_budget);
     assert!(multi.findings().len() < multi_baseline.findings().len());
-    assert_eq!(
-        multi
-            .findings()
-            .iter()
-            .map(PolicyFinding::id)
-            .collect::<Vec<_>>(),
-        multi_baseline
-            .findings()
-            .iter()
-            .take(multi.findings().len())
-            .map(PolicyFinding::id)
-            .collect::<Vec<_>>()
-    );
+    assert!(multi.retained_size() <= multi_cap);
+    let mut baseline_ids = multi_baseline
+        .findings()
+        .iter()
+        .map(PolicyFinding::id)
+        .collect::<Vec<_>>();
+    baseline_ids.sort();
+    let mut retained_ids = multi
+        .findings()
+        .iter()
+        .map(PolicyFinding::id)
+        .collect::<Vec<_>>();
+    retained_ids.sort();
+    assert_eq!(retained_ids, baseline_ids[..retained_ids.len()].to_vec(),);
     assert!(matches!(
         multi.completion(),
         PolicyRunCompletion::Inconclusive { reasons, .. }
@@ -1692,6 +1960,10 @@ fn cvss_overlay_hash_uses_canonical_labels_and_utc_time() {
 #[test]
 fn broad_advisory_stays_complete_and_untruncated_capability_gap_is_inconclusive() {
     let broad = CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        has_non_utf8_refusal: false,
+        refusal_sites: Default::default(),
+        call_relation_facts: None,
+        uses_omissions: Vec::new(),
         incompleteness: brokk_bifrost_rql::Incompleteness::Content,
         related: Vec::new(),
         source: None,
@@ -1705,6 +1977,44 @@ fn broad_advisory_stays_complete_and_untruncated_capability_gap_is_inconclusive(
     });
     assert!(certainty_reasons(std::slice::from_ref(&broad), &[]).is_empty());
     assert!(incomplete_reasons(&CodeQueryCompletion::Complete).is_empty());
+    for (code, label) in [
+        (
+            CodeQueryDiagnosticCode::UsesCandidateUnavailable,
+            "uses_candidate_unavailable",
+        ),
+        (
+            CodeQueryDiagnosticCode::UsesCandidateIncomplete,
+            "uses_candidate_incomplete",
+        ),
+        (
+            CodeQueryDiagnosticCode::UsesCandidateUnresolved,
+            "uses_candidate_unresolved",
+        ),
+        (
+            CodeQueryDiagnosticCode::UsesReferenceProjectionMissing,
+            "uses_projection_missing",
+        ),
+        (
+            CodeQueryDiagnosticCode::UsesDefinitionProjectionMissing,
+            "uses_projection_missing",
+        ),
+        (
+            CodeQueryDiagnosticCode::UsesInverseUnconfirmed,
+            "uses_inverse_unconfirmed",
+        ),
+        (
+            CodeQueryDiagnosticCode::UsesIndexedSourceUnavailable,
+            "uses_source_unavailable",
+        ),
+        (
+            CodeQueryDiagnosticCode::UsesTargetRangeUnavailable,
+            "uses_source_unavailable",
+        ),
+    ] {
+        let completion = CodeQueryCompletion::Incomplete { codes: vec![code] };
+        assert_eq!(incomplete_reasons(&completion)[0].label(), label);
+    }
+
     // A policy run drops the advisory entirely: it measures the execution that
     // raised it, and only a whole execution can raise it, so forwarding it
     // would make a sliced run and a full run differ in report bytes and at the
@@ -1728,7 +2038,7 @@ fn secondary_incomplete_cause_does_not_corrupt_terminal_completion() {
     let mut completion = PolicyRunCompletion::Failed {
         reasons: vec![PolicyFailureReason::WorkspaceIo],
     };
-    let mut diagnostics = Vec::new();
+    let mut diagnostics = PolicyDiagnostics::new();
     let mut diagnostics_truncated = false;
 
     record_run_incomplete(
@@ -1750,10 +2060,17 @@ fn secondary_incomplete_cause_does_not_corrupt_terminal_completion() {
 }
 
 #[test]
-fn rejected_query_diagnostic_marks_truncation_without_hiding_later_valid_diagnostics() {
+#[brokk_bifrost_test_macros::hardwon(
+    "#12312: diagnostic adaptation rejection was mislabeled as retention"
+)]
+fn rejected_query_diagnostic_fails_without_hiding_later_valid_diagnostics() {
     // Any forwarded code will do; deliberately not `broad_query`, which a
     // policy run drops before it can be rejected for its length.
     let rejected = CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        has_non_utf8_refusal: false,
+        refusal_sites: Default::default(),
+        call_relation_facts: None,
+        uses_omissions: Vec::new(),
         incompleteness: brokk_bifrost_rql::Incompleteness::Content,
         related: Vec::new(),
         source: None,
@@ -1766,6 +2083,10 @@ fn rejected_query_diagnostic_marks_truncation_without_hiding_later_valid_diagnos
         withheld_rows_path: None,
     });
     let valid = CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        has_non_utf8_refusal: false,
+        refusal_sites: Default::default(),
+        call_relation_facts: None,
+        uses_omissions: Vec::new(),
         incompleteness: brokk_bifrost_rql::Incompleteness::Content,
         related: Vec::new(),
         source: None,
@@ -1778,21 +2099,211 @@ fn rejected_query_diagnostic_marks_truncation_without_hiding_later_valid_diagnos
         withheld_rows_path: None,
     });
 
+    let execution = adapt_match_execution(
+        &PolicyId::new("test.diagnostic-adaptation").unwrap(),
+        BindingOutputClass::DirectOnly,
+        false,
+        None,
+        Vec::new(),
+        Vec::new(),
+        &[rejected.clone(), valid.clone()],
+        CodeQueryCompletion::Complete,
+        CodeQueryExecutionWork::default(),
+        None,
+        &PolicyBudget::default(),
+    );
+    assert!(
+        matches!(execution.completion, PolicyRunCompletion::Failed { ref reasons }
+        if reasons == &[PolicyFailureReason::InternalInvariant])
+    );
+    assert!(!execution.diagnostics_truncated);
+    assert!(execution.diagnostics.iter().any(|diagnostic| matches!(
+        diagnostic.code(),
+        PolicyDiagnosticCode::EvaluationFailure
+    )
+        && diagnostic.message().contains("UsesTargetsAmbiguous")
+        && diagnostic.message().contains("ProseTooLong")));
+    assert!(!execution.diagnostics.iter().any(|diagnostic| matches!(
+        diagnostic.code(),
+        PolicyDiagnosticCode::ReportRetentionBudget
+    )));
+    let registry = policy_registry(
+        "test:adapter-weak",
+        r#"(policy :id "test.diagnostic-adaptation"
+        :name "Adapter" :message "M" :severity warning
+        :analysis (analysis :type match :selector (rql (language rust (identifier)))))"#,
+    );
+    let policy = registry.policies().next().unwrap();
+    for cap in [0, 1] {
+        let budget = PolicyBudget::builder()
+            .with_max_diagnostics(cap)
+            .unwrap()
+            .build()
+            .unwrap();
+        let raised = if cap == 0 {
+            vec![rejected.clone()]
+        } else {
+            vec![rejected.clone(), valid.clone()]
+        };
+        let execution = adapt_match_execution(
+            &PolicyId::new("test.diagnostic-adaptation").unwrap(),
+            BindingOutputClass::DirectOnly,
+            false,
+            None,
+            Vec::new(),
+            Vec::new(),
+            &raised,
+            CodeQueryCompletion::Complete,
+            CodeQueryExecutionWork::default(),
+            None,
+            &budget,
+        );
+        assert!(execution.diagnostics_truncated);
+        let run = assemble_match_run(policy, execution, &[], &[], &budget, None).unwrap();
+        assert!(
+            run.budget_refusals()
+                .iter()
+                .any(|lane| lane == "policy/diagnostics")
+        );
+    }
+    let (items, mut evidence) = projected_binding_rows();
+    evidence[0].stable_owner_candidate = Some(CodeQueryStableOwnerCandidate::Derived {
+        namespace: "INVALID".into(),
+        derivation: CodeQueryStableOwnerDerivation::CanonicalAstIdentity,
+        semantic_key: "binding:test".into(),
+    });
+    for cap in [1, 256] {
+        let budget = PolicyBudget::builder()
+            .with_max_diagnostics(cap)
+            .unwrap()
+            .build()
+            .unwrap();
+        let evaluated = adapt_match_execution(
+            &policy.definition().metadata.id,
+            BindingOutputClass::BindingOfOnly,
+            false,
+            None,
+            items.clone(),
+            evidence.clone(),
+            std::slice::from_ref(&rejected),
+            CodeQueryCompletion::Complete,
+            CodeQueryExecutionWork::default(),
+            None,
+            &budget,
+        );
+        assert_eq!(evaluated.candidates.len(), 2);
+        assert!(
+            evaluated.candidates.iter().any(|candidate| matches!(
+                candidate.evidence.anchor(),
+                MatchFindingAnchor::Weak(_)
+            ))
+        );
+        let run = assemble_match_run(policy, evaluated, &[], &[], &budget, None).unwrap();
+        assert!(
+            matches!(run.completion(), PolicyRunCompletion::Failed { reasons } if reasons == &[PolicyFailureReason::InternalInvariant])
+        );
+        assert_eq!(run.findings().len(), 1);
+        assert_eq!(
+            run.findings()[0].identity_stability(),
+            FindingIdentityStability::Strong
+        );
+        assert_eq!(run.work().semantic_omitted_findings_lower_bound(), 1);
+        assert_eq!(run.work().retention_omitted_findings_lower_bound(), 0);
+        assert!(!run.diagnostics_truncated());
+        assert!(
+            run.diagnostics()
+                .iter()
+                .any(|d| d.message().contains("UsesTargetsAmbiguous")
+                    && d.message().contains("ProseTooLong"))
+        );
+        assert!(
+            !run.diagnostic_causes()
+                .iter()
+                .any(|cause| cause.code() == "report_retention_budget")
+        );
+    }
     let adapted = adapt_query_diagnostics(&[rejected, valid], 1, 64);
 
     assert!(adapted.adaptation_failed);
-    assert!(adapted.truncated);
+    assert!(!adapted.truncated);
+    assert_eq!(
+        adapted.diagnostics.worst_omitted_diagnostic_severity(),
+        None
+    );
     assert_eq!(adapted.diagnostics.len(), 1);
     assert_eq!(adapted.diagnostics[0].message(), "later valid diagnostic");
 }
 
 #[test]
 #[brokk_bifrost_test_macros::hardwon(
-    "#6638: repeated per-site diagnostics filled the retention cap and hid later distinct causes"
+    "#12312: oversized row-predicate diagnostics failed policy admission"
+)]
+fn bounded_row_predicate_diagnostic_remains_typed_incomplete() {
+    let sites = (0..512)
+        .map(|i| format!("statement-{i}: control evidence is incomplete"))
+        .collect::<Vec<_>>();
+    let message = brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+        format_args!("row predicate is undecided; withheld sites: {sites:?}"),
+        format_args!("row predicate is undecided; withheld sites"),
+        sites.iter(),
+    );
+    assert!(message.contains("total_items=512"));
+    assert!(message.contains("omitted_items="));
+    let diagnostic = CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        has_non_utf8_refusal: false,
+        refusal_sites: Default::default(),
+        incompleteness: brokk_bifrost_rql::Incompleteness::Content,
+        code: CodeQueryDiagnosticCode::RowPredicateUndecided,
+        impact: CodeQueryDiagnosticImpact::Incomplete,
+        related: Vec::new(),
+        source: None,
+        branch: Vec::new(),
+        language: "workspace",
+        message: message.clone(),
+        exhausted_roots: Vec::new(),
+        withheld_rows_path: Some("fixture.rs".into()),
+        call_relation_facts: None,
+        uses_omissions: Vec::new(),
+    });
+    let execution = adapt_match_execution(
+        &PolicyId::new("test.predicate-diagnostic").unwrap(),
+        BindingOutputClass::DirectOnly,
+        false,
+        None,
+        Vec::new(),
+        Vec::new(),
+        &[diagnostic],
+        CodeQueryCompletion::Incomplete {
+            codes: vec![CodeQueryDiagnosticCode::RowPredicateUndecided],
+        },
+        CodeQueryExecutionWork::default(),
+        None,
+        &PolicyBudget::default(),
+    );
+    assert!(
+        matches!(execution.completion, PolicyRunCompletion::Inconclusive { ref reasons, .. }
+        if !reasons.contains(&PolicyIncompleteReason::ReportRetentionBudget))
+    );
+    assert!(!execution.diagnostics_truncated);
+    assert_eq!(execution.diagnostics.len(), 1);
+    assert!(matches!(
+        execution.diagnostics[0].code(),
+        PolicyDiagnosticCode::CodeQuery { .. }
+    ));
+    assert_eq!(execution.diagnostics[0].message(), message);
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#6638+#12936: repeated refusals must retain bounded subjects without changing admission"
 )]
 fn retained_query_diagnostics_are_a_function_of_the_set_raised() {
     let diagnostic = |message: &str| {
         CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            has_non_utf8_refusal: false,
+            refusal_sites: Default::default(),
+            call_relation_facts: None,
+            uses_omissions: Vec::new(),
             incompleteness: brokk_bifrost_rql::Incompleteness::Operational(
                 brokk_bifrost_rql::DiagnosticExecutionCause::Provider,
             ),
@@ -1807,6 +2318,113 @@ fn retained_query_diagnostics_are_a_function_of_the_set_raised() {
             withheld_rows_path: None,
         })
     };
+    // Refusal subjects preserve that same set and admission at every evidence
+    // cap, including zero. Reversed producer order must keep the same sites.
+    let mut subjects = (0..5).rev().map(|offset| {
+        let mut value = diagnostic("call_bindings did not establish complete actual-to-formal coverage");
+        let source = brokk_bifrost_rql::structural::CodeQuerySourceSpan {
+            path: if offset == 4 { "z.py" } else { "a.py" }.into(),
+            range: brokk_bifrost_rql::structural::CodeQueryRange {
+                start_line: 1, start_column: offset + 1,
+                end_line: 1, end_column: offset + 2,
+            },
+            start_byte: offset, end_byte: offset + 1,
+        };
+        // Query branches retain provenance without spending policy slots.
+        value.branch = vec![offset % 2];
+        value.source = Some(source.clone());
+        value.related = vec![brokk_bifrost_rql::structural::CodeQueryRelatedSource {
+            source, label: "call-binding refusal: binding=[UnresolvedTarget]; dispatch=Provider; receiver=Unknown".into(),
+        }];
+        value
+    }).collect::<Vec<_>>();
+    let baseline = adapt_query_diagnostics(
+        &[diagnostic(
+            "call_bindings did not establish complete actual-to-formal coverage",
+        )],
+        1,
+        0,
+    );
+    for cap in [0, 1, 2, 4, 8] {
+        let result = adapt_query_diagnostics(&subjects, 1, cap);
+        assert_eq!(result.diagnostics.len(), 1);
+        assert_eq!(result.truncated, baseline.truncated);
+        assert_eq!(result.budget_refusals, baseline.budget_refusals);
+        assert_eq!(result.adaptation_failed, baseline.adaptation_failed);
+        assert_eq!(result.diagnostics.causes(), baseline.diagnostics.causes());
+        let json = serde_json::to_value(&result.diagnostics[0]).unwrap();
+        let primary = result.diagnostics[0].primary().expect("first refused call");
+        assert_eq!(primary.path(), "a.py");
+        assert_eq!(primary.byte_span().unwrap().start(), 0);
+        assert_eq!(result.diagnostics[0].related().len(), cap.min(4));
+        assert_eq!(
+            json["omitted_related_locations_lower_bound"],
+            4usize.saturating_sub(cap)
+        );
+        assert!(result.diagnostics[0].message().contains("UnresolvedTarget"));
+        subjects.reverse();
+        let rerun = adapt_query_diagnostics(&subjects, 1, cap);
+        assert_eq!(result.diagnostics, rerun.diagnostics);
+    }
+    // A capped family keeps the original locationless summary rather than
+    // attributing all its causes to one refusal. The cap decision stays the
+    // same. Invalid portable paths are omissions, never adaptation errors.
+    let mut mixed = subjects.clone();
+    for item in &mut mixed {
+        item.message.push_str(" another reason");
+    }
+    mixed.extend(subjects.iter().cloned());
+    let folded = adapt_query_diagnostics(&mixed, 1, 2);
+    assert!(folded.truncated);
+    assert_eq!(folded.diagnostics.len(), 1);
+    assert!(folded.diagnostics[0].primary().is_none());
+    assert!(folded.diagnostics[0].related().is_empty());
+    assert!(folded.diagnostics[0].refusal_omissions().is_none());
+    // Another cause can lose related evidence during the same family fold.
+    // Attaching the refusal subset must not replace Unknown with an exact zero.
+    let mut other = diagnostic("another semantic analysis gap");
+    other.related = subjects
+        .iter()
+        .take(2)
+        .map(|value| {
+            let mut related = value.related[0].clone();
+            related.label = "other protocol evidence".into();
+            related
+        })
+        .collect();
+    let refused = subjects[0].clone();
+    let expected = adapt_query_diagnostics(
+        &[crate::evaluator::refusal_identity(&refused), other.clone()],
+        1,
+        2,
+    );
+    let mixed_family = adapt_query_diagnostics(&[refused, other], 1, 2);
+    assert_eq!(mixed_family.diagnostics, expected.diagnostics);
+    assert_eq!(mixed_family.truncated, expected.truncated);
+    assert_eq!(mixed_family.budget_refusals, expected.budget_refusals);
+    let aggregate = &mixed_family.diagnostics[0];
+    assert!(aggregate.primary().is_none());
+    assert!(aggregate.related().is_empty());
+    assert!(aggregate.refusal_omissions().is_none());
+    assert_eq!(
+        aggregate.omitted_related_locations_lower_bound(),
+        crate::RelatedLocationOmissions::Unknown
+    );
+    for path in ["foo:bar.py", "aux.rs"] {
+        let mut invalid = subjects[0].clone();
+        invalid.source.as_mut().unwrap().path = path.into();
+        invalid.related[0].source.path = path.into();
+        let result = adapt_query_diagnostics(&[invalid], 1, 0);
+        assert!(!result.adaptation_failed);
+        assert!(!result.truncated);
+        assert!(result.diagnostics[0].message().contains("UnresolvedTarget"));
+        assert_eq!(result.budget_refusals, baseline.budget_refusals);
+        assert!(result.diagnostics[0].primary().is_none());
+        assert_eq!(
+            result.diagnostics[0].omitted_related_locations_lower_bound(),
+            crate::RelatedLocationOmissions::Known(1)
+        );
+    }
     let repeated = diagnostic("dispatch outcome=unknown");
     let later = diagnostic("dispatch outcome=unproven");
     // One producer raises one diagnostic per call site, so a run raises the
@@ -2045,6 +2663,74 @@ export function invoke(service: Service) { service.run(); }
 }
 
 #[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#12029: a dispatch-target finding id hashed the arm id, which folds the lever-scoped artifact fingerprint and the site's byte range"
+)]
+fn dispatch_target_finding_id_is_lever_and_position_free() {
+    // One dispatch-target row: its arm id, its positional site id (which is
+    // also its root id), its byte offset, and its target.
+    let finding_id = |arm_id: &str, site_id: &str, start: usize, target: &str| {
+        let key = DetailedCodeQueryKey::DispatchTarget {
+            id: arm_id.to_owned(),
+            site_id: site_id.to_owned(),
+            root_id: site_id.to_owned(),
+            ordinal: 0,
+            selection_key: target.to_owned(),
+        };
+        let item = UnitRowItem {
+            domain: DetailedCodeQueryDomain::DispatchTarget,
+            path: "src/lib.rs".into(),
+            range: Some(CodeQueryRange {
+                start_line: 1,
+                start_column: 1,
+                end_line: 1,
+                end_column: 6,
+            }),
+            evidence: None,
+            coverage: None,
+            fields: Vec::new(),
+            projected_field_names: Vec::new(),
+            unknown_fields: Vec::new(),
+            terminal: Some(UnitRowItemTerminal::SourcePosition),
+            provenance: Vec::new(),
+            provenance_truncated: false,
+        };
+        let evidence = UnitRowEvidence {
+            call_path_evidence: None,
+            domain: DetailedCodeQueryDomain::DispatchTarget,
+            key,
+            rel_path: "src/lib.rs".into(),
+            byte_span: Some(start..start + 5),
+            stable_owner_candidate: Some(CodeQueryStableOwnerCandidate::Declaration {
+                namespace: "rust".to_owned(),
+                id: format!("decl:v1:{}", "a".repeat(64)),
+            }),
+            identities: UnitRowIdentities::None,
+            source_slice_sha256: Some([0x42; 32]),
+            provenance: Vec::new(),
+        };
+        let adapted = adapt_match_candidates(
+            &PolicyId::new("test.dispatch-target-identity").unwrap(),
+            BindingOutputClass::DirectOnly,
+            vec![item],
+            vec![evidence],
+            &[],
+        );
+        assert!(!adapted.conversion_failed);
+        let [candidate] = adapted.candidates.as_slice() else {
+            panic!("one dispatch-target candidate: {:?}", adapted.candidates);
+        };
+        candidate.id
+    };
+    let before = finding_id("arm-1", "site-1", 0, "target-a");
+    // A lever rotation changes the arm id; lines inserted above the
+    // declaration move the site, which changes its positional id. Neither
+    // changes the finding.
+    assert_eq!(before, finding_id("arm-2", "site-2", 120, "target-a"));
+    assert_ne!(before, finding_id("arm-1", "site-1", 0, "target-b"));
+}
+
+#[test]
 fn source_backed_analysis_terminals_require_exact_callable_row_evidence() {
     fn row(domain: DetailedCodeQueryDomain) -> (UnitRowItem, UnitRowEvidence) {
         let key = match domain {
@@ -2053,6 +2739,7 @@ fn source_backed_analysis_terminals_require_exact_callable_row_evidence() {
                 site_id: "site-1".to_owned(),
                 root_id: "root-1".to_owned(),
                 ordinal: 0,
+                selection_key: "selection-1".to_owned(),
             },
             DetailedCodeQueryDomain::CallShape => DetailedCodeQueryKey::CallShape {
                 id: "shape-1".to_owned(),
@@ -2092,6 +2779,7 @@ fn source_backed_analysis_terminals_require_exact_callable_row_evidence() {
                 provenance_truncated: false,
             },
             UnitRowEvidence {
+                call_path_evidence: None,
                 domain,
                 key,
                 rel_path: "app.py".into(),
@@ -2205,6 +2893,7 @@ fn source_backed_analysis_terminals_require_exact_callable_row_evidence() {
                 source_slice_sha256: Some([0x42; 32]),
             };
             let evidence = UnitRowEvidence {
+                call_path_evidence: None,
                 domain: DetailedCodeQueryDomain::File,
                 key: DetailedCodeQueryKey::File,
                 rel_path: "app.py".into(),
@@ -2236,6 +2925,7 @@ fn source_backed_analysis_terminals_require_exact_callable_row_evidence() {
                 depth_answers: Vec::new(),
                 diagnostics: Vec::new(),
                 truncated: false,
+                reuse: Default::default(),
             };
             let encoded = serde_json::to_vec(&unit).unwrap();
             let unit: UnitExecutionResult = serde_json::from_slice(&encoded).unwrap();
@@ -2388,6 +3078,7 @@ fn source_backed_analysis_terminals_require_exact_callable_row_evidence() {
         (
             item.clone(),
             UnitRowEvidence {
+                call_path_evidence: None,
                 byte_span: None,
                 ..evidence.clone()
             },
@@ -2395,6 +3086,7 @@ fn source_backed_analysis_terminals_require_exact_callable_row_evidence() {
         (
             item.clone(),
             UnitRowEvidence {
+                call_path_evidence: None,
                 source_slice_sha256: None,
                 ..evidence.clone()
             },
@@ -2608,6 +3300,8 @@ fn direct_call_terminal_downgrades_proven_proof_when_caller_identity_is_unavaila
         row_projection: Vec::new(),
     };
     let evidence = DetailedCodeQueryEvidence {
+        selected_pattern_source: Default::default(),
+        call_path_evidence: None,
         result_index: 0,
         domain: DetailedCodeQueryDomain::CallSite,
         key: DetailedCodeQueryKey::CallSite {
@@ -2925,6 +3619,10 @@ fn advisory_ambiguity_only_lowers_findings_from_the_affected_set_branch() {
         steps: Vec::new(),
     };
     let diagnostic = CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        has_non_utf8_refusal: false,
+        refusal_sites: Default::default(),
+        call_relation_facts: None,
+        uses_omissions: Vec::new(),
         incompleteness: brokk_bifrost_rql::Incompleteness::Content,
         related: Vec::new(),
         source: None,
@@ -2949,6 +3647,8 @@ fn advisory_ambiguity_only_lowers_findings_from_the_affected_set_branch() {
 fn invalid_owner_candidate_forces_weak_anchor() {
     let file = ProjectFile::new(std::env::temp_dir(), "src/app.ts");
     let evidence = DetailedCodeQueryEvidence {
+        selected_pattern_source: Default::default(),
+        call_path_evidence: None,
         result_index: 0,
         domain: DetailedCodeQueryDomain::StructuralMatch,
         key: DetailedCodeQueryKey::StructuralMatch {
@@ -3001,6 +3701,8 @@ fn unicode_location_conversion_preserves_byte_and_codepoint_coordinates() {
 fn weak_key_is_domain_and_span_separated() {
     let file = ProjectFile::new(std::env::temp_dir(), "src/app.ts");
     let evidence = |span| DetailedCodeQueryEvidence {
+        selected_pattern_source: Default::default(),
+        call_path_evidence: None,
         result_index: 0,
         domain: DetailedCodeQueryDomain::StructuralMatch,
         key: DetailedCodeQueryKey::StructuralMatch {
@@ -3304,6 +4006,7 @@ fn modeled_python_ancestry_survives_unit_roundtrip_and_endpoint_free_projection(
                     provenance_truncated: false,
                 };
                 let detailed = UnitRowEvidence {
+                    call_path_evidence: None,
                     domain,
                     key,
                     rel_path: "app.py".into(),
@@ -3579,6 +4282,7 @@ fn declared_depth_completion_preserves_real_query_causes() {
             &[],
             query_completion,
             CodeQueryExecutionWork::default(),
+            None,
             &PolicyBudget::default(),
         )
         .completion
@@ -3652,6 +4356,7 @@ fn depth_consumer_keys_separate_shared_queries_in_both_orders() {
     let workspace = project.workspace_analyzer(AnalyzerConfig::default());
     let flow = brokk_bifrost_flow::FlowWorkspaceState::default();
     let context = PolicyEvaluationContext {
+        acceptance_hint: None,
         analyzer: workspace.analyzer(),
         workspace: Some(&workspace),
         flow_state: &flow,
@@ -3734,4 +4439,1117 @@ fn depth_consumer_keys_separate_shared_queries_in_both_orders() {
             assert_eq!(product.depth_answers.is_empty(), !opted_in);
         }
     }
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#11321: diagnostic retention hid work cuts and mislabeled related-location cuts"
+)]
+fn budget_telemetry_keeps_refusals_outside_the_diagnostic_cap() {
+    use brokk_bifrost_rql::structural::{
+        CodeQueryExhaustedRoot, CodeQueryRelatedSource, CodeQuerySourceSpan,
+    };
+    let mut diagnostic = CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        has_non_utf8_refusal: false,
+        refusal_sites: Default::default(),
+        uses_omissions: Vec::new(),
+        incompleteness: brokk_bifrost_rql::Incompleteness::Content,
+        code: CodeQueryDiagnosticCode::ExecutionBudgetExhausted,
+        impact: CodeQueryDiagnosticImpact::Incomplete,
+        branch: Vec::new(),
+        language: "workspace",
+        message: "cut".to_string(),
+        source: None,
+        related: Vec::new(),
+        withheld_rows_path: None,
+        exhausted_roots: vec![CodeQueryExhaustedRoot {
+            path: ".".to_string(),
+            procedure: None,
+            lane: "query/fact_nodes".to_string(),
+            stage: None,
+            budget: None,
+            charge: None,
+            feedback_iteration: None,
+        }],
+        call_relation_facts: None,
+    });
+    let adapted = adapt_query_diagnostics(&[diagnostic.clone()], 0, 64);
+    assert!(adapted.diagnostics.is_empty());
+    assert_eq!(
+        adapted.budget_refusals,
+        ["policy/diagnostics", "query/fact_nodes"]
+    );
+    let mut cancelled = diagnostic.clone();
+    cancelled.exhausted_roots[0].lane = "solver/cancelled".to_string();
+    let adapted = adapt_query_diagnostics(&[cancelled], 256, 64);
+    assert!(adapted.budget_refusals.is_empty());
+    diagnostic.code = CodeQueryDiagnosticCode::ResultLimitReached;
+    diagnostic.exhausted_roots.clear();
+    let adapted = adapt_query_diagnostics(&[diagnostic.clone()], 256, 64);
+    assert!(adapted.result_limit_reached);
+    assert!(adapted.budget_refusals.is_empty());
+    diagnostic.code = CodeQueryDiagnosticCode::QualifyingTypeUnresolved;
+    diagnostic.related.push(CodeQueryRelatedSource {
+        source: CodeQuerySourceSpan {
+            path: "main.py".to_string(),
+            range: CodeQueryRange {
+                start_line: 1,
+                start_column: 1,
+                end_line: 1,
+                end_column: 2,
+            },
+            start_byte: 0,
+            end_byte: 1,
+        },
+        label: "site".to_string(),
+    });
+    let diagnostic_budget = crate::budget::PolicyBudget::builder()
+        .with_max_related_locations_per_finding(0)
+        .unwrap()
+        .build()
+        .unwrap();
+    let adapted = adapt_query_diagnostics(
+        &[diagnostic],
+        diagnostic_budget.max_diagnostics(),
+        diagnostic_budget.max_related_locations_per_finding(),
+    );
+    assert!(adapted.truncated);
+    assert_eq!(
+        adapted.budget_refusals,
+        ["policy/related_locations_per_diagnostic"]
+    );
+    let loaded = crate::test_support::load_match_policy(
+        r#"(policy :id "test.diagnostic-retention" :name "Diagnostic retention"
+            :message "test" :severity warning
+            :analysis (analysis :type match :selector
+              (rql (language python (call :callee (name "eval"))))))"#,
+    );
+    let work = PolicyWorkReport::default().with_budget_refusals(&adapted.budget_refusals);
+    let run = crate::finding::PolicyRun::try_new(
+        loaded.definition().metadata.id.clone(),
+        loaded.semantic_hash(),
+        loaded.definition().analysis.analysis_type(),
+        PolicyRunCompletion::inconclusive(vec![PolicyIncompleteReason::ReportRetentionBudget])
+            .unwrap(),
+        Vec::new(),
+        adapted.diagnostics,
+        adapted.truncated,
+        work,
+        &diagnostic_budget,
+    )
+    .unwrap();
+    let json = serde_json::to_value(run).unwrap();
+    assert_eq!(json["findings"], serde_json::json!([]));
+    assert_eq!(
+        json["budget_refusals"],
+        serde_json::json!(["policy/related_locations_per_diagnostic"])
+    );
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#12105: upstream pointer source omissions lost their operational origin"
+)]
+fn pointer_source_omissions_survive_retained_projection_and_policy_caps() {
+    use brokk_bifrost_core::omission::OmissionCount;
+    use brokk_bifrost_rql::structural::search::{CodeQueryRustPointerFinding, CodeQuerySourceSpan};
+    let registry = policy_registry(
+        "test:pointer-omission",
+        r#"(policy
+        :id "test.pointer-omission" :name "Pointer omission" :message "Pointer access"
+        :severity warning :analysis (analysis :type match
+            :selector (rql (rust-pointer-findings (procedure-of (language rust (function)))))))"#,
+    );
+    let policy = registry.policies().next().unwrap();
+    let range = CodeQueryRange {
+        start_line: 1,
+        start_column: 1,
+        end_line: 1,
+        end_column: 6,
+    };
+    let mut ids = Vec::new();
+    for (upstream, limit, expected) in [
+        (OmissionCount::exact(0), 64, OmissionCount::exact(0)),
+        (
+            OmissionCount::lower_bound(1),
+            64,
+            OmissionCount::lower_bound(1),
+        ),
+        (OmissionCount::exact(0), 0, OmissionCount::exact(1)),
+        (
+            OmissionCount::lower_bound(1),
+            0,
+            OmissionCount::lower_bound(2),
+        ),
+    ] {
+        let row = CodeQueryRustPointerFinding {
+            id: "pointer-1".into(),
+            path: "sink.rs".into(),
+            language: "rust",
+            range,
+            source_ranges: vec![CodeQuerySourceSpan {
+                path: "source.rs".into(),
+                range,
+                start_byte: 0,
+                end_byte: 5,
+            }],
+            source_ranges_omitted: upstream,
+            relation: "access_invalid_pointer",
+            origin_id: "origin-1".into(),
+            origin_kind: "allocation",
+            invalidation_cause: Some("deallocated"),
+            access_kind: "read",
+            strength: "must",
+            path_proven: true,
+            bounds: "in_bounds",
+            byte_offset: Some("0".into()),
+            byte_extent: Some("8".into()),
+            access_width: Some("4".into()),
+            proof: "proven",
+            completeness: "complete",
+            reason: None,
+        };
+        let item = UnitRowItem::project(&CodeQueryResultItem {
+            value: CodeQueryResultValue::RustPointerFinding {
+                value: Box::new(row),
+            },
+            provenance: Vec::new(),
+            provenance_truncated: false,
+            row_projection: Vec::new(),
+        });
+        let item: UnitRowItem =
+            serde_json::from_slice(&serde_json::to_vec(&item).unwrap()).unwrap();
+        let evidence = UnitRowEvidence {
+            call_path_evidence: None,
+            domain: DetailedCodeQueryDomain::RustPointerFinding,
+            key: DetailedCodeQueryKey::RustPointerFinding {
+                id: "pointer-1".into(),
+            },
+            rel_path: "sink.rs".into(),
+            byte_span: Some(0..5),
+            stable_owner_candidate: None,
+            identities: UnitRowIdentities::Primary(None),
+            source_slice_sha256: Some([0x42; 32]),
+            provenance: Vec::new(),
+        };
+        let candidate = adapt_match_candidate(
+            &policy.definition().metadata.id,
+            item,
+            evidence,
+            &[],
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+        )
+        .unwrap();
+        let budget = PolicyBudget::builder()
+            .with_max_related_locations_per_finding(limit)
+            .unwrap()
+            .build()
+            .unwrap();
+        let run = assemble_match_run(
+            policy,
+            EvaluatedMatchPolicy {
+                candidates: vec![candidate],
+                completion: PolicyRunCompletion::Complete,
+                diagnostics: Vec::new().into(),
+                diagnostics_truncated: false,
+                work: PolicyWorkReport::default(),
+            },
+            &[],
+            &[],
+            &budget,
+            None,
+        )
+        .unwrap();
+        let [finding] = run.findings() else {
+            panic!("retain primary: {run:#?}")
+        };
+        ids.push(finding.id());
+        assert_eq!(finding.related_locations_omitted(), expected);
+        if !upstream.is_empty() {
+            let causes = serde_json::to_value(run.diagnostic_causes()).unwrap();
+            assert!(
+                causes.as_array().unwrap().iter().any(|cause| {
+                    cause["code"] == "evaluation_failure" && cause["execution_cause"] == "budget"
+                }),
+                "upstream evidence retention must stay operational: {causes}"
+            );
+        }
+        assert_eq!(finding.related_truncated(), !expected.is_empty());
+        assert_eq!(finding.related().len(), usize::from(limit > 0));
+        if !expected.is_empty() {
+            assert!(
+                matches!(finding.completeness(), FindingCompleteness::Partial { reasons }
+                if reasons.contains(&FindingIncompleteReason::RelatedLocationsTruncated))
+            );
+            assert!(!matches!(run.completion(), PolicyRunCompletion::Complete));
+        }
+        assert_eq!(
+            run.budget_refusals()
+                .iter()
+                .any(|lane| lane == "policy/related_locations_per_finding"),
+            limit == 0,
+            "upstream omissions are not evidence that the local related-location cap refused data",
+        );
+    }
+    assert!(ids.iter().all(|id| *id == ids[0]));
+}
+
+#[test]
+fn raw_rql_typestate_partial_outside_root_is_explicitly_evaluation_scoped() {
+    let diagnostic = CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        has_non_utf8_refusal: false,
+        refusal_sites: Default::default(),
+        call_relation_facts: None,
+        uses_omissions: Vec::new(),
+        incompleteness: brokk_bifrost_rql::Incompleteness::Content,
+        related: Vec::new(),
+        source: None,
+        code: CodeQueryDiagnosticCode::TypestateAnalysisPartial,
+        impact: CodeQueryDiagnosticImpact::Incomplete,
+        branch: Vec::new(),
+        language: "workspace",
+        message: "raw typestate partial".into(),
+        exhausted_roots: Vec::new(),
+        withheld_rows_path: None,
+    });
+    let adapted = adapt_query_diagnostic(&diagnostic, 8, &mut PolicyDiagnostics::new()).unwrap();
+    assert_eq!(
+        serde_json::to_value(adapted.code()).unwrap(),
+        serde_json::json!({
+            "type": "code_query", "code": "typestate_analysis_partial", "scope": {"type":"evaluation"}
+        })
+    );
+}
+
+#[test]
+fn diagnostic_causes_survive_failed_run_assembly() {
+    let registry = policy_registry(
+        "test:cause-assembly",
+        r#"(policy :id "test.cause-assembly" :name "Cause assembly"
+            :message "Matched alpha" :severity warning
+            :analysis (analysis :type match
+                :selector (rql (language typescript (call :callee (name "alpha"))))))"#,
+    );
+    let policy = registry.policies().next().unwrap();
+    let diagnostic = PolicyDiagnostic::new_bounded(
+        PolicyDiagnosticCode::CodeQuery {
+            code: CodeQueryDiagnosticCode::ExecutionBudgetExhausted
+                .try_into()
+                .unwrap(),
+        },
+        PolicyDiagnosticSeverity::Warning,
+        PolicyDiagnosticImpact::RunIncomplete,
+        "query did not finish",
+    );
+    // Deliberately inconsistent completion forces the assembly failure path.
+    let run = finish_assembled_run(
+        policy,
+        PolicyAnalysisType::Match,
+        PolicyRunCompletion::Complete,
+        Vec::new(),
+        vec![diagnostic].into(),
+        false,
+        PolicyWorkReport::default(),
+        "invalid completion",
+        &PolicyBudget::default(),
+        None,
+    )
+    .unwrap();
+    assert!(matches!(
+        run.completion(),
+        PolicyRunCompletion::Failed { .. }
+    ));
+    let causes = serde_json::to_value(run.diagnostic_causes()).unwrap();
+    assert!(causes.as_array().unwrap().contains(&json!({
+        "code": "execution_budget_exhausted", "impact": "run_incomplete", "execution_cause": "unknown"
+    })));
+    assert!(causes.as_array().unwrap().contains(&json!({
+        "code": "evaluation_failure", "impact": "run_failed", "execution_cause": "other"
+    })));
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#11552: a call-path certificate erased ambiguity from another contributing set operand"
+)]
+fn call_path_certificate_preserves_contributing_branch_ambiguity() {
+    use brokk_bifrost_rql::structural::search::{
+        CallPathCoverage, CallPathEdge, CallPathEvidence, CallPathLocation, CallPathSource,
+        StaticCallPath, StaticCallProof, UnitRowItemProvenance, UnitRowItemRef,
+        UnitRowItemRefValue, UnitRowProvenanceRef,
+    };
+    let location = |start, end| CallPathLocation {
+        rel_path: "app.rs".into(),
+        byte_span: start..end,
+        display_range: CodeQueryRange {
+            start_line: 1,
+            start_column: start + 1,
+            end_line: 1,
+            end_column: end + 1,
+        },
+    };
+    let primary = location(0, 12);
+    let key = DetailedCodeQueryKey::Declaration {
+        kind: "function".into(),
+        fq_name: "app.root".into(),
+        analyzer_id: None,
+    };
+    let certificate = CallPathEvidence {
+        paths: vec![StaticCallPath {
+            source: CallPathSource {
+                location: location(0, 4),
+                identity: "source".into(),
+                expansion_origin: None,
+            },
+            primary_root: primary.clone(),
+            root_identity: "root".into(),
+            edges: vec![CallPathEdge {
+                caller: "root".into(),
+                call_site: location(6, 10),
+                static_target: "sink".into(),
+                proof: StaticCallProof::DirectDeclaration,
+            }],
+        }],
+        coverage: CallPathCoverage::Complete,
+        truncated: false,
+    };
+    assert!(certificate.validate());
+    for code in [
+        CodeQueryDiagnosticCode::CallRelationTargetsAmbiguous,
+        CodeQueryDiagnosticCode::ReferenceTargetsAmbiguous,
+        CodeQueryDiagnosticCode::UsesTargetsAmbiguous,
+    ] {
+        for contributes in [false, true] {
+            let branches = if contributes { vec![0, 1] } else { vec![0] };
+            let item = UnitRowItem {
+                domain: DetailedCodeQueryDomain::Declaration,
+                path: "app.rs".into(),
+                range: Some(primary.display_range),
+                evidence: None,
+                coverage: None,
+                fields: Vec::new(),
+                projected_field_names: Vec::new(),
+                unknown_fields: Vec::new(),
+                terminal: Some(UnitRowItemTerminal::Declaration {
+                    kind: "function".into(),
+                    fq_name: "app.root".into(),
+                }),
+                provenance: branches
+                    .iter()
+                    .map(|&branch| UnitRowItemProvenance {
+                        branch: vec![branch],
+                        seed: UnitRowItemRef {
+                            kind: "declaration".into(),
+                            path: "app.rs".into(),
+                            value: UnitRowItemRefValue::Declaration {
+                                kind: "function".into(),
+                                fq_name: "app.root".into(),
+                                node_range: Some(primary.display_range),
+                            },
+                        },
+                        steps: Vec::new(),
+                    })
+                    .collect(),
+                provenance_truncated: false,
+            };
+            let evidence = UnitRowEvidence {
+                call_path_evidence: Some(certificate.clone()),
+                domain: DetailedCodeQueryDomain::Declaration,
+                key: key.clone(),
+                rel_path: "app.rs".into(),
+                byte_span: Some(primary.byte_span.clone()),
+                stable_owner_candidate: None,
+                identities: UnitRowIdentities::Primary(None),
+                source_slice_sha256: Some([1; 32]),
+                provenance: branches
+                    .iter()
+                    .map(|&branch| UnitRowProvenance {
+                        branch: vec![branch],
+                        seed: UnitRowProvenanceRef {
+                            domain: DetailedCodeQueryDomain::Declaration,
+                            key: key.clone(),
+                            rel_path: "app.rs".into(),
+                            byte_span: Some(primary.byte_span.clone()),
+                            display_range: Some(primary.display_range),
+                            identities: UnitRowIdentities::Primary(None),
+                            source_slice_sha256: Some([1; 32]),
+                        },
+                        steps: Vec::new(),
+                    })
+                    .collect(),
+            };
+            let diagnostic = CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
+                incompleteness: brokk_bifrost_rql::Incompleteness::Content,
+                related: Vec::new(),
+                source: None,
+                code,
+                impact: CodeQueryDiagnosticImpact::Advisory,
+                branch: vec![1],
+                language: "rust",
+                message: "another contributing query branch is ambiguous".into(),
+                exhausted_roots: Vec::new(),
+                withheld_rows_path: None,
+            });
+            let candidate = adapt_match_candidate(
+                &PolicyId::new("test.call-path-branch-certainty").unwrap(),
+                item,
+                evidence,
+                &[diagnostic],
+                &mut HashMap::new(),
+                &mut HashMap::new(),
+            )
+            .expect("valid certified declaration adapts");
+            if contributes {
+                let reason = CertaintyReason::analyzer_ambiguity(code.as_str()).unwrap();
+                assert!(
+                    matches!(candidate.certainty, FindingCertainty::Possible { ref reasons } if reasons.contains(&reason)),
+                    "certificate cannot discharge another branch's {code:?} ambiguity: {:?}",
+                    candidate.certainty
+                );
+            } else {
+                assert_eq!(
+                    candidate.certainty,
+                    FindingCertainty::Definite,
+                    "an unrelated branch does not contribute to this finding"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#11442: position-free usage dependencies must not retain finding coordinates after a prefix edit"
+)]
+fn usage_derived_dispatch_finding_positions_match_warm_and_cold() {
+    use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_analysis::AnalyzerConfig;
+    use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
+    use brokk_bifrost_analysis::analyzer::read_ledger::{LookupKind, ReadKey, ReadLedger};
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    let original = "package census\nvar F = func(value int) {}\nfunc Caller() { F(1) }\n";
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/census\n\ngo 1.23\n")
+        .file("a.go", original)
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let policy = crate::test_support::load_match_policy(
+        r#"(policy :schema-version 1 :id "test.usage-position" :name "Usage positions" :message "Argument" :severity warning
+        :analysis (analysis :type match :selector (rql :schema-version 1
+          (language go (dispatch-targets (call :callee (name "F")))))))"#,
+    );
+    let flow = brokk_bifrost_flow::FlowWorkspaceState::default();
+    let evaluate = |workspace: &WorkspaceAnalyzer,
+                    flow: &brokk_bifrost_flow::FlowWorkspaceState| {
+        let ledger = Arc::new(ReadLedger::new());
+        let _scope =
+            AnalyzerQueryScope::with_read_ledger(workspace.analyzer(), Arc::clone(&ledger));
+        let context = PolicyEvaluationContext {
+            acceptance_hint: None,
+            analyzer: workspace.analyzer(),
+            workspace: Some(workspace),
+            flow_state: flow,
+            root_memo: None,
+            cancellation: None,
+            cvss_overlays: &[],
+            organizational_risk: &[],
+            incremental: None,
+            identifier_typos: None,
+        };
+        let run = DefaultPolicyEvaluator::new()
+            .evaluate(&policy, &context, &mut PolicyBudget::default())
+            .unwrap();
+        assert_eq!(run.findings().len(), 1, "{run:?}");
+        assert!(
+            ledger.keys().iter().any(|key| matches!(
+                key,
+                ReadKey::Lookup {
+                    kind: LookupKind::Usages,
+                    ..
+                }
+            )),
+            "the actual Go dispatch must consume the usage proof: {:?}",
+            ledger.keys()
+        );
+        run.findings()[0].primary().clone()
+    };
+    let before = evaluate(&workspace, &flow);
+    let file = project.file("a.go");
+    file.write(format!("// length-changing prefix\n{original}"))
+        .unwrap();
+    let warm = workspace.update(&BTreeSet::from([file]));
+    let cold = project.workspace_analyzer(AnalyzerConfig::default());
+    let after = evaluate(&warm, &flow);
+    assert_ne!(before, after);
+    assert_eq!(
+        after,
+        evaluate(&cold, &brokk_bifrost_flow::FlowWorkspaceState::default())
+    );
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#11321: invalid diagnostic detail lost its cause and omitted severity"
+)]
+fn omitted_diagnostic_severity_survives_invalid_detail() {
+    let message = "x".repeat(5000);
+    let mut diagnostics = PolicyDiagnostics::new();
+    let mut truncated = false;
+    truncated |= retain_adaptation_failure(&mut diagnostics, 0, &message);
+    assert!(truncated);
+    assert!(diagnostics.is_empty());
+    assert_eq!(
+        diagnostics.worst_omitted_diagnostic_severity(),
+        Some(PolicyDiagnosticSeverity::Error)
+    );
+    assert!(
+        diagnostics
+            .causes()
+            .iter()
+            .any(|cause| cause.code() == "evaluation_failure")
+    );
+    let mut completion = PolicyRunCompletion::Complete;
+    record_run_incomplete(
+        &mut completion,
+        &mut diagnostics,
+        &mut truncated,
+        PolicyIncompleteReason::CapabilityIncomplete,
+        &message,
+        &PolicyBudget::default(),
+    );
+    assert_eq!(diagnostics.causes().iter().count(), 2);
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#11321: semantic diagnostic codes lost contextual Provider causes before report retention"
+)]
+fn diagnostic_causes_preserve_product_execution_metadata_before_loss() {
+    for allowance in [0, 1, 16] {
+        for message in ["same diagnostic".to_owned(), "x".repeat(4097)] {
+            let diagnostic = |incompleteness| {
+                CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                    has_non_utf8_refusal: false,
+                    refusal_sites: Default::default(),
+                    uses_omissions: Vec::new(),
+                    incompleteness,
+                    related: Vec::new(),
+                    source: None,
+                    code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                    impact: CodeQueryDiagnosticImpact::Incomplete,
+                    branch: Vec::new(),
+                    language: "rust",
+                    message: message.clone(),
+                    exhausted_roots: Vec::new(),
+                    withheld_rows_path: None,
+                    call_relation_facts: None,
+                })
+            };
+            let adapted = adapt_query_diagnostics(
+                &[
+                    diagnostic(brokk_bifrost_rql::Incompleteness::Content),
+                    diagnostic(brokk_bifrost_rql::Incompleteness::Operational(
+                        brokk_bifrost_rql::DiagnosticExecutionCause::Provider,
+                    )),
+                ],
+                allowance,
+                64,
+            );
+            let values = serde_json::to_value(adapted.diagnostics.causes()).unwrap();
+            let values = values
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|value| value["code"] == "semantic_analysis_partial")
+                .collect::<Vec<_>>();
+            assert_eq!(values.len(), 2, "{values:?}");
+            assert_eq!(values[0]["execution_cause"], serde_json::Value::Null);
+            assert_eq!(values[1]["execution_cause"], "provider");
+            assert!(
+                values
+                    .iter()
+                    .all(|value| value["impact"] == "run_incomplete")
+            );
+        }
+    }
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#12105: successful per-finding retention panicked on related omissions and hid its cause"
+)]
+fn match_detail_retention_preserves_omission_counts_and_run_cause() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    ProjectFile::new(root.clone(), "app.ts")
+        .write("alpha();")
+        .unwrap();
+    let analyzer = TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+    let policy = crate::test_support::load_match_policy(
+        r#"(policy :id "test.detail-retention" :name "Retention" :message "matched" :severity warning :analysis (analysis :type match :selector (rql (call))))"#,
+    );
+    let query = CodeQuery::from_source("(call)").unwrap();
+    for upstream in [
+        brokk_bifrost_core::omission::OmissionCount::exact(0),
+        brokk_bifrost_core::omission::OmissionCount::lower_bound(7),
+    ] {
+        let mut evaluated = evaluate_match_query_candidates(
+            &policy.definition().metadata.id,
+            false,
+            &brokk_bifrost_flow::FlowWorkspaceState::default(),
+            &analyzer,
+            None,
+            &query,
+            &PolicyBudget::default(),
+            None,
+        );
+        assert_eq!(evaluated.candidates.len(), 1);
+        let candidate = &mut evaluated.candidates[0];
+        candidate.related_omissions = upstream;
+        candidate.related.push(
+            RelatedPolicyLocation::try_new(
+                PolicyLocationRelationship::Evidence,
+                candidate.location.clone(),
+                vec![EvidenceRef::try_new("test", "optional-related").unwrap()],
+            )
+            .unwrap()
+            .with_label("context ".repeat(400))
+            .unwrap(),
+        );
+        let expected_id = candidate.id;
+        let budget = PolicyBudget::builder()
+            .with_max_evidence_refs_per_finding(0)
+            .unwrap()
+            .with_max_diagnostics(0)
+            .unwrap()
+            .build()
+            .unwrap();
+        let run = assemble_match_run(&policy, evaluated, &[], &[], &budget, None).unwrap();
+        assert_eq!(run.findings().len(), 1);
+        assert_eq!(run.findings()[0].id(), expected_id);
+        assert!(run.findings()[0].related().is_empty());
+        assert_eq!(
+            run.findings()[0].related_locations_omitted(),
+            upstream.combined(brokk_bifrost_core::omission::OmissionCount::exact(1))
+        );
+        assert_eq!(run.work().omitted_findings_lower_bound(), 0);
+        assert!(
+            run.diagnostic_causes()
+                .iter()
+                .any(|cause| cause.execution_cause()
+                    == crate::finding::PolicyDiagnosticExecutionCause::DetailRetention)
+        );
+        assert!(
+            run.budget_refusals()
+                .iter()
+                .any(|lane| lane == "policy/retained_report_bytes")
+        );
+    }
+}
+
+#[test]
+// Hard-won: #12089 interaction: a finding-ID collision crossed retention accounting.
+#[brokk_bifrost_test_macros::hardwon(
+    "#12089: interaction: failed-run retention deleted strong collision groups"
+)]
+fn failed_run_retention_preserves_strong_colliding_records() {
+    let original = classified_match_run("alpha();", PolicyBudget::default());
+    let finding = original.findings()[0].clone();
+    assert_eq!(
+        finding.identity_stability(),
+        FindingIdentityStability::Strong
+    );
+    let registry = policy_registry("test:classified-retention", CLASSIFIED_MATCH_POLICY);
+    let policy = registry.policies().next().unwrap();
+    let findings = vec![finding.clone(), finding];
+    let run = failed_policy_run_with_findings(
+        policy,
+        PolicyAnalysisType::Match,
+        findings.clone(),
+        "test failure after answer discovery",
+        PolicyWorkReport::default(),
+        &PolicyBudget::default(),
+        None,
+    )
+    .unwrap();
+    assert!(matches!(
+        run.completion(),
+        PolicyRunCompletion::Failed { .. }
+    ));
+    assert_eq!(
+        serde_json::to_value(run.findings()).unwrap(),
+        serde_json::json!(findings)
+    );
+}
+
+#[test]
+// Hard-won: #12089 interaction: a finding-ID collision crossed retention accounting.
+#[brokk_bifrost_test_macros::hardwon(
+    "#12089: interaction: attribution prefix loss left a surviving subject falsely complete"
+)]
+fn attribution_prefix_collision_loss_marks_surviving_subject_partial() {
+    use crate::finding::{
+        FurtherFindingsAbsent, PolicySubjectVerdict, PolicySubjectVerdicts, SubjectEnumeration,
+        SubjectSelectorEnumeration, SubjectVerdict,
+    };
+    use crate::finding_identity::AnalysisSubjectRef;
+    use serde::de::DeserializeSeed;
+    let mut run = classified_match_run("alpha();", PolicyBudget::default());
+    let mut wire = serde_json::to_value(&run.findings()[0]).unwrap();
+    wire["message"] = json!("x".repeat(4_000));
+    let finding = crate::finding::PolicyFindingSeed::new(&PolicyBudget::default())
+        .deserialize(wire)
+        .unwrap();
+    let id = finding.id();
+    run.replace_findings(vec![finding.clone(), finding.clone()]);
+    let subjects = PolicySubjectVerdicts::new(
+        vec![SubjectSelectorEnumeration {
+            selector: "src".to_owned(),
+            enumeration: SubjectEnumeration::Certified,
+        }],
+        vec![PolicySubjectVerdict {
+            selector: "src".to_owned(),
+            location: finding.primary().clone(),
+            verdict: SubjectVerdict::Selected {
+                bindings: 1,
+                subject_keys: vec![AnalysisSubjectRef::try_new("bifrost", "test-subject").unwrap()],
+                findings: vec![id],
+                further_findings_absent: FurtherFindingsAbsent::Complete,
+                finding_location_bound: None,
+            },
+        }],
+    );
+    let run = run
+        .with_subjects(subjects, &PolicyBudget::default())
+        .unwrap();
+    let contributor = read_dependency_contributor();
+    let attribution = ModelAttribution::from_full(vec![contributor.clone()], 0);
+    let mut marked = run.clone();
+    marked.replace_findings(
+        marked
+            .findings()
+            .iter()
+            .cloned()
+            .map(|finding| {
+                finding
+                    .with_model_attribution(Some(attribution.clone()), &PolicyBudget::default())
+                    .unwrap()
+            })
+            .collect(),
+    );
+    marked.omit_optional_detail();
+    let budget = PolicyBudget::builder()
+        .with_max_retained_report_bytes(marked.retained_size() - 1)
+        .unwrap()
+        .build()
+        .unwrap();
+    let retained = mark_approximate_family_run(run, vec![contributor], &budget, None).unwrap();
+    assert_eq!(retained.findings().len(), 1);
+    assert_eq!(retained.findings()[0].id(), id);
+    assert_eq!(retained.work().retention_omitted_findings_lower_bound(), 1);
+    assert!(matches!(&retained.subjects().unwrap().entries[0].verdict,
+        SubjectVerdict::Selected { findings,
+            further_findings_absent: FurtherFindingsAbsent::Partial { reasons }, ..
+        } if findings == &[id] && reasons == &["findings_truncated"]));
+}
+
+#[test]
+fn procedure_source_owner_provenance_is_complete_and_edit_stable() {
+    use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_analysis::analyzer::AnalyzerConfig;
+    use brokk_bifrost_rql::structural::search::UnitRowItemRefValue;
+    use brokk_bifrost_rql::structural::search::execute_code_query_detailed_eager_index_workspace;
+    fn evidence(source: &str, truncated: bool) -> serde_json::Value {
+        let source = if truncated {
+            (0..17)
+                .map(|index| format!("pub fn run{index}() {{}}\n"))
+                .collect::<String>()
+        } else {
+            source.to_owned()
+        };
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file("lib.rs", source)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let mut query = if truncated {
+            CodeQuery::from_source("(file-of (procedure-of (language rust (function))))").unwrap()
+        } else {
+            CodeQuery::from_json(&json!({"match":{"kind":"function","name":"run"},"steps":[{"op":"procedure_of"},{"op":"file_of"}],"result_detail":"full"})).unwrap()
+        };
+        query.result_detail = CodeQueryResultDetail::Full;
+        let detailed = execute_code_query_detailed_eager_index_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::default(),
+            &query,
+            PolicyBudget::default().query_limits(),
+            None,
+        );
+        let rows: Vec<_> = detailed
+            .result
+            .results
+            .iter()
+            .map(UnitRowItem::project)
+            .collect();
+        assert_eq!(rows.len(), 1, "{detailed:?}");
+        assert!(matches!(
+            rows[0].provenance[0].steps[0].result.value,
+            UnitRowItemRefValue::Procedure { .. }
+        ));
+        assert_eq!(rows[0].provenance_truncated, truncated);
+        let evaluated = adapt_match_candidates(
+            &PolicyId::new("test.procedure-source-owner").unwrap(),
+            BindingOutputClass::DirectOnly,
+            rows,
+            detailed
+                .evidence
+                .iter()
+                .map(UnitRowEvidence::project)
+                .collect(),
+            &[],
+        );
+        assert!(!evaluated.conversion_failed, "{evaluated:?}");
+        assert_eq!(evaluated.candidates.len(), 1);
+        let result = &evaluated.candidates[0].evidence;
+        assert_eq!(result.provenance_truncated(), truncated);
+        json!({"id": evaluated.candidates[0].id, "evidence": result})
+    }
+    let first = evidence("// first\npub fn run() {}", false);
+    let changed = evidence("// other\npub fn run() {}", false);
+    assert_eq!(first, changed, "unrelated edit must not rotate evidence");
+    let shifted = evidence("// inserted\n// first\npub fn run() {}", false);
+    assert_eq!(first["id"], shifted["id"]);
+    assert_eq!(
+        first["evidence"]["provenance"][0]["steps"][0]["result"],
+        shifted["evidence"]["provenance"][0]["steps"][0]["result"]
+    );
+    let mut pending = vec![(String::new(), &first, &shifted)];
+    let mut changed_paths = Vec::new();
+    while let Some((path, before, after)) = pending.pop() {
+        if before == after {
+            continue;
+        }
+        match (before, after) {
+            (serde_json::Value::Object(before), serde_json::Value::Object(after))
+                if before.keys().eq(after.keys()) =>
+            {
+                pending.extend(
+                    before
+                        .iter()
+                        .map(|(key, value)| (format!("{path}/{key}"), value, &after[key])),
+                );
+            }
+            (serde_json::Value::Array(before), serde_json::Value::Array(after))
+                if before.len() == after.len() =>
+            {
+                pending.extend(
+                    before
+                        .iter()
+                        .zip(after)
+                        .enumerate()
+                        .map(|(index, (before, after))| (format!("{path}/{index}"), before, after)),
+                );
+            }
+            _ => changed_paths.push(path),
+        }
+    }
+    assert!(!changed_paths.is_empty());
+    assert!(
+        changed_paths
+            .iter()
+            .all(|path| path.starts_with("/evidence/provenance/0/seed/location/")),
+        "line insertion changed non-location evidence: {changed_paths:?}"
+    );
+    assert_eq!(
+        evidence("// first\npub fn run() {}", true)["evidence"]["provenance_truncated"],
+        true
+    );
+}
+
+#[test]
+fn procedure_source_owner_reader_round_trips_and_refuses_unknown_kinds() {
+    let source_owner = StableSemanticIdentity::canonical_ast_identity(
+        "rust",
+        workspace_relative_path("lib.rs").unwrap(),
+        r#"[["function","run"]]"#,
+    )
+    .unwrap();
+    let reference = PolicyQueryResultRef::Procedure { source_owner };
+    reference.validate().unwrap();
+    let wire = serde_json::to_value(&reference).unwrap();
+    assert_eq!(wire.as_object().unwrap().len(), 2);
+    assert_eq!(
+        serde_json::from_value::<PolicyQueryResultRef>(wire.clone()).unwrap(),
+        reference
+    );
+    let mut unknown = wire;
+    unknown["type"] = json!("future_procedure_source_owner");
+    assert!(
+        serde_json::from_value::<PolicyQueryResultRef>(unknown)
+            .unwrap_err()
+            .to_string()
+            .contains("unknown variant")
+    );
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#11532: cross-file procedure provenance certified the seed file instead of the target"
+)]
+fn procedure_source_owner_provenance_uses_the_cross_file_target() {
+    use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_analysis::analyzer::AnalyzerConfig;
+    use brokk_bifrost_rql::structural::search::execute_code_query_detailed_eager_index_workspace;
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("target.ts", "export function target() {}\n")
+        .file(
+            "caller.ts",
+            "import { target } from './target';\nexport function caller() { target(); }\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "where": ["target.ts"],
+        "match": {"kind": "function", "name": "target"},
+        "steps": [{"op": "enclosing_decl"}, {"op": "callers", "proof": "proven"}, {"op": "procedure_of"}, {"op": "file_of"}],
+        "result_detail": "full"
+    }))
+    .unwrap();
+    let detailed = execute_code_query_detailed_eager_index_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::default(),
+        &query,
+        PolicyBudget::default().query_limits(),
+        None,
+    );
+    let evaluated = adapt_match_candidates(
+        &PolicyId::new("test.cross-file-procedure-source-owner").unwrap(),
+        BindingOutputClass::DirectOnly,
+        detailed
+            .result
+            .results
+            .iter()
+            .map(UnitRowItem::project)
+            .collect(),
+        detailed
+            .evidence
+            .iter()
+            .map(UnitRowEvidence::project)
+            .collect(),
+        &detailed.result.diagnostics,
+    );
+    assert!(!evaluated.conversion_failed, "{evaluated:?}");
+    assert_eq!(evaluated.candidates.len(), 1, "{detailed:?}");
+    let candidate = &evaluated.candidates[0];
+    assert!(!candidate.evidence.provenance_truncated(), "{candidate:?}");
+    let references: Vec<_> = candidate
+        .evidence
+        .provenance()
+        .iter()
+        .flat_map(|trace| trace.steps())
+        .filter_map(|step| match step.result() {
+            PolicyQueryResultRef::Procedure { source_owner } => Some(source_owner),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(references.len(), 1);
+    assert_eq!(references[0].path().as_str(), "caller.ts");
+    assert!(references[0].semantic_key().unwrap().contains("caller"));
+    assert!(!references[0].semantic_key().unwrap().contains("target"));
+}
+
+/// An unmeasured candidate count publishes no metric, so a reader can never
+/// mistake "not measured" for "the anchor selected nothing"; a measured zero
+/// publishes 0 (#12581).
+#[test]
+fn match_candidate_sites_metric_is_published_only_when_measured() {
+    let policy_id = PolicyId::new("test.candidate-sites").expect("policy id");
+    let metric = |candidate_sites: Option<u64>| {
+        let evaluated = adapt_match_execution(
+            &policy_id,
+            BindingOutputClass::DirectOnly,
+            false,
+            None,
+            Vec::new(),
+            Vec::new(),
+            &[],
+            CodeQueryCompletion::Complete,
+            CodeQueryExecutionWork::default(),
+            candidate_sites,
+            &PolicyBudget::default(),
+        );
+        evaluated
+            .work
+            .metrics()
+            .iter()
+            .find(|metric| metric.name() == MATCH_CANDIDATE_SITES_METRIC)
+            .map(|metric| (metric.unit(), metric.value()))
+    };
+    assert_eq!(metric(None), None);
+    assert_eq!(metric(Some(0)), Some((PolicyWorkUnit::Count, 0)));
+    assert_eq!(metric(Some(7)), Some((PolicyWorkUnit::Count, 7)));
+}
+
+#[test]
+fn non_utf8_refusal_is_flagged_without_an_omission_count() {
+    let query = serde_json::json!({
+        "code":"semantic_analysis_partial", "impact":"incomplete", "incompleteness":"content",
+        "language":"rust", "has_non_utf8_refusal":true,
+        "message":"call_bindings incomplete\ncall-binding refusal: CalleeUnresolved"
+    });
+    let query: CodeQueryDiagnostic = serde_json::from_value(query).unwrap();
+    let result = adapt_query_diagnostics(&vec![query; 6], 1, 2);
+    assert_eq!(result.diagnostics.len(), 1);
+    let diagnostic = &result.diagnostics[0];
+    assert!(diagnostic.primary().is_none());
+    assert!(diagnostic.related().is_empty());
+    assert_eq!(
+        diagnostic.omitted_related_locations_lower_bound(),
+        crate::RelatedLocationOmissions::Known(0)
+    );
+    let counts = diagnostic.refusal_omissions().unwrap();
+    assert_eq!(counts.bound_trimmed, 0);
+    assert_eq!(counts.unrepresentable_path, 0);
+    assert!(counts.has_non_utf8_refusal);
+    assert!(diagnostic.message().contains("CalleeUnresolved"));
+}
+
+#[test]
+fn refusal_render_counts_distinct_nonportable_utf8_sites() {
+    let make = |path: &str, offset: usize| {
+        let source = serde_json::json!({"path":path,"start_byte":offset,"end_byte":offset+1,
+            "range":{"start_line":1,"end_line":1,"start_column":offset+1,"end_column":offset+2}});
+        serde_json::from_value::<CodeQueryDiagnostic>(serde_json::json!({
+            "code":"semantic_analysis_partial","impact":"incomplete","incompleteness":"content",
+            "language":"rust","message":"call_bindings incomplete",
+            "source":source,"related":[{"source":source,"label":"call-binding refusal: CalleeUnresolved"}]
+        })).unwrap()
+    };
+    let mut queries = (0..6).map(|n| make("main.rs", n)).collect::<Vec<_>>();
+    queries.extend([make("aux.rs", 0), make("foo:bar.rs", 0)]);
+    queries.extend(queries.clone());
+    let result = adapt_query_diagnostics(&queries, 1, 2);
+    let diagnostic = &result.diagnostics[0];
+    assert_eq!(result.diagnostics.len(), 1);
+    let counts = diagnostic.refusal_omissions().unwrap();
+    assert_eq!(counts.bound_trimmed, 3);
+    assert_eq!(counts.unrepresentable_path, 2);
+    assert!(!counts.has_non_utf8_refusal);
+    assert_eq!(
+        diagnostic.omitted_related_locations_lower_bound(),
+        crate::RelatedLocationOmissions::Known(5)
+    );
+    assert_eq!(diagnostic.primary().unwrap().path(), "main.rs");
+    assert_eq!(diagnostic.related().len(), 2);
+    queries.reverse();
+    let repeated = adapt_query_diagnostics(&queries, 1, 2);
+    assert_eq!(result.diagnostics, repeated.diagnostics);
+    assert!(!result.truncated);
+    assert!(result.budget_refusals.is_empty());
 }

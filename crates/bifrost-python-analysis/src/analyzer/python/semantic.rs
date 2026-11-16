@@ -83,25 +83,12 @@ use brokk_bifrost_python::syntax::{
     python_plain_string_literal, python_static_attribute_path,
 };
 
-// Bumping this rotates every public wire id hashed from the adapter
-// fingerprint (`SemanticArtifactKey::push_environment_identity`). A checked-in
-// golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
-// change; the code-query tutorial pages elide such ids (#5016).
-// #5911: ordered decomposition observes cancellation and records target traversal;
-// old artifacts must not bypass the shared planner or its stopped outcomes.
-// Quicksilver round 6: the regex and structural facts the lowerer reads, the
-// alias-scan budget (exhaustion is Budget, not "no mutation") and runtime key
-// shapes (radix indices, tuple keys) change for unchanged bytes.
-// #5658: shared lexical inventories recognize recovered file roots structurally;
-// invalidate artifacts that reached the former module-scope rule.
-// #7182: native member-operation names change on the uncached import-read path.
-// #5658: native lexical presentation changes reparsing reachable from lowering.
-// #8306: await binds its operand and result values in the shared scaffold.
-// #9438: decorator argument roles reach on-demand semantic lowering.
-// #9447: structured formal roles and refusal change semantic payloads.
-// #5658 M8: imports and callees lower from the file alone.
-// #5658 M8: the lowerer holds no analyzer or model state, and `with` suppression is an unproven branch.
-const ADAPTER_VERSION: &[u8] = b"python-value-semantics-v58";
+/// The python adapter lever (#11570): `levers/python-adapter.tokens`. Add a line there
+/// when a change alters the semantics this lowerer publishes for unchanged
+/// source; see `.agents/docs/cache-identity-levers.md`.
+fn adapter_version() -> &'static [u8] {
+    brokk_bifrost_core::lever_label!("python-value-semantics", "python-adapter.tokens").as_bytes()
+}
 
 const PYTHON_UNKNOWN_ITERATION_ELEMENT: &str = "python.unknown_iteration_element";
 const PYTHON_UNKNOWN_UNPACK_ELEMENT: &str = "python.unknown_unpack_element";
@@ -135,7 +122,7 @@ fn policy_lowering_identity_for_dependencies(
 ) -> SemanticAdapterIdentity {
     SemanticAdapterIdentity::for_adapter(
         "python",
-        ADAPTER_VERSION,
+        adapter_version(),
         b"python-intrafile-execution-defaults-v1",
         dependencies,
     )
@@ -145,7 +132,7 @@ impl ProgramSemanticsLowerer for PythonSemanticLowerer {
     fn identity(&self) -> SemanticAdapterIdentity {
         SemanticAdapterIdentity::for_adapter(
             "python",
-            ADAPTER_VERSION,
+            adapter_version(),
             b"python-intrafile-execution-defaults-v1",
             DependencyFingerprint::hash_bytes(b"no-intrafile-dependencies"),
         )
@@ -1566,8 +1553,15 @@ fn lower_procedure<'tree, 'targets>(
     }
     let work_before_freeze = builder.prospective_work();
     let (parts, work) = builder
-        .finish_with_work()
-        .map_err(|error| ProcedureLoweringError::Budget(error, Box::new(work_before_freeze)))?;
+        .finish_with_work(cancellation)
+        .map_err(|error| match error {
+            brokk_bifrost_semantic::analyzer::semantic::cfg::FinishError::Cancelled => {
+                ProcedureLoweringError::Cancelled(Box::new(work_before_freeze))
+            }
+            brokk_bifrost_semantic::analyzer::semantic::cfg::FinishError::ExceededBudget(error) => {
+                ProcedureLoweringError::Budget(error, Box::new(work_before_freeze))
+            }
+        })?;
     report_python_procedure_work(file, spec, "finish", work.nested_entries);
     Ok((parts, work))
 }
@@ -3990,7 +3984,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 // Evaluate the expression before cleanup, but publish its saved
                 // value only if cleanup preserves this return. An abrupt cleanup
                 // can replace or cancel it without reaching this continuation.
-                let completion = if route.cleanups().is_empty() {
+                let completion = if builder.cleanup_regions(&route).next().is_none() {
                     terminal
                 } else {
                     self.session.add_node_point(builder, node, Vec::new())?
@@ -7642,7 +7636,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         if !self
             .local_exception_dispatchers
             .contains(&route.destination().target())
-            && route.cleanups().is_empty()
+            && builder.cleanup_regions(&route).next().is_none()
         {
             return Ok(());
         }

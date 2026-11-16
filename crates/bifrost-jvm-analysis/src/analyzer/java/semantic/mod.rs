@@ -46,27 +46,12 @@ use brokk_bifrost_core::hash::HashMap;
 use brokk_bifrost_core::hash::HashSet;
 use brokk_bifrost_jvm::java::structural::JAVA_STRUCTURAL_SPEC;
 
-// Bumping this rotates every public wire id hashed from the adapter
-// fingerprint (`SemanticArtifactKey::push_environment_identity`). A checked-in
-// golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
-// change; the code-query tutorial pages elide such ids (#5016).
-// v32: #7578 publishes shared direct-call-result condition guards.
-// v33: compose #7348/#7349/#7369 compound/static/pattern lowering with v32.
-// v35: compose #7578 decoded string-literal ConstantString values with v33.
-// #8387: invalidate artifacts embedding ranked synthetic declaration identities.
-// v38: #7750 guarded switch cases name an edge the guard lowering creates (v37 is held by #8650).
-// #8634: a default-only switch reaches its default arm by a SwitchCase edge.
-// Batch d1bb2a8e: combine #8682 (v39) with #7750 (v38); keep v39, above master's v38.
-// #8599: method-reference receiver binding and null-check control flow changed.
-// v40: compose #8599 above master's v38 and the open #8634 v39 identity.
-// v41: qualified this now derives an opaque enclosing receiver instead of sharing inner this.
-// #9447: structured formal roles and refusal change semantic payloads.
-// #9183: persist Java's per-procedure footprint branch account.
-// #10881: comparisons over literals and constant int/long locals fold to one arm.
-// #11022 J1: instance and non-void method signature and body footprint claims; above master v45.
-// #11014: resource-specific implicit close selection changes Java semantic artifacts.
-// Merge of #11022 J1 v46 and #11014 v47: both parents' semantic changes are present; v48 exceeds both.
-const ADAPTER_VERSION: &[u8] = b"java-value-semantics-v48";
+/// The java adapter lever (#11570): `levers/java-adapter.tokens`. Add a line there
+/// when a change alters the semantics this lowerer publishes for unchanged
+/// source; see `.agents/docs/cache-identity-levers.md`.
+fn adapter_version() -> &'static [u8] {
+    brokk_bifrost_core::lever_label!("java-value-semantics", "java-adapter.tokens").as_bytes()
+}
 
 impl_program_semantics_provider!(JavaAnalyzer, JavaSemanticLowerer);
 
@@ -75,7 +60,7 @@ pub(crate) struct JavaSemanticLowerer;
 impl ProgramSemanticsLowerer for JavaSemanticLowerer {
     fn identity(&self) -> SemanticAdapterIdentity {
         SemanticAdapterIdentity {
-            adapter: AdapterSemanticsVersion::hash_bytes("java", ADAPTER_VERSION)
+            adapter: AdapterSemanticsVersion::hash_bytes("java", adapter_version())
                 .expect("adapter name is non-empty"),
             configuration: ConfigurationFingerprint::hash_bytes(
                 b"java-intrafile-execution-defaults-v1",
@@ -210,6 +195,7 @@ impl ProgramSemanticsLowerer for JavaSemanticLowerer {
                 });
             }
         };
+        let declaration_inventory = values::java_declaration_inventory(prepared);
         lower_procedure_batch(
             &specs,
             initial_work,
@@ -221,6 +207,7 @@ impl ProgramSemanticsLowerer for JavaSemanticLowerer {
                     spec,
                     &procedure_targets,
                     &structural_node_index,
+                    &declaration_inventory,
                     staged_budget,
                     cancellation,
                 )
@@ -377,10 +364,13 @@ struct LoweringContext<'tree, 'targets> {
     return_type: Option<Node<'tree>>,
     expression_values: HashMap<usize, ValueId>,
     constant_index_values: HashMap<Box<str>, ValueId>,
+    /// The file's declaration inventory, built once per file by `lower`
+    /// and shared read-only by every procedure. Building it walks the whole
+    /// file, so a per-procedure build costs procedures x file nodes.
     field_declaration_anchors:
-        HashMap<(usize, Box<str>), Option<values::FieldDeclarationAnchor<'tree>>>,
-    source_type_nodes: HashMap<(usize, Box<str>), Option<Node<'tree>>>,
-    type_name_roots: HashSet<Box<str>>,
+        &'targets HashMap<(usize, Box<str>), Option<values::FieldDeclarationAnchor<'tree>>>,
+    source_type_nodes: &'targets HashMap<(usize, Box<str>), Option<Node<'tree>>>,
+    type_name_roots: &'targets HashSet<Box<str>>,
     local_types: HashMap<ValueId, Box<str>>,
     local_type_nodes: HashMap<ValueId, Node<'tree>>,
     /// Effectively final `int` and `long` locals whose initializer is an
@@ -390,6 +380,7 @@ struct LoweringContext<'tree, 'targets> {
     constant_locals: HashMap<ValueId, numeric::JavaNumericLiteral>,
     array_values: HashSet<ValueId>,
     non_null_values: HashSet<ValueId>,
+    written_bindings: HashSet<ValueId>,
     catch_binders: HashMap<ProgramPointId, ValueId>,
     /// The value of each switch expression in this procedure, keyed by the
     /// point its `yield` completions end at. A `yield` resolves its
@@ -398,7 +389,7 @@ struct LoweringContext<'tree, 'targets> {
     /// Query-local filter for pattern spellings in this file. The shared
     /// lexical resolver proves each reference; missing value establishments
     /// and record-component extraction keep explicit gaps.
-    pattern_variable_names: HashSet<Box<str>>,
+    pattern_variable_names: &'targets HashSet<Box<str>>,
     parameters: HashMap<Box<str>, ValueId>,
     locals: HashMap<Box<str>, Vec<LocalBinding>>,
     /// The per-procedure, per-field-name "virtual local" carrier #2573's
@@ -476,6 +467,43 @@ mod persistence_tests {
         {
             SemanticOutcome::Complete { value, .. } => value,
             other => panic!("fixture lowering must complete: {other:?}"),
+        }
+    }
+
+    #[test]
+    #[hardwon("#12650: Java lowering rebuilt the whole-file declaration inventory per procedure")]
+    fn declaration_inventory_work_does_not_grow_with_procedure_count() {
+        // Each method has an instanceof pattern, so pattern lookups run in
+        // every procedure. The inventory walks the whole file, so it is built
+        // once per file and its node count follows the file, not the
+        // procedure count times the file.
+        let mut measured = Vec::new();
+        for methods in [200, 400, 800] {
+            let mut source = String::from("class C {\n");
+            for index in 0..methods {
+                source.push_str(&format!(
+                    "  int m{index}(Object o) {{ if (o instanceof String s) {{ return s.length(); }} return {index}; }}\n"
+                ));
+            }
+            source.push_str("}\n");
+            values::INVENTORY_BUILDS.with(|builds| builds.set(0));
+            values::INVENTORY_NODES.with(|nodes| nodes.set(0));
+            let parts = lower_call_control_fixture(&source);
+            assert_eq!(parts.len(), methods, "one procedure per method");
+            let builds = values::INVENTORY_BUILDS.with(|builds| builds.get());
+            let nodes = values::INVENTORY_NODES.with(|nodes| nodes.get());
+            measured.push((methods, builds, nodes));
+        }
+        assert!(
+            measured.iter().all(|(_, builds, _)| *builds == 1),
+            "{measured:?}"
+        );
+        // Doubling the methods roughly doubles the file's nodes; allow slack
+        // for the class declaration and header.
+        for pair in measured.windows(2) {
+            let (_, _, small) = pair[0];
+            let (_, _, large) = pair[1];
+            assert!(large <= small * 2 + 10, "{measured:?}");
         }
     }
 

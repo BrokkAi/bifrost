@@ -5,7 +5,8 @@ use brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer;
 use brokk_bifrost_analysis::analyzer::resolution::SemanticId;
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedNativeTypes;
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::SelectedLocalDeclarationOutcome;
-use brokk_bifrost_core::analyzer::model::Language;
+use brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::SelectedSourceDeclarationCandidateOutcome;
+use brokk_bifrost_core::analyzer::model::{CodeUnit, Language};
 
 use brokk_bifrost_analysis::analyzer::resolution::ResolutionCompletion;
 use brokk_bifrost_core::cancellation::CancellationToken;
@@ -43,6 +44,7 @@ use brokk_bifrost_analysis::analyzer::store::resolution_operation::go_named::GoP
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::go_named::GoPreparedImportContextOutcome;
 
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::go_named::GoSelectedExternalImport;
+use brokk_bifrost_analysis::analyzer::store::resolution_operation::go_named::GoSelectedImportNamespace;
 
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionContextMetrics;
 
@@ -176,7 +178,7 @@ pub(crate) fn declared_external_receiver_call(
             crate::analyzer::usages::get_definition::go::AnalyzerGoDefinitionProvider::bounded(
                 go,
                 &session,
-                query.analyzer.semantic_model_overlay(),
+                query.analyzer.semantic_model_overlay_read().published(),
             );
         let (parameter_count, spread) =
             crate::analyzer::usages::get_definition::go::go_selected_receiver_argument_shape(
@@ -1147,6 +1149,9 @@ fn go_declaration_definition(
         }
     }
     Some(DefinitionLookupOutcome {
+        selected_sites: Vec::new(),
+        inventory_evidence: None,
+        incomplete_evidence: None,
         modeled_definitions: Vec::new(),
         status: DefinitionLookupStatus::Resolved,
         reference: Some(site.clone()),
@@ -1157,6 +1162,7 @@ fn go_declaration_definition(
 }
 
 struct GoNativeDefinitionEvidence {
+    import_namespace: Option<GoSelectedImportNamespace>,
     selected_callable_result_count: Option<usize>,
     source_member_evidence: Option<Box<[brokk_bifrost_analysis::analyzer::usages::get_definition::SourceMemberCallEvidence]>>,
     model_selection: Option<Box<brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::ProjectedNativeModelMemberSelection>>,
@@ -1684,6 +1690,146 @@ impl<'a> GoNativePointRequest<'a> {
             .resolve_local_declaration_bounded(locator, budget, cancellation)
     }
 
+    pub(crate) fn resolve_source_declaration_candidate(
+        &mut self,
+        locator: &SelectedSemanticLocator,
+        budget: brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget,
+        cancellation: &CancellationToken,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<
+        BoundedResolution<SelectedSourceDeclarationCandidateOutcome>,
+    > {
+        self.operation
+            .resolve_source_declaration_candidate_bounded(locator, budget, cancellation)
+    }
+
+    /// Validate a source-field candidate against the complete native binding.
+    /// This stays below Go definition/application inference and its guards.
+    pub(crate) fn validate_source_field_candidate(
+        &mut self,
+        candidate: (SemanticId, &CodeUnit),
+        locator: &SelectedSemanticLocator,
+        budget: brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget,
+        cancellation: &CancellationToken,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<
+        BoundedResolution<SelectedResolutionOperationOutcome<Option<()>>>,
+    > {
+        use brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::{
+            SelectedNativeDefinition, SelectedNativeDefinitions,
+        };
+        let file = candidate.1.source();
+        let path = brokk_bifrost_core::path_utils::rel_path_string(file);
+        debug_assert_eq!(locator.relative_path(), path);
+        let Some(prepared) = self.file_context(&path, cancellation)? else {
+            return Ok(if cancellation.is_cancelled() {
+                BoundedResolution::Cancelled {
+                    work: Default::default(),
+                }
+            } else {
+                BoundedResolution::Unavailable {
+                    reason: "selected Go binding context is unavailable",
+                    work: Default::default(),
+                }
+            });
+        };
+        let result = self
+            .operation
+            .resolve_native_reference_units_bounded_for_go_request(
+                prepared.context,
+                None,
+                locator,
+                budget,
+                cancellation,
+                &mut SelectedResolutionContextMetrics,
+                self.forward_candidate_artifacts.entry(path).or_default(),
+                &mut self.point_metrics,
+            )?;
+        let (located, work) = match result {
+            BoundedResolution::Complete {
+                value: SelectedResolutionOperationOutcome::Native(value),
+                work,
+            } => (value, work),
+            BoundedResolution::Complete {
+                value: SelectedResolutionOperationOutcome::Unavailable(reason),
+                work,
+            } => {
+                return Ok(BoundedResolution::Complete {
+                    value: SelectedResolutionOperationOutcome::Unavailable(reason),
+                    work,
+                });
+            }
+            BoundedResolution::Complete {
+                value: SelectedResolutionOperationOutcome::Stale(reason),
+                work,
+            } => {
+                return Ok(BoundedResolution::Complete {
+                    value: SelectedResolutionOperationOutcome::Stale(reason),
+                    work,
+                });
+            }
+            BoundedResolution::Complete {
+                value: SelectedResolutionOperationOutcome::Cancelled(completion),
+                work,
+            } => {
+                return Ok(BoundedResolution::Complete {
+                    value: SelectedResolutionOperationOutcome::Cancelled(completion),
+                    work,
+                });
+            }
+            BoundedResolution::Exceeded { limit, work } => {
+                return Ok(BoundedResolution::Exceeded { limit, work });
+            }
+            BoundedResolution::Unavailable { reason, work } => {
+                return Ok(BoundedResolution::Unavailable { reason, work });
+            }
+            BoundedResolution::Cancelled { work } => {
+                return Ok(BoundedResolution::Cancelled { work });
+            }
+        };
+        let absent = || BoundedResolution::Complete {
+            value: SelectedResolutionOperationOutcome::Native(None),
+            work,
+        };
+        let SelectedResolutionLocated::Found(answer) = located else {
+            return Ok(absent());
+        };
+        let rows = match answer.definitions {
+            SelectedNativeDefinitions::Ready(rows) => rows,
+            SelectedNativeDefinitions::Unavailable => {
+                return Ok(BoundedResolution::Unavailable {
+                    reason: "selected Go variable projection is unavailable",
+                    work,
+                });
+            }
+            SelectedNativeDefinitions::Cancelled => {
+                return Ok(BoundedResolution::Cancelled { work });
+            }
+        };
+        if answer.answer.binding().completion() != &ResolutionCompletion::Complete {
+            return Ok(absent());
+        }
+        let [binder] = answer.answer.binding().targets() else {
+            return Ok(absent());
+        };
+        if *binder != candidate.0 {
+            return Ok(absent());
+        }
+        let selected = match rows.as_slice() {
+            [(identity, SelectedNativeDefinition::Unit(unit))]
+                if identity == binder
+                    && unit == candidate.1
+                    && unit.is_field()
+                    && unit.source() == file =>
+            {
+                Some(())
+            }
+            _ => None,
+        };
+        Ok(BoundedResolution::Complete {
+            value: SelectedResolutionOperationOutcome::Native(selected),
+            work,
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn method_family_for_test(
         &self,
@@ -2173,6 +2319,111 @@ impl<'a> GoNativePointRequest<'a> {
         Ok(Some(overlay))
     }
 
+    fn discard_file_context_memo_state(&mut self) {
+        self.files.clear();
+        self.file_context_reads.clear();
+        self.forward_candidate_artifacts.clear();
+        self.operation.discard_go_request_derived_state();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assert_file_context_conformance_for_test(&self, path: &str) {
+        use brokk_bifrost_analysis::analyzer::usages::common::{
+            QueryMemoOwner, assert_memo_owner_conformance_for_test,
+        };
+        let file = brokk_bifrost_core::analyzer::model::ProjectFile::new(
+            self.go.inner.project().root(),
+            path,
+        );
+        assert_memo_owner_conformance_for_test(
+            QueryMemoOwner::GoFileContext,
+            &self.go.inner,
+            || match Self::open_for_file(
+                self.go,
+                &file,
+                self.overlay.clone(),
+                &CancellationToken::new(),
+            )
+            .unwrap()
+            {
+                GoNativePointRequestOpen::Ready(request) => request,
+                _ => panic!("conformance context request must open"),
+            },
+            |request| {
+                request
+                    .prepare_file_context(path, &CancellationToken::new())
+                    .unwrap()
+                    .is_some()
+            },
+            |request| {
+                if request.files.is_empty() {
+                    assert!(request.file_context_reads.is_empty());
+                    assert!(request.forward_candidate_artifacts.is_empty());
+                    assert!(request.operation.go_request_derived_state_empty_for_test());
+                    false
+                } else {
+                    assert_eq!(request.files.len(), request.file_context_reads.len());
+                    true
+                }
+            },
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn snapshot_hits_for_test(&self) -> usize {
+        self.go
+            .inner
+            .store_context
+            .store
+            .cache_budget
+            .go_prepared_context_hits_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assert_demand_deadline_at_preparation_boundary_for_test(&self, path: &str) {
+        let selected = self
+            .operation
+            .go_context_for_file(&self.base_profile, path)
+            .unwrap()
+            .unwrap();
+        self.operation
+            .assert_go_demand_deadline_at_preparation_boundary_for_test(selected.context_id, path)
+            .unwrap();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assert_rejected_context_fill_rolls_back_for_test(&mut self, path: &str) {
+        use brokk_bifrost_analysis::analyzer::usages::common::{
+            QueryMemoOwner, capture_mutable_memo_reads,
+        };
+        let analyzer = &self.go.inner;
+        let (context, receipt) = capture_mutable_memo_reads(
+            QueryMemoOwner::GoFileContext,
+            analyzer,
+            self,
+            None,
+            Self::discard_file_context_memo_state,
+            |request| {
+                let context = request
+                    .prepare_file_context(path, &CancellationToken::new())
+                    .unwrap();
+                analyzer.record_budget_dependences(1);
+                context
+            },
+        );
+        assert!(context.is_some());
+        assert!(receipt.is_none());
+        assert!(self.files.is_empty());
+        assert!(self.file_context_reads.is_empty());
+        assert!(self.forward_candidate_artifacts.is_empty());
+        assert!(self.operation.go_request_derived_state_empty_for_test());
+        assert!(
+            self.prepare_file_context(path, &CancellationToken::new())
+                .unwrap()
+                .is_some()
+        );
+    }
+
     fn prepare_file_context(
         &mut self,
         path: &str,
@@ -2182,19 +2433,34 @@ impl<'a> GoNativePointRequest<'a> {
             return Ok(None);
         }
         if let Some(context) = self.files.get(path) {
-            if let Some(reads) = self.file_context_reads.get(path) {
-                brokk_bifrost_analysis::analyzer::usages::common::replay_memo_reads(
-                    reads,
-                    &self.go.inner,
-                );
-            }
+            let reads = self
+                .file_context_reads
+                .get(path)
+                .expect("an admitted Go file context has a completion receipt");
+            brokk_bifrost_analysis::analyzer::usages::common::replay_memo_reads(
+                reads,
+                &self.go.inner,
+            );
             return Ok(Some(context.clone()));
         }
-        let (result, reads) = brokk_bifrost_analysis::analyzer::usages::common::capture_memo_reads(
-            &self.go.inner,
-            || self.prepare_file_context_uncached(path, cancellation),
-        );
-        if result.as_ref().is_ok_and(Option::is_some) {
+        let (result, reads) =
+            brokk_bifrost_analysis::analyzer::usages::common::capture_mutable_memo_reads(
+                brokk_bifrost_analysis::analyzer::usages::common::QueryMemoOwner::GoFileContext,
+                &self.go.inner,
+                self,
+                None,
+                Self::discard_file_context_memo_state,
+                |request| {
+                    let result = request.prepare_file_context_uncached(path, cancellation);
+                    brokk_bifrost_analysis::analyzer::usages::common::memo_store_result(
+                        &request.go.inner,
+                        result,
+                    )
+                },
+            );
+        if result.as_ref().is_ok_and(Option::is_some)
+            && let Some(reads) = reads
+        {
             self.file_context_reads.insert(path.to_owned(), reads);
         }
         result
@@ -2232,10 +2498,6 @@ impl<'a> GoNativePointRequest<'a> {
         };
         self.files.insert(path.to_owned(), context.clone());
         Ok(Some(context))
-    }
-
-    pub(crate) fn reader_excludes_store_access(&self) -> bool {
-        self.operation.ready.inventory.conn.excludes_store_access()
     }
 
     #[cfg(test)]
@@ -2470,12 +2732,19 @@ impl<'a> GoNativePointRequest<'a> {
         let canonical_source_complete = !tree.root_node().has_error();
         use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
         let syntax_session = ResolutionSession::bounded(query.budget, Some(&cancellation));
-        let eligible = super::type_identity_proof::explicit_binding_type_node(
+        let eligible = super::type_identity_proof::explicit_binding_type_nodes(
             tree.root_node(),
             binding,
             || syntax_session.scope_step(),
         )
-        .is_some();
+        .is_some_and(|(name, _)| {
+            let declaration = name.parent().expect("a written type has a declaration");
+            declaration.kind() != "parameter_declaration"
+                || !super::type_identity_proof::parameter_has_generic_callable_context(
+                    declaration,
+                    &mut || syntax_session.scope_step(),
+                )
+        });
         let syntax_work = match syntax_session.finish(eligible) {
             BoundedResolution::Complete { value: true, work } => work,
             BoundedResolution::Complete { value: false, work } => {
@@ -2551,18 +2820,14 @@ impl<'a> GoNativePointRequest<'a> {
                     }
                     SelectedNativeDefinition::Unit(unit) => {
                         let ranges = self.go.ranges_limited(unit, 2);
-                        unit.source() == query.file
-                            && ranges.complete
-                            // Parser-unit ranges cover the whole var_spec,
-                            // including all names in `var a, b T`. The syntax
-                            // check above selected an exact identifier; pair
-                            // that identifier with this unit, not its sibling.
-                            && query.source.get(binding.start_byte..binding.end_byte)
-                                == Some(unit.terminal_name())
-                            && ranges.rows.iter().any(|range| {
-                                range.start_byte <= binding.start_byte
-                                    && binding.end_byte <= range.end_byte
-                            })
+                        ranges.complete
+                            && super::type_identity_proof::selected_unit_binding_is_exact(
+                                unit,
+                                query.file,
+                                query.source,
+                                binding,
+                                &ranges.rows,
+                            )
                     }
                     SelectedNativeDefinition::Intrinsic { .. }
                     | SelectedNativeDefinition::ExternalOwner { .. } => false,
@@ -3107,7 +3372,7 @@ impl<'a> GoNativePointRequest<'a> {
                     }
                     }
                     SelectedResolutionOperationOutcome::Native(
-                        SelectedResolutionLocated::Missing,
+                        SelectedResolutionLocated::Missing(_),
                     ) => {
                         let value =
                             go_interface_method_owner_type(query, self.go).unwrap_or_else(|| {
@@ -3365,6 +3630,19 @@ impl<'a> GoNativePointRequest<'a> {
                 query.site.focus_end_byte,
             )
         });
+        // A completed preparation may be returned without memo admission.
+        // Keep that exact value for namespace projection; the memo is optional.
+        let import_namespace_context = query
+            .tree
+            .or(parsed_tree.as_ref())
+            .is_some_and(|tree| {
+                brokk_bifrost_go::references::go_selector_descriptor(tree.root_node(), query.site)
+                    .is_some_and(|selector| {
+                        selector.focus_segment == 0
+                            && matches!(selector.base.kind(), "identifier" | "package_identifier")
+                    })
+            })
+            .then(|| file_context.context.clone());
         let artifacts = self
             .forward_candidate_artifacts
             .entry(path.clone())
@@ -3372,7 +3650,7 @@ impl<'a> GoNativePointRequest<'a> {
         let locator = if call_selector {
             SelectedSemanticLocator::for_reference_range_preferring_namespace(
                 "go",
-                path,
+                &path,
                 query.site.focus_start_byte,
                 query.site.focus_end_byte,
                 // Go call sites share their reference with conversions; the
@@ -3384,7 +3662,7 @@ impl<'a> GoNativePointRequest<'a> {
         } else {
             SelectedSemanticLocator::for_reference_range(
                 "go",
-                path,
+                &path,
                 query.site.focus_start_byte,
                 query.site.focus_end_byte,
             )
@@ -3435,12 +3713,33 @@ impl<'a> GoNativePointRequest<'a> {
         let result = match go_definition_operation(query.site, native) {
             GoDefinitionOperation::Native {
                 value: SelectedResolutionLocated::Found(answer),
-                work,
+                mut work,
             } => match answer.definitions {
                 brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::SelectedNativeDefinitions::Cancelled => {
                     BoundedResolution::Cancelled { work }
                 }
                 _ => {
+                    let import_namespace = if let Some(context) = import_namespace_context {
+                        let session = brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession::bounded(
+                            query.budget.remaining_after(&work), Some(&cancellation),
+                        );
+                        let selected = context.selected_import_namespace(&answer.answer, &session);
+                        match session.finish(selected) {
+                            BoundedResolution::Complete { value, work: projection_work } => {
+                                work = go_add_resolution_work(work, projection_work);
+                                value
+                            }
+                            BoundedResolution::Exceeded { limit, work: projection_work } => {
+                                return (BoundedResolution::Exceeded { limit, work: go_add_resolution_work(work, projection_work) }, selected_imports);
+                            }
+                            BoundedResolution::Unavailable { reason, work: projection_work } => {
+                                return (BoundedResolution::Unavailable { reason, work: go_add_resolution_work(work, projection_work) }, selected_imports);
+                            }
+                            BoundedResolution::Cancelled { work: projection_work } => {
+                                return (BoundedResolution::Cancelled { work: go_add_resolution_work(work, projection_work) }, selected_imports);
+                            }
+                        }
+                    } else { None };
                     let source_member_evidence = if answer.model_member_selection.is_none()
                         && let brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::SelectedNativeDefinitions::Ready(projected) = &answer.definitions
                     {
@@ -3528,7 +3827,10 @@ impl<'a> GoNativePointRequest<'a> {
                     let model_selection = answer.model_member_selection.clone().filter(|selection| selection.native_target_count == 0 || selection.candidates.iter().any(|candidate| candidate.selected && !candidate.rejected));
                     let outcome = if model_selection.is_some() {
                         DefinitionLookupOutcome {
-                            modeled_definitions: Vec::new(), status: DefinitionLookupStatus::Incomplete,
+                            selected_sites: Vec::new(),
+                            inventory_evidence: None,
+                            incomplete_evidence: None,
+        modeled_definitions: Vec::new(), status: DefinitionLookupStatus::Incomplete,
                             reference: Some(query.site.clone()), definitions: match &answer.definitions {
                                 brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::SelectedNativeDefinitions::Ready(rows) => rows.iter().filter_map(|(_, definition)| match definition {
                                     brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::SelectedNativeDefinition::Unit(unit) => Some(unit.clone()), _ => None,
@@ -3544,6 +3846,7 @@ impl<'a> GoNativePointRequest<'a> {
                         value: (
                             outcome,
                             Some(GoNativeDefinitionEvidence {
+                                import_namespace,
                                 selected_callable_result_count,
                                 source_member_evidence,
                                 model_selection,
@@ -3557,7 +3860,7 @@ impl<'a> GoNativePointRequest<'a> {
                 }
             },
             GoDefinitionOperation::Native {
-                value: SelectedResolutionLocated::Missing,
+                value: SelectedResolutionLocated::Missing(_),
                 work,
             } => BoundedResolution::Complete {
                 value: (
@@ -3959,6 +4262,18 @@ impl<'a> GoNativePointRequest<'a> {
         query: BoundedReceiverQuery<'_>,
     ) -> BoundedResolution<GoNativeDefinitionResolution> {
         let (mut native, selected_imports) = self.resolve_definition_native(query);
+        // Capture the native ownership obligation before any syntax projection
+        // replaces the answer. Native model selections name a pinned external
+        // declaring owner, independently of source-package absence.
+        let unproved_external_provider = matches!(
+            &native,
+            BoundedResolution::Complete {
+                value: (_, Some(evidence)), ..
+            } if evidence.model_selection.is_none()
+                && evidence.answer.projected_frontiers().iter().any(|state| {
+                    !state.unindexed_external().is_empty()
+                })
+        ) && !self.go.workspace_package_inventory_complete();
         let parsed_tree = query
             .tree
             .is_none()
@@ -3989,6 +4304,9 @@ impl<'a> GoNativePointRequest<'a> {
                             let mut reference = query.site.clone();
                             reference.text = projection.direct_target.canonical_symbol;
                             *outcome = DefinitionLookupOutcome {
+                                selected_sites: Vec::new(),
+                                inventory_evidence: None,
+                                incomplete_evidence: None,
                                 modeled_definitions: Vec::new(),
                                 status: DefinitionLookupStatus::NoDefinition,
                                 reference: Some(reference),
@@ -4270,6 +4588,68 @@ impl<'a> GoNativePointRequest<'a> {
                             error.to_string(),
                         )
                     }
+                }
+            }
+        }
+        if unproved_external_provider && let BoundedResolution::Complete { value, .. } = &mut answer
+        {
+            // List every carrier explicitly: adding a proof field must revisit
+            // this downgrade. No finisher may certify an unproved owner.
+            let GoNativeDefinitionResolution {
+                selected_callable_result_count,
+                source_member_evidence,
+                native_resolution,
+                model_member_selection,
+                outcome,
+                call_application,
+                exact_external_call,
+                external_callee_identity,
+            } = value;
+            *selected_callable_result_count = None;
+            *source_member_evidence = None;
+            *native_resolution = None;
+            *model_member_selection = None;
+            *call_application = CallApplicationKind::Unknown;
+            *exact_external_call = None;
+            *external_callee_identity = None;
+            let DefinitionLookupOutcome {
+                selected_sites,
+                // Keep query-local causes of incompleteness, never target proof.
+                inventory_evidence: _,
+                incomplete_evidence: _,
+                modeled_definitions,
+                status,
+                reference: _,
+                definitions,
+                lexical_definition,
+                diagnostics,
+            } = outcome;
+            selected_sites.clear();
+            modeled_definitions.clear();
+            definitions.clear();
+            *lexical_definition = None;
+            diagnostics.retain_mut(|diagnostic| {
+                let DefinitionLookupDiagnostic { kind, message: _, claim } = diagnostic;
+                *claim = None;
+                !brokk_bifrost_analysis::analyzer::usages::get_definition::is_adjudicated_answer_diagnostic_kind(kind)
+            });
+            if matches!(
+                status,
+                DefinitionLookupStatus::Resolved
+                    | DefinitionLookupStatus::NoDefinition
+                    | DefinitionLookupStatus::UnresolvableImportBoundary
+                    | DefinitionLookupStatus::Incomplete
+            ) {
+                *status = DefinitionLookupStatus::Incomplete;
+                if !diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.kind == "go-package-incomplete")
+                {
+                    diagnostics.push(DefinitionLookupDiagnostic {
+                        claim: None,
+                        kind: "go-package-incomplete".into(),
+                        message: "the request's workspace package inventory cannot prove an external provider".into(),
+                    });
                 }
             }
         }
@@ -4697,7 +5077,7 @@ pub(crate) fn resolve_go_definition_with_evidence_bounded(
     after_open();
     // The selected operation consumes this authority during resolution. The
     // input capture above is read-free; record the pinned model dependency here.
-    let _ = query.analyzer.semantic_model_overlay();
+    let _ = query.analyzer.semantic_model_overlay_read().published();
     let result = request.resolve_definition_with_evidence(query);
     if let Some(profile) = profile {
         profile.report_definition(&request, &result);
@@ -4744,18 +5124,18 @@ fn finish_go_definition_resolution(
             work,
         } => {
             let (
-                native_answer,
                 local_receiver_application,
                 model_selection,
                 source_member_evidence,
                 selected_callable_result_count,
+                import_namespace,
             ) = native_evidence.map_or((None, None, None, None, None), |evidence| {
                 (
-                    Some(evidence.answer),
                     evidence.receiver_application,
                     evidence.model_selection,
                     evidence.source_member_evidence,
                     evidence.selected_callable_result_count,
+                    evidence.import_namespace,
                 )
             });
             if query.cancellation.is_some_and(|token| token.is_cancelled()) {
@@ -4842,23 +5222,6 @@ fn finish_go_definition_resolution(
                             | "native_definition_projection_unavailable"
                     )
                 });
-            let native_unindexed_frontier = native_answer.as_ref().is_some_and(|answer| {
-                answer
-                    .projected_frontiers()
-                    .iter()
-                    .any(|state| !state.unindexed_external().is_empty())
-            }) && outcome.status
-                == DefinitionLookupStatus::UnresolvableImportBoundary;
-            if native_unindexed_frontier && !go.workspace_package_inventory_complete() {
-                // A presumed name cannot prove that an unplaced or overlaid
-                // workspace package is external to this request.
-                outcome.status = DefinitionLookupStatus::Incomplete;
-                outcome.diagnostics.push(DefinitionLookupDiagnostic {
-                    claim: None,
-                    kind: "go-package-incomplete".into(),
-                    message: "the request's workspace package inventory cannot prove an external provider".into(),
-                });
-            }
             let external_candidate_status = matches!(
                 outcome.status,
                 DefinitionLookupStatus::Resolved
@@ -4892,11 +5255,59 @@ fn finish_go_definition_resolution(
                     query.site.focus_end_byte,
                 )
             });
+            if import_qualifier {
+                let projection = brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession::bounded(
+                    query.budget.remaining_after(&work), query.cancellation,
+                );
+                if let Some(namespace) = import_namespace {
+                    outcome = crate::analyzer::usages::get_definition::go::go_selected_import_namespace_resolution(
+                        BoundedReceiverQuery { tree, ..query }, &projection, namespace,
+                    ).unwrap_or_else(|| unavailable_definition(
+                        query.site, "native_import_projection_unavailable",
+                        "the selected import has no exact source syntax projection".into(),
+                    ));
+                }
+                let projected = projection.finish(GoNativeDefinitionResolution {
+                    selected_callable_result_count: None,
+                    source_member_evidence,
+                    native_resolution: None,
+                    model_member_selection: None,
+                    outcome,
+                    call_application: CallApplicationKind::Unknown,
+                    exact_external_call: None,
+                    external_callee_identity: None,
+                });
+                return match projected {
+                    BoundedResolution::Complete {
+                        value,
+                        work: projection_work,
+                    } => BoundedResolution::Complete {
+                        value,
+                        work: go_add_resolution_work(work, projection_work),
+                    },
+                    BoundedResolution::Exceeded {
+                        limit,
+                        work: projection_work,
+                    } => BoundedResolution::Exceeded {
+                        limit,
+                        work: go_add_resolution_work(work, projection_work),
+                    },
+                    BoundedResolution::Unavailable {
+                        reason,
+                        work: projection_work,
+                    } => BoundedResolution::Unavailable {
+                        reason,
+                        work: go_add_resolution_work(work, projection_work),
+                    },
+                    BoundedResolution::Cancelled {
+                        work: projection_work,
+                    } => BoundedResolution::Cancelled {
+                        work: go_add_resolution_work(work, projection_work),
+                    },
+                };
+            }
             if external_candidate_status
-                && (!selected_imports.is_empty()
-                    || import_qualifier
-                    || external_package_member
-                    || identifier_call)
+                && (!selected_imports.is_empty() || external_package_member || identifier_call)
                 && let Some(tree) = tree
             {
                 let query_with_tree = BoundedReceiverQuery {
@@ -4913,31 +5324,7 @@ fn finish_go_definition_resolution(
                         if !matches!(selector.base.kind(), "identifier" | "package_identifier") {
                             return None;
                         }
-                        if selector.focus_segment == 0 {
-                            selected_imports
-                                .iter()
-                                .find_map(|selected| {
-                                    crate::analyzer::usages::get_definition::go::go_native_external_import_binding_resolution(
-                                        query_with_tree,
-                                        go,
-                                        &external_session,
-                                        selected,
-                                    )
-                                })
-                                .map(|outcome| {
-                                    (outcome, None, CallApplicationKind::Unknown, None)
-                                })
-                                .or_else(|| {
-                                    crate::analyzer::usages::get_definition::go::go_native_import_namespace_resolution(
-                                        query_with_tree,
-                                        go,
-                                        &external_session,
-                                    )
-                                    .map(|outcome| {
-                                        (outcome, None, CallApplicationKind::Unknown, None)
-                                    })
-                                })
-                        } else if selector.focus_segment == 1 {
+                        if selector.focus_segment == 1 {
                             selected_imports.iter().find_map(|selected| {
                                 crate::analyzer::usages::get_definition::go::go_native_external_package_member_resolution(
                                         query_with_tree,
@@ -5178,7 +5565,7 @@ pub(crate) fn resolve_go_type_bounded(
         }
     };
     after_open();
-    let _ = query.analyzer.semantic_model_overlay();
+    let _ = query.analyzer.semantic_model_overlay_read().published();
     let result = request.resolve_type(query);
     if let Some(profile) = profile {
         profile.report_type(&request, &result);

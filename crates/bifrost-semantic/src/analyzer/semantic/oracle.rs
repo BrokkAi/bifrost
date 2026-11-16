@@ -19,6 +19,8 @@ pub mod limits;
 #[doc(hidden)]
 pub mod model;
 #[doc(hidden)]
+pub mod payload_projection;
+#[doc(hidden)]
 pub mod relation;
 #[doc(hidden)]
 pub mod retained;
@@ -44,3 +46,5 @@ pub use crate::analyzer::semantic::oracle::relation::*;
 pub use crate::analyzer::semantic::oracle::traits::*;
 
 pub use crate::analyzer::semantic::oracle::value_flow::*;
+
+pub use crate::analyzer::semantic::oracle::payload_projection::*;

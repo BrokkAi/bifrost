@@ -344,6 +344,7 @@ mod rust_departing_tests_tests {
     }
 
     #[test]
+    #[hardwon("#11183: local-root workspace aliases were rejected by shared import admission")]
     fn reverse_inventory_keeps_workspace_member_and_renamed_crate_roots() {
         let workspace_root = workspace_api_client(
             "pub fn target() {}",
@@ -363,6 +364,15 @@ mod rust_departing_tests_tests {
         assert!(
             matches!(result.completeness, EdgeCompleteness::Incomplete { .. }),
             "an extern-crate rename to a workspace member is not an external root: {result:?}"
+        );
+        let local_alias = workspace_api_client(
+            "pub fn target() {}",
+            "extern crate renamed as d; mod inner { use crate::d as alias; pub fn caller() { alias::missing::target(); } }",
+        );
+        let result = inverse_result_for(&local_alias, "api/src/lib.rs", "target");
+        assert!(
+            matches!(result.completeness, EdgeCompleteness::Incomplete { .. }),
+            "a locally rooted workspace crate alias remains in the workspace: {result:?}"
         );
     }
 
@@ -621,12 +631,17 @@ mod rust_departing_tests_tests {
             let mut source = "pub fn target() {} pub fn z_after() {} pub fn caller() { crate::target(); crate::z_after(); }\n".to_owned();
             for index in 0..unrelated {
                 source.push_str(&format!("pub mod decoy{index};\n"));
-                builder = builder.file(
-                    format!("src/decoy{index}.rs"),
-                    format!(
+                builder = builder
+                    .file(
+                        format!("src/decoy{index}.rs"),
+                        format!(
                         "pub fn target() {{}} pub fn caller() {{ crate::decoy{index}::target(); }}"
                     ),
-                ).file(format!("isolated/decoy{index}.rs"), "pub fn target() {} pub fn caller() { crate::target(); }");
+                    )
+                    .file(
+                        format!("isolated/decoy{index}.rs"),
+                        "pub fn target() {} pub fn caller() { crate::target(); }",
+                    );
             }
             let fixture = builder.file("src/lib.rs", source).build();
             let analyzer = fixture.workspace_analyzer(AnalyzerConfig::default());
@@ -967,7 +982,9 @@ mod rust_departing_tests_tests {
         let summary_keys: Vec<i64> = conn
             .prepare(SAME_BLOB_TYPE_EXPORT_KEYS_SQL)
             .unwrap()
-            .query_map(params![blob, "Target", target_site], |row| row.get(0))
+            .query_map(params![blob, "Target", target_site, "src/lib.rs"], |row| {
+                row.get(0)
+            })
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
@@ -1043,6 +1060,7 @@ mod rust_departing_tests_tests {
                         Value::Integer(blob),
                         Value::Text("Target".into()),
                         Value::Integer(target_site),
+                        Value::Text("src/lib.rs".into()),
                     ],
                     &[
                         "resolution_unit_summary_members_blob",
@@ -1060,7 +1078,6 @@ mod rust_departing_tests_tests {
                     ],
                     &[
                         "resolution_unit_summary_members_blob",
-                        "resolution_unit_summary_placements_member",
                         "rust_resolution_unit_summary_exports_declaration",
                     ][..],
                 ),
@@ -1075,6 +1092,17 @@ mod rust_departing_tests_tests {
                     assert!(
                         plan.iter().any(|row| row.contains(index)),
                         "{state:?} {name} requires {index}: {plan:?}"
+                    );
+                }
+                if name == "same_blob_type_exports" {
+                    assert!(
+                        plan.iter().any(|row| {
+                            (row.contains("resolution_unit_summary_placements_member")
+                                || row
+                                    .contains("resolution_unit_summary_placements_surface_lookup"))
+                                && row.contains("(summary_id=? AND member_ordinal=?)")
+                        }),
+                        "{state:?} {name} requires a keyed placement lookup: {plan:?}"
                     );
                 }
                 assert!(

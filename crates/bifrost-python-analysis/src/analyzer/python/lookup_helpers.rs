@@ -53,7 +53,7 @@ pub(crate) fn python_member_outcome(
     if candidates.is_empty()
         && !cross_language_owner
         && let Some(python) = resolve_analyzer::<PythonAnalyzer>(analyzer)
-        && let Some(overlay) = analyzer.semantic_model_overlay()
+        && let Some(overlay) = analyzer.semantic_model_overlay_read().published()
         && let Some(symbol) =
             crate::analyzer::python::python_external_value_member_on_workspace_class(
                 python,
@@ -65,6 +65,9 @@ pub(crate) fn python_member_outcome(
         let mut reference = site.clone();
         reference.text = symbol.qualified_name.clone();
         let outcome = DefinitionLookupOutcome {
+            selected_sites: Vec::new(),
+            inventory_evidence: None,
+            incomplete_evidence: None,
             modeled_definitions: vec![symbol],
             status: DefinitionLookupStatus::Resolved,
             reference: Some(reference),

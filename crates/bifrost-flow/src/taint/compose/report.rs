@@ -100,6 +100,10 @@ pub(super) fn build_report<
         sources: &outcome.sources,
         provider,
         functions: &outcome.functions,
+        endpoint_projections: super::endpoint_projections_enabled(
+            Some(plan.value_flow()),
+            provider,
+        ),
         handles: HashMap::default(),
         gaps: Vec::new(),
     };
@@ -413,6 +417,7 @@ struct WitnessBuilder<'a, 'u, Provider> {
     sources: &'a [BoundSource],
     provider: &'a Provider,
     functions: &'a super::labels::LabelFunctions<super::labels::TaintLabels<'u>>,
+    endpoint_projections: bool,
     /// Live handles of procedures a witness run has served.
     handles: HashMap<DurableProcedureKey, ProcedureHandle>,
     /// Why witness runs that recorded no witness were incomplete. The search
@@ -493,6 +498,7 @@ impl<Provider: CompositionProvider<Fact = TaintClassSet, Function = TaintEdgeFun
             let Some(handle) = self.handles.get(&call.0) else {
                 return Ok(None);
             };
+            debug_assert!(handle.validate_durable_locator(&call.0).is_ok());
             let (Some(site), Some(call_handle)) = (
                 handle.semantics().call_site(call.1),
                 handle.call_site_handle(call.1),
@@ -659,7 +665,26 @@ impl<Provider: CompositionProvider<Fact = TaintClassSet, Function = TaintEdgeFun
         function: super::labels::LabelFunctionId,
         request: &mut SemanticRequest<'_>,
     ) -> Result<Option<Vec<SummaryWitnessStep>>, ComposeError> {
-        let Some(seed) = interior_seed(self.sources, from) else {
+        let projected = if self.endpoint_projections
+            && let Endpoint::Port(port @ PartialFlowPort::Heap { root, .. }) = from
+            && matches!(root.as_ref(), PartialFlowPort::CallResult { .. })
+        {
+            if !self.handles.contains_key(procedure) {
+                for (_, flows) in self
+                    .provider
+                    .projected_interior_flows(procedure, &[], &[], false, request)
+                    .map_err(provider_error)?
+                {
+                    self.handles.insert(procedure.clone(), flows.procedure);
+                }
+            }
+            self.handles
+                .get(procedure)
+                .and_then(|handle| crate::composition::projected_return_seed(handle, port))
+        } else {
+            None
+        };
+        let Some(seed) = projected.or_else(|| interior_seed(self.sources, from)) else {
             return Ok(None);
         };
         let (observations, target) = match to {
@@ -740,6 +765,7 @@ pub(super) fn interior_seed<Fact>(
         Endpoint::Source(source) => {
             let source = &sources[source.index()];
             Some(InteriorSeed::Source {
+                selected_entry: source.selected_entry.clone(),
                 point: source.point.id(),
                 phase: source.phase,
                 carrier: source.carrier.clone(),

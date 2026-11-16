@@ -123,7 +123,7 @@ struct ModuleSurface {
 impl RetainedNpmSurface {
     fn read(analyzer: &dyn IAnalyzer, language: Language) -> Self {
         Self {
-            overlay: analyzer.semantic_model_overlay(),
+            overlay: analyzer.semantic_model_overlay_read().published(),
             discovery: analyzer.dependency_discovery_evidence(language),
         }
     }

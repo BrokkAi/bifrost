@@ -1389,6 +1389,36 @@ impl<'request, 'store, 'input> super::demand_closure::DemandRules
             })
             .collect();
         let binding = answer.binding().completion().clone();
+        let imported = answer.binding().targets().iter().any(|binder| {
+            packages.contains_key(&(source_mount, *binder))
+                || selected_demand
+                    .modeled_imports
+                    .contains_key(&(source_mount, *binder))
+                || self
+                    .language
+                    .operation
+                    .ready
+                    .context_identities
+                    .unindexed_go_import(*binder)
+                    .is_some()
+        });
+        // A missing binder is a proved non-import only when all local import
+        // names are known. An unresolved unaliased provider may use another
+        // package clause than its presumed path basename.
+        let retained_binding_completion = if imported {
+            Some(binding.clone())
+        } else if binding == ResolutionCompletion::Complete
+            && !answer.binding().targets().is_empty()
+        {
+            // A complete declaration binding shadows any file-scope import,
+            // even one whose provider has not established its package name.
+            None
+        } else {
+            let Some(names) = selected_demand.import_name_completions.get(&source_mount) else {
+                return Err(StoreError::new("Go import-name inventory is unavailable"));
+            };
+            (names != &ResolutionCompletion::Complete).then(|| binding.combine(names))
+        };
         let context_completion = prepared
             .map(|prepared| prepared.completion.clone())
             .or_else(|| {
@@ -1790,20 +1820,14 @@ impl<'request, 'store, 'input> super::demand_closure::DemandRules
                 .named_semantic(
                     CanonicalHasher::new(b"go-external-member-unprovided:v1").finish(),
                     super::GO_EXTERNAL_MEMBER_UNPROVIDED,
+                    crate::analyzer::resolution::ReasonDeterminism::Unaudited,
                     "no active declaration provider supplies a unique owner for this Go type",
                 )
         });
         let completion = if let Some(reason) = unprovided_reason {
-            let completion = binding.combine(&ResolutionCompletion::incomplete([
+            binding.combine(&ResolutionCompletion::incomplete([
                 ResolutionIncompleteReason::UnsupportedSemantic(reason),
-            ]));
-            // With no exports the closure retains the base relation, and later
-            // candidate reads of a retained base see only keyed endpoint
-            // evidence, so the gap must be keyed here as well, as it is for
-            // a selected owner above.
-            assert!(endpoint_completion.is_none());
-            endpoint_completion = Some(completion.clone());
-            completion
+            ]))
         } else if exports.is_empty() {
             binding.clone()
         } else {
@@ -1817,13 +1841,22 @@ impl<'request, 'store, 'input> super::demand_closure::DemandRules
             if !unprovided_candidate || projection_evidence == ResolutionCompletion::Complete {
                 completion
             } else {
-                let completion = completion.combine(&projection_evidence);
-                // An unprovided candidate has no selected owner, and the
-                // unprovided branch keys evidence only after a complete read.
-                assert!(endpoint_completion.is_none());
-                endpoint_completion = Some(completion.clone());
-                completion
+                completion.combine(&projection_evidence)
             };
+        // Retain the actual import's obligation, or the inability to exclude
+        // an import with an unknown local name. Proved non-imports keep the
+        // base's existing discharge policy; provisional gaps do not key them.
+        let completion = if exports.is_empty()
+            && let Some(binding) = retained_binding_completion
+        {
+            let completion = completion.combine(&binding);
+            if completion != ResolutionCompletion::Complete {
+                endpoint_completion = Some(completion.clone());
+            }
+            completion
+        } else {
+            completion
+        };
         #[cfg(any(test, feature = "test-support"))]
         if unprovided_reason.is_some()
             && let Some(records) = GO_UNPROVIDED_MEMBER_PROBE.lock().unwrap().as_mut()
@@ -2027,6 +2060,69 @@ impl<'request, 'store, 'input> super::demand_closure::DemandRules
 }
 
 impl SelectedResolutionOperation<'_, '_> {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn assert_go_demand_deadline_at_preparation_boundary_for_test(
+        &self,
+        context_id: i64,
+        caller_path: &str,
+    ) -> Result<()> {
+        let caller = self
+            .mount_table()
+            .mount_for_path("go", caller_path)?
+            .unwrap()
+            .ordinal();
+        let role = self
+            .go_source_role_for_mount(context_id, caller, &CancellationToken::new())?
+            .unwrap();
+        let preparation = self.go_file_preparation_key(context_id, caller, caller_path, &role);
+        assert!(self.go_prepared_contexts.get(&preparation).is_none());
+        // The first soft-deadline observation is the request memo's final
+        // admission check. Hard cancellation stays false throughout this demand.
+        let cancellation = CancellationToken::soft_deadline_after_checks_for_test(1);
+        let session = ResolutionSession::unbounded();
+        let arena = RefCell::new(ClosedRelations::default());
+        let paths = self.ready.lexical_source();
+        let mut language = GoDemandState {
+            operation: self,
+            base: &paths,
+            arena: &arena,
+            session: &session,
+            cancellation: &cancellation,
+            demand: GoDemandContext {
+                context_id,
+                import_packages: HashMap::default(),
+                context_completions: HashMap::default(),
+                import_name_completions: HashMap::default(),
+                modeled_imports: HashMap::default(),
+            },
+            caller,
+            remote_root_expansion: GoRemoteRootExpansion::CallerContextOnly,
+            package_mounts: HashMap::default(),
+            package_inventories: HashSet::default(),
+            export_index: HashMap::default(),
+            source_roles: HashMap::default(),
+            base_context_mounts: HashSet::default(),
+            receipts: GoReceiptStore::default(),
+            prepared_root_source_halves: HashMap::default(),
+        };
+        let question = GoSourceDemand {
+            mount: caller,
+            root_semantic: SemanticId::for_test(b"11234-go-deadline-at-admission"),
+            source_role: Some(role.clone()),
+            qualified: None,
+        };
+        let result = language.prepare_file_context(&(caller, role), &question)?;
+        assert!(
+            matches!(result, LanguageContextPreparation::Cancelled(_)),
+            "an unadmitted Go preparation cannot promise Ready"
+        );
+        assert!(!cancellation.is_cancelled());
+        assert!(cancellation.soft_deadline_passed());
+        assert!(self.go_prepared_contexts.get(&preparation).is_none());
+        Ok(())
+    }
+
     #[doc(hidden)]
     pub fn stage_go_reference_batches(
         &self,
@@ -2061,6 +2157,7 @@ impl SelectedResolutionOperation<'_, '_> {
         let reason = self.ready.context_identities.named_semantic(
             CanonicalHasher::new(b"7868-go-settled-readmission").finish(),
             "7868-go-settled-readmission",
+            crate::analyzer::resolution::ReasonDeterminism::Unaudited,
             "unavailable Go root",
         );
         let completion =

@@ -132,6 +132,7 @@ fn incomplete_symbol_index_still_reviews_later_go_summary_declarations() {
     let activation = WorkspacePacksActivation {
         ecosystems: Vec::new(),
         workspace_models: Vec::new(),
+        registration_evidence: Vec::new(),
         outcome: DependencyPackActivationOutcome {
             ecosystems: Vec::new(),
             runtime: Some(runtime),

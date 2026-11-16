@@ -17,6 +17,7 @@ fn active_close_match_shard_marks_complete_typestate_finding_without_changing_id
         exact.clone(),
         Some(crate::test_support::exact_rust_dependency_snapshot().as_ref()),
         &budget,
+        None,
     )
     .unwrap();
     assert_eq!(
@@ -27,6 +28,7 @@ fn active_close_match_shard_marks_complete_typestate_finding_without_changing_id
         exact.clone(),
         Some(crate::test_support::close_match_snapshot().as_ref()),
         &budget,
+        None,
     )
     .unwrap();
     assert_eq!(marked.completion(), exact.completion());
@@ -81,7 +83,7 @@ impl crate::evaluator::TypestatePolicyEvaluator for TruncatedProtocolAdapter {
         crate::projection::TypestateProjectionPayload {
             projections: vec![projected],
             completion: PolicyRunCompletion::Complete,
-            diagnostics: Vec::new(),
+            diagnostics: Vec::new().into(),
             diagnostics_truncated: false,
             work: crate::finding::PolicyWorkReport::default(),
             subjects: None,

@@ -132,8 +132,8 @@ pub fn explain_match_finding(
         matches!(
             diagnostic.code(),
             PolicyDiagnosticCode::CodeQuery {
-                code: CodeQueryDiagnosticCode::PolicyDeclaredProvenSubset,
-            }
+                code,
+            } if code.raw_code() == CodeQueryDiagnosticCode::PolicyDeclaredProvenSubset
         )
     }) {
         root.push_child(
@@ -409,6 +409,10 @@ pub(super) fn describe_ref(value: &PolicyQueryResultRef) -> String {
             outcome,
             ..
         } => format!("receiver_analysis {analysis_kind} {outcome}"),
+        PolicyQueryResultRef::Procedure { source_owner } => format!(
+            "procedure source owner {}",
+            source_owner.semantic_key().unwrap_or("")
+        ),
         PolicyQueryResultRef::Unsupported {
             query_result_kind, ..
         } => format!("unsupported {query_result_kind}"),

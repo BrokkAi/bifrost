@@ -19,6 +19,14 @@ pub struct SelectedGoImportBindingDescriptor {
 }
 
 impl SelectedGoImportBindingDescriptor {
+    pub(crate) fn import(&self) -> &LoweredGoPackageImport {
+        &self.import
+    }
+
+    pub(crate) fn completion(&self) -> &ResolutionCompletion {
+        &self.completion
+    }
+
     /// The selected reader supplies the exact definition node and a Package
     /// lookup for the sealed explicit alias or canonical provider package name.
     /// Blank imports cannot create a lexical binding.

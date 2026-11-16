@@ -20,6 +20,8 @@ fn incomplete_subject_product_cannot_mask_a_complete_followup() {
         truncated: true,
         diagnostics: Vec::new(),
         work: Default::default(),
+        reuse: Default::default(),
+        candidate_sites: None,
     });
     let complete = Arc::new(ExecutedQueryRows {
         items: Vec::new(),
@@ -29,6 +31,8 @@ fn incomplete_subject_product_cannot_mask_a_complete_followup() {
         truncated: false,
         diagnostics: Vec::new(),
         work: Default::default(),
+        reuse: Default::default(),
+        candidate_sites: None,
     });
     let first = batch.reuse_or_execute(
         workspace.analyzer(),
@@ -96,6 +100,7 @@ fn repeated_match_selector_reuses_one_complete_unit() {
             completion: CodeQueryCompletion::Complete,
             diagnostics: Vec::new(),
             truncated: false,
+            reuse: Default::default(),
         }
     };
     let first_rows = shared.execute(None, workspace.analyzer(), None, execute);
@@ -136,6 +141,7 @@ fn unit_result() -> UnitExecutionResult {
         completion: CodeQueryCompletion::Complete,
         diagnostics: Vec::new(),
         truncated: false,
+        reuse: Default::default(),
     }
 }
 
@@ -247,6 +253,8 @@ fn subject_product_is_never_reused_across_the_depth_opt_in_bit() {
             truncated: false,
             diagnostics: Vec::new(),
             work: Default::default(),
+            reuse: Default::default(),
+            candidate_sites: None,
         })
     };
     let executions = AtomicUsize::new(0);

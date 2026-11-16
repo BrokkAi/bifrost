@@ -255,6 +255,8 @@ pub struct CallBindingReport {
     pub range: Range,
     /// The exact callee declaration, when one was established.
     pub target: Option<CodeUnit>,
+    pub fixed_array_invocation:
+        Option<crate::analyzer::semantic::call_binding::FixedArrayInvocation>,
     pub coverage: CallBindingCoverage,
     /// Actual argument rows the call shape enumerated.
     pub actual_count: usize,
@@ -350,6 +352,8 @@ pub enum CallReceiverBinding {
     },
     /// The language fills the position with no source syntax: a Python
     /// constructor call binds the object it allocates to `__init__`'s `self`.
+    /// An instance call may bind an enclosing instance, including an outer
+    /// instance; this variant does not claim a source expression or identity.
     Implicit { declared_first_ordinary: bool },
     /// A receiver expression is written at `range`, and nothing the callee
     /// publishes establishes whether it binds a receiver: the language's
@@ -432,6 +436,7 @@ pub fn call_binding_report(
             site_ast_id: outcome.site_ast_id.clone(),
             range: outcome.range,
             target,
+            fixed_array_invocation: None,
             coverage,
             actual_count,
             bound_count,
@@ -933,7 +938,7 @@ mod tests {
 
     fn shape_for(source: &str, facts: &FileFacts, call_text: &str) -> CallShapeReport {
         let call_id = crate::analyzer::usages::test_support::call_node_id(source, facts, call_text);
-        call_shape_for_call(facts, &file("Main.java"), call_id).expect("call shape")
+        call_shape_for_call(facts, &file("Main.java"), call_id, None).expect("call shape")
     }
 
     fn unit(name: &str) -> CodeUnit {

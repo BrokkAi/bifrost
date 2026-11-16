@@ -19,7 +19,7 @@ pub fn maybe_gc_for_analyzer(
     // stale generations at the same cadence, only if no builder has acquired
     // the released build lock. Withdrawing stale versions can orphan more rows.
     let _build_lock = if outcome.ran {
-        AnalyzerCacheBuildLock::try_acquire(db_path)?
+        AnalyzerCacheBuildLock::try_acquire(db_path, "reclaiming stale analyzer generations")?
     } else {
         None
     };
@@ -55,7 +55,8 @@ pub fn force_gc_for_analyzer(
     let outcome = force_gc(db_path, repo, workspace_root)?;
     // Core swept orphan summaries/topologies under its collection lock. Stale
     // generation reclamation withdraws versions and must exclude builds too.
-    let _build_lock = AnalyzerCacheBuildLock::acquire(db_path)?;
+    let _build_lock =
+        AnalyzerCacheBuildLock::acquire(db_path, "reclaiming stale analyzer generations")?;
     let reclaimed = store
         .reclaim_stale_generations(i64::MAX as usize)
         .map_err(|error| format!("analyzer stale-generation GC failed: {error}"))?;

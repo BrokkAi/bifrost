@@ -14,6 +14,7 @@ use crate::analyzer::{IAnalyzer, WorkspaceAnalyzer};
 use crate::cancellation::CancellationToken;
 use brokk_bifrost_analysis::analyzer::read_attribution_records_reads as read_ledger_attached;
 use brokk_bifrost_analysis::analyzer::workspace_authority::{CaptureScopedMemo, memo_attribution};
+use brokk_bifrost_core::retention_budget::SharedBackingLease;
 use brokk_bifrost_flow::taint::ProductionTaintAnalysisResult;
 use brokk_bifrost_flow::taint::TaintProjectionLimits;
 use brokk_bifrost_flow::taint::output_product::{
@@ -23,7 +24,9 @@ use brokk_bifrost_flow::typestate::{
     CompiledProtocol, ProductionTypestateSummaryRepository, TypestateBindingPlan,
     TypestateBindingPlanHash, TypestateProtocolHash,
 };
-use brokk_bifrost_flow::value_flow::ValueFlowPlan;
+use brokk_bifrost_flow::value_flow::{
+    ValueFlowPlan, ValueFlowRetentionBudget, ValueFlowRetentionScope, ValueFlowRetentionScopeError,
+};
 use sha2::{Digest, Sha256};
 
 pub use brokk_bifrost_rql::refs::{
@@ -575,11 +578,14 @@ impl std::error::Error for ProtocolRegistrationSetError {}
 /// One immutable host registration for an already-resolved value-flow plan.
 #[derive(Debug)]
 pub struct ValueFlowPlanRegistration {
+    // Drop charges before the plan releases the payload owners they measure.
+    _retention: Option<ValueFlowRegistrationRetention>,
     workspace_generation: u64,
     plan: Arc<ValueFlowPlan>,
     identity: ValueFlowPlanRegistrationIdentity,
     artifact_keys: Box<[SemanticArtifactKey]>,
     retained_artifact_bytes: usize,
+    retained_exclusive_plan_bytes: usize,
 }
 
 impl ValueFlowPlanRegistration {
@@ -604,12 +610,17 @@ impl ValueFlowPlanRegistration {
         });
         let mut artifact_keys = artifact_keys.into_iter().collect::<Vec<_>>();
         artifact_keys.sort_unstable();
+        // Selected payloads own their leases already. Registration charges
+        // only its unchanged ordinary exclusive formula, never a second census.
+        let retained_exclusive_plan_bytes = plan.retained_registration_bytes();
         Self {
+            _retention: None,
             workspace_generation,
             plan,
             identity,
             artifact_keys: artifact_keys.into_boxed_slice(),
             retained_artifact_bytes: usize::try_from(retained_artifact_bytes).unwrap_or(usize::MAX),
+            retained_exclusive_plan_bytes,
         }
     }
 
@@ -686,6 +697,9 @@ pub enum ValueFlowPlanRegistrationOutcome {
     Unchanged,
 }
 
+/// Byte limits are total occupied-memory capacities for their retention
+/// authorities. They include the shared process-required account, not only
+/// registered payload bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ValueFlowPlanRegistrationLimits {
     references: usize,
@@ -721,12 +735,24 @@ impl Default for ValueFlowPlanRegistrationLimits {
     }
 }
 
+struct ValueFlowRegistrationRetention {
+    plan: SharedBackingLease,
+    artifact: SharedBackingLease,
+}
+impl fmt::Debug for ValueFlowRegistrationRetention {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ValueFlowRegistrationRetention")
+            .field("plan_bytes", &self.plan.bytes())
+            .field("artifact_bytes", &self.artifact.bytes())
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ValueFlowPlanRegistrationSet {
     by_ref: HashMap<ValueFlowPlanRef, Arc<ValueFlowPlanRegistration>>,
     by_identity: HashMap<ValueFlowPlanRegistrationIdentity, Arc<ValueFlowPlanRegistration>>,
-    retained_plan_bytes: usize,
-    retained_artifact_bytes: usize,
+    retention: ValueFlowRetentionBudget,
     limits: ValueFlowPlanRegistrationLimits,
 }
 
@@ -741,18 +767,40 @@ impl ValueFlowPlanRegistrationSet {
         Self {
             by_ref: HashMap::new(),
             by_identity: HashMap::new(),
-            retained_plan_bytes: 0,
-            retained_artifact_bytes: 0,
+            retention: ValueFlowRetentionBudget::new(limits.plan_bytes, limits.artifact_bytes),
             limits,
         }
+    }
+
+    /// Capture-safe capability; it exposes no host registration answers.
+    pub fn retention_budget(&self) -> &ValueFlowRetentionBudget {
+        &self.retention
+    }
+
+    /// Bind this registry's capture-safe retention capability to one request.
+    ///
+    /// The bind answers no host registration question and touches no
+    /// registration map, so an enclosing read capture may hold it. Reading or
+    /// changing registrations themselves remains outside those captures.
+    pub fn bind_retention_scope(
+        &self,
+        request: &Arc<brokk_bifrost_core::analyzer::outer_request::OuterRequest>,
+    ) -> Result<Arc<ValueFlowRetentionScope>, ValueFlowRetentionScopeError> {
+        ValueFlowRetentionScope::bind(request, &self.retention)
     }
 
     pub fn register(
         &mut self,
         plan_ref: ValueFlowPlanRef,
-        registration: ValueFlowPlanRegistration,
+        mut registration: ValueFlowPlanRegistration,
     ) -> Result<ValueFlowPlanRegistrationOutcome, ValueFlowPlanRegistrationSetError> {
         assert_registration_outside_capture();
+        if !registration
+            .plan
+            .retention_scope_matches(self.retention.scope_id())
+        {
+            return Err(ValueFlowPlanRegistrationSetError::RetentionScopeMismatch);
+        }
         let identity = registration.identity().clone();
         if let Some(existing) = self.by_ref.get(&plan_ref) {
             return if existing.identity() == &identity {
@@ -775,33 +823,25 @@ impl ValueFlowPlanRegistrationSet {
                 maximum: self.limits.registrations,
             });
         }
-        let retained_plan_bytes = self
-            .retained_plan_bytes
-            .checked_add(registration.plan.retained_bytes())
+        let plan = self
+            .retention
+            .plan_allocation(registration.retained_exclusive_plan_bytes)
             .ok_or(ValueFlowPlanRegistrationSetError::RetainedPlanBytes {
                 maximum: self.limits.plan_bytes,
             })?;
-        if retained_plan_bytes > self.limits.plan_bytes {
-            return Err(ValueFlowPlanRegistrationSetError::RetainedPlanBytes {
-                maximum: self.limits.plan_bytes,
-            });
-        }
-        let retained_artifact_bytes = self
-            .retained_artifact_bytes
-            .checked_add(registration.retained_artifact_bytes())
+        // Deliberately unkeyed: retain the full ordinary per-registration
+        // artifact sum, even when factory holders also charge exact owners.
+        // Failure drops the temporary plan lease before any registry mutation.
+        let artifact = self
+            .retention
+            .artifact_allocation(registration.retained_artifact_bytes())
             .ok_or(ValueFlowPlanRegistrationSetError::RetainedArtifactBytes {
                 maximum: self.limits.artifact_bytes,
             })?;
-        if retained_artifact_bytes > self.limits.artifact_bytes {
-            return Err(ValueFlowPlanRegistrationSetError::RetainedArtifactBytes {
-                maximum: self.limits.artifact_bytes,
-            });
-        }
+        registration._retention = Some(ValueFlowRegistrationRetention { plan, artifact });
         let registration = Arc::new(registration);
         self.by_ref.insert(plan_ref, Arc::clone(&registration));
         self.by_identity.insert(identity, registration);
-        self.retained_plan_bytes = retained_plan_bytes;
-        self.retained_artifact_bytes = retained_artifact_bytes;
         Ok(ValueFlowPlanRegistrationOutcome::Inserted)
     }
 
@@ -812,28 +852,20 @@ impl ValueFlowPlanRegistrationSet {
 
     pub fn unregister(&mut self, plan_ref: &ValueFlowPlanRef) -> bool {
         assert_registration_outside_capture();
-        let Some(registration) = self.by_ref.remove(plan_ref) else {
+        let Some(registration) = self.by_ref.get(plan_ref).cloned() else {
             return false;
         };
-        if self
-            .by_ref
-            .values()
-            .any(|candidate| Arc::ptr_eq(candidate, &registration))
-        {
+        if self.by_ref.iter().any(|(reference, candidate)| {
+            reference != plan_ref && Arc::ptr_eq(candidate, &registration)
+        }) {
+            self.by_ref.remove(plan_ref);
             return true;
         }
-        let removed = self
-            .by_identity
+        self.by_ref.remove(plan_ref);
+        self.by_identity
             .remove(registration.identity())
             .expect("registered value-flow alias retains its identity entry");
-        self.retained_plan_bytes = self
-            .retained_plan_bytes
-            .checked_sub(removed.plan.retained_bytes())
-            .expect("retained plan bytes cover every unique registration");
-        self.retained_artifact_bytes = self
-            .retained_artifact_bytes
-            .checked_sub(removed.retained_artifact_bytes())
-            .expect("retained artifact bytes cover every unique flow registration");
+        // External registration Arcs and cloned registries keep the leases.
         true
     }
 
@@ -841,8 +873,6 @@ impl ValueFlowPlanRegistrationSet {
         assert_registration_outside_capture();
         self.by_ref.clear();
         self.by_identity.clear();
-        self.retained_plan_bytes = 0;
-        self.retained_artifact_bytes = 0;
     }
 
     pub fn reference_count(&self) -> usize {
@@ -855,17 +885,18 @@ impl ValueFlowPlanRegistrationSet {
         self.by_identity.len()
     }
 
-    pub const fn retained_plan_bytes(&self) -> usize {
-        self.retained_plan_bytes
+    pub fn retained_plan_bytes(&self) -> usize {
+        self.retention.retained_plan_bytes()
     }
 
-    pub const fn retained_artifact_bytes(&self) -> usize {
-        self.retained_artifact_bytes
+    pub fn retained_artifact_bytes(&self) -> usize {
+        self.retention.retained_artifact_bytes()
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValueFlowPlanRegistrationSetError {
+    RetentionScopeMismatch,
     ReferenceConflict { plan_ref: ValueFlowPlanRef },
     TooManyReferences { maximum: usize },
     TooManyRegistrations { maximum: usize },
@@ -876,6 +907,9 @@ pub enum ValueFlowPlanRegistrationSetError {
 impl fmt::Display for ValueFlowPlanRegistrationSetError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::RetentionScopeMismatch => {
+                formatter.write_str("selected plan belongs to another retention authority")
+            }
             Self::ReferenceConflict { plan_ref } => {
                 fmt_registration_conflict(formatter, "value-flow plan", plan_ref)
             }
@@ -1476,6 +1510,7 @@ pub struct QueryAnalysisContext {
     registrations: Box<[Arc<ProtocolRegistration>]>,
     value_flow_by_ref: CaptureScopedMemo<HashMap<ValueFlowPlanRef, ValueFlowPlanHandle>>,
     value_flow_registrations: Box<[Arc<ValueFlowPlanRegistration>]>,
+    value_flow_retention: Option<Arc<ValueFlowRetentionScope>>,
     taint_by_ref: CaptureScopedMemo<HashMap<TaintResultRef, TaintResultHandle>>,
     taint_registrations: Box<[Arc<TaintResultRegistration>]>,
     summaries: Arc<ProductionTypestateSummaryRepository>,
@@ -1611,15 +1646,19 @@ impl QueryAnalysisContext {
         cancellation: Option<&CancellationToken>,
         summaries: Arc<ProductionTypestateSummaryRepository>,
     ) -> Result<Self, QueryAnalysisContextError> {
-        let value_flow_registrations = ValueFlowPlanRegistrationSet::default();
+        // This convenience API imports protocols only. It has no explicit
+        // value-flow owner and must not bind a disposable empty registry.
+        let value_flow_retention = brokk_bifrost_analysis::analyzer::current_outer_request()
+            .and_then(|request| ValueFlowRetentionScope::current(&request));
         let taint_registrations = TaintResultRegistrationSet::default();
-        Self::new_with_all_registrations_and_summaries(
+        Self::import_registrations_and_summaries(
             workspace,
             workspace_generation,
             registrations,
             requested,
-            &value_flow_registrations,
+            None,
             &[],
+            value_flow_retention,
             &taint_registrations,
             &[],
             validation_limits,
@@ -1629,13 +1668,14 @@ impl QueryAnalysisContext {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new_with_all_registrations_and_summaries(
+    pub(super) fn import_registrations_and_summaries(
         workspace: &WorkspaceAnalyzer,
         workspace_generation: u64,
         registrations: &ProtocolRegistrationSet,
         requested: &[ProtocolRef],
-        value_flow_registrations: &ValueFlowPlanRegistrationSet,
+        value_flow_registrations: Option<&ValueFlowPlanRegistrationSet>,
         requested_value_flows: &[ValueFlowPlanRef],
+        value_flow_retention: Option<Arc<ValueFlowRetentionScope>>,
         taint_registrations: &TaintResultRegistrationSet,
         requested_taint_results: &[TaintResultRef],
         validation_limits: QueryAnalysisValidationLimits,
@@ -1707,11 +1747,13 @@ impl QueryAnalysisContext {
             if value_flow_by_ref.contains_key(plan_ref) {
                 continue;
             }
-            let registration = value_flow_registrations.get(plan_ref).ok_or_else(|| {
-                QueryAnalysisContextError::UnresolvedValueFlowPlanReference {
-                    plan_ref: plan_ref.clone(),
-                }
-            })?;
+            let registration = value_flow_registrations
+                .and_then(|registry| registry.get(plan_ref))
+                .ok_or_else(
+                    || QueryAnalysisContextError::UnresolvedValueFlowPlanReference {
+                        plan_ref: plan_ref.clone(),
+                    },
+                )?;
             let pointer = Arc::as_ptr(registration);
             let slot = match dense_value_flows.get(&pointer).copied() {
                 Some(slot) => slot,
@@ -1788,6 +1830,7 @@ impl QueryAnalysisContext {
             registrations: imported.into_boxed_slice(),
             value_flow_by_ref: CaptureScopedMemo::new(value_flow_by_ref),
             value_flow_registrations: imported_value_flows.into_boxed_slice(),
+            value_flow_retention,
             taint_by_ref: CaptureScopedMemo::new(taint_by_ref),
             taint_registrations: imported_taint_results.into_boxed_slice(),
             summaries,
@@ -1839,6 +1882,10 @@ impl QueryAnalysisContext {
             return Err(QueryAnalysisContextError::AnalysisRootMismatch);
         }
         Ok(registration)
+    }
+
+    pub fn value_flow_retention_scope(&self) -> Option<&Arc<ValueFlowRetentionScope>> {
+        self.value_flow_retention.as_ref()
     }
 
     pub fn value_flow_handle(
@@ -2063,6 +2110,9 @@ fn registration_error(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryAnalysisContextError {
+    ValueFlowRetentionUnavailable {
+        detail: Box<str>,
+    },
     GenerationExhausted,
     Cancelled,
     TooManyResolvedProtocols,
@@ -2114,6 +2164,7 @@ pub enum QueryAnalysisContextError {
 impl fmt::Display for QueryAnalysisContextError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ValueFlowRetentionUnavailable { detail } => formatter.write_str(detail),
             Self::GenerationExhausted => {
                 formatter.write_str("query analysis context generation is exhausted")
             }

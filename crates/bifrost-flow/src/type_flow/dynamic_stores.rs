@@ -391,10 +391,7 @@ fn field_value_write_receiver_bounds(
             || bounds.iter().any(|bound| {
                 bound == owner
                     || hierarchy.ancestors.contains(bound)
-                    || hierarchy
-                        .descendants
-                        .as_ref()
-                        .is_some_and(|descendants| descendants.contains(bound))
+                    || hierarchy.descendants.edges.contains(bound)
             })
         {
             return StructuralWriteReceiverBound::Unbounded(UnknownReason::DynamicFieldWrite);

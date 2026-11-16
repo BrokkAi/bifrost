@@ -60,7 +60,7 @@ pub(crate) fn collect_ruby_semantic_diagnostics(
     // Both reads are of state a host already published. Neither starts
     // dependency discovery nor touches a gem archive.
     let gems = RetainedRubyGems {
-        overlay: analyzer.semantic_model_overlay(),
+        overlay: analyzer.semantic_model_overlay_read().published(),
         evidence: analyzer.dependency_discovery_evidence(Language::Ruby),
     };
     let report = with_ruby_graph_source(analyzer, |graph| {
@@ -148,36 +148,29 @@ impl RubyGemSurface for RetainedRubyGems {
     }
 
     fn require_boundary(&self, require_path: &str) -> RubyGemBoundary {
-        let Some(evidence) = self.evidence.as_deref() else {
-            return RubyGemBoundary::Unpublished(
-                SemanticDiagnosticIncompleteReason::MissingDependencyDiscovery {
-                    boundary: BoundaryStatus::ExternalUnknown,
-                },
-            );
+        use brokk_bifrost_analysis::analyzer::semantic_model::dependency::{
+            DeclaredDependencyVerdict, declared_dependency_verdict,
         };
-        if evidence.truncated() {
-            return RubyGemBoundary::Incomplete(SemanticDiagnosticIncompleteReason::Truncated);
-        }
-        if !evidence.declares_ruby_require_path(require_path) {
-            return RubyGemBoundary::Unpublished(
+        match declared_dependency_verdict(self.evidence.as_deref(), require_path, '/', |package| {
+            self.overlay
+                .as_ref()
+                .is_some_and(|overlay| overlay.package_active("ruby", "rubygems", package))
+        }) {
+            DeclaredDependencyVerdict::Undeclared => RubyGemBoundary::Unpublished(
                 SemanticDiagnosticIncompleteReason::MissingDependencyDiscovery {
                     boundary: BoundaryStatus::ExternalUnknown,
                 },
-            );
-        }
-        // Discovery evidence is retained only after every gem it resolved was
-        // prepared and activated (see `WorkspaceAnalyzer::activate_dependency_packs`),
-        // so a declared gem with a published overlay is an indexed gem. A
-        // declared gem with no overlay is the one that discovery reached and
-        // activation did not.
-        if self.overlay.is_none() {
-            return RubyGemBoundary::Incomplete(
+            ),
+            DeclaredDependencyVerdict::Truncated => {
+                RubyGemBoundary::Incomplete(SemanticDiagnosticIncompleteReason::Truncated)
+            }
+            DeclaredDependencyVerdict::DeclaredIndexed => RubyGemBoundary::Indexed,
+            DeclaredDependencyVerdict::DeclaredUnindexed => RubyGemBoundary::Incomplete(
                 SemanticDiagnosticIncompleteReason::MissingDependencyDiscovery {
                     boundary: BoundaryStatus::ExternalDeclaredUnindexed,
                 },
-            );
+            ),
         }
-        RubyGemBoundary::Indexed
     }
 }
 
@@ -273,8 +266,7 @@ mod tests {
     fn ruby_require_boundary_reports_a_declared_gem_nothing_indexed() {
         // Discovery reached the lockfile and named the gem; no activation
         // published an overlay. That is exactly `ExternalDeclaredUnindexed`,
-        // and it is the one state the workspace activation path can leave
-        // behind, because evidence is retained only after preparation succeeds.
+        // including when preparation of another declared gem succeeds.
         assert_eq!(
             RubyGemBoundary::Incomplete(
                 SemanticDiagnosticIncompleteReason::MissingDependencyDiscovery {

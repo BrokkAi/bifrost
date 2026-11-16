@@ -57,6 +57,8 @@ pub enum CodeQueryResultRef {
         path: String,
         procedure_kind: &'static str,
         range: CodeQueryRange,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source_owner: Option<super::CodeQueryStableOwnerCandidate>,
     },
     FlowEndpoint {
         id: String,

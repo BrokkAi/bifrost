@@ -943,7 +943,7 @@ pub fn resolve_import_files_batched(
                 ..
             }) => {
                 let resolved_module = if module.starts_with('.') {
-                    resolve_python_relative_module(python.project(), file, &module)
+                    resolve_python_module_specifier(python.project(), file, &module)
                 } else {
                     Some(module)
                 };
@@ -1664,25 +1664,18 @@ pub fn python_namespace_binding_module(
         .unwrap_or_else(|| module.to_string())
 }
 
-pub fn resolve_python_relative_module(
-    project: &dyn brokk_bifrost_core::analyzer::project::Project,
-    source_file: &ProjectFile,
-    module_expr: &str,
-) -> Option<String> {
-    resolve_python_relative_module_from_package(
-        &python_current_package(project, source_file),
-        module_expr,
-    )
-}
-
-/// Resolve a relative Python module specifier against the importing file.
+/// Resolve a Python module specifier, consulting the importing package only
+/// when the specifier is relative.
 pub fn resolve_python_module_specifier(
     project: &dyn brokk_bifrost_core::analyzer::project::Project,
     importing_file: &ProjectFile,
     module_specifier: &str,
 ) -> Option<String> {
     if module_specifier.starts_with('.') {
-        resolve_python_relative_module(project, importing_file, module_specifier)
+        resolve_python_relative_module_from_package(
+            &python_current_package(project, importing_file),
+            module_specifier,
+        )
     } else {
         Some(module_specifier.to_string())
     }

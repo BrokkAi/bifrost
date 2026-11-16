@@ -1859,7 +1859,7 @@ fn resolve_cpp_bounded_member(
             && matches!(
                 crate::analyzer::cpp::external::external_member_resolution(
                 provider.cpp,
-                provider.analyzer.semantic_model_overlay().as_deref(),
+                provider.analyzer.semantic_model_overlay_read().published().as_deref(),
                 file,
                 &owner_name,
                 member,
@@ -4032,7 +4032,15 @@ fn cpp_incomplete_type_outcome(
     reason: brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadIncomplete,
 ) -> DefinitionLookupOutcome {
     use brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadIncomplete;
-    match reason {
+    match reason.base_cause() {
+        QueryReadIncomplete::Attributed(_) => unreachable!("base cause has no provenance layer"),
+        QueryReadIncomplete::ProofStopped { reason, .. } => {
+            no_definition("analysis_incomplete", *reason)
+        }
+        QueryReadIncomplete::SemanticModelsPending => no_definition(
+            "analysis_incomplete",
+            "semantic models selected but not published",
+        ),
         QueryReadIncomplete::Cancelled => no_definition(
             "cancelled",
             "C++ type candidate resolution was cancelled; results are incomplete",
@@ -6717,7 +6725,7 @@ fn c_header_function_call(
         return None;
     }
     let cpp = resolve_analyzer::<CppAnalyzer>(ctx.analyzer)?;
-    let overlay = ctx.analyzer.semantic_model_overlay();
+    let overlay = ctx.analyzer.semantic_model_overlay_read().published();
     crate::analyzer::cpp::external::reached_header_file_scope_function(
         cpp,
         overlay.as_deref(),
@@ -6743,7 +6751,7 @@ fn cpp_header_namespace_function_call(
     }
     let arity = u32::try_from(call_arity?).ok()?;
     let cpp = resolve_analyzer::<CppAnalyzer>(ctx.analyzer)?;
-    let overlay = ctx.analyzer.semantic_model_overlay();
+    let overlay = ctx.analyzer.semantic_model_overlay_read().published();
     crate::analyzer::cpp::external::reached_header_namespace_function(
         cpp,
         overlay.as_deref(),
@@ -7344,7 +7352,7 @@ fn resolve_cpp_field(
             && matches!(
                 crate::analyzer::cpp::external::external_member_resolution(
                 cpp,
-                ctx.analyzer.semantic_model_overlay().as_deref(),
+                ctx.analyzer.semantic_model_overlay_read().published().as_deref(),
                 ctx.file,
                 &owner_name,
                 member,
@@ -10264,6 +10272,7 @@ fn cpp_bindings_before_with_reference_guards(
             brokk_bifrost_analysis::analyzer::lexical_definitions::cpp_recovered_function_body(
                 reference,
                 cutoff_start,
+                &Node::parent,
             )
         })
     });

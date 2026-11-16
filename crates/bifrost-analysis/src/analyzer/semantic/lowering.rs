@@ -187,6 +187,8 @@ pub(crate) mod tests {
                 },
             )
             .expect("drop action");
+        // A capture splits subsequent registration into a new immutable chunk.
+        let earlier = builder.normal_cleanup_completion(region, normal_exit);
         builder
             .register_scope_cleanup_action(
                 cleanup_scope,
@@ -198,6 +200,7 @@ pub(crate) mod tests {
             )
             .expect("scope-end action");
         let route = builder.normal_cleanup_completion(region, normal_exit);
+        assert_ne!(earlier.segment.head, route.segment.head);
         let region_metadata = session
             .add_mapping(
                 &mut builder,
@@ -206,7 +209,12 @@ pub(crate) mod tests {
             )
             .expect("cleanup region mapping");
         let (region_entry, created) = builder
-            .cleanup_specialization(&route, 0, region_metadata.source, region_metadata.evidence)
+            .cleanup_specialization(
+                &route,
+                route.segment.head.expect("region head"),
+                region_metadata.source,
+                region_metadata.evidence,
+            )
             .expect("cleanup region entry");
         assert!(created);
         session
@@ -236,18 +244,36 @@ pub(crate) mod tests {
         let target = planner.target();
         assert_eq!(action_steps.len(), 2);
         assert!(matches!(
-            action_steps[0].action,
+            builder.cleanup_action(action_steps[0].action).action,
             ScopeCleanupAction::ScopeEnd { .. }
         ));
         assert!(matches!(
-            action_steps[1].action,
+            builder.cleanup_action(action_steps[1].action).action,
             ScopeCleanupAction::Drop { .. }
         ));
         assert_eq!(target.point, action_steps[1].entry);
         assert_eq!(action_steps[1].next.point, action_steps[0].entry);
         assert_eq!(action_steps[0].next.point, region_entry);
 
-        let (parts, _) = builder.finish_with_work().expect("finish procedure CFG");
+        let before_reuse = builder.prospective_work();
+        let mut reused = CleanupRoutePlanner::new(&route);
+        assert!(
+            reused
+                .next_step_with_lookup(
+                    &mut builder,
+                    &mut session,
+                    |_| unreachable!("memoized plan must not look up regions"),
+                    |(): ()| unreachable!("memoized plan must not allocate mappings"),
+                )
+                .expect("memoized route")
+                .is_none()
+        );
+        assert_eq!(reused.target(), target);
+        assert_eq!(builder.prospective_work(), before_reuse);
+
+        let (parts, _) = builder
+            .finish_with_work(&brokk_bifrost_core::cancellation::CancellationToken::default())
+            .expect("finish procedure CFG");
         assert_eq!(parts.drops.len(), 1);
         assert_eq!(parts.drops[0].place, place);
         assert_eq!(parts.drops[0].point, action_steps[1].entry);
@@ -546,6 +572,7 @@ pub(crate) mod tests {
         } = ProcedureLoweringSession::start(parts(), &SemanticBudget::default(), &cancellation)
             .expect("lowering start");
         let region_id = CleanupRegionId::new(1);
+        builder.push_scope(None, ScopeBinding::Cleanup { region: region_id });
         let route = builder.normal_cleanup_completion(region_id, normal_exit);
 
         let mut parser = tree_sitter::Parser::new();
@@ -646,7 +673,9 @@ pub(crate) mod tests {
                 )
             })
             .expect("await scaffold");
-        let (parts, _) = builder.finish_with_work().expect("finished parts");
+        let (parts, _) = builder
+            .finish_with_work(&brokk_bifrost_core::cancellation::CancellationToken::default())
+            .expect("finished parts");
 
         assert_eq!(scaffold.suspend.index(), 3);
         assert_eq!(scaffold.normal_resume.index(), 4);
@@ -882,7 +911,9 @@ pub(crate) mod tests {
                 },
             )
             .expect("call scaffold");
-        let (parts, _) = builder.finish_with_work().expect("finished parts");
+        let (parts, _) = builder
+            .finish_with_work(&brokk_bifrost_core::cancellation::CancellationToken::default())
+            .expect("finished parts");
 
         assert_eq!(call_site.index(), 0);
         assert_eq!(parts.call_sites.len(), 1);

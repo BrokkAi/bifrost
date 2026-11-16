@@ -119,19 +119,20 @@ fn scan_sources(
     keep_going: &dyn Fn() -> bool,
     mut unmodified: impl FnMut(&ProjectFile, tree_sitter::Node<'_>, &str) -> bool,
 ) -> Option<bool> {
-    let Ok(files) = analyzer.project().all_files_shared() else {
+    // The answers are keyed by the analyzed Python source scope, so they read
+    // exactly those files. A bifrostignored tree, such as an installed runtime
+    // environment, is outside that scope: its code is what the selected models
+    // describe, and its edits would not invalidate these answers (#12429).
+    let Ok(files) = analyzer.project().analyzable_files(Language::Python) else {
         return Some(false);
     };
     let mut parser = tree_sitter::Parser::new();
     parser
         .set_language(&tree_sitter_python::LANGUAGE.into())
         .expect("Python grammar is compatible with the parser");
-    for file in files.iter() {
+    for file in &files {
         if !keep_going() {
             return None;
-        }
-        if brokk_bifrost_core::analyzer::common::language_for_file(file) != Language::Python {
-            continue;
         }
         let Ok(source) = file.read_to_string() else {
             return Some(false);

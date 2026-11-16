@@ -97,6 +97,82 @@ pub struct DispatchCandidate {
 }
 
 impl DispatchCandidate {
+    /// Sufficient borrowed content correspondence; grants no admission authority.
+    /// Executable handles retain their exact artifact and interpretation equality.
+    #[doc(hidden)]
+    pub fn has_same_content_by(
+        &self,
+        other: &Self,
+        same_relation: &impl Fn(&OracleRelationHandle, &OracleRelationHandle) -> bool,
+    ) -> bool {
+        let Self {
+            target: l_target,
+            proof: l_proof,
+            completeness: l_completeness,
+            native_incomplete_source_reason: l_native_incomplete_source_reason,
+            member_receiver_preparation: l_member_receiver_preparation,
+            receiver_owner_relation: l_receiver_owner_relation,
+            provenance: l_provenance,
+            excluded_targets: l_excluded_targets,
+            sealed: l_sealed,
+        } = self;
+        let Self {
+            target: r_target,
+            proof: r_proof,
+            completeness: r_completeness,
+            native_incomplete_source_reason: r_native_incomplete_source_reason,
+            member_receiver_preparation: r_member_receiver_preparation,
+            receiver_owner_relation: r_receiver_owner_relation,
+            provenance: r_provenance,
+            excluded_targets: r_excluded_targets,
+            sealed: r_sealed,
+        } = other;
+
+        l_target == r_target
+            && l_proof == r_proof
+            && l_completeness == r_completeness
+            && l_native_incomplete_source_reason == r_native_incomplete_source_reason
+            && l_member_receiver_preparation == r_member_receiver_preparation
+            && l_receiver_owner_relation == r_receiver_owner_relation
+            && l_provenance.len() == r_provenance.len()
+            && l_provenance
+                .iter()
+                .zip(r_provenance.iter())
+                .all(|(a, b)| same_relation(a, b))
+            && l_excluded_targets == r_excluded_targets
+            && l_sealed == r_sealed
+    }
+
+    /// Full content of the candidate's single-arena provenance group.
+    #[doc(hidden)]
+    pub fn has_same_content(&self, other: &Self) -> bool {
+        OracleRelationHandle::slices_have_same_content(&self.provenance, &other.provenance)
+            && self.has_same_content_by(other, &|a, b| a.id() == b.id())
+    }
+}
+
+impl DispatchCandidate {
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn retention_census_for_test(
+        &self,
+        census: &mut brokk_bifrost_core::retention_census::RetentionCensus<'_>,
+        family: &'static str,
+    ) {
+        use crate::analyzer::semantic::oracle::retained::{
+            RetainedNode, visit_retained_allocations_from_roots,
+        };
+
+        let mut roots = vec![RetainedNode::Procedure(self.target())];
+        for target in self.excluded_targets() {
+            roots.push(RetainedNode::Procedure(target));
+        }
+        for relation in self.provenance() {
+            roots.push(RetainedNode::Relation(relation));
+        }
+        visit_retained_allocations_from_roots(roots, census, family);
+    }
+
     /// Create a draft that becomes a candidate-specific query token only
     /// after validation by [`DispatchResult::new`].
     pub fn new<I>(
@@ -125,15 +201,71 @@ impl DispatchCandidate {
     #[doc(hidden)]
     pub fn retained_artifacts(
         &self,
-        census: &mut crate::analyzer::semantic::service::ArtifactRetentionCensus,
+        census: &mut impl crate::analyzer::semantic::service::ArtifactRetentionVisitor,
     ) {
         census.procedure(self.target());
-        for target in self.excluded_targets() {
-            census.procedure(target);
+        if let ProofStatus::Unproven(reason) = &self.proof {
+            census.owned_slice(reason.as_bytes());
         }
-        for relation in self.provenance() {
-            relation.retained_artifacts(census);
+        if let EvidenceCompleteness::Partial(reason) = &self.completeness {
+            census.owned_slice(reason.as_bytes());
         }
+        if let Some(reason) = &self.native_incomplete_source_reason {
+            census.owned_slice(reason.as_bytes());
+        }
+        if census.owned_slice(&self.excluded_targets) {
+            for target in self.excluded_targets() {
+                census.procedure(target);
+            }
+        }
+        if census.owned_slice(&self.provenance) {
+            for relation in self.provenance() {
+                relation.retained_artifacts(census);
+            }
+        }
+        // Receiver preparation/relation and sealed state have no owned heap.
+    }
+
+    pub(crate) fn reseal_selected(
+        &self,
+        call: &CallSiteHandle,
+        selected: &ProcedureHandle,
+        limits: OracleLimits,
+    ) -> Result<Self, OracleContractError> {
+        use super::relation::{OracleRelationArena, OracleRelationId, OracleRelationRecord};
+        self.validate_for_call(call)?;
+        if self.target.id() != selected.id()
+            || self.target.artifact().key() != selected.artifact().key()
+        {
+            return Err(OracleContractError::InvalidRelationIdentity);
+        }
+        if &self.target == selected {
+            return Ok(self.clone());
+        }
+        let records = self
+            .provenance
+            .iter()
+            .map(|relation| {
+                OracleRelationRecord::dispatch_candidate(
+                    selected.clone(),
+                    relation.record().evidence().iter().cloned(),
+                    limits,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let arena =
+            OracleRelationArena::new(OracleRelationOwner::Dispatch(call.clone()), records, limits)?;
+        let mut candidate = self.clone();
+        candidate.target = selected.clone();
+        candidate.provenance = (0..arena.records().len())
+            .map(|index| {
+                arena
+                    .handle(OracleRelationId::new(index as u32))
+                    .expect("validated relation")
+            })
+            .collect();
+        candidate.validate_for_call(call)?;
+        Ok(candidate)
     }
 
     pub fn target(&self) -> &ProcedureHandle {
@@ -277,6 +409,30 @@ pub struct ExactExternalProcedureTarget {
 }
 
 impl ExactExternalProcedureTarget {
+    /// Owned children; the enclosing payload accounts for the inline target.
+    #[doc(hidden)]
+    pub fn retained_artifacts(
+        &self,
+        census: &mut impl crate::analyzer::semantic::service::ArtifactRetentionVisitor,
+    ) {
+        census.artifact_key(&self.artifact);
+        census.locator(&self.procedure);
+        census.owned_slice(self.symbol.as_bytes());
+        if census.owned_slice(&self.receiver_adjustments) {
+            for step in &self.receiver_adjustments {
+                step.retained_allocations(census);
+            }
+        }
+        census.owned_slice(self.formal_contract.label.as_bytes());
+        if census.owned_slice(&self.formal_contract.parameters) {
+            for parameter in &self.formal_contract.parameters {
+                census.owned_slice(parameter.label.as_bytes());
+                if let Some(ty) = &parameter.declared_type {
+                    census.owned_slice(ty.as_bytes());
+                }
+            }
+        }
+    }
     #[doc(hidden)]
     pub fn new(
         artifact: SemanticArtifactKey,
@@ -719,6 +875,25 @@ pub struct ReturnedCallableProvenance {
 }
 
 impl ReturnedCallableProvenance {
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn retention_census_for_test(
+        &self,
+        census: &mut brokk_bifrost_core::retention_census::RetentionCensus<'_>,
+        family: &'static str,
+    ) {
+        use crate::analyzer::semantic::oracle::retained::{
+            RetainedNode, visit_retained_allocations_from_roots,
+        };
+
+        let roots = [
+            RetainedNode::Procedure(self.producer().procedure()),
+            RetainedNode::Procedure(self.producer_callee()),
+            RetainedNode::Procedure(self.closure()),
+        ];
+        visit_retained_allocations_from_roots(roots, census, family);
+    }
+
     #[doc(hidden)]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -757,11 +932,13 @@ impl ReturnedCallableProvenance {
     #[doc(hidden)]
     pub fn retained_artifacts(
         &self,
-        census: &mut crate::analyzer::semantic::service::ArtifactRetentionCensus,
+        census: &mut impl crate::analyzer::semantic::service::ArtifactRetentionVisitor,
     ) {
         census.procedure(self.producer().procedure());
         census.procedure(self.producer_callee());
         census.procedure(self.closure());
+        census.owned_slice(&self.captures);
+        census.owned_slice(&self.capture_bindings);
     }
 
     pub const fn producer(&self) -> &CallSiteHandle {
@@ -832,12 +1009,94 @@ pub struct ArgumentCallableProvenance {
 }
 
 impl ArgumentCallableProvenance {
+    /// Sufficient borrowed content correspondence; grants no admission authority.
+    /// Executable handles retain their exact artifact and interpretation equality.
+    #[doc(hidden)]
+    pub fn has_same_content(&self, other: &Self) -> bool {
+        let Self {
+            producer: l_producer,
+            entering_call: l_entering_call,
+            caller_context: l_caller_context,
+            callee: l_callee,
+            formal_ordinal: l_formal_ordinal,
+            actual: l_actual,
+            creation: l_creation,
+            closure: l_closure,
+            captures: l_captures,
+            capture_bindings: l_capture_bindings,
+            binding: l_binding,
+        } = self;
+        let Self {
+            producer: r_producer,
+            entering_call: r_entering_call,
+            caller_context: r_caller_context,
+            callee: r_callee,
+            formal_ordinal: r_formal_ordinal,
+            actual: r_actual,
+            creation: r_creation,
+            closure: r_closure,
+            captures: r_captures,
+            capture_bindings: r_capture_bindings,
+            binding: r_binding,
+        } = other;
+
+        l_producer == r_producer
+            && l_entering_call == r_entering_call
+            && l_caller_context == r_caller_context
+            && l_callee == r_callee
+            && l_formal_ordinal == r_formal_ordinal
+            && l_actual == r_actual
+            && l_creation == r_creation
+            && l_closure == r_closure
+            && l_captures == r_captures
+            && l_capture_bindings == r_capture_bindings
+            && OracleRelationHandle::slices_have_same_content(l_binding, r_binding)
+    }
+}
+
+impl ArgumentCallableProvenance {
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn retention_census_for_test(
+        &self,
+        census: &mut brokk_bifrost_core::retention_census::RetentionCensus<'_>,
+        family: &'static str,
+    ) {
+        use crate::analyzer::semantic::oracle::retained::{
+            RetainedNode, visit_retained_allocations_from_roots,
+        };
+
+        let mut roots = vec![RetainedNode::CallContext(self.caller_context())];
+        if let Some(producer) = self.producer() {
+            for procedure in [
+                producer.producer().procedure(),
+                producer.producer_callee(),
+                producer.closure(),
+            ] {
+                roots.push(RetainedNode::Procedure(procedure));
+            }
+        }
+        for procedure in [
+            self.entering_call().procedure(),
+            self.callee(),
+            self.closure(),
+            self.actual().procedure(),
+            self.creation().procedure(),
+        ] {
+            roots.push(RetainedNode::Procedure(procedure));
+        }
+        for relation in self.binding() {
+            roots.push(RetainedNode::Relation(relation));
+        }
+        visit_retained_allocations_from_roots(roots, census, family);
+    }
+
     /// Exact producing call when the actual came from a factory return.
     /// Creation and capture binding owners remain the producing procedure.
     #[doc(hidden)]
     pub fn retained_artifacts(
         &self,
-        census: &mut crate::analyzer::semantic::service::ArtifactRetentionCensus,
+        census: &mut impl crate::analyzer::semantic::service::ArtifactRetentionVisitor,
     ) {
         if let Some(producer) = self.producer() {
             producer.retained_artifacts(census);
@@ -848,8 +1107,12 @@ impl ArgumentCallableProvenance {
         census.procedure(self.closure());
         census.procedure(self.actual().procedure());
         census.procedure(self.creation().procedure());
-        for relation in self.binding() {
-            relation.retained_artifacts(census);
+        census.owned_slice(&self.captures);
+        census.owned_slice(&self.capture_bindings);
+        if census.owned_slice(&self.binding) {
+            for relation in self.binding() {
+                relation.retained_artifacts(census);
+            }
         }
     }
 
@@ -923,6 +1186,35 @@ pub struct StablePackageValueProvenance {
 }
 
 impl StablePackageValueProvenance {
+    #[doc(hidden)]
+    pub fn retained_artifacts(
+        &self,
+        census: &mut impl crate::analyzer::semantic::service::ArtifactRetentionVisitor,
+    ) {
+        census.procedure(self.initializer());
+        census.code_unit(&self.variable);
+        if census.owned_slice(&self.references) {
+            for reference in &self.references {
+                census.usage(reference);
+            }
+        }
+    }
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn retention_census_for_test(
+        &self,
+        census: &mut brokk_bifrost_core::retention_census::RetentionCensus<'_>,
+        family: &'static str,
+    ) {
+        crate::analyzer::semantic::oracle::retained::visit_retained_allocations(
+            crate::analyzer::semantic::oracle::retained::RetainedNode::Procedure(
+                self.initializer(),
+            ),
+            census,
+            family,
+        );
+    }
+
     #[doc(hidden)]
     pub fn new(
         variable: CodeUnit,

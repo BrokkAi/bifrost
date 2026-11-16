@@ -167,18 +167,15 @@ pub enum ValueFlowEndpoint {
 }
 
 impl ValueFlowEndpoint {
-    pub(super) fn retained_artifacts(
+    #[doc(hidden)]
+    pub fn retained_artifacts(
         &self,
-        census: &mut crate::analyzer::semantic::service::ArtifactRetentionCensus,
+        census: &mut impl crate::analyzer::semantic::service::ArtifactRetentionVisitor,
     ) {
-        match self {
-            Self::Value(value) => census.procedure(value.procedure()),
-            Self::Port(port) => census.procedure(port.procedure()),
-            Self::Location(location) => {
-                location.object().identity().retained_artifacts(census);
-                location.path().retained_artifacts(census);
-            }
-        }
+        super::model::collect_retained_model(
+            super::model::RetainedModelPart::Endpoint(self),
+            census,
+        );
     }
 
     /// The runtime carrier for a value, including a formal binding's port.
@@ -310,7 +307,7 @@ fn copy_definition(
     match *effect {
         SemanticEffect::Assignment { target, value } => Some((target, value)),
         SemanticEffect::ValueFlow {
-            kind: ValueFlowKind::Local | ValueFlowKind::BackingStore { .. },
+            kind: ValueFlowKind::Local | ValueFlowKind::AddressOf | ValueFlowKind::BackingStore { .. },
             source,
             target,
         } => Some((target, source)),
@@ -605,7 +602,8 @@ fn relation_matches_event(
                 || is_container_collapse(relation, *target)
         }
         SemanticEffect::ValueFlow {
-            kind: ValueFlowKind::Local | ValueFlowKind::BackingStore { .. },
+            kind:
+                ValueFlowKind::Local | ValueFlowKind::AddressOf | ValueFlowKind::BackingStore { .. },
             source,
             target,
         } => {
@@ -706,7 +704,8 @@ fn relation_matches_event(
         }
         SemanticEffect::ValueFlow {
             kind:
-                ValueFlowKind::LanguageDefined
+                ValueFlowKind::MemoryLoad { .. }
+                | ValueFlowKind::LanguageDefined
                 | ValueFlowKind::ByValueCapture
                 | ValueFlowKind::IntegerOffset { .. },
             source,
@@ -1036,17 +1035,73 @@ pub struct ValueFlowRelation {
 }
 
 impl ValueFlowRelation {
+    /// Sufficient borrowed content correspondence; grants no admission authority.
+    /// Executable handles retain their exact artifact and interpretation equality.
+    #[doc(hidden)]
+    fn has_same_content_by(
+        &self,
+        other: &Self,
+        same_relation: &impl Fn(&OracleRelationHandle, &OracleRelationHandle) -> bool,
+    ) -> bool {
+        let Self {
+            point: l_point,
+            event_index: l_event_index,
+            id: l_id,
+            kind: l_kind,
+            transfer: l_transfer,
+            source: l_source,
+            target: l_target,
+            collapse_read: l_collapse_read,
+            proof: l_proof,
+            completeness: l_completeness,
+            strong_update: l_strong_update,
+            direct_cell_overwrite: l_direct_cell_overwrite,
+            original_cell: l_original_cell,
+            memory_seal: l_memory_seal,
+        } = self;
+        let Self {
+            point: r_point,
+            event_index: r_event_index,
+            id: r_id,
+            kind: r_kind,
+            transfer: r_transfer,
+            source: r_source,
+            target: r_target,
+            collapse_read: r_collapse_read,
+            proof: r_proof,
+            completeness: r_completeness,
+            strong_update: r_strong_update,
+            direct_cell_overwrite: r_direct_cell_overwrite,
+            original_cell: r_original_cell,
+            memory_seal: r_memory_seal,
+        } = other;
+
+        l_point == r_point
+            && l_event_index == r_event_index
+            && same_relation(l_id, r_id)
+            && l_kind == r_kind
+            && l_transfer == r_transfer
+            && l_source == r_source
+            && l_target == r_target
+            && l_collapse_read == r_collapse_read
+            && l_proof == r_proof
+            && l_completeness == r_completeness
+            && l_strong_update == r_strong_update
+            && l_direct_cell_overwrite == r_direct_cell_overwrite
+            && l_original_cell == r_original_cell
+            && l_memory_seal == r_memory_seal
+    }
+}
+
+impl ValueFlowRelation {
     pub(super) fn retained_artifacts(
         &self,
-        census: &mut crate::analyzer::semantic::service::ArtifactRetentionCensus,
+        census: &mut impl crate::analyzer::semantic::service::ArtifactRetentionVisitor,
     ) {
-        census.procedure(self.point.procedure());
-        self.id.retained_artifacts(census);
-        self.source.retained_artifacts(census);
-        self.target.retained_artifacts(census);
-        if let Some(original) = &self.original_cell {
-            original.path().retained_artifacts(census);
-        }
+        super::model::collect_retained_model(
+            super::model::RetainedModelPart::Relation(self),
+            census,
+        );
     }
 
     /// Construct an unsealed row. This grants no memory-operation authority.
@@ -1495,8 +1550,19 @@ pub struct ValueFlowSnapshot {
     execution_dependent: bool,
     procedure: ProcedureHandle,
     context: OracleCallContext,
-    relations: Box<[ValueFlowRelation]>,
+    backing: Arc<ValueFlowSnapshotBacking>,
+    /// Only this selected root may discharge this exact additional gap.
+    selected_entry_gap: Option<SemanticGapId>,
     coverage: CandidateCoverage,
+    /// The workspace proof could not discharge a lowered Go builtin assumption.
+    unproven_go_builtin_assumptions: bool,
+}
+
+/// Immutable query-time rows shared by plain and selected-root snapshots.
+/// Explicit row filtering uses copy-on-write; selecting an entry never does.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ValueFlowSnapshotBacking {
+    relations: Box<[ValueFlowRelation]>,
     /// Gaps on this snapshot's procedure that a query-time discharge
     /// predicate proved do not apply, computed once while this snapshot was
     /// materialized (#2545).
@@ -1514,20 +1580,195 @@ pub struct ValueFlowSnapshot {
     /// consumer trust this snapshot's own judgment without re-deriving it
     /// and without needing the query-time analyzer access that judgment
     /// required.
-    discharged_gaps: Box<[SemanticGapId]>,
-    /// The workspace proof could not discharge a lowered Go builtin assumption.
-    unproven_go_builtin_assumptions: bool,
-    /// A stored member of a returned join was not published at the return port
-    /// (#9766). The relation list is then missing a relation although the
-    /// coverage is Open, not Truncated: Open admits more candidates, while this
-    /// flag says a known one was left out.
-    untransported_return_member: bool,
+    discharged_gaps: Box<[crate::analyzer::semantic::GapKey]>,
+    /// Known omissions from the materialized relation list (#9766).
+    omission_causes: Box<[ValueFlowOmissionCause]>,
     member_receivers: Box<[MemberReceiverFlow]>,
     /// Calls whose collection contract replaced their summary (#10989).
     collection_cells: Box<[CollectionCellBinding]>,
+    payload_projection: super::SelectedPayloadProjection,
+}
+
+impl ValueFlowSnapshotBacking {
+    /// Sufficient borrowed content correspondence; grants no admission authority.
+    /// Executable handles retain their exact artifact and interpretation equality.
+    #[doc(hidden)]
+    fn has_same_content(&self, other: &Self) -> bool {
+        let Self {
+            relations: l_relations,
+            discharged_gaps: l_discharged_gaps,
+            member_receivers: l_member_receivers,
+            collection_cells: l_collection_cells,
+            payload_projection: l_payload_projection,
+            omission_causes: l_omission_causes,
+        } = self;
+        let Self {
+            relations: r_relations,
+            discharged_gaps: r_discharged_gaps,
+            member_receivers: r_member_receivers,
+            collection_cells: r_collection_cells,
+            payload_projection: r_payload_projection,
+            omission_causes: r_omission_causes,
+        } = other;
+
+        l_relations.len() == r_relations.len()
+            && match (l_relations.first(), r_relations.first()) {
+                (None, None) => true,
+                (Some(l), Some(r)) => {
+                    l.id.has_same_arena_content(&r.id)
+                        && l_relations.iter().zip(r_relations.iter()).all(|(a, b)| {
+                            a.has_same_content_by(b, &|x, y| {
+                                x.same_arena(&l.id) && y.same_arena(&r.id) && x.id() == y.id()
+                            })
+                        })
+                }
+                _ => false,
+            }
+            && l_discharged_gaps == r_discharged_gaps
+            && l_member_receivers == r_member_receivers
+            && l_collection_cells == r_collection_cells
+            && l_payload_projection == r_payload_projection
+            && l_omission_causes == r_omission_causes
+    }
+}
+
+impl ValueFlowSnapshotBacking {
+    fn retained_bytes(&self) -> usize {
+        let mut bytes = std::mem::size_of::<Self>()
+            .saturating_add(2 * std::mem::size_of::<usize>())
+            .saturating_add(std::mem::size_of_val(self.relations.as_ref()))
+            .saturating_add(std::mem::size_of_val(self.discharged_gaps.as_ref()))
+            .saturating_add(std::mem::size_of_val(self.omission_causes.as_ref()))
+            .saturating_add(std::mem::size_of_val(self.member_receivers.as_ref()))
+            .saturating_add(std::mem::size_of_val(self.collection_cells.as_ref()));
+        for relation in &self.relations {
+            bytes = bytes
+                .saturating_add(relation.proof.retained_heap_bytes())
+                .saturating_add(relation.completeness.retained_heap_bytes());
+        }
+        for receiver in &self.member_receivers {
+            bytes = bytes
+                .saturating_add(std::mem::size_of_val(receiver.storage.as_ref()))
+                .saturating_add(
+                    receiver
+                        .field_read
+                        .as_ref()
+                        .map_or(0, |read| std::mem::size_of_val(read.as_ref())),
+                );
+        }
+        for binding in &self.collection_cells {
+            bytes = bytes.saturating_add(std::mem::size_of_val(binding.transfers.as_ref()));
+        }
+        let projection = &self.payload_projection;
+        bytes = bytes
+            .saturating_add(std::mem::size_of_val(projection.replacements.as_ref()))
+            .saturating_add(std::mem::size_of_val(projection.limitations.as_ref()));
+        for limitation in &projection.limitations {
+            bytes = bytes.saturating_add(limitation.len());
+        }
+        for event in &projection.replacements {
+            bytes = bytes.saturating_add(std::mem::size_of_val(event.relations.as_ref()));
+            if let Some(path) = &event.constructor_path {
+                bytes = bytes.saturating_add(std::mem::size_of_val(path.as_ref()));
+                for step in path.iter() {
+                    bytes = bytes.saturating_add(match step {
+                        crate::analyzer::semantic::PatternProjectionStep::Named(name) => name.len(),
+                        crate::analyzer::semantic::PatternProjectionStep::Variant {
+                            declaration,
+                        } => declaration.len(),
+                        crate::analyzer::semantic::PatternProjectionStep::Tuple(_)
+                        | crate::analyzer::semantic::PatternProjectionStep::Element => 0,
+                    });
+                }
+            }
+        }
+        bytes
+    }
 }
 
 impl ValueFlowSnapshot {
+    /// Sufficient borrowed content correspondence; grants no admission authority.
+    /// Executable handles retain their exact artifact and interpretation equality.
+    #[doc(hidden)]
+    pub fn has_same_content(&self, other: &Self) -> bool {
+        let Self {
+            execution_dependent: l_execution_dependent,
+            procedure: l_procedure,
+            context: l_context,
+            backing: l_backing,
+            selected_entry_gap: l_selected_entry_gap,
+            coverage: l_coverage,
+            unproven_go_builtin_assumptions: l_unproven_go_builtin_assumptions,
+        } = self;
+        let Self {
+            execution_dependent: r_execution_dependent,
+            procedure: r_procedure,
+            context: r_context,
+            backing: r_backing,
+            selected_entry_gap: r_selected_entry_gap,
+            coverage: r_coverage,
+            unproven_go_builtin_assumptions: r_unproven_go_builtin_assumptions,
+        } = other;
+
+        l_execution_dependent == r_execution_dependent
+            && l_procedure == r_procedure
+            && l_context == r_context
+            && l_backing.has_same_content(r_backing)
+            && l_selected_entry_gap == r_selected_entry_gap
+            && l_coverage == r_coverage
+            && l_unproven_go_builtin_assumptions == r_unproven_go_builtin_assumptions
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ValueFlowOmissionCause {
+    UntransportedReturnMember,
+}
+
+impl ValueFlowSnapshot {
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn retention_census_for_test(
+        &self,
+        census: &mut brokk_bifrost_core::retention_census::RetentionCensus<'_>,
+        family: &'static str,
+    ) {
+        use crate::analyzer::semantic::oracle::retained::{
+            RetainedNode, visit_retained_allocations_from_roots,
+        };
+
+        let mut roots = vec![
+            RetainedNode::Procedure(&self.procedure),
+            RetainedNode::CallContext(&self.context),
+        ];
+        for relation in self.relations() {
+            roots.push(RetainedNode::ValueFlow(relation));
+        }
+        for binding in self.collection_cells() {
+            roots.push(RetainedNode::Procedure(binding.call().procedure()));
+            for transfer in binding.transfers() {
+                roots.push(RetainedNode::ValueFlowEndpoint(&transfer.source));
+                roots.push(RetainedNode::ValueFlowEndpoint(&transfer.target));
+            }
+        }
+        for receiver in self.member_receivers() {
+            roots.push(RetainedNode::Procedure(receiver.call().procedure()));
+            if let Some(read) = &receiver.field_read {
+                roots.push(RetainedNode::ValueFlowEndpoint(&read.source));
+            }
+            for endpoint in receiver.storage() {
+                roots.push(RetainedNode::ValueFlowEndpoint(endpoint));
+            }
+        }
+        for event in &self.backing.payload_projection.replacements {
+            for relation in &event.relations {
+                roots.push(RetainedNode::ValueFlowEndpoint(&relation.source));
+                roots.push(RetainedNode::ValueFlowEndpoint(&relation.target));
+            }
+        }
+        visit_retained_allocations_from_roots(roots, census, family);
+    }
+
     /// Build a snapshot whose materialization discharged no gap. Equivalent
     /// to [`Self::with_discharged_gaps`] with an empty discharge set.
     pub fn new(
@@ -1551,7 +1792,7 @@ impl ValueFlowSnapshot {
         relations: Vec<ValueFlowRelation>,
         coverage: CandidateCoverage,
         limits: OracleLimits,
-        discharged_gaps: Vec<SemanticGapId>,
+        discharged_gaps: Vec<crate::analyzer::semantic::GapKey>,
     ) -> Result<Self, OracleContractError> {
         Self::with_member_receivers_and_discharged_gaps(
             procedure,
@@ -1573,31 +1814,71 @@ impl ValueFlowSnapshot {
         relations: Vec<ValueFlowRelation>,
         coverage: CandidateCoverage,
         limits: OracleLimits,
-        discharged_gaps: Vec<SemanticGapId>,
+        discharged_gaps: Vec<crate::analyzer::semantic::GapKey>,
         receivers: Vec<MemberReceiverFlow>,
         collection_cells: Vec<CollectionCellBinding>,
         execution_dependent: bool,
     ) -> Result<Self, OracleContractError> {
+        Self::with_selected_payload_projection(
+            procedure,
+            context,
+            relations,
+            coverage,
+            limits,
+            discharged_gaps,
+            receivers,
+            collection_cells,
+            execution_dependent,
+            Default::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_selected_payload_projection(
+        procedure: ProcedureHandle,
+        context: OracleCallContext,
+        relations: Vec<ValueFlowRelation>,
+        coverage: CandidateCoverage,
+        limits: OracleLimits,
+        discharged_gaps: Vec<crate::analyzer::semantic::GapKey>,
+        receivers: Vec<MemberReceiverFlow>,
+        collection_cells: Vec<CollectionCellBinding>,
+        execution_dependent: bool,
+        payload_projection: super::SelectedPayloadProjection,
+    ) -> Result<Self, OracleContractError> {
+        if (!payload_projection.affected() && !payload_projection.replacements.is_empty())
+            || payload_projection
+                .replacements
+                .windows(2)
+                .any(|rows| (rows[0].point, rows[0].event) >= (rows[1].point, rows[1].event))
+        {
+            return Err(OracleContractError::InvalidRelationIdentity);
+        }
         for binding in &collection_cells {
             require_same_procedure(binding.call.procedure(), &procedure)?;
         }
-        let metadata = Self {
+        let mut metadata = Self {
             execution_dependent: execution_dependent || coverage == CandidateCoverage::Truncated,
             procedure: procedure.clone(),
             context: context.clone(),
-            relations: Box::default(),
+            backing: Arc::new(ValueFlowSnapshotBacking {
+                relations: Box::default(),
+                omission_causes: Box::default(),
+                discharged_gaps: Box::default(),
+                member_receivers: Box::default(),
+                collection_cells: collection_cells.into_boxed_slice(),
+                payload_projection,
+            }),
+            selected_entry_gap: None,
             coverage,
-            discharged_gaps: Box::default(),
             unproven_go_builtin_assumptions: !procedure
                 .artifact()
                 .go_predeclared_builtin_assumptions()
                 .is_empty(),
-            untransported_return_member: false,
-            member_receivers: Box::default(),
-            collection_cells: collection_cells.into_boxed_slice(),
         }
         .with_member_receivers(receivers, limits)?;
         let member_calls = metadata
+            .backing
             .member_receivers
             .iter()
             .map(|receiver| (receiver.call.id(), receiver))
@@ -1652,7 +1933,7 @@ impl ValueFlowSnapshot {
                 && matches!(event.effect, SemanticEffect::CallContinuation {
                     call_site,
                     kind: CallContinuationKind::Normal,
-                } if metadata.collection_cells.iter().any(|binding| {
+                } if metadata.backing.collection_cells.iter().any(|binding| {
                     binding.call.id() == call_site
                         && binding.transfers.iter().any(|transfer| {
                             transfer.point == relation.point
@@ -1661,11 +1942,26 @@ impl ValueFlowSnapshot {
                                 && transfer.target == relation.target
                         })
                 }));
-            if !(member_transfer
-                || collection_cell_transfer
-                || relation_matches_event(&procedure, relation, &event.effect, &mut chains))
-                || !relation.has_valid_memory_authority(&event.effect)
+            let matches_selected_event = match metadata
+                .backing
+                .payload_projection
+                .replacement_at(relation.point.id(), relation.event_index)
             {
+                Some(selected) => selected.relations.iter().any(|row| {
+                    row.kind == relation.kind
+                        && row.source == relation.source
+                        && row.target == relation.target
+                        && relation.transfer.is_none()
+                        && !relation.strong_update
+                        && !relation.direct_cell_overwrite
+                }),
+                None => {
+                    member_transfer
+                        || collection_cell_transfer
+                        || relation_matches_event(&procedure, relation, &event.effect, &mut chains)
+                }
+            };
+            if !matches_selected_event || !relation.has_valid_memory_authority(&event.effect) {
                 return Err(OracleContractError::InvalidRelationIdentity);
             }
             if relation.transfer.is_some() && relation.kind != ValueFlowRelationKind::Assignment {
@@ -1719,18 +2015,16 @@ impl ValueFlowSnapshot {
             }
         }
         validate_retained_relation_arenas(relations.iter().map(|relation| &relation.id), limits)?;
-        Ok(Self {
-            procedure,
-            context,
-            relations: relations.into_boxed_slice(),
-            coverage: metadata.coverage,
-            execution_dependent: metadata.execution_dependent,
-            discharged_gaps: discharged_gaps.into_boxed_slice(),
-            unproven_go_builtin_assumptions: metadata.unproven_go_builtin_assumptions,
-            untransported_return_member: metadata.untransported_return_member,
-            member_receivers: metadata.member_receivers,
-            collection_cells: metadata.collection_cells,
-        })
+        let backing = Arc::get_mut(&mut metadata.backing)
+            .expect("a new snapshot uniquely owns its row backing");
+        backing.relations = relations.into_boxed_slice();
+        backing.discharged_gaps = discharged_gaps.into_boxed_slice();
+        Ok(metadata)
+    }
+
+    /// This same selection decides the snapshot path and every derived key.
+    pub fn payload_projection(&self) -> &super::SelectedPayloadProjection {
+        &self.backing.payload_projection
     }
 
     pub fn is_execution_dependent(&self) -> bool {
@@ -1756,8 +2050,16 @@ impl ValueFlowSnapshot {
     /// Record that the projection left a stored member of a returned join out of
     /// the relation list (#9766).
     pub fn with_untransported_return_member(mut self, untransported: bool) -> Self {
-        self.untransported_return_member = untransported;
+        Arc::make_mut(&mut self.backing).omission_causes = if untransported {
+            vec![ValueFlowOmissionCause::UntransportedReturnMember].into_boxed_slice()
+        } else {
+            Box::default()
+        };
         self
+    }
+
+    pub fn omission_causes(&self) -> &[ValueFlowOmissionCause] {
+        &self.backing.omission_causes
     }
 
     /// Whether the relation list may lack a relation: a capacity cap cut it
@@ -1767,7 +2069,7 @@ impl ValueFlowSnapshot {
     /// A consumer that treats the relations as complete must ask this, not
     /// match the coverage.
     pub fn relations_may_be_missing(&self) -> bool {
-        self.coverage == CandidateCoverage::Truncated || self.untransported_return_member
+        self.coverage == CandidateCoverage::Truncated || !self.backing.omission_causes.is_empty()
     }
 
     pub fn with_member_receivers(
@@ -1796,39 +2098,60 @@ impl ValueFlowSnapshot {
         {
             self.coverage = CandidateCoverage::Open;
         }
-        self.member_receivers = receivers.into_boxed_slice();
+        Arc::make_mut(&mut self.backing).member_receivers = receivers.into_boxed_slice();
         Ok(self)
     }
 
     pub fn member_receivers(&self) -> &[MemberReceiverFlow] {
-        &self.member_receivers
+        &self.backing.member_receivers
     }
 
     /// The calls whose collection contract this snapshot bound to container
     /// cells (#10989). Their summaries' receiver transfers must not also apply
     /// at the normal continuation.
     pub fn collection_cells(&self) -> &[CollectionCellBinding] {
-        &self.collection_cells
+        &self.backing.collection_cells
+    }
+
+    /// Full backing/context children beneath this inline snapshot. The same
+    /// actual backing allocation is counted once across ordinary/selected views.
+    #[doc(hidden)]
+    pub fn retained_allocations(
+        &self,
+        census: &mut impl crate::analyzer::semantic::service::ArtifactRetentionVisitor,
+    ) {
+        self.retained_artifacts(census);
     }
 
     #[doc(hidden)]
     pub fn retained_artifacts(
         &self,
-        census: &mut crate::analyzer::semantic::service::ArtifactRetentionCensus,
+        census: &mut impl crate::analyzer::semantic::service::ArtifactRetentionVisitor,
     ) {
         census.procedure(&self.procedure);
         census.context(&self.context);
+        if !census.shared_allocation(Arc::as_ptr(&self.backing) as usize, || {
+            self.backing.retained_bytes()
+        }) {
+            return;
+        }
         for relation in self.relations() {
             relation.retained_artifacts(census);
         }
-        for binding in &self.collection_cells {
+        for event in &self.backing.payload_projection.replacements {
+            for relation in &event.relations {
+                relation.source.retained_artifacts(census);
+                relation.target.retained_artifacts(census);
+            }
+        }
+        for binding in &self.backing.collection_cells {
             census.procedure(binding.call.procedure());
             for transfer in &binding.transfers {
                 transfer.source.retained_artifacts(census);
                 transfer.target.retained_artifacts(census);
             }
         }
-        for receiver in &self.member_receivers {
+        for receiver in &self.backing.member_receivers {
             census.procedure(receiver.call.procedure());
             if let Some(read) = &receiver.field_read {
                 read.source.retained_artifacts(census);
@@ -1843,14 +2166,21 @@ impl ValueFlowSnapshot {
         &self.procedure
     }
 
+    /// Exact immutable allocation identity, including empty row collections.
+    #[doc(hidden)]
+    pub fn shares_backing_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.backing, &other.backing)
+    }
+
     pub fn relations(&self) -> &[ValueFlowRelation] {
-        &self.relations
+        &self.backing.relations
     }
 
     /// Structural owned arena bytes, counted once even after filtering rows.
     /// Retained handles keep the entire original bounded arena alive.
     pub fn retained_arena_bytes(&self) -> usize {
-        self.relations
+        self.backing
+            .relations
             .first()
             .map_or(0, |relation| relation.id.arena().retained_bytes())
     }
@@ -1861,10 +2191,35 @@ impl ValueFlowSnapshot {
     /// The client must independently account for results of excluded transfers
     /// rather than treating the missing dependency as proof of absence.
     pub fn into_class_identity_projection(mut self) -> Self {
-        let mut relations = self.relations.into_vec();
+        let backing = Arc::make_mut(&mut self.backing);
+        let mut relations = std::mem::take(&mut backing.relations).into_vec();
         let mut chains = None;
         relations.retain(|relation| relation.preserves_runtime_class(&mut chains));
-        self.relations = relations.into_boxed_slice();
+        backing.relations = relations.into_boxed_slice();
+        self
+    }
+
+    /// Exclude address construction and address-to-load dependencies from
+    /// pointer-identity propagation while
+    /// preserving the same snapshot's ordinary dependence for taint clients.
+    pub fn without_pointer_operand_dependencies(mut self) -> Self {
+        let backing = Arc::make_mut(&mut self.backing);
+        let mut relations = std::mem::take(&mut backing.relations).into_vec();
+        relations.retain(|relation| {
+            let point = self
+                .procedure
+                .semantics()
+                .point(relation.point.id())
+                .expect("validated relation point");
+            !matches!(
+                point.events[relation.event_index as usize].effect,
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::AddressOf | ValueFlowKind::MemoryLoad { .. },
+                    ..
+                }
+            )
+        });
+        backing.relations = relations.into_boxed_slice();
         self
     }
 
@@ -1888,13 +2243,14 @@ impl ValueFlowSnapshot {
                 "a replaced load must belong to the snapshot procedure"
             );
         }
-        let mut relations = self.relations.into_vec();
+        let backing = Arc::make_mut(&mut self.backing);
+        let mut relations = std::mem::take(&mut backing.relations).into_vec();
         relations.retain(|relation| {
             !(relation.kind == ValueFlowRelationKind::MemoryLoad
                 && matches!(&relation.target, ValueFlowEndpoint::Value(value)
                     if loads.contains(&(relation.point.id(), value.id()))))
         });
-        self.relations = relations.into_boxed_slice();
+        backing.relations = relations.into_boxed_slice();
         self
     }
 
@@ -1906,13 +2262,156 @@ impl ValueFlowSnapshot {
         self.coverage
     }
 
+    /// Query-local selected-root provenance; this grants no source authority.
+    pub const fn selected_entry_gap(&self) -> Option<SemanticGapId> {
+        self.selected_entry_gap
+    }
+
     /// Whether a query-time discharge predicate proved, while this snapshot
     /// was materialized, that `gap` does not apply (#2545). `false` for a
     /// gap this snapshot never examined (a stale or foreign ID) as well as
     /// for one it examined and left standing -- both keep whatever the gap
     /// would otherwise mean to a caller that re-examines this snapshot's
     /// procedure's raw gap list.
-    pub fn gap_is_discharged(&self, gap: SemanticGapId) -> bool {
-        self.discharged_gaps.contains(&gap)
+    pub fn gap_is_discharged(&self, gap: crate::analyzer::semantic::GapKey) -> bool {
+        if matches!(gap, crate::analyzer::semantic::GapKey::Member(_))
+            && self.procedure.semantics().logical_gap(gap).is_none()
+        {
+            return false;
+        }
+        self.selected_entry_gap
+            .is_some_and(|selected| gap == crate::analyzer::semantic::GapKey::Gap(selected))
+            || gap.is_discharged_by(|key| self.backing.discharged_gaps.contains(&key))
+    }
+}
+
+/// Query-only entry evidence. This certifies the existing binder after its
+/// guarded definition, never a transfer from the pattern's whole input.
+/// Declaration/AST authority is supplied by admission; this layer validates
+/// its exact correspondence with the immutable procedure and linked gap.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SelectedPatternEntry {
+    observation: crate::analyzer::semantic::ValueAtPoint,
+    candidate: u32,
+    gap: SemanticGapId,
+    field: crate::analyzer::semantic::SourceSpan,
+}
+
+impl SelectedPatternEntry {
+    #[doc(hidden)]
+    pub fn validate(
+        observation: crate::analyzer::semantic::ValueAtPoint,
+        candidate: u32,
+        constructor: crate::analyzer::semantic::SourceSpan,
+        field: crate::analyzer::semantic::SourceSpan,
+        root_to_constructor: &[crate::analyzer::semantic::PatternProjectionStep],
+        constructor_to_binding: &[crate::analyzer::semantic::PatternProjectionStep],
+    ) -> Result<Self, OracleContractError> {
+        use crate::analyzer::semantic::{SemanticCapability, SemanticGapKind, SemanticGapSubject};
+        let procedure = observation.point().procedure();
+        require_same_procedure(procedure, observation.value().procedure())?;
+        let semantics = procedure.semantics();
+        let projection = semantics
+            .guarded_pattern_projections()
+            .get(candidate as usize)
+            .ok_or(OracleContractError::InvalidRelationIdentity)?;
+        let gap = projection
+            .gap
+            .and_then(|id| semantics.gaps().get(id.index()))
+            .ok_or(OracleContractError::InvalidRelationIdentity)?;
+        let pattern = semantics
+            .source_mapping(projection.pattern_source)
+            .ok_or(OracleContractError::InvalidRelationIdentity)?
+            .locator
+            .anchor()
+            .span();
+        let binder = semantics
+            .source_mapping(projection.binder_source)
+            .ok_or(OracleContractError::InvalidRelationIdentity)?
+            .locator
+            .anchor()
+            .span();
+        let contains = |outer: crate::analyzer::semantic::SourceSpan,
+                        inner: crate::analyzer::semantic::SourceSpan| {
+            outer.start_byte() <= inner.start_byte() && inner.end_byte() <= outer.end_byte()
+        };
+        let point = semantics
+            .point(projection.point)
+            .ok_or(OracleContractError::InvalidRelationIdentity)?;
+        if projection.ordinal != candidate
+            || projection.point != observation.point().id()
+            || projection.binder != observation.value().id()
+            || observation.phase() != crate::analyzer::semantic::ObservationPhase::AfterEffects
+            || gap.point != projection.point
+            || gap.subject != SemanticGapSubject::Value(projection.binder)
+            || gap.capability != SemanticCapability::Values
+            || gap.kind != SemanticGapKind::Unsupported
+            || !gap
+                .impacts
+                .contains(crate::analyzer::semantic::SemanticGapImpact::ValueFlow)
+            || !contains(pattern, constructor)
+            || !contains(pattern, field)
+            || constructor.end_byte() > field.start_byte()
+            || !contains(field, binder)
+            || constructor_to_binding.is_empty()
+            || !root_to_constructor
+                .iter()
+                .chain(constructor_to_binding)
+                .eq(projection.path.iter())
+            || !point.events.iter().any(|event| {
+                matches!(event.effect,
+                SemanticEffect::Gap { gap: id } if id == gap.id)
+            })
+            || !point.events.iter().any(|event| {
+                matches!(event.effect,
+                SemanticEffect::Assignment { target, .. } if target == projection.binder)
+            })
+        {
+            return Err(OracleContractError::InvalidRelationIdentity);
+        }
+        let gap_id = gap.id;
+        Ok(Self {
+            observation,
+            candidate,
+            gap: gap_id,
+            field,
+        })
+    }
+
+    pub fn observation(&self) -> &crate::analyzer::semantic::ValueAtPoint {
+        &self.observation
+    }
+
+    /// Retained candidate identity, without constructing or validating a proof.
+    #[doc(hidden)]
+    pub const fn candidate_ordinal(&self) -> u32 {
+        self.candidate
+    }
+
+    /// The exact retained certified field geometry.
+    #[doc(hidden)]
+    pub const fn field(&self) -> &crate::analyzer::semantic::SourceSpan {
+        &self.field
+    }
+
+    pub const fn gap(&self) -> SemanticGapId {
+        self.gap
+    }
+
+    /// A distinct, selected-root product. The caller must keep it with this
+    /// entry and must never publish it as a plain procedure snapshot/summary.
+    /// Every relation, capability and other gap is retained unchanged.
+    #[doc(hidden)]
+    pub fn project(
+        &self,
+        base: &ValueFlowSnapshot,
+    ) -> Result<ValueFlowSnapshot, OracleContractError> {
+        require_same_procedure(base.procedure(), self.observation.point().procedure())?;
+        if base.context() != self.observation.context() || base.selected_entry_gap.is_some() {
+            return Err(OracleContractError::InvalidRelationIdentity);
+        }
+        let mut selected = base.clone();
+        selected.selected_entry_gap = Some(self.gap);
+        Ok(selected)
     }
 }

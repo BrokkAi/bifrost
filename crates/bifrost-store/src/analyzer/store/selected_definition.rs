@@ -219,9 +219,12 @@ pub(super) static SELECTED_MACRO_ITEM_UNIT_SQL: std::sync::LazyLock<String> =
              CROSS JOIN temp.selected_resolution_mounts AS mount
                ON mount.mount_ordinal = staged.host_ordinal
              CROSS JOIN main.resolution_unit_summary_members AS member
-                 INDEXED BY resolution_unit_summary_members_blob
-               ON member.blob_id = mount.blob_id
-              AND member.rel_path = mount.persisted_relative_path
+                 INDEXED BY resolution_unit_summary_members_path
+               ON member.rel_path = mount.persisted_relative_path
+             CROSS JOIN temp.selected_unit_member_blobs AS attachment
+               ON attachment.summary_id = member.summary_id
+              AND attachment.member_ordinal = member.member_ordinal
+              AND attachment.blob_id = mount.blob_id
              CROSS JOIN temp.selected_rust_unit_summaries AS selected
                ON selected.summary_id = member.summary_id
              CROSS JOIN main.rust_resolution_unit_summary_generated_names AS item
@@ -229,7 +232,7 @@ pub(super) static SELECTED_MACRO_ITEM_UNIT_SQL: std::sync::LazyLock<String> =
                ON item.summary_id = member.summary_id
               AND item.member_ordinal = member.member_ordinal
              CROSS JOIN main.source_declarations AS declaration
-               ON declaration.blob_id = member.blob_id
+               ON declaration.blob_id = attachment.blob_id
               AND declaration.declaration_id = item.declaration_id
               AND declaration.name_start_byte = staged.start_byte
               AND declaration.name_end_byte = staged.end_byte

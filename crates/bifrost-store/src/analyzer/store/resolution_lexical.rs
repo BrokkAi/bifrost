@@ -1059,6 +1059,14 @@ pub struct UnconditionalCandidateCache {
 }
 
 impl UnconditionalCandidateCache {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn is_empty_for_test(&self) -> bool {
+        self.gap_boxes.borrow().is_empty()
+            && self.reverse_rows.borrow().is_empty()
+            && self.context_paths.borrow().is_empty()
+            && self.context_snapshots.borrow().is_empty()
+    }
+
     #[doc(hidden)]
     pub fn for_operation() -> Self {
         Self::new(None)
@@ -10959,6 +10967,11 @@ pub(crate) struct CandidatePathReadMemo {
     pub(crate) statements: usize,
 }
 impl CandidatePathReadMemo {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn is_empty_for_test(&self) -> bool {
+        self.rows.is_empty()
+    }
+
     /// Statements run, fills, refused admissions and admitted bytes.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn counts_for_test(&self) -> (usize, usize, usize, usize) {

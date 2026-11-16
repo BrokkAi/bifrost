@@ -169,7 +169,9 @@ fn populate_lexical_captures<'tree>(
     inventory: &mut ProcedureInventoryBuilder<'_>,
     cancellation: &CancellationToken,
 ) -> Result<(), JavaCaptureInventoryStop> {
-    use brokk_bifrost_analysis::analyzer::lexical_definitions::LexicalBindingResolution;
+    use brokk_bifrost_analysis::analyzer::lexical_definitions::{
+        LexicalBindingResolution, LexicalBindingUnproven,
+    };
 
     use brokk_bifrost_analysis::analyzer::lexical_definitions::resolve_lexical_binding_from_focus_with_visibility;
 
@@ -269,7 +271,7 @@ fn populate_lexical_captures<'tree>(
             name,
         ) {
             Ok(Some(resolution)) => resolution,
-            Ok(None) => continue,
+            Ok(None) | Err(LexicalBindingUnproven::NonLexicalFocus) => continue,
             Err(_) => {
                 // A refused nearer binding may hide any ancestor's parameter.
                 // Every lambda that reads through this writer's lexical chain
@@ -393,7 +395,7 @@ fn populate_lexical_captures<'tree>(
                 name,
             ) {
                 Ok(Some(resolution)) => resolution,
-                Ok(None) => continue,
+                Ok(None) | Err(LexicalBindingUnproven::NonLexicalFocus) => continue,
                 Err(_) => {
                     incomplete[spec.id.index()] = true;
                     continue;

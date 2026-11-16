@@ -486,6 +486,7 @@ mod row_fixture {
             kind,
             budget,
             discharge,
+            dispatch: Default::default(),
             detail: format!("gap detail {id}").into(),
             source: sm(1),
             evidence: ev(2),
@@ -1269,6 +1270,8 @@ mod row_fixture {
             ),
             flow(ValueFlowKind::IndexedReturn { ordinal: 2 }, 17, 5),
             flow(ValueFlowKind::Local, 0, 6),
+            flow(ValueFlowKind::AddressOf, 0, 6),
+            flow(ValueFlowKind::MemoryLoad { location: mem(5) }, 7, 6),
             flow(ValueFlowKind::Parameter, 1, 6),
             flow(ValueFlowKind::Receiver, 4, 6),
             flow(ValueFlowKind::Return, 6, 5),
@@ -1937,6 +1940,7 @@ mod row_fixture {
             binder: v(0),
             pattern_source: sm(4),
             binder_source: sm(3),
+            gap: None,
             declared_path_len: 2,
             path: vec![
                 PatternProjectionStep::Tuple(0),
@@ -2207,7 +2211,10 @@ mod row_fixture {
             ],
             true,
             true,
-            vec![SemanticGapId::new(1), SemanticGapId::new(3)],
+            vec![
+                crate::analyzer::semantic::GapKey::Gap(SemanticGapId::new(1)),
+                crate::analyzer::semantic::GapKey::Gap(SemanticGapId::new(3)),
+            ],
         );
         // A second procedure with ports, so a read of one procedure's ports
         // or flows that also took another's would be seen.
@@ -2242,6 +2249,104 @@ mod row_fixture {
                 Vec::new(),
             )
         };
+        // Compact schema boundary fixture: two nodes, independently evidenced
+        // incompleteness, owner invalidation, and an interned action selection.
+        {
+            use crate::analyzer::semantic::cfg::{
+                CleanupRegionId, CompletionKind, ScopeCleanupAction,
+            };
+            use crate::analyzer::semantic::{
+                CleanupActionEntry, CleanupActionIncomplete, CleanupAnchor, CleanupAnchorPurpose,
+                CleanupChainBuilder, CleanupChainNode, CleanupOwnerEntry, CleanupOwnerInvalidation,
+                CleanupOwnerLifecycle, CleanupSegment, LifecycleIncompleteReason,
+                PointerInvalidationCause, PointerInvalidationTarget, PointerRelationStrength,
+            };
+            let drop = &p0.drops[0];
+            let mut chains = CleanupChainBuilder::default();
+            let root = chains.intern(CleanupChainNode {
+                parent: None,
+                region: Some(CleanupRegionId::new(0)),
+                actions: vec![CleanupActionEntry {
+                    action: ScopeCleanupAction::Drop {
+                        place: drop.place.clone(),
+                        behavior: drop.behavior.clone(),
+                        source: drop.source,
+                        evidence: drop.evidence,
+                    },
+                    incomplete: Some(CleanupActionIncomplete {
+                        reason: LifecycleIncompleteReason::MissingType,
+                        evidence: p0.evidence_rows[1].id,
+                    }),
+                }]
+                .into_boxed_slice(),
+                owners: vec![CleanupOwnerEntry {
+                    value: p0.values[0].id,
+                    place: drop.place.clone(),
+                    lifecycle: CleanupOwnerLifecycle::ScopeEnd,
+                    invalidation: Some(CleanupOwnerInvalidation {
+                        target: PointerInvalidationTarget::Pointer(p0.values[0].id),
+                        cause: PointerInvalidationCause::OwnerDropped,
+                        strength: PointerRelationStrength::Must,
+                    }),
+                    source: drop.source,
+                    evidence: drop.evidence,
+                }]
+                .into_boxed_slice(),
+            });
+            let head = chains.intern(CleanupChainNode {
+                parent: Some(root),
+                region: Some(CleanupRegionId::new(1)),
+                actions: vec![CleanupActionEntry {
+                    action: ScopeCleanupAction::ScopeEnd {
+                        place: drop.place.clone(),
+                        source: drop.source,
+                        evidence: drop.evidence,
+                    },
+                    incomplete: None,
+                }]
+                .into_boxed_slice(),
+                owners: Box::default(),
+            });
+            let projection = chains.intern_projection(vec![chains.action_cursor(root, 0)]);
+            chains.append_anchor(CleanupAnchor {
+                point: drop.point,
+                segment: CleanupSegment {
+                    head: Some(head),
+                    stop: None,
+                },
+                destination: drop.point,
+                destination_kind: CompletionKind::Return,
+                edge_kind: ControlEdgeKind::Cleanup,
+                purpose: CleanupAnchorPurpose::Completion,
+                projection: Some(projection),
+                drop_offset: 0,
+                scope_end_offset: 0,
+                incomplete_offset: 0,
+                pointer_invalidation_offset: 0,
+            });
+            p0.cleanup_chains = chains
+                .finish(&brokk_bifrost_core::cancellation::CancellationToken::default())
+                .expect("valid cleanup chains");
+            for segment in [
+                CleanupSegment {
+                    head: Some(head),
+                    stop: None,
+                },
+                CleanupSegment {
+                    head: Some(head),
+                    stop: Some(root),
+                },
+                CleanupSegment {
+                    head: None,
+                    stop: None,
+                },
+            ] {
+                let mut gap = p0.gaps[0].clone();
+                gap.id = SemanticGapId::new(p0.gaps.len() as u32);
+                gap.subject = SemanticGapSubject::CleanupOwners(segment);
+                p0.gaps.push(gap);
+            }
+        }
         Fixture {
             scope,
             parts: vec![p0, p1, p2, p3, p4],
@@ -2323,6 +2428,7 @@ mod row_fixture {
 /// columns. The expected value is the input itself, except that the blob's Go
 /// builtin assumptions come back sorted and deduplicated on procedure 0.
 #[test]
+#[hardwon("#10879: owner-independent cleanup abort discharges must round-trip as stored IDs")]
 fn semantic_ir_rows_round_trip_every_table_and_variant() {
     use super::{SemanticIrPublication, SemanticIrPublicationOutcome};
     use crate::analyzer::semantic::ProcedureId;
@@ -2369,10 +2475,12 @@ fn semantic_ir_rows_round_trip_every_table_and_variant() {
             source: crate::analyzer::semantic::SourceMappingId::new(0),
             evidence: crate::analyzer::semantic::EvidenceId::new(1),
         });
+    let next_gap =
+        crate::analyzer::semantic::SemanticGapId::new(fixture.parts[0].gaps.len() as u32);
     fixture.parts[0]
         .gaps
         .push(crate::analyzer::semantic::SemanticGap {
-            id: crate::analyzer::semantic::SemanticGapId::new(8),
+            id: next_gap,
             point: crate::analyzer::semantic::ProgramPointId::new(4),
             subject: crate::analyzer::semantic::SemanticGapSubject::Point,
             capability: crate::analyzer::semantic::SemanticCapability::ExceptionalControlFlow,
@@ -2382,11 +2490,94 @@ fn semantic_ir_rows_round_trip_every_table_and_variant() {
             ),
             kind: crate::analyzer::semantic::SemanticGapKind::Unproven,
             budget: None,
+            dispatch: Default::default(),
             discharge: crate::analyzer::semantic::SemanticGapDischarge::None,
             detail: "unproven reason".into(),
             source: crate::analyzer::semantic::SourceMappingId::new(0),
             evidence: crate::analyzer::semantic::EvidenceId::new(1),
         });
+    // A separate obligation on the same binder/point must not be confused
+    // with the candidate's exact omitted-projection obligation.
+    let mut projection_gap = fixture.parts[0].gaps[2].clone();
+    projection_gap.id = crate::analyzer::semantic::SemanticGapId::new(
+        u32::try_from(fixture.parts[0].gaps.len()).unwrap(),
+    );
+    projection_gap.kind = crate::analyzer::semantic::SemanticGapKind::Unsupported;
+    projection_gap.discharge = crate::analyzer::semantic::SemanticGapDischarge::None;
+    fixture.parts[0].guarded_pattern_projections[0].gap = Some(projection_gap.id);
+    let mut events = std::mem::take(&mut fixture.parts[0].points[2].events).into_vec();
+    events.push(crate::analyzer::semantic::SemanticEvent::new(
+        crate::analyzer::semantic::SemanticEffect::Gap {
+            gap: projection_gap.id,
+        },
+        projection_gap.source,
+        projection_gap.evidence,
+    ));
+    fixture.parts[0].points[2].events = events.into_boxed_slice();
+    fixture.parts[0].gaps.push(projection_gap);
+    // One uniform abort verdict represents every member without storing a
+    // per-owner list. Keep the existing Vec<u32> JSONB format on this boundary.
+    use crate::analyzer::semantic::{
+        GapKey, SemanticCapability, SemanticGapDischarge, SemanticGapKind, SemanticGapSubject,
+    };
+    let mut implicit_drop = fixture.parts[0].gaps[0].clone();
+    implicit_drop.id =
+        crate::analyzer::semantic::SemanticGapId::new(fixture.parts[0].gaps.len() as u32);
+    implicit_drop.subject = SemanticGapSubject::Point;
+    implicit_drop.capability = SemanticCapability::CleanupControlFlow;
+    implicit_drop.kind = SemanticGapKind::Unknown;
+    implicit_drop.discharge = SemanticGapDischarge::ImplicitDropExecution;
+    implicit_drop.impacts = crate::analyzer::semantic::SemanticGapImpacts::for_gap(
+        implicit_drop.capability,
+        implicit_drop.subject,
+    );
+    fixture.parts[0].gaps.push(implicit_drop.clone());
+    for (marker, control) in [
+        (
+            SemanticGapDischarge::InertDropGlue,
+            SemanticGapDischarge::NonRejoiningExceptionalExitAfterInertDrops,
+        ),
+        (
+            SemanticGapDischarge::ImplicitDropExecution,
+            SemanticGapDischarge::ExitOnlyProcedureCompletion,
+        ),
+    ] {
+        let mut exceptional_drop = implicit_drop.clone();
+        exceptional_drop.id =
+            crate::analyzer::semantic::SemanticGapId::new(fixture.parts[0].gaps.len() as u32);
+        exceptional_drop.subject =
+            SemanticGapSubject::Value(crate::analyzer::semantic::ValueId::new(0));
+        exceptional_drop.capability = SemanticCapability::ExceptionalControlFlow;
+        exceptional_drop.kind = SemanticGapKind::Unsupported;
+        exceptional_drop.discharge = marker;
+        exceptional_drop.impacts =
+            crate::analyzer::semantic::SemanticGapImpacts::for_gap_with_discharge(
+                exceptional_drop.capability,
+                exceptional_drop.subject,
+                marker,
+            );
+        assert!(exceptional_drop.is_implicit_drop_omission());
+        assert_eq!(exceptional_drop.control_flow_discharge(), control);
+        fixture.parts[0].gaps.push(exceptional_drop);
+    }
+    let uniform = fixture.parts[0]
+        .gaps
+        .iter_mut()
+        .find(|gap| {
+            matches!(gap.subject, SemanticGapSubject::CleanupOwners(segment)
+            if !segment.is_empty())
+        })
+        .unwrap();
+    uniform.capability = SemanticCapability::ExceptionalControlFlow;
+    uniform.kind = SemanticGapKind::Unsupported;
+    uniform.budget = None;
+    uniform.discharge = SemanticGapDischarge::NonRejoiningExceptionalExitAfterInertDrops;
+    uniform.impacts =
+        crate::analyzer::semantic::SemanticGapImpacts::for_gap(uniform.capability, uniform.subject);
+    let uniform_id = uniform.id;
+    fixture.flows[0]
+        .discharged_gaps
+        .push(GapKey::Gap(uniform_id));
     let prepared = prepare(&fixture);
     let store = AnalyzerStore::open_ephemeral().unwrap();
     let (oid, blob_id) = insert(&store, "round trip", &prepared);
@@ -2440,6 +2631,25 @@ fn semantic_ir_rows_round_trip_every_table_and_variant() {
                 "receiver places must name stored parents: {statement}"
             );
         }
+        let duplicate = conn
+            .execute(
+                "INSERT INTO semantic_ir_guarded_pattern_projections
+             (blob_id, procedure, ordinal, point, whole_value, binder, pattern_source,
+              binder_source, gap, path_len, status)
+             SELECT blob_id, procedure, 1, point, whole_value, binder, pattern_source,
+                    binder_source, gap, path_len, status
+             FROM semantic_ir_guarded_pattern_projections
+             WHERE blob_id = ?1 AND procedure = 0 AND ordinal = 0",
+                [blob_id],
+            )
+            .expect_err("one exact gap cannot authorize two candidates");
+        assert_eq!(
+            duplicate
+                .sqlite_error()
+                .expect("SQLite constraint")
+                .extended_code,
+            rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+        );
         assert_eq!(
             conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
                 row.get::<_, i64>(0)
@@ -2472,6 +2682,27 @@ fn semantic_ir_rows_round_trip_every_table_and_variant() {
         );
     }
 
+    let hydrated_flows = store
+        .read_partial_flows(blob_id, ProcedureId::new(0), &fixture.scope)
+        .unwrap()
+        .unwrap();
+    let hydrated_procedure = &decoded[0];
+    let uniform = hydrated_procedure
+        .gaps
+        .iter()
+        .find(|gap| gap.id == uniform_id)
+        .unwrap();
+    let SemanticGapSubject::CleanupOwners(segment) = uniform.subject else {
+        unreachable!()
+    };
+    for owner in hydrated_procedure.cleanup_chains.member_owners(segment) {
+        let key = GapKey::Member(crate::analyzer::semantic::GapMemberRef {
+            base_gap_id: uniform_id,
+            owner,
+        });
+        assert!(key.is_discharged_by(|key| fixture.flows[0].discharged_gaps.contains(&key)));
+        assert!(key.is_discharged_by(|key| hydrated_flows.discharged_gaps.contains(&key)));
+    }
     for (index, flows) in fixture.flows.iter().enumerate() {
         let procedure = ProcedureId::new(u32::try_from(index).unwrap());
         assert_eq!(
@@ -2895,6 +3126,33 @@ fn semantic_ir_decoder_rejects_corrupted_rows_by_naming_the_row() {
 
     let cases: &[(&str, CorruptedRead, &str, &[&str])] = &[
         (
+            "a guarded candidate with a missing linked gap",
+            CorruptedRead::Ir,
+            "UPDATE semantic_ir_guarded_pattern_projections SET gap = 999 WHERE blob_id = {blob} AND procedure = 0 AND ordinal = 0",
+            &[
+                "semantic_ir_guarded_pattern_projections",
+                "invalid unevaluated pattern projection 0",
+            ],
+        ),
+        (
+            "a guarded candidate with a wrong linked point or binder",
+            CorruptedRead::Ir,
+            "UPDATE semantic_ir_guarded_pattern_projections SET gap = 0 WHERE blob_id = {blob} AND procedure = 0 AND ordinal = 0",
+            &[
+                "semantic_ir_guarded_pattern_projections",
+                "invalid unevaluated pattern projection 0",
+            ],
+        ),
+        (
+            "a guarded candidate with a unrelated co-located linked gap",
+            CorruptedRead::Ir,
+            "UPDATE semantic_ir_guarded_pattern_projections SET gap = 2 WHERE blob_id = {blob} AND procedure = 0 AND ordinal = 0",
+            &[
+                "semantic_ir_guarded_pattern_projections",
+                "invalid unevaluated pattern projection 0",
+            ],
+        ),
+        (
             "a guarded candidate with a mismatched path length",
             CorruptedRead::Ir,
             "UPDATE semantic_ir_guarded_pattern_projections SET path_len = 3 WHERE blob_id = {blob} AND procedure = 0 AND ordinal = 0",
@@ -3256,4 +3514,557 @@ fn call_control_coverage_reader_requires_complete_scoped_publication() {
         read(0),
         StoredFootprintCoverage::Refused(StoredFootprintRefusal::RefusedCoverage)
     );
+}
+
+/// Exercise the shared typed decoder with a sparse guarded procedure ID and
+/// populated child/flow rows, retaining references to ordinary procedures.
+#[test]
+fn guarded_semantic_ir_sparse_typed_rows_round_trip() {
+    use row_fixture::{fixture, insert, prepare};
+    let store = AnalyzerStore::open_ephemeral().unwrap();
+    let mut fixture = fixture();
+    // Retain a non-null omitted-projection obligation in the candidate namespace.
+    let mut projection_gap = fixture.parts[0].gaps[2].clone();
+    projection_gap.id = crate::analyzer::semantic::SemanticGapId::new(
+        u32::try_from(fixture.parts[0].gaps.len()).unwrap(),
+    );
+    projection_gap.kind = crate::analyzer::semantic::SemanticGapKind::Unsupported;
+    projection_gap.discharge = crate::analyzer::semantic::SemanticGapDischarge::None;
+    fixture.parts[0].guarded_pattern_projections[0].gap = Some(projection_gap.id);
+    let mut events = std::mem::take(&mut fixture.parts[0].points[2].events).into_vec();
+    events.push(crate::analyzer::semantic::SemanticEvent::new(
+        crate::analyzer::semantic::SemanticEffect::Gap {
+            gap: projection_gap.id,
+        },
+        projection_gap.source,
+        projection_gap.evidence,
+    ));
+    fixture.parts[0].points[2].events = events.into_boxed_slice();
+    fixture.parts[0].gaps.push(projection_gap);
+    let (_, blob_id) = insert(&store, "guarded sparse rows", &prepare(&fixture));
+    let conn = store.conn.lock().unwrap();
+    let mut expected = super::decode::read_and_decode(&conn, blob_id, &fixture.scope)
+        .unwrap()
+        .unwrap()
+        .remove(0);
+    expected.id = crate::analyzer::semantic::ProcedureId::new(7);
+    expected.go_predeclared_builtin_assumptions.clear();
+    let expected_flows = super::decode::read_partial_flows(&conn, blob_id, &fixture.scope, 0)
+        .unwrap()
+        .unwrap();
+    for &table in super::Table::ALL {
+        let spec = table.spec();
+        let target = table.candidate_spec();
+        let columns = spec.columns.join(", ");
+        let values = spec
+            .columns
+            .iter()
+            .map(|column| if *column == "procedure" { "7" } else { *column })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let filter = if spec.columns.first() == Some(&"procedure") {
+            " AND procedure = 0"
+        } else {
+            ""
+        };
+        conn.execute(&format!(
+            "INSERT INTO {} (blob_id, {columns}) SELECT blob_id, {values} FROM {} WHERE blob_id = ?1{filter}",
+            target.name, spec.name,
+        ), [blob_id]).unwrap();
+    }
+    let record = crate::analyzer::semantic::CandidateRecord::same_call(
+        &fixture.parts[0],
+        crate::analyzer::semantic::CallSiteId::new(0),
+    );
+    conn.execute(
+        "INSERT INTO candidate_macro_semantic_ir_candidates VALUES (?1, 7, ?2, ?3, 0, 'call', 0)",
+        rusqlite::params![blob_id, record.anchor.start_byte, record.anchor.end_byte],
+    )
+    .unwrap();
+    let mut decoded = super::decode::read_guarded(&conn, blob_id, &fixture.scope).unwrap();
+    assert_eq!(decoded.len(), 1);
+    let decoded = decoded.remove(0);
+    assert_eq!(format!("{:?}", expected), format!("{:?}", decoded.parts));
+    assert_eq!(
+        format!("{:?}", expected_flows),
+        format!("{:?}", decoded.flows)
+    );
+    assert_eq!(decoded.candidates, vec![record]);
+    for table in ["semantic_ir_gaps", "candidate_macro_semantic_ir_gaps"] {
+        let count: i64 = conn
+            .query_row(
+                &format!("SELECT count(*) FROM {table} WHERE subject = 8"),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 3, "{table} retains compact segment rows");
+    }
+    conn.pragma_update(None, "foreign_keys", false).unwrap();
+    conn.pragma_update(None, "ignore_check_constraints", true)
+        .unwrap();
+    for mutation in [
+        "subject = 99",
+        "subject = 0, segment_head = 0",
+        "segment_head = 99",
+        "segment_head = 0, segment_stop = 1",
+        "segment_head = NULL, segment_stop = 0",
+    ] {
+        conn.execute_batch("SAVEPOINT damage").unwrap();
+        conn.execute(
+            &format!("UPDATE candidate_macro_semantic_ir_gaps SET {mutation} WHERE gap = 8"),
+            [],
+        )
+        .unwrap();
+        assert!(
+            super::decode::read_guarded(&conn, blob_id, &fixture.scope)
+                .err()
+                .expect("damaged candidate gaps must fail")
+                .is_corrupt(),
+            "{mutation}"
+        );
+        conn.execute_batch("ROLLBACK TO damage; RELEASE damage")
+            .unwrap();
+    }
+}
+
+#[test]
+fn semantic_ir_base_decoder_rejects_sparse_procedure_heads() {
+    use row_fixture::{fixture, insert, prepare};
+    let store = AnalyzerStore::open_ephemeral().unwrap();
+    let fixture = fixture();
+    let (_, blob) = insert(&store, "sparse base head", &prepare(&fixture));
+    let conn = store.conn.lock().unwrap();
+    // Simulate on-disk corruption without allowing foreign keys to repair it.
+    conn.pragma_update(None, "foreign_keys", false).unwrap();
+    assert_eq!(
+        conn.execute(
+            "UPDATE semantic_ir_procedures SET procedure = 99 WHERE blob_id = ?1 AND procedure = 3",
+            [blob],
+        )
+        .unwrap(),
+        1
+    );
+    for selected in [None, Some(0)] {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match selected {
+            None => {
+                super::decode::read_and_decode(&conn, blob, &fixture.scope).unwrap();
+            }
+            Some(id) => {
+                super::decode::read_one_procedure(&conn, blob, &fixture.scope, id).unwrap();
+            }
+        }));
+        let payload = result.expect_err("base head must be dense");
+        let message = payload.downcast_ref::<String>().unwrap();
+        assert!(message.contains("expected the dense id 3"), "{message}");
+    }
+}
+
+/// Guard every Rust source file, including macro arguments and local constants.
+/// The allowlist names operations, rather than granting whole codec files access.
+#[test]
+fn candidate_macro_rows_have_one_guarded_reader() {
+    use syn::visit::Visit;
+    struct Audit {
+        file: String,
+        function: String,
+        violations: Vec<String>,
+    }
+    impl Audit {
+        fn check(&mut self, reference: &str) {
+            if !(reference.contains("candidate_macro_semantic_ir_")
+                || reference.contains("candidate_macro_")
+                || reference == "candidate_spec"
+                || reference == "read_guarded")
+            {
+                return;
+            }
+            let codec = self.file.ends_with("/store/semantic_ir/mod.rs");
+            // The downgrade replay removes additive tables, indexes and
+            // columns and reconstructs the pre-M2 gap relation, preserving
+            // its existing candidate rows.
+            // It also names the guarded gap table to read its schema from
+            // sqlite_master and rebuild it with the older CHECK, which is
+            // schema replay rather than a row read.
+            let downgrade = self
+                .file
+                .ends_with("/tests/suite_cross_language/golden_java_fqn_expression_prefix.rs")
+                && self.function
+                    == "lexical_head_records_survive_persisted_reopen_remount_and_epoch_rotation"
+                && (reference == "candidate_macro_semantic_ir_gaps"
+                    || (reference.contains("candidate_macro_semantic_ir_")
+                        && reference
+                            .split(';')
+                            .filter(|statement| {
+                                statement.contains("candidate_macro_semantic_ir_")
+                            })
+                            .all(|statement| {
+                                let statement = statement.trim_start();
+                                statement.starts_with("DROP TABLE candidate_macro_semantic_ir_")
+                                    || statement
+                                        .starts_with("DROP INDEX candidate_macro_semantic_ir_")
+                                    || statement
+                                        .starts_with("ALTER TABLE candidate_macro_semantic_ir_")
+                                    || statement.starts_with(
+                                        "CREATE TABLE candidate_macro_semantic_ir_candidates(",
+                                    )
+                                    || statement.starts_with(
+                                        "CREATE TABLE \"candidate_macro_semantic_ir_gaps_pre_m2\"",
+                                    )
+                                    || statement.starts_with(
+                                        "INSERT INTO candidate_macro_semantic_ir_gaps_pre_m2 SELECT ",
+                                    )
+                                    || statement.starts_with(
+                                        "ALTER TABLE candidate_macro_semantic_ir_gaps_pre_m2 RENAME TO ",
+                                    )
+                            })));
+            let allowed = downgrade
+                || (codec
+                    && matches!(
+                        self.function.as_str(),
+                        "table_census" | "insert_semantic_ir_tx" | "sealed_publication_digest"
+                    ))
+                || (self.file.ends_with("/store/semantic_ir/decode.rs")
+                    && self.function == "read_guarded")
+                || (self.file.ends_with("/store/semantic_ir/tests.rs")
+                    && matches!(
+                        self.function.as_str(),
+                        "guarded_semantic_ir_sparse_typed_rows_round_trip"
+                            | "candidate_macro_rows_have_one_guarded_reader"
+                    ))
+                || (self.file.ends_with("/store/semantic_ir/mod.rs")
+                    && matches!(
+                        self.function.as_str(),
+                        "semantic_ir_candidate_macro_alternate"
+                            | "semantic_ir_candidate_macro_presence"
+                    ))
+                || (self.file.ends_with("/bifrost-core/src/cache_db.rs")
+                    // Migration proofs rebuild a pre-upgrade schema and compare
+                    // stored rows, so they cannot use the current-format reader.
+                    && matches!(
+                        self.function.as_str(),
+                        "candidate_macro_migration_preserves_rows_and_publication_lifetime"
+                            | "cleanup_chains_upgrade_from_real_pre_m1_schema"
+                            | "candidate_records_upgrade_from_real_m2_schema"
+                            | "implicit_drop_discharge_migration_preserves_populated_gap_tables"
+                            | "guarded_pattern_gap_upgrade_preserves_both_namespaces"
+                    ));
+            if !allowed {
+                self.violations
+                    .push(format!("{}::{}: {reference}", self.file, self.function));
+            }
+        }
+    }
+    impl<'ast> Visit<'ast> for Audit {
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            let previous = std::mem::replace(&mut self.function, item.sig.ident.to_string());
+            // The audit's own strings describe its access policy.
+            if item.sig.ident != "candidate_macro_rows_have_one_guarded_reader" {
+                syn::visit::visit_item_fn(self, item);
+            }
+            self.function = previous;
+        }
+        fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+            let previous = std::mem::replace(&mut self.function, item.sig.ident.to_string());
+            syn::visit::visit_impl_item_fn(self, item);
+            self.function = previous;
+        }
+        fn visit_ident(&mut self, ident: &'ast syn::Ident) {
+            let name = ident.to_string();
+            if name == "candidate_spec" || name == "read_guarded" {
+                self.check(&name);
+            }
+        }
+        fn visit_lit_str(&mut self, literal: &'ast syn::LitStr) {
+            if literal.value().contains("candidate_macro_semantic_ir_") {
+                self.check(&literal.value());
+            }
+        }
+        fn visit_item_macro(&mut self, item: &'ast syn::ItemMacro) {
+            if self.file.ends_with("/store/semantic_ir/mod.rs")
+                && item.mac.path.is_ident("macro_rules")
+                && item.ident.as_ref().is_some_and(|ident| ident == "tables")
+            {
+                return;
+            }
+            syn::visit::visit_item_macro(self, item);
+        }
+        fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+            use syn::parse::Parser;
+            if let Ok(args) =
+                syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated
+                    .parse2(mac.tokens.clone())
+            {
+                for arg in &args {
+                    self.visit_expr(arg);
+                }
+            } else {
+                // Non-expression macros cannot conceal a table name or accessor.
+                let tokens = mac.tokens.to_string();
+                for marker in [
+                    "candidate_macro_semantic_ir_",
+                    "candidate_spec",
+                    "read_guarded",
+                ] {
+                    if tokens.contains(marker) {
+                        self.check(marker);
+                    }
+                }
+            }
+        }
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap();
+    let repository = root.parent().unwrap();
+    let mut pending = ["crates", "src", "tests", "examples", "benches", "scripts"]
+        .into_iter()
+        .map(|directory| repository.join(directory))
+        .filter(|directory| directory.is_dir())
+        .collect::<Vec<_>>();
+    let mut audit = Audit {
+        file: String::new(),
+        function: String::new(),
+        violations: Vec::new(),
+    };
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                // Fixture projects are inputs, not linked application/test code.
+                if path.file_name().is_none_or(|name| name != "fixtures") {
+                    pending.push(path);
+                }
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                audit.file = path.to_string_lossy().replace('\\', "/");
+                audit
+                    .visit_file(&syn::parse_file(&std::fs::read_to_string(path).unwrap()).unwrap());
+            }
+        }
+    }
+    assert!(
+        audit.violations.is_empty(),
+        "unauthorized guarded row access: {:?}",
+        audit.violations
+    );
+    audit.file = "crates/bifrost-store/src/analyzer/store/semantic_ir/decode.rs".into();
+    for forbidden in [
+        "fn second_reader() { let rows = Table::candidate_spec; }",
+        "fn second_reader() { let rows = read_guarded; }",
+        "fn second_reader() { const SQL: &str = \"SELECT * FROM candidate_macro_semantic_ir_calls\"; }",
+    ] {
+        audit.violations.clear();
+        audit.visit_file(&syn::parse_file(forbidden).unwrap());
+        assert!(!audit.violations.is_empty(), "audit missed {forbidden}");
+    }
+}
+
+#[test]
+fn candidate_macro_rows_cascade_with_publication_deletion() {
+    use super::SemanticIrLoweringOutcome;
+    use crate::analyzer::semantic::CallSiteId;
+    use row_fixture::{EPOCH, fixture, insert};
+
+    let mut fixture = fixture();
+    let alternate = fixture.parts[0].clone();
+    let record =
+        crate::analyzer::semantic::CandidateRecord::same_call(&alternate, CallSiteId::new(0));
+    fixture.parts[0].attach_candidate_macro_alternate(alternate, vec![record].into_boxed_slice());
+    let prepared = super::PreparedSemanticIr::prepare_with_candidate_flows(
+        SemanticIrLoweringOutcome::Complete {
+            parts: fixture.parts,
+        },
+        Some(&fixture.flows),
+        &[],
+        EPOCH,
+        fixture.scope.content,
+        row_fixture::SOURCE_BYTES,
+    );
+    let store = AnalyzerStore::open_ephemeral().unwrap();
+    let (_, blob_id) = insert(&store, "candidate macro publication cascade", &prepared);
+
+    let conn = store.conn.lock().unwrap();
+    let tables = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'candidate_macro_%' ORDER BY name")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    // 0338 adds nodes, actions, owners, anchors, projections and projection members.
+    assert_eq!(tables.len(), 56, "all guarded tables are present");
+    let counts = tables
+        .iter()
+        .map(|table| {
+            let count = conn
+                .query_row(
+                    &format!("SELECT count(*) FROM {table} WHERE blob_id=?1"),
+                    [blob_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap();
+            (table, count)
+        })
+        .collect::<Vec<_>>();
+    assert!(counts.iter().any(|(_, count)| *count > 0), "{counts:?}");
+
+    conn.execute(
+        "DELETE FROM semantic_ir_publications WHERE blob_id=?1",
+        [blob_id],
+    )
+    .unwrap();
+    for table in &tables {
+        let count = conn
+            .query_row(
+                &format!("SELECT count(*) FROM {table} WHERE blob_id=?1"),
+                [blob_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "{table} retains rows after publication deletion");
+    }
+    drop(conn);
+    let (_, blob_id) = insert(&store, "candidate macro blob cascade", &prepared);
+    let conn = store.conn.lock().unwrap();
+    let _cascade = crate::analyzer::store::sealed_families::CascadeDelete::new(&conn);
+    conn.execute("DELETE FROM blobs WHERE id=?1", [blob_id])
+        .unwrap();
+    for table in super::Table::ALL
+        .iter()
+        .map(|table| table.spec().name)
+        .chain(tables.iter().map(String::as_str))
+    {
+        let count: i64 = conn
+            .query_row(
+                &format!("SELECT count(*) FROM {table} WHERE blob_id=?1"),
+                [blob_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "{table} retains rows after blob deletion");
+    }
+}
+
+/// Dispatch metadata is a relational scalar; unspecified producers keep NULL.
+#[test]
+fn call_target_dispatch_rows_preserve_explicit_kinds_and_legacy_null() {
+    use crate::analyzer::semantic::CallTargetDispatch;
+    use row_fixture::{fixture, insert, prepare};
+    for dispatch in [
+        CallTargetDispatch::Unspecified,
+        CallTargetDispatch::Static,
+        CallTargetDispatch::Special,
+        CallTargetDispatch::Virtual,
+        CallTargetDispatch::Interface,
+    ] {
+        let mut fixture = fixture();
+        fixture.parts[0].gaps[5].dispatch = dispatch;
+        let prepared = prepare(&fixture);
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let (_, blob_id) = insert(&store, "dispatch round trip", &prepared);
+        let stored: Option<i64> = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT subject_b FROM semantic_ir_gaps WHERE blob_id = ?1 AND procedure = 0 AND gap = 5",
+                [blob_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stored.is_none(),
+            dispatch == CallTargetDispatch::Unspecified
+        );
+        let decoded = store.read_semantic_ir(blob_id, &fixture.scope).unwrap();
+        assert_eq!(decoded[0].gaps[5].dispatch, dispatch);
+    }
+}
+
+#[test]
+fn cleanup_rows_reject_damage_with_typed_corruption() {
+    use row_fixture::{fixture, insert, prepare};
+    let mutations = [
+        "UPDATE semantic_ir_gaps SET subject = 99 WHERE gap = 0",
+        "UPDATE semantic_ir_gaps SET segment_head = 0 WHERE gap = 0",
+        "UPDATE semantic_ir_gaps SET segment_head = 99 WHERE subject = 8",
+        "UPDATE semantic_ir_gaps SET segment_head = 0, segment_stop = 1 WHERE subject = 8",
+        "UPDATE semantic_ir_gaps SET segment_head = NULL, segment_stop = 0 WHERE subject = 8",
+        "UPDATE semantic_ir_cleanup_nodes SET parent = node WHERE node = 0",
+        "UPDATE semantic_ir_cleanup_nodes SET parent = 99 WHERE node = 1",
+        "UPDATE semantic_ir_cleanup_actions SET ordinal = 3 WHERE node = 0",
+        "UPDATE semantic_ir_cleanup_actions SET kind = 99 WHERE node = 0",
+        "UPDATE semantic_ir_cleanup_actions SET incomplete_evidence = 99 WHERE node = 0",
+        "UPDATE semantic_ir_cleanup_owners SET target_value = 99",
+        "UPDATE semantic_ir_cleanup_owners SET lifecycle = 99",
+        "UPDATE semantic_ir_cleanup_anchors SET head = 0, stop = 1",
+        "UPDATE semantic_ir_cleanup_anchors SET head = 99",
+        "UPDATE semantic_ir_cleanup_anchors SET projection = 99",
+        "UPDATE semantic_ir_cleanup_anchors SET drop_offset = 99999",
+        "UPDATE semantic_ir_cleanup_projections SET projection = 4",
+        "UPDATE semantic_ir_cleanup_projection_members SET ordinal = 4",
+        "UPDATE semantic_ir_cleanup_projection_members SET action_ordinal = 99",
+        "UPDATE semantic_ir_cleanup_anchors SET stop = 0",
+        "UPDATE semantic_ir_cleanup_owners SET procedure = 99",
+        "INSERT INTO semantic_ir_cleanup_projection_members SELECT blob_id, procedure, projection, 1, node, action_ordinal FROM semantic_ir_cleanup_projection_members",
+        "UPDATE semantic_ir_cleanup_anchors SET purpose = 99",
+    ];
+    for mutation in mutations {
+        let fixture = fixture();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let (_, blob_id) = insert(&store, mutation, &prepare(&fixture));
+        let conn = store.conn.lock().unwrap();
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
+        conn.pragma_update(None, "ignore_check_constraints", true)
+            .unwrap();
+        assert!(conn.execute(mutation, []).unwrap() > 0, "{mutation}");
+        let error = super::decode::read_and_decode(&conn, blob_id, &fixture.scope).unwrap_err();
+        assert!(error.is_corrupt(), "{mutation}: {error:?}");
+    }
+}
+
+#[test]
+fn cleanup_publication_failure_rolls_back_all_relations() {
+    use row_fixture::{EPOCH, LANG, fixture, prepare};
+    let store = AnalyzerStore::open_ephemeral().unwrap();
+    store
+        .ensure_semantic_ir_producer_epoch(LANG, EPOCH)
+        .unwrap();
+    let fixture = fixture();
+    let prepared = prepare(&fixture);
+    let mut conn = store.conn.lock().unwrap();
+    conn.execute(
+        "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, ?2, 1)",
+        rusqlite::params!["1111111111111111111111111111111111111111", LANG],
+    )
+    .unwrap();
+    let blob_id = conn.last_insert_rowid();
+    conn.execute_batch("CREATE TEMP TRIGGER reject_cleanup_anchor BEFORE INSERT ON semantic_ir_cleanup_anchors BEGIN SELECT RAISE(ABORT, 'injected cleanup publication failure'); END;").unwrap();
+    let tx = conn.transaction().unwrap();
+    let error = super::insert_semantic_ir_tx(
+        &tx,
+        blob_id,
+        LANG,
+        &prepared,
+        &crate::CancellationToken::default(),
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("injected cleanup publication failure")
+    );
+    tx.rollback().unwrap();
+    for table in std::iter::once("semantic_ir_publications")
+        .chain(super::Table::ALL.iter().map(|table| table.spec().name))
+    {
+        let count: i64 = conn
+            .query_row(
+                &format!("SELECT count(*) FROM {table} WHERE blob_id = ?1"),
+                [blob_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "{table}");
+    }
 }

@@ -121,7 +121,7 @@ pub(crate) fn build_loop_candidates(
 ) -> LoopCandidates {
     let prepared = match ProcedureSyntax::prepare(workspace, procedure, cancellation) {
         Ok(prepared) => prepared,
-        Err(reason) => return unavailable(reason),
+        Err(open) => return unavailable(open.reason_joined(workspace.analyzer())),
     };
     let procedure_node = match prepared.procedure_node(procedure) {
         Ok(node) => node,
@@ -194,7 +194,7 @@ pub fn nested_loop_facts(
 ) -> NestedLoopFacts {
     let prepared = match ProcedureSyntax::prepare(workspace, procedure, cancellation) {
         Ok(prepared) => prepared,
-        Err(reason) => return NestedLoopFacts::unavailable(reason),
+        Err(open) => return NestedLoopFacts::unavailable(open.reason_joined(workspace.analyzer())),
     };
     let procedure_node = match prepared.procedure_node(procedure) {
         Ok(node) => node,
@@ -635,7 +635,10 @@ fn node_coordinates(node: Node<'_>, source: &str, line_starts: &[usize]) -> Loop
 
 impl brokk_bifrost_core::retention_budget::RetainedBytes for LoopCandidates {
     fn retained_bytes(&self) -> usize {
-        size_of::<Self>() + self.rows.capacity() * size_of::<LoopCandidate>()
+        size_of::<Self>()
+            + brokk_bifrost_core::allocation_size::allocation_size(
+                self.rows.capacity() * size_of::<LoopCandidate>(),
+            )
     }
 }
 

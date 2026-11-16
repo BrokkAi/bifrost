@@ -5,11 +5,14 @@
 //! semantic-model overlay, and leaves the relational evaluator with only
 //! typed identity predicates.
 
+use brokk_bifrost_analysis::analyzer::languages::language_support;
 use brokk_bifrost_analysis::analyzer::semantic_model::{
-    SemanticModelCompleteness, SemanticModelOverlayDisposition, SemanticModelProvenance,
-    SemanticModelSymbol, SemanticModelSymbolKind, semantic_model_callable_family_id,
+    SemanticModelCallableKey, SemanticModelCompleteness, SemanticModelOverlay,
+    SemanticModelOverlayDisposition, SemanticModelProvenance, SemanticModelSymbol,
+    SemanticModelSymbolKind, semantic_model_callable_family_id,
     semantic_model_possible_callable_family_id,
 };
+use brokk_bifrost_analysis::analyzer::usages::effects::modeled_procedure_key_for_unit;
 use brokk_bifrost_analysis::analyzer::{
     CodeUnit, CodeUnitType, DescendantIndexScope, IAnalyzer, Language,
 };
@@ -951,7 +954,7 @@ fn qualified_locator_candidates(
     source_identities.sort();
     source_identities.dedup();
 
-    let overlay = analyzer.semantic_model_overlay();
+    let overlay = analyzer.semantic_model_overlay_read().published();
     let model_records = overlay.as_ref().map(|overlay| {
         let matched = overlay.symbols_named(&locator.value);
         let mut records = matched
@@ -1015,6 +1018,19 @@ fn resolve_qualified_locator(
                 LocatorFailure::Partial,
                 "active semantic-model inventory is incomplete".to_string(),
             ));
+        }
+        if let [source_identity] = source_identities.as_slice()
+            && matches!(role, LocatorRole::Callable)
+            && !records.is_empty()
+            && let Some(identity) = overlay.as_ref().and_then(|overlay| {
+                let unit = source_matches
+                    .iter()
+                    .find(|unit| unit.declaration_id().as_str() == source_identity.as_str())
+                    .expect("a workspace identity comes from a source match");
+                source_declaration_model_identity(analyzer, overlay, unit, &records)
+            })
+        {
+            return Ok(identity);
         }
         if matches!(role, LocatorRole::Callable)
             && records.len() > 1
@@ -1173,6 +1189,50 @@ fn resolve_qualified_locator(
         LocatorFailure::Zero,
         format!("qualified locator `{}`", locator.value),
     ))
+}
+
+/// The active model identity of a callable whose one workspace declaration is
+/// the vendored copy of the dependency module that activated the model's
+/// record, at the same version: a vendored Go module's source and the model
+/// shard selected for that module (#11322). The two are one callable, not
+/// competing identities, so a vendoring project gets the answer a module-cache
+/// project gets. The record is the one call bindings attach to an exact source
+/// target, so every call bound to the declaration carries this identity and
+/// its model record. Workspace code that only shares the model's qualified
+/// name, or a model that does not describe the declaration uniquely, leaves
+/// the locator ambiguous.
+fn source_declaration_model_identity(
+    analyzer: &dyn IAnalyzer,
+    overlay: &SemanticModelOverlay,
+    unit: &CodeUnit,
+    records: &[std::sync::Arc<SemanticModelSymbol>],
+) -> Option<ResolvedLocatorIdentity> {
+    let key = modeled_procedure_key_for_unit(analyzer, unit)?;
+    let key = SemanticModelCallableKey::new(
+        &key.language,
+        &key.owner,
+        &key.member,
+        key.has_receiver,
+        key.parameter_count,
+    );
+    let symbol = overlay.callable_for_target(key).unique()?;
+    if !records.iter().any(|record| record.id == symbol.id)
+        || !language_support(unit.source().language()).is_some_and(|support| {
+            support.is_vendored_copy_of(
+                unit.source(),
+                &symbol.provenance.activation.matched_evidence,
+            )
+        })
+    {
+        return None;
+    }
+    let identity = overlay.callable_family_id_for_target(key)?;
+    let mut provenance = symbol.provenance.clone();
+    provenance.record_id = identity.clone();
+    Some(ResolvedLocatorIdentity::ActiveSemanticModel {
+        identity,
+        provenance: Box::new(provenance),
+    })
 }
 
 fn model_symbol_matches_role(symbol: &SemanticModelSymbol, role: LocatorRole) -> bool {

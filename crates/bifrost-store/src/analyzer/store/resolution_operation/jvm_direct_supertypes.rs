@@ -64,6 +64,7 @@ pub(crate) fn combine_implicit_root_reference(
             let boundary = identities.named_semantic(
                 hash.finish(),
                 "jvm-intrinsic-root",
+                crate::analyzer::resolution::ReasonDeterminism::Unaudited,
                 &format!(
                     "language-defined root `{}` has a fixed complete member inventory",
                     root.owner_fqn

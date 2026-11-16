@@ -1429,14 +1429,48 @@ fn definition_is_unused(
     uses: &[PythonVariableUse],
 ) -> bool {
     let rhs = definition_rhs(node);
+    let back_edge_regions = loop_back_edge_regions(node);
     !uses.iter().any(|usage| {
         usage.access == "read"
-            && usage.start_byte >= definition.end_byte
-            && next_definition_start.is_none_or(|next| usage.start_byte < next)
-            && !rhs.is_some_and(|rhs| {
-                rhs.start_byte() <= usage.start_byte && usage.end_byte <= rhs.end_byte()
-            })
+            && ((usage.start_byte >= definition.end_byte
+                && next_definition_start.is_none_or(|next| usage.start_byte < next)
+                && !rhs.is_some_and(|rhs| {
+                    rhs.start_byte() <= usage.start_byte && usage.end_byte <= rhs.end_byte()
+                }))
+                || back_edge_regions
+                    .iter()
+                    .any(|&(start, end)| start <= usage.start_byte && usage.end_byte <= end))
     })
+}
+
+/// Byte ranges that the enclosing loops run again after `node` executes: the
+/// condition and body of each `while` and the body of each `for` whose
+/// per-iteration part contains `node`, up to the boundary of `node`'s own
+/// scope. A read anywhere in such a range can observe the value on the next
+/// pass, including a read earlier in the body or in the definition's own
+/// right-hand side, so the definition is live along the loop's back edge.
+fn loop_back_edge_regions(node: Node<'_>) -> Vec<(usize, usize)> {
+    let mut regions = Vec::new();
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if scope_kind(parent).is_some() {
+            break;
+        }
+        let body = parent.child_by_field_name("body");
+        let repeated_start = match parent.kind() {
+            "while_statement" => parent.child_by_field_name("condition"),
+            "for_statement" => body,
+            _ => None,
+        };
+        if let (Some(start), Some(body)) = (repeated_start, body)
+            && start.start_byte() <= current.start_byte()
+            && current.end_byte() <= body.end_byte()
+        {
+            regions.push((start.start_byte(), body.end_byte()));
+        }
+        current = parent;
+    }
+    regions
 }
 
 fn tuple_assignment_siblings(node: Node<'_>) -> Vec<Node<'_>> {

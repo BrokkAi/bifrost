@@ -1091,6 +1091,7 @@ const fn plan_source_label(source: &CodeQueryPlanSource) -> &'static str {
         CodeQueryPlanSource::Exports(_) => "exports",
         CodeQueryPlanSource::DependencyEvidence(_) => "dependency_evidence",
         CodeQueryPlanSource::ConfigurationFacts(_) => "configuration_facts",
+        CodeQueryPlanSource::CallReachability(_) => "call_reachability",
         CodeQueryPlanSource::Correlate(_) => "correlate",
         CodeQueryPlanSource::RequireBoth(_) => "require_both",
         CodeQueryPlanSource::Set { op, .. } => match op {

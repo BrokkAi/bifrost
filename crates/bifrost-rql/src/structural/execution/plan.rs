@@ -75,6 +75,12 @@ pub(crate) enum LogicalQueryOperator {
         op: SetOperator,
         inputs: Box<[LogicalQueryNodeId]>,
     },
+    CallReachability {
+        sources: Box<CodeQueryPlan>,
+        input: LogicalQueryNodeId,
+        sinks: Box<CodeQueryPlan>,
+        depth: Option<std::num::NonZeroUsize>,
+    },
     /// Pair code rows (`inputs[0]`) with configuration facts (`inputs[1]`)
     /// through one registered relation.
     Correlate {
@@ -138,7 +144,9 @@ impl LogicalQueryOperator {
             | Self::ExportSeed(_) => &[],
             Self::PathSeed(_) => &[],
             Self::DependencyEvidenceSeed(_) | Self::ConfigurationFactsSeed(_) => &[],
-            Self::Step { input, .. } | Self::Limit { input, .. } => std::slice::from_ref(input),
+            Self::Step { input, .. }
+            | Self::Limit { input, .. }
+            | Self::CallReachability { input, .. } => std::slice::from_ref(input),
             Self::Set { inputs, .. } => inputs,
             Self::Correlate { inputs, .. } | Self::RequireBoth { inputs } => inputs,
         }
@@ -434,6 +442,19 @@ impl LogicalQueryPlanBuilder {
                 let id = self.push_node(LogicalQueryOperator::Set { op: *op, inputs }, output_kind);
                 (id, output_kind)
             }
+            CodeQueryPlanSource::CallReachability(relation) => {
+                let (input, _) = self.lower_child_plan(&relation.sources, 0);
+                let id = self.push_node(
+                    LogicalQueryOperator::CallReachability {
+                        sources: Box::new(relation.sources.clone()),
+                        input,
+                        sinks: Box::new(relation.sinks.clone()),
+                        depth: relation.depth,
+                    },
+                    QueryValueKind::Declaration,
+                );
+                (id, QueryValueKind::Declaration)
+            }
             CodeQueryPlanSource::Correlate(correlation) => {
                 let (code, _) = self.lower_child_plan(&correlation.code, 0);
                 let (configuration, _) = self.lower_child_plan(&correlation.configuration, 1);
@@ -553,6 +574,7 @@ pub(crate) enum PhysicalQueryOperator {
     SequentialExcept,
     CrossDomainCorrelate,
     CrossDomainRequireBoth,
+    CallReachability,
     Limit,
 }
 
@@ -659,6 +681,9 @@ pub(crate) struct PhysicalQueryPlan {
     logical: LogicalQueryPlan,
     nodes: Vec<PhysicalQueryNode>,
     root: PhysicalQueryNodeId,
+    /// Indexed by node: whether the node is a seed leaf on the side of the
+    /// plan that can produce rows. See [`Self::is_anchor_seed`].
+    anchor_seeds: Vec<bool>,
 }
 
 impl PhysicalQueryPlan {
@@ -684,7 +709,7 @@ impl PhysicalQueryPlan {
                 consumers[dependency.index()].push(LogicalQueryNodeId::from_index(index));
             }
         }
-        let nodes = logical
+        let nodes: Vec<PhysicalQueryNode> = logical
             .nodes
             .iter()
             .enumerate()
@@ -717,6 +742,9 @@ impl PhysicalQueryPlan {
                         SetOperator::Intersect => PhysicalQueryOperator::SequentialIntersection,
                         SetOperator::Except => PhysicalQueryOperator::SequentialExcept,
                     },
+                    LogicalQueryOperator::CallReachability { .. } => {
+                        PhysicalQueryOperator::CallReachability
+                    }
                     LogicalQueryOperator::Correlate { .. } => {
                         PhysicalQueryOperator::CrossDomainCorrelate
                     }
@@ -740,6 +768,12 @@ impl PhysicalQueryPlan {
                     _ => None,
                 };
                 let semantic_request = match node.operator() {
+                    LogicalQueryOperator::CallReachability { .. } => {
+                        CodeQuerySemanticRequest::from_facets(&[
+                            QuerySemanticFacet::Procedures,
+                            QuerySemanticFacet::Dispatch,
+                        ])
+                    }
                     LogicalQueryOperator::Step { step, .. } => {
                         CodeQuerySemanticRequest::from_facets(step.semantic_facets())
                     }
@@ -767,11 +801,54 @@ impl PhysicalQueryPlan {
             })
             .collect();
         let root = PhysicalQueryNodeId::from_logical(logical.root);
+        let mut anchor_seeds = vec![false; nodes.len()];
+        let mut pending = vec![root];
+        while let Some(node) = pending.pop() {
+            let dependencies = nodes[node.index()].dependencies();
+            match logical.node(nodes[node.index()].logical_node()).operator() {
+                LogicalQueryOperator::Seed(_)
+                | LogicalQueryOperator::OccurrenceSeed(_)
+                | LogicalQueryOperator::ScopeSeed(_)
+                | LogicalQueryOperator::BindingSeed(_)
+                | LogicalQueryOperator::GenerationSiteSeed(_)
+                | LogicalQueryOperator::ExportSeed(_)
+                | LogicalQueryOperator::PathSeed(_)
+                | LogicalQueryOperator::ConfigurationFactsSeed(_)
+                | LogicalQueryOperator::DependencyEvidenceSeed(_) => {
+                    anchor_seeds[node.index()] = true;
+                }
+                // Every branch of a union can contribute a row to the answer.
+                LogicalQueryOperator::Set {
+                    op: SetOperator::Union,
+                    ..
+                } => pending.extend(dependencies),
+                // The later operands of these operators hold exclusions,
+                // sinks or configuration, which are not candidates.
+                LogicalQueryOperator::Set { .. }
+                | LogicalQueryOperator::Correlate { .. }
+                | LogicalQueryOperator::RequireBoth { .. }
+                | LogicalQueryOperator::Step { .. }
+                | LogicalQueryOperator::CallReachability { .. }
+                | LogicalQueryOperator::Limit { .. } => pending.push(dependencies[0]),
+            }
+        }
         Self {
             logical,
             nodes,
             root,
+            anchor_seeds,
         }
+    }
+
+    /// Whether `node` is a seed leaf whose rows are the plan's candidates.
+    ///
+    /// The anchor side of a plan is every operand of a union and operand zero
+    /// of an intersect, except, correlate or require-both, followed down
+    /// through steps and the sources of a call reachability relation. The other
+    /// operands hold exclusions, configuration or sinks, so their seeds are
+    /// not candidates of any finding the plan can produce.
+    pub(crate) fn is_anchor_seed(&self, node: PhysicalQueryNodeId) -> bool {
+        self.anchor_seeds[node.index()]
     }
 
     pub(crate) fn terminal_caps(
@@ -941,6 +1018,10 @@ enum LogicalQueryOperatorExplain {
         relation: serde_json::Value,
     },
     RequireBoth,
+    CallReachability {
+        sinks: serde_json::Value,
+        depth: Option<usize>,
+    },
     Limit {
         count: usize,
     },
@@ -1004,6 +1085,10 @@ impl LogicalQueryOperatorExplain {
                         },
                     }),
                 },
+            },
+            LogicalQueryOperator::CallReachability { sinks, depth, .. } => Self::CallReachability {
+                sinks: Value::Object(crate::query::plan_to_json(sinks)),
+                depth: depth.map(std::num::NonZeroUsize::get),
             },
             LogicalQueryOperator::RequireBoth { .. } => Self::RequireBoth,
             LogicalQueryOperator::Limit { count, .. } => Self::Limit { count: *count },
@@ -1135,20 +1220,50 @@ pub struct CodeQueryLogicalNode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CodeQueryLogicalOperation {
-    Seed { seed: serde_json::Value },
-    OccurrenceSeed { seed: serde_json::Value },
-    ScopeSeed { seed: serde_json::Value },
-    BindingSeed { seed: serde_json::Value },
-    GenerationSiteSeed { seed: serde_json::Value },
-    ExportSeed { seed: serde_json::Value },
-    PathSeed { seed: serde_json::Value },
-    DependencyEvidenceSeed { seed: serde_json::Value },
-    ConfigurationFactsSeed { seed: serde_json::Value },
-    Step { step: serde_json::Value },
-    Set { op: &'static str },
-    Correlate { relation: serde_json::Value },
+    Seed {
+        seed: serde_json::Value,
+    },
+    OccurrenceSeed {
+        seed: serde_json::Value,
+    },
+    ScopeSeed {
+        seed: serde_json::Value,
+    },
+    BindingSeed {
+        seed: serde_json::Value,
+    },
+    GenerationSiteSeed {
+        seed: serde_json::Value,
+    },
+    ExportSeed {
+        seed: serde_json::Value,
+    },
+    PathSeed {
+        seed: serde_json::Value,
+    },
+    DependencyEvidenceSeed {
+        seed: serde_json::Value,
+    },
+    ConfigurationFactsSeed {
+        seed: serde_json::Value,
+    },
+    Step {
+        step: serde_json::Value,
+    },
+    Set {
+        op: &'static str,
+    },
+    Correlate {
+        relation: serde_json::Value,
+    },
     RequireBoth,
-    Limit { count: usize },
+    CallReachability {
+        sinks: serde_json::Value,
+        depth: Option<usize>,
+    },
+    Limit {
+        count: usize,
+    },
 }
 
 impl CodeQueryLogicalOperation {
@@ -1172,6 +1287,9 @@ impl CodeQueryLogicalOperation {
             LogicalQueryOperatorExplain::Step { step, .. } => Self::Step { step },
             LogicalQueryOperatorExplain::Set { op } => Self::Set { op },
             LogicalQueryOperatorExplain::Correlate { relation } => Self::Correlate { relation },
+            LogicalQueryOperatorExplain::CallReachability { sinks, depth } => {
+                Self::CallReachability { sinks, depth }
+            }
             LogicalQueryOperatorExplain::RequireBoth => Self::RequireBoth,
             LogicalQueryOperatorExplain::Limit { count } => Self::Limit { count },
         }
@@ -1253,6 +1371,7 @@ pub enum CodeQueryPhysicalOperator {
     SequentialExcept,
     CrossDomainCorrelate,
     CrossDomainRequireBoth,
+    CallReachability,
     Limit,
 }
 
@@ -1274,6 +1393,7 @@ impl CodeQueryPhysicalOperator {
             PhysicalQueryOperator::SequentialIntersection => Self::SequentialIntersection,
             PhysicalQueryOperator::SequentialExcept => Self::SequentialExcept,
             PhysicalQueryOperator::CrossDomainCorrelate => Self::CrossDomainCorrelate,
+            PhysicalQueryOperator::CallReachability => Self::CallReachability,
             PhysicalQueryOperator::CrossDomainRequireBoth => Self::CrossDomainRequireBoth,
             PhysicalQueryOperator::Limit => Self::Limit,
         }

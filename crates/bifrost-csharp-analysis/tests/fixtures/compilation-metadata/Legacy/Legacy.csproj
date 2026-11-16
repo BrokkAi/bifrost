@@ -1,0 +1,1 @@
+<Project><ItemGroup><Compile Include="Source.cs"/><Using Include="Legacy.Wrong" Condition="'$(Gate)' == 'true'"/></ItemGroup></Project>

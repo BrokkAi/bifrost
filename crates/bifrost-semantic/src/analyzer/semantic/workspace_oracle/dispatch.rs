@@ -205,7 +205,7 @@ pub fn returned_callable_producer(
                         definition = Some(*value);
                     }
                     SemanticEffect::ValueFlow {
-                        kind: ValueFlowKind::Local,
+                        kind: ValueFlowKind::Local | ValueFlowKind::AddressOf,
                         source,
                         target,
                     } if *target == current => {
@@ -346,9 +346,15 @@ pub fn exact_call_range(call: &CallSiteHandle) -> Result<Range, SemanticProvider
     })
 }
 
-/// Walk only uniquely proven identity-preserving definitions to a formal slot.
+/// The formal parameter whose unchanged value `value` is on every execution.
+///
+/// Walks only uniquely proven identity-preserving definitions (assignments
+/// and local value flow) backwards, and refuses at a value with two different
+/// definitions or one produced by a load, a call or a callable. A callee value
+/// with an origin is the parameter's callable; a receiver with an origin is
+/// the object the caller bound to that parameter.
 #[doc(hidden)]
-pub fn callback_parameter(
+pub fn parameter_origin(
     procedure: &ProcedureHandle,
     value: ValueId,
     request: &mut SemanticRequest<'_>,
@@ -382,7 +388,7 @@ pub fn callback_parameter(
                         Some(*value)
                     }
                     SemanticEffect::ValueFlow {
-                        kind: ValueFlowKind::Local | ValueFlowKind::Parameter,
+                        kind: ValueFlowKind::Local | ValueFlowKind::AddressOf | ValueFlowKind::Parameter,
                         source,
                         target,
                     } if *target == current => Some(*source),
@@ -487,7 +493,9 @@ pub fn resolver_proven_external_static_dispatch_discharges_gap(
     resolver_proven_external_static: bool,
     gap: &SemanticGap,
 ) -> bool {
-    gap.capability == SemanticCapability::DynamicDispatch
+    (gap.capability == SemanticCapability::DynamicDispatch
+        || (gap.capability == SemanticCapability::Calls
+            && matches!(gap.subject, SemanticGapSubject::CallSite(_))))
         && matches!(
             gap.kind,
             SemanticGapKind::Unknown | SemanticGapKind::Unproven

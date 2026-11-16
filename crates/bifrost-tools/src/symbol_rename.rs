@@ -724,8 +724,11 @@ mod tests {
             completion,
             candidate_files: Default::default(),
             candidate_files_truncated: false,
+            candidate_files_budget_exhausted: false,
             source_bytes_truncated: false,
             scanned_source_bytes: 0,
+            source_byte_refusal: None,
+            unavailable_sources: Vec::new(),
             candidate_files_sample: None,
             result,
             proof_authority: Default::default(),
@@ -802,7 +805,10 @@ mod tests {
 
     fn unresolved_outcome(status: DefinitionLookupStatus) -> DefinitionLookupOutcome {
         DefinitionLookupOutcome {
-            modeled_definitions: Vec::new(),
+            selected_sites: Vec::new(),
+            inventory_evidence: None,
+            incomplete_evidence: None,
+        modeled_definitions: Vec::new(),
             status,
             reference: None,
             definitions: Vec::new(),

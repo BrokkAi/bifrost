@@ -3,14 +3,20 @@
 use crate::local_bindings::{
     LocalBindingTimeline, UnboundedLocalBindingBudget, collect_local_bindings,
 };
-use crate::syntax::{call_method_node, ruby_call_arguments, ruby_static_string_content_node};
+use crate::syntax::{
+    RubyWriterPosition, call_method_node, ruby_assigned_value, ruby_call_arguments,
+    ruby_call_receiver, ruby_callee_spelling, ruby_callee_token, ruby_element_arguments,
+    ruby_static_string_content_node, ruby_writer_position,
+};
 use brokk_bifrost_core::analyzer::common::node_source_text as node_text;
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
     CalleeSpineStep, attach_argument_role_with_derived_name, attach_role_with_derived_name,
     attach_terminal_callee, field_name_in_parent, first_named_child, nearest_ancestor,
     terminal_callee_leaf,
 };
-use brokk_bifrost_core::analyzer::structural::callable::CallSiteContext;
+use brokk_bifrost_core::analyzer::structural::callable::{
+    CallShapeCoverage, CallSiteContext, CallSiteFacts, CalleeSpelling,
+};
 use brokk_bifrost_core::analyzer::structural::edges::{
     INVERSE_REFERENCE_EDGE_SUPPORT, ReferenceEdgeSupport,
 };
@@ -213,6 +219,9 @@ impl RubyCallResultUseIndex {
 pub const RUBY_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("comment", NormalizedKind::Comment),
     ("call", NormalizedKind::Call),
+    // `r[i]` calls `[]` and `r[i] = v` calls `[]=`: ordinary method calls
+    // whose callee the grammar spells with brackets.
+    ("element_reference", NormalizedKind::Call),
     ("method", NormalizedKind::Function),
     ("singleton_method", NormalizedKind::Method),
     ("block", NormalizedKind::Lambda),
@@ -265,7 +274,8 @@ fn expression_target_node(mut node: Node<'_>) -> Node<'_> {
 pub fn callee_spine_step(kind: &str) -> Option<CalleeSpineStep> {
     use CalleeSpineStep::{Field, Name, OnlyChild};
     match kind {
-        "identifier" | "constant" | "operator" => Some(Name),
+        // The opening bracket of an element reference names `[]` or `[]=`.
+        "identifier" | "constant" | "operator" | "[" => Some(Name),
         "scope_resolution" => Some(Field("name")),
         "parenthesized_statements" => Some(OnlyChild),
         _ => None,
@@ -515,24 +525,27 @@ fn bare_call_identifier_starts(root: Node<'_>, source: &str) -> HashSet<usize> {
 fn attach_argument_roles(sink: &mut RoleSink<'_>, arguments: Node<'_>) {
     brokk_bifrost_core::analyzer::structural::adapter_helpers::for_each_argument(
         arguments,
-        |argument| {
-            if !sink.should_continue() {
-                return false;
-            }
-            if argument.kind() == "pair" {
-                if let Some(key) = argument.child_by_field_name("key")
-                    && let Some(value) = argument
-                        .child_by_field_name("value")
-                        .map(expression_target_node)
-                {
-                    sink.kwarg(expression_name_node(key).unwrap_or(key), value);
-                }
-            } else {
-                attach_argument_role_with_derived_name(sink, argument, expression_name_node);
-            }
-            true
-        },
+        |argument| attach_argument(sink, argument),
     );
+}
+
+/// Attach one written argument; false once the sink stops admitting roles.
+fn attach_argument(sink: &mut RoleSink<'_>, argument: Node<'_>) -> bool {
+    if !sink.should_continue() {
+        return false;
+    }
+    if argument.kind() == "pair" {
+        if let Some(key) = argument.child_by_field_name("key")
+            && let Some(value) = argument
+                .child_by_field_name("value")
+                .map(expression_target_node)
+        {
+            sink.kwarg(expression_name_node(key).unwrap_or(key), value);
+        }
+    } else {
+        attach_argument_role_with_derived_name(sink, argument, expression_name_node);
+    }
+    true
 }
 
 fn module_argument_node(node: Node<'_>) -> Option<Node<'_>> {
@@ -993,6 +1006,29 @@ impl StructuralSpec for RubyStructuralSpec {
         CallSiteContext::with_identifier_call_starts(bare_call_identifier_starts(root, source))
     }
 
+    /// A Ruby writer or element access calls a method its grammar node does
+    /// not spell as one token: `r.attr = v` calls `attr=`, `r[i]` calls `[]`
+    /// and `r[i] = v` calls `[]=`. A destructured writer target (`r.a, r[i] =
+    /// pair`) passes a value assembled at runtime, so its argument list is
+    /// only partly written.
+    fn call_site_facts(
+        &self,
+        node: Node<'_>,
+        _source: &str,
+        _context: &CallSiteContext,
+    ) -> Option<CallSiteFacts> {
+        let spelling = ruby_callee_spelling(node);
+        if spelling == CalleeSpelling::Written {
+            return None;
+        }
+        let coverage = if ruby_writer_position(node) == RubyWriterPosition::DestructuredAssignment {
+            CallShapeCoverage::Partial
+        } else {
+            CallShapeCoverage::Exact
+        };
+        Some(CallSiteFacts::of_coverage(coverage).spelled(spelling))
+    }
+
     fn refine_kind(
         &self,
         node: Node<'_>,
@@ -1105,6 +1141,12 @@ impl StructuralSpec for RubyStructuralSpec {
                 // bare-call refinement above, and it is its own callee.
                 if node.kind() == "identifier" {
                     attach_terminal_callee(sink, node, Some(node));
+                } else if node.kind() == "element_reference" {
+                    // The opening bracket is the only token naming `[]`/`[]=`;
+                    // the call site's spelling derives the name from it.
+                    if let Some(bracket) = ruby_callee_token(node) {
+                        attach_terminal_callee(sink, bracket, Some(bracket));
+                    }
                 } else if let Some(method) = call_method_node(node) {
                     attach_terminal_callee(
                         sink,
@@ -1112,7 +1154,7 @@ impl StructuralSpec for RubyStructuralSpec {
                         terminal_callee_leaf(method, callee_spine_step),
                     );
                 }
-                if let Some(receiver) = node.child_by_field_name("receiver") {
+                if let Some(receiver) = ruby_call_receiver(node) {
                     attach_role_with_derived_name(
                         sink,
                         Role::Receiver,
@@ -1122,6 +1164,17 @@ impl StructuralSpec for RubyStructuralSpec {
                 }
                 if let Some(arguments) = node.child_by_field_name("arguments") {
                     attach_argument_roles(sink, arguments);
+                } else if node.kind() == "element_reference" {
+                    for argument in ruby_element_arguments(node) {
+                        if !attach_argument(sink, argument) {
+                            break;
+                        }
+                    }
+                }
+                // A writer's value is its last positional argument:
+                // `r.attr = v` is `r.attr=(v)` and `r[i] = v` is `r.[]=(i, v)`.
+                if let Some(value) = ruby_assigned_value(node) {
+                    attach_argument(sink, expression_target_node(value));
                 }
                 if let Some(block) = node.child_by_field_name("block") {
                     attach_role_with_derived_name(sink, Role::Arg, block, expression_name_node);

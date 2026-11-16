@@ -1,0 +1,1 @@
+<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><Gate>true</Gate></PropertyGroup><ItemGroup><Using Include="Restore.Wrong" Condition="'$(Gate)' == 'true'"/><InternalsVisibleTo Include="Restore.Wrong" Condition="'$(Gate)' == 'true'"/></ItemGroup></Project>

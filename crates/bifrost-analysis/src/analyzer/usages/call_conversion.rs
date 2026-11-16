@@ -28,6 +28,20 @@ use crate::analyzer::usages::get_definition::parse_tree_for_language;
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::hash::HashMap;
 
+/// Invocation-specific model types and the fixed-array proof from selection.
+pub type ModelInvocationSelection = (
+    usize,
+    Vec<TypeRef>,
+    Option<crate::analyzer::semantic::call_binding::FixedArrayInvocation>,
+);
+
+/// Selected model identity and signature, retaining the invocation proof.
+pub type ModelSignatureSelection = (
+    String,
+    Signature,
+    Option<crate::analyzer::semantic::call_binding::FixedArrayInvocation>,
+);
+
 /// Identity of an external declaration or a scope-proven static type.
 ///
 /// This stores resolver evidence only. The language-specific producer owns
@@ -241,8 +255,11 @@ pub fn unread_conversion_may_run_user_code(analyzer: &dyn IAnalyzer, language: L
 /// tree without loading source; build work alone is charged to the request.
 #[doc(hidden)]
 pub struct CallConversionContext<'a> {
+    pub fixed_array_invocation:
+        Option<crate::analyzer::semantic::call_binding::FixedArrayInvocation>,
     cache: &'a CallConversionCache,
     indexes: Option<crate::analyzer::lexical_definitions::LexicalIndexCache>,
+    syntax: Option<(&'a ProjectFile, &'a ConversionSource)>,
 }
 
 impl<'a> CallConversionContext<'a> {
@@ -250,6 +267,22 @@ impl<'a> CallConversionContext<'a> {
         Self {
             cache,
             indexes: None,
+            syntax: None,
+            fixed_array_invocation: None,
+        }
+    }
+
+    /// Supply syntax already acquired by the caller, preserving its index policy.
+    pub fn with_source<'b>(
+        &'b self,
+        file: &'b ProjectFile,
+        source: &'b ConversionSource,
+    ) -> CallConversionContext<'b> {
+        CallConversionContext {
+            cache: self.cache,
+            indexes: self.indexes.clone(),
+            syntax: Some((file, source)),
+            fixed_array_invocation: self.fixed_array_invocation,
         }
     }
 
@@ -267,9 +300,16 @@ impl<'a> CallConversionContext<'a> {
             return None;
         }
         if self.indexes.is_none() {
+            let mut root = focus;
+            while let Some(parent) = root.parent() {
+                root = parent;
+            }
+            let embedded = self.syntax.filter(|(owner, parsed)| {
+                *owner == file && root.id() != parsed.tree.root_node().id()
+            });
             return crate::analyzer::lexical_definitions::resolve_lexical_binding_with_candidate_index(
-                language_for_file(file), focus, source, focus.start_byte(), identifier, None,
-            ).ok().flatten();
+                language_for_file(file), focus, source, focus.start_byte(), identifier, None, &|node| embedded.map_or_else(|| node.parent(), |(_, parsed)| parsed.logical_parent(*node)),
+            ).into_legacy().ok().flatten();
         }
         let parsed = self.cache.source(analyzer, file)?;
         let mut root = focus;
@@ -292,7 +332,9 @@ impl<'a> CallConversionContext<'a> {
                     focus.start_byte(),
                     identifier,
                     Some(&mut index),
+                    &|node| parsed.logical_parent(*node),
                 )
+                .into_legacy()
                 .ok()
                 .flatten();
             // A derived index of an immutable tree is not charged to the
@@ -318,7 +360,9 @@ impl<'a> CallConversionContext<'a> {
                 focus.start_byte(),
                 identifier,
                 None,
+                &|node| parsed.logical_parent(*node),
             )
+            .into_legacy()
             .ok()
             .flatten()
         }
@@ -376,6 +420,17 @@ pub trait CallArgumentConversionProver: Send + Sync {
         false
     }
 
+    /// Refine a caller proof with an explicitly selected executable procedure.
+    fn selected_actual_may_run_user_code(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        sources: &CallConversionCache,
+        actual: ConversionSyntax<'_>,
+        _selected: &crate::analyzer::semantic::ProcedureHandle,
+    ) -> bool {
+        self.unknown_conversion_may_run_user_code(analyzer, sources, Some(actual), None)
+    }
+
     /// Prove one actual against a structured model signature formal. The
     /// language adapter owns interpretation of the model's `TypeRef`; the
     /// shared relation never compares rendered type spellings.
@@ -391,6 +446,20 @@ pub trait CallArgumentConversionProver: Send + Sync {
         Err(ConversionUnknown::UnsupportedConversion)
     }
 
+    /// Preferred model-proof entry point: share the query's source and lexical
+    /// index context across actuals. Legacy adapters keep their existing proof.
+    fn prove_model_argument_with_context(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        _sources: &CallConversionContext<'_>,
+        file: &ProjectFile,
+        actual: tree_sitter::Node<'_>,
+        source: &str,
+        formal_type: &TypeRef,
+    ) -> Result<ArgumentTypeConversion, ConversionUnknown> {
+        self.prove_model_argument(analyzer, file, actual, source, formal_type)
+    }
+
     /// A language with phased invocation rules selects its overload and supplies
     /// the corresponding actual-to-formal type layout. The shared consumer
     /// retains AST extraction, binding joins and conversion fact publication.
@@ -401,7 +470,7 @@ pub trait CallArgumentConversionProver: Send + Sync {
         _actuals: &[tree_sitter::Node<'_>],
         _source: &str,
         _signatures: &[Signature],
-    ) -> Option<Result<(usize, Vec<TypeRef>), ConversionUnknown>> {
+    ) -> Option<Result<ModelInvocationSelection, ConversionUnknown>> {
         None
     }
 
@@ -422,6 +491,20 @@ pub trait CallArgumentConversionProver: Send + Sync {
         }
     }
 
+    /// Preferred applicability entry point for a query with retained syntax.
+    /// Existing language-specific overload rules remain authoritative.
+    fn model_argument_applicability_with_context(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        _sources: &CallConversionContext<'_>,
+        file: &ProjectFile,
+        actual: tree_sitter::Node<'_>,
+        source: &str,
+        formal_type: &TypeRef,
+    ) -> ModelArgumentApplicability {
+        self.model_argument_applicability(analyzer, file, actual, source, formal_type)
+    }
+
     /// Whether an applicable member whose every formal is identical to its
     /// actual's static type is better than every other member that can apply,
     /// whether or not the other member's applicability is decided. C# has
@@ -433,11 +516,23 @@ pub trait CallArgumentConversionProver: Send + Sync {
         false
     }
 
+    /// Whether a member applicable by fixed-arity invocation, where a variadic
+    /// formal takes one actual as its array type, excludes every member
+    /// applicable only by variable-arity invocation. Java's phases have this
+    /// rule (JLS 15.12.2.1-4): a variable-arity application is considered
+    /// only when no member is applicable by strict or loose invocation. The
+    /// default keeps a variable-arity application undecided, so only a
+    /// rejection in both forms removes a variadic member.
+    fn fixed_arity_invocation_precedes_variable_arity(&self) -> bool {
+        false
+    }
+
     /// Whether `specific` is proven strictly more specific than `other` for a
     /// positional application of `arity` actuals, under the language's
-    /// overload resolution rules. The caller has proven `specific` applicable
-    /// by fixed-arity invocation; `other` is applicable or undecided. Only a
-    /// proof counts: the default proves nothing, so overload selection stays
+    /// overload resolution rules. The caller has proven `specific` applicable,
+    /// by variable-arity invocation only when the language's phases reached
+    /// it; `other` is applicable or undecided in the same phase. Only a proof
+    /// counts: the default proves nothing, so overload selection stays
     /// ambiguous.
     fn model_signature_more_specific(
         &self,
@@ -557,12 +652,43 @@ impl ScalaConversionType {
     }
 }
 
+/// Canonical compiler-owned standard identities, never inferred from a pack name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RustStdIdentity {
+    /// alloc::string::String (including its std reexport).
+    String,
+    /// alloc::vec::Vec (including its std reexport).
+    Vec,
+    /// alloc::boxed::Box (including its std reexport).
+    Box,
+    /// alloc::rc::Rc (including its std reexport).
+    Rc,
+    /// alloc::sync::Arc (including its std reexport).
+    Arc,
+    /// alloc::borrow::Cow (including its std reexport).
+    Cow,
+}
+
+/// Independent std authority (source route or verified sysroot receipt) and
+/// declaration-owner evidence. A disagreement cannot establish std identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RustStdRouteProof {
+    pub route: RustStdIdentity,
+    pub declaration: RustStdIdentity,
+}
+
 /// Structured Rust conversion types. The language producer bounds nesting
 /// before construction; references describe conversion shape, not a proof of
 /// borrow validity or region inference. Nominals retain resolved declarations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RustConversionType {
     Primitive(RustPrimitive),
+    /// A source-route-proven standard type without a model declaration.
+    /// Declaration consumers must return Unavailable for this variant.
+    StdIntrinsic {
+        identity: RustStdIdentity,
+        arguments: Vec<Self>,
+    },
     Declaration(CodeUnit),
     AppliedDeclaration {
         declaration: CodeUnit,
@@ -570,6 +696,8 @@ pub enum RustConversionType {
     },
     /// Exact nominal identity from one captured active model set.
     Model {
+        /// Set only by source route proof or a verified owner sysroot receipt.
+        std_identity: Option<RustStdRouteProof>,
         model_set: String,
         symbol: String,
         arguments: Vec<Self>,
@@ -594,6 +722,12 @@ pub enum RustConversionType {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RustProjectedType {
     Primitive(RustPrimitive),
+    /// A source-route-proven standard type without a model declaration.
+    /// Declaration consumers must return Unavailable for this variant.
+    StdIntrinsic {
+        identity: RustStdIdentity,
+        arguments: Vec<Self>,
+    },
     Declaration(CodeUnit),
     AppliedDeclaration {
         declaration: CodeUnit,
@@ -601,6 +735,8 @@ pub enum RustProjectedType {
     },
     /// Exact nominal identity from one captured active model set.
     Model {
+        /// Set only by source route proof or a verified owner sysroot receipt.
+        std_identity: Option<RustStdRouteProof>,
         model_set: String,
         symbol: String,
         arguments: Vec<Self>,
@@ -626,6 +762,13 @@ impl From<RustConversionType> for RustProjectedType {
     fn from(value: RustConversionType) -> Self {
         match value {
             RustConversionType::Primitive(value) => Self::Primitive(value),
+            RustConversionType::StdIntrinsic {
+                identity,
+                arguments,
+            } => Self::StdIntrinsic {
+                identity,
+                arguments: arguments.into_iter().map(Self::from).collect(),
+            },
             RustConversionType::Declaration(value) => Self::Declaration(value),
             RustConversionType::AppliedDeclaration {
                 declaration,
@@ -635,10 +778,12 @@ impl From<RustConversionType> for RustProjectedType {
                 arguments: arguments.into_iter().map(Self::from).collect(),
             },
             RustConversionType::Model {
+                std_identity,
                 model_set,
                 symbol,
                 arguments,
             } => Self::Model {
+                std_identity,
                 model_set,
                 symbol,
                 arguments: arguments.into_iter().map(Self::from).collect(),
@@ -667,6 +812,16 @@ impl RustProjectedType {
     pub fn into_complete(self) -> Result<RustConversionType, ConversionUnknown> {
         Ok(match self {
             Self::Primitive(value) => RustConversionType::Primitive(value),
+            Self::StdIntrinsic {
+                identity,
+                arguments,
+            } => RustConversionType::StdIntrinsic {
+                identity,
+                arguments: arguments
+                    .into_iter()
+                    .map(Self::into_complete)
+                    .collect::<Result<_, _>>()?,
+            },
             Self::Declaration(value) => RustConversionType::Declaration(value),
             Self::AppliedDeclaration {
                 declaration,
@@ -679,10 +834,12 @@ impl RustProjectedType {
                     .collect::<Result<_, _>>()?,
             },
             Self::Model {
+                std_identity,
                 model_set,
                 symbol,
                 arguments,
             } => RustConversionType::Model {
+                std_identity,
                 model_set,
                 symbol,
                 arguments: arguments
@@ -744,6 +901,15 @@ impl RustConversionType {
                     digest.push(b"primitive");
                     digest.push(&[*primitive as u8]);
                 }
+                Self::StdIntrinsic {
+                    identity,
+                    arguments,
+                } => {
+                    digest.push(b"std_intrinsic");
+                    digest.push(&[*identity as u8]);
+                    digest.push(&(arguments.len() as u64).to_be_bytes());
+                    pending.extend(arguments.iter().rev());
+                }
                 Self::Declaration(unit) => {
                     digest.push(b"declaration");
                     digest.push(unit.declaration_id().as_str().as_bytes());
@@ -758,11 +924,18 @@ impl RustConversionType {
                     pending.extend(arguments.iter().rev());
                 }
                 Self::Model {
+                    std_identity,
                     model_set,
                     symbol,
                     arguments,
                 } => {
                     digest.push(b"model");
+                    match std_identity {
+                        Some(proof) => {
+                            digest.push(&[1, proof.route as u8, proof.declaration as u8])
+                        }
+                        None => digest.push(&[0]),
+                    }
                     digest.push(model_set.as_bytes());
                     digest.push(symbol.as_bytes());
                     digest.push(&(arguments.len() as u64).to_be_bytes());
@@ -1104,6 +1277,13 @@ impl CallArgumentConversion {
 type IndexedConversionProof = (usize, Result<ArgumentTypeConversion, ConversionUnknown>);
 
 pub struct ConversionSource {
+    macro_inventories: std::sync::OnceLock<
+        HashMap<usize, brokk_bifrost_rust::macro_matcher::MacroDefinitionInventory>,
+    >,
+    embedded: Result<
+        crate::analyzer::structural::spec::EmbeddedSyntaxForest,
+        crate::analyzer::structural::spec::EmbeddedSyntaxStop,
+    >,
     pub source: Arc<str>,
     pub tree: tree_sitter::Tree,
     pub(crate) preparation: super::get_definition::PreparedDefinitionSource,
@@ -1112,6 +1292,35 @@ pub struct ConversionSource {
 }
 
 impl ConversionSource {
+    pub fn macro_inventory(
+        &self,
+        tree: &tree_sitter::Tree,
+    ) -> &brokk_bifrost_rust::macro_matcher::MacroDefinitionInventory {
+        self.macro_inventories
+            .get_or_init(|| {
+                let mut inventories = HashMap::default();
+                let fragments = self
+                    .embedded
+                    .as_ref()
+                    .ok()
+                    .into_iter()
+                    .flat_map(|forest| forest.trees().iter().map(|fragment| &fragment.tree));
+                for tree in std::iter::once(&self.tree).chain(fragments) {
+                    let inventory =
+                        brokk_bifrost_rust::macro_matcher::MacroDefinitionInventory::build(
+                            tree,
+                            &self.source,
+                            &|| true,
+                        )
+                        .expect("conversion syntax has no cancellation token");
+                    inventories.insert(tree.root_node().id(), inventory);
+                }
+                inventories
+            })
+            .get(&tree.root_node().id())
+            .expect("conversion tree belongs to this source")
+    }
+
     /// The census names the file as well as its content: each file holds its
     /// own source and tree, so files with identical bytes are charged once each.
     fn new(file: &ProjectFile, source: Arc<str>, tree: tree_sitter::Tree) -> Self {
@@ -1125,13 +1334,69 @@ impl ConversionSource {
         shape.push(content.as_bytes());
         let preparation =
             super::get_definition::PreparedDefinitionSource::new(Arc::clone(&source), tree.clone());
+        let embedded = crate::analyzer::structural::spec::EmbeddedSyntaxForest::parse(
+            crate::analyzer::structural_spec_for(language_for_file(file))
+                .expect("conversion source has a registered structural adapter"),
+            tree.root_node(),
+            &source,
+            200_000,
+            None,
+        );
         Self {
+            macro_inventories: std::sync::OnceLock::new(),
+            embedded,
             source,
             tree,
             preparation,
             parse_census: parse.finish(),
             shape_census: shape.finish(),
         }
+    }
+
+    pub fn logical_parent<'a>(
+        &'a self,
+        node: tree_sitter::Node<'a>,
+    ) -> Option<tree_sitter::Node<'a>> {
+        self.embedded.as_ref().map_or_else(
+            |_| node.parent(),
+            |forest| forest.logical_parent(&self.tree, node),
+        )
+    }
+
+    pub fn logical_root<'a>(&'a self, node: tree_sitter::Node<'a>) -> tree_sitter::Node<'a> {
+        self.embedded.as_ref().map_or_else(
+            |_| brokk_bifrost_core::analyzer::tree_walk::root_node(node),
+            |forest| forest.logical_root(&self.tree, node),
+        )
+    }
+
+    pub fn tree_for_range(
+        &self,
+        start: usize,
+        end: usize,
+    ) -> Result<&tree_sitter::Tree, ConversionUnknown> {
+        use crate::analyzer::structural::spec::EmbeddedSyntaxStop;
+        Ok(match &self.embedded {
+            Ok(forest) => forest.tree_for_range(&self.tree, start, end),
+            Err(EmbeddedSyntaxStop::Exceeded) => &self.tree,
+            Err(EmbeddedSyntaxStop::Cancelled) => {
+                return Err(ConversionUnknown::UnsupportedExpression);
+            }
+        })
+    }
+
+    fn expression(
+        &self,
+        start: usize,
+        end: usize,
+    ) -> Result<tree_sitter::Node<'_>, ConversionUnknown> {
+        let tree = self.tree_for_range(start, end)?;
+        tree.root_node()
+            .named_descendant_for_byte_range(start, end)
+            .filter(|node| {
+                node.byte_range() == (start..end) && !node.has_error() && !node.is_missing()
+            })
+            .ok_or(ConversionUnknown::UnsupportedExpression)
     }
 
     pub(crate) fn charge_shape(
@@ -1203,16 +1468,7 @@ fn exact_argument_expression<'tree>(
     source: &'tree ConversionSource,
     row: &CallBindingRow,
 ) -> Result<tree_sitter::Node<'tree>, ConversionUnknown> {
-    let actual = source
-        .tree
-        .root_node()
-        .named_descendant_for_byte_range(row.range.start_byte, row.range.end_byte)
-        .filter(|node| node.byte_range() == (row.range.start_byte..row.range.end_byte))
-        .ok_or(ConversionUnknown::UnsupportedExpression)?;
-    if actual.has_error() || actual.is_missing() {
-        return Err(ConversionUnknown::UnsupportedExpression);
-    }
-    Ok(actual)
+    source.expression(row.range.start_byte, row.range.end_byte)
 }
 
 fn model_conversion_prover(
@@ -1237,17 +1493,7 @@ fn written_model_actuals<'tree>(
         if argument.spread || argument.name.is_some() {
             return Err(ConversionUnknown::AmbiguousBinding);
         }
-        let actual = source
-            .tree
-            .root_node()
-            .named_descendant_for_byte_range(argument.range.start_byte, argument.range.end_byte)
-            .filter(|node| {
-                node.byte_range() == (argument.range.start_byte..argument.range.end_byte)
-            })
-            .ok_or(ConversionUnknown::UnsupportedExpression)?;
-        if actual.has_error() || actual.is_missing() {
-            return Err(ConversionUnknown::UnsupportedExpression);
-        }
+        let actual = source.expression(argument.range.start_byte, argument.range.end_byte)?;
         written.push(actual);
     }
     Ok(written)
@@ -1265,17 +1511,142 @@ enum ModelCandidateApplicability {
     Unknown(Vec<ConversionUnknown>),
 }
 
-/// Applicability of one model member to the written positional actuals. The
-/// error channel carries only cancellation and budget exhaustion.
-fn model_candidate_applicability(
+impl ModelCandidateApplicability {
+    /// Whether this form provably cannot invoke the member.
+    fn is_excluded(&self) -> bool {
+        matches!(self, Self::Rejected | Self::LayoutMismatch)
+    }
+}
+
+/// One model member's applicability in each invocation form. In the
+/// fixed-arity form a variadic formal takes exactly one actual, typed as the
+/// formal's array type; in the variable-arity form it takes every trailing
+/// actual, each typed as the array's element type. A member without a
+/// variadic formal has only the fixed-arity form, and a variadic member
+/// written with no actual or several actuals for that formal has only the
+/// variable-arity form.
+struct ModelCandidateForms {
+    fixed: ModelCandidateApplicability,
+    variable: ModelCandidateApplicability,
+    /// How many written actuals bind to the variadic formal.
+    variadic_actuals: usize,
+    /// Why the actuals of non-variadic formals, which both forms share, are
+    /// undecided.
+    shared_unknown: Vec<ConversionUnknown>,
+}
+
+impl ModelCandidateForms {
+    /// One applicability for a language without phased invocation. Only the
+    /// fixed-arity form proves the member applicable, since a variable-arity
+    /// application competes with other members under the language's own
+    /// expansion rules; the member is excluded only when neither form can
+    /// apply. An undecided member keeps the reasons for its shared formals and
+    /// one unsupported variadic conversion per actual the variadic formal takes.
+    fn combined(self) -> ModelCandidateApplicability {
+        match (self.fixed, self.variable) {
+            (applicable @ ModelCandidateApplicability::Applicable { .. }, _) => applicable,
+            (
+                ModelCandidateApplicability::LayoutMismatch,
+                ModelCandidateApplicability::LayoutMismatch,
+            ) => ModelCandidateApplicability::LayoutMismatch,
+            (fixed, variable) if fixed.is_excluded() && variable.is_excluded() => {
+                ModelCandidateApplicability::Rejected
+            }
+            _ => {
+                let mut unknown = self.shared_unknown;
+                unknown.extend(std::iter::repeat_n(
+                    ConversionUnknown::UnsupportedConversion,
+                    self.variadic_actuals,
+                ));
+                ModelCandidateApplicability::Unknown(unknown)
+            }
+        }
+    }
+}
+
+/// The proof accumulated for one invocation form.
+#[derive(Default)]
+struct ModelFormProof {
+    rejected: bool,
+    inexact: bool,
+    unknown: Vec<ConversionUnknown>,
+}
+
+impl ModelFormProof {
+    fn record(&mut self, outcome: ModelActualOutcome) {
+        match outcome {
+            ModelActualOutcome::Converts { identity } => self.inexact |= !identity,
+            ModelActualOutcome::Inapplicable => self.rejected = true,
+            ModelActualOutcome::Unknown(reason) => self.unknown.push(reason),
+        }
+    }
+
+    fn finish(self) -> ModelCandidateApplicability {
+        if self.rejected {
+            ModelCandidateApplicability::Rejected
+        } else if self.unknown.is_empty() {
+            ModelCandidateApplicability::Applicable {
+                exact: !self.inexact,
+            }
+        } else {
+            ModelCandidateApplicability::Unknown(self.unknown)
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ModelActualOutcome {
+    Converts { identity: bool },
+    Inapplicable,
+    Unknown(ConversionUnknown),
+}
+
+/// One actual against one formal type. The error channel carries only
+/// cancellation and budget exhaustion.
+fn model_actual_outcome(
     prover: &dyn CallArgumentConversionProver,
     analyzer: &dyn IAnalyzer,
+    sources: &CallConversionContext<'_>,
+    file: &ProjectFile,
+    source: &str,
+    actual: tree_sitter::Node<'_>,
+    formal_type: &TypeRef,
+) -> Result<ModelActualOutcome, ConversionUnknown> {
+    Ok(
+        match prover.model_argument_applicability_with_context(
+            analyzer,
+            sources,
+            file,
+            actual,
+            source,
+            formal_type,
+        ) {
+            ModelArgumentApplicability::Applicable(proof) => ModelActualOutcome::Converts {
+                identity: proof.kind.is_identity(),
+            },
+            ModelArgumentApplicability::Inapplicable => ModelActualOutcome::Inapplicable,
+            ModelArgumentApplicability::Unknown(
+                reason @ (ConversionUnknown::Cancelled | ConversionUnknown::BudgetExhausted),
+            ) => return Err(reason),
+            ModelArgumentApplicability::Unknown(reason) => ModelActualOutcome::Unknown(reason),
+        },
+    )
+}
+
+/// Applicability of one model member to the written positional actuals, in
+/// each invocation form. The error channel carries only cancellation and
+/// budget exhaustion.
+#[allow(clippy::too_many_arguments)]
+fn model_candidate_forms(
+    prover: &dyn CallArgumentConversionProver,
+    analyzer: &dyn IAnalyzer,
+    sources: &CallConversionContext<'_>,
     file: &ProjectFile,
     source: &str,
     written: &[tree_sitter::Node<'_>],
     signature: &Signature,
     is_cancelled: &dyn Fn() -> bool,
-) -> Result<ModelCandidateApplicability, ConversionUnknown> {
+) -> Result<ModelCandidateForms, ConversionUnknown> {
     if is_cancelled() {
         return Err(ConversionUnknown::Cancelled);
     }
@@ -1285,43 +1656,125 @@ fn model_candidate_applicability(
     let parameter_ordinals = match bind_semantic_model_arguments(signature, &application) {
         SemanticModelArgumentBinding::Exact { parameter_ordinals } => parameter_ordinals,
         SemanticModelArgumentBinding::Mismatch => {
-            return Ok(ModelCandidateApplicability::LayoutMismatch);
+            return Ok(ModelCandidateForms {
+                fixed: ModelCandidateApplicability::LayoutMismatch,
+                variable: ModelCandidateApplicability::LayoutMismatch,
+                variadic_actuals: 0,
+                shared_unknown: Vec::new(),
+            });
         }
         SemanticModelArgumentBinding::PossibleSpread => {
-            return Ok(ModelCandidateApplicability::Unknown(vec![
-                ConversionUnknown::AmbiguousBinding,
-            ]));
+            let unknown = vec![ConversionUnknown::AmbiguousBinding];
+            return Ok(ModelCandidateForms {
+                fixed: ModelCandidateApplicability::Unknown(unknown.clone()),
+                variable: ModelCandidateApplicability::LayoutMismatch,
+                variadic_actuals: 0,
+                shared_unknown: unknown,
+            });
         }
     };
-    let mut rejected = false;
-    let mut exact = true;
-    let mut unknown = Vec::new();
+    let variadic_ordinal = signature
+        .parameters
+        .iter()
+        .position(|formal| formal.variadic);
+    let variadic_actuals = parameter_ordinals
+        .iter()
+        .filter(|ordinal| Some(**ordinal) == variadic_ordinal)
+        .count();
+    let has_fixed_form = variadic_ordinal.is_none() || variadic_actuals == 1;
+    let mut fixed = ModelFormProof::default();
+    let mut variable = ModelFormProof::default();
+    let mut shared_unknown = Vec::new();
     for (actual, formal_index) in written.iter().zip(parameter_ordinals) {
         if is_cancelled() {
             return Err(ConversionUnknown::Cancelled);
         }
         let formal = &signature.parameters[formal_index];
-        // Variadic conversion requires language-owned expansion semantics.
-        if formal.variadic {
-            unknown.push(ConversionUnknown::UnsupportedConversion);
+        if !formal.variadic {
+            let outcome = model_actual_outcome(
+                prover,
+                analyzer,
+                sources,
+                file,
+                source,
+                *actual,
+                &formal.r#type,
+            )?;
+            if let ModelActualOutcome::Unknown(reason) = outcome {
+                shared_unknown.push(reason);
+            }
+            fixed.record(outcome);
+            variable.record(outcome);
             continue;
         }
-        match prover.model_argument_applicability(analyzer, file, *actual, source, &formal.r#type) {
-            ModelArgumentApplicability::Applicable(proof) => exact &= proof.kind.is_identity(),
-            ModelArgumentApplicability::Inapplicable => rejected = true,
-            ModelArgumentApplicability::Unknown(
-                reason @ (ConversionUnknown::Cancelled | ConversionUnknown::BudgetExhausted),
-            ) => return Err(reason),
-            ModelArgumentApplicability::Unknown(reason) => unknown.push(reason),
+        if has_fixed_form {
+            fixed.record(model_actual_outcome(
+                prover,
+                analyzer,
+                sources,
+                file,
+                source,
+                *actual,
+                &formal.r#type,
+            )?);
         }
+        variable.record(match &formal.r#type {
+            TypeRef::Array { element } => {
+                model_actual_outcome(prover, analyzer, sources, file, source, *actual, element)?
+            }
+            _ => ModelActualOutcome::Unknown(ConversionUnknown::UnresolvedTargetType),
+        });
     }
-    Ok(if rejected {
-        ModelCandidateApplicability::Rejected
-    } else if unknown.is_empty() {
-        ModelCandidateApplicability::Applicable { exact }
-    } else {
-        ModelCandidateApplicability::Unknown(unknown)
+    Ok(ModelCandidateForms {
+        fixed: if has_fixed_form {
+            fixed.finish()
+        } else {
+            ModelCandidateApplicability::LayoutMismatch
+        },
+        variable: match (variadic_ordinal, variable.finish()) {
+            (None, _) => ModelCandidateApplicability::LayoutMismatch,
+            // An element conversion never makes a variable-arity application
+            // an exact match of the declared array formal.
+            (Some(_), ModelCandidateApplicability::Applicable { .. }) => {
+                ModelCandidateApplicability::Applicable { exact: false }
+            }
+            (Some(_), variable) => variable,
+        },
+        variadic_actuals,
+        shared_unknown,
     })
+}
+
+/// Each candidate's applicability for overload selection. A language whose
+/// fixed-arity invocation precedes variable-arity invocation, as Java's
+/// phases do (JLS 15.12.2.1-4), considers a variable-arity application only
+/// when no candidate is applicable by fixed-arity invocation. While some
+/// candidate's fixed-arity applicability is undecided, the variable-arity
+/// phase may or may not be reached, so those candidates stay undecided peers
+/// of every variable-arity applicable candidate.
+fn model_selection_applicability(
+    prover: &dyn CallArgumentConversionProver,
+    forms: Vec<ModelCandidateForms>,
+) -> Vec<ModelCandidateApplicability> {
+    if !prover.fixed_arity_invocation_precedes_variable_arity() {
+        return forms
+            .into_iter()
+            .map(ModelCandidateForms::combined)
+            .collect();
+    }
+    let fixed_applicable = forms
+        .iter()
+        .any(|form| matches!(form.fixed, ModelCandidateApplicability::Applicable { .. }));
+    forms
+        .into_iter()
+        .map(|form| {
+            if fixed_applicable || !form.fixed.is_excluded() {
+                form.fixed
+            } else {
+                form.variable
+            }
+        })
+        .collect()
 }
 
 fn apply_conversion_proofs(report: &mut CallBindingReport, proofs: Vec<IndexedConversionProof>) {
@@ -1381,12 +1834,204 @@ type RustModeledResultKey = (
 
 type RustExpressionTypeKey = (ProjectFile, usize, usize, usize, StableDigest);
 
+// These two memos belong to this call-conversion operation. Their regions use
+// its analyzer's owner budget, and Drop invalidates them before that operation
+// can disappear. An ownerless analyzer computes without retaining anything.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct RustOperatorHeadersKey {
+    selection: Option<(u64, u64, [u8; 32])>,
+    models: StableDigest,
+    trait_name: String,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct RustBinaryOperationKey {
+    file: ProjectFile,
+    selection: (u64, u64, [u8; 32]),
+    models: StableDigest,
+    output: crate::analyzer::resolution::SemanticId,
+    operator: brokk_bifrost_core::analyzer::resolution_facts::ResolutionBinaryOperator,
+    left: crate::analyzer::resolution::ResolutionSlotValue,
+    right: crate::analyzer::resolution::ResolutionSlotValue,
+}
+
+impl brokk_bifrost_core::retention_budget::RetainedBytes for RustOperatorHeadersKey {
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + brokk_bifrost_core::allocation_size::allocation_size(self.trait_name.capacity())
+    }
+}
+impl brokk_bifrost_core::retention_budget::RetainedBytes for RustBinaryOperationKey {
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self
+                .file
+                .retained_bytes()
+                .saturating_sub(std::mem::size_of::<ProjectFile>())
+    }
+}
+
+struct RustProofMemoValue<V> {
+    value: V,
+    reads: super::common::QueryMemoReads,
+    bytes: usize,
+}
+impl<V> brokk_bifrost_core::retention_budget::RetainedBytes for RustProofMemoValue<V> {
+    fn retained_bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+type RustProofMemo<K, V> = std::sync::OnceLock<
+    brokk_bifrost_core::retention_budget::BudgetRegion<K, RustProofMemoValue<V>>,
+>;
+type RustOperatorHeaders = Result<Vec<(ProjectFile, std::ops::Range<usize>)>, ConversionUnknown>;
+
+fn rust_proof_memo_value<K, V>(
+    memo: &RustProofMemo<K, V>,
+    region_name: &'static str,
+    analyzer: &dyn IAnalyzer,
+    key: K,
+    build: impl FnOnce() -> V,
+    retain: impl FnOnce(&V) -> bool,
+    weight: impl FnOnce(&V) -> usize,
+) -> V
+where
+    K: Eq
+        + std::hash::Hash
+        + Clone
+        + Send
+        + Sync
+        + brokk_bifrost_core::retention_budget::RetainedBytes
+        + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    let region = memo.get().or_else(|| {
+        analyzer
+            .snapshot_caches()
+            .map(|owner| memo.get_or_init(|| owner.retention_budget().region(region_name, None)))
+    });
+    if let Some(value) = region.and_then(|region| region.get(&key)) {
+        super::common::replay_memo_reads(&value.reads, analyzer);
+        return value.value.clone();
+    }
+    let (value, admission) = super::common::capture_memo_reads(
+        super::common::QueryMemoOwner::RustOperator,
+        analyzer,
+        build,
+    );
+    // Admission may also report operational refusal to the enclosing reader;
+    // perform that classification even when this analyzer has no cache owner.
+    let retain_value = retain(&value);
+    if let Some(region) = region
+        && retain_value
+        && let Some(reads) = admission.admitted()
+    {
+        let bytes = std::mem::size_of::<RustProofMemoValue<V>>()
+            .saturating_add(weight(&value).saturating_sub(std::mem::size_of::<V>()))
+            .saturating_add(super::common::allocated_memo_read_bytes(&reads));
+        // A refused admission returns a current-only value. It never installs
+        // an unaccounted entry and the next use recomputes the proof.
+        return region
+            .insert(
+                key,
+                RustProofMemoValue {
+                    value,
+                    reads,
+                    bytes,
+                },
+            )
+            .value
+            .clone();
+    }
+    value
+}
+
+fn rust_operator_header_bytes(value: &RustOperatorHeaders) -> usize {
+    std::mem::size_of_val(value)
+        + value.as_ref().map_or(0, |headers| {
+            brokk_bifrost_core::hash::allocated_vec_slot_bytes(headers)
+                + headers
+                    .iter()
+                    .map(|(file, _)| {
+                        file.retained_bytes()
+                            .saturating_sub(std::mem::size_of::<ProjectFile>())
+                    })
+                    .sum::<usize>()
+        })
+}
+
+fn rust_binary_result_bytes(value: &Result<RustConversionType, ConversionUnknown>) -> usize {
+    use brokk_bifrost_core::allocation_size::allocation_size;
+    use brokk_bifrost_core::hash::allocated_vec_slot_bytes;
+    let mut bytes = std::mem::size_of_val(value);
+    let mut pending = value.as_ref().ok().into_iter().collect::<Vec<_>>();
+    while let Some(ty) = pending.pop() {
+        match ty {
+            RustConversionType::Primitive(_) | RustConversionType::Unit => {}
+            RustConversionType::StdIntrinsic { arguments, .. } => {
+                bytes += allocated_vec_slot_bytes(arguments);
+                pending.extend(arguments);
+            }
+            RustConversionType::Declaration(unit) => {
+                bytes += unit
+                    .retained_bytes()
+                    .saturating_sub(std::mem::size_of::<CodeUnit>())
+            }
+            RustConversionType::AppliedDeclaration {
+                declaration,
+                arguments,
+            } => {
+                bytes += declaration
+                    .retained_bytes()
+                    .saturating_sub(std::mem::size_of::<CodeUnit>());
+                bytes += allocated_vec_slot_bytes(arguments);
+                pending.extend(arguments);
+            }
+            RustConversionType::Model {
+                model_set,
+                symbol,
+                arguments,
+                ..
+            } => {
+                bytes += allocation_size(model_set.capacity())
+                    + allocation_size(symbol.capacity())
+                    + allocated_vec_slot_bytes(arguments);
+                pending.extend(arguments);
+            }
+            RustConversionType::Reference { referent, .. } => {
+                bytes += allocation_size(std::mem::size_of::<RustConversionType>());
+                pending.push(referent);
+            }
+            RustConversionType::Array { element, .. } | RustConversionType::Slice { element } => {
+                bytes += allocation_size(std::mem::size_of::<RustConversionType>());
+                pending.push(element);
+            }
+            RustConversionType::Tuple(elements) => {
+                bytes += allocated_vec_slot_bytes(elements);
+                pending.extend(elements);
+            }
+        }
+    }
+    bytes
+}
+
 /// One indexed source/tree per file, scoped to the caller's query snapshot.
 pub struct CallConversionCache {
+    rust_operator_headers: RustProofMemo<RustOperatorHeadersKey, RustOperatorHeaders>,
+    rust_binary_operations:
+        RustProofMemo<RustBinaryOperationKey, Result<RustConversionType, ConversionUnknown>>,
+
+    // Query-owned handle into the snapshot's existing retention budget. The
+    // region drops with this cache; it never creates another memory allowance.
+    model_indexes:
+        std::sync::OnceLock<Option<crate::analyzer::lexical_definitions::LexicalIndexCache>>,
     #[cfg(any(test, feature = "test-support"))]
     lexical_work: std::sync::Mutex<crate::analyzer::lexical_definitions::LexicalIndexWork>,
     #[cfg(any(test, feature = "test-support"))]
     source_acquisitions: std::sync::atomic::AtomicUsize,
+    #[cfg(any(test, feature = "test-support"))]
+    source_builds: std::sync::atomic::AtomicUsize,
     rust_modeled_results: super::common::QueryReadMemo<
         RustModeledResultKey,
         Result<RustConversionType, ConversionUnknown>,
@@ -1417,6 +2062,9 @@ pub struct CallConversionCache {
 impl Default for CallConversionCache {
     fn default() -> Self {
         Self {
+            rust_operator_headers: Default::default(),
+            rust_binary_operations: Default::default(),
+            model_indexes: Default::default(),
             rust_modeled_results: super::common::query_read_memo(),
             rust_methods: super::common::query_read_memo(),
             rust_expressions: super::common::query_read_memo(),
@@ -1429,7 +2077,20 @@ impl Default for CallConversionCache {
             lexical_work: Default::default(),
             #[cfg(any(test, feature = "test-support"))]
             source_acquisitions: Default::default(),
+            #[cfg(any(test, feature = "test-support"))]
+            source_builds: Default::default(),
             shapes: super::common::query_read_memo(),
+        }
+    }
+}
+
+impl Drop for CallConversionCache {
+    fn drop(&mut self) {
+        if let Some(region) = self.rust_operator_headers.get() {
+            region.invalidate_all();
+        }
+        if let Some(region) = self.rust_binary_operations.get() {
+            region.invalidate_all();
         }
     }
 }
@@ -1472,6 +2133,61 @@ fn rust_conversion_model_set(analyzer: &dyn IAnalyzer) -> StableDigest {
 }
 
 impl CallConversionCache {
+    /// The same captured impl inventory serves source and native operator proofs.
+    pub fn rust_operator_headers(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        selection: Option<(u64, u64, [u8; 32])>,
+        trait_name: &str,
+        build: impl FnOnce() -> RustOperatorHeaders,
+    ) -> RustOperatorHeaders {
+        let key = RustOperatorHeadersKey {
+            selection,
+            models: rust_conversion_model_set(analyzer),
+            trait_name: trait_name.to_owned(),
+        };
+        rust_proof_memo_value(
+            &self.rust_operator_headers,
+            "rust-call-conversion-operator-headers",
+            analyzer,
+            key,
+            build,
+            |value| selection.is_none() || value.is_ok(),
+            rust_operator_header_bytes,
+        )
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn with_rust_operator_budget_for_test(
+        budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
+    ) -> Self {
+        let cache = Self::default();
+        assert!(
+            cache
+                .rust_operator_headers
+                .set(budget.region("rust-call-conversion-operator-headers", None))
+                .is_ok()
+        );
+        assert!(
+            cache
+                .rust_binary_operations
+                .set(budget.region("rust-call-conversion-binary-results", None))
+                .is_ok()
+        );
+        cache
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn rust_operator_header_memo_stats_for_test(
+        &self,
+    ) -> brokk_bifrost_core::retention_budget::RegionStats {
+        self.rust_operator_headers
+            .get()
+            .map_or_else(Default::default, |region| region.stats())
+    }
+
     /// Cache operation-bound modeled results and replay all reads on a hit.
     /// The key includes the call site: member selection depends on the
     /// call's arity and on the traits visible at it, so two calls on the
@@ -1543,6 +2259,38 @@ impl CallConversionCache {
             return Err(ConversionUnknown::Cancelled);
         }
         (*value).clone()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn rust_binary_operation_type(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        selection: (u64, u64, [u8; 32]),
+        output: crate::analyzer::resolution::SemanticId,
+        operator: brokk_bifrost_core::analyzer::resolution_facts::ResolutionBinaryOperator,
+        left: crate::analyzer::resolution::ResolutionSlotValue,
+        right: crate::analyzer::resolution::ResolutionSlotValue,
+        prove: impl FnOnce() -> Result<RustConversionType, ConversionUnknown>,
+    ) -> Result<RustConversionType, ConversionUnknown> {
+        let key = RustBinaryOperationKey {
+            file: file.clone(),
+            selection,
+            models: rust_conversion_model_set(analyzer),
+            output,
+            operator,
+            left,
+            right,
+        };
+        rust_proof_memo_value(
+            &self.rust_binary_operations,
+            "rust-call-conversion-binary-results",
+            analyzer,
+            key,
+            prove,
+            |value| retain_conversion_result(analyzer, value) && value.is_ok(),
+            rust_binary_result_bytes,
+        )
     }
 
     /// Expression proofs are request-local and retain their transitive reads.
@@ -1617,7 +2365,33 @@ impl CallConversionCache {
         analyzer: &dyn IAnalyzer,
         file: &ProjectFile,
         range: &crate::analyzer::Range,
+        selected: Option<&crate::analyzer::semantic::ProcedureHandle>,
     ) -> Option<CallShapeReport> {
+        if let Some(selected) = selected
+            && selected.durable_key().2
+                == crate::analyzer::semantic::ProcedureInterpretation::CandidateAlternate
+        {
+            let facts = analyzer
+                .structural_fact_providers()
+                .into_iter()
+                .find_map(|provider| provider.structural_facts(file))?;
+            return facts
+                .nodes()
+                .iter()
+                .enumerate()
+                .filter(|(_, node)| {
+                    node.range.start_byte == range.start_byte
+                        && node.range.end_byte == range.end_byte
+                })
+                .find_map(|(id, _)| {
+                    super::call_shape::call_shape_for_call(
+                        &facts,
+                        file,
+                        u32::try_from(id).expect("facts node ID"),
+                        Some(selected),
+                    )
+                });
+        }
         let shapes = super::common::query_memo_value(&self.shapes, analyzer, file, || {
             let mut shapes = HashMap::default();
             if let Some(facts) = analyzer
@@ -1654,8 +2428,9 @@ impl CallConversionCache {
         file: &ProjectFile,
         range: &crate::analyzer::Range,
         budget: &mut crate::analyzer::semantic::SemanticBudget,
+        selected: Option<&crate::analyzer::semantic::ProcedureHandle>,
     ) -> Result<bool, crate::analyzer::semantic::SemanticBudgetExceeded> {
-        let Some(shape) = self.shape(analyzer, file, range) else {
+        let Some(shape) = self.shape(analyzer, file, range, selected) else {
             return Ok(true);
         };
         // call_shape omits argument rows for unreadable shapes. Unknown
@@ -1678,6 +2453,12 @@ impl CallConversionCache {
             nested_entries: shape.arguments.len(),
             ..Default::default()
         });
+        // Base interpretation keeps its original proof and memo identity.
+        if let Some(selected) = selected.filter(|selected| selected.is_candidate_alternate()) {
+            return Ok(shape.arguments.iter().any(|argument| {
+                self.selected_actual_may_run_user_code(analyzer, file, &argument.range, selected)
+            }));
+        }
         Ok(*super::common::query_memo_value(
             &self.prefilter_effects,
             analyzer,
@@ -1689,6 +2470,38 @@ impl CallConversionCache {
                     .any(|argument| self.actual_may_run_user_code(analyzer, file, &argument.range))
             },
         ))
+    }
+
+    pub(crate) fn selected_actual_may_run_user_code(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        range: &crate::analyzer::Range,
+        selected: &crate::analyzer::semantic::ProcedureHandle,
+    ) -> bool {
+        if !selected.is_candidate_alternate() {
+            return self.actual_may_run_user_code(analyzer, file, range);
+        }
+        let Some(source) = self.source(analyzer, file) else {
+            return true;
+        };
+        let Ok(node) = source.expression(range.start_byte, range.end_byte) else {
+            return true;
+        };
+        language_support_for_hook(language_for_file(file), "call_argument_conversion_prover")
+            .and_then(LanguageSupport::call_argument_conversion_prover)
+            .is_some_and(|prover| {
+                prover.selected_actual_may_run_user_code(
+                    analyzer,
+                    self,
+                    ConversionSyntax {
+                        file,
+                        node,
+                        source: &source.source,
+                    },
+                    selected,
+                )
+            })
     }
 
     pub(crate) fn actual_may_run_user_code(
@@ -1705,15 +2518,7 @@ impl CallConversionCache {
                 let Some(source) = self.source(analyzer, file) else {
                     return true;
                 };
-                let actual = source
-                    .tree
-                    .root_node()
-                    .named_descendant_for_byte_range(range.start_byte, range.end_byte)
-                    .filter(|node| {
-                        node.byte_range() == (range.start_byte..range.end_byte)
-                            && !node.has_error()
-                            && !node.is_missing()
-                    });
+                let actual = source.expression(range.start_byte, range.end_byte).ok();
                 language_support_for_hook(
                     language_for_file(file),
                     "call_argument_conversion_prover",
@@ -1751,6 +2556,12 @@ impl CallConversionCache {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn source_builds(&self) -> usize {
+        self.source_builds
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn source(
         &self,
         analyzer: &dyn IAnalyzer,
@@ -1760,6 +2571,9 @@ impl CallConversionCache {
         self.source_acquisitions
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let value = super::common::query_memo_value(&self.sources, analyzer, file, || {
+            #[cfg(any(test, feature = "test-support"))]
+            self.source_builds
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let source = analyzer.indexed_source(file)?;
             let tree = parse_tree_for_language(file, language_for_file(file), &source)?;
             Some(Arc::new(ConversionSource::new(
@@ -1787,6 +2601,22 @@ impl CallConversionCache {
         );
     }
 
+    /// Retain the query's model lexical indexes under its snapshot owner.
+    /// An analyzer without a snapshot owner keeps the reference-only policy.
+    #[doc(hidden)]
+    pub fn model_context(&self, analyzer: &dyn IAnalyzer) -> CallConversionContext<'_> {
+        match self.model_indexes.get_or_init(|| {
+            analyzer.snapshot_caches().map(|snapshot| {
+                crate::analyzer::lexical_definitions::lexical_index_cache(
+                    snapshot.retention_budget(),
+                )
+            })
+        }) {
+            Some(indexes) => self.indexed_context(indexes.clone()),
+            None => CallConversionContext::reference(self),
+        }
+    }
+
     #[doc(hidden)]
     pub fn indexed_context(
         &self,
@@ -1795,6 +2625,8 @@ impl CallConversionCache {
         CallConversionContext {
             cache: self,
             indexes: Some(indexes),
+            syntax: None,
+            fixed_array_invocation: None,
         }
     }
 
@@ -1918,6 +2750,9 @@ impl CallConversionCache {
         let source = self
             .source(analyzer, &report.file)
             .ok_or(ConversionUnknown::UnresolvedSourceType)?;
+        let mut context = context.with_source(&report.file, &source);
+        context.fixed_array_invocation = report.fixed_array_invocation;
+        let context = &context;
         let formal_source = self
             .source(analyzer, target.source())
             .ok_or(ConversionUnknown::UnresolvedTargetType)?;
@@ -1937,9 +2772,19 @@ impl CallConversionCache {
             enclosing = node.parent();
         }
         prover.validate_owner(owner)?;
-        let slots =
+        let mut slots =
             formal_parameter_slots_for_owner_with_nodes(language, owner, &formal_source.source)
                 .ok_or(ConversionUnknown::UnresolvedTargetType)?;
+        let layout = crate::analyzer::semantic::call_binding::call_local_formal_layout(
+            crate::analyzer::lexical_definitions::FormalParameterLayout {
+                slots: slots.iter().map(|(slot, _)| slot.clone()).collect(),
+                python_binding: None,
+            },
+            report.fixed_array_invocation,
+        );
+        for ((slot, _), projected) in slots.iter_mut().zip(layout.slots) {
+            *slot = projected;
+        }
         let ordinary: Vec<_> = slots.iter().filter(|(slot, _)| !slot.receiver).collect();
         let mut proofs = Vec::new();
         for (index, row) in report.rows.iter().enumerate() {
@@ -2006,7 +2851,7 @@ impl CallConversionCache {
         shape: &CallShapeReport,
         caller_source: Option<(&ProjectFile, &str)>,
         candidates: &[(String, Signature)],
-    ) -> Result<Option<(String, Signature)>, ConversionUnknown> {
+    ) -> Result<Option<ModelSignatureSelection>, ConversionUnknown> {
         let cancellation = analyzer.active_query_cancellation();
         let is_cancelled = || {
             cancellation
@@ -2030,22 +2875,37 @@ impl CallConversionCache {
                 .map(|(_, signature)| signature.clone())
                 .collect::<Vec<_>>(),
         ) {
-            return selected.map(|(index, _)| Some(candidates[index].clone()));
+            return selected.map(|(index, _, fixed)| {
+                let (id, signature) = candidates[index].clone();
+                Some((id, signature, fixed))
+            });
         }
+        let forms = candidates
+            .iter()
+            .map(|(_, signature)| {
+                model_candidate_forms(
+                    prover,
+                    analyzer,
+                    &self
+                        .model_context(analyzer)
+                        .with_source(&shape.outcome.file, &source),
+                    &shape.outcome.file,
+                    &source.source,
+                    &written,
+                    signature,
+                    &is_cancelled,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let mut applicable = Vec::new();
         let mut exact = Vec::new();
         let mut undecided = Vec::new();
         let mut failures = Vec::new();
-        for (model_id, signature) in candidates {
-            match model_candidate_applicability(
-                prover,
-                analyzer,
-                &shape.outcome.file,
-                &source.source,
-                &written,
-                signature,
-                &is_cancelled,
-            )? {
+        for ((model_id, signature), applicability) in candidates
+            .iter()
+            .zip(model_selection_applicability(prover, forms))
+        {
+            match applicability {
                 ModelCandidateApplicability::Applicable { exact: is_exact } => {
                     if is_exact {
                         exact.push((model_id, signature));
@@ -2072,14 +2932,14 @@ impl CallConversionCache {
         if let [(model_id, signature)] = exact.as_slice()
             && prover.exact_match_is_best_member()
         {
-            return Ok(Some(((*model_id).clone(), (*signature).clone())));
+            return Ok(Some(((*model_id).clone(), (*signature).clone(), None)));
         }
         // As for a unique layout match (#9981), only a proven rejection removes
         // an overload of a complete family: when every other candidate is
         // rejected, the one undecided candidate is the overload the code calls,
         // and its conversion facts stay typed unknown.
         if let ([], [(model_id, signature)]) = (applicable.as_slice(), undecided.as_slice()) {
-            return Ok(Some(((*model_id).clone(), (*signature).clone())));
+            return Ok(Some(((*model_id).clone(), (*signature).clone(), None)));
         }
         // Several overloads can accept the actuals, as print(String) and
         // print(Object) both accept a String, and a peer's applicability can
@@ -2110,7 +2970,7 @@ impl CallConversionCache {
                         })
                 });
             if let Some((_, selected)) = most_specific {
-                return Ok(Some(selected.clone()));
+                return Ok(Some((selected.0.clone(), selected.1.clone(), None)));
             }
             if is_cancelled() {
                 return Err(ConversionUnknown::Cancelled);
@@ -2119,7 +2979,7 @@ impl CallConversionCache {
         match applicable.as_slice() {
             [_, _, ..] => Err(ConversionUnknown::AmbiguousBinding),
             [(model_id, signature)] if failures.is_empty() => {
-                Ok(Some((model_id.clone(), signature.clone())))
+                Ok(Some((model_id.clone(), signature.clone(), None)))
             }
             _ if failures.windows(2).all(|pair| pair[0] == pair[1]) && !failures.is_empty() => {
                 Err(failures[0])
@@ -2165,9 +3025,12 @@ impl CallConversionCache {
             Err(reason @ ConversionUnknown::Cancelled) => return Err(reason),
             Err(_) => return Ok(false),
         };
-        let applicability = model_candidate_applicability(
+        let forms = model_candidate_forms(
             prover,
             analyzer,
+            &self
+                .model_context(analyzer)
+                .with_source(&shape.outcome.file, &source),
             &shape.outcome.file,
             &source.source,
             &written,
@@ -2175,10 +3038,11 @@ impl CallConversionCache {
             &is_cancelled,
         );
         // A budget stop proves nothing: the binding stands and its conversion
-        // facts report the exhausted budget.
-        match applicability {
-            Ok(applicability) => Ok(matches!(
-                applicability,
+        // facts report the exhausted budget. A member is rejected only when
+        // neither invocation form can apply.
+        match forms {
+            Ok(forms) => Ok(matches!(
+                forms.combined(),
                 ModelCandidateApplicability::Rejected
             )),
             Err(reason @ ConversionUnknown::Cancelled) => Err(reason),
@@ -2254,7 +3118,15 @@ impl CallConversionCache {
         let source = self
             .source(analyzer, &report.file)
             .ok_or(ConversionUnknown::UnresolvedSourceType)?;
-        let invocation_formals = if signature.parameters.iter().any(|formal| formal.variadic) {
+        let invocation_formals = if report.fixed_array_invocation.is_some() {
+            Some(
+                signature
+                    .parameters
+                    .iter()
+                    .map(|formal| formal.r#type.clone())
+                    .collect(),
+            )
+        } else if signature.parameters.iter().any(|formal| formal.variadic) {
             let actuals = report
                 .rows
                 .iter()
@@ -2293,8 +3165,11 @@ impl CallConversionCache {
                     None => &formal.r#type,
                 };
                 let actual = exact_argument_expression(&source, row)?;
-                prover.prove_model_argument(
+                prover.prove_model_argument_with_context(
                     analyzer,
+                    &self
+                        .model_context(analyzer)
+                        .with_source(&report.file, &source),
                     &report.file,
                     actual,
                     &source.source,
@@ -2396,8 +3271,44 @@ mod tests {
     use brokk_bifrost_test_macros::hardwon;
 
     #[test]
+    #[hardwon("#10930: exhausted macro forest rejected primary-tree expressions")]
+    fn exhausted_macro_forest_keeps_primary_expression() {
+        let source: Arc<str> =
+            Arc::from("fn f(value: usize) { ordinary(value); info!(value + 1); }");
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source.as_ref(), None).unwrap();
+        let file = ProjectFile::new(std::env::temp_dir(), "exhausted.rs");
+        let mut parsed = ConversionSource::new(&file, Arc::clone(&source), tree);
+        parsed.embedded = crate::analyzer::structural::spec::EmbeddedSyntaxForest::parse(
+            crate::analyzer::structural_spec_for(crate::analyzer::Language::Rust).unwrap(),
+            parsed.tree.root_node(),
+            &source,
+            0,
+            None,
+        );
+        assert!(matches!(
+            parsed.embedded,
+            Err(crate::analyzer::structural::spec::EmbeddedSyntaxStop::Exceeded)
+        ));
+        let start = source.find("ordinary(value)").unwrap() + "ordinary(".len();
+        assert_eq!(
+            parsed
+                .expression(start, start + "value".len())
+                .unwrap()
+                .kind(),
+            "identifier"
+        );
+        let start = source.find("value + 1").unwrap();
+        assert!(parsed.expression(start, start + "value + 1".len()).is_err());
+    }
+
+    #[test]
     fn projected_types_preserve_complete_identity_and_digest() {
         let complete = RustConversionType::Model {
+            std_identity: None,
             model_set: "active-set".to_owned(),
             symbol: "model::Pair".to_owned(),
             arguments: vec![
@@ -2418,7 +3329,7 @@ mod tests {
         };
         assert_eq!(
             complete.digest().to_string(),
-            "16eae00890cf22d07e56a9bbc35a282478a9f805222f02fa05c0b1aba64fa9c4"
+            "bae338cb7641bed9a55b026f9b07e5bd337005e4a828286dec5767e1001f64ff"
         );
         let roundtrip = RustProjectedType::from(complete.clone())
             .into_complete()
@@ -2444,6 +3355,7 @@ mod tests {
             );
         }
         let partial = RustProjectedType::Model {
+            std_identity: None,
             model_set: "active-set".to_owned(),
             symbol: "model::Pair".to_owned(),
             arguments: vec![RustProjectedType::Unknown(
@@ -2600,6 +3512,7 @@ mod tests {
             })
             .collect();
         CallBindingReport {
+            fixed_array_invocation: None,
             file,
             site_id: "call".to_owned(),
             site_ast_id: "ast".to_owned(),

@@ -76,6 +76,9 @@ pub struct GoDemandContext {
     #[doc(hidden)]
     pub import_packages: HashMap<(SelectedResolutionMountOrdinal, SemanticId), i64>,
     pub(crate) context_completions: HashMap<SelectedResolutionMountOrdinal, ResolutionCompletion>,
+    // File-local binder names, distinct from whether providers are complete.
+    pub(crate) import_name_completions:
+        HashMap<SelectedResolutionMountOrdinal, ResolutionCompletion>,
     #[doc(hidden)]
     /// External binder authority, including source-less GoTool packages.
     pub modeled_imports:
@@ -113,6 +116,17 @@ impl GoDemandContext {
                 );
             }
         }
+        for (mount, completion) in other.import_name_completions {
+            if let Some(previous) = self
+                .import_name_completions
+                .insert(mount, completion.clone())
+            {
+                assert_eq!(
+                    previous, completion,
+                    "one Go file has one import-name inventory"
+                );
+            }
+        }
     }
 }
 
@@ -125,7 +139,7 @@ pub(crate) struct GoPreparedContextCacheKey {
     caller_mount: SelectedResolutionMountOrdinal,
     caller_path: String,
     source_role: String,
-    derivation_version: i64,
+    derivation_identity: [u8; 32],
     active_model_set_hash: Option<String>,
 }
 
@@ -214,6 +228,10 @@ impl SelectedResolutionOperation<'_, '_> {
         assert_eq!(
             base.demand.context_completions,
             full.demand.context_completions
+        );
+        assert_eq!(
+            base.demand.import_name_completions,
+            full.demand.import_name_completions
         );
         let inputs = |context: SelectedResolutionContextSet| {
             let SelectedResolutionContextValidationOutcome::Ready(inputs) = context
@@ -328,7 +346,117 @@ pub struct GoImportDiagnosticBinding {
     pub named_reasons: Vec<(&'static str, Arc<str>)>,
 }
 
+/// Navigation evidence for one native-selected import. Never retained in a cache.
+#[derive(Debug)]
+#[doc(hidden)]
+pub struct GoSelectedImportNamespace {
+    pub import_start_byte: usize,
+    pub import_end_byte: usize,
+    pub provider: GoSelectedImportNamespaceProvider,
+}
+
+#[derive(Debug)]
+#[doc(hidden)]
+pub enum GoSelectedImportNamespaceProvider {
+    Source,
+    External,
+    UnindexedExternal { provider_path: Arc<str> },
+}
+
 impl GoPreparedImportContext {
+    /// Project an already resolved binder through this file's prepared authority.
+    /// A missing value projection never establishes namespace authority.
+    #[doc(hidden)]
+    pub fn selected_import_namespace(
+        &self,
+        answer: &crate::analyzer::resolution::fact_resolution::FactResolutionAnswer,
+        session: &ResolutionSession,
+    ) -> Option<GoSelectedImportNamespace> {
+        if !session.observe_cancellation() {
+            return None;
+        }
+        let [binder] = answer.binding().targets() else {
+            return None;
+        };
+        let mount = SelectedResolutionMountOrdinal::new(binder.ordinal()?);
+        let source = self.demand.import_packages.get(&(mount, *binder));
+        let modeled = self.demand.modeled_imports.get(&(mount, *binder));
+        let unindexed = self.context.identity_space().unindexed_go_import(*binder);
+        if source.is_none() && modeled.is_none() && unindexed.is_none() {
+            return None;
+        }
+        // A selected source package or model/tool provider must have completed
+        // its import resolution before it can name a projection. An import
+        // spelling with no provider row is different: its unindexed frontier is
+        // the external-boundary evidence, and a binder presumed from the path's
+        // last segment is still the selected lexical import.
+        let known_provider = source.is_some() || modeled.is_some();
+        if known_provider && answer.binding().completion() != &ResolutionCompletion::Complete {
+            return None;
+        }
+        let mut selected = None;
+        for descriptor in self.context.go_import_bindings_for_mount(mount) {
+            if !session.scope_step() {
+                return None;
+            }
+            if descriptor.import().definition == *binder && selected.replace(descriptor).is_some() {
+                return None;
+            }
+        }
+        let descriptor = selected?;
+        if known_provider && descriptor.completion() != &ResolutionCompletion::Complete {
+            return None;
+        }
+        let mut source_provider = None;
+        if let Some(package) = source {
+            for row in &self.diagnostic_view.as_ref()?.bindings {
+                if !session.scope_step() {
+                    return None;
+                }
+                if row.provider_package_id != Some(*package) {
+                    continue;
+                }
+                let provider = row.provider_path.as_ref()?;
+                if row.completion != ResolutionCompletion::Complete
+                    || provider.is_empty()
+                    || source_provider.is_some_and(|(path, indexed)| {
+                        path != provider || indexed != row.has_source_declarations
+                    })
+                {
+                    return None;
+                }
+                source_provider = Some((provider, row.has_source_declarations));
+            }
+            source_provider?;
+        }
+        let provider = if source_provider.is_some_and(|(_, indexed)| indexed) {
+            GoSelectedImportNamespaceProvider::Source
+        } else {
+            let unindexed = unindexed.filter(|frontier| frontier.member.is_none())?;
+            if let Some(modeled) = modeled {
+                if !modeled.has_authoritative_provenance()
+                    || modeled.source_spelling != unindexed.provider_path.as_ref()
+                {
+                    return None;
+                }
+                GoSelectedImportNamespaceProvider::External
+            } else if source.is_some() {
+                // A resolved package clause without indexed declarations keeps
+                // the existing import-alias projection.
+                GoSelectedImportNamespaceProvider::External
+            } else {
+                GoSelectedImportNamespaceProvider::UnindexedExternal {
+                    provider_path: unindexed.provider_path.clone(),
+                }
+            }
+        };
+        Some(GoSelectedImportNamespace {
+            import_start_byte: descriptor.import().start_byte,
+            import_end_byte: descriptor.import().end_byte,
+            provider,
+        })
+    }
+
     /// Keep the snapshot's identity allow-list exhaustive, including projections.
     /// Scalar fields have explicit types so they cannot silently become tokens.
     fn assert_go_snapshot_safe(&self) {
@@ -342,6 +470,18 @@ impl GoPreparedImportContext {
             diagnostic_view,
         } = self;
         let identities = context.identity_space();
+        for completion in self.demand.import_name_completions.values() {
+            assert!(
+                match completion {
+                    ResolutionCompletion::Complete => true,
+                    ResolutionCompletion::Incomplete(reasons) => reasons.iter().all(|reason| {
+                        matches!(reason, ResolutionIncompleteReason::UnsupportedSemantic(id)
+                        if identities.named_reason(*id).is_some())
+                    }),
+                },
+                "import-name snapshots retain only canonical named reasons: {completion:?}"
+            );
+        }
         identities.assert_snapshot_fields(|field| {
             use PreparedContextIdentityField::*;
             match field {
@@ -413,7 +553,9 @@ impl GoPreparedImportContext {
                         | ResolutionIncompleteReason::OpenBoundary { .. }
                         | ResolutionIncompleteReason::ReceiverBudgetExhausted(_)
                         | ResolutionIncompleteReason::TimeBudgetExceeded(_)
-                        | ResolutionIncompleteReason::UnmountedFile { .. } => panic!(
+                        | ResolutionIncompleteReason::UnmountedFile { .. }
+                        | ResolutionIncompleteReason::OverlayFrontierUnknown(_)
+                        | ResolutionIncompleteReason::Unclassified(_) => panic!(
                             "request-only completion cannot enter a diagnostic snapshot: {reason:?}"
                         ),
                     }
@@ -433,6 +575,19 @@ impl GoPreparedImportContext {
         source: &dyn BatchResolutionFragmentSource,
         cancellation: &CancellationToken,
     ) -> Result<Option<GoPreparedImportContextSnapshot>> {
+        if let Some(view) = &self.diagnostic_view {
+            for binding in &view.bindings {
+                if let ResolutionCompletion::Incomplete(reasons) = &binding.completion
+                    && reasons
+                        .iter()
+                        .any(|reason| matches!(reason, ResolutionIncompleteReason::Unclassified(_)))
+                {
+                    return Err(StoreError::new(
+                        "reader-local Unclassified completion cannot enter a prepared-context snapshot",
+                    ));
+                }
+            }
+        }
         PreparedContextSnapshot::capture(self, source, cancellation)
     }
 }
@@ -467,6 +622,9 @@ impl PreparedContextPayload for GoPreparedImportContext {
         &mut self,
         remap: &mut dyn FnMut(SemanticId) -> Result<SemanticId>,
     ) -> Result<()> {
+        // Import-name completions contain only the context-local named reasons
+        // checked at capture. Snapshot restore copies that isolated identity
+        // space into an empty request; only bridge shared names need rebinding.
         self.context.remap_shared_names(remap)
     }
 }
@@ -770,6 +928,8 @@ pub(super) struct GoFileImportRow {
     pub(super) source_refusal: Option<super::super::go_package_context::GoSourceImportRefusal>,
     /// A missing or nameless tool provider has no authoritative package clause.
     pub(super) package_name: Option<String>,
+    /// A nonempty tool name alone cannot certify an incomplete provider.
+    pub(super) package_name_complete: bool,
     /// Retained as provider evidence even when its package clause is unknown.
     pub(super) package_id: Option<i64>,
     pub(super) modeled_provider: Option<GoSelectedExternalImport>,
@@ -839,7 +999,7 @@ impl GoImportInputCache {
 
     #[doc(hidden)]
     pub fn is_empty(&self) -> bool {
-        self.mounts.is_empty()
+        self.mounts.is_empty() && self.selected.is_empty()
     }
 }
 
@@ -1165,7 +1325,7 @@ impl SelectedResolutionOperation<'_, '_> {
                     snapshot.generation.get(),
                     snapshot.revision,
                     base,
-                    super::super::go_package_context::DERIVATION_VERSION,
+                    super::super::go_package_context::derivation_identity(),
                     dir
                 ],
                 |row| {
@@ -1367,12 +1527,12 @@ impl SelectedResolutionOperation<'_, '_> {
             return Ok(GoPreparedImportContextOutcome::Ready(Box::new(full)));
         }
         key.stage = stage;
-        // Keep non-ready outcomes outside the memo. Ordinary read admission
-        // retains a completed preparation even if cancellation prevents its
-        // optional cross-request snapshot at the end of the derivation.
+        // Keep non-ready outcomes outside the memo. Snapshots are separately
+        // admitted; request preparation checks cancellation and deadline again
+        // before inserting its completed value into the request memo.
         let mut outcome = GoPreparedImportContextOutcome::Unavailable;
         let mut inventory_recorded = false;
-        let prepared = self.go_prepared_contexts.read(key, |_| {
+        let prepared = self.go_prepared_contexts.prepare(key, cancellation, || {
             let Some(selection) = self.go_context_selection(context_id, source_role)? else {
                 return Ok(None);
             };
@@ -1384,7 +1544,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 caller_mount: source.ordinal(),
                 caller_path: path.to_owned(),
                 source_role: source_role.to_owned(),
-                derivation_version: super::super::go_package_context::DERIVATION_VERSION,
+                derivation_identity: super::super::go_package_context::derivation_identity(),
                 active_model_set_hash: self
                     .ready
                     .model_authority()
@@ -1446,6 +1606,11 @@ impl SelectedResolutionOperation<'_, '_> {
             }
         })?;
         if let Some(context) = prepared {
+            // prepare can return a completed value without admitting it.
+            // Ready consumers attach projections to the admitted memo entry.
+            if cancellation.is_cancelled() || cancellation.soft_deadline_passed() {
+                return Ok(GoPreparedImportContextOutcome::Cancelled);
+            }
             if !inventory_recorded {
                 self.record_go_package_inventory_state(&context.package_inventory);
             }
@@ -1719,6 +1884,7 @@ impl SelectedResolutionOperation<'_, '_> {
                         gaps,
                         source_refusal,
                         package_name,
+                        package_name_complete: row.get::<_, Option<bool>>(14)? == Some(true),
                         package_id,
                         modeled_provider,
                         has_source_declarations,
@@ -1970,6 +2136,20 @@ impl SelectedResolutionOperation<'_, '_> {
         let mut bindings = Vec::new();
         let mut import_packages = HashMap::default();
         let mut modeled_imports = HashMap::default();
+        // The strict source-import publication was read above. Every ordinary
+        // import must have a native binder before absence can prove NotImport.
+        let covered_imports: HashSet<_> = inputs
+            .bindings
+            .values()
+            .map(|row| row.source_import)
+            .collect();
+        if imports.iter().enumerate().any(|(index, import)| {
+            !matches!(import.alias.as_deref(), Some("_" | "."))
+                && (!covered_imports.contains(&index) || import.path.is_none())
+        }) {
+            return Ok(GoPreparedImportContextOutcome::Unavailable);
+        }
+        let mut import_name_completion = ResolutionCompletion::Complete;
         for row in inputs.bindings.into_values() {
             if cancellation.is_cancelled() {
                 return Ok(GoPreparedImportContextOutcome::Cancelled);
@@ -2018,6 +2198,23 @@ impl SelectedResolutionOperation<'_, '_> {
                     !matches!(import_completion, ResolutionCompletion::Complete),
                     "a presumed binder requires an unresolved provider"
                 );
+            }
+            // An incomplete provider can retain a nonempty tool package name.
+            // Only provider completeness certifies that name; importer errors
+            // do not weaken a fully known provider's declared name.
+            if import.alias.is_none()
+                && (presumed
+                    || (package_name.is_some()
+                        && !selected.is_some_and(|row| row.package_name_complete))
+                    || (modeled_provider.is_some()
+                        && import_completion != ResolutionCompletion::Complete))
+            {
+                assert_ne!(
+                    import_completion,
+                    ResolutionCompletion::Complete,
+                    "an unproved import name has an existing provider obligation"
+                );
+                import_name_completion = import_name_completion.combine(&import_completion);
             }
             diagnostic_view
                 .bindings
@@ -2082,6 +2279,10 @@ impl SelectedResolutionOperation<'_, '_> {
             context_id,
             import_packages,
             modeled_imports,
+            import_name_completions: HashMap::from_iter([(
+                source.ordinal(),
+                import_name_completion,
+            )]),
             context_completions: HashMap::from_iter([(
                 source.ordinal(),
                 context.inventory_completion().clone(),
@@ -2410,25 +2611,24 @@ FROM go_context_domain_modules m
 JOIN go_context_publications c ON c.context_id=m.context_id
 JOIN go_context_selections s ON s.selection_id=c.selection_id
 WHERE m.module_dir=?6 AND s.workspace_id=?1 AND s.lang='go' AND s.generation=?2
-  AND s.base_profile_digest=?4 AND s.derivation_version=?5
+  AND s.base_profile_digest=?4 AND s.derivation_identity=?5
   AND c.valid_from<=?3 AND (c.valid_until IS NULL OR ?3<c.valid_until)
 "#;
 
 impl super::super::cache_budget::RetainedBytes for GoPreparedContextCacheKey {
     fn retained_bytes(&self) -> usize {
         std::mem::size_of_val(self)
-            + self.caller_path.capacity()
-            + self.source_role.capacity()
-            + self
-                .active_model_set_hash
-                .as_ref()
-                .map_or(0, String::capacity)
+            + brokk_bifrost_core::allocation_size::allocation_size(self.caller_path.capacity())
+            + brokk_bifrost_core::allocation_size::allocation_size(self.source_role.capacity())
+            + self.active_model_set_hash.as_ref().map_or(0, |value| {
+                brokk_bifrost_core::allocation_size::allocation_size(value.capacity())
+            })
     }
 }
 
 impl super::super::cache_budget::RetainedBytes for GoPreparedImportContextSnapshot {
     fn retained_bytes(&self) -> usize {
-        let mut heap = super::super::cache_budget::RetainedHeap::default();
+        let mut heap = super::super::cache_budget::RetainedHeap::allocated();
         heap.add(std::mem::size_of_val(self));
         assert!(
             self.payload.blueprint.is_none(),
@@ -2442,12 +2642,16 @@ impl super::super::cache_budget::RetainedBytes for GoPreparedImportContextSnapsh
         for completion in demand.context_completions.values() {
             completion.charge_retained(&mut heap);
         }
+        heap.map(&demand.import_name_completions);
+        for completion in demand.import_name_completions.values() {
+            completion.charge_retained(&mut heap);
+        }
         heap.map(&demand.modeled_imports);
         for provider in demand.modeled_imports.values() {
             heap.add(
-                provider.source_spelling.capacity()
-                    + provider.import_path.capacity()
-                    + provider.package_name.capacity(),
+                heap.allocation_bytes(provider.source_spelling.capacity())
+                    + heap.allocation_bytes(provider.import_path.capacity())
+                    + heap.allocation_bytes(provider.package_name.capacity()),
             );
             match &provider.provenance {
                 GoExternalPackageProvenance::GoTool {
@@ -2456,9 +2660,13 @@ impl super::super::cache_budget::RetainedBytes for GoPreparedImportContextSnapsh
                     module_version,
                 } => {
                     heap.add(
-                        provider_kind.capacity()
-                            + module_path.as_ref().map_or(0, String::capacity)
-                            + module_version.as_ref().map_or(0, String::capacity),
+                        heap.allocation_bytes(provider_kind.capacity())
+                            + module_path
+                                .as_ref()
+                                .map_or(0, |value| heap.allocation_bytes(value.capacity()))
+                            + module_version
+                                .as_ref()
+                                .map_or(0, |value| heap.allocation_bytes(value.capacity())),
                     );
                 }
                 GoExternalPackageProvenance::SemanticModel {
@@ -2468,10 +2676,10 @@ impl super::super::cache_budget::RetainedBytes for GoPreparedImportContextSnapsh
                     record_id,
                 } => {
                     heap.add(
-                        symbol_id.capacity()
-                            + pack_id.capacity()
-                            + pack_digest.capacity()
-                            + record_id.capacity(),
+                        heap.allocation_bytes(symbol_id.capacity())
+                            + heap.allocation_bytes(pack_id.capacity())
+                            + heap.allocation_bytes(pack_digest.capacity())
+                            + heap.allocation_bytes(record_id.capacity()),
                     );
                 }
             }
@@ -2479,11 +2687,17 @@ impl super::super::cache_budget::RetainedBytes for GoPreparedImportContextSnapsh
         heap.vec(&self.payload.source_import_refusals);
         for refusal in &self.payload.source_import_refusals {
             heap.add(
-                refusal.importer.capacity()
-                    + refusal.spelling.capacity()
-                    + refusal.role.capacity()
-                    + refusal.directory.as_ref().map_or(0, String::capacity)
-                    + refusal.module_manifest.as_ref().map_or(0, String::capacity),
+                heap.allocation_bytes(refusal.importer.capacity())
+                    + heap.allocation_bytes(refusal.spelling.capacity())
+                    + heap.allocation_bytes(refusal.role.capacity())
+                    + refusal
+                        .directory
+                        .as_ref()
+                        .map_or(0, |value| heap.allocation_bytes(value.capacity()))
+                    + refusal
+                        .module_manifest
+                        .as_ref()
+                        .map_or(0, |value| heap.allocation_bytes(value.capacity())),
             );
             heap.vec(&refusal.candidates);
             heap.vec(&refusal.declared_names);
@@ -2492,7 +2706,7 @@ impl super::super::cache_budget::RetainedBytes for GoPreparedImportContextSnapsh
                     .candidates
                     .iter()
                     .chain(&refusal.declared_names)
-                    .map(String::capacity)
+                    .map(|value| heap.allocation_bytes(value.capacity()))
                     .sum(),
             );
         }
@@ -2501,10 +2715,13 @@ impl super::super::cache_budget::RetainedBytes for GoPreparedImportContextSnapsh
             heap.vec(&view.bindings);
             for binding in &view.bindings {
                 heap.add(
-                    binding.local_name.capacity()
-                        + binding.source_spelling.capacity()
-                        + binding.completion_display.capacity()
-                        + binding.provider_path.as_ref().map_or(0, String::capacity),
+                    heap.allocation_bytes(binding.local_name.capacity())
+                        + heap.allocation_bytes(binding.source_spelling.capacity())
+                        + heap.allocation_bytes(binding.completion_display.capacity())
+                        + binding
+                            .provider_path
+                            .as_ref()
+                            .map_or(0, |value| heap.allocation_bytes(value.capacity())),
                 );
                 binding.completion.charge_retained(&mut heap);
                 heap.vec(&binding.named_reasons);
@@ -2514,7 +2731,10 @@ impl super::super::cache_budget::RetainedBytes for GoPreparedImportContextSnapsh
             }
             heap.vec(&view.source_authority_gaps);
             for gap in &view.source_authority_gaps {
-                heap.add(gap.code.capacity() + gap.file.capacity());
+                heap.add(
+                    heap.allocation_bytes(gap.code.capacity())
+                        + heap.allocation_bytes(gap.file.capacity()),
+                );
             }
         }
         heap.total()
@@ -2680,6 +2900,7 @@ mod snapshot_tests {
                     context_id: 1,
                     import_packages: HashMap::default(),
                     context_completions: HashMap::default(),
+                    import_name_completions: HashMap::default(),
                     modeled_imports: HashMap::default(),
                 },
                 source_import_refusals: Vec::new(),

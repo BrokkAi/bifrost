@@ -28,6 +28,16 @@ the source itself.
 Artifact validity, applicability, declaration binding, and behavioral
 completeness are recorded independently.
 
+An exact closed Rust receiver can select one nongeneric inherent declaration
+without establishing its external body's effects. Call-binding results name
+this proof `resolver_declaration`; `selector_exact` certifies declaration
+selection and formal mapping. Runtime dispatch completeness remains on the
+separate dispatch fields. Structured source projections still validate the
+selected declaration's return type, and traversal still needs admitted
+summaries or native effects. Generic owners whose declaring impl conditions
+are unavailable remain refused.
+
+
 A partial procedure summary may declare positive transfers without claiming to
 enumerate all effects. Once exactly bound to a call, those transfers coexist
 with the call's ordinary dispatch and unmodeled residual. Their proof comes
@@ -39,9 +49,9 @@ transfer edge.
 
 A usable procedure summary must bind to a callable identity; display names are
 presentation data. Depending on the language, that identity can include an
-owner, namespace or module route, declaration kind, receiver presence, arity
-and formal positions, signature information, and source or dependency artifact
-identity.
+owner, namespace or module route, declaration kind, receiver presence, the
+declared receiver type of an extension method, arity and formal positions,
+signature information, and source or dependency artifact identity.
 
 Binding requires:
 
@@ -248,14 +258,54 @@ replacement for a superseded warm. Publication checks the semantic-pack state
 and source snapshot pointers under `session.write`; input changes invalidate
 those pointers, so an older warm cannot publish authority for a newer snapshot.
 
-An unpinned Rust workspace explicitly requests approximate standard-library
-facts. Shared activation chooses the newest available `bifrost.rust-stdlib`
+A Rust workspace without a toolchain file, or with the supported plain channel
+but no known build target, can request approximate standard-library facts. A
+known plain pin first matches target-free packs strictly, retaining exact version
+evidence. Target-bound packs require a configured Cargo `build.target` or a full
+toolchain name with a known host suffix for exact activation. Approximate fallback
+for a known pin is limited to an otherwise matching selector with a missing
+target; version or explicit target mismatches remain refused. The analyzer's own build target is not toolchain evidence.
+Multiple configured targets cannot share exact target-bound activation in one
+workspace-wide overlay. A single explicit target is exact when it equals the
+known host, or when a census of all indexed Rust units proves there are no host
+units. Build scripts, proc macros and unknown unit kinds otherwise require
+approximate target-bound activation, with a `MixedCompileContexts` diagnostic.
+Target-free packs retain strict version matching. A workspace-wide exact target
+row also requires agreement across acquired member invocation contexts. Different
+member targets produce `MixedCompileContexts`; unreadable or unclassifiable
+configuration produces `BuildModeUnknown`. Rebuilding std through
+`unstable.build-std` produces `StdlibRebuilt` and withholds exact target-bound
+activation. Established prebuilt mode adds no build-mode condition.
+
+Exact identity reflects the acquired workspace, ancestor and Cargo-home layers,
+including canonically contained includes. User build-process overrides remain
+unobserved; server environment facts do not establish the caller's build shell.
+Shared activation chooses the newest available `bifrost.rust-stdlib`
 pack by semantic pack version, retaining engine compatibility and review
 controls. It records `approximate` in activation provenance and policy runs
 publish an advisory naming the selected pack and version. This does not supply
 an observed compiler version or artifact digest, or certify a complete exact
-dependency boundary. A declared toolchain pin that
+dependency boundary. Approximate activation never certifies exact callable-family
+completeness or verified generated origin. The existing distributed approximate
+artifact hold remains in effect. A declared toolchain pin that
 does not match a pack never falls back to approximate activation.
+
+A rustdoc document names other documents' items by ID, and an ID with no
+declaration mapping projects to Unknown rather than binding by spelling.
+Cross-document references among `core`, `alloc` and `std` resolve to declared
+targets only when the pack producer has verified that each document is a
+member of one toolchain's `rust-docs-json` archive. The producer checks the
+archive digest before decompressing it and checks each selected path and
+crate. It then writes a typed verified sysroot receipt into the pack's
+extraction metadata: per document, the path, toolchain release (exact semver,
+with channel checked against it), compiler date, commit, component, target,
+archive digest and member. The receipt is part of the pack's content digests
+and so of the active model set's identity. The compiler and loader refuse a
+receipt in an authored or curated pack. Pin specifications record a typed
+origin per document; version-2 pins read as dependency origins, which carry no
+sysroot authority. A hierarchy edge whose target still contains an Unknown
+component is not emitted, and its owner's implemented-trait inventory stays
+open, so the missing edge never proves absence.
 
 The selected stdlib also supplies one assumed Rust toolchain version for enabled
 companion packs. This is the unique exact Rust version named by selectors on
@@ -289,6 +339,24 @@ Incompleteness that the recorded inputs determine is carried with its truncated 
 When a language's own reconcile has already run discovery for an update, activation consumes that captured result instead of running discovery again.
 
 The provider identity includes one digest of the evidence that consumers read, the declared modules and the truncated flag of each language. So products built from different evidence never replay against each other.
+
+### Reusing complete activation within one generation
+
+A repeated request against the same immutable analyzer generation reuses a complete dependency activation instead of running discovery again. Reuse requires the pre-discovery activation key to match, no captured discovery to still be pending publication, every recorded external read to still match, and the retained Ready snapshot to remain the published one. Project membership and project reads are fixed for the generation, so those inputs cannot change. Partial, cancelled and configured Python-runtime activations reactivate. The update carry below is the cross-generation counterpart: it separately proves the new generation's inputs after discovery.
+
+### The published overlay across an update
+
+Every reader gets the selected models from one accessor on the analyzer. It answers one of three states: published, pending, or not selected. A pending answer is typed incompleteness (`semantic_models_pending`) that every query in the request records. Absence of an overlay is never read as "no models apply".
+
+A workspace update starts with no published overlay on the new snapshot. It carries the previous publication over only when the activation key is equal and the changed paths meet three conditions. No changed path equals, contains or lies inside the workspace model directory. No changed path equals, contains or lies inside a workspace path the published overlay was authored from, including the anchors of a row-backed overlay. Every changed spelling can be certified. Otherwise the new snapshot stays pending, and the existing coalesced background warm publishes the replacement. An update never rebuilds an activation synchronously. Once an update has gone pending, a later unrelated edit does not make the older publication reusable again.
+
+A change event can name only a directory: a renamed `.bifrost`, or a renamed directory that holds an authored source. So the comparison runs in both directions, component by component, and never on string prefixes (`.bifrost2` does not touch `.bifrost`). One helper, `ChangedPaths` in `bifrost-core`, owns that relation. The carry proof and the MCP check that decides whether an update refreshes the global pack inputs both call it. The proof scans every authored path of the overlay and never stops at a count. If a row-backed read cannot finish (an open family, cancellation or a budget stop), the scan answers that a path is touched, so carry is refused.
+
+A changed spelling is certified when it is a member of the exact post-update workspace listing. Any other spelling (a deleted path, a directory, an ignored or omitted entry, or an alias) is compared a second time with case folded. A spelling with an existing symlink among its ancestors refuses carry for every authored path, because the project cannot say which file the link reached. The MCP check has no project view to certify against, so it compares every spelling both exactly and with case folded. An uncertified spelling also leaves the overlay pending, and the pending branch of the update then refreshes the activation.
+
+The retained publication state is in memory and bounded by the session's retention budget. It adds no persisted identity or schema.
+
+A source block records whether its text came from the workspace or from a semantic model. Only workspace-origin blocks can make a request refresh workspace files. A model's authored location is not a workspace path, even when its spelling matches one.
 
 ## CSMI interoperability
 

@@ -105,6 +105,32 @@ impl<S> RubyScopeStack<S> {
         })
     }
 
+    /// Whether the innermost method is defined directly in a class or module
+    /// body that resolved to an owner, or in a `class << self` body directly
+    /// inside one: then the receiver side and the last lexical owner name
+    /// the method's owner. A method in a block, a nested method, or a body
+    /// that did not resolve is not.
+    pub fn method_in_resolved_type_body(&self) -> bool {
+        let mut frames = self
+            .frames
+            .iter()
+            .rev()
+            .skip_while(|frame| matches!(frame, RubyScopeFrame::Block));
+        if !matches!(frames.next(), Some(RubyScopeFrame::Method { .. })) {
+            return false;
+        }
+        match frames.next() {
+            Some(RubyScopeFrame::Type { owner, .. }) => *owner,
+            Some(RubyScopeFrame::SingletonClass { .. }) => {
+                matches!(
+                    frames.next(),
+                    Some(RubyScopeFrame::Type { owner: true, .. })
+                )
+            }
+            _ => false,
+        }
+    }
+
     /// The receiver side of the innermost method body; a `class << self` body
     /// counts as class side.
     pub fn method_mode(&self) -> Option<ReceiverMode> {

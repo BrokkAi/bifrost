@@ -948,6 +948,46 @@ impl<T> Wrapper<T> { pub fn second(&self) {} }
             assert!(resolution.is_none(), "Some is not a local binding");
         }
         #[test]
+        #[hardwon("#11830: struct-literal values and shorthand were refused lexical resolution")]
+        fn struct_field_value_lexical_resolution() {
+            use brokk_bifrost_analysis::analyzer::lexical_definitions::{
+                LexicalBindingResolution,
+                resolve_lexical_binding_from_focus_with_visibility as resolve,
+            };
+            let source = "struct Foo { x: u32, f: Option<u32> } fn outer() { let x = 1; Foo { x }; Foo { f: x }; Foo { f: Some(x) }; let Foo { x: y } = value; }";
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_rust::LANGUAGE.into())
+                .unwrap();
+            let tree = parser.parse(source, None).unwrap();
+            let mut stack = vec![tree.root_node()];
+            let mut uses = 0;
+            let mut names = 0;
+            while let Some(node) = stack.pop() {
+                if source.get(node.byte_range()) == Some("x") {
+                    let result = resolve(Language::Rust, node, source, node.start_byte(), "x");
+                    if node.kind() == "identifier"
+                        && node.start_byte() > source.find("Foo { x }").unwrap()
+                    {
+                        assert!(
+                            matches!(result, Ok(Some(LexicalBindingResolution::OtherLocal(_)))),
+                            "{:?}: {result:?}",
+                            node
+                        );
+                        uses += 1;
+                    } else if node.kind() == "field_identifier" {
+                        assert!(result.is_err(), "field names refuse lexical resolution");
+                        names += 1;
+                    }
+                }
+                let mut cursor = node.walk();
+                stack.extend(node.named_children(&mut cursor));
+            }
+            assert_eq!(uses, 3);
+            assert_eq!(names, 2);
+        }
+
+        #[test]
         fn parsed_rust_ambiguous_bound_head_is_not_a_proven_union() {
             let fixture = parsed_rust_fixture(
                 r#"
@@ -1187,6 +1227,167 @@ fn invoke(value: Selected) { value.run(); }
                 .references_to(contract, &CancellationToken::new())
                 .unwrap();
             assert_eq!(reverse.references().len(), 2, "{reverse:?}");
+        }
+    }
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#12364: adding build.rs carried exact cross-target stdlib evidence past its host-unit census"
+)]
+fn rust_source_membership_invalidates_the_stdlib_host_unit_census() {
+    use brokk_bifrost_analysis::analyzer::semantic_model::{
+        CatalogOptions, SemanticModelActivationRequest, SemanticPackCatalog,
+    };
+    use brokk_bifrost_analysis::analyzer::workspace::{
+        DependencyPackWorkspaceContext, WorkspaceAnalyzer,
+    };
+    use brokk_bifrost_analysis::{CancellationToken, DependencyPackEcosystem};
+    use brokk_bifrost_core::analyzer::config::AnalyzerConfig;
+    use brokk_bifrost_core::analyzer::project::TestProject;
+    use brokk_bifrost_core::analyzer::{Language, ProjectFile};
+    use std::{collections::BTreeSet, fs, sync::Arc};
+
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir_all(root.path().join("src")).unwrap();
+    fs::create_dir_all(root.path().join(".cargo")).unwrap();
+    for (path, text) in [
+        ("src/lib.rs", "pub fn local() {}\n"),
+        (
+            "Cargo.toml",
+            "[package]\nname='app'\nversion='0.1.0'\nedition='2021'\n",
+        ),
+        (
+            "Cargo.lock",
+            "version=3\n[[package]]\nname='app'\nversion='0.1.0'\n",
+        ),
+        (
+            "rust-toolchain.toml",
+            "[toolchain]\nchannel='nightly-2026-08-24-x86_64-unknown-linux-gnu'\n",
+        ),
+        (
+            ".cargo/config.toml",
+            "[build]\ntarget='aarch64-unknown-linux-gnu'\n",
+        ),
+    ] {
+        fs::write(root.path().join(path), text).unwrap();
+    }
+    let config = AnalyzerConfig::default();
+    let build = || {
+        // This small hermetic regression deliberately owns a disposable store.
+        WorkspaceAnalyzer::build_ephemeral_for_languages_footgun(
+            Arc::new(TestProject::new(root.path().to_path_buf(), Language::Rust)),
+            config.clone(),
+            &BTreeSet::from([Language::Rust]),
+        )
+        .unwrap()
+    };
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    // A tiny, explicitly test-only installed pack makes discovery publishable;
+    // without one the missing-pack acquisition is pending and nothing carries.
+    let pack = brokk_bifrost_analysis::test_support::compile_semantic_pack_fixture(
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version":22, "pack_id":"bifrost.rust-stdlib", "version":"0.0.0",
+            "producer":{"name":"test-only-census", "version":"0.0.0"},
+            "language":"rust", "ecosystem":"cargo", "compatibility":{"toolchains":[{"name":"rust","requirement":"=1.100.0-nightly"}]},
+            "provenance":{"source":"test-only stdlib census invalidation"},
+            "license":"NOASSERTION", "completeness":"complete",
+            "safety":{"generated_code_only":true,"review_required":false},
+            "shards":[{"id":"test.declarations", "activation":[{"toolchain":{"name":"rust","version":"=1.100.0-nightly"}}],
+                "payload":{"kind":"declaration_facts", "types":[{
+                    "id":"type.test.std", "name":"std", "type_kind":"module", "visibility":"public",
+                    "locator":{"kind":"artifact","path":"std.json","symbol":"std"}
+                }], "members":[], "relations":[]}}]
+        })).unwrap(),
+    );
+    brokk_bifrost_analysis::test_support::install_pre_shipped_semantic_pack(
+        &catalog,
+        &pack,
+        "test-only-census",
+    );
+    let request = SemanticModelActivationRequest {
+        bifrost_version: "0.0.0".parse().unwrap(),
+        approximate_standard_libraries: Vec::new(),
+        evidence: Vec::new(),
+        controls: Vec::new(),
+        limits: Default::default(),
+    };
+    let cancellation = CancellationToken::new();
+    let activate = |workspace: &WorkspaceAnalyzer| {
+        let mut result = workspace.activate_installed_dependency_packs(
+            &config,
+            &[DependencyPackEcosystem::Cargo],
+            DependencyPackWorkspaceContext {
+                catalog: &catalog,
+                persistence: None,
+                activation: &request,
+                limits: Default::default(),
+                cancellation: &cancellation,
+            },
+        );
+        assert!(
+            result.pending.is_empty(),
+            "fixture must publish discovery: {result:#?}"
+        );
+        let discovery = result.outcome.ecosystems.remove(0).discovery;
+        let target = discovery
+            .dependencies
+            .iter()
+            .find(|row| row.id.starts_with("rust:stdlib:"))
+            .unwrap()
+            .evidence
+            .target
+            .clone();
+        let approximate = discovery
+            .standard_library_pack_expectations()
+            .next()
+            .unwrap()
+            .approximate;
+        let mixed = discovery
+            .diagnostics
+            .iter()
+            .any(|entry| entry.code == "rust.stdlib.mixed_compile_contexts");
+        (target, approximate, mixed)
+    };
+    let mut workspace = build();
+    assert_eq!(
+        activate(&workspace),
+        (Some("aarch64-unknown-linux-gnu".into()), false, false)
+    );
+    // Editing a body does not change the census membership or stale Cargo.
+    fs::write(root.path().join("src/lib.rs"), "pub fn edited() {}\n").unwrap();
+    workspace = workspace.update(&BTreeSet::from([ProjectFile::new(
+        root.path().to_path_buf(),
+        "src/lib.rs",
+    )]));
+    assert!(workspace.stale_dependency_ecosystems().is_empty());
+    for present in [true, false] {
+        if present {
+            fs::write(root.path().join("build.rs"), "fn main() {}\n").unwrap();
+        } else {
+            fs::remove_file(root.path().join("build.rs")).unwrap();
+        }
+        workspace = workspace.update(&BTreeSet::from([ProjectFile::new(
+            root.path().to_path_buf(),
+            "build.rs",
+        )]));
+        assert_eq!(
+            workspace.stale_dependency_ecosystems(),
+            vec![DependencyPackEcosystem::Cargo]
+        );
+        let incremental = activate(&workspace);
+        assert_eq!(
+            incremental,
+            activate(&build()),
+            "build.rs present={present}"
+        );
+        if present {
+            assert_eq!(incremental, (None, true, true));
+        } else {
+            assert_eq!(
+                incremental,
+                (Some("aarch64-unknown-linux-gnu".into()), false, false)
+            );
         }
     }
 }

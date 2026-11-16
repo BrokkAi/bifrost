@@ -38,14 +38,13 @@ WITH RECURSIVE selected_members(
  workspace_id, generation, summary_id, member_ordinal, blob_id
 ) AS MATERIALIZED (
  SELECT owner.workspace_id, owner.generation, owner.summary_id,
-        member.member_ordinal, member.blob_id
+        member.member_ordinal, (SELECT attachment.blob_id FROM temp.selected_unit_member_blobs AS attachment WHERE attachment.summary_id=member.summary_id AND attachment.member_ordinal=member.member_ordinal)
  FROM selected_workspace_file_versions AS files
  CROSS JOIN main.blobs AS blob
   ON blob.lang=files.lang AND blob.blob_oid=files.blob_oid AND blob.parse_variant=files.parse_variant
  AND blob.generation=files.generation
  CROSS JOIN main.resolution_unit_summary_members AS member
-  INDEXED BY resolution_unit_summary_members_blob
-  ON member.blob_id=blob.id AND member.rel_path=files.rel_path
+  ON (SELECT attachment.blob_id FROM temp.selected_unit_member_blobs AS attachment WHERE attachment.summary_id=member.summary_id AND attachment.member_ordinal=member.member_ordinal)=blob.id AND member.rel_path=files.rel_path
  CROSS JOIN selected_rust_unit_summaries AS owner
   ON owner.summary_id=member.summary_id
  WHERE files.lang='rust' AND files.rel_path=?1
@@ -120,6 +119,7 @@ WITH RECURSIVE selected_members(
   ON member.summary_id=export.summary_id
  AND member.member_ordinal=export.declaration_member_ordinal
  CROSS JOIN source_native_declaration_bridges AS bridge
+  -- Rust-only derived-from blob until #11183 M3 converts Rust child rows
   ON bridge.blob_id=member.blob_id AND bridge.source_site=export.declaration_site
 )
 SELECT rel_path, declaration_id, local_extent, is_glob
@@ -143,12 +143,11 @@ CROSS JOIN source_rust_import_targets AS import
   ON import.blob_id=scope.blob_id AND import.native_scope=scope.source_scope
  AND import.bound_name=identity.spelling AND import.is_glob=0
 CROSS JOIN main.resolution_unit_summary_members AS member
-  INDEXED BY resolution_unit_summary_members_blob
-  ON member.blob_id=mount.blob_id AND member.rel_path=mount.persisted_relative_path
+  ON (SELECT attachment.blob_id FROM temp.selected_unit_member_blobs AS attachment WHERE attachment.summary_id=member.summary_id AND attachment.member_ordinal=member.member_ordinal)=mount.blob_id AND member.rel_path=mount.persisted_relative_path
 CROSS JOIN selected_rust_unit_summary_route_owners AS owner
   ON owner.summary_id=member.summary_id AND owner.workspace_id=mount.workspace_id
  AND owner.generation=mount.generation
-JOIN main.rust_unit_summary_placements AS placement
+JOIN temp.rust_unit_summary_placements AS placement
   ON placement.summary_id=member.summary_id
  AND placement.member_ordinal=member.member_ordinal
 CROSS JOIN main.rust_resolution_unit_summary_gaps AS gap
@@ -189,12 +188,45 @@ SELECT units.unit_key
  CROSS JOIN main.rust_resolution_unit_summary_contexts AS contexts
   ON contexts.summary_id=units.summary_id
  WHERE contexts.target_kind='detached'";
-pub(super) const FILE_CRATES: &str = "SELECT units.unit_key
+/// Whether configuration alone can certify cfg-dependent decisions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RustCfgAuthority {
+    Configuration,
+    IncompleteBuildScript,
+}
+#[derive(Clone, Debug)]
+pub struct RustConfigurationTarget {
+    pub manifest_path: String,
+    pub target_kind: String,
+    pub target_name: String,
+    pub cfg_authority: RustCfgAuthority,
+}
+#[derive(Clone, Debug)]
+pub struct RustFileConfigurationTargets {
+    pub targets: Vec<RustConfigurationTarget>,
+    pub membership_complete: bool,
+}
+
+pub(super) const FILE_CRATES: &str = "SELECT units.unit_key, manifest.rel_path, contexts.target_kind, contexts.crate_name,
+ EXISTS(SELECT 1 FROM selected_rust_unit_summaries build
+ JOIN main.rust_resolution_unit_summary_contexts build_context ON build_context.summary_id=build.summary_id
+ WHERE build.manifest_file_version_id=units.manifest_file_version_id AND build_context.target_kind='build')
  FROM main.resolution_unit_summary_members AS members
-  INDEXED BY resolution_unit_summary_members_blob
  CROSS JOIN selected_rust_unit_summaries AS units
   ON units.summary_id=members.summary_id
- WHERE members.blob_id=?1 AND members.rel_path=?2
+ JOIN main.rust_resolution_unit_summary_contexts contexts ON contexts.summary_id=units.summary_id
+ LEFT JOIN main.workspace_file_versions manifest ON manifest.file_version_id=units.manifest_file_version_id
+ WHERE (SELECT attachment.blob_id FROM temp.selected_unit_member_blobs AS attachment WHERE attachment.summary_id=members.summary_id AND attachment.member_ordinal=members.member_ordinal)=?1 AND members.rel_path=?2
+ -- A persisted membership compiles the file only while one of its placements
+ -- survives the selected module graph.
+ AND (NOT EXISTS (SELECT 1 FROM main.resolution_unit_summary_placements AS persisted
+                  WHERE persisted.summary_id=members.summary_id AND persisted.member_ordinal=members.member_ordinal)
+      OR EXISTS (SELECT 1 FROM main.resolution_unit_summary_placements AS persisted
+                 WHERE persisted.summary_id=members.summary_id AND persisted.member_ordinal=members.member_ordinal
+                   AND NOT EXISTS (SELECT 1 FROM temp.selected_rust_unplaced_placements AS unplaced
+                                   WHERE unplaced.summary_id=persisted.summary_id
+                                     AND unplaced.container_path=persisted.container_path
+                                     AND unplaced.member_ordinal=persisted.member_ordinal)))
  ORDER BY units.unit_key";
 /// Enumerate a crate and its workspace dependency crates from live summaries.
 /// Rust placements supply the module path/scope route; the shared member row
@@ -216,11 +248,12 @@ CROSS JOIN selected_rust_unit_closure AS graph ON graph.root_unit_key=root.unit_
 CROSS JOIN selected_rust_unit_summaries AS units ON units.summary_id=graph.summary_id
 CROSS JOIN main.rust_resolution_unit_summary_contexts AS contexts
   ON contexts.summary_id=graph.summary_id
-CROSS JOIN main.rust_unit_summary_placements AS placement
+CROSS JOIN temp.rust_unit_summary_placements AS placement
   ON placement.summary_id=graph.summary_id AND placement.scope_ordinal IS NOT NULL
 CROSS JOIN selected_rust_unit_members AS members
   ON members.summary_id=placement.summary_id
  AND members.member_ordinal=placement.member_ordinal
+-- Rust-only derived-from blob until #11183 M3 converts Rust child rows
 CROSS JOIN source_rust_module_scopes AS scopes
   ON scopes.blob_id=members.blob_id AND scopes.ordinal=placement.scope_ordinal
 LEFT JOIN temp.selected_resolution_mounts AS mount
@@ -237,6 +270,7 @@ pub(super) const MODULE_PLACEMENTS: &str = "SELECT topology_id, container_path, 
 pub(super) const NAMED: &str =
     "SELECT route.target_unit_key, route.target_module_path, route.target_name
  FROM selected_rust_unit_summaries AS unit
+ -- Rust-only derived-from blob until #11183 M3 converts Rust child rows
  CROSS JOIN main.resolution_unit_summary_members AS member
   ON member.summary_id=unit.summary_id AND member.blob_id=?3
  CROSS JOIN main.rust_resolution_unit_summary_import_routes AS route
@@ -246,6 +280,7 @@ pub(super) const NAMED: &str =
  UNION ALL
  SELECT route.target_unit_key, route.target_module_path, selected.imported_name
  FROM selected_rust_unit_summaries AS unit
+ -- Rust-only derived-from blob until #11183 M3 converts Rust child rows
  CROSS JOIN main.resolution_unit_summary_members AS member
   ON member.summary_id=unit.summary_id AND member.blob_id=?3
  CROSS JOIN main.rust_resolution_unit_summary_import_routes AS route
@@ -271,6 +306,7 @@ pub(super) const GLOBS: &str = "SELECT route.target_unit_key, route.target_modul
   SELECT segment FROM source_rust_import_module_segments
   WHERE blob_id=member.blob_id AND import_ordinal=route.route_ordinal ORDER BY ordinal)))
  FROM selected_rust_unit_summaries AS unit
+ -- Rust-only derived-from blob until #11183 M3 converts Rust child rows
  CROSS JOIN main.resolution_unit_summary_members AS member
   ON member.summary_id=unit.summary_id AND member.blob_id=?3
  CROSS JOIN main.rust_resolution_unit_summary_glob_imports AS route
@@ -284,10 +320,10 @@ pub(super) const SCOPES: &str = include_str!("rust_crate_point_scopes.sql");
 /// together. Both composed queries (`DEPENDENCY`, `REFERENCE_NAMES_WORKSPACE_CRATE`)
 /// use this block, and each binds `target` and `target_context` from it.
 ///
-/// `derivation_version_param` is the caller's placeholder for
-/// [`RUST_UNIT_SUMMARY_DERIVATION_VERSION`], bound at the call site so the
+/// `derivation_identity_param` is the caller's placeholder for
+/// [`rust_unit_summary_derivation_identity`], bound at the call site so the
 /// reader tracks a version bump instead of repeating the literal.
-pub(super) fn target_unit_joins(derivation_version_param: &str) -> String {
+pub(super) fn target_unit_joins(derivation_identity_param: &str) -> String {
     format!(
         "CROSS JOIN main.resolution_unit_summary_versions AS target_version
  ON target_version.workspace_id=owner.workspace_id AND target_version.lang=owner.lang
@@ -297,7 +333,7 @@ AND (target_version.valid_until IS NULL OR owner.revision<target_version.valid_u
 CROSS JOIN main.resolution_unit_summaries AS target_summary
  ON target_summary.summary_id=target_version.summary_id
 AND target_summary.lang='rust' AND target_summary.unit_kind='rust_crate'
-AND target_summary.publication_state='complete' AND target_summary.derivation_version={derivation_version_param}
+AND target_summary.publication_state='complete' AND target_summary.derivation_identity={derivation_identity_param}
 CROSS JOIN main.resolution_producer_epochs AS epoch
  ON epoch.lang=target_version.lang AND epoch.producer_epoch=target_summary.producer_epoch
 CROSS JOIN main.rust_resolution_unit_summary_contexts AS target_context
@@ -333,33 +369,6 @@ pub(super) const PARENT: &str = "SELECT CASE container.parent_container_path WHE
  WHERE unit.topology_id=?1
  LIMIT 1";
 
-/// Structured macro gates for a selected module import whose target module
-/// has an unknown activation. The importer and target route come from the
-/// persisted Cargo rows; the gate is tied to its source macro invocation.
-/// This keeps a route behind an unexpanded item macro an explicit boundary
-/// without treating the macro's tokens as expanded module declarations.
-pub(super) fn macro_gated_import_route_details(
-    conn: &rusqlite::Connection,
-    module: &Module,
-    name: &str,
-    binder_scope: u32,
-) -> Result<Vec<String>> {
-    conn.prepare_cached(MACRO_GATED_IMPORT_ROUTE)?
-        .query_map(
-            params![
-                module.topology,
-                module.path,
-                module.blob,
-                binder_scope,
-                name,
-                module.selected_blob
-            ],
-            |row| row.get::<_, String>(0),
-        )?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(Into::into)
-}
-
 pub(super) fn macro_gated_unmounted_file_details(
     conn: &rusqlite::Connection,
     relative_path: &str,
@@ -390,6 +399,7 @@ pub(super) fn macro_gated_route_boundary(
         ResolutionIncompleteReason::UnsupportedSemantic(identities.named_semantic(
             digest.finish(),
             "UnsupportedMacroGeneratedModule",
+            crate::analyzer::resolution::ReasonDeterminism::Unaudited,
             detail,
         ))
     }))
@@ -422,6 +432,9 @@ pub(super) fn unselected_target_boundary(
         identities.named_semantic(
             digest.finish(),
             "UnselectedRustRouteTarget",
+            crate::analyzer::resolution::ReasonDeterminism::Request {
+                cause: "the unit has no selected summary until a reconcile derives it again",
+            },
             &format!("{unit_key:?}"),
         ),
     )])
@@ -437,6 +450,7 @@ pub(super) fn inactive_cfg_route_boundary(
         ResolutionIncompleteReason::UnsupportedSemantic(identities.named_semantic(
             digest.finish(),
             "InactiveCfgPlacement",
+            crate::analyzer::resolution::ReasonDeterminism::Unaudited,
             detail,
         ))
     }))
@@ -488,6 +502,7 @@ pub(super) fn generated_item_surface_boundary(
             ResolutionIncompleteReason::UnsupportedSemantic(identities.named_semantic(
                 digest.finish(),
                 GENERATED_ITEM_SURFACE_REASON,
+                crate::analyzer::resolution::ReasonDeterminism::Unaudited,
                 detail,
             ))
         },
@@ -589,6 +604,7 @@ pub(super) fn generated_surface_prefix_boundary(
         ResolutionIncompleteReason::UnsupportedSemantic(identities.named_semantic(
             digest.finish(),
             GENERATED_ITEM_SURFACE_REASON,
+            crate::analyzer::resolution::ReasonDeterminism::Unaudited,
             &detail,
         )),
     ]))
@@ -614,41 +630,6 @@ pub(super) const IMPORT_MODULE_PREFIX_STARTS: &str = concat!(
     " CROSS JOIN selected_rust_unit_summaries AS target ON target.unit_key=binding.target_crate_key"
 );
 
-// This matches nothing on current publications: the detail is wrapped in `evidence` (#11233).
-const MACRO_GATED_IMPORT_ROUTE: &str =
-    "WITH binding(target_crate_key, target_module_path, target_name) AS (
- SELECT imports.target_unit_key, imports.target_module_path, imports.target_name
- FROM selected_rust_unit_summaries AS unit CROSS JOIN main.resolution_unit_summary_members AS member ON member.summary_id=unit.summary_id AND member.blob_id=?3 CROSS JOIN main.rust_resolution_unit_summary_import_routes AS imports ON imports.summary_id=unit.summary_id AND imports.member_ordinal=member.member_ordinal
- WHERE unit.topology_id=?1 AND imports.module_path=?2
-  AND imports.binder_scope=?4 AND imports.bound_name=?5 AND imports.namespace='type'
- UNION
- SELECT imports.target_unit_key, imports.target_module_path, selected.imported_name
- FROM selected_rust_unit_summaries AS unit CROSS JOIN main.resolution_unit_summary_members AS member ON member.summary_id=unit.summary_id AND member.blob_id=?3 CROSS JOIN main.rust_resolution_unit_summary_import_routes AS imports ON imports.summary_id=unit.summary_id AND imports.member_ordinal=member.member_ordinal
- CROSS JOIN source_rust_import_targets AS selected
-  ON selected.blob_id=?6 AND selected.ordinal=imports.route_ordinal
- WHERE unit.topology_id=?1 AND imports.module_path=?2
-  AND imports.binder_scope=?4 AND imports.namespace='type' AND selected.bound_name=?5
-)
-SELECT DISTINCT json_object('evidence', json_array(json_object(
- 'reason', 'UnsupportedMacroGeneratedModule',
- 'member_blob', route.blob_id,
- 'invocation_occurrence', gate.invocation_occurrence_id,
- 'macro', invocation.macro_name,
- 'replay_covered', json('false'),
- 'route_subject', gap.subject)))
-FROM binding
-CROSS JOIN selected_rust_unit_summaries AS target ON target.unit_key=binding.target_crate_key
-CROSS JOIN main.rust_resolution_unit_summary_gaps AS gap ON gap.summary_id=target.summary_id
- AND gap.gap_kind='unknown_activation'
- AND gap.subject=binding.target_module_path || '::' || binding.target_name
-CROSS JOIN source_rust_module_routes AS route
- ON route.blob_id=json_extract(gap.detail, '$.member_blob')
- AND route.declaration_id=json_extract(gap.detail, '$.declaration_id')
-CROSS JOIN source_rust_module_route_gates AS gate
- ON gate.blob_id=route.blob_id AND gate.route_ordinal=route.ordinal
-CROSS JOIN source_rust_macro_invocations AS invocation
- ON invocation.blob_id=gate.blob_id AND invocation.occurrence_id=gate.invocation_occurrence_id";
-
 const MACRO_GATED_UNMOUNTED_FILE: &str = "WITH RECURSIVE ancestors(path) AS (
  SELECT ?1
  UNION ALL SELECT cr_parent(path) FROM ancestors WHERE path NOT IN ('', '.')
@@ -662,7 +643,7 @@ SELECT DISTINCT json_object('evidence', json_array(json_object(
  'route_subject', gap.subject)))
 FROM ancestors
 CROSS JOIN selected_rust_unit_summaries AS selected
-CROSS JOIN main.rust_unit_summary_placements AS parent ON parent.summary_id=selected.summary_id
+CROSS JOIN temp.rust_unit_summary_placements AS parent ON parent.summary_id=selected.summary_id
 CROSS JOIN main.resolution_unit_summary_members AS member ON member.summary_id=parent.summary_id AND member.member_ordinal=parent.member_ordinal
 CROSS JOIN source_rust_module_routes AS route ON route.blob_id=member.blob_id
 CROSS JOIN source_rust_module_declarations AS declaration
@@ -676,7 +657,11 @@ CROSS JOIN source_rust_macro_invocations AS invocation
  ON invocation.blob_id=gate.blob_id AND invocation.occurrence_id=gate.invocation_occurrence_id
 WHERE ancestors.path=cr_join(cr_parent(member.rel_path), declaration.module_name)";
 
-// This matches nothing on current publications: the detail is wrapped in `evidence` (#11233).
+// Placement gaps carry top-level path and activation keys (unlike export-derived gaps).
+// This projects diagnostic evidence, one entry per inactive route of the path. Whether a
+// file is compiled is decided once, by `file_activity` (rust_file_activity.sql); the first
+// inactive route of each chain is the only one with a gap row, so a descendant of an inactive
+// module has no evidence here.
 const INACTIVE_CFG_UNMOUNTED_FILE: &str =
     "SELECT DISTINCT json_object('evidence', json_array(json_object(
  'reason', 'InactiveCfgPlacement',
@@ -697,8 +682,9 @@ pub const MACRO_GATED_UNMOUNTED_FILE_SQL_FOR_TEST: &str = MACRO_GATED_UNMOUNTED_
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub const INACTIVE_CFG_UNMOUNTED_FILE_SQL_FOR_TEST: &str = INACTIVE_CFG_UNMOUNTED_FILE;
-/// Source gap conditions: derive-helper names of module-level declarations and
-/// directly proven inactive macro inputs. A NULL helper is an inactive-input proof.
+/// Source gap conditions: derive-helper names of module-level declarations,
+/// directly proven inactive macro inputs, and built-in derive names. A NULL
+/// helper is an inactive-input proof.
 /// The derive-helper attribute names of the module-level declarations a
 /// lookup reached, with the open binder gap the producer left on each
 /// declaration site (origin ?1) and every placement of the declaration.
@@ -745,21 +731,120 @@ pub(super) const DERIVE_HELPER_CONDITIONS: &str = "SELECT mount.mount_ordinal, g
   AND (reached.value->>1 IS NULL OR gap.reason=reached.value->>1)
  WHERE mount.storage_language='rust'
   AND EXISTS (
-   SELECT 1 FROM main.resolution_unit_summary_members AS member
-    INDEXED BY resolution_unit_summary_members_blob
+   SELECT 1 FROM selected_workspace_file_versions AS file
+   CROSS JOIN main.blobs AS blob
+    ON blob.lang=file.lang AND blob.blob_oid=file.blob_oid
+   AND blob.parse_variant=file.parse_variant AND blob.generation=file.generation
+   CROSS JOIN main.resolution_unit_summary_members AS member
+    INDEXED BY resolution_unit_summary_members_path
+    ON member.rel_path=file.rel_path
+   CROSS JOIN temp.selected_unit_member_blobs AS attachment
+    ON attachment.summary_id=member.summary_id
+   AND attachment.member_ordinal=member.member_ordinal AND attachment.blob_id=blob.id
    CROSS JOIN selected_rust_unit_summaries AS selected
     ON selected.summary_id=member.summary_id
-   WHERE member.blob_id=input.blob_id)
+   WHERE file.lang='rust' AND file.rel_path=mount.persisted_relative_path AND blob.id=input.blob_id)
   AND NOT EXISTS (
-   SELECT 1 FROM main.resolution_unit_summary_members AS member
-    INDEXED BY resolution_unit_summary_members_blob
+   SELECT 1 FROM selected_workspace_file_versions AS file
+   CROSS JOIN main.blobs AS blob
+    ON blob.lang=file.lang AND blob.blob_oid=file.blob_oid
+   AND blob.parse_variant=file.parse_variant AND blob.generation=file.generation
+   CROSS JOIN main.resolution_unit_summary_members AS member
+    INDEXED BY resolution_unit_summary_members_path
+    ON member.rel_path=file.rel_path
+   CROSS JOIN temp.selected_unit_member_blobs AS attachment
+    ON attachment.summary_id=member.summary_id
+   AND attachment.member_ordinal=member.member_ordinal AND attachment.blob_id=blob.id
    CROSS JOIN selected_rust_unit_summaries AS selected
     ON selected.summary_id=member.summary_id
    LEFT JOIN main.rust_resolution_unit_summary_contexts AS context
     ON context.summary_id=selected.summary_id
-   WHERE member.blob_id=input.blob_id
+   WHERE file.lang='rust' AND file.rel_path=mount.persisted_relative_path AND blob.id=input.blob_id
     AND CASE WHEN context.summary_id IS NULL THEN -1
              ELSE cr_cfg(input.cfg_condition,json(context.cfg_atoms)) END<>0)
+ UNION ALL
+ -- A file-backed module with an inactive cfg cannot place another file.
+ -- Only the declaration's placement reason is eligible: malformed modules
+ -- have a separate synthetic site with no declaration bridge. Require a
+ -- selected membership and a false predicate in every membership; a missing
+ -- context is unknown and must retain the boundary.
+ -- The summary records configuration OIDs and the topology digest as UnitRead
+ -- inputs (rust_unit_summaries::read_rows and context_publication). Selection
+ -- fingerprints bind the revision and blob/producer identities. Inventory Drop
+ -- clears request stage producers through CLEAR_REQUEST_SQL, including their
+ -- closed reasons; retained macro frontiers also check selection/routing/scope
+ -- digests before reuse. This proof never survives a changed selection.
+ SELECT mount.mount_ordinal, gap.reason, NULL, 0, ''
+ FROM json_each(?2) AS reached
+ CROSS JOIN temp.selected_resolution_mounts AS mount
+  ON mount.mount_ordinal=reached.value->>0
+ CROSS JOIN main.resolution_gap_reasons AS gap
+  ON gap.blob_id=mount.blob_id AND gap.origin=?4
+  AND (reached.value->>1 IS NULL OR gap.reason=reached.value->>1)
+ CROSS JOIN main.source_native_declaration_bridges AS bridge
+  ON bridge.blob_id=gap.blob_id AND bridge.source_site=gap.site
+ CROSS JOIN main.source_rust_declaration_properties AS property
+  ON property.blob_id=bridge.blob_id AND property.declaration_id=bridge.declaration_id
+  AND property.declaration_kind=5 -- RustDeclarationKind::ExternalModule (source_facts.rs decode)
+ WHERE mount.storage_language='rust'
+  AND EXISTS (
+   SELECT 1 FROM selected_workspace_file_versions AS file
+   CROSS JOIN main.blobs AS blob
+    ON blob.lang=file.lang AND blob.blob_oid=file.blob_oid
+   AND blob.parse_variant=file.parse_variant AND blob.generation=file.generation
+   CROSS JOIN main.resolution_unit_summary_members AS member
+    INDEXED BY resolution_unit_summary_members_path
+    ON member.rel_path=file.rel_path
+   CROSS JOIN temp.selected_unit_member_blobs AS attachment
+    ON attachment.summary_id=member.summary_id
+   AND attachment.member_ordinal=member.member_ordinal AND attachment.blob_id=blob.id
+   CROSS JOIN selected_rust_unit_summaries AS selected
+    ON selected.summary_id=member.summary_id
+   WHERE file.lang='rust' AND file.rel_path=mount.persisted_relative_path AND blob.id=gap.blob_id)
+  AND NOT EXISTS (
+   SELECT 1 FROM selected_workspace_file_versions AS file
+   CROSS JOIN main.blobs AS blob
+    ON blob.lang=file.lang AND blob.blob_oid=file.blob_oid
+   AND blob.parse_variant=file.parse_variant AND blob.generation=file.generation
+   CROSS JOIN main.resolution_unit_summary_members AS member
+    INDEXED BY resolution_unit_summary_members_path
+    ON member.rel_path=file.rel_path
+   CROSS JOIN temp.selected_unit_member_blobs AS attachment
+    ON attachment.summary_id=member.summary_id
+   AND attachment.member_ordinal=member.member_ordinal AND attachment.blob_id=blob.id
+   CROSS JOIN selected_rust_unit_summaries AS selected
+    ON selected.summary_id=member.summary_id
+   LEFT JOIN main.rust_resolution_unit_summary_contexts AS context
+    ON context.summary_id=selected.summary_id
+   WHERE file.lang='rust' AND file.rel_path=mount.persisted_relative_path AND blob.id=gap.blob_id
+    AND CASE WHEN context.summary_id IS NULL THEN -1
+             ELSE cr_cfg(property.cfg_condition,json(context.cfg_atoms)) END<>0)
+ UNION ALL
+ -- A declaration whose only generated surface is built-in derives keeps that
+ -- surface gap (origin ?3) on its declaration site. Each derive name closes
+ -- it like a helper name: absent from macro lookup, it is the prelude's
+ -- built-in derive, which adds one impl of a reviewed trait and no name
+ -- (#11325).
+ SELECT mount.mount_ordinal, gap.reason,
+ derive.value, placement.topology_id, placement.container_path
+ FROM json_each(?2) AS reached
+ CROSS JOIN temp.selected_resolution_mounts AS mount
+  ON mount.mount_ordinal=reached.value->>0
+ CROSS JOIN source_rust_declaration_properties AS property
+  INDEXED BY source_rust_declaration_properties_builtin_derives
+  ON property.blob_id=mount.blob_id AND property.builtin_derives IS NOT NULL
+ CROSS JOIN json_each(property.builtin_derives) AS derive
+ CROSS JOIN source_native_declaration_bridges AS bridge
+  ON bridge.blob_id=property.blob_id AND bridge.declaration_id=property.declaration_id
+ CROSS JOIN resolution_gap_reasons AS gap
+  ON gap.blob_id=bridge.blob_id AND gap.site=bridge.source_site AND gap.origin=?3
+  AND (reached.value->>1 IS NULL OR gap.reason=reached.value->>1)
+ CROSS JOIN resolution_rust_declaration_authorities AS authority
+  ON authority.blob_id=bridge.blob_id AND authority.semantic_key=bridge.source_site
+ CROSS JOIN selected_rust_container_placements AS placement
+  ON placement.mount_ordinal=mount.mount_ordinal
+  AND placement.module_declaration IS authority.module_declaration
+ WHERE mount.storage_language='rust' AND property.nearest_declaration_boundary=0
  ORDER BY 1, 2, 3, 4, 5";
 pub(super) const EXTERNAL_BINDING: &str = concat!(
     include_str!("rust_crate_point_targets.sql"),
@@ -784,8 +869,8 @@ pub(super) const CONTAINER_DECLARATION: &str = "SELECT CASE parent.container_pat
  CROSS JOIN main.resolution_unit_summary_members AS member
   ON member.summary_id=parent.summary_id AND member.member_ordinal=parent.member_ordinal
  CROSS JOIN source_rust_module_inventory AS declaration
-  ON declaration.blob_id=member.blob_id
- AND declaration.parent_scope_ordinal=parent.scope_ordinal
+  ON declaration.blob_id=(SELECT attachment.blob_id FROM temp.selected_unit_member_blobs AS attachment WHERE attachment.summary_id=member.summary_id AND attachment.member_ordinal=member.member_ordinal)
+ AND declaration.parent_scope_ordinal=(SELECT dense.dense_id FROM temp.surface_dense AS dense WHERE dense.blob_id=(SELECT attachment.blob_id FROM temp.selected_unit_member_blobs AS attachment WHERE attachment.summary_id=member.summary_id AND attachment.member_ordinal=member.member_ordinal) AND dense.id_space=7 AND dense.surface_ordinal=parent.scope_surface_ordinal)
  WHERE unit.topology_id=?1
   AND CASE parent.container_path WHEN '' THEN 'crate' ELSE parent.container_path END || '::' || declaration.module_name=?2";
 pub(super) const DEFINITION_MODULE: &str = "SELECT selected.topology_id, modules.module_path
@@ -805,7 +890,7 @@ pub(super) const DEFINITION_MODULE: &str = "SELECT selected.topology_id, modules
 pub(super) const MACRO_ITEM_MODULE: &str = "SELECT unit.topology_id, modules.module_path
  FROM selected_rust_unit_summaries AS unit
  CROSS JOIN main.resolution_unit_summary_members AS member
-  ON member.summary_id=unit.summary_id AND member.blob_id=?1
+  ON member.summary_id=unit.summary_id AND (SELECT attachment.blob_id FROM temp.selected_unit_member_blobs AS attachment WHERE attachment.summary_id=member.summary_id AND attachment.member_ordinal=member.member_ordinal)=?1
  CROSS JOIN main.rust_resolution_unit_summary_generated_names AS item
   ON item.summary_id=unit.summary_id AND item.member_ordinal=member.member_ordinal
  CROSS JOIN main.rust_unit_summary_containers AS modules
@@ -907,14 +992,24 @@ pub const PUBLISHED_OPEN_INVENTORY: &str = concat!(
     include_str!("rust_crate_published_bindings.sql"),
     include_str!("rust_crate_published_macro_prelude.sql"),
     include_str!("rust_crate_published_targets.sql"),
-    include_str!("rust_crate_published_inventory.sql")
+    include_str!("rust_crate_published_inventory.sql"),
+    "UNION ALL\n",
+    // The unplaced-glob-source arm. Its two halves surround the predicate that
+    // says the lookup is scoped, which makes an explicit module binding stop
+    // the glob walk only for a module-scope lookup. This reads published
+    // module owners only: its `?5` and `?6` are the requester, and it has no
+    // scoped form.
+    include_str!("rust_crate_point_unplaced_glob_sources_head.sql"),
+    "0\n OR ",
+    include_str!("rust_crate_point_unplaced_glob_sources_tail.sql"),
+    "\n) SELECT DISTINCT * FROM details ORDER BY 1"
 );
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub const PUBLISHED_MACRO_PRELUDE: &str = concat!(
     include_str!("rust_crate_published_bindings.sql"),
     include_str!("rust_crate_published_macro_prelude.sql"),
-    "SELECT owner_id FROM macro_prelude_owners ORDER BY owner_id"
+    "SELECT summary_id,owner_handle FROM macro_prelude_owners ORDER BY 1,2"
 );
 pub(super) const PUBLISHED_BINDING_EXACT: &str = concat!(
     include_str!("rust_crate_published_bindings.sql"),
@@ -987,9 +1082,35 @@ pub(super) fn published_module_starts(
         )?
         .collect::<rusqlite::Result<Vec<_>>>()?)
 }
+/// Whether a module, or a module its glob imports reach, holds a gap on one
+/// name: a declaration or import whose cfg activation is unknown, a module that
+/// is unplaced or duplicated, an unresolved visibility, or an open inventory
+/// for the name. `?1` and `?2` are the glob target's topology and module path,
+/// `?3` the name; the gap kinds are the ones the producer ties to a name.
+/// Every glob import of a module counts, private or public: following more
+/// globs only refuses more. A closure unit that is not selected cannot be
+/// read, which also counts as a gap. Block and function scoped globs never
+/// re-export, so only module scope (`binder_scope=0`) is followed. A
+/// `UNION` key bounds the recursion; no Rust recursion or depth limit is used.
+pub(super) const GLOB_CLOSURE_NAME_GAP: &str = "WITH RECURSIVE closure(unit_key,module_path) AS (
+ SELECT unit.unit_key,?2 FROM selected_rust_unit_summaries unit WHERE unit.topology_id=?1
+ UNION
+ SELECT glob.target_unit_key,glob.target_module_path
+ FROM closure CROSS JOIN selected_rust_unit_summaries unit ON unit.unit_key=closure.unit_key
+ CROSS JOIN main.rust_resolution_unit_summary_glob_imports glob ON glob.summary_id=unit.summary_id
+ AND glob.module_path=closure.module_path AND glob.binder_scope=0
+)
+SELECT 1 FROM closure LEFT JOIN selected_rust_unit_summaries unit ON unit.unit_key=closure.unit_key
+ WHERE unit.summary_id IS NULL
+UNION ALL
+SELECT 1 FROM closure CROSS JOIN selected_rust_unit_summaries unit ON unit.unit_key=closure.unit_key
+ CROSS JOIN main.rust_resolution_unit_summary_gaps gap ON gap.summary_id=unit.summary_id
+ AND gap.subject=closure.module_path || '::' || ?3
+ AND gap.gap_kind IN ('unknown_activation','unplaced_module','duplicate_placement','unresolved_visibility','open_export_inventory')";
 pub(super) const BINDING_TARGET_TOPOLOGY: &str = "SELECT topology_id
  FROM selected_rust_unit_summaries WHERE unit_key=unhex(?1)";
-pub(super) const BINDING_INVENTORY: &str = "SELECT json_object('evidence',json_group_array(json(evidence.value)))
+pub(super) const BINDING_INVENTORY: &str = concat!(
+    "SELECT json_object('evidence',json_group_array(json(evidence.value)))
  FROM selected_rust_unit_summaries unit CROSS JOIN main.rust_resolution_unit_summary_gaps gap
  ON gap.summary_id=unit.summary_id AND gap.gap_kind='open_export_inventory' AND gap.subject=?2 || '::' || ?4
  CROSS JOIN json_each(gap.detail,'$.evidence') evidence
@@ -1008,7 +1129,15 @@ pub(super) const BINDING_INVENTORY: &str = "SELECT json_object('evidence',json_g
  WHERE scoped.summary_id=unit.summary_id AND scoped.gap_kind='open_export_inventory' AND scoped.subject=?2 || '::' || ?4
  AND json_extract(evidence.value,'$.member_blob')=?5 AND json_extract(evidence.value,'$.binder_scope')=?6
  AND (?3='' OR json_extract(evidence.value,'$.namespace')=?3) AND json_extract(evidence.value,'$.reason')='OpenBoundary'
- AND json_extract(evidence.value,'$.boundary')='workspace_local')";
+ AND json_extract(evidence.value,'$.boundary')='workspace_local')",
+    "\n UNION ALL\n",
+    // The unplaced-glob-source arm: a lookup with a block or function binder
+    // scope (`?5` member blob or `?6` binder scope nonzero) never stops the
+    // walk on the enclosing module's explicit binding.
+    include_str!("rust_crate_point_unplaced_glob_sources_head.sql"),
+    "(?5<>0 OR ?6<>0)\n OR ",
+    include_str!("rust_crate_point_unplaced_glob_sources_tail.sql")
+);
 pub(super) const UNKNOWN_IMPORT_INVENTORY: &str = "SELECT json_object('evidence',json_group_array(json(evidence.value)))
  FROM selected_rust_unit_summaries AS unit
  CROSS JOIN main.rust_resolution_unit_summary_gaps AS gap
@@ -1033,14 +1162,25 @@ pub(super) const OPEN_ROUTE: &str = "SELECT json(gap.detail)
   ON gap.summary_id=unit.summary_id
  WHERE unit.topology_id=?1
   AND gap.gap_kind IN ('unknown_activation','unplaced_module','duplicate_placement')
-  AND gap.subject=?2 || '::' || ?3";
+  AND gap.subject=?2 || '::' || ?3
+ UNION ALL
+ -- The modules this selection unplaced or added, and the modules whose
+ -- inventory an added edge opened. A name looked up inside such a module is
+ -- open too: a bare `foo::bar` reaches the added `foo` by its declaration
+ -- in the requesting file, so the walk starts in the container `foo` and
+ -- dead-ends on `bar`, never on `foo` as a child of its parent.
+ SELECT json(gap.detail)
+ FROM selected_rust_unit_summaries AS unit
+ CROSS JOIN temp.selected_rust_unplaced_gaps AS gap
+  ON gap.summary_id=unit.summary_id
+ WHERE unit.topology_id=?1 AND gap.subject IN (?2 || '::' || ?3, ?2)";
 pub(in crate::analyzer::store) const GAP_DETAILS: &str =
     include_str!("rust_crate_point_gap_details.sql");
 pub(super) const IMPORT_INVENTORY: &str = "SELECT json_array(imports.native_scope, imports.bound_name, imports.imported_name, imports.is_glob, imports.leading_absolute, imports.is_extern_crate, imports.is_macro_use, imports.visibility, imports.cfg_condition, imports.owner_module, imports.local_start IS NOT NULL, json((SELECT json_group_array(segment) FROM (SELECT segment FROM source_rust_import_module_segments WHERE blob_id=imports.blob_id AND import_ordinal=imports.ordinal ORDER BY ordinal)))) FROM source_rust_import_targets AS imports WHERE imports.blob_id=?1 ORDER BY imports.ordinal";
 pub(super) const OVERLAY_IMPORT_TARGETS: &str = r#"SELECT DISTINCT target.topology_id, route.target_module_path, route.namespace,
  owner.topology_id, route.module_path
+ -- Rust-only derived-from blob until #11183 M3 converts Rust child rows
  FROM main.resolution_unit_summary_members AS member
-  INDEXED BY resolution_unit_summary_members_blob
  CROSS JOIN selected_rust_unit_summaries AS owner ON owner.summary_id=member.summary_id
  CROSS JOIN source_rust_import_targets AS source
   ON source.blob_id=member.blob_id AND source.ordinal=?2
@@ -1055,20 +1195,19 @@ pub(super) const OVERLAY_IMPORT_TARGETS: &str = r#"SELECT DISTINCT target.topolo
 pub(in crate::analyzer::store) const MACRO_HOST_FILES: &str = r#"SELECT DISTINCT host_member.rel_path
  FROM temp.selected_resolution_mounts AS included_mount
  CROSS JOIN main.resolution_unit_summary_members AS included_member
-  INDEXED BY resolution_unit_summary_members_blob
-  ON included_member.blob_id=included_mount.blob_id
+  ON (SELECT attachment.blob_id FROM temp.selected_unit_member_blobs AS attachment WHERE attachment.summary_id=included_member.summary_id AND attachment.member_ordinal=included_member.member_ordinal)=included_mount.blob_id
  AND included_member.rel_path=included_mount.persisted_relative_path
  CROSS JOIN selected_rust_unit_summaries AS unit
   ON unit.summary_id=included_member.summary_id
- CROSS JOIN main.rust_unit_summary_placements AS included
+ CROSS JOIN temp.rust_unit_summary_placements AS included
   ON included.summary_id=unit.summary_id
  AND included.member_ordinal=included_member.member_ordinal
  AND included.source_kind='include'
- CROSS JOIN main.rust_unit_summary_placements AS host
+ CROSS JOIN temp.rust_unit_summary_placements AS host
   ON host.summary_id=included.summary_id AND host.module_path=included.module_path
  CROSS JOIN main.resolution_unit_summary_members AS host_member
   ON host_member.summary_id=host.summary_id AND host_member.member_ordinal=host.member_ordinal
- CROSS JOIN rust_include_edges AS edge ON edge.blob_id=host_member.blob_id
+ CROSS JOIN rust_include_edges AS edge ON edge.blob_id=(SELECT attachment.blob_id FROM temp.selected_unit_member_blobs AS attachment WHERE attachment.summary_id=host_member.summary_id AND attachment.member_ordinal=host_member.member_ordinal)
   AND included_member.rel_path LIKE '%' || edge.file_name
  WHERE included_mount.storage_language='rust'
   AND included_mount.persisted_relative_path=?1"#;
@@ -1091,13 +1230,12 @@ pub const MACRO_WALK_ANCESTRY: &str = r#"WITH RECURSIVE climb(summary_id, child,
   ON child_mount.storage_language='rust'
  AND child_mount.persisted_relative_path=climb.parent
  CROSS JOIN main.resolution_unit_summary_members AS child_member
-  INDEXED BY resolution_unit_summary_members_blob
-  ON child_member.blob_id=child_mount.blob_id
+  ON (SELECT attachment.blob_id FROM temp.selected_unit_member_blobs AS attachment WHERE attachment.summary_id=child_member.summary_id AND attachment.member_ordinal=child_member.member_ordinal)=child_mount.blob_id
  AND child_member.rel_path=child_mount.persisted_relative_path
  CROSS JOIN selected_rust_unit_summaries AS unit
   ON unit.summary_id=child_member.summary_id
  AND (climb.summary_id IS NULL OR climb.summary_id=unit.summary_id)
- CROSS JOIN main.rust_unit_summary_placements AS child
+ CROSS JOIN temp.rust_unit_summary_placements AS child
   ON child.summary_id=unit.summary_id
  AND child.member_ordinal=child_member.member_ordinal
  AND child.source_kind='declared'
@@ -1112,7 +1250,7 @@ pub const MACRO_WALK_ANCESTRY: &str = r#"WITH RECURSIVE climb(summary_id, child,
   ON parent_member.summary_id=parent.summary_id
  AND parent_member.member_ordinal=parent.member_ordinal
  CROSS JOIN rust_module_routes AS route
-  ON route.blob_id=parent_member.blob_id
+  ON route.blob_id=(SELECT attachment.blob_id FROM temp.selected_unit_member_blobs AS attachment WHERE attachment.summary_id=parent_member.summary_id AND attachment.member_ordinal=parent_member.member_ordinal)
  AND child.module_path=CASE parent.container_path WHEN '' THEN 'crate' ELSE parent.container_path END || '::' || route.module_name
  UNION
  SELECT unit.summary_id, climb.parent, host_member.rel_path, edge.include_start
@@ -1121,21 +1259,20 @@ pub const MACRO_WALK_ANCESTRY: &str = r#"WITH RECURSIVE climb(summary_id, child,
   ON included_mount.storage_language='rust'
  AND included_mount.persisted_relative_path=climb.parent
  CROSS JOIN main.resolution_unit_summary_members AS included_member
-  INDEXED BY resolution_unit_summary_members_blob
-  ON included_member.blob_id=included_mount.blob_id
+  ON (SELECT attachment.blob_id FROM temp.selected_unit_member_blobs AS attachment WHERE attachment.summary_id=included_member.summary_id AND attachment.member_ordinal=included_member.member_ordinal)=included_mount.blob_id
  AND included_member.rel_path=included_mount.persisted_relative_path
  CROSS JOIN selected_rust_unit_summaries AS unit
   ON unit.summary_id=included_member.summary_id
  AND (climb.summary_id IS NULL OR climb.summary_id=unit.summary_id)
- CROSS JOIN main.rust_unit_summary_placements AS included
+ CROSS JOIN temp.rust_unit_summary_placements AS included
   ON included.summary_id=unit.summary_id
  AND included.member_ordinal=included_member.member_ordinal
  AND included.source_kind='include'
- CROSS JOIN main.rust_unit_summary_placements AS host
+ CROSS JOIN temp.rust_unit_summary_placements AS host
   ON host.summary_id=included.summary_id AND host.module_path=included.module_path
  CROSS JOIN main.resolution_unit_summary_members AS host_member
   ON host_member.summary_id=host.summary_id AND host_member.member_ordinal=host.member_ordinal
- CROSS JOIN rust_include_edges AS edge ON edge.blob_id=host_member.blob_id
+ CROSS JOIN rust_include_edges AS edge ON edge.blob_id=(SELECT attachment.blob_id FROM temp.selected_unit_member_blobs AS attachment WHERE attachment.summary_id=host_member.summary_id AND attachment.member_ordinal=host_member.member_ordinal)
   AND included_member.rel_path LIKE '%' || edge.file_name
 ) SELECT child, parent, position FROM climb WHERE child IS NOT NULL"#;
 /// The files of the child module `?2` that `?1` declares.
@@ -1143,11 +1280,11 @@ pub const MACRO_WALK_ANCESTRY: &str = r#"WITH RECURSIVE climb(summary_id, child,
 /// so the walk descends into the child it names.
 pub(in crate::analyzer::store) const MACRO_WALK_CHILD_MODULE_FILES: &str = r#"SELECT DISTINCT child_member.rel_path
  FROM selected_rust_unit_members AS parent_member
- CROSS JOIN main.rust_unit_summary_placements AS parent
+ CROSS JOIN temp.rust_unit_summary_placements AS parent
   ON parent.summary_id=parent_member.summary_id
  AND parent.member_ordinal=parent_member.member_ordinal
  AND parent.source_kind='declared'
- CROSS JOIN main.rust_unit_summary_placements AS child
+ CROSS JOIN temp.rust_unit_summary_placements AS child
   ON child.summary_id=parent.summary_id
  AND child.module_path=parent.module_path || '::' || ?2
  AND child.source_kind='declared'
@@ -1159,14 +1296,13 @@ pub(in crate::analyzer::store) const MACRO_WALK_CHILD_MODULE_FILES: &str = r#"SE
 pub(in crate::analyzer::store) const MACRO_INCLUDED_FILE: &str = r#"SELECT DISTINCT included_member.rel_path
  FROM temp.selected_resolution_mounts AS host_mount
  CROSS JOIN main.resolution_unit_summary_members AS host_member
-  INDEXED BY resolution_unit_summary_members_blob
-  ON host_member.blob_id=host_mount.blob_id
+  ON (SELECT attachment.blob_id FROM temp.selected_unit_member_blobs AS attachment WHERE attachment.summary_id=host_member.summary_id AND attachment.member_ordinal=host_member.member_ordinal)=host_mount.blob_id
  AND host_member.rel_path=host_mount.persisted_relative_path
  CROSS JOIN selected_rust_unit_summaries AS unit
   ON unit.summary_id=host_member.summary_id
- CROSS JOIN main.rust_unit_summary_placements AS host
+ CROSS JOIN temp.rust_unit_summary_placements AS host
   ON host.summary_id=unit.summary_id AND host.member_ordinal=host_member.member_ordinal
- CROSS JOIN main.rust_unit_summary_placements AS included
+ CROSS JOIN temp.rust_unit_summary_placements AS included
   ON included.summary_id=host.summary_id AND included.module_path=host.module_path
  AND included.source_kind='include'
  CROSS JOIN main.resolution_unit_summary_members AS included_member
@@ -1177,18 +1313,17 @@ pub(in crate::analyzer::store) const MACRO_INCLUDED_FILE: &str = r#"SELECT DISTI
   AND included_member.rel_path LIKE '%' || ?2"#;
 /// Every byte at which `?1` includes a file the selection carries.
 #[doc(hidden)]
-pub const MACRO_INCLUDE_STARTS: &str = r#"SELECT DISTINCT edge.include_start, included_member.rel_path, included_member.blob_id
+pub const MACRO_INCLUDE_STARTS: &str = r#"SELECT DISTINCT edge.include_start, included_member.rel_path, (SELECT attachment.blob_id FROM temp.selected_unit_member_blobs AS attachment WHERE attachment.summary_id=included_member.summary_id AND attachment.member_ordinal=included_member.member_ordinal)
  FROM temp.selected_resolution_mounts AS host_mount
  CROSS JOIN main.resolution_unit_summary_members AS host_member
-  INDEXED BY resolution_unit_summary_members_blob
-  ON host_member.blob_id=host_mount.blob_id
+  ON (SELECT attachment.blob_id FROM temp.selected_unit_member_blobs AS attachment WHERE attachment.summary_id=host_member.summary_id AND attachment.member_ordinal=host_member.member_ordinal)=host_mount.blob_id
  AND host_member.rel_path=host_mount.persisted_relative_path
  CROSS JOIN selected_rust_unit_summaries AS unit
   ON unit.summary_id=host_member.summary_id
- CROSS JOIN main.rust_unit_summary_placements AS host
+ CROSS JOIN temp.rust_unit_summary_placements AS host
   ON host.summary_id=unit.summary_id AND host.member_ordinal=host_member.member_ordinal
- CROSS JOIN rust_include_edges AS edge ON edge.blob_id=host_member.blob_id
- CROSS JOIN main.rust_unit_summary_placements AS included
+ CROSS JOIN rust_include_edges AS edge ON edge.blob_id=(SELECT attachment.blob_id FROM temp.selected_unit_member_blobs AS attachment WHERE attachment.summary_id=host_member.summary_id AND attachment.member_ordinal=host_member.member_ordinal)
+ CROSS JOIN temp.rust_unit_summary_placements AS included
   ON included.summary_id=host.summary_id AND included.module_path=host.module_path
  AND included.source_kind='include'
  CROSS JOIN main.resolution_unit_summary_members AS included_member
@@ -1235,21 +1370,25 @@ pub(super) const CLEAR_SCOPE_MOUNTS: &str = "DELETE FROM temp.selected_resolutio
 /// file rather than a pass over the selection or Rust topology sources.
 #[doc(hidden)]
 pub const CLOSURE_SCOPE_MOUNTS: &str =
-    "INSERT OR IGNORE INTO temp.selected_resolution_scope_mounts(mount_ordinal)
- SELECT DISTINCT mount.mount_ordinal
+    "INSERT INTO temp.selected_resolution_scope_mounts(mount_ordinal)
+ SELECT * FROM (
+SELECT DISTINCT mount.mount_ordinal
  FROM selected_rust_unit_closure AS closure
  CROSS JOIN selected_rust_unit_members AS member ON member.summary_id=closure.summary_id
  CROSS JOIN temp.selected_resolution_mounts AS mount
   ON mount.storage_language='rust' AND mount.persisted_relative_path=member.rel_path
- WHERE closure.root_unit_key IN (SELECT unhex(value) FROM json_each(?1))";
+ WHERE closure.root_unit_key IN (SELECT unhex(value) FROM json_each(?1))
+) WHERE true ON CONFLICT DO NOTHING";
 
 /// The mounts no crate row can place, which a crate closure cannot narrow:
 /// another language's files, and a content mount carrying an editor buffer
 /// whose path the crate derivation has never seen.
 pub(super) const UNPLACEABLE_SCOPE_MOUNTS: &str =
-    "INSERT OR IGNORE INTO temp.selected_resolution_scope_mounts(mount_ordinal)
- SELECT mount_ordinal FROM temp.selected_resolution_mounts
- WHERE storage_language <> 'rust' OR file_version_id IS NULL";
+    "INSERT INTO temp.selected_resolution_scope_mounts(mount_ordinal)
+ SELECT * FROM (
+SELECT mount_ordinal FROM temp.selected_resolution_mounts
+ WHERE storage_language <> 'rust' OR file_version_id IS NULL
+) WHERE true ON CONFLICT DO NOTHING";
 
 /// One narrowed request scope, restored when it is dropped.
 ///
@@ -1549,6 +1688,42 @@ impl SelectedResolutionOperation<'_, '_> {
         Ok(true)
     }
 
+    /// Selected membership uses exactly the same FILE_CRATES filter as resolution.
+    /// Build scripts are source membership: their generated cfg is not in Cargo configuration.
+    pub fn rust_file_configuration_targets(
+        &self,
+        caller: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<RustFileConfigurationTargets> {
+        let (keys, _, targets) = self.rust_file_crates_and_mount(caller, cancellation)?;
+        let snapshot = self
+            .ready
+            .inventory
+            .languages()?
+            .iter()
+            .find(|language| language.snapshot_id().lang == "rust")
+            .map(|language| language.snapshot_id());
+        let mut membership_complete = !cancellation.is_cancelled();
+        if let Some(snapshot) = snapshot {
+            membership_complete &= matches!(super::super::rust_unit_summaries::rust_selected_units_known(self.ready.inventory.connection(), &snapshot)?, super::super::rust_unit_summaries::RustSelectedUnitsPublication::Published { partial } if partial.is_empty());
+            membership_complete &= AnalyzerStore::rust_source_listing_complete_on_connection(
+                self.ready.inventory.connection(),
+                &snapshot,
+                super::super::rust_source_listing_derivation_identity(),
+            )?;
+        } else {
+            membership_complete = false;
+        }
+        membership_complete &= !super::super::rust_unit_summaries::rust_selection_has_overlay(
+            self.ready.inventory.connection(),
+        )?;
+        membership_complete &= targets.len() == keys.len();
+        Ok(RustFileConfigurationTargets {
+            targets,
+            membership_complete,
+        })
+    }
+
     #[doc(hidden)]
     pub fn rust_crate_keys_for_file(
         &self,
@@ -1573,9 +1748,10 @@ impl SelectedResolutionOperation<'_, '_> {
     ) -> Result<(
         Vec<[u8; 32]>,
         Option<(SelectedResolutionMountOrdinal, Language)>,
+        Vec<RustConfigurationTarget>,
     )> {
         if cancellation.is_cancelled() {
-            return Ok((Vec::new(), None));
+            return Ok((Vec::new(), None, Vec::new()));
         }
         let path = crate::path_utils::normalize_pattern(&caller.to_string_lossy());
         let (blob, ordinal, semantic): (Option<i64>, Option<u32>, Option<String>) = self
@@ -1586,18 +1762,41 @@ impl SelectedResolutionOperation<'_, '_> {
             .query_row([&path], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
         let mount = selected_mount_columns(ordinal, semantic)?;
         let Some(blob) = blob else {
-            return Ok((Vec::new(), mount));
+            return Ok((Vec::new(), mount, Vec::new()));
         };
         let mut statement = self
             .ready
             .inventory
             .connection()
             .prepare_cached(FILE_CRATES)?;
-        let keys = statement
-            .query_map(params![blob, path], |row| row.get::<_, Vec<u8>>(0))?
-            .map(|row| Ok(row?.try_into().expect("crate-key schema constraint")))
-            .collect::<Result<Vec<_>>>()?;
-        Ok((keys, mount))
+        let rows = statement.query_map(params![blob, path], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, bool>(4)?,
+            ))
+        })?;
+        let mut keys = Vec::new();
+        let mut targets = Vec::new();
+        for row in rows {
+            let (key, manifest, kind, name, build_script) = row?;
+            keys.push(key.try_into().expect("crate-key schema constraint"));
+            if let Some(manifest_path) = manifest {
+                targets.push(RustConfigurationTarget {
+                    manifest_path,
+                    target_kind: kind,
+                    target_name: name,
+                    cfg_authority: if build_script {
+                        RustCfgAuthority::IncompleteBuildScript
+                    } else {
+                        RustCfgAuthority::Configuration
+                    },
+                });
+            }
+        }
+        Ok((keys, mount, targets))
     }
 
     /// One file's Rust context, with the crates that compile it.
@@ -1647,16 +1846,28 @@ impl SelectedResolutionOperation<'_, '_> {
     /// scope that survived a panic would make the next reverse request miss
     /// usages in crates that depend on the definition's, which is a wrong
     /// answer rather than a slow one.
+    ///
+    /// `frame` runs after that narrowing and before `run`. Analyzer code under
+    /// the scope must hold this operation's read frame
+    /// (`RustAnalyzer::operation_read_frame`, in `rust/mod.rs`). The frame is
+    /// entered only after narrowing because it stamps the route recipe for the
+    /// narrowed scope (`stamp_declared_rust_route_recipe`). A caller that
+    /// deliberately runs without a frame passes `|_| Ok(())` and says why at
+    /// the call. The scope guard is declared first so the frame drops before
+    /// the scope is restored, including on unwind.
     #[doc(hidden)]
-    pub fn with_rust_forward_crate_scope<T>(
+    pub fn with_rust_forward_crate_scope<T, Frame>(
         &self,
         crate_keys: &[[u8; 32]],
         cancellation: &CancellationToken,
+        frame: impl FnOnce(&Self) -> Result<Frame>,
         run: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
+        // Declared after the scope guard, so it drops first.
         let _scope = self
             .ready
             .narrow_forward_scope_to_crates(crate_keys, cancellation)?;
+        let _frame = frame(self)?;
         run()
     }
 }
@@ -1765,7 +1976,7 @@ impl SelectedResolutionOperation<'_, '_> {
         let mut sources = Vec::new();
         let mounts = self.mount_table();
         for caller in callers {
-            let (crates, persisted) = self.rust_file_crates_and_mount(caller, cancellation)?;
+            let (crates, persisted, _) = self.rust_file_crates_and_mount(caller, cancellation)?;
             keys.extend(crates);
             let path = selected_path_key(caller);
             sources.extend(mounts.mount_for_joined_path(persisted, "rust", &path));
@@ -2327,6 +2538,7 @@ impl SelectedResolutionOperation<'_, '_> {
                             module.topology,
                             module.path.clone(),
                             &route,
+                            demand.spelling(),
                             anchor,
                             &mut route_completion,
                             cancellation,
@@ -2384,6 +2596,7 @@ impl SelectedResolutionOperation<'_, '_> {
                             module.topology,
                             module.path.clone(),
                             &route,
+                            demand.spelling(),
                             anchor,
                             &mut route_completion,
                             cancellation,
@@ -2414,10 +2627,6 @@ impl SelectedResolutionOperation<'_, '_> {
                         namespace(demand.namespace()),
                         &name,
                     )?;
-                    let binding_completion = module
-                        .overlay_completion
-                        .combine(&import_completion)
-                        .combine(&binding_inventory.completion);
                     let exports = rows.crate_exports_from_inventory(
                         module,
                         target_topology,
@@ -2426,6 +2635,11 @@ impl SelectedResolutionOperation<'_, '_> {
                         &name,
                         &binding_inventory,
                     )?;
+                    let binding_completion = module
+                        .overlay_completion
+                        .combine(&import_completion)
+                        .combine(&binding_inventory.completion)
+                        .combine(&rows.unplaced_exports_completion(&exports));
                     // The point route's rule (`rust_demand/rows.rs`): behind
                     // an open inventory, a name the walk finds as an import
                     // that leaves the workspace is the boundary, and the open
@@ -2455,12 +2669,23 @@ impl SelectedResolutionOperation<'_, '_> {
                         }
                     }
                     route_completion = route_completion.combine(&inventory);
+                    if exports.is_empty() {
+                        // No export bridge carries the binding's own evidence.
+                        // An unproven route publishes no export, but its gap
+                        // still says the name cannot read as a decided
+                        // absence; the point route keeps the same inventory
+                        // evidence (`rust_demand/rows.rs`).
+                        route_completion = route_completion
+                            .combine(&binding_completion)
+                            .combine(&rows.unmounted_keyword_root_completion(module, &route)?);
+                    }
                     for RustCrateExport {
                         blob,
                         declaration,
                         topology: export_topology,
                         module_path: export_module_path,
                         mount,
+                        ..
                     } in exports
                     {
                         let site = match declaration {
@@ -2582,6 +2807,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 "inactive_placement"
                     | "unplaced_module"
                     | "external_dependency"
+                    | "dev_dependency_cycle_edge_dropped"
                     | "unresolved_import"
                     | "unresolved_reexport"
                     | "unresolved_visibility"
@@ -2749,7 +2975,7 @@ impl SelectedResolutionOperation<'_, '_> {
                         // type can name a module through a dependency or a
                         // named import, so consult its selected route here.
                         for row in conn.prepare_cached(DEPENDENCY.as_str())?.query_map(
-                            params![module.topology,name,super::super::rust_unit_summaries::RUST_UNIT_SUMMARY_DERIVATION_VERSION],
+                            params![module.topology,name,super::super::rust_unit_summaries::rust_unit_summary_derivation_identity()],
                             |row| row.get::<_,i64>(0),
                         )? { starts.push((row?,"crate".to_owned())); }
                         starts.extend(published_module_starts(
@@ -2808,13 +3034,8 @@ impl SelectedResolutionOperation<'_, '_> {
                             starts.push(row?);
                         }
                         if starts.is_empty() {
-                            let mut details = macro_gated_import_route_details(
-                                conn,
-                                module,
-                                name,
-                                prefix_import_scope,
-                            )?;
-                            if details.is_empty() && module.unmounted {
+                            let mut details = Vec::new();
+                            if module.unmounted {
                                 details.extend(macro_gated_unmounted_file_details(
                                     conn,
                                     &module.rel_path,
@@ -2850,6 +3071,7 @@ impl SelectedResolutionOperation<'_, '_> {
                                     id,
                                     path,
                                     &route,
+                                    demand.spelling(),
                                     *anchor,
                                     &mut continuation,
                                     cancellation,
@@ -2857,20 +3079,24 @@ impl SelectedResolutionOperation<'_, '_> {
                         );
                     }
                     for (id, path) in targets {
+                        let rows = super::rust_crate_rows::RustCrateRows { ready: &self.ready };
+                        let exports = rows.crate_exports(
+                            module,
+                            id,
+                            &path,
+                            namespace(demand.namespace()),
+                            demand.spelling(),
+                        )?;
+                        let continuation =
+                            continuation.combine(&rows.unplaced_exports_completion(&exports));
                         for RustCrateExport {
                             blob,
                             declaration,
                             topology: export_topology,
                             module_path: export_module_path,
                             mount,
-                        } in (super::rust_crate_rows::RustCrateRows { ready: &self.ready })
-                            .crate_exports(
-                                module,
-                                id,
-                                &path,
-                                namespace(demand.namespace()),
-                                demand.spelling(),
-                            )?
+                            ..
+                        } in exports
                         {
                             let site = match declaration {
                                 RustCrateDeclaration::Site(site) => site,
@@ -3001,27 +3227,33 @@ impl SelectedResolutionOperation<'_, '_> {
                                         id,
                                         path,
                                         &route[route.len().min(1)..],
+                                        demand.spelling(),
                                         ResolutionRootImportAnchor::Lexical,
                                         &mut continuation,
                                         cancellation,
                                     )?
                                 {
+                                    let rows = super::rust_crate_rows::RustCrateRows {
+                                        ready: &self.ready,
+                                    };
+                                    let exports = rows.crate_exports(
+                                        module,
+                                        id,
+                                        &path,
+                                        namespace(demand.namespace()),
+                                        demand.spelling(),
+                                    )?;
+                                    let continuation = continuation
+                                        .combine(&rows.unplaced_exports_completion(&exports));
                                     for RustCrateExport {
                                         blob,
                                         declaration,
                                         topology: export_topology,
                                         module_path: export_module_path,
                                         mount,
-                                    } in (super::rust_crate_rows::RustCrateRows {
-                                        ready: &self.ready,
-                                    })
-                                    .crate_exports(
-                                        module,
-                                        id,
-                                        &path,
-                                        namespace(demand.namespace()),
-                                        demand.spelling(),
-                                    )? {
+                                        ..
+                                    } in exports
+                                    {
                                         let site = match declaration {
                                             RustCrateDeclaration::Site(site) => site,
                                             RustCrateDeclaration::MacroItem(declaration) => {
@@ -3408,6 +3640,7 @@ pub(super) fn inventory_reason(identities: &SelectedContextIdentities, detail: &
         identities.named_semantic(
             digest.finish(),
             "UnsupportedMacroGeneratedModule",
+            crate::analyzer::resolution::ReasonDeterminism::Unaudited,
             &canonical,
         )
     } else if value["evidence"].as_array().is_some_and(|items| {
@@ -3419,6 +3652,7 @@ pub(super) fn inventory_reason(identities: &SelectedContextIdentities, detail: &
         identities.named_semantic(
             digest.finish(),
             "UnsupportedGlobConflictVisibility",
+        crate::analyzer::resolution::ReasonDeterminism::Unaudited,
             "a glob conflict group with mixed member visibility, whose export depends on rustc's import resolution order",
         )
     } else {
@@ -4158,7 +4392,12 @@ pub(super) fn unlowered_export_declaration(
     let mut digest = CanonicalHasher::new(b"bifrost-rust-unlowered-export:v1");
     digest.field("evidence", evidence.as_bytes());
     ResolutionCompletion::incomplete([ResolutionIncompleteReason::UnsupportedSemantic(
-        identities.named_semantic(digest.finish(), UNLOWERED_EXPORT_REASON, &evidence),
+        identities.named_semantic(
+            digest.finish(),
+            UNLOWERED_EXPORT_REASON,
+            crate::analyzer::resolution::ReasonDeterminism::Unaudited,
+            &evidence,
+        ),
     )])
 }
 
@@ -4186,7 +4425,41 @@ pub(super) fn route_dead_end(
     let mut digest = CanonicalHasher::new(b"bifrost-rust-route-dead-end:v1");
     digest.field("evidence", evidence.as_bytes());
     ResolutionCompletion::incomplete([ResolutionIncompleteReason::UnsupportedSemantic(
-        identities.named_semantic(digest.finish(), dead_end.name(), &evidence),
+        identities.named_semantic(
+            digest.finish(),
+            dead_end.name(),
+            crate::analyzer::resolution::ReasonDeterminism::Unaudited,
+            &evidence,
+        ),
+    )])
+}
+
+/// A leading `::name` whose root the crate rows cannot decide: the crate's
+/// edition is unknown (a detached file has no manifest), or a binder's cfg is
+/// undecidable. The meaning of the path differs between the answers the rows
+/// could not choose, so the route is open rather than a proved absence.
+pub(super) fn unavailable_absolute_root(
+    identities: &SelectedContextIdentities,
+    reason: &str,
+    name: &str,
+) -> ResolutionCompletion {
+    let evidence = serde_json::json!({
+        "evidence": [{
+            "reason": "UnavailableAbsoluteRoot",
+            "detail": reason,
+            "name": name,
+        }]
+    })
+    .to_string();
+    let mut digest = CanonicalHasher::new(b"bifrost-rust-unavailable-absolute-root:v1");
+    digest.field("evidence", evidence.as_bytes());
+    ResolutionCompletion::incomplete([ResolutionIncompleteReason::UnsupportedSemantic(
+        identities.named_semantic(
+            digest.finish(),
+            "UnavailableAbsoluteRoot",
+            crate::analyzer::resolution::ReasonDeterminism::Unaudited,
+            &evidence,
+        ),
     )])
 }
 
@@ -4214,6 +4487,7 @@ pub(super) fn prelude_boundary(
     let namespace = match demand.namespace() {
         ResolutionNamespace::Type => RustPreludeNamespace::Type,
         ResolutionNamespace::Value | ResolutionNamespace::Callable => RustPreludeNamespace::Value,
+        ResolutionNamespace::Macro => RustPreludeNamespace::Macro,
         _ => return Ok(None),
     };
     let (edition, prelude): (String, String) = conn
@@ -4241,6 +4515,7 @@ pub(super) fn prelude_boundary(
     Ok(Some(identities.named_semantic(
         digest.finish(),
         "rust_prelude_item",
+        crate::analyzer::resolution::ReasonDeterminism::Unaudited,
         &evidence,
     )))
 }
@@ -4536,11 +4811,6 @@ pub(super) fn sql_pins() -> Vec<(&'static str, &'static str, usize)> {
             7,
         ),
         (
-            "rust_point_macro_gated_import_route",
-            MACRO_GATED_IMPORT_ROUTE,
-            6,
-        ),
-        (
             "rust_point_macro_gated_unmounted_file",
             MACRO_GATED_UNMOUNTED_FILE,
             1,
@@ -4568,7 +4838,7 @@ pub(super) fn sql_pins() -> Vec<(&'static str, &'static str, usize)> {
         (
             "rust_point_derive_helper_conditions",
             DERIVE_HELPER_CONDITIONS,
-            2,
+            4,
         ),
         ("rust_point_unindexed_scope", UNINDEXED_SCOPE, 6),
         ("rust_point_external_binding", EXTERNAL_BINDING, 7),
@@ -4654,6 +4924,16 @@ pub(super) fn sql_pins() -> Vec<(&'static str, &'static str, usize)> {
             "rust_point_reference_names_macro_module",
             super::rust_crate_rows::REFERENCE_NAMES_MACRO_MODULE,
             3,
+        ),
+        (
+            "rust_point_reference_file_adds_edge",
+            super::rust_crate_rows::REFERENCE_FILE_ADDS_EDGE,
+            1,
+        ),
+        (
+            "rust_point_reference_unit_adds_macro_scope",
+            super::rust_crate_rows::REFERENCE_UNIT_ADDS_MACRO_SCOPE,
+            2,
         ),
         (
             "rust_point_reference_names_workspace_crate",
@@ -4814,6 +5094,126 @@ impl<'a, 'store> super::RustForwardBuildView<'a, 'store> {
         Ok(Some(ForwardCrateScope {
             inventory: self.inventory,
         }))
+    }
+}
+
+impl crate::analyzer::store::AnalyzerStore {
+    /// Ask the published local binding authority, including its negative and
+    /// open-inventory obligations. The import is selected by parser facts,
+    /// never by its rendered source text. Missing routes cannot prove absence.
+    pub fn rust_local_glob_name_absence(
+        conn: &rusqlite::Connection,
+        file: &str,
+        start: usize,
+        segments: &[String],
+        namespace: brokk_bifrost_rust::graph_support::RustGlobNamespace,
+        name: &str,
+    ) -> Result<brokk_bifrost_rust::graph_support::RustGlobNameAbsence> {
+        use brokk_bifrost_rust::graph_support::RustGlobNameAbsence as Answer;
+        let namespace = namespace.as_str();
+        let segments = serde_json::to_string(segments).expect("import path is strings");
+        let routes = conn
+            .prepare_cached(
+                "SELECT owner.topology_id, route.module_path, target.topology_id,
+                    route.target_module_path, source.cfg_condition
+ FROM selected_rust_unit_summaries owner
+ JOIN main.resolution_unit_summary_members member USING(summary_id)
+ JOIN temp.selected_unit_member_blobs attachment
+   ON attachment.summary_id=member.summary_id AND attachment.member_ordinal=member.member_ordinal
+ JOIN source_imports import ON import.blob_id=attachment.blob_id
+ JOIN source_rust_import_targets source ON source.blob_id=import.blob_id
+   AND source.source_import_id=import.import_id
+ LEFT JOIN main.rust_resolution_unit_summary_glob_imports route
+   ON route.summary_id=member.summary_id AND route.member_ordinal=member.member_ordinal
+   AND route.source_import_id=import.import_id AND route.route_ordinal=source.ordinal
+ LEFT JOIN selected_rust_unit_summaries target ON target.unit_key=route.target_unit_key
+ WHERE member.rel_path=?1 AND import.declaration_start_byte=?2 AND import.is_wildcard=1
+   AND json((SELECT json_group_array(segment ORDER BY ordinal) FROM source_import_segments
+             WHERE blob_id=import.blob_id AND import_id=import.import_id))=json(?3)",
+            )?
+            .query_map(params![file, start, segments], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if routes.is_empty() {
+            return Ok(Answer::ExternalGlobInventoryUnavailable);
+        }
+        let mut present = false;
+        for (requester, requester_path, target, module, cfg) in routes {
+            let (Some(requester_path), Some(target), Some(module)) =
+                (requester_path, target, module)
+            else {
+                return Ok(Answer::ExternalGlobInventoryUnavailable);
+            };
+            if cfg != "always" {
+                return Ok(Answer::Incomplete);
+            }
+            // This relation follows recursive glob obligations with UNION keys;
+            // no Rust recursion or arbitrary depth bound is introduced here.
+            if conn
+                .prepare_cached(PUBLISHED_OPEN_INVENTORY)?
+                .exists(params![
+                    target,
+                    module,
+                    namespace,
+                    name,
+                    requester,
+                    requester_path
+                ])?
+            {
+                return Ok(Answer::ExternalGlobInventoryUnavailable);
+            }
+            match published_binding_exact(
+                conn,
+                target,
+                &module,
+                namespace,
+                name,
+                requester,
+                &requester_path,
+            )? {
+                Some((true, endpoints)) => {
+                    present |= !endpoints.is_empty();
+                }
+                Some((false, _)) => return Ok(Answer::Incomplete),
+                None => {
+                    // Unlisted names are absent only in a closed owner. A
+                    // missing owner is a missing publication, never emptiness.
+                    let closed: Option<bool> = conn
+                        .prepare_cached(
+                            "SELECT owner.closed FROM selected_rust_unit_summaries unit
+ JOIN rust_resolution_unit_summary_binding_owners owner USING(summary_id)
+ WHERE unit.topology_id=?1 AND owner.kind='module' AND owner.module_path=?2",
+                        )?
+                        .query_row(params![target, module], |row| row.get(0))
+                        .optional()?;
+                    if closed != Some(true) {
+                        return Ok(Answer::Incomplete);
+                    }
+                    // A name no lookup demanded has no certificate and no
+                    // blocker, so `closed` cannot see a binding-level gap on
+                    // it: the producer ties such a gap to a name only when the
+                    // name is demanded. Read the gaps of the closure directly.
+                    if conn
+                        .prepare_cached(GLOB_CLOSURE_NAME_GAP)?
+                        .exists(params![target, module, name])?
+                    {
+                        return Ok(Answer::Incomplete);
+                    }
+                }
+            }
+        }
+        Ok(if present {
+            Answer::Present
+        } else {
+            Answer::ClosedAbsent
+        })
     }
 }
 

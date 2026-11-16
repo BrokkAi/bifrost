@@ -40,6 +40,7 @@ pub enum ProjectRead<'a> {
 /// Listing caches retain only the scalar fields; overlay Arcs live for one call.
 #[derive(Clone, Debug, Default)]
 pub struct ProjectReadReceipt {
+    pub incomplete: Option<super::project::IgnoreObservationError>,
     pub listing: Option<[u8; 32]>,
     pub inventory: Option<[u8; 32]>,
     pub ignore_rules: Option<[u8; 32]>,
@@ -190,9 +191,15 @@ pub fn publish_file_set(
     let _reset = Reset;
     // Certification must not change a successful getter into an IO
     // failure. In particular, legacy custom projects may not expose
-    // their ignore rules. Clear any delegate's listing certificates so
-    // the recorder refuses reuse through its missing-receipt path.
-    let receipt = file_set_receipt(project, files).unwrap_or_default();
+    // their ignore rules. Publish the typed cause and clear any delegate's
+    // listing certificates so the recorder refuses reuse.
+    let receipt = match file_set_receipt(project, files) {
+        Ok(receipt) => receipt,
+        Err(cause) => ProjectReadReceipt {
+            incomplete: Some(cause),
+            ..ProjectReadReceipt::default()
+        },
+    };
     publish_receipt(receipt);
     Ok(())
 }
@@ -200,7 +207,7 @@ pub fn publish_file_set(
 pub fn file_set_receipt(
     project: &dyn Project,
     files: &std::collections::BTreeSet<ProjectFile>,
-) -> io::Result<ProjectReadReceipt> {
+) -> Result<ProjectReadReceipt, super::project::IgnoreObservationError> {
     let was_building = BUILDING_RECEIPT.with(|flag| flag.replace(true));
     struct Reset(bool);
     impl Drop for Reset {
@@ -210,21 +217,25 @@ pub fn file_set_receipt(
     }
     let _reset = Reset(was_building);
 
-    let mut analyzable = std::collections::BTreeSet::new();
-    for language in super::Language::ANALYZABLE {
-        analyzable.extend(project.analyzable_files_from(files, language)?);
-    }
+    let observation = project.ignore_observation_for_files(files)?;
+    assert_eq!(
+        observation.ignored.len(),
+        files.len(),
+        "one ignore decision per supplied path"
+    );
     let paths = files
         .iter()
-        .map(|file| {
+        .zip(observation.ignored)
+        .map(|(file, ignored)| {
             (
                 crate::path_utils::rel_path_string(file),
-                project.is_bifrostignored(file.rel_path()),
+                ignored,
                 project.has_overlay(file),
             )
         })
         .collect::<Vec<_>>();
-    let selected = analyzable
+    let selected = observation
+        .selected
         .iter()
         .map(|file| {
             (
@@ -248,8 +259,20 @@ pub fn file_set_receipt(
         paths,
         selected,
         overlays,
-        project.ignore_rules_digest()?,
+        observation.rules_digest,
     ))
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static FILE_SET_RECEIPT_BUILDS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Per-thread work counter for inventory complexity regressions.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn file_set_receipt_build_count() -> usize {
+    FILE_SET_RECEIPT_BUILDS.with(Cell::get)
 }
 
 pub(crate) fn file_set_receipt_from_entries(
@@ -258,6 +281,8 @@ pub(crate) fn file_set_receipt_from_entries(
     mut overlays: Vec<String>,
     rules: [u8; 32],
 ) -> ProjectReadReceipt {
+    #[cfg(any(test, feature = "test-support"))]
+    FILE_SET_RECEIPT_BUILDS.with(|count| count.set(count.get() + 1));
     paths.sort_unstable();
     selected.sort_unstable();
     overlays.sort_unstable();
@@ -462,6 +487,14 @@ pub fn with_project_read_suppression<T>(suppressed: bool, build: impl FnOnce() -
 }
 
 impl ProjectReadSlot {
+    pub fn is_capturing(&self) -> bool {
+        self.0
+            .read()
+            .expect("project read recorders poisoned")
+            .iter()
+            .any(|recorder| recorder.0.is_capturing())
+    }
+
     pub fn install(&self, capability: ReadCapability) {
         let mut recorders = self.0.write().expect("project read recorders poisoned");
         recorders.retain(|recorder| recorder.0.is_live());
@@ -823,5 +856,155 @@ impl ErasedMemoAttribution {
             },
             reads.forwarded_to,
         )
+    }
+}
+
+#[cfg(test)]
+mod ignore_receipt_tests {
+    use super::*;
+    use crate::analyzer::Language;
+    use crate::analyzer::project::{IgnoreObservationError, IgnoreObservationOperation};
+    use brokk_bifrost_test_macros::hardwon;
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
+    struct FailedListingProject {
+        root: std::path::PathBuf,
+        reads: ProjectReadSlot,
+    }
+    impl Project for FailedListingProject {
+        fn root(&self) -> &Path {
+            &self.root
+        }
+        fn project_read_slot(&self) -> Option<&ProjectReadSlot> {
+            Some(&self.reads)
+        }
+        fn analyzer_languages(&self) -> BTreeSet<Language> {
+            [Language::Rust].into()
+        }
+        fn all_files(&self) -> io::Result<BTreeSet<ProjectFile>> {
+            Err(io::Error::other("injected listing failure"))
+        }
+        fn analyzable_files(&self, _: Language) -> io::Result<BTreeSet<ProjectFile>> {
+            self.all_files()
+        }
+        fn file_by_rel_path(&self, _: &Path) -> Option<ProjectFile> {
+            None
+        }
+        fn is_bifrostignored(&self, path: &Path) -> Result<bool, IgnoreObservationError> {
+            self.all_files().map(|_| false).map_err(|cause| {
+                IgnoreObservationError::new(
+                    self.root.join(path),
+                    IgnoreObservationOperation::Listing,
+                    cause,
+                )
+            })
+        }
+    }
+
+    #[test]
+    #[hardwon("#12889: filesystem receipt matching replaced custom project selection")]
+    fn ignore_receipt_preserves_custom_selection() {
+        struct Custom(crate::analyzer::project::TestProject);
+        impl Project for Custom {
+            fn root(&self) -> &Path {
+                self.0.root()
+            }
+            fn analyzer_languages(&self) -> BTreeSet<Language> {
+                self.0.analyzer_languages()
+            }
+            fn all_files(&self) -> io::Result<BTreeSet<ProjectFile>> {
+                self.0.all_files()
+            }
+            fn analyzable_files(&self, language: Language) -> io::Result<BTreeSet<ProjectFile>> {
+                self.analyzable_files_from(&self.all_files()?, language)
+            }
+            fn analyzable_files_from(
+                &self,
+                files: &BTreeSet<ProjectFile>,
+                language: Language,
+            ) -> io::Result<BTreeSet<ProjectFile>> {
+                Ok(files
+                    .iter()
+                    .filter(|file| {
+                        file.language() == language && file.rel_path() == Path::new("selected.rs")
+                    })
+                    .cloned()
+                    .collect())
+            }
+            fn file_by_rel_path(&self, path: &Path) -> Option<ProjectFile> {
+                self.0.file_by_rel_path(path)
+            }
+            fn ignore_rules_digest(&self) -> io::Result<[u8; 32]> {
+                self.0.ignore_rules_digest()
+            }
+            fn is_bifrostignored(&self, path: &Path) -> Result<bool, IgnoreObservationError> {
+                Ok(path == Path::new("ignored.rs"))
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let project = Custom(crate::analyzer::project::TestProject::new(
+            temp.path(),
+            Language::Rust,
+        ));
+        let files = ["ignored.rs", "selected.rs", "unselected.rs"]
+            .into_iter()
+            .map(|path| ProjectFile::new(temp.path(), path))
+            .collect();
+        let observation = project.ignore_observation_for_files(&files).unwrap();
+        assert_eq!(observation.ignored, vec![true, false, false]);
+        assert_eq!(
+            observation.selected,
+            [ProjectFile::new(temp.path(), "selected.rs")].into()
+        );
+    }
+
+    #[test]
+    #[hardwon("#12889: listing failure was published as a default certificate")]
+    fn ignore_receipt_generic_listing_failure_is_typed_incomplete() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = FailedListingProject {
+            root: temp.path().to_path_buf(),
+            reads: ProjectReadSlot::default(),
+        };
+        let files = [ProjectFile::new(project.root.clone(), "a.rs")].into();
+        assert!(project.is_bifrostignored(Path::new("a.rs")).is_err());
+        let _read = project.reads.listing(&project);
+        publish_file_set(&project, &files).unwrap();
+        READ_RECEIPT.with_borrow(|receipt| {
+            let cause = receipt
+                .incomplete
+                .as_ref()
+                .expect("typed incomplete certificate");
+            assert_eq!(cause.operation, IgnoreObservationOperation::Listing);
+            assert!(cause.to_string().contains("injected listing failure"));
+            assert!(receipt.listing.is_none());
+            assert!(receipt.inventory.is_none());
+        });
+    }
+
+    #[test]
+    #[hardwon("#12889: invalid ignore rules erased certification failure causes")]
+    fn ignore_receipt_invalid_matcher_is_typed_incomplete() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("a.rs"), "fn a() {}\n").unwrap();
+        let project = crate::analyzer::project::FilesystemProject::new(temp.path()).unwrap();
+        std::fs::write(temp.path().join(".bifrostignore"), "[z-a]\n").unwrap();
+        project.invalidate_cached_file_listing();
+        let files = project
+            .all_files()
+            .expect("certification failure preserves the file getter");
+        assert!(project.is_bifrostignored(Path::new("a.rs")).is_err());
+        let _read = project.project_read_slot().unwrap().listing(&project);
+        publish_file_set(&project, &files).unwrap();
+        READ_RECEIPT.with_borrow(|receipt| {
+            let cause = receipt
+                .incomplete
+                .as_ref()
+                .expect("typed incomplete certificate");
+            assert_eq!(cause.operation, IgnoreObservationOperation::Matcher);
+            assert!(!cause.cause.to_string().is_empty());
+            assert!(receipt.listing.is_none());
+        });
     }
 }

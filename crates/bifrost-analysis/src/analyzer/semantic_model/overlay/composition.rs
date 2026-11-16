@@ -627,13 +627,24 @@ pub(super) fn compose(
             .as_deref()
             .and_then(|id| group.iter().find(|&&owner| symbols[owner].id == id))
             .map(|&owner| &symbols[owner]);
-        let preserve_authored_family = curated.language == "rust"
-            && curated.kind == SemanticModelSymbolKind::Function
-            && !curated.has_receiver()
-            && curated.callable_family_complete
+        // An authored `callable_family_complete` claim covers every callable
+        // with the member's exact owner, name, receiver form and declared
+        // arity. Composition keeps it on the artifact member only when the
+        // claim names that same declaration: the artifact's family of that
+        // shape holds exactly the one member the curated record corresponds
+        // to, and the original structured owner and member paths agree, which
+        // excludes aliases and reexports. The rule is language-neutral: a
+        // Rust free function (#10045) and a Java method a collection-flow
+        // pack certifies (#10989) meet it the same way.
+        let mut arity_family = candidates
+            .iter()
+            .copied()
+            .filter(|&candidate| same_declared_arity(&curated, &symbols[candidate]));
+        let preserve_authored_family = curated.callable_family_complete
             && curated.structured_signature.is_some()
-            && corresponding.len() == candidates.len()
             && corresponding.len() == 1
+            && arity_family.next() == Some(corresponding[0])
+            && arity_family.next().is_none()
             && original_owner.is_some_and(|owner| {
                 owner
                     .pre_composition_qualified_name
@@ -662,7 +673,7 @@ pub(super) fn compose(
             let artifact = &mut symbols[artifact_index];
             structural_diagnostics(&curated, artifact, active, &mut diagnostics)?;
             fill_semantics(artifact, &curated);
-            if preserve_authored_family {
+            if preserve_authored_family && !artifact.provenance.activation.approximate {
                 artifact.callable_family_complete = true;
             }
             artifact
@@ -852,6 +863,17 @@ fn compatible(
             continue;
         }
         match (curated, artifact) {
+            // A curated unbounded wildcard and a generated callable generic
+            // (the Rust producer wrote the former before the latter) both
+            // denote an unknown type.
+            (
+                TypeRef::Wildcard {
+                    variance:
+                        brokk_bifrost_semantic::analyzer::semantic_model::WildcardVariance::Any,
+                    bound: None,
+                },
+                TypeRef::TypeParameter { .. },
+            ) => {}
             (
                 TypeRef::Named {
                     name,
@@ -962,6 +984,19 @@ fn member_corresponds(
         (None, None) => Ok(curated.receiver == artifact.receiver),
         _ => Ok(false),
     }
+}
+
+/// Whether two structured signatures fall in one declared-arity family: the
+/// same number of parameters, and a variadic final parameter on both or
+/// neither (`callable_family_complete`'s family identity).
+fn same_declared_arity(left: &SemanticModelSymbol, right: &SemanticModelSymbol) -> bool {
+    let (Some(left), Some(right)) = (&left.structured_signature, &right.structured_signature)
+    else {
+        return false;
+    };
+    left.parameters.len() == right.parameters.len()
+        && left.parameters.last().is_some_and(|last| last.variadic)
+            == right.parameters.last().is_some_and(|last| last.variadic)
 }
 
 fn diagnostic(

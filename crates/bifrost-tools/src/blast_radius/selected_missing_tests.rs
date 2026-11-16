@@ -738,7 +738,16 @@ fn trace_selected_test_reachability_with_queries(
                 }
                 telemetry.proven_rows_observed = telemetry.proven_rows_observed.saturating_add(1);
 
-                if test_file_context(analyzer, &row.site.file) {
+                if match test_file_context(analyzer, &row.site.file) {
+                    Ok(value) => value,
+                    Err(reason) => {
+                        analyzer.record_query_incomplete(reason);
+                        outcome
+                            .incomplete_reasons
+                            .insert(MissingTestsIncompleteReason::UsageAnalysisIncomplete);
+                        continue;
+                    }
+                } {
                     outcome.reaches_test_context = true;
                     continue;
                 }
@@ -750,7 +759,16 @@ fn trace_selected_test_reachability_with_queries(
                         .insert(MissingTestsIncompleteReason::UnsupportedBindingBoundary);
                     continue;
                 };
-                if analyzer.in_test_region(caller) {
+                if match analyzer.in_test_region(caller) {
+                    Ok(value) => value,
+                    Err(reason) => {
+                        analyzer.record_query_incomplete(reason);
+                        outcome
+                            .incomplete_reasons
+                            .insert(MissingTestsIncompleteReason::UsageAnalysisIncomplete);
+                        continue;
+                    }
+                } {
                     outcome.reaches_test_context = true;
                     continue;
                 }
@@ -876,7 +894,7 @@ mod tests {
                     start_line: range.start_line,
                     end_line: range.end_line,
                     language: language.to_string(),
-                    in_test_context: false,
+                    in_test_context: Some(false),
                 },
                 changes: vec![CallableChangeTag::Edited],
                 incomplete_reasons: Vec::new(),

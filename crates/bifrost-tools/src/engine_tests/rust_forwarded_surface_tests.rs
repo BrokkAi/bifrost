@@ -165,9 +165,13 @@ mod forwarded_surface_tests {
                 after["vector_lib"].1, after_private_body["vector_lib"].1,
                 "facade output cutoff after private core body edit: {route}"
             );
+            // The consumer recorded vector_core, which it reads through the
+            // facade, so it derives again when that output moves (#11173 walk
+            // slice 2a); its own output is unchanged, which stops the cascade.
+            // Name-level output digests (slice 3) restore id reuse here.
             assert_eq!(
-                after["vector"], after_private_body["vector"],
-                "consumer summary cutoff after private core body edit: {route}"
+                after["vector"].1, after_private_body["vector"].1,
+                "consumer output cutoff after private core body edit: {route}"
             );
 
             // Editing the consumer forces it to read the retained facade
@@ -242,7 +246,12 @@ mod forwarded_surface_tests {
                 "public forwarded topology is unchanged: {edit}"
             );
             assert_eq!(previous["vector_lib"].1, after["vector_lib"].1, "{edit}");
-            assert_eq!(previous["vector"], after["vector"], "consumer cutoff: {edit}");
+            // The consumer derives again because the vector_core output it
+            // recorded moved (#11173 walk slice 2a); equal output cuts off.
+            assert_eq!(
+                previous["vector"].1, after["vector"].1,
+                "consumer output cutoff: {edit}"
+            );
             assert_eq!(consumer_names(&workspace), expected, "{edit}");
             assert_vector_consumed_live_facade(&workspace);
             assert_vector_matches_fresh_store(&fixture, &workspace);

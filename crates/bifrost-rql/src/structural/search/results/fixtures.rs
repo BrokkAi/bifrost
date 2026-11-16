@@ -407,7 +407,16 @@ pub fn code_query_result_fixtures_json() -> Value {
             value: Default::default(),
         },
         CodeQueryResultValue::RustPointerFinding {
-            value: Default::default(),
+            value: Box::new(CodeQueryRustPointerFinding {
+                source_ranges: vec![CodeQuerySourceSpan {
+                    path: "source.rs".into(),
+                    range: Default::default(),
+                    start_byte: 4,
+                    end_byte: 8,
+                }],
+                source_ranges_omitted: brokk_bifrost_core::omission::OmissionCount::lower_bound(1),
+                ..Default::default()
+            }),
         },
         CodeQueryResultValue::Guard {
             value: Default::default(),
@@ -465,6 +474,10 @@ pub fn code_query_result_fixtures_json() -> Value {
         depth_bound_status: Some(DepthBoundStatus::Unknown),
         session_subset: None,
         diagnostics: vec![CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            has_non_utf8_refusal: false,
+            refusal_sites: Default::default(),
+            call_relation_facts: None,
+            uses_omissions: Vec::new(),
             incompleteness: brokk_bifrost_rql::Incompleteness::Operational(
                 brokk_bifrost_rql::DiagnosticExecutionCause::Provider,
             ),

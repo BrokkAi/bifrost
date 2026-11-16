@@ -271,17 +271,21 @@ fn source_snapshot_limit_counts_utf8_bytes() {
         )
         .unwrap();
         for analyzer in [&workspace, &fresh] {
-            assert!(
+            assert!(matches!(
                 analyzer
                     .current_program_semantics_artifact_source(&file, source.len() - 1)
-                    .unwrap()
-                    .is_none()
-            );
+                    .unwrap(),
+                brokk_bifrost_analysis::analyzer::workspace::SemanticArtifactSourceOutcome::Refused(
+                    _
+                )
+            ));
             for limit in [source.len(), source.len() + 1] {
                 let snapshot = analyzer
                     .current_program_semantics_artifact_source(&file, limit)
-                    .unwrap()
                     .unwrap();
+                let brokk_bifrost_analysis::analyzer::workspace::SemanticArtifactSourceOutcome::Held(snapshot) = snapshot else {
+                    panic!("expected current source");
+                };
                 assert_eq!(snapshot.source(), source);
                 assert_eq!(
                     snapshot.key().revision().content(),

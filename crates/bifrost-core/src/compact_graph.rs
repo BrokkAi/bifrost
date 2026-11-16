@@ -87,6 +87,13 @@ impl<T> CompactRows<T> {
                 (self.values.len() as u64).saturating_mul(std::mem::size_of::<T>() as u64),
             )
     }
+    /// Allocated buffers for pure evictable snapshots. The raw estimator stays
+    /// available to construction and resident-admission limits.
+    pub fn allocated_estimated_bytes(&self) -> u64 {
+        crate::allocation_size::allocation_size(std::mem::size_of_val(self.offsets.as_ref())) as u64
+            + crate::allocation_size::allocation_size(std::mem::size_of_val(self.values.as_ref()))
+                as u64
+    }
 }
 
 pub struct CompactRowsBuilder<T> {
@@ -223,6 +230,37 @@ where
             self.index_by_node.capacity(),
             self.edge_count(),
         )
+    }
+
+    pub fn allocated_estimated_bytes(&self) -> u64 {
+        Self::allocated_estimated_bytes_for_parts(
+            self.nodes.len(),
+            self.index_by_node.capacity(),
+            self.edge_count(),
+        )
+    }
+
+    /// Per-buffer allocation estimate for evictable graph caches. The raw
+    /// estimator is retained for semantic/refusing work ledgers.
+    pub fn allocated_estimated_bytes_for_parts(
+        node_count: usize,
+        index_capacity: usize,
+        edge_count: usize,
+    ) -> u64 {
+        use crate::allocation_size::allocation_size;
+        let nodes = allocation_size(node_count.saturating_mul(std::mem::size_of::<K>()));
+        let index = crate::hash::allocated_table_slot_bytes::<(K, u32)>(index_capacity);
+        let offsets = allocation_size(
+            node_count
+                .saturating_add(1)
+                .saturating_mul(std::mem::size_of::<u32>()),
+        );
+        let edges = allocation_size(edge_count.saturating_mul(std::mem::size_of::<u32>()));
+        std::mem::size_of::<Self>()
+            .saturating_add(nodes)
+            .saturating_add(index)
+            .saturating_add(offsets.saturating_mul(2))
+            .saturating_add(edges.saturating_mul(2)) as u64
     }
 
     pub fn estimated_bytes_for_parts(

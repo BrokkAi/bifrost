@@ -106,6 +106,7 @@ use brokk_bifrost_jvm::scala::ambient_use::scala_declaration_ambient_use;
 use brokk_bifrost_jvm::scala::declarations::scala_class_parameter_field_keyword;
 use brokk_bifrost_jvm::scala::graph::syntax::{
     ScalaCallableRole, ScalaCallableSourceAlternative, ScalaTypeExpressionPath,
+    scala_extension_receiver,
 };
 use tree_sitter::Node;
 
@@ -694,6 +695,7 @@ fn scala_entry_facts(
             hierarchy,
             aliases: Vec::new(),
             extension_surfaces: Vec::new(),
+            rust_stability: None,
             guard: None,
             locator: Locator::Source {
                 path: entry_name.to_owned(),
@@ -776,6 +778,28 @@ fn scala_entry_facts(
         }
         let callable = declaration_source.callable.as_ref();
         let member_kind = scala_member_kind(declaration, callable);
+        let extension = callable.and_then(|_| scala_extension_receiver(node, source));
+        let owner_type_parameters = type_parameters_by_declaration
+            .get(owner)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let extension_type_parameters = extension
+            .as_ref()
+            .map(|extension| extension.type_parameters.as_slice())
+            .unwrap_or_default();
+        // The receiver is not an ordinary parameter, so extensions in one
+        // owner that differ only in their receivers need it in their identity.
+        let extension_receiver = extension.as_ref().map(|extension| {
+            extension
+                .receiver_type
+                .as_ref()
+                .map_or(TypeRef::Unknown, |receiver| {
+                    scala_type_ref(
+                        receiver,
+                        &[owner_type_parameters, extension_type_parameters].concat(),
+                    )
+                })
+        });
         // Exact source formal types still define the declaration identity when
         // the public flat signature cannot express its parameter-list boundary.
         let identity_signature = callable.and_then(|callable| {
@@ -784,10 +808,8 @@ fn scala_entry_facts(
                 node,
                 source,
                 declaration_source.generic_owner.as_ref(),
-                type_parameters_by_declaration
-                    .get(owner)
-                    .map(Vec::as_slice)
-                    .unwrap_or_default(),
+                owner_type_parameters,
+                extension_type_parameters,
             )
         });
         let omit_signature = identity_signature.is_some()
@@ -852,6 +874,7 @@ fn scala_entry_facts(
             generic_arity,
             parameter_types: &parameter_types,
             parameter_variadics: &parameter_variadics,
+            extension_receiver: extension_receiver.as_ref(),
             return_type: identity_signature
                 .as_ref()
                 .and_then(|signature| signature.returns.as_ref()),
@@ -901,9 +924,10 @@ fn scala_entry_facts(
             exact_return_classes: Vec::new(),
             signature,
             receiver: is_map_member.then_some(ReceiverFact { pointer: false }),
-            extension_receiver: None,
+            extension_receiver,
             extension_receiver_constraints: Vec::new(),
             aliases: Vec::new(),
+            rust_stability: None,
             guard: None,
             locator: Locator::Source {
                 path: entry_name.to_owned(),
@@ -946,6 +970,7 @@ fn empty_constructor_fact(owner: &TypeFact, name: String) -> MemberFact {
             generic_arity: 0,
             parameter_types: &[],
             parameter_variadics: &[],
+            extension_receiver: None,
             return_type: None,
         }),
         owner: owner.id.clone(),
@@ -968,6 +993,7 @@ fn empty_constructor_fact(owner: &TypeFact, name: String) -> MemberFact {
         extension_receiver: None,
         extension_receiver_constraints: Vec::new(),
         aliases: Vec::new(),
+        rust_stability: None,
         guard: None,
         locator: owner.locator.clone(),
     }
@@ -1074,13 +1100,22 @@ fn scala_signature(
         &brokk_bifrost_jvm::scala::graph::syntax::ScalaGenericOwnerSourceFacts,
     >,
     owner_type_parameters: &[String],
+    extension_type_parameters: &[String],
 ) -> Option<Signature> {
     if callable.parameter_type_expressions.len() != callable.parameter_defaults.len() {
         return None;
     }
-    let type_parameters = callable_generic_facts
-        .map(|facts| facts.type_parameters.clone())
-        .unwrap_or_default();
+    // Scala desugars an extension method so that the extension clause's type
+    // parameters lead its own; the flat signature keeps that order.
+    let type_parameters = extension_type_parameters
+        .iter()
+        .chain(
+            callable_generic_facts
+                .into_iter()
+                .flat_map(|facts| &facts.type_parameters),
+        )
+        .cloned()
+        .collect::<Vec<_>>();
     let mut available_type_parameters = owner_type_parameters.to_vec();
     available_type_parameters.extend(type_parameters.iter().cloned());
     let expected_parameter_count = callable
@@ -1519,6 +1554,387 @@ trait Overloads[A] {
         compile_pack(&pack, &Default::default()).unwrap();
     }
 
+    /// Reduced from `scala/IArray.scala` in the released
+    /// scala3-library_3-3.3.5-sources.jar.
+    const IARRAY_EXTENSIONS: &str = r#"package scala
+import reflect.ClassTag
+
+opaque type IArray[+T] = Array[_ <: T]
+
+object IArray:
+  extension (arr: IArray[Byte]) def length: Int = arr.asInstanceOf[Array[Byte]].length
+  extension (arr: IArray[Object]) def length: Int = arr.asInstanceOf[Array[Object]].length
+  extension [T](arr: IArray[T]) def length: Int = arr.asInstanceOf[Array[T]].length
+
+  def apply[T](xs: T*)(using ct: ClassTag[T]): IArray[T] = Array(xs: _*)
+  def apply(x: Byte, xs: Byte*): IArray[Byte] = Array(x, xs: _*)
+  def apply(x: Short, xs: Short*): IArray[Short] = Array(x, xs: _*)
+
+  extension [T, U >: T: ClassTag](prefix: IterableOnce[T])
+    def ++:(arr: IArray[U]): IArray[U] = genericArrayOps(arr).prependedAll(prefix)
+
+  extension [T, U >: T: ClassTag](prefix: IArray[T])
+    def ++:(arr: IArray[U]): IArray[U] = genericArrayOps(arr).prependedAll(prefix)
+end IArray
+"#;
+
+    /// The same declarations with each receiver type laid out differently.
+    const IARRAY_EXTENSIONS_RESPELLED: &str = r#"package scala
+import reflect.ClassTag
+
+opaque type IArray[+T] = Array[_ <: T]
+
+object IArray:
+  extension (arr: IArray[ Byte ]) def length: Int = arr.asInstanceOf[Array[Byte]].length
+  extension (arr:  IArray[Object
+    ]) def length: Int = arr.asInstanceOf[Array[Object]].length
+  extension [T](arr: IArray [T]) def length: Int = arr.asInstanceOf[Array[T]].length
+
+  def apply[T](xs: T*)(using ct: ClassTag[T]): IArray[T] = Array(xs: _*)
+  def apply(x: Byte, xs: Byte*): IArray[Byte] = Array(x, xs: _*)
+  def apply(x: Short, xs: Short*): IArray[Short] = Array(x, xs: _*)
+
+  extension [T, U >: T: ClassTag](prefix:
+      IterableOnce[
+        T
+      ])
+    def ++:(arr: IArray[U]): IArray[U] = genericArrayOps(arr).prependedAll(prefix)
+
+  extension [T, U >: T: ClassTag](prefix: IArray[T] )
+    def ++:(arr: IArray[U]): IArray[U] = genericArrayOps(arr).prependedAll(prefix)
+end IArray
+"#;
+
+    #[test]
+    #[hardwon(
+        "#5997: Scala 3 IArray `++:` extensions on IterableOnce[T] and IArray[T] shared one member id and panicked the producer"
+    )]
+    fn scala_source_jar_keeps_extension_receivers_in_member_identity() {
+        let other = ("scala/Other.scala", "package scala\nobject Other\n");
+        let produce = |entries: &[(&str, &str)]| {
+            let jar = source_jar(entries);
+            let production = ScalaSourceJarPackProducer.produce_exact_artifact(
+                &request(jar.path().to_owned()),
+                &ArtifactProducerLimits::default(),
+            );
+            let pack = production.pack.expect("Scala extension pack");
+            compile_pack(&pack, &Default::default()).expect("member ids are distinct");
+            let AuthoredPayload::DeclarationFacts { types, members, .. } = &pack.shards[0].payload
+            else {
+                panic!("Scala producer should emit declaration facts");
+            };
+            let owner = types
+                .iter()
+                .find(|fact| fact.name == "scala.IArray")
+                .expect("IArray owner")
+                .id
+                .clone();
+            let mut identities = members
+                .iter()
+                .filter(|member| member.owner == owner)
+                .map(|member| {
+                    (
+                        member.id.clone(),
+                        member.name.clone(),
+                        member.extension_receiver.clone(),
+                        member.signature.clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            identities.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+            (owner, identities, production.diagnostics)
+        };
+        let (owner, identities, diagnostics) =
+            produce(&[("scala/IArray.scala", IARRAY_EXTENSIONS), other]);
+
+        let named = |name: &str, arguments: Vec<TypeRef>| TypeRef::Named {
+            name: name.to_owned(),
+            arguments,
+            nullable: false,
+        };
+        let type_parameter = |name: &str| TypeRef::TypeParameter {
+            name: name.to_owned(),
+        };
+        let receivers_of = |name: &str| {
+            let members = identities
+                .iter()
+                .filter(|(_, member, _, _)| member == name)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                members
+                    .iter()
+                    .map(|(id, ..)| id)
+                    .collect::<HashSet<_>>()
+                    .len(),
+                members.len(),
+                "{name} members={members:#?}"
+            );
+            members
+                .iter()
+                .map(|(_, _, receiver, _)| receiver.clone().expect("extension receiver"))
+                .collect::<HashSet<_>>()
+        };
+        // Receivers are qualified like signature types: `IArray` is declared
+        // in the artifact, `IterableOnce`, `Byte` and `Object` are not.
+        assert_eq!(
+            receivers_of("++:"),
+            HashSet::from_iter([
+                named("IterableOnce", vec![type_parameter("T")]),
+                named("scala.IArray", vec![type_parameter("T")]),
+            ])
+        );
+        assert_eq!(
+            receivers_of("length"),
+            HashSet::from_iter([
+                named("scala.IArray", vec![named("Byte", Vec::new())]),
+                named("scala.IArray", vec![named("Object", Vec::new())]),
+                named("scala.IArray", vec![type_parameter("T")]),
+            ])
+        );
+        // The extension clause's type parameters lead the signature's type
+        // parameters, and both `++:` share that signature.
+        let prepend_array = named("scala.IArray", vec![type_parameter("U")]);
+        for (_, _, _, signature) in identities.iter().filter(|(_, name, ..)| name == "++:") {
+            let signature = signature.as_ref().expect("`++:` signature");
+            assert_eq!(signature.type_parameters, ["T", "U"]);
+            assert_eq!(
+                signature
+                    .parameters
+                    .iter()
+                    .map(|parameter| (parameter.name.as_deref(), &parameter.r#type))
+                    .collect::<Vec<_>>(),
+                [(Some("arr"), &prepend_array)]
+            );
+            assert_eq!(signature.returns.as_ref(), Some(&prepend_array));
+        }
+
+        // Ordinary members keep the identity they had before receivers
+        // entered it, and the curried repeated list stays withheld.
+        let byte = named("Byte", Vec::new());
+        let ordinary_apply = member_declaration_id(MemberIdentity {
+            owner_id: &owner,
+            kind: MemberKind::Method,
+            is_static: true,
+            parameter_arity: 2,
+            name: "apply",
+            generic_arity: 0,
+            parameter_types: &[byte.clone(), byte.clone()],
+            parameter_variadics: &[false, true],
+            extension_receiver: None,
+            return_type: Some(&named("IArray", vec![byte])),
+        });
+        let applies = identities
+            .iter()
+            .filter(|(_, name, ..)| name == "apply")
+            .collect::<Vec<_>>();
+        assert_eq!(applies.len(), 3, "applies={applies:#?}");
+        assert!(applies.iter().all(|(_, _, receiver, _)| receiver.is_none()));
+        assert!(applies.iter().any(|(id, ..)| *id == ordinary_apply));
+        assert_eq!(
+            applies
+                .iter()
+                .filter(|(_, _, _, signature)| signature.is_none())
+                .count(),
+            1
+        );
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "scala.signature.repeated_parameter_list"
+                && diagnostic.declaration.as_deref() == Some("scala.IArray$.apply")
+        }));
+
+        // Identity is semantic: archive order, entry path and receiver
+        // spelling do not move it.
+        for entries in [
+            vec![other, ("scala/IArray.scala", IARRAY_EXTENSIONS)],
+            vec![("renamed/ImmutableArray.scala", IARRAY_EXTENSIONS), other],
+            vec![("scala/IArray.scala", IARRAY_EXTENSIONS_RESPELLED), other],
+        ] {
+            assert_eq!(produce(&entries).1, identities, "entries={entries:?}");
+        }
+    }
+
+    /// The members the Scala producer publishes on `owner` for one source
+    /// file. Compiling the pack checks that member ids are distinct.
+    fn scala_owner_members(source: &str, owner: &str) -> Vec<MemberFact> {
+        let jar = source_jar(&[("sample/Forwarders.scala", source)]);
+        let production = ScalaSourceJarPackProducer.produce_exact_artifact(
+            &request(jar.path().to_owned()),
+            &ArtifactProducerLimits::default(),
+        );
+        let pack = production.pack.expect("Scala forwarder pack");
+        compile_pack(&pack, &Default::default()).expect("member ids are distinct");
+        let AuthoredPayload::DeclarationFacts { types, members, .. } = &pack.shards[0].payload
+        else {
+            panic!("Scala producer should emit declaration facts");
+        };
+        let owner_id = &types
+            .iter()
+            .find(|fact| fact.name == owner)
+            .unwrap_or_else(|| panic!("{owner} owner in {types:#?}"))
+            .id;
+        members
+            .iter()
+            .filter(|member| member.owner == *owner_id)
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    #[hardwon(
+        "#12189: object forwarder shadowing compared type parameters by source name, so a renamed own term left a spurious inherited overload"
+    )]
+    fn scala_object_forwarders_compare_type_parameters_by_position() {
+        let members = scala_owner_members(
+            r#"
+package sample
+
+trait Ops:
+  def first[T](xs: Seq[T]): T = xs.head
+  extension [T](xs: Seq[T]) def second: T = xs(1)
+  def scale[T](x: T): T = x
+  extension [T](xs: Array[T]) def tag: Int = 0
+
+object O extends Ops:
+  def first[U](xs: Seq[U]): U = xs.head
+  extension [U](xs: Seq[U]) def second: U = xs(1)
+  def scale[T](x: Int): Int = x
+  extension (xs: Array[Int]) def tag: Int = xs.length
+"#,
+            "sample.O",
+        );
+        let named = |name: &str, arguments: Vec<TypeRef>| TypeRef::Named {
+            name: name.to_owned(),
+            arguments,
+            nullable: false,
+        };
+        let type_parameter = |name: &str| TypeRef::TypeParameter {
+            name: name.to_owned(),
+        };
+        // Each term of `O` as its type parameters, receiver and parameter
+        // types, spelled as the declaration that published it spells them.
+        let terms_of = |name: &str| {
+            let mut terms = members
+                .iter()
+                .filter(|member| member.name == name)
+                .map(|member| {
+                    let signature = member.signature.as_ref().expect("signature");
+                    (
+                        signature.type_parameters.clone(),
+                        member.extension_receiver.clone(),
+                        signature
+                            .parameters
+                            .iter()
+                            .map(|parameter| parameter.r#type.clone())
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            terms.sort_by_key(|term| format!("{term:?}"));
+            terms
+        };
+        let t = || vec!["T".to_owned()];
+
+        // A renamed type parameter is the same term, for an ordinary parameter
+        // and for an extension receiver, so only the own declaration remains.
+        assert_eq!(
+            terms_of("first"),
+            [(
+                vec!["U".to_owned()],
+                None,
+                vec![named("Seq", vec![type_parameter("U")])]
+            )]
+        );
+        assert_eq!(
+            terms_of("second"),
+            [(
+                vec!["U".to_owned()],
+                Some(named("Seq", vec![type_parameter("U")])),
+                Vec::new()
+            )]
+        );
+        // A concrete type where the inherited term has a type parameter is a
+        // genuine overload, so the inherited term stays as a forwarder.
+        let mut scale = vec![
+            (t(), None, vec![named("Int", Vec::new())]),
+            (t(), None, vec![type_parameter("T")]),
+        ];
+        scale.sort_by_key(|term| format!("{term:?}"));
+        assert_eq!(terms_of("scale"), scale);
+        let mut tag = vec![
+            (
+                Vec::new(),
+                Some(named("Array", vec![named("Int", Vec::new())])),
+                Vec::new(),
+            ),
+            (
+                t(),
+                Some(named("Array", vec![type_parameter("T")])),
+                Vec::new(),
+            ),
+        ];
+        tag.sort_by_key(|term| format!("{term:?}"));
+        assert_eq!(terms_of("tag"), tag);
+    }
+
+    #[test]
+    #[hardwon(
+        "#12375: an object's swap[B <: String, A](x: A, y: B) and the forwarder of an inherited swap[A <: String, B](x: A, y: B) shared one spelled member id"
+    )]
+    fn scala_object_forwarders_keep_swapped_type_parameter_overloads_distinct() {
+        let members = scala_owner_members(
+            r#"
+package sample
+
+trait Generic:
+  def swap[A <: String, B](x: A, y: B): Int = 0
+
+object O extends Generic:
+  def swap[B <: String, A](x: A, y: B): Int = 1
+"#,
+            "sample.O",
+        );
+        let swaps = members
+            .iter()
+            .filter(|member| member.name == "swap")
+            .collect::<Vec<_>>();
+        // By position these are different overloads: the bounded type
+        // parameter types `x` in one and `y` in the other. The forwarder keeps
+        // the trait's spelling and the own term keeps its own.
+        assert_eq!(swaps.len(), 2, "swaps={swaps:#?}");
+        assert_ne!(swaps[0].id, swaps[1].id, "swaps={swaps:#?}");
+        let mut type_parameters = swaps
+            .iter()
+            .map(|member| {
+                let signature = member.signature.as_ref().expect("swap signature");
+                assert_eq!(
+                    signature
+                        .parameters
+                        .iter()
+                        .map(|parameter| (parameter.name.as_deref(), &parameter.r#type))
+                        .collect::<Vec<_>>(),
+                    [
+                        (
+                            Some("x"),
+                            &TypeRef::TypeParameter {
+                                name: "A".to_owned()
+                            }
+                        ),
+                        (
+                            Some("y"),
+                            &TypeRef::TypeParameter {
+                                name: "B".to_owned()
+                            }
+                        ),
+                    ],
+                    "swap={member:#?}"
+                );
+                signature.type_parameters.clone()
+            })
+            .collect::<Vec<_>>();
+        type_parameters.sort();
+        assert_eq!(type_parameters, [["A", "B"], ["B", "A"]]);
+    }
+
     #[test]
     #[hardwon(
         "#4709: curried Scala `xs: T*)(y: U)` flattened into a positional formal after a vararg and failed native pack validation"
@@ -1605,6 +2021,7 @@ trait RepeatedLists {
                 generic_arity: 0,
                 parameter_types: &parameter_types,
                 parameter_variadics: &[true, false],
+                extension_receiver: None,
                 return_type: Some(&return_type),
             })
         );

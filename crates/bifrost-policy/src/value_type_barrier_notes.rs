@@ -200,6 +200,18 @@ pub struct ValueTypeBarrierNotes {
 }
 
 impl ValueTypeBarrierNotes {
+    pub(crate) fn omit_optional_detail(&mut self) -> bool {
+        if self.entries.is_empty() {
+            return false;
+        }
+        self.truncated = true;
+        self.omitted_lower_bound = self
+            .omitted_lower_bound
+            .saturating_add(self.entries.len() as u64);
+        self.entries = Vec::new();
+        true
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty() && !self.truncated
     }

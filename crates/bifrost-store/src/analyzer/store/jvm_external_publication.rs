@@ -6,7 +6,15 @@ use rusqlite::{
 };
 use sha2::{Digest, Sha256};
 
-pub const JVM_EXTERNAL_PROJECTION_VERSION: i64 = 1;
+pub fn jvm_external_projection_identity() -> [u8; 32] {
+    static IDENTITY: std::sync::LazyLock<[u8; 32]> = std::sync::LazyLock::new(|| {
+        brokk_bifrost_core::lever_tokens::lever_identity(
+            "jvm-external-projection",
+            brokk_bifrost_core::lever_file!("jvm-external-projection.tokens"),
+        )
+    });
+    *IDENTITY
+}
 
 /// Values use the target inventory table's column order, including provider_id.
 /// The caller reads these through its pinned catalog handle. No decoded shard is used.
@@ -26,11 +34,10 @@ pub enum JvmExternalPublication {
     Conflict,
 }
 
-const OWNER_COLUMNS: &str =
-    "provider_id,owner_fqn,callables_complete,values_complete,types_complete,supertypes_complete";
-const MEMBER_COLUMNS: &str = "provider_id,owner_fqn,ordinal,member_name,member_kind,visibility,is_static,signature_present,callable_family_complete,non_overridable,parameters_jsonb,return_type_jsonb";
-const MEMBER_READ_COLUMNS: &str = "provider_id,owner_fqn,ordinal,member_name,member_kind,visibility,is_static,signature_present,callable_family_complete,non_overridable,json(parameters_jsonb),json(return_type_jsonb)";
-const SUPERTYPE_COLUMNS: &str = "provider_id,owner_fqn,supertype_fqn,ordinal";
+const OWNER_COLUMNS: &str = "provider_id,owner_fqn,callables_complete,values_complete,types_complete,supertypes_complete,type_parameters_jsonb";
+const MEMBER_COLUMNS: &str = "provider_id,owner_fqn,ordinal,member_name,member_kind,visibility,is_static,signature_present,callable_family_complete,non_overridable,parameters_jsonb,return_type_jsonb,is_abstract,type_parameters_jsonb";
+const MEMBER_READ_COLUMNS: &str = "provider_id,owner_fqn,ordinal,member_name,member_kind,visibility,is_static,signature_present,callable_family_complete,non_overridable,json(parameters_jsonb),json(return_type_jsonb),is_abstract,json(type_parameters_jsonb)";
+const SUPERTYPE_COLUMNS: &str = "provider_id,owner_fqn,supertype_fqn,ordinal,type_arguments_jsonb";
 
 fn canonical_rows(rows: &[Vec<Value>], columns: usize, digest: &mut Sha256) -> Result<()> {
     let mut encoded = Vec::with_capacity(rows.len());
@@ -61,11 +68,11 @@ fn canonical_rows(rows: &[Vec<Value>], columns: usize, digest: &mut Sha256) -> R
 
 fn projection_digest(source: &JvmExternalProjection) -> Result<Vec<u8>> {
     let mut digest = Sha256::new();
-    digest.update(b"jvm-external-projection-v1");
+    digest.update(b"jvm-external-projection-v2");
     for (tag, rows, width) in [
-        (0u8, &source.owners, 6),
-        (1, &source.members, 12),
-        (2, &source.supertypes, 4),
+        (0u8, &source.owners, 7),
+        (1, &source.members, 14),
+        (2, &source.supertypes, 5),
     ] {
         digest.update([tag]);
         digest.update((rows.len() as u64).to_le_bytes());
@@ -79,15 +86,16 @@ fn certificate_matches(
     source: &JvmExternalProjection,
     digest: &[u8],
 ) -> Result<bool> {
-    let certificate: Option<(String, i64, Vec<u8>, i64, i64, i64)> = tx.prepare_cached(
-        "SELECT source_identity,projection_version,projected_rows_sha256,owner_count,member_count,supertype_count FROM jvm_external_provider_publications WHERE provider_id=?1",
+    type Certificate = (String, [u8; 32], Vec<u8>, i64, i64, i64);
+    let certificate: Option<Certificate> = tx.prepare_cached(
+        "SELECT source_identity,projection_identity,projected_rows_sha256,owner_count,member_count,supertype_count FROM jvm_external_provider_publications WHERE provider_id=?1",
     )?.query_row([&source.provider_id],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
     ).optional()?;
     Ok(certificate.is_some_and(|row| {
         row == (
             source.source_identity.clone(),
-            JVM_EXTERNAL_PROJECTION_VERSION,
+            jvm_external_projection_identity(),
             digest.to_vec(),
             source.owners.len() as i64,
             source.members.len() as i64,
@@ -126,23 +134,23 @@ fn readback_matches(
         owners: read_rows(
             tx,
             "jvm_external_owners",
-            OWNER_COLUMNS,
+            "provider_id,owner_fqn,callables_complete,values_complete,types_complete,supertypes_complete,json(type_parameters_jsonb)",
             &source.provider_id,
-            6,
+            7,
         )?,
         members: read_rows(
             tx,
             "jvm_external_owner_members",
             MEMBER_READ_COLUMNS,
             &source.provider_id,
-            12,
+            14,
         )?,
         supertypes: read_rows(
             tx,
             "jvm_external_owner_supertypes",
-            SUPERTYPE_COLUMNS,
+            "provider_id,owner_fqn,supertype_fqn,ordinal,json(type_arguments_jsonb)",
             &source.provider_id,
-            4,
+            5,
         )?,
     };
     Ok(actual.owners.len() == source.owners.len()
@@ -199,9 +207,9 @@ impl AnalyzerStore {
             // Legacy rows have no certificate and cannot be trusted, even if their counts agree.
             tx.prepare_cached("DELETE FROM jvm_external_owners WHERE provider_id=?1")?.execute([&source.provider_id])?;
             for (table, columns, placeholders, rows) in [
-                ("jvm_external_owners", OWNER_COLUMNS, "?1,?2,?3,?4,?5,?6", &source.owners),
-                ("jvm_external_owner_members", MEMBER_COLUMNS, "?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,jsonb(?11),jsonb(?12)", &source.members),
-                ("jvm_external_owner_supertypes", SUPERTYPE_COLUMNS, "?1,?2,?3,?4", &source.supertypes),
+                ("jvm_external_owners", OWNER_COLUMNS, "?1,?2,?3,?4,?5,?6,jsonb(?7)", &source.owners),
+                ("jvm_external_owner_members", MEMBER_COLUMNS, "?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,jsonb(?11),jsonb(?12),?13,jsonb(?14)", &source.members),
+                ("jvm_external_owner_supertypes", SUPERTYPE_COLUMNS, "?1,?2,?3,?4,jsonb(?5)", &source.supertypes),
             ] {
                 let sql = format!("INSERT INTO {table}({columns}) VALUES({placeholders})");
                 let mut statement = tx.prepare(&sql)?;
@@ -214,8 +222,8 @@ impl AnalyzerStore {
                 return Err(StoreError::new("JVM provider projection readback mismatch"));
             }
             if cancelled() { return Err(StoreError::cancelled("JVM publication cancelled")); }
-            tx.prepare_cached("INSERT INTO jvm_external_provider_publications(provider_id,source_identity,projection_version,projected_rows_sha256,owner_count,member_count,supertype_count) VALUES(?1,?2,?3,?4,?5,?6,?7)")?.execute(
-                params![source.provider_id, source.source_identity, JVM_EXTERNAL_PROJECTION_VERSION, digest,
+            tx.prepare_cached("INSERT INTO jvm_external_provider_publications(provider_id,source_identity,projection_identity,projected_rows_sha256,owner_count,member_count,supertype_count) VALUES(?1,?2,?3,?4,?5,?6,?7)")?.execute(
+                params![source.provider_id, source.source_identity, jvm_external_projection_identity(), digest,
                     source.owners.len(), source.members.len(), source.supertypes.len()])?;
             tx.commit()?;
             Ok(JvmExternalPublication::Available)
@@ -238,22 +246,50 @@ mod tests {
                 Value::Integer(1),
                 Value::Integer(1),
                 Value::Integer(1),
+                Value::Text("[]".into()),
             ]],
-            members: vec![],
+            members: [false, true]
+                .into_iter()
+                .enumerate()
+                .map(|(ordinal, is_abstract)| {
+                    vec![
+                        Value::Text("sha".into()),
+                        Value::Text("p.C".into()),
+                        Value::Integer(ordinal as i64),
+                        Value::Text(format!("run{ordinal}")),
+                        Value::Text("method".into()),
+                        Value::Text("public".into()),
+                        Value::Integer(0),
+                        Value::Integer(1),
+                        Value::Integer(1),
+                        Value::Null,
+                        Value::Text("[]".into()),
+                        Value::Null,
+                        Value::Integer(i64::from(is_abstract)),
+                        Value::Text("[]".into()),
+                    ]
+                })
+                .collect(),
             supertypes: vec![],
         }
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11148: legacy JVM member rows lacked declaration kind and must reproject before sealing"
+    )]
     fn publication_replaces_legacy_and_seals_rows() {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
             .conn
             .execute(|conn| -> Result<()> {
                 conn.execute(
-                    "INSERT INTO jvm_external_owners VALUES('sha','p.C',0,0,0,0)",
+                    "INSERT INTO jvm_external_owners(provider_id,owner_fqn,callables_complete,values_complete,types_complete,supertypes_complete) VALUES('sha','p.C',0,0,0,0)",
                     [],
                 )?;
+                conn.execute("INSERT INTO jvm_external_owner_members(provider_id,owner_fqn,ordinal,member_name,member_kind,visibility,is_static,signature_present,callable_family_complete,parameters_jsonb) VALUES('sha','p.C',0,'run0','method','public',0,1,1,jsonb('[]'))", [])?;
+                let flag: Option<bool> = conn.query_row("SELECT is_abstract FROM jvm_external_owner_members WHERE provider_id='sha'", [], |row| row.get(0))?;
+                assert_eq!(flag, None);
                 Ok(())
             })
             .unwrap();
@@ -274,6 +310,11 @@ mod tests {
         store
             .conn
             .execute(|conn| -> Result<()> {
+                let flags = conn.prepare("SELECT is_abstract FROM jvm_external_owner_members WHERE provider_id='sha' ORDER BY ordinal")?
+                    .query_map([], |row| row.get::<_, Option<bool>>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                assert_eq!(flags, [Some(false), Some(true)]);
+                assert!(conn.execute("UPDATE jvm_external_owner_members SET is_abstract=NULL WHERE provider_id='sha'", []).is_err());
                 assert!(
                     conn.execute(
                         "UPDATE jvm_external_owners SET values_complete=0 WHERE provider_id='sha'",

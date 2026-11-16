@@ -60,6 +60,15 @@ pub enum RustVecMacroArguments {
     Repeated(Box<RustVecMacroRepeatedArguments>),
 }
 
+impl RustVecMacroArguments {
+    pub fn into_operands(self) -> Vec<RustFormatMacroArgument> {
+        match self {
+            Self::Elements(elements) => elements,
+            Self::Repeated(repeated) => vec![repeated.element, repeated.count],
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RustVecMacroRepeatedArguments {
     pub element: RustFormatMacroArgument,
@@ -96,6 +105,10 @@ pub enum RustMacroRuntimeArgument {
     BorrowedOperand(usize),
     OptionalMessage { first_operand: usize },
     DebugOperand,
+    Synthetic,
+    LogMessage,
+    LogOperand(crate::macro_matcher::RustLogOperandRole),
+    LogKeyValues,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -142,11 +155,18 @@ pub fn rust_macro_runtime_layout(owner: &str, member: &str) -> Option<RustMacroR
                 OptionalMessage { first_operand: 2 },
             ],
         ),
+        ("std" | "alloc", "vec") => ("alloc", "vec", &[]),
         ("std", "dbg") => ("std.io.stdio", "_eprint", &[DebugOperand]),
         (owner, member) if rust_logging_macro(owner, member).is_some() => (
             "log.__private_api",
             "log",
-            &[Message { first_operand: 0 }; 5],
+            &[
+                Synthetic,
+                LogMessage,
+                LogOperand(crate::macro_matcher::RustLogOperandRole::Level),
+                LogOperand(crate::macro_matcher::RustLogOperandRole::Target),
+                LogKeyValues,
+            ],
         ),
         _ => return None,
     };
@@ -158,8 +178,8 @@ pub fn rust_macro_runtime_layout(owner: &str, member: &str) -> Option<RustMacroR
     })
 }
 
-/// Obtain a candidate layout from an AST path. Bare names use the standard
-/// prelude candidate; local shadowing is decided by the resolver, not here.
+/// Obtain a candidate layout from an AST path. Bare logging names use the log
+/// grammar candidate with unresolved identity; other bare names use the prelude.
 pub fn rust_macro_runtime_layout_for_path(
     path: Node<'_>,
     source: &str,
@@ -171,6 +191,7 @@ pub fn rust_macro_runtime_layout_for_path(
         source,
     ));
     let owner = match segments.as_slice() {
+        [_] if rust_logging_macro("log", member).is_some() => "log",
         [_] => "std",
         [owner, _] => {
             strip_raw_identifier_prefix(crate::declarations::rust_node_text(*owner, source))
@@ -213,6 +234,7 @@ pub struct RustFormatMacroArgument {
     pub value_kind: &'static str,
     /// Name from the structured `name = expression` grammar, when present.
     pub name: Option<Box<str>>,
+    pub role: Option<crate::macro_matcher::RustLogOperandRole>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,27 +266,10 @@ pub fn rust_logging_format_operand(
     let name = *crate::graph_support::rust_path_segments(path)?.last()?;
     let name = crate::declarations::rust_node_text(name, source);
     rust_logging_macro("log", name)?;
-    let tree = crate::declarations::rust_macro_invocation_arguments(invocation)?;
-    let (tokens, _) = crate::macro_matcher::interior_tokens(tree);
-    if tokens.iter().any(|token| token.kind() == ";") {
-        return None;
-    }
-    let target = matches!(tokens.as_slice(), [first, colon, ..] if first.kind() == "identifier" && crate::declarations::rust_node_text(*first, source) == "target" && colon.kind() == ":");
-    let index = usize::from(target) + usize::from(name == "log");
-    arguments
-        .get(index)
-        .filter(|argument| matches!(argument.value_kind, "string_literal" | "raw_string_literal"))
-        .map(|_| index)
-}
-
-pub fn rust_matches_macro_scrutinee(
-    invocation: Node<'_>,
-    source: &str,
-) -> Result<RustFormatMacroArgument, RustFormatMacroArgumentsError> {
-    rust_format_macro_arguments(invocation, source)?
-        .into_iter()
-        .next()
-        .ok_or(RustFormatMacroArgumentsError::InvalidExpressionList)
+    arguments.iter().position(|argument| {
+        argument.role == Some(crate::macro_matcher::RustLogOperandRole::Format)
+            && matches!(argument.value_kind, "string_literal" | "raw_string_literal")
+    })
 }
 
 pub fn rust_vec_macro_arguments(
@@ -311,6 +316,7 @@ pub fn macro_arguments_from_operands(
                 value_range: node.range(),
                 value_kind: node.kind(),
                 name: None,
+                role: operand.role,
             }
         })
         .collect::<Vec<_>>();
@@ -335,9 +341,7 @@ pub fn rust_macro_format_operand(
     let path = invocation.child_by_field_name("macro")?;
     let layout = rust_macro_runtime_layout_for_path(path, source);
     let index = if layout.is_some_and(|layout| layout.owner == "log.__private_api") {
-        arguments.iter().position(|argument| {
-            matches!(argument.value_kind, "string_literal" | "raw_string_literal")
-        })?
+        return rust_logging_format_operand(invocation, source, arguments);
     } else if let Some(first_operand) = layout.and_then(|layout| {
         layout.arguments.iter().find_map(|role| match role {
             RustMacroRuntimeArgument::Message { first_operand }
@@ -891,13 +895,6 @@ mod tests {
     fn value_macro_arguments_keep_scrutinee_and_vector_element_ranges() {
         let source = "fn f(input: Option<u8>, item: String) { let _ = matches!(input, Some(_)); let _ = vec![item; 2]; let _ = vec![item, item]; }";
         let tree = parse_rust(source);
-
-        let matches = macro_invocation_named(tree.root_node(), source, "matches");
-        let scrutinee = rust_matches_macro_scrutinee(matches, source).expect("scrutinee");
-        assert_eq!(
-            &source[scrutinee.value_range.start_byte..scrutinee.value_range.end_byte],
-            "input"
-        );
 
         let repeated = macro_invocation_named(tree.root_node(), source, "vec");
         let repeated_arguments = rust_vec_macro_arguments(repeated, source).expect("repeat args");

@@ -6,6 +6,7 @@ use crate::resolved::PolicyDependencyPath;
 use crate::retained::RetainedSize;
 use crate::test_support::load_match_policy;
 use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
+use brokk_bifrost_test_macros::hardwon;
 use serde_json::Value;
 
 const POLICY: &str = r#"(policy
@@ -44,6 +45,65 @@ fn report_from_loaded(
         PolicyReportDocument::try_new(vec![descriptor], vec![run], diagnostics, false, 0, None)
             .unwrap();
     serde_json::to_value(report).unwrap()
+}
+
+#[test]
+#[hardwon("#10984: canonical report JSON must carry omission knowledge on both diagnostic types")]
+fn report_json_serializes_run_and_root_diagnostic_omission_values() {
+    let loaded = load_match_policy(POLICY);
+    let descriptor = PolicyRuleDescriptor::from_loaded(&loaded);
+    let run_diagnostic = crate::PolicyDiagnostic::try_new(
+        crate::PolicyDiagnosticCode::EmptySelection,
+        crate::PolicyDiagnosticSeverity::Note,
+        crate::PolicyDiagnosticImpact::Advisory,
+        "empty selector",
+        None,
+        Vec::new(),
+        crate::RelatedLocationOmissions::Known(2),
+    )
+    .unwrap();
+    let run = PolicyRun::try_new(
+        loaded.definition().metadata.id.clone(),
+        loaded.semantic_hash(),
+        loaded.definition().analysis.analysis_type(),
+        PolicyRunCompletion::Complete,
+        Vec::new(),
+        vec![run_diagnostic],
+        false,
+        crate::finding::PolicyWorkReport::default(),
+        &crate::budget::PolicyBudget::default(),
+    )
+    .unwrap();
+    let report_diagnostic = PolicyReportDiagnostic::try_new(
+        crate::PolicyReportDiagnosticCode::PolicyLoadFailed,
+        crate::PolicyDiagnosticSeverity::Error,
+        "policy source failed",
+        None,
+        None,
+        Vec::new(),
+        crate::RelatedLocationOmissions::Unknown,
+    )
+    .unwrap();
+    let report = PolicyReportDocument::try_new(
+        vec![descriptor],
+        vec![run],
+        vec![report_diagnostic],
+        false,
+        0,
+        None,
+    )
+    .unwrap();
+    let json = serde_json::to_value(report).unwrap();
+
+    assert_eq!(json["schema_version"], PolicyReportDocument::SCHEMA_VERSION);
+    assert_eq!(
+        json["runs"][0]["diagnostics"][0]["omitted_related_locations_lower_bound"],
+        2
+    );
+    assert_eq!(
+        json["diagnostics"][0]["omitted_related_locations_lower_bound"],
+        serde_json::json!({"kind": "unknown"})
+    );
 }
 
 #[test]
@@ -274,6 +334,7 @@ fn related_diagnostic_allocations_count_toward_the_report_byte_limit() {
                 range: 2..4,
                 message: "related detail".to_owned(),
             }],
+            crate::RelatedLocationOmissions::Known(0),
         )
         .unwrap();
         diagnostic.related[0].message.reserve(4096);
@@ -333,6 +394,7 @@ fn related_diagnostic_message_and_source_have_distinct_report_fields() {
             range: 2..4,
             message: "Related explanation".to_owned(),
         }],
+        crate::RelatedLocationOmissions::Known(0),
     )
     .unwrap();
     let json = report_from_loaded(
@@ -439,4 +501,181 @@ fn authored_typestate_expectation_precedence_uses_its_own_type_label() {
     assert_eq!(edges[0]["type"], "typestate_expectation");
     assert_eq!(edges[0]["dominant"], "preferred");
     assert_eq!(edges[0]["dominated"], "base");
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#11321: unbounded family root evidence overflowed retention or erased refused lanes"
+)]
+fn budget_telemetry_survives_diagnostic_family_folding() {
+    use crate::budget::{PolicyBatchBudget, PolicySourceCensus, effective_grant};
+    use crate::finding::{
+        PolicyDiagnostic, PolicyDiagnosticCode, PolicyDiagnosticImpact, PolicyDiagnosticSeverity,
+        PolicyIncompleteReason, PolicyWorkReport, normalize_policy_diagnostics_bounded,
+    };
+    use brokk_bifrost_rql::structural::{
+        CodeQueryDiagnosticCode, CodeQueryExhaustedCharge, CodeQueryExhaustedRoot,
+    };
+    let census = PolicySourceCensus {
+        bytes: 60_000_000,
+        files: 4000,
+    };
+    let grant = effective_grant(PolicyBatchBudget::default(), census);
+    let telemetry = crate::budget::PolicyBudgetTelemetry {
+        effective_grant: grant.replay_caps(crate::registry::PolicyRegistryLimits::default()),
+        census: Some(census),
+        policy_deadlines_ms: [("test.report-wire".to_string(), 1234)].into(),
+        batch_remaining_ms: None,
+        batch_refusals: Default::default(),
+    };
+    let diagnostics = (0..6000)
+        .map(|index| {
+            let (lane, limit) = if index % 2 == 0 {
+                ("query/fact_nodes", 10_000_000)
+            } else {
+                ("query/scanned_files", 20_000)
+            };
+            PolicyDiagnostic::try_new(
+                PolicyDiagnosticCode::CodeQuery {
+                    code: CodeQueryDiagnosticCode::ExecutionBudgetExhausted
+                        .try_into()
+                        .unwrap(),
+                },
+                PolicyDiagnosticSeverity::Warning,
+                PolicyDiagnosticImpact::RunIncomplete,
+                format!("cut {index}"),
+                None,
+                Vec::new(),
+                crate::RelatedLocationOmissions::Known(0),
+            )
+            .unwrap()
+            .with_exhausted_roots(vec![CodeQueryExhaustedRoot {
+                path: format!("src/site{index}.rs"),
+                procedure: Some(format!("{}root{index}", "scope::".repeat(450))),
+                lane: lane.to_string(),
+                stage: None,
+                budget: None,
+                charge: Some(CodeQueryExhaustedCharge {
+                    attempted: limit + 1,
+                    limit,
+                }),
+                feedback_iteration: None,
+            }])
+        })
+        .collect::<Vec<_>>();
+    let raw_witness_bytes = diagnostics
+        .iter()
+        .flat_map(PolicyDiagnostic::exhausted_roots)
+        .map(RetainedSize::retained_size)
+        .sum::<usize>();
+    assert!(raw_witness_bytes > grant.per_policy().max_retained_report_bytes());
+    let mut diagnostics: PolicyDiagnostics = diagnostics.into();
+    assert!(normalize_policy_diagnostics_bounded(&mut diagnostics, 256));
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].exhausted_roots().len(), 1);
+    // Both lanes survive even though only one large witness fits the sample.
+    let loaded = load_match_policy(POLICY);
+    let mut work = PolicyWorkReport::default();
+    work.record_budget_refusal("policy/diagnostics");
+    let run = PolicyRun::try_new(
+        loaded.definition().metadata.id.clone(),
+        loaded.semantic_hash(),
+        loaded.definition().analysis.analysis_type(),
+        PolicyRunCompletion::inconclusive(vec![PolicyIncompleteReason::ReportRetentionBudget])
+            .unwrap(),
+        Vec::new(),
+        diagnostics,
+        true,
+        work,
+        grant.per_policy(),
+    )
+    .unwrap();
+    let evaluation = default_test_evaluation_context().with_budget(telemetry);
+    let report = PolicyReportDocument::try_new_with_suppression_audit(
+        evaluation,
+        vec![PolicyRuleDescriptor::from_loaded(&loaded)],
+        vec![run],
+        Vec::new(),
+        Vec::new(),
+        false,
+        0,
+        None,
+    )
+    .unwrap();
+    let json = serde_json::to_value(&report).unwrap();
+    assert_eq!(
+        json["evaluation"]["budget"]["effective_grant"]["query.max_fact_nodes"],
+        10_000_000
+    );
+    assert_eq!(json["evaluation"]["budget"]["census"]["bytes"], 60_000_000);
+    assert_eq!(
+        json["evaluation"]["budget"]["policy_deadlines_ms"]["test.report-wire"],
+        1234
+    );
+    assert_eq!(
+        json["runs"][0]["budget_refusals"],
+        serde_json::json!([
+            "policy/diagnostics",
+            "query/fact_nodes",
+            "query/scanned_files"
+        ])
+    );
+    assert_eq!(
+        json["runs"][0]["diagnostics"][0]["exhausted_roots"][0]["charge"]["limit"],
+        10_000_000
+    );
+    assert_eq!(json["runs"][0]["diagnostics"][0]["family_count"], 6000);
+    assert_eq!(
+        json["runs"][0]["diagnostics"][0]["exhausted_roots"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let mut batch_run = report.runs()[0].clone();
+    batch_run.record_budget_refusal("batch/retained_report_bytes");
+    let batch = PolicyReportDocument::try_new_with_suppression_audit(
+        report.evaluation().clone(),
+        report.rules().to_vec(),
+        vec![batch_run],
+        Vec::new(),
+        Vec::new(),
+        false,
+        0,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(batch).unwrap()["evaluation"]["budget"]["batch_refusals"],
+        serde_json::json!(["batch/retained_report_bytes"])
+    );
+    let mut builder = PolicyReportBuilder::new_with_suppression_audit(
+        grant,
+        1,
+        report.evaluation().clone(),
+        Vec::new(),
+        Vec::new(),
+    )
+    .unwrap();
+    builder
+        .register_policy(report.rules()[0].clone(), report.runs()[0].clone())
+        .unwrap();
+    builder
+        .set_execution(
+            PolicyExecutionMetadata::try_new(
+                1,
+                Vec::new(),
+                Some(PolicyExecutionTermination::DeadlineExceeded),
+                Some(PolicyExecutionStage::ReportConstruction),
+                None,
+                PolicyExecutionProgress::default(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let deadline = serde_json::to_value(builder.finish().unwrap()).unwrap();
+    assert_eq!(
+        deadline["evaluation"]["budget"]["batch_refusals"],
+        serde_json::json!(["time/batch_deadline_ms"])
+    );
 }

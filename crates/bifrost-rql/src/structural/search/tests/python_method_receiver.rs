@@ -52,7 +52,8 @@ fn callable_signature_rows_preserve_python_receiver_kind_and_source_evidence() {
 #[brokk_bifrost_test_macros::hardwon(
     "#7347: Python import hydration reacquired the single store connection"
 )]
-fn python_receiver_evidence_on_single_connection_store() {
+fn python_receiver_evidence_on_pooled_store() {
+    // This regression now runs on the pooled store.
     use brokk_bifrost_analysis::analyzer::store::AnalyzerStore;
     use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::store_context_from_store;
 
@@ -61,7 +62,7 @@ fn python_receiver_evidence_on_single_connection_store() {
         .build();
     let context = store_context_from_store(
         project.project_dyn().as_ref(),
-        AnalyzerStore::open_in_memory_single_connection().unwrap(),
+        AnalyzerStore::open_ephemeral().unwrap(),
         false,
     );
     let workspace = WorkspaceAnalyzer::build_with_store_context_for_test(

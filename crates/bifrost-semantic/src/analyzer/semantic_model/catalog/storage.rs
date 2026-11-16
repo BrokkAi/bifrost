@@ -353,14 +353,16 @@ fn verify(path: &Path, digest: &str, stored_size: u64) -> Result<(), CatalogErro
 }
 
 #[cfg(unix)]
-fn sync_directory(path: &Path) -> Result<(), CatalogError> {
+#[doc(hidden)]
+pub fn sync_directory(path: &Path) -> Result<(), CatalogError> {
     File::open(path)
         .and_then(|directory| sync_file(&directory))
         .map_err(|error| CatalogError::io("sync catalog object directory", error))
 }
 
 #[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> Result<(), CatalogError> {
+#[doc(hidden)]
+pub fn sync_directory(_path: &Path) -> Result<(), CatalogError> {
     Ok(())
 }
 

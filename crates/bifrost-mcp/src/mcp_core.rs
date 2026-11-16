@@ -42,7 +42,7 @@ pub(crate) fn symbol_tool_descriptors(render_line_numbers: bool) -> Vec<Value> {
                             "type": "string",
                             "maxLength": SEARCH_SYMBOL_MAX_PATTERN_BYTES
                         },
-                        "description": "Search patterns to match against indexed symbol names: case-insensitive regex, with `*`/`?` wildcard patterns that are not valid regex (for example `*Name*`) matched as globs."
+                        "description": "Search patterns to match against indexed symbol names: case-insensitive regex, with `*`/`?` wildcard patterns that are not valid regex (for example `*Name*`) matched as globs. A literal qualified name matches the declaration whatever separator its language stores, so `App\\Models\\User`, `Outer$Inner`, `ns::C`, `pkg/Thing` and `Outer+Inner` each reach their `.`-joined spelling, with or without a leading `::` or `\\`."
                     },
                     "include_tests": {
                         "type": "boolean",

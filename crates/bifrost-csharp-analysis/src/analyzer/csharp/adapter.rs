@@ -85,11 +85,14 @@ impl CSharpAdapter {
     }
 }
 
+use brokk_bifrost_analysis::analyzer::store::csharp_compilation::CSharpRuleIndexHandle;
 use brokk_bifrost_analysis::analyzer::store::{
     AnalyzerStore, GenerationId, StoreError, WorkspaceConfigurationInput, WorkspaceId,
     WorkspaceSnapshotId,
 };
-use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::{ParseConfiguration, PathParse};
+use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::{
+    ParseConfiguration, ParseRulesState, PathParse,
+};
 use brokk_bifrost_core::gitblob::{BlobKey, ParseVariant};
 use brokk_bifrost_csharp::preprocessor::{
     OwnerEnvironments, SymbolEnvironment, assignment_digest, empty_decision_digest,
@@ -134,18 +137,23 @@ impl CSharpAdapter {
         let Some(set) = configuration.set else {
             return Ok(None);
         };
-        let Some(membership) = store.csharp_compilations_of_set(
-            set,
-            &brokk_bifrost_core::path_utils::rel_path_string(file),
-        )?
+        let digest = configuration
+            .output_digest
+            .expect("selected C# set has a digest");
+        let rules = configuration
+            .rules
+            .downcast::<CSharpRuleIndexHandle>()
+            .expect("C# parse configuration carries a C# rule index handle");
+        let Some(index) = rules.get(store, set, digest)? else {
+            return Ok(None);
+        };
+        index.validate(set, digest);
+        let Some(owners) =
+            index.closed_owners(&brokk_bifrost_core::path_utils::rel_path_string(file))
         else {
             return Ok(None);
         };
-        if !membership.open.is_empty() {
-            return Ok(None);
-        }
-        membership
-            .proven
+        owners
             .into_iter()
             .map(|id| {
                 let environment = store.csharp_owner_environment(id)?.ok_or_else(|| {
@@ -227,6 +235,7 @@ impl LanguageAdapter for CSharpAdapter {
     ) -> Result<Option<ParseConfiguration>, StoreError> {
         let set = store.derive_csharp_compilation_set(workspace, generation, captured)?;
         Ok(Some(ParseConfiguration {
+            rules: ParseRulesState::new(CSharpRuleIndexHandle::default()),
             set: set.map(|set| set.id),
             output_digest: set.map(|set| set.output_digest),
         }))
@@ -240,6 +249,7 @@ impl LanguageAdapter for CSharpAdapter {
         Self::validate_decisions(store, snapshot)?;
         let set = store.csharp_selected_compilation_set(snapshot)?;
         Ok(Some(ParseConfiguration {
+            rules: ParseRulesState::new(CSharpRuleIndexHandle::default()),
             set: set.map(|set| set.id),
             output_digest: set.map(|set| set.output_digest),
         }))

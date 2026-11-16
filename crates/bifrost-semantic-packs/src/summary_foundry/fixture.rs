@@ -97,9 +97,15 @@ pub enum FixtureInputPort {
 
 impl FixtureInputPort {
     fn from_authored(input: &AuthoredSummaryInput) -> Self {
+        assert!(
+            input.path().is_none(),
+            "projected fixture inputs are refused before source generation"
+        );
         match input {
-            AuthoredSummaryInput::Receiver {} => Self::Receiver,
-            AuthoredSummaryInput::Parameter { ordinal } => Self::Parameter { ordinal: *ordinal },
+            AuthoredSummaryInput::Receiver { .. } => Self::Receiver,
+            AuthoredSummaryInput::Parameter { ordinal, .. } => {
+                Self::Parameter { ordinal: *ordinal }
+            }
         }
     }
 }
@@ -192,6 +198,8 @@ pub enum FixtureUnsupported {
     /// needs a fixture that reads the mutated cell back, and an exceptional
     /// output needs a throwing fixture.
     OutputPortUnsupported { output: String },
+    /// This fixture driver cannot seed an individual aggregate component.
+    InputPortUnsupported { input: String },
     /// The transfer leaves through the exceptional exit.
     ExitKindUnsupported { exit_kind: String },
 }
@@ -207,6 +215,10 @@ impl fmt::Display for FixtureUnsupported {
             Self::OutputPortUnsupported { output } => write!(
                 formatter,
                 "the fixture engine cannot observe the `{output}` output port"
+            ),
+            Self::InputPortUnsupported { input } => write!(
+                formatter,
+                "the fixture engine cannot seed the `{input}` input port"
             ),
             Self::ExitKindUnsupported { exit_kind } => write!(
                 formatter,
@@ -268,6 +280,11 @@ pub fn generate_fixture_suite(
         return Err(FixtureUnsupported::NoAuthoredSummary);
     }
     for transfer in &entry.transfers {
+        if transfer.input.path().is_some() {
+            return Err(FixtureUnsupported::InputPortUnsupported {
+                input: format!("{:?}", transfer.input),
+            });
+        }
         match transfer.exit_kind {
             AuthoredSummaryExitKind::Normal => {}
             AuthoredSummaryExitKind::Exceptional => {
@@ -276,7 +293,10 @@ pub fn generate_fixture_suite(
                 });
             }
         }
-        if !matches!(transfer.output, AuthoredSummaryOutput::NormalReturn {}) {
+        if !matches!(
+            transfer.output,
+            AuthoredSummaryOutput::NormalReturn { path: None }
+        ) {
             return Err(FixtureUnsupported::OutputPortUnsupported {
                 output: rendered_output(&transfer.output),
             });
@@ -364,8 +384,8 @@ fn target_shape(
         .transfers
         .iter()
         .filter_map(|transfer| match transfer.input {
-            AuthoredSummaryInput::Parameter { ordinal } => Some(ordinal as usize + 1),
-            AuthoredSummaryInput::Receiver {} => None,
+            AuthoredSummaryInput::Parameter { ordinal, .. } => Some(ordinal as usize + 1),
+            AuthoredSummaryInput::Receiver { .. } => None,
         })
         .max()
         .unwrap_or(0)
@@ -611,14 +631,24 @@ fn pack_source(
 /// The output port an entry names, spelled the way the join spells it.
 fn rendered_output(output: &AuthoredSummaryOutput) -> String {
     match output {
-        AuthoredSummaryOutput::NormalReturn {} => "normal_return".to_owned(),
-        AuthoredSummaryOutput::IndexedNormalReturn { ordinal } => {
+        AuthoredSummaryOutput::NormalReturn { path: None } => "normal_return".to_owned(),
+        AuthoredSummaryOutput::IndexedNormalReturn {
+            ordinal,
+            path: None,
+        } => {
             format!("normal_return[{ordinal}]")
         }
-        AuthoredSummaryOutput::ExceptionalReturn {} => "exceptional_return".to_owned(),
-        AuthoredSummaryOutput::Receiver {} => "receiver".to_owned(),
-        AuthoredSummaryOutput::Capture { location } => format!("capture[{location}]"),
-        AuthoredSummaryOutput::Heap { location } => format!("heap[{location}]"),
+        AuthoredSummaryOutput::ExceptionalReturn { path: None } => "exceptional_return".to_owned(),
+        AuthoredSummaryOutput::Receiver { path: None } => "receiver".to_owned(),
+        AuthoredSummaryOutput::Capture {
+            location,
+            path: None,
+        } => format!("capture[{location}]"),
+        AuthoredSummaryOutput::Heap {
+            location,
+            path: None,
+        } => format!("heap[{location}]"),
+        projected => format!("{projected:?}"),
     }
 }
 
@@ -772,8 +802,11 @@ mod tests {
             &["CharSequence", "CharSequence"],
             true,
             vec![
-                transfer(AuthoredSummaryInput::Receiver {}),
-                transfer(AuthoredSummaryInput::Parameter { ordinal: 1 }),
+                transfer(AuthoredSummaryInput::Receiver { path: None }),
+                transfer(AuthoredSummaryInput::Parameter {
+                    ordinal: 1,
+                    path: None,
+                }),
             ],
         );
 
@@ -812,7 +845,10 @@ mod tests {
             "valueOf",
             &["Object"],
             false,
-            vec![transfer(AuthoredSummaryInput::Parameter { ordinal: 1 })],
+            vec![transfer(AuthoredSummaryInput::Parameter {
+                ordinal: 1,
+                path: None,
+            })],
         );
         corrupted.boundary.parameter_count = 1;
 
@@ -844,8 +880,11 @@ mod tests {
             &["String"],
             true,
             vec![
-                transfer(AuthoredSummaryInput::Receiver {}),
-                transfer(AuthoredSummaryInput::Parameter { ordinal: 0 }),
+                transfer(AuthoredSummaryInput::Receiver { path: None }),
+                transfer(AuthoredSummaryInput::Parameter {
+                    ordinal: 0,
+                    path: None,
+                }),
             ],
         );
 

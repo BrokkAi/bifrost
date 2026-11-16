@@ -101,7 +101,7 @@ pub(crate) fn declarator_conversion_runs_no_user_code(
             let context = CSharpLookupContext::at(source, declared_node, || true)
                 .expect("an unbounded lookup context completes");
             match csharp
-                .external_declarations(analyzer.semantic_model_overlay())
+                .external_declarations(analyzer.semantic_model_overlay_read().published())
                 .resolve_type_in_file(
                     &reference_type_text(declared_node, source),
                     context.namespace(),

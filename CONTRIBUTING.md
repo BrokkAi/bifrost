@@ -166,14 +166,27 @@ queue first, then `git cherry-pick -x <master-commit>` puts that exact commit
 on the RC. Never commit a fix directly to an RC and never merge `master` into
 one. The verifier enforces this: it walks first parents from the RC head to
 the nearest `master` commit (at most 50 commits) and requires every commit on
-the way to be a cherry-pick (its `git patch-id --stable` equals that of a
-commit on `master` newer than the base) or the one metadata commit. A merge
-commit, a second metadata commit, or a commit that matches no `master` commit
-and touches a path outside release metadata is rejected with that commit named.
+the way to be a cherry-pick of a commit on `master` newer than the base, or the
+one metadata commit. Commits are compared file by file: each file a cherry-pick
+changes must have the same `git patch-id --stable` as that `master` commit's
+change to the file, and a cherry-pick carries every file of its `master`
+commit. The one exception is the merge queue's own "Apply rustfmt" commit,
+which formats every file of a batch, including files from changes the RC
+lacks: a cherry-pick of it may carry only the files the RC has
+(`git show <master-commit> -- <paths> | git apply --index`), and the verifier
+lists the files it left out. Part of any other commit could drop a salt or
+epoch bump while keeping the change it pays for. A merge commit, a second
+metadata commit, or a commit that matches no `master` commit and touches a path
+outside release metadata is rejected with that commit named.
 Cherry-pick a merge-queue batch's constituent commits, not the batch merge. The
 patch-id covers context lines, so a cherry-pick that needed conflict resolution
 no longer matches and cannot go on the RC; recut the RC from a newer `master`
-commit instead.
+commit instead. Cache-identity lever token files (`crates/*/levers/*.tokens`)
+are the exception: Git merges them with `merge=union`, so a cherry-picked token
+line lands after whatever lines the RC base already holds and its context
+differs from `master`'s. The verifier therefore compares the token lines a
+commit adds and removes in those files exactly. Skip a `master` commit that only
+reorders token lines; it has no meaning on an RC.
 
 When a gate run on the RC is red, first ask whether the source is red or the
 run is. Re-dispatch the gate on the RC branch (`gh workflow run

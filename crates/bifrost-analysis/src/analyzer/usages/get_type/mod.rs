@@ -128,7 +128,7 @@ pub fn exact_semantic_model_type_outcome(
     fqn: &str,
     target_kind: TypeLookupTargetKind,
 ) -> Option<TypeLookupOutcome> {
-    let overlay = analyzer.semantic_model_overlay()?;
+    let overlay = analyzer.semantic_model_overlay_read().published()?;
     let matched = overlay.symbols_named_for(fqn, language.config_label());
     let matched_record_count = matched.records.len();
     let records = matched
@@ -199,7 +199,7 @@ pub fn resolve_type_batch_with_budget(
     requests
         .into_iter()
         .map(|request| {
-            let scope = crate::analyzer::AnalyzerQueryScope::new(analyzer);
+            let scope = crate::analyzer::AnalyzerQueryScope::independent_answer(analyzer, None);
             let outcome = resolve_one(analyzer, &mut context, request, budget);
             (outcome, scope.read_completion().err())
         })
@@ -238,6 +238,7 @@ pub fn resolve_type_at_reference_site_with_budget(
 }
 
 struct TypeBatchContext<'a> {
+    analyzer: &'a dyn IAnalyzer,
     sources: HashMap<ProjectFile, Result<Arc<String>, String>>,
     trees: HashMap<(ProjectFile, Language), Option<Tree>>,
     support: AnalyzerDefinitionLookup<'a>,
@@ -246,6 +247,7 @@ struct TypeBatchContext<'a> {
 impl<'a> TypeBatchContext<'a> {
     fn new(analyzer: &'a dyn IAnalyzer) -> Self {
         Self {
+            analyzer,
             sources: HashMap::default(),
             trees: HashMap::default(),
             support: AnalyzerDefinitionLookup::new(analyzer, Language::None),
@@ -255,7 +257,7 @@ impl<'a> TypeBatchContext<'a> {
     fn source(&mut self, file: &ProjectFile) -> Result<Arc<String>, String> {
         self.sources
             .entry(file.clone())
-            .or_insert_with(|| read_source(file).map(Arc::new))
+            .or_insert_with(|| read_source(self.analyzer, file).map(Arc::new))
             .clone()
     }
 
@@ -295,7 +297,11 @@ fn resolve_one<'a>(
         None => match context.source(&file) {
             Ok(source) => source,
             Err(message) => {
-                return diagnostic_outcome(TypeLookupStatus::NotFound, "file_read_failed", message);
+                return diagnostic_outcome(
+                    TypeLookupStatus::Unavailable,
+                    "indexed_source_unavailable",
+                    message,
+                );
             }
         },
     };

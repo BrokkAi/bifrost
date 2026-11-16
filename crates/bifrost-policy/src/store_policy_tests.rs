@@ -125,7 +125,7 @@ fn the_store_records_decode_into_the_taint_spec() {
     assert_eq!(read.store.as_str(), "primary");
     assert_eq!(read.key, Some(PolicyPort::ArgumentIndex { index: 0 }));
     assert_eq!(read.instance, Some(PolicyPort::Receiver));
-    assert_eq!(read.output, PolicyPort::ReturnValue);
+    assert_eq!(read.output, PolicyPort::ReturnValue { path: None });
 }
 
 #[test]

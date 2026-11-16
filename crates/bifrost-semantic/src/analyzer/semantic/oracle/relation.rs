@@ -424,7 +424,9 @@ impl OracleRelationArena {
 
     pub(in crate::analyzer::semantic::oracle) fn retained_bytes(&self) -> usize {
         self.records.iter().fold(
-            std::mem::size_of::<OracleRelationRecord>().saturating_mul(self.records.len()),
+            std::mem::size_of::<Self>()
+                .saturating_add(2 * std::mem::size_of::<usize>())
+                .saturating_add(std::mem::size_of_val(self.records.as_ref())),
             |retained, record| {
                 let evidence_bytes = std::mem::size_of_val(record.evidence.as_ref());
                 let runtime_read_bytes = record.runtime_read.as_ref().map_or(0, |runtime_read| {
@@ -461,17 +463,90 @@ pub struct OracleRelationHandle {
 }
 
 impl OracleRelationHandle {
+    /// Compare a complete immutable arena, without granting query admission.
+    /// Compare once per provenance group, then check each row's own-arena
+    /// membership and ordinal. Global handle equality remains arena scoped.
+    #[doc(hidden)]
+    pub fn has_same_arena_content(&self, other: &Self) -> bool {
+        let Self { arena: left, id: _ } = self;
+        let Self {
+            arena: right,
+            id: _,
+        } = other;
+        let OracleRelationArena {
+            owner: left_owner,
+            records: left_records,
+        } = left.as_ref();
+        let OracleRelationArena {
+            owner: right_owner,
+            records: right_records,
+        } = right.as_ref();
+        left_owner == right_owner && left_records == right_records
+    }
+
+    /// Complete ordered content of a single-arena provenance group.
+    /// Mixed arenas are conservatively ineligible even if their rows look alike.
+    #[doc(hidden)]
+    pub fn slices_have_same_content(left: &[Self], right: &[Self]) -> bool {
+        left.len() == right.len()
+            && match (left.first(), right.first()) {
+                (None, None) => true,
+                (Some(l), Some(r)) => {
+                    l.has_same_arena_content(r)
+                        && left
+                            .iter()
+                            .zip(right)
+                            .all(|(a, b)| a.same_arena(l) && b.same_arena(r) && a.id() == b.id())
+                }
+                _ => false,
+            }
+    }
+}
+
+impl OracleRelationHandle {
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn retention_census_for_test(
+        &self,
+        census: &mut brokk_bifrost_core::retention_census::RetentionCensus<'_>,
+        family: &'static str,
+    ) {
+        crate::analyzer::semantic::oracle::retained::visit_retained_allocations(
+            crate::analyzer::semantic::oracle::retained::RetainedNode::Relation(self),
+            census,
+            family,
+        );
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(super) fn record_arena_allocation_for_test(
+        &self,
+        census: &mut brokk_bifrost_core::retention_census::RetentionCensus<'_>,
+        family: &'static str,
+    ) {
+        use brokk_bifrost_core::retention_census::{AllocationAccounting, FamilyLifetime};
+
+        census.record_arc_allocation(
+            Arc::clone(&self.arena),
+            family,
+            FamilyLifetime::Persistent,
+            "oracle-relation-arena",
+            self.arena.retained_bytes() as u64,
+            AllocationAccounting::OutsideBudget,
+        );
+    }
+
     #[doc(hidden)]
     pub fn retained_artifacts(
         &self,
-        census: &mut crate::analyzer::semantic::service::ArtifactRetentionCensus,
+        census: &mut impl crate::analyzer::semantic::service::ArtifactRetentionVisitor,
     ) {
         census.relation(self);
     }
 
     pub(crate) fn collect_retained_artifacts(
         &self,
-        census: &mut crate::analyzer::semantic::service::ArtifactRetentionCensus,
+        census: &mut impl crate::analyzer::semantic::service::ArtifactRetentionVisitor,
     ) {
         if !census.arena(self.arena_identity() as usize, || {
             self.arena().retained_bytes()
@@ -494,26 +569,38 @@ impl OracleRelationHandle {
                 census.procedure(callee);
             }
             OracleRelationOwner::PointsTo(value) => {
+                census.owned_box(value.as_ref());
                 census.context(value.context());
                 census.procedure(value.point().procedure());
             }
             OracleRelationOwner::Locations(access) => {
+                census.owned_box(access.as_ref());
                 census.context(access.context());
                 access.path().retained_artifacts(census);
                 census.procedure(access.point().procedure());
             }
             OracleRelationOwner::Alias(query) => {
+                census.owned_box(query.as_ref());
+                query.left().path().retained_artifacts(census);
+                query.right().path().retained_artifacts(census);
                 census.context(query.left().context());
                 census.context(query.right().context());
                 census.procedure(query.left().point().procedure());
                 census.procedure(query.right().point().procedure());
             }
             OracleRelationOwner::FreshObjectPublications(query) => {
+                census.owned_box(query.as_ref());
                 census.context(query.context());
                 query.object().identity().retained_artifacts(census);
                 census.procedure(query.observation().procedure())
             }
             OracleRelationOwner::StrongUpdate(store) => {
+                census.owned_box(store.as_ref());
+                census.context(store.value().context());
+                if let Some(base) = store.base() {
+                    census.context(base.context());
+                    census.procedure(base.point().procedure());
+                }
                 census.context(store.target().context());
                 store.target().path().retained_artifacts(census);
                 census.procedure(store.store().point().procedure())
@@ -523,8 +610,16 @@ impl OracleRelationHandle {
             for evidence in record.evidence() {
                 census.procedure(evidence.procedure());
             }
-            if let Some(OracleRelationSubject::DispatchCandidate(target)) = record.subject() {
-                census.procedure(target);
+            match record.subject() {
+                Some(OracleRelationSubject::DispatchCandidate(target)) => census.procedure(target),
+                Some(OracleRelationSubject::DispatchBoundary(
+                    DispatchBoundaryKind::External(Some(locator))
+                    | DispatchBoundaryKind::Unmaterialized(locator)
+                    | DispatchBoundaryKind::Deferred {
+                        target: locator, ..
+                    },
+                )) => census.locator(locator),
+                _ => {}
             }
         }
     }
@@ -543,6 +638,12 @@ impl OracleRelationHandle {
 
     pub(super) fn arena(&self) -> &OracleRelationArena {
         &self.arena
+    }
+
+    /// Owned bytes of the relation arena this handle keeps alive, for a
+    /// cache that retains the handle and charges what it pins.
+    pub fn retained_arena_bytes(&self) -> usize {
+        self.arena.retained_bytes()
     }
 
     /// Query-local identity used only to total-order retained handles whose

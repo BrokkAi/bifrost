@@ -22,7 +22,7 @@ mod tests {
         use brokk_bifrost_analysis::analyzer::derivation_host::AnalyzerDerivations;
         use brokk_bifrost_core::retention_budget::RetentionBudget;
         use brokk_bifrost_semantic::analyzer::semantic::read_ledger::PersistedDerivationFamily;
-        let budget = RetentionBudget::new(1_000_000);
+        let budget = RetentionBudget::for_test_capacity(1_000_000);
         let host = AnalyzerDerivations::new(&budget);
         let shapes = host.registered_question_shapes();
         assert!(
@@ -144,6 +144,7 @@ mod tests {
                 value: 1,
                 complete: true,
                 validity: ReuseValidity::Reusable,
+                reuse: brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::Content,
             }
         }
         fn output_projection(
@@ -174,9 +175,9 @@ mod tests {
         let analyzer = RustAnalyzer::new(fixture.project_dyn());
         let host = analyzer.inner.derivations().expect("derivation host");
         host.register(OuterRouteWithUnpersistedChild {
-            inner: AnalyzerDerivations::without_declared_recipes(&RetentionBudget::new(
-                16 * 1024 * 1024,
-            )),
+            inner: AnalyzerDerivations::without_declared_recipes(
+                &RetentionBudget::for_test_capacity(16 * 1024 * 1024),
+            ),
         });
         let key = "src/lib.rs".to_string();
         let cancellation = brokk_bifrost_core::cancellation::CancellationToken::default();
@@ -273,6 +274,7 @@ mod tests {
                 value: 1,
                 complete: true,
                 validity: ReuseValidity::Reusable,
+                reuse: brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::Content,
             }
         }
         fn output_projection(
@@ -351,7 +353,7 @@ mod tests {
                 brokk_bifrost_semantic::analyzer::semantic::derivation::OutputIdentity(identity)
             )
         );
-        let fresh = AnalyzerDerivations::new(&RetentionBudget::new(16 * 1024 * 1024));
+        let fresh = AnalyzerDerivations::new(&RetentionBudget::for_test_capacity(16 * 1024 * 1024));
         assert_eq!(
             fresh.replay(&analyzer, kind, &question),
             ReplayResult::Identity(
@@ -415,7 +417,7 @@ mod tests {
         );
         drop(operation);
 
-        let tiny = AnalyzerDerivations::new(&RetentionBudget::new(1));
+        let tiny = AnalyzerDerivations::new(&RetentionBudget::for_test_capacity(1));
         assert_eq!(
             tiny.replay(&analyzer, kind, &question),
             ReplayResult::Missing(ReplayMissing::Refused)
@@ -472,7 +474,8 @@ mod tests {
         let expected = ReplayResult::Identity(
             brokk_bifrost_semantic::analyzer::semantic::derivation::OutputIdentity(digest),
         );
-        let replay = AnalyzerDerivations::new(&RetentionBudget::new(16 * 1024 * 1024));
+        let replay =
+            AnalyzerDerivations::new(&RetentionBudget::for_test_capacity(16 * 1024 * 1024));
         assert_eq!(replay.replay(&analyzer, kind, &question), expected);
 
         write(
@@ -789,6 +792,102 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11599: an inherited operational stop (real-code 2-hour stops) kept the Rust route memo from publishing"
+    )]
+    fn route_memo_publishes_beside_an_enclosing_operational_stop() {
+        use brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause;
+        use brokk_bifrost_rust::graph_support::RustSource;
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"stop\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            )
+            .file("src/lib.rs", "pub fn f() {}\n")
+            .build();
+        let analyzer = RustAnalyzer::new(project.project_dyn());
+        let file = project.file("src/lib.rs");
+        let _request = AnalyzerQueryScope::new(&analyzer);
+        // An unrelated earlier read of the request stops operationally. The
+        // route build reads none of that, so its memo must still publish and the
+        // second consumer must hit it.
+        analyzer
+            .inner
+            .record_query_incomplete(QueryReadIncomplete::ProofStopped {
+                reason: "resolution_unsupported_semantic",
+                cause: Some(DerivationExecutionCause::Provider),
+            });
+        for _ in 0..2 {
+            let capture = AnalyzerQueryScope::capturing_read_incompleteness(&analyzer);
+            let routes = <RustAnalyzer as RustSource>::file_routes(&analyzer, &file, None).unwrap();
+            assert!(routes.is_complete());
+            assert!(capture.captured_read_incompleteness().is_empty());
+        }
+        assert!(analyzer.walk_caches.route_memo_hits() > 0);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12308: topology-kept overlay route proof lacked coverage of its request memo hit"
+    )]
+    fn overlay_route_topology_memo_hit_skips_blob_reads() {
+        use brokk_bifrost_core::analyzer::project::OverlayProject;
+        use std::sync::Arc;
+
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname='overlay_routes'\nversion='0.1.0'\nedition='2021'\n",
+            )
+            .file("src/lib.rs", "pub fn base() {}\n")
+            .build();
+        let (_workspace, base) = super::super::test_support::certified_analyzer(fixture.root());
+        let overlay = OverlayProject::new(fixture.project_dyn());
+        let file = fixture.file("src/lib.rs");
+        assert!(overlay.set(file.abs_path(), "pub fn changed() {}\n".to_owned()));
+        let analyzer = base.clone_with_project(Arc::new(overlay.snapshot()));
+        assert!(!analyzer.declarations(&file).is_empty());
+        let request = AnalyzerQueryScope::new(&analyzer);
+        let reads = || super::super::ROUTE_TOPOLOGY_BLOB_READS.with(|reads| reads.get());
+        let before = reads();
+        let first = analyzer
+            .file_routes(&file, None)
+            .expect("first overlay routes");
+        let after_fill = reads();
+        assert_eq!(
+            after_fill - before,
+            2,
+            "the fill compares Main and overlay blobs"
+        );
+        let memo = analyzer
+            .inner
+            .active_query_request_memo::<super::super::RustRouteRequestMemo>()
+            .expect("request route memo");
+        assert_eq!(memo.route_topology_kept.lock().unwrap().len(), 1);
+        let second = analyzer
+            .file_routes(&file, None)
+            .expect("second overlay routes");
+        assert_eq!(
+            reads(),
+            after_fill,
+            "the memo hit must perform no topology blob reads"
+        );
+        assert!(first.is_complete());
+        assert!(second.is_complete());
+        assert_eq!(first.target_roots(&file), vec![file.clone()]);
+        assert_eq!(second.target_roots(&file), first.target_roots(&file));
+        assert!(first.file_has_production_witness(&file));
+        assert!(second.file_has_production_witness(&file));
+        assert_eq!(
+            first.file_is_test_only(&file),
+            second.file_is_test_only(&file)
+        );
+        request
+            .read_completion()
+            .expect("complete overlay route reads");
+    }
+
+    #[test]
     fn overlay_route_inventory_carries_mask_and_overlay_authority() {
         use brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionMountInventoryOutcome;
         use brokk_bifrost_core::analyzer::project::OverlayProject;
@@ -845,7 +944,7 @@ mod tests {
             workspace.analyzer(),
         )
         .expect("Rust analyzer");
-        let host = AnalyzerDerivations::new(&RetentionBudget::new(1_000_000));
+        let host = AnalyzerDerivations::new(&RetentionBudget::for_test_capacity(1_000_000));
         let unit = analyzer
             .with_selected_route_demands(None, |inventory| {
                 match host.demand::<RustFileUnits>(analyzer, inventory, &"src/lib.rs".to_owned()) {
@@ -877,6 +976,170 @@ mod tests {
         assert!(memo.get().is_none());
     }
 
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11479: a retained resolver session lost its operation read frame and reported generic validation failure"
+    )]
+    fn missing_operation_frame_refuses_route_memo_and_records_provider_failure() {
+        use brokk_bifrost_analysis::analyzer::ReadLedger;
+        use brokk_bifrost_analysis::analyzer::derivation_host::{
+            read_frame, rust_route_question_identity, selected_rust_snapshot,
+        };
+        use brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause;
+        use brokk_bifrost_core::analyzer::pool_memo::PoolSafeMemo;
+        use brokk_bifrost_core::analyzer::reuse_verdict::{
+            CapBinding, ExecutionCause, ReuseVerdict, SelectionEvidence, admit,
+        };
+        use brokk_bifrost_semantic::analyzer::semantic::derivation::UnavailableCause;
+
+        let fixture = readiness_fixture();
+        let workspace = fixture.certified_workspace_analyzer(
+            brokk_bifrost_core::analyzer::config::AnalyzerConfig::default(),
+        );
+        let analyzer = brokk_bifrost_analysis::analyzer::resolve_analyzer::<RustAnalyzer>(
+            workspace.analyzer(),
+        )
+        .expect("Rust analyzer");
+        let cancellation = brokk_bifrost_core::cancellation::CancellationToken::default();
+        let operation = match analyzer
+            .open_selected_rust_operation(&cancellation)
+            .outcome
+            .expect("selected operation")
+        {
+            SelectedResolutionOperationOpenOutcome::Ready(operation) => *operation,
+            other => panic!("selected operation: {other:?}"),
+        };
+        assert!(brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_selected_operation_active());
+        assert_eq!(read_frame::read_frame_depth_for_test(), 0);
+        let identity = rust_route_question_identity(
+            analyzer,
+            analyzer.analyzer_store(),
+            selected_rust_snapshot(&operation.ready.inventory).expect("Rust snapshot"),
+        );
+        assert_eq!(
+            read_frame::with_read_frame(
+                &identity,
+                || panic!("missing frame must not open another selection"),
+                |_| (),
+            ),
+            Err(UnavailableCause::MissingOperationReadFrame),
+        );
+
+        let ledger = std::sync::Arc::new(ReadLedger::new());
+        let memo = PoolSafeMemo::new();
+        {
+            let _reads = AnalyzerQueryScope::with_read_ledger(analyzer, ledger.clone());
+            let scope = AnalyzerQueryScope::capturing_read_incompleteness(analyzer);
+            // Use the existing production conversion, not a constructed StoreError:
+            // the route inventory fails at the same real active-operation guard.
+            let result = analyzer.memoized_route_index(&memo, &|| true, || {
+                analyzer.with_selected_route_demands(None, |_| Ok(()))
+            });
+            assert!(matches!(result, Err(RustCargoRouteError::Unavailable)));
+            let reasons = scope.captured_read_incompleteness();
+            assert!(
+                reasons.iter().any(|reason| matches!(
+                    reason,
+                    QueryReadIncomplete::StoreFailure(error)
+                        if error.to_string().contains("MissingOperationReadFrame")
+                        && reason.execution_cause() == Some(DerivationExecutionCause::Provider)
+                        && reason.label() == "store_failure"
+                    && reason.stable_replay_reason().is_none()
+                )),
+                "{reasons:?}"
+            );
+            assert!(
+                memo.get().is_none(),
+                "failure must not retain an answer or receipt"
+            );
+            assert!(ledger.publishable_keys().is_none());
+            assert_eq!(
+                ledger.ambient_verdict(),
+                ReuseVerdict::ExecutionDependent(ExecutionCause::Other)
+            );
+            // #11518 uses this exact shared admission boundary for aggregate
+            // evaluations. Pair with its real SQL recovery/replay regression:
+            // aggregate_evaluation_recomputes_after_transient_locator_source_failure.
+            assert!(
+                admit(
+                    CapBinding::RecordedGrant,
+                    (),
+                    ledger.explicit_verdict(),
+                    ledger.ambient_verdict(),
+                    SelectionEvidence::Complete,
+                )
+                .is_none()
+            );
+        }
+        // The guard remains strict, while a frame bound to THIS operation lets
+        // the same production route reader publish a normal request memo.
+        {
+            let _scope = AnalyzerQueryScope::new(analyzer);
+            let _frame = analyzer
+                .operation_read_frame(&operation)
+                .expect("operation frame");
+            assert!(
+                analyzer
+                    .memoized_route_index(&memo, &|| true, || {
+                        analyzer.with_selected_route_demands(None, |_| Ok(()))
+                    })
+                    .is_ok()
+            );
+            assert!(memo.get().is_some());
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#13196: an operation Main route bridge refusal also recorded a bare ValidationFailed store error"
+    )]
+    fn main_route_bridge_refusal_records_only_the_real_cause() {
+        let fixture = readiness_fixture();
+        let workspace = fixture.certified_workspace_analyzer(
+            brokk_bifrost_core::analyzer::config::AnalyzerConfig::default(),
+        );
+        let analyzer = brokk_bifrost_analysis::analyzer::resolve_analyzer::<RustAnalyzer>(
+            workspace.analyzer(),
+        )
+        .expect("Rust analyzer");
+        let cancellation = brokk_bifrost_core::cancellation::CancellationToken::default();
+        let operation = match analyzer
+            .open_selected_rust_operation(&cancellation)
+            .outcome
+            .expect("selected operation")
+        {
+            SelectedResolutionOperationOpenOutcome::Ready(operation) => *operation,
+            other => panic!("selected operation: {other:?}"),
+        };
+        let file = ProjectFile::new(fixture.root().to_path_buf(), "src/part.rs");
+        let scope = AnalyzerQueryScope::capturing_read_incompleteness(analyzer);
+        let _frame = analyzer
+            .operation_read_frame(&operation)
+            .expect("operation frame");
+        analyzer.analyzer_store().drop_rust_modules_table_for_test();
+        let result = analyzer.file_routes(&file, None);
+        assert!(matches!(result, Err(RustCargoRouteError::Unavailable)));
+        let failures: Vec<String> = scope
+            .captured_read_incompleteness()
+            .iter()
+            .filter_map(|reason| match reason {
+                QueryReadIncomplete::StoreFailure(error) => Some(error.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            failures
+                .iter()
+                .all(|message| message != "Rust file routes unavailable: ValidationFailed"),
+            "{failures:?}"
+        );
+        let first = scope
+            .store_error()
+            .expect("recorded store error")
+            .to_string();
+        assert!(first.contains("no such table"), "{first}");
+    }
+
     fn readiness_fixture() -> BuiltInlineTestProject {
         InlineTestProject::with_language(Language::Rust)
             .file(
@@ -886,6 +1149,266 @@ mod tests {
             .file("src/lib.rs", "pub mod part;\n")
             .file("src/part.rs", "pub fn target() {}\n")
             .build()
+    }
+
+    /// A module declared under `#[cfg(any())]` is compiled by no configuration.
+    /// Its file is neither production nor test code, so no route, package or
+    /// classification question may answer definitely for it, while its active
+    /// sibling keeps the definite answers.
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11639: a cfg-inactive module was routed and classified as production"
+    )]
+    fn a_cfg_inactive_module_is_neither_routed_nor_classified_as_production() {
+        use brokk_bifrost_analysis::analyzer::{IAnalyzer, QueryScope};
+
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"inactive\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            )
+            .file(
+                "src/lib.rs",
+                "mod active;\n#[cfg(any())]\nmod caller;\n#[cfg(test)]\nmod tests;\n",
+            )
+            .file("src/active.rs", "pub fn f() {}\n")
+            .file("src/caller.rs", "mod nested;\npub fn f() {}\n")
+            .file("src/caller/nested.rs", "pub fn g() {}\n")
+            .file("src/tests.rs", "pub fn t() {}\n")
+            .build();
+        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
+        for path in ["src/caller.rs", "src/caller/nested.rs"] {
+            let file = fixture.file(path);
+            let routes = analyzer.file_routes(&file, None).expect("routes");
+            assert!(
+                !routes.is_complete() && !routes.file_has_production_witness(&file),
+                "{path}: an inactive module is not a complete production route"
+            );
+            assert!(
+                matches!(
+                    analyzer.file_is_test_only(&file),
+                    Err(QueryReadIncomplete::SemanticEvidenceGap(_))
+                ),
+                "{path}: {:?}",
+                analyzer.file_is_test_only(&file)
+            );
+            let contains =
+                <RustAnalyzer as RustSource>::package_contains(&analyzer, token, &file, None)
+                    .expect("package answer");
+            assert!(
+                !contains.complete,
+                "{path}: membership of an inactive file is not a complete answer: {contains:?}"
+            );
+        }
+        for (path, test_only) in [
+            ("src/lib.rs", false),
+            ("src/active.rs", false),
+            ("src/tests.rs", true),
+        ] {
+            let file = fixture.file(path);
+            let routes = analyzer.file_routes(&file, None).expect("routes");
+            assert!(routes.is_complete(), "{path}");
+            assert_eq!(
+                analyzer.file_is_test_only(&file).expect("classified"),
+                test_only,
+                "{path}"
+            );
+        }
+    }
+
+    /// A file that an inactive module and an active `#[cfg(test)]` module both
+    /// declare is compiled as test code. The inactive declaration must not hide
+    /// the active placement, while the inactive module itself stays inactive.
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11639: an inactive parent hid a file's active cfg(test) placement"
+    )]
+    fn a_file_shared_by_an_inactive_and_a_test_module_stays_test_code() {
+        use brokk_bifrost_analysis::analyzer::IAnalyzer;
+
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"shared\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            )
+            .file(
+                "src/lib.rs",
+                "#[cfg(test)]\n#[path = \"shared.rs\"]\nmod tests;\n#[cfg(any())]\nmod dead;\n",
+            )
+            .file("src/dead.rs", "#[path = \"shared.rs\"]\nmod shared;\n")
+            .file("src/shared.rs", "pub fn t() {}\n")
+            .build();
+        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        let shared = fixture.file("src/shared.rs");
+        assert!(
+            analyzer.file_is_test_only(&shared).expect("classified"),
+            "shared.rs has an active cfg(test) placement"
+        );
+        let routes = analyzer.file_routes(&shared, None).expect("routes");
+        assert!(
+            routes.is_complete(),
+            "the inactive declaration must not make the active route incomplete"
+        );
+        let dead = fixture.file("src/dead.rs");
+        assert!(
+            matches!(
+                analyzer.file_is_test_only(&dead),
+                Err(QueryReadIncomplete::SemanticEvidenceGap(_))
+            ),
+            "dead.rs: {:?}",
+            analyzer.file_is_test_only(&dead)
+        );
+    }
+
+    /// `lib.rs` declares `shared.rs` twice: as `tests` under `#[cfg(test)]`, and
+    /// as `dead` under `dead_cfg`.
+    fn shared_declared_twice(dead_cfg: Option<&str>) -> BuiltInlineTestProject {
+        let gate = dead_cfg.map_or(String::new(), |cfg| format!("#[cfg({cfg})]\n"));
+        InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"twice\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            )
+            .file(
+                "src/lib.rs",
+                format!(
+                    "#[cfg(test)]\n#[path = \"shared.rs\"]\nmod tests;\n{gate}#[path = \"shared.rs\"]\nmod dead;\n"
+                ),
+            )
+            .file("src/shared.rs", "pub fn t() {}\n")
+            .build()
+    }
+
+    /// The edge a declaration adds counts by the placement that declaration
+    /// creates. `dead` is compiled by no configuration, so the file it names is
+    /// still reached only by the test declaration, whatever the file's own
+    /// activity (it has an active placement as `tests`).
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11639: a cfg-false declaration of an actively test-placed file witnessed production"
+    )]
+    fn a_cfg_false_declaration_of_a_test_placed_file_is_no_production_route() {
+        use brokk_bifrost_analysis::analyzer::IAnalyzer;
+
+        let fixture = shared_declared_twice(Some("any()"));
+        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        let shared = fixture.file("src/shared.rs");
+        assert!(
+            analyzer.file_is_test_only(&shared).expect("classified"),
+            "shared.rs is reached by cfg(test) only"
+        );
+    }
+
+    /// The control: with `dead` active it is a production route to the file.
+    #[test]
+    fn an_active_declaration_of_a_test_placed_file_is_a_production_route() {
+        use brokk_bifrost_analysis::analyzer::IAnalyzer;
+
+        let fixture = shared_declared_twice(None);
+        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        assert!(
+            !analyzer
+                .file_is_test_only(&fixture.file("src/shared.rs"))
+                .expect("classified")
+        );
+    }
+
+    /// `lib.rs` declares `shared.rs` under `#[cfg(test)]` and also declares
+    /// `maybe.rs` under `maybe_cfg`; `maybe.rs` declares the same `shared.rs`.
+    fn shared_through_a_maybe_module(maybe_cfg: &str) -> BuiltInlineTestProject {
+        InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"maybe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            )
+            .file(
+                "src/lib.rs",
+                format!(
+                    "#[cfg(test)]\n#[path = \"shared.rs\"]\nmod tests;\n#[cfg({maybe_cfg})]\nmod maybe;\n"
+                ),
+            )
+            .file("src/maybe.rs", "#[path = \"shared.rs\"]\nmod shared;\n")
+            .file("src/shared.rs", "pub fn t() {}\n")
+            .build()
+    }
+
+    /// An undecided `cfg` (a name only a build script could set) decides
+    /// nothing: enabling it would compile `shared.rs` in production, so the
+    /// file is not definitely test code.
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11639: an undecided cfg route was dropped and made a file definitely test-only"
+    )]
+    fn an_undecided_cfg_route_leaves_a_shared_file_unclassified() {
+        use brokk_bifrost_analysis::analyzer::IAnalyzer;
+
+        let fixture = shared_through_a_maybe_module("undecided_build_script_cfg");
+        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        let shared = fixture.file("src/shared.rs");
+        assert!(
+            matches!(
+                analyzer.file_is_test_only(&shared),
+                Err(QueryReadIncomplete::SemanticEvidenceGap(_))
+            ),
+            "shared.rs: {:?}",
+            analyzer.file_is_test_only(&shared)
+        );
+    }
+
+    /// The same shape with a proven-inactive route: nothing can compile
+    /// `maybe.rs`, so its declaration of `shared.rs` is no route at all.
+    #[test]
+    fn a_proven_inactive_route_still_leaves_a_shared_file_test_only() {
+        use brokk_bifrost_analysis::analyzer::IAnalyzer;
+
+        let fixture = shared_through_a_maybe_module("any()");
+        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        assert!(
+            analyzer
+                .file_is_test_only(&fixture.file("src/shared.rs"))
+                .expect("classified")
+        );
+    }
+
+    /// One unit places the file under `#[cfg(test)]`; another places it under
+    /// an undecided `cfg`. The second unit is not a unit that never compiles
+    /// the file, so it cannot be filtered out of the test-only answer.
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11639: an undecided cfg route was dropped and made a file definitely test-only"
+    )]
+    fn an_undecided_placement_in_another_unit_leaves_a_shared_file_unclassified() {
+        use brokk_bifrost_analysis::analyzer::IAnalyzer;
+
+        let package = |name: &str| {
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n")
+        };
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file("Cargo.toml", "[workspace]\nmembers = [\"a\", \"b\"]\n")
+            .file("a/Cargo.toml", package("a"))
+            .file("b/Cargo.toml", package("b"))
+            .file(
+                "a/src/lib.rs",
+                "#[cfg(test)]\n#[path = \"../../common/shared.rs\"]\nmod shared;\n",
+            )
+            .file(
+                "b/src/lib.rs",
+                "#[cfg(undecided_build_script_cfg)]\n#[path = \"../../common/shared.rs\"]\nmod shared;\n",
+            )
+            .file("common/shared.rs", "pub fn t() {}\n")
+            .build();
+        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        let shared = fixture.file("common/shared.rs");
+        assert!(
+            matches!(
+                analyzer.file_is_test_only(&shared),
+                Err(QueryReadIncomplete::SemanticEvidenceGap(_))
+            ),
+            "shared.rs: {:?}",
+            analyzer.file_is_test_only(&shared)
+        );
     }
 
     fn module_route_fixture(temp: &tempfile::TempDir) -> PathBuf {

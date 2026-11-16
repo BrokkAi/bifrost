@@ -38,6 +38,86 @@ mod rust_departing_tests_tests {
     use brokk_bifrost_semantic::analyzer::semantic::service::SERVE_COUNTS;
     use std::sync::atomic::Ordering;
 
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12128: all await producers must publish one shared interference event in stored IR"
+    )]
+    fn await_memory_interference_round_trips_in_all_shared_producers() {
+        use brokk_bifrost_semantic::analyzer::semantic::SemanticEffect;
+        for (language, path, source) in [
+            (
+                Language::Rust,
+                "lib.rs",
+                "async fn run(t: impl std::future::Future<Output=i32>) -> i32 { t.await }",
+            ),
+            (
+                Language::Python,
+                "a.py",
+                "async def run(t):\n    return await t\n",
+            ),
+            (
+                Language::CSharp,
+                "A.cs",
+                "using System.Threading.Tasks; class A { static async Task<int> Run(Task<int> t) { return await t; } }",
+            ),
+            (
+                Language::JavaScript,
+                "a.js",
+                "async function run(t) { return await t; }",
+            ),
+            (
+                Language::TypeScript,
+                "a.ts",
+                "async function run(t: Promise<number>) { return await t; }",
+            ),
+        ] {
+            let fixture = AnalyzerFixture::new_for_language(language, &[(path, source)]);
+            let file = ProjectFile::new(fixture.project_root(), path);
+            let cancellation = CancellationToken::default();
+            let overlay = OverlayProject::new(Arc::new(fixture.test_project().clone()));
+            assert!(overlay.set(file.abs_path(), source.to_owned()));
+            let overlaid = fixture
+                .analyzer
+                .clone_with_project(Arc::new(overlay.snapshot()));
+            // The disk touch serves rows, its repeat serves the artifact cache,
+            // and an overlay with identical bytes forces on-demand lowering.
+            for analyzer in [&fixture.analyzer, &fixture.analyzer, &overlaid] {
+                let mut budget = SemanticBudget::default();
+                let outcome = analyzer
+                    .materialize_program_semantics(
+                        &file,
+                        &mut SemanticRequest::new(&mut budget, &cancellation),
+                    )
+                    .expect("materialize await IR");
+                let artifact = outcome.available_value().expect("retained artifact");
+                let mut suspends = 0;
+                let mut interferences = 0;
+                for procedure in artifact.procedures() {
+                    for point in procedure.points() {
+                        for (index, event) in point.events.iter().enumerate() {
+                            if matches!(event.effect, SemanticEffect::AsyncSuspend { .. }) {
+                                suspends += 1;
+                                assert!(
+                                    point.events[..index]
+                                        .iter()
+                                        .any(|event| event.effect
+                                            == SemanticEffect::MemoryInterference),
+                                    "{language:?}: missing prefix"
+                                );
+                            }
+                            if event.effect == SemanticEffect::MemoryInterference {
+                                interferences += 1;
+                                assert_eq!(index, 0, "{language:?}: interference must be first");
+                            }
+                        }
+                    }
+                }
+                assert_eq!(suspends, 1, "{language:?}: fixture await");
+                assert_eq!(interferences, suspends, "{language:?}: exactly one owner");
+            }
+        }
+    }
+
     const COMPLETION_SOURCE: &str = "pub fn answer() -> i32 { 42 }\n";
 
     fn assert_completion_origins(limits: SemanticWork, complete: bool) {
@@ -183,6 +263,67 @@ mod rust_departing_tests_tests {
         assert_completion_origins(limits, false);
     }
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12128: local async admission must not certify a must-return across unknown awaited control"
+    )]
+    fn async_body_must_return_profile_keeps_unknown_awaited_control_open() {
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Rust,
+            &[(
+                "lib.rs",
+                "async fn condition() -> bool { true } async fn body() -> i32 { if condition().await { 1 } else { 2 } }",
+            )],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "lib.rs");
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let artifact = fixture
+            .analyzer
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .unwrap()
+            .available_value()
+            .cloned()
+            .expect("artifact");
+        let body = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(DeclarationSegment::name)
+                    == Some("body")
+            })
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .expect("async body");
+        let entry = body.point_handle(body.semantics().entry_point()).unwrap();
+        let exit = body
+            .point_handle(body.semantics().normal_exit_point())
+            .unwrap();
+        let mut budget = SemanticBudget::default();
+        let profile = materialize_exit_profile(
+            &entry,
+            &exit,
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .unwrap();
+        let profile = profile.available_value().expect("retained exit profile");
+        assert!(
+            profile.gap_reason.is_some(),
+            "must-return profile must retain deferred activation: {profile:?}"
+        );
+        assert_ne!(
+            profile.quality,
+            brokk_bifrost_semantic::analyzer::semantic::SnapshotQuality::Complete
+        );
+    }
+
+    #[test]
     fn procedure_deferred_scheduling_does_not_weaken_a_nested_call_transfer() {
         let fixture = AnalyzerFixture::new_for_language(
             brokk_bifrost_core::analyzer::model::Language::Rust,
@@ -223,7 +364,7 @@ mod rust_departing_tests_tests {
             .gaps()
             .iter()
             .find(|gap| {
-                gap.subject == SemanticGapSubject::Procedure
+                gap.subject == SemanticGapSubject::FutureConstruction
                     && gap.capability == SemanticCapability::DeferredExecution
             })
             .expect("async procedure scheduling gap");

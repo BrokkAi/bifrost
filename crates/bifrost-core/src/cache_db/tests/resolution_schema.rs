@@ -2824,8 +2824,8 @@ fn unit_summary_profile_migration_preserves_rust_and_rebinds_go() {
     for conn in [upgraded, open_in_memory_cache()] {
         conn.execute(
             "INSERT INTO resolution_unit_summaries(lang,unit_kind,unit_key,summary_digest,producer_epoch,
-               derivation_version,complete,output_digest,publication_state)
-             VALUES('go','go_package',zeroblob(32),randomblob(32),'test',1,1,zeroblob(32),'complete')", [],
+               derivation_identity,complete,output_digest,publication_state)
+             VALUES('go','go_package',zeroblob(32),randomblob(32),'test',zeroblob(32),1,zeroblob(32),'complete')", [],
         ).unwrap();
         let summary = conn.last_insert_rowid();
         for profile in [[1_u8; 32], [2; 32]] {
@@ -2982,8 +2982,8 @@ fn python_member_operations_migration_enforces_rows_and_cascade() {
             conn.execute_batch("INSERT INTO resolution_unit_summary_containers VALUES(1,'',NULL);
                 INSERT INTO python_unit_summary_providers VALUES(1,'','module','',0,'module','selected','module.py',0,zeroblob(32));
                 INSERT INTO python_unit_summary_surfaces VALUES(1,'','module','slots');
-                INSERT INTO python_unit_summary_export_names VALUES(1,'','module','known',NULL);
-                INSERT INTO python_unit_summary_imports VALUES(1,0,0,'','','module',0,'known','known','from','activation_open');").unwrap();
+                INSERT INTO python_unit_summary_export_names(summary_id,container_path,surface,name,slot_site) VALUES(1,'','module','known',NULL);
+                INSERT INTO python_unit_summary_imports(summary_id,member_ordinal,import_site,importer_container,target_container,module_name,relative_level,requested_name,bound_name,form,state) VALUES(1,0,0,'','','module',0,'known','known','from','activation_open');").unwrap();
             conn.execute_batch(include_str!(
                 "../../../migrations/cache/0209-python-environment-source-inputs.sql"
             ))
@@ -3203,7 +3203,7 @@ fn python_source_root_spellings_migrate_and_cascade() {
             [blob],
         )
         .unwrap();
-        conn.execute_batch("INSERT INTO resolution_unit_summaries(summary_id,lang,unit_kind,unit_key,summary_digest,producer_epoch,derivation_version,complete,publication_state) VALUES(1,'python','python_environment',zeroblob(32),zeroblob(32),'native',1,0,'building');
+        conn.execute_batch("INSERT INTO resolution_unit_summaries(summary_id,lang,unit_kind,unit_key,summary_digest,producer_epoch,derivation_identity,complete,publication_state) VALUES(1,'python','python_environment',zeroblob(32),zeroblob(32),'native',zeroblob(32),0,'building');
             INSERT INTO python_unit_summary_roots VALUES(1,0,'','workspace',0,'runtime',zeroblob(32));
             INSERT INTO resolution_unit_summary_containers VALUES(1,'',NULL);
             INSERT INTO resolution_unit_summary_containers VALUES(1,'provider','');
@@ -3403,9 +3403,16 @@ fn rust_route_question_lookup_migration_backfills_and_seeks() {
     }
     conn.execute("INSERT INTO resolution_unit_summary_dependency_names(summary_id,role,name) VALUES(1,'workspace','alias')", []).unwrap();
     conn.execute("INSERT INTO rust_crate_topologies(topology_id,topology_digest,crate_key,producer_epoch,target_kind,crate_name,edition,prelude,cfg_atoms,inventory_complete,export_surface_digest,publication_state) VALUES(1,zeroblob(32),zeroblob(32),'route-test','lib','demo','2021','std',jsonb('[]'),1,zeroblob(32),'complete')", []).unwrap();
-    migrate(&mut conn).unwrap();
-    assert!(current_schema_is_valid(&conn).unwrap());
-    validate_foreign_keys(&conn).unwrap();
+    // Check the 0281 backfill while the rows it rewrites still exist. Migration
+    // 0334 later withdraws every unit summary for re-derivation.
+    let route_lookups = POST_BASELINE_MIGRATIONS
+        .iter()
+        .find(|migration| migration.version == 281)
+        .expect("migration 281 exists");
+    conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+    conn.execute_batch(route_lookups.sql).unwrap();
+    conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+    conn.pragma_update(None, "user_version", 281).unwrap();
     let mismatches: i64 = conn.query_row("SELECT count(*) FROM rust_resolution_unit_summary_file_naming AS naming WHERE package_path <> COALESCE((SELECT group_concat(value, '.') FROM (SELECT value FROM json_each(naming.package_components) ORDER BY CAST(key AS INTEGER))), '')", [], |r| r.get(0)).unwrap();
     assert_eq!(mismatches, 0);
     let mut stmt = conn.prepare("SELECT member_ordinal, package_path FROM rust_resolution_unit_summary_file_naming ORDER BY member_ordinal").unwrap();
@@ -3423,8 +3430,25 @@ fn rust_route_question_lookup_migration_backfills_and_seeks() {
         ]
     );
     drop(stmt);
+    migrate(&mut conn).unwrap();
+    assert!(current_schema_is_valid(&conn).unwrap());
+    validate_foreign_keys(&conn).unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM rust_resolution_unit_summary_file_naming",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0,
+        "migration 0334 withdraws every unit summary"
+    );
+    // Re-seed the summary family under the current schema so the write, reopen
+    // and lookup checks below run on a valid store.
+    conn.execute("INSERT INTO resolution_unit_summaries(summary_id,lang,unit_kind,unit_key,summary_digest,producer_epoch,derivation_identity,complete,publication_state) VALUES(1,'rust','rust_crate',zeroblob(32),zeroblob(32),'route-test',zeroblob(32),0,'building')", []).unwrap();
     conn.execute("INSERT INTO resolution_unit_summary_members(summary_id,member_ordinal,blob_id,rel_path,source_role) VALUES(1,3,?1,'src/new.rs','source')", [blob]).unwrap();
     conn.execute("INSERT INTO rust_resolution_unit_summary_file_naming(summary_id,member_ordinal,package_components,package_path,root_components) VALUES(1,3,jsonb('[\"new\",\"pkg\"]'),'new.pkg',jsonb('[]'))", []).unwrap();
+    conn.execute("INSERT INTO resolution_unit_summary_dependency_names(summary_id,role,name) VALUES(1,'workspace','alias')", []).unwrap();
     assert_eq!(conn.query_row("SELECT package_path FROM rust_resolution_unit_summary_file_naming WHERE summary_id=1 AND member_ordinal=3", [], |r| r.get::<_, String>(0)).unwrap(), "new.pkg");
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("route-cache.db");

@@ -423,7 +423,7 @@ fn model_type_outcome(
     type_name: &str,
     target_kind: TypeLookupTargetKind,
 ) -> Option<TypeLookupOutcome> {
-    let overlay = analyzer.semantic_model_overlay()?;
+    let overlay = analyzer.semantic_model_overlay_read().published()?;
     let matched = overlay.symbols_named_for(type_name, "typescript");
     let records = matched
         .records

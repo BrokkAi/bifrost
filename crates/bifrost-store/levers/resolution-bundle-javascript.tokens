@@ -1,0 +1,14 @@
+# The javascript resolution bundle lever (#11570).
+#
+# Add one `<issue>-<slug>` line when a change alters the persisted per-file
+# javascript resolution bundle for unchanged source: stored interiors and unit
+# summaries produced under an earlier identity are withdrawn and relowered.
+# Whoever adds a line must also ask whether both ICFG provider domains rotate
+# (see .agents/docs/cache-identity-levers.md). Git merges this file with
+# merge=union, so two branches that each add a line keep both. Never edit or
+# remove a line; compaction replaces a prefix with a checkpoint line and keeps
+# the identity.
+#
+# Replaced the string literal:
+# resolution-bundle-javascript-v25-compact-identity-digests-9628-positioned-expression-gaps-5375-local-write-joins-5015-2026-10
+11570-slice2a-token-files

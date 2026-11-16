@@ -187,7 +187,8 @@ impl KotlinAnalyzer {
         };
         let query_scope = AnalyzerQueryScope::new(self);
         let token = query_scope.token();
-        let external = self.external_declarations(analyzer.semantic_model_overlay());
+        let external =
+            self.external_declarations(analyzer.semantic_model_overlay_read().published());
         let recorder = crate::analyzer::jvm::external::QueryGapRecorder::new(analyzer);
         let mut closure = brokk_bifrost_jvm::ExternalSupertypeClosure::default();
         build_kotlin_external_root_hierarchy(

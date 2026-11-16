@@ -22,6 +22,7 @@ pub(crate) fn verify_selection(
     cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
 ) -> Result<VerifiedSelection, SelectionRefused> {
     match question.kind {
+        ExternalSelectionQuestionKind::RustToolchain => Err(SelectionRefused::Stale),
         ExternalSelectionQuestionKind::Dependencies => {
             verify_dependencies_with(config, project, question, retry, || {})
         }
@@ -69,6 +70,52 @@ fn verify_jdk(
             records: Arc::new(jdk),
         });
     }
+}
+
+/// Whether a complete dependency selection can be certified, apart from a view
+/// stamp: its question is certifiable, it ran no build tool, and it listed no
+/// directory.
+fn dependencies_certifiable(
+    config: &JvmAnalyzerConfig,
+    question: &ExternalSelectionQuestion,
+    selection: Option<&super::external::ExternalInventorySelection>,
+) -> bool {
+    !question.uncertified
+        && config.dependency_discovery.mode != JvmDependencyDiscoveryMode::OfflineBuildTools
+        // Dependency resolution lists directories only in the Gradle cache, and
+        // that listing makes the selection uncertified. Every listing counts:
+        // the probes sit under the canonical cache root, which need not share a
+        // prefix with the configured root.
+        && selection.is_some_and(|selection| {
+            !selection
+                .inputs
+                .resolution_steps
+                .iter()
+                .any(|probe| matches!(probe.operation, ExternalProbeOperation::List))
+        })
+}
+
+/// The answer digest of the dependency question when its tree part is `basis`
+/// and the environment is this one, or `None` unless that answer is complete
+/// and certifiable (#11607). Reads no manifest: replay resolves the recorded
+/// coordinates under `project_root` and compares the digest with the recorded
+/// one.
+pub(crate) fn dependencies_answer_under_basis(
+    config: &JvmAnalyzerConfig,
+    project_root: &std::path::Path,
+    question: &ExternalSelectionQuestion,
+    basis: &brokk_bifrost_core::analyzer::external_selection::JvmDependencyBasis,
+) -> Option<[u8; 32]> {
+    let selection = JvmExternalDeclarationIndex::select_under_basis::<std::convert::Infallible>(
+        config,
+        project_root,
+        basis,
+        |_| Ok(()),
+    )?
+    .expect("infallible artifact visitor");
+    let complete = selection.completeness.is_complete();
+    let certified = complete && dependencies_certifiable(config, question, Some(&selection));
+    (complete && certified).then(|| selection.answer_digest(complete, certified))
 }
 
 fn verify_dependencies_with(
@@ -123,20 +170,8 @@ fn verify_dependencies_with(
             .as_ref()
             .is_some_and(|selection| selection.completeness.is_complete());
         let certified = complete
-            && !question.uncertified
-            && config.dependency_discovery.mode != JvmDependencyDiscoveryMode::OfflineBuildTools
             && stamp.is_some()
-            // Dependency resolution lists directories only in the Gradle cache,
-            // and that listing makes the selection uncertified. Every listing
-            // counts: the probes sit under the canonical cache root, which need
-            // not share a prefix with the configured root.
-            && selection.as_ref().is_some_and(|selection| {
-                !selection
-                    .inputs
-                    .resolution_steps
-                    .iter()
-                    .any(|probe| matches!(probe.operation, ExternalProbeOperation::List))
-            });
+            && dependencies_certifiable(config, question, selection.as_ref());
         return Ok(VerifiedSelection {
             question_digest: question.digest,
             answer_digest: match &selection {
@@ -198,6 +233,58 @@ mod tests {
         });
         assert!(matches!(answer, Err(SelectionRefused::Stale)));
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    /// The dependency answer is reproduced from the coordinates alone, and
+    /// follows the environment (#11607).
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11607: a dependency selection recorded over an export could not be checked against a head that differed from its tree"
+    )]
+    fn a_dependency_answer_is_reproduced_from_its_recorded_coordinates() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(
+            root.join("pom.xml"),
+            r#"<project><modelVersion>4.0.0</modelVersion><groupId>g</groupId><artifactId>app</artifactId><version>1</version><dependencies><dependency><groupId>com.example</groupId><artifactId>lib</artifactId><version>1.0</version></dependency></dependencies></project>"#,
+        )
+        .unwrap();
+        let repository = root.join("repo");
+        let jar = repository.join("com/example/lib/1.0/lib-1.0.jar");
+        std::fs::create_dir_all(jar.parent().unwrap()).unwrap();
+        std::fs::write(&jar, b"not a jar").unwrap();
+        let listing = Arc::new(WorkspaceFileListingCache::new(root.clone()));
+        let project = FilesystemProject::with_cached_listing(root.clone(), listing).unwrap();
+        let config = JvmAnalyzerConfig {
+            external_dependencies: brokk_bifrost_core::analyzer::config::JvmExternalDependencies {
+                repository_roots: vec![repository],
+                ..Default::default()
+            },
+            ..JvmAnalyzerConfig::default()
+        };
+        let question = ExternalSelectionQuestion::for_jvm(&config).remove(0);
+        let live = verify_dependencies_with(
+            &config,
+            &project,
+            &question,
+            &SelectionRetry::default(),
+            || {},
+        )
+        .expect("a stable view");
+        assert!(live.complete && live.certified, "{live:?}");
+        let basis = super::super::external::jvm_dependency_basis(&config, &project)
+            .expect("a recordable tree part");
+        let under = || dependencies_answer_under_basis(&config, &root, &question, &basis);
+        assert_eq!(under(), Some(live.answer_digest));
+        // The artifact's bytes are the environment part.
+        std::fs::write(&jar, b"other bytes").unwrap();
+        assert_ne!(under(), Some(live.answer_digest));
+        std::fs::remove_file(&jar).unwrap();
+        assert_eq!(
+            under(),
+            None,
+            "an unresolved coordinate is not a complete answer"
+        );
     }
 
     #[test]

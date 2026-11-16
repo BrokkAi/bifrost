@@ -125,6 +125,8 @@ occurrence_roles! {
         "A name declared by a Python global statement.",
     NonlocalDirective => "nonlocal_directive": NonReference,
         "A name declared by a Python nonlocal statement.",
+    CalleePosition => "callee_position": Reference,
+        "The terminal identifier of a Rust call's callee path, including local-binding callees; policies opt in explicitly. Method names retain member_position.",
 }
 
 impl fmt::Display for OccurrenceRole {

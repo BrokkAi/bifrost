@@ -43,6 +43,16 @@ pub(super) struct MemberFamilyValue {
     pub(super) edges: Arc<Vec<MemberFamilyRowEdge>>,
 }
 
+struct UnreadAncestorSuffix<'a, T>(&'a [T]);
+impl<T: std::fmt::Debug> std::fmt::Display for UnreadAncestorSuffix<'_, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if !self.0.is_empty() {
+            write!(f, "; unread ancestors: {:?}", self.0)?;
+        }
+        Ok(())
+    }
+}
+
 impl MemberFamilyValue {
     pub(super) fn file(&self) -> &ProjectFile {
         self.member.unit.source()
@@ -178,20 +188,13 @@ fn finish(
                 _ => Incompleteness::Content,
             },
             crate::analyzer::common::language_for_file(declaration.unit.source()).config_label(),
-            format!(
-                "member-family {} for {} in {} has no established edges: {}{}",
-                answer.outcome.label(),
-                declaration.unit.identifier(),
-                rel_path_string(declaration.unit.source()),
-                answer
-                    .reason
-                    .expect("a non-proven family states its reason")
-                    .label(),
-                if answer.unread_ancestors.is_empty() {
-                    String::new()
-                } else {
-                    format!("; unread ancestors: {:?}", answer.unread_ancestors)
-                },
+            brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+                format_args!("member-family {} for {} in {} has no established edges: {}{}",
+                    answer.outcome.label(), declaration.unit.identifier(), rel_path_string(declaration.unit.source()),
+                    answer.reason.expect("a non-proven family states its reason").label(), UnreadAncestorSuffix(&answer.unread_ancestors)),
+                format_args!("member-family {} has no established edges: {}; detail_kind=UnreadAncestor; omitted_source_context_items=1",
+                    answer.outcome.label(), answer.reason.expect("a non-proven family states its reason").label()),
+                answer.unread_ancestors.iter(),
             ),
             Vec::new(),
         ));

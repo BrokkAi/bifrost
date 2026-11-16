@@ -4,6 +4,10 @@
 //! The inverse resolver owns target identity, including overload selection.
 //! This module only recognizes call syntax at those already-confirmed sites.
 
+use brokk_bifrost_analysis::analyzer::usages::call_relations::{
+    CallRelationDiagnosticPayload, CallRelationFailure, LocatedCallRelationDiagnostic,
+};
+
 use crate::analyzer::java::JavaAnalyzer;
 
 use crate::analyzer::java::selected_reverse::JavaSelectedInverseResolution;
@@ -78,10 +82,9 @@ impl CallRelationProvider for JavaNativeCallRelations {
         if let Some(result) = native_incoming_preflight(target, limits, &cancellation, || {
             diagnostic(
                 CallRelationDiagnosticCode::BudgetExhausted,
-                format!(
-                    "native Java incoming-call budget omitted {}",
-                    target.fq_name()
-                ),
+                CallRelationDiagnosticPayload::JavaIncomingBudget {
+                    target: target.fq_name().to_string(),
+                },
                 target.fq_name().to_string(),
                 "native_call_budget_exhausted",
             )
@@ -89,19 +92,16 @@ impl CallRelationProvider for JavaNativeCallRelations {
             return result;
         }
         let Some(java) = resolve_analyzer::<JavaAnalyzer>(analyzer) else {
-            return unavailable("native Java analyzer is unavailable", target);
+            return unavailable(CallRelationFailure::Unavailable, target);
         };
         let selected = match java_selected_inverse_detailed_for(java, java, target, &cancellation) {
             JavaSelectedReverseOutcome::Ready(answer) => answer,
-            JavaSelectedReverseOutcome::Unavailable(reason)
-            | JavaSelectedReverseOutcome::TargetUncovered(reason) => {
-                return unavailable(
-                    format!("selected Java inverse is unavailable: {reason}"),
-                    target,
-                );
+            JavaSelectedReverseOutcome::Unavailable(_reason)
+            | JavaSelectedReverseOutcome::TargetUncovered(_reason) => {
+                return unavailable(CallRelationFailure::Unavailable, target);
             }
-            JavaSelectedReverseOutcome::Stale(reason) => {
-                return unavailable(format!("selected Java inverse is stale: {reason}"), target);
+            JavaSelectedReverseOutcome::Stale(_reason) => {
+                return unavailable(CallRelationFailure::Stale, target);
             }
             JavaSelectedReverseOutcome::Cancelled => {
                 return CallRelationResult {
@@ -110,8 +110,8 @@ impl CallRelationProvider for JavaNativeCallRelations {
                     ..CallRelationResult::default()
                 };
             }
-            JavaSelectedReverseOutcome::StoreError(reason) => {
-                return unavailable(format!("selected Java inverse failed: {reason}"), target);
+            JavaSelectedReverseOutcome::StoreError(_reason) => {
+                return unavailable(CallRelationFailure::StoreError, target);
             }
         };
         project_incoming_calls(java, target, selected, limits, &cancellation)
@@ -124,10 +124,7 @@ impl CallRelationProvider for JavaNativeCallRelations {
         _limits: CallRelationLimits,
         _cancellation: Option<&CancellationToken>,
     ) -> CallRelationResult {
-        unavailable(
-            "native Java outgoing calls are not part of this slice",
-            caller,
-        )
+        unavailable(CallRelationFailure::Unavailable, caller)
     }
 }
 
@@ -163,10 +160,9 @@ fn project_incoming_calls(
     {
         result.diagnostics.push(diagnostic(
             CallRelationDiagnosticCode::AnalysisFailed,
-            format!(
-                "Java dispatch can reach {} without a selected inverse row",
-                target.fq_name()
-            ),
+            CallRelationDiagnosticPayload::JavaDispatchUnenumerable {
+                target: target.fq_name().to_string(),
+            },
             target.fq_name().to_string(),
             "native_call_dispatch_unenumerable",
         ));
@@ -210,11 +206,12 @@ fn project_incoming_calls(
             };
             result.diagnostics.push(diagnostic(
                 code,
-                format!(
-                    "selected Java binding target count is {binding_target_count:?}: {:?}",
-                    edge.site
-                ),
-                edge.site.file.to_string(),
+                CallRelationDiagnosticPayload::JavaBindingCount {
+                    count: binding_target_count,
+                    enclosing: edge.site.enclosing.as_ref().map(Into::into),
+                }
+                .at(&edge.site.file, Some(edge.site.range)),
+                "call_source".to_string(),
                 reason,
             ));
         }
@@ -251,10 +248,9 @@ fn project_incoming_calls(
     if result.caller_inventory == CallerInventoryCoverage::Incomplete && result.sites.is_empty() {
         result.diagnostics.push(diagnostic(
             CallRelationDiagnosticCode::AnalysisFailed,
-            format!(
-                "no projected Java invocation certifies callers of {}",
-                target.fq_name()
-            ),
+            CallRelationDiagnosticPayload::JavaWithoutInvocation {
+                target: target.fq_name().to_string(),
+            },
             target.fq_name().to_string(),
             "native_call_target_without_invocation_certificate",
         ));
@@ -270,7 +266,7 @@ fn project_incoming_calls(
             site.kind = CallSyntaxKind::Constructor;
         }
     }
-    result
+    result.with_diagnostic_limits(limits)
 }
 
 fn caller_context_reason(
@@ -320,16 +316,22 @@ fn record_caller_context(
         return;
     };
     *coverage = CallerInventoryCoverage::Incomplete;
-    let message = format!("Java caller identity is incomplete at {range:?}: {reason}");
+    let message = CallRelationDiagnosticPayload::JavaCallerIncomplete {
+        kind: reason.to_string(),
+    }
+    .at(file, Some(*range));
     if !diagnostics.iter().any(|item| {
         item.reason_kind.as_deref() == Some(reason)
-            && item.context == file.to_string()
-            && item.message == message
+            && item.context == "call_source"
+            && item
+                .location
+                .iter()
+                .any(|location| location.file == *file && location.range == Some(*range))
     }) {
         diagnostics.push(diagnostic(
             CallRelationDiagnosticCode::AnalysisFailed,
             message,
-            file.to_string(),
+            "call_source".to_string(),
             reason,
         ));
     }
@@ -359,8 +361,8 @@ impl IncomingCallProjection for JavaIncomingProjection<'_> {
         let Some(source) = self.java.indexed_source(file) else {
             diagnostics.push(diagnostic(
                 CallRelationDiagnosticCode::AnalysisFailed,
-                format!("selected Java call source is unavailable: {}", file),
-                file.to_string(),
+                CallRelationDiagnosticPayload::JavaSourceUnavailable.at(file, None),
+                "call_source".to_string(),
                 "native_call_source_unavailable",
             ));
             return Ok(IncomingFile::Rejected);
@@ -371,8 +373,8 @@ impl IncomingCallProjection for JavaIncomingProjection<'_> {
         let Some(tree) = brokk_bifrost_jvm::java::declarations::parse_tree(&source) else {
             diagnostics.push(diagnostic(
                 CallRelationDiagnosticCode::ParseFailed,
-                format!("cannot parse selected Java call source: {}", file),
-                file.to_string(),
+                CallRelationDiagnosticPayload::JavaParseFailed.at(file, None),
+                "call_source".to_string(),
                 "native_call_parse_failed",
             ));
             return Ok(IncomingFile::Rejected);
@@ -384,8 +386,8 @@ impl IncomingCallProjection for JavaIncomingProjection<'_> {
         {
             diagnostics.push(diagnostic(
                 CallRelationDiagnosticCode::AnalysisFailed,
-                format!("selected Java call source changed: {}", file),
-                file.to_string(),
+                CallRelationDiagnosticPayload::JavaSourceStale.at(file, None),
+                "call_source".to_string(),
                 "native_call_source_stale",
             ));
             return Ok(IncomingFile::Rejected);
@@ -401,8 +403,8 @@ impl IncomingCallProjection for JavaIncomingProjection<'_> {
         {
             diagnostics.push(diagnostic(
                 CallRelationDiagnosticCode::AnalysisFailed,
-                format!("selected Java structural source changed: {}", file),
-                file.to_string(),
+                CallRelationDiagnosticPayload::JavaStructuralSourceStale.at(file, None),
+                "call_source".to_string(),
                 "native_call_source_stale",
             ));
             return Ok(IncomingFile::Rejected);
@@ -427,18 +429,28 @@ impl IncomingCallProjection for JavaIncomingProjection<'_> {
         structural_incoming_caller(self.java.structural_fact_providers(), edge, syntax)
     }
 
+    fn join_reuse_verdict(
+        &self,
+        verdict: brokk_bifrost_analysis::analyzer::reuse_verdict::ReuseVerdict,
+    ) {
+        brokk_bifrost_analysis::analyzer::IAnalyzer::join_reuse_verdict(self.java, verdict);
+    }
+
     fn report_issue(&self, issue: IncomingProjectionIssue<'_>) -> CallRelationDiagnostic {
         match issue {
             IncomingProjectionIssue::FactsUnavailable(file) => diagnostic(
                 CallRelationDiagnosticCode::AnalysisFailed,
-                format!("Java structural call facts are unavailable: {file}"),
-                file.to_string(),
+                CallRelationDiagnosticPayload::JavaFactsUnavailable.at(file, None),
+                "call_source".to_string(),
                 "native_call_facts_unavailable",
             ),
             IncomingProjectionIssue::OwnerUnavailable(edge) => diagnostic(
                 CallRelationDiagnosticCode::AnalysisFailed,
-                format!("selected Java call has no callable owner: {:?}", edge.site),
-                edge.site.file.to_string(),
+                CallRelationDiagnosticPayload::JavaOwnerUnavailable {
+                    enclosing: edge.site.enclosing.as_ref().map(Into::into),
+                }
+                .at(&edge.site.file, Some(edge.site.range)),
+                "call_source".to_string(),
                 "native_call_owner_unavailable",
             ),
         }
@@ -517,10 +529,10 @@ fn incomplete_diagnostics(
         .map(|reason| {
             diagnostic(
                 CallRelationDiagnosticCode::AnalysisFailed,
-                format!(
-                    "selected Java incoming-call inventory is incomplete for {}: {reason:?}",
-                    target.fq_name()
-                ),
+                CallRelationDiagnosticPayload::JavaInventoryIncomplete {
+                    target: target.fq_name().to_string(),
+                    reason: reason.into(),
+                },
                 target.fq_name().to_string(),
                 "native_call_inventory_incomplete",
             )
@@ -528,12 +540,12 @@ fn incomplete_diagnostics(
         .collect()
 }
 
-fn unavailable(message: impl Into<String>, target: &CodeUnit) -> CallRelationResult {
+fn unavailable(reason: CallRelationFailure, target: &CodeUnit) -> CallRelationResult {
     CallRelationResult {
         proof_authority: UsageProofAuthority::Native,
         diagnostics: vec![diagnostic(
             CallRelationDiagnosticCode::AnalysisFailed,
-            message.into(),
+            CallRelationDiagnosticPayload::Failure { reason },
             target.fq_name().to_string(),
             "native_call_unavailable",
         )],
@@ -543,17 +555,13 @@ fn unavailable(message: impl Into<String>, target: &CodeUnit) -> CallRelationRes
 
 fn diagnostic(
     code: CallRelationDiagnosticCode,
-    message: impl Into<String>,
+    message: impl Into<LocatedCallRelationDiagnostic>,
     context: impl Into<String>,
     reason_kind: &str,
 ) -> CallRelationDiagnostic {
-    CallRelationDiagnostic {
-        code,
-        message: message.into(),
-        context: context.into(),
-        semantic_count: None,
-        reason_kind: Some(reason_kind.to_owned()),
-    }
+    let mut diagnostic = CallRelationDiagnostic::new(code, message, context.into());
+    diagnostic.reason_kind = Some(reason_kind.to_owned());
+    diagnostic
 }
 
 #[cfg(test)]

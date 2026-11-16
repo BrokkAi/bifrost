@@ -75,7 +75,7 @@ fn rust_poem_test_only_declaration_pack_compiles() {
 
 #[test]
 #[brokk_bifrost_test_macros::hardwon(
-    "#10229: nested each captures retained quadratic source bytes without a row bound"
+    "#10229+#11321: nested each capture bytes need a bound and must not be mislabeled as fact work"
 )]
 fn nested_each_capture_bytes_are_bounded() {
     let suffix = std::iter::repeat_n("a", 120)
@@ -99,6 +99,22 @@ fn nested_each_capture_bytes_are_bounded() {
             .any(|diagnostic| diagnostic.code == CodeQueryDiagnosticCode::ExecutionBudgetExhausted),
         "{result:?}"
     );
+    let roots = result
+        .diagnostics
+        .iter()
+        .flat_map(|diagnostic| &diagnostic.exhausted_roots)
+        .collect::<Vec<_>>();
+    assert!(!roots.is_empty(), "{result:?}");
+    for root in roots {
+        assert_eq!(root.lane, "query/capture_bytes_per_row");
+        assert_eq!(root.stage.as_deref(), Some("structural_capture"));
+        let budget = root.budget.unwrap();
+        let charge = root.charge.unwrap();
+        assert!(budget.consumed <= budget.limit);
+        assert_eq!(budget.limit, 1024 * 1024);
+        assert_eq!(charge.limit, budget.limit);
+        assert!(charge.attempted > charge.limit);
+    }
 }
 
 #[test]

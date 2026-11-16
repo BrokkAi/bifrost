@@ -4,8 +4,8 @@ CROSS JOIN main.blobs AS blob
  ON blob.blob_oid=file.blob_oid AND blob.lang=file.lang AND blob.generation=file.generation
 AND blob.parse_variant=x''
 CROSS JOIN main.resolution_unit_summary_members AS candidate
- INDEXED BY resolution_unit_summary_members_blob
- ON candidate.blob_id=blob.id AND candidate.rel_path=file.rel_path
+ INDEXED BY resolution_unit_summary_members_path
+ ON candidate.rel_path=file.rel_path
 -- Bind both member key columns before opening the shared validity view. This
 -- avoids scanning every selected unit or automatically indexing member paths.
 CROSS JOIN selected_rust_unit_members AS member
@@ -16,4 +16,7 @@ AND naming.member_ordinal=member.member_ordinal
 CROSS JOIN main.rust_resolution_unit_summary_contexts AS context
  ON context.summary_id=member.summary_id
 WHERE file.lang='rust' AND file.rel_path=?1
+AND blob.id=(SELECT attachment.blob_id FROM temp.selected_unit_member_blobs AS attachment
+             WHERE attachment.summary_id=candidate.summary_id
+               AND attachment.member_ordinal=candidate.member_ordinal)
 ORDER BY context.target_kind <> 'lib', member.unit_key LIMIT 1

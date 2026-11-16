@@ -961,6 +961,14 @@ fn plan_summary_text(plan: &CodeQueryPlan) -> String {
         CodeQueryPlanSource::Set { op, branches } => {
             vec![format!("{} of {} queries", op.label(), branches.len())]
         }
+        CodeQueryPlanSource::CallReachability(relation) => vec![format!(
+            "call reachability: sources {{{}}}, sinks {{{}}}, depth {}",
+            plan_summary_text(&relation.sources),
+            plan_summary_text(&relation.sinks),
+            relation
+                .depth
+                .map_or_else(|| "unbounded".to_owned(), |depth| depth.to_string())
+        )],
         CodeQueryPlanSource::Correlate(correlation) => vec![format!(
             "correlate by {}: code {{{}}} with configuration {{{}}}",
             correlation.relation.label(),

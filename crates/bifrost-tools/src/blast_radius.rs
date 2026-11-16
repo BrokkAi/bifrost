@@ -55,6 +55,7 @@ mod coverage_tests;
 mod missing_tests;
 
 pub use crate::blast_radius::missing_tests::*;
+pub(crate) use missing_tests::test_file_context;
 
 pub const DEFAULT_MAX_SCOPES: usize = 100;
 pub const MAX_SCOPES: usize = 1_000;
@@ -190,7 +191,8 @@ pub struct BlastRadiusCallableSymbol {
     /// The declaration is structurally nested in test code or lives under a
     /// language-recognized test-tree path. This is contextual evidence, not a
     /// claim that the declaration is an individually runnable test.
-    pub in_test_context: bool,
+    /// null when test classification was unavailable.
+    pub in_test_context: Option<bool>,
 }
 
 impl From<&CommitSymbol> for BlastRadiusCallableSymbol {
@@ -1094,7 +1096,7 @@ fn path_components(path: &str) -> Vec<&str> {
         .collect()
 }
 
-fn normalized_path(path: &Path) -> String {
+pub(crate) fn normalized_path(path: &Path) -> String {
     let parts = path
         .components()
         .filter_map(|component| match component {
@@ -1253,8 +1255,11 @@ mod tests {
         let db_path = brokk_bifrost_analysis::analyzer::store::analyzer_db_path(root);
         fs::create_dir_all(db_path.parent().expect("the store path has a directory"))
             .expect("cache directory");
-        let held =
-            brokk_bifrost_core::cache_gc::AnalyzerCacheBuildLock::acquire(&db_path).expect("lock");
+        let held = brokk_bifrost_core::cache_gc::AnalyzerCacheBuildLock::acquire(
+            &db_path,
+            "a test holder",
+        )
+        .expect("lock");
 
         let cancellation =
             CancellationToken::default().with_timeout(std::time::Duration::from_millis(300));
@@ -1781,7 +1786,7 @@ assert.strictEqual(runtime(), 2);
             .filter_map(|callable| callable.after.as_ref())
             .find(|symbol| symbol.path == "compiler/testData/codegen/box/ordinaryTestCall.kt")
             .expect("changed fixture callable");
-        assert!(ordinary_fixture.in_test_context);
+        assert_eq!(ordinary_fixture.in_test_context, Some(true));
         assert!(
             result
                 .test_scopes

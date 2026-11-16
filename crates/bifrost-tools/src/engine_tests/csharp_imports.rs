@@ -4,7 +4,7 @@ use brokk_bifrost_analysis::analyzer::store::resolution_operation::{
     csharp_imports::{CSharpImportPrecedence, probe_imports},
 };
 use brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionLanguage;
-use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::single_connection_store_context_for_test;
+use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::ephemeral_store_context;
 use brokk_bifrost_analysis::analyzer::{AnalyzerConfig, WorkspaceAnalyzer};
 use brokk_bifrost_core::{analyzer::Language, cancellation::CancellationToken};
 use brokk_bifrost_csharp_analysis::analyzer::csharp::CSharpAdapter;
@@ -49,7 +49,7 @@ fn csharp_import_rules_join_real_scopes_and_activation() {
     let fixture = InlineTestProject::with_language(Language::CSharp)
         .file("Imports.cs", source)
         .build();
-    let context = single_connection_store_context_for_test(fixture.project_dyn().as_ref()).unwrap();
+    let context = ephemeral_store_context(fixture.project_dyn().as_ref()).unwrap();
     let workspace_id = context.workspace_id.clone();
     let store = std::sync::Arc::clone(&context.store);
     let _workspace = WorkspaceAnalyzer::build_with_store_context_for_test(
@@ -142,27 +142,15 @@ fn csharp_import_rules_join_real_scopes_and_activation() {
         assert!(rooted(at(needle)), "Type reference {needle}: {facts:?}");
         assert!(precedences(at(needle)).is_empty(), "{needle}: {probe:?}");
     }
-    // Field initializers add one lexical scope compared with Type-position
-    // fields. TypeOrValue also adds a Value demand for the static using;
-    // namespace and alias using ranks remain unchanged.
-    assert_eq!(
-        name,
-        vec![
-            CSharpImportPrecedence { depth: 2, rank: 1 },
-            CSharpImportPrecedence { depth: 2, rank: 1 },
-            CSharpImportPrecedence { depth: 2, rank: 1 },
-            CSharpImportPrecedence { depth: 4, rank: 0 }
-        ]
-    );
-    assert_eq!(
-        local,
-        vec![
-            CSharpImportPrecedence { depth: 2, rank: 0 },
-            CSharpImportPrecedence { depth: 2, rank: 1 },
-            CSharpImportPrecedence { depth: 2, rank: 1 },
-            CSharpImportPrecedence { depth: 2, rank: 1 }
-        ]
-    );
+    // #7314 M6a2 selects the identifier after '=' in each variable_declarator
+    // as a runtime value. The grammar gives the declarator a name field but no
+    // value field; the trailing comment is outside the declarator. Value
+    // lowering claims Name/Local before the generic TypeOrValue walk, so only
+    // the static using's Value demand applies. Previously the Type demand also
+    // contributed the namespace using, static using, and matching type alias.
+    // The initializer's lexical scope puts Helpers two scopes away.
+    assert_eq!(name, vec![CSharpImportPrecedence { depth: 2, rank: 1 }]);
+    assert_eq!(local, vec![CSharpImportPrecedence { depth: 2, rank: 1 }]);
     assert_eq!(invoke, vec![CSharpImportPrecedence { depth: 3, rank: 1 }]);
     // The stored earlier initializer reference precedes using activation.
     assert!(

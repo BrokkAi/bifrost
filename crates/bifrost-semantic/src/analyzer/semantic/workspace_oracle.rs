@@ -185,3 +185,9 @@ impl Drop for IncomingActualCache {
 }
 
 use std::sync::Arc;
+
+pub use crate::analyzer::semantic::workspace_oracle::value_flow::deferred_body_gap_is_caller_only;
+
+pub use crate::analyzer::semantic::workspace_oracle::value_flow::MemoryInterferenceOwnership;
+
+pub use crate::analyzer::semantic::workspace_oracle::value_flow::memory_interference_successors;

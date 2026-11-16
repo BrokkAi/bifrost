@@ -612,7 +612,10 @@ fn tracked_values(
 fn is_identity_flow(kind: ValueFlowKind) -> bool {
     matches!(
         kind,
-        ValueFlowKind::Local | ValueFlowKind::Parameter | ValueFlowKind::Receiver
+        ValueFlowKind::Local
+            | ValueFlowKind::AddressOf
+            | ValueFlowKind::Parameter
+            | ValueFlowKind::Receiver
     )
 }
 

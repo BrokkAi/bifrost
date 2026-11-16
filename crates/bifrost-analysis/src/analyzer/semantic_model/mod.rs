@@ -25,6 +25,9 @@ pub mod rust_cargo_graph;
 pub mod rust_qualified_path;
 pub use rust_cargo_graph::*;
 #[doc(hidden)]
+pub mod alias_resolution;
+pub mod endpoint_projections;
+#[doc(hidden)]
 pub mod overlay;
 pub mod python_runtime_bases;
 #[doc(hidden)]

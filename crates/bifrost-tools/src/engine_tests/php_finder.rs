@@ -158,6 +158,17 @@ mod php_extraction_tests {
 
 #[test]
 fn php_incomplete_descendants_skip_alias_augmentation() {
+    // #12331: a caller-only gap no longer poisons the descendant index.
+    // #12331 (7a9cabcf028) made complete_descendant_query withhold a
+    // descendant answer only when the fill's own receipt is incomplete. The
+    // old version of this test recorded a gap on the caller's scope and
+    // expected alias augmentation to be skipped; that gap is not a fill
+    // refusal.
+    //
+    // There is no product-surface assertion here today. The only available
+    // product queries cannot isolate the caller gap from other reasons for
+    // an open answer, so the captured query incompleteness checked below is
+    // the completion signal that policy and RQL consume.
     use crate::inline_project::InlineTestProject;
     use brokk_bifrost_analysis::analyzer::languages::{CandidateCtx, LanguageSupport};
     use brokk_bifrost_analysis::analyzer::{
@@ -171,32 +182,70 @@ fn php_incomplete_descendants_skip_alias_augmentation() {
     let project = InlineTestProject::with_language(Language::Php)
         .file("Base.php", "<?php namespace Demo; class Base {}")
         .file(
+            "Child.php",
+            "<?php namespace Demo; class Child extends Base {}",
+        )
+        .file(
             "Alias.php",
             "<?php namespace Client; use Demo\\Base as Alias;",
         )
         .build();
-    let analyzer = PhpAnalyzer::new(project.project_dyn());
-    let owner = analyzer
-        .declarations(&project.file("Base.php"))
-        .into_iter()
-        .find(|unit| unit.identifier() == "Base")
-        .unwrap();
-    let (_, reads) = capture_query_reads(&analyzer, || {
-        let _query = AnalyzerQueryScope::capturing_read_incompleteness(&analyzer);
-        analyzer.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceGap(
-            "refused alias hierarchy".into(),
-        ));
-        let failure =
-            php_import_alias_candidates(&owner, &analyzer, Some(&analyzer), &analyzer, &|| {
-                panic!("incomplete hierarchy must skip alias files")
-            })
-            .unwrap_err();
+
+    // (a) Genuine in-fill refusal. The analyzer is cold: retained file states
+    // are dropped, then Child.php is replaced by binary bytes before the first descendant
+    // query, so the fill itself cannot read the file and must refuse.
+    {
+        let mut cold = PhpAnalyzer::new(project.project_dyn());
+        let owner = cold
+            .declarations(&project.file("Base.php"))
+            .into_iter()
+            .find(|unit| unit.identifier() == "Base")
+            .unwrap();
+        cold.clear_retained_file_states_for_test();
+        std::fs::write(project.file("Child.php").abs_path(), b"\xff\xfe\x00\x01").unwrap();
+        let failure = php_import_alias_candidates(&owner, &cold, Some(&cold), &cold, &|| {
+            panic!("incomplete hierarchy must skip alias files")
+        })
+        .unwrap_err();
+        assert!(!failure.is_complete(), "{failure:?}");
         assert!(
             failure
                 .open
                 .iter()
                 .any(|reason| matches!(reason, HierarchyOpenReason::DescendantIndexUnavailable)),
             "{failure:?}"
+        );
+        // Restore the file for the converse below.
+        std::fs::write(
+            project.file("Child.php").abs_path(),
+            "<?php namespace Demo; class Child extends Base {}",
+        )
+        .unwrap();
+    }
+
+    // (b) Converse: a gap recorded only on the caller's scope leaves the
+    // descendant index complete, so alias augmentation proceeds, and the
+    // caller's captured incompleteness holds exactly that gap.
+    let analyzer = PhpAnalyzer::new(project.project_dyn());
+    let owner = analyzer
+        .declarations(&project.file("Base.php"))
+        .into_iter()
+        .find(|unit| unit.identifier() == "Base")
+        .unwrap();
+    let gap = QueryReadIncomplete::SemanticEvidenceGap("refused alias hierarchy".into());
+    let alias_file = project.file("Alias.php");
+    let (_, reads) = capture_query_reads(&analyzer, || {
+        let query = AnalyzerQueryScope::capturing_read_incompleteness(&analyzer);
+        analyzer.record_query_incomplete(gap.clone());
+        let candidates =
+            php_import_alias_candidates(&owner, &analyzer, Some(&analyzer), &analyzer, &|| {
+                vec![alias_file.clone()]
+            })
+            .unwrap();
+        assert!(candidates.contains(&alias_file), "{candidates:?}");
+        assert!(
+            candidates.contains(&project.file("Child.php")),
+            "{candidates:?}"
         );
         let token = CancellationToken::default();
         let augmentation = brokk_bifrost_php_analysis::analyzer::php::PhpSupport
@@ -206,9 +255,10 @@ fn php_incomplete_descendants_skip_alias_augmentation() {
                 cancellation: &token,
             });
         assert!(
-            augmentation
-                .is_none_or(|value| value.supplemental.is_empty() && value.protected.is_empty())
+            augmentation.is_some_and(|value| !value.supplemental.is_empty()),
+            "alias augmentation must proceed once the descendant index is complete"
         );
+        assert_eq!(query.captured_read_incompleteness(), vec![gap.clone()]);
     });
-    assert!(reads.unattributed_reads() > 0, "{reads:?}");
+    assert_eq!(reads.execution_dependences(), 0, "{reads:?}");
 }

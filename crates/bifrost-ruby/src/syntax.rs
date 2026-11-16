@@ -6,10 +6,107 @@
 //! `tree_sitter::Node` and the source text it points into.
 
 use brokk_bifrost_core::analyzer::model::Range;
+use brokk_bifrost_core::analyzer::structural::callable::CalleeSpelling;
 use tree_sitter::Node;
 
 pub fn call_method_node(node: Node<'_>) -> Option<Node<'_>> {
     node.child_by_field_name("method")
+}
+
+/// Where a Ruby call-shaped node stands relative to an assignment that
+/// dispatches through it.
+///
+/// Ruby compiles a write to `r.attr` into a call of `attr=` and a write to
+/// `r[i]` into a call of `[]=`. The grammar reuses the reader's `call` and
+/// `element_reference` nodes for those targets, so the position decides which
+/// method the node calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RubyWriterPosition {
+    /// Not an assignment target: the node calls its reader (`attr`, `[]`).
+    Reader,
+    /// The left side of a plain `=`: the right side is the writer's value.
+    PlainAssignment,
+    /// A parallel-assignment, `for` or `rescue =>` target. The node calls the
+    /// writer, but the value it passes is assembled at runtime and has no
+    /// source expression of its own.
+    DestructuredAssignment,
+}
+
+pub fn ruby_writer_position(node: Node<'_>) -> RubyWriterPosition {
+    let Some(parent) = node.parent() else {
+        return RubyWriterPosition::Reader;
+    };
+    let is_field = |field: &str| {
+        parent
+            .child_by_field_name(field)
+            .is_some_and(|child| child.id() == node.id())
+    };
+    match parent.kind() {
+        "assignment" if is_field("left") => RubyWriterPosition::PlainAssignment,
+        "left_assignment_list"
+        | "destructured_left_assignment"
+        | "rest_assignment"
+        | "exception_variable" => RubyWriterPosition::DestructuredAssignment,
+        "for" if is_field("pattern") => RubyWriterPosition::DestructuredAssignment,
+        _ => RubyWriterPosition::Reader,
+    }
+}
+
+/// The method a Ruby `call` or `element_reference` node calls, relative to the
+/// name token it writes ([`ruby_callee_token`]).
+///
+/// An operator assignment (`r.attr += 1`) keeps the reader spelling: its
+/// target calls both the reader and the writer, and the node records the
+/// reader it writes.
+pub fn ruby_callee_spelling(node: Node<'_>) -> CalleeSpelling {
+    let writer = ruby_writer_position(node) != RubyWriterPosition::Reader;
+    match node.kind() {
+        "element_reference" if writer => CalleeSpelling::ElementAssignment,
+        "element_reference" => CalleeSpelling::ElementReference,
+        "call" if writer && call_method_node(node).is_some() => CalleeSpelling::AttributeWriter,
+        _ => CalleeSpelling::Written,
+    }
+}
+
+/// The token a Ruby call-shaped node records as its callee name: the method
+/// of a `call`, or the opening bracket of an `element_reference`.
+pub fn ruby_callee_token(node: Node<'_>) -> Option<Node<'_>> {
+    match node.kind() {
+        "element_reference" => {
+            let mut cursor = node.walk();
+            node.children(&mut cursor)
+                .find(|child| !child.is_named() && child.kind() == "[")
+        }
+        _ => call_method_node(node),
+    }
+}
+
+/// The receiver a Ruby call-shaped node is written against.
+pub fn ruby_call_receiver(node: Node<'_>) -> Option<Node<'_>> {
+    match node.kind() {
+        "element_reference" => node.child_by_field_name("object"),
+        _ => node.child_by_field_name("receiver"),
+    }
+}
+
+/// The value a plain assignment passes to the writer this node calls.
+pub fn ruby_assigned_value(node: Node<'_>) -> Option<Node<'_>> {
+    (ruby_writer_position(node) == RubyWriterPosition::PlainAssignment)
+        .then(|| node.parent()?.child_by_field_name("right"))
+        .flatten()
+}
+
+/// The index arguments written between an element reference's brackets.
+pub fn ruby_element_arguments(node: Node<'_>) -> Vec<Node<'_>> {
+    debug_assert_eq!(node.kind(), "element_reference");
+    let object = node.child_by_field_name("object").map(|child| child.id());
+    let block = node.child_by_field_name("block").map(|child| child.id());
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .filter(|child| {
+            Some(child.id()) != object && Some(child.id()) != block && is_runtime_node(child.kind())
+        })
+        .collect()
 }
 
 /// Whether a call's receiver can select one of `Kernel`'s module functions

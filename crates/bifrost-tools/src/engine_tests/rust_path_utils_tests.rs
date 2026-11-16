@@ -75,27 +75,37 @@ mod rust_departing_tests_tests {
     )]
     fn a_failed_workspace_listing_reports_the_failure_rather_than_a_confident_absence() {
         let (_temp, analyzer) = unlistable_workspace();
-        let context = std::sync::Arc::new(AnalyzerQueryContext::default());
-        let context_attribution = context.enter();
-        analyzer.begin_query(&context);
+        let workspace = brokk_bifrost_analysis::WorkspaceAnalyzer::build_ephemeral_footgun(
+            std::sync::Arc::new(UnlistableProject {
+                delegate: TestProject::new(_temp.path().canonicalize().unwrap(), Language::Rust),
+            }),
+            Default::default(),
+        )
+        .unwrap();
+        for analyzer in [&analyzer as &dyn IAnalyzer, workspace.analyzer()] {
+            let context = std::sync::Arc::new(AnalyzerQueryContext::default());
+            let context_attribution = context.enter();
+            analyzer.begin_query(&context);
 
-        let resolved = WorkspaceFileResolver::for_analyzer(&analyzer).resolve_literal("widget.rs");
+            let resolved =
+                WorkspaceFileResolver::for_analyzer(analyzer).resolve_literal("widget.rs");
 
-        let error = context
-            .store_error()
-            .expect("a failed workspace listing must reach the request boundary");
-        analyzer.end_query(&context);
-        drop(context_attribution);
-        assert!(
-            matches!(resolved, ResolvedFileInput::NotFound(_)),
-            "the bare name still has no answer"
-        );
-        assert!(
-            error
-                .to_string()
-                .contains("injected workspace listing failure"),
-            "the recorded failure must carry the listing error: {error}"
-        );
+            let error = context
+                .store_error()
+                .expect("a failed workspace listing must reach the request boundary");
+            analyzer.end_query(&context);
+            drop(context_attribution);
+            assert!(
+                matches!(resolved, ResolvedFileInput::NotFound(_)),
+                "the bare name still has no answer"
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("injected workspace listing failure"),
+                "the recorded failure must carry the listing error: {error}"
+            );
+        }
     }
 
     /// The same resolver on a healthy workspace records nothing: the failure

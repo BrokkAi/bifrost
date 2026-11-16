@@ -288,6 +288,7 @@ pub(super) fn formal_annotation_match(
         file: file.clone(),
         facts,
         fact_match: FactMatch {
+            selected_pattern_source: Default::default(),
             node: u32::try_from(node).expect("structural node ids fit u32"),
             captures: Arc::from([]),
             reported_range: None,
@@ -322,7 +323,13 @@ pub(super) fn formal_annotation_match(
     if undecided.is_empty() {
         FormalAnnotationMatch::Lacks
     } else {
-        Undecided(format!("its decorator types are unproven: {undecided:?}"))
+        Undecided(
+            brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+                format_args!("its decorator types are unproven: {undecided:?}"),
+                format_args!("its decorator types are unproven"),
+                undecided.iter(),
+            ),
+        )
     }
 }
 

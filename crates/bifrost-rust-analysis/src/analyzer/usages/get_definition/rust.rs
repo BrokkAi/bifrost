@@ -1,5 +1,6 @@
 use brokk_bifrost_analysis::analyzer::QueryScope;
 use brokk_bifrost_analysis::analyzer::common::language_for_file;
+use brokk_bifrost_analysis::analyzer::derivation_host::read_frame::OperationReadFrame;
 use brokk_bifrost_analysis::analyzer::usages::reference_site::ResolvedReferenceSite;
 use brokk_bifrost_analysis::analyzer::{
     AnalyzerQueryScope, CodeUnit, IAnalyzer, Language, ProjectFile, QueryToken,
@@ -68,6 +69,20 @@ pub(crate) trait RustDispatchBatch<'a> {
         receiver_facts: &mut dyn FnMut() -> Arc<crate::analyzer::rust::RustReceiverTypeFacts>,
         cancellation: Option<&CancellationToken>,
     ) -> Option<RustExactProof>;
+
+    /// The exact proof of a bare call bound only by external glob imports
+    /// (#9949), with the glob's written module path.
+    #[allow(clippy::too_many_arguments)]
+    fn glob_external_proof(
+        &mut self,
+        analyzer: &'a dyn IAnalyzer,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+        source: &str,
+        tree: &Tree,
+        site: &ResolvedReferenceSite,
+        cancellation: Option<&CancellationToken>,
+    ) -> Option<(RustExactProof, String)>;
 }
 
 pub(crate) type RustExactProof = (
@@ -121,6 +136,7 @@ pub(crate) fn apply_exact_rust_external_proof(
     site: &ResolvedReferenceSite,
     tree: &Tree,
     (proof, identity): RustExactProof,
+    glob_route: Option<&str>,
 ) {
     // Call evidence describes the containing call, but owner and generic-argument
     // navigation must retain the native type answer rather than the callable.
@@ -138,11 +154,20 @@ pub(crate) fn apply_exact_rust_external_proof(
             && site.focus_start_byte < site.focus_end_byte
             && site.focus_end_byte <= member.end_byte()
     }) {
-        *outcome = boundary_unchecked(
-            format!(
+        // The glob's module path is the witness that the glob route, not the
+        // call's spelling, selected the callable.
+        let message = match glob_route {
+            Some(route) => format!(
+                "`{}` is a resolver-proven external Rust callable bound by the glob import `use {route}::*`",
+                proof.canonical_callee()
+            ),
+            None => format!(
                 "`{}` is a resolver-proven external Rust callable",
                 proof.canonical_callee()
             ),
+        };
+        *outcome = boundary_unchecked(
+            message,
             UnindexedClaim::external_boundary(identity.owner_fqn(), ClaimSubjectRole::Any),
         );
         let mut reference = outcome.reference.take().unwrap_or_else(|| site.clone());
@@ -153,6 +178,73 @@ pub(crate) fn apply_exact_rust_external_proof(
     evidence.dispatch_extensibility = proof.dispatch_extensibility();
     evidence.exact_external_call = Some(proof);
     evidence.external_callee_identity = Some(identity);
+}
+
+/// The exact call proof for a member that a proven built-in derive supplies
+/// (#11325), when that member is the answer's only boundary.
+///
+/// The resolver names the standard trait item in a `rust_builtin_derive_member`
+/// reason only after proving every derive name of the owner is the prelude's
+/// built-in derive, so the derived impl is the one selected and its trait item
+/// is the callee. Any other diagnostic is a reason the resolver could not
+/// discharge, so the answer stays the resolver's own.
+fn builtin_derive_member_proof(
+    outcome: &DefinitionLookupOutcome,
+    receiver_call: bool,
+) -> Option<RustExactProof> {
+    if !outcome.definitions.is_empty()
+        || outcome.status != DefinitionLookupStatus::UnresolvableImportBoundary
+    {
+        return None;
+    }
+    let mut member = None;
+    for diagnostic in &outcome.diagnostics {
+        match diagnostic.kind.as_str() {
+            "rust_builtin_derive_member" if member.is_none() => {
+                member = Some(diagnostic.message.as_str());
+            }
+            // The generic boundary diagnostic the named reason is reported in.
+            "unindexed_import_boundary" => {}
+            _ => return None,
+        }
+    }
+    let evidence: serde_json::Value = serde_json::from_str(member?)
+        .expect("a built-in derive member reason carries JSON evidence");
+    let field = |name: &str| {
+        evidence[name]
+            .as_str()
+            .unwrap_or_else(|| panic!("built-in derive member evidence names its {name}"))
+    };
+    let (module, trait_, member) = (field("module"), field("trait"), field("member"));
+    let arity = u32::try_from(
+        evidence["arity"]
+            .as_u64()
+            .expect("built-in derive member evidence states its arity"),
+    )
+    .expect("a reviewed trait item arity fits u32");
+    let receiver = evidence["receiver"]
+        .as_bool()
+        .expect("built-in derive member evidence states its receiver");
+    let owner = format!("core.{module}.{trait_}");
+    let proof = if receiver_call {
+        // The derived impl is the type's only impl of the trait, so the
+        // receiver call selects exactly this item.
+        ExactExternalCallProof::rust_bound_external_member(&owner, member, arity)
+    } else {
+        // A path call writes the receiver, if any, as its first argument.
+        ExactExternalCallProof::rust_external_call(
+            format!("core::{module}::{trait_}::{member}"),
+            arity + u32::from(receiver),
+        )
+    };
+    Some((
+        proof,
+        brokk_bifrost_analysis::analyzer::semantic::ResolverOwnedExternalCalleeIdentity::new(
+            Language::Rust,
+            owner,
+            member,
+        ),
+    ))
 }
 
 impl<'a: 'selection, 'factory, 'selection, 'borrow> RustDispatchBatch<'a>
@@ -191,6 +283,33 @@ impl<'a: 'selection, 'factory, 'selection, 'borrow> RustDispatchBatch<'a>
             factory,
             operation,
         )
+    }
+
+    fn glob_external_proof(
+        &mut self,
+        analyzer: &'a dyn IAnalyzer,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+        source: &str,
+        tree: &Tree,
+        site: &ResolvedReferenceSite,
+        cancellation: Option<&CancellationToken>,
+    ) -> Option<(RustExactProof, String)> {
+        let (Some(factory), Some(operation)) = self.resolver_parts() else {
+            return None;
+        };
+        crate::analyzer::rust::external_calls::resolve_rust_glob_external_call_with_operation(
+            analyzer,
+            token,
+            file,
+            source,
+            tree,
+            site,
+            cancellation,
+            factory,
+            operation,
+        )
+        .map(|(proof, identity, route)| ((proof, identity), route))
     }
 }
 
@@ -287,7 +406,27 @@ pub(crate) fn resolve_definition_dispatch<'a>(
             && has_external_call_shape;
         let should_try_exact_rust_external_call =
             (rust_receiver_call && has_no_workspace_target) || should_try_model_receiver_fallback;
-        let exact = if should_try_exact_rust_external_call {
+        // A bare call whose selected answer stopped only at unindexed imports
+        // (the `unindexed_import_boundary` diagnostic) may name an external
+        // free function through a glob import (#9949).
+        let should_try_glob_external_call = !should_try_exact_rust_external_call
+            && outcome.status == DefinitionLookupStatus::UnresolvableImportBoundary
+            && outcome.definitions.is_empty()
+            && outcome.lexical_definition.is_none()
+            && outcome.diagnostics.iter().any(|diagnostic| {
+                diagnostic.kind == RUST_UNINDEXED_IMPORT_BOUNDARY_DIAGNOSTIC_KIND
+            })
+            && tree.as_ref().is_some_and(|tree| {
+                crate::analyzer::rust::external_calls::call_path_for_site(tree, site)
+                    .is_some_and(|callee| callee.kind() == "identifier")
+            });
+        let derived = tree
+            .as_ref()
+            .and_then(|_| builtin_derive_member_proof(&outcome, rust_receiver_call));
+        let mut glob_route = None;
+        let exact = if derived.is_some() {
+            derived
+        } else if should_try_exact_rust_external_call {
             tree.as_ref().and_then(|tree| {
                 let token = context.token;
                 let batch = rust_definition_batch.as_mut()?;
@@ -310,6 +449,20 @@ pub(crate) fn resolve_definition_dispatch<'a>(
                     cancellation,
                 )
             })
+        } else if should_try_glob_external_call {
+            tree.as_ref().and_then(|tree| {
+                let (proof, route) = rust_definition_batch.as_mut()?.glob_external_proof(
+                    analyzer,
+                    context.token,
+                    &request.file,
+                    source.as_ref(),
+                    tree,
+                    site,
+                    cancellation,
+                )?;
+                glob_route = Some(route);
+                Some(proof)
+            })
         } else {
             None
         };
@@ -321,6 +474,7 @@ pub(crate) fn resolve_definition_dispatch<'a>(
                 tree.as_ref()
                     .expect("an exact Rust call proof requires parsed syntax"),
                 exact,
+                glob_route.as_deref(),
             );
         }
         outcome
@@ -359,8 +513,6 @@ pub(crate) fn definition_batch_resolver<'a>(
         factory: RustBatchFactory::Owned(factory),
         operation: None,
         borrowed_operation: None,
-        file_window: false,
-        retained_reader: None,
         reuse_disabled: false,
         precomputed: Vec::new(),
         precomputed_index: 0,
@@ -402,8 +554,6 @@ pub(crate) fn resolve_definition_dispatch_entry<'a>(
         factory: RustBatchFactory::Owned(factory),
         operation: None,
         borrowed_operation: None,
-        file_window: false,
-        retained_reader: None,
         reuse_disabled: false,
         precomputed: Vec::new(),
         precomputed_index: 0,
@@ -486,25 +636,23 @@ impl<'a: 'selection, 'factory, 'selection, 'borrow> DefinitionBatchResolver<'a>
                 .inventory
                 .clear_site_row_memo_for_file_window();
         }
-        self.file_window = true;
     }
 
     fn release_file_operation(&mut self) {
         self.operation = None;
-        self.retained_reader = None;
     }
 
-    fn release_before_store_read(&mut self) {
-        // Exclusive readers own the writer mutex and must not survive a scalar
-        // lookup, whose store reads would wait for it; pooled WAL readers may
-        // reuse.
-        if self
-            .operation
-            .as_ref()
-            .is_some_and(|operation| operation.ready.inventory.conn.excludes_store_access())
-        {
-            self.release_file_operation();
-        }
+    // Pooled readers remain reusable across independent store reads.
+    fn release_before_store_read(&mut self) {}
+
+    fn enter_dependent_read_frame(
+        &self,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<Option<OperationReadFrame<'_>>> {
+        self.borrowed_operation
+            .as_deref()
+            .or(self.operation.as_ref())
+            .map(|operation| self.factory.operation_read_frame(operation))
+            .transpose()
     }
 
     fn precompute(
@@ -559,8 +707,6 @@ pub(crate) struct RustDefinitionBatchOperation<'analyzer, 'factory, 'selection, 
             'selection,
         >,
     >,
-    file_window: bool,
-    retained_reader: Option<brokk_bifrost_analysis::analyzer::store::writer::RetainedExclusiveReader>,
     reuse_disabled: bool,
     precomputed: Vec<Option<crate::analyzer::rust::native_points::RustDefinitionLookup>>,
     precomputed_index: usize,
@@ -612,13 +758,6 @@ impl<'analyzer: 'selection, 'factory, 'selection, 'borrow>
                     ),
                 ) => {
                     self.operation = Some(*operation);
-                    if self.file_window
-                        && self.operation.as_ref().is_some_and(|operation| {
-                            operation.ready.inventory.conn.excludes_store_access()
-                        })
-                    {
-                        self.retained_reader = Some(self.factory.retain_exclusive_reader());
-                    }
                 },
                 outcome => {
                     self.reuse_disabled = true;
@@ -710,13 +849,6 @@ impl<'analyzer: 'selection, 'factory, 'selection, 'borrow>
                     ),
                 ) => {
                     self.operation = Some(*operation);
-                    if self.file_window
-                        && self.operation.as_ref().is_some_and(|operation| {
-                            operation.ready.inventory.conn.excludes_store_access()
-                        })
-                    {
-                        self.retained_reader = Some(self.factory.retain_exclusive_reader());
-                    }
                 },
                 outcome => {
                     self.reuse_disabled = true;
@@ -837,8 +969,6 @@ pub(crate) fn resolve_call_target_batch_in_operation<'a: 'selection, 'selection>
         factory: RustBatchFactory::Borrowed(factory),
         operation: None,
         borrowed_operation: Some(operation),
-        file_window: false,
-        retained_reader: None,
         reuse_disabled: false,
         precomputed: Vec::new(),
         precomputed_index: 0,
@@ -941,6 +1071,7 @@ mod tests {
                         ExactExternalCallProof::rust_external_call("dep::café", 0),
                         ResolverOwnedExternalCalleeIdentity::new(Language::Rust, "dep", "café"),
                     ),
+                    None,
                 );
                 assert!(evidence.exact_external_call.is_some());
                 assert_eq!(

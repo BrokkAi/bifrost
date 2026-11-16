@@ -10,6 +10,54 @@ use super::ir::{CodeQueryPlan, CodeQueryPlanSource, QueryValueKind, SetOperator}
 use super::schema::{QueryStepOp, QueryStepShape};
 
 impl CodeQueryPlan {
+    /// Nonlocal sink dependencies must be shared by a whole binding query,
+    /// rather than repeated in independent per-source continuation units.
+    /// This is a deterministic plan classification, never a policy-name gate.
+    pub fn requires_shared_reachability_dependencies(&self) -> bool {
+        let mut plans = vec![self];
+        while let Some(plan) = plans.pop() {
+            if let CodeQueryPlanSource::CallReachability(relation) = &plan.source {
+                let mut sinks = vec![&relation.sinks];
+                while let Some(sink) = sinks.pop() {
+                    if sink.steps.iter().any(|step| {
+                        !matches!(
+                            step,
+                            super::QueryStep::Filter(_)
+                                | super::QueryStep::Project(_)
+                                | super::QueryStep::IdenticalCaptures { .. }
+                                | super::QueryStep::DispatchTargets
+                        )
+                    }) {
+                        return true;
+                    }
+                    match &sink.source {
+                        CodeQueryPlanSource::Seed(_) => {}
+                        CodeQueryPlanSource::Set {
+                            op: SetOperator::Union,
+                            branches,
+                        } => {
+                            sinks.extend(branches);
+                        }
+                        CodeQueryPlanSource::Set { .. }
+                        | CodeQueryPlanSource::Occurrences(_)
+                        | CodeQueryPlanSource::Scopes(_)
+                        | CodeQueryPlanSource::Bindings(_)
+                        | CodeQueryPlanSource::Paths(_)
+                        | CodeQueryPlanSource::GenerationSites(_)
+                        | CodeQueryPlanSource::Exports(_)
+                        | CodeQueryPlanSource::ConfigurationFacts(_)
+                        | CodeQueryPlanSource::DependencyEvidence(_)
+                        | CodeQueryPlanSource::CallReachability(_)
+                        | CodeQueryPlanSource::Correlate(_)
+                        | CodeQueryPlanSource::RequireBoth(_) => return true,
+                    }
+                }
+            }
+            plans.extend(plan.source.child_plans());
+        }
+        false
+    }
+
     /// Classify the forward form of an incoming call-site frontier. Targets
     /// are evaluated over the workspace; only the resulting sites are local.
     /// Set and cross-domain sources remain conservative until their executor
@@ -98,6 +146,8 @@ pub enum PlanPartitioning {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IntersectCut {
     Root,
+    /// Per-seed continuation over validated source and shared sink operands.
+    CallReachability,
 }
 
 impl IntersectCut {
@@ -419,6 +469,17 @@ impl PlanPartitioning {
     }
 
     fn classify_leaf(plan: &CodeQueryPlan) -> Self {
+        if let CodeQueryPlanSource::CallReachability(relation) = &plan.source {
+            if plan.steps.iter().any(|step| {
+                step.op() == QueryStepOp::DecoratorBindings || step.op().is_registration_dependent()
+            }) {
+                return Self::Whole(PlanWidenDetail::RegistrationDependentStep);
+            }
+            return match Self::classify(&relation.sources) {
+                Self::Whole(detail) => Self::Whole(detail),
+                _ => Self::BySeed,
+            };
+        }
         if plan.source.uses_only_file_facts()
             || matches!(
                 &plan.source,

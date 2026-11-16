@@ -69,6 +69,16 @@ pub struct LoweredTypeTransfer {
     rule: TypeTransferRule,
 }
 
+/// One language-neutral runtime operation; operand ordering is significant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LoweredBinaryOperation {
+    pub output: SemanticId,
+    pub left: SemanticId,
+    pub right: SemanticId,
+    pub operator: brokk_bifrost_core::analyzer::resolution_facts::ResolutionBinaryOperator,
+    pub right_reference: brokk_bifrost_core::analyzer::resolution_facts::ResolutionBinaryReference,
+}
+
 /// One value-producing constructor, evaluated only in the requesting query.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LoweredTypeProduction {
@@ -1004,6 +1014,13 @@ pub enum LoweredSupertypeTarget {
     ResolvedIdentity(SemanticId),
 }
 
+/// Already persisted argument evidence materialized for one selected edge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoweredSupertypeArguments {
+    Source(Box<[SemanticId]>),
+    External(Box<[brokk_bifrost_semantic::analyzer::semantic_model::TypeRef]>),
+}
+
 /// A declared hierarchy edge and its honest source or external target.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoweredSupertypeProperty {
@@ -1013,6 +1030,7 @@ pub struct LoweredSupertypeProperty {
     kind: Option<ResolutionSupertypeKind>,
     parent_ordinal: u32,
     target: LoweredSupertypeTarget,
+    applied_arguments: Option<LoweredSupertypeArguments>,
 }
 
 /// A supertype edge lowered from source and eligible for persistence.
@@ -1067,6 +1085,7 @@ impl From<LoweredSourceSupertypeProperty> for LoweredSupertypeProperty {
             kind: Some(source.kind),
             parent_ordinal: source.parent_ordinal,
             target: LoweredSupertypeTarget::SelectedReference(source.reference),
+            applied_arguments: None,
         }
     }
 }
@@ -1082,6 +1101,22 @@ impl super::mounted::SpliceMount for LoweredSupertypeProperty {
             frontier: translation.semantic(self.frontier),
             kind: self.kind,
             parent_ordinal: self.parent_ordinal,
+            applied_arguments: self
+                .applied_arguments
+                .as_ref()
+                .map(|arguments| match arguments {
+                    LoweredSupertypeArguments::Source(arguments) => {
+                        LoweredSupertypeArguments::Source(
+                            arguments
+                                .iter()
+                                .map(|argument| translation.semantic(*argument))
+                                .collect(),
+                        )
+                    }
+                    LoweredSupertypeArguments::External(arguments) => {
+                        LoweredSupertypeArguments::External(arguments.clone())
+                    }
+                }),
             target: match &self.target {
                 LoweredSupertypeTarget::SelectedReference(reference) => {
                     LoweredSupertypeTarget::SelectedReference(translation.semantic(*reference))
@@ -1113,6 +1148,7 @@ impl LoweredSupertypeProperty {
             kind: None,
             parent_ordinal,
             target: LoweredSupertypeTarget::ResolvedIdentity(target),
+            applied_arguments: None,
         }
     }
 
@@ -1130,7 +1166,47 @@ impl LoweredSupertypeProperty {
             kind: None,
             parent_ordinal,
             target: LoweredSupertypeTarget::External(target),
+            applied_arguments: None,
         }
+    }
+
+    /// Decode M1 once; absent JSON remains unknown, distinct from an empty list.
+    pub fn with_external_arguments(
+        mut self,
+        encoded: Option<&str>,
+    ) -> Result<Self, serde_json::Error> {
+        self.applied_arguments = encoded
+            .map(serde_json::from_str)
+            .transpose()?
+            .map(LoweredSupertypeArguments::External);
+        Ok(self)
+    }
+
+    pub fn with_source_arguments(mut self, arguments: &[LoweredDeclaredTypeArgument]) -> Self {
+        let mut arguments = arguments
+            .iter()
+            .filter(|argument| argument.owner() == self.frontier())
+            .copied()
+            .collect::<Vec<_>>();
+        arguments.sort_unstable_by_key(LoweredDeclaredTypeArgument::position);
+        for (position, argument) in arguments.iter().enumerate() {
+            assert_eq!(
+                argument.position() as usize,
+                position,
+                "dense supertype argument positions"
+            );
+        }
+        self.applied_arguments = Some(LoweredSupertypeArguments::Source(
+            arguments
+                .iter()
+                .map(LoweredDeclaredTypeArgument::argument)
+                .collect(),
+        ));
+        self
+    }
+
+    pub const fn applied_arguments(&self) -> Option<&LoweredSupertypeArguments> {
+        self.applied_arguments.as_ref()
     }
 
     pub const fn target(&self) -> &LoweredSupertypeTarget {
@@ -2048,6 +2124,7 @@ pub struct LoweredTypedFragment {
     transfers: Vec<LoweredTypeTransfer>,
     type_components: Vec<LoweredTypeComponent>,
     type_productions: Vec<LoweredTypeProduction>,
+    binary_operations: Vec<LoweredBinaryOperation>,
     declared_type_arguments: Vec<LoweredDeclaredTypeArgument>,
     type_arguments: Vec<LoweredTypeArgument>,
     underlying_types: Vec<LoweredUnderlyingType>,
@@ -2110,6 +2187,7 @@ impl LoweredTypedFragment {
         self.transfers.extend(added.transfers);
         self.type_components.extend(added.type_components);
         self.type_productions.extend(added.type_productions);
+        self.binary_operations.extend(added.binary_operations);
         self.declared_type_arguments
             .extend(added.declared_type_arguments);
         self.type_arguments.extend(added.type_arguments);
@@ -2159,6 +2237,7 @@ impl LoweredTypedFragment {
             std::mem::take(&mut self.callable_signatures),
         )
         .with_type_productions(std::mem::take(&mut self.type_productions))
+        .with_binary_operations(std::mem::take(&mut self.binary_operations))
         .with_declared_type_arguments(std::mem::take(&mut self.declared_type_arguments))
         .with_generic_formal_defaults(std::mem::take(&mut self.generic_formal_defaults))
         .with_generic_formals(std::mem::take(&mut self.generic_formals));
@@ -2281,6 +2360,7 @@ impl LoweredTypedFragment {
             type_components,
             declared_type_arguments: Vec::new(),
             type_productions: Vec::new(),
+            binary_operations: Vec::new(),
             type_arguments,
             underlying_types,
             generic_type_alias_parameters,
@@ -3206,6 +3286,26 @@ impl LoweredTypedFragment {
         &self.transfers
     }
 
+    pub fn binary_operations(&self) -> &[LoweredBinaryOperation] {
+        &self.binary_operations
+    }
+
+    pub fn with_binary_operations(mut self, mut rows: Vec<LoweredBinaryOperation>) -> Self {
+        rows.sort_unstable();
+        assert!(rows.windows(2).all(|pair| pair[0].output != pair[1].output));
+        for row in &rows {
+            for slot in [row.output, row.left, row.right] {
+                assert!(
+                    self.frontiers
+                        .iter()
+                        .any(|frontier| frontier.slot() == slot)
+                );
+            }
+        }
+        self.binary_operations = rows;
+        self
+    }
+
     pub fn type_productions(&self) -> &[LoweredTypeProduction] {
         &self.type_productions
     }
@@ -3881,11 +3981,15 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
             fact.role,
         ));
     }
+    // Activation intervals share one declaration and therefore one observed
+    // value property. Preserve first-encounter ordering for existing producers.
+    let mut observed_binder_declarations = HashSet::default();
     for binder in &facts.binders {
         if !matches!(
             binder.kind,
             ResolutionBinderKind::Local | ResolutionBinderKind::Pattern
-        ) {
+        ) || !observed_binder_declarations.insert(binder.declaration)
+        {
             continue;
         }
         let identifier = index
@@ -4451,6 +4555,19 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
                 element: identities.type_slot_semantic(fact.element),
                 constructor: fact.constructor,
                 length: fact.length.clone(),
+            })
+            .collect(),
+    )
+    .with_binary_operations(
+        facts
+            .binary_operations
+            .iter()
+            .map(|fact| LoweredBinaryOperation {
+                output: identities.type_slot_semantic(fact.output),
+                left: identities.type_slot_semantic(fact.left),
+                right: identities.type_slot_semantic(fact.right),
+                operator: fact.operator,
+                right_reference: fact.right_reference,
             })
             .collect(),
     )
@@ -7993,6 +8110,7 @@ mod tests {
         .with_generic_formal_defaults(reversed(lowered.generic_formal_defaults().iter().copied()))
         .with_generic_formals(reversed(lowered.generic_formals().iter().copied()))
         .with_type_productions(reversed(lowered.type_productions().iter().cloned()))
+        .with_binary_operations(reversed(lowered.binary_operations().iter().cloned()))
     }
 
     fn renormalize_hydrated(lowered: LoweredTypedFragment) -> LoweredTypedFragment {
@@ -8004,6 +8122,7 @@ mod tests {
             frontiers,
             transfers,
             type_productions,
+            binary_operations,
             type_components,
             declared_type_arguments,
             type_arguments,
@@ -8051,7 +8170,8 @@ mod tests {
         .with_declared_type_arguments(declared_type_arguments)
         .with_generic_formal_defaults(generic_formal_defaults)
         .with_generic_formals(generic_formals)
-        .with_type_productions(type_productions);
+        .with_type_productions(type_productions)
+        .with_binary_operations(binary_operations);
         lowered.declaration_values = declaration_values;
         lowered.callable_returns = callable_returns;
         lowered
@@ -9095,5 +9215,71 @@ mod tests {
                 .iter()
                 .all(|property| !definitions.contains(&property.reference()))
         );
+    }
+}
+
+#[cfg(test)]
+mod unclassified_persistence_tests {
+    use super::*;
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11510: reader-local evidence must be rejected before a persisted completion-kind conversion"
+    )]
+    fn unclassified_completion_is_rejected_before_bundle_serialization() {
+        use crate::analyzer::resolution::{
+            lower_resolution_facts_for_selection, test_shared_names,
+            test_support::unsupported_expression_gap_facts,
+        };
+        use crate::analyzer::store::resolution_prepare::{
+            ResolutionInteriorPreparation, prepare_resolution_bundle_with_source_facts,
+            prepare_resolution_bundle_with_unit_keys,
+        };
+        let cancellation = crate::CancellationToken::default();
+        let mut lowered = lower_resolution_facts_for_selection(
+            BindingFragmentId::for_test(b"unclassified-write"),
+            test_shared_names(),
+            Language::Rust,
+            &unsupported_expression_gap_facts(),
+        );
+        let slot = SemanticId::for_test("reader-local slot without a producer catalog entry");
+        // Deliberately construct malformed writer input inside this module's
+        // private unit test. Do not weaken the production constructor's
+        // persistable-graph invariant or add a test-support injection hook.
+        lowered.typed.frontiers.push(LoweredTypedFrontier::new(
+            slot,
+            ResolutionTypeSlotRole::ExpressionValue,
+        ));
+        lowered
+            .typed
+            .intrinsic_seeds
+            .push(LoweredIntrinsicSeed::new(
+                IntrinsicTypeKind::Structural,
+                "unknown",
+                TypedFrontierState::new(
+                    slot,
+                    Vec::new(),
+                    ResolutionCompletion::incomplete([ResolutionIncompleteReason::Unclassified(
+                        slot,
+                    )]),
+                ),
+            ));
+        let ResolutionInteriorPreparation::Rejected(error) =
+            prepare_resolution_bundle_with_unit_keys(&lowered, None, &cancellation)
+        else {
+            panic!("reader-local evidence must return a typed preparation rejection");
+        };
+        assert!(error.to_string().contains("Unclassified"), "{error}");
+        // This entry point rejects before requiring parsed Rust facts, too.
+        let Err(error) = prepare_resolution_bundle_with_source_facts(
+            &lowered,
+            &HashMap::default(),
+            None,
+            None,
+            &cancellation,
+        ) else {
+            panic!("source-aware preparation must reject reader-local evidence");
+        };
+        assert!(error.to_string().contains("Unclassified"), "{error}");
     }
 }

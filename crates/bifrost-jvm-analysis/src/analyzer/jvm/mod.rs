@@ -470,7 +470,7 @@ impl JvmOverlayModel {
                 .filter_map(|language| analyzer.dependency_discovery_evidence(*language))
                 .any(|evidence| evidence.truncated());
         Self {
-            overlay: analyzer.semantic_model_overlay(),
+            overlay: analyzer.semantic_model_overlay_read().published(),
             truncated_discovery,
         }
     }

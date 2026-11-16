@@ -95,13 +95,23 @@ impl SemanticModelOverlay {
                     ));
                 }
                 // Authored edges establish positive paths without certifying
-                // an exhaustive supertype inventory. A missing witness must
-                // therefore stay open even when all authored edges were read.
+                // an exhaustive supertype inventory, unless the declaration
+                // certifies its whole surface: `callable_surface_complete`
+                // covers every direct hierarchy edge, as the callable
+                // inventory walk also reads it. Only the implicit `extends
+                // java.lang.Object` may be unwritten, and Object has no
+                // supertypes, so a walk that misses it can only miss Object
+                // itself, which the Java conversion classifier proves first
+                // (#12136). Otherwise a missing witness stays open.
                 let (_, edges) = self
                     .java_hierarchy
                     .get(&current.id)
                     .ok_or(JavaHierarchyIncomplete::MissingHierarchy)?;
-                Ok((edges.clone(), false, None))
+                Ok((
+                    edges.clone(),
+                    current.callable_surface_complete && !current.provenance.ambiguous,
+                    None,
+                ))
             },
             |ty| match ty {
                 TypeRef::Named { name, .. } => Some(name),

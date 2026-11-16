@@ -1,0 +1,10 @@
+# The go-unit-summary-derivation lever (#11570).
+#
+# Invalidates Go resolution unit summaries and their derived children.
+# Add one `<issue>-<slug>` line when these derivation rules change.
+# Git merges this file with merge=union. Never edit or remove a token line.
+# See .agents/docs/cache-identity-levers.md.
+#
+# Replaced the literal: GO_UNIT_SUMMARY_DERIVATION_VERSION = 10.
+11570-slice2b-derivation-identity
+12904-go-conflicting-subject-stable-key

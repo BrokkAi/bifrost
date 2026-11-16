@@ -3174,10 +3174,7 @@ fn validate_authored_policy_selectors(
             for event in &spec.automaton.events {
                 if let TypestateEventTrigger::Calls { selector, .. } = &event.trigger {
                     validate_authored_selector_at(
-                        &format!(
-                            "/analysis/automaton/events/{}/selector",
-                            json_pointer_segment(event.id.as_str())
-                        ),
+                        &typestate_event_selector_path(&event.id),
                         selector,
                         selectors,
                     )?;
@@ -3300,7 +3297,7 @@ fn resolved_binding_to_endpoint(binding: &ResolvedTypestateBinding) -> PolicyEnd
     match binding {
         ResolvedTypestateBinding::MatchedValue => PolicyEndpointBinding::MatchedValue,
         ResolvedTypestateBinding::Receiver => PolicyEndpointBinding::Receiver,
-        ResolvedTypestateBinding::ReturnValue => PolicyEndpointBinding::ReturnValue,
+        ResolvedTypestateBinding::ReturnValue => PolicyEndpointBinding::ReturnValue { path: None },
         ResolvedTypestateBinding::ResultIndex { index } => {
             PolicyEndpointBinding::ResultIndex { index: *index }
         }
@@ -3708,10 +3705,7 @@ fn expected_selector_paths(
             }
             for event in &spec.automaton.events {
                 if matches!(event.trigger, TypestateEventTrigger::Calls { .. }) {
-                    paths.push(selector_path(&format!(
-                        "/analysis/automaton/events/{}/selector",
-                        json_pointer_segment(event.id.as_str())
-                    ))?);
+                    paths.push(selector_path(&typestate_event_selector_path(&event.id))?);
                 }
             }
         }
@@ -3966,7 +3960,7 @@ mod tests {
             ResolvedTaintSanitizerDefinition {
                 kind: TaintSanitizerKind::Transfer {
                     input: PolicyPort::ArgumentIndex { index: 0 },
-                    output: PolicyPort::ReturnValue,
+                    output: PolicyPort::ReturnValue { path: None },
                 },
                 removes: vec![TaintLabel::new("unsafe").unwrap()],
             },
@@ -3981,7 +3975,7 @@ mod tests {
             selector_path,
             ResolvedTaintTransformDefinition {
                 input: PolicyPort::ArgumentIndex { index: 0 },
-                output: PolicyPort::ReturnValue,
+                output: PolicyPort::ReturnValue { path: None },
                 removes: vec![TaintLabel::new("encoded").unwrap()],
                 adds: vec![TaintLabel::new("unsafe").unwrap()],
             },
@@ -3997,7 +3991,7 @@ mod tests {
             ResolvedTaintExternalModelDefinition {
                 transfers: vec![TaintTransferSpec {
                     from: PolicyPort::ArgumentIndex { index: 0 },
-                    to: PolicyPort::ReturnValue,
+                    to: PolicyPort::ReturnValue { path: None },
                     labels: vec![TaintLabel::new("unsafe").unwrap()],
                     effect: TaintTransferEffect::Propagate,
                 }],

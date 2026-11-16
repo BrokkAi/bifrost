@@ -191,49 +191,82 @@ fn analyze_python(
     root: Node<'_>,
     weights: &ExceptionSmellWeights,
 ) -> Vec<ExceptionHandlingSmell> {
-    analyze_handler_nodes(
-        analyzer,
-        file,
-        source,
-        collect_nodes_by_kind(root, "except_clause"),
-        weights,
-        |node, source| {
-            let body = named_child_by_kind(node, "block")?;
-            let values = children_by_field_name(node, "value");
-            let catch_type = if values.is_empty() {
-                "<bare>".to_string()
-            } else {
-                values
-                    .iter()
-                    .filter_map(|value| node_text(*value, source))
-                    .collect::<Vec<_>>()
-                    .join(" | ")
-            };
-            let broad = if catch_type == "<bare>"
-                || values
-                    .iter()
-                    .any(|value| contains_identifier(*value, source, "BaseException"))
-            {
-                Some((
-                    weights.generic_throwable_weight,
-                    format!("generic-catch:{catch_type}"),
-                ))
-            } else if values
+    let mut handlers = Vec::new();
+    for node in collect_nodes_by_kind(root, "except_clause") {
+        let Some(body) = named_child_by_kind(node, "block") else {
+            continue;
+        };
+        let values = children_by_field_name(node, "value");
+        let catch_type = if values.is_empty() {
+            "<bare>".to_string()
+        } else {
+            values
                 .iter()
-                .any(|value| contains_identifier(*value, source, "Exception"))
-            {
-                Some((
-                    weights.generic_exception_weight,
-                    format!("generic-catch:{catch_type}"),
-                ))
-            } else {
-                None
-            };
-            Some((body, catch_type, broad))
-        },
-        python_statement_count,
-        &["raise_statement"],
-    )
+                .filter_map(|value| node_text(*value, source))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        };
+        let broad_handler = if catch_type == "<bare>"
+            || values
+                .iter()
+                .any(|value| contains_identifier(*value, source, "BaseException"))
+        {
+            Some((
+                weights.generic_throwable_weight,
+                format!("generic-catch:{catch_type}"),
+            ))
+        } else if values
+            .iter()
+            .any(|value| contains_identifier(*value, source, "Exception"))
+        {
+            Some((
+                weights.generic_exception_weight,
+                format!("generic-catch:{catch_type}"),
+            ))
+        } else {
+            None
+        };
+        handlers.push(HandlerFacts {
+            handler: node,
+            body,
+            catch_type,
+            broad_handler,
+            body_statement_count: python_statement_count(body),
+            has_comment: python_except_has_comment(node, body),
+            rethrow_present: has_descendant_of_kind(body, "raise_statement"),
+        });
+    }
+    collect_handler_findings(analyzer, file, source, handlers, weights)
+}
+
+/// Checks whether a Python `except_clause` carries an explanatory comment either
+/// inside its `block` or attached to the `except_clause` between `:` and `block`.
+///
+/// `tree-sitter-python` attaches comments immediately after `:` (same line or
+/// indented before the first suite statement) directly onto `except_clause` before
+/// opening `block`. Requiring a real `:` token excludes header and caught-type
+/// comments that sit before `:`.
+fn python_except_has_comment(except_clause: Node<'_>, body: Node<'_>) -> bool {
+    contains_comment(body) || python_except_has_leading_comment(except_clause, body)
+}
+
+fn python_except_has_leading_comment(except_clause: Node<'_>, body: Node<'_>) -> bool {
+    let mut after_colon = false;
+    for child in children_iter(except_clause) {
+        if child.id() == body.id() {
+            break;
+        }
+        if !after_colon {
+            if !child.is_missing() && child.kind() == ":" {
+                after_colon = true;
+            }
+            continue;
+        }
+        if is_comment_node(child) {
+            return true;
+        }
+    }
+    false
 }
 
 fn analyze_go(
@@ -532,7 +565,7 @@ fn scala_catch_pattern(
 }
 
 fn scala_pattern_children<'tree>(node: Node<'tree>) -> impl Iterator<Item = Node<'tree>> {
-    named_children_iter(node).filter(|child| !child.kind().ends_with("comment"))
+    named_children_iter(node).filter(|child| !is_comment_node(*child))
 }
 
 fn scala_catch_all(weights: &ExceptionSmellWeights) -> (String, Option<(i32, String)>) {
@@ -616,6 +649,16 @@ fn analyze_kotlin(
     )
 }
 
+struct HandlerFacts<'tree> {
+    handler: Node<'tree>,
+    body: Node<'tree>,
+    catch_type: String,
+    broad_handler: Option<(i32, String)>,
+    body_statement_count: u32,
+    has_comment: bool,
+    rethrow_present: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn analyze_handler_nodes<'tree>(
     analyzer: &(impl IAnalyzer + ?Sized),
@@ -627,38 +670,24 @@ fn analyze_handler_nodes<'tree>(
     statement_count: impl Fn(Node<'tree>) -> u32,
     rethrow_kinds: &[&str],
 ) -> Vec<ExceptionHandlingSmell> {
-    let mut findings = Vec::new();
+    let mut handlers = Vec::new();
     for handler in nodes {
         let Some((body, catch_type, broad_handler)) = extract(handler, source) else {
             continue;
         };
-        let body_statement_count = statement_count(body);
-        let has_comment = contains_comment(body);
-        let rethrow_present = rethrow_kinds
-            .iter()
-            .any(|kind| has_descendant_of_kind(body, kind));
-        let log_only =
-            body_statement_count == 1 && !rethrow_present && contains_logging_call(body, source);
-        let Some(finding) = build_handler_smell(
-            analyzer,
-            file,
-            source,
+        handlers.push(HandlerFacts {
             handler,
+            body,
             catch_type,
-            weights,
-            HandlerScoreInput {
-                broad_handler,
-                body_statement_count,
-                has_comment,
-                log_only,
-            },
-        ) else {
-            continue;
-        };
-        findings.push(finding);
+            broad_handler,
+            body_statement_count: statement_count(body),
+            has_comment: contains_comment(body),
+            rethrow_present: rethrow_kinds
+                .iter()
+                .any(|kind| has_descendant_of_kind(body, kind)),
+        });
     }
-    sort_findings(&mut findings);
-    findings
+    collect_handler_findings(analyzer, file, source, handlers, weights)
 }
 
 type PreextractedHandler<'tree> = (Node<'tree>, Node<'tree>, String, Option<(i32, String)>);
@@ -671,23 +700,44 @@ fn analyze_preextracted_handlers<'tree>(
     weights: &ExceptionSmellWeights,
     mut is_rethrow: impl FnMut(Node<'tree>) -> bool,
 ) -> Vec<ExceptionHandlingSmell> {
+    let facts = handlers
+        .into_iter()
+        .map(|(handler, body, catch_type, broad_handler)| HandlerFacts {
+            handler,
+            body,
+            catch_type,
+            broad_handler,
+            body_statement_count: handler_statement_count(body),
+            has_comment: contains_comment(body),
+            rethrow_present: is_rethrow(body),
+        })
+        .collect();
+    collect_handler_findings(analyzer, file, source, facts, weights)
+}
+
+fn collect_handler_findings<'tree>(
+    analyzer: &(impl IAnalyzer + ?Sized),
+    file: &ProjectFile,
+    source: &str,
+    handlers: Vec<HandlerFacts<'tree>>,
+    weights: &ExceptionSmellWeights,
+) -> Vec<ExceptionHandlingSmell> {
     let mut findings = Vec::new();
-    for (handler, body, catch_type, broad_handler) in handlers {
-        let body_statement_count = handler_statement_count(body);
-        let has_comment = contains_comment(body);
-        let log_only =
-            body_statement_count == 1 && !is_rethrow(body) && contains_logging_call(body, source);
+    for item in handlers {
+        let log_only = item.body_statement_count == 1
+            && !item.rethrow_present
+            && contains_logging_call(item.body, source);
         let Some(finding) = build_handler_smell(
             analyzer,
             file,
             source,
-            handler,
-            catch_type,
+            item.handler,
+            item.catch_type,
             weights,
             HandlerScoreInput {
-                broad_handler,
-                body_statement_count,
-                has_comment,
+                broad_handler: item.broad_handler,
+                body_statement_count: item.body_statement_count,
+                has_comment: item.has_comment,
                 log_only,
             },
         ) else {
@@ -814,7 +864,7 @@ fn handler_statement_count(mut body: Node<'_>) -> u32 {
     }
     let mut cursor = body.walk();
     body.named_children(&mut cursor)
-        .filter(|child| !child.kind().ends_with("comment") && child.kind() != "comment")
+        .filter(|child| !is_comment_node(*child))
         .count() as u32
 }
 
@@ -918,10 +968,16 @@ fn direct_statement_count(body: Node<'_>, kinds: &[&str]) -> u32 {
         .count() as u32
 }
 
+/// Every grammar this smell reads names its comment nodes `comment` or
+/// `*_comment` (`line_comment`, `block_comment`, `multiline_comment`).
+fn is_comment_node(node: Node<'_>) -> bool {
+    node.kind().ends_with("comment")
+}
+
 fn contains_comment(root: Node<'_>) -> bool {
     let mut pending = vec![root];
     while let Some(node) = pending.pop() {
-        if node.kind().ends_with("comment") || node.kind() == "comment" {
+        if is_comment_node(node) {
             return true;
         }
         pending.extend(children_iter(node));
@@ -1115,9 +1171,7 @@ fn single_statement_through_wrappers(mut node: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn single_non_comment_named_child(node: Node<'_>) -> Option<Node<'_>> {
-    crate::analyzer::tree_walk::single_named_child_matching(node, |child| {
-        !child.kind().ends_with("comment") && child.kind() != "comment"
-    })
+    crate::analyzer::tree_walk::single_named_child_matching(node, |child| !is_comment_node(child))
 }
 
 fn node_text_ref<'source>(node: Node<'_>, source: &'source str) -> Option<&'source str> {
@@ -1617,6 +1671,219 @@ mod tests {
                 reports("Sample.scala", Language::Scala, &source, weights),
                 expected
             );
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#7559: Python leading comments after the except colon sit on except_clause before block"
+    )]
+    fn python_except_leading_comment_parse_attachment() {
+        for (source, expected_children) in [
+            (
+                "try:\n    work()\nexcept DomainError:\n    # explanation\n    pass\n",
+                vec!["except", "identifier", ":", "comment", "block"],
+            ),
+            (
+                "try:\n    work()\nexcept DomainError:  # inline explanation\n    pass\n",
+                vec!["except", "identifier", ":", "comment", "block"],
+            ),
+            (
+                "try:\n    work()\nexcept* DomainError:\n    # explanation\n    pass\n",
+                vec!["except", "*", "identifier", ":", "comment", "block"],
+            ),
+            (
+                "try:\n    work()\nexcept:\n    # explanation\n    pass\n",
+                vec!["except", ":", "comment", "block"],
+            ),
+            (
+                "try:\n    work()\nexcept (\n    # caught-type note\n    DomainError,\n):\n    pass\n",
+                vec!["except", "tuple", ":", "block"],
+            ),
+        ] {
+            let tree = parse("sample.py", Language::Python, source);
+            assert!(
+                !tree.root_node().has_error(),
+                "unexpected parse error for {source}: {}",
+                tree.root_node().to_sexp()
+            );
+            let clause = collect_nodes_by_kind(tree.root_node(), "except_clause")[0];
+            let child_kinds = children_iter(clause)
+                .map(|child| child.kind())
+                .collect::<Vec<_>>();
+            assert_eq!(child_kinds, expected_children, "source:\n{source}");
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#7559: Python leading comments between except colon and block get comment-only credit while header, outside, and string hashes stay excluded"
+    )]
+    fn python_except_leading_comment_credit_and_controls() {
+        let weights = ExceptionSmellWeights::defaults();
+        for (label, source, expected) in [
+            (
+                "leading comment before pass",
+                "try:\n    work()\nexcept DomainError:\n    # explanation\n    pass\n",
+                "DomainError; 0; 6; comment-only-body, small-body:0\n",
+            ),
+            (
+                "bare pass control",
+                "try:\n    work()\nexcept DomainError:\n    pass\n",
+                "DomainError; 0; 7; empty-body, small-body:0\n",
+            ),
+            (
+                "inline comment after colon",
+                "try:\n    work()\nexcept DomainError:  # explanation\n    pass\n",
+                "DomainError; 0; 6; comment-only-body, small-body:0\n",
+            ),
+            (
+                "multiple leading comments before pass",
+                "try:\n    work()\nexcept DomainError:\n    # first reason\n    # second reason\n    pass\n",
+                "DomainError; 0; 6; comment-only-body, small-body:0\n",
+            ),
+            (
+                "alias binding with leading comment",
+                "try:\n    work()\nexcept DomainError as err:\n    # explanation\n    pass\n",
+                "DomainError as err; 0; 6; comment-only-body, small-body:0\n",
+            ),
+            (
+                "broad Exception with leading comment",
+                "try:\n    work()\nexcept Exception:\n    # explanation\n    pass\n",
+                "Exception; 0; 9; generic-catch:Exception, comment-only-body, small-body:0\n",
+            ),
+            (
+                "broad Exception bare pass control",
+                "try:\n    work()\nexcept Exception:\n    pass\n",
+                "Exception; 0; 10; generic-catch:Exception, empty-body, small-body:0\n",
+            ),
+            (
+                "except star with leading comment",
+                "try:\n    work()\nexcept* DomainError:\n    # explanation\n    pass\n",
+                "DomainError; 0; 6; comment-only-body, small-body:0\n",
+            ),
+            (
+                "except star bare pass control",
+                "try:\n    work()\nexcept* DomainError:\n    pass\n",
+                "DomainError; 0; 7; empty-body, small-body:0\n",
+            ),
+            (
+                "bare except with leading comment",
+                "try:\n    work()\nexcept:\n    # explanation\n    pass\n",
+                "<bare>; 0; 11; generic-catch:<bare>, comment-only-body, small-body:0\n",
+            ),
+            (
+                "bare except pass control",
+                "try:\n    work()\nexcept:\n    pass\n",
+                "<bare>; 0; 12; generic-catch:<bare>, empty-body, small-body:0\n",
+            ),
+            (
+                "preserved trailing indented comment inside block",
+                "try:\n    work()\nexcept DomainError:\n    pass\n    # explanation inside block\n",
+                "DomainError; 0; 6; comment-only-body, small-body:0\n",
+            ),
+            (
+                "preserved trailing inline comment inside block",
+                "try:\n    work()\nexcept DomainError:\n    pass  # inline explanation\n",
+                "DomainError; 0; 6; comment-only-body, small-body:0\n",
+            ),
+            (
+                "preserved in-block comment between passes",
+                "try:\n    work()\nexcept DomainError:\n    pass\n    # explanation\n    pass\n",
+                "DomainError; 0; 6; comment-only-body, small-body:0\n",
+            ),
+            (
+                "caught-type tuple comment before colon excluded",
+                "try:\n    work()\nexcept (\n    # caught-type note\n    DomainError,\n):\n    pass\n",
+                "(\n    # caught-type note\n    DomainError,\n); 0; 7; empty-body, small-body:0\n",
+            ),
+            (
+                "header comment before alias and colon excluded",
+                "try:\n    work()\nexcept (\n    DomainError,  # header note\n) as err:\n    pass\n",
+                "(\n    DomainError,  # header note\n) as err; 0; 7; empty-body, small-body:0\n",
+            ),
+            (
+                "outside comments before except and finally excluded",
+                "# outside before try\ntry:\n    work()\n# outside before except\nexcept DomainError:\n    pass\n# outside before finally\nfinally:\n    cleanup()\n",
+                "DomainError; 0; 7; empty-body, small-body:0\n",
+            ),
+            (
+                "string literal hash in try call excluded",
+                "try:\n    work('#')\nexcept DomainError:\n    pass\n",
+                "DomainError; 0; 7; empty-body, small-body:0\n",
+            ),
+            (
+                "string literal hash in caught subscript excluded",
+                "try:\n    work()\nexcept SomeMap['#']:\n    pass\n",
+                "SomeMap['#']; 0; 7; empty-body, small-body:0\n",
+            ),
+            (
+                "string literal hash inside handler body is statement not comment",
+                "try:\n    work()\nexcept DomainError:\n    '# not a comment'\n    pass\n",
+                "DomainError; 1; 1; small-body:1, meaningful-body-credit:1\n",
+            ),
+            (
+                "string literal hash in Exception handler stays statement not comment-only",
+                "try:\n    work()\nexcept Exception:\n    '# not a comment'\n",
+                "Exception; 1; 4; generic-catch:Exception, small-body:1, meaningful-body-credit:1\n",
+            ),
+        ] {
+            assert_eq!(
+                reports("sample.py", Language::Python, source, weights),
+                expected,
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn braced_handler_grammars_keep_header_comments_outside_body() {
+        let weights = ExceptionSmellWeights::defaults();
+        for (path, language, source, expected) in [
+            (
+                "sample.cpp",
+                Language::Cpp,
+                "void f() { try {} catch (/* header */ const DomainError& e) /* between */ {} }",
+                "DomainError; 0; 7; empty-body, small-body:0\n",
+            ),
+            (
+                "Sample.cs",
+                Language::CSharp,
+                "class C { void F() { try {} catch (/* header */ DomainError e) when (true) /* between */ {} } }",
+                "DomainError; 0; 7; empty-body, small-body:0\n",
+            ),
+            (
+                "sample.js",
+                Language::JavaScript,
+                "try {} catch (/* header */ e) /* between */ {}",
+                "<untyped>; 0; 10; generic-catch:<untyped>, empty-body, small-body:0\n",
+            ),
+            (
+                "sample.ts",
+                Language::TypeScript,
+                "try {} catch (/* header */ e: unknown) /* between */ {}",
+                "unknown; 0; 10; generic-catch:unknown, empty-body, small-body:0\n",
+            ),
+            (
+                "sample.php",
+                Language::Php,
+                "<?php try {} catch (/* header */ DomainError $e) /* between */ {}",
+                "DomainError; 0; 7; empty-body, small-body:0\n",
+            ),
+            (
+                "sample.go",
+                Language::Go,
+                "package p\nfunc f() {\n\tdefer func() {\n\t\tif r := recover(); r != nil /* between */ {\n\t\t}\n\t}()\n\tif /* h */ err != nil /* between */ {\n\t}\n}\n",
+                "recover(); 0; 12; generic-catch:recover(), empty-body, small-body:0\nerror; 0; 10; generic-catch:error, empty-body, small-body:0\n",
+            ),
+            (
+                "sample.rs",
+                Language::Rust,
+                "fn f(r: Result<(), ()>) { match r { Ok(v) => v, Err(_ /* header */) => // between\n {} } if let Err(_ /* header */) = r /* between */ {} }",
+                "Err; 0; 10; generic-catch:Err, empty-body, small-body:0\nErr; 0; 10; generic-catch:Err, empty-body, small-body:0\n",
+            ),
+        ] {
+            assert_eq!(reports(path, language, source, weights), expected, "{path}");
         }
     }
 }

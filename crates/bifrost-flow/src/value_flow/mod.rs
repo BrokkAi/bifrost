@@ -14,6 +14,10 @@ mod planned;
 mod pointer;
 mod provider;
 mod result;
+mod retention;
+pub use retention::{
+    ValueFlowRetentionBudget, ValueFlowRetentionScope, ValueFlowRetentionScopeError,
+};
 mod source_derivation;
 
 /// Languages whose production semantic adapters have source-backed parity
@@ -65,14 +69,16 @@ pub use model::{
     ValueFlowSources,
 };
 pub use plan::{
-    AuthoredArmClosure, CallerContentLocation, CallerContentLocations, SummaryCallBinding,
-    ValueFlowCompositionExclusion, ValueFlowCuratedCallModel, ValueFlowEdgeKillSpec,
-    ValueFlowIncompleteCause, ValueFlowInput, ValueFlowLocalRuleSpec, ValueFlowPlan,
-    ValueFlowPlanError, ValueFlowPlanLimits, ValueFlowReturnedCallable,
+    AuthoredArmClosure, CallerContentLocation, CallerContentLocations, SummaryCallActual,
+    SummaryCallBinding, ValueFlowCompositionExclusion, ValueFlowCuratedCallModel,
+    ValueFlowEdgeKillSpec, ValueFlowIncompleteCause, ValueFlowInput, ValueFlowLocalRuleSpec,
+    ValueFlowPlan, ValueFlowPlanError, ValueFlowPlanLimits, ValueFlowReturnedCallable,
     ValueFlowSummaryLocationBinding, actual_argument_index_for_formal, authored_call_closures,
-    caller_content_locations, closes_as_resolved_constructor,
+    caller_content_locations, closes_as_resolved_constructor, projected_summary_carrier,
 };
-pub(crate) use plan::{ValueFlowCarrierSummaryIdentity, ValueFlowSourceBehaviorIdentity};
+pub(crate) use plan::{
+    ValueFlowCarrierSummaryIdentity, ValueFlowSourceBehaviorIdentity, value_location,
+};
 pub use planned::{
     ValueFlowCanonicalMeeting, ValueFlowDirectionPlan, ValueFlowDirectionPlanError,
     ValueFlowPlannedEvidence, ValueFlowPlannedResult, ValueFlowPlannedSolveError,
@@ -90,7 +96,8 @@ pub use provider::{
     ValueFlowCache, ValueFlowCacheStatsSnapshot, ValueFlowProvider, WorkspaceValueFlowProvider,
 };
 pub use result::{
-    ValueFlowMayStatus, ValueFlowMeeting, ValueFlowSinkOutcome, ValueFlowSummaryResult,
+    ValueFlowDiscoveryStatus, ValueFlowMayStatus, ValueFlowMeeting, ValueFlowSinkOutcome,
+    ValueFlowSummaryResult,
 };
 pub use source_derivation::{
     NormalResultTransferPartition, SourceDependencyIdentity, SourceDerivationError,
@@ -186,5 +193,17 @@ pub fn caller_storage_locations(
             })
             .collect(),
         complete: !search.incomplete,
+        components: Vec::new(),
+        components_complete: false,
     }
 }
+
+mod selected_entry;
+pub use discovery::{
+    SelectedSourceEntryIdentity, SelectedSourceEntryView, SelectedSourceEntryViews,
+    SourceRootPartition, partition_source_roots,
+};
+
+pub(crate) use plan::{snapshot_data_dependencies, snapshot_has_unknown_memory_dependency};
+#[doc(hidden)]
+pub use selected_entry::{SelectedSourceEntryAdmission, SelectedSourceEntryRetentionError};

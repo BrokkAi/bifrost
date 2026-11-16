@@ -90,6 +90,7 @@ impl ActivatedProcedureSummary {
         Some(UnmaterializedExternalSummaryCallShapeBinding {
             actual_locator: target.locator().clone(),
             actual_to_formal: self.actual_to_formal.clone(),
+            receiver_binds_first_formal: target.receiver_is_first_argument(),
             formal_locator: target.formal_summary_locator(self.record.target.parameter_count),
             model_id: self.record.model_id.clone().into_boxed_str(),
             content: StableDigest::from_array(content),
@@ -2068,15 +2069,6 @@ impl ResolvedActiveSemanticModels {
         let rejected_artifact = std::cell::Cell::new(false);
         let mut matched =
             self.applicable_member_summaries(key, &parameter_counts, |shard, summary| {
-                // Summary ports address the declared formals, and flow binds
-                // a receiverless target's formal 0 to the call's first written
-                // argument. A reduced-form extension call writes formal 0 as
-                // its receiver, so no summary binds until flow can place it
-                // there; the call stays an open boundary (#11100).
-                if target.receiver_is_first_argument {
-                    incomplete.set(true);
-                    return ProcedureSummaryAcceptance::Reject;
-                }
                 let artifact_applies = python_artifact_applies_to_target(shard, target);
                 let actual_to_formal = procedure_summary_actual_to_formal(shard, summary, target);
                 if python_shard_requires_distribution_artifact(shard, target) && !artifact_applies {
@@ -2085,6 +2077,7 @@ impl ResolvedActiveSemanticModels {
                 if artifact_applies
                     && actual_to_formal.is_none()
                     && (!summary.target.formals.is_empty()
+                        || target.receiver_is_first_argument()
                         || python_shard_requires_distribution_artifact(shard, target))
                 {
                     incomplete.set(true);
@@ -2444,6 +2437,9 @@ pub fn procedure_summary_actual_to_formal(
     summary: &CompiledProcedureSummary,
     target: &UnmaterializedExternalTarget,
 ) -> Option<Option<Box<[u32]>>> {
+    if target.receiver_is_first_argument() {
+        return receiver_first_actual_to_formal(summary, target).map(Some);
+    }
     if python_shard_requires_distribution_artifact(shard, target) {
         if target.python_formal_parameter_count() != Some(summary.target.parameter_count)
             || target.python_formal_call_shape_accepts_arity(target.arity()) != Some(true)
@@ -2491,18 +2487,7 @@ pub fn procedure_summary_actual_to_formal(
         // The retained mapping reaches summary transfers. Other formal-input
         // consumers do not yet carry it, so keep their claims incomplete when
         // a keyword call reorders those inputs.
-        let mapped_claims_supported = !reordered
-            || (summary.locations.is_empty()
-                && summary.effects.is_empty()
-                && summary.concurrency_effects.is_empty()
-                && summary.preconditions.as_ref().is_none_or(Vec::is_empty)
-                && summary.result_contracts.is_empty()
-                && summary.result_use_obligations.is_empty()
-                && summary.conditional_result_refinements.is_empty()
-                && summary.conditional_indirect_writes.is_empty()
-                && summary.normal_return_refinements.is_empty()
-                && summary.normal_return_type_refinements.is_empty()
-                && summary.class_decorator_identity.is_none());
+        let mapped_claims_supported = !reordered || summary_claims_only_transfers(summary);
         mapped_claims_supported.then(|| Some(mapping.to_vec().into_boxed_slice()))
     } else if !summary.target.formals.is_empty() {
         let layout = summary_formal_layout(&summary.target)?;
@@ -2514,25 +2499,85 @@ pub fn procedure_summary_actual_to_formal(
             return None;
         }
         let reordered = mapping_reorders_fixed_formals(&mapping, &summary.target.formals);
-        let mapped_claims_supported = !reordered
-            || (summary.locations.is_empty()
-                && summary.effects.is_empty()
-                && summary.concurrency_effects.is_empty()
-                && summary.preconditions.as_ref().is_none_or(Vec::is_empty)
-                && summary.result_contracts.is_empty()
-                && summary.result_use_obligations.is_empty()
-                && summary.conditional_result_refinements.is_empty()
-                && summary.conditional_indirect_writes.is_empty()
-                && summary.normal_return_refinements.is_empty()
-                && summary.normal_return_type_refinements.is_empty()
-                && summary.class_decorator_identity.is_none());
+        let mapped_claims_supported = !reordered || summary_claims_only_transfers(summary);
         mapped_claims_supported.then_some(Some(mapping))
+    } else if let Some(mapping) = target.python_actual_to_formal() {
+        // A Python target selected through a model declaration is a typed
+        // call-mapping alias of its formal locator, which flow accepts only
+        // with the mapping. A summary that names no formals, as one with no
+        // parameters must (`__init__(self)`), still needs it (#11329).
+        if !summary.target.accepts_parameter_count(target.arity())
+            || mapping
+                .iter()
+                .any(|formal| *formal >= summary.target.parameter_count)
+        {
+            return None;
+        }
+        let reordered = mapping_reorders_fixed_formals(mapping, &summary.target.formals);
+        let mapped_claims_supported = !reordered || summary_claims_only_transfers(summary);
+        mapped_claims_supported.then(|| Some(mapping.to_vec().into_boxed_slice()))
     } else {
         summary
             .target
             .accepts_parameter_count(target.arity())
             .then_some(None)
     }
+}
+
+/// Whether every formal-input claim of `summary` is a transfer. Only summary
+/// transfers read a retained call mapping; the other claim kinds project
+/// formals positionally, so a mapped call keeps them unbound.
+fn summary_claims_only_transfers(summary: &CompiledProcedureSummary) -> bool {
+    summary.locations.is_empty()
+        && summary.effects.is_empty()
+        && summary.concurrency_effects.is_empty()
+        && summary.preconditions.as_ref().is_none_or(Vec::is_empty)
+        && summary.result_contracts.is_empty()
+        && summary.result_use_obligations.is_empty()
+        && summary.conditional_result_refinements.is_empty()
+        && summary.conditional_indirect_writes.is_empty()
+        && summary.normal_return_refinements.is_empty()
+        && summary.normal_return_type_refinements.is_empty()
+        && summary.class_decorator_identity.is_none()
+}
+
+/// The formal each written argument of a reduced-form extension call binds.
+/// The receiver binds formal 0, so the written arguments bind the formals
+/// after it, by the same slot matcher a static call uses. Flow reads the
+/// receiver binding for transfers only, so a summary with other claims stays
+/// unbound.
+fn receiver_first_actual_to_formal(
+    summary: &CompiledProcedureSummary,
+    target: &UnmaterializedExternalTarget,
+) -> Option<Box<[u32]>> {
+    if !summary_claims_only_transfers(summary) {
+        return None;
+    }
+    let arguments = target.call_arguments()?;
+    let written = if summary.target.formals.is_empty() {
+        let written_count = summary.target.parameter_count.checked_sub(1)?;
+        if summary.target.variadic
+            || arguments.len() != written_count as usize
+            || arguments.iter().any(|argument| {
+                argument.keyword.is_some()
+                    || argument.expansion
+                        != crate::analyzer::semantic::CallArgumentExpansion::Direct(
+                            crate::analyzer::semantic::ArgumentDomain::Positional,
+                        )
+            })
+        {
+            return None;
+        }
+        (0..written_count).collect::<Box<[u32]>>()
+    } else {
+        let mut layout = summary_formal_layout(&summary.target)?;
+        if layout.slots.is_empty() {
+            return None;
+        }
+        layout.slots.remove(0);
+        crate::analyzer::semantic::call_binding::bind_semantic_call_arguments(arguments, &layout)?
+    };
+    Some(written.iter().map(|formal| formal + 1).collect())
 }
 
 /// Rows of one catalog question, in publication order, with the state of its
@@ -3961,6 +4006,8 @@ pub type ExternalCallTypeBindings = Box<[(Box<str>, crate::analyzer::semantic_mo
 /// the documented match identity.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct UnmaterializedExternalTarget {
+    /// Query-local proof of the selected implicit instance receiver route.
+    pub implicit_receiver: bool,
     pub receiver_adjustment_call: Option<crate::analyzer::semantic::StableDigest>,
     pub unadmitted_receiver_deref: bool,
     pub receiver_adjustments: Box<[crate::analyzer::semantic_model::ReceiverAdjustment]>,
@@ -3970,11 +4017,18 @@ pub struct UnmaterializedExternalTarget {
     has_receiver: bool,
     #[doc(hidden)]
     pub resolver_owned_call_shape: bool,
+    /// Query-local declaration selection only; says nothing about body effects.
+    #[doc(hidden)]
+    pub resolver_closed_bound_receiver: bool,
+    /// Abstract status of the exact selected declaration, retained only for
+    /// this query. None leaves declaration kind unproved.
+    pub declaration_is_abstract: Option<bool>,
     /// The resolver proved a static extension method called in reduced form,
     /// `v.M(args...)`: the written receiver value is the first declared
     /// argument, which `arity` counts, and the call's own arguments follow it.
-    #[doc(hidden)]
-    pub receiver_is_first_argument: bool,
+    /// Set only by [`Self::bind_receiver_as_first_formal`], which also gives
+    /// the call its own alias locator.
+    receiver_is_first_argument: bool,
     normalized_static_owner: Option<Box<str>>,
     /// Exact JDK artifact selected for the Java source module and verified
     /// against the selected external declaration. Model and dispatch
@@ -4008,10 +4062,82 @@ pub struct UnmaterializedExternalTarget {
     pub python_constructor_class: Option<Box<str>>,
     #[doc(hidden)]
     pub locator: SemanticLocator,
-    python_formal_locator: Option<SemanticLocator>,
+    /// The shared declaration a call-specific alias `locator` binds, when the
+    /// call's actuals do not bind the formals positionally: a Python keyword
+    /// mapping or a reduced-form extension receiver.
+    formal_locator: Option<SemanticLocator>,
 }
 
 impl UnmaterializedExternalTarget {
+    /// Visit owned children without cloning bindings or constructing a local
+    /// census. The enclosing boundary accounts for the inline target storage.
+    #[doc(hidden)]
+    pub fn retained_heap(
+        &self,
+        census: &mut impl crate::analyzer::semantic::service::ArtifactRetentionVisitor,
+    ) {
+        census.owned_slice(self.owner_fqn.as_bytes());
+        census.owned_slice(self.member.as_bytes());
+        if census.owned_slice(&self.receiver_adjustments) {
+            for step in &self.receiver_adjustments {
+                step.retained_allocations(census);
+            }
+        }
+        for text in [
+            &self.normalized_static_owner,
+            &self.selected_python_model_manifest_sha256,
+            &self.python_constructor_class,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            census.owned_slice(text.as_bytes());
+        }
+        for activation in [&self.selected_jdk_artifact, &self.selected_python_artifact]
+            .into_iter()
+            .flatten()
+        {
+            activation.retained_allocations(census);
+        }
+        if let Some(descriptor) = &self.selected_external_descriptor {
+            for text in [&descriptor.owner.provider_id, &descriptor.owner.owner_fqn] {
+                census
+                    .shared_allocation(std::sync::Arc::as_ptr(text).cast::<()>() as usize, || {
+                        2 * std::mem::size_of::<usize>() + text.len()
+                    });
+            }
+        }
+        if let Some(bindings) = &self.type_argument_bindings
+            && census.owned_slice(bindings)
+        {
+            for (name, ty) in bindings {
+                census.owned_slice(name.as_bytes());
+                ty.retained_allocations(census);
+            }
+        }
+        if let Some(formals) = &self.python_formal_call_shape {
+            census.owned_slice(&formals.defaulted_formals);
+            census.owned_slice(&formals.variadic_formals);
+            if let Some(mapping) = &formals.actual_to_formal {
+                census.owned_slice(mapping);
+            }
+        }
+        if let Some(arguments) = &self.call_arguments
+            && census.owned_slice(arguments)
+        {
+            for argument in arguments {
+                if let Some(keyword) = &argument.keyword {
+                    census.owned_slice(keyword.as_bytes());
+                }
+            }
+        }
+        census.locator(&self.locator);
+        if let Some(locator) = &self.formal_locator {
+            census.locator(locator);
+        }
+        // Remaining fields are inline IDs, enum tags, arities and flags.
+    }
+
     /// Heap bytes owned by the type-argument bindings, for caches that retain
     /// this target across requests and charge it against their memory budget.
     pub fn type_argument_binding_heap_bytes(&self) -> usize {
@@ -4120,6 +4246,7 @@ impl UnmaterializedExternalTarget {
                 .is_none_or(|owner| owner == owner_fqn.as_ref())
         );
         Self {
+            implicit_receiver: false,
             receiver_adjustment_call: None,
             unadmitted_receiver_deref: false,
             receiver_adjustments: Box::default(),
@@ -4128,6 +4255,8 @@ impl UnmaterializedExternalTarget {
             arity,
             has_receiver,
             resolver_owned_call_shape: false,
+            resolver_closed_bound_receiver: false,
+            declaration_is_abstract: None,
             receiver_is_first_argument: false,
             normalized_static_owner,
             selected_jdk_artifact: None,
@@ -4138,7 +4267,7 @@ impl UnmaterializedExternalTarget {
             python_formal_call_shape: None,
             call_arguments: None,
             python_constructor_class: None,
-            python_formal_locator: None,
+            formal_locator: None,
             locator,
         }
     }
@@ -4325,13 +4454,48 @@ impl UnmaterializedExternalTarget {
         self
     }
 
+    /// Bind a reduced-form extension call `v.M(args...)` of the static
+    /// declaration this target names: the call's receiver value is formal 0
+    /// and its written arguments bind formals 1... The static form
+    /// `Owner.M(v, args...)` names the same declaration but binds its
+    /// arguments positionally, so this call gets its own alias locator while
+    /// summaries stay anchored to the declaration.
+    pub fn bind_receiver_as_first_formal(&mut self) {
+        debug_assert!(!self.has_receiver && self.formal_locator.is_none());
+        self.receiver_is_first_argument = true;
+        self.formal_locator = Some(self.locator.clone());
+        let mut segments = self.locator.declaration().segments().to_vec();
+        segments.insert(
+            0,
+            DeclarationSegment::named(
+                crate::analyzer::semantic::ids::DeclarationSegmentKind::Namespace,
+                "bifrost.receiver-first-formal.v1",
+                self.locator.anchor(),
+                0,
+            )
+            .expect("receiver alias namespace is nonempty"),
+        );
+        self.locator = SemanticLocator::new(
+            self.locator.mount(),
+            self.locator.path().clone(),
+            self.locator.language(),
+            DeclarationLocator::new(segments).expect("receiver alias preserves declaration"),
+            self.locator.role(),
+            self.locator.anchor(),
+        );
+    }
+
+    pub const fn receiver_is_first_argument(&self) -> bool {
+        self.receiver_is_first_argument
+    }
+
     #[doc(hidden)]
     pub fn qualify_python_argument_mapping(
         &mut self,
         formal_parameter_count: u32,
         actual_to_formal: Option<&[u32]>,
     ) {
-        self.python_formal_locator = Some(self.locator.clone());
+        self.formal_locator = Some(self.locator.clone());
         if let Some(mapping) = actual_to_formal {
             // Call-specific argument order is part of the target alias, while
             // the shared summary remains anchored to its formal declaration.
@@ -4396,7 +4560,7 @@ impl UnmaterializedExternalTarget {
     }
 
     pub fn formal_summary_locator(&self, arity: u32) -> SemanticLocator {
-        let Some(formal) = &self.python_formal_locator else {
+        let Some(formal) = &self.formal_locator else {
             return self.locator_for_arity(arity);
         };
         let mut target = self.clone();

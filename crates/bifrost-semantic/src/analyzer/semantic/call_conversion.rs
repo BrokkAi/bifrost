@@ -12,6 +12,7 @@ pub enum ConversionUnknown {
     UnsupportedConversion,
     UnsupportedExpression,
     IncompleteHierarchy,
+    FixedLimit,
     BudgetExhausted,
     Cancelled,
     /// Another actual prevents establishing applicability of this signature.
@@ -29,6 +30,7 @@ impl ConversionUnknown {
         "unsupported_conversion",
         "unsupported_expression",
         "incomplete_hierarchy",
+        "fixed_limit",
         "budget_exhausted",
         "cancelled",
         "signature_applicability",
@@ -45,6 +47,7 @@ impl ConversionUnknown {
             Self::UnsupportedConversion => "unsupported_conversion",
             Self::UnsupportedExpression => "unsupported_expression",
             Self::IncompleteHierarchy => "incomplete_hierarchy",
+            Self::FixedLimit => "fixed_limit",
             Self::BudgetExhausted => "budget_exhausted",
             Self::Cancelled => "cancelled",
             Self::SignatureApplicability => "signature_applicability",

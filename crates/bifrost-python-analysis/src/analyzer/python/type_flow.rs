@@ -8,6 +8,8 @@
 //! source text is parsed or scanned here; reading a node's text at an
 //! AST-provided span is structured access.
 
+use brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelNamespace;
+
 use std::sync::{Arc, Mutex};
 
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
@@ -32,6 +34,7 @@ use crate::analyzer::python::PythonAnalyzer;
 use crate::analyzer::python::native_request::definition_lookup::{
     PythonReceiverRequest, definition_at_range_with_request,
 };
+use crate::analyzer::usages::get_definition::python::PythonDefinitionBatchOperation;
 use brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause;
 use brokk_bifrost_analysis::analyzer::usages::get_definition::{
     DefinitionLookupOutcome, DefinitionLookupStatus,
@@ -915,7 +918,7 @@ fn class_attribute_assignment_value<'tree>(
     };
     let hierarchy =
         PythonTypeFlowAdapter.class_hierarchy(workspace, &ClassIdentity::Workspace(unit));
-    (hierarchy.descendants.as_deref() == Some(&[])
+    ((hierarchy.descendants.is_complete() && hierarchy.descendants.edges.is_empty())
         && !hierarchy.unresolved_base
         && !hierarchy.dynamic_attributes)
         .then_some(value)
@@ -1671,7 +1674,7 @@ fn scoped_dynamic_write(
                             _ if matches!(
                                 builtin_class_reference(
                                     python_analyzer(workspace),
-                                    workspace.analyzer().semantic_model_overlay().as_deref(),
+                                    workspace.analyzer().semantic_model_overlay_read().published().as_deref(),
                                     object,
                                     prepared,
                                     &mut ExternalClassCache::default()
@@ -2681,7 +2684,10 @@ fn imported_external_module_value(
 ) -> Option<(String, String, ClassSeed)> {
     let (module, member) =
         import_bound_external_symbol(python_analyzer(workspace), file, prepared, reference)?;
-    let overlay = workspace.analyzer().semantic_model_overlay()?;
+    let overlay = workspace
+        .analyzer()
+        .semantic_model_overlay_read()
+        .published()?;
     let seed = external_module_value_seed(&overlay, &module, &member)?;
     Some((module, member, seed))
 }
@@ -2762,7 +2768,10 @@ fn imported_external_function_result_seed(
     let python = python_analyzer(workspace);
     let (module, member) = imported_external_callable_binding(python, file, prepared, expression)?;
     let canonical = format!("{module}.{member}");
-    let overlay = workspace.analyzer().semantic_model_overlay()?;
+    let overlay = workspace
+        .analyzer()
+        .semantic_model_overlay_read()
+        .published()?;
     let symbols = overlay.symbols_named_for(&canonical, "python");
     let [symbol] = symbols.records.as_slice() else {
         return None;
@@ -3005,7 +3014,11 @@ fn external_hierarchy_has_protocol_or_abstract_members(
     workspace: &WorkspaceAnalyzer,
     ancestors: &[ClassIdentity],
 ) -> bool {
-    let Some(overlay) = workspace.analyzer().semantic_model_overlay() else {
+    let Some(overlay) = workspace
+        .analyzer()
+        .semantic_model_overlay_read()
+        .published()
+    else {
         return ancestors
             .iter()
             .any(|ancestor| matches!(ancestor, ClassIdentity::External { .. }));
@@ -3331,11 +3344,16 @@ pub(crate) fn exact_external_base_node_with_lookup<E>(
 /// external hierarchy edge that does not resolve to one modeled declaration
 /// remains risky; a partial member surface alone does not, because an override
 /// is an explicit declaration in the modeled class body or its ancestors.
-pub(crate) fn python_receiver_method_dispatch_may_be_bypassed(
+/// Ancestor reads are supplied by the caller's retained native operation.
+pub(crate) fn python_receiver_method_dispatch_may_be_bypassed_with(
     python: &PythonAnalyzer,
     receiver_class: &CodeUnit,
+    workspace_ancestors: &[CodeUnit],
+    direct_ancestors: &mut dyn FnMut(
+        &CodeUnit,
+    )
+        -> brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer,
 ) -> bool {
-    let workspace_ancestors = python.get_ancestors(receiver_class).definite().to_vec();
     if std::iter::once(receiver_class)
         .chain(workspace_ancestors.iter())
         .any(|owner| {
@@ -3354,7 +3372,7 @@ pub(crate) fn python_receiver_method_dispatch_may_be_bypassed(
     let mut external_cache = ExternalClassCache::default();
     let mut checked_external = HashSet::<Box<str>>::default();
     for owner in std::iter::once(receiver_class).chain(workspace_ancestors.iter()) {
-        let direct = python.get_direct_ancestors(owner).definite().to_vec();
+        let direct = direct_ancestors(owner).definite().to_vec();
         for raw in python.inner.raw_supertypes_of(owner) {
             if direct
                 .iter()
@@ -3764,7 +3782,7 @@ fn external_class_hierarchy(
     ancestors.dedup();
     ClassHierarchy {
         ancestors,
-        descendants: None,
+        descendants: brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer::incomplete(brokk_bifrost_core::analyzer::capabilities::HierarchyOpenReason::DescendantIndexUnavailable),
         unresolved_base: mro.as_ref().is_none_or(|classes| {
             classes.iter().any(|class_id| {
                 exact_python_model_class(overlay, class_id)
@@ -4115,7 +4133,11 @@ fn imported_external_class(
     let (module, member) =
         import_bound_external_symbol(python_analyzer(workspace), file, prepared, reference)?;
     external_class_identity(
-        workspace.analyzer().semantic_model_overlay().as_deref(),
+        workspace
+            .analyzer()
+            .semantic_model_overlay_read()
+            .published()
+            .as_deref(),
         Language::Python,
         &format!("{module}.{member}"),
         None,
@@ -4139,7 +4161,11 @@ fn imported_external_class_callee(
         file,
         prepared,
         callee,
-        workspace.analyzer().semantic_model_overlay().as_deref(),
+        workspace
+            .analyzer()
+            .semantic_model_overlay_read()
+            .published()
+            .as_deref(),
     )
 }
 
@@ -4316,7 +4342,7 @@ fn resolve_class_at_span(
         file,
         span,
         prepared,
-        &mut PythonTypeQuery::default(),
+        &mut PythonDefinitionBatchOperation::new(python_analyzer(workspace)),
     )
 }
 
@@ -4325,7 +4351,7 @@ fn resolve_class_at_span_with_native<'a>(
     file: ProjectFile,
     span: SourceSpan,
     prepared: &PreparedSyntaxTree,
-    native: &mut PythonTypeQuery<'a>,
+    native: &mut PythonDefinitionBatchOperation<'a>,
 ) -> ClassSeed {
     memoized_class_seed(
         workspace,
@@ -4339,13 +4365,13 @@ fn resolve_class_at_span_with_native<'a>(
 
 /// The class a constructor call's callee names, decided from the callee's
 /// native definition (#5658).
-fn constructor_callee_class_at_span<'a>(
-    workspace: &'a WorkspaceAnalyzer,
+fn constructor_callee_class_at_span(
+    workspace: &WorkspaceAnalyzer,
     file: &ProjectFile,
     span: SourceSpan,
     prepared: &PreparedSyntaxTree,
     callee: Node<'_>,
-    native: &mut PythonTypeQuery<'a>,
+    native: &mut PythonDefinitionBatchOperation<'_>,
 ) -> ClassSeed {
     if python_attribute_names_nested_class_through_current_receiver_bounded(
         prepared.source(),
@@ -4364,7 +4390,11 @@ fn constructor_callee_class_at_span<'a>(
         || {
             builtin_class_reference(
                 python_analyzer(workspace),
-                workspace.analyzer().semantic_model_overlay().as_deref(),
+                workspace
+                    .analyzer()
+                    .semantic_model_overlay_read()
+                    .published()
+                    .as_deref(),
                 callee,
                 prepared,
                 &mut ExternalClassCache::default(),
@@ -4390,7 +4420,7 @@ fn callee_class_at_node(
         span_for_node(callee),
         prepared,
         callee,
-        &mut PythonTypeQuery::default(),
+        &mut PythonDefinitionBatchOperation::new(python_analyzer(workspace)),
     )
 }
 
@@ -4429,7 +4459,8 @@ fn memoized_class_seed(
         project_generation: workspace.analyzer().project().analysis_generation(),
         semantic_overlay: workspace
             .analyzer()
-            .semantic_model_overlay()
+            .semantic_model_overlay_read()
+            .published()
             .map(|overlay| Box::from(overlay.active_model_set_hash())),
     };
     let cached = memo
@@ -4467,13 +4498,17 @@ fn resolve_indexed_class_at_span<'a>(
     file: ProjectFile,
     span: SourceSpan,
     prepared: &PreparedSyntaxTree,
-    native: &mut PythonTypeQuery<'a>,
+    native: &mut PythonDefinitionBatchOperation<'a>,
 ) -> ClassSeed {
     let indexed_source = prepared.source();
     if let Some(reference) = node_at_span(prepared, span)
         && let Some(seed) = builtin_class_reference(
             python_analyzer(workspace),
-            workspace.analyzer().semantic_model_overlay().as_deref(),
+            workspace
+                .analyzer()
+                .semantic_model_overlay_read()
+                .published()
+                .as_deref(),
             reference,
             prepared,
             &mut ExternalClassCache::default(),
@@ -4545,7 +4580,11 @@ fn class_seed_from_type_outcome(
         | TypeLookupStatus::NotFound => {}
     }
     class_seed_from_lookup_types(
-        workspace.analyzer().semantic_model_overlay().as_deref(),
+        workspace
+            .analyzer()
+            .semantic_model_overlay_read()
+            .published()
+            .as_deref(),
         Language::Python,
         &outcome.types,
     )
@@ -4733,7 +4772,10 @@ impl PythonTypeFlowAdapter {
         if nodes.is_empty() {
             return Err(unmodeled(node));
         }
-        let overlay = workspace.analyzer().semantic_model_overlay();
+        let overlay = workspace
+            .analyzer()
+            .semantic_model_overlay_read()
+            .published();
         let mut cache = ExternalClassCache::default();
         nodes
             .into_iter()
@@ -4760,7 +4802,10 @@ impl PythonTypeFlowAdapter {
         prepared: &PreparedSyntaxTree,
         class: Node<'_>,
     ) -> Result<ClassIdentity, UnknownReason> {
-        let overlay = workspace.analyzer().semantic_model_overlay();
+        let overlay = workspace
+            .analyzer()
+            .semantic_model_overlay_read()
+            .published();
         guard_class_identity(
             workspace,
             file,
@@ -4853,7 +4898,7 @@ impl PythonTypeFlowAdapter {
             return false;
         }
         let hierarchy = self.class_hierarchy(workspace, class);
-        hierarchy.descendants.as_deref() == Some(&[])
+        (hierarchy.descendants.is_complete() && hierarchy.descendants.edges.is_empty())
             && !hierarchy.unresolved_base
             && !hierarchy.dynamic_attributes
     }
@@ -5068,7 +5113,10 @@ impl PythonTypeFlowAdapter {
         }
         // A raw base the hierarchy resolver did not enter must be answered by
         // the pack overlay or the member list is not known to be complete.
-        let overlay = workspace.analyzer().semantic_model_overlay();
+        let overlay = workspace
+            .analyzer()
+            .semantic_model_overlay_read()
+            .published();
         let mut cache = ExternalClassCache::default();
         let mut external_bases = Vec::new();
         for owner in std::iter::once(unit).chain(ancestors.iter()) {
@@ -5431,7 +5479,11 @@ pub(crate) fn python_external_field_read_discharges_gap(
     else {
         return false;
     };
-    let Some(overlay) = workspace.analyzer().semantic_model_overlay() else {
+    let Some(overlay) = workspace
+        .analyzer()
+        .semantic_model_overlay_read()
+        .published()
+    else {
         return false;
     };
     let python = python_analyzer(workspace);
@@ -5491,7 +5543,11 @@ fn external_class_member_mutation_free(
     else {
         return false;
     };
-    let Some(overlay) = workspace.analyzer().semantic_model_overlay() else {
+    let Some(overlay) = workspace
+        .analyzer()
+        .semantic_model_overlay_read()
+        .published()
+    else {
         return false;
     };
     let mut class_ids = HashSet::from_iter([symbol_id.to_string()]);
@@ -5549,7 +5605,21 @@ pub(crate) fn python_external_class_call_identity(
     procedure: &ProcedureHandle,
     call: &SemanticCallSite,
 ) -> Option<ClassIdentity> {
-    match PythonTypeFlowAdapter.constructed_class(workspace, procedure, call) {
+    python_external_class_call_identity_with_request(
+        &mut PythonDefinitionBatchOperation::new(python_analyzer(workspace)),
+        workspace,
+        procedure,
+        call,
+    )
+}
+
+pub(crate) fn python_external_class_call_identity_with_request(
+    native: &mut PythonDefinitionBatchOperation<'_>,
+    workspace: &WorkspaceAnalyzer,
+    procedure: &ProcedureHandle,
+    call: &SemanticCallSite,
+) -> Option<ClassIdentity> {
+    match python_constructed_class(native, workspace, procedure, call) {
         ClassSeed::Class(class @ ClassIdentity::External { .. }) => Some(class),
         ClassSeed::Class(_)
         | ClassSeed::ClassWithOpenBound(_)
@@ -5807,65 +5877,31 @@ fn exact_python_method_declaration(
     Some(symbol)
 }
 
-#[derive(Debug)]
-struct PythonModelMroFrame {
-    class_id: String,
-    bases: Option<Vec<String>>,
-    next_base: usize,
+/// The declared active Python model hierarchy as a supertype source: each
+/// class's ordered bases come from the same selected model overlay the
+/// workspace walk reads, and an owner the overlay cannot name stops the order.
+struct PythonModelBases<'a>(&'a SemanticModelOverlay);
+
+impl brokk_bifrost_analysis::analyzer::resolution::SupertypeSource<String>
+    for PythonModelBases<'_>
+{
+    fn bases(&mut self, class_id: &String) -> Option<Vec<String>> {
+        let class = exact_python_model_class(self.0, class_id)?;
+        python_external_direct_bases(self.0, &class)
+    }
 }
 
-/// C3 linearization over the declared active Python model hierarchy. A partial
-/// member surface can still provide useful base identities; callers retain the
-/// surface gap separately when deciding whether absence is provable.
+/// C3 linearization over the declared active Python model hierarchy, run by
+/// the shared cursor. A partial member surface can still provide useful base
+/// identities; callers retain the surface gap separately when deciding whether
+/// absence is provable.
 fn python_external_class_mro(overlay: &SemanticModelOverlay, root_id: &str) -> Option<Vec<String>> {
-    let mut c3_work = 0;
-    let mut linearizations = HashMap::<String, Vec<String>>::default();
-    let mut visiting = HashSet::<String>::default();
-    let mut stack = vec![PythonModelMroFrame {
-        class_id: root_id.to_owned(),
-        bases: None,
-        next_base: 0,
-    }];
-    visiting.insert(root_id.to_owned());
-
-    while !stack.is_empty() {
-        let top = stack.len() - 1;
-        if stack[top].bases.is_none() {
-            let class_id = stack[top].class_id.clone();
-            let class = exact_python_model_class(overlay, &class_id)?;
-            stack[top].bases = Some(python_external_direct_bases(overlay, &class)?);
-        }
-        let bases = stack[top].bases.as_ref().expect("bases were initialized");
-        if stack[top].next_base < bases.len() {
-            let base = bases[stack[top].next_base].clone();
-            stack[top].next_base += 1;
-            if linearizations.contains_key(&base) {
-                continue;
-            }
-            if !visiting.insert(base.clone()) {
-                return None;
-            }
-            stack.push(PythonModelMroFrame {
-                class_id: base,
-                bases: None,
-                next_base: 0,
-            });
-            continue;
-        }
-
-        let frame = stack.pop().expect("the MRO stack is nonempty");
-        let bases = frame.bases.expect("bases were initialized");
-        let linearization = crate::analyzer::python::hierarchy::merge_c3(
-            &frame.class_id,
-            &bases,
-            &linearizations,
-            &mut |amount| crate::analyzer::python::hierarchy::spend_c3(&mut c3_work, amount),
-        )
-        .ok()?;
-        visiting.remove(&frame.class_id);
-        linearizations.insert(frame.class_id, linearization);
-    }
-    linearizations.remove(root_id)
+    brokk_bifrost_analysis::analyzer::store::resolution_operation::python_model_c3(
+        &root_id.to_owned(),
+        &mut PythonModelBases(overlay),
+        crate::analyzer::python::hierarchy::MAX_PYTHON_C3_WORK,
+    )
+    .ok()
 }
 
 fn python_external_direct_bases(
@@ -5948,7 +5984,7 @@ fn python_external_direct_bases_for_record(
                 continue;
             }
             overlay
-                .symbols_named_in_family(&relation.to, "python")
+                .symbols_named_in_family(&relation.to, "python", SemanticModelNamespace::Unknown)
                 .records
                 .into_iter()
                 .filter(|symbol| {
@@ -6332,7 +6368,11 @@ fn constructor_result_has_stable_local_receiver_in_query<'a>(
                     ) {
                         reject!("earlier receiver call can mutate class state");
                     }
-                    let Some(overlay) = workspace.analyzer().semantic_model_overlay() else {
+                    let Some(overlay) = workspace
+                        .analyzer()
+                        .semantic_model_overlay_read()
+                        .published()
+                    else {
                         reject!("active semantic model is unavailable");
                     };
                     for class in origin.classes.iter() {
@@ -6823,7 +6863,10 @@ fn python_exact_external_receiver_identities_in_query<'a>(
         .child_by_field_name("attribute")?
         .utf8_text(prepared.source().as_bytes())
         .ok()?;
-    let overlay = workspace.analyzer().semantic_model_overlay()?;
+    let overlay = workspace
+        .analyzer()
+        .semantic_model_overlay_read()
+        .published()?;
     let mut identities = Vec::with_capacity(origin.classes.len());
     for class in origin.classes.iter() {
         let ClassIdentity::External { symbol_id, .. } = class else {
@@ -6897,7 +6940,11 @@ fn workspace_instance_method_surface_is_closed(
             workspace,
             python,
             owner,
-            workspace.analyzer().semantic_model_overlay().as_deref(),
+            workspace
+                .analyzer()
+                .semantic_model_overlay_read()
+                .published()
+                .as_deref(),
         )
     {
         return false;
@@ -7886,9 +7933,9 @@ struct PythonExactCallResult {
     kind: SourceSiteKind,
 }
 
-fn python_constructed_class<'a>(
-    native: &mut PythonTypeQuery<'a>,
-    workspace: &'a WorkspaceAnalyzer,
+fn python_constructed_class(
+    native: &mut PythonDefinitionBatchOperation<'_>,
+    workspace: &WorkspaceAnalyzer,
     procedure: &ProcedureHandle,
     call: &SemanticCallSite,
 ) -> ClassSeed {
@@ -8027,35 +8074,15 @@ fn python_constructed_class<'a>(
     seed
 }
 
-// The selected operation and its artifacts belong only to this exact-result walk.
-#[derive(Default)]
-struct PythonTypeQuery<'a> {
-    request: Option<(
-        super::native_request::definition_lookup::PythonReceiverRequest<'a>,
-        brokk_bifrost_analysis::analyzer::usages::common::QueryMemoReads,
-    )>,
-}
-
-impl<'a> PythonTypeQuery<'a> {
-    fn open(
+// Type-flow and dispatch constructor probes use the same selected request owner.
+// Every probe runs under `captured`, which opens the request and admits its reads.
+impl<'a> PythonDefinitionBatchOperation<'a> {
+    fn open_type_query(
         &mut self,
-        workspace: &'a WorkspaceAnalyzer,
+        workspace: &WorkspaceAnalyzer,
     ) -> &mut super::native_request::definition_lookup::PythonReceiverRequest<'a> {
-        use brokk_bifrost_analysis::analyzer::usages::common::{
-            capture_memo_reads, replay_memo_reads,
-        };
-        let python = python_analyzer(workspace);
-        if let Some((_, reads)) = &self.request {
-            replay_memo_reads(reads, workspace.analyzer());
-        } else {
-            let cancel = python.inner.active_query_cancellation().unwrap_or_default();
-            self.request = Some(capture_memo_reads(workspace.analyzer(), || {
-                super::native_request::definition_lookup::PythonReceiverRequest::open(
-                    python, &cancel,
-                )
-            }));
-        }
-        let request = &mut self.request.as_mut().expect("Python type request opened").0;
+        let cancellation = python_analyzer(workspace).inner.active_query_cancellation();
+        let request = self.request_in_capture(cancellation.as_ref());
         request.begin_receiver_query();
         request
     }
@@ -8067,7 +8094,21 @@ impl<'a> PythonTypeQuery<'a> {
     /// uncertain.
     fn constructed_class_definition(
         &mut self,
-        workspace: &'a WorkspaceAnalyzer,
+        workspace: &WorkspaceAnalyzer,
+        file: &ProjectFile,
+        prepared: &PreparedSyntaxTree,
+        callee: Node<'_>,
+    ) -> ClassSeed {
+        self.captured(
+            brokk_bifrost_analysis::analyzer::usages::common::QueryMemoOwner::PythonType,
+            workspace.analyzer(),
+            |state| state.constructed_class_definition_with_memo(workspace, file, prepared, callee),
+        )
+    }
+
+    fn constructed_class_definition_with_memo(
+        &mut self,
+        workspace: &WorkspaceAnalyzer,
         file: &ProjectFile,
         prepared: &PreparedSyntaxTree,
         callee: Node<'_>,
@@ -8075,7 +8116,7 @@ impl<'a> PythonTypeQuery<'a> {
         use brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupStatus;
         let python = python_analyzer(workspace);
         let cancellation = python.inner.active_query_cancellation();
-        let request = self.open(workspace);
+        let request = self.open_type_query(workspace);
         let answer = definition_at_range_with_request(
             request,
             workspace.analyzer(),
@@ -8085,7 +8126,6 @@ impl<'a> PythonTypeQuery<'a> {
             callee.start_byte()..callee.end_byte(),
             cancellation.as_ref(),
         );
-        let excludes_store_access = request.reader_excludes_store_access();
         let seed = match &answer {
             Err(DerivationExecutionCause::Budget) => {
                 ClassSeed::Unknown(UnknownReason::SemanticBudget)
@@ -8120,7 +8160,11 @@ impl<'a> PythonTypeQuery<'a> {
                                 && symbol.owner_id.is_none() =>
                         {
                             external_class_identity(
-                                workspace.analyzer().semantic_model_overlay().as_deref(),
+                                workspace
+                                    .analyzer()
+                                    .semantic_model_overlay_read()
+                                    .published()
+                                    .as_deref(),
                                 Language::Python,
                                 &symbol.qualified_name,
                                 Some(&symbol.id),
@@ -8148,11 +8192,6 @@ impl<'a> PythonTypeQuery<'a> {
                         )
                     }) =>
                 {
-                    // The legacy lookup reads the store through its own
-                    // checkouts; a writer-backed reader would block it (#6018).
-                    if excludes_store_access {
-                        self.request = None;
-                    }
                     self.legacy_constructed_class(workspace, file, prepared, callee)
                 }
                 _ => ClassSeed::NotApplicable,
@@ -8160,8 +8199,8 @@ impl<'a> PythonTypeQuery<'a> {
         };
         // Same release rule as `resolve`.
         let clean = matches!(&answer, Ok(Some((outcome, _))) if !outcome.diagnostics.iter().any(|diagnostic| brokk_bifrost_analysis::analyzer::usages::common::is_native_operation_failure(&diagnostic.kind)));
-        if !clean || excludes_store_access {
-            self.request = None;
+        if !clean {
+            self.release_request();
         }
         seed
     }
@@ -8169,7 +8208,7 @@ impl<'a> PythonTypeQuery<'a> {
     /// The legacy structural class answer for the name path at `callee`.
     fn legacy_constructed_class(
         &mut self,
-        workspace: &'a WorkspaceAnalyzer,
+        workspace: &WorkspaceAnalyzer,
         file: &ProjectFile,
         prepared: &PreparedSyntaxTree,
         callee: Node<'_>,
@@ -8202,7 +8241,22 @@ impl<'a> PythonTypeQuery<'a> {
 
     fn resolve(
         &mut self,
-        workspace: &'a WorkspaceAnalyzer,
+        workspace: &WorkspaceAnalyzer,
+        file: &ProjectFile,
+        source: &str,
+        tree: &tree_sitter::Tree,
+        site: &ResolvedReferenceSite,
+    ) -> brokk_bifrost_analysis::analyzer::usages::get_type::TypeLookupOutcome {
+        self.captured(
+            brokk_bifrost_analysis::analyzer::usages::common::QueryMemoOwner::PythonType,
+            workspace.analyzer(),
+            |state| state.resolve_with_memo(workspace, file, source, tree, site),
+        )
+    }
+
+    fn resolve_with_memo(
+        &mut self,
+        workspace: &WorkspaceAnalyzer,
         file: &ProjectFile,
         source: &str,
         tree: &tree_sitter::Tree,
@@ -8210,7 +8264,7 @@ impl<'a> PythonTypeQuery<'a> {
     ) -> brokk_bifrost_analysis::analyzer::usages::get_type::TypeLookupOutcome {
         let python = python_analyzer(workspace);
         let cancellation = python.inner.active_query_cancellation();
-        let request = self.open(workspace);
+        let request = self.open_type_query(workspace);
         let answer = request.resolve_type_bounded(
             brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery {
                 analyzer: workspace.analyzer(),
@@ -8225,8 +8279,8 @@ impl<'a> PythonTypeQuery<'a> {
         // Go's rule: only a stopped answer or a failed operation releases the
         // request; an incomplete or unprojectable answer keeps it.
         let clean = matches!(&answer, BoundedResolution::Complete { value, .. } if !value.diagnostics.iter().any(|diagnostic| brokk_bifrost_analysis::analyzer::usages::common::is_native_operation_failure(&diagnostic.kind)));
-        if !clean || request.reader_excludes_store_access() {
-            self.request = None;
+        if !clean {
+            self.release_request();
         }
         brokk_bifrost_analysis::analyzer::usages::get_type::finish_bounded_resolution(
             Some(answer),
@@ -8239,14 +8293,21 @@ impl<'a> PythonTypeQuery<'a> {
 // One query over one procedure. Missing call results become worklist entries,
 // so origin revalidation and mixed call/access chains never recurse in Rust.
 // Both successful and unknown results are dropped when this query returns.
-#[derive(Default)]
 struct PythonExactResultQuery<'a> {
-    native: PythonTypeQuery<'a>,
+    native: PythonDefinitionBatchOperation<'a>,
     calls: HashMap<CallSiteId, Option<PythonExactCallResult>>,
     pending: Option<CallSiteId>,
 }
 
 impl<'a> PythonExactResultQuery<'a> {
+    fn new(workspace: &'a WorkspaceAnalyzer) -> Self {
+        Self {
+            native: PythonDefinitionBatchOperation::new(python_analyzer(workspace)),
+            calls: HashMap::default(),
+            pending: None,
+        }
+    }
+
     fn call_result(&mut self, call: &SemanticCallSite) -> Option<PythonExactCallResult> {
         if let Some(result) = self.calls.get(&call.id) {
             return result.clone();
@@ -8385,7 +8446,7 @@ pub(crate) fn python_exact_external_receiver_identities(
     procedure: &ProcedureHandle,
     method_call: &SemanticCallSite,
 ) -> Option<Vec<brokk_bifrost_analysis::analyzer::semantic::oracle::dispatch::ResolverOwnedExternalCalleeIdentity>>{
-    PythonExactResultQuery::default().resolve(workspace, procedure, |query| {
+    PythonExactResultQuery::new(workspace).resolve(workspace, procedure, |query| {
         python_exact_external_receiver_identities_in_query(workspace, procedure, method_call, query)
     })
 }
@@ -8660,8 +8721,11 @@ fn python_exact_call_result_value<'a>(
     let [identity] = identities.as_slice() else {
         return None;
     };
-    let overlay = workspace.analyzer().semantic_model_overlay()?;
-    let owner_match = overlay.symbols_named_for(identity.owner_fqn(), "python");
+    let overlay = workspace
+        .analyzer()
+        .semantic_model_overlay_read()
+        .published()?;
+    let owner_match = overlay.python_symbols_named(identity.owner_fqn());
     let [owner] = owner_match.records.as_slice() else {
         return None;
     };
@@ -8727,7 +8791,10 @@ fn python_exact_access_return_classes(
     receiver_class: &ClassIdentity,
     access: &PythonExactAccess,
 ) -> Option<Box<[ClassIdentity]>> {
-    let overlay = workspace.analyzer().semantic_model_overlay()?;
+    let overlay = workspace
+        .analyzer()
+        .semantic_model_overlay_read()
+        .published()?;
     let ClassIdentity::External { symbol_id, .. } = receiver_class else {
         let ClassIdentity::Workspace(owner) = receiver_class else {
             unreachable!("the external receiver case returned above")
@@ -9010,7 +9077,11 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         };
         let mut cache = ExternalClassCache::default();
         external_seed(
-            workspace.analyzer().semantic_model_overlay().as_deref(),
+            workspace
+                .analyzer()
+                .semantic_model_overlay_read()
+                .published()
+                .as_deref(),
             name,
             &mut cache,
         )
@@ -9035,7 +9106,11 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         if let Some(name) = implicit_class {
             let mut cache = ExternalClassCache::default();
             return external_seed(
-                workspace.analyzer().semantic_model_overlay().as_deref(),
+                workspace
+                    .analyzer()
+                    .semantic_model_overlay_read()
+                    .published()
+                    .as_deref(),
                 name,
                 &mut cache,
             );
@@ -9087,7 +9162,11 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
             if let Some(name) = container {
                 let mut cache = ExternalClassCache::default();
                 return external_seed(
-                    workspace.analyzer().semantic_model_overlay().as_deref(),
+                    workspace
+                        .analyzer()
+                        .semantic_model_overlay_read()
+                        .published()
+                        .as_deref(),
                     name,
                     &mut cache,
                 );
@@ -9152,7 +9231,10 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
                 let seed = callee_class_at_node(workspace, &file, &prepared, function);
                 if let ClassSeed::Class(class @ ClassIdentity::Workspace(owner)) = &seed {
                     let hierarchy = self.class_hierarchy(workspace, class);
-                    let overlay = workspace.analyzer().semantic_model_overlay();
+                    let overlay = workspace
+                        .analyzer()
+                        .semantic_model_overlay_read()
+                        .published();
                     if !hierarchy.unresolved_base
                         && python_class_hierarchy_member_unshadowed_bounded(
                             python_analyzer(workspace),
@@ -9179,7 +9261,11 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
             "string" | "concatenated_string" => {
                 let mut cache = ExternalClassCache::default();
                 external_seed(
-                    workspace.analyzer().semantic_model_overlay().as_deref(),
+                    workspace
+                        .analyzer()
+                        .semantic_model_overlay_read()
+                        .published()
+                        .as_deref(),
                     "builtins.str",
                     &mut cache,
                 )
@@ -9195,7 +9281,12 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         procedure: &ProcedureHandle,
         call: &SemanticCallSite,
     ) -> ClassSeed {
-        python_constructed_class(&mut PythonTypeQuery::default(), workspace, procedure, call)
+        python_constructed_class(
+            &mut PythonDefinitionBatchOperation::new(python_analyzer(workspace)),
+            workspace,
+            procedure,
+            call,
+        )
     }
 
     fn exact_call_result_class(
@@ -9204,7 +9295,7 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         procedure: &ProcedureHandle,
         call: &SemanticCallSite,
     ) -> Option<Box<[ClassIdentity]>> {
-        PythonExactResultQuery::default()
+        PythonExactResultQuery::new(workspace)
             .resolve(workspace, procedure, |query| query.exact_call_classes(call))
     }
 
@@ -9217,7 +9308,7 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         origin: &ConstructorResultOrigin,
     ) -> bool {
         call.receiver == Some(receiver)
-            && PythonExactResultQuery::default()
+            && PythonExactResultQuery::new(workspace)
                 .resolve(workspace, procedure, |query| {
                     python_exact_receiver_origin_in_query(workspace, procedure, call, query)
                 })
@@ -9232,7 +9323,7 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         location: &MemoryLocation,
         result: ValueId,
     ) -> ClassSeed {
-        PythonExactResultQuery::default()
+        PythonExactResultQuery::new(workspace)
             .resolve(workspace, procedure, |query| {
                 Some(python_memory_load_result_class_in_query(
                     workspace, procedure, location, result, query,
@@ -9274,7 +9365,11 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         };
         let mut cache = ExternalClassCache::default();
         external_seed(
-            workspace.analyzer().semantic_model_overlay().as_deref(),
+            workspace
+                .analyzer()
+                .semantic_model_overlay_read()
+                .published()
+                .as_deref(),
             name,
             &mut cache,
         )
@@ -9324,7 +9419,11 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         };
         let mut cache = ExternalClassCache::default();
         external_seed(
-            workspace.analyzer().semantic_model_overlay().as_deref(),
+            workspace
+                .analyzer()
+                .semantic_model_overlay_read()
+                .published()
+                .as_deref(),
             name,
             &mut cache,
         )
@@ -9452,7 +9551,11 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
             };
             let mut cache = ExternalClassCache::default();
             return external_seed(
-                workspace.analyzer().semantic_model_overlay().as_deref(),
+                workspace
+                    .analyzer()
+                    .semantic_model_overlay_read()
+                    .published()
+                    .as_deref(),
                 name,
                 &mut cache,
             );
@@ -9678,7 +9781,11 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
                 self.workspace_member_lookup(workspace, python, unit, member)
             }
             ClassIdentity::External { symbol_id, .. } => {
-                let Some(overlay) = workspace.analyzer().semantic_model_overlay() else {
+                let Some(overlay) = workspace
+                    .analyzer()
+                    .semantic_model_overlay_read()
+                    .published()
+                else {
                     return MemberLookup::Unknown(UnknownReason::ExternalNotModeled);
                 };
                 external_member_lookup(&overlay, symbol_id, member)
@@ -9715,7 +9822,10 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         let mut lookup = self.member_lookup(workspace, MemberAccessKind::Call, class, member);
         if exact_receiver_instance
             && let ClassIdentity::External { symbol_id, .. } = class
-            && let Some(overlay) = workspace.analyzer().semantic_model_overlay()
+            && let Some(overlay) = workspace
+                .analyzer()
+                .semantic_model_overlay_read()
+                .published()
         {
             lookup = external_direct_member_lookup(&overlay, symbol_id, member);
         }
@@ -9793,14 +9903,18 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
             ClassIdentity::Workspace(unit) => unit,
             ClassIdentity::External { symbol_id, .. } => {
                 return external_class_hierarchy(
-                    workspace.analyzer().semantic_model_overlay().as_deref(),
+                    workspace
+                        .analyzer()
+                        .semantic_model_overlay_read()
+                        .published()
+                        .as_deref(),
                     symbol_id,
                 );
             }
             ClassIdentity::Intrinsic { .. } => {
                 return ClassHierarchy {
                     ancestors: Vec::new(),
-                    descendants: None,
+                    descendants: brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer::incomplete(brokk_bifrost_core::analyzer::capabilities::HierarchyOpenReason::DescendantIndexUnavailable),
                     unresolved_base: false,
                     dynamic_attributes: true,
                 };
@@ -9814,7 +9928,10 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
             .map(ClassIdentity::Workspace)
             .collect::<Vec<_>>();
         let mut unresolved_base = false;
-        let overlay = workspace.analyzer().semantic_model_overlay();
+        let overlay = workspace
+            .analyzer()
+            .semantic_model_overlay_read()
+            .published();
         let mut external_cache = ExternalClassCache::default();
         for owner in std::iter::once(unit).chain(workspace_ancestors.iter()) {
             let direct = python.get_direct_ancestors(owner).definite().to_vec();
@@ -9839,28 +9956,38 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
             }
         }
 
-        let descendants = (|| {
-            let mut descendants = Vec::new();
+        let descendants = {
+            use brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer;
+            let mut answer = HierarchyAnswer::complete(Vec::new());
             let mut seen = HashSet::default();
-            let answer = python.get_direct_descendants(unit);
-            if !answer.is_complete() {
-                return None;
-            }
-            let mut pending = answer.edges;
-            while let Some(descendant) = pending.pop() {
-                if !seen.insert(descendant.clone()) {
+            let mut pending = vec![unit.clone()];
+            while let Some(owner) = pending.pop() {
+                if !seen.insert(owner.clone()) {
                     continue;
                 }
-                let answer = python.get_direct_descendants(&descendant);
-                if !answer.is_complete() {
-                    return None;
+                let direct = python.get_direct_descendants(&owner);
+                pending.extend(direct.edges.iter().cloned());
+                answer
+                    .edges
+                    .extend(direct.edges.into_iter().map(ClassIdentity::Workspace));
+                answer.ambiguous.extend(
+                    direct
+                        .ambiguous
+                        .into_iter()
+                        .map(|group| group.into_iter().map(ClassIdentity::Workspace).collect()),
+                );
+                for reason in direct.open {
+                    if !answer.open.contains(&reason) {
+                        answer.open.push(reason);
+                    }
                 }
-                pending.extend(answer.edges);
-                descendants.push(ClassIdentity::Workspace(descendant));
             }
-            descendants.sort_by(|left, right| left.qualified_name().cmp(right.qualified_name()));
-            Some(descendants)
-        })();
+            answer
+                .edges
+                .sort_by(|left, right| left.qualified_name().cmp(right.qualified_name()));
+            answer.edges.dedup();
+            answer
+        };
 
         let dynamic_attributes =
             std::iter::once(unit)
@@ -9986,9 +10113,10 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         if hierarchy.unresolved_base || hierarchy.dynamic_attributes {
             return false;
         }
-        let Some(descendants) = hierarchy.descendants.as_ref() else {
+        let descendants = &hierarchy.descendants.edges;
+        if !hierarchy.descendants.is_complete() {
             return false;
-        };
+        }
         std::iter::once(class)
             .chain(&hierarchy.ancestors)
             .chain(descendants)
@@ -10278,7 +10406,10 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
                     Ok(classes) => classes,
                     Err(reason) => return vec![NarrowingVerdict::Incomplete(reason); atoms.len()],
                 };
-                let overlay = workspace.analyzer().semantic_model_overlay();
+                let overlay = workspace
+                    .analyzer()
+                    .semantic_model_overlay_read()
+                    .published();
                 for class in &classes {
                     if !self.guard_classes_have_supported_instance_checks(
                         workspace,
@@ -10340,7 +10471,10 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
                 // classes or it is not. The named classes must still be the
                 // classes the source spells, which is the same proof
                 // `isinstance` needs of them.
-                let overlay = workspace.analyzer().semantic_model_overlay();
+                let overlay = workspace
+                    .analyzer()
+                    .semantic_model_overlay_read()
+                    .published();
                 for class in &classes {
                     if !self.guard_classes_have_supported_instance_checks(
                         workspace,
@@ -10447,7 +10581,10 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         // The same proof `narrowing_verdicts` needs of a guard's operands:
         // the names must denote the classes the source spells before either
         // arm may act on them.
-        let overlay = workspace.analyzer().semantic_model_overlay();
+        let overlay = workspace
+            .analyzer()
+            .semantic_model_overlay_read()
+            .published();
         if !self.guard_classes_have_supported_instance_checks(
             workspace,
             &classes,
@@ -10708,7 +10845,7 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         let hierarchy = self.class_hierarchy(workspace, &ClassIdentity::Workspace(owner.clone()));
         if hierarchy.unresolved_base
             || hierarchy.dynamic_attributes
-            || hierarchy.descendants.as_deref() != Some(&[])
+            || (!hierarchy.descendants.is_complete() || !hierarchy.descendants.edges.is_empty())
         {
             return Vec::new();
         }
@@ -10879,7 +11016,10 @@ fn python_descriptor_mro(
     };
     let python = python_analyzer(workspace);
     let workspace_ancestors = python.get_ancestors(unit).definite().to_vec();
-    let overlay = workspace.analyzer().semantic_model_overlay();
+    let overlay = workspace
+        .analyzer()
+        .semantic_model_overlay_read()
+        .published();
     let mut external_cache = ExternalClassCache::default();
     let mut mro = vec![class.clone()];
     mro.extend(
@@ -11146,6 +11286,49 @@ fn python_has_refinement_candidate(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11234: Python type request hits lost opening completion and retained operational fills"
+    )]
+    fn native_type_request_memo_completion_conformance() {
+        use super::*;
+        use brokk_bifrost_analysis::analyzer::usages::common::{
+            QueryMemoOwner, assert_memo_owner_conformance_for_test,
+        };
+        let project = InlineTestProject::with_language(Language::Python)
+            .file("models.py", "class Widget:\n    pass\n")
+            .file("app.py", "import models\nresult = models.Widget()\n")
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let file = project.file("app.py");
+        let python = python_analyzer(&workspace);
+        let prepared = current_indexed_prepared(python, &file).unwrap();
+        let callee = prepared
+            .tree()
+            .root_node()
+            .named_child(1)
+            .unwrap()
+            .named_child(0)
+            .unwrap()
+            .child_by_field_name("right")
+            .unwrap()
+            .child_by_field_name("function")
+            .unwrap();
+        let _scope =
+            brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::new(workspace.analyzer());
+        assert_memo_owner_conformance_for_test(
+            QueryMemoOwner::PythonType,
+            workspace.analyzer(),
+            || PythonDefinitionBatchOperation::new(python),
+            |query| {
+                format!(
+                    "{:?}",
+                    query.constructed_class_definition(&workspace, &file, &prepared, callee)
+                )
+            },
+            |query| query.retains_request_with_receipt(),
+        );
+    }
 
     use crate::analyzer::python::type_flow::PythonAnalyzer;
 
@@ -11957,6 +12140,7 @@ mod tests {
     /// reached through self or cls stay uncertain, and anything else is not a
     /// constructor.
     #[test]
+    #[hardwon("#10621: transparent module-root parentheses lost native constructor class proofs")]
     fn constructed_class_probes_only_name_path_callees() {
         enum Expected {
             Class(&'static str),
@@ -11969,10 +12153,40 @@ mod tests {
                 "from models import Widget\ndef make():\n    return (Widget)()\n",
                 Expected::Class("models.Widget"),
             ),
-            // The producer publishes no lexical route for a parenthesized
-            // attribute root, so the native definition stays open (#10621).
             (
                 "import models\ndef make():\n    return (models).Widget()\n",
+                Expected::Class("models.Widget"),
+            ),
+            (
+                "import models\ndef make():\n    return (((models))).Widget()\n",
+                Expected::Class("models.Widget"),
+            ),
+            (
+                "import models as alias\ndef make():\n    return ((alias)).Widget()\n",
+                Expected::Class("models.Widget"),
+            ),
+            (
+                "import models\nalias = models\ndef make():\n    return ((alias)).Widget()\n",
+                Expected::Class("models.Widget"),
+            ),
+            (
+                "import models\nmodels = object()\ndef make():\n    return (models).Widget()\n",
+                Expected::NotApplicable,
+            ),
+            (
+                "import models\ndef make(models):\n    return ((models)).Widget()\n",
+                Expected::NotApplicable,
+            ),
+            (
+                "import models\ndef make():\n    result = (models).Widget()\n    models = None\n    return result\n",
+                Expected::NotApplicable,
+            ),
+            (
+                "import models\ndef make():\n    return (models.helper()).Widget()\n",
+                Expected::NotApplicable,
+            ),
+            (
+                "import models\ndef make():\n    return (models[0]).Widget()\n",
                 Expected::NotApplicable,
             ),
             (
@@ -11993,6 +12207,10 @@ mod tests {
             ),
             (
                 "import models\ndef make():\n    return models.helper()\n",
+                Expected::NotApplicable,
+            ),
+            (
+                "import models\ndef make():\n    return (models).helper()\n",
                 Expected::NotApplicable,
             ),
             (
@@ -12068,6 +12286,43 @@ mod tests {
             }
             match expected {
                 Expected::Class(expected) => {
+                    let prepared = prepared_for_procedure(&workspace, &procedure, &file)
+                        .expect("fixture syntax");
+                    let span = semantics
+                        .source_mapping(semantics.value(call.callee).expect("callee").source)
+                        .expect("callee mapping")
+                        .locator
+                        .anchor()
+                        .span();
+                    let callee =
+                        brokk_bifrost_core::analyzer::tree_walk::unwrap_parenthesized_expression(
+                            super::node_at_span(&prepared, span).expect("callee node"),
+                        );
+                    let _scope = brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::new(
+                        workspace.analyzer(),
+                    );
+                    let python = super::python_analyzer(&workspace);
+                    let mut operation = super::PythonDefinitionBatchOperation::new(python);
+                    let (definition, _) = super::definition_at_range_with_request(
+                        operation.open_type_query(&workspace),
+                        workspace.analyzer(),
+                        &file,
+                        prepared.source(),
+                        prepared.tree(),
+                        callee.start_byte()..callee.end_byte(),
+                        None,
+                    )
+                    .expect("native definition query")
+                    .expect("native definition available");
+                    assert_eq!(
+                        definition.status,
+                        super::DefinitionLookupStatus::Resolved,
+                        "{consumer}: {definition:?}"
+                    );
+                    assert!(definition.lexical_definition.is_none(), "{definition:?}");
+                    assert_eq!(definition.definitions.len(), 1, "{definition:?}");
+                    assert_eq!(definition.definitions[0].fq_name_str(), expected);
+                    assert!(definition.definitions[0].is_class());
                     let ClassSeed::Class(class) = &seed else {
                         panic!("{consumer}: expected a constructed class, got {seed:?}");
                     };

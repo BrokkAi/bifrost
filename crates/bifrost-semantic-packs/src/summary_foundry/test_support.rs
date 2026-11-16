@@ -18,7 +18,7 @@ pub(super) fn transfer(input: AuthoredSummaryInput) -> AuthoredSummaryTransfer {
     AuthoredSummaryTransfer {
         input,
         exit_kind: AuthoredSummaryExitKind::Normal,
-        output: AuthoredSummaryOutput::NormalReturn {},
+        output: AuthoredSummaryOutput::NormalReturn { path: None },
         value_transfer: None,
     }
 }

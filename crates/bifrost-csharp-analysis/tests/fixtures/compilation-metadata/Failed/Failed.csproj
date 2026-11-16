@@ -1,0 +1,1 @@
+<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><Gate>true</Gate></PropertyGroup><Import Project="$(Missing)/Unknown.props"/><PropertyGroup><Gate>false</Gate></PropertyGroup><ItemGroup><Using Include="Failed.Wrong" Condition="'$(Gate)' == 'true'"/></ItemGroup></Project>

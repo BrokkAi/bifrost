@@ -65,16 +65,19 @@ impl StructuralNodeIndex {
                     });
                 }
             };
-        Self::for_source_with_forest(spec, prepared, &forest, max_work_items, cancellation)
+        Self::for_source_with_forest(spec, prepared, &forest, max_work_items, cancellation, None)
     }
 
     #[doc(hidden)]
-    pub fn for_source_with_forest(
+    pub fn for_source_with_forest<'tree>(
         spec: &dyn StructuralSpec,
-        prepared: &PreparedSyntaxTree,
-        forest: &brokk_bifrost_core::analyzer::structural::spec::EmbeddedSyntaxForest,
+        prepared: &'tree PreparedSyntaxTree,
+        forest: &'tree brokk_bifrost_core::analyzer::structural::spec::EmbeddedSyntaxForest,
         max_work_items: usize,
         cancellation: &CancellationToken,
+        hooks: Option<
+            &dyn brokk_bifrost_core::analyzer::structural::spec::StructuralFileHooks<'tree>,
+        >,
     ) -> Result<StructuralNodeIndexOutcome, SemanticProviderError> {
         let grammar = parser_language_for_dialect(prepared.dialect()).ok_or_else(|| {
             SemanticProviderError::internal("semantic lowering has no structural parser language")
@@ -87,6 +90,7 @@ impl StructuralNodeIndex {
             prepared.source(),
             max_work_items,
             Some(cancellation),
+            hooks,
         );
         let (facts, node_ids) = match extracted {
             LimitedFileFacts::CompleteWithNodeIndex { facts, node_ids } => (facts, node_ids),

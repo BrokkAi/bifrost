@@ -27,6 +27,7 @@ These pages therefore spell every such id as `<public-id>` and assert the stable
 - [Reference Traversal Across Languages](/code-query-tutorials/reference-traversal/)
 - [Bounded Receiver Traversal](/code-query-tutorials/receiver-traversal/)
 - [Python](/code-query-tutorials/python/)
+- [Python Inheritance Inference](/code-query-tutorials/python-inheritance-inference/)
 - [Python Parser Recovery](/code-query-tutorials/python-recovery/)
 - [Java](/code-query-tutorials/java/)
 - [JavaScript](/code-query-tutorials/javascript/)

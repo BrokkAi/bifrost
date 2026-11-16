@@ -38,6 +38,43 @@ use crate::analyzer::semantic::oracle::value_flow::ValueFlowSnapshot;
 
 /// Procedure-local and candidate-specific value-flow answers.
 pub trait ValueFlowOracle {
+    /// The single owner of a procedure's raw-versus-selected payload decision.
+    fn selected_payload_projection(
+        &self,
+        _procedure: &ProcedureHandle,
+        _request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<super::SelectedPayloadProjection>, SemanticProviderError> {
+        Ok(SemanticOutcome::Complete {
+            value: Default::default(),
+            work: Default::default(),
+        })
+    }
+
+    /// Read a selection key without retaining the proof's temporary payload.
+    fn payload_projection_identity(
+        &self,
+        procedure: &ProcedureHandle,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<
+        SemanticOutcome<Option<crate::analyzer::semantic::StableDigest>>,
+        SemanticProviderError,
+    > {
+        let mark = request.budget.scratch_mark();
+        let outcome = self.selected_payload_projection(procedure, request);
+        request.budget.release_scratch_since(&mark);
+        Ok(outcome?.map(|projection| projection.identity))
+    }
+
+    fn payload_constructor_output(
+        &self,
+        call: &CallSiteHandle,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<Option<super::ValueFlowEndpoint>>, SemanticProviderError> {
+        Ok(self
+            .selected_payload_projection(call.procedure(), request)?
+            .map(|projection| projection.constructor_output(call)))
+    }
+
     fn procedure_relations(
         &self,
         procedure: &ProcedureHandle,

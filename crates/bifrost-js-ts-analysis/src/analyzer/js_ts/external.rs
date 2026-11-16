@@ -26,6 +26,17 @@ use brokk_bifrost_analysis::analyzer::dependency_support::failed_dependency_pack
 
 use brokk_bifrost_analysis::analyzer::dependency_support::read_bounded_bytes;
 
+use brokk_bifrost_analysis::analyzer::dependency_support::select_dependency_input_snapshots;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::{
+    BoundedDependencyDiagnostics, DependencyEvidence, DependencyEvidenceGapKind,
+    DependencyEvidenceKind, DependencyFileEvidenceLimits,
+};
+
+use crate::analyzer::js_ts::dependency_evidence::{
+    is_js_ts_dependency_input, js_ts_selected_dependency_file_evidence,
+};
+
 use brokk_bifrost_analysis::analyzer::dependency_support::resolve_dependency_path as resolve;
 #[cfg(test)]
 use producer::ExternalArtifactPackProducer;
@@ -329,22 +340,45 @@ pub fn resolve_js_ts_semantic_pack_dependencies(
         }
     }
 
+    let mut lock_diagnostics = BoundedDependencyDiagnostics::new(limits);
+    let languages = project.analyzer_languages();
+    let lock_languages = [Language::JavaScript, Language::TypeScript]
+        .into_iter()
+        .filter(|language| languages.contains(language))
+        .collect::<Vec<_>>();
+    if !lock_languages.is_empty() {
+        let (mut locked, lock_cancelled) = npm_lock_activation_rows(
+            project,
+            &lock_languages,
+            limits,
+            cancellation,
+            &mut lock_diagnostics,
+        );
+        if lock_cancelled {
+            return cancelled_outcome();
+        }
+        metadata_inputs_considered = metadata_inputs_considered.saturating_add(locked.len());
+        dependencies.append(&mut locked);
+    }
+
     declare_external_discovery_reads_complete();
     dependencies.sort_by(|left, right| left.id.cmp(&right.id));
     dependencies.dedup_by(|left, right| left.id == right.id);
+    let (lock_diagnostics, lock_suppressed) = lock_diagnostics.finish();
     // Every diagnostic below is mapped to error severity, so the truncated
     // tail is a count of dropped errors. Dropped dependencies are not
     // diagnostics and join the non-error bucket.
     let mut suppressed_diagnostics = SuppressedDiagnostics {
-        warnings: 0,
-        errors: diagnostics.len().saturating_sub(limits.max_diagnostics),
+        warnings: lock_suppressed.warnings,
+        errors: lock_suppressed.errors
+            + (diagnostics.len() + lock_diagnostics.len()).saturating_sub(limits.max_diagnostics),
     };
     diagnostics.truncate(limits.max_diagnostics);
     if dependencies.len() > limits.max_dependencies {
         suppressed_diagnostics.warnings = dependencies.len() - limits.max_dependencies;
         dependencies.truncate(limits.max_dependencies);
     }
-    let diagnostics: Vec<_> = diagnostics
+    let mut diagnostics: Vec<_> = diagnostics
         .into_iter()
         .map(|diagnostic| DependencyPackDiagnostic {
             severity: DependencyPackDiagnosticSeverity::Error,
@@ -354,7 +388,10 @@ pub fn resolve_js_ts_semantic_pack_dependencies(
             message: bounded_message(diagnostic.message, limits.max_diagnostic_message_bytes),
         })
         .collect();
+    let room = limits.max_diagnostics.saturating_sub(diagnostics.len());
+    diagnostics.extend(lock_diagnostics.into_iter().take(room));
     let mut outcome = DependencyDiscoveryOutcome {
+        incomplete_reason: None,
         profile: DependencyDiscoveryProfile {
             metadata_inputs_considered,
             dependencies_resolved: dependencies.len(),
@@ -366,7 +403,6 @@ pub fn resolve_js_ts_semantic_pack_dependencies(
         suppressed_diagnostics,
         cancelled: false,
     };
-    let languages = project.analyzer_languages();
     if languages.contains(&Language::TypeScript) {
         let expectation = typescript_stdlib_expectation(&outcome);
         outcome.expect_standard_library_pack(expectation);
@@ -381,6 +417,204 @@ pub fn resolve_js_ts_semantic_pack_dependencies(
         ));
     }
     outcome
+}
+
+/// The public npm registry hosts whose tarballs name a published package
+/// version. Other registries and git, file, link or workspace sources do not.
+const NPM_PUBLIC_REGISTRIES: [&str; 2] = [
+    "https://registry.npmjs.org/",
+    "https://registry.yarnpkg.com/",
+];
+
+/// Whether a complete lock row's source names the public npm registry. pnpm
+/// omits the tarball for registry packages and Yarn Berry spells registry
+/// resolutions `<name>@npm:<version>`; every other spelling is a non-registry
+/// source, which activates nothing.
+fn npm_registry_source(row: &DependencyEvidence) -> bool {
+    let condition = |kind: &str| {
+        row.conditions
+            .iter()
+            .any(|condition| condition.kind == kind)
+    };
+    if condition("workspace_link") {
+        return false;
+    }
+    match row.source.as_deref() {
+        None => true,
+        Some(source) => {
+            NPM_PUBLIC_REGISTRIES
+                .iter()
+                .any(|registry| source.starts_with(registry))
+                || row
+                    .exact_version
+                    .as_deref()
+                    .is_some_and(|version| source == format!("{}@npm:{version}", row.package))
+        }
+    }
+}
+
+/// Package activation rows for the exact npm packages the workspace's
+/// manifests lock (#11365).
+///
+/// A complete `locked` row that a workspace manifest owns (its importer edge
+/// names the dependency under its own package name) and whose source is the
+/// public npm registry becomes one artifact-less `npm` package row per
+/// analyzed JS/TS language, naming the package and its exact version. Such a
+/// row reads no `node_modules` and produces nothing: it selects only a
+/// compatible installed or reviewed workspace pack. Fail-closed cases
+/// activate nothing:
+/// - raw lock-table rows no manifest owns, incomplete rows, workspace links,
+///   git, file and other-registry sources, and non-semver versions;
+/// - an `npm:` alias, whose import specifier is not the package name;
+/// - a package the workspace locks at more than one version, counting aliased
+///   instances, because activation is workspace-wide and one version's models
+///   would apply to code that loads another. That ambiguity is reported as
+///   `npm.lockfile.ambiguous_activation`.
+///
+/// Returns the rows and whether acquisition was cancelled.
+fn npm_lock_activation_rows(
+    project: &dyn Project,
+    languages: &[Language],
+    limits: &DependencyPackLimits,
+    cancellation: Option<&CancellationToken>,
+    diagnostics: &mut BoundedDependencyDiagnostics,
+) -> (Vec<ResolvedDependency>, bool) {
+    let (selected, _, cancelled) = select_dependency_input_snapshots(
+        project,
+        "npm",
+        "npm",
+        |path| {
+            is_js_ts_dependency_input(path)
+                && !path
+                    .components()
+                    .any(|component| component.as_os_str() == "node_modules")
+        },
+        limits,
+        cancellation,
+        diagnostics,
+    );
+    if cancelled {
+        return (Vec::new(), true);
+    }
+    let evidence = js_ts_selected_dependency_file_evidence(
+        &selected,
+        &DependencyFileEvidenceLimits::default(),
+    );
+    for gap in &evidence.gaps {
+        // A row limit may have omitted lock rows; other gaps are interpretation
+        // limits of rows that then activate nothing, and stay on the files-only
+        // dependency-evidence surface.
+        if gap.kind == DependencyEvidenceGapKind::Limit {
+            diagnostics.push(DependencyPackDiagnostic {
+                severity: DependencyPackDiagnosticSeverity::Error,
+                code: "limit.npm_lock_rows".to_owned(),
+                dependency_id: None,
+                location: Some(slash_path(&gap.build_file)),
+                message: gap.message.clone(),
+            });
+        }
+    }
+    let alias = |row: &DependencyEvidence| {
+        row.conditions
+            .iter()
+            .find(|condition| condition.kind == "alias")
+            .map(|condition| condition.value.clone())
+    };
+    let owned = evidence.rows.iter().filter(|row| {
+        row.ecosystem == "npm"
+            && row.kind == DependencyEvidenceKind::Locked
+            && row.complete
+            && row.declared_by.is_some()
+    });
+    let mut possible_versions = BTreeMap::<&str, BTreeSet<&str>>::new();
+    let mut activating = BTreeMap::<(&str, &str), Vec<&DependencyEvidence>>::new();
+    for row in owned {
+        let Some(version) = row.exact_version.as_deref() else {
+            continue;
+        };
+        possible_versions
+            .entry(row.package.as_str())
+            .or_default()
+            .insert(version);
+        if alias(row).as_deref() == Some(row.package.as_str()) && npm_registry_source(row) {
+            activating
+                .entry((row.package.as_str(), version))
+                .or_default()
+                .push(row);
+        }
+    }
+    let mut rows = Vec::new();
+    for ((package, version), owners) in activating {
+        let versions = &possible_versions[package];
+        if versions.len() > 1 {
+            diagnostics.push(DependencyPackDiagnostic {
+                severity: DependencyPackDiagnosticSeverity::Error,
+                code: "npm.lockfile.ambiguous_activation".to_owned(),
+                dependency_id: None,
+                location: None,
+                message: format!(
+                    "workspace manifests lock npm package {package} at versions {versions:?}; no version activates package-scoped semantic models"
+                ),
+            });
+            continue;
+        }
+        let Ok(parsed) = Version::parse(version) else {
+            continue;
+        };
+        for row in owners {
+            let owner = row
+                .declared_by
+                .as_deref()
+                .expect("owned rows name their manifest");
+            let mut provenance = vec![
+                DependencyProvenance {
+                    key: "npm.activation".to_owned(),
+                    value: "exact_lock_row".to_owned(),
+                },
+                DependencyProvenance {
+                    key: "npm.lockfile".to_owned(),
+                    value: slash_path(&row.build_file),
+                },
+                DependencyProvenance {
+                    key: "npm.lockfile_digest".to_owned(),
+                    value: row.source_digest.clone(),
+                },
+                DependencyProvenance {
+                    key: "package".to_owned(),
+                    value: package.to_owned(),
+                },
+                DependencyProvenance {
+                    key: "version".to_owned(),
+                    value: version.to_owned(),
+                },
+            ];
+            provenance.sort_by(|left, right| left.key.cmp(&right.key));
+            for language in languages {
+                let language = language.config_label();
+                rows.push(ResolvedDependency {
+                    id: format!("npm:lock:{language}:{owner}:{package}@{version}"),
+                    evidence: SemanticModelActivationEvidence {
+                        language: language.to_owned(),
+                        ecosystem: "npm".to_owned(),
+                        package: Some(CatalogCoordinate {
+                            name: package.to_owned(),
+                            version: Some(parsed.clone()),
+                        }),
+                        module: None,
+                        toolchain: None,
+                        target: None,
+                        configuration: None,
+                        artifact_sha256: None,
+                    },
+                    provenance: provenance.clone(),
+                    artifacts: Vec::new(),
+                    scope: row.scope,
+                    declared_by: Some(owner.to_owned()),
+                });
+            }
+        }
+    }
+    (rows, false)
 }
 
 /// What TypeScript discovery concluded about the TypeScript standard-library
@@ -406,7 +640,9 @@ fn typescript_stdlib_expectation(
         .dependencies
         .iter()
         .filter(is_typescript)
-        .filter(|dependency| dependency.artifacts.is_empty())
+        .filter(|dependency| {
+            dependency.artifacts.is_empty() && dependency.evidence.configuration.is_some()
+        })
         .map(|dependency| dependency.id.clone())
         .collect::<Vec<_>>();
     if !library_ids.is_empty() {
@@ -1435,6 +1671,16 @@ impl DependencyPackAdapter for JsTsDependencyPackAdapter {
         Producer::for_name("bifrost-typescript-declaration")
     }
 
+    /// An npm lock row names a package coordinate and no artifact, so it
+    /// selects only compatible installed or reviewed workspace packs (#11365).
+    /// The TypeScript standard-library rows also carry no artifact, but they
+    /// name a library configuration and select the declared stdlib pack.
+    fn installed_packs_only(&self, dependency: &ResolvedDependency) -> bool {
+        dependency.artifacts.is_empty()
+            && dependency.evidence.package.is_some()
+            && dependency.evidence.configuration.is_none()
+    }
+
     fn can_produce(&self, dependency: &ResolvedDependency) -> bool {
         if dependency.evidence.language == "typescript"
             && dependency.evidence.ecosystem == "npm"
@@ -2070,6 +2316,7 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
             hierarchy,
             aliases: Vec::new(),
             extension_surfaces: Vec::new(),
+            rust_stability: None,
             guard: None,
             locator: source_locator(&self.artifact_path, name, node),
         });
@@ -2103,6 +2350,7 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
                 .map_or(0, |signature| signature.type_parameters.len()),
             parameter_types: &parameter_types,
             parameter_variadics: &[],
+            extension_receiver: None,
             return_type: draft
                 .signature
                 .as_ref()
@@ -2132,6 +2380,7 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
             extension_receiver: None,
             extension_receiver_constraints: Vec::new(),
             aliases: Vec::new(),
+            rust_stability: None,
             guard: None,
             locator: source_locator(&self.artifact_path, &draft.name, node),
         });
@@ -2723,7 +2972,10 @@ fn resolve_locked_package(
     let canonical_package = package_path.canonicalize().map_err(|error| {
         failure(
             "npm.package.missing",
-            format!("installed package directory is unavailable: {error}"),
+            format!(
+                "installed package directory is unavailable: {:?}",
+                error.kind()
+            ),
         )
     })?;
     if !is_canonical_spelling(&package_path, &canonical_package) {

@@ -104,10 +104,18 @@ pub fn build_direct_descendant_index_by_unit<P>(
 where
     P: TypeHierarchyProvider + ?Sized,
 {
-    let mut nodes = analyzer
-        .all_declarations()
-        .filter(|candidate| candidate.is_class() && scope.admits(candidate))
-        .collect::<Vec<_>>();
+    let mut nodes = Vec::new();
+    for candidate in analyzer.all_declarations().filter(CodeUnit::is_class) {
+        if match scope.admits(&candidate) {
+            Ok(value) => value,
+            Err(reason) => {
+                let _unavailable = reason;
+                return None;
+            }
+        } {
+            nodes.push(candidate);
+        }
+    }
     nodes.sort();
     let mut index_by_node: HashMap<_, _> = nodes
         .iter()
@@ -121,17 +129,22 @@ where
         .collect();
     let candidates = nodes.clone();
     let mut edges = Vec::new();
+    let mut open_candidates = Vec::new();
     for candidate in candidates {
         if scope.cancellation().is_cancelled() {
             return None;
         }
         let descendant = index_by_node[&candidate];
-        for ancestor in provider
+        let answer = provider
             .get_direct_ancestors_within(&candidate, scope)
-            .ok()?
-            .definite()
-            .to_vec()
-        {
+            .ok()?;
+        if answer.stopped_short() {
+            return None;
+        }
+        if !answer.is_complete() {
+            open_candidates.push(candidate.clone());
+        }
+        for ancestor in answer.edges {
             let ancestor = *index_by_node.entry(ancestor.clone()).or_insert_with(|| {
                 let index = u32::try_from(nodes.len())
                     .expect("hierarchy index declarations must fit in a u32");
@@ -141,11 +154,10 @@ where
             edges.push((ancestor, descendant));
         }
     }
-    Some(DirectDescendantIndex::from_indexed_nodes(
-        nodes,
-        index_by_node,
-        edges,
-    ))
+    Some(
+        DirectDescendantIndex::from_indexed_nodes(nodes, index_by_node, edges)
+            .with_open_candidates(open_candidates),
+    )
 }
 
 fn collect_heritage_clause_types(

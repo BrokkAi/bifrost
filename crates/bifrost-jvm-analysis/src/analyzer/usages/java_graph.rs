@@ -656,6 +656,7 @@ where
                 .map(class_range_index_from_state)
                 .unwrap_or_else(|| ClassRangeIndex::build(analyzer, file));
             parse_and_collect_with_declarations_and_domain(
+                analyzer,
                 file,
                 domain,
                 ParseSpec::whole(&language),
@@ -861,6 +862,65 @@ mod relational_inverted_tests {
             !graph.edges.keys().any(|(_, callee)| callee == &triple_fqn),
             "the commented two-argument call must not resolve through TripleResult"
         );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10089: the inverse graph typed receivers of creations with no applicable constructor"
+    )]
+    fn java_inverse_receiver_skips_erroneous_creations() {
+        let project = InlineTestProject::with_language(Language::Java)
+            .file(
+                "app/Counter.java",
+                "package app;\n\
+                 public class Counter {\n\
+                     public Counter(int n) {}\n\
+                     public void foo() {}\n\
+                     public Counter self() { return this; }\n\
+                 }\n",
+            )
+            .file(
+                "app/Callers.java",
+                "package app;\n\
+                 public class Callers {\n\
+                     void refused() { new Counter(true).foo(); }\n\
+                     void refusedChain() { new Counter(true).self().foo(); }\n\
+                     void refusedVar() { var c = new Counter(true); c.foo(); }\n\
+                     void valid() { new Counter(1).foo(); }\n\
+                     void validChain() { new Counter(1).self().foo(); }\n\
+                 }\n",
+            )
+            .build();
+        let analyzer = JavaAnalyzer::from_project(project.project().clone());
+        let fqn = |name: &str| {
+            analyzer
+                .get_definitions(name)
+                .into_iter()
+                .find(CodeUnit::is_function)
+                .unwrap_or_else(|| panic!("fixture declares {name}"))
+                .fq_name()
+        };
+        let foo = fqn("app.Counter.foo");
+        let mut interesting = HashSet::from_iter([foo.clone()]);
+        for caller in [
+            "refused",
+            "refusedChain",
+            "refusedVar",
+            "valid",
+            "validChain",
+        ] {
+            interesting.insert(fqn(&format!("app.Callers.{caller}")));
+        }
+        let graph = build_java_usage_edges(&analyzer, &interesting, |_| true)
+            .expect("Java inverse usage graph");
+        let mut callers = graph
+            .edges
+            .keys()
+            .filter(|(_, callee)| callee == &foo)
+            .map(|(caller, _)| caller.rsplit('.').next().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        callers.sort();
+        assert_eq!(callers, ["valid", "validChain"]);
     }
 
     #[test]

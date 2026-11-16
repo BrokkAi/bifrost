@@ -68,7 +68,7 @@ pub(crate) fn resolve_php_type_bounded(
     };
     let candidates = support.fqn(&resolution.fqn);
     if candidates.is_empty() {
-        if let Some(overlay) = analyzer.semantic_model_overlay()
+        if let Some(overlay) = analyzer.semantic_model_overlay_read().published()
             && let PhpOverlayType::Indexed(symbol_id) =
                 php_overlay_type(Some(&overlay), &resolution.fqn)
         {

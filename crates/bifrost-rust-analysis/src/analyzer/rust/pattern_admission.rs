@@ -10,13 +10,14 @@ use super::call_conversion::selected_type::{
 use std::sync::Arc;
 
 use brokk_bifrost_analysis::analyzer::languages::{
-    AdmittedTupleBinding, SelectedBindingUnavailable, SelectedTupleBinding,
+    AdmittedTupleBinding, SelectedBindingUnavailable, SelectedPatternSource, SelectedTupleBinding,
     SelectedTupleBindingReads,
 };
+use brokk_bifrost_analysis::analyzer::semantic::type_flow::source_span_for_node as pattern_span;
 use brokk_bifrost_analysis::analyzer::semantic::type_flow::validate_prepared_syntax_source_for_procedure;
 use brokk_bifrost_analysis::analyzer::semantic::{
     GuardedPatternProjection, PatternProjectionStep, ProcedureHandle, SemanticProviderError,
-    SemanticRequest,
+    SemanticRequest, SourceSpan,
 };
 use brokk_bifrost_analysis::analyzer::semantic_model::{TupleFieldSlot, TypeRef};
 use brokk_bifrost_analysis::analyzer::structural::provider::StructuralSyntaxLimitedOutcome;
@@ -102,10 +103,111 @@ fn route_unavailable(request: &SemanticRequest<'_>, external: bool) -> SelectedT
     })
 }
 
+/// Validate every recorded step before selecting the inner field. No step
+/// changes the meaning of the candidate's root whole value.
+fn selected_field_path<'tree>(
+    mut node: Node<'tree>,
+    candidate: &GuardedPatternProjection,
+    selected: &std::ops::Range<usize>,
+    binder: SourceSpan,
+    source: &str,
+) -> Option<(Node<'tree>, u32, usize, Node<'tree>)> {
+    if candidate.path.len() != usize::from(candidate.declared_path_len) {
+        return None;
+    }
+    let mut selected_step = None;
+    for (index, step) in candidate.path.iter().enumerate() {
+        let parent = node;
+        node = match (node.kind(), step) {
+            ("tuple_struct_pattern" | "tuple_pattern", PatternProjectionStep::Tuple(ordinal)) => {
+                let type_id = node.child_by_field_name("type").map(|ty| ty.id());
+                let mut cursor = node.walk();
+                let fields = node
+                    .children(&mut cursor)
+                    .filter(|child| {
+                        (child.is_named() || child.kind() == "_")
+                            && !child.is_extra()
+                            && Some(child.id()) != type_id
+                    })
+                    .collect::<Vec<_>>();
+                if fields
+                    .iter()
+                    .any(|field| field.kind() == "remaining_field_pattern")
+                {
+                    return None;
+                }
+                let child = *fields.get(*ordinal as usize)?;
+                if parent.kind() == "tuple_struct_pattern"
+                    && child.start_byte() == selected.start
+                    && child.end_byte() == selected.end
+                {
+                    selected_step = Some((parent, *ordinal, index));
+                }
+                child
+            }
+            ("struct_pattern", PatternProjectionStep::Named(name)) => {
+                let mut cursor = node.walk();
+                let field = node.named_children(&mut cursor).find(|field| {
+                    field.kind() == "field_pattern"
+                        && field.child_by_field_name("name").is_some_and(|field_name| {
+                            // Compare only an AST-selected field identifier's value.
+                            field_name.utf8_text(source.as_bytes()).ok() == Some(name.as_ref())
+                        })
+                });
+                let field = field?;
+                field.child_by_field_name("pattern").or_else(|| {
+                    field
+                        .child_by_field_name("name")
+                        .filter(|name| name.kind() == "shorthand_field_identifier")
+                })?
+            }
+            _ => return None,
+        };
+    }
+    // The full path ends at this exact recorded binder, never at another
+    // identifier in the same selected field or at an aggregate/wildcard.
+    let identifier = super::semantic::identity_binding_identifier(node)?;
+    let (constructor, ordinal, split) = selected_step?;
+    (pattern_span(identifier) == binder).then_some((constructor, ordinal, split, identifier))
+}
+
 pub(super) fn admit_selected_tuple_binding(
     workspace: &WorkspaceAnalyzer,
     procedure: &ProcedureHandle,
     candidate: &GuardedPatternProjection,
+    snapshot: Option<
+        &brokk_bifrost_analysis::analyzer::semantic_model::ActiveSemanticModelSnapshot,
+    >,
+    request: &mut SemanticRequest<'_>,
+) -> Result<SelectedTupleBinding, SemanticProviderError> {
+    admit_pattern(workspace, procedure, candidate, None, snapshot, request)
+}
+
+pub(super) fn admit_selected_pattern_source(
+    workspace: &WorkspaceAnalyzer,
+    procedure: &ProcedureHandle,
+    candidate: &GuardedPatternProjection,
+    field: std::ops::Range<usize>,
+    snapshot: Option<
+        &brokk_bifrost_analysis::analyzer::semantic_model::ActiveSemanticModelSnapshot,
+    >,
+    request: &mut SemanticRequest<'_>,
+) -> Result<SelectedTupleBinding, SemanticProviderError> {
+    admit_pattern(
+        workspace,
+        procedure,
+        candidate,
+        Some(field),
+        snapshot,
+        request,
+    )
+}
+
+fn admit_pattern(
+    workspace: &WorkspaceAnalyzer,
+    procedure: &ProcedureHandle,
+    candidate: &GuardedPatternProjection,
+    selected_field: Option<std::ops::Range<usize>>,
     snapshot: Option<
         &brokk_bifrost_analysis::analyzer::semantic_model::ActiveSemanticModelSnapshot,
     >,
@@ -130,12 +232,9 @@ pub(super) fn admit_selected_tuple_binding(
         layout: None,
         layout_complete: false,
     };
-    if candidate.path.len() != 1 || candidate.declared_path_len != 1 {
+    if selected_field.is_none() && (candidate.path.len() != 1 || candidate.declared_path_len != 1) {
         return Ok(reject("only one tuple field step is supported", reads));
     }
-    let PatternProjectionStep::Tuple(ordinal) = &candidate.path[0] else {
-        return Ok(reject("field is not a tuple ordinal", reads));
-    };
     let file = ProjectFile::new(
         analyzer.project().root(),
         procedure.artifact().key().path().as_path(),
@@ -175,18 +274,47 @@ pub(super) fn admit_selected_tuple_binding(
         return Ok(reject("pattern source mapping unavailable", reads));
     };
     let span = mapping.locator.anchor().span();
-    let pattern = match exact_node(
-        tree.root_node(),
-        "tuple_struct_pattern",
-        span.start_byte() as usize,
-        span.end_byte() as usize,
-    ) {
-        Ok(Some(node)) => node,
-        Ok(None) => return Ok(reject("pattern source is not exact", reads)),
-        Err(()) => {
-            return Ok(SelectedTupleBinding::Unavailable(
-                SelectedBindingUnavailable::LimitExceeded("syntax walk limit"),
-            ));
+    let Some(pattern) = tree
+        .root_node()
+        .named_descendant_for_byte_range(span.start_byte() as usize, span.end_byte() as usize)
+        .filter(|node| {
+            node.start_byte() == span.start_byte() as usize
+                && node.end_byte() == span.end_byte() as usize
+                && matches!(
+                    node.kind(),
+                    "tuple_struct_pattern" | "tuple_pattern" | "struct_pattern"
+                )
+        })
+    else {
+        return Ok(reject("pattern source is not exact", reads));
+    };
+    let (pattern, ordinal, path_split, selected_binder) = match selected_field.as_ref() {
+        Some(field) => {
+            let Some(binder) = procedure
+                .semantics()
+                .source_mapping(candidate.binder_source)
+            else {
+                return Ok(reject("binder source mapping unavailable", reads));
+            };
+            let Some(selected) = selected_field_path(
+                pattern,
+                candidate,
+                field,
+                binder.locator.anchor().span(),
+                &source,
+            ) else {
+                return Ok(reject(
+                    "selected field does not match the recorded pattern path",
+                    reads,
+                ));
+            };
+            (selected.0, selected.1, selected.2, Some(selected.3))
+        }
+        None => {
+            let PatternProjectionStep::Tuple(ordinal) = &candidate.path[0] else {
+                return Ok(reject("field is not a tuple ordinal", reads));
+            };
+            (pattern, *ordinal, 0, None)
         }
     };
     let Some(constructor) = pattern.child_by_field_name("type") else {
@@ -207,7 +335,7 @@ pub(super) fn admit_selected_tuple_binding(
     {
         return Ok(reject("rest pattern has no fixed ordinal", reads));
     }
-    let Some(field_pattern) = fields.get(*ordinal as usize) else {
+    let Some(field_pattern) = fields.get(ordinal as usize) else {
         return Ok(reject(
             "field ordinal is outside the written pattern",
             reads,
@@ -220,18 +348,22 @@ pub(super) fn admit_selected_tuple_binding(
         return Ok(reject("binder source mapping unavailable", reads));
     };
     let binder_span = binder_mapping.locator.anchor().span();
-    let binder_node = match exact_node(
-        *field_pattern,
-        "identifier",
-        binder_span.start_byte() as usize,
-        binder_span.end_byte() as usize,
-    ) {
-        Ok(Some(node)) => node,
-        Ok(None) => return Ok(reject("binder is not the selected field identifier", reads)),
-        Err(()) => {
-            return Ok(SelectedTupleBinding::Unavailable(
-                SelectedBindingUnavailable::LimitExceeded("syntax walk limit"),
-            ));
+    let binder_node = if let Some(binder) = selected_binder {
+        binder
+    } else {
+        match exact_node(
+            *field_pattern,
+            "identifier",
+            binder_span.start_byte() as usize,
+            binder_span.end_byte() as usize,
+        ) {
+            Ok(Some(node)) => node,
+            Ok(None) => return Ok(reject("binder is not the selected field identifier", reads)),
+            Err(()) => {
+                return Ok(SelectedTupleBinding::Unavailable(
+                    SelectedBindingUnavailable::LimitExceeded("syntax walk limit"),
+                ));
+            }
         }
     };
     let mut binding_shape = binder_node;
@@ -239,23 +371,18 @@ pub(super) fn admit_selected_tuple_binding(
         let Some(parent) = binding_shape.parent() else {
             return Ok(reject("binder ancestry unavailable", reads));
         };
-        if parent.kind() == "ref_pattern" {
+        if super::semantic::pattern_binds_by_reference(parent) {
             return Ok(reject("binder is by reference", reads));
         }
         binding_shape = parent;
     }
-    let Some(parameter) = pattern
+    let formal = pattern
         .parent()
         .filter(|parent| parent.kind() == "parameter")
-    else {
+        .and_then(|parameter| parameter.child_by_field_name("type"));
+    if selected_field.is_none() && formal.is_none() {
         return Ok(reject("pattern is not an ordinary formal", reads));
-    };
-    let Some(formal) = parameter.child_by_field_name("type") else {
-        return Ok(reject(
-            "formal type is not an exact non-reference constructor",
-            reads,
-        ));
-    };
+    }
     // Decide the constructor first. A local struct or enum variant is never a
     // pack-declared extractor, so it must not pay for the formal type walk, and
     // a deeply nested formal on an unrelated local type must not reach its limit.
@@ -272,21 +399,33 @@ pub(super) fn admit_selected_tuple_binding(
         }
         ExternalRoute::Unavailable => return Ok(route_unavailable(request, false)),
     };
-    let mut type_budget = 256;
-    let Some(formal) = alias_type_expr(formal, &file, &source, &mut type_budget) else {
-        return Ok(SelectedTupleBinding::Unavailable(
-            SelectedBindingUnavailable::ExternalLimitExceeded(
-                "formal type exceeds the alias budget",
-            ),
-        ));
-    };
-    reads.formal_constructor =
-        match selected_formal_route(analyzer, formal, request.cancellation, 0) {
-            ExternalRoute::Selected(route) => Some(route),
-            ExternalRoute::LocalDefinition(_) => None,
-            ExternalRoute::Rejected => None,
-            ExternalRoute::Unavailable => return Ok(route_unavailable(request, true)),
+    if let Some(formal) = formal {
+        let mut type_budget = 256;
+        let Some(formal) = alias_type_expr(formal, &file, &source, &mut type_budget) else {
+            use brokk_bifrost_analysis::analyzer::i_analyzer::SELECTED_PATTERN_ALIAS_LIMIT_REASON;
+            analyzer.record_query_incomplete(
+                brokk_bifrost_analysis::analyzer::QueryReadIncomplete::ProofStopped {
+                    reason: SELECTED_PATTERN_ALIAS_LIMIT_REASON,
+                    cause: None,
+                },
+            );
+            return Ok(SelectedTupleBinding::Unavailable(
+                SelectedBindingUnavailable::ExternalLimitExceeded(
+                    SELECTED_PATTERN_ALIAS_LIMIT_REASON,
+                ),
+            ));
         };
+        reads.formal_constructor =
+            match selected_formal_route(analyzer, formal, request.cancellation, 0) {
+                ExternalRoute::Selected(route) => Some(route),
+                ExternalRoute::LocalDefinition(_) => None,
+                ExternalRoute::Rejected => None,
+                ExternalRoute::Unavailable => return Ok(route_unavailable(request, true)),
+            };
+        if reads.formal_constructor.is_none() {
+            return Ok(reject("formal constructor identity unresolved", reads));
+        }
+    }
     if request.cancellation.is_cancelled() {
         return Ok(SelectedTupleBinding::Unavailable(
             SelectedBindingUnavailable::Cancelled,
@@ -295,9 +434,6 @@ pub(super) fn admit_selected_tuple_binding(
     let Some(constructor_route) = reads.constructor.as_deref() else {
         return Ok(reject("constructor identity unresolved", reads));
     };
-    let Some(formal_route) = reads.formal_constructor.as_deref() else {
-        return Ok(reject("formal constructor identity unresolved", reads));
-    };
     let Some(snapshot) = snapshot else {
         return Ok(reject("active declaration selection unavailable", reads));
     };
@@ -305,16 +441,18 @@ pub(super) fn admit_selected_tuple_binding(
         return Ok(reject("selected declaration overlay unavailable", reads));
     };
     let crates = super::crate_identity::RustOverlayCrates::new(Some(overlay));
-    let Some(symbol) = crates.referenceable_symbol(constructor_route) else {
+    let Some(symbol) = crates.referenceable_owner(constructor_route) else {
         return Ok(reject("selected constructor is absent or ambiguous", reads));
     };
-    let Some(formal_symbol) = crates.referenceable_symbol(formal_route) else {
-        return Ok(reject("selected formal is absent or ambiguous", reads));
-    };
-    if symbol.id != formal_symbol.id
-        || symbol.provenance.pack_digest != formal_symbol.provenance.pack_digest
-    {
-        return Ok(reject("formal and pattern constructor differ", reads));
+    if let Some(formal_route) = reads.formal_constructor.as_deref() {
+        let Some(formal_symbol) = crates.referenceable_owner(formal_route) else {
+            return Ok(reject("selected formal is absent or ambiguous", reads));
+        };
+        if symbol.id != formal_symbol.id
+            || symbol.provenance.pack_digest != formal_symbol.provenance.pack_digest
+        {
+            return Ok(reject("formal and pattern constructor differ", reads));
+        }
     }
     reads.selected_constructor = Some(symbol.qualified_name.clone());
     reads.selected_pack_digest = Some(symbol.provenance.pack_digest.clone());
@@ -380,7 +518,7 @@ pub(super) fn admit_selected_tuple_binding(
     if fields.len() != layout.arity as usize {
         return Ok(reject("pattern arity differs from selected layout", reads));
     }
-    let Some(TupleFieldSlot::Public { id, r#type, .. }) = layout.fields.get(*ordinal as usize)
+    let Some(TupleFieldSlot::Public { id, r#type, .. }) = layout.fields.get(ordinal as usize)
     else {
         return Ok(reject("tuple field is not public and in bounds", reads));
     };
@@ -395,16 +533,79 @@ pub(super) fn admit_selected_tuple_binding(
     } else {
         r#type.clone()
     };
-    Ok(SelectedTupleBinding::Admitted(AdmittedTupleBinding {
-        ordinal: *ordinal,
+    let binding = AdmittedTupleBinding {
+        ordinal,
         field_id: id.clone(),
         field_type,
         reads,
-    }))
+    };
+    Ok(match selected_field.as_ref() {
+        Some(_) => SelectedTupleBinding::Observed(SelectedPatternSource {
+            constructor: pattern_span(constructor),
+            field: pattern_span(*field_pattern),
+            root_to_constructor: candidate.path[..path_split].into(),
+            constructor_to_binding: candidate.path[path_split..].into(),
+            binding,
+        }),
+        None => SelectedTupleBinding::Admitted(binding),
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9925: shorthand field ref tokens bypassed the selected binder reference-mode refusal"
+    )]
+    fn shorthand_and_positional_reference_modes_have_structured_owners() {
+        for (pattern, expected_owner) in [
+            ("Query(Payload { ref value })", Some("field_pattern")),
+            ("Query(Payload { ref mut value })", Some("field_pattern")),
+            ("Query(Payload { mut value })", None),
+            ("Query(ref value)", Some("ref_pattern")),
+            ("Query(ref mut value)", Some("ref_pattern")),
+            ("Query(mut value)", None),
+        ] {
+            let source = format!("fn handler(q: Query<Payload>) {{ let {pattern} = q; }}");
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_rust::LANGUAGE.into())
+                .unwrap();
+            let tree = parser.parse(&source, None).unwrap();
+            assert!(!tree.root_node().has_error(), "{pattern}");
+            let mut pending = vec![tree.root_node()];
+            let mut binder = None;
+            while let Some(node) = pending.pop() {
+                if matches!(node.kind(), "identifier" | "shorthand_field_identifier")
+                    && node.utf8_text(source.as_bytes()).unwrap() == "value"
+                {
+                    assert!(binder.replace(node).is_none(), "one binding per case");
+                }
+                let mut cursor = node.walk();
+                pending.extend(node.named_children(&mut cursor));
+            }
+            let mut ancestor = binder.expect("parsed binding");
+            let mut owner = None;
+            while ancestor.kind() != "tuple_struct_pattern" {
+                if super::super::semantic::pattern_binds_by_reference(ancestor) {
+                    assert!(owner.replace(ancestor.kind()).is_none());
+                    if ancestor.kind() == "field_pattern" {
+                        let mut cursor = ancestor.walk();
+                        assert!(
+                            ancestor
+                                .children(&mut cursor)
+                                .any(|child| child.kind() == "ref")
+                        );
+                    }
+                }
+                ancestor = ancestor
+                    .parent()
+                    .expect("binder belongs to the tuple field");
+            }
+            assert_eq!(owner, expected_owner, "{pattern}");
+        }
+    }
+
     use super::{ImportHop, structured_route, written_import_hop};
 
     #[test]

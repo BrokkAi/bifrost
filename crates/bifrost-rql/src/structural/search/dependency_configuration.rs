@@ -131,11 +131,12 @@ pub(super) fn execute_dependency_configuration(
             {
                 return PlanExecution::cancelled(Vec::new());
             }
-            if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+            if brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
                 contributions.len(),
                 limits.max_pipeline_rows.min(4096),
             )
-            .allows(1)
+            .try_allow(1)
+            .is_err()
             {
                 reasons.push(ConfigurationIncompleteReason::ContributionBudgetExhausted);
                 gaps.push(format!(
@@ -344,7 +345,8 @@ pub(super) fn execute_dependency_configuration(
                 projected.retained_evidence_bytes,
                 limits.semantic.max_retained_bytes.min(8 * 1024 * 1024),
             )
-            .allows(0);
+            .try_allow(0)
+            .is_ok();
             if retain_proof && let Some(lease) = &state.parallel_seed_budget {
                 match lease.admit(projected) {
                     FairSeedBudgetAdmission::Admitted => {}
@@ -406,7 +408,15 @@ pub(super) fn execute_dependency_configuration(
     if !gaps.is_empty() {
         diagnostics.push(cross_domain_diagnostic(CodeQueryDiagnosticCode::CrossDomainDocumentIncomplete,
             CodeQueryDiagnosticImpact::Incomplete,
-            format!("dependency configuration mitigation is unproved; affected witnesses remain with mitigated=false: {gaps:?}")));
+            brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+                format_args!(
+                    "dependency configuration mitigation is unproved; affected witnesses remain with mitigated=false: {gaps:?}"
+                ),
+                format_args!(
+                    "dependency configuration mitigation is unproved; affected witnesses remain with mitigated=false"
+                ),
+                gaps.iter(),
+            )));
     }
     PlanExecution::new(rows, truncated)
 }

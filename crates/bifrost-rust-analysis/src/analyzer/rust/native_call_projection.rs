@@ -9,6 +9,15 @@
 //! within the same reverse operation. The binding-only fixture remains useful
 //! for checking that call syntax never changes ordinary reference proofs.
 
+use brokk_bifrost_analysis::analyzer::usages::call_relations::{
+    CallRelationCanonicalTarget, CallRelationCompletion, CallRelationReceiverDisposition,
+    call_relation_diagnostic_semantics,
+};
+
+use brokk_bifrost_analysis::analyzer::usages::call_relations::{
+    CallRelationDiagnosticPayload, CallRelationFailure, LocatedCallRelationDiagnostic,
+};
+
 use crate::analyzer::rust::RustAnalyzer;
 
 use crate::analyzer::rust::selected_reverse::RustSelectedReverseOutcome;
@@ -222,7 +231,7 @@ impl CallRelationProvider for RustNativeCallRelations {
                     else {
                         return Ok(None);
                     };
-                    references.push(reference);
+                    references.push((reference, edge.site.file.clone(), edge.site.range));
                 }
                 let Some(result) = finish_rust_incoming(
                     references,
@@ -313,14 +322,20 @@ impl CallRelationProvider for RustNativeCallRelations {
         &self,
         request: CallDispatchLanguageRequest<'_>,
     ) -> Option<CallDispatchLookup> {
-        crate::analyzer::rust::format_macro_dispatch::dispatch(request)
+        crate::analyzer::rust::format_macro_dispatch::dispatch(request, None)
     }
 }
 
-fn unavailable(kind: &str, message: impl Into<String>, subject: &CodeUnit) -> CallRelationResult {
+fn unavailable(kind: &str, _message: impl Into<String>, subject: &CodeUnit) -> CallRelationResult {
     CallRelationResult {
         caller_inventory: CallerInventoryCoverage::Incomplete,
-        diagnostics: vec![diagnostic(kind, message.into(), subject.fq_name())],
+        diagnostics: vec![diagnostic(
+            kind,
+            CallRelationDiagnosticPayload::Failure {
+                reason: CallRelationFailure::Upstream { kind: kind.into() },
+            },
+            subject.fq_name(),
+        )],
         ..CallRelationResult::default()
     }
 }
@@ -350,7 +365,11 @@ pub(crate) fn project_rust_rich_call_relation(
     let Some(sites) = project_selected_incoming(
         &mut RustIncomingProjection(rust, &mut dispatch),
         target,
-        selected.edges.iter().zip(references.iter().copied()),
+        selected
+            .edges
+            .iter()
+            .zip(references.iter().copied())
+            .map(|(edge, reference)| (edge, (reference, edge.site.file.clone(), edge.site.range))),
         limits,
         cancellation,
         &mut result,
@@ -365,9 +384,11 @@ pub(crate) fn project_rust_rich_call_relation(
 /// Both incoming directions finish with the same binding rechecks of the
 /// deduplicated sites that stayed unproven, given by their references.
 fn finish_rust_incoming(
-    incomplete_binding_references: Vec<
+    incomplete_binding_references: Vec<(
         brokk_bifrost_analysis::analyzer::resolution::model::SemanticId,
-    >,
+        ProjectFile,
+        brokk_bifrost_core::analyzer::model::Range,
+    )>,
     mut result: CallRelationResult,
     target: &CodeUnit,
     queries: &mut dyn brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_reverse::SelectedRustReverseQueries,
@@ -386,11 +407,15 @@ fn finish_rust_incoming(
             result.truncated = true;
             continue;
         }
-        let Some(answers) = queries.resolve_references(references)? else {
+        let aliases = references
+            .iter()
+            .map(|(reference, _, _)| *reference)
+            .collect::<Vec<_>>();
+        let Some(answers) = queries.resolve_references(&aliases)? else {
             return Ok(None);
         };
         assert_eq!(answers.len(), references.len());
-        for (&reference, slot) in references.iter().zip(answers) {
+        for ((_, file, range), slot) in references.iter().zip(answers) {
             use brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_reverse::ReferenceOmission;
 
             use brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_reverse::ReferenceResolution;
@@ -408,25 +433,67 @@ fn finish_rust_incoming(
                 }
             };
             for answer in answers {
+                if answer.call_target_completion() == ResolutionCompletion::Complete
+                    && answer.binding().targets().len() <= 1
+                {
+                    continue;
+                }
+                let semantics = call_relation_diagnostic_semantics(&answer);
+                let Some(projected) = queries.diagnostic_definitions(&semantics)? else {
+                    return Ok(None);
+                };
+                assert_eq!(semantics.len(), projected.len());
+                let canonical = semantics
+                    .into_iter()
+                    .zip(projected)
+                    .map(|(id, target)| (id, CallRelationCanonicalTarget::from_projection(&target)))
+                    .collect::<HashMap<_, _>>();
+                let project = |id| {
+                    canonical
+                        .get(&id)
+                        .expect("every diagnostic semantic has a projection slot")
+                        .clone()
+                };
+
                 if answer.call_target_completion() != ResolutionCompletion::Complete {
                     result.diagnostics.push(diagnostic(
-                    "native_call_resolution_incomplete",
-                    format!("selected Rust call {reference} has incomplete call-target evidence: {:?}; receiver dispositions: {:?}",
-                        answer.call_target_completion(), answer.callable_receiver_dispositions()),
-                    reference.to_string(),
-                ));
+                        "native_call_resolution_incomplete",
+                        CallRelationDiagnosticPayload::RustSelectedIncomplete {
+                            completion: CallRelationCompletion::from_resolution(
+                                &answer.call_target_completion(),
+                                project,
+                            ),
+                            receivers: CallRelationReceiverDisposition::from_resolution(
+                                answer.callable_receiver_dispositions(),
+                                project,
+                            ),
+                        }
+                        .at(file, Some(*range)),
+                        target.fq_name(),
+                    ));
                 }
                 if answer.binding().targets().len() > 1 {
-                    result.diagnostics.push(CallRelationDiagnostic {
-                        code: CallRelationDiagnosticCode::TargetsAmbiguous,
-                        message: format!(
-                            "selected Rust call {reference} has ambiguous targets: {:?}",
-                            answer.binding().targets()
-                        ),
-                        context: reference.to_string(),
-                        semantic_count: Some(answer.binding().targets().len()),
-                        reason_kind: None,
-                    });
+                    result.diagnostics.push(
+                        CallRelationDiagnostic::new(
+                            CallRelationDiagnosticCode::TargetsAmbiguous,
+                            CallRelationDiagnosticPayload::RustSelectedAmbiguous {
+                                targets: {
+                                    let mut targets = answer
+                                        .binding()
+                                        .targets()
+                                        .iter()
+                                        .copied()
+                                        .map(project)
+                                        .collect::<Vec<_>>();
+                                    targets.sort();
+                                    targets
+                                },
+                            }
+                            .at(file, Some(*range)),
+                            target.fq_name(),
+                        )
+                        .with_count(answer.binding().targets().len()),
+                    );
                 }
             }
         }
@@ -438,25 +505,27 @@ fn finish_rust_incoming(
                     && diagnostic.reason_kind.as_deref() == Some("time_budget"))
             });
         }
-        result.diagnostics.push(CallRelationDiagnostic {
-            code: CallRelationDiagnosticCode::BudgetExhausted,
-            message: format!("{omitted} incoming call sites kept unproven because the {lane} budget stopped their binding recheck"),
-            context: target.fq_name().to_string(),
-            semantic_count: Some(omitted),
-            reason_kind: None,
-        });
+        result.diagnostics.push(
+            CallRelationDiagnostic::new(
+                CallRelationDiagnosticCode::BudgetExhausted,
+                CallRelationDiagnosticPayload::RustIncomingOmitted {
+                    lane: lane.to_string(),
+                    count: omitted,
+                },
+                target.fq_name().to_string(),
+            )
+            .with_count(omitted),
+        );
     }
     if cancellation.is_cancelled() {
         return Ok(None);
     }
-    if projection_limits_exceeded {
-        result.diagnostics.push(CallRelationDiagnostic {
-            code: CallRelationDiagnosticCode::BudgetExhausted,
-            message: format!("selected Rust incoming call projection exceeded limits {limits:?}"),
-            context: target.fq_name().to_string(),
-            semantic_count: None,
-            reason_kind: None,
-        });
+    if projection_limits_exceeded && !result.scan_grant_refused() {
+        result.diagnostics.push(CallRelationDiagnostic::new(
+            CallRelationDiagnosticCode::BudgetExhausted,
+            CallRelationDiagnosticPayload::RustIncomingBudget { limits },
+            target.fq_name().to_string(),
+        ));
     }
     result.diagnostics.sort();
     result.diagnostics.dedup();
@@ -466,7 +535,7 @@ fn finish_rust_incoming(
     if result.truncated {
         result.caller_inventory = CallerInventoryCoverage::Incomplete;
     }
-    Ok(Some(result))
+    Ok(Some(result.with_diagnostic_limits(limits)))
 }
 
 struct RustIncomingProjection<'a>(
@@ -495,10 +564,10 @@ impl IncomingCallProjection for RustIncomingProjection<'_> {
             let reason = EdgeIncompleteReason::InverseIndexResolutionIncomplete;
             diagnostic(
                 incomplete_reason_kind(&reason),
-                format!(
-                    "selected Rust reverse call inventory for {} is incomplete: {reason:?}",
-                    target.fq_name()
-                ),
+                CallRelationDiagnosticPayload::RustInventoryIncomplete {
+                    target: target.fq_name().to_string(),
+                    reason: (&reason).into(),
+                },
                 target.fq_name().to_string(),
             )
         })
@@ -553,20 +622,27 @@ impl IncomingCallProjection for RustIncomingProjection<'_> {
         Ok(IncomingFile::Loaded(facts))
     }
 
+    fn join_reuse_verdict(
+        &self,
+        verdict: brokk_bifrost_analysis::analyzer::reuse_verdict::ReuseVerdict,
+    ) {
+        brokk_bifrost_analysis::analyzer::IAnalyzer::join_reuse_verdict(self.0, verdict);
+    }
+
     fn report_issue(&self, issue: IncomingProjectionIssue<'_>) -> CallRelationDiagnostic {
         match issue {
             IncomingProjectionIssue::FactsUnavailable(file) => diagnostic(
                 "structural_facts_unavailable",
-                format!("structured Rust facts are unavailable in {file}"),
-                file.to_string(),
+                CallRelationDiagnosticPayload::RustFactsUnavailable.at(file, None),
+                "call_source".to_string(),
             ),
             IncomingProjectionIssue::OwnerUnavailable(edge) => diagnostic(
                 "enclosing_caller_unavailable",
-                format!(
-                    "selected Rust call at {:?} has no callable owner",
-                    edge.site
-                ),
-                edge.site.file.to_string(),
+                CallRelationDiagnosticPayload::RustOwnerUnavailable {
+                    enclosing: edge.site.enclosing.as_ref().map(Into::into),
+                }
+                .at(&edge.site.file, Some(edge.site.range)),
+                "call_source".to_string(),
             ),
         }
     }
@@ -630,10 +706,10 @@ fn incomplete_diagnostics(
         .map(|reason| {
             diagnostic(
                 incomplete_reason_kind(reason),
-                format!(
-                    "selected Rust reverse call inventory for {} is incomplete: {reason:?}",
-                    target.fq_name()
-                ),
+                CallRelationDiagnosticPayload::RustInventoryIncomplete {
+                    target: target.fq_name().to_string(),
+                    reason: reason.into(),
+                },
                 target.fq_name().to_string(),
             )
         })
@@ -673,7 +749,11 @@ fn incomplete_reason_kind(reason: &EdgeIncompleteReason) -> &'static str {
     }
 }
 
-fn diagnostic(reason_kind: &str, message: String, context: String) -> CallRelationDiagnostic {
+fn diagnostic(
+    reason_kind: &str,
+    message: impl Into<LocatedCallRelationDiagnostic>,
+    context: String,
+) -> CallRelationDiagnostic {
     CallRelationDiagnostic::analysis_failed(message, context, reason_kind.to_owned())
 }
 
@@ -882,7 +962,7 @@ mod tests {
         assert!(
             bounded[0].diagnostics.iter().any(|diagnostic| {
                 diagnostic.code == CallRelationDiagnosticCode::BudgetExhausted
-                    && diagnostic.message
+                    && diagnostic.message()
                         == format!(
                             "selected Rust incoming call projection exceeded limits {limits:?}"
                         )

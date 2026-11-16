@@ -190,6 +190,7 @@ fn activated_nonreturn_model_changes_flow_assertion_result() {
     let policy = registry.policies().next().unwrap();
     let flow_state = brokk_bifrost_flow::FlowWorkspaceState::new();
     let context = PolicyEvaluationContext {
+        acceptance_hint: None,
         analyzer: workspace.analyzer(),
         workspace: Some(&workspace),
         flow_state: &flow_state,

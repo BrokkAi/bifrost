@@ -592,6 +592,39 @@ fn lambda_captures_relay_through_lambdas_and_keep_unsupported_binders_open() {
     }
 }
 
+/// A header binder ends with its statement, so a lambda after the statement
+/// reads the same-named field and needs no lexical capture. Before #7632 the
+/// lexical lookup still answered the expired loop variable, catch parameter
+/// or resource there, and the lowered lambda kept an open capture gap.
+#[test]
+#[hardwon("#7632: lambdas after a header statement captured its expired binder")]
+fn lambdas_after_header_statements_read_fields_not_expired_binders() {
+    let source = "class Fixture { String s; RuntimeException e; AutoCloseable r; Runnable afterLoop(String[] values) { for (String s : values) { } return () -> s.length(); } Runnable afterCatch() { try { fail(); } catch (RuntimeException e) { } return () -> e.getMessage(); } Runnable afterResource() throws Exception { try (AutoCloseable r = open()) { } return () -> close(r); } Runnable inLoop(String[] values) { for (String s : values) { return () -> s.length(); } return null; } void fail() {} AutoCloseable open() { return null; } void close(AutoCloseable value) {} }";
+    let artifact = java_semantics(source);
+    for name in ["afterLoop", "afterCatch", "afterResource"] {
+        let procedure = method(&artifact, name);
+        assert!(
+            procedure
+                .gaps()
+                .iter()
+                .all(|gap| gap.capability != SemanticCapability::Captures),
+            "{name}: {:?}",
+            procedure.gaps()
+        );
+    }
+    // Inside the loop body the lambda still captures the loop variable.
+    let in_loop = method(&artifact, "inLoop");
+    assert_eq!(in_loop.captures().len(), 1, "{:?}", in_loop.captures());
+    assert!(
+        in_loop
+            .gaps()
+            .iter()
+            .all(|gap| gap.capability != SemanticCapability::Captures),
+        "{:?}",
+        in_loop.gaps()
+    );
+}
+
 #[test]
 fn labeled_loop_header_keeps_its_own_source_mapping() {
     let source =
@@ -1492,4 +1525,195 @@ fn string_template_joins_its_embedded_expressions_and_leaves_a_call_gap() {
         panic!("the gap names the template result: {gap:?}");
     };
     assert_eq!(value_text(run, source, subject), template);
+}
+
+#[test]
+#[hardwon(
+    "#11165: normal and exceptional try-with-resources implicit closes shared occurrence 0 on one resource"
+)]
+fn implicit_resource_closes_have_distinct_locators_per_completion_route_and_share_span_and_receiver()
+ {
+    let source = r#"class Fixture {
+  static AutoCloseable firstOpen() throws Exception { return null; }
+  static AutoCloseable secondOpen() throws Exception { return null; }
+  static void mayThrow() throws Exception {}
+
+  static void singleResourceRoutes(boolean early) throws Exception {
+    try (AutoCloseable resource = firstOpen()) {
+      mayThrow();
+      if (early) {
+        return;
+      }
+    }
+  }
+
+  static void multiResourceReverseOrder(AutoCloseable existing) throws Exception {
+    try (
+      existing;
+      AutoCloseable first = firstOpen();
+      AutoCloseable second = secondOpen()
+    ) {
+      mayThrow();
+    }
+  }
+}
+"#;
+    let artifact = java_semantics(source);
+
+    let single = method(&artifact, "singleResourceRoutes");
+    let acquired = single
+        .call_sites()
+        .iter()
+        .find(|call| mapping_text(single, source, call.source) == "firstOpen()")
+        .and_then(|call| call.result)
+        .expect("resource initializer call result");
+    let closes = single
+        .call_sites()
+        .iter()
+        .filter(|call| {
+            call.member_selection
+                .as_ref()
+                .is_some_and(|selection| selection.member.as_ref() == "close")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        closes.len(),
+        3,
+        "normal fallthrough, return, and exceptional exit each emit one implicit close: {closes:?}"
+    );
+    let expected_resource_text = "AutoCloseable resource = firstOpen()";
+    let expected_span = single
+        .source_mapping(closes[0].source)
+        .expect("first close mapping")
+        .locator
+        .anchor()
+        .span();
+    assert_eq!(
+        &source[expected_span.start_byte() as usize..expected_span.end_byte() as usize],
+        expected_resource_text
+    );
+    let mut locators = HashSet::default();
+    let mut points = HashSet::default();
+    let mut occurrences = Vec::new();
+    for close in &closes {
+        let mapping = single
+            .source_mapping(close.source)
+            .expect("implicit close source mapping");
+        assert_eq!(mapping.kind, SourceMappingKind::Exact);
+        assert_eq!(mapping.locator.anchor().span(), expected_span);
+        assert_eq!(
+            mapping_text(single, source, close.source),
+            expected_resource_text
+        );
+        assert_eq!(close.receiver, Some(acquired));
+        assert!(
+            locators.insert(mapping.locator.clone()),
+            "duplicate implicit close locator: {:?}",
+            mapping.locator
+        );
+        assert!(
+            points.insert(close.point),
+            "duplicate implicit close invoke point: {:?}",
+            close.point
+        );
+        occurrences.push(mapping.locator.anchor().occurrence());
+    }
+    occurrences.sort_unstable();
+    assert_eq!(occurrences, [0, 1, 2]);
+
+    let multi = method(&artifact, "multiResourceReverseOrder");
+    let first_value = multi
+        .call_sites()
+        .iter()
+        .find(|call| mapping_text(multi, source, call.source) == "firstOpen()")
+        .and_then(|call| call.result)
+        .expect("first resource value");
+    let second_value = multi
+        .call_sites()
+        .iter()
+        .find(|call| mapping_text(multi, source, call.source) == "secondOpen()")
+        .and_then(|call| call.result)
+        .expect("second resource value");
+    let multi_closes = multi
+        .call_sites()
+        .iter()
+        .filter(|call| {
+            call.member_selection
+                .as_ref()
+                .is_some_and(|selection| selection.member.as_ref() == "close")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        multi_closes.len(),
+        6,
+        "three resources across normal and exceptional body completions emit six closes"
+    );
+    let by_point = multi_closes
+        .iter()
+        .copied()
+        .map(|call| (call.point, call))
+        .collect::<HashMap<_, _>>();
+    let mut all_locators = HashSet::default();
+    for call in &multi_closes {
+        let mapping = multi
+            .source_mapping(call.source)
+            .expect("multi-resource close mapping");
+        assert_eq!(mapping.kind, SourceMappingKind::Exact);
+        assert!(
+            all_locators.insert(mapping.locator.clone()),
+            "duplicate multi-resource implicit close locator: {:?}",
+            mapping.locator
+        );
+    }
+    let existing_receivers = multi_closes
+        .iter()
+        .filter(|call| mapping_text(multi, source, call.source) == "existing")
+        .filter_map(|call| call.receiver)
+        .collect::<Vec<_>>();
+    assert_eq!(existing_receivers.len(), 2);
+    assert_eq!(existing_receivers[0], existing_receivers[1]);
+    let existing_value = existing_receivers[0];
+
+    let second_closes = multi_closes
+        .iter()
+        .copied()
+        .filter(|call| {
+            mapping_text(multi, source, call.source) == "AutoCloseable second = secondOpen()"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(second_closes.len(), 2);
+    for head in second_closes {
+        assert_eq!(head.receiver, Some(second_value));
+        let next_point = multi
+            .control_edges()
+            .iter()
+            .find(|edge| {
+                ControlContinuation::Target(edge.source_point) == head.normal_continuation
+                    && edge.kind == ControlEdgeKind::Normal
+            })
+            .expect("normal chain from second close to first close")
+            .target_point;
+        let second_step = by_point
+            .get(&next_point)
+            .expect("first resource close invoke point");
+        assert_eq!(
+            mapping_text(multi, source, second_step.source),
+            "AutoCloseable first = firstOpen()"
+        );
+        assert_eq!(second_step.receiver, Some(first_value));
+        let third_point = multi
+            .control_edges()
+            .iter()
+            .find(|edge| {
+                ControlContinuation::Target(edge.source_point) == second_step.normal_continuation
+                    && edge.kind == ControlEdgeKind::Normal
+            })
+            .expect("normal chain from first close to existing close")
+            .target_point;
+        let third_step = by_point
+            .get(&third_point)
+            .expect("existing resource close invoke point");
+        assert_eq!(mapping_text(multi, source, third_step.source), "existing");
+        assert_eq!(third_step.receiver, Some(existing_value));
+    }
 }

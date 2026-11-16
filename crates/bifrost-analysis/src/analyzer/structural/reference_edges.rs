@@ -1629,8 +1629,12 @@ pub fn classify_owner_relation(
         site_enclosing,
         target,
         |hierarchy, site, target| {
+            // The target is an indexed type, so an ancestor answer whose only
+            // open reasons name types outside the index still rules
+            // inheritance in or out exactly (#7363).
             let answer = hierarchy.get_ancestors(site);
-            if !answer.is_complete() {
+            let exact = answer.keeps_indexed_edges_exact();
+            if !exact {
                 analyzer.record_query_incomplete(
                     crate::analyzer::QueryReadIncomplete::SemanticEvidenceUnavailable(
                         "incomplete owner hierarchy".into(),
@@ -1640,7 +1644,7 @@ pub fn classify_owner_relation(
             if answer.edges.contains(target) {
                 Some(true)
             } else {
-                answer.is_complete().then_some(false)
+                exact.then_some(false)
             }
         },
     )
@@ -1707,7 +1711,10 @@ impl OwnerRelationMemo {
                                     || hierarchy.get_ancestors(site),
                                 ) {
                                     Ok(Ok(answer)) => {
-                                        complete = answer.is_complete();
+                                        // Open reasons that name only types
+                                        // outside the index leave the
+                                        // indexed ancestors exact (#7363).
+                                        complete = answer.keeps_indexed_edges_exact();
                                         answer.edges
                                     }
                                     Ok(Err(incomplete)) => {
@@ -1867,6 +1874,7 @@ fn classify_forward_usage_kind_from_evidence(
         OccurrenceRole::ReceiverPosition
             | OccurrenceRole::MemberPosition
             | OccurrenceRole::ValueReference
+            | OccurrenceRole::CalleePosition
     ) && matches!(owner_relation, OwnerRelation::SelfReference)
     {
         return UsageHitKind::SelfReceiver;
@@ -2504,7 +2512,9 @@ fn forward_resolution_incomplete_reason(row: &OccurrenceRow) -> Option<EdgeIncom
         return None;
     }
     match row.resolution_status? {
-        DefinitionLookupStatus::Resolved | DefinitionLookupStatus::NoDefinition => None,
+        DefinitionLookupStatus::Resolved
+        | DefinitionLookupStatus::NotAReference
+        | DefinitionLookupStatus::NoDefinition => None,
         DefinitionLookupStatus::Cancelled => Some(EdgeIncompleteReason::Cancelled),
         DefinitionLookupStatus::Unavailable
         | DefinitionLookupStatus::Incomplete

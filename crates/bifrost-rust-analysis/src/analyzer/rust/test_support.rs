@@ -77,10 +77,14 @@ pub(crate) fn certified_analyzer_with_config(
     brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer,
     RustAnalyzer,
 ) {
+    let budget = brokk_bifrost_core::retention_budget::RetentionBudget::for_test_capacity(
+        config.retention_budget_bytes(),
+    );
     let workspace =
-        brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer::build_ephemeral_footgun(
+        brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer::build_ephemeral_footgun_with_budget(
             crate::inline_project::certified_project_at(root),
             config,
+            &budget,
         )
         .expect("certified fixture workspace builds");
     let analyzer =

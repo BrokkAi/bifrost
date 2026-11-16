@@ -13,6 +13,8 @@
 //! Every method reads retained overlay state. None of them runs Bundler, reads
 //! a gem archive, walks a gem directory, or starts dependency discovery.
 
+use brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelNamespace;
+
 use brokk_bifrost_core::analyzer::model::SemanticDiagnosticDomain;
 use std::sync::Arc;
 
@@ -127,7 +129,7 @@ impl<'a> RubyOverlayConstants<'a> {
         &self,
         owner: &SemanticModelSymbol,
         name: &str,
-        argument_count: usize,
+        application: &SemanticModelCallApplication,
     ) -> Option<Arc<SemanticModelSymbol>> {
         let matched = self.overlay?.member_target_on_owner(&owner.id, name);
         if matched.disposition != SemanticModelMemberTargetDisposition::Unique {
@@ -147,10 +149,7 @@ impl<'a> RubyOverlayConstants<'a> {
         }
         if let Some(signature) = member.structured_signature()
             && !matches!(
-                bind_semantic_model_arguments(
-                    signature,
-                    &SemanticModelCallApplication::positional(u32::try_from(argument_count).ok()?)
-                ),
+                bind_semantic_model_arguments(signature, application),
                 SemanticModelArgumentBinding::Exact { .. }
             )
         {
@@ -299,7 +298,11 @@ impl<'a> RubyOverlayConstants<'a> {
                         SemanticModelOverlayDisposition::Open(_)
                     )
                 {
-                    matched = overlay.symbols_named_in_family(&relation.to, "ruby");
+                    matched = overlay.symbols_named_in_family(
+                        &relation.to,
+                        "ruby",
+                        SemanticModelNamespace::Unknown,
+                    );
                 }
                 // An open lookup leaves the ancestor's declarations partly
                 // unread, so the surface is open whatever it returned.

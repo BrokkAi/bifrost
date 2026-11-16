@@ -71,7 +71,16 @@ pub fn enclosing_context(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> EnclosingCont
     if let Some(cached) = ctx.enclosing_cache.get(&key) {
         return cached.clone();
     }
+    let resolved = enclosing_context_uncached(node, ctx);
+    ctx.enclosing_cache.insert(key, resolved.clone());
+    resolved
+}
 
+/// [`enclosing_context`] without the per-file memo, for callers that only hold
+/// a shared borrow of the scan and still need the same answer: the receiver
+/// typing of a `super` receiver resolves the class body that lexically holds it
+/// (#9703), and that must be the owner `this` resolves through as well.
+pub(super) fn enclosing_context_uncached(node: Node<'_>, ctx: &ScanCtx<'_>) -> EnclosingContext {
     let range = Range {
         start_byte: node.start_byte(),
         end_byte: node.end_byte(),
@@ -96,7 +105,5 @@ pub fn enclosing_context(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> EnclosingCont
         }
         current
     });
-    let resolved = EnclosingContext { enclosing, owner };
-    ctx.enclosing_cache.insert(key, resolved.clone());
-    resolved
+    EnclosingContext { enclosing, owner }
 }

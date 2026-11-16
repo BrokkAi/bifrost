@@ -537,9 +537,9 @@ fn resolve_segments(
         let status = match outcome.status {
             DefinitionLookupStatus::Resolved => SegmentResolutionStatus::Resolved,
             DefinitionLookupStatus::Ambiguous => SegmentResolutionStatus::Ambiguous,
-            DefinitionLookupStatus::NoDefinition | DefinitionLookupStatus::NotFound => {
-                SegmentResolutionStatus::Unresolved
-            }
+            DefinitionLookupStatus::NotAReference
+            | DefinitionLookupStatus::NoDefinition
+            | DefinitionLookupStatus::NotFound => SegmentResolutionStatus::Unresolved,
             DefinitionLookupStatus::UnresolvableImportBoundary
             | DefinitionLookupStatus::Unavailable
             | DefinitionLookupStatus::Incomplete

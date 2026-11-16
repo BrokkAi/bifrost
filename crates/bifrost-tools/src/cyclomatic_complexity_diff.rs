@@ -91,7 +91,8 @@ pub struct CyclomaticComplexityFunction {
     pub start_line: usize,
     pub end_line: usize,
     pub language: String,
-    pub is_test: bool,
+    /// null when test classification was unavailable.
+    pub is_test: Option<bool>,
     pub complexity: u32,
 }
 
@@ -222,8 +223,21 @@ pub fn cyclomatic_complexity_at_root(
         summary.increased + summary.decreased + summary.unchanged
     );
 
+    let mut incomplete = analyzed.incomplete().to_vec();
+    if functions
+        .iter()
+        .any(|function| function.after.is_test.is_none())
+    {
+        incomplete.push(crate::result_incomplete::ToolResultIncomplete {
+            reason: crate::result_incomplete::ToolResultIncompleteReason::StructureUnavailable,
+            detail: Some(
+                "test status unknown: the files that decide it are outside the scoped diff image"
+                    .into(),
+            ),
+        });
+    }
     Ok(CyclomaticComplexityDiffResult {
-        incomplete: analyzed.incomplete().to_vec(),
+        incomplete,
         endpoints,
         summary,
         functions,
@@ -345,6 +359,11 @@ impl RenderText for CyclomaticComplexityDiffResult {
         lines.push("## Functions".to_string());
         lines.push(String::new());
         for function in &self.functions {
+            if function.after.is_test.is_none() {
+                lines.push(
+                    "- Test status unknown: the files that decide it are outside the scoped diff image".into(),
+                );
+            }
             let location = if options.render_line_numbers {
                 format!("{}:{}", function.after.path, function.after.start_line)
             } else {
@@ -521,7 +540,7 @@ mod tests {
             .iter()
             .find(|f| f.after.name == "checks")
             .expect("inline test");
-        assert!(checks.after.is_test);
+        assert_eq!(checks.after.is_test, Some(true));
         let rendered = result.render_text(RenderOptions {
             render_line_numbers: true,
         });

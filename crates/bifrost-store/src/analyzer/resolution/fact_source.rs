@@ -31,14 +31,14 @@ use super::model::{
 };
 use super::seam_profile::{self, SeamMethod};
 use super::typed_fact_lowering::{
-    LoweredBindingProjection, LoweredCallApplicabilityObligation, LoweredCallableSignatureProperty,
-    LoweredConstructionRequirementProperty, LoweredDeclarationTypeProperty,
-    LoweredDeclarationVisibilityProperty, LoweredDeclaredTypeArgument,
-    LoweredDefinitionPropertyGap, LoweredGenericFormal, LoweredGenericFormalDefault,
-    LoweredGenericTypeAliasParameter, LoweredIntrinsicSeed, LoweredMemberOwnerProperty,
-    LoweredMemberScopeProperty, LoweredQualifiedSeededRoute, LoweredSupertypeProperty,
-    LoweredTypeArgument, LoweredTypeComponent, LoweredTypeProduction, LoweredTypeTransfer,
-    LoweredTypedFrontier, LoweredUnderlyingType,
+    LoweredBinaryOperation, LoweredBindingProjection, LoweredCallApplicabilityObligation,
+    LoweredCallableSignatureProperty, LoweredConstructionRequirementProperty,
+    LoweredDeclarationTypeProperty, LoweredDeclarationVisibilityProperty,
+    LoweredDeclaredTypeArgument, LoweredDefinitionPropertyGap, LoweredGenericFormal,
+    LoweredGenericFormalDefault, LoweredGenericTypeAliasParameter, LoweredIntrinsicSeed,
+    LoweredMemberOwnerProperty, LoweredMemberScopeProperty, LoweredQualifiedSeededRoute,
+    LoweredSupertypeProperty, LoweredTypeArgument, LoweredTypeComponent, LoweredTypeProduction,
+    LoweredTypeTransfer, LoweredTypedFrontier, LoweredUnderlyingType,
 };
 
 /// Hard upper bound on identities in one typed-fact source request.
@@ -206,9 +206,15 @@ pub struct FactModelMember {
     pub selection_complete: bool,
     pub incomplete_reasons: Vec<String>,
     pub receiver: super::ResolutionSlotValue,
-    pub interface: bool,
-    pub route_exact: bool,
-    pub receiver_route_proven: bool,
+    /// The declaring owner is abstract (an interface or trait), so the
+    /// implementation that runs is chosen by an open family of implementers.
+    pub abstract_owner: bool,
+    /// Every owner on the path from the receiver to the declaring owner has an
+    /// exact member inventory.
+    pub owner_path_members_exact: bool,
+    /// The receiver value is itself the declaring owner: the path has no
+    /// promotion or deref step whose storage the receiver would need to supply.
+    pub receiver_is_declaring_owner: bool,
     pub completion: ResolutionCompletion,
     pub rejected: bool,
 }
@@ -329,6 +335,28 @@ pub enum RustImplementedTraits {
     /// staged content, or its file is placed in no crate. The crate rows cannot
     /// answer, so an empty answer here would be a guess.
     Unplaced,
+    Cancelled,
+}
+
+/// What a Rust type's built-in derives say about one member name (#11325).
+/// See [`SelectedTypedFactSource::rust_builtin_derive_member`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RustBuiltinDeriveMember {
+    /// The owner records no built-in derive surface: it has no derive, or a
+    /// derive that is not built in keeps its generated surface open.
+    NotDerived,
+    /// The derives are proven to be the prelude's, and none of their traits
+    /// declares the member.
+    Absent,
+    /// The derives are proven to be the prelude's, and this derive's trait
+    /// declares the member.
+    Member {
+        derive: &'static brokk_bifrost_rust::prelude::RustBuiltinDerive,
+        item: &'static brokk_bifrost_rust::prelude::RustDerivedTraitItem,
+    },
+    /// A derive name may not be the prelude's: a workspace or external macro
+    /// binding, an open inventory, or a placement the rows cannot decide.
+    Unproven,
     Cancelled,
 }
 
@@ -722,6 +750,23 @@ pub enum ExternalMemberCoordinate {
 pub struct ExternalMemberIdentity {
     pub owner: ExternalOwnerIdentity,
     pub ordinal: u32,
+}
+
+impl ExternalMemberIdentity {
+    /// The content digest of this member's `UnsupportedExternalSignatureTypeVariable`
+    /// obligation: its declared signature mentions a type variable whose
+    /// substitution is unproven. The store mints the obligation from this
+    /// digest. Java's native route recomputes it to discharge exactly this
+    /// obligation where it proved the substitution from exact type arguments.
+    pub fn jvm_generic_signature_obligation_digest(&self) -> [u8; 32] {
+        let mut hash = brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher::new(
+            b"bifrost-jvm-external-generic-signature-obligation:v1",
+        );
+        hash.field("provider", self.owner.provider_id.as_bytes());
+        hash.field("owner", self.owner.owner_fqn.as_bytes());
+        hash.field("member", &self.ordinal.to_be_bytes());
+        hash.finish()
+    }
 }
 
 /// The identity carried by a selected typed row. Its payload supplies the
@@ -1146,6 +1191,12 @@ impl SelectedTypedRow<LoweredTypeTransfer> {
 }
 
 impl SelectedTypedRow<LoweredTypeProduction> {
+    pub const fn natural_identity(&self) -> (BindingFragmentId, SemanticId) {
+        (self.fragment(), self.row.output)
+    }
+}
+
+impl SelectedTypedRow<LoweredBinaryOperation> {
     pub const fn natural_identity(&self) -> (BindingFragmentId, SemanticId) {
         (self.fragment(), self.row.output)
     }
@@ -1806,10 +1857,51 @@ pub struct ImplicitRootObject {
     pub occurrence: SemanticId,
 }
 
+/// Conditional admission of inheritance inputs, independent of constructor behavior.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BasePreservationGuard {
+    pub references: Vec<SemanticId>,
+    pub terminal: &'static str,
+    pub absent_members: &'static [&'static str],
+    pub enclosing_absent_members: &'static [&'static str],
+    pub completion: ResolutionCompletion,
+}
+
+/// Complete semantic identity of one conditional inheritance proof.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BasePreservationRule {
+    pub terminal: &'static str,
+    pub absent_members: &'static [&'static str],
+    pub enclosing_absent_members: &'static [&'static str],
+}
+
+impl BasePreservationGuard {
+    pub fn rule(&self) -> BasePreservationRule {
+        BasePreservationRule {
+            terminal: self.terminal,
+            absent_members: self.absent_members,
+            enclosing_absent_members: self.enclosing_absent_members,
+        }
+    }
+}
+
+/// Exhaustive direct-member presence for a guard's requested names.
+#[derive(Clone, Debug)]
+pub struct BasePreservationMembers {
+    /// Selected-workspace writes whose receiver identity must be disjoint.
+    pub mutation_receivers: Vec<SemanticId>,
+    /// Possible writes to the terminal's module binding. Proven class-object
+    /// receivers are disjoint from that module namespace; None is unproven.
+    pub terminal_mutation_receivers: Option<Vec<SemanticId>>,
+    pub names: Vec<String>,
+    pub complete: bool,
+}
+
 /// Inputs for one owner's implicit base. Empty written inventory is distinct
 /// from missing metadata and does not by itself prove ordinary creation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImplicitBaseInputs {
+    pub base_preservation: Option<BasePreservationGuard>,
     pub written_inventory_complete: bool,
     pub written_base_count: u32,
     pub creation: ClassCreationKind,
@@ -1840,7 +1932,88 @@ pub struct ConditionalTypeSeed {
     pub discharged_gap_reasons: Vec<SemanticId>,
 }
 
+/// A selected nominal constructor candidate. A present head certifies its
+/// language identity; element agreement and activation belong to the shared
+/// solver. Never persisted as a solved type.
+#[derive(Clone, Debug)]
+pub struct ConditionalTypeProduction {
+    pub output: SemanticId,
+    pub elements: Vec<SemanticId>,
+    pub head: Option<&'static str>,
+    pub language: Language,
+}
+
+/// Whether written operands name proven class objects for an implicit-base rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImplicitWrittenBaseObjects {
+    Proven,
+    /// A source declaration does not prove which runtime class object its
+    /// binding denotes; a decorator can replace it with a language marker.
+    UnprovenSource,
+    Unproven,
+}
+
+/// One language-implied trailing base and the identity that suppresses it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImplicitAppendedBase {
+    /// None has no definite target: the base is unmodeled or its presence is undecided.
+    pub target: Option<SemanticId>,
+    pub suppressing_target: Option<SemanticId>,
+    pub written_objects: ImplicitWrittenBaseObjects,
+    /// None when the runtime factory read stopped; false when replacement is possible.
+    pub factory_unmodified: Option<bool>,
+    pub completion: ResolutionCompletion,
+}
+
 pub trait SelectedTypedFactSource {
+    /// The reference a class-object alias copies: for a declaration that is
+    /// the only writer of its name and is the direct, unconditional assignment
+    /// `name = <reference>`, that reference. A base spelled through such a name
+    /// names the class the reference names (JS/TS `const Alias = Base` has the
+    /// same shape). `None` for every other declaration, so every other base
+    /// keeps the binding's own answer. The prefilter reads one binding row; it
+    /// starts no type task.
+    fn class_alias_source(
+        &self,
+        _definition: SemanticId,
+        _cancellation: &CancellationToken,
+    ) -> StoreResult<Option<SemanticId>> {
+        Ok(None)
+    }
+    fn base_preservation_reference_complete(
+        &self,
+        _reference: SemanticId,
+        cancellation: &CancellationToken,
+        _work: &mut dyn FnMut() -> bool,
+    ) -> StoreResult<bool> {
+        Ok(!cancellation.is_cancelled())
+    }
+    fn base_preservation_members(
+        &self,
+        _owner: SemanticId,
+        _members: &[&str],
+        _cancellation: &CancellationToken,
+        _work: &mut dyn FnMut() -> bool,
+    ) -> StoreResult<Option<BasePreservationMembers>> {
+        Ok(None)
+    }
+    fn base_preservation_terminal_reference(
+        &self,
+        _reference: SemanticId,
+        _terminal: &str,
+        _cancellation: &CancellationToken,
+    ) -> StoreResult<bool> {
+        Ok(false)
+    }
+    fn base_preservation_terminal_owner(
+        &self,
+        _owner: SemanticId,
+        _terminal: &str,
+        _cancellation: &CancellationToken,
+    ) -> StoreResult<bool> {
+        Ok(false)
+    }
+
     /// Current selected blob for the fragment, if it has a selected mount.
     fn selected_blob_for_fragment(
         &self,
@@ -1863,6 +2036,16 @@ pub trait SelectedTypedFactSource {
     fn jvm_external_owner_is_indexed(&self, _owner: &ExternalOwnerIdentity) -> StoreResult<bool> {
         Ok(false)
     }
+    fn binary_operation_type_provider(
+        &self,
+    ) -> Option<&dyn crate::analyzer::store::language_support::BinaryOperationTypeProvider> {
+        None
+    }
+    fn selected_type_heads(
+        &self,
+    ) -> Option<&dyn crate::analyzer::store::language_support::SelectedTypeHeadSource> {
+        None
+    }
     fn selected_model_language(
         &self,
         _token: SemanticId,
@@ -1878,6 +2061,14 @@ pub trait SelectedTypedFactSource {
         _cancellation: &CancellationToken,
     ) -> StoreResult<Option<(Vec<super::ResolutionSlotValue>, ResolutionCompletion)>> {
         Ok(None)
+    }
+
+    fn conditional_type_productions(
+        &self,
+        _slots: &[SemanticId],
+        _cancellation: &CancellationToken,
+    ) -> StoreResult<Vec<ConditionalTypeProduction>> {
+        Ok(Vec::new())
     }
 
     /// Fixed selected capability. Default languages incur no seed reader call.
@@ -1898,6 +2089,13 @@ pub trait SelectedTypedFactSource {
     fn qualified_member_registrations(&self) -> &'static [QualifiedMemberRegistration] {
         &[]
     }
+
+    fn implicit_appended_base(
+        &self,
+        owner: SemanticId,
+        written_targets: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<ImplicitAppendedBase>>;
 
     /// Bounded selected inputs for one owner. None exposes no authority; a
     /// cancelled read also returns None with cancellation set. The default
@@ -2067,6 +2265,27 @@ pub trait SelectedTypedFactSource {
         cancellation: &CancellationToken,
     ) -> StoreResult<RustImplementedTraits> {
         Ok(empty_rust_traits_or_cancelled(cancellation))
+    }
+
+    /// What the built-in derives of the Rust type declared at `owner` say
+    /// about the member spelled by the shared lookup recipe `lookup` (#11325).
+    ///
+    /// A built-in derive expands to exactly one impl of its standard trait, so
+    /// once every derive name of the declaration is proven to fall through to
+    /// the prelude at every placement, the generated member surface is the
+    /// traits' reviewed items. A source that holds no Rust crate rows answers
+    /// [`RustBuiltinDeriveMember::NotDerived`].
+    fn rust_builtin_derive_member(
+        &self,
+        _owner: SemanticId,
+        _lookup: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<RustBuiltinDeriveMember> {
+        Ok(if cancellation.is_cancelled() {
+            RustBuiltinDeriveMember::Cancelled
+        } else {
+            RustBuiltinDeriveMember::NotDerived
+        })
     }
 
     /// The persisted namespace of a shared lookup recipe. An absent recipe
@@ -2300,10 +2519,12 @@ pub trait SelectedTypedFactSource {
         Ok((!cancellation.is_cancelled()).then_some(None))
     }
 
-    /// A reached selected model member callable. No source or durable inventory is minted.
+    /// A reached selected model member callable. No source or durable inventory
+    /// is minted. `owner_language` is the family of the callable's owner.
     fn model_member_callable_result(
         &self,
         _member: &crate::analyzer::semantic_model::overlay::ModelSymbolRef,
+        _owner_language: super::ExternalOwnerLanguage,
         cancellation: &CancellationToken,
     ) -> StoreResult<Option<Option<ModelCallableResultDeclaration>>> {
         Ok((!cancellation.is_cancelled()).then_some(None))
@@ -2489,6 +2710,13 @@ pub trait SelectedTypedFactSource {
         target_slots: TypedFactRequest<'_, SemanticId>,
         cancellation: &CancellationToken,
         visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredTypeTransfer>>,
+    ) -> StoreResult<TypedFactReadOutcome>;
+
+    fn visit_binary_operation_pages_for_outputs(
+        &self,
+        outputs: TypedFactRequest<'_, SemanticId>,
+        cancellation: &CancellationToken,
+        visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredBinaryOperation>>,
     ) -> StoreResult<TypedFactReadOutcome>;
 
     fn visit_type_production_pages_for_outputs(

@@ -23,16 +23,41 @@ mod csharp_extraction_tests {
 
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
+        "#11253: stale parsed record structs retained Class signature metadata"
+    )]
+    fn csharp_record_struct_kind_epoch_invalidates_prior_parsed_blobs() {
+        use brokk_bifrost_core::analyzer::model::ClassLikeKind;
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "Record.cs",
+            "public record struct Value(int X);",
+        );
+        let mut state = parse_state(&CSharpAdapter, &file);
+        let metadata = state
+            .signature_metadata
+            .values_mut()
+            .flat_map(|rows| rows.iter_mut())
+            .find(|metadata| metadata.class_like_kind() == Some(ClassLikeKind::Struct))
+            .expect("record struct metadata");
+        *metadata = metadata.clone().with_class_like_kind(ClassLikeKind::Class);
+        let prior_epoch = epoch::csharp_epoch_before_record_struct_kind();
+        assert_prior_parsed_blob_invalidated(&CSharpAdapter, &state, &prior_epoch);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
         "#7314: retained source gaps caused a full compilation scan per publication"
     )]
     fn csharp_extent_publication_tracks_edits_and_overlay_inventory() {
+        // This regression now runs on the pooled store.
         use crate::inline_project::InlineTestProject;
         use brokk_bifrost_analysis::analyzer::{AnalyzerConfig, WorkspaceAnalyzer};
         use brokk_bifrost_analysis::analyzer::store::{WorkspaceId,workspace_inputs::WorkspaceConfigurationInput};
         use brokk_bifrost_analysis::analyzer::store::resolution_publication::ResolutionContentPublicationOutcome;
         use brokk_bifrost_analysis::analyzer::store::resolution_selection::{SelectedResolutionContentMountRequest,SelectedResolutionLanguage,SelectedResolutionMountInventoryOutcome,SelectedResolutionOverlayMask};
         use brokk_bifrost_analysis::analyzer::store_support::test_support::operation_fixture_support::parsed_operation_source_state;
-        use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::single_connection_store_context_for_test;
+        use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::ephemeral_store_context;
         use brokk_bifrost_core::{analyzer::Language,cancellation::CancellationToken,gitblob::BlobKey,hash::HashMap};
         if std::env::var_os("BIFROST_TRIAL_NATIVE_CSHARP").is_none() {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
@@ -61,8 +86,7 @@ mod csharp_extraction_tests {
             builder = builder.file(format!("A/F{i:03}.cs"), format!("class F{i} {{}}"));
         }
         let fixture = builder.build();
-        let context =
-            single_connection_store_context_for_test(fixture.project_dyn().as_ref()).unwrap();
+        let context = ephemeral_store_context(fixture.project_dyn().as_ref()).unwrap();
         let store = Arc::clone(&context.store);
         let workspace = context.workspace_id.clone();
         let _analyzer = WorkspaceAnalyzer::build_with_store_context_for_test(
@@ -496,7 +520,7 @@ mod csharp_extraction_tests {
             // must fail closed rather than certify the directive inventory.
             use brokk_bifrost_analysis::analyzer::resolution::ResolutionCompletion;
             use brokk_bifrost_analysis::analyzer::resolution::selected_context::SelectedContextIdentities;
-            use brokk_bifrost_analysis::analyzer::store::csharp_compilation::DERIVATION_VERSION;
+            use brokk_bifrost_analysis::analyzer::store::csharp_compilation::derivation_identity;
             use brokk_bifrost_analysis::analyzer::store::resolution_operation::csharp_units::CSharpUnitReader;
             use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
             let SelectedResolutionMountInventoryOutcome::Ready(selection) = store
@@ -536,18 +560,21 @@ mod csharp_extraction_tests {
             };
             let fresh = answer(&mut reader);
             assert_eq!(fresh.1, ResolutionCompletion::Complete, "{fresh:?}");
-            let set_version = |version: i64| {
-                selection
-                    .connection()
-                    .execute(
-                        "UPDATE csharp_compilation_sets SET derivation_version=?1 WHERE set_id=(SELECT set_id FROM csharp_compilations WHERE compilation_id=?2)",
-                        rusqlite::params![version, compilation_id],
-                    )
-                    .unwrap();
+            // The selection reads through a read-only pooled reader, so the
+            // perturbation goes through the writer.
+            let set_version = |version: [u8; 32]| {
+                let conn = store.conn.lock().unwrap();
+                let _fixture =
+                    brokk_bifrost_analysis::analyzer::store::sealed_families::Fixture::new(&conn);
+                conn.execute(
+                    "UPDATE csharp_compilation_sets SET derivation_identity=?1 WHERE set_id=(SELECT set_id FROM csharp_compilations WHERE compilation_id=?2)",
+                    rusqlite::params![version, compilation_id],
+                )
+                .unwrap();
             };
-            set_version(DERIVATION_VERSION - 1);
+            set_version(brokk_bifrost_analysis::analyzer::store::csharp_compilation::derivation_identity_before_last_token());
             let stale = answer(&mut reader);
-            set_version(DERIVATION_VERSION);
+            set_version(derivation_identity());
             let ResolutionCompletion::Incomplete(_) = stale.1 else {
                 panic!("a coverage row from another derivation version was trusted: {stale:?}");
             };
@@ -640,10 +667,13 @@ mod csharp_extraction_tests {
             assert_eq!(inspect(complete), 2);
         }
         {
-            // The engine fixture uses one in-memory connection. Reclaim a persisted copy
-            // of that exact publication history through the real core collector.
+            // The engine fixture runs on the pooled temp-file store. Reclaim a
+            // persisted copy of that exact publication history through the real
+            // core collector. `VACUUM main INTO` inherits the writer's
+            // SQLITE_OPEN_NOFOLLOW, so resolve the scratch root first: macOS temp
+            // paths go through /var -> /private/var (#4604).
             let scratch = tempfile::tempdir().unwrap();
-            let db = scratch.path().join("gc.db");
+            let db = scratch.path().canonicalize().unwrap().join("gc.db");
             let conn = store.conn.lock().unwrap();
             let _fixture =
                 brokk_bifrost_analysis::analyzer::store::sealed_families::Fixture::new(&conn);
@@ -793,7 +823,7 @@ mod csharp_extraction_tests {
         use brokk_bifrost_analysis::analyzer::store::resolution_publication::ResolutionContentPublicationOutcome;
         use brokk_bifrost_analysis::analyzer::store::resolution_selection::{SelectedResolutionContentMountRequest, SelectedResolutionLanguage, SelectedResolutionMountInventoryOutcome, SelectedResolutionOverlayMask};
         use brokk_bifrost_analysis::analyzer::store_support::test_support::operation_fixture_support::parsed_operation_source_state;
-        use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::single_connection_store_context_for_test;
+        use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::ephemeral_store_context;
         use brokk_bifrost_core::{analyzer::Language, cancellation::CancellationToken, gitblob::BlobKey};
         if std::env::var_os("BIFROST_TRIAL_NATIVE_CSHARP").is_none() {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
@@ -813,8 +843,7 @@ mod csharp_extraction_tests {
                 "global using X = N.W; namespace N { public class W {} }",
             )
             .build();
-        let context =
-            single_connection_store_context_for_test(fixture.project_dyn().as_ref()).unwrap();
+        let context = ephemeral_store_context(fixture.project_dyn().as_ref()).unwrap();
         let store = Arc::clone(&context.store);
         let workspace_id = context.workspace_id.clone();
         let workspace = WorkspaceAnalyzer::build_with_store_context_for_test(
@@ -961,7 +990,7 @@ mod csharp_extraction_tests {
         use brokk_bifrost_analysis::analyzer::store::resolution_selection::{
             SelectedResolutionLanguage, SelectedResolutionMountInventoryOutcome,
         };
-        use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::single_connection_store_context_for_test;
+        use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::ephemeral_store_context;
         use brokk_bifrost_analysis::analyzer::{AnalyzerConfig, WorkspaceAnalyzer};
         use brokk_bifrost_core::{analyzer::Language, cancellation::CancellationToken};
         if std::env::var_os("BIFROST_TRIAL_NATIVE_CSHARP").is_none() {
@@ -986,8 +1015,7 @@ mod csharp_extraction_tests {
             .file("B/Hidden.cs", "class Hidden {}")
             .file("Outside.cs", "class Outside {}")
             .build();
-        let context =
-            single_connection_store_context_for_test(fixture.project_dyn().as_ref()).unwrap();
+        let context = ephemeral_store_context(fixture.project_dyn().as_ref()).unwrap();
         let workspace_id = context.workspace_id.clone();
         let store = Arc::clone(&context.store);
         let _workspace = WorkspaceAnalyzer::build_with_store_context_for_test(
@@ -1245,6 +1273,17 @@ mod csharp_extraction_tests {
     "#8155: incomplete C# descendant cache fills panicked during member-family inversion"
 )]
 fn csharp_incomplete_descendant_fill_leaves_member_family_open() {
+    // #12331: a caller-only gap no longer poisons the descendant index.
+    // #12331 (7a9cabcf028) made complete_descendant_query withhold a
+    // descendant answer only when the fill's own receipt is incomplete. The
+    // old version of this test recorded a gap on the caller's scope and
+    // expected the family to be open; that gap is not a fill refusal.
+    //
+    // There is no product-surface assertion here today. The only available C#
+    // product query, member_targets on b.Run(), is ambiguous/open for
+    // unrelated reasons in both clean and gapped callers, so it cannot
+    // isolate the caller gap. The captured query incompleteness checked below
+    // is the completion signal that policy and RQL consume.
     use crate::inline_project::InlineTestProject;
     use brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadIncomplete;
     use brokk_bifrost_analysis::analyzer::multi_analyzer::{AnalyzerDelegate, MultiAnalyzer};
@@ -1253,7 +1292,9 @@ fn csharp_incomplete_descendant_fill_leaves_member_family_open() {
     use brokk_bifrost_core::analyzer::Language;
     use brokk_bifrost_core::analyzer::capabilities::TypeHierarchyProvider;
     use brokk_bifrost_core::analyzer::code_unit_index::CodeUnitIndex;
-    use brokk_bifrost_core::analyzer::structural::resolution::MemberFamilyOutcome;
+    use brokk_bifrost_core::analyzer::structural::resolution::{
+        MemberFamilyOutcome, MemberFamilyReason,
+    };
     use brokk_bifrost_csharp_analysis::CSharpAnalyzer;
     use std::collections::BTreeMap;
     let project = InlineTestProject::with_language(Language::CSharp)
@@ -1266,6 +1307,45 @@ fn csharp_incomplete_descendant_fill_leaves_member_family_open() {
             "public class Child : Base { public override void Run() {} }",
         )
         .build();
+
+    // (a) Genuine in-fill refusal. The analyzer is cold: retained file states
+    // are dropped, then Child.cs gains NUL bytes before the first descendant
+    // query, so the fill itself cannot read the file and must refuse.
+    {
+        let mut cold = CSharpAnalyzer::new(project.project_dyn());
+        let member = cold
+            .declarations(&project.file("Base.cs"))
+            .into_iter()
+            .find(|unit| unit.is_function() && unit.identifier() == "Run")
+            .unwrap();
+        cold.clear_retained_file_states_for_test();
+        std::fs::write(
+            project.file("Child.cs").abs_path(),
+            b"public class Child : Base { \0\0 public override void Run() {} }",
+        )
+        .unwrap();
+        let answer = csharp_member_family(&cold, &cold, &member, None);
+        assert_eq!(
+            answer.descendants.outcome,
+            MemberFamilyOutcome::Incomplete,
+            "{answer:?}"
+        );
+        assert_eq!(
+            answer.descendants.reason,
+            Some(MemberFamilyReason::HierarchyTruncated),
+            "{answer:?}"
+        );
+        // Restore the file for the converse below.
+        std::fs::write(
+            project.file("Child.cs").abs_path(),
+            "public class Child : Base { public override void Run() {} }",
+        )
+        .unwrap();
+    }
+
+    // (b) Converse: a gap recorded only on the caller's scope leaves the
+    // descendant index complete and the descendants proven, and the caller's
+    // captured incompleteness holds exactly that gap.
     let analyzer = MultiAnalyzer::new(BTreeMap::from([(
         Language::CSharp,
         AnalyzerDelegate::new(CSharpAnalyzer::new(project.project_dyn())),
@@ -1283,13 +1363,12 @@ fn csharp_incomplete_descendant_fill_leaves_member_family_open() {
         let answer = csharp_member_family(&analyzer, &analyzer, &member, None);
         assert_eq!(
             answer.descendants.outcome,
-            MemberFamilyOutcome::Incomplete,
+            MemberFamilyOutcome::Proven,
             "{answer:?}"
         );
         assert_eq!(scope.captured_read_incompleteness(), vec![gap]);
     });
     assert_eq!(reads.execution_dependences(), 0, "{reads:?}");
-    assert!(reads.unattributed_reads() > 0, "{reads:?}");
     let descendants = analyzer.get_direct_descendants(&owner);
     assert!(
         descendants.is_complete()
@@ -1303,6 +1382,17 @@ fn csharp_incomplete_descendant_fill_leaves_member_family_open() {
 
 #[test]
 fn csharp_membership_descendants_preserve_refused_fill() {
+    // #12331: a caller-only gap no longer poisons the descendant index.
+    // #12331 (7a9cabcf028) made complete_descendant_query withhold a
+    // descendant answer only when the fill's own receipt is incomplete. The
+    // old version of this test recorded a gap on the caller's scope and
+    // expected the membership view to be open; that gap is not a fill refusal.
+    //
+    // There is no product-surface assertion here today. The only available C#
+    // product query, member_targets on b.Run(), is ambiguous/open for
+    // unrelated reasons in both clean and gapped callers, so it cannot
+    // isolate the caller gap. The captured query incompleteness checked below
+    // is the completion signal that policy and RQL consume.
     use crate::inline_project::InlineTestProject;
     use brokk_bifrost_analysis::analyzer::{AnalyzerQueryScope, IAnalyzer, QueryReadIncomplete};
     use brokk_bifrost_core::analyzer::capabilities::{
@@ -1319,6 +1409,56 @@ fn csharp_membership_descendants_preserve_refused_fill() {
             "public partial class Base {} public class Child : Base {}",
         )
         .build();
+    let token = CancellationToken::default();
+
+    // (a) Genuine in-fill refusal. The analyzer is cold: retained file states
+    // are dropped, then Part.cs gains NUL bytes before the first descendant
+    // query, so the fill itself cannot read the file and must refuse.
+    {
+        let mut cold = CSharpAnalyzer::new(project.project_dyn());
+        let owner = cold
+            .declarations(&project.file("Base.cs"))
+            .into_iter()
+            .find(|unit| unit.identifier() == "Base")
+            .unwrap();
+        cold.clear_retained_file_states_for_test();
+        std::fs::write(
+            project.file("Part.cs").abs_path(),
+            b"public partial class Base {} \0\0 public class Child : Base {}",
+        )
+        .unwrap();
+        let view = MembershipScopedSource::new(&cold, &project.file("Base.cs"));
+        let answer = view.get_direct_descendants(&owner);
+        assert!(!answer.is_complete(), "{answer:?}");
+        assert!(
+            answer
+                .open
+                .iter()
+                .any(|reason| matches!(reason, HierarchyOpenReason::OpenAncestorCandidates(_))),
+            "{answer:?}"
+        );
+        let scoped = view
+            .get_direct_descendants_within(&owner, &DescendantIndexScope::whole_workspace(&token))
+            .unwrap();
+        assert!(!scoped.is_complete(), "{scoped:?}");
+        assert!(
+            scoped
+                .open
+                .iter()
+                .any(|reason| matches!(reason, HierarchyOpenReason::OpenAncestorCandidates(_))),
+            "{scoped:?}"
+        );
+        // Restore the file for the converse below.
+        std::fs::write(
+            project.file("Part.cs").abs_path(),
+            "public partial class Base {} public class Child : Base {}",
+        )
+        .unwrap();
+    }
+
+    // (b) Converse: a gap recorded only on the caller's scope leaves the
+    // descendant index complete, and the caller's captured incompleteness
+    // holds exactly that gap.
     let analyzer = CSharpAnalyzer::new(project.project_dyn());
     let owner = analyzer
         .declarations(&project.file("Base.cs"))
@@ -1326,29 +1466,22 @@ fn csharp_membership_descendants_preserve_refused_fill() {
         .find(|unit| unit.identifier() == "Base")
         .unwrap();
     let view = MembershipScopedSource::new(&analyzer, &project.file("Base.cs"));
-    let _query = AnalyzerQueryScope::capturing_read_incompleteness(&analyzer);
-    analyzer.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceGap(
-        "refused physical part".into(),
-    ));
+    let query = AnalyzerQueryScope::capturing_read_incompleteness(&analyzer);
+    let gap = QueryReadIncomplete::SemanticEvidenceGap("refused physical part".into());
+    analyzer.record_query_incomplete(gap.clone());
     let answer = view.get_direct_descendants(&owner);
-    assert!(!answer.is_complete(), "{answer:?}");
+    assert!(answer.is_complete(), "{answer:?}");
     assert!(
-        answer
-            .open
-            .iter()
-            .any(|reason| matches!(reason, HierarchyOpenReason::DescendantIndexUnavailable)),
+        answer.edges.iter().any(|unit| unit.identifier() == "Child"),
         "{answer:?}"
     );
-    let token = CancellationToken::default();
     let scoped = view
         .get_direct_descendants_within(&owner, &DescendantIndexScope::whole_workspace(&token))
         .unwrap();
-    assert!(!scoped.is_complete(), "{scoped:?}");
+    assert!(scoped.is_complete(), "{scoped:?}");
     assert!(
-        scoped
-            .open
-            .iter()
-            .any(|reason| matches!(reason, HierarchyOpenReason::DescendantIndexUnavailable)),
+        scoped.edges.iter().any(|unit| unit.identifier() == "Child"),
         "{scoped:?}"
     );
+    assert_eq!(query.captured_read_incompleteness(), vec![gap]);
 }

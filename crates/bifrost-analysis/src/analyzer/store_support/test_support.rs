@@ -764,7 +764,8 @@ pub mod operation_fixture_support {
         project_reads: brokk_bifrost_core::analyzer::project_reads::ProjectReadSlot,
         delegate: TestProject,
         generation: Arc<AtomicU64>,
-        overlay_content: Arc<Mutex<Option<Arc<WorkspaceOverlayContent>>>>,
+        overlay_project:
+            Arc<Mutex<Option<Arc<brokk_bifrost_core::analyzer::project::OverlayProject>>>>,
         /// The listing's omissions when a test sets them. Unset, the project
         /// uses `TestProject`'s real enumeration.
         omissions: Arc<Mutex<Option<Arc<Vec<WorkspaceFileOmission>>>>>,
@@ -779,7 +780,7 @@ pub mod operation_fixture_support {
                 project_reads:
                     brokk_bifrost_core::analyzer::project_reads::ProjectReadSlot::default(),
                 generation: Arc::new(AtomicU64::new(0)),
-                overlay_content: Arc::new(Mutex::new(None)),
+                overlay_project: Arc::new(Mutex::new(None)),
                 omissions: Arc::new(Mutex::new(None)),
                 omissions_fail: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }
@@ -824,16 +825,13 @@ pub mod operation_fixture_support {
 
         #[doc(hidden)]
         pub fn set_overlay_content(&self, file: ProjectFile, content: &str) {
-            let digest =
-                brokk_bifrost_core::analyzer::canonical_hash::sha256_bytes(content.as_bytes());
-            let overlay = Arc::new(WorkspaceOverlayContent::new([(
-                file,
-                digest,
-                git2::Oid::hash_object(git2::ObjectType::Blob, content.as_bytes())
-                    .expect("hashing installed fixture overlay"),
-            )]));
+            // Each setter replaces the fixture's entire advertised overlay set.
+            let overlay = Arc::new(brokk_bifrost_core::analyzer::project::OverlayProject::new(
+                Arc::new(self.delegate.clone()),
+            ));
+            assert!(overlay.set(file.abs_path(), content.to_owned()));
             *self
-                .overlay_content
+                .overlay_project
                 .lock()
                 .expect("operation test overlay lock") = Some(overlay);
         }
@@ -923,13 +921,29 @@ pub mod operation_fixture_support {
         fn overlay_content(&self) -> Option<Arc<WorkspaceOverlayContent>> {
             let _project_read = self.project_reads.overlays(self.as_project());
             let answer = {
-                self.overlay_content
+                self.overlay_project
                     .lock()
                     .expect("operation test overlay lock")
-                    .clone()
+                    .as_ref()
+                    .and_then(|project| project.overlay_content())
             };
             brokk_bifrost_core::analyzer::project_reads::publish_overlays(&answer);
             answer
+        }
+
+        fn capture_source_overlays(
+            &self,
+        ) -> std::io::Result<Arc<brokk_bifrost_core::analyzer::project::PinnedSourceOverlayView>>
+        {
+            let overlay = self
+                .overlay_project
+                .lock()
+                .expect("operation test overlay lock")
+                .clone();
+            match overlay {
+                Some(project) => project.capture_source_overlays(),
+                None => self.delegate.capture_source_overlays(),
+            }
         }
     }
     #[doc(hidden)]
@@ -1045,6 +1059,29 @@ pub mod operation_fixture_support {
 mod overlay_input_tests {
     use super::operation_fixture_support::MutableGenerationProject;
     use crate::analyzer::{Language, MultiAnalyzer, Project, ProjectFile, capture_query_reads};
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12170: the dirty-replacement fixture advertised overlays it could not pin"
+    )]
+    fn overlay_content_can_be_pinned_without_disk_content() {
+        let root = tempfile::tempdir().unwrap();
+        let project = MutableGenerationProject::new(root.path(), Language::Rust);
+        let file = ProjectFile::new(root.path(), "input.rs");
+        file.write("disk").unwrap();
+        project.set_overlay_content(file.clone(), "unsaved");
+        let pinned = project.capture_source_overlays().unwrap();
+        assert_eq!(
+            pinned.content().unwrap().entries(),
+            project.overlay_content().unwrap().entries()
+        );
+        assert_eq!(pinned.source_snapshot(&file).unwrap().source(), "unsaved");
+        let disk_only = ProjectFile::new(root.path(), "disk_only.rs");
+        disk_only.write("disk only").unwrap();
+        assert!(pinned.source_snapshot(&disk_only).is_none());
+        project.set_overlay_content(file.clone(), "later");
+        assert_eq!(pinned.source_snapshot(&file).unwrap().source(), "unsaved");
+    }
 
     #[test]
     fn overlay_content_only_projects_explicit_fixture_inputs() {

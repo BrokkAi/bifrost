@@ -528,11 +528,7 @@ fn go_selected_inverse_in_context(
             "Go selected reverse query crossed an analyzer generation".into(),
         ));
     }
-    // Projection reads structural facts through the analyzer. Release the
-    // selected reader first: a test-only single-connection store uses the
-    // writer connection for reads and cannot acquire it again while this
-    // operation holds it.
-    // Publication authority of every bound context is rechecked below.
+    // Publication authority of every bound context is rechecked after projection.
     let bound_contexts = operation.bound_go_context_publications();
     drop(operation);
     let answer = project_confirmed_references(go, target, generation, confirmed, cancellation)?;
@@ -2058,6 +2054,36 @@ func TestNew(t *testing.T) { _ = New() }
             answer.completeness,
             EdgeCompleteness::Complete,
             "the named testing import cannot hide another workspace reference: {answer:#?}"
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12904: the Go reverse readers must match the producer's conflicting_names subject"
+    )]
+    fn selected_go_reverse_reader_recognizes_published_name_conflict() {
+        // Both files are selected, so the unit publishes two declarations of
+        // `F` and its summary carries a `conflicting_names` gap. The reverse
+        // reader matches that gap by subject; a subject spelled differently
+        // from the producer's would silently drop the fallback.
+        const FIRST: &str = "package api\n\nfunc F() {}\n";
+        // Different content: identical files would share one content-addressed
+        // blob and publish one declaration.
+        const SECOND: &str = "package api\n\nfunc F() { _ = 0 }\n";
+        const CALLER: &str =
+            "package caller\n\nimport \"example.test/transitive/api\"\n\nfunc Use() { api.F() }\n";
+        let (fixture, analyzer) = transitive_fixture(&[
+            ("api/f1.go", FIRST),
+            ("api/f2.go", SECOND),
+            ("caller/caller.go", CALLER),
+        ]);
+        let target = target_at(&analyzer, &fixture, "api/f1.go", "F");
+        brokk_bifrost_analysis::analyzer::store::resolution_operation::go_reverse_rows::take_go_reverse_conflicting_names_fallbacks_for_test();
+        let answer = inverse(&analyzer, &target);
+        assert!(
+            brokk_bifrost_analysis::analyzer::store::resolution_operation::go_reverse_rows::take_go_reverse_conflicting_names_fallbacks_for_test()
+                > 0,
+            "the reverse reader must see the summary's conflicting_names gap for F: {answer:#?}"
         );
     }
 

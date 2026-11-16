@@ -901,8 +901,16 @@ impl ChangedFacts {
         for (rel_path, blob) in base_blobs {
             let file = ProjectFile::new(root.clone(), Path::new(rel_path.as_ref()).to_path_buf());
             let language = file.language();
-            if language == Language::None || project.is_bifrostignored(Path::new(rel_path.as_ref()))
-            {
+            let ignored = match project.is_bifrostignored(Path::new(rel_path.as_ref())) {
+                Ok(ignored) => ignored,
+                Err(error) => {
+                    head.analyzer()
+                        .record_query_failure(std::io::Error::other(error).into());
+                    facts.delta.refused_sources_incomplete = true;
+                    continue;
+                }
+            };
+            if language == Language::None || ignored {
                 continue;
             }
             let Some(index) = head_indexes.get(&language) else {
@@ -931,12 +939,22 @@ impl ChangedFacts {
                 .entry(language)
                 .or_default()
                 .insert(rel_path.clone());
-            let keys = base_source(*blob)
-                .and_then(|source| index.stored_blob_index_keys(&file, *blob, &source));
             let head_entries = head_by_language
                 .get(&language)
                 .and_then(|blobs| blobs.get(rel_path))
                 .map(|(head_file, head_blob)| index.blob_index_keys(head_file, *head_blob));
+            // A configured parse variant is the head's selection for a path the
+            // head holds. A path the head lacks (deleted, or outside a
+            // `--sources` file set) has no head variant to key the base blob
+            // with, so its base facts cannot be enumerated from the head (#12508).
+            if head_blob.is_none() && language.uses_configured_parse_variants() {
+                facts
+                    .delta
+                    .record_index_difference(language, rel_path, Some(None), head_entries);
+                continue;
+            }
+            let keys = base_source(*blob)
+                .and_then(|source| index.stored_blob_index_keys(&file, *blob, &source));
             // An absent deleted blob never published facts in this generation;
             // retain the existing reclamation/admission exception.
             let base_entries = if keys.is_none() && head_blob.is_none() {
@@ -1114,7 +1132,7 @@ fn blob_map(index: &dyn WorkspaceFactIndex) -> Option<HashMap<Box<str>, (Project
 /// recorded answer whenever the content did not move. A narrower replay would
 /// truncate where the recording did not and report a change that is really a
 /// budget artifact.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LookupReplayLimits {
     /// The call-relation funnel's own limits, for `callers` and `callees`.
     pub call_relations: CallRelationLimits,
@@ -1164,20 +1182,24 @@ pub trait SummaryAnswers {
         None
     }
 
-    /// The content digest the head retains under `identity`, or the ledger's
-    /// absent digest when it retains nothing.
+    /// An optional retained-content comparison for `identity`.
     ///
-    /// `None` is not absence. It says this head cannot be asked the question
-    /// at all -- no repository in hand, or more than one summary retained
-    /// under one identity -- which makes every unit that recorded a summary
-    /// read recompute, the sound direction.
+    /// A present, non-absent digest different from the recorded digest
+    /// invalidates the read. `None` or the ledger's absent digest adds no
+    /// additional invalidation. The complete producer and dependency reads
+    /// must verify independently.
+    ///
+    /// `None` means the head cannot answer the question, for example because
+    /// no repository is available or differing contents are retained under
+    /// one identity. The absent digest means it retains nothing.
     fn summary_content(&self, identity: StableDigest) -> Option<StableDigest>;
 }
 
 /// The answer source for a verification holding no summary repository.
 ///
-/// Every summary read it is asked about is unanswerable, so a unit that
-/// recorded one is recomputed.
+/// It supplies no retained-content comparison and does not itself force
+/// recomputation. The complete producer and dependency reads must verify
+/// independently.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoSummaryAnswers;
 
@@ -1187,7 +1209,32 @@ impl SummaryAnswers for NoSummaryAnswers {
     }
 }
 
-/// Replayed lookup answers, keyed by the question that produced them.
+/// Request-owned, language-neutral slots for bounded language lookup memos.
+#[derive(Default)]
+pub struct OwnedLookupMemo {
+    slots: std::sync::Mutex<
+        HashMap<std::any::TypeId, std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    >,
+}
+impl std::fmt::Debug for OwnedLookupMemo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnedLookupMemo").finish_non_exhaustive()
+    }
+}
+impl OwnedLookupMemo {
+    pub fn get<T: Default + Send + Sync + 'static>(&self) -> std::sync::Arc<T> {
+        let mut slots = self.slots.lock().expect("lookup memo poisoned");
+        std::sync::Arc::clone(
+            slots
+                .entry(std::any::TypeId::of::<T>())
+                .or_insert_with(|| std::sync::Arc::new(T::default())),
+        )
+        .downcast::<T>()
+        .expect("lookup slot has its registered type")
+    }
+}
+
+/// Replayed lookup answers, keyed by the question and its replay limits.
 ///
 /// Verification asks the same question once per unit that recorded it, and a
 /// policy with many units asks it many times. The memo is the caller's, not a
@@ -1195,7 +1242,9 @@ impl SummaryAnswers for NoSummaryAnswers {
 /// outlives the workspace it was computed against.
 #[derive(Debug, Default)]
 pub struct LookupMemo {
-    answers: HashMap<(LookupKind, LookupQuestion), Option<StableDigest>>,
+    drop_inventory: OwnedLookupMemo,
+    answers:
+        HashMap<(LookupKind, LookupQuestion, Option<LookupReplayLimits>), Option<StableDigest>>,
     replay_elapsed: Duration,
     selection_request:
         Option<std::sync::Arc<brokk_bifrost_core::analyzer::outer_request::OuterRequest>>,
@@ -1215,7 +1264,7 @@ impl LookupMemo {
     ) -> Option<StableDigest> {
         use brokk_bifrost_core::analyzer::external_selection::SelectionRetry;
         use brokk_bifrost_core::analyzer::outer_request::OuterRequest;
-        let key = (LookupKind::ExternalSelection, question.clone());
+        let key = (LookupKind::ExternalSelection, question.clone(), None);
         if let Some(answer) = self.answers.get(&key) {
             return *answer;
         }
@@ -1267,7 +1316,7 @@ impl LookupMemo {
             })
     }
 
-    /// How many distinct questions this memo has answered.
+    /// How many distinct question-and-limit combinations this memo has answered.
     pub fn len(&self) -> usize {
         self.answers.len()
     }
@@ -1300,7 +1349,7 @@ impl LookupMemo {
             !read_ledger_attached,
             "lookup verification is outside product captures"
         );
-        if let Some(answer) = self.answers.get(&(kind, question.clone())) {
+        if let Some(answer) = self.answers.get(&(kind, question.clone(), Some(limits))) {
             return *answer;
         }
         let started = Instant::now();
@@ -1334,16 +1383,41 @@ impl LookupMemo {
                             language: Language::None,
                             subject: FactSubject::Whole,
                         },
+                        Some(limits),
                     ),
                     answer,
                 );
             }
             self.replay_elapsed += started.elapsed();
-            return self.answers[&(kind, question.clone())];
+            return self.answers[&(kind, question.clone(), Some(limits))];
         }
-        let answer = replay_lookup(head, kind, question, limits, summaries);
+        let answer = if matches!(
+            kind,
+            LookupKind::RustDropInventory | LookupKind::RustDropSubject
+        ) {
+            crate::analyzer::languages::language_support_for_hook(
+                Language::Rust,
+                "replay_owned_lookup",
+            )
+            .and_then(|support| {
+                support.replay_owned_lookup(
+                    head,
+                    kind,
+                    question,
+                    limits.semantic.nested_entries,
+                    &self.drop_inventory,
+                )
+            })
+        } else {
+            replay_lookup(head, kind, question, limits, summaries)
+        };
         self.replay_elapsed += started.elapsed();
-        self.answers.insert((kind, question.clone()), answer);
+        // Usages returns None for a refused coverage certificate as well as
+        // a missing declaration. A refused query never becomes a memo fill.
+        if kind != LookupKind::Usages || answer.is_some() {
+            self.answers
+                .insert((kind, question.clone(), Some(limits)), answer);
+        }
         answer
     }
 }
@@ -1485,6 +1559,16 @@ pub fn replay_lookup(
         LookupKind::Derivation(_) => None,
         // #9559 M3a: the head has no external-selection verifier yet.
         LookupKind::ExternalSelection => None,
+        LookupKind::RustMacroInvocations => {
+            let analyzer = head.analyzer();
+            let store = head.store()?;
+            let snapshots = analyzer.selected_workspace_snapshots_for_reads()?;
+            let cancellation = analyzer.active_query_cancellation().unwrap_or_default();
+            store
+                .rust_macro_invocations_answer(snapshots.as_ref(), question, &cancellation)
+                .ok()
+                .map(|answer| answer.digest)
+        }
         LookupKind::RustBoundTraitImplInventory
         | LookupKind::RustTraitsImplementedByInventory
         | LookupKind::RustAliasBlobInventory
@@ -1492,11 +1576,19 @@ pub fn replay_lookup(
         | LookupKind::RustUnresolvedTraitImplInventory
         | LookupKind::RustModuleImportCandidateInventory
         | LookupKind::RustIdentifierOccurrenceInventory
-        | LookupKind::RustCopyAbsence => crate::analyzer::languages::language_support_for_hook(
+        | LookupKind::RustCopyAbsence
+        | LookupKind::RustDropInventory
+        | LookupKind::RustDropSubject => crate::analyzer::languages::language_support_for_hook(
             Language::Rust,
             "replay_owned_lookup",
         )?
-        .replay_owned_lookup(head, kind, question, limits.semantic.nested_entries),
+        .replay_owned_lookup(
+            head,
+            kind,
+            question,
+            limits.semantic.nested_entries,
+            &OwnedLookupMemo::default(),
+        ),
         LookupKind::StructuralNameInventory
         | LookupKind::StructuralRoleNameInventory
         | LookupKind::StructuralRecoveredInventory => {
@@ -1690,15 +1782,15 @@ pub fn replay_lookup(
         }
         LookupKind::Usages => {
             let unit = replayed_declaration(analyzer, question)?;
-            let result = UsageFinder::new().find_usages(
-                analyzer,
-                std::slice::from_ref(&unit),
-                limits.max_usage_files,
-                limits.max_usages,
-            );
-            Some(crate::analyzer::i_analyzer::usage_answer_digest(
-                &result, &unit,
-            ))
+            let result = UsageFinder::new()
+                .with_cancellation(analyzer.active_query_cancellation().unwrap_or_default())
+                .query(
+                    analyzer,
+                    std::slice::from_ref(&unit),
+                    limits.max_usage_files,
+                    limits.max_usages,
+                );
+            crate::analyzer::usages::reusable_usage_answer_digest(&result, &unit)
         }
         LookupKind::ReferenceCandidates => {
             let unit = replayed_declaration(analyzer, question)?;
@@ -1736,6 +1828,9 @@ pub fn replay_lookup(
         }
         LookupKind::Dispatch | LookupKind::ProcedureDispatch => {
             replay_dispatch(head, kind, question, limits)
+        }
+        LookupKind::ArgumentClasses | LookupKind::ConditionalDispatch => {
+            replay_argument_receiver_question(head, kind, question, limits)
         }
         // The repository is not this crate's, so the answer comes from the
         // caller that holds the head's, through the same lookup the recording
@@ -2101,12 +2196,86 @@ fn replay_procedure_dispatch_with_request(
 ) -> Option<StableDigest> {
     let LookupQuestion::CallSite {
         rel_path,
-        procedure: expected_procedure,
-        site: expected_site,
+        procedure,
+        site,
     } = question
     else {
         unreachable!("replay_procedure_dispatch is called only for a procedure call-site question")
     };
+    let call = replayed_procedure_call(head, rel_path, procedure, site, request)?;
+    let outcome = oracle.resolve_call(&call, request).ok()?;
+    Some(
+        crate::analyzer::semantic::workspace_oracle::one_call_dispatch_answer_digest(
+            &call, &outcome,
+        ),
+    )
+}
+
+/// Replay one #12968 argument-receiver read: the argument classes of an
+/// entering call, or a call's dispatch under a receiver hypothesis.
+fn replay_argument_receiver_question(
+    head: &WorkspaceAnalyzer,
+    kind: LookupKind,
+    question: &LookupQuestion,
+    limits: LookupReplayLimits,
+) -> Option<StableDigest> {
+    let mut budget = SemanticBudget::new(limits.semantic).ok()?;
+    let cancellation = CancellationToken::default();
+    let request = &mut SemanticRequest::new(&mut budget, &cancellation);
+    let oracle = head.semantic_oracle_provider();
+    match (kind, question) {
+        (
+            LookupKind::ArgumentClasses,
+            LookupQuestion::CallSite {
+                rel_path,
+                procedure,
+                site,
+            },
+        ) => {
+            let call = replayed_procedure_call(head, rel_path, procedure, site, request)?;
+            let outcome = oracle.argument_classes(&call, request).ok()?;
+            Some(
+                crate::analyzer::semantic::workspace_oracle::argument_classes_answer_digest(
+                    &outcome,
+                ),
+            )
+        }
+        (
+            LookupKind::ConditionalDispatch,
+            LookupQuestion::ReceiverCallSite {
+                rel_path,
+                procedure,
+                site,
+                receiver_class,
+            },
+        ) => {
+            let call = replayed_procedure_call(head, rel_path, procedure, site, request)?;
+            let outcome = oracle
+                .resolve_call_with_receiver_class(&call, receiver_class, request)
+                .ok()?;
+            Some(
+                crate::analyzer::semantic::workspace_oracle::one_call_dispatch_answer_digest(
+                    &call, &outcome,
+                ),
+            )
+        }
+        _ => {
+            debug_assert!(false, "an argument-receiver read needs its call question");
+            None
+        }
+    }
+}
+
+/// The one live call a stable procedure lineage and source rank name on
+/// `head`, or `None` when the procedure is gone, ambiguous or the rank is out
+/// of range.
+fn replayed_procedure_call(
+    head: &WorkspaceAnalyzer,
+    rel_path: &str,
+    expected_procedure: &StableDigest,
+    expected_site: &crate::analyzer::read_ledger::CallSiteLocator,
+    request: &mut SemanticRequest<'_>,
+) -> Option<CallSiteHandle> {
     let file = analyzed_file(head.analyzer(), rel_path)?;
     let materialized = head
         .materialize_program_semantics(&file, request)
@@ -2134,16 +2303,10 @@ fn replay_procedure_dispatch_with_request(
         }
     }
     let procedure = matched_procedure?;
-    let call = match procedure_dispatch_call_at_relative_site(&procedure, expected_site, request) {
-        Ok(Some(call)) => call,
-        Ok(None) | Err(_) => return None,
-    };
-    let outcome = oracle.resolve_call(&call, request).ok()?;
-    Some(
-        crate::analyzer::semantic::workspace_oracle::one_call_dispatch_answer_digest(
-            &call, &outcome,
-        ),
-    )
+    match procedure_dispatch_call_at_relative_site(&procedure, expected_site, request) {
+        Ok(Some(call)) => Some(call),
+        Ok(None) | Err(_) => None,
+    }
 }
 
 fn procedure_dispatch_call_at_relative_site(
@@ -2350,6 +2513,205 @@ pub fn verify_read_set_for_artifact(
     ReadVerdict::Unchanged
 }
 
+/// How the head relates to the base tree a recorded selection read describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BaseView {
+    /// The head holds exactly the base tree's content, so its authority speaks
+    /// for the base on every question.
+    HeadIsBase,
+    /// The head can differ from the base tree. Its authority speaks for the
+    /// base only on questions that content cannot change.
+    HeadMayDiffer,
+}
+
+/// The class of one recorded selection read, or `None` when it is not a
+/// selection-authority lookup.
+fn selection_class_of(
+    head: &WorkspaceAnalyzer,
+    key: &ReadKey,
+) -> Option<brokk_bifrost_core::analyzer::reuse_verdict::SelectionClass> {
+    use brokk_bifrost_core::analyzer::reuse_verdict::SelectionClass;
+    match key {
+        ReadKey::Lookup {
+            kind: LookupKind::ExternalSelection,
+            question: LookupQuestion::ExternalSelection { question_digest },
+            ..
+        } => Some(
+            brokk_bifrost_core::analyzer::external_selection::questions(
+                &head.analyzer().external_selection_authorities(),
+            )
+            .iter()
+            .find(|question| question.digest == *question_digest)
+            .map_or(SelectionClass::TreeDependent, |question| {
+                question.kind.class()
+            }),
+        ),
+        ReadKey::Lookup {
+            question:
+                LookupQuestion::WorkspaceFact {
+                    family, subject, ..
+                },
+            ..
+        } if key.is_selection_authority() => Some(family.selection_class(subject)),
+        _ => None,
+    }
+}
+
+/// The tree part to record beside a `Split` selection read: what the analyzer's
+/// manifests declare, when resolving it again reproduces the recorded answer
+/// (#11607). `None` for any other read, and for a `Split` read whose
+/// declaration cannot stand for its answer, which then replays only against a
+/// head that is the base tree.
+pub fn selection_basis(
+    analyzer: &dyn IAnalyzer,
+    key: &ReadKey,
+) -> Option<brokk_bifrost_core::analyzer::external_selection::JvmDependencyBasis> {
+    match key {
+        ReadKey::Lookup {
+            kind: LookupKind::ExternalSelection,
+            question: LookupQuestion::ExternalSelection { question_digest },
+            digest,
+        } => analyzer
+            .external_selection_authorities()
+            .into_iter()
+            .find_map(|authority| {
+                authority
+                    .questions()
+                    .into_iter()
+                    .find(|question| question.digest == *question_digest)
+                    .and_then(|question| authority.basis(&question, *digest.as_bytes()))
+            }),
+        ReadKey::Lookup {
+            question:
+                LookupQuestion::WorkspaceFact {
+                    family,
+                    language,
+                    subject,
+                },
+            digest,
+            ..
+        } if family.selection_class(subject)
+            == brokk_bifrost_core::analyzer::reuse_verdict::SelectionClass::Split =>
+        {
+            crate::analyzer::languages::language_support(Language::Java)?
+                .workspace_fact_basis(analyzer, *family, *language, subject, *digest)
+        }
+        _ => None,
+    }
+}
+
+/// The answer of a `Split` selection read when its tree part is `basis` and the
+/// environment is the head's.
+///
+/// Paths the answer resolves under the workspace root (an in-tree explicit
+/// artifact) resolve under the head's root here, and the result is compared with
+/// the recorded digest. That is sound in both directions without a root-relative
+/// digest: an equal digest means the head's artifact gives the answer the base
+/// recorded, and a changed artifact refuses, which is only conservative. No
+/// recorded digest folds the export's temporary root: an uncertified selection
+/// (explicit config paths) is never recorded, the gap identity hashes no path,
+/// and a manifest-named artifact path records no tree part at all (#11607).
+fn selection_answer_under_basis(
+    head: &WorkspaceAnalyzer,
+    key: &ReadKey,
+    basis: &brokk_bifrost_core::analyzer::external_selection::JvmDependencyBasis,
+) -> Option<StableDigest> {
+    match key {
+        ReadKey::Lookup {
+            kind: LookupKind::ExternalSelection,
+            question: LookupQuestion::ExternalSelection { question_digest },
+            ..
+        } => head
+            .analyzer()
+            .external_selection_authorities()
+            .into_iter()
+            .find_map(|authority| {
+                authority
+                    .questions()
+                    .into_iter()
+                    .find(|question| question.digest == *question_digest)
+                    .map(|question| authority.answer_under_basis(&question, basis))
+            })
+            .flatten()
+            .map(StableDigest::from_array),
+        ReadKey::Lookup {
+            question:
+                LookupQuestion::WorkspaceFact {
+                    family,
+                    language,
+                    subject,
+                },
+            ..
+        } => crate::analyzer::languages::language_support(Language::Java)?
+            .workspace_fact_answer_under_basis(head.analyzer(), *family, *language, subject, basis),
+        _ => None,
+    }
+}
+
+/// Whether every recorded selection read still holds, for an aggregate
+/// evaluation recorded over a base the head may differ from (#11482, #11607).
+///
+/// Each read is checked by what its class allows:
+/// - `EnvironmentOnly`: recomputed by the verifier its key kind already has.
+/// - `ExportDetermined`: nothing to recompute when the row was produced over an
+///   export of the key's tree (`base_is_export`), because the answer is a
+///   function of that tree.
+/// - `Split`: with an export base and a recorded tree part, the part is resolved
+///   again in the head's environment and compared with the recorded answer.
+/// - any other read, or any read without what its class needs: verified only
+///   when `view` says the head is the base tree. Otherwise nothing here can say
+///   what the base would answer today, and the answer is `Incomplete`.
+///
+/// Anything that is not a selection-authority lookup is `Incomplete`.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_selection_reads(
+    head: &WorkspaceAnalyzer,
+    changed: &ChangedFacts,
+    reads: &[crate::analyzer::semantic::read_ledger::SelectionRead],
+    view: BaseView,
+    base_is_export: bool,
+    limits: LookupReplayLimits,
+    summaries: &dyn SummaryAnswers,
+    memo: &mut LookupMemo,
+) -> brokk_bifrost_core::analyzer::reuse_verdict::SelectionEvidence {
+    use brokk_bifrost_core::analyzer::reuse_verdict::{SelectionClass, SelectionEvidence};
+    let mut recompute = Vec::new();
+    for read in reads {
+        let Some(class) = selection_class_of(head, &read.key) else {
+            return SelectionEvidence::Incomplete;
+        };
+        match (class, &read.basis) {
+            (SelectionClass::EnvironmentOnly, _) => recompute.push(read.key.clone()),
+            (SelectionClass::ExportDetermined, _) if base_is_export => {}
+            (SelectionClass::Split, Some(basis)) if base_is_export => {
+                let recorded = match &read.key {
+                    ReadKey::Lookup { digest, .. } => *digest,
+                    _ => return SelectionEvidence::Incomplete,
+                };
+                if selection_answer_under_basis(head, &read.key, basis) != Some(recorded) {
+                    return SelectionEvidence::Incomplete;
+                }
+            }
+            _ if view == BaseView::HeadIsBase => recompute.push(read.key.clone()),
+            _ => return SelectionEvidence::Incomplete,
+        }
+    }
+    // The inputs a lookup never consults: every key above is a lookup.
+    let unused = StableDigest::from_array([0; 32]);
+    let inputs = HeadInputs {
+        models: unused,
+        policy_semantic_hash: unused,
+        policy_source: unused,
+        configuration: unused,
+        epoch: unused,
+    };
+    if verify_read_set(head, changed, &inputs, &recompute, limits, summaries, memo).is_unchanged() {
+        SelectionEvidence::Complete
+    } else {
+        SelectionEvidence::Incomplete
+    }
+}
+
 /// The result of checking one recorded input against the selected head.
 #[derive(Debug)]
 pub enum KeyVerdict {
@@ -2428,18 +2790,6 @@ pub fn verify_read_key(
                     })
             }
         }
-        // A procedure-summary read is the one lookup whose absence is not
-        // evidence of a change. A head that has not solved anything
-        // retains no summary at all, so replaying every recorded summary
-        // read against a cold repository would answer absence for all of
-        // them and recompute every unit that ever crossed the summary
-        // funnel -- which is every typestate root. What carries the
-        // dependency instead is the closure the recorder names beside the
-        // summary: one `Artifact` key per member, verified by fingerprint
-        // against what the head would derive from those files now. So an
-        // absent or unanswerable summary lookup holds, and only a head
-        // that does retain a summary under the recorded identity, with
-        // different content, reports a change.
         ReadKey::Lookup {
             kind: LookupKind::ExternalSelection,
             question,
@@ -2458,6 +2808,18 @@ pub fn verify_read_key(
                 dependency: key.canonical_digest(),
             })
         }
+        // A procedure-summary read is the one lookup whose absence is not
+        // evidence of a change. A head that has not solved anything
+        // retains no summary at all, so replaying every recorded summary
+        // read against a cold repository would answer absence for all of
+        // them and recompute every unit that ever crossed the summary
+        // funnel -- which is every typestate root. What carries the
+        // dependency instead is the closure the recorder names beside the
+        // summary: one `Artifact` key per member, verified by fingerprint
+        // against what the head would derive from those files now. So an
+        // absent or unanswerable summary lookup holds, and only a head
+        // that does retain a summary under the recorded identity, with
+        // different content, reports a change.
         ReadKey::Lookup {
             kind: LookupKind::ProcedureSummary,
             question,
@@ -2488,8 +2850,10 @@ pub fn verify_read_key(
             digest,
         } => match kind {
             LookupKind::Derivation(_) => {
+                // Bind derived replay answers to the same limits as every
+                // ordinary lookup, including any usage work reached inside it.
                 let answer = if let Some(Some(answer)) =
-                    memo.answers.get(&(*kind, question.clone()))
+                    memo.answers.get(&(*kind, question.clone(), Some(limits)))
                 {
                     Some(*answer)
                 } else {
@@ -2508,7 +2872,7 @@ pub fn verify_read_key(
                     memo.replay_elapsed += started.elapsed();
                     if let Some(identity) = answer {
                         memo.answers
-                            .insert((*kind, question.clone()), Some(identity));
+                            .insert((*kind, question.clone(), Some(limits)), Some(identity));
                     }
                     answer
                 };
@@ -2526,6 +2890,7 @@ pub fn verify_read_key(
             }
             LookupKind::StoredSemanticIrPublication
             | LookupKind::RustCopyAbsence
+            | LookupKind::RustMacroInvocations
             | LookupKind::RustBoundTraitImplInventory
             | LookupKind::RustTraitsImplementedByInventory
             | LookupKind::RustAliasBlobInventory
@@ -2533,6 +2898,8 @@ pub fn verify_read_key(
             | LookupKind::RustUnresolvedTraitImplInventory
             | LookupKind::RustModuleImportCandidateInventory
             | LookupKind::RustIdentifierOccurrenceInventory
+            | LookupKind::RustDropSubject
+            | LookupKind::RustDropInventory
             | LookupKind::StructuralNameInventory
             | LookupKind::StructuralRoleNameInventory
             | LookupKind::StructuralRecoveredInventory
@@ -2552,6 +2919,8 @@ pub fn verify_read_key(
             | LookupKind::Importers
             | LookupKind::Dispatch
             | LookupKind::ProcedureDispatch
+            | LookupKind::ArgumentClasses
+            | LookupKind::ConditionalDispatch
             | LookupKind::WorkspaceFact => {
                 match memo.answer(head, *kind, question, limits, summaries) {
                     None => Some(InvalidationReason::ReverseDependencyEvidenceMissing { artifact }),
@@ -2847,6 +3216,91 @@ mod tests {
         let index = fixture_index(root.path(), source);
         let head = workspace(root.path(), Some(index));
         (root, head)
+    }
+
+    #[test]
+    #[hardwon(
+        "#11967: a Callers read digest ignored caller-site proof, so a proof-filtering consumer reused a stale result"
+    )]
+    fn callers_proof_change_invalidates_read() {
+        use crate::analyzer::usages::call_relations::{
+            CallRelationResult, CallSite, call_relation_answer_digest,
+        };
+        use crate::analyzer::usages::get_definition::call_sites::CallSyntaxKind;
+        use crate::analyzer::usages::{UsageProof, UsageProofAuthority};
+        let (root, head) = workspace_fixture("");
+        let file = ProjectFile::new(root.path(), "caller.py");
+        let caller = CodeUnit::new(
+            file.clone(),
+            crate::analyzer::CodeUnitType::Function,
+            "",
+            "caller",
+        );
+        let callee = CodeUnit::new(
+            file.clone(),
+            crate::analyzer::CodeUnitType::Function,
+            "",
+            "target",
+        );
+        let range = crate::analyzer::Range {
+            start_byte: 10,
+            end_byte: 18,
+            start_line: 1,
+            end_line: 1,
+        };
+        let mut answer = CallRelationResult {
+            sites: vec![CallSite {
+                file,
+                range,
+                callee_range: range,
+                caller,
+                callee: callee.clone(),
+                kind: CallSyntaxKind::Function,
+                proof: UsageProof::Proven,
+                receiver: None,
+                arguments: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        let before = call_relation_answer_digest(&answer);
+        let question = LookupQuestion::declaration(&callee);
+        let key = ReadKey::lookup(LookupKind::Callers, question.clone(), before);
+        let limits = LookupReplayLimits::default();
+        // Seed the replay memo with a constructed producer answer, keeping the
+        // actual read-verification and invalidation path under test.
+        let verify = |result: &CallRelationResult| {
+            let mut memo = LookupMemo::new();
+            memo.answers.insert(
+                (LookupKind::Callers, question.clone(), Some(limits)),
+                Some(call_relation_answer_digest(result)),
+            );
+            verify_read_set(
+                &head,
+                &ChangedFacts::between(&head, &head),
+                &inputs(),
+                std::slice::from_ref(&key),
+                limits,
+                &NoSummaryAnswers,
+                &mut memo,
+            )
+        };
+        assert!(verify(&answer).is_unchanged());
+        answer.sites[0].proof = UsageProof::Unproven;
+        assert_ne!(before, call_relation_answer_digest(&answer));
+        assert!(!verify(&answer).is_unchanged());
+        let unproven = call_relation_answer_digest(&answer);
+        answer.sites.push(CallSite {
+            proof: UsageProof::Proven,
+            ..answer.sites[0].clone()
+        });
+        assert_ne!(unproven, call_relation_answer_digest(&answer));
+        answer.sites.reverse();
+        let both = call_relation_answer_digest(&answer);
+        answer.sites.push(answer.sites[0].clone());
+        assert_eq!(both, call_relation_answer_digest(&answer));
+        answer.proof_authority = UsageProofAuthority::Native;
+        assert_ne!(both, call_relation_answer_digest(&answer));
+        assert!(!verify(&answer).is_unchanged());
     }
 
     #[test]

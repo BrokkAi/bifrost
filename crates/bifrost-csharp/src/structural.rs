@@ -352,6 +352,9 @@ pub const CSHARP_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("invocation_expression", NormalizedKind::Call),
     ("object_creation_expression", NormalizedKind::Call),
     ("implicit_object_creation_expression", NormalizedKind::Call),
+    // `: base(...)` and `: this(...)` chain to another constructor of the
+    // direct base or the same type, so each is one constructor call.
+    ("constructor_initializer", NormalizedKind::Call),
     ("member_access_expression", NormalizedKind::FieldAccess),
     ("conditional_access_expression", NormalizedKind::FieldAccess),
     ("element_access_expression", NormalizedKind::FieldAccess),
@@ -553,7 +556,7 @@ fn case_parts(node: Node<'_>) -> Option<(Vec<Node<'_>>, Vec<Node<'_>>)> {
     (has_label && !header && !needs_test).then_some((tests, body))
 }
 
-fn csharp_string_literal_value(node: Node<'_>, source: &str) -> Option<String> {
+pub(crate) fn csharp_string_literal_value(node: Node<'_>, source: &str) -> Option<String> {
     let spelling = node.utf8_text(source.as_bytes()).ok()?;
     match node.kind() {
         "string_literal" => {
@@ -1482,8 +1485,10 @@ impl StructuralSpec for CSharpStructuralSpec {
     }
 
     /// C# spells object creation as its own grammar node, so a constructor
-    /// call is a node-type reading (#1478). Named arguments already reach the
-    /// shared arena as keyword roles and need no classification here.
+    /// call is a node-type reading (#1478). A `: base(...)` or `: this(...)`
+    /// initializer is a constructor call as well (#10319). Named arguments
+    /// already reach the shared arena as keyword roles and need no
+    /// classification here.
     fn call_site_facts(
         &self,
         node: Node<'_>,
@@ -1492,7 +1497,9 @@ impl StructuralSpec for CSharpStructuralSpec {
     ) -> Option<CallSiteFacts> {
         matches!(
             node.kind(),
-            "object_creation_expression" | "implicit_object_creation_expression"
+            "object_creation_expression"
+                | "implicit_object_creation_expression"
+                | "constructor_initializer"
         )
         .then(|| CallSiteFacts::of_kind(CallKind::Constructor))
     }
@@ -1778,12 +1785,28 @@ impl StructuralSpec for CSharpStructuralSpec {
                         );
                     }
                 }
+                if node.kind() == "constructor_initializer" {
+                    // The `base` or `this` keyword names the callee, as the
+                    // type does for `new T(x)` (#10319).
+                    let mut cursor = node.walk();
+                    if let Some(keyword) = node
+                        .children(&mut cursor)
+                        .find(|child| matches!(child.kind(), "base" | "this"))
+                    {
+                        attach_terminal_callee(sink, keyword, Some(keyword));
+                    }
+                }
+                // Target-typed `new(...)` and constructor initializers spell
+                // their argument list without an `arguments` field.
                 let arguments = node.child_by_field_name("arguments").or_else(|| {
-                    (node.kind() == "implicit_object_creation_expression")
-                        .then(|| {
-                            named_children_iter(node).find(|child| child.kind() == "argument_list")
-                        })
-                        .flatten()
+                    matches!(
+                        node.kind(),
+                        "implicit_object_creation_expression" | "constructor_initializer"
+                    )
+                    .then(|| {
+                        named_children_iter(node).find(|child| child.kind() == "argument_list")
+                    })
+                    .flatten()
                 });
                 if let Some(arguments) = arguments {
                     attach_argument_roles(sink, arguments);

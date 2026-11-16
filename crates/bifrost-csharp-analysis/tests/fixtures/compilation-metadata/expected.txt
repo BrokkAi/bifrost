@@ -29,7 +29,7 @@ Framework: assembly=Some("Framework")
     namespace Shared.Targets alias=None origin=item
   friends complete=true: []
 Mixed: assembly=Some("Mixed")
-  usings complete=false
+  usings complete=true
     namespace Shared.Configuration alias=None origin=item
     namespace System alias=None origin=implicit
     namespace System.Collections.Generic alias=None origin=implicit
@@ -76,7 +76,7 @@ Browser: assembly=Some("Browser")
     namespace Shared.Targets alias=None origin=item
   friends complete=true: []
 MixedWeb: assembly=Some("MixedWeb")
-  usings complete=false
+  usings complete=true
     namespace Shared.Configuration alias=None origin=item
     namespace System alias=None origin=implicit
     namespace System.Collections.Generic alias=None origin=implicit
@@ -85,6 +85,15 @@ MixedWeb: assembly=Some("MixedWeb")
     namespace System.Net.Http alias=None origin=implicit
     namespace System.Threading alias=None origin=implicit
     namespace System.Threading.Tasks alias=None origin=implicit
+    namespace System.Net.Http.Json alias=None origin=implicit
+    namespace Microsoft.AspNetCore.Builder alias=None origin=implicit
+    namespace Microsoft.AspNetCore.Hosting alias=None origin=implicit
+    namespace Microsoft.AspNetCore.Http alias=None origin=implicit
+    namespace Microsoft.AspNetCore.Routing alias=None origin=implicit
+    namespace Microsoft.Extensions.Configuration alias=None origin=implicit
+    namespace Microsoft.Extensions.DependencyInjection alias=None origin=implicit
+    namespace Microsoft.Extensions.Hosting alias=None origin=implicit
+    namespace Microsoft.Extensions.Logging alias=None origin=implicit
     namespace Shared.Targets alias=None origin=item
   friends complete=true: []
 Worker: assembly=Some("Worker")
@@ -176,6 +185,22 @@ Conditional: assembly=None
     namespace Shared.Configuration alias=None origin=item
     namespace Shared.Targets alias=None origin=item
   friends complete=false: []
+Restored: assembly=Some("Restored")
+  usings complete=true
+    namespace Shared.Configuration alias=None origin=item
+    namespace Shared.Targets alias=None origin=item
+  friends complete=true: []
+Legacy: assembly=Some("Legacy")
+  usings complete=false
+  friends complete=true: []
+SdkMutable: assembly=Some("SdkMutable")
+  usings complete=false
+    namespace Shared.Configuration alias=None origin=item
+    namespace Shared.Targets alias=None origin=item
+  friends complete=false: []
+Failed: assembly=None
+  usings complete=false
+  friends complete=false: []
 gaps:
   unsupported_project_items Blazor/Blazor.csproj Microsoft.NET.Sdk.BlazorWebAssembly generated Razor component declarations and SDK Compile effects: BaseIntermediateOutputPath=obj/ (inside project); Configuration=Debug (inside project); TargetFramework=net8.0 (inside project); IntermediateOutputPath=obj/Debug/net8.0/ (inside project); workspace SDK defaults: AppDesignerFolder=Properties, BaseIntermediateOutputPath=obj/, Configuration=Debug, IntermediateOutputPath under BaseIntermediateOutputPath/Configuration/TargetFramework
   unproven_transitive_reference_flow Blazor/Blazor.csproj a non-SDK project's transitive reference flow is not modeled
@@ -183,18 +208,32 @@ gaps:
   unproven_transitive_reference_flow Browser/Browser.csproj a non-SDK project's transitive reference flow is not modeled
   unresolved_assembly_name Conditional/Conditional.csproj AssemblyName has a dynamic value or condition
   unresolved_global_usings Conditional/Conditional.csproj ImplicitUsings has a dynamic value or condition
-  unresolved_global_usings Conditional/Conditional.csproj unsupported using item: [("Include", "Conditional.Namespace")]
-  unresolved_internals_visible_to Conditional/Conditional.csproj unsupported internalsvisibleto item: [("Include", "Conditional.Friend")]
+  unresolved_global_usings Conditional/Conditional.csproj undecided using item conditions: ["'$(Configuration)' == 'Debug'"]
+  unresolved_internals_visible_to Conditional/Conditional.csproj undecided internalsvisibleto item conditions: ["'$(Configuration)' == 'Debug'"]
   unsupported_project_items Desktop/Desktop.csproj Microsoft.NET.Sdk.WindowsDesktop generated XAML .g.cs declarations and SDK Compile effects: BaseIntermediateOutputPath=obj/ (inside project); Configuration=Debug (inside project); TargetFramework=net8.0-windows (inside project); IntermediateOutputPath=obj/Debug/net8.0-windows/ (inside project); workspace SDK defaults: AppDesignerFolder=Properties, BaseIntermediateOutputPath=obj/, Configuration=Debug, IntermediateOutputPath under BaseIntermediateOutputPath/Configuration/TargetFramework
   unproven_transitive_reference_flow Desktop/Desktop.csproj a non-SDK project's transitive reference flow is not modeled
-  unresolved_global_usings Mixed/Mixed.csproj TargetFrameworkIdentifier does not establish the System.Net.Http condition
+  unsupported_project_items Failed/Failed.csproj unresolved Import: [("Project", "$(Missing)/Unknown.props")]
+  unresolved_compilation_metadata Failed/Failed.csproj an unsupported configuration shape can change compilation metadata
+  unresolved_global_usings Directory.Build.props undecided using item conditions: []
+  unresolved_global_usings Directory.Build.props undecided using item conditions: []
+  unresolved_global_usings Directory.Build.props undecided using item conditions: []
+  unresolved_internals_visible_to Directory.Build.props undecided internalsvisibleto item conditions: []
+  unresolved_global_usings Failed/Failed.csproj undecided using item conditions: ["'$(Gate)' == 'true'"]
+  unresolved_global_usings Directory.Build.targets undecided using item conditions: []
+  unresolved_global_usings Directory.Build.targets undecided using item conditions: []
+  unresolved_internals_visible_to Directory.Build.targets undecided internalsvisibleto item conditions: []
+  unproven_transitive_reference_flow Legacy/Legacy.csproj a non-SDK project's transitive reference flow is not modeled
+  unresolved_global_usings Legacy/Legacy.csproj undecided using item conditions: ["'$(Gate)' == 'true'"]
   unsupported_project_items MixedWeb/MixedWeb.csproj Microsoft.NET.Sdk.Web generated Razor/cshtml declarations and SDK Compile effects: TargetFramework=net8.0 AppDesignerFolder=Properties (inside project); TargetFramework=net8.0-browser AppDesignerFolder=Properties (inside project); workspace SDK defaults: AppDesignerFolder=Properties, BaseIntermediateOutputPath=obj/, Configuration=Debug, IntermediateOutputPath under BaseIntermediateOutputPath/Configuration/TargetFramework
   unproven_transitive_reference_flow MixedWeb/MixedWeb.csproj a non-SDK project's transitive reference flow is not modeled
-  unresolved_global_usings MixedWeb/MixedWeb.csproj TargetFramework does not establish the Web SDK browser condition
   unsupported_project_items Razor/Razor.csproj Razor generator and embedded validation declarations are unacquired
   unsupported_project_items Razor10/Razor10.csproj Razor generator and embedded validation declarations are unacquired
   unresolved_global_usings Razor10/Razor10.csproj .NET 10 Razor _AddEmbeddedValidationAttribute can add Microsoft.Extensions.Validation.Embedded based on unevaluated Razor inputs
   unsupported_project_items Razor10Disabled/Razor10Disabled.csproj Razor generator and embedded validation declarations are unacquired
+  unresolved_global_usings SdkMutable/SdkMutable.csproj undecided using item conditions: ["'$(DefineConstants)' == ''"]
+  unresolved_internals_visible_to SdkMutable/SdkMutable.csproj undecided internalsvisibleto item conditions: ["'$(Alias)' == ''"]
+  unresolved_global_usings SdkMutable/SdkMutable.csproj undecided using item conditions: ["'$(TargetFrameworkIdentifier)' == '.NETCoreApp'"]
+  unresolved_internals_visible_to SdkMutable/SdkMutable.csproj undecided internalsvisibleto item conditions: ["'$(TargetFrameworkIdentifier)' == '.NETCoreApp'"]
   unsupported_project_items Unknown/Unknown.csproj unmodeled SDK membership: ["Unknown.Sdk"]
   unproven_transitive_reference_flow Unknown/Unknown.csproj a non-SDK project's transitive reference flow is not modeled
   unknown_implicit_usings_sdk Unknown/Unknown.csproj unmodeled SDK Unknown.Sdk

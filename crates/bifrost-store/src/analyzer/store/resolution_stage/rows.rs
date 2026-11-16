@@ -104,6 +104,13 @@ const TYPED_FAMILIES: &[TypedFamily] = &[
         seeks: &[&["source_slot"], &["target_slot"], &["rule"]],
     },
     TypedFamily {
+        name: "binary_operations",
+        semantics: &["output_slot", "left_slot", "right_slot"],
+        columns: "operator INTEGER NOT NULL CHECK(operator IN (0,1,2,3,4,5,6,7,8,9)), right_reference INTEGER NOT NULL CHECK(right_reference IN (0,1,2))",
+        unique: &[&["output_slot"]],
+        seeks: &[&["output_slot"]],
+    },
+    TypedFamily {
         name: "type_productions",
         semantics: &["output_slot", "element_slot"],
         columns: "constructor INTEGER NOT NULL CHECK(constructor IN (3,4)), length_token TEXT, CHECK((constructor=4)=(length_token IS NOT NULL))",

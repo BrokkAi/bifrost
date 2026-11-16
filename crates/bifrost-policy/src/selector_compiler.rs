@@ -1,10 +1,13 @@
+use brokk_bifrost_analysis::analyzer::store::cache_budget::RetainedHeap;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::ops::Range as ByteRange;
 use std::sync::Arc;
 
 use crate::resolved::LoadedPolicy;
-use crate::unit_execution::{UnitAttempt, UnitReuse, query_slicing_widen_reason, recompute_unit};
+use crate::unit_execution::{
+    UnitAttempt, UnitReuse, query_slicing_widen_reason, recompute_unit_judged,
+};
 use crate::units::{
     PolicyIncrementalContext, PolicyUnitKey, PolicyUnitProduct, SelectorProduct,
     SelectorProductSite, UnitPartition, WidenReason,
@@ -13,6 +16,9 @@ use crate::{PolicyWorkMetric, PolicyWorkReport, PolicyWorkUnit, ResolvedPolicySe
 use brokk_bifrost_analysis::CancellationToken;
 use brokk_bifrost_analysis::analyzer::common::language_for_file;
 use brokk_bifrost_analysis::analyzer::i_analyzer::{capture_query_reads, replay_query_reads};
+use brokk_bifrost_analysis::analyzer::reuse_verdict::{
+    CarriesReuseVerdict, ExecutionCause, ReuseVerdict,
+};
 use brokk_bifrost_analysis::analyzer::semantic::ids::StableDigest;
 use brokk_bifrost_analysis::analyzer::semantic::{
     CallBinding, CallSiteHandle, CallerReceiverBinding, CandidateCoverage, DispatchOracle,
@@ -34,7 +40,8 @@ use brokk_bifrost_rql::PlanWidenDetail;
 use brokk_bifrost_rql::structural::search::{
     CodeQueryCallBinding, CodeQueryExecutionScope, CodeQueryRowFamilySession,
     CodeQuerySemanticReceipt, DetailedCodeQueryDecoratedParameterEvidence, DetailedCodeQueryDomain,
-    DetailedCodeQueryEvidence, DetailedCodeQueryResult, UnitExecutionResult, UnitRowItemTerminal,
+    DetailedCodeQueryEvidence, DetailedCodeQueryResult, SelectedPatternSourceEvidence,
+    UnitExecutionResult, UnitRowItemTerminal,
     execute_code_query_detailed_eager_index_workspace_with_semantic_receipt,
     execute_code_query_detailed_eager_index_workspace_with_semantic_receipt_and_row_family_session,
     execute_code_query_selector_unit, merge_unit_rows_in_scope, plan_seed_files,
@@ -56,6 +63,11 @@ pub(super) enum PolicySelectorSessionError {
     Incomplete {
         completion: CodeQueryCompletion,
         detail: String,
+        /// The execution dependence the stop itself is. `Content` when the
+        /// cause that stopped the selector reported its own dependence where
+        /// it happened, which every stop but the session's own result-limit
+        /// refusal does.
+        reuse: ReuseVerdict,
     },
     Unavailable(String),
     Provider(String),
@@ -64,6 +76,15 @@ pub(super) enum PolicySelectorSessionError {
     /// no units. Not a failure: the reason says which step refused, and the
     /// answer is the compile this session was avoiding.
     Widen(WidenReason),
+}
+
+impl CarriesReuseVerdict for PolicySelectorSessionError {
+    fn reuse_verdict(&self) -> ReuseVerdict {
+        match self {
+            Self::Incomplete { reuse, .. } => *reuse,
+            Self::Unavailable(_) | Self::Provider(_) | Self::Widen(_) => ReuseVerdict::Content,
+        }
+    }
 }
 
 impl fmt::Display for PolicySelectorSessionError {
@@ -83,6 +104,9 @@ impl fmt::Display for PolicySelectorSessionError {
 
 #[derive(Clone)]
 pub(super) struct PolicySelectedSite {
+    /// Certified matched-value source roots, retained by the exact query row.
+    pub(super) selected_source_entries:
+        Option<Box<[Arc<brokk_bifrost_flow::value_flow::SelectedSourceEntryView>]>>,
     pub(super) file: ProjectFile,
     pub(super) span: ByteRange<usize>,
     pub(super) proof: ProofStatus,
@@ -124,7 +148,175 @@ pub(super) struct PolicySelectedSite {
     pub(super) retained_incomplete_result_contract_query: bool,
 }
 
-#[derive(Clone)]
+impl PolicySelectedSite {
+    /// Visit owned children only; the caller charges the selected-site root.
+    pub(super) fn retained_heap(&self, heap: &mut RetainedHeap) {
+        let Self {
+            selected_source_entries,
+            file,
+            span: _,
+            proof,
+            completeness,
+            result_contract,
+            call_shape,
+            call_binding,
+            selected_model_record,
+            selected_summary_record,
+            modeled_member_id,
+            modeled_target_origin: _,
+            decorated_parameter,
+            runtime_keyed_read,
+            runtime_keyed_read_row: _,
+            runtime_keyed_read_conclusive_exclusion: _,
+            occurrence_role: _,
+            retained_incomplete_result_contract_query: _,
+        } = self;
+        if let Some(entries) = selected_source_entries {
+            heap.owned_slice(entries);
+            for entry in entries.iter() {
+                entry.retained_heap(heap);
+            }
+        }
+        {
+            use brokk_bifrost_analysis::analyzer::semantic::service::{
+                ArtifactRetentionVisitor, RetainedArtifactWalker,
+            };
+            let mut census = RetainedArtifactWalker::new(heap);
+            census.project_file(file);
+            census.finish();
+        }
+        heap.add(proof.retained_heap_bytes());
+        heap.add(completeness.retained_heap_bytes());
+        if let Some(contract) = result_contract {
+            contract.retained_heap(heap);
+        }
+        if let Some(PolicyCallShapeSelection {
+            callee_name: Some(name),
+            argument_count: _,
+        }) = call_shape
+        {
+            heap.add(name.capacity());
+        }
+        if let Some(binding) = call_binding {
+            binding.retained_heap(heap);
+        }
+        for (pack, record) in selected_model_record.iter().chain(selected_summary_record) {
+            heap.add(pack.capacity());
+            heap.add(record.capacity());
+        }
+        if let Some(member) = modeled_member_id {
+            heap.add(member.capacity());
+        }
+        if let Some(PolicyDecoratedParameterSelection {
+            value_locator,
+            port,
+        }) = decorated_parameter
+        {
+            use brokk_bifrost_analysis::analyzer::semantic::service::{
+                ArtifactRetentionVisitor, RetainedArtifactWalker,
+            };
+            let mut census = RetainedArtifactWalker::new(heap);
+            census.artifact_key(value_locator.artifact_key());
+            census.locator(value_locator.procedure_locator());
+            port.retained_allocations(&mut census);
+            census.finish();
+        }
+        if let Some(runtime) = runtime_keyed_read {
+            use brokk_bifrost_analysis::analyzer::semantic::service::RetainedArtifactWalker;
+            let mut census = RetainedArtifactWalker::new(heap);
+            runtime.retained_allocations(&mut census);
+            census.finish();
+        }
+    }
+
+    /// Input correspondence only, never admission of the other selection.
+    /// Selected views require the same pinned owner; their ordinary Eq is identity-only.
+    pub(super) fn has_same_inputs(&self, other: &Self) -> bool {
+        let Self {
+            selected_source_entries,
+            file,
+            span,
+            proof,
+            completeness,
+            result_contract,
+            call_shape,
+            call_binding,
+            selected_model_record,
+            selected_summary_record,
+            modeled_member_id,
+            modeled_target_origin,
+            decorated_parameter,
+            runtime_keyed_read,
+            runtime_keyed_read_row,
+            runtime_keyed_read_conclusive_exclusion,
+            occurrence_role,
+            retained_incomplete_result_contract_query,
+        } = self;
+        let entries_equal = match (selected_source_entries, &other.selected_source_entries) {
+            (None, None) => true,
+            (Some(left), Some(right)) => {
+                left.len() == right.len()
+                    && left
+                        .iter()
+                        .zip(right.iter())
+                        .all(|(left, right)| left.has_same_input_backing(right))
+            }
+            _ => false,
+        };
+        // Runtime observations carry live semantic artifacts. Their ordinary
+        // handle Eq names content; retain exact pinned owners as a conservative
+        // additional requirement rather than treating identity as admission.
+        let runtime_backing_equal = match (&self.runtime_keyed_read, &other.runtime_keyed_read) {
+            (None, None) => true,
+            (Some(left), Some(right)) => [
+                (&left.observation, &right.observation),
+                (&left.container_observation, &right.container_observation),
+            ]
+            .into_iter()
+            .all(|(left, right)| {
+                Arc::ptr_eq(
+                    left.point().procedure().artifact(),
+                    right.point().procedure().artifact(),
+                ) && Arc::ptr_eq(
+                    left.value().procedure().artifact(),
+                    right.value().procedure().artifact(),
+                ) && left.context().calls().len() == right.context().calls().len()
+                    && left
+                        .context()
+                        .calls()
+                        .iter()
+                        .zip(right.context().calls())
+                        .all(|(left, right)| {
+                            Arc::ptr_eq(left.procedure().artifact(), right.procedure().artifact())
+                        })
+            }),
+            _ => false,
+        };
+        entries_equal
+            && runtime_backing_equal
+            && file == &other.file
+            && span == &other.span
+            && proof == &other.proof
+            && completeness == &other.completeness
+            && result_contract == &other.result_contract
+            && call_shape == &other.call_shape
+            && call_binding == &other.call_binding
+            && selected_model_record == &other.selected_model_record
+            && selected_summary_record == &other.selected_summary_record
+            && modeled_member_id == &other.modeled_member_id
+            && modeled_target_origin == &other.modeled_target_origin
+            && decorated_parameter == &other.decorated_parameter
+            && runtime_keyed_read == &other.runtime_keyed_read
+            && runtime_keyed_read_row == &other.runtime_keyed_read_row
+            && runtime_keyed_read_conclusive_exclusion
+                == &other.runtime_keyed_read_conclusive_exclusion
+            && occurrence_role == &other.occurrence_role
+            && retained_incomplete_result_contract_query
+                == &other.retained_incomplete_result_contract_query
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub(super) struct PolicyDecoratedParameterSelection {
     pub(super) value_locator:
         brokk_bifrost_analysis::analyzer::semantic::ProcedureLocalLocator<ValueId>,
@@ -273,13 +465,18 @@ pub(crate) mod candidate_enumeration {
     }
 
     impl CandidateReason {
-        pub(crate) fn label(&self) -> String {
+        pub(crate) fn label_parts(&self) -> (&'static str, &'static str) {
             match self {
-                Self::Read(reason) => format!("read:{}", reason.label()),
-                Self::SilentDrop => "silent_drop".to_owned(),
-                Self::IncompleteQuery(_) => "incomplete_query".to_owned(),
-                Self::Disagreement { .. } => "disagreement".to_owned(),
+                Self::Read(reason) => ("read:", reason.label()),
+                Self::SilentDrop => ("", "silent_drop"),
+                Self::IncompleteQuery(_) => ("", "incomplete_query"),
+                Self::Disagreement { .. } => ("", "disagreement"),
             }
+        }
+
+        pub(crate) fn label(&self) -> String {
+            let (prefix, label) = self.label_parts();
+            [prefix, label].concat()
         }
     }
 
@@ -329,23 +526,30 @@ pub(crate) mod candidate_enumeration {
                 .any(|outcome| matches!(outcome, CandidateOutcome::Undecided { .. }))
             {
                 return Err(PolicySelectorSessionError::Incomplete {
+                    reuse: ReuseVerdict::Content,
                     completion: CodeQueryCompletion::Incomplete {
                         codes: vec![CodeQueryDiagnosticCode::SemanticProviderFailed],
                     },
-                    detail: self
-                        .candidates()
-                        .filter_map(|(candidate, outcome)| {
-                            if let CandidateOutcome::Undecided { reasons } = outcome {
-                                Some(format!(
-                                    "{}:{:?}: {reasons:?}",
-                                    candidate.file, candidate.span
-                                ))
-                            } else {
-                                None
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join("; "),
+                    detail: {
+                        let items = self
+                            .candidates()
+                            .filter_map(|(candidate, outcome)| {
+                                if let CandidateOutcome::Undecided { reasons } = outcome {
+                                    Some(format!(
+                                        "{}:{:?}: {reasons:?}",
+                                        candidate.file, candidate.span
+                                    ))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect::<Vec<_>>();
+                        brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+                            format_args!("{}", items.join("; ")),
+                            format_args!("selector candidates are undecided"),
+                            items.iter(),
+                        )
+                    },
                 });
             }
             Ok(self.batch)
@@ -376,6 +580,7 @@ pub(crate) mod candidate_enumeration {
         detail: String,
     ) -> PolicySelectorSessionError {
         PolicySelectorSessionError::Incomplete {
+            reuse: ReuseVerdict::Content,
             completion: if matches!(result.result.completion(), CodeQueryCompletion::Complete) {
                 CodeQueryCompletion::Incomplete {
                     codes: vec![CodeQueryDiagnosticCode::SemanticProviderFailed],
@@ -383,7 +588,11 @@ pub(crate) mod candidate_enumeration {
             } else {
                 result.result.completion()
             },
-            detail: format!("{detail}: {:?}", result.result.diagnostics),
+            detail: brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+                format_args!("{detail}: {:?}", result.result.diagnostics),
+                format_args!("{detail}"),
+                result.result.diagnostics.iter(),
+            ),
         }
     }
 
@@ -887,41 +1096,16 @@ pub(crate) mod candidate_enumeration {
                     .with_isolated_call_binding_receipts(receipts.clone());
                 // These are executions of one logical selector, not new
                 // selector entries with renewed structural allowances.
-                let mut limits = session.remaining_query_limits()?;
-                let remaining = |limit: usize, used: u64| {
-                    limit.saturating_sub(usize::try_from(used).unwrap_or(usize::MAX))
-                };
-                limits.max_scanned_files = remaining(
-                    limits.max_scanned_files,
-                    isolation_work
-                        .scanned_files
-                        .max(isolation_budgeted_work.import_files_resolved),
-                );
-                limits.max_scanned_source_bytes = remaining(
-                    limits.max_scanned_source_bytes,
-                    isolation_work.scanned_source_bytes,
-                );
-                limits.max_fact_nodes = remaining(limits.max_fact_nodes, isolation_work.fact_nodes);
-                limits.max_pipeline_rows = remaining(
-                    limits.max_pipeline_rows,
-                    isolation_work
-                        .pipeline_rows
-                        .max(isolation_budgeted_work.provenance_steps)
-                        .max(isolation_budgeted_work.import_edges_resolved),
-                );
-                if [
-                    limits.max_scanned_files,
-                    limits.max_scanned_source_bytes,
-                    limits.max_fact_nodes,
-                    limits.max_pipeline_rows,
-                ]
-                .contains(&0)
-                {
+                let Some(limits) = brokk_bifrost_rql::structural::search::remaining_unit_limits(
+                    session.remaining_query_limits()?,
+                    &isolation_work,
+                    &isolation_budgeted_work,
+                ) else {
                     return Err(whole_selector(
                         &batch,
                         "candidate isolation exhausted selector structural allowance".into(),
                     ));
-                }
+                };
                 // Prefix/plan reads are outside classification. A reason there
                 // is global even if this candidate's binding receipt is clean.
                 let outside = brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::capturing_read_incompleteness(session.workspace.analyzer());
@@ -982,19 +1166,7 @@ pub(crate) mod candidate_enumeration {
                         .incomplete_reasons()
                         .iter()
                         .fold(0usize, |bytes, reason| {
-                            use brokk_bifrost_analysis::analyzer::QueryReadIncomplete;
-                            let content = match reason {
-                                QueryReadIncomplete::ArtifactUnavailable(detail)
-                                | QueryReadIncomplete::SemanticEvidenceGap(detail)
-                                | QueryReadIncomplete::SemanticEvidenceUnavailable(detail) => {
-                                    detail.len()
-                                }
-                                QueryReadIncomplete::StructureUnavailable(file) => {
-                                    file.retained_bytes()
-                                }
-                                QueryReadIncomplete::Cancelled
-                                | QueryReadIncomplete::StoreFailure(_) => 0,
-                            };
+                            let content = reason.retained_payload_bytes();
                             bytes
                                 .saturating_add(std::mem::size_of::<CandidateReason>())
                                 .saturating_add(content)
@@ -1039,9 +1211,12 @@ pub(crate) mod candidate_enumeration {
                         .saturating_add(isolated.result.results.len())
                         > query.limit
                     {
+                        // The ambient marks and the returned verdict say the
+                        // same thing: one dependence, and it is a refusal.
                         session.workspace.analyzer().mark_execution_dependent();
                         session.workspace.analyzer().record_budget_dependences(1);
                         return Err(PolicySelectorSessionError::Incomplete {
+                            reuse: ReuseVerdict::ExecutionDependent(ExecutionCause::BudgetRefusal),
                             completion: CodeQueryCompletion::Incomplete {
                                 codes: vec![CodeQueryDiagnosticCode::ResultLimitReached],
                             },
@@ -1277,7 +1452,7 @@ impl From<DetailedCodeQueryDecoratedParameterEvidence> for PolicyDecoratedParame
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub(super) struct PolicyResultContractSelection {
     pub(super) result_ordinal: u32,
     pub(super) fresh_allocation: bool,
@@ -1290,7 +1465,87 @@ pub(super) struct PolicyResultContractSelection {
         Vec<brokk_bifrost_analysis::analyzer::semantic_model::CompiledResultMemberContract>,
 }
 
-#[derive(Clone)]
+impl PolicyResultContractSelection {
+    fn retained_heap(&self, heap: &mut RetainedHeap) {
+        let Self {
+            result_ordinal: _,
+            fresh_allocation: _,
+            success_guard_coverage: _,
+            success_guard_edges,
+            possible_success_guard_edges,
+            member_contracts,
+        } = self;
+        heap.vec(success_guard_edges);
+        heap.vec(possible_success_guard_edges);
+        {
+            use brokk_bifrost_analysis::analyzer::semantic::service::{
+                ArtifactRetentionVisitor, RetainedArtifactWalker,
+            };
+            let mut census = RetainedArtifactWalker::new(heap);
+            for edge in success_guard_edges
+                .iter()
+                .chain(possible_success_guard_edges)
+            {
+                census.artifact_key(edge.artifact_key());
+                census.locator(edge.procedure_locator());
+            }
+            census.finish();
+        }
+        heap.vec(member_contracts);
+        for contract in member_contracts {
+            use brokk_bifrost_analysis::analyzer::semantic_model::CompiledResultMemberContract;
+            use brokk_bifrost_analysis::analyzer::semantic_model::model::{
+                AuthoredDeclaredEffect, AuthoredOperationPrecondition, AuthoredSummaryInput,
+            };
+            let CompiledResultMemberContract {
+                member,
+                parameter_count: _,
+                completeness: _,
+                preconditions,
+                declared_effects,
+            } = contract;
+            heap.add(member.capacity());
+            if let Some(preconditions) = preconditions {
+                heap.vec(preconditions);
+                for AuthoredOperationPrecondition {
+                    input,
+                    predicate: _,
+                } in preconditions
+                {
+                    let path = match input {
+                        AuthoredSummaryInput::Receiver { path }
+                        | AuthoredSummaryInput::Parameter { ordinal: _, path } => path,
+                    };
+                    if let Some(path) = path {
+                        heap.owned_slice(path);
+                        for step in path.iter() {
+                            use brokk_bifrost_analysis::analyzer::semantic::PatternProjectionStep;
+                            match step {
+                                PatternProjectionStep::Named(name)
+                                | PatternProjectionStep::Variant { declaration: name } => {
+                                    heap.owned_slice(name.as_bytes())
+                                }
+                                PatternProjectionStep::Tuple(_)
+                                | PatternProjectionStep::Element => {}
+                            }
+                        }
+                    }
+                }
+            }
+            heap.vec(declared_effects);
+            for AuthoredDeclaredEffect {
+                id,
+                timing: _,
+                certainty: _,
+            } in declared_effects
+            {
+                heap.add(id.capacity());
+            }
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub(super) struct PolicyCallShapeSelection {
     pub(super) callee_name: Option<String>,
     pub(super) argument_count: u32,
@@ -1318,12 +1573,68 @@ pub(super) enum ReceiverBindingApplicability {
     Inconsistent,
 }
 
+/// A policy-only capability supplied solely for matched-value SOURCE selection.
+pub(super) struct MatchedValueSourceAdmission {
+    pub(super) scope: Option<Arc<brokk_bifrost_flow::value_flow::ValueFlowRetentionScope>>,
+    pub(super) models:
+        Option<Arc<brokk_bifrost_analysis::analyzer::semantic_model::ActiveSemanticModelSnapshot>>,
+}
+
+// Only positive selected-source roles request this factory. Missing or closed
+// request authority is operational; a live authority refusing capacity is a
+// budget dependence. Neither is a snapshot-deterministic content gap.
+fn selected_source_factory(
+    analyzer: &dyn brokk_bifrost_analysis::analyzer::IAnalyzer,
+    scope: Option<&Arc<brokk_bifrost_flow::value_flow::ValueFlowRetentionScope>>,
+) -> Result<
+    Arc<brokk_bifrost_flow::value_flow::SelectedSourceEntryViews>,
+    brokk_bifrost_rql::Incompleteness,
+> {
+    use brokk_bifrost_flow::value_flow::{
+        SelectedSourceEntryRetentionError, SelectedSourceEntryViews,
+    };
+    let Some(scope) = scope else {
+        analyzer.mark_execution_dependent();
+        return Err(brokk_bifrost_rql::Incompleteness::Operational(
+            brokk_bifrost_rql::DiagnosticExecutionCause::Provider,
+        ));
+    };
+    match SelectedSourceEntryViews::for_request(Arc::clone(scope)) {
+        Ok(factory) => Ok(factory),
+        Err(SelectedSourceEntryRetentionError::Capacity) if !scope.is_closed() => {
+            analyzer.mark_execution_dependent();
+            analyzer.record_budget_dependences(1);
+            Err(brokk_bifrost_rql::Incompleteness::Operational(
+                brokk_bifrost_rql::DiagnosticExecutionCause::Budget,
+            ))
+        }
+        Err(
+            SelectedSourceEntryRetentionError::Capacity
+            | SelectedSourceEntryRetentionError::Scope(_),
+        ) => {
+            // Option-returning funding can race request closure. A closed scope
+            // cannot establish that capacity, rather than closure, refused it.
+            analyzer.mark_execution_dependent();
+            Err(brokk_bifrost_rql::Incompleteness::Operational(
+                brokk_bifrost_rql::DiagnosticExecutionCause::Provider,
+            ))
+        }
+    }
+}
+
+struct SourceRowCertification {
+    entries: Box<[Arc<brokk_bifrost_flow::value_flow::SelectedSourceEntryView>]>,
+    incomplete: bool,
+    incompleteness: Option<brokk_bifrost_rql::Incompleteness>,
+}
+
 struct PolicySelectorQueryResult {
     result: CodeQueryResult,
     evidence: Vec<DetailedCodeQueryEvidence>,
     artifact_charge: Option<SemanticArtifactLeaseCharge>,
     retained_incomplete_result_contracts: bool,
     retained_incomplete_taint_rows: bool,
+    source_certifications: HashMap<usize, SourceRowCertification>,
 }
 
 /// Admit a positive result-contract subset when only its guard/use derivation
@@ -1386,6 +1697,24 @@ fn retains_independently_proven_result_contracts(
     retained
 }
 
+/// The files an incomplete result's gaps are confined to, when every
+/// incomplete diagnostic names the one file whose rows it withheld and the
+/// result is not capped. The executor withdraws that attribution once a later
+/// operator is not row-local, so a composed query that crosses files has none
+/// and reports `None`: then any file's row may be affected (#11673).
+fn file_scoped_gap_files(result: &CodeQueryResult) -> Option<HashSet<&str>> {
+    if result.truncated {
+        return None;
+    }
+    let mut files = HashSet::new();
+    for diagnostic in &result.diagnostics {
+        if diagnostic.impact == CodeQueryDiagnosticImpact::Incomplete {
+            files.insert(diagnostic.withheld_rows_path.as_deref()?);
+        }
+    }
+    (!files.is_empty()).then_some(files)
+}
+
 /// A taint endpoint row is useful only when the query retained a located
 /// structural or semantic site. An open dispatch may still have a concrete
 /// call-binding row. A terminal binding row is also a usable call site when it
@@ -1396,7 +1725,13 @@ fn usable_taint_row(
     item: &CodeQueryResultItem,
     evidence: &DetailedCodeQueryEvidence,
     query_binding_proof: Option<&str>,
+    certification: Option<&SourceRowCertification>,
 ) -> bool {
+    if let Some(certification) = certification {
+        return matches!(item.value, CodeQueryResultValue::StructuralMatch { .. })
+            && evidence.byte_span.is_some()
+            && !certification.entries.is_empty();
+    }
     if evidence.byte_span.is_none() || matches!(evidence.domain, DetailedCodeQueryDomain::File) {
         return false;
     }
@@ -1444,10 +1779,118 @@ fn usable_taint_row(
         CodeQueryResultValue::RuntimeKeyedReadValue { value } => {
             !value.terminal && evidence.runtime_keyed_read.is_some()
         }
-        // A located name or shape match alone cannot identify the selected
-        // semantic endpoint when the query as a whole is incomplete.
+        // Rows that are not AST-identity rows depend on resolution, so a
+        // located match alone cannot identify the selected semantic endpoint
+        // when the query as a whole is incomplete. Every such row is counted in
+        // the incomplete-selector gap (`withheld_taint_rows`).
         _ => false,
     }
+}
+
+/// A row whose identity is the matched syntax node itself: a literal, an
+/// identifier occurrence or a field access. What it selects does not depend on
+/// any resolution, so a gap in the query's other reads cannot change which node
+/// it is. Such a row of an incomplete query stays a possible endpoint, unproven
+/// and partial (#11210); only a row whose identity needs resolution is withheld.
+fn ast_identity_taint_row(item: &CodeQueryResultItem) -> bool {
+    matches!(
+        item.value,
+        CodeQueryResultValue::StructuralMatch { .. }
+            | CodeQueryResultValue::CppExpression { .. }
+            | CodeQueryResultValue::ExpressionSite { .. }
+            | CodeQueryResultValue::Occurrence { .. }
+            | CodeQueryResultValue::LiteralOccurrence { .. }
+            | CodeQueryResultValue::PathSegment { .. }
+            | CodeQueryResultValue::QualifiedPath { .. }
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TaintRowRetention {
+    IndividuallyUsable,
+    PossibleAst,
+}
+
+/// Compute query-wide recovery scope once, rather than allocating per row.
+struct TaintRowRetentionScope<'a> {
+    gap_files: Option<HashSet<&'a str>>,
+}
+
+impl<'a> TaintRowRetentionScope<'a> {
+    fn for_result(result: &'a CodeQueryResult) -> Self {
+        Self {
+            gap_files: file_scoped_gap_files(result),
+        }
+    }
+}
+
+/// One retention classification shared by artifact continuation, selected
+/// rows and disposition accounting. Only reliable AST identity may substitute
+/// for an individual semantic binding, and remains a possible endpoint.
+fn retained_taint_row(
+    item: &CodeQueryResultItem,
+    evidence: &DetailedCodeQueryEvidence,
+    query_binding_proof: Option<&str>,
+    scope: &TaintRowRetentionScope<'_>,
+    certification: Option<&SourceRowCertification>,
+) -> Option<TaintRowRetention> {
+    if certification.is_some() {
+        return usable_taint_row(item, evidence, query_binding_proof, certification)
+            .then_some(TaintRowRetention::IndividuallyUsable);
+    }
+    if scope
+        .gap_files
+        .as_ref()
+        .is_some_and(|files| !files.contains(rel_path_string(&evidence.file).as_str()))
+        || usable_taint_row(item, evidence, query_binding_proof, None)
+    {
+        Some(TaintRowRetention::IndividuallyUsable)
+    } else if evidence.byte_span.is_some()
+        && !matches!(evidence.domain, DetailedCodeQueryDomain::File)
+        && ast_identity_taint_row(item)
+    {
+        Some(TaintRowRetention::PossibleAst)
+    } else {
+        None
+    }
+}
+
+/// What an incomplete selector query does to its located rows before binding:
+/// how many syntax-identity rows stay as possible endpoints, and the rows
+/// withheld because their identity needs resolution, by row kind.
+fn taint_row_disposition(
+    detailed: &PolicySelectorQueryResult,
+    query_binding_proof: Option<&str>,
+) -> (usize, std::collections::BTreeMap<String, usize>) {
+    let mut possible = 0;
+    let mut withheld = std::collections::BTreeMap::new();
+    let scope = TaintRowRetentionScope::for_result(&detailed.result);
+    for evidence in &detailed.evidence {
+        if matches!(evidence.domain, DetailedCodeQueryDomain::File) {
+            continue;
+        }
+        let item = detailed
+            .result
+            .results
+            .get(evidence.result_index)
+            .expect("selector evidence refers to a result row");
+        match retained_taint_row(
+            item,
+            evidence,
+            query_binding_proof,
+            &scope,
+            detailed.source_certifications.get(&evidence.result_index),
+        ) {
+            Some(TaintRowRetention::IndividuallyUsable) => {}
+            Some(TaintRowRetention::PossibleAst) => possible += 1,
+            None => {
+                *withheld
+                    .entry(format!("{:?}", evidence.domain))
+                    .or_default() += 1;
+            }
+        }
+    }
+    (possible, withheld)
 }
 
 fn incomplete_source_call_binding(value: &CodeQueryCallBinding) -> bool {
@@ -1463,19 +1906,27 @@ fn incomplete_source_call_binding(value: &CodeQueryCallBinding) -> bool {
         && value.actual_count == value.bound_count
 }
 
-fn retains_usable_taint_rows(
+fn retains_taint_rows(
     result: &CodeQueryResult,
     evidence: &[DetailedCodeQueryEvidence],
     query_binding_proof: Option<&str>,
+    certifications: &HashMap<usize, SourceRowCertification>,
 ) -> bool {
+    let scope = TaintRowRetentionScope::for_result(result);
     matches!(
         result.completion(),
         CodeQueryCompletion::Incomplete { .. } | CodeQueryCompletion::ProvenSubset { .. }
     ) && evidence.iter().any(|row| {
-        result
-            .results
-            .get(row.result_index)
-            .is_some_and(|item| usable_taint_row(item, row, query_binding_proof))
+        result.results.get(row.result_index).is_some_and(|item| {
+            retained_taint_row(
+                item,
+                row,
+                query_binding_proof,
+                &scope,
+                certifications.get(&row.result_index),
+            )
+            .is_some()
+        })
     })
 }
 
@@ -1619,7 +2070,7 @@ impl<T> PolicySemanticContinuation<T> {
 ///
 /// `actual_index` is the caller-side operand ordinal. `formal_index` is kept
 /// only as evidence and must never be passed to a `PolicyPort::ArgumentIndex`.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub(super) struct PolicySelectedCallBinding {
     pub(super) row_id: String,
     pub(super) site_id: String,
@@ -1644,6 +2095,54 @@ pub(super) struct PolicySelectedCallBinding {
     pub(super) selector_summary_model_id: Option<String>,
     pub(super) selector_summary_pack_id: Option<String>,
     pub(super) selector_summary_pack_digest: Option<String>,
+}
+
+impl PolicySelectedCallBinding {
+    fn retained_heap(&self, heap: &mut RetainedHeap) {
+        let Self {
+            row_id,
+            site_id,
+            site_ast_id,
+            argument_id,
+            call_span: _,
+            actual_index: _,
+            formal_index: _,
+            formal_name,
+            semantic_target_id,
+            model_callable_id,
+            formal_layout_id,
+            signature_id,
+            model_id,
+            pack_id,
+            selector_proof: _,
+            requires_receiver_dispatch: _,
+            selector_provenance: _,
+            selector_summary_id,
+            selector_summary_model_id,
+            selector_summary_pack_id,
+            selector_summary_pack_digest,
+        } = self;
+        for text in [row_id, site_id, site_ast_id, argument_id, formal_layout_id] {
+            heap.add(text.capacity());
+        }
+        for text in [
+            formal_name,
+            semantic_target_id,
+            model_callable_id,
+            signature_id,
+            model_id,
+            pack_id,
+            selector_summary_id,
+            selector_summary_model_id,
+            selector_summary_pack_id,
+            selector_summary_pack_digest,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            heap.add(text.capacity());
+        }
+    }
 }
 
 fn accepted_model_record(
@@ -1687,7 +2186,7 @@ impl PolicySelectedCallBinding {
         self.requires_receiver_dispatch
             || matches!(
                 self.selector_proof,
-                "resolved_workspace" | "authored_summary"
+                "resolved_workspace" | "authored_summary" | "resolver_declaration"
             )
     }
 
@@ -1717,6 +2216,7 @@ impl PolicySelectedCallBinding {
                 | "authored_summary"
                 | "resolved_workspace"
                 | "incomplete_source_candidate"
+                | "resolver_declaration"
         ));
         debug_assert!(
             self.selector_provenance != "declared"
@@ -1731,7 +2231,11 @@ impl PolicySelectedCallBinding {
         );
         debug_assert!(matches!(
             self.selector_proof,
-            "declared" | "derived" | "authored_summary" | "resolved_workspace"
+            "declared"
+                | "derived"
+                | "authored_summary"
+                | "resolved_workspace"
+                | "resolver_declaration"
         ));
     }
 }
@@ -1739,7 +2243,7 @@ impl PolicySelectedCallBinding {
 /// A taint endpoint selector whose discovery did not finish. The path says
 /// which endpoint role the gap belongs to, so the compiler can tell a gap
 /// that could hide a flow from one that cannot.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(super) struct IncompleteTaintSelector {
     pub(super) path: crate::definition::PolicySelectorPath,
     pub(super) message: String,
@@ -1747,10 +2251,42 @@ pub(super) struct IncompleteTaintSelector {
     /// open, in the order the query reported them. Empty for a selector that
     /// could not be applied at all.
     pub(super) discovery: Vec<(CodeQueryDiagnosticCode, Option<DiscoverySite>)>,
-    /// The query stopped at a result cap. A cap leaves rows missing for a
-    /// reason of the execution, even when its own limit diagnostic was
-    /// suppressed because another incomplete diagnostic already exists.
+    pub(super) refusal_subjects: Vec<brokk_bifrost_rql::structural::CodeQueryRelatedSource>,
+    pub(super) has_non_utf8_refusal: bool,
+    pub(super) refusal_reason: String,
+    /// The query stopped at a configured result cap, including when its own
+    /// limit diagnostic was suppressed by another incomplete diagnostic.
     pub(super) truncated: bool,
+    /// Producer provenance, kept independently of rendered diagnostic caps.
+    pub(super) incompleteness: Vec<brokk_bifrost_rql::Incompleteness>,
+}
+
+// Subject evidence never changes selector-gap identity or routing.
+impl PartialEq for IncompleteTaintSelector {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path
+            && self.message == other.message
+            && self.discovery == other.discovery
+            && self.truncated == other.truncated
+            && self.incompleteness == other.incompleteness
+    }
+}
+impl Eq for IncompleteTaintSelector {}
+
+impl IncompleteTaintSelector {
+    /// Whether the analysis engine failed while this selector ran. Such a
+    /// failure is a property of the files it could not analyze, not of this
+    /// selector's query, so it can hide an endpoint of any selector.
+    pub(super) fn is_provider_failure(&self) -> bool {
+        self.discovery.iter().any(|(code, _)| {
+            matches!(
+                code,
+                CodeQueryDiagnosticCode::SemanticProviderFailed
+                    | CodeQueryDiagnosticCode::TypestateProviderFailed
+                    | CodeQueryDiagnosticCode::ValueFlowProviderFailed
+            )
+        })
+    }
 }
 
 /// Metrics-only details of one incomplete selector. Never used for deduplication.
@@ -1771,6 +2307,7 @@ struct MaterializedArtifact {
 }
 
 pub(super) struct PolicySelectorSession<'a> {
+    refusal_subject_limit: Option<usize>,
     session_id: u64,
     #[cfg(all(test, feature = "test-support"))]
     binding_candidate_probe: brokk_bifrost_rql::structural::search::CallBindingCandidateProbe,
@@ -1805,6 +2342,7 @@ pub(super) struct PolicySelectorSession<'a> {
     artifacts: HashMap<ProjectFile, MaterializedArtifact>,
     // A refusal in an earlier region must survive its budget counter reset.
     semantic_stop_seen: bool,
+    budget_refusals: Vec<String>,
     artifact_leases: PolicyArtifactLeases,
     materialized_files_limit: usize,
     // Semantic work retired by prior regions. `reset_region_semantic_budget`
@@ -1852,6 +2390,9 @@ pub(super) struct PolicySelectorSession<'a> {
     // whole-workspace scan allowance (see `remaining_query_limits`), so this is
     // the multiplier on that allowance the compile actually spent.
     selector_scans: u64,
+    /// The joined reuse verdict of the query executions since the last
+    /// `take_execution_reuse`. A caller's capture joins its share of it.
+    execution_reuse: ReuseVerdict,
     // Exact allocations first admitted from result-contract query receipts.
     // Later direct materialization can retain the same allocation, so keeping
     // this boundary-specific count makes immediate receipt adoption auditable.
@@ -1870,6 +2411,11 @@ pub(super) struct PolicySelectorSession<'a> {
 }
 
 impl<'a> PolicySelectorSession<'a> {
+    pub(super) fn with_refusal_subject_limit(mut self, limit: usize) -> Self {
+        self.refusal_subject_limit = Some(limit);
+        self
+    }
+
     /// `execution_scope` is which files every selector of this session
     /// enumerates seeds over. A per-seed selector unit passes its one seed
     /// file; everything else passes
@@ -1918,6 +2464,7 @@ impl<'a> PolicySelectorSession<'a> {
             ),
             max_selector_results,
             cancellation,
+            refusal_subject_limit: execution_scope.refusal_subject_limit(),
             execution_scope: execution_scope.with_depth_bound_status(false),
             call_target_outcomes,
             units: None,
@@ -1927,6 +2474,7 @@ impl<'a> PolicySelectorSession<'a> {
             query_work: CodeQueryExecutionWork::default(),
             artifacts: HashMap::new(),
             semantic_stop_seen: false,
+            budget_refusals: Vec::new(),
             artifact_leases: SemanticArtifactLeaseSet::new(
                 query_limits.semantic.max_retained_bytes,
             ),
@@ -1947,6 +2495,7 @@ impl<'a> PolicySelectorSession<'a> {
             semantic_snapshot_materializations: 0,
             semantic_handle_identity_reuses: 0,
             selector_scans: 0,
+            execution_reuse: ReuseVerdict::Content,
             result_contract_artifact_leases: 0,
             retained_incomplete_result_contract_selectors: 0,
             incomplete_taint_selectors: Vec::new(),
@@ -1984,6 +2533,16 @@ impl<'a> PolicySelectorSession<'a> {
     /// cross-region work stays amortized and each region's budget only accounts
     /// for the material it newly pulls.
     pub(super) fn reset_region_semantic_budget(&mut self) {
+        if let Some(refusal) = self.semantic_budget.first_refusal() {
+            self.budget_refusals
+                .push(format!("semantic/{}", refusal.exceeded.dimension().label()));
+        }
+        if self.semantic_execution_budget.work().exhausted {
+            self.budget_refusals
+                .push("semantic/materialized_files".to_string());
+        }
+        self.budget_refusals.sort();
+        self.budget_refusals.dedup();
         self.semantic_stop_seen |= self.semantic_budget.first_refusal().is_some()
             || self.semantic_execution_budget.work().exhausted;
         // Retire the finishing region's consumed work before the counters are
@@ -2089,10 +2648,13 @@ impl<'a> PolicySelectorSession<'a> {
             artifact_leases,
             self.execution_scope
                 .clone()
+                .with_refusal_subject_limit(self.refusal_subject_limit)
                 .with_optional_shared_call_target_outcomes(self.call_target_outcomes.as_ref()),
         );
         let semantic_receipt = detailed.take_semantic_receipt();
+        self.record_query_budget_refusals(&detailed.result.diagnostics);
         self.query_work = self.query_work.saturating_add(detailed.work);
+        self.execution_reuse.join_in(detailed.reuse);
         self.charge_query_semantic_work(detailed.work.semantic, semantic_receipt)?;
         if !matches!(detailed.result.completion(), CodeQueryCompletion::Complete) {
             return Ok(Vec::new());
@@ -2134,7 +2696,37 @@ impl<'a> PolicySelectorSession<'a> {
     ) -> Result<Vec<PolicySelectedSite>, PolicySelectorSessionError> {
         let query = self.selector_query(selector)?;
         let scope = self.execution_scope.clone();
-        self.select_taint_in(selector, &query, scope)
+        self.select_taint_in(selector, &query, scope, None)
+    }
+
+    pub(super) fn select_taint_source(
+        &mut self,
+        selector: &ResolvedPolicySelector,
+        admission: &MatchedValueSourceAdmission,
+    ) -> Result<Vec<PolicySelectedSite>, PolicySelectorSessionError> {
+        let query = self.selector_query(selector)?;
+        self.select_taint_in(
+            selector,
+            &query,
+            self.execution_scope.clone(),
+            Some(admission),
+        )
+    }
+
+    pub(super) fn select_taint_source_in_file(
+        &mut self,
+        selector: &ResolvedPolicySelector,
+        file: &ProjectFile,
+        workspace_files: &[ProjectFile],
+        admission: &MatchedValueSourceAdmission,
+    ) -> Result<Vec<PolicySelectedSite>, PolicySelectorSessionError> {
+        let query = self.selector_query(selector)?;
+        self.select_taint_in(
+            selector,
+            &query,
+            CodeQueryExecutionScope::for_seed_files(std::slice::from_ref(file), workspace_files),
+            Some(admission),
+        )
     }
 
     /// Run a taint selector sliced to the seed files `files`, or
@@ -2154,7 +2746,7 @@ impl<'a> PolicySelectorSession<'a> {
         // the slice narrows only which files seed.
         let workspace_files = self.workspace.analyzer().analyzed_files();
         let scope = CodeQueryExecutionScope::for_seed_files(files, &workspace_files);
-        Ok((self.select_taint_in(selector, &query, scope)?, None))
+        Ok((self.select_taint_in(selector, &query, scope, None)?, None))
     }
 
     /// Select one taint endpoint selector with its seed enumeration narrowed
@@ -2172,6 +2764,7 @@ impl<'a> PolicySelectorSession<'a> {
             selector,
             &query,
             CodeQueryExecutionScope::for_seed_files(std::slice::from_ref(file), workspace_files),
+            None,
         )
     }
 
@@ -2198,6 +2791,7 @@ impl<'a> PolicySelectorSession<'a> {
                 "conditional procedure source revision changed".into(),
             ));
         }
+        let procedure = self.selected_procedure(procedure)?;
         let analyzer = self.workspace.analyzer();
         // This artifact is the complete source-call/procedure index, not a
         // textual enclosing range. Preserve honest coarse file dependencies:
@@ -2233,13 +2827,22 @@ impl<'a> PolicySelectorSession<'a> {
             // Unsupported/inexact ownership never proves that a site is foreign.
             return self.select_taint_in_file(selector, file, workspace_files);
         }
+        let procedures = artifact
+            .procedures()
+            .iter()
+            .map(|row| {
+                let base = artifact
+                    .procedure_handle(row.id())
+                    .expect("artifact owns procedure");
+                self.selected_procedure(&base)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let peak_scope_work = SemanticWork {
             owned_text_bytes: OwnedCallAnchors::allocation_upper_bound(
                 file,
-                artifact
-                    .procedures()
+                procedures
                     .iter()
-                    .map(|procedure| procedure.call_sites().len())
+                    .map(|procedure| procedure.semantics().call_sites().len())
                     .sum(),
             ),
             ..SemanticWork::default()
@@ -2265,10 +2868,10 @@ impl<'a> PolicySelectorSession<'a> {
         // Compare structural candidates against every semantic call range,
         // including closure calls, before choosing which procedure may own it.
         // This reads structural metadata only; receiver resolution stays scoped.
-        let all_anchors = artifact
-            .procedures()
+        let all_anchors = procedures
             .iter()
             .flat_map(|procedure| {
+                let procedure = procedure.semantics();
                 procedure.call_sites().iter().map(|call| {
                     let mapping = procedure
                         .source_mapping(call.source)
@@ -2290,6 +2893,7 @@ impl<'a> PolicySelectorSession<'a> {
             &query,
             CodeQueryExecutionScope::for_seed_files(std::slice::from_ref(file), workspace_files)
                 .with_owned_call_anchors(owned),
+            None,
         );
         self.semantic_budget.release_admission(scope_work);
         result
@@ -2300,6 +2904,7 @@ impl<'a> PolicySelectorSession<'a> {
         selector: &ResolvedPolicySelector,
         query: &CodeQuery,
         scope: CodeQueryExecutionScope<'_>,
+        source_admission: Option<&MatchedValueSourceAdmission>,
     ) -> Result<Vec<PolicySelectedSite>, PolicySelectorSessionError> {
         let _cpu = crate::phase_cpu::Scope::new(crate::phase_cpu::Phase::Selector);
         // Missing model declarations limit this endpoint alone. Never execute
@@ -2316,7 +2921,8 @@ impl<'a> PolicySelectorSession<'a> {
             self.record_unavailable_taint_selector(selector, &error);
             return Ok(Vec::new());
         }
-        let mut detailed = self.execute_taint_selector_query(&bound_query, scope)?;
+        let mut detailed =
+            self.execute_taint_selector_query(&bound_query, scope, source_admission)?;
         let completion = detailed.result.completion();
         // Opt-in profiling only: measure query completeness without changing
         // selector answers, receipts, logical work or persisted unit products.
@@ -2332,6 +2938,7 @@ impl<'a> PolicySelectorSession<'a> {
             CodeQueryCompletion::Cancelled | CodeQueryCompletion::Invalid { .. }
         ) {
             return Err(PolicySelectorSessionError::Incomplete {
+                reuse: ReuseVerdict::Content,
                 completion,
                 detail: format!(
                     "selector `{}` was cancelled or invalid: {:?}",
@@ -2352,15 +2959,25 @@ impl<'a> PolicySelectorSession<'a> {
                 workspace_exact_call,
             )
         {
-            let diagnostics = detailed
-                .result
-                .diagnostics
+            // Query execution deduplicated these diagnostics before subjects
+            // existed. Recreate that same set before summarizing so extra
+            // sites cannot change selector identity, cause counts or routing.
+            let mut identities = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for diagnostic in &detailed.result.diagnostics {
+                let mut identity = diagnostic.clone();
+                if crate::evaluator::is_call_binding_refusal(diagnostic) {
+                    identity = crate::evaluator::refusal_identity(diagnostic);
+                }
+                if seen.insert(identity.clone()) {
+                    identities.push(identity);
+                }
+            }
+            let diagnostics = identities
                 .iter()
                 .map(|diagnostic| format!("{}: {diagnostic:?}", diagnostic.code.as_str()))
                 .collect::<Vec<_>>();
-            let discovery = detailed
-                .result
-                .diagnostics
+            let discovery = identities
                 .iter()
                 .map(|diagnostic| {
                     let site = match (&diagnostic.source, &diagnostic.withheld_rows_path) {
@@ -2387,23 +3004,97 @@ impl<'a> PolicySelectorSession<'a> {
                 })
                 .flatten()
                 .map(str::to_owned);
+            let query_binding_proof = selector
+                .as_query()
+                .and_then(|(_, query)| query_call_binding_proof(&query.plan));
+            let (possible, withheld) = taint_row_disposition(&detailed, query_binding_proof);
+            brokk_bifrost_analysis::profiling::note_with(|| {
+                format!(
+                    "policy.taint_selection_rows path={} possible={possible} withheld={withheld:?}",
+                    selector.path
+                )
+            });
+            // A selector that keeps only individually usable rows says so. One
+            // that also keeps syntax-identity rows as possible endpoints, or
+            // loses rows whose identity needs resolution, reports both counts
+            // and the withheld kinds, so no row disappears without a trace.
+            let row_account = if possible == 0 && withheld.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; {possible} syntax-identity rows retained as possible endpoints, {} rows withheld because their identity needs resolution: {withheld:?}",
+                    withheld.values().sum::<usize>()
+                )
+            };
             self.incomplete_taint_selectors
                 .push(IncompleteTaintSelector {
                     path: selector.path.clone(),
-                    message: format!(
-                        "selector `{}` discovery is {:?}; only individually usable rows were retained: {:?}",
-                        selector.path, completion, diagnostics
+                    message: brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+                        format_args!(
+                            "selector `{}` discovery is {:?}; only individually usable rows were retained: {:?}{}",
+                            selector.path, completion, diagnostics, row_account
+                        ),
+                        format_args!(
+                            "selector `{}` discovery is {:?}; only individually usable rows were retained{}",
+                            selector.path, completion, row_account
+                        ),
+                        diagnostics.iter(),
                     ),
                     discovery,
+                    refusal_subjects: detailed.result.diagnostics.iter()
+                        .filter(|diagnostic| crate::evaluator::is_call_binding_refusal(diagnostic))
+                        .flat_map(crate::evaluator::refusal_subjects).collect(),
+                    refusal_reason: detailed.result.diagnostics.iter().filter(|d| crate::evaluator::is_call_binding_refusal(d)).filter_map(|d| d.message.split_once('\n').map(|(_, reason)| reason.to_owned())).min().unwrap_or_default(),
+                    has_non_utf8_refusal: detailed.result.diagnostics.iter().filter(|d| crate::evaluator::is_call_binding_refusal(d)).any(|d| d.has_non_utf8_refusal),
+                    incompleteness: detailed.result.diagnostics.iter().filter(|d| d.impact == CodeQueryDiagnosticImpact::Incomplete).map(|d| d.incompleteness).collect(),
                     truncated: detailed.result.truncated,
                 });
             self.incomplete_selector_observations
                 .push(IncompleteSelectorObservation {
-                    original_completion: Some(completion),
+                    original_completion: Some(completion.clone()),
                     original_locator_refusal_code: None,
                     attributed_file,
                 });
             detailed.retained_incomplete_taint_rows = true;
+        }
+        for evidence in &detailed.evidence {
+            if detailed
+                .source_certifications
+                .get(&evidence.result_index)
+                .is_some_and(|certification| certification.incomplete)
+            {
+                self.incomplete_taint_selectors
+                    .push(IncompleteTaintSelector {
+                        path: selector.path.clone(),
+                        message: format!(
+                            "selector `{}` has an unavailable selected source entry at {}:{:?}",
+                            selector.path,
+                            rel_path_string(&evidence.file),
+                            evidence.byte_span
+                        ),
+                        refusal_subjects: Vec::new(),
+                        has_non_utf8_refusal: false,
+                        refusal_reason: String::new(),
+                        discovery: vec![(
+                            CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                            Some((rel_path_string(&evidence.file), None)),
+                        )],
+                        incompleteness: vec![
+                            detailed.source_certifications[&evidence.result_index]
+                                .incompleteness
+                                .expect(
+                                    "incomplete source certification retains its producer cause",
+                                ),
+                        ],
+                        truncated: false,
+                    });
+                self.incomplete_selector_observations
+                    .push(IncompleteSelectorObservation {
+                        original_completion: Some(completion.clone()),
+                        original_locator_refusal_code: None,
+                        attributed_file: Some(rel_path_string(&evidence.file)),
+                    });
+            }
         }
         let (selected, artifact_charge) = self.selected_sites(selector, detailed)?;
         if let Some(artifact_charge) = artifact_charge {
@@ -2423,7 +3114,11 @@ impl<'a> PolicySelectorSession<'a> {
                 "selector `{}` could not be applied: {}: {}",
                 selector.path, error.diagnostic.code, error.diagnostic.message,
             ),
+            refusal_subjects: Vec::new(),
+            has_non_utf8_refusal: false,
+            refusal_reason: String::new(),
             discovery: Vec::new(),
+            incompleteness: vec![brokk_bifrost_rql::Incompleteness::Content],
             truncated: false,
         };
         if !self.incomplete_taint_selectors.contains(&gap) {
@@ -2434,6 +3129,64 @@ impl<'a> PolicySelectorSession<'a> {
                     original_locator_refusal_code: Some(error.diagnostic.code),
                     attributed_file: None,
                 });
+        }
+    }
+
+    /// Record a provider failure on every endpoint selector in `sides` that
+    /// has not recorded one itself.
+    ///
+    /// `select_taint_in` records a failure only for the selector that ran. A
+    /// failure to analyze a file hides evidence from every selector that
+    /// would have read the file, including a selector that never ran (the
+    /// composition engine matches sources on its frontier) or one that ran
+    /// over structure alone. Without a gap on those selectors, an empty side
+    /// looks proven empty and the failure's own gap is discarded as
+    /// irrelevant (#12571). Each new gap is a copy of the origin gap's
+    /// discovery sites and typed cause under the hidden selector's path, so
+    /// its scope is what the origin diagnostics carry: a file when the
+    /// producer named one, otherwise the whole workspace.
+    pub(super) fn record_provider_failure_gaps<'p>(
+        &mut self,
+        sides: impl IntoIterator<Item = &'p crate::definition::PolicySelectorPath>,
+    ) {
+        let origins: Vec<IncompleteTaintSelector> = self
+            .incomplete_taint_selectors
+            .iter()
+            .filter(|gap| gap.is_provider_failure())
+            .cloned()
+            .collect();
+        if origins.is_empty() {
+            return;
+        }
+        for side in sides {
+            if origins.iter().any(|origin| &origin.path == side) {
+                continue;
+            }
+            for origin in &origins {
+                let hidden = IncompleteTaintSelector {
+                    path: side.clone(),
+                    message: format!(
+                        "selector `{side}` may be hidden by a provider failure seen while \
+                         evaluating selector `{}`: {}",
+                        origin.path, origin.message
+                    ),
+                    discovery: origin.discovery.clone(),
+                    refusal_subjects: origin.refusal_subjects.clone(),
+                    has_non_utf8_refusal: origin.has_non_utf8_refusal,
+                    refusal_reason: origin.refusal_reason.clone(),
+                    truncated: false,
+                    incompleteness: origin.incompleteness.clone(),
+                };
+                if !self.incomplete_taint_selectors.contains(&hidden) {
+                    self.incomplete_taint_selectors.push(hidden);
+                    self.incomplete_selector_observations
+                        .push(IncompleteSelectorObservation {
+                            original_completion: None,
+                            original_locator_refusal_code: None,
+                            attributed_file: None,
+                        });
+                }
+            }
         }
     }
 
@@ -2458,6 +3211,18 @@ impl<'a> PolicySelectorSession<'a> {
             }
         }
         Ok(())
+    }
+
+    /// The joined reuse verdict of this session's query executions since the
+    /// last call. A capture around selections takes the share its own
+    /// selections produced and gives the rest back with
+    /// [`Self::join_execution_reuse`].
+    pub(super) fn take_execution_reuse(&mut self) -> ReuseVerdict {
+        std::mem::take(&mut self.execution_reuse)
+    }
+
+    pub(super) fn join_execution_reuse(&mut self, reuse: ReuseVerdict) {
+        self.execution_reuse.join_in(reuse);
     }
 
     pub(super) fn take_incomplete_taint_selectors(&mut self) -> Vec<IncompleteTaintSelector> {
@@ -2787,6 +3552,7 @@ impl<'a> PolicySelectorSession<'a> {
                         runtime_keyed_read_conclusive_exclusion: false,
                         occurrence_role: None,
                         retained_incomplete_result_contract_query: false,
+                        selected_source_entries: None,
                     })
                 })
                 .collect();
@@ -2807,7 +3573,7 @@ impl<'a> PolicySelectorSession<'a> {
         let semantic_before = self.semantic_budget.replay_snapshot();
         let refusals_before = self.semantic_budget.refusal_count();
         let execution_before = self.semantic_execution_budget.work();
-        let (executed, mut reads, elapsed) = recompute_unit(
+        let (executed, mut reads, elapsed, _) = recompute_unit_judged(
             self.workspace.analyzer(),
             Some(self.cancellation),
             || {
@@ -2819,7 +3585,7 @@ impl<'a> PolicySelectorSession<'a> {
                 )
             },
             || {
-                execute_code_query_selector_unit(
+                let executed = execute_code_query_selector_unit(
                     self.workspace,
                     &self.flow_state,
                     query,
@@ -2833,16 +3599,21 @@ impl<'a> PolicySelectorSession<'a> {
                         std::slice::from_ref(file),
                         &units.workspace_files,
                     )
+                    .with_refusal_subject_limit(self.refusal_subject_limit)
                     .with_depth_bound_status(false)
                     .with_optional_shared_call_target_outcomes(self.call_target_outcomes.as_ref()),
-                )
+                );
+                let verdict = executed.detailed.reuse;
+                (executed, verdict)
             },
         );
         units.reuse.record_recompute(elapsed);
         let mut detailed = executed.detailed;
         let rows = executed.unit;
         let semantic_receipt = detailed.take_semantic_receipt();
+        self.record_query_budget_refusals(&detailed.result.diagnostics);
         self.query_work = self.query_work.saturating_add(detailed.work);
+        self.execution_reuse.join_in(detailed.reuse);
         let complete = matches!(detailed.result.completion(), CodeQueryCompletion::Complete);
         let artifact_charge = self.charge_query_semantic_work_with_artifact_continuation(
             detailed.work.semantic,
@@ -2872,6 +3643,7 @@ impl<'a> PolicySelectorSession<'a> {
                         artifact_charge,
                         retained_incomplete_result_contracts: false,
                         retained_incomplete_taint_rows: false,
+                        source_certifications: HashMap::new(),
                     },
                 )?
             };
@@ -2947,6 +3719,7 @@ impl<'a> PolicySelectorSession<'a> {
                 self.analysis
             )));
         }
+        self.record_query_budget_refusals(&product.rows.diagnostics);
         self.query_work = self.query_work.saturating_add(product.rows.work);
         Ok(())
     }
@@ -3101,7 +3874,11 @@ impl<'a> PolicySelectorSession<'a> {
                     }
                 }
             };
-            PolicySelectorSessionError::Incomplete { completion, detail }
+            PolicySelectorSessionError::Incomplete {
+                completion,
+                detail,
+                reuse: ReuseVerdict::Content,
+            }
         })?;
         enumeration
             .classify_in_scope(self, &selector, query, scope)
@@ -3139,6 +3916,7 @@ impl<'a> PolicySelectorSession<'a> {
                 artifact_charge: None,
                 retained_incomplete_result_contracts: false,
                 retained_incomplete_taint_rows: false,
+                source_certifications: HashMap::new(),
             },
         )?;
         assert!(charge.is_none());
@@ -3180,11 +3958,13 @@ impl<'a> PolicySelectorSession<'a> {
             &self.semantic_budget,
             &self.semantic_execution_budget,
             artifact_leases,
-            scope.with_depth_bound_status(false).with_optional_shared_call_target_outcomes(self.call_target_outcomes.as_ref()),
+            scope.with_refusal_subject_limit(self.refusal_subject_limit).with_depth_bound_status(false).with_optional_shared_call_target_outcomes(self.call_target_outcomes.as_ref()),
             &mut self.row_family_session,
         );
         let semantic_receipt = detailed.take_semantic_receipt();
+        self.record_query_budget_refusals(&detailed.result.diagnostics);
         self.query_work = self.query_work.saturating_add(detailed.work);
+        self.execution_reuse.join_in(detailed.reuse);
         Ok((detailed, semantic_receipt))
     }
 
@@ -3202,6 +3982,7 @@ impl<'a> PolicySelectorSession<'a> {
             artifact_charge: None,
             retained_incomplete_result_contracts: false,
             retained_incomplete_taint_rows: false,
+            source_certifications: HashMap::new(),
         })
     }
 
@@ -3225,6 +4006,83 @@ impl<'a> PolicySelectorSession<'a> {
             artifact_charge,
             retained_incomplete_result_contracts: retain_result_contract_subset,
             retained_incomplete_taint_rows: false,
+            source_certifications: HashMap::new(),
+        })
+    }
+
+    /// Consume the exact language-rule authority carried by the live row.
+    /// Do not rediscover candidates from the output span: it can have been
+    /// projected, or merged with a different row by the query pipeline.
+    fn certify_source_row(
+        &mut self,
+        admission: &MatchedValueSourceAdmission,
+        file: &ProjectFile,
+        proof: Arc<brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::SelectedPatternObservation>,
+    ) -> Result<SourceRowCertification, PolicySelectorSessionError> {
+        use brokk_bifrost_flow::dataflow::SemanticInputStatus;
+        let views =
+            match selected_source_factory(self.workspace.analyzer(), admission.scope.as_ref()) {
+                Ok(views) => views,
+                Err(incompleteness) => {
+                    // No bound/open/funded factory never authorizes ordinary fallback.
+                    return Ok(SourceRowCertification {
+                        entries: Box::default(),
+                        incomplete: true,
+                        incompleteness: Some(incompleteness),
+                    });
+                }
+            };
+        let mut retention_error = None;
+        let workspace = self.workspace;
+        let continuation = self.continue_semantic(|request| {
+            let (outcome, refusal) = views.admit(
+                workspace,
+                proof,
+                // The row carries admission authority, not the materialization
+                // envelope. The factory obtains the actual base status itself.
+                SemanticInputStatus::Unknown,
+                admission.models.clone(),
+                request,
+            )?;
+            retention_error = refusal;
+            Ok(outcome)
+        })?;
+        self.require_uninterrupted(
+            continuation.outcome(),
+            "selected source entry certification",
+        )?;
+        let entries = if continuation.outcome().is_complete() {
+            let outcome = continuation.commit(self, "selected source entry certification")?;
+            let SemanticOutcome::Complete { value, .. } = outcome else {
+                unreachable!()
+            };
+            self.remember_artifact(
+                file.clone(),
+                Arc::clone(value.observation().point().procedure().artifact()),
+            );
+            vec![value].into_boxed_slice()
+        } else {
+            continuation.finish_scalar((), "selected source entry refusal")?;
+            Box::default()
+        };
+        self.require_execution_budget("selected source entry certification")?;
+        let incompleteness = entries.is_empty().then(|| {
+            use brokk_bifrost_flow::value_flow::SelectedSourceEntryRetentionError;
+            use brokk_bifrost_rql::{DiagnosticExecutionCause, Incompleteness};
+            // An untyped semantic refusal cannot prove a capacity or content cause.
+            Incompleteness::Operational(match retention_error {
+                Some(SelectedSourceEntryRetentionError::Capacity) => {
+                    DiagnosticExecutionCause::Budget
+                }
+                Some(SelectedSourceEntryRetentionError::Scope(_)) | None => {
+                    DiagnosticExecutionCause::Provider
+                }
+            })
+        });
+        Ok(SourceRowCertification {
+            incomplete: entries.is_empty(),
+            entries,
+            incompleteness,
         })
     }
 
@@ -3232,24 +4090,69 @@ impl<'a> PolicySelectorSession<'a> {
         &mut self,
         query: &brokk_bifrost_rql::CodeQuery,
         scope: CodeQueryExecutionScope<'_>,
+        source_admission: Option<&MatchedValueSourceAdmission>,
     ) -> Result<PolicySelectorQueryResult, PolicySelectorSessionError> {
         let (detailed, semantic_receipt) = self.execute_selector_query_core(query, scope)?;
-        let retain_rows = retains_usable_taint_rows(
+        // The query child extends the exact parent execution snapshot it saw.
+        // Settle its scalar/execution charge before certification spends parent
+        // work. Selected-source proof retention must also precede a new window.
+        let mut artifact_charge =
+            self.settle_query_semantic_work(detailed.work.semantic, semantic_receipt)?;
+        let mut source_certifications = HashMap::new();
+        if !matches!(
+            detailed.result.completion(),
+            CodeQueryCompletion::Cancelled | CodeQueryCompletion::Invalid { .. }
+        ) && let Some(admission) = source_admission
+        {
+            if detailed.evidence.iter().any(|evidence| {
+                matches!(
+                    &evidence.selected_pattern_source,
+                    SelectedPatternSourceEvidence::Admitted(_)
+                )
+            }) && let Some(charge) = artifact_charge.take()
+            {
+                // The original receipt owns the transported proof roots. Apply
+                // it atomically before the factory opens a window against the
+                // parent's current generation and retained-byte headroom.
+                // This accounts actual request ownership, not completeness:
+                // a later refusal leaves these owners charged until drop.
+                self.apply_artifact_charge(Ok(charge), "selected source proof retention")?;
+            }
+            for evidence in &detailed.evidence {
+                let certification = match &evidence.selected_pattern_source {
+                    // Ordinary sources must keep their old binding path,
+                    // including rows with no semantic artifact or provider.
+                    SelectedPatternSourceEvidence::NotRequired => continue,
+                    SelectedPatternSourceEvidence::Admitted(proof) => {
+                        self.certify_source_row(admission, &evidence.file, Arc::clone(proof))?
+                    }
+                    // Retain a refusal marker even for a Complete query so
+                    // selected_sites cannot fall through to ordinary binding.
+                    SelectedPatternSourceEvidence::Conflict => SourceRowCertification {
+                        entries: Box::default(),
+                        incomplete: true,
+                        incompleteness: Some(brokk_bifrost_rql::Incompleteness::Content),
+                    },
+                };
+                source_certifications.insert(evidence.result_index, certification);
+            }
+        }
+        let retain_rows = retains_taint_rows(
             &detailed.result,
             &detailed.evidence,
             query_call_binding_proof(&query.plan),
+            &source_certifications,
         );
-        let artifact_charge = self.charge_query_semantic_work_with_artifact_continuation(
-            detailed.work.semantic,
-            semantic_receipt,
-            matches!(detailed.result.completion(), CodeQueryCompletion::Complete) || retain_rows,
-        )?;
+        let artifact_charge = artifact_charge.filter(|_| {
+            matches!(detailed.result.completion(), CodeQueryCompletion::Complete) || retain_rows
+        });
         Ok(PolicySelectorQueryResult {
             result: detailed.result,
             evidence: detailed.evidence,
             artifact_charge,
             retained_incomplete_result_contracts: false,
             retained_incomplete_taint_rows: false,
+            source_certifications,
         })
     }
 
@@ -3289,18 +4192,21 @@ impl<'a> PolicySelectorSession<'a> {
                 .collect::<Vec<_>>()
                 .join("; ");
             return Err(PolicySelectorSessionError::Incomplete {
+                reuse: ReuseVerdict::Content,
                 completion: detailed.result.completion(),
                 detail: format!("`{}` ({diagnostics})", selector.path),
             });
         }
+        let retention = TaintRowRetentionScope::for_result(&detailed.result);
         let selected = detailed
             .evidence
             .into_iter()
             .filter(|evidence| !matches!(evidence.domain, DetailedCodeQueryDomain::File))
             .filter(|evidence| {
-                !taint_subset
-                    || detailed.result.results.get(evidence.result_index)
-                        .is_some_and(|item| usable_taint_row(item, evidence, query_binding_proof))
+                let certification = detailed.source_certifications.get(&evidence.result_index);
+                (!taint_subset && certification.is_none()) || detailed.result.results.get(evidence.result_index).is_some_and(|item| {
+                    retained_taint_row(item, evidence, query_binding_proof, &retention, certification).is_some()
+                    })
             })
             .map(|evidence| {
                 let item = detailed
@@ -3323,6 +4229,7 @@ impl<'a> PolicySelectorSession<'a> {
                     // indexed-result or receiver binding.
                     return Ok(None);
                 }
+                let row_retention = retained_taint_row(item, &evidence, query_binding_proof, &retention, detailed.source_certifications.get(&evidence.result_index));
                 let decorated_parameter = match (
                     &item.value,
                     evidence.decorated_parameter.as_ref(),
@@ -3393,6 +4300,19 @@ impl<'a> PolicySelectorSession<'a> {
                     (ProofStatus::Proven, EvidenceCompleteness::Complete)
                 } else {
                     selected_site_quality(item)
+                };
+                // Only the shared predicate's AST fallback is a possible
+                // endpoint. A row outside the named gap keeps its own proof;
+                // the unrelated file's recovery cannot weaken that identity.
+                let (proof, completeness) = if taint_subset
+                    && row_retention == Some(TaintRowRetention::PossibleAst)
+                {
+                    (
+                        ProofStatus::Unproven("selector discovery was incomplete".into()),
+                        EvidenceCompleteness::Partial("selector discovery was incomplete".into()),
+                    )
+                } else {
+                    (proof, completeness)
                 };
                 let result_contract = match &item.value {
                     CodeQueryResultValue::CallResultContract { value } => {
@@ -3623,6 +4543,8 @@ impl<'a> PolicySelectorSession<'a> {
                     runtime_keyed_read_conclusive_exclusion,
                     occurrence_role,
                     retained_incomplete_result_contract_query,
+                    selected_source_entries: detailed.source_certifications.get(&evidence.result_index)
+                        .map(|certification| certification.entries.clone()),
                 }))
             })
             .collect::<Result<Vec<_>, _>>()?
@@ -3674,6 +4596,40 @@ impl<'a> PolicySelectorSession<'a> {
 
     pub(super) fn cancellation(&self) -> &'a CancellationToken {
         self.cancellation
+    }
+
+    /// Select before enumerating executable IDs. The workspace owner replays
+    /// its complete receipt on both decision fills and hits.
+    pub(super) fn selected_procedure(
+        &mut self,
+        base: &ProcedureHandle,
+    ) -> Result<ProcedureHandle, PolicySelectorSessionError> {
+        let outcome = self
+            .workspace
+            .selected_procedure_handle(base, &mut self.semantic_request())
+            .map_err(|error| PolicySelectorSessionError::Unavailable(error.to_string()))?;
+        if let Some((completion, detail)) =
+            semantic_outcome_failure(&outcome, "procedure selection")
+        {
+            return Err(PolicySelectorSessionError::Incomplete {
+                completion,
+                detail,
+                reuse: ReuseVerdict::Content,
+            });
+        }
+        match outcome {
+            SemanticOutcome::Complete {
+                value:
+                    brokk_bifrost_analysis::analyzer::semantic::service::SelectedProcedureHandle {
+                        handle: procedure,
+                        ..
+                    },
+                ..
+            } => Ok(procedure),
+            _ => Err(PolicySelectorSessionError::Unavailable(format!(
+                "procedure selection incomplete: {outcome:?}"
+            ))),
+        }
     }
 
     pub(super) fn semantic_request(&mut self) -> SemanticRequest<'_> {
@@ -3973,7 +4929,23 @@ impl<'a> PolicySelectorSession<'a> {
         self.artifacts.values().map(|entry| &entry.artifact)
     }
 
+    /// Retain only the structural base in the file registry. Alternate
+    /// observations keep their executable arena on their endpoint handles.
+    pub(super) fn remember_procedure_artifact(
+        &mut self,
+        file: ProjectFile,
+        procedure: &ProcedureHandle,
+    ) {
+        if !procedure.is_candidate_alternate() {
+            self.remember_artifact(file, Arc::clone(procedure.artifact()));
+        }
+    }
+
     pub(super) fn remember_artifact(&mut self, file: ProjectFile, artifact: Arc<SemanticArtifact>) {
+        debug_assert!(
+            artifact.candidate_evidence().is_none(),
+            "a guarded arena cannot seed the file's base registry"
+        );
         self.artifacts.entry(file).or_insert(MaterializedArtifact {
             artifact,
             reads: None,
@@ -4030,6 +5002,7 @@ impl<'a> PolicySelectorSession<'a> {
         self.require_execution_budget("program semantics materialization")?;
         if !continuation.outcome().is_complete() {
             return Err(PolicySelectorSessionError::Incomplete {
+                reuse: ReuseVerdict::Content,
                 completion: CodeQueryCompletion::Incomplete {
                     codes: vec![CodeQueryDiagnosticCode::SemanticAnalysisPartial],
                 },
@@ -4049,6 +5022,10 @@ impl<'a> PolicySelectorSession<'a> {
         assert!(
             self.artifact_leases.snapshot().contains_exact(&artifact),
             "a complete typestate materialization is leased before its handle escapes"
+        );
+        debug_assert!(
+            artifact.candidate_evidence().is_none(),
+            "materialization returns the file's base allocation"
         );
         self.artifacts.insert(
             file.clone(),
@@ -4103,6 +5080,10 @@ impl<'a> PolicySelectorSession<'a> {
             .available_value()
             .cloned()
             .ok_or_else(|| unavailable_semantic_artifact(file))?;
+        debug_assert!(
+            artifact.candidate_evidence().is_none(),
+            "materialization returns the file's base allocation"
+        );
         self.artifacts.insert(
             file.clone(),
             MaterializedArtifact {
@@ -4128,8 +5109,33 @@ impl<'a> PolicySelectorSession<'a> {
         operation: &str,
     ) -> Result<(), PolicySelectorSessionError> {
         semantic_outcome_failure(outcome, operation).map_or(Ok(()), |(completion, detail)| {
-            Err(PolicySelectorSessionError::Incomplete { completion, detail })
+            Err(PolicySelectorSessionError::Incomplete {
+                completion,
+                detail,
+                reuse: ReuseVerdict::Content,
+            })
         })
+    }
+
+    fn record_query_budget_refusals(
+        &mut self,
+        diagnostics: &[brokk_bifrost_rql::structural::CodeQueryDiagnostic],
+    ) {
+        for diagnostic in diagnostics {
+            self.budget_refusals.extend(
+                diagnostic
+                    .exhausted_roots
+                    .iter()
+                    .filter(|root| root.is_budget_refusal())
+                    .map(|root| root.lane.clone()),
+            );
+            if diagnostic.code == CodeQueryDiagnosticCode::ResultLimitReached {
+                self.budget_refusals
+                    .push("policy/selector_results".to_string());
+            }
+        }
+        self.budget_refusals.sort();
+        self.budget_refusals.dedup();
     }
 
     pub(super) fn work_report(&self, analysis: &str) -> PolicyWorkReport {
@@ -4259,7 +5265,7 @@ impl<'a> PolicySelectorSession<'a> {
             resident,
             root_work,
         );
-        PolicyWorkReport::try_new(
+        let mut work = PolicyWorkReport::try_new(
             self.query_work.scanned_files,
             self.query_work.scanned_source_bytes,
             self.query_work.fact_nodes,
@@ -4271,6 +5277,17 @@ impl<'a> PolicySelectorSession<'a> {
             metrics,
         )
         .unwrap_or_default()
+        .with_budget_refusals(&self.budget_refusals);
+        if let Some(refusal) = self.semantic_budget.first_refusal() {
+            work.record_budget_refusal(&format!(
+                "semantic/{}",
+                refusal.exceeded.dimension().label()
+            ));
+        }
+        if self.semantic_execution_budget.work().exhausted {
+            work.record_budget_refusal("semantic/materialized_files");
+        }
+        work
     }
 
     pub(super) fn semantic_peaks(&self) -> PolicySemanticPeaks {
@@ -4382,6 +5399,9 @@ impl<'a> PolicySelectorSession<'a> {
             max_scanned_files: self.query_limits.max_scanned_files,
             max_scanned_source_bytes: self.query_limits.max_scanned_source_bytes,
             max_fact_nodes: self.query_limits.max_fact_nodes,
+            max_call_answers: self.query_limits.max_call_answers,
+            max_call_scanned_files: self.query_limits.max_call_scanned_files,
+            max_call_scanned_source_bytes: self.query_limits.max_call_scanned_source_bytes,
             max_pipeline_rows: self.query_limits.max_pipeline_rows,
             semantic,
             typestate: self.query_limits.typestate,
@@ -4405,6 +5425,18 @@ impl<'a> PolicySelectorSession<'a> {
         receipt: Option<CodeQuerySemanticReceipt>,
         completed: bool,
     ) -> Result<Option<SemanticArtifactLeaseCharge>, PolicySelectorSessionError> {
+        Ok(self
+            .settle_query_semantic_work(work, receipt)?
+            .filter(|_| completed))
+    }
+
+    /// Apply the query's scalar/execution receipt once, retaining its bounded
+    /// artifact charge until the consumer decides whether rows may escape.
+    fn settle_query_semantic_work(
+        &mut self,
+        work: CodeQuerySemanticWork,
+        receipt: Option<CodeQuerySemanticReceipt>,
+    ) -> Result<Option<SemanticArtifactLeaseCharge>, PolicySelectorSessionError> {
         let semantic_work = self.selector_semantic_work(work);
         let Some(receipt) = receipt else {
             assert_eq!(
@@ -4422,12 +5454,7 @@ impl<'a> PolicySelectorSession<'a> {
             execution_before,
             execution_charge,
         )?;
-        if completed {
-            Ok(Some(artifact_charge))
-        } else {
-            drop(artifact_charge);
-            Ok(None)
-        }
+        Ok(Some(artifact_charge))
     }
 
     fn selector_semantic_work(&mut self, work: CodeQuerySemanticWork) -> SemanticWork {
@@ -4769,6 +5796,7 @@ impl<'a> SelectorUnits<'a> {
                     runtime_keyed_read_conclusive_exclusion: false,
                     occurrence_role: None,
                     retained_incomplete_result_contract_query: false,
+                    selected_source_entries: None,
                 })
             })
             .collect()
@@ -4838,6 +5866,7 @@ pub(super) struct SelectorUnitOutcome {
 
 fn semantic_budget_error(detail: impl Into<String>) -> PolicySelectorSessionError {
     PolicySelectorSessionError::Incomplete {
+        reuse: ReuseVerdict::Content,
         completion: incomplete_code_query_completion(
             CodeQueryDiagnosticCode::SemanticBudgetExhausted,
         ),
@@ -5144,7 +6173,11 @@ pub(super) fn selected_site_quality(
                 ProofStatus::Proven,
                 if value.verdict == "open" {
                     EvidenceCompleteness::Partial(
-                        format!("loop relation is open: {:?}", value.reasons).into(),
+                        brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+                            format_args!("loop relation is open: {:?}", value.reasons),
+                            format_args!("loop relation is open"),
+                            value.reasons.iter(),
+                        ).into(),
                     )
                 } else {
                     EvidenceCompleteness::Complete
@@ -5841,6 +6874,79 @@ pub(super) fn parameter_name_matches(name: &str, expected: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9925: selected-source retention refusal lost transient read provenance"
+    )]
+    fn selected_factory_refusals_reach_captured_read_channels() {
+        use brokk_bifrost_analysis::analyzer::OuterRequest;
+        use brokk_bifrost_flow::value_flow::{ValueFlowRetentionBudget, ValueFlowRetentionScope};
+
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file("lib.rs", "pub fn run() {}")
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        // Capture the production resolver, including its real root allocation.
+        // Nested forwarding checks the observing caller's channels, not messages.
+        let observe = |scope: Option<&Arc<ValueFlowRetentionScope>>| {
+            let ((factory, child), parent) = capture_query_reads(workspace.analyzer(), || {
+                capture_query_reads(workspace.analyzer(), || {
+                    selected_source_factory(workspace.analyzer(), scope)
+                })
+            });
+            assert_eq!(parent.channels(), child.channels());
+            (factory, parent.channels())
+        };
+        let (missing, reads) = observe(None);
+        assert!(matches!(
+            missing,
+            Err(brokk_bifrost_rql::Incompleteness::Operational(
+                brokk_bifrost_rql::DiagnosticExecutionCause::Provider
+            ))
+        ));
+        assert!(reads.execution_dependences > 0);
+        assert_eq!(reads.budget_dependences, 0);
+
+        let capped_request = OuterRequest::new();
+        let capped_budget = ValueFlowRetentionBudget::new(1, 1);
+        let capped = ValueFlowRetentionScope::bind(&capped_request, &capped_budget).unwrap();
+        let (refused, reads) = observe(Some(&capped));
+        assert!(matches!(
+            refused,
+            Err(brokk_bifrost_rql::Incompleteness::Operational(
+                brokk_bifrost_rql::DiagnosticExecutionCause::Budget
+            ))
+        ));
+        assert!(reads.budget_dependences > 0);
+        assert_eq!(reads.execution_dependences, reads.budget_dependences);
+        assert_eq!(capped_budget.retained_plan_bytes(), 0);
+
+        let outer = OuterRequest::new();
+        let budget = ValueFlowRetentionBudget::new(1 << 20, 1 << 20);
+        let scope = ValueFlowRetentionScope::bind(&outer, &budget).unwrap();
+        let (factory, reads) = observe(Some(&scope));
+        assert!(factory.is_ok());
+        assert_eq!(reads.execution_dependences, 0);
+        assert_eq!(reads.budget_dependences, 0);
+        let (alias, reads) = observe(Some(&scope));
+        assert!(Arc::ptr_eq(
+            factory.as_ref().unwrap(),
+            alias.as_ref().unwrap()
+        ));
+        assert_eq!(reads.execution_dependences, 0);
+        assert_eq!(reads.budget_dependences, 0);
+        outer.close();
+        let (closed, reads) = observe(Some(&scope));
+        assert!(matches!(
+            closed,
+            Err(brokk_bifrost_rql::Incompleteness::Operational(
+                brokk_bifrost_rql::DiagnosticExecutionCause::Provider
+            ))
+        ));
+        assert!(reads.execution_dependences > 0);
+        assert_eq!(reads.budget_dependences, 0);
+    }
 
     #[test]
     fn structural_candidate_enumeration_whitelist_and_limits() {
@@ -6990,6 +8096,459 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "f3fffc13b78d: a literal, identifier or field-access source row was dropped silently when its selector query was incomplete"
+    )]
+    fn incomplete_taint_selector_keeps_syntax_rows_as_possible_endpoints() {
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "src/lib.rs",
+                "struct Config { secret: u8 }\n\
+                 fn target(_: u8) {}\n\
+                 fn read_secret() -> u8 { 1 }\n\
+                 fn run(secret_key: u8, config: &Config) {\n\
+                 let _ = (\"one\", \"two\");\n\
+                 target(secret_key); target(secret_key);\n\
+                 target(config.secret); target(config.secret);\n\
+                 read_secret(); read_secret();\n\
+                 }\n",
+            )
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig {
+            parallelism: Some(1),
+            ..AnalyzerConfig::default()
+        });
+        let cancellation = CancellationToken::default();
+        for (form, selector, syntax_row) in [
+            (
+                "inside",
+                "(language rust (inside (function) (string_literal)))",
+                true,
+            ),
+            (
+                "occurrences-in",
+                "(language rust (occurrences-in :role [value_reference] :namespace value (identifier :name/regex \"^secret_key$\")))",
+                true,
+            ),
+            (
+                "field_access",
+                "(language rust (field_access :name/regex \"^secret$\"))",
+                true,
+            ),
+            (
+                "call callee",
+                "(language rust (call :callee (name/regex \"^read_secret$\")))",
+                false,
+            ),
+        ] {
+            let selector = resolved_selector(selector, "/analysis/sources/entries/source/selector");
+            // A row cap of one leaves the second match missing: the query is
+            // incomplete for a reason unrelated to what the first row is.
+            let mut capped = PolicySelectorSession::new(
+                &workspace,
+                &brokk_bifrost_flow::FlowWorkspaceState::default(),
+                "taint",
+                PolicyBudget::default().query_limits(),
+                1,
+                &cancellation,
+                CodeQueryExecutionScope::whole_workspace(),
+            );
+            let retained = capped
+                .select_taint(&selector)
+                .unwrap_or_else(|error| panic!("{form}: {error:?}"));
+            let gaps = capped.take_incomplete_taint_selectors();
+            assert_eq!(gaps.len(), 1, "{form}: {gaps:#?}");
+            assert!(gaps[0].truncated, "{form}: {gaps:#?}");
+            if syntax_row {
+                assert!(
+                    gaps[0].message.contains("syntax-identity rows retained"),
+                    "{form}: the retained syntax rows are reported: {gaps:#?}"
+                );
+                // The artifact continuation and the row filter share one
+                // predicate: rows that are retained keep their artifact lease.
+                let query = capped.selector_query(&selector).expect("selector query");
+                let (detailed, _receipt) = capped
+                    .execute_selector_query_core(&query, CodeQueryExecutionScope::whole_workspace())
+                    .expect("capped selector query");
+                assert!(
+                    retains_taint_rows(&detailed.result, &detailed.evidence, None, &HashMap::new()),
+                    "{form}: syntax rows of an incomplete query are retained"
+                );
+                assert_eq!(retained.len(), 1, "{form}: {gaps:#?}");
+                assert!(
+                    matches!(retained[0].proof, ProofStatus::Unproven(_))
+                        && matches!(retained[0].completeness, EvidenceCompleteness::Partial(_)),
+                    "{form}: a syntax row of an incomplete query is a possible endpoint: {:?} {:?}",
+                    retained[0].proof,
+                    retained[0].completeness
+                );
+            } else {
+                // A call row needs resolution. It is retained when it binds
+                // exactly; otherwise the gap names the rows it withheld.
+                assert!(
+                    !retained.is_empty() || gaps[0].message.contains("rows withheld"),
+                    "{form}: a removed row leaves a typed trace: {gaps:#?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "f3fffc13b78d: an operational proof stop recorded by the sink phase in an enclosing scope made every later source selector incomplete"
+    )]
+    fn source_selector_is_not_made_incomplete_by_an_enclosing_proof_stop() {
+        use brokk_bifrost_analysis::analyzer::{
+            AnalyzerQueryScope, QueryReadIncomplete, read_ledger::DerivationExecutionCause,
+        };
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "src/lib.rs",
+                "fn target(_: u8) {}\nfn run() { let _ = (\"one\", \"two\"); }\n",
+            )
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig {
+            parallelism: Some(1),
+            ..AnalyzerConfig::default()
+        });
+        let selector = resolved_selector(
+            "(language rust (inside (function) (string_literal)))",
+            "/analysis/sources/entries/source/selector",
+        );
+        let cancellation = CancellationToken::default();
+        // The sink phase binds its calls in the policy's enclosing scope and
+        // stops there operationally. The source selector reads none of that.
+        let enclosing = AnalyzerQueryScope::new(workspace.analyzer());
+        workspace
+            .analyzer()
+            .record_query_incomplete(QueryReadIncomplete::ProofStopped {
+                reason: "resolution_unsupported_semantic",
+                cause: Some(DerivationExecutionCause::Provider),
+            });
+        let mut session = PolicySelectorSession::new(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::default(),
+            "taint",
+            PolicyBudget::default().query_limits(),
+            16,
+            &cancellation,
+            CodeQueryExecutionScope::whole_workspace(),
+        );
+        let selected = session.select_taint(&selector).expect("source selector");
+        let gaps = session.take_incomplete_taint_selectors();
+        assert!(gaps.is_empty(), "{gaps:#?}");
+        assert_eq!(selected.len(), 2);
+        assert!(
+            selected.iter().all(|site| {
+                matches!(site.proof, ProofStatus::Proven)
+                    && matches!(site.completeness, EvidenceCompleteness::Complete)
+            }),
+            "the rows keep their own proof"
+        );
+        drop(enclosing);
+    }
+
+    #[test]
+    #[hardwon("#12936: policy query scope did not bound refusal subjects before retention")]
+    fn policy_scope_bounds_refusal_subjects_before_retention() {
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file("subject.rs", "fn caller() { missing(); missing(); missing(); missing(); missing(); missing(); }\n")
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let selector = resolved_selector(
+            "(language rust (call-bindings (call-shape (call :callee (name \"missing\")))))",
+            "/analysis/sources/refused/selector",
+        );
+        let (_, query) = selector.as_query().expect("inline query");
+        let cancellation = CancellationToken::default();
+        let run = |bound| {
+            let mut session = PolicySelectorSession::new(
+                &workspace,
+                &brokk_bifrost_flow::FlowWorkspaceState::default(),
+                "taint",
+                PolicyBudget::default().query_limits(),
+                16,
+                &cancellation,
+                CodeQueryExecutionScope::whole_workspace().with_refusal_subject_limit(bound),
+            );
+            session
+                .execute_selector_query_core(query, CodeQueryExecutionScope::whole_workspace())
+                .unwrap()
+                .0
+                .result
+        };
+        let baseline = run(None);
+        for bound in [0, 2] {
+            let result = run(Some(bound));
+            assert_eq!(result.completion(), baseline.completion());
+            let subjects = result
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| crate::evaluator::is_call_binding_refusal(diagnostic))
+                .collect::<Vec<_>>();
+            assert_eq!(subjects.len(), 1, "{:#?}", result.diagnostics);
+            let diagnostic = crate::PolicyDiagnostic::new_bounded(
+                crate::PolicyDiagnosticCode::EvaluationFailure,
+                crate::PolicyDiagnosticSeverity::Warning,
+                crate::PolicyDiagnosticImpact::RunIncomplete,
+                selector.path.to_string(),
+            );
+            let rendered = crate::evaluator::attach_refusal_subjects(
+                diagnostic,
+                &crate::evaluator::refusal_subjects(subjects[0]),
+                bound,
+                subjects[0].has_non_utf8_refusal,
+                "call-binding refusal: CalleeUnresolved",
+            );
+            assert!(rendered.primary().is_some());
+            assert_eq!(rendered.related().len(), bound);
+            let counts = rendered.refusal_omissions().unwrap();
+            assert_eq!(counts.bound_trimmed, (5 - bound) as u64);
+            assert_eq!(counts.unrepresentable_path, 0);
+            assert!(!counts.has_non_utf8_refusal);
+        }
+        // Distinct authored branches can select the same calls. Their union
+        // must still count the six physical sites once at this selector.
+        let second = resolved_selector(
+            "(language rust (call-bindings (call-shape (call :callee (name \"missing\") (arity 0)))))",
+            "/analysis/sources/overlap/selector",
+        );
+        let (_, second_query) = second.as_query().unwrap();
+        for split_after_bindings in [false, true] {
+            let mut left = query.plan.clone();
+            let mut right = second_query.plan.clone();
+            let suffix = if split_after_bindings {
+                Vec::new()
+            } else {
+                let suffix = left.steps.split_off(left.steps.len() - 1);
+                right.steps.pop();
+                suffix
+            };
+            let mut union = query.clone();
+            union.plan = brokk_bifrost_rql::CodeQueryPlan {
+                source: brokk_bifrost_rql::CodeQueryPlanSource::Set {
+                    op: brokk_bifrost_rql::SetOperator::Union,
+                    branches: vec![left, right],
+                },
+                steps: suffix,
+            };
+            let mut session = PolicySelectorSession::new(
+                &workspace,
+                &brokk_bifrost_flow::FlowWorkspaceState::default(),
+                "taint",
+                PolicyBudget::default().query_limits(),
+                16,
+                &cancellation,
+                CodeQueryExecutionScope::whole_workspace().with_refusal_subject_limit(Some(2)),
+            );
+            let (detailed, _) = session
+                .execute_selector_query_core(&union, CodeQueryExecutionScope::whole_workspace())
+                .unwrap();
+            assert_eq!(detailed.result.completion(), baseline.completion());
+            let mut sites = Vec::new();
+            let mut omitted = false;
+            for diagnostic in detailed
+                .result
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| crate::evaluator::is_call_binding_refusal(diagnostic))
+            {
+                sites.extend(crate::evaluator::refusal_subjects(diagnostic));
+                omitted |= diagnostic.has_non_utf8_refusal;
+            }
+            let diagnostic = crate::PolicyDiagnostic::new_bounded(
+                crate::PolicyDiagnosticCode::EvaluationFailure,
+                crate::PolicyDiagnosticSeverity::Warning,
+                crate::PolicyDiagnosticImpact::RunIncomplete,
+                selector.path.to_string(),
+            );
+            let diagnostic = crate::evaluator::attach_refusal_subjects(
+                diagnostic,
+                &sites,
+                2,
+                omitted,
+                "call-binding refusal: CalleeUnresolved",
+            );
+            assert_eq!(
+                diagnostic.omitted_related_locations_lower_bound(),
+                crate::RelatedLocationOmissions::Known(3),
+                "split_after_bindings={split_after_bindings}"
+            );
+            let counts = diagnostic.refusal_omissions().unwrap();
+            assert_eq!(counts.bound_trimmed, 3);
+            assert_eq!(counts.unrepresentable_path, 0);
+            assert!(!counts.has_non_utf8_refusal);
+        }
+    }
+
+    #[test]
+    #[hardwon("#12936: persisted seed units can diagnose the same derived call site")]
+    fn persisted_refusal_sites_merge_before_rendering() {
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file("Cargo.toml", "[package]\nname='refusal_overlap'\nversion='0.1.0'\nedition='2021'\n")
+            .file("src/lib.rs", "mod a; mod b; mod shared;\n")
+            .file("src/a.rs", "pub fn first() { crate::shared::shared(); }\n")
+            .file("src/b.rs", "pub fn second() { crate::shared::shared(); }\n")
+            .file("src/shared.rs", "pub fn shared() { missing(); missing(); missing(); missing(); missing(); missing(); }\n")
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let selector = resolved_selector(
+            r#"(language rust (call-bindings (call-shape (occurrences-in :class reference (file-of (callees :depth 1 (enclosing-decl (call :callee (name "shared")))))))))"#,
+            "/analysis/overlap/selector",
+        );
+        let (_, query) = selector.as_query().unwrap();
+        let files = workspace.analyzer().analyzed_files();
+        let budget = PolicyBudget::default();
+        let cancellation = CancellationToken::default();
+        let mut units = Vec::new();
+        for name in ["src/a.rs", "src/b.rs"] {
+            let seed = project.file(name);
+            let unit = brokk_bifrost_rql::structural::search::execute_code_query_unit(
+                workspace.analyzer(),
+                &brokk_bifrost_flow::FlowWorkspaceState::default(),
+                Some(&workspace),
+                query,
+                budget.query_limits(),
+                Some(&cancellation),
+                CodeQueryExecutionScope::for_seed_files(std::slice::from_ref(&seed), &files),
+            );
+            let subjects = unit
+                .diagnostics
+                .iter()
+                .filter(|d| crate::evaluator::is_call_binding_refusal(d))
+                .flat_map(crate::evaluator::refusal_subjects)
+                .collect::<Vec<_>>();
+            assert_eq!(subjects.len(), 6, "{:#?}", unit.diagnostics);
+            let wire = serde_json::to_value(&unit).unwrap();
+            assert!(!wire.to_string().contains("bound_trimmed"));
+            assert!(!wire.to_string().contains("omitted_related"));
+            let reused: UnitExecutionResult = serde_json::from_value(wire).unwrap();
+            assert!(
+                reused
+                    .diagnostics
+                    .iter()
+                    .all(|d| d.refusal_sites.is_empty())
+            );
+            units.push(reused);
+        }
+        let merged = merge_unit_rows_in_scope(
+            query,
+            units.clone(),
+            CodeQueryExecutionScope::whole_workspace(),
+        );
+        let single = merge_unit_rows_in_scope(
+            query,
+            units.into_iter().take(1),
+            CodeQueryExecutionScope::whole_workspace(),
+        );
+        assert_eq!(merged.completion(), single.completion());
+        let subjects = merged
+            .diagnostics
+            .iter()
+            .filter(|d| crate::evaluator::is_call_binding_refusal(d))
+            .flat_map(crate::evaluator::refusal_subjects)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            subjects.len(),
+            6,
+            "each shared site occurs once after persisted merge"
+        );
+        let diagnostic = crate::PolicyDiagnostic::new_bounded(
+            crate::PolicyDiagnosticCode::EvaluationFailure,
+            crate::PolicyDiagnosticSeverity::Warning,
+            crate::PolicyDiagnosticImpact::RunIncomplete,
+            selector.path.to_string(),
+        );
+        let rendered = crate::evaluator::attach_refusal_subjects(
+            diagnostic,
+            &subjects,
+            2,
+            false,
+            "call-binding refusal: CalleeUnresolved",
+        );
+        assert!(rendered.primary().is_some());
+        assert_eq!(rendered.related().len(), 2);
+        assert_eq!(rendered.refusal_omissions().unwrap().bound_trimmed, 3);
+        assert_eq!(
+            rendered.refusal_omissions().unwrap().unrepresentable_path,
+            0
+        );
+        assert_eq!(
+            rendered.omitted_related_locations_lower_bound(),
+            crate::RelatedLocationOmissions::Known(3)
+        );
+    }
+
+    #[test]
+    #[hardwon("#12936: bounded incomplete selector units must never publish")]
+    fn bounded_refusal_selector_unit_is_not_publishable() {
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file("subject.rs", "fn caller() { missing(); missing(); missing(); missing(); missing(); missing(); }\n")
+            .file("policy.rqlp", r#"(policy :schema-version 1 :id "test.refusal-unit" :name "Refusal unit"
+                :message "No reads" :severity warning
+                :analysis (analysis :type assertion
+                    :subject (rql :schema-version 1 (language rust (function :capture "at")))
+                    :asserts [(assert :id no-reads :at "at" :role value_reference :expect none)]))"#)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let catalogs = Arc::new(crate::catalog::TaintCatalogRegistry::new_without_workspace(
+            crate::catalog::CatalogRegistryLimits::default(),
+        ));
+        let mut registry = crate::registry::PolicyRegistry::new_for_workspace(
+            project.root().to_path_buf(),
+            catalogs,
+            crate::registry::PolicyRegistryLimits::default(),
+        )
+        .unwrap();
+        let policy = registry.load_policy_path("policy.rqlp").unwrap();
+        let store = std::sync::Mutex::new(crate::units::InMemoryPolicyUnitStore::new());
+        let store: &std::sync::Mutex<dyn crate::units::PolicyUnitStore> = &store;
+        let changed =
+            brokk_bifrost_analysis::analyzer::ChangedFacts::between(&workspace, &workspace);
+        let snapshot = crate::units::workspace_snapshot(&workspace).unwrap();
+        let incremental = PolicyIncrementalContext::new(
+            store,
+            &workspace,
+            &changed,
+            crate::units::WorkspaceUnitInputs::of(&workspace, None, None),
+            crate::units::IncrementalBaseState::Evaluated,
+            crate::units::UnitSnapshots::of(snapshot),
+        );
+        let budget = PolicyBudget::default();
+        let flow = brokk_bifrost_flow::FlowWorkspaceState::default();
+        let units = SelectorUnits::new(policy, &incremental, &budget, &workspace, &flow);
+        let cancellation = CancellationToken::default();
+        let selector = resolved_selector(
+            r#"(language rust (call-bindings (call-shape (call :callee (name "missing")))))"#,
+            "/analysis/refusal/selector",
+        );
+        let (_, query) = selector.as_query().unwrap();
+        let mut session = PolicySelectorSession::new(
+            &workspace,
+            &flow,
+            "test",
+            budget.query_limits(),
+            16,
+            &cancellation,
+            CodeQueryExecutionScope::whole_workspace().with_refusal_subject_limit(Some(2)),
+        );
+        let run = session
+            .execute_selector_unit(&units, &selector, query, &project.file("subject.rs"))
+            .unwrap();
+        let SelectorUnitRun::Incomplete(rows) = run else {
+            panic!("refused selector must return before constructing a publishable product");
+        };
+        let sites = rows
+            .diagnostics
+            .iter()
+            .filter(|d| crate::evaluator::is_call_binding_refusal(d))
+            .flat_map(crate::evaluator::refusal_subjects)
+            .collect::<Vec<_>>();
+        assert_eq!(sites.len(), 6);
+        assert!(units.keys.is_empty());
+    }
+
+    #[test]
     fn zero_argument_call_binding_retains_the_call_site() {
         let project = InlineTestProject::with_language(Language::Go)
             .file(
@@ -7095,18 +8654,96 @@ mod tests {
         assert_eq!(value.argument_id, None);
         assert_eq!(value.actual_index, None);
         assert_eq!(value.formal_index, None);
-        assert!(usable_taint_row(&item, evidence, None));
+        assert!(usable_taint_row(&item, evidence, None, None));
 
         if let CodeQueryResultValue::CallBinding { value } = &mut item.value {
             value.mapping = "incomplete";
         }
-        assert!(!usable_taint_row(&item, evidence, None));
+        assert!(!usable_taint_row(&item, evidence, None, None));
         if let CodeQueryResultValue::CallBinding { value } = &mut item.value {
             value.mapping = "exact";
             value.formal_layout_id = None;
             value.selector_proof = None;
         }
-        assert!(!usable_taint_row(&item, evidence, None));
+        assert!(!usable_taint_row(&item, evidence, None, None));
+    }
+
+    #[test]
+    fn named_gap_file_requires_its_own_semantic_binding_proof() {
+        let project = InlineTestProject::with_language(Language::Java)
+            .file(
+                "App.java",
+                "class App { void zero() {} void run() { new App().zero(); } }\n",
+            )
+            .file(
+                "Other.java",
+                "class Other { void zero() {} void run() { new Other().zero(); } }\n",
+            )
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig {
+            parallelism: Some(1),
+            ..AnalyzerConfig::default()
+        });
+        let selector = resolved_selector(
+            "(language java (call-bindings (call-shape (call :callee (name \"zero\")))))",
+            "/analysis/sources/entries/s/selector",
+        );
+        let cancellation = CancellationToken::default();
+        let mut session = PolicySelectorSession::new(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::default(),
+            "taint",
+            PolicyBudget::default().query_limits(),
+            16,
+            &cancellation,
+            CodeQueryExecutionScope::whole_workspace(),
+        );
+        let (_, query) = selector.as_query().expect("query selector");
+        let (detailed, _) = session
+            .execute_selector_query_core(query, CodeQueryExecutionScope::whole_workspace())
+            .expect("call-binding query");
+        let app = project.file("App.java");
+        let gap_path = rel_path_string(&app);
+        let scope = TaintRowRetentionScope {
+            gap_files: Some(HashSet::from([gap_path.as_str()])),
+        };
+        let mut compared = 0;
+        for evidence in &detailed.evidence {
+            let mut item = detailed.result.results[evidence.result_index].clone();
+            let CodeQueryResultValue::CallBinding { value } = &mut item.value else {
+                continue;
+            };
+            if value.binding_kind != Some("receiver") {
+                continue;
+            }
+            value.target = None;
+            value.declared_target_id = None;
+            value.target_origin = Some("model");
+            value.coverage = "exhaustive";
+            value.mapping = "exact";
+            value.formal_layout_id = None;
+            value.selector_proof = None;
+            assert!(!usable_taint_row(&item, evidence, None, None));
+            let expected = (evidence.file != app).then_some(TaintRowRetention::IndividuallyUsable);
+            assert_eq!(
+                retained_taint_row(&item, evidence, None, &scope, None),
+                expected
+            );
+            let CodeQueryResultValue::CallBinding { value } = &mut item.value else {
+                unreachable!();
+            };
+            value.formal_layout_id = Some("layout".into());
+            value.selector_proof = Some("authored_summary");
+            value.semantic_target_id = Some("target".into());
+            value.model_callable_id = Some("callable".into());
+            assert!(usable_taint_row(&item, evidence, None, None));
+            assert_eq!(
+                retained_taint_row(&item, evidence, None, &scope, None),
+                Some(TaintRowRetention::IndividuallyUsable)
+            );
+            compared += 1;
+        }
+        assert_eq!(compared, 2, "both files must supply a real receiver row");
     }
 
     fn cfg_entry_selector(name: &str, path: &str) -> ResolvedPolicySelector {

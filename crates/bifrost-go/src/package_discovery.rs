@@ -44,6 +44,15 @@ pub fn host_build_configuration(config: &GoDependencyDiscoveryConfig) -> GoBuild
     selected_build_configuration(config, goos, goarch)
 }
 
+/// One `go env -json` capture, taken in the hardened context discovery runs
+/// `go list` in (the process environment is cleared, GOENV=off, GOFLAGS, GOPROXY
+/// and the rest are pinned). Discovery and the build profile read this one
+/// capture, so the profile covers what `go list` sees: the Go binary's own
+/// defaults, the home-derived locations and every pinned value (#11607).
+///
+/// The named fields are the ones discovery itself uses. `settings` holds every
+/// other key the Go command reported, so a key a newer Go adds is covered
+/// without a list of names to keep in sync.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub struct GoEnvironment {
@@ -54,7 +63,24 @@ pub struct GoEnvironment {
     pub gowork: String,
     pub goos: String,
     pub goarch: String,
+    #[serde(flatten)]
+    pub settings: BTreeMap<String, String>,
 }
+
+/// The `go env` keys whose values differ between two captures of the same
+/// configuration, or between checkouts of the same tree, without changing what
+/// `go list` reports. The build profile does not fold them; it folds every other
+/// key (#11607).
+///
+/// - `GOGCCFLAGS` embeds the name of a temporary build directory that the Go
+///   command creates for each invocation.
+/// - `GOMOD` is the absolute path of the `go.mod` that governs the invocation's
+///   directory, so it names the checkout. The domain's workspace-relative
+///   directory and `go.work` path are in the profile separately.
+///
+/// `GOWORK` is the third checkout-dependent key. It is a named field of
+/// [`GoEnvironment`], and the profile does not fold it for the same reason.
+pub const PER_INVOCATION_GO_ENV_KEYS: &[&str] = &["GOGCCFLAGS", "GOMOD"];
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -148,6 +174,19 @@ pub struct GoDiscoveryDomain {
     pub modules: Vec<(String, String)>,
 }
 
+/// Whether the go command ignores modules and packages under this
+/// workspace-relative directory: `vendor` and `testdata` trees, and
+/// directories whose names begin with `_` or `.`.
+pub fn go_tool_ignores_directory(directory: &std::path::Path) -> bool {
+    directory.components().any(|component| match component {
+        std::path::Component::Normal(name) => {
+            let name = name.to_string_lossy();
+            name == "vendor" || name == "testdata" || name.starts_with('_') || name.starts_with('.')
+        }
+        _ => false,
+    })
+}
+
 /// Derive invocation domains from exact selected configuration snapshots.
 pub fn go_discovery_domains(
     root: &std::path::Path,
@@ -157,21 +196,12 @@ pub fn go_discovery_domains(
     use brokk_bifrost_core::path_normalization::NormalizePath;
     use brokk_bifrost_core::path_utils::workspace_relative_slash_path;
     use std::collections::BTreeMap;
-    use std::path::{Component, Path};
+    use std::path::Path;
     let mut modules = Vec::new();
     let mut workfiles = BTreeMap::new();
     for (path, source) in inputs {
         let directory = path.parent().expect("configuration has a parent");
-        if directory.components().any(|component| match component {
-            Component::Normal(name) => {
-                let name = name.to_string_lossy();
-                name == "vendor"
-                    || name == "testdata"
-                    || name.starts_with('_')
-                    || name.starts_with('.')
-            }
-            _ => false,
-        }) {
+        if go_tool_ignores_directory(directory) {
             continue;
         }
         if path.file_name().is_some_and(|name| name == "go.mod") {
@@ -229,4 +259,53 @@ pub fn go_discovery_domains(
         domain.modules.sort();
     }
     Ok(domains.into_values().collect())
+}
+
+/// The targets of the local `replace` directives in the `go.mod` of a domain
+/// without a `go.work`, in directory form (#11607).
+///
+/// Without a workspace, Go applies `replace` only from the main module's
+/// `go.mod`, and module graph loading reads the `go.mod` of each replacement
+/// target even when no package is imported from it; the requirements in that
+/// file can change which version of another module is selected. A domain with a
+/// `go.work` is not covered: it is not export-verifiable (see
+/// `selected_domain_evidence` in bifrost-go-analysis).
+///
+/// Paths are joined to `root` and lexically normalized, so they are absolute
+/// when `root` is. They include targets inside the checkout; the caller decides
+/// which of them its tree already pins. `inputs` are the selected configuration
+/// snapshots (workspace-relative path and source) that `go_discovery_domains`
+/// takes. `Err` names a `go.mod` that is not among them or cannot be parsed.
+pub fn go_module_local_replacement_directories(
+    root: &std::path::Path,
+    directory: &str,
+    inputs: &[(PathBuf, String)],
+) -> Result<Vec<PathBuf>, String> {
+    use crate::build_files::{BuildFileLimits, GoDirective, parse_go_mod};
+    use brokk_bifrost_core::path_normalization::NormalizePath;
+    let relative = std::path::Path::new(directory).join("go.mod");
+    let (_, source) = inputs
+        .iter()
+        .find(|(path, _)| *path == relative)
+        .ok_or_else(|| format!("{relative:?} is not a selected configuration file"))?;
+    let document = parse_go_mod(source, &BuildFileLimits::default(), || false);
+    if !document.issues.is_empty() {
+        return Err(format!(
+            "invalid Go build file {relative:?}: {:?}",
+            document.issues
+        ));
+    }
+    let base = root.join(directory);
+    Ok(document
+        .entries
+        .iter()
+        .filter_map(|entry| match &entry.directive {
+            GoDirective::Replace {
+                source,
+                local: true,
+                ..
+            } => Some(base.join(&source.value).normalize()),
+            _ => None,
+        })
+        .collect())
 }

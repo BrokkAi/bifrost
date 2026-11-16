@@ -1471,10 +1471,7 @@ impl PolicyRegistry {
         }
         for event in &spec.automaton.events {
             if let TypestateEventTrigger::Calls { selector, .. } = &event.trigger {
-                let path = selector_path(format!(
-                    "/analysis/automaton/events/{}/selector",
-                    json_pointer_segment(event.id.as_str())
-                ))?;
+                let path = selector_path(typestate_event_selector_path(&event.id))?;
                 let selector =
                     self.resolve_selector(parsed, path, selector, retained_bytes, locators)?;
                 insert_selector(fixed_selectors, selector)?;
@@ -2123,7 +2120,7 @@ fn seed_to_endpoint_binding(binding: &TypestateSeedBinding) -> PolicyEndpointBin
     match binding {
         TypestateSeedBinding::MatchedValue => PolicyEndpointBinding::MatchedValue,
         TypestateSeedBinding::Receiver => PolicyEndpointBinding::Receiver,
-        TypestateSeedBinding::ReturnValue => PolicyEndpointBinding::ReturnValue,
+        TypestateSeedBinding::ReturnValue => PolicyEndpointBinding::ReturnValue { path: None },
         TypestateSeedBinding::ResultIndex { index } => {
             PolicyEndpointBinding::ResultIndex { index: *index }
         }

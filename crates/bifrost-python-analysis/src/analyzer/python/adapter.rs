@@ -449,7 +449,8 @@ mod published_module_read_tests {
     #[brokk_bifrost_test_macros::hardwon(
         "#7347: Python hydration hooks nested a read on the single connection store"
     )]
-    fn python_store_hydration_reuses_single_connection() {
+    fn python_store_hydration_on_pooled_store() {
+        // This regression now runs on the pooled store.
         use super::super::PythonAnalyzer;
         use crate::inline_project::InlineTestProject;
         use brokk_bifrost_analysis::analyzer::WorkspaceAnalyzer;
@@ -473,7 +474,7 @@ mod published_module_read_tests {
             .build();
         let context = store_context_from_store(
             project.project_dyn().as_ref(),
-            AnalyzerStore::open_in_memory_single_connection().unwrap(),
+            AnalyzerStore::open_ephemeral().unwrap(),
             false,
         );
         let store = context.store.clone();
@@ -500,7 +501,6 @@ mod published_module_read_tests {
             false,
         );
         let disk_store = disk_context.store.clone();
-        assert!(!disk_store.uses_single_connection_reads());
         let disk_workspace = WorkspaceAnalyzer::build_with_store_context_for_test(
             project.project_dyn(),
             Default::default(),
@@ -777,8 +777,23 @@ mod published_module_read_tests {
             .finish();
         tracing::subscriber::with_default(subscriber, || {
             let valid = adapter(Some("pkg.tool"));
+            for project in [valid.project(), corrupt.project(), failed.project()] {
+                assert_eq!(
+                    brokk_bifrost_python::imports::resolve_python_module_specifier(
+                        project,
+                        &file,
+                        "external.provider"
+                    ),
+                    Some("external.provider".to_owned())
+                );
+                assert_eq!(
+                    probes.load(std::sync::atomic::Ordering::Relaxed),
+                    0,
+                    "absolute imports must not probe the importing package"
+                );
+            }
             assert_eq!(
-                brokk_bifrost_python::imports::resolve_python_relative_module(
+                brokk_bifrost_python::imports::resolve_python_module_specifier(
                     valid.project(),
                     &file,
                     ".sibling"
@@ -793,7 +808,7 @@ mod published_module_read_tests {
             for project in [corrupt.project(), failed.project()] {
                 probes.store(0, std::sync::atomic::Ordering::Relaxed);
                 assert_eq!(
-                    brokk_bifrost_python::imports::resolve_python_relative_module(
+                    brokk_bifrost_python::imports::resolve_python_module_specifier(
                         project, &file, ".sibling"
                     ),
                     Some("pkg.sibling".to_owned())

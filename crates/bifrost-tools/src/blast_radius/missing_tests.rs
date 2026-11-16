@@ -134,6 +134,8 @@ pub enum MissingTestsIncompleteReason {
     UsageTargetAmbiguous,
     UsageAnalysisFailure,
     UsageAnalysisIncomplete,
+    /// Test status unknown: the files that decide it are outside the scoped diff image.
+    TestStatusUnknownOutsideScopedDiffImage,
     UnprovenReferences,
     UsageSiteWithoutEnclosingDeclaration,
     UnresolvedChangedTarget,
@@ -317,7 +319,14 @@ fn prepare_missing_tests_at_root(
                         | CallableChangeTag::SignatureChanged
                 )
             });
-            (actionable && !after.in_test_context).then_some(CandidateState {
+            let incomplete_reasons = match after.in_test_context {
+                Some(true) => return None,
+                Some(false) => BTreeSet::new(),
+                None => BTreeSet::from([
+                    MissingTestsIncompleteReason::TestStatusUnknownOutsideScopedDiffImage,
+                ]),
+            };
+            actionable.then_some(CandidateState {
                 record: MissingTestFunction {
                     before: change.before,
                     after,
@@ -325,7 +334,7 @@ fn prepare_missing_tests_at_root(
                     incomplete_reasons: Vec::new(),
                 },
                 reached: false,
-                incomplete_reasons: BTreeSet::new(),
+                incomplete_reasons,
             })
         })
         .collect::<Vec<_>>();
@@ -441,12 +450,12 @@ fn finish_missing_tests(
     let candidate_function_count = candidates.len();
     let reached_function_count = candidates
         .iter()
-        .filter(|candidate| candidate.reached)
+        .filter(|candidate| candidate.reached && candidate.record.after.in_test_context.is_some())
         .count();
     let mut missing_functions = Vec::new();
     let mut indeterminate_functions = Vec::new();
     for mut candidate in candidates {
-        if candidate.reached {
+        if candidate.reached && candidate.record.after.in_test_context.is_some() {
             continue;
         }
         candidate.record.incomplete_reasons = candidate.incomplete_reasons.into_iter().collect();
@@ -658,7 +667,16 @@ fn exact_node_outcome(analyzer: &dyn IAnalyzer, entry: ScanUsagesEntry) -> Exact
             continue;
         };
         for hit in &group.hits {
-            if test_file_context(analyzer, &file) {
+            if match test_file_context(analyzer, &file) {
+                Ok(value) => value,
+                Err(reason) => {
+                    analyzer.record_query_incomplete(reason);
+                    outcome
+                        .incomplete_reasons
+                        .insert(MissingTestsIncompleteReason::UsageAnalysisIncomplete);
+                    continue;
+                }
+            } {
                 outcome.reaches_test_context = true;
                 continue;
             }
@@ -671,7 +689,16 @@ fn exact_node_outcome(analyzer: &dyn IAnalyzer, entry: ScanUsagesEntry) -> Exact
                     .insert(MissingTestsIncompleteReason::UsageSiteWithoutEnclosingDeclaration);
                 continue;
             };
-            if analyzer.in_test_region(&caller) {
+            if match analyzer.in_test_region(&caller) {
+                Ok(value) => value,
+                Err(reason) => {
+                    analyzer.record_query_incomplete(reason);
+                    outcome
+                        .incomplete_reasons
+                        .insert(MissingTestsIncompleteReason::UsageAnalysisIncomplete);
+                    continue;
+                }
+            } {
                 outcome.reaches_test_context = true;
             } else if caller.is_function() || caller.is_class() {
                 outcome.callers.insert(caller.declaration_id(), caller);
@@ -685,10 +712,16 @@ fn exact_node_outcome(analyzer: &dyn IAnalyzer, entry: ScanUsagesEntry) -> Exact
     outcome
 }
 
-fn test_file_context(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> bool {
+pub(crate) fn test_file_context(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+) -> Result<bool, brokk_bifrost_analysis::analyzer::QueryReadIncomplete> {
     let path = normalized_path(file.rel_path());
-    test_paths::is_test_like_path(&path, language_for_file(file))
-        || analyzer.file_is_test_only(file)
+    if test_paths::is_test_like_path(&path, language_for_file(file)) {
+        Ok(true)
+    } else {
+        analyzer.file_is_test_only(file)
+    }
 }
 
 fn map_scan_incomplete_reason(reason: ScanUsagesIncompleteReason) -> MissingTestsIncompleteReason {
@@ -797,6 +830,12 @@ fn render_function_section(
         } else {
             function.after.path.clone()
         };
+        if function.after.in_test_context.is_none() {
+            lines.push(
+                "- Test status unknown: the files that decide it are outside the scoped diff image"
+                    .into(),
+            );
+        }
         lines.push(format!(
             "- `{}` at `{}` ({:?}){}",
             function.after.fqn,
@@ -1008,6 +1047,14 @@ mod tests {
             root,
             "src/changed.rs",
             "pub fn covered() -> i32 {\n    2\n}\n\npub fn uncovered() -> i32 {\n    2\n}\n",
+        );
+        // Scoped endpoint images hold only changed files; without a target root,
+        // module ancestry is unavailable (#11385). Touch the parent to retain
+        // production evidence and exercise the original reference behavior.
+        write(
+            root,
+            "src/lib.rs",
+            "pub mod changed;\npub mod tests;\n// endpoint context\n",
         );
         let target = commit_all(&repo, "target");
 

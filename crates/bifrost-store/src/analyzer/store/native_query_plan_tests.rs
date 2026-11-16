@@ -226,6 +226,18 @@ pub mod shared_support {
             syn::visit::visit_expr_method_call(self, call);
         }
     }
+    /// Create the TEMP views that production generates in code instead of
+    /// declaring them as literal `CREATE TEMP` statements, so a planner of the
+    /// registered statements can prepare every one. The Go and Python
+    /// unit-summary statements read the generated surface views (#11183).
+    #[doc(hidden)]
+    pub fn install_generated_views(
+        conn: &rusqlite::Connection,
+    ) -> crate::analyzer::store::Result<()> {
+        use crate::analyzer::store::{go_unit_summaries, surface_relations};
+        surface_relations::create_surface_views(conn, surface_relations::PYTHON_RELATIONS)?;
+        go_unit_summaries::install_go_summary_surface_views(conn)
+    }
     #[doc(hidden)]
     pub fn registry() -> Registry {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/analyzer/store");
@@ -236,7 +248,15 @@ pub mod shared_support {
             .collect();
         files.push(root.join("source_facts.rs"));
         files.extend(
-            ["unit_summaries.rs", "unit_schedule.rs", "rust_crates.rs"].map(|name| root.join(name)),
+            [
+                "unit_summaries.rs",
+                "unit_schedule.rs",
+                "rust_crates.rs",
+                "rust_feature_projections.rs",
+                "rust_unit_summaries/export_walk.rs",
+                "rust_unit_summaries/output_supplement.rs",
+            ]
+            .map(|name| root.join(name)),
         );
         files.extend(
             std::fs::read_dir(&root)
@@ -289,7 +309,7 @@ pub mod shared_support {
         use super::super::{
             go_reverse_rows, imports, rust_crate_context, rust_crate_rows, rust_reverse_rows,
         };
-        use crate::analyzer::store::{go_unit_summaries, rust_unit_summaries, selected_definition};
+        use crate::analyzer::store::{go_unit_summaries, selected_definition};
         for (name, sql) in [
             (
                 "MISSING_PUBLISHED_COMPLETE_ANALYSIS_SQL",
@@ -331,7 +351,7 @@ pub mod shared_support {
             ("imports::ENUMERATE", imports::ENUMERATE),
             (
                 "python_unit_summaries::LIVE",
-                crate::analyzer::store::python_unit_summaries::LIVE,
+                crate::analyzer::store::python_unit_summaries::LIVE.as_str(),
             ),
             (
                 "python_binding_rows::IMPORT_MODULE_OPERAND_SQL",
@@ -360,6 +380,26 @@ pub mod shared_support {
                 crate::analyzer::store::unit_summaries::LIVE_SUMMARY_SQL,
             ),
             (
+                "unit_summaries::FIND_SUMMARY_SQL",
+                crate::analyzer::store::unit_summaries::FIND_SUMMARY_SQL,
+            ),
+            (
+                "unit_summaries::CONSUMED_UNITS_CURRENT_SQL",
+                crate::analyzer::store::unit_summaries::CONSUMED_UNITS_CURRENT_SQL,
+            ),
+            (
+                "unit_summaries::SETTLED_KEY_SQL",
+                crate::analyzer::store::unit_summaries::SETTLED_KEY_SQL,
+            ),
+            (
+                "unit_summaries::OPEN_CANDIDATE_SQL",
+                crate::analyzer::store::unit_summaries::OPEN_CANDIDATE_SQL,
+            ),
+            (
+                "unit_summaries::OTHER_CANDIDATES_SQL",
+                crate::analyzer::store::unit_summaries::OTHER_CANDIDATES_SQL,
+            ),
+            (
                 "rust_crate_rows::IMPL_ITEM_TRAITS",
                 rust_crate_rows::IMPL_ITEM_TRAITS,
             ),
@@ -377,15 +417,19 @@ pub mod shared_support {
             ),
             (
                 "go_unit_summaries::GO_LIVE_SUMMARY_SQL",
-                go_unit_summaries::GO_LIVE_SUMMARY_SQL,
+                go_unit_summaries::GO_LIVE_SUMMARY_SQL.as_str(),
+            ),
+            (
+                "go_unit_summaries::UNIT_ALIAS_EXPORTS_SQL",
+                go_unit_summaries::UNIT_ALIAS_EXPORTS_SQL,
+            ),
+            (
+                "go_unit_summaries::UNIT_IMPORTS_SQL",
+                go_unit_summaries::UNIT_IMPORTS_SQL,
             ),
             (
                 "file_context::PeerSelection::RELATION",
                 crate::analyzer::store::resolution_operation::go_same_package::PACKAGE_PEER_MOUNTS,
-            ),
-            (
-                "rust_unit_summaries::DEPENDENCY_REEXPORT_WITNESS_SQL",
-                rust_unit_summaries::DEPENDENCY_REEXPORT_WITNESS_SQL,
             ),
             (
                 "rust_copy_absence::RUST_COPY_ABSENCE_SQL",
@@ -426,6 +470,14 @@ pub mod shared_support {
             (
                 "rust_reverse_rows::DEFINITION_SITE_SQL",
                 rust_reverse_rows::DEFINITION_SITE_SQL,
+            ),
+            (
+                "go_package_context::SOURCE_INVENTORY_SQL",
+                crate::analyzer::store::go_package_context::SOURCE_INVENTORY_SQL,
+            ),
+            (
+                "go_package_context::SOURCE_INVENTORY_FILE_SQL",
+                crate::analyzer::store::go_package_context::SOURCE_INVENTORY_FILE_SQL,
             ),
             (
                 "go_package_context::OUTSIDE_SELECTED_BUILD_FILES_SQL",

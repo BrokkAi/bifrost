@@ -562,10 +562,9 @@ fn add_cross_language_jvm_candidates(
             if is_cancelled(cancellation) {
                 return;
             }
-            if file.is_binary().unwrap_or(true) {
-                continue;
-            }
-            let Ok(source) = file.read_to_string() else {
+            let Some(source) = analyzer.indexed_source(&file) else {
+                // Keep unavailable inputs for admission to report incompleteness.
+                candidates.insert(file);
                 continue;
             };
             if source.contains(target_name) || source.contains(&target_fq_name) {
@@ -640,10 +639,11 @@ fn find_text_candidates(
             if is_cancelled(cancellation) {
                 return;
             }
-            if file.is_binary().unwrap_or(true) {
-                return;
-            }
-            let Ok(content) = file.read_to_string() else {
+            let Some(content) = analyzer.indexed_source(file) else {
+                matches
+                    .lock()
+                    .expect("candidate match set poisoned")
+                    .insert(file.clone());
                 return;
             };
             if is_cancelled(cancellation) {

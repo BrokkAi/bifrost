@@ -187,6 +187,29 @@ impl ValueFlowCarrier {
         }
     }
 
+    /// Census this carrier's owned provenance beneath its enclosing value.
+    #[doc(hidden)]
+    pub fn retained_heap(&self, heap: &mut crate::analyzer::store::cache_budget::RetainedHeap) {
+        let mut census = crate::analyzer::semantic::service::RetainedArtifactWalker::new(heap);
+        self.retained_artifacts(&mut census);
+        census.finish();
+    }
+
+    pub(crate) fn retained_artifacts(
+        &self,
+        census: &mut impl crate::analyzer::semantic::service::ArtifactRetentionVisitor,
+    ) {
+        match self {
+            Self::Value(value) => census.procedure(value.procedure()),
+            Self::Port(port) => census.procedure(port.procedure()),
+            Self::Location(location) => {
+                if census.owned_box(location.as_ref()) {
+                    location.visit_retained_allocations(census);
+                }
+            }
+        }
+    }
+
     pub fn stable_key(&self) -> Result<ValueFlowCarrierKey, ValueFlowModelError> {
         match self {
             Self::Value(value) => {
@@ -631,6 +654,99 @@ impl ValueFlowCarrierKey {
     }
 
     /// Conservative retained size, including boxed nested access paths.
+    pub(crate) fn retained_allocations(
+        &self,
+        census: &mut impl crate::analyzer::semantic::service::ArtifactRetentionVisitor,
+    ) {
+        use crate::analyzer::semantic::service::RetentionScratch;
+        let mut pending = RetentionScratch::default();
+        pending.push(self, census);
+        while !census.is_refused() {
+            let Some(key) = pending.pop() else {
+                break;
+            };
+            match key {
+                Self::Value { locator, role, .. } => {
+                    census.locator(locator);
+                    census.owned_slice(role.as_bytes());
+                }
+                Self::Port { procedure, .. } => census.locator(procedure),
+                Self::Allocation { locator } | Self::ScopedRoot { locator, .. } => {
+                    census.locator(locator)
+                }
+                Self::RuntimeObject {
+                    runtime_profile_digest,
+                    realm,
+                    exposure_id,
+                    container_member,
+                    state_boundary,
+                    active_model_set_hash,
+                    manifest_digest,
+                    shard_id,
+                    behavior_id,
+                    activation_source,
+                    ..
+                } => {
+                    for text in [
+                        runtime_profile_digest,
+                        realm,
+                        exposure_id,
+                        container_member,
+                        state_boundary,
+                        active_model_set_hash,
+                        manifest_digest,
+                        shard_id,
+                        behavior_id,
+                        activation_source,
+                    ] {
+                        census.owned_string(text);
+                    }
+                }
+                Self::LexicalCell { locator, binding } => {
+                    census.locator(locator);
+                    census.locator(&binding.locator);
+                    census.owned_slice(binding.role.as_bytes());
+                }
+                Self::CallResult {
+                    call,
+                    result,
+                    callee,
+                } => {
+                    census.locator(call);
+                    census.locator(callee);
+                    if census.owned_box(result.as_ref()) {
+                        pending.push(result.as_ref(), census);
+                    }
+                }
+                Self::Location {
+                    root, selectors, ..
+                } => {
+                    if census.owned_box(root.as_ref()) {
+                        pending.push(root.as_ref(), census);
+                    }
+                    if census.owned_slice(selectors.as_ref()) {
+                        for selector in selectors {
+                            match selector {
+                                ValueFlowSelectorKey::Field(locator) => census.locator(locator),
+                                ValueFlowSelectorKey::Property(property) => {
+                                    census.owned_string(property);
+                                }
+                                ValueFlowSelectorKey::ExactIndex(key) => {
+                                    if census.owned_box(key.as_ref()) {
+                                        pending.push(key.as_ref(), census);
+                                    }
+                                }
+                                ValueFlowSelectorKey::ConstantIndex(_)
+                                | ValueFlowSelectorKey::AnyIndex => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        pending.release(census);
+    }
+
     pub fn retained_bytes(&self) -> usize {
         let mut total = std::mem::size_of::<Self>();
         let mut stack = vec![self];
@@ -964,6 +1080,15 @@ impl ValueFlowEventKey {
         });
     }
 
+    /// Owned event identity payload; inline storage belongs to the caller.
+    #[doc(hidden)]
+    pub fn retained_heap(&self, heap: &mut crate::analyzer::store::cache_budget::RetainedHeap) {
+        use crate::analyzer::semantic::service::ArtifactRetentionVisitor;
+        let mut census = crate::analyzer::semantic::service::RetainedArtifactWalker::new(heap);
+        census.locator(&self.site);
+        census.finish();
+    }
+
     pub fn retained_bytes(&self) -> usize {
         std::mem::size_of::<Self>().saturating_add(semantic_locator_heap_bytes(&self.site))
     }
@@ -977,6 +1102,7 @@ pub enum ValueFlowObservationPhase {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ValueFlowSourceSpec {
+    selected_entry: Option<std::sync::Arc<super::SelectedSourceEntryView>>,
     key: ValueFlowEventKey,
     point: ProgramPointHandle,
     phase: ValueFlowObservationPhase,
@@ -1025,7 +1151,25 @@ impl ValueFlowSourceSpec {
             completeness,
             dispatch_obligations: Box::new([]),
             conditional_triggers: None,
+            selected_entry: None,
         }
+    }
+
+    /// Retain the exact discovery-owned entry for a selected source root.
+    pub fn with_selected_entry(
+        mut self,
+        entry: std::sync::Arc<super::SelectedSourceEntryView>,
+    ) -> Self {
+        assert!(
+            entry.matches_source(&self.point, self.phase, &self.carrier),
+            "a selected entry belongs to this exact source observation"
+        );
+        self.selected_entry = Some(entry);
+        self
+    }
+
+    pub fn selected_entry(&self) -> Option<&std::sync::Arc<super::SelectedSourceEntryView>> {
+        self.selected_entry.as_ref()
     }
 
     /// Make this source conditional on one of the supplied source events

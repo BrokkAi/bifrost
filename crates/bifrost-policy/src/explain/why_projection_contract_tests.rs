@@ -80,7 +80,7 @@ fn proof_preserves_multiple_reason_labels_with_separators() {
                 scope: None,
                 projections: vec![projected],
                 completion: PolicyRunCompletion::Complete,
-                diagnostics: Vec::new(),
+                diagnostics: Vec::new().into(),
                 diagnostics_truncated: false,
                 work: crate::finding::PolicyWorkReport::default(),
                 authored_arm_closures: Vec::new(),

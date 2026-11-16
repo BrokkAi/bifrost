@@ -995,7 +995,7 @@ pub mod go_extraction_tests {
                 source, &facts, call,
             );
             (
-                call_shape_for_call(&facts, &file, call_id).expect("exact call shape"),
+                call_shape_for_call(&facts, &file, call_id, None).expect("exact call shape"),
                 Arc::from(source),
             )
         }
@@ -2675,21 +2675,29 @@ import "os"
 
 func caller() { _, _ = os.Open("book.xlsx") }
 "#;
-            let incomplete = AnalyzerFixture::new_for_language(
-                Language::Go,
-                &[
-                    ("go.mod", "module example.com/app\n"),
-                    ("main.go", incomplete_source),
-                ],
-            );
+            // Source inventory has no selected tool authority to prove package
+            // absence. A same-content buffer does not create that authority.
+            let incomplete = crate::inline_project::InlineTestProject::with_language(Language::Go)
+                .file("go.mod", "module example.com/app\n")
+                .file("main.go", incomplete_source)
+                .build();
+            let mut config = brokk_bifrost_core::analyzer::config::AnalyzerConfig::default();
+            config.go.dependency_discovery.mode =
+                brokk_bifrost_core::analyzer::config::GoDependencyDiscoveryMode::Disabled;
+            let incomplete_workspace = incomplete.workspace_analyzer(config);
             let go = brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<
                 brokk_bifrost_go_analysis::GoAnalyzer,
-            >(incomplete.analyzer.analyzer())
+            >(incomplete_workspace.analyzer())
             .expect("fixture Go analyzer");
+            assert_eq!(
+                go.context_profile_for_test(),
+                Some(brokk_bifrost_analysis::analyzer::store::go_package_context::source_inventory_profile()),
+                "the absence refusal requires an inventory-only fixture"
+            );
             let overlay = Arc::new(brokk_bifrost_core::analyzer::project::OverlayProject::new(
-                Arc::new(incomplete.test_project().clone()),
+                incomplete.project_dyn(),
             ));
-            let incomplete_file = ProjectFile::new(incomplete.project_root(), "main.go");
+            let incomplete_file = incomplete.file("main.go");
             assert!(overlay.set(
                 incomplete_file.abs_path().to_path_buf(),
                 incomplete_source.to_owned(),
@@ -2850,6 +2858,11 @@ func caller() { _, _ = os.Open("book.xlsx") }
                 },
                 ..AnalyzerConfig::default()
             }
+        }
+        fn go_source_inventory_config() -> AnalyzerConfig {
+            let mut config = go_full_production_config();
+            config.go.dependency_discovery.mode = GoDependencyDiscoveryMode::Disabled;
+            config
         }
         /// Publish the Go dependency context of `workspace` through the production path,
         /// which reconciles the unit summaries after the head publication.
@@ -3215,7 +3228,7 @@ func caller() { _, _ = os.Open("book.xlsx") }
                 {
                     let mut statement = connection
                 .prepare(
-                    "SELECT blob_id, rel_path FROM main.resolution_unit_summary_members WHERE summary_id = ?1",
+                    "SELECT attachment.blob_id, member.rel_path FROM main.resolution_unit_summary_members member JOIN selected_unit_member_blobs attachment USING(summary_id,member_ordinal) WHERE member.summary_id = ?1",
                 )
                 .unwrap();
                     let mut rows = statement.query([summary_id]).unwrap();
@@ -3236,11 +3249,14 @@ func caller() { _, _ = os.Open("book.xlsx") }
                 {
                     let mut statement = connection
                 .prepare(
-                    "SELECT exports.declaration_blob_id, exports.declaration_site, exports.declaration_key,
+                    "SELECT attachment.blob_id, site.dense_id, declaration.dense_id,
                             exports.namespace, exports.identity_id, exports.visibility, identities.spelling,
                             exports.origin, exports.alias_dependency_ordinal, alias_identity.spelling,
                             dependencies.dependency_unit_key
                      FROM main.resolution_unit_summary_exports AS exports
+                     JOIN selected_unit_member_blobs attachment ON attachment.summary_id=exports.summary_id AND attachment.member_ordinal=exports.declaration_member_ordinal
+                     JOIN surface_dense site ON site.blob_id=attachment.blob_id AND site.id_space=0 AND site.surface_ordinal=exports.site_surface_ordinal
+                     JOIN surface_dense declaration ON declaration.blob_id=attachment.blob_id AND declaration.id_space=1 AND declaration.surface_ordinal=exports.declaration_surface_ordinal
                      JOIN main.resolution_identities AS identities ON identities.id = exports.identity_id
                      LEFT JOIN main.resolution_identities AS alias_identity
                        ON alias_identity.id = exports.alias_identity_id
@@ -3415,9 +3431,12 @@ func caller() { _, _ = os.Open("book.xlsx") }
                 {
                     let mut statement = connection
                 .prepare(
-                    "SELECT imports.blob_id, imports.import_id, imports.kind, imports.import_definition_key,
+                    "SELECT attachment.blob_id, dense.dense_id, imports.kind, site.dense_id,
                             imports.state, dependencies.dependency_unit_key
                      FROM main.resolution_unit_summary_imports AS imports
+                     JOIN selected_unit_member_blobs attachment ON attachment.summary_id=imports.summary_id AND attachment.member_ordinal=imports.member_ordinal
+                     JOIN surface_dense dense ON dense.blob_id=attachment.blob_id AND dense.id_space=5 AND dense.surface_ordinal=imports.import_surface_ordinal
+                     LEFT JOIN surface_dense site ON site.blob_id=attachment.blob_id AND site.id_space=1 AND site.surface_ordinal=imports.site_surface_ordinal
                      LEFT JOIN main.resolution_unit_summary_dependencies AS dependencies
                        ON dependencies.summary_id = imports.summary_id
                       AND dependencies.dependency_ordinal = imports.dependency_ordinal
@@ -3598,6 +3617,71 @@ func caller() { _, _ = os.Open("book.xlsx") }
             activate_go_context(&updated);
             updated
         }
+        fn assert_fresh_go_rows(
+            fixture: &BuiltInlineTestProject,
+            workspace: &WorkspaceAnalyzer,
+            fresh_config: AnalyzerConfig,
+            publish: impl FnOnce(&WorkspaceAnalyzer),
+        ) {
+            // The fresh build must select the profile the compared workspace
+            // has active: source inventory admits build-constrained files that
+            // the tool profile excludes.
+            use brokk_bifrost_analysis::analyzer::store::go_unit_summaries::GoUnitSummaries;
+            let go = resolve_analyzer::<GoAnalyzer>(workspace.analyzer()).unwrap();
+            let snapshot = go.selected_snapshot_for_test().unwrap();
+            let profile = go.context_profile_for_test().unwrap();
+            let store = workspace.store().unwrap();
+            let context = store
+                .selected_go_context(&snapshot, &profile)
+                .unwrap()
+                .unwrap();
+            let report = store
+                .reconcile_unit_summaries(
+                    &snapshot,
+                    GoUnitSummaries {
+                        context_id: context.context_id,
+                        profile,
+                    },
+                    &CancellationToken::new(),
+                )
+                .unwrap();
+            assert_eq!(report.derived, 0, "{report:?}");
+            assert!(report.failed.is_empty(), "{report:?}");
+            let mut project = InlineTestProject::with_language(Language::Go);
+            let mut pending = vec![fixture.root().to_path_buf()];
+            while let Some(dir) = pending.pop() {
+                for entry in std::fs::read_dir(dir).unwrap() {
+                    let entry = entry.unwrap();
+                    let path = entry.path();
+                    if entry.file_type().unwrap().is_dir() {
+                        pending.push(path);
+                    } else if matches!(
+                        path.extension().and_then(|s| s.to_str()),
+                        Some("go" | "mod")
+                    ) {
+                        project = project.file(
+                            path.strip_prefix(fixture.root()).unwrap().to_str().unwrap(),
+                            std::fs::read_to_string(&path).unwrap(),
+                        );
+                    }
+                }
+            }
+            let fresh_fixture = project.build();
+            let fresh = fresh_fixture.workspace_analyzer(fresh_config);
+            publish(&fresh);
+            let actual = open_units(workspace);
+            let expected = open_units(&fresh);
+            assert_eq!(
+                actual.keys().collect::<Vec<_>>(),
+                expected.keys().collect::<Vec<_>>()
+            );
+            for (label, unit) in actual {
+                assert_eq!(
+                    unit.output_digest, expected[&label].output_digest,
+                    "{label}"
+                );
+            }
+        }
         /// How many live summaries record `profile` as the context profile they derive
         /// from, in their read ledger.
         fn live_summaries_of_profile(workspace: &WorkspaceAnalyzer, profile: [u8; 32]) -> usize {
@@ -3776,13 +3860,13 @@ func caller() { _, _ = os.Open("book.xlsx") }
                 Some(go_unit_key("example.test/native/util", "", "go").as_slice())
             );
         }
-        /// Early cutoff, end to end. A body edit to a package with dependents derives
-        /// exactly that package again and leaves every dependent's version row alone,
+        /// Early cutoff, end to end. A body edit to a package with dependents reuses
+        /// that package and leaves every dependent's version row alone,
         /// because the package's output digest is unchanged. An edit that adds an
         /// exported name derives the package and its direct importers, and stops at the
         /// importers' own dependents because their output digests are unchanged.
         #[test]
-        fn a_body_edit_derives_one_unit_and_stops_at_the_output_digest() {
+        fn a_body_edit_reuses_the_unit_and_stops_at_the_surface_digest() {
             let Some((fixture, workspace)) = published_go_workspace(GO_FIXTURE) else {
                 return;
             };
@@ -3806,18 +3890,25 @@ func caller() { _, _ = os.Open("book.xlsx") }
             assert_ne!(body_edit, util_source);
             let after_body = edit_and_republish(&fixture, &workspace, "util/util.go", &body_edit);
             let body_units = open_units(&after_body);
+            assert_fresh_go_rows(
+                &fixture,
+                &after_body,
+                go_full_production_config(),
+                activate_go_context,
+            );
+            assert_summaries_match_incumbent_readers(&after_body);
             assert_eq!(
                 units_with_a_new_summary(&initial, &body_units),
-                ["util/util.go".to_owned()].into(),
-                "a body edit derives the one unit that lists the file"
+                Default::default(),
+                "a body edit reuses every summary"
             );
             assert_eq!(
                 initial["util/util.go"].output_digest, body_units["util/util.go"].output_digest,
                 "a body edit leaves the output digest"
             );
-            assert_ne!(
+            assert_eq!(
                 initial["util/util.go"].summary_digest, body_units["util/util.go"].summary_digest,
-                "the member oid is part of the input digest"
+                "the member surface, rather than its oid, keys the input"
             );
             for (label, unit) in &initial {
                 if label != "util/util.go" {
@@ -3968,7 +4059,7 @@ func caller() { _, _ = os.Open("book.xlsx") }
                     .unwrap();
                 let (blob_oid, lang): (String, String) = connection
             .query_row(
-                "SELECT blobs.blob_oid, blobs.lang FROM resolution_unit_summary_members AS members
+                "SELECT blobs.blob_oid, blobs.lang FROM temp.selected_unit_member_blobs AS members
                  JOIN blobs ON blobs.id = members.blob_id WHERE members.summary_id = ?1 LIMIT 1",
                 [summary_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
@@ -3988,7 +4079,7 @@ func caller() { _, _ = os.Open("book.xlsx") }
                  FROM main.resolution_qualified_routes AS route
                  JOIN temp.selected_resolution_mounts AS mount
                    ON mount.blob_id=route.blob_id AND mount.storage_language='go'
-                 JOIN main.resolution_unit_summary_members AS member
+                 JOIN temp.selected_unit_member_blobs AS member
                    ON member.blob_id=route.blob_id
                  JOIN main.resolution_unit_summary_versions AS versions
                    ON versions.summary_id=member.summary_id
@@ -4168,9 +4259,7 @@ func caller() { _, _ = os.Open("book.xlsx") }
                 Value::Blob(unit_key.clone()),
                 Value::Integer(snapshot.revision),
                 Value::Text(epoch.clone()),
-                Value::Integer(
-                    brokk_bifrost_analysis::analyzer::store::go_unit_summaries::GO_UNIT_SUMMARY_DERIVATION_VERSION,
-                ),
+                rusqlite::types::Value::Blob(brokk_bifrost_analysis::analyzer::store::go_unit_summaries::go_unit_summary_derivation_identity().to_vec()),
                 Value::Blob(go_profile_read_key(&unit_key_array).to_vec()),
                 Value::Blob(profile.clone()),
             ],
@@ -4227,7 +4316,11 @@ func caller() { _, _ = os.Open("book.xlsx") }
                         Value::Integer(identity_id),
                     ],
                 );
-                uses(&plan, "resolution_unit_summary_exports", "export point");
+                uses(
+                    &plan,
+                    "exports USING PRIMARY KEY (summary_id=? AND identity_id=? AND namespace=?)",
+                    "export point",
+                );
 
                 let plan = bind(
                     "unit_summary_dependents",
@@ -4262,21 +4355,27 @@ func caller() { _, _ = os.Open("book.xlsx") }
                     "graph join with {statistics} must probe the exports once per root path: {plan:?}"
                 );
 
-                let plan = bind(
-                    "unit_summary_withdraw_replaced_blob",
-                    vec![
-                        Value::Text(blob_oid),
-                        Value::Text(lang),
-                        Value::Blob(Vec::new()),
-                    ],
+                // Go members have no persisted blob_id. Pin the selected-member
+                // read used above instead of the foreign-language withdrawal path.
+                let plan: Vec<String> = connection
+                    .prepare(
+                        "EXPLAIN QUERY PLAN SELECT blobs.blob_oid, blobs.lang
+                     FROM temp.selected_unit_member_blobs AS members
+                     JOIN blobs ON blobs.id=members.blob_id
+                     WHERE members.summary_id=?1 LIMIT 1",
+                    )
+                    .unwrap()
+                    .query_map([summary_id], |row| row.get(3))
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+                assert!(
+                    plan.iter().all(|step| !step.starts_with("SCAN ")),
+                    "selected member blob read with {statistics}: {plan:?}"
                 );
-                uses(&plan, "blobs USING", "withdraw replaced blob");
-                uses(&plan, "members USING", "withdraw replaced blob");
-                uses(
-                    &plan,
-                    "resolution_unit_summary_versions USING",
-                    "withdraw replaced blob",
-                );
+                uses(&plan, "members USING", "selected member blob read");
+                uses(&plan, "blobs USING", "selected member blob read");
+                let _ = (blob_oid, lang);
 
                 let plan = bind(
                     "reference_local_path_evidence",
@@ -4302,9 +4401,7 @@ func caller() { _, _ = os.Open("book.xlsx") }
                 Value::Integer(snapshot.generation.get()),
                 Value::Integer(snapshot.revision),
                 Value::Text(epoch.clone()),
-                Value::Integer(
-                    brokk_bifrost_analysis::analyzer::store::go_unit_summaries::GO_UNIT_SUMMARY_DERIVATION_VERSION,
-                ),
+                rusqlite::types::Value::Blob(brokk_bifrost_analysis::analyzer::store::go_unit_summaries::go_unit_summary_derivation_identity().to_vec()),
                 Value::Blob(go_profile_read_key(&caller_unit_key).to_vec()),
                 Value::Text("[]".into()),
                 Value::Integer(1),
@@ -4333,9 +4430,7 @@ func caller() { _, _ = os.Open("book.xlsx") }
                     Value::Integer(snapshot.generation.get()),
                     Value::Integer(snapshot.revision),
                     Value::Text(epoch.clone()),
-                    Value::Integer(
-                        brokk_bifrost_analysis::analyzer::store::go_unit_summaries::GO_UNIT_SUMMARY_DERIVATION_VERSION,
-                    ),
+                    rusqlite::types::Value::Blob(brokk_bifrost_analysis::analyzer::store::go_unit_summaries::go_unit_summary_derivation_identity().to_vec()),
                     Value::Blob(go_profile_read_key(&caller_unit_key).to_vec()),
                     Value::Text("[]".into()),
                 ],
@@ -4372,9 +4467,7 @@ func caller() { _, _ = os.Open("book.xlsx") }
                 Value::Integer(snapshot.generation.get()),
                 Value::Integer(snapshot.revision),
                 Value::Text(epoch.clone()),
-                Value::Integer(
-                    brokk_bifrost_analysis::analyzer::store::go_unit_summaries::GO_UNIT_SUMMARY_DERIVATION_VERSION,
-                ),
+                rusqlite::types::Value::Blob(brokk_bifrost_analysis::analyzer::store::go_unit_summaries::go_unit_summary_derivation_identity().to_vec()),
                 Value::Blob(go_profile_read_key(&caller_unit_key).to_vec()),
                 Value::Text("[]".into()),
                 Value::Integer(inventory_context_id),
@@ -4399,9 +4492,7 @@ func caller() { _, _ = os.Open("book.xlsx") }
                 Value::Integer(snapshot.revision),
                 Value::Text(epoch.clone()),
                 Value::Blob(profile.clone()),
-                Value::Integer(
-                    brokk_bifrost_analysis::analyzer::store::go_unit_summaries::GO_UNIT_SUMMARY_DERIVATION_VERSION,
-                ),
+                rusqlite::types::Value::Blob(brokk_bifrost_analysis::analyzer::store::go_unit_summaries::go_unit_summary_derivation_identity().to_vec()),
                 Value::Text("[]".into()),
             ],
                 );
@@ -4624,15 +4715,10 @@ func caller() { _, _ = os.Open("book.xlsx") }
                 table_counts("edited");
             }
         }
-        /// Blob replacement. Persisting a blob that already exists deletes its row and
-        /// inserts a new one, and the unit summary rows that reference the old row
-        /// cascade away. The persist path withdraws the version rows of every summary
-        /// that listed the blob in the same transaction, so a reader finds no live
-        /// summary for the unit (it falls back) instead of a complete summary whose rows
-        /// are gone. The next reconcile rebuilds the header in place and rebinds the
-        /// unit, and the rebuilt rows equal the incumbent readers' again.
+        /// Equal-fact blob replacement retains the surface-keyed version; changed
+        /// facts move the key, and both publications agree with fresh builds.
         #[test]
-        fn a_replaced_blob_withdraws_its_summaries_until_the_next_reconcile() {
+        fn a_replaced_blob_retains_equal_facts_and_moves_changed_surface_keys() {
             let Some((fixture, workspace)) = published_go_workspace(GO_FIXTURE) else {
                 return;
             };
@@ -4666,21 +4752,7 @@ func caller() { _, _ = os.Open("book.xlsx") }
             );
 
             let hollow = open_units(&workspace);
-            let missing: Vec<&String> = before
-                .keys()
-                .filter(|label| !hollow.contains_key(*label))
-                .collect();
-            assert_eq!(
-                missing,
-                ["util/util.go"],
-                "exactly the units that listed the replaced blob lose their live summary"
-            );
-            for (label, unit) in &hollow {
-                assert_eq!(
-                    &before[label], unit,
-                    "{label}: unrelated units are untouched"
-                );
-            }
+            assert_eq!(before, hollow, "equal facts preserve every live version");
 
             activate_go_context(&workspace);
             let rebuilt = open_units(&workspace);
@@ -4690,7 +4762,7 @@ func caller() { _, _ = os.Open("book.xlsx") }
             );
             assert_eq!(
                 rebuilt["util/util.go"].summary_id, before["util/util.go"].summary_id,
-                "the header with the same digest is rebuilt in place"
+                "equal facts retain the surface-keyed header"
             );
             assert_eq!(
                 rebuilt["util/util.go"].output_digest,
@@ -4704,12 +4776,35 @@ func caller() { _, _ = os.Open("book.xlsx") }
                     );
                 }
             }
+            assert_fresh_go_rows(
+                &fixture,
+                &workspace,
+                go_full_production_config(),
+                activate_go_context,
+            );
             assert_summaries_match_incumbent_readers(&workspace);
+            let changed = format!("{source}\nfunc ReplacementAdded() {{}}\n");
+            let updated = edit_and_republish(&fixture, &workspace, "util/util.go", &changed);
+            let after = open_units(&updated);
+            assert_ne!(
+                before["util/util.go"].summary_digest,
+                after["util/util.go"].summary_digest
+            );
+            assert_ne!(
+                before["util/util.go"].summary_id,
+                after["util/util.go"].summary_id
+            );
+            assert_fresh_go_rows(
+                &fixture,
+                &updated,
+                go_full_production_config(),
+                activate_go_context,
+            );
         }
-        /// The production default context: no Go tool, so the publication is the source
+        /// An explicit source-only context: no Go tool, so the publication is the source
         /// inventory, whose test and external-test files sit in the plain instance. The
         /// summaries must equal the incumbent readers there too, and a body edit must
-        /// derive exactly the unit that lists the file.
+        /// reuse the unit that lists the file.
         #[test]
         fn source_inventory_unit_summaries_equal_the_incumbent_readers_and_cut_off() {
             let mut project = InlineTestProject::with_language(Language::Go);
@@ -4755,12 +4850,13 @@ func caller() { _, _ = os.Open("book.xlsx") }
             let after = open_units(&updated);
             assert_eq!(
                 units_with_a_new_summary(&initial, &after),
-                ["util/util.go".to_owned()].into()
+                Default::default()
             );
             assert_eq!(
                 initial["util/util.go"].output_digest,
                 after["util/util.go"].output_digest
             );
+            assert_fresh_go_rows(&fixture, &updated, go_source_inventory_config(), |_| {});
             assert_summaries_match_incumbent_readers(&updated);
 
             // An added workspace import is not caller-visible: no importer is derived.
@@ -4790,7 +4886,7 @@ func caller() { _, _ = os.Open("book.xlsx") }
                 project = project.file(*path, *source);
             }
             let fixture = project.build();
-            let workspace = fixture.workspace_analyzer(go_full_production_config());
+            let workspace = fixture.workspace_analyzer(go_source_inventory_config());
             let inventory = source_inventory_profile();
             let before = open_units(&workspace).len();
             assert_eq!(live_summaries_of_profile(&workspace, inventory), before);
@@ -4853,7 +4949,7 @@ func main() { api.Public() }
 "#,
                 )
                 .build();
-            let workspace = fixture.workspace_analyzer(go_full_production_config());
+            let workspace = fixture.workspace_analyzer(go_source_inventory_config());
             let retained = resolve_analyzer::<GoAnalyzer>(workspace.analyzer())
                 .unwrap()
                 .clone();
@@ -4952,7 +5048,7 @@ func main() { api.Public() }
         .build();
             let workspace = WorkspaceAnalyzer::build_persisted_without_automatic_gc(
                 fixture.project_dyn(),
-                go_full_production_config(),
+                go_source_inventory_config(),
             )
             .unwrap();
             let path = workspace.persisted_store_path().unwrap();
@@ -5047,7 +5143,7 @@ func main() { api.Public() }
             .unwrap();
             let updated = WorkspaceAnalyzer::build_persisted_without_automatic_gc(
                 fixture.project_dyn(),
-                go_full_production_config(),
+                go_source_inventory_config(),
             )
             .unwrap();
             let next = resolve_analyzer::<GoAnalyzer>(updated.analyzer())
@@ -5057,13 +5153,21 @@ func main() { api.Public() }
             assert_eq!(snapshot.generation, next.generation);
             assert!(snapshot.revision < next.revision);
             let inventory_next = read(store, &next, &inventory).unwrap();
-            assert_ne!(inventory_next.0, inventory_first.0);
-            // The other profile has no later open interval yet. Its old reconcile must
+            assert_eq!(inventory_next.0, inventory_first.0);
+            assert_fresh_go_rows(&fixture, &updated, go_source_inventory_config(), |_| {});
+            // This source-only construction leaves the tool profile at the old
+            // revision until the explicit activation below. Its old reconcile must
             // not be rejected by the newer inventory profile's revision guard.
             reconcile(store, &snapshot, tool, &cancellation);
             activate_go_context(&updated);
             let tool_next = read(store, &next, &tool).unwrap();
-            assert_ne!(tool_next.0, tool_first.0);
+            assert_eq!(tool_next.0, tool_first.0);
+            assert_fresh_go_rows(
+                &fixture,
+                &updated,
+                go_full_production_config(),
+                activate_go_context,
+            );
             assert_eq!(inventory_go.context_profile_for_test(), Some(inventory));
             assert_eq!(tool_go.context_profile_for_test(), Some(tool));
             assert_eq!(
@@ -6291,8 +6395,8 @@ type Item struct{ Decoy bool }
             let snapshot = fixture.snapshots["go"].clone();
             fixture.store.conn.execute(move |conn| {
         let tx = conn.transaction().unwrap();
-        tx.execute("INSERT INTO go_context_selections(workspace_id,lang,generation,base_profile_digest,domain_dir,gowork_path,profile_digest,derivation_version)
-            VALUES(?1,'go',?2,zeroblob(32),'','',zeroblob(32),?4)", rusqlite::params![snapshot.workspace_id.as_str(),snapshot.generation.get(),snapshot.revision,brokk_bifrost_analysis::analyzer::store::go_package_context::DERIVATION_VERSION]).unwrap();
+        tx.execute("INSERT INTO go_context_selections(workspace_id,lang,generation,base_profile_digest,domain_dir,gowork_path,profile_digest,derivation_identity)
+            VALUES(?1,'go',?2,zeroblob(32),'','',zeroblob(32),?4)", rusqlite::params![snapshot.workspace_id.as_str(),snapshot.generation.get(),snapshot.revision,brokk_bifrost_analysis::analyzer::store::go_package_context::derivation_identity()]).unwrap();
         let selection = tx.last_insert_rowid();
         tx.execute("INSERT INTO go_context_publications(selection_id,workspace_id,lang,generation,valid_from,input_digest,publication_digest,complete,gaps)
             VALUES(?1,?2,'go',?3,?4,zeroblob(32),zeroblob(32),0,jsonb('[]'))", rusqlite::params![selection,snapshot.workspace_id.as_str(),snapshot.generation.get(),snapshot.revision]).unwrap();
@@ -6413,9 +6517,14 @@ type Item struct{ Decoy bool }
                 // #9300: preserving the full pass's next-round self-answer
                 // dependency revisits a changed reference, adding 14 charged
                 // steps to the sparse pin; unchanged references still skip.
+                // #12370 (d65a2b60825, #12159 stage 1 at 1e5b2027a0c) adds
+                // projected type-shape identities to the intrinsic descriptor
+                // read. intrinsic_type_descriptors charges one scope step per
+                // requested identity, adding one step for both point kinds.
+                // 0427 alone and #12735 alone leave these pins at 419/424.
                 let expected_scope_nodes = match kind {
-                    ProductionGoPointKind::Definition => 419,
-                    ProductionGoPointKind::Type => 424,
+                    ProductionGoPointKind::Definition => 420,
+                    ProductionGoPointKind::Type => 425,
                 };
                 // These generic-free fixtures no longer open the optional formal-row
                 // table and its indexes during cold point setup. The cold open is
@@ -6510,10 +6619,41 @@ type Item struct{ Decoy bool }
                 // #9948 installs three TEMP triggers on selected Rust summary
                 // rows: their DDL adds three statements and schema rows at
                 // cold open. This Go fixture does not mutate those rows.
+                // #11519 (migration 0334) installs three connection-local
+                // summary translation TEMP views on every selected connection:
+                // selected member blobs, the current surface list, and Rust
+                // summary placements. Their CREATE TEMP VIEW definitions add
+                // three statements and three schema rows to the first cold
+                // open only; search work is unchanged.
+                // #11546 adds the selected unplaced-placement TEMP table and
+                // its unplaced-gap TEMP view to that setup (+2 statements and
+                // schema rows), and the selected placement fill clears and
+                // fills the table (+4 executions, no decoded rows) on every
+                // selected connection: +6/+2 at cold open only.
+                // #11682 adds selected Rust added-edge and overlay-gap TEMP
+                // tables and runs fill statements 7-10: +12 cold-open
+                // statements/+6 decoded schema rows in both profiles.
+                // #11682 C2 adds the partial index on the added-edge target path
+                // (`selected_rust_added_edges_target_path`): +1 cold-open
+                // statement and +1 decoded schema row in both profiles.
+                // #12004 publication-lineage nonce validation adds two
+                // cold-open statements and two decoded schema rows in both
+                // profiles; search and warm work are unchanged.
+                // #11904 (e0d67d829c6, landed in #12139) adds the TEMP index
+                // `selected_rust_unit_closure_dependents`: one more cold-open
+                // schema statement and decoded row in both profiles.
+                // #12495 (migration 0427) registers the binary-operation typed
+                // stage family. Its TEMP table and unique/seek indexes add three
+                // cold-open statements and three decoded schema rows in both
+                // profiles.
+                // #13339 installs the three shared Rust source-scope TEMP views
+                // in selected-resolution schema setup: +3 cold-open statements
+                // and decoded schema rows in both profiles. Search and warm work
+                // are unchanged.
                 let cold_open = if cfg!(debug_assertions) {
-                    (279, 246)
+                    (310, 267)
                 } else {
-                    (276, 243)
+                    (307, 264)
                 };
                 // #8166: the batch candidate-path memo serves repeated
                 // RESOLUTION_PATHS_BY_KEY_SQL hydration within one point
@@ -6542,9 +6682,14 @@ type Item struct{ Decoy bool }
                 // Warm lookup work and engine work remain unchanged.
                 // This integration merge keeps one additional cold statement
                 // and row above the pre-#9869 counts.
+                // The extra projected type-shape identity from #12370 also
+                // makes the Type point execute an intrinsic descriptor read
+                // group: four cold and three warm statements and decoded rows.
+                // 0427 alone leaves the search unchanged; Definition's scope
+                // step adds no SQL, and #12735 does not move these pins.
                 let (cold_search, warm_open, warm_search) = match kind {
                     ProductionGoPointKind::Definition => ((163, 147), (5, 4), (131, 100)),
-                    ProductionGoPointKind::Type => ((180, 143), (5, 4), (149, 97)),
+                    ProductionGoPointKind::Type => ((184, 147), (5, 4), (152, 100)),
                 };
                 let production_schema = cold
                     .open
@@ -7623,6 +7768,24 @@ type Item struct{ Decoy bool }
                 }
             }
             impl brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedAnalyzerServices for LiveModels<'_> {
+                fn selected_read_recorder(
+                    &self,
+                ) -> Option<
+                    brokk_bifrost_analysis::analyzer::store::selected_read::SelectedReadRecorder<
+                        '_,
+                    >,
+                > {
+                    None
+                }
+                fn record_selected_dependency(
+                    &self,
+                    _dependency:&brokk_bifrost_analysis::analyzer::store::selected_read::SelectedDependency,
+                ) -> brokk_bifrost_analysis::analyzer::store::Result<()> {
+                    brokk_bifrost_core::analyzer::memo_attribution::ReadReuseRefusal::refuse_read_reuse(self);
+                    Ok(())
+                }
+
+
                 fn verified_declaration(&self, expected: &brokk_bifrost_analysis::analyzer::CodeUnit) -> Option<brokk_bifrost_analysis::analyzer::CodeUnit> { self.0.declarations_named(expected.source(), expected.identifier()).into_iter().find(|unit| unit == expected) }
                 fn declarations_named(&self, file: &brokk_bifrost_analysis::analyzer::ProjectFile, name: &str) -> Vec<brokk_bifrost_analysis::analyzer::CodeUnit> { self.0.declarations_named(file, name) }
                 fn external_inventory_providers(&self) -> Vec<String> { Vec::new() }
@@ -7882,7 +8045,10 @@ type Item struct{ Decoy bool }
                     ),
                     SemanticModelRuntimeOutcome::Ready { .. }
                 ));
-                let selected_overlay = workspace.analyzer().semantic_model_overlay();
+                let selected_overlay = workspace
+                    .analyzer()
+                    .semantic_model_overlay_read()
+                    .published();
                 let run = |republish: bool| {
                     let services = LiveModels(workspace.analyzer());
                     let input = selected_operation_input(
@@ -8180,10 +8346,12 @@ type Item struct{ Decoy bool }
                                     "example.test/root/provider.Base"
                                 );
                                 assert!(
-                                    !candidate.receiver_route_proven,
+                                    !candidate.receiver_is_declaring_owner,
                                     "model embedding supplies no receiver storage proof"
                                 );
-                                assert!(candidate.route_exact && !candidate.interface);
+                                assert!(
+                                    candidate.owner_path_members_exact && !candidate.abstract_owner
+                                );
                                 assert!(
                                     matches!(&answer.definitions, brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::SelectedNativeDefinitions::Ready(rows) if rows.is_empty()),
                                     "model token must not become a source unit"
@@ -8448,7 +8616,7 @@ type Item struct{ Decoy bool }
             let fixture = GoRootResolutionOperationFixture::new();
             let context = publish_go_root_fixture_context(&fixture, "example.test/root/provider");
             fixture.store.conn.execute(move |connection| {
-        connection.execute("UPDATE go_context_selections SET derivation_version=derivation_version-1 WHERE selection_id=(SELECT selection_id FROM go_context_publications WHERE context_id=?1)", [context]).unwrap();
+        connection.execute("UPDATE go_context_selections SET derivation_identity=?2 WHERE selection_id=(SELECT selection_id FROM go_context_publications WHERE context_id=?1)", rusqlite::params![context,brokk_bifrost_analysis::analyzer::store::go_package_context::derivation_identity_before_last_token()]).unwrap();
     });
             let cancellation = CancellationToken::new();
             let operation = fixture.open_ready(&cancellation);
@@ -8665,7 +8833,7 @@ type Item struct{ Decoy bool }
                         revision,
                         producer_epoch,
                         vec![0u8; 32],
-                        brokk_bifrost_analysis::analyzer::store::go_unit_summaries::GO_UNIT_SUMMARY_DERIVATION_VERSION,
+                        brokk_bifrost_analysis::analyzer::store::go_unit_summaries::go_unit_summary_derivation_identity(),
                         "[]",
                     ],
                     |row| row.get::<_, bool>(0),
@@ -8712,7 +8880,7 @@ type Item struct{ Decoy bool }
                 Value::Integer(fixture.snapshots["go"].revision),
                 Value::Text("go-epoch".into()),
                 Value::Blob(vec![0; 32]),
-                Value::Integer(brokk_bifrost_analysis::analyzer::store::go_unit_summaries::GO_UNIT_SUMMARY_DERIVATION_VERSION),
+                rusqlite::types::Value::Blob(brokk_bifrost_analysis::analyzer::store::go_unit_summaries::go_unit_summary_derivation_identity().to_vec()),
                 Value::Text("[]".into()),
             ];
             fixture.store.conn.execute(move |connection| {
@@ -8856,17 +9024,20 @@ func use() { provider.Rewrites.ReadFile() }
                 let context_id =
                     publish_go_root_fixture_context(&fixture, "example.test/root/provider");
                 fixture.store.conn.execute(move |connection| {
+            // #12131: the publication writer cannot mark an import complete
+            // while its selected provider is incomplete. Keep that authority
+            // invariant while testing local proofs and remote absence.
             connection.execute(
-                "UPDATE go_context_publications SET complete=1,gaps=jsonb('[]') WHERE context_id=?1",
-                [context_id],
+                "UPDATE go_context_publications SET complete=?2,gaps=jsonb('[]') WHERE context_id=?1",
+                rusqlite::params![context_id, complete],
             ).unwrap();
             connection.execute(
                 "UPDATE go_package_instances SET complete=CASE WHEN tool_import_path='example.test/root/provider' THEN ?2 ELSE 1 END,gaps=jsonb('[]') WHERE context_id=?1",
                 rusqlite::params![context_id, complete],
             ).unwrap();
             connection.execute(
-                "UPDATE go_package_imports SET complete=1,gaps=jsonb('[]') WHERE context_id=?1",
-                [context_id],
+                "UPDATE go_package_imports SET complete=?2,gaps=jsonb(CASE WHEN ?2 THEN '[]' ELSE '[{\"code\":\"incomplete_import_provider\",\"evidence\":\"example.test/root/provider\"}]' END) WHERE context_id=?1",
+                rusqlite::params![context_id, complete],
             ).unwrap();
         });
                 let mut queries = vec![
@@ -9166,21 +9337,28 @@ func use() { provider.Rewrites.ReadFile() }
                         },
                     )
                     .unwrap();
+                // #9009: PR #11909 made the native demand path retain an
+                // unresolved import's gap on a qualified reference. The eager
+                // oracle is the historical compiler and still answers
+                // Complete-empty for that one case.
+                let unresolved_import = source_text.contains("root/missing");
                 assert_eq!(
                     demand_answer.binding().targets(),
                     eager_answer.binding().targets(),
                     "{source_text}: demand={demand_answer:?}, eager={eager_answer:?}"
                 );
-                assert_eq!(
-                    demand_answer.binding().completion(),
-                    eager_answer.binding().completion(),
-                    "{source_text}: binding completion demand={demand_answer:?}, eager={eager_answer:?}"
-                );
-                assert_eq!(
-                    demand_answer.completion(),
-                    eager_answer.completion(),
-                    "{source_text}: answer completion"
-                );
+                if !unresolved_import {
+                    assert_eq!(
+                        demand_answer.binding().completion(),
+                        eager_answer.binding().completion(),
+                        "{source_text}: binding completion demand={demand_answer:?}, eager={eager_answer:?}"
+                    );
+                    assert_eq!(
+                        demand_answer.completion(),
+                        eager_answer.completion(),
+                        "{source_text}: answer completion"
+                    );
+                }
                 if complete_inventory {
                     assert_eq!(
                         eager_answer.completion(),
@@ -9196,11 +9374,13 @@ func use() { provider.Rewrites.ReadFile() }
                 }
                 if eager_answer.completion() == &ResolutionCompletion::Complete {
                     saw_complete_eager_answer = true;
-                    assert_eq!(
-                        demand_answer.completion(),
-                        &ResolutionCompletion::Complete,
-                        "the demand provider preserves the eager complete answer: {source_text}"
-                    );
+                    if !unresolved_import {
+                        assert_eq!(
+                            demand_answer.completion(),
+                            &ResolutionCompletion::Complete,
+                            "the demand provider preserves the eager complete answer: {source_text}"
+                        );
+                    }
                 }
                 if matches!(
                     eager_answer.binding().completion(),
@@ -9215,15 +9395,46 @@ func use() { provider.Rewrites.ReadFile() }
                         "an incomplete eager prefix binding remains incomplete on demand: {source_text}"
                     );
                 }
-                if source_text.contains("root/missing") {
-                    assert_eq!(
-                        demand_answer.binding().completion(),
-                        &ResolutionCompletion::Complete,
-                        "the eager path also treats an unresolved imported package as a complete binding"
-                    );
+                if unresolved_import {
+                    use brokk_bifrost_analysis::analyzer::resolution::model::ResolutionIncompleteReason;
+                    use brokk_bifrost_analysis::analyzer::store::resolution_operation::GO_IMPORT_INCOMPLETE;
+
                     assert_eq!(
                         eager_answer.binding().completion(),
-                        &ResolutionCompletion::Complete
+                        &ResolutionCompletion::Complete,
+                        "the historical eager oracle treats an unresolved imported package as a complete binding"
+                    );
+                    let ResolutionCompletion::Incomplete(reasons) =
+                        demand_answer.binding().completion()
+                    else {
+                        panic!(
+                            "the demand path retains an unresolved import's obligation: {demand_answer:?}"
+                        );
+                    };
+                    let named: Vec<_> = reasons
+                        .iter()
+                        .filter_map(|reason| match reason {
+                            ResolutionIncompleteReason::UnsupportedSemantic(id) => operation
+                                .ready
+                                .context_identities
+                                .named_reason(*id)
+                                .map(|(name, _)| name),
+                            _ => None,
+                        })
+                        .collect();
+                    assert_eq!(named.len(), 2, "{source_text}: {named:?}");
+                    assert!(
+                        named.contains(&GO_IMPORT_INCOMPLETE),
+                        "{source_text}: {named:?}"
+                    );
+                    assert!(
+                        named.contains(&"go-package-incomplete"),
+                        "{source_text}: {named:?}"
+                    );
+                    assert_eq!(
+                        demand_answer.completion(),
+                        demand_answer.binding().completion(),
+                        "the native answer carries the qualified binding's import obligation"
                     );
                 }
             }
@@ -10051,7 +10262,7 @@ func use() { provider.Rewrites.ReadFile() }
 
         use brokk_bifrost_core::cancellation::CancellationToken;
 
-        use brokk_bifrost_analysis::analyzer::store::go_package_context::DERIVATION_VERSION;
+        use brokk_bifrost_analysis::analyzer::store::go_package_context::derivation_identity;
 
         use crate::store_test_support::go_extraction_support_13::Fixture;
 
@@ -10901,11 +11112,11 @@ func use() { provider.Rewrites.ReadFile() }
                     "package shared\n",
                 )
                 .build();
-            let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
-                project.project_dyn(),
-                AnalyzerConfig::default(),
-            )
-            .unwrap();
+            let mut config = AnalyzerConfig::default();
+            config.go.dependency_discovery.mode =
+                brokk_bifrost_core::analyzer::config::GoDependencyDiscoveryMode::Disabled;
+            let workspace =
+                WorkspaceAnalyzer::build_ephemeral_footgun(project.project_dyn(), config).unwrap();
             let conn = workspace.store().unwrap().read_conn().unwrap();
             let context: i64 = conn
                 .query_row(
@@ -10945,7 +11156,7 @@ func use() { provider.Rewrites.ReadFile() }
         }
         #[test]
         fn go_context_active_tool_profile_never_falls_back_after_source_update() {
-            let fixture = Fixture::new();
+            let fixture = Fixture::new_with_config(AnalyzerConfig::default());
             let discovery = fixture.discovery();
             let profile = profile_digest(&discovery);
             let original = fixture.publish(discovery, None);
@@ -10956,7 +11167,7 @@ func use() { provider.Rewrites.ReadFile() }
             assert!(go.activate_native_context_profile(&fixture.snapshot, profile));
             let changed = fixture.project.file("provider/item.go");
             changed
-                .write("package provider\ntype Updated struct{}\n")
+                .write("// Equivalent membership, moved coordinates.\npackage provider\ntype Updated struct{}\n")
                 .unwrap();
             let updated = fixture.workspace.update(&BTreeSet::from([changed]));
             let go = brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<
@@ -10995,6 +11206,35 @@ func use() { provider.Rewrites.ReadFile() }
                     .unwrap()
                     .is_some(),
                 "inactive inventory intervals remain retained without becoming active"
+            );
+            let inventory = store
+                .selected_go_context(&next, &source_inventory_profile())
+                .unwrap()
+                .unwrap();
+            let origin: i64 = store
+                .read_conn()
+                .unwrap()
+                .query_row(
+                    "SELECT valid_from FROM go_context_publications WHERE context_id=?1",
+                    [inventory.context_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(
+                origin < next.revision,
+                "equivalent headers retain the context origin"
+            );
+            assert!(
+                store
+                    .go_source_inventory_membership_unchanged(
+                        &next,
+                        inventory.context_id,
+                        fixture.project.root(),
+                        &["provider/item.go".to_owned()],
+                        &CancellationToken::new()
+                    )
+                    .unwrap(),
+                "normalized producer inputs certify equivalent-header reuse"
             );
             assert_eq!(
                 store
@@ -11157,7 +11397,7 @@ func use() { provider.Rewrites.ReadFile() }
                 Value::Integer(fixture.snapshot.generation.get()),
                 Value::Integer(fixture.snapshot.revision),
                 Value::Blob(profile.to_vec()),
-                Value::Integer(DERIVATION_VERSION),
+                Value::Blob(derivation_identity().to_vec()),
             ];
             let mut head = pinned("go_native_context_head");
             head.params = vec![
@@ -11181,7 +11421,9 @@ func use() { provider.Rewrites.ReadFile() }
             ];
             let mut prior = pinned("go_native_prior_heads");
             prior.params = inputs.params.clone();
-            prior.params.push(Value::Integer(DERIVATION_VERSION));
+            prior
+                .params
+                .push(Value::Blob(derivation_identity().to_vec()));
             for state in brokk_bifrost_core::cache_gc::PlannerStatisticsState::BOTH {
                 state.install(&conn);
                 for query in [

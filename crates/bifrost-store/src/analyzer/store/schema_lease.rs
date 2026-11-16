@@ -124,7 +124,8 @@ pub(super) struct LastTemp {
 
 impl RetainedBytes for LastTemp {
     fn retained_bytes(&self) -> usize {
-        std::mem::size_of::<Self>() + self.bytes.capacity()
+        std::mem::size_of::<Self>()
+            + brokk_bifrost_core::allocation_size::allocation_size(self.bytes.capacity())
     }
 }
 
@@ -222,7 +223,8 @@ mod tests {
     #[test]
     fn a_cached_schema_hides_no_change_and_eviction_only_costs_a_rescan() {
         let budget = budget();
-        let conn = brokk_bifrost_core::cache_db::open_in_memory_store_connection().unwrap();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        brokk_bifrost_core::cache_db::sql_profile::install_catalog_session(&conn);
         let key = LastTempKey(connection_tag(&conn).unwrap());
         conn.execute_batch("CREATE TEMP TABLE a(value)").unwrap();
         let lease = SchemaLease::capture(&conn, &budget).unwrap();

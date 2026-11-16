@@ -70,6 +70,64 @@ mod rust_departing_wave2_root_tests {
         assert_eq!(ready.stable_point_read_fill_counts_for_test(), fills);
     }
 
+    /// The macro-input memo is caller-keyed by the capsule's blob, the exact
+    /// fill input: the rows it returns are the sealed rows of that blob, and a
+    /// second read is a hit that returns the same rows and fills nothing.
+    #[test]
+    fn selected_macro_inputs_hit_with_the_fill_rows() {
+        use brokk_bifrost_analysis::analyzer::store::resolution_operation::selected_path_key;
+        let mut fixture = RustRootResolutionOperationFixture::new_with_scale_sources(
+            4,
+            0,
+            "",
+            macro_definition_scale_source,
+        );
+        fixture.replace_persisted_consumer_source(
+            r#"
+#[macro_use] mod scale_0000;
+pub fn caller(t: &Tensor) {
+    let _first = dispatch!(permute(t.datum_type())(t));
+}
+"#,
+        );
+        let cancellation = CancellationToken::new();
+        let operation = fixture.open_ready(&cancellation);
+        assert!(
+            operation
+                .ensure_selected_rust_inputs(&cancellation)
+                .unwrap()
+        );
+        let capsule = operation
+            .rust_macro_capsule(&selected_path_key(Path::new(RUST_ROOT_CONSUMER_PATH)))
+            .unwrap()
+            .unwrap();
+        // What a fill reads: the blob's sealed rows, through the same reader.
+        let sealed = capsule
+            .macro_rows()
+            .input_rows(
+                operation.ready.inventory.connection(),
+                capsule.blob_id(),
+                &|| true,
+            )
+            .unwrap()
+            .expect("an uncancelled read returns rows");
+        assert!(!sealed.is_empty(), "the caller invokes a macro");
+        let sealed = format!("{sealed:?}");
+        let (first, held) = operation
+            .selected_macro_input_rows_probe_for_test(&capsule, &cancellation)
+            .unwrap();
+        assert_eq!(first, sealed, "the memo returns exactly the sealed rows");
+        assert!(held >= 1, "the read leaves its rows in the memo");
+        let (second, held_after) = operation
+            .selected_macro_input_rows_probe_for_test(&capsule, &cancellation)
+            .unwrap();
+        assert_eq!(second, sealed, "a hit returns the fill's rows");
+        assert_eq!(
+            held_after, held,
+            "the second read is a hit and fills nothing"
+        );
+    }
+
     /// The main hydration statement must seek a fixed requested declaration,
     /// even when the workspace or that declaration's own blob grows. VM steps
     /// measure SQLite work; the mount-visit regression below measures Rust work.

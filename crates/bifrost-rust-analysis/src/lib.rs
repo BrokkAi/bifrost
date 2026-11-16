@@ -14,6 +14,9 @@ pub mod analyzer {
             RustFailureIdentities, rust_failure_handler_body_shapes,
             rust_failure_handler_identities,
         },
+        macro_binding_access::{
+            MacroDefinitionInventory, RustMacroBindingAccess, rust_macro_binding_access,
+        },
         resolve_rust_semantic_pack_dependencies, rust_declaration_is_enum_variant,
         rust_declaration_matches_reference_namespace, rust_file_dependency_evidence,
         rust_reference_namespace,

@@ -1,0 +1,36 @@
+# The Rust crate derivation lever (#11570).
+#
+# Add one `<issue>-<slug>` line when the crate-row derivation changes: the
+# statements under `store/rust_crate_*.sql`, the module route walk, the order
+# `derive_exports` runs them in, or the dependency waves. Its identity is
+# hashed into every Rust crate topology digest and stored in
+# `rust_crate_reconciliations.derivation_identity`, so a store built under an
+# earlier rule set re-derives its crate rows although its inputs are
+# unchanged. Git merges this file with merge=union, so two branches that each
+# add a line keep both. Never edit or remove a line; compaction replaces a
+# prefix with a checkpoint line and keeps the identity.
+# See .agents/docs/cache-identity-levers.md.
+#
+# Replaced the hyphen-joined string literal:
+# 4460-2026-10-07-module-self-imports-target-has-atomic-cfg-attr-derived-surface-generated-attribute-boundary-fact-enum-variant-export-set-2026-10-08-cycle-only-forced-wave-2026-10-09-primitive-shadowing-5235-2026-10-14-item-macro-guess-scope-5375-2026-10-15-reverse-inventory-5375-2026-10-16-v2-composite-primitive-shadowing-5243-2026-10-15-reverse-inventory-5375-2026-10-16-v3-enumerated-inputs-5517-cfg-if-ordered-items-and-conditional-imports-5172-2026-10-17-conditional-macro-frontiers-constructor-visibility-5133-2026-10-15-forwarded-public-surface-5133-2026-10-17-rust-route-precedence-5780-v6-admitted-binding-provenance-5658-p2-own-binding-authority-native-namespaces-owner-gap-certificates-owner-wide-propagation-6046-own-member-source-paths-prelude-root-witnesses-6102-gap-subject-levels-6136-settled-terminal-lookups-6114-glob-own-root-lookup-6389-associated-macro-contexts-inherent-impl-subjects-6394-duplicate-module-macro-scope-v1-absent-feature-cfg-inactive-v1-workspace-exclude-curdir-patch-version-topology-v1-macro-replay-path-module-walk-6861-v1-6846-cargo-literal-exclude-selected-build-features-v1-unresolved-impl-resolved-half-declarations-7226-10042-missing-target-roots-9737-d18d-broad-placements-9737-unproven-path-candidates-10469-case-folded-path-candidates-10552-path-probes-10774-manifests-only-cargo-toml-10953-target-dependencies-and-lib-names-9737-crate-manifest-currency-10987-scoped-symlink-omissions-11060-unplaced-module-topology-11111-certified-absent-module-topology-10972-cargo-config-paths-11629-blocker-evidence-module
+11570-slice2a-token-files
+11764-name-level-surface-digest
+11173-m2b-inherent-impl-subject-names
+11732-ambiguous-glob-reexport-unresolved
+11173-trait-impl-declaring-names
+11856-unproven-binding-gap
+11173-gap-foreign-name-forms
+11799-scope-broad-completeness
+11173-gap-macro-invocation-forms
+11904-impl-half-classification
+12014-explicit-binding-precedence
+11799-closure-scoped-inventory-errors
+12239-macro-cfg-shadowing
+10879-rust-drop-inventory
+12164-all-features-test
+12358-dev-cycle-target-scheduling
+10381-per-unit-feature-projection
+12998-listing-only-acquired-cargo-configuration
+12748-unknown-acquisition-cfg-atoms
+12830-detached-edition
+13016-body-local-macro-inventory

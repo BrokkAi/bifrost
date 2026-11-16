@@ -1276,6 +1276,23 @@ impl RowOverlay {
         (rows, open)
     }
 
+    /// Whether `touches` accepts any workspace path this row overlay was
+    /// authored from: the activation anchors, the generated symbols and the
+    /// request owner's carried-source anchors. The scan is complete. When the
+    /// request anchors cannot be read (an open family, cancellation or a
+    /// budget stop) the answer is `true`, so a caller proving that no authored
+    /// path changed never proves it from a partial view.
+    pub(super) fn any_authored_path(&self, mut touches: impl FnMut(&str) -> bool) -> bool {
+        let open = LookupOpen::default();
+        let anchors = self.anchor_view(&open);
+        open.get().is_some()
+            || self.generated.iter().any(|symbol| {
+                matches!(&symbol.location,
+                    SemanticModelLocation::Authored(anchor) if touches(&anchor.path))
+            })
+            || anchors.authored_paths().any(touches)
+    }
+
     pub(super) fn symbols_at_authored_path(&self, path: &str) -> LookupRows {
         let (rows, open) = self.symbols_for_lookup(
             CompositionLookup::AuthoredPath(path.to_owned()),

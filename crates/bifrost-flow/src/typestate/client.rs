@@ -1524,7 +1524,7 @@ impl<'plan> TypestateFlowProblem<'plan> {
             .arguments
             .get(condition.argument_index() as usize)
             .expect("validated event condition retains its selected argument");
-        let source = direct_scalar_source(semantics, argument.value);
+        let source = direct_scalar_source(call.procedure(), argument.value);
         match source {
             Some(DirectScalarSource::Boolean(value)) => Some(value == condition.expected()),
             Some(DirectScalarSource::Port(_))

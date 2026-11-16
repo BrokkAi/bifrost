@@ -134,9 +134,12 @@ pub(super) fn loop_relation_expansions<'a>(
     let candidates = match loop_candidates(workspace, &procedure.handle, cancellation) {
         Ok(candidates) => candidates,
         Err(reason) => {
-            let cause = match &reason {
+            let cause = match reason.base_cause() {
+                brokk_bifrost_analysis::analyzer::QueryReadIncomplete::Attributed(_) => unreachable!("base cause has no provenance layer"),
+                brokk_bifrost_analysis::analyzer::QueryReadIncomplete::ProofStopped { cause, .. } => *cause,
                 brokk_bifrost_analysis::analyzer::QueryReadIncomplete::Cancelled => Some(DerivationExecutionCause::Cancelled),
-                brokk_bifrost_analysis::analyzer::QueryReadIncomplete::StoreFailure(_)
+                brokk_bifrost_analysis::analyzer::QueryReadIncomplete::SemanticModelsPending
+                | brokk_bifrost_analysis::analyzer::QueryReadIncomplete::StoreFailure(_)
                 | brokk_bifrost_analysis::analyzer::QueryReadIncomplete::StructureUnavailable(_) => Some(DerivationExecutionCause::Provider),
                 brokk_bifrost_analysis::analyzer::QueryReadIncomplete::SemanticEvidenceUnavailable(_)
                 | brokk_bifrost_analysis::analyzer::QueryReadIncomplete::ArtifactUnavailable(_)
@@ -232,7 +235,10 @@ pub(super) fn loop_relation_expansions<'a>(
     );
     let token = cancellation.cloned().unwrap_or_default();
     // One budget is shared by all loop sites in this procedure.
-    let mut request = FlowStateRequest::new(&token);
+    let mut request = FlowStateRequest::new(
+        &token,
+        brokk_bifrost_flow::flow_state::FlowStateRequestMemos::new(workspace.retention_budget()),
+    );
     candidates
         .rows
         .into_iter()
@@ -403,21 +409,19 @@ mod tests {
             end_byte: source.len() - 1,
         };
         {
-            // Existing request-failure injection exercises nested cache reads;
-            // this is not physical corruption or a claim about hiredis' cause.
+            // A store failure recorded by the enclosing request is not an input
+            // of this loop read: the nested read reports only its own reads, so
+            // the loop answer stays complete and the outer failure stays outer
+            // (#11210; the failure used to be inherited downward). A failure of
+            // the read itself reaches `loop_relation_expansions` through the
+            // `Err` arm that formats its typed cause and procedure source.
             let scope = AnalyzerQueryScope::new(workspace.analyzer());
-            let marker = "#5385 injected inherited loop read failure";
+            let marker = "#5385 injected outer request failure";
             scope.record_store_error_for_test(StoreError::new(marker));
-            let failure = loop_candidates(&workspace, &procedure.handle, None)
-                .expect_err("cold loop read must preserve the inherited failure");
-            assert!(
-                matches!(
-                    &failure,
-                    QueryReadIncomplete::StoreFailure(error) if error.to_string() == marker
-                ),
-                "{failure:?}"
-            );
-            let expected_detail = format!("{failure:?}");
+            let candidates = loop_candidates(&workspace, &procedure.handle, None)
+                .expect("an unrelated outer failure does not fail the nested read");
+            assert!(candidates.complete, "{candidates:?}");
+            assert_eq!(candidates.rows.len(), 1);
             let mut diagnostics = Vec::new();
             let rows = loop_relation_expansions(
                 &workspace,
@@ -427,24 +431,8 @@ mod tests {
                 &mut diagnostics,
                 procedure,
             );
-            assert!(rows.is_empty(), "failed read must not publish loop rows");
-            let [diagnostic] = diagnostics.as_slice() else {
-                panic!("expected one attributed read failure: {diagnostics:?}");
-            };
-            assert_eq!(
-                diagnostic.code,
-                CodeQueryDiagnosticCode::LoopRelationDerivationIncomplete
-            );
-            assert_eq!(diagnostic.impact, CodeQueryDiagnosticImpact::Incomplete);
-            assert!(
-                diagnostic.message.contains(&expected_detail),
-                "{diagnostic:?}"
-            );
-            assert!(
-                diagnostic.message.contains("kind: Generic"),
-                "{diagnostic:?}"
-            );
-            assert_eq!(diagnostic.source.as_ref(), Some(&expected));
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            assert_eq!(rows.len(), 1);
             assert!(matches!(
                 scope.read_completion(),
                 Err(QueryReadIncomplete::StoreFailure(error)) if error.to_string() == marker

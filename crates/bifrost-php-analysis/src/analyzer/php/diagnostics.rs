@@ -55,7 +55,7 @@ pub(crate) fn collect_php_semantic_diagnostics(
     // Both reads are of state a host already published. Neither starts
     // dependency discovery nor touches a vendor tree.
     let external = AnalyzerPhpExternalSurface {
-        overlay: analyzer.semantic_model_overlay(),
+        overlay: analyzer.semantic_model_overlay_read().published(),
         evidence: analyzer.dependency_discovery_evidence(Language::Php),
     };
     let report = brokk_bifrost_php::diagnostics::collect_php_semantic_diagnostics(

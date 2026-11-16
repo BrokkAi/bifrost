@@ -16,9 +16,13 @@ pub(crate) const RUST_COPY_ABSENCE_QUESTION_SQL: &str =
              FROM blobs AS blob INDEXED BY sqlite_autoindex_blobs_1
              CROSS JOIN source_declarations AS declaration ON declaration.blob_id = blob.id
              CROSS JOIN resolution_unit_summary_members AS m
-               INDEXED BY resolution_unit_summary_members_blob
-               ON m.blob_id = blob.id AND m.rel_path = ?1
+               INDEXED BY resolution_unit_summary_members_path
+               ON m.rel_path = ?1
              CROSS JOIN selected_rust_unit_summaries AS u ON u.summary_id = m.summary_id
+             CROSS JOIN temp.selected_unit_member_blobs AS attachment
+               ON attachment.summary_id = m.summary_id
+              AND attachment.member_ordinal = m.member_ordinal
+              AND attachment.blob_id = blob.id
              JOIN workspace_file_versions AS live
                ON live.workspace_id = u.workspace_id AND live.lang = u.lang
               AND live.generation = u.generation AND live.rel_path = m.rel_path
@@ -36,6 +40,8 @@ pub(crate) const RUST_COPY_ABSENCE_QUESTION_SQL: &str =
              JOIN rust_resolution_unit_summary_exports AS e
                ON e.summary_id = m.summary_id
               AND e.declaration_member_ordinal = m.member_ordinal
+              /* Rust child sites use the retained derived-from blob. */
+              AND m.blob_id = authority.blob_id
               AND e.declaration_site = authority.source_site
               AND e.origin = 'declaration' AND e.namespace = 'type'
              JOIN resolution_identities AS identity ON identity.id = e.identity_id
@@ -138,15 +144,13 @@ impl AnalyzerStore {
 
     /// Evaluate the recorded question on the current selected crate. Replay
     /// calls this same method; a missing selected unit gives no comparison.
-    /// A budget equal to the row count cuts the read: after the last charged
-    /// row, no allowance remains to advance and prove end of stream.
+    /// Existing rows are scanned under SQL cancellation/deadline controls;
+    /// each visit is observed work, not a refusing semantic work quota.
     pub fn rust_copy_absence_answer(
         &self,
         snapshots: &WorkspaceSnapshots,
         question: &LookupQuestion,
         cancellation: &CancellationToken,
-        row_budget: usize,
-        cut: &mut bool,
         mut charge_row: impl FnMut(),
     ) -> Result<Option<(RustCopyAbsence, usize)>> {
         let LookupQuestion::RustCopyAbsence {
@@ -183,7 +187,6 @@ impl AnalyzerStore {
             hasher.field("producer", producer_digest.as_bytes());
             let mut header = 0;
             let mut row_count = 0usize;
-            let mut remaining = row_budget;
             let mut reason: Option<(u8, RustCopyAbsenceReason)> = None;
             let mut put = |rank, next| {
                 if reason.is_none_or(|(old, _)| rank < old) {
@@ -194,14 +197,7 @@ impl AnalyzerStore {
                 if cancellation.is_cancelled() {
                     return Err(StoreError::cancelled("Rust Copy absence read cancelled"));
                 }
-                // A full budget cannot certify the end of the stream: one more
-                // advance could expose another row. Refuse before that advance.
-                if remaining == 0 {
-                    *cut = true;
-                    return Ok(None);
-                }
                 let Some(row) = rows.next()? else { break };
-                remaining -= 1;
                 charge_row();
                 row_count += 1;
                 let row_kind: i64 = row.get(0)?;
@@ -305,7 +301,6 @@ impl AnalyzerStore {
                             put(3, RustCopyAbsenceReason::ModuleUniverseOpen);
                         }
                     }
-                    7 => put(3, RustCopyAbsenceReason::ModuleUniverseOpen),
                     8 => put(4, RustCopyAbsenceReason::UnpairedImpl),
                     9 => {
                         if row.get::<_, i64>(7)? != 1 {
@@ -336,5 +331,78 @@ impl AnalyzerStore {
                 row_count,
             )))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use brokk_bifrost_core::cache_gc::PlannerStatisticsState;
+    use brokk_bifrost_test_macros::hardwon;
+
+    use super::super::AnalyzerStore;
+    use super::super::planner_statistics::pinned_plans::pinned_queries;
+
+    #[test]
+    #[hardwon(
+        "#6394: cross-file reads must seek by key; the impl and gap arms now read unit-summary rows"
+    )]
+    fn copy_absence_impl_and_gap_arms_seek_summary_rows_by_their_keys() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let conn = store.conn.lock().unwrap();
+        store
+            .select_writer_workspace_snapshots(&conn, &Default::default())
+            .unwrap();
+        let query = pinned_queries()
+            .into_iter()
+            .find(|query| query.name == "rust_copy_absence")
+            .unwrap();
+        for state in PlannerStatisticsState::BOTH {
+            state.install(&conn);
+            let plan = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {}", query.sql))
+                .unwrap()
+                .query_map(rusqlite::params_from_iter(query.params.iter()), |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            for expected in [
+                // per-member inherent and unresolved-inherent counts
+                "rust_summary_inherent_declaration (summary_id=? AND impl_member_ordinal=? AND impl_declaration_id=?)",
+                "rust_summary_unresolved_inherent_declaration (summary_id=? AND impl_member_ordinal=? AND impl_declaration_id=?)",
+                // the foreign subject's one declaration export, by name form
+                "rust_summary_decl_export_endpoint (summary_id=? AND module_path=? AND namespace=? AND name=?",
+                // the subject rows of one impl member
+                "SEARCH h USING PRIMARY KEY (summary_id=? AND impl_member_ordinal=?)",
+            ] {
+                assert!(
+                    plan.iter().any(|step| step.contains(expected)),
+                    "{state:?}: missing {expected}: {plan:?}"
+                );
+            }
+            // The gap arm reads both summary gap tables of the one selected unit.
+            assert!(
+                plan.iter()
+                    .any(|step| step.contains("gaps") && step.contains("summary_id=?")),
+                "{state:?}: the gap arm does not seek by summary: {plan:?}"
+            );
+            // No arm reads the topology's impl, gap or source tables any more, and no
+            // summary table is read by a scan of every unit.
+            for step in &plan {
+                assert!(
+                    !step.contains("rust_crate_inherent_impls")
+                        && !step.contains("rust_crate_unresolved_inherent_impls")
+                        && !step.contains("rust_crate_gaps")
+                        && !step.contains("rust_crate_container_sources")
+                        // The pairs CTE's own automatic index is not a table probe.
+                        && !(step.contains("AUTOMATIC")
+                            && (step.contains("inherent") || step.contains("gaps")))
+                        && !(step.starts_with("SCAN")
+                            && step.contains("rust_resolution_unit_summary_")),
+                    "{state:?}: {step}: {plan:?}"
+                );
+            }
+        }
     }
 }

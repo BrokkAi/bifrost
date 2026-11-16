@@ -1104,7 +1104,7 @@ fn forward_direct_ancestors_in_session(
             }
             let raw =
                 session.query_limited_rows(|limit| csharp.raw_supertypes_limited(part, limit));
-            session.observe_cancellation().then_some(raw)
+            session.observe_cancellation().then_some(Some(raw))
         },
         |part, raw| {
             if !session.scope_step() {
@@ -1115,6 +1115,7 @@ fn forward_direct_ancestors_in_session(
         },
         |_| session.scope_step().then_some(()),
     )
+    .map(|ancestors| ancestors.resolved)
     .unwrap_or_default()
 }
 

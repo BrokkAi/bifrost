@@ -69,6 +69,52 @@ mod why_not_flow;
 mod why_not_relational;
 mod why_typestate;
 
+// A prebound caller keeps its canonical authority. An unbound caller must
+// remain unbound: own a nested request for this question instead of installing
+// a default authority in the caller's immutable resource slot.
+fn value_flow_question_scope(
+    analyzer: &dyn brokk_bifrost_analysis::analyzer::IAnalyzer,
+    snapshot: Option<
+        std::sync::Arc<
+            brokk_bifrost_analysis::analyzer::semantic_model::ActiveSemanticModelSnapshot,
+        >,
+    >,
+) -> Result<brokk_bifrost_analysis::analyzer::AnalyzerQueryScope<'_>, ExplainError> {
+    use brokk_bifrost_analysis::analyzer::{AnalyzerQueryScope, current_outer_request};
+    use brokk_bifrost_flow::value_flow::{ValueFlowRetentionScope, ValueFlowRetentionScopeError};
+
+    let unavailable = |error: ValueFlowRetentionScopeError| ExplainError::PolicyUnavailable {
+        message: format!("the explanation's value-flow retention scope is unavailable: {error}"),
+    };
+    let bound = match current_outer_request() {
+        Some(request) => {
+            let bound = ValueFlowRetentionScope::current(&request);
+            if request.is_closed() || bound.as_ref().is_some_and(|scope| scope.is_closed()) {
+                return Err(unavailable(ValueFlowRetentionScopeError::Closed));
+            }
+            bound
+        }
+        None => None,
+    };
+    let question = if bound.is_some() {
+        AnalyzerQueryScope::with_active_semantic_model_snapshot(analyzer, snapshot)
+    } else {
+        // Preserve enclosing read attribution and cancellation, as ordinary
+        // policy evaluation does, while closing only this owned request.
+        AnalyzerQueryScope::with_new_outer_request_and_active_semantic_model_snapshot(
+            analyzer, snapshot,
+        )
+    };
+    if bound.is_none() {
+        // These are the existing registration limits. Only the question-owned
+        // slot is filled, through the capture-safe budget capability.
+        let defaults = brokk_bifrost_rql::ValueFlowPlanRegistrationSet::default();
+        ValueFlowRetentionScope::bind(&question.outer_request(), defaults.retention_budget())
+            .map_err(unavailable)?;
+    }
+    Ok(question)
+}
+
 fn add_omitted_amount(truncated: &mut bool, lower_bound: &mut u64, amount: u64) {
     if amount == 0 {
         return;

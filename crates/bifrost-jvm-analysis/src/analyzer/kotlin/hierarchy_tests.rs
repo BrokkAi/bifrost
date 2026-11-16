@@ -89,7 +89,7 @@ fn kotlin_descendant_index_populates_the_ancestor_memo() {
 
     let uncancelled = CancellationToken::default();
     let excluded = BTreeSet::from([wild]);
-    let excludes = |file: &ProjectFile| excluded.contains(file);
+    let excludes = |file: &ProjectFile| Ok(excluded.contains(file));
     let scope = DescendantIndexScope::excluding_sources(&uncancelled, &excludes);
     let production = sorted_names(
         analyzer

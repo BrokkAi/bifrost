@@ -3,7 +3,7 @@ import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 import rehypeBasePathLinks from './rehype-base-path-links.mjs';
 
-const site = process.env.PUBLIC_DOCS_SITE ?? 'https://bifrost.brokk.ai';
+const site = process.env.PUBLIC_DOCS_SITE ?? 'https://bifrost.slopcop.com';
 const productionBase = process.env.PUBLIC_DOCS_BASE ?? '/';
 const isDev = process.argv.includes('dev');
 const socialCardPath = [
@@ -155,6 +155,7 @@ export default defineConfig({
                     { label: 'Reference Traversal', slug: 'code-query-tutorials/reference-traversal' },
                     { label: 'Receiver Traversal', slug: 'code-query-tutorials/receiver-traversal' },
                     { label: 'Python', slug: 'code-query-tutorials/python' },
+                    { label: 'Python Inheritance Inference', slug: 'code-query-tutorials/python-inheritance-inference' },
                     { label: 'Python Parser Recovery', slug: 'code-query-tutorials/python-recovery' },
                     { label: 'Java', slug: 'code-query-tutorials/java' },
                     { label: 'JavaScript', slug: 'code-query-tutorials/javascript' },

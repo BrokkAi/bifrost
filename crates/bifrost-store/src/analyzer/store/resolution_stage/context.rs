@@ -181,7 +181,7 @@ impl SelectedContextPathWriter<'_> {
             .unwrap_or((None, None));
         let start_node = codec::encode_node(path.start().node());
         let end_node = codec::encode_node(path.end().node());
-        let body = codec::encode_path(path);
+        let body = codec::encode_path(path)?;
         let values = params![
             self.context.get(),
             identity.fragment().ordinal(),

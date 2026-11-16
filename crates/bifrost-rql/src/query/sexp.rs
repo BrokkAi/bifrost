@@ -211,6 +211,18 @@ fn annotate_call_identity_ranges(plan: &mut CodeQueryPlan, expr: &Expr, path: &s
                 annotate_call_identity_ranges(branch, expr, &branch_path);
             }
         }
+        CodeQueryPlanSource::CallReachability(relation) => {
+            annotate_call_identity_ranges(
+                &mut relation.sources,
+                expr,
+                &child_path("call_reachability.sources".into()),
+            );
+            annotate_call_identity_ranges(
+                &mut relation.sinks,
+                expr,
+                &child_path("call_reachability.sinks".into()),
+            );
+        }
         CodeQueryPlanSource::Correlate(correlation) => {
             annotate_call_identity_ranges(
                 &mut correlation.code,
@@ -533,6 +545,30 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
             };
             insert_unique(&mut query, field, pattern_to_json(&items[1])?).at(expr)?;
             Ok(Some(Value::Object(query)))
+        }
+        RqlForm::CallReachability => {
+            if !(items.len() - 1).is_multiple_of(2) {
+                return Err(lower_error(
+                    expr,
+                    "call-reachability expects keyword/query pairs",
+                ));
+            }
+            let mut body = Map::new();
+            for pair in items[1..].as_chunks::<2>().0 {
+                let field = pair[0]
+                    .as_symbol()
+                    .and_then(super::schema::call_reachability_field_for_rql_label)
+                    .ok_or_else(|| lower_error(&pair[0], "unknown call-reachability option"))?;
+                let value = match field {
+                    super::schema::CallReachabilityField::Sources
+                    | super::schema::CallReachabilityField::Sinks => query_to_json(&pair[1])?,
+                    super::schema::CallReachabilityField::Depth => {
+                        non_negative_integer_value(&pair[1])?
+                    }
+                };
+                insert_unique(&mut body, field.label(), value).at(&pair[0])?;
+            }
+            Ok(Some(json!({ "call_reachability": body })))
         }
         RqlForm::Correlate | RqlForm::RequireBoth => {
             let operator = cross_domain_inputs_to_json(expr, head, &items[1..])?;
@@ -3332,6 +3368,7 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::ConfigurationFacts
         | RqlForm::ConfigurationAbsence
         | RqlForm::ConfigurationCode
+        | RqlForm::CallReachability
         | RqlForm::Correlate
         | RqlForm::RequireBoth
         | RqlForm::ConfigurationKey

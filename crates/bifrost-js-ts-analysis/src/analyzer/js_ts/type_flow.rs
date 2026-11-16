@@ -312,7 +312,11 @@ fn sort_external_classes(classes: &mut [ClassIdentity]) {
 
 fn exact_external_seed(workspace: &WorkspaceAnalyzer, name: &str) -> ClassSeed {
     match external_intrinsic_type(
-        workspace.analyzer().semantic_model_overlay().as_deref(),
+        workspace
+            .analyzer()
+            .semantic_model_overlay_read()
+            .published()
+            .as_deref(),
         name,
     ) {
         Some(ExternalType::Class(identity)) => ClassSeed::Class(identity),
@@ -326,7 +330,10 @@ fn exact_external_seed(workspace: &WorkspaceAnalyzer, name: &str) -> ClassSeed {
 /// that one canonical `String` interface an exact receiver identity for the
 /// TypeScript adapter; ordinary interfaces remain open everywhere else.
 fn exact_builtin_string_seed(workspace: &WorkspaceAnalyzer, language: Language) -> ClassSeed {
-    let overlay = workspace.analyzer().semantic_model_overlay();
+    let overlay = workspace
+        .analyzer()
+        .semantic_model_overlay_read()
+        .published();
     if language == Language::TypeScript
         && let Some(identity) = overlay.as_deref().and_then(|overlay| {
             let records = overlay
@@ -363,7 +370,11 @@ fn exact_builtin_string_seed(workspace: &WorkspaceAnalyzer, language: Language) 
 
 fn open_external_seed(workspace: &WorkspaceAnalyzer, name: &str) -> ClassSeed {
     match external_intrinsic_type(
-        workspace.analyzer().semantic_model_overlay().as_deref(),
+        workspace
+            .analyzer()
+            .semantic_model_overlay_read()
+            .published()
+            .as_deref(),
         name,
     ) {
         Some(ExternalType::Class(identity)) => ClassSeed::ClassWithOpenBound(identity),
@@ -855,7 +866,10 @@ fn constructed_class(
                 }
                 name
             };
-            let overlay = workspace.analyzer().semantic_model_overlay();
+            let overlay = workspace
+                .analyzer()
+                .semantic_model_overlay_read()
+                .published();
             match external_type(overlay.as_deref(), external_name) {
                 Some(ExternalType::Class(identity))
                     if overlay.as_deref().is_some_and(|overlay| {
@@ -1240,7 +1254,11 @@ fn declared_parameter_class(
         [] if annotation.kind() != "nested_type_identifier" => {
             let name = slice(annotation, prepared.source());
             match external_type(
-                workspace.analyzer().semantic_model_overlay().as_deref(),
+                workspace
+                    .analyzer()
+                    .semantic_model_overlay_read()
+                    .published()
+                    .as_deref(),
                 name,
             ) {
                 Some(ExternalType::Class(identity)) => ClassSeed::ClassWithOpenBound(identity),
@@ -1795,7 +1813,11 @@ fn resolve_class_expression(
         name
     };
     external_class(
-        workspace.analyzer().semantic_model_overlay().as_deref(),
+        workspace
+            .analyzer()
+            .semantic_model_overlay_read()
+            .published()
+            .as_deref(),
         external_name,
     )
     .ok_or(UnknownReason::UnresolvedBase)
@@ -2477,7 +2499,7 @@ fn unrecorded_member_surface_summary(
     });
     if let Some(entry) = summary {
         if !built_here.load(std::sync::atomic::Ordering::Relaxed) {
-            brokk_bifrost_analysis::analyzer::common::replay_query_cache_stable_reasons(
+            brokk_bifrost_analysis::analyzer::common::replay_query_read_incompleteness(
                 &entry.stable_reasons,
             );
         }
@@ -2576,7 +2598,10 @@ fn workspace_member_lookup(
             });
         coverage.include(owner_coverage);
     }
-    let overlay = workspace.analyzer().semantic_model_overlay();
+    let overlay = workspace
+        .analyzer()
+        .semantic_model_overlay_read()
+        .published();
     let mut external_reason = None;
     for base in &closure.external_bases {
         let ClassIdentity::External { symbol_id, .. } = base else {
@@ -2638,7 +2663,11 @@ fn member_lookup_with_surface_limit(
             workspace_member_lookup(workspace, language, kind, unit, member, max_nodes)
         }
         ClassIdentity::External { symbol_id, .. } => {
-            let Some(overlay) = workspace.analyzer().semantic_model_overlay() else {
+            let Some(overlay) = workspace
+                .analyzer()
+                .semantic_model_overlay_read()
+                .published()
+            else {
                 return MemberLookup::Unknown(UnknownReason::ExternalNotModeled);
             };
             let modeled = external_member_lookup(&overlay, symbol_id, kind, member);
@@ -2708,7 +2737,7 @@ fn class_hierarchy(
         // JavaScript permits subclasses and prototype mutation outside the
         // indexed workspace; a finite workspace descendant list is never a
         // closed-world proof.
-        descendants: None,
+        descendants: brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer::incomplete(brokk_bifrost_core::analyzer::capabilities::HierarchyOpenReason::DescendantIndexUnavailable),
         unresolved_base,
         dynamic_attributes: true,
     }
@@ -3144,7 +3173,7 @@ mod tests {
                 vec![ClassIdentity::Workspace(base)],
                 "the structured base identity is retained"
             );
-            assert_eq!(hierarchy.descendants, None);
+            assert!(!hierarchy.descendants.is_complete());
             assert!(!hierarchy.unresolved_base, "Base resolves in the workspace");
             assert!(
                 hierarchy.dynamic_attributes,

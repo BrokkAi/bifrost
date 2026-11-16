@@ -12,6 +12,8 @@ use crate::value_flow::{
     ValueFlowObservationPhase, ValueFlowSinkId, semantic_locator_heap_bytes,
 };
 
+use crate::analyzer::store::cache_budget::RetainedHeap;
+
 use super::{
     SourceEventKey, TaintAnalysisPlan, TaintClassSet, TaintSummaryResult, TaintUniverseHash,
 };
@@ -246,6 +248,160 @@ pub struct TaintFinding {
 }
 
 impl TaintFinding {
+    fn retained_inputs_heap(&self, heap: &mut RetainedHeap) {
+        use crate::analyzer::semantic::service::{
+            ArtifactRetentionVisitor, RetainedArtifactWalker,
+        };
+        self.classes.retained_heap(heap);
+        heap.add(crate::model_attribution::model_receipt_heap_bytes(
+            &self.model_receipt,
+        ));
+        heap.owned_slice(self.origins.origins.as_ref());
+        heap.owned_slice(self.origins.evidence.as_ref());
+        for evidence in &self.origins.evidence {
+            evidence.classes.retained_heap(heap);
+            evidence.reached_classes.retained_heap(heap);
+            heap.owned_slice(evidence.witnesses.as_ref());
+            heap.owned_slice(evidence.authored_arm_closures.as_ref());
+            for closure in &evidence.authored_arm_closures {
+                heap.add(closure.origin().model().as_str().len());
+            }
+            for witness in &evidence.witnesses {
+                heap.arc(witness, |witness, heap| {
+                    heap.add(
+                        witness
+                            .retained_bytes()
+                            .saturating_sub(std::mem::size_of::<SummaryWitness>()),
+                    );
+                });
+            }
+        }
+        let mut census = RetainedArtifactWalker::new(heap);
+        census.artifact_key(&self.key.snapshot);
+        census.procedure(self.entry.procedure());
+        census.procedure(self.entry.point().procedure());
+        census.locator(self.key.sink.site());
+        census.locator(&self.key.entry);
+        census.locator(&self.key.meeting_site);
+        if let Some(carrier) = &self.key.entry_carrier {
+            carrier.retained_allocations(&mut census);
+        }
+        for origin in &self.origins.origins {
+            census.locator(origin.value_flow_key().site());
+        }
+        for evidence in &self.origins.evidence {
+            census.locator(evidence.origin.value_flow_key().site());
+            if let Some((_, carrier)) = &evidence.frontier_source {
+                carrier.retained_artifacts(&mut census);
+            }
+            for closure in &evidence.authored_arm_closures {
+                census.locator(closure.target());
+                census.context(closure.call_context());
+                census.procedure(closure.call().procedure());
+            }
+            for witness in &evidence.witnesses {
+                for step in witness.steps() {
+                    census.procedure(step.source().procedure());
+                    if let Some(target) = step.target() {
+                        census.procedure(target.procedure());
+                    }
+                    if let Some(origin) = step.origin() {
+                        census.procedure(origin.procedure());
+                    }
+                }
+            }
+        }
+        census.finish();
+    }
+
+    pub(crate) fn retained_heap(&self, heap: &mut RetainedHeap) {
+        let witness_bytes = self
+            .origins
+            .evidence
+            .iter()
+            .flat_map(|e| e.witnesses.iter())
+            .map(|w| w.retained_bytes())
+            .sum::<usize>();
+        heap.add(self.owned_heap_bytes().saturating_sub(witness_bytes));
+        for witness in self
+            .origins
+            .evidence
+            .iter()
+            .flat_map(|e| e.witnesses.iter())
+        {
+            heap.arc(witness, |witness, heap| {
+                heap.add(
+                    witness
+                        .retained_bytes()
+                        .saturating_sub(std::mem::size_of::<SummaryWitness>()),
+                )
+            });
+        }
+    }
+
+    pub(super) fn owned_heap_bytes(&self) -> usize {
+        let finding = self;
+
+        finding
+            .key
+            .sink
+            .retained_bytes()
+            .saturating_add(semantic_locator_heap_bytes(&finding.key.entry))
+            .saturating_add(
+                finding
+                    .key
+                    .entry_carrier
+                    .as_ref()
+                    .map_or(0, ValueFlowCarrierKey::retained_bytes),
+            )
+            .saturating_add(semantic_locator_heap_bytes(&finding.key.meeting_site))
+            .saturating_add(finding.classes.retained_heap_bytes())
+            .saturating_add(crate::model_attribution::model_receipt_heap_bytes(
+                &finding.model_receipt,
+            ))
+            .saturating_add(size_of_val(&*finding.origins.origins))
+            .saturating_add(size_of_val(&*finding.origins.evidence))
+            .saturating_add(
+                finding
+                    .origins
+                    .origins
+                    .iter()
+                    .map(|origin| origin.value_flow_key().retained_bytes())
+                    .fold(0usize, usize::saturating_add),
+            )
+            .saturating_add(
+                finding
+                    .origins
+                    .evidence
+                    .iter()
+                    .map(|evidence| {
+                        evidence
+                            .origin
+                            .value_flow_key()
+                            .retained_bytes()
+                            .saturating_add(evidence.classes.retained_heap_bytes())
+                            .saturating_add(evidence.reached_classes.retained_heap_bytes())
+                            .saturating_add(size_of_val(&*evidence.authored_arm_closures))
+                            .saturating_add(
+                                evidence
+                                    .authored_arm_closures
+                                    .iter()
+                                    .map(AuthoredArmClosure::retained_heap_bytes)
+                                    .fold(0usize, usize::saturating_add),
+                            )
+                            .saturating_add(size_of_val(&*evidence.witnesses))
+                            .saturating_add(
+                                evidence
+                                    .witnesses
+                                    .iter()
+                                    .map(|witness| witness.retained_bytes())
+                                    .fold(0usize, usize::saturating_add),
+                            )
+                    })
+                    .fold(0usize, usize::saturating_add),
+            )
+    }
+
     pub fn model_receipt(&self) -> &crate::model_attribution::ModelReceipt {
         &self.model_receipt
     }
@@ -256,6 +412,17 @@ impl TaintFinding {
             receipt,
             crate::model_attribution::SUMMARY_RECEIPT_CAP,
         );
+    }
+
+    /// Preserve the captured meeting's uncertainty separately from its siblings.
+    pub(crate) fn with_meeting_fact(mut self, fact: super::TaintFact) -> Self {
+        assert_eq!(
+            fact.sink(),
+            Some(self.sink),
+            "a finding retains its own meeting"
+        );
+        self.key.meeting_uncertain = fact.is_uncertain();
+        self
     }
 
     pub const fn key(&self) -> &TaintFindingKey {
@@ -342,6 +509,31 @@ impl TaintAttributionBudget {
         self.work
     }
 
+    pub(super) fn witness_grant(
+        &self,
+        limits: WitnessReconstructionLimits,
+    ) -> Option<WitnessReconstructionLimits> {
+        WitnessReconstructionLimits::new(
+            limits
+                .max_steps()
+                .min(self.limits.0.saturating_sub(self.work.steps)),
+            limits
+                .max_expansions()
+                .min(self.limits.1.saturating_sub(self.work.expansions)),
+        )
+        .ok()
+    }
+
+    pub(super) fn charge_witness_walk(&mut self, steps: usize, expansions: usize, exhausted: bool) {
+        self.work.attempts += 1;
+        self.work.steps += steps;
+        self.work.expansions += expansions;
+        self.work.candidate_exhaustions += usize::from(exhausted);
+        assert!(self.work.steps <= self.limits.0 && self.work.expansions <= self.limits.1);
+        self.work.run_exhausted |=
+            self.work.steps == self.limits.0 || self.work.expansions == self.limits.1;
+    }
+
     /// Admit the work of a stored, complete Output unit before the next anchor.
     pub fn replay_fits(&self, work: TaintAttributionWork) -> bool {
         !work.run_exhausted
@@ -390,6 +582,23 @@ impl TaintFindingReport {
         site_report.omitted_findings_lower_bound = self.omitted_findings_lower_bound;
         site_report.attribution = self.attribution;
         site_report
+    }
+
+    pub(super) fn take_findings(&mut self) -> Box<[TaintFinding]> {
+        std::mem::take(&mut self.findings)
+    }
+
+    pub(super) fn with_open_source_coverage(mut self) -> Self {
+        self.collection_truncated = true;
+        self
+    }
+
+    pub(super) fn add_attribution_work(&mut self, work: TaintAttributionWork) {
+        self.attribution.attempts += work.attempts;
+        self.attribution.steps += work.steps;
+        self.attribution.expansions += work.expansions;
+        self.attribution.candidate_exhaustions += work.candidate_exhaustions;
+        self.attribution.run_exhausted |= work.run_exhausted;
     }
 
     pub const fn result(&self) -> &TaintSummaryResult {
@@ -448,79 +657,54 @@ impl TaintFindingReport {
         Arc::ptr_eq(plan.owner(), self.result.owner())
     }
 
+    /// Full input-product children, including semantic owners. The caller pays
+    /// the enclosing report's inline/Arc storage and pins it until census drop.
+    #[doc(hidden)]
+    pub fn retained_inputs_heap(&self, heap: &mut RetainedHeap) {
+        heap.add(
+            self.result
+                .retained_bytes()
+                .saturating_sub(std::mem::size_of::<TaintSummaryResult>())
+                .saturating_sub(self.result.fact_result().fact_storage_retained_bytes()),
+        );
+        heap.arc(self.result.owner(), |_, _| {});
+        self.result.fact_result().retained_facts_heap(heap);
+        heap.owned_slice(self.findings.as_ref());
+        for finding in &self.findings {
+            finding.retained_inputs_heap(heap);
+        }
+        use crate::analyzer::semantic::service::{
+            ArtifactRetentionVisitor, RetainedArtifactWalker,
+        };
+        let mut census = RetainedArtifactWalker::new(heap);
+        for closure in self.result.authored_arm_closures() {
+            census.procedure(closure.call().procedure());
+            for call in closure.call_context().calls() {
+                census.procedure(call.procedure());
+            }
+        }
+        census.finish();
+    }
+
+    pub(crate) fn retained_heap(&self, heap: &mut RetainedHeap) {
+        heap.add(
+            self.result
+                .retained_bytes()
+                .saturating_sub(std::mem::size_of::<TaintSummaryResult>())
+                .saturating_sub(self.result.fact_result().fact_storage_retained_bytes()),
+        );
+        self.result.fact_result().retained_facts_heap(heap);
+        heap.slice(&self.findings);
+        for finding in &self.findings {
+            finding.retained_heap(heap);
+        }
+    }
+
     pub(crate) fn retained_bytes(&self) -> usize {
-        std::mem::size_of::<Self>()
-            .saturating_add(self.result.retained_bytes())
-            .saturating_add(size_of_val(&*self.findings))
-            .saturating_add(
-                self.findings
-                    .iter()
-                    .map(|finding| {
-                        finding
-                            .key
-                            .sink
-                            .retained_bytes()
-                            .saturating_add(semantic_locator_heap_bytes(&finding.key.entry))
-                            .saturating_add(
-                                finding
-                                    .key
-                                    .entry_carrier
-                                    .as_ref()
-                                    .map_or(0, ValueFlowCarrierKey::retained_bytes),
-                            )
-                            .saturating_add(semantic_locator_heap_bytes(&finding.key.meeting_site))
-                            .saturating_add(finding.classes.retained_heap_bytes())
-                            .saturating_add(crate::model_attribution::model_receipt_heap_bytes(
-                                &finding.model_receipt,
-                            ))
-                            .saturating_add(size_of_val(&*finding.origins.origins))
-                            .saturating_add(size_of_val(&*finding.origins.evidence))
-                            .saturating_add(
-                                finding
-                                    .origins
-                                    .origins
-                                    .iter()
-                                    .map(|origin| origin.value_flow_key().retained_bytes())
-                                    .fold(0usize, usize::saturating_add),
-                            )
-                            .saturating_add(
-                                finding
-                                    .origins
-                                    .evidence
-                                    .iter()
-                                    .map(|evidence| {
-                                        evidence
-                                            .origin
-                                            .value_flow_key()
-                                            .retained_bytes()
-                                            .saturating_add(evidence.classes.retained_heap_bytes())
-                                            .saturating_add(
-                                                evidence.reached_classes.retained_heap_bytes(),
-                                            )
-                                            .saturating_add(size_of_val(
-                                                &*evidence.authored_arm_closures,
-                                            ))
-                                            .saturating_add(
-                                                evidence
-                                                    .authored_arm_closures
-                                                    .iter()
-                                                    .map(AuthoredArmClosure::retained_heap_bytes)
-                                                    .fold(0usize, usize::saturating_add),
-                                            )
-                                            .saturating_add(size_of_val(&*evidence.witnesses))
-                                            .saturating_add(
-                                                evidence
-                                                    .witnesses
-                                                    .iter()
-                                                    .map(|witness| witness.retained_bytes())
-                                                    .fold(0usize, usize::saturating_add),
-                                            )
-                                    })
-                                    .fold(0usize, usize::saturating_add),
-                            )
-                    })
-                    .fold(0usize, usize::saturating_add),
-            )
+        let mut heap = RetainedHeap::default();
+        heap.add(std::mem::size_of::<Self>());
+        self.retained_heap(&mut heap);
+        heap.total()
     }
 }
 
@@ -595,7 +779,9 @@ impl CollectionBudget<'_> {
                     .1
                     .saturating_sub(self.attribution.work.expansions),
             );
-        WitnessReconstructionLimits::new(steps, expansions).ok()
+        WitnessReconstructionLimits::new(steps, expansions)
+            .ok()
+            .and_then(|limits| self.attribution.witness_grant(limits))
     }
 
     fn charge_attribution(
@@ -625,16 +811,8 @@ impl CollectionBudget<'_> {
         candidate.attempts += 1;
         candidate.steps += steps;
         candidate.expansions += expansions;
-        self.attribution.work.attempts += 1;
-        self.attribution.work.steps += steps;
-        self.attribution.work.expansions += expansions;
-        debug_assert!(
-            self.attribution.work.steps <= self.attribution.limits.0
-                && self.attribution.work.expansions <= self.attribution.limits.1
-        );
-        self.attribution.work.run_exhausted |= self.attribution.work.steps
-            == self.attribution.limits.0
-            || self.attribution.work.expansions == self.attribution.limits.1;
+        self.attribution
+            .charge_witness_walk(steps, expansions, false);
     }
 
     /// Attribution has already used the transient path. Only retained evidence
@@ -884,23 +1062,29 @@ impl TaintFindingReport {
 
     pub(crate) fn composed(result: TaintSummaryResult, mut findings: Vec<TaintFinding>) -> Self {
         findings.sort_by(|left, right| left.key.cmp(&right.key));
-        let witnesses = findings
+        let (retained_witnesses, retained_witness_steps, retained_witness_bytes) = findings
             .iter()
             .flat_map(|finding| finding.origins.evidence.iter())
             .flat_map(|evidence| evidence.witnesses.iter())
-            .collect::<Vec<_>>();
+            .fold(
+                (0usize, 0usize, 0usize),
+                |(count, steps, bytes), witness| {
+                    (
+                        count + 1,
+                        steps.saturating_add(witness.steps().len()),
+                        bytes.saturating_add(witness.retained_bytes()),
+                    )
+                },
+            );
         Self {
             result,
             collection_truncated: false,
             omitted_findings_lower_bound: 0,
-            retained_witnesses: witnesses.len(),
-            retained_witness_steps: witnesses.iter().map(|witness| witness.steps().len()).sum(),
+            retained_witnesses,
+            retained_witness_steps,
             witness_expansions: 0,
             attribution: TaintAttributionWork::default(),
-            retained_witness_bytes: witnesses
-                .iter()
-                .map(|witness| witness.retained_bytes())
-                .fold(0usize, usize::saturating_add),
+            retained_witness_bytes,
             findings: findings.into_boxed_slice(),
         }
     }
@@ -1110,6 +1294,18 @@ fn collect_taint_findings_internal(
             witness_limits,
             &mut budget,
         )?;
+        // The solver's frontier describes retained transfers. Source/meeting
+        // uncertainty is independent of those native steps and must also be
+        // visible in the observed finding, as in source-qualified replay.
+        let mut path_qualities = PathQualityFrontier::default();
+        let observation_quality = if fact.is_uncertain() {
+            crate::dataflow::PathQuality::UNPROVEN_PARTIAL
+        } else {
+            crate::dataflow::PathQuality::PROVEN_COMPLETE
+        };
+        for quality in point_value.path_qualities().iter() {
+            path_qualities.insert(quality.conjoin(observation_quality));
+        }
         let certain_path = !fact.is_uncertain()
             && result.termination().is_fixed_point()
             && origins.is_complete()
@@ -1124,7 +1320,7 @@ fn collect_taint_findings_internal(
             sink,
             classes,
             entry,
-            path_qualities: point_value.path_qualities(),
+            path_qualities,
             // A derived-complete run has discharged every unproven or partial
             // edge it retained -- an abort-only exceptional return carries no
             // value, and a fully modeled call's continuation is modeled -- so
@@ -1136,10 +1332,9 @@ fn collect_taint_findings_internal(
                 && (result.is_complete()
                     || (result.coverage().unproven_edges().is_empty()
                         && result.coverage().partial_edges().is_empty()))
-                && point_value.path_qualities().has_proven_path()
+                && path_qualities.has_proven_path()
                 || certain_path,
-            complete: (result.is_complete() && point_value.path_qualities().has_complete_path())
-                || certain_path,
+            complete: (result.is_complete() && path_qualities.has_complete_path()) || certain_path,
             origins,
         };
         // Distinct summary entries can reach one sink with identical facts --
@@ -1339,10 +1534,13 @@ fn reconstruct_origins(
     witness_limits: WitnessReconstructionLimits,
     budget: &mut CollectionBudget<'_>,
 ) -> Result<TaintOriginStatus, TaintFindingError> {
-    let sink = result
+    let meeting = result
         .fact_result()
         .fact(point_value.fact())
-        .and_then(|fact| fact.sink())
+        .copied()
+        .ok_or(TaintFindingError::InvalidResult)?;
+    let sink = meeting
+        .sink()
         .and_then(|sink| plan.value_flow().sink(sink))
         .ok_or(TaintFindingError::InvalidResult)?;
     let reached = result
@@ -1400,6 +1598,11 @@ fn reconstruct_origins(
             budget.charge_attribution(&mut candidate, &reconstructed, bounded_limits);
             match reconstructed {
                 Ok(witness) => {
+                    let witness = witness.with_observation_quality(if meeting.is_uncertain() {
+                        crate::dataflow::PathQuality::UNPROVEN_PARTIAL
+                    } else {
+                        crate::dataflow::PathQuality::PROVEN_COMPLETE
+                    });
                     let witness = Arc::new(witness);
                     // Sibling derivations the retention limit dropped are still not
                     // marked truncated: this witness's own steps are complete
@@ -1584,7 +1787,9 @@ fn reconstruct_origins(
                 .find(|source| source.origin() == &origin)
                 .and_then(|source| plan.value_flow().source(source.source()))
                 .expect("reconstructed origin names a live source");
-            let mut certain_path = !witnesses.is_empty();
+            // Native or authored closure validation cannot discharge an
+            // uncertain source/meeting. Keep its dependencies independently.
+            let mut certain_path = !meeting.is_uncertain() && !witnesses.is_empty();
             for witness in &witnesses {
                 for closure in plan
                     .value_flow()

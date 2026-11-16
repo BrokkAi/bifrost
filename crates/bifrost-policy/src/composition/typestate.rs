@@ -155,16 +155,16 @@ fn resolve_subjects(
             let dependency = universe
                 .get(identity)
                 .expect("selected endpoint remains in immutable universe");
-            ResolvedTypestateSubject::new(
+            Ok(ResolvedTypestateSubject::new(
                 identity.clone(),
                 dependency.selector_path.clone(),
-                endpoint_binding_to_typestate(&dependency.model.binding),
+                endpoint_binding_to_typestate(&dependency.model.binding)?,
                 dependency.semantic_hash,
                 dependency.analysis_projection_hash,
                 dependency.origins.clone(),
-            )
+            ))
         })
-        .collect();
+        .collect::<Result<_, CompositionError>>()?;
     Ok(SubjectSelection {
         subjects,
         manifests: used_manifests,
@@ -1007,11 +1007,8 @@ fn invalid_automaton<T>(message: impl Into<String>) -> Result<T, CompositionErro
 }
 
 fn event_selector_path(id: &TypestateEventId) -> Result<PolicySelectorPath, CompositionError> {
-    PolicySelectorPath::new(format!(
-        "/analysis/automaton/events/{}/selector",
-        id.as_str()
-    ))
-    .map_err(|error| CompositionError::LoadedModel(error.to_string()))
+    PolicySelectorPath::new(typestate_event_selector_path(id))
+        .map_err(|error| CompositionError::LoadedModel(error.to_string()))
 }
 
 fn resolve_observed_match_set(
@@ -1109,7 +1106,7 @@ mod tests {
             endpoint(
                 "resource-open",
                 EndpointRole::Source,
-                PolicyEndpointBinding::ReturnValue,
+                PolicyEndpointBinding::ReturnValue { path: None },
                 1,
             ),
             endpoint(

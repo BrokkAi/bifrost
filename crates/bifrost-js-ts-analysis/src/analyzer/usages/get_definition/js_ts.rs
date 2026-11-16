@@ -517,7 +517,8 @@ fn js_ts_alias_preference(unit: &CodeUnit) -> (usize, String) {
     (fq_name.matches('.').count(), fq_name)
 }
 
-/// Exact external callable selected by one direct static named import.
+/// Exact external callable selected by one direct named import: a static
+/// `import { f } from 'm'` or a CommonJS `const { f } = require('m')`.
 ///
 /// Every admitted fact comes from the tree-sitter import binder, lexical
 /// binding index, and call-expression fields. The local callee spelling is not
@@ -546,12 +547,10 @@ pub(crate) fn exact_direct_named_import_call(
     }
 
     let local_name = source.get(callee.byte_range())?;
-    if imports.has_competing_static_imports(local_name) || imports.was_truncated(local_name) {
-        return None;
-    }
-    let mut bindings = imports.direct_bindings_for(local_name);
-    let binding = bindings.next()?;
-    if bindings.next().is_some() || binding.kind != ImportKind::Named {
+    // The one binding in force for the name: a static import, or the CommonJS
+    // destructuring declarator the binder records as a named import.
+    let binding = imports.binding(local_name)?;
+    if binding.kind != ImportKind::Named {
         return None;
     }
     let imported_name = binding.imported_name.as_deref()?;
@@ -565,7 +564,9 @@ pub(crate) fn exact_direct_named_import_call(
     }
     let binding_ranges =
         lexical_bindings.binding_identifier_ranges_at(local_name, callee.start_byte());
-    if binding_ranges.len() != 1 || !jsts_binding_range_belongs_to_import(root, binding_ranges[0]) {
+    if binding_ranges.len() != 1
+        || !jsts_binding_range_belongs_to_import(root, source, binding_ranges[0])
+    {
         return None;
     }
 
@@ -641,7 +642,7 @@ pub(crate) fn exact_modeled_external_call(
     tree: &Tree,
     site: &ResolvedReferenceSite,
 ) -> Option<ExactExternalCallProof> {
-    let overlay = analyzer.semantic_model_overlay()?;
+    let overlay = analyzer.semantic_model_overlay_read().published()?;
     let lexical = JsTsLexicalBindingIndex::build(tree.root_node(), source);
     modeled_external_call_at_site(
         overlay.as_ref(),
@@ -836,7 +837,11 @@ fn callable_declared_return_owner(
         .then_some(owner.clone())
 }
 
-fn jsts_binding_range_belongs_to_import(root: Node<'_>, range: Range) -> bool {
+/// Whether the binder identifier at `range` is declared by an ESM import or by
+/// the destructuring pattern of a direct CommonJS `require` declarator. The
+/// import binder records `const { f } = require('m')` as a named import of
+/// `f` from `m`, so both forms name one module export (#11365).
+fn jsts_binding_range_belongs_to_import(root: Node<'_>, source: &str, range: Range) -> bool {
     let Some(mut node) = smallest_named_node_covering(root, range.start_byte, range.end_byte)
     else {
         return false;
@@ -844,6 +849,16 @@ fn jsts_binding_range_belongs_to_import(root: Node<'_>, range: Range) -> bool {
     loop {
         if node.kind() == "import_statement" {
             return true;
+        }
+        if node.kind() == "variable_declarator" {
+            return node.child_by_field_name("name").is_some_and(|name| {
+                name.kind() == "object_pattern"
+                    && name.start_byte() <= range.start_byte
+                    && range.end_byte <= name.end_byte()
+            }) && brokk_bifrost_js_ts::imports::commonjs_require_module_specifier_from_declarator(
+                node, source,
+            )
+            .is_some();
         }
         if node.id() == root.id() {
             return false;
@@ -1061,7 +1076,7 @@ pub(crate) fn resolve_js_ts(
         return jsts_local_dotted_outcome(analyzer, reference, members);
     }
 
-    if let Some(overlay) = analyzer.semantic_model_overlay()
+    if let Some(overlay) = analyzer.semantic_model_overlay_read().published()
         && let Some(modeled) = modeled_external_call_at_site(
             overlay.as_ref(),
             language,
@@ -1608,11 +1623,16 @@ pub(crate) fn resolve_js_ts(
             if !exact_global.is_empty() {
                 return js_ts_candidates_outcome(analyzer, exact_global);
             }
-            if let Some(target) = analyzer.semantic_model_overlay().and_then(|model| {
-                model
-                    .typescript_global_member_target(qualifier, name)
-                    .map(|symbol| symbol.id.clone())
-            }) {
+            if let Some(target) =
+                analyzer
+                    .semantic_model_overlay_read()
+                    .published()
+                    .and_then(|model| {
+                        model
+                            .typescript_global_member_target(qualifier, name)
+                            .map(|symbol| symbol.id.clone())
+                    })
+            {
                 if !support.file_identifier(file, qualifier).is_empty() {
                     return no_definition(
                         "workspace_internal",
@@ -1991,7 +2011,8 @@ fn merge_js_ts_binding_outcomes(
                 stopped = Some(DefinitionLookupStatus::ExceededBudget(limit))
             }
             DefinitionLookupStatus::UnresolvableImportBoundary => crossed_external_boundary = true,
-            DefinitionLookupStatus::NoDefinition
+            DefinitionLookupStatus::NotAReference
+            | DefinitionLookupStatus::NoDefinition
             | DefinitionLookupStatus::UnsupportedLanguage
             | DefinitionLookupStatus::InvalidLocation
             | DefinitionLookupStatus::NotFound => unresolved_import = true,
@@ -3947,7 +3968,7 @@ fn ts_synthetic_member_is_supported_by_receiver_initializer(
     receiver: &CodeUnit,
     member: &str,
 ) -> bool {
-    let Ok(source) = receiver.source().read_to_string() else {
+    let Some(source) = analyzer.indexed_source(receiver.source()) else {
         return false;
     };
     let Some(tree) = parse_js_ts_tree(receiver.source(), &source, Language::TypeScript) else {
@@ -4103,7 +4124,7 @@ fn ts_function_preserves_parameter_shape(
     callee: &CodeUnit,
     parameter_index: usize,
 ) -> bool {
-    let Ok(source) = callee.source().read_to_string() else {
+    let Some(source) = analyzer.indexed_source(callee.source()) else {
         return false;
     };
     let Some(tree) = parse_js_ts_tree(callee.source(), &source, Language::TypeScript) else {

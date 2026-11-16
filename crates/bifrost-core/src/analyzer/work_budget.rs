@@ -3,6 +3,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use super::reuse_verdict::{CarriesReuseVerdict, ExecutionCause, ReuseVerdict};
+
 /// One fixed set of independently measured work dimensions.
 pub trait BudgetWork: Copy {
     type Dimension: Copy + 'static;
@@ -18,15 +20,17 @@ pub trait ZeroBudgetWork: BudgetWork {
     const ZERO: Self;
 }
 
-/// Exact failed charge reported by the shared ledger.
+/// The exact charge a ledger's limits do not admit. Finding one records
+/// nothing: [`BudgetLedger::check_without_recording`] returns it as a probe,
+/// and [`BudgetLedger::check`] records it as a refusal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct WorkBudgetExceeded<Dimension> {
+pub struct WorkBudgetShortfall<Dimension> {
     dimension: Dimension,
     limit: usize,
     attempted: usize,
 }
 
-impl<Dimension: Copy> WorkBudgetExceeded<Dimension> {
+impl<Dimension: Copy> WorkBudgetShortfall<Dimension> {
     pub const fn dimension(self) -> Dimension {
         self.dimension
     }
@@ -37,6 +41,43 @@ impl<Dimension: Copy> WorkBudgetExceeded<Dimension> {
 
     pub const fn attempted(self) -> usize {
         self.attempted
+    }
+}
+
+/// A charge the shared ledger refused, with the proof that it recorded the
+/// refusal. Its verdict is `BudgetRefusal`; the caller joins it into the
+/// answer the refusal shaped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WorkBudgetExceeded<Dimension> {
+    shortfall: WorkBudgetShortfall<Dimension>,
+    refused: BudgetRefused,
+}
+
+impl<Dimension: Copy> WorkBudgetExceeded<Dimension> {
+    pub const fn shortfall(self) -> WorkBudgetShortfall<Dimension> {
+        self.shortfall
+    }
+
+    pub const fn refused(self) -> BudgetRefused {
+        self.refused
+    }
+
+    pub const fn dimension(self) -> Dimension {
+        self.shortfall.dimension
+    }
+
+    pub const fn limit(self) -> usize {
+        self.shortfall.limit
+    }
+
+    pub const fn attempted(self) -> usize {
+        self.shortfall.attempted
+    }
+}
+
+impl<Dimension> CarriesReuseVerdict for WorkBudgetExceeded<Dimension> {
+    fn reuse_verdict(&self) -> ReuseVerdict {
+        self.refused.reuse_verdict()
     }
 }
 
@@ -140,8 +181,27 @@ impl<Work> BudgetLedger<Work> {
         }
     }
 
+    /// Record a refused charge and return its proof, whose verdict the caller
+    /// joins into the answer the refusal shaped. The ambient mark stays until
+    /// every caller carries the verdict.
     #[track_caller]
-    pub fn record_refusal(&self) {
+    pub fn refuse(&self) -> BudgetRefused {
+        let refused = BudgetRefused::record::<Work>();
+        self.refusals.fetch_add(1, Ordering::Relaxed);
+        refused
+    }
+}
+
+/// A recorded refusal whose verdict the budget owner joins into its result.
+/// Owners with typed refusal state record that state themselves; this proof
+/// records the common ambient mark without maintaining a second counter.
+#[must_use = "a budget refusal makes the answer it shaped execution dependent"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BudgetRefused(());
+
+impl BudgetRefused {
+    #[track_caller]
+    pub fn record<Work>() -> Self {
         super::carried_context::mark_budget_refusal();
         let origin = std::panic::Location::caller();
         crate::profiling::note_with(|| {
@@ -152,7 +212,13 @@ impl<Work> BudgetLedger<Work> {
                 std::any::type_name::<Work>()
             )
         });
-        self.refusals.fetch_add(1, Ordering::Relaxed);
+        Self(())
+    }
+}
+
+impl CarriesReuseVerdict for BudgetRefused {
+    fn reuse_verdict(&self) -> ReuseVerdict {
+        ReuseVerdict::ExecutionDependent(ExecutionCause::BudgetRefusal)
     }
 }
 
@@ -180,25 +246,28 @@ where
 
     pub fn check(&self, work: Work) -> Result<(), WorkBudgetExceeded<Work::Dimension>> {
         self.check_without_recording(work)
-            .inspect_err(|_| self.record_refusal())
+            .map_err(|shortfall| WorkBudgetExceeded {
+                shortfall,
+                refused: self.refuse(),
+            })
     }
 
     /// Check a prospective charge without recording a refusal on this ledger.
     pub fn check_without_recording(
         &self,
         work: Work,
-    ) -> Result<(), WorkBudgetExceeded<Work::Dimension>> {
+    ) -> Result<(), WorkBudgetShortfall<Work::Dimension>> {
         for &dimension in Work::DIMENSIONS {
             let limit = self.limits.get(dimension);
             let Some(attempted) = self.used.get(dimension).checked_add(work.get(dimension)) else {
-                return Err(WorkBudgetExceeded {
+                return Err(WorkBudgetShortfall {
                     dimension,
                     limit,
                     attempted: usize::MAX,
                 });
             };
             if attempted > limit {
-                return Err(WorkBudgetExceeded {
+                return Err(WorkBudgetShortfall {
                     dimension,
                     limit,
                     attempted,
@@ -209,7 +278,19 @@ where
     }
 
     pub fn charge(&mut self, work: Work) -> Result<(), WorkBudgetExceeded<Work::Dimension>> {
-        self.check(work)?;
+        self.charge_without_recording(work)
+            .map_err(|shortfall| WorkBudgetExceeded {
+                shortfall,
+                refused: self.refuse(),
+            })
+    }
+
+    /// Admit one charge while leaving refusal recording to its typed owner.
+    pub fn charge_without_recording(
+        &mut self,
+        work: Work,
+    ) -> Result<(), WorkBudgetShortfall<Work::Dimension>> {
+        self.check_without_recording(work)?;
         self.used = self
             .used
             .checked_add(work)
@@ -420,7 +501,7 @@ mod work_budget_properties {
         limits: Work,
         used: Work,
         work: Work,
-    ) -> Option<WorkBudgetExceeded<Dimension>> {
+    ) -> Option<WorkBudgetShortfall<Dimension>> {
         [
             (Dimension::Rows, limits.rows, used.rows, work.rows),
             (Dimension::Bytes, limits.bytes, used.bytes, work.bytes),
@@ -430,7 +511,7 @@ mod work_budget_properties {
         .find_map(|(dimension, limit, used, work)| {
             let sum = used.checked_add(work);
             let attempted = sum.unwrap_or(usize::MAX);
-            (sum.is_none() || attempted > limit).then_some(WorkBudgetExceeded {
+            (sum.is_none() || attempted > limit).then_some(WorkBudgetShortfall {
                 dimension,
                 limit,
                 attempted,
@@ -447,15 +528,19 @@ mod work_budget_properties {
         ) {
             let expected = expected_exceeded(limits, used, work);
             let ledger = BudgetLedger::new(limits, used);
-            prop_assert_eq!(ledger.check(work).err(), expected);
+            prop_assert_eq!(ledger.check_without_recording(work).err(), expected);
+            prop_assert_eq!(ledger.check(work).err().map(WorkBudgetExceeded::shortfall), expected);
 
             let mut charged = ledger.clone();
             let staged = ledger.staged_charge(work);
             match expected {
                 Some(exceeded) => {
-                    prop_assert_eq!(charged.charge(work), Err(exceeded));
+                    prop_assert_eq!(
+                        charged.charge(work).map_err(WorkBudgetExceeded::shortfall),
+                        Err(exceeded)
+                    );
                     prop_assert_eq!(charged.used(), used);
-                    prop_assert_eq!(staged, Err(exceeded));
+                    prop_assert_eq!(staged.map_err(WorkBudgetExceeded::shortfall), Err(exceeded));
                 }
                 None => {
                     prop_assert_eq!(charged.charge(work), Ok(()));
@@ -518,6 +603,17 @@ impl NodeBudget {
     }
 }
 
+/// A refusal observed by [`LimitedCounter::try_allow`]. A fixed limit is an
+/// execution input, not a budget charge, so its cause is `Other`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LimitRefused(());
+
+impl CarriesReuseVerdict for LimitRefused {
+    fn reuse_verdict(&self) -> ReuseVerdict {
+        ReuseVerdict::ExecutionDependent(ExecutionCause::Other)
+    }
+}
+
 /// A query-local scalar allowance. Refusal is an execution input even when
 /// the caller catches it and returns a useful fallback.
 #[derive(Debug, Clone, Copy)]
@@ -531,25 +627,40 @@ impl LimitedCounter {
         Self { used, limit }
     }
 
+    /// [`Self::try_allow`] for a caller that does not yet carry the verdict.
     #[track_caller]
     pub fn allows(&self, additional: usize) -> bool {
+        self.try_allow(additional).is_ok()
+    }
+
+    /// Whether `additional` more units fit. A refusal is returned as a value
+    /// whose verdict the caller joins into the answer it shaped; the ambient
+    /// mark stays until every caller carries the verdict.
+    #[track_caller]
+    pub fn try_allow(&self, additional: usize) -> Result<(), LimitRefused> {
         let fits = self
             .used
             .checked_add(additional)
             .is_some_and(|used| used <= self.limit);
-        if !fits {
+        if fits {
+            Ok(())
+        } else {
             super::carried_context::mark_observed("limit");
+            Err(LimitRefused(()))
         }
-        fits
+    }
+
+    /// [`Self::try_charge`] for a caller that does not yet carry the verdict.
+    #[track_caller]
+    pub fn charge(&mut self, additional: usize) -> bool {
+        self.try_charge(additional).is_ok()
     }
 
     #[track_caller]
-    pub fn charge(&mut self, additional: usize) -> bool {
-        if !self.allows(additional) {
-            return false;
-        }
+    pub fn try_charge(&mut self, additional: usize) -> Result<(), LimitRefused> {
+        self.try_allow(additional)?;
         self.used += additional;
-        true
+        Ok(())
     }
 
     pub fn used(&self) -> usize {

@@ -295,6 +295,7 @@ typed_fact_relations! {
     GenericFormalOwner = 38,
     GenericFormalDefaultOwner = 39,
     TypeProductionOutput = 40,
+
     /// Enumerates candidate blobs embedding this terminal type name. Every
     /// embedded name has a row when parsing is complete; consumers confirm
     /// ownership from the candidate blob's own rows.
@@ -309,6 +310,7 @@ typed_fact_relations! {
     SupertypeNameLookup = 43,
     /// Candidate blobs declaring an alias with this spelled target terminal.
     AliasTargetLookup = 44,
+    BinaryOperationOutput = 45,
 }
 
 impl TypedFactRelation {
@@ -348,6 +350,7 @@ macro_rules! resolution_bundle_families {
             declaration_access_boundaries => ("declaration_access_boundaries", "resolution_declaration_access_boundaries", "expected_declaration_access_boundary_count", "definition_semantic_key, boundary_kind, package_region, template_semantic_key", 4, 1),
             member_scope_properties => ("member_scope_properties", "resolution_member_scope_properties", "expected_member_scope_property_count", "definition_semantic_key, scope_head_node_key, scope_kind", 3, 2),
             member_owner_properties => ("member_owner_properties", "resolution_member_owner_properties", "expected_member_owner_property_count", "definition_semantic_key, owner_definition_semantic_key, owner_scope_head_node_key, member_name, member_kind, member_access, qualifier_compatibility", 7, 7),
+            structural_trait_impls => ("structural_trait_impls", "resolution_rust_structural_trait_impls", "expected_structural_trait_impl_count", "relation_key, trait_terminal_spelling, impl_site, impl_start_byte, impl_end_byte", 5, 1),
             trait_implementations => ("trait_implementations", "resolution_trait_implementations", "expected_trait_implementation_count", "relation_key, side, position, segment, terminal_spelling, impl_site, impl_start_byte, impl_end_byte", 8, 3),
             inherent_implementations => ("inherent_implementations", "resolution_inherent_implementations", "expected_inherent_implementation_count", "relation_key, position, segment, terminal_spelling, impl_site, impl_start_byte, impl_end_byte, impl_declaration_id", 8, 2),
             typed_fact_lookups => ("typed_fact_lookups", "resolution_typed_fact_lookups", "expected_typed_fact_lookup_count", "relation, identity_id", 2, 2),
@@ -365,6 +368,7 @@ macro_rules! resolution_bundle_families {
             package_routes => ("package_routes", "resolution_package_routes", "expected_package_route_count", "package_scope_node_key, declaration_site, placement_gap_site", 3, 1),
             package_route_segments => ("package_route_segments", "resolution_package_route_segments", "expected_package_route_segment_count", "package_scope_node_key, ordinal, spelling", 3, 2),
             singleton_relations => ("singleton_relations", "resolution_singleton_relations", "expected_singleton_relation_count", "declaration_site, enclosing_type_site, kind", 3, 1),
+            csharp_friend_attributes => ("csharp_friend_attributes", "resolution_csharp_friend_attributes", "expected_csharp_friend_attribute_count", "site, scope, name_segments, identity_state, argument, parse_state, friend_name, has_public_key", 8, 1),
             extern_aliases => ("extern_aliases", "resolution_extern_aliases", "expected_extern_alias_count", "site, scope, name", 3, 1),
             compilation_imports => ("compilation_imports", "resolution_compilation_imports", "expected_compilation_import_count", "import_site", 1, 1),
             reference_package_contexts => ("reference_package_contexts", "resolution_reference_package_contexts", "expected_reference_package_context_count", "reference_site, prefixes", 2, 1),
@@ -467,6 +471,8 @@ resolution_bundle_families!(define_manifest_counts);
 pub(crate) fn resolution_family_applies(language: Language, family: &str) -> bool {
     match family {
         "reference_package_contexts" => language == Language::Scala,
+        "binary_operations" | "structural_trait_impls" => language == Language::Rust,
+        "csharp_friend_attributes" => language == Language::CSharp,
         // #9546: only the JVM producers claim member-type coverage, so other
         // languages keep their earlier bundle and count encodings.
         "member_type_coverage" => matches!(
@@ -479,6 +485,11 @@ pub(crate) fn resolution_family_applies(language: Language, family: &str) -> boo
 }
 
 pub(crate) fn resolution_count_applies(language: Language, index: usize) -> bool {
+    // Another language must rotate its own bundle token before admitting
+    // binary operations; omit its empty column from existing count identities.
+    if RESOLUTION_MANIFEST_COUNT_COLUMNS[index] == "expected_binary_operation_count" {
+        return resolution_family_applies(language, "binary_operations");
+    }
     if index == RESOLUTION_MANIFEST_COUNT_COLUMNS.len() - 1 {
         return language == Language::Java;
     }
@@ -779,6 +790,7 @@ pub const PERSISTED_RESOLUTION_TABLES: &[&str] = &[
     "resolution_root_route_segments",
     "resolution_root_imports",
     "resolution_extern_aliases",
+    "resolution_csharp_friend_attributes",
     "resolution_compilation_imports",
     "resolution_root_import_segments",
     "resolution_root_import_demands",
@@ -794,10 +806,15 @@ pub const PERSISTED_RESOLUTION_TABLES: &[&str] = &[
     "resolution_singleton_relations",
     "resolution_supertypes",
     "resolution_trait_implementations",
+    "resolution_rust_structural_trait_impls",
     "resolution_inherent_implementations",
     "resolution_type_arguments",
     "resolution_type_components",
     "resolution_type_productions",
+    "resolution_binary_operations",
+    "resolution_macro_type_candidates",
+    "resolution_macro_type_elements",
+    "resolution_macro_type_segments",
     "resolution_type_frontiers",
     "resolution_type_transfers",
     "resolution_declared_type_arguments",
@@ -806,12 +823,14 @@ pub const PERSISTED_RESOLUTION_TABLES: &[&str] = &[
     // The per-unit summary (derivation contract, kind 2): written by the
     // language reconcile after the bundles, read by keyed lookups.
     "resolution_unit_summaries",
+    "resolution_unit_summary_consumed_units",
     "resolution_unit_summary_containers",
     "resolution_unit_summary_dependencies",
     "resolution_unit_summary_dependency_names",
     "resolution_unit_summary_exports",
     "resolution_unit_summary_gaps",
     "resolution_unit_summary_imports",
+    "resolution_unit_summary_input_files",
     "resolution_unit_summary_members",
     "resolution_unit_summary_placements",
     "resolution_unit_summary_reads",
@@ -892,6 +911,29 @@ pub const MEMBER_TYPE_COVERAGE_HISTORY: &[MemberTypeCoverageHistoryEntry] = &[
         census_digest: "0e40f56ce6d48fbd37976fdf944f0f054bb85fb9016e6608bee10f81de6cd76c",
         golden_digest: "506545827e2ddccb2e81261a36646c6e4adf72e2c27e47eea31267e11b29388b",
     },
+    // #12120 changes annotated-type lowering only; member-type coverage is unchanged.
+    MemberTypeCoverageHistoryEntry {
+        language: Language::Java,
+        bundle_epoch: "resolution-bundle-java-v68-annotated-types-12120-compact-identity-digests-9628-member-type-coverage-9546-reference-execution-context-8870-v63-root-prefix-sites-9002-v61-lexical-head-blockers-9002-v60-fqn-expression-roots-7804-v58-implicit-roots-reland-7027-8387-ranked-synthetic-names-revert-8261-producer-rules-port-6291-2026-10-23-ranked-import-destination-gaps-5969-complete-provider-inventory-absence-above-v49-classified-route-gaps-5658-root-import-publication-suppressed-anonymous-allocation-identity-5701-2026-10",
+        census_digest: "7a60699d0fda92431adc4ab34d454fb70efffd6fc7a941126e356a85a2dcbb08",
+        golden_digest: "d82c9620cb3de5ee8981574a8418f8ce14a481b4d3888409857439443e793617",
+    },
+    // #7860 publishes generic creation prefix absences only; member-type coverage is unchanged.
+    MemberTypeCoverageHistoryEntry {
+        language: Language::Java,
+        bundle_epoch: "resolution-bundle-java-v69-generic-creation-prefix-absences-7860-annotated-types-12120-compact-identity-digests-9628-member-type-coverage-9546-reference-execution-context-8870-v63-root-prefix-sites-9002-v61-lexical-head-blockers-9002-v60-fqn-expression-roots-7804-v58-implicit-roots-reland-7027-8387-ranked-synthetic-names-revert-8261-producer-rules-port-6291-2026-10-23-ranked-import-destination-gaps-5969-complete-provider-inventory-absence-above-v49-classified-route-gaps-5658-root-import-publication-suppressed-anonymous-allocation-identity-5701-2026-10",
+        census_digest: "7a60699d0fda92431adc4ab34d454fb70efffd6fc7a941126e356a85a2dcbb08",
+        golden_digest: "d82c9620cb3de5ee8981574a8418f8ce14a481b4d3888409857439443e793617",
+    },
+    // #7746 adds pattern binder intervals and #12948 adds type-parameter
+    // declaration bridges. This merged v73 keeps both changes; member-type
+    // coverage is unchanged.
+    MemberTypeCoverageHistoryEntry {
+        language: Language::Java,
+        bundle_epoch: "resolution-bundle-java-v73-instanceof-pattern-binders-7746-type-parameter-names-12948-generic-creation-prefix-absences-7860-annotated-types-12120-compact-identity-digests-9628-member-type-coverage-9546-reference-execution-context-8870-v63-root-prefix-sites-9002-v61-lexical-head-blockers-9002-v60-fqn-expression-roots-7804-v58-implicit-roots-reland-7027-8387-ranked-synthetic-names-revert-8261-producer-rules-port-6291-2026-10-23-ranked-import-destination-gaps-5969-complete-provider-inventory-absence-above-v49-classified-route-gaps-5658-root-import-publication-suppressed-anonymous-allocation-identity-5701-2026-10",
+        census_digest: "7a60699d0fda92431adc4ab34d454fb70efffd6fc7a941126e356a85a2dcbb08",
+        golden_digest: "d82c9620cb3de5ee8981574a8418f8ce14a481b4d3888409857439443e793617",
+    },
 ];
 
 /// Whether the resolution producer publishes complete positioned reference
@@ -904,29 +946,27 @@ pub const fn reference_execution_context_capability(language: Language) -> bool 
 /// One sole producer-identity bump point for the complete persisted bundle.
 /// Changes to shared lowering invalidate every language, including producers
 /// whose source facts are unchanged.
-// v42 retires v41 and pre-hold trial rows. The trial identity is this
-// plain literal plus "-trial" (#7314).
-macro_rules! csharp_bundle_epoch {
-    // #7314 M6a1: v51 publishes declared type slots and global predefined aliases (plain and trial).
-    // #7314 AD3d: v44, because per-file parse variants follow the ordered membership.
-    // #9402: v50, because indexers are declared as their `Item` members.
-    // #7314 M10a0 part 2: v51 adds named-open symbol compilation identity.
-    // #9402: indexers are declared as their `Item` members.
-    // #8430 step 2: v53, because extern alias facts change C# resolution answers.
-    // #10342: v54, because global using enumeration evidence changes C# resolution bundles.
-    // #7314 M6a1: v56 publishes declared type slots and global predefined aliases (plain and trial).
-    // Promotion merge of master v56 (#7314 M6a1) with this batch's v55 (M10a0): max + 1 is v57.
-    // #7314 M10a0 per-framework symbols: v60; v58/v59 are held by sibling lanes.
-    () => { "resolution-bundle-csharp-v60-10342-global-using-enumeration-evidence-indexer-item-declarations-9402-extern-alias-facts-8430-derived-sdk-default-compile-10356-msbuild-condition-short-circuit-7314-ad3d-r5-csharp-grammar-0-23-9-8430-10357-file-program-evidence-ordered-msbuild-properties-7314-ad3d-compact-identity-digests-9628-multi-target-razor-paths-8845-target-property-scope-8831-nuget-build-asset-folders-8830-get-path-of-file-above-7314-ad3b-unseen-branches-8147-m4c-parent-relative-open-items-8632-parse-variants-8147-m4b-per-file-membership-7314-c1-4e-ad2-qualified-heads-7314-c1-4d1-preprocessor-decisions-8147-m4a-bare-lexical-roots-7314-c1-4b2p-2026-10-7314-frozen-native-trial-separation-7314-m6a1-csharp-declared-types-global-predefined-aliases-7314-m10a0-named-open-symbols" };
+///
+/// The C# bundle epoch is a lever file like the other converted languages
+/// (`levers/resolution-bundle-csharp.tokens`); its trial form appends `-trial`
+/// to the same identity (#7314).
+fn csharp_bundle_epoch() -> &'static str {
+    brokk_bifrost_core::lever_label!(
+        "resolution-bundle-csharp",
+        "resolution-bundle-csharp.tokens"
+    )
 }
 
 #[doc(hidden)]
-pub const fn csharp_trial_bundle_epoch() -> &'static str {
-    concat!(csharp_bundle_epoch!(), "-trial")
+pub fn csharp_trial_bundle_epoch() -> &'static str {
+    static TRIAL: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(|| format!("{}-trial", csharp_bundle_epoch()));
+    &TRIAL
 }
 
 #[doc(hidden)]
-pub const fn resolution_bundle_epoch(language: Language) -> &'static str {
+pub fn resolution_bundle_epoch(language: Language) -> &'static str {
+    use brokk_bifrost_core::lever_label;
     match language {
         // #9628: every language moved one version together. Bundle and
         // fragment-local identity digests use a compact encoding, so stored
@@ -954,64 +994,34 @@ pub const fn resolution_bundle_epoch(language: Language) -> &'static str {
         // Member-type coverage changes append to MEMBER_TYPE_COVERAGE_HISTORY.
         // v65: #9002's v63 and #8870's v64 merged; the literal keeps both tokens.
         // v66: master's #9546 v65 and #9002's v65 merged; the literal keeps both tokens.
+        // v68 (#12120): annotated types lower to their named element, so older
+        // same-OID interiors retain gap slots and must be relowered.
+        // v69 (#7860): a creation whose type is a generic_type publishes the
+        // prefix absence of its base type, so older interiors lack that row.
+        // v71 (#12948, above Ready #12919's v70): a type parameter's native
+        // declaration bridge names the parameter's named declaration, so
+        // older interiors point at a second, nameless declaration.
+        // v72 (#7746): Java pattern binders publish disjoint activation regions.
+        // v73: master's #12948 v71 and the batch's v72 merged; keep both tokens.
         Language::Java => {
-            "resolution-bundle-java-v67-compact-identity-digests-9628-member-type-coverage-9546-reference-execution-context-8870-v63-root-prefix-sites-9002-v61-lexical-head-blockers-9002-v60-fqn-expression-roots-7804-v58-implicit-roots-reland-7027-8387-ranked-synthetic-names-revert-8261-producer-rules-port-6291-2026-10-23-ranked-import-destination-gaps-5969-complete-provider-inventory-absence-above-v49-classified-route-gaps-5658-root-import-publication-suppressed-anonymous-allocation-identity-5701-2026-10"
+            "resolution-bundle-java-v73-instanceof-pattern-binders-7746-type-parameter-names-12948-generic-creation-prefix-absences-7860-annotated-types-12120-compact-identity-digests-9628-member-type-coverage-9546-reference-execution-context-8870-v63-root-prefix-sites-9002-v61-lexical-head-blockers-9002-v60-fqn-expression-roots-7804-v58-implicit-roots-reland-7027-8387-ranked-synthetic-names-revert-8261-producer-rules-port-6291-2026-10-23-ranked-import-destination-gaps-5969-complete-provider-inventory-absence-above-v49-classified-route-gaps-5658-root-import-publication-suppressed-anonymous-allocation-identity-5701-2026-10"
         }
-        // v71: v70 (#7509) and v70 (#7391) landed together.
-        // v70 (#7509): persist SpreadArgument type frontiers (role ordinal 8).
-        // v70 (#7391): publish type assertion results.
-        // v69 (#7509): publish embedding and interface method candidate names.
-        // v68 (#7509): an initialized type-switch clause binder no longer
-        // carries an InferredType gap row.
-        // #8387: regenerate bundles containing ranked synthetic identities.
-        // v74 (#8762): publish anonymous interface Identity slots for alias method-owner projection.
-        // v73 (#7509): publish alias target terminal lookup rows.
-        // v75 (#7509): sole-spec alias definition bridges use the parser-owned declaration.
-        // v76 (#7509): directional channel component constructors replace legacy code 2.
-        Language::Go => {
-            "resolution-bundle-go-v77-compact-identity-digests-9628-8762-anonymous-interface-identity-slot-7509-alias-target-lookup-8387-ranked-synthetic-names-type-assertion-results-7391-classified-route-gaps-5658-root-import-publication-receiver-applicability-binding-result-separation-index-slice-component-projections-stable-transfer-codes-qualified-call-conversions-2026-10-7509-clause-guard-initializer-gap-7509-sole-alias-owner-7509-channel-direction"
-        }
-        // #8387: regenerate bundles containing ranked synthetic identities.
-        Language::Cpp => {
-            "resolution-bundle-cpp-v28-compact-identity-digests-9628-8387-ranked-synthetic-names-opaque-guard-implication-6902-2026-10"
-        }
-        Language::JavaScript => {
-            "resolution-bundle-javascript-v25-compact-identity-digests-9628-positioned-expression-gaps-5375-local-write-joins-5015-2026-10"
-        }
-        Language::TypeScript => {
-            "resolution-bundle-typescript-v25-compact-identity-digests-9628-positioned-expression-gaps-5375-local-write-joins-5015-2026-10"
-        }
-        Language::Python => {
-            "resolution-bundle-python-v26-compact-identity-digests-9628-native-production-switch-5658-positioned-expression-gaps-5375-local-write-joins-5015-2026-10-5658-annotation-application-heads-5658-callee-callable-result-only"
-        }
-        // Definitionless item macros preserve existing bindings and keep
-        // argument uncertainty on guessed reference sites. Only unenumerable input
-        // groups open reverse inventory (#5517).
-        // v122: a reference-typed generic default lowers as a TypeAlias transfer
-        // (#6950), and replayed trait methods take their trait's Self frontier
-        // (#6949).
-        // v123: attributed items bind item fragments in macro replay, and derive
-        // paths publish Macro-namespace reference sites (#6912).
-        // v124: wrapper projection is a selected ConditionalPayload transfer
-        // decided by resolved identity, not producer spelling (#6844).
-        // v125: typed self does not publish a Value receiver form (#9203).
-        // v127: master's v126 and #9628's compact identity digests merged.
-        // #10774+#10830: retire stored Rust resolution output with old manifest-gap completion.
-        // #10953: retire stored Rust resolution output resolved against crate routes
-        // without target-specific dependencies and destination library names.
-        // #10987: retire per-file products resolved against workspace-wide symlink omissions.
-        // v130 must remain above master at the final merge.
-        Language::Rust => {
-            // c2 changes route answers: retire stored per-file Rust resolution output
-            // computed under the whole route index (#10774 closure rule).
-            // Merge of master's v130-9737-route-completeness and this branch's v130-10987-scoped-symlink-omissions: max of both sides + 1 gives v131 with both tokens.
-            // #11060: a declared module without a source blob keeps its topology partial, so stored Rust resolution output computed against a broad-complete topology is retired; above master v131: v132.
-            // #11111: certified-absent modules preserve broad completeness; retire v132 answers.
-            "resolution-bundle-rust-v133-11111-certified-absent-module-topology-11060-unplaced-module-topology-9737-route-completeness-10987-scoped-symlink-omissions-10953-target-dependencies-and-lib-names-10774-manifests-only-cargo-toml-compact-identity-digests-9628-duplicate-export-uncertainty-replay-call-roles-6861-inherent-impl-subjects-6394-cfg-import-precedence-6242-classified-route-gaps-5658-root-import-publication-cfg-if-conditional-macro-frontiers-5172-unique-macro-reference-gaps-5133-local-write-joins-5015-2026-10-generic-default-reference-6950-cfg-if-self-frontier-6949-macro-item-attributes-derive-sites-6912-wrapper-identity-conditional-payload-6844"
-        }
-        Language::Php => {
-            "resolution-bundle-php-v25-compact-identity-digests-9628-positioned-expression-gaps-5375-local-write-joins-5015-2026-10"
-        }
+        Language::Go => lever_label!("resolution-bundle-go", "resolution-bundle-go.tokens"),
+        Language::Cpp => lever_label!("resolution-bundle-cpp", "resolution-bundle-cpp.tokens"),
+        Language::JavaScript => lever_label!(
+            "resolution-bundle-javascript",
+            "resolution-bundle-javascript.tokens"
+        ),
+        Language::TypeScript => lever_label!(
+            "resolution-bundle-typescript",
+            "resolution-bundle-typescript.tokens"
+        ),
+        Language::Python => lever_label!(
+            "resolution-bundle-python",
+            "resolution-bundle-python.tokens"
+        ),
+        Language::Rust => lever_label!("resolution-bundle-rust", "resolution-bundle-rust.tokens"),
+        Language::Php => lever_label!("resolution-bundle-php", "resolution-bundle-php.tokens"),
         // Self-type edges and aliases extend Scala's explicit-instantiation
         // bundle; case-class and enum companions publish binders and singleton
         // relations, and enum cases are companion members. Constructors use
@@ -1056,12 +1066,8 @@ pub const fn resolution_bundle_epoch(language: Language) -> &'static str {
         Language::Scala => {
             "resolution-bundle-scala-v105-parameter-clause-activation-10445-compact-identity-digests-9628-member-type-coverage-9546-root-prefix-sites-9002-lexical-head-blockers-9002-v99-reference-package-contexts-9195-bare-term-bindings-6792-package-alias-demand-9195-v92-implicit-roots-reland-7027-imports-bind-enclosing-scope-8279-8387-ranked-synthetic-names-revert-8261-incomplete-function-type-8200-parent-paths-enclosing-scope-5104-producer-rules-port-6291-2026-10-23-complete-provider-inventory-and-lexical-companion-jvm-aliases-5177-classified-route-gaps-5658-scala-as-instance-of-types-7577-2026-10"
         }
-        Language::CSharp => {
-            csharp_bundle_epoch!()
-        }
-        Language::Ruby => {
-            "resolution-bundle-ruby-v25-compact-identity-digests-9628-positioned-expression-gaps-5375-local-write-joins-5015-2026-10"
-        }
+        Language::CSharp => csharp_bundle_epoch(),
+        Language::Ruby => lever_label!("resolution-bundle-ruby", "resolution-bundle-ruby.tokens"),
         // #8387: regenerate bundles containing ranked synthetic identities.
         // #9546 M2a v71: Kotlin bundles publish member-type coverage claims for
         // source type owners; older same-OID interiors carry no claim rows.
@@ -1175,6 +1181,11 @@ impl PreparedResolutionBundle {
                 return None;
             }
         }
+        assert!(
+            semantic_language == Language::Rust || typed_fact_rows.binary_operations.is_empty(),
+            "{semantic_language:?} must rotate its resolution-bundle token before emitting binary operations: {:?}",
+            typed_fact_rows.binary_operations
+        );
         assert!(semantic_language == Language::Scala || rows.reference_package_contexts.is_empty());
         assert!(
             resolution_family_applies(semantic_language, "member_type_coverage")
@@ -1264,6 +1275,23 @@ impl PreparedResolutionBundle {
     #[doc(hidden)]
     pub const fn logical_rows(&self) -> usize {
         self.logical_rows
+    }
+
+    /// Upper bound on the Go/Rust surface spaces owned by resolution rows.
+    pub(super) fn surface_owner_rows(&self) -> usize {
+        // Semantic IDs and nodes/scopes each have a catalog row. Rust sites
+        // also include gap-only sites (RUST_SITE_OWNERS); duplicate sites only
+        // overcount. Paths, IR and member relations cannot own additional IDs.
+        super::saturating_sum([
+            self.rows.semantic_catalog.len(),
+            self.rows.node_catalog.len(),
+            self.site_rows.len(),
+            if self.semantic_language == Language::Rust {
+                self.gap_rows.reasons.len()
+            } else {
+                0
+            },
+        ])
     }
 
     /// Pre-write batching estimate; committed witnesses carry measured SQLite
@@ -1358,6 +1386,10 @@ impl AnalyzerStore {
                 tx.commit()?;
                 return Ok(false);
             }
+            tx.execute(
+                "DELETE FROM surface_sets WHERE blob_id IN (SELECT id FROM blobs WHERE lang=?1)",
+                [&storage_language],
+            )?;
             // Every summary of this language was derived from bundles of the old
             // epoch; withdraw them so no reader finds one before the next
             // reconcile derives the units again.
@@ -1760,6 +1792,7 @@ pub(super) fn insert_prepared_bundle_tx(
     if cancellation.is_cancelled() {
         return Ok(false);
     }
+    tx.execute("DELETE FROM surface_sets WHERE blob_id=?1", [blob_id])?;
     let count_columns = RESOLUTION_MANIFEST_COUNT_COLUMNS.join(", ");
     let value_count = 5 + RESOLUTION_MANIFEST_COUNT_COLUMNS.len() + 2;
     let placeholders = (1..=value_count)
@@ -2226,6 +2259,28 @@ fn insert_typed_fact_rows(
                     row.reference_indirection_delta,
                     row.value_transform,
                     optional_body(&row.completion),
+                )
+            })
+            .collect::<Vec<_>>(),
+        cancellation,
+    )? {
+        return Ok(false);
+    }
+    if !super::row_batch::insert_typed_rows(
+        tx,
+        "INSERT INTO resolution_binary_operations(blob_id, output_slot, left_slot, right_slot, operator, right_reference) VALUES",
+        "(?, ?, ?, ?, ?, ?)",
+        &rows
+            .binary_operations
+            .iter()
+            .map(|row| {
+                (
+                    blob_id,
+                    row.output_slot,
+                    row.left_slot,
+                    row.right_slot,
+                    row.operator,
+                    row.right_reference,
                 )
             })
             .collect::<Vec<_>>(),
@@ -2929,7 +2984,7 @@ mod tests {
 
     #[test]
     fn json_publication_chunks_preserve_sqlite_values_and_rowids() {
-        let mut connection = crate::cache_db::open_in_memory_store_connection().unwrap();
+        let mut connection = rusqlite::Connection::open_in_memory().unwrap();
         connection.execute_batch("CREATE TABLE batched(id INTEGER PRIMARY KEY, ordinal INTEGER, body BLOB, optional TEXT, flag INTEGER);
                                   CREATE TABLE single(id INTEGER PRIMARY KEY, ordinal INTEGER, body BLOB, optional TEXT, flag INTEGER);").unwrap();
         let tx = connection.transaction().unwrap();
@@ -2971,8 +3026,9 @@ mod tests {
     }
 
     fn shared_name_connection() -> Connection {
-        let mut connection = crate::cache_db::open_in_memory_store_connection()
-            .expect("shared-name store connection");
+        let mut connection =
+            rusqlite::Connection::open_in_memory().expect("shared-name store connection");
+        crate::cache_db::register_seal_validation(&connection).unwrap();
         crate::cache_db::configure_connection(&mut connection).expect("configure store");
         crate::cache_db::migrate(&mut connection).expect("migrate store");
         connection
@@ -3246,12 +3302,15 @@ mod tests {
             .iter()
             .enumerate()
             .filter_map(|(index, count)| {
-                resolution_count_applies(language, index).then_some(*count)
+                (index != ResolutionManifestFamilyIndex::csharp_friend_attributes as usize
+                    && resolution_count_applies(language, index))
+                .then_some(*count)
             })
             .collect::<Vec<_>>();
-        let inapplicable = PreparedResolutionBundleRows::family_specs()
+        let inapplicable = RESOLUTION_MANIFEST_COUNT_COLUMNS
             .iter()
-            .filter(|family| !resolution_family_applies(language, family.name))
+            .enumerate()
+            .filter(|(index, _)| !resolution_count_applies(language, *index))
             .count();
         assert_eq!(old_counts.len() + inapplicable, counts.len());
 
@@ -3263,7 +3322,10 @@ mod tests {
             .into_iter()
             .zip(prepared.rows.families())
         {
-            if !resolution_family_applies(language, spec.name) {
+            // Reconstruct the pre-IVT framing independently of applicability.
+            if spec.name == "csharp_friend_attributes"
+                || !resolution_family_applies(language, spec.name)
+            {
                 continue;
             }
             put_bytes(old_header.buffer(), spec.name.as_bytes());
@@ -3377,14 +3439,15 @@ mod tests {
                     .map(|_| PreparedResolutionValue::Integer(0))
                     .collect::<Vec<_>>(),
             ));
-            let language = if spec.name == "reference_package_contexts" {
-                Language::Scala
-            } else {
-                Language::Java
+            let language = match spec.name {
+                "reference_package_contexts" => Language::Scala,
+                "csharp_friend_attributes" => Language::CSharp,
+                "structural_trait_impls" => Language::Rust,
+                _ => Language::Java,
             };
             let changed_family = bundle(language, rows);
-            let empty_family = if language == Language::Scala {
-                bundle(Language::Scala, PreparedResolutionBundleRows::default())
+            let empty_family = if language != Language::Java {
+                bundle(language, PreparedResolutionBundleRows::default())
             } else {
                 empty.clone()
             };

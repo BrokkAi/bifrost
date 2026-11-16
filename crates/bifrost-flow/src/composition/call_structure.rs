@@ -57,11 +57,11 @@ pub trait CallStructureProvider: LocalTransferDiscovery {
         procedure: &DurableProcedureKey,
         request: &mut SemanticRequest<'_>,
     ) -> Result<Option<DurableProcedureKey>, Self::Error> {
-        let handle = self.procedure(procedure, request)?;
+        let handle = self.selected_procedure(procedure, request)?;
         Ok(handle
             .semantics()
             .lexical_parent()
-            .map(|parent| (procedure.0.clone(), parent)))
+            .map(|parent| (procedure.0.clone(), parent, handle.interpretation())))
     }
 }
 
@@ -72,10 +72,13 @@ pub(super) fn resolve_call_structure<D: LocalTransferDiscovery + ?Sized>(
     call: &DurableCallSiteKey,
     request: &mut SemanticRequest<'_>,
 ) -> Result<CallStructureDispatch, D::Error> {
-    let handle: ProcedureHandle = discovery.procedure(&call.0, request)?;
-    let site = handle.call_site_handle(call.1).ok_or_else(|| {
-        discovery.unavailable(format!("call {:?} is not in its procedure", call.1))
-    })?;
+    let handle: ProcedureHandle = discovery.locator_procedure(&call.0, request)?;
+    let site = handle
+        .resolve_durable_call(call)
+        .map_err(|error| discovery.refuse_locator(error))?
+        .ok_or_else(|| {
+            discovery.unavailable(format!("call {:?} is not in its procedure", call.1))
+        })?;
     let answer = {
         let _timing = brokk_bifrost_analysis::profiling::scope("taint.compose.dispatch.resolve");
         discovery.resolve_call(&site, request)?

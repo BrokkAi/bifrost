@@ -467,6 +467,7 @@ impl GoAnalyzer {
                             hash.value(package.as_bytes());
                         });
                         let completion = super::workspace_facts::stable_completion(
+                            self,
                             completion_scope.captured_read_incompleteness(),
                         );
                         hash.sequence("completion", &completion, |hash, gap| gap.hash_into(hash));

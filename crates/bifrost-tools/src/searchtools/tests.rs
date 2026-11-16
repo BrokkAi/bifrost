@@ -433,6 +433,9 @@ fn definition_outcome_key_reuses_declaration_context() {
         .next()
         .expect("target declaration");
     let outcome = DefinitionLookupOutcome {
+        selected_sites: Vec::new(),
+        inventory_evidence: None,
+        incomplete_evidence: None,
         modeled_definitions: Vec::new(),
         status: DefinitionLookupStatus::Resolved,
         reference: None,
@@ -1473,7 +1476,8 @@ fn terminal_navigation_status_cannot_be_resolved_by_semantic_overlay() {
         fixture
             .analyzer
             .analyzer()
-            .semantic_model_overlay()
+            .semantic_model_overlay_read()
+            .published()
             .is_some()
     );
 

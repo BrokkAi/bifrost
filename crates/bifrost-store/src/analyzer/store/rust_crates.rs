@@ -21,7 +21,7 @@ use brokk_bifrost_rust::selected_context::RustCargoEdition;
 use brokk_bifrost_rust::selected_context::RustCrateTarget;
 use brokk_bifrost_rust::selected_context::RustSelectedActivation;
 use brokk_bifrost_rust::selected_context::RustSelectedManifestMount;
-use brokk_bifrost_rust::selected_context::rust_broad_target_discovery_complete;
+use brokk_bifrost_rust::selected_context::rust_broad_target_discovery_completeness;
 use brokk_bifrost_rust::selected_context::rust_crate_targets;
 
 use git2::Oid;
@@ -72,40 +72,64 @@ type CrateKey = [u8; 32];
 /// The version of the crate-row derivation itself: the statements under
 /// `store/rust_crate_*.sql`, the module route walk, the order
 /// `derive_exports` runs them in, and the dependency waves, which decide which
-/// dependencies each crate is derived with. It is hashed into every topology
-/// digest, so a store built under an earlier rule set re-derives its crate rows
-/// although its inputs are unchanged. Bump it whenever those rules change.
+/// dependencies each crate is derived with. It is the Rust crate derivation
+/// lever (#11570), one change name per line in
+/// `levers/rust-crate-derivation.tokens`, hashed into every topology digest and
+/// stored as raw bytes in `rust_crate_reconciliations.derivation_identity`, so a
+/// store built under an earlier rule set re-derives its crate rows although its
+/// inputs are unchanged. Add a line whenever those rules change.
 ///
 /// The digest also folds in the Rust analysis epoch, which versions the
 /// per-blob payloads the derivation reads. Keeping the two apart is the point:
 /// rotating the epoch for a consumer-side change would make every Rust blob
 /// dirty and force a full reparse of a warm store.
+fn rust_crate_derivation_identity() -> [u8; 32] {
+    static IDENTITY: std::sync::LazyLock<[u8; 32]> = std::sync::LazyLock::new(|| {
+        brokk_bifrost_core::lever_tokens::lever_identity(
+            "rust-crate-derivation",
+            brokk_bifrost_core::lever_file!("rust-crate-derivation.tokens"),
+        )
+    });
+    *IDENTITY
+}
+
+/// The version a head one change older derived under, for tests that build a
+/// store under it and upgrade.
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
-pub const RUST_CRATE_DERIVATION_VERSION: &str = "4460-2026-10-07-module-self-imports-target-has-atomic-cfg-attr-derived-surface-generated-attribute-boundary-fact-enum-variant-export-set-2026-10-08-cycle-only-forced-wave-2026-10-09-primitive-shadowing-5235-2026-10-14-item-macro-guess-scope-5375-2026-10-15-reverse-inventory-5375-2026-10-16-v2-composite-primitive-shadowing-5243-2026-10-15-reverse-inventory-5375-2026-10-16-v3-enumerated-inputs-5517-cfg-if-ordered-items-and-conditional-imports-5172-2026-10-17-conditional-macro-frontiers-constructor-visibility-5133-2026-10-15-forwarded-public-surface-5133-2026-10-17-rust-route-precedence-5780-v6-admitted-binding-provenance-5658-p2-own-binding-authority-native-namespaces-owner-gap-certificates-owner-wide-propagation-6046-own-member-source-paths-prelude-root-witnesses-6102-gap-subject-levels-6136-settled-terminal-lookups-6114-glob-own-root-lookup-6389-associated-macro-contexts-inherent-impl-subjects-6394-duplicate-module-macro-scope-v1-absent-feature-cfg-inactive-v1-workspace-exclude-curdir-patch-version-topology-v1-macro-replay-path-module-walk-6861-v1-6846-cargo-literal-exclude-selected-build-features-v1-unresolved-impl-resolved-half-declarations-7226-10042-missing-target-roots-9737-d18d-broad-placements-9737-unproven-path-candidates-10469-case-folded-path-candidates-10552-path-probes-10774-manifests-only-cargo-toml-10953-target-dependencies-and-lib-names-9737-crate-manifest-currency-10987-scoped-symlink-omissions-11060-unplaced-module-topology-11111-certified-absent-module-topology";
-/// Set by `crate_topology_digests_follow_the_derivation_version` and
-/// `warm_derivation_version_rotation_replaces_same_revision_versions` so that a
+pub fn derivation_identity_before_last_token() -> [u8; 32] {
+    static OLDER: std::sync::LazyLock<[u8; 32]> = std::sync::LazyLock::new(|| {
+        brokk_bifrost_core::lever_tokens::lever_identity_before_last_token(
+            "rust-crate-derivation",
+            brokk_bifrost_core::lever_file!("rust-crate-derivation.tokens"),
+        )
+    });
+    *OLDER
+}
+/// Set by `crate_topology_digests_follow_the_derivation_identity` and
+/// `warm_derivation_identity_rotation_replaces_same_revision_versions` so that a
 /// test can derive under a second version and compare. Nothing else writes it.
 #[cfg(any(test, feature = "test-support"))]
-static DERIVATION_VERSION_OVERRIDE: std::sync::Mutex<Option<&'static str>> =
+static DERIVATION_IDENTITY_OVERRIDE: std::sync::Mutex<Option<[u8; 32]>> =
     std::sync::Mutex::new(None);
 
 /// The derivation version this process derives under.
 #[doc(hidden)]
-pub fn derivation_version() -> &'static str {
+pub fn derivation_identity() -> [u8; 32] {
     #[cfg(any(test, feature = "test-support"))]
-    if let Some(version) = *DERIVATION_VERSION_OVERRIDE
+    if let Some(version) = *DERIVATION_IDENTITY_OVERRIDE
         .lock()
         .expect("derivation version override lock")
     {
         return version;
     }
-    RUST_CRATE_DERIVATION_VERSION
+    rust_crate_derivation_identity()
 }
 
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
-pub fn set_derivation_version(version: Option<&'static str>) {
-    *DERIVATION_VERSION_OVERRIDE
+pub fn set_derivation_identity(version: Option<[u8; 32]>) {
+    *DERIVATION_IDENTITY_OVERRIDE
         .lock()
         .expect("derivation version override lock") = version;
 }
@@ -133,7 +157,7 @@ struct Gap {
 }
 // The configuration values are JSON arrays of scalar strings. Targets,
 // dependency kinds, identity, availability and prior outputs are separate rows.
-const STAGED_TARGET_SQL: &str = "SELECT crate_key,manifest_path,root_path,target_kind,crate_name,edition,cfg,features,inventory_complete,manifest_version,inventory_error FROM temp.rust_schedule_targets WHERE unit_id = ?1";
+const STAGED_TARGET_SQL: &str = "SELECT crate_key,manifest_path,root_path,target_kind,crate_name,edition,cfg,features,inventory_complete,manifest_version,inventory_error,features_complete FROM temp.rust_schedule_targets WHERE unit_id = ?1";
 const STAGED_DEPENDENCIES_SQL: &str = "SELECT extern_name,kind,dependency_key FROM temp.rust_schedule_dependencies WHERE crate_key = ?1 ORDER BY ordinal";
 const WAVE_UNIT_SQL: &str = "SELECT wave.unit_id, wave.forced
                                 FROM temp.rust_schedule_wave_order AS ordered
@@ -148,6 +172,7 @@ CREATE TEMP TABLE IF NOT EXISTS rust_schedule_targets(
  crate_name TEXT NOT NULL, edition TEXT NOT NULL,
  cfg TEXT NOT NULL CHECK(json_valid(cfg)), features TEXT NOT NULL CHECK(json_valid(features)),
  inventory_complete INTEGER NOT NULL, manifest_version INTEGER, inventory_error TEXT,
+ features_complete INTEGER NOT NULL,
  reached INTEGER NOT NULL DEFAULT 0, pending INTEGER NOT NULL DEFAULT 0
 ) STRICT;
 CREATE INDEX IF NOT EXISTS temp.rust_schedule_targets_pending ON rust_schedule_targets(pending, unit_id);
@@ -168,7 +193,12 @@ CREATE TEMP TABLE IF NOT EXISTS rust_schedule_outputs(crate_key BLOB PRIMARY KEY
 CREATE TEMP TABLE IF NOT EXISTS rust_schedule_moved(crate_key BLOB PRIMARY KEY) WITHOUT ROWID, STRICT;
 CREATE TEMP TABLE IF NOT EXISTS rust_schedule_next(ordinal INTEGER PRIMARY KEY, crate_key BLOB NOT NULL UNIQUE) STRICT;
 CREATE TEMP TABLE IF NOT EXISTS rust_schedule_pending_order(ordinal INTEGER PRIMARY KEY, unit_id INTEGER NOT NULL UNIQUE) STRICT;
-CREATE TEMP TABLE IF NOT EXISTS rust_schedule_retire(crate_key BLOB PRIMARY KEY, opened INTEGER NOT NULL) WITHOUT ROWID, STRICT;";
+CREATE TEMP TABLE IF NOT EXISTS rust_schedule_retire(crate_key BLOB PRIMARY KEY, opened INTEGER NOT NULL) WITHOUT ROWID, STRICT;
+CREATE TEMP TABLE IF NOT EXISTS rust_schedule_dropped_dev_dependencies(
+ crate_key BLOB NOT NULL, extern_name TEXT NOT NULL, from_manifest TEXT NOT NULL,
+ to_manifest TEXT NOT NULL, test_applicability TEXT NOT NULL CHECK(test_applicability='test_cfg'),
+ PRIMARY KEY(crate_key, extern_name)
+) WITHOUT ROWID, STRICT;";
 
 const RUST_READY_WAVE_SQL: &str = "INSERT INTO temp.rust_schedule_wave
  SELECT target.unit_id, 0 FROM temp.rust_schedule_targets AS target
@@ -197,9 +227,17 @@ const RUST_FORCE_COMPONENT_SQL: &str = "SELECT component.component_id
 
 fn stage_crate(conn: &Connection, ordinal: i64, item: &PreparedCrate) -> Result<()> {
     let target = &item.target;
+    super::rust_feature_projections::stage(
+        conn,
+        &item.key,
+        &target.manifest_path,
+        &target.configuration_directory,
+        target.features_complete,
+        &target.feature_projection,
+    )?;
     conn.prepare_cached("INSERT INTO temp.rust_schedule_targets
-        (unit_id,crate_key,manifest_path,root_path,target_kind,crate_name,edition,cfg,features,inventory_complete,manifest_version,inventory_error)
-        VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)")?.execute( params![ordinal, item.key.as_slice(), stable_path(&target.manifest_path), stable_path(&target.root_path), target_kind(target.kind), target.name, edition(target.edition), serde_json::to_string(&target.cfg_atoms).expect("cfg string sets serialize"), serde_json::to_string(&target.features).expect("feature string sets serialize"), target.inventory_complete, item.manifest_version, item.inventory_error])?;
+        (unit_id,crate_key,manifest_path,root_path,target_kind,crate_name,edition,cfg,features,inventory_complete,manifest_version,inventory_error,features_complete)
+        VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)")?.execute( params![ordinal, item.key.as_slice(), stable_path(&target.manifest_path), stable_path(&target.root_path), target_kind(target.kind), target.name, edition(target.edition), serde_json::to_string(&target.cfg_atoms).expect("cfg string sets serialize"), serde_json::to_string(&target.features).expect("feature string sets serialize"), target.inventory_complete, item.manifest_version, item.inventory_error, target.features_complete])?;
     for (ordinal, (name, kind, dependency)) in item.dependencies.iter().enumerate() {
         conn.prepare_cached("INSERT INTO temp.rust_schedule_dependencies VALUES(?1,?2,?3,?4,?5)")?
             .execute(params![
@@ -209,6 +247,10 @@ fn stage_crate(conn: &Connection, ordinal: i64, item: &PreparedCrate) -> Result<
                 kind,
                 dependency.as_ref().map(|key| key.as_slice())
             ])?;
+    }
+    for gap in &target.dropped_dev_dependencies {
+        conn.prepare_cached("INSERT INTO temp.rust_schedule_dropped_dev_dependencies VALUES(?1,?2,?3,?4,'test_cfg')")?
+            .execute(params![item.key.as_slice(), gap.extern_name, stable_path(&gap.from_manifest), stable_path(&gap.to_manifest)])?;
     }
     Ok(())
 }
@@ -226,6 +268,7 @@ fn read_staged_crate(conn: &Connection, id: i64, forced: bool) -> Result<Prepare
         complete,
         version,
         inventory_error,
+        features_complete,
     ) = conn
         .prepare_cached(STAGED_TARGET_SQL)?
         .query_row([id], |row| {
@@ -241,6 +284,7 @@ fn read_staged_crate(conn: &Connection, id: i64, forced: bool) -> Result<Prepare
                 row.get::<_, bool>(8)?,
                 row.get::<_, Option<i64>>(9)?,
                 row.get::<_, Option<String>>(10)?,
+                row.get::<_, bool>(11)?,
             ))
         })?;
     let key = crate_key_from_row(key)?;
@@ -292,7 +336,16 @@ fn read_staged_crate(conn: &Connection, id: i64, forced: bool) -> Result<Prepare
             },
             cfg_atoms: serde_json::from_str(&cfg).expect("staged cfg string arrays decode"),
             features: serde_json::from_str(&features).expect("staged feature string arrays decode"),
+            features_complete,
+            feature_projection: Vec::new(),
+            configuration_directory: PathBuf::new(),
             dependencies: Vec::new(),
+            dropped_dev_dependencies: conn.prepare_cached("SELECT from_manifest,to_manifest,extern_name FROM temp.rust_schedule_dropped_dev_dependencies WHERE crate_key=?1 ORDER BY extern_name")?
+                .query_map([key.as_slice()], |row| Ok(brokk_bifrost_rust::selected_context::DevDependencyCycleEdgeDropped {
+                    from_manifest: PathBuf::from(row.get::<_, String>(0)?),
+                    to_manifest: PathBuf::from(row.get::<_, String>(1)?),
+                    extern_name: row.get(2)?,
+                }))?.collect::<rusqlite::Result<Vec<_>>>()?,
             inventory_complete: complete && !forced,
             inventory_error,
         },
@@ -448,13 +501,18 @@ impl AnalyzerStore {
                     snapshot.workspace_id.as_str(),
                     snapshot.generation.0,
                     snapshot.revision,
-                    derivation_version()
+                    derivation_identity()
                 ],
                 |_| Ok(()),
             )
             .optional()?
             .is_some();
-        if current {
+        let feature_current = {
+            let conn = self.read_conn()?;
+            current
+                && super::rust_feature_projections::current_input_digest(&conn, snapshot)?.is_some()
+        };
+        if feature_current {
             crate::profiling::note_with(|| {
                 format!(
                     "rust_crates.reconcile: skipped, rows current for generation {} revision {}",
@@ -474,7 +532,7 @@ impl AnalyzerStore {
                 params![
                     snapshot.workspace_id.as_str(),
                     snapshot.generation.0,
-                    derivation_version()
+                    derivation_identity()
                 ],
                 |row| row.get::<_, i64>(0),
             )
@@ -501,8 +559,6 @@ impl AnalyzerStore {
             generation: snapshot.generation,
             revision: previous_revision,
         };
-        // The reader is released before reconciliation: a single-connection
-        // store has no second connection for the reconcile to read through.
         let certificate_differs = {
             let conn = self.read_conn()?;
             super::rust_listing_certificate_at(&conn, &previous)?
@@ -804,14 +860,24 @@ impl AnalyzerStore {
         };
         let snapshots = WorkspaceSnapshots::from_iter([("rust".to_string(), snapshot.clone())]);
         let prelude_timing = crate::profiling::scope("rust_crates.reconcile.inputs");
-        let (crates, paths, epoch, inventory_errors, naming, configuration, broad_targets) = {
+        let (
+            crates,
+            paths,
+            epoch,
+            inventory_errors,
+            naming,
+            configuration,
+            broad_targets,
+            manifest_paths,
+            manifest_map,
+        ) = {
             let conn = self.read_conn_for_workspace(&snapshots)?;
             #[cfg(any(test, feature = "test-support"))]
             let _trace =
                 StatementTrace::new(&conn, self.crate_statement_counter.lock().unwrap().clone());
             let SelectedCargoInputs {
                 manifests,
-                configuration_files,
+                configuration_files: _,
                 mut inventory_errors,
                 manifest_versions,
             } = load_selected_cargo_inputs(&conn, snapshot)?;
@@ -827,13 +893,26 @@ impl AnalyzerStore {
                     &manifests,
                 )
                 .map_err(StoreError::new)?;
-            let configuration = RustCargoConfiguration::from_files(configuration_files);
+            let configuration = super::rust_acquired_cargo_config::configuration(&conn, snapshot)?
+                .unwrap_or_else(RustCargoConfiguration::unknown_acquired);
             let epoch: String = conn
                 .prepare_cached(SQL_ANALYSIS_EPOCHS_4)?
                 .query_row([], |row| row.get(0))?;
             let manifest_map: std::collections::BTreeMap<_, _> = manifests
                 .iter()
                 .map(|manifest| (manifest.relative_path.clone(), manifest.clone()))
+                .collect();
+            let manifest_paths: BTreeSet<PathBuf> = manifests
+                .iter()
+                .map(|manifest| manifest.relative_path.clone())
+                .chain(
+                    inventory_errors
+                        .iter()
+                        .filter(|error| {
+                            !matches!(error.category, CargoInventoryErrorCategory::Configuration)
+                        })
+                        .map(|error| error.path.clone()),
+                )
                 .collect();
             let source_paths: BTreeSet<_> = paths
                 .iter()
@@ -845,18 +924,28 @@ impl AnalyzerStore {
             let listing_failures = Self::rust_source_listing_failures_on(
                 &conn,
                 snapshot,
-                super::RUST_SOURCE_LISTING_DERIVATION_VERSION,
+                super::rust_source_listing_derivation_identity(),
             )?;
+            let failed_manifests = inventory_errors
+                .iter()
+                .filter(|error| {
+                    !matches!(error.category, CargoInventoryErrorCategory::Configuration)
+                })
+                .map(|error| error.path.clone())
+                .collect();
+            let discovery_complete = rust_broad_target_discovery_completeness(
+                &manifest_map,
+                &source_paths,
+                &configuration,
+                &failed_manifests,
+            );
             let broad_targets: HashMap<_, _> = manifests
                 .iter()
                 .map(|manifest| {
                     (
                         manifest.relative_path.clone(),
-                        rust_broad_target_discovery_complete(
-                            manifest,
-                            &manifest_map,
-                            &source_paths,
-                        ) && listing_failures.as_ref().is_none_or(|failures| {
+                        discovery_complete[&manifest.relative_path]
+                            && listing_failures.as_ref().is_none_or(|failures| {
                             failures.iter().all(|(prefix, reason)| {
                                 reason != "omission: SymlinkToDirectory"
                                     || !brokk_bifrost_rust::selected_context::rust_directory_omission_affects_cargo(
@@ -878,7 +967,11 @@ impl AnalyzerStore {
             let targets = match targets {
                 Ok(targets) => targets,
                 Err(error) => {
-                    inventory_errors.push(error);
+                    inventory_errors.push(CargoInventoryError {
+                        path: PathBuf::new(),
+                        category: CargoInventoryErrorCategory::TargetInventory,
+                        diagnostic: error,
+                    });
                     Vec::new()
                 }
             };
@@ -924,6 +1017,8 @@ impl AnalyzerStore {
                 naming,
                 configuration,
                 broad_targets,
+                manifest_paths,
+                manifest_map,
             )
         };
         // The case-fold keys of the selected Rust paths, for the module
@@ -933,11 +1028,16 @@ impl AnalyzerStore {
             .iter()
             .map(|(path, _)| brokk_bifrost_rust::cargo_routes::rust_case_fold_key(path))
             .collect();
+        let feature_input_digest = {
+            let conn = self.read_conn_for_workspace(&snapshots)?;
+            super::rust_feature_projections::input_digest(&conn, snapshot)?
+        };
         drop(prelude_timing);
         let waves_timing = crate::profiling::scope("rust_crates.reconcile.waves");
         let schedule = Connection::open_in_memory()?;
         schedule.execute_batch(unit_schedule::SCHEMA_SQL)?;
         schedule.execute_batch(RUST_SCHEDULE_SCHEMA_SQL)?;
+        super::rust_feature_projections::prepare(&schedule)?;
         // Targets are an input query result only until their normalized rows
         // have been staged. No target or topology arena survives into waves.
         for (ordinal, item) in crates.into_iter().enumerate() {
@@ -1152,7 +1252,9 @@ impl AnalyzerStore {
                 SELECT outputs.crate_key FROM temp.rust_schedule_outputs AS outputs
                 WHERE NOT EXISTS (SELECT 1 FROM temp.rust_schedule_previous AS previous
                     WHERE previous.crate_key = outputs.crate_key AND previous.surface = outputs.surface);
-                INSERT OR REPLACE INTO temp.rust_schedule_live SELECT * FROM temp.rust_schedule_outputs;")?;
+                INSERT INTO temp.rust_schedule_live SELECT * FROM (
+SELECT * FROM temp.rust_schedule_outputs
+) WHERE true ON CONFLICT(crate_key) DO UPDATE SET topology_id=excluded.topology_id, surface=excluded.surface;")?;
             if !failures.is_empty() {
                 return Err(StoreError::new(format!(
                     "crate derivation wave failed: {failures:?}"
@@ -1174,25 +1276,29 @@ impl AnalyzerStore {
                             params![snapshot.workspace_id.as_str(), snapshot.generation.0, key],
                             |row| row.get::<_, Vec<u8>>(0),
                         )? {
-                            conn.prepare_cached("INSERT OR IGNORE INTO temp.rust_schedule_next(crate_key) VALUES(?1)")?.execute(
+                            conn.prepare_cached("INSERT INTO temp.rust_schedule_next(crate_key) VALUES(?1) ON CONFLICT DO NOTHING")?.execute(
                                 [key?],
                             )?;
                         }
-                        conn.execute_batch("INSERT OR IGNORE INTO temp.rust_schedule_next(crate_key)
-                    SELECT peers.crate_key FROM temp.rust_schedule_next AS next
+                        conn.execute_batch("INSERT INTO temp.rust_schedule_next(crate_key)
+                    SELECT * FROM (
+SELECT peers.crate_key FROM temp.rust_schedule_next AS next
                     JOIN temp.rust_schedule_targets AS target USING(crate_key)
                     JOIN temp.unit_schedule_components AS component USING(unit_id)
                     JOIN temp.unit_schedule_components AS member ON member.component_id = component.component_id
                     JOIN temp.rust_schedule_targets AS peers ON peers.unit_id = member.unit_id
-                    ORDER BY next.ordinal, peers.unit_id;
+                    ORDER BY next.ordinal, peers.unit_id
+) WHERE true ON CONFLICT DO NOTHING;
                     DELETE FROM temp.rust_schedule_next WHERE crate_key IN (SELECT crate_key FROM temp.rust_schedule_reached);
                     DELETE FROM temp.rust_schedule_live WHERE crate_key IN (SELECT crate_key FROM temp.rust_schedule_next);
                     UPDATE temp.rust_schedule_targets SET reached = 1, pending = 1
                     WHERE crate_key IN (SELECT crate_key FROM temp.rust_schedule_next);
                     INSERT INTO temp.rust_schedule_reached SELECT crate_key FROM temp.rust_schedule_next;
-                    INSERT OR IGNORE INTO temp.rust_schedule_pending_order(unit_id)
-                    SELECT targets.unit_id FROM temp.rust_schedule_next AS next
-                    JOIN temp.rust_schedule_targets AS targets USING(crate_key) ORDER BY next.ordinal;
+                    INSERT INTO temp.rust_schedule_pending_order(unit_id)
+                    SELECT * FROM (
+SELECT targets.unit_id FROM temp.rust_schedule_next AS next
+                    JOIN temp.rust_schedule_targets AS targets USING(crate_key) ORDER BY next.ordinal
+) WHERE true ON CONFLICT DO NOTHING;
                     DELETE FROM temp.rust_schedule_next;")?;
                     }
                 }
@@ -1296,6 +1402,18 @@ impl AnalyzerStore {
                 .query_map([], |row| row.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
+        let unavailable_manifests = inventory_errors
+            .iter()
+            .filter(|error| {
+                matches!(
+                    error.category,
+                    CargoInventoryErrorCategory::ManifestSyntax
+                        | CargoInventoryErrorCategory::ManifestSemantics
+                        | CargoInventoryErrorCategory::MissingSource
+                )
+            })
+            .map(|error| (error.path.clone(), error.diagnostic.clone()))
+            .collect();
         for path in detached_paths {
             // A reached detached root may have been deleted; retiring its old
             // version is enough, and no new topology can be derived for it.
@@ -1306,27 +1424,82 @@ impl AnalyzerStore {
                 continue;
             }
             let root_path = PathBuf::from(&path);
-            // No Cargo workspace owns the file, so the configuration of a
-            // build started beside it applies.
-            let cfg_atoms =
-                configuration.cfg_atoms(root_path.parent().expect("a file has a directory"));
+            // Detached files use the selected broad root profile. Their
+            // source directory is not a separately acquired Cargo build owner.
+            let configuration_directory = detached_configuration_directory();
+            let cfg_atoms = configuration.cfg_atoms(&configuration_directory);
+            let (edition, edition_error) =
+                match brokk_bifrost_rust::selected_context::rust_detached_edition(
+                    &root_path,
+                    &manifest_map,
+                    &unavailable_manifests,
+                    &mut |_| true,
+                ) {
+                    Ok(brokk_bifrost_rust::selected_context::RustSelectedBuildOutcome::Ready(
+                        edition,
+                    )) => (edition, None),
+                    Ok(brokk_bifrost_rust::selected_context::RustSelectedBuildOutcome::Stopped) => {
+                        unreachable!("progress is always live")
+                    }
+                    Err(cause) => {
+                        // The edition is unknown: inventory_error and
+                        // inventory_complete=false record that fact. The NOT NULL
+                        // column still needs a value. Readers that do not gate on
+                        // completeness (prelude, derives, edition helpers) can still
+                        // publish edition-dependent results; #12943 adds the unit
+                        // Unavailable carrier that prevents that publication.
+                        (
+                            brokk_bifrost_rust::selected_context::DETACHED_DEFAULT_EDITION,
+                            Some(cause),
+                        )
+                    }
+                };
             let target = RustCrateTarget {
                 manifest_path: root_path.clone(),
-                root_path,
+                root_path: root_path.clone(),
                 kind: RustCallerTargetKind::Detached,
                 name: path.clone(),
-                edition: RustCargoEdition::Rust2021,
+                edition,
                 cfg_atoms,
                 features: BTreeSet::new(),
+                features_complete: true,
+                feature_projection: Vec::new(),
+                configuration_directory,
                 dependencies: Vec::new(),
-                inventory_complete: true,
-                inventory_error: None,
+                dropped_dev_dependencies: Vec::new(),
+                inventory_complete: edition_error.is_none(),
+                inventory_error: edition_error.clone(),
             };
+            {
+                let schedule = schedule.lock().unwrap();
+                super::rust_feature_projections::stage(
+                    &schedule,
+                    &crate_key(&target),
+                    &target.manifest_path,
+                    &target.configuration_directory,
+                    target.features_complete,
+                    &target.feature_projection,
+                )?;
+            }
             let item = PreparedCrate {
                 key: crate_key(&target),
                 manifest_version: None,
-                inventory_error: (!inventory_errors.is_empty())
-                    .then(|| format!("{inventory_errors:?}")),
+                inventory_error: {
+                    let errors: Vec<_> = edition_error
+                        .into_iter()
+                        .chain(
+                            inventory_errors
+                                .iter()
+                                .filter(|error| {
+                                    error.affects_detached(&target.root_path, &manifest_paths)
+                                })
+                                .map(|error| {
+                                    format!("{}: {}", error.path.display(), error.diagnostic)
+                                }),
+                        )
+                        .collect();
+                    (!errors.is_empty()).then(|| format!("{errors:?}"))
+                },
                 dependencies: Vec::new(),
                 forced: false,
                 target,
@@ -1346,12 +1519,41 @@ impl AnalyzerStore {
             schedule
                 .lock()
                 .unwrap()
-                .prepare_cached("INSERT OR REPLACE INTO temp.rust_schedule_live VALUES(?1,?2,?3)")?
+                .prepare_cached("INSERT INTO temp.rust_schedule_live VALUES(?1,?2,?3) ON CONFLICT(crate_key) DO UPDATE SET topology_id=excluded.topology_id, surface=excluded.surface")?
                 .execute(params![
                     result.key.as_slice(),
                     result.topology_id,
                     result.surface.as_slice()
                 ])?;
+        }
+        // A scoped source pass carries detached units it did not reach. They
+        // still need an output in THIS discovery publication. Detached units
+        // have no Cargo feature activation; derive their empty, complete output
+        // from the live unit kind/path instead of copying an older input identity.
+        {
+            let schedule = schedule.lock().unwrap();
+            let source = self.read_conn_for_workspace(&snapshots)?;
+            let mut statement = schedule.prepare_cached(
+                "SELECT live.crate_key, live.topology_id FROM temp.rust_schedule_live AS live
+                 WHERE NOT EXISTS(SELECT 1 FROM temp.rust_discovery_features AS features
+                     WHERE features.unit_key=live.crate_key)",
+            )?;
+            let mut rows = statement.query([])?;
+            while let Some(row) = rows.next()? {
+                let key = crate_key_from_row(row.get(0)?)?;
+                let path: String = source.prepare_cached(
+                    "SELECT crate_name FROM rust_crate_topologies WHERE topology_id=?1 AND target_kind='detached'")?
+                    .query_row([row.get::<_, i64>(1)?], |row| row.get(0))?;
+                let path = Path::new(&path);
+                super::rust_feature_projections::stage(
+                    &schedule,
+                    &key,
+                    path,
+                    &detached_configuration_directory(),
+                    true,
+                    &[],
+                )?;
+            }
         }
         drop(detached_timing);
         let close_timing = crate::profiling::scope("rust_crates.reconcile.close_versions");
@@ -1407,7 +1609,7 @@ impl AnalyzerStore {
                 snapshot.workspace_id.as_str(),
                 snapshot.generation.0,
                 snapshot.revision,
-                derivation_version()
+                derivation_identity()
             ];
             match from_revision {
                 None => tx
@@ -1423,10 +1625,16 @@ impl AnalyzerStore {
                         snapshot.workspace_id.as_str(),
                         snapshot.generation.0,
                         snapshot.revision,
-                        derivation_version(),
+                        derivation_identity(),
                         from_revision
                     ])?,
             };
+            super::rust_feature_projections::publish(
+                &tx,
+                &schedule,
+                &snapshot,
+                &feature_input_digest,
+            )?;
             #[cfg(any(test, feature = "test-support"))]
             drop(trace);
             #[cfg(any(test, debug_assertions, feature = "test-support"))]
@@ -1533,7 +1741,7 @@ impl AnalyzerStore {
             .to_string();
             let decided = conn
                 .prepare_cached(ITEM_MACRO_DECISIONS_SQL)?
-                .query_map(params![mounts, members], |row| {
+                .query_map(params![mounts, members, cfg], |row| {
                     Ok(ItemMacroDecision {
                         blob_id: row.get(0)?,
                         invocation_occurrence_id: row.get(1)?,
@@ -1599,12 +1807,9 @@ impl AnalyzerStore {
             "a crate is published only after its own derivation returns"
         );
         debug_assert_crate_functions(&conn);
-        let mut atoms = item.target.cfg_atoms.clone();
-        atoms.extend(
-            item.target
-                .features
-                .iter()
-                .map(|feature| format!("feature = {feature:?}")),
+        let atoms = brokk_bifrost_rust::selected_context::merge_rust_configuration_atoms(
+            &item.target.cfg_atoms,
+            &item.target.features,
         );
         let cfg = serde_json::to_string(&atoms).expect("cfg strings serialize");
         let (rows, gate_decisions) = {
@@ -1629,6 +1834,14 @@ impl AnalyzerStore {
         let counts = active_placement_counts(&rows);
         let mut modules = Vec::new();
         let mut gaps = Vec::new();
+        for gap in &item.target.dropped_dev_dependencies {
+            gaps.push(Gap {
+                kind: "dev_dependency_cycle_edge_dropped",
+                subject: gap.extern_name.clone(),
+                detail: serde_json::json!({"from": stable_path(&gap.from_manifest), "to": stable_path(&gap.to_manifest),
+                    "extern_name": gap.extern_name, "test_applicability": "test_cfg"}).to_string(),
+            });
+        }
         if let Some(error) = &item.inventory_error {
             gaps.push(Gap {
                 kind: "unsupported_manifest",
@@ -1684,17 +1897,23 @@ impl AnalyzerStore {
         }
         let mut digest = Sha256::new();
         hash_cell(&mut digest, epoch.as_bytes());
-        hash_cell(&mut digest, derivation_version().as_bytes());
+        hash_cell(&mut digest, &derivation_identity());
         hash_cell(&mut digest, &item.key);
         hash_cell(&mut digest, edition(item.target.edition).as_bytes());
+        hash_cell(&mut digest, b"all-workspace-features-plus-global-test-v1");
         hash_cell(&mut digest, cfg.as_bytes());
+        for gap in &item.target.dropped_dev_dependencies {
+            hash_cell(&mut digest, stable_path(&gap.from_manifest).as_bytes());
+            hash_cell(&mut digest, stable_path(&gap.to_manifest).as_bytes());
+            hash_cell(&mut digest, gap.extern_name.as_bytes());
+        }
         if let Some(error) = &item.inventory_error {
             hash_cell(&mut digest, error.as_bytes());
         }
         let listing_complete = match Self::rust_source_listing_failures_on(
             &conn,
             &snapshots["rust"],
-            super::RUST_SOURCE_LISTING_DERIVATION_VERSION,
+            super::rust_source_listing_derivation_identity(),
         )? {
             None => false,
             Some(failures) => failures.iter().all(|(prefix, reason)| {
@@ -1782,6 +2001,9 @@ impl AnalyzerStore {
             && rows.iter().all(|row| !row.depth_capped)
             && !item.forced
             && item.inventory_error.is_none();
+        // Selected completeness can change while broad completeness is already
+        // false (for example, without a complete listing certificate).
+        hash_cell(&mut digest, &[u8::from(item.target.inventory_complete)]);
         hash_cell(&mut digest, &[u8::from(broad_complete)]);
         let mut broad_row_digests = Vec::with_capacity(rows.len());
         for row in &rows {
@@ -1935,7 +2157,9 @@ impl AnalyzerStore {
             .optional()?;
         let derived = existing
             .is_none()
-            .then(|| derivation::derive_exports(&conn, item, &modules, &gate_decisions, &cfg))
+            .then(|| {
+                derivation::derive_exports(&conn, item, &modules, &gaps, &gate_decisions, &cfg)
+            })
             .transpose()?;
         #[cfg(any(test, feature = "test-support"))]
         drop(trace);
@@ -1946,9 +2170,12 @@ impl AnalyzerStore {
         let key = item.key;
         let manifest_version = item.manifest_version;
         let mut target = item.target.clone();
-        target.inventory_complete &= gaps
-            .iter()
-            .all(|gap| matches!(gap.kind, "inactive_placement" | "external_dependency"));
+        target.inventory_complete &= gaps.iter().all(|gap| {
+            matches!(
+                gap.kind,
+                "inactive_placement" | "external_dependency" | "dev_dependency_cycle_edge_dropped"
+            )
+        });
         target.inventory_complete &= derived
             .as_ref()
             .is_none_or(derivation::ExportRows::inventory_complete);
@@ -2225,7 +2452,96 @@ fn dependency_kind(kind: RustCargoDependencyKind) -> &'static str {
         RustCargoDependencyKind::Build => "build",
     }
 }
-fn stable_path(path: &Path) -> String {
+/// `base` joined with the relative `path`, normalizing `.` and `..`; `None`
+/// when the path is absolute or leaves the workspace.
+fn join_relative(base: &str, path: &str) -> Option<String> {
+    let mut result = PathBuf::from(base);
+    for part in Path::new(path).components() {
+        match part {
+            Component::CurDir => {}
+            Component::Normal(part) => result.push(part),
+            Component::ParentDir => {
+                if !result.pop() {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(stable_path(&result))
+}
+
+/// The file or directory a module declaration names, relative to the
+/// workspace: the one rule of the module route walk (`rust_crate_module_walk.sql`)
+/// and of the selected placement fill, which asks where an added `mod x;`
+/// could be mounted. A `#[path]` value is relative to `path_dir` (the directory
+/// of the declaring source file), any other declaration to `module_dir` (the
+/// directory of the declaring module's children). `suffix` is `.rs` or
+/// `/mod.rs` for the two files an ordinary `mod x;` names, and empty for the
+/// directory an inline module opens. `None` when the join leaves the workspace.
+fn module_candidate(
+    module_dir: Option<&str>,
+    path_dir: Option<&str>,
+    name: &str,
+    path_attribute: Option<&str>,
+    suffix: &str,
+) -> Option<String> {
+    let base = if path_attribute.is_none() {
+        module_dir?
+    } else {
+        path_dir?
+    };
+    match path_attribute {
+        Some(path) => join_relative(base, path),
+        None => join_relative(base, &format!("{name}{suffix}")),
+    }
+}
+
+/// The files a `mod x;` declaration can mount, as a JSON array: the single
+/// `#[path]` target, or `x.rs` and `x/mod.rs`. `None` when the join leaves the
+/// workspace. This is the walk's `path_candidate` column.
+fn module_candidates(
+    module_dir: Option<&str>,
+    path_dir: Option<&str>,
+    name: &str,
+    path_attribute: Option<&str>,
+) -> Option<String> {
+    let rs = module_candidate(module_dir, path_dir, name, path_attribute, ".rs")?;
+    let files = if path_attribute.is_some() {
+        vec![rs]
+    } else {
+        vec![
+            rs,
+            module_candidate(module_dir, path_dir, name, path_attribute, "/mod.rs")?,
+        ]
+    };
+    Some(serde_json::to_string(&files).expect("paths serialize"))
+}
+
+/// The directory of the children of a module that a declared source file
+/// opened, recovered from where the walk found that file. An ordinary
+/// `mod x;` mounts `<module_dir>/x.rs` or `<module_dir>/x/mod.rs`, and both
+/// open the children directory `<module_dir>/x`; a `#[path]` file and the
+/// crate root open the directory they sit in. This inverts the walk's child row.
+fn module_file_dir(placement: &str, rel_path: &str) -> Option<String> {
+    let directory = rel_path.rsplit_once('/').map_or("", |(parent, _)| parent);
+    match placement {
+        "mod_declaration" if !rel_path.ends_with("/mod.rs") => {
+            rel_path.strip_suffix(".rs").map(str::to_owned)
+        }
+        _ => Some(directory.to_owned()),
+    }
+}
+
+// Cargo discovers configuration from its invocation directory. A detached file
+// has no Cargo build owner, so analysis models invocation from the workspace
+// root, matching the broad root cfg profile. The enclosing-manifest edition
+// fallback (detached_caller_edition, #12830) does not create a build owner.
+fn detached_configuration_directory() -> PathBuf {
+    PathBuf::new()
+}
+
+pub(super) fn stable_path(path: &Path) -> String {
     path.to_str()
         .expect("workspace path is UTF-8")
         .replace('\\', "/")
@@ -2256,6 +2572,9 @@ fn debug_assert_crate_functions(conn: &Connection) {
         let missing: Vec<_> = [
             ("cr_parent", 1),
             ("cr_join", 2),
+            ("cr_module_candidate", 5),
+            ("cr_module_candidates", 4),
+            ("cr_module_file_dir", 2),
             ("cr_cfg", 2),
             ("cr_authority_cfg", 2),
             ("cr_authority_namespace", 1),
@@ -2289,23 +2608,42 @@ pub(super) fn register_functions(conn: &Connection) -> Result<()> {
         let path: Option<String> = context.get(1)?;
         // An escaping inline #[path] has no directory. Descendants retain
         // that missing placement instead of passing NULL to a String reader.
-        let (Some(base), Some(path)) = (base, path) else {
-            return Ok(None);
-        };
-        let mut result = PathBuf::from(base);
-        for part in Path::new(&path).components() {
-            match part {
-                Component::CurDir => {}
-                Component::Normal(part) => result.push(part),
-                Component::ParentDir => {
-                    if !result.pop() {
-                        return Ok(None);
-                    }
-                }
-                _ => return Ok(None),
-            }
-        }
-        Ok(Some(stable_path(&result)))
+        Ok(base
+            .zip(path)
+            .and_then(|(base, path)| join_relative(&base, &path)))
+    })?;
+    // The module walk's path rule, shared with the selected placement fill so
+    // that the two cannot drift. See `module_candidate`.
+    conn.create_scalar_function("cr_module_candidate", 5, flags, |context| {
+        let module_dir: Option<String> = context.get(0)?;
+        let path_dir: Option<String> = context.get(1)?;
+        let name: String = context.get(2)?;
+        let path_attribute: Option<String> = context.get(3)?;
+        let suffix: String = context.get(4)?;
+        Ok(module_candidate(
+            module_dir.as_deref(),
+            path_dir.as_deref(),
+            &name,
+            path_attribute.as_deref(),
+            &suffix,
+        ))
+    })?;
+    conn.create_scalar_function("cr_module_candidates", 4, flags, |context| {
+        let module_dir: Option<String> = context.get(0)?;
+        let path_dir: Option<String> = context.get(1)?;
+        let name: String = context.get(2)?;
+        let path_attribute: Option<String> = context.get(3)?;
+        Ok(module_candidates(
+            module_dir.as_deref(),
+            path_dir.as_deref(),
+            &name,
+            path_attribute.as_deref(),
+        ))
+    })?;
+    conn.create_scalar_function("cr_module_file_dir", 2, flags, |context| {
+        let placement: String = context.get(0)?;
+        let rel_path: String = context.get(1)?;
+        Ok(module_file_dir(&placement, &rel_path))
     })?;
     // Native lookup recipes persist vocabulary ordinals. Convert once when
     // crossing into the crate binding relation's three namespace domains.
@@ -2377,10 +2715,41 @@ impl StatementTrace {
 /// Cargo manifests and configuration files of one snapshot, parsed from their
 /// retained sources. A file that cannot be parsed is reported in
 /// `inventory_errors` and left out of the other fields.
+#[derive(Debug)]
+enum CargoInventoryErrorCategory {
+    ManifestSyntax,
+    ManifestSemantics,
+    MissingSource,
+    Configuration,
+    TargetInventory,
+}
+
+#[derive(Debug)]
+struct CargoInventoryError {
+    path: PathBuf,
+    category: CargoInventoryErrorCategory,
+    diagnostic: String,
+}
+
+impl CargoInventoryError {
+    fn affects_detached(&self, source: &Path, manifests: &BTreeSet<PathBuf>) -> bool {
+        if !matches!(self.category, CargoInventoryErrorCategory::ManifestSyntax) {
+            return true;
+        }
+        source
+            .parent()
+            .into_iter()
+            .flat_map(Path::ancestors)
+            .map(|directory| directory.join("Cargo.toml"))
+            .find(|manifest| manifests.contains(manifest))
+            .is_some_and(|manifest| manifest == self.path)
+    }
+}
+
 struct SelectedCargoInputs {
     manifests: Vec<RustSelectedManifestMount>,
     configuration_files: Vec<(PathBuf, RustCargoConfigDocument)>,
-    inventory_errors: Vec<String>,
+    inventory_errors: Vec<CargoInventoryError>,
     manifest_versions: HashMap<PathBuf, i64>,
 }
 
@@ -2438,9 +2807,15 @@ fn load_selected_cargo_inputs(
             continue;
         }
         let Some(source) = source else {
-            inputs
-                .inventory_errors
-                .push(format!("{path}: retained manifest source is missing"));
+            inputs.inventory_errors.push(CargoInventoryError {
+                path: PathBuf::from(&path),
+                category: if configuration {
+                    CargoInventoryErrorCategory::Configuration
+                } else {
+                    CargoInventoryErrorCategory::MissingSource
+                },
+                diagnostic: "retained manifest source is missing".to_owned(),
+            });
             continue;
         };
         if configuration {
@@ -2448,15 +2823,41 @@ fn load_selected_cargo_inputs(
                 Ok(document) => inputs
                     .configuration_files
                     .push((PathBuf::from(path), document)),
-                Err(error) => inputs.inventory_errors.push(format!("{path}: {error}")),
+                Err(error) => inputs.inventory_errors.push(CargoInventoryError {
+                    path: PathBuf::from(&path),
+                    category: CargoInventoryErrorCategory::Configuration,
+                    diagnostic: error,
+                }),
             }
             continue;
         }
-        let manifest = parse_selected_manifest(&path, &oid, source)?;
+        let document = brokk_bifrost_rust::cargo_manifest::RustCargoManifestDocument::from_retained_source_classified(
+            Oid::from_str(&oid)?, source.into_boxed_slice());
+        let manifest = match document {
+            Ok(document) => {
+                RustSelectedManifestMount::from_document(PathBuf::from(&path), document)
+                    .map_err(|error| (CargoInventoryErrorCategory::ManifestSemantics, error))
+            }
+            Err(error) => {
+                let category = match &error {
+                    brokk_bifrost_rust::cargo_manifest::RustCargoManifestError::Syntax(_) => {
+                        CargoInventoryErrorCategory::ManifestSyntax
+                    }
+                    brokk_bifrost_rust::cargo_manifest::RustCargoManifestError::RetainedSource(
+                        _,
+                    ) => CargoInventoryErrorCategory::MissingSource,
+                };
+                Err((category, error.diagnostic().to_owned()))
+            }
+        };
         let manifest = match manifest {
             Ok(manifest) => manifest,
-            Err(error) => {
-                inputs.inventory_errors.push(format!("{path}: {error}"));
+            Err((category, diagnostic)) => {
+                inputs.inventory_errors.push(CargoInventoryError {
+                    path: PathBuf::from(&path),
+                    category,
+                    diagnostic,
+                });
                 continue;
             }
         };
@@ -2479,6 +2880,16 @@ impl AnalyzerStore {
         snapshot: &WorkspaceSnapshotId,
         paths: &[String],
     ) -> Result<std::result::Result<RustCargoConfiguration, Vec<String>>> {
+        let directory = paths
+            .iter()
+            .filter_map(|path| Path::new(path).parent().and_then(Path::parent))
+            .max_by_key(|path| path.components().count())
+            .unwrap_or(Path::new(""));
+        if let Some(configuration) = super::rust_acquired_cargo_config::configuration_at_directory(
+            conn, snapshot, directory,
+        )? {
+            return Ok(Ok(configuration));
+        }
         let mut statement = conn.prepare_cached(SQL_SELECTED_CONFIGURATION_INPUTS_AT_PATHS)?;
         let rows = statement.query_map(
             params![
@@ -2492,18 +2903,19 @@ impl AnalyzerStore {
                     row.get::<_, String>(0)?,
                     row.get::<_, Option<String>>(1)?,
                     row.get::<_, Option<Vec<u8>>>(2)?,
+                    row.get::<_, Option<bool>>(3)?,
                 ))
             },
         )?;
         let mut files = Vec::new();
         let mut failures = Vec::new();
         for row in rows {
-            let (path, oid, source) = row?;
+            let (path, oid, source, present) = row?;
             assert!(
                 is_cargo_configuration_path(Path::new(&path)),
                 "{path:?} is not a Cargo configuration file"
             );
-            if oid.is_none() {
+            if oid.is_none() || present == Some(false) {
                 continue;
             }
             let Some(source) = source else {
@@ -2578,7 +2990,7 @@ impl AnalyzerStore {
 /// The selected Rust configuration input (a manifest or a Cargo configuration
 /// file) at each requested path, with a NULL version for an absent path.
 const SQL_SELECTED_CONFIGURATION_INPUTS_AT_PATHS: &str =
-    "SELECT requested.value, versions.blob_oid, sources.source_bytes
+    "SELECT requested.value, versions.blob_oid, sources.source_bytes, versions.file_present
      FROM json_each(?4) AS requested
      LEFT JOIN workspace_file_versions AS versions
        ON versions.rel_path = requested.value
@@ -2601,7 +3013,7 @@ pub(super) const SQL_SELECTED_WORKSPACE_FILE_VERSIONS_3: &str =
                  WHERE files.lang = 'rust' ORDER BY files.rel_path";
 pub(super) const SQL_RUST_CRATE_RECONCILIATION_CURRENT: &str =
     "SELECT 1 FROM rust_crate_reconciliations
-     WHERE workspace_id = ?1 AND generation = ?2 AND revision = ?3 AND derivation_version = ?4";
+     WHERE workspace_id = ?1 AND generation = ?2 AND revision = ?3 AND derivation_identity = ?4";
 /// The revision of the last complete reconcile of this generation under this
 /// derivation version, at whatever revision that pass ran. The marker table
 /// keeps one row per generation; the ORDER BY states the choice rather than
@@ -2609,7 +3021,7 @@ pub(super) const SQL_RUST_CRATE_RECONCILIATION_CURRENT: &str =
 /// last pass that completed.
 pub(super) const SQL_RUST_CRATE_RECONCILIATION_PREVIOUS: &str =
     "SELECT revision FROM rust_crate_reconciliations
-     WHERE workspace_id = ?1 AND generation = ?2 AND derivation_version = ?3
+     WHERE workspace_id = ?1 AND generation = ?2 AND derivation_identity = ?3
      ORDER BY revision DESC LIMIT 1";
 /// The Rust paths the revision log changed in the range (from, to]: a file
 /// version that opened or closed at one of those revisions. A path added,
@@ -2620,13 +3032,13 @@ pub(super) const SQL_WORKSPACE_FILE_CHANGES_BETWEEN: &str = "SELECT DISTINCT ver
        AND ((versions.valid_from > ?3 AND versions.valid_from <= ?4)
          OR (versions.valid_until > ?3 AND versions.valid_until <= ?4))";
 pub(super) const SQL_RUST_CRATE_RECONCILIATION_RECORD: &str =
-    "INSERT INTO rust_crate_reconciliations(workspace_id, generation, revision, derivation_version)
+    "INSERT INTO rust_crate_reconciliations(workspace_id, generation, revision, derivation_identity)
      VALUES(?1, ?2, ?3, ?4)
      ON CONFLICT(workspace_id, generation) DO UPDATE
-     SET revision = excluded.revision, derivation_version = excluded.derivation_version";
+     SET revision = excluded.revision, derivation_identity = excluded.derivation_identity";
 pub(super) const SQL_RUST_CRATE_RECONCILIATION_ADVANCE: &str =
     "UPDATE rust_crate_reconciliations SET revision = ?3
-     WHERE workspace_id = ?1 AND generation = ?2 AND derivation_version = ?4 AND revision = ?5";
+     WHERE workspace_id = ?1 AND generation = ?2 AND derivation_identity = ?4 AND revision = ?5";
 pub(super) const SQL_ANALYSIS_EPOCHS_4: &str =
     "SELECT epoch FROM analysis_epochs WHERE lang = 'rust'";
 pub(super) const SQL_RUST_CRATE_MODULES_5: &str =
@@ -2706,8 +3118,7 @@ pub(super) const SQL_RUST_CRATE_MODULES_11: &str =
 #[doc(hidden)]
 pub const SQL_RUST_CRATE_DEPENDENCIES_12: &str =
     "INSERT INTO rust_crate_dependencies VALUES(?1, ?2, ?3, ?4, ?5)";
-pub(super) const SQL_RUST_CRATE_GAPS_13: &str =
-    "INSERT OR IGNORE INTO rust_crate_gaps VALUES(?1, ?2, ?3, jsonb(?4))";
+pub(super) const SQL_RUST_CRATE_GAPS_13: &str = "INSERT INTO rust_crate_gaps VALUES(?1, ?2, ?3, jsonb(?4)) ON CONFLICT(topology_id, gap_kind, subject) DO NOTHING";
 pub(super) const SQL_RUST_CRATE_TOPOLOGIES_14: &str = "UPDATE rust_crate_topologies SET export_surface_digest = ?1, publication_state = 'complete' WHERE topology_id = ?2";
 pub(super) const SQL_RUST_CRATE_VERSIONS_15: &str = "SELECT topology_id, valid_from, manifest_file_version_id FROM rust_crate_versions WHERE workspace_id = ?1 AND lang = 'rust' AND generation = ?2 AND crate_key = ?3 AND valid_until IS NULL";
 // The two ways `end_open_crate_version` ends an open row, bound alike: close it
@@ -2877,6 +3288,43 @@ mod tests {
     use brokk_bifrost_test_macros::hardwon;
 
     #[test]
+    #[hardwon(
+        "#11799: syntax-invalid manifests must keep their own files partial until a nested manifest boundary"
+    )]
+    fn syntax_errors_stop_at_nested_manifest_boundaries() {
+        let manifests = [
+            "Cargo.toml",
+            "broken/Cargo.toml",
+            "broken/nested/Cargo.toml",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+        let error = CargoInventoryError {
+            path: PathBuf::from("broken/Cargo.toml"),
+            category: CargoInventoryErrorCategory::ManifestSyntax,
+            diagnostic: "syntax failure".to_owned(),
+        };
+        assert!(error.affects_detached(Path::new("broken/src/lib.rs"), &manifests));
+        assert!(!error.affects_detached(Path::new("elsewhere.rs"), &manifests));
+        assert!(!error.affects_detached(Path::new("broken/nested/src/lib.rs"), &manifests));
+        for category in [
+            CargoInventoryErrorCategory::ManifestSemantics,
+            CargoInventoryErrorCategory::MissingSource,
+            CargoInventoryErrorCategory::Configuration,
+            CargoInventoryErrorCategory::TargetInventory,
+        ] {
+            let error = CargoInventoryError {
+                path: PathBuf::from("broken/Cargo.toml"),
+                category,
+                diagnostic: "other failure".to_owned(),
+            };
+            assert!(error.affects_detached(Path::new("elsewhere.rs"), &manifests));
+            assert!(error.affects_detached(Path::new("broken/nested/src/lib.rs"), &manifests));
+        }
+    }
+
+    #[test]
     #[hardwon("#10774+#10830: a target-layout .rs root was parsed as a Cargo manifest")]
     fn cargo_inputs_mount_only_cargo_toml_as_a_manifest() {
         let conn = Connection::open_in_memory().unwrap();
@@ -2951,7 +3399,7 @@ mod tests {
         conn.execute_batch(
             "CREATE TABLE workspace_file_versions(
             workspace_id, lang, generation, input_kind, valid_from, valid_until,
-            rel_path, blob_oid);
+            rel_path, blob_oid, file_present);
             CREATE TABLE workspace_input_sources(content_oid, source_bytes);",
         )
         .unwrap();
@@ -2971,7 +3419,7 @@ mod tests {
         )
         .unwrap();
         for path in ["Cargo.toml", "other/Cargo.toml", "third/Cargo.toml"] {
-            conn.execute("INSERT INTO workspace_file_versions VALUES('test','rust',1,'configuration',1,NULL,?1,?2)", params![path, oid]).unwrap();
+            conn.execute("INSERT INTO workspace_file_versions VALUES('test','rust',1,'configuration',1,NULL,?1,?2,1)", params![path, oid]).unwrap();
         }
         let paths = vec!["Cargo.toml".to_string(), "src/Cargo.toml".to_string()];
         let (mounts, before, failures) =
@@ -2980,7 +3428,7 @@ mod tests {
         assert!(failures.is_empty(), "an absent manifest is not a failure");
         assert_eq!(mounts.len(), 1, "unrelated manifests must never be parsed");
         assert_eq!(mounts[0].relative_path, PathBuf::from("Cargo.toml"));
-        conn.execute("INSERT INTO workspace_file_versions VALUES('test','rust',1,'configuration',1,NULL,'src/Cargo.toml',?1)", params![oid]).unwrap();
+        conn.execute("INSERT INTO workspace_file_versions VALUES('test','rust',1,'configuration',1,NULL,'src/Cargo.toml',?1,1)", params![oid]).unwrap();
         let (mounts, after, _) =
             AnalyzerStore::rust_selected_manifest_mounts_at_paths(&conn, &snapshot, &paths)
                 .unwrap();
@@ -2993,12 +3441,13 @@ mod tests {
 
     #[test]
     #[hardwon("#9737: a reader held across reconciliation deadlocked a single-connection store")]
-    fn changed_listing_certificate_reconciles_on_a_single_connection_store() {
-        let store = std::sync::Arc::new(AnalyzerStore::open_in_memory_single_connection().unwrap());
+    fn changed_listing_certificate_reconciles_on_pooled_store() {
+        // This regression now runs on the pooled store.
+        let store = std::sync::Arc::new(AnalyzerStore::open_ephemeral().unwrap());
         let generation = store
             .ensure_language_epoch_value("rust", "single-connection")
             .unwrap();
-        let version = super::super::RUST_SOURCE_LISTING_DERIVATION_VERSION;
+        let version = super::super::rust_source_listing_derivation_identity();
         let first = store
             .sync_workspace_inputs_with_rust_listing(
                 &super::super::WorkspaceId("a".repeat(64)),
@@ -3024,6 +3473,7 @@ mod tests {
                 &first,
                 version,
                 vec![("src/link.rs".into(), "symlink".into())],
+                Default::default(),
             )
             .unwrap();
         assert!(
@@ -3343,5 +3793,89 @@ mod tests {
             vec![],
             "rejected duplicate mounts cannot export pass!"
         );
+    }
+
+    #[test]
+    #[hardwon("#12239: an inactive later macro_rules! shadowed the active definition")]
+    fn textual_macro_sql_agrees_with_cfg_fold() {
+        use brokk_bifrost_rust::cfg::{RustMacroDefinitionOutcome, select_textual_macro};
+        for (first, second) in [
+            ("always", "expression [{\"Any\":0}]"),
+            ("expression [{\"Any\":0}]", "always"),
+            ("always", "unknown"),
+            ("always", "always"),
+        ] {
+            let conn = Connection::open_in_memory().unwrap();
+            register_functions(&conn).unwrap();
+            conn.execute_batch("CREATE TABLE blobs(id, blob_oid, lang, generation, parse_variant BLOB NOT NULL DEFAULT x'');
+             INSERT INTO blobs(id, blob_oid, lang, generation) VALUES(1,'root','rust',0),(2,'macros','rust',0);
+             CREATE TABLE workspace_file_versions(file_version_id, rel_path, blob_oid, lang, generation);
+             INSERT INTO workspace_file_versions VALUES
+               (1,'src/lib.rs','root','rust',0),(2,'src/macros.rs','macros','rust',0);
+             CREATE VIEW selected_workspace_file_versions AS SELECT * FROM workspace_file_versions;
+             CREATE TABLE source_declarations(blob_id, declaration_id, start_byte, end_byte);
+             INSERT INTO source_declarations VALUES(1,0,0,10),(1,1,20,30);
+             CREATE TABLE source_rust_module_declarations(
+               blob_id, declaration_id, module_name, body_occurrence_id,
+               path_attribute, body_start_byte, body_end_byte, macro_use);
+             INSERT INTO source_rust_module_declarations VALUES
+               (1,0,'duplicate',NULL,'macros.rs',NULL,NULL,0),
+               (1,1,'duplicate',NULL,'macros.rs',NULL,NULL,1);
+             CREATE TABLE source_rust_module_scopes(blob_id, ordinal, parent_ordinal, declaration_id);
+             CREATE TABLE source_rust_declaration_properties(blob_id, declaration_id, cfg_condition, macro_exported);
+             INSERT INTO source_rust_declaration_properties VALUES(1,0,'always',0),(1,1,'always',0);
+             CREATE TABLE source_rust_module_routes(blob_id, ordinal, scope_ordinal, declaration_id);
+             INSERT INTO source_rust_module_routes VALUES(1,0,0,0),(1,1,0,1);
+             CREATE TABLE source_rust_module_route_gates(blob_id, route_ordinal, invocation_occurrence_id);
+             CREATE TABLE rust_include_edges(blob_id, relative_path, include_start);
+             CREATE TABLE source_rust_item_macro_expansions(
+               blob_id, invocation_occurrence_id, invocation_start_byte, invocation_end_byte,
+               source_position, expansion_kind);
+             INSERT INTO source_rust_item_macro_expansions VALUES(1,7,40,70,0,0);
+             CREATE TABLE source_rust_macro_invocations(blob_id, occurrence_id, macro_name);
+             INSERT INTO source_rust_macro_invocations VALUES(1,7,'pass');
+             CREATE TABLE rust_item_macros(
+               blob_id, declaration_id, macro_name, passthrough, decoration_cfg,
+               scope_start, scope_end, visible_after);
+             INSERT INTO rust_item_macros VALUES(2,0,'pass',1,'always',0,100,60);
+             CREATE TABLE source_rust_item_contexts(
+               blob_id, context_kind, parent_occurrence_id, start_byte, end_byte);
+             INSERT INTO source_rust_item_contexts VALUES(2,0,NULL,0,100);
+             CREATE TABLE source_rust_macro_inputs(blob_id, invocation_occurrence_id, native_gap_site);
+             INSERT INTO source_rust_macro_inputs VALUES(1,7,7);
+             CREATE TABLE source_rust_import_targets(blob_id, bound_name, is_glob, is_macro_use);").unwrap();
+            conn.execute_batch("DELETE FROM rust_item_macros; DELETE FROM source_rust_declaration_properties; INSERT INTO rust_item_macros VALUES(1,2,'pass',1,'always',0,100,10),(1,3,'pass',1,'expression [{\"Any\":0}]',0,100,20);").unwrap();
+            conn.execute(
+                "INSERT INTO source_rust_declaration_properties VALUES(1,2,?1,0),(1,3,?2,0)",
+                params![first, second],
+            )
+            .unwrap();
+            let selected = select_textual_macro([(3, second), (2, first)], |(_, cfg)| {
+                let condition =
+                    brokk_bifrost_core::analyzer::rust_facts::decode_rust_cfg_condition(cfg)
+                        .unwrap();
+                brokk_bifrost_rust::cfg::crate_activation(&Default::default(), &condition)
+            });
+            let expected = match selected {
+                RustMacroDefinitionOutcome::Resolved((2, _)) => vec!["always".to_owned()],
+                RustMacroDefinitionOutcome::Resolved((3, _)) => {
+                    vec!["expression [{\"Any\":0}]".to_owned()]
+                }
+                RustMacroDefinitionOutcome::Resolved(other) => {
+                    panic!("unexpected definition: {other:?}")
+                }
+                RustMacroDefinitionOutcome::Missing
+                | RustMacroDefinitionOutcome::UnprovenActivation => vec![],
+                RustMacroDefinitionOutcome::Ambiguous => panic!("textual fold cannot be ambiguous"),
+            };
+            let rows = conn
+                .prepare_cached(ITEM_MACRO_DECISIONS_SQL)
+                .unwrap()
+                .query_map(params!["[]", "[1]", "[]"], |row| row.get::<_, String>(2))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(rows, expected, "cfg pair {first:?}, {second:?}");
+        }
     }
 }

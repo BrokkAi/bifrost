@@ -40,6 +40,7 @@ struct PendingOccurrence {
 /// parser walk.
 pub struct StructuralFactCollector<'a, 'tree> {
     spec: &'a dyn StructuralSpec,
+    hooks: Option<&'a dyn super::spec::StructuralFileHooks<'tree>>,
     source: &'a str,
     context: &'a CallSiteContext,
     /// AST parents for the tree being walked.
@@ -54,6 +55,7 @@ pub struct StructuralFactCollector<'a, 'tree> {
     max_work_items: usize,
     cancellation: Option<&'a CancellationToken>,
     nodes: Vec<NormalizedNode>,
+    node_ranges: Vec<Span>,
     fact_by_ast_node: HashMap<usize, u32>,
     pending_roles: Vec<Vec<PendingRoleTarget>>,
     pending_occurrence_roles: Vec<PendingOccurrence>,
@@ -72,18 +74,28 @@ impl<'a, 'tree> StructuralFactCollector<'a, 'tree> {
     ) -> Self {
         Self {
             spec,
+            hooks: None,
             source,
             context,
             parents,
             max_work_items,
             cancellation,
             nodes: Vec::new(),
+            node_ranges: Vec::new(),
             fact_by_ast_node: HashMap::default(),
             pending_roles: Vec::new(),
             pending_occurrence_roles: Vec::new(),
             coverage: Vec::new(),
             role_count: 0,
         }
+    }
+
+    pub fn with_file_hooks(
+        mut self,
+        hooks: Option<&'a dyn super::spec::StructuralFileHooks<'tree>>,
+    ) -> Self {
+        self.hooks = hooks;
+        self
     }
 
     /// Normalize an ordinary parser event with the language-owned kind table
@@ -192,7 +204,7 @@ impl<'a, 'tree> StructuralFactCollector<'a, 'tree> {
     /// inserts them directly below the admitted event.
     pub fn enter(
         &mut self,
-        node: Node<'_>,
+        node: Node<'tree>,
         normalized_kind: NormalizedKind,
         enclosing_normalized_id: Option<u32>,
         source_facts: &mut PrimarySourceFactCollector<'_>,
@@ -288,9 +300,12 @@ impl<'a, 'tree> StructuralFactCollector<'a, 'tree> {
                 }
                 Ok(())
             };
-            let provenance = self
-                .spec
-                .callee_provenance(node, self.source, &mut charge)?;
+            let provenance = match self.hooks {
+                Some(hooks) => hooks.callee_provenance(node, self.source, &mut charge)?,
+                None => self
+                    .spec
+                    .callee_provenance(node, self.source, &mut charge)?,
+            };
             let unsafe_context = self.spec.unsafe_context_value(node, &mut charge)?;
             self.max_work_items -= work;
             let site = self.spec.call_site_facts(node, self.source, self.context);
@@ -306,6 +321,10 @@ impl<'a, 'tree> StructuralFactCollector<'a, 'tree> {
         } else {
             (None, None)
         };
+        self.node_ranges.push(Span {
+            start_byte: range.start_byte,
+            end_byte: range.end_byte,
+        });
         self.nodes.push(NormalizedNode {
             kind: normalized_kind,
             occurrence,
@@ -379,6 +398,10 @@ impl<'a, 'tree> StructuralFactCollector<'a, 'tree> {
             let embedded_id = u32::try_from(self.nodes.len())
                 .expect("embedded structural fact ids must fit in a u32 before allocation");
             let occurrence = source_facts.intern_embedded(embedded.range);
+            self.node_ranges.push(Span {
+                start_byte: embedded.range.start_byte,
+                end_byte: embedded.range.end_byte,
+            });
             self.nodes.push(NormalizedNode {
                 kind: embedded.kind,
                 occurrence,
@@ -554,6 +577,7 @@ impl<'a, 'tree> StructuralFactCollector<'a, 'tree> {
             spec,
             source,
             mut nodes,
+            node_ranges,
             fact_by_ast_node,
             pending_roles,
             pending_occurrence_roles,
@@ -593,6 +617,23 @@ impl<'a, 'tree> StructuralFactCollector<'a, 'tree> {
             .map(|(owner, role, outcome, _)| (owner, role, outcome))
             .collect();
         coverage.sort_unstable_by_key(|&(owner, role, _)| (owner, role));
+        // Span targets can refer to expressions parsed in an embedded forest.
+        // Nodes are in preorder, so the first exact match is the outermost.
+        let mut span_targets: HashMap<(usize, usize), Option<u32>> = pending_roles
+            .iter()
+            .flatten()
+            .filter_map(|pending| match pending.target {
+                PendingRoleTargetKind::Span(span) => Some(((span.start_byte, span.end_byte), None)),
+                PendingRoleTargetKind::Node(_) => None,
+            })
+            .collect();
+        if !span_targets.is_empty() {
+            for (id, range) in node_ranges.iter().enumerate() {
+                if let Some(target) = span_targets.get_mut(&(range.start_byte, range.end_byte)) {
+                    target.get_or_insert(u32::try_from(id).expect("structural fact ids fit u32"));
+                }
+            }
+        }
         let mut roles = CompactRowsBuilder::with_capacity(nodes.len(), role_count);
         for (owner, pending) in pending_roles.into_iter().enumerate() {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
@@ -608,7 +649,9 @@ impl<'a, 'tree> StructuralFactCollector<'a, 'tree> {
                     keyword: pending.keyword,
                     node: match pending.target {
                         PendingRoleTargetKind::Node(node) => fact_by_ast_node.get(&node).copied(),
-                        PendingRoleTargetKind::Span => None,
+                        PendingRoleTargetKind::Span(span) => {
+                            span_targets[&(span.start_byte, span.end_byte)]
+                        }
                     },
                     occurrence: pending.occurrence,
                     name: pending.name,

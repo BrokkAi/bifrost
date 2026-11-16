@@ -16,6 +16,11 @@ use crate::structural::execution::plan::StepOutputCap;
 use crate::structural::identifier_dictionary::IdentifierDictionary;
 use crate::structural::identifier_typos::IdentifierTypoTable;
 use std::path::Path;
+pub(super) mod reachability_operands;
+pub use reachability_operands::{
+    CallReachabilityOperands, CallReachabilitySinkProduct, CallReachabilitySourceProduct,
+    execute_call_reachability_sink, execute_call_reachability_source,
+};
 
 // An exactly empty set prefix makes every later operand irrelevant to the answer.
 pub(super) const EXACT_SHORT_CIRCUIT_DEPTH_STATUS: DepthBoundStatus = DepthBoundStatus::NotReached;
@@ -218,6 +223,9 @@ pub struct IntersectPrefixProduct {
     pub diagnostics: Vec<CodeQueryDiagnostic>,
     pub reads: Vec<crate::analyzer::read_ledger::ReadKey>,
     pub reads_closed: bool,
+    /// The operand execution's reuse verdict. Not stored: a stored prefix is
+    /// complete and `Content`.
+    pub reuse: ReuseVerdict,
 }
 
 impl IntersectPrefixProduct {
@@ -269,7 +277,7 @@ impl IntersectPrefixProduct {
             }
         }
         let mut budgeted = self.budgeted_work.clone();
-        budgeted.step_outputs = steps;
+        budgeted.step_outputs = Some(steps);
         reached_limit_counters(
             &self.work,
             &budgeted,
@@ -411,6 +419,7 @@ impl IntersectPrefixProduct {
                     file,
                     facts,
                     fact_match: FactMatch {
+                        selected_pattern_source: Default::default(),
                         node,
                         captures: Arc::from([]),
                         reported_range: None,
@@ -528,6 +537,7 @@ impl IntersectPrefixProduct {
                 {
                     return Err(CorruptIntersectProduct);
                 }
+                let enclosing = analyzer.enclosing_code_unit(&file, &range);
                 Ok(PipelineTraceValue::DispatchTarget(Box::new(
                     DispatchTargetValue {
                         site: DispatchSiteValue {
@@ -535,6 +545,7 @@ impl IntersectPrefixProduct {
                             range,
                             site_id,
                             site_ast_id,
+                            enclosing,
                             answer,
                         },
                         root_id,
@@ -621,6 +632,7 @@ impl IntersectPrefixProduct {
             return Err(CorruptIntersectProduct);
         }
         let envelope = IntersectPrefixEnvelope {
+            admission: self.budgeted_work.admission,
             seed: rel_path_string(&self.seed),
             operator: cut.operator(plan).label().to_string(),
             operands: self.encode_rows_json(plan)?,
@@ -631,11 +643,6 @@ impl IntersectPrefixProduct {
             depth_bound_status: self.depth_bound_status,
             depth_answers: self.depth_answers.clone(),
             diagnostics: self.diagnostics.clone(),
-            diagnostic_causes: self
-                .diagnostics
-                .iter()
-                .map(|diagnostic| diagnostic.incompleteness.into())
-                .collect(),
             reads_closed: self.reads_closed,
             read_set_digest: crate::analyzer::read_ledger::read_set_digest(&self.reads).to_string(),
         };
@@ -693,7 +700,8 @@ impl IntersectPrefixProduct {
         else {
             return Err(CorruptIntersectProduct);
         };
-        if envelope.operator != cut.operator(plan).label()
+        if envelope.admission != envelope.budgeted_work.admission
+            || envelope.operator != cut.operator(plan).label()
             || envelope.seed != rel_path_string(&seed)
             || !envelope.reads_closed
             || reads.is_empty()
@@ -731,13 +739,6 @@ impl IntersectPrefixProduct {
                 return Err(CorruptIntersectProduct);
             }
         }
-        if envelope.diagnostics.len() != envelope.diagnostic_causes.len() {
-            return Err(CorruptIntersectProduct);
-        }
-        let mut diagnostics = envelope.diagnostics;
-        for (diagnostic, cause) in diagnostics.iter_mut().zip(envelope.diagnostic_causes) {
-            diagnostic.incompleteness = cause.into();
-        }
         let mut product = Self {
             seed,
             operands: vec![Vec::new(); rows.len()],
@@ -747,9 +748,11 @@ impl IntersectPrefixProduct {
             completion: envelope.completion,
             depth_bound_status: envelope.depth_bound_status,
             depth_answers: envelope.depth_answers,
-            diagnostics,
+            diagnostics: envelope.diagnostics,
             reads,
             reads_closed: true,
+            // Only a complete prefix with closed reads is stored.
+            reuse: ReuseVerdict::Content,
         };
         product.decode_rows_json_with_limits(
             analyzer,
@@ -783,6 +786,10 @@ impl IntersectPrefixProduct {
                             || !trace.seed.fact_match.captures.is_empty()
                             || trace.seed.fact_match.reported_range.is_some()
                             || trace.seed.fact_match.heuristic.is_some()
+                            || !matches!(
+                                trace.seed.fact_match.selected_pattern_source,
+                                super::SelectedPatternSourceEvidence::NotRequired
+                            )
                     })
                 {
                     return Err(CorruptIntersectProduct);
@@ -801,6 +808,12 @@ impl IntersectPrefixProduct {
                     .collect::<Result<Vec<_>, CorruptIntersectProduct>>()?;
                 let identity = match &row.value {
                     PipelineValue::StructuralMatch(seed) => {
+                        if !matches!(
+                            seed.fact_match.selected_pattern_source,
+                            super::SelectedPatternSourceEvidence::NotRequired
+                        ) {
+                            return Err(CorruptIntersectProduct);
+                        }
                         if seed.file != self.seed {
                             return Err(CorruptIntersectProduct);
                         }
@@ -990,6 +1003,7 @@ impl IntersectPrefixProduct {
                             file: self.seed.clone(),
                             facts: Arc::clone(&facts),
                             fact_match: FactMatch {
+                                selected_pattern_source: Default::default(),
                                 node: node_id,
                                 captures: Arc::from([]),
                                 reported_range: None,
@@ -1049,6 +1063,7 @@ impl IntersectPrefixProduct {
                     return Err(CorruptIntersectProduct);
                 }
                 output.push(PipelineRow {
+                    call_path_evidence: None,
                     value,
                     traces: traces
                         .into_iter()
@@ -1088,6 +1103,7 @@ impl IntersectPrefixProduct {
                                     file: self.seed.clone(),
                                     facts: Arc::clone(&facts),
                                     fact_match: FactMatch {
+                                        selected_pattern_source: Default::default(),
                                         node: trace.seed_node,
                                         captures: Arc::from([]),
                                         reported_range: None,
@@ -1125,6 +1141,7 @@ pub struct CorruptIntersectProduct;
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct IntersectPrefixEnvelope {
+    admission: super::results::CodeQueryAdmissionWork,
     seed: String,
     operator: String,
     operands: serde_json::Value,
@@ -1137,57 +1154,8 @@ struct IntersectPrefixEnvelope {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     depth_answers: Vec<BoundedCallAnswer>,
     diagnostics: Vec<CodeQueryDiagnostic>,
-    diagnostic_causes: Vec<IntersectDiagnosticCause>,
     reads_closed: bool,
     read_set_digest: String,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum IntersectDiagnosticCause {
-    Content,
-    Cancelled,
-    Budget,
-    Snapshot,
-    Provider,
-}
-
-impl From<brokk_bifrost_rql::Incompleteness> for IntersectDiagnosticCause {
-    fn from(value: brokk_bifrost_rql::Incompleteness) -> Self {
-        match value {
-            brokk_bifrost_rql::Incompleteness::Content => Self::Content,
-            brokk_bifrost_rql::Incompleteness::Operational(DiagnosticExecutionCause::Cancelled) => {
-                Self::Cancelled
-            }
-            brokk_bifrost_rql::Incompleteness::Operational(DiagnosticExecutionCause::Budget) => {
-                Self::Budget
-            }
-            brokk_bifrost_rql::Incompleteness::Operational(DiagnosticExecutionCause::Snapshot) => {
-                Self::Snapshot
-            }
-            brokk_bifrost_rql::Incompleteness::Operational(DiagnosticExecutionCause::Provider) => {
-                Self::Provider
-            }
-        }
-    }
-}
-
-impl From<IntersectDiagnosticCause> for brokk_bifrost_rql::Incompleteness {
-    fn from(value: IntersectDiagnosticCause) -> Self {
-        match value {
-            IntersectDiagnosticCause::Content => Self::Content,
-            IntersectDiagnosticCause::Cancelled => {
-                Self::Operational(DiagnosticExecutionCause::Cancelled)
-            }
-            IntersectDiagnosticCause::Budget => Self::Operational(DiagnosticExecutionCause::Budget),
-            IntersectDiagnosticCause::Snapshot => {
-                Self::Operational(DiagnosticExecutionCause::Snapshot)
-            }
-            IntersectDiagnosticCause::Provider => {
-                Self::Operational(DiagnosticExecutionCause::Provider)
-            }
-        }
-    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1339,7 +1307,11 @@ fn encode_trace_value(
             if seed.python_import.is_none()
                 && seed.fact_match.captures.is_empty()
                 && seed.fact_match.reported_range.is_none()
-                && seed.fact_match.heuristic.is_none() =>
+                && seed.fact_match.heuristic.is_none()
+                && matches!(
+                    seed.fact_match.selected_pattern_source,
+                    super::SelectedPatternSourceEvidence::NotRequired
+                ) =>
         {
             IntersectTraceValueIdentity::StructuralMatch {
                 rel_path: rel_path_string(&seed.file),
@@ -1507,12 +1479,15 @@ pub struct IntersectContinuationResult {
     pub diagnostics: Vec<CodeQueryDiagnostic>,
     pub work: CodeQueryExecutionWork,
     pub budgeted_work: CodeQueryBudgetedWork,
+    /// The prefixes' and the suffix execution's joined reuse verdict.
+    pub reuse: ReuseVerdict,
 }
 
 impl IntersectContinuationResult {
     /// Project the once-executed suffix into the existing policy merge port.
     /// A withheld continuation carries no rows and remains incomplete.
     pub fn into_merged_rows(self, query: &CodeQuery) -> MergedUnitRows {
+        let reuse = self.reuse;
         match self.detailed {
             Some(detailed) => MergedUnitRows {
                 items: detailed
@@ -1533,6 +1508,7 @@ impl IntersectContinuationResult {
                 depth_bound_status: detailed.result.depth_bound_status,
                 fair_share_divisor: 1,
                 step_output_caps: unit_step_output_caps(query),
+                reuse,
             },
             None => MergedUnitRows {
                 items: Vec::new(),
@@ -1544,6 +1520,7 @@ impl IntersectContinuationResult {
                 depth_bound_status: self.depth_bound_status,
                 fair_share_divisor: 1,
                 step_output_caps: unit_step_output_caps(query),
+                reuse,
             },
         }
     }
@@ -1606,8 +1583,18 @@ pub fn continue_empty_operand_zero(
                     vec![0; branch_plan.step_output_caps().len()]
                 })
                 .collect::<Vec<_>>();
-            assert_eq!(slots[0].len(), probe.budgeted_work.step_outputs.len());
-            slots[0] = probe.budgeted_work.step_outputs.clone();
+            match &probe.budgeted_work.step_outputs {
+                Some(counts) => {
+                    assert_eq!(slots[0].len(), counts.len());
+                    slots[0] = counts.clone();
+                }
+                // A stopped probe counted nothing, and a product built from it
+                // is incomplete and never stored.
+                None => assert!(
+                    probe.completion != CodeQueryCompletion::Complete,
+                    "an uncounted probe carries its own incompleteness"
+                ),
+            }
             let mut status = probe.depth_bound_status;
             let mut depth_answers = probe.depth_answers;
             let rewrites = rebased_traversal_keys(
@@ -1647,6 +1634,7 @@ pub fn continue_empty_operand_zero(
                 diagnostics: probe.diagnostics,
                 reads,
                 reads_closed: true,
+                reuse: probe.reuse,
             }
         })
         .collect();
@@ -1686,6 +1674,11 @@ pub fn continue_intersect_prefix(
     // ProjectFile's component order for paths such as stats.rs/stats/client.rs.
     assert_eq!(seeds, plan_seed_files(&query.plan, seeds));
     assert!(seeds.windows(2).all(|pair| pair[0] != pair[1]));
+    let mut reuse = prefixes
+        .iter()
+        .fold(ReuseVerdict::Content, |reuse, prefix| {
+            reuse.join(prefix.reuse)
+        });
     let mut diagnostics = Vec::new();
     let mut charged_work = CodeQueryExecutionWork::default();
     let mut charged_budgeted = CodeQueryBudgetedWork::default();
@@ -1703,10 +1696,12 @@ pub fn continue_intersect_prefix(
             join_depth_bound_status(&mut depth_bound_status, prefix.depth_bound_status);
         }
         charged_work = charged_work.saturating_add(prefix.work);
-        if charged_budgeted.step_outputs.is_empty() {
-            charged_budgeted
-                .step_outputs
-                .resize(prefix.budgeted_work.step_outputs.len(), 0);
+        if let (Some(accumulated), Some(counts)) = (
+            charged_budgeted.step_outputs.as_mut(),
+            &prefix.budgeted_work.step_outputs,
+        ) && accumulated.is_empty()
+        {
+            accumulated.resize(counts.len(), 0);
         }
         charged_budgeted = charged_budgeted.saturating_add(&prefix.budgeted_work);
     }
@@ -1746,6 +1741,10 @@ pub fn continue_intersect_prefix(
             || cancellation.is_some_and(CancellationToken::is_cancelled)
         {
             diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
             incompleteness: brokk_bifrost_rql::Incompleteness::Content,
             code: CodeQueryDiagnosticCode::SemanticResultsOmitted,
             impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -1774,6 +1773,7 @@ pub fn continue_intersect_prefix(
             diagnostics,
             work: charged_work,
             budgeted_work: charged_budgeted,
+            reuse,
         };
     }
     let mut merged_operands = Vec::new();
@@ -1850,6 +1850,9 @@ pub fn continue_intersect_prefix(
     let mut prefix_budgeted = CodeQueryBudgetedWork::default();
     for prefix in &prefixes {
         prefix_work = prefix_work.saturating_add(prefix.work);
+        prefix_budgeted.admission = prefix_budgeted
+            .admission
+            .saturating_add(prefix.budgeted_work.admission);
         prefix_budgeted.provenance_steps = prefix_budgeted
             .provenance_steps
             .saturating_add(prefix.budgeted_work.provenance_steps);
@@ -1861,7 +1864,7 @@ pub fn continue_intersect_prefix(
             .saturating_add(prefix.budgeted_work.import_edges_resolved);
     }
     let Some(suffix_limits) = remaining_unit_limits(limits, &prefix_work, &prefix_budgeted) else {
-        push_budget_diagnostic(&mut diagnostics, &CodeQueryExecutionBudget::default());
+        push_unit_budget_diagnostic(&mut diagnostics, limits, &prefix_work, &prefix_budgeted);
         if scope.computes_depth_bound_status()
             && super::query_plan_has_bounded_call_step(&query.plan)
             && depth_bound_status != Some(DepthBoundStatus::Reached)
@@ -1875,6 +1878,7 @@ pub fn continue_intersect_prefix(
             diagnostics,
             work: charged_work,
             budgeted_work: charged_budgeted,
+            reuse,
         };
     };
     let mut detailed = execute_detailed_unit(
@@ -1908,10 +1912,19 @@ pub fn continue_intersect_prefix(
     // The injected cut output is charged while rendering the continuation so
     // its retained rows have budget evidence. The ordinary set operator does
     // not add that charge to published work.
-    detailed.work.pipeline_rows = detailed
-        .work
-        .pipeline_rows
-        .saturating_sub(detailed.budgeted_work.step_outputs[cut_node.index()]);
+    // A suffix that stopped before it counted any step charged no injected cut
+    // output, and it carries its own typed incompleteness.
+    if let Some(counts) = &detailed.budgeted_work.step_outputs {
+        detailed.work.pipeline_rows = detailed
+            .work
+            .pipeline_rows
+            .saturating_sub(counts[cut_node.index()]);
+    } else {
+        assert!(
+            detailed.result.completion() != CodeQueryCompletion::Complete,
+            "an uncounted suffix carries its own incompleteness"
+        );
+    }
     for (branch, operand) in cut.operands(&query.plan).iter().enumerate() {
         let branch_query = CodeQuery {
             plan: operand.clone(),
@@ -1928,9 +1941,10 @@ pub fn continue_intersect_prefix(
                 whole_plan.node(cut_node).dependencies()[branch],
             )];
             while let Some((source, target)) = pending.pop() {
-                detailed.budgeted_work.step_outputs[target.index()] =
-                    detailed.budgeted_work.step_outputs[target.index()]
-                        .saturating_add(slots[source.index()]);
+                if let Some(counts) = detailed.budgeted_work.step_outputs.as_mut() {
+                    counts[target.index()] =
+                        counts[target.index()].saturating_add(slots[source.index()]);
+                }
                 let source_children = branch_plan.node(source).dependencies();
                 let target_children = whole_plan.node(target).dependencies();
                 assert_eq!(source_children.len(), target_children.len());
@@ -1945,6 +1959,10 @@ pub fn continue_intersect_prefix(
     }
     for prefix in &prefixes {
         detailed.work = detailed.work.saturating_add(prefix.work);
+        detailed.budgeted_work.admission = detailed
+            .budgeted_work
+            .admission
+            .saturating_add(prefix.budgeted_work.admission);
         detailed.budgeted_work.provenance_steps = detailed
             .budgeted_work
             .provenance_steps
@@ -1957,6 +1975,13 @@ pub fn continue_intersect_prefix(
             .budgeted_work
             .import_edges_resolved
             .saturating_add(prefix.budgeted_work.import_edges_resolved);
+        // The continuation ran no seed (its operands were injected), so its
+        // own count is a measured zero and the prefixes carry the candidates.
+        detailed.budgeted_work.candidate_sites = detailed
+            .budgeted_work
+            .candidate_sites
+            .zip(prefix.budgeted_work.candidate_sites)
+            .map(|(total, prefix)| total.saturating_add(prefix));
     }
     for branch in 0..cut.operands(&query.plan).len() {
         for prefix in &prefixes {
@@ -2003,7 +2028,9 @@ pub fn continue_intersect_prefix(
         // a later suffix stops before completion.
         detailed.result.depth_bound_status = Some(DepthBoundStatus::Unknown);
     }
+    reuse.join_in(detailed.reuse);
     IntersectContinuationResult {
+        reuse,
         depth_bound_status: detailed.result.depth_bound_status,
         detailed: Some(detailed),
         completion,
@@ -2067,6 +2094,7 @@ pub fn execute_intersect_prefix(
         &mut row_keys,
         None,
     );
+    ledger.join_verdict(detailed.reuse);
     let operands = capture
         .lock()
         .expect("prefix capture lock is not poisoned")
@@ -2082,6 +2110,11 @@ pub fn execute_intersect_prefix(
             SetOperator::Intersect => PhysicalQueryOperator::SequentialIntersection,
             SetOperator::Except => PhysicalQueryOperator::SequentialExcept,
         }
+    );
+    assert!(
+        detailed.budgeted_work.step_outputs.is_some()
+            || detailed.result.completion() != CodeQueryCompletion::Complete,
+        "an uncounted prefix carries its own incompleteness"
     );
     let mut operand_step_outputs = Vec::with_capacity(cut.operands(&query.plan).len());
     for (branch, operand) in cut.operands(&query.plan).iter().enumerate() {
@@ -2099,7 +2132,9 @@ pub fn execute_intersect_prefix(
             physical.node(cut_node).dependencies()[branch],
         )];
         while let Some((source, target)) = pending.pop() {
-            slots[source.index()] = detailed.budgeted_work.step_outputs[target.index()];
+            if let Some(counts) = &detailed.budgeted_work.step_outputs {
+                slots[source.index()] = counts[target.index()];
+            }
             pending.extend(
                 branch_plan
                     .node(source)
@@ -2133,6 +2168,7 @@ pub fn execute_intersect_prefix(
         diagnostics: detailed.result.diagnostics,
         reads: ledger.keys(),
         reads_closed,
+        reuse: detailed.reuse,
     }
 }
 
@@ -2241,6 +2277,10 @@ impl CallBindingReadReceipts {
 
 #[derive(Debug, Clone)]
 pub struct CodeQueryExecutionScope<'a> {
+    pub(super) refusal_subject_limit: Option<usize>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) reachability_probe: Option<super::reached_sinks::CallReachabilityDemandProbe>,
+    pub(super) sink_sites: Option<Arc<super::reached_sinks::ReachedSinkSites>>,
     isolated_call_binding_receipts: Option<CallBindingReadReceipts>,
     call_binding_receipts: Option<CallBindingReadReceipts>,
     owned_call_anchors: Option<Arc<OwnedCallAnchors>>,
@@ -2259,6 +2299,7 @@ pub struct CodeQueryExecutionScope<'a> {
     shared_call_target_outcomes:
         Option<crate::analyzer::usages::call_relations::CallTargetOutcomeCache>,
     intersect_operands: Option<std::sync::Arc<Vec<Vec<PipelineRow>>>>,
+    pub(super) reachability_operands: Option<Arc<CallReachabilityOperands>>,
     intersect_prefix_capture: Option<IntersectPrefixCapture>,
     except_left_capture: Option<Arc<std::sync::Mutex<Option<bool>>>>,
     /// Words the host accepts as spelled correctly, for relations that guess
@@ -2272,6 +2313,11 @@ pub struct CodeQueryExecutionScope<'a> {
     /// The file whose call sites a reverse-in-file plan answers. Seeds then
     /// range over the workspace: the operand denotes the targets everywhere.
     reverse_entered_file: Option<&'a ProjectFile>,
+    /// Whether the execution counts the sites its anchor seeds select into
+    /// `CodeQueryBudgetedWork::candidate_sites`. An execution that exists only
+    /// to answer a non-anchor operand, such as the sinks of a call
+    /// reachability relation, turns this off so its seeds are not candidates.
+    candidate_census: bool,
 }
 
 impl Default for CodeQueryExecutionScope<'_> {
@@ -2281,6 +2327,29 @@ impl Default for CodeQueryExecutionScope<'_> {
 }
 
 impl<'a> CodeQueryExecutionScope<'a> {
+    pub fn refusal_subject_limit(&self) -> Option<usize> {
+        self.refusal_subject_limit
+    }
+
+    /// Mark a policy execution with the host's existing report allowance.
+    /// Evidence stays full through query and unit merges; policy rendering
+    /// applies the host budget once. None selects ordinary unit/direct mode,
+    /// without transient site keys. This adds no query or completion limit.
+    pub fn with_refusal_subject_limit(mut self, limit: Option<usize>) -> Self {
+        self.refusal_subject_limit = limit;
+        self
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn with_call_reachability_probe(
+        mut self,
+        probe: super::reached_sinks::CallReachabilityDemandProbe,
+    ) -> Self {
+        self.reachability_probe = Some(probe);
+        self
+    }
+
     /// Opt in only after proving a complete structural call inventory. The
     /// sink belongs to this execution; default queries do not capture it.
     #[doc(hidden)]
@@ -2350,6 +2419,19 @@ impl<'a> CodeQueryExecutionScope<'a> {
         self.reverse_entered_file
     }
 
+    /// Do not count this execution's seeds as candidate sites. For an execution
+    /// that answers a non-anchor operand (the sinks of a call reachability
+    /// relation); its product then contributes a measured zero to a sum.
+    #[doc(hidden)]
+    pub const fn without_candidate_census(mut self) -> Self {
+        self.candidate_census = false;
+        self
+    }
+
+    pub(super) const fn counts_candidate_sites(&self) -> bool {
+        self.candidate_census
+    }
+
     /// Compute traversal completion evidence for a consumer that requests it.
     /// Direct RQL defaults to enabled; policy hosts use their completion declaration.
     #[doc(hidden)]
@@ -2375,6 +2457,10 @@ impl<'a> CodeQueryExecutionScope<'a> {
         Self {
             #[cfg(any(test, feature = "test-support"))]
             binding_candidate_probe: None,
+            #[cfg(any(test, feature = "test-support"))]
+            reachability_probe: None,
+            sink_sites: None,
+            refusal_subject_limit: None,
             isolated_call_binding_receipts: None,
             call_binding_receipts: None,
             owned_call_anchors: None,
@@ -2386,11 +2472,13 @@ impl<'a> CodeQueryExecutionScope<'a> {
             depth_key_rewrites: None,
             shared_call_target_outcomes: None,
             intersect_operands: None,
+            reachability_operands: None,
             intersect_prefix_capture: None,
             except_left_capture: None,
             identifier_dictionary: None,
             identifier_typos: None,
             reverse_entered_file: None,
+            candidate_census: true,
         }
     }
 
@@ -2432,6 +2520,10 @@ impl<'a> CodeQueryExecutionScope<'a> {
         Self {
             #[cfg(any(test, feature = "test-support"))]
             binding_candidate_probe: None,
+            #[cfg(any(test, feature = "test-support"))]
+            reachability_probe: None,
+            sink_sites: None,
+            refusal_subject_limit: None,
             isolated_call_binding_receipts: None,
             call_binding_receipts: None,
             owned_call_anchors: None,
@@ -2443,11 +2535,13 @@ impl<'a> CodeQueryExecutionScope<'a> {
             depth_key_rewrites: None,
             shared_call_target_outcomes: None,
             intersect_operands: None,
+            reachability_operands: None,
             intersect_prefix_capture: None,
             except_left_capture: None,
             identifier_dictionary: None,
             identifier_typos: None,
             reverse_entered_file: None,
+            candidate_census: true,
         }
     }
 
@@ -2504,9 +2598,32 @@ impl<'a> CodeQueryExecutionScope<'a> {
         self.identifier_dictionary.unwrap_or(&EMPTY)
     }
 
+    /// An independent ordinary plan inside a projecting operator. Preserve
+    /// workspace inputs, but not the caller's seed/candidate restrictions or
+    /// retained-prefix capture hooks: those belong to the outer plan.
+    pub(super) fn nested_workspace_plan(&self) -> Self {
+        let mut scope = Self::whole_workspace();
+        scope.workspace_files = self.workspace_files;
+        scope.depth_bound_status = self.depth_bound_status;
+        scope.shared_call_target_outcomes = self.shared_call_target_outcomes().cloned();
+        scope.identifier_dictionary = self.identifier_dictionary;
+        scope.identifier_typos = self.identifier_typos;
+        // A nested plan is a non-anchor operand (the sinks of a reachability
+        // relation); its seeds are not the query's candidates.
+        scope.candidate_census = false;
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            scope.reachability_probe = self.reachability_probe.clone();
+        }
+        scope
+    }
+
     /// The exact files seed enumeration is restricted to, if any.
-    pub const fn seed_files(&self) -> Option<&'a [ProjectFile]> {
-        self.seed_files
+    pub fn seed_files(&self) -> Option<&[ProjectFile]> {
+        self.sink_sites
+            .as_ref()
+            .map(|sites| sites.files())
+            .or(self.seed_files)
     }
 
     /// The whole-workspace enumeration, if the caller already computed it.
@@ -2562,6 +2679,16 @@ impl<'a> CodeQueryExecutionScope<'a> {
         if let Some(capture) = &self.except_left_capture {
             *capture.lock().expect("except capture lock is not poisoned") = Some(complete_empty);
         }
+    }
+
+    /// Bind validated typed operands without importing their read receipts into
+    /// this continuation's traversal ledger.
+    pub fn with_call_reachability_operands(
+        mut self,
+        operands: Arc<CallReachabilityOperands>,
+    ) -> Self {
+        self.reachability_operands = Some(operands);
+        self
     }
 
     pub(super) fn with_intersect_operands(mut self, rows: Vec<Vec<PipelineRow>>) -> Self {
@@ -2662,7 +2789,7 @@ pub fn execute_code_query_unit(
 /// admission; its cumulative work is telemetry, not a cumulative limit.
 pub fn remaining_unit_limits(
     limits: CodeQueryExecutionLimits,
-    work: &CodeQueryExecutionWork,
+    _work: &CodeQueryExecutionWork,
     budgeted: &CodeQueryBudgetedWork,
 ) -> Option<CodeQueryExecutionLimits> {
     let subtract =
@@ -2670,19 +2797,22 @@ pub fn remaining_unit_limits(
     let remaining = CodeQueryExecutionLimits {
         max_scanned_files: subtract(
             limits.max_scanned_files,
-            work.scanned_files.max(budgeted.import_files_resolved),
+            budgeted
+                .admission
+                .scanned_files
+                .max(budgeted.import_files_resolved),
         ),
         max_scanned_source_bytes: subtract(
             limits.max_scanned_source_bytes,
-            work.scanned_source_bytes,
+            budgeted.admission.scanned_source_bytes,
         ),
-        max_fact_nodes: subtract(
-            limits.max_fact_nodes,
-            work.fact_nodes.saturating_add(work.examined_references),
-        ),
+        max_call_answers: subtract(limits.max_call_answers, budgeted.admission.call_answers),
+        max_fact_nodes: subtract(limits.max_fact_nodes, budgeted.admission.fact_nodes),
         max_pipeline_rows: subtract(
             limits.max_pipeline_rows,
-            work.pipeline_rows
+            budgeted
+                .admission
+                .pipeline_rows
                 .max(budgeted.provenance_steps)
                 .max(budgeted.import_edges_resolved),
         ),
@@ -2691,19 +2821,87 @@ pub fn remaining_unit_limits(
     (remaining.max_scanned_files > 0
         && remaining.max_scanned_source_bytes > 0
         && remaining.max_fact_nodes > 0
+        && remaining.max_call_answers > 0
         && remaining.max_pipeline_rows > 0)
         .then_some(remaining)
 }
 
 /// Name an exhausted unit budget as the cause of a truncated merge whose
 /// remaining physical limits left no room for further units.
-pub fn push_unit_budget_diagnostic(diagnostics: &mut Vec<CodeQueryDiagnostic>) {
-    push_budget_diagnostic(diagnostics, &CodeQueryExecutionBudget::default());
+pub fn push_unit_budget_diagnostic(
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    limits: CodeQueryExecutionLimits,
+    work: &CodeQueryExecutionWork,
+    budgeted: &CodeQueryBudgetedWork,
+) {
+    let remaining = |cap: usize, used: u64| used >= cap as u64;
+    let mut projected = CodeQueryExecutionBudget::default();
+    // No new charge was attempted: the next unit could not start. Name only
+    // lanes with no remaining allowance and leave the attempted charge absent.
+    if remaining(
+        limits.max_scanned_files,
+        work.scanned_files.max(budgeted.import_files_resolved),
+    ) {
+        projected.scanned_files = limits.max_scanned_files.saturating_add(1);
+    }
+    if remaining(limits.max_scanned_source_bytes, work.scanned_source_bytes) {
+        projected.scanned_source_bytes = limits.max_scanned_source_bytes.saturating_add(1);
+    }
+    if remaining(
+        limits.max_fact_nodes,
+        work.fact_nodes.saturating_add(work.examined_references),
+    ) {
+        projected.fact_nodes = limits.max_fact_nodes.saturating_add(1);
+    }
+    if remaining(
+        limits.max_pipeline_rows,
+        work.pipeline_rows
+            .max(budgeted.provenance_steps)
+            .max(budgeted.import_edges_resolved),
+    ) {
+        projected.pipeline_rows = limits.max_pipeline_rows.saturating_add(1);
+    }
+    let mut refused = Vec::new();
+    let consumed = CodeQueryExecutionBudget {
+        scanned_files: usize::try_from(work.scanned_files.max(budgeted.import_files_resolved))
+            .unwrap_or(usize::MAX),
+        scanned_source_bytes: usize::try_from(work.scanned_source_bytes).unwrap_or(usize::MAX),
+        fact_nodes: usize::try_from(work.fact_nodes).unwrap_or(usize::MAX),
+        examined_references: usize::try_from(work.examined_references).unwrap_or(usize::MAX),
+        pipeline_rows: usize::try_from(
+            work.pipeline_rows
+                .max(budgeted.provenance_steps)
+                .max(budgeted.import_edges_resolved),
+        )
+        .unwrap_or(usize::MAX),
+        ..Default::default()
+    };
+    push_budget_diagnostic(
+        &mut refused,
+        &projected,
+        limits,
+        Some(&consumed),
+        "unit_admission",
+    );
+    for diagnostic in &mut refused {
+        for root in &mut diagnostic.exhausted_roots {
+            root.charge = None;
+        }
+    }
+    for diagnostic in refused {
+        merge_budget_diagnostic(diagnostics, diagnostic);
+    }
 }
 
 /// Report units or leaves omitted after a physical allowance ran out.
-pub fn push_skipped_unit_diagnostic(diagnostics: &mut Vec<CodeQueryDiagnostic>, skipped: usize) {
-    push_unit_budget_diagnostic(diagnostics);
+pub fn push_skipped_unit_diagnostic(
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    skipped: usize,
+    limits: CodeQueryExecutionLimits,
+    work: &CodeQueryExecutionWork,
+    budgeted: &CodeQueryBudgetedWork,
+) {
+    push_unit_budget_diagnostic(diagnostics, limits, work, budgeted);
     let diagnostic = diagnostics
         .iter_mut()
         .find(|diagnostic| diagnostic.code == CodeQueryDiagnosticCode::ExecutionBudgetExhausted)
@@ -2764,6 +2962,10 @@ fn execute_seed_union_unit(
     let mut budgeted_work = CodeQueryBudgetedWork::default();
     let mut diagnostics = Vec::new();
     let mut truncated = false;
+    let mut reuse = ReuseVerdict::Content;
+    // Every leaf of a union is an anchor. Their counts cannot be added, because
+    // one site two leaves both select counts once in the whole execution.
+    let mut candidate_sites: Option<HashSet<SeedSite>> = Some(HashSet::default());
 
     let mut depth_answers = Vec::new();
     let mut depth_bound_status = None;
@@ -2771,8 +2973,16 @@ fn execute_seed_union_unit(
     let leaf_count = leaves.len();
     for (index, (leaf, branch_path, inherited_suffix_steps)) in leaves.into_iter().enumerate() {
         let Some(remaining) = remaining_unit_limits(limits, &work, &budgeted_work) else {
-            push_skipped_unit_diagnostic(&mut diagnostics, leaf_count - index);
+            push_skipped_unit_diagnostic(
+                &mut diagnostics,
+                leaf_count - index,
+                limits,
+                &work,
+                &budgeted_work,
+            );
             truncated = true;
+            // A skipped leaf selected candidates nobody counted.
+            candidate_sites = None;
             if scope.computes_depth_bound_status() {
                 depth_answers.extend(unknown_depth_answers(&query.plan));
             }
@@ -2797,9 +3007,11 @@ fn execute_seed_union_unit(
                 .expect("a seed-union unit requires whole-workspace files"),
             &branch_path,
         )
+        .with_refusal_subject_limit(scope.refusal_subject_limit)
         .with_depth_bound_status(scope.computes_depth_bound_status())
         .with_shared_call_target_outcomes_from(&scope)
         .with_spelling_inputs_from(&scope);
+        leaf_scope.reachability_operands = scope.reachability_operands.clone();
         leaf_scope.inherited_suffix_steps = inherited_suffix_steps;
         leaf_scope.depth_key_rewrites = Some(Arc::new(leaf_traversal_rewrites(
             &query.plan,
@@ -2818,11 +3030,21 @@ fn execute_seed_union_unit(
             None,
         );
         let mut leaf_result = project_unit_result(&detailed, row_keys);
+        match (
+            candidate_sites.as_mut(),
+            leaf_result.budgeted_work.candidate_sites,
+        ) {
+            (Some(sites), Some(_)) => sites.extend(detailed.candidate_site_set.iter().cloned()),
+            _ => candidate_sites = None,
+        }
         if leaf_result.depth_answers.is_empty() {
             join_depth_bound_status(&mut depth_bound_status, leaf_result.depth_bound_status);
         }
         depth_answers.append(&mut leaf_result.depth_answers);
         work = work.saturating_add(leaf_result.work);
+        budgeted_work.admission = budgeted_work
+            .admission
+            .saturating_add(leaf_result.budgeted_work.admission);
         budgeted_work.provenance_steps = budgeted_work
             .provenance_steps
             .saturating_add(leaf_result.budgeted_work.provenance_steps);
@@ -2832,11 +3054,18 @@ fn execute_seed_union_unit(
         budgeted_work.import_edges_resolved = budgeted_work
             .import_edges_resolved
             .saturating_add(leaf_result.budgeted_work.import_edges_resolved);
-        budgeted_work
-            .step_outputs
-            .extend(leaf_result.budgeted_work.step_outputs);
+        // A leaf that stopped before it counted its steps leaves its slots
+        // unknown, and so the whole unit's.
+        match (
+            budgeted_work.step_outputs.as_mut(),
+            leaf_result.budgeted_work.step_outputs,
+        ) {
+            (Some(counts), Some(leaf_counts)) => counts.extend(leaf_counts),
+            _ => budgeted_work.step_outputs = None,
+        }
         diagnostics.append(&mut leaf_result.diagnostics);
         truncated |= leaf_result.truncated;
+        reuse.join_in(leaf_result.reuse);
         rows.append(&mut leaf_result.rows);
     }
 
@@ -2847,9 +3076,11 @@ fn execute_seed_union_unit(
     );
 
     // Skipped suffix leaves still occupy their physical-plan counter slots.
-    budgeted_work
-        .step_outputs
-        .resize(unit_step_output_caps(query).len(), 0);
+    if let Some(counts) = budgeted_work.step_outputs.as_mut() {
+        counts.resize(unit_step_output_caps(query).len(), 0);
+    }
+    budgeted_work.candidate_sites =
+        candidate_sites.map(|sites| u64::try_from(sites.len()).unwrap_or(u64::MAX));
     join_depth_bound_status(
         &mut depth_bound_status,
         reconciled_depth_status(&depth_answers),
@@ -2864,6 +3095,7 @@ fn execute_seed_union_unit(
         depth_answers,
         diagnostics,
         truncated,
+        reuse,
     }
 }
 
@@ -2962,6 +3194,7 @@ fn project_unit_result(
         depth_answers: detailed.depth_answers.clone(),
         diagnostics: detailed.result.diagnostics.clone(),
         truncated: detailed.result.truncated,
+        reuse: detailed.reuse,
     }
 }
 
@@ -3512,6 +3745,8 @@ fn semantic_unit_row_key(key_value: &SemanticPipelineKey) -> UnitRowKey {
 /// model, which is why a plan carrying it classifies as `Whole`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnitRowEvidence {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_path_evidence: Option<CallPathEvidence>,
     pub domain: DetailedCodeQueryDomain,
     pub key: DetailedCodeQueryKey,
     pub rel_path: Box<str>,
@@ -3634,6 +3869,7 @@ impl UnitRowEvidence {
             key: reference.key,
             rel_path: reference.rel_path,
             byte_span: reference.byte_span,
+            call_path_evidence: evidence.call_path_evidence.clone(),
             stable_owner_candidate: evidence.stable_owner_candidate.clone(),
             identities: reference.identities,
             source_slice_sha256: reference.source_slice_sha256,
@@ -3661,6 +3897,7 @@ impl UnitRowEvidence {
             root,
         );
         DetailedCodeQueryEvidence {
+            selected_pattern_source: Default::default(),
             result_index,
             domain: reference.domain,
             key: reference.key,
@@ -3675,6 +3912,7 @@ impl UnitRowEvidence {
                 .map(|provenance| provenance.to_detailed(root))
                 .collect(),
             decorated_parameter: None,
+            call_path_evidence: self.call_path_evidence.clone(),
             runtime_keyed_read: None,
         }
     }
@@ -4063,6 +4301,11 @@ pub enum UnitRowItemTerminal {
         ancestry_basis: crate::analyzer::usages::python_class_hierarchy::PythonAncestryBasis,
     },
     SourcePosition,
+    RustPointerFinding {
+        source_ranges: Vec<CodeQuerySourceSpan>,
+        #[serde(default)]
+        source_ranges_omitted: brokk_bifrost_core::omission::OmissionCount,
+    },
     GenerationSite {
         id: Box<str>,
         ast_id: Option<Box<str>>,
@@ -4400,7 +4643,6 @@ impl UnitRowItemTerminal {
             | CodeQueryResultValue::PendingCleanupFlow { .. }
             | CodeQueryResultValue::PythonRuleFact { .. }
             | CodeQueryResultValue::RustMarkerImpl { .. }
-            | CodeQueryResultValue::RustPointerFinding { .. }
             | CodeQueryResultValue::Guard { .. }
             | CodeQueryResultValue::QualifiedPath { .. }
             | CodeQueryResultValue::Export { .. }
@@ -4412,6 +4654,12 @@ impl UnitRowItemTerminal {
             | CodeQueryResultValue::BuildConfiguration { .. }
             | CodeQueryResultValue::DependencyEvidence { .. }
             | CodeQueryResultValue::ConfigurationFact { .. } => UnitRowItemTerminal::SourcePosition,
+            CodeQueryResultValue::RustPointerFinding { value } => {
+                UnitRowItemTerminal::RustPointerFinding {
+                    source_ranges: value.source_ranges.clone(),
+                    source_ranges_omitted: value.source_ranges_omitted,
+                }
+            }
             CodeQueryResultValue::CrossDomain { value } => UnitRowItemTerminal::CrossDomain {
                 operator: boxed(value.operator),
                 domain: boxed(value.domain),
@@ -4779,6 +5027,10 @@ pub enum UnitRowItemRefValue {
         parameter_id: Box<str>,
         range: CodeQueryRange,
     },
+    /// Canonical source owner; never an executable interpretation ID.
+    Procedure {
+        source_owner: CodeQueryStableOwnerCandidate,
+    },
 }
 
 impl UnitRowItemProvenance {
@@ -5078,6 +5330,12 @@ impl UnitRowItemRef {
                     node_range: Some(*range),
                 }
             }
+            CodeQueryResultRef::Procedure {
+                source_owner: Some(source_owner),
+                ..
+            } => UnitRowItemRefValue::Procedure {
+                source_owner: source_owner.clone(),
+            },
             _ => UnitRowItemRefValue::Unsupported,
         };
         Self {
@@ -5129,6 +5387,16 @@ pub struct UnitExecutionResult {
     pub depth_answers: Vec<BoundedCallAnswer>,
     pub diagnostics: Vec<CodeQueryDiagnostic>,
     pub truncated: bool,
+    /// The execution's reuse verdict. Not persisted: only a unit whose
+    /// receipt is bounded is published, so a stored unit is `Content`.
+    #[serde(skip)]
+    pub reuse: ReuseVerdict,
+}
+
+impl CarriesReuseVerdict for UnitExecutionResult {
+    fn reuse_verdict(&self) -> ReuseVerdict {
+        self.reuse
+    }
 }
 
 impl UnitExecutionResult {
@@ -5147,7 +5415,10 @@ impl UnitExecutionResult {
 
     /// Persisted unit products must retain one work slot per physical step.
     pub fn has_valid_step_outputs(&self, query: &CodeQuery) -> bool {
-        self.budgeted_work.step_outputs.len() == unit_step_output_caps(query).len()
+        self.budgeted_work
+            .step_outputs
+            .as_ref()
+            .is_some_and(|counts| counts.len() == unit_step_output_caps(query).len())
     }
 }
 
@@ -5164,6 +5435,8 @@ pub struct MergedUnitRows {
     pub depth_bound_status: Option<DepthBoundStatus>,
     fair_share_divisor: usize,
     step_output_caps: Vec<Option<StepOutputCap>>,
+    /// The merged units' joined reuse verdict.
+    pub reuse: ReuseVerdict,
 }
 
 pub(super) fn join_depth_bound_status(
@@ -5349,9 +5622,11 @@ pub fn merge_unit_rows_in_scope(
     };
     let mut step_output_caps = unit_step_output_caps(query);
     let mut raw_rows = Vec::new();
+    let mut reuse = ReuseVerdict::Content;
 
     for unit in units {
         any_units = true;
+        reuse.join_in(unit.reuse);
         except_left_complete_empty &= unit.except_left_complete_empty == Some(true);
         if unit.depth_answers.is_empty() {
             join_depth_bound_status(&mut depth_bound_status, unit.depth_bound_status);
@@ -5366,6 +5641,8 @@ pub fn merge_unit_rows_in_scope(
         truncated |= unit.truncated;
         raw_rows.extend(unit.rows);
     }
+
+    diagnostics = super::merge_refused_sites(diagnostics);
 
     if any_units
         && except_left_complete_empty
@@ -5390,15 +5667,18 @@ pub fn merge_unit_rows_in_scope(
     // typed rows. Select the counter layout actually carried by the products;
     // if layouts have equal length, use the stricter cap in each slot so an
     // ambiguous layout can only widen early.
-    if union
-        && !budgeted_work
-            .as_ref()
-            .is_none_or(|work| work.step_outputs.is_empty())
-    {
+    //
+    // A unit that never counted its steps carries no layout; the merge is then
+    // unknown whatever the caps, and reached_limit reports it as undecidable.
+    let counted_layout = budgeted_work
+        .as_ref()
+        .and_then(|work| work.step_outputs.as_ref())
+        .map(Vec::len)
+        .filter(|&count| count > 0);
+    if union && let Some(count) = counted_layout {
         let whole = select_physical_plan(query, UnionExecutionStrategy::Sequential, 1, 0)
             .expect("an eligible union has a physical plan")
             .step_output_caps();
-        let count = budgeted_work.as_ref().unwrap().step_outputs.len();
         if count == whole.len() && count == step_output_caps.len() {
             for (cap, whole_cap) in step_output_caps.iter_mut().zip(whole) {
                 *cap = match (*cap, whole_cap) {
@@ -5468,6 +5748,7 @@ pub fn merge_unit_rows_in_scope(
         depth_bound_status,
         fair_share_divisor,
         step_output_caps,
+        reuse,
     }
 }
 
@@ -5559,6 +5840,12 @@ fn merge_duplicate_row(item: &mut UnitRowItem, evidence: &mut UnitRowEvidence, r
         row.evidence.provenance.len(),
         "a duplicate row's item and evidence provenance remain aligned"
     );
+    if let Some(incoming) = row.evidence.call_path_evidence.clone() {
+        match &mut evidence.call_path_evidence {
+            Some(existing) => existing.merge(incoming),
+            slot @ None => *slot = Some(incoming),
+        }
+    }
     let remaining = MAX_PROVENANCE_TRACES.saturating_sub(item.provenance.len());
     if row.item.provenance.len() > remaining {
         item.provenance_truncated = true;
@@ -5616,6 +5903,10 @@ pub fn structural_seed_file_order(left: &ProjectFile, right: &ProjectFile) -> st
 ///
 /// [`Whole`]: crate::query::PlanPartitioning::Whole
 pub fn plan_seed_files(plan: &CodeQueryPlan, files: &[ProjectFile]) -> Vec<ProjectFile> {
+    let mut plan = plan;
+    while let CodeQueryPlanSource::CallReachability(relation) = &plan.source {
+        plan = &relation.sources;
+    }
     let (leaves, structural) = match PlanPartitioning::classify_for_prefix(plan) {
         PlanPartitioning::BySeedUnion => {
             let leaves = PlanPartitioning::union_leaf_plans(plan)
@@ -5688,7 +5979,7 @@ pub fn plan_seed_files(plan: &CodeQueryPlan, files: &[ProjectFile]) -> Vec<Proje
         if leaf_languages.is_empty() {
             accepts_all_languages = true;
         }
-        for language in leaf_languages {
+        for language in &leaf_languages {
             if !languages.contains(language) {
                 languages.push(*language);
             }
@@ -5710,26 +6001,50 @@ pub fn plan_seed_files(plan: &CodeQueryPlan, files: &[ProjectFile]) -> Vec<Proje
     selected
 }
 
-/// Return a seed's language filter and its seed-file comparator family.
-fn seed_languages(plan: &CodeQueryPlan) -> (&[Language], bool) {
-    match &plan.source {
-        CodeQueryPlanSource::Seed(seed) => (&seed.languages, true),
-        CodeQueryPlanSource::Occurrences(seed) => (&seed.languages, false),
-        CodeQueryPlanSource::Scopes(seed) => (&seed.languages, false),
-        CodeQueryPlanSource::Bindings(seed) => (&seed.languages, false),
-        CodeQueryPlanSource::Paths(seed) => (&seed.languages, false),
-        CodeQueryPlanSource::GenerationSites(seed) => (&seed.languages, false),
-        CodeQueryPlanSource::Exports(seed) => (&seed.languages, false),
-        CodeQueryPlanSource::DependencyEvidence(_) | CodeQueryPlanSource::ConfigurationFacts(_) => {
-            (&[], false)
-        }
-        CodeQueryPlanSource::Set { .. } => {
-            unreachable!("a seed enumeration leaf has no set source")
-        }
-        CodeQueryPlanSource::Correlate(_) | CodeQueryPlanSource::RequireBoth(_) => {
-            unreachable!("cross-domain plans are whole and never union leaves")
+/// Return source-seed languages and the comparator family proved by admission.
+/// Reachability sources can contain sets even when an outer union treats the
+/// reachability plan as a leaf. Sinks do not enumerate this unit's sources.
+fn seed_languages(plan: &CodeQueryPlan) -> (Vec<Language>, bool) {
+    let mut pending = vec![plan];
+    let mut languages = Vec::new();
+    let mut accepts_all = false;
+    let mut structural = None;
+    while let Some(plan) = pending.pop() {
+        let (selected, family) = match &plan.source {
+            CodeQueryPlanSource::Seed(seed) => (&seed.languages[..], true),
+            CodeQueryPlanSource::Occurrences(seed) => (&seed.languages[..], false),
+            CodeQueryPlanSource::Scopes(seed) => (&seed.languages[..], false),
+            CodeQueryPlanSource::Bindings(seed) => (&seed.languages[..], false),
+            CodeQueryPlanSource::Paths(seed) => (&seed.languages[..], false),
+            CodeQueryPlanSource::GenerationSites(seed) => (&seed.languages[..], false),
+            CodeQueryPlanSource::Exports(seed) => (&seed.languages[..], false),
+            CodeQueryPlanSource::DependencyEvidence(_)
+            | CodeQueryPlanSource::ConfigurationFacts(_) => (&[][..], false),
+            CodeQueryPlanSource::Set { branches, .. } => {
+                pending.extend(branches.iter().rev());
+                continue;
+            }
+            CodeQueryPlanSource::CallReachability(relation) => {
+                pending.push(&relation.sources);
+                continue;
+            }
+            CodeQueryPlanSource::Correlate(_) | CodeQueryPlanSource::RequireBoth(_) => {
+                unreachable!("cross-domain plans are whole and never union leaves")
+            }
+        };
+        debug_assert!(structural.is_none_or(|known| known == family));
+        structural.get_or_insert(family);
+        accepts_all |= selected.is_empty();
+        for language in selected {
+            if !languages.contains(language) {
+                languages.push(*language);
+            }
         }
     }
+    if accepts_all {
+        languages.clear();
+    }
+    (languages, structural.unwrap_or(false))
 }
 
 /// The cumulative cap a merged product reached, if it reached one.
@@ -5738,8 +6053,10 @@ fn seed_languages(plan: &CodeQueryPlan) -> (&[Language], bool) {
 /// execution. A merge of per-seed executions equals the whole execution only
 /// while none of them was reached: at the cap the whole run could have
 /// truncated somewhere in its own order, and a sum that over-counts what two
-/// units both reached cannot say where. So a caller that sees any arm here
-/// must evaluate the whole query instead of merging.
+/// units both reached cannot say where. A caller requiring the whole answer
+/// uses this to reject equivalence. Budget-limited sliced policies retain their
+/// correct partial answers and report incompleteness; reaching a cap alone does
+/// not require them to repeat the whole query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MergedLimit {
     /// At least one unit reported its own truncation.
@@ -5749,6 +6066,7 @@ pub enum MergedLimit {
     ScannedFiles,
     ScannedSourceBytes,
     FactNodes,
+    CallAnswers,
     PipelineRows,
     StepOutputs,
     SemanticMaterializedFiles,
@@ -5767,6 +6085,7 @@ impl MergedLimit {
             Self::ScannedFiles => "scanned_files",
             Self::ScannedSourceBytes => "scanned_source_bytes",
             Self::FactNodes => "fact_nodes",
+            Self::CallAnswers => "call_answers",
             Self::PipelineRows => "pipeline_rows",
             Self::StepOutputs => "step_outputs",
             Self::SemanticMaterializedFiles => "semantic_materialized_files",
@@ -5800,6 +6119,11 @@ impl MergedUnitRows {
         limits: &CodeQueryExecutionLimits,
         result_limit: usize,
     ) -> Option<MergedLimit> {
+        assert_uncounted_steps_are_incomplete(
+            &self.budgeted_work,
+            self.truncated,
+            &self.diagnostics,
+        );
         reached_limit_counters(
             &self.work,
             &self.budgeted_work,
@@ -5815,6 +6139,28 @@ impl MergedUnitRows {
 }
 
 impl UnitExecutionResult {
+    /// Ordinary operand plans execute directly, rather than through flattened
+    /// per-seed union leaves. Validate against that physical counter layout.
+    pub fn reached_ordinary_plan_limit(
+        &self,
+        query: &CodeQuery,
+        limits: &CodeQueryExecutionLimits,
+    ) -> Option<MergedLimit> {
+        let physical = select_physical_plan(query, UnionExecutionStrategy::Sequential, 1, 0)
+            .expect("an executed ordinary operand has a physical plan");
+        reached_limit_counters(
+            &self.work,
+            &self.budgeted_work,
+            self.truncated,
+            self.rows.len(),
+            1,
+            &physical.step_output_caps(),
+            limits,
+            limits.max_pipeline_rows,
+            query.limit,
+        )
+    }
+
     /// Check a stored unit's own work without copying its rows.
     pub fn reached_limit(
         &self,
@@ -5833,6 +6179,11 @@ impl UnitExecutionResult {
             | PlanPartitioning::Prefix { .. }
             | PlanPartitioning::Whole(_) => 1,
         };
+        assert_uncounted_steps_are_incomplete(
+            &self.budgeted_work,
+            self.truncated,
+            &self.diagnostics,
+        );
         reached_limit_counters(
             &self.work,
             &self.budgeted_work,
@@ -5845,6 +6196,24 @@ impl UnitExecutionResult {
             result_limit,
         )
     }
+}
+
+/// Per-step counts are unknown only for an execution that stopped before it
+/// counted any step, and that execution always says why. A cap check that sees
+/// unknown counts without a stop would be a silent path.
+fn assert_uncounted_steps_are_incomplete(
+    budgeted_work: &CodeQueryBudgetedWork,
+    truncated: bool,
+    diagnostics: &[CodeQueryDiagnostic],
+) {
+    assert!(
+        budgeted_work.step_outputs.is_some()
+            || !matches!(
+                code_query_completion(truncated, diagnostics),
+                CodeQueryCompletion::Complete | CodeQueryCompletion::ProvenSubset { .. }
+            ),
+        "an execution that never counted its steps carries its own incompleteness"
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5868,41 +6237,56 @@ fn reached_limit_counters(
         return Some(MergedLimit::ResultLimit);
     }
     if reached(
-        work.scanned_files
+        budgeted_work
+            .admission
+            .scanned_files
             .saturating_add(budgeted_work.import_files_resolved),
         physical_cap(limits.max_scanned_files),
     ) {
         return Some(MergedLimit::ScannedFiles);
     }
     if reached(
-        work.scanned_source_bytes,
+        budgeted_work.admission.scanned_source_bytes,
         physical_cap(limits.max_scanned_source_bytes),
     ) {
         return Some(MergedLimit::ScannedSourceBytes);
     }
     if reached(
-        work.fact_nodes.saturating_add(work.examined_references),
+        budgeted_work.admission.call_answers,
+        physical_cap(limits.max_call_answers),
+    ) {
+        return Some(MergedLimit::CallAnswers);
+    }
+    if reached(
+        budgeted_work.admission.fact_nodes,
         physical_cap(limits.max_fact_nodes),
     ) {
         return Some(MergedLimit::FactNodes);
     }
     if reached(
-        work.pipeline_rows
+        budgeted_work
+            .admission
+            .pipeline_rows
             .saturating_add(budgeted_work.provenance_steps)
             .saturating_add(budgeted_work.import_edges_resolved),
         physical_cap(limits.max_pipeline_rows),
     ) {
         return Some(MergedLimit::PipelineRows);
     }
+    // Unknown per-step counts decide no cap. The execution that never counted
+    // them carries its own typed incompleteness (a cancellation or an invalid
+    // plan), so say so as a truncation instead of claiming no step cap was
+    // reached.
+    let Some(step_outputs) = &budgeted_work.step_outputs else {
+        return Some(MergedLimit::UnitTruncated);
+    };
     assert!(
-        budgeted_work.step_outputs.is_empty()
-            || budgeted_work.step_outputs.len() == step_output_caps.len(),
+        step_outputs.is_empty() || step_outputs.len() == step_output_caps.len(),
         "step output counters follow the executed physical plan layout"
     );
     // The executor can stop at equality, before examining another input.
     // Set plans retain the existing conservative branch-share allowance.
-    if budgeted_work
-        .step_outputs
+    if step_outputs
         .iter()
         .zip(step_output_caps)
         .any(|(&outputs, cap)| {

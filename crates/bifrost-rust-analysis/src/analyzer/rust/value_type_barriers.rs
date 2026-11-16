@@ -240,22 +240,20 @@ impl ValueTypeBarrierContext for RustBarrierContext<'_> {
             };
             let (LexicalBindingResolution::Parameter(definition)
             | LexicalBindingResolution::OtherLocal(definition)) = binding;
-            let mut current = prepared.tree().root_node().named_descendant_for_byte_range(
-                definition.declaration_range.start_byte,
-                definition.declaration_range.end_byte,
-            );
-            let declared = loop {
-                let Some(node) = current else {
-                    return Ok(undecided());
-                };
-                match node.kind() {
-                    "parameter" | "let_declaration" => break node.child_by_field_name("type"),
-                    "function_item" | "function_signature_item" | "closure_expression" => {
-                        return Ok(undecided());
-                    }
-                    _ => current = node.parent(),
-                }
-            };
+            let declared = prepared
+                .tree()
+                .root_node()
+                .named_descendant_for_byte_range(
+                    definition.declaration_range.start_byte,
+                    definition.declaration_range.end_byte,
+                )
+                .and_then(|declaration| {
+                    super::std_types::binding_pattern_owner(
+                        declaration,
+                        definition.name_range.start_byte..definition.name_range.end_byte,
+                    )
+                })
+                .and_then(|owner| owner.child_by_field_name("type"));
             let Some(ty) = declared else {
                 return Ok(undecided());
             };
@@ -619,7 +617,7 @@ impl RustBarrierContext<'_> {
                     )?,
                     SelectedRustCallerReferenceOutcome::Operation(
                         SelectedResolutionOperationOutcome::Native(
-                            SelectedResolutionLocated::Missing,
+                            SelectedResolutionLocated::Missing(_),
                         ),
                     ) => Undecided(UnknownType),
                     SelectedRustCallerReferenceOutcome::Operation(
@@ -722,7 +720,7 @@ impl RustBarrierContext<'_> {
             .find(|(identity, _)| *identity == ty.identity())
         {
             match definition {
-                SelectedRustSourceDefinition::Unit(unit) => {
+                SelectedRustSourceDefinition::Unit(unit, _) => {
                     let prepared = match prepare_value_type_barrier_source(
                         &self.rust.inner,
                         syntax,

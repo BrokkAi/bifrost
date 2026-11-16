@@ -34,7 +34,29 @@ pub trait RustRoutePathFacts {
 /// 3: names compare ignoring ASCII case (#10469). On a case-insensitive volume
 /// rustc opens src/foo.RS for `mod foo;`, so an omitted `.RS` file must fail
 /// the certificate as an omitted `.rs` file does.
-pub const RUST_SOURCE_LISTING_DERIVATION_VERSION: i64 = 3;
+/// The identity before the last change, for certificate mismatch tests.
+pub fn rust_source_listing_derivation_identity_before_last_token() -> [u8; 32] {
+    brokk_bifrost_core::lever_tokens::lever_identity_before_last_token(
+        "rust-source-listing-derivation",
+        brokk_bifrost_core::lever_file!("rust-source-listing-derivation.tokens"),
+    )
+}
+
+pub fn rust_source_listing_derivation_identity() -> [u8; 32] {
+    static IDENTITY: std::sync::LazyLock<[u8; 32]> = std::sync::LazyLock::new(|| {
+        brokk_bifrost_core::lever_tokens::lever_identity(
+            "rust-source-listing-derivation",
+            brokk_bifrost_core::lever_file!("rust-source-listing-derivation.tokens"),
+        )
+    });
+    *IDENTITY
+}
+
+/// The Rust source-path class used by listing and selected-content proofs.
+pub fn is_rust_source_path(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("rs"))
+}
 
 /// Whether a file listing that was certified complete for Rust proves a path
 /// absent. The listing certificate covers `.rs` names and `Cargo.toml`,
@@ -45,10 +67,9 @@ pub const RUST_SOURCE_LISTING_DERIVATION_VERSION: i64 = 3;
 ///
 /// The certificate's coverage, its omission rule, the per-unit route kinds
 /// and the crate-row producer share this predicate. A change to it requires a
-/// bump of [`RUST_SOURCE_LISTING_DERIVATION_VERSION`].
+/// bump of [`rust_source_listing_derivation_identity()`].
 pub fn is_rust_listing_path(path: &Path) -> bool {
-    path.extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("rs"))
+    is_rust_source_path(path)
         || path
             .file_name()
             .is_some_and(|name| name.eq_ignore_ascii_case("Cargo.toml"))
@@ -114,9 +135,15 @@ fn case_fold_pass(text: &str) -> String {
 ///
 /// A denied candidate whose [`rust_case_fold_key`] equals a selected file's is
 /// recorded whatever its name.
+///
+/// A denied candidate that the selection holds as a file of some other unit is
+/// recorded too: the persisted unit does not know it, so a declaration that
+/// now names it (an overlay's retargeted `#[path]` or a new `mod`) leaves the
+/// unit's membership unproven rather than absent.
 pub struct SelectedRustRoutePathFacts<'a> {
     pub files: &'a HashSet<ProjectFile>,
     pub naming: &'a crate::crate_naming::RustSelectedCargoNaming,
+    held_by_selection: &'a dyn Fn(&ProjectFile) -> bool,
     folded_files: HashSet<String>,
     unproven: std::sync::Mutex<std::collections::BTreeSet<ProjectFile>>,
 }
@@ -124,10 +151,12 @@ impl<'a> SelectedRustRoutePathFacts<'a> {
     pub fn new(
         files: &'a HashSet<ProjectFile>,
         naming: &'a crate::crate_naming::RustSelectedCargoNaming,
+        held_by_selection: &'a dyn Fn(&ProjectFile) -> bool,
     ) -> Self {
         Self {
             files,
             naming,
+            held_by_selection,
             folded_files: files
                 .iter()
                 .map(|file| rust_case_fold_key(&file.rel_path().to_string_lossy()))
@@ -148,6 +177,7 @@ impl RustRoutePathFacts for SelectedRustRoutePathFacts<'_> {
             || self
                 .folded_files
                 .contains(&rust_case_fold_key(&candidate.rel_path().to_string_lossy()))
+            || (self.held_by_selection)(candidate)
         {
             self.unproven
                 .lock()
@@ -208,7 +238,7 @@ use crate::imports::{rust_external_module_route, rust_external_module_segments};
 // the total against a workspace whose crate and target count grows while its
 // file count does not.
 //
-// Loops over the module-declaration list (`build_test_only_files_while`) are
+// Loops over the module-declaration list (`build_module_file_evidence_while`) are
 // deliberately not counted: that list is not the file set, and it was one
 // bounded pass before this change and after it.
 //
@@ -235,6 +265,104 @@ fn workspace_file_sweeps_of(build: impl FnOnce()) -> usize {
     WORKSPACE_FILE_SWEEPS.with(std::cell::Cell::get)
 }
 
+/// The member files of one unit that have no active placement, split by what
+/// the stored activation proves. `proven_inactive` files are inactive in every
+/// configuration (activation 0); `undecided` files depend on a `cfg` the
+/// selection cannot decide (activation -1) and may be compiled. Both give the
+/// file itself no definite verdict, but only a proven-inactive module can be
+/// ignored as a route to other files (#11639).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RustInactivePlacements {
+    pub proven_inactive: HashSet<ProjectFile>,
+    pub undecided: HashSet<ProjectFile>,
+    /// What the stored rows prove about each placement of a file, by module
+    /// path (`crate`, `crate::a::b`). A `mod` declaration creates one
+    /// placement of its target, so this decides whether that declaration is a
+    /// route: the file's own activity is the best of its placements and says
+    /// nothing about a declaration whose placement is inactive. Empty when the
+    /// caller has no placement rows; edges are then judged by file.
+    pub placements: HashMap<ProjectFile, Vec<(String, RustPlacementState)>>,
+}
+
+/// What the stored activation proves about one placement of a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RustPlacementState {
+    Active,
+    Inactive,
+    Undecided,
+}
+
+impl RustInactivePlacements {
+    pub fn contains(&self, file: &ProjectFile) -> bool {
+        self.proven_inactive.contains(file) || self.undecided.contains(file)
+    }
+    pub fn is_proven_inactive(&self, file: &ProjectFile) -> bool {
+        self.proven_inactive.contains(file) && !self.undecided.contains(file)
+    }
+    pub fn is_empty(&self) -> bool {
+        self.proven_inactive.is_empty() && self.undecided.is_empty()
+    }
+    pub fn extend(&mut self, other: &Self) {
+        self.proven_inactive
+            .extend(other.proven_inactive.iter().cloned());
+        self.undecided.extend(other.undecided.iter().cloned());
+        for (file, placements) in &other.placements {
+            let merged = self.placements.entry(file.clone()).or_default();
+            for placement in placements {
+                if !merged.contains(placement) {
+                    merged.push(placement.clone());
+                }
+            }
+        }
+    }
+
+    /// The states of the placements that a `mod` item of `module_suffix` in
+    /// `declaring` creates of `target`, and whether they are exactly that item's
+    /// placements.
+    ///
+    /// Exact: the declaring file's own placement paths are known, so the child
+    /// paths are those paths, `::`, and the suffix. Otherwise the match is a
+    /// candidate match: every placement of `target` whose path ends with the
+    /// suffix. It holds the item's placements among others and fails closed
+    /// when ambiguous: a production route then needs every candidate Active,
+    /// and a possible route is dropped only when every candidate is Inactive.
+    /// `None` when the caller has no placement row for the target to match.
+    fn placement_states(
+        &self,
+        declaring: &ProjectFile,
+        target: &ProjectFile,
+        module_suffix: &str,
+    ) -> Option<(Vec<RustPlacementState>, bool)> {
+        let target_placements = self.placements.get(target)?;
+        let parents = self.placements.get(declaring).filter(|p| !p.is_empty());
+        let exact: Vec<RustPlacementState> = parents
+            .into_iter()
+            .flatten()
+            .filter_map(|(parent, _)| {
+                let child = format!("{parent}::{module_suffix}");
+                target_placements
+                    .iter()
+                    .find(|(path, _)| *path == child)
+                    .map(|(_, state)| *state)
+            })
+            .collect();
+        if !exact.is_empty() {
+            return Some((exact, true));
+        }
+        let candidates: Vec<RustPlacementState> = target_placements
+            .iter()
+            .filter(|(path, _)| {
+                path == module_suffix
+                    || path
+                        .strip_suffix(module_suffix)
+                        .is_some_and(|prefix| prefix.ends_with("::"))
+            })
+            .map(|(_, state)| *state)
+            .collect();
+        (!candidates.is_empty()).then_some((candidates, false))
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RustCargoRouteIndex {
     routes_by_manifest_and_name: HashMap<(PathBuf, String), Vec<RustCargoRoute>>,
@@ -247,6 +375,17 @@ pub struct RustCargoRouteIndex {
     files_by_reachable_root: HashMap<ProjectFile, Vec<ProjectFile>>,
     external_module_declarations: Vec<RustCargoModuleDeclaration>,
     test_only_files: HashSet<ProjectFile>,
+    production_witnessed_files: HashSet<ProjectFile>,
+    /// Files no selected build is proven to compile: every placement of the
+    /// file is under an inactive or unknown `cfg`, and no production route
+    /// reaches it by a live module edge.
+    inactive_files: HashSet<ProjectFile>,
+    /// The subset of `inactive_files` that is inactive in every configuration.
+    proven_inactive_files: HashSet<ProjectFile>,
+    /// Files with an active placement that an undecided `cfg` route may also
+    /// reach from a production seed, and no production route witnesses. Whether
+    /// they are test-only depends on that route, so they are not classified.
+    uncertain_files: HashSet<ProjectFile>,
 }
 
 #[derive(Debug, Clone)]
@@ -305,9 +444,51 @@ impl RustFileRoutes {
         found
     }
     pub fn file_is_test_only(&self, file: &ProjectFile) -> bool {
+        // A unit that never compiles the file says nothing about test code. A
+        // unit that may compile it does, and `false`: see
+        // `file_test_verdict_uncertain`.
+        let mut compiled = self
+            .units
+            .iter()
+            .filter(|unit| !unit.file_is_proven_inactive(file));
         self.complete
-            && !self.units.is_empty()
-            && self.units.iter().all(|unit| unit.file_is_test_only(file))
+            && compiled.next().is_some_and(|first| {
+                first.file_is_test_only(file) && compiled.all(|unit| unit.file_is_test_only(file))
+            })
+    }
+    /// Whether every unit that holds `file` places it only under an inactive or
+    /// unknown `cfg`, and none proves a production route to it. No selected
+    /// build is proven to compile such a file, so it has no definite route and
+    /// no test or production classification (#11639).
+    pub fn file_is_inactive(&self, file: &ProjectFile) -> bool {
+        !self.units.is_empty()
+            && self.units.iter().all(|unit| unit.file_is_inactive(file))
+            && !self.file_has_production_witness(file)
+    }
+    /// Whether a unit cannot say if `file` is test code (its placement is
+    /// undecided there, or an undecided `cfg` route may make it production),
+    /// and no unit proves a production route. `file_is_test_only` is `false`
+    /// then, but that is not a production verdict (#11639).
+    pub fn file_test_verdict_uncertain(&self, file: &ProjectFile) -> bool {
+        !self.file_has_production_witness(file)
+            && self
+                .units
+                .iter()
+                .any(|unit| unit.file_test_verdict_uncertain(file))
+    }
+    /// These routes with the completeness claim withdrawn.
+    pub fn into_incomplete(mut self) -> Self {
+        self.complete = false;
+        self
+    }
+    /// Whether a known unit proves that a production build compiles `file`.
+    /// Unlike `file_is_test_only`, this holds while the routes are incomplete:
+    /// facts that are not known yet can add units, roots and module edges, but
+    /// cannot remove the route that proves it.
+    pub fn file_has_production_witness(&self, file: &ProjectFile) -> bool {
+        self.units
+            .iter()
+            .any(|unit| unit.file_has_production_witness(file))
     }
     pub fn target_relation(
         &self,
@@ -604,10 +785,26 @@ fn unique_library_route(libraries: &RustUnscopedLibraries) -> Option<RustCargoRo
     }
 }
 
+/// One `mod` item behind a [`RustCargoModuleDeclaration`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RustCargoDeclaredModule {
+    /// The module path the item creates, relative to the module the declaring
+    /// file is placed at: the declared name below its enclosing inline modules,
+    /// joined by `::` (`shared`, `inner::shared`). The full path of the created
+    /// placement ends with it.
+    pub module_suffix: String,
+    /// Whether this item carries a bare `#[cfg(test)]`.
+    pub test_gated: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RustCargoModuleDeclaration {
     pub declaring_file: ProjectFile,
     pub declaring_module: String,
+    /// The declarations this one merges (every `mod` item that names the same
+    /// target file from the same module), each with the module it creates and
+    /// its own test gate. Empty only for a declaration built without them.
+    pub declared_modules: Vec<RustCargoDeclaredModule>,
     pub target_file: ProjectFile,
     pub visibility: RustVisibility,
     /// Byte offset of the `mod` declaration, including an item-macro argument
@@ -711,89 +908,112 @@ struct RustVisibleItemMacroDefinition {
 }
 
 impl RustCargoRouteIndex {
+    /// Allocated bytes of this index for the pure evictable cache that holds it:
+    /// every owned buffer and hash table is rounded to what the allocator hands
+    /// out, and shared file handles use their allocator-sized estimate.
     pub fn retained_bytes(&self) -> usize {
+        use brokk_bifrost_core::allocation_size::allocation_size;
+        use brokk_bifrost_core::hash::{allocated_table_slot_bytes, allocated_vec_slot_bytes};
         use std::mem::size_of;
+        let string = |value: &String| allocation_size(value.capacity());
+        let path = |value: &PathBuf| allocation_size(value.capacity());
         let mut bytes = size_of::<Self>();
-        bytes += self.routes_by_manifest_and_name.capacity()
-            * (size_of::<(PathBuf, String)>()
-                + size_of::<Vec<RustCargoRoute>>()
-                + 2 * size_of::<usize>());
-        for ((path, name), routes) in &self.routes_by_manifest_and_name {
-            bytes +=
-                path.capacity() + name.capacity() + routes.capacity() * size_of::<RustCargoRoute>();
+        bytes += allocated_table_slot_bytes::<((PathBuf, String), Vec<RustCargoRoute>)>(
+            self.routes_by_manifest_and_name.capacity(),
+        );
+        for ((manifest, name), routes) in &self.routes_by_manifest_and_name {
+            bytes += path(manifest) + string(name) + allocated_vec_slot_bytes(routes);
             for route in routes {
-                bytes += route.package.capacity()
-                    + route.root_file.retained_heap_bytes()
-                    + route.target_predicate.as_ref().map_or(0, String::capacity);
+                bytes += string(&route.package)
+                    + route.root_file.allocated_heap_bytes()
+                    + route.target_predicate.as_ref().map_or(0, string);
             }
         }
-        bytes += self.declared_dependencies_by_manifest_and_name.capacity()
-            * (size_of::<(PathBuf, String)>()
-                + size_of::<Vec<RustCargoDependencyKind>>()
-                + 2 * size_of::<usize>());
-        for ((path, name), kinds) in &self.declared_dependencies_by_manifest_and_name {
-            bytes += path.capacity()
-                + name.capacity()
-                + kinds.capacity() * size_of::<RustCargoDependencyKind>();
+        bytes += allocated_table_slot_bytes::<((PathBuf, String), Vec<RustCargoDependencyKind>)>(
+            self.declared_dependencies_by_manifest_and_name.capacity(),
+        );
+        for ((manifest, name), kinds) in &self.declared_dependencies_by_manifest_and_name {
+            bytes += path(manifest) + string(name) + allocated_vec_slot_bytes(kinds);
         }
-        bytes += self.declared_dependencies_by_unit_and_name.capacity()
-            * (size_of::<([u8; 32], String)>()
-                + size_of::<Vec<RustCargoDependencyKind>>()
-                + 2 * size_of::<usize>());
+        bytes += allocated_table_slot_bytes::<(([u8; 32], String), Vec<RustCargoDependencyKind>)>(
+            self.declared_dependencies_by_unit_and_name.capacity(),
+        );
         for ((_, name), kinds) in &self.declared_dependencies_by_unit_and_name {
-            bytes += name.capacity() + kinds.capacity() * size_of::<RustCargoDependencyKind>();
+            bytes += string(name) + allocated_vec_slot_bytes(kinds);
         }
-        bytes += self.target_roots_by_file.capacity()
-            * (size_of::<ProjectFile>()
-                + size_of::<HashSet<ProjectFile>>()
-                + 2 * size_of::<usize>());
+        bytes += allocated_table_slot_bytes::<(ProjectFile, HashSet<ProjectFile>)>(
+            self.target_roots_by_file.capacity(),
+        );
         for (file, roots) in &self.target_roots_by_file {
-            bytes += file.retained_heap_bytes()
-                + roots.capacity() * (size_of::<ProjectFile>() + 2 * size_of::<usize>());
+            bytes += file.allocated_heap_bytes()
+                + allocated_table_slot_bytes::<ProjectFile>(roots.capacity());
             for root in roots {
-                bytes += root.retained_heap_bytes();
+                bytes += root.allocated_heap_bytes();
             }
         }
-        bytes += self.targets_by_root.capacity()
-            * (size_of::<ProjectFile>()
-                + size_of::<HashSet<RustCargoTarget>>()
-                + 2 * size_of::<usize>());
+        bytes += allocated_table_slot_bytes::<(ProjectFile, HashSet<RustCargoTarget>)>(
+            self.targets_by_root.capacity(),
+        );
         for (root, targets) in &self.targets_by_root {
-            bytes += root.retained_heap_bytes()
-                + targets.capacity() * (size_of::<RustCargoTarget>() + 2 * size_of::<usize>());
+            bytes += root.allocated_heap_bytes()
+                + allocated_table_slot_bytes::<RustCargoTarget>(targets.capacity());
             for target in targets {
-                bytes += target.manifest.capacity() + target.edition.capacity();
+                bytes += path(&target.manifest) + string(&target.edition);
             }
         }
-        bytes += self.files_by_reachable_root.capacity()
-            * (size_of::<ProjectFile>() + size_of::<Vec<ProjectFile>>() + 2 * size_of::<usize>());
+        bytes += allocated_table_slot_bytes::<(ProjectFile, Vec<ProjectFile>)>(
+            self.files_by_reachable_root.capacity(),
+        );
         for (root, files) in &self.files_by_reachable_root {
-            bytes += root.retained_heap_bytes() + files.capacity() * size_of::<ProjectFile>();
+            bytes += root.allocated_heap_bytes() + allocated_vec_slot_bytes(files);
             for file in files {
-                bytes += file.retained_heap_bytes();
+                bytes += file.allocated_heap_bytes();
             }
         }
-        bytes +=
-            self.external_module_declarations.capacity() * size_of::<RustCargoModuleDeclaration>();
+        bytes += allocated_vec_slot_bytes(&self.external_module_declarations);
         for decl in &self.external_module_declarations {
-            bytes += decl.declaring_file.retained_heap_bytes()
-                + decl.target_file.retained_heap_bytes()
-                + decl.declaring_module.capacity();
+            bytes += decl.declaring_file.allocated_heap_bytes()
+                + decl.target_file.allocated_heap_bytes()
+                + string(&decl.declaring_module)
+                + allocated_vec_slot_bytes(&decl.declared_modules)
+                + decl
+                    .declared_modules
+                    .iter()
+                    .map(|m| string(&m.module_suffix))
+                    .sum::<usize>()
+                + decl.visibility.allocated_retained_bytes();
         }
-        bytes +=
-            self.test_only_files.capacity() * (size_of::<ProjectFile>() + 2 * size_of::<usize>());
-        for file in &self.test_only_files {
-            bytes += file.retained_heap_bytes();
+        for files in [
+            &self.test_only_files,
+            &self.production_witnessed_files,
+            &self.inactive_files,
+            &self.proven_inactive_files,
+            &self.uncertain_files,
+        ] {
+            bytes += allocated_table_slot_bytes::<ProjectFile>(files.capacity());
+            for file in files {
+                bytes += file.allocated_heap_bytes();
+            }
         }
         bytes
     }
 
     /// Compose routes from authored summary rows and explicit path facts.
+    ///
+    /// `no_active_placement` lists the member files whose every stored
+    /// placement activation is inactive (0) or unknown (-1). A module edge to
+    /// or from such a file proves nothing for the production witness, as a
+    /// test gate proves nothing, and the file is classified neither test-only
+    /// nor production (#11639). An edge through an undecided file may still be
+    /// a production route, so a file only such an edge could make production
+    /// is not classified test-only either. The caller reads the activation
+    /// from the stored placement rows; this index evaluates no `cfg` itself.
     pub fn build_from_summary_rows_with_path_facts(
         files: &[ProjectFile],
         module_route_facts: &HashMap<ProjectFile, RustModuleRouteFacts>,
         rows: &[RustCargoRouteSummaryRow],
         paths: &dyn RustRoutePathFacts,
+        no_active_placement: &RustInactivePlacements,
         keep_going_fn: &dyn Fn() -> bool,
     ) -> Option<Self> {
         let keep_going = || keep_going_fn();
@@ -935,13 +1155,20 @@ impl RustCargoRouteIndex {
             dependencies.sort_by_key(|kind| *kind as u8);
             dependencies.dedup();
         }
-        Self::finish_build_from_topology_while(module_route_facts, topology, paths, &keep_going)
+        Self::finish_build_from_topology_while(
+            module_route_facts,
+            topology,
+            paths,
+            no_active_placement,
+            &keep_going,
+        )
     }
 
     fn finish_build_from_topology_while(
         module_route_facts: &HashMap<ProjectFile, RustModuleRouteFacts>,
         topology: CargoManifestTopology,
         paths: &dyn RustRoutePathFacts,
+        no_active_placement: &RustInactivePlacements,
         keep_going: &impl Fn() -> bool,
     ) -> Option<Self> {
         let mut edges = ModuleEdgeCache::new(paths);
@@ -1204,6 +1431,7 @@ impl RustCargoRouteIndex {
                     RustCargoModuleDeclaration {
                         declaring_file: file.clone(),
                         declaring_module: edge.declaring_module.clone(),
+                        declared_modules: edge.declared_modules.clone(),
                         target_file: edge.file.clone(),
                         visibility: edge.visibility.clone(),
                         declaration_start_byte: edge.declaration_start_byte,
@@ -1220,7 +1448,12 @@ impl RustCargoRouteIndex {
         let mut index = topology.into_index(target_roots_by_file, keep_going)?;
         sort_and_dedup_external_module_declarations(&mut external_module_declarations);
         index.external_module_declarations = external_module_declarations;
-        index.test_only_files = index.build_test_only_files_while(keep_going)?;
+        let evidence = index.build_module_file_evidence_while(no_active_placement, keep_going)?;
+        index.test_only_files = evidence.test_only;
+        index.production_witnessed_files = evidence.production_witnessed;
+        index.inactive_files = evidence.inactive;
+        index.proven_inactive_files = evidence.proven_inactive;
+        index.uncertain_files = evidence.uncertain;
         Some(index)
     }
 
@@ -1344,7 +1577,36 @@ impl RustCargoRouteIndex {
         self.test_only_files.contains(file)
     }
 
-    /// Files that no production build can reach.
+    /// Whether no selected build is proven to compile `file`: every placement
+    /// of it is under an inactive or unknown `cfg`, directly or through the
+    /// module that declares it. Such a file is neither test-only nor
+    /// production.
+    pub fn file_is_inactive(&self, file: &ProjectFile) -> bool {
+        self.inactive_files.contains(file)
+    }
+
+    /// Whether `file` is inactive in every configuration of this unit, so the
+    /// unit says nothing about its test or production use.
+    pub fn file_is_proven_inactive(&self, file: &ProjectFile) -> bool {
+        self.proven_inactive_files.contains(file)
+    }
+
+    /// Whether this unit cannot say if `file` is test code: its placement here
+    /// is undecided, or an undecided `cfg` route may make it production.
+    pub fn file_test_verdict_uncertain(&self, file: &ProjectFile) -> bool {
+        (self.inactive_files.contains(file) && !self.proven_inactive_files.contains(file))
+            || self.uncertain_files.contains(file)
+    }
+
+    /// Whether a target root of this unit reaches `file` through module
+    /// declarations that carry no test gate. Such a route stays a production
+    /// route however much of the workspace is still unknown (#11385).
+    pub fn file_has_production_witness(&self, file: &ProjectFile) -> bool {
+        self.production_witnessed_files.contains(file)
+    }
+
+    /// Files that no production build can reach, and files that a target root
+    /// proves a production build reaches.
     ///
     /// Rather than pushing test-ness down from the gated declarations, push
     /// *production reachability* down from the roots and take the complement.
@@ -1354,52 +1616,219 @@ impl RustCargoRouteIndex {
     /// `helpers.rs` is test-only purely because nothing production-reachable
     /// declares it.
     ///
-    /// The seeds are every file that no external `mod` item declares -- crate
-    /// and target roots, plus any file outside the module tree -- so a file is
-    /// only ever classified test-only on positive evidence that some
-    /// declaration reaches it.
-    fn build_test_only_files_while(
+    /// The first pass seeds only the roots of targets built outside test
+    /// builds (everything but Cargo test targets). A test target's root and the
+    /// files only it reaches are test-only candidates. Unknown facts can add
+    /// roots and edges but cannot remove these, so what it reaches is the production
+    /// witness. The second pass also seeds every declaring file that no
+    /// external `mod` item declares (a file outside the known module tree), so
+    /// a file is only ever classified test-only on positive evidence that some
+    /// declaration reaches it. Those extra seeds are assumptions, not
+    /// witnesses: a declaration that is not known yet could gate them.
+    ///
+    /// A file with no active placement (`no_active_placement`) is compiled by
+    /// no build the stored activation proves. An edge from or to it is no
+    /// production route, but it still counts as a declaration, so the file is
+    /// not mistaken for an undeclared one. The files only it declares are in
+    /// `no_active_placement` themselves (their stored placements are inactive
+    /// too), so they are inactive, not test-only; a file with any active
+    /// placement, a test route included, never is.
+    ///
+    /// An undecided file (activation -1) may be compiled, so an edge through it
+    /// may be a production route. Such an edge is no witness, but a file that
+    /// only such an edge could make production is `uncertain`: it is not
+    /// classified test-only. Only a proven-inactive file's edges are ignored.
+    fn build_module_file_evidence_while(
         &self,
+        no_active_placement: &RustInactivePlacements,
         keep_going: &impl Fn() -> bool,
-    ) -> Option<HashSet<ProjectFile>> {
+    ) -> Option<ModuleFileEvidence> {
         let mut declared = HashSet::default();
         for declaration in &self.external_module_declarations {
             keep_going().then_some(())?;
             declared.insert(&declaration.target_file);
         }
-        if declared.is_empty() {
-            return Some(HashSet::default());
-        }
         let mut production_children: HashMap<&ProjectFile, Vec<&ProjectFile>> = HashMap::default();
-        let mut pending: Vec<&ProjectFile> = self.targets_by_root.keys().collect();
+        // The same edges, except that only a proven-inactive endpoint drops one.
+        let mut possible_children: HashMap<&ProjectFile, Vec<&ProjectFile>> = HashMap::default();
+        let mut undeclared_parents = Vec::new();
+        let mut possibly_undeclared_parents = Vec::new();
         for declaration in &self.external_module_declarations {
             keep_going().then_some(())?;
-            if !declaration.test_gated {
+            // Each merged `mod` item is a route of its own, judged by the
+            // placement it creates. A declaration built without its items is
+            // judged as one item by the activity of its target file.
+            let fallback = [RustCargoDeclaredModule {
+                module_suffix: String::new(),
+                test_gated: declaration.test_gated,
+            }];
+            let items = if declaration.declared_modules.is_empty() {
+                &fallback[..]
+            } else {
+                &declaration.declared_modules[..]
+            };
+            let (mut witnesses, mut may_be_compiled) = (false, false);
+            for item in items.iter().filter(|item| !item.test_gated) {
+                let placements = (!item.module_suffix.is_empty())
+                    .then(|| {
+                        no_active_placement.placement_states(
+                            &declaration.declaring_file,
+                            &declaration.target_file,
+                            &item.module_suffix,
+                        )
+                    })
+                    .flatten();
+                let (witness, possible) = match placements {
+                    // Exact placements: one Active is this item's route. A
+                    // candidate match may hold other items' placements, so
+                    // every candidate must be Active.
+                    Some((states, exact)) => (
+                        !no_active_placement.contains(&declaration.declaring_file)
+                            && if exact {
+                                states.contains(&RustPlacementState::Active)
+                            } else {
+                                states
+                                    .iter()
+                                    .all(|state| *state == RustPlacementState::Active)
+                            },
+                        !no_active_placement.is_proven_inactive(&declaration.declaring_file)
+                            && states
+                                .iter()
+                                .any(|state| *state != RustPlacementState::Inactive),
+                    ),
+                    None => (
+                        !no_active_placement.contains(&declaration.declaring_file)
+                            && !no_active_placement.contains(&declaration.target_file),
+                        !no_active_placement.is_proven_inactive(&declaration.declaring_file)
+                            && !no_active_placement.is_proven_inactive(&declaration.target_file),
+                    ),
+                };
+                witnesses |= witness;
+                may_be_compiled |= possible;
+            }
+            if may_be_compiled {
+                possible_children
+                    .entry(&declaration.declaring_file)
+                    .or_default()
+                    .push(&declaration.target_file);
+            }
+            if witnesses {
                 production_children
                     .entry(&declaration.declaring_file)
                     .or_default()
                     .push(&declaration.target_file);
             }
             if !declared.contains(&declaration.declaring_file) {
-                pending.push(&declaration.declaring_file);
+                if !no_active_placement.is_proven_inactive(&declaration.declaring_file) {
+                    possibly_undeclared_parents.push(&declaration.declaring_file);
+                }
+                if !no_active_placement.contains(&declaration.declaring_file) {
+                    undeclared_parents.push(&declaration.declaring_file);
+                }
             }
+        }
+        fn reach<'a>(
+            mut pending: Vec<&'a ProjectFile>,
+            production: &mut HashSet<&'a ProjectFile>,
+            production_children: &HashMap<&'a ProjectFile, Vec<&'a ProjectFile>>,
+            keep_going: &impl Fn() -> bool,
+        ) -> Option<()> {
+            while let Some(file) = pending.pop() {
+                keep_going().then_some(())?;
+                if production.insert(file) {
+                    pending.extend(production_children.get(file).into_iter().flatten().copied());
+                }
+            }
+            Some(())
         }
         let mut production: HashSet<&ProjectFile> = HashSet::default();
-        while let Some(file) = pending.pop() {
+        // A root is a production seed unless every target it hosts is a Cargo
+        // test target; benches and examples are not test code. A test root and
+        // what only it reaches are test-only candidates below (#11507).
+        let mut production_roots = Vec::new();
+        let mut test_roots = Vec::new();
+        for (root, targets) in &self.targets_by_root {
             keep_going().then_some(())?;
-            if !production.insert(file) {
-                continue;
+            if targets
+                .iter()
+                .all(|target| target.kind == RustCargoTargetKind::Test)
+            {
+                test_roots.push(root);
+            } else {
+                production_roots.push(root);
             }
-            pending.extend(production_children.get(file).into_iter().flatten().copied());
         }
+        let mut possible_seeds = production_roots.clone();
+        reach(
+            production_roots,
+            &mut production,
+            &production_children,
+            keep_going,
+        )?;
+        let production_witnessed = production.iter().map(|file| (*file).clone()).collect();
+        // A test root is undeclared by construction; it is not an assumed
+        // production seed.
+        let test_root_set: HashSet<&ProjectFile> = test_roots.iter().copied().collect();
+        undeclared_parents.retain(|file| !test_root_set.contains(file));
+        possibly_undeclared_parents.retain(|file| !test_root_set.contains(file));
+        possible_seeds.extend(possibly_undeclared_parents);
+        reach(
+            undeclared_parents,
+            &mut production,
+            &production_children,
+            keep_going,
+        )?;
+        let mut possible: HashSet<&ProjectFile> = HashSet::default();
+        reach(
+            possible_seeds,
+            &mut possible,
+            &possible_children,
+            keep_going,
+        )?;
+        let mut test_reached: HashSet<&ProjectFile> = HashSet::default();
+        reach(
+            test_roots.clone(),
+            &mut test_reached,
+            &production_children,
+            keep_going,
+        )?;
+        // The stored activation already covers what an inactive file declares:
+        // every module the walk reached through a non-active route has its own
+        // inactive row, so it is in `no_active_placement` too. No walk from the
+        // inactive files is needed, and none may run: a file that an inactive
+        // module and an active `#[cfg(test)]` module both declare has an active
+        // placement and is test code, not inactive.
+        let inactive: HashSet<ProjectFile> = no_active_placement
+            .proven_inactive
+            .iter()
+            .chain(&no_active_placement.undecided)
+            .filter(|file| !production.contains(file))
+            .cloned()
+            .collect();
+        let proven_inactive: HashSet<ProjectFile> = inactive
+            .iter()
+            .filter(|file| no_active_placement.is_proven_inactive(file))
+            .cloned()
+            .collect();
+        let uncertain: HashSet<ProjectFile> = possible
+            .into_iter()
+            .filter(|file| !production.contains(file))
+            .cloned()
+            .collect();
         let mut test_only = HashSet::default();
-        for file in declared {
+        for file in declared.into_iter().chain(test_reached) {
             keep_going().then_some(())?;
-            if !production.contains(file) {
+            if !production.contains(file) && !inactive.contains(file) && !uncertain.contains(file) {
                 test_only.insert(file.clone());
             }
         }
-        Some(test_only)
+        Some(ModuleFileEvidence {
+            test_only,
+            production_witnessed,
+            inactive,
+            proven_inactive,
+            uncertain,
+        })
     }
 
     pub fn files_that_can_reference_target_of(
@@ -1662,6 +2091,15 @@ impl RustCargoRouteIndex {
     }
 }
 
+/// What `build_module_file_evidence_while` proves about the files of one unit.
+struct ModuleFileEvidence {
+    test_only: HashSet<ProjectFile>,
+    production_witnessed: HashSet<ProjectFile>,
+    inactive: HashSet<ProjectFile>,
+    proven_inactive: HashSet<ProjectFile>,
+    uncertain: HashSet<ProjectFile>,
+}
+
 /// The forward resolvers shared by the whole index and `RustFileRoutes`. They
 /// differ only in where the route for a crate name comes from (the scoped
 /// candidates, and for the whole index the unscoped fallback), which the
@@ -1854,6 +2292,10 @@ impl CargoManifestTopology {
             // the topology only knows the manifests.
             external_module_declarations: Vec::new(),
             test_only_files: HashSet::default(),
+            production_witnessed_files: HashSet::default(),
+            inactive_files: HashSet::default(),
+            proven_inactive_files: HashSet::default(),
+            uncertain_files: HashSet::default(),
         };
         index.files_by_reachable_root = index.build_files_by_reachable_root_while(keep_going)?;
         Some(index)
@@ -1999,6 +2441,9 @@ struct ResolvedModuleScope {
     /// Where a `#[path = "..."]` written in this scope resolves from.
     path_directory: Option<PathBuf>,
     declaring_module: String,
+    /// The module names from the file's root down to this scope, joined by
+    /// `::`; empty for the file root.
+    module_chain: String,
 }
 
 /// Resolve one file's persisted module-route facts into the module edges the
@@ -2041,6 +2486,7 @@ fn module_child_edges_with(
                 module_directory: Some(base_directory.clone()),
                 path_directory: Some(parent.to_path_buf()),
                 declaring_module: package.clone(),
+                module_chain: String::new(),
             },
             Some(index) => {
                 assert!(
@@ -2064,6 +2510,7 @@ fn module_child_edges_with(
                         enclosing.declaring_module.clone(),
                         Some(&scope.module_name),
                     ),
+                    module_chain: child_module_suffix(&enclosing.module_chain, &scope.module_name),
                 }
             }
         };
@@ -2145,6 +2592,10 @@ fn module_child_edges_with(
         }
     }
     sort_and_merge_module_children(&mut children);
+    for child in &mut children {
+        child.declared_modules.sort();
+        child.declared_modules.dedup();
+    }
     children
 }
 
@@ -2166,6 +2617,10 @@ fn push_module_child(
     children.push(RustExternalModuleChild {
         file: candidate,
         declaring_module: scope.declaring_module.clone(),
+        declared_modules: vec![RustCargoDeclaredModule {
+            module_suffix: child_module_suffix(&scope.module_chain, &route.module_name),
+            test_gated,
+        }],
         visibility: route.visibility.clone(),
         imports_macros: route.imports_macros,
         test_gated,
@@ -2185,11 +2640,15 @@ struct RustExternalModuleChild {
     visibility: RustVisibility,
     imports_macros: bool,
     test_gated: bool,
+    /// Each declaration this edge merges, by the module it creates.
+    declared_modules: Vec<RustCargoDeclaredModule>,
     declaration_start_byte: usize,
     visibility_start_byte: usize,
 }
 
-/// Collapse repeated declarations of the same file into one edge.
+/// Collapse repeated declarations of the same file into one edge. The edge
+/// keeps each merged declaration's module name and test gate in
+/// `declared_modules`, because each creates its own placement (#11639).
 ///
 /// Shared by every canonical module-route fact reader.
 fn sort_and_merge_module_children(children: &mut Vec<RustExternalModuleChild>) {
@@ -2219,6 +2678,9 @@ fn sort_and_merge_module_children(children: &mut Vec<RustExternalModuleChild>) {
             // any one of them is un-gated, so the merged edge is gated only if
             // every declaration was.
             retained.test_gated &= duplicate.test_gated;
+            retained
+                .declared_modules
+                .append(&mut duplicate.declared_modules);
             true
         } else {
             false
@@ -2662,6 +3124,87 @@ pub fn cargo_dependency_directory_with(
         })
 }
 
+fn cargo_dependency_patches(
+    workspace_directory: &Path,
+    source_name: &str,
+    manifests: &HashMap<PathBuf, RustCargoManifestDocument>,
+    configuration: &RustCargoConfiguration,
+) -> Vec<crate::cargo_config::RustCargoConfigPatch> {
+    let mut configured = configuration.patches(workspace_directory, source_name);
+    let manifest_patches = manifests
+        .get(workspace_directory)
+        .and_then(|manifest| manifest.get("patch"))
+        .and_then(|patch| patch.get(source_name))
+        .and_then(toml::Value::as_table);
+    // Configuration replaces the manifest entry with the same patch name.
+    for (name, patch) in manifest_patches.into_iter().flatten() {
+        if configured.iter().any(|patch| patch.name == *name) {
+            continue;
+        }
+        if let Some(entry) = patch.as_table() {
+            configured.push(crate::cargo_config::RustCargoConfigPatch {
+                name: name.clone(),
+                entry: entry.clone(),
+                base: workspace_directory.to_path_buf(),
+            });
+        }
+    }
+    configured
+}
+
+/// Candidate patches before reading package/version metadata. A failed parse
+/// cannot prove that a matching configured local replacement is inapplicable.
+pub(crate) fn cargo_expected_dependency_patch_manifests(
+    manifest_directory: &Path,
+    manifest: &RustCargoManifestDocument,
+    name: &str,
+    raw_dependency: &toml::Value,
+    manifests: &HashMap<PathBuf, RustCargoManifestDocument>,
+    configuration: &RustCargoConfiguration,
+) -> Vec<PathBuf> {
+    let effective = cargo_dependency_value(
+        Path::new(""),
+        manifest_directory,
+        manifest,
+        name,
+        raw_dependency,
+        manifests,
+    );
+    let value = effective
+        .as_ref()
+        .map_or(raw_dependency, |(value, _)| *value);
+    let dependency = value.as_table();
+    if dependency.is_some_and(|table| table.contains_key("path")) {
+        return Vec::new();
+    }
+    let Some(source) = cargo_dependency_patch_source(dependency, value) else {
+        return Vec::new();
+    };
+    let Some(workspace) =
+        cargo_workspace_manifest_directory(Path::new(""), manifest_directory, manifest, manifests)
+    else {
+        return Vec::new();
+    };
+    let package_name = dependency
+        .and_then(|table| table.get("package"))
+        .and_then(toml::Value::as_str)
+        .unwrap_or(name);
+    cargo_dependency_patches(&workspace, source, manifests, configuration)
+        .into_iter()
+        .filter(|patch| {
+            patch.name == package_name
+                || patch.entry.get("package").and_then(toml::Value::as_str) == Some(package_name)
+        })
+        .filter_map(|patch| {
+            super::selected_context::normalize_selected_path(
+                &patch.base,
+                Path::new(patch.entry.get("path")?.as_str()?),
+            )
+        })
+        .map(|directory| directory.join("Cargo.toml"))
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cargo_patched_dependency_directory(
     root: &Path,
@@ -2674,27 +3217,11 @@ fn cargo_patched_dependency_directory(
     resolve_path: &mut impl FnMut(&Path, &Path) -> Option<PathBuf>,
 ) -> Option<PathBuf> {
     let source_name = cargo_dependency_patch_source(dependency, raw_dependency)?;
-    let configured = configuration.patches(workspace_directory, source_name);
-    let manifest_patches = manifests
-        .get(workspace_directory)
-        .and_then(|manifest| manifest.get("patch"))
-        .and_then(|patch| patch.get(source_name))
-        .and_then(toml::Value::as_table);
-    // A configuration patch replaces the manifest's patch of the same name,
-    // as Cargo's `Workspace::root_patch` combines them. Each entry resolves
-    // its `path` against the directory that defined it.
-    let patches = configured
+    let patches =
+        cargo_dependency_patches(workspace_directory, source_name, manifests, configuration);
+    let patches = patches
         .iter()
-        .map(|patch| (patch.name.as_str(), &patch.entry, patch.base.as_path()))
-        .chain(
-            manifest_patches
-                .into_iter()
-                .flatten()
-                .filter(|(name, _)| !configured.iter().any(|patch| patch.name == **name))
-                .filter_map(|(name, patch)| {
-                    Some((name.as_str(), patch.as_table()?, workspace_directory))
-                }),
-        );
+        .map(|patch| (patch.name.as_str(), &patch.entry, patch.base.as_path()));
     let version_requirement =
         match cargo_dependency_version_requirement(dependency, raw_dependency)? {
             Some(requirement) => Some(VersionReq::parse(requirement).ok()?),
@@ -2844,6 +3371,16 @@ pub(crate) fn cargo_workspace_exclude_covers(excluded: &Path, relative: &Path) -
 
 pub(super) use crate::cargo_manifest::normalize_crate_name;
 
+/// The module path a `mod name;` creates below the module `chain`, relative to
+/// the module that holds the declaring file's own placement.
+fn child_module_suffix(chain: &str, name: &str) -> String {
+    if chain.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{chain}::{name}")
+    }
+}
+
 fn append_module_package(mut package: String, nested: Option<&str>) -> String {
     let Some(nested) = nested else {
         return package;
@@ -2947,7 +3484,7 @@ mod tests {
             std::iter::empty(),
             &[],
         );
-        let paths = SelectedRustRoutePathFacts::new(&files, &naming);
+        let paths = SelectedRustRoutePathFacts::new(&files, &naming, &|_| false);
         assert_eq!(
             paths.workspace_relative(&root, Path::new("ignored"), &inside),
             Some(PathBuf::from("inside"))
@@ -2972,6 +3509,7 @@ mod tests {
             |declaring_module: &str, visibility: RustVisibility| RustCargoModuleDeclaration {
                 declaring_file: declaring_file.clone(),
                 declaring_module: declaring_module.to_string(),
+                declared_modules: Vec::new(),
                 target_file: target_file.clone(),
                 visibility,
                 declaration_start_byte: 0,
@@ -3111,7 +3649,7 @@ mod tests {
                 &records,
             );
             let selected = files.iter().cloned().collect();
-            let paths = SelectedRustRoutePathFacts::new(&selected, &naming);
+            let paths = SelectedRustRoutePathFacts::new(&selected, &naming, &|_| false);
             let rows =
                 (0..crates)
                     .flat_map(|index| {
@@ -3153,6 +3691,7 @@ mod tests {
                     &facts,
                     &rows,
                     &paths,
+                    &Default::default(),
                     &|| true,
                 )
                 .expect("composed summary index");

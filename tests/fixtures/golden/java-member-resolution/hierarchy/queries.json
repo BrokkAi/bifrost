@@ -517,6 +517,53 @@
     }
   },
   {
+    "name": "java_super_receiver_reads_the_direct_superclass-0-calls",
+    "query": {
+      "languages": [
+        "java"
+      ],
+      "where": [
+        "superreceiver/Fixture.java"
+      ],
+      "steps": [
+        {
+          "op": "call_shape"
+        },
+        {
+          "op": "call_bindings"
+        }
+      ],
+      "result_detail": "full",
+      "limit": 1000,
+      "match": {
+        "kind": "call"
+      }
+    }
+  },
+  {
+    "name": "java_super_receiver_reads_the_direct_superclass-0-bindings",
+    "query": {
+      "languages": [
+        "java"
+      ],
+      "where": [
+        "superreceiver/Fixture.java"
+      ],
+      "steps": [
+        {
+          "op": "candidates_of"
+        }
+      ],
+      "result_detail": "full",
+      "limit": 1000,
+      "occurrences": {
+        "role": [
+          "member_position"
+        ]
+      }
+    }
+  },
+  {
     "name": "definition-completeness",
     "tool": "get_definitions_by_location",
     "arguments": {
@@ -595,6 +642,61 @@
           "path": "boundary6/Boundary.java",
           "line": 2,
           "column": 57
+        },
+        {
+          "path": "superreceiver/Fixture.java",
+          "line": 5,
+          "column": 22
+        },
+        {
+          "path": "superreceiver/Fixture.java",
+          "line": 18,
+          "column": 15
+        },
+        {
+          "path": "superreceiver/Fixture.java",
+          "line": 26,
+          "column": 22
+        },
+        {
+          "path": "superreceiver/Fixture.java",
+          "line": 43,
+          "column": 15
+        },
+        {
+          "path": "superreceiver/Fixture.java",
+          "line": 52,
+          "column": 23
+        },
+        {
+          "path": "superreceiver/Fixture.java",
+          "line": 62,
+          "column": 26
+        },
+        {
+          "path": "superreceiver/Fixture.java",
+          "line": 75,
+          "column": 15
+        },
+        {
+          "path": "superreceiver/Fixture.java",
+          "line": 84,
+          "column": 23
+        },
+        {
+          "path": "superreceiver/Fixture.java",
+          "line": 94,
+          "column": 15
+        },
+        {
+          "path": "superreceiver/Fixture.java",
+          "line": 105,
+          "column": 19
+        },
+        {
+          "path": "superreceiver2/CrossPackage.java",
+          "line": 7,
+          "column": 15
         }
       ]
     }

@@ -148,9 +148,20 @@ fn returned_value(
 
 fn preserves_value(kind: ValueFlowKind) -> bool {
     match kind {
-        ValueFlowKind::Local | ValueFlowKind::Return => true,
+        ValueFlowKind::Local | ValueFlowKind::AddressOf | ValueFlowKind::Return => true,
         ValueFlowKind::Transfer(transfer) => transfer.preserves_member_contents(),
-        _ => false,
+        ValueFlowKind::OwnershipUnknown
+        | ValueFlowKind::BackingStore { .. }
+        | ValueFlowKind::IntegerOffset { .. }
+        | ValueFlowKind::BackingStoreAlternative { .. }
+        | ValueFlowKind::Parameter
+        | ValueFlowKind::Receiver
+        | ValueFlowKind::IndexedReturn { .. }
+        | ValueFlowKind::ReferenceBoxing
+        | ValueFlowKind::ReferenceUnboxing
+        | ValueFlowKind::MemoryLoad { .. }
+        | ValueFlowKind::LanguageDefined
+        | ValueFlowKind::ByValueCapture => false,
     }
 }
 

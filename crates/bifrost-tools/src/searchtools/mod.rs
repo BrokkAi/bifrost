@@ -404,7 +404,7 @@ pub use crate::searchtools::selectors::DefinitionLookupIncompleteReason;
 
 pub use crate::searchtools::selectors::NotFoundInput;
 
-pub use crate::searchtools::sources::SourceBlock;
+pub use crate::searchtools::sources::{SourceBlock, SourceOrigin};
 
 pub use crate::searchtools::sources::SymbolSourcesBudgetExceeded;
 

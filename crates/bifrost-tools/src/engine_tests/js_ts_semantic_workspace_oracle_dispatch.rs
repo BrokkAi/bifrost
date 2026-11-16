@@ -1277,6 +1277,7 @@ export function shadowed(raw) {
             impacts: SemanticGapImpacts::single(SemanticGapImpact::DispatchCoverage),
             kind: SemanticGapKind::ExceededBudget,
             budget: Some(exceeded),
+            dispatch: Default::default(),
             discharge: SemanticGapDischarge::None,
             detail: "dynamic target exploration exceeded its finite budget".into(),
             source: call_row.source,
@@ -1368,6 +1369,7 @@ export function shadowed(raw) {
             impacts: SemanticGapImpacts::single(SemanticGapImpact::DispatchCoverage),
             kind: SemanticGapKind::Unsupported,
             budget: None,
+            dispatch: Default::default(),
             discharge: SemanticGapDischarge::None,
             detail: "dynamic target discovery is unsupported".into(),
             source: call_row.source,
@@ -1377,6 +1379,7 @@ export function shadowed(raw) {
             id: SemanticGapId::new(1),
             kind: SemanticGapKind::ExceededBudget,
             budget: Some(exceeded),
+            dispatch: Default::default(),
             discharge: SemanticGapDischarge::None,
             detail: "dynamic target exploration exceeded its finite budget".into(),
             ..unsupported_gap.clone()

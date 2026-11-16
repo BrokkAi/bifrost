@@ -1,4 +1,5 @@
 use brokk_bifrost_analysis::analyzer::ReadKey;
+use brokk_bifrost_analysis::analyzer::reuse_verdict::ReuseVerdict;
 use brokk_bifrost_analysis::analyzer::structural::resolution::BindingKind;
 use brokk_bifrost_analysis::analyzer::usages::UsageHitKind;
 use brokk_bifrost_analysis::path_utils::workspace_relative_slash_path;
@@ -21,7 +22,7 @@ use crate::relational::{
 
 use super::super::finding::InconclusiveScope;
 use super::super::unit_execution::{UnitDecodeError, UnitSlice, evaluate_reusable_slice};
-use super::super::units::AssertFileProduct;
+use super::super::units::{AssertFileProduct, AssertFileRetention};
 use super::*;
 
 /// One subject row: the node an assertion is evaluated at, plus every capture
@@ -101,6 +102,11 @@ pub(super) struct ExecutedQueryRows {
     pub(super) truncated: bool,
     pub(super) diagnostics: Vec<CodeQueryDiagnostic>,
     pub(super) work: CodeQueryExecutionWork,
+    /// The execution's reuse verdict, which the capture around it joins.
+    pub(super) reuse: ReuseVerdict,
+    /// The query's candidate count, for a match policy's report. `None` is not
+    /// measured, which publishes no metric.
+    pub(super) candidate_sites: Option<u64>,
 }
 
 impl ExecutedQueryRows {
@@ -124,6 +130,8 @@ impl ExecutedQueryRows {
             truncated: detailed.result.truncated,
             diagnostics: detailed.result.diagnostics,
             work: detailed.work,
+            reuse: detailed.reuse,
+            candidate_sites: detailed.budgeted_work.candidate_sites,
         }
     }
 
@@ -135,8 +143,10 @@ impl ExecutedQueryRows {
             truncated: merged.truncated,
             diagnostics: merged.diagnostics,
             work: merged.work,
+            candidate_sites: merged.budgeted_work.candidate_sites,
             items: merged.items,
             evidence: merged.evidence,
+            reuse: merged.reuse,
         }
     }
 }
@@ -371,6 +381,7 @@ enum AssertFileFailure {
 /// A sliced run fills it from published products and a whole run from products
 /// it just computed; neither can tell the difference, which is the whole claim.
 struct AssertionRunTotals {
+    retention: AssertFileRetention,
     findings: Vec<PolicyFinding>,
     unconcluded_files: Vec<(String, Vec<PolicyIncompleteReason>)>,
     /// Whether a file-set assert could not conclude a file. Its one finding is
@@ -387,6 +398,7 @@ impl AssertionRunTotals {
     /// said.
     fn of_subject(rows: &ExecutedQueryRows) -> Self {
         Self {
+            retention: AssertFileRetention::None,
             findings: Vec::new(),
             unconcluded_files: Vec::new(),
             unconcluded_file_set: false,
@@ -402,6 +414,7 @@ impl AssertionRunTotals {
             product.findings.is_empty() || product.unconcluded.is_empty(),
             "a file that could not be concluded reports no findings"
         );
+        self.retention = self.retention.combined(product.retention);
         self.findings.extend(product.findings);
         if !product.unconcluded.is_empty() {
             self.unconcluded_files
@@ -416,6 +429,7 @@ impl AssertionRunTotals {
 /// The per-subject-file cut. The generic evaluator owns reuse and read proof;
 /// this contract owns the file product, ordered merge, and finalization.
 struct AssertFileSlice<'a, F> {
+    hint: Option<&'a crate::AcceptanceHint<'a>>,
     rows: &'a ExecutedQueryRows,
     policy: &'a LoadedPolicy,
     budget: &'a PolicyBudget,
@@ -482,7 +496,7 @@ where
 
     fn failure(&self, failure: Self::Error, products: Vec<Self::Prefix>) -> Self::Output {
         let mut totals = self.merge(products);
-        assert_file_failure_run(self.policy, *failure, &mut totals, self.budget)
+        assert_file_failure_run(self.policy, *failure, &mut totals, self.budget, self.hint)
     }
 
     fn merge(&self, products: impl IntoIterator<Item = Self::Prefix>) -> Self::Merged {
@@ -494,7 +508,13 @@ where
     }
 
     fn suffix(&self, totals: Self::Merged, _skipped: usize) -> Self::Output {
-        finish_assertion_run(self.policy, &self.rows.completion, totals, self.budget)
+        finish_assertion_run(
+            self.policy,
+            &self.rows.completion,
+            totals,
+            self.budget,
+            self.hint,
+        )
     }
 }
 
@@ -730,6 +750,7 @@ fn sliced_assertion_run(
 
     let presentation = run.plan.presentation(policy);
     let slice = AssertFileSlice {
+        hint: context.acceptance_hint,
         rows: &rows,
         policy,
         budget,
@@ -773,11 +794,10 @@ fn sliced_assertion_run(
 }
 
 fn check_exhaustive_assert_file(product: &AssertFileProduct) -> Result<(), WidenReason> {
-    if product
-        .diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.code.is_execution_state())
-    {
+    if product.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code.is_execution_state()
+            || diagnostic.incompleteness.execution_cause().is_some()
+    }) {
         return Err(WidenReason::UnitDiagnostics);
     }
     Ok(())
@@ -881,7 +901,13 @@ fn whole_assertion_run(
         ) {
             Ok(product) => totals.merge(path, product),
             Err(failure) => {
-                return assert_file_failure_run(policy, *failure, &mut totals, budget);
+                return assert_file_failure_run(
+                    policy,
+                    *failure,
+                    &mut totals,
+                    budget,
+                    context.acceptance_hint,
+                );
             }
         }
     }
@@ -946,6 +972,7 @@ fn whole_assertion_run(
                         ),
                         work,
                         budget,
+                        context.acceptance_hint,
                     );
                 }
                 paths.sort_unstable();
@@ -1029,6 +1056,7 @@ fn whole_assertion_run(
                         "a rewrite origin could not be projected into a workspace-relative path",
                         work,
                         budget,
+                        context.acceptance_hint,
                     );
                 }
             }
@@ -1077,6 +1105,7 @@ fn whole_assertion_run(
                 "a violated assertion could not be projected into validated policy evidence",
                 work,
                 budget,
+                context.acceptance_hint,
             );
         };
         let Ok(related) = std::iter::once((
@@ -1100,6 +1129,7 @@ fn whole_assertion_run(
                 "an evidence row could not be projected into a related policy location",
                 work,
                 budget,
+                context.acceptance_hint,
             );
         };
         match presentation.assemble(
@@ -1110,7 +1140,14 @@ fn whole_assertion_run(
             evidence,
             budget,
         ) {
-            Ok(finding) => totals.findings.push(finding),
+            Ok((finding, detail_omitted)) => {
+                if detail_omitted {
+                    totals.retention = totals
+                        .retention
+                        .combined(AssertFileRetention::DetailRetention);
+                }
+                totals.findings.push(finding);
+            }
             Err(()) => {
                 return failed_policy_run_with_reason(
                     policy,
@@ -1120,11 +1157,18 @@ fn whole_assertion_run(
                     "a validated assertion violation could not be retained as a finding",
                     work,
                     budget,
+                    context.acceptance_hint,
                 );
             }
         }
     }
-    finish_assertion_run(policy, &run.subject_completion, totals, budget)
+    finish_assertion_run(
+        policy,
+        &run.subject_completion,
+        totals,
+        budget,
+        context.acceptance_hint,
+    )
 }
 
 /// Everything one run computes between its subject rows and its per-file
@@ -1210,6 +1254,7 @@ impl AssertionRunRefusal {
                 "assertion evaluation could not execute a valid query plan",
                 work_report(work, 0, 0),
                 budget,
+                None,
             ),
             Self::SubjectsIncomplete { reasons, work } => inconclusive_policy_run_many(
                 policy,
@@ -1229,6 +1274,8 @@ fn assert_file_failure_run(
     failure: AssertFileFailure,
     totals: &mut AssertionRunTotals,
     budget: &PolicyBudget,
+
+    hint: Option<&crate::AcceptanceHint<'_>>,
 ) -> Result<PolicyRun, PolicyRunError> {
     match failure {
         AssertFileFailure::QueryPlan(message) => {
@@ -1246,6 +1293,7 @@ fn assert_file_failure_run(
             &message,
             work_report(totals.work.saturating_add(work), 0, 0),
             budget,
+            hint,
         ),
         AssertFileFailure::Projection {
             message,
@@ -1263,6 +1311,7 @@ fn assert_file_failure_run(
                 message,
                 work_report(charged, 0, 0),
                 budget,
+                hint,
             )
         }
     }
@@ -1274,6 +1323,8 @@ fn finish_assertion_run(
     subject_completion: &CodeQueryCompletion,
     totals: AssertionRunTotals,
     budget: &PolicyBudget,
+
+    hint: Option<&crate::AcceptanceHint<'_>>,
 ) -> Result<PolicyRun, PolicyRunError> {
     let adapted = adapt_query_diagnostics(
         &totals.query_diagnostics,
@@ -1305,14 +1356,6 @@ fn finish_assertion_run(
     if diagnostics_truncated {
         run_incomplete.push(PolicyIncompleteReason::ReportRetentionBudget);
     }
-    if adapted.adaptation_failed {
-        retain_incomplete_diagnostic(
-            &mut diagnostics,
-            &mut diagnostics_truncated,
-            budget.max_diagnostics(),
-            "one or more query diagnostics could not be retained as validated policy diagnostics",
-        );
-    }
     if !totals.unconcluded_files.is_empty() {
         retain_unconcluded_files_diagnostic(
             &totals.unconcluded_files,
@@ -1324,7 +1367,7 @@ fn finish_assertion_run(
     run_incomplete.sort();
     run_incomplete.dedup();
 
-    let completion = if run_incomplete.is_empty() {
+    let mut completion = if run_incomplete.is_empty() {
         // Every declared omission participates, including row queries when
         // the subject itself is a subset. A sorted union is independent of
         // file order and of the order in which unit products are replayed.
@@ -1349,7 +1392,39 @@ fn finish_assertion_run(
         PolicyRunCompletion::inconclusive_in(run_incomplete, scope)
             .expect("typed per-file incomplete reasons are canonical")
     };
-    let work = work_report(totals.work, totals.findings.len(), 0);
+    let mut work = work_report(totals.work, totals.findings.len(), 0)
+        .with_budget_refusals(&adapted.budget_refusals);
+    if adapted.result_limit_reached {
+        work.record_budget_refusal("query/pipeline_rows");
+    }
+    match totals.retention {
+        AssertFileRetention::None => {}
+        AssertFileRetention::DetailRetention => {
+            record_detail_retention(&mut completion, &mut diagnostics, &mut work)
+        }
+        AssertFileRetention::FindingRetention {
+            omitted_lower_bound,
+        } => {
+            work.add_retention_omitted_findings(omitted_lower_bound.get());
+            completion.mark_inconclusive(PolicyIncompleteReason::ReportRetentionBudget);
+        }
+    }
+    if adapted.adaptation_failed {
+        completion = PolicyRunCompletion::failed(vec![PolicyFailureReason::InternalInvariant])
+            .expect("one typed failure reason");
+        diagnostics.retain_failed_run_diagnostics();
+        if retain_adaptation_failure(
+            &mut diagnostics,
+            budget.max_diagnostics(),
+            adapted
+                .failure_detail
+                .as_deref()
+                .expect("adapter failure has detail"),
+        ) {
+            diagnostics_truncated = true;
+            work.record_budget_refusal("policy/diagnostics");
+        }
+    }
     finish_assembled_run(
         policy,
         PolicyAnalysisType::Assertion,
@@ -1360,6 +1435,7 @@ fn finish_assertion_run(
         work,
         "assertion evaluation produced an invalid policy run",
         budget,
+        hint,
     )
 }
 
@@ -1389,6 +1465,7 @@ fn evaluate_assert_file(
     let mut row_family_session = CodeQueryRowFamilySession::default();
     let mut file_work = CodeQueryExecutionWork::default();
     let mut file_failures: Vec<PolicyFailureReason> = Vec::new();
+    let mut file_retention = AssertFileRetention::None;
     let mut file_diagnostics: Vec<CodeQueryDiagnostic> = Vec::new();
     let mut row_completions: Vec<CodeQueryCompletion> = Vec::new();
     let file_paths = [path];
@@ -1634,6 +1711,7 @@ fn evaluate_assert_file(
         file_incomplete.sort();
         file_incomplete.dedup();
         return Ok(AssertFileProduct {
+            retention: file_retention,
             findings: Vec::new(),
             unconcluded: file_incomplete,
             row_completions,
@@ -2061,7 +2139,13 @@ fn evaluate_assert_file(
                 budget,
             );
             match finding {
-                Ok(finding) => file_findings.push(finding),
+                Ok((finding, detail_omitted)) => {
+                    if detail_omitted {
+                        file_retention =
+                            file_retention.combined(AssertFileRetention::DetailRetention);
+                    }
+                    file_findings.push(finding);
+                }
                 Err(_) => {
                     return Err(Box::new(AssertFileFailure::Projection {
                         message: "a validated assertion violation could not be retained as a finding",
@@ -2096,6 +2180,7 @@ fn evaluate_assert_file(
     // halves of the product are never both populated.
     if late_incomplete.is_empty() {
         return Ok(AssertFileProduct {
+            retention: file_retention,
             findings: file_findings,
             unconcluded: Vec::new(),
             row_completions,
@@ -2106,6 +2191,7 @@ fn evaluate_assert_file(
     late_incomplete.sort();
     late_incomplete.dedup();
     Ok(AssertFileProduct {
+        retention: file_retention,
         findings: Vec::new(),
         unconcluded: late_incomplete,
         row_completions,
@@ -2137,7 +2223,7 @@ impl AssertionFindingPresentation<'_> {
         omitted_related: u64,
         evidence: super::super::finding::AssertionFindingEvidence,
         budget: &PolicyBudget,
-    ) -> Result<PolicyFinding, ()> {
+    ) -> Result<(PolicyFinding, bool), ()> {
         let completeness = if related_truncated {
             FindingCompleteness::partial(vec![FindingIncompleteReason::RelatedLocationsTruncated])
                 .expect("one typed finding-incomplete reason is canonical")
@@ -2150,7 +2236,7 @@ impl AssertionFindingPresentation<'_> {
             Vec::new(),
         )
         .expect("a proven direct structural match is a canonical proof");
-        PolicyFinding::try_new(
+        PolicyFinding::try_new_shedding_detail(
             self.policy_id.clone(),
             self.policy.semantic_hash(),
             self.severity,
@@ -2182,35 +2268,48 @@ impl AssertionFindingPresentation<'_> {
 /// unless the report prose bound forces a tail count.
 fn retain_unconcluded_files_diagnostic(
     unconcluded_files: &[(String, Vec<PolicyIncompleteReason>)],
-    diagnostics: &mut Vec<PolicyDiagnostic>,
+    diagnostics: &mut PolicyDiagnostics,
     diagnostics_truncated: &mut bool,
     max_diagnostics: usize,
 ) {
-    if diagnostics.len() >= max_diagnostics {
-        *diagnostics_truncated = true;
-        return;
-    }
-    // The policy-report prose bound is 4096 bytes; leave room for the tail
-    // note so the message always validates.
-    const MESSAGE_BYTE_BUDGET: usize = 3_900;
-    let mut message = String::from("assertion evaluation could not conclude these subject files: ");
-    let mut listed = 0_usize;
-    for (path, reasons) in unconcluded_files {
-        let entry = format!("{}{path} {reasons:?}", if listed == 0 { "" } else { "; " });
-        if message.len() + entry.len() > MESSAGE_BYTE_BUDGET {
-            break;
+    struct UnconcludedFiles<'a>(&'a [(String, Vec<PolicyIncompleteReason>)]);
+    impl std::fmt::Display for UnconcludedFiles<'_> {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            for (index, (path, reasons)) in self.0.iter().enumerate() {
+                if index > 0 {
+                    formatter.write_str("; ")?;
+                }
+                write!(formatter, "{path} {reasons:?}")?;
+            }
+            Ok(())
         }
-        message.push_str(&entry);
-        listed += 1;
     }
-    let omitted = unconcluded_files.len() - listed;
-    if omitted > 0 {
-        message.push_str(&format!(" ... and {omitted} more unconcluded files"));
-    }
-    match super::incomplete_run_diagnostic(PolicyDiagnosticCode::EvaluationFailure, &message) {
-        Some(diagnostic) => diagnostics.push(diagnostic),
-        None => *diagnostics_truncated = true,
-    }
+    let message = brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+        format_args!(
+            "assertion evaluation could not conclude these subject files: {}",
+            UnconcludedFiles(unconcluded_files)
+        ),
+        format_args!("assertion evaluation could not conclude these subject files"),
+        unconcluded_files.iter(),
+    );
+    let upstream = diagnostics.causes().clone();
+    let reasons = unconcluded_files
+        .iter()
+        .flat_map(|(_, reasons)| reasons.iter().copied())
+        .collect::<Vec<_>>();
+    retain_incomplete_summary_diagnostic(
+        diagnostics,
+        diagnostics_truncated,
+        max_diagnostics,
+        &upstream,
+        &reasons,
+        PolicyDiagnostic::new_bounded(
+            PolicyDiagnosticCode::EvaluationFailure,
+            PolicyDiagnosticSeverity::Warning,
+            PolicyDiagnosticImpact::RunIncomplete,
+            message,
+        ),
+    );
 }
 
 /// Execute a decoded relational assertion plan: run every named query and
@@ -2312,6 +2411,7 @@ fn evaluate_relational_assertion_policy(
             &executed,
             budget,
             context.cancellation,
+            context.acceptance_hint,
         );
     };
     let mut attempt = UnitAttempt::default();
@@ -2357,6 +2457,7 @@ fn evaluate_relational_assertion_policy(
         &executed,
         budget,
         context.cancellation,
+        context.acceptance_hint,
     )
 }
 
@@ -2547,6 +2648,8 @@ fn relational_run(
     executed: &[ExecutedQueryRows],
     budget: &PolicyBudget,
     cancellation: Option<&CancellationToken>,
+
+    hint: Option<&crate::AcceptanceHint<'_>>,
 ) -> Result<PolicyRun, PolicyRunError> {
     use super::super::assertion_policy::{
         RelationalInput, RelationalViolationRow, evaluate_relational_assertion_rows,
@@ -2598,6 +2701,7 @@ fn relational_run(
             "relational assertion evaluation could not execute a valid query plan",
             work,
             budget,
+            hint,
         );
     }
     for rows in executed {
@@ -2610,6 +2714,7 @@ fn relational_run(
                 "relational binding rows and their detailed evidence disagree",
                 work,
                 budget,
+                hint,
             );
         }
     }
@@ -2636,6 +2741,7 @@ fn relational_run(
                 &format!("relational assertion evaluation could not conclude: {error:?}"),
                 work,
                 budget,
+                hint,
             );
         }
     };
@@ -2652,18 +2758,13 @@ fn relational_run(
     } else {
         relational_inconclusive_scope(plan, executed, &binding_coverage, &evaluation)
     };
+    // Snapshot the complete query inventory before policy presentation adds its
+    // own causes. Detail retention in adaptation does not remove this inventory.
+    let upstream_causes = adapted.diagnostics.causes().clone();
     let mut diagnostics = adapted.diagnostics;
     let mut diagnostics_truncated = adapted.truncated;
     if diagnostics_truncated {
         run_incomplete.push(PolicyIncompleteReason::ReportRetentionBudget);
-    }
-    if adapted.adaptation_failed {
-        retain_incomplete_diagnostic(
-            &mut diagnostics,
-            &mut diagnostics_truncated,
-            budget.max_diagnostics(),
-            "one or more query diagnostics could not be retained as validated policy diagnostics",
-        );
     }
 
     // An assertion that had no group to judge is satisfied vacuously, not
@@ -2690,14 +2791,21 @@ fn relational_run(
     }
     run_incomplete.sort();
     run_incomplete.dedup();
-    let completion = if run_incomplete.is_empty() {
+    let mut completion = if run_incomplete.is_empty() {
         PolicyRunCompletion::Complete
     } else {
-        retain_incomplete_run_diagnostic(
+        retain_incomplete_summary_diagnostic(
             &mut diagnostics,
             &mut diagnostics_truncated,
             budget.max_diagnostics(),
-            "relational assertion evaluation could not observe a complete row set",
+            &upstream_causes,
+            &run_incomplete,
+            PolicyDiagnostic::new_bounded(
+                PolicyDiagnosticCode::EvaluationFailure,
+                PolicyDiagnosticSeverity::Warning,
+                PolicyDiagnosticImpact::RunIncomplete,
+                "relational assertion evaluation could not observe a complete row set",
+            ),
         );
         // One diagnostic per blocked verdict, so a reader sees which
         // assertion could not conclude and why, not only that something
@@ -2718,11 +2826,14 @@ fn relational_run(
     let message = match &metadata.message {
         PolicyMessageSpec::Static { text } => text.clone(),
         PolicyMessageSpec::Generated { .. } => {
-            return failed_policy_run(
-                policy,
-                PolicyAnalysisType::Assertion,
-                "assertion policy presentation could not be projected into a finding",
-                budget,
+            return preserving_diagnostic_summary(
+                failed_policy_run(
+                    policy,
+                    PolicyAnalysisType::Assertion,
+                    "assertion policy presentation could not be projected into a finding",
+                    budget,
+                ),
+                &diagnostics.omitted_summary(),
             );
         }
     };
@@ -2733,11 +2844,14 @@ fn relational_run(
     ) {
         Ok(classification) => classification,
         Err(_) => {
-            return failed_policy_run(
-                policy,
-                PolicyAnalysisType::Assertion,
-                "assertion policy classification could not be reduced",
-                budget,
+            return preserving_diagnostic_summary(
+                failed_policy_run(
+                    policy,
+                    PolicyAnalysisType::Assertion,
+                    "assertion policy classification could not be reduced",
+                    budget,
+                ),
+                &diagnostics.omitted_summary(),
             );
         }
     };
@@ -2809,8 +2923,22 @@ fn relational_run(
                 .collect()
         };
 
+    let Some(subjects) =
+        relational_anchor_subjects(&evaluation.violations, binding_index_by_name, executed)
+    else {
+        return failed_policy_run_with_reason(
+            policy,
+            PolicyAnalysisType::Assertion,
+            Vec::new(),
+            PolicyFailureReason::InternalInvariant,
+            "a violated relational group key names an identity no contributing row carries",
+            work,
+            budget,
+            hint,
+        );
+    };
     let mut findings = Vec::new();
-    for violation in &evaluation.violations {
+    for (violation, subject) in evaluation.violations.iter().zip(&subjects) {
         let assertion = plan
             .assertions
             .iter()
@@ -2821,25 +2949,33 @@ fn relational_run(
             .first()
             .and_then(|tuple| tuple.first())
         else {
-            return failed_policy_run_with_reason(
-                policy,
-                PolicyAnalysisType::Assertion,
-                findings,
-                PolicyFailureReason::InternalInvariant,
-                "a violated relational group retained no contributing row",
-                work,
-                budget,
+            return preserving_diagnostic_summary(
+                failed_policy_run_with_reason(
+                    policy,
+                    PolicyAnalysisType::Assertion,
+                    findings,
+                    PolicyFailureReason::InternalInvariant,
+                    "a violated relational group retained no contributing row",
+                    work,
+                    budget,
+                    hint,
+                ),
+                &diagnostics.omitted_summary(),
             );
         };
         let Some(primary_location) = row_location(primary_row) else {
-            return failed_policy_run_with_reason(
-                policy,
-                PolicyAnalysisType::Assertion,
-                findings,
-                PolicyFailureReason::InternalInvariant,
-                "a relational violation row could not be projected into a source location",
-                work,
-                budget,
+            return preserving_diagnostic_summary(
+                failed_policy_run_with_reason(
+                    policy,
+                    PolicyAnalysisType::Assertion,
+                    findings,
+                    PolicyFailureReason::InternalInvariant,
+                    "a relational violation row could not be projected into a source location",
+                    work,
+                    budget,
+                    hint,
+                ),
+                &diagnostics.omitted_summary(),
             );
         };
         let key_text = render_relational_key(&violation.key);
@@ -2869,38 +3005,50 @@ fn relational_run(
                     continue;
                 }
                 let Some(location) = row_location(row) else {
-                    return failed_policy_run_with_reason(
-                        policy,
-                        PolicyAnalysisType::Assertion,
-                        findings,
-                        PolicyFailureReason::InternalInvariant,
-                        "a relational violation row could not be projected into a source location",
-                        work,
-                        budget,
+                    return preserving_diagnostic_summary(
+                        failed_policy_run_with_reason(
+                            policy,
+                            PolicyAnalysisType::Assertion,
+                            findings,
+                            PolicyFailureReason::InternalInvariant,
+                            "a relational violation row could not be projected into a source location",
+                            work,
+                            budget,
+                            hint,
+                        ),
+                        &diagnostics.omitted_summary(),
                     );
                 };
                 let Ok(entry) = RelatedPolicyLocation::try_new(relationship, location, Vec::new())
                 else {
-                    return failed_policy_run_with_reason(
-                        policy,
-                        PolicyAnalysisType::Assertion,
-                        findings,
-                        PolicyFailureReason::InternalInvariant,
-                        "an evidence row could not be projected into a related policy location",
-                        work,
-                        budget,
+                    return preserving_diagnostic_summary(
+                        failed_policy_run_with_reason(
+                            policy,
+                            PolicyAnalysisType::Assertion,
+                            findings,
+                            PolicyFailureReason::InternalInvariant,
+                            "an evidence row could not be projected into a related policy location",
+                            work,
+                            budget,
+                            hint,
+                        ),
+                        &diagnostics.omitted_summary(),
                     );
                 };
                 related.push(entry);
                 let Some(additional_locations) = row_also_fails_at_locations(row) else {
-                    return failed_policy_run_with_reason(
-                        policy,
-                        PolicyAnalysisType::Assertion,
-                        findings,
-                        PolicyFailureReason::InternalInvariant,
-                        "an absent-member row could not project its masked access locations",
-                        work,
-                        budget,
+                    return preserving_diagnostic_summary(
+                        failed_policy_run_with_reason(
+                            policy,
+                            PolicyAnalysisType::Assertion,
+                            findings,
+                            PolicyFailureReason::InternalInvariant,
+                            "an absent-member row could not project its masked access locations",
+                            work,
+                            budget,
+                            hint,
+                        ),
+                        &diagnostics.omitted_summary(),
                     );
                 };
                 for location in additional_locations {
@@ -2917,14 +3065,18 @@ fn relational_run(
                         location,
                         Vec::new(),
                     ) else {
-                        return failed_policy_run_with_reason(
-                            policy,
-                            PolicyAnalysisType::Assertion,
-                            findings,
-                            PolicyFailureReason::InternalInvariant,
-                            "a masked absent-member access could not be retained as related evidence",
-                            work,
-                            budget,
+                        return preserving_diagnostic_summary(
+                            failed_policy_run_with_reason(
+                                policy,
+                                PolicyAnalysisType::Assertion,
+                                findings,
+                                PolicyFailureReason::InternalInvariant,
+                                "a masked absent-member access could not be retained as related evidence",
+                                work,
+                                budget,
+                                hint,
+                            ),
+                            &diagnostics.omitted_summary(),
                         );
                     };
                     related.push(entry);
@@ -2933,19 +3085,23 @@ fn relational_run(
         }
 
         let Ok(anchor_path) = WorkspaceRelativePath::new(primary_location.path()) else {
-            return failed_policy_run_with_reason(
-                policy,
-                PolicyAnalysisType::Assertion,
-                findings,
-                PolicyFailureReason::InternalInvariant,
-                "a relational violation location has no workspace-relative path",
-                work,
-                budget,
+            return preserving_diagnostic_summary(
+                failed_policy_run_with_reason(
+                    policy,
+                    PolicyAnalysisType::Assertion,
+                    findings,
+                    PolicyFailureReason::InternalInvariant,
+                    "a relational violation location has no workspace-relative path",
+                    work,
+                    budget,
+                    hint,
+                ),
+                &diagnostics.omitted_summary(),
             );
         };
         let anchor = super::super::finding_identity::AssertionFindingAnchor::new(
             anchor_path,
-            &key_text,
+            subject,
             assertion.id.as_str(),
         );
         let expectation = format!(
@@ -2969,14 +3125,18 @@ fn relational_run(
             effect_derivations,
             omitted_effect_derivations,
         ) else {
-            return failed_policy_run_with_reason(
-                policy,
-                PolicyAnalysisType::Assertion,
-                findings,
-                PolicyFailureReason::InternalInvariant,
-                "a violated assertion could not be projected into validated policy evidence",
-                work,
-                budget,
+            return preserving_diagnostic_summary(
+                failed_policy_run_with_reason(
+                    policy,
+                    PolicyAnalysisType::Assertion,
+                    findings,
+                    PolicyFailureReason::InternalInvariant,
+                    "a violated assertion could not be projected into validated policy evidence",
+                    work,
+                    budget,
+                    hint,
+                ),
+                &diagnostics.omitted_summary(),
             );
         };
 
@@ -3015,7 +3175,7 @@ fn relational_run(
             ),
         }
         .expect("relational row evidence has canonical proof metadata");
-        let finding = PolicyFinding::try_new(
+        let finding = PolicyFinding::try_new_shedding_detail(
             metadata.id.clone(),
             policy.semantic_hash(),
             severity,
@@ -3039,22 +3199,61 @@ fn relational_run(
             budget,
         );
         match finding {
-            Ok(finding) => findings.push(finding),
+            Ok((finding, detail_omitted)) => {
+                if detail_omitted {
+                    completion.mark_inconclusive(PolicyIncompleteReason::ReportRetentionBudget);
+                    diagnostics.record_typed_cause(
+                        &PolicyDiagnosticCode::ReportRetentionBudget,
+                        PolicyDiagnosticImpact::RunIncomplete,
+                        crate::finding::PolicyDiagnosticExecutionCause::DetailRetention,
+                    );
+                }
+                findings.push(finding);
+            }
             Err(_) => {
-                return failed_policy_run_with_reason(
-                    policy,
-                    PolicyAnalysisType::Assertion,
-                    findings,
-                    PolicyFailureReason::InternalInvariant,
-                    "a validated assertion violation could not be retained as a finding",
-                    work,
-                    budget,
+                return preserving_diagnostic_summary(
+                    failed_policy_run_with_reason(
+                        policy,
+                        PolicyAnalysisType::Assertion,
+                        findings,
+                        PolicyFailureReason::InternalInvariant,
+                        "a validated assertion violation could not be retained as a finding",
+                        work,
+                        budget,
+                        hint,
+                    ),
+                    &diagnostics.omitted_summary(),
                 );
             }
         }
     }
 
-    let work = relational_work_report(total_work, evaluation.work, findings.len(), 0);
+    let mut work = relational_work_report(total_work, evaluation.work, findings.len(), 0)
+        .with_budget_refusals(&adapted.budget_refusals);
+    if diagnostics.causes().iter().any(|cause| {
+        cause.execution_cause() == crate::finding::PolicyDiagnosticExecutionCause::DetailRetention
+    }) {
+        work.record_budget_refusal("policy/retained_report_bytes");
+    }
+    if adapted.result_limit_reached {
+        work.record_budget_refusal("query/pipeline_rows");
+    }
+    if adapted.adaptation_failed {
+        completion = PolicyRunCompletion::failed(vec![PolicyFailureReason::InternalInvariant])
+            .expect("one typed failure reason");
+        diagnostics.retain_failed_run_diagnostics();
+        if retain_adaptation_failure(
+            &mut diagnostics,
+            budget.max_diagnostics(),
+            adapted
+                .failure_detail
+                .as_deref()
+                .expect("adapter failure has detail"),
+        ) {
+            diagnostics_truncated = true;
+            work.record_budget_refusal("policy/diagnostics");
+        }
+    }
     let mut run = finish_assembled_run(
         policy,
         PolicyAnalysisType::Assertion,
@@ -3065,6 +3264,7 @@ fn relational_run(
         work,
         "relational assertion evaluation produced an invalid policy run",
         budget,
+        hint,
     )?;
     attach_relational_obligations(&mut run, &evaluation, budget);
     Ok(run)
@@ -3208,40 +3408,6 @@ const fn policy_obligation_kind(
     }
 }
 
-/// Retain the one diagnostic that says this relational run could not observe
-/// everything it needed to.
-///
-/// Separate from `retain_incomplete_diagnostic` because that helper reports a
-/// retention-budget cause; this one reports an evaluation cause, which is the
-/// code the inconclusive relational path has always published.
-fn retain_incomplete_run_diagnostic(
-    diagnostics: &mut Vec<PolicyDiagnostic>,
-    diagnostics_truncated: &mut bool,
-    max_diagnostics: usize,
-    message: &str,
-) {
-    if diagnostics.len() >= max_diagnostics {
-        *diagnostics_truncated = true;
-        return;
-    }
-    match super::incomplete_run_diagnostic(PolicyDiagnosticCode::EvaluationFailure, message) {
-        Some(diagnostic) => diagnostics.push(diagnostic),
-        None => *diagnostics_truncated = true,
-    }
-}
-
-/// Name every unmet proof obligation on the run's diagnostics.
-///
-/// One diagnostic per blocked verdict, in the evaluation's own deterministic
-/// order, bounded by the same per-policy diagnostic cap every other channel
-/// respects. The reason family is the obligation kind rather than the whole
-/// message, so a capped list still reports how many verdicts each kind
-/// blocked (#2356); the message carries the assertion, the group and the group
-/// key, which is what makes the blocked claim addressable.
-///
-/// Truncation is recorded, never silent: the run's typed incomplete reasons
-/// are folded in before this runs, so a dropped diagnostic costs detail and
-/// never soundness.
 /// One advisory note per assertion whose group relation held no group at all.
 ///
 /// The verdict is clean and the run is complete: an assertion over no group
@@ -3251,14 +3417,20 @@ fn retain_incomplete_run_diagnostic(
 /// assertion and its group. `PolicyDiagnostic::empty_selection` carries the
 /// code, severity and impact so this and the taint evaluator cannot drift.
 fn retain_vacuous_assertion_diagnostics(
-    diagnostics: &mut Vec<PolicyDiagnostic>,
+    diagnostics: &mut PolicyDiagnostics,
     diagnostics_truncated: &mut bool,
     max_diagnostics: usize,
     policy_id: &PolicyId,
     evaluation: &super::super::assertion_policy::RelationalAssertionEvaluation,
 ) {
     for vacuous in &evaluation.vacuous_assertions {
+        diagnostics.record_typed_cause(
+            &PolicyDiagnosticCode::EmptySelection,
+            PolicyDiagnosticImpact::Advisory,
+            crate::finding::PolicyDiagnosticExecutionCause::Known(None),
+        );
         if diagnostics.len() >= max_diagnostics {
+            diagnostics.record_omitted_severity(PolicyDiagnosticSeverity::Note);
             *diagnostics_truncated = true;
             return;
         }
@@ -3271,25 +3443,27 @@ fn retain_vacuous_assertion_diagnostics(
             vacuous.group,
         )) {
             Ok(diagnostic) => diagnostics.push(diagnostic),
-            Err(_) => *diagnostics_truncated = true,
+            Err(_) => {
+                diagnostics.record_omitted_severity(PolicyDiagnosticSeverity::Note);
+                *diagnostics_truncated = true;
+            }
         }
     }
 }
 
 fn retain_relational_obligation_diagnostics(
-    diagnostics: &mut Vec<PolicyDiagnostic>,
+    diagnostics: &mut PolicyDiagnostics,
     diagnostics_truncated: &mut bool,
     max_diagnostics: usize,
     evaluation: &super::super::assertion_policy::RelationalAssertionEvaluation,
 ) {
     if evaluation.obligations_truncated {
+        // The run summary already recorded the complete evaluator cause inventory.
+        diagnostics.record_omitted_severity(PolicyDiagnosticSeverity::Warning);
         *diagnostics_truncated = true;
     }
+    let upstream = diagnostics.causes().clone();
     for obligation in &evaluation.unmet_obligations {
-        if diagnostics.len() >= max_diagnostics {
-            *diagnostics_truncated = true;
-            return;
-        }
         // The reasons are already canonical and sorted on the obligation, and
         // their serialized spelling is the same one the report publishes.
         let reasons = obligation
@@ -3310,23 +3484,38 @@ fn retain_relational_obligation_diagnostics(
         // The partition is what makes an analysis-backed obligation actionable:
         // the reasons say a solve did not finish, and this says which one.
         let partition = render_coverage_partition(&obligation.partition);
-        let message = format!(
-            "relational assertion `{}` published no verdict for {scope}{partition}: {} ({reasons})",
-            obligation.assertion,
-            obligation.kind.label(),
+        let message = brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+            format_args!(
+                "relational assertion `{}` published no verdict for {scope}{partition}: {} ({reasons})",
+                obligation.assertion,
+                obligation.kind.label()
+            ),
+            format_args!(
+                "relational assertion `{}` published no verdict for {scope}{partition}: {}",
+                obligation.assertion,
+                obligation.kind.label()
+            ),
+            obligation.reasons.iter(),
         );
-        match PolicyDiagnostic::try_new_in_family(
+        let diagnostic = PolicyDiagnostic::try_new_in_family(
             PolicyDiagnosticCode::EvaluationFailure,
             PolicyDiagnosticSeverity::Warning,
             PolicyDiagnosticImpact::RunIncomplete,
             format!("relational_obligation/{}", obligation.kind.label()),
-            message,
+            crate::finding::bounded_report_prose(message),
             None,
             Vec::new(),
-        ) {
-            Ok(diagnostic) => diagnostics.push(diagnostic),
-            Err(_) => *diagnostics_truncated = true,
-        }
+            crate::RelatedLocationOmissions::Known(0),
+        )
+        .expect("relational obligation prose is bounded");
+        retain_incomplete_summary_diagnostic(
+            diagnostics,
+            diagnostics_truncated,
+            max_diagnostics,
+            &upstream,
+            &obligation.reasons,
+            diagnostic,
+        );
     }
 }
 
@@ -3353,9 +3542,10 @@ fn render_coverage_partition(partition: &super::super::relational::CoverageParti
     format!(" in analysis partition {named}{suffix}")
 }
 
-/// Render one group key as a stable, human-readable correlation string. Group
-/// keys are stable row scalars, so this rendering is content-scoped exactly
-/// when the authored key fields are.
+/// Render one group key as a human-readable correlation string for the
+/// finding's observed text. It is presentation only: a `StableId` component
+/// can be a lever-scoped semantic wire id, so the finding identity uses
+/// [`relational_anchor_subjects`] instead.
 fn render_relational_key(key: &[Option<super::super::assertion_policy::RowScalar>]) -> String {
     use super::super::assertion_policy::RowScalar;
     key.iter()
@@ -3372,6 +3562,171 @@ fn render_relational_key(key: &[Option<super::super::assertion_policy::RowScalar
         })
         .collect::<Vec<_>>()
         .join("|")
+}
+
+const RELATIONAL_SUBJECT_DOMAIN: &[u8] = b"bifrost-policy-relational-assertion-subject/v1";
+
+/// The anchor subject of each violated group, in violation order, or `None`
+/// when a group key names an identity no contributing row carries.
+///
+/// A group key can hold `StableId` row fields, and many of those are semantic
+/// wire ids: digests scoped by the adapter fingerprint and the semantic IR
+/// version, which a cache-identity lever token rotates without any change to
+/// the analyzed code. A finding id must survive that rotation, because users
+/// store it in baselines and suppressions (#12029). So the subject never
+/// hashes a `StableId` value. Each such key component is replaced by what it
+/// names in the source: the first-tuple row that carries the value, by its
+/// binding, domain, role, owning declaration and selected source bytes.
+/// Every other key component is a value the rows state and is hashed as it
+/// is.
+///
+/// The subject is also position-free: no byte span or line enters it, so
+/// lines inserted above the declaration, or an edit to another declaration,
+/// leave it unchanged. Groups that share a basis, for example two copies of
+/// the same call text in one function, are told apart by an ordinal. The
+/// basis already names the owning declaration, so the ordinal counts only
+/// equal groups within it, in their relative source order there. It is not
+/// assigned in violation order: violations are sorted by the raw key, which
+/// is exactly the lever-scoped order this avoids.
+fn relational_anchor_subjects(
+    violations: &[super::super::relational::RelationalAssertionViolation],
+    binding_index_by_name: &HashMap<&super::super::definition::RowBindingName, usize>,
+    executed: &[ExecutedQueryRows],
+) -> Option<Vec<String>> {
+    use super::super::assertion_policy::RowScalar;
+    use brokk_bifrost_rql::structural::search::UnitRowScalar;
+
+    let row_evidence = |row: &super::super::assertion_policy::RelationalViolationRow| {
+        let index = *binding_index_by_name.get(&row.binding)?;
+        Some((
+            &executed[index].items[row.row],
+            &executed[index].evidence[row.row],
+        ))
+    };
+    let mut bases = Vec::with_capacity(violations.len());
+    let mut source_orders = Vec::with_capacity(violations.len());
+    for violation in violations {
+        let tuple = violation.representatives.first()?;
+        let mut hasher = Sha256::new();
+        update_hash(&mut hasher, RELATIONAL_SUBJECT_DOMAIN);
+        update_hash(&mut hasher, violation.assertion.as_str().as_bytes());
+        for component in &violation.key {
+            match component {
+                None => update_hash(&mut hasher, b"null"),
+                Some(RowScalar::StableId(value)) => {
+                    let (row, item, evidence) = tuple.iter().find_map(|row| {
+                        let (item, evidence) = row_evidence(row)?;
+                        item.fields
+                            .iter()
+                            .any(|field| {
+                                matches!(&field.value, UnitRowScalar::StableId(id) if id.as_ref() == value.as_str())
+                            })
+                            .then_some((row, item, evidence))
+                    })?;
+                    update_hash(&mut hasher, b"row");
+                    update_hash(&mut hasher, row.binding.as_str().as_bytes());
+                    update_hash(&mut hasher, evidence.domain.label().as_bytes());
+                    match row_text(item, "role") {
+                        Some(role) => {
+                            update_hash(&mut hasher, b"role");
+                            update_hash(&mut hasher, role.as_bytes());
+                        }
+                        None => update_hash(&mut hasher, b"no-role"),
+                    }
+                    update_hash(&mut hasher, evidence.rel_path.as_bytes());
+                    match &evidence.stable_owner_candidate {
+                        Some(CodeQueryStableOwnerCandidate::Declaration { namespace, id }) => {
+                            update_hash(&mut hasher, b"declaration");
+                            update_hash(&mut hasher, namespace.as_bytes());
+                            update_hash(&mut hasher, id.as_bytes());
+                        }
+                        Some(CodeQueryStableOwnerCandidate::Derived {
+                            namespace,
+                            derivation: CodeQueryStableOwnerDerivation::CanonicalAstIdentity,
+                            semantic_key,
+                        }) => {
+                            update_hash(&mut hasher, b"canonical-ast");
+                            update_hash(&mut hasher, namespace.as_bytes());
+                            update_hash(&mut hasher, semantic_key.as_bytes());
+                        }
+                        // A semantic wire id is lever-scoped, so it names no
+                        // owner here; the file is the scope instead.
+                        Some(CodeQueryStableOwnerCandidate::Derived {
+                            derivation: CodeQueryStableOwnerDerivation::SemanticWireId,
+                            ..
+                        })
+                        | None => update_hash(&mut hasher, b"file"),
+                    }
+                    match evidence.source_slice_sha256 {
+                        Some(slice) => {
+                            update_hash(&mut hasher, b"source-slice");
+                            update_hash(&mut hasher, &slice);
+                        }
+                        None => update_hash(&mut hasher, b"no-source-slice"),
+                    }
+                }
+                Some(value) => {
+                    let tag: &[u8] = match value {
+                        RowScalar::StableId(_) => unreachable!("handled above"),
+                        RowScalar::String(_) => b"string",
+                        RowScalar::StringList(_) => b"string-list",
+                        RowScalar::IntegerList(_) => b"integer-list",
+                        RowScalar::Integer(_) => b"integer",
+                        RowScalar::Boolean(_) => b"boolean",
+                        RowScalar::ConstrainedEnum(_) => b"enum",
+                        RowScalar::DeclarationIdentity(_) => b"declaration",
+                    };
+                    update_hash(&mut hasher, tag);
+                    update_hash(
+                        &mut hasher,
+                        render_relational_key(std::slice::from_ref(component)).as_bytes(),
+                    );
+                }
+            }
+        }
+        bases.push(<[u8; 32]>::from(hasher.finalize()));
+        // Positions only order groups that share a basis, and the basis names
+        // their declaration, so an edit above or elsewhere keeps that order.
+        // No position enters the subject.
+        source_orders.push(
+            tuple
+                .iter()
+                .map(|row| {
+                    let (_, evidence) = row_evidence(row)?;
+                    Some((
+                        evidence.rel_path.clone(),
+                        evidence
+                            .byte_span
+                            .as_ref()
+                            .map(|span| (span.start, span.end)),
+                    ))
+                })
+                .collect::<Option<Vec<_>>>()?,
+        );
+    }
+
+    let mut order = (0..violations.len()).collect::<Vec<_>>();
+    order.sort_by(|&left, &right| {
+        bases[left]
+            .cmp(&bases[right])
+            .then_with(|| source_orders[left].cmp(&source_orders[right]))
+    });
+    let mut subjects = vec![String::new(); violations.len()];
+    let mut ordinal = 0_u32;
+    for (position, &index) in order.iter().enumerate() {
+        if position > 0 && bases[order[position - 1]] == bases[index] {
+            ordinal = ordinal.checked_add(1)?;
+        } else {
+            ordinal = 0;
+        }
+        let mut hasher = Sha256::new();
+        update_hash(&mut hasher, &bases[index]);
+        update_hash(&mut hasher, &ordinal.to_be_bytes());
+        subjects[index] = brokk_bifrost_analysis::analyzer::canonical_hash::lower_hex_string(
+            &hasher.finalize().into(),
+        );
+    }
+    Some(subjects)
 }
 
 /// The roles asserted by one family of asserts, deduplicated. Capability
@@ -6309,5 +6664,684 @@ mod value_origin_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod relational_subject_tests {
+    use super::*;
+    use crate::assertion_policy::{RelationalViolationRow, RowScalar};
+    use crate::definition::{PolicyAssertId, RowBindingName, RowGroupName};
+    use crate::relational::RelationalAssertionViolation;
+    use brokk_bifrost_rql::structural::search::{
+        UnitRowField, UnitRowIdentities, UnitRowItemTerminal, UnitRowScalar,
+    };
+    use brokk_bifrost_test_macros::hardwon;
+
+    /// One `uses` row: its id, its source slice (`None` for a row without
+    /// one), its byte offset and its owning declaration.
+    struct Row {
+        id: &'static str,
+        slice: Option<u8>,
+        start: usize,
+        owner: char,
+    }
+
+    fn executed(rows: &[Row]) -> ExecutedQueryRows {
+        let (items, evidence) = rows
+            .iter()
+            .map(|row| {
+                let item = UnitRowItem {
+                    domain: DetailedCodeQueryDomain::CallSite,
+                    path: "app.js".into(),
+                    range: None,
+                    evidence: None,
+                    coverage: None,
+                    fields: vec![UnitRowField {
+                        name: "id".into(),
+                        value: UnitRowScalar::StableId(row.id.into()),
+                    }],
+                    projected_field_names: Vec::new(),
+                    unknown_fields: Vec::new(),
+                    terminal: Some(UnitRowItemTerminal::SourcePosition),
+                    provenance: Vec::new(),
+                    provenance_truncated: false,
+                };
+                let evidence = UnitRowEvidence {
+                    call_path_evidence: None,
+                    domain: DetailedCodeQueryDomain::CallSite,
+                    key: DetailedCodeQueryKey::CallSite {
+                        site_id: Some(row.id.to_owned()),
+                        caller_fq_name: "app.run".to_owned(),
+                        callee_fq_name: "sink".to_owned(),
+                    },
+                    rel_path: "app.js".into(),
+                    byte_span: Some(row.start..row.start + 5),
+                    stable_owner_candidate: Some(CodeQueryStableOwnerCandidate::Declaration {
+                        namespace: "javascript".to_owned(),
+                        id: format!("decl:v1:{}", row.owner.to_string().repeat(64)),
+                    }),
+                    identities: UnitRowIdentities::None,
+                    source_slice_sha256: row.slice.map(|slice| [slice; 32]),
+                    provenance: Vec::new(),
+                };
+                (item, evidence)
+            })
+            .unzip();
+        ExecutedQueryRows {
+            items,
+            evidence,
+            completion: CodeQueryCompletion::Complete,
+            depth_bound_status: None,
+            truncated: false,
+            diagnostics: Vec::new(),
+            work: CodeQueryExecutionWork::default(),
+            reuse: Default::default(),
+            candidate_sites: None,
+        }
+    }
+
+    /// The anchor subject of the group of each row, by row, with one
+    /// violation per row grouped by its id and sorted by that key as the
+    /// relational evaluator publishes them.
+    fn subjects_by_row(rows: &[Row]) -> Vec<String> {
+        let executed = [executed(rows)];
+        let binding = RowBindingName::new("uses").unwrap();
+        let binding_index_by_name = HashMap::from([(&binding, 0)]);
+        let mut violations = rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| RelationalAssertionViolation {
+                assertion: PolicyAssertId::new("no-uses").unwrap(),
+                group: RowGroupName::new("by-use").unwrap(),
+                key: vec![Some(RowScalar::StableId(row.id.to_owned()))],
+                actual: 1,
+                certainty: FindingCertainty::Definite,
+                representatives: vec![vec![RelationalViolationRow {
+                    binding: binding.clone(),
+                    row: index,
+                }]],
+            })
+            .collect::<Vec<_>>();
+        violations.sort_by(|left, right| left.key.cmp(&right.key));
+        let subjects = relational_anchor_subjects(&violations, &binding_index_by_name, &executed)
+            .expect("every key id is carried by a contributing row");
+        let mut by_row = vec![String::new(); rows.len()];
+        for (violation, subject) in violations.iter().zip(subjects) {
+            by_row[violation.representatives[0][0].row] = subject;
+        }
+        by_row
+    }
+
+    #[test]
+    #[hardwon(
+        "#12029: a relational finding id hashed its group key, so a lever token that rotated the semantic row ids changed stored finding ids"
+    )]
+    fn relational_subjects_are_lever_and_position_free() {
+        // In declaration `a`: two rows with the same call text and one row
+        // without a source slice. In declaration `b`: other call text.
+        let before = subjects_by_row(&[
+            Row {
+                id: "11aa",
+                slice: Some(0xa1),
+                start: 0,
+                owner: 'a',
+            },
+            Row {
+                id: "22bb",
+                slice: Some(0xa1),
+                start: 40,
+                owner: 'a',
+            },
+            Row {
+                id: "33cc",
+                slice: None,
+                start: 60,
+                owner: 'a',
+            },
+            Row {
+                id: "44dd",
+                slice: Some(0xb2),
+                start: 80,
+                owner: 'b',
+            },
+        ]);
+        let mut distinct = before.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(distinct.len(), 4, "{before:?}");
+
+        // A lever rotation changes every id and reverses the key order the
+        // evaluator sorts violations by. Lines inserted above both
+        // declarations move every row. Neither changes a subject.
+        let rotated_and_moved = subjects_by_row(&[
+            Row {
+                id: "f4",
+                slice: Some(0xa1),
+                start: 100,
+                owner: 'a',
+            },
+            Row {
+                id: "e3",
+                slice: Some(0xa1),
+                start: 140,
+                owner: 'a',
+            },
+            Row {
+                id: "d2",
+                slice: None,
+                start: 160,
+                owner: 'a',
+            },
+            Row {
+                id: "c1",
+                slice: Some(0xb2),
+                start: 180,
+                owner: 'b',
+            },
+        ]);
+        assert_eq!(before, rotated_and_moved);
+
+        // An edit to declaration `b` that adds the same call text there, ahead
+        // of everything in `a`, leaves the subjects in `a` unchanged.
+        let other_declaration_edited = subjects_by_row(&[
+            Row {
+                id: "11aa",
+                slice: Some(0xa1),
+                start: 300,
+                owner: 'a',
+            },
+            Row {
+                id: "22bb",
+                slice: Some(0xa1),
+                start: 340,
+                owner: 'a',
+            },
+            Row {
+                id: "33cc",
+                slice: None,
+                start: 360,
+                owner: 'a',
+            },
+            Row {
+                id: "44dd",
+                slice: Some(0xb2),
+                start: 0,
+                owner: 'b',
+            },
+            Row {
+                id: "55ee",
+                slice: Some(0xa1),
+                start: 20,
+                owner: 'b',
+            },
+        ]);
+        assert_eq!(before[..3], other_declaration_edited[..3]);
+    }
+}
+
+#[cfg(test)]
+mod budget_telemetry_tests {
+    use super::*;
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11321: assertion assembly discarded refused work lanes when diagnostics were capped"
+    )]
+    fn assertion_budget_telemetry_survives_diagnostic_cap() {
+        let catalogs = Arc::new(crate::TaintCatalogRegistry::new_without_workspace(
+            crate::CatalogRegistryLimits::default(),
+        ));
+        let mut registry = crate::PolicyRegistry::new_without_workspace(
+            catalogs,
+            crate::PolicyRegistryLimits::default(),
+        );
+        registry.register_policy_bytes(crate::PolicySourceIdentity::new("test:assertion-budget"), br#"(policy :id "test.assertion-budget" :name "Budget" :message "M" :severity warning
+            :analysis (analysis :type assertion :subject (rql (identifier :capture "site"))
+            :asserts [(assert-round-trip :id check :at "site" :role type_operand)]))"#).unwrap();
+        let diagnostic = CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            has_non_utf8_refusal: false,
+            refusal_sites: Default::default(),
+            uses_omissions: Vec::new(),
+            incompleteness: brokk_bifrost_rql::Incompleteness::Content,
+            code: CodeQueryDiagnosticCode::ExecutionBudgetExhausted,
+            impact: CodeQueryDiagnosticImpact::Incomplete,
+            branch: Vec::new(),
+            language: "workspace",
+            message: "cut".to_string(),
+            source: None,
+            related: Vec::new(),
+            exhausted_roots: vec![brokk_bifrost_rql::structural::CodeQueryExhaustedRoot {
+                path: ".".to_string(),
+                procedure: None,
+                lane: "query/fact_nodes".to_string(),
+                stage: None,
+                budget: None,
+                charge: None,
+                feedback_iteration: None,
+            }],
+            withheld_rows_path: None,
+            call_relation_facts: None,
+        });
+        let totals = AssertionRunTotals {
+            retention: AssertFileRetention::None,
+            findings: Vec::new(),
+            unconcluded_files: Vec::new(),
+            unconcluded_file_set: false,
+            row_completions: Vec::new(),
+            query_diagnostics: vec![diagnostic],
+            work: CodeQueryExecutionWork::default(),
+        };
+        let budget = PolicyBudget::builder()
+            .with_max_diagnostics(0)
+            .unwrap()
+            .build()
+            .unwrap();
+        let run = finish_assertion_run(
+            registry.policies().next().unwrap(),
+            &CodeQueryCompletion::Complete,
+            totals,
+            &budget,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            run.budget_refusals(),
+            ["policy/diagnostics", "query/fact_nodes"]
+        );
+    }
+}
+
+#[cfg(test)]
+mod cause_tests {
+    use super::*;
+    use brokk_bifrost_rql::{DiagnosticExecutionCause, Incompleteness};
+    use brokk_bifrost_test_macros::hardwon;
+    use serde_json::json;
+
+    #[test]
+    #[hardwon(
+        "#12312: assertion paths mislabeled adapter rejection and built invalid complete runs"
+    )]
+    fn assertion_diagnostic_adaptation_fails_with_actual_error() {
+        let registry = crate::test_support::registry_with_policy(
+            "test:assertion-adapter",
+            r#"(policy :schema-version 1 :id "test.assertion-adapter" :name "Adapter" :message "M"
+                :severity warning :analysis (analysis :type assertion
+                (bind :name read :query (rql (occurrences :role [value_reference])))
+                (group :name by-read :by (read.ast_id) (aggregate :name reads :op count))
+                (assert :group by-read :value reads :cardinality (at-most 10))))"#,
+            "valid policy",
+        );
+        let policy = registry.policies().next().unwrap();
+        let crate::definition::PolicyAnalysis::Assertion { spec } = &policy.definition().analysis
+        else {
+            panic!("assertion policy")
+        };
+        let plan = spec.relational.as_ref().unwrap();
+        let bindings = plan
+            .bindings
+            .iter()
+            .enumerate()
+            .map(|(i, binding)| (&binding.name, i))
+            .collect();
+        let rejected = CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            has_non_utf8_refusal: false,
+            refusal_sites: Default::default(),
+            incompleteness: Incompleteness::Content,
+            code: CodeQueryDiagnosticCode::UsesTargetsAmbiguous,
+            impact: CodeQueryDiagnosticImpact::Advisory,
+            branch: Vec::new(),
+            language: "workspace",
+            message: "x".repeat(4097),
+            source: None,
+            related: Vec::new(),
+            exhausted_roots: Vec::new(),
+            withheld_rows_path: None,
+            call_relation_facts: None,
+            uses_omissions: Vec::new(),
+        });
+        let budget = PolicyBudget::default();
+        let totals = AssertionRunTotals {
+            retention: AssertFileRetention::None,
+            findings: Vec::new(),
+            unconcluded_files: Vec::new(),
+            unconcluded_file_set: false,
+            row_completions: Vec::new(),
+            query_diagnostics: vec![rejected.clone()],
+            work: CodeQueryExecutionWork::default(),
+        };
+        let per_file = finish_assertion_run(
+            policy,
+            &CodeQueryCompletion::Complete,
+            totals,
+            &budget,
+            None,
+        )
+        .unwrap();
+        let input = ExecutedQueryRows {
+            items: Vec::new(),
+            evidence: Vec::new(),
+            completion: CodeQueryCompletion::Complete,
+            depth_bound_status: None,
+            truncated: false,
+            diagnostics: vec![rejected],
+            work: CodeQueryExecutionWork::default(),
+            reuse: Default::default(),
+            candidate_sites: None,
+        };
+        let relational =
+            relational_run(policy, plan, &bindings, &[input], &budget, None, None).unwrap();
+        for run in [per_file, relational] {
+            assert!(
+                matches!(run.completion(), PolicyRunCompletion::Failed { reasons } if reasons == &[PolicyFailureReason::InternalInvariant])
+            );
+            assert!(!run.diagnostics_truncated());
+            assert!(run.diagnostics().iter().any(|d| d.code()
+                == &PolicyDiagnosticCode::EvaluationFailure
+                && d.impact() == PolicyDiagnosticImpact::RunFailed
+                && d.message().contains("UsesTargetsAmbiguous")
+                && d.message().contains("ProseTooLong")));
+            assert!(
+                !run.diagnostic_causes()
+                    .iter()
+                    .any(|cause| cause.code() == "report_retention_budget")
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#12105: evaluator cancellation and row limits must remain operational in summary causes"
+    )]
+    fn relational_evaluator_stops_preserve_execution_causes() {
+        let registry = crate::test_support::registry_with_policy(
+            "test:relational-causes",
+            r#"(policy
+            :schema-version 1 :id "test.relational-causes" :name "Causes" :message "Unreachable"
+            :severity warning :analysis (analysis :type assertion
+                (bind :name read :query (rql (occurrences :role [value_reference])))
+                (group :name by-read :by (read.ast_id) (aggregate :name reads :op count))
+                (assert :group by-read :value reads :cardinality (at-most 10))))"#,
+            "valid policy",
+        );
+        let policy = registry.policies().next().unwrap();
+        let crate::definition::PolicyAnalysis::Assertion { spec } = &policy.definition().analysis
+        else {
+            panic!("assertion policy")
+        };
+        for (cancelled, cap, expected) in [
+            (true, 0, "cancelled"),
+            (true, 256, "cancelled"),
+            (false, 0, "budget"),
+            (false, 256, "budget"),
+        ] {
+            let mut plan = spec.relational.clone().unwrap();
+            if !cancelled {
+                plan.limits.max_source_rows = 1;
+            }
+            let (mut items, evidence) = super::super::tests::projected_binding_rows();
+            // This test exercises a row cap, not the helper's projected-field
+            // rejection case. Restore the full registered field domain.
+            for item in &mut items {
+                item.projected_field_names.clear();
+            }
+            let input = ExecutedQueryRows {
+                items,
+                evidence,
+                completion: CodeQueryCompletion::Complete,
+                depth_bound_status: None,
+                truncated: false,
+                diagnostics: Vec::new(),
+                work: CodeQueryExecutionWork::default(),
+                reuse: Default::default(),
+                candidate_sites: None,
+            };
+            let token = CancellationToken::new();
+            if cancelled {
+                token.cancel();
+            }
+            let budget = PolicyBudget::builder()
+                .with_max_diagnostics(cap)
+                .unwrap()
+                .build()
+                .unwrap();
+            let bindings = plan
+                .bindings
+                .iter()
+                .enumerate()
+                .map(|(i, binding)| (&binding.name, i))
+                .collect();
+            let run = relational_run(
+                policy,
+                &plan,
+                &bindings,
+                &[input],
+                &budget,
+                Some(&token),
+                None,
+            )
+            .unwrap();
+            assert!(run.findings().is_empty());
+            let causes = run
+                .diagnostic_causes()
+                .iter()
+                .filter(|cause| cause.code() == "evaluation_failure")
+                .map(|cause| serde_json::to_value(cause.execution_cause()).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                causes,
+                vec![json!(expected)],
+                "cap={cap}, cancelled={cancelled}, run={run:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon("#12105: relational summaries invented Unknown over typed and omitted query causes")]
+    fn relational_summary_preserves_causes_before_detail_retention() {
+        for (inputs, reasons, expected) in [
+            (
+                vec![Incompleteness::Content],
+                vec![PolicyIncompleteReason::CapabilityIncomplete],
+                json!([null]),
+            ),
+            (
+                vec![Incompleteness::Operational(
+                    DiagnosticExecutionCause::Provider,
+                )],
+                vec![],
+                json!(["provider"]),
+            ),
+            (
+                vec![
+                    Incompleteness::Content,
+                    Incompleteness::Operational(DiagnosticExecutionCause::Provider),
+                ],
+                vec![],
+                json!([null, "provider"]),
+            ),
+            (
+                vec![],
+                vec![PolicyIncompleteReason::Cancelled],
+                json!(["cancelled"]),
+            ),
+            (
+                vec![],
+                vec![PolicyIncompleteReason::PipelineRowBudget],
+                json!(["budget"]),
+            ),
+            (
+                vec![Incompleteness::Content],
+                vec![
+                    PolicyIncompleteReason::Cancelled,
+                    PolicyIncompleteReason::PipelineRowBudget,
+                ],
+                json!([null, "cancelled", "budget"]),
+            ),
+            (
+                vec![Incompleteness::ConfiguredCap],
+                vec![PolicyIncompleteReason::QueryResultLimit],
+                json!([null]),
+            ),
+        ] {
+            let query = inputs
+                .into_iter()
+                .map(|incompleteness| {
+                    CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                        has_non_utf8_refusal: false,
+                        refusal_sites: Default::default(),
+                        incompleteness,
+                        related: Vec::new(),
+                        source: None,
+                        code: CodeQueryDiagnosticCode::StatementReachabilityDerivationIncomplete,
+                        impact: CodeQueryDiagnosticImpact::Incomplete,
+                        branch: Vec::new(),
+                        language: "rust",
+                        message: "open control evidence".to_owned(),
+                        uses_omissions: Vec::new(),
+                        exhausted_roots: Vec::new(),
+                        withheld_rows_path: None,
+                        call_relation_facts: None,
+                    })
+                })
+                .collect::<Vec<_>>();
+            for cap in [0, 256] {
+                let adapted = adapt_query_diagnostics(&query, cap, 64);
+                let upstream = adapted.diagnostics.causes().clone();
+                let mut diagnostics = adapted.diagnostics;
+                let mut truncated = adapted.truncated;
+                retain_incomplete_summary_diagnostic(
+                    &mut diagnostics,
+                    &mut truncated,
+                    cap,
+                    &upstream,
+                    &reasons,
+                    PolicyDiagnostic::new_bounded(
+                        PolicyDiagnosticCode::EvaluationFailure,
+                        PolicyDiagnosticSeverity::Warning,
+                        PolicyDiagnosticImpact::RunIncomplete,
+                        "relational assertion evaluation could not observe a complete row set",
+                    ),
+                );
+                let summary = diagnostics
+                    .causes()
+                    .iter()
+                    .filter(|cause| cause.code() == "evaluation_failure")
+                    .map(|cause| serde_json::to_value(cause.execution_cause()).unwrap())
+                    .collect::<Vec<_>>();
+                assert_eq!(json!(summary), expected, "cap={cap}");
+                if cap == 0 {
+                    assert!(diagnostics.is_empty());
+                    assert!(truncated);
+                } else {
+                    let retained = diagnostics
+                        .iter()
+                        .find(|diagnostic| {
+                            diagnostic.code() == &PolicyDiagnosticCode::EvaluationFailure
+                        })
+                        .unwrap();
+                    let retained_only: PolicyDiagnostics = vec![retained.clone()].into();
+                    assert_eq!(
+                        serde_json::to_value(retained_only.causes()).unwrap()[0]["execution_cause"],
+                        *expected.as_array().unwrap().last().unwrap()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12105: assertion unit replay lost the detail-retention producer event"
+    )]
+    fn assertion_unit_replay_preserves_required_retention_origin() {
+        use serde::de::DeserializeSeed;
+        let registry = crate::test_support::registry_with_policy(
+            "test:retention",
+            r#"(policy :id "test.retention" :name "Retention" :message "matched" :severity warning :analysis (analysis :type assertion :subject (rql (identifier :capture "site")) :asserts [(assert-round-trip :id check :at "site" :role type_operand)]))"#,
+            "valid retention policy",
+        );
+        let budget = PolicyBudget::builder()
+            .with_max_diagnostics(0)
+            .unwrap()
+            .build()
+            .unwrap();
+        for retention in [
+            AssertFileRetention::None,
+            AssertFileRetention::DetailRetention,
+            AssertFileRetention::FindingRetention {
+                omitted_lower_bound: std::num::NonZeroU64::new(2).unwrap(),
+            },
+        ] {
+            let product = AssertFileProduct {
+                retention,
+                findings: Vec::new(),
+                unconcluded: Vec::new(),
+                row_completions: Vec::new(),
+                diagnostics: Vec::new(),
+                work: CodeQueryExecutionWork::default(),
+            };
+            let wire = serde_json::to_value(&product).unwrap();
+            let replay = crate::units::AssertFileProductSeed::new(&budget)
+                .deserialize(wire.clone())
+                .unwrap();
+            assert_eq!(replay.retention, retention);
+            let mut missing = wire;
+            missing.as_object_mut().unwrap().remove("retention");
+            assert!(
+                crate::units::AssertFileProductSeed::new(&budget)
+                    .deserialize(missing)
+                    .is_err()
+            );
+            let mut totals = AssertionRunTotals {
+                retention: AssertFileRetention::None,
+                findings: Vec::new(),
+                unconcluded_files: Vec::new(),
+                unconcluded_file_set: false,
+                row_completions: Vec::new(),
+                query_diagnostics: Vec::new(),
+                work: CodeQueryExecutionWork::default(),
+            };
+            totals.merge("app.ts", replay);
+            let run = finish_assertion_run(
+                registry.policies().next().unwrap(),
+                &CodeQueryCompletion::Complete,
+                totals,
+                &budget,
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                run.work().retention_omitted_findings_lower_bound(),
+                if matches!(retention, AssertFileRetention::FindingRetention { .. }) {
+                    2
+                } else {
+                    0
+                }
+            );
+            let expected = match retention {
+                AssertFileRetention::None => None,
+                AssertFileRetention::DetailRetention => {
+                    Some(crate::finding::PolicyDiagnosticExecutionCause::DetailRetention)
+                }
+                AssertFileRetention::FindingRetention { .. } => {
+                    Some(crate::finding::PolicyDiagnosticExecutionCause::FindingRetention)
+                }
+            };
+            assert_eq!(
+                run.diagnostic_causes()
+                    .iter()
+                    .find(|cause| cause.code() == "report_retention_budget")
+                    .map(|cause| cause.execution_cause()),
+                expected
+            );
+        }
+        assert!(
+            serde_json::from_value::<AssertFileRetention>(
+                serde_json::json!({"type":"finding_retention","omitted_lower_bound":0})
+            )
+            .is_err()
+        );
     }
 }

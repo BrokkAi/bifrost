@@ -37,6 +37,7 @@
 //! semantic IR, so no adapter version moves.
 
 use super::DerivationExecutionCause;
+use super::EXECUTION_DEPENDENT;
 use super::results::{
     CodeQueryBuildTarget, CodeQueryDiagnostic, CodeQueryDiagnosticCode, CodeQueryDiagnosticImpact,
     CodeQueryResultRef, CodeQuerySourceSet, CodeQueryTopologyEdge, DetailedCodeQueryKey,
@@ -51,6 +52,7 @@ use crate::hash::HashSet;
 use crate::path_utils::rel_path_string;
 use brokk_bifrost_analysis::analyzer::semantic_model::DependencyEvidence;
 use brokk_bifrost_analysis::analyzer::workspace_authority::{CaptureScopedMemo, memo_attribution};
+use brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict;
 use std::sync::Arc;
 
 /// Per-request memo of the workspace's declared topology plus the diagnostics
@@ -67,6 +69,9 @@ pub(super) struct TopologyTraversalCache {
     /// The workspace's `rust-toolchain` evidence rows, read once per query
     /// for Rust build-configuration rows.
     pub(super) rust_toolchain: Option<Result<Arc<[DependencyEvidence]>, String>>,
+    /// The execution dependences marked through this cache; the query joins it
+    /// into its reuse verdict.
+    pub(super) reuse: ReuseVerdict,
 }
 
 impl TopologyTraversalCache {
@@ -76,6 +81,7 @@ impl TopologyTraversalCache {
             topology.as_ref().map(|cached| {
                 if cached.provider_failed() {
                     analyzer.mark_execution_dependent();
+                    self.reuse.join_in(EXECUTION_DEPENDENT);
                 }
                 Arc::clone(cached)
             })
@@ -201,6 +207,10 @@ impl TopologyTraversalCache {
             return;
         }
         diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            has_non_utf8_refusal: false,
+            refusal_sites: Default::default(),
+            call_relation_facts: None,
+            uses_omissions: Vec::new(),
             incompleteness: brokk_bifrost_rql::Incompleteness::Operational(
                 brokk_bifrost_rql::DiagnosticExecutionCause::Provider,
             ),

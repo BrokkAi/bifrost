@@ -1,5 +1,7 @@
 use brokk_bifrost_analysis::analyzer::resolution::fact_resolution::call_applicability::compare_formal_types;
-use brokk_bifrost_analysis::analyzer::resolution::model::ResolutionSlotValue;
+use brokk_bifrost_analysis::analyzer::resolution::fact_resolution::call_applicability::{
+    CallFormalType, FormalSubtypeRelations, RepeatedParameterAssessment,
+};
 
 use brokk_bifrost_analysis::analyzer::resolution::fact_resolution::AnswerMap;
 
@@ -126,8 +128,7 @@ impl CallApplicabilityAdapter for JavaCallApplicabilityAdapter {
         component: brokk_bifrost_analysis::analyzer::resolution::model::ResolutionTypeRef,
         repeated_actual_count: usize,
         states: &StateMap,
-    ) -> Result<Option<brokk_bifrost_analysis::analyzer::resolution::model::ResolutionTypeRef>>
-    {
+    ) -> Result<Option<RepeatedParameterAssessment>> {
         if repeated_actual_count == 1 {
             evaluation.jvm_repeated_sequence_parameter_type(
                 actual_slot,
@@ -137,7 +138,7 @@ impl CallApplicabilityAdapter for JavaCallApplicabilityAdapter {
                 states,
             )
         } else {
-            Ok(Some(component))
+            Ok(Some(RepeatedParameterAssessment::Component(component)))
         }
     }
 
@@ -195,22 +196,31 @@ impl CallApplicabilityAdapter for JavaCallApplicabilityAdapter {
                 else {
                     return Ok(None);
                 };
-                if let Some(parameter) = signature.parameters().last().filter(|p| p.repeated()) {
-                    // The source signature publishes the repeated component. A
-                    // proved array actual replaces that component in conversion
-                    // evidence, admitting the method in the fixed-arity phase.
-                    let fixed_arity = bindings.len() == signature.parameters().len()
-                        && assessment.conversions.last().is_some_and(|conversion| {
-                            let Some(state) = previous_states.get(&parameter.slot()) else {
-                                return false;
-                            };
-                            matches!(state.possible_values(), [ResolutionSlotValue::Runtime { ty, .. }]
-                                if state.completion() == &ResolutionCompletion::Complete
-                                    && conversion.source_type == conversion.target_type
-                                    && conversion.target_type.is_some_and(|target| target != ty.identity()))
-                        });
-                    assessment.used_vararg = !fixed_arity;
+                // A variable-arity formal that receives no argument is used
+                // with a zero-length tail, which is only applicable in the
+                // variable-arity phase (JLS 15.12.2.4). The shared mapping
+                // marks vararg use only when an argument binds to the repeated
+                // formal, so record the empty tail here.
+                if let Some((trailing_index, parameter)) =
+                    signature.parameters().iter().enumerate().next_back()
+                    && parameter.repeated()
+                    && bindings
+                        .iter()
+                        .all(|binding| binding.parameter_index != trailing_index)
+                {
+                    assessment.used_vararg = true;
                 }
+                assessment.fixed_array_invocation = (!assessment.used_vararg
+                    && assessment.verdict == ApplicabilityVerdict::Applicable
+                    && assessment.conversions.iter().any(|conversion| {
+                        matches!(
+                            conversion.repeated,
+                            Some(RepeatedParameterAssessment::FixedArray { .. })
+                        )
+                    }))
+                .then_some(
+                    brokk_bifrost_analysis::analyzer::semantic::call_binding::FixedArrayInvocation,
+                );
                 Ok(Some(assessment))
             }
             MappingAssessment::Inapplicable(reason) => {
@@ -241,14 +251,14 @@ impl CallApplicabilityAdapter for JavaCallApplicabilityAdapter {
             }))
     }
 
-    fn candidate_formal_is_subtype(
+    fn candidate_formal_view_is_subtype(
         &self,
         evaluation: &mut FactEvaluation<'_, '_>,
-        subtype: SemanticId,
-        supertype: SemanticId,
+        subtype: CallFormalType,
+        supertype: CallFormalType,
         states: &StateMap,
     ) -> Result<Option<bool>> {
-        evaluation.java_reference_type_is_subtype(subtype, supertype, states)
+        evaluation.java_reference_formal_is_subtype(subtype, supertype, states)
     }
 
     fn invocation_phase(&self, candidate: &CandidateAssessment) -> Option<InvocationPhase> {
@@ -296,7 +306,7 @@ impl CallApplicabilityAdapter for JavaCallApplicabilityAdapter {
         &self,
         left: ConversionEvidence,
         right: ConversionEvidence,
-        subtype_relations: &HashMap<(SemanticId, SemanticId), bool>,
+        subtype_relations: &FormalSubtypeRelations,
     ) -> PartialOrder {
         match compare_formal_types(left, right, subtype_relations) {
             PartialOrder::Unknown => PartialOrder::Incomparable,

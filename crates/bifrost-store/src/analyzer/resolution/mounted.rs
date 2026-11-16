@@ -63,14 +63,15 @@ use super::remount::{
     remount_type_transfer_rule, remount_typed_frontier,
 };
 use super::typed_fact_lowering::{
-    LoweredBindingProjection, LoweredCallApplicabilityObligation, LoweredCallableSignatureProperty,
-    LoweredConstructionRequirementProperty, LoweredDeclarationTypeProperty,
-    LoweredDeclarationVisibilityProperty, LoweredDeclaredTypeArgument,
-    LoweredDefinitionPropertyGap, LoweredGenericFormal, LoweredGenericFormalDefault,
-    LoweredGenericTypeAliasParameter, LoweredIntrinsicSeed, LoweredMemberOwnerProperty,
-    LoweredMemberScopeProperty, LoweredQualifiedSeededRoute, LoweredSourceSupertypeProperty,
-    LoweredSupertypeProperty, LoweredTypeArgument, LoweredTypeComponent, LoweredTypeProduction,
-    LoweredTypeTransfer, LoweredTypedFrontier, LoweredUnderlyingType,
+    LoweredBinaryOperation, LoweredBindingProjection, LoweredCallApplicabilityObligation,
+    LoweredCallableSignatureProperty, LoweredConstructionRequirementProperty,
+    LoweredDeclarationTypeProperty, LoweredDeclarationVisibilityProperty,
+    LoweredDeclaredTypeArgument, LoweredDefinitionPropertyGap, LoweredGenericFormal,
+    LoweredGenericFormalDefault, LoweredGenericTypeAliasParameter, LoweredIntrinsicSeed,
+    LoweredMemberOwnerProperty, LoweredMemberScopeProperty, LoweredQualifiedSeededRoute,
+    LoweredSourceSupertypeProperty, LoweredSupertypeProperty, LoweredTypeArgument,
+    LoweredTypeComponent, LoweredTypeProduction, LoweredTypeTransfer, LoweredTypedFrontier,
+    LoweredUnderlyingType,
 };
 
 /// The token every splice walk runs under.
@@ -226,6 +227,12 @@ macro_rules! splice_translation {
                     ResolutionIncompleteReason::TimeBudgetExceeded(semantic) => {
                         ResolutionIncompleteReason::TimeBudgetExceeded(self.map(*semantic))
                     }
+                    ResolutionIncompleteReason::OverlayFrontierUnknown(semantic) => {
+                        ResolutionIncompleteReason::OverlayFrontierUnknown(self.map(*semantic))
+                    }
+                    ResolutionIncompleteReason::Unclassified(semantic) => {
+                        ResolutionIncompleteReason::Unclassified(self.map(*semantic))
+                    }
                     ResolutionIncompleteReason::UnmountedFile { fragment } => {
                         ResolutionIncompleteReason::UnmountedFile {
                             fragment: self.fragment_of(*fragment),
@@ -325,6 +332,12 @@ impl ResolutionIdentityTranslation for OperationBlind {
             }
             ResolutionIncompleteReason::TimeBudgetExceeded(semantic) => {
                 ResolutionIncompleteReason::TimeBudgetExceeded(self.map(*semantic))
+            }
+            ResolutionIncompleteReason::OverlayFrontierUnknown(semantic) => {
+                ResolutionIncompleteReason::OverlayFrontierUnknown(self.map(*semantic))
+            }
+            ResolutionIncompleteReason::Unclassified(semantic) => {
+                ResolutionIncompleteReason::Unclassified(self.map(*semantic))
             }
             other => *other,
         }
@@ -448,6 +461,21 @@ impl SpliceMount for super::ResolutionSlotValue {
     }
 }
 
+impl SpliceMount for super::fact_source::ConditionalTypeProduction {
+    fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
+        Self {
+            output: translation.semantic(self.output),
+            elements: self
+                .elements
+                .iter()
+                .map(|&element| translation.semantic(element))
+                .collect(),
+            head: self.head,
+            language: self.language,
+        }
+    }
+}
+
 impl SpliceMount for super::ConditionalTypeSeed {
     fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
         Self {
@@ -517,6 +545,20 @@ impl<A: SpliceMount, B: SpliceMount> SpliceMount for (A, B) {
     }
 }
 
+impl SpliceMount for super::fact_source::ImplicitAppendedBase {
+    fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
+        Self {
+            written_objects: self.written_objects,
+            factory_unmodified: self.factory_unmodified,
+            target: self.target.map(|target| translation.semantic(target)),
+            suppressing_target: self
+                .suppressing_target
+                .map(|target| translation.semantic(target)),
+            completion: self.completion.splice(translation),
+        }
+    }
+}
+
 impl SpliceMount for super::fact_source::ImplicitBaseInputs {
     fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
         use super::fact_source::{ImplicitBaseAuthority, SelectedTypedRowIdentity};
@@ -532,6 +574,19 @@ impl SpliceMount for super::fact_source::ImplicitBaseInputs {
             value => value.clone(),
         };
         Self {
+            base_preservation: self.base_preservation.as_ref().map(|guard| {
+                super::fact_source::BasePreservationGuard {
+                    references: guard
+                        .references
+                        .iter()
+                        .map(|reference| translation.semantic(*reference))
+                        .collect(),
+                    terminal: guard.terminal,
+                    absent_members: guard.absent_members,
+                    enclosing_absent_members: guard.enclosing_absent_members,
+                    completion: guard.completion.splice(translation),
+                }
+            }),
             written_inventory_complete: self.written_inventory_complete,
             written_base_count: self.written_base_count,
             creation: self.creation,
@@ -1055,6 +1110,18 @@ impl SpliceMount for LoweredTypeProduction {
     }
 }
 
+impl SpliceMount for LoweredBinaryOperation {
+    fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
+        Self {
+            output: translation.semantic(self.output),
+            left: translation.semantic(self.left),
+            right: translation.semantic(self.right),
+            operator: self.operator,
+            right_reference: self.right_reference,
+        }
+    }
+}
+
 impl SpliceMount for LoweredTypeComponent {
     fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
         LoweredTypeComponent::new(
@@ -1382,9 +1449,15 @@ where
         &self,
         reference: SemanticId,
         cancellation: &CancellationToken,
-    ) -> StoreResult<Option<super::universe::UniverseEntry>> {
+    ) -> StoreResult<Option<crate::analyzer::resolution::SelectedUniverseEntry>> {
         self.inner
             .selected_universe_entry(self.argument(&reference), cancellation)
+            .map(|entry| {
+                entry.map(|selected| super::SelectedUniverseEntry {
+                    entry: selected.entry,
+                    completion: self.result(&selected.completion),
+                })
+            })
     }
 
     fn intern_shared_name_digest(
@@ -1699,6 +1772,73 @@ where
     S: std::ops::Deref,
     S::Target: SelectedTypedFactSource,
 {
+    fn class_alias_source(
+        &self,
+        definition: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<SemanticId>> {
+        Ok(self
+            .inner
+            .class_alias_source(self.argument(&definition), cancellation)?
+            .map(|reference| self.result(&reference)))
+    }
+    fn base_preservation_reference_complete(
+        &self,
+        reference: SemanticId,
+        cancellation: &CancellationToken,
+        work: &mut dyn FnMut() -> bool,
+    ) -> StoreResult<bool> {
+        self.inner.base_preservation_reference_complete(
+            self.argument(&reference),
+            cancellation,
+            work,
+        )
+    }
+    fn base_preservation_members(
+        &self,
+        owner: SemanticId,
+        members: &[&str],
+        cancellation: &CancellationToken,
+        work: &mut dyn FnMut() -> bool,
+    ) -> StoreResult<Option<super::fact_source::BasePreservationMembers>> {
+        let mut inventory = self.inner.base_preservation_members(
+            self.argument(&owner),
+            members,
+            cancellation,
+            work,
+        )?;
+        if let Some(inventory) = &mut inventory {
+            for reference in inventory
+                .mutation_receivers
+                .iter_mut()
+                .chain(inventory.terminal_mutation_receivers.iter_mut().flatten())
+            {
+                *reference = self.result(reference);
+            }
+        }
+        Ok(inventory)
+    }
+    fn base_preservation_terminal_reference(
+        &self,
+        reference: SemanticId,
+        terminal: &str,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<bool> {
+        self.inner.base_preservation_terminal_reference(
+            self.argument(&reference),
+            terminal,
+            cancellation,
+        )
+    }
+    fn base_preservation_terminal_owner(
+        &self,
+        owner: SemanticId,
+        terminal: &str,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<bool> {
+        self.inner
+            .base_preservation_terminal_owner(self.argument(&owner), terminal, cancellation)
+    }
     fn selected_blob_for_fragment(
         &self,
         fragment: BindingFragmentId,
@@ -1730,6 +1870,27 @@ where
         owner: &super::ExternalOwnerIdentity,
     ) -> StoreResult<bool> {
         self.inner.jvm_external_owner_is_indexed(owner)
+    }
+    fn binary_operation_type_provider(
+        &self,
+    ) -> Option<&dyn crate::analyzer::store::language_support::BinaryOperationTypeProvider> {
+        self.inner.binary_operation_type_provider()
+    }
+    fn selected_type_heads(
+        &self,
+    ) -> Option<&dyn crate::analyzer::store::language_support::SelectedTypeHeadSource> {
+        self.inner.selected_type_heads()
+    }
+    fn conditional_type_productions(
+        &self,
+        slots: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Vec<super::fact_source::ConditionalTypeProduction>> {
+        Ok(self.results(
+            &self
+                .inner
+                .conditional_type_productions(&self.arguments(slots), cancellation)?,
+        ))
     }
     fn supports_conditional_type_seeds(&self) -> bool {
         self.inner.supports_conditional_type_seeds()
@@ -1776,6 +1937,22 @@ where
         &self,
     ) -> &'static [super::fact_source::QualifiedMemberRegistration] {
         self.inner.qualified_member_registrations()
+    }
+
+    fn implicit_appended_base(
+        &self,
+        owner: SemanticId,
+        written_targets: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<super::fact_source::ImplicitAppendedBase>> {
+        Ok(self
+            .inner
+            .implicit_appended_base(
+                self.argument(&owner),
+                &self.arguments(written_targets),
+                cancellation,
+            )?
+            .map(|inputs| self.result(&inputs)))
     }
 
     fn implicit_base_inputs(
@@ -2007,6 +2184,19 @@ where
                 self.argument(&reference),
                 cancellation,
             )?),
+        )
+    }
+
+    fn rust_builtin_derive_member(
+        &self,
+        owner: SemanticId,
+        lookup: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<super::RustBuiltinDeriveMember> {
+        self.inner.rust_builtin_derive_member(
+            self.argument(&owner),
+            self.argument(&lookup),
+            cancellation,
         )
     }
 
@@ -2260,10 +2450,11 @@ where
     fn model_member_callable_result(
         &self,
         member: &crate::analyzer::semantic_model::overlay::ModelSymbolRef,
+        owner_language: super::ExternalOwnerLanguage,
         cancellation: &CancellationToken,
     ) -> StoreResult<Option<Option<super::fact_source::ModelCallableResultDeclaration>>> {
         self.inner
-            .model_member_callable_result(member, cancellation)
+            .model_member_callable_result(member, owner_language, cancellation)
     }
 
     fn go_model_owner_declarations(
@@ -2447,6 +2638,11 @@ where
         visit_type_production_pages_for_outputs,
         SemanticId,
         SelectedTypedRow<LoweredTypeProduction>
+    );
+    spliced_typed_pages!(
+        visit_binary_operation_pages_for_outputs,
+        SemanticId,
+        SelectedTypedRow<LoweredBinaryOperation>
     );
     spliced_typed_pages!(
         visit_type_component_pages_for_containers,
@@ -2753,8 +2949,13 @@ mod tests {
         // The descriptor-only projection is forwarded independently of the
         // seed reader; the source-derived membership check below proves both.
         // #7619 adds two readers; #5671 adds one; #7654 adds
-        // selected_jvm_declaration_owner; #5658 adds two Python readers.
-        assert_eq!(typed.len(), 104, "SelectedTypedFactSource: {typed:?}");
+        // selected_jvm_declaration_owner; #5658 adds two Python readers;
+        // #11325 adds rust_builtin_derive_member; #5658 2b.1 adds five
+        // hierarchy readers; #12241 adds the operator provider, selected type
+        // heads and binary-operation page reader; #12159 adds the conditional
+        // nominal-constructor reader; #12070 adds the trailing implicit-base
+        // read.
+        assert_eq!(typed.len(), 115, "SelectedTypedFactSource: {typed:?}");
 
         let forwarded = forwarded_methods(include_str!("mounted.rs"))
             .into_iter()
@@ -2786,6 +2987,15 @@ mod implicit_base_remount_tests {
         let root = SemanticId::local(fragment.ordinal(), 17);
         let occurrence = SemanticId::local(fragment.ordinal(), 23);
         let inputs = ImplicitBaseInputs {
+            base_preservation: Some(super::super::BasePreservationGuard {
+                references: vec![occurrence],
+                terminal: "builtins.type",
+                absent_members: &["__new__", "__init__"],
+                enclosing_absent_members: &["__call__"],
+                completion: ResolutionCompletion::incomplete([
+                    ResolutionIncompleteReason::UnsupportedSemantic(occurrence),
+                ]),
+            }),
             written_inventory_complete: true,
             written_base_count: 0,
             creation: ClassCreationKind::Ordinary,
@@ -2805,6 +3015,14 @@ mod implicit_base_remount_tests {
         };
         let mount = SelectedResolutionMountOrdinal::new(19);
         let mounted = out_of_interior(&inputs, mount);
+        let guard = mounted.base_preservation.as_ref().unwrap();
+        assert_eq!(guard.references, [SemanticId::local(19, 23)]);
+        assert_eq!(
+            guard.completion,
+            ResolutionCompletion::incomplete([ResolutionIncompleteReason::UnsupportedSemantic(
+                SemanticId::local(19, 23)
+            )])
+        );
         let root = mounted.root_object.as_ref().unwrap();
         assert_eq!(root.identity, SemanticId::local(19, 17));
         assert_eq!(root.occurrence, SemanticId::local(19, 23));
@@ -2822,6 +3040,18 @@ mod implicit_base_remount_tests {
             )])
         );
         assert_eq!(into_interior(&mounted, mount), inputs);
+        let appended = super::super::fact_source::ImplicitAppendedBase {
+            written_objects: super::super::fact_source::ImplicitWrittenBaseObjects::Proven,
+            factory_unmodified: Some(true),
+            target: Some(SemanticId::local(fragment.ordinal(), 17)),
+            suppressing_target: Some(occurrence),
+            completion: inputs.completion.clone(),
+        };
+        let mapped = out_of_interior(&appended, mount);
+        assert_eq!(mapped.target, Some(SemanticId::local(19, 17)));
+        assert_eq!(mapped.suppressing_target, Some(SemanticId::local(19, 23)));
+        assert_eq!(mapped.completion, mounted.completion);
+        assert_eq!(into_interior(&mapped, mount), appended);
         let mut intrinsic = inputs;
         intrinsic.authority = ImplicitBaseAuthority::Intrinsic {
             descriptor: occurrence,

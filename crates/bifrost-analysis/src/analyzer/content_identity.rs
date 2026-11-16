@@ -157,6 +157,51 @@ pub(crate) fn language_content_identity<'a>(
     StableDigest::from_array(hasher.finish())
 }
 
+/// Domain for the omission fold of a per-language identity.
+const OMISSIONS_DOMAIN: &[u8] = b"bifrost-workspace-content:omissions:v1";
+
+/// The digest of the listing omissions that keep one language's source
+/// inventory from being complete, or `None` when none do. `omissions` are the
+/// ones [`crate::analyzer::languages::omission_hides_source`] selects.
+///
+/// The files an omission hides are not in the file set, so the file set digest
+/// cannot move when a directory symlink appears. A product derived under a
+/// complete inventory (a usage graph, a call graph) would then be reused by a
+/// workspace whose inventory is incomplete. A complete inventory folds nothing,
+/// so its identity stays byte-identical to the one that predates the fold.
+pub(crate) fn listing_omissions_digest<'a>(
+    omissions: impl IntoIterator<
+        Item = &'a brokk_bifrost_core::analyzer::project::WorkspaceFileOmission,
+    >,
+) -> Option<StableDigest> {
+    let mut omissions = omissions.into_iter().collect::<Vec<_>>();
+    if omissions.is_empty() {
+        return None;
+    }
+    omissions.sort();
+    omissions.dedup();
+    let mut hasher = CanonicalHasher::new(OMISSIONS_DOMAIN);
+    for omission in omissions {
+        hasher.value(omission.path.as_os_str().as_encoded_bytes());
+        hasher.value(format!("{:?}", omission.reason).as_bytes());
+    }
+    Some(StableDigest::from_array(hasher.finish()))
+}
+
+/// Fold a [`listing_omissions_digest`] into a language identity.
+pub(crate) fn fold_listing_omissions(
+    identity: StableDigest,
+    omissions: Option<StableDigest>,
+) -> StableDigest {
+    let Some(omissions) = omissions else {
+        return identity;
+    };
+    let mut hasher = CanonicalHasher::new(OMISSIONS_DOMAIN);
+    hasher.field("identity", identity.as_bytes());
+    hasher.field("omissions", omissions.as_bytes());
+    StableDigest::from_array(hasher.finish())
+}
+
 pub use crate::analyzer::store::file_set_identity::{
     FILE_SET_DOMAIN, OVERLAID_BY_PROJECT, analyzed_file_set_digest,
     analyzed_file_set_digest_with_overlays,
@@ -192,6 +237,35 @@ mod tests {
             ("src/b.rs".to_string(), oid(1)),
         ]);
         assert_ne!(before, after);
+    }
+
+    #[cfg(unix)]
+    #[hardwon(
+        "#12280: omission identity must use raw path bytes, since two non-UTF-8 names can share a lossy display"
+    )]
+    #[test]
+    fn omissions_with_equal_lossy_displays_have_different_identities() {
+        use brokk_bifrost_core::analyzer::project::{
+            WorkspaceFileOmission, WorkspaceFileOmissionReason,
+        };
+        use std::os::unix::ffi::OsStringExt;
+        let omission = |name: &[u8]| WorkspaceFileOmission {
+            path: std::ffi::OsString::from_vec(name.to_vec()).into(),
+            reason: WorkspaceFileOmissionReason::NonUtf8GitPath,
+        };
+        let (first, second) = (omission(b"a\xffb"), omission(b"a\xfeb"));
+        assert_eq!(
+            brokk_bifrost_core::path_utils::workspace_relative_slash_path(&first.path),
+            brokk_bifrost_core::path_utils::workspace_relative_slash_path(&second.path),
+            "the display is lossy"
+        );
+        let identity = StableDigest::sha256(b"identity");
+        let folded = |omission: &WorkspaceFileOmission| {
+            fold_listing_omissions(identity, listing_omissions_digest([omission]))
+        };
+        assert_ne!(folded(&first), folded(&second));
+        assert_ne!(folded(&first), identity);
+        assert_eq!(fold_listing_omissions(identity, None), identity);
     }
 
     #[test]

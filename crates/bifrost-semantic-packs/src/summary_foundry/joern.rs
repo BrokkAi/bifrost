@@ -698,7 +698,7 @@ pub fn translate_joern_semantics(file: &str, semantics: &[JoernFlowSemantic]) ->
         let mut representable = 0usize;
         for mapping in &semantic.mappings {
             let input = match mapping.source {
-                RECEIVER_INDEX => AuthoredSummaryInput::Receiver {},
+                RECEIVER_INDEX => AuthoredSummaryInput::Receiver { path: None },
                 RETURN_INDEX => {
                     skips.push(FoundrySkip {
                         file: file.to_owned(),
@@ -725,7 +725,10 @@ pub fn translate_joern_semantics(file: &str, semantics: &[JoernFlowSemantic]) ->
                         });
                         continue;
                     }
-                    AuthoredSummaryInput::Parameter { ordinal }
+                    AuthoredSummaryInput::Parameter {
+                        ordinal,
+                        path: None,
+                    }
                 }
                 source => {
                     skips.push(FoundrySkip {
@@ -738,8 +741,8 @@ pub fn translate_joern_semantics(file: &str, semantics: &[JoernFlowSemantic]) ->
                 }
             };
             let output = match mapping.destination {
-                RETURN_INDEX => AuthoredSummaryOutput::NormalReturn {},
-                RECEIVER_INDEX => AuthoredSummaryOutput::Receiver {},
+                RETURN_INDEX => AuthoredSummaryOutput::NormalReturn { path: None },
+                RECEIVER_INDEX => AuthoredSummaryOutput::Receiver { path: None },
                 destination if destination > 0 => {
                     skips.push(FoundrySkip {
                         file: file.to_owned(),

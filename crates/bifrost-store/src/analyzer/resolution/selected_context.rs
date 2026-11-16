@@ -986,6 +986,21 @@ type ExternalTypeBoundaries = (ExternalOwnerLanguage, Vec<SemanticId>);
 pub enum ExternalOwnerLanguage {
     Jvm,
     Go,
+    Rust,
+}
+
+impl ExternalOwnerLanguage {
+    /// The semantic-model family the selected model authority knows this
+    /// owner language by (`model_selected_groups`, `model_type_owner`). JVM
+    /// owners span several model families (java, kotlin, scala), so they name
+    /// none here and never reach the single-family callable reader.
+    pub(crate) const fn model_family(self) -> Option<&'static str> {
+        match self {
+            Self::Jvm => None,
+            Self::Go => Some("go"),
+            Self::Rust => Some("rust"),
+        }
+    }
 }
 
 /// One request can select the same (reference, slot, binder) question under
@@ -1152,11 +1167,43 @@ type JvmExternalMemberMap =
 /// A named incompleteness reason's stable name and its evidence.
 type NamedReason = (&'static str, Arc<str>);
 
+/// What decides a named incompleteness reason, declared by whoever mints it
+/// (#11510).
+///
+/// A reason is a proof stop that a policy unit may retain and replay as a fact
+/// about its inputs only when every input that decides it is covered by the
+/// unit's key or its recorded reads. The minting site is the only place that
+/// knows what it read, so it states the answer here; there is no default, and
+/// no allowlist kept elsewhere that could drift from the reasons it names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReasonDeterminism {
+    /// Decided only by the snapshot's bytes, the analyzer and adapter version,
+    /// and configuration the unit key or recorded reads cover. `inputs` names
+    /// them.
+    Snapshot { inputs: &'static str },
+    /// Decided by request state or history (staging, the request's crate set,
+    /// a summary awaiting reconcile). `cause` says which.
+    Request { cause: &'static str },
+    /// Not audited. Treated as request-dependent.
+    Unaudited,
+}
+
+impl ReasonDeterminism {
+    /// Whether a stop with this determinism may be retained as deterministic.
+    pub const fn is_snapshot(self) -> bool {
+        match self {
+            Self::Snapshot { .. } => true,
+            Self::Request { .. } | Self::Unaudited => false,
+        }
+    }
+}
+
 /// Immutable lookup provenance belongs to the reason, not to any later proof
 /// that a selected binding can discharge it.
 #[derive(Clone, Debug)]
 struct NamedReasonEntry {
     reason: NamedReason,
+    determinism: ReasonDeterminism,
     lookup: Option<(BindingFragmentId, SemanticId)>,
 }
 
@@ -1232,7 +1279,7 @@ impl<P: PreparedContextPayload> PreparedContextSnapshot<P> {
             }
             Ok(identity)
         })?;
-        if cancellation.is_cancelled() {
+        if cancellation.is_cancelled() || cancellation.soft_deadline_passed() {
             return Ok(None);
         }
         Ok(Some(Self {
@@ -1795,6 +1842,7 @@ impl SelectedContextIdentities {
         &self,
         digest: [u8; 32],
         name: &'static str,
+        determinism: ReasonDeterminism,
         evidence: &str,
     ) -> SemanticId {
         let number = self.number(digest);
@@ -1804,9 +1852,26 @@ impl SelectedContextIdentities {
             .entry(number)
             .or_insert_with(|| NamedReasonEntry {
                 reason: (name, Arc::from(evidence)),
+                determinism,
                 lookup: None,
             });
         SemanticId::context_local(number)
+    }
+
+    /// What decides a reason this context minted with [`Self::named_semantic`].
+    /// `None` for any other identity, which is then not known to be a snapshot
+    /// fact.
+    #[doc(hidden)]
+    pub fn named_reason_determinism(&self, semantic: SemanticId) -> Option<ReasonDeterminism> {
+        if !semantic.is_context_local() {
+            return None;
+        }
+        let number = semantic.operation_local_number()? & !super::model::CONTEXT_OPERATION_BASE;
+        self.named_reasons
+            .lock()
+            .expect("the selected context's named reasons are not poisoned")
+            .get(&number)
+            .map(|entry| entry.determinism)
     }
 
     /// The stable name and evidence of a reason this context minted with
@@ -2991,6 +3056,20 @@ impl SelectedResolutionContextSet {
     /// Borrow the already prepared descriptor material without another read.
     pub(crate) fn root_bridges(&self) -> &[SelectedRootBridgeDescriptor] {
         &self.root_bridges
+    }
+
+    /// Borrow one file's prepared Go import descriptors, without preparing it.
+    pub(crate) fn go_import_bindings_for_mount(
+        &self,
+        mount: SelectedResolutionMountOrdinal,
+    ) -> &[SelectedGoImportBindingDescriptor] {
+        let Ok(index) = self
+            .mounts
+            .binary_search_by_key(&mount, |context| context.ordinal())
+        else {
+            return &[];
+        };
+        &self.mounts[index].go_import_bindings
     }
 
     /// Return the identity handle retained by this immutable context.
@@ -6526,7 +6605,7 @@ impl SelectedContextIdentities {
                 for path in paths {
                     heap.vec(path);
                     for part in path {
-                        heap.add(part.capacity());
+                        heap.add(heap.allocation_bytes(part.capacity()));
                     }
                 }
             }
@@ -6554,10 +6633,10 @@ impl SelectedContextIdentities {
             let values = values.lock().expect("model members are not poisoned");
             heap.map(&values);
             for member in values.values() {
-                heap.add(member.symbol_id.capacity());
-                heap.add(member.provider.pack_id.capacity());
-                heap.add(member.provider.pack_version.capacity());
-                heap.add(member.provider.pack_digest.capacity());
+                heap.add(heap.allocation_bytes(member.symbol_id.capacity()));
+                heap.add(heap.allocation_bytes(member.provider.pack_id.capacity()));
+                heap.add(heap.allocation_bytes(member.provider.pack_version.capacity()));
+                heap.add(heap.allocation_bytes(member.provider.pack_digest.capacity()));
             }
         });
         let jvm = &self.jvm;
@@ -6574,12 +6653,12 @@ impl SelectedContextIdentities {
                 heap.vec(witnesses);
             }
             for witness in values.values().flatten() {
-                heap.add(witness.owner_provider.pack_id.capacity());
-                heap.add(witness.owner_provider.pack_version.capacity());
-                heap.add(witness.owner_provider.pack_digest.capacity());
-                heap.add(witness.qualified_name.capacity());
+                heap.add(heap.allocation_bytes(witness.owner_provider.pack_id.capacity()));
+                heap.add(heap.allocation_bytes(witness.owner_provider.pack_version.capacity()));
+                heap.add(heap.allocation_bytes(witness.owner_provider.pack_digest.capacity()));
+                heap.add(heap.allocation_bytes(witness.qualified_name.capacity()));
                 let authority = &witness.authority;
-                heap.add(authority.active_model_set_hash.capacity());
+                heap.add(heap.allocation_bytes(authority.active_model_set_hash.capacity()));
                 match &authority.demand {
                     crate::analyzer::store::resolution_operation::go_demand::GoTerminalDemand::Prepared(key) => {
                         heap.add(key.heap_bytes());
@@ -6592,18 +6671,18 @@ impl SelectedContextIdentities {
                     }
                 }
                 let import = &authority.binder_import;
-                heap.add(import.source_spelling.capacity());
-                heap.add(import.import_path.capacity());
-                heap.add(import.package_name.capacity());
+                heap.add(heap.allocation_bytes(import.source_spelling.capacity()));
+                heap.add(heap.allocation_bytes(import.import_path.capacity()));
+                heap.add(heap.allocation_bytes(import.package_name.capacity()));
                 match &import.provenance {
                     crate::analyzer::store::resolution_operation::go_named::GoExternalPackageProvenance::GoTool {
                         provider_kind,
                         module_path,
                         module_version,
                     } => {
-                        heap.add(provider_kind.capacity());
-                        heap.add(module_path.as_ref().map_or(0, String::capacity));
-                        heap.add(module_version.as_ref().map_or(0, String::capacity));
+                        heap.add(heap.allocation_bytes(provider_kind.capacity()));
+                        heap.add(module_path.as_ref().map_or(0, |value| heap.allocation_bytes(value.capacity())));
+                        heap.add(module_version.as_ref().map_or(0, |value| heap.allocation_bytes(value.capacity())));
                     }
                     crate::analyzer::store::resolution_operation::go_named::GoExternalPackageProvenance::SemanticModel {
                         symbol_id,
@@ -6611,10 +6690,10 @@ impl SelectedContextIdentities {
                         pack_digest,
                         record_id,
                     } => {
-                        heap.add(symbol_id.capacity());
-                        heap.add(pack_id.capacity());
-                        heap.add(pack_digest.capacity());
-                        heap.add(record_id.capacity());
+                        heap.add(heap.allocation_bytes(symbol_id.capacity()));
+                        heap.add(heap.allocation_bytes(pack_id.capacity()));
+                        heap.add(heap.allocation_bytes(pack_digest.capacity()));
+                        heap.add(heap.allocation_bytes(record_id.capacity()));
                     }
                 }
             }

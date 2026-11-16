@@ -36,6 +36,7 @@ fn canonical_report_preserves_carriage_return_and_unicode() {
         Some(PolicySourceIdentity::new(original)),
         None,
         vec![],
+        crate::RelatedLocationOmissions::Known(0),
     )
     .unwrap();
     let report =

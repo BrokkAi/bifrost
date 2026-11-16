@@ -50,12 +50,15 @@ use crate::analyzer::java_integral_parameter::{
 use crate::analyzer::languages::{LanguageSupport, language_support_for_hook};
 use crate::analyzer::{Language, ProjectFile, Range};
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
+use brokk_bifrost_core::analyzer::reuse_verdict::{CarriesReuseVerdict, ReuseVerdict};
 use brokk_bifrost_core::analyzer::structural::body_relations::{
     BodyState, BodyStateAnswer, empty_if_arm_relation,
 };
 use brokk_bifrost_core::analyzer::structural::conditional_regions::ConditionalRegions;
 use brokk_bifrost_core::analyzer::tree_walk::node_range;
-use brokk_bifrost_core::analyzer::work_budget::{BudgetLedger, define_work_dimensions};
+use brokk_bifrost_core::analyzer::work_budget::{
+    BudgetLedger, BudgetRefused, define_work_dimensions,
+};
 use std::collections::HashMap;
 use tree_sitter::Node;
 
@@ -283,12 +286,26 @@ enum ReferenceCoverage<'a> {
     Subtrees(&'a [Range]),
 }
 
+/// The reference sites of a branch file or subtree, with the verdict of the
+/// role budget that shaped them. A refused role charge opens the collection;
+/// the caller joins `reuse` into the answer that gap shapes.
+pub struct BranchReferenceSites {
+    pub sites: Result<Vec<ReferenceSite>, BranchOpenReason>,
+    pub reuse: ReuseVerdict,
+}
+
+impl CarriesReuseVerdict for BranchReferenceSites {
+    fn reuse_verdict(&self) -> ReuseVerdict {
+        self.reuse
+    }
+}
+
 pub fn reference_sites(
     syntax: &PreparedSyntaxTree,
     language: Language,
     facts: &FileFacts,
     env: &EnvironmentFileResult,
-) -> Result<Vec<ReferenceSite>, BranchOpenReason> {
+) -> BranchReferenceSites {
     collect_reference_sites(syntax, language, facts, env, ReferenceCoverage::BranchFile)
 }
 
@@ -298,7 +315,7 @@ pub fn reference_sites_in_ranges(
     facts: &FileFacts,
     env: &EnvironmentFileResult,
     ranges: &[Range],
-) -> Result<Vec<ReferenceSite>, BranchOpenReason> {
+) -> BranchReferenceSites {
     collect_reference_sites(
         syntax,
         language,
@@ -314,6 +331,23 @@ fn collect_reference_sites(
     facts: &FileFacts,
     env: &EnvironmentFileResult,
     coverage: ReferenceCoverage<'_>,
+) -> BranchReferenceSites {
+    let mut role_budget = BranchWorkBudget::new();
+    let sites =
+        collect_reference_sites_charged(syntax, language, facts, env, coverage, &mut role_budget);
+    BranchReferenceSites {
+        sites,
+        reuse: role_budget.reuse_verdict(),
+    }
+}
+
+fn collect_reference_sites_charged(
+    syntax: &PreparedSyntaxTree,
+    language: Language,
+    facts: &FileFacts,
+    env: &EnvironmentFileResult,
+    coverage: ReferenceCoverage<'_>,
+    role_budget: &mut BranchWorkBudget,
 ) -> Result<Vec<ReferenceSite>, BranchOpenReason> {
     const MAX_TREE_NODES: usize = 131_072;
     const MAX_REFERENCE_SITES: usize = 256;
@@ -336,6 +370,7 @@ fn collect_reference_sites(
         let roles = facts.occurrence_roles(index);
         if roles.contains(&OccurrenceRole::ValueReference)
             || roles.contains(&OccurrenceRole::ReceiverPosition)
+            || roles.contains(&OccurrenceRole::CalleePosition)
         {
             value_references.push((node.range.start_byte, node.range.end_byte));
         } else if !roles.is_empty() {
@@ -375,7 +410,6 @@ fn collect_reference_sites(
     let mut stack = vec![(syntax.tree().root_node(), Region::Outside)];
     let mut sites = Vec::new();
     let mut visited = 0;
-    let mut role_budget = BranchWorkBudget::new();
     while let Some((node, region)) = stack.pop() {
         if matches!(coverage, ReferenceCoverage::Subtrees(_)) && {
             let prior = merged.partition_point(|(start, _)| *start < node.end_byte());
@@ -427,7 +461,7 @@ fn collect_reference_sites(
                 // Some adapters publish only binder/member roles. Reuse the
                 // comparator's structured AST role interpretation; do not
                 // change persisted occurrence production to select these reads.
-                identifier_role(node, &mut role_budget)? == IdentifierRole::Value
+                identifier_role(node, role_budget)? == IdentifierRole::Value
             } else {
                 false
             };
@@ -489,22 +523,31 @@ define_work_dimensions! {
 /// envelope replaces the old sixteen-arm cutoff; cheap long chains can finish
 /// without allowing either quadratic output or repeated stability walks to
 /// grow without a bound. Local tree stops do not exhaust the whole chain.
+/// The first refused charge keeps its proof; its owner joins the verdict into
+/// the answer the refusal shaped.
 struct BranchWorkBudget {
     ledger: BudgetLedger<BranchWork>,
-    exhausted: bool,
+    refused: Option<BudgetRefused>,
 }
 
 impl BranchWorkBudget {
     fn new() -> Self {
         Self {
             ledger: BudgetLedger::with_zero_usage(BranchWork::default_limits()),
-            exhausted: false,
+            refused: None,
         }
     }
 
+    fn exhausted(&self) -> bool {
+        self.refused.is_some()
+    }
+
     fn charge(&mut self, work: BranchWork) -> Result<(), BranchOpenReason> {
-        if self.exhausted || self.ledger.charge(work).is_err() {
-            self.exhausted = true;
+        if self.refused.is_some() {
+            return Err(BranchOpenReason::ComparisonBudget);
+        }
+        if let Err(exceeded) = self.ledger.charge(work) {
+            self.refused = Some(exceeded.refused());
             return Err(BranchOpenReason::ComparisonBudget);
         }
         Ok(())
@@ -567,6 +610,49 @@ pub fn relations_for_if(
     env: &EnvironmentFileResult,
     members: &ReferenceProofs,
     regions: &ConditionalRegions,
+) -> BranchRelations {
+    let mut reuse = ReuseVerdict::Content;
+    let mut budget = BranchWorkBudget::new();
+    let rows = relation_rows_for_if(
+        syntax,
+        language,
+        range,
+        env,
+        members,
+        regions,
+        &mut budget,
+        &mut reuse,
+    );
+    BranchRelations {
+        rows,
+        reuse: reuse.join(budget.reuse_verdict()),
+    }
+}
+
+/// The relation rows of one `if`, with the verdict of every work budget that
+/// shaped them. A refused chain charge opens its pending pairs; the caller
+/// joins `reuse` into the answer those rows shape.
+pub struct BranchRelations {
+    pub rows: Vec<BranchRelationRow>,
+    pub reuse: ReuseVerdict,
+}
+
+impl CarriesReuseVerdict for BranchRelations {
+    fn reuse_verdict(&self) -> ReuseVerdict {
+        self.reuse
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn relation_rows_for_if(
+    syntax: &PreparedSyntaxTree,
+    language: Language,
+    range: Range,
+    env: &EnvironmentFileResult,
+    members: &ReferenceProofs,
+    regions: &ConditionalRegions,
+    budget: &mut BranchWorkBudget,
+    reuse: &mut ReuseVerdict,
 ) -> Vec<BranchRelationRow> {
     let if_kinds: &[&str] = match language {
         Language::Java
@@ -618,7 +704,7 @@ pub fn relations_for_if(
         return Vec::new();
     }
     let mut rows = Vec::new();
-    rows.extend(redundant_boolean_row(syntax, language, node, env));
+    rows.extend(redundant_boolean_row(syntax, language, node, env, reuse));
     if let Some(empty_arm) = empty_if_arm_relation(node, language, regions) {
         let consequence = node_range(empty_arm.consequence);
         let alternative = empty_arm.alternative.map(node_range).unwrap_or(consequence);
@@ -644,8 +730,7 @@ pub fn relations_for_if(
     }
     let independent = rows;
     let mut rows = Vec::new();
-    let mut budget = BranchWorkBudget::new();
-    let arms = match collect_arms(node, language, &mut budget) {
+    let arms = match collect_arms(node, language, budget) {
         Ok(arms) => arms,
         Err(reason) => {
             rows.extend(open_pair_rows(range, reason));
@@ -659,7 +744,7 @@ pub fn relations_for_if(
         arms.iter().filter_map(|arm| arm.condition),
         syntax.source(),
         language,
-        &mut budget,
+        budget,
     ) {
         Ok(names) => names,
         Err(reason) => {
@@ -682,8 +767,8 @@ pub fn relations_for_if(
         let later = arms[later_ordinal];
         for earlier_ordinal in 0..later_ordinal {
             let earlier = arms[earlier_ordinal];
-            let body_verdict = compare_trees(earlier.body, later.body, &chain, &mut budget).into();
-            if budget.exhausted {
+            let body_verdict = compare_trees(earlier.body, later.body, &chain, budget).into();
+            if budget.exhausted() {
                 rows.extend(
                     open_pair_rows(range, BranchOpenReason::ComparisonBudget).filter(|row| {
                         row.kind == BranchRelationKind::IdenticalBodies
@@ -724,7 +809,7 @@ pub fn relations_for_if(
             {
                 BranchRelationVerdict::Open(BranchOpenReason::EffectfulCondition)
             } else {
-                compare_trees(earlier_condition, later_condition, &chain, &mut budget).into()
+                compare_trees(earlier_condition, later_condition, &chain, budget).into()
             };
             let verdict = if verdict == BranchRelationVerdict::Proven {
                 let mut verdict = BranchRelationVerdict::Proven;
@@ -737,7 +822,7 @@ pub fn relations_for_if(
                         continue;
                     };
                     let stable = *stability[index].get_or_insert_with(|| {
-                        condition_stability(condition, language, syntax, env, &mut budget)
+                        condition_stability(condition, language, syntax, env, budget)
                     });
                     if stable != BranchRelationVerdict::Proven {
                         verdict = stable;
@@ -748,7 +833,7 @@ pub fn relations_for_if(
             } else {
                 verdict
             };
-            if budget.exhausted {
+            if budget.exhausted() {
                 let bodies_pending =
                     earlier_ordinal + 1 < later_ordinal || later_ordinal + 1 < arms.len();
                 rows.extend(
@@ -782,15 +867,15 @@ fn redundant_boolean_row(
     language: Language,
     node: Node<'_>,
     env: &EnvironmentFileResult,
+    reuse: &mut ReuseVerdict,
 ) -> Option<BranchRelationRow> {
     if language == Language::Rust {
         let condition = node.child_by_field_name("condition")?;
-        match rust_boolean_expression_bounded(
-            condition,
-            env,
-            syntax.source(),
-            &mut BranchWorkBudget::new(),
-        ) {
+        let mut budget = BranchWorkBudget::new();
+        let condition_boolean =
+            rust_boolean_expression_bounded(condition, env, syntax.source(), &mut budget);
+        reuse.join_in(budget.reuse_verdict());
+        match condition_boolean {
             Ok(true) => {}
             Ok(false) => return None,
             Err(reason) => return Some(open_redundant_boolean_row(node, node, node, reason)),
@@ -2770,6 +2855,13 @@ impl From<IdentityVerdict> for BranchRelationVerdict {
     }
 }
 
+impl CarriesReuseVerdict for BranchWorkBudget {
+    fn reuse_verdict(&self) -> ReuseVerdict {
+        self.refused
+            .map_or(ReuseVerdict::Content, |refused| refused.reuse_verdict())
+    }
+}
+
 impl IdentityBudget for BranchWorkBudget {
     fn step(&mut self) -> Result<(), IdentityOpenReason> {
         BranchWorkBudget::step(self).map_err(|_| IdentityOpenReason::ComparisonBudget)
@@ -2791,7 +2883,7 @@ impl IdentityBudget for BranchWorkBudget {
         .map_err(|_| IdentityOpenReason::ComparisonBudget)
     }
     fn exhausted(&self) -> bool {
-        self.exhausted
+        BranchWorkBudget::exhausted(self)
     }
 }
 
@@ -3078,7 +3170,7 @@ mod tests {
                         arms: limit,
                         ..BranchWork::default_limits()
                     }),
-                    exhausted: false,
+                    refused: None,
                 };
                 match collect_arms(node, Language::Python, &mut budget) {
                     Ok(arms) => {
@@ -3355,7 +3447,7 @@ mod tests {
                             steps,
                             ..BranchWork::default_limits()
                         }),
-                        exhausted: false,
+                        refused: None,
                     };
                     let answer = bounded_named_statements(arm, pending, &mut budget);
                     if steps < cost || pending + cost > MAX_COMPARISON_TREE_NODES {

@@ -38,9 +38,9 @@ use brokk_bifrost_analysis::analyzer::resolution::model::TypedFrontierState;
 
 use brokk_bifrost_analysis::analyzer::store::Result;
 
+use brokk_bifrost_analysis::analyzer::resolution::fact_resolution::call_applicability::FormalSubtypeRelations;
 use brokk_bifrost_core::analyzer::resolution_facts::ResolutionScopeKind;
 use brokk_bifrost_core::analyzer::structural::callable::CallableRejectionReason;
-use brokk_bifrost_core::hash::HashMap;
 
 pub(crate) static KOTLIN_CALL_APPLICABILITY_ADAPTER: KotlinCallApplicabilityAdapter =
     KotlinCallApplicabilityAdapter;
@@ -250,7 +250,7 @@ impl CallApplicabilityAdapter for KotlinCallApplicabilityAdapter {
         &self,
         left: ConversionEvidence,
         right: ConversionEvidence,
-        subtype_relations: &HashMap<(SemanticId, SemanticId), bool>,
+        subtype_relations: &FormalSubtypeRelations,
     ) -> PartialOrder {
         brokk_bifrost_analysis::analyzer::resolution::fact_resolution::call_applicability::compare_formal_types(
             left, right, subtype_relations,

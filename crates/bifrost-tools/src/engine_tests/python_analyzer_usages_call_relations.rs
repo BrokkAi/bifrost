@@ -232,7 +232,7 @@ mod python_residency_tests {
             survey
                 .diagnostics
                 .iter()
-                .all(|diagnostic| { !diagnostic.message.contains("python_environment_open") }),
+                .all(|diagnostic| { !diagnostic.message().contains("python_environment_open") }),
             "{survey:?}"
         );
     }

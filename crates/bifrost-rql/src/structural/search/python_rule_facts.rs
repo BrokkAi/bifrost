@@ -195,6 +195,7 @@ pub(super) fn make_row(
             decorator_count: None,
             is_override: None,
             is_property_accessor: None,
+            entry_point: None,
             public_method_count: None,
             has_inheritance: None,
             has_subclasses: None,
@@ -250,10 +251,20 @@ pub(super) fn parse_python(source: &str) -> Option<tree_sitter::Tree> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PythonTestScope {
+enum PythonTriState {
     Yes,
     No,
     Unknown,
+}
+
+impl PythonTriState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Yes => "yes",
+            Self::No => "no",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 #[derive(Default)]
@@ -386,42 +397,42 @@ fn python_class_test_scope(
     file: &ProjectFile,
     source: &str,
     class: Node<'_>,
-) -> HierarchyDecision<PythonTestScope> {
+) -> HierarchyDecision<PythonTriState> {
     let mut premises = Vec::new();
     let value = (|| {
         if python_class_directly_extends_unittest_test_case(class, source) {
-            return PythonTestScope::Yes;
+            return PythonTriState::Yes;
         }
         let Some(name) = class.child_by_field_name("name") else {
-            return PythonTestScope::Unknown;
+            return PythonTriState::Unknown;
         };
         let Some(definition) = resolve_identifier(analyzer, file, source, name, None) else {
-            return PythonTestScope::Unknown;
+            return PythonTriState::Unknown;
         };
         if definition.status != DefinitionLookupStatus::Resolved {
-            return PythonTestScope::Unknown;
+            return PythonTriState::Unknown;
         }
         let [unit] = definition.definitions.as_slice() else {
-            return PythonTestScope::Unknown;
+            return PythonTriState::Unknown;
         };
         if !unit.is_class() {
-            return PythonTestScope::Unknown;
+            return PythonTriState::Unknown;
         }
         let Some(provider) = analyzer.python_class_hierarchy_provider_for(unit) else {
-            return PythonTestScope::Unknown;
+            return PythonTriState::Unknown;
         };
         let hierarchy = provider.class_hierarchy(unit, None);
         let Some(premise) = hierarchy_premise(analyzer, unit, &hierarchy) else {
-            return PythonTestScope::Unknown;
+            return PythonTriState::Unknown;
         };
         premises.push(premise);
         if hierarchy.outcome != PythonHierarchyOutcome::Complete {
-            return PythonTestScope::Unknown;
+            return PythonTriState::Unknown;
         }
         for ancestor in &hierarchy.mro {
             let fqn = ancestor.qualified_name();
             if matches!(fqn, "unittest.TestCase" | "unittest.case.TestCase") {
-                return PythonTestScope::Yes;
+                return PythonTriState::Yes;
             }
             let ClassIdentity::Workspace(ancestor) = ancestor else {
                 continue;
@@ -434,16 +445,16 @@ fn python_class_test_scope(
             let Some(tree) =
                 parse_python(&ancestor_source).filter(|tree| !tree.root_node().has_error())
             else {
-                return PythonTestScope::Unknown;
+                return PythonTriState::Unknown;
             };
             let Some(ancestor_class) = python_class_node_for_unit(analyzer, ancestor, &tree) else {
-                return PythonTestScope::Unknown;
+                return PythonTriState::Unknown;
             };
             if python_class_directly_extends_unittest_test_case(ancestor_class, &ancestor_source) {
-                return PythonTestScope::Yes;
+                return PythonTriState::Yes;
             }
         }
-        PythonTestScope::No
+        PythonTriState::No
     })();
     HierarchyDecision { value, premises }
 }
@@ -455,13 +466,16 @@ fn python_function_is_test(function: Node<'_>, source: &str) -> bool {
         .is_some_and(|name| name.starts_with("test"))
 }
 
-fn python_assertion_test_scope(
+/// Classify `node` as test code from its enclosing definitions, starting with
+/// `node` itself: a `unittest.TestCase` subclass, or a `test*` function in a
+/// module that imports pytest or nose or is named `test_*.py`.
+fn python_enclosing_test_scope(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
-    assertion: Node<'_>,
-) -> HierarchyDecision<PythonTestScope> {
+    node: Node<'_>,
+) -> HierarchyDecision<PythonTriState> {
     let mut premises = Vec::new();
     let value = (|| {
         let imports = python_test_imports(root, source);
@@ -470,7 +484,7 @@ fn python_assertion_test_scope(
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.starts_with("test_") && name.ends_with(".py"));
-        let mut current = Some(assertion);
+        let mut current = Some(node);
         let mut unknown_class = false;
         while let Some(node) = current {
             match node.kind() {
@@ -478,28 +492,119 @@ fn python_assertion_test_scope(
                     let decision = python_class_test_scope(analyzer, file, source, node);
                     premises.extend(decision.premises);
                     match decision.value {
-                        PythonTestScope::Yes => return PythonTestScope::Yes,
-                        PythonTestScope::Unknown => unknown_class = true,
-                        PythonTestScope::No => {}
+                        PythonTriState::Yes => return PythonTriState::Yes,
+                        PythonTriState::Unknown => unknown_class = true,
+                        PythonTriState::No => {}
                     }
                 }
                 "function_definition"
                     if python_function_is_test(node, source)
                         && (imports.pytest_or_nose || fallback_file) =>
                 {
-                    return PythonTestScope::Yes;
+                    return PythonTriState::Yes;
                 }
                 _ => {}
             }
             current = node.parent();
         }
         if unknown_class {
-            PythonTestScope::Unknown
+            PythonTriState::Unknown
         } else {
-            PythonTestScope::No
+            PythonTriState::No
         }
     })();
     HierarchyDecision { value, premises }
+}
+
+/// Whether `file` is a module that pytest collects by default (`test_*.py`,
+/// `*_test.py`) or its `conftest.py`, so every declaration in it is test code.
+fn python_file_is_test_module(file: &ProjectFile) -> bool {
+    file.rel_path()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name == "conftest.py"
+                || name
+                    .strip_suffix(".py")
+                    .is_some_and(|stem| stem.starts_with("test_") || stem.ends_with("_test"))
+        })
+}
+
+fn python_documentation_test_scope(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    definition: Node<'_>,
+) -> HierarchyDecision<PythonTriState> {
+    if python_file_is_test_module(file) {
+        return HierarchyDecision::plain(PythonTriState::Yes);
+    }
+    python_enclosing_test_scope(analyzer, file, source, root, definition)
+}
+
+/// Whether `function` is a module-level function that a call in the module's
+/// top-level `if __name__ == "__main__":` block resolves to, as in
+/// `sys.exit(main())`. A same-named call that does not resolve is `Unknown`.
+fn python_function_entry_point(
+    analyzer: &dyn IAnalyzer,
+    unit: &CodeUnit,
+    source: &str,
+    function: Node<'_>,
+    cancellation: Option<&CancellationToken>,
+) -> PythonTriState {
+    let definition = function
+        .parent()
+        .filter(|parent| parent.kind() == "decorated_definition")
+        .unwrap_or(function);
+    let Some(module) = definition
+        .parent()
+        .filter(|parent| parent.kind() == "module")
+    else {
+        return PythonTriState::No;
+    };
+    let Some(name) = function
+        .child_by_field_name("name")
+        .and_then(|name| node_text(source, name))
+    else {
+        return PythonTriState::No;
+    };
+    let mut answer = PythonTriState::No;
+    for statement in named_children(module) {
+        if !super::python_imports::python_if_is_name_eq_main(statement, source) {
+            continue;
+        }
+        let Some(body) = statement.child_by_field_name("consequence") else {
+            continue;
+        };
+        let mut pending = vec![body];
+        while let Some(node) = pending.pop() {
+            if matches!(
+                node.kind(),
+                "function_definition" | "class_definition" | "lambda"
+            ) {
+                continue;
+            }
+            if node.kind() == "call"
+                && let Some(callee) = node.child_by_field_name("function")
+                && callee.kind() == "identifier"
+                && node_text(source, callee) == Some(name)
+            {
+                match resolve_identifier(analyzer, unit.source(), source, callee, cancellation) {
+                    Some(outcome)
+                        if outcome.status == DefinitionLookupStatus::Resolved
+                            && outcome.definitions.contains(unit) =>
+                    {
+                        return PythonTriState::Yes;
+                    }
+                    Some(outcome) if outcome.status == DefinitionLookupStatus::Resolved => {}
+                    _ => answer = PythonTriState::Unknown,
+                }
+            }
+            pending.extend(named_children(node));
+        }
+    }
+    answer
 }
 
 fn python_assertion_is_terminal_elif_else(assertion: Node<'_>) -> bool {
@@ -557,20 +662,16 @@ pub(super) fn python_assertion_context_expansions(
     fact.row.terminal_elif_else = Some("unknown");
     if let Some(assertion) = assertion.filter(|_| !tree.root_node().has_error()) {
         let test_scope =
-            python_assertion_test_scope(analyzer, &seed.file, source, tree.root_node(), assertion);
+            python_enclosing_test_scope(analyzer, &seed.file, source, tree.root_node(), assertion);
         fact.hierarchy_premises.extend(test_scope.premises);
         let test_scope = test_scope.value;
-        fact.row.test_scope = Some(match test_scope {
-            PythonTestScope::Yes => "yes",
-            PythonTestScope::No => "no",
-            PythonTestScope::Unknown => "unknown",
-        });
+        fact.row.test_scope = Some(test_scope.label());
         fact.row.terminal_elif_else = Some(if python_assertion_is_terminal_elif_else(assertion) {
             "yes"
         } else {
             "no"
         });
-        if test_scope == PythonTestScope::Unknown {
+        if test_scope == PythonTriState::Unknown {
             fact.row.reason = Some("unittest_test_scope_unresolved".to_owned());
         } else {
             fact.row.outcome = "no_issue";
@@ -1534,6 +1635,10 @@ fn report_rule_fact_incomplete(
         return;
     }
     diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        has_non_utf8_refusal: false,
+        refusal_sites: Default::default(),
+        call_relation_facts: None,
+        uses_omissions: Vec::new(),
         incompleteness,
         related: Vec::new(),
         source: None,
@@ -1640,6 +1745,13 @@ pub(super) fn documentation_expansions(
             fact,
         )))];
     };
+    let test_scope =
+        python_documentation_test_scope(analyzer, file, &source, tree.root_node(), node);
+    let entry_point = if unit.is_function() {
+        python_function_entry_point(analyzer, unit, &source, node, cancellation)
+    } else {
+        PythonTriState::No
+    };
     let docstring = match python_first_docstring_expression(node) {
         Ok(None) => Some((false, None)),
         Ok(Some(expression)) => {
@@ -1687,6 +1799,8 @@ pub(super) fn documentation_expansions(
         HierarchyDecision::plain(Ok(None))
     };
     let mut hierarchy_premises = override_answer.premises;
+    hierarchy_premises.extend(test_scope.premises);
+    let test_scope = test_scope.value;
     let override_answer = override_answer.value;
     let is_override = if unit.is_function() {
         match &override_answer {
@@ -1763,6 +1877,8 @@ pub(super) fn documentation_expansions(
                         fact.row.decorator_count = decorator_count;
                         fact.row.is_override = is_override;
                         fact.row.is_property_accessor = is_property_accessor;
+                        fact.row.test_scope = Some(test_scope.label());
+                        fact.row.entry_point = Some(entry_point.label());
                         return vec![pipeline_expansion(PipelineValue::PythonRuleFact(Box::new(
                             fact,
                         )))];
@@ -1816,6 +1932,8 @@ pub(super) fn documentation_expansions(
     fact.row.decorator_count = decorator_count;
     fact.row.is_override = is_override;
     fact.row.is_property_accessor = is_property_accessor;
+    fact.row.test_scope = Some(test_scope.label());
+    fact.row.entry_point = Some(entry_point.label());
     vec![pipeline_expansion(PipelineValue::PythonRuleFact(Box::new(
         fact,
     )))]
@@ -1976,22 +2094,32 @@ pub(super) fn useless_class_expansions(
     }
 
     let token = cancellation.cloned().unwrap_or_default();
-    let has_subclasses = if let Some(provider) = analyzer.type_hierarchy_provider() {
-        provider
-            .get_direct_descendants_within(
-                unit,
-                &crate::analyzer::DescendantIndexScope::whole_workspace(&token),
-            )
-            .ok()
-            .filter(|answer| answer.is_complete())
-            .map(|descendants| !descendants.definite().is_empty())
-    } else {
-        None
-    };
+    let descendants = analyzer.type_hierarchy_provider().map(|provider| {
+        provider.get_direct_descendants_within(
+            unit,
+            &crate::analyzer::DescendantIndexScope::whole_workspace(&token),
+        )
+    });
+    let has_subclasses = descendants
+        .as_ref()
+        .and_then(|answer| answer.as_ref().ok())
+        .filter(|answer| answer.is_complete())
+        .map(|answer| !answer.edges.is_empty());
     if has_subclasses.is_none() {
-        incompleteness = Incompleteness::Operational(DerivationExecutionCause::Provider);
         complete = false;
-        reason.get_or_insert("subclass_index_unavailable");
+        let content_open = descendants.as_ref().is_some_and(|answer| {
+            answer.as_ref().is_ok_and(|answer| {
+                super::python_class_hierarchy::descendant_answer_incompleteness(answer)
+                    == Incompleteness::Content
+            })
+        });
+        if content_open {
+            incompleteness = incompleteness.combine(Incompleteness::Content);
+            reason.get_or_insert("incomplete_hierarchy");
+        } else {
+            incompleteness = Incompleteness::Operational(DerivationExecutionCause::Provider);
+            reason.get_or_insert("subclass_index_unavailable");
+        }
     }
 
     let children = analyzer.direct_children(unit);
@@ -2444,6 +2572,7 @@ fn python_destructor_complexity<'a, 'workspace>(
             {
                 return Err(PythonRuleFactFailure {
                     reason: "control_flow_gap",
+
                     incompleteness: match gap.kind {
                         SemanticGapKind::ExceededBudget => {
                             Incompleteness::Operational(DerivationExecutionCause::Budget)
@@ -4138,6 +4267,10 @@ fn report_uninitialized_variable_incomplete(
         return;
     }
     diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        has_non_utf8_refusal: false,
+        refusal_sites: Default::default(),
+        call_relation_facts: None,
+        uses_omissions: Vec::new(),
         incompleteness,
         related: Vec::new(),
         source: None,
@@ -4418,8 +4551,10 @@ pub(super) fn uninitialized_variable_expansions<'a>(
     let read_failure_is_handled =
         derivation.binding_read_failure_is_handled(&procedure.handle, read.event);
     let uncancelled = CancellationToken::new();
-    let mut request =
-        brokk_bifrost_flow::flow_state::FlowStateRequest::new(cancellation.unwrap_or(&uncancelled));
+    let mut request = brokk_bifrost_flow::flow_state::FlowStateRequest::new(
+        cancellation.unwrap_or(&uncancelled),
+        brokk_bifrost_flow::flow_state::FlowStateRequestMemos::new(workspace.retention_budget()),
+    );
     let initialization =
         derivation.binding_initialization_at_read(&procedure.handle, read.event, &mut request);
     if read_failure_is_handled {
@@ -5137,6 +5272,7 @@ fn exact_local_dispatch_target(
     let (answer, dispatch_incompleteness) = semantic.dispatch_at_source_with_cause(file, range);
     if dispatch_incompleteness.execution_cause().is_some() {
         semantic.analyzer().mark_execution_dependent();
+        semantic.join_reuse(EXECUTION_DEPENDENT);
     }
     if answer.outcome != "resolved"
         || !answer.coverage.is_exhaustive()
@@ -5735,7 +5871,13 @@ fn workspace_class_subclass_of_builtin(
             match hierarchy.outcome {
                 PythonHierarchyOutcome::Complete => {}
                 PythonHierarchyOutcome::Incomplete
-                    if hierarchy.reason == Some(PythonHierarchyReason::UnresolvedBase) => {}
+                    if matches!(
+                        hierarchy.reason,
+                        Some(
+                            PythonHierarchyReason::UnresolvedBase
+                                | PythonHierarchyReason::MissingRuntimeBases
+                        )
+                    ) => {}
                 _ => {
                     return WorkspaceClassProof {
                         relation: ExceptionProof::Open,
@@ -5788,7 +5930,11 @@ fn workspace_class_subclass_of_builtin(
                 };
             }
             if base_nodes.is_empty() {
-                continue;
+                return WorkspaceClassProof {
+                    relation: ExceptionProof::Open,
+                    default_metaclass,
+                    premises: Vec::new(),
+                };
             }
 
             for (ordinal, (base_node, base_fact)) in

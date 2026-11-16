@@ -12,6 +12,8 @@ mod ruby_extraction_tests {
     use brokk_bifrost_analysis::analyzer::semantic_model::overlay::test_support::method;
 
     use brokk_bifrost_analysis::analyzer::semantic_model::overlay::test_support::overlay;
+
+    use brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelCallApplication;
     #[test]
     #[hardwon(
         "6ecf92322c56: Ruby constructor results used receiver instead of declared return type"
@@ -43,15 +45,27 @@ mod ruby_extraction_tests {
         let owner = constants.unique_type("Example::Factory").unwrap();
         assert_eq!(
             constants
-                .declared_result(&constants.callable(&owner, "new", 0).unwrap())
+                .declared_result(
+                    &constants
+                        .callable(&owner, "new", &SemanticModelCallApplication::positional(0))
+                        .unwrap()
+                )
                 .unwrap()
                 .qualified_name,
             "Example::Product"
         );
-        assert!(constants.callable(&owner, "new", 1).is_none());
+        assert!(
+            constants
+                .callable(&owner, "new", &SemanticModelCallApplication::positional(1))
+                .is_none()
+        );
         assert!(
             RubyOverlayConstants::new(None)
-                .declared_result(&constants.callable(&owner, "new", 0).unwrap())
+                .declared_result(
+                    &constants
+                        .callable(&owner, "new", &SemanticModelCallApplication::positional(0))
+                        .unwrap()
+                )
                 .is_none()
         );
     }

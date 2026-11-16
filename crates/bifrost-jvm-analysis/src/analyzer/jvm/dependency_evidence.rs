@@ -1074,6 +1074,73 @@ impl MavenVersion {
         normalize(&mut items);
         Ok(Self { items })
     }
+
+    /// The semver activation coordinate for this version (#11371), or `None`
+    /// when it does not start with a number. The leading numeric items are
+    /// major, minor and patch, missing ones zero, so `2.6` is `2.6.0`. What
+    /// follows decides how the rest is kept. A qualifier Maven orders before
+    /// the release (`alpha`, `beta`, `milestone`, `rc`, `snapshot`) becomes
+    /// semver prerelease identifiers, so `2.7-rc1` is `2.7.0-rc.1`; semver
+    /// requirements match a prerelease only against a comparator that names
+    /// one on the same release, so such a version activates nothing broader.
+    /// Anything Maven orders after
+    /// the release (a fourth number, `sp`, or another qualifier such as Guava's
+    /// `jre`) is below semver's resolution and becomes build metadata, which
+    /// requirements ignore: a pack requirement reads `32.1.2-jre` as `32.1.2`.
+    pub fn coordinate_version(&self) -> Option<semver::Version> {
+        let release = self
+            .items
+            .iter()
+            .take(3)
+            .take_while(|item| matches!(item, VersionItem::Int(_)))
+            .count();
+        if release == 0 {
+            return None;
+        }
+        let component = |index: usize| match self.items.get(index) {
+            Some(VersionItem::Int(digits)) if index < release && !digits.is_empty() => {
+                digits.parse::<u64>().ok()
+            }
+            _ => Some(0),
+        };
+        let mut version = semver::Version::new(component(0)?, component(1)?, component(2)?);
+        let rest = &self.items[release..];
+        if rest.is_empty() {
+            return Some(version);
+        }
+        // Flatten the remaining items in order with an explicit stack; empty
+        // items are release markers and zeros that semver cannot spell.
+        let mut identifiers = Vec::new();
+        let mut pending: Vec<&VersionItem> = rest.iter().rev().collect();
+        while let Some(item) = pending.pop() {
+            match item {
+                VersionItem::Int(digits) if digits.is_empty() => identifiers.push("0".to_owned()),
+                VersionItem::Int(digits) => identifiers.push(digits.clone()),
+                VersionItem::Text(text) if text.is_empty() => {}
+                VersionItem::Text(text) => identifiers.push(
+                    text.chars()
+                        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                        .collect(),
+                ),
+                VersionItem::List(items) => pending.extend(items.iter().rev()),
+            }
+        }
+        if identifiers.is_empty() {
+            return Some(version);
+        }
+        let joined = identifiers.join(".");
+        let prerelease = identifiers
+            .first()
+            .is_some_and(|first| QUALIFIERS[..RELEASE].contains(&first.as_str()));
+        if prerelease {
+            version.pre = semver::Prerelease::new(&joined)
+                .expect("sanitized Maven qualifiers are semver identifiers");
+        } else {
+            version.build = semver::BuildMetadata::new(&joined)
+                .expect("sanitized Maven qualifiers are semver identifiers");
+        }
+        Some(version)
+    }
 }
 
 fn version_item(digit: bool, text: &str, followed_by_digit: bool) -> VersionItem {

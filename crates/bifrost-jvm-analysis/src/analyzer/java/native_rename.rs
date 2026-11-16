@@ -10,6 +10,7 @@ use brokk_bifrost_analysis::analyzer::rename::exact::{
     AssembledExactRename, ExactRenameEditIssue, ExactRenameHooks, RenameAssemblyIssue,
     RenameAssemblyLimits, RenameEditCoordinateSegments, RenameSourceIssue,
     admit_selected_native_source, assemble_exact_rename, check_rename_authority,
+    describe_incomplete_inventory,
 };
 use brokk_bifrost_analysis::analyzer::structural::reference_edges::EdgeSite;
 
@@ -376,7 +377,10 @@ fn rename_assembly_failure(issue: RenameAssemblyIssue<'_>) -> RenameFailure {
     let message = match issue {
         RenameAssemblyIssue::IncompleteInventory(result)
         | RenameAssemblyIssue::UnprovenInventory(result) => {
-            format!("original Java inverse evidence is incomplete or unproven: {result:?}")
+            format!(
+                "original Java inverse evidence is incomplete or unproven: {}",
+                describe_incomplete_inventory(result)
+            )
         }
         RenameAssemblyIssue::TooManyUsages(count) => {
             return failure(

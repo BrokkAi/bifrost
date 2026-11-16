@@ -102,17 +102,12 @@ use brokk_bifrost_jvm::kotlin::value_classes::{
 ///
 /// Bumped for #8523: brokk-tree-sitter-kotlin 0.4.7 parses an empty
 /// collection literal `[]` instead of recovering it with a MISSING node.
-// Bumping this rotates every public wire id hashed from the adapter
-// fingerprint (`SemanticArtifactKey::push_environment_identity`). A checked-in
-// golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
-// change; the code-query tutorial pages elide such ids (#5016).
-// #8387: invalidate artifacts embedding ranked synthetic declaration identities.
-// #8689: invalidate Kotlin artifacts after mutable closure captures acquire shared cells.
-// #8591: context-parameter function types change Kotlin semantic identities.
-// #8672: Kotlin 0.4.9 keeps annotated primary constructors after line comments.
-// #9447: structured formal roles and refusal change semantic payloads.
-// #9423: property reads lower as bound-method call sites (Java getters).
-const ADAPTER_VERSION: &[u8] = b"kotlin-value-semantics-v28";
+/// The kotlin adapter lever (#11570): `levers/kotlin-adapter.tokens`. Add a line there
+/// when a change alters the semantics this lowerer publishes for unchanged
+/// source; see `.agents/docs/cache-identity-levers.md`.
+fn adapter_version() -> &'static [u8] {
+    brokk_bifrost_core::lever_label!("kotlin-value-semantics", "kotlin-adapter.tokens").as_bytes()
+}
 
 impl_program_semantics_provider!(KotlinAnalyzer, KotlinSemanticLowerer);
 
@@ -122,7 +117,7 @@ impl ProgramSemanticsLowerer for KotlinSemanticLowerer {
     fn identity(&self) -> SemanticAdapterIdentity {
         SemanticAdapterIdentity::for_adapter(
             "kotlin",
-            ADAPTER_VERSION,
+            adapter_version(),
             b"kotlin-intrafile-execution-defaults-v1",
             DependencyFingerprint::hash_bytes(b"no-intrafile-dependencies"),
         )

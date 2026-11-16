@@ -1,39 +1,70 @@
 -- CodeUnit -> source declaration -> native declaration site -> the selected
--- summary member/export bridge. `unit_key` belongs to the summary version;
--- exports address its declaration through declaration_member_ordinal/site.
+-- summary member/export bridge (the subjects CTE below), then the impls that name that
+-- declaration as their subject, all read from the selected unit summaries:
+--   trait impls   trait endpoint rows, subject resolved (independent of the trait endpoint), found by
+--                 the subject's (unit key, module path, identity);
+--   inherent impls whose subject is a member and site of the impl's own unit, found
+--                 by (summary, subject member, subject site);
+--   inherent impls whose subject is another unit's name form, found by that name
+--                 form, and only when exactly one declaration export carries it.
+-- A name form that several exports carry (cfg alternatives) or an endpoint the
+-- summary left unresolved cannot attribute its impl to one declaration;
+-- rust_impl_children_gaps.sql reports that, and this statement returns no child for it.
 -- Only complete topologies valid in the selected workspace generation/revision
--- participate. Both UNION ALL arms seek their subject index before binding
--- topology; neither a historical profile nor a building topology adds members.
-WITH subjects AS (
- SELECT DISTINCT asked.id AS blob_id, bridge.source_site, member.rel_path
- FROM blobs AS asked
- CROSS JOIN code_units AS owner ON owner.blob_id=asked.id
- CROSS JOIN source_declaration_units AS source
-   ON source.blob_id=owner.blob_id AND source.unit_key=owner.unit_key
- CROSS JOIN source_native_declaration_bridges AS bridge
-   INDEXED BY source_native_declaration_bridges_declaration
-   ON bridge.blob_id=source.blob_id AND bridge.declaration_id=source.declaration_id
- CROSS JOIN resolution_unit_summary_members AS member
-   INDEXED BY resolution_unit_summary_members_blob
-   ON member.blob_id=asked.id AND member.rel_path=?2
- CROSS JOIN selected_rust_unit_summaries AS selected
-   ON selected.summary_id=member.summary_id
- CROSS JOIN rust_resolution_unit_summary_exports AS exports
-   INDEXED BY rust_resolution_unit_summary_exports_declaration
-   ON exports.summary_id=member.summary_id
-  AND exports.declaration_member_ordinal=member.member_ordinal
-  AND exports.declaration_site=bridge.source_site
-  AND exports.namespace='type' AND exports.origin='declaration'
- WHERE asked.blob_oid=?1 AND asked.lang='rust'
-  AND owner.kind=?3 AND owner.signature IS ?4 AND owner.synthetic=?5
-  AND owner.fq_anchor_kind IS ?6 AND owner.fq_anchor_pop IS ?7
-  AND owner.fq_package_tail_segments=?8 AND owner.exact_fqn_tail=?9
+-- participate (the reconcile-currency guard, reached through the summary's
+-- topology id until the topology tables go); neither a historical profile nor a
+-- building topology adds members.
+WITH {subjects}, impls AS (
+ SELECT subject.summary_id, subject.member_ordinal AS impl_member_ordinal,
+        subject.impl_declaration_id
+ FROM subjects
+ CROSS JOIN rust_resolution_unit_summary_trait_endpoints AS subject
+   INDEXED BY rust_resolution_unit_summary_trait_endpoints_target
+   ON subject.target_unit_key=subjects.unit_key
+  AND subject.target_module_path=subjects.module_path
+  AND subject.target_identity_id=subjects.identity_id
+  AND subject.endpoint_role='subject' AND subject.endpoint_state='resolved'
+ WHERE (SELECT count(*) FROM rust_resolution_unit_summary_exports AS same_name
+        INDEXED BY rust_summary_decl_export_endpoint
+        WHERE same_name.summary_id=subjects.summary_id
+          AND same_name.module_path=subjects.module_path
+          AND same_name.namespace='type' AND same_name.name=subjects.name
+          AND same_name.origin='declaration')=1
+ UNION ALL
+ SELECT inherent.summary_id, inherent.impl_member_ordinal, inherent.impl_declaration_id
+ FROM subjects
+ CROSS JOIN rust_resolution_unit_summary_inherent_impls AS inherent
+   INDEXED BY rust_summary_inherent_local_subject
+   ON inherent.summary_id=subjects.summary_id
+  AND inherent.subject_member_ordinal=subjects.member_ordinal
+  AND inherent.subject_site=subjects.source_site
+  AND inherent.subject_form='local_site'
+ UNION ALL
+ SELECT inherent.summary_id, inherent.impl_member_ordinal, inherent.impl_declaration_id
+ FROM subjects
+ CROSS JOIN rust_resolution_unit_summary_inherent_impls AS inherent
+   INDEXED BY rust_summary_inherent_subject
+   ON inherent.subject_unit_key=subjects.unit_key
+  AND inherent.subject_module_path=subjects.module_path
+  AND inherent.subject_kind='declaration' AND inherent.subject_namespace='type'
+  AND inherent.subject_name=subjects.name AND inherent.subject_origin='declaration'
+  AND inherent.subject_form='foreign'
+ WHERE (SELECT count(*) FROM rust_resolution_unit_summary_exports AS same_name
+        INDEXED BY rust_summary_decl_export_endpoint
+        WHERE same_name.summary_id=subjects.summary_id
+          AND same_name.module_path=subjects.module_path
+          AND same_name.namespace='type' AND same_name.name=subjects.name
+          AND same_name.origin='declaration')=1
 ), members AS (
- SELECT DISTINCT impl.impl_blob_id AS blob_id, impl.impl_rel_path AS rel_path,
+ SELECT DISTINCT impl_member.blob_id AS blob_id, impl_member.rel_path AS rel_path,
                  units.unit_key
- FROM rust_crate_impls_of_subject AS impl
+ FROM impls
+ CROSS JOIN resolution_unit_summary_members AS impl_member
+   ON impl_member.summary_id=impls.summary_id
+  AND impl_member.member_ordinal=impls.impl_member_ordinal
+ CROSS JOIN selected_rust_unit_summaries AS impl_unit ON impl_unit.summary_id=impls.summary_id
  CROSS JOIN rust_crate_versions AS versions INDEXED BY rust_crate_versions_topology
-   ON versions.topology_id=impl.topology_id
+   ON versions.topology_id=impl_unit.topology_id
  CROSS JOIN selected_workspace_revisions AS selected
    ON selected.workspace_id=versions.workspace_id AND selected.lang=versions.lang
   AND selected.generation=versions.generation
@@ -48,21 +79,19 @@ WITH subjects AS (
  CROSS JOIN rust_crate_reconciliations AS reconciliation
    ON reconciliation.workspace_id=selected.workspace_id
   AND reconciliation.generation=selected.generation
-  AND reconciliation.revision=selected.revision AND reconciliation.derivation_version=?10
+  AND reconciliation.revision=selected.revision AND reconciliation.derivation_identity=?10
  CROSS JOIN selected_workspace_file_versions AS file
    ON file.workspace_id=selected.workspace_id AND file.lang=selected.lang
-  AND file.generation=selected.generation AND file.rel_path=impl.impl_rel_path
+  AND file.generation=selected.generation AND file.rel_path=impl_member.rel_path
+ -- Rust-only derived-from blob until #11183 M3 converts Rust child rows
  CROSS JOIN blobs AS impl_blob
-   ON impl_blob.id=impl.impl_blob_id AND impl_blob.blob_oid=file.blob_oid
+   ON impl_blob.id=impl_member.blob_id AND impl_blob.blob_oid=file.blob_oid
   AND impl_blob.lang=file.lang AND impl_blob.generation=file.generation
  CROSS JOIN source_rust_item_body_children AS child
-   ON child.blob_id=impl.impl_blob_id
-  AND child.owner_declaration_id=impl.impl_declaration_id
+   ON child.blob_id=impl_member.blob_id
+  AND child.owner_declaration_id=impls.impl_declaration_id
  CROSS JOIN source_declaration_units AS units
    ON units.blob_id=child.blob_id AND units.declaration_id=child.declaration_id
- WHERE impl.subject_declaration_blob_id=(SELECT id FROM blobs WHERE blob_oid=?1 AND lang='rust' AND parse_variant=x'')
-  AND impl.subject_declaration_site IN (SELECT source_site FROM subjects)
-  AND impl.subject_rel_path=?2
 )
 SELECT {projection}, members.rel_path,
        ranges.start_byte, ranges.end_byte, ranges.start_line, ranges.end_line

@@ -379,14 +379,14 @@ impl FactEvaluation<'_, '_> {
                 }
             },
             receiver,
-            interface: matches!(
+            abstract_owner: matches!(
                 metadata.declaration.kind,
                 GoMemberDeclarationKind::Interface { .. }
             ),
-            route_exact: self.go_member_owner_path_is_depth_exact(owners),
+            owner_path_members_exact: self.go_member_owner_path_is_depth_exact(owners),
             // Conservative until model field places exist (#7556). Even a
             // source-field promotion cannot prepare the outer receiver here.
-            receiver_route_proven: owners.len() == 1,
+            receiver_is_declaring_owner: owners.len() == 1,
             completion: completion.clone(),
             rejected,
         };
@@ -1785,8 +1785,13 @@ pub(crate) struct GoInterfaceSatisfaction {
     pub(crate) owner: SemanticId,
     pub(crate) methods: Vec<SemanticId>,
     pub(crate) outcome: GoMethodSatisfaction,
-    pub(crate) satisfying_receivers: Vec<ResolutionTypeRef>,
     pub(crate) candidate_receivers: Vec<ResolutionTypeRef>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct GoMethodReceiverCandidates {
+    pub(crate) receivers: Vec<ResolutionTypeRef>,
+    pub(crate) complete: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -2135,6 +2140,63 @@ impl FactResolutionOperation<'_> {
         )
     }
 
+    pub(crate) fn go_method_receiver_candidates(
+        &mut self,
+        target: SemanticId,
+    ) -> StoreResult<GoMethodReceiverCandidates> {
+        let provider = self
+            .demand_provider
+            .take()
+            .expect("Go receiver discovery requires its installed demand provider");
+        let mut evaluation = FactEvaluation::from_lexical_answer(
+            &mut self.session,
+            &mut self.hierarchy,
+            target,
+            ResolutionAnswer::new([target], [], ResolutionCompletion::Complete),
+        )
+        .with_candidate_paths(&mut self.candidate_paths);
+        evaluation.forward_candidate_artifacts = Some(&mut self.forward_candidate_artifacts);
+        let provider = std::cell::RefCell::new(provider);
+        let mut result = GoMethodReceiverCandidates::default();
+        let answer = evaluation.run_with_rounds_and_inspection(
+            |evaluation, answers, states| {
+                evaluation.evaluate_round_with_dependencies(
+                    answers,
+                    states,
+                    provider.borrow_mut().as_mut(),
+                )
+            },
+            |evaluation, states| {
+                let read = evaluation
+                    .session
+                    .deferred_member_owners_for_definitions(&[target])?;
+                let complete = matches!(&read, SessionFactRead::Exhausted { evidence, .. }
+                    if evidence == &ResolutionCompletion::Complete);
+                let Some(rows) = evaluation.accept_session_read(read) else {
+                    result = GoMethodReceiverCandidates::default();
+                    return Ok(());
+                };
+                let rows = rows
+                    .into_iter()
+                    .map(|row| *row.get(evaluation.session).row())
+                    .collect::<Vec<_>>();
+                result = evaluation.go_deferred_method_receivers(&rows, states);
+                result.complete &= complete;
+                Ok(())
+            },
+        );
+        self.demand_provider = Some(provider.into_inner());
+        let answer = answer?;
+        result.complete &= answer.completion() == &ResolutionCompletion::Complete;
+        if evaluation.cancellation_observed
+            || evaluation.cancellation.is_cancelled()
+            || evaluation.session.resolution_stopped()
+        {
+            return Ok(GoMethodReceiverCandidates::default());
+        }
+        Ok(result)
+    }
+
     pub(crate) fn go_method_satisfaction(
         &mut self,
         target: SemanticId,
@@ -2167,7 +2229,6 @@ impl FactResolutionOperation<'_> {
                 unclosed_interfaces.push(GoInterfaceSatisfaction {
                     owner,
                     methods: Vec::new(),
-                    satisfying_receivers: Vec::new(),
                     candidate_receivers: Vec::new(),
                     outcome: GoMethodSatisfaction::Inconclusive(
                         "interface method-set endpoint closure is incomplete or cancelled",
@@ -2215,7 +2276,6 @@ impl FactResolutionOperation<'_> {
                         .find(|interface| interface.owner == owner)
                         .map(|interface| interface.methods.clone())
                         .unwrap_or_default(),
-                    satisfying_receivers: Vec::new(),
                     candidate_receivers: Vec::new(),
                     outcome: GoMethodSatisfaction::Inconclusive(
                         "method-family endpoint closure was cancelled or exhausted its budget",
@@ -2229,6 +2289,36 @@ impl FactResolutionOperation<'_> {
 }
 
 impl FactEvaluation<'_, '_> {
+    fn go_deferred_method_receivers(
+        &mut self,
+        rows: &[LoweredDeferredMemberOwner],
+        states: &StateMap,
+    ) -> GoMethodReceiverCandidates {
+        let mut result = GoMethodReceiverCandidates {
+            receivers: Vec::new(),
+            complete: !rows.is_empty(),
+        };
+        for row in rows {
+            self.demand_slot(row.owner_frontier());
+            if let Some(state) = states.get(&row.owner_frontier())
+                && state.completion() == &ResolutionCompletion::Complete
+                && let [value] = state.possible_values()
+            {
+                // Value-receiver methods belong to T and *T. Pointer methods
+                // belong only to *T; neither lookup is addressable.
+                result.receivers.push(value.ty());
+                if value.ty().indirection() == 0 {
+                    result
+                        .receivers
+                        .push(ResolutionTypeRef::new(value.ty().identity(), 1));
+                }
+            } else {
+                result.complete = false;
+            }
+        }
+        result
+    }
+
     // Flatten a selected interface's method set, using the shared hierarchy
     // closure and edge authority. This also serves struct-embedded interfaces.
     fn go_interface_method_set(
@@ -3058,30 +3148,17 @@ impl FactEvaluation<'_, '_> {
                             owner,
                             methods: vec![target],
                             outcome: Satisfies,
-                            satisfying_receivers: Vec::new(),
                             candidate_receivers: Vec::new(),
                         })
                 })
                 .collect());
         }
-        let mut receivers = Vec::new();
-        for row in rows {
-            self.demand_slot(row.owner_frontier());
-            if let Some(state) = states.get(&row.owner_frontier())
-                && state.completion() == &ResolutionCompletion::Complete
-                && let [value] = state.possible_values()
-            {
-                // Value-receiver methods belong to both T and *T. Pointer
-                // methods belong only to *T; neither lookup is addressable.
-                receivers.push(ResolutionSlotValue::type_object(value.ty()));
-                if value.ty().indirection() == 0 {
-                    receivers.push(ResolutionSlotValue::type_object(ResolutionTypeRef::new(
-                        value.ty().identity(),
-                        1,
-                    )));
-                }
-            }
-        }
+        let receivers = self
+            .go_deferred_method_receivers(&rows, states)
+            .receivers
+            .into_iter()
+            .map(ResolutionSlotValue::type_object)
+            .collect::<Vec<_>>();
         let mut result = Vec::new();
         for &owner in interfaces {
             if !self.close_hierarchy_owner_roots(&BTreeSet::from([owner]), provider)? {
@@ -3101,7 +3178,6 @@ impl FactEvaluation<'_, '_> {
                 continue;
             }
             let mut outcome = Inconclusive("receiver or interface method set is unavailable");
-            let mut satisfying_receivers = Vec::new();
             for receiver in &receivers {
                 let Some(check) = self.go_check_receiver_interface(
                     *receiver,
@@ -3124,7 +3200,6 @@ impl FactEvaluation<'_, '_> {
                     check.outcome
                 };
                 if checked == Satisfies {
-                    satisfying_receivers.push(receiver.ty());
                     outcome = checked;
                     break;
                 }
@@ -3142,7 +3217,6 @@ impl FactEvaluation<'_, '_> {
                 owner,
                 methods: matches,
                 outcome,
-                satisfying_receivers,
                 candidate_receivers: receivers.iter().map(|receiver| receiver.ty()).collect(),
             });
         }

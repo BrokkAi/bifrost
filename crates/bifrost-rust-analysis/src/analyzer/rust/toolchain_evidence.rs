@@ -26,7 +26,7 @@ use brokk_bifrost_core::analyzer::model::ProjectFile;
 use brokk_bifrost_core::analyzer::project::ProjectSourceSnapshot;
 use brokk_bifrost_core::hash::HashMap;
 use brokk_bifrost_rust::cargo_config::{
-    RustCargoConfigDocument, RustCargoConfiguration, is_cargo_configuration_path,
+    RustCargoConfiguration, RustStdlibBuildMode, is_cargo_configuration_path,
 };
 use brokk_bifrost_rust::cargo_manifest::RustCargoManifestDocument;
 use brokk_bifrost_rust::cargo_routes::{cargo_package_string, cargo_workspace_manifest_directory};
@@ -59,12 +59,12 @@ struct Input<'a> {
 pub(super) fn push_rust_toolchain_evidence(
     root: &Path,
     selected: &[(ProjectFile, ProjectSourceSnapshot)],
+    configuration: &RustCargoConfiguration,
     limits: &DependencyFileEvidenceLimits,
     result: &mut DependencyFileEvidence,
 ) {
     let mut inputs = HashMap::<PathBuf, Input<'_>>::default();
     let mut manifests = HashMap::default();
-    let mut configs = Vec::new();
     for (file, snapshot) in selected {
         let path = file.rel_path();
         let toolchain = rust_toolchain_input(path);
@@ -98,12 +98,6 @@ pub(super) fn push_rust_toolchain_evidence(
         {
             manifests.insert(parent(path), document);
         }
-        if config
-            && let Ok(document) =
-                RustCargoConfigDocument::from_source_bytes(snapshot.source().as_bytes())
-        {
-            configs.push((path.to_path_buf(), document));
-        }
         inputs.insert(
             path.to_path_buf(),
             Input {
@@ -112,7 +106,6 @@ pub(super) fn push_rust_toolchain_evidence(
             },
         );
     }
-    let configuration = RustCargoConfiguration::from_files(configs);
     let mut members = manifests
         .iter()
         .filter(|(_, manifest)| manifest.package_name().is_some())
@@ -126,12 +119,24 @@ pub(super) fn push_rust_toolchain_evidence(
         // Cargo and rustup run where a workspace build starts: its root.
         let workspace = cargo_workspace_manifest_directory(root, directory, manifest, &manifests)
             .unwrap_or_else(|| directory.clone());
+        let mut conditions = vec![
+            condition("cargo.member_manifest", &display(&manifest_path)),
+            condition("cargo.member_package", package),
+        ];
+        // Existing string condition metadata: no enum/schema or encoding changes.
+        // Silence certifies Prebuilt only for a completely acquired config view.
+        match configuration.stdlib_build_mode(&workspace) {
+            RustStdlibBuildMode::Prebuilt => {}
+            RustStdlibBuildMode::BuildStd => {
+                conditions.push(condition("rust.stdlib_build_mode", "build_std"))
+            }
+            RustStdlibBuildMode::Unknown => {
+                conditions.push(condition("rust.stdlib_build_mode", "unknown"))
+            }
+        }
         let owner = Owner {
             id: member_entity(directory).id(),
-            conditions: vec![
-                condition("cargo.member_manifest", &display(&manifest_path)),
-                condition("cargo.member_package", package),
-            ],
+            conditions,
         };
         rows.push(toolchain_row(
             &owner,
@@ -162,7 +167,10 @@ pub(super) fn push_rust_toolchain_evidence(
                 .into_iter()
                 .map(|name| level.join(".cargo").join(name))
                 .find(|path| inputs.contains_key(path))
-                .expect("a defining configuration level has a selected file");
+                // External/contained-include targets have no direct `.cargo`
+                // source row. Anchor their typed fact on the existing owner
+                // manifest; the acquired input digest binds its actual source.
+                .unwrap_or_else(|| manifest_path.clone());
             for target in targets {
                 let mut conditions = vec![
                     condition("rust.toolchain_evidence", "cargo_build_target"),

@@ -781,6 +781,24 @@ pub struct TaintFindingEvidence {
 }
 
 impl TaintFindingEvidence {
+    pub(crate) fn omit_optional_detail(&mut self) -> bool {
+        let changed = !self.origins.is_empty()
+            || !self.source_scenarios.is_empty()
+            || !self.witness_refs.is_empty();
+        self.origins_truncated |= !self.origins.is_empty();
+        self.origins = Vec::new();
+        if !self.source_scenarios.is_empty() {
+            self.source_scenarios_truncated = true;
+            self.omitted_source_scenarios_lower_bound = self
+                .omitted_source_scenarios_lower_bound
+                .saturating_add(self.source_scenarios.len() as u64);
+            self.source_scenarios = Vec::new();
+        }
+        self.witness_refs_truncated |= !self.witness_refs.is_empty();
+        self.witness_refs = Vec::new();
+        changed
+    }
+
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_new(
@@ -1069,6 +1087,10 @@ pub struct FlowFindingEvidence {
 }
 
 impl FlowFindingEvidence {
+    pub(crate) fn omit_optional_detail(&mut self) -> bool {
+        self.inner.omit_optional_detail()
+    }
+
     pub(crate) const fn new(inner: TaintFindingEvidence) -> Self {
         Self { inner }
     }
@@ -1304,6 +1326,22 @@ pub struct TypestatePolicyProjectionFacts {
     pub scenario_ids: Vec<TypestateScenarioId>,
     pub scenario_set_hash: TypestateScenarioSetHash,
     pub semantic_hash: TypestateProjectionFactsHash,
+}
+
+impl RetainedSize for TypestatePolicyProjectionFacts {
+    fn retained_size(&self) -> usize {
+        retained_size_with_extras(
+            self,
+            [
+                retained_extra(&self.source_endpoint),
+                retained_extra(&self.source_categories),
+                retained_extra(&self.source_display_name),
+                retained_extra(&self.violation_site),
+                retained_extra(&self.violation),
+                retained_extra(&self.scenario_ids),
+            ],
+        )
+    }
 }
 
 impl TypestatePolicyProjectionFacts {
@@ -1733,6 +1771,20 @@ pub struct TypestateFindingEvidence {
 }
 
 impl TypestateFindingEvidence {
+    pub(crate) fn omit_optional_detail(&mut self) -> bool {
+        let changed = !self.scenario_ids.is_empty() || !self.witness_refs.is_empty();
+        if !self.scenario_ids.is_empty() {
+            self.scenarios_truncated = true;
+            self.omitted_scenarios_lower_bound = self
+                .omitted_scenarios_lower_bound
+                .saturating_add(self.scenario_ids.len() as u64);
+            self.scenario_ids = Vec::new();
+        }
+        self.witness_refs_truncated |= !self.witness_refs.is_empty();
+        self.witness_refs = Vec::new();
+        changed
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_new(
         analysis_finding_id: AnalysisFindingId,

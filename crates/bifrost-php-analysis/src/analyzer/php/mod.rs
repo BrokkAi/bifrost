@@ -26,6 +26,7 @@ use brokk_bifrost_analysis::{
 use brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer;
 #[doc(hidden)]
 pub mod adapter;
+mod allocation_lifetime;
 mod clones;
 pub mod dependency_discovery;
 pub mod dependency_evidence;
@@ -297,6 +298,14 @@ impl PhpAnalyzer {
     #[cfg(any(test, feature = "test-support"))]
     pub fn new(project: Arc<dyn Project>) -> Self {
         Self::new_with_config(project, AnalyzerConfig::default())
+    }
+
+    /// Drop every retained in-memory file state so the next read goes through
+    /// the live source, the way a freshly started process would.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn clear_retained_file_states_for_test(&mut self) {
+        self.inner.clear_retained_file_states_for_test();
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -604,6 +613,11 @@ impl CodeUnitIndex for PhpAnalyzer {
     }
 
     delegate_inner_methods! {
+        fn owns_source_file(&self, file: &ProjectFile) -> bool;
+        fn indexed_source_files(&self) -> brokk_bifrost_analysis::analyzer::QueryBatch<ProjectFile>;
+    }
+
+    delegate_inner_methods! {
         fn indexed_blob_oid(&self, file: &ProjectFile) -> Option<brokk_bifrost_analysis::analyzer::Oid>;
     }
 
@@ -789,11 +803,8 @@ impl IAnalyzer for PhpAnalyzer {
     }
 
     delegate_inner_methods! {
-        fn record_query_failure(&self, error: brokk_bifrost_analysis::analyzer::store::StoreError);
-    }
-
-    delegate_inner_methods! {
         fn workspace_file_index_cell(&self) -> Option<brokk_bifrost_analysis::analyzer::WorkspaceFileIndexCell>;
+        fn workspace_file_inventory_cell(&self) -> Option<brokk_bifrost_analysis::analyzer::WorkspaceFileInventoryCell>;
     }
 
     delegate_inner_methods! {
@@ -806,6 +817,13 @@ impl IAnalyzer for PhpAnalyzer {
         fn structural_fact_providers(
         &self,
     ) -> Vec<&dyn brokk_bifrost_analysis::analyzer::structural::StructuralFactProvider>;
+    }
+
+    fn generation_membership(
+        &self,
+    ) -> &Arc<brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::GenerationWorkspaceMembership>
+    {
+        IAnalyzer::generation_membership(&self.inner)
     }
 
     fn snapshot_caches(
@@ -912,7 +930,10 @@ impl IAnalyzer for PhpAnalyzer {
         fn contains_tests(&self, file: &ProjectFile) -> bool;
     }
 
-    fn in_test_region(&self, code_unit: &brokk_bifrost_core::analyzer::model::CodeUnit) -> bool {
+    fn in_test_region(
+        &self,
+        code_unit: &brokk_bifrost_core::analyzer::model::CodeUnit,
+    ) -> Result<bool, brokk_bifrost_analysis::analyzer::QueryReadIncomplete> {
         self.inner.in_test_region(code_unit)
     }
 
@@ -1163,6 +1184,15 @@ impl LanguageSupport for PhpSupport {
 
     fn definition_call_reference_candidate(&self, node: tree_sitter::Node<'_>) -> bool {
         crate::analyzer::usages::get_definition::php::php_call_reference_candidate(node)
+    }
+
+    fn resolved_allocation_lifetime_gaps(
+        &self,
+        workspace: &brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer,
+        procedure: &brokk_bifrost_analysis::analyzer::semantic::ProcedureHandle,
+        request: &mut brokk_bifrost_analysis::analyzer::semantic::SemanticRequest<'_>,
+    ) -> Vec<brokk_bifrost_analysis::analyzer::semantic::SemanticGapId> {
+        allocation_lifetime::resolved_allocation_lifetime_gaps(workspace, procedure, request)
     }
 
     fn dead_code(&self) -> DeadCodeSupport {
@@ -1458,6 +1488,8 @@ impl brokk_bifrost_analysis::analyzer::multi_analyzer::LanguageAnalyzer for PhpA
     ) -> Box<dyn brokk_bifrost_analysis::analyzer::multi_analyzer::LanguageAnalyzer> {
         Box::new(PhpAnalyzer::update_all_with_progress(self, progress))
     }
+
+    brokk_bifrost_analysis::delegate_generation_membership_updates!(PhpAnalyzer);
 
     fn as_any(&self) -> &dyn std::any::Any {
         self

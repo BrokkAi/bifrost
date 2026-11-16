@@ -766,18 +766,32 @@ pub fn split_parameter_types(inner: &str) -> Vec<String> {
 /// One transfer rendered as a stable comparable string.
 pub fn render_transfer(transfer: &AuthoredSummaryTransfer) -> String {
     let input = match &transfer.input {
-        AuthoredSummaryInput::Receiver {} => "receiver".to_owned(),
-        AuthoredSummaryInput::Parameter { ordinal } => format!("parameter[{ordinal}]"),
+        AuthoredSummaryInput::Receiver { path: None } => "receiver".to_owned(),
+        AuthoredSummaryInput::Parameter {
+            ordinal,
+            path: None,
+        } => format!("parameter[{ordinal}]"),
+        projected => format!("{projected:?}"),
     };
     let output = match &transfer.output {
-        AuthoredSummaryOutput::NormalReturn {} => "normal_return".to_owned(),
-        AuthoredSummaryOutput::IndexedNormalReturn { ordinal } => {
+        AuthoredSummaryOutput::NormalReturn { path: None } => "normal_return".to_owned(),
+        AuthoredSummaryOutput::IndexedNormalReturn {
+            ordinal,
+            path: None,
+        } => {
             format!("normal_return[{ordinal}]")
         }
-        AuthoredSummaryOutput::Receiver {} => "receiver".to_owned(),
-        AuthoredSummaryOutput::Capture { location } => format!("capture[{location}]"),
-        AuthoredSummaryOutput::Heap { location } => format!("heap[{location}]"),
-        AuthoredSummaryOutput::ExceptionalReturn {} => "exceptional_return".to_owned(),
+        AuthoredSummaryOutput::Receiver { path: None } => "receiver".to_owned(),
+        AuthoredSummaryOutput::Capture {
+            location,
+            path: None,
+        } => format!("capture[{location}]"),
+        AuthoredSummaryOutput::Heap {
+            location,
+            path: None,
+        } => format!("heap[{location}]"),
+        AuthoredSummaryOutput::ExceptionalReturn { path: None } => "exceptional_return".to_owned(),
+        projected => format!("{projected:?}"),
     };
     let exit = match transfer.exit_kind {
         AuthoredSummaryExitKind::Normal => "normal",
@@ -804,12 +818,20 @@ pub struct FoundryEntryBuilder {
 
 impl FoundryEntryBuilder {
     pub fn add_transfer(&mut self, mut transfer: AuthoredSummaryTransfer) {
-        if matches!(transfer.input, AuthoredSummaryInput::Receiver {})
-            || matches!(transfer.output, AuthoredSummaryOutput::Receiver {})
-        {
+        if matches!(
+            transfer.input,
+            AuthoredSummaryInput::Receiver { path: None }
+        ) || matches!(
+            transfer.output,
+            AuthoredSummaryOutput::Receiver { path: None }
+        ) {
             self.has_receiver = true;
         }
-        if let AuthoredSummaryInput::Parameter { ordinal } = transfer.input {
+        if let AuthoredSummaryInput::Parameter {
+            ordinal,
+            path: None,
+        } = transfer.input
+        {
             self.max_ordinal = Some(self.max_ordinal.map_or(ordinal, |seen| seen.max(ordinal)));
         }
         self.has_flow_rows = true;
@@ -929,7 +951,9 @@ mod tests {
                 let mut builder = FoundryEntryBuilder::default();
                 for kind in kinds {
                     let mut transfer =
-                        super::super::test_support::transfer(AuthoredSummaryInput::Receiver {});
+                        super::super::test_support::transfer(AuthoredSummaryInput::Receiver {
+                            path: None,
+                        });
                     transfer.value_transfer = Some(SummaryValueTransfer {
                         kind,
                         operation: SummaryValueTransferOperation::None {},

@@ -13,6 +13,17 @@
 //! stays off while the statement-start attribution guard remains installed.
 //!
 //! One callback per connection dispatches attribution, profiling and listeners.
+//!
+//! Both JSONL outputs start with `profile_header`, format_version 2. In a
+//! cumulative dump, the sum of statement, sqlite_internal_rows and overflow
+//! decoded_rows equals the header decoded_rows and totals_with_rows.
+//! This partitions ROW events by their own SQL, independently of completion.
+//! Request records use the same partition in their statements and
+//! sqlite_internal_rows arrays. For a non-overlapping request, their sum equals
+//! the totals_with_rows delta over the scope (per role as well as overall).
+//! In contrast, statement `rows` and row_histogram attribute nested internal ROW
+//! events to the active application statement too. Do not add `rows` to the
+//! decoded_rows partition: that would count those internal rows twice.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -206,8 +217,8 @@ pub(crate) enum ConnectionRole {
 }
 
 struct ActiveStatement {
+    statement: usize,
     role: ConnectionRole,
-    sql: String,
     keys: Option<usize>,
     rows: u64,
 }
@@ -225,6 +236,7 @@ struct RequestStatement {
     total_nanos: u128,
     max_nanos: u64,
     rows: u64,
+    decoded_rows: u64,
     row_histogram: HashMap<u64, u64>,
     key_histogram: HashMap<u64, u64>,
     repeated_expanded_invocations: u64,
@@ -237,6 +249,7 @@ struct RequestAggregate {
     overlapped: bool,
     statements: HashMap<u64, RequestStatement>,
     seen_bindings: HashSet<(u64, u64)>,
+    internal_rows: [u64; ConnectionRole::ALL.len()],
 }
 
 impl RequestAggregate {
@@ -247,6 +260,7 @@ impl RequestAggregate {
             overlapped: false,
             statements: HashMap::new(),
             seen_bindings: HashSet::new(),
+            internal_rows: [0; ConnectionRole::ALL.len()],
         }
     }
 
@@ -259,16 +273,12 @@ impl RequestAggregate {
         keys: Option<usize>,
         rows: u64,
     ) {
-        let mut family_hasher = DefaultHasher::new();
-        role.hash(&mut family_hasher);
-        sql.hash(&mut family_hasher);
-        let family = family_hasher.finish();
         let nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
-        let statement = self.statements.entry(family).or_default();
-        if statement.role.is_none() {
-            statement.role = Some(role);
-            statement.sql = sql.to_string();
-        }
+        let family = self.ensure_statement(role, sql);
+        let statement = self
+            .statements
+            .get_mut(&family)
+            .expect("statement was inserted");
         statement.executions += 1;
         statement.total_nanos += u128::from(nanos);
         statement.max_nanos = statement.max_nanos.max(nanos);
@@ -293,6 +303,32 @@ impl RequestAggregate {
         }
     }
 
+    fn ensure_statement(&mut self, role: ConnectionRole, sql: &str) -> u64 {
+        assert!(!sql.is_empty(), "profiled statements must have SQL");
+        let mut family_hasher = DefaultHasher::new();
+        role.hash(&mut family_hasher);
+        sql.hash(&mut family_hasher);
+        let family = family_hasher.finish();
+        let statement = self.statements.entry(family).or_default();
+        if statement.role.is_none() {
+            statement.role = Some(role);
+            statement.sql = sql.to_string();
+        }
+        family
+    }
+
+    fn record_decoded_row(&mut self, role: ConnectionRole, sql: &str) {
+        if sql.is_empty() {
+            self.internal_rows[role as usize] += 1;
+        } else {
+            let family = self.ensure_statement(role, sql);
+            self.statements
+                .get_mut(&family)
+                .expect("statement was inserted")
+                .decoded_rows += 1;
+        }
+    }
+
     fn render(self) -> String {
         let mut statements = self
             .statements
@@ -311,6 +347,8 @@ impl RequestAggregate {
                     .map(|(key, count)| (key.to_string(), count))
                     .collect::<std::collections::BTreeMap<_, _>>();
                 serde_json::json!({
+                    "kind": "statement",
+                    "decoded_rows": statement.decoded_rows,
                     "role": statement.role.expect("profiled statement role is set").as_str(),
                     "sql": statement.sql,
                     "executions": statement.executions,
@@ -340,13 +378,15 @@ impl RequestAggregate {
             "expanded_binding_cap": REQUEST_BINDING_CAP,
             "distinct_expanded_bindings": self.seen_bindings.len(),
             "statements": statements,
+            "sqlite_internal_rows": internal_row_records(&self.internal_rows),
         })
         .to_string()
     }
 }
 
 /// A request-local SQL family profile. Its statement totals and histograms are
-/// written beside the process-wide dump as `<profile>.requests.jsonl`.
+/// written beside the process-wide dump by replacing its extension with
+/// `requests.jsonl`.
 pub struct RequestScope {
     profile: Option<&'static Profile>,
     counted: bool,
@@ -433,10 +473,38 @@ struct Overflow {
     first: Option<(ConnectionRole, String)>,
 }
 
+/// SQLite suppresses SQL text and completion events while loading its schema.
+#[derive(Clone, Copy, serde::Serialize)]
+enum InternalRowReason {
+    #[serde(rename = "sqlite_schema_or_statistics_statement")]
+    SchemaOrStatisticsStatement,
+}
+
+fn profile_header() -> serde_json::Value {
+    serde_json::json!({"kind": "profile_header", "format_version": 2})
+}
+
+fn internal_row_records(rows: &[u64; ConnectionRole::ALL.len()]) -> Vec<serde_json::Value> {
+    ConnectionRole::ALL
+        .iter()
+        .zip(rows)
+        .filter(|(_, decoded_rows)| **decoded_rows > 0)
+        .map(|(role, &decoded_rows)| {
+            serde_json::json!({
+                "kind": "sqlite_internal_rows",
+                "role": role.as_str(),
+                "decoded_rows": decoded_rows,
+                "reason": InternalRowReason::SchemaOrStatisticsStatement,
+            })
+        })
+        .collect()
+}
+
 struct Aggregate {
     /// One map per role, so a repeat execution finds its entry without
     /// allocating a key.
     by_role: [HashMap<String, Statement>; ConnectionRole::ALL.len()],
+    internal_rows: [u64; ConnectionRole::ALL.len()],
     distinct: usize,
     decoded_rows: u64,
     overflow: Overflow,
@@ -460,7 +528,11 @@ impl Profile {
             .write(true)
             .truncate(true)
             .open(&request_path)
-        {
+            .and_then(|mut file| {
+                writeln!(file, "{}", profile_header())?;
+                file.flush()?;
+                Ok(file)
+            }) {
             Ok(file) => Some(file),
             Err(error) => {
                 eprintln!(
@@ -474,6 +546,7 @@ impl Profile {
             path,
             aggregate: Mutex::new(Aggregate {
                 by_role: std::array::from_fn(|_| HashMap::new()),
+                internal_rows: [0; ConnectionRole::ALL.len()],
                 distinct: 0,
                 decoded_rows: 0,
                 overflow: Overflow::default(),
@@ -843,13 +916,24 @@ unsafe extern "C" fn trace_callback(
             [usize::from(context.role.load(std::sync::atomic::Ordering::Relaxed))];
         match code {
             ffi::SQLITE_TRACE_STMT => {
-                let active = ActiveStatement {
-                    role,
-                    sql: sql_text.to_owned(),
-                    keys: LOGICAL_KEY_COUNT.with(Cell::get),
-                    rows: 0,
-                };
-                ACTIVE_STATEMENTS.with(|current| current.borrow_mut().push(active));
+                ACTIVE_STATEMENTS.with(|current| {
+                    let mut current = current.borrow_mut();
+                    // SQLite repeats STMT for trigger subprograms with the same
+                    // prepared-statement pointer, then emits one PROFILE when
+                    // that execution finishes. Retain one frame per execution.
+                    if current
+                        .iter()
+                        .any(|active| active.statement == stmt as usize)
+                    {
+                        return;
+                    }
+                    current.push(ActiveStatement {
+                        statement: stmt as usize,
+                        role,
+                        keys: LOGICAL_KEY_COUNT.with(Cell::get),
+                        rows: 0,
+                    });
+                });
             }
             ffi::SQLITE_TRACE_ROW => {
                 ACTIVE_STATEMENTS.with(|current| {
@@ -865,7 +949,7 @@ unsafe extern "C" fn trace_callback(
                     let mut active = current.borrow_mut();
                     active
                         .iter()
-                        .rposition(|entry| entry.role == role && entry.sql == sql_text)
+                        .rposition(|entry| entry.role == role && entry.statement == stmt as usize)
                         .map(|index| active.remove(index))
                         .map_or((None, 0), |entry| (entry.keys, entry.rows))
                 });
@@ -911,6 +995,14 @@ fn record_decoded_row(role: ConnectionRole, sql: &str) {
     let Some(profile) = profile() else {
         return;
     };
+    if let Some(request) = profile
+        .active_request
+        .lock()
+        .expect("SQL request profile poisoned")
+        .as_mut()
+    {
+        request.record_decoded_row(role, sql);
+    }
     let mut aggregate = profile
         .aggregate
         .lock()
@@ -920,12 +1012,15 @@ fn record_decoded_row(role: ConnectionRole, sql: &str) {
         .checked_add(1)
         .expect("SQL profile decoded row count fits u64");
     let index = role as usize;
-    if let Some(statement) = aggregate.by_role[index].get_mut(sql) {
+    if sql.is_empty() {
+        aggregate.internal_rows[index] += 1;
+    } else if let Some(statement) = aggregate.by_role[index].get_mut(sql) {
         statement.decoded_rows = statement
             .decoded_rows
             .checked_add(1)
             .expect("statement decoded row count fits u64");
     } else if aggregate.distinct < STATEMENT_CAP {
+        assert!(!sql.is_empty(), "profiled statements must have SQL");
         aggregate.distinct += 1;
         aggregate.by_role[index].insert(
             sql.to_string(),
@@ -963,6 +1058,7 @@ fn record(
     reprepares: i32,
     rows: u64,
 ) {
+    assert!(!sql.is_empty(), "profiled statements must have SQL");
     let profile = profile().expect("SQL profile hook installed without a profile");
     let nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
     let mut aggregate = profile
@@ -1109,16 +1205,20 @@ fn render(profile: &Profile) -> Option<String> {
         return None;
     }
     aggregate.dirty = false;
-    let mut dump = serde_json::json!({
-        "kind": "header",
-        "pid": std::process::id(),
-        "statement_cap": STATEMENT_CAP,
-        "expanded_sample_cap_bytes": EXPANDED_SAMPLE_CAP_BYTES,
-        "distinct_statements": aggregate.distinct,
-        "decoded_rows": aggregate.decoded_rows,
-        "flush_interval_ms": FLUSH_INTERVAL.as_millis(),
-    })
-    .to_string();
+    let mut dump = profile_header().to_string();
+    dump.push('\n');
+    dump.push_str(
+        &serde_json::json!({
+            "kind": "header",
+            "pid": std::process::id(),
+            "statement_cap": STATEMENT_CAP,
+            "expanded_sample_cap_bytes": EXPANDED_SAMPLE_CAP_BYTES,
+            "distinct_statements": aggregate.distinct,
+            "decoded_rows": aggregate.decoded_rows,
+            "flush_interval_ms": FLUSH_INTERVAL.as_millis(),
+        })
+        .to_string(),
+    );
     dump.push('\n');
     for (role, statements) in ConnectionRole::ALL.iter().zip(aggregate.by_role.iter()) {
         for (sql, statement) in statements {
@@ -1144,6 +1244,10 @@ fn render(profile: &Profile) -> Option<String> {
             );
             dump.push('\n');
         }
+    }
+    for internal in internal_row_records(&aggregate.internal_rows) {
+        dump.push_str(&internal.to_string());
+        dump.push('\n');
     }
     if let Some((role, sql)) = &aggregate.overflow.first {
         dump.push_str(
@@ -1305,6 +1409,67 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#12610: trigger profiling retained unmatched outer SQL buffers across requests")]
+    fn profile_trigger_events_do_not_retain_outer_sql() {
+        const CHILD: &str = "BIFROST_SQL_TRIGGER_MEMORY_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cache_db::sql_profile::tests::profile_trigger_events_do_not_retain_outer_sql",
+                    "--test-threads",
+                    "1",
+                ])
+                .env(CHILD, "1")
+                .env_remove(PROFILE_PATH_ENV)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "fixture failed: {output:?}");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            TEST_PROFILE
+                .set(Profile::new(dir.path().join("sql.jsonl")))
+                .is_ok()
+        );
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t(v); CREATE TABLE audit(v);
+            CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO audit VALUES(new.v); END;
+            CREATE TRIGGER audit_tr AFTER INSERT ON audit BEGIN SELECT new.v; END;",
+        )
+        .unwrap();
+        install(&conn, ConnectionRole::Ephemeral);
+        let sql = format!("INSERT INTO t VALUES(?1) /*{}*/", "x".repeat(65536));
+        for value in 0..10 {
+            conn.execute(&sql, [value]).unwrap();
+        }
+        ACTIVE_STATEMENTS.with(|active| {
+            let active = active.borrow();
+            let bytes = active.capacity() * std::mem::size_of::<ActiveStatement>();
+            assert!(
+                active.is_empty(),
+                "unmatched active statements={}, retained frame capacity bytes={bytes}",
+                active.len()
+            );
+        });
+        // A primary statement can itself begin with a comment. Distinguish
+        // executions by SQLite's pointer, not by an event-text prefix.
+        let commented = "-- ordinary SQL comment\nSELECT count(*) FROM audit";
+        assert_eq!(
+            conn.query_row(commented, [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            10
+        );
+        let aggregate = profile().unwrap().aggregate.lock().unwrap();
+        assert_eq!(
+            aggregate.by_role[ConnectionRole::Ephemeral as usize][commented].rows,
+            1
+        );
+    }
+
+    #[test]
     #[hardwon("#9755: trigger callbacks were reported as repeated outer statements")]
     fn trigger_statement_listener_uses_event_sql() {
         let conn = Connection::open_in_memory().unwrap();
@@ -1409,6 +1574,137 @@ mod tests {
         assert!(!tags().lock().unwrap().contains_key(&address));
     }
 
+    #[test]
+    #[hardwon("#12067: internal schema rows rendered as statements with empty SQL")]
+    fn profile_internal_rows_reconcile_with_requests_and_totals() {
+        // The collector and request scope are process-global. Isolate the fixture
+        // from concurrently running tests that also install the dispatcher.
+        const CHILD: &str = "BIFROST_SQL_INTERNAL_ROWS_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "cache_db::sql_profile::tests::profile_internal_rows_reconcile_with_requests_and_totals", "--test-threads", "8"])
+                .env(CHILD, "1")
+                .env_remove(PROFILE_PATH_ENV)
+                .output().unwrap();
+            assert!(output.status.success(), "fixture failed: {output:?}");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("existing.sqlite");
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE original(value); INSERT INTO original VALUES(1),(2); ANALYZE;",
+            )
+            .unwrap();
+        let dump_path = dir.path().join("sql.jsonl");
+        assert!(TEST_PROFILE.set(Profile::new(dump_path.clone())).is_ok());
+        let mut expected_by_role = [0_u64; ConnectionRole::ALL.len()];
+        let mut expected_internal_by_role = [0_u64; ConnectionRole::ALL.len()];
+        for role in [
+            ConnectionRole::Writer,
+            ConnectionRole::Reader,
+            ConnectionRole::SessionReader,
+        ] {
+            let before = totals_with_rows().unwrap().1;
+            let scope = request_scope(role.as_str());
+            let conn = Connection::open(&db).unwrap();
+            install(&conn, role);
+            // Opening does not read the existing schema until preparation.
+            let rows: i64 = conn
+                .query_row("SELECT count(*) FROM original", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(rows, 2);
+            conn.execute_batch("ANALYZE;").unwrap();
+            conn.execute_batch("CREATE TABLE added(value);").unwrap();
+            conn.execute_batch("DROP TABLE added;").unwrap();
+            drop(conn);
+            drop(scope);
+            expected_by_role[role as usize] = totals_with_rows().unwrap().1 - before;
+        }
+        let requests: Vec<serde_json::Value> =
+            std::fs::read_to_string(dump_path.with_extension("requests.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        assert_eq!(requests[0], profile_header());
+        assert_eq!(requests.len(), 4);
+        for request in &requests[1..] {
+            let role = ConnectionRole::ALL
+                .iter()
+                .find(|role| role.as_str() == request["tool"].as_str().unwrap())
+                .unwrap();
+            let statements = request["statements"].as_array().unwrap();
+            assert!(statements.iter().all(|row| row["kind"] == "statement"
+                && !row["sql"].as_str().unwrap().is_empty()
+                && row["role"] == role.as_str()));
+            let internal = request["sqlite_internal_rows"].as_array().unwrap();
+            assert_eq!(internal.len(), 1);
+            let row = &internal[0];
+            assert_eq!(row["role"], role.as_str());
+            assert_eq!(row["kind"], "sqlite_internal_rows");
+            assert_eq!(row["reason"], "sqlite_schema_or_statistics_statement");
+            assert_eq!(row.as_object().unwrap().len(), 4);
+            let internal_count = row["decoded_rows"].as_u64().unwrap();
+            assert!(internal_count > 0);
+            expected_internal_by_role[*role as usize] = internal_count;
+            let statement_count = statements
+                .iter()
+                .map(|row| row["decoded_rows"].as_u64().unwrap())
+                .sum::<u64>();
+            assert_eq!(
+                statement_count + internal_count,
+                expected_by_role[*role as usize],
+                "request partition: {request}"
+            );
+            // Nested internal rows remain attributed to the active application
+            // statement's execution rows, independently of the ROW partition.
+            let create = statements
+                .iter()
+                .find(|row| row["sql"] == "CREATE TABLE added(value);")
+                .unwrap();
+            assert!(create["rows"].as_u64().unwrap() > create["decoded_rows"].as_u64().unwrap());
+        }
+        flush();
+        let dump: Vec<serde_json::Value> = std::fs::read_to_string(dump_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(dump[0], profile_header());
+        assert!(
+            dump.iter()
+                .filter(|row| row["kind"] == "statement")
+                .all(|row| !row["sql"].as_str().unwrap().is_empty())
+        );
+        let mut actual_by_role = [0_u64; ConnectionRole::ALL.len()];
+        for row in &dump {
+            if row["kind"] == "statement" || row["kind"] == "sqlite_internal_rows" {
+                let role = ConnectionRole::ALL
+                    .iter()
+                    .find(|role| row["role"] == role.as_str())
+                    .unwrap();
+                actual_by_role[*role as usize] += row["decoded_rows"].as_u64().unwrap();
+                if row["kind"] == "sqlite_internal_rows" {
+                    assert_eq!(
+                        row,
+                        &internal_row_records(&expected_internal_by_role)
+                            .into_iter()
+                            .find(|entry| entry["role"] == role.as_str())
+                            .unwrap()
+                    );
+                }
+            }
+        }
+        assert_eq!(actual_by_role, expected_by_role);
+        assert_eq!(
+            actual_by_role.iter().sum::<u64>(),
+            totals_with_rows().unwrap().1
+        );
+        assert_eq!(dump[1]["decoded_rows"], actual_by_role.iter().sum::<u64>());
+    }
+
     /// The hook exists or it does not: a connection opened while
     /// [`PROFILE_PATH_ENV`] is unset carries no hook for the rest of its life,
     /// and one opened afterwards records every execution of its statements.
@@ -1475,8 +1771,9 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).expect("profile dump line"))
             .collect();
-        assert_eq!(lines[0]["kind"], "header", "dump lines: {lines:?}");
-        assert!(lines[0]["decoded_rows"].as_u64().is_some());
+        assert_eq!(lines[0], profile_header(), "dump lines: {lines:?}");
+        assert_eq!(lines[1]["kind"], "header");
+        assert!(lines[1]["decoded_rows"].as_u64().is_some());
         let statements: Vec<&serde_json::Value> = lines
             .iter()
             .filter(|line| line["kind"] == "statement")
@@ -1492,8 +1789,14 @@ mod tests {
                 line["decoded_rows"].as_u64().expect("overflow row total")
             });
         assert_eq!(
-            statement_rows + overflow_rows,
-            lines[0]["decoded_rows"].as_u64().expect("global row total"),
+            statement_rows
+                + overflow_rows
+                + lines
+                    .iter()
+                    .filter(|line| line["kind"] == "sqlite_internal_rows")
+                    .map(|line| line["decoded_rows"].as_u64().unwrap())
+                    .sum::<u64>(),
+            lines[1]["decoded_rows"].as_u64().expect("global row total"),
             "statement row totals partition the global total: {lines:?}"
         );
         assert!(

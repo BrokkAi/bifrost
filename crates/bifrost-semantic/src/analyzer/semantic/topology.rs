@@ -35,6 +35,21 @@ impl DependencyScope {
         "unknown",
     ];
 
+    /// The scope a [`Self::label`] names.
+    pub fn from_label(label: &str) -> Option<Self> {
+        [
+            Self::Compile,
+            Self::Runtime,
+            Self::Test,
+            Self::Provided,
+            Self::Optional,
+            Self::FeatureGated,
+            Self::Unknown,
+        ]
+        .into_iter()
+        .find(|scope| scope.label() == label)
+    }
+
     pub const fn label(self) -> &'static str {
         match self {
             Self::Compile => "compile",

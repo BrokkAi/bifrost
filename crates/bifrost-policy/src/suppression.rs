@@ -230,6 +230,10 @@ pub struct PolicySuppressionRecord {
 }
 
 impl PolicySuppressionRecord {
+    pub(crate) fn candidate_matches(&self, finding: &crate::PolicyFinding) -> bool {
+        self.policy_id() == finding.policy_id() && self.finding_id() == finding.id()
+    }
+
     pub const fn policy_id(&self) -> &PolicyId {
         &self.policy_id
     }
@@ -515,6 +519,8 @@ impl RetainedSize for PolicySuppressionSourceState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PolicyReportEvaluationContext {
     evaluation_date: PolicyEvaluationDate,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    budget: Option<super::budget::PolicyBudgetTelemetry>,
     suppression_sources: Box<[PolicySuppressionSourceState]>,
     scope_path: Box<str>,
     scope_document_state: PolicyScopeDocumentState,
@@ -533,11 +539,33 @@ impl PolicyReportEvaluationContext {
     ) -> Self {
         Self {
             evaluation_date,
+            budget: None,
             suppression_sources: suppression_sources.into_boxed_slice(),
             scope_path: scope.source().relative_path().into(),
             scope_document_state,
             builtin_selection: None,
         }
+    }
+
+    pub(crate) fn with_budget(mut self, budget: super::budget::PolicyBudgetTelemetry) -> Self {
+        self.budget = Some(budget);
+        self
+    }
+
+    pub(crate) fn record_batch_deadline_refusal(&mut self) {
+        if let Some(budget) = &mut self.budget {
+            budget.batch_refusals.deadline = true;
+        }
+    }
+
+    pub(crate) fn record_batch_report_byte_refusal(&mut self) {
+        if let Some(budget) = &mut self.budget {
+            budget.batch_refusals.report_bytes = true;
+        }
+    }
+
+    pub fn budget(&self) -> Option<&super::budget::PolicyBudgetTelemetry> {
+        self.budget.as_ref()
     }
 
     pub(crate) fn with_builtin_selection(
@@ -737,6 +765,9 @@ pub struct PolicySuppressionReview {
     policy_hash_state: PolicySuppressionPolicyHashState,
     orphan_state: PolicySuppressionOrphanState,
     applied: bool,
+    /// As of schema 20, at least one member of the (policy_id, finding_id)
+    /// group was omitted. Under 19 every group was a singleton, so both
+    /// meanings agree.
     result_omitted: bool,
     /// Unclaimed identities this run found for the same policy in the record's
     /// own file. On an orphan caused by rotation these are the identities the
@@ -967,6 +998,15 @@ pub(crate) fn load_policy_suppressions_from_root(
     root: &WorkspaceRoot,
     options: &PolicySuppressionOptions,
 ) -> PolicySuppressionLoadOutcome {
+    load_policy_suppressions_with(options, |path| {
+        load_one_policy_suppression_document(root, path)
+    })
+}
+
+pub(crate) fn load_policy_suppressions_with(
+    options: &PolicySuppressionOptions,
+    mut load: impl FnMut(&str) -> Result<Option<PolicySuppressionDocument>, PolicySuppressionLoadError>,
+) -> PolicySuppressionLoadOutcome {
     let mut outcome = PolicySuppressionLoadOutcome::default();
     // Which source claimed each identity, so a collision can name both files.
     let mut claimed: HashMap<(PolicyId, PolicyFindingId), (usize, PolicySuppressionRecord)> =
@@ -974,7 +1014,7 @@ pub(crate) fn load_policy_suppressions_from_root(
     let mut order = Vec::new();
 
     for relative_path in options.source.relative_paths() {
-        let (state, loaded) = match load_one_policy_suppression_document(root, relative_path) {
+        let (state, loaded) = match load(relative_path) {
             Ok(Some(document)) => (PolicySuppressionDocumentState::Loaded, Some(document)),
             Ok(None) => (PolicySuppressionDocumentState::NotFound, None),
             Err(error) => {
@@ -1307,6 +1347,7 @@ impl RetainedSize for PolicyReportEvaluationContext {
             }))
             .saturating_add(self.scope_path.len())
             .saturating_add(retained_extra(&self.builtin_selection))
+            .saturating_add(retained_extra(&self.budget))
     }
 }
 

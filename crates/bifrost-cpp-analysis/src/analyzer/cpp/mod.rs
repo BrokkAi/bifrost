@@ -526,10 +526,19 @@ impl CppAnalyzer {
         let key = (procedure.artifact().materialization_id(), procedure.id());
         self.cached_complete_read(&self.c_assignment_candidates_by_procedure, &key, || {
             let value = expression_branch_facts::build_c_assignment_candidates(
-                workspace, procedure, cancellation,
+                workspace,
+                procedure,
+                cancellation,
             );
-            if value.reason.is_some_and(|reason| brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause::from_reason(reason).is_some()) {
-                self.mark_execution_dependent();
+            // The candidates carry their verdict by their stop reason. The fill
+            // runs inside the cache's capture, so the verdict joins it beside
+            // the ambient mark.
+            if !brokk_bifrost_analysis::analyzer::reuse_verdict::CarriesReuseVerdict::reuse_verdict(
+                &value,
+            )
+            .is_content()
+            {
+                brokk_bifrost_analysis::analyzer::i_analyzer::join_execution_dependence(self);
             }
             value
         })
@@ -557,10 +566,16 @@ impl CppAnalyzer {
                                         procedure,
                                         cancellation,
                                     );
-                                if value.reason.is_some_and(|reason| {
-                                    brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause::from_reason(reason).is_some()
-                                }) {
-                                    self.mark_execution_dependent();
+                                // The candidates carry their verdict by their
+                                // stop reason. The fill runs inside the cache's
+                                // capture, so the verdict joins it beside the
+                                // ambient mark.
+                                if !expression_branch_facts::candidate_reason_reuse_verdict(
+                                    value.reason,
+                                )
+                                .is_content()
+                                {
+                                    brokk_bifrost_analysis::analyzer::i_analyzer::join_execution_dependence(self);
                                 }
                                 scope.read_completion().map(|()| Arc::new(value))
                             },
@@ -574,15 +589,17 @@ impl CppAnalyzer {
             |_| AuthorityInputs::SourceOf(&[Language::Cpp]),
         ) {
             Ok(value) => value,
-            Err(attempt) => match attempt.as_ref() {
-                Ok(value) => Arc::clone(value),
-                Err(reason) => {
-                    self.record_query_incomplete(reason.clone());
-                    Arc::new(OverwrittenLocalCandidates {
+            Err(attempt) => {
+                match attempt.as_ref() {
+                    Ok(value) => Arc::clone(value),
+                    Err(reason) => {
+                        self.record_query_incomplete(reason.clone());
+                        Arc::new(OverwrittenLocalCandidates {
                         rows: Vec::new(), complete: false, reason: Some(brokk_bifrost_analysis::analyzer::read_ledger::reason::QUERY_INCOMPLETE),
                     })
+                    }
                 }
-            },
+            }
         }
     }
 
@@ -751,14 +768,29 @@ impl CppAnalyzer {
         file: &ProjectFile,
     ) -> Arc<Vec<ObjectMacroFieldEvent>> {
         self.cached_complete_read(&self.object_macro_field_events_by_file, file, || {
-            let Some((_, prepared)) = self
-                .inner
-                .prepared_syntax_limited(token, file, usize::MAX)
-                .expect("an unbounded syntax read cannot exceed its source limit")
-            else {
-                self.record_query_incomplete(
-                    brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadIncomplete::StructureUnavailable(file.clone()),
+            let (prepared, cause) =
+                brokk_bifrost_analysis::analyzer::i_analyzer::capture_read_execution_cause(
+                    self,
+                    || {
+                        self.inner
+                            .prepared_syntax_limited(token, file, usize::MAX)
+                            .expect("an unbounded syntax read cannot exceed its source limit")
+                    },
                 );
+            let Some((_, prepared)) = prepared else {
+                self.record_query_incomplete(match cause {
+                    Some(cause) => {
+                        brokk_bifrost_analysis::analyzer::QueryReadIncomplete::ProofStopped {
+                            reason: "cpp_source_unavailable",
+                            cause: Some(cause),
+                        }
+                    }
+                    None => {
+                        brokk_bifrost_analysis::analyzer::QueryReadIncomplete::StructureUnavailable(
+                            file.clone(),
+                        )
+                    }
+                });
                 return Vec::new();
             };
             collect_cpp_object_macro_field_events(prepared.tree().root_node(), prepared.source())
@@ -1611,11 +1643,25 @@ impl CppAnalyzer {
         token: QueryToken<'_>,
         file: &ProjectFile,
     ) -> Option<Arc<brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree>> {
-        let prepared = self.inner.prepared_syntax(token, file);
-        if prepared.is_none() {
-            self.inner.record_query_incomplete(
-                brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadIncomplete::StructureUnavailable(file.clone()),
+        let (prepared, cause) =
+            brokk_bifrost_analysis::analyzer::i_analyzer::capture_read_execution_cause(
+                self,
+                || self.inner.prepared_syntax(token, file),
             );
+        if prepared.is_none() {
+            self.inner.record_query_incomplete(match cause {
+                Some(cause) => {
+                    brokk_bifrost_analysis::analyzer::QueryReadIncomplete::ProofStopped {
+                        reason: "cpp_source_unavailable",
+                        cause: Some(cause),
+                    }
+                }
+                None => {
+                    brokk_bifrost_analysis::analyzer::QueryReadIncomplete::StructureUnavailable(
+                        file.clone(),
+                    )
+                }
+            });
         }
         prepared
     }
@@ -2328,11 +2374,25 @@ impl CppSource for CppAnalyzer {
     }
 
     fn file_source(&self, file: &ProjectFile) -> Option<String> {
-        let source = self.inner.file_source(file);
-        if source.is_none() {
-            self.record_query_incomplete(
-                brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadIncomplete::StructureUnavailable(file.clone()),
+        let (source, cause) =
+            brokk_bifrost_analysis::analyzer::i_analyzer::capture_read_execution_cause(
+                self,
+                || self.inner.file_source(file),
             );
+        if source.is_none() {
+            self.record_query_incomplete(match cause {
+                Some(cause) => {
+                    brokk_bifrost_analysis::analyzer::QueryReadIncomplete::ProofStopped {
+                        reason: "cpp_source_unavailable",
+                        cause: Some(cause),
+                    }
+                }
+                None => {
+                    brokk_bifrost_analysis::analyzer::QueryReadIncomplete::StructureUnavailable(
+                        file.clone(),
+                    )
+                }
+            });
         }
         source
     }
@@ -2589,6 +2649,11 @@ impl CodeUnitIndex for CppAnalyzer {
 
     brokk_bifrost_analysis::delegate_inner_methods! {
         fn indexed_source(&self, file: &ProjectFile) -> Option<String>;
+    }
+
+    brokk_bifrost_analysis::delegate_inner_methods! {
+        fn owns_source_file(&self, file: &ProjectFile) -> bool;
+        fn indexed_source_files(&self) -> brokk_bifrost_analysis::analyzer::QueryBatch<ProjectFile>;
     }
 
     brokk_bifrost_analysis::delegate_inner_methods! {
@@ -2916,6 +2981,7 @@ impl IAnalyzer for CppAnalyzer {
     fn statement_source_facts(
         &self,
         file: &ProjectFile,
+        _reuse: &mut brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict,
     ) -> Option<Arc<brokk_bifrost_core::analyzer::statement_facts::StatementFactRows>> {
         let source = self.file_source(file)?;
         Some(self.statement_facts_for(file, &source))
@@ -2948,6 +3014,13 @@ impl IAnalyzer for CppAnalyzer {
 
     brokk_bifrost_analysis::delegate_inner_methods! {
         fn active_query_cancellation(&self) -> Option<crate::CancellationToken>;
+    }
+
+    fn active_query_semantic_model_overlay_read(
+        &self,
+    ) -> Option<brokk_bifrost_analysis::analyzer::semantic_model::runtime::SemanticModelOverlayRead>
+    {
+        self.inner.active_query_semantic_model_overlay_read()
     }
 
     fn active_query_semantic_model_overlay(
@@ -3320,11 +3393,8 @@ impl IAnalyzer for CppAnalyzer {
     }
 
     brokk_bifrost_analysis::delegate_inner_methods! {
-        fn record_query_failure(&self, error: brokk_bifrost_analysis::analyzer::store::StoreError);
-    }
-
-    brokk_bifrost_analysis::delegate_inner_methods! {
         fn workspace_file_index_cell(&self) -> Option<brokk_bifrost_analysis::analyzer::WorkspaceFileIndexCell>;
+        fn workspace_file_inventory_cell(&self) -> Option<brokk_bifrost_analysis::analyzer::WorkspaceFileInventoryCell>;
     }
 
     brokk_bifrost_analysis::delegate_inner_methods! {
@@ -3476,6 +3546,13 @@ impl IAnalyzer for CppAnalyzer {
     ) -> Vec<&dyn brokk_bifrost_analysis::analyzer::structural::StructuralFactProvider>;
     }
 
+    fn generation_membership(
+        &self,
+    ) -> &Arc<brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::GenerationWorkspaceMembership>
+    {
+        IAnalyzer::generation_membership(&self.inner)
+    }
+
     fn snapshot_caches(
         &self,
     ) -> Option<&brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerSnapshotCaches> {
@@ -3498,7 +3575,10 @@ impl IAnalyzer for CppAnalyzer {
         fn contains_tests(&self, file: &ProjectFile) -> bool;
     }
 
-    fn in_test_region(&self, code_unit: &brokk_bifrost_core::analyzer::model::CodeUnit) -> bool {
+    fn in_test_region(
+        &self,
+        code_unit: &brokk_bifrost_core::analyzer::model::CodeUnit,
+    ) -> Result<bool, brokk_bifrost_analysis::analyzer::QueryReadIncomplete> {
         self.inner.in_test_region(code_unit)
     }
 
@@ -3665,6 +3745,13 @@ fn cpp_spelled_member_identifier<'a>(
 pub struct CppSupport;
 
 impl LanguageSupport for CppSupport {
+    /// C++ adopts a file no language owns when an include names it (#1837), so
+    /// an omitted file of that kind could be C++ source: the same rule as
+    /// `ProjectFile::has_unclaimed_extension` and `claims_included_files`.
+    fn is_listing_path(&self, path: &std::path::Path) -> bool {
+        Language::from_path(path) == Language::Cpp || Language::path_is_unclaimed(path)
+    }
+
     fn branch_current_object_fields(
         &self,
     ) -> Option<
@@ -4018,6 +4105,7 @@ impl LanguageSupport for CppSupport {
         _token: brokk_bifrost_core::analyzer::query_token::QueryToken<'_>,
         file: &brokk_bifrost_core::analyzer::model::ProjectFile,
         name: &str,
+        _reuse: &mut brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict,
     ) -> Option<(
         brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus,
         Option<String>,
@@ -4030,7 +4118,10 @@ impl LanguageSupport for CppSupport {
                 .map(|cpp| {
                     crate::analyzer::cpp::external::external_boundary_evidence(
                         cpp,
-                        analyzer.semantic_model_overlay().as_deref(),
+                        analyzer
+                            .semantic_model_overlay_read()
+                            .published()
+                            .as_deref(),
                         file,
                         name,
                     )
@@ -4398,6 +4489,8 @@ impl brokk_bifrost_analysis::analyzer::multi_analyzer::LanguageAnalyzer for CppA
     ) -> Box<dyn brokk_bifrost_analysis::analyzer::multi_analyzer::LanguageAnalyzer> {
         Box::new(CppAnalyzer::update_all_with_progress(self, progress))
     }
+
+    brokk_bifrost_analysis::delegate_generation_membership_updates!(CppAnalyzer);
 
     fn as_any(&self) -> &dyn std::any::Any {
         self

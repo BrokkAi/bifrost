@@ -24,6 +24,62 @@ use brokk_bifrost_semantic::analyzer::semantic::read_ledger::{
     StoredSemanticIrParseVariant, StoredSemanticIrPublicationQuestion,
 };
 
+/// Decode every member before an unsupported receipt can become a miss.
+/// Stored canonical digests also let owners validate their enclosing content
+/// without inventing a structured key for vocabulary this reader cannot know.
+#[derive(Default)]
+pub(super) struct ReadKeyBatch {
+    keys: Vec<ReadKey>,
+    digests: Vec<StableDigest>,
+    seen: crate::hash::HashSet<[u8; 32]>,
+    unsupported: Vec<String>,
+}
+
+impl ReadKeyBatch {
+    pub(super) fn len(&self) -> usize {
+        self.digests.len()
+    }
+
+    pub(super) fn push(&mut self, row: &rusqlite::Row<'_>) -> Result<()> {
+        let key = match decode_read_key(row) {
+            Ok(key) => Some(key),
+            Err(error) if error.is_unsupported_read_key() => {
+                self.unsupported.push(error.to_string());
+                None
+            }
+            Err(error) => return Err(error),
+        };
+        let raw: Vec<u8> = row.get(0)?;
+        let digest = decode_digest(&raw, "read key")?;
+        if !self.seen.insert(*digest.as_bytes()) {
+            return Err(StoreError::corrupt(
+                "stored reads duplicate a canonical key",
+            ));
+        }
+        self.digests.push(digest);
+        if let Some(key) = key {
+            self.keys.push(key);
+        }
+        Ok(())
+    }
+
+    /// The owner validates the remaining product before support is decided.
+    /// A product built with only the known keys never escapes this boundary.
+    pub(super) fn finish_with<T>(
+        self,
+        validate: impl FnOnce(Vec<ReadKey>, &[StableDigest]) -> Result<T>,
+    ) -> Result<T> {
+        let product = validate(self.keys, &self.digests)?;
+        if !self.unsupported.is_empty() {
+            return Err(StoreError::unsupported_read_key(format!(
+                "unsupported stored read evidence: {:?}",
+                self.unsupported
+            )));
+        }
+        Ok(product)
+    }
+}
+
 /// The normalized column values for one [`ReadKey`].
 ///
 /// Clients persist these fields in this order and select them in the order
@@ -58,6 +114,11 @@ pub(super) struct ReadKeyColumns {
     pub(super) copy_census_version: Option<i64>,
     pub(super) copy_config_digest: Option<Vec<u8>>,
     pub(super) copy_producer_digest: Option<Vec<u8>>,
+    pub(super) drop_owning_unit: Option<Vec<u8>>,
+    pub(super) drop_module_path: Option<String>,
+    pub(super) drop_identity_digest: Option<Vec<u8>>,
+    pub(super) drop_config_digest: Option<Vec<u8>>,
+    pub(super) drop_proof_version: Option<i64>,
     pub(super) parse_variant_kind: Option<&'static str>,
     pub(super) parse_variant_digest: Option<Vec<u8>>,
 }
@@ -101,6 +162,11 @@ impl ReadKeyColumns {
             copy_census_version: None,
             copy_config_digest: None,
             copy_producer_digest: None,
+            drop_owning_unit: None,
+            drop_module_path: None,
+            drop_identity_digest: None,
+            drop_config_digest: None,
+            drop_proof_version: None,
             parse_variant_kind: None,
             parse_variant_digest: None,
         };
@@ -172,6 +238,49 @@ impl ReadKeyColumns {
                         columns.subject = question.subject.map(|subject| subject.to_vec());
                         columns.rel_path = question.rel_path.as_deref().map(str::to_owned);
                         columns.name = question.name.as_deref().map(str::to_owned);
+                    }
+                    LookupQuestion::RustDropSubject {
+                        rel_path,
+                        blob,
+                        start_byte,
+                        end_byte,
+                    } => {
+                        columns.rel_path = Some(rel_path.to_string());
+                        columns.blob_oid =
+                            Some(Oid::from_bytes(blob).expect("fixed-width OID").to_string());
+                        columns.start_byte = Some(*start_byte as i64);
+                        columns.end_byte = Some(*end_byte as i64);
+                    }
+                    LookupQuestion::RustDropInventory {
+                        rel_path,
+                        blob,
+                        start_byte,
+                        end_byte,
+                        owning_unit,
+                        module_path,
+                        identity_digest,
+                        config_digest,
+                        proof_version,
+                    } => {
+                        columns.rel_path = Some(rel_path.to_string());
+                        columns.blob_oid =
+                            Some(Oid::from_bytes(blob).expect("fixed-width OID").to_string());
+                        columns.start_byte = Some(*start_byte as i64);
+                        columns.end_byte = Some(*end_byte as i64);
+                        columns.drop_owning_unit = Some(owning_unit.as_bytes().to_vec());
+                        columns.drop_module_path = Some(module_path.to_string());
+                        columns.drop_identity_digest = Some(identity_digest.as_bytes().to_vec());
+                        columns.drop_config_digest = Some(config_digest.as_bytes().to_vec());
+                        columns.drop_proof_version = Some(i64::from(*proof_version));
+                    }
+                    LookupQuestion::RustMacroInvocations {
+                        unit_key,
+                        module_path,
+                        macro_name,
+                    } => {
+                        columns.subject = Some(unit_key.as_bytes().to_vec());
+                        columns.rel_path = Some(module_path.to_string());
+                        columns.name = Some(macro_name.to_string());
                     }
                     LookupQuestion::RustCopyAbsence {
                         owning_unit,
@@ -264,6 +373,18 @@ impl ReadKeyColumns {
                         if *kind == LookupKind::ProcedureDispatch {
                             columns.site_ordinal = Some(site.ordinal as i64);
                         }
+                    }
+                    LookupQuestion::ReceiverCallSite {
+                        rel_path,
+                        procedure,
+                        site,
+                        receiver_class,
+                    } => {
+                        columns.rel_path = Some(rel_path.to_string());
+                        columns.subject = Some(procedure.as_bytes().to_vec());
+                        columns.start_byte = Some(site.ordinal as i64);
+                        columns.end_byte = Some(site.ordinal as i64);
+                        columns.name = Some(receiver_class.to_string());
                     }
                     LookupQuestion::WorkspaceFact {
                         family,
@@ -372,11 +493,51 @@ pub(super) fn decode_read_key(row: &rusqlite::Row<'_>) -> Result<ReadKey> {
         .then(|| row.get::<_, Option<i64>>(28))
         .transpose()?
         .flatten();
-    let is_role_name =
-        kind == "lookup" && family.as_deref() == Some("structural_role_name_inventory");
-    if !is_role_name && (structural_role.is_some() || structural_keyword.is_some()) {
+    let drop_owning_unit = row
+        .as_ref()
+        .column_index("drop_owning_unit")
+        .ok()
+        .map(|index| row.get::<_, Option<Vec<u8>>>(index))
+        .transpose()?
+        .flatten();
+    let drop_module_path = row
+        .as_ref()
+        .column_index("drop_module_path")
+        .ok()
+        .map(|index| row.get::<_, Option<String>>(index))
+        .transpose()?
+        .flatten();
+    let drop_identity_digest = row
+        .as_ref()
+        .column_index("drop_identity_digest")
+        .ok()
+        .map(|index| row.get::<_, Option<Vec<u8>>>(index))
+        .transpose()?
+        .flatten();
+    let drop_config_digest = row
+        .as_ref()
+        .column_index("drop_config_digest")
+        .ok()
+        .map(|index| row.get::<_, Option<Vec<u8>>>(index))
+        .transpose()?
+        .flatten();
+    let drop_proof_version = row
+        .as_ref()
+        .column_index("drop_proof_version")
+        .ok()
+        .map(|index| row.get::<_, Option<i64>>(index))
+        .transpose()?
+        .flatten();
+    let is_drop = kind == "lookup" && family.as_deref() == Some("rust_drop_inventory");
+    if !is_drop
+        && (drop_owning_unit.is_some()
+            || drop_module_path.is_some()
+            || drop_identity_digest.is_some()
+            || drop_config_digest.is_some()
+            || drop_proof_version.is_some())
+    {
         return Err(StoreError::corrupt(
-            "structural role columns on another read kind",
+            "Rust Drop columns on another read kind",
         ));
     }
     let index_key = row.get::<_, Option<Vec<u8>>>(6)?;
@@ -432,6 +593,103 @@ pub(super) fn decode_read_key(row: &rusqlite::Row<'_>) -> Result<ReadKey> {
         .then(|| row.get::<_, Option<Vec<u8>>>(26))
         .transpose()?
         .flatten();
+    // Even an unsupported future vocabulary must have well-typed SQL columns
+    // and fixed-width digests. Do not mistake damaged rows for a cache miss.
+    decode_digest(&key_digest, "read key")?;
+    for (bytes, field) in [
+        (digest.as_deref(), "answer"),
+        (subject.as_deref(), "subject"),
+        (copy_owning_unit.as_deref(), "Copy owning unit"),
+        (copy_target_unit.as_deref(), "Copy target unit"),
+        (
+            copy_target_identity_digest.as_deref(),
+            "Copy target identity",
+        ),
+        (copy_config_digest.as_deref(), "Copy configuration"),
+        (copy_producer_digest.as_deref(), "Copy producer"),
+        (parse_variant_digest.as_deref(), "parse variant"),
+    ] {
+        if let Some(bytes) = bytes {
+            decode_digest(bytes, field)?;
+        }
+    }
+    let missing = |column: &str| StoreError::new(format!("read key `{kind}` has no {column}"));
+    // These requirements belong to the known outer kind, independently of
+    // any inner family or language vocabulary a newer writer may introduce.
+    match kind.as_str() {
+        "file" => {
+            rel_path.as_ref().ok_or_else(|| missing("path"))?;
+            decode_oid(blob_oid.as_deref().ok_or_else(|| missing("blob"))?)?;
+            languages.as_ref().ok_or_else(|| missing("language"))?;
+        }
+        "path_absent" => {
+            rel_path.as_ref().ok_or_else(|| missing("path"))?;
+            languages.as_ref().ok_or_else(|| missing("language"))?;
+        }
+        "index" => {
+            family.as_ref().ok_or_else(|| missing("family"))?;
+            index_key.as_ref().ok_or_else(|| missing("key"))?;
+        }
+        "artifact" => {
+            family.as_ref().ok_or_else(|| missing("kind"))?;
+            subject.as_ref().ok_or_else(|| missing("fingerprint"))?;
+        }
+        "scope" => {
+            languages.as_ref().ok_or_else(|| missing("languages"))?;
+            digest.as_ref().ok_or_else(|| missing("identity"))?;
+        }
+        "lookup" => {
+            family.as_ref().ok_or_else(|| missing("kind"))?;
+            digest.as_ref().ok_or_else(|| missing("digest"))?;
+        }
+        _ => {}
+    }
+    // Decide vocabulary support before inspecting a known family's shape:
+    // a future format may legitimately use today's unrelated columns.
+    let lookup_kind = match kind.as_str() {
+        "lookup" => {
+            let label = family.as_deref().ok_or_else(|| missing("kind"))?;
+            Some(
+                if let Some(registered) = PersistedDerivationFamily::of(label) {
+                    LookupKind::Derivation(registered.id)
+                } else {
+                    lookup_kind_of(label)?
+                },
+            )
+        }
+        "index" => {
+            index_family_of(family.as_deref().ok_or_else(|| missing("family"))?)?;
+            None
+        }
+        "artifact" => {
+            artifact_kind_of(family.as_deref().ok_or_else(|| missing("kind"))?)?;
+            None
+        }
+        "file" | "path_absent" | "scope" | "models" | "policy" | "configuration" | "epoch" => None,
+        other => {
+            return Err(StoreError::unsupported_read_key(format!(
+                "unknown read key kind `{other}`"
+            )));
+        }
+    };
+    if lookup_kind == Some(LookupKind::WorkspaceFact) {
+        let family = workspace_fact_family
+            .as_deref()
+            .ok_or_else(|| missing("workspace fact family"))?;
+        languages
+            .as_deref()
+            .ok_or_else(|| missing("workspace fact language"))?;
+        // These fields belong to the known envelope. A future family remains
+        // uninterpreted; a known family validates its subject before language.
+        workspace_fact_family_of(family)?;
+    }
+    let is_role_name =
+        kind == "lookup" && family.as_deref() == Some("structural_role_name_inventory");
+    if !is_role_name && (structural_role.is_some() || structural_keyword.is_some()) {
+        return Err(StoreError::corrupt(
+            "structural role columns on another read kind",
+        ));
+    }
     let is_publication =
         kind == "lookup" && family.as_deref() == Some("stored_semantic_ir_publication");
     if !is_publication && (parse_variant_kind.is_some() || parse_variant_digest.is_some()) {
@@ -471,7 +729,6 @@ pub(super) fn decode_read_key(row: &rusqlite::Row<'_>) -> Result<ReadKey> {
         ));
     }
 
-    let missing = |column: &str| StoreError::new(format!("read key `{kind}` has no {column}"));
     let key = match kind.as_str() {
         "file" => ReadKey::File {
             language: decode_language(languages.as_deref().ok_or_else(|| missing("language"))?)?,
@@ -495,12 +752,7 @@ pub(super) fn decode_read_key(row: &rusqlite::Row<'_>) -> Result<ReadKey> {
             key: Box::from(index_key.ok_or_else(|| missing("key"))?.as_slice()),
         },
         "lookup" => {
-            let label = family.as_deref().ok_or_else(|| missing("kind"))?;
-            let lookup_kind = if let Some(registered) = PersistedDerivationFamily::of(label) {
-                LookupKind::Derivation(registered.id)
-            } else {
-                lookup_kind_of(label)?
-            };
+            let lookup_kind = lookup_kind.expect("lookup vocabulary was checked");
             let question = if lookup_kind == LookupKind::StoredSemanticIrPublication {
                 if !matches!(rel_path.as_deref(), Some(path) if !path.is_empty())
                     || !matches!(languages.as_deref(), Some(language) if !language.is_empty() && !language.contains(','))
@@ -556,8 +808,8 @@ pub(super) fn decode_read_key(row: &rusqlite::Row<'_>) -> Result<ReadKey> {
                 return Err(StoreError::corrupt(
                     "certified definition keys have no persisted schema",
                 ));
-            } else if let LookupKind::Derivation(_) = lookup_kind {
-                let registered = PersistedDerivationFamily::of(label)
+            } else if let LookupKind::Derivation(id) = lookup_kind {
+                let registered = PersistedDerivationFamily::of(id.0)
                     .ok_or_else(|| StoreError::corrupt("unregistered derivation family"))?;
                 if languages.is_some() != registered.language
                     || subject.is_some() != registered.subject
@@ -631,6 +883,110 @@ pub(super) fn decode_read_key(row: &rusqlite::Row<'_>) -> Result<ReadKey> {
                         "external selection question",
                     )?
                     .as_bytes(),
+                }
+            } else if lookup_kind == LookupKind::RustDropSubject {
+                if languages.is_some()
+                    || name.is_some()
+                    || subject.is_some()
+                    || site_ordinal.is_some()
+                    || decl_kind.is_some()
+                    || decl_signature.is_some()
+                    || workspace_fact_family.is_some()
+                    || fact_member.is_some()
+                    || fact_names.is_some()
+                    || drop_owning_unit.is_some()
+                    || drop_module_path.is_some()
+                    || drop_identity_digest.is_some()
+                    || drop_config_digest.is_some()
+                    || drop_proof_version.is_some()
+                {
+                    return Err(StoreError::corrupt(
+                        "Rust Drop subject carries unrelated columns",
+                    ));
+                }
+                LookupQuestion::RustDropSubject {
+                    rel_path: rel_path
+                        .ok_or_else(|| missing("rel_path"))?
+                        .into_boxed_str(),
+                    blob: decode_oid(&blob_oid.ok_or_else(|| missing("blob"))?)?
+                        .as_bytes()
+                        .try_into()
+                        .expect("fixed-width OID"),
+                    start_byte: usize::try_from(start_byte.ok_or_else(|| missing("start_byte"))?)
+                        .map_err(|_| StoreError::corrupt("invalid Drop start byte"))?,
+                    end_byte: usize::try_from(end_byte.ok_or_else(|| missing("end_byte"))?)
+                        .map_err(|_| StoreError::corrupt("invalid Drop end byte"))?,
+                }
+            } else if lookup_kind == LookupKind::RustDropInventory {
+                if languages.is_some()
+                    || name.is_some()
+                    || subject.is_some()
+                    || site_ordinal.is_some()
+                    || decl_kind.is_some()
+                    || decl_signature.is_some()
+                    || workspace_fact_family.is_some()
+                    || fact_member.is_some()
+                    || fact_names.is_some()
+                {
+                    return Err(StoreError::corrupt(
+                        "Rust Drop question carries unrelated columns",
+                    ));
+                }
+                LookupQuestion::RustDropInventory {
+                    rel_path: rel_path
+                        .ok_or_else(|| missing("rel_path"))?
+                        .into_boxed_str(),
+                    blob: decode_oid(&blob_oid.ok_or_else(|| missing("blob"))?)?
+                        .as_bytes()
+                        .try_into()
+                        .expect("fixed-width OID"),
+                    start_byte: usize::try_from(start_byte.ok_or_else(|| missing("start_byte"))?)
+                        .map_err(|_| StoreError::corrupt("invalid Drop start byte"))?,
+                    end_byte: usize::try_from(end_byte.ok_or_else(|| missing("end_byte"))?)
+                        .map_err(|_| StoreError::corrupt("invalid Drop end byte"))?,
+                    owning_unit: decode_digest(
+                        &drop_owning_unit.ok_or_else(|| missing("drop_owning_unit"))?,
+                        "Drop owner",
+                    )?,
+                    module_path: drop_module_path
+                        .ok_or_else(|| missing("drop_module_path"))?
+                        .into_boxed_str(),
+                    identity_digest: decode_digest(
+                        &drop_identity_digest.ok_or_else(|| missing("drop_identity_digest"))?,
+                        "Drop identity",
+                    )?,
+                    config_digest: decode_digest(
+                        &drop_config_digest.ok_or_else(|| missing("drop_config_digest"))?,
+                        "Drop configuration",
+                    )?,
+                    proof_version: u32::try_from(
+                        drop_proof_version.ok_or_else(|| missing("drop_proof_version"))?,
+                    )
+                    .map_err(|_| StoreError::corrupt("invalid Drop proof version"))?,
+                }
+            } else if lookup_kind == LookupKind::RustMacroInvocations {
+                if languages.is_some()
+                    || index_key.is_some()
+                    || blob_oid.is_some()
+                    || start_byte.is_some()
+                    || end_byte.is_some()
+                    || site_ordinal.is_some()
+                    || decl_kind.is_some()
+                    || decl_signature.is_some()
+                {
+                    return Err(StoreError::corrupt(
+                        "Rust macro invocation question carries unrelated columns",
+                    ));
+                }
+                LookupQuestion::RustMacroInvocations {
+                    unit_key: decode_digest(
+                        &subject.ok_or_else(|| missing("subject"))?,
+                        "Rust macro unit",
+                    )?,
+                    module_path: rel_path
+                        .ok_or_else(|| missing("rel_path"))?
+                        .into_boxed_str(),
+                    macro_name: name.ok_or_else(|| missing("name"))?.into_boxed_str(),
                 }
             } else if lookup_kind == LookupKind::RustCopyAbsence {
                 if rel_path.is_some()
@@ -743,8 +1099,7 @@ pub(super) fn decode_read_key(row: &rusqlite::Row<'_>) -> Result<ReadKey> {
                         languages.as_deref().ok_or_else(|| {
                             StoreError::corrupt("missing workspace fact language")
                         })?,
-                    )
-                    .map_err(|error| StoreError::corrupt(error.to_string()))?,
+                    )?,
                     subject,
                 }
             } else {
@@ -754,8 +1109,8 @@ pub(super) fn decode_read_key(row: &rusqlite::Row<'_>) -> Result<ReadKey> {
                         | LookupKind::StructuralRoleNameInventory
                         | LookupKind::StructuralRecoveredInventory
                 ) {
-                    let language =
-                        decode_language(languages.as_deref().ok_or_else(|| missing("languages"))?)?;
+                    let language_label =
+                        languages.as_deref().ok_or_else(|| missing("languages"))?;
                     let authority = decode_digest(
                         &subject.ok_or_else(|| missing("subject"))?,
                         "structural authority",
@@ -778,13 +1133,12 @@ pub(super) fn decode_read_key(row: &rusqlite::Row<'_>) -> Result<ReadKey> {
                     }
                     match lookup_kind {
                         LookupKind::StructuralNameInventory => LookupQuestion::StructuralName {
-                            language,
                             name: name.ok_or_else(|| missing("name"))?.into(),
                             authority,
+                            language: decode_language(language_label)?,
                         },
                         LookupKind::StructuralRoleNameInventory => {
                             LookupQuestion::StructuralRoleName {
-                                language,
                                 role: Role::from_label(
                                     structural_role
                                         .as_deref()
@@ -804,6 +1158,7 @@ pub(super) fn decode_read_key(row: &rusqlite::Row<'_>) -> Result<ReadKey> {
                                     }
                                 },
                                 authority,
+                                language: decode_language(language_label)?,
                             }
                         }
                         LookupKind::StructuralRecoveredInventory => {
@@ -813,8 +1168,8 @@ pub(super) fn decode_read_key(row: &rusqlite::Row<'_>) -> Result<ReadKey> {
                                 ));
                             }
                             LookupQuestion::StructuralRecovered {
-                                language,
                                 authority,
+                                language: decode_language(language_label)?,
                             }
                         }
                         _ => unreachable!(),
@@ -876,7 +1231,9 @@ pub(super) fn decode_read_key(row: &rusqlite::Row<'_>) -> Result<ReadKey> {
                                 && rank >= 0
                                 && matches!(
                                     lookup_kind,
-                                    LookupKind::Dispatch | LookupKind::ProcedureDispatch
+                                    LookupKind::Dispatch
+                                        | LookupKind::ProcedureDispatch
+                                        | LookupKind::ArgumentClasses
                                 ) =>
                         {
                             if site_ordinal.is_some_and(|ordinal| ordinal != rank) {
@@ -888,6 +1245,25 @@ pub(super) fn decode_read_key(row: &rusqlite::Row<'_>) -> Result<ReadKey> {
                                 site: CallSiteLocator {
                                     ordinal: rank as usize,
                                 },
+                            }
+                        }
+                        (
+                            Some(rel_path),
+                            Some(receiver_class),
+                            Some(subject),
+                            Some(rank),
+                            Some(end),
+                        ) if rank == end
+                            && rank >= 0
+                            && lookup_kind == LookupKind::ConditionalDispatch =>
+                        {
+                            LookupQuestion::ReceiverCallSite {
+                                rel_path: Box::from(rel_path.as_str()),
+                                procedure: decode_digest(&subject, "procedure lineage")?,
+                                site: CallSiteLocator {
+                                    ordinal: rank as usize,
+                                },
+                                receiver_class: Box::from(receiver_class.as_str()),
                             }
                         }
                         (None, None, Some(identity), None, None) => LookupQuestion::Summary {
@@ -942,8 +1318,34 @@ pub(super) fn decode_read_key(row: &rusqlite::Row<'_>) -> Result<ReadKey> {
         "scope" => {
             let languages = languages.ok_or_else(|| missing("languages"))?;
             let mut scope = Vec::new();
+            let mut unknown = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            let mut previous: Option<Language> = None;
+            // Validate the entire CSV before refusing unknown vocabulary. An
+            // unknown token cannot conceal a later empty/duplicate token or
+            // a noncanonical order among the languages this reader knows.
             for label in languages.split(',') {
-                scope.push(decode_language(label)?);
+                if !seen.insert(label) {
+                    return Err(StoreError::corrupt(format!(
+                        "duplicate scope language {label:?}"
+                    )));
+                }
+                if let Some(language) = known_language_label(label)? {
+                    if previous.is_some_and(|previous| previous >= language) {
+                        return Err(StoreError::corrupt(format!(
+                            "noncanonical scope languages {languages:?}"
+                        )));
+                    }
+                    previous = Some(language);
+                    scope.push(language);
+                } else {
+                    unknown.push(label);
+                }
+            }
+            if !unknown.is_empty() {
+                return Err(StoreError::unsupported_read_key(format!(
+                    "unknown scope language labels {unknown:?}"
+                )));
             }
             ReadKey::Scope {
                 languages: scope.into_boxed_slice(),
@@ -1028,6 +1430,28 @@ fn lookup_question_matches_kind(kind: LookupKind, question: &LookupQuestion) -> 
     if matches!(question, LookupQuestion::Derivation(_)) {
         return false;
     }
+    if kind == LookupKind::RustDropSubject
+        || matches!(question, LookupQuestion::RustDropSubject { .. })
+    {
+        return matches!(
+            (kind, question),
+            (
+                LookupKind::RustDropSubject,
+                LookupQuestion::RustDropSubject { .. }
+            )
+        );
+    }
+    if kind == LookupKind::RustDropInventory
+        || matches!(question, LookupQuestion::RustDropInventory { .. })
+    {
+        return matches!(
+            (kind, question),
+            (
+                LookupKind::RustDropInventory,
+                LookupQuestion::RustDropInventory { .. }
+            )
+        );
+    }
     if matches!(
         kind,
         LookupKind::RustUnresolvedTraitImplInventory
@@ -1042,6 +1466,17 @@ fn lookup_question_matches_kind(kind: LookupKind, question: &LookupQuestion) -> 
                 language: Some(Language::Rust),
                 ..
             }
+        );
+    }
+    if kind == LookupKind::RustMacroInvocations
+        || matches!(question, LookupQuestion::RustMacroInvocations { .. })
+    {
+        return matches!(
+            (kind, question),
+            (
+                LookupKind::RustMacroInvocations,
+                LookupQuestion::RustMacroInvocations { .. }
+            )
         );
     }
     if kind == LookupKind::RustCopyAbsence
@@ -1117,6 +1552,11 @@ fn lookup_question_matches_kind(kind: LookupKind, question: &LookupQuestion) -> 
                 LookupKind::ProcedureDispatch,
                 LookupQuestion::CallSite { .. }
             )
+            | (LookupKind::ArgumentClasses, LookupQuestion::CallSite { .. })
+            | (
+                LookupKind::ConditionalDispatch,
+                LookupQuestion::ReceiverCallSite { .. }
+            )
     ) || (!matches!(
         kind,
         LookupKind::ResolvedName
@@ -1125,10 +1565,14 @@ fn lookup_question_matches_kind(kind: LookupKind, question: &LookupQuestion) -> 
             | LookupKind::ShortNameCandidates
             | LookupKind::Dispatch
             | LookupKind::ProcedureDispatch
+            | LookupKind::ArgumentClasses
+            | LookupKind::ConditionalDispatch
             | LookupKind::DeclarationCandidates
     ) && !matches!(
         question,
-        LookupQuestion::Name { .. } | LookupQuestion::CallSite { .. }
+        LookupQuestion::Name { .. }
+            | LookupQuestion::CallSite { .. }
+            | LookupQuestion::ReceiverCallSite { .. }
     ))
 }
 
@@ -1160,12 +1604,31 @@ fn decode_oid(text: &str) -> Result<Oid> {
         .map_err(|error| StoreError::new(format!("unreadable blob `{text}`: {error}")))
 }
 
-fn decode_language(label: &str) -> Result<Language> {
-    if label == Language::None.config_label() {
-        return Ok(Language::None);
+fn known_language_label(label: &str) -> Result<Option<Language>> {
+    if label.trim().is_empty() || label.contains(',') {
+        return Err(StoreError::corrupt(format!(
+            "invalid scalar language label {label:?}"
+        )));
     }
-    super::canonical_language_label(label)
-        .ok_or_else(|| StoreError::new(format!("unknown language label `{label}`")))
+    if label == Language::None.config_label() {
+        return Ok(Some(Language::None));
+    }
+    if let Some(language) = super::canonical_language_label(label) {
+        return Ok(Some(language));
+    }
+    if Language::from_config_label(label).is_some() {
+        return Err(StoreError::corrupt(format!(
+            "noncanonical language label {label:?}"
+        )));
+    }
+    // No character grammar is imposed on future labels we cannot interpret.
+    Ok(None)
+}
+
+fn decode_language(label: &str) -> Result<Language> {
+    known_language_label(label)?.ok_or_else(|| {
+        StoreError::unsupported_read_key(format!("unknown language label `{label}`"))
+    })
 }
 
 /// Every index family, so a label decodes to the variant that spells it.
@@ -1182,7 +1645,7 @@ const ALL_INDEX_FAMILIES: [IndexFamily; 9] = [
 ];
 
 /// Every derived-value lookup kind.
-const ALL_LOOKUP_KINDS: [LookupKind; 31] = [
+const ALL_LOOKUP_KINDS: [LookupKind; 36] = [
     LookupKind::CertifiedDefinitionAnswer,
     LookupKind::StoredSemanticIrPublication,
     LookupKind::ResolvedName,
@@ -1207,13 +1670,18 @@ const ALL_LOOKUP_KINDS: [LookupKind; 31] = [
     LookupKind::Descendants,
     LookupKind::Dispatch,
     LookupKind::ProcedureDispatch,
+    LookupKind::ArgumentClasses,
+    LookupKind::ConditionalDispatch,
     LookupKind::ProcedureSummary,
     LookupKind::WorkspaceFact,
     LookupKind::StructuralNameInventory,
     LookupKind::StructuralRoleNameInventory,
     LookupKind::StructuralRecoveredInventory,
     LookupKind::RustCopyAbsence,
+    LookupKind::RustDropSubject,
+    LookupKind::RustDropInventory,
     LookupKind::ExternalSelection,
+    LookupKind::RustMacroInvocations,
 ];
 
 /// Every derived-artifact kind.
@@ -1232,26 +1700,61 @@ fn index_family_of(label: &str) -> Result<IndexFamily> {
     ALL_INDEX_FAMILIES
         .into_iter()
         .find(|family| family.stable_label() == label)
-        .ok_or_else(|| StoreError::new(format!("unknown index family `{label}`")))
+        .ok_or_else(|| StoreError::unsupported_read_key(format!("unknown index family `{label}`")))
 }
 
 fn workspace_fact_family_of(label: &str) -> Result<WorkspaceFactFamily> {
-    WorkspaceFactFamily::from_label(label)
-        .ok_or_else(|| StoreError::corrupt(format!("unknown workspace fact family `{label}`")))
+    WorkspaceFactFamily::from_label(label).ok_or_else(|| {
+        StoreError::unsupported_read_key(format!("unknown workspace fact family `{label}`"))
+    })
 }
 
 fn lookup_kind_of(label: &str) -> Result<LookupKind> {
     ALL_LOOKUP_KINDS
         .into_iter()
         .find(|kind| kind.stable_label() == label)
-        .ok_or_else(|| StoreError::new(format!("unknown lookup kind `{label}`")))
+        .ok_or_else(|| StoreError::unsupported_read_key(format!("unknown lookup kind `{label}`")))
 }
 
 fn artifact_kind_of(label: &str) -> Result<DerivedArtifactKind> {
     ALL_ARTIFACT_KINDS
         .into_iter()
         .find(|kind| kind.stable_label() == label)
-        .ok_or_else(|| StoreError::new(format!("unknown derived artifact kind `{label}`")))
+        .ok_or_else(|| {
+            StoreError::unsupported_read_key(format!("unknown derived artifact kind `{label}`"))
+        })
+}
+
+#[cfg(test)]
+pub(super) fn rust_drop_receipt_keys() -> Vec<ReadKey> {
+    let digest = StableDigest::sha256(b"Drop receipt");
+    vec![
+        ReadKey::lookup(
+            LookupKind::RustDropSubject,
+            LookupQuestion::RustDropSubject {
+                rel_path: "src/lib.rs".into(),
+                blob: [0; 20],
+                start_byte: 0,
+                end_byte: 1,
+            },
+            digest,
+        ),
+        ReadKey::lookup(
+            LookupKind::RustDropInventory,
+            LookupQuestion::RustDropInventory {
+                rel_path: "src/lib.rs".into(),
+                blob: [0; 20],
+                start_byte: 0,
+                end_byte: 1,
+                owning_unit: digest,
+                module_path: "crate".into(),
+                identity_digest: digest,
+                config_digest: digest,
+                proof_version: 1,
+            },
+            digest,
+        ),
+    ]
 }
 
 #[cfg(test)]
@@ -1355,6 +1858,28 @@ mod tests {
                 LookupKind::Derivation(_) => {
                     unreachable!("derivations have their own registered families")
                 }
+                LookupKind::RustDropSubject => LookupQuestion::RustDropSubject {
+                    rel_path: "src/lib.rs".into(),
+                    blob: [0; 20],
+                    start_byte: 0,
+                    end_byte: 1,
+                },
+                LookupKind::RustDropInventory => LookupQuestion::RustDropInventory {
+                    rel_path: "src/lib.rs".into(),
+                    blob: [0; 20],
+                    start_byte: 0,
+                    end_byte: 1,
+                    owning_unit: digest,
+                    module_path: "crate".into(),
+                    identity_digest: digest,
+                    config_digest: digest,
+                    proof_version: 1,
+                },
+                LookupKind::RustMacroInvocations => LookupQuestion::RustMacroInvocations {
+                    unit_key: digest,
+                    module_path: "crate".into(),
+                    macro_name: "unknown".into(),
+                },
                 LookupKind::RustCopyAbsence => LookupQuestion::RustCopyAbsence {
                     owning_unit: digest,
                     target_unit: digest,
@@ -1403,10 +1928,18 @@ mod tests {
                     kind: CodeUnitType::Function,
                     signature: None,
                 },
-                LookupKind::Dispatch | LookupKind::ProcedureDispatch => LookupQuestion::CallSite {
+                LookupKind::Dispatch
+                | LookupKind::ProcedureDispatch
+                | LookupKind::ArgumentClasses => LookupQuestion::CallSite {
                     rel_path: "src/main.go".into(),
                     procedure: digest,
                     site: CallSiteLocator { ordinal: 0 },
+                },
+                LookupKind::ConditionalDispatch => LookupQuestion::ReceiverCallSite {
+                    rel_path: "src/main.go".into(),
+                    procedure: digest,
+                    site: CallSiteLocator { ordinal: 0 },
+                    receiver_class: "Array".into(),
                 },
                 _ => LookupQuestion::File {
                     rel_path: "src/main.go".into(),
@@ -1564,6 +2097,9 @@ mod tests {
             fn report_execution_dependence(&self, _: NotReusableCause) {
                 panic!("unexpected capture")
             }
+            fn report_verdict(&self, _: brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict) {
+                panic!("unexpected capture")
+            }
             fn report_reuse_refusal(&self, _: NotReusableCause) {
                 panic!("unexpected capture")
             }
@@ -1583,6 +2119,7 @@ mod tests {
         for (label, subject, path, name) in [
             ("derivation:rust_selection_content:v1", None, None, None),
             ("derivation:rust_selection_content:v2", None, None, None),
+            ("derivation:rust_unit_set:v1", None, None, None),
             (
                 "derivation:rust_forward_scope_witness:v1",
                 Some(vec![7u8; 32]),
@@ -1640,81 +2177,203 @@ mod tests {
         let end = start + schema[start..].find(") STRICT;").unwrap() + ") STRICT;".len();
         let connection = Connection::open_in_memory().unwrap();
         connection.execute_batch(&schema[start..end]).unwrap();
-        let subject = [7; 32];
+        let subject = Some([7; 32]);
+        let rust = Some(Language::Rust);
         let answer = StableDigest::sha256(b"derivation answer");
-        for (label, language, subject) in [
+        for (label, language, subject, rel_path, name) in [
+            ("derivation:unit_summary:v1", rust, subject, None, None),
             (
-                "derivation:unit_summary:v1",
-                Some(Language::Rust),
-                Some(subject),
+                "derivation:rust_selected_units_known:v1",
+                rust,
+                None,
+                None,
+                None,
             ),
-            ("derivation:rust_unit_set:v1", Some(Language::Rust), None),
+            (
+                "derivation:rust_file_units:v1",
+                rust,
+                None,
+                Some("src/lib.rs"),
+                None,
+            ),
+            (
+                "derivation:rust_broad_file_units:v1",
+                rust,
+                None,
+                Some("src/off.rs"),
+                None,
+            ),
+            ("derivation:rust_unit_naming:v1", rust, subject, None, None),
             (
                 "derivation:rust_unit_dependency_identities:v1",
-                Some(Language::Rust),
-                Some(subject),
+                rust,
+                subject,
+                None,
+                None,
+            ),
+            ("derivation:rust_unit_inputs:v1", rust, subject, None, None),
+            ("derivation:rust_unit_inputs:v2", rust, subject, None, None),
+            (
+                "derivation:rust_unit_dependents:v1",
+                rust,
+                subject,
+                None,
+                None,
             ),
             (
-                "derivation:rust_unit_routes:v1",
-                Some(Language::Rust),
-                Some(subject),
+                "derivation:rust_package_units:v1",
+                rust,
+                None,
+                None,
+                Some("pkg"),
             ),
-            ("derivation:rust_route_directory:v1", None, None),
-            ("derivation:rust_route_index:v1", None, None),
-            // Retired by v2; a stored row must still decode, so its unit
-            // recomputes instead of failing to load.
+            (
+                "derivation:rust_crate_name_units:v2",
+                rust,
+                None,
+                None,
+                Some("dep_crate"),
+            ),
+            ("derivation:rust_unit_routes:v1", rust, subject, None, None),
+            (
+                "derivation:rust_target_reachability:v2",
+                rust,
+                subject,
+                None,
+                None,
+            ),
+            (
+                "derivation:rust_unit_package_rows:v1",
+                rust,
+                subject,
+                None,
+                None,
+            ),
+            // Historical read sets remain decodable even without a live kind.
+            ("derivation:rust_route_directory:v1", None, None, None, None),
+            ("derivation:rust_route_index:v1", None, None, None, None),
             (
                 "derivation:rust_selection_content:v1",
-                Some(Language::Rust),
+                rust,
+                None,
+                None,
                 None,
             ),
         ] {
             let family = PersistedDerivationFamily::of(label).unwrap();
+            let question = DerivationQuestion {
+                language,
+                subject,
+                rel_path: rel_path.map(Into::into),
+                name: name.map(Into::into),
+            };
             let key = ReadKey::lookup(
                 LookupKind::Derivation(family.id),
-                LookupQuestion::Derivation(DerivationQuestion {
-                    language,
-                    subject,
-                    rel_path: None,
-                    name: None,
-                }),
+                LookupQuestion::Derivation(question.clone()),
                 answer,
             );
             let columns = ReadKeyColumns::of(&key).unwrap();
             connection.execute(
-                "INSERT INTO policy_read_keys(key_digest, kind, family, languages, subject, digest) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![columns.key_digest.as_slice(), columns.kind, columns.family, columns.languages, columns.subject, columns.digest],
+                "INSERT INTO policy_read_keys(key_digest, kind, family, languages, subject, rel_path, name, digest) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![columns.key_digest.as_slice(), columns.kind, columns.family, columns.languages, columns.subject, columns.rel_path, columns.name, columns.digest],
             ).unwrap();
-            let read = || {
+            let read = |digest: &[u8]| {
                 connection.query_row(
-                "SELECT key_digest, kind, family, languages, rel_path, name, index_key, blob_oid, subject, start_byte, end_byte, digest, site_ordinal, decl_kind, decl_signature, workspace_fact_family, fact_member, fact_names, copy_owning_unit, copy_target_unit, copy_module_path, copy_target_identity_digest, copy_census_version, copy_config_digest, copy_producer_digest, parse_variant_kind, parse_variant_digest, structural_role, structural_keyword FROM policy_read_keys WHERE key_digest = ?1",
-                [columns.key_digest.as_slice()],
-                |row| Ok(decode_read_key(row).map_err(|error| error.to_string())),
-            ).unwrap()
+                    "SELECT key_digest, kind, family, languages, rel_path, name, index_key, blob_oid, subject, start_byte, end_byte, digest, site_ordinal, decl_kind, decl_signature, workspace_fact_family, fact_member, fact_names, copy_owning_unit, copy_target_unit, copy_module_path, copy_target_identity_digest, copy_census_version, copy_config_digest, copy_producer_digest, parse_variant_kind, parse_variant_digest, structural_role, structural_keyword, drop_owning_unit, drop_module_path, drop_identity_digest, drop_config_digest, drop_proof_version FROM policy_read_keys WHERE key_digest = ?1",
+                    [digest],
+                    |row| Ok(decode_read_key(row)),
+                ).unwrap()
             };
-            assert_eq!(read(), Ok(key.clone()), "{label}");
+            assert_eq!(read(&columns.key_digest), Ok(key.clone()), "{label}");
+            // Recompute the canonical digest after changing the question so
+            // these controls test exact field admission, not a stale key hash.
+            for field in ["languages", "subject", "rel_path", "name"] {
+                let mut malformed = question.clone();
+                let value = match field {
+                    "languages" => {
+                        malformed.language = if language.is_some() { None } else { rust };
+                        malformed
+                            .language
+                            .map_or(rusqlite::types::Value::Null, |language| {
+                                language.config_label().to_owned().into()
+                            })
+                    }
+                    "subject" => {
+                        malformed.subject = if subject.is_some() {
+                            None
+                        } else {
+                            Some([8; 32])
+                        };
+                        malformed
+                            .subject
+                            .map_or(rusqlite::types::Value::Null, |subject| {
+                                subject.to_vec().into()
+                            })
+                    }
+                    "rel_path" => {
+                        malformed.rel_path = if rel_path.is_some() {
+                            None
+                        } else {
+                            Some("extra.rs".into())
+                        };
+                        malformed
+                            .rel_path
+                            .as_deref()
+                            .map_or(rusqlite::types::Value::Null, |path| path.to_owned().into())
+                    }
+                    "name" => {
+                        malformed.name = if name.is_some() {
+                            None
+                        } else {
+                            Some("extra".into())
+                        };
+                        malformed
+                            .name
+                            .as_deref()
+                            .map_or(rusqlite::types::Value::Null, |name| name.to_owned().into())
+                    }
+                    _ => unreachable!(),
+                };
+                let malformed_digest = ReadKey::lookup(
+                    LookupKind::Derivation(family.id),
+                    LookupQuestion::Derivation(malformed),
+                    answer,
+                )
+                .canonical_digest();
+                connection.execute_batch("SAVEPOINT malformed").unwrap();
+                connection.execute(
+                    &format!("UPDATE policy_read_keys SET {field} = ?2, key_digest = ?3 WHERE key_digest = ?1"),
+                    params![columns.key_digest.as_slice(), value, malformed_digest.as_bytes().as_slice()],
+                ).unwrap();
+                let error = read(malformed_digest.as_bytes()).unwrap_err();
+                assert!(
+                    !error.is_unsupported_read_key(),
+                    "{label}: {field}: {error:?}"
+                );
+                connection
+                    .execute_batch("ROLLBACK TO malformed; RELEASE malformed")
+                    .unwrap();
+            }
             for sql in [
                 "UPDATE policy_read_keys SET family = 'derivation:unknown:v1' WHERE key_digest = ?1",
                 "UPDATE policy_read_keys SET family = 'derivation:unit_summary:v2' WHERE key_digest = ?1",
-                "UPDATE policy_read_keys SET name = 'extra' WHERE key_digest = ?1",
-                "UPDATE policy_read_keys SET languages = NULL WHERE key_digest = ?1",
-                "UPDATE policy_read_keys SET subject = NULL WHERE key_digest = ?1",
                 "UPDATE policy_read_keys SET key_digest = zeroblob(32) WHERE key_digest = ?1",
             ] {
-                if sql.contains("languages = NULL") && language.is_none()
-                    || sql.contains("subject = NULL") && subject.is_none()
-                {
-                    continue;
-                }
                 connection.execute_batch("SAVEPOINT malformed").unwrap();
                 connection
                     .execute(sql, [columns.key_digest.as_slice()])
                     .unwrap();
-                let result = connection.query_row(
-                    "SELECT key_digest, kind, family, languages, rel_path, name, index_key, blob_oid, subject, start_byte, end_byte, digest, site_ordinal, decl_kind, decl_signature, workspace_fact_family, fact_member, fact_names, copy_owning_unit, copy_target_unit, copy_module_path, copy_target_identity_digest, copy_census_version, copy_config_digest, copy_producer_digest, parse_variant_kind, parse_variant_digest, structural_role, structural_keyword FROM policy_read_keys LIMIT 1 OFFSET (SELECT count(*) - 1 FROM policy_read_keys)",
-                    [], |row| Ok(decode_read_key(row).is_err()),
-                ).unwrap();
-                assert!(result, "{label}: {sql}");
+                let digest = if sql.contains("key_digest = zeroblob") {
+                    &[0; 32]
+                } else {
+                    &columns.key_digest
+                };
+                let error = read(digest).unwrap_err();
+                assert_eq!(
+                    error.is_unsupported_read_key(),
+                    digest != &[0; 32],
+                    "{label}: {sql}: {error:?}"
+                );
                 connection
                     .execute_batch("ROLLBACK TO malformed; RELEASE malformed")
                     .unwrap();
@@ -1876,6 +2535,37 @@ mod tests {
     }
 
     #[test]
+    fn rust_drop_inventory_question_round_trips_typed_columns() {
+        let key = ReadKey::lookup(
+            LookupKind::RustDropInventory,
+            LookupQuestion::RustDropInventory {
+                rel_path: "src/lib.rs".into(),
+                blob: [0; 20],
+                start_byte: 0,
+                end_byte: 1,
+                owning_unit: StableDigest::sha256(b"owner"),
+                module_path: "crate::resource".into(),
+                identity_digest: StableDigest::sha256(b"Resource"),
+                config_digest: StableDigest::sha256(b"config"),
+                proof_version: 1,
+            },
+            StableDigest::sha256(b"answer"),
+        );
+        let columns = ReadKeyColumns::of(&key).unwrap();
+        assert_eq!(decode_columns(&columns).unwrap(), key);
+        let mut malformed = columns;
+        malformed.drop_identity_digest = None;
+        assert!(decode_columns(&malformed).is_err());
+        assert!(!lookup_question_matches_kind(
+            LookupKind::RustCopyAbsence,
+            match &key {
+                ReadKey::Lookup { question, .. } => question,
+                _ => unreachable!(),
+            }
+        ));
+    }
+
+    #[test]
     fn rust_copy_absence_question_round_trips_typed_columns() {
         let key = ReadKey::lookup(
             LookupKind::RustCopyAbsence,
@@ -1897,6 +2587,32 @@ mod tests {
         let mut malformed = ReadKeyColumns::of(&key).unwrap();
         malformed.copy_target_unit = None;
         assert!(decode_columns(&malformed).is_err());
+    }
+
+    #[test]
+    fn rust_macro_invocation_question_round_trips_and_rejects_missing_or_stray_fields() {
+        let key = ReadKey::lookup(
+            LookupKind::RustMacroInvocations,
+            LookupQuestion::RustMacroInvocations {
+                unit_key: StableDigest::sha256(b"dependency"),
+                module_path: "crate::event".into(),
+                macro_name: "unknown".into(),
+            },
+            StableDigest::sha256(b"invocations"),
+        );
+        let columns = ReadKeyColumns::of(&key).unwrap();
+        assert_eq!(decode_columns(&columns).unwrap(), key);
+        for field in ["subject", "rel_path", "name", "languages"] {
+            let mut malformed = ReadKeyColumns::of(&key).unwrap();
+            match field {
+                "subject" => malformed.subject = None,
+                "rel_path" => malformed.rel_path = None,
+                "name" => malformed.name = None,
+                "languages" => malformed.languages = Some("rust".into()),
+                _ => unreachable!(),
+            }
+            assert!(decode_columns(&malformed).is_err(), "{field}");
+        }
     }
 
     #[test]
@@ -2022,7 +2738,7 @@ mod tests {
         let connection = Connection::open_in_memory()?;
         connection
             .query_row(
-                "SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19 AS copy_owning_unit, ?20, ?21, ?22, ?23, ?24, ?25, ?26 AS parse_variant_kind, ?27, ?28 AS structural_role, ?29",
+                "SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19 AS copy_owning_unit, ?20, ?21, ?22, ?23, ?24, ?25, ?26 AS parse_variant_kind, ?27, ?28 AS structural_role, ?29, ?30 AS drop_owning_unit, ?31 AS drop_module_path, ?32 AS drop_identity_digest, ?33 AS drop_config_digest, ?34 AS drop_proof_version",
                 params![
                     columns.key_digest.as_slice(),
                     columns.kind,
@@ -2053,18 +2769,16 @@ mod tests {
                     columns.parse_variant_digest,
                     columns.structural_role,
                     columns.structural_keyword,
+                    columns.drop_owning_unit,
+                    columns.drop_module_path,
+                    columns.drop_identity_digest,
+                    columns.drop_config_digest,
+                    columns.drop_proof_version,
+
                 ],
-                |row| {
-                    decode_read_key(row).map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            0,
-                            rusqlite::types::Type::Blob,
-                            Box::new(error),
-                        )
-                    })
-                },
+                |row| Ok(decode_read_key(row)),
             )
-            .map_err(StoreError::from)
+            ?
     }
 
     #[test]
@@ -2085,6 +2799,75 @@ mod tests {
             "{error}"
         );
     }
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10126: future languages hid malformed known lookup envelopes"
+    )]
+    fn future_languages_do_not_hide_known_lookup_corruption() {
+        let answer = StableDigest::sha256(b"answer");
+        let fact = ReadKey::lookup(
+            LookupKind::WorkspaceFact,
+            LookupQuestion::WorkspaceFact {
+                family: WorkspaceFactFamily::FieldSlots,
+                language: Language::Python,
+                subject: FactSubject::Named {
+                    name: "pkg.Item".into(),
+                },
+            },
+            answer,
+        );
+        for damage in ["missing_family", "missing_language", "mixed_subject"] {
+            let mut columns = ReadKeyColumns::of(&fact).unwrap();
+            columns.languages = Some("Future.Language-v2+custom".into());
+            match damage {
+                "missing_family" => columns.workspace_fact_family = None,
+                "missing_language" => {
+                    columns.languages = None;
+                    columns.workspace_fact_family = Some("future_workspace_fact");
+                }
+                "mixed_subject" => columns.subject = Some(vec![3; 32]),
+                _ => unreachable!(),
+            }
+            let error = decode_columns(&columns).expect_err(damage);
+            assert!(!error.is_unsupported_read_key(), "{damage}: {error:?}");
+        }
+        let authority = StableDigest::sha256(b"selection");
+        for (kind, question) in [
+            (
+                LookupKind::StructuralNameInventory,
+                LookupQuestion::StructuralName {
+                    language: Language::Rust,
+                    name: "put".into(),
+                    authority,
+                },
+            ),
+            (
+                LookupKind::StructuralRoleNameInventory,
+                LookupQuestion::StructuralRoleName {
+                    language: Language::Rust,
+                    role: Role::Callee,
+                    name: "put".into(),
+                    keyword: false,
+                    authority,
+                },
+            ),
+            (
+                LookupKind::StructuralRecoveredInventory,
+                LookupQuestion::StructuralRecovered {
+                    language: Language::Rust,
+                    authority,
+                },
+            ),
+        ] {
+            let key = ReadKey::lookup(kind, question, answer);
+            let mut columns = ReadKeyColumns::of(&key).unwrap();
+            columns.languages = Some("Future.Language-v2+custom".into());
+            columns.subject = None;
+            let error = decode_columns(&columns).expect_err("missing structural authority");
+            assert!(!error.is_unsupported_read_key(), "{kind:?}: {error:?}");
+        }
+    }
+
     #[test]
     fn workspace_fact_columns_reject_inconsistent_subjects() {
         for (family, subject) in [

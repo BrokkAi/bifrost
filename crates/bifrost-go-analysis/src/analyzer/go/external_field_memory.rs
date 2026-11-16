@@ -800,7 +800,10 @@ pub fn bind_go_aggregate_operand_source(
     let Some(go) = resolve_analyzer::<super::GoAnalyzer>(workspace.analyzer()) else {
         return Ok(incomplete(GoExternalFieldGap::SourceStateUnknown));
     };
-    let selected_overlay = workspace.analyzer().semantic_model_overlay();
+    let selected_overlay = workspace
+        .analyzer()
+        .semantic_model_overlay_read()
+        .published();
     let model_set_hash = selected_overlay
         .as_ref()
         .map(|overlay| overlay.active_model_set_hash().to_owned());
@@ -2761,7 +2764,7 @@ fn gap_affects_related(
     let Some(gap) = procedure.semantics().gap(gap_id) else {
         return true;
     };
-    if gap.discharge == brokk_bifrost_analysis::analyzer::semantic::SemanticGapDischarge::NonRejoiningExceptionalExit
+    if gap.control_flow_discharge() == brokk_bifrost_analysis::analyzer::semantic::SemanticGapDischarge::NonRejoiningExceptionalExit
     {
         // This query is conditional on reaching the consumer along a complete
         // normal route. A non-rejoining panic route never reaches that point.

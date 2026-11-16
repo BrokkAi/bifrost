@@ -206,3 +206,22 @@ pub fn assert_declared_binding_shortcut_is_skipped(language: Language, name: &st
     assert_eq!(budget.used(), SemanticWork::default());
     assert_eq!(session.retained_bytes(), 0);
 }
+
+/// Opaque identities let integration tests distinguish replay from recomputation.
+#[doc(hidden)]
+pub fn inert_drop_query_proofs(
+    workspace: &WorkspaceAnalyzer,
+) -> Vec<Arc<dyn std::any::Any + Send + Sync>> {
+    let Some(slots) = workspace.analyzer().owned_lookup_memo() else {
+        return Vec::new();
+    };
+    slots
+        .get::<InertDropQueryMemo>()
+        .entries
+        .lock()
+        .expect("inert Drop query memo poisoned")
+        .values()
+        .cloned()
+        .map(|proof| proof as Arc<dyn std::any::Any + Send + Sync>)
+        .collect()
+}

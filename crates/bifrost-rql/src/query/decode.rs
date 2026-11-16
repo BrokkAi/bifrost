@@ -156,6 +156,7 @@ struct QueryFields<'a> {
     exports: Option<&'a Value>,
     dependency_evidence: Option<&'a Value>,
     configuration_facts: Option<&'a Value>,
+    call_reachability: Option<&'a Value>,
     correlate: Option<&'a Value>,
     require_both: Option<&'a Value>,
     paths: Option<&'a Value>,
@@ -178,6 +179,7 @@ impl<'a> QueryFields<'a> {
             QueryField::Exports => self.exports,
             QueryField::DependencyEvidence => self.dependency_evidence,
             QueryField::ConfigurationFacts => self.configuration_facts,
+            QueryField::CallReachability => self.call_reachability,
             QueryField::Correlate => self.correlate,
             QueryField::RequireBoth => self.require_both,
             QueryField::Paths => self.paths,
@@ -218,6 +220,7 @@ fn collect_query_fields<'a>(
             QueryField::Exports => fields.exports = Some(value),
             QueryField::DependencyEvidence => fields.dependency_evidence = Some(value),
             QueryField::ConfigurationFacts => fields.configuration_facts = Some(value),
+            QueryField::CallReachability => fields.call_reachability = Some(value),
             QueryField::Correlate => fields.correlate = Some(value),
             QueryField::RequireBoth => fields.require_both = Some(value),
             QueryField::Paths => fields.paths = Some(value),
@@ -515,6 +518,55 @@ fn decode_plan(
                 .unwrap_or_default(),
             filter: decode_configuration_facts_filter(object, &configuration_path)?,
         }))
+    } else if let Some(value) = fields.call_reachability {
+        let relation_path = child_path(path, "call_reachability");
+        reject_structural_containment(&fields, path, "call_reachability")?;
+        let body = as_object(value, &relation_path)?;
+        for key in body.keys() {
+            if super::schema::CallReachabilityField::from_label(key).is_none() {
+                return Err(QueryError::new(
+                    child_path(&relation_path, key),
+                    "unknown call-reachability field",
+                ));
+            }
+        }
+        let mut child = |label: &str| -> Result<CodeQueryPlan, QueryError> {
+            let child_path = child_path(&relation_path, label);
+            let value = body
+                .get(label)
+                .ok_or_else(|| QueryError::new(&child_path, "required call-reachability input"))?;
+            decode_plan(
+                collect_query_fields(as_object(value, &child_path)?, &child_path)?,
+                &child_path,
+                budget,
+                false,
+                depth + 1,
+            )
+        };
+        let sources = child("sources")?;
+        let sinks = child("sinks")?;
+        let authored_depth = body
+            .get("depth")
+            .map(|value| {
+                value
+                    .as_u64()
+                    .and_then(|n| usize::try_from(n).ok())
+                    .and_then(std::num::NonZeroUsize::new)
+                    .ok_or_else(|| {
+                        QueryError::new(
+                            child_path(&relation_path, "depth"),
+                            "depth must be a positive integer",
+                        )
+                    })
+            })
+            .transpose()?;
+        let mut source = CodeQueryPlanSource::CallReachability(Box::new(super::CallReachability {
+            sources,
+            sinks,
+            depth: authored_depth,
+        }));
+        conjoin_shared_scope(&mut source, &fields, path)?;
+        source
     } else if let Some(value) = fields.correlate {
         let correlate_path = child_path(path, "correlate");
         reject_structural_containment(&fields, path, "correlate")?;
@@ -2201,6 +2253,20 @@ fn conjoin_source_scope(
                             )
                         }),
                 );
+                continue;
+            }
+            CodeQueryPlanSource::CallReachability(relation) => {
+                let operator_path = child_path(&path, "call_reachability");
+                pending.push((
+                    &mut relation.sources.source,
+                    child_path(&operator_path, "sources"),
+                    languages,
+                ));
+                pending.push((
+                    &mut relation.sinks.source,
+                    child_path(&operator_path, "sinks"),
+                    languages,
+                ));
                 continue;
             }
             CodeQueryPlanSource::Correlate(correlation) => {

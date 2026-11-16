@@ -183,11 +183,16 @@ impl IndexWarmer {
             return;
         }
         drop(state);
+        // Taken here, not in the spawned task: the request that scheduled this
+        // warm ends right after, and must not see an idle process before the
+        // warm thread has started. Dropped when the task ends, whichever way.
+        let heap_activity = brokk_bifrost_core::heap_release::IdleHeapRelease::process().warm();
         let warmer = Arc::clone(self);
         // Keep background warming off the global Rayon pool used by
         // interactive request fan-out. Otherwise a small request can wait for
         // an unrelated workspace-scale warm to release a worker (#2464).
         spawn_index_warm(move || {
+            let _heap_activity = heap_activity;
             let mut next = Some(snapshot);
             while let Some(current) = next.take() {
                 #[cfg(test)]

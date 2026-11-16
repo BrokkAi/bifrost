@@ -1,3 +1,6 @@
+#[cfg(test)]
+use brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelNamespace;
+
 use std::path::PathBuf;
 
 use brokk_bifrost_core::cancellation::CancellationToken;
@@ -48,8 +51,15 @@ use crate::analyzer::rust::RustdocJsonPackProducer;
 pub struct RustDependencyPackAdapter;
 
 /// Changes in the Rustdoc declaration producer for identical artifact bytes.
+/// #12073: unresolved IDs now produce Unknown instead of binding by spelling.
+/// #12213: verified sysroot receipts change output for identical document bytes.
+/// #12213 also withholds hierarchy edges whose arguments remain Unknown.
+/// #12425 scopes unknown-self trait impl gaps to their complete callable-name sets.
+/// #12484 bounds known-owner hierarchy gaps to complete trait callable names.
+/// #12733 D1a writes a callable's own generics and a trait's `Self` as
+/// TypeParameter (not wildcard) and keeps impls whose conditions use Fn sugar.
 pub(crate) const RUST_PACK_PRODUCER_VERSION: &str =
-    concat!(env!("CARGO_PKG_VERSION"), "+rust-pack-3");
+    concat!(env!("CARGO_PKG_VERSION"), "+rust-pack-12");
 
 impl DependencyPackAdapter for RustDependencyPackAdapter {
     fn adapter_name(&self) -> &str {
@@ -70,7 +80,7 @@ impl DependencyPackAdapter for RustDependencyPackAdapter {
     /// The production key is minted before the artifact is read, so it admits
     /// every supported schema up to the highest one this producer may write.
     fn production_schema_version(&self, _dependency: &ResolvedDependency) -> u32 {
-        super::rustdoc_artifact::RUSTDOC_PACK_MAX_SCHEMA_VERSION
+        crate::analyzer::rust::rustdoc_artifact::RUSTDOC_PACK_MAX_SCHEMA_VERSION
     }
 
     fn can_produce(&self, dependency: &ResolvedDependency) -> bool {
@@ -619,7 +629,7 @@ mod tests {
             )
             .pack
             .unwrap_or_else(|| panic!("an alias-target pack must be produced"));
-        assert_eq!(produced.schema_version, 32);
+        assert_eq!(produced.schema_version, 40);
         assert!(
             produced.schema_version
                 <= RustDependencyPackAdapter.production_schema_version(&dependency)
@@ -669,11 +679,25 @@ mod tests {
         let first_pack = first_product
             .pack
             .unwrap_or_else(|| panic!("{:?}", first_product.diagnostics));
-        assert_eq!(first_pack.schema_version, 28);
+        assert_eq!(
+            first_pack.schema_version,
+            crate::analyzer::rust::rustdoc_artifact::RUSTDOC_PACK_MAX_SCHEMA_VERSION
+        );
         let mut decoded_payloads = Vec::new();
         for schema_version in [28, 29, 32] {
             let mut relabelled = first_pack.clone();
             relabelled.schema_version = schema_version;
+            // Legacy-schema comparison deliberately excludes the new certificate.
+            for shard in &mut relabelled.shards {
+                if let brokk_bifrost_semantic::analyzer::semantic_model::AuthoredPayload::DeclarationFacts { types, members, .. } = &mut shard.payload {
+                    for ty in types {
+                        ty.rust_stability = None;
+                        for implementation in &mut ty.implemented_traits { implementation.rust_stability = None; }
+                        for implementation in &mut ty.generic_trait_impls { implementation.implementation.rust_stability = None; }
+                    }
+                    for member in members { member.rust_stability = None; }
+                }
+            }
             let compiled = crate::analyzer::semantic_model::compile_pack(
                 &relabelled,
                 &crate::analyzer::semantic_model::CompilerOptions::default(),
@@ -937,7 +961,11 @@ mod tests {
             &brokk_bifrost_core::retention_budget::RetentionBudget::for_tests(),
         )
         .unwrap();
-        let widget = overlay.symbols_named_in_family("widget.Widget", "rust");
+        let widget = overlay.symbols_named_in_family(
+            "widget.Widget",
+            "rust",
+            SemanticModelNamespace::Unknown,
+        );
         assert_eq!(widget.records.len(), 1, "{:#?}", overlay.symbols());
         assert!(
             widget.records[0]
@@ -1080,7 +1108,7 @@ mod tests {
             .unwrap();
             let publishes_crate_root = |spelling: &str| {
                 overlay
-                    .symbols_named_in_family(spelling, "rust")
+                    .symbols_named_in_family(spelling, "rust", SemanticModelNamespace::Unknown)
                     .records
                     .iter()
                     .any(|symbol| symbol.qualified_name == spelling)
@@ -1097,7 +1125,11 @@ mod tests {
             );
             assert_eq!(
                 overlay
-                    .symbols_named_in_family("widget.Widget", "rust")
+                    .symbols_named_in_family(
+                        "widget.Widget",
+                        "rust",
+                        SemanticModelNamespace::Unknown
+                    )
                     .records
                     .len(),
                 1,

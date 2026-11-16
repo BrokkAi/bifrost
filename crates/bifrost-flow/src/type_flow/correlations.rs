@@ -866,7 +866,11 @@ fn read_exception_edges(
             .iter()
             .filter_map(|event| match event.effect {
                 SemanticEffect::ValueFlow {
-                    kind: ValueFlowKind::Local | ValueFlowKind::Parameter | ValueFlowKind::Receiver,
+                    kind:
+                        ValueFlowKind::Local
+                        | ValueFlowKind::AddressOf
+                        | ValueFlowKind::Parameter
+                        | ValueFlowKind::Receiver,
                     source,
                     ..
                 } if semantics
@@ -2141,8 +2145,7 @@ pub(super) fn unknown_write_bindings(
             .unwrap_or_default(),
         SemanticEffect::Invoke { .. }
         | SemanticEffect::CallContinuation { .. }
-        | SemanticEffect::AsyncSuspend { .. }
-        | SemanticEffect::AsyncResume { .. }
+        | SemanticEffect::MemoryInterference
         | SemanticEffect::Synchronization { .. } => sorted_bindings(open_bindings),
         SemanticEffect::Gap { gap } => semantics
             .gap(*gap)
@@ -2189,7 +2192,7 @@ pub(super) fn correlation_event_candidate(effect: &SemanticEffect) -> bool {
             | SemanticEffect::MemoryStore { .. }
             | SemanticEffect::Invoke { .. }
             | SemanticEffect::CallContinuation { .. }
-            | SemanticEffect::AsyncSuspend { .. }
+            | SemanticEffect::MemoryInterference
             | SemanticEffect::AsyncResume { .. }
             | SemanticEffect::Synchronization { .. }
             | SemanticEffect::Gap { .. }

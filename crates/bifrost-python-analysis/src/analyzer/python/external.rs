@@ -1897,6 +1897,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
             hierarchy,
             aliases: Vec::new(),
             extension_surfaces: Vec::new(),
+            rust_stability: None,
             guard,
             locator: Locator::Artifact {
                 path: self.locator_path.clone(),
@@ -1974,6 +1975,7 @@ fn member_fact(
             .map_or(0, |signature| signature.type_parameters.len()),
         parameter_types: &parameter_types,
         parameter_variadics: &[],
+        extension_receiver: None,
         return_type: signature
             .as_ref()
             .and_then(|signature| signature.returns.as_ref()),
@@ -2002,6 +2004,7 @@ fn member_fact(
         extension_receiver: None,
         extension_receiver_constraints: Vec::new(),
         aliases: Vec::new(),
+        rust_stability: None,
         guard,
         locator: Locator::Artifact {
             path: locator_path.to_owned(),
@@ -3122,13 +3125,38 @@ fn resolve_declared_python_stdlib_dependency(
     project_root: &Path,
     inputs_considered: &mut usize,
 ) -> Result<Option<ResolvedDependency>, DependencyPackDiagnostic> {
+    // Enumerate even lower-precedence candidates: their creation, deletion or
+    // edit must invalidate carried evidence. Read every candidate before
+    // interpreting any declaration so an early return cannot omit an input.
+    let [
+        version_source,
+        pyproject_source,
+        setup_cfg_source,
+        setup_py_source,
+    ] = [
+        PYTHON_VERSION_FILE_NAME,
+        PYPROJECT_FILE_NAME,
+        SETUP_CFG_FILE_NAME,
+        SETUP_PY_FILE_NAME,
+    ]
+    .map(|name| {
+        let path = project_root.join(name);
+        read_bounded_declaration_file(&path, MAX_PYTHON_TOOLCHAIN_DECLARATION_BYTES).map_err(
+            |message| {
+                declaration_diagnostic(
+                    if name == PYTHON_VERSION_FILE_NAME {
+                        "python.toolchain.version_file"
+                    } else {
+                        "python.toolchain.requires_python"
+                    },
+                    &path,
+                    message,
+                )
+            },
+        )
+    });
     let version_file = project_root.join(PYTHON_VERSION_FILE_NAME);
-    if let Some(source) =
-        read_bounded_declaration_file(&version_file, MAX_PYTHON_TOOLCHAIN_DECLARATION_BYTES)
-            .map_err(|message| {
-                declaration_diagnostic("python.toolchain.version_file", &version_file, message)
-            })?
-    {
+    if let Some(source) = version_source? {
         *inputs_considered += 1;
         let (version, declared) = parse_python_version_file(&source).map_err(|message| {
             declaration_diagnostic("python.toolchain.version_file", &version_file, message)
@@ -3140,21 +3168,25 @@ fn resolve_declared_python_stdlib_dependency(
         )));
     }
     let pyproject = project_root.join(PYPROJECT_FILE_NAME);
-    let Some(source) =
-        read_bounded_declaration_file(&pyproject, MAX_PYTHON_TOOLCHAIN_DECLARATION_BYTES).map_err(
-            |message| {
-                declaration_diagnostic("python.toolchain.requires_python", &pyproject, message)
-            },
-        )?
-    else {
-        return resolve_setuptools_python_requires(project_root, inputs_considered);
+    let Some(source) = pyproject_source? else {
+        return resolve_setuptools_python_requires(
+            project_root,
+            inputs_considered,
+            setup_cfg_source,
+            setup_py_source,
+        );
     };
     *inputs_considered += 1;
     let Some(requirement) = parse_pyproject_requires_python(&source).map_err(|message| {
         declaration_diagnostic("python.toolchain.requires_python", &pyproject, message)
     })?
     else {
-        return resolve_setuptools_python_requires(project_root, inputs_considered);
+        return resolve_setuptools_python_requires(
+            project_root,
+            inputs_considered,
+            setup_cfg_source,
+            setup_py_source,
+        );
     };
     let version = requires_python_lower_bound(&requirement).map_err(|message| {
         declaration_diagnostic("python.toolchain.requires_python", &pyproject, message)
@@ -3172,15 +3204,11 @@ fn resolve_declared_python_stdlib_dependency(
 fn resolve_setuptools_python_requires(
     project_root: &Path,
     inputs_considered: &mut usize,
+    setup_cfg_source: Result<Option<String>, DependencyPackDiagnostic>,
+    setup_py_source: Result<Option<String>, DependencyPackDiagnostic>,
 ) -> Result<Option<ResolvedDependency>, DependencyPackDiagnostic> {
     let setup_cfg = project_root.join(SETUP_CFG_FILE_NAME);
-    if let Some(source) =
-        read_bounded_declaration_file(&setup_cfg, MAX_PYTHON_TOOLCHAIN_DECLARATION_BYTES).map_err(
-            |message| {
-                declaration_diagnostic("python.toolchain.requires_python", &setup_cfg, message)
-            },
-        )?
-    {
+    if let Some(source) = setup_cfg_source? {
         *inputs_considered += 1;
         if let Some(requirement) = parse_setup_cfg_python_requires(&source) {
             let version = requires_python_lower_bound(&requirement).map_err(|message| {
@@ -3194,12 +3222,14 @@ fn resolve_setuptools_python_requires(
         }
     }
     let setup_py = project_root.join(SETUP_PY_FILE_NAME);
-    if !setup_py.is_file() {
+    let Some(source) = setup_py_source? else {
         return Ok(None);
-    }
+    };
     *inputs_considered += 1;
     let Some(requirement) =
-        brokk_bifrost_python::declarations::setuptools_setup_py_python_requires(&setup_py)
+        brokk_bifrost_python::declarations::setuptools_setup_py_python_requires_from_source(
+            &source,
+        )
     else {
         return Ok(None);
     };
@@ -3444,6 +3474,9 @@ fn resolve_declared_python_stdlib_outcome(project: &dyn Project) -> DependencyDi
         Ok(None) if has_python => Ok(Some(assumed_python_stdlib_dependency())),
         resolved => resolved,
     };
+    if resolved.is_ok() {
+        brokk_bifrost_analysis::analyzer::dependency_support::declare_external_discovery_reads_complete();
+    }
     let expectation = match resolved {
         Ok(Some(dependency)) => {
             let expectation = StandardLibraryPackExpectation::declared(
@@ -3616,6 +3649,7 @@ impl<'a> DiscoveryState<'a> {
 
     fn outcome(self, dependencies: Vec<ResolvedDependency>) -> DependencyDiscoveryOutcome {
         DependencyDiscoveryOutcome {
+            incomplete_reason: None,
             profile: DependencyDiscoveryProfile {
                 metadata_inputs_considered: self.metadata_inputs_considered,
                 dependencies_resolved: dependencies.len(),

@@ -830,6 +830,10 @@ fn bench() {}
                 "expected_callable_parameter_owner_count",
                 "resolution_callable_parameter_owners",
             ),
+            (
+                "expected_binary_operation_count",
+                "resolution_binary_operations",
+            ),
             ("expected_capsule_input_count", "resolution_capsule_inputs"),
             (
                 "expected_capsule_declaration_count",

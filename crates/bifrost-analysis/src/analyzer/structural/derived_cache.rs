@@ -16,6 +16,7 @@ use crate::analyzer::invalidation::{
 };
 
 use crate::analyzer::read_ledger::ReadKey;
+use crate::analyzer::reuse_verdict::{CarriesReuseVerdict, ExecutionCause, ReuseVerdict};
 use crate::analyzer::semantic::ids::StableDigest;
 use crate::analyzer::workspace_authority::{ReplayingMemo, ReplayingMemoEntry, memo_attribution};
 use crate::analyzer::{IAnalyzer, Language, ProjectFile};
@@ -101,9 +102,17 @@ impl DerivedLayer {
         }
     }
 
+    /// Raw: compared with `construction_limit_bytes`, unchanged until the R follow-up.
     fn retained_bytes(&self) -> u64 {
         match self {
             Self::DirectImportTopology(topology) => topology.retained_bytes(),
+        }
+    }
+
+    /// Allocated: the region charge.
+    fn allocated_bytes(&self) -> u64 {
+        match self {
+            Self::DirectImportTopology(topology) => topology.allocated_bytes(),
         }
     }
 }
@@ -444,7 +453,8 @@ impl SnapshotDerivedLayerCache {
                                         over_budget: false, rejection_scope: None, wait, build: metrics,
                                     });
                                 }
-                                Ok((Arc::new(layer), usize::try_from(metrics.retained_bytes).unwrap_or(usize::MAX)))
+                                let charge = usize::try_from(layer.allocated_bytes()).unwrap_or(usize::MAX);
+                                Ok((Arc::new(layer), charge))
                             }
                             DerivedLayerBuildOutcome::Cancelled { metrics } => Err(DerivedLayerAcquisition::Cancelled { wait, build: metrics }),
                             DerivedLayerBuildOutcome::Unavailable { reason, over_budget, rejection_scope, metrics } => {
@@ -472,7 +482,7 @@ impl SnapshotDerivedLayerCache {
                         }
                     };
                     entry.charge(&self.budget, |key| {
-                        let mut heap = RetainedHeap::default();
+                        let mut heap = RetainedHeap::allocated();
                         retained_read_key(&mut heap, key);
                         heap.total()
                     });
@@ -560,6 +570,15 @@ pub struct DirectImportTopologyLimits {
 pub struct DirectImportTopologyBuild {
     pub outcome: DerivedLayerBuildOutcome,
     pub fallback: Option<RequestLocalDirectImportGraph>,
+    /// The verdict of the import-resolution refusals that shaped `outcome`.
+    /// A cancellation is a token observation and stays ambient.
+    pub reuse: ReuseVerdict,
+}
+
+impl CarriesReuseVerdict for DirectImportTopologyBuild {
+    fn reuse_verdict(&self) -> ReuseVerdict {
+        self.reuse
+    }
 }
 
 /// Complete import resolution for every analyzed file in one declared support
@@ -570,7 +589,10 @@ pub struct DirectImportTopology {
     graph: CompactDirectedGraph<ProjectFile>,
     supported_sources: Box<[bool]>,
     resolved_files: usize,
+    /// Raw: compared with `construction_limit_bytes`, unchanged until the R follow-up.
     retained_bytes: u64,
+    /// Allocated: the region charge.
+    allocated_bytes: u64,
 }
 
 fn outgoing_files(graph: &CompactDirectedGraph<ProjectFile>, source: u32) -> Vec<ProjectFile> {
@@ -663,6 +685,10 @@ impl DirectImportTopology {
     pub fn retained_bytes(&self) -> u64 {
         self.retained_bytes
     }
+
+    pub fn allocated_bytes(&self) -> u64 {
+        self.allocated_bytes
+    }
 }
 
 pub fn build_direct_import_topology(
@@ -689,6 +715,7 @@ pub fn build_direct_import_topology(
                 metrics,
             },
             fallback: None,
+            reuse: ReuseVerdict::Content,
         };
     }
     if cancellation.is_cancelled() {
@@ -696,6 +723,7 @@ pub fn build_direct_import_topology(
         return DirectImportTopologyBuild {
             outcome: DerivedLayerBuildOutcome::Cancelled { metrics },
             fallback: None,
+            reuse: ReuseVerdict::Content,
         };
     }
 
@@ -710,11 +738,16 @@ pub fn build_direct_import_topology(
                 metrics,
             },
             fallback: None,
+            reuse: ReuseVerdict::Content,
         };
     }
 
     let mut request_graph = RequestLocalDirectImportGraph::from_files(files);
-    let (exhausted, construction_over_budget) = request_graph.resolve_complete_for_snapshot(
+    let ForwardResolution {
+        exhausted,
+        over_byte_budget: construction_over_budget,
+        reuse,
+    } = request_graph.resolve_complete_for_snapshot(
         analyzer,
         token,
         limits.max_files,
@@ -729,6 +762,7 @@ pub fn build_direct_import_topology(
         return DirectImportTopologyBuild {
             outcome: DerivedLayerBuildOutcome::Cancelled { metrics },
             fallback: None,
+            reuse,
         };
     }
     if exhausted {
@@ -752,6 +786,7 @@ pub fn build_direct_import_topology(
                 metrics,
             },
             fallback: Some(request_graph),
+            reuse,
         };
     }
 
@@ -775,6 +810,7 @@ pub fn build_direct_import_topology(
                 metrics,
             },
             fallback: Some(request_graph),
+            reuse,
         };
     }
 
@@ -803,15 +839,18 @@ pub fn build_direct_import_topology(
                 metrics,
             },
             fallback: Some(request_graph),
+            reuse,
         };
     }
-    let topology = request_graph.into_topology(retained_bytes);
+    let allocated_bytes = request_graph.allocated_topology_bytes();
+    let topology = request_graph.into_topology(retained_bytes, allocated_bytes);
     DirectImportTopologyBuild {
         outcome: DerivedLayerBuildOutcome::Complete {
             layer: DerivedLayer::DirectImportTopology(topology),
             metrics,
         },
         fallback: None,
+        reuse,
     }
 }
 
@@ -819,6 +858,8 @@ pub fn build_direct_import_topology(
 /// is disabled, incomplete, unsupported, cancelled, or over budget.
 #[derive(Debug, Default)]
 pub struct RequestLocalDirectImportGraph {
+    refused_file_charge: Option<(usize, usize)>,
+    refused_edge_charge: Option<(usize, usize)>,
     forward: HashMap<ProjectFile, Vec<ProjectFile>>,
     persisted_import_edges: Vec<crate::analyzer::PersistedImportEdge>,
     resolution_dependencies: HashMap<ProjectFile, crate::analyzer::ImportResolutionDependencies>,
@@ -837,6 +878,33 @@ pub struct RequestLocalDirectImportGraph {
     complete: bool,
 }
 
+/// How one import-resolution pass ended, with the reuse verdict of the
+/// refusals that stopped it.
+#[derive(Clone, Copy, Debug)]
+struct ForwardResolution {
+    exhausted: bool,
+    over_byte_budget: bool,
+    reuse: ReuseVerdict,
+}
+
+impl ForwardResolution {
+    fn new(exhausted: bool, over_byte_budget: bool, reuse: ReuseVerdict) -> Self {
+        Self {
+            exhausted,
+            over_byte_budget,
+            reuse,
+        }
+    }
+}
+
+/// A byte-budget or omitted-file refusal: mark the current capture through
+/// the ambient channel and return the matching explicit verdict.
+#[track_caller]
+fn execution_dependent() -> ReuseVerdict {
+    brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
+    ReuseVerdict::ExecutionDependent(ExecutionCause::Other)
+}
+
 #[derive(Clone, Copy)]
 struct RequestImportResolutionLimits<'a> {
     max_files: usize,
@@ -847,6 +915,15 @@ struct RequestImportResolutionLimits<'a> {
 }
 
 impl RequestLocalDirectImportGraph {
+    /// The attempted charge and cap that refused import-file work.
+    pub fn refused_file_charge(&self) -> Option<(usize, usize)> {
+        self.refused_file_charge
+    }
+    /// The attempted charge and cap that refused import-edge work.
+    pub fn refused_edge_charge(&self) -> Option<(usize, usize)> {
+        self.refused_edge_charge
+    }
+
     pub fn new(analyzer: &dyn IAnalyzer) -> Self {
         let mut all_files = analyzer.analyzed_files();
         canonicalize_project_files(&mut all_files);
@@ -870,6 +947,7 @@ impl RequestLocalDirectImportGraph {
         ))
     }
 
+    /// Raw: compared with `construction_limit_bytes`, unchanged until the R follow-up.
     fn estimated_working_bytes(&self) -> u64 {
         (size_of::<Self>() as u64)
             .saturating_add(
@@ -912,6 +990,22 @@ impl RequestLocalDirectImportGraph {
             )
     }
 
+    /// Allocated: the region charge. The graph's index capacity is the
+    /// analyzed set's, as in the raw estimate below.
+    fn allocated_topology_bytes(&self) -> u64 {
+        (size_of::<DirectImportTopology>()
+            .saturating_sub(size_of::<CompactDirectedGraph<ProjectFile>>()) as u64)
+            .saturating_add(
+                self.compact
+                    .as_ref()
+                    .map_or(0, CompactDirectedGraph::allocated_estimated_bytes),
+            )
+            .saturating_add(brokk_bifrost_core::allocation_size::allocation_size(
+                self.all_files.len(),
+            ) as u64)
+    }
+
+    /// Raw: compared with `construction_limit_bytes`, unchanged until the R follow-up.
     fn estimated_topology_retained_bytes(&self) -> u64 {
         (size_of::<DirectImportTopology>()
             .saturating_sub(size_of::<CompactDirectedGraph<ProjectFile>>()) as u64)
@@ -925,7 +1019,7 @@ impl RequestLocalDirectImportGraph {
             .saturating_add(self.all_files.len() as u64)
     }
 
-    fn into_topology(mut self, retained_bytes: u64) -> DirectImportTopology {
+    fn into_topology(mut self, retained_bytes: u64, allocated_bytes: u64) -> DirectImportTopology {
         let graph = self
             .compact
             .take()
@@ -941,6 +1035,7 @@ impl RequestLocalDirectImportGraph {
             supported_sources,
             resolved_files: self.attempted_files,
             retained_bytes,
+            allocated_bytes,
         }
     }
 
@@ -1085,7 +1180,9 @@ impl RequestLocalDirectImportGraph {
             self.freeze();
             return false;
         }
-        let (exhausted, _) = self.resolve_all_canonical_files(
+        // A caller of this boolean API cannot carry the verdict yet; the
+        // ambient marks still decide for it.
+        let ForwardResolution { exhausted, .. } = self.resolve_all_canonical_files(
             analyzer,
             token,
             RequestImportResolutionLimits {
@@ -1108,7 +1205,7 @@ impl RequestLocalDirectImportGraph {
         analyzer: &dyn IAnalyzer,
         token: QueryToken<'_>,
         limits: RequestImportResolutionLimits<'_>,
-    ) -> (bool, bool) {
+    ) -> ForwardResolution {
         let files = self.all_files.clone();
         self.ensure_forward_inner(analyzer, token, &files, None, limits)
     }
@@ -1121,9 +1218,9 @@ impl RequestLocalDirectImportGraph {
         max_edges: usize,
         cancellation: &CancellationToken,
         maximum_working_bytes: u64,
-    ) -> (bool, bool) {
+    ) -> ForwardResolution {
         if self.complete {
-            return (false, false);
+            return ForwardResolution::new(false, false, ReuseVerdict::Content);
         }
         let outcome = self.resolve_all_canonical_files(
             analyzer,
@@ -1136,7 +1233,7 @@ impl RequestLocalDirectImportGraph {
                 files_are_canonical: true,
             },
         );
-        if !outcome.0 {
+        if !outcome.exhausted {
             self.complete = true;
         }
         outcome
@@ -1164,7 +1261,9 @@ impl RequestLocalDirectImportGraph {
                 files_are_canonical: false,
             },
         )
-        .0
+        // A caller of this boolean API cannot carry the verdict yet; the
+        // ambient marks still decide for it.
+        .exhausted
     }
 
     // These inputs identify distinct demand and snapshot state; an envelope would add indirection.
@@ -1193,7 +1292,9 @@ impl RequestLocalDirectImportGraph {
                 files_are_canonical: false,
             },
         )
-        .0
+        // A caller of this boolean API cannot carry the verdict yet; the
+        // ambient marks still decide for it.
+        .exhausted
     }
 
     fn ensure_forward_inner(
@@ -1203,7 +1304,7 @@ impl RequestLocalDirectImportGraph {
         files: &[ProjectFile],
         selected_import_ordinals: Option<&HashMap<ProjectFile, Vec<u32>>>,
         limits: RequestImportResolutionLimits<'_>,
-    ) -> (bool, bool) {
+    ) -> ForwardResolution {
         let RequestImportResolutionLimits {
             max_files,
             max_edges,
@@ -1211,9 +1312,14 @@ impl RequestLocalDirectImportGraph {
             maximum_working_bytes,
             files_are_canonical,
         } = limits;
+        let mut reuse = ReuseVerdict::Content;
         let previously_omitted = files.iter().any(|file| self.budget_omitted.contains(file));
+        self.refused_file_charge = None;
+        if !previously_omitted {
+            self.refused_edge_charge = None;
+        }
         if previously_omitted {
-            brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
+            reuse.join_in(execution_dependent());
         }
         let mut pending = files
             .iter()
@@ -1228,24 +1334,35 @@ impl RequestLocalDirectImportGraph {
             canonicalize_project_files(&mut pending);
         }
         if pending.is_empty() {
-            return (previously_omitted, false);
+            return ForwardResolution::new(previously_omitted, false, reuse);
         }
 
         let available_files = max_files.saturating_sub(self.attempted_files);
-        let files_fit = brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+        let files_fit = match brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
             self.attempted_files,
             max_files,
         )
-        .allows(pending.len());
+        .try_allow(pending.len())
+        {
+            Ok(()) => true,
+            Err(refused) => {
+                reuse.join_in(refused.reuse_verdict());
+                false
+            }
+        };
         let mut exhausted = previously_omitted || !files_fit;
         if !files_fit {
+            self.refused_file_charge = Some((
+                self.attempted_files.saturating_add(pending.len()),
+                max_files,
+            ));
             pending.truncate(available_files);
         }
 
         let mut groups: BTreeMap<Language, Vec<ProjectFile>> = BTreeMap::new();
         for file in pending {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                return (true, false);
+                return ForwardResolution::new(true, false, reuse);
             }
             if analyzer.import_analysis_provider_for_file(&file).is_some() {
                 groups
@@ -1259,8 +1376,8 @@ impl RequestLocalDirectImportGraph {
                 if maximum_working_bytes
                     .is_some_and(|maximum| self.estimated_working_bytes() > maximum)
                 {
-                    brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
-                    return (true, true);
+                    reuse.join_in(execution_dependent());
+                    return ForwardResolution::new(true, true, reuse);
                 }
             }
         }
@@ -1273,14 +1390,18 @@ impl RequestLocalDirectImportGraph {
                 continue;
             };
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                return (true, false);
+                return ForwardResolution::new(true, false, reuse);
             }
-            if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
-                self.attempted_edges,
-                max_edges,
-            )
-            .allows(1)
+            if let Err(refused) =
+                brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                    self.attempted_edges,
+                    max_edges,
+                )
+                .try_allow(1)
             {
+                reuse.join_in(refused.reuse_verdict());
+                self.refused_edge_charge =
+                    Some((self.attempted_edges.saturating_add(1), max_edges));
                 exhausted = true;
                 self.budget_omitted.extend(grouped_files.iter().cloned());
                 self.compact = None;
@@ -1304,6 +1425,9 @@ impl RequestLocalDirectImportGraph {
             self.attempted_files = self.attempted_files.saturating_add(grouped_files.len());
             let visited_files = Cell::new(0usize);
             let byte_budget_exhausted = Cell::new(false);
+            // The fact visitor below cannot borrow `reuse`; its byte-budget
+            // refusals join through this cell.
+            let byte_budget_reuse = Cell::new(ReuseVerdict::Content);
             let mut visit_facts =
                 |file: &ProjectFile, facts: Vec<crate::analyzer::ImportedFileEdgeFacts>| {
                     let file_index = visited_files.get();
@@ -1364,7 +1488,7 @@ impl RequestLocalDirectImportGraph {
                             .saturating_add(provenance_bytes)
                             > maximum
                     }) {
-                        brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
+                        byte_budget_reuse.set(execution_dependent());
                         self.budget_omitted.insert(file.clone());
                         self.compact = None;
                         byte_budget_exhausted.set(true);
@@ -1373,12 +1497,16 @@ impl RequestLocalDirectImportGraph {
 
                     let available_edges =
                         max_edges.saturating_sub(self.attempted_edges.saturating_sub(edge_work));
-                    if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
-                        edge_work,
-                        available_edges,
-                    )
-                    .allows(0)
+                    if let Err(refused) =
+                        brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                            edge_work,
+                            available_edges,
+                        )
+                        .try_allow(0)
                     {
+                        byte_budget_reuse
+                            .set(byte_budget_reuse.get().join(refused.reuse_verdict()));
+                        self.refused_edge_charge = Some((self.attempted_edges, max_edges));
                         exhausted = true;
                         self.budget_omitted.insert(file.clone());
                         self.budget_omitted
@@ -1397,7 +1525,7 @@ impl RequestLocalDirectImportGraph {
                     if maximum_working_bytes
                         .is_some_and(|maximum| self.estimated_working_bytes() > maximum)
                     {
-                        brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
+                        byte_budget_reuse.set(execution_dependent());
                         byte_budget_exhausted.set(true);
                         return false;
                     }
@@ -1410,11 +1538,12 @@ impl RequestLocalDirectImportGraph {
                 cancellation,
                 &mut visit_facts,
             );
+            reuse.join_in(byte_budget_reuse.get());
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                return (true, false);
+                return ForwardResolution::new(true, false, reuse);
             }
             if byte_budget_exhausted.get() {
-                return (true, true);
+                return ForwardResolution::new(true, true, reuse);
             }
             if streamed.is_none() {
                 assert_eq!(visited_files.get(), 0);
@@ -1425,7 +1554,7 @@ impl RequestLocalDirectImportGraph {
                 }
                 for file in grouped_files.iter() {
                     if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                        return (true, false);
+                        return ForwardResolution::new(true, false, reuse);
                     }
                     let owned_imports;
                     let imports = if let Some(imports) =
@@ -1462,18 +1591,19 @@ impl RequestLocalDirectImportGraph {
                             edges: imported_edges,
                         }],
                     ) {
+                        reuse.join_in(byte_budget_reuse.get());
                         if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                            return (true, false);
+                            return ForwardResolution::new(true, false, reuse);
                         }
                         if byte_budget_exhausted.get() {
-                            return (true, true);
+                            return ForwardResolution::new(true, true, reuse);
                         }
                         break;
                     }
                 }
             }
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                return (true, false);
+                return ForwardResolution::new(true, false, reuse);
             }
             if let Some(dependencies) = provider.import_resolution_dependencies_for_ordinals(
                 grouped_files,
@@ -1507,12 +1637,12 @@ impl RequestLocalDirectImportGraph {
                 if maximum_working_bytes
                     .is_some_and(|maximum| self.estimated_working_bytes() > maximum)
                 {
-                    brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
-                    return (true, true);
+                    reuse.join_in(execution_dependent());
+                    return ForwardResolution::new(true, true, reuse);
                 }
             }
         }
-        (exhausted, false)
+        ForwardResolution::new(exhausted, false, reuse)
     }
 }
 
@@ -1545,6 +1675,7 @@ mod tests {
                 supported_sources: vec![true].into_boxed_slice(),
                 resolved_files: 1,
                 retained_bytes,
+                allocated_bytes: retained_bytes,
             }),
             metrics: DerivedLayerBuildMetrics {
                 resolved_files: 1,
@@ -1800,6 +1931,9 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11321: import graph work cuts omitted the refused file or edge dimension"
+    )]
     fn import_graph_projection_and_incremental_completion_match_edge_set() {
         use crate::analyzer::{AnalyzerQueryScope, QueryScope};
         let analyzer = FiniteImports::new(5, &[(0, 1), (0, 3), (1, 2)]);
@@ -1808,9 +1942,13 @@ mod tests {
         let mut graph = RequestLocalDirectImportGraph::new(&analyzer);
         assert!(!graph.reverse_relation_complete());
         assert!(graph.ensure_complete(&analyzer, token, 2, 10, None));
+        assert_eq!(graph.refused_file_charge(), Some((5, 2)));
+        assert_eq!(graph.refused_edge_charge(), None);
         assert!(!graph.is_complete());
         assert!(!graph.reverse_relation_complete());
         assert!(!graph.ensure_complete(&analyzer, token, 5, 10, None));
+        assert_eq!(graph.refused_file_charge(), None);
+        assert_eq!(graph.refused_edge_charge(), None);
         assert!(graph.reverse_relation_complete());
         analyzer.assert_projection(&graph);
         let calls = analyzer.calls.load(Ordering::Relaxed);
@@ -1826,15 +1964,16 @@ mod tests {
 
         let cancellation = CancellationToken::default();
         let mut snapshot = RequestLocalDirectImportGraph::new(&analyzer);
+        let resolution = snapshot.resolve_complete_for_snapshot(
+            &analyzer,
+            token,
+            2,
+            10,
+            &cancellation,
+            u64::MAX,
+        );
         assert_eq!(
-            snapshot.resolve_complete_for_snapshot(
-                &analyzer,
-                token,
-                2,
-                10,
-                &cancellation,
-                u64::MAX
-            ),
+            (resolution.exhausted, resolution.over_byte_budget),
             (true, false)
         );
         assert!(!snapshot.is_complete());

@@ -366,7 +366,7 @@ fn width(value: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::source::{MAX_RQLP_SEXP_DEPTH, MAX_RQLP_SEXP_NODES, MAX_RQLP_SOURCE_BYTES};
+    use crate::source::{MAX_RQLP_SEXP_DEPTH, MAX_RQLP_SOURCE_BYTES};
 
     fn at_width(source: &str, max_width: usize) -> String {
         format_rqlp_source_with_options(source, &PolicyFormatOptions::new(max_width).unwrap())
@@ -528,15 +528,13 @@ mod tests {
         let multiple = format_rqlp_source("(policy) (endpoint)").unwrap_err();
         assert_eq!(multiple.diagnostic.code, "invalid-s-expression");
 
-        let too_many_nodes = format!(
+        let large_source = format!(
             "(policy :future [{}])",
-            std::iter::repeat_n("x", MAX_RQLP_SEXP_NODES)
+            std::iter::repeat_n("x", 5_000)
                 .collect::<Vec<_>>()
                 .join(" ")
         );
-        let error = format_rqlp_source(&too_many_nodes).unwrap_err();
-        assert_eq!(error.diagnostic.code, "invalid-s-expression");
-        assert!(error.diagnostic.message.contains("node count"));
+        assert!(format_rqlp_source(&large_source).is_ok());
 
         let nesting = MAX_RQLP_SEXP_DEPTH + 1;
         let too_deep = format!("{}x{}", "(".repeat(nesting), ")".repeat(nesting));

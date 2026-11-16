@@ -101,6 +101,7 @@ mod rust_departing_wave2_root_tests {
         for schema in &registry.schemas {
             conn.execute_batch(schema).unwrap();
         }
+        brokk_bifrost_analysis::analyzer::store::resolution_operation::tests::native_query_plan_tests::shared_support::install_generated_views(conn).unwrap();
         let (_, package_members_sql) = registry
             .statements
             .iter()

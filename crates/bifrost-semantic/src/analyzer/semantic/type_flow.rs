@@ -45,11 +45,7 @@ use crate::analyzer::semantic::MemoryLocationKind;
 
 use crate::analyzer::semantic::ProcedureHandle;
 
-use crate::analyzer::semantic::ProcedureId;
-
 use crate::analyzer::semantic::ProgramPointId;
-
-use crate::analyzer::semantic::SemanticArtifactKey;
 
 use crate::analyzer::semantic::SemanticCallSite;
 
@@ -547,12 +543,15 @@ pub enum ConstructorResultEvidence {
 /// semantic artifact.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DispatchHintCallSiteKey {
-    procedure: (SemanticArtifactKey, ProcedureId),
+    procedure: crate::analyzer::semantic::DurableProcedureKey,
     call: CallSiteId,
 }
 
 impl DispatchHintCallSiteKey {
-    pub fn new(procedure: (SemanticArtifactKey, ProcedureId), call: CallSiteId) -> Self {
+    pub fn new(
+        procedure: crate::analyzer::semantic::DurableProcedureKey,
+        call: CallSiteId,
+    ) -> Self {
         Self { procedure, call }
     }
 
@@ -560,7 +559,7 @@ impl DispatchHintCallSiteKey {
         Self::new(procedure.durable_key(), call)
     }
 
-    pub fn procedure(&self) -> &(SemanticArtifactKey, ProcedureId) {
+    pub fn procedure(&self) -> &crate::analyzer::semantic::DurableProcedureKey {
         &self.procedure
     }
 
@@ -924,8 +923,8 @@ pub struct NormalReturnTypeConstraint {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassHierarchy {
     pub ancestors: Vec<ClassIdentity>,
-    /// `None` means the workspace descendant inventory is unavailable.
-    pub descendants: Option<Vec<ClassIdentity>>,
+    /// Proven descendants and explicit uncertainty about additional classes.
+    pub descendants: brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer<ClassIdentity>,
     pub unresolved_base: bool,
     pub dynamic_attributes: bool,
 }
@@ -936,7 +935,7 @@ impl ClassHierarchy {
     pub fn unknown() -> Self {
         Self {
             ancestors: Vec::new(),
-            descendants: None,
+            descendants: brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer::incomplete(brokk_bifrost_core::analyzer::capabilities::HierarchyOpenReason::DescendantIndexUnavailable),
             unresolved_base: true,
             dynamic_attributes: true,
         }

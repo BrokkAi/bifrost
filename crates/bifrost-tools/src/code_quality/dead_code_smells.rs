@@ -4,6 +4,9 @@
 //! cases.
 
 use crate::code_quality::ReportLines;
+use brokk_bifrost_analysis::analyzer::i_analyzer::{
+    SourceInventoryCompletion, SourceInventoryPreflight,
+};
 
 use crate::code_quality::append_ambiguous_path_notes;
 
@@ -134,6 +137,7 @@ pub struct ReportDeadCodeAndUnusedAbstractionSmellsParams {
 #[derive(Debug, Clone, Serialize)]
 pub struct ReportDeadCodeAndUnusedAbstractionSmellsResult {
     pub report: String,
+    pub completion: SourceInventoryCompletion,
     pub truncated: bool,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub ambiguous_paths: Vec<AmbiguousPathInput>,
@@ -198,6 +202,7 @@ pub fn report_dead_code_and_unused_abstraction_smells(
 ) -> ReportDeadCodeAndUnusedAbstractionSmellsResult {
     let query_scope =
         brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope::new(analyzer);
+    let source_inventory = SourceInventoryPreflight::acquire(analyzer);
     let generation = analyzer.project().analysis_generation();
     let threshold = positive_or(params.min_score, DEFAULT_MIN_SCORE);
     let findings_cap = positive_or(params.max_findings, DEFAULT_MAX_FINDINGS as i32) as usize;
@@ -302,13 +307,13 @@ pub fn report_dead_code_and_unused_abstraction_smells(
                 entry.languages.contains(&language).then_some(provider)
             })
         {
-            let inventory = analyzer
-                .source_file_inventory()
+            let inventory = source_inventory
                 .rows
-                .into_iter()
+                .iter()
                 .filter(|file| {
                     brokk_bifrost_core::analyzer::common::language_for_file(file) == language
                 })
+                .cloned()
                 .collect::<Vec<_>>();
             if let Some(failure) = provider.input_failure(analyzer, &inventory) {
                 for candidate in &candidates {
@@ -356,11 +361,6 @@ pub fn report_dead_code_and_unused_abstraction_smells(
     // sight of a language that has a proof, because its routing memo is what makes the
     // whole-workspace facts a per-report cost rather than a per-candidate one.
     let mut buckets: HashMap<EdgePassId, DeadCodeBulkBucket> = HashMap::default();
-    struct NativeDeadCodeBucket {
-        provider: &'static dyn NativeWorkspaceGraphProvider,
-        languages: Vec<Language>,
-        candidates: Vec<CodeUnit>,
-    }
     let mut native_buckets: HashMap<EdgePassId, NativeDeadCodeBucket> = HashMap::default();
     // Deferred queries retain their original skip positions; grouping must not
     // change which ten explanations the report presents first.
@@ -512,13 +512,13 @@ pub fn report_dead_code_and_unused_abstraction_smells(
             findings.extend(
                 prove_native_candidates(
                     &mut declaration_syntax,
-                    bucket.provider,
-                    &bucket.languages,
-                    &bucket.candidates,
+                    &bucket,
+                    &source_inventory,
                     usage_candidate_file_cap,
                     usage_cap,
                     &mut skipped,
                 )
+                .findings(&mut skipped)
                 .into_iter()
                 .filter(|finding| finding.score >= threshold),
             );
@@ -552,6 +552,13 @@ pub fn report_dead_code_and_unused_abstraction_smells(
         );
     }
 
+    if !source_inventory.completion.is_complete() {
+        findings.clear();
+        skipped.push(format!(
+            "dead-code analysis uncertain: {:?}; no absence findings published",
+            source_inventory.completion
+        ));
+    }
     let incomplete = crate::result_incomplete::query_read_incomplete(&query_scope);
     if !incomplete.is_empty() {
         truncated = true;
@@ -644,6 +651,7 @@ pub fn report_dead_code_and_unused_abstraction_smells(
         append_skipped(&mut lines, &skipped);
         return ReportDeadCodeAndUnusedAbstractionSmellsResult {
             report: lines.build(),
+            completion: source_inventory.completion,
             truncated,
             ambiguous_paths,
         };
@@ -683,6 +691,7 @@ pub fn report_dead_code_and_unused_abstraction_smells(
 
     ReportDeadCodeAndUnusedAbstractionSmellsResult {
         report: lines.build(),
+        completion: source_inventory.completion,
         truncated,
         ambiguous_paths,
     }
@@ -934,13 +943,17 @@ mod tests {
         let mut skipped = Vec::new();
         let findings = crate::code_quality::dead_code_smells::prove_native_candidates(
             &mut super::DeclarationSyntaxCache::new(&analyzer),
-            &provider,
-            &[Language::Rust],
-            &candidates,
+            &super::NativeDeadCodeBucket {
+                provider: &provider,
+                languages: vec![Language::Rust],
+                candidates: candidates.clone(),
+            },
+            &super::SourceInventoryPreflight::acquire(&analyzer),
             10,
             2,
             &mut skipped,
-        );
+        )
+        .findings(&mut skipped);
         assert!(
             findings.is_empty(),
             "an unreadable fact base proves nothing dead: {findings:#?}"
@@ -1266,13 +1279,17 @@ mod tests {
             let mut skipped = Vec::new();
             let findings = crate::code_quality::dead_code_smells::prove_native_candidates(
                 &mut super::DeclarationSyntaxCache::new(&analyzer),
-                &provider,
-                &[Language::Java],
-                std::slice::from_ref(&candidate),
+                &super::NativeDeadCodeBucket {
+                    provider: &provider,
+                    languages: vec![Language::Java],
+                    candidates: vec![candidate.clone()],
+                },
+                &super::SourceInventoryPreflight::acquire(&analyzer),
                 10,
                 2,
                 &mut skipped,
-            );
+            )
+            .findings(&mut skipped);
             assert_eq!(findings.len(), expected_findings);
             assert_eq!(skipped.is_empty(), expected_findings == 1);
         }
@@ -1630,6 +1647,164 @@ mod tests {
         );
     }
 
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12278: consumers dropped QueryBatch.complete and relied on an ambient-failure side channel"
+    )]
+    fn incomplete_source_inventory_withholds_absence_proofs() {
+        use brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer;
+        use brokk_bifrost_jvm_analysis::analyzer::java::JavaAnalyzer;
+        struct IncompleteInventoryAnalyzer {
+            inner: Box<dyn IAnalyzer>,
+            source_reads: std::sync::atomic::AtomicUsize,
+        }
+        impl CodeUnitIndex for IncompleteInventoryAnalyzer {
+            fn project(&self) -> &dyn Project {
+                self.inner.project()
+            }
+            fn languages(&self) -> std::collections::BTreeSet<Language> {
+                self.inner.languages()
+            }
+            fn analyzed_files(&self) -> Vec<ProjectFile> {
+                self.inner.analyzed_files()
+            }
+            fn declarations(&self, file: &ProjectFile) -> std::collections::BTreeSet<CodeUnit> {
+                self.inner.declarations(file)
+            }
+            fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
+                self.inner.all_declarations()
+            }
+            fn search_definitions(
+                &self,
+                pattern: &str,
+                auto_quote: bool,
+            ) -> std::collections::BTreeSet<CodeUnit> {
+                self.inner.search_definitions(pattern, auto_quote)
+            }
+            fn enclosing_code_unit(
+                &self,
+                file: &ProjectFile,
+                range: &super::Range,
+            ) -> Option<CodeUnit> {
+                self.inner.enclosing_code_unit(file, range)
+            }
+            fn enclosing_code_unit_for_lines(
+                &self,
+                file: &ProjectFile,
+                start: usize,
+                end: usize,
+            ) -> Option<CodeUnit> {
+                self.inner.enclosing_code_unit_for_lines(file, start, end)
+            }
+            fn get_skeleton(&self, unit: &CodeUnit) -> Option<String> {
+                self.inner.get_skeleton(unit)
+            }
+            fn get_skeleton_header(&self, unit: &CodeUnit) -> Option<String> {
+                self.inner.get_skeleton_header(unit)
+            }
+            fn get_sources(
+                &self,
+                unit: &CodeUnit,
+                comments: bool,
+            ) -> std::collections::BTreeSet<String> {
+                self.inner.get_sources(unit, comments)
+            }
+            fn ranges_of(&self, unit: &CodeUnit) -> Vec<super::Range> {
+                self.inner.ranges_of(unit)
+            }
+            fn indexed_source(&self, file: &ProjectFile) -> Option<String> {
+                self.source_reads
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.inner.indexed_source(file)
+            }
+        }
+        impl IAnalyzer for IncompleteInventoryAnalyzer {
+            fn source_file_inventory(
+                &self,
+            ) -> brokk_bifrost_core::analyzer::query_batch::QueryBatch<ProjectFile> {
+                let mut batch = self.inner.source_file_inventory();
+                assert!(batch.rows.len() >= 2);
+                batch.rows.truncate(1);
+                brokk_bifrost_core::analyzer::query_batch::QueryBatch::incomplete(
+                    batch.rows,
+                    batch.inspected,
+                )
+            }
+
+            fn update_with_listing(
+                &self,
+                _files: &std::collections::BTreeSet<ProjectFile>,
+                _listing: Option<
+                    &brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing,
+                >,
+            ) -> Self {
+                unimplemented!()
+            }
+            fn update_all(&self) -> Self {
+                unimplemented!()
+            }
+            fn is_access_expression(&self, file: &ProjectFile, start: usize, end: usize) -> bool {
+                self.inner.is_access_expression(file, start, end)
+            }
+            fn find_nearest_declaration(
+                &self,
+                file: &ProjectFile,
+                start: usize,
+                end: usize,
+                name: &str,
+            ) -> Option<brokk_bifrost_core::analyzer::model::DeclarationInfo> {
+                self.inner.find_nearest_declaration(file, start, end, name)
+            }
+        }
+
+        let fixture = InlineTestProject::with_language(Language::Java)
+            .file("Target.java", "class Target { private void unused() {} }")
+            .file("Caller.java", "class Caller {}")
+            .build();
+        let analyzer = IncompleteInventoryAnalyzer {
+            inner: Box::new(JavaAnalyzer::new(fixture.project_dyn())),
+            source_reads: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let scope =
+            brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope::new(&analyzer);
+        let result = super::report_dead_code_and_unused_abstraction_smells(
+            &analyzer,
+            super::ReportDeadCodeAndUnusedAbstractionSmellsParams {
+                min_score: 1,
+                ..Default::default()
+            },
+        );
+        assert_eq!(result.completion, super::SourceInventoryCompletion::Uncertain(
+            brokk_bifrost_analysis::analyzer::i_analyzer::SourceInventoryIncompleteReason::SourceInventoryIncomplete));
+        assert!(
+            result.report.contains("no absence findings published"),
+            "{}",
+            result.report
+        );
+        assert!(!result.report.contains("| unused |"), "{}", result.report);
+        assert!(
+            result.report.contains("Findings shown: 0 of 0"),
+            "{}",
+            result.report
+        );
+        assert!(scope.store_error().is_none());
+        use brokk_bifrost_analysis::analyzer::usages::workspace_graph::{
+            UsageEcosystem, WorkspaceUsageCatalog, WorkspaceUsageGraphBuildOutcome,
+            build_workspace_usage_graph_with_passes,
+        };
+        let catalog = WorkspaceUsageCatalog::build(&analyzer);
+        let outcome = build_workspace_usage_graph_with_passes(
+            &analyzer,
+            catalog,
+            &[UsageEcosystem::Jvm].into_iter().collect(),
+            &brokk_bifrost_core::cancellation::CancellationToken::default(),
+            &[],
+        );
+        assert!(matches!(
+            outcome,
+            WorkspaceUsageGraphBuildOutcome::Incomplete(_)
+        ));
+    }
     #[test]
     #[hardwon(
         "dce884c96143: quicksilver round 12 on brokk-bifrost-analysis: declaration visibility read words from annotations and bodies"
@@ -2733,15 +2908,43 @@ fn prove_bulk_candidates(
     }
 }
 
+struct NativeDeadCodeBucket<'a> {
+    provider: &'a dyn NativeWorkspaceGraphProvider,
+    languages: Vec<Language>,
+    candidates: Vec<CodeUnit>,
+}
+
+enum NativeCandidateProof {
+    Complete(Vec<DeadCodeFinding>),
+    Uncertain(brokk_bifrost_analysis::analyzer::i_analyzer::SourceInventoryIncompleteReason),
+}
+
+impl NativeCandidateProof {
+    fn findings(self, skipped: &mut Vec<String>) -> Vec<DeadCodeFinding> {
+        match self {
+            Self::Complete(findings) => findings,
+            Self::Uncertain(reason) => {
+                skipped.push(format!("native absence proof uncertain: {reason:?}"));
+                Vec::new()
+            }
+        }
+    }
+}
+
 fn prove_native_candidates(
     declaration_syntax: &mut DeclarationSyntaxCache<'_>,
-    provider: &dyn NativeWorkspaceGraphProvider,
-    languages: &[Language],
-    candidates: &[CodeUnit],
+    bucket: &NativeDeadCodeBucket<'_>,
+    inventory: &SourceInventoryPreflight,
     usage_candidate_file_cap: usize,
     usage_cap: usize,
     skipped: &mut Vec<String>,
-) -> Vec<DeadCodeFinding> {
+) -> NativeCandidateProof {
+    let provider = bucket.provider;
+    let languages = &bucket.languages;
+    let candidates = &bucket.candidates;
+    if let SourceInventoryCompletion::Uncertain(reason) = &inventory.completion {
+        return NativeCandidateProof::Uncertain(reason.clone());
+    }
     let analyzer = declaration_syntax.analyzer;
     // Input authority before admission. A candidate is called dead because no
     // edge reaches it, so a pass whose canonical facts could not be read
@@ -2753,15 +2956,15 @@ fn prove_native_candidates(
     // Publication readiness is part of the analyzed-file predicate, so a file
     // whose canonical facts were never published is missing from
     // `analyzed_files` for exactly the reason the preflight exists to report.
-    let analyzable = analyzer
-        .source_file_inventory()
+    let analyzable = inventory
         .rows
-        .into_iter()
+        .iter()
         .filter(|file| {
             languages.contains(&brokk_bifrost_core::analyzer::common::language_for_file(
                 file,
             ))
         })
+        .cloned()
         .collect::<Vec<_>>();
     if let Some(failure) = provider.input_failure(analyzer, &analyzable) {
         for candidate in candidates {
@@ -2772,7 +2975,7 @@ fn prove_native_candidates(
                 failure.files
             ));
         }
-        return Vec::new();
+        return NativeCandidateProof::Complete(Vec::new());
     }
     // A source that admission refused may reference any candidate: an
     // explained exclusion still leaves every candidate's inbound edges unknown.
@@ -2790,7 +2993,7 @@ fn prove_native_candidates(
                 candidate.fq_name(),
             ));
         }
-        return Vec::new();
+        return NativeCandidateProof::Complete(Vec::new());
     }
     // Admission is the analyzed listing: only a published file can contribute
     // an edge, and the preflight above has already reported any that cannot.
@@ -2828,7 +3031,7 @@ fn prove_native_candidates(
                     candidate.fq_name()
                 ));
             }
-            return Vec::new();
+            return NativeCandidateProof::Complete(Vec::new());
         }
     };
     if files.len() > usage_candidate_file_cap {
@@ -2843,7 +3046,7 @@ fn prove_native_candidates(
                 files.len()
             ));
         }
-        return Vec::new();
+        return NativeCandidateProof::Complete(Vec::new());
     }
     let projection = match provider.project_dead_code(
         analyzer,
@@ -2928,7 +3131,7 @@ fn prove_native_candidates(
                     candidate.fq_name()
                 ));
             }
-            return Vec::new();
+            return NativeCandidateProof::Complete(Vec::new());
         }
     };
     // Deliberately excluded callers have already had their names checked by
@@ -3083,7 +3286,7 @@ fn prove_native_candidates(
             findings.push(finding);
         }
     }
-    findings
+    NativeCandidateProof::Complete(findings)
 }
 
 fn prove_fqn_candidates(

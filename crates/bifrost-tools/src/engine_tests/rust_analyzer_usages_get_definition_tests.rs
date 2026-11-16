@@ -43,6 +43,9 @@ mod rust_departing_tests_tests {
         let mut context = DefinitionBatchContext::new(analyzer, scope.token());
         let candidate = CodeUnit::file_scope(file.clone());
         let outcome = DefinitionLookupOutcome {
+            selected_sites: Vec::new(),
+            inventory_evidence: None,
+            incomplete_evidence: None,
             modeled_definitions: Vec::new(),
             status: DefinitionLookupStatus::Incomplete,
             reference: None,
@@ -120,6 +123,9 @@ mod rust_departing_tests_tests {
         let scope = AnalyzerQueryScope::new(analyzer);
         let mut context = DefinitionBatchContext::new(analyzer, scope.token());
         let outcome = DefinitionLookupOutcome {
+            selected_sites: Vec::new(),
+            inventory_evidence: None,
+            incomplete_evidence: None,
             modeled_definitions: Vec::new(),
             status: DefinitionLookupStatus::Cancelled,
             reference: None,

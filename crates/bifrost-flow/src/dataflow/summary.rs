@@ -30,7 +30,7 @@ use super::{
     PathQualityFrontier, SolverTermination, SolverWork, SummaryBoundary, SummaryBoundaryKind,
     SummaryCoverage, SummaryDataflowError, SummaryDataflowResult, SummaryEdge, SummaryEntry,
     SummaryEntryTransfer, SummaryIncomingCall, SummaryMetrics, SummaryReachedFact,
-    SummarySemanticStatus, TabulationEndSummary, WitnessRetentionLimits,
+    SummarySemanticStatus, TabulationEndSummary, WitnessRetentionLimits, call_observation_edge,
 };
 
 const ZERO_FACT_ID: FactId = FactId::new(0);
@@ -69,6 +69,7 @@ impl MemberReadReceipt {
         self.channels.unattributed_reads |= usize::from(channels.unattributed_reads != 0);
         self.channels.execution_dependences |= usize::from(channels.execution_dependences != 0);
         self.channels.reuse_refused |= channels.reuse_refused;
+        self.channels.store_failed |= channels.store_failed;
     }
 }
 
@@ -2140,15 +2141,12 @@ where
                     // which every consumer reads as a call needing a matched
                     // return (#1954). It uses the same continuation kind a
                     // native callee's boundary observation carries.
-                    let observation_edge = ProcedureIcfgEdge {
-                        source: point.clone(),
-                        target: point.clone(),
-                        kind: IcfgEdgeKind::CallToNormalContinuation,
-                        origin: Some(origin.clone()),
-                        proof: transfer.proof.clone(),
-                        completeness: transfer.completeness.clone(),
-                        boundary: None,
-                    };
+                    let observation_edge = call_observation_edge(
+                        point,
+                        &origin,
+                        &transfer.proof,
+                        &transfer.completeness,
+                    );
                     let witness_source = if self.witness_arena.is_enabled() {
                         Some(PathWitnessSource::Edge {
                             predecessor: queued.evidence.ok_or(

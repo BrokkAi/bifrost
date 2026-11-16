@@ -100,23 +100,23 @@ pub fn weight_code_unit_vec_by_unit(_key: &CodeUnit, value: &Arc<Vec<CodeUnit>>)
 impl RetainedBytes for ProjectFile {
     fn retained_bytes(&self) -> usize {
         // The root is interned and shared by every file of the project.
-        size_of::<Self>() + self.rel_path().as_os_str().len()
+        size_of::<Self>() + self.allocated_heap_bytes()
     }
 }
 impl RetainedBytes for CodeUnit {
     fn retained_bytes(&self) -> usize {
-        estimate_code_unit(self)
+        self.allocated_bytes()
     }
 }
 impl RetainedBytes for ExportIndex {
     fn retained_bytes(&self) -> usize {
-        export_index_bytes(self)
+        allocated_export_index_bytes(self)
     }
 }
 impl<T: RetainedBytes, S> RetainedBytes for std::collections::HashSet<T, S> {
     fn retained_bytes(&self) -> usize {
         size_of::<Self>()
-            + self.capacity() * size_of::<T>()
+            + crate::hash::allocated_table_slot_bytes::<T>(self.capacity())
             + self
                 .iter()
                 .map(|item| item.retained_bytes().saturating_sub(size_of::<T>()))
@@ -126,7 +126,7 @@ impl<T: RetainedBytes, S> RetainedBytes for std::collections::HashSet<T, S> {
 impl<K: RetainedBytes, V: RetainedBytes, S> RetainedBytes for std::collections::HashMap<K, V, S> {
     fn retained_bytes(&self) -> usize {
         size_of::<Self>()
-            + self.capacity() * (size_of::<K>() + size_of::<V>())
+            + crate::hash::allocated_table_slot_bytes::<(K, V)>(self.capacity())
             + self
                 .iter()
                 .map(|(key, value)| {
@@ -147,4 +147,41 @@ fn estimate_code_unit(code_unit: &CodeUnit) -> usize {
 pub fn weight_bytes(bytes: impl Into<u128>) -> u32 {
     let bytes = bytes.into();
     bytes.clamp(1, u128::from(u32::MAX)) as u32
+}
+
+fn allocated_export_index_bytes(value: &ExportIndex) -> usize {
+    use crate::allocation_size::allocation_size;
+    size_of::<ExportIndex>()
+        + crate::hash::allocated_table_slot_bytes::<(String, ExportEntry)>(
+            value.exports_by_name.capacity(),
+        )
+        + value
+            .exports_by_name
+            .iter()
+            .map(|(name, entry)| {
+                allocation_size(name.capacity())
+                    + match entry {
+                        ExportEntry::Local { local_name } => allocation_size(local_name.capacity()),
+                        ExportEntry::ReexportedNamed {
+                            module_specifier,
+                            imported_name,
+                        } => {
+                            allocation_size(module_specifier.capacity())
+                                + allocation_size(imported_name.capacity())
+                        }
+                        ExportEntry::ReexportedModule { module_specifier } => {
+                            allocation_size(module_specifier.capacity())
+                        }
+                        ExportEntry::Default { local_name } => local_name
+                            .as_ref()
+                            .map_or(0, |name| allocation_size(name.capacity())),
+                    }
+            })
+            .sum::<usize>()
+        + crate::hash::allocated_vec_slot_bytes(&value.reexport_stars)
+        + value
+            .reexport_stars
+            .iter()
+            .map(|star| allocation_size(star.module_specifier.capacity()))
+            .sum::<usize>()
 }

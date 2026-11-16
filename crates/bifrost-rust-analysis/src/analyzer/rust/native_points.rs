@@ -3,7 +3,10 @@
 //! Source authority, canonical binding identity, and typed completion are
 //! established inside the selected operation before public result projection.
 
+use brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelNamespace;
+
 use crate::analyzer::rust::RustAnalyzer;
+use brokk_bifrost_analysis::analyzer::derivation_host::read_frame::OperationReadFrame;
 
 use brokk_bifrost_core::cancellation::CancellationToken;
 
@@ -29,6 +32,7 @@ use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResol
 
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation;
 
+#[cfg(test)]
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperationInput;
 
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperationOpenOutcome;
@@ -60,7 +64,9 @@ use brokk_bifrost_analysis::analyzer::usages::get_definition::{CallApplicationKi
 
 use brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupDiagnostic;
 
-use brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupOutcome;
+use brokk_bifrost_analysis::analyzer::usages::get_definition::{
+    DefinitionLookupEvidence, DefinitionLookupOutcome, DefinitionLookupReason,
+};
 
 use brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupStatus;
 
@@ -167,14 +173,11 @@ impl<'analyzer> RustDefinitionOperationFactory<'analyzer> {
         })
     }
 
-    pub(crate) fn retain_exclusive_reader(
+    pub(crate) fn operation_read_frame<'store>(
         &self,
-    ) -> brokk_bifrost_analysis::analyzer::store::writer::RetainedExclusiveReader {
-        self.rust
-            .inner
-            .analyzer_store()
-            .conn
-            .retain_exclusive_reader()
+        operation: &SelectedResolutionOperation<'store, '_>,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<OperationReadFrame<'store>> {
+        self.rust.operation_read_frame(operation)
     }
 
     pub(crate) fn open(
@@ -222,23 +225,23 @@ impl<'analyzer> RustDefinitionOperationFactory<'analyzer> {
             .inner
             .analyzer_store()
             .open_selected_resolution_operation(
-                SelectedResolutionOperationInput::new(
-                    self.rust.inner.project(),
-                    self.rust.inner.workspace_id(),
-                    self.snapshots.as_ref(),
-                    &self.languages,
-                    &overlay_inputs.masks,
-                )
-                .with_content_mounts(overlay_inputs.content_mounts.clone()),
+                self.rust
+                    .selected_resolution_operation_input(
+                        self.snapshots.as_ref(),
+                        &self.languages,
+                        &overlay_inputs.masks,
+                    )
+                    .with_content_mounts(overlay_inputs.content_mounts.clone()),
                 cancellation,
             )
             .map(|outcome| match outcome {
                 SelectedResolutionOperationOpenOutcome::Ready(operation) => {
+                    let operation = *operation;
                     SelectedResolutionOperationOpenOutcome::Ready(Box::new(
                         if macro_frontier_cache_enabled() {
-                            (*operation).with_macro_frontier_reads(Box::new(self.analyzer))
+                            operation.with_macro_frontier_reads(Box::new(self.analyzer))
                         } else {
-                            *operation
+                            operation
                         },
                     ))
                 }
@@ -295,39 +298,38 @@ impl<'analyzer> RustDefinitionOperationFactory<'analyzer> {
     }
 }
 
+impl RustDefinitionOperationOpenFailure {
+    pub(crate) fn from_open_outcome(
+        outcome: brokk_bifrost_analysis::analyzer::store::Result<
+            SelectedResolutionOperationOpenOutcome<'_, '_>,
+        >,
+    ) -> Self {
+        match outcome {
+            Ok(SelectedResolutionOperationOpenOutcome::Unavailable(reason)) => {
+                Self::Unavailable(format!("{reason:?}"))
+            }
+            Ok(SelectedResolutionOperationOpenOutcome::Stale(reason)) => {
+                Self::Stale(format!("{reason:?}"))
+            }
+            Ok(SelectedResolutionOperationOpenOutcome::Cancelled) => Self::Cancelled,
+            Ok(SelectedResolutionOperationOpenOutcome::Ready(_)) => {
+                unreachable!("ready selected Rust operation is not an open failure")
+            }
+            Err(error) => Self::StoreError(error.to_string()),
+        }
+    }
+}
+
 pub(crate) fn resolve_rust_definition_open_failure(
     query: BoundedReceiverQuery<'_>,
     outcome: brokk_bifrost_analysis::analyzer::store::Result<
         SelectedResolutionOperationOpenOutcome<'_, '_>,
     >,
 ) -> BoundedResolution<DefinitionLookupOutcome> {
-    match outcome {
-        Ok(SelectedResolutionOperationOpenOutcome::Unavailable(reason)) => {
-            resolve_rust_definition_open_failure_for_batch(
-                query,
-                &RustDefinitionOperationOpenFailure::Unavailable(format!("{reason:?}")),
-            )
-        }
-        Ok(SelectedResolutionOperationOpenOutcome::Stale(reason)) => {
-            resolve_rust_definition_open_failure_for_batch(
-                query,
-                &RustDefinitionOperationOpenFailure::Stale(format!("{reason:?}")),
-            )
-        }
-        Ok(SelectedResolutionOperationOpenOutcome::Cancelled) => {
-            resolve_rust_definition_open_failure_for_batch(
-                query,
-                &RustDefinitionOperationOpenFailure::Cancelled,
-            )
-        }
-        Ok(SelectedResolutionOperationOpenOutcome::Ready(_)) => {
-            unreachable!("ready selected Rust operation is not an open failure")
-        }
-        Err(error) => resolve_rust_definition_open_failure_for_batch(
-            query,
-            &RustDefinitionOperationOpenFailure::StoreError(error.to_string()),
-        ),
-    }
+    resolve_rust_definition_open_failure_for_batch(
+        query,
+        &RustDefinitionOperationOpenFailure::from_open_outcome(outcome),
+    )
 }
 
 pub(crate) fn resolve_rust_definition_open_failure_for_batch(
@@ -506,6 +508,9 @@ fn resolve_rust_definition_bounded_with_after_open_and_evidence(
                 "native_unavailable",
                 format!("selected Rust point operation is unavailable: {reason:?}"),
             )
+            .with_reason(DefinitionLookupReason::Execution(
+                brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause::Provider,
+            ))
             .into_complete_resolution();
         }
         Ok(SelectedResolutionOperationOpenOutcome::Stale(reason)) => {
@@ -671,6 +676,7 @@ fn resolve_rust_definition_with_operation(
             "macro_expansion_context_required",
             "the relative module anchor in this macro template requires an invocation context",
         )
+        .with_reason(DefinitionLookupReason::MacroExpansionContextRequired)
         .into_complete_resolution();
     }
 
@@ -738,6 +744,7 @@ fn resolve_rust_definition_with_operation(
                 "unknown_activation",
                 "the selected Rust cfg predicate contains an undecidable atom",
             )
+            .with_reason(DefinitionLookupReason::UnknownActivation)
             .into_complete_resolution();
         }
         Ok(None) => {
@@ -1021,7 +1028,7 @@ fn resolve_rust_definition_with_operation(
                     DefinitionLookupStatus::Incomplete,
                     brokk_bifrost_analysis::analyzer::usages::get_definition::MACRO_FRAGMENT_NO_NAMESPACE_DIAGNOSTIC_KIND,
                     "the matched macro fragment carries no namespace and has no replayed reference site",
-                )
+                ).with_reason(DefinitionLookupReason::MacroFragmentNoNamespace)
                 .into_complete_value();
             }
 
@@ -1056,7 +1063,7 @@ fn resolve_rust_definition_with_operation(
 enum RustForwardQuery {
     /// Answered without the store's reference route (a refuted or undecidable
     /// cfg, a cancelled or failed cfg lookup).
-    Answered(BoundedResolution<DefinitionLookupOutcome>),
+    Answered(Box<BoundedResolution<DefinitionLookupOutcome>>),
     /// The forward route does not handle this site; the point route does.
     PointRoute,
     /// Probe `declaration` first: a declaration answer there leaves the site to
@@ -1066,6 +1073,12 @@ enum RustForwardQuery {
         reference: SelectedSemanticLocator,
         conditional_cfg: Option<brokk_bifrost_core::analyzer::rust_facts::RustCfgCondition>,
     },
+}
+
+impl RustForwardQuery {
+    fn answered(answer: BoundedResolution<DefinitionLookupOutcome>) -> Self {
+        Self::Answered(Box::new(answer))
+    }
 }
 
 fn prepare_rust_forward_query(
@@ -1099,7 +1112,7 @@ fn prepare_rust_forward_query(
                     conditional.then_some(condition)
                 }
                 Ok(Some((RustSelectedActivation::Inactive, _))) => {
-                    return RustForwardQuery::Answered(
+                    return RustForwardQuery::answered(
                         complete_definition(
                             query.site,
                             DefinitionLookupStatus::NoDefinition,
@@ -1110,23 +1123,24 @@ fn prepare_rust_forward_query(
                     );
                 }
                 Ok(Some((RustSelectedActivation::Unknown, _))) => {
-                    return RustForwardQuery::Answered(
+                    return RustForwardQuery::answered(
                         complete_definition(
                             query.site,
                             DefinitionLookupStatus::Incomplete,
                             "unknown_activation",
                             "the selected Rust cfg predicate contains an undecidable atom",
                         )
+                        .with_reason(DefinitionLookupReason::UnknownActivation)
                         .into_complete_resolution(),
                     );
                 }
                 Ok(None) => {
-                    return RustForwardQuery::Answered(BoundedResolution::Cancelled {
+                    return RustForwardQuery::answered(BoundedResolution::Cancelled {
                         work: ReceiverAnalysisWork::default(),
                     });
                 }
                 Err(error) => {
-                    return RustForwardQuery::Answered(
+                    return RustForwardQuery::answered(
                         complete_definition(
                             query.site,
                             DefinitionLookupStatus::Unavailable,
@@ -1197,7 +1211,7 @@ fn resolve_rust_definitions_in_operation(
         let (declaration, reference, conditional_cfg) =
             match prepare_rust_forward_query(operation, query, cancellation) {
                 RustForwardQuery::Answered(answer) => {
-                    results[index] = Some(answer);
+                    results[index] = Some(*answer);
                     continue;
                 }
                 RustForwardQuery::PointRoute => continue,
@@ -1467,6 +1481,7 @@ fn claim_external_route_head(
         return;
     }
     if head_names_macro_module {
+        outcome.add_incomplete_reason(DefinitionLookupReason::MacroModuleHeadUnbound);
         outcome.status = DefinitionLookupStatus::Incomplete;
         outcome.diagnostics.push(DefinitionLookupDiagnostic {
             claim: None,
@@ -1541,10 +1556,13 @@ fn adapt_declaration_value(
                 "native_cancelled",
                 "selected Rust declaration lookup was cancelled",
             )
+            .with_reason(DefinitionLookupReason::Execution(
+                brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause::Cancelled,
+            ))
             .0;
         }
         SelectedResolutionOperationOutcome::Native(
-            SelectedRustSourceDefinitionProjection::Unavailable,
+            SelectedRustSourceDefinitionProjection::Unavailable(_),
         ) => {
             return complete_definition(
                 site,
@@ -1574,11 +1592,20 @@ fn adapt_declaration_value(
         }
     };
     let mut definitions = Vec::new();
+    let mut selected_sites = Vec::new();
     let mut lexical = Vec::new();
     let mut withdrawn = 0usize;
     for (_, definition) in rows {
         match definition {
-            SelectedRustSourceDefinition::Unit(unit) => definitions.push(unit),
+            SelectedRustSourceDefinition::Unit(unit, declaration_range) => {
+                selected_sites.push(
+                    brokk_bifrost_analysis::analyzer::usages::get_definition::NavigationTarget {
+                        code_unit: unit.clone(),
+                        declaration_range,
+                    },
+                );
+                definitions.push(unit);
+            }
             SelectedRustSourceDefinition::Lexical(row) => lexical.push(row),
             // The parser published neither a `CodeUnit` nor a lexical binder
             // for this declaration, so neither vocabulary has a row to carry
@@ -1611,12 +1638,19 @@ fn adapt_declaration_value(
         )
         .0;
     }
-    let status = if definitions.len() + lexical.len() == 1 {
+    selected_sites.sort_by(|left, right| {
+        (&left.code_unit, left.declaration_range).cmp(&(&right.code_unit, right.declaration_range))
+    });
+    selected_sites.dedup();
+    let status = if selected_sites.len() + lexical.len() == 1 {
         DefinitionLookupStatus::Resolved
     } else {
         DefinitionLookupStatus::Ambiguous
     };
     let outcome = DefinitionLookupOutcome {
+        selected_sites,
+        inventory_evidence: None,
+        incomplete_evidence: None,
         modeled_definitions: Vec::new(),
         status,
         reference: None,
@@ -1708,14 +1742,9 @@ pub(crate) fn resolve_rust_type_bounded(
             .into_complete_resolution();
         }
     };
-    let input = SelectedResolutionOperationInput::new(
-        rust.inner.project(),
-        rust.inner.workspace_id(),
-        snapshots.as_ref(),
-        &languages,
-        &masks,
-    )
-    .with_content_mounts(content_mounts);
+    let input = rust
+        .selected_resolution_operation_input(snapshots.as_ref(), &languages, &masks)
+        .with_content_mounts(content_mounts);
     let mut operation = match rust
         .inner
         .analyzer_store()
@@ -1937,8 +1966,10 @@ fn modeled_expression_type<'analyzer>(
     else {
         return None;
     };
-    let overlay = query.analyzer.semantic_model_overlay()?;
-    let symbol = overlay.symbols_named_in_family(&owner, "rust").unique()?;
+    let overlay = query.analyzer.semantic_model_overlay_read().published()?;
+    let symbol = overlay
+        .symbols_named_in_family(&owner, "rust", SemanticModelNamespace::TypeOrModule)
+        .unique()?;
     if !matches!(
         symbol.kind,
         SemanticModelSymbolKind::Struct
@@ -2057,6 +2088,507 @@ fn selected_member_call_evidence(
     }
 }
 
+fn certify_glob_name_absence(
+    rust: &RustAnalyzer,
+    file: &brokk_bifrost_core::analyzer::model::ProjectFile,
+    import: &brokk_bifrost_core::analyzer::model::ImportInfo,
+    namespace: brokk_bifrost_rust::graph_support::RustGlobNamespace,
+    name: &str,
+) -> Result<(), PrimitiveUniverseRefusal> {
+    use brokk_bifrost_rust::graph_support::{RustFactSource, RustGlobNameAbsence};
+    match rust.local_glob_name_absence(file, import, namespace, name) {
+        RustGlobNameAbsence::ClosedAbsent => Ok(()),
+        RustGlobNameAbsence::Present => Err(PrimitiveUniverseRefusal::Imports),
+        RustGlobNameAbsence::Incomplete => Err(PrimitiveUniverseRefusal::ShadowSurface),
+        RustGlobNameAbsence::ExternalGlobInventoryUnavailable => {
+            Err(PrimitiveUniverseRefusal::ExternalGlobInventoryUnavailable)
+        }
+    }
+}
+
+/// Whether the stored wildcard import `info` is in scope at `byte`, by the
+/// shared owner rule on the same file's projected imports. A glob with no
+/// projected counterpart has an unknown scope and counts: fail closed.
+fn primitive_glob_is_visible(
+    projected: &[brokk_bifrost_rust::imports::RustProjectedImport],
+    module: (usize, usize),
+    byte: usize,
+    info: &brokk_bifrost_core::analyzer::model::ImportInfo,
+) -> bool {
+    let Some(path) = info.path.as_ref() else {
+        return true;
+    };
+    let mut counterparts = projected
+        .iter()
+        .filter(|candidate| {
+            candidate
+                .import
+                .info
+                .path
+                .as_ref()
+                .is_some_and(|candidate| {
+                    candidate.declaration_start_byte == path.declaration_start_byte
+                        && candidate.segments == path.segments
+                })
+        })
+        .peekable();
+    counterparts.peek().is_none()
+        || counterparts.any(|candidate| candidate.owner.visible_at(module, byte))
+}
+
+/// A conservative whole-file proof, shared by the reference and crate roots.
+/// Operand fragments live only for this proof; no new cross-request state.
+///
+/// `glob_site` is the byte of the query site when `file` is the query's own
+/// file. Only a glob import visible there (`RustImportOwner::visible_at`: its
+/// own module or an enclosing block, never a parent, child or sibling module
+/// or another function's body) can bind the path head, so only those globs
+/// are asked about. `None` is for a crate root other than the query's file:
+/// its module is not the query's module, and the walk below refuses every
+/// macro invocation but four standard ones, so no `include!` can place the
+/// query's file inside it.
+fn primitive_shadow_surface_is_closed(
+    rust: &RustAnalyzer,
+    file: &brokk_bifrost_core::analyzer::model::ProjectFile,
+    root: tree_sitter::Node<'_>,
+    source: &str,
+    spelling: &str,
+    glob_site: Option<usize>,
+    cancellation: &CancellationToken,
+) -> Result<(), PrimitiveUniverseRefusal> {
+    use brokk_bifrost_analysis::analyzer::{QueryScope, i_analyzer::AnalyzerQueryScope};
+    use brokk_bifrost_rust::declarations::rust_node_text;
+    use brokk_bifrost_rust::macro_matcher::{
+        ExportedMacroDefinitions, StandardMacroIdentity, parse_macro_operands,
+        standard_macro_identity,
+    };
+    use brokk_bifrost_rust::usage_walks::RustUsageWalks;
+    let scope = AnalyzerQueryScope::new(rust);
+    let keep_going = || !cancellation.is_cancelled();
+    let walks = RustUsageWalks::new_certified_while(rust, scope.token(), &keep_going)
+        .map_err(|_| PrimitiveUniverseRefusal::Routes)?;
+    let exported = ExportedMacroDefinitions::from_root(root, source);
+    let file_imports = brokk_bifrost_rust::imports::rust_import_projection(root, source, "");
+    let mut fragments: Vec<tree_sitter::Tree> = Vec::new();
+    let mut fragment_ranges = Vec::new();
+    let mut fragment_index = 0;
+    loop {
+        let selected_root = if fragment_index == 0 {
+            root
+        } else {
+            let (start, end) = fragment_ranges[fragment_index - 1];
+            fragments[fragment_index - 1]
+                .root_node()
+                .descendant_for_byte_range(start, end)
+                .expect("validated macro operand retains its exact range")
+        };
+        if selected_root.has_error() {
+            return Err(PrimitiveUniverseRefusal::Syntax);
+        }
+        // Includes operand-local imports, which selected_import_infos for the
+        // original file cannot see inside a token tree.
+        let imports =
+            brokk_bifrost_rust::imports::rust_import_projection(selected_root, source, "");
+        // Each tree measures its own module extents, as `rust_import_owner`
+        // does for the imports it projects.
+        let site_module = glob_site.map(|byte| {
+            let mut tree_root = selected_root;
+            while let Some(parent) = tree_root.parent() {
+                tree_root = parent;
+            }
+            (
+                byte,
+                brokk_bifrost_rust::imports::rust_module_extent_at(tree_root, source, byte),
+            )
+        });
+        for import in &imports {
+            if import.import.binding_name().is_glob()
+                && site_module.is_some_and(|(byte, module)| import.owner.visible_at(module, byte))
+            {
+                // A fragment without matching selected import coordinates has
+                // no recoverable requester and the question refuses it.
+                certify_glob_name_absence(
+                    rust,
+                    file,
+                    &import.import.info,
+                    brokk_bifrost_rust::graph_support::RustGlobNamespace::Type,
+                    spelling,
+                )?;
+            }
+            if import.import.binding_name().named().is_some_and(|name| {
+                brokk_bifrost_rust::imports::rust_binding_name_matches(name, spelling)
+            }) {
+                return Err(PrimitiveUniverseRefusal::Imports);
+            }
+        }
+        let mut next_fragments = Vec::new();
+        let mut pending = vec![selected_root];
+        while let Some(node) = pending.pop() {
+            if cancellation.is_cancelled() {
+                return Err(PrimitiveUniverseRefusal::Cancelled);
+            }
+            match node.kind() {
+                "attribute_item" | "inner_attribute_item" => {
+                    // These exact built-in names cannot introduce declarations.
+                    // Derive, cfg_attr, qualified paths and unknown names stay open.
+                    if ![
+                        "allow",
+                        "warn",
+                        "deny",
+                        "forbid",
+                        "expect",
+                        "doc",
+                        "inline",
+                        "cold",
+                        "must_use",
+                        "deprecated",
+                        "repr",
+                        "test",
+                        "ignore",
+                        "should_panic",
+                        "non_exhaustive",
+                        "track_caller",
+                        "cfg",
+                    ]
+                    .iter()
+                    .any(|name| {
+                        brokk_bifrost_rust::syntax::attribute_item_has_path(node, source, name)
+                    }) {
+                        return Err(PrimitiveUniverseRefusal::ShadowSurface);
+                    }
+                }
+                // Every leaf was checked through the structured projection above.
+                "use_wildcard" => continue,
+                "macro_definition" => return Err(PrimitiveUniverseRefusal::ShadowSurface),
+                "macro_invocation" => {
+                    // The shared resolver owns identity, including textual scope.
+                    // A positive target in a partial route is insufficient here
+                    // (#11527); this new negative proof requires closed routes.
+                    // A cancelled route walk reports an incomplete route;
+                    // keep the cancellation cause rather than a route gap.
+                    if !walks.file_routes(file).is_complete() {
+                        return Err(if cancellation.is_cancelled() {
+                            PrimitiveUniverseRefusal::Cancelled
+                        } else {
+                            PrimitiveUniverseRefusal::Routes
+                        });
+                    }
+                    let lexical_context = root
+                        .descendant_for_byte_range(node.start_byte(), node.end_byte())
+                        .ok_or(PrimitiveUniverseRefusal::Syntax)?;
+                    let identity = standard_macro_identity(
+                        rust,
+                        &walks,
+                        file,
+                        node,
+                        source,
+                        Some(&exported),
+                        lexical_context,
+                        &fragments,
+                    );
+                    if !walks.routes_are_complete() {
+                        return Err(if cancellation.is_cancelled() {
+                            PrimitiveUniverseRefusal::Cancelled
+                        } else {
+                            PrimitiveUniverseRefusal::Routes
+                        });
+                    }
+                    match identity {
+                        StandardMacroIdentity::Standard { member, .. }
+                            if matches!(
+                                member.as_str(),
+                                "vec" | "println" | "format" | "assert"
+                            ) =>
+                        {
+                            // An unresolved named import must not fall through
+                            // to the prelude without an indexed external target.
+                            if file_imports.iter().chain(&imports).any(|import| {
+                                import.import.binding_name().named().is_some_and(|name| {
+                                    brokk_bifrost_rust::imports::rust_binding_name_matches(
+                                        name, &member,
+                                    )
+                                })
+                            }) {
+                                return Err(PrimitiveUniverseRefusal::MacroIdentity);
+                            }
+                        }
+                        _ => return Err(PrimitiveUniverseRefusal::MacroIdentity),
+                    }
+                    // A standard macro cannot introduce a caller-visible item,
+                    // but an operand block can contain declarations. Parse each
+                    // operand with the existing fragment grammar, then apply the
+                    // same shadow checks to its AST. Never inspect opaque tokens
+                    // as if they were already parsed declarations.
+                    let operands = parse_macro_operands(node, source)
+                        .ok_or(PrimitiveUniverseRefusal::MacroOperands)?;
+                    next_fragments.extend(operands);
+                    continue;
+                }
+                // Named type/module items, block-local items, generic parameters,
+                // and value items that can bind a path head. Walking all descendants
+                // also covers associated types and extern-block declarations.
+                "struct_item"
+                | "enum_item"
+                | "union_item"
+                | "trait_item"
+                | "trait_alias"
+                | "type_item"
+                | "associated_type"
+                | "mod_item"
+                | "function_item"
+                | "function_signature_item"
+                | "const_item"
+                | "static_item"
+                | "type_parameter"
+                | "const_parameter"
+                | "extern_crate_declaration" => {
+                    for field in ["name", "alias"] {
+                        if node.child_by_field_name(field).is_some_and(|name| {
+                            let value = rust_node_text(name, source);
+                            brokk_bifrost_rust::imports::rust_binding_name_matches(value, spelling)
+                        }) {
+                            return Err(PrimitiveUniverseRefusal::ShadowSurface);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            let mut cursor = node.walk();
+            pending.extend(node.named_children(&mut cursor));
+        }
+        for operand in next_fragments {
+            fragment_ranges.push((operand.binding.start_byte, operand.binding.end_byte));
+            fragments.push(operand.tree);
+        }
+        if fragment_index == fragments.len() {
+            break;
+        }
+        fragment_index += 1;
+    }
+    Ok(())
+}
+
+/// A live prepared tree must describe the selected blob whose imports we read.
+/// A concurrent edit cannot supply the negative half of an older selection.
+fn primitive_source_is_selected(
+    rust: &RustAnalyzer,
+    operation: &SelectedResolutionOperation<'_, '_>,
+    file: &brokk_bifrost_core::analyzer::model::ProjectFile,
+    source: &str,
+) -> bool {
+    let Some(oid) = rust.inner.content_oid_of(file, source) else {
+        return false;
+    };
+    match operation
+        .mount_table()
+        .blob_oid_for_path("rust", &rel_path_string(file))
+    {
+        Ok(selected) => selected == Some(oid),
+        Err(error) => {
+            rust.inner.record_store_error(error);
+            false
+        }
+    }
+}
+
+#[derive(Debug)]
+enum PrimitiveUniverseRefusal {
+    Syntax,
+    Cancelled,
+    ReadFrame,
+    SelectedContent,
+    Imports,
+    ShadowSurface,
+    ExternalGlobInventoryUnavailable,
+    MacroIdentity,
+    MacroOperands,
+    Routes,
+    Membership,
+    RootSyntax,
+    Targets,
+    ConfigurationUnavailable(
+        brokk_bifrost_semantic::analyzer::semantic::derivation::UnavailableCause,
+    ),
+    // Kept distinct from unavailable configuration: feature closure alone
+    // does not constrain the conservative extern-prelude absence proof.
+    #[allow(dead_code)]
+    ConfigurationIncomplete,
+    ExternPrelude,
+}
+
+/// Certify only a source-free universe projection with a closed shadow surface.
+/// This walk deliberately checks the entire referencing file (including nested
+/// blocks), a conservative superset of the module and its enclosing scopes.
+fn primitive_universe_reason(
+    query: &BoundedReceiverQuery<'_>,
+    operation: &SelectedResolutionOperation<'_, '_>,
+    cancellation: &CancellationToken,
+) -> Result<DefinitionLookupReason, PrimitiveUniverseRefusal> {
+    use brokk_bifrost_analysis::analyzer::usages::get_definition::record_definition_probe_reads;
+    use brokk_bifrost_analysis::analyzer::{IAnalyzer, QueryScope};
+    let tree = query.tree.ok_or(PrimitiveUniverseRefusal::Syntax)?;
+    let root = tree.root_node();
+    if cancellation.is_cancelled() {
+        return Err(PrimitiveUniverseRefusal::Cancelled);
+    }
+    if root.has_error() {
+        return Err(PrimitiveUniverseRefusal::Syntax);
+    }
+    let spelling = query
+        .source
+        .get(query.site.focus_start_byte..query.site.focus_end_byte)
+        .ok_or(PrimitiveUniverseRefusal::Syntax)?;
+    let rust = resolve_analyzer::<RustAnalyzer>(query.analyzer)
+        .expect("Rust universe proof requires Rust");
+    let _frame = rust
+        .operation_read_frame(operation)
+        .map_err(|error| rust.inner.record_store_error(error))
+        .map_err(|_| PrimitiveUniverseRefusal::ReadFrame)?;
+    if !primitive_source_is_selected(rust, operation, query.file, query.source) {
+        return Err(PrimitiveUniverseRefusal::SelectedContent);
+    }
+    // This lookup's own frame records the file, even on an import memo hit.
+    let imports = super::std_types::selected_import_infos(
+        query.analyzer,
+        operation,
+        query.file,
+        cancellation,
+    )
+    .ok_or(PrimitiveUniverseRefusal::Imports)?;
+    record_definition_probe_reads(query.analyzer, Language::Rust, query.site, query.source);
+    let site = query.site.focus_start_byte;
+    let site_module = brokk_bifrost_rust::imports::rust_module_extent_at(root, query.source, site);
+    let projected = brokk_bifrost_rust::imports::rust_import_projection(root, query.source, "");
+    for import in imports.iter().filter(|import| import.is_wildcard) {
+        if !primitive_glob_is_visible(&projected, site_module, site, import) {
+            continue;
+        }
+        certify_glob_name_absence(
+            rust,
+            query.file,
+            import,
+            brokk_bifrost_rust::graph_support::RustGlobNamespace::Type,
+            spelling,
+        )?;
+    }
+    if imports.iter().any(|import| {
+        !import.is_wildcard
+            && import.local_name().is_some_and(|name| {
+                brokk_bifrost_rust::imports::rust_binding_name_matches(name, spelling)
+            })
+    }) {
+        return Err(PrimitiveUniverseRefusal::Imports);
+    }
+    primitive_shadow_surface_is_closed(
+        rust,
+        query.file,
+        root,
+        query.source,
+        spelling,
+        Some(site),
+        cancellation,
+    )?;
+    let routes = rust
+        .file_routes(query.file, Some(&|| !cancellation.is_cancelled()))
+        .map_err(|_| PrimitiveUniverseRefusal::Routes)?;
+    if routes.has_available_declared_dependency(query.file, spelling) != Some(false) {
+        return Err(PrimitiveUniverseRefusal::Membership);
+    }
+    let roots = routes.target_roots(query.file);
+    // A detached file has no Cargo authority for the negative extern lookup.
+    if roots.is_empty() {
+        return Err(PrimitiveUniverseRefusal::Membership);
+    }
+    for root in &roots {
+        // A root macro can add an extern alias visible in every child module.
+        // The same own-frame File read must close that frontier as well.
+        let scope =
+            brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope::new(query.analyzer);
+        // Only syntax is needed; indexed preparation also hydrates FileState.
+        let prepared = rust
+            .inner
+            .prepared_syntax_limited(scope.token(), root, usize::MAX)
+            .map_err(|_| PrimitiveUniverseRefusal::RootSyntax)?
+            .ok_or(PrimitiveUniverseRefusal::RootSyntax)?
+            .1;
+        if !primitive_source_is_selected(rust, operation, root, prepared.source()) {
+            return Err(PrimitiveUniverseRefusal::SelectedContent);
+        }
+        primitive_shadow_surface_is_closed(
+            rust,
+            root,
+            prepared.tree().root_node(),
+            prepared.source(),
+            spelling,
+            (root == query.file).then_some(site),
+            cancellation,
+        )?;
+        let imports =
+            super::std_types::selected_import_infos(query.analyzer, operation, root, cancellation)
+                .ok_or(PrimitiveUniverseRefusal::Imports)?;
+        if imports.iter().any(|import| {
+            import.local_name().is_some_and(|name| {
+                brokk_bifrost_rust::imports::rust_binding_name_matches(name, spelling)
+            })
+        }) {
+            return Err(PrimitiveUniverseRefusal::Imports);
+        }
+    }
+    // Membership was certified by file_routes in this operation's read frame.
+    // Configuration is demanded in the original narrowed operation, rather
+    // than borrowing Main's topology inputs from the route bridge.
+    use super::configuration_kinds::{RustUnitConfiguration, RustUnitConfigurationKey};
+    use brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_crate_context::RustCfgAuthority;
+    use brokk_bifrost_semantic::analyzer::semantic::derivation::Demanded;
+    let targets = operation
+        .rust_file_configuration_targets(query.file.rel_path(), cancellation)
+        .map_err(|error| rust.inner.record_store_error(error))
+        .map_err(|_| PrimitiveUniverseRefusal::Targets)?;
+    // Do not use membership_complete here: its literal overlay predicate is
+    // superseded by the route bridge's selected-content certification above.
+    if targets.targets.is_empty() {
+        return Err(PrimitiveUniverseRefusal::Targets);
+    }
+    let host = rust.inner.derivations().expect("Rust owns derivations");
+    for target in targets.targets {
+        if target.cfg_authority != RustCfgAuthority::Configuration {
+            return Err(PrimitiveUniverseRefusal::ConfigurationUnavailable(
+                brokk_bifrost_semantic::analyzer::semantic::derivation::UnavailableCause::ChildUnavailable,
+            ));
+        }
+        let key = RustUnitConfigurationKey {
+            manifest_path: target.manifest_path,
+            target_kind: target.target_kind,
+            target_name: target.target_name,
+        };
+        let value = match host.demand_in_operation::<RustUnitConfiguration>(rust, operation, &key) {
+            Demanded::Available { value, .. } => value,
+            Demanded::Unavailable(cause) => {
+                return Err(PrimitiveUniverseRefusal::ConfigurationUnavailable(cause));
+            }
+        };
+        // extern_names includes optional and target-specific dependencies
+        // independently of feature activation. Unknown dependency feature
+        // requests cannot enlarge this root-declared superset. The route and
+        // AST guards above separately prove membership and source closure.
+        // Authority is workspace-only: process RUSTFLAGS and
+        // CARGO_ENCODED_RUSTFLAGS are intentionally unread, as documented in
+        // bifrost-rust/src/cargo_config.rs:11-13.
+        if value.0.rustflags_extern
+            || value
+                .0
+                .extern_names
+                .iter()
+                .any(|name| brokk_bifrost_rust::imports::rust_binding_name_matches(name, spelling))
+        {
+            return Err(PrimitiveUniverseRefusal::ExternPrelude);
+        }
+    }
+    Ok(DefinitionLookupReason::UnprojectedDefinition {
+        target_files: Vec::new(),
+    })
+}
+
 fn adapt_definition_value(
     query: &BoundedReceiverQuery<'_>,
     value: SelectedRustCallerReferenceOutcome,
@@ -2074,7 +2606,7 @@ fn adapt_definition_value(
         )
         .into_complete_value(),
         SelectedRustCallerReferenceOutcome::Operation(outcome) => match outcome {
-            SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Missing) => {
+            SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Missing(_)) => {
                 complete_definition(
                     site,
                     DefinitionLookupStatus::Unavailable,
@@ -2129,6 +2661,7 @@ fn adapt_definition_value(
                         outcome
                             .diagnostics
                             .retain(|diagnostic| diagnostic.kind != "incomplete_binding");
+                        outcome.incomplete_evidence = None;
                         outcome.modeled_definitions = definitions;
                         brokk_bifrost_analysis::analyzer::usages::get_definition::trace::record_selected_modeled(
                             &outcome,
@@ -2143,13 +2676,53 @@ fn adapt_definition_value(
                 }
                 outcome
             }
-            SelectedResolutionOperationOutcome::Unavailable(reason) => complete_definition(
-                site,
-                DefinitionLookupStatus::Unavailable,
-                "native_unavailable",
-                format!("selected Rust point operation is unavailable: {reason:?}"),
-            )
-            .into_complete_value(),
+            SelectedResolutionOperationOutcome::Unavailable(reason) => {
+                use brokk_bifrost_analysis::analyzer::store::resolution_selection::{
+                    MissingDefinitionReason, SelectedResolutionUnavailable,
+                };
+                let mut primitive_refusal = None;
+                let (status, lookup_reason) = match &reason {
+                    SelectedResolutionUnavailable::MissingDefinitionUnit { reason, .. } => (
+                        DefinitionLookupStatus::Incomplete,
+                        match reason {
+                            MissingDefinitionReason::UnprojectedDefinition { target_files } => {
+                                let reason = DefinitionLookupReason::UnprojectedDefinition { target_files: target_files.clone() };
+                                brokk_bifrost_analysis::analyzer::usages::get_definition::record_unprojected_definition_read(query.analyzer, &reason);
+                                reason
+                            },
+                            MissingDefinitionReason::UniverseDefinition => primitive_universe_reason(query, operation, cancellation)
+                                .unwrap_or_else(|refusal| {
+                                    let cause = if matches!(refusal, PrimitiveUniverseRefusal::Cancelled | PrimitiveUniverseRefusal::ConfigurationUnavailable(brokk_bifrost_semantic::analyzer::semantic::derivation::UnavailableCause::Cancelled)) {
+                                        brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause::Cancelled
+                                    } else {
+                                        brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause::Provider
+                                    };
+                                    primitive_refusal = Some(refusal);
+                                    DefinitionLookupReason::Execution(cause)
+                                }),
+                            MissingDefinitionReason::UncertifiedDefinition => DefinitionLookupReason::Execution(brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause::Provider),
+                            MissingDefinitionReason::UnplacedDefinition => DefinitionLookupReason::UnplacedDefinition,
+                        },
+                    ),
+                    _ => (DefinitionLookupStatus::Unavailable, DefinitionLookupReason::Execution(brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause::Provider)),
+                };
+                let mut outcome = complete_definition(
+                    site,
+                    status,
+                    "native_unavailable",
+                    format!("selected Rust point operation is unavailable: {reason:?}"),
+                )
+                .with_reason(lookup_reason)
+                .into_complete_value();
+                if let Some(refusal) = primitive_refusal {
+                    outcome.diagnostics.push(DefinitionLookupDiagnostic {
+                        claim: None,
+                        kind: "primitive_universe_refused".to_owned(),
+                        message: format!("primitive universe certification refused: {refusal:?}"),
+                    });
+                }
+                outcome
+            }
             SelectedResolutionOperationOutcome::Stale(reason) => complete_definition(
                 site,
                 DefinitionLookupStatus::Unavailable,
@@ -2250,6 +2823,10 @@ fn describe_incomplete_binding(
                 format!("time_budget_exceeded({})", named(semantic))
             }
             Reason::UnmountedFile { fragment } => format!("unmounted_file({fragment})"),
+            Reason::Unclassified(semantic) => format!("unclassified({semantic})"),
+            Reason::OverlayFrontierUnknown(semantic) => {
+                format!("overlay_frontier_unknown({})", named(semantic))
+            }
         });
     }
     // Every identity space can change encounter order across fresh stores.
@@ -2374,7 +2951,7 @@ fn modeled_macro_definitions(
     {
         return Ok(Vec::new());
     }
-    let Some(overlay) = query.analyzer.semantic_model_overlay() else {
+    let Some(overlay) = query.analyzer.semantic_model_overlay_read().published() else {
         return Ok(Vec::new());
     };
     let records = crate::analyzer::rust::generated_model::resolve_generated_functions(
@@ -2389,6 +2966,7 @@ fn modeled_macro_definitions(
         .collect::<Vec<_>>();
     let covers = |symbol: &crate::analyzer::semantic_model::SemanticModelSymbol,
                   gap: &brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedRustMacroExpansionGap| {
+        let Some(gap) = &gap.anchor else { return false; };
         matches!(&symbol.location, SemanticModelLocation::Authored(anchor)
             if anchor.path == gap.relative_path
                 && gap.start_byte <= anchor.range.start_byte
@@ -2569,10 +3147,8 @@ fn rust_external_macro_frontiers(
     if !canonical_targets.is_empty()
         || !definitions.is_empty()
         || !lexical.is_empty()
-        || crate::analyzer::rust::format_macro_dispatch::rust_standard_macro_prelude_owner(
-            callee_name,
-        )
-        .is_none()
+        || brokk_bifrost_rust::macro_matcher::rust_standard_macro_prelude_owner(callee_name)
+            .is_none()
     {
         return None;
     }
@@ -2749,6 +3325,7 @@ fn adapt_definition_answer(
             })
         });
     stage_rust_member_attribution(&answers);
+    let mut selected_sites = Vec::new();
     let mut definitions = Vec::new();
     let mut lexical = Vec::new();
     let mut examined_answers = 0usize;
@@ -2756,6 +3333,14 @@ fn adapt_definition_answer(
         if !definition_answer_abstains(&answer.resolution) {
             examined_answers += 1;
         }
+        selected_sites.extend(answer.definition_sites.iter().map(
+            |(code_unit, declaration_range)| {
+                brokk_bifrost_analysis::analyzer::usages::get_definition::NavigationTarget {
+                    code_unit: code_unit.clone(),
+                    declaration_range: *declaration_range,
+                }
+            },
+        ));
         definitions.extend(answer.definitions.iter().cloned());
         lexical.extend(answer.lexical_definitions.iter().cloned());
     }
@@ -2823,9 +3408,9 @@ fn adapt_definition_answer(
                 "evidence": [{
                     "reason": "UnexpandedMacroBoundary",
                     "macro": gap.macro_name,
-                    "rel_path": gap.relative_path,
-                    "start_byte": gap.start_byte,
-                    "end_byte": gap.end_byte,
+                    "rel_path": gap.anchor.as_ref().map(|anchor| &anchor.relative_path),
+                    "start_byte": gap.anchor.as_ref().map(|anchor| anchor.start_byte),
+                    "end_byte": gap.anchor.as_ref().map(|anchor| anchor.end_byte),
                 }]
             })),
         });
@@ -2964,9 +3549,11 @@ fn adapt_definition_answer(
     // from this reference to that generated surface. A direct lookup in the
     // file with the undecided module declaration stays open.
     let explicit_macro_gated_import_route = macro_module_boundary
-        && macro_expansion_gaps
-            .iter()
-            .any(|gap| gap.relative_path != site.path);
+        && macro_expansion_gaps.iter().any(|gap| {
+            gap.anchor
+                .as_ref()
+                .is_some_and(|anchor| anchor.relative_path != site.path)
+        });
     let has_external_declared_unindexed_boundary = matches!(
         &completion,
         ResolutionCompletion::Incomplete(reasons)
@@ -3157,7 +3744,27 @@ fn adapt_definition_answer(
             message: "selected Rust binding resolved to multiple workspace definitions".to_owned(),
         });
     }
+    let mut snapshot_stops = answers
+        .iter()
+        .flat_map(|answer| answer.snapshot_stops.iter().copied())
+        .collect::<Vec<_>>();
+    snapshot_stops.sort_unstable();
+    snapshot_stops.dedup();
     let outcome = DefinitionLookupOutcome {
+        selected_sites,
+        inventory_evidence: None,
+        incomplete_evidence: Some(DefinitionLookupEvidence {
+            completion,
+            snapshot_stops,
+            reasons: if binding_complete
+                && examined_answers == 0
+                && status == DefinitionLookupStatus::Incomplete
+            {
+                vec![DefinitionLookupReason::UnprojectedTypeFrontier]
+            } else {
+                Vec::new()
+            },
+        }),
         modeled_definitions: Vec::new(),
         status,
         reference: Some(site.clone()),
@@ -3198,7 +3805,7 @@ fn adapt_type_value(
         )
         .into_complete_value(),
         SelectedRustCallerReferenceOutcome::Operation(outcome) => match outcome {
-            SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Missing) => {
+            SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Missing(_)) => {
                 complete_type(
                     site,
                     TypeLookupStatus::Unavailable,
@@ -3372,6 +3979,75 @@ fn adapt_type_answer(
                     ),
                 });
             }
+            let generic_shape = answer.resolution.projected_type_shapes().iter().find(|shape| {
+                shape.output_slot() == output_slot && shape.nodes().iter().any(|node| {
+                    matches!(node.form(), brokk_bifrost_analysis::analyzer::resolution::FactProjectedTypeNodeForm::Applied(_))
+                })
+            });
+            if let Some(shape) = generic_shape {
+                let rendered_shape =
+                    brokk_bifrost_analysis::analyzer::native_points::render_type_shape_with(
+                        shape,
+                        |node, rendered| {
+                            use brokk_bifrost_analysis::analyzer::resolution::FactProjectedTypeNodeForm;
+                            let head = || {
+                                answer
+                                    .projection
+                                    .intrinsic_types
+                                    .iter()
+                                    .find(|descriptor| descriptor.identity() == node.identity())
+                                    .map(|descriptor| descriptor.spelling().to_owned())
+                                    .or_else(|| {
+                                        answer.projection.nominal_types.iter().find_map(
+                                            |(identity, definition)| {
+                                                if *identity != node.identity() {
+                                                    return None;
+                                                }
+                                                match definition {
+                                                    SelectedRustSourceDefinition::Unit(unit, _) => {
+                                                        Some(unit.fq_name())
+                                                    }
+                                                    _ => None,
+                                                }
+                                            },
+                                        )
+                                    })
+                            };
+                            let text = match node.form() {
+                                FactProjectedTypeNodeForm::Leaf => head()?,
+                                FactProjectedTypeNodeForm::Alias(child) => {
+                                    rendered.get(child)?.clone()
+                                }
+                                FactProjectedTypeNodeForm::Applied(arguments) => {
+                                    let arguments = arguments
+                                        .iter()
+                                        .map(|argument| rendered.get(argument).cloned())
+                                        .collect::<Option<Vec<_>>>()?;
+                                    format!("{}<{}>", head()?, arguments.join(", "))
+                                }
+                                _ => return None,
+                            };
+                            Some(format!(
+                                "{}{text}",
+                                "&".repeat(usize::try_from(node.indirection()).ok()?)
+                            ))
+                        },
+                    );
+                if let Some(fqn) = rendered_shape
+                    && shape.supported()
+                    && matches!(shape.completion(), ResolutionCompletion::Complete)
+                {
+                    canonical_types
+                        .entry((output_slot, 0))
+                        .or_insert((fqn, Vec::new()));
+                    continue;
+                }
+                typed_complete = false;
+                diagnostics.push(TypeLookupDiagnostic {
+                    kind: "unsupported_substituted_type_shape".into(),
+                    message: "selected Rust generic type shape is incomplete".into(),
+                });
+            }
             for value in frontier.possible_values() {
                 let identity = value.ty().identity();
                 if let Some(descriptor) = answer
@@ -3404,7 +4080,7 @@ fn adapt_type_answer(
                     continue;
                 };
                 match source_definition {
-                    SelectedRustSourceDefinition::Unit(unit) => {
+                    SelectedRustSourceDefinition::Unit(unit, _) => {
                         let fqn = render_type_spelling(&unit.fq_name(), *value, &mut diagnostics);
                         canonical_types
                             .entry((identity, value.ty().indirection()))
@@ -3638,6 +4314,13 @@ impl<T> CompleteOutcome<T> {
     }
 }
 
+impl CompleteOutcome<DefinitionLookupOutcome> {
+    fn with_reason(mut self, reason: DefinitionLookupReason) -> Self {
+        self.0.add_incomplete_reason(reason);
+        self
+    }
+}
+
 fn complete_definition(
     site: &brokk_bifrost_core::analyzer::usages::reference_site::ResolvedReferenceSite,
     status: DefinitionLookupStatus,
@@ -3645,6 +4328,9 @@ fn complete_definition(
     message: impl Into<String>,
 ) -> CompleteOutcome<DefinitionLookupOutcome> {
     CompleteOutcome(DefinitionLookupOutcome {
+        selected_sites: Vec::new(),
+        inventory_evidence: None,
+        incomplete_evidence: None,
         modeled_definitions: Vec::new(),
         status,
         reference: Some(site.clone()),

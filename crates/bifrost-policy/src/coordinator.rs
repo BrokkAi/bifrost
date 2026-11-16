@@ -4,6 +4,16 @@
 //! analyzer-backed evaluation, canonical report assembly, and CLI status
 //! selection. Renderers consume only the returned [`PolicyReportDocument`].
 
+use crate::finding::safe_report_text;
+use brokk_bifrost_analysis::analyzer::ReadKey;
+use brokk_bifrost_analysis::analyzer::read_ledger::{EvaluationSelectionReads, SelectionRead};
+use brokk_bifrost_analysis::analyzer::read_verification::{
+    BaseView, LookupMemo, LookupReplayLimits, NoSummaryAnswers, verify_selection_reads,
+};
+use brokk_bifrost_analysis::analyzer::reuse_verdict::{
+    Admitted, ReuseVerdict, SelectionView, admit,
+};
+use brokk_bifrost_analysis::analyzer::{EvaluationExecution, join_evaluation_verdict};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -53,7 +63,7 @@ use brokk_bifrost_rql::structural::identifier_typos::IdentifierTypoTable;
 use brokk_bifrost_rql::structural::search::CodeQueryExecutionScope;
 use brokk_bifrost_tools::diff_analysis::{
     RevisionExport, RevisionSubtree, RevisionWorkspace, changed_buffer_ranges, export_revision,
-    resolve_revision_subtree, worktree_paths_match_head,
+    resolve_revision_subtree, worktree_paths_match_head, worktree_tracked_content_is_tree,
 };
 
 use super::budget::{PolicySourceCensus, effective_grant};
@@ -63,7 +73,7 @@ use super::baseline::{
     PolicyBaselineMatchState, PolicyBaselineOptions, PolicyBaselineReview, PolicyFindingBaseline,
     load_policy_baseline_from_root,
 };
-use super::builtin::BuiltInPolicySelectionRecord;
+use super::builtin::{BuiltInPolicySelectionRecord, BuiltInRejection, BuiltInRejectionNotice};
 use super::catalog::{CatalogRegistryLimits, TaintCatalogRegistry};
 use super::definition::{
     FindingSeverity, PolicyCategoryId, PolicyId, RqlpDocument, UnknownVerdict,
@@ -90,8 +100,7 @@ use super::report::{
     PolicyOptionalReviews, PolicyPackActivationReview, PolicyPackDecision,
     PolicyPackDecisionStatus, PolicyPackProcedureSummaryEvidence, PolicyReportBuilder,
     PolicyReportBuilderError, PolicyReportDiagnostic, PolicyReportDiagnosticCode,
-    PolicyReportDocument, PolicyRetentionOutcome, PolicyRuleDescriptor, PolicySourceRange,
-    PolicyStageTiming,
+    PolicyReportDocument, PolicyRuleDescriptor, PolicySourceRange, PolicyStageTiming,
 };
 use super::resolved::{
     EndpointDefinitionSchemaResolution, EndpointOrigin, LoadedPolicy, ResolvedEndpointIdentity,
@@ -362,6 +371,9 @@ pub struct PolicyEvaluationOptions {
     /// The built-in selection this batch was resolved from, recorded in the
     /// report's evaluation context. Absent when no built-in policy was selected.
     builtin_selection: Option<BuiltInPolicySelectionRecord>,
+    /// The packs the built-in catalog rejected, as this batch's built-in
+    /// selection reports them; one report diagnostic each.
+    builtin_pack_rejections: Vec<BuiltInRejectionNotice>,
     /// The changed range the runs are scoped to.
     range: PolicyRangeRequest,
     /// The known identifier misspellings the active rules packs supply. Part
@@ -370,6 +382,8 @@ pub struct PolicyEvaluationOptions {
     /// The host's last published snapshot and what moved since; see
     /// [`WarmBase`]. Used only by a full scan that names no diff base.
     warm_base: Option<Arc<WarmBase>>,
+    #[cfg(any(test, feature = "test-support"))]
+    store_error_probe: Option<PolicyId>,
     /// Test-only: reorders and reports the Output anchors of this evaluation
     /// alone; see [`crate::OutputOrderProbe`].
     #[cfg(any(test, feature = "test-support"))]
@@ -420,12 +434,22 @@ impl PolicyEvaluationOptions {
             policy_deadlines: PolicyDeadlines(BTreeMap::new()),
             stream_runs: false,
             builtin_selection: None,
+            builtin_pack_rejections: Vec::new(),
             range: PolicyRangeRequest::Workspace,
             identifier_typos: None,
             warm_base: None,
             #[cfg(any(test, feature = "test-support"))]
+            store_error_probe: None,
+            #[cfg(any(test, feature = "test-support"))]
             output_order_probe: None,
         }
+    }
+
+    /// Inject a recorded store failure after the named policy has evaluated.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_store_error_probe(mut self, policy: PolicyId) -> Self {
+        self.store_error_probe = Some(policy);
+        self
     }
 
     /// Verify units published on `base.snapshot` against `base.delta` when
@@ -466,13 +490,24 @@ impl PolicyEvaluationOptions {
     fn identifier_typos_shared(&self) -> Option<&Arc<IdentifierTypoTable>> {
         match self.identifier_typos.as_ref() {
             Some(typos) => Some(typos),
-            None => super::builtin::catalog_identifier_typos(),
+            // A catalog that failed to load supplies no table here; every
+            // policy that reads typos gets the batch's
+            // identifier-typos-incomplete diagnostic instead.
+            None => super::builtin::catalog_identifier_typos().ok().flatten(),
         }
     }
 
     /// Record the built-in selection this batch was resolved from.
     pub fn with_builtin_selection(mut self, selection: BuiltInPolicySelectionRecord) -> Self {
         self.builtin_selection = Some(selection);
+        self
+    }
+
+    /// Report the packs the built-in catalog rejected, as
+    /// [`super::builtin::BuiltInPolicyCatalog::rejection_notices`] gives them
+    /// for this batch's built-in selection.
+    pub fn with_builtin_pack_rejections(mut self, rejections: Vec<BuiltInRejectionNotice>) -> Self {
+        self.builtin_pack_rejections = rejections;
         self
     }
 
@@ -617,6 +652,7 @@ impl PolicyEvaluationOptions {
 
 /// Complete canonical report plus the already precedence-resolved CLI status.
 pub struct PolicyBatchOutcome {
+    cut_hint_digest: Option<[u8; 32]>,
     report: PolicyReportDocument,
     /// Out-of-band wall-clock stage attribution for this run.
     ///
@@ -642,6 +678,10 @@ pub struct PolicyBatchOutcome {
     incremental: Option<PolicyIncrementalReview>,
     /// Actual execution limits and certified snapshot volume, never rendered.
     replay_evidence: Option<PolicyReplayEvidence>,
+    reuse_verdict: ReuseVerdict,
+    /// The selection-authority reads this batch consumed, as the evaluation
+    /// collector saw them.
+    selection_reads: Vec<ReadKey>,
     /// The snapshot this batch published units on: set when the batch flushed
     /// its units, so a later run may name it as a [`WarmBase`] snapshot.
     /// `None` for a batch that published nothing, including a run that
@@ -1221,6 +1261,7 @@ pub fn suppression_preflight_failure_outcome(
         Some(PolicySourceIdentity::new(&failure.path)),
         None,
         Vec::new(),
+        crate::RelatedLocationOmissions::Known(0),
     )?;
     let stage_timings = vec![
         PolicyStageTiming::from_duration(PolicyExecutionStage::PolicySelection, selection_elapsed),
@@ -1329,10 +1370,13 @@ pub fn workspace_snapshot_deadline_outcome_with_preflight(
         None,
         None,
         Vec::new(),
+        crate::RelatedLocationOmissions::Known(0),
     )?;
     deadline_before_evaluation_outcome(
         options,
         PolicyBatchBudget::default(),
+        None,
+        None,
         suppression_preflight.outcome().sources.clone(),
         PolicyScopeDocumentState::NotEvaluated,
         vec![
@@ -1368,6 +1412,8 @@ pub fn workspace_snapshot_deadline_outcome_with_preflight(
 fn diff_base_deadline_outcome(
     options: &PolicyEvaluationOptions,
     batch_budget: PolicyBatchBudget,
+    registry_limits: PolicyRegistryLimits,
+    census: Option<PolicySourceCensus>,
     suppression_sources: Vec<PolicySuppressionSourceState>,
     scope_document_state: PolicyScopeDocumentState,
     registration_elapsed: Duration,
@@ -1385,10 +1431,13 @@ fn diff_base_deadline_outcome(
         None,
         None,
         Vec::new(),
+        crate::RelatedLocationOmissions::Known(0),
     )?;
     deadline_before_evaluation_outcome(
         options,
         batch_budget,
+        Some(registry_limits),
+        census,
         suppression_sources,
         scope_document_state,
         vec![
@@ -1412,6 +1461,8 @@ fn diff_base_deadline_outcome(
 fn deadline_before_evaluation_outcome(
     options: &PolicyEvaluationOptions,
     batch_budget: PolicyBatchBudget,
+    registry_limits: Option<PolicyRegistryLimits>,
+    census: Option<PolicySourceCensus>,
     suppression_sources: Vec<PolicySuppressionSourceState>,
     scope_document_state: PolicyScopeDocumentState,
     stage_timings: Vec<PolicyStageTiming>,
@@ -1419,13 +1470,29 @@ fn deadline_before_evaluation_outcome(
     pending_policy_ids: Vec<PolicyId>,
     diagnostic: Option<PolicyReportDiagnostic>,
 ) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
+    // Only callers that reached registry construction can state its grant.
+    // Keep the actual limits through later preparation and diff-base timeouts.
+    let mut effective_grant = batch_budget.replay_caps(registry_limits.unwrap_or_default());
+    if registry_limits.is_none() {
+        effective_grant.retain(|name, _| !name.starts_with("registry."));
+    }
     let evaluation = PolicyReportEvaluationContext::new(
         options.evaluation_date(),
         suppression_sources,
         options.scope(),
         scope_document_state,
     )
-    .with_builtin_selection(options.builtin_selection.clone());
+    .with_builtin_selection(options.builtin_selection.clone())
+    .with_budget(super::budget::PolicyBudgetTelemetry {
+        effective_grant,
+        census,
+        policy_deadlines_ms: options.policy_deadlines.0.clone(),
+        batch_remaining_ms: Some(0),
+        batch_refusals: super::budget::PolicyBatchBudgetRefusals {
+            deadline: true,
+            ..Default::default()
+        },
+    });
     let diagnostics = diagnostic.into_iter().collect();
     let total_elapsed_ms = stage_timings.iter().fold(0_u64, |total, timing| {
         total.saturating_add(timing.elapsed_ms())
@@ -1481,6 +1548,7 @@ fn unreliable_empty_policy_outcome(
     batch_budget: PolicyBatchBudget,
 ) -> PolicyBatchOutcome {
     PolicyBatchOutcome {
+        cut_hint_digest: None,
         report,
         stage_attribution,
         taint_findings: Vec::new(),
@@ -1491,6 +1559,10 @@ fn unreliable_empty_policy_outcome(
         max_serialized_report_bytes: batch_budget.max_serialized_report_bytes(),
         incremental: None,
         replay_evidence: None,
+        reuse_verdict: ReuseVerdict::ExecutionDependent(
+            brokk_bifrost_analysis::analyzer::reuse_verdict::ExecutionCause::Other,
+        ),
+        selection_reads: Vec::new(),
         published_snapshot: None,
     }
 }
@@ -1718,6 +1790,52 @@ fn replay_evidence(
     }
 }
 
+/// Keep telemetry in the existing SQL-readable evidence JSON, without changing
+/// the scalar cap comparison used to admit replay.
+fn report_replay_evidence(
+    evidence: &PolicyReplayEvidence,
+    report: &PolicyReportDocument,
+) -> Option<PolicyReplayEvidence> {
+    let mut evidence = evidence.clone();
+    let previous: serde_json::Value = serde_json::from_str(&evidence.effective_grant).ok()?;
+    let caps = previous.get("effective_grant").unwrap_or(&previous);
+    evidence.effective_grant = serde_json::to_string(&serde_json::json!({
+        "effective_grant": caps,
+        "budget": report.evaluation().budget(),
+        "refusals": report.runs().iter().map(|run| (run.policy_id().as_str(), run.budget_refusals())).collect::<BTreeMap<_, _>>(),
+    })).expect("policy budget evidence serializes");
+    Some(evidence)
+}
+
+/// Child rows carry only this policy's variable-size telemetry. The aggregate
+/// keeps the complete maps, so publishing/loading N policies uses O(N) evidence.
+fn policy_replay_evidence(
+    evidence: &PolicyReplayEvidence,
+    caps: &serde_json::Value,
+    report: &PolicyReportDocument,
+    policy_id: &PolicyId,
+    run: Option<&PolicyRun>,
+) -> PolicyReplayEvidence {
+    let budget = report
+        .evaluation()
+        .budget()
+        .map(|budget| budget.for_policy(policy_id.as_str()));
+    let refusals = run
+        .map(|run| (policy_id.as_str(), run.budget_refusals()))
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    PolicyReplayEvidence {
+        effective_grant: serde_json::to_string(&serde_json::json!({
+            "effective_grant": caps,
+            "budget": budget,
+            "refusals": refusals,
+        }))
+        .expect("policy-local budget evidence serializes"),
+        census_files: evidence.census_files,
+        census_bytes: evidence.census_bytes,
+    }
+}
+
 /// The one budget validity rule for both child and aggregate records.
 fn replay_grant_admits(
     evidence: Option<&PolicyReplayEvidence>,
@@ -1731,8 +1849,12 @@ fn replay_grant_admits(
     let Ok(files) = usize::try_from(evidence.census_files) else {
         return false;
     };
-    let Ok(recorded) = serde_json::from_str::<BTreeMap<String, u64>>(&evidence.effective_grant)
-    else {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&evidence.effective_grant) else {
+        return false;
+    };
+    let Ok(recorded) = serde_json::from_value::<BTreeMap<String, u64>>(
+        value.get("effective_grant").unwrap_or(&value).clone(),
+    ) else {
         return false;
     };
     let request = effective_grant(
@@ -1743,13 +1865,17 @@ fn replay_grant_admits(
         },
     )
     .replay_caps(registry);
+    // A complete record stays complete and identical under any larger grant.
+    // An incomplete record is admitted only for a configured cap (#11445), and a
+    // fresh evaluation under any other cap returns a different subset or
+    // different diagnostics, so it replays only under the exact recorded grant.
     request.len() == recorded.len()
         && request.iter().all(|(name, limit)| {
             recorded.get(name).is_some_and(|recorded| {
                 if complete {
                     limit >= recorded
                 } else {
-                    limit <= recorded
+                    limit == recorded
                 }
             })
         })
@@ -1909,6 +2035,7 @@ pub const ENGINE_POLICY_CAPABILITIES: &[&str] = &[
     "reviewed-python-result-obligation",
     "reviewed-ruby-core-result-obligation",
     "reviewed-typescript-string-result-obligation",
+    "rql-call-reachability",
     "runtime-keyed-read",
     "same-evaluation",
     "scalar-state",
@@ -2489,6 +2616,7 @@ fn workspace_activation_diagnostic(
             Some(PolicySourceIdentity::new(WORKSPACE_PACKS_DOCUMENT_PATH)),
             None,
             Vec::new(),
+            crate::RelatedLocationOmissions::Known(0),
         ),
         WorkspaceActivationError::ShippedModels(error) => report_diagnostic(
             PolicyReportDiagnosticCode::PackActivationFailed,
@@ -2496,6 +2624,7 @@ fn workspace_activation_diagnostic(
             None,
             None,
             Vec::new(),
+            crate::RelatedLocationOmissions::Known(0),
         ),
         WorkspaceActivationError::WorkspaceModels(models) => {
             // The per-file variants already carry the full workspace-relative
@@ -2508,6 +2637,7 @@ fn workspace_activation_diagnostic(
                 Some(PolicySourceIdentity::new(path)),
                 None,
                 Vec::new(),
+                crate::RelatedLocationOmissions::Known(0),
             )
         }
     }
@@ -2548,6 +2678,7 @@ fn nonready_activation_diagnostic(
         source,
         None,
         Vec::new(),
+        crate::RelatedLocationOmissions::Known(0),
     )
     .map(Some)
 }
@@ -2597,6 +2728,7 @@ fn inactive_workspace_model_diagnostics(
                 source,
                 None,
                 Vec::new(),
+                crate::RelatedLocationOmissions::Known(0),
             )?);
         }
     }
@@ -2619,6 +2751,7 @@ fn workspace_model_warning(
         source,
         None,
         Vec::new(),
+        crate::RelatedLocationOmissions::Known(0),
     )
     .map_err(|error| {
         PolicyCoordinatorError::new(format!(
@@ -2988,6 +3121,8 @@ enum PolicyWorkspaceSource<'a> {
 /// One policy's evaluation, before the batch-level bookkeeping that reads
 /// policy order.
 struct EvaluatedPolicy {
+    reuse_verdict: ReuseVerdict,
+    selection_reads: Vec<ReadKey>,
     policy_id: PolicyId,
     run: PolicyRun,
     elapsed: std::time::Duration,
@@ -3048,7 +3183,10 @@ fn evaluate_policy_once(
     options: &PolicyEvaluationOptions,
     workspace_has_analyzable_files: bool,
     range: &ChangedRangeResolution,
+    acceptance_hint: &crate::AcceptanceHint<'_>,
 ) -> Result<EvaluatedPolicy, PolicyCoordinatorError> {
+    let execution = Arc::new(EvaluationExecution::default());
+    let _execution = execution.install();
     let _attribution = brokk_bifrost_analysis::analyzer::ReadAttribution::for_request().install();
     let policy_id = policy.definition().metadata.id.clone();
     let started_after_batch_deadline = policy_deadline_reached(cancellation)?;
@@ -3066,6 +3204,7 @@ fn evaluate_policy_once(
         incremental.record_run(PolicyIncrementalRun::whole_family(policy_id.clone()));
     }
     let context = PolicyEvaluationContext {
+        acceptance_hint: Some(acceptance_hint),
         analyzer: workspace.map(WorkspaceAnalyzer::analyzer).ok_or_else(|| {
             PolicyCoordinatorError::new(format!(
                 "runnable policy `{}` has no analyzer snapshot",
@@ -3088,6 +3227,7 @@ fn evaluate_policy_once(
     };
     crate::phase_cpu::reset();
     let policy_started = Instant::now();
+
     let evaluated = {
         let _scope = brokk_bifrost_analysis::profiling::scope_with(|| {
             format!(
@@ -3242,6 +3382,13 @@ fn evaluate_policy_once(
     if !workspace_has_analyzable_files && !policy_uses_only_file_facts(policy) {
         run.mark_inconclusive(PolicyIncompleteReason::NoAnalyzableFiles);
     }
+    // A policy that reads data the rules packs supply cannot be complete
+    // while that data may be missing a rejected pack's share (#10941); the
+    // batch's identifier-typos-incomplete or pack-catalogs-incomplete
+    // diagnostic names the gap.
+    if policy_reads_incomplete_pack_data(policy, options) {
+        run.mark_inconclusive(PolicyIncompleteReason::CapabilityIncomplete);
+    }
     let batch_deadline_reached = policy_deadline_reached(cancellation)?;
     let stopped = matches!(
         run.completion(),
@@ -3269,6 +3416,11 @@ fn evaluate_policy_once(
         (PolicyProgress::Completed, None)
     };
     if let Some(reason) = deadline_reason {
+        run.record_budget_refusal(if reason == PolicyIncompleteReason::RuleDeadlineExceeded {
+            "time/policy_deadline_ms"
+        } else {
+            "time/batch_deadline_ms"
+        });
         run.replace_incomplete_reason(PolicyIncompleteReason::Cancelled, reason)
             .map_err(|error| {
                 PolicyCoordinatorError::new(format!(
@@ -3311,6 +3463,10 @@ fn evaluate_policy_once(
         cancellation.publish_result(POLICY_RUN_RESULT_KIND, value);
     }
     Ok(EvaluatedPolicy {
+        reuse_verdict: execution.verdict(),
+        selection_reads: execution
+            .selection_reads::<EvaluationSelectionReads>()
+            .keys(),
         policy_id,
         run,
         elapsed,
@@ -3427,6 +3583,8 @@ fn evaluate_prepared_policy_inputs(
     cancellation: Option<&CancellationToken>,
     retention_budget: &brokk_bifrost_analysis::retention_budget::RetentionBudget,
 ) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
+    let execution = Arc::new(EvaluationExecution::default());
+    let _execution = execution.install();
     let _product_entry = brokk_bifrost_analysis::analyzer::enter_product_entry();
     let registration_started = Instant::now();
     let requested_policy_ids = inputs
@@ -3462,6 +3620,8 @@ fn evaluate_prepared_policy_inputs(
         return deadline_before_evaluation_outcome(
             options,
             batch_budget,
+            None,
+            None,
             options
                 .suppressions()
                 .source_states(PolicySuppressionDocumentState::NotEvaluated),
@@ -3492,6 +3652,31 @@ fn evaluate_prepared_policy_inputs(
             Some(PolicySourceIdentity::new(&failure.path)),
             None,
             Vec::new(),
+            crate::RelatedLocationOmissions::Known(0),
+        )?);
+    }
+    // A rejected pack that may have held selected policies leaves the batch
+    // incomplete, so its diagnostic is an error; any other rejection stays
+    // visible as a warning (#10941).
+    for notice in &options.builtin_pack_rejections {
+        let rejection = &notice.rejection;
+        let severity = if notice.selection_incomplete {
+            PolicyDiagnosticSeverity::Error
+        } else {
+            PolicyDiagnosticSeverity::Warning
+        };
+        let code = match rejection {
+            BuiltInRejection::Pack(_) => PolicyReportDiagnosticCode::BuiltinPolicyPackRejected,
+            BuiltInRejection::Policy(_) => PolicyReportDiagnosticCode::BuiltinPolicyRejected,
+        };
+        secondary_diagnostics.push(report_diagnostic_with_severity(
+            code,
+            severity,
+            format!("the built-in policy catalog rejected {rejection}"),
+            None,
+            None,
+            Vec::new(),
+            crate::RelatedLocationOmissions::Known(0),
         )?);
     }
     let suppression_document = suppression_load.document;
@@ -3513,6 +3698,7 @@ fn evaluate_prepared_policy_inputs(
                     )),
                     None,
                     Vec::new(),
+                    crate::RelatedLocationOmissions::Known(0),
                 )?);
                 (None, PolicyScopeDocumentState::Invalid)
             }
@@ -3534,6 +3720,7 @@ fn evaluate_prepared_policy_inputs(
                     )),
                     None,
                     Vec::new(),
+                    crate::RelatedLocationOmissions::Known(0),
                 )?);
                 None
             }
@@ -3556,6 +3743,7 @@ fn evaluate_prepared_policy_inputs(
                     Some(PolicySourceIdentity::new(WORKSPACE_PACKS_DOCUMENT_PATH)),
                     None,
                     Vec::new(),
+                    crate::RelatedLocationOmissions::Known(0),
                 )?);
                 packs_load_failure = Some(failure);
                 None
@@ -3566,6 +3754,8 @@ fn evaluate_prepared_policy_inputs(
         return deadline_before_evaluation_outcome(
             options,
             batch_budget,
+            None,
+            None,
             suppression_sources.clone(),
             scope_document_state,
             vec![PolicyStageTiming::from_duration(
@@ -3602,6 +3792,8 @@ fn evaluate_prepared_policy_inputs(
         return deadline_before_evaluation_outcome(
             options,
             batch_budget,
+            None,
+            None,
             suppression_sources.clone(),
             scope_document_state,
             vec![PolicyStageTiming::from_duration(
@@ -3711,6 +3903,14 @@ fn evaluate_prepared_policy_inputs(
     let workspace = supplied_workspace
         .or(reused_host_workspace)
         .or(owned_analyzer.as_ref());
+    // Declared after the owned workspace: sample while its regions still live,
+    // on errors as well as success. Nested host calls are separate boundaries;
+    // these owner-wide cumulative observations are not additive request costs.
+    let _retention = brokk_bifrost_analysis::profiling::retention_scope(
+        workspace.map_or(retention_budget, WorkspaceAnalyzer::retention_budget),
+        "policy_request",
+        "evaluate",
+    );
     let workspace_has_analyzable_files =
         workspace.is_some_and(|workspace| !workspace.analyzer().analyzed_files().is_empty());
     let uncancelled = CancellationToken::default();
@@ -3794,6 +3994,18 @@ fn evaluate_prepared_policy_inputs(
         )
     });
 
+    // Bind existing default RQL registration limits once for the whole policy
+    // request, before preparation captures or per-policy resource wrappers.
+    let _value_flow_retention = workspace
+        .map(|_| {
+            let request = brokk_bifrost_analysis::analyzer::current_outer_request()
+                .expect("policy registration is inside its outer request");
+            brokk_bifrost_rql::ValueFlowPlanRegistrationSet::default()
+                .bind_retention_scope(&request)
+                .map_err(|error| PolicyCoordinatorError::new(error.to_string()))
+        })
+        .transpose()?;
+
     let mut pending_indexes = inputs
         .iter()
         .enumerate()
@@ -3815,6 +4027,8 @@ fn evaluate_prepared_policy_inputs(
             return deadline_before_evaluation_outcome(
                 options,
                 batch_budget,
+                Some(registry_limits),
+                None,
                 suppression_sources.clone(),
                 scope_document_state,
                 vec![PolicyStageTiming::from_duration(
@@ -3897,6 +4111,8 @@ fn evaluate_prepared_policy_inputs(
                     return deadline_before_evaluation_outcome(
                         options,
                         batch_budget,
+                        Some(registry_limits),
+                        None,
                         suppression_sources.clone(),
                         scope_document_state,
                         vec![PolicyStageTiming::from_duration(
@@ -3941,6 +4157,52 @@ fn evaluate_prepared_policy_inputs(
         })
         .collect::<HashSet<_>>();
 
+    // A policy that reads the identifier typo table answers from the union
+    // the loaded rules packs supply. When that union may be missing typos,
+    // because the catalog failed or rejected a pack that may have supplied
+    // them, those policies' answers may be incomplete; other policies are
+    // unaffected (#10941).
+    if options.identifier_typos.is_none()
+        && let Some(gap) = super::builtin::catalog_identifier_typos_gap()
+    {
+        let readers = registry
+            .policies()
+            .filter(|policy| runnable_ids.contains(&policy.definition().metadata.id))
+            .filter(|policy| super::builtin::policy_reads_identifier_typos(policy))
+            .map(|policy| policy.definition().metadata.id.as_str())
+            .collect::<Vec<_>>();
+        if !readers.is_empty() {
+            secondary_diagnostics.push(report_diagnostic(
+                PolicyReportDiagnosticCode::IdentifierTyposIncomplete,
+                format!("policies {readers:?} read identifier typos, but {gap}"),
+                None,
+                None,
+                Vec::new(),
+                crate::RelatedLocationOmissions::Known(0),
+            )?);
+        }
+    }
+    // The same holds for a policy that reads every registered catalog: a
+    // rejected pack's catalogs are missing from the run's registry.
+    if let Some(gap) = super::builtin::catalog_registry_gap() {
+        let readers = registry
+            .policies()
+            .filter(|policy| runnable_ids.contains(&policy.definition().metadata.id))
+            .filter(|policy| super::builtin::policy_reads_any_registered_catalog(policy))
+            .map(|policy| policy.definition().metadata.id.as_str())
+            .collect::<Vec<_>>();
+        if !readers.is_empty() {
+            secondary_diagnostics.push(report_diagnostic(
+                PolicyReportDiagnosticCode::PackCatalogsIncomplete,
+                format!("policies {readers:?} read every registered catalog, but {gap}"),
+                None,
+                None,
+                Vec::new(),
+                crate::RelatedLocationOmissions::Known(0),
+            )?);
+        }
+    }
+
     let mut not_run_runs = HashMap::new();
     let semantic_snapshot = active_semantic_model_snapshot
         .as_ref()
@@ -3963,6 +4225,33 @@ fn evaluate_prepared_policy_inputs(
             .remove(policy_id)
             .into_iter()
             .collect::<Vec<_>>();
+        if let Some(metadata) = metadata {
+            let uses_call_reachability = policy.resolved_selectors().iter().any(|selector| {
+                let Some((_, query)) = selector.as_query() else {
+                    return false;
+                };
+                let mut pending = vec![&query.plan];
+                while let Some(plan) = pending.pop() {
+                    if matches!(
+                        &plan.source,
+                        brokk_bifrost_rql::CodeQueryPlanSource::CallReachability(_)
+                    ) {
+                        return true;
+                    }
+                    pending.extend(plan.source.child_plans());
+                }
+                false
+            });
+            if uses_call_reachability
+                && !metadata
+                    .required_capabilities
+                    .iter()
+                    .any(|label| label == "rql-call-reachability")
+            {
+                unavailable_capabilities.push(UnavailablePolicyCapability { label: "rql-call-reachability".into(), reason: "the policy pack must declare rql-call-reachability in required_capabilities".into() });
+            }
+        }
+
         unavailable_capabilities.extend(
             metadata
                 .into_iter()
@@ -4023,6 +4312,8 @@ fn evaluate_prepared_policy_inputs(
         return deadline_before_evaluation_outcome(
             options,
             batch_budget,
+            Some(registry_limits),
+            None,
             suppression_sources.clone(),
             scope_document_state,
             vec![PolicyStageTiming::from_duration(
@@ -4075,6 +4366,15 @@ fn evaluate_prepared_policy_inputs(
     });
     let replay_evidence =
         certified_census.map(|census| replay_evidence(batch_budget, registry_limits, census));
+    let budget_telemetry = super::budget::PolicyBudgetTelemetry {
+        effective_grant: batch_budget.replay_caps(registry_limits),
+        census,
+        policy_deadlines_ms: options.policy_deadlines.0.clone(),
+        batch_remaining_ms: cancellation
+            .and_then(CancellationToken::remaining_time)
+            .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)),
+        batch_refusals: Default::default(),
+    };
     let per_policy_budget = *batch_budget.per_policy();
     let activation_for_report = workspace_activation
         .as_ref()
@@ -4166,6 +4466,7 @@ fn evaluate_prepared_policy_inputs(
             Some(PolicySourceIdentity::new(WORKSPACE_PACKS_DOCUMENT_PATH)),
             None,
             Vec::new(),
+            crate::RelatedLocationOmissions::Known(0),
         )?);
     }
     // A registered workspace model that never reaches the active set is
@@ -4186,15 +4487,45 @@ fn evaluate_prepared_policy_inputs(
                         .rust_artifact_approximation
                         .is_none()
             })
-            .map(|shard| (&shard.manifest.pack_id, &shard.manifest.version))
+            .map(|shard| {
+                (
+                    &shard.manifest.language,
+                    format!("{}@{}", shard.manifest.pack_id, shard.manifest.version),
+                )
+            })
             .collect::<BTreeSet<_>>();
-        for (pack_id, version) in packs {
-            secondary_diagnostics.push(PolicyReportDiagnostic::try_new(
-                PolicyReportDiagnosticCode::ApproximateStandardLibrary,
-                PolicyDiagnosticSeverity::Note,
-                format!("ADVISORY: selected {pack_id}@{version}; the project's toolchain is unpinned, so std facts are approximate; pin a toolchain channel in rust-toolchain.toml for exact std facts"),
-                None, None, Vec::new(),
-            ).map_err(|error| PolicyCoordinatorError::new(format!("failed to construct approximate stdlib advisory: {error}")))?);
+        // One toolchain observation selects a language's whole standard
+        // library, so one advisory per language names every pack it chose.
+        let mut packs_by_language = BTreeMap::<&String, Vec<String>>::new();
+        for (language, pack) in packs {
+            packs_by_language.entry(language).or_default().push(pack);
+        }
+        for (language, packs) in packs_by_language {
+            let packs = packs.join(", ");
+            let cause = match language.as_str() {
+                "go" => {
+                    "no Go toolchain was observed, so the go.mod `go` lines selected it and std facts are approximate; run with the go command on PATH for exact std facts"
+                }
+                _ => {
+                    "the project's toolchain is unpinned, so std facts are approximate; pin a toolchain channel in rust-toolchain.toml for exact std facts"
+                }
+            };
+            secondary_diagnostics.push(
+                PolicyReportDiagnostic::try_new(
+                    PolicyReportDiagnosticCode::ApproximateStandardLibrary,
+                    PolicyDiagnosticSeverity::Note,
+                    format!("ADVISORY: selected {packs}; {cause}"),
+                    None,
+                    None,
+                    Vec::new(),
+                    crate::RelatedLocationOmissions::Known(0),
+                )
+                .map_err(|error| {
+                    PolicyCoordinatorError::new(format!(
+                        "failed to construct approximate stdlib advisory: {error}"
+                    ))
+                })?,
+            );
         }
         let dependency_advisories = approximate_dependency_advisories(&shards)?;
         for message in dependency_advisories {
@@ -4206,6 +4537,7 @@ fn evaluate_prepared_policy_inputs(
                     None,
                     None,
                     Vec::new(),
+                    crate::RelatedLocationOmissions::Known(0),
                 )
                 .map_err(|error| {
                     PolicyCoordinatorError::new(format!(
@@ -4240,7 +4572,7 @@ fn evaluate_prepared_policy_inputs(
             .iter()
             .any(|entry| !entry.policy_categories().is_empty())
     }) {
-        built_in_scope_categories()
+        built_in_scope_categories()?
     } else {
         HashMap::new()
     };
@@ -4341,6 +4673,7 @@ fn evaluate_prepared_policy_inputs(
                     key,
                     caller_batch_budget,
                     registry_limits,
+                    &policy_categories,
                 ),
                 _ => None,
             };
@@ -4376,6 +4709,8 @@ fn evaluate_prepared_policy_inputs(
                 return diff_base_deadline_outcome(
                     options,
                     batch_budget,
+                    registry_limits,
+                    census,
                     suppression_sources.clone(),
                     scope_document_state,
                     registration_elapsed,
@@ -4516,11 +4851,15 @@ fn evaluate_prepared_policy_inputs(
         .with_taint(&taint)
         .with_typestate(&typestate)
         .with_active_semantic_model_snapshot(icfg_active_semantic_model_snapshot.clone());
+    #[cfg(any(test, feature = "test-support"))]
+    let evaluator = evaluator.with_store_error_probe(options.store_error_probe.clone());
     let preparation_elapsed = preparation_before_diff + late_preparation_started.elapsed();
     if policy_deadline_reached(cancellation)? {
         return deadline_before_evaluation_outcome(
             options,
             batch_budget,
+            Some(registry_limits),
+            census,
             suppression_sources.clone(),
             scope_document_state,
             vec![
@@ -4564,6 +4903,32 @@ fn evaluate_prepared_policy_inputs(
         .policies()
         .filter(|policy| runnable_ids.contains(&policy.definition().metadata.id))
         .collect::<Vec<_>>();
+    let inline_scan = super::inline_suppression::InlineDirectiveScan::new(
+        options.inline_suppressions(),
+        workspace,
+        retention_budget,
+    );
+    let acceptance_hints = runnable_policies
+        .iter()
+        .map(|policy| {
+            let id = &policy.definition().metadata.id;
+            let categories = policy_categories
+                .get(id)
+                .map(std::slice::from_ref)
+                .unwrap_or_default();
+            (
+                id.clone(),
+                crate::AcceptanceHint::new(
+                    id,
+                    suppression_document.as_ref(),
+                    baseline_document.as_ref(),
+                    scope_document.as_ref(),
+                    categories,
+                    &inline_scan,
+                ),
+            )
+        })
+        .collect::<HashMap<_, _>>();
     let policy_outer_request =
         workspace.map(|_| brokk_bifrost_analysis::analyzer::current_outer_request_or_transient());
     let parallelism = super::policy_evaluation_parallelism();
@@ -4587,6 +4952,7 @@ fn evaluate_prepared_policy_inputs(
                 options,
                 workspace_has_analyzable_files,
                 &range,
+                &acceptance_hints[&policy.definition().metadata.id],
             )?);
         }
         evaluations
@@ -4635,6 +5001,7 @@ fn evaluate_prepared_policy_inputs(
                         options,
                         workspace_has_analyzable_files,
                         &range,
+                        &acceptance_hints[&policy.definition().metadata.id],
                     ),
                 )
             });
@@ -4647,67 +5014,92 @@ fn evaluate_prepared_policy_inputs(
         }
         evaluations
     };
-    let mut fail_closed_gate = false;
-    let mut progress = PolicyExecutionProgress::default();
-    // The first interrupted policy in policy order, so the field does not
-    // depend on which worker observed the deadline first.
-    let mut active_policy_id = None;
-    for evaluated in evaluations {
-        policy_evaluation_elapsed += evaluated.elapsed;
-        if evaluated.batch_deadline_reached {
-            batch_clock.reached(PolicyExecutionStage::PolicyEvaluation);
-        }
-        let ids = match evaluated.progress {
-            PolicyProgress::Completed => &mut progress.completed,
-            PolicyProgress::Interrupted => {
-                active_policy_id.get_or_insert_with(|| evaluated.policy_id.clone());
-                &mut progress.interrupted
+    let cut_hint_digest = evaluations
+        .iter()
+        .any(|evaluated| {
+            evaluated
+                .run
+                .work()
+                .retention_omitted_findings_by_dimension()
+                .contains_key("policy/evaluator_retention")
+        })
+        .then(|| {
+            acceptance_hint_digest(
+                suppression_document.as_ref(),
+                baseline_document.as_ref(),
+                options.inline_suppressions(),
+                &policy_categories,
+            )
+        });
+    // The report phase runs in its own frame. Everything it builds is dead
+    // before the next policy batch starts, and a debug build would otherwise
+    // keep those locals in this frame under every policy evaluation (#11691).
+    let build_outcome = || -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
+        let mut fail_closed_gate = false;
+        let mut progress = PolicyExecutionProgress::default();
+        // The first interrupted policy in policy order, so the field does not
+        // depend on which worker observed the deadline first.
+        let mut active_policy_id = None;
+        for evaluated in evaluations {
+            join_evaluation_verdict(evaluated.reuse_verdict);
+            brokk_bifrost_analysis::analyzer::read_ledger::forward_evaluation_selection_reads(
+                &evaluated.selection_reads,
+            );
+            policy_evaluation_elapsed += evaluated.elapsed;
+            if evaluated.batch_deadline_reached {
+                batch_clock.reached(PolicyExecutionStage::PolicyEvaluation);
             }
-            PolicyProgress::TimedOut => &mut progress.timed_out,
-            PolicyProgress::Pending => &mut progress.pending,
-        };
-        ids.push(evaluated.policy_id.clone());
-        if evaluated.fail_closed {
-            fail_closed_gate = true;
+            let ids = match evaluated.progress {
+                PolicyProgress::Completed => &mut progress.completed,
+                PolicyProgress::Interrupted => {
+                    active_policy_id.get_or_insert_with(|| evaluated.policy_id.clone());
+                    &mut progress.interrupted
+                }
+                PolicyProgress::TimedOut => &mut progress.timed_out,
+                PolicyProgress::Pending => &mut progress.pending,
+            };
+            ids.push(evaluated.policy_id.clone());
+            if evaluated.fail_closed {
+                fail_closed_gate = true;
+            }
+            runs.insert(evaluated.policy_id, evaluated.run);
         }
-        runs.insert(evaluated.policy_id, evaluated.run);
-    }
-    let evaluation_elapsed = evaluation_started.elapsed();
-    brokk_bifrost_analysis::profiling::duration(
-        "policy.coordination_including_diff_base",
-        evaluation_elapsed.saturating_sub(policy_evaluation_elapsed),
-    );
-    let report_started = Instant::now();
-    batch_clock.observe(PolicyExecutionStage::ReportConstruction)?;
-    // Every policy has run, so the units this batch computed describe work
-    // that finished. A run that stopped early publishes nothing: its units
-    // would be indistinguishable from complete ones on a later run, and the
-    // whole reuse claim rests on being unable to confuse the two.
-    // A policy its own deadline stopped is not such a run: a unit that
-    // observed its cancellation is execution-dependent and never staged
-    // (`recompute_unit`), so the batch's other policies publish theirs (#7557).
-    let mut published_snapshot = None;
-    if let Some(store) = unit_store.as_ref()
-        && batch_clock.deadline().is_none()
-    {
-        store.flush();
-        published_snapshot = head_snapshot;
-        if let Some(publication) = diff_baseline
-            .as_ref()
-            .and_then(|outcome| outcome.publication.as_ref())
+        let evaluation_elapsed = evaluation_started.elapsed();
+        brokk_bifrost_analysis::profiling::duration(
+            "policy.coordination_including_diff_base",
+            evaluation_elapsed.saturating_sub(policy_evaluation_elapsed),
+        );
+        let report_started = Instant::now();
+        batch_clock.observe(PolicyExecutionStage::ReportConstruction)?;
+        // Every policy has run, so the units this batch computed describe work
+        // that finished. A run that stopped early publishes nothing: its units
+        // would be indistinguishable from complete ones on a later run, and the
+        // whole reuse claim rests on being unable to confuse the two.
+        // A policy its own deadline stopped is not such a run: a unit that
+        // observed its cancellation is execution-dependent and never staged
+        // (`recompute_unit`), so the batch's other policies publish theirs (#7557).
+        let mut published_snapshot = None;
+        if let Some(store) = unit_store.as_ref()
+            && batch_clock.deadline().is_none()
         {
-            store.publish_evaluation(publication);
+            store.flush();
+            published_snapshot = head_snapshot;
+            if let Some(publication) = diff_baseline
+                .as_ref()
+                .and_then(|outcome| outcome.publication.as_ref())
+            {
+                store.publish_evaluation(publication);
+            }
         }
-    }
 
-    let diff_review = match &diff_baseline {
-        Some(baseline) => Some(apply_policy_diff(&baseline.baseline, &mut runs)?),
-        None => None,
-    };
-    if let Some(baseline) = diff_baseline.as_ref().map(|outcome| &outcome.baseline)
-        && let Some(detail) = &baseline.unreliable_detail
-    {
-        secondary_diagnostics.push(report_diagnostic(
+        let diff_review = match &diff_baseline {
+            Some(baseline) => Some(apply_policy_diff(&baseline.baseline, &mut runs)?),
+            None => None,
+        };
+        if let Some(baseline) = diff_baseline.as_ref().map(|outcome| &outcome.baseline)
+            && let Some(detail) = &baseline.unreliable_detail
+        {
+            secondary_diagnostics.push(report_diagnostic(
             PolicyReportDiagnosticCode::DiffBaseUnreliable,
             format!(
                 "diff base `{}` ({}) was unreliable; qualified policies use verified diff evidence and unqualified policies use full gating: {detail}",
@@ -4716,113 +5108,116 @@ fn evaluate_prepared_policy_inputs(
             None,
             None,
             Vec::new(),
+            crate::RelatedLocationOmissions::Known(0),
         )?);
-    }
-    if let Some(baseline) = diff_baseline.as_ref().map(|outcome| &outcome.baseline) {
-        for policy in &baseline.unqualified_policies {
-            diff_base_policy_unqualified.push(policy.policy_id().clone());
-            // An unqualified policy gates every head finding in full, so no
-            // new finding hides behind it. When its base run was Bifrost's own
-            // inconclusive verdict the comparison it could not make is
-            // advisory, as SlopCop reads it (#8111); a base that an unreliable
-            // reading condemns already carries `diff-base-unreliable`. Any
-            // other unqualified base run reached no verdict and stays an error.
-            let severity = if policy.completion() == "inconclusive" {
-                PolicyDiagnosticSeverity::Warning
-            } else {
-                PolicyDiagnosticSeverity::Error
-            };
-            secondary_diagnostics.push(report_diagnostic_with_severity(
-                PolicyReportDiagnosticCode::DiffBasePolicyUnqualified,
-                severity,
-                format!(
-                    "diff base policy `{}` is unqualified ({}, {}); diagnostics: {:?}",
-                    policy.policy_id(),
-                    policy.completion(),
-                    policy.completion_detail(),
-                    policy.diagnostics()
-                ),
-                None,
-                None,
-                Vec::new(),
-            )?);
         }
-    }
+        if let Some(baseline) = diff_baseline.as_ref().map(|outcome| &outcome.baseline) {
+            for policy in &baseline.unqualified_policies {
+                diff_base_policy_unqualified.push(policy.policy_id().clone());
+                // An unqualified policy gates every head finding in full, so no
+                // new finding hides behind it. When its base run was Bifrost's own
+                // inconclusive verdict the comparison it could not make is
+                // advisory, as SlopCop reads it (#8111); a base that an unreliable
+                // reading condemns already carries `diff-base-unreliable`. Any
+                // other unqualified base run reached no verdict and stays an error.
+                let severity = if policy.completion() == "inconclusive" {
+                    PolicyDiagnosticSeverity::Warning
+                } else {
+                    PolicyDiagnosticSeverity::Error
+                };
+                secondary_diagnostics.push(report_diagnostic_with_severity(
+                    PolicyReportDiagnosticCode::DiffBasePolicyUnqualified,
+                    severity,
+                    format!(
+                        "diff base policy `{}` is unqualified ({}, {}); diagnostics: {:?}",
+                        policy.policy_id(),
+                        policy.completion(),
+                        policy.completion_detail(),
+                        policy.diagnostics()
+                    ),
+                    None,
+                    None,
+                    Vec::new(),
+                    crate::RelatedLocationOmissions::Known(0),
+                )?);
+            }
+        }
 
-    let suppression_reviews = match suppression_document.as_ref() {
-        Some(document) => apply_policy_suppressions(
-            document,
-            options.evaluation_date(),
-            &registry,
-            workspace,
-            &scoped_files,
+        let suppression_reviews = match suppression_document.as_ref() {
+            Some(document) => apply_policy_suppressions(
+                document,
+                options.evaluation_date(),
+                &registry,
+                workspace,
+                &scoped_files,
+                &mut runs,
+            )?,
+            None => Vec::new(),
+        };
+        // Inline directives claim after exact records and before scope: a
+        // directive names the finding's line, a scope entry only its directory.
+        let inline_review = super::inline_suppression::apply_inline_suppressions(
+            options.inline_suppressions(),
+            &inline_scan,
             &mut runs,
-        )?,
-        None => Vec::new(),
-    };
-    // Inline directives claim after exact records and before scope: a
-    // directive names the finding's line, a scope entry only its directory.
-    let inline_review = super::inline_suppression::apply_inline_suppressions(
-        options.inline_suppressions(),
-        workspace,
-        &mut runs,
-    );
-    let scope_reviews = match scope_document.as_ref() {
-        Some(document) => {
-            let mut reviews = apply_policy_scope(document, &policy_categories, &mut runs)?;
-            for review in &mut reviews {
-                if !review.entry().excludes_roots() {
-                    continue;
+        );
+        let scope_reviews = match scope_document.as_ref() {
+            Some(document) => {
+                let mut reviews = apply_policy_scope(document, &policy_categories, &mut runs)?;
+                for review in &mut reviews {
+                    if !review.entry().excludes_roots() {
+                        continue;
+                    }
+                    let count = registry
+                        .policies()
+                        .filter(|policy| {
+                            runs.contains_key(&policy.definition().metadata.id)
+                                && policy_supports_execution_scope(policy)
+                        })
+                        .map(|policy| {
+                            let id = &policy.definition().metadata.id;
+                            let categories = policy_categories
+                                .get(id)
+                                .map(std::slice::from_ref)
+                                .unwrap_or_default();
+                            workspace_files
+                                .iter()
+                                .filter(|file| {
+                                    review
+                                        .entry()
+                                        .matches(&rel_path_string(file), id, categories)
+                                })
+                                .count() as u64
+                        })
+                        .sum();
+                    review.set_excluded_root_files(count);
                 }
-                let count = registry
-                    .policies()
-                    .filter(|policy| {
-                        runs.contains_key(&policy.definition().metadata.id)
-                            && policy_supports_execution_scope(policy)
-                    })
-                    .map(|policy| {
-                        let id = &policy.definition().metadata.id;
-                        let categories = policy_categories
-                            .get(id)
-                            .map(std::slice::from_ref)
-                            .unwrap_or_default();
-                        workspace_files
-                            .iter()
-                            .filter(|file| {
-                                review
-                                    .entry()
-                                    .matches(&rel_path_string(file), id, categories)
-                            })
-                            .count() as u64
-                    })
-                    .sum();
-                review.set_excluded_root_files(count);
+                reviews
             }
-            reviews
-        }
-        None => Vec::new(),
-    };
-    let evaluation = PolicyReportEvaluationContext::new(
-        options.evaluation_date(),
-        suppression_sources,
-        options.scope(),
-        scope_document_state,
-    )
-    .with_builtin_selection(options.builtin_selection.clone());
-    let mut builder = match PolicyReportBuilder::new_with_suppression_audit(
-        batch_budget,
-        inputs.len(),
-        evaluation.clone(),
-        suppression_reviews,
-        scope_reviews,
-    ) {
-        Ok(builder) => builder,
-        Err(PolicyReportBuilderError::SuppressionAuditPreflightExceeded { .. }) => {
-            for finding in runs.values_mut().flat_map(|run| run.findings_mut()) {
-                finding.clear_suppression();
-                finding.clear_scope();
-            }
-            secondary_diagnostics.push(report_diagnostic(
+            None => Vec::new(),
+        };
+        let evaluation = PolicyReportEvaluationContext::new(
+            options.evaluation_date(),
+            suppression_sources,
+            options.scope(),
+            scope_document_state,
+        )
+        .with_builtin_selection(options.builtin_selection.clone())
+        .with_budget(budget_telemetry);
+        let mut builder = match PolicyReportBuilder::new_with_suppression_audit(
+            batch_budget,
+            inputs.len(),
+            evaluation.clone(),
+            suppression_reviews,
+            scope_reviews,
+        ) {
+            Ok(builder) => builder,
+            Err(PolicyReportBuilderError::SuppressionAuditPreflightExceeded { .. }) => {
+                for finding in runs.values_mut().flat_map(|run| run.findings_mut()) {
+                    finding.clear_suppression();
+                    finding.clear_scope();
+                }
+                secondary_diagnostics.push(report_diagnostic(
                 PolicyReportDiagnosticCode::SuppressionAuditRetentionExceeded,
                 format!(
                     "suppression and scope audits exceed the report retention budget; finding acceptance was rolled back, but execution root exclusions remain in effect under {} for policies {:?}",
@@ -4842,44 +5237,45 @@ fn evaluate_prepared_policy_inputs(
                 )),
                 None,
                 Vec::new(),
+                crate::RelatedLocationOmissions::Known(0),
             )?);
-            PolicyReportBuilder::new_with_suppression_audit(
-                batch_budget,
-                inputs.len(),
-                evaluation,
-                Vec::new(),
-                Vec::new(),
-            )
-            .map_err(|error| {
-                PolicyCoordinatorError::new(format!(
-                    "policy report preflight failed after disabling suppressions: {error}"
+                PolicyReportBuilder::new_with_suppression_audit(
+                    batch_budget,
+                    inputs.len(),
+                    evaluation,
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .map_err(|error| {
+                    PolicyCoordinatorError::new(format!(
+                        "policy report preflight failed after disabling suppressions: {error}"
+                    ))
+                })?
+            }
+            Err(error) => {
+                return Err(PolicyCoordinatorError::new(format!(
+                    "policy report preflight failed: {error}"
+                )));
+            }
+        };
+        // The baseline claims only findings that suppressions and scope left
+        // unclaimed, so it joins after the builder preflight settled those
+        // attachments (a preflight rollback clears them, and the baseline must
+        // see the final claim state).
+        let baseline_review = match baseline_document.as_ref() {
+            Some(document) => {
+                let entries = apply_policy_baseline(document, &registry, &mut runs)?;
+                Some(PolicyBaselineReview::new(
+                    options.baseline().source().relative_path(),
+                    document,
+                    entries,
                 ))
-            })?
-        }
-        Err(error) => {
-            return Err(PolicyCoordinatorError::new(format!(
-                "policy report preflight failed: {error}"
-            )));
-        }
-    };
-    // The baseline claims only findings that suppressions and scope left
-    // unclaimed, so it joins after the builder preflight settled those
-    // attachments (a preflight rollback clears them, and the baseline must
-    // see the final claim state).
-    let baseline_review = match baseline_document.as_ref() {
-        Some(document) => {
-            let entries = apply_policy_baseline(document, &registry, &mut runs)?;
-            Some(PolicyBaselineReview::new(
-                options.baseline().source().relative_path(),
-                document,
-                entries,
-            ))
-        }
-        None => None,
-    };
-    let threshold_exceeded = fail_closed_gate
-        || runs.values().flat_map(PolicyRun::findings).any(|finding| {
-            !finding.is_accepted()
+            }
+            None => None,
+        };
+        let threshold_exceeded = fail_closed_gate
+            || runs.values().flat_map(PolicyRun::findings).any(|finding| {
+                !finding.is_accepted()
                 && options.fail_on().matches(finding.severity())
                 // Keep exact diff decisions for qualified policies when a
                 // different policy lacks complete base evidence. Findings
@@ -4887,154 +5283,146 @@ fn evaluate_prepared_policy_inputs(
                 && finding.diff().is_none_or(|diff| {
                     diff.disposition() == FindingDiffDisposition::New
                 })
-        });
-    if let Some(review) = diff_review {
-        builder.set_diff(review).map_err(|error| {
-            PolicyCoordinatorError::new(format!("failed to retain the policy diff review: {error}"))
-        })?;
-    }
-    for policy_id in diff_base_policy_unqualified {
-        if let Some(run) = runs.get(&policy_id) {
-            for finding in run.findings() {
-                if finding.diff().is_none() {
-                    continue;
+            });
+        if let Some(review) = diff_review {
+            builder.set_diff(review).map_err(|error| {
+                PolicyCoordinatorError::new(format!(
+                    "failed to retain the policy diff review: {error}"
+                ))
+            })?;
+        }
+        for policy_id in diff_base_policy_unqualified {
+            if let Some(run) = runs.get(&policy_id) {
+                for finding in run.findings() {
+                    if finding.diff().is_none() {
+                        continue;
+                    }
+                    return Err(PolicyCoordinatorError::new(format!(
+                        "unqualified diff-base policy {policy_id} unexpectedly has a finding diff decision for {}",
+                        finding.id()
+                    )));
                 }
-                return Err(PolicyCoordinatorError::new(format!(
-                    "unqualified diff-base policy {policy_id} unexpectedly has a finding diff decision for {}",
-                    finding.id()
-                )));
             }
         }
-    }
-    // Every diff-base run reports what it reused, including the run that
-    // reused nothing. The section is charged to the report's retention budget
-    // like the diff review, so a section present in one mode and absent in the
-    // other would be a retained size that depends on how the run executed, and
-    // two runs that must agree byte for byte could retain a different prefix
-    // of the same findings at the exact boundary.
-    let incremental_review = options.diff_base().map(|_| match head_incremental {
-        Some(incremental) => match diff_baseline
-            .as_ref()
-            .and_then(|outcome| outcome.base_review.as_ref())
-        {
-            Some(base_review) => incremental.review().with_base_runs(base_review),
-            None => incremental.review(),
-        },
-        None => {
-            let reason = if options.incremental() {
-                // Reuse was asked for and there was nothing to reuse against:
-                // the base evaluation produced no comparison, which is the
-                // same missing evidence a verification reports.
-                WidenReason::ReverseDependencyEvidenceMissing
-            } else {
-                WidenReason::IncrementalDisabled
-            };
-            PolicyIncrementalReview::evaluated_in_full(
-                registry
-                    .policies()
-                    .filter(|policy| runnable_ids.contains(&policy.definition().metadata.id))
-                    .map(|policy| policy.definition().metadata.id.clone()),
-                reason,
-            )
+        // Every diff-base run reports what it reused, including the run that
+        // reused nothing. The section is charged to the report's retention budget
+        // like the diff review, so a section present in one mode and absent in the
+        // other would be a retained size that depends on how the run executed, and
+        // two runs that must agree byte for byte could retain a different prefix
+        // of the same findings at the exact boundary.
+        let incremental_review = options.diff_base().map(|_| match head_incremental {
+            Some(incremental) => match diff_baseline
+                .as_ref()
+                .and_then(|outcome| outcome.base_review.as_ref())
+            {
+                Some(base_review) => incremental.review().with_base_runs(base_review),
+                None => incremental.review(),
+            },
+            None => {
+                let reason = if options.incremental() {
+                    // Reuse was asked for and there was nothing to reuse against:
+                    // the base evaluation produced no comparison, which is the
+                    // same missing evidence a verification reports.
+                    WidenReason::ReverseDependencyEvidenceMissing
+                } else {
+                    WidenReason::IncrementalDisabled
+                };
+                PolicyIncrementalReview::evaluated_in_full(
+                    registry
+                        .policies()
+                        .filter(|policy| runnable_ids.contains(&policy.definition().metadata.id))
+                        .map(|policy| policy.definition().metadata.id.clone()),
+                    reason,
+                )
+            }
+        });
+        if let Some(review) = incremental_review.clone() {
+            builder.set_incremental(review).map_err(|error| {
+                PolicyCoordinatorError::new(format!(
+                    "failed to retain the incremental reuse review: {error}"
+                ))
+            })?;
         }
-    });
-    if let Some(review) = incremental_review.clone() {
-        builder.set_incremental(review).map_err(|error| {
-            PolicyCoordinatorError::new(format!(
-                "failed to retain the incremental reuse review: {error}"
-            ))
-        })?;
-    }
-    if let Some(review) = packs_review {
-        builder.set_packs(review).map_err(|error| {
-            PolicyCoordinatorError::new(format!(
-                "failed to retain the pack-activation review: {error}"
-            ))
-        })?;
-    }
-    if let Some(review) = inline_review {
-        builder.set_inline_suppressions(review).map_err(|error| {
-            PolicyCoordinatorError::new(format!(
-                "failed to retain the inline suppression review: {error}"
-            ))
-        })?;
-    }
-    if let Some(review) = baseline_review {
-        builder.set_baseline(review).map_err(|error| {
-            PolicyCoordinatorError::new(format!(
-                "failed to retain the policy baseline review: {error}"
-            ))
-        })?;
-    }
-    let mut retained_findings = Vec::new();
-    for input in inputs {
-        batch_clock.observe(PolicyExecutionStage::ReportConstruction)?;
-        match input {
-            InputOutcome::Diagnostic(diagnostic) => builder
-                .register_primary_diagnostic(diagnostic)
-                .map_err(|error| {
-                    PolicyCoordinatorError::new(format!(
-                        "failed to reserve a policy diagnostic skeleton: {error}"
-                    ))
-                })?,
-            InputOutcome::Runnable(policy_id) => {
-                let policy = registry
-                    .policies()
-                    .find(|policy| policy.definition().metadata.id == policy_id)
-                    .ok_or_else(|| {
-                        PolicyCoordinatorError::new(format!(
-                            "runnable policy `{policy_id}` is missing from the registry"
-                        ))
-                    })?;
-                let mut run = runs.remove(&policy_id).ok_or_else(|| {
-                    PolicyCoordinatorError::new(format!(
-                        "runnable policy `{policy_id}` has no evaluation outcome"
-                    ))
-                })?;
-                retained_findings.append(&mut run.take_findings());
-                builder
-                    .register_policy(PolicyRuleDescriptor::from_loaded(policy), run)
+        if let Some(review) = packs_review {
+            builder.set_packs(review).map_err(|error| {
+                PolicyCoordinatorError::new(format!(
+                    "failed to retain the pack-activation review: {error}"
+                ))
+            })?;
+        }
+        if let Some(review) = inline_review {
+            builder.set_inline_suppressions(review).map_err(|error| {
+                PolicyCoordinatorError::new(format!(
+                    "failed to retain the inline suppression review: {error}"
+                ))
+            })?;
+        }
+        if let Some(review) = baseline_review {
+            builder.set_baseline(review).map_err(|error| {
+                PolicyCoordinatorError::new(format!(
+                    "failed to retain the policy baseline review: {error}"
+                ))
+            })?;
+        }
+        let mut retained_findings = Vec::new();
+        for input in inputs {
+            batch_clock.observe(PolicyExecutionStage::ReportConstruction)?;
+            match input {
+                InputOutcome::Diagnostic(diagnostic) => builder
+                    .register_primary_diagnostic(diagnostic)
                     .map_err(|error| {
                         PolicyCoordinatorError::new(format!(
-                            "failed to reserve a policy run skeleton: {error}"
+                            "failed to reserve a policy diagnostic skeleton: {error}"
+                        ))
+                    })?,
+                InputOutcome::Runnable(policy_id) => {
+                    let policy = registry
+                        .policies()
+                        .find(|policy| policy.definition().metadata.id == policy_id)
+                        .ok_or_else(|| {
+                            PolicyCoordinatorError::new(format!(
+                                "runnable policy `{policy_id}` is missing from the registry"
+                            ))
+                        })?;
+                    let mut run = runs.remove(&policy_id).ok_or_else(|| {
+                        PolicyCoordinatorError::new(format!(
+                            "runnable policy `{policy_id}` has no evaluation outcome"
                         ))
                     })?;
-            }
-            InputOutcome::Pending(_) => {
-                return Err(PolicyCoordinatorError::new(
-                    "internal policy coordinator input remained unresolved",
-                ));
+                    retained_findings.push(run.take_findings());
+                    builder
+                        .register_policy(PolicyRuleDescriptor::from_loaded(policy), run)
+                        .map_err(|error| {
+                            PolicyCoordinatorError::new(format!(
+                                "failed to reserve a policy run skeleton: {error}"
+                            ))
+                        })?;
+                }
+                InputOutcome::Pending(_) => {
+                    return Err(PolicyCoordinatorError::new(
+                        "internal policy coordinator input remained unresolved",
+                    ));
+                }
             }
         }
-    }
 
-    // Retention priority: suppressed/scoped findings first (their omission is
-    // a loud audit failure), then unclaimed gating findings, then baselined
-    // findings last — their identities are already durably recorded in the
-    // baseline review counts, so under pressure they are dropped first.
-    retained_findings.sort_by_key(|finding| {
-        let priority: u8 = if finding.is_explicitly_accepted() {
-            0
-        } else if finding.baseline().is_none() {
-            1
-        } else {
-            2
-        };
-        (priority, finding.id())
-    });
-    let mut suppression_result_omitted = false;
-    let mut scope_result_omitted = false;
-    let mut baseline_result_omitted = false;
-    for finding in retained_findings {
-        let policy_id = finding.policy_id().clone();
-        let finding_id = finding.id();
-        let suppressed = finding.suppression().is_some();
-        let baselined = finding.baseline().is_some();
-        let finding_scope = finding.scope().cloned();
-        let outcome = builder.retain_finding(finding).map_err(|error| {
-            PolicyCoordinatorError::new(format!("failed to retain a policy finding: {error}"))
-        })?;
-        if matches!(outcome, PolicyRetentionOutcome::Omitted { .. }) {
+        let omitted_findings =
+            builder
+                .retain_policy_findings(retained_findings)
+                .map_err(|error| {
+                    PolicyCoordinatorError::new(format!(
+                        "failed to retain policy finding prefixes: {error}"
+                    ))
+                })?;
+        let mut suppression_result_omitted = false;
+        let mut scope_result_omitted = false;
+        let mut baseline_result_omitted = false;
+        for finding in omitted_findings {
+            let policy_id = finding.policy_id().clone();
+            let finding_id = finding.id();
+            let suppressed = finding.suppression().is_some();
+            let baselined = finding.baseline().is_some();
+            let finding_scope = finding.scope().cloned();
             if suppressed {
                 builder
                     .mark_suppression_result_omitted(&policy_id, finding_id)
@@ -5066,172 +5454,190 @@ fn evaluate_prepared_policy_inputs(
                 scope_result_omitted = true;
             }
         }
-    }
-    if scope_result_omitted {
-        secondary_diagnostics.push(report_diagnostic(
-            PolicyReportDiagnosticCode::ScopeAuditRetentionExceeded,
-            "one or more scoped finding results exceeded the report retention budget",
-            Some(PolicySourceIdentity::new(
-                options.scope().source().relative_path(),
-            )),
-            None,
-            Vec::new(),
-        )?);
-    }
-    if suppression_result_omitted {
-        secondary_diagnostics.push(report_diagnostic(
-            PolicyReportDiagnosticCode::SuppressionAuditRetentionExceeded,
-            "one or more applied suppression results exceeded the report retention budget",
-            Some(PolicySourceIdentity::new(
-                options.suppressions().primary_relative_path(),
-            )),
-            None,
-            Vec::new(),
-        )?);
-    }
-    if baseline_result_omitted {
-        secondary_diagnostics.push(report_diagnostic(
-            PolicyReportDiagnosticCode::BaselineAuditRetentionExceeded,
-            "one or more baselined finding results exceeded the report retention budget",
-            Some(PolicySourceIdentity::new(
-                options.baseline().source().relative_path(),
-            )),
-            None,
-            Vec::new(),
-        )?);
-    }
-    for diagnostic in secondary_diagnostics {
-        builder
-            .retain_report_diagnostic(diagnostic)
+        if scope_result_omitted {
+            secondary_diagnostics.push(report_diagnostic(
+                PolicyReportDiagnosticCode::ScopeAuditRetentionExceeded,
+                "one or more scoped finding results exceeded the report retention budget",
+                Some(PolicySourceIdentity::new(
+                    options.scope().source().relative_path(),
+                )),
+                None,
+                Vec::new(),
+                crate::RelatedLocationOmissions::Known(0),
+            )?);
+        }
+        if suppression_result_omitted {
+            secondary_diagnostics.push(report_diagnostic(
+                PolicyReportDiagnosticCode::SuppressionAuditRetentionExceeded,
+                "one or more applied suppression results exceeded the report retention budget",
+                Some(PolicySourceIdentity::new(
+                    options.suppressions().primary_relative_path(),
+                )),
+                None,
+                Vec::new(),
+                crate::RelatedLocationOmissions::Known(0),
+            )?);
+        }
+        if baseline_result_omitted {
+            secondary_diagnostics.push(report_diagnostic(
+                PolicyReportDiagnosticCode::BaselineAuditRetentionExceeded,
+                "one or more baselined finding results exceeded the report retention budget",
+                Some(PolicySourceIdentity::new(
+                    options.baseline().source().relative_path(),
+                )),
+                None,
+                Vec::new(),
+                crate::RelatedLocationOmissions::Known(0),
+            )?);
+        }
+        for diagnostic in secondary_diagnostics {
+            builder
+                .retain_report_diagnostic(diagnostic)
+                .map_err(|error| {
+                    PolicyCoordinatorError::new(format!(
+                        "failed to retain a policy report diagnostic: {error}"
+                    ))
+                })?;
+        }
+
+        batch_clock.observe(PolicyExecutionStage::ReportConstruction)?;
+        // The measured stages always leave through the outcome's side channel.
+        // They enter the canonical report only on a deadline, where elapsed time
+        // is the reason the run stopped; a successful report stays byte-identical
+        // across invocations (#2611).
+        //
+        // The diff-base phase is its own stage rather than part of
+        // policy evaluation. A diff-scoped run spends its export, base build and
+        // base evaluation there before a single head policy runs, and billing that
+        // to `policy_evaluation` is what left #3351 unable to say which phase
+        // consumed the request budget. The stage is present only when a diff base
+        // was requested, and the evaluation stage keeps the head loop's own time so
+        // the stages still sum to the run's elapsed time.
+        let mut stage_attribution = Vec::with_capacity(5);
+        stage_attribution.push(PolicyStageTiming::from_duration(
+            PolicyExecutionStage::PolicyRegistration,
+            registration_elapsed,
+        ));
+        stage_attribution.push(PolicyStageTiming::from_duration(
+            PolicyExecutionStage::PolicyPreparation,
+            preparation_elapsed,
+        ));
+        if options.diff_base().is_some() {
+            stage_attribution.push(PolicyStageTiming::from_duration(
+                PolicyExecutionStage::DiffBase,
+                diff_base_elapsed,
+            ));
+        }
+        stage_attribution.push(PolicyStageTiming::from_duration(
+            PolicyExecutionStage::PolicyEvaluation,
+            evaluation_elapsed
+                .saturating_sub(diff_base_elapsed)
+                .saturating_sub(preparation_elapsed.saturating_sub(preparation_before_diff)),
+        ));
+        stage_attribution.push(PolicyStageTiming::from_duration(
+            PolicyExecutionStage::ReportConstruction,
+            report_started.elapsed(),
+        ));
+        // A policy its own deadline stopped leaves the batch running, so the report
+        // names it without a termination; its run already says why it stopped.
+        let deadline_stage = batch_clock.deadline();
+        if deadline_stage.is_some() || !progress.timed_out.is_empty() {
+            let stage_timings = stage_attribution.clone();
+            let total_elapsed_ms = stage_timings.iter().fold(0_u64, |total, timing| {
+                total.saturating_add(timing.elapsed_ms())
+            });
+            let execution = PolicyExecutionMetadata::try_new(
+                total_elapsed_ms,
+                stage_timings,
+                deadline_stage.map(|_| PolicyExecutionTermination::DeadlineExceeded),
+                deadline_stage,
+                active_policy_id,
+                progress,
+            )
             .map_err(|error| {
                 PolicyCoordinatorError::new(format!(
-                    "failed to retain a policy report diagnostic: {error}"
+                    "failed to record policy execution metadata: {error}"
                 ))
             })?;
-    }
-
-    batch_clock.observe(PolicyExecutionStage::ReportConstruction)?;
-    // The measured stages always leave through the outcome's side channel.
-    // They enter the canonical report only on a deadline, where elapsed time
-    // is the reason the run stopped; a successful report stays byte-identical
-    // across invocations (#2611).
-    //
-    // The diff-base phase is its own stage rather than part of
-    // policy evaluation. A diff-scoped run spends its export, base build and
-    // base evaluation there before a single head policy runs, and billing that
-    // to `policy_evaluation` is what left #3351 unable to say which phase
-    // consumed the request budget. The stage is present only when a diff base
-    // was requested, and the evaluation stage keeps the head loop's own time so
-    // the stages still sum to the run's elapsed time.
-    let mut stage_attribution = Vec::with_capacity(5);
-    stage_attribution.push(PolicyStageTiming::from_duration(
-        PolicyExecutionStage::PolicyRegistration,
-        registration_elapsed,
-    ));
-    stage_attribution.push(PolicyStageTiming::from_duration(
-        PolicyExecutionStage::PolicyPreparation,
-        preparation_elapsed,
-    ));
-    if options.diff_base().is_some() {
-        stage_attribution.push(PolicyStageTiming::from_duration(
-            PolicyExecutionStage::DiffBase,
-            diff_base_elapsed,
-        ));
-    }
-    stage_attribution.push(PolicyStageTiming::from_duration(
-        PolicyExecutionStage::PolicyEvaluation,
-        evaluation_elapsed
-            .saturating_sub(diff_base_elapsed)
-            .saturating_sub(preparation_elapsed.saturating_sub(preparation_before_diff)),
-    ));
-    stage_attribution.push(PolicyStageTiming::from_duration(
-        PolicyExecutionStage::ReportConstruction,
-        report_started.elapsed(),
-    ));
-    // A policy its own deadline stopped leaves the batch running, so the report
-    // names it without a termination; its run already says why it stopped.
-    let deadline_stage = batch_clock.deadline();
-    if deadline_stage.is_some() || !progress.timed_out.is_empty() {
-        let stage_timings = stage_attribution.clone();
-        let total_elapsed_ms = stage_timings.iter().fold(0_u64, |total, timing| {
-            total.saturating_add(timing.elapsed_ms())
-        });
-        let execution = PolicyExecutionMetadata::try_new(
-            total_elapsed_ms,
-            stage_timings,
-            deadline_stage.map(|_| PolicyExecutionTermination::DeadlineExceeded),
-            deadline_stage,
-            active_policy_id,
-            progress,
-        )
-        .map_err(|error| {
-            PolicyCoordinatorError::new(format!(
-                "failed to record policy execution metadata: {error}"
-            ))
+            builder.set_execution(execution).map_err(|error| {
+                PolicyCoordinatorError::new(format!(
+                    "failed to retain policy execution metadata: {error}"
+                ))
+            })?;
+        }
+        let report = builder.finish().map_err(|error| {
+            PolicyCoordinatorError::new(format!("failed to finish policy report: {error}"))
         })?;
-        builder.set_execution(execution).map_err(|error| {
-            PolicyCoordinatorError::new(format!(
-                "failed to retain policy execution metadata: {error}"
-            ))
-        })?;
-    }
-    let report = builder.finish().map_err(|error| {
-        PolicyCoordinatorError::new(format!("failed to finish policy report: {error}"))
-    })?;
-    // A complete head over a workspace that holds exactly what `HEAD` commits
-    // is the answer a later diff base at that commit needs, so it is recorded
-    // as one. Only a head this run owns: the base half of a diff run is
-    // handed its caller's context and evaluates an exported tree.
-    if deadline_stage.is_none()
-        && let Some(store) = unit_store.as_ref()
-        && store.persisted().is_some()
-        && let Some(incremental) = head_incremental_owned.as_ref()
-        && let Some(head) = workspace
-        && let Some(publication) = head_evaluation_publication(
-            root,
-            head,
-            options,
-            base_evaluation_key(
+        let replay_evidence = replay_evidence
+            .as_ref()
+            .and_then(|evidence| report_replay_evidence(evidence, &report));
+        // A complete head over a workspace that holds exactly what `HEAD` commits
+        // is the answer a later diff base at that commit needs, so it is recorded
+        // as one. Only a head this run owns: the base half of a diff run is
+        // handed its caller's context and evaluates an exported tree.
+        if deadline_stage.is_none()
+            && let Some(store) = unit_store.as_ref()
+            && store.persisted().is_some()
+            && let Some(incremental) = head_incremental_owned.as_ref()
+            && let Some(head) = workspace
+            && let Some(publication) = head_evaluation_publication(
+                root,
+                head,
                 options,
-                scope_document.as_ref(),
-                WorkspaceUnitInputs::of(
-                    head,
-                    icfg_active_semantic_model_snapshot.as_deref(),
-                    options.identifier_typos(),
+                base_evaluation_key(
+                    options,
+                    scope_document.as_ref(),
+                    WorkspaceUnitInputs::of(
+                        head,
+                        icfg_active_semantic_model_snapshot.as_deref(),
+                        options.identifier_typos(),
+                    ),
                 ),
-            ),
-            incremental,
-            &report,
-            &runnable_policies,
-            replay_evidence.as_ref(),
-        )
-    {
-        store.publish_evaluation(&publication);
-    }
-    let taint_findings = taint.take_public_findings();
-    let taint_analysis_results = taint.take_retained_analyses();
-    let taint_output_rows = taint.take_retained_output_rows();
-    let exit_status = report_exit_status(&report, threshold_exceeded, options.on_inconclusive());
-    Ok(PolicyBatchOutcome {
-        report,
-        stage_attribution,
-        taint_findings,
-        taint_analysis_results,
-        taint_output_rows,
-        replay_evidence,
-        published_snapshot,
-        exit_status,
-        max_retained_report_bytes: batch_budget.max_retained_report_bytes(),
-        max_serialized_report_bytes: batch_budget.max_serialized_report_bytes(),
-        // A full scan's review stays out of the report, which carries the
-        // section only for diff runs, but a caller can still read what the
-        // scan reused.
-        incremental: incremental_review.or_else(|| {
-            head_incremental_owned
-                .as_ref()
-                .map(PolicyIncrementalContext::review)
-        }),
-    })
+                incremental,
+                &report,
+                &runnable_policies,
+                replay_evidence.as_ref(),
+                execution.verdict(),
+                &execution
+                    .selection_reads::<EvaluationSelectionReads>()
+                    .keys(),
+                cut_hint_digest,
+            )
+        {
+            store.publish_evaluation(&publication);
+        }
+        let taint_findings = taint.take_public_findings();
+        let taint_analysis_results = taint.take_retained_analyses();
+        let taint_output_rows = taint.take_retained_output_rows();
+        let exit_status =
+            report_exit_status(&report, threshold_exceeded, options.on_inconclusive());
+        Ok(PolicyBatchOutcome {
+            cut_hint_digest,
+            report,
+            stage_attribution,
+            taint_findings,
+            taint_analysis_results,
+            taint_output_rows,
+            replay_evidence,
+            reuse_verdict: execution.verdict(),
+            selection_reads: execution
+                .selection_reads::<EvaluationSelectionReads>()
+                .keys(),
+            published_snapshot,
+            exit_status,
+            max_retained_report_bytes: batch_budget.max_retained_report_bytes(),
+            max_serialized_report_bytes: batch_budget.max_serialized_report_bytes(),
+            // A full scan's review stays out of the report, which carries the
+            // section only for diff runs, but a caller can still read what the
+            // scan reused.
+            incremental: incremental_review.or_else(|| {
+                head_incremental_owned
+                    .as_ref()
+                    .map(PolicyIncrementalContext::review)
+            }),
+        })
+    };
+    build_outcome()
 }
 
 /// Where one batch's evaluation units live.
@@ -5297,7 +5703,7 @@ impl BatchUnitStore {
     }
 
     /// Record that this run's base evaluation is complete and reusable.
-    fn publish_evaluation(&self, evaluation: &PolicyEvaluationRow) {
+    fn publish_evaluation(&self, evaluation: &Admitted<PolicyEvaluationRow>) {
         let Some(store) = self.persisted() else {
             return;
         };
@@ -5328,8 +5734,8 @@ pub(crate) fn base_evaluation_key(
         scope,
         inputs,
         (
-            brokk_bifrost_analysis::analyzer::semantic::icfg::WORKSPACE_ICFG_PROVIDER_BEHAVIOR_DOMAIN,
-            brokk_bifrost_analysis::analyzer::semantic::icfg::WORKSPACE_ICFG_PROVIDER_READ_BEHAVIOR_DOMAIN,
+            brokk_bifrost_analysis::analyzer::semantic::icfg::workspace_icfg_provider_behavior_domain(),
+            brokk_bifrost_analysis::analyzer::semantic::icfg::workspace_icfg_provider_read_behavior_domain(),
         ),
     )
 }
@@ -5363,7 +5769,14 @@ pub(crate) fn base_evaluation_key_under_icfg_domains(
         options.require_explicit_schema_versions(),
         options.on_inconclusive().label(),
     );
-    let mut engine = b"bifrost-policy-evaluation-key:engine:v1".to_vec();
+    // #11250: retire base-evidence diagnostic strings without explicit partial
+    // scope. Root/selector units retain unchanged raw gaps and RQL diagnostics.
+    // #10984: retire rendered base diagnostics without lookup provenance.
+    // Final v3 retires pre-provenance rendered base diagnostics above master v2.
+    // #12105: retire relational summaries with invented Unknown execution causes.
+    // #12111: retire base rows whose retention decisions and budget evidence predate per-policy fair-share admission.
+    // #12413: retire ID-only evaluator cuts and condition cut-row reuse on hints.
+    let mut engine = b"bifrost-policy-evaluation-key:engine:v6".to_vec();
     for part in [
         inputs.epoch().as_bytes().as_slice(),
         icfg_domains.0,
@@ -5379,6 +5792,24 @@ pub(crate) fn base_evaluation_key_under_icfg_domains(
         active_model_set_hash: inputs.models().to_string(),
         engine_epoch: StableDigest::sha256(engine).to_string(),
     }
+}
+
+fn acceptance_hint_digest(
+    suppressions: Option<&PolicySuppressionDocument>,
+    baseline: Option<&PolicyBaselineDocument>,
+    inline: &super::inline_suppression::PolicyInlineSuppressionOptions,
+    categories: &HashMap<PolicyId, PolicyCategoryId>,
+) -> [u8; 32] {
+    // Scope stays in options_digest because it also governs execution roots.
+    // Inline directive bytes belong to the tree's analyzed source inputs; the
+    // configured prefix is the additional input the tree cannot determine.
+    let categories = categories
+        .iter()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    *StableDigest::sha256(format!(
+        "bifrost-cut-hint:v1\x01{suppressions:?}\x01{baseline:?}\x01{inline:?}\x01{categories:?}"
+    ))
+    .as_bytes()
 }
 
 fn policy_set_digest(policies: &[&LoadedPolicy]) -> String {
@@ -5420,6 +5851,7 @@ fn reuse_persisted_diff_baseline(
     key: &PolicyEvaluationRowKey,
     caller_batch_budget: PolicyBatchBudget,
     registry_limits: PolicyRegistryLimits,
+    policy_categories: &HashMap<PolicyId, PolicyCategoryId>,
 ) -> Option<PolicyDiffBaselineOutcome> {
     let persisted = store.persisted()?;
     let subtree = match resolve_revision_subtree(head_root, revision) {
@@ -5437,11 +5869,61 @@ fn reuse_persisted_diff_baseline(
         base_tree_oid: subtree.tree_id().to_string(),
         ..key.clone()
     };
+    // Read only the conventional paths selected by stripped base options,
+    // once each, from the revision being queried. This dependency is visible
+    // in profiling even when the parent row avoids exporting the workspace.
+    let revision_document = |path: &str| -> Option<Option<String>> {
+        let blob = subtree
+            .blobs()
+            .iter()
+            .find(|(candidate, _)| candidate.as_ref() == path)
+            .map(|(_, blob)| *blob);
+        brokk_bifrost_analysis::profiling::note_with(|| {
+            format!("policy.units base_cut_hint_input path={path:?} blob={blob:?}")
+        });
+        match blob {
+            Some(blob) => subtree.source(blob).map(Some),
+            None => Some(None),
+        }
+    };
+    let base_suppression_options = PolicySuppressionOptions::default();
+    // Cache the few document reads so the merge loader and digest see one view.
+    let mut documents = HashMap::new();
+    for path in base_suppression_options.source().relative_paths() {
+        documents.insert(path.to_owned(), revision_document(path)?);
+    }
+    let suppressions =
+        super::suppression::load_policy_suppressions_with(&base_suppression_options, |path| {
+            documents[path]
+                .as_deref()
+                .map(super::suppression::parse_policy_suppression_document)
+                .transpose()
+                .map_err(super::suppression::PolicySuppressionLoadError::Document)
+        });
+    let baseline = match revision_document(DEFAULT_POLICY_BASELINE_PATH)?
+        .as_deref()
+        .map(super::baseline::parse_policy_baseline_document)
+        .transpose()
+    {
+        Ok(baseline) => baseline,
+        Err(error) => {
+            brokk_bifrost_analysis::profiling::note_with(|| {
+                format!("policy.units base_cut_hint_invalid_baseline error={error}")
+            });
+            return None;
+        }
+    };
+    let hint_digest = acceptance_hint_digest(
+        suppressions.document.as_ref(),
+        baseline.as_ref(),
+        &super::inline_suppression::PolicyInlineSuppressionOptions::DEFAULT,
+        policy_categories,
+    );
     let evaluation = match persisted
         .lock()
         .expect("persisted policy-unit store mutex poisoned")
         .store()
-        .policy_evaluation_for_key(&key)
+        .policy_evaluation_for_key(&key, &hint_digest)
     {
         Ok(Some(evaluation)) => evaluation,
         Ok(None) => return None,
@@ -5477,6 +5959,59 @@ fn reuse_persisted_diff_baseline(
             format!(
                 "policy.units base_facts_incomplete unenumerated={unenumerated:?} \
                  languages_without_index={without_index:?}"
+            )
+        });
+        return None;
+    }
+    // The row answers under the discovery and environment it recorded. The
+    // replay is admitted by the same boundary as the write, with each recorded
+    // selection read recomputed against the head's authority. A baseline builds
+    // no base analyzer, so a read that tree content also decides is verified
+    // only when the head is the base tree.
+    let view = if evaluation.selection_reads.is_empty() {
+        BaseView::HeadMayDiffer
+    } else if changed.changed_path_count() == 0
+        && match worktree_tracked_content_is_tree(head_root, subtree.tree_id()) {
+            Ok(is_tree) => is_tree,
+            Err(error) => {
+                brokk_bifrost_analysis::profiling::note_with(|| {
+                    format!("policy.units base_tree_unverified={error}")
+                });
+                false
+            }
+        }
+    {
+        BaseView::HeadIsBase
+    } else {
+        BaseView::HeadMayDiffer
+    };
+    let selection = verify_selection_reads(
+        head_workspace,
+        &changed,
+        &evaluation.selection_reads,
+        view,
+        evaluation.selection_view.is_export_of(&key.base_tree_oid),
+        LookupReplayLimits::default(),
+        &NoSummaryAnswers,
+        &mut LookupMemo::new(),
+    );
+    if admit(
+        brokk_bifrost_analysis::analyzer::reuse_verdict::CapBinding::RecordedGrant,
+        (),
+        ReuseVerdict::Content,
+        ReuseVerdict::Content,
+        selection,
+    )
+    .is_none()
+    {
+        brokk_bifrost_analysis::profiling::note_with(|| {
+            format!(
+                "policy.units base_selection_unverified view={view:?} reads={:?}",
+                evaluation
+                    .selection_reads
+                    .iter()
+                    .map(|read| &read.key)
+                    .collect::<Vec<_>>()
             )
         });
         return None;
@@ -5552,7 +6087,7 @@ fn reuse_persisted_diff_baseline(
     } else if unqualified.is_empty() {
         (false, None)
     } else {
-        let detail = unqualified
+        let items = unqualified
             .iter()
             .map(|policy| {
                 format!(
@@ -5561,8 +6096,12 @@ fn reuse_persisted_diff_baseline(
                     policy.completion()
                 )
             })
-            .collect::<Vec<_>>()
-            .join("; ");
+            .collect::<Vec<_>>();
+        let detail = brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+            format_args!("{}", items.join("; ")),
+            format_args!("unqualified base policies"),
+            items.iter(),
+        );
         (true, Some(detail))
     };
     Some(PolicyDiffBaselineOutcome {
@@ -5728,7 +6267,7 @@ struct PolicyDiffBaselineOutcome {
     /// `None` when there is nothing a later run could replay: a base that
     /// published no units, a base that was replayed rather than evaluated, or
     /// an ephemeral workspace whose store outlives nothing.
-    publication: Option<PolicyEvaluationRow>,
+    publication: Option<Admitted<PolicyEvaluationRow>>,
     /// How this run obtained the base, for the review.
     state: IncrementalBaseState,
     /// What the base evaluation did with each policy's units, when this run
@@ -6056,6 +6595,12 @@ fn evaluate_policy_diff_baseline(
                     policies,
                     &baseline,
                     outcome.replay_evidence.as_ref(),
+                    outcome.reuse_verdict,
+                    &outcome.selection_reads,
+                    // Only an export that is a function of its tree vouches for
+                    // a read that tree decides (#11607).
+                    export.is_function_of_tree().then_some(base.workspace()),
+                    outcome.cut_hint_digest,
                 )
             });
     let base_review = base_incremental
@@ -6101,7 +6646,10 @@ fn head_evaluation_publication(
     report: &PolicyReportDocument,
     policies: &[&LoadedPolicy],
     evidence: Option<&PolicyReplayEvidence>,
-) -> Option<PolicyEvaluationRow> {
+    reuse_verdict: ReuseVerdict,
+    selection_reads: &[ReadKey],
+    cut_hint_digest: Option<[u8; 32]>,
+) -> Option<Admitted<PolicyEvaluationRow>> {
     let base_options = PolicyEvaluationOptions::new(options.evaluation_date());
     if *options.range() != PolicyRangeRequest::Workspace
         || options.suppressions() != base_options.suppressions()
@@ -6188,6 +6736,10 @@ fn head_evaluation_publication(
         policies,
         &baseline,
         evidence,
+        reuse_verdict,
+        selection_reads,
+        None,
+        cut_hint_digest,
     )
 }
 
@@ -6202,6 +6754,13 @@ fn head_evaluation_publication(
 ///
 /// Every policy run is recorded with its completion and diagnostics. Only an
 /// exhaustive run carries identities and units that may qualify a diff join.
+///
+/// `export_analyzer` is the analyzer over an export of exactly `tree_id` whose
+/// answers are a function of that tree. With it the row records that view and
+/// the tree part of each `Split` selection read; without it the evaluation was
+/// taken over a live worktree and its tree-decided reads replay only against a
+/// head that is the base tree (#11607).
+#[allow(clippy::too_many_arguments)]
 fn base_evaluation_publication(
     incremental: &PolicyIncrementalContext<'_>,
     key: PolicyEvaluationRowKey,
@@ -6210,9 +6769,18 @@ fn base_evaluation_publication(
     policies: &[&LoadedPolicy],
     baseline: &PolicyDiffBaseline,
     evidence: Option<&PolicyReplayEvidence>,
-) -> Option<PolicyEvaluationRow> {
+    reuse_verdict: ReuseVerdict,
+    selection_reads: &[ReadKey],
+    export_analyzer: Option<&WorkspaceAnalyzer>,
+    cut_hint_digest: Option<[u8; 32]>,
+) -> Option<Admitted<PolicyEvaluationRow>> {
     // Uncertified snapshots never partly update a parent or publish children.
     let evidence = evidence?;
+    let aggregate_evidence = report_replay_evidence(evidence, report)?;
+    // Parse the original cap envelope once; never parse or clone the batch's
+    // deadline/refusal maps while constructing each child row.
+    let recorded: serde_json::Value = serde_json::from_str(&evidence.effective_grant).ok()?;
+    let caps = recorded.get("effective_grant").unwrap_or(&recorded);
     // Execution termination depends on time or host conditions absent from
     // the key. Retention truncation is deterministic under its recorded grant.
     if report.execution().termination().is_some()
@@ -6229,9 +6797,11 @@ fn base_evaluation_publication(
         .iter()
         .map(|policy| {
             let policy_id = &policy.definition().metadata.id;
-            let Some(run) = runs.get(policy_id) else {
+            let run = runs.get(policy_id).copied();
+            let policy_evidence = policy_replay_evidence(evidence, caps, report, policy_id, run);
+            let Some(run) = run else {
                 return PolicyEvaluationPolicyRow {
-                    evidence: Some(evidence.clone()),
+                    evidence: Some(policy_evidence),
                     policy_id: policy_id.to_string(),
                     source_hash: policy.source_hash().to_string(),
                     semantic_hash: policy.semantic_hash().to_string(),
@@ -6262,7 +6832,7 @@ fn base_evaluation_publication(
                 base_run_unqualified_detail(report, run)
             };
             PolicyEvaluationPolicyRow {
-                evidence: Some(evidence.clone()),
+                evidence: Some(policy_evidence),
                 policy_id: policy_id.to_string(),
                 source_hash: policy.source_hash().to_string(),
                 semantic_hash: policy.semantic_hash().to_string(),
@@ -6296,25 +6866,56 @@ fn base_evaluation_publication(
         && policy_rows
             .iter()
             .all(|policy| policy.completion == "complete" && policy.qualified);
-    Some(PolicyEvaluationRow {
-        evidence: Some(evidence.clone()),
-        evidence_complete: Some(evidence_complete),
-        key: PolicyEvaluationRowKey {
-            base_tree_oid: tree_id.to_string(),
-            ..key
+    let selection = brokk_bifrost_analysis::analyzer::read_ledger::recordable_selection_evidence(
+        selection_reads,
+    );
+    brokk_bifrost_analysis::profiling::note_with(|| {
+        format!("policy.units base_selection_reads={selection_reads:?} evidence={selection:?}")
+    });
+    admit(
+        brokk_bifrost_analysis::analyzer::reuse_verdict::CapBinding::RecordedGrant,
+        PolicyEvaluationRow {
+            cut_hint_digest,
+            evidence: Some(aggregate_evidence),
+            evidence_complete: Some(evidence_complete),
+            key: PolicyEvaluationRowKey {
+                base_tree_oid: tree_id.to_string(),
+                ..key
+            },
+            resolved_commit: baseline.resolved_commit.clone(),
+            policy_set_digest: policy_set_digest(policies),
+            unreliable_detail: baseline.unreliable_detail.clone(),
+            aggregate_unreliable: baseline.aggregate_unreliable,
+            base_content_identity: *incremental.snapshot().as_bytes(),
+            policies: policy_rows,
+            unqualified_policy_ids: baseline
+                .unqualified_policies
+                .iter()
+                .map(|policy| policy.policy_id().as_str().to_string())
+                .collect(),
+            selection_reads: selection_reads
+                .iter()
+                .map(|key| SelectionRead {
+                    key: key.clone(),
+                    basis: export_analyzer.and_then(|analyzer| {
+                        brokk_bifrost_analysis::analyzer::read_verification::selection_basis(
+                            analyzer.analyzer(),
+                            key,
+                        )
+                    }),
+                })
+                .collect(),
+            selection_view: match export_analyzer {
+                Some(_) => SelectionView::Export {
+                    tree_oid: tree_id.to_string().into(),
+                },
+                None => SelectionView::Worktree,
+            },
         },
-        resolved_commit: baseline.resolved_commit.clone(),
-        policy_set_digest: policy_set_digest(policies),
-        unreliable_detail: baseline.unreliable_detail.clone(),
-        aggregate_unreliable: baseline.aggregate_unreliable,
-        base_content_identity: *incremental.snapshot().as_bytes(),
-        policies: policy_rows,
-        unqualified_policy_ids: baseline
-            .unqualified_policies
-            .iter()
-            .map(|policy| policy.policy_id().as_str().to_string())
-            .collect(),
-    })
+        reuse_verdict,
+        ReuseVerdict::Content,
+        selection,
+    )
 }
 
 /// The strong finding identities of every run whose evidence is exhaustive,
@@ -6515,7 +7116,11 @@ fn diff_base_unreliable_detail(
         !parts.is_empty(),
         "an unreliable base evaluation always has a termination, diagnostic, or non-exhaustive run"
     );
-    parts.join("; ")
+    brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+        format_args!("{}", parts.join("; ")),
+        format_args!("base evaluation was unreliable"),
+        parts.iter(),
+    )
 }
 
 /// Join the head runs against the base identities and attach a diff decision
@@ -6696,7 +7301,7 @@ fn apply_policy_suppressions(
                 let finding_index = run
                     .findings()
                     .iter()
-                    .position(|finding| finding.id() == record.finding_id());
+                    .position(|finding| record.candidate_matches(finding));
                 let match_state = match finding_index.map(|index| &run.findings()[index]) {
                     Some(finding)
                         if finding.identity_stability() == FindingIdentityStability::Strong =>
@@ -6770,24 +7375,41 @@ fn apply_policy_suppressions(
     Ok(reviews)
 }
 
-fn built_in_scope_categories() -> HashMap<PolicyId, PolicyCategoryId> {
+/// Whether `policy` reads the identifier typo table or every registered
+/// catalog while what the rules packs supply of it may be incomplete.
+fn policy_reads_incomplete_pack_data(
+    policy: &LoadedPolicy,
+    options: &PolicyEvaluationOptions,
+) -> bool {
+    (options.identifier_typos.is_none()
+        && super::builtin::catalog_identifier_typos_gap().is_some()
+        && super::builtin::policy_reads_identifier_typos(policy))
+        || (super::builtin::catalog_registry_gap().is_some()
+            && super::builtin::policy_reads_any_registered_catalog(policy))
+}
+
+/// Category membership of every built-in policy. A catalog that cannot load
+/// fails the batch, as it fails every other path that reads the catalog: an
+/// empty map would let a category-scoped entry match nothing without notice.
+fn built_in_scope_categories() -> Result<HashMap<PolicyId, PolicyCategoryId>, PolicyCoordinatorError>
+{
     // Category membership is a built-in pack manifest concept; repository
     // policies have no category and match only via policy_ids or an
     // all-policies entry.
-    match super::builtin::built_in_policy_catalog() {
-        Ok(catalog) => catalog
-            .document()
-            .packs
-            .iter()
-            .flat_map(|pack| pack.policies.iter())
-            .filter_map(|entry| {
-                let id = PolicyId::new(&entry.id).ok()?;
-                let category = PolicyCategoryId::new(&entry.category).ok()?;
-                Some((id, category))
-            })
-            .collect::<HashMap<_, _>>(),
-        Err(_) => HashMap::new(),
-    }
+    let catalog = super::builtin::built_in_policy_catalog().map_err(|error| {
+        PolicyCoordinatorError::new(format!("failed to load built-in policy catalog: {error}"))
+    })?;
+    Ok(catalog
+        .document()
+        .packs
+        .iter()
+        .flat_map(|pack| pack.policies.iter())
+        .filter_map(|entry| {
+            let id = PolicyId::new(&entry.id).ok()?;
+            let category = PolicyCategoryId::new(&entry.category).ok()?;
+            Some((id, category))
+        })
+        .collect::<HashMap<_, _>>())
 }
 
 fn apply_policy_scope(
@@ -6874,7 +7496,7 @@ fn apply_policy_baseline(
         let exhaustive = run.completion().is_exhaustive();
         for finding_id in record.finding_ids() {
             let match_state = match index_by_id.get(finding_id) {
-                Some(&index) => {
+                Some(&index) if record.candidate_matches(&run.findings()[index]) => {
                     let finding = &run.findings()[index];
                     if finding.identity_stability() != FindingIdentityStability::Strong {
                         PolicyBaselineMatchState::CurrentFindingNotStrong
@@ -6895,8 +7517,8 @@ fn apply_policy_baseline(
                         PolicyBaselineMatchState::StrongFinding
                     }
                 }
-                None if exhaustive => PolicyBaselineMatchState::FindingAbsent,
-                None => PolicyBaselineMatchState::PolicyIncomplete,
+                _ if exhaustive => PolicyBaselineMatchState::FindingAbsent,
+                _ => PolicyBaselineMatchState::PolicyIncomplete,
             };
             reviews.push(PolicyBaselineEntryReview::new(
                 record.policy_id().clone(),
@@ -7082,6 +7704,7 @@ fn prepare_parsed_input(
             Some(source),
             None,
             Vec::new(),
+            crate::RelatedLocationOmissions::Known(0),
         )?)),
         RqlpDocument::EndpointSet { .. } => Ok(InputOutcome::Diagnostic(report_diagnostic(
             PolicyReportDiagnosticCode::NotExecutableEndpoint,
@@ -7090,6 +7713,7 @@ fn prepare_parsed_input(
             Some(source),
             None,
             Vec::new(),
+            crate::RelatedLocationOmissions::Known(0),
         )?)),
         RqlpDocument::DeclarationSelection { .. } => {
             Ok(InputOutcome::Diagnostic(report_diagnostic(
@@ -7099,6 +7723,7 @@ fn prepare_parsed_input(
                 Some(source),
                 None,
                 Vec::new(),
+                crate::RelatedLocationOmissions::Known(0),
             )?))
         }
     }
@@ -7148,7 +7773,8 @@ fn exclude_duplicate_policy_ids(inputs: &mut [InputOutcome]) -> Result<(), Polic
                     range: 0..0,
                     message: "duplicate definition of this policy ID".to_string(),
                 })
-                .collect();
+                .collect::<Vec<_>>();
+            let omitted_related = unique_source_count - 1 - related.len();
             inputs[index] = InputOutcome::Diagnostic(report_diagnostic(
                 PolicyReportDiagnosticCode::DuplicatePolicyId,
                 format!(
@@ -7157,6 +7783,9 @@ fn exclude_duplicate_policy_ids(inputs: &mut [InputOutcome]) -> Result<(), Polic
                 Some(source),
                 None,
                 related,
+                crate::RelatedLocationOmissions::Known(
+                    u64::try_from(omitted_related).expect("omitted source count fits in u64"),
+                ),
             )?);
         }
     }
@@ -7188,6 +7817,7 @@ fn document_load_diagnostic(
             Some(requested_source),
             None,
             Vec::new(),
+            crate::RelatedLocationOmissions::Known(0),
         ),
     }
 }
@@ -7213,6 +7843,7 @@ fn invalid_source_identity_diagnostic(
         Some(surrogate),
         None,
         Vec::new(),
+        crate::RelatedLocationOmissions::Known(0),
     )
 }
 
@@ -7238,6 +7869,7 @@ fn source_diagnostic(
             })?,
         ),
         diagnostic.related.clone(),
+        crate::RelatedLocationOmissions::Known(0),
     )
 }
 
@@ -7280,6 +7912,7 @@ fn registry_diagnostic(
                 })?,
             ),
             error.diagnostic.related.clone(),
+            crate::RelatedLocationOmissions::Known(0),
         );
     }
     let code = match error {
@@ -7307,7 +7940,14 @@ fn registry_diagnostic(
         }
         _ => PolicyReportDiagnosticCode::PolicyValidationFailed,
     };
-    report_diagnostic(code, error.to_string(), Some(source), None, Vec::new())
+    report_diagnostic(
+        code,
+        error.to_string(),
+        Some(source),
+        None,
+        Vec::new(),
+        crate::RelatedLocationOmissions::Known(0),
+    )
 }
 
 fn explicit_version_diagnostics(
@@ -7326,6 +7966,7 @@ fn explicit_version_diagnostics(
             Some(policy.source().clone()),
             None,
             Vec::new(),
+            crate::RelatedLocationOmissions::Known(0),
         )?);
     }
 
@@ -7353,6 +7994,7 @@ fn explicit_version_diagnostics(
             dependency_source(policy, dependency.origins()),
             None,
             Vec::new(),
+            crate::RelatedLocationOmissions::Known(0),
         )?);
     }
 
@@ -7372,6 +8014,7 @@ fn explicit_version_diagnostics(
                 Some(selector_source(policy, &selector.origin)),
                 None,
                 Vec::new(),
+                crate::RelatedLocationOmissions::Known(0),
             )?);
         }
     }
@@ -7424,12 +8067,26 @@ fn failed_evaluation_run(
         safe_report_text(format!("policy evaluation failed: {message}")),
         None,
         Vec::new(),
+        crate::RelatedLocationOmissions::Known(0),
     )
     .map_err(|error| {
         PolicyCoordinatorError::new(format!(
             "failed to construct evaluation diagnostic: {error}"
         ))
     })?;
+    failed_run_with_diagnostic(
+        policy,
+        diagnostic
+            .with_policy_execution_cause(crate::finding::PolicyDiagnosticExecutionCause::Other),
+        budget,
+    )
+}
+
+fn failed_run_with_diagnostic(
+    policy: &LoadedPolicy,
+    diagnostic: PolicyDiagnostic,
+    budget: &PolicyBudget,
+) -> Result<PolicyRun, PolicyCoordinatorError> {
     PolicyRun::try_new(
         policy.definition().metadata.id.clone(),
         policy.semantic_hash(),
@@ -7593,6 +8250,7 @@ fn report_diagnostic(
     source: Option<PolicySourceIdentity>,
     byte_range: Option<PolicySourceRange>,
     related: Vec<PolicySourceRelatedDiagnostic>,
+    omitted_related_locations_lower_bound: crate::RelatedLocationOmissions,
 ) -> Result<PolicyReportDiagnostic, PolicyCoordinatorError> {
     report_diagnostic_with_severity(
         code,
@@ -7601,6 +8259,7 @@ fn report_diagnostic(
         source,
         byte_range,
         related,
+        omitted_related_locations_lower_bound,
     )
 }
 
@@ -7611,6 +8270,7 @@ fn report_diagnostic_with_severity(
     source: Option<PolicySourceIdentity>,
     byte_range: Option<PolicySourceRange>,
     mut related: Vec<PolicySourceRelatedDiagnostic>,
+    omitted_related_locations_lower_bound: crate::RelatedLocationOmissions,
 ) -> Result<PolicyReportDiagnostic, PolicyCoordinatorError> {
     for item in &mut related {
         item.message = safe_report_text(std::mem::take(&mut item.message));
@@ -7622,6 +8282,7 @@ fn report_diagnostic_with_severity(
         source,
         byte_range,
         related,
+        omitted_related_locations_lower_bound,
     )
     .map_err(|error| {
         PolicyCoordinatorError::new(format!(
@@ -7632,37 +8293,6 @@ fn report_diagnostic_with_severity(
 
 fn requested_source_identity(path: &Path) -> PolicySourceIdentity {
     PolicySourceIdentity::new(path.to_string_lossy().replace('\\', "/"))
-}
-
-fn safe_report_text(value: String) -> String {
-    const MAX_BYTES: usize = 4_096;
-    let mut escaped = String::with_capacity(value.len().min(MAX_BYTES));
-    for character in value.chars() {
-        let unsafe_character = character.is_control()
-            || matches!(
-                character,
-                '\u{061c}'
-                    | '\u{200e}'
-                    | '\u{200f}'
-                    | '\u{0080}'..='\u{009f}'
-                    | '\u{202a}'..='\u{202e}'
-                    | '\u{2066}'..='\u{2069}'
-            );
-        let fragment = if unsafe_character {
-            format!("\\u{{{:X}}}", u32::from(character))
-        } else {
-            character.to_string()
-        };
-        if escaped.len().saturating_add(fragment.len()) > MAX_BYTES {
-            break;
-        }
-        escaped.push_str(&fragment);
-    }
-    if escaped.is_empty() {
-        "policy operation failed".to_string()
-    } else {
-        escaped
-    }
 }
 
 #[cfg(test)]
@@ -7704,6 +8334,72 @@ mod coordinator_input_tests;
 #[path = "coordinator/procedure_summary_fallback_tests.rs"]
 mod procedure_summary_fallback_tests;
 
+/// Test-only check that report acceptance remains inside the conservative hint.
+/// Golden drivers call this on each fixture's final report, after confirmations
+/// and audit rollback. It is never called by evaluation or production builds.
+#[cfg(feature = "test-support")]
+pub fn assert_acceptance_hint_superset_for_test(
+    root: &Path,
+    options: &PolicyEvaluationOptions,
+    report: &PolicyReportDocument,
+) {
+    let read_root = WorkspaceRoot::open(root).unwrap();
+    let exact = load_policy_suppressions_from_root(&read_root, options.suppressions());
+    let scope = load_policy_scope_from_root(&read_root, options.scope()).unwrap();
+    let baseline = load_policy_baseline_from_root(&read_root, options.baseline()).unwrap();
+    let project = brokk_bifrost_analysis::FilesystemProject::new(root.to_path_buf()).unwrap();
+    let workspace =
+        WorkspaceAnalyzer::build_ephemeral_footgun(Arc::new(project), Default::default()).unwrap();
+    let inline = super::inline_suppression::InlineDirectiveScan::new(
+        options.inline_suppressions(),
+        Some(&workspace),
+        workspace.retention_budget(),
+    );
+    let categories = if scope.as_ref().is_some_and(|doc| {
+        doc.scopes()
+            .iter()
+            .any(|entry| !entry.policy_categories().is_empty())
+    }) {
+        built_in_scope_categories().unwrap()
+    } else {
+        HashMap::new()
+    };
+    let mut accepted = std::collections::BTreeSet::new();
+    let mut candidates = std::collections::BTreeSet::new();
+    let mut missing = std::collections::BTreeSet::new();
+    for run in report.runs() {
+        let categories = categories
+            .get(run.policy_id())
+            .map(std::slice::from_ref)
+            .unwrap_or_default();
+        let hint = crate::AcceptanceHint::new(
+            run.policy_id(),
+            exact.document.as_ref(),
+            baseline.as_ref(),
+            scope.as_ref(),
+            categories,
+            &inline,
+        );
+        for finding in run.findings() {
+            let identity = (finding.policy_id().to_string(), finding.id().to_string());
+            let tier = hint.tier(finding);
+            if tier != 1 {
+                candidates.insert(identity.clone());
+            }
+            if finding.is_explicitly_accepted() || finding.baseline().is_some() {
+                accepted.insert(identity.clone());
+                if tier == 1 || (finding.is_explicitly_accepted() && tier != 0) {
+                    missing.insert(identity);
+                }
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "accepted findings missing from hints: missing={missing:?}; accepted={accepted:?}; candidates={candidates:?}"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use crate::PolicyRunScopeKind;
@@ -7731,6 +8427,7 @@ mod tests {
         PRIVATE_POLICY_SUPPRESSION_PATH,
     };
     use crate::write_policy_json;
+    use brokk_bifrost_analysis::analyzer::reuse_verdict::SelectionEvidence;
 
     #[test]
     #[hardwon(
@@ -7936,26 +8633,41 @@ mod tests {
             })
             .collect::<Vec<_>>();
         store
-            .publish_policy_evaluation(PolicyEvaluationRow {
-                evidence: None,
-                evidence_complete: None,
-                key: key.clone(),
-                resolved_commit: "c".repeat(40),
-                policy_set_digest: digest,
-                unreliable_detail: None,
-                aggregate_unreliable: true,
-                base_content_identity: [1; 32],
-                unqualified_policy_ids: policies
-                    .iter()
-                    .filter(|p| !p.qualified)
-                    .map(|p| p.policy_id.clone())
-                    .collect(),
-                policies: policies.clone(),
-            })
+            .publish_policy_evaluation(
+                brokk_bifrost_analysis::analyzer::reuse_verdict::admit(
+                    brokk_bifrost_analysis::analyzer::reuse_verdict::CapBinding::Unbound,
+                    PolicyEvaluationRow {
+                        cut_hint_digest: None,
+                        evidence: None,
+                        evidence_complete: None,
+                        key: key.clone(),
+                        resolved_commit: "c".repeat(40),
+                        policy_set_digest: digest,
+                        unreliable_detail: None,
+                        aggregate_unreliable: true,
+                        base_content_identity: [1; 32],
+                        unqualified_policy_ids: policies
+                            .iter()
+                            .filter(|p| !p.qualified)
+                            .map(|p| p.policy_id.clone())
+                            .collect(),
+                        selection_reads: Vec::new(),
+                        selection_view: SelectionView::Worktree,
+                        policies: policies.clone(),
+                    },
+                    brokk_bifrost_analysis::analyzer::reuse_verdict::ReuseVerdict::Content,
+                    brokk_bifrost_analysis::analyzer::reuse_verdict::ReuseVerdict::Content,
+                    SelectionEvidence::NotApplicable,
+                )
+                .unwrap(),
+            )
             .unwrap();
         drop(store);
         let store = AnalyzerStore::open_persistent(&path).unwrap();
-        let loaded = store.policy_evaluation_for_key(&key).unwrap().unwrap();
+        let loaded = store
+            .policy_evaluation_for_key(&key, &[0; 32])
+            .unwrap()
+            .unwrap();
         for expected in policies {
             let actual = loaded
                 .policies
@@ -8050,12 +8762,26 @@ mod tests {
                     PolicyRegistryLimits::default(),
                     certified_source_census(&workspace, &subtree).unwrap(),
                 )),
+                ReuseVerdict::Content,
+                &[],
+                None,
+                None,
             )
+            .map(Admitted::into_inner)
             .unwrap();
             assert_eq!(row.policies.len(), 1);
             assert!(!row.policies[0].qualified);
             assert!(row.policies[0].identities.is_empty());
-            store.publish_evaluation(&row);
+            store.publish_evaluation(
+                &admit(
+                    brokk_bifrost_analysis::analyzer::reuse_verdict::CapBinding::Unbound,
+                    row.clone(),
+                    ReuseVerdict::Content,
+                    ReuseVerdict::Content,
+                    SelectionEvidence::NotApplicable,
+                )
+                .unwrap(),
+            );
             let replay = reuse_persisted_diff_baseline(
                 root.path(),
                 &workspace,
@@ -8065,6 +8791,7 @@ mod tests {
                 &key,
                 PolicyBatchBudget::default(),
                 PolicyRegistryLimits::default(),
+                &HashMap::new(),
             )
             .unwrap();
             assert_eq!(replay.state, IncrementalBaseState::Reused);
@@ -8110,7 +8837,12 @@ mod tests {
                         PolicyRegistryLimits::default(),
                         certified_source_census(&workspace, &subtree).unwrap()
                     )),
+                    ReuseVerdict::Content,
+                    &[],
+                    None,
+                    None,
                 )
+                .map(Admitted::into_inner)
                 .is_none()
             );
         }
@@ -8324,6 +9056,80 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#11829: coordinated evaluation must use the same single owner as direct evaluation")]
+    fn coordinated_single_policy_installs_one_completion_owner() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(
+            workspace.path().join("target.py"),
+            "def target():\n    return 1\n",
+        )
+        .unwrap();
+        let sources = [PolicyEvaluationInput::embedded(
+            PolicySourceIdentity::new("one.rqlp"),
+            r#"(policy :schema-version 1 :id "test.one-owner" :name "Target"
+                :message "Target" :severity warning
+                :analysis (analysis :type match :selector
+                  (rql :schema-version 1 (language python (function :name "target")))))"#,
+        )];
+        // map_bounded executes a one-item batch on the caller's thread.
+        let (outcome, installations) = brokk_bifrost_analysis::analyzer::i_analyzer::with_policy_completion_install_counter_for_test(|| {
+            evaluate_policy_inputs(workspace.path(), &sources, &evaluation_options(),
+                &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests()).unwrap()
+        });
+        assert_eq!(installations, 1, "coordinator must not add another owner");
+        assert_eq!(outcome.report().runs().len(), 1);
+        assert!(outcome.report().runs()[0].completion().is_complete());
+    }
+
+    #[test]
+    #[hardwon("#11534: the first policy's recorded store failure discarded healthy siblings")]
+    fn policy_store_error_isolation_failing_first() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(
+            workspace.path().join("target.py"),
+            "def target():\n    return 1\n",
+        )
+        .unwrap();
+        let sources = ["alpha", "beta"].map(|suffix| {
+            PolicyEvaluationInput::embedded(
+                PolicySourceIdentity::new(format!("policies/{suffix}.rqlp")),
+                format!(
+                    r#"(policy :schema-version 1 :id "test.{suffix}" :name "Target"
+              :message "Avoid target" :severity warning
+              :analysis (analysis :type match :selector
+                (rql :schema-version 1 (language python (function :name "target")))))"#
+                ),
+            )
+        });
+        // SAFETY: nextest isolates this test in its own process.
+        unsafe { std::env::set_var(crate::parallel::POLICY_PARALLELISM_ENV, "1") };
+        let retention = brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests();
+        let options = evaluation_options();
+        let healthy =
+            evaluate_policy_inputs(workspace.path(), &sources, &options, &retention).unwrap();
+        let mut failing_options = options.clone();
+        failing_options.store_error_probe = Some(PolicyId::new("test.alpha").unwrap());
+        let failed =
+            evaluate_policy_inputs(workspace.path(), &sources, &failing_options, &retention)
+                .unwrap();
+        assert!(matches!(
+            failed.report().runs()[0].completion(),
+            PolicyRunCompletion::Failed { .. }
+        ));
+        assert!(failed.report().runs()[1].completion().is_complete());
+        assert_eq!(
+            serde_json::to_vec(&healthy.report().runs()[1]).unwrap(),
+            serde_json::to_vec(&failed.report().runs()[1]).unwrap()
+        );
+        let diagnostic = &failed.report().runs()[0].diagnostics()[0];
+        assert!(
+            matches!(diagnostic.code(), PolicyDiagnosticCode::InternalError { policy_id, cause: crate::finding::PolicyInternalErrorCause::StoreRead, error } if policy_id.as_str() == "test.alpha" && error.contains("injected policy read"))
+        );
+        assert_eq!(diagnostic.impact(), PolicyDiagnosticImpact::RunFailed);
+        assert_eq!(failed.exit_status(), 2);
+    }
+
+    #[test]
     #[hardwon(
         "#7336: a missing restored assembly made discovery incomplete but its diagnostic never reached the report"
     )]
@@ -8392,6 +9198,7 @@ mod tests {
         let activation = WorkspacePacksActivation {
             ecosystems: vec![DependencyPackEcosystem::Jvm],
             workspace_models: Vec::new(),
+            registration_evidence: Vec::new(),
             outcome: DependencyPackActivationOutcome {
                 ecosystems: vec![DependencyPackEcosystemOutcome {
                     ecosystem: DependencyPackEcosystem::Jvm,
@@ -8493,6 +9300,7 @@ mod tests {
                 DependencyPackEcosystem::Cargo,
             ],
             workspace_models: Vec::new(),
+            registration_evidence: Vec::new(),
             outcome: DependencyPackActivationOutcome {
                 ecosystems: vec![
                     ecosystem(
@@ -8800,6 +9608,7 @@ mod tests {
             activation: WorkspacePacksActivation {
                 ecosystems: Vec::new(),
                 workspace_models: Vec::new(),
+                registration_evidence: Vec::new(),
                 outcome: DependencyPackActivationOutcome {
                     ecosystems: Vec::new(),
                     runtime: Some(runtime),
@@ -9072,11 +9881,10 @@ pub fn run() {
         "#4803: a qualified locator must still select its exact declaration, excluding same-named calls"
     )]
     fn available_qualified_locator_evaluates_exact_calls() {
-        // Workspace-exact rows prove positive selections. An empty exact
-        // selection cannot close a partially discovered Java dispatch family
-        // (selector_compiler::admits_existing_incomplete_call_bindings). Keep
-        // the standalone near miss inconclusive rather than claiming absence;
-        // the mixed case independently checks that its call adds no finding.
+        // Workspace-exact rows prove positive selections. A candidate bound
+        // exactly to another identity is a proven near miss, so it neither
+        // selects nor leaves the standalone case incomplete (#11323). The
+        // mixed case independently checks that its call adds no finding.
         for (body, expected_findings, expected_completion) in [
             ("return Widget.create(1);", 1, PolicyRunCompletion::Complete),
             (
@@ -9084,12 +9892,7 @@ pub fn run() {
                 1,
                 PolicyRunCompletion::Complete,
             ),
-            (
-                "return Other.create(1);",
-                0,
-                PolicyRunCompletion::inconclusive(vec![PolicyIncompleteReason::PartialDiscovery])
-                    .expect("partial discovery is an incomplete reason"),
-            ),
+            ("return Other.create(1);", 0, PolicyRunCompletion::Complete),
         ] {
             let source = format!(
                 "final class Widget {{ static int create(int value) {{ return value; }} }}\nfinal class Other {{ static int create(int value) {{ return value; }} }}\nclass Caller {{ int run() {{ {body} }} }}\n"
@@ -9196,6 +9999,7 @@ pub fn run() {
             let activation = WorkspacePacksActivation {
                 ecosystems: Vec::new(),
                 workspace_models: Vec::new(),
+                registration_evidence: Vec::new(),
                 outcome: DependencyPackActivationOutcome {
                     ecosystems: Vec::new(),
                     runtime,
@@ -9925,6 +10729,89 @@ pub fn run() {
 
     #[test]
     #[hardwon(
+        "#11709: a deadline that stopped some per-file units before they started panicked the unit merge and wrote no report"
+    )]
+    fn a_deadline_between_per_file_units_still_yields_a_report() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        for index in 0..8 {
+            fs::write(
+                workspace.path().join(format!("app{index}.ts")),
+                "function target() {}\n",
+            )
+            .expect("source fixture");
+        }
+        let project = FilesystemProject::new(workspace.path().to_path_buf()).expect("project");
+        let project: Arc<dyn Project> = Arc::new(project);
+        let analyzer =
+            WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default())
+                .expect("ephemeral workspace should build");
+
+        // Every check count stops the deadline at a different unit boundary: a
+        // unit it stops mid-way keeps a full per-step count, and every unit
+        // after it stops before it starts and counts nothing.
+        let mut stopped_in_evaluation = 0;
+        let mut completed = false;
+        for checks in 1..=400 {
+            let cancellation = CancellationToken::timeout_after_checks_for_test(checks);
+            let outcome = evaluate_policy_source(
+                workspace.path(),
+                PolicySourceIdentity::new("policies/live.rqlp"),
+                &match_policy("test.timed-out", "Timed out"),
+                &analyzer,
+                &brokk_bifrost_flow::FlowWorkspaceState::new(),
+                &evaluation_options(),
+                Some(&cancellation),
+                &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+            )
+            .unwrap_or_else(|error| panic!("checks={checks}: {error}"));
+            if outcome.report().execution().termination().is_none() {
+                let run = &outcome.report().runs()[0];
+                assert_eq!(run.completion(), &PolicyRunCompletion::Complete);
+                assert_eq!(run.findings().len(), 8, "checks={checks}");
+                completed = true;
+                break;
+            }
+            assert_eq!(
+                outcome.report().execution().termination(),
+                Some(PolicyExecutionTermination::DeadlineExceeded),
+                "checks={checks}"
+            );
+            if outcome.report().execution().terminal_stage()
+                == Some(PolicyExecutionStage::PolicyEvaluation)
+            {
+                // A deadline that passes after the policy finished leaves a
+                // complete run; one that stops it leaves the typed reason.
+                match outcome.report().runs()[0].completion() {
+                    PolicyRunCompletion::Complete => {}
+                    PolicyRunCompletion::Inconclusive { reasons, .. }
+                        if reasons.contains(&PolicyIncompleteReason::DeadlineExceeded) =>
+                    {
+                        // The typed reason is for code; the report shows a user
+                        // the stop through the run's cancellation diagnostic.
+                        let labels = outcome.report().runs()[0]
+                            .diagnostics()
+                            .iter()
+                            .map(|diagnostic| diagnostic.code().stable_label())
+                            .collect::<Vec<_>>();
+                        assert!(
+                            labels.iter().any(|label| label == "code_query/cancelled"),
+                            "checks={checks}: {labels:?}"
+                        );
+                        stopped_in_evaluation += 1;
+                    }
+                    other => panic!("checks={checks}: {other:?}"),
+                }
+            }
+        }
+        assert!(completed, "the sweep reaches an undisturbed evaluation");
+        assert!(
+            stopped_in_evaluation > 0,
+            "the sweep stops the deadline inside policy evaluation"
+        );
+    }
+
+    #[test]
+    #[hardwon(
         "#1296: a spent registration deadline must stop before policy evaluation and report that phase accurately."
     )]
     fn issue_1296_registration_deadline_stops_before_policy_evaluation() {
@@ -9970,6 +10857,8 @@ pub fn run() {
         let outcome = deadline_before_evaluation_outcome(
             &evaluation_options(),
             PolicyBatchBudget::default(),
+            None,
+            None,
             evaluation_options()
                 .suppressions()
                 .source_states(PolicySuppressionDocumentState::NotEvaluated),
@@ -9984,10 +10873,89 @@ pub fn run() {
         )
         .expect("deadline report");
 
+        let json = serde_json::to_value(outcome.report()).unwrap();
+        assert_eq!(
+            json["evaluation"]["budget"]["batch_refusals"],
+            serde_json::json!(["time/batch_deadline_ms"])
+        );
+        assert_eq!(json["evaluation"]["budget"]["batch_remaining_ms"], 0);
+        assert!(json["evaluation"]["budget"]["census"].is_null());
         assert_eq!(
             report_exit_status(outcome.report(), false, PolicyOnInconclusive::Pass),
             POLICY_EXIT_UNRELIABLE
         );
+    }
+
+    #[test]
+    #[hardwon("#11321: later deadline reports erased actual registry grants")]
+    fn budget_telemetry_deadlines_keep_applied_registry_grants() {
+        let options = evaluation_options();
+        let limits = PolicyRegistryLimits::default()
+            .with_max_endpoint_set_files(7)
+            .unwrap();
+        let census = PolicySourceCensus {
+            bytes: 60_000_000,
+            files: 4000,
+        };
+        let batch = effective_grant(PolicyBatchBudget::default(), census);
+        for (stage, applied) in [
+            (PolicyExecutionStage::PolicyRegistration, None),
+            (PolicyExecutionStage::PolicyRegistration, Some(limits)),
+            (PolicyExecutionStage::PolicyPreparation, Some(limits)),
+        ] {
+            let outcome = deadline_before_evaluation_outcome(
+                &options,
+                batch,
+                applied,
+                Some(census),
+                options
+                    .suppressions()
+                    .source_states(PolicySuppressionDocumentState::NotEvaluated),
+                PolicyScopeDocumentState::NotEvaluated,
+                vec![PolicyStageTiming::new(stage, 1)],
+                stage,
+                Vec::new(),
+                None,
+            )
+            .unwrap();
+            let json = serde_json::to_value(outcome.report()).unwrap();
+            let grant = &json["evaluation"]["budget"]["effective_grant"];
+            if applied.is_some() {
+                assert_eq!(grant["registry.max_endpoint_set_files"], 7);
+            } else {
+                assert!(
+                    !grant
+                        .as_object()
+                        .unwrap()
+                        .keys()
+                        .any(|key| key.starts_with("registry."))
+                );
+            }
+            assert_eq!(grant["query.max_fact_nodes"], 10_000_000);
+            assert_eq!(json["evaluation"]["budget"]["census"]["files"], 4000);
+        }
+        let outcome = diff_base_deadline_outcome(
+            &options,
+            batch,
+            limits,
+            Some(census),
+            options
+                .suppressions()
+                .source_states(PolicySuppressionDocumentState::NotEvaluated),
+            PolicyScopeDocumentState::NotEvaluated,
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            Vec::new(),
+            "test-base",
+        )
+        .unwrap();
+        let json = serde_json::to_value(outcome.report()).unwrap();
+        assert_eq!(
+            json["evaluation"]["budget"]["effective_grant"]["registry.max_endpoint_set_files"],
+            7
+        );
+        assert_eq!(json["execution"]["terminal_stage"], "diff_base");
     }
 
     fn single_run_report(completion: PolicyRunCompletion) -> PolicyReportDocument {
@@ -10123,6 +11091,7 @@ pub fn run() {
             None,
             None,
             Vec::new(),
+            crate::RelatedLocationOmissions::Known(0),
         )
         .unwrap();
         let with_report_diagnostics = |diagnostics, truncated, omitted| {
@@ -10398,59 +11367,223 @@ pub fn run() {
             &finding.to_string(),
         );
 
-        let one_result_budget = PolicyBatchBudget::builder()
-            .with_max_total_findings(1)
-            .unwrap()
-            .build()
-            .unwrap();
-        let retained = evaluate_policy_files_with_limits(
+        let retained = evaluate_policy_files(
             workspace.path(),
             &paths,
             &evaluation_options(),
-            one_result_budget,
-            PolicyRegistryLimits::default(),
             &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
-        .expect("one-result report");
-        let retained_findings = retained
-            .report()
-            .runs()
-            .iter()
-            .flat_map(PolicyRun::findings)
-            .collect::<Vec<_>>();
-        assert_eq!(retained_findings.len(), 1);
-        assert_eq!(retained_findings[0].policy_id().as_str(), "test.z");
-        assert!(retained_findings[0].suppression().is_some());
-        assert!(retained.report().suppressions()[0].applied());
-        assert!(!retained.report().suppressions()[0].result_omitted());
-
-        let zero_result_budget = PolicyBatchBudget::builder()
-            .with_max_total_findings(0)
-            .unwrap()
-            .build()
-            .unwrap();
-        let omitted = evaluate_policy_files_with_limits(
-            workspace.path(),
-            &paths,
-            &evaluation_options(),
-            zero_result_budget,
-            PolicyRegistryLimits::default(),
-            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
-        )
-        .expect("zero-result report");
-        assert_eq!(omitted.exit_status(), POLICY_EXIT_UNRELIABLE);
-        assert!(
-            omitted
+        .unwrap();
+        assert_eq!(
+            retained
                 .report()
                 .runs()
                 .iter()
-                .all(|run| run.findings().is_empty())
+                .map(|run| run.findings().len())
+                .sum::<usize>(),
+            2
         );
-        assert!(omitted.report().suppressions()[0].applied());
-        assert!(omitted.report().suppressions()[0].result_omitted());
-        assert!(omitted.report().diagnostics().iter().any(|diagnostic| {
-            diagnostic.code() == PolicyReportDiagnosticCode::SuppressionAuditRetentionExceeded
-        }));
+        assert!(retained.report().suppressions()[0].applied());
+        assert!(!retained.report().suppressions()[0].result_omitted());
+    }
+
+    #[test]
+    fn evaluator_cut_keeps_a_suppressed_finding_that_sorts_last() {
+        let workspace = tempfile::tempdir().unwrap();
+        let source = (0..120)
+            .map(|index| format!("export namespace N{index} {{ export function target() {{}} }}\n"))
+            .collect::<String>();
+        fs::write(workspace.path().join("app.ts"), source).unwrap();
+        write_policy(
+            workspace.path(),
+            "policy.rqlp",
+            &match_policy("test.cut", "Cut"),
+        );
+        let paths = [PathBuf::from("policy.rqlp")];
+        let retention = brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests();
+        let full =
+            evaluate_policy_files(workspace.path(), &paths, &evaluation_options(), &retention)
+                .unwrap();
+        let run = &full.report().runs()[0];
+        assert_eq!(run.findings().len(), 120);
+        let last = run
+            .findings()
+            .iter()
+            .max_by_key(|finding| finding.id())
+            .unwrap()
+            .id();
+        let hash = full.report().rules()[0].policy_hash().to_string();
+        let bytes = run.retained_size() / 2;
+        let budget = PolicyBudget::builder()
+            .with_max_retained_report_bytes(bytes)
+            .unwrap()
+            .build()
+            .unwrap();
+        let batch = PolicyBatchBudget::builder()
+            .with_per_policy(budget)
+            .unwrap()
+            .build()
+            .unwrap();
+        let before = evaluate_policy_files_with_limits(
+            workspace.path(),
+            &paths,
+            &evaluation_options(),
+            batch,
+            PolicyRegistryLimits::default(),
+            &retention,
+        )
+        .unwrap();
+        assert!(
+            !before.report().runs()[0]
+                .findings()
+                .iter()
+                .any(|finding| finding.id() == last)
+        );
+        write_test_suppression(workspace.path(), "test.cut", &hash, &last.to_string());
+        let after = evaluate_policy_files_with_limits(
+            workspace.path(),
+            &paths,
+            &evaluation_options(),
+            batch,
+            PolicyRegistryLimits::default(),
+            &retention,
+        )
+        .unwrap();
+        let review = &after.report().suppressions()[0];
+        assert!(review.applied(), "{review:?}");
+        assert!(!review.result_omitted(), "{review:?}");
+        assert!(
+            after.report().runs()[0]
+                .findings()
+                .iter()
+                .any(|finding| finding.id() == last && finding.is_explicitly_accepted())
+        );
+        assert!(
+            after.report().runs()[0]
+                .work()
+                .retention_omitted_findings_lower_bound()
+                > 0
+        );
+    }
+
+    #[test]
+    fn candidate_hints_cover_final_suppression_scope_and_baseline_decisions() {
+        // The rich-report audit golden's target fixture, extended with inline
+        // forms from the inline-suppression golden and an expired exact claim.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::write(root.join("app.ts"), "export function target() {}\n").unwrap();
+        write_policy(root, "policy.rqlp", &match_policy("test.audit", "Audit"));
+        let paths = [PathBuf::from("policy.rqlp")];
+        let retention = brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests();
+        let options = evaluation_options();
+        let initial = evaluate_policy_files(root, &paths, &options, &retention).unwrap();
+        let finding = &initial.report().runs()[0].findings()[0];
+        let id = finding.id().to_string();
+        let hash = initial.report().rules()[0].policy_hash().to_string();
+        let (baseline, weak) = PolicyBaselineDocument::from_completed_report(
+            initial.report(),
+            "Reviewed targets",
+            None,
+            options.evaluation_date(),
+        )
+        .unwrap();
+        assert_eq!(weak, 0);
+        fs::create_dir_all(root.join(".bifrost")).unwrap();
+        fs::write(
+            root.join(DEFAULT_POLICY_BASELINE_PATH),
+            baseline.to_canonical_json(),
+        )
+        .unwrap();
+        for mode in ["baseline", "exact", "expired", "scope", "inline"] {
+            for path in [DEFAULT_POLICY_SUPPRESSION_PATH, DEFAULT_POLICY_SCOPE_PATH] {
+                let path = root.join(path);
+                if path.exists() {
+                    fs::remove_file(path).unwrap();
+                }
+            }
+            if matches!(mode, "exact" | "expired") {
+                let mut record = suppression_record("test.audit", &hash, &id, Some("app.ts"));
+                if mode == "expired" {
+                    record["expires_at"] = serde_json::json!("2026-01-01");
+                }
+                write_suppressions(root, vec![record]);
+            }
+            if mode == "scope" {
+                fs::write(root.join(DEFAULT_POLICY_SCOPE_PATH), serde_json::json!({"schema_version":1,"scopes":[{"path":"app.ts","reason":"Reviewed application"}]}).to_string()).unwrap();
+            }
+            if mode == "inline" {
+                fs::write(
+                    root.join("app.ts"),
+                    "// bifrost: ignore[test.audit] -- reviewed\nexport function target() {}\n",
+                )
+                .unwrap();
+            }
+            let evaluated = evaluate_policy_files(root, &paths, &options, &retention).unwrap();
+            let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
+                Arc::new(FilesystemProject::new(root.to_path_buf()).unwrap()),
+                AnalyzerConfig::default(),
+            )
+            .unwrap();
+            let read_root = WorkspaceRoot::open(root).unwrap();
+            let exact = load_policy_suppressions_from_root(&read_root, options.suppressions());
+            let scope = load_policy_scope_from_root(&read_root, options.scope()).unwrap();
+            let baseline = load_policy_baseline_from_root(&read_root, options.baseline()).unwrap();
+            let digest = acceptance_hint_digest(
+                exact.document.as_ref(),
+                baseline.as_ref(),
+                options.inline_suppressions(),
+                &HashMap::new(),
+            );
+            assert_ne!(
+                digest,
+                acceptance_hint_digest(
+                    exact.document.as_ref(),
+                    None,
+                    options.inline_suppressions(),
+                    &HashMap::new(),
+                ),
+                "baseline file edit changes the conditional digest"
+            );
+            if exact.document.is_some() {
+                assert_ne!(
+                    digest,
+                    acceptance_hint_digest(
+                        None,
+                        baseline.as_ref(),
+                        options.inline_suppressions(),
+                        &HashMap::new(),
+                    ),
+                    "suppression file edit changes the conditional digest"
+                );
+            }
+            let inline = super::super::inline_suppression::InlineDirectiveScan::new(
+                options.inline_suppressions(),
+                Some(&workspace),
+                workspace.retention_budget(),
+            );
+            let mut accepted = 0;
+            for run in evaluated.report().runs() {
+                let hint = crate::AcceptanceHint::new(
+                    run.policy_id(),
+                    exact.document.as_ref(),
+                    baseline.as_ref(),
+                    scope.as_ref(),
+                    &[],
+                    &inline,
+                );
+                for finding in run.findings() {
+                    if finding.is_explicitly_accepted() {
+                        assert_eq!(hint.tier(finding), 0, "{mode}: {finding:?}");
+                        accepted += 1;
+                    } else if finding.baseline().is_some() {
+                        assert_ne!(hint.tier(finding), 1, "{mode}: {finding:?}");
+                        accepted += 1;
+                    }
+                }
+            }
+            assert!(accepted > 0, "non-vacuous superset check for {mode}");
+        }
     }
 
     fn init_git_workspace(root: &Path) {
@@ -10680,6 +11813,171 @@ pub fn run() {
     }
 
     #[test]
+    fn old_engine_retention_rows_remain_stored_but_miss_serving() {
+        let root = tempfile::tempdir().unwrap();
+        init_git_workspace(root.path());
+        fs::write(root.path().join("app.ts"), "export function target() {}\n").unwrap();
+        let paths = [PathBuf::from("policies/diff.rqlp")];
+        write_policy(
+            root.path(),
+            "policies/diff.rqlp",
+            &match_policy("test.diff", "Diff"),
+        );
+        commit_everything(root.path(), "base");
+        let options = evaluation_options().with_diff_base("HEAD".to_string());
+        let evaluate = || {
+            evaluate_policy_files(
+                root.path(),
+                &paths,
+                &options,
+                &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+            )
+            .unwrap()
+        };
+        let cold = evaluate();
+        assert_eq!(
+            cold.incremental().unwrap().base(),
+            IncrementalBaseState::Evaluated
+        );
+        let workspace = WorkspaceAnalyzer::build_persisted(
+            Arc::new(owned_policy_project(root.path()).unwrap()),
+            AnalyzerConfig::default(),
+        )
+        .unwrap();
+        let activation = activate_owned_policy_workspace(
+            root.path(),
+            &workspace,
+            None,
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        let models = ready_policy_semantic_model_snapshot(activation.as_ref());
+        let inputs = WorkspaceUnitInputs::of(&workspace, models.as_deref(), None);
+        let revision = resolve_revision_subtree(root.path(), "HEAD").unwrap();
+        let current = PolicyEvaluationRowKey {
+            base_tree_oid: revision.tree_id().to_string(),
+            ..base_evaluation_key(&options, None, inputs)
+        };
+        let store = workspace.store().unwrap();
+        assert!(
+            store
+                .policy_evaluation_for_key(&current, &[0; 32])
+                .unwrap()
+                .is_some()
+        );
+
+        // Recreate the historical frame independently of the current key builder.
+        // Only the engine identity changes; the tree and every other input agree.
+        let mut old_engine = b"bifrost-policy-evaluation-key:engine:v4".to_vec();
+        for part in [
+            inputs.epoch().as_bytes().as_slice(),
+            brokk_bifrost_analysis::analyzer::semantic::icfg::workspace_icfg_provider_behavior_domain(),
+            brokk_bifrost_analysis::analyzer::semantic::icfg::workspace_icfg_provider_read_behavior_domain(),
+        ] {
+            old_engine.extend_from_slice(&(part.len() as u64).to_le_bytes());
+            old_engine.extend_from_slice(part);
+        }
+        let old = PolicyEvaluationRowKey {
+            engine_epoch: StableDigest::sha256(old_engine).to_string(),
+            ..current.clone()
+        };
+        let diagnostic = PolicyDiagnostic::try_new(
+            PolicyDiagnosticCode::UnsupportedAnalysis,
+            PolicyDiagnosticSeverity::Warning,
+            PolicyDiagnosticImpact::Advisory,
+            "legacy base lookup diagnostic without source provenance",
+            None,
+            Vec::new(),
+            crate::finding::RelatedLocationOmissions::Known(0),
+        )
+        .unwrap();
+        let mut legacy_wire = serde_json::to_value(&diagnostic).unwrap();
+        legacy_wire
+            .as_object_mut()
+            .unwrap()
+            .remove("omitted_related_locations_lower_bound")
+            .expect("current diagnostics carry the mandatory omission field");
+        let legacy = serde_json::to_string(&legacy_wire).unwrap();
+        let diagnostics = serde_json::to_string(&vec![legacy.clone()]).unwrap();
+        let new_key = current.clone();
+        let old_epoch = old.engine_epoch.clone();
+        store.execute_selection_publication(move |conn| {
+            assert_eq!(
+                conn.execute(
+                    "UPDATE policy_evaluations SET engine_epoch = ?1
+                 WHERE base_tree_oid = ?2 AND options_digest = ?3
+                   AND configuration_fingerprint = ?4 AND active_model_set_hash = ?5
+                   AND engine_epoch = ?6",
+                    (
+                        &old_epoch,
+                        &new_key.base_tree_oid,
+                        &new_key.options_digest,
+                        &new_key.configuration_fingerprint,
+                        &new_key.active_model_set_hash,
+                        &new_key.engine_epoch
+                    ),
+                )
+                .unwrap(),
+                1
+            );
+            assert_eq!(
+                conn.execute(
+                    "UPDATE policy_evaluation_policies SET diagnostics = ?1
+                 WHERE evaluation_id IN
+                   (SELECT evaluation_id FROM policy_evaluations WHERE engine_epoch = ?2)",
+                    (&diagnostics, &old_epoch),
+                )
+                .unwrap(),
+                1
+            );
+        });
+        let stored_old = store
+            .policy_evaluation_for_key(&old, &[0; 32])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored_old.policies[0].diagnostics.as_slice(),
+            std::slice::from_ref(&legacy),
+        );
+
+        // Exercise the coordinator's actual key-selected serving path, rather
+        // than just comparing keys: the old row cannot satisfy this request.
+        let recomputed = evaluate();
+        assert_eq!(
+            recomputed.incremental().unwrap().base(),
+            IncrementalBaseState::Evaluated
+        );
+        for run in recomputed.report().runs() {
+            assert!(
+                serde_json::to_value(run.work())
+                    .unwrap()
+                    .get("retention_omitted_findings_by_dimension")
+                    .is_some()
+            );
+        }
+        let stored_current = store
+            .policy_evaluation_for_key(&current, &[0; 32])
+            .unwrap()
+            .unwrap();
+        assert!(!stored_current.policies[0].diagnostics.contains(&legacy));
+        let warm = evaluate();
+        assert_eq!(
+            warm.incremental().unwrap().base(),
+            IncrementalBaseState::Reused
+        );
+        assert_eq!(recomputed.report().diff(), warm.report().diff());
+        // Recompute and warm serving did not delete or rewrite the old evidence.
+        assert_eq!(
+            store
+                .policy_evaluation_for_key(&old, &[0; 32])
+                .unwrap()
+                .unwrap()
+                .policies,
+            stored_old.policies
+        );
+    }
+
+    #[test]
     #[hardwon("#7557: the diff base evaluated without the caller's per-policy deadlines")]
     fn policy_deadline_bounds_the_diff_base_evaluation_too() {
         let workspace = tempfile::tempdir().expect("workspace");
@@ -10753,7 +12051,13 @@ pub fn run() {
             .unwrap();
         let batch = |findings| {
             PolicyBatchBudget::builder()
-                .with_max_total_findings(findings)
+                .with_per_policy(
+                    PolicyBudget::builder()
+                        .with_max_findings(findings)
+                        .unwrap()
+                        .build()
+                        .unwrap(),
+                )
                 .unwrap()
                 .build()
                 .unwrap()
@@ -10833,7 +12137,11 @@ pub fn run() {
                 outcome.report(),
                 policies,
                 outcome.replay_evidence.as_ref(),
+                ReuseVerdict::Content,
+                &[],
+                None,
             )
+            .map(Admitted::into_inner)
             .unwrap()
         };
         let replays = |policies: &[&LoadedPolicy], budget, limits| {
@@ -10846,6 +12154,7 @@ pub fn run() {
                 &key,
                 budget,
                 limits,
+                &HashMap::new(),
             )
             .inspect(|outcome| {
                 // The `DiffBaseUnreliable` diagnostic is built from the
@@ -10866,7 +12175,7 @@ pub fn run() {
             workspace
                 .store()
                 .unwrap()
-                .policy_evaluation_for_key(&key)
+                .policy_evaluation_for_key(&key, &[0; 32])
                 .unwrap()
                 .unwrap()
         };
@@ -10874,12 +12183,84 @@ pub fn run() {
         assert_eq!(complete.evidence_complete, Some(true));
         assert_eq!(complete.evidence.as_ref(), initial.replay_evidence.as_ref());
         assert_eq!(complete.policies[0].evidence, complete.evidence);
+        let evidence_json: serde_json::Value =
+            serde_json::from_str(&complete.evidence.as_ref().unwrap().effective_grant).unwrap();
         assert_eq!(
-            complete.evidence.as_ref().unwrap(),
-            &replay_evidence(effective_grant(batch(5), census), registry_limits, census)
+            evidence_json["effective_grant"],
+            serde_json::to_value(effective_grant(batch(5), census).replay_caps(registry_limits))
+                .unwrap()
         );
+        assert_eq!(evidence_json["budget"]["census"]["files"], census.files);
+        assert!(evidence_json["refusals"].is_object());
         // Exercise both the same-set aggregate and a retained child whose
         // parent's set differs, so neither branch can mask the other's check.
+        // #11321: aggregate maps must not be copied into each persisted child.
+        let timed_options = options
+            .clone()
+            .with_policy_deadlines(PolicyDeadlines(BTreeMap::from([
+                ("test.first".to_owned(), 100_000),
+                ("test.second".to_owned(), 100_000),
+            ])));
+        let paired = evaluate_policy_files_with_limits(
+            root.path(),
+            &paths,
+            &timed_options,
+            batch(7),
+            registry_limits,
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+        )
+        .unwrap();
+        let paired_key = PolicyEvaluationRowKey {
+            base_tree_oid: revision.tree_id().to_string(),
+            ..base_evaluation_key(&timed_options, None, inputs)
+        };
+        let paired_row = head_evaluation_publication(
+            root.path(),
+            &workspace,
+            &timed_options,
+            paired_key.clone(),
+            &incremental,
+            paired.report(),
+            &policies,
+            paired.replay_evidence.as_ref(),
+            ReuseVerdict::Content,
+            &[],
+            None,
+        )
+        .unwrap();
+        store.publish_evaluation(&paired_row);
+        let persisted = workspace
+            .store()
+            .unwrap()
+            .policy_evaluation_for_key(&paired_key, &[0; 32])
+            .unwrap()
+            .unwrap();
+        let aggregate: serde_json::Value =
+            serde_json::from_str(&persisted.evidence.as_ref().unwrap().effective_grant).unwrap();
+        assert_eq!(aggregate["refusals"].as_object().unwrap().len(), 2);
+        assert_eq!(
+            aggregate["budget"]["policy_deadlines_ms"]
+                .as_object()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(persisted.policies.len(), 2);
+        for child in &persisted.policies {
+            let local: serde_json::Value =
+                serde_json::from_str(&child.evidence.as_ref().unwrap().effective_grant).unwrap();
+            assert_eq!(local["effective_grant"], aggregate["effective_grant"]);
+            let refusals = local["refusals"].as_object().unwrap();
+            assert_eq!(refusals.len(), 1);
+            assert_eq!(
+                refusals[&child.policy_id],
+                aggregate["refusals"][&child.policy_id]
+            );
+            let deadlines = local["budget"]["policy_deadlines_ms"].as_object().unwrap();
+            assert_eq!(deadlines.len(), 1);
+            assert_eq!(deadlines[&child.policy_id], 100_000);
+        }
+
         let incomplete = evaluate(&paths[..1], batch(3), registry_limits);
         assert!(!incomplete.report().runs()[0].completion().is_exhaustive());
         assert_eq!(incomplete.exit_status(), POLICY_EXIT_CLEAN);
@@ -10892,14 +12273,25 @@ pub fn run() {
         let incomparable_limits = registry_limits.with_max_endpoint_set_files(64).unwrap();
         for (row, center, expected) in [
             (&complete, 5, [true, true, false, false]),
-            (&incomplete, 3, [true, false, true, false]),
+            // An incomplete record replays only under its exact grant: a smaller
+            // request would receive a subset a fresh run truncates further.
+            (&incomplete, 3, [true, false, false, false]),
         ] {
             for same_set in [true, false] {
                 let mut row = row.clone();
                 if !same_set {
                     row.policy_set_digest = policy_set_digest(&policies);
                 }
-                store.publish_evaluation(&row);
+                store.publish_evaluation(
+                    &admit(
+                        brokk_bifrost_analysis::analyzer::reuse_verdict::CapBinding::Unbound,
+                        row.clone(),
+                        ReuseVerdict::Content,
+                        ReuseVerdict::Content,
+                        SelectionEvidence::NotApplicable,
+                    )
+                    .unwrap(),
+                );
                 for ((budget, limits), expected) in [
                     (batch(center), registry_limits),
                     (batch(center + 1), registry_limits),
@@ -10926,17 +12318,35 @@ pub fn run() {
                 effective_grant: json.to_string(),
                 ..complete.evidence.clone().unwrap()
             });
-            store.publish_evaluation(&legacy);
+            store.publish_evaluation(
+                &admit(
+                    brokk_bifrost_analysis::analyzer::reuse_verdict::CapBinding::Unbound,
+                    legacy.clone(),
+                    ReuseVerdict::Content,
+                    ReuseVerdict::Content,
+                    SelectionEvidence::NotApplicable,
+                )
+                .unwrap(),
+            );
             assert!(!replays(first, batch(5), registry_limits));
             legacy.evidence = complete.evidence.clone();
             legacy.policies[0].evidence = malformed.map(|json| PolicyReplayEvidence {
                 effective_grant: json.to_string(),
                 ..complete.evidence.clone().unwrap()
             });
-            store.publish_evaluation(&legacy);
+            store.publish_evaluation(
+                &admit(
+                    brokk_bifrost_analysis::analyzer::reuse_verdict::CapBinding::Unbound,
+                    legacy.clone(),
+                    ReuseVerdict::Content,
+                    ReuseVerdict::Content,
+                    SelectionEvidence::NotApplicable,
+                )
+                .unwrap(),
+            );
             assert!(!replays(first, batch(5), registry_limits));
         }
-        // A zero output cap is a real limit, not an absent/unbounded value.
+        // The workspace-scaled minimum remains a real recorded output limit.
         let zero = replay_evidence(effective_grant(batch(0), census), registry_limits, census);
         assert!(replay_grant_admits(
             Some(&zero),
@@ -10947,9 +12357,28 @@ pub fn run() {
         assert!(!replay_grant_admits(
             Some(&zero),
             false,
-            batch(1),
+            batch(3),
             registry_limits
         ));
+        // #11445 review: a capped (incomplete) record replays only under its exact
+        // grant. A fresh evaluation under a smaller cap would truncate further, so
+        // replaying the larger subset would make incremental and from-scratch
+        // results disagree; a larger cap would return more.
+        let capped = replay_evidence(effective_grant(batch(5), census), registry_limits, census);
+        assert!(replay_grant_admits(
+            Some(&capped),
+            false,
+            batch(5),
+            registry_limits
+        ));
+        for other in [batch(4), batch(6)] {
+            assert!(!replay_grant_admits(
+                Some(&capped),
+                false,
+                other,
+                registry_limits
+            ));
+        }
         assert!(!replay_grant_admits(
             complete.evidence.as_ref(),
             true,
@@ -10959,7 +12388,16 @@ pub fn run() {
 
         let mut legacy = complete.clone();
         legacy.evidence_complete = None;
-        store.publish_evaluation(&legacy);
+        store.publish_evaluation(
+            &admit(
+                brokk_bifrost_analysis::analyzer::reuse_verdict::CapBinding::Unbound,
+                legacy.clone(),
+                ReuseVerdict::Content,
+                ReuseVerdict::Content,
+                SelectionEvidence::NotApplicable,
+            )
+            .unwrap(),
+        );
         assert!(!replays(first, batch(5), registry_limits));
 
         // A sibling published under smaller limits cannot relabel a retained
@@ -10990,7 +12428,16 @@ pub fn run() {
 
         // A clean full head seeds replay. The larger next commit has a
         // different effective row grant, while the base keeps its own grant.
-        store.publish_evaluation(&complete);
+        store.publish_evaluation(
+            &admit(
+                brokk_bifrost_analysis::analyzer::reuse_verdict::CapBinding::Unbound,
+                complete.clone(),
+                ReuseVerdict::Content,
+                ReuseVerdict::Content,
+                SelectionEvidence::NotApplicable,
+            )
+            .unwrap(),
+        );
         let before = loaded();
         let head_source = format!(
             "{source}/*{}*/\n",
@@ -11053,7 +12500,7 @@ pub fn run() {
         let base = workspace
             .store()
             .unwrap()
-            .policy_evaluation_for_key(&base_key)
+            .policy_evaluation_for_key(&base_key, &[0; 32])
             .unwrap()
             .unwrap();
         assert_eq!(base.evidence, complete.evidence);
@@ -11068,7 +12515,7 @@ pub fn run() {
         let before = workspace
             .store()
             .unwrap()
-            .policy_evaluation_for_key(&head_key)
+            .policy_evaluation_for_key(&head_key, &[0; 32])
             .unwrap()
             .unwrap();
         fs::write(
@@ -11081,7 +12528,7 @@ pub fn run() {
         let after = workspace
             .store()
             .unwrap()
-            .policy_evaluation_for_key(&head_key)
+            .policy_evaluation_for_key(&head_key, &[0; 32])
             .unwrap()
             .unwrap();
         assert_eq!(after.evidence, before.evidence);
@@ -11098,7 +12545,7 @@ pub fn run() {
             workspace
                 .store()
                 .unwrap()
-                .policy_evaluation_for_key(&head_key)
+                .policy_evaluation_for_key(&head_key, &[0; 32])
                 .unwrap()
                 .unwrap()
                 .evidence,
@@ -11132,8 +12579,13 @@ pub fn run() {
                     unreliable_detail: None,
                     aggregate_unreliable: false
                 },
-                None
+                None,
+                ReuseVerdict::Content,
+                &[],
+                None,
+                None,
             )
+            .map(Admitted::into_inner)
             .is_none()
         );
 
@@ -11263,11 +12715,25 @@ pub fn run() {
             first,
             &recovered_baseline,
             recovered.replay_evidence.as_ref(),
+            ReuseVerdict::Content,
+            &[],
+            None,
+            None,
         )
+        .map(Admitted::into_inner)
         .unwrap();
-        mixed_units.publish_evaluation(&protected);
+        mixed_units.publish_evaluation(
+            &admit(
+                brokk_bifrost_analysis::analyzer::reuse_verdict::CapBinding::Unbound,
+                protected.clone(),
+                ReuseVerdict::Content,
+                ReuseVerdict::Content,
+                SelectionEvidence::NotApplicable,
+            )
+            .unwrap(),
+        );
         let before = mixed_store
-            .policy_evaluation_for_key(&protected.key)
+            .policy_evaluation_for_key(&protected.key, &[0; 32])
             .unwrap()
             .unwrap();
         assert!(
@@ -11279,11 +12745,16 @@ pub fn run() {
                 first,
                 &recovered_baseline,
                 failed_evidence.as_ref(),
+                ReuseVerdict::Content,
+                &[],
+                None,
+                None,
             )
+            .map(Admitted::into_inner)
             .is_none()
         );
         let after = mixed_store
-            .policy_evaluation_for_key(&protected.key)
+            .policy_evaluation_for_key(&protected.key, &[0; 32])
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -11295,6 +12766,65 @@ pub fn run() {
             after.policies, before.policies,
             "failed census cannot update any child"
         );
+    }
+
+    #[test]
+    fn configured_cap_replays_the_same_subset_with_reversed_file_inputs() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let root = workspace.path();
+        init_git_workspace(root);
+        // More matches than the effective six-finding grant across three files.
+        let source = "export function target() {}\n".repeat(4);
+        for path in ["c.ts", "b.ts", "a.ts"] {
+            fs::write(root.join(path), &source).expect("source");
+        }
+        write_policy(
+            root,
+            "policies/cap.rqlp",
+            &match_policy("test.cap-order", "Cap order"),
+        );
+        commit_everything(root, "cap fixture");
+        let budget = PolicyBatchBudget::builder()
+            .with_per_policy(
+                PolicyBudget::builder()
+                    .with_max_findings(1)
+                    .unwrap()
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        let paths = [PathBuf::from("policies/cap.rqlp")];
+        let mut previous = None;
+        for files in [["a.ts", "b.ts", "c.ts"], ["c.ts", "b.ts", "a.ts"]] {
+            let options =
+                PolicyEvaluationOptions::new(PolicyEvaluationDate::from_ymd(2026, 7, 27).unwrap())
+                    .with_range(PolicyRangeRequest::Files(
+                        files.into_iter().map(str::to_owned).collect(),
+                    ));
+            let outcome = evaluate_policy_files_with_limits(
+                root,
+                &paths,
+                &options,
+                budget,
+                PolicyRegistryLimits::default(),
+                &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+            )
+            .unwrap();
+            let run = &outcome.report().runs()[0];
+            assert_eq!(run.findings().len(), 6);
+            let diagnostics = serde_json::to_vec(run.diagnostics()).unwrap();
+            assert!(String::from_utf8_lossy(&diagnostics).contains("result_limit_reached"));
+            let retained = (serde_json::to_vec(run.findings()).unwrap(), diagnostics);
+            if let Some(previous) = &previous {
+                assert_eq!(
+                    &retained, previous,
+                    "cold and warm runs retain the same capped subset despite reversed inputs"
+                );
+            }
+            previous = Some(retained);
+        }
     }
 
     #[test]
@@ -11354,6 +12884,12 @@ pub fn run() {
             &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .expect("cold mixed evaluation");
+        for table in ["policy_evaluations", "policy_units"] {
+            assert!(
+                brokk_bifrost_analysis::test_support::cache_row_count(workspace.path(), table) > 0,
+                "configured-cap aggregate and independent units must be retained: {table}"
+            );
+        }
         let warm = evaluate_policy_files_with_limits(
             workspace.path(),
             &paths,
@@ -11415,6 +12951,42 @@ pub fn run() {
                 .expect("warm reuse review")
                 .base(),
             IncrementalBaseState::Reused,
+        );
+
+        for (cold_run, warm_run) in cold.report().runs().iter().zip(warm.report().runs()) {
+            assert_eq!(
+                serde_json::to_vec(cold_run.findings()).unwrap(),
+                serde_json::to_vec(warm_run.findings()).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_vec(cold_run.diagnostics()).unwrap(),
+                serde_json::to_vec(warm_run.diagnostics()).unwrap()
+            );
+        }
+        let larger_cap = PolicyBatchBudget::builder()
+            .with_per_policy(
+                PolicyBudget::builder()
+                    .with_max_findings(crate::budget::SCALED_FINDINGS_PER_FILE + 2)
+                    .unwrap()
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        let changed_cap = evaluate_policy_files_with_limits(
+            workspace.path(),
+            &paths,
+            &options,
+            larger_cap,
+            PolicyRegistryLimits::default(),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+        )
+        .expect("changed cap evaluates");
+        assert_eq!(
+            changed_cap.report().incremental().unwrap().base(),
+            IncrementalBaseState::Evaluated,
+            "the retained capped answer is admitted only under its recorded grant"
         );
 
         // Changing authored policy bytes invalidates its own cached child.
@@ -11552,12 +13124,12 @@ pub fn run() {
 
     #[test]
     #[hardwon("#2586: stale diff child preserves finding-limit parity across batches")]
-    fn stale_diff_child_keeps_batch_finding_limit_parity() {
+    fn stale_diff_child_keeps_policy_finding_limit_parity() {
         let workspace = tempfile::tempdir().expect("workspace");
         init_git_workspace(workspace.path());
         fs::write(
             workspace.path().join("app.ts"),
-            "export function target() {}\n",
+            "export function target() {}\n".repeat(4),
         )
         .expect("source fixture");
         write_policy(
@@ -11580,7 +13152,13 @@ pub fn run() {
         )
         .with_diff_base("HEAD".to_string());
         let budget = PolicyBatchBudget::builder()
-            .with_max_total_findings(1)
+            .with_per_policy(
+                PolicyBudget::builder()
+                    .with_max_findings(2)
+                    .unwrap()
+                    .build()
+                    .unwrap(),
+            )
             .unwrap()
             .build()
             .unwrap();
@@ -11611,12 +13189,12 @@ pub fn run() {
                 .expect("diff review")
                 .unqualified_policies()
                 .len(),
-            1
+            2
         );
 
         // A source change makes one child stale. Recomputing just that child
-        // with a fresh batch quota would manufacture a second complete
-        // finding; the full base rerun preserves the original truncation.
+        // without the per-policy cap would manufacture complete
+        // findings; the full base rerun preserves the original truncation.
         write_policy(
             workspace.path(),
             "policies/second.rqlp",
@@ -11637,7 +13215,7 @@ pub fn run() {
                 .diff()
                 .expect("changed diff")
                 .persisting_count(),
-            1
+            0
         );
         assert_eq!(
             changed
@@ -11646,7 +13224,7 @@ pub fn run() {
                 .expect("changed diff")
                 .unqualified_policies()
                 .len(),
-            1
+            2
         );
         let changed_warm = evaluate();
         assert_eq!(
@@ -11688,6 +13266,41 @@ pub fn run() {
             .expect("profile host policy requests");
             let stderr = String::from_utf8(output.stderr).expect("UTF-8 profile");
             assert!(output.status.success(), "{stderr}");
+            for request in [
+                "external_edit",
+                "pack_install",
+                "python_cold",
+                "python_warm",
+            ] {
+                let trace = stderr
+                    .split_once(&format!("HOST_CONFIG_BEGIN {request}\n"))
+                    .expect("activation request begins")
+                    .1
+                    .split_once(&format!("HOST_CONFIG_END {request}\n"))
+                    .expect("activation request ends")
+                    .0;
+                assert!(
+                    trace.contains("semantic_pack.discover[npm]"),
+                    "{request}: {trace}"
+                );
+                assert!(
+                    trace.contains("semantic_pack.publish_overlay"),
+                    "{request}: {trace}"
+                );
+            }
+            #[cfg(unix)]
+            {
+                let trace = stderr
+                    .split_once("HOST_CONFIG_BEGIN catalog_replaced\n")
+                    .unwrap()
+                    .1
+                    .split_once("HOST_CONFIG_END catalog_replaced\n")
+                    .unwrap()
+                    .0;
+                assert!(trace.contains("semantic_pack.open_catalog"), "{trace}");
+                assert!(trace.contains("semantic_pack.discover[npm]"), "{trace}");
+                assert!(trace.contains("semantic_pack.publish_overlay"), "{trace}");
+            }
             for request in ["cold", "warm"] {
                 let trace = stderr
                     .split_once(&format!("HOST_CONFIG_BEGIN {request}\n"))
@@ -11712,6 +13325,10 @@ pub fn run() {
                     !trace.contains("WorkspaceBuildSnapshot::resolve_identities"),
                     "{trace}"
                 );
+                if request == "warm" {
+                    assert!(!trace.contains("semantic_pack.discover"), "{trace}");
+                    assert!(!trace.contains("semantic_pack.publish_overlay"), "{trace}");
+                }
                 assert!(!trace.contains("gitblob::dirty_worktree_paths"), "{trace}");
             }
             return;
@@ -11761,8 +13378,121 @@ pub fn run() {
             outcome
         };
         let cold = evaluate_host("cold", &host);
+        let published = host
+            .analyzer()
+            .active_semantic_model_snapshot()
+            .expect("cold publication");
         let warm = evaluate_host("warm", &host);
+        assert!(Arc::ptr_eq(
+            &published,
+            &host.analyzer().active_semantic_model_snapshot().unwrap()
+        ));
         assert_eq!(canonical_report_bytes(&cold), canonical_report_bytes(&warm));
+
+        // The unchanged warm case above keeps the original fixture. Now create
+        // an externally observed lockfile, activate it, then edit its bytes.
+        fs::write(
+            workspace.path().join("package-lock.json"),
+            r#"{"lockfileVersion":3,"packages":{}}"#,
+        )
+        .expect("seed external npm lockfile");
+        evaluate_host("external_seed", &host);
+        let seeded = host.analyzer().active_semantic_model_snapshot().unwrap();
+        assert!(!Arc::ptr_eq(&published, &seeded));
+
+        // This is the same host generation and configuration. Npm also reads
+        // the lockfile directly as an external input, so changing only its
+        // bytes must invalidate reuse even though the selected source is fixed.
+        fs::write(
+            workspace.path().join("package-lock.json"),
+            r#"{"name":"changed","lockfileVersion":3,"packages":{}}"#,
+        )
+        .expect("edit externally observed lockfile");
+        evaluate_host("external_edit", &host);
+        let after_edit = host.analyzer().active_semantic_model_snapshot().unwrap();
+        assert!(!Arc::ptr_eq(&seeded, &after_edit));
+
+        // A second connection's install changes data_version on the catalog
+        // retained by the host. It must invalidate activation without rebuilding
+        // the host analyzer or changing its configuration.
+        use brokk_bifrost_analysis::analyzer::semantic_model::{
+            CatalogOptions, DurablePackSource, DurablePackSourceKind,
+            open_default_semantic_pack_catalog,
+        };
+        let (_, pack) = brokk_bifrost_analysis::analyzer::semantic_model::catalog::go_extraction_support_22::install_fixture();
+        let catalog =
+            open_default_semantic_pack_catalog(workspace.path(), CatalogOptions::default())
+                .expect("second connection to host registry");
+        catalog
+            .install(
+                &pack,
+                &DurablePackSource {
+                    kind: DurablePackSourceKind::Installed,
+                    source_id: "11890-test-only-registry-change".to_owned(),
+                },
+            )
+            .expect("install test pack between requests");
+        evaluate_host("pack_install", &host);
+        let after_install = host.analyzer().active_semantic_model_snapshot().unwrap();
+        assert!(!Arc::ptr_eq(&after_edit, &after_install));
+
+        #[cfg(unix)]
+        {
+            // Unix permits unlinking an open database. The live connection's
+            // data_version cannot observe a replacement at the same pathname.
+            let registry = catalog.root().to_path_buf();
+            drop(catalog);
+            fs::remove_dir_all(&registry).expect("clear the catalog while host is alive");
+            let replacement =
+                open_default_semantic_pack_catalog(workspace.path(), CatalogOptions::default())
+                    .expect("replacement catalog at the same configured path");
+            replacement
+                .install(
+                    &pack,
+                    &DurablePackSource {
+                        kind: DurablePackSourceKind::Installed,
+                        source_id: "11890-test-only-replacement".to_owned(),
+                    },
+                )
+                .expect("install into replacement database");
+            evaluate_host("catalog_replaced", &host);
+            assert!(!Arc::ptr_eq(
+                &after_install,
+                &host.analyzer().active_semantic_model_snapshot().unwrap()
+            ));
+        }
+
+        // Provider verification reads are separate from discovery capture.
+        // Even a successfully published runtime binding must run on each call.
+        let python = brokk_bifrost_analysis::analyzer::packs_document::parse_workspace_packs_config(
+            r#"{"schema_version":1,"ecosystems":["npm"],"python_runtime_environments":[{"source_root":".","artifacts":[]}]}"#,
+        ).expect("Python runtime binding config");
+        fs::write(workspace.path().join("runtime.py"), "value = 1\n").expect("Python source");
+        let python_host = WorkspaceAnalyzer::build_persisted(
+            Arc::new(FilesystemProject::new(workspace.path()).expect("Python host project")),
+            AnalyzerConfig::default(),
+        )
+        .expect("Python runtime host");
+        let mut previous = after_install;
+        for request in ["python_cold", "python_warm"] {
+            eprintln!("HOST_CONFIG_BEGIN {request}");
+            let activation = activate_owned_policy_workspace(
+                workspace.path(),
+                &python_host,
+                Some(&python),
+                &CancellationToken::default(),
+            )
+            .expect("configured runtime activation")
+            .expect("activation outcome");
+            eprintln!("HOST_CONFIG_END {request}");
+            assert!(activation.outcome.complete(), "{:?}", activation.outcome);
+            let current = python_host
+                .analyzer()
+                .active_semantic_model_snapshot()
+                .unwrap();
+            assert!(!Arc::ptr_eq(&previous, &current));
+            previous = current;
+        }
 
         // The whole host-supplied diff path still runs and joins.
         let gating_date = PolicyEvaluationDate::from_ymd(2026, 7, 27).expect("fixed test date");
@@ -11806,6 +13536,538 @@ pub fn run() {
         .expect("base analyzer workspace");
         assert_eq!(base_config, AnalyzerConfig::default());
         assert_eq!(base.workspace().config(), host.config());
+    }
+
+    #[test]
+    #[hardwon("#11902: missing dependency membership suppressed independent configured models")]
+    fn host_policy_missing_membership_preserves_explicit_models() {
+        use brokk_bifrost_analysis::analyzer::Project;
+        use brokk_bifrost_analysis::analyzer::workspace::{
+            DependencyPackEcosystem, DependencyPackWorkspaceContext,
+        };
+        struct FailedCapture(PathBuf);
+        impl Project for FailedCapture {
+            fn root(&self) -> &Path {
+                &self.0
+            }
+            fn analyzer_languages(&self) -> BTreeSet<Language> {
+                BTreeSet::from([Language::Java])
+            }
+            fn all_files(&self) -> std::io::Result<BTreeSet<ProjectFile>> {
+                Err(std::io::Error::other("initial listing failed"))
+            }
+            fn analyzable_files(&self, _: Language) -> std::io::Result<BTreeSet<ProjectFile>> {
+                Err(std::io::Error::other("initial listing failed"))
+            }
+            fn file_by_rel_path(&self, _: &Path) -> Option<ProjectFile> {
+                None
+            }
+            fn ignore_rules_digest(&self) -> std::io::Result<[u8; 32]> {
+                Ok([0; 32])
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("App.java"), "class App {}\n").unwrap();
+        let config = AnalyzerConfig::default();
+        let host = WorkspaceAnalyzer::build_persisted(
+            Arc::new(FailedCapture(temp.path().to_path_buf())),
+            config.clone(),
+        )
+        .unwrap();
+        assert!(host.analyzer().generation_membership().listing().is_err());
+        let pack = compile_source(
+            SourceFormat::Json,
+            REVIEW_SUMMARY_MODEL.as_bytes(),
+            &CompilerOptions::default(),
+        )
+        .unwrap();
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        catalog
+            .register_session_pack(
+                &pack,
+                &SessionPackSource {
+                    kind: SessionPackSourceKind::Embedded,
+                    source_id: "test:missing-membership-independent-model".into(),
+                },
+            )
+            .unwrap();
+        let request = SemanticModelActivationRequest {
+            bifrost_version: env!("CARGO_PKG_VERSION").parse().unwrap(),
+            approximate_standard_libraries: Vec::new(),
+            evidence: vec![SemanticModelActivationEvidence {
+                language: "go".into(),
+                ecosystem: "go".into(),
+                package: None,
+                module: None,
+                toolchain: None,
+                target: None,
+                configuration: None,
+                artifact_sha256: None,
+            }],
+            controls: Vec::new(),
+            limits: Default::default(),
+        };
+        let cancellation = CancellationToken::new();
+        let context = || DependencyPackWorkspaceContext {
+            catalog: &catalog,
+            persistence: None,
+            activation: &request,
+            limits: Default::default(),
+            cancellation: &cancellation,
+        };
+        let full =
+            host.activate_dependency_packs(&config, &[DependencyPackEcosystem::Npm], context());
+        let installed = host.activate_installed_dependency_packs(
+            &config,
+            &[DependencyPackEcosystem::Npm],
+            context(),
+        );
+        for outcome in [full, installed.outcome] {
+            assert!(!outcome.complete());
+            assert_eq!(outcome.ecosystems[0].discovery.incomplete_reason, Some(brokk_bifrost_analysis::analyzer::semantic_model::DependencyDiscoveryIncompleteReason::GenerationListingUnavailable));
+            let Some(SemanticModelRuntimeOutcome::Ready { active, .. }) = outcome.runtime else {
+                panic!("explicit model evidence must still activate");
+            };
+            assert!(!active.shards().is_empty());
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#11902: discovery replaced build membership for scoped, ignored, overlay and non-Git projects"
+    )]
+    #[hardwon(
+        "#12471: the overlay case keyed its buffer by a temp-dir alias of the canonical root and lost it"
+    )]
+    fn host_discovery_membership_matches_generation_views() {
+        use brokk_bifrost_core::analyzer::project::{
+            FileSetProject, MultiRootProject, OverlayProject, Project,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let populate = |path: &Path| {
+            fs::create_dir_all(path).unwrap();
+            fs::write(path.join("app.ts"), "export const present = 1;\n").unwrap();
+            fs::write(
+                path.join("package.json"),
+                "{\"name\":\"fixture\",\"version\":\"1.0.0\"}",
+            )
+            .unwrap();
+        };
+        let mut cases: Vec<(&str, Arc<dyn Project>)> = Vec::new();
+        let empty = root.join("empty");
+        fs::create_dir_all(&empty).unwrap();
+        cases.push(("empty", Arc::new(FilesystemProject::new(&empty).unwrap())));
+        let plain = root.join("non-git");
+        populate(&plain);
+        cases.push(("non-git", Arc::new(FilesystemProject::new(&plain).unwrap())));
+        let subset = root.join("subset");
+        populate(&subset);
+        cases.push((
+            "subset",
+            Arc::new(FileSetProject::new(&subset, [PathBuf::from("app.ts")])),
+        ));
+        let overlay_root = root.join("overlay");
+        fs::create_dir_all(&overlay_root).unwrap();
+        fs::write(overlay_root.join("app.ts"), "export const present = 1;\n").unwrap();
+        let overlay = Arc::new(OverlayProject::new(Arc::new(
+            FilesystemProject::new(&overlay_root).unwrap(),
+        )));
+        // Key the buffer by the project's own root, as every production caller
+        // does. `FilesystemProject` canonicalizes its root, and the temporary
+        // directory may be spelled through an alias that canonicalizing
+        // removes: a Windows 8.3 short name (`ADMINI~1`) or the macOS `/var`
+        // symlink. A key spelled through the alias lies under no root.
+        assert!(overlay.set(
+            overlay.root().join("package.json"),
+            "{\"name\":\"buffer-only\"}".into()
+        ));
+        cases.push(("overlay-only-manifest", overlay));
+        let git = root.join("git");
+        populate(&git);
+        populate(&git.join("selected"));
+        populate(&git.join("outside"));
+        populate(&git.join("ignored"));
+        fs::write(git.join(".gitignore"), "ignored/\n").unwrap();
+        init_git_workspace(&git);
+        commit_everything(&git, "matrix");
+        cases.push((
+            "ignored-subtree",
+            Arc::new(FilesystemProject::new(&git).unwrap()),
+        ));
+        cases.push((
+            "ignored-explicit-root",
+            Arc::new(FilesystemProject::new(git.join("ignored")).unwrap()),
+        ));
+        cases.push((
+            "scoped",
+            Arc::new(FilesystemProject::new(git.join("selected")).unwrap()),
+        ));
+        cases.push((
+            "multi-root",
+            Arc::new(
+                MultiRootProject::with_cache_root(
+                    [git.join("selected"), git.join("outside")],
+                    root.join("multi-cache"),
+                )
+                .unwrap(),
+            ),
+        ));
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let non_utf = root.join("non-utf8");
+            populate(&non_utf);
+            match fs::write(
+                non_utf.join(std::ffi::OsString::from_vec(b"bad-\xff.ts".to_vec())),
+                "export const bad = 1;\n",
+            ) {
+                Ok(()) => cases.push((
+                    "non-utf8",
+                    Arc::new(FilesystemProject::new(&non_utf).unwrap()),
+                )),
+                // APFS refuses non-UTF-8 names with EILSEQ (#10379); the
+                // remaining Unix cases still run on such filesystems.
+                Err(error) if error.raw_os_error() == Some(libc::EILSEQ) => {}
+                Err(error) => panic!("non-utf8: {error:?}"),
+            }
+            // On Unix these bytes are a relative component, not a Windows root.
+            let component = PathBuf::from(r"\\?\opaque-component");
+            assert!(!component.is_absolute());
+            let spelling = root.join(component);
+            populate(&spelling);
+            cases.push((
+                "opaque-path-spelling",
+                Arc::new(FilesystemProject::new(&spelling).unwrap()),
+            ));
+        }
+        #[cfg(windows)]
+        {
+            let windows = root.join("windows");
+            populate(&windows);
+            init_git_workspace(&windows);
+            commit_everything(&windows, "verbatim workdir");
+            let verbatim = windows.canonicalize().unwrap();
+            assert!(verbatim.to_string_lossy().starts_with(r"\\?\"));
+            cases.push((
+                "windows-verbatim-workdir",
+                Arc::new(FilesystemProject::new(verbatim).unwrap()),
+            ));
+        }
+        let module_source = root.join("module-source");
+        populate(&module_source);
+        init_git_workspace(&module_source);
+        commit_everything(&module_source, "module source");
+        let super_root = root.join("super");
+        populate(&super_root);
+        init_git_workspace(&super_root);
+        commit_everything(&super_root, "super source");
+        let added = std::process::Command::new("git")
+            .current_dir(&super_root)
+            .args(["-c", "protocol.file.allow=always", "submodule", "add"])
+            .arg(&module_source)
+            .arg("module")
+            .output()
+            .unwrap();
+        assert!(added.status.success(), "{added:?}");
+        commit_everything(&super_root, "materialized submodule");
+        cases.push((
+            "submodule",
+            Arc::new(FilesystemProject::new(&super_root).unwrap()),
+        ));
+        for (label, project) in cases {
+            let host = if label == "subset" {
+                WorkspaceAnalyzer::build_scoped_persisted(
+                    Arc::clone(&project),
+                    AnalyzerConfig::default(),
+                )
+            } else {
+                WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default())
+            }
+            .unwrap();
+            let listing = host.analyzer().generation_membership().listing().unwrap();
+            let package = ProjectFile::new(project.root(), "package.json");
+            if label == "subset" {
+                assert!(!listing.0.contains(&package), "{label}");
+            } else if label != "multi-root" && label != "empty" {
+                assert!(listing.0.contains(&package), "{label}: {listing:?}");
+            }
+            if label == "multi-root" {
+                assert_eq!(
+                    listing
+                        .0
+                        .iter()
+                        .filter(|file| file
+                            .rel_path()
+                            .file_name()
+                            .is_some_and(|name| name == "package.json"))
+                        .count(),
+                    2
+                );
+            }
+            if label == "ignored-subtree" {
+                assert!(
+                    !listing
+                        .0
+                        .iter()
+                        .any(|file| file.rel_path().starts_with("ignored"))
+                );
+            }
+            if label == "scoped" {
+                assert!(
+                    !listing
+                        .0
+                        .iter()
+                        .any(|file| file.rel_path().starts_with("outside"))
+                );
+            }
+            if label == "non-utf8" {
+                assert!(!listing.1.is_empty(), "{label}: missing omission evidence");
+            }
+            if label == "submodule" {
+                assert!(
+                    listing
+                        .0
+                        .contains(&ProjectFile::new(project.root(), "module/package.json"))
+                );
+            }
+            fs::write(
+                project
+                    .root()
+                    .join(format!("{label}-after-generation.json")),
+                "{}",
+            )
+            .unwrap();
+            project.invalidate_cached_file_listing();
+            let discovery = host.dependency_discovery_project().unwrap();
+            let observed = discovery.all_files_with_omissions().unwrap();
+            assert_eq!(observed.0, listing.0, "{label}");
+            assert!(Arc::ptr_eq(&observed.0, &listing.0), "{label}");
+            assert!(Arc::ptr_eq(&observed.1, &listing.1), "{label}");
+            let cached = discovery.cached_listing_if_available().unwrap().unwrap();
+            assert!(Arc::ptr_eq(&cached.0, &listing.0), "{label}");
+            assert!(Arc::ptr_eq(&cached.1, &listing.1), "{label}");
+            let result = host.resolve_dependency_discovery(
+                brokk_bifrost_analysis::analyzer::workspace::DependencyPackEcosystem::Npm,
+                &AnalyzerConfig::default(),
+                &Default::default(),
+                &CancellationToken::new(),
+            );
+            assert!(result.incomplete_reason.is_none(), "{label}: {result:?}");
+            if label == "empty" {
+                assert!(result.complete, "{result:?}");
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon("#11902: unavailable generation membership silently scanned during activation")]
+    fn host_discovery_missing_generation_listing_never_scans() {
+        const CHILD: &str = "BIFROST_MISSING_LISTING_PROFILE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "coordinator::tests::host_discovery_missing_generation_listing_never_scans",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("BIFROST_TIMING", "1")
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(output.status.success(), "{stderr}");
+            let trace = stderr
+                .split_once("MISSING_LISTING_BEGIN\n")
+                .unwrap()
+                .1
+                .split_once("MISSING_LISTING_END\n")
+                .unwrap()
+                .0;
+            assert!(!trace.contains("dirty_worktree_paths"), "{trace}");
+            return;
+        }
+        use brokk_bifrost_analysis::analyzer::semantic_model::{
+            CatalogOptions, DependencyDiscoveryIncompleteReason, SemanticModelActivationRequest,
+            SemanticPackCatalog,
+        };
+        use brokk_bifrost_analysis::analyzer::workspace::{
+            DependencyPackEcosystem, DependencyPackWorkspaceContext, EmptyAnalyzer,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        init_git_workspace(temp.path());
+        fs::write(temp.path().join("app.ts"), "export const present = 1;\n").unwrap();
+        fs::write(temp.path().join("package.json"), "{\"name\":\"present\"}").unwrap();
+        commit_everything(temp.path(), "files exist without an analyzer build");
+        let host = WorkspaceAnalyzer::Empty(EmptyAnalyzer::new(Arc::new(
+            FilesystemProject::new(temp.path()).unwrap(),
+        )));
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let request = SemanticModelActivationRequest {
+            bifrost_version: "0.0.0".parse().unwrap(),
+            approximate_standard_libraries: Vec::new(),
+            evidence: Vec::new(),
+            controls: Vec::new(),
+            limits: Default::default(),
+        };
+        let cancellation = CancellationToken::new();
+        let config = AnalyzerConfig::default();
+        eprintln!("MISSING_LISTING_BEGIN");
+        for ecosystem in DependencyPackEcosystem::ALL {
+            let discovery = host.resolve_dependency_discovery(
+                ecosystem,
+                &config,
+                &Default::default(),
+                &cancellation,
+            );
+            assert!(!discovery.complete);
+            assert_eq!(
+                discovery.incomplete_reason,
+                Some(DependencyDiscoveryIncompleteReason::GenerationListingUnavailable)
+            );
+        }
+        let context = || DependencyPackWorkspaceContext {
+            catalog: &catalog,
+            persistence: None,
+            activation: &request,
+            limits: Default::default(),
+            cancellation: &cancellation,
+        };
+        let full =
+            host.activate_dependency_packs(&config, &DependencyPackEcosystem::ALL, context());
+        let installed = host.activate_installed_dependency_packs(
+            &config,
+            &DependencyPackEcosystem::ALL,
+            context(),
+        );
+        for activation in [full, installed.outcome] {
+            assert!(!activation.complete());
+            assert_eq!(
+                activation.ecosystems.len(),
+                DependencyPackEcosystem::ALL.len()
+            );
+            for ecosystem in activation.ecosystems {
+                assert!(!ecosystem.discovery.complete);
+                assert_eq!(
+                    ecosystem.discovery.incomplete_reason,
+                    Some(DependencyDiscoveryIncompleteReason::GenerationListingUnavailable)
+                );
+            }
+        }
+        eprintln!("MISSING_LISTING_END");
+    }
+
+    #[test]
+    #[hardwon("#11902: dependency discovery admitted metadata created after the host generation")]
+    fn host_policy_discovery_keeps_generation_membership_after_worktree_additions() {
+        use brokk_bifrost_analysis::analyzer::read_ledger::{FactSubject, LookupQuestion, ReadKey};
+        let cases = [
+            (
+                Language::TypeScript,
+                None,
+                vec![
+                    ("late/package.json", r#"{"name":"late","version":"1.0.0"}"#),
+                    (
+                        "late/package-lock.json",
+                        r#"{"lockfileVersion":3,"packages":{}}"#,
+                    ),
+                ],
+            ),
+            (
+                Language::Java,
+                Some(("App.java", "class App {}\n")),
+                vec![(
+                    "late/pom.xml",
+                    "<project><modelVersion>4.0.0</modelVersion><groupId>test</groupId><artifactId>late</artifactId><version>1.0</version></project>",
+                )],
+            ),
+        ];
+        for (language, extra_source, metadata) in cases {
+            let workspace = tempfile::tempdir().unwrap();
+            init_git_workspace(workspace.path());
+            fs::write(
+                workspace.path().join("app.ts"),
+                "export function target() {}\n",
+            )
+            .unwrap();
+            if let Some((path, source)) = extra_source {
+                fs::write(workspace.path().join(path), source).unwrap();
+            }
+            write_policy(
+                workspace.path(),
+                "policies/membership.rqlp",
+                &match_policy("test.membership", "Membership"),
+            );
+            commit_everything(workspace.path(), "generation");
+            let build = || {
+                WorkspaceAnalyzer::build_persisted(
+                    Arc::new(FilesystemProject::new(workspace.path()).unwrap()),
+                    AnalyzerConfig::default(),
+                )
+                .unwrap()
+            };
+            let host = build();
+            // This generation has never activated: F2's warm-outcome reuse
+            // cannot hide a live listing in its first policy request.
+            assert!(host.analyzer().active_semantic_model_snapshot().is_none());
+            fs::create_dir(workspace.path().join("late")).unwrap();
+            for (path, source) in &metadata {
+                fs::write(workspace.path().join(path), source).unwrap();
+            }
+            let inputs = [PolicyEvaluationInput::workspace_file(
+                "policies/membership.rqlp",
+            )];
+            let options = evaluation_options();
+            let evaluate = |host: &WorkspaceAnalyzer| {
+                let outcome = evaluate_policy_inputs_for_host_session(
+                    workspace.path(),
+                    &inputs,
+                    host,
+                    &options,
+                    None,
+                    &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+                )
+                .unwrap();
+                assert_eq!(
+                    outcome.report().runs()[0].completion(),
+                    &PolicyRunCompletion::Complete
+                );
+                assert_eq!(outcome.report().runs()[0].findings().len(), 1);
+                let evidence = host
+                    .analyzer()
+                    .dependency_discovery_evidence(language)
+                    .expect("host request publishes this ecosystem's discovery evidence");
+                evidence
+                    .project_read_keys
+                    .iter()
+                    .filter_map(|key| match key {
+                        ReadKey::File { rel_path, .. } | ReadKey::PathAbsent { rel_path, .. } => {
+                            Some(rel_path.to_string())
+                        }
+                        ReadKey::Lookup {
+                            question:
+                                LookupQuestion::WorkspaceFact {
+                                    subject: FactSubject::File { rel_path },
+                                    ..
+                                },
+                            ..
+                        } => Some(rel_path.to_string()),
+                        _ => None,
+                    })
+                    .collect::<std::collections::BTreeSet<_>>()
+            };
+            let old_reads = evaluate(&host);
+            for (path, _) in &metadata {
+                assert!(!old_reads.contains(*path), "{language:?}: {old_reads:?}");
+            }
+            // A new generation sees the same on-disk additions. This positive
+            // control proves that discovery really reads these metadata files.
+            let next = build();
+            let new_reads = evaluate(&next);
+            for (path, _) in &metadata {
+                assert!(new_reads.contains(*path), "{language:?}: {new_reads:?}");
+            }
+        }
     }
 
     #[test]
@@ -12352,6 +14614,10 @@ pub fn run() {
                 diagnostic.related().len() == MAX_DUPLICATE_RELATED_DIAGNOSTICS
             })
         );
+        assert!(forward.report().diagnostics().iter().all(|diagnostic| {
+            diagnostic.omitted_related_locations_lower_bound()
+                == crate::RelatedLocationOmissions::Known(253)
+        }));
         let named_sources = forward
             .report()
             .diagnostics()
@@ -12558,7 +14824,7 @@ mod pack_catalog_tests {
             TaintCatalogRegistry::new_without_workspace(CatalogRegistryLimits::default());
         let hash = fixture
             .register(TaintCatalogDefinition {
-                schema_version: 1,
+                schema_version: crate::definition::POLICY_DOCUMENT_SCHEMA_VERSION,
                 name: PolicyId::new("test.sinks").unwrap(),
                 version: 1,
                 categories: vec![
@@ -12786,17 +15052,26 @@ mod pack_catalog_tests {
         unsafe {
             std::env::remove_var(crate::builtin::POLICY_BUNDLE_ROOT_ENV);
         }
-        // A new run rereads the installation rather than retaining catalog content.
+        // A new run rereads the installation rather than retaining catalog
+        // content. The loaded catalog still lists the pack, so a run whose
+        // catalog documents vanished fails instead of running without them.
         fs::remove_dir_all(&pack).unwrap();
-        unsafe {
-            std::env::remove_var(crate::builtin::POLICY_PACK_ROOT_ENV);
-        }
-        let empty = serde_json::to_value(evaluate(POLICY).report()).unwrap();
+        let failure = evaluate_policy_inputs(
+            project.root(),
+            &[PolicyEvaluationInput::embedded(
+                PolicySourceIdentity::new("removed.rqlp"),
+                POLICY,
+            )],
+            &options,
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+        )
+        .err()
+        .expect("a removed installation must fail catalog registration");
         assert!(
-            empty
+            failure
                 .to_string()
-                .contains("resolved Sink endpoint set must not be empty"),
-            "{empty:#}"
+                .contains("failed to register pack catalogs"),
+            "{failure}"
         );
     }
     #[test]

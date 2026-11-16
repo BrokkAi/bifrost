@@ -496,6 +496,7 @@ impl AnalyzerStore {
                             &cancellation,
                         )?;
                     }
+                    super::surface_relations::ensure_surface_set_tx(&tx, blob_id)?;
                     root_content_tx(&tx, &owner, blob_id)?;
                     // The writer-2 contract: the blob's source facts were just
                     // published, so a projection that waited for them is
@@ -739,6 +740,9 @@ pub fn prepare_resolution_capsule(
     ) {
         super::resolution_prepare::ResolutionInteriorPreparation::Prepared(bundle) => *bundle,
         super::resolution_prepare::ResolutionInteriorPreparation::Cancelled => return Ok(None),
+        super::resolution_prepare::ResolutionInteriorPreparation::Rejected(error) => {
+            return Err(error);
+        }
     };
     assert_eq!(key.producer_epoch, bundle.producer_epoch());
     assert_eq!(bundle.semantic_language(), super::Language::Rust);
@@ -903,6 +907,9 @@ pub fn verify_capsule_artifact(
             super::resolution_prepare::ResolutionInteriorPreparation::Prepared(bundle) => bundle,
             super::resolution_prepare::ResolutionInteriorPreparation::Cancelled => {
                 return Ok(Cancelled);
+            }
+            super::resolution_prepare::ResolutionInteriorPreparation::Rejected(error) => {
+                return Err(error);
             }
         };
         if bundle.producer_epoch() != key.producer_epoch

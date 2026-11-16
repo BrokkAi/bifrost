@@ -1,0 +1,20 @@
+# The java semantic adapter lever (#11570).
+#
+# Add one `<issue>-<slug>` line when a change alters the value semantics the
+# java lowerer publishes for unchanged source: its identity is hashed into
+# every semantic artifact key, every public id derived from the adapter
+# fingerprint, the lowered-IR producer epoch and the policy lowering identity.
+# No other language's identity moves. Git merges this file with merge=union, so
+# two branches that each add a line keep both. Never edit or remove a line;
+# compaction replaces a prefix with a checkpoint line and keeps the identity.
+# See .agents/docs/cache-identity-levers.md.
+#
+# Replaced the numbered literal `java-value-semantics-v49`.
+11570-slice2a-token-files
+12120-java-annotated-types
+10319-java-constructor-chaining-calls
+7746-java-instanceof-pattern-binders
+9891-implicit-access-call-control
+12939-java-store-fault-exits
+11165-java-implicit-close-occurrences
+7632-header-scoped-bindings

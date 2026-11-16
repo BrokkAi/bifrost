@@ -54,30 +54,20 @@ use brokk_bifrost_js_ts::syntax::{
 };
 use brokk_bifrost_js_ts::ts_owners::ts_unwrap_expression;
 
-// Bumping this rotates every public wire id hashed from the adapter
-// fingerprint (`SemanticArtifactKey::push_environment_identity`). A checked-in
-// golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
-// change; the code-query tutorial pages elide such ids (#5016).
-// The lowerer reaches the changed import-binder and structural-index code.
-// #8306: await binds its operand and result values in the shared scaffold.
-// #7960: a call's thrown value binds the catch parameter that handles it.
-// #8025: namespace import reads are static loads rooted at the import binder.
-// #8836: revert #7960; calls no longer bind the catch parameter. v37 is held by #8827.
-// #7960: re-land; a call's thrown value binds the catch parameter again.
-// #9447: structured formal roles and refusal change semantic payloads.
-const JAVASCRIPT_ADAPTER_VERSION: &[u8] = b"javascript-value-semantics-v40";
-// Bumping this rotates every public wire id hashed from the adapter
-// fingerprint (`SemanticArtifactKey::push_environment_identity`). A checked-in
-// golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
-// change; the code-query tutorial pages elide such ids (#5016).
-// The lowerer reaches the changed import-binder and structural-index code.
-// #8306: await binds its operand and result values in the shared scaffold.
-// #7960: a call's thrown value binds the catch parameter that handles it.
-// #8025: namespace import reads are static loads rooted at the import binder.
-// #8836: revert #7960; calls no longer bind the catch parameter. v42 is held by #8827.
-// #7960: re-land; a call's thrown value binds the catch parameter again.
-// #9447: structured formal roles and refusal change semantic payloads.
-const TYPESCRIPT_ADAPTER_VERSION: &[u8] = b"typescript-value-semantics-v45";
+/// The javascript adapter lever (#11570): `levers/javascript-adapter.tokens`. Add a line there
+/// when a change alters the semantics this lowerer publishes for unchanged
+/// source; see `.agents/docs/cache-identity-levers.md`.
+fn javascript_adapter_version() -> &'static [u8] {
+    brokk_bifrost_core::lever_label!("javascript-value-semantics", "javascript-adapter.tokens")
+        .as_bytes()
+}
+/// The typescript adapter lever (#11570): `levers/typescript-adapter.tokens`. Add a line there
+/// when a change alters the semantics this lowerer publishes for unchanged
+/// source; see `.agents/docs/cache-identity-levers.md`.
+fn typescript_adapter_version() -> &'static [u8] {
+    brokk_bifrost_core::lever_label!("typescript-value-semantics", "typescript-adapter.tokens")
+        .as_bytes()
+}
 
 #[derive(Debug, Clone, Copy)]
 enum JsTsSemanticFlavor {
@@ -100,10 +90,10 @@ impl JsTsSemanticFlavor {
         }
     }
 
-    const fn adapter_version(self) -> &'static [u8] {
+    fn adapter_version(self) -> &'static [u8] {
         match self {
-            Self::JavaScript => JAVASCRIPT_ADAPTER_VERSION,
-            Self::TypeScript => TYPESCRIPT_ADAPTER_VERSION,
+            Self::JavaScript => javascript_adapter_version(),
+            Self::TypeScript => typescript_adapter_version(),
         }
     }
 

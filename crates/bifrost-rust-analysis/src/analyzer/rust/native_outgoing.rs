@@ -1,6 +1,14 @@
 //! Rust outgoing calls from one bounded selected native forward operation.
 
+use brokk_bifrost_analysis::analyzer::usages::call_relations::{
+    CallRelationCanonicalTarget, CallRelationCompletion, CallRelationReceiverDisposition,
+    call_relation_completion_semantics, call_relation_diagnostic_semantics,
+};
+
 use crate::analyzer::rust::RustAnalyzer;
+use brokk_bifrost_analysis::analyzer::usages::call_relations::{
+    CallRelationDiagnosticPayload, CallRelationFailure, LocatedCallRelationDiagnostic,
+};
 
 use brokk_bifrost_core::cancellation::CancellationToken;
 
@@ -18,8 +26,6 @@ use brokk_bifrost_analysis::analyzer::store::Result;
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionContextMetrics;
 
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionLocated;
-
-use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperationInput;
 
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperationOpenOutcome;
 
@@ -39,11 +45,15 @@ use brokk_bifrost_core::analyzer::structural::kinds::NormalizedKind;
 
 use brokk_bifrost_core::analyzer::usages::model::UsageProof;
 
-use brokk_bifrost_analysis::analyzer::usages::call_relations::CallArgument;
+use brokk_bifrost_analysis::analyzer::usages::call_relations::{
+    CallArgument, CallRelationBudgetRefusal,
+};
 
 use brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationDiagnostic;
 
-use brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationDiagnosticCode;
+use brokk_bifrost_analysis::analyzer::usages::call_relations::{
+    CallRelationDiagnosticCode, CallRelationScanLimit,
+};
 
 use brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationLimits;
 
@@ -73,15 +83,19 @@ use brokk_bifrost_core::analyzer::usages::resolution_session::{
 };
 use brokk_bifrost_core::path_utils::rel_path_string;
 
-fn diagnostic(kind: &str, message: impl Into<String>, caller: &CodeUnit) -> CallRelationDiagnostic {
-    CallRelationDiagnostic::analysis_failed(
-        message.into(),
-        caller.fq_name().to_string(),
-        kind.to_owned(),
-    )
+fn diagnostic(
+    kind: &str,
+    message: impl Into<LocatedCallRelationDiagnostic>,
+    caller: &CodeUnit,
+) -> CallRelationDiagnostic {
+    CallRelationDiagnostic::analysis_failed(message, caller.fq_name().to_string(), kind.to_owned())
 }
 
-fn failed(kind: &str, message: impl Into<String>, caller: &CodeUnit) -> CallRelationResult {
+fn failed(
+    kind: &str,
+    message: impl Into<LocatedCallRelationDiagnostic>,
+    caller: &CodeUnit,
+) -> CallRelationResult {
     CallRelationResult {
         diagnostics: vec![diagnostic(kind, message, caller)],
         ..CallRelationResult::default()
@@ -98,6 +112,16 @@ pub(crate) fn outgoing(
     budget: ReceiverAnalysisBudget,
     cancellation: &CancellationToken,
 ) -> CallRelationResult {
+    outgoing_inner(rust, caller, limits, budget, cancellation).with_diagnostic_limits(limits)
+}
+
+fn outgoing_inner(
+    rust: &RustAnalyzer,
+    caller: &CodeUnit,
+    limits: CallRelationLimits,
+    budget: ReceiverAnalysisBudget,
+    cancellation: &CancellationToken,
+) -> CallRelationResult {
     if cancellation.is_cancelled() {
         return CallRelationResult {
             cancelled: true,
@@ -107,36 +131,66 @@ pub(crate) fn outgoing(
     if !is_call_relation_unit(caller) {
         return failed(
             "native_caller_not_callable",
-            "requested caller is not callable",
+            CallRelationDiagnosticPayload::Failure {
+                reason: CallRelationFailure::Upstream {
+                    kind: "native_caller_not_callable".into(),
+                },
+            },
             caller,
         );
     }
-    if limits.max_files == 0 || limits.max_source_bytes == 0 || limits.max_candidates == 0 {
+    if let Some(refusal) = CallRelationBudgetRefusal::preflight(limits) {
         let mut result = failed(
             "native_call_budget",
-            "outgoing call admission budget is zero",
+            CallRelationDiagnosticPayload::Failure {
+                reason: CallRelationFailure::Upstream {
+                    kind: "native_call_budget".into(),
+                },
+            },
             caller,
         );
         result.truncated = true;
-        result.diagnostics[0].code = CallRelationDiagnosticCode::BudgetExhausted;
+        refusal.record(&mut result.budget_refusals);
+        result.diagnostics[0].code = if limits.max_files == 0 {
+            CallRelationDiagnosticCode::ScanGrantRefused(CallRelationScanLimit::Files)
+        } else if limits.max_source_bytes == 0 {
+            CallRelationDiagnosticCode::ScanGrantRefused(CallRelationScanLimit::SourceBytes)
+        } else {
+            CallRelationDiagnosticCode::BudgetExhausted
+        };
         result.diagnostics[0].reason_kind = None;
         return result;
     }
     let Some(source) = rust.indexed_source(caller.source()) else {
         return failed(
             "native_source_unavailable",
-            "indexed caller source is unavailable",
+            CallRelationDiagnosticPayload::Failure {
+                reason: CallRelationFailure::Upstream {
+                    kind: "native_source_unavailable".into(),
+                },
+            },
             caller,
         );
     };
     if source.len() > limits.max_source_bytes {
         let mut result = failed(
             "native_call_budget",
-            "caller source exceeds the source-byte budget",
+            CallRelationDiagnosticPayload::Failure {
+                reason: CallRelationFailure::Upstream {
+                    kind: "native_call_budget".into(),
+                },
+            },
             caller,
         );
         result.truncated = true;
-        result.diagnostics[0].code = CallRelationDiagnosticCode::BudgetExhausted;
+        CallRelationBudgetRefusal::SourceBytes {
+            consumed: 0,
+            attempted: source.len(),
+            limit: limits.max_source_bytes,
+        }
+        .record(&mut result.budget_refusals);
+        result.diagnostics[0].code =
+            CallRelationDiagnosticCode::ScanGrantRefused(CallRelationScanLimit::SourceBytes);
         result.diagnostics[0].reason_kind = None;
         return result;
     }
@@ -147,7 +201,11 @@ pub(crate) fn outgoing(
     else {
         return failed(
             "native_caller_range_unavailable",
-            "caller has no structured source range",
+            CallRelationDiagnosticPayload::Failure {
+                reason: CallRelationFailure::Upstream {
+                    kind: "native_caller_range_unavailable".into(),
+                },
+            },
             caller,
         );
     };
@@ -180,14 +238,9 @@ pub(crate) fn outgoing(
                 ));
             }
         };
-        let input = SelectedResolutionOperationInput::new(
-            rust.inner.project(),
-            rust.inner.workspace_id(),
-            snapshots.as_ref(),
-            &languages,
-            &masks,
-        )
-        .with_content_mounts(content_mounts);
+        let input = rust
+            .selected_resolution_operation_input(snapshots.as_ref(), &languages, &masks)
+            .with_content_mounts(content_mounts);
         let operation = match rust
             .inner
             .analyzer_store()
@@ -223,6 +276,7 @@ pub(crate) fn outgoing(
             SelectedRustDefinitionSemanticOutcome::Missing => {
                 return Ok(SelectedResolutionOperationOutcome::Unavailable(
                     SelectedResolutionUnavailable::MissingDefinitionUnit {
+                        reason: brokk_bifrost_analysis::analyzer::store::resolution_selection::MissingDefinitionReason::UncertifiedDefinition,
                         storage_language: "rust".to_owned(),
                         persisted_relative_path: rel_path_string(caller.source()),
                     },
@@ -241,48 +295,130 @@ pub(crate) fn outgoing(
             .expect("a located Rust caller has an admitted source mount")
             .fragment();
         operation.with_rust_forward_queries_in_session(
-            caller_context, &caller_crate_keys, &[caller.source().rel_path()], cancellation, &mut SelectedResolutionContextMetrics, &session,
+            caller_context,
+            &caller_crate_keys,
+            &[caller.source().rel_path()],
+            cancellation,
+            &mut SelectedResolutionContextMetrics,
+            &session,
             |queries| {
                 let inventory = queries.reference_inventory_completion(fragment)?;
                 let mut result = CallRelationResult::default();
                 if inventory != ResolutionCompletion::Complete {
+                    let semantics = call_relation_completion_semantics(&inventory);
+                    let Some(projected) = queries.diagnostic_definitions(&semantics)? else {
+                        return Ok(CallRelationResult {
+                            cancelled: true,
+                            ..CallRelationResult::default()
+                        });
+                    };
+                    let canonical = semantics
+                        .into_iter()
+                        .zip(projected)
+                        .map(|(id, target)| {
+                            (id, CallRelationCanonicalTarget::from_projection(&target))
+                        })
+                        .collect::<brokk_bifrost_core::hash::HashMap<_, _>>();
                     result.diagnostics.push(diagnostic(
-                        "native_reference_inventory_incomplete", format!("caller source reference inventory: {inventory:?}"), caller,
+                        "native_reference_inventory_incomplete",
+                        CallRelationDiagnosticPayload::RustInventory {
+                            completion: CallRelationCompletion::from_resolution(&inventory, |id| {
+                                canonical
+                                    .get(&id)
+                                    .expect("every diagnostic semantic has a projection slot")
+                                    .clone()
+                            }),
+                        },
+                        caller,
                     ));
                 }
-                let Some(facts) = rust.structural_fact_providers().into_iter()
-                    .find_map(|provider| provider.structural_facts(caller.source())) else {
-                    return Ok(failed("native_structural_facts_unavailable", "caller structural facts are unavailable", caller));
+                let Some(facts) = rust
+                    .structural_fact_providers()
+                    .into_iter()
+                    .find_map(|provider| provider.structural_facts(caller.source()))
+                else {
+                    return Ok(failed(
+                        "native_structural_facts_unavailable",
+                        CallRelationDiagnosticPayload::Failure {
+                            reason: CallRelationFailure::Upstream {
+                                kind: "native_structural_facts_unavailable".into(),
+                            },
+                        },
+                        caller,
+                    ));
                 };
                 if facts.source() != source.as_str()
-                    || !rust.inner.source_matches_selected_native_content(caller.source(), &source)
+                    || !rust
+                        .inner
+                        .source_matches_selected_native_content(caller.source(), &source)
                 {
-                    return Ok(failed("native_source_mismatch", "call syntax does not match the admitted selected source", caller));
+                    return Ok(failed(
+                        "native_source_mismatch",
+                        CallRelationDiagnosticPayload::Failure {
+                            reason: CallRelationFailure::Upstream {
+                                kind: "native_source_mismatch".into(),
+                            },
+                        },
+                        caller,
+                    ));
                 }
                 for (node_id, node) in facts.nodes().iter().enumerate() {
                     if !session.scope_step() || cancellation.is_cancelled() {
                         break;
                     }
-                    if !node.kind.satisfies(NormalizedKind::Call) || node.range.start_byte < caller_range.start_byte
-                        || node.range.end_byte > caller_range.end_byte {
+                    if !node.kind.satisfies(NormalizedKind::Call)
+                        || node.range.start_byte < caller_range.start_byte
+                        || node.range.end_byte > caller_range.end_byte
+                    {
                         continue;
                     }
-                    let shape = call_shape_for_call(&facts, caller.source(), u32::try_from(node_id).expect("source node ID fits u32"))
-                        .expect("a structured Call node has a call shape");
+                    let shape = call_shape_for_call(
+                        &facts,
+                        caller.source(),
+                        u32::try_from(node_id).expect("source node ID fits u32"),
+                        None,
+                    )
+                    .expect("a structured Call node has a call shape");
                     if !shape.outcome.coverage.is_exact() {
-                        result.diagnostics.push(diagnostic("native_call_shape_incomplete", format!("call shape is {:?} at {:?}", shape.outcome.coverage, shape.outcome.range), caller));
+                        result.diagnostics.push(diagnostic(
+                            "native_call_shape_incomplete",
+                            CallRelationDiagnosticPayload::RustShape {
+                                coverage: shape.outcome.coverage,
+                            }
+                            .at(caller.source(), Some(shape.outcome.range)),
+                            caller,
+                        ));
                         continue;
                     }
                     let Some(callee_range) = shape.outcome.callee_range else {
-                        result.diagnostics.push(diagnostic("native_call_reference_unavailable", format!("call has no structured callee reference at {:?}", shape.outcome.range), caller));
+                        result.diagnostics.push(diagnostic(
+                            "native_call_reference_unavailable",
+                            CallRelationDiagnosticPayload::RustStructuredReferenceUnavailable
+                                .at(caller.source(), Some(shape.outcome.range)),
+                            caller,
+                        ));
                         continue;
                     };
-                    let locator = SelectedSemanticLocator::for_reference_range("rust", caller_path.clone(), callee_range.start_byte, callee_range.end_byte);
+                    let locator = SelectedSemanticLocator::for_reference_range(
+                        "rust",
+                        caller_path.clone(),
+                        callee_range.start_byte,
+                        callee_range.end_byte,
+                    );
                     let mut metrics = ResolutionBatchMetrics::default();
                     let answer = match queries.resolve_reference(&locator, &mut metrics)? {
-                        SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Found(answer)) => answer,
-                        SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Missing) => {
-                            result.diagnostics.push(diagnostic("native_call_reference_unavailable", format!("call has no native reference at {callee_range:?}"), caller));
+                        SelectedResolutionOperationOutcome::Native(
+                            SelectedResolutionLocated::Found(answer),
+                        ) => answer,
+                        SelectedResolutionOperationOutcome::Native(
+                            SelectedResolutionLocated::Missing(_),
+                        ) => {
+                            result.diagnostics.push(diagnostic(
+                                "native_call_reference_unavailable",
+                                CallRelationDiagnosticPayload::RustReferenceUnavailable
+                                    .at(caller.source(), Some(callee_range)),
+                                caller,
+                            ));
                             continue;
                         }
                         SelectedResolutionOperationOutcome::Unavailable(_)
@@ -293,10 +429,41 @@ pub(crate) fn outgoing(
                         Some(Some(owner)) if owner == caller_semantic => {}
                         Some(_) => continue,
                         None => {
-                            result.diagnostics.push(diagnostic("native_call_owner_unavailable", format!("call has no canonical owner at {callee_range:?}"), caller));
+                            result.diagnostics.push(diagnostic(
+                                "native_call_owner_unavailable",
+                                CallRelationDiagnosticPayload::RustCanonicalOwnerUnavailable
+                                    .at(caller.source(), Some(callee_range)),
+                                caller,
+                            ));
                             continue;
                         }
                     }
+                    let diagnostic_semantics = if answer.resolution.call_target_completion()
+                        != ResolutionCompletion::Complete
+                        || answer.resolution.binding().targets().len() > 1
+                    {
+                        call_relation_diagnostic_semantics(&answer.resolution)
+                    } else {
+                        Vec::new()
+                    };
+                    let Some(projected) = queries.diagnostic_definitions(&diagnostic_semantics)?
+                    else {
+                        break;
+                    };
+                    assert_eq!(diagnostic_semantics.len(), projected.len());
+                    let canonical = diagnostic_semantics
+                        .into_iter()
+                        .zip(projected)
+                        .map(|(id, target)| {
+                            (id, CallRelationCanonicalTarget::from_projection(&target))
+                        })
+                        .collect::<brokk_bifrost_core::hash::HashMap<_, _>>();
+                    let project = |id| {
+                        canonical
+                            .get(&id)
+                            .expect("every diagnostic semantic has a projection slot")
+                            .clone()
+                    };
                     let external_leaf = matches!(answer.resolution.call_target_completion(),
                         ResolutionCompletion::Incomplete(reasons) if reasons.iter().all(|reason|
                             matches!(reason, ResolutionIncompleteReason::OpenBoundary {
@@ -304,66 +471,159 @@ pub(crate) fn outgoing(
                             }))
                     ) && answer.definitions.is_empty();
                     if external_leaf {
-                        result.external_terminal_sites.push((caller.source().clone(), shape.outcome.range));
+                        result
+                            .external_terminal_sites
+                            .push((caller.source().clone(), shape.outcome.range));
                         result.diagnostics.push(CallRelationDiagnostic::new(
                             CallRelationDiagnosticCode::ExternalBoundary,
-                            format!("native call at {callee_range:?} reaches a declared external terminal"),
+                            CallRelationDiagnosticPayload::RustExternalTerminal
+                                .at(caller.source(), Some(callee_range)),
                             caller.fq_name().to_string(),
                         ));
-                    } else if answer.resolution.call_target_completion() != ResolutionCompletion::Complete {
-                        result.diagnostics.push(diagnostic("native_call_resolution_incomplete", format!(
-                            "call resolution at {callee_range:?}: {:?}; receiver dispositions: {:?}",
-                            answer.resolution.call_target_completion(), answer.resolution.callable_receiver_dispositions(),
-                        ), caller));
+                    } else if answer.resolution.call_target_completion()
+                        != ResolutionCompletion::Complete
+                    {
+                        result.diagnostics.push(diagnostic(
+                            "native_call_resolution_incomplete",
+                            CallRelationDiagnosticPayload::RustIncomplete {
+                                completion: CallRelationCompletion::from_resolution(
+                                    &answer.resolution.call_target_completion(),
+                                    project,
+                                ),
+                                receivers: CallRelationReceiverDisposition::from_resolution(
+                                    answer.resolution.callable_receiver_dispositions(),
+                                    project,
+                                ),
+                            }
+                            .at(caller.source(), Some(callee_range)),
+                            caller,
+                        ));
                     }
                     let cardinality = answer.resolution.binding().targets().len();
-                    work.examined_candidates = work.examined_candidates.checked_add(cardinality).expect("call candidate work fits usize");
-                    let proof = if cardinality == 1 && answer.resolution.binding().completion() == &ResolutionCompletion::Complete {
+                    work.examined_candidates = work
+                        .examined_candidates
+                        .checked_add(cardinality)
+                        .expect("call candidate work fits usize");
+                    let proof = if cardinality == 1
+                        && answer.resolution.binding().completion()
+                            == &ResolutionCompletion::Complete
+                    {
                         UsageProof::Proven
-                    } else { UsageProof::Unproven };
+                    } else {
+                        UsageProof::Unproven
+                    };
                     if cardinality > 1 {
-                        result.diagnostics.push(CallRelationDiagnostic {
-                            code: CallRelationDiagnosticCode::TargetsAmbiguous,
-                            message: format!("native call at {callee_range:?} has ambiguous canonical targets: {:?}", answer.resolution.binding().targets()),
-                            context: caller.fq_name(),
-                            semantic_count: Some(cardinality),
-                            reason_kind: None,
-                        });
+                        result.diagnostics.push(
+                            CallRelationDiagnostic::new(
+                                CallRelationDiagnosticCode::TargetsAmbiguous,
+                                CallRelationDiagnosticPayload::RustAmbiguous {
+                                    targets: {
+                                        let mut targets = answer
+                                            .resolution
+                                            .binding()
+                                            .targets()
+                                            .iter()
+                                            .copied()
+                                            .map(project)
+                                            .collect::<Vec<_>>();
+                                        targets.sort();
+                                        targets
+                                    },
+                                }
+                                .at(caller.source(), Some(callee_range)),
+                                caller.fq_name().to_string(),
+                            )
+                            .with_count(cardinality),
+                        );
                     }
-                    if !external_leaf && (!answer.lexical_definitions.is_empty() || answer.definitions.is_empty()) {
-                        result.diagnostics.push(diagnostic("native_call_target_unavailable", format!("call at {callee_range:?} has no complete callable unit projection"), caller));
+                    if !external_leaf
+                        && (!answer.lexical_definitions.is_empty() || answer.definitions.is_empty())
+                    {
+                        result.diagnostics.push(diagnostic(
+                            "native_call_target_unavailable",
+                            CallRelationDiagnosticPayload::RustTargetUnavailable
+                                .at(caller.source(), Some(callee_range)),
+                            caller,
+                        ));
                     }
                     let mut definitions = answer.definitions;
                     definitions.sort();
                     if definitions.len() > limits.max_candidates {
                         result.truncated = true;
-                        let mut omitted = diagnostic("native_call_candidates_omitted", format!("call at {callee_range:?} exceeds its candidate bound"), caller);
+                        CallRelationBudgetRefusal::Candidates {
+                            consumed: limits.max_candidates,
+                            limit: limits.max_candidates,
+                        }
+                        .record(&mut result.budget_refusals);
+                        let mut omitted = diagnostic(
+                            "native_call_candidates_omitted",
+                            CallRelationDiagnosticPayload::RustCandidateBound {
+                                limit: limits.max_candidates,
+                            }
+                            .at(caller.source(), Some(callee_range)),
+                            caller,
+                        );
                         omitted.code = CallRelationDiagnosticCode::CandidateLimit;
                         omitted.reason_kind = None;
-                        result.diagnostics.push(omitted);
+                        result.diagnostics.push(
+                            omitted.with_count(
+                                definitions.len().saturating_sub(limits.max_candidates),
+                            ),
+                        );
                     }
                     for callee in definitions.into_iter().take(limits.max_candidates) {
-                        if !session.scope_step() || cancellation.is_cancelled() { break; }
+                        if !session.scope_step() || cancellation.is_cancelled() {
+                            break;
+                        }
                         if !is_call_relation_unit(&callee) {
-                            result.diagnostics.push(diagnostic("native_call_target_not_callable", format!("native call target is not callable: {callee:?}"), caller));
+                            result.diagnostics.push(diagnostic(
+                                "native_call_target_not_callable",
+                                CallRelationDiagnosticPayload::RustTargetNotCallable {
+                                    target: (&callee).into(),
+                                },
+                                caller,
+                            ));
                             continue;
                         }
-                        let kind = if callee.is_class() { CallSyntaxKind::Constructor }
-                            else if shape.outcome.receiver_range.is_some() { CallSyntaxKind::Method }
-                            else { CallSyntaxKind::Function };
-                        let arguments = shape.arguments.iter().map(|argument| CallArgument {
-                            range: argument.range, name: argument.name.clone(),
-                            position: argument.name.is_none().then_some(argument.argument_index),
-                            formal_index: None, formal_name: None, variadic: false, spread: argument.spread,
-                        }).collect();
+                        let kind = if callee.is_class() {
+                            CallSyntaxKind::Constructor
+                        } else if shape.outcome.receiver_range.is_some() {
+                            CallSyntaxKind::Method
+                        } else {
+                            CallSyntaxKind::Function
+                        };
+                        let arguments = shape
+                            .arguments
+                            .iter()
+                            .map(|argument| CallArgument {
+                                range: argument.range,
+                                name: argument.name.clone(),
+                                position: argument
+                                    .name
+                                    .is_none()
+                                    .then_some(argument.argument_index),
+                                formal_index: None,
+                                formal_name: None,
+                                variadic: false,
+                                spread: argument.spread,
+                            })
+                            .collect();
                         result.sites.push(CallSite {
-                            file: caller.source().clone(), range: shape.outcome.range, callee_range,
-                            caller: caller.clone(), callee, kind, proof,
-                            receiver: shape.outcome.receiver_range, arguments,
+                            file: caller.source().clone(),
+                            range: shape.outcome.range,
+                            callee_range,
+                            caller: caller.clone(),
+                            callee,
+                            kind,
+                            proof,
+                            receiver: shape.outcome.receiver_range,
+                            arguments,
                         });
                     }
                 }
-                result.sites.sort_by(|a, b| (a.range.start_byte, &a.callee).cmp(&(b.range.start_byte, &b.callee)));
+                result.sites.sort_by(|a, b| {
+                    (a.range.start_byte, &a.callee).cmp(&(b.range.start_byte, &b.callee))
+                });
                 result.sites.dedup();
                 result.diagnostics.sort();
                 result.diagnostics.dedup();
@@ -376,10 +636,10 @@ pub(crate) fn outgoing(
             cancelled: true,
             ..CallRelationResult::default()
         },
-        BoundedResolution::Exceeded { limit, work } => {
+        BoundedResolution::Exceeded { limit, work: _ } => {
             let mut result = failed(
                 "native_call_budget",
-                format!("native outgoing resolution exceeded {limit:?}: {work:?}"),
+                CallRelationDiagnosticPayload::RustBudget { limit },
                 caller,
             );
             result.truncated = true;
@@ -387,28 +647,44 @@ pub(crate) fn outgoing(
             result.diagnostics[0].reason_kind = None;
             result
         }
-        BoundedResolution::Unavailable { reason, .. } => {
+        BoundedResolution::Unavailable { .. } => {
             let mut result = failed(
                 "native_input_unavailable",
-                format!("input unavailable: {reason}"),
+                CallRelationDiagnosticPayload::Failure {
+                    reason: CallRelationFailure::InputUnavailable,
+                },
                 caller,
             );
             result.truncated = true;
             result
         }
         BoundedResolution::Complete {
-            value: Err(error), ..
-        } => failed("native_store_error", error.to_string(), caller),
+            value: Err(_error), ..
+        } => failed(
+            "native_store_error",
+            CallRelationDiagnosticPayload::Failure {
+                reason: CallRelationFailure::StoreError,
+            },
+            caller,
+        ),
         BoundedResolution::Complete {
             value: Ok(outcome), ..
         } => match outcome {
             SelectedResolutionOperationOutcome::Native(value) => value,
-            SelectedResolutionOperationOutcome::Unavailable(reason) => {
-                failed("native_unavailable", format!("{reason:?}"), caller)
-            }
-            SelectedResolutionOperationOutcome::Stale(reason) => {
-                failed("native_stale", format!("{reason:?}"), caller)
-            }
+            SelectedResolutionOperationOutcome::Unavailable(reason) => failed(
+                "native_unavailable",
+                CallRelationDiagnosticPayload::NativeUnavailable {
+                    reason: (&reason).into(),
+                },
+                caller,
+            ),
+            SelectedResolutionOperationOutcome::Stale(reason) => failed(
+                "native_stale",
+                CallRelationDiagnosticPayload::NativeStale {
+                    reason: (&reason).into(),
+                },
+                caller,
+            ),
             SelectedResolutionOperationOutcome::Cancelled(_) => CallRelationResult {
                 cancelled: true,
                 ..CallRelationResult::default()
@@ -457,6 +733,136 @@ mod tests {
             max_files: 1,
             max_source_bytes: 16_384,
             max_candidates: 16,
+        }
+    }
+
+    #[test]
+    #[hardwon("#11321: native outgoing zero allowances omitted their typed refusal")]
+    fn native_outgoing_budget_telemetry_names_zero_allowances() {
+        let (fixture, rust) = fixture();
+        let caller = rust
+            .declarations(&fixture.file("src/lib.rs"))
+            .into_iter()
+            .find(|unit| unit.identifier() == "caller")
+            .unwrap();
+        for (grant, expected) in [
+            (
+                CallRelationLimits {
+                    max_files: 0,
+                    ..limits()
+                },
+                CallRelationBudgetRefusal::Files {
+                    consumed: 0,
+                    limit: 0,
+                },
+            ),
+            (
+                CallRelationLimits {
+                    max_source_bytes: 0,
+                    ..limits()
+                },
+                CallRelationBudgetRefusal::SourceBytes {
+                    consumed: 0,
+                    attempted: 0,
+                    limit: 0,
+                },
+            ),
+            (
+                CallRelationLimits {
+                    max_candidates: 0,
+                    ..limits()
+                },
+                CallRelationBudgetRefusal::Candidates {
+                    consumed: 0,
+                    limit: 0,
+                },
+            ),
+        ] {
+            let result = outgoing(
+                &rust,
+                &caller,
+                grant,
+                ReceiverAnalysisBudget::default(),
+                &CancellationToken::new(),
+            );
+            assert!(result.truncated && result.sites.is_empty(), "{result:?}");
+            assert_eq!(result.budget_refusals, [expected]);
+            assert_eq!(result.work.examined_candidates, 0);
+        }
+    }
+
+    #[test]
+    #[hardwon("#11321: native outgoing source-byte refusal consumed no work and omitted its lane")]
+    fn native_outgoing_budget_telemetry_names_source_bytes() {
+        let (fixture, rust) = fixture();
+        let file = fixture.file("src/lib.rs");
+        let caller = rust
+            .declarations(&file)
+            .into_iter()
+            .find(|unit| unit.identifier() == "caller")
+            .unwrap();
+        let source_len = rust.indexed_source(&file).unwrap().len();
+        let result = outgoing(
+            &rust,
+            &caller,
+            CallRelationLimits {
+                max_source_bytes: 1,
+                ..limits()
+            },
+            ReceiverAnalysisBudget::default(),
+            &CancellationToken::new(),
+        );
+        assert!(result.truncated && result.sites.is_empty(), "{result:?}");
+        assert_eq!(result.work.scanned_source_bytes, 0);
+        assert_eq!(
+            result.budget_refusals,
+            [CallRelationBudgetRefusal::SourceBytes {
+                consumed: 0,
+                attempted: source_len,
+                limit: 1
+            }]
+        );
+    }
+
+    #[test]
+    #[hardwon("#11321: native target-projection candidate cuts omitted their typed refusal")]
+    fn native_outgoing_budget_telemetry_names_target_projection() {
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file("Cargo.toml", "[package]\nname = \"native_projection_cut\"\nversion = \"0.1.0\"\nedition = \"2024\"\n")
+            .file("src/lib.rs", "mod left { pub fn target() {} }\nmod right { pub fn target() {} }\nuse left::*;\nuse right::*;\npub fn caller() { target(); }\n")
+            .build();
+        let rust = RustAnalyzer::new(fixture.project_dyn());
+        let caller = rust
+            .declarations(&fixture.file("src/lib.rs"))
+            .into_iter()
+            .find(|unit| unit.identifier() == "caller")
+            .unwrap();
+        for cap in [1, 2] {
+            let result = outgoing(
+                &rust,
+                &caller,
+                CallRelationLimits {
+                    max_candidates: cap,
+                    ..limits()
+                },
+                ReceiverAnalysisBudget::default(),
+                &CancellationToken::new(),
+            );
+            if cap == 1 {
+                assert!(result.truncated, "{result:?}");
+                assert_eq!(
+                    result.budget_refusals,
+                    [CallRelationBudgetRefusal::Candidates {
+                        consumed: 1,
+                        limit: 1
+                    }]
+                );
+                assert_eq!(result.sites.len(), 1, "{result:?}");
+            } else {
+                assert!(!result.truncated, "{result:?}");
+                assert!(result.budget_refusals.is_empty(), "{result:?}");
+                assert_eq!(result.sites.len(), 2, "{result:?}");
+            }
         }
     }
 

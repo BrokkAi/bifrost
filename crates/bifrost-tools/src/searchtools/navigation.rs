@@ -1,3 +1,5 @@
+use brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelNamespace;
+
 use crate::searchtools::definitions::*;
 
 use crate::searchtools::selectors::*;
@@ -278,12 +280,10 @@ pub struct SearchSymbolHit {
         Option<brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelProvenance>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SearchPatternKind {
-    LiteralIdentifier,
-    LiteralQualified,
-    RegexLike,
-}
+pub(crate) use brokk_bifrost_analysis::analyzer::search_pattern::{
+    SearchPatternKind, classify_search_pattern, normalize_symbol_name_for_search,
+    strip_global_qualifier,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct SymbolMatchScore {
@@ -482,23 +482,10 @@ pub(crate) fn search_symbols_with_cap(
         .into_iter()
         .filter(|pattern| !pattern.trim().is_empty())
         .collect();
-    let matcher_patterns = patterns
-        .iter()
-        .map(|pattern| {
-            if pattern.contains('+')
-                && classify_search_pattern(pattern) == SearchPatternKind::LiteralQualified
-            {
-                format!(
-                    "(?:{}|{})",
-                    regex::escape(&pattern.replace('+', ".")),
-                    pattern
-                )
-            } else {
-                pattern.clone()
-            }
-        })
-        .collect();
-    let pattern_batch = SearchSymbolPatternBatch::compile(matcher_patterns, false, cancellation);
+    // The batch interprets a literal qualified spelling itself, so a request
+    // like `Outer+Inner` reaches the stored `Outer.Inner` without a per-request
+    // regex alternative here (#8697).
+    let pattern_batch = SearchSymbolPatternBatch::compile(patterns.clone(), false, cancellation);
     let invalid_patterns = pattern_batch.invalid_patterns().to_vec();
 
     let definitions = {
@@ -530,11 +517,26 @@ pub(crate) fn search_symbols_with_cap(
             // test region, or lives under a test-tree path. The old whole-file
             // `contains_tests` gate hid the production API of any file carrying
             // an inline `#[cfg(test)] mod tests`.
-            let is_test = candidate.in_test_region
-                || test_paths::is_test_like_path(
-                    &rel_path_string(candidate.code_unit.source()),
-                    language_for_file(candidate.code_unit.source()),
-                );
+            let path_is_test = test_paths::is_test_like_path(
+                &rel_path_string(candidate.code_unit.source()),
+                language_for_file(candidate.code_unit.source()),
+            );
+            let is_test = match (path_is_test, candidate.in_test_region) {
+                (true, _) => true,
+                (false, Some(verdict)) => verdict,
+                // Unknown status in a search that includes tests: the symbol
+                // is kept either way and the verdict only ranks it, so an
+                // unclassified file is ranked as production (#11385).
+                (false, None) if params.include_tests => false,
+                (false, None) => match analyzer.in_test_region(&candidate.code_unit) {
+                    Ok(verdict) => verdict,
+                    Err(reason) => {
+                        analyzer.record_query_incomplete(reason);
+                        complete = false;
+                        continue;
+                    }
+                },
+            };
             if !params.include_tests && is_test {
                 continue;
             }
@@ -631,7 +633,7 @@ pub(crate) fn search_symbols_with_cap(
         .flatten()
         .map(|candidate| candidate.code_unit.fq_name())
         .collect();
-    let semantic_model_overlay = analyzer.semantic_model_overlay();
+    let semantic_model_overlay = analyzer.semantic_model_overlay_read().published();
     // An incomplete model search without cancellation means a semantic-model
     // read was open; it is reported as such, not as a cancelled search.
     let mut model_inventory_open = false;
@@ -771,7 +773,12 @@ pub(crate) fn search_symbols_with_cap(
     }
     let read_gap = match analyzer_query.read_completion() {
         Ok(()) => None,
-        Err(brokk_bifrost_analysis::analyzer::QueryReadIncomplete::Cancelled) => {
+        Err(reason)
+            if matches!(
+                reason.base_cause(),
+                brokk_bifrost_analysis::analyzer::QueryReadIncomplete::Cancelled
+            ) =>
+        {
             complete = false;
             None
         }
@@ -988,7 +995,7 @@ pub fn get_symbol_locations_with_cancellation(
 
     let mut model_locations = Vec::new();
     let mut model_ambiguous = Vec::new();
-    if let Some(overlay) = analyzer.semantic_model_overlay() {
+    if let Some(overlay) = analyzer.semantic_model_overlay_read().published() {
         not_found.retain(|missing| {
             let mut matched = if missing.input.starts_with("bifrost-model://") {
                 overlay.symbols_at_uri(&missing.input)
@@ -1154,13 +1161,10 @@ fn get_navigation_by_location_with_cancellation(
         {
             break;
         }
-        let pre_scope = cancellation.map_or_else(
-            || AnalyzerQueryScope::new(analyzer),
-            |cancellation| AnalyzerQueryScope::with_cancellation(analyzer, cancellation),
-        );
+        let pre_scope = AnalyzerQueryScope::independent_answer(analyzer, cancellation);
         let token = pre_scope.token();
         if query.path.starts_with("bifrost-model://")
-            && let Some(overlay) = analyzer.semantic_model_overlay()
+            && let Some(overlay) = analyzer.semantic_model_overlay_read().published()
         {
             let matched = overlay.symbols_at_uri(&query.path);
             if matched.records.is_empty()
@@ -1366,10 +1370,7 @@ fn get_navigation_by_location_with_cancellation(
             // Rendering reads the target's declaration data and source. Its
             // gap belongs to this lookup, together with any gap this lookup's
             // own resolution recorded.
-            let render_scope = cancellation.map_or_else(
-                || AnalyzerQueryScope::new(analyzer),
-                |cancellation| AnalyzerQueryScope::with_cancellation(analyzer, cancellation),
-            );
+            let render_scope = AnalyzerQueryScope::independent_answer(analyzer, cancellation);
             let mut result = render_definition_lookup(
                 analyzer,
                 render_scope.token(),
@@ -1469,7 +1470,11 @@ fn semantic_model_navigation_candidates(
             )
         )
     {
-        modeled_target = overlay.symbols_named_in_family(&relation.to, &symbol.language);
+        modeled_target = overlay.symbols_named_in_family(
+            &relation.to,
+            &symbol.language,
+            SemanticModelNamespace::Unknown,
+        );
     }
     match modeled_target.disposition {
         brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique => {
@@ -1574,7 +1579,7 @@ pub fn get_type_by_location(analyzer: &dyn IAnalyzer, params: GetTypeParams) -> 
     let mut results: Vec<Option<TypeLookupResult>> = vec![None; params.references.len()];
 
     for (index, query) in params.references.into_iter().enumerate() {
-        let pre_scope = AnalyzerQueryScope::new(analyzer);
+        let pre_scope = AnalyzerQueryScope::independent_answer(analyzer, None);
         match resolver.resolve_literal(&query.path) {
             ResolvedFileInput::File(file) => {
                 pending.push((
@@ -1640,7 +1645,7 @@ pub fn get_type_by_location(analyzer: &dyn IAnalyzer, params: GetTypeParams) -> 
     for ((index, pre_gap, query, request), (outcome, resolution_gap)) in
         pending.into_iter().zip(outcomes)
     {
-        let render_scope = AnalyzerQueryScope::new(analyzer);
+        let render_scope = AnalyzerQueryScope::independent_answer(analyzer, None);
         let mut result = render_type_lookup(
             analyzer,
             render_scope.token(),
@@ -2047,7 +2052,7 @@ pub(crate) fn render_definition_lookup(
             ),
         });
     }
-    if let Some(overlay) = analyzer.semantic_model_overlay() {
+    if let Some(overlay) = analyzer.semantic_model_overlay_read().published() {
         if !definitions.is_empty()
             && let Some(target) = reference_target.as_deref()
         {
@@ -2068,7 +2073,11 @@ pub(crate) fn render_definition_lookup(
                 // avoiding irrelevant work for names absent from every active
                 // model (#2324).
                 let receiver_owner = overlay
-                    .symbols_named_in_family(member_name, model_language)
+                    .symbols_named_in_family(
+                        member_name,
+                        model_language,
+                        SemanticModelNamespace::Unknown,
+                    )
                     .records
                     .iter()
                     .any(|record| record.owner_id.is_some())
@@ -2085,7 +2094,7 @@ pub(crate) fn render_definition_lookup(
                     .or_else(|| {
                         imported_model_target
                             .as_deref()
-                            .map(|target| overlay.symbols_named_in_family(target, model_language))
+                            .map(|target| overlay.symbols_named_in_family(target, model_language, SemanticModelNamespace::Unknown))
                     })
                     .unwrap_or_else(|| overlay.symbols_with_id_in_family(target, model_language));
                 // A visible explicit import names the binding. Its absence
@@ -2105,10 +2114,10 @@ pub(crate) fn render_definition_lookup(
                                 analyzer, file, target,
                             )
                         {
-                            matched = overlay.symbols_named_in_family(&external_target, model_language);
+                            matched = overlay.symbols_named_in_family(&external_target, model_language, SemanticModelNamespace::Unknown);
                         }
                     } else {
-                        matched = overlay.symbols_named_in_family(target, model_language);
+                        matched = overlay.symbols_named_in_family(target, model_language, SemanticModelNamespace::Unknown);
                     }
                 }
                 if !jvm_reference && matched.records.is_empty() && target.contains("::") {
@@ -2122,12 +2131,19 @@ pub(crate) fn render_definition_lookup(
                     } else {
                         // Ruby constant navigation shares this rendering arm,
                         // but Cargo crate-root visibility is Rust-specific.
-                        matched = overlay.symbols_named_in_family(&dotted_target, model_language);
+                        matched = overlay.symbols_named_in_family(
+                            &dotted_target,
+                            model_language,
+                            SemanticModelNamespace::Unknown,
+                        );
                     }
                 }
                 if !jvm_reference && matched.records.is_empty() && target.contains('#') {
-                    matched =
-                        overlay.symbols_named_in_family(&target.replace('#', "."), model_language);
+                    matched = overlay.symbols_named_in_family(
+                        &target.replace('#', "."),
+                        model_language,
+                        SemanticModelNamespace::Unknown,
+                    );
                 }
                 if language_for_file(file) == Language::Rust {
                     matched
@@ -2291,7 +2307,11 @@ pub(crate) fn render_definition_lookup(
         } else {
             for candidate in &mut definitions {
                 let target = candidate.fqn.as_deref().unwrap_or(&candidate.name);
-                let matched = overlay.symbols_named_in_family(target, model_language);
+                let matched = overlay.symbols_named_in_family(
+                    target,
+                    model_language,
+                    SemanticModelNamespace::Unknown,
+                );
                 if matched.disposition
                     == brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
                     && matches!(
@@ -2855,7 +2875,7 @@ fn append_active_universal_root(
     {
         return;
     }
-    let Some(overlay) = analyzer.semantic_model_overlay() else {
+    let Some(overlay) = analyzer.semantic_model_overlay_read().published() else {
         return;
     };
     let root = overlay.universal_root_for_language(language);
@@ -2881,7 +2901,7 @@ fn append_active_universal_root(
 }
 
 fn model_symbol_ancestors(analyzer: &dyn IAnalyzer, target: &str) -> Option<SymbolAncestors> {
-    let overlay = analyzer.semantic_model_overlay()?;
+    let overlay = analyzer.semantic_model_overlay_read().published()?;
     let matched = overlay.symbols_named(target);
     let open = match matched.disposition {
         brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(
@@ -3032,7 +3052,9 @@ pub(crate) fn score_symbol_match(pattern: &str, code_unit: &CodeUnit) -> SymbolM
 
     let pattern_kind = classify_search_pattern(normalized);
     let query = normalized.to_ascii_lowercase();
-    let qualified_query = normalize_symbol_name_for_search(normalized);
+    // `::ns::Widget` and `\App\Models\User` name the same declarations as their
+    // unrooted spellings; the matcher drops the qualifier the same way.
+    let qualified_query = normalize_symbol_name_for_search(strip_global_qualifier(normalized));
     let identifier_raw = code_unit.identifier();
     let short_name_raw = code_unit.short_name();
     let fq_name_raw = code_unit.fq_name();
@@ -3107,47 +3129,6 @@ pub(crate) fn score_symbol_match(pattern: &str, code_unit: &CodeUnit) -> SymbolM
                     && (qualified_query == normalized_short || qualified_query == normalized_fq)),
         ),
     }
-}
-
-pub(crate) fn classify_search_pattern(pattern: &str) -> SearchPatternKind {
-    if pattern.is_empty()
-        || pattern.chars().any(|ch| {
-            matches!(
-                ch,
-                '*' | '?' | '[' | ']' | '(' | ')' | '{' | '}' | '|' | '^' | ' '
-            )
-        })
-    {
-        return SearchPatternKind::RegexLike;
-    }
-
-    if pattern.contains("::")
-        || pattern.contains('.')
-        || pattern.contains('/')
-        || pattern.contains('\\')
-        || pattern.contains('$')
-        || pattern.contains('+')
-    {
-        SearchPatternKind::LiteralQualified
-    } else {
-        SearchPatternKind::LiteralIdentifier
-    }
-}
-
-pub(crate) fn normalize_symbol_name_for_search(symbol: &str) -> String {
-    let mut out = String::with_capacity(symbol.len());
-    let mut chars = symbol.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match ch {
-            ':' if chars.peek() == Some(&':') => {
-                chars.next();
-                out.push('.');
-            }
-            '/' | '\\' | '$' | '+' => out.push('.'),
-            _ => out.push(ch.to_ascii_lowercase()),
-        }
-    }
-    out
 }
 
 pub(crate) fn contains_exact_symbol_component(haystack: &str, query: &str) -> bool {
@@ -3471,7 +3452,7 @@ pub(crate) fn collect_ranked_names_by(
         .flat_map(|(candidate, line)| {
             let semantic_model = semantic_model_overlay.and_then(|overlay| {
                 let matched = overlay.symbols_named_in_family(&candidate.code_unit.fq_name(),
-                    brokk_bifrost_core::analyzer::model::LanguageDialect::Standard(language_for_file(candidate.code_unit.source())).semantic_pack_label());
+                    brokk_bifrost_core::analyzer::model::LanguageDialect::Standard(language_for_file(candidate.code_unit.source())).semantic_pack_label(), SemanticModelNamespace::Unknown);
                 (matched.disposition
                     == brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique)
                     .then(|| matched.records[0].provenance.clone())

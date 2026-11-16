@@ -131,7 +131,7 @@ pub enum ExplicitReceiverLookup {
     ReceiverOnly,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ReceiverType {
     pub owner_fq_name: String,
     pub mode: ReceiverMode,

@@ -94,7 +94,7 @@ fn flow_origins_publish_all_retained_references() {
                 scope: None,
                 projections: vec![projected],
                 completion: PolicyRunCompletion::Complete,
-                diagnostics: Vec::new(),
+                diagnostics: Vec::new().into(),
                 diagnostics_truncated: false,
                 work: crate::finding::PolicyWorkReport::default(),
                 authored_arm_closures: Vec::new(),

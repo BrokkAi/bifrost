@@ -31,6 +31,7 @@ getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-f
 hashbrown = { version = "0.17" }
 idna = { version = "1" }
 indexmap = { version = "2", features = ["serde"] }
+lzma-rust2 = { version = "0.25", default-features = false, features = ["encoder", "std", "xz"] }
 memchr = { version = "2" }
 num-traits = { version = "0.2", features = ["i128"] }
 percent-encoding = { version = "2" }
@@ -120,4 +121,4 @@ getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-f
 
 # Generated cargo-machete exemptions; run node scripts/public/workspace-hack.mjs.
 [package.metadata.cargo-machete]
-ignored = ["aho-corasick","allocator-api2","bit-set","bit-vec","bitflags","cc","chrono","either","errno","foldhash","getrandom-468e82937335b1c9","getrandom-9fbad63c4bcf4a8f","hashbrown","idna","indexmap","libc","linux-raw-sys","memchr","mio","num-traits","percent-encoding","proc-macro2","quote","regex","regex-automata","regex-syntax","rusqlite","rustix","schemars","serde","serde_core","serde_json","simd-adler32","smallvec","syn-7b89eefb6aaa9bf3","syn-f595c2ba2a3f28df","toml_edit","tracing","url","windows-sys-4db8c43aad08e7ae","windows-sys-d4189bed749088b6"]
+ignored = ["aho-corasick","allocator-api2","bit-set","bit-vec","bitflags","cc","chrono","either","errno","foldhash","getrandom-468e82937335b1c9","getrandom-9fbad63c4bcf4a8f","hashbrown","idna","indexmap","libc","linux-raw-sys","lzma-rust2","memchr","mio","num-traits","percent-encoding","proc-macro2","quote","regex","regex-automata","regex-syntax","rusqlite","rustix","schemars","serde","serde_core","serde_json","simd-adler32","smallvec","syn-7b89eefb6aaa9bf3","syn-f595c2ba2a3f28df","toml_edit","tracing","url","windows-sys-4db8c43aad08e7ae","windows-sys-d4189bed749088b6"]

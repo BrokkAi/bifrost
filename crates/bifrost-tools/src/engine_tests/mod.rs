@@ -10,6 +10,7 @@ mod declaration_candidates;
 mod declaration_inventory_bounds;
 mod declaration_limits;
 mod definition_index_inventory;
+mod derivation_identity_upgrade;
 mod go_native_graph;
 mod go_retained_receiver_oracle;
 mod hit_path_read_parity;
@@ -408,3 +409,5 @@ mod store_jvm_package_context;
 
 mod resolution_rows_dump;
 mod structural_rows_dump;
+
+mod usage_answer_coverage;

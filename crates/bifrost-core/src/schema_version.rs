@@ -1,9 +1,10 @@
 //! Shared compatibility-lineage mechanics for versioned source formats.
 //!
 //! Each source format owns its descriptors. This module only validates those
-//! descriptors and resolves an omitted version to the single compatible head
-//! or an authored version to that exact descriptor. It deliberately contains
-//! no policy- or query-specific vocabulary.
+//! descriptors and resolves authored versions exactly. Formats can infer the
+//! lowest version admitting their constructs without crossing a semantic
+//! change; the compatible head remains available for decoding. This module
+//! contains no policy- or query-specific vocabulary.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -30,6 +31,13 @@ impl SchemaVersionDescriptor {
             auto_compatible,
         }
     }
+}
+
+/// Whether a version adds vocabulary or changes an existing construct's meaning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaVersionChange {
+    Additive,
+    Semantic,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -116,6 +124,7 @@ impl std::error::Error for UnsupportedSchemaVersion {}
 pub struct SchemaVersionRegistry {
     descriptors: HashMap<u32, SchemaVersionDescriptor>,
     implicit_head: u32,
+    changes: HashMap<u32, SchemaVersionChange>,
     supported_versions: Vec<u32>,
 }
 
@@ -195,7 +204,80 @@ impl SchemaVersionRegistry {
         Ok(Self {
             descriptors: descriptors_by_version,
             implicit_head,
+            // Formats that do not opt into construct-based inference retain
+            // their existing latest-compatible behavior.
+            changes: descriptors
+                .iter()
+                .map(|d| (d.version, SchemaVersionChange::Semantic))
+                .collect(),
             supported_versions,
+        })
+    }
+
+    /// Declare every version's inference effect at registry construction.
+    /// This immutable format metadata is shared by all documents; it stores
+    /// no workspace facts or per-document results.
+    pub fn with_changes(mut self, changes: &[(u32, SchemaVersionChange)]) -> Self {
+        assert_eq!(
+            changes.len(),
+            self.descriptors.len(),
+            "every schema version needs one change declaration: changes={changes:?}, versions={:?}",
+            self.supported_versions
+        );
+        let mut declared = HashMap::with_capacity(changes.len());
+        for &(version, change) in changes {
+            assert!(
+                self.descriptors.contains_key(&version),
+                "unknown schema version {version}"
+            );
+            assert!(
+                declared.insert(version, change).is_none(),
+                "duplicate schema change declaration for {version}"
+            );
+        }
+        self.changes = declared;
+        self
+    }
+
+    /// Infer the lowest compatible version admitting a document's constructs,
+    /// without crossing the last change to existing semantics. Exact authored
+    /// pins still use `resolve` and are checked by the format's decoder.
+    pub fn infer_for_constructs(
+        &self,
+        required_version: u32,
+    ) -> Result<SchemaVersionResolution, UnsupportedSchemaVersion> {
+        let mut lineage = Vec::new();
+        let mut semantic_floor = None;
+        let mut version = self.implicit_head;
+        loop {
+            if semantic_floor.is_none() && self.changes[&version] == SchemaVersionChange::Semantic {
+                semantic_floor = Some(lineage.len());
+            }
+            lineage.push(version);
+            let Some(predecessor) = self.descriptors[&version].implicit_predecessor else {
+                break;
+            };
+            version = predecessor;
+        }
+        // Numeric ordering alone cannot prove vocabulary inheritance: an
+        // explicit-only sibling may have a smaller number than this head.
+        // Keep the full lineage so constructs predating the semantic floor
+        // still admit a descendant at that floor.
+        let required_position = lineage
+            .iter()
+            .position(|version| *version == required_version)
+            .ok_or_else(|| UnsupportedSchemaVersion {
+                requested: required_version,
+                supported: self.supported_versions.clone(),
+            })?;
+        let floor_position = semantic_floor.unwrap_or(lineage.len() - 1);
+        let version = *lineage[..=required_position.min(floor_position)]
+            .iter()
+            .min()
+            .expect("the implicit lineage contains at least its head");
+        Ok(SchemaVersionResolution {
+            version,
+            origin: SchemaVersionOrigin::ImplicitCompatible,
         })
     }
 
@@ -445,5 +527,73 @@ mod tests {
                 versions: vec![2, 3],
             }
         );
+    }
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11466: additive schema bumps rotated untouched unpinned policy identities"
+    )]
+    fn construct_inference_preserves_additive_identity_and_respects_semantic_floors() {
+        let descriptors = [descriptor(1, None, true), descriptor(2, Some(1), true)];
+        let additive = SchemaVersionRegistry::new(&descriptors)
+            .unwrap()
+            .with_changes(&[
+                (1, SchemaVersionChange::Additive),
+                (2, SchemaVersionChange::Additive),
+            ]);
+        assert_eq!(additive.infer_for_constructs(1).unwrap().version, 1);
+        assert_eq!(additive.infer_for_constructs(2).unwrap().version, 2);
+        assert_eq!(
+            additive.resolve(Some(1)).unwrap().origin,
+            SchemaVersionOrigin::Explicit
+        );
+        assert_eq!(additive.resolve(Some(1)).unwrap().version, 1);
+        assert_eq!(additive.infer_for_constructs(3).unwrap_err().requested, 3);
+        // The ordinary resolver remains available to decode new vocabulary
+        // before the format determines which constructs a document uses.
+        assert_eq!(additive.resolve(None).unwrap().version, 2);
+        let semantic = SchemaVersionRegistry::new(&[
+            descriptor(1, None, true),
+            descriptor(2, Some(1), true),
+            descriptor(3, Some(2), true),
+            descriptor(4, Some(3), true),
+            descriptor(5, Some(4), false),
+        ])
+        .unwrap()
+        .with_changes(&[
+            (1, SchemaVersionChange::Additive),
+            (2, SchemaVersionChange::Additive),
+            (3, SchemaVersionChange::Semantic),
+            (4, SchemaVersionChange::Additive),
+            (5, SchemaVersionChange::Semantic),
+        ]);
+        assert_eq!(semantic.infer_for_constructs(1).unwrap().version, 3);
+        assert_eq!(semantic.infer_for_constructs(4).unwrap().version, 4);
+        assert_eq!(semantic.infer_for_constructs(5).unwrap_err().requested, 5);
+        assert_eq!(semantic.resolve(Some(1)).unwrap().version, 1);
+        assert_eq!(semantic.resolve(Some(5)).unwrap().version, 5);
+    }
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "0a7a9bf724bd: numeric inference admitted constructs from an explicit-only sibling"
+    )]
+    fn construct_inference_requires_vocabulary_on_the_compatible_lineage() {
+        let registry = SchemaVersionRegistry::new(&[
+            descriptor(1, None, true),
+            descriptor(2, Some(1), false),
+            descriptor(3, Some(1), true),
+            descriptor(4, Some(3), true),
+        ])
+        .unwrap()
+        .with_changes(&[
+            (1, SchemaVersionChange::Additive),
+            (2, SchemaVersionChange::Additive),
+            (3, SchemaVersionChange::Additive),
+            (4, SchemaVersionChange::Additive),
+        ]);
+        assert_eq!(registry.infer_for_constructs(1).unwrap().version, 1);
+        assert_eq!(registry.infer_for_constructs(2).unwrap_err().requested, 2);
+        assert_eq!(registry.infer_for_constructs(3).unwrap().version, 3);
+        assert_eq!(registry.infer_for_constructs(4).unwrap().version, 4);
+        assert_eq!(registry.resolve(Some(2)).unwrap().version, 2);
     }
 }

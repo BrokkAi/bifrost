@@ -161,11 +161,15 @@ threads-required = "num-cpus"
 # the test cannot meet the 600 s threshold. Partial flows (#8617) cost 1.39x
 # the CPU seconds of lowering and rows alone (13,735 s against 9,858 s on one
 # 32-CPU host, 2026-11-01, #8739). Release gate legs took up to 1,164 s on
-# macOS before that, so about 1,650 s now; 40 minutes keeps the margin.
+# macOS before that, so about 1,650 s then. #11491 (2026-11-11) stopped six
+# lowering panics that had abandoned the heaviest files, and the macOS leg
+# then took 2,190 s (gate run 43056152488). The test runs in a shard of its
+# own (ROUND_TRIP_RUST_TESTS in ci-os-matrix.yml); 50 minutes keeps a margin
+# under that shard's 60-minute job limit.
 [[profile.default.overrides]]
 filter = 'test(semantic_ir_rows_round_trip_every_workspace_crate_source)'
 threads-required = "num-cpus"
-slow-timeout = { period = "60s", terminate-after = 40 }
+slow-timeout = { period = "60s", terminate-after = 50 }
 
 # rust_call_targets_are_independent_of_file_batch (#9755) resolves every Rust
 # call site in every golden fixture twice, once in its file's batch and once
@@ -190,6 +194,40 @@ slow-timeout = { period = "60s", terminate-after = 15 }
 filter = 'test(transient_residency_boundary_scan)'
 threads-required = "num-cpus"
 slow-timeout = { period = "60s", terminate-after = 15 }
+
+# flow_evidence_contracts::golden_policy_flow_evidence (#12773) renders 54
+# independent policy-flow fixture cases through the CLI and, in the
+# rust-primitive-universe case, 19 independent edits of one fixture. Serial,
+# the family took about 525 s alone and timed out at the 600 s profile-wide
+# kill under full policy-integration load. The cases, and the edits inside
+# rust-primitive-universe, copy their own fixture roots and use independent
+# processes, so both levels spread their work over the CPUs this reservation
+# hands the test: measured 55 s on 32 CPUs at host load 9 to 21, down from
+# 386 s in the rust-primitive-universe case alone. Fifteen minutes keeps this
+# a hang detector on the smallest runner.
+[[profile.default.overrides]]
+filter = 'test(flow_evidence_contracts::golden_policy_flow_evidence)'
+threads-required = "num-cpus"
+slow-timeout = { period = "60s", terminate-after = 15 }
+
+# protocol_summary_relations::oversized_exit_projection_preserves_source_results_without_publishing_a_prefix
+# (#12839) intentionally produces 65,792 exit summaries (257 bindings x 256
+# states) and solves the same oversized projection twice: once from an empty
+# repository, then again from the same repository to prove the first run
+# published no prefix. The solver and projection are single-threaded, so this
+# test cannot spread its work over the CPUs a reservation would hand it.
+# Measured on 2026-11-14: alone on a 32-CPU container, 249.3 s (setup 2.4 s,
+# first solve 125.3 s, assertions 12 ms, second solve 121.6 s); in the whole
+# suite_semantic binary on that container, 387.205 s (1.55x); alone on the
+# merge host, 582.763 s, only 17.2 s under the profile-wide 600 s kill, and a
+# full suite_semantic run there timed out at 600.056 s. At the container's
+# loaded ratio, the merge host's loaded duration is about 900 s. Twenty
+# minutes gives that estimate 33% headroom and keeps this a hang detector
+# without moving the global threshold. The current CI x86 runner takes about
+# 175 s.
+[[profile.default.overrides]]
+filter = 'test(oversized_exit_projection_preserves_source_results_without_publishing_a_prefix)'
+slow-timeout = { period = "60s", terminate-after = 20 }
 
 [[profile.default.overrides]]
 filter = 'test(native_java_kotlin_csharp_all_fixture_rows_and_partial_flows_round_trip)'

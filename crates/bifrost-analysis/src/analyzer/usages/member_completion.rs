@@ -1,50 +1,15 @@
-use std::sync::Arc;
-
 use tree_sitter::Node;
 
 use super::get_definition::parse_tree_for_language;
-use super::get_type::{TypeLookupRequest, TypeLookupStatus, resolve_type_batch};
 use crate::analyzer::common::language_for_file;
-use crate::analyzer::languages::language_support_for_hook;
-use crate::analyzer::semantic_model::{
-    SemanticModelCompleteness, SemanticModelOverlayDisposition, SemanticModelSymbol,
-    SemanticModelSymbolKind,
-};
-use crate::analyzer::{
-    AnalyzerDefinitionLookup, BoundedDefinitionLookup, CodeUnit, CodeUnitType, IAnalyzer, Language,
-    ProjectFile, sort_units,
-};
+use crate::analyzer::semantic_model::SemanticModelSymbolKind;
+use crate::analyzer::{CodeUnitType, Language, ProjectFile};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemberCompletionSite {
     pub receiver_start_byte: usize,
     pub receiver_end_byte: usize,
     pub prefix: String,
-}
-
-#[derive(Debug, Clone)]
-pub enum MemberCompletionCandidate {
-    Workspace(CodeUnit),
-    SemanticModel {
-        name: String,
-        kind: SemanticModelSymbolKind,
-        signature: Option<String>,
-    },
-}
-
-impl MemberCompletionCandidate {
-    pub fn name(&self) -> &str {
-        match self {
-            Self::Workspace(unit) => unit.terminal_name(),
-            Self::SemanticModel { name, .. } => name,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct MemberCompletionResult {
-    pub candidates: Vec<MemberCompletionCandidate>,
-    pub incomplete: bool,
 }
 
 pub fn member_completion_site(
@@ -60,156 +25,6 @@ pub fn member_completion_site(
         let repaired_tree = parse_tree_for_language(file, language, &repaired)?;
         member_completion_site_in_tree(language, source, repaired_tree.root_node(), cursor_byte)
     })
-}
-
-pub fn complete_members(
-    analyzer: &dyn IAnalyzer,
-    file: &ProjectFile,
-    source: Arc<String>,
-    site: &MemberCompletionSite,
-) -> MemberCompletionResult {
-    let [(outcome, read_gap)] = resolve_type_batch(
-        analyzer,
-        vec![TypeLookupRequest {
-            file: file.clone(),
-            source: Some(Arc::clone(&source)),
-            line: None,
-            column: None,
-            start_byte: Some(site.receiver_start_byte),
-            end_byte: Some(site.receiver_end_byte),
-        }],
-    )
-    .try_into()
-    .expect("one member-completion type request returns one outcome");
-
-    let mut incomplete = read_gap.is_some()
-        || outcome.status != TypeLookupStatus::Resolved
-        || outcome.types.len() != 1;
-    let go_import_path = (language_for_file(file) == Language::Go)
-        .then(|| {
-            language_support_for_hook(Language::Go, "imported_package_at_range")?
-                .imported_package_at_range(
-                    analyzer,
-                    file,
-                    source.as_str(),
-                    site.receiver_start_byte,
-                    site.receiver_end_byte,
-                )
-        })
-        .flatten();
-    let receiver_is_go_package = go_import_path.is_some();
-    let lookup = AnalyzerDefinitionLookup::new(analyzer, language_for_file(file));
-    let overlay = analyzer.semantic_model_overlay();
-    let mut workspace = Vec::new();
-    let mut modeled = Vec::new();
-    let mut modeled_owner_ids = Vec::new();
-
-    for resolved_type in outcome.types {
-        for definition in resolved_type.definitions {
-            workspace.extend(lookup.fqn_direct_children(&definition.fq_name()));
-        }
-        if let Some(owner_id) = resolved_type.semantic_model_id {
-            modeled_owner_ids.push(owner_id);
-        }
-    }
-
-    if let Some(import_path) = go_import_path {
-        let Some(overlay) = overlay.as_ref() else {
-            incomplete = true;
-            return MemberCompletionResult {
-                candidates: Vec::new(),
-                incomplete,
-            };
-        };
-        let owners = overlay.symbols_named(&import_path);
-        if owners.disposition != SemanticModelOverlayDisposition::Unique
-            || owners.records.len() != 1
-        {
-            incomplete = true;
-        } else {
-            let owner = &owners.records[0];
-            if owner.language == "go"
-                && owner.kind == SemanticModelSymbolKind::Module
-                && owner.owner_id.is_none()
-                && !owner.provenance.ambiguous
-            {
-                modeled_owner_ids.push(owner.id.clone());
-            } else {
-                incomplete = true;
-            }
-        }
-    }
-
-    modeled_owner_ids.sort();
-    modeled_owner_ids.dedup();
-    if receiver_is_go_package && modeled_owner_ids.len() == 1 {
-        incomplete = false;
-    }
-    for owner_id in modeled_owner_ids {
-        let Some(overlay) = overlay.as_ref() else {
-            incomplete = true;
-            continue;
-        };
-        let owners = overlay.symbols_with_id(&owner_id);
-        if owners.disposition != SemanticModelOverlayDisposition::Unique
-            || owners.records.len() != 1
-        {
-            incomplete = true;
-            continue;
-        }
-        let owner = &owners.records[0];
-        let namespace_owner = owner.kind == SemanticModelSymbolKind::Module;
-        let members = overlay.members_of(&owner_id);
-        incomplete |= owner.provenance.completeness != SemanticModelCompleteness::Complete
-            || members.disposition != SemanticModelOverlayDisposition::Unique
-            || members.records.iter().any(|member| {
-                member.provenance.completeness != SemanticModelCompleteness::Complete
-                    || member.provenance.ambiguous
-            });
-        modeled.extend(members.records.into_iter().filter(|member| {
-            member.externally_visible()
-                && if namespace_owner {
-                    member.is_static()
-                } else {
-                    member.has_receiver()
-                }
-        }));
-    }
-
-    sort_units(&mut workspace);
-    workspace.dedup();
-    modeled.sort_by(|left, right| {
-        (&left.name, &left.signature, &left.id).cmp(&(&right.name, &right.signature, &right.id))
-    });
-    modeled.dedup_by(|left, right| left.id == right.id);
-
-    let prefix = site.prefix.as_str();
-    let mut candidates = workspace
-        .into_iter()
-        .filter(|unit| unit.terminal_name().starts_with(prefix))
-        .map(MemberCompletionCandidate::Workspace)
-        .chain(
-            modeled
-                .into_iter()
-                .filter(|member| member.name.starts_with(prefix))
-                .map(semantic_candidate),
-        )
-        .collect::<Vec<_>>();
-    candidates.sort_by(|left, right| left.name().cmp(right.name()));
-    candidates.dedup_by(|left, right| left.name() == right.name());
-
-    MemberCompletionResult {
-        candidates,
-        incomplete,
-    }
-}
-
-fn semantic_candidate(symbol: std::sync::Arc<SemanticModelSymbol>) -> MemberCompletionCandidate {
-    MemberCompletionCandidate::SemanticModel {
-        name: symbol.name.clone(),
-        kind: symbol.kind,
-        signature: symbol.signature.clone(),
-    }
 }
 
 fn member_completion_site_in_tree(

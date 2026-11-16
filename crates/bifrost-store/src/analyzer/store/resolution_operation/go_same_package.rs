@@ -219,7 +219,7 @@ WHERE caller.context_id=?1 AND caller.file_version_id=?2
     WHERE inventory_selection.workspace_id=selection.workspace_id
       AND inventory_selection.lang=selection.lang
       AND inventory_selection.generation=selection.generation
-      AND inventory_selection.derivation_version=selection.derivation_version
+      AND inventory_selection.derivation_identity=selection.derivation_identity
       AND inventory_selection.profile_digest=?3
       AND sibling.source_role IN ('go',caller.source_role)
       AND sibling.file_version_id<>caller.file_version_id

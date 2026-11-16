@@ -251,9 +251,29 @@ impl HierarchyPolicy for PythonHierarchy {
     }
 }
 impl HierarchyEdgeProvider for PythonHierarchy {
+    fn base_preservation_rule(&self) -> Option<crate::analyzer::resolution::BasePreservationRule> {
+        Some(super::super::python_member_rows::PYTHON_BASE_PRESERVATION_RULE)
+    }
+
+    fn base_preservation_order(&self) -> Option<&'static dyn HierarchyLinearizationPolicy> {
+        Some(&PYTHON_C3)
+    }
+
+    fn base_preservation_input(
+        &self,
+        owner: SemanticId,
+        source: &dyn SelectedTypedFactSource,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<BasePreservationGuard>> {
+        Ok(source
+            .implicit_base_inputs(owner, cancellation)?
+            .and_then(|input| input.base_preservation))
+    }
+
     fn implicit_base(
         &self,
         owner: SemanticId,
+        written: &[crate::analyzer::resolution::fact_resolution::WrittenHierarchyBase<'_>],
         source: &dyn SelectedTypedFactSource,
         cancellation: &CancellationToken,
     ) -> Result<Option<ImplicitBaseRead>> {
@@ -266,6 +286,7 @@ impl HierarchyEdgeProvider for PythonHierarchy {
         }
         let Some(inputs) = inputs else {
             return Ok(Some(ImplicitBaseRead {
+                guard: None,
                 base: None,
                 observations: Box::new([]),
                 completion: ResolutionCompletion::incomplete([
@@ -273,14 +294,17 @@ impl HierarchyEdgeProvider for PythonHierarchy {
                 ]),
             }));
         };
-        let ordinary =
-            inputs.creation == ClassCreationKind::Ordinary && inputs.written_inventory_complete;
-        let completion = inputs.completion;
+        let guard = inputs.base_preservation;
+        let ordinary = (inputs.creation == ClassCreationKind::Ordinary || guard.is_some())
+            && inputs.written_inventory_complete;
+        let completion = guard
+            .as_ref()
+            .map_or(inputs.completion, |guard| guard.completion.clone());
         let provider = HierarchyProviderKey::source(
             owner,
             owner,
             brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace::Type,
-            implicit_authority(inputs.authority),
+            implicit_authority(inputs.authority.clone()),
             HierarchyProviderOperand::SupertypeInventory,
             owner,
             0,
@@ -291,6 +315,76 @@ impl HierarchyEdgeProvider for PythonHierarchy {
             completion: completion.clone(),
             inventory_complete: Some(ordinary),
         };
+        // CPython appends Generic's alias after all written operands. Its
+        // __mro_entries__ omits Generic exactly when Protocol is present; the
+        // later-alias branch cannot fire for this last operand. The selected
+        // source also proves that no workspace typing module supplies the
+        // alias constructor before admitting this bound.
+        let written_targets = written
+            .iter()
+            .flat_map(|base| base.targets.iter().copied())
+            .collect::<Vec<_>>();
+        if let Some(appended) =
+            source.implicit_appended_base(owner, &written_targets, cancellation)?
+        {
+            let factory_open = appended.factory_unmodified == Some(false);
+            let complete = appended.factory_unmodified == Some(true)
+                && ordinary
+                && completion == ResolutionCompletion::Complete
+                && appended.completion == ResolutionCompletion::Complete
+                && appended.written_objects != ImplicitWrittenBaseObjects::Unproven
+                && written.len() == inputs.written_base_count as usize
+                && written.iter().all(|base| base.complete);
+            let definite = appended.written_objects == ImplicitWrittenBaseObjects::Proven;
+            let suppressed = complete
+                && definite
+                && appended
+                    .suppressing_target
+                    .is_some_and(|target| written.iter().any(|base| base.targets == [target]));
+            let ordinal = inputs.written_base_count;
+            let provider = HierarchyProviderKey::source(
+                owner,
+                owner,
+                brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace::Type,
+                implicit_authority(inputs.authority.clone()),
+                HierarchyProviderOperand::SupertypeEdge {
+                    reference: owner,
+                    ordinal,
+                },
+                owner,
+                ordinal,
+            );
+            let completion = if complete {
+                ResolutionCompletion::Complete
+            } else {
+                completion
+                    .combine(&appended.completion)
+                    .combine(&ResolutionCompletion::incomplete([
+                        ResolutionIncompleteReason::UnsupportedSemantic(owner),
+                    ]))
+            };
+            return Ok(Some(ImplicitBaseRead {
+                guard,
+                base: ((complete && !suppressed) || factory_open).then_some(ImplicitBaseFact {
+                    target: if definite && !factory_open {
+                        appended.target
+                    } else {
+                        None
+                    },
+                    definite: definite && !factory_open,
+                    external: !factory_open,
+                    ordinal,
+                    provider,
+                    occurrence: owner,
+                }),
+                observations: Box::new([HierarchyProviderObservation {
+                    inventory_complete: Some(complete),
+                    completion: completion.clone(),
+                    ..observation
+                }]),
+                completion,
+            }));
+        }
         let base = if ordinary && inputs.written_base_count == 0 {
             inputs
                 .root_object
@@ -309,7 +403,9 @@ impl HierarchyEdgeProvider for PythonHierarchy {
                         0,
                     );
                     ImplicitBaseFact {
-                        target: root.identity,
+                        target: Some(root.identity),
+                        definite: true,
+                        external: true,
                         ordinal: 0,
                         occurrence: root.occurrence,
                         provider,
@@ -319,6 +415,7 @@ impl HierarchyEdgeProvider for PythonHierarchy {
             None
         };
         Ok(Some(ImplicitBaseRead {
+            guard,
             base,
             observations: Box::new([observation]),
             completion,
@@ -726,10 +823,7 @@ pub(super) fn member_rows(
             let bindings = if mount.blob_id() == half.blob {
                 half.rows
             } else {
-                let Some(loaded) = half
-                    .rules
-                    .load_binding_rows(mount.blob_id(), Some(mount.blob_oid()))?
-                else {
+                let Some(loaded) = half.rules.load_binding_rows(&mount)? else {
                     return Ok(Read::Cancelled(dictionary_completion));
                 };
                 owned = loaded;
@@ -1040,6 +1134,7 @@ pub(super) fn member_rows(
             let reason = half.rules.ready.context_identities.named_semantic(
                 digest.finish(),
                 "missing-runtime-binding",
+                crate::analyzer::resolution::ReasonDeterminism::Unaudited,
                 "An annotation describes an instance field but supplies no runtime binding",
             );
             row_completion = row_completion.combine(&ResolutionCompletion::incomplete([

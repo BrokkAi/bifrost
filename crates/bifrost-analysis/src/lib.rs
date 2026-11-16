@@ -36,6 +36,7 @@ pub mod workspace_document;
 
 pub use brokk_bifrost_core::benchmark_provenance::git_commit;
 
+pub use brokk_bifrost_core::allocation_size;
 pub use brokk_bifrost_core::cache_db;
 pub use brokk_bifrost_core::cancellation;
 pub use brokk_bifrost_core::compact_graph;
@@ -258,16 +259,24 @@ pub mod native_resolution_test_support {
         revision: i64,
         session: &brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession,
     ) -> crate::analyzer::store::Result<String> {
-        with_python_native_operation(
+        with_python_native_operation_judged(
             publication,
             project,
             revision,
             |operation, summary, cancellation| {
-                operation.python_native_route_probe_in_session(
+                let probe = operation.python_native_route_probe_in_session(
                     summary,
                     publication.profile.python_version,
                     session,
                     cancellation,
+                );
+                // The rendered route cannot carry the caller's session verdict;
+                // it joins this capture, where the session's marks went.
+                (
+                    probe,
+                    brokk_bifrost_core::analyzer::reuse_verdict::CarriesReuseVerdict::reuse_verdict(
+                        session,
+                    ),
                 )
             },
         )
@@ -328,13 +337,43 @@ pub mod native_resolution_test_support {
             &crate::CancellationToken,
         ) -> crate::analyzer::store::Result<T>,
     ) -> crate::analyzer::store::Result<T> {
+        with_python_native_operation_judged(
+            publication,
+            project,
+            revision,
+            |operation, summary, cancellation| {
+                (
+                    action(operation, summary, cancellation),
+                    crate::analyzer::reuse_verdict::ReuseVerdict::Content,
+                )
+            },
+        )
+    }
+
+    /// [`with_python_native_operation`] for an action that returns its reuse
+    /// verdict, which joins the operation's capture.
+    fn with_python_native_operation_judged<T>(
+        publication: &crate::analyzer::store::python_unit_summaries::PythonEnvironmentPublication,
+        project: &dyn crate::analyzer::Project,
+        revision: i64,
+        action: impl FnOnce(
+            &crate::analyzer::store::resolution_operation::SelectedResolutionOperation<'_, '_>,
+            i64,
+            &crate::CancellationToken,
+        ) -> (
+            crate::analyzer::store::Result<T>,
+            crate::analyzer::reuse_verdict::ReuseVerdict,
+        ),
+    ) -> crate::analyzer::store::Result<T> {
         let reads = crate::analyzer::tree_sitter_analyzer::ProjectReadRegistry::try_new(project)
             .ok_or_else(|| {
                 crate::analyzer::store::StoreError::new(
                     "Python native helper Project cannot install a read recorder",
                 )
             })?;
-        let (result, _receipt) = reads.capture(|| {
+        let mut verdict = crate::analyzer::reuse_verdict::ReuseVerdict::Content;
+        let (result, _receipt) = reads.capture_judged(|| {
+            let result = (|| -> crate::analyzer::store::Result<T> {
             use crate::analyzer::store::resolution_operation::{
                 SelectedResolutionOperationInput, SelectedResolutionOperationOpenOutcome,
             };
@@ -359,17 +398,11 @@ pub mod native_resolution_test_support {
             // ordinary workspace membership selects the same source content.
             let members = {
                 let connection = publication.store.read_conn()?;
-                let mut statement = connection.prepare(
-                    "SELECT members.rel_path,blob.blob_oid
-                 FROM resolution_unit_summary_members members
-                 JOIN blobs blob ON blob.id=members.blob_id
-                 WHERE members.summary_id=?1 ORDER BY members.member_ordinal",
-                )?;
-                statement
-                    .query_map([summary], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?
+                brokk_bifrost_store::analyzer::store::surface_relations::member_blobs_at_revision(
+                    &connection,
+                    summary,
+                    &snapshot,
+                )?
             };
             let mut mounts = Vec::with_capacity(members.len());
             let mut masks = Vec::with_capacity(members.len());
@@ -438,12 +471,16 @@ pub mod native_resolution_test_support {
                 .open_selected_resolution_operation(input, &cancellation)?
             {
                 SelectedResolutionOperationOpenOutcome::Ready(operation) => {
-                    action(&operation, summary, &cancellation)
+                    let (result, action_verdict) = action(&operation, summary, &cancellation);
+                    verdict = action_verdict;
+                    result
                 }
                 outcome => Err(crate::analyzer::store::StoreError::new(format!(
                     "Python route selection: {outcome:?}"
                 ))),
             }
+            })();
+            (result, verdict)
         });
         result
     }
@@ -769,3 +806,7 @@ pub mod native_resolution_test_support {
         parse(file, source, &tree)
     }
 }
+
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub use brokk_bifrost_core::retention_census;

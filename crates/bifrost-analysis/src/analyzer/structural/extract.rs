@@ -64,48 +64,6 @@ pub(crate) fn extract_file_facts_limited(
     max_fact_nodes: usize,
     cancellation: Option<&CancellationToken>,
 ) -> LimitedFileFacts {
-    extract_file_facts_limited_with_tree(
-        spec,
-        grammar,
-        source,
-        None,
-        max_fact_nodes,
-        cancellation,
-        false,
-    )
-}
-
-/// Extract facts and live-node joins from the same primary and embedded trees
-/// retained by semantic lowering. Synthetic wrappers are excluded.
-pub(crate) fn extract_file_facts_from_forest_limited(
-    spec: &dyn StructuralSpec,
-    grammar: &TsLanguage,
-    tree: &tree_sitter::Tree,
-    forest: &EmbeddedSyntaxForest,
-    source: &str,
-    max_fact_nodes: usize,
-    cancellation: Option<&CancellationToken>,
-) -> LimitedFileFacts {
-    extract_file_facts_limited_with_tree(
-        spec,
-        grammar,
-        source,
-        Some((tree, forest)),
-        max_fact_nodes,
-        cancellation,
-        true,
-    )
-}
-
-fn extract_file_facts_limited_with_tree(
-    spec: &dyn StructuralSpec,
-    grammar: &TsLanguage,
-    source: &str,
-    prepared: Option<(&tree_sitter::Tree, &EmbeddedSyntaxForest)>,
-    max_fact_nodes: usize,
-    cancellation: Option<&CancellationToken>,
-    include_node_index: bool,
-) -> LimitedFileFacts {
     // An empty source is a legitimate file with zero facts (empty __init__.py
     // and placeholder .ts fixtures are real workspace members). Rejecting it
     // as Unavailable made one empty file abort the whole provider index and
@@ -119,8 +77,7 @@ fn extract_file_facts_limited_with_tree(
             minimum_fact_nodes: 1,
         };
     }
-    let (prepared_tree, prepared_forest) = prepared.unzip();
-    let parsed_tree = if prepared_tree.is_none() {
+    let parsed_tree = {
         let mut parser = Parser::new();
         if parser.set_language(grammar).is_err() {
             return LimitedFileFacts::Unavailable;
@@ -150,37 +107,88 @@ fn extract_file_facts_limited_with_tree(
             spec.reparse_grammar_gap(source, &tree, cancellation)
                 .unwrap_or(tree)
         })
-    } else {
-        None
     };
-    let Some(tree) = prepared_tree.or(parsed_tree.as_ref()) else {
+    let Some(tree) = parsed_tree.as_ref() else {
         return if cancellation.is_some_and(CancellationToken::is_cancelled) {
             LimitedFileFacts::Cancelled
         } else {
             LimitedFileFacts::Unavailable
         };
     };
-    let parsed_forest;
-    let forest = if let Some(forest) = prepared_forest {
-        forest
-    } else {
-        parsed_forest = match EmbeddedSyntaxForest::parse(
-            spec,
-            tree.root_node(),
-            source,
-            max_fact_nodes,
-            cancellation,
-        ) {
-            Ok(forest) => forest,
-            Err(EmbeddedSyntaxStop::Cancelled) => return LimitedFileFacts::Cancelled,
-            Err(EmbeddedSyntaxStop::Exceeded) => {
-                return LimitedFileFacts::Exceeded {
-                    minimum_fact_nodes: max_fact_nodes.saturating_add(1),
-                };
-            }
-        };
-        &parsed_forest
+    let forest = match EmbeddedSyntaxForest::parse(
+        spec,
+        tree.root_node(),
+        source,
+        max_fact_nodes,
+        cancellation,
+    ) {
+        Ok(forest) => forest,
+        Err(EmbeddedSyntaxStop::Cancelled) => return LimitedFileFacts::Cancelled,
+        Err(EmbeddedSyntaxStop::Exceeded) => {
+            return LimitedFileFacts::Exceeded {
+                minimum_fact_nodes: max_fact_nodes.saturating_add(1),
+            };
+        }
     };
+    collect_admitted_tree(
+        spec,
+        grammar,
+        source,
+        tree,
+        &forest,
+        max_fact_nodes,
+        cancellation,
+        false,
+        None,
+    )
+}
+
+/// Extract facts and live-node joins from the same primary and embedded trees
+/// retained by semantic lowering. Synthetic wrappers are excluded.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn extract_file_facts_from_forest_limited<'tree>(
+    spec: &dyn StructuralSpec,
+    grammar: &TsLanguage,
+    tree: &'tree tree_sitter::Tree,
+    forest: &'tree EmbeddedSyntaxForest,
+    source: &str,
+    max_fact_nodes: usize,
+    cancellation: Option<&CancellationToken>,
+    hooks: Option<&dyn brokk_bifrost_core::analyzer::structural::spec::StructuralFileHooks<'tree>>,
+) -> LimitedFileFacts {
+    collect_admitted_tree(
+        spec,
+        grammar,
+        source,
+        tree,
+        forest,
+        max_fact_nodes,
+        cancellation,
+        true,
+        hooks,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_admitted_tree<'tree>(
+    spec: &dyn StructuralSpec,
+    grammar: &TsLanguage,
+    source: &str,
+    tree: &'tree tree_sitter::Tree,
+    forest: &'tree EmbeddedSyntaxForest,
+    max_fact_nodes: usize,
+    cancellation: Option<&CancellationToken>,
+    include_node_index: bool,
+    hooks: Option<&dyn brokk_bifrost_core::analyzer::structural::spec::StructuralFileHooks<'tree>>,
+) -> LimitedFileFacts {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return LimitedFileFacts::Cancelled;
+    }
+    if max_fact_nodes == 0 {
+        return LimitedFileFacts::Exceeded {
+            minimum_fact_nodes: 1,
+        };
+    }
     let compiled = CompiledKinds::compile(grammar, spec.kind_table());
     // One per-file scan, before any call site is classified: a language whose
     // call shapes depend on file-wide facts (C/C++ function-like macros) reads
@@ -211,7 +219,8 @@ fn extract_file_facts_limited_with_tree(
         brokk_bifrost_core::analyzer::tree_walk::ParentIndex::unindexed(),
         max_fact_nodes,
         cancellation,
-    );
+    )
+    .with_file_hooks(hooks);
     if !forest.register_occurrences(&mut source_facts, cancellation) {
         return LimitedFileFacts::Cancelled;
     }

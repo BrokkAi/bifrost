@@ -27,6 +27,9 @@ const MAX_HANDLER_SOURCE_BYTES: usize = 1024 * 1024;
 
 #[derive(Default)]
 pub(super) struct FailureHandlerStateCache {
+    /// The execution dependences marked through this cache; the query joins
+    /// it into its reuse verdict.
+    pub(super) reuse: ReuseVerdict,
     // Compatibility executions with no caller token share this query-owned
     // token; supplied cancellation is always forwarded instead.
     uncancelled: CancellationToken,
@@ -189,6 +192,10 @@ fn expansion_at(
         diagnostics.push(super::QueryExecutionState::diagnostic(
             analyzer,
             CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                 incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                 related: Vec::new(),
                 source: None,
@@ -456,6 +463,10 @@ pub(super) fn failure_handler_state_expansions(
     if native_seed {
         let workspace = workspace.expect("native failure-handler hooks require a workspace");
         let cancellation = cancellation.unwrap_or(&cache.uncancelled);
+        // Each file is filled once per capture-scoped memo, which shares this
+        // cache's lifetime, so joining a fill's verdict into `cache.reuse`
+        // covers every later hit on that file.
+        let reuse = &mut cache.reuse;
         let branches = if seed.language == Language::Go {
             cache
                 .go_branches
@@ -463,12 +474,14 @@ pub(super) fn failure_handler_state_expansions(
                     go_branches
                         .entry(seed.file.clone())
                         .or_insert_with(|| {
-                            go_failure_handler_file_body_shapes(
+                            let (shapes, verdict) = go_failure_handler_file_body_shapes(
                                 workspace,
                                 &seed.file,
                                 &syntax,
                                 cancellation,
-                            )
+                            );
+                            reuse.join_in(verdict);
+                            shapes
                         })
                         .get(&handler_seed)
                         .cloned()
@@ -480,7 +493,10 @@ pub(super) fn failure_handler_state_expansions(
                 .read_mut(&memo_attribution(analyzer), |rust_identities| {
                     let identities =
                         rust_identities.entry(seed.file.clone()).or_insert_with(|| {
-                            rust_failure_handler_identities(workspace, &seed.file, &syntax)
+                            let identities =
+                                rust_failure_handler_identities(workspace, &seed.file, &syntax);
+                            reuse.join_in(identities.reuse_verdict());
+                            identities
                         });
                     rust_failure_handler_body_shapes(identities, &syntax, handler_seed)
                 })
@@ -492,7 +508,10 @@ pub(super) fn failure_handler_state_expansions(
         let mut expansions = Vec::with_capacity(branches.len());
         for branch in branches {
             let (verdict, reason) = match branch.shape.state {
-                HandlerBodyState::Open(gap) => ("unknown", Some(handler_gap_label(analyzer, gap))),
+                HandlerBodyState::Open(gap) => (
+                    "unknown",
+                    Some(handler_gap_label(analyzer, &mut cache.reuse, gap)),
+                ),
                 HandlerBodyState::Nonempty => ("nonempty", branch.identity.gap()),
                 HandlerBodyState::Empty => match branch.identity.gap() {
                     Some(reason) => ("unknown", Some(reason)),
@@ -548,7 +567,10 @@ pub(super) fn failure_handler_state_expansions(
                 node_id,
             );
             let (verdict, reason) = match shape.state {
-                HandlerBodyState::Open(gap) => ("unknown", Some(handler_gap_label(analyzer, gap))),
+                HandlerBodyState::Open(gap) => (
+                    "unknown",
+                    Some(handler_gap_label(analyzer, &mut cache.reuse, gap)),
+                ),
                 HandlerBodyState::Nonempty => ("nonempty", None),
                 HandlerBodyState::Empty => ("empty", None),
             };
@@ -584,7 +606,7 @@ pub(super) fn failure_handler_state_expansions(
         let scope =
             brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::with_semantic_model_overlay(
                 csharp,
-                analyzer.semantic_model_overlay(),
+                analyzer.semantic_model_overlay_read().published(),
             );
         let facts = cache
             .regions
@@ -602,7 +624,10 @@ pub(super) fn failure_handler_state_expansions(
                 )
             });
         let (verdict, body_reason) = match facts.body.state {
-            HandlerBodyState::Open(gap) => ("unknown", Some(handler_gap_label(analyzer, gap))),
+            HandlerBodyState::Open(gap) => (
+                "unknown",
+                Some(handler_gap_label(analyzer, &mut cache.reuse, gap)),
+            ),
             HandlerBodyState::Nonempty => ("nonempty", None),
             HandlerBodyState::Empty => ("empty", None),
         };
@@ -629,15 +654,18 @@ pub(super) fn failure_handler_state_expansions(
     }
     let shape = classify.expect("catch language has a classifier")(&syntax, handler_seed);
     match shape.state {
-        HandlerBodyState::Open(gap) => expansion(
-            analyzer,
-            cache,
-            seed,
-            shape.body,
-            "unknown",
-            Some(handler_gap_label(analyzer, gap)),
-            diagnostics,
-        ),
+        HandlerBodyState::Open(gap) => {
+            let reason = handler_gap_label(analyzer, &mut cache.reuse, gap);
+            expansion(
+                analyzer,
+                cache,
+                seed,
+                shape.body,
+                "unknown",
+                Some(reason),
+                diagnostics,
+            )
+        }
         HandlerBodyState::Nonempty => expansion(
             analyzer,
             cache,
@@ -679,10 +707,12 @@ pub(super) fn result_ref(value: &FailureHandlerStateValue) -> CodeQueryResultRef
 
 fn handler_gap_label(
     analyzer: &dyn IAnalyzer,
+    reuse: &mut ReuseVerdict,
     gap: brokk_bifrost_analysis::analyzer::structural::failure_handlers::HandlerBodyGap,
 ) -> &'static str {
     if gap.execution_cause().is_some() {
         analyzer.mark_execution_dependent();
+        reuse.join_in(EXECUTION_DEPENDENT);
     }
     gap.label()
 }

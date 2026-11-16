@@ -51,8 +51,148 @@ pub(in crate::analyzer::semantic::ir) struct Boundaries {
     pub(in crate::analyzer::semantic::ir) exceptional_exit: ProgramPointId,
 }
 
+// Required construction scratch, dropped before publishing the immutable artifact.
+struct IndexedProcedure<'a> {
+    parts: &'a ProcedureSemanticsParts,
+    loaded_locations: HashSet<(ProgramPointId, MemoryLocationId)>,
+    load_points: HashSet<ProgramPointId>,
+    loaded_values: HashSet<ValueId>,
+    pattern_gaps: HashSet<(ProgramPointId, ValueId)>,
+    unknown_field_moves: HashSet<(ProgramPointId, ValueId, ValueId)>,
+    evidence_sources: HashSet<(EvidenceId, SourceMappingId)>,
+    #[cfg(any(test, feature = "test-support"))]
+    construction_steps: [usize; 4],
+}
+
+impl std::ops::Deref for IndexedProcedure<'_> {
+    type Target = ProcedureSemanticsParts;
+    fn deref(&self) -> &Self::Target {
+        self.parts
+    }
+}
+
+impl<'a> IndexedProcedure<'a> {
+    fn new(
+        parts: &'a ProcedureSemanticsParts,
+        cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+    ) -> Result<Self, SemanticIrError> {
+        let mut index = Self {
+            parts,
+            loaded_locations: HashSet::default(),
+            load_points: HashSet::default(),
+            loaded_values: HashSet::default(),
+            pattern_gaps: HashSet::default(),
+            unknown_field_moves: HashSet::default(),
+            evidence_sources: HashSet::default(),
+            #[cfg(any(test, feature = "test-support"))]
+            construction_steps: [0; 4],
+        };
+        for point in &parts.points {
+            for event in &point.events {
+                if cancellation.is_cancelled() {
+                    return Err(SemanticIrError::procedure(
+                        parts.id,
+                        SemanticIrErrorKind::Cancelled,
+                        "semantic validation cancelled",
+                    ));
+                }
+                #[cfg(any(test, feature = "test-support"))]
+                {
+                    index.construction_steps[0] += 1;
+                }
+                if let SemanticEffect::MemoryLoad {
+                    location, result, ..
+                } = event.effect
+                {
+                    index.loaded_locations.insert((point.id, location));
+                    index.load_points.insert(point.id);
+                    index.loaded_values.insert(result);
+                }
+            }
+        }
+        for gap in &parts.gaps {
+            if cancellation.is_cancelled() {
+                return Err(SemanticIrError::procedure(
+                    parts.id,
+                    SemanticIrErrorKind::Cancelled,
+                    "semantic validation cancelled",
+                ));
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            {
+                index.construction_steps[1] += 1;
+            }
+            if let SemanticGapSubject::Value(value) = gap.subject
+                && gap.capability == SemanticCapability::Values
+                && gap.impacts.contains(SemanticGapImpact::ValueFlow)
+            {
+                index.pattern_gaps.insert((gap.point, value));
+            }
+        }
+        for fact in &parts.move_outs {
+            if cancellation.is_cancelled() {
+                return Err(SemanticIrError::procedure(
+                    parts.id,
+                    SemanticIrErrorKind::Cancelled,
+                    "semantic validation cancelled",
+                ));
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            {
+                index.construction_steps[2] += 1;
+            }
+            if fact.state_after == MoveOutState::Unknown
+                && matches!(fact.place, SemanticPlace::MemoryLocation(location) if parts.memory_locations.get(location.index()).is_some_and(|row| matches!(row.kind, MemoryLocationKind::Field { .. })))
+            {
+                index.unknown_field_moves.insert((
+                    fact.point,
+                    fact.source_value,
+                    fact.target_value,
+                ));
+            }
+        }
+        for (row, evidence) in parts.evidence_rows.iter().enumerate() {
+            for source in &evidence.sources {
+                if cancellation.is_cancelled() {
+                    return Err(SemanticIrError::procedure(
+                        parts.id,
+                        SemanticIrErrorKind::Cancelled,
+                        "semantic validation cancelled",
+                    ));
+                }
+                #[cfg(any(test, feature = "test-support"))]
+                {
+                    index.construction_steps[3] += 1;
+                }
+                index
+                    .evidence_sources
+                    .insert((EvidenceId::new(row as u32), *source));
+            }
+        }
+        Ok(index)
+    }
+
+    fn runtime_read(&self, gap: &SemanticGap) -> bool {
+        match (gap.capability, gap.subject) {
+            (
+                SemanticCapability::FieldMemory | SemanticCapability::IndexMemory,
+                SemanticGapSubject::MemoryLocation(location),
+            ) => self.loaded_locations.contains(&(gap.point, location)),
+            (SemanticCapability::ExceptionalControlFlow, SemanticGapSubject::Point) => {
+                self.load_points.contains(&gap.point)
+            }
+            (SemanticCapability::Calls, SemanticGapSubject::Value(value)) => {
+                self.loaded_values.contains(&value)
+            }
+            _ => false,
+        }
+    }
+}
+
 #[derive(Default)]
 struct ControlEdgeIndex {
+    #[cfg(any(test, feature = "test-support"))]
+    validation_steps: usize,
     exact: HashSet<(
         ProgramPointId,
         ProgramPointId,
@@ -184,7 +324,7 @@ pub(super) fn measure_artifact_work(
     key: &SemanticArtifactKey,
     procedures: &[ProcedureSemanticsParts],
     go_predeclared_builtin_assumptions: &[GoPredeclaredBuiltin],
-) -> SemanticWork {
+) -> (SemanticWork, SemanticWork) {
     let mut work = SemanticWork {
         procedures: procedures.len(),
         owned_text_bytes: key
@@ -198,13 +338,15 @@ pub(super) fn measure_artifact_work(
         .nested_entries
         .saturating_add(go_predeclared_builtin_assumptions.len());
 
+    let mut guarded = SemanticWork::default();
     for procedure in procedures {
-        let mut census = measure_procedure_work(procedure);
+        let mut census = measure_base_procedure_work(procedure);
         census.procedures = 0;
         work = work.conservative_add(census);
+        guarded = guarded.conservative_add(measure_guarded_procedure_work(procedure));
     }
 
-    work
+    (work, work.conservative_add(guarded))
 }
 
 fn account_target_resolution(resolution: &CallableTargetResolution, work: &mut SemanticWork) {
@@ -275,7 +417,14 @@ pub(in crate::analyzer::semantic::ir) fn validate_artifact(
     key: &SemanticArtifactKey,
     capabilities: &SemanticCapabilities,
     procedures: &[ProcedureSemanticsParts],
+    cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
 ) -> Result<(), SemanticIrError> {
+    if cancellation.is_cancelled() {
+        return Err(SemanticIrError::artifact(
+            SemanticIrErrorKind::Cancelled,
+            "semantic validation cancelled",
+        ));
+    }
     if key.language().language() == brokk_bifrost_core::analyzer::model::Language::None {
         return Err(SemanticIrError::artifact(
             SemanticIrErrorKind::ArtifactIdentity,
@@ -352,15 +501,42 @@ pub(in crate::analyzer::semantic::ir) fn validate_artifact(
                 .map(|capture| (capture.target, capture.destination))
         })
         .collect();
+    let context = procedures
+        .iter()
+        .map(|procedure| ProcedureValidation {
+            id: procedure.id,
+            locator: &procedure.locator,
+            lexical_parent: procedure.lexical_parent,
+            memory_locations: &procedure.memory_locations,
+        })
+        .collect::<Vec<_>>();
     for procedure in procedures {
+        if cancellation.is_cancelled() {
+            return Err(SemanticIrError::artifact(
+                SemanticIrErrorKind::Cancelled,
+                "semantic validation cancelled",
+            ));
+        }
         validate_procedure(
             key,
             capabilities,
-            procedures,
+            &context,
             &locators,
             procedure,
             &capture_destinations,
+            cancellation,
         )?;
+        if let Some(alternate) = &procedure.candidate_alternate {
+            validate_procedure(
+                key,
+                capabilities,
+                &context,
+                &locators,
+                &alternate.parts,
+                &capture_destinations,
+                cancellation,
+            )?;
+        }
     }
     Ok(())
 }
@@ -424,17 +600,82 @@ fn validate_parent_forest(procedures: &[ProcedureSemanticsParts]) -> Result<(), 
     Ok(())
 }
 
+struct ProcedureValidation<'a> {
+    id: ProcedureId,
+    locator: &'a SemanticLocator,
+    lexical_parent: Option<ProcedureId>,
+    memory_locations: &'a [MemoryLocation],
+}
+
+pub(super) fn validate_ownership_projection(
+    base: &super::artifact::SemanticArtifact,
+    target: &ProcedureSemanticsParts,
+    cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+) -> Result<(), SemanticIrError> {
+    let Some(original) = base.procedure(target.id) else {
+        return Err(SemanticIrError::procedure(
+            target.id,
+            SemanticIrErrorKind::OutOfBounds,
+            "ownership target is absent",
+        ));
+    };
+    if original.locator() != &target.locator || original.lexical_parent() != target.lexical_parent {
+        return Err(SemanticIrError::procedure(
+            target.id,
+            SemanticIrErrorKind::CallContract,
+            "ownership projection changed target topology",
+        ));
+    }
+    let procedures = base
+        .procedures()
+        .iter()
+        .map(|procedure| ProcedureValidation {
+            id: procedure.id(),
+            locator: procedure.locator(),
+            lexical_parent: procedure.lexical_parent(),
+            memory_locations: procedure.memory_locations(),
+        })
+        .collect::<Vec<_>>();
+    let locators = base
+        .procedures()
+        .iter()
+        .map(|procedure| (procedure.locator().clone(), procedure.id()))
+        .collect();
+    let captures = base
+        .procedures()
+        .iter()
+        .flat_map(|procedure| {
+            procedure
+                .captures()
+                .iter()
+                .map(|capture| (capture.target, capture.destination))
+        })
+        .collect();
+    validate_procedure(
+        base.key(),
+        base.capabilities(),
+        &procedures,
+        &locators,
+        target,
+        &captures,
+        cancellation,
+    )?;
+    Ok(())
+}
+
 fn validate_procedure(
     key: &SemanticArtifactKey,
     capabilities: &SemanticCapabilities,
-    procedures: &[ProcedureSemanticsParts],
+    procedures: &[ProcedureValidation<'_>],
     procedure_locators: &ProcedureLocatorIndex,
     procedure: &ProcedureSemanticsParts,
     capture_destinations: &CaptureDestinationIndex,
+    cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
 ) -> Result<(), SemanticIrError> {
     let id = procedure.id;
 
     validate_dense_rows(procedure)?;
+    let procedure = &IndexedProcedure::new(procedure, cancellation)?;
     let span = procedure.locator.anchor().span();
     if procedure
         .source_range_holes
@@ -521,11 +762,62 @@ fn validate_procedure(
     for gap in &procedure.gaps {
         ensure_point(id, gap.point, procedure.points.len(), "gap point")?;
         validate_metadata(id, gap.source, gap.evidence, procedure, "gap")?;
+        if gap.dispatch != super::model::CallTargetDispatch::Unspecified
+            && !(matches!(gap.subject, SemanticGapSubject::CallSite(_))
+                && gap.capability == SemanticCapability::Calls)
+        {
+            return Err(SemanticIrError::procedure(
+                id,
+                SemanticIrErrorKind::GapContract,
+                format!(
+                    "gap {} carries dispatch metadata outside a call-target gap",
+                    gap.id
+                ),
+            ));
+        }
         if gap.detail.is_empty() {
             return Err(SemanticIrError::procedure(
                 id,
                 SemanticIrErrorKind::GapContract,
                 format!("gap {} has no diagnostic detail", gap.id),
+            ));
+        }
+        if gap.subject == SemanticGapSubject::FutureConstruction
+            && (procedure.properties.invocation
+                != super::model::ProcedureInvocationKind::DeferredBody
+                || !procedure.points[gap.point.index()]
+                    .events
+                    .iter()
+                    .any(|event| matches!(event.effect, SemanticEffect::Entry))
+                || gap.capability != SemanticCapability::DeferredExecution)
+        {
+            return Err(SemanticIrError::procedure(
+                id,
+                SemanticIrErrorKind::GapContract,
+                "future construction obligation requires a deferred body's entry",
+            ));
+        }
+        if gap.subject == SemanticGapSubject::FutureActivation
+            && (!async_suspends.contains_key(&gap.point)
+                || !matches!(
+                    gap.capability,
+                    SemanticCapability::Calls | SemanticCapability::AsyncSuspendResume
+                ))
+        {
+            return Err(SemanticIrError::procedure(
+                id,
+                SemanticIrErrorKind::GapContract,
+                "future activation obligation requires an exact suspension point",
+            ));
+        }
+        if gap.discharge == SemanticGapDischarge::DataDependency
+            && (!matches!(gap.subject, SemanticGapSubject::Value(_))
+                || gap.capability != SemanticCapability::Calls)
+        {
+            return Err(SemanticIrError::procedure(
+                id,
+                SemanticIrErrorKind::GapContract,
+                "data-dependency obligations require an exact withheld value",
             ));
         }
         if gap.discharge == SemanticGapDischarge::CallResolution
@@ -582,7 +874,9 @@ fn validate_procedure(
         ) && (gap.capability != SemanticCapability::ExceptionalControlFlow
             || !matches!(
                 gap.subject,
-                SemanticGapSubject::Point | SemanticGapSubject::Value(_)
+                SemanticGapSubject::Point
+                    | SemanticGapSubject::Value(_)
+                    | SemanticGapSubject::CleanupOwners(_)
             )
             || !matches!(
                 gap.kind,
@@ -598,6 +892,34 @@ fn validate_procedure(
                 ),
             ));
         }
+        if gap.discharge == SemanticGapDischarge::ImplicitDropExecution
+            && (!matches!(
+                (gap.capability, gap.kind),
+                (
+                    SemanticCapability::CleanupControlFlow
+                        | SemanticCapability::ResourceManagement
+                        | SemanticCapability::Calls,
+                    SemanticGapKind::Unknown
+                ) | (
+                    SemanticCapability::ExceptionalControlFlow,
+                    SemanticGapKind::Unsupported
+                )
+            ) || !matches!(
+                gap.subject,
+                SemanticGapSubject::Point
+                    | SemanticGapSubject::Value(_)
+                    | SemanticGapSubject::CleanupOwners(_)
+            ))
+        {
+            return Err(SemanticIrError::procedure(
+                id,
+                SemanticIrErrorKind::GapContract,
+                format!(
+                    "gap {} declares implicit drop execution outside a cleanup, resource, call or exceptional drop omission",
+                    gap.id
+                ),
+            ));
+        }
         if gap.discharge == SemanticGapDischarge::ExitOnlyProcedureCompletion
             && (!matches!(
                 (gap.capability, gap.subject),
@@ -606,7 +928,9 @@ fn validate_procedure(
                     SemanticGapSubject::Point
                 ) | (
                     SemanticCapability::ExceptionalControlFlow,
-                    SemanticGapSubject::Point | SemanticGapSubject::Value(_)
+                    SemanticGapSubject::Point
+                        | SemanticGapSubject::Value(_)
+                        | SemanticGapSubject::CleanupOwners(_)
                 )
             ) || !matches!(
                 gap.kind,
@@ -623,31 +947,7 @@ fn validate_procedure(
             ));
         }
         if gap.discharge == SemanticGapDischarge::RuntimeReadBehavior {
-            let valid_subject = match (gap.capability, gap.subject) {
-                (SemanticCapability::FieldMemory | SemanticCapability::IndexMemory,
-                    SemanticGapSubject::MemoryLocation(location)) => {
-                    procedure.points[gap.point.index()].events.iter().any(|event| {
-                        matches!(event.effect, SemanticEffect::MemoryLoad { location: found, .. } if found == location)
-                    })
-                }
-                (SemanticCapability::ExceptionalControlFlow, SemanticGapSubject::Point) => {
-                    procedure.points[gap.point.index()].events.iter().any(|event| {
-                        matches!(event.effect, SemanticEffect::MemoryLoad { .. })
-                    })
-                }
-                // A claim about what produced a loaded value. The claim is
-                // published ahead of the load, because a read that abandons
-                // control never performs it, so the load is elsewhere in the
-                // procedure rather than at this point.
-                (SemanticCapability::Calls, SemanticGapSubject::Value(value)) => {
-                    procedure.points.iter().any(|point| {
-                        point.events.iter().any(|event| {
-                            matches!(event.effect, SemanticEffect::MemoryLoad { result, .. } if result == value)
-                        })
-                    })
-                }
-                _ => false,
-            };
+            let valid_subject = procedure.runtime_read(gap);
             if !valid_subject
                 || !matches!(
                     gap.kind,
@@ -962,12 +1262,12 @@ fn validate_procedure(
         )?;
     }
     validate_receiver_type_facts(procedure)?;
-    validate_guarded_pattern_projections(procedure)?;
+    validate_guarded_pattern_projections_indexed(procedure)?;
 
     validate_blocks(procedure)?;
     validate_statement_entries(procedure)?;
     validate_loop_sites(procedure)?;
-    let control_edges = validate_control_edges(capabilities, procedure)?;
+    let control_edges = validate_control_edges(capabilities, procedure, cancellation)?;
     validate_lifecycle_pointer_rows(
         key,
         procedures,
@@ -1034,7 +1334,7 @@ fn validate_receiver_type_facts(
     Ok(())
 }
 
-fn validate_loop_sites(procedure: &ProcedureSemanticsParts) -> Result<(), SemanticIrError> {
+fn validate_loop_sites(procedure: &IndexedProcedure<'_>) -> Result<(), SemanticIrError> {
     for site in &procedure.loop_sites {
         validate_metadata(
             procedure.id,
@@ -1066,7 +1366,7 @@ fn validate_loop_sites(procedure: &ProcedureSemanticsParts) -> Result<(), Semant
     Ok(())
 }
 
-fn validate_statement_entries(procedure: &ProcedureSemanticsParts) -> Result<(), SemanticIrError> {
+fn validate_statement_entries(procedure: &IndexedProcedure<'_>) -> Result<(), SemanticIrError> {
     for site in &procedure.statement_entries {
         validate_metadata(
             procedure.id,
@@ -1115,14 +1415,14 @@ fn has_exact_local_source_mapping(
 }
 
 fn has_complete_source_proof(
-    procedure: &ProcedureSemanticsParts,
+    procedure: &IndexedProcedure<'_>,
     source: SourceMappingId,
     evidence: EvidenceId,
 ) -> bool {
     let evidence = &procedure.evidence_rows[evidence.index()];
     evidence.proof == ProofStatus::Proven
         && evidence.completeness == EvidenceCompleteness::Complete
-        && evidence.sources.contains(&source)
+        && procedure.evidence_sources.contains(&(evidence.id, source))
 }
 
 fn validate_dense_rows(procedure: &ProcedureSemanticsParts) -> Result<(), SemanticIrError> {
@@ -1159,11 +1459,36 @@ fn validate_dense_rows(procedure: &ProcedureSemanticsParts) -> Result<(), Semant
     Ok(())
 }
 
-fn validate_guarded_pattern_projections(
-    procedure: &ProcedureSemanticsParts,
+fn validate_guarded_pattern_projections_indexed(
+    procedure: &IndexedProcedure<'_>,
 ) -> Result<(), SemanticIrError> {
+    let mut linked_gaps = HashSet::default();
     for (ordinal, candidate) in procedure.guarded_pattern_projections.iter().enumerate() {
-        if candidate.ordinal as usize != ordinal
+        if candidate.path.iter().any(|step| {
+            matches!(
+                step,
+                PatternProjectionStep::Variant { .. } | PatternProjectionStep::Element
+            )
+        }) {
+            return Err(SemanticIrError::procedure(
+                procedure.id,
+                SemanticIrErrorKind::ValueFlowContract,
+                "variant and element projections are endpoint-only and cannot enter guarded-pattern IR",
+            ));
+        }
+        let valid_link = candidate.gap.is_none_or(|id| {
+            linked_gaps.insert(id)
+                && procedure.gaps.get(id.index()).is_some_and(|gap| {
+                    gap.id == id
+                        && gap.point == candidate.point
+                        && gap.subject == SemanticGapSubject::Value(candidate.binder)
+                        && gap.capability == SemanticCapability::Values
+                        && gap.kind == SemanticGapKind::Unsupported
+                        && gap.impacts.contains(SemanticGapImpact::ValueFlow)
+                })
+        });
+        if !valid_link
+            || candidate.ordinal as usize != ordinal
             || candidate.point.index() >= procedure.points.len()
             || candidate.whole_value.index() >= procedure.values.len()
             || candidate.binder.index() >= procedure.values.len()
@@ -1190,12 +1515,9 @@ fn validate_guarded_pattern_projections(
                 .any(|step| matches!(step, PatternProjectionStep::Named(name) if name.is_empty()))
             || candidate.status != PatternProjectionStatus::Unevaluated
             || procedure.values[candidate.binder.index()].source != candidate.binder_source
-            || !procedure.gaps.iter().any(|gap| {
-                gap.point == candidate.point
-                    && gap.subject == SemanticGapSubject::Value(candidate.binder)
-                    && gap.capability == SemanticCapability::Values
-                    && gap.impacts.contains(SemanticGapImpact::ValueFlow)
-            })
+            || !procedure
+                .pattern_gaps
+                .contains(&(candidate.point, candidate.binder))
         {
             return Err(SemanticIrError::procedure(
                 procedure.id,
@@ -1207,43 +1529,194 @@ fn validate_guarded_pattern_projections(
     Ok(())
 }
 
-fn validate_lifecycle_pointer_rows(
-    key: &SemanticArtifactKey,
-    procedures: &[ProcedureSemanticsParts],
+/// Validate candidate structure and exact optional gap ownership after row decoding.
+/// This grants no query-time admission or permission to discharge that gap.
+pub fn validate_guarded_pattern_projections(
+    procedure: &ProcedureSemanticsParts,
+) -> Result<(), SemanticIrError> {
+    let indexed = IndexedProcedure::new(procedure, &Default::default())?;
+    validate_guarded_pattern_projections_indexed(&indexed)
+}
+
+fn validate_invalidation_target(
+    procedure: &ProcedureSemanticsParts,
+    target: PointerInvalidationTarget,
+) -> Result<(), SemanticIrError> {
+    match target {
+        PointerInvalidationTarget::Pointer(pointer) => ensure_value(
+            procedure.id,
+            pointer,
+            procedure.values.len(),
+            "pointer-invalidation pointer value",
+        ),
+        PointerInvalidationTarget::Origin(origin) => ensure_index(
+            procedure.id,
+            "pointer-invalidation origin",
+            origin.index(),
+            procedure.pointer_origins.len(),
+        ),
+    }
+}
+
+fn validate_drop_behavior(
+    procedures: &[ProcedureValidation<'_>],
     procedure_locators: &ProcedureLocatorIndex,
     procedure: &ProcedureSemanticsParts,
+    behavior: &DropBehavior,
+    evidence: EvidenceId,
+) -> Result<(), SemanticIrError> {
+    let id = procedure.id;
+    match behavior {
+        DropBehavior::Trivial => {
+            let evidence = &procedure.evidence_rows[evidence.index()];
+            if !evidence
+                .proof
+                .establishes_complete_evidence(&evidence.completeness)
+            {
+                return Err(SemanticIrError::procedure(
+                    id,
+                    SemanticIrErrorKind::LifecycleContract,
+                    "a trivial drop requires proven complete evidence",
+                ));
+            }
+        }
+        DropBehavior::Destructor(targets) => {
+            validate_target_resolution(
+                id,
+                procedures,
+                procedure_locators,
+                targets,
+                &procedure.evidence_rows[evidence.index()].proof,
+                "drop destructor target",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_lifecycle_pointer_rows(
+    key: &SemanticArtifactKey,
+    procedures: &[ProcedureValidation<'_>],
+    procedure_locators: &ProcedureLocatorIndex,
+    procedure: &IndexedProcedure<'_>,
     control_edges: &ControlEdgeIndex,
 ) -> Result<(), SemanticIrError> {
     let id = procedure.id;
-    for fact in &procedure.drops {
-        validate_semantic_place(key, procedure, &fact.place, "drop place")?;
-        ensure_point(id, fact.point, procedure.points.len(), "drop point")?;
-        validate_fact_metadata(id, fact.source, fact.evidence, procedure, "drop")?;
-        match &fact.behavior {
-            DropBehavior::Trivial => {
-                let evidence = &procedure.evidence_rows[fact.evidence.index()];
-                if !evidence
+    for node in procedure.cleanup_chains.nodes() {
+        for entry in &node.actions {
+            use crate::analyzer::semantic::cfg::ScopeCleanupAction;
+            let (place, source, evidence) = match &entry.action {
+                ScopeCleanupAction::Drop {
+                    place,
+                    behavior,
+                    source,
+                    evidence,
+                } => {
+                    validate_fact_metadata(id, *source, *evidence, procedure, "cleanup drop")?;
+                    validate_drop_behavior(
+                        procedures,
+                        procedure_locators,
+                        procedure,
+                        behavior,
+                        *evidence,
+                    )?;
+                    (place, *source, *evidence)
+                }
+                ScopeCleanupAction::ScopeEnd {
+                    place,
+                    source,
+                    evidence,
+                } => (place, *source, *evidence),
+            };
+            validate_semantic_place(key, procedure, place, "cleanup action place")?;
+            validate_fact_metadata(id, source, evidence, procedure, "cleanup action")?;
+            if let Some(incomplete) = &entry.incomplete {
+                validate_fact_metadata(
+                    id,
+                    source,
+                    incomplete.evidence,
+                    procedure,
+                    "cleanup incomplete",
+                )?;
+                let evidence = &procedure.evidence_rows[incomplete.evidence.index()];
+                if evidence
                     .proof
                     .establishes_complete_evidence(&evidence.completeness)
                 {
                     return Err(SemanticIrError::procedure(
                         id,
-                        SemanticIrErrorKind::LifecycleContract,
-                        "a trivial drop requires proven complete evidence",
+                        SemanticIrErrorKind::PointerContract,
+                        "an incomplete fact cannot cite proven complete evidence",
                     ));
                 }
             }
-            DropBehavior::Destructor(targets) => {
-                validate_target_resolution(
-                    id,
-                    procedures,
-                    procedure_locators,
-                    targets,
-                    &procedure.evidence_rows[fact.evidence.index()].proof,
-                    "drop destructor target",
-                )?;
+        }
+        for owner in &node.owners {
+            ensure_value(id, owner.value, procedure.values.len(), "cleanup owner")?;
+            validate_semantic_place(key, procedure, &owner.place, "cleanup owner place")?;
+            validate_fact_metadata(id, owner.source, owner.evidence, procedure, "cleanup owner")?;
+            if let Some(invalidation) = owner.invalidation {
+                validate_invalidation_target(procedure, invalidation.target)?;
             }
         }
+    }
+    // Projection bounds and segment order are arena invariants, checked once
+    // by CleanupChains construction for lowered and hydrated arenas alike.
+    for anchor in procedure.cleanup_chains.anchors() {
+        for (context, offset, len) in [
+            (
+                "cleanup drop offset",
+                anchor.drop_offset,
+                procedure.drops.len(),
+            ),
+            (
+                "cleanup scope-end offset",
+                anchor.scope_end_offset,
+                procedure.scope_ends.len(),
+            ),
+            (
+                "cleanup incomplete offset",
+                anchor.incomplete_offset,
+                procedure.incomplete_facts.len(),
+            ),
+            (
+                "cleanup invalidation offset",
+                anchor.pointer_invalidation_offset,
+                procedure.pointer_invalidations.len(),
+            ),
+        ] {
+            if offset as usize > len {
+                return Err(SemanticIrError::procedure(
+                    id,
+                    SemanticIrErrorKind::OutOfBounds,
+                    format!("{context} {offset} exceeds direct table length {len}"),
+                ));
+            }
+        }
+        ensure_point(
+            id,
+            anchor.point,
+            procedure.points.len(),
+            "cleanup anchor point",
+        )?;
+        ensure_point(
+            id,
+            anchor.destination,
+            procedure.points.len(),
+            "cleanup anchor destination",
+        )?;
+    }
+    for fact in &procedure.drops {
+        validate_semantic_place(key, procedure, &fact.place, "drop place")?;
+        ensure_point(id, fact.point, procedure.points.len(), "drop point")?;
+        validate_fact_metadata(id, fact.source, fact.evidence, procedure, "drop")?;
+        validate_drop_behavior(
+            procedures,
+            procedure_locators,
+            procedure,
+            &fact.behavior,
+            fact.evidence,
+        )?;
     }
 
     for fact in &procedure.move_outs {
@@ -1449,20 +1922,7 @@ fn validate_lifecycle_pointer_rows(
             procedure.points.len(),
             "pointer-invalidation point",
         )?;
-        match fact.target {
-            PointerInvalidationTarget::Pointer(pointer) => ensure_value(
-                id,
-                pointer,
-                procedure.values.len(),
-                "pointer-invalidation pointer value",
-            )?,
-            PointerInvalidationTarget::Origin(origin) => ensure_index(
-                id,
-                "pointer-invalidation origin",
-                origin.index(),
-                procedure.pointer_origins.len(),
-            )?,
-        }
+        validate_invalidation_target(procedure, fact.target)?;
         validate_fact_metadata(
             id,
             fact.source,
@@ -1557,14 +2017,11 @@ fn validate_fact_metadata(
     procedure: ProcedureId,
     source: SourceMappingId,
     evidence: EvidenceId,
-    parts: &ProcedureSemanticsParts,
+    parts: &IndexedProcedure<'_>,
     context: &str,
 ) -> Result<(), SemanticIrError> {
     validate_metadata(procedure, source, evidence, parts, context)?;
-    if !parts.evidence_rows[evidence.index()]
-        .sources
-        .contains(&source)
-    {
+    if !parts.evidence_sources.contains(&(evidence, source)) {
         return Err(SemanticIrError::procedure(
             procedure,
             SemanticIrErrorKind::SourceScope,
@@ -1656,6 +2113,31 @@ fn validate_switch_edge(
     Ok(())
 }
 
+/// A guard contract violation, located at the guard's own source range so a
+/// reader can find the construct the producer lowered wrongly (#11755).
+fn guard_contract_error(
+    procedure: &ProcedureSemanticsParts,
+    source: SourceMappingId,
+    detail: String,
+) -> SemanticIrError {
+    // `validate_metadata` already proved every guard's source mapping exists.
+    let locator = &procedure.source_mappings[source.index()].locator;
+    let span = locator.anchor().span();
+    let location = format!(
+        "{}:{}:{} (bytes {}..{})",
+        locator.path().as_str(),
+        span.start().line() + 1,
+        span.start().byte_column() + 1,
+        span.start_byte(),
+        span.end_byte()
+    );
+    SemanticIrError::procedure(
+        procedure.id,
+        SemanticIrErrorKind::GuardContract,
+        format!("{detail} at {location}"),
+    )
+}
+
 /// Guard rows say something about control, so every id they name has to be one
 /// this procedure owns (issue #2443).
 ///
@@ -1700,9 +2182,9 @@ fn validate_guard_facts(
                 "guard arm target",
             )?;
             if !control_edges.contains(guard.point, arm.target_point, arm.kind) {
-                return Err(SemanticIrError::procedure(
-                    id,
-                    SemanticIrErrorKind::GuardContract,
+                return Err(guard_contract_error(
+                    procedure,
+                    guard.source,
                     format!(
                         "guard {} declares a {label} arm {} -> {} ({}) that is not an edge of its own point",
                         guard.id,
@@ -1716,9 +2198,9 @@ fn validate_guard_facts(
         if let (Some(true_arm), Some(false_arm)) = (guard.true_arm, guard.false_arm)
             && true_arm == false_arm
         {
-            return Err(SemanticIrError::procedure(
-                id,
-                SemanticIrErrorKind::GuardContract,
+            return Err(guard_contract_error(
+                procedure,
+                guard.source,
                 format!("guard {} declares one edge as both outcomes", guard.id),
             ));
         }
@@ -1728,9 +2210,9 @@ fn validate_guard_facts(
         if let GuardPredicate::ConstantEquality { constant, .. } = guard.predicate {
             ensure_value(id, constant, procedure.values.len(), "guard constant")?;
             if !procedure.values[constant.index()].kind.is_constant() {
-                return Err(SemanticIrError::procedure(
-                    id,
-                    SemanticIrErrorKind::GuardContract,
+                return Err(guard_contract_error(
+                    procedure,
+                    guard.source,
                     format!(
                         "guard {} compares against value {constant}, which is a {} rather than a constant",
                         guard.id,
@@ -1741,9 +2223,9 @@ fn validate_guard_facts(
         }
         if let GuardPredicate::OrderedIntegerComparison { constant, .. } = guard.predicate {
             let Some(subject) = guard.subject else {
-                return Err(SemanticIrError::procedure(
-                    id,
-                    SemanticIrErrorKind::GuardContract,
+                return Err(guard_contract_error(
+                    procedure,
+                    guard.source,
                     format!("ordered integer guard {} has no subject", guard.id),
                 ));
             };
@@ -1754,13 +2236,13 @@ fn validate_guard_facts(
                 procedure.values.len(),
                 "ordered guard constant",
             )?;
-            if !matches!(
-                procedure.values[constant.index()].kind,
-                SemanticValueKind::UnsignedInteger(_) | SemanticValueKind::SignedInteger(_)
-            ) {
-                return Err(SemanticIrError::procedure(
-                    id,
-                    SemanticIrErrorKind::GuardContract,
+            if !procedure.values[constant.index()]
+                .kind
+                .is_represented_integer()
+            {
+                return Err(guard_contract_error(
+                    procedure,
+                    guard.source,
                     format!(
                         "ordered integer guard {} compares against value {constant}, which is a {} rather than a represented integer",
                         guard.id,
@@ -1771,9 +2253,9 @@ fn validate_guard_facts(
         }
         if let GuardPredicate::OrderedFloatComparison { constant, .. } = guard.predicate {
             let Some(subject) = guard.subject else {
-                return Err(SemanticIrError::procedure(
-                    id,
-                    SemanticIrErrorKind::GuardContract,
+                return Err(guard_contract_error(
+                    procedure,
+                    guard.source,
                     format!("ordered floating guard {} has no subject", guard.id),
                 ));
             };
@@ -1788,9 +2270,9 @@ fn validate_guard_facts(
                 procedure.values[constant.index()].kind,
                 SemanticValueKind::FloatingPoint { .. }
             ) {
-                return Err(SemanticIrError::procedure(
-                    id,
-                    SemanticIrErrorKind::GuardContract,
+                return Err(guard_contract_error(
+                    procedure,
+                    guard.source,
                     format!(
                         "ordered floating guard {} compares against value {constant}, which is a {} rather than a represented floating constant",
                         guard.id,
@@ -1802,9 +2284,9 @@ fn validate_guard_facts(
         if matches!(guard.predicate, GuardPredicate::NanComparison { .. })
             && guard.subject.is_none()
         {
-            return Err(SemanticIrError::procedure(
-                id,
-                SemanticIrErrorKind::GuardContract,
+            return Err(guard_contract_error(
+                procedure,
+                guard.source,
                 format!("NaN comparison guard {} has no subject", guard.id),
             ));
         }
@@ -1834,7 +2316,7 @@ fn validate_guard_facts(
 }
 
 fn validate_memory_location(
-    procedures: &[ProcedureSemanticsParts],
+    procedures: &[ProcedureValidation<'_>],
     procedure: &ProcedureSemanticsParts,
     location: &MemoryLocation,
     capture_destinations: &CaptureDestinationIndex,
@@ -1962,7 +2444,10 @@ fn validate_gap_subject(
     gap: &SemanticGap,
 ) -> Result<(), SemanticIrError> {
     match gap.subject {
-        SemanticGapSubject::Procedure | SemanticGapSubject::Point => {}
+        SemanticGapSubject::Procedure
+        | SemanticGapSubject::Point
+        | SemanticGapSubject::FutureConstruction
+        | SemanticGapSubject::FutureActivation => {}
         SemanticGapSubject::Value(value) => {
             ensure_value(
                 procedure_id,
@@ -1970,6 +2455,18 @@ fn validate_gap_subject(
                 procedure.values.len(),
                 "gap subject value",
             )?;
+        }
+        SemanticGapSubject::CleanupOwners(segment) => {
+            procedure
+                .cleanup_chains
+                .validate_segment(segment)
+                .map_err(|error| {
+                    SemanticIrError::procedure(
+                        procedure_id,
+                        SemanticIrErrorKind::AsyncContract,
+                        format!("invalid cleanup gap segment: {error:?}"),
+                    )
+                })?;
         }
         SemanticGapSubject::MemoryLocation(location) => {
             ensure_location(
@@ -2215,7 +2712,7 @@ fn validate_capture_consistency(
 }
 
 fn validate_capture_row(
-    procedures: &[ProcedureSemanticsParts],
+    procedures: &[ProcedureValidation<'_>],
     procedure: &ProcedureSemanticsParts,
     capture: &CaptureBinding,
     gaps: &GapIndex,
@@ -2360,7 +2857,7 @@ fn validate_capture_row(
 }
 
 fn validate_call_site(
-    procedures: &[ProcedureSemanticsParts],
+    procedures: &[ProcedureValidation<'_>],
     procedure_locators: &ProcedureLocatorIndex,
     procedure: &ProcedureSemanticsParts,
     call_site: &SemanticCallSite,
@@ -2500,7 +2997,7 @@ fn validate_call_site(
 
 fn validate_target_resolution(
     procedure: ProcedureId,
-    procedures: &[ProcedureSemanticsParts],
+    procedures: &[ProcedureValidation<'_>],
     procedure_locators: &ProcedureLocatorIndex,
     resolution: &CallableTargetResolution,
     proof: &ProofStatus,
@@ -2608,7 +3105,7 @@ fn validate_target_resolution(
 
 fn validate_procedure_target_locator(
     procedure: ProcedureId,
-    procedures: &[ProcedureSemanticsParts],
+    procedures: &[ProcedureValidation<'_>],
     locator: &SemanticLocator,
     context: &str,
 ) -> Result<(), SemanticIrError> {
@@ -2723,11 +3220,46 @@ fn validate_blocks(procedure: &ProcedureSemanticsParts) -> Result<(), SemanticIr
 
 fn validate_control_edges(
     capabilities: &SemanticCapabilities,
-    procedure: &ProcedureSemanticsParts,
+    procedure: &IndexedProcedure<'_>,
+    cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
 ) -> Result<ControlEdgeIndex, SemanticIrError> {
     let id = procedure.id;
+    // Exactly the old candidate predicate: subject and kind select eligible
+    // gaps; every other compared field is part of the membership key.
     let mut edges = ControlEdgeIndex::default();
+    let mut candidate_gaps = HashSet::default();
+    for gap in &procedure.gaps {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            edges.validation_steps += 1;
+        }
+        if cancellation.is_cancelled() {
+            return Err(SemanticIrError::artifact(
+                SemanticIrErrorKind::Cancelled,
+                "semantic validation cancelled",
+            ));
+        }
+        if gap.subject == SemanticGapSubject::Point && gap.kind == SemanticGapKind::Unproven {
+            candidate_gaps.insert((
+                gap.point,
+                gap.capability,
+                gap.evidence,
+                gap.source,
+                gap.detail.as_ref(),
+            ));
+        }
+    }
     for edge in &procedure.control_edges {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            edges.validation_steps += 1;
+        }
+        if cancellation.is_cancelled() {
+            return Err(SemanticIrError::artifact(
+                SemanticIrErrorKind::Cancelled,
+                "semantic validation cancelled",
+            ));
+        }
         require_capability(
             id,
             capabilities,
@@ -2751,17 +3283,17 @@ fn validate_control_edges(
         // Completeness on an edge is inherited point metadata, not route
         // quality. An unproven route requires its own scoped gap.
         if let ProofStatus::Unproven(reason) = &evidence.proof {
-            let candidate_gap = procedure.gaps.iter().any(|gap| {
-                gap.point == edge.target_point
-                    && gap.subject == SemanticGapSubject::Point
-                    && gap.capability == control_edge_capability(edge.kind)
-                    && gap.kind == SemanticGapKind::Unproven
-                    && gap.evidence == edge.evidence
-                    && gap.source == edge.source
-                    && gap.detail.as_ref() == reason.as_ref()
-            });
+            let candidate_gap = candidate_gaps.contains(&(
+                edge.target_point,
+                control_edge_capability(edge.kind),
+                edge.evidence,
+                edge.source,
+                reason.as_ref(),
+            ));
             if !matches!(&evidence.completeness, EvidenceCompleteness::Partial(partial) if partial.as_ref() == reason.as_ref())
-                || !evidence.sources.contains(&edge.source)
+                || !procedure
+                    .evidence_sources
+                    .contains(&(edge.evidence, edge.source))
                 || !candidate_gap
             {
                 return Err(SemanticIrError::procedure(
@@ -2797,9 +3329,9 @@ fn validate_control_edges(
 fn validate_events(
     key: &SemanticArtifactKey,
     capabilities: &SemanticCapabilities,
-    procedures: &[ProcedureSemanticsParts],
+    procedures: &[ProcedureValidation<'_>],
     procedure_locators: &ProcedureLocatorIndex,
-    procedure: &ProcedureSemanticsParts,
+    procedure: &IndexedProcedure<'_>,
     gaps: &GapIndex,
     control_edges: &ControlEdgeIndex,
 ) -> Result<(), SemanticIrError> {
@@ -2869,6 +3401,14 @@ fn validate_events(
                     ensure_value(id, *source, procedure.values.len(), "value-flow source")?;
                     ensure_value(id, *target, procedure.values.len(), "value-flow target")?;
                     match kind {
+                        ValueFlowKind::MemoryLoad { location } => {
+                            if !procedure.memory_locations.get(location.index()).is_some_and(|row| {
+                                matches!(row.kind, MemoryLocationKind::Dereference { address } if address == *source)
+                            }) {
+                                return Err(SemanticIrError::procedure(id, SemanticIrErrorKind::ValueFlowContract,
+                                    "pointer memory load must name its address's dereference location"));
+                            }
+                        }
                         ValueFlowKind::BackingStore {
                             offset: BackingStoreOffset::Value(offset),
                         }
@@ -2886,6 +3426,7 @@ fn validate_events(
                         ValueFlowKind::BackingStore { .. }
                         | ValueFlowKind::BackingStoreAlternative { .. }
                         | ValueFlowKind::Local
+                        | ValueFlowKind::AddressOf
                         | ValueFlowKind::OwnershipUnknown
                         | ValueFlowKind::Transfer(_)
                         | ValueFlowKind::Parameter
@@ -2930,18 +3471,9 @@ fn validate_events(
                             validate_transfer(procedure, *transfer, event.evidence, point.id)?;
                         }
                         if matches!(kind, ValueFlowKind::OwnershipUnknown) {
-                            let paired_field_fact = procedure.move_outs.iter().any(|fact| {
-                                fact.point == point.id
-                                    && fact.source_value == *source
-                                    && fact.target_value == *target
-                                    && fact.state_after == MoveOutState::Unknown
-                                    && matches!(
-                                        fact.place,
-                                        SemanticPlace::MemoryLocation(location)
-                                            if procedure.memory_locations.get(location.index()).is_some_and(|row|
-                                                matches!(row.kind, MemoryLocationKind::Field { .. }))
-                                    )
-                            });
+                            let paired_field_fact = procedure
+                                .unknown_field_moves
+                                .contains(&(point.id, *source, *target));
                             if !paired_field_fact {
                                 return Err(SemanticIrError::procedure(
                                     id,
@@ -3256,6 +3788,19 @@ fn validate_events(
                     }
                     resumes.entry((*suspend, *kind)).or_default().push(point.id);
                 }
+                SemanticEffect::MemoryInterference => {
+                    if point
+                        .events
+                        .first()
+                        .is_none_or(|first| !std::ptr::eq(first, event))
+                    {
+                        return Err(SemanticIrError::procedure(
+                            id,
+                            SemanticIrErrorKind::EventContract,
+                            "memory interference must be the prefix effect of its point",
+                        ));
+                    }
+                }
                 SemanticEffect::Gap { gap } => {
                     ensure_gap(id, *gap, procedure.gaps.len(), "gap event")?;
                     let row = &procedure.gaps[gap.index()];
@@ -3381,7 +3926,7 @@ fn validate_events(
 
 #[allow(clippy::too_many_arguments)]
 fn validate_callable_value(
-    procedures: &[ProcedureSemanticsParts],
+    procedures: &[ProcedureValidation<'_>],
     procedure_locators: &ProcedureLocatorIndex,
     procedure: &ProcedureSemanticsParts,
     point: ProgramPointId,
@@ -3577,6 +4122,7 @@ fn validate_value_flow_kind(
     let target_kind = &procedure.values[target.index()].kind;
     let valid = match kind {
         ValueFlowKind::Local
+        | ValueFlowKind::AddressOf
         | ValueFlowKind::OwnershipUnknown
         | ValueFlowKind::Transfer(_)
         | ValueFlowKind::BackingStore { .. }
@@ -3596,7 +4142,9 @@ fn validate_value_flow_kind(
             matches!(source_kind, SemanticValueKind::Return)
                 || matches!(target_kind, SemanticValueKind::Return)
         }
-        ValueFlowKind::LanguageDefined | ValueFlowKind::ByValueCapture => true,
+        ValueFlowKind::MemoryLoad { .. }
+        | ValueFlowKind::LanguageDefined
+        | ValueFlowKind::ByValueCapture => true,
     };
     if !valid {
         return Err(SemanticIrError::procedure(
@@ -4130,7 +4678,8 @@ fn validate_gap_impacts(procedure: ProcedureId, gap: &SemanticGap) -> Result<(),
     if gap.discharge == SemanticGapDischarge::ModeledEffectPartition {
         return Ok(());
     }
-    let required = SemanticGapImpacts::for_gap(gap.capability, gap.subject);
+    let required =
+        SemanticGapImpacts::for_gap_with_discharge(gap.capability, gap.subject, gap.discharge);
     let Some(missing) = required
         .iter()
         .find(|impact| !gap.impacts.contains(*impact))
@@ -4211,6 +4760,7 @@ fn effect_capabilities(effect: &SemanticEffect) -> &'static [SemanticCapability]
         SemanticEffect::AggregateInitializer { .. } => &[SemanticCapability::Values],
         SemanticEffect::ValueFlow { kind, .. } => match kind {
             ValueFlowKind::Local
+            | ValueFlowKind::AddressOf
             | ValueFlowKind::OwnershipUnknown
             | ValueFlowKind::Transfer(_)
             | ValueFlowKind::BackingStore { .. }
@@ -4230,7 +4780,9 @@ fn effect_capabilities(effect: &SemanticEffect) -> &'static [SemanticCapability]
             ValueFlowKind::Return | ValueFlowKind::IndexedReturn { .. } => {
                 &[SemanticCapability::Values, SemanticCapability::ReturnFlow]
             }
-            ValueFlowKind::LanguageDefined | ValueFlowKind::ByValueCapture => {
+            ValueFlowKind::MemoryLoad { .. }
+            | ValueFlowKind::LanguageDefined
+            | ValueFlowKind::ByValueCapture => {
                 &[SemanticCapability::Values, SemanticCapability::LocalFlow]
             }
         },
@@ -4275,12 +4827,30 @@ fn effect_capabilities(effect: &SemanticEffect) -> &'static [SemanticCapability]
         SemanticEffect::AsyncSuspend { .. } | SemanticEffect::AsyncResume { .. } => {
             &[SemanticCapability::AsyncSuspendResume]
         }
-        SemanticEffect::Gap { .. } => &[],
+        SemanticEffect::Gap { .. } | SemanticEffect::MemoryInterference => &[],
     }
 }
 
 #[doc(hidden)]
 pub fn measure_procedure_work(procedure: &ProcedureSemanticsParts) -> SemanticWork {
+    measure_base_procedure_work(procedure)
+        .conservative_add(measure_guarded_procedure_work(procedure))
+}
+
+fn measure_guarded_procedure_work(procedure: &ProcedureSemanticsParts) -> SemanticWork {
+    if let Some(alternate) = &procedure.candidate_alternate {
+        let mut census = measure_base_procedure_work(&alternate.parts);
+        census.procedures = 0;
+        census.nested_entries = census
+            .nested_entries
+            .saturating_add(alternate.candidates.len());
+        census
+    } else {
+        SemanticWork::default()
+    }
+}
+
+pub(super) fn measure_base_procedure_work(procedure: &ProcedureSemanticsParts) -> SemanticWork {
     let mut work = SemanticWork {
         procedures: 1,
         ..SemanticWork::default()
@@ -4311,6 +4881,7 @@ pub fn measure_procedure_work(procedure: &ProcedureSemanticsParts) -> SemanticWo
         .saturating_add(procedure.statement_entries.len())
         .saturating_add(procedure.loop_sites.len())
         .saturating_add(procedure.guard_facts.len())
+        .saturating_add(procedure.cleanup_chains.stored_entries())
         .saturating_add(procedure.drops.len())
         .saturating_add(procedure.move_outs.len())
         .saturating_add(procedure.scope_ends.len())
@@ -4431,6 +5002,28 @@ pub fn measure_procedure_work(procedure: &ProcedureSemanticsParts) -> SemanticWo
     for mapping in &procedure.source_mappings {
         account_locator(&mapping.locator, &mut work);
     }
+    for node in procedure.cleanup_chains.nodes() {
+        for entry in &node.actions {
+            match &entry.action {
+                crate::analyzer::semantic::cfg::ScopeCleanupAction::Drop {
+                    place,
+                    behavior,
+                    ..
+                } => {
+                    account_place(place, &mut work);
+                    if let DropBehavior::Destructor(targets) = behavior {
+                        account_target_resolution(targets, &mut work);
+                    }
+                }
+                crate::analyzer::semantic::cfg::ScopeCleanupAction::ScopeEnd { place, .. } => {
+                    account_place(place, &mut work);
+                }
+            }
+        }
+        for entry in &node.owners {
+            account_place(&entry.place, &mut work);
+        }
+    }
     for fact in &procedure.drops {
         account_place(&fact.place, &mut work);
         if let DropBehavior::Destructor(targets) = &fact.behavior {
@@ -4501,9 +5094,81 @@ pub fn measure_procedure_work(procedure: &ProcedureSemanticsParts) -> SemanticWo
                 | SemanticEffect::AsyncSuspend { .. }
                 | SemanticEffect::AsyncResume { .. }
                 | SemanticEffect::Synchronization { .. }
-                | SemanticEffect::Gap { .. } => {}
+                | SemanticEffect::Gap { .. }
+                | SemanticEffect::MemoryInterference => {}
             }
         }
     }
     work
+}
+
+/// Count the actual indexed gap and edge visits without requiring unrelated
+/// procedure contracts in this construction-complexity regression.
+#[cfg(any(test, feature = "test-support"))]
+pub fn control_edge_validation_work_for_test(
+    capabilities: &SemanticCapabilities,
+    procedure: &ProcedureSemanticsParts,
+) -> Result<(usize, usize), SemanticIrError> {
+    let indexed = IndexedProcedure::new(procedure, &Default::default())?;
+    let index = validate_control_edges(capabilities, &indexed, &Default::default())?;
+    Ok((index.exact.len(), index.validation_steps))
+}
+
+/// Deterministic construction visits and indexed membership answers for the
+/// procedure-local construction regression harness.
+#[cfg(any(test, feature = "test-support"))]
+pub fn construction_membership_work_for_test(
+    parts: &ProcedureSemanticsParts,
+) -> ([usize; 4], [Vec<bool>; 4]) {
+    let index = IndexedProcedure::new(parts, &Default::default()).unwrap();
+    let runtime = parts
+        .gaps
+        .iter()
+        .filter(|gap| gap.discharge == SemanticGapDischarge::RuntimeReadBehavior)
+        .map(|gap| index.runtime_read(gap))
+        .collect();
+    let patterns = parts
+        .guarded_pattern_projections
+        .iter()
+        .map(|candidate| {
+            index
+                .pattern_gaps
+                .contains(&(candidate.point, candidate.binder))
+        })
+        .collect();
+    let moves = parts
+        .points
+        .iter()
+        .flat_map(|point| {
+            point.events.iter().filter_map(|event| {
+                if let SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::OwnershipUnknown,
+                    source,
+                    target,
+                } = event.effect
+                {
+                    Some(
+                        index
+                            .unknown_field_moves
+                            .contains(&(point.id, source, target)),
+                    )
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+    let evidence = parts
+        .move_outs
+        .iter()
+        .map(|fact| {
+            index
+                .evidence_sources
+                .contains(&(fact.evidence, fact.source))
+        })
+        .collect();
+    (
+        index.construction_steps,
+        [runtime, patterns, moves, evidence],
+    )
 }

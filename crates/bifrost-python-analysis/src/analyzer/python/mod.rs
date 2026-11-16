@@ -62,6 +62,7 @@ pub(crate) mod source_publication;
 pub mod source_storage;
 mod structural;
 mod type_flow;
+pub(crate) use type_flow::python_receiver_method_dispatch_may_be_bypassed_with;
 
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 
@@ -74,13 +75,12 @@ pub(crate) use crate::analyzer::python::type_flow::python_attribute_value_termin
 pub(crate) use crate::analyzer::python::type_flow::python_exact_external_receiver_identities;
 
 pub(crate) use crate::analyzer::python::type_flow::python_external_class_call_identity;
+pub(crate) use crate::analyzer::python::type_flow::python_external_class_call_identity_with_request;
 
 #[doc(hidden)]
 pub use crate::analyzer::python::type_flow::python_external_member_declaration;
 
 pub(crate) use crate::analyzer::python::type_flow::python_external_value_member_on_workspace_class;
-
-use brokk_bifrost_analysis::analyzer::cache_weight::weight_code_unit_vec;
 
 use brokk_bifrost_analysis::analyzer::clone_detection::detect_language_structural_clone_smells;
 
@@ -111,8 +111,6 @@ use brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupOu
 use brokk_bifrost_analysis::analyzer::usages::get_type::TypeLookupOutcome;
 
 use brokk_bifrost_analysis::analyzer::usages::get_type::TypeLookupStatus;
-
-use crate::analyzer::usages::get_type::resolve_python_type_bounded;
 
 use brokk_bifrost_core::analyzer::usages::receiver_analysis::INTERACTIVE_TYPE_LOOKUP_BUDGET;
 
@@ -247,6 +245,8 @@ const FILE_STATE_BATCH_SIZE: usize = 256;
 
 #[derive(Clone)]
 pub struct PythonAnalyzer {
+    #[cfg(any(test, feature = "test-support"))]
+    hierarchy_stop_for_test: Option<(String, Option<&'static str>)>,
     inner: TreeSitterAnalyzer<PythonAdapter>,
     native_environment_reconcile: Arc<
         WorkspaceAuthorityMemo<std::sync::RwLock<native_request::PythonEnvironmentReconcileState>>,
@@ -285,7 +285,7 @@ pub struct PythonAnalyzer {
     // from-import through `resolve_module_code_unit` -- for every single `.bindings.get(name)` the
     // receiver-type and annotation resolvers do. One binder per file serves all of them.
     import_binder: Arc<PythonMemo<ProjectFile, ImportBinder>>,
-    direct_ancestors: Arc<PythonMemo<CodeUnit, Vec<CodeUnit>>>,
+    direct_ancestors: Arc<PythonMemo<CodeUnit, hierarchy::DirectAncestors>>,
     // Dead-code analysis scans the stable caller domain but resolves a bounded
     // callee target set. Cache that exact pair for warm requests so repeated
     // queries do not reparse the entire Python workspace.
@@ -431,10 +431,6 @@ impl PythonAnalyzer {
     ) -> LimitedQueryRows<CodeUnit> {
         self.inner
             .lookup_path_modules_by_fqn_limited(fqn, limit, continue_query)
-    }
-
-    pub(crate) fn workspace_fqn_prefix_exists(&self, prefix: &str) -> bool {
-        self.inner.forward_fqn_prefix_exists(prefix)
     }
 
     pub(crate) fn declaration_candidates_by_identifier_limited(
@@ -628,6 +624,8 @@ impl PythonAnalyzer {
 
     fn from_inner(inner: TreeSitterAnalyzer<PythonAdapter>, memo_budget: u64) -> Self {
         Self {
+            #[cfg(any(test, feature = "test-support"))]
+            hierarchy_stop_for_test: None,
             inner,
             native_environment_reconcile: Arc::new(WorkspaceAuthorityMemo::new(
                 WorkspaceFactFamily::PythonEnvironmentBinding,
@@ -1172,6 +1170,11 @@ impl CodeUnitIndex for PythonAnalyzer {
     }
 
     delegate_inner_methods! {
+        fn owns_source_file(&self, file: &ProjectFile) -> bool;
+        fn indexed_source_files(&self) -> brokk_bifrost_analysis::analyzer::QueryBatch<ProjectFile>;
+    }
+
+    delegate_inner_methods! {
         fn indexed_blob_oid(&self, file: &ProjectFile) -> Option<brokk_bifrost_analysis::analyzer::Oid>;
     }
 
@@ -1371,11 +1374,8 @@ impl IAnalyzer for PythonAnalyzer {
     }
 
     delegate_inner_methods! {
-        fn record_query_failure(&self, error: brokk_bifrost_analysis::analyzer::store::StoreError);
-    }
-
-    delegate_inner_methods! {
         fn workspace_file_index_cell(&self) -> Option<brokk_bifrost_analysis::analyzer::WorkspaceFileIndexCell>;
+        fn workspace_file_inventory_cell(&self) -> Option<brokk_bifrost_analysis::analyzer::WorkspaceFileInventoryCell>;
     }
 
     delegate_inner_methods! {
@@ -1477,6 +1477,13 @@ impl IAnalyzer for PythonAnalyzer {
     ) -> Vec<&dyn brokk_bifrost_analysis::analyzer::structural::StructuralFactProvider>;
     }
 
+    fn generation_membership(
+        &self,
+    ) -> &Arc<brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::GenerationWorkspaceMembership>
+    {
+        IAnalyzer::generation_membership(&self.inner)
+    }
+
     fn snapshot_caches(
         &self,
     ) -> Option<&brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerSnapshotCaches> {
@@ -1499,7 +1506,10 @@ impl IAnalyzer for PythonAnalyzer {
         fn contains_tests(&self, file: &ProjectFile) -> bool;
     }
 
-    fn in_test_region(&self, code_unit: &brokk_bifrost_core::analyzer::model::CodeUnit) -> bool {
+    fn in_test_region(
+        &self,
+        code_unit: &brokk_bifrost_core::analyzer::model::CodeUnit,
+    ) -> Result<bool, brokk_bifrost_analysis::analyzer::QueryReadIncomplete> {
         self.inner.in_test_region(code_unit)
     }
 
@@ -1895,34 +1905,78 @@ fn ctypes_loaded_symbol_identity(site: &ExternalCalleeSite<'_>) -> Option<Import
     ))
 }
 
-fn python_imported_model_call_identity(
+pub(crate) fn python_external_callee_identity_with(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
-    site: &ExternalCalleeSite<'_>,
+    callee_text: &str,
+    site: Option<&ExternalCalleeSite<'_>>,
+    imported_identity: impl FnOnce(
+        &PythonAnalyzer,
+        &ExternalCalleeSite<'_>,
+    ) -> Result<
+        Option<ImportedExternalCallee>,
+        brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause,
+    >,
 ) -> Result<
     Option<ImportedExternalCallee>,
     brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause,
 > {
+    let Some(site) = site else { return Ok(None) };
+    if callee_text == "print"
+        && let Some(parameter_count) = unshadowed_builtin_print_parameter_count(site)
+    {
+        return Ok(Some(ImportedExternalCallee::proven(
+                brokk_bifrost_analysis::analyzer::usages::get_definition::ExactExternalCallProof::python_builtin_call(
+                    "builtins.print",
+                    parameter_count,
+                ),
+                brokk_bifrost_analysis::analyzer::semantic::ResolverOwnedExternalCalleeIdentity::new(
+                    Language::Python,
+                    "builtins",
+                    "print",
+                ),
+            )));
+    }
     let Some(python) = resolve_analyzer::<PythonAnalyzer>(analyzer) else {
         return Ok(None);
     };
+    let scope = AnalyzerQueryScope::new(python);
+    if python_imports_ctypes(python, scope.token(), file)
+        && let Some(identity) = ctypes_loaded_symbol_identity(site)
+    {
+        return Ok(Some(identity));
+    }
+    imported_identity(python, site)
+}
+
+pub(crate) fn python_imported_model_call_identity_with_request(
+    analyzer: &dyn IAnalyzer,
+    python: &PythonAnalyzer,
+    file: &ProjectFile,
+    site: &ExternalCalleeSite<'_>,
+    request: &mut crate::analyzer::usages::get_definition::python::PythonDefinitionBatchOperation<
+        '_,
+    >,
+) -> Result<
+    Option<ImportedExternalCallee>,
+    brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause,
+> {
     let Some((callee, call)) = python_call_parts(site) else {
         return Ok(None);
     };
-    if let Some(identity) =
-        python_external_receiver_method_identity(analyzer, python, file, site, callee, call)
-    {
+    if let Some(identity) = python_external_receiver_method_identity(
+        analyzer, python, file, site, callee, call, request,
+    ) {
         return Ok(Some(identity));
     }
     // Imported callable identity is the definition path's native selection
     // and admission. Receiver-member inventory above is a separate question.
-    let evidence = native_request::definition_lookup::definition_at_range(
+    let evidence = request.definition_at_range(
         analyzer,
         file,
         site.source,
         site.tree,
         callee.start_byte()..callee.end_byte(),
-        None,
     )?;
     Ok(evidence.and_then(|(_, evidence)| {
         Some(ImportedExternalCallee::proven(
@@ -1939,6 +1993,9 @@ fn python_external_receiver_method_identity(
     site: &ExternalCalleeSite<'_>,
     callee: tree_sitter::Node<'_>,
     call: tree_sitter::Node<'_>,
+    request: &mut crate::analyzer::usages::get_definition::python::PythonDefinitionBatchOperation<
+        '_,
+    >,
 ) -> Option<ImportedExternalCallee> {
     if callee.kind() != "attribute" {
         return None;
@@ -1962,16 +2019,17 @@ fn python_external_receiver_method_identity(
         focus_start_byte: receiver_start,
         focus_end_byte: receiver_end,
     };
-    let scope = AnalyzerQueryScope::new(python);
-    let receiver_type = match resolve_python_type_bounded(
-        analyzer,
-        scope.token(),
-        file,
-        site.source,
-        Some(site.tree),
-        &receiver_site,
-        INTERACTIVE_TYPE_LOOKUP_BUDGET,
-        None,
+    let _scope = AnalyzerQueryScope::new(python);
+    let receiver_type = match request.resolve_type_bounded(
+        brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery {
+            analyzer,
+            file,
+            source: site.source,
+            tree: Some(site.tree),
+            site: &receiver_site,
+            budget: INTERACTIVE_TYPE_LOOKUP_BUDGET,
+            cancellation: None,
+        },
     ) {
         BoundedResolution::Complete { value, .. } => value,
         BoundedResolution::Exceeded { .. }
@@ -1983,7 +2041,7 @@ fn python_external_receiver_method_identity(
     }
     let receiver_type = receiver_type.types.first()?;
     let model_id = receiver_type.semantic_model_id.as_deref()?;
-    let overlay = analyzer.semantic_model_overlay()?;
+    let overlay = analyzer.semantic_model_overlay_read().published()?;
     let owner_match = overlay.symbols_with_id_for(model_id, "python");
     let [owner] = owner_match.records.as_slice() else {
         return None;
@@ -2374,40 +2432,16 @@ impl LanguageSupport for PythonSupport {
 
     fn expand_imported_external_callee(
         &self,
-        analyzer: &dyn IAnalyzer,
-        file: &ProjectFile,
-        callee_text: &str,
-        site: Option<&ExternalCalleeSite<'_>>,
+        _analyzer: &dyn IAnalyzer,
+        _file: &ProjectFile,
+        _callee_text: &str,
+        _site: Option<&ExternalCalleeSite<'_>>,
     ) -> Result<
         Option<ImportedExternalCallee>,
         brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause,
     > {
-        let Some(site) = site else { return Ok(None) };
-        if callee_text == "print"
-            && let Some(parameter_count) = unshadowed_builtin_print_parameter_count(site)
-        {
-            return Ok(Some(ImportedExternalCallee::proven(
-                brokk_bifrost_analysis::analyzer::usages::get_definition::ExactExternalCallProof::python_builtin_call(
-                    "builtins.print",
-                    parameter_count,
-                ),
-                brokk_bifrost_analysis::analyzer::semantic::ResolverOwnedExternalCalleeIdentity::new(
-                    Language::Python,
-                    "builtins",
-                    "print",
-                ),
-            )));
-        }
-        let Some(python) = resolve_analyzer::<PythonAnalyzer>(analyzer) else {
-            return Ok(None);
-        };
-        let scope = AnalyzerQueryScope::new(python);
-        if python_imports_ctypes(python, scope.token(), file)
-            && let Some(identity) = ctypes_loaded_symbol_identity(site)
-        {
-            return Ok(Some(identity));
-        }
-        python_imported_model_call_identity(analyzer, file, site)
+        // Python expansion requires the retained definition operation.
+        Ok(None)
     }
 
     fn procedure_syntax_roles(
@@ -2478,31 +2512,15 @@ impl LanguageSupport for PythonSupport {
 
     fn refine_resolved_call_targets(
         &self,
-        analyzer: &dyn IAnalyzer,
-        token: QueryToken<'_>,
-        file: &ProjectFile,
-        site: &brokk_bifrost_analysis::analyzer::languages::ExternalCalleeSite<'_>,
+        _analyzer: &dyn IAnalyzer,
+        _token: QueryToken<'_>,
+        _file: &ProjectFile,
+        _site: &brokk_bifrost_analysis::analyzer::languages::ExternalCalleeSite<'_>,
         targets: &mut [brokk_bifrost_analysis::analyzer::usages::call_relations::CallDispatchTarget],
     ) {
-        let Some(receiver_class) =
-            crate::analyzer::usages::get_definition::python::python_bound_receiver_class_for_method_call(
-                analyzer,
-                token,
-                file,
-                site.source,
-                site.tree,
-                site.callee_start_byte,
-            )
-        else {
-            return;
-        };
-        let Some(python) = resolve_analyzer::<PythonAnalyzer>(analyzer) else {
-            return;
-        };
-        if type_flow::python_receiver_method_dispatch_may_be_bypassed(python, &receiver_class) {
-            for target in targets {
-                target.proof = brokk_bifrost_core::analyzer::usages::model::UsageProof::Unproven;
-            }
+        // Without the retained operation, refuse proof without ambient reads.
+        for target in targets {
+            target.proof = brokk_bifrost_core::analyzer::usages::model::UsageProof::Unproven;
         }
     }
 
@@ -2831,6 +2849,8 @@ impl brokk_bifrost_analysis::analyzer::multi_analyzer::LanguageAnalyzer for Pyth
     ) -> Box<dyn brokk_bifrost_analysis::analyzer::multi_analyzer::LanguageAnalyzer> {
         Box::new(PythonAnalyzer::update_all_with_progress(self, progress))
     }
+
+    brokk_bifrost_analysis::delegate_generation_membership_updates!(PythonAnalyzer);
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -3348,6 +3368,7 @@ impl brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport for PythonSup
         });
         if root == Some(owner) {
             return Ok(Some(ImplicitBaseInputs {
+                base_preservation: None,
                 written_inventory_complete: true,
                 written_base_count: 0,
                 creation: ClassCreationKind::Ordinary,
@@ -3368,7 +3389,7 @@ impl brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport for PythonSup
         else {
             return Ok(None);
         };
-        if inputs.creation == ClassCreationKind::Ordinary
+        if (inputs.creation == ClassCreationKind::Ordinary || inputs.base_preservation.is_some())
             && inputs.written_inventory_complete
             && inputs.written_base_count == 0
             && let Some(root) = root
@@ -3451,11 +3472,18 @@ impl PythonAnalyzer {
                     brokk_bifrost_core::analyzer::capabilities::build_direct_descendant_index(self, self, &scope)
                 });
                 let index = brokk_bifrost_analysis::analyzer::common::read_replayable_query_cache(memo, &scope.variant(), fill);
+                let mut stop_causes: Vec<_> = index.incomplete_reasons().iter().map(|reason| format!("{reason:?}")).collect();
+                stop_causes.sort();
+                stop_causes.dedup();
+                let stop_causes = format!("stops:{stop_causes:?}");
                 let index = index.replay();
+                // The declarations whose own ancestry is open are part of what the
+                // index certifies: one resolving later changes every answer.
+                let open: Vec<_> = index.as_ref().map(|index| index.open_candidates().iter().map(|class| class.declaration_id()).collect()).unwrap_or_default();
                 authority_digest(classes.iter().map(|class| {
                     let mut children: Vec<_> = index.as_ref().map(|index| index.descendants(class)).unwrap_or_default().into_iter().map(|child| child.declaration_id()).collect(); children.sort();
                     format!("{}:{children:?}", class.declaration_id())
-                }).collect())
+                }).chain([format!("open:{open:?}"), stop_causes]).collect())
             })
         }, |answer| whole_fact(*answer));
         query_scope.read_completion().is_ok().then_some(answer)
@@ -3540,5 +3568,72 @@ mod cancellation_tests {
                 .usage_index(scope.token(), &|| true)
                 .expect("complete index cached")
         ));
+    }
+}
+
+#[cfg(test)]
+mod request_read_tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon(
+        "#11516: absent source hits lost their inputs and later queries must see new overlays"
+    )]
+    fn request_sources_replay_absence_and_refresh_overlay_between_queries() {
+        use brokk_bifrost_core::analyzer::project::OverlayProject;
+        let original = "value = 1\n";
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Python)
+            .file("app.py", original)
+            .build();
+        let overlay = Arc::new(OverlayProject::new(fixture.project_dyn()));
+        let project: Arc<dyn brokk_bifrost_core::analyzer::project::Project> = overlay.clone();
+        let store =
+            brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::ephemeral_store_context(
+                project.as_ref(),
+            )
+            .expect("pooled source store");
+        let python =
+            PythonAnalyzer::new_with_config_store_context(project, Default::default(), store, None)
+                .expect("Python analyzer");
+        let app = fixture.file("app.py");
+        let (before, before_reads) = {
+            let _query = AnalyzerQueryScope::new(&python);
+            brokk_bifrost_analysis::analyzer::capture_query_reads(&python, || {
+                python.inner.file_source(&app)
+            })
+        };
+        assert_eq!(before.as_deref(), Some(original));
+        let missing = fixture.file("missing.py");
+        {
+            let _query = AnalyzerQueryScope::new(&python);
+            let (first, first_reads) =
+                brokk_bifrost_analysis::analyzer::capture_query_reads(&python, || {
+                    python.inner.resolve_live_oid_for_file(&missing)
+                });
+            let (second, second_reads) =
+                brokk_bifrost_analysis::analyzer::capture_query_reads(&python, || {
+                    python.inner.resolve_live_oid_for_file(&missing)
+                });
+            assert!(first.is_none() && second.is_none());
+            assert_eq!(first_reads.keys(), second_reads.keys());
+            assert_eq!(first_reads.channels(), second_reads.channels());
+            assert!(first_reads.keys().iter().any(|key| matches!(key, ReadKey::Lookup {
+                question: brokk_bifrost_analysis::analyzer::read_ledger::LookupQuestion::WorkspaceFact {
+                    family: brokk_bifrost_analysis::analyzer::read_ledger::WorkspaceFactFamily::WorkspaceOverlayMembership,
+                    subject: brokk_bifrost_analysis::analyzer::read_ledger::FactSubject::File { rel_path }, ..
+                }, ..
+            } if rel_path.as_ref() == "missing.py")), "{:?}", first_reads.keys());
+        }
+        let edited = "value = 2\n";
+        assert!(overlay.set(app.abs_path().to_path_buf(), edited.to_owned()));
+        let (after, after_reads) = {
+            let _query = AnalyzerQueryScope::new(&python);
+            brokk_bifrost_analysis::analyzer::capture_query_reads(&python, || {
+                python.inner.file_source(&app)
+            })
+        };
+        assert_eq!(after.as_deref(), Some(edited));
+        assert_ne!(before_reads.keys(), after_reads.keys());
     }
 }

@@ -134,6 +134,18 @@ pub fn seed_missing_database<E: From<TemplateIoError>>(
     template: &Template,
     build: impl FnOnce(&Path) -> Result<(), E>,
 ) -> Result<bool, E> {
+    seed_missing_database_with_finalizer(db_path, template_dir, template, build, |_| Ok(()))
+}
+
+/// Complete a private destination after copying/building its reusable template,
+/// and before its final name is visible. The template itself stays unchanged.
+pub fn seed_missing_database_with_finalizer<E: From<TemplateIoError>>(
+    db_path: &Path,
+    template_dir: Option<&Path>,
+    template: &Template,
+    build: impl FnOnce(&Path) -> Result<(), E>,
+    finalize: impl FnOnce(&Path) -> Result<(), E>,
+) -> Result<bool, E> {
     let Some(template_dir) = template_dir else {
         return Ok(false);
     };
@@ -168,6 +180,7 @@ pub fn seed_missing_database<E: From<TemplateIoError>>(
         }
         Err(error) => return Err(io_error("copying", &template_path)(error).into()),
     }
+    finalize(&staged)?;
     match staged.persist_noclobber(db_path) {
         Ok(()) => Ok(true),
         Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),

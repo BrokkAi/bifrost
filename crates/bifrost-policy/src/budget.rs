@@ -195,7 +195,6 @@ const MAX_COMPOSITION_CALLERS_PER_PROCEDURE_HARD_CAP: usize =
 const MAX_RETAINED_REPORT_BYTES_PER_POLICY: usize = 16 * 1024 * 1024;
 
 const MAX_POLICIES_PER_BATCH: usize = 256;
-const MAX_TOTAL_FINDINGS_PER_BATCH: usize = 10_000;
 const MAX_RETAINED_REPORT_BYTES_PER_BATCH: usize = 64 * 1024 * 1024;
 const MAX_SERIALIZED_REPORT_BYTES_PER_BATCH: usize = 64 * 1024 * 1024;
 
@@ -204,8 +203,8 @@ fn saturating_usize(value: u64) -> usize {
 }
 
 /// Source volume of exactly the analyzer snapshot being evaluated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PolicySourceCensus {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct PolicySourceCensus {
     pub bytes: u64,
     pub files: usize,
 }
@@ -257,6 +256,10 @@ impl Default for PolicyBudget {
                 max_scanned_files: MAX_SCANNED_FILES,
                 max_scanned_source_bytes: MAX_SCANNED_SOURCE_BYTES,
                 max_fact_nodes: MAX_FACT_NODES,
+                max_call_answers: CodeQueryExecutionLimits::default().max_call_answers,
+                max_call_scanned_files: CodeQueryExecutionLimits::default().max_call_scanned_files,
+                max_call_scanned_source_bytes: CodeQueryExecutionLimits::default()
+                    .max_call_scanned_source_bytes,
                 max_pipeline_rows: MAX_PIPELINE_ROWS,
                 semantic: CodeQuerySemanticLimits::default(),
                 typestate: CodeQueryTypestateLimits::default(),
@@ -523,13 +526,21 @@ impl PolicyBudget {
     pub const fn max_retained_report_bytes(&self) -> usize {
         self.max_retained_report_bytes
     }
+
+    /// Keep earlier products of the same question inside its existing report
+    /// allowance while a later production pass runs.
+    pub(crate) fn with_remaining_report_bytes(self, remaining: usize) -> Self {
+        Self {
+            max_retained_report_bytes: self.max_retained_report_bytes.min(remaining),
+            ..self
+        }
+    }
 }
 
 /// Immutable limits for one multi-policy report invocation.
 #[derive(Debug, Clone, Copy)]
 pub struct PolicyBatchBudget {
     max_policies: usize,
-    max_total_findings: usize,
     max_retained_report_bytes: usize,
     max_serialized_report_bytes: usize,
     per_policy: PolicyBudget,
@@ -539,7 +550,6 @@ impl Default for PolicyBatchBudget {
     fn default() -> Self {
         Self {
             max_policies: MAX_POLICIES_PER_BATCH,
-            max_total_findings: MAX_TOTAL_FINDINGS_PER_BATCH,
             max_retained_report_bytes: MAX_RETAINED_REPORT_BYTES_PER_BATCH,
             max_serialized_report_bytes: MAX_SERIALIZED_REPORT_BYTES_PER_BATCH,
             per_policy: PolicyBudget::default(),
@@ -568,7 +578,6 @@ impl PolicyBatchBudget {
         let mut caps = BTreeMap::new();
         grant_caps!(caps, "batch.", self, PolicyBatchBudget {
             max_policies,
-            max_total_findings,
             max_retained_report_bytes,
             max_serialized_report_bytes,
         }; per_policy);
@@ -602,6 +611,9 @@ impl PolicyBatchBudget {
             max_scanned_files,
             max_scanned_source_bytes,
             max_fact_nodes,
+            max_call_answers,
+            max_call_scanned_files,
+            max_call_scanned_source_bytes,
             max_pipeline_rows,
         }; semantic, typestate, value_flow, taint);
         grant_caps!(caps, "semantic.", query.semantic, CodeQuerySemanticLimits {
@@ -676,10 +688,6 @@ impl PolicyBatchBudget {
         self.max_policies
     }
 
-    pub const fn max_total_findings(&self) -> usize {
-        self.max_total_findings
-    }
-
     pub const fn max_retained_report_bytes(&self) -> usize {
         self.max_retained_report_bytes
     }
@@ -725,7 +733,6 @@ pub enum PolicyBudgetField {
     CompositionCallersPerProcedure,
     RetainedReportBytesPerPolicy,
     PoliciesPerBatch,
-    TotalFindingsPerBatch,
     RetainedReportBytesPerBatch,
     SerializedReportBytesPerBatch,
 }
@@ -763,7 +770,6 @@ impl PolicyBudgetField {
             Self::CompositionCallersPerProcedure => "composition_callers_per_procedure",
             Self::RetainedReportBytesPerPolicy => "retained_report_bytes_per_policy",
             Self::PoliciesPerBatch => "policies_per_batch",
-            Self::TotalFindingsPerBatch => "total_findings_per_batch",
             Self::RetainedReportBytesPerBatch => "retained_report_bytes_per_batch",
             Self::SerializedReportBytesPerBatch => "serialized_report_bytes_per_batch",
         }
@@ -1058,12 +1064,6 @@ impl PolicyBatchBudgetBuilder {
         MAX_POLICIES_PER_BATCH
     );
     batch_budget_setter!(
-        with_max_total_findings,
-        max_total_findings,
-        TotalFindingsPerBatch,
-        MAX_TOTAL_FINDINGS_PER_BATCH
-    );
-    batch_budget_setter!(
         with_max_retained_report_bytes,
         max_retained_report_bytes,
         RetainedReportBytesPerBatch,
@@ -1340,11 +1340,6 @@ mod tests {
         assert!(
             PolicyBatchBudget::builder()
                 .with_max_policies(MAX_POLICIES_PER_BATCH + 1)
-                .is_err()
-        );
-        assert!(
-            PolicyBatchBudget::builder()
-                .with_max_total_findings(MAX_TOTAL_FINDINGS_PER_BATCH + 1)
                 .is_err()
         );
         assert!(
@@ -1820,5 +1815,74 @@ mod tests {
             .unwrap()
             .build()
             .expect("equal per-policy and batch retained limits are valid");
+    }
+}
+
+/// Batch refusals use fixed storage so recording one needs no extra retention.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PolicyBatchBudgetRefusals {
+    pub(crate) deadline: bool,
+    pub(crate) report_bytes: bool,
+}
+
+impl serde::Serialize for PolicyBatchBudgetRefusals {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut sequence = serializer.serialize_seq(Some(
+            usize::from(self.deadline) + usize::from(self.report_bytes),
+        ))?;
+        if self.report_bytes {
+            sequence.serialize_element("batch/retained_report_bytes")?;
+        }
+        if self.deadline {
+            sequence.serialize_element("time/batch_deadline_ms")?;
+        }
+        sequence.end()
+    }
+}
+
+/// Limits actually used by a policy batch, before any work was admitted.
+/// A missing census means no analyzer snapshot was available for scaling.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PolicyBudgetTelemetry {
+    pub effective_grant: BTreeMap<String, u64>,
+    pub census: Option<PolicySourceCensus>,
+    pub policy_deadlines_ms: BTreeMap<String, u64>,
+    pub batch_remaining_ms: Option<u64>,
+    pub batch_refusals: PolicyBatchBudgetRefusals,
+}
+
+impl PolicyBudgetTelemetry {
+    pub(crate) fn for_policy(&self, policy_id: &str) -> Self {
+        let Self {
+            effective_grant,
+            census,
+            policy_deadlines_ms,
+            batch_remaining_ms,
+            batch_refusals,
+        } = self;
+        Self {
+            effective_grant: effective_grant.clone(),
+            census: *census,
+            policy_deadlines_ms: policy_deadlines_ms
+                .get_key_value(policy_id)
+                .map(|(id, deadline)| (id.clone(), *deadline))
+                .into_iter()
+                .collect(),
+            batch_remaining_ms: *batch_remaining_ms,
+            batch_refusals: *batch_refusals,
+        }
+    }
+}
+
+impl super::retained::RetainedSize for PolicyBudgetTelemetry {
+    fn retained_size(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self
+                .effective_grant
+                .iter()
+                .chain(self.policy_deadlines_ms.iter())
+                .map(|(key, _)| key.capacity() + std::mem::size_of::<(String, u64)>())
+                .sum::<usize>()
     }
 }

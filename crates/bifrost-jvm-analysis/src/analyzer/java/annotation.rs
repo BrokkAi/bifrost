@@ -516,7 +516,7 @@ fn external_route_resolution(
     route_kind: JavaAnnotationTypeRoute,
 ) -> JavaAnnotationTypeResolution {
     use crate::analyzer::java::annotation::JavaAnnotationTypeStatus as Status;
-    let overlay = analyzer.semantic_model_overlay();
+    let overlay = analyzer.semantic_model_overlay_read().published();
     if route_kind == JavaAnnotationTypeRoute::QualifiedName
         && let Some(head) =
             java.resolve_type_name_with_external(token, overlay.clone(), file, &components[0])

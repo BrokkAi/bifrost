@@ -106,7 +106,7 @@ impl ImportAnalysisProvider for CSharpAnalyzer {
                     }
                     imported
                 },
-                |_| self.compilation_authority_inputs(),
+                |_| self.membership_authority_inputs(),
             )
         }
     }
@@ -172,10 +172,10 @@ impl ImportAnalysisProvider for CSharpAnalyzer {
                         }
                         result
                     },
-                    |_| self.compilation_authority_inputs(),
+                    |_| self.membership_authority_inputs(),
                 )
             },
-            |_| self.compilation_authority_inputs(),
+            |_| self.membership_authority_inputs(),
         )
     }
 
@@ -273,13 +273,13 @@ impl ImportAnalysisProvider for CSharpAnalyzer {
         // comes from those rows even when no selected source declares a
         // global using: an explicitly included source the revision does not
         // select, or a recorded gap, can still hold one.
-        let (dependencies, membership_complete) = self
+        let (dependencies, membership_complete, membership_cause) = self
             .global_using_dependencies(files, global_using_files.as_slice())
             .unwrap_or_default();
         if cancellation.is_cancelled() {
             return None;
         }
-        Some(if imports_complete && membership_complete {
+        let mut answer = if imports_complete && membership_complete {
             brokk_bifrost_core::analyzer::capabilities::AdditionalFileDependencies::complete(
                 dependencies,
             )
@@ -287,7 +287,9 @@ impl ImportAnalysisProvider for CSharpAnalyzer {
             brokk_bifrost_core::analyzer::capabilities::AdditionalFileDependencies::incomplete(
                 dependencies,
             )
-        })
+        };
+        answer.membership_cause = membership_cause;
+        Some(answer)
     }
 
     /// Derived from [`Self::import_reachability`] rather than written

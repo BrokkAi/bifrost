@@ -410,6 +410,25 @@ pub trait RustSource:
         Ok(RustRoutedAnswer::complete(index.contains(file)))
     }
 
+    /// Strict topology proofs require an implementation with certified inputs.
+    fn certified_package_files_of(
+        &self,
+        _token: QueryToken<'_>,
+        _package: &str,
+        _progress: Option<&dyn Fn() -> bool>,
+    ) -> Result<RustRoutedAnswer<Vec<ProjectFile>>, RustCargoRouteError> {
+        Err(RustCargoRouteError::Unavailable)
+    }
+
+    fn certified_package_contains(
+        &self,
+        _token: QueryToken<'_>,
+        _file: &ProjectFile,
+        _progress: Option<&dyn Fn() -> bool>,
+    ) -> Result<RustRoutedAnswer<bool>, RustCargoRouteError> {
+        Err(RustCargoRouteError::Unavailable)
+    }
+
     /// The packages that hold the library and binary roots named
     /// `import_name`. An incomplete answer may omit packages.
     fn crate_package_names(
@@ -565,7 +584,59 @@ pub fn live_file_at(
 /// that runs before any of that
 /// exists -- the Cargo route composition, the declaration walk -- takes
 /// [`RustSource`] instead, so it cannot re-enter what it is filling.
+/// Rust namespaces used by negative primitive and standard macro proofs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RustGlobNamespace {
+    Type,
+    Macro,
+}
+impl RustGlobNamespace {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Type => "type",
+            Self::Macro => "macro",
+        }
+    }
+}
+
+/// Result of a selected namespace/name absence question for one glob import.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RustGlobNameAbsence {
+    ClosedAbsent,
+    Present,
+    Incomplete,
+    ExternalGlobInventoryUnavailable,
+}
+
+impl brokk_bifrost_core::retention_budget::RetainedBytes for RustGlobNameAbsence {
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
+}
+
 pub trait RustFactSource: RustSource {
+    /// This question must record its answer in the calling consumer's ledger.
+    fn local_glob_name_absence(
+        &self,
+        _file: &ProjectFile,
+        _import: &brokk_bifrost_core::analyzer::model::ImportInfo,
+        _namespace: RustGlobNamespace,
+        _name: &str,
+    ) -> RustGlobNameAbsence {
+        RustGlobNameAbsence::ExternalGlobInventoryUnavailable
+    }
+
+    /// Selected dependency package identity, with complete route evidence.
+    /// An error must fail standard macro identity closed as Unknown(Route),
+    /// never establish a standard identity or a negative identity claim.
+    fn selected_dependency_package(
+        &self,
+        _file: &ProjectFile,
+        _exposed: &str,
+    ) -> Result<String, String> {
+        Err("selected dependency package capability unavailable".to_owned())
+    }
+
     /// This generation's read recorder. A walk cache entry keeps the reads its
     /// fill made and replays them through this capability on every hit, so a
     /// consumer that hits records what the fill read.
@@ -1498,6 +1569,22 @@ impl<T> RustRoutedAnswer<T> {
     }
 }
 
+/// One package-membership question: general or certified, chosen at construction.
+type RustPackageMembershipQuery = fn(
+    &dyn RustSource,
+    QueryToken<'_>,
+    &ProjectFile,
+    Option<&dyn Fn() -> bool>,
+) -> Result<RustRoutedAnswer<bool>, RustCargoRouteError>;
+
+/// One package file-list question: general or certified, chosen at construction.
+type RustPackageFilesQuery = fn(
+    &dyn RustSource,
+    QueryToken<'_>,
+    &str,
+    Option<&dyn Fn() -> bool>,
+) -> Result<RustRoutedAnswer<Vec<ProjectFile>>, RustCargoRouteError>;
+
 /// The package and member questions of one query, answered lazily from the
 /// source's per-question kinds instead of from an index of every analyzed file.
 /// Each answer carries its completeness, and the source records a route
@@ -1509,6 +1596,8 @@ impl<T> RustRoutedAnswer<T> {
 /// predicate, so the view lives inside the borrow it was given.
 #[derive(Clone, Copy)]
 pub struct RustPackageFileIndex<'a> {
+    membership: RustPackageMembershipQuery,
+    package_files: RustPackageFilesQuery,
     rust: &'a dyn RustSource,
     token: QueryToken<'a>,
     progress: Option<&'a dyn Fn() -> bool>,
@@ -1521,9 +1610,31 @@ impl<'a> RustPackageFileIndex<'a> {
         progress: Option<&'a dyn Fn() -> bool>,
     ) -> Self {
         Self {
+            membership: |rust, token, file, progress| rust.package_contains(token, file, progress),
+            package_files: |rust, token, package, progress| {
+                rust.package_files_of(token, package, progress)
+            },
             rust,
             token,
             progress,
+        }
+    }
+
+    pub fn certified(
+        rust: &'a dyn RustSource,
+        token: QueryToken<'a>,
+        progress: Option<&'a dyn Fn() -> bool>,
+    ) -> Self {
+        Self {
+            rust,
+            token,
+            progress,
+            membership: |rust, token, file, progress| {
+                rust.certified_package_contains(token, file, progress)
+            },
+            package_files: |rust, token, package, progress| {
+                rust.certified_package_files_of(token, package, progress)
+            },
         }
     }
 
@@ -1532,7 +1643,7 @@ impl<'a> RustPackageFileIndex<'a> {
         &self,
         file: &ProjectFile,
     ) -> Result<RustRoutedAnswer<bool>, RustCargoRouteError> {
-        self.rust.package_contains(self.token, file, self.progress)
+        (self.membership)(self.rust, self.token, file, self.progress)
     }
 
     /// The member files whose path-derived package is `package`.
@@ -1540,8 +1651,7 @@ impl<'a> RustPackageFileIndex<'a> {
         &self,
         package: &str,
     ) -> Result<RustRoutedAnswer<Vec<ProjectFile>>, RustCargoRouteError> {
-        self.rust
-            .package_files_of(self.token, package, self.progress)
+        (self.package_files)(self.rust, self.token, package, self.progress)
     }
 
     /// The packages that hold the library and binary roots named
@@ -3059,7 +3169,11 @@ fn resolve_module_files_direct_with_progress(
         )?
     }) else {
         return Ok(DirectModuleFiles {
-            files: rust_module_files_from_path(importing_file, module_specifier),
+            files: rust_module_files_from_path(
+                rust.crate_naming_caches(),
+                importing_file,
+                module_specifier,
+            ),
             local_target: false,
             follow_exports: false,
         });
@@ -3093,6 +3207,7 @@ fn resolve_module_files_direct_with_progress(
         }
     }
     files.extend(rust_module_files_from_path(
+        rust.crate_naming_caches(),
         importing_file,
         module_specifier,
     ));
@@ -3880,10 +3995,11 @@ pub fn trait_implementer_names(
     rust: &dyn RustFactSource,
     token: QueryToken<'_>,
     trait_owner: &CodeUnit,
+    spellings: &[String],
     keep_going: &dyn Fn() -> bool,
 ) -> Result<HashSet<String>, RustCargoRouteError> {
     let mut implementer_names = HashSet::default();
-    for file in impl_files_of_trait(rust, trait_owner)? {
+    for file in impl_files_of_trait(rust, trait_owner, spellings)? {
         if !keep_going() {
             return Err(RustCargoRouteError::Cancelled);
         }
@@ -3997,11 +4113,25 @@ fn rust_impl_resolves_to_trait_owner(
 ///
 /// One blob can be mounted at more than one path, so each blob contributes
 /// every path it is mounted at.
+///
+/// `spellings` is every name the trait can be written as in an impl header:
+/// its own name and each alias that a `use ... as` import or re-export
+/// introduces. Impls the relation could not bind, and impls whose subject has
+/// no nominal path (`impl Trait for u16`), are found only by those spellings,
+/// so a renamed import must be in the set for its impls to be nominated.
 #[doc(hidden)]
 pub fn impl_files_of_trait(
     rust: &dyn RustFactSource,
     trait_owner: &CodeUnit,
+    spellings: &[String],
 ) -> Result<Vec<ProjectFile>, RustCargoRouteError> {
+    debug_assert!(
+        spellings
+            .iter()
+            .any(|spelling| spelling == trait_owner.identifier()),
+        "the spelling set {spellings:?} includes the trait's own name {}",
+        trait_owner.identifier()
+    );
     let live = rust.live_blobs();
     let mut files = Vec::new();
 
@@ -4036,12 +4166,16 @@ pub fn impl_files_of_trait(
     // spelling is a row. Handing their files to the same walk lets its own
     // resolver decide them, instead of the caller refusing the question
     // because a spelling somewhere failed.
-    for unresolved in rust.rust_unresolved_trait_impl_files(trait_owner.identifier())? {
-        files.extend(live_file_at(
-            rust,
-            unresolved.impl_blob,
-            &unresolved.impl_rel_path,
-        ));
+    // The same rows also hold impls whose subject has no nominal path: they
+    // persist in the structural impl family and are found by spelling too.
+    for spelling in spellings {
+        for unresolved in rust.rust_unresolved_trait_impl_files(spelling)? {
+            files.extend(live_file_at(
+                rust,
+                unresolved.impl_blob,
+                &unresolved.impl_rel_path,
+            ));
+        }
     }
 
     files.extend(macro_impl_files_of_trait(rust, trait_owner)?);
@@ -4072,11 +4206,29 @@ pub(crate) fn macro_impl_files_of_trait(
     Ok(files)
 }
 
+/// Positive members and source impls whose members lack declaration identities.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RustTraitMemberImplementations {
+    pub implementations: Vec<CodeUnit>,
+    pub gaps: Vec<RustImplMemberIdentityGap>,
+}
+
+pub const IMPL_MEMBER_WITHOUT_DECLARATION_IDENTITY: &str =
+    "impl member without declaration identity";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RustImplMemberIdentityGap {
+    pub file: ProjectFile,
+    pub start_byte: usize,
+    pub end_byte: usize,
+}
+
 pub fn rust_trait_member_implementations(
     rust: &dyn RustFactSource,
     token: QueryToken<'_>,
     trait_member: &CodeUnit,
-) -> ReferenceContextResult<Option<Vec<CodeUnit>>> {
+    trait_spellings: &dyn Fn(&CodeUnit) -> Vec<String>,
+) -> ReferenceContextResult<Option<RustTraitMemberImplementations>> {
     let Some(trait_owner) = rust.parent_of(trait_member) else {
         return Ok(None);
     };
@@ -4089,8 +4241,9 @@ pub fn rust_trait_member_implementations(
     let member_name = trait_member.identifier();
 
     let mut implementations = Vec::new();
+    let mut gaps = Vec::new();
     let mut seen = HashSet::default();
-    for file in impl_files_of_trait(rust, &trait_owner)? {
+    for file in impl_files_of_trait(rust, &trait_owner, &trait_spellings(&trait_owner))? {
         let facts = rust.canonical_rust_hierarchy_source_facts(&file, &|| true)?;
         let contexts = RustSourceContextIndex::new(facts.as_ref(), &|| true)?;
         let types = rust_hierarchy_types_by_occurrence(facts.as_ref());
@@ -4130,10 +4283,25 @@ pub fn rust_trait_member_implementations(
                 if child.syntax_kind != expected_syntax_kind {
                     continue;
                 }
-                let Some(declaration) = child.declaration else {
-                    continue;
-                };
-                let Some(candidates) = declarations.get(&declaration) else {
+                let Some(candidates) = child.declaration.and_then(|d| declarations.get(&d)) else {
+                    if !child.declaration.is_some_and(|declaration| {
+                        facts
+                            .lexical_identifiers
+                            .iter()
+                            .any(|(id, identifier)| *id == declaration && identifier == member_name)
+                    }) {
+                        continue;
+                    }
+                    let (start_byte, end_byte) =
+                        facts.declaration_spans[impl_fact.declaration.index()];
+                    let gap = RustImplMemberIdentityGap {
+                        file: file.clone(),
+                        start_byte,
+                        end_byte,
+                    };
+                    if !gaps.contains(&gap) {
+                        gaps.push(gap);
+                    }
                     continue;
                 };
                 for candidate in candidates {
@@ -4150,7 +4318,10 @@ pub fn rust_trait_member_implementations(
             }
         }
     }
-    Ok(Some(implementations))
+    Ok(Some(RustTraitMemberImplementations {
+        implementations,
+        gaps,
+    }))
 }
 
 fn any_canonical_declaration_property(
@@ -4668,14 +4839,24 @@ pub fn rust_module_files_at(file: &ProjectFile, relative_module: &Path) -> Vec<P
     files
 }
 
-pub fn rust_module_files_from_path(file: &ProjectFile, module_specifier: &str) -> Vec<ProjectFile> {
-    let Some(relative_module) = rust_relative_module_path(file, module_specifier) else {
+pub fn rust_module_files_from_path(
+    caches: &crate_naming::RustCrateNamingCaches,
+    file: &ProjectFile,
+    module_specifier: &str,
+) -> Vec<ProjectFile> {
+    let Some(relative_module) = rust_relative_module_path(caches, file, module_specifier) else {
         return Vec::new();
     };
     rust_module_files_at(file, &relative_module)
 }
 
-pub fn rust_relative_module_segments(file: &ProjectFile, segments: &[String]) -> Option<PathBuf> {
+/// The relative module path that `segments` name from `file`. A leading crate
+/// name is recognized through the owner's manifest source, `caches`.
+pub fn rust_relative_module_segments(
+    caches: &crate_naming::RustCrateNamingCaches,
+    file: &ProjectFile,
+    segments: &[String],
+) -> Option<PathBuf> {
     let (first, rest) = segments.split_first()?;
     let append = |base: &mut PathBuf, parts: &[String]| {
         for part in parts {
@@ -4704,13 +4885,7 @@ pub fn rust_relative_module_segments(file: &ProjectFile, segments: &[String]) ->
         }
         crate_name
             if Some(crate_name)
-                == crate_naming::rust_file_crate_name_with(
-                    &crate_naming::RustCrateNamingCaches::new(
-                        &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing(),
-                    ),
-                    file,
-                )
-                .as_deref() =>
+                == crate_naming::rust_file_crate_name_with(caches, file).as_deref() =>
         {
             let mut path = PathBuf::new();
             append(&mut path, rest);
@@ -4731,7 +4906,11 @@ pub fn rust_relative_module_segments(file: &ProjectFile, segments: &[String]) ->
     (!module.as_os_str().is_empty()).then_some(std::mem::take(&mut module))
 }
 
-pub fn rust_relative_module_path(file: &ProjectFile, module_specifier: &str) -> Option<PathBuf> {
+pub fn rust_relative_module_path(
+    caches: &crate_naming::RustCrateNamingCaches,
+    file: &ProjectFile,
+    module_specifier: &str,
+) -> Option<PathBuf> {
     let module = module_specifier
         .strip_prefix("crate::")
         .or_else(|| module_specifier.strip_prefix("self::"))
@@ -4743,15 +4922,8 @@ pub fn rust_relative_module_path(file: &ProjectFile, module_specifier: &str) -> 
         })
         .or_else(|| {
             let (crate_name, rest) = module_specifier.split_once("::")?;
-            (Some(crate_name)
-                == crate_naming::rust_file_crate_name_with(
-                    &crate_naming::RustCrateNamingCaches::new(
-                        &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing(),
-                    ),
-                    file,
-                )
-                .as_deref())
-            .then(|| rest.into())
+            (Some(crate_name) == crate_naming::rust_file_crate_name_with(caches, file).as_deref())
+                .then(|| rest.into())
         })
         .or_else(|| {
             let relative = PathBuf::from(module_specifier);
@@ -4863,6 +5035,14 @@ mod fact_source_coverage_guard {
     // Every set-membership read needs wrapper recording or a documented enclosing
     // recompute-verified lookup. Other methods name their content/capability cover.
     const COVERAGE: &[(&str, &str)] = &[
+        (
+            "local_glob_name_absence",
+            "(a) RustLocalGlobNameAbsence: the selected-closure bridge records the question receipt and replays it after the operation frame is restored. Callers certify primitive and standard-macro shadow absence.",
+        ),
+        (
+            "selected_dependency_package",
+            "(b) Forwards RustAnalyzer::selected_dependency_package (rust-analysis mod.rs): reads go through the RustFileUnits derivation demand under the selected Rust route inventory, whose receipts record them. Callers: the shared standard_macro_identity qualified-root shadowing helper and the logging dependency proof; an error makes identity Unknown.",
+        ),
         (
             "read_capability",
             "(b) Recorder capability, no workspace-set answer.",

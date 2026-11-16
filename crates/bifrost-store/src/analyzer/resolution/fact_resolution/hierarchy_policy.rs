@@ -68,14 +68,38 @@ impl HierarchyPolicy for DefaultHierarchyPolicy {
 pub(crate) static DEFAULT_HIERARCHY_POLICY: DefaultHierarchyPolicy =
     DefaultHierarchyPolicy { _identity: 0 };
 
+pub(crate) struct WrittenHierarchyBase<'a> {
+    pub(crate) targets: &'a [SemanticId],
+    pub(crate) complete: bool,
+}
+
 pub(crate) trait HierarchyEdgeProvider: std::fmt::Debug + Sync {
-    fn implicit_base(
+    fn base_preservation_rule(&self) -> Option<crate::analyzer::resolution::BasePreservationRule> {
+        None
+    }
+
+    fn base_preservation_order(&self) -> Option<&'static dyn HierarchyLinearizationPolicy> {
+        None
+    }
+
+    fn base_preservation_input(
         &self,
         _owner: SemanticId,
         _source: &dyn SelectedTypedFactSource,
         _cancellation: &CancellationToken,
+    ) -> StoreResult<Option<crate::analyzer::resolution::BasePreservationGuard>> {
+        Ok(None)
+    }
+
+    fn implicit_base(
+        &self,
+        _owner: SemanticId,
+        _written: &[WrittenHierarchyBase<'_>],
+        _source: &dyn SelectedTypedFactSource,
+        _cancellation: &CancellationToken,
     ) -> StoreResult<Option<ImplicitBaseRead>> {
         Ok(Some(ImplicitBaseRead {
+            guard: None,
             base: None,
             observations: Box::new([]),
             completion: ResolutionCompletion::incomplete([
@@ -91,10 +115,12 @@ impl HierarchyEdgeProvider for ExplicitHierarchyEdges {
     fn implicit_base(
         &self,
         _owner: SemanticId,
+        _written: &[WrittenHierarchyBase<'_>],
         _source: &dyn SelectedTypedFactSource,
         _cancellation: &CancellationToken,
     ) -> StoreResult<Option<ImplicitBaseRead>> {
         Ok(Some(ImplicitBaseRead {
+            guard: None,
             base: None,
             observations: Box::new([]),
             completion: ResolutionCompletion::Complete,
@@ -108,12 +134,15 @@ struct ConservativeHierarchyEdges;
 impl HierarchyEdgeProvider for ConservativeHierarchyEdges {}
 static CONSERVATIVE_HIERARCHY_EDGES: ConservativeHierarchyEdges = ConservativeHierarchyEdges;
 pub(crate) struct ImplicitBaseRead {
+    pub(crate) guard: Option<crate::analyzer::resolution::BasePreservationGuard>,
     pub(crate) base: Option<ImplicitBaseFact>,
     pub(crate) observations: Box<[HierarchyProviderObservation]>,
     pub(crate) completion: ResolutionCompletion,
 }
 pub(crate) struct ImplicitBaseFact {
-    pub(crate) target: SemanticId,
+    pub(crate) target: Option<SemanticId>,
+    pub(crate) definite: bool,
+    pub(crate) external: bool,
     pub(crate) ordinal: u32,
     pub(crate) provider: HierarchyProviderKey,
     pub(crate) occurrence: SemanticId,
@@ -184,7 +213,11 @@ impl HierarchyOperationArena {
 #[derive(Clone, Debug)]
 pub(super) enum HierarchyBaseOrigin {
     Typed(SelectedTypedRowIdentity),
-    Implicit(HierarchyProviderKey),
+    Implicit {
+        provider: HierarchyProviderKey,
+        definite: bool,
+        external: bool,
+    },
 }
 impl HierarchyBaseOrigin {
     pub(super) fn provider(
@@ -198,7 +231,7 @@ impl HierarchyBaseOrigin {
                 HierarchyProviderAuthority::Typed(row.clone()),
                 operand,
             ),
-            Self::Implicit(provider) => provider.with_operand(operand),
+            Self::Implicit { provider, .. } => provider.with_operand(operand),
         }
     }
 }
@@ -206,6 +239,152 @@ impl HierarchyBaseOrigin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12141: a cached creation-hook rejection cannot answer the narrower mro-free question"
+    )]
+    fn guard_rules_isolate_cached_creation_and_mro_proofs() {
+        use crate::analyzer::resolution::{
+            BasePreservationGuard, BasePreservationMembers, ClassCreationKind,
+            ImplicitBaseAuthority, ImplicitBaseInputs, ImplicitRootObject, QueryObligations,
+        };
+        use crate::analyzer::store::python_member_rows::{
+            PYTHON_BASE_PRESERVATION_RULE as FULL, PYTHON_MRO_ONLY_RULE as MRO,
+        };
+        for member in ["__init__", "mro"] {
+            let subject = SemanticId::for_test("subject");
+            let meta = SemanticId::for_test("meta");
+            let terminal = hierarchy_global_atom_identity(
+                &HierarchyOperationArena::default(),
+                FULL.terminal.as_bytes(),
+            );
+            let mut source = PreloadedFactResolutionService::from_lowered_fragments([], []);
+            for owner in [subject, meta] {
+                source.base_guard_test_inputs.insert(
+                    owner,
+                    ImplicitBaseInputs {
+                        base_preservation: (owner == subject).then(|| BasePreservationGuard {
+                            references: vec![meta],
+                            terminal: FULL.terminal,
+                            absent_members: FULL.absent_members,
+                            enclosing_absent_members: FULL.enclosing_absent_members,
+                            completion: ResolutionCompletion::Complete,
+                        }),
+                        written_inventory_complete: true,
+                        written_base_count: 0,
+                        creation: ClassCreationKind::Ordinary,
+                        root_object: Some(ImplicitRootObject {
+                            identity: terminal,
+                            occurrence: terminal,
+                            authority: ImplicitBaseAuthority::Intrinsic {
+                                descriptor: terminal,
+                            },
+                        }),
+                        authority: ImplicitBaseAuthority::Intrinsic { descriptor: owner },
+                        completion: ResolutionCompletion::Complete,
+                    },
+                );
+                source.base_guard_test_members.insert(
+                    owner,
+                    BasePreservationMembers {
+                        mutation_receivers: vec![],
+                        terminal_mutation_receivers: Some(vec![]),
+                        names: if owner == meta {
+                            vec![member.into()]
+                        } else {
+                            vec![]
+                        },
+                        complete: true,
+                    },
+                );
+            }
+            let cancellation = CancellationToken::new();
+            let mut session = FactReadSession::from_split_sources(&source, &source, &cancellation);
+            let mut arena = HierarchyOperationArena::default();
+            let policy = arena.register_policy(
+                crate::analyzer::store::resolution_operation::python_hierarchy_policy_for_test(),
+            );
+            arena.reference_answers.insert(
+                meta,
+                ClosedQueryValue::new(
+                    Arc::new(ResolutionAnswer::new(
+                        vec![meta],
+                        vec![],
+                        ResolutionCompletion::Complete,
+                    )),
+                    QueryObligations::empty(),
+                ),
+            );
+            let mut evaluation = FactEvaluation::new(&mut session, &mut arena, subject);
+            evaluation.hierarchy_policy = policy;
+            let mut cursors = HashMap::default();
+            let mut aliases = HashMap::default();
+            for (rule, admitted) in [
+                (FULL, false),
+                (MRO, member == "__init__"),
+                (FULL, false),
+                (MRO, member == "__init__"),
+            ] {
+                assert_eq!(
+                    evaluation
+                        .settle_base_preservation_guards(
+                            &[subject],
+                            Some(rule),
+                            &mut cursors,
+                            &mut aliases
+                        )
+                        .unwrap(),
+                    Some(vec![])
+                );
+                assert_eq!(
+                    evaluation.base_preservation_proven(subject, rule),
+                    admitted,
+                    "{member}: {rule:?}"
+                );
+            }
+            assert_eq!(evaluation.hierarchy.base_guard_proofs.len(), 2);
+            drop(evaluation);
+            let mut operation = FactResolutionOperation::from_session(session);
+            operation.hierarchy = arena;
+            struct Provider;
+            impl demand_scheduler::RootProvider for Provider {
+                fn discover(
+                    &mut self,
+                    _: &demand_scheduler::RelationKey,
+                ) -> StoreResult<demand_scheduler::RootDiscovery> {
+                    unreachable!("cached reference")
+                }
+                fn close(
+                    &mut self,
+                    _: &demand_scheduler::RelationKey,
+                    _: &[(demand_scheduler::ReferenceKey, &FactResolutionAnswer)],
+                ) -> StoreResult<demand_scheduler::RootClosure> {
+                    unreachable!("guard-only demand")
+                }
+            }
+            let request = || demand_scheduler::HierarchyDemandRequest {
+                policy:
+                    crate::analyzer::store::resolution_operation::python_hierarchy_policy_for_test(),
+                order: None,
+                root: subject,
+                shape: subject,
+                language: Language::Python,
+            };
+            assert_eq!(
+                operation
+                    .prove_guard_by_demand(request(), MRO, &mut Provider)
+                    .unwrap(),
+                member == "__init__"
+            );
+            cancellation.cancel();
+            assert!(
+                !operation
+                    .prove_guard_by_demand(request(), MRO, &mut Provider)
+                    .unwrap()
+            );
+        }
+    }
+
     #[derive(Default)]
     struct Bytes(Vec<u8>);
     impl Hasher for Bytes {
@@ -354,5 +533,774 @@ mod tests {
         let mut arena = HierarchyOperationArena::default();
         arena.register_policy(&EXHAUSTIVE);
         arena.register_policy(&DIFFERENT);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) struct BaseGuardKey {
+    pub(super) owner: HierarchyOwnerKey,
+    pub(super) rule: crate::analyzer::resolution::BasePreservationRule,
+}
+
+/// One suspended conditional-input proof. Only the shared driver owns these
+/// graph and reference cursors; language sources supply inventories and rules.
+pub(super) struct BaseGuardCursor {
+    rule: crate::analyzer::resolution::BasePreservationGuard,
+    pending: VecDeque<GuardOperand>,
+    nodes: HashMap<SemanticId, GuardOwner>,
+    roots: Vec<SemanticId>,
+    terminal: SemanticId,
+    observations: Vec<HierarchyProviderObservation>,
+    obligations: super::super::QueryObligations,
+    mutation_receivers: HashSet<(GuardRelation, SemanticId)>,
+    mutated_owners: HashSet<SemanticId>,
+    mutation_targets: HashSet<SemanticId>,
+    unknown_mutation: bool,
+    unknown_terminal_mutation: bool,
+}
+#[derive(Debug)]
+pub(super) struct BasePreservationProof {
+    pub(super) admitted: bool,
+    pub(super) observations: Vec<HierarchyProviderObservation>,
+}
+struct GuardOperand {
+    container: Option<SemanticId>,
+    reference: SemanticId,
+    target: Option<SemanticId>,
+    relation: GuardRelation,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum GuardRelation {
+    Base,
+    Guard,
+    Mutation,
+    TerminalMutation,
+}
+#[derive(Default)]
+struct GuardOwner {
+    bases: Vec<SemanticId>,
+    guards: Vec<SemanticId>,
+    members: Option<crate::analyzer::resolution::BasePreservationMembers>,
+}
+
+impl FactEvaluation<'_, '_> {
+    pub(super) fn settle_base_preservation_guards(
+        &mut self,
+        owners: &[SemanticId],
+        supplied_rule: Option<crate::analyzer::resolution::BasePreservationRule>,
+        cursors: &mut HashMap<BaseGuardKey, BaseGuardCursor>,
+        aliases: &mut HashMap<SemanticId, HierarchyClassAliasWalk>,
+    ) -> StoreResult<Option<Vec<SemanticId>>> {
+        for &subject in owners {
+            if self.poll_cancelled() || !self.session.charge_scope_steps(1) {
+                self.cancellation_observed = true;
+                return Ok(None);
+            }
+            let edge_provider = self.hierarchy.policy(self.hierarchy_policy).edge_provider();
+            let Some(identity) = supplied_rule.or_else(|| edge_provider.base_preservation_rule())
+            else {
+                continue;
+            };
+            let proof_key = BaseGuardKey {
+                owner: HierarchyOwnerKey {
+                    owner: subject,
+                    policy: self.hierarchy_policy,
+                },
+                rule: identity,
+            };
+            if let Some(proof) = self.hierarchy.base_guard_proofs.get(&proof_key) {
+                proof.read(&mut self.query_obligations.node(QueryNode::Hierarchy(subject)));
+                continue;
+            }
+            let mut cursor = if let Some(cursor) = cursors.remove(&proof_key) {
+                cursor
+            } else {
+                let Some(mut rule) = edge_provider.base_preservation_input(
+                    subject,
+                    self.session.typed_source,
+                    self.cancellation,
+                )?
+                else {
+                    continue;
+                };
+                rule.terminal = identity.terminal;
+                rule.absent_members = identity.absent_members;
+                rule.enclosing_absent_members = identity.enclosing_absent_members;
+                if rule.completion != ResolutionCompletion::Complete || rule.references.is_empty() {
+                    self.hierarchy.base_guard_proofs.insert(
+                        proof_key,
+                        ClosedQueryValue::new(
+                            BasePreservationProof {
+                                admitted: false,
+                                observations: Vec::new(),
+                            },
+                            self.query_obligations.scope(QueryNode::Hierarchy(subject)),
+                        ),
+                    );
+                    continue;
+                }
+                if !self.session.charge_scope_steps(rule.references.len()) {
+                    self.cancellation_observed = true;
+                    return Ok(None);
+                }
+                BaseGuardCursor {
+                    // Start with the subject, so inherited providers participate
+                    // in selecting its effective creation guard too.
+                    pending: VecDeque::from([GuardOperand {
+                        container: None,
+                        reference: subject,
+                        target: Some(subject),
+                        relation: GuardRelation::Base,
+                    }]),
+                    terminal: hierarchy_global_atom_identity(
+                        &*self.hierarchy,
+                        rule.terminal.as_bytes(),
+                    ),
+                    rule,
+                    nodes: HashMap::default(),
+                    roots: Vec::new(),
+                    observations: Vec::new(),
+                    obligations: super::super::QueryObligations::empty(),
+                    mutation_receivers: HashSet::default(),
+                    mutated_owners: HashSet::default(),
+                    mutation_targets: HashSet::default(),
+                    unknown_mutation: false,
+                    unknown_terminal_mutation: false,
+                }
+            };
+            self.query_obligations
+                .node(QueryNode::Hierarchy(subject))
+                .union(&cursor.obligations);
+            let mut rejected = false;
+            while let Some(operand) = cursor.pending.front() {
+                if self.poll_cancelled() || !self.session.charge_scope_steps(1) {
+                    self.cancellation_observed = true;
+                    return Ok(None);
+                }
+                let terminal_mutation = matches!(operand.relation, GuardRelation::TerminalMutation);
+                let mutation = matches!(
+                    operand.relation,
+                    GuardRelation::Mutation | GuardRelation::TerminalMutation
+                );
+                let reference = operand.reference;
+                let target = if let Some(target) = operand.target {
+                    target
+                } else if self
+                    .session
+                    .typed_source
+                    .base_preservation_terminal_reference(
+                        reference,
+                        cursor.rule.terminal,
+                        self.cancellation,
+                    )?
+                {
+                    cursor.terminal
+                } else {
+                    let mut pending = if !self.hierarchy.reference_ready(reference) {
+                        vec![reference]
+                    } else {
+                        match self.settle_class_aliases(&[reference], aliases)? {
+                            Some(pending) => pending,
+                            None => return Ok(None),
+                        }
+                    };
+                    if !pending.is_empty() {
+                        pending.sort_unstable();
+                        pending.dedup();
+                        cursors.insert(proof_key, cursor);
+                        return Ok(Some(pending));
+                    }
+                    let mut uncertain = false;
+                    for source in std::iter::once(reference).chain(
+                        self.hierarchy
+                            .alias_source_references
+                            .get(&reference)
+                            .into_iter()
+                            .flatten()
+                            .copied(),
+                    ) {
+                        if !self.session.charge_scope_steps(1) {
+                            self.cancellation_observed = true;
+                            return Ok(None);
+                        }
+                        let session = &mut *self.session;
+                        let cancellation = self.cancellation;
+                        let mut stopped = false;
+                        let source_complete =
+                            session.typed_source.base_preservation_reference_complete(
+                                source,
+                                cancellation,
+                                &mut || {
+                                    let proceed = !cancellation.is_cancelled()
+                                        && session.charge_scope_steps(1);
+                                    stopped |= !proceed;
+                                    proceed
+                                },
+                            )?;
+                        if stopped {
+                            self.cancellation_observed = true;
+                            return Ok(None);
+                        }
+                        if !source_complete {
+                            uncertain = true;
+                            break;
+                        }
+                    }
+                    if uncertain && mutation {
+                        if terminal_mutation {
+                            cursor.unknown_terminal_mutation = true;
+                        } else {
+                            cursor.unknown_mutation = true;
+                        }
+                        cursor.pending.pop_front();
+                        continue;
+                    }
+                    if uncertain {
+                        rejected = true;
+                        break;
+                    }
+                    let answer = self
+                        .hierarchy
+                        .effective_reference_answer(reference, &mut cursor.obligations)
+                        .clone();
+                    self.query_obligations
+                        .node(QueryNode::Hierarchy(subject))
+                        .union(&cursor.obligations);
+                    if answer.completion() != &ResolutionCompletion::Complete
+                        || answer.targets().len() != 1
+                    {
+                        if mutation {
+                            if terminal_mutation {
+                                cursor.unknown_terminal_mutation = true;
+                            } else {
+                                cursor.unknown_mutation = true;
+                            }
+                            cursor.pending.pop_front();
+                            continue;
+                        }
+                        rejected = true;
+                        break;
+                    }
+                    answer.targets()[0]
+                };
+                let target = if target == cursor.terminal
+                    || self.session.typed_source.base_preservation_terminal_owner(
+                        target,
+                        cursor.rule.terminal,
+                        self.cancellation,
+                    )? {
+                    cursor.terminal
+                } else {
+                    target
+                };
+                let operand = cursor.pending.pop_front().expect("front operand");
+                if mutation {
+                    if !terminal_mutation {
+                        cursor.mutated_owners.insert(target);
+                    }
+                    cursor.mutation_targets.insert(target);
+                }
+                match operand.container {
+                    None if !mutation => cursor.roots.push(target),
+                    None => {}
+                    Some(container) => match operand.relation {
+                        GuardRelation::Base => cursor
+                            .nodes
+                            .get_mut(&container)
+                            .expect("guard owner")
+                            .bases
+                            .push(target),
+                        GuardRelation::Guard => cursor
+                            .nodes
+                            .get_mut(&container)
+                            .expect("guard owner")
+                            .guards
+                            .push(target),
+                        GuardRelation::Mutation | GuardRelation::TerminalMutation => {
+                            unreachable!("mutation is handled before graph edges")
+                        }
+                    },
+                }
+                if target == cursor.terminal || cursor.nodes.contains_key(&target) {
+                    continue;
+                }
+                let Some(inputs) = self
+                    .session
+                    .typed_source
+                    .implicit_base_inputs(target, self.cancellation)?
+                else {
+                    if mutation {
+                        if terminal_mutation {
+                            cursor.unknown_terminal_mutation = true;
+                        } else {
+                            cursor.unknown_mutation = true;
+                        }
+                        continue;
+                    }
+                    rejected = true;
+                    break;
+                };
+                let completion = inputs
+                    .base_preservation
+                    .as_ref()
+                    .map_or(&inputs.completion, |guard| &guard.completion);
+                if !inputs.written_inventory_complete
+                    || completion != &ResolutionCompletion::Complete
+                {
+                    if mutation {
+                        if terminal_mutation {
+                            cursor.unknown_terminal_mutation = true;
+                        } else {
+                            cursor.unknown_mutation = true;
+                        }
+                        continue;
+                    }
+                    rejected = true;
+                    break;
+                }
+                let mut requested = cursor
+                    .rule
+                    .absent_members
+                    .iter()
+                    .chain(cursor.rule.enclosing_absent_members)
+                    .copied()
+                    .collect::<Vec<_>>();
+                requested.sort_unstable();
+                requested.dedup();
+                let session = &mut *self.session;
+                let cancellation = self.cancellation;
+                let mut stopped = false;
+                let members = session.typed_source.base_preservation_members(
+                    target,
+                    &requested,
+                    cancellation,
+                    &mut || {
+                        let proceed = !cancellation.is_cancelled() && session.charge_scope_steps(1);
+                        stopped |= !proceed;
+                        proceed
+                    },
+                )?;
+                if stopped {
+                    self.cancellation_observed = true;
+                    return Ok(None);
+                }
+                if members.is_none() && target == subject {
+                    // No subject inventory means no closed terminal-binding
+                    // mutation input, even when the explicit guard is terminal.
+                    rejected = true;
+                    break;
+                }
+                if let Some(members) = &members {
+                    if let Some(receivers) = &members.terminal_mutation_receivers {
+                        for &reference in receivers {
+                            if self.poll_cancelled() || !self.session.charge_scope_steps(1) {
+                                self.cancellation_observed = true;
+                                return Ok(None);
+                            }
+                            if cursor
+                                .mutation_receivers
+                                .insert((GuardRelation::TerminalMutation, reference))
+                            {
+                                cursor.pending.push_back(GuardOperand {
+                                    container: None,
+                                    reference,
+                                    target: None,
+                                    relation: GuardRelation::TerminalMutation,
+                                });
+                            }
+                        }
+                    } else {
+                        cursor.unknown_terminal_mutation = true;
+                    }
+                    for &reference in &members.mutation_receivers {
+                        if self.poll_cancelled() || !self.session.charge_scope_steps(1) {
+                            self.cancellation_observed = true;
+                            return Ok(None);
+                        }
+                        if cursor
+                            .mutation_receivers
+                            .insert((GuardRelation::Mutation, reference))
+                        {
+                            cursor.pending.push_back(GuardOperand {
+                                container: None,
+                                reference,
+                                target: None,
+                                relation: GuardRelation::Mutation,
+                            });
+                        }
+                    }
+                }
+                let authority = match inputs.authority {
+                    crate::analyzer::resolution::ImplicitBaseAuthority::Selected(row) => {
+                        HierarchyProviderAuthority::Typed(row)
+                    }
+                    crate::analyzer::resolution::ImplicitBaseAuthority::Intrinsic {
+                        descriptor,
+                    } => HierarchyProviderAuthority::Intrinsic { descriptor },
+                };
+                cursor.observations.push(HierarchyProviderObservation {
+                    provider: HierarchyProviderKey::source(
+                        target,
+                        target,
+                        ResolutionNamespace::Type,
+                        authority,
+                        HierarchyProviderOperand::SupertypeInventory,
+                        target,
+                        0,
+                    ),
+                    visit: HierarchyProviderVisit::Observed,
+                    completion: ResolutionCompletion::Complete,
+                    inventory_complete: Some(true),
+                });
+                cursor.nodes.insert(
+                    target,
+                    GuardOwner {
+                        members,
+                        ..Default::default()
+                    },
+                );
+                let read = self.session.supertypes_for_definitions(&[target])?;
+                let rows = match read {
+                    SessionFactRead::Exhausted { rows, evidence } => {
+                        let identity = hierarchy_support_read_identity(
+                            self.session,
+                            self.hierarchy,
+                            b"base-preservation-supertypes",
+                            &[target],
+                        )?;
+                        self.observe_hierarchy_support_completion(identity, &evidence);
+                        if evidence != ResolutionCompletion::Complete {
+                            rejected = true;
+                            break;
+                        }
+                        rows
+                    }
+                    SessionFactRead::Cancelled(evidence) => {
+                        self.observe_cancelled_hierarchy_support_completion(&evidence);
+                        return Ok(None);
+                    }
+                };
+                let mut rows = rows;
+                rows.sort_by_key(|row| row.get(self.session).row().parent_ordinal());
+                if rows.len() != inputs.written_base_count as usize {
+                    rejected = true;
+                    break;
+                }
+                for row in rows {
+                    if self.poll_cancelled() || !self.session.charge_scope_steps(1) {
+                        self.cancellation_observed = true;
+                        return Ok(None);
+                    }
+                    let row = row.get(self.session).row();
+                    let resolved = match row.target() {
+                        super::super::LoweredSupertypeTarget::ResolvedIdentity(target) => {
+                            Some(*target)
+                        }
+                        _ => None,
+                    };
+                    cursor.pending.push_back(GuardOperand {
+                        container: Some(target),
+                        reference: row.reference(),
+                        target: resolved,
+                        relation: GuardRelation::Base,
+                    });
+                }
+                if inputs.written_base_count == 0
+                    && let Some(root) = inputs.root_object
+                {
+                    cursor.pending.push_back(GuardOperand {
+                        container: Some(target),
+                        reference: root.occurrence,
+                        target: Some(root.identity),
+                        relation: GuardRelation::Base,
+                    });
+                }
+                if let Some(guard) = inputs.base_preservation {
+                    if guard.completion != ResolutionCompletion::Complete
+                        || guard.terminal != cursor.rule.terminal
+                    {
+                        rejected = true;
+                        break;
+                    }
+                    for reference in guard.references {
+                        if self.poll_cancelled() || !self.session.charge_scope_steps(1) {
+                            self.cancellation_observed = true;
+                            return Ok(None);
+                        }
+                        cursor.pending.push_back(GuardOperand {
+                            container: Some(target),
+                            reference,
+                            target: None,
+                            relation: GuardRelation::Guard,
+                        });
+                    }
+                }
+            }
+            if !rejected {
+                rejected = !self.finish_base_preservation_guard(
+                    &mut cursor,
+                    edge_provider.base_preservation_order(),
+                )?;
+            }
+            if self.poll_cancelled() || self.cancellation_observed {
+                return Ok(None);
+            }
+            self.hierarchy.base_guard_proofs.insert(
+                proof_key,
+                ClosedQueryValue::new(
+                    BasePreservationProof {
+                        admitted: !rejected,
+                        observations: cursor.observations,
+                    },
+                    self.query_obligations.scope(QueryNode::Hierarchy(subject)),
+                ),
+            );
+        }
+        Ok(Some(Vec::new()))
+    }
+
+    /// A stopped or unfinished proof never admits a caller's narrower question.
+    pub(super) fn base_preservation_proven(
+        &mut self,
+        owner: SemanticId,
+        rule: crate::analyzer::resolution::BasePreservationRule,
+    ) -> bool {
+        if self.poll_cancelled() || self.cancellation_observed {
+            return false;
+        }
+        self.hierarchy
+            .base_guard_proofs
+            .get(&BaseGuardKey {
+                owner: HierarchyOwnerKey {
+                    owner,
+                    policy: self.hierarchy_policy,
+                },
+                rule,
+            })
+            .is_some_and(|proof| {
+                proof
+                    .read(&mut self.query_obligations.node(QueryNode::Hierarchy(owner)))
+                    .admitted
+            })
+    }
+
+    fn finish_base_preservation_guard(
+        &mut self,
+        cursor: &mut BaseGuardCursor,
+        policy: Option<&'static dyn HierarchyLinearizationPolicy>,
+    ) -> StoreResult<bool> {
+        let Some(policy) = policy else {
+            return Ok(false);
+        };
+        if cursor.unknown_terminal_mutation {
+            return Ok(false);
+        }
+        // Metaclass dependencies must be well-founded independently of base MROs.
+        let mut remaining = HashMap::default();
+        let mut parents = HashMap::<SemanticId, Vec<SemanticId>>::default();
+        let mut ready = VecDeque::new();
+        for (&owner, node) in &cursor.nodes {
+            if self.poll_cancelled() || !self.session.charge_scope_steps(1) {
+                self.cancellation_observed = true;
+                return Ok(false);
+            }
+            let mut count = 0usize;
+            for &base in node.bases.iter().chain(&node.guards) {
+                if self.poll_cancelled() || !self.session.charge_scope_steps(1) {
+                    self.cancellation_observed = true;
+                    return Ok(false);
+                }
+                if base != cursor.terminal {
+                    parents.entry(base).or_default().push(owner);
+                    count += 1;
+                }
+            }
+            remaining.insert(owner, count);
+            if count == 0 {
+                ready.push_back(owner);
+            }
+        }
+        let mut completed = Vec::new();
+        while let Some(owner) = ready.pop_front() {
+            if self.poll_cancelled() || !self.session.charge_scope_steps(1) {
+                self.cancellation_observed = true;
+                return Ok(false);
+            }
+            completed.push(owner);
+            for parent in parents.get(&owner).into_iter().flatten() {
+                let count = remaining.get_mut(parent).expect("guard dependency");
+                *count -= 1;
+                if *count == 0 {
+                    ready.push_back(*parent);
+                }
+            }
+        }
+        if completed.len() != cursor.nodes.len() {
+            return Ok(false);
+        }
+        struct GuardSource<'a> {
+            cursor: &'a BaseGuardCursor,
+        }
+        impl SupertypeSource<SemanticId> for GuardSource<'_> {
+            fn bases(&mut self, owner: &SemanticId) -> Option<Vec<SemanticId>> {
+                if *owner == self.cursor.terminal {
+                    Some(Vec::new())
+                } else {
+                    self.cursor.nodes.get(owner).map(|node| node.bases.clone())
+                }
+            }
+        }
+        let mut roots = cursor.roots.clone();
+        roots.extend(
+            cursor
+                .mutation_targets
+                .iter()
+                .filter(|owner| cursor.nodes.contains_key(owner))
+                .copied(),
+        );
+        for node in cursor.nodes.values() {
+            roots.extend(&node.guards);
+        }
+        roots.sort_unstable();
+        roots.dedup();
+        let mut orders = HashMap::from_iter([(cursor.terminal, vec![cursor.terminal])]);
+        for root in roots {
+            let mut source = GuardSource { cursor };
+            let mut stopped = false;
+            let result = super::hierarchy_linearize::linearize_with_budget(
+                &root,
+                &mut source,
+                policy,
+                &mut || {
+                    let step =
+                        !self.cancellation.is_cancelled() && self.session.charge_scope_steps(1);
+                    stopped |= !step;
+                    step
+                },
+            );
+            if stopped {
+                self.cancellation_observed = true;
+            }
+            let Ok(order) = result else {
+                return Ok(false);
+            };
+            orders.insert(root, order);
+        }
+        // Inherited conditional providers must select one most-derived owner.
+        let mut effective = HashMap::from_iter([(cursor.terminal, cursor.terminal)]);
+        for owner in completed {
+            if self.poll_cancelled() || !self.session.charge_scope_steps(1) {
+                self.cancellation_observed = true;
+                return Ok(false);
+            }
+            let node = &cursor.nodes[&owner];
+            let mut candidates = node.guards.clone();
+            candidates.extend(node.bases.iter().map(|base| effective[base]));
+            candidates.sort_unstable();
+            candidates.dedup();
+            if candidates.is_empty() {
+                candidates.push(cursor.terminal);
+            }
+            let mut selected = None;
+            for &candidate in &candidates {
+                let mut dominates = true;
+                for other in &candidates {
+                    if self.poll_cancelled() || !self.session.charge_scope_steps(1) {
+                        self.cancellation_observed = true;
+                        return Ok(false);
+                    }
+                    if !orders
+                        .get(&candidate)
+                        .is_some_and(|order| order.contains(other))
+                    {
+                        dominates = false;
+                        break;
+                    }
+                }
+                if dominates {
+                    selected = Some(candidate);
+                    break;
+                }
+            }
+            let Some(selected) = selected else {
+                return Ok(false);
+            };
+            effective.insert(owner, selected);
+        }
+        // A receiver declaration is disjoint only after its class-object
+        // creation proof too; a factory result or replacing metaclass is unknown.
+        let mut requirements = HashMap::<SemanticId, HashSet<&'static str>>::default();
+        let mut pending = VecDeque::new();
+        for &subject in cursor.roots.iter().chain(
+            cursor
+                .mutation_targets
+                .iter()
+                .filter(|owner| cursor.nodes.contains_key(owner)),
+        ) {
+            pending.push_back((effective[&subject], cursor.rule.absent_members));
+        }
+        while let Some((provider, members)) = pending.pop_front() {
+            if self.poll_cancelled() || !self.session.charge_scope_steps(1) {
+                self.cancellation_observed = true;
+                return Ok(false);
+            }
+            if provider == cursor.terminal {
+                continue;
+            }
+            let Some(order) = orders.get(&provider) else {
+                return Ok(false);
+            };
+            if !order.contains(&cursor.terminal) {
+                return Ok(false);
+            }
+            // Use the shared MRO's prefix, not each base's independent MRO:
+            // the terminal and every owner after it are outside this guard.
+            for &owner in order.iter().take_while(|owner| **owner != cursor.terminal) {
+                if self.poll_cancelled() || !self.session.charge_scope_steps(1) {
+                    self.cancellation_observed = true;
+                    return Ok(false);
+                }
+                let required = requirements.entry(owner).or_default();
+                let prior = required.len();
+                required.extend(members);
+                if required.len() == prior {
+                    continue;
+                }
+                let node = &cursor.nodes[&owner];
+                let Some(inventory) = &node.members else {
+                    return Ok(false);
+                };
+                if !inventory.complete
+                    || cursor.unknown_mutation
+                    || cursor.mutated_owners.contains(&owner)
+                {
+                    return Ok(false);
+                }
+                for name in &inventory.names {
+                    if self.poll_cancelled() || !self.session.charge_scope_steps(1) {
+                        self.cancellation_observed = true;
+                        return Ok(false);
+                    }
+                    if required.contains(name.as_str()) {
+                        return Ok(false);
+                    }
+                }
+                let header = cursor
+                    .observations
+                    .iter()
+                    .find(|observation| observation.provider.owner == owner)
+                    .expect("guard header observation");
+                cursor.observations.push(HierarchyProviderObservation {
+                    provider: header
+                        .provider
+                        .with_operand(HierarchyProviderOperand::NamespaceInventory),
+                    visit: HierarchyProviderVisit::Observed,
+                    completion: ResolutionCompletion::Complete,
+                    inventory_complete: Some(true),
+                });
+                pending.push_back((effective[&owner], cursor.rule.enclosing_absent_members));
+            }
+        }
+        Ok(true)
     }
 }

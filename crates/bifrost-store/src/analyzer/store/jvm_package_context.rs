@@ -16,7 +16,15 @@ use crate::analyzer::store::maven::MavenModelLimitation;
 use crate::analyzer::store::maven::MavenValue;
 use crate::analyzer::store::maven::maven_configuration_from_bytes;
 
-pub(crate) const JVM_CONTEXT_DERIVATION_VERSION: i64 = 1;
+pub(crate) fn jvm_context_derivation_identity() -> [u8; 32] {
+    static IDENTITY: std::sync::LazyLock<[u8; 32]> = std::sync::LazyLock::new(|| {
+        brokk_bifrost_core::lever_tokens::lever_identity(
+            "jvm-context-derivation",
+            brokk_bifrost_core::lever_file!("jvm-context-derivation.tokens"),
+        )
+    });
+    *IDENTITY
+}
 
 pub(super) const JVM_NATIVE_SOURCE_MEMBERSHIP_SQL: &str =
     "INSERT INTO jvm_source_root_files(context_id,root_id,source_file_version_id)
@@ -45,16 +53,16 @@ impl AnalyzerStore {
             let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             super::require_current_generation(&tx, &snapshot.lang, snapshot.generation)?;
             let existing = tx.prepare_cached("SELECT context_id FROM jvm_context_revisions
-                 WHERE workspace_id=?1 AND lang=?2 AND generation=?3 AND revision=?4 AND derivation_version=?5")?.query_row(
-                params![snapshot.workspace_id.as_str(), snapshot.lang, snapshot.generation.get(), snapshot.revision, JVM_CONTEXT_DERIVATION_VERSION],
+                 WHERE workspace_id=?1 AND lang=?2 AND generation=?3 AND revision=?4 AND derivation_identity=?5")?.query_row(
+                params![snapshot.workspace_id.as_str(), snapshot.lang, snapshot.generation.get(), snapshot.revision, jvm_context_derivation_identity()],
                 |row| row.get(0),
             ).optional()?;
             if let Some(context_id) = existing {
                 return Ok(context_id);
             }
-            tx.prepare_cached("INSERT INTO jvm_context_revisions(workspace_id,lang,generation,revision,derivation_version)
+            tx.prepare_cached("INSERT INTO jvm_context_revisions(workspace_id,lang,generation,revision,derivation_identity)
                  VALUES(?1,?2,?3,?4,?5)")?.execute(
-                params![snapshot.workspace_id.as_str(), snapshot.lang, snapshot.generation.get(), snapshot.revision, JVM_CONTEXT_DERIVATION_VERSION],
+                params![snapshot.workspace_id.as_str(), snapshot.lang, snapshot.generation.get(), snapshot.revision, jvm_context_derivation_identity()],
             )?;
             let context_id = tx.last_insert_rowid();
             let mut parsed_project = false;

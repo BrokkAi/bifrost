@@ -23,6 +23,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use brokk_bifrost_rql::structural::identifier_typos::IdentifierTypoTable;
+
 use brokk_bifrost_analysis::CancellationToken;
 use brokk_bifrost_analysis::analyzer::packs_document::load_workspace_packs_config_at;
 use brokk_bifrost_analysis::analyzer::{
@@ -221,6 +223,13 @@ fn with_one_policy<T>(
     let workspace = workspace
         .or(owned.as_ref())
         .expect("either the caller supplied a workspace or one was built");
+    // This owner boundary covers explanations and near-miss questions. The
+    // guard drops before `owned`, including on activation/selection errors.
+    let _retention = brokk_bifrost_analysis::profiling::retention_scope(
+        workspace.retention_budget(),
+        "policy_explanation",
+        "explain",
+    );
     // The earliest point a pinned generation can be checked: the analyzer
     // exists, and nothing after this -- pack activation, registry loading,
     // policy registration, evaluation -- is worth doing for a question about a
@@ -260,10 +269,8 @@ fn with_one_policy<T>(
     // Pin both a successful activation and a deliberate absence for the whole
     // question. A host publication that races an explanation must not change
     // the model set between its prefix executions or finding re-evaluation.
-    let _semantic_model_scope = AnalyzerQueryScope::with_active_semantic_model_snapshot(
-        workspace.analyzer(),
-        active_semantic_model_snapshot,
-    );
+    let _question_scope =
+        super::value_flow_question_scope(workspace.analyzer(), active_semantic_model_snapshot)?;
     // Normal evaluation resolves qualified policy locators only after the
     // analyzer and semantic publication are ready. Explanation must cross the
     // same loaded-policy boundary or an otherwise runnable policy can fail here
@@ -291,6 +298,7 @@ fn with_one_policy<T>(
         .or(owned_flow_state.as_ref())
         .expect("every explanation owns reusable flow state");
     let context = PolicyEvaluationContext {
+        acceptance_hint: None,
         analyzer: workspace.analyzer(),
         workspace: Some(workspace),
         flow_state,
@@ -303,7 +311,7 @@ fn with_one_policy<T>(
         incremental: None,
         // Reproduce an ordinary pack-driven run's typo table, so a
         // misspelled-identifier finding remains explainable (#10386).
-        identifier_typos: crate::builtin::catalog_identifier_typos(),
+        identifier_typos: explanation_identifier_typos(policy)?,
     };
     // The same per-policy budget an ordinary run would use, scaled the same
     // way, so a re-executed prefix is bounded exactly as the original was.
@@ -311,6 +319,37 @@ fn with_one_policy<T>(
         policy_budget_for_workspace(*PolicyBatchBudget::default().per_policy(), Some(workspace));
     check_explanation_cancellation(cancellation)?;
     answer(policy, &context, &mut budget)
+}
+
+/// The catalog typo table an explanation reproduces. A policy that reads it,
+/// or that reads every registered catalog, cannot be explained faithfully
+/// while what the rules packs supply may be incomplete (#10941).
+fn explanation_identifier_typos(
+    policy: &LoadedPolicy,
+) -> Result<Option<&'static Arc<IdentifierTypoTable>>, ExplainError> {
+    if crate::builtin::policy_reads_identifier_typos(policy)
+        && let Some(gap) = crate::builtin::catalog_identifier_typos_gap()
+    {
+        return Err(ExplainError::PolicyUnavailable {
+            message: format!(
+                "policy `{}` reads identifier typos, but {gap}",
+                policy.definition().metadata.id
+            ),
+        });
+    }
+    if crate::builtin::policy_reads_any_registered_catalog(policy)
+        && let Some(gap) = crate::builtin::catalog_registry_gap()
+    {
+        return Err(ExplainError::PolicyUnavailable {
+            message: format!(
+                "policy `{}` reads every registered catalog, but {gap}",
+                policy.definition().metadata.id
+            ),
+        });
+    }
+    // A catalog that failed to load supplies nothing here, and this policy
+    // does not read the table.
+    Ok(crate::builtin::catalog_identifier_typos().ok().flatten())
 }
 
 /// Answer one explanation question about an already-loaded policy.
@@ -360,10 +399,14 @@ pub fn explain_loaded_policy(
     // This public reuse boundary may be called without `with_one_policy`'s
     // host scope. Freeze one publication for every target so candidate prefix
     // executions and finding adapters cannot observe different model sets.
-    let _semantic_model_scope = AnalyzerQueryScope::with_active_semantic_model_snapshot(
-        context.analyzer,
-        active_semantic_model_snapshot.clone(),
-    );
+    let _question_scope = if context.workspace.is_some() {
+        super::value_flow_question_scope(context.analyzer, active_semantic_model_snapshot.clone())?
+    } else {
+        AnalyzerQueryScope::with_active_semantic_model_snapshot(
+            context.analyzer,
+            active_semantic_model_snapshot.clone(),
+        )
+    };
     match target {
         ExplanationTarget::Finding(finding_id) => {
             let taint = context.workspace.map_or_else(

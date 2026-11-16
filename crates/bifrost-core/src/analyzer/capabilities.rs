@@ -1,6 +1,6 @@
 use crate::analyzer::code_unit_index::CodeUnitIndex;
 use crate::analyzer::model::{CodeUnit, ImportInfo, ProjectFile};
-use crate::analyzer::pool_memo::{KeyedPoolSafeMemo, PoolSafeMemo};
+use crate::analyzer::pool_memo::PoolSafeMemo;
 use crate::analyzer::query_token::QueryToken;
 use crate::cancellation::CancellationToken;
 use crate::compact_graph::{CompactRows, CompactRowsBuilder, normalize_indexed_edges};
@@ -38,8 +38,37 @@ pub struct FileDependencyFacts {
 /// publishing the result as a complete cached graph.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdditionalFileDependencies {
+    /// Optional structured cause when membership discovery cannot close this set.
+    pub membership_cause: Option<CSharpCompilationMembershipOpenCause>,
     pub dependencies: HashMap<ProjectFile, HashSet<ProjectFile>>,
     pub complete: bool,
+}
+
+/// Discovery evidence for exhaustive C# source-to-compilation membership.
+/// This is process-local evidence, not a persisted compilation fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CSharpCompilationMembershipCompleteness {
+    Complete,
+    Open(CSharpCompilationMembershipOpenCause),
+}
+
+impl CSharpCompilationMembershipCompleteness {
+    pub fn cause(self) -> Option<CSharpCompilationMembershipOpenCause> {
+        match self {
+            Self::Complete => None,
+            Self::Open(cause) => Some(cause),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CSharpCompilationMembershipOpenCause {
+    DirectoryOmitted,
+    /// A project file the listing omitted and configuration capture did not
+    /// read. The reason is that omission's typed cause. The file is unknown,
+    /// not missing.
+    ProjectFileUnknown(crate::analyzer::project::WorkspaceFileOmissionReason),
+    ListingUnavailable,
 }
 
 /// One structured name lookup performed while resolving a file's imports.
@@ -105,6 +134,7 @@ impl AdditionalFileDependencies {
         Self {
             dependencies,
             complete: true,
+            membership_cause: None,
         }
     }
 
@@ -112,6 +142,7 @@ impl AdditionalFileDependencies {
         Self {
             dependencies,
             complete: false,
+            membership_cause: None,
         }
     }
 }
@@ -681,6 +712,15 @@ pub enum DescendantIndexVariant {
     ProductionOnly,
 }
 
+/// An exclusion decision could not be established. The caller retains the
+/// underlying diagnostic; index builders must stop without publishing an index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceExclusionUnavailable;
+
+/// A source exclusion decision, with availability preserved across crate boundaries.
+pub type SourceExclusionPredicate<'a> =
+    dyn Fn(&ProjectFile) -> Result<bool, SourceExclusionUnavailable> + 'a;
+
 /// The request state a whole-workspace descendant-index build needs: the
 /// deadline it polls, and the slice of the workspace it covers.
 ///
@@ -696,11 +736,12 @@ pub enum DescendantIndexVariant {
 /// predicate. **The predicate must be a pure function of the analyzer and the
 /// file.** That is the condition that makes [`DescendantIndexVariant`] a
 /// complete key: two requests that both exclude test files must describe the
-/// same index, or one would be served the other's.
+/// same index, or one would be served the other's. An unavailable decision
+/// invalidates the entire build: never cache that index under ProductionOnly.
 #[derive(Clone, Copy)]
 pub struct DescendantIndexScope<'a> {
     cancellation: &'a CancellationToken,
-    excluded_source: Option<&'a dyn Fn(&ProjectFile) -> bool>,
+    excluded_source: Option<&'a SourceExclusionPredicate<'a>>,
 }
 
 impl<'a> DescendantIndexScope<'a> {
@@ -717,7 +758,7 @@ impl<'a> DescendantIndexScope<'a> {
     /// per-file resolution work behind that call is never charged.
     pub fn excluding_sources(
         cancellation: &'a CancellationToken,
-        excluded: &'a dyn Fn(&ProjectFile) -> bool,
+        excluded: &'a SourceExclusionPredicate<'a>,
     ) -> Self {
         Self {
             cancellation,
@@ -743,9 +784,11 @@ impl<'a> DescendantIndexScope<'a> {
     }
 
     /// Whether `declaration` belongs in this index.
-    pub fn admits(&self, declaration: &CodeUnit) -> bool {
-        self.excluded_source
-            .is_none_or(|excluded| !excluded(declaration.source()))
+    pub fn admits(&self, declaration: &CodeUnit) -> Result<bool, SourceExclusionUnavailable> {
+        match self.excluded_source {
+            Some(excluded) => excluded(declaration.source()).map(|excluded| !excluded),
+            None => Ok(true),
+        }
     }
 }
 
@@ -765,7 +808,7 @@ fn query_within_scope<T>(
 }
 
 /// One member shape fixed by a platform language specification.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlatformInventoryMethod {
     pub name: &'static str,
     pub parameters: &'static [&'static str],
@@ -813,7 +856,7 @@ pub enum MemberFamilySupertypeArguments {
 }
 
 /// An ancestor whose member declarations the workspace did not read.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnreadMemberFamilyAncestor {
     pub name: String,
     pub inventory: Option<&'static [PlatformInventoryMethod]>,
@@ -827,7 +870,7 @@ pub struct MemberFamilyAncestors {
 }
 
 /// Evidence that a hierarchy query could not close its search boundary.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HierarchyOpenReason {
     /// Existing hierarchy diagnostics, including `HierarchyTruncated` and
     /// `AncestorExternalUnindexed`, retain their consumer-side vocabulary.
@@ -839,6 +882,25 @@ pub enum HierarchyOpenReason {
     ForwardSatisfactionIncomplete,
     /// Preserve the unread name and any language-specified member inventory.
     UnreadAncestor(UnreadMemberFamilyAncestor),
+    /// A descendant index was built, but these candidates' own ancestor
+    /// answers are open: any of them may be a descendant of the queried type
+    /// through an ancestor the language could not close. The definite edges
+    /// beside this reason are still correct.
+    OpenAncestorCandidates(Vec<CodeUnit>),
+    /// A supertype clause of `declared_by` names `name`, and the language's
+    /// type lookup finds no indexed declaration for it: a library type read
+    /// from an assembly, for example. When `may_name_indexed` is false the
+    /// language proved the clause names a type outside the index, so the
+    /// definite edges still name every indexed ancestor; when it is true the
+    /// lookup failure proves nothing about indexed types.
+    ExternalUnindexedAncestor {
+        name: String,
+        declared_by: CodeUnit,
+        may_name_indexed: bool,
+    },
+    /// Source could not establish the supertype clauses of `declared_by`, so
+    /// the definite edges may omit any ancestor.
+    SupertypesUnread { declared_by: CodeUnit },
 }
 
 impl HierarchyOpenReason {
@@ -846,8 +908,28 @@ impl HierarchyOpenReason {
     pub fn description(&self) -> String {
         match self {
             Self::UnreadAncestor(ancestor) => format!("{}: {}", self.as_str(), ancestor.name),
+            Self::OpenAncestorCandidates(candidates) => {
+                let names: Vec<String> = candidates.iter().map(CodeUnit::fq_name).collect();
+                format!("{}: {}", self.as_str(), names.join(", "))
+            }
+            Self::ExternalUnindexedAncestor { name, .. } => format!("{}: {name}", self.as_str()),
             _ => self.as_str().to_string(),
         }
+    }
+
+    /// Whether the work behind this reason stopped short, as opposed to
+    /// finishing with a closed-world gap. An index builder keeps its positive
+    /// edges and treats the declaration as an unbounded open candidate; the
+    /// caller retains the stop receipt and decides whether to memoize it.
+    pub fn stopped_short(&self) -> bool {
+        matches!(
+            self,
+            Self::DescendantIndexUnavailable
+                | Self::MemberFamily(
+                    crate::analyzer::structural::resolution::MemberFamilyReason::HierarchyTruncated
+                        | crate::analyzer::structural::resolution::MemberFamilyReason::ProviderUnavailable
+                )
+        )
     }
 
     /// Stable public reason label, shared by hierarchy presentation surfaces.
@@ -857,7 +939,37 @@ impl HierarchyOpenReason {
             Self::DescendantIndexUnavailable => "descendant_index_unavailable",
             Self::ForwardSatisfactionIncomplete => "forward_satisfaction_incomplete",
             Self::UnreadAncestor(_) => "unread_ancestor",
+            Self::OpenAncestorCandidates(_) => "open_ancestor_candidates",
+            Self::ExternalUnindexedAncestor { .. } => {
+                crate::analyzer::structural::resolution::MemberFamilyReason::AncestorExternalUnindexed
+                    .label()
+            }
+            Self::SupertypesUnread { .. } => "supertypes_unread",
         }
+    }
+
+    /// The declaration whose supertype clauses left the answer open, when the
+    /// reason names one.
+    pub fn declared_by(&self) -> Option<&CodeUnit> {
+        match self {
+            Self::ExternalUnindexedAncestor { declared_by, .. }
+            | Self::SupertypesUnread { declared_by } => Some(declared_by),
+            _ => None,
+        }
+    }
+
+    /// Whether the definite edges still name every indexed ancestor, so the
+    /// inverse (descendant) relation over indexed types built from them is
+    /// exact. Only a clause proven to name a type outside the index
+    /// qualifies.
+    pub fn keeps_indexed_edges_exact(&self) -> bool {
+        matches!(
+            self,
+            Self::ExternalUnindexedAncestor {
+                may_name_indexed: false,
+                ..
+            }
+        )
     }
 }
 
@@ -866,16 +978,16 @@ impl HierarchyOpenReason {
 /// Only `edges` are definite. Each ambiguous group contains alternatives for
 /// one unresolved edge; none of those alternatives is a definite ancestor or
 /// descendant. Ambiguity and open reasons both prevent an exhaustive answer.
-#[derive(Debug, Default)]
-pub struct HierarchyAnswer {
-    pub edges: Vec<CodeUnit>,
-    pub ambiguous: Vec<Vec<CodeUnit>>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HierarchyAnswer<T = CodeUnit> {
+    pub edges: Vec<T>,
+    pub ambiguous: Vec<Vec<T>>,
     pub open: Vec<HierarchyOpenReason>,
 }
 
-impl HierarchyAnswer {
+impl<T> HierarchyAnswer<T> {
     /// Construct a complete answer, preserving the provider's edge order.
-    pub fn complete(edges: Vec<CodeUnit>) -> Self {
+    pub fn complete(edges: Vec<T>) -> Self {
         Self {
             edges,
             ambiguous: Vec::new(),
@@ -883,8 +995,20 @@ impl HierarchyAnswer {
         }
     }
 
+    /// Unavailable facts must name their gap explicitly.
+    pub fn incomplete(reason: HierarchyOpenReason) -> Self {
+        Self {
+            edges: Vec::new(),
+            ambiguous: Vec::new(),
+            open: vec![reason],
+        }
+    }
+
     /// Union definite edges in CodeUnit order while retaining all uncertainty.
-    pub fn merge(&mut self, other: Self) {
+    pub fn merge(&mut self, other: Self)
+    where
+        T: Ord,
+    {
         self.edges.extend(other.edges);
         self.edges.sort();
         self.edges.dedup();
@@ -896,9 +1020,25 @@ impl HierarchyAnswer {
         self.ambiguous.is_empty() && self.open.is_empty()
     }
 
+    /// Whether the query stopped short (see [`HierarchyOpenReason::stopped_short`]).
+    pub fn stopped_short(&self) -> bool {
+        self.open.iter().any(HierarchyOpenReason::stopped_short)
+    }
+
+    /// Whether the definite edges name every indexed ancestor, so an inverse
+    /// (descendant) relation over indexed types built from them is exact. An
+    /// answer whose only open reasons name types outside the index qualifies.
+    pub fn keeps_indexed_edges_exact(&self) -> bool {
+        self.ambiguous.is_empty()
+            && self
+                .open
+                .iter()
+                .all(HierarchyOpenReason::keeps_indexed_edges_exact)
+    }
+
     /// Lossy: drops ambiguous groups and open reasons. Only for callers whose
     /// language answers are complete by construction.
-    pub fn definite(&self) -> &[CodeUnit] {
+    pub fn definite(&self) -> &[T] {
         &self.edges
     }
 }
@@ -978,12 +1118,27 @@ pub trait TypeHierarchyProvider: Send + Sync {
 
     /// The nominal member walk also needs the ancestors not represented by
     /// workspace declarations. Languages opt in without changing type lookup.
+    /// The default names each clause the provider reported as outside the
+    /// index as an unread ancestor without an inventory, so a family that
+    /// reaches it stays open under that ancestor's name (#7363).
     fn member_family_ancestors(&self, owner: &CodeUnit) -> MemberFamilyAncestors {
         let answer = self.get_direct_ancestors(owner);
         MemberFamilyAncestors {
             resolved: answer.edges,
             ambiguous: answer.ambiguous,
-            unread: Vec::new(),
+            unread: answer
+                .open
+                .into_iter()
+                .filter_map(|reason| match reason {
+                    HierarchyOpenReason::ExternalUnindexedAncestor { name, .. } => {
+                        Some(UnreadMemberFamilyAncestor {
+                            name,
+                            inventory: None,
+                        })
+                    }
+                    _ => None,
+                })
+                .collect(),
         }
     }
 
@@ -1168,10 +1323,21 @@ pub trait TypeHierarchyProvider: Send + Sync {
 }
 
 /// Exact declaration identities plus compact ancestor-to-descendant rows.
+///
+/// `open_candidates` are the declarations whose own ancestor answer was
+/// open (an unresolved or ambiguous base, or a stopped proof). Their definite
+/// ancestors are rows like any other; the rest of their ancestry is unknown, so
+/// any of them may also descend from any other type. A row is complete only
+/// when no other declaration is an open candidate.
 pub struct DirectDescendantIndex {
     nodes: Box<[CodeUnit]>,
     row_by_ancestor: HashMap<CodeUnit, u32>,
     descendants: CompactRows<u32>,
+    /// Any language that produces open candidates must include them in its
+    /// descendants authority digest (for Python, `descendants_authority_digest`
+    /// in python/mod.rs); otherwise two indexes that differ only in their open
+    /// set would certify the same descendant answers.
+    open_candidates: Box<[CodeUnit]>,
 }
 
 impl DirectDescendantIndex {
@@ -1192,6 +1358,11 @@ impl DirectDescendantIndex {
             + self.row_by_ancestor.capacity()
                 * (std::mem::size_of::<CodeUnit>() + std::mem::size_of::<u32>() + 1)
             + self.descendants.estimated_bytes() as usize
+            + self
+                .open_candidates
+                .iter()
+                .map(|unit| std::mem::size_of::<CodeUnit>() + unit.fq_name().len())
+                .sum::<usize>()
     }
 
     pub fn from_indexed_nodes(
@@ -1228,7 +1399,41 @@ impl DirectDescendantIndex {
             nodes: nodes.into_boxed_slice(),
             row_by_ancestor,
             descendants: descendants.finish(),
+            open_candidates: Box::default(),
         }
+    }
+
+    /// Record the candidates whose ancestor answer is open, in `CodeUnit` order.
+    pub fn with_open_candidates(mut self, mut open_candidates: Vec<CodeUnit>) -> Self {
+        open_candidates.sort();
+        open_candidates.dedup();
+        self.open_candidates = open_candidates.into_boxed_slice();
+        self
+    }
+
+    /// The candidates whose ancestor answer is open, in `CodeUnit` order.
+    pub fn open_candidates(&self) -> &[CodeUnit] {
+        &self.open_candidates
+    }
+
+    /// The definite descendants of `ancestor`, sorted, with the index's open
+    /// candidates as typed incompleteness, excluding the ancestor itself.
+    pub fn answer(&self, ancestor: &CodeUnit) -> HierarchyAnswer {
+        let mut edges: Vec<_> = self.descendants(ancestor).into_iter().collect();
+        edges.sort();
+        let mut answer = HierarchyAnswer::complete(edges);
+        let open_candidates: Vec<_> = self
+            .open_candidates
+            .iter()
+            .filter(|candidate| *candidate != ancestor)
+            .cloned()
+            .collect();
+        if !open_candidates.is_empty() {
+            answer
+                .open
+                .push(HierarchyOpenReason::OpenAncestorCandidates(open_candidates));
+        }
+        answer
     }
 
     pub fn descendants(&self, ancestor: &CodeUnit) -> HashSet<CodeUnit> {
@@ -1243,37 +1448,14 @@ impl DirectDescendantIndex {
     }
 }
 
-/// Answer a descendant query from a variant-keyed index cell, building the
-/// variant the caller asked for if it is missing.
-///
-/// Every analyzer that memoizes a whole-workspace descendant index repeats this
-/// same dance: pick the cell for the scope's variant, build while the deadline
-/// holds, publish nothing if it does not, project the ancestor's row. It lives
-/// here so the complete-or-nothing rule is stated once instead of copied into
-/// each language module.
-pub fn descendants_from_variant_index(
-    index: &KeyedPoolSafeMemo<DescendantIndexVariant, DirectDescendantIndex>,
-    scope: &DescendantIndexScope<'_>,
-    code_unit: &CodeUnit,
-    build: impl Fn() -> Option<DirectDescendantIndex>,
-) -> Option<HashSet<CodeUnit>> {
-    Some(
-        index
-            .cell(&scope.variant())
-            // The builders are serial, so the same closure serves both memo
-            // arms; the memo's value here is the non-blocking claim protocol.
-            .get_or_build_while(&scope.keep_going(), &build, &build)?
-            .descendants(code_unit),
-    )
-}
-
 /// Invert the ancestor relation over every class the analyzer indexes.
 ///
 /// `scope` decides two things. Its predicate drops declarations before they are
 /// ever handed to `get_direct_ancestors`, which is where the per-declaration
 /// resolution cost is charged (for C++ that is a whole transitive `#include`
 /// closure per declaring file). Its token bounds the loop: `None` means the
-/// build stopped short and must not be published.
+/// build stopped short (including an unavailable source exclusion) and must not
+/// be published.
 pub fn build_direct_descendant_index<A, P>(
     analyzer: &A,
     provider: &P,
@@ -1298,17 +1480,21 @@ pub fn build_direct_descendant_index_in_query<A: CodeUnitIndex>(
     query: &mut dyn HierarchyQuery,
     scope: &DescendantIndexScope<'_>,
 ) -> Option<DirectDescendantIndex> {
+    let mut candidates = Vec::new();
+    for candidate in analyzer.all_declarations().filter(CodeUnit::is_class) {
+        if match scope.admits(&candidate) {
+            Ok(value) => value,
+            Err(reason) => {
+                let _unavailable = reason;
+                return None;
+            }
+        } {
+            candidates.push(candidate);
+        }
+    }
     build_direct_descendant_index_from_candidates(
-        analyzer
-            .all_declarations()
-            .filter(|candidate| candidate.is_class() && scope.admits(candidate))
-            .collect(),
-        |candidate| {
-            let answer = query.direct_ancestors_within(candidate, scope).ok()?;
-            // Legacy indexes cannot represent uncertainty. Do not publish an
-            // incomplete inverse relation as a complete cached index.
-            answer.is_complete().then_some(answer.edges)
-        },
+        candidates,
+        |candidate| query.direct_ancestors_within(candidate, scope).ok(),
         &scope.keep_going(),
     )
 }
@@ -1320,15 +1506,19 @@ pub fn build_direct_descendant_index_in_query<A: CodeUnitIndex>(
 /// checkpoint: one candidate is one `direct_ancestors` call, which is the unit
 /// of work whose tens of thousands of repetitions made this loop unbounded in
 /// the first place (issue #1748). `direct_ancestors` answers `None` when its
-/// own work stopped short, which stops this loop too -- a candidate whose bases
-/// were half-resolved must not contribute a half-populated edge set.
+/// own work stopped short. A stopped answer contributes its proven edges and
+/// remains an unbounded open candidate. Its caller retains the stop receipt
+/// and decides whether the index can be memoized. An open answer contributes
+/// its definite edges and makes the candidate an open candidate of the index,
+/// unless its only open reasons name types outside the index
+/// ([`HierarchyAnswer::keeps_indexed_edges_exact`]).
 pub fn build_direct_descendant_index_from_candidates<F>(
     mut candidates: Vec<CodeUnit>,
     mut direct_ancestors: F,
     keep_going: &dyn Fn() -> bool,
 ) -> Option<DirectDescendantIndex>
 where
-    F: FnMut(&CodeUnit) -> Option<Vec<CodeUnit>>,
+    F: FnMut(&CodeUnit) -> Option<HierarchyAnswer>,
 {
     candidates.sort();
     candidates.dedup();
@@ -1351,12 +1541,20 @@ where
         })
         .collect();
     let mut edges = Vec::new();
+    let mut open_candidates = Vec::new();
     for candidate in candidates {
         if !keep_going() {
             return None;
         }
         let descendant = index_by_node[&candidate];
-        for ancestor in direct_ancestors(&candidate)? {
+        let answer = direct_ancestors(&candidate)?;
+        // A clause naming a type outside the index leaves every indexed edge
+        // known: no indexed type can descend through it, so it does not make
+        // the candidate open (#7363).
+        if !answer.keeps_indexed_edges_exact() {
+            open_candidates.push(candidate.clone());
+        }
+        for ancestor in answer.edges {
             let ancestor = types_by_fq_name
                 .get(&ancestor.fq_name())
                 .and_then(|same_name| {
@@ -1376,11 +1574,10 @@ where
             edges.push((ancestor, descendant));
         }
     }
-    Some(DirectDescendantIndex::from_indexed_nodes(
-        nodes,
-        index_by_node,
-        edges,
-    ))
+    Some(
+        DirectDescendantIndex::from_indexed_nodes(nodes, index_by_node, edges)
+            .with_open_candidates(open_candidates),
+    )
 }
 
 fn traverse_hierarchy(
@@ -1412,13 +1609,24 @@ fn traverse_hierarchy_edges_while<F>(
 where
     F: FnMut(&CodeUnit) -> Result<HierarchyAnswer, Cancelled>,
 {
-    let mut result = HierarchyAnswer::default();
+    let mut result = HierarchyAnswer::complete(Vec::new());
     let mut seen = BTreeSet::new();
     let mut queue = VecDeque::from([root.clone()]);
     while let Some(current) = queue.pop_front() {
         let answer = next(&current)?;
         result.ambiguous.extend(answer.ambiguous);
-        result.open.extend(answer.open);
+        for reason in answer.open {
+            // One index's open candidates are the same at every node of the
+            // walk; name each distinct set once.
+            if let HierarchyOpenReason::OpenAncestorCandidates(candidates) = &reason
+                && result.open.iter().any(|seen| {
+                    matches!(seen, HierarchyOpenReason::OpenAncestorCandidates(other) if other == candidates)
+                })
+            {
+                continue;
+            }
+            result.open.push(reason);
+        }
         for item in answer.edges {
             if seen.insert(item.fq_name()) {
                 queue.push_back(item.clone());
@@ -1605,6 +1813,56 @@ mod hierarchy_traversal_properties {
             matches!(answer.open.as_slice(), [HierarchyOpenReason::UnreadAncestor(ancestor)] if ancestor.name == "External")
         );
         assert!(!answer.is_complete());
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12211: an open candidate tainted its own descendant answer"
+    )]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12172: an open candidate's own ancestry tainted its descendant query"
+    )]
+    fn an_open_candidate_does_not_taint_its_own_descendants() {
+        let project = ProjectFile::new(std::env::temp_dir(), "Hierarchy.java");
+        let class = |name: &str| CodeUnit::new(project.clone(), CodeUnitType::Class, "", name);
+        let base = class("Base");
+        let open = class("Open");
+        let derived = class("Derived");
+        let index = build_direct_descendant_index_from_candidates(
+            vec![base.clone(), open.clone(), derived.clone()],
+            |candidate| {
+                if candidate == &open {
+                    Some(HierarchyAnswer {
+                        edges: vec![base.clone()],
+                        open: vec![HierarchyOpenReason::UnreadAncestor(
+                            UnreadMemberFamilyAncestor {
+                                name: "Mystery".into(),
+                                inventory: None,
+                            },
+                        )],
+                        ambiguous: Vec::new(),
+                    })
+                } else if candidate == &derived {
+                    Some(HierarchyAnswer::complete(vec![open.clone()]))
+                } else {
+                    Some(HierarchyAnswer::complete(Vec::new()))
+                }
+            },
+            &|| true,
+        )
+        .expect("finished open answers build an index");
+
+        let base_answer = index.answer(&base);
+        assert!(!base_answer.is_complete());
+        assert!(matches!(
+            base_answer.open.as_slice(),
+            [HierarchyOpenReason::OpenAncestorCandidates(candidates)]
+                if candidates == std::slice::from_ref(&open)
+        ));
+
+        let own = index.answer(&open);
+        assert!(own.is_complete(), "{own:?}");
+        assert_eq!(own.edges, vec![derived]);
     }
 
     /// Edge lists may repeat a target, hold self loops and form cycles.

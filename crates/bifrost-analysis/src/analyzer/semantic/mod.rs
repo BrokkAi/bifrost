@@ -182,6 +182,34 @@ macro_rules! impl_program_semantics_provider {
                 self.inner.has_complete_semantic_ir_rows(file, key)
             }
 
+            fn selected_procedure_handle(
+                &self,
+                file: &$crate::analyzer::ProjectFile,
+                base: &$crate::analyzer::semantic::ProcedureHandle,
+                request: &mut $crate::analyzer::semantic::SemanticRequest<'_>,
+            ) -> Result<$crate::analyzer::semantic::SemanticOutcome<$crate::analyzer::semantic::service::SelectedProcedureHandle>, $crate::analyzer::semantic::SemanticProviderError> {
+                self.inner.selected_procedure_handle(self, file, base, request)
+            }
+
+            fn selected_procedure_and_flows(
+                &self,
+                file: &$crate::analyzer::ProjectFile,
+                base: &$crate::analyzer::semantic::ProcedureHandle,
+                request: &mut $crate::analyzer::semantic::SemanticRequest<'_>,
+            ) -> Result<$crate::analyzer::semantic::service::CandidateProcedureOutcome<()>, $crate::analyzer::semantic::SemanticProviderError> {
+                self.inner.selected_procedure_and_flows(self, file, base, request)
+            }
+
+            fn stored_candidate_macro_artifact(
+                &self,
+                file: &$crate::analyzer::ProjectFile,
+                key: &$crate::analyzer::semantic::SemanticArtifactKey,
+                capabilities: &$crate::analyzer::semantic::SemanticCapabilities,
+                request: &mut $crate::analyzer::semantic::SemanticRequest<'_>,
+            ) -> Result<$crate::analyzer::semantic::SemanticOutcome<Option<$crate::analyzer::semantic::StoredCandidateMacroArtifact>>, $crate::analyzer::semantic::SemanticProviderError> {
+                self.inner.stored_candidate_macro_artifact(file, key, capabilities, request)
+            }
+
             fn stored_semantic_ir_procedure(
                 &self,
                 file: &$crate::analyzer::ProjectFile,
@@ -321,6 +349,34 @@ macro_rules! impl_program_semantics_provider {
                 key: &$crate::analyzer::semantic::SemanticArtifactKey,
             ) -> Result<bool, $crate::analyzer::semantic::SemanticProviderError> {
                 self.inner.has_complete_semantic_ir_rows(file, key)
+            }
+
+            fn selected_procedure_handle(
+                &self,
+                file: &$crate::analyzer::ProjectFile,
+                base: &$crate::analyzer::semantic::ProcedureHandle,
+                request: &mut $crate::analyzer::semantic::SemanticRequest<'_>,
+            ) -> Result<$crate::analyzer::semantic::SemanticOutcome<$crate::analyzer::semantic::service::SelectedProcedureHandle>, $crate::analyzer::semantic::SemanticProviderError> {
+                self.inner.selected_procedure_handle(self, file, base, request)
+            }
+
+            fn selected_procedure_and_flows(
+                &self,
+                file: &$crate::analyzer::ProjectFile,
+                base: &$crate::analyzer::semantic::ProcedureHandle,
+                request: &mut $crate::analyzer::semantic::SemanticRequest<'_>,
+            ) -> Result<$crate::analyzer::semantic::service::CandidateProcedureOutcome<()>, $crate::analyzer::semantic::SemanticProviderError> {
+                self.inner.selected_procedure_and_flows(self, file, base, request)
+            }
+
+            fn stored_candidate_macro_artifact(
+                &self,
+                file: &$crate::analyzer::ProjectFile,
+                key: &$crate::analyzer::semantic::SemanticArtifactKey,
+                capabilities: &$crate::analyzer::semantic::SemanticCapabilities,
+                request: &mut $crate::analyzer::semantic::SemanticRequest<'_>,
+            ) -> Result<$crate::analyzer::semantic::SemanticOutcome<Option<$crate::analyzer::semantic::StoredCandidateMacroArtifact>>, $crate::analyzer::semantic::SemanticProviderError> {
+                self.inner.stored_candidate_macro_artifact(file, key, capabilities, request)
             }
 
             fn stored_semantic_ir_procedure(

@@ -143,7 +143,7 @@ const ALLOWED_DEVELOPMENT_DEPENDENCIES = new Map([
   [SEMANTIC_PACKS, new Set([GO_ANALYSIS, TOOLS, JS_TS_ANALYSIS, JVM_ANALYSIS])],
   [RQL, new Set([GO_ANALYSIS, RUBY_ANALYSIS, JS_TS_ANALYSIS, JVM_ANALYSIS])],
   [POLICY, new Set([CPP_ANALYSIS, PYTHON_ANALYSIS, JS_TS_ANALYSIS, JVM_ANALYSIS])],
-  [FACADE, new Set([CORE, CSHARP, JS_TS, JVM, JS_TS_ANALYSIS, JVM_ANALYSIS])],
+  [FACADE, new Set([CORE, CSHARP, JS_TS, JVM, RUST, JS_TS_ANALYSIS, JVM_ANALYSIS])],
 ]);
 // Optional production edges for feature-gated binaries. Only tools defines the
 // complete language table the engine links by symbol, so the release-tooling

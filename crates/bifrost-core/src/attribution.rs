@@ -507,7 +507,11 @@ mod sqlite_tests {
     }
     #[test]
     fn subscriber_drop_keeps_statement_guard() {
-        let conn = crate::cache_db::open_in_memory_store_connection().unwrap();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::cache_db::sql_profile::install(
+            &conn,
+            crate::cache_db::sql_profile::ConnectionRole::Ephemeral,
+        );
         let counter = Arc::new(Counter(AtomicUsize::new(0)));
         let observed = Arc::new(AtomicUsize::new(0));
         let _frame = enter_frame(counter.clone());

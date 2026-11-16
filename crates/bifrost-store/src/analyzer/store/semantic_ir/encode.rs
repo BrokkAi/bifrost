@@ -1,5 +1,7 @@
 //! Lowered procedures to row vectors, one vector of cells per table.
 
+use crate::analyzer::semantic::CallTargetDispatch;
+
 use rusqlite::types::Value;
 
 use super::Table;
@@ -143,6 +145,7 @@ pub(super) fn encode<'a>(
             encoder.partial_flows(
                 u32::try_from(index).expect("a procedure index fits u32"),
                 procedure_flows,
+                &parts[index].gaps,
             );
         }
     }
@@ -157,6 +160,43 @@ pub(super) fn encode<'a>(
         rows: encoder.rows,
         go_predeclared_builtins: serde_json::to_string(&builtins).expect("builtin names serialize"),
     }
+}
+
+/// Encode only candidate-bearing procedures using the shared typed codec.
+pub(super) fn encode_candidates(
+    parts: &[ProcedureSemanticsParts],
+    flows: &[crate::analyzer::semantic::partial_flow::fixpoint::CandidateMacroPartialFlows],
+    content: ContentIdentity,
+) -> (
+    EncodedRows,
+    Vec<(u32, crate::analyzer::semantic::CandidateRecord)>,
+) {
+    let mut encoder = Encoder {
+        rows: EncodedRows::default(),
+        texts: HashMap::default(),
+        declarations: HashMap::default(),
+        locators: HashMap::default(),
+        scope: parts
+            .first()
+            .map(|p| (p.locator.mount(), p.locator.path(), p.locator.language())),
+        content,
+        next_group: 0,
+    };
+    let mut candidates = Vec::new();
+    for procedure in parts {
+        if let Some((alternate, records)) = procedure.candidate_macro_alternate_parts() {
+            encoder.procedure(alternate);
+            candidates.extend(records.iter().map(|record| (alternate.id.get(), *record)));
+            if !flows.is_empty() {
+                let paired = flows
+                    .iter()
+                    .find(|flow| flow.procedure.id() == alternate.id)
+                    .expect("every alternate has paired flows");
+                encoder.partial_flows(alternate.id.get(), &paired.partial, &alternate.gaps);
+            }
+        }
+    }
+    (encoder.rows, candidates)
 }
 
 struct Encoder<'a> {
@@ -417,6 +457,7 @@ impl<'a> Encoder<'a> {
         self.control_edges(procedure);
         self.guard_facts(procedure);
         self.switch_facts(procedure);
+        self.cleanup_chains(procedure);
         self.lifecycle(procedure);
         self.pointers(procedure);
         self.receiver_type_facts(procedure);
@@ -1013,13 +1054,21 @@ impl<'a> Encoder<'a> {
         for (index, gap) in procedure.gaps.iter().enumerate() {
             assert_eq!(gap.id.index(), index, "procedure {id} gap {index}");
             let (subject_a, subject_b) = match gap.subject {
-                SemanticGapSubject::Procedure | SemanticGapSubject::Point => {
-                    (Value::Null, Value::Null)
-                }
+                SemanticGapSubject::FutureConstruction
+                | SemanticGapSubject::FutureActivation
+                | SemanticGapSubject::Procedure
+                | SemanticGapSubject::Point
+                | SemanticGapSubject::CleanupOwners(_) => (Value::Null, Value::Null),
                 SemanticGapSubject::Value(value) => (integer(value), Value::Null),
                 SemanticGapSubject::MemoryLocation(location) => (integer(location), Value::Null),
                 SemanticGapSubject::Capture(capture) => (integer(capture), Value::Null),
-                SemanticGapSubject::CallSite(call) => (integer(call), Value::Null),
+                SemanticGapSubject::CallSite(call) => (
+                    integer(call),
+                    match gap.dispatch {
+                        CallTargetDispatch::Unspecified => Value::Null,
+                        dispatch => code(dispatch),
+                    },
+                ),
                 SemanticGapSubject::CallContinuation { call_site, kind } => {
                     (integer(call_site), code(kind))
                 }
@@ -1056,6 +1105,22 @@ impl<'a> Encoder<'a> {
                     some(detail),
                     integer(gap.source),
                     integer(gap.evidence),
+                    match gap.subject {
+                        SemanticGapSubject::CleanupOwners(segment) => {
+                            segment.head.map_or(Value::Null, |node| {
+                                some(i64::try_from(node.index()).expect("arena index fits i64"))
+                            })
+                        }
+                        _ => Value::Null,
+                    },
+                    match gap.subject {
+                        SemanticGapSubject::CleanupOwners(segment) => {
+                            segment.stop.map_or(Value::Null, |node| {
+                                some(i64::try_from(node.index()).expect("arena index fits i64"))
+                            })
+                        }
+                        _ => Value::Null,
+                    },
                 ],
             );
         }
@@ -1136,7 +1201,8 @@ impl<'a> Encoder<'a> {
         match effect {
             SemanticEffect::Entry
             | SemanticEffect::NormalExit
-            | SemanticEffect::ExceptionalExit => EventCells::default(),
+            | SemanticEffect::ExceptionalExit
+            | SemanticEffect::MemoryInterference => EventCells::default(),
             SemanticEffect::Assignment { target, value } => EventCells {
                 value_a: Some(target.get()),
                 value_b: Some(value.get()),
@@ -1242,7 +1308,9 @@ impl<'a> Encoder<'a> {
                             ]),
                         );
                     }
-                    ValueFlowKind::Local
+                    ValueFlowKind::MemoryLoad { .. }
+                    | ValueFlowKind::Local
+                    | ValueFlowKind::AddressOf
                     | ValueFlowKind::OwnershipUnknown
                     | ValueFlowKind::Parameter
                     | ValueFlowKind::Receiver
@@ -1254,6 +1322,11 @@ impl<'a> Encoder<'a> {
                 }
                 EventCells {
                     sub_kind: Some(ValueFlowKindTag::of(kind).code()),
+                    location: if let ValueFlowKind::MemoryLoad { location } = kind {
+                        Some(location.get())
+                    } else {
+                        None
+                    },
                     value_a: Some(source.get()),
                     value_b: Some(target.get()),
                     ..EventCells::default()
@@ -1836,6 +1909,7 @@ impl<'a> Encoder<'a> {
                     some(match candidate.status {
                         PatternProjectionStatus::Unevaluated => 0_i64,
                     }),
+                    candidate.gap.map_or(Value::Null, integer),
                 ],
             );
             for (step_index, step) in candidate.path.iter().enumerate() {
@@ -1845,6 +1919,11 @@ impl<'a> Encoder<'a> {
                     }
                     PatternProjectionStep::Named(name) => {
                         (1_i64, Value::Null, some(self.text(name)))
+                    }
+                    PatternProjectionStep::Variant { .. } | PatternProjectionStep::Element => {
+                        unreachable!(
+                            "validated guarded-pattern IR cannot contain endpoint-only variant or element projections"
+                        )
                     }
                 };
                 self.rows.push(
@@ -1866,7 +1945,12 @@ impl<'a> Encoder<'a> {
 impl<'a> Encoder<'a> {
     /// One procedure's ports, flows and head. Ports come first in id order,
     /// so a heap port's root is always a row already written.
-    fn partial_flows(&mut self, procedure: u32, flows: &'a ProcedurePartialFlows) {
+    fn partial_flows(
+        &mut self,
+        procedure: u32,
+        flows: &'a ProcedurePartialFlows,
+        rows: &[crate::analyzer::semantic::SemanticGap],
+    ) {
         let port_ids = flows
             .ports
             .iter()
@@ -1892,7 +1976,21 @@ impl<'a> Encoder<'a> {
         let gaps = flows
             .discharged_gaps
             .iter()
-            .map(|gap| i64::from(gap.get()))
+            .map(|key| {
+                // Owner-independent abort verdicts retain ordinary stored IDs.
+                // Per-owner proof keys are query-time only, never persisted.
+                let crate::analyzer::semantic::GapKey::Gap(gap) = key else {
+                    panic!("member discharge cannot be persisted before #10879");
+                };
+                assert!(
+                    rows.get(gap.get() as usize)
+                        .is_some_and(|row| row.id == *gap
+                            && (!matches!(row.subject, SemanticGapSubject::CleanupOwners(_))
+                                || crate::analyzer::semantic::workspace_oracle::implicit_abort_gap_is_discharged(row, false))),
+                    "persisted discharge must name an ordinary gap or uniform abort verdict"
+                );
+                i64::from(gap.get())
+            })
             .collect::<Vec<_>>();
         let detail = self.optional_text(flows.detail.as_deref());
         self.rows.push(
@@ -2042,5 +2140,164 @@ fn backing_store_offset(offset: BackingStoreOffset) -> [Value; 3] {
         BackingStoreOffset::Zero => [tag, Value::Null, Value::Null],
         BackingStoreOffset::Constant(magnitude) => [tag, decimal(magnitude), Value::Null],
         BackingStoreOffset::Value(value) => [tag, Value::Null, integer(value)],
+    }
+}
+
+impl<'a> Encoder<'a> {
+    fn cleanup_chains(&mut self, procedure: &'a ProcedureSemanticsParts) {
+        use crate::analyzer::semantic::cfg::ScopeCleanupAction;
+        let id = procedure.id.get();
+        let index = |i: usize| some(i64::try_from(i).expect("arena index fits i64"));
+        let node_id = |id: Option<crate::analyzer::semantic::CleanupChainNodeId>| {
+            id.map_or(Value::Null, |id| index(id.index()))
+        };
+        let chains = &procedure.cleanup_chains;
+        for (n, node) in chains.nodes().iter().enumerate() {
+            self.rows.push(
+                Table::CleanupNodes,
+                vec![
+                    integer(id),
+                    index(n),
+                    node_id(node.parent),
+                    node.region.map_or(Value::Null, |r| index(r.index())),
+                ],
+            );
+            for (ordinal, entry) in node.actions.iter().enumerate() {
+                let (kind, place, behavior, source, evidence) = match &entry.action {
+                    ScopeCleanupAction::Drop {
+                        place,
+                        behavior,
+                        source,
+                        evidence,
+                    } => (0, place, Some(behavior), source, evidence),
+                    ScopeCleanupAction::ScopeEnd {
+                        place,
+                        source,
+                        evidence,
+                    } => (1, place, None, source, evidence),
+                };
+                let [pk, pl, pm] = self.place(place);
+                let [resolution, targets] = match behavior {
+                    Some(DropBehavior::Destructor(resolution)) => self.resolution(id, resolution),
+                    _ => [Value::Null, Value::Null],
+                };
+                let (domain, reason, incomplete_evidence) = entry.incomplete.as_ref().map_or(
+                    (Value::Null, Value::Null, Value::Null),
+                    |incomplete| {
+                        (
+                            some(0),
+                            code(incomplete.reason),
+                            integer(incomplete.evidence),
+                        )
+                    },
+                );
+                self.rows.push(
+                    Table::CleanupActions,
+                    vec![
+                        integer(id),
+                        index(n),
+                        index(ordinal),
+                        some(kind),
+                        pk,
+                        pl,
+                        pm,
+                        behavior.map_or(Value::Null, |b| code(DropBehaviorTag::of(b))),
+                        resolution,
+                        targets,
+                        integer(*source),
+                        integer(*evidence),
+                        domain,
+                        reason,
+                        incomplete_evidence,
+                    ],
+                );
+            }
+            for (ordinal, owner) in node.owners.iter().enumerate() {
+                let [pk, pl, pm] = self.place(&owner.place);
+                let (target_kind, value, origin, cause, strength) = owner.invalidation.map_or(
+                    (
+                        Value::Null,
+                        Value::Null,
+                        Value::Null,
+                        Value::Null,
+                        Value::Null,
+                    ),
+                    |inv| {
+                        let (value, origin) = match inv.target {
+                            PointerInvalidationTarget::Pointer(value) => {
+                                (integer(value), Value::Null)
+                            }
+                            PointerInvalidationTarget::Origin(origin) => {
+                                (Value::Null, integer(origin))
+                            }
+                        };
+                        (
+                            code(PointerInvalidationTargetTag::of(&inv.target)),
+                            value,
+                            origin,
+                            code(inv.cause),
+                            code(inv.strength),
+                        )
+                    },
+                );
+                self.rows.push(
+                    Table::CleanupOwners,
+                    vec![
+                        integer(id),
+                        index(n),
+                        index(ordinal),
+                        integer(owner.value),
+                        pk,
+                        pl,
+                        pm,
+                        code(owner.lifecycle),
+                        target_kind,
+                        value,
+                        origin,
+                        cause,
+                        strength,
+                        integer(owner.source),
+                        integer(owner.evidence),
+                    ],
+                );
+            }
+        }
+        for (p, projection) in chains.projections().iter().enumerate() {
+            self.rows
+                .push(Table::CleanupProjections, vec![integer(id), index(p)]);
+            for (ordinal, cursor) in projection.iter().enumerate() {
+                self.rows.push(
+                    Table::CleanupProjectionMembers,
+                    vec![
+                        integer(id),
+                        index(p),
+                        index(ordinal),
+                        index(cursor.node().index()),
+                        index(cursor.ordinal()),
+                    ],
+                );
+            }
+        }
+        for (a, anchor) in chains.anchors().iter().enumerate() {
+            self.rows.push(
+                Table::CleanupAnchors,
+                vec![
+                    integer(id),
+                    index(a),
+                    integer(anchor.point),
+                    node_id(anchor.segment.head),
+                    node_id(anchor.segment.stop),
+                    integer(anchor.destination),
+                    code(anchor.destination_kind),
+                    code(anchor.edge_kind),
+                    integer(anchor.drop_offset),
+                    integer(anchor.scope_end_offset),
+                    integer(anchor.incomplete_offset),
+                    integer(anchor.pointer_invalidation_offset),
+                    anchor.projection.map_or(Value::Null, |p| index(p.index())),
+                    code(anchor.purpose),
+                ],
+            );
+        }
     }
 }

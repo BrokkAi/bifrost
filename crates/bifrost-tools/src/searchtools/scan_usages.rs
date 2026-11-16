@@ -586,14 +586,17 @@ impl<'a> TestFileExclusion<'a> {
     }
 
     /// Whether `file` is dropped from a non-test scan.
-    pub(crate) fn excludes(&self, file: &ProjectFile) -> bool {
+    pub(crate) fn excludes(
+        &self,
+        file: &ProjectFile,
+    ) -> Result<bool, brokk_bifrost_analysis::analyzer::QueryReadIncomplete> {
         if let Some(verdict) = self
             .verdicts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(file)
         {
-            return *verdict;
+            return Ok(*verdict);
         }
         // Classify with the lock released: `file_is_test_only` can build a
         // language's route index, and holding the memo lock across it would
@@ -604,12 +607,12 @@ impl<'a> TestFileExclusion<'a> {
             file,
             &rel_path_string(file),
             language_for_file(file),
-        );
+        )?;
         self.verdicts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(file.clone(), verdict);
-        verdict
+        Ok(verdict)
     }
 }
 
@@ -626,8 +629,12 @@ pub(crate) fn is_test_like_file(
     file: &ProjectFile,
     path: &str,
     language: Language,
-) -> bool {
-    test_paths::is_test_like_path(path, language) || analyzer.file_is_test_only(file)
+) -> Result<bool, brokk_bifrost_analysis::analyzer::QueryReadIncomplete> {
+    if test_paths::is_test_like_path(path, language) {
+        Ok(true)
+    } else {
+        analyzer.file_is_test_only(file)
+    }
 }
 
 /// Build a [`UsageFinder`] whose file filter drops the excluded test files and
@@ -653,16 +660,20 @@ pub(crate) fn scoped_usage_finder<'a>(
         let path_filter = path_filter.map(Arc::clone);
         // The candidate files reaching this filter are the only files the scan
         // will read, so this is where the test classification is paid for --
-        // per candidate, not per workspace file.
+        // per candidate, not per workspace file. The path filter runs first:
+        // a file outside the requested paths cannot contribute, so its
+        // classification, and any failure to classify it, is irrelevant.
         finder = finder.with_file_filter(move |file| {
-            !test_files.excludes(file)
-                && path_filter
-                    .as_ref()
-                    .map(|filter| filter.matches(file))
-                    .unwrap_or(true)
+            if !path_filter
+                .as_ref()
+                .is_none_or(|filter| filter.matches(file))
+            {
+                return Ok(false);
+            }
+            Ok(!test_files.excludes(file)?)
         });
     } else if let Some(path_filter) = path_filter.map(Arc::clone) {
-        finder = finder.with_file_filter(move |file| path_filter.matches(file));
+        finder = finder.with_file_filter(move |file| Ok(path_filter.matches(file)));
     }
     finder
 }
@@ -1018,14 +1029,30 @@ fn macro_lexical_usage_rows(
     context: &ScanUsagesExecutionContext,
 ) -> (Vec<UsageHitRow>, Option<ScanUsagesIncompleteReason>, bool) {
     let test_files = (!include_tests).then(|| TestFileExclusion::new(analyzer));
-    let mut files =
+    let files =
         macro_lexical::macro_lexical_candidate_files(analyzer, target_file, &context.cancellation);
-    files.retain(|file| {
-        path_filter.is_none_or(|filter| filter.matches(file))
-            && test_files
-                .as_ref()
-                .is_none_or(|tests| !tests.excludes(file))
-    });
+    let mut admitted = Vec::new();
+    for file in files {
+        if path_filter.is_some_and(|filter| !filter.matches(&file)) {
+            continue;
+        }
+        if let Some(tests) = &test_files {
+            match tests.excludes(&file) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(reason) => {
+                    analyzer.record_query_incomplete(reason);
+                    return (
+                        Vec::new(),
+                        Some(ScanUsagesIncompleteReason::SemanticAnalysis),
+                        false,
+                    );
+                }
+            }
+        }
+        admitted.push(file);
+    }
+    let mut files = admitted;
     files.sort_by_key(|file| (file != target_file, file.clone()));
     if files.len() > context.max_candidate_files {
         return (
@@ -1146,9 +1173,6 @@ fn lexical_label_usage_rows(
     if context.cancellation.is_cancelled()
         || language_for_file(target_file) != Language::Cpp
         || path_filter.is_some_and(|filter| !filter.matches(target_file))
-        || test_files
-            .as_ref()
-            .is_some_and(|tests| tests.excludes(target_file))
     {
         return (
             Vec::new(),
@@ -1158,6 +1182,20 @@ fn lexical_label_usage_rows(
                 .then(|| context.interruption_reason()),
             false,
         );
+    }
+    if let Some(tests) = &test_files {
+        match tests.excludes(target_file) {
+            Ok(true) => return (Vec::new(), None, false),
+            Ok(false) => {}
+            Err(reason) => {
+                analyzer.record_query_incomplete(reason);
+                return (
+                    Vec::new(),
+                    Some(ScanUsagesIncompleteReason::SemanticAnalysis),
+                    false,
+                );
+            }
+        }
     }
     let Some(source) = analyzer.indexed_source(target_file) else {
         return (Vec::new(), None, false);
@@ -1750,7 +1788,7 @@ pub(crate) fn resolve_scan_usages_target(
         };
     }
 
-    if let Some(overlay) = analyzer.semantic_model_overlay() {
+    if let Some(overlay) = analyzer.semantic_model_overlay_read().published() {
         let path = rel_path_string(&file);
         let authored = overlay.symbols_at_authored_path(&path);
         // A possible record of an open lookup is a candidate, never the target.
@@ -3154,7 +3192,7 @@ fn collect_scan_usages_reference_sites(
     // Models can contribute authored reference sites (for example generated
     // accessors). Keep that evidence without fitting it to an interactive reply.
     if !context.cancellation.is_cancelled()
-        && let Some(overlay) = analyzer.semantic_model_overlay()
+        && let Some(overlay) = analyzer.semantic_model_overlay_read().published()
     {
         attach_model_relations_to_entries(analyzer, &overlay, &scope, &mut classified);
     }
@@ -4001,6 +4039,7 @@ pub(crate) fn usage_graph_at_lines(
         .map(|file| (rel_path_string(&file), file))
         .collect::<HashMap<_, _>>();
     let mut incomplete = BTreeSet::new();
+    let mut classification_failures = Vec::new();
     let mut rows = Vec::new();
     let mut selected_references = 0usize;
     for (path, lines) in demanded {
@@ -4014,11 +4053,16 @@ pub(crate) fn usage_graph_at_lines(
             ));
             continue;
         };
-        if excluded
-            .as_ref()
-            .is_some_and(|filter| filter.excludes(file))
-        {
-            continue;
+        if let Some(filter) = excluded.as_ref() {
+            match filter.excludes(file) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(reason) => {
+                    analyzer.record_query_incomplete(reason.clone());
+                    classification_failures.push((path.clone(), reason));
+                    continue;
+                }
+            }
         }
         if let Some(unsupported) = forward_axis_gate(analyzer, file, generation) {
             incomplete.insert((
@@ -4032,7 +4076,7 @@ pub(crate) fn usage_graph_at_lines(
             Err(_) => {
                 return unavailable_usage_graph_result(
                     analyzer,
-                    &[],
+                    &UsageGraphPathDiagnostics::default(),
                     "cancelled",
                     "selected-line reference resolution was cancelled".into(),
                 );
@@ -4080,7 +4124,7 @@ pub(crate) fn usage_graph_at_lines(
     if cancellation.is_cancelled() {
         return unavailable_usage_graph_result(
             analyzer,
-            &[],
+            &UsageGraphPathDiagnostics::default(),
             "cancelled",
             "selected-line graph was cancelled".into(),
         );
@@ -4101,14 +4145,22 @@ pub(crate) fn usage_graph_at_lines(
             is_graph_declaration(unit)
                 && excluded
                     .as_ref()
-                    .is_none_or(|filter| !filter.excludes(unit.source()))
+                    .is_none_or(|filter| match filter.excludes(unit.source()) {
+                        Ok(true) => false,
+                        Ok(false) => true,
+                        Err(reason) => {
+                            analyzer.record_query_incomplete(reason.clone());
+                            classification_failures.push((rel_path_string(unit.source()), reason));
+                            false
+                        }
+                    })
         })
         .map(|unit| (unit.clone(), primary_range(analyzer, unit)))
         .collect();
     let Some(catalog) = WorkspaceUsageCatalog::from_declarations(declarations, cancellation) else {
         return unavailable_usage_graph_result(
             analyzer,
-            &[],
+            &UsageGraphPathDiagnostics::default(),
             "cancelled",
             "selected-line catalog was cancelled".into(),
         );
@@ -4178,7 +4230,7 @@ pub(crate) fn usage_graph_at_lines(
     if generation != analyzer.project().analysis_generation() {
         return unavailable_usage_graph_result(
             analyzer,
-            &[],
+            &UsageGraphPathDiagnostics::default(),
             "stale_generation",
             "workspace changed during selected-line graph resolution".into(),
         );
@@ -4186,29 +4238,42 @@ pub(crate) fn usage_graph_at_lines(
     if cancellation.is_cancelled() {
         return unavailable_usage_graph_result(
             analyzer,
-            &[],
+            &UsageGraphPathDiagnostics::default(),
             "cancelled",
             "selected-line graph was cancelled".into(),
         );
     }
     if let Some(error) = _query.store_error() {
-        return unavailable_usage_graph_result(analyzer, &[], "query_failed", error.to_string());
+        return unavailable_usage_graph_result(
+            analyzer,
+            &UsageGraphPathDiagnostics::default(),
+            "query_failed",
+            error.to_string(),
+        );
+    }
+    for (path, reason) in classification_failures {
+        incomplete.insert((reason.label().to_string(), format!("{path}: {reason:?}")));
     }
     let result = finalize_usage_graph_result(
         analyzer,
-        &[],
+        &UsageGraphPathDiagnostics::default(),
         catalog,
         edge_sites,
         BTreeMap::new(),
         incomplete,
     );
     if let Some(error) = _query.store_error() {
-        return unavailable_usage_graph_result(analyzer, &[], "query_failed", error.to_string());
+        return unavailable_usage_graph_result(
+            analyzer,
+            &UsageGraphPathDiagnostics::default(),
+            "query_failed",
+            error.to_string(),
+        );
     }
     if cancellation.is_cancelled() {
         return unavailable_usage_graph_result(
             analyzer,
-            &[],
+            &UsageGraphPathDiagnostics::default(),
             "cancelled",
             "selected-line graph was cancelled during finalization".into(),
         );
@@ -4216,11 +4281,12 @@ pub(crate) fn usage_graph_at_lines(
     if generation != analyzer.project().analysis_generation() {
         return unavailable_usage_graph_result(
             analyzer,
-            &[],
+            &UsageGraphPathDiagnostics::default(),
             "stale_generation",
             "workspace changed during selected-line graph finalization".into(),
         );
     }
+
     result
 }
 
@@ -4274,7 +4340,7 @@ fn usage_graph_with_passes(
     if cancellation.is_cancelled() {
         return unavailable_usage_graph_result(
             analyzer,
-            &[],
+            &UsageGraphPathDiagnostics::default(),
             "cancelled",
             "usage graph was cancelled".into(),
         );
@@ -4293,11 +4359,14 @@ fn usage_graph_with_passes(
 
     let rooted = params.paths.is_some();
     let built_path_filter = build_scan_usages_path_filter(analyzer, params.paths.as_deref());
-    let unmatched_paths = built_path_filter.unmatched_paths;
+    let path_diagnostics = UsageGraphPathDiagnostics {
+        unmatched_paths: built_path_filter.unmatched_paths,
+        invalid_paths: built_path_filter.invalid_paths,
+    };
     let cancelled = || {
         unavailable_usage_graph_result(
             analyzer,
-            &unmatched_paths,
+            &path_diagnostics,
             "cancelled",
             "usage graph was cancelled".into(),
         )
@@ -4305,28 +4374,37 @@ fn usage_graph_with_passes(
     let path_filter = built_path_filter.filter;
     let test_files = test_file_exclusion(analyzer, params.include_tests);
 
-    let eligible_files: Vec<ProjectFile> = analyzer
+    let classification_failures = std::sync::Mutex::new(Vec::new());
+    // Roots are the named files of a rooted request, or every analyzed file.
+    // Only roots are classified here: a file outside the roots is classified
+    // by `keep_file` if and when a pass scans it, so a file the request never
+    // reaches cannot make the graph incomplete.
+    let root_files: Vec<ProjectFile> = analyzer
         .analyzed_files()
         .into_iter()
         .filter(|file| {
-            test_files
-                .as_ref()
-                .is_none_or(|exclusion| !exclusion.excludes(file))
-        })
-        .collect();
-    let root_files: Vec<ProjectFile> = if rooted {
-        eligible_files
-            .iter()
-            .filter(|file| {
-                path_filter
+            !rooted
+                || path_filter
                     .as_ref()
                     .is_some_and(|filter| filter.matches(file))
-            })
-            .cloned()
-            .collect()
-    } else {
-        eligible_files.clone()
-    };
+        })
+        .filter(|file| {
+            test_files
+                .as_ref()
+                .is_none_or(|exclusion| match exclusion.excludes(file) {
+                    Ok(true) => false,
+                    Ok(false) => true,
+                    Err(reason) => {
+                        analyzer.record_query_incomplete(reason.clone());
+                        classification_failures
+                            .lock()
+                            .unwrap()
+                            .push((rel_path_string(file), reason));
+                        false
+                    }
+                })
+        })
+        .collect();
 
     // An unavailable declaration catalog may be empty. Check input authority
     // before the catalog build, without building any edge indexes.
@@ -4342,18 +4420,34 @@ fn usage_graph_with_passes(
     // keeps it -- "source files owned by this analyzer, including files whose
     // parse products are unavailable" -- and it reads the project's shared
     // file listing, not the store.
+    let source_inventory = (!rooted).then(|| {
+        brokk_bifrost_analysis::analyzer::i_analyzer::SourceInventoryPreflight::acquire(analyzer)
+    });
     let preflight_files: Vec<ProjectFile> = if rooted {
         root_files.clone()
     } else {
-        analyzer
-            .source_file_inventory()
+        source_inventory
+            .as_ref()
+            .expect("unrooted inventory acquired")
             .rows
-            .into_iter()
+            .iter()
             .filter(|file| {
                 test_files
                     .as_ref()
-                    .is_none_or(|exclusion| !exclusion.excludes(file))
+                    .is_none_or(|exclusion| match exclusion.excludes(file) {
+                        Ok(true) => false,
+                        Ok(false) => true,
+                        Err(reason) => {
+                            analyzer.record_query_incomplete(reason.clone());
+                            classification_failures
+                                .lock()
+                                .unwrap()
+                                .push((rel_path_string(file), reason));
+                            false
+                        }
+                    })
             })
+            .cloned()
             .collect()
     };
     let mut unavailable_passes = HashSet::default();
@@ -4391,7 +4485,7 @@ fn usage_graph_with_passes(
             Err(error) => {
                 return unavailable_usage_graph_result(
                     analyzer,
-                    &unmatched_paths,
+                    &path_diagnostics,
                     "query_failed",
                     error.to_string(),
                 );
@@ -4440,7 +4534,7 @@ fn usage_graph_with_passes(
                 .expect("uncancelled unavailable usage graph catalog construction");
                 return finalize_usage_graph_result(
                     analyzer,
-                    &unmatched_paths,
+                    &path_diagnostics,
                     catalog,
                     BTreeMap::new(),
                     BTreeMap::new(),
@@ -4499,6 +4593,12 @@ fn usage_graph_with_passes(
     let mut native_projections: Vec<SelectedWorkspaceUsageGraphProjection> = Vec::new();
     let mut legacy_withheld = Vec::new();
     let mut missing_relative_imports = BTreeSet::new();
+    // The causes of an incomplete source inventory an edge pass resolved over.
+    // A rooted request skips the workspace inventory preflight, so the pass that
+    // holds the inventory it resolved against is the only place to learn them.
+    let mut pass_inventory_incomplete: Option<
+        Vec<brokk_bifrost_core::analyzer::query_batch::QueryIncompleteReason>,
+    > = None;
     let mut legacy_withheld_complete = true;
     let mut native_admitted_callers = HashSet::default();
     let mut skipped_callers = std::collections::BTreeMap::new();
@@ -4576,9 +4676,20 @@ fn usage_graph_with_passes(
                             entry.languages.contains(
                                 &brokk_bifrost_core::analyzer::common::language_for_file(file),
                             ) && !native_admitted_callers.contains(*file)
-                                && test_files
-                                    .as_ref()
-                                    .is_none_or(|exclusion| !exclusion.excludes(file))
+                                && test_files.as_ref().is_none_or(|exclusion| {
+                                    match exclusion.excludes(file) {
+                                        Ok(true) => false,
+                                        Ok(false) => true,
+                                        Err(reason) => {
+                                            analyzer.record_query_incomplete(reason.clone());
+                                            classification_failures
+                                                .lock()
+                                                .unwrap()
+                                                .push((rel_path_string(file), reason));
+                                            false
+                                        }
+                                    }
+                                })
                         })
                         .cloned()
                         .collect::<Vec<_>>();
@@ -4596,7 +4707,7 @@ fn usage_graph_with_passes(
                             Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Cancelled) => {
                                 return unavailable_usage_graph_result(
                                     analyzer,
-                                    &unmatched_paths,
+                                    &path_diagnostics,
                                     "cancelled",
                                     "native graph projection was cancelled".into(),
                                 );
@@ -4604,7 +4715,7 @@ fn usage_graph_with_passes(
                             Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Stale) => {
                                 return unavailable_usage_graph_result(
                                     analyzer,
-                                    &unmatched_paths,
+                                    &path_diagnostics,
                                     "stale_generation",
                                     "native graph projection lost selected generation authority"
                                         .into(),
@@ -4615,7 +4726,7 @@ fn usage_graph_with_passes(
                             )) => {
                                 return unavailable_usage_graph_result(
                                     analyzer,
-                                    &unmatched_paths,
+                                    &path_diagnostics,
                                     "unavailable_canonical_facts",
                                     reason,
                                 );
@@ -4624,7 +4735,7 @@ fn usage_graph_with_passes(
                                 analyzer.record_query_failure(error.clone());
                                 return unavailable_usage_graph_result(
                                     analyzer,
-                                    &unmatched_paths,
+                                    &path_diagnostics,
                                     "native_graph_failed",
                                     error.to_string(),
                                 );
@@ -4638,7 +4749,7 @@ fn usage_graph_with_passes(
                     {
                         return unavailable_usage_graph_result(
                             analyzer,
-                            &unmatched_paths,
+                            &path_diagnostics,
                             "stale_generation",
                             "workspace changed during native graph projection".into(),
                         );
@@ -4751,7 +4862,18 @@ fn usage_graph_with_passes(
                 scan_files.contains(file)
                     && test_files
                         .as_ref()
-                        .is_none_or(|exclusion| !exclusion.excludes(file))
+                        .is_none_or(|exclusion| match exclusion.excludes(file) {
+                            Ok(true) => false,
+                            Ok(false) => true,
+                            Err(reason) => {
+                                analyzer.record_query_incomplete(reason.clone());
+                                classification_failures
+                                    .lock()
+                                    .unwrap()
+                                    .push((rel_path_string(file), reason));
+                                false
+                            }
+                        })
             };
             let ctx = brokk_bifrost_analysis::analyzer::languages::EdgeSiteScanCtx {
                 cancellation,
@@ -4768,6 +4890,11 @@ fn usage_graph_with_passes(
                         for target in targets {
                             missing_relative_imports.insert((path.clone(), target.clone()));
                         }
+                    }
+                    if let Some(reasons) = &result.incomplete_inventory {
+                        pass_inventory_incomplete
+                            .get_or_insert_default()
+                            .extend(reasons.iter().cloned());
                     }
                     legacy_withheld_complete &= result.unproven_sites_complete;
                     legacy_withheld.extend(legacy_usage_graph_withheld_references(
@@ -4801,6 +4928,11 @@ fn usage_graph_with_passes(
                         for target in targets {
                             missing_relative_imports.insert((path.clone(), target.clone()));
                         }
+                    }
+                    if let Some(reasons) = &result.incomplete_inventory {
+                        pass_inventory_incomplete
+                            .get_or_insert_default()
+                            .extend(reasons.iter().cloned());
                     }
                     legacy_withheld_complete &= result.unproven_sites_complete;
                     legacy_withheld.extend(legacy_usage_graph_withheld_references(
@@ -4968,8 +5100,19 @@ fn usage_graph_with_passes(
                                     })
                                     .filter(is_graph_declaration)
                                     .filter(|unit| {
-                                        test_files.as_ref().is_none_or(|exclusion| {
-                                            !exclusion.excludes(unit.source())
+                                        test_files.as_ref().is_none_or(|exclusion| match exclusion
+                                            .excludes(unit.source())
+                                        {
+                                            Ok(true) => false,
+                                            Ok(false) => true,
+                                            Err(reason) => {
+                                                analyzer.record_query_incomplete(reason.clone());
+                                                classification_failures
+                                                    .lock()
+                                                    .unwrap()
+                                                    .push((rel_path_string(unit.source()), reason));
+                                                false
+                                            }
                                         })
                                     }),
                             );
@@ -5254,7 +5397,7 @@ fn usage_graph_with_passes(
                     // the request token to interrupt reference resolution.
                     let exact = ReferenceEngine::new()
                         .with_cancellation(cancellation.clone())
-                        .with_file_filter(|file| admitted_files.contains(file))
+                        .with_file_filter(|file| Ok(admitted_files.contains(file)))
                         .references_to_edges_with_provider(
                             analyzer,
                             &endpoints,
@@ -5626,7 +5769,7 @@ fn usage_graph_with_passes(
     if analyzer.project().analysis_generation() != generation {
         return unavailable_usage_graph_result(
             analyzer,
-            &unmatched_paths,
+            &path_diagnostics,
             "stale_generation",
             "workspace changed during usage graph construction".into(),
         );
@@ -5636,9 +5779,20 @@ fn usage_graph_with_passes(
         .flat_map(|projection| {
             projection.withheld_references.iter().filter(|reference| {
                 projection.admitted_callers().contains(&reference.site.file)
-                    && test_files
-                        .as_ref()
-                        .is_none_or(|filter| !filter.excludes(&reference.site.file))
+                    && test_files.as_ref().is_none_or(|filter| {
+                        match filter.excludes(&reference.site.file) {
+                            Ok(true) => false,
+                            Ok(false) => true,
+                            Err(reason) => {
+                                analyzer.record_query_incomplete(reason.clone());
+                                classification_failures
+                                    .lock()
+                                    .unwrap()
+                                    .push((rel_path_string(&reference.site.file), reason));
+                                false
+                            }
+                        }
+                    })
             })
         })
         .chain(legacy_withheld.iter())
@@ -5683,9 +5837,12 @@ fn usage_graph_with_passes(
         return cancelled();
     };
     let public_withheld = render_usage_graph_withheld_references(&catalog, withheld);
+    for (path, reason) in classification_failures.into_inner().unwrap() {
+        incomplete.insert((reason.label().to_string(), format!("{path}: {reason:?}")));
+    }
     let mut result = finalize_usage_graph_result(
         analyzer,
-        &unmatched_paths,
+        &path_diagnostics,
         catalog,
         edge_sites,
         truncated_by_id,
@@ -5716,6 +5873,29 @@ fn usage_graph_with_passes(
                 module_path: None,
             }
         }));
+    if let Some(inventory) = &source_inventory
+        && let brokk_bifrost_analysis::analyzer::i_analyzer::SourceInventoryCompletion::Uncertain(
+            reason,
+        ) = &inventory.completion
+    {
+        result.incomplete_reasons.push(UsageGraphIncompleteReason {
+            discovery_error: None,
+            code: "source_inventory_incomplete".into(),
+            message: format!("{reason:?}"),
+            path: None,
+            module_path: None,
+        });
+    } else if let Some(mut reasons) = pass_inventory_incomplete {
+        reasons.sort();
+        reasons.dedup();
+        result.incomplete_reasons.push(UsageGraphIncompleteReason {
+            discovery_error: None,
+            code: "source_inventory_incomplete".into(),
+            message: format!("{reasons:?}"),
+            path: None,
+            module_path: None,
+        });
+    }
     result.complete = result.incomplete_reasons.is_empty();
 
     result.withheld_references = public_withheld;
@@ -5768,8 +5948,8 @@ fn usage_graph_with_passes(
     if let Some(error) = _analyzer_query.store_error() {
         return unavailable_usage_graph_result(
             analyzer,
-            &unmatched_paths,
-            "graph_input_failed",
+            &path_diagnostics,
+            "query_failed",
             error.to_string(),
         );
     }
@@ -5779,7 +5959,7 @@ fn usage_graph_with_passes(
     if analyzer.project().analysis_generation() != generation {
         return unavailable_usage_graph_result(
             analyzer,
-            &unmatched_paths,
+            &path_diagnostics,
             "stale_generation",
             "workspace changed while finalizing usage graph".into(),
         );
@@ -5901,9 +6081,36 @@ fn debug_assert_unique_usage_graph_file_notes(result: &UsageGraphResult) {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct UsageGraphPathDiagnostics {
+    unmatched_paths: Vec<String>,
+    invalid_paths: Vec<String>,
+}
+
+fn push_unmatched_paths_reason(
+    incomplete_reasons: &mut Vec<UsageGraphIncompleteReason>,
+    selectors: &[String],
+    prefix: &str,
+) {
+    if selectors.is_empty() {
+        return;
+    }
+    let (listed, omitted) = bounded_scope_paths(selectors.iter().map(String::as_str));
+    let more = omitted
+        .map(|count| format!(" (+{count} more)"))
+        .unwrap_or_default();
+    incomplete_reasons.push(UsageGraphIncompleteReason {
+        discovery_error: None,
+        path: None,
+        module_path: None,
+        code: "unmatched_paths".to_string(),
+        message: format!("{prefix}: {}{more}", listed.join(", ")),
+    });
+}
+
 fn unavailable_usage_graph_result(
     analyzer: &dyn IAnalyzer,
-    unmatched_paths: &[String],
+    path_diagnostics: &UsageGraphPathDiagnostics,
     reason_kind: &str,
     reason: String,
 ) -> UsageGraphResult {
@@ -5912,7 +6119,7 @@ fn unavailable_usage_graph_result(
             .expect("uncancelled empty graph catalog construction");
     finalize_usage_graph_result(
         analyzer,
-        unmatched_paths,
+        path_diagnostics,
         catalog,
         BTreeMap::new(),
         BTreeMap::new(),
@@ -5922,7 +6129,7 @@ fn unavailable_usage_graph_result(
 
 fn finalize_usage_graph_result(
     analyzer: &dyn IAnalyzer,
-    unmatched_paths: &[String],
+    path_diagnostics: &UsageGraphPathDiagnostics,
     catalog: WorkspaceUsageCatalog,
     edge_sites: UsageGraphEdgeSites,
     mut truncated_by_id: BTreeMap<DeclarationId, usize>,
@@ -6050,23 +6257,21 @@ fn finalize_usage_graph_result(
         });
     }
     // Roots come from `paths`, so a selector that names nothing in the
-    // workspace silently removes part of the graph the caller asked for
-    // (#3092).
-    if !unmatched_paths.is_empty() {
-        let (listed, omitted) = bounded_scope_paths(unmatched_paths.iter().map(String::as_str));
-        let more = omitted
-            .map(|count| format!(" (+{count} more)"))
-            .unwrap_or_default();
-        incomplete_reasons.push(UsageGraphIncompleteReason {
-            discovery_error: None,
-            path: None, module_path: None,
-            code: "unmatched_paths".to_string(),
-            message: format!(
-                "these `paths` selectors name no workspace file or directory, so they contributed no graph roots: {}{more}",
-                listed.join(", ")
-            ),
-        });
-    }
+    // workspace, or is blank or invalid, silently removes part or all of the
+    // graph the caller asked for (#3092, #6492). An explicit empty list names
+    // no selector at all: it asks for zero roots, and the empty graph is the
+    // exact answer, so it adds no reason. `analyze_diff` relies on this when a
+    // diff changes no files.
+    push_unmatched_paths_reason(
+        &mut incomplete_reasons,
+        &path_diagnostics.unmatched_paths,
+        "these `paths` selectors name no workspace file or directory, so they contributed no graph roots",
+    );
+    push_unmatched_paths_reason(
+        &mut incomplete_reasons,
+        &path_diagnostics.invalid_paths,
+        "these `paths` selectors are blank or invalid, so they contributed no graph roots",
+    );
     let csharp_compilations = match usage_graph_csharp_compilations(analyzer) {
         Some(configurations) => configurations,
         None => {
@@ -7499,7 +7704,7 @@ pub(crate) fn render_symbol_usages(state: &SymbolUsageRenderState) -> SymbolUsag
 }
 
 fn attach_model_relations(analyzer: &dyn IAnalyzer, result: &mut ScanUsagesResult) {
-    let Some(overlay) = analyzer.semantic_model_overlay() else {
+    let Some(overlay) = analyzer.semantic_model_overlay_read().published() else {
         return;
     };
     attach_model_relations_to_entries(analyzer, &overlay, &result.scope, &mut result.results);
@@ -8212,6 +8417,10 @@ pub(crate) struct BuiltScanUsagesPathFilter {
     /// select nothing, so an absence they "prove" is an absence over zero
     /// files (#3092).
     unmatched_paths: Vec<String>,
+    /// Selectors that were blank, whitespace-only, or syntactically invalid
+    /// (for example uncompilable globs), so they contributed no graph roots
+    /// (#6492).
+    invalid_paths: Vec<String>,
 }
 
 /// One `paths` entry: what the caller wrote, and what this workspace makes of
@@ -8289,6 +8498,16 @@ pub(crate) fn truncate_scan_usages_scope_path(path: &str) -> String {
     format!("{}…", &path[..cut])
 }
 
+fn format_invalid_path_selector(raw: &str, trimmed: &str) -> String {
+    // Quote blank or whitespace-only entries so diagnostics preserve "" vs "   "
+    // rather than collapsing to an invisible entry (#6492).
+    if trimmed.is_empty() {
+        format!("{raw:?}")
+    } else {
+        trimmed.to_string()
+    }
+}
+
 pub(crate) fn build_scan_usages_path_filter(
     analyzer: &dyn IAnalyzer,
     paths: Option<&[String]>,
@@ -8298,21 +8517,23 @@ pub(crate) fn build_scan_usages_path_filter(
             filter: None,
             ignored_paths: 0,
             unmatched_paths: Vec::new(),
+            invalid_paths: Vec::new(),
         };
     };
     let resolver = WorkspaceFileResolver::for_analyzer(analyzer);
     let mut rules = Vec::new();
     let mut ignored_paths = 0;
     let mut unmatched_paths = Vec::new();
+    let mut invalid_paths = Vec::new();
     for raw in paths {
         let selector = raw.trim().to_string();
         let matcher = resolver.classify_selector(&selector);
         match matcher {
-            // A blank entry or an uncompilable glob narrows nothing and is
-            // reported as an ignored path, exactly as before the shared
-            // classifier existed.
+            // Invalid entries do not widen scan_usages (reported via ignored_paths),
+            // and must remain visible as failed root selectors in usage_graph (#6492).
             WorkspacePathSelector::Invalid => {
                 ignored_paths += 1;
+                invalid_paths.push(format_invalid_path_selector(raw, &selector));
                 continue;
             }
             // Kept as a rule even though it selects nothing: dropping it would
@@ -8330,6 +8551,7 @@ pub(crate) fn build_scan_usages_path_filter(
         filter: (!rules.is_empty()).then(|| Arc::new(ScanUsagesPathFilter { rules })),
         ignored_paths,
         unmatched_paths,
+        invalid_paths,
     }
 }
 
@@ -8442,7 +8664,7 @@ pub struct ClassifyTestFilesResult {
 pub fn classify_test_files(
     analyzer: &dyn IAnalyzer,
     params: ClassifyTestFilesParams,
-) -> ClassifyTestFilesResult {
+) -> Result<ClassifyTestFilesResult, String> {
     let resolver = WorkspaceFileResolver::for_analyzer(analyzer);
     let mut classifications = BTreeMap::new();
     let mut unresolved = Vec::new();
@@ -8451,27 +8673,32 @@ pub fn classify_test_files(
             ResolvedFileInput::File(file) if file.exists() => {
                 classifications.insert(
                     rel_path_string(&file),
-                    classify_resolved_test_file(analyzer, &file),
+                    classify_resolved_test_file(analyzer, &file)?,
                 );
             }
             _ => unresolved.push(input.clone()),
         }
     }
-    ClassifyTestFilesResult {
+    Ok(ClassifyTestFilesResult {
         classifications,
         unresolved,
-    }
+    })
 }
 
 pub(crate) fn classify_resolved_test_file(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
-) -> TestFileClassification {
+) -> Result<TestFileClassification, String> {
     let path = rel_path_string(file);
     let language = language_for_file(file);
     let path_verdict = test_paths::path_test_verdict(&path);
     let contains_test_code = analyzer.contains_tests(file);
-    let test_like = is_test_like_file(analyzer, file, &path, language);
+    let test_like = test_paths::is_test_like_path(&path, language)
+        || analyzer.file_is_test_only(file).map_err(|reason| {
+            let message = format!("test-file classification unavailable: {reason:?}");
+            analyzer.record_query_incomplete(reason);
+            message
+        })?;
     let kind = if test_like && contains_test_code {
         TestFileKind::Test
     } else if test_like {
@@ -8481,10 +8708,10 @@ pub(crate) fn classify_resolved_test_file(
     } else {
         TestFileKind::Ambiguous
     };
-    TestFileClassification {
+    Ok(TestFileClassification {
         kind,
         contains_test_code,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -8514,6 +8741,161 @@ mod tests {
 
     use brokk_bifrost_analysis::test_support::AnalyzerFixture;
     use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#11385: search_symbols listed a Rust sibling test module as production")]
+    fn search_symbols_excludes_a_rust_sibling_test_module() {
+        use crate::inline_project::InlineTestProject;
+        use crate::searchtools::navigation::{SearchSymbolsParams, search_symbols};
+
+        // The test module's file carries no local test evidence; only the
+        // parent's `#[cfg(test)] mod tests;` makes it test-only.
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"sibling\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file(
+                "src/lib.rs",
+                "pub fn production_helper() {}\n#[cfg(test)]\nmod tests;\n",
+            )
+            .file("src/tests.rs", "pub fn sibling_helper() {}\n")
+            .build();
+        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        let names = |include_tests| {
+            search_symbols(
+                &analyzer,
+                SearchSymbolsParams {
+                    patterns: vec!["helper".to_owned()],
+                    include_tests,
+                    limit: 50,
+                },
+            )
+            .files
+            .into_iter()
+            .flat_map(|file| file.functions)
+            .map(|hit| hit.symbol)
+            .collect::<Vec<_>>()
+        };
+        let production = names(false);
+        assert!(
+            production
+                .iter()
+                .any(|name| name.ends_with("production_helper")),
+            "{production:?}"
+        );
+        assert!(
+            !production
+                .iter()
+                .any(|name| name.ends_with("sibling_helper")),
+            "{production:?}"
+        );
+        let all = names(true);
+        assert!(
+            all.iter().any(|name| name.ends_with("sibling_helper")),
+            "{all:?}"
+        );
+    }
+
+    #[test]
+    #[hardwon("#11385: unavailable test-file routes were classified as production")]
+    fn classify_test_files_rejects_unavailable_rust_routes() {
+        use crate::inline_project::InlineTestProject;
+
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"classification\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file("src/lib.rs", "mod part;\npub fn production() {}\n")
+            .file("src/part.rs", "pub fn helper() {}\n")
+            .build();
+        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        let part = fixture.file("src/part.rs");
+        let oid = analyzer
+            .live_path_snapshot()
+            .oid_for_path(&part)
+            .expect("live file identity");
+        analyzer
+            .analyzer_store()
+            .mark_parsed_blob_incomplete_for_test(&brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                oid, "rust",
+            ));
+
+        let result = classify_test_files(
+            &analyzer,
+            ClassifyTestFilesParams {
+                file_paths: vec!["src/lib.rs".to_owned()],
+            },
+        );
+        assert!(
+            result.is_err(),
+            "unavailable routes must not classify a production file: {result:?}"
+        );
+    }
+
+    #[test]
+    #[hardwon("#11507: a Cargo [[test]] target at a custom path was classified as production")]
+    fn custom_path_cargo_test_target_is_test_only() {
+        use crate::inline_project::InlineTestProject;
+
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"custom\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+                 [[test]]\nname = \"integration\"\npath = \"checks/integration.rs\"\n\n\
+                 [[bench]]\nname = \"speed\"\npath = \"perf/speed.rs\"\nharness = false\n",
+            )
+            .file("src/lib.rs", "mod shared;\npub fn production() {}\n")
+            .file("src/shared.rs", "pub fn shared() {}\n")
+            .file(
+                "checks/integration.rs",
+                "mod helper;\n#[path = \"../src/shared.rs\"]\nmod shared;\nfn main() {}\n",
+            )
+            .file("checks/helper.rs", "pub fn helper() {}\n")
+            .file("perf/speed.rs", "fn main() {}\n")
+            .build();
+        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        let test_only = |path: &str| {
+            analyzer
+                .file_is_test_only(&fixture.file(path))
+                .expect("complete routes")
+        };
+        assert!(test_only("checks/integration.rs"));
+        assert!(test_only("checks/helper.rs"));
+        assert!(!test_only("src/shared.rs"));
+        assert!(!test_only("src/lib.rs"));
+        assert!(!test_only("perf/speed.rs"));
+
+        let result = classify_test_files(
+            &analyzer,
+            ClassifyTestFilesParams {
+                file_paths: [
+                    "checks/integration.rs",
+                    "checks/helper.rs",
+                    "src/shared.rs",
+                    "perf/speed.rs",
+                ]
+                .map(str::to_owned)
+                .to_vec(),
+            },
+        )
+        .expect("classification");
+        let kinds = result
+            .classifications
+            .iter()
+            .map(|(path, classification)| (path.as_str(), classification.kind))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![
+                ("checks/helper.rs", TestFileKind::TestSupport),
+                ("checks/integration.rs", TestFileKind::TestSupport),
+                ("perf/speed.rs", TestFileKind::Ambiguous),
+                ("src/shared.rs", TestFileKind::Ambiguous),
+            ]
+        );
+    }
 
     /// A rooted `usage_graph` naming only Rust files must not make the Rust
     /// provider demand canonical Rust facts for a file the Rust adapter does
@@ -10107,5 +10489,94 @@ mod tests {
             2,
             "a cache hit after the prefetch must not issue another store round trip"
         );
+    }
+
+    #[test]
+    #[hardwon(
+        "#6492: build_scan_usages_path_filter dropped blank and invalid selectors without a trace"
+    )]
+    fn build_scan_usages_path_filter_tracks_invalid_unmatched_and_empty_selectors() {
+        let (_temp, workspace) =
+            brokk_bifrost_analysis::test_support::mixed_language_rust_workspace();
+        let analyzer = workspace.analyzer();
+
+        let omitted = build_scan_usages_path_filter(analyzer, None);
+        assert!(omitted.filter.is_none());
+        assert_eq!(omitted.ignored_paths, 0);
+        assert!(omitted.unmatched_paths.is_empty());
+        assert!(omitted.invalid_paths.is_empty());
+
+        let empty = build_scan_usages_path_filter(analyzer, Some(&[]));
+        assert!(empty.filter.is_none());
+        assert_eq!(empty.ignored_paths, 0);
+        assert!(empty.unmatched_paths.is_empty());
+        assert!(empty.invalid_paths.is_empty());
+
+        let invalid_input = vec!["".to_string(), "   ".to_string(), "[".to_string()];
+        let invalid_only = build_scan_usages_path_filter(analyzer, Some(&invalid_input));
+        assert!(invalid_only.filter.is_none());
+        assert_eq!(invalid_only.ignored_paths, 3);
+        assert!(invalid_only.unmatched_paths.is_empty());
+        assert_eq!(
+            invalid_only.invalid_paths,
+            vec!["\"\"".to_string(), "\"   \"".to_string(), "[".to_string()]
+        );
+
+        let mixed_input = vec![
+            "src/lib.rs".to_string(),
+            "".to_string(),
+            "[".to_string(),
+            "missing.rs".to_string(),
+        ];
+        let mixed = build_scan_usages_path_filter(analyzer, Some(&mixed_input));
+        let filter = mixed
+            .filter
+            .as_ref()
+            .expect("valid selector should remain active in mixed filter");
+        assert!(filter.matches(&ProjectFile::new(analyzer.project().root(), "src/lib.rs")));
+        assert!(!filter.matches(&ProjectFile::new(
+            analyzer.project().root(),
+            "scripts/build.py"
+        )));
+        assert_eq!(mixed.ignored_paths, 2);
+        assert_eq!(mixed.unmatched_paths, vec!["missing.rs".to_string()]);
+        assert_eq!(
+            mixed.invalid_paths,
+            vec!["\"\"".to_string(), "[".to_string()]
+        );
+    }
+
+    #[test]
+    #[hardwon("#6492: unavailable_usage_graph_result must keep blank and invalid path diagnostics")]
+    fn unavailable_usage_graph_result_preserves_path_diagnostics() {
+        let (_temp, workspace) =
+            brokk_bifrost_analysis::test_support::mixed_language_rust_workspace();
+        let analyzer = workspace.analyzer();
+
+        let mixed = unavailable_usage_graph_result(
+            analyzer,
+            &UsageGraphPathDiagnostics {
+                unmatched_paths: vec!["missing.rs".to_string()],
+                invalid_paths: vec!["\"\"".to_string(), "[".to_string()],
+            },
+            "cancelled",
+            "usage graph was cancelled".to_string(),
+        );
+        assert!(!mixed.complete);
+        assert!(
+            mixed
+                .incomplete_reasons
+                .iter()
+                .any(|reason| reason.code == "cancelled")
+        );
+        let unmatched_messages: Vec<&str> = mixed
+            .incomplete_reasons
+            .iter()
+            .filter(|reason| reason.code == "unmatched_paths")
+            .map(|reason| reason.message.as_str())
+            .collect();
+        assert_eq!(unmatched_messages.len(), 2, "{unmatched_messages:?}");
+        assert!(unmatched_messages[0].contains("missing.rs"));
+        assert!(unmatched_messages[1].contains("\"\", ["));
     }
 }

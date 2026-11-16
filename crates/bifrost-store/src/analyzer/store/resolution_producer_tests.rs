@@ -508,6 +508,9 @@ fn typed_relation_answers(
         TypedFactRelation::TypeTransferTargetSlot => {
             answered!(visit_type_transfer_pages_to_targets, semantic)
         }
+        TypedFactRelation::BinaryOperationOutput => {
+            answered!(visit_binary_operation_pages_for_outputs, semantic)
+        }
         TypedFactRelation::TypeProductionOutput => {
             answered!(visit_type_production_pages_for_outputs, semantic)
         }

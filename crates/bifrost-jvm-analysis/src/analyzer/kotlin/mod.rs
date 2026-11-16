@@ -449,6 +449,10 @@ impl KotlinAnalyzer {
     /// reports every gap it carries. The index cell is filled by whichever
     /// language reads first and holds no gaps itself, so this does not depend
     /// on which builder ran (#10470).
+    pub(crate) fn jvm_selection_config(&self) -> &JvmAnalyzerConfig {
+        &self.jvm_config
+    }
+
     pub(crate) fn external_declaration_index(&self) -> Arc<JvmExternalDeclarationIndex> {
         let index = crate::analyzer::jvm::external::get_or_build_external_declaration_index(
             self,
@@ -458,7 +462,6 @@ impl KotlinAnalyzer {
                 brokk_bifrost_analysis::analyzer::WorkspaceFactFamily::KotlinExternalDeclarations,
             ),
             &self.jvm_config,
-            self.inner.project(),
             self.inner.analyzer_store(),
         );
         crate::analyzer::jvm::external::QueryGapRecorder::new(self).all(&index);
@@ -789,6 +792,11 @@ impl CodeUnitIndex for KotlinAnalyzer {
     }
 
     delegate_inner_methods! {
+        fn owns_source_file(&self, file: &ProjectFile) -> bool;
+        fn indexed_source_files(&self) -> brokk_bifrost_analysis::analyzer::QueryBatch<ProjectFile>;
+    }
+
+    delegate_inner_methods! {
         fn indexed_blob_oid(&self, file: &ProjectFile) -> Option<brokk_bifrost_analysis::analyzer::Oid>;
     }
 
@@ -976,11 +984,8 @@ impl IAnalyzer for KotlinAnalyzer {
     }
 
     delegate_inner_methods! {
-        fn record_query_failure(&self, error: brokk_bifrost_analysis::analyzer::store::StoreError);
-    }
-
-    delegate_inner_methods! {
         fn workspace_file_index_cell(&self) -> Option<brokk_bifrost_analysis::analyzer::WorkspaceFileIndexCell>;
+        fn workspace_file_inventory_cell(&self) -> Option<brokk_bifrost_analysis::analyzer::WorkspaceFileInventoryCell>;
     }
 
     delegate_inner_methods! {
@@ -993,6 +998,13 @@ impl IAnalyzer for KotlinAnalyzer {
         fn structural_fact_providers(
         &self,
     ) -> Vec<&dyn brokk_bifrost_analysis::analyzer::structural::StructuralFactProvider>;
+    }
+
+    fn generation_membership(
+        &self,
+    ) -> &Arc<brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::GenerationWorkspaceMembership>
+    {
+        IAnalyzer::generation_membership(&self.inner)
     }
 
     fn snapshot_caches(
@@ -1176,7 +1188,10 @@ impl IAnalyzer for KotlinAnalyzer {
         brokk_bifrost_jvm::kotlin::test_detection::kotlin_changed_file_contains_tests(file, &source)
     }
 
-    fn in_test_region(&self, code_unit: &CodeUnit) -> bool {
+    fn in_test_region(
+        &self,
+        code_unit: &CodeUnit,
+    ) -> Result<bool, brokk_bifrost_analysis::analyzer::QueryReadIncomplete> {
         self.inner.in_test_region(code_unit)
     }
 
@@ -1344,6 +1359,8 @@ impl brokk_bifrost_analysis::analyzer::multi_analyzer::LanguageAnalyzer for Kotl
         Box::new(KotlinAnalyzer::update_all_with_progress(self, progress))
     }
 
+    brokk_bifrost_analysis::delegate_generation_membership_updates!(KotlinAnalyzer);
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -1417,7 +1434,7 @@ impl DeadCodeBulkProof for KotlinDeadCodeBulk {
         // A warm inbound graph bypasses resolver reads of the dependency realm
         // and selected model set. Name them before consulting its bounded cache.
         kotlin.external_index.record_read(kotlin);
-        drop(analyzer.semantic_model_overlay());
+        drop(analyzer.semantic_model_overlay_read().published());
         drop(analyzer.active_semantic_models());
         brokk_bifrost_analysis::analyzer::languages::build_fqn_dead_code_edges(
             analyzer,
@@ -1675,12 +1692,18 @@ impl LanguageSupport for KotlinSupport {
         token: QueryToken<'_>,
         file: &ProjectFile,
         name: &str,
+        _reuse: &mut brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict,
     ) -> Option<(
         brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus,
         Option<String>,
     )> {
         resolve_analyzer::<KotlinAnalyzer>(analyzer).map(|kotlin| {
-            kotlin.external_boundary_evidence(token, analyzer.semantic_model_overlay(), file, name)
+            kotlin.external_boundary_evidence(
+                token,
+                analyzer.semantic_model_overlay_read().published(),
+                file,
+                name,
+            )
         })
     }
     #[cfg(any(test, feature = "test-support"))]
@@ -1856,7 +1879,7 @@ impl LanguageSupport for KotlinSupport {
         Ok(kotlin
             .resolve_member_name_with_external(
                 scope.token(),
-                analyzer.semantic_model_overlay(),
+                analyzer.semantic_model_overlay_read().published(),
                 file,
                 callee_text,
             )

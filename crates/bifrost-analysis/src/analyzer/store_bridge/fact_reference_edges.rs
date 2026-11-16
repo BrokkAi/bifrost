@@ -943,7 +943,10 @@ impl<'analyzer> FactReferenceEdgeCatalog<'analyzer> {
             let target_domain = declaration_domain(&canonical);
             if target_domain != definition.lookup_domain {
                 return Err(StoreError::new(format!(
-                    "selected native reference-edge lookup namespace disagrees with its graph declaration domain in {file:?}: definition={definition:?}, declaration={canonical:?}, domain={target_domain:?}"
+                    "selected native reference-edge lookup namespace disagrees with its graph declaration domain in {file:?}: definition={definition:?}, declaration={}, fqn={}, path={:?}, domain={target_domain:?}",
+                    canonical.declaration_id(),
+                    canonical.fq_name(),
+                    canonical.source().rel_path(),
                 )));
             }
             self.targets_by_lookup
@@ -2572,12 +2575,18 @@ impl SelectedReferenceInverseIndexAccumulator {
                 }
                 let Some(&target_domain) = self.target_domains.get(target) else {
                     return Err(StoreError::new(format!(
-                        "selected inverse-index lookup impact names uncovered declaration {target:?}: reference={reference:?}, impact={impact:?}"
+                        "selected inverse-index lookup impact names uncovered declaration={}, fqn={}, path={:?}: reference={reference:?}, impact={impact:?}",
+                        target.declaration_id(),
+                        target.fq_name(),
+                        target.source().rel_path(),
                     )));
                 };
                 if target_domain != impact.domain {
                     return Err(StoreError::new(format!(
-                        "selected inverse-index lookup impact domain {impact:?} disagrees with declaration domain {target_domain:?}: reference={reference:?}, target={target:?}"
+                        "selected inverse-index lookup impact domain {impact:?} disagrees with declaration domain {target_domain:?}: reference={reference:?}, target={}, fqn={}, path={:?}",
+                        target.declaration_id(),
+                        target.fq_name(),
+                        target.source().rel_path(),
                     )));
                 }
                 self.push_target_reason(
@@ -2602,12 +2611,18 @@ impl SelectedReferenceInverseIndexAccumulator {
         })?;
         let Some(&target_domain) = self.target_domains.get(&target) else {
             return Err(StoreError::new(format!(
-                "selected inverse-index target-local gap names uncovered declaration {target:?}"
+                "selected inverse-index target-local gap names uncovered declaration={}, fqn={}, path={:?}",
+                target.declaration_id(),
+                target.fq_name(),
+                target.source().rel_path(),
             )));
         };
         if !gap_domain.affects(target_domain) {
             return Err(StoreError::new(format!(
-                "selected inverse-index target-local gap domain {gap_domain:?} does not cover declaration domain {target_domain:?}: target={target:?}"
+                "selected inverse-index target-local gap domain {gap_domain:?} does not cover declaration domain {target_domain:?}: target={}, fqn={}, path={:?}",
+                target.declaration_id(),
+                target.fq_name(),
+                target.source().rel_path(),
             )));
         }
         Ok(target)
@@ -3463,7 +3478,10 @@ fn graph_target(
     let target_language = target.source().declaration_language();
     if !selected_edge_languages_can_reach(source_language, target_language) {
         return Err(StoreError::new(format!(
-            "selected native reference edge crosses unsupported languages: source={source_language:?}, target={target_language:?}, target={target:?}"
+            "selected native reference edge crosses unsupported languages: source={source_language:?}, target={target_language:?}, declaration={}, fqn={}, path={:?}",
+            target.declaration_id(),
+            target.fq_name(),
+            target.source().rel_path(),
         )));
     }
     Ok(Some(target))

@@ -38,6 +38,7 @@ impl From<&str> for MarkerIncomplete {
     fn from(message: &str) -> Self {
         Self {
             message: message.to_owned(),
+
             incompleteness: Incompleteness::Operational(DerivationExecutionCause::Provider),
         }
     }
@@ -154,17 +155,20 @@ impl Context<'_> {
         if self.cancellation.is_cancelled() {
             return Err(MarkerIncomplete {
                 message: "Rust marker impl query cancelled".into(),
+
                 incompleteness: Incompleteness::Operational(DerivationExecutionCause::Cancelled),
             });
         }
-        if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+        if brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
             self.budget.fact_nodes,
             self.limits.max_fact_nodes,
         )
-        .allows(1)
+        .try_allow(1)
+        .is_err()
         {
             return Err(MarkerIncomplete {
                 message: "Rust marker impl syntax work budget exceeded".into(),
+
                 incompleteness: Incompleteness::Operational(DerivationExecutionCause::Budget),
             });
         }
@@ -190,14 +194,16 @@ impl Context<'_> {
         file: &ProjectFile,
     ) -> Result<Option<StructuralPreparedSyntax>, MarkerIncomplete> {
         self.charge()?;
-        if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+        if brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
             self.budget.scanned_files,
             self.limits.max_scanned_files,
         )
-        .allows(1)
+        .try_allow(1)
+        .is_err()
         {
             return Err(MarkerIncomplete {
                 message: "Rust marker impl file budget exceeded".into(),
+
                 incompleteness: Incompleteness::Operational(DerivationExecutionCause::Budget),
             });
         }
@@ -230,6 +236,7 @@ impl Context<'_> {
                             "Rust marker impl syntax unavailable for {}: {outcome:?}",
                             file.rel_path().display()
                         ),
+
                         incompleteness: Incompleteness::Operational(cause),
                     });
                 }
@@ -267,6 +274,7 @@ impl Context<'_> {
         if self.cancellation.is_cancelled() {
             return Err(MarkerIncomplete {
                 message: "Rust marker definition lookup cancelled".into(),
+
                 incompleteness: Incompleteness::Operational(DerivationExecutionCause::Cancelled),
             });
         }
@@ -607,11 +615,12 @@ fn marker_bounds(
             if !visited.insert(unit.clone()) {
                 continue;
             }
-            if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+            if brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
                 visited.len(),
                 16,
             )
-            .allows(1)
+            .try_allow(1)
+            .is_err()
             {
                 incompleteness = incompleteness.combine(Incompleteness::Operational(
                     DerivationExecutionCause::Budget,
@@ -1054,6 +1063,7 @@ fn method_inventory(ctx: &mut Context<'_>, declaration: &CodeUnit) -> MethodInve
         if let Err(reason) = outcome {
             inventory.reasons.push(MarkerIncomplete {
                 message: format!("{}: {}", method.fq_name_str(), reason.message),
+
                 incompleteness: reason.incompleteness,
             });
         }
@@ -1424,11 +1434,19 @@ pub(super) fn expansions(
     };
     if !reasons.is_empty() {
         diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            has_non_utf8_refusal: false,
+            refusal_sites: Default::default(),
+            call_relation_facts: None,
+            uses_omissions: Vec::new(),
             incompleteness,
             related: Vec::new(),
             code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
             impact: CodeQueryDiagnosticImpact::Incomplete,
-            message: format!("Rust marker impl analysis incomplete: {reasons:?}"),
+            message: brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+                format_args!("Rust marker impl analysis incomplete: {reasons:?}"),
+                format_args!("Rust marker impl analysis incomplete"),
+                reasons.iter(),
+            ),
             branch: Vec::new(),
             language: "rust",
             source: None,

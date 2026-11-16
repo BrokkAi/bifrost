@@ -32,11 +32,13 @@ pub const fn procedure_relays_receiver_capture(kind: ProcedureKind) -> bool {
     matches!(kind, ProcedureKind::Lambda)
 }
 
+pub mod binding_initialization;
 pub mod binding_origins;
 pub mod capabilities;
 #[doc(hidden)]
 pub mod cfg;
 pub mod cfg_algorithms;
+pub mod derivation_cause;
 pub mod icfg;
 pub mod ids;
 #[doc(hidden)]

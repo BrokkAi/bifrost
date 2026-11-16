@@ -3,14 +3,17 @@
 //! This producer is separate from artifact-backed pack production. Its rows
 //! have no artifacts or selected target/configuration; only exact crates.io
 //! lock associations become package activation evidence
-//! ([`cargo_lock_activation_rows`]). Consumers must
+//! (the lock activation projection). Consumers must
 //! preserve `evidence.kind` and association uncertainty when projecting them into
 //! the shared durable dependency/query contract. Nothing is retained on an
 //! analyzer, and queries must consume persisted rows rather than call acquisition.
 
 use std::path::{Path, PathBuf};
 
-use brokk_bifrost_rust::cargo_config::RustCargoConfiguration;
+use brokk_bifrost_rust::cargo_config::{
+    RustCargoConfigDocument, RustCargoConfigSourceEffect, RustCargoConfiguration,
+    is_cargo_configuration_path,
+};
 use brokk_bifrost_rust::cargo_manifest::RustCargoManifestDocument;
 use brokk_bifrost_rust::cargo_routes::{
     RustCargoDependencyKind, cargo_dependency_directory_with, cargo_dependency_tables_with_kind,
@@ -84,6 +87,21 @@ fn acquire_cargo_discovery_rows(
     DependencyDiscoveryOutcome,
     usize,
     Vec<(ProjectFile, ProjectSourceSnapshot)>,
+    RustCargoConfiguration,
+) {
+    acquire_cargo_discovery_rows_with_configuration(project, limits, cancellation, None)
+}
+
+pub(super) fn acquire_cargo_discovery_rows_with_configuration(
+    project: &dyn Project,
+    limits: &DependencyPackLimits,
+    cancellation: Option<&CancellationToken>,
+    recorded: Option<&RustCargoConfiguration>,
+) -> (
+    DependencyDiscoveryOutcome,
+    usize,
+    Vec<(ProjectFile, ProjectSourceSnapshot)>,
+    RustCargoConfiguration,
 ) {
     let mut diagnostics = BoundedDependencyDiagnostics::new(limits);
     let (selected, bytes, cancelled) = select_dependency_input_snapshots(
@@ -100,19 +118,43 @@ fn acquire_cargo_discovery_rows(
         cancellation,
         &mut diagnostics,
     );
-    let mut outcome = cargo_file_discovery_rows(project.root(), &selected, limits, cancellation);
+    let (selection_diagnostics, selection_suppressed) = diagnostics.finish();
+    let incomplete_selection = cancelled
+        || !selection_diagnostics.is_empty()
+        || selection_suppressed.errors > 0
+        || selection_suppressed.warnings > 0;
+    let mut diagnostics = BoundedDependencyDiagnostics::new(limits);
+    for diagnostic in selection_diagnostics {
+        diagnostics.push(diagnostic);
+    }
+    let mut configuration = recorded.cloned().unwrap_or_else(|| {
+        super::cargo_configuration_acquisition::acquire(project, &selected, limits).configuration
+    });
+    if recorded.is_none() && incomplete_selection {
+        // Bounded project selection may have omitted another Cargo owner's
+        // context. Only a separately recorded complete view can close it.
+        configuration = configuration.with_acquisition_complete(false);
+    }
+    let mut outcome = cargo_file_discovery_rows_with_configuration(
+        project.root(),
+        &selected,
+        &configuration,
+        limits,
+        cancellation,
+    );
     for entry in outcome.diagnostics.drain(..) {
         diagnostics.push(entry);
     }
     let (entries, suppressed) = diagnostics.finish();
     // Preserve both independently bounded diagnostic sets' omission counts.
     outcome.suppressed_diagnostics += suppressed;
+    outcome.suppressed_diagnostics += selection_suppressed;
     outcome.diagnostics = entries;
     outcome.cancelled |= cancelled;
     outcome.complete &= outcome.diagnostics.is_empty()
         && outcome.suppressed_diagnostics.errors == 0
         && !outcome.cancelled;
-    (outcome, bytes as usize, selected)
+    (outcome, bytes as usize, selected, configuration)
 }
 pub(super) fn cargo_input(path: &Path) -> bool {
     matches!(
@@ -130,9 +172,75 @@ pub(super) fn cargo_input(path: &Path) -> bool {
 /// Project a bounded set of immutable Cargo snapshots. The caller selects the
 /// input files; this function never reads disk, environment, or build artifacts.
 /// Duplicate paths and lossy-decoded snapshots are rejected explicitly.
+fn ignored_legacy_config(path: &Path, selected: &[(ProjectFile, ProjectSourceSnapshot)]) -> bool {
+    path.file_name().is_some_and(|name| name == "config.toml")
+        && selected.iter().any(|(file, _)| {
+            file.rel_path().parent() == path.parent()
+                && file
+                    .rel_path()
+                    .file_name()
+                    .is_some_and(|name| name == "config")
+        })
+}
+
+/// A snapshot-only view is incomplete until acquisition establishes all layers.
+fn selected_cargo_configuration(
+    selected: &[(ProjectFile, ProjectSourceSnapshot)],
+) -> RustCargoConfiguration {
+    let mut unclassified = false;
+    let mut seen = std::collections::BTreeSet::new();
+    let documents = selected
+        .iter()
+        .filter_map(|(file, snapshot)| {
+            if !is_cargo_configuration_path(file.rel_path())
+                || ignored_legacy_config(file.rel_path(), selected)
+            {
+                return None;
+            }
+            if !seen.insert(file.rel_path()) {
+                unclassified = true;
+                return None;
+            }
+            let actual =
+                git2::Oid::hash_object(git2::ObjectType::Blob, snapshot.source().as_bytes()).ok();
+            let parsed = RustCargoConfigDocument::from_source_bytes(snapshot.source().as_bytes());
+            if actual != Some(snapshot.oid()) || parsed.is_err() {
+                unclassified = true;
+                return None;
+            }
+            Some((file.rel_path().to_path_buf(), parsed.unwrap()))
+        })
+        .collect::<Vec<_>>();
+    let configuration = RustCargoConfiguration::from_files(documents);
+    if unclassified {
+        configuration.with_unclassified_inputs()
+    } else {
+        configuration
+    }
+}
+
+#[cfg(test)]
 fn cargo_file_discovery_rows(
     root: &Path,
     selected: &[(ProjectFile, ProjectSourceSnapshot)],
+    limits: &DependencyPackLimits,
+    cancellation: Option<&CancellationToken>,
+) -> DependencyDiscoveryOutcome {
+    // Closed unit fixtures explicitly supply their entire modeled config view.
+    let configuration = selected_cargo_configuration(selected).with_acquisition_complete(true);
+    cargo_file_discovery_rows_with_configuration(
+        root,
+        selected,
+        &configuration,
+        limits,
+        cancellation,
+    )
+}
+
+fn cargo_file_discovery_rows_with_configuration(
+    root: &Path,
+    selected: &[(ProjectFile, ProjectSourceSnapshot)],
+    configuration: &RustCargoConfiguration,
     limits: &DependencyPackLimits,
     cancellation: Option<&CancellationToken>,
 ) -> DependencyDiscoveryOutcome {
@@ -153,16 +261,14 @@ fn cargo_file_discovery_rows(
     let mut sources = HashMap::default();
     let mut documents = HashMap::default();
     let mut locks = HashMap::default();
-    let mut configs = Vec::new();
     let mut rows = Vec::new();
     let mut retained_bytes = 0_u64;
     let mut total_bytes = 0_u64;
     let mut cancelled = false;
     let mut inputs = 0;
-    for (file, snapshot) in selected
-        .iter()
-        .filter(|(file, _)| cargo_input(file.rel_path()))
-    {
+    for (file, snapshot) in selected.iter().filter(|(file, _)| {
+        cargo_input(file.rel_path()) && !ignored_legacy_config(file.rel_path(), selected)
+    }) {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             cancelled = true;
             break;
@@ -230,7 +336,11 @@ fn cargo_file_discovery_rows(
                 diagnostics.push(diagnostic(
                     "rust.files.invalid_toml",
                     Some(file.rel_path()),
-                    error.to_string(),
+                    if is_cargo_configuration_path(file.rel_path()) {
+                        "invalid Cargo configuration".to_owned()
+                    } else {
+                        error.to_string()
+                    },
                 ));
                 continue;
             }
@@ -264,7 +374,7 @@ fn cargo_file_discovery_rows(
                 }
                 Err(entry) => diagnostics.push(entry),
             },
-            _ => configs.push(file.rel_path().to_path_buf()),
+            _ => {}
         }
     }
     if manifests.is_empty() {
@@ -528,7 +638,7 @@ fn cargo_file_discovery_rows(
                     workspace.as_deref().filter(|_| membership),
                     &manifests,
                     &locks,
-                    &configs,
+                    configuration,
                     &mut row.provenance,
                 );
                 if association != "exact" {
@@ -648,8 +758,12 @@ fn cargo_file_discovery_rows(
             }
         }
     }
-    for path in configs {
-        diagnostics.push(diagnostic("rust.configuration.unresolved", Some(&path), "Cargo configuration overrides are owned by #3768; dependency rows apply no rustflags or patch selection (build targets are rust-toolchain rows)"));
+    if configuration.source_effect(Path::new("")) != RustCargoConfigSourceEffect::Preserves {
+        diagnostics.push(diagnostic(
+            "rust.configuration.unresolved",
+            None,
+            "Cargo configuration can redirect sources or contains unclassified settings",
+        ));
     }
     if cancelled {
         diagnostics.push(diagnostic(
@@ -1153,7 +1267,7 @@ fn associate(
     workspace: Option<&Path>,
     manifests: &HashMap<PathBuf, RustCargoManifestDocument>,
     locks: &HashMap<PathBuf, CargoLockfile>,
-    configs: &[PathBuf],
+    configuration: &RustCargoConfiguration,
     provenance: &mut Vec<DependencyProvenance>,
 ) -> &'static str {
     let Some(workspace) = workspace else {
@@ -1194,8 +1308,8 @@ fn associate(
             return "unresolved";
         }
     };
-    // Evidence leaves Cargo configuration unresolved (`configs` below), so the
-    // path candidate is the manifests' route without configuration patches.
+    // Source-changing config is refused by the classifier below. This path
+    // candidate therefore follows manifests without applying config patches.
     let selected_path = cargo_dependency_directory_with(
         root,
         directory,
@@ -1258,8 +1372,10 @@ fn associate(
     let replacement_present = manifests
         .get(workspace)
         .is_some_and(|manifest| manifest.get("replace").is_some());
-    let mut source_known =
-        declaration_known && local_identity_unique && !replacement_present && configs.is_empty();
+    let mut source_known = declaration_known
+        && local_identity_unique
+        && !replacement_present
+        && configuration.source_effect(workspace) == RustCargoConfigSourceEffect::Preserves;
     if patch_present && local_version.is_none() {
         source_known = false;
         provenance.push(entry("cargo.lock_reason", "unsupported_or_ambiguous_patch"));
@@ -1267,7 +1383,7 @@ fn associate(
     if replacement_present {
         provenance.push(entry("cargo.lock_reason", "unsupported_replacement"));
     }
-    if !configs.is_empty() {
+    if configuration.source_effect(workspace) != RustCargoConfigSourceEffect::Preserves {
         provenance.push(entry("cargo.lock_reason", "unresolved_cargo_configuration"));
     }
     if value.get("path").is_some() && local_version.is_none() {
@@ -1382,10 +1498,16 @@ pub fn acquire_rust_file_dependency_evidence(
     limits: &DependencyFileEvidenceLimits,
     cancellation: Option<&CancellationToken>,
 ) -> DependencyFileEvidence {
-    let (outcome, bytes, selected) =
+    let (outcome, bytes, selected, configuration) =
         acquire_cargo_discovery_rows(project, &discovery_limits(limits), cancellation);
     let mut evidence = shared_file_evidence(outcome, bytes, limits);
-    push_rust_toolchain_evidence(project.root(), &selected, limits, &mut evidence);
+    push_rust_toolchain_evidence(
+        project.root(),
+        &selected,
+        &configuration,
+        limits,
+        &mut evidence,
+    );
     evidence
 }
 
@@ -1409,17 +1531,34 @@ pub fn acquire_rust_file_dependency_evidence(
 /// acquisition limit that may have omitted rows.
 ///
 /// Returns the rows, those diagnostics, and whether acquisition was cancelled.
-pub(crate) fn cargo_lock_activation_rows(
-    project: &dyn Project,
-    limits: &DependencyPackLimits,
-    cancellation: Option<&CancellationToken>,
+pub(super) fn cargo_lock_activation_rows_from_outcome(
+    outcome: DependencyDiscoveryOutcome,
 ) -> (Vec<ResolvedDependency>, Vec<DependencyPackDiagnostic>, bool) {
-    let (outcome, _, _) = acquire_cargo_discovery_rows(project, limits, cancellation);
     fn value<'a>(row: &'a ResolvedDependency, key: &str) -> Option<&'a str> {
         row.provenance
             .iter()
             .find(|entry| entry.key == key)
             .map(|entry| entry.value.as_str())
+    }
+    // Activation is workspace-wide, while configuration belongs to each
+    // Cargo workspace. A known owner's row cannot certify a package model for
+    // another owner whose source configuration is unresolved. Preserve the
+    // former global refusal for source-changing/unknown config, while allowing
+    // fully acquired source-neutral settings.
+    if outcome.dependencies.iter().any(|row| {
+        row.provenance.iter().any(|provenance| {
+            provenance.key == "cargo.lock_reason"
+                && provenance.value == "unresolved_cargo_configuration"
+        })
+    }) {
+        let mut diagnostics = outcome
+            .diagnostics
+            .into_iter()
+            .filter(|entry| entry.code.starts_with("limit."))
+            .collect::<Vec<_>>();
+        diagnostics.push(diagnostic("rust.lockfile.unresolved_configuration_activation",None,
+            "Cargo source configuration is unresolved for an indexed owner; workspace-wide package model activation is not established"));
+        return (Vec::new(), diagnostics, outcome.cancelled);
     }
     let locks = outcome
         .dependencies
@@ -1533,8 +1672,32 @@ pub fn rust_file_dependency_evidence(
     limits: &DependencyFileEvidenceLimits,
     cancellation: Option<&CancellationToken>,
 ) -> DependencyFileEvidence {
-    let outcome =
-        cargo_file_discovery_rows(root, selected, &discovery_limits(limits), cancellation);
+    let configuration = selected_cargo_configuration(selected);
+    rust_file_dependency_evidence_with_config_view(
+        root,
+        selected,
+        &configuration,
+        limits,
+        cancellation,
+    )
+}
+
+/// Pure projection from the recorded acquired configuration view. It performs
+/// no filesystem or environment acquisition; a missing/partial view stays Unknown.
+pub(crate) fn rust_file_dependency_evidence_with_config_view(
+    root: &Path,
+    selected: &[(ProjectFile, ProjectSourceSnapshot)],
+    configuration: &RustCargoConfiguration,
+    limits: &DependencyFileEvidenceLimits,
+    cancellation: Option<&CancellationToken>,
+) -> DependencyFileEvidence {
+    let outcome = cargo_file_discovery_rows_with_configuration(
+        root,
+        selected,
+        configuration,
+        &discovery_limits(limits),
+        cancellation,
+    );
     let bytes = selected
         .iter()
         .filter(|(file, _)| cargo_input(file.rel_path()))
@@ -1543,7 +1706,7 @@ pub fn rust_file_dependency_evidence(
             total.saturating_add(snapshot.source().len())
         });
     let mut evidence = shared_file_evidence(outcome, bytes, limits);
-    push_rust_toolchain_evidence(root, selected, limits, &mut evidence);
+    push_rust_toolchain_evidence(root, selected, configuration, limits, &mut evidence);
     evidence
 }
 
@@ -2201,6 +2364,34 @@ source = "git+https://git.example/unused#abcdef"
     }
 
     #[test]
+    fn config_key_classification_controls_lock_association() {
+        for (config, exact) in [
+            ("[build]\ntarget='x86_64-unknown-linux-gnu'", true),
+            ("[source.crates-io]\nreplace-with='local'", false),
+            (
+                "[patch.crates-io]\nwidget={git='https://git.example/replacement'}",
+                false,
+            ),
+            ("[unknown]\nsetting=true", false),
+            ("[build invalid", false),
+        ] {
+            let mut files = fixture();
+            files.push((".cargo/config.toml", config));
+            let outcome = evidence(&files);
+            assert_eq!(
+                values(
+                    declared(&outcome, "alpha/Cargo.toml", "renamed", "normal"),
+                    "cargo.lock_association"
+                )
+                .next()
+                    == Some("exact"),
+                exact,
+                "{config}"
+            );
+        }
+    }
+
+    #[test]
     fn unsupported_registry_patch_config_and_missing_lock_stay_unresolved() {
         for replacement in [
             "registry = 'company'",
@@ -2322,6 +2513,59 @@ source = "git+https://git.example/unused#abcdef"
         }
     }
     #[test]
+    fn legacy_config_precedence_ignores_malformed_modern_input() {
+        let selected = inputs(&[
+            (
+                ".cargo/config",
+                "[build]\ntarget='x86_64-unknown-linux-gnu'",
+            ),
+            (".cargo/config.toml", "[invalid"),
+        ]);
+        let configuration = selected_cargo_configuration(&selected).with_acquisition_complete(true);
+        assert_eq!(
+            configuration.stdlib_build_mode(Path::new("")),
+            brokk_bifrost_rust::cargo_config::RustStdlibBuildMode::Prebuilt
+        );
+        assert_eq!(
+            configuration.source_effect(Path::new("")),
+            RustCargoConfigSourceEffect::Preserves
+        );
+    }
+
+    #[test]
+    fn stdlib_build_mode_conditions_preserve_prebuilt_rows_and_type_unknown() {
+        let manifest = "[package]\nname='app'\nversion='0.1.0'";
+        for (config, complete, expected) in [
+            ("", true, None),
+            ("[unstable]\nbuild-std=['std']", true, Some("build_std")),
+            ("", false, Some("unknown")),
+            ("[unstable]\nbuild-std=false", true, Some("unknown")),
+        ] {
+            let selected = inputs(&[("Cargo.toml", manifest), (".cargo/config.toml", config)]);
+            let configuration =
+                selected_cargo_configuration(&selected).with_acquisition_complete(complete);
+            let mut result = DependencyFileEvidence::default();
+            push_rust_toolchain_evidence(
+                &root(),
+                &selected,
+                &configuration,
+                &DependencyFileEvidenceLimits::default(),
+                &mut result,
+            );
+            assert!(!result.rows.is_empty());
+            for row in result.rows {
+                assert_eq!(
+                    row.conditions
+                        .iter()
+                        .find(|condition| condition.kind == "rust.stdlib_build_mode")
+                        .map(|condition| condition.value.as_str()),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
     fn snapshot_replacement_and_fresh_projection_are_equivalent() {
         let mut selected = inputs(&fixture());
         let original =
@@ -2356,11 +2600,42 @@ source = "git+https://git.example/unused#abcdef"
     }
 
     #[test]
-    fn shared_contract_associates_only_proven_lock_instances_with_members() {
+    fn missing_recorded_config_view_cannot_certify_lock_association() {
         let selected = inputs(&fixture());
         let result = rust_file_dependency_evidence(
             &root(),
             &selected,
+            &DependencyFileEvidenceLimits::default(),
+            None,
+        );
+        assert!(
+            result
+                .rows
+                .iter()
+                .filter(|row| row.ecosystem
+                    == crate::analyzer::rust::toolchain_evidence::RUST_TOOLCHAIN_ECOSYSTEM)
+                .all(|row| row
+                    .conditions
+                    .iter()
+                    .any(|condition| condition.kind == "rust.stdlib_build_mode"
+                        && condition.value == "unknown"))
+        );
+        assert!(!result.complete());
+        assert!(result.rows.iter().all(|row| {
+            !row.conditions.iter().any(|condition| {
+                condition.kind == "cargo.lock_association" && condition.value == "exact"
+            })
+        }));
+    }
+
+    #[test]
+    fn shared_contract_associates_only_proven_lock_instances_with_members() {
+        let selected = inputs(&fixture());
+        let configuration = selected_cargo_configuration(&selected).with_acquisition_complete(true);
+        let result = rust_file_dependency_evidence_with_config_view(
+            &root(),
+            &selected,
+            &configuration,
             &DependencyFileEvidenceLimits::default(),
             None,
         );
@@ -2473,5 +2748,37 @@ source = "git+https://git.example/unused#abcdef"
             ..DependencyPackLimits::default()
         };
         assert!(!cargo_file_discovery_rows(&root(), &selected, &limits, None).complete);
+    }
+    #[test]
+    fn unresolved_owner_cannot_borrow_another_workspaces_exact_package_model() {
+        let alpha = "[package]\nname='alpha'\nversion='0.1.0'\n[dependencies]\nwidget='=1.2.3'\n";
+        let beta = alpha.replace("alpha", "beta");
+        let lock = LOCK.replace(
+            "name = \"beta\"\nversion = \"0.1.0\"\ndependencies = [\"widget 2.3.4",
+            "name = \"beta\"\nversion = \"0.1.0\"\ndependencies = [\"widget 1.2.3",
+        );
+        let outcome = evidence(&[
+            ("alpha/Cargo.toml", alpha),
+            ("beta/Cargo.toml", &beta),
+            ("alpha/Cargo.lock", &lock),
+            ("beta/Cargo.lock", &lock),
+            (
+                "alpha/.cargo/config.toml",
+                "[source.crates-io]\nreplace-with='private'\n",
+            ),
+        ]);
+        assert_eq!(
+            values(
+                declared(&outcome, "beta/Cargo.toml", "widget", "normal"),
+                "cargo.lock_association"
+            )
+            .next(),
+            Some("exact")
+        );
+        let (activation, diagnostics, _) = cargo_lock_activation_rows_from_outcome(outcome);
+        assert!(activation.is_empty());
+        assert!(diagnostics.iter().any(
+            |diagnostic| diagnostic.code == "rust.lockfile.unresolved_configuration_activation"
+        ));
     }
 }

@@ -729,7 +729,7 @@ impl<'a> CSharpDefinitionProvider<'a> {
                     if normalized_raw == ATTRIBUTE_FQN {
                         return Some(true);
                     }
-                    if matches!(normalized_raw.as_str(), "object" | "System.Object") {
+                    if graph_support::is_csharp_object_root(&normalized_raw) {
                         continue;
                     }
                     let ancestors = self.supertype_candidates(token, &part, &raw);
@@ -809,7 +809,7 @@ impl<'a> CSharpDefinitionProvider<'a> {
                             return None;
                         }
                         let raw = self.raw_supertypes(part);
-                        self.observe_cancellation().then_some(raw)
+                        self.observe_cancellation().then_some(Some(raw))
                     },
                     |part, raw| {
                         let candidates = self.supertype_candidates(token, part, raw);
@@ -817,7 +817,10 @@ impl<'a> CSharpDefinitionProvider<'a> {
                     },
                     |_| Some(()),
                 );
-                let Some(ancestors) = ancestors.filter(|_| self.observe_cancellation()) else {
+                let Some(ancestors) = ancestors
+                    .filter(|_| self.observe_cancellation())
+                    .map(|ancestors| ancestors.resolved)
+                else {
                     return Vec::new();
                 };
                 direct_ancestor_answers_memo
@@ -1039,7 +1042,7 @@ fn publish_csharp_model_extension(
         });
         return;
     };
-    let external = csharp.external_declarations(analyzer.semantic_model_overlay());
+    let external = csharp.external_declarations(analyzer.semantic_model_overlay_read().published());
     let instance_absent = receiver_type_names
         .iter()
         .filter(|receiver| external.declares_type(receiver))
@@ -1153,8 +1156,11 @@ fn csharp_external_member_evidence(
     else {
         return CallEvidence::default();
     };
-    let staticness =
-        csharp.external_member_is_static(analyzer.semantic_model_overlay(), &owner, &member);
+    let staticness = csharp.external_member_is_static(
+        analyzer.semantic_model_overlay_read().published(),
+        &owner,
+        &member,
+    );
     let Some(is_static) = staticness else {
         return CallEvidence::default();
     };
@@ -1195,6 +1201,7 @@ fn csharp_external_member_evidence(
     };
     CallEvidence {
         source_member_evidence: None,
+        fixed_array_source: None,
         native_resolution: None,
         model_member_selection: None,
         call_application: proof.call_application(),
@@ -1389,7 +1396,12 @@ fn hold_to_compilation_inventory(
     }
     // A failed inventory read proves nothing about additions, so only a read
     // that names the open obligations can be overcome by the closure proof.
-    let closed = inventory.is_some()
+    let closed = definitions
+        .csharp
+        .compilation_membership_completeness()
+        .cause()
+        .is_none()
+        && inventory.is_some()
         && outcome.status == DefinitionLookupStatus::Resolved
         && tree.is_some_and(|tree| {
             csharp_unqualified_call_closed_under_additions(
@@ -1935,7 +1947,7 @@ fn resolve_csharp_reference(
             }
             let arity = csharp_invocation_arity(name, source, definitions);
             let external_member_identity = csharp.external_member_identity(
-                analyzer.semantic_model_overlay(),
+                analyzer.semantic_model_overlay_read().published(),
                 &receiver_type_names,
                 member,
             );
@@ -1950,12 +1962,14 @@ fn resolve_csharp_reference(
                 .and_then(|identity| {
                     let owner = identity.strip_suffix(member)?.strip_suffix('.')?;
                     (csharp.external_member_is_static(
-                        analyzer.semantic_model_overlay(),
+                        analyzer.semantic_model_overlay_read().published(),
                         owner,
                         member,
                     ) == Some(false)
-                        && csharp.external_type_is_sealed(analyzer.semantic_model_overlay(), owner)
-                            == Some(true))
+                        && csharp.external_type_is_sealed(
+                            analyzer.semantic_model_overlay_read().published(),
+                            owner,
+                        ) == Some(true))
                     .then_some(())
                 })
                 .is_some();
@@ -2036,6 +2050,9 @@ fn resolve_csharp_reference(
                 if !extensions.candidates.is_empty() {
                     outcome = if extensions.open.is_some() {
                         DefinitionLookupOutcome {
+                            selected_sites: Vec::new(),
+                            inventory_evidence: None,
+                            incomplete_evidence: None,
                             status: DefinitionLookupStatus::Incomplete,
                             definitions: extensions.candidates,
                             modeled_definitions: Vec::new(),
@@ -3914,7 +3931,7 @@ fn csharp_external_constructor_target(
     }
     let parameter_count = u32::try_from(csharp_argument_count(creation, source)).ok()?;
     let (owner, member) = csharp.external_constructor_identity(
-        analyzer.semantic_model_overlay(),
+        analyzer.semantic_model_overlay_read().published(),
         &candidate_owners,
         parameter_count,
     )?;
@@ -4080,6 +4097,7 @@ fn csharp_external_constructor_evidence(
         ExactExternalCallProof::csharp_external_constructor(&owner, &member, parameter_count);
     CallEvidence {
         source_member_evidence: None,
+        fixed_array_source: None,
         native_resolution: None,
         model_member_selection: None,
         call_application: proof.call_application(),
@@ -4308,9 +4326,12 @@ fn csharp_type_outcome(
     ) {
         return candidates_outcome(vec![unit]);
     }
-    if let Some(reason) =
-        csharp.type_forward_boundary(analyzer.semantic_model_overlay(), token, file, reference)
-    {
+    if let Some(reason) = csharp.type_forward_boundary(
+        analyzer.semantic_model_overlay_read().published(),
+        token,
+        file,
+        reference,
+    ) {
         return boundary_unchecked(
             reason,
             UnindexedClaim::external_boundary(reference, ClaimSubjectRole::Type),
@@ -4560,7 +4581,7 @@ fn csharp_indexer_outcome(
         )),
     });
     if let Some(canonical) = csharp.external_member_identity(
-        analyzer.semantic_model_overlay(),
+        analyzer.semantic_model_overlay_read().published(),
         &receiver_type_names,
         CSHARP_INDEXER_MEMBER_NAME,
     ) {
@@ -4795,10 +4816,7 @@ fn csharp_hierarchy_crosses_unindexed_supertype(
             for raw in definitions.raw_supertypes(&part) {
                 // Every C# type derives from `object`, which no workspace
                 // indexes; naming it is not evidence of a truncated hierarchy.
-                if matches!(
-                    csharp_normalize_full_name(&raw).as_str(),
-                    "object" | "System.Object"
-                ) {
+                if graph_support::is_csharp_object_root(&csharp_normalize_full_name(&raw)) {
                     continue;
                 }
                 let candidates = definitions.supertype_candidates(token, &part, &raw);
@@ -6228,7 +6246,7 @@ fn csharp_external_transition_types(
         return types;
     };
     if let Some(value_type) = csharp.external_member_value_type(
-        analyzer.semantic_model_overlay(),
+        analyzer.semantic_model_overlay_read().published(),
         receiver_type_names,
         csharp_node_text(name.identifier, source),
         arity,
@@ -6770,7 +6788,7 @@ fn csharp_unindexed_type_qualifier_names(
         return heads;
     }
     let nested = nested.join(".");
-    let external = csharp.external_declarations(analyzer.semantic_model_overlay());
+    let external = csharp.external_declarations(analyzer.semantic_model_overlay_read().published());
     heads
         .into_iter()
         .map(|head| format!("{head}.{nested}"))

@@ -799,6 +799,7 @@ pub(crate) fn java_api_facts(
             hierarchy: declaration.hierarchy,
             aliases: Vec::new(),
             extension_surfaces: Vec::new(),
+            rust_stability: None,
             guard: None,
             locator: *declaration.locator,
         });
@@ -835,6 +836,7 @@ pub(crate) fn java_api_facts(
                 generic_arity,
                 parameter_types: &parameter_types,
                 parameter_variadics: &[],
+                extension_receiver: None,
                 return_type: member
                     .signature
                     .as_ref()
@@ -891,6 +893,7 @@ pub(crate) fn java_api_facts(
                 extension_receiver: None,
                 extension_receiver_constraints: Vec::new(),
                 aliases,
+                rust_stability: None,
                 guard: None,
                 locator: member.locator,
             };

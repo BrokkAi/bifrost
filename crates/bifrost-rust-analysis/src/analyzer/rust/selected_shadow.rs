@@ -33,7 +33,6 @@ use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResol
 #[cfg(any(test, feature = "test-support"))]
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionLocated;
 #[cfg(any(test, feature = "test-support"))]
-use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperationInput;
 #[cfg(any(test, feature = "test-support"))]
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperationOpenOutcome;
 #[cfg(any(test, feature = "test-support"))]
@@ -223,7 +222,7 @@ pub fn selected_rust_definition_shadow_result_with_after_open(
             value: SelectedRustCallerReferenceOutcome::Operation(operation),
             work,
         } => match operation {
-            SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Missing) => {
+            SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Missing(_)) => {
                 // The caller supplied a structured reference occurrence. A
                 // missing native site is missing producer support, not proof
                 // that this occurrence has no definition. Closed negatives
@@ -641,14 +640,9 @@ pub fn selected_rust_workspace_binding_world(
             return RustWorkspaceBindingWorldResult::StoreError(error.to_string());
         }
     };
-    let input = SelectedResolutionOperationInput::new(
-        rust.inner.project(),
-        rust.inner.workspace_id(),
-        snapshots.as_ref(),
-        &languages,
-        &masks,
-    )
-    .with_content_mounts(content_mounts);
+    let input = rust
+        .selected_resolution_operation_input(snapshots.as_ref(), &languages, &masks)
+        .with_content_mounts(content_mounts);
     let operation = match rust
         .inner
         .analyzer_store()

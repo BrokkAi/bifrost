@@ -18,6 +18,8 @@ pub mod rust_departing_root_tests {
     use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit;
     use brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution;
     use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
+    use brokk_bifrost_rust::cargo_config::RustCargoConfiguration;
+    use brokk_bifrost_rust::cargo_config::acquired::RustCargoAcquiredConfigView;
     use brokk_bifrost_rust::selected_context::RustCallerTargetKind;
     use brokk_bifrost_rust::selected_context::RustCallerTargetProfile;
     use brokk_bifrost_rust::selected_context::RustSelectedManifestMount;
@@ -273,7 +275,7 @@ pub mod rust_departing_root_tests {
                         }
                     }
                     SelectedResolutionOperationOutcome::Native(
-                        SelectedResolutionLocated::Missing,
+                        SelectedResolutionLocated::Missing(_),
                     ) => RustPrivatePointSummary {
                         located: false,
                         definition_ids: Vec::new(),
@@ -1362,7 +1364,7 @@ pub mod rust_departing_root_tests {
         };
         let file = ProjectFile::new(fixture._project_root.path(), RUST_ROOT_CONSUMER_PATH);
         let (selected_oid, selected) = operation
-            .selected_rust_import_infos(&file, &cancellation)
+            .selected_rust_import_infos(&file, None, &cancellation)
             .unwrap()
             .expect("selected Rust import facts");
         assert_eq!(selected_oid, oid);
@@ -2073,7 +2075,11 @@ pub mod rust_departing_root_tests {
             })?;
             }
         }
-        let configuration = manifests
+        assert!(
+            !manifests.is_empty(),
+            "the Rust root fixture publishes at least one manifest"
+        );
+        let mut configuration = manifests
             .iter()
             .map(|manifest| {
                 WorkspaceConfigurationInput::new(
@@ -2085,6 +2091,31 @@ pub mod rust_departing_root_tests {
                 )
             })
             .collect::<Vec<_>>();
+        // A selected snapshot without an acquired configuration is explicitly
+        // partial. Publish the complete, empty acquisition production records
+        // when no Cargo configuration file exists, so manifest-controlled cfg
+        // and feature activation keep their exact answers.
+        let empty =
+            RustCargoConfiguration::from_files(std::iter::empty()).with_acquisition_complete(true);
+        let mut acquired = RustCargoAcquiredConfigView {
+            complete: true,
+            ..Default::default()
+        };
+        let mut owners = BTreeSet::from([PathBuf::new()]);
+        owners.extend(manifests.iter().map(|manifest| {
+            manifest
+                .relative_path
+                .parent()
+                .unwrap_or(Path::new(""))
+                .to_path_buf()
+        }));
+        for directory in owners {
+            acquired.owners.insert(
+                directory.clone(),
+                empty.acquired_owner_facts(&directory, directory.clone(), Vec::new()),
+            );
+        }
+        WorkspaceConfigurationInput::attach_rust_cargo_acquisition(&mut configuration, acquired);
         let snapshot = store.sync_workspace_inputs_for_workspace(
             workspace_id,
             "rust",
@@ -3485,16 +3516,23 @@ pub mod rust_departing_root_tests {
         let selected = operation.ready.inventory.persisted_mount_count();
         let narrowed = std::cell::Cell::new(usize::MAX);
         let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            operation.with_rust_forward_crate_scope(&keys, &cancellation, || -> Result<()> {
-                narrowed.set(
-                    operation
-                        .ready
-                        .inventory
-                        .scope_mount_count()
-                        .expect("the narrowed scope's mount count"),
-                );
-                panic!("a forward request panics inside its scope");
-            })
+            // Asks no route question. It only counts mounts and panics, to
+            // prove Drop restores the scope on unwind.
+            operation.with_rust_forward_crate_scope(
+                &keys,
+                &cancellation,
+                |_| Ok(()),
+                || -> Result<()> {
+                    narrowed.set(
+                        operation
+                            .ready
+                            .inventory
+                            .scope_mount_count()
+                            .expect("the narrowed scope's mount count"),
+                    );
+                    panic!("a forward request panics inside its scope");
+                },
+            )
         }));
         assert!(
             unwound.is_err(),
@@ -3557,9 +3595,13 @@ pub mod rust_departing_root_tests {
                     measurement.1.decoded_rows
                 );
             }
+            // #12370's conditional macro type productions read through the
+            // selected typed stage. The point therefore leaves the stage in
+            // use, and the selection's drop performs its finish freshness
+            // check as a second selected read group before stage cleanup.
             assert_eq!(
                 point_read_freshness_groups(search),
-                1,
+                2,
                 "selected crate-context read groups changed"
             );
             // The rows-era tables that no writer produces any more. This list is
@@ -3783,10 +3825,51 @@ pub mod rust_departing_root_tests {
             // (+3 schema statements/rows at cold open). This Rust fixture also
             // executes four trigger bodies while filling/clearing selection
             // rows (+4 statements, no decoded result rows). Search is unchanged.
+            // #11519 (migration 0334) installs three connection-local summary
+            // translation TEMP views on every selected connection: selected
+            // member blobs, the current surface list, and Rust summary
+            // placements. Their CREATE TEMP VIEW definitions add three
+            // statements and three schema rows to the first cold open only;
+            // search work is unchanged.
+            // #11546 adds the selected unplaced-placement TEMP table and its
+            // unplaced-gap TEMP view to the same translation setup (+2
+            // statements and schema rows), and the selected placement fill
+            // clears and fills the table (+4 executions, no decoded rows): +6/+2
+            // at cold open only. Without an overlay the table stays empty and
+            // the search is unchanged.
+            // #11682 adds selected Rust added-edge and overlay-gap TEMP
+            // tables and runs fill statements 7-10: +12 cold-open
+            // statements/+6 decoded schema rows in both profiles.
+            // #11682 C2 adds the partial index on the added-edge target path
+            // (`selected_rust_added_edges_target_path`): +1 cold-open
+            // statement and +1 decoded schema row in both profiles.
+            // #12004 publication-lineage nonce validation adds two cold-open
+            // statements and two decoded schema rows in both profiles; search
+            // and warm work are unchanged.
+            // #11904 (e0d67d829c6, landed in #12139) adds the TEMP index
+            // `selected_rust_unit_closure_dependents`: one more cold-open
+            // schema statement and decoded row in both profiles.
+            // #12365 reads every selected declaration through its exact source
+            // bridge to carry the selected site: +1 search statement and +1
+            // decoded row per search in both profiles; cold open is unchanged.
+            // #12495's binary-operations stage family adds the TEMP table, its
+            // unique index and its seek index: +3 cold-open statements and schema
+            // rows in both profiles, plus the point's binary-operation pages
+            // (+3 search statements, no decoded rows).
+            // #12370's conditional macro type productions add one cold-only
+            // interior-validation COUNT (+1 statement/+1 row) and two macro type
+            // candidate pages (+2 statements/no rows) per search. Their typed
+            // stage use also makes the selection's finish freshness check the
+            // second read group (+3 statements/+3 rows), a cost the warm searches
+            // pay without the cold-only COUNT (+5/+3).
+            // #13339 installs the three shared Rust source-scope TEMP views in
+            // selected-resolution schema setup: +3 cold-open statements and
+            // decoded schema rows in both profiles. Search and warm work are
+            // unchanged.
             if cfg!(debug_assertions) {
-                (283, 246, 331, 205)
+                (314, 267, 341, 210)
             } else {
-                (280, 243, 331, 205)
+                (311, 264, 341, 210)
             },
             "production Rust cold point SQL changed; the crate-key open and row-backed point search have exact statement and decoded-row counts"
         );
@@ -3842,7 +3925,12 @@ pub mod rust_departing_root_tests {
             // in both debug and measure builds after the merge.
             // #9755: the same site-row read outside a stage read as the cold
             // search: +1/+1.
-            (5, 4, 331, 205),
+            // #12365's selected declaration read adds the same +1/+1.
+            // #12495's binary-operation pages add the same +3/0 as the cold
+            // search. #12370's two macro type candidate pages (+2/0) and the
+            // finish freshness boundary (+3/+3) add +5/+3; the cold-only
+            // interior-validation COUNT is absent here.
+            (5, 4, 340, 209),
             "production Rust warm point SQL changed; exact relational selection verification and requested opening metadata keep the open at five statements while the row-backed search has exact statement and decoded-row counts"
         );
         assert_eq!(
@@ -3868,7 +3956,11 @@ pub mod rust_departing_root_tests {
             // #9231: the same two sole-producer reads as the cold search: +2/0
             // in both debug and measure builds after the merge.
             // #9755: the same site-row read outside a stage read: +1/+1.
-            (5, 4, 331, 205),
+            // #12365's selected declaration read adds the same +1/+1.
+            // #12495's binary-operation pages (+3/0), #12370's two macro type
+            // candidate pages (+2/0) and the finish freshness boundary (+3/+3)
+            // add the same +8/+3 as the first warm search.
+            (5, 4, 340, 209),
             "repeated production Rust warm point SQL changed; the repeated retained selection and row-backed search have identical measured counts"
         );
         assert_eq!(cold.2, first_warm.2);
@@ -5145,6 +5237,125 @@ pub mod rust_departing_root_tests {
         }
     }
 
+    #[test]
+    #[hardwon("#11342: flat unknown activation evidence panicked in the crate row reader")]
+    fn rust_flat_producer_inventory_evidence_remains_incomplete() {
+        use brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_crate_rows::RustCrateRows;
+        let mut fixture = RustRootResolutionOperationFixture::new();
+        fixture.replace_persisted_consumer_source(
+            "#[cfg(unknown_build_flag)] pub mod hidden { pub fn target() {} }\nuse crate::hidden::target;\n"
+        );
+        let cancellation = CancellationToken::new();
+        let operation = fixture.open_ready(&cancellation);
+        let conn = operation.ready.inventory.connection();
+        let detail: String = conn.query_row(
+            "SELECT json(detail) FROM rust_crate_gaps WHERE gap_kind='unknown_activation' AND subject='crate::hidden' LIMIT 1",
+            [], |row| row.get(0),
+        ).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&detail).unwrap();
+        assert_eq!(parsed["subject_level"], "binding");
+        assert!(parsed.get("evidence").is_none(), "{parsed:?}");
+        let rows = RustCrateRows::new(&operation.ready);
+        for detail in [
+            detail,
+            serde_json::json!({"evidence": [parsed]}).to_string(),
+        ] {
+            let completion = rows.inventory_completion_for_test(vec![detail]).unwrap();
+            assert!(
+                matches!(completion, ResolutionCompletion::Incomplete { .. }),
+                "{completion:?}"
+            );
+        }
+        for evidence in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!("invalid"),
+        ] {
+            let detail = serde_json::json!({"evidence": evidence}).to_string();
+            assert!(rows.inventory_completion_for_test(vec![detail]).is_err());
+        }
+        assert!(
+            rows.inventory_completion_for_test(vec!["invalid JSON".to_owned()])
+                .is_err()
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#11510: a gap reason the crate relation did not name was reported as the certified unsupported-semantic stop"
+    )]
+    fn rust_gap_evidence_reasons_remain_uncertified() {
+        use brokk_bifrost_analysis::analyzer::resolution::{
+            ReasonDeterminism, ResolutionIncompleteReason as Reason,
+        };
+        use brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_crate_rows::RustCrateRows;
+        let mut fixture = RustRootResolutionOperationFixture::new();
+        fixture.replace_persisted_consumer_source("pub fn target() {}\n");
+        let cancellation = CancellationToken::new();
+        let operation = fixture.open_ready(&cancellation);
+        let rows = RustCrateRows::new(&operation.ready);
+        let reasons = |reason: Option<&str>| {
+            let mut evidence = serde_json::json!({"subject_level": "module", "exact_targets": []});
+            if let Some(reason) = reason {
+                evidence["reason"] = serde_json::Value::from(reason);
+            }
+            let detail = serde_json::json!({"evidence": [evidence]}).to_string();
+            let ResolutionCompletion::Incomplete(reasons) =
+                rows.inventory_completion_for_test(vec![detail]).unwrap()
+            else {
+                panic!("a gap is incomplete")
+            };
+            reasons.iter().copied().collect::<Vec<_>>()
+        };
+        let determinism = |reason: Option<&str>| match reasons(reason).as_slice() {
+            [Reason::UnsupportedSemantic(semantic)] => operation
+                .ready
+                .context_identities
+                .named_reason_determinism(*semantic),
+            // A wire string this build does not know stays reader-local and
+            // carries no declaration, so it is never a snapshot stop.
+            [Reason::Unclassified(_)] => None,
+            other => panic!("{reason:?} is not a single provider reason: {other:?}"),
+        };
+        // The two named candidates remain uncertified after the 0/42 experiment.
+        for named in [
+            "UnsupportedMacroGeneratedModule",
+            "UnsupportedGlobConflictVisibility",
+        ] {
+            assert!(
+                matches!(determinism(Some(named)), Some(ReasonDeterminism::Unaudited)),
+                "{named}"
+            );
+        }
+        // Every other reason, known or not, has no declaration, so it is never
+        // a snapshot stop and stays a Provider stop at the stop site.
+        for undeclared in [
+            None,
+            Some("GeneratedItemSurface"),
+            Some("UnloweredDeclaration"),
+            Some("UnsupportedImportTarget"),
+            Some("UnresolvedVisibility"),
+            Some("public_module_ambiguous"),
+            Some("EditedMacroHost"),
+            Some("SomethingNew"),
+            Some(""),
+        ] {
+            assert_eq!(determinism(undeclared), None, "{undeclared:?}");
+        }
+        assert!(matches!(
+            reasons(Some("InconsistentPrecedence")).as_slice(),
+            [Reason::InconsistentPrecedence(_)]
+        ));
+        assert!(matches!(
+            reasons(Some("OpenBoundary")).as_slice(),
+            [Reason::OpenBoundary { .. }]
+        ));
+        assert!(matches!(
+            reasons(Some("CyclicExpansion")).as_slice(),
+            [Reason::CyclicExpansion(_)]
+        ));
+    }
+
     /// The crate declares a decided invocation's items against the persisted blob
     /// of the file that invokes it and closes the module's export inventory. A
     /// request that edits that file reads other content, which has no crate rows,
@@ -5481,7 +5692,7 @@ pub mod rust_departing_root_tests {
             SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Found(
                 result,
             )) => only_rust_point_answer(result),
-            SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Missing) => {
+            SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Missing(_)) => {
                 panic!("dirty Rust constant reference range is absent")
             }
             SelectedResolutionOperationOutcome::Unavailable(reason) => {
@@ -6350,7 +6561,11 @@ pub mod rust_departing_root_tests {
                 // incomplete call answer pays two more scope steps for that
                 // read even though the fixture has no external sibling to
                 // discharge, with the same rounds and answer: 261 -> 263.
-                scope_nodes: 263,
+                // #12715's complete Cargo acquisition fixture combined with
+                // #12370's selected resolution facts adds six deterministic
+                // scope charges; rounds, answer and bounded/unbounded agreement
+                // are unchanged (263 -> 269).
+                scope_nodes: 269,
                 resolution_rounds: 10,
                 hierarchy_order_steps: 0,
             },
@@ -7352,7 +7567,7 @@ pub mod rust_departing_root_tests {
     }
 
     #[hardwon(
-        "#5658: existence checks and single-invocation matching hydrated file-wide macro tokens"
+        "#11281+#5658: macro readers hydrated unused fact families and file-wide token inputs"
     )]
     #[test]
     pub(crate) fn selected_macro_source_rows_preserve_invocation_snapshots() {
@@ -7421,9 +7636,46 @@ pub fn inactive() { unknown!({ nested(tokens) }); }
                 .unwrap()
                 .is_empty()
         );
+        // #11281: the module walk retains exactly its route/include inputs,
+        // while the full reader keeps the identifier and import families.
+        struct WalkReads(std::sync::Mutex<Vec<String>>);
+        impl brokk_bifrost_core::attribution::StatementObserver for WalkReads {
+            fn statement(&self, sql: &str) {
+                self.0.lock().unwrap().push(sql.to_owned());
+            }
+        }
+        let full = operation
+            .selected_rust_usage_facts(Path::new(RUST_ROOT_CONSUMER_PATH), &cancellation)
+            .unwrap()
+            .unwrap();
+        assert!(!full.identifier_occurrences.is_empty());
+        let walk_reads = std::sync::Arc::new(WalkReads(std::sync::Mutex::new(Vec::new())));
+        let narrow = {
+            let _observe = brokk_bifrost_core::attribution::observe_statements(walk_reads.clone());
+            operation
+                .selected_rust_module_walk_facts_for_test(
+                    Path::new(RUST_ROOT_CONSUMER_PATH),
+                    &cancellation,
+                )
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(narrow.module_routes, full.module_routes);
+        assert_eq!(narrow.include_edges, full.include_edges);
+        let sql = walk_reads.0.lock().unwrap();
+        assert!(
+            sql.iter().any(|s| s.contains("rust_published_fact_blobs")),
+            "publication validation: {sql:?}"
+        );
+        assert!(
+            !sql.iter().any(|s| s.contains("rust_identifier_occurrences")
+                || s.contains("source_rust_exports")
+                || s.contains("source_rust_import_targets")),
+            "unused families: {sql:?}"
+        );
     }
 
-    #[hardwon("#4501: selected macro overlay queried the occurrence arena once per input")]
+    #[hardwon("#11281+#4501: macro consumers repeated token and occurrence arena reads")]
     #[test]
     pub(crate) fn selected_macro_overlay_scans_occurrence_arena_once_for_many_inputs() {
         let mut fixture = RustRootResolutionOperationFixture::new_with_scale_sources(
@@ -7475,6 +7727,18 @@ pub fn caller(t: &Tensor) {
             "expected multiple macro inputs: {input_count}"
         );
 
+        // #11281: overlay and frontier consumers must share the same decoded
+        // immutable input rows without skipping either consumer's work.
+        struct TokenReads(std::sync::atomic::AtomicUsize);
+        impl brokk_bifrost_core::attribution::StatementObserver for TokenReads {
+            fn statement(&self, sql: &str) {
+                if sql.contains("FROM source_rust_macro_input_tokens WHERE blob_id = ?1 ORDER BY") {
+                    self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+        let token_reads = std::sync::Arc::new(TokenReads(std::sync::atomic::AtomicUsize::new(0)));
+        let _observe = brokk_bifrost_core::attribution::observe_statements(token_reads.clone());
         brokk_bifrost_analysis::analyzer::store::resolution_operation::reset_selected_macro_occurrence_line_query_count_for_test();
         assert!(matches!(
             operation
@@ -7498,6 +7762,11 @@ pub fn caller(t: &Tensor) {
         1,
         "a repeated same-file request reuses the prepared overlay"
     );
+        assert_eq!(
+            token_reads.0.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "overlay and frontier share one file-wide token load in the operation"
+        );
     }
 
     #[hardwon("#4501: identical macro include plans were rebuilt across caller operations")]
@@ -7819,6 +8088,198 @@ pub fn caller(t: &Tensor) {
         );
     }
 
+    fn macro_activation_closure_flags(
+        operation: &SelectedResolutionOperation<'_, '_>,
+    ) -> Vec<bool> {
+        let host = operation
+            .ready
+            .inventory
+            .mount_record_for_path("rust", RUST_ROOT_CONSUMER_PATH)
+            .unwrap()
+            .unwrap();
+        let conn = operation.ready.inventory.connection();
+        conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM temp.selected_resolution_stage_closed_reasons AS closed WHERE closed.semantic_key=(?2+gap.reason)) FROM resolution_gap_reasons AS gap JOIN source_rust_macro_inputs AS input ON input.blob_id=gap.blob_id AND input.native_gap_site=gap.site WHERE gap.blob_id=?1 AND gap.origin=?3 ORDER BY gap.reason").unwrap().query_map(params![host.blob_id(), i64::from(host.ordinal().get()) << 32, brokk_bifrost_analysis::analyzer::store::resolution_prepare::resolution_rows::gap_origin_code(brokk_bifrost_analysis::analyzer::resolution::LoweringGapOrigin::Extracted(brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::UnprovenActivation))], |row| row.get(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
+    }
+
+    #[test]
+    #[hardwon("#12239: an inactive later macro_rules! shadowed the active definition")]
+    fn selected_textual_macro_respects_definition_cfg() {
+        use brokk_bifrost_rust::cfg::RustMacroDefinitionOutcome;
+        // A possible local shadow never authorizes builtin replay, and closing
+        // activation must leave the independent generated-item frontier open.
+        for (name, body, input, generated) in [
+            ("m", "() => { struct Generated; }", "()", "Generated"),
+            (
+                "cfg_if",
+                "($($t:tt)*) => {}",
+                "{ if #[cfg(all())] { struct Phantom; } }",
+                "Phantom",
+            ),
+        ] {
+            for guard in ["feature = \"custom\"", "any()"] {
+                let source =
+                    format!("#[cfg({guard})] macro_rules! {name} {{ {body}; }}\n{name}!{input};\n");
+                let mut fixture = RustRootResolutionOperationFixture::new();
+                let (_, native) = fixture.replace_persisted_consumer_source(&source);
+                let builtin = name == "cfg_if" && guard == "any()";
+                assert_eq!(
+                    native.identifiers.iter().any(|identifier| identifier.role
+                        == ResolutionIdentifierRole::Declaration
+                        && native.names[identifier.name.index()].spelling == generated),
+                    builtin,
+                    "{source}: {native:#?}"
+                );
+                if !builtin {
+                    assert!(native.gaps.iter().any(|gap| matches!(gap.kind,
+                        brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::GeneratedItemSurface
+                        | brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::UnexpandedItemMacro)),
+                        "{source}: {native:#?}");
+                }
+            }
+        }
+        for (first, second, expected) in [
+            ("", "#[cfg(any())]", Some(0)),
+            ("#[cfg(any())]", "", Some(1)),
+            ("", "#[cfg(custom_build_cfg)]", None),
+            ("", "", Some(1)),
+        ] {
+            let source = format!(
+                "{first} macro_rules! m {{ () => {{}}; }}\n{second} macro_rules! m {{ () => {{}}; }}\nfn run() {{ m!(); }}\n"
+            );
+            let mut fixture = RustRootResolutionOperationFixture::new();
+            let (_, native) = fixture.replace_persisted_consumer_source(&source);
+            if expected.is_none() {
+                assert!(native.gaps.iter().any(|gap| gap.kind == brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::UnprovenActivation), "{native:#?}");
+            }
+            let cancellation = CancellationToken::new();
+            let operation = fixture.open_ready(&cancellation);
+            let path = Path::new(RUST_ROOT_CONSUMER_PATH);
+            let facts = operation
+                .selected_rust_module_walk_facts_for_test(path, &cancellation)
+                .unwrap()
+                .unwrap();
+            let selected = operation
+                .select_textual_macro_definition(
+                    path,
+                    source.rfind("m!()").unwrap(),
+                    "m",
+                    &cancellation,
+                )
+                .unwrap();
+            let RustSelectedBuildOutcome::Ready(selected) = selected else {
+                panic!("selection stopped");
+            };
+            match (expected, selected) {
+                (Some(index), RustMacroDefinitionOutcome::Resolved((file, declaration))) => {
+                    assert_eq!(file, path);
+                    assert_eq!(
+                        declaration,
+                        facts.module_routes.item_macros[index].declaration
+                    );
+                }
+                (None, RustMacroDefinitionOutcome::UnprovenActivation) => {}
+                (expected, selected) => {
+                    panic!("expected {expected:?}, got {selected:?} for {source}")
+                }
+            }
+            assert!(matches!(
+                operation
+                    .prepare_selected_macro_frontiers(path, &cancellation)
+                    .unwrap(),
+                SelectedResolutionStageOutcome::Ready
+            ));
+            let closed = macro_activation_closure_flags(&operation);
+            assert_eq!(
+                closed,
+                if expected.is_none() {
+                    vec![false]
+                } else {
+                    vec![]
+                }
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon("#12239: an inactive later macro_rules! shadowed the active definition")]
+    fn textual_macro_activation_closure_tracks_manifest_warm_and_fresh() {
+        use brokk_bifrost_rust::cfg::RustMacroDefinitionOutcome;
+        const SOURCE: &str =
+            "#[cfg(feature = \"later\")] macro_rules! m { () => { struct Generated; }; }\nm!();\n";
+        let mut warm = RustRootResolutionOperationFixture::new();
+        warm.replace_persisted_consumer_source(SOURCE);
+        for enabled in [false, true, false] {
+            let mut fresh = RustRootResolutionOperationFixture::new();
+            fresh.replace_persisted_consumer_source(SOURCE);
+            let mut answers = Vec::new();
+            for fixture in [&mut warm, &mut fresh] {
+                // Members activate every declared feature (#12164), so later is undeclared when inactive.
+                let features = if enabled { "later=[]" } else { "" };
+                let manifest = RustSelectedManifestMount::from_source("app/Cargo.toml", &format!("[package]\nname='app'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nengine={{path='../engine'}}\n[features]\n{features}\n")).unwrap();
+                ProjectFile::new(fixture._project_root.path(), "app/Cargo.toml")
+                    .write(std::str::from_utf8(manifest.source_bytes()).unwrap())
+                    .unwrap();
+                fixture.selected_manifests[0] = manifest;
+                let mut rows = fixture.source_rows();
+                rows.iter_mut()
+                    .find(|row| row.rel_path == RUST_ROOT_CONSUMER_PATH)
+                    .unwrap()
+                    .blob_oid = Oid::hash_object(ObjectType::Blob, SOURCE.as_bytes()).unwrap();
+                let snapshot = sync_rust_operation_inputs(
+                    &fixture.store,
+                    &fixture.workspace_id,
+                    fixture.generation,
+                    fixture._project_root.path(),
+                    &rows,
+                    &fixture.selected_manifests,
+                )
+                .unwrap();
+                fixture.snapshots.get_mut("rust").unwrap().revision = snapshot.revision;
+                let cancellation = CancellationToken::new();
+                let operation = fixture.open_ready(&cancellation);
+                let path = Path::new(RUST_ROOT_CONSUMER_PATH);
+                let facts = operation
+                    .selected_rust_module_walk_facts_for_test(path, &cancellation)
+                    .unwrap()
+                    .unwrap();
+                let selected = operation
+                    .select_textual_macro_definition(
+                        path,
+                        SOURCE.rfind("m!()").unwrap(),
+                        "m",
+                        &cancellation,
+                    )
+                    .unwrap();
+                let index = match selected {
+                    RustSelectedBuildOutcome::Ready(RustMacroDefinitionOutcome::Resolved((
+                        _,
+                        declaration,
+                    ))) => Some(
+                        facts
+                            .module_routes
+                            .item_macros
+                            .iter()
+                            .position(|candidate| candidate.declaration == declaration)
+                            .unwrap(),
+                    ),
+                    RustSelectedBuildOutcome::Ready(RustMacroDefinitionOutcome::Missing) => None,
+                    other => panic!("{other:?}"),
+                };
+                assert_eq!(index, enabled.then_some(0));
+                assert!(matches!(
+                    operation
+                        .prepare_selected_macro_frontiers(path, &cancellation)
+                        .unwrap(),
+                    SelectedResolutionStageOutcome::Ready
+                ));
+                let closed = macro_activation_closure_flags(&operation);
+                assert_eq!(closed, vec![enabled]);
+                answers.push((index, closed));
+            }
+            assert_eq!(answers[0], answers[1]);
+        }
+    }
+
     pub(crate) struct DenseSelectedMacroFixture {
     pub(crate) key: brokk_bifrost_analysis::analyzer::store::resolution_publication::ResolutionCapsuleKey,
     pub(crate) checkpoint: brokk_bifrost_analysis::analyzer::resolution::local_identity::ResolutionNodeIdentity,
@@ -7932,7 +8393,12 @@ pub fn caller(t: &Tensor) {
                 pending.extend(node.named_children(&mut cursor));
             }
             let macro_head = macro_head.unwrap();
-            let RustSelectedBuildOutcome::Ready(Some((definition_path, declaration))) = operation
+            let RustSelectedBuildOutcome::Ready(
+                brokk_bifrost_rust::cfg::RustMacroDefinitionOutcome::Resolved((
+                    definition_path,
+                    declaration,
+                )),
+            ) = operation
                 .select_textual_macro_definition(
                     Path::new(path),
                     macro_head.start_byte(),
@@ -8996,9 +9462,16 @@ pub fn caller(t: &Tensor) {
                 serde_json::to_string(&blobs.repeat(17)).unwrap(),
             )];
             let plan = explain_pin(&conn, &query);
+            // The requested blob drives selected file versions; the member is
+            // then reached by rel_path through the path index or by the
+            // summary/member primary key. Both are bounded membership seeks.
             assert!(
-                plan.iter()
-                    .any(|row| row.contains("resolution_unit_summary_members_blob (blob_id=?")),
+                plan.iter().any(|row| {
+                    row.contains("resolution_unit_summary_members_path (rel_path=?")
+                        || row.contains(
+                            "SEARCH members USING PRIMARY KEY (summary_id=? AND member_ordinal=?)",
+                        )
+                }),
                 "{state}: {plan:?}"
             );
             assert!(
@@ -9007,6 +9480,227 @@ pub fn caller(t: &Tensor) {
                 "{state}: {plan:?}"
             );
         }
+    }
+
+    /// The reverse-reference gate (by blob) and the route index (by unit) read
+    /// one definition of file activity, so they cannot disagree. The fixture
+    /// holds the cases the gate's own SQL and a fold over the placement rows
+    /// had answered differently: a file placed by two competing declarations of
+    /// one module (an undecided `#[path]` twin), and the descendants of an
+    /// inactive or undecided module, which have no `inactive_placement` gap.
+    #[test]
+    #[hardwon(
+        "#11639: readers disagreed on activity for a descendant of an inactive module and for a module with an undecided twin; an overlay that re-activates a cfg-inactive module kept its callers dropped"
+    )]
+    pub(crate) fn rust_file_activity_has_one_definition_for_gate_and_route_index() {
+        use brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_crate_access::RustBlobActivity::{
+            Active, Inactive, Unknown,
+        };
+        use brokk_bifrost_analysis::analyzer::store::rust_unit_summaries::rust_unit_file_activity;
+
+        let mut fixture = RustRootResolutionOperationFixture::new();
+        fixture.replace_persisted_consumer_and_sources(
+            "mod normal;\n#[cfg(windows)] mod win;\n#[cfg(placement_reader_build_script)] mod undecided;\nmod dup;\n#[cfg(placement_reader_build_script)] #[path = \"dup_alt.rs\"] mod dup;\n#[cfg(placement_reader_build_script)] mod inl { mod inl_child; }\n#[cfg(any())] mod gone;\n",
+            &[
+                ("app/src/normal.rs", "pub fn normal() {}\n"),
+                ("app/src/win.rs", "pub fn win() {}\n"),
+                ("app/src/undecided.rs", "mod deep;\n#[cfg(any())] mod dead;\n"),
+                ("app/src/undecided/deep.rs", "pub fn deep() {}\n"),
+                ("app/src/undecided/dead.rs", "pub fn dead() {}\n"),
+                ("app/src/dup.rs", "mod dup_child;\n"),
+                ("app/src/dup/dup_child.rs", "pub fn dup_child() {}\n"),
+                ("app/src/dup_alt.rs", "pub fn alt() {}\n"),
+                ("app/src/inl/inl_child.rs", "pub fn inl_child() {}\n"),
+                ("app/src/gone.rs", "mod gone_child;\n"),
+                ("app/src/gone/gone_child.rs", "pub fn gone_child() {}\n"),
+                ("app/src/stray.rs", "pub fn stray() {}\n"),
+            ],
+        );
+        let cancellation = CancellationToken::new();
+        let operation = fixture.open_ready(&cancellation);
+        let conn = operation.ready.inventory.connection();
+        let windows = if cfg!(windows) { Active } else { Inactive };
+        let expected = [
+            ("app/src/lib.rs", Active),
+            ("app/src/normal.rs", Active),
+            ("app/src/win.rs", windows),
+            ("app/src/undecided.rs", Unknown),
+            ("app/src/undecided/deep.rs", Unknown),
+            // Its own cfg is false whatever the undecided parent decides.
+            ("app/src/undecided/dead.rs", Inactive),
+            ("app/src/dup.rs", Unknown),
+            ("app/src/dup/dup_child.rs", Unknown),
+            ("app/src/dup_alt.rs", Unknown),
+            ("app/src/inl/inl_child.rs", Unknown),
+            ("app/src/gone.rs", Inactive),
+            ("app/src/gone/gone_child.rs", Inactive),
+            ("app/src/stray.rs", Unknown),
+        ];
+        let blobs = expected.map(|(path, _)| {
+            conn.query_row(
+                "SELECT blob_id FROM selected_resolution_mounts WHERE persisted_relative_path=?1",
+                [path],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+        });
+        let by_blob = operation.rust_blob_placement_activity(&blobs).unwrap();
+        assert_eq!(
+            by_blob
+                .iter()
+                .map(|(_, activity)| *activity)
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|(_, activity)| *activity)
+                .collect::<Vec<_>>(),
+            "{:?}",
+            expected.map(|(path, _)| path)
+        );
+
+        // The route index asks the unit; every file the unit stores a placement
+        // of gets the verdict the gate gives it.
+        let unit: Vec<u8> = conn
+            .query_row(
+                "SELECT unit.unit_key FROM selected_rust_unit_summaries AS unit
+                 JOIN rust_resolution_unit_summary_contexts AS context USING(summary_id)
+                 JOIN resolution_unit_summary_members AS member USING(summary_id)
+                 WHERE context.target_kind<>'detached' AND member.rel_path='app/src/lib.rs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let unit: [u8; 32] = unit.try_into().unwrap();
+        let snapshot = fixture.snapshots.get("rust").unwrap();
+        let by_unit = rust_unit_file_activity(conn, snapshot, &unit).unwrap();
+        let mut compared = 0;
+        for (path, activity) in &by_unit {
+            let (_, gate) = expected.iter().find(|(p, _)| p == path).unwrap();
+            assert_eq!(activity, gate, "{path}");
+            compared += 1;
+        }
+        assert_eq!(
+            compared,
+            expected.len() - 1,
+            "stray.rs is in no real unit: {by_unit:?}"
+        );
+        drop(operation);
+
+        // An overlay that re-activates the inactive modules edits their
+        // declaring file, so the stored inactive rows are stale for the whole
+        // unit: the gate must not drop the callers of those files.
+        let edited = "mod normal;\nmod win;\n#[cfg(placement_reader_build_script)] mod undecided;\nmod dup;\n#[cfg(placement_reader_build_script)] #[path = \"dup_alt.rs\"] mod dup;\n#[cfg(placement_reader_build_script)] mod inl { mod inl_child; }\nmod gone;\n";
+        let (state, _) = parsed_operation_source_state(
+            fixture._project_root.path(),
+            RUST_ROOT_CONSUMER_PATH,
+            edited,
+            &RustAdapter::for_tests(),
+        );
+        let content = fixture.publish_counterfactual_content(
+            RUST_ROOT_CONSUMER_PATH,
+            edited,
+            &state,
+            &cancellation,
+        );
+        let masks = [SelectedResolutionOverlayMask::replacement(
+            "rust",
+            RUST_ROOT_CONSUMER_PATH,
+        )];
+        let overlaid = fixture.open_content_selected(&masks, vec![content], &cancellation);
+        let conn = overlaid.ready.inventory.connection();
+        let blobs = expected.map(|(path, _)| {
+            conn.query_row(
+                "SELECT blob_id FROM selected_resolution_mounts WHERE persisted_relative_path=?1",
+                [path],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+        });
+        assert_eq!(
+            overlaid
+                .rust_blob_placement_activity(&blobs)
+                .unwrap()
+                .iter()
+                .map(|(_, activity)| *activity)
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|(_, activity)| if *activity == Inactive {
+                    Unknown
+                } else {
+                    *activity
+                })
+                .collect::<Vec<_>>(),
+            "{:?}",
+            expected.map(|(path, _)| path)
+        );
+    }
+
+    /// A file inactive in one target and a duplicate-placement candidate in
+    /// another has no proved inactivity: the other target's placement is
+    /// unresolved, so its callers must be kept. The producer stores each
+    /// duplicate candidate as an inactive placement of activation -1, which is
+    /// what keeps the verdict unknown.
+    #[test]
+    pub(crate) fn a_duplicate_placement_in_another_target_keeps_the_gate_unknown() {
+        use brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_crate_access::RustBlobActivity::{
+            Inactive, Unknown,
+        };
+
+        let mut fixture = RustRootResolutionOperationFixture::new();
+        let manifest = RustSelectedManifestMount::from_source(
+            "app/Cargo.toml",
+            "[package]\nname='app'\nversion='0.1.0'\nedition='2021'\n[[bin]]\nname='twice'\npath='src/twice.rs'\n",
+        )
+        .unwrap();
+        ProjectFile::new(fixture._project_root.path(), "app/Cargo.toml")
+            .write(std::str::from_utf8(manifest.source_bytes()).unwrap())
+            .unwrap();
+        fixture.selected_manifests = vec![manifest, fixture.selected_manifests[1].clone()].into();
+        fixture.replace_persisted_consumer_and_sources(
+            "#[cfg(any())] mod once;\n",
+            &[
+                ("app/src/once.rs", "pub fn once() {}\n"),
+                (
+                    "app/src/twice.rs",
+                    "mod once;\n#[path = \"once.rs\"]\nmod once;\n",
+                ),
+            ],
+        );
+        let cancellation = CancellationToken::new();
+        let operation = fixture.open_ready(&cancellation);
+        let conn = operation.ready.inventory.connection();
+        let kinds: Vec<(String, String)> = conn
+            .prepare(
+                "SELECT context.target_kind, gap.gap_kind
+                 FROM selected_rust_unit_summaries AS unit
+                 JOIN rust_resolution_unit_summary_contexts AS context USING(summary_id)
+                 JOIN rust_resolution_unit_summary_gaps AS gap USING(summary_id)
+                 WHERE context.target_kind<>'detached' ORDER BY 1,2",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            kinds.contains(&("bin".to_owned(), "duplicate_placement".to_owned()))
+                && kinds.contains(&("lib".to_owned(), "inactive_placement".to_owned())),
+            "{kinds:?}"
+        );
+        let blob = conn
+            .query_row(
+                "SELECT blob_id FROM selected_resolution_mounts WHERE persisted_relative_path='app/src/once.rs'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        let verdict = operation.rust_blob_placement_activity(&[blob]).unwrap()[0].1;
+        assert_ne!(
+            verdict, Inactive,
+            "the bin target's duplicate is unresolved"
+        );
+        assert_eq!(verdict, Unknown);
     }
 
     #[doc(hidden)]

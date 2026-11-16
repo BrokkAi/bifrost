@@ -190,6 +190,7 @@ use git2::Oid;
 pub(crate) use go_package_context::GoContextHeadStatus;
 pub(crate) use go_package_context::GoContextIdentity;
 
+#[cfg(test)]
 use growable_bloom_filter::GrowableBloom;
 
 #[doc(hidden)]
@@ -266,7 +267,7 @@ pub use workspace_inputs::WorkspaceConfigurationInput;
 pub use workspace_inputs::WorkspaceSourceRefusalRow;
 
 #[doc(hidden)]
-pub use workspace_inputs::configuration_digest;
+pub use workspace_inputs::{bind_acquired_configuration_digest, configuration_digest};
 
 use writer::StoreWriter;
 
@@ -297,15 +298,19 @@ pub mod query;
 mod read_keys;
 #[doc(hidden)]
 pub mod relational_query;
+mod rust_acquired_cargo_config;
 #[doc(hidden)]
 pub mod rust_macro_source_sql;
 
 pub mod rust_copy_absence;
 #[doc(hidden)]
 pub mod rust_crates;
+pub mod rust_drop_inventory;
+mod rust_feature_projections;
 #[doc(hidden)]
 pub mod rust_impl_children;
 pub mod rust_inventory;
+pub mod rust_macro_invocations;
 
 #[doc(hidden)]
 pub mod selected_definition;
@@ -338,6 +343,7 @@ pub mod python_member_rows;
 pub mod python_unit_summaries;
 #[doc(hidden)]
 pub mod rust_unit_summaries;
+pub mod surface_relations;
 #[doc(hidden)]
 pub mod unit_schedule;
 #[doc(hidden)]
@@ -372,6 +378,7 @@ pub mod resolution_stage;
 pub mod resolution_typed;
 pub(crate) mod row_batch;
 mod schema_lease;
+pub mod selected_read;
 pub(crate) mod selected_read_memo;
 #[doc(hidden)]
 pub mod semantic_ir;
@@ -381,8 +388,6 @@ pub mod test_adapters;
 #[doc(hidden)]
 pub mod workspace_inputs;
 
-#[cfg(any(test, feature = "test-support"))]
-mod nested_lend;
 #[doc(hidden)]
 pub mod sealed_families;
 pub mod writer;
@@ -448,8 +453,10 @@ pub enum StoreErrorKind {
     Cancelled,
     ResourceBound,
     Corrupt,
-    #[cfg(any(test, feature = "test-support"))]
-    SelectedLendSnapshotMismatch,
+    /// The stored read vocabulary is newer than this reader understands.
+    UnsupportedReadKey,
+    /// The store is construction material and cannot publish yet.
+    UnmintedPublication,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -461,7 +468,20 @@ pub struct StoreError {
     pub missing_required_source_facts: bool,
 }
 
+impl brokk_bifrost_core::retention_budget::RetainedBytes for StoreError {
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + brokk_bifrost_core::allocation_size::allocation_size(self.message.capacity())
+    }
+}
+
 impl StoreError {
+    /// Owned message allocation, excluding the inline error value.
+    #[doc(hidden)]
+    pub fn retained_message_capacity(&self) -> usize {
+        self.message.capacity()
+    }
+
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
@@ -528,6 +548,19 @@ impl StoreError {
         }
     }
 
+    #[doc(hidden)]
+    pub fn unsupported_read_key(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: StoreErrorKind::UnsupportedReadKey,
+            missing_required_source_facts: false,
+        }
+    }
+
+    pub fn is_unsupported_read_key(&self) -> bool {
+        self.kind == StoreErrorKind::UnsupportedReadKey
+    }
+
     pub fn kind(&self) -> StoreErrorKind {
         self.kind
     }
@@ -580,6 +613,25 @@ impl std::error::Error for StoreError {}
 impl From<std::io::Error> for StoreError {
     fn from(err: std::io::Error) -> Self {
         Self::new(format!("analyzer store I/O error: {err}"))
+    }
+}
+
+impl From<brokk_bifrost_core::cache_db::publication_lineage::PublicationLineageError>
+    for StoreError
+{
+    fn from(
+        error: brokk_bifrost_core::cache_db::publication_lineage::PublicationLineageError,
+    ) -> Self {
+        use brokk_bifrost_core::cache_db::publication_lineage::PublicationLineageError;
+        match error {
+            PublicationLineageError::Unminted => Self {
+                message: "store publication lineage is not minted".to_owned(),
+                kind: StoreErrorKind::UnmintedPublication,
+                missing_required_source_facts: false,
+            },
+            PublicationLineageError::Sqlite(error) => error.into(),
+            error => Self::corrupt(error.to_string()),
+        }
     }
 }
 
@@ -667,7 +719,7 @@ pub struct WorkspaceSnapshotId {
 
 /// Defined beside the listing-name predicate in `bifrost-rust`, so that the
 /// two change together.
-pub use brokk_bifrost_rust::cargo_routes::RUST_SOURCE_LISTING_DERIVATION_VERSION;
+pub use brokk_bifrost_rust::cargo_routes::rust_source_listing_derivation_identity;
 
 #[doc(hidden)]
 pub type WorkspaceSnapshots = HashMap<String, WorkspaceSnapshotId>;
@@ -783,12 +835,17 @@ pub const REVISIONED_WORKSPACE_VIEWS_SQL: &str = include_str!("revisioned_worksp
 /// `rust_selected_units_fill.sql` carries this token where its one
 /// derivation-version predicate stands. The fill runs as a multi-statement
 /// batch and `execute_batch` binds no parameters, so the token is rendered from
-/// [`rust_unit_summaries::RUST_UNIT_SUMMARY_DERIVATION_VERSION`]; prepared
+/// [`rust_unit_summaries::rust_unit_summary_derivation_identity()`]; prepared
 /// readers bind the same constant as a parameter instead.
 static RUST_SELECTED_UNITS_FILL_SQL: LazyLock<String> = LazyLock::new(|| {
     include_str!("rust_selected_units_fill.sql").replace(
-        ":rust_unit_summary_derivation_version",
-        &rust_unit_summaries::RUST_UNIT_SUMMARY_DERIVATION_VERSION.to_string(),
+        ":rust_unit_summary_derivation_identity",
+        &format!(
+            "x'{}'",
+            brokk_bifrost_core::analyzer::canonical_hash::lower_hex_string(
+                &rust_unit_summaries::rust_unit_summary_derivation_identity()
+            )
+        ),
     )
 });
 
@@ -830,6 +887,9 @@ DELETE FROM temp.selected_resolution_stage_producers;
 DELETE FROM temp.selected_resolution_stage_nodes;
 DELETE FROM temp.selected_resolution_admissions;
 DELETE FROM temp.selected_resolution_scope_mounts;
+DELETE FROM temp.selected_rust_unplaced_placements;
+DELETE FROM temp.selected_rust_added_edges;
+DELETE FROM temp.selected_rust_overlay_gaps;
 DELETE FROM temp.selected_rust_transient_placement_attributes;
 DELETE FROM temp.selected_resolution_transient_placements;
 DELETE FROM temp.selected_resolution_mounts;
@@ -882,6 +942,40 @@ pub fn clear_selected_rust_units_for_test(conn: &Connection) -> Result<()> {
         None,
         false,
     )
+}
+
+/// Test support for the minimal membership-only relational fixture.
+#[doc(hidden)]
+pub fn insert_selected_rust_summary_id_for_test(
+    conn: &Connection,
+    summary_id: i64,
+) -> Result<usize> {
+    Ok(conn
+        .prepare_cached("INSERT INTO temp.selected_rust_unit_summaries(summary_id) VALUES(?1)")?
+        .execute([summary_id])?)
+}
+
+/// Test support: remove the selected rows of one topology, as if that unit had left the
+/// selected set. Lives here so selected-summary writes stay in the owner module.
+#[doc(hidden)]
+pub fn drop_selected_rust_unit_for_test(conn: &Connection, topology_id: i64) -> Result<usize> {
+    Ok(conn.execute(
+        "DELETE FROM temp.selected_rust_unit_summaries WHERE topology_id=?1",
+        [topology_id],
+    )?)
+}
+
+/// Test support: advance the selected-summary generation without changing a
+/// row. The `AFTER UPDATE` trigger performs the bump; the write lives here so
+/// selected-summary writes stay in the owner module.
+#[doc(hidden)]
+pub fn advance_selected_rust_unit_summaries_generation_for_test(
+    conn: &Connection,
+) -> Result<usize> {
+    Ok(conn.execute(
+        "UPDATE temp.selected_rust_unit_summaries SET summary_id=summary_id",
+        [],
+    )?)
 }
 
 #[doc(hidden)]
@@ -1103,12 +1197,6 @@ pub struct AnalyzerStore {
     #[doc(hidden)]
     pub active_readers: ReaderPool,
     streaming_readers: ReaderPool,
-    /// The workspace selection held by the writer connection's temp schema, for
-    /// the test-only single-connection store that reads through it. Only the
-    /// holder of the writer connection's guard ever reads or writes this, and
-    /// it takes both guards together (see [`ReaderConn::Writer`]).
-    #[doc(hidden)]
-    pub writer_selection: Arc<Mutex<Option<AppliedWorkspaceSelection>>>,
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub crate_statement_counter: Mutex<Option<Arc<std::sync::atomic::AtomicUsize>>>,
@@ -1118,7 +1206,6 @@ pub struct AnalyzerStore {
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub unit_tail_blob_reads: std::sync::atomic::AtomicUsize,
-    writer_resolution_selection: Mutex<Option<resolution_selection::RetainedResolutionSelection>>,
     /// All cross-request relation caches share this weighted capacity.
     #[doc(hidden)]
     pub cache_budget: cache_budget::StoreCacheBudget,
@@ -1186,17 +1273,9 @@ pub struct AnalyzerStore {
 /// checkin that only another waiting thread could make (#3798). So `capacity`
 /// bounds the top-level checkouts, and each holder may exceed it by its own
 /// nesting depth. A reader returned while `capacity` readers are idle is closed.
-/// `ReaderGuard` is not `Send` (its writer variant holds a `MutexGuard`), so a
-/// checkout is always returned on the thread that took it.
-///
-/// When `source` is `None` the store has no separate readable file (the
-/// test-only in-memory single-connection store); reads then route back through
-/// the writer connection so correctness is preserved at the cost of read
-/// parallelism. That path takes no permit: it is already serialized by the
-/// writer mutex.
 #[doc(hidden)]
 pub struct ReaderPool {
-    source: Option<PathBuf>,
+    source: PathBuf,
     #[doc(hidden)]
     pub capacity: usize,
     #[doc(hidden)]
@@ -1270,11 +1349,6 @@ fn workspace_selection_stamp(conn: &Connection) -> Result<WorkspaceSelectionStam
 pub struct AppliedWorkspaceSelection {
     snapshots: WorkspaceSnapshots,
     stamp: WorkspaceSelectionStamp,
-    /// The rows that applying selections on this connection has changed,
-    /// summed since the record was last cleared. A lent writer-backed reader
-    /// uses it to tell those writes from any other
-    /// ([`ReaderGuard::reclaim_writer`]).
-    application_changes: u64,
 }
 
 /// A reader connection together with the workspace selection its temp schema
@@ -1313,7 +1387,7 @@ pub struct SelectedReader {
 }
 
 // Reader pool frames move this value repeatedly. Only fixed selection
-// metadata and the SQLite connection may survive here; query preparation
+// metadata, the SQLite connection and its budgeted macro-front region survive here; query preparation
 // and requested mount records belong to the operation that checks it out.
 const _: () = assert!(
     std::mem::size_of::<SelectedReader>() <= 512,
@@ -1342,6 +1416,8 @@ const MAX_RETAINED_RESOLUTION_READERS: usize = 2;
 #[cfg(any(test, feature = "test-support"))]
 static NEXT_POOLED_READER_SERIAL: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
+
+const READER_POOL_WAIT_PHASE: &str = "waiting for an analyzer store pooled reader";
 
 impl ReaderPool {
     /// `capacity` is the host's parallelism, at least 4, with no upper bound,
@@ -1377,7 +1453,7 @@ impl ReaderPool {
     /// readers again. Each cold open runs the view script and compiles its own
     /// statements, so the split turned a one-time cost into a recurring one.
     /// The owner's decision is that retention equals concurrency.
-    fn new(source: Option<PathBuf>) -> Self {
+    fn new(source: PathBuf) -> Self {
         let capacity = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4)
@@ -1401,14 +1477,16 @@ impl ReaderPool {
     /// may have loaded its statistics before the refresh committed, and
     /// discarding a reader that did not need it costs one reopen.
     fn acquire(&self) -> (u64, Option<SelectedReader>) {
-        self.acquire_with(|state| state.idle.len().checked_sub(1))
+        self.acquire_with(None, |state| state.idle.len().checked_sub(1))
+            .expect("uncancellable reader checkout")
     }
 
     fn acquire_for_resolution(
         &self,
         key: &resolution_selection::RetainedResolutionSelectionKey,
-    ) -> (u64, Option<SelectedReader>) {
-        self.acquire_with(|state| {
+        cancellation: Option<&CancellationToken>,
+    ) -> Option<(u64, Option<SelectedReader>)> {
+        self.acquire_with(cancellation, |state| {
             if let Some(index) = state.idle.iter().rposition(|reader| {
                 reader
                     .resolution_selection
@@ -1445,8 +1523,9 @@ impl ReaderPool {
 
     fn acquire_with(
         &self,
+        cancellation: Option<&CancellationToken>,
         choose: impl FnOnce(&ReaderPoolState) -> Option<usize>,
-    ) -> (u64, Option<SelectedReader>) {
+    ) -> Option<(u64, Option<SelectedReader>)> {
         let thread = std::thread::current().id();
         let mut state = self
             .state
@@ -1454,16 +1533,34 @@ impl ReaderPool {
             .expect("analyzer store reader pool poisoned");
         // A nested checkout does not wait: the checkins it would wait for can
         // belong to threads that wait for it in turn (#3798).
+        let mut phase = None;
         while state.holders.len() >= self.capacity && !state.holders.contains(&thread) {
-            state = self
-                .reader_returned
-                .wait(state)
-                .expect("analyzer store reader pool poisoned");
+            state = if let Some(cancellation) = cancellation {
+                if phase.is_none() {
+                    phase = Some(cancellation.enter_phase(READER_POOL_WAIT_PHASE));
+                }
+                if cancellation.is_cancelled() {
+                    return None;
+                }
+                // This interval bounds cancellation notice latency, not a deadline.
+                // Keep waiting until a slot is available or the token is cancelled.
+                self.reader_returned
+                    .wait_timeout(state, std::time::Duration::from_millis(10))
+                    .expect("analyzer store reader pool poisoned")
+                    .0
+            } else {
+                self.reader_returned
+                    .wait(state)
+                    .expect("analyzer store reader pool poisoned")
+            };
+        }
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return None;
         }
         let index = choose(&state);
         state.holders.push(thread);
         let reader = index.map(|index| state.idle.remove(index));
-        (state.statistics_epoch, reader)
+        Some((state.statistics_epoch, reader))
     }
 
     /// Return a reader and the checkout it was held under, unless the store's
@@ -1504,7 +1601,7 @@ impl ReaderPool {
                     .count()
                     > MAX_RETAINED_RESOLUTION_READERS
                 {
-                    // Cleared readers hold at most MAX_RETAINED_RESOLUTION_READERS times the snapshot cap of idle TEMP.
+                    // Cleared readers hold at most MAX_RETAINED_RESOLUTION_READERS times the cleared-reader bound of idle TEMP.
                     // A cleared reader without a selection goes first, so a warm selection
                     // outlives the readers that would have closed before #10225.
                     let index = state
@@ -1580,8 +1677,7 @@ impl ReaderPool {
     }
 }
 
-/// RAII handle to a checked-out reader (or the writer, in the test-only
-/// single-connection path).
+/// RAII handle to a checked-out pooled reader.
 /// Derefs to `Connection` so existing read methods — `conn.transaction()`,
 /// helper calls taking `&Connection` — work unchanged. On drop, a pooled reader
 /// is returned to its pool.
@@ -1596,7 +1692,8 @@ pub struct ReaderGuard<'a> {
     checkin: CheckinPlan,
     /// Scoped connection settings to put back at check-in. They are restored
     /// whatever the plan decides, so they are not part of it.
-    query_planner_stability_on_checkin: Option<bool>,
+    // Pool permits are charged to the checkout thread.
+    _checkout_thread: std::marker::PhantomData<*mut ()>,
     restore_reader_mmap_on_checkin: bool,
 }
 
@@ -1629,12 +1726,9 @@ enum CheckinOutcome {
     Close,
 }
 
-/// A read transaction that reuses an already selected transaction when the
-/// connection is lent to a nested store read.
+/// An owned read transaction.
 pub enum ReadTransaction<'a> {
     Owned(rusqlite::Transaction<'a>),
-    #[cfg(any(test, feature = "test-support"))]
-    Nested(&'a Connection),
 }
 
 impl std::ops::Deref for ReadTransaction<'_> {
@@ -1643,8 +1737,6 @@ impl std::ops::Deref for ReadTransaction<'_> {
     fn deref(&self) -> &Connection {
         match self {
             Self::Owned(tx) => tx,
-            #[cfg(any(test, feature = "test-support"))]
-            Self::Nested(conn) => conn,
         }
     }
 }
@@ -1653,8 +1745,6 @@ impl ReadTransaction<'_> {
     pub fn commit(self) -> rusqlite::Result<()> {
         match self {
             Self::Owned(tx) => tx.commit(),
-            #[cfg(any(test, feature = "test-support"))]
-            Self::Nested(_) => Ok(()),
         }
     }
 }
@@ -1666,87 +1756,6 @@ enum ReaderConn<'a> {
         pool: &'a ReaderPool,
         reader: Option<SelectedReader>,
     },
-    /// The test-only in-memory single-connection store reads through the
-    /// writer, whose temp schema is shared with every other user of that
-    /// connection. Its selection therefore lives beside the connection mutex
-    /// rather than in a pool entry, and is held for as long as the connection
-    /// guard is.
-    Writer {
-        store: &'a AnalyzerStore,
-        conn: std::sync::MutexGuard<'a, Connection>,
-        selection: std::sync::MutexGuard<'a, Option<AppliedWorkspaceSelection>>,
-        resolution_selection:
-            std::sync::MutexGuard<'a, Option<resolution_selection::RetainedResolutionSelection>>,
-        // Another writer checkout on this thread would wait for this one.
-        _exclusive: writer::RetainedExclusiveReader,
-    },
-    /// A read-only borrow of the selected operation's connection. Its scope
-    /// counts every guard and asserts that all guards return before it exits.
-    #[cfg(any(test, feature = "test-support"))]
-    NestedReader {
-        connection: *const Connection,
-        writer: usize,
-        _thread: std::marker::PhantomData<std::rc::Rc<()>>,
-    },
-    /// A writer-backed reader whose owner lent the connection to other store
-    /// users ([`ReaderGuard::lend_writer`]). It holds no lock, so nothing may
-    /// read through it until [`ReaderGuard::reclaim_writer`].
-    LentWriter {
-        store: &'a AnalyzerStore,
-        witness: LentWriterWitness,
-    },
-}
-
-/// Every way another user of the writer connection can change what a lent
-/// reader left there: rows in either database (SQLite does not move
-/// `data_version` for the connection's own commits) and either schema, with
-/// the share of the rows that ordinary selection applications changed.
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct LentWriterWitness {
-    total_changes: u64,
-    stamp: WorkspaceSelectionStamp,
-    application_changes: Option<u64>,
-}
-
-impl LentWriterWitness {
-    fn read(conn: &Connection, selection: Option<&AppliedWorkspaceSelection>) -> Result<Self> {
-        Ok(Self {
-            total_changes: conn.total_changes(),
-            stamp: workspace_selection_stamp(conn)?,
-            application_changes: selection.map(|selection| selection.application_changes),
-        })
-    }
-
-    /// Whether ordinary selection applications made every row change since
-    /// `lent`, with no schema or data-version change. They write only the
-    /// revision rows and the Rust unit rows filled from them.
-    fn only_selection_applications_since(&self, lent: &Self) -> bool {
-        let applied = self
-            .application_changes
-            .zip(lent.application_changes)
-            .and_then(|(now, then)| now.checked_sub(then));
-        self.stamp == lent.stamp && applied == Some(self.total_changes - lent.total_changes)
-    }
-}
-
-/// What a lent writer-backed reader found when it took the connection back.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::analyzer::store) enum WriterReclaim {
-    /// No other user changed the connection while it was lent.
-    Unchanged,
-    /// Other users only applied ordinary workspace selections, which share
-    /// the lent selection's revision rows. Those rows hold its snapshots
-    /// again; `changes` counts every row changed since the lend, theirs and
-    /// the restoration's.
-    Restored { changes: u64 },
-    /// Another user wrote other rows or schema on the connection meanwhile.
-    Changed,
-    /// The caller's cancellation stopped the wait; the reader is still lent.
-    Cancelled,
-}
-
-fn lent_writer_used() -> ! {
-    panic!("a lent writer-backed reader was used before its owner reclaimed the connection")
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1768,9 +1777,6 @@ impl<'a> ReaderGuard<'a> {
                 .expect("reader guard already returned")
                 .macro_frontier
                 .take(),
-            ReaderConn::Writer { .. } | ReaderConn::LentWriter { .. } => None,
-            #[cfg(any(test, feature = "test-support"))]
-            ReaderConn::NestedReader { .. } => None,
         }
     }
 
@@ -1778,9 +1784,7 @@ impl<'a> ReaderGuard<'a> {
         &mut self,
         frontier: Box<resolution_operation::RetainedMacroFrontier>,
     ) {
-        let ReaderConn::Pooled { reader, .. } = &mut self.inner else {
-            panic!("macro frontier retention requires a pooled reader");
-        };
+        let ReaderConn::Pooled { reader, .. } = &mut self.inner;
         assert!(
             reader
                 .as_mut()
@@ -1788,102 +1792,8 @@ impl<'a> ReaderGuard<'a> {
                 .macro_frontier
                 .replace(frontier)
                 .is_none(),
-            "one macro frontier per pooled reader"
+            "one macro-front region per pooled reader"
         );
-    }
-
-    pub(in crate::analyzer::store) fn is_pooled(&self) -> bool {
-        matches!(self.inner, ReaderConn::Pooled { .. })
-    }
-
-    /// Whether another store checkout on this thread would reacquire our mutex.
-    #[doc(hidden)]
-    pub fn excludes_store_access(&self) -> bool {
-        matches!(self.inner, ReaderConn::Writer { .. })
-    }
-
-    pub(in crate::analyzer::store) fn is_lent_writer(&self) -> bool {
-        matches!(self.inner, ReaderConn::LentWriter { .. })
-    }
-
-    /// Release a writer-backed reader's locks, so that other store users,
-    /// including this thread, can use the connection until
-    /// [`Self::reclaim_writer`] takes it back.
-    ///
-    /// The temp schema stays on the connection. `installed` names the
-    /// workspace selection its revision rows hold, so that an ordinary read of
-    /// the same snapshots reuses them instead of rewriting them; `None`
-    /// records that the rows are no longer known.
-    pub(in crate::analyzer::store) fn lend_writer(
-        &mut self,
-        installed: Option<&WorkspaceSnapshots>,
-    ) -> Result<()> {
-        let ReaderConn::Writer {
-            store,
-            conn,
-            selection,
-            ..
-        } = &mut self.inner
-        else {
-            panic!("only a held writer-backed reader can lend its connection")
-        };
-        assert!(
-            conn.is_autocommit(),
-            "a writer-backed reader is lent only between transactions"
-        );
-        let stamp = workspace_selection_stamp(conn)?;
-        let application_changes = selection
-            .as_ref()
-            .map_or(0, |selection| selection.application_changes);
-        **selection = installed.map(|snapshots| AppliedWorkspaceSelection {
-            snapshots: snapshots.clone(),
-            stamp,
-            application_changes,
-        });
-        let witness = LentWriterWitness::read(conn, selection.as_ref())?;
-        let store = *store;
-        // Dropping the held variant releases the connection and both
-        // selection mutexes.
-        self.inner = ReaderConn::LentWriter { store, witness };
-        Ok(())
-    }
-
-    /// Take back a connection lent by [`Self::lend_writer`]. With a
-    /// cancellation the wait for the connection observes it.
-    ///
-    /// When ordinary selection applications were the only writers meanwhile,
-    /// the revision rows are restored to `installed`, the snapshots the
-    /// lender staged. Every other row the lender staged is then as it left
-    /// it. Without `installed` any change is reported as such.
-    pub(in crate::analyzer::store) fn reclaim_writer(
-        &mut self,
-        cancellation: Option<&CancellationToken>,
-        installed: Option<&WorkspaceSnapshots>,
-    ) -> Result<WriterReclaim> {
-        let ReaderConn::LentWriter { store, witness } = self.inner else {
-            panic!("only a lent writer-backed reader can be reclaimed")
-        };
-        let conn = match cancellation {
-            Some(cancellation) => match store.conn.lock_cancellable(cancellation) {
-                Some(conn) => conn,
-                None => return Ok(WriterReclaim::Cancelled),
-            },
-            None => store.conn.lock().expect("analyzer store mutex poisoned"),
-        };
-        self.inner = store.writer_reader_conn(conn);
-        let (conn, selection) = self.connection_and_selection();
-        let now = LentWriterWitness::read(conn, selection.as_ref())?;
-        if now == witness {
-            return Ok(WriterReclaim::Unchanged);
-        }
-        let Some(installed) = installed.filter(|_| now.only_selection_applications_since(&witness))
-        else {
-            return Ok(WriterReclaim::Changed);
-        };
-        store.apply_workspace_selection(conn, selection, installed)?;
-        Ok(WriterReclaim::Restored {
-            changes: conn.total_changes() - witness.total_changes,
-        })
     }
 
     /// This connection and the selection its temp schema holds, borrowed
@@ -1897,12 +1807,6 @@ impl<'a> ReaderGuard<'a> {
                 let reader = reader.as_mut().expect("reader guard already returned");
                 (&reader.conn, &mut reader.selection)
             }
-            ReaderConn::Writer {
-                conn, selection, ..
-            } => (conn, selection),
-            ReaderConn::LentWriter { .. } => lent_writer_used(),
-            #[cfg(any(test, feature = "test-support"))]
-            ReaderConn::NestedReader { .. } => lent_writer_used(),
         }
     }
 }
@@ -1915,12 +1819,6 @@ impl std::ops::Deref for ReaderGuard<'_> {
             ReaderConn::Pooled { reader, .. } => {
                 &reader.as_ref().expect("reader guard already returned").conn
             }
-            ReaderConn::Writer { conn, .. } => conn,
-            ReaderConn::LentWriter { .. } => lent_writer_used(),
-            // The scope holds the original connection and asserts that every
-            // nested guard has returned before that connection can be released.
-            #[cfg(any(test, feature = "test-support"))]
-            ReaderConn::NestedReader { connection, .. } => unsafe { &**connection },
         }
     }
 }
@@ -1931,12 +1829,6 @@ impl std::ops::DerefMut for ReaderGuard<'_> {
             ReaderConn::Pooled { reader, .. } => {
                 &mut reader.as_mut().expect("reader guard already returned").conn
             }
-            ReaderConn::Writer { conn, .. } => conn,
-            ReaderConn::LentWriter { .. } => lent_writer_used(),
-            #[cfg(any(test, feature = "test-support"))]
-            ReaderConn::NestedReader { .. } => panic!(
-                "nested transactional read under a selected-operation lend: mutable connection access"
-            ),
         }
     }
 }
@@ -1952,7 +1844,6 @@ impl ReaderGuard<'_> {
                     .expect("reader guard already returned")
                     .serial,
             ),
-            _ => None,
         }
     }
 
@@ -1968,15 +1859,10 @@ impl ReaderGuard<'_> {
                 .iter()
                 .map(|reader| reader.serial)
                 .collect(),
-            _ => Vec::new(),
         }
     }
 
     pub fn transaction(&mut self) -> rusqlite::Result<ReadTransaction<'_>> {
-        #[cfg(any(test, feature = "test-support"))]
-        if matches!(&self.inner, ReaderConn::NestedReader { .. }) {
-            return Ok(ReadTransaction::Nested(&*self));
-        }
         Ok(ReadTransaction::Owned(
             std::ops::DerefMut::deref_mut(self).transaction()?,
         ))
@@ -2002,13 +1888,6 @@ impl ReaderGuard<'_> {
                 .expect("reader guard already returned")
                 .resolution_selection
                 .take(),
-            ReaderConn::Writer {
-                resolution_selection,
-                ..
-            } => resolution_selection.take(),
-            ReaderConn::LentWriter { .. } => lent_writer_used(),
-            #[cfg(any(test, feature = "test-support"))]
-            ReaderConn::NestedReader { .. } => lent_writer_used(),
         }
     }
 
@@ -2024,13 +1903,6 @@ impl ReaderGuard<'_> {
                     .expect("reader guard already returned")
                     .resolution_selection
             }
-            ReaderConn::Writer {
-                resolution_selection,
-                ..
-            } => &mut **resolution_selection,
-            ReaderConn::LentWriter { .. } => lent_writer_used(),
-            #[cfg(any(test, feature = "test-support"))]
-            ReaderConn::NestedReader { .. } => lent_writer_used(),
         };
         assert!(
             slot.replace(retained).is_none(),
@@ -2054,25 +1926,6 @@ impl ReaderGuard<'_> {
         }
     }
 
-    /// Keep parameter changes from recompiling the selected reader's indexed
-    /// queries. Restore the borrowed connection's setting before releasing it.
-    pub(super) fn stabilize_query_plans(&mut self) -> Result<()> {
-        use rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_QPSG;
-
-        assert!(
-            self.query_planner_stability_on_checkin.is_none(),
-            "reader query planner stability may be scoped only once"
-        );
-        let previous = self.db_config(SQLITE_DBCONFIG_ENABLE_QPSG)?;
-        let enabled = self.set_db_config(SQLITE_DBCONFIG_ENABLE_QPSG, true)?;
-        assert!(
-            enabled,
-            "SQLite must enable the requested planner stability"
-        );
-        self.query_planner_stability_on_checkin = Some(previous);
-        Ok(())
-    }
-
     /// Keep plans valid between checkouts of an unchanged retained selection.
     /// Only pooled resolution readers retain this policy; a shared writer
     /// still restores its borrowed setting when the guard leaves scope.
@@ -2092,10 +1945,6 @@ impl ReaderGuard<'_> {
                 }
                 Ok(())
             }
-            ReaderConn::Writer { .. } => self.stabilize_query_plans(),
-            ReaderConn::LentWriter { .. } => lent_writer_used(),
-            #[cfg(any(test, feature = "test-support"))]
-            ReaderConn::NestedReader { .. } => lent_writer_used(),
         }
     }
 
@@ -2108,10 +1957,6 @@ impl ReaderGuard<'_> {
                 .expect("reader guard already returned")
                 .query_planner_stability_before_resolution
                 .take(),
-            ReaderConn::Writer { .. } => None,
-            ReaderConn::LentWriter { .. } => lent_writer_used(),
-            #[cfg(any(test, feature = "test-support"))]
-            ReaderConn::NestedReader { .. } => lent_writer_used(),
         };
         if let Some(previous) = previous {
             match self.set_db_config(SQLITE_DBCONFIG_ENABLE_QPSG, previous) {
@@ -2147,8 +1992,6 @@ impl ReaderGuard<'_> {
     }
 
     /// Borrow the larger build-only map without changing the pool's policy.
-    /// The test-only single-connection store is in-memory and has no file to
-    /// map.
     pub(crate) fn use_derivation_mmap(&mut self) -> Result<()> {
         if matches!(&self.inner, ReaderConn::Pooled { .. }) {
             assert!(
@@ -2185,8 +2028,6 @@ impl ReaderGuard<'_> {
     }
 
     /// Check a cleared reader's TEMP baseline before it goes back to the pool.
-    /// Only a pooled reader serves another request afterwards; a writer-backed
-    /// reader stays with its store, so there is no pooling decision to make.
     pub(crate) fn verify_selection_clear_on_checkin(
         &mut self,
         selection: resolution_selection::RetainedResolutionSelection,
@@ -2206,10 +2047,6 @@ impl ReaderGuard<'_> {
                 .expect("reader guard already returned")
                 .conn
                 .execute_batch(sql),
-            ReaderConn::Writer { conn, .. } => conn.execute_batch(sql),
-            ReaderConn::LentWriter { .. } => lent_writer_used(),
-            #[cfg(any(test, feature = "test-support"))]
-            ReaderConn::NestedReader { .. } => lent_writer_used(),
         }
     }
 }
@@ -2233,17 +2070,6 @@ pub fn take_pooled_reader_closes_for_test() -> usize {
 
 impl Drop for ReaderGuard<'_> {
     fn drop(&mut self) {
-        #[cfg(any(test, feature = "test-support"))]
-        if let ReaderConn::NestedReader { writer, .. } = &self.inner {
-            nested_lend::release(*writer);
-            return;
-        }
-        // The owner reclaims a lent connection first: its cleanup, the
-        // planner restoration and the checks below need the connection held.
-        assert!(
-            !self.is_lent_writer(),
-            "a lent writer-backed reader must be reclaimed before it is dropped"
-        );
         // Checkin maintenance does not read the derivation's inputs.
         let _cleanup = brokk_bifrost_core::attribution::capture_frame_active()
             .then(brokk_bifrost_core::attribution::classifier_statements);
@@ -2267,12 +2093,6 @@ impl Drop for ReaderGuard<'_> {
                 if let Err(error) = self.run_checkin_cleanup(sql) {
                     cleanup_errors.push(("TEMP cleanup", error));
                     CheckinOutcome::Close
-                } else if let Err(error) = resolution_operation::discard_macro_stage_snapshot(self)
-                {
-                    eprintln!(
-                        "analyzer store discarded pooled reader after macro shadow cleanup failed: {error}"
-                    );
-                    CheckinOutcome::Close
                 } else if schema.is_ok_and(|schema| {
                     selection
                         .cleared_reader_is_at_baseline(self, changes, schema)
@@ -2291,17 +2111,6 @@ impl Drop for ReaderGuard<'_> {
         {
             cleanup_errors.push(("reader mmap restoration", error));
         }
-        if let Some(previous) = self.query_planner_stability_on_checkin.take() {
-            use rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_QPSG;
-
-            match self.set_db_config(SQLITE_DBCONFIG_ENABLE_QPSG, previous) {
-                Ok(restored) => assert_eq!(
-                    restored, previous,
-                    "SQLite must restore the borrowed query planner setting"
-                ),
-                Err(error) => cleanup_errors.push(("query planner restoration", error)),
-            }
-        }
         match &mut self.inner {
             ReaderConn::Pooled { pool, reader } => {
                 let mut reader = reader.take().expect("reader guard already returned");
@@ -2317,9 +2126,7 @@ impl Drop for ReaderGuard<'_> {
                 }
                 let pool_reader = match outcome {
                     CheckinOutcome::Close => false,
-                    // A cleared reader does not keep the frontier whose TEMP
-                    // shadow its cleanup removed.
-                    CheckinOutcome::PoolCleared { .. } => reader.macro_frontier.is_none(),
+                    CheckinOutcome::PoolCleared { .. } => true,
                     CheckinOutcome::Pool => {
                         reader.macro_frontier.is_none()
                             || resolution_operation::macro_temp_within_cap(&reader.conn)
@@ -2342,29 +2149,6 @@ impl Drop for ReaderGuard<'_> {
                 }
                 pool.checkin(reader);
             }
-            ReaderConn::Writer {
-                selection,
-                resolution_selection,
-                ..
-            } => {
-                if matches!(outcome, CheckinOutcome::PoolCleared { .. }) {
-                    if let Some(selection) = selection.as_mut() {
-                        selection.snapshots.clear();
-                    }
-                    **resolution_selection = None;
-                }
-                assert!(
-                    cleanup_errors.is_empty(),
-                    "analyzer store cleanup failed on the writer-backed reader: {cleanup_errors:?}"
-                );
-                assert!(
-                    !matches!(outcome, CheckinOutcome::Close),
-                    "analyzer store writer-backed reader left TEMP state unverified"
-                );
-            }
-            ReaderConn::LentWriter { .. } => lent_writer_used(),
-            #[cfg(any(test, feature = "test-support"))]
-            ReaderConn::NestedReader { .. } => lent_writer_used(),
         }
     }
 }
@@ -3320,6 +3104,7 @@ pub fn ensure_revisioned_workspace_views(conn: &Connection) -> Result<()> {
         .is_some();
     if !configured {
         conn.execute_batch(REVISIONED_WORKSPACE_VIEWS_SQL)?;
+        surface_relations::create_summary_translation_views(conn)?;
     }
     Ok(())
 }
@@ -3397,16 +3182,19 @@ pub enum DefinitionInventoryState {
 const STALE_BLOB_DELETE_SQL: &str = "DELETE FROM blobs
  WHERE blob_oid = ?1 AND lang = ?2 AND parse_variant = ?4 AND generation <> ?3
  RETURNING generation";
-const UNROOTED_BLOB_GC_DELETE_SQL: &str = "DELETE FROM blobs
- WHERE blob_oid = ?1 AND lang = ?2 AND parse_variant = ?3
-   AND generation = COALESCE(
-     (SELECT generation FROM analysis_epochs WHERE lang = ?2), 0
-   )
-   AND NOT EXISTS (
-     SELECT 1 FROM workspace_resolution_content_roots AS roots
-     WHERE roots.blob_id = blobs.id
-   )
- RETURNING generation";
+
+// Ephemeral fixtures have no file path for force_gc. Delegate their connection
+// to the same core candidate deletion and root phases, with no store SQL copy.
+#[cfg(any(test, feature = "test-support"))]
+pub fn collect_ephemeral_candidates_for_test(
+    store: &AnalyzerStore,
+    keep: impl Fn(&str) -> bool + Send + 'static,
+) -> Result<usize> {
+    store.conn.execute_fixture(move |conn| {
+        brokk_bifrost_core::cache_gc::collect_candidates_for_test(conn, keep)
+            .map_err(StoreError::new)
+    })
+}
 
 /// Writer 1: the owner publication promotes the one file version it just
 /// published when its blob is already ready.
@@ -3805,12 +3593,44 @@ CROSS JOIN rust_resolution_unit_summary_versions AS rust_versions
  AND rust_versions.valid_from = versions.valid_from AND rust_versions.summary_id = versions.summary_id
 CROSS JOIN resolution_unit_summary_members AS members
   ON members.summary_id = endpoints.summary_id AND members.member_ordinal = endpoints.member_ordinal
+/* Rust-only derived-from blob until #11183 M3 converts Rust child rows */
 CROSS JOIN blobs ON blobs.id = members.blob_id
 WHERE endpoints.endpoint_role = 'trait' AND endpoints.endpoint_state = 'unresolved'
   AND endpoints.unresolved_spelling = ?1
   AND summaries.lang = 'rust' AND summaries.unit_kind = 'rust_crate'
   AND summaries.publication_state = 'complete'
-  AND summaries.derivation_version = ?2";
+  AND summaries.derivation_identity = ?2
+UNION
+/* A trait impl whose subject has no nominal path persists a structural row
+   (#12956). It has no summary endpoint, so it is found by the written trait
+   spelling in the per-file relation rows of a live member blob. */
+SELECT DISTINCT blobs.blob_oid, members.rel_path, NULL
+FROM resolution_rust_structural_trait_impls AS structural
+     INDEXED BY resolution_rust_structural_trait_impls_spelling
+CROSS JOIN resolution_unit_summary_members AS members
+     INDEXED BY resolution_unit_summary_members_blob
+  ON members.blob_id = structural.blob_id
+CROSS JOIN resolution_unit_summaries AS summaries
+  ON summaries.summary_id = members.summary_id
+CROSS JOIN resolution_unit_summary_versions AS versions
+     INDEXED BY resolution_unit_summary_versions_summary
+  ON versions.summary_id = summaries.summary_id
+CROSS JOIN workspace_heads AS heads
+  ON heads.workspace_id = versions.workspace_id AND heads.lang = versions.lang
+ AND heads.generation = versions.generation
+ AND versions.valid_from <= heads.revision
+ AND (versions.valid_until IS NULL OR heads.revision < versions.valid_until)
+CROSS JOIN resolution_producer_epochs AS epochs
+  ON epochs.lang = versions.lang AND epochs.producer_epoch = summaries.producer_epoch
+CROSS JOIN rust_resolution_unit_summary_versions AS rust_versions
+  ON rust_versions.workspace_id = versions.workspace_id AND rust_versions.lang = versions.lang
+ AND rust_versions.generation = versions.generation AND rust_versions.unit_key = versions.unit_key
+ AND rust_versions.valid_from = versions.valid_from AND rust_versions.summary_id = versions.summary_id
+CROSS JOIN blobs ON blobs.id = members.blob_id
+WHERE structural.trait_terminal_spelling = ?1
+  AND summaries.lang = 'rust' AND summaries.unit_kind = 'rust_crate'
+  AND summaries.publication_state = 'complete'
+  AND summaries.derivation_identity = ?2";
 
 impl AnalyzerStore {
     #[doc(hidden)]
@@ -4228,7 +4048,7 @@ impl AnalyzerStore {
         foreign_source_paths: &[String],
         refusals: &[WorkspaceSourceRefusalRow],
         inventories: &[WorkspaceFileDefinitionInventory],
-        rust_listing: Option<(i64, Vec<(String, String)>)>,
+        rust_listing: Option<RustListingInput>,
     ) -> Result<WorkspaceSnapshotId> {
         assert!(rust_listing.is_none() || lang == "rust");
         assert!(
@@ -4252,6 +4072,7 @@ impl AnalyzerStore {
             .iter()
             .map(|inventory| (inventory.rel_path.clone(), inventory.clone()))
             .collect::<HashMap<_, _>>();
+        let csharp_rule_budget = self.retention_budget().clone();
         self.execute_selection_publication(move |conn| {
             let lang = lang.as_str();
             let files = files.as_slice();
@@ -4309,6 +4130,7 @@ impl AnalyzerStore {
                 .optional()?;
             let (snapshot, inserted) = workspace_inputs::replace_workspace_input_partitions(
                 &tx,
+                &csharp_rule_budget,
                 &workspace_id,
                 lang,
                 generation,
@@ -4325,6 +4147,11 @@ impl AnalyzerStore {
                     },
                 ],
                 &refusal_changes,
+                if lang == "rust" {
+                    WorkspaceConfigurationInput::rust_cargo_acquisition(&configuration)
+                } else {
+                    None
+                },
             )?;
             let mut published_ids = crate::hash::HashSet::default();
             for ((kind, path), id) in inserted {
@@ -4374,29 +4201,29 @@ impl AnalyzerStore {
     pub fn rust_source_listing_complete(
         &self,
         snapshot: &WorkspaceSnapshotId,
-        derivation_version: i64,
+        derivation_identity: [u8; 32],
     ) -> Result<bool> {
         let conn = self.read_conn()?;
-        Self::rust_source_listing_complete_on_connection(&conn, snapshot, derivation_version)
+        Self::rust_source_listing_complete_on_connection(&conn, snapshot, derivation_identity)
     }
 
     /// The same answer on a caller's bound connection.
     pub fn rust_source_listing_complete_on_connection(
         conn: &rusqlite::Connection,
         snapshot: &WorkspaceSnapshotId,
-        derivation_version: i64,
+        derivation_identity: [u8; 32],
     ) -> Result<bool> {
         assert_eq!(snapshot.lang, "rust");
         conn.query_row(
             "SELECT complete FROM rust_source_listing_certificates
                  WHERE workspace_id=?1 AND lang=?2 AND generation=?3
-                   AND revision=?4 AND derivation_version=?5",
+                   AND revision=?4 AND derivation_identity=?5",
             rusqlite::params![
                 snapshot.workspace_id.0,
                 snapshot.lang,
                 snapshot.generation.0,
                 snapshot.revision,
-                derivation_version
+                derivation_identity
             ],
             |row| row.get::<_, bool>(0),
         )
@@ -4409,30 +4236,30 @@ impl AnalyzerStore {
     pub fn rust_source_listing_failures(
         &self,
         snapshot: &WorkspaceSnapshotId,
-        derivation_version: i64,
+        derivation_identity: [u8; 32],
     ) -> Result<Option<Vec<(String, String)>>> {
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
-        Self::rust_source_listing_failures_on(&tx, snapshot, derivation_version)
+        Self::rust_source_listing_failures_on(&tx, snapshot, derivation_identity)
     }
 
     fn rust_source_listing_failures_on(
         conn: &rusqlite::Connection,
         snapshot: &WorkspaceSnapshotId,
-        derivation_version: i64,
+        derivation_identity: [u8; 32],
     ) -> Result<Option<Vec<(String, String)>>> {
         let exists: bool = conn.query_row(
             "SELECT EXISTS(
                  SELECT 1 FROM rust_source_listing_certificates
                  WHERE workspace_id=?1 AND lang=?2 AND generation=?3
-                   AND revision=?4 AND derivation_version=?5
+                   AND revision=?4 AND derivation_identity=?5
              )",
             rusqlite::params![
                 snapshot.workspace_id.0,
                 snapshot.lang,
                 snapshot.generation.0,
                 snapshot.revision,
-                derivation_version
+                derivation_identity
             ],
             |row| row.get(0),
         )?;
@@ -4472,12 +4299,15 @@ impl AnalyzerStore {
     /// select, so a certificate that is not identical to the one stored there
     /// (none stored included) opens a new revision, which changes no file
     /// version, and the returned snapshot names it. The caller installs that
-    /// snapshot.
+    /// snapshot. The caller supplies a newly acquired Cargo view for the same
+    /// captured configuration inputs. If that capture changed, it must publish
+    /// those inputs before certifying; this boundary never reacquires host files.
     pub fn publish_rust_source_listing(
         &self,
         snapshot: &WorkspaceSnapshotId,
-        derivation_version: i64,
+        derivation_identity: [u8; 32],
         failures: Vec<(String, String)>,
+        acquired: brokk_bifrost_rust::cargo_config::acquired::RustCargoAcquiredConfigView,
     ) -> Result<WorkspaceSnapshotId> {
         assert_eq!(snapshot.lang, "rust");
         let snapshot = snapshot.clone();
@@ -4499,7 +4329,8 @@ impl AnalyzerStore {
                     snapshot.revision
                 )));
             }
-            let certified = certify_rust_listing(&tx, &snapshot, derivation_version, &failures)?;
+            let certified =
+                certify_rust_listing(&tx, &snapshot, derivation_identity, &failures, &acquired)?;
             tx.commit()?;
             Ok(certified)
         })
@@ -4838,7 +4669,7 @@ impl AnalyzerStore {
         package_edges: &[WorkspacePackageEdgeRow],
         anchors: &[WorkspaceAnchorRow],
         refusal: Option<(&str, &WorkspaceSourceRefusalRow)>,
-        rust_listing: Option<&(i64, Vec<(String, String)>)>,
+        rust_listing: Option<&RustListingInput>,
     ) -> Result<WorkspaceSnapshots> {
         self.replace_path_symbol_unit_with_inventory(
             workspace_id,
@@ -4875,7 +4706,7 @@ impl AnalyzerStore {
         anchors: &[WorkspaceAnchorRow],
         inventory: Option<&WorkspaceFileDefinitionInventory>,
         refusal: Option<(&str, &WorkspaceSourceRefusalRow)>,
-        rust_listing: Option<&(i64, Vec<(String, String)>)>,
+        rust_listing: Option<&RustListingInput>,
     ) -> Result<WorkspaceSnapshots> {
         assert!(
             rust_listing.is_none() || storage_langs == ["rust"],
@@ -4905,6 +4736,7 @@ impl AnalyzerStore {
         let anchors = anchors.to_vec();
         let inventory = inventory.cloned();
         let rust_listing = rust_listing.cloned();
+        let csharp_rule_budget = self.retention_budget().clone();
         self.execute_selection_publication(move |conn| {
             let storage_langs = storage_langs.as_slice();
             let workspace_id_text = workspace_id.as_str();
@@ -5013,6 +4845,7 @@ impl AnalyzerStore {
                 )?;
                 let (snapshot, inserted) = workspace_inputs::publish_workspace_input_changes(
                     &tx,
+                    &csharp_rule_budget,
                     &workspace_id,
                     lang,
                     generation,
@@ -5020,6 +4853,7 @@ impl AnalyzerStore {
                     closed.as_slice(),
                     replacements.as_slice(),
                     &refusal_changes,
+                    None,
                 )?;
                 for id in inserted.into_values() {
                     insert_workspace_file_projection_rows(
@@ -5126,7 +4960,7 @@ impl AnalyzerStore {
         storage_langs: &[String],
         generations: &HashMap<String, GenerationId>,
         input: WorkspaceConfigurationInput,
-        rust_listing: Option<&(i64, Vec<(String, String)>)>,
+        rust_listing: Option<&RustListingInput>,
     ) -> Result<(
         WorkspaceSnapshots,
         crate::analyzer::semantic::ids::StableDigest,
@@ -5140,6 +4974,7 @@ impl AnalyzerStore {
         let base_snapshots = base_snapshots.clone();
         let storage_langs = storage_langs.to_vec();
         let generations = generations.clone();
+        let csharp_rule_budget = self.retention_budget().clone();
         self.conn.execute(move |conn| {
             let tx = conn.transaction()?;
             input.retain(&tx)?;
@@ -5180,6 +5015,7 @@ impl AnalyzerStore {
                     changed.then_some((workspace_inputs::WorkspaceInputKind::Configuration, &row));
                 let (snapshot, _) = workspace_inputs::publish_workspace_input_changes(
                     &tx,
+                    &csharp_rule_budget,
                     &workspace_id,
                     lang,
                     generation,
@@ -5187,6 +5023,9 @@ impl AnalyzerStore {
                     closed.as_slice(),
                     replacements.as_slice(),
                     &Default::default(),
+                    WorkspaceConfigurationInput::rust_cargo_acquisition(std::slice::from_ref(
+                        &input,
+                    )),
                 )?;
                 let rows = tx
                     .prepare_cached(
@@ -5215,6 +5054,14 @@ impl AnalyzerStore {
                 let lang_digest = workspace_inputs::configuration_digest(
                     rows.iter()
                         .map(|(path, oid, present)| (path.as_str(), *oid, *present)),
+                );
+                let lang_digest = workspace_inputs::bind_acquired_configuration_digest(
+                    lang_digest,
+                    if lang == "rust" {
+                        rust_acquired_cargo_config::selected_digest(&tx, &snapshot)?
+                    } else {
+                        None
+                    },
                 );
                 assert!(
                     digest.is_none_or(|digest| digest == lang_digest),
@@ -5264,7 +5111,7 @@ impl AnalyzerStore {
 
     fn from_parts(
         conn: Connection,
-        reader_source: Option<PathBuf>,
+        reader_source: PathBuf,
         db_path: Option<PathBuf>,
         ephemeral: Option<EphemeralDb>,
         _config: &brokk_bifrost_core::analyzer::config::AnalyzerConfig,
@@ -5275,19 +5122,20 @@ impl AnalyzerStore {
         rust_crates::register_point_export_functions(&conn)
             .expect("configure Rust export SQL functions");
         #[cfg(any(test, feature = "test-support"))]
-        conn.execute_batch(REVISIONED_WORKSPACE_VIEWS_SQL)
-            .expect("configure test workspace views");
+        ensure_revisioned_workspace_views(&conn)
+            .expect("configure test workspace views and summary translations");
+        #[cfg(not(any(test, feature = "test-support")))]
+        surface_relations::create_summary_translation_views(&conn)
+            .expect("configure bootstrap summary translations");
         Self {
             conn: StoreWriter::local(conn),
             readers: ReaderPool::new(reader_source.clone()),
             active_readers: ReaderPool::new(reader_source.clone()),
             streaming_readers: ReaderPool::new(reader_source),
-            writer_selection: Arc::new(Mutex::new(None)),
             #[cfg(any(test, feature = "test-support"))]
             crate_statement_counter: Mutex::new(None),
             #[cfg(any(test, feature = "test-support"))]
             unit_tail_blob_reads: std::sync::atomic::AtomicUsize::new(0),
-            writer_resolution_selection: Mutex::new(None),
             cache_budget: cache_budget::StoreCacheBudget::new(budget),
             retention_budget: budget.clone(),
             content_digests: brokk_bifrost_core::content_digest::ContentDigestCache::new(budget),
@@ -5329,7 +5177,7 @@ impl AnalyzerStore {
     pub fn open_persistent(db_path: &Path) -> Result<Self> {
         {
             let config = brokk_bifrost_core::analyzer::config::AnalyzerConfig::default();
-            let budget = brokk_bifrost_core::retention_budget::RetentionBudget::new(
+            let budget = brokk_bifrost_core::retention_budget::RetentionBudget::for_test_capacity(
                 config.retention_budget_bytes(),
             );
             Self::open_persistent_with_config(db_path, &config, &budget)
@@ -5344,15 +5192,13 @@ impl AnalyzerStore {
         let (conn, reader_source) = StoreWriter::persistent(db_path)?;
         Ok(Self {
             conn,
-            readers: ReaderPool::new(Some(reader_source.clone())),
-            active_readers: ReaderPool::new(Some(reader_source.clone())),
-            streaming_readers: ReaderPool::new(Some(reader_source)),
-            writer_selection: Arc::new(Mutex::new(None)),
+            readers: ReaderPool::new(reader_source.clone()),
+            active_readers: ReaderPool::new(reader_source.clone()),
+            streaming_readers: ReaderPool::new(reader_source),
             #[cfg(any(test, feature = "test-support"))]
             crate_statement_counter: Mutex::new(None),
             #[cfg(any(test, feature = "test-support"))]
             unit_tail_blob_reads: std::sync::atomic::AtomicUsize::new(0),
-            writer_resolution_selection: Mutex::new(None),
             cache_budget: cache_budget::StoreCacheBudget::new(budget),
             retention_budget: budget.clone(),
             content_digests: brokk_bifrost_core::content_digest::ContentDigestCache::new(budget),
@@ -5407,7 +5253,7 @@ impl AnalyzerStore {
     pub fn open_ephemeral() -> Result<Self> {
         {
             let config = brokk_bifrost_core::analyzer::config::AnalyzerConfig::default();
-            let budget = brokk_bifrost_core::retention_budget::RetentionBudget::new(
+            let budget = brokk_bifrost_core::retention_budget::RetentionBudget::for_test_capacity(
                 config.retention_budget_bytes(),
             );
             Self::open_ephemeral_with_config(&config, &budget)
@@ -5532,41 +5378,12 @@ impl AnalyzerStore {
         };
         Ok(Self::from_parts(
             conn,
-            Some(resolved.clone()),
+            resolved.clone(),
             None,
             Some(EphemeralDb { path: resolved }),
             config,
             budget,
         ))
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    #[doc(hidden)]
-    /// Test-only single-connection store. Production ephemeral stores use
-    /// `open_ephemeral_with_config`, whose reader pool needs a temp file.
-    /// Test convenience. Production owners pass their shared budget to
-    /// `open_in_memory_single_connection_with_config`.
-    pub fn open_in_memory_single_connection() -> Result<Self> {
-        {
-            let config = brokk_bifrost_core::analyzer::config::AnalyzerConfig::default();
-            let budget = brokk_bifrost_core::retention_budget::RetentionBudget::new(
-                config.retention_budget_bytes(),
-            );
-            Self::open_in_memory_single_connection_with_config(&config, &budget)
-        }
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    #[doc(hidden)]
-    pub fn open_in_memory_single_connection_with_config(
-        config: &brokk_bifrost_core::analyzer::config::AnalyzerConfig,
-        budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
-    ) -> Result<Self> {
-        let mut conn = crate::cache_db::open_in_memory_store_connection()?;
-        crate::cache_db::configure_connection(&mut conn).map_err(StoreError::new)?;
-        crate::cache_db::migrate(&mut conn).map_err(StoreError::new)?;
-        // `reader_source = None` routes reads back through the writer connection.
-        Ok(Self::from_parts(conn, None, None, None, config, budget))
     }
 
     /// Decode language-owned source rows in one generation-checked snapshot.
@@ -5588,16 +5405,9 @@ impl AnalyzerStore {
 
     /// Check out a read-only connection for a pure-SELECT method. Pooled readers
     /// run concurrently against WAL snapshots; the writer connection is never
-    /// taken by these paths (except in the test-only in-memory
-    /// single-connection store, where `source` is `None`).
+    /// taken by these paths.
     #[doc(hidden)]
     pub fn read_conn(&self) -> Result<ReaderGuard<'_>> {
-        #[cfg(any(test, feature = "test-support"))]
-        if nested_lend::active(self.conn.reader_exclusion_identity()) {
-            // This checkout has no requested snapshot. The lent connection
-            // already carries the selected operation's workspace selection.
-            return self.checkout_read_conn();
-        }
         let conn = self.checkout_read_conn()?;
         #[cfg(any(test, feature = "test-support"))]
         let conn = {
@@ -5615,11 +5425,6 @@ impl AnalyzerStore {
         Ok(conn)
     }
 
-    #[doc(hidden)]
-    pub fn uses_single_connection_reads(&self) -> bool {
-        self.readers.source.is_none()
-    }
-
     /// Check out a reader and point its revisioned views at `snapshots`.
     ///
     /// This does not go through [`Self::read_conn`]: that path selects the test
@@ -5631,133 +5436,45 @@ impl AnalyzerStore {
         &self,
         snapshots: &WorkspaceSnapshots,
     ) -> Result<ReaderGuard<'_>> {
-        #[cfg(any(test, feature = "test-support"))]
-        if nested_lend::active(self.conn.reader_exclusion_identity()) {
-            let conn = self.checkout_read_conn()?;
-            let installed: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_temp_master WHERE type='table' AND name='selected_workspace_revisions')",
-                [],
-                |row| row.get(0),
-            )?;
-            if !installed {
-                return Err(Self::lend_snapshot_error());
-            }
-            let installed_count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM temp.selected_workspace_revisions",
-                [],
-                |row| row.get(0),
-            )?;
-            if installed_count != snapshots.len() as i64 {
-                return Err(Self::lend_snapshot_error());
-            }
-            let mut statement = conn.prepare_cached(
-                "SELECT EXISTS(SELECT 1 FROM temp.selected_workspace_revisions WHERE workspace_id=?1 AND lang=?2 AND generation=?3 AND revision=?4)",
-            )?;
-            for snapshot in snapshots.values() {
-                let matches: bool = statement.query_row(
-                    params![
-                        snapshot.workspace_id.as_str(),
-                        snapshot.lang,
-                        snapshot.generation.0,
-                        snapshot.revision
-                    ],
-                    |row| row.get(0),
-                )?;
-                if !matches {
-                    return Err(Self::lend_snapshot_error());
-                }
-            }
-            drop(statement);
-            return Ok(conn);
-        }
         let mut conn = self.checkout_read_conn()?;
         self.select_workspace_snapshots(&mut conn, snapshots)?;
         Ok(conn)
     }
 
-    #[cfg(any(test, feature = "test-support"))]
-    fn lend_snapshot_error() -> StoreError {
-        StoreError {
-            message: "different snapshot under selected-operation lend".into(),
-            kind: StoreErrorKind::SelectedLendSnapshotMismatch,
-            missing_required_source_facts: false,
-        }
-    }
-
-    /// In test-support single-connection stores, run callbacks with the selected reader.
-    /// Production stores use pooled readers, so callbacks run directly.
-    /// Nested workspace reads are admitted only for exactly the operation's installed
-    /// selection; a subset request fails closed. A nested guard must be dropped before
-    /// the callback returns; scope exit
-    /// aborts if one escapes because it borrows the selected connection.
-    #[doc(hidden)]
-    pub fn lend_selected_reader<T>(&self, connection: &Connection, f: impl FnOnce() -> T) -> T {
-        #[cfg(any(test, feature = "test-support"))]
-        {
-            if self.uses_single_connection_reads() {
-                let _scope =
-                    nested_lend::Scope::new(self.conn.reader_exclusion_identity(), connection);
-                return f();
-            }
-        }
-        #[cfg(not(any(test, feature = "test-support")))]
-        let _ = connection;
-        f()
-    }
-
     fn checkout_read_conn(&self) -> Result<ReaderGuard<'_>> {
-        #[cfg(any(test, feature = "test-support"))]
-        if self.uses_single_connection_reads() {
-            let writer = self.conn.reader_exclusion_identity();
-            // Selected callbacks stay on this thread. Graph/reverse stages avoid
-            // workers on single-connection stores, and worker transports reject
-            // them. Independent threads have no local lend and wait on the writer.
-            if let Some(connection) = nested_lend::borrow(writer) {
-                return Ok(ReaderGuard {
-                    cache_budget: &self.cache_budget,
-                    inner: ReaderConn::NestedReader {
-                        connection,
-                        writer,
-                        _thread: std::marker::PhantomData,
-                    },
-                    checkin: CheckinPlan::Reusable,
-                    query_planner_stability_on_checkin: None,
-                    restore_reader_mmap_on_checkin: false,
-                });
-            }
-        }
-        let conn = if self.streaming_read_active() {
-            self.read_conn_from_pool(
-                &self.streaming_readers,
-                crate::cache_db::open_streaming_readonly_connection,
-            )
+        if self.streaming_read_active() {
+            self.read_streaming_conn_from_pool()
         } else {
             self.read_conn_from_pool(
                 &self.readers,
                 crate::cache_db::open_readonly_temp_connection,
             )
-        }?;
-        Ok(conn)
+        }
     }
 
-    /// A publication job may commit before returning an error. Invalidate the
-    /// test-only writer-backed reader selection while its connection is still
-    /// held, even in that case: SQLite data_version excludes commits made by
-    /// the connection itself.
+    fn read_streaming_conn_from_pool(&self) -> Result<ReaderGuard<'_>> {
+        let mut reader = self.read_conn_with_acquisition(
+            &self.streaming_readers,
+            crate::cache_db::open_streaming_readonly_connection_before_query_only,
+            || self.streaming_readers.acquire(),
+        )?;
+        reader.restore_general_query_plans()?;
+        if !reader.query_row("PRAGMA query_only", [], |row| row.get::<_, bool>(0))?
+            && let Err(error) = crate::cache_db::enable_streaming_readonly_query_only(&reader)
+        {
+            reader.discard_before_checkin();
+            return Err(StoreError::new(error));
+        }
+        Ok(reader)
+    }
+
     #[doc(hidden)]
     pub fn execute_selection_publication<T, F>(&self, job: F) -> T
     where
         T: Send + 'static,
         F: FnOnce(&mut Connection) -> T + Send + 'static,
     {
-        let selection = Arc::clone(&self.writer_selection);
-        self.conn.execute(move |conn| {
-            let outcome = job(conn);
-            *selection
-                .lock()
-                .expect("analyzer store writer selection poisoned") = None;
-            outcome
-        })
+        self.conn.execute(job)
     }
 
     /// Materialize `snapshots` in `guard`'s temp schema, unless that is already
@@ -5781,9 +5498,7 @@ impl AnalyzerStore {
     /// Point the writer connection's revisioned views at `snapshots`.
     ///
     /// Reads normally take a pooled reader; this is for the ephemeral store's
-    /// own writer-connection queries, which hold that connection already. The
-    /// selection it leaves behind is the one the test-only writer-backed reader
-    /// then sees.
+    /// own writer-connection queries, which hold that connection already.
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn select_writer_workspace_snapshots(
@@ -5791,11 +5506,7 @@ impl AnalyzerStore {
         conn: &Connection,
         snapshots: &WorkspaceSnapshots,
     ) -> Result<()> {
-        let mut selection = self
-            .writer_selection
-            .lock()
-            .expect("analyzer store writer selection poisoned");
-        self.apply_workspace_selection(conn, &mut selection, snapshots)
+        self.apply_workspace_selection(conn, &mut None, snapshots)
     }
 
     fn apply_workspace_selection(
@@ -5822,7 +5533,6 @@ impl AnalyzerStore {
         self.workspace_selection_counters
             .selection_writes
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let changes_before = conn.total_changes();
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch("DELETE FROM temp.selected_rust_unit_closure;")?;
         selected_summary_write(
@@ -5853,14 +5563,9 @@ impl AnalyzerStore {
         // fill. An external commit after it ends must differ on next checkout.
         let stamp = workspace_selection_stamp(&tx)?;
         tx.commit()?;
-        let application_changes = selection
-            .as_ref()
-            .map_or(0, |selection| selection.application_changes)
-            + (conn.total_changes() - changes_before);
         *selection = Some(AppliedWorkspaceSelection {
             snapshots: snapshots.clone(),
             stamp,
-            application_changes,
         });
         Ok(())
     }
@@ -5918,27 +5623,34 @@ impl AnalyzerStore {
         let conn = self.read_conn_with_acquisition(
             &self.active_readers,
             crate::cache_db::open_readonly_temp_connection,
-            || self.active_readers.acquire_for_resolution(key),
+            || {
+                self.active_readers
+                    .acquire_for_resolution(key, None)
+                    .expect("uncancellable resolution checkout")
+            },
         )?;
         Ok(conn)
     }
 
     /// [`Self::active_read_conn_for_resolution`] for a selection opener. The
-    /// test-only single-connection store's only connection can be held by
-    /// another request for as long as that request runs, so the wait for it
-    /// observes `cancellation`; `None` means it stopped the wait.
+    /// pool wait observes `cancellation`; `None` means it stopped the wait.
     fn cancellable_read_conn_for_resolution(
         &self,
         key: &resolution_selection::RetainedResolutionSelectionKey,
         cancellation: &CancellationToken,
     ) -> Result<Option<ReaderGuard<'_>>> {
-        if self.active_readers.source.is_none() {
-            return Ok(self
-                .conn
-                .lock_cancellable(cancellation)
-                .map(|conn| self.writer_reader_guard(conn)));
-        }
-        self.active_read_conn_for_resolution(key).map(Some)
+        let Some(acquired) = self
+            .active_readers
+            .acquire_for_resolution(key, Some(cancellation))
+        else {
+            return Ok(None);
+        };
+        self.read_conn_with_acquisition(
+            &self.active_readers,
+            crate::cache_db::open_readonly_temp_connection,
+            || acquired,
+        )
+        .map(Some)
     }
 
     fn read_conn_with_acquisition<'a>(
@@ -5947,91 +5659,48 @@ impl AnalyzerStore {
         open: fn(&Path) -> crate::cache_db::Result<Connection>,
         acquire: impl FnOnce() -> (u64, Option<SelectedReader>),
     ) -> Result<ReaderGuard<'a>> {
-        match pool.source.as_deref() {
-            Some(path) => {
-                // The permit is held across the open, so a cold connection
-                // still counts against capacity while it is being built.
-                let (statistics_epoch, acquired) = acquire();
-                let reader = match acquired {
-                    Some(reader) => reader,
-                    None => match open(path).map_err(StoreError::new).and_then(|conn| {
-                        // Replacing a SQLite function expires every prepared
-                        // statement. Install once per newly opened connection,
-                        // never on checkout of an already configured reader.
-                        resolution_lexical::register_resolution_identity_functions(&conn)?;
-                        rust_crates::register_point_export_functions(&conn)?;
-                        Ok(conn)
-                    }) {
-                        Ok(conn) => SelectedReader {
-                            conn,
-                            #[cfg(any(test, feature = "test-support"))]
-                            serial: NEXT_POOLED_READER_SERIAL
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                            pooled_after_clear: false,
-                            macro_frontier: None,
-                            selection: None,
-                            resolution_selection: None,
-                            statistics_epoch,
-                            query_planner_stability_before_resolution: None,
-                        },
-                        Err(error) => {
-                            pool.abandon_checkout();
-                            return Err(error);
-                        }
-                    },
-                };
-                Ok(ReaderGuard {
-                    cache_budget: &self.cache_budget,
-                    inner: ReaderConn::Pooled {
-                        pool,
-                        reader: Some(reader),
-                    },
-                    checkin: CheckinPlan::Reusable,
-                    query_planner_stability_on_checkin: None,
-                    restore_reader_mmap_on_checkin: false,
-                })
-            }
-            None => {
-                Ok(self
-                    .writer_reader_guard(self.conn.lock().expect("analyzer store mutex poisoned")))
-            }
-        }
-    }
-
-    /// The test-only single-connection store's reader around a held writer
-    /// connection.
-    fn writer_reader_guard<'a>(
-        &'a self,
-        conn: std::sync::MutexGuard<'a, Connection>,
-    ) -> ReaderGuard<'a> {
-        ReaderGuard {
+        let path = &pool.source;
+        // The permit is held across the open, so a cold connection
+        // still counts against capacity while it is being built.
+        let (statistics_epoch, acquired) = acquire();
+        let reader = match acquired {
+            Some(reader) => reader,
+            None => match open(path).map_err(StoreError::new).and_then(|conn| {
+                // Replacing a SQLite function expires every prepared
+                // statement. Install once per newly opened connection,
+                // never on checkout of an already configured reader.
+                resolution_lexical::register_resolution_identity_functions(&conn)?;
+                rust_crates::register_point_export_functions(&conn)?;
+                Ok(conn)
+            }) {
+                Ok(conn) => SelectedReader {
+                    conn,
+                    #[cfg(any(test, feature = "test-support"))]
+                    serial: NEXT_POOLED_READER_SERIAL
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    pooled_after_clear: false,
+                    macro_frontier: None,
+                    selection: None,
+                    resolution_selection: None,
+                    statistics_epoch,
+                    query_planner_stability_before_resolution: None,
+                },
+                Err(error) => {
+                    pool.abandon_checkout();
+                    return Err(error);
+                }
+            },
+        };
+        Ok(ReaderGuard {
             cache_budget: &self.cache_budget,
-            inner: self.writer_reader_conn(conn),
+            inner: ReaderConn::Pooled {
+                pool,
+                reader: Some(reader),
+            },
             checkin: CheckinPlan::Reusable,
-            query_planner_stability_on_checkin: None,
+            _checkout_thread: std::marker::PhantomData,
             restore_reader_mmap_on_checkin: false,
-        }
-    }
-
-    /// The selection mutexes are taken only by a holder of the connection, so
-    /// they never wait once `conn` is held.
-    fn writer_reader_conn<'a>(
-        &'a self,
-        conn: std::sync::MutexGuard<'a, Connection>,
-    ) -> ReaderConn<'a> {
-        ReaderConn::Writer {
-            store: self,
-            conn,
-            selection: self
-                .writer_selection
-                .lock()
-                .expect("analyzer store writer selection poisoned"),
-            resolution_selection: self
-                .writer_resolution_selection
-                .lock()
-                .expect("analyzer store retained resolution selection poisoned"),
-            _exclusive: self.conn.retain_exclusive_reader(),
-        }
+        })
     }
 
     #[doc(hidden)]
@@ -6647,6 +6316,10 @@ impl AnalyzerStore {
                 params![oid, lang, variant],
             )
             .expect("mark parsed blob incomplete");
+            tx.execute(
+                "DELETE FROM surface_sets WHERE blob_id IN (SELECT id FROM blobs WHERE blob_oid=?1 AND lang=?2 AND parse_variant=?3)",
+                params![oid, lang, variant],
+            ).expect("retire surface sets of incomplete facts");
             let generation: i64 = tx
                 .query_row(
                     "SELECT generation FROM blobs WHERE blob_oid = ?1 AND lang = ?2 AND parse_variant = ?3",
@@ -6990,7 +6663,10 @@ impl AnalyzerStore {
                 .any(|metadata| metadata.overload_discriminator().is_none())
         {
             return Err(StoreError::corrupt(format!(
-                "callable metadata lacks its overload discriminator: {unit:?}"
+                "callable metadata lacks its overload discriminator: declaration={}, fqn={}, path={:?}",
+                unit.declaration_id(),
+                unit.fq_name(),
+                unit.source().rel_path(),
             )));
         }
         Ok(rows)
@@ -9073,89 +8749,12 @@ impl AnalyzerStore {
         Ok(total)
     }
 
-    pub fn gc_with_bloom(&self, reachable: &GrowableBloom) -> Result<usize> {
-        let reachable = reachable.clone();
-        self.gc_with(move |oid| reachable.contains(oid))
-    }
-
-    pub fn gc_with(&self, keep: impl Fn(&str) -> bool + Send + 'static) -> Result<usize> {
-        self.conn.execute(move |conn| {
-            let tx = conn.transaction()?;
-            let dead: Vec<BlobKey> = {
-                let mut stmt = tx.prepare(
-                    "SELECT blobs.blob_oid, blobs.lang, blobs.parse_variant
-                 FROM blobs
-                 LEFT JOIN analysis_epochs AS epochs ON epochs.lang = blobs.lang
-                 WHERE blobs.generation = COALESCE(epochs.generation, 0)
-                   AND NOT EXISTS (
-                     SELECT 1 FROM workspace_file_versions AS files
-                     LEFT JOIN csharp_file_version_decisions AS decisions ON decisions.file_version_id = files.file_version_id
-                     WHERE files.input_kind = 'source' AND files.blob_oid = blobs.blob_oid
-                       AND files.lang = blobs.lang AND blobs.parse_variant = COALESCE(decisions.decision_digest, x'')
-                   )
-                   AND NOT EXISTS (
-                     SELECT 1 FROM workspace_resolution_content_roots AS roots
-                     WHERE roots.blob_id = blobs.id
-                   )",
-                )?;
-                let rows = stmt.query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, ParseVariant>(2)?,
-                    ))
-                })?;
-                let mut dead = Vec::new();
-                for row in rows {
-                    let (oid, lang, variant) = row?;
-                    let oid = Oid::from_str(&oid)
-                        .map_err(|error| StoreError::corrupt(error.to_string()))?;
-                    let key = BlobKey { oid, lang, variant };
-                    if variant != ParseVariant::Empty || !keep(&oid.to_string()) {
-                        dead.push(key);
-                    }
-                }
-                dead
-            };
-            {
-                let _cascade = sealed_families::CascadeDelete::new(&tx);
-                let mut del = tx.prepare(UNROOTED_BLOB_GC_DELETE_SQL)?;
-                for key in &dead {
-                    csharp_compilation::extent::before_blob_delete(&tx, key)?;
-                    if key.lang == "csharp" {
-                        tx.execute(
-                            "DELETE FROM csharp_source_condition_symbols WHERE blob_id IN (
-                               SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2 AND parse_variant = ?3
-                                 AND generation = COALESCE((SELECT generation FROM analysis_epochs WHERE lang = ?2), 0)
-                                 AND NOT EXISTS (SELECT 1 FROM workspace_resolution_content_roots AS roots WHERE roots.blob_id = blobs.id))",
-                            params![key.oid.to_string(), key.lang, key.variant],
-                        )?;
-
-                        tx.execute(
-                            csharp_compilation::DELETE_UNROOTED_CHAINS_SQL,
-                            params![key.oid.to_string(), key.lang, key.variant],
-                        )?;
-                    }
-                    let removed = del
-                        .query_map(params![key.oid.to_string(), key.lang, key.variant], |row| row.get::<_, i64>(0))?
-                        .collect::<std::result::Result<Vec<_>, _>>()?;
-                    for removed_generation in removed {
-                        brokk_bifrost_core::definition_inventory::withdraw_definition_inventory_for_deleted_blob_tx(&tx, &key.oid.to_string(), &key.lang, removed_generation, key.variant)?;
-                    }
-                }
-            }
-            tx.commit()?;
-            // Drain the whole freelist. A single `PRAGMA incremental_vacuum`
-            // step frees exactly one page; see `cache_db::drain_free_pages`.
-            crate::cache_db::drain_free_pages(conn).map_err(StoreError::new)?;
-            Ok(dead.len())
-        })
-    }
-
     #[doc(hidden)]
     pub fn reclaim_stale_generations(&self, max_logical_rows: usize) -> Result<usize> {
         self.execute_selection_publication(move |conn| {
-            reclaim_stale_generations_conn(conn, max_logical_rows)
+            let reclaimed = reclaim_stale_generations_conn(conn, max_logical_rows)?;
+            rust_acquired_cargo_config::reclaim_all(conn)?;
+            Ok(reclaimed)
         })
     }
 
@@ -9208,6 +8807,7 @@ impl AnalyzerStore {
                 "DELETE FROM workspace_revisions WHERE workspace_id = ?1",
                 params![workspace_id],
             )?;
+            rust_acquired_cargo_config::reclaim_all(&tx)?;
             #[cfg(any(test, debug_assertions, feature = "test-support"))]
             drop(_cascade);
             tx.commit()?;
@@ -9330,11 +8930,13 @@ impl AnalyzerStore {
     #[doc(hidden)]
     pub fn rust_traits_implemented_by(
         &self,
+        snapshots: &WorkspaceSnapshots,
         key: &BlobKey,
         declaration_id: u32,
         rel_path: &str,
     ) -> Result<Vec<(Oid, u32, String)>> {
         self.rust_trait_impl_counterparts(
+            snapshots,
             &RUST_TRAITS_IMPLEMENTED_BY_SQL,
             key,
             declaration_id,
@@ -9348,11 +8950,13 @@ impl AnalyzerStore {
     #[doc(hidden)]
     pub fn rust_types_implementing(
         &self,
+        snapshots: &WorkspaceSnapshots,
         key: &BlobKey,
         declaration_id: u32,
         rel_path: &str,
     ) -> Result<Vec<(Oid, u32, String)>> {
         self.rust_trait_impl_counterparts(
+            snapshots,
             &RUST_TYPES_IMPLEMENTING_SQL,
             key,
             declaration_id,
@@ -9362,19 +8966,20 @@ impl AnalyzerStore {
 
     fn rust_trait_impl_counterparts(
         &self,
+        snapshots: &WorkspaceSnapshots,
         sql: &str,
         key: &BlobKey,
         declaration_id: u32,
         rel_path: &str,
     ) -> Result<Vec<(Oid, u32, String)>> {
-        let conn = self.read_conn()?;
+        let conn = self.read_conn_for_workspace(snapshots)?;
         let mut stmt = conn.prepare_cached(sql)?;
         let rows = stmt.query_map(
             params![
                 key.oid.to_string(),
                 declaration_id,
                 rel_path,
-                rust_unit_summaries::RUST_UNIT_SUMMARY_DERIVATION_VERSION,
+                rust_unit_summaries::rust_unit_summary_derivation_identity(),
                 key.variant
             ],
             |row| {
@@ -9405,18 +9010,19 @@ impl AnalyzerStore {
     #[doc(hidden)]
     pub fn rust_trait_impl_rows(
         &self,
+        snapshots: &WorkspaceSnapshots,
         key: &BlobKey,
         declaration_id: u32,
         rel_path: &str,
     ) -> Result<Vec<StoredTraitImplRow>> {
-        let conn = self.read_conn()?;
+        let conn = self.read_conn_for_workspace(snapshots)?;
         let mut stmt = conn.prepare_cached(&RUST_TRAIT_IMPL_ROWS_SQL)?;
         let rows = stmt.query_map(
             params![
                 key.oid.to_string(),
                 declaration_id,
                 rel_path,
-                rust_unit_summaries::RUST_UNIT_SUMMARY_DERIVATION_VERSION,
+                rust_unit_summaries::rust_unit_summary_derivation_identity(),
                 key.variant
             ],
             |row| {
@@ -9463,11 +9069,13 @@ impl AnalyzerStore {
     #[doc(hidden)]
     pub fn rust_traits_of_impl(
         &self,
+        snapshots: &WorkspaceSnapshots,
         impl_key: &BlobKey,
         impl_declaration_id: u32,
         impl_rel_path: &str,
     ) -> Result<Vec<(Oid, u32, String)>> {
         self.rust_trait_impl_counterparts(
+            snapshots,
             &RUST_TRAITS_OF_IMPL_SQL,
             impl_key,
             impl_declaration_id,
@@ -9626,18 +9234,19 @@ impl AnalyzerStore {
     #[doc(hidden)]
     pub fn rust_trait_impl_spellings(
         &self,
+        snapshots: &WorkspaceSnapshots,
         key: &BlobKey,
         declaration_id: u32,
         rel_path: &str,
     ) -> Result<Vec<String>> {
-        let conn = self.read_conn()?;
+        let conn = self.read_conn_for_workspace(snapshots)?;
         let mut stmt = conn.prepare_cached(&RUST_TRAIT_IMPL_SPELLINGS_SQL)?;
         let rows = stmt.query_map(
             params![
                 key.oid.to_string(),
                 declaration_id,
                 rel_path,
-                rust_unit_summaries::RUST_UNIT_SUMMARY_DERIVATION_VERSION,
+                rust_unit_summaries::rust_unit_summary_derivation_identity(),
                 key.variant
             ],
             |row| row.get::<_, String>(0),
@@ -9680,14 +9289,15 @@ impl AnalyzerStore {
     #[doc(hidden)]
     pub fn rust_unresolved_trait_impl_files(
         &self,
+        snapshots: &WorkspaceSnapshots,
         spelling: &str,
     ) -> Result<Vec<(Oid, String, Option<u32>)>> {
-        let conn = self.read_conn()?;
+        let conn = self.read_conn_for_workspace(snapshots)?;
         let mut stmt = conn.prepare_cached(RUST_UNRESOLVED_TRAIT_IMPL_FILES_SQL)?;
         let rows = stmt.query_map(
             params![
                 spelling,
-                rust_unit_summaries::RUST_UNIT_SUMMARY_DERIVATION_VERSION
+                rust_unit_summaries::rust_unit_summary_derivation_identity()
             ],
             |row| {
                 Ok((
@@ -9849,6 +9459,10 @@ impl AnalyzerStore {
         check: impl FnOnce() -> T,
     ) -> T {
         self.conn.execute(|conn| {
+            conn.execute_batch(
+                crate::analyzer::store::resolution_selection::selected_resolution_temp_schema_sql(),
+            )
+                .expect("initialize selected resolution temp schema");
             conn.execute(
                 "ALTER TABLE rust_identifier_occurrences RENAME TO unreadable_rust_identifier_occurrences",
                 [],
@@ -10056,7 +9670,8 @@ impl AnalyzerStore {
                 "SELECT keys.blob_oid, facts.macro_name, facts.visible_after,
                         facts.scope_start, facts.scope_end, facts.passthrough,
                         facts.exported, facts.declaration_id, facts.arguments_only,
-                        facts.decoration_cfg, facts.declares_no_item, facts.writes_only_impls
+                        facts.decoration_cfg, facts.declares_no_item, facts.writes_only_impls,
+                        (SELECT cfg_condition FROM source_rust_declaration_properties AS property WHERE property.blob_id=facts.blob_id AND property.declaration_id=facts.declaration_id)
                  FROM rust_published_fact_blobs AS keys
                  JOIN rust_item_macros AS facts
                    ON facts.blob_id = keys.blob_id AND facts.lang = keys.lang
@@ -10120,11 +9735,17 @@ const RUST_MODULE_IMPORT_CANDIDATE_BLOBS_SQL: &str = "SELECT DISTINCT keys.blob_
        AND occurrence.identifier = ?2
        AND (import_target.imported_name = ?2
             OR import_target.module_path = ?2
-            OR import_target.module_path LIKE '%::' || ?2)";
+            OR import_target.module_path LIKE '%::' || ?2)
+UNION
+SELECT keys.blob_oid
+FROM resolution_rust_structural_trait_impls AS structural
+INDEXED BY resolution_rust_structural_trait_impls_spelling
+JOIN blobs AS keys ON keys.id=structural.blob_id
+WHERE keys.lang=?1 AND structural.trait_terminal_spelling=?2";
 
 /// The Rust unit-summary readers bind the writer's derivation version as a SQL
 /// parameter instead of repeating the literal, so bumping
-/// [`rust_unit_summaries::RUST_UNIT_SUMMARY_DERIVATION_VERSION`] changes one
+/// [`rust_unit_summaries::rust_unit_summary_derivation_identity()`] changes one
 /// constant. The live-summary readers built here all number it `?4`, after
 /// their three declaration key parameters.
 const RUST_SUMMARY_DERIVATION_VERSION_PARAM: &str = "?4";
@@ -10138,7 +9759,7 @@ const RUST_SUMMARY_DERIVATION_VERSION_PARAM: &str = "?4";
 /// declaration's file, which the seek includes so that one of two
 /// byte-identical files does not answer for the other. `version_param` is the
 /// caller's placeholder for
-/// [`rust_unit_summaries::RUST_UNIT_SUMMARY_DERIVATION_VERSION`].
+/// [`rust_unit_summaries::rust_unit_summary_derivation_identity()`].
 fn live_rust_summary_joins(
     prefix: &str,
     version_index: &str,
@@ -10160,7 +9781,7 @@ fn live_rust_summary_joins(
           AND {prefix}_summaries.lang='rust' \
           AND {prefix}_summaries.unit_kind='rust_crate' \
           AND {prefix}_summaries.{is_complete} \
-          AND {prefix}_summaries.derivation_version={version_param} \
+          AND {prefix}_summaries.derivation_identity={version_param} \
          CROSS JOIN main.resolution_producer_epochs AS {prefix}_epochs \
            ON {prefix}_epochs.lang={prefix}_versions.lang \
           AND {prefix}_epochs.producer_epoch={prefix}_summaries.producer_epoch \
@@ -10201,7 +9822,10 @@ fn live_rust_summary_by_key(prefix: &str, owner_prefix: &str, unit_key: &str) ->
 
 fn live_rust_member_file_joins(prefix: &str, member: &str, version: &str) -> String {
     format!(
-        "CROSS JOIN main.workspace_file_versions AS {prefix}_files \
+        "CROSS JOIN temp.selected_unit_member_blobs AS {prefix}_attachment \
+           ON {prefix}_attachment.summary_id={member}.summary_id \
+          AND {prefix}_attachment.member_ordinal={member}.member_ordinal \
+         CROSS JOIN main.workspace_file_versions AS {prefix}_files \
            INDEXED BY idx_workspace_file_versions_snapshot_path \
            ON {prefix}_files.workspace_id={version}.workspace_id \
           AND {prefix}_files.lang={version}.lang \
@@ -10212,16 +9836,34 @@ fn live_rust_member_file_joins(prefix: &str, member: &str, version: &str) -> Str
           AND ({prefix}_files.valid_until IS NULL OR \
                {prefix}_heads.revision<{prefix}_files.valid_until) \
          CROSS JOIN main.blobs AS {prefix}_blobs \
-           ON {prefix}_blobs.id={member}.blob_id \
+           ON {prefix}_blobs.id={prefix}_attachment.blob_id \
           AND {prefix}_blobs.lang={version}.lang \
           AND {prefix}_blobs.generation={version}.generation \
           AND {prefix}_blobs.blob_oid={prefix}_files.blob_oid"
     )
 }
 
+/// The surface ordinal of one Rust child export's dense declaration site.
+///
+/// Rust child rows keep per-file dense ids until #11183 M3, so the M2 readers
+/// translate them through the member's surface set. The shared export relation
+/// holds the exported surface only, and a private declaration has no row there;
+/// the Rust child row names the site directly.
+fn rust_child_export_site_ordinal(export: &str) -> String {
+    format!(
+        "(SELECT dense.surface_ordinal FROM temp.surface_dense AS dense \
+          WHERE dense.blob_id=(SELECT member.blob_id \
+            FROM main.resolution_unit_summary_members AS member \
+            WHERE member.summary_id={export}.summary_id \
+              AND member.member_ordinal={export}.declaration_member_ordinal) \
+            AND dense.id_space=0 AND dense.dense_id={export}.declaration_site)"
+    )
+}
+
 fn trait_impl_counterpart_sql(asked: &str, counterpart: &str) -> String {
     let asked_live = live_rust_summary_by_id("asked", "asked_member.summary_id");
     let asked_file = live_rust_member_file_joins("asked", "asked_member", "asked_versions");
+    let asked_ordinal = rust_child_export_site_ordinal("asked_export");
     let owner_live = live_rust_summary_by_id("owner", "asked_endpoint.summary_id");
     let owner_file = live_rust_member_file_joins("owner", "owner_member", "owner_versions");
     let target_live = live_rust_summary_by_key(
@@ -10231,6 +9873,7 @@ fn trait_impl_counterpart_sql(asked: &str, counterpart: &str) -> String {
     );
     let target_file =
         live_rust_member_file_joins("counterpart", "counterpart_member", "counterpart_versions");
+    let counterpart_ordinal = rust_child_export_site_ordinal("counterpart_export");
     format!(
         "SELECT DISTINCT counterpart_blobs.blob_oid, counterpart_bridge.declaration_id, \
                 counterpart_member.rel_path \
@@ -10239,15 +9882,26 @@ fn trait_impl_counterpart_sql(asked: &str, counterpart: &str) -> String {
            INDEXED BY source_native_declaration_bridges_declaration \
            ON asked.blob_id=asked_keys.id AND asked.declaration_id=?2 \
          CROSS JOIN main.resolution_unit_summary_members AS asked_member \
-           INDEXED BY resolution_unit_summary_members_blob \
-           ON asked_member.blob_id=asked_keys.id AND asked_member.rel_path=?3 \
+           INDEXED BY resolution_unit_summary_members_path \
+           ON asked_member.rel_path=?3 \
+          AND EXISTS (SELECT 1 FROM temp.selected_unit_member_blobs AS attachment \
+                      WHERE attachment.summary_id=asked_member.summary_id \
+                        AND attachment.member_ordinal=asked_member.member_ordinal \
+                        AND attachment.blob_id=asked_keys.id) \
          {asked_live} {asked_file} \
          CROSS JOIN main.rust_resolution_unit_summary_exports AS asked_export \
            INDEXED BY rust_resolution_unit_summary_exports_declaration \
            ON asked_export.summary_id=asked_member.summary_id \
           AND asked_export.declaration_member_ordinal=asked_member.member_ordinal \
-          AND asked_export.declaration_site=asked.source_site \
           AND asked_export.namespace='type' AND asked_export.origin='declaration' \
+         CROSS JOIN temp.surface_dense AS asked_site_dense \
+           ON asked_site_dense.blob_id=asked_attachment.blob_id \
+          AND asked_site_dense.id_space=0 \
+          AND asked_site_dense.surface_ordinal={asked_ordinal} \
+         CROSS JOIN main.resolution_sites AS asked_site \
+           ON asked_site.blob_id=asked_attachment.blob_id \
+          AND asked_site.site=asked_site_dense.dense_id \
+          AND asked_site.site=asked.source_site \
          CROSS JOIN main.rust_resolution_unit_summary_trait_endpoints AS asked_endpoint \
            INDEXED BY rust_resolution_unit_summary_trait_endpoints_target \
            ON asked_endpoint.target_unit_key=asked_versions.unit_key \
@@ -10259,6 +9913,7 @@ fn trait_impl_counterpart_sql(asked: &str, counterpart: &str) -> String {
            ON counterpart_endpoint.summary_id=asked_endpoint.summary_id \
           AND counterpart_endpoint.member_ordinal=asked_endpoint.member_ordinal \
           AND counterpart_endpoint.owner_module_path=asked_endpoint.owner_module_path \
+          /* Rust-only derived-from blob until #11183 M3 converts Rust child rows */ \
           AND counterpart_endpoint.source_relation_key=asked_endpoint.source_relation_key \
           AND counterpart_endpoint.endpoint_role='{counterpart}' \
           AND counterpart_endpoint.endpoint_state='resolved' \
@@ -10278,9 +9933,16 @@ fn trait_impl_counterpart_sql(asked: &str, counterpart: &str) -> String {
            ON counterpart_member.summary_id=counterpart_export.summary_id \
           AND counterpart_member.member_ordinal=counterpart_export.declaration_member_ordinal \
          {target_file} \
+         CROSS JOIN temp.surface_dense AS counterpart_site_dense \
+           ON counterpart_site_dense.blob_id=counterpart_attachment.blob_id \
+          AND counterpart_site_dense.id_space=0 \
+          AND counterpart_site_dense.surface_ordinal={counterpart_ordinal} \
+         CROSS JOIN main.resolution_sites AS counterpart_site \
+           ON counterpart_site.blob_id=counterpart_attachment.blob_id \
+          AND counterpart_site.site=counterpart_site_dense.dense_id \
          CROSS JOIN main.source_native_declaration_bridges AS counterpart_bridge \
-           ON counterpart_bridge.blob_id=counterpart_member.blob_id \
-          AND counterpart_bridge.source_site=counterpart_export.declaration_site \
+           ON counterpart_bridge.blob_id=counterpart_attachment.blob_id \
+          AND counterpart_bridge.source_site=counterpart_site.site \
          WHERE asked_keys.blob_oid=?1 AND asked_keys.lang='rust' AND asked_keys.parse_variant=?5"
     )
 }
@@ -10323,14 +9985,19 @@ const RUST_ITEM_MACRO_DECISIONS_SQL: &str =
        ON head.blob_id = invocation.blob_id
       AND head.occurrence_id = invocation.invocation_occurrence_id
      LEFT JOIN main.resolution_unit_summary_members AS member
-       INDEXED BY resolution_unit_summary_members_blob
-       ON member.blob_id = invocation.blob_id AND member.rel_path = ?2
+       INDEXED BY resolution_unit_summary_members_path
+       ON member.rel_path = ?2
       AND EXISTS(SELECT 1 FROM temp.selected_rust_unit_summary_route_owners AS live
                  WHERE live.summary_id = member.summary_id)
+      AND EXISTS(SELECT 1 FROM temp.selected_workspace_file_versions AS files
+                 WHERE files.lang = 'rust' AND files.rel_path = member.rel_path
+                   AND files.blob_oid = keys.blob_oid)
      LEFT JOIN main.rust_resolution_unit_summary_macro_decisions AS decided
        ON decided.summary_id = member.summary_id
       AND decided.member_ordinal = member.member_ordinal
-      AND decided.invocation_occurrence_id = invocation.invocation_occurrence_id
+      /* Rust-only derived-from blob until #11183 M3 converts Rust child rows */
+      AND invocation.blob_id = member.blob_id
+      AND invocation.invocation_occurrence_id = decided.invocation_occurrence_id
      LEFT JOIN main.rust_resolution_unit_summary_contexts AS context
        ON context.summary_id = member.summary_id
      WHERE keys.blob_oid = ?1 AND keys.lang = 'rust' AND keys.parse_variant = ?3 AND invocation.source_position IN (0, 1)
@@ -10395,30 +10062,45 @@ pub(crate) static RUST_TRAIT_IMPL_ROWS_SQL: std::sync::LazyLock<String> = std::s
     || {
         let target_live = live_rust_summary_by_id("asked", "asked_member.summary_id");
         let target_file = live_rust_member_file_joins("asked", "asked_member", "asked_versions");
+        let asked_ordinal = rust_child_export_site_ordinal("asked_export");
         let impl_live = live_rust_summary_by_id("impl", "trait_endpoint.summary_id");
         let impl_file = live_rust_member_file_joins("impl", "impl_member", "impl_versions");
         let subject_live =
             live_rust_summary_by_key("subject", "impl", "subject_endpoint.target_unit_key");
         let subject_file =
             live_rust_member_file_joins("subject", "subject_member", "subject_versions");
+        let subject_ordinal = rust_child_export_site_ordinal("subject_export");
         format!(
             "SELECT DISTINCT impl_blobs.blob_oid, impl_member.rel_path, \
-                    trait_endpoint.impl_declaration_id, subject_blobs.blob_oid, \
+                    /* Rust-only derived-from blob until #11183 M3 converts Rust child rows */ \
+                    trait_endpoint.impl_declaration_id, \
+                    subject_blobs.blob_oid, \
                     subject_bridge.declaration_id, subject_member.rel_path \
              FROM main.blobs AS asked_keys \
              CROSS JOIN main.source_native_declaration_bridges AS asked \
                INDEXED BY source_native_declaration_bridges_declaration \
                ON asked.blob_id=asked_keys.id AND asked.declaration_id=?2 \
              CROSS JOIN main.resolution_unit_summary_members AS asked_member \
-               INDEXED BY resolution_unit_summary_members_blob \
-               ON asked_member.blob_id=asked_keys.id AND asked_member.rel_path=?3 \
+               INDEXED BY resolution_unit_summary_members_path \
+               ON asked_member.rel_path=?3 \
+              AND EXISTS (SELECT 1 FROM temp.selected_unit_member_blobs AS attachment \
+                          WHERE attachment.summary_id=asked_member.summary_id \
+                            AND attachment.member_ordinal=asked_member.member_ordinal \
+                            AND attachment.blob_id=asked_keys.id) \
              {target_live} {target_file} \
              CROSS JOIN main.rust_resolution_unit_summary_exports AS asked_export \
                INDEXED BY rust_resolution_unit_summary_exports_declaration \
                ON asked_export.summary_id=asked_member.summary_id \
               AND asked_export.declaration_member_ordinal=asked_member.member_ordinal \
-              AND asked_export.declaration_site=asked.source_site \
               AND asked_export.namespace='type' AND asked_export.origin='declaration' \
+             CROSS JOIN temp.surface_dense AS asked_site_dense \
+               ON asked_site_dense.blob_id=asked_attachment.blob_id \
+              AND asked_site_dense.id_space=0 \
+              AND asked_site_dense.surface_ordinal={asked_ordinal} \
+             CROSS JOIN main.resolution_sites AS asked_site \
+               ON asked_site.blob_id=asked_attachment.blob_id \
+              AND asked_site.site=asked_site_dense.dense_id \
+              AND asked_site.site=asked.source_site \
              CROSS JOIN main.rust_resolution_unit_summary_trait_endpoints AS trait_endpoint \
                INDEXED BY rust_resolution_unit_summary_trait_endpoints_target \
                ON trait_endpoint.target_unit_key=asked_versions.unit_key \
@@ -10430,6 +10112,7 @@ pub(crate) static RUST_TRAIT_IMPL_ROWS_SQL: std::sync::LazyLock<String> = std::s
                ON subject_endpoint.summary_id=trait_endpoint.summary_id \
               AND subject_endpoint.member_ordinal=trait_endpoint.member_ordinal \
               AND subject_endpoint.owner_module_path=trait_endpoint.owner_module_path \
+              /* Rust-only derived-from blob until #11183 M3 converts Rust child rows */ \
               AND subject_endpoint.source_relation_key=trait_endpoint.source_relation_key \
               AND subject_endpoint.endpoint_role='subject' \
               AND subject_endpoint.endpoint_state='resolved' \
@@ -10449,9 +10132,14 @@ pub(crate) static RUST_TRAIT_IMPL_ROWS_SQL: std::sync::LazyLock<String> = std::s
                ON subject_member.summary_id=subject_export.summary_id \
               AND subject_member.member_ordinal=subject_export.declaration_member_ordinal \
              {subject_file} \
+             LEFT JOIN main.resolution_sites AS subject_site \
+               ON subject_site.blob_id=subject_attachment.blob_id \
+              AND subject_site.site=(SELECT dense.dense_id FROM temp.surface_dense AS dense \
+                WHERE dense.blob_id=subject_attachment.blob_id AND dense.id_space=0 \
+                  AND dense.surface_ordinal={subject_ordinal}) \
              LEFT JOIN main.source_native_declaration_bridges AS subject_bridge \
-               ON subject_bridge.blob_id=subject_member.blob_id \
-              AND subject_bridge.source_site=subject_export.declaration_site \
+               ON subject_bridge.blob_id=subject_attachment.blob_id \
+              AND subject_bridge.source_site=subject_site.site \
              WHERE asked_keys.blob_oid=?1 AND asked_keys.lang='rust' AND asked_keys.parse_variant=?5"
         )
     },
@@ -10465,18 +10153,24 @@ pub(crate) static RUST_TRAITS_OF_IMPL_SQL: std::sync::LazyLock<String> =
         let target_live =
             live_rust_summary_by_key("trait", "owner", "trait_endpoint.target_unit_key");
         let target_file = live_rust_member_file_joins("trait", "trait_member", "trait_versions");
+        let trait_ordinal = rust_child_export_site_ordinal("trait_export");
         format!(
             "SELECT DISTINCT trait_blobs.blob_oid, trait_bridge.declaration_id, \
                     trait_member.rel_path \
              FROM main.blobs AS impl_keys \
              CROSS JOIN main.resolution_unit_summary_members AS owner_member \
-               INDEXED BY resolution_unit_summary_members_blob \
-               ON owner_member.blob_id=impl_keys.id AND owner_member.rel_path=?3 \
+               INDEXED BY resolution_unit_summary_members_path \
+               ON owner_member.rel_path=?3 \
+              AND EXISTS (SELECT 1 FROM temp.selected_unit_member_blobs AS attachment \
+                          WHERE attachment.summary_id=owner_member.summary_id \
+                            AND attachment.member_ordinal=owner_member.member_ordinal \
+                            AND attachment.blob_id=impl_keys.id) \
              {owner_live} {owner_file} \
              CROSS JOIN main.rust_resolution_unit_summary_trait_endpoints AS trait_endpoint \
                INDEXED BY rust_resolution_unit_summary_trait_endpoints_impl \
                ON trait_endpoint.summary_id=owner_versions.summary_id \
               AND trait_endpoint.member_ordinal=owner_member.member_ordinal \
+              /* Rust-only derived-from blob until #11183 M3 converts Rust child rows */ \
               AND trait_endpoint.impl_declaration_id=?2 \
               AND trait_endpoint.endpoint_role='trait' \
               AND trait_endpoint.endpoint_state='resolved' \
@@ -10484,6 +10178,7 @@ pub(crate) static RUST_TRAITS_OF_IMPL_SQL: std::sync::LazyLock<String> =
                ON subject_endpoint.summary_id=trait_endpoint.summary_id \
               AND subject_endpoint.member_ordinal=trait_endpoint.member_ordinal \
               AND subject_endpoint.owner_module_path=trait_endpoint.owner_module_path \
+              /* Rust-only derived-from blob until #11183 M3 converts Rust child rows */ \
               AND subject_endpoint.source_relation_key=trait_endpoint.source_relation_key \
               AND subject_endpoint.endpoint_role='subject' \
               AND subject_endpoint.endpoint_state='resolved' \
@@ -10498,9 +10193,16 @@ pub(crate) static RUST_TRAITS_OF_IMPL_SQL: std::sync::LazyLock<String> =
                ON trait_member.summary_id=trait_export.summary_id \
               AND trait_member.member_ordinal=trait_export.declaration_member_ordinal \
              {target_file} \
+             CROSS JOIN temp.surface_dense AS trait_site_dense \
+               ON trait_site_dense.blob_id=trait_attachment.blob_id \
+              AND trait_site_dense.id_space=0 \
+              AND trait_site_dense.surface_ordinal={trait_ordinal} \
+             CROSS JOIN main.resolution_sites AS trait_site \
+               ON trait_site.blob_id=trait_attachment.blob_id \
+              AND trait_site.site=trait_site_dense.dense_id \
              CROSS JOIN main.source_native_declaration_bridges AS trait_bridge \
-               ON trait_bridge.blob_id=trait_member.blob_id \
-              AND trait_bridge.source_site=trait_export.declaration_site \
+               ON trait_bridge.blob_id=trait_attachment.blob_id \
+              AND trait_bridge.source_site=trait_site.site \
              WHERE impl_keys.blob_oid=?1 AND impl_keys.lang='rust' AND impl_keys.parse_variant=?5"
         )
     });
@@ -10512,24 +10214,36 @@ pub(crate) static RUST_TRAIT_IMPL_SPELLINGS_SQL: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| {
         let target_live = live_rust_summary_by_id("asked", "asked_member.summary_id");
         let target_file = live_rust_member_file_joins("asked", "asked_member", "asked_versions");
+        let asked_ordinal = rust_child_export_site_ordinal("asked_export");
         let impl_live = live_rust_summary_by_id("impl", "trait_endpoint.summary_id");
         let impl_file = live_rust_member_file_joins("impl", "impl_member", "impl_versions");
         format!(
-            "SELECT DISTINCT spelled.terminal_spelling \
+            "SELECT DISTINCT retained_relation.terminal_spelling \
              FROM main.blobs AS asked_keys \
              CROSS JOIN main.source_native_declaration_bridges AS asked \
                INDEXED BY source_native_declaration_bridges_declaration \
                ON asked.blob_id=asked_keys.id AND asked.declaration_id=?2 \
              CROSS JOIN main.resolution_unit_summary_members AS asked_member \
-               INDEXED BY resolution_unit_summary_members_blob \
-               ON asked_member.blob_id=asked_keys.id AND asked_member.rel_path=?3 \
+               INDEXED BY resolution_unit_summary_members_path \
+               ON asked_member.rel_path=?3 \
+              AND EXISTS (SELECT 1 FROM temp.selected_unit_member_blobs AS attachment \
+                          WHERE attachment.summary_id=asked_member.summary_id \
+                            AND attachment.member_ordinal=asked_member.member_ordinal \
+                            AND attachment.blob_id=asked_keys.id) \
              {target_live} {target_file} \
              CROSS JOIN main.rust_resolution_unit_summary_exports AS asked_export \
                INDEXED BY rust_resolution_unit_summary_exports_declaration \
                ON asked_export.summary_id=asked_member.summary_id \
               AND asked_export.declaration_member_ordinal=asked_member.member_ordinal \
-              AND asked_export.declaration_site=asked.source_site \
               AND asked_export.namespace='type' AND asked_export.origin='declaration' \
+             CROSS JOIN temp.surface_dense AS asked_site_dense \
+               ON asked_site_dense.blob_id=asked_attachment.blob_id \
+              AND asked_site_dense.id_space=0 \
+              AND asked_site_dense.surface_ordinal={asked_ordinal} \
+             CROSS JOIN main.resolution_sites AS asked_site \
+               ON asked_site.blob_id=asked_attachment.blob_id \
+              AND asked_site.site=asked_site_dense.dense_id \
+              AND asked_site.site=asked.source_site \
              CROSS JOIN main.rust_resolution_unit_summary_trait_endpoints AS trait_endpoint \
                INDEXED BY rust_resolution_unit_summary_trait_endpoints_target \
                ON trait_endpoint.target_unit_key=asked_versions.unit_key \
@@ -10549,10 +10263,12 @@ pub(crate) static RUST_TRAIT_IMPL_SPELLINGS_SQL: std::sync::LazyLock<String> =
                ON impl_member.summary_id=impl_versions.summary_id \
               AND impl_member.member_ordinal=trait_endpoint.member_ordinal \
              {impl_file} \
-             CROSS JOIN main.resolution_trait_implementations AS spelled \
-               ON spelled.blob_id=impl_member.blob_id \
-              AND spelled.relation_key=trait_endpoint.source_relation_key \
-              AND spelled.side='trait' AND spelled.terminal_spelling IS NOT NULL \
+             /* Rust-only derived-from blob until #11183 M3 converts Rust child rows */ \
+             CROSS JOIN main.resolution_trait_implementations AS retained_relation \
+               ON retained_relation.blob_id=impl_member.blob_id \
+              AND retained_relation.relation_key=trait_endpoint.source_relation_key \
+              AND retained_relation.side='trait' \
+              AND retained_relation.terminal_spelling IS NOT NULL \
              WHERE asked_keys.blob_oid=?1 AND asked_keys.lang='rust' AND asked_keys.parse_variant=?5"
         )
     });
@@ -12362,29 +12078,7 @@ pub fn read_rust_usage_facts_bulk_with_session(
         let placeholders = chunk_placeholders(chunk);
         let params = chunk_params(key, chunk);
 
-        // Registered, unparsed blobs have no metadata and remain absent. A
-        // retained publication, however, must never hydrate legacy module rows.
-        let sql = format!(
-            "SELECT keys.blob_oid FROM blobs AS keys
-             JOIN blob_meta AS meta ON meta.blob_id = keys.id
-             WHERE keys.lang = ? AND keys.parse_variant = ? AND keys.blob_oid IN ({placeholders})
-               AND NOT EXISTS (
-                   SELECT 1 FROM rust_published_fact_blobs AS ready
-                   WHERE ready.blob_id = keys.id
-               )"
-        );
-        let mut stmt = conn.prepare_cached(&sql)?;
-        let unavailable = stmt
-            .query_map(params_from_iter(params.iter()), |row| {
-                row.get::<_, String>(0)
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        if !unavailable.is_empty() {
-            return Err(StoreError::new(format!(
-                "canonical Rust module publication is unavailable for {unavailable:?}"
-            )));
-        }
-        drop(stmt);
+        ensure_rust_module_fact_publications(conn, &placeholders, &params)?;
 
         let sql = format!(
             "SELECT keys.blob_oid, facts.exported_name, facts.source_path,
@@ -12573,186 +12267,251 @@ pub fn read_rust_usage_facts_bulk_with_session(
         drop(rows);
         drop(stmt);
 
-        let sql = format!(
-            "SELECT keys.blob_oid, source_scope.declaration_id,
-                    facts.parent_ordinal, facts.module_name,
-                    facts.path_attribute, facts.visibility, facts.imports_macros,
-                    facts.resolution_scope, facts.body_start, facts.body_end
-             FROM blobs AS keys
-             JOIN rust_module_scopes AS facts ON facts.blob_id = keys.id
-             JOIN source_rust_module_scopes AS source_scope
-               ON source_scope.blob_id = facts.blob_id
-              AND source_scope.ordinal = facts.ordinal
-             WHERE keys.lang = ? AND keys.parse_variant = ? AND keys.blob_oid IN ({placeholders})
-             ORDER BY keys.blob_oid, facts.ordinal"
-        );
-        let mut stmt = conn.prepare_cached(&sql)?;
-        let mut rows = stmt.query(params_from_iter(params.iter()))?;
-        while let Some(row) = rows.next()? {
-            if session.is_some_and(|session| !session.scope_step()) {
-                return Ok(None);
-            }
-            let oid = row.get::<_, String>(0)?;
-            let scope = decode_rust_module_scope_row(row, 1)?;
-            out.entry(oid)
-                .or_default()
-                .module_routes
-                .scopes
-                .push(scope?);
+        if !read_rust_module_walk_chunk(conn, &placeholders, &params, session, &mut out)? {
+            return Ok(None);
         }
-        drop(rows);
-        drop(stmt);
-
-        let sql = format!(
-            "SELECT keys.blob_oid, source_route.declaration_id,
-                    facts.scope_ordinal, facts.module_name,
-                    facts.path_attribute, facts.visibility, facts.imports_macros,
-                    facts.test_gated, facts.cfg_condition, facts.declaration_start,
-                    facts.declaration_end
-             FROM blobs AS keys
-             JOIN rust_module_routes AS facts ON facts.blob_id = keys.id
-             JOIN source_rust_module_routes AS source_route
-               ON source_route.blob_id = facts.blob_id
-              AND source_route.ordinal = facts.ordinal
-             WHERE keys.lang = ? AND keys.parse_variant = ? AND keys.blob_oid IN ({placeholders})
-             ORDER BY keys.blob_oid, facts.ordinal"
-        );
-        let mut stmt = conn.prepare_cached(&sql)?;
-        let mut rows = stmt.query(params_from_iter(params.iter()))?;
-        while let Some(row) = rows.next()? {
-            if session.is_some_and(|session| !session.scope_step()) {
-                return Ok(None);
-            }
-            let oid = row.get::<_, String>(0)?;
-            let route = decode_rust_module_route_row(row, 1)?;
-            out.entry(oid)
-                .or_default()
-                .module_routes
-                .routes
-                .push(route?);
-        }
-        drop(rows);
-        drop(stmt);
-
-        let sql = format!(
-            "SELECT keys.blob_oid, facts.route_ordinal, facts.macro_name,
-                    facts.invocation_start
-             FROM blobs AS keys
-             JOIN rust_module_route_gates AS facts ON facts.blob_id = keys.id
-             WHERE keys.lang = ? AND keys.parse_variant = ? AND keys.blob_oid IN ({placeholders})
-             ORDER BY keys.blob_oid, facts.route_ordinal, facts.gate_ordinal"
-        );
-        let mut stmt = conn.prepare_cached(&sql)?;
-        let mut rows = stmt.query(params_from_iter(params.iter()))?;
-        while let Some(row) = rows.next()? {
-            if session.is_some_and(|session| !session.scope_step()) {
-                return Ok(None);
-            }
-            let oid = row.get::<_, String>(0)?;
-            let gate = decode_rust_module_route_gate_row(row, 1)?;
-            let (route_ordinal, gate) = gate?;
-            attach_rust_module_route_gate(
-                &mut out.entry(oid).or_default().module_routes.routes,
-                route_ordinal,
-                gate,
-            )?;
-        }
-        drop(rows);
-        drop(stmt);
-
-        let sql = format!(
-            "SELECT keys.blob_oid, facts.macro_name, facts.visible_after,
-                    facts.scope_start, facts.scope_end, facts.passthrough,
-                    facts.exported, facts.declaration_id, facts.arguments_only,
-                    facts.decoration_cfg, facts.declares_no_item, facts.writes_only_impls
-             FROM blobs AS keys
-             JOIN rust_item_macros AS facts ON facts.blob_id = keys.id
-             WHERE keys.lang = ? AND keys.parse_variant = ? AND keys.blob_oid IN ({placeholders})
-             ORDER BY keys.blob_oid, facts.ordinal"
-        );
-        let mut stmt = conn.prepare_cached(&sql)?;
-        let mut rows = stmt.query(params_from_iter(params.iter()))?;
-        while let Some(row) = rows.next()? {
-            if session.is_some_and(|session| !session.scope_step()) {
-                return Ok(None);
-            }
-            let oid = row.get::<_, String>(0)?;
-            let definition = decode_rust_item_macro_row(row, 1)?;
-            out.entry(oid)
-                .or_default()
-                .module_routes
-                .item_macros
-                .push(definition?);
-        }
-        drop(rows);
-        drop(stmt);
-
-        let sql = format!(
-            "SELECT keys.blob_oid, facts.relative_path, facts.file_name,
-                    facts.include_start
-             FROM blobs AS keys
-             JOIN rust_include_edges AS facts ON facts.blob_id = keys.id
-             WHERE keys.lang = ? AND keys.parse_variant = ? AND keys.blob_oid IN ({placeholders})
-             ORDER BY keys.blob_oid, facts.ordinal"
-        );
-        let mut stmt = conn.prepare_cached(&sql)?;
-        let mut rows = stmt.query(params_from_iter(params.iter()))?;
-        while let Some(row) = rows.next()? {
-            if session.is_some_and(|session| !session.scope_step()) {
-                return Ok(None);
-            }
-            let oid = row.get::<_, String>(0)?;
-            out.entry(oid)
-                .or_default()
-                .include_edges
-                .push(RustIncludeEdgeFact {
-                    relative_path: row.get(1)?,
-                    file_name: row.get(2)?,
-                    include_start: i64_to_usize(row.get::<_, i64>(3)?)?,
-                    host_bindings: Vec::new(),
-                });
-        }
-        drop(rows);
-        drop(stmt);
-
-        let sql = format!(
-            "SELECT keys.blob_oid, facts.edge_ordinal, facts.local_name,
-                    facts.module_specifier, facts.imported_name, facts.scope_start,
-                    facts.kind
-             FROM blobs AS keys
-             JOIN rust_include_host_bindings AS facts ON facts.blob_id = keys.id
-             WHERE keys.lang = ? AND keys.parse_variant = ? AND keys.blob_oid IN ({placeholders})
-             ORDER BY keys.blob_oid, facts.edge_ordinal, facts.ordinal"
-        );
-        let mut stmt = conn.prepare_cached(&sql)?;
-        let mut rows = stmt.query(params_from_iter(params.iter()))?;
-        while let Some(row) = rows.next()? {
-            if session.is_some_and(|session| !session.scope_step()) {
-                return Ok(None);
-            }
-            let oid = row.get::<_, String>(0)?;
-            let edge_ordinal = i64_to_usize(row.get::<_, i64>(1)?)?;
-            let Some(facts) = out.get_mut(&oid) else {
-                continue;
-            };
-            let Some(edge) = facts.include_edges.get_mut(edge_ordinal) else {
-                continue;
-            };
-            let kind = row.get::<_, String>(6)?;
-            let binding = RustIncludeHostBindingFact {
-                local_name: row.get(2)?,
-                module_specifier: row.get(3)?,
-                imported_name: row.get(4)?,
-                scope_start: i64_to_usize(row.get::<_, i64>(5)?)?,
-                kind: decode_rust_include_binding_kind(&kind)
-                    .unwrap_or_else(|| panic!("unknown persisted include binding kind: {kind}")),
-            };
-            edge.host_bindings.push(binding);
-        }
-        drop(rows);
-        drop(stmt);
     }
     Ok(Some(out))
+}
+
+/// The selected module walk consumes only route and include facts. General
+/// Rust usage readers continue to hydrate the complete publication above.
+pub(crate) fn read_rust_module_walk_facts(
+    conn: &Connection,
+    key: &BlobKey,
+) -> Result<RustUsageFacts> {
+    let oid = key.oid.to_string();
+    let requested = [oid.clone()];
+    let placeholders = chunk_placeholders(&requested);
+    let params = chunk_params(key, &requested);
+    ensure_rust_module_fact_publications(conn, &placeholders, &params)?;
+    let mut out = HashMap::default();
+    assert!(
+        read_rust_module_walk_chunk(conn, &placeholders, &params, None, &mut out)?,
+        "unbounded module walk does not stop"
+    );
+    Ok(out.remove(&oid).unwrap_or_default())
+}
+
+fn ensure_rust_module_fact_publications(
+    conn: &Connection,
+    placeholders: &str,
+    params: &[rusqlite::types::Value],
+) -> Result<()> {
+    // Registered, unparsed blobs have no metadata and remain absent. A
+    // retained publication, however, must never hydrate legacy module rows.
+    let sql = format!(
+        "SELECT keys.blob_oid FROM blobs AS keys
+         JOIN blob_meta AS meta ON meta.blob_id = keys.id
+         WHERE keys.lang = ? AND keys.parse_variant = ? AND keys.blob_oid IN ({placeholders})
+           AND NOT EXISTS (
+               SELECT 1 FROM rust_published_fact_blobs AS ready
+               WHERE ready.blob_id = keys.id
+           )"
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let unavailable = stmt
+        .query_map(params_from_iter(params.iter()), |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !unavailable.is_empty() {
+        return Err(StoreError::new(format!(
+            "canonical Rust module publication is unavailable for {unavailable:?}"
+        )));
+    }
+    drop(stmt);
+
+    Ok(())
+}
+
+fn read_rust_module_walk_chunk(
+    conn: &Connection,
+    placeholders: &str,
+    params: &[rusqlite::types::Value],
+    session: Option<&ResolutionSession>,
+    out: &mut HashMap<String, RustUsageFacts>,
+) -> Result<bool> {
+    let sql = format!(
+        "SELECT keys.blob_oid, source_scope.declaration_id,
+                facts.parent_ordinal, facts.module_name,
+                facts.path_attribute, facts.visibility, facts.imports_macros,
+                facts.resolution_scope, facts.body_start, facts.body_end
+         FROM blobs AS keys
+         JOIN rust_module_scopes AS facts ON facts.blob_id = keys.id
+         JOIN source_rust_module_scopes AS source_scope
+           ON source_scope.blob_id = facts.blob_id
+          AND source_scope.ordinal = facts.ordinal
+         WHERE keys.lang = ? AND keys.parse_variant = ? AND keys.blob_oid IN ({placeholders})
+         ORDER BY keys.blob_oid, facts.ordinal"
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let mut rows = stmt.query(params_from_iter(params.iter()))?;
+    while let Some(row) = rows.next()? {
+        if session.is_some_and(|session| !session.scope_step()) {
+            return Ok(false);
+        }
+        let oid = row.get::<_, String>(0)?;
+        let scope = decode_rust_module_scope_row(row, 1)?;
+        out.entry(oid)
+            .or_default()
+            .module_routes
+            .scopes
+            .push(scope?);
+    }
+    drop(rows);
+    drop(stmt);
+
+    let sql = format!(
+        "SELECT keys.blob_oid, source_route.declaration_id,
+                facts.scope_ordinal, facts.module_name,
+                facts.path_attribute, facts.visibility, facts.imports_macros,
+                facts.test_gated, facts.cfg_condition, facts.declaration_start,
+                facts.declaration_end
+         FROM blobs AS keys
+         JOIN rust_module_routes AS facts ON facts.blob_id = keys.id
+         JOIN source_rust_module_routes AS source_route
+           ON source_route.blob_id = facts.blob_id
+          AND source_route.ordinal = facts.ordinal
+         WHERE keys.lang = ? AND keys.parse_variant = ? AND keys.blob_oid IN ({placeholders})
+         ORDER BY keys.blob_oid, facts.ordinal"
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let mut rows = stmt.query(params_from_iter(params.iter()))?;
+    while let Some(row) = rows.next()? {
+        if session.is_some_and(|session| !session.scope_step()) {
+            return Ok(false);
+        }
+        let oid = row.get::<_, String>(0)?;
+        let route = decode_rust_module_route_row(row, 1)?;
+        out.entry(oid)
+            .or_default()
+            .module_routes
+            .routes
+            .push(route?);
+    }
+    drop(rows);
+    drop(stmt);
+
+    let sql = format!(
+        "SELECT keys.blob_oid, facts.route_ordinal, facts.macro_name,
+                facts.invocation_start
+         FROM blobs AS keys
+         JOIN rust_module_route_gates AS facts ON facts.blob_id = keys.id
+         WHERE keys.lang = ? AND keys.parse_variant = ? AND keys.blob_oid IN ({placeholders})
+         ORDER BY keys.blob_oid, facts.route_ordinal, facts.gate_ordinal"
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let mut rows = stmt.query(params_from_iter(params.iter()))?;
+    while let Some(row) = rows.next()? {
+        if session.is_some_and(|session| !session.scope_step()) {
+            return Ok(false);
+        }
+        let oid = row.get::<_, String>(0)?;
+        let gate = decode_rust_module_route_gate_row(row, 1)?;
+        let (route_ordinal, gate) = gate?;
+        attach_rust_module_route_gate(
+            &mut out.entry(oid).or_default().module_routes.routes,
+            route_ordinal,
+            gate,
+        )?;
+    }
+    drop(rows);
+    drop(stmt);
+
+    let sql = format!(
+        "SELECT keys.blob_oid, facts.macro_name, facts.visible_after,
+                facts.scope_start, facts.scope_end, facts.passthrough,
+                facts.exported, facts.declaration_id, facts.arguments_only,
+                facts.decoration_cfg, facts.declares_no_item, facts.writes_only_impls,
+                        (SELECT cfg_condition FROM source_rust_declaration_properties AS property WHERE property.blob_id=facts.blob_id AND property.declaration_id=facts.declaration_id)
+         FROM blobs AS keys
+         JOIN rust_item_macros AS facts ON facts.blob_id = keys.id
+         WHERE keys.lang = ? AND keys.parse_variant = ? AND keys.blob_oid IN ({placeholders})
+         ORDER BY keys.blob_oid, facts.ordinal"
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let mut rows = stmt.query(params_from_iter(params.iter()))?;
+    while let Some(row) = rows.next()? {
+        if session.is_some_and(|session| !session.scope_step()) {
+            return Ok(false);
+        }
+        let oid = row.get::<_, String>(0)?;
+        let definition = decode_rust_item_macro_row(row, 1)?;
+        out.entry(oid)
+            .or_default()
+            .module_routes
+            .item_macros
+            .push(definition?);
+    }
+    drop(rows);
+    drop(stmt);
+
+    let sql = format!(
+        "SELECT keys.blob_oid, facts.relative_path, facts.file_name,
+                facts.include_start
+         FROM blobs AS keys
+         JOIN rust_include_edges AS facts ON facts.blob_id = keys.id
+         WHERE keys.lang = ? AND keys.parse_variant = ? AND keys.blob_oid IN ({placeholders})
+         ORDER BY keys.blob_oid, facts.ordinal"
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let mut rows = stmt.query(params_from_iter(params.iter()))?;
+    while let Some(row) = rows.next()? {
+        if session.is_some_and(|session| !session.scope_step()) {
+            return Ok(false);
+        }
+        let oid = row.get::<_, String>(0)?;
+        out.entry(oid)
+            .or_default()
+            .include_edges
+            .push(RustIncludeEdgeFact {
+                relative_path: row.get(1)?,
+                file_name: row.get(2)?,
+                include_start: i64_to_usize(row.get::<_, i64>(3)?)?,
+                host_bindings: Vec::new(),
+            });
+    }
+    drop(rows);
+    drop(stmt);
+
+    let sql = format!(
+        "SELECT keys.blob_oid, facts.edge_ordinal, facts.local_name,
+                facts.module_specifier, facts.imported_name, facts.scope_start,
+                facts.kind
+         FROM blobs AS keys
+         JOIN rust_include_host_bindings AS facts ON facts.blob_id = keys.id
+         WHERE keys.lang = ? AND keys.parse_variant = ? AND keys.blob_oid IN ({placeholders})
+         ORDER BY keys.blob_oid, facts.edge_ordinal, facts.ordinal"
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let mut rows = stmt.query(params_from_iter(params.iter()))?;
+    while let Some(row) = rows.next()? {
+        if session.is_some_and(|session| !session.scope_step()) {
+            return Ok(false);
+        }
+        let oid = row.get::<_, String>(0)?;
+        let edge_ordinal = i64_to_usize(row.get::<_, i64>(1)?)?;
+        let Some(facts) = out.get_mut(&oid) else {
+            continue;
+        };
+        let Some(edge) = facts.include_edges.get_mut(edge_ordinal) else {
+            continue;
+        };
+        let kind = row.get::<_, String>(6)?;
+        let binding = RustIncludeHostBindingFact {
+            local_name: row.get(2)?,
+            module_specifier: row.get(3)?,
+            imported_name: row.get(4)?,
+            scope_start: i64_to_usize(row.get::<_, i64>(5)?)?,
+            kind: decode_rust_include_binding_kind(&kind)
+                .unwrap_or_else(|| panic!("unknown persisted include binding kind: {kind}")),
+        };
+        edge.host_bindings.push(binding);
+    }
+    drop(rows);
+    drop(stmt);
+    Ok(true)
 }
 
 pub(crate) fn read_rust_usage_facts_with_session(
@@ -12880,6 +12639,10 @@ fn decode_rust_item_macro_row(
     let writes_only_impls = row.get::<_, i64>(base + 10)? != 0;
     Ok((|| {
         Ok(RustRulesItemMacroDefinition {
+            cfg_condition: brokk_bifrost_core::analyzer::rust_facts::decode_rust_cfg_condition(
+                &row.get::<_, String>(base + 11)?,
+            )
+            .ok_or_else(|| StoreError::corrupt("invalid item macro cfg"))?,
             declaration,
             name,
             visible_after: i64_to_usize(visible_after)?,
@@ -13315,6 +13078,20 @@ impl PreparedParsedBlob {
         self.mutation_payload_bytes
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn surface_logical_rows_for_test(&self) -> usize {
+        surface_relations::prepared_surface_cost(self).logical_rows
+    }
+
+    fn grouping_cost(&self) -> PersistedMutationCost {
+        let surface = surface_relations::prepared_surface_cost(self);
+        PersistedMutationCost {
+            logical_rows: self.logical_rows().saturating_add(surface.logical_rows),
+            payload_bytes: self.payload_bytes().saturating_add(surface.payload_bytes),
+        }
+    }
+
     fn persisted_payload_bytes(&self) -> usize {
         self.payload_bytes.saturating_sub(self.state.source.len())
     }
@@ -13576,17 +13353,23 @@ impl<'a> PreparedPersistenceWriter<'a> {
                 .filter(|fragment| !batch_keys.contains(&fragment.key))
                 .collect::<Vec<_>>();
             let new_fragment_count = new_fragments.len();
-            let new_rows =
-                saturating_sum(new_fragments.iter().map(|fragment| fragment.logical_rows()));
-            let new_bytes = saturating_sum(
-                new_fragments
-                    .iter()
-                    .map(|fragment| fragment.payload_bytes()),
+            let new_cost = new_fragments.iter().fold(
+                PersistedMutationCost::default(),
+                |mut cost, fragment| {
+                    let fragment_cost = fragment.grouping_cost();
+                    cost.logical_rows =
+                        cost.logical_rows.saturating_add(fragment_cost.logical_rows);
+                    cost.payload_bytes = cost
+                        .payload_bytes
+                        .saturating_add(fragment_cost.payload_bytes);
+                    cost
+                },
             );
             let exceeds = !batch.is_empty()
                 && (batch_fragments.saturating_add(new_fragment_count) > limits.max_blobs
-                    || batch_rows.saturating_add(new_rows) > limits.max_rows
-                    || batch_bytes.saturating_add(new_bytes) > limits.max_payload_bytes);
+                    || batch_rows.saturating_add(new_cost.logical_rows) > limits.max_rows
+                    || batch_bytes.saturating_add(new_cost.payload_bytes)
+                        > limits.max_payload_bytes);
             let same_source_as_batch =
                 batch
                     .last()
@@ -13609,8 +13392,9 @@ impl<'a> PreparedPersistenceWriter<'a> {
             for fragment in fragments {
                 if batch_keys.insert(fragment.key.clone()) {
                     added_fragments = added_fragments.saturating_add(1);
-                    added_rows = added_rows.saturating_add(fragment.logical_rows());
-                    added_bytes = added_bytes.saturating_add(fragment.payload_bytes());
+                    let cost = fragment.grouping_cost();
+                    added_rows = added_rows.saturating_add(cost.logical_rows);
+                    added_bytes = added_bytes.saturating_add(cost.payload_bytes);
                 }
             }
             batch_fragments = batch_fragments.saturating_add(added_fragments);
@@ -13892,6 +13676,9 @@ fn try_persist_prepared_chunk_tx(
     #[cfg(any(test, feature = "test-support"))]
     counters.transaction_starts.fetch_add(1, Ordering::SeqCst);
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // One typed preflight per actual batch, under the same writer transaction
+    // and before any persisted fragment or producer mutation.
+    brokk_bifrost_core::cache_db::publication_lineage::require_publication_nonce(&tx)?;
     let mut fragments = Vec::new();
     for (_, root) in prepared {
         root.append_fragments(&mut fragments);
@@ -14012,6 +13799,11 @@ fn try_persist_prepared_chunk_tx(
                 cancellation,
             )?;
         }
+        let (_, surface_cost) = surface_relations::ensure_surface_set_tx(&tx, blob_id)?;
+        cost.logical_rows = cost.logical_rows.saturating_add(surface_cost.logical_rows);
+        cost.payload_bytes = cost
+            .payload_bytes
+            .saturating_add(surface_cost.payload_bytes);
         csharp_compilation::extent::content_available(&tx, &blob.key.lang, blob_id)?;
         brokk_bifrost_core::definition_inventory::reconcile_definition_inventory_for_blob_tx(
             &tx,
@@ -14023,6 +13815,14 @@ fn try_persist_prepared_chunk_tx(
     if cancellation.is_cancelled() {
         tx.rollback()?;
         return Err(StoreError::new("prepared blob persistence was cancelled"));
+    }
+    if multiple_source_groups
+        && (cost.logical_rows > limits.max_rows || cost.payload_bytes > limits.max_payload_bytes)
+    {
+        return Err(StoreError::resource_bound(format!(
+            "published mutation batch exceeds grouping targets: rows={}, bytes={}",
+            cost.logical_rows, cost.payload_bytes
+        )));
     }
     tx.commit()?;
     Ok(cost)
@@ -14384,10 +14184,21 @@ pub fn prepare_parse_time_semantic_ir(
         }
         None => None,
     };
+    let candidate_flows = if let Some((artifact, _)) = &lowered {
+        match crate::analyzer::semantic::partial_flow::fixpoint::candidate_macro_partial_flows_with_limits(
+            artifact, prepared, cancellation, Default::default(),
+        ) {
+            Some(flows) => flows,
+            None => return Ok(None),
+        }
+    } else {
+        Vec::new()
+    };
     let _encode = crate::profiling::scope("semantic_ir.encode");
-    let rows = PreparedSemanticIr::prepare(
+    let rows = PreparedSemanticIr::prepare_with_candidate_flows(
         outcome,
         lowered.as_ref().map(|(_, flows)| flows.as_slice()),
+        &candidate_flows,
         &producer_epoch,
         content,
         prepared.source().len(),
@@ -14445,12 +14256,14 @@ fn lower_parse_time_semantic_ir(
                 key,
                 lowerer.capabilities(),
                 parts.clone(),
-                &mut SemanticBudget::default(),
+                &mut SemanticBudget::producer(),
+                cancellation,
             ) {
                 Ok(artifact) => Some((
                     SemanticIrLoweringOutcome::Complete { parts },
                     Some(Arc::new(artifact)),
                 )),
+                Err(SemanticArtifactBuildError::Cancelled) => None,
                 Err(SemanticArtifactBuildError::Invalid(error)) => {
                     unvalidated(SemanticIrLoweringOutcome::Error(error.to_string()))
                 }
@@ -15237,6 +15050,33 @@ impl AnalyzerStore {
             lang,
             family,
             key,
+            None,
+            || true,
+        )
+    }
+
+    /// A complete candidate superset within the caller's remaining work.
+    /// Unknown authority, cancellation or exhaustion discards every partial
+    /// candidate: none of those outcomes can constrain a subsequent lookup.
+    pub fn index_blob_candidates_for_key_at_limited(
+        &self,
+        listed: &ListedSnapshots,
+        lang: &str,
+        family: IndexFamily,
+        key: &[u8],
+        remaining: &mut usize,
+        mut continue_query: impl FnMut() -> bool,
+    ) -> Result<Option<Vec<DefinitionIndexCandidate>>> {
+        if *remaining == 0 || !continue_query() || !listed.snapshots().contains_key(lang) {
+            return Ok(None);
+        }
+        self.index_blob_candidates(
+            self.read_conn_for_workspace(listed.snapshots())?,
+            lang,
+            family,
+            key,
+            Some(remaining),
+            continue_query,
         )
     }
 
@@ -15253,7 +15093,7 @@ impl AnalyzerStore {
         if !workspace_listing_complete {
             return Ok(None);
         }
-        self.index_blob_candidates(self.read_conn()?, lang, family, key)
+        self.index_blob_candidates(self.read_conn()?, lang, family, key, None, || true)
     }
 
     fn index_blob_candidates(
@@ -15262,6 +15102,8 @@ impl AnalyzerStore {
         lang: &str,
         family: IndexFamily,
         key: &[u8],
+        mut remaining: Option<&mut usize>,
+        mut continue_query: impl FnMut() -> bool,
     ) -> Result<Option<Vec<DefinitionIndexCandidate>>> {
         let arms: &[usize] = match family {
             IndexFamily::DefinitionExact => &[0, 4, 6],
@@ -15273,6 +15115,9 @@ impl AnalyzerStore {
         let key = std::str::from_utf8(key).map_err(|error| StoreError::new(error.to_string()))?;
         let tx = conn.transaction()?;
         for sql in DEFINITION_INVENTORY_UNKNOWN_ARMS {
+            if remaining.as_ref().is_some_and(|budget| **budget == 0) || !continue_query() {
+                return Ok(None);
+            }
             if tx.query_row(sql, [lang], |row| row.get::<_, bool>(0))? {
                 return Ok(None);
             }
@@ -15281,11 +15126,23 @@ impl AnalyzerStore {
             .iter()
             .map(|&arm| DEFINITION_INVENTORY_CANDIDATE_ARMS[arm])
             .collect::<Vec<_>>()
-            .join(" UNION ");
+            .join(" UNION ALL ");
         let mut stmt = tx.prepare_cached(&sql)?;
         let mut rows = stmt.query(params![lang, key])?;
         let mut candidates = Vec::new();
-        while let Some(row) = rows.next()? {
+        loop {
+            if remaining.as_ref().is_some_and(|budget| **budget == 0) || !continue_query() {
+                return Ok(None);
+            }
+            let Some(row) = rows.next()? else {
+                break;
+            };
+            if let Some(budget) = remaining.as_deref_mut() {
+                *budget -= 1;
+            }
+            // UNION ALL streams instead of materializing a workspace-sized
+            // distinct result. Charging duplicate rows can only cause earlier
+            // fallback; a partial constraint is never authoritative.
             candidates.push(DefinitionIndexCandidate {
                 mounted_path: PathBuf::from(row.get::<_, String>(0)?),
                 blob: BlobKey {
@@ -15295,6 +15152,18 @@ impl AnalyzerStore {
                 },
             });
         }
+        candidates.sort_unstable_by(|left, right| {
+            left.mounted_path
+                .cmp(&right.mounted_path)
+                .then_with(|| left.blob.oid.as_bytes().cmp(right.blob.oid.as_bytes()))
+                .then_with(|| {
+                    left.blob
+                        .variant
+                        .as_bytes()
+                        .cmp(right.blob.variant.as_bytes())
+                })
+        });
+        candidates.dedup();
         Ok(Some(candidates))
     }
 }
@@ -15709,8 +15578,12 @@ pub fn collect_stored_units<A: StoreLanguageAdapter>(
         })
         .collect();
 
+    // Rendered fields can tie for distinct structured names. Dense keys stay
+    // local to this blob, but must not inherit hash-table or interning order.
     units.sort_by(|left, right| {
-        stored_unit_order_key(state, &left.unit).cmp(&stored_unit_order_key(state, &right.unit))
+        stored_unit_order_key(state, &left.unit)
+            .cmp(&stored_unit_order_key(state, &right.unit))
+            .then_with(|| left.unit.cmp(&right.unit))
     });
     for (index, unit) in units.iter_mut().enumerate() {
         unit.key = index as i64;
@@ -19917,7 +19790,10 @@ fn matching_language_epochs_conn(
 /// Return the head revision of one storage language after checking that it is
 /// still the revision the analyzer based its change on.
 /// The certificate stored at a revision: its derivation version and failures.
-pub(super) type RustListingCertificate = (i64, std::collections::BTreeSet<(String, String)>);
+#[doc(hidden)]
+pub type RustListingInput = ([u8; 32], Vec<(String, String)>);
+
+pub(super) type RustListingCertificate = ([u8; 32], std::collections::BTreeSet<(String, String)>);
 
 pub(super) fn rust_listing_certificate_at(
     conn: &Connection,
@@ -19931,10 +19807,10 @@ pub(super) fn rust_listing_certificate_at(
     ];
     let Some(version) = conn
         .query_row(
-            "SELECT derivation_version FROM rust_source_listing_certificates
+            "SELECT derivation_identity FROM rust_source_listing_certificates
              WHERE workspace_id=?1 AND lang=?2 AND generation=?3 AND revision=?4",
             key,
-            |row| row.get::<_, i64>(0),
+            |row| row.get::<_, [u8; 32]>(0),
         )
         .optional()?
     else {
@@ -19959,7 +19835,7 @@ pub(super) fn rust_listing_certificate_at(
 fn write_rust_listing_certificate(
     tx: &Transaction<'_>,
     snapshot: &WorkspaceSnapshotId,
-    derivation_version: i64,
+    derivation_identity: [u8; 32],
     failures: &[(String, String)],
 ) -> Result<()> {
     assert!(
@@ -19968,14 +19844,14 @@ fn write_rust_listing_certificate(
     );
     tx.execute(
         "INSERT INTO rust_source_listing_certificates
-         (workspace_id,lang,generation,revision,derivation_version,complete)
+         (workspace_id,lang,generation,revision,derivation_identity,complete)
          VALUES (?1,?2,?3,?4,?5,?6)",
         params![
             snapshot.workspace_id.as_str(),
             snapshot.lang,
             snapshot.generation.0,
             snapshot.revision,
-            derivation_version,
+            derivation_identity,
             failures.is_empty()
         ],
     )?;
@@ -20007,11 +19883,17 @@ fn publish_rust_listing_certificate(
     tx: &Transaction<'_>,
     snapshot: WorkspaceSnapshotId,
     head_before: Option<i64>,
-    (version, failures): &(i64, Vec<(String, String)>),
+    (version, failures): &([u8; 32], Vec<(String, String)>),
 ) -> Result<WorkspaceSnapshotId> {
     assert_eq!(snapshot.lang, "rust");
     if head_before == Some(snapshot.revision) {
-        certify_rust_listing(tx, &snapshot, *version, failures)
+        // The selected view is validated by its own digest when loaded, and
+        // by its local input references again when the new evidence is admitted.
+        // Its caller has just published captured configuration for this revision.
+        let acquired = rust_acquired_cargo_config::selected(tx, &snapshot)?.ok_or_else(|| {
+            StoreError::new("Rust listing certification requires selected Cargo acquisition")
+        })?;
+        certify_rust_listing(tx, &snapshot, *version, failures, &acquired)
     } else {
         write_rust_listing_certificate(tx, &snapshot, *version, failures)?;
         Ok(snapshot)
@@ -20027,10 +19909,11 @@ fn publish_rust_listing_certificate(
 fn certify_rust_listing(
     tx: &Transaction<'_>,
     snapshot: &WorkspaceSnapshotId,
-    derivation_version: i64,
+    derivation_identity: [u8; 32],
     failures: &[(String, String)],
+    acquired: &brokk_bifrost_rust::cargo_config::acquired::RustCargoAcquiredConfigView,
 ) -> Result<WorkspaceSnapshotId> {
-    let wanted = (derivation_version, failures.iter().cloned().collect());
+    let wanted = (derivation_identity, failures.iter().cloned().collect());
     if rust_listing_certificate_at(tx, snapshot)? == Some(wanted) {
         return Ok(snapshot.clone());
     }
@@ -20045,8 +19928,8 @@ fn certify_rust_listing(
         revision,
         ..snapshot.clone()
     };
-    dependency_file_evidence::publish(tx, &opened)?;
-    write_rust_listing_certificate(tx, &opened, derivation_version, failures)?;
+    dependency_file_evidence::publish_with_acquired(tx, &opened, acquired)?;
+    write_rust_listing_certificate(tx, &opened, derivation_identity, failures)?;
     Ok(opened)
 }
 
@@ -20304,6 +20187,12 @@ pub fn rust_projection_cascade_payload_bytes_sql(blob_id: &str) -> String {
 // One whole-blob row authority for replacement and stale reclamation. The
 // caller supplies the blob key expression; all three queries bind meta
 // to that same blob. Headerless capsules own no parsed metadata rows.
+fn surface_cascade_payload_bytes_sql(blob_id: &str) -> String {
+    format!(
+        "COALESCE((SELECT SUM(length(CAST(producer_epoch AS BLOB)) + length(list_digest) + length(fingerprint)) FROM surface_sets WHERE blob_id = {blob_id}), 0)"
+    )
+}
+
 fn complete_blob_cascade_rows_sql(blob_id: &str) -> String {
     let class_set_rows = class_set_summary_cascade_rows_sql(blob_id);
     let rust_projection_rows = rust_projection_cascade_rows_sql(blob_id);
@@ -20350,6 +20239,8 @@ fn complete_blob_cascade_rows_sql(blob_id: &str) -> String {
          + {class_set_rows}
          + {rust_projection_rows}
          + {semantic_ir_rows}
+         + (SELECT COUNT(*) FROM surface_sets WHERE blob_id = {blob_id})
+         + (SELECT COUNT(*) FROM surface_ids JOIN surface_sets USING(set_id) WHERE blob_id = {blob_id})
          + (SELECT COUNT(*) FROM workspace_resolution_content_roots WHERE blob_id = {blob_id})"
     )
 }
@@ -20364,6 +20255,7 @@ pub fn stored_blob_cascade_costs_sql(key_count: usize) -> String {
     let complete_rows = complete_blob_cascade_rows_sql("blob.id");
     let class_set_bytes = class_set_summary_cascade_payload_bytes_sql("blob.id");
     let semantic_ir_bytes = semantic_ir_cascade_payload_bytes_sql("blob.id");
+    let surface_bytes = surface_cascade_payload_bytes_sql("blob.id");
     format!(
         "WITH requested(ordinal, blob_oid, lang, parse_variant) AS (VALUES {requested})
          SELECT requested.ordinal,
@@ -20371,13 +20263,13 @@ pub fn stored_blob_cascade_costs_sql(key_count: usize) -> String {
            meta.blob_id IS NOT NULL,
            CASE WHEN blob.id IS NULL THEN 0 ELSE {complete_rows} END,
            CASE WHEN blob.id IS NULL THEN 0
-             WHEN meta.blob_id IS NULL THEN {class_set_bytes} + {semantic_ir_bytes}
+             WHEN meta.blob_id IS NULL THEN {class_set_bytes} + {semantic_ir_bytes} + {surface_bytes}
                + COALESCE((SELECT payload_bytes FROM resolution_fragment_interiors
                  WHERE blob_id = blob.id AND publication_state = 'complete'), 0)
                + COALESCE((SELECT SUM(length(workspace_id) + length(lang))
                  FROM workspace_resolution_content_roots WHERE blob_id = blob.id), 0)
              WHEN costs.payload_bytes IS NULL THEN NULL
-             ELSE costs.payload_bytes + {class_set_bytes}
+             ELSE costs.payload_bytes + {class_set_bytes} + {surface_bytes}
                + COALESCE((SELECT SUM(length(workspace_id) + length(lang))
                  FROM workspace_resolution_content_roots WHERE blob_id = blob.id), 0) END
          , (SELECT COUNT(*) FROM workspace_resolution_content_roots AS roots
@@ -20655,6 +20547,7 @@ pub fn persisted_blob_mutation_cost_fallback_sql() -> &'static str {
         let rust_projection_bytes = rust_projection_cascade_payload_bytes_sql("blob.id");
         let class_set_bytes = class_set_summary_cascade_payload_bytes_sql("blob.id");
         let semantic_ir_bytes = semantic_ir_cascade_payload_bytes_sql("blob.id");
+        let surface_bytes = surface_cascade_payload_bytes_sql("blob.id");
         format!(
             "SELECT
        {complete_rows},
@@ -20735,6 +20628,7 @@ pub fn persisted_blob_mutation_cost_fallback_sql() -> &'static str {
          + {class_set_bytes}
          + {rust_projection_bytes}
          + {semantic_ir_bytes}
+         + {surface_bytes}
          + COALESCE((SELECT SUM(length(CAST(workspace_id AS BLOB)) + length(CAST(lang AS BLOB)))
            FROM workspace_resolution_content_roots WHERE blob_id = blob.id), 0)
      FROM blobs AS blob
@@ -22333,6 +22227,7 @@ struct StructuralNodeJson(
     Option<bool>,
     Option<Vec<String>>,
     Option<String>,
+    Option<u8>,
 );
 
 /// One `source_structural_facts.roles` element, ordered by source node.
@@ -22398,6 +22293,7 @@ fn decode_structural_nodes(
                 unsafe_context,
                 declaration_modifiers,
                 declaration_type_kind,
+                callee_spelling,
             ) = row;
             let declaration_attributes = match (declaration_modifiers, declaration_type_kind) {
                 (None, None) => None,
@@ -22458,12 +22354,15 @@ fn decode_structural_nodes(
                 _ => return Err(serde::de::Error::custom("incomplete callee provenance")),
             };
             let call_site = match (call_kind, call_coverage, continues) {
-                (None, None, None) => None,
+                (None, None, None) if callee_spelling.is_none() => None,
                 (call_kind, Some(coverage), Some(continues)) => Some(PersistedCallSite {
                     call_kind,
                     coverage,
                     continues_callee_groups: continues != 0,
                     callee_provenance,
+                    // An absent spelling is the written callee, which most
+                    // call sites are, so the common row stays short.
+                    callee_spelling: callee_spelling.unwrap_or(0),
                 }),
                 _ => {
                     return Err(serde::de::Error::custom(
@@ -22688,6 +22587,48 @@ pub mod resolution_producer_tests;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod tests {
+    #[cfg(test)]
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9962: a subset request admitted extra installed languages under the lend"
+    )]
+    fn nested_workspace_selection_checks_installed_rows() {
+        use super::{GenerationId, WorkspaceId, WorkspaceSnapshotId};
+
+        // This now runs on the pooled store, reusing a reader with extra installed languages.
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let snapshot = |lang: &str, revision| WorkspaceSnapshotId {
+            workspace_id: WorkspaceId("a".repeat(64)),
+            lang: lang.into(),
+            generation: GenerationId(1),
+            revision,
+        };
+        let csharp = snapshot("csharp", 1);
+        let mut selection = WorkspaceSnapshots::default();
+        selection.insert("csharp".into(), csharp.clone());
+        selection.insert("python".into(), snapshot("python", 2));
+        let outer = store.read_conn().unwrap();
+        let reader = store.read_conn_for_workspace(&selection).unwrap();
+        let serial = reader.pooled_reader_serial_for_test();
+        drop(reader);
+        // The nested checkout must reuse the reader returned with the broader selection.
+        let mut request = WorkspaceSnapshots::default();
+        request.insert("csharp".into(), csharp);
+        let nested = store.read_conn_for_workspace(&request).unwrap();
+        assert_eq!(nested.pooled_reader_serial_for_test(), serial);
+        let installed: Vec<String> = nested
+            .prepare("SELECT lang FROM temp.selected_workspace_revisions ORDER BY lang")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(installed, ["csharp"]);
+        drop(nested);
+        drop(outer);
+    }
     #[cfg(test)]
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
@@ -23147,6 +23088,8 @@ pub mod tests {
                 .module_routes
                 .item_macros
                 .push(RustRulesItemMacroDefinition {
+                    cfg_condition:
+                        brokk_bifrost_core::analyzer::rust_facts::RustCfgCondition::Always,
                     declaration,
                     name: format!("macro_{index}"),
                     visible_after: 80 + index * 20,
@@ -23501,6 +23444,7 @@ pub mod tests {
             null,
             null,
             null,
+            null,
             null
         ]])
         .to_string();
@@ -23736,7 +23680,10 @@ pub mod tests {
     }
 
     #[test]
-    fn prepared_csharp_variants_persist_their_own_referenced_symbols() {
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11535: a canonical unminted store must refuse the actual publication batch before effects"
+    )]
+    fn prepared_csharp_variants_persist_their_own_source_evidence() {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
             .ensure_resolution_producer_epoch("csharp", Language::CSharp)
@@ -23747,9 +23694,21 @@ pub mod tests {
         for (digest, symbol) in [(1, "DEBUG"), (2, "FEATURE")] {
             // An explicitly test-only empty source/row fixture, with a C# resolution bundle.
             let mut blob = empty_publication(oid, "csharp");
+            let mut rows = resolution::PreparedResolutionBundleRows::default();
+            rows.csharp_friend_attributes
+                .push(resolution::PreparedResolutionRow::new(vec![
+                    0_u32.into(),
+                    0_u32.into(),
+                    "[\"Friend\"]".into(),
+                    "unresolved".into(),
+                    symbol.into(),
+                    "complete".into(),
+                    symbol.into(),
+                    0_i64.into(),
+                ]));
             let resolution = PreparedResolutionBundle::new(
                 Language::CSharp,
-                Default::default(),
+                rows,
                 Default::default(),
                 Vec::new(),
                 Default::default(),
@@ -23786,6 +23745,52 @@ pub mod tests {
                     }),
             );
         }
+        // The actual nonempty batch must refuse canonical construction state
+        // before any producer or payload effect, preserving the typed cause.
+        let mut unminted = Connection::open_in_memory().unwrap();
+        brokk_bifrost_core::cache_db::configure_connection(&mut unminted).unwrap();
+        unminted
+            .execute_batch(include_str!(
+                "../../../../bifrost-core/migrations/cache/current-schema.sql"
+            ))
+            .unwrap();
+        let batch: Vec<_> = prepared.into_iter().enumerate().collect();
+        let error = try_persist_prepared_chunk_tx(
+            &mut unminted,
+            &batch,
+            PersistBatchTargets::PRODUCTION,
+            &PreparedWriteCounters::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), StoreErrorKind::UnmintedPublication);
+        assert_eq!(
+            unminted
+                .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            unminted
+                .query_row(
+                    "SELECT COUNT(*) FROM resolution_producer_epochs",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            unminted
+                .query_row(
+                    "SELECT next_witness FROM blob_publication_witness_sequence",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        let prepared = batch.into_iter().map(|(_, blob)| blob).collect();
         let (outcomes, _) = store.persist_prepared_blobs(prepared, PersistBatchTargets::PRODUCTION);
         assert_eq!(outcomes.len(), 2);
         for outcome in outcomes {
@@ -23798,6 +23803,24 @@ pub mod tests {
             |row| row.get(0),
         ).unwrap();
         assert_eq!(chain_rows, 2);
+        let attributes = conn.prepare(
+            "SELECT argument, json_extract(name_segments,'$[0]'), identity_state, parse_state, friend_name, has_public_key
+             FROM resolution_csharp_friend_attributes ORDER BY argument"
+        ).unwrap().query_map([], |row| Ok((
+            row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, i64>(5)?,
+        ))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        assert_eq!(
+            attributes,
+            ["DEBUG", "FEATURE"].map(|symbol| (
+                symbol.to_owned(),
+                "Friend".to_owned(),
+                "unresolved".to_owned(),
+                "complete".to_owned(),
+                symbol.to_owned(),
+                0,
+            ))
+        );
         drop(conn);
         assert_eq!(
             store.csharp_referenced_symbols(&keys[0]).unwrap(),
@@ -23972,12 +23995,8 @@ pub mod tests {
             );
             return;
         }
-        let store =
+        let _store =
             AnalyzerStore::open_ephemeral().expect("a symlinked TMPDIR is a supported temp root");
-        assert!(
-            !store.uses_single_connection_reads(),
-            "a symlinked TMPDIR must keep the pooled-reader store"
-        );
     }
 
     #[cfg(all(test, unix))]
@@ -24029,18 +24048,14 @@ pub mod tests {
             );
             return;
         }
-        let store = AnalyzerStore::open_ephemeral()
+        let _store = AnalyzerStore::open_ephemeral()
             .expect("an unwritable template cache must not fail an ephemeral store");
-        assert!(
-            !store.uses_single_connection_reads(),
-            "an unwritable template cache must not select the single-connection store"
-        );
     }
 
     #[cfg(test)]
     #[test]
     fn requested_projection_repairs_do_not_leak_between_queries() {
-        let store = AnalyzerStore::open_in_memory_single_connection().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let oid = oid_for(b"stale projection");
         let mut root = empty_publication(oid, "java");
         root.additional
@@ -24113,7 +24128,7 @@ pub mod tests {
     #[cfg(test)]
     #[test]
     fn stale_go_resolution_interior_with_same_oid_requires_republication() {
-        let store = AnalyzerStore::open_in_memory_single_connection().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let oid = oid_for(b"directional channel epoch");
         let prepared = || {
             let mut blob = empty_publication(oid, "go");
@@ -24193,7 +24208,7 @@ pub mod tests {
         use brokk_bifrost_core::analyzer::ProjectFile;
         use tree_sitter::Parser;
 
-        let store = AnalyzerStore::open_in_memory_single_connection().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         for (language, storage_language, source) in [
             (
                 Language::Java,
@@ -24773,11 +24788,16 @@ pub mod tests {
             [],
         )
         .unwrap();
+        let path = unique_temp_db_path().unwrap();
+        conn.execute("VACUUM INTO ?1", [path.to_str().unwrap()])
+            .unwrap();
+        drop(conn);
+        let conn = crate::cache_db::open_unified_connection(&path).unwrap();
         let store = AnalyzerStore::from_parts(
             conn,
+            path.clone(),
             None,
-            None,
-            None,
+            Some(EphemeralDb { path }),
             &Default::default(),
             &brokk_bifrost_core::retention_budget::RetentionBudget::new(1024 * 1024 * 1024),
         );
@@ -25424,11 +25444,12 @@ pub mod tests {
     )]
     #[test]
     fn reader_checkout_preserves_prepared_statements_and_identity_functions() {
+        // This regression now runs on the pooled store.
         use rusqlite::StatementStatus;
 
         let temp = tempfile::TempDir::new().unwrap();
         let persistent = AnalyzerStore::open_persistent(&temp.path().join("cache.db")).unwrap();
-        let fallback = AnalyzerStore::open_in_memory_single_connection().unwrap();
+        let fallback = AnalyzerStore::open_ephemeral().unwrap();
         for store in [&persistent, &fallback] {
             for route in ["ordinary", "active", "streaming"] {
                 if route == "streaming" {
@@ -25463,6 +25484,30 @@ pub mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    #[hardwon(
+        "#13300: per-connection temp-view DDL in reader setup broke query_only streaming readers"
+    )]
+    fn streaming_reader_registers_export_functions_without_temp_ddl() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let store = AnalyzerStore::open_persistent(&temp.path().join("cache.db")).unwrap();
+        store.begin_streaming_read();
+        {
+            let reader = store.checkout_read_conn().unwrap();
+            let query_only: bool = reader
+                .query_row("PRAGMA query_only", [], |row| row.get(0))
+                .unwrap();
+            assert!(query_only);
+            let digest: Vec<u8> = reader
+                .query_row("SELECT cr_lookup_digest('macro', 'exported')", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(digest.len(), 32);
+        }
+        store.end_streaming_read();
     }
 
     #[cfg(test)]
@@ -25583,7 +25628,7 @@ pub mod tests {
     #[test]
     #[brokk_bifrost_test_macros::hardwon("#10225: cleared readers evaded the retained TEMP bound")]
     fn cleared_readers_obey_retained_limit() {
-        let pool = ReaderPool::new(None);
+        let pool = ReaderPool::new(PathBuf::new());
         let mut readers = Vec::new();
         for serial in 1..=MAX_RETAINED_RESOLUTION_READERS as u64 + 1 {
             let (epoch, acquired) = pool.acquire();
@@ -25620,7 +25665,7 @@ pub mod tests {
         "#10225: a retained macro frontier could grow TEMP past the snapshot cap before checkin"
     )]
     fn oversized_macro_frontier_closes_at_checkin() {
-        let pool = ReaderPool::new(None);
+        let pool = ReaderPool::new(PathBuf::new());
         let (epoch, acquired) = pool.acquire();
         assert!(acquired.is_none());
         let conn = Connection::open_in_memory().unwrap();
@@ -25638,7 +25683,9 @@ pub mod tests {
                     serial: 1,
                     pooled_after_clear: false,
                     macro_frontier: Some(Box::new(
-                        resolution_operation::RetainedMacroFrontier::empty_for_test(),
+                        resolution_operation::RetainedMacroFrontier::new(
+                            &brokk_bifrost_core::retention_budget::RetentionBudget::for_tests(),
+                        ),
                     )),
                     selection: None,
                     resolution_selection: None,
@@ -25647,7 +25694,7 @@ pub mod tests {
                 }),
             },
             checkin: CheckinPlan::Reusable,
-            query_planner_stability_on_checkin: None,
+            _checkout_thread: std::marker::PhantomData,
             restore_reader_mmap_on_checkin: false,
         };
         let _ = take_pooled_reader_closes_for_test();
@@ -25664,7 +25711,7 @@ pub mod tests {
     /// resident pool stays at `capacity`.
     #[test]
     fn nested_checkouts_at_capacity_do_not_wait_for_each_other() {
-        let mut pool = ReaderPool::new(None);
+        let mut pool = ReaderPool::new(PathBuf::new());
         pool.capacity = 2;
         let open = |statistics_epoch| SelectedReader {
             serial: 0,
@@ -25692,6 +25739,26 @@ pub mod tests {
         let state = pool.state.lock().unwrap();
         assert!(state.holders.is_empty(), "{:?}", state.holders);
         assert_eq!(pool.capacity, state.idle.len());
+    }
+
+    #[test]
+    fn selected_readers_install_summary_translation_views() {
+        let temp = tempfile::tempdir().unwrap();
+        for store in [
+            AnalyzerStore::open_ephemeral().unwrap(),
+            AnalyzerStore::open_persistent(&temp.path().join("cache.sqlite3")).unwrap(),
+        ] {
+            let snapshots = WorkspaceSnapshots::default();
+            let reader = store.read_conn_for_workspace(&snapshots).unwrap();
+            for view in ["selected_unit_member_blobs", "surface_dense"] {
+                let count: i64 = reader
+                    .query_row(&format!("SELECT count(*) FROM temp.{view}"), [], |r| {
+                        r.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(count, 0);
+            }
+        }
     }
 
     #[cfg(test)]
@@ -26486,7 +26553,10 @@ pub mod tests {
                 &[],
             )
             .unwrap();
-        assert_eq!(store.gc_with(|_| false).unwrap(), 0);
+        assert_eq!(
+            collect_ephemeral_candidates_for_test(&store, |_| false).unwrap(),
+            0
+        );
         let checkpoint = store
             .conn
             .execute(|conn| {
@@ -26531,7 +26601,7 @@ pub mod tests {
     #[cfg(test)]
     #[test]
     fn parse_variants_are_registered_found_and_collected_independently() {
-        let store = AnalyzerStore::open_in_memory_single_connection().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let generation = store
             .ensure_language_epoch_value("csharp", "variants")
             .unwrap();
@@ -26561,7 +26631,10 @@ pub mod tests {
 
         // Reachability of the bytes protects the empty parse. A configured parse
         // requires an exact retained workspace or resolution root.
-        assert_eq!(store.gc_with(|_| true).unwrap(), 1);
+        assert_eq!(
+            collect_ephemeral_candidates_for_test(&store, |_| true).unwrap(),
+            1
+        );
         assert!(store.contains_blob(&empty).unwrap());
         assert!(!store.contains_blob(&configured).unwrap());
         store
@@ -26662,7 +26735,10 @@ pub mod tests {
 
         let mut bloom = GrowableBloom::new(0.01, 8);
         bloom.insert(reachable.to_string());
-        assert_eq!(store.gc_with_bloom(&bloom).unwrap(), 1);
+        assert_eq!(
+            collect_ephemeral_candidates_for_test(&store, move |oid| bloom.contains(oid)).unwrap(),
+            1
+        );
         assert_eq!(
             store
                 .missing_blobs(&[
@@ -26690,7 +26766,10 @@ pub mod tests {
         conn.execute("INSERT INTO csharp_undecided_chains(blob_id,chain,directive_start,directive_end,omitted_nonblank,invalid_condition,unknown_symbols,open_reasons,disagreeing_owners) VALUES((SELECT id FROM blobs WHERE blob_oid=?1 AND lang='csharp'),0,0,1,1,0,jsonb('[]'),jsonb('[]'),jsonb('[]'))", [oid.to_string()]).unwrap();
         drop(conn);
         let bloom = GrowableBloom::new(0.01, 8);
-        assert_eq!(store.gc_with_bloom(&bloom).unwrap(), 1);
+        assert_eq!(
+            collect_ephemeral_candidates_for_test(&store, move |oid| bloom.contains(oid)).unwrap(),
+            1
+        );
         let conn = store.read_conn().unwrap();
         let remaining: i64 = conn
             .query_row("SELECT count(*) FROM csharp_undecided_chains", [], |r| {
@@ -29232,6 +29311,58 @@ mod roundtrip_unit_properties {
             "the final hydration hook must run"
         );
     }
+
+    #[test]
+    fn stored_unit_keys_use_total_structured_declaration_order() {
+        let file = ProjectFile::new(
+            std::env::temp_dir().join("bifrost-11555-root"),
+            "Pairs.java",
+        );
+        let interner = segment_interner();
+        let mut expected = Vec::new();
+        for index in 0..64 {
+            let name = format!("Widget{index:03}");
+            let unit = |kind| {
+                let fq = FqName::new()
+                    .with_pushed(interner.intern("example", SegmentKind::Package))
+                    .with_pushed(interner.intern(&name, kind));
+                CodeUnit::from_fq(file.clone(), CodeUnitType::Class, fq, 1, None, false)
+            };
+            let package = unit(SegmentKind::Package);
+            let ty = unit(SegmentKind::Type);
+            assert_ne!(package, ty);
+            let state = empty_state();
+            assert_eq!(
+                stored_unit_order_key(&state, &package),
+                stored_unit_order_key(&state, &ty),
+            );
+            expected.extend([package, ty]);
+        }
+        expected.sort();
+        assert_eq!(expected.len(), 128);
+        assert!(expected.windows(2).all(|pair| pair[0] < pair[1]));
+        // This pins total ordering for model-level ties, not a claim that a
+        // language extractor emits this pair of structured declarations.
+        for variant in 0..4 {
+            let mut insertion_order = expected.clone();
+            insertion_order.rotate_left(variant * 17);
+            if variant % 2 == 1 {
+                insertion_order.reverse();
+            }
+            let mut state = empty_state();
+            state.declarations.extend(insertion_order);
+            let stored = collect_stored_units(&Adapter, &state);
+            assert_eq!(
+                stored.iter().map(|row| &row.unit).collect::<Vec<_>>(),
+                expected.iter().collect::<Vec<_>>(),
+                "all distinct declarations must follow the total order: variant {variant}",
+            );
+            assert_eq!(
+                stored.iter().map(|row| row.key).collect::<Vec<_>>(),
+                (0..128).collect::<Vec<i64>>(),
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -30333,7 +30464,7 @@ mod generation_liveness_properties {
         assert_eq!(inventory_states(&store), known);
 
         assert_eq!(
-            store.gc_with(|_| false).unwrap(),
+            collect_ephemeral_candidates_for_test(&store, |_| false).unwrap(),
             1,
             "only the unmounted row"
         );
@@ -30808,7 +30939,7 @@ mod generation_liveness_properties {
 
     #[test]
     fn fallback_snapshot_sync_selects_new_rows_before_any_reader_checkout() {
-        let store = AnalyzerStore::open_in_memory_single_connection().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         for (name, bytes) in [
             ("A.java", b"first".as_slice()),
             ("B.java", b"second".as_slice()),
@@ -30830,7 +30961,7 @@ mod generation_liveness_properties {
                     &[],
                 )
                 .unwrap();
-            let conn = store.conn.lock().unwrap();
+            let conn = store.read_conn().unwrap();
             let rows = conn
                 .prepare("SELECT rel_path,blob_oid FROM workspace_files")
                 .unwrap()
@@ -30961,6 +31092,7 @@ mod selected_summary_write_owner_tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "active operation must advance")]
     fn selected_summary_owner_requires_generation_for_active_operation() {
         let connection = Connection::open_in_memory().unwrap();

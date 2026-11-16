@@ -256,6 +256,10 @@ impl MemoAttribution for AnalyzerMemoAttribution<'_> {
         let attached = checked_read_ledger_attachment(self.analyzer);
         read_attribution_records_reads(|| attached)
     }
+    fn is_recording_authorities(&self) -> bool {
+        brokk_bifrost_core::analyzer::carried_context::current_evaluation().is_some()
+            || self.is_capturing()
+    }
     fn capture_identity(&self) -> Option<CaptureIdentity> {
         checked_read_ledger_attachment(self.analyzer);
         super::i_analyzer::innermost_read_ledger().map(|ledger| ledger.capture_identity())
@@ -383,6 +387,37 @@ pub fn record_workspace_authority_read(
     inputs: AuthorityInputs<'_>,
 ) {
     let attached = checked_read_ledger_attachment(analyzer);
+    // The authority owner is the recording boundary. Do not depend on a
+    // wrapper forwarding ordinary ledger operations to reach the evaluation.
+    if family.is_selection_authority()
+        && let Some(evaluation) =
+            brokk_bifrost_core::analyzer::carried_context::current_evaluation()
+    {
+        if let AuthorityInputs::Fact {
+            language,
+            subject,
+            answer,
+        } = &inputs
+        {
+            super::read_ledger::record_evaluation_selection_read(&ReadKey::lookup(
+                LookupKind::WorkspaceFact,
+                super::LookupQuestion::WorkspaceFact {
+                    family,
+                    language: *language,
+                    subject: subject.clone(),
+                },
+                *answer,
+            ));
+        } else {
+            // Source scopes and unnamed inputs cannot certify a bounded
+            // selection answer. The single admission boundary refuses them.
+            evaluation.join(
+                brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::ExecutionDependent(
+                    brokk_bifrost_core::analyzer::reuse_verdict::ExecutionCause::Other,
+                ),
+            );
+        }
+    }
     if !read_attribution_records_reads(|| attached) {
         return;
     }
@@ -425,6 +460,52 @@ mod tests {
     use crate::analyzer::{MultiAnalyzer, capture_query_reads};
     use std::convert::Infallible;
     use std::sync::OnceLock;
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11482: an authority memo skipped evaluation evidence without an ordinary ledger"
+    )]
+    fn evaluation_only_authority_memo_records_selection_and_refuses_unnamed() {
+        use super::super::read_ledger::EvaluationSelectionReads;
+        use brokk_bifrost_core::analyzer::carried_context::EvaluationExecution;
+        let analyzer = MultiAnalyzer::default();
+        let memo =
+            WorkspaceAuthorityMemo::new(WorkspaceFactFamily::CSharpCompilationConfiguration, 17);
+        let evaluation = Arc::new(EvaluationExecution::default());
+        let _evaluation = evaluation.install();
+        let _empty_frame = crate::analyzer::ReadAttribution::for_request().install();
+        let attribution = memo_attribution(&analyzer);
+        let answer = StableDigest::from_array([9; 32]);
+        assert_eq!(
+            memo.read(
+                &attribution,
+                |value| *value,
+                |_| AuthorityInputs::Fact {
+                    language: Language::CSharp,
+                    subject: FactSubject::Whole,
+                    answer,
+                }
+            ),
+            17
+        );
+        assert_eq!(
+            evaluation
+                .selection_reads::<EvaluationSelectionReads>()
+                .keys(),
+            vec![ReadKey::lookup(
+                LookupKind::WorkspaceFact,
+                super::super::LookupQuestion::WorkspaceFact {
+                    family: WorkspaceFactFamily::CSharpCompilationConfiguration,
+                    language: Language::CSharp,
+                    subject: FactSubject::Whole,
+                },
+                answer
+            ),]
+        );
+        assert!(evaluation.verdict().is_content());
+        memo.read(&attribution, |value| *value, |_| AuthorityInputs::Unnamed);
+        assert!(!evaluation.verdict().is_content());
+    }
 
     #[test]
     fn runtime_cache_touch_replays_from_another_units_memo_fill() {
@@ -669,6 +750,60 @@ pub fn workspace_file_set_answers(
     })
 }
 
+/// Replay the project getter's scalar inventory certificate into every consumer.
+/// Building a resolver index would clone and rehash a warm workspace listing.
+#[doc(hidden)]
+pub fn record_request_workspace_file_inventory(analyzer: &dyn super::IAnalyzer) -> bool {
+    let Some(cell) = analyzer.workspace_file_inventory_cell() else {
+        return false;
+    };
+    let project = analyzer.project();
+    let receipt = WorkspaceAuthorityMemo::new(WorkspaceFactFamily::WorkspaceFileInventory, cell);
+    let (root, answer) = receipt.read(
+        &memo_attribution(analyzer),
+        |cell| {
+            cell.get_or_init(|| {
+                let (listed, reads) =
+                    super::capture_query_reads(analyzer, || project.all_files_shared());
+                let answer = listed.ok().and_then(|_| {
+                    if reads.unattributed_reads() != 0 || reads.execution_dependences() != 0 {
+                        return None;
+                    }
+                    let keys = reads.keys();
+                    let mut answers = keys.iter().filter_map(|key| match key {
+                        ReadKey::Lookup {
+                            kind: LookupKind::WorkspaceFact,
+                            question:
+                                super::LookupQuestion::WorkspaceFact {
+                                    family: WorkspaceFactFamily::WorkspaceFileInventory,
+                                    language: Language::None,
+                                    subject: FactSubject::Whole,
+                                },
+                            digest,
+                        } => Some(*digest),
+                        _ => None,
+                    });
+                    let answer = answers.next()?;
+                    // A custom getter with conflicting authorities has not
+                    // certified one inventory for this request view.
+                    answers.all(|other| other == answer).then_some(answer)
+                });
+                (project.root().to_path_buf(), answer)
+            })
+            .clone()
+        },
+        |(root, answer)| match answer {
+            Some(answer) if root == project.root() => AuthorityInputs::Fact {
+                language: Language::None,
+                subject: FactSubject::Whole,
+                answer: *answer,
+            },
+            _ => AuthorityInputs::Unnamed,
+        },
+    );
+    root == project.root() && answer.is_some()
+}
+
 pub fn workspace_file_listing_answer(
     project: &dyn super::Project,
 ) -> std::io::Result<StableDigest> {
@@ -881,22 +1016,28 @@ fn erased_memo_receipt(
     reads: CapturedMemoReads<ReadKey>,
     forwarded_to: Option<CaptureIdentity>,
 ) -> brokk_bifrost_core::analyzer::project_reads::ErasedCapturedReads {
-    // Debug expands strings and every collection, so its size plus the key
-    // storage conservatively accounts for the keys' retained allocations.
-    let retained_bytes = std::mem::size_of_val(reads.keys.as_ref())
-        + reads
-            .keys
-            .iter()
-            .map(|key| format!("{key:?}").len())
-            .sum::<usize>();
+    // This erased receipt funds pure walk caches only. Keep the raw semantic
+    // receipt census separate, and count each owned allocation before erasure.
+    use brokk_bifrost_core::allocation_size::allocation_size;
+    use std::mem::{size_of, size_of_val};
+    let retained_bytes =
+        allocation_size(size_of::<CapturedMemoReads<ReadKey>>() + 2 * size_of::<usize>())
+            + allocation_size(size_of_val(reads.keys.as_ref()) + 2 * size_of::<usize>())
+            + reads
+                .keys
+                .iter()
+                .map(|key| key.allocated_retained_bytes() - size_of::<ReadKey>())
+                .sum::<usize>()
+            + [&reads.first_refusal, &reads.first_execution_refusal]
+                .into_iter()
+                .flatten()
+                .map(|refusal| allocation_size(refusal.reason.capacity()))
+                .sum::<usize>();
     brokk_bifrost_core::analyzer::project_reads::ErasedCapturedReads {
         channels: reads.channels,
         first_refusal: reads.first_refusal.clone(),
         first_execution_refusal: reads.first_execution_refusal.clone(),
-        receipt: OpaqueReadReceipt::new(
-            Arc::new(reads),
-            retained_bytes + std::mem::size_of::<CapturedMemoReads<ReadKey>>(),
-        ),
+        receipt: OpaqueReadReceipt::new(Arc::new(reads), retained_bytes),
         forwarded_to,
     }
 }
@@ -962,9 +1103,19 @@ pub(super) fn replay_erased_reads(
         |count| super::i_analyzer::record_unattributed_on_active_ledgers(contexts, count),
         |count| super::i_analyzer::record_execution_dependence_on_active_ledgers(contexts, count),
         |count| super::i_analyzer::record_budget_dependence_on_active_ledgers(contexts, count),
+        |verdict| {
+            super::i_analyzer::for_each_unshadowed_active_ledger(contexts, |ledger| {
+                ledger.join_verdict(verdict)
+            })
+        },
         || {
             super::i_analyzer::for_each_unshadowed_active_ledger(contexts, |ledger| {
                 ledger.refuse_read_reuse()
+            })
+        },
+        || {
+            super::i_analyzer::for_each_unshadowed_active_ledger(contexts, |ledger| {
+                ledger.record_store_failure()
             })
         },
         |count| {
@@ -986,6 +1137,9 @@ pub(super) fn project_read_keys(
 ) -> std::io::Result<Vec<ReadKey>> {
     use brokk_bifrost_core::analyzer::project_reads::{ProjectRead, without_project_reads};
     without_project_reads(|| {
+        if let Some(cause) = &receipt.incomplete {
+            return Err(std::io::Error::other(cause.clone()));
+        }
         if project.root() != workspace_root
             && matches!(
                 read,

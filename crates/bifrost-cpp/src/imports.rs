@@ -10,7 +10,9 @@ use brokk_bifrost_core::analyzer::model::{ImportInfo, Language};
 use brokk_bifrost_core::analyzer::project::Project;
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use brokk_bifrost_core::path_normalization::NormalizePath;
-use brokk_bifrost_core::path_utils::path_suffix_key;
+use brokk_bifrost_core::path_utils::{
+    path_suffix_key, strip_native_path_prefix as strip_path_prefix,
+};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use tree_sitter::Node;
@@ -545,26 +547,6 @@ pub fn receiver_query_supported(file: &ProjectFile) -> bool {
         .extension()
         .and_then(|extension| extension.to_str())
         != Some("c")
-}
-
-#[cfg(windows)]
-fn strip_path_prefix(path: &Path, root: &Path) -> Option<PathBuf> {
-    let mut path_components = path.components();
-    for root_component in root.components() {
-        let path_component = path_components.next()?;
-        if !path_component
-            .as_os_str()
-            .eq_ignore_ascii_case(root_component.as_os_str())
-        {
-            return None;
-        }
-    }
-    Some(path_components.as_path().to_path_buf())
-}
-
-#[cfg(not(windows))]
-fn strip_path_prefix(path: &Path, root: &Path) -> Option<PathBuf> {
-    path.strip_prefix(root).ok().map(Path::to_path_buf)
 }
 
 #[cfg(test)]

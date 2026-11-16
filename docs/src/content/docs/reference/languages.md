@@ -82,11 +82,16 @@ filter. To restrict a query to C files, add a `where` glob such as `**/*.c`.
 ### Files that Bifrost does not analyze
 
 Bifrost does not parse these template files: `.vue` and `.svelte` (JavaScript
-and TypeScript) and `.razor` and `.cshtml` (C#). They can still reference
-analyzed symbols. When the workspace contains such files, `scan_usages` adds a
-note to the result: "workspace contains .vue files that may reference this
-symbol but are not analyzed; inspect or analyze those files separately before
-concluding absence".
+and TypeScript), `.razor` and `.cshtml` (C#), and `.erb` (Ruby, including Rails
+views such as `edit.html.erb`). They can still reference analyzed symbols and
+contain code of their language. When the workspace contains such files,
+`scan_usages` adds a note to the result: "workspace contains .vue files that
+may reference this symbol but are not analyzed; inspect or analyze those files
+separately before concluding absence". A CodeQuery over the template's
+language reports each such file in its path scope with a
+`missing_structural_adapter` diagnostic, so the result is incomplete rather
+than a complete answer without those files. Policy evaluation, which runs
+queries in per-file units, does not report them yet (#11370).
 
 Bifrost also does not analyze common extensions that are not in the table, for
 example `.pyi`, `.pyw`, `.mts`, `.cts`, `.rake`, `.gemspec`, `.sc`, and

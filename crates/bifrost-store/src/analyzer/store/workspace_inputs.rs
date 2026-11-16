@@ -26,9 +26,28 @@ pub struct WorkspaceConfigurationInput {
     pub source_bytes: Box<[u8]>,
     #[doc(hidden)]
     pub file_present: bool,
+    // Request-only capture metadata; retain() persists local bytes separately.
+    // The acquired input set stores typed facts/hashes, never external TOML.
+    rust_cargo_external_reads:
+        std::sync::Arc<[crate::analyzer::semantic_model::ExternalDiscoveryRead]>,
+    rust_cargo_acquisition: Option<
+        std::sync::Arc<brokk_bifrost_rust::cargo_config::acquired::RustCargoAcquiredConfigView>,
+    >,
 }
 
 impl WorkspaceConfigurationInput {
+    /// Whether a recorder may name this source or native metadata path in a
+    /// File read for `language`. Metadata ownership does not make it source
+    /// code, so source admission keeps its narrower language classification.
+    #[doc(hidden)]
+    pub fn may_record_file_read(
+        language: crate::analyzer::Language,
+        file: &crate::analyzer::ProjectFile,
+    ) -> bool {
+        brokk_bifrost_core::analyzer::common::workspace_language_for_file(file) == language
+            || Self::is_native_input(language, file.rel_path())
+    }
+
     /// Workspace-contained inputs shared by capture and selected-context guards.
     #[doc(hidden)]
     pub fn is_native_input(language: crate::analyzer::Language, path: &std::path::Path) -> bool {
@@ -232,6 +251,8 @@ impl WorkspaceConfigurationInput {
             relative_path,
             source_bytes,
             file_present: true,
+            rust_cargo_acquisition: None,
+            rust_cargo_external_reads: Default::default(),
         }
     }
 
@@ -240,6 +261,58 @@ impl WorkspaceConfigurationInput {
         let mut input = Self::new(relative_path, Box::new([]));
         input.file_present = false;
         input
+    }
+
+    /// Attach one explicitly acquired input view to this capture. The chosen
+    /// anchor is an existing local configuration input, not a synthetic file.
+    #[doc(hidden)]
+    pub fn attach_rust_cargo_acquisition(
+        inputs: &mut [Self],
+        view: brokk_bifrost_rust::cargo_config::acquired::RustCargoAcquiredConfigView,
+    ) {
+        for input in inputs.iter_mut() {
+            input.rust_cargo_acquisition = None;
+        }
+        if let Some(input) = inputs.first_mut() {
+            input.rust_cargo_acquisition = Some(std::sync::Arc::new(view));
+        }
+    }
+
+    /// Existing read keys are ephemeral admission receipts. They are never
+    /// written by retain() or included in the persisted acquired input record.
+    #[doc(hidden)]
+    pub fn attach_rust_cargo_external_reads(
+        inputs: &mut [Self],
+        reads: Vec<crate::analyzer::semantic_model::ExternalDiscoveryRead>,
+    ) {
+        for input in inputs.iter_mut() {
+            input.rust_cargo_external_reads = Default::default();
+        }
+        if let Some(input) = inputs.first_mut() {
+            input.rust_cargo_external_reads = reads.into();
+        }
+    }
+    #[doc(hidden)]
+    pub fn rust_cargo_external_reads(
+        inputs: &[Self],
+    ) -> std::sync::Arc<[crate::analyzer::semantic_model::ExternalDiscoveryRead]> {
+        inputs
+            .iter()
+            .find(|input| !input.rust_cargo_external_reads.is_empty())
+            .map_or_else(Default::default, |input| {
+                std::sync::Arc::clone(&input.rust_cargo_external_reads)
+            })
+    }
+
+    #[doc(hidden)]
+    pub fn rust_cargo_acquisition(
+        inputs: &[Self],
+    ) -> Option<&brokk_bifrost_rust::cargo_config::acquired::RustCargoAcquiredConfigView> {
+        let mut views = inputs
+            .iter()
+            .filter_map(|input| input.rust_cargo_acquisition.as_deref());
+        let view = views.next()?;
+        views.next().is_none().then_some(view)
     }
 
     #[doc(hidden)]
@@ -449,6 +522,51 @@ impl super::AnalyzerStore {
         )?;
         rows.collect::<rusqlite::Result<_>>()
             .map_err(StoreError::from)
+    }
+
+    /// Configuration-class inputs only; capture and overlay proofs use the same language hook.
+    pub fn rust_configuration_inputs_on_connection(
+        conn: &Connection,
+        snapshot: &WorkspaceSnapshotId,
+    ) -> Result<Vec<(String, String, Vec<u8>)>> {
+        let mut statement = conn.prepare_cached(
+            "SELECT versions.rel_path, versions.blob_oid, retained.source_bytes
+          FROM main.workspace_file_versions versions
+          LEFT JOIN main.workspace_input_sources retained ON retained.content_oid=versions.blob_oid
+          WHERE versions.workspace_id=?1 AND versions.lang='rust' AND versions.generation=?2
+          AND versions.input_kind='configuration' AND versions.file_present=1
+          AND versions.valid_from<=?3 AND (versions.valid_until IS NULL OR ?3<versions.valid_until)
+          ORDER BY versions.rel_path",
+        )?;
+        let rows = statement.query_map(
+            params![
+                snapshot.workspace_id.as_str(),
+                snapshot.generation.get(),
+                snapshot.revision
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<Vec<u8>>>(2)?,
+                ))
+            },
+        )?;
+        let mut inputs = Vec::new();
+        for row in rows {
+            let (path, oid, bytes) = row?;
+            if !WorkspaceConfigurationInput::is_native_input(
+                crate::analyzer::Language::Rust,
+                std::path::Path::new(&path),
+            ) {
+                continue;
+            }
+            let bytes = bytes.ok_or_else(|| {
+                StoreError::corrupt(format!("configuration bytes missing: {path}"))
+            })?;
+            inputs.push((path, oid, bytes));
+        }
+        Ok(inputs)
     }
 
     /// Exact configuration bytes, including absence, selected by this revision.
@@ -833,13 +951,16 @@ pub(super) fn open_inputs(
 /// Publish all supplied input families at one revision and return new row IDs.
 /// The caller inserts source projection children before committing the same
 /// transaction. Configuration-only changes never replace source rows.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn replace_workspace_input_partitions(
     tx: &Transaction<'_>,
+    budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
     workspace_id: &WorkspaceId,
     lang: &str,
     generation: GenerationId,
     partitions: &[WorkspaceInputPartition<'_>],
     refusals: &WorkspaceRefusalChanges<'_>,
+    acquired: Option<&brokk_bifrost_rust::cargo_config::acquired::RustCargoAcquiredConfigView>,
 ) -> Result<PublishedWorkspaceInputChanges> {
     super::require_current_generation(tx, lang, generation)?;
     let head = tx
@@ -889,6 +1010,7 @@ pub(super) fn replace_workspace_input_partitions(
     }
     publish_workspace_input_changes(
         tx,
+        budget,
         workspace_id,
         lang,
         generation,
@@ -896,6 +1018,7 @@ pub(super) fn replace_workspace_input_partitions(
         &closed_ids,
         &replacements,
         refusals,
+        acquired,
     )
 }
 
@@ -932,6 +1055,7 @@ pub(super) fn open_workspace_revision(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn publish_workspace_input_changes(
     tx: &Transaction<'_>,
+    budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
     workspace_id: &WorkspaceId,
     lang: &str,
     generation: GenerationId,
@@ -939,7 +1063,50 @@ pub(super) fn publish_workspace_input_changes(
     closed_ids: &[i64],
     replacements: &[(WorkspaceInputKind, &WorkspaceInputRow<'_>)],
     refusals: &WorkspaceRefusalChanges<'_>,
+    acquired: Option<&brokk_bifrost_rust::cargo_config::acquired::RustCargoAcquiredConfigView>,
 ) -> Result<PublishedWorkspaceInputChanges> {
+    // A source-only publication carries the prior snapshot's explicitly
+    // recorded config input, validated again against the new local references.
+    // This is an exact revision lookup inside admission, never a head guess.
+    let carried = if acquired.is_none() && lang == "rust" {
+        head.map(|revision| {
+            super::rust_acquired_cargo_config::selected(
+                tx,
+                &WorkspaceSnapshotId {
+                    workspace_id: workspace_id.clone(),
+                    lang: lang.to_owned(),
+                    generation,
+                    revision,
+                },
+            )
+        })
+        .transpose()?
+        .flatten()
+    } else {
+        None
+    };
+    let acquired = acquired.or(carried.as_ref());
+    // What the previous revision's acquisition meant. Local input OIDs are not
+    // part of it, so republishing an edit that keeps the meaning (a comment)
+    // withdraws nothing.
+    let previous_acquired_effect = if lang == "rust" {
+        head.map(|revision| {
+            super::rust_acquired_cargo_config::selected(
+                tx,
+                &WorkspaceSnapshotId {
+                    workspace_id: workspace_id.clone(),
+                    lang: lang.to_owned(),
+                    generation,
+                    revision,
+                },
+            )
+        })
+        .transpose()?
+        .flatten()
+        .map(|view| view.effective_digest())
+    } else {
+        None
+    };
     let mut inserted = HashMap::default();
     let revision = match head {
         Some(revision)
@@ -1041,7 +1208,29 @@ pub(super) fn publish_workspace_input_changes(
         generation,
         revision,
     };
-    super::dependency_file_evidence::publish(tx, &snapshot)?;
+    // Non-Rust and test-only snapshots may have no Cargo acquisition. They
+    // publish an explicit unknown view, never an evidence set without a view.
+    let unknown =
+        brokk_bifrost_rust::cargo_config::acquired::RustCargoAcquiredConfigView::default();
+    super::dependency_file_evidence::publish_with_acquired(
+        tx,
+        &snapshot,
+        acquired.unwrap_or(&unknown),
+    )?;
+    if lang == "rust"
+        && previous_acquired_effect
+            != super::rust_acquired_cargo_config::selected(tx, &snapshot)?
+                .map(|view| view.effective_digest())
+    {
+        // An edit that changes what the acquisition means, external or local,
+        // withdraws the certificate and all FK-cascaded feature projections
+        // before rediscovery is admitted.
+        let _cascade = super::sealed_families::CascadeDelete::new(tx);
+        tx.execute(
+            "DELETE FROM rust_crate_reconciliations WHERE workspace_id=?1 AND generation=?2",
+            params![workspace_id.as_str(), generation.get()],
+        )?;
+    }
     super::csharp_compilation::publish(tx, &snapshot)?;
     if lang == super::csharp_compilation::STORAGE_LANGUAGE {
         let changed = closed_ids
@@ -1049,9 +1238,26 @@ pub(super) fn publish_workspace_input_changes(
             .copied()
             .chain(inserted.values().copied())
             .collect::<Vec<_>>();
-        super::csharp_compilation::extent::publish(tx, &snapshot, head, &changed)?;
+        super::csharp_compilation::extent::publish(tx, &snapshot, head, &changed, budget)?;
     }
     Ok((snapshot, inserted))
+}
+
+/// Acquisition is part of selection identity, including external-only edits.
+#[doc(hidden)]
+pub fn bind_acquired_configuration_digest(
+    configuration: crate::analyzer::semantic::ids::StableDigest,
+    acquired: Option<[u8; 32]>,
+) -> crate::analyzer::semantic::ids::StableDigest {
+    let Some(acquired) = acquired else {
+        return configuration;
+    };
+    let mut hash = brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher::new(
+        b"bifrost.captured-configuration-with-acquired-cargo.v1",
+    );
+    hash.field("configuration", configuration.as_bytes());
+    hash.field("acquired-cargo-config", &acquired);
+    crate::analyzer::semantic::ids::StableDigest::from_array(hash.finish())
 }
 
 #[cfg(test)]
@@ -1182,7 +1388,7 @@ mod tests {
                     &[],
                     &[],
                     Some((
-                        super::super::RUST_SOURCE_LISTING_DERIVATION_VERSION,
+                        super::super::rust_source_listing_derivation_identity(),
                         if complete {
                             vec![]
                         } else {
@@ -1197,7 +1403,7 @@ mod tests {
             store
                 .rust_source_listing_complete(
                     &snapshot,
-                    super::super::RUST_SOURCE_LISTING_DERIVATION_VERSION
+                    super::super::rust_source_listing_derivation_identity()
                 )
                 .unwrap()
         );
@@ -1205,7 +1411,7 @@ mod tests {
             !store
                 .rust_source_listing_complete(
                     &snapshot,
-                    super::super::RUST_SOURCE_LISTING_DERIVATION_VERSION + 1
+                    brokk_bifrost_rust::cargo_routes::rust_source_listing_derivation_identity_before_last_token()
                 )
                 .unwrap()
         );
@@ -1216,7 +1422,7 @@ mod tests {
             store
                 .rust_source_listing_complete(
                     &snapshot,
-                    super::super::RUST_SOURCE_LISTING_DERIVATION_VERSION
+                    super::super::rust_source_listing_derivation_identity()
                 )
                 .unwrap()
         );
@@ -1224,7 +1430,7 @@ mod tests {
             !store
                 .rust_source_listing_complete(
                     &failed,
-                    super::super::RUST_SOURCE_LISTING_DERIVATION_VERSION
+                    super::super::rust_source_listing_derivation_identity()
                 )
                 .unwrap()
         );
@@ -1237,7 +1443,7 @@ mod tests {
         let generation = store
             .ensure_language_epoch_value("rust", "listing-test")
             .unwrap();
-        let version = super::super::RUST_SOURCE_LISTING_DERIVATION_VERSION;
+        let version = super::super::rust_source_listing_derivation_identity();
         let snapshot = store
             .sync_workspace_inputs_with_rust_listing(
                 &WorkspaceId("a".repeat(64)),
@@ -1259,13 +1465,18 @@ mod tests {
         let failures = vec![("x.rs".to_string(), "test".to_string())];
         assert_eq!(
             store
-                .publish_rust_source_listing(&snapshot, version, failures.clone())
+                .publish_rust_source_listing(
+                    &snapshot,
+                    version,
+                    failures.clone(),
+                    Default::default()
+                )
                 .unwrap(),
             snapshot,
             "an identical certificate stays at its revision"
         );
         let moved = store
-            .publish_rust_source_listing(&snapshot, version, Vec::new())
+            .publish_rust_source_listing(&snapshot, version, Vec::new(), Default::default())
             .unwrap();
         assert_eq!(moved.revision, snapshot.revision + 1);
         assert_eq!(
@@ -1290,7 +1501,7 @@ mod tests {
         let generation = store
             .ensure_language_epoch_value("rust", "listing-test")
             .unwrap();
-        let version = super::super::RUST_SOURCE_LISTING_DERIVATION_VERSION;
+        let version = super::super::rust_source_listing_derivation_identity();
         let observable = store
             .sync_workspace_inputs_with_rust_listing(
                 &WorkspaceId("a".repeat(64)),
@@ -1316,7 +1527,7 @@ mod tests {
             None
         );
         let certified = store
-            .publish_rust_source_listing(&observable, version, Vec::new())
+            .publish_rust_source_listing(&observable, version, Vec::new(), Default::default())
             .unwrap();
         assert_eq!(certified.revision, observable.revision + 1);
         assert_eq!(
@@ -1346,7 +1557,7 @@ mod tests {
         let generation = store
             .ensure_language_epoch_value("rust", "listing-test")
             .unwrap();
-        let version = super::super::RUST_SOURCE_LISTING_DERIVATION_VERSION;
+        let version = super::super::rust_source_listing_derivation_identity();
         let snapshot = store
             .sync_workspace_inputs_with_rust_listing(
                 &WorkspaceId("a".repeat(64)),

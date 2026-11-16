@@ -1,3 +1,6 @@
+#[cfg(test)]
+use brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelNamespace;
+
 use std::collections::{BTreeMap, VecDeque};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -52,8 +55,6 @@ use crate::analyzer::semantic_model::{
 
 use crate::analyzer::semantic_model::StandardLibraryPackExpectation;
 use crate::analyzer::topology::DependencyScope;
-
-use crate::analyzer::rust::file_dependency_evidence::cargo_lock_activation_rows;
 
 use brokk_bifrost_core::analyzer::model::Language;
 
@@ -637,6 +638,22 @@ pub fn resolve_rust_semantic_pack_dependencies(
     limits: &DependencyPackLimits,
     cancellation: Option<&CancellationToken>,
 ) -> DependencyDiscoveryOutcome {
+    resolve_rust_semantic_pack_dependencies_with_configuration(
+        config,
+        project,
+        limits,
+        cancellation,
+        None,
+    )
+}
+
+pub(super) fn resolve_rust_semantic_pack_dependencies_with_configuration(
+    config: &RustAnalyzerConfig,
+    project: &dyn Project,
+    limits: &DependencyPackLimits,
+    cancellation: Option<&CancellationToken>,
+    recorded: Option<&brokk_bifrost_rust::cargo_config::RustCargoConfiguration>,
+) -> DependencyDiscoveryOutcome {
     RUST_CARGO_ROWS
         .with(|slot| *slot.borrow_mut() = CargoResolveView::from_rows(Vec::new(), Vec::new()));
     let mut dependencies = Vec::new();
@@ -685,9 +702,16 @@ pub fn resolve_rust_semantic_pack_dependencies(
         }
     }
 
+    let (lock_outcome, _, _, configuration) =
+        super::file_dependency_evidence::acquire_cargo_discovery_rows_with_configuration(
+            project,
+            limits,
+            cancellation,
+            recorded,
+        );
     if !cancelled {
         let (mut locked, lock_diagnostics, lock_cancelled) =
-            cargo_lock_activation_rows(project, limits, cancellation);
+            super::file_dependency_evidence::cargo_lock_activation_rows_from_outcome(lock_outcome);
         dependencies.append(&mut locked);
         for lock_diagnostic in lock_diagnostics {
             diagnostics.push(lock_diagnostic);
@@ -700,19 +724,34 @@ pub fn resolve_rust_semantic_pack_dependencies(
 
     let mut stdlib_expectation = None;
     if !cancelled && project.analyzer_languages().contains(&Language::Rust) {
-        match resolve_rust_stdlib_dependency(
+        match resolve_rust_stdlib_dependency_with_configuration(
             project,
             limits,
             &mut evidence_bytes_read,
             cancellation,
+            &configuration,
         ) {
             Ok(stdlib) => {
-                stdlib_expectation = Some(StandardLibraryPackExpectation::declared(
+                let mut expectation = StandardLibraryPackExpectation::declared(
                     Language::Rust,
                     RUST_STDLIB_PACK_ID,
-                    vec![stdlib.id.clone()],
-                ));
-                dependencies.push(stdlib);
+                    vec![stdlib.dependency.id.clone()],
+                );
+                // The version remains exact for target-free packs; only a
+                // missing target may use the runtime's approximate fallback.
+                expectation.approximate = stdlib.dependency.evidence.target.is_none();
+                stdlib_expectation = Some(expectation);
+                if stdlib.approximation == Some(RustStdlibApproximation::MixedCompileContexts) {
+                    let mut warning = diagnostic(
+                        "rust.stdlib.mixed_compile_contexts",
+                        None,
+                        "MixedCompileContexts: indexed units may require different standard-library targets; target-bound packs can activate only approximately, while target-free strict activation is unchanged",
+                    );
+                    warning.severity =
+                        crate::analyzer::semantic_model::DependencyPackDiagnosticSeverity::Warning;
+                    diagnostics.push(warning);
+                }
+                dependencies.push(stdlib.dependency);
             }
             Err(diagnostic) if diagnostic.code == "rust.toolchain.missing" => {
                 stdlib_expectation = Some(StandardLibraryPackExpectation::approximate(
@@ -740,6 +779,7 @@ pub fn resolve_rust_semantic_pack_dependencies(
     dependencies.dedup();
     let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
     let mut outcome = DependencyDiscoveryOutcome {
+        incomplete_reason: None,
         profile: DependencyDiscoveryProfile {
             metadata_inputs_considered,
             dependencies_resolved: dependencies.len(),
@@ -747,11 +787,16 @@ pub fn resolve_rust_semantic_pack_dependencies(
         },
         // Approximate models can supply positive declarations, but an unpinned
         // toolchain does not establish an exact, complete dependency boundary.
-        complete: diagnostics.is_empty()
+        complete: diagnostics
+            .iter()
+            .all(|entry| entry.code == "rust.stdlib.mixed_compile_contexts")
             && !cancelled
-            && !stdlib_expectation
-                .as_ref()
-                .is_some_and(|expectation| expectation.approximate),
+            && !stdlib_expectation.as_ref().is_some_and(|expectation| {
+                matches!(
+                    expectation.selection,
+                    crate::analyzer::semantic_model::StandardLibraryPackSelection::Unpinned
+                )
+            }),
         dependencies,
         diagnostics,
         suppressed_diagnostics,
@@ -796,12 +841,30 @@ thread_local! {
     static RUST_CARGO_ROWS: std::cell::RefCell<CargoResolveView> = std::cell::RefCell::new(CargoResolveView::from_rows(Vec::new(), Vec::new()));
 }
 
+#[cfg(test)]
 fn resolve_rust_stdlib_dependency(
     project: &dyn Project,
     limits: &DependencyPackLimits,
     evidence_bytes_read: &mut u64,
     cancellation: Option<&CancellationToken>,
-) -> Result<ResolvedDependency, DependencyPackDiagnostic> {
+) -> Result<RustStdlibResolution, DependencyPackDiagnostic> {
+    let acquired = super::cargo_configuration_acquisition::acquire(project, &[], limits);
+    resolve_rust_stdlib_dependency_with_configuration(
+        project,
+        limits,
+        evidence_bytes_read,
+        cancellation,
+        &acquired.configuration,
+    )
+}
+
+fn resolve_rust_stdlib_dependency_with_configuration(
+    project: &dyn Project,
+    limits: &DependencyPackLimits,
+    evidence_bytes_read: &mut u64,
+    cancellation: Option<&CancellationToken>,
+    configuration: &brokk_bifrost_rust::cargo_config::RustCargoConfiguration,
+) -> Result<RustStdlibResolution, DependencyPackDiagnostic> {
     let path = project.root().join("rust-toolchain.toml");
     match std::fs::metadata(&path) {
         Ok(metadata) if !metadata.is_file() => {
@@ -879,7 +942,12 @@ fn resolve_rust_stdlib_dependency(
             format!("could not decode rust-toolchain.toml: {error}"),
         )
     })?;
-    if file.toolchain.channel != RUST_STDLIB_TOOLCHAIN_CHANNEL {
+    let host = file
+        .toolchain
+        .channel
+        .strip_prefix(RUST_STDLIB_TOOLCHAIN_CHANNEL)
+        .and_then(|suffix| suffix.strip_prefix('-'));
+    if file.toolchain.channel != RUST_STDLIB_TOOLCHAIN_CHANNEL && host.is_none() {
         return Err(diagnostic(
             "rust.toolchain.stdlib_channel_mismatch",
             Some(&path),
@@ -889,9 +957,26 @@ fn resolve_rust_stdlib_dependency(
             ),
         ));
     }
+    if host.is_some_and(|host| {
+        brokk_bifrost_rust::cargo_config::builtin_target_platform(host).is_none()
+    }) {
+        return Err(diagnostic(
+            "rust.toolchain.unknown_host",
+            Some(&path),
+            format!("toolchain host suffix is not a known target triple: {host:?}"),
+        ));
+    }
+    let activation = rust_stdlib_targets(
+        project,
+        host,
+        limits,
+        evidence_bytes_read,
+        cancellation,
+        configuration,
+    )?;
     let version = semver::Version::parse(RUST_STDLIB_TOOLCHAIN_VERSION)
         .expect("pinned Rust toolchain version is valid semver");
-    Ok(ResolvedDependency {
+    let mut dependency = ResolvedDependency {
         id: format!("rust:stdlib:{RUST_STDLIB_TOOLCHAIN_CHANNEL}"),
         evidence: SemanticModelActivationEvidence {
             language: "rust".to_owned(),
@@ -907,9 +992,13 @@ fn resolve_rust_stdlib_dependency(
             artifact_sha256: None,
         },
         provenance: vec![
+            dependency_provenance_entry(
+                "rust.activation_input_scope",
+                "workspace toolchain file and in-root Cargo configuration; ambient build overrides unobserved",
+            ),
             DependencyProvenance {
                 key: "rust.toolchain_channel".to_owned(),
-                value: RUST_STDLIB_TOOLCHAIN_CHANNEL.to_owned(),
+                value: file.toolchain.channel.clone(),
             },
             DependencyProvenance {
                 key: "rustc.version".to_owned(),
@@ -931,7 +1020,334 @@ fn resolve_rust_stdlib_dependency(
         artifacts: Vec::new(),
         scope: DependencyScope::Unknown,
         declared_by: None,
+    };
+    let approximation = match activation {
+        RustStdlibActivation::Exact { target, source } => {
+            dependency.id.push(':');
+            dependency.id.push_str(&target);
+            dependency.evidence.target = Some(target.clone());
+            dependency
+                .provenance
+                .push(dependency_provenance_entry("rust.build_target", &target));
+            dependency.provenance.push(dependency_provenance_entry(
+                "rust.build_target_source",
+                source,
+            ));
+            None
+        }
+        RustStdlibActivation::Approximate(reason) => {
+            dependency.provenance.push(dependency_provenance_entry(
+                "rust.stdlib_approximation",
+                format!("{reason:?}"),
+            ));
+            Some(reason)
+        }
+    };
+    Ok(RustStdlibResolution {
+        dependency,
+        approximation,
     })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RustHostUnitCensus {
+    NoHostUnits,
+    HostOrUnknownUnits,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RustStdlibApproximation {
+    UnknownHost,
+    MixedCompileContexts,
+    StdlibRebuilt,
+    BuildModeUnknown,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RustStdlibActivation {
+    Exact {
+        target: String,
+        source: &'static str,
+    },
+    Approximate(RustStdlibApproximation),
+}
+
+struct RustStdlibResolution {
+    dependency: ResolvedDependency,
+    approximation: Option<RustStdlibApproximation>,
+}
+
+/// One owner of the workspace-wide exactness decision. Until per-unit
+/// attachment exists (#12397), a union of target rows cannot certify any one
+/// unit's standard-library identity.
+fn rust_stdlib_activation(
+    explicit: &[String],
+    host: Option<&str>,
+    census: RustHostUnitCensus,
+) -> RustStdlibActivation {
+    match explicit {
+        [] => match host {
+            Some(host) => RustStdlibActivation::Exact {
+                target: host.to_owned(),
+                source: "rust.toolchain_host",
+            },
+            None => RustStdlibActivation::Approximate(RustStdlibApproximation::UnknownHost),
+        },
+        [target] if host == Some(target.as_str()) || census == RustHostUnitCensus::NoHostUnits => {
+            RustStdlibActivation::Exact {
+                target: target.clone(),
+                source: "cargo.build.target",
+            }
+        }
+        _ => RustStdlibActivation::Approximate(RustStdlibApproximation::MixedCompileContexts),
+    }
+}
+
+/// Census the entire indexed Rust view, including path and indexed dependency
+/// manifests. Unknown/unowned source units and incomplete inventories cannot
+/// certify the absence of host compilation. Nothing survives this request.
+fn rust_host_unit_census(
+    project: &dyn Project,
+    limits: &DependencyPackLimits,
+    evidence_bytes_read: &mut u64,
+    cancellation: Option<&CancellationToken>,
+) -> RustHostUnitCensus {
+    use brokk_bifrost_rust::selected_context::{
+        RustCallerTargetKind, RustSelectedManifestMount,
+        rust_selected_workspace_profiles_from_paths,
+    };
+    let unknown = RustHostUnitCensus::HostOrUnknownUnits;
+    let Ok(files) = project.all_files_shared() else {
+        refuse_external_discovery_reads();
+        return unknown;
+    };
+    let Ok(rust_files) = project.analyzable_files_from(&files, Language::Rust) else {
+        refuse_external_discovery_reads();
+        return unknown;
+    };
+    let paths = rust_files
+        .iter()
+        .map(|file| file.rel_path().to_path_buf())
+        .collect::<std::collections::BTreeSet<_>>();
+    let all_paths = files
+        .iter()
+        .map(|file| file.rel_path())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut manifests = BTreeMap::new();
+    for file in files.iter().filter(|file| {
+        file.rel_path()
+            .file_name()
+            .is_some_and(|name| name == "Cargo.toml")
+    }) {
+        if manifests.len() >= limits.max_source_files_per_artifact || is_cancelled(cancellation) {
+            return unknown;
+        }
+        let remaining = limits
+            .max_total_artifact_bytes
+            .saturating_sub(*evidence_bytes_read)
+            .min(limits.producer.max_artifact_bytes)
+            .min(usize::MAX as u64) as usize;
+        if remaining == 0 {
+            return unknown;
+        }
+        let Ok(Some(snapshot)) = project.read_source_snapshot_limited(file, remaining) else {
+            return unknown;
+        };
+        *evidence_bytes_read = evidence_bytes_read.saturating_add(snapshot.source().len() as u64);
+        report_external_discovery_read(ExternalDiscoveryRead::file(
+            &file.abs_path(),
+            snapshot.source().as_bytes(),
+        ));
+        let Ok(manifest) =
+            RustSelectedManifestMount::from_source(file.rel_path(), snapshot.source())
+        else {
+            return unknown;
+        };
+        if let Some(build) = manifest
+            .facts
+            .package
+            .as_ref()
+            .and_then(|package| package.build_script.as_deref())
+        {
+            let build = brokk_bifrost_rust::selected_context::normalize_selected_path(
+                file.rel_path().parent().unwrap_or(Path::new("")),
+                build,
+            );
+            if build
+                .as_ref()
+                .is_none_or(|path| all_paths.contains(path.as_path()))
+            {
+                return unknown;
+            }
+        }
+        // A declared host dependency can itself be indexed even when its
+        // build-script caller is omitted. Treat that role as possibly host.
+        if manifest.facts.dependencies.iter().any(|dependency| {
+            dependency.kind == brokk_bifrost_rust::selected_context::RustCargoDependencyKind::Build
+        }) || manifest
+            .document()
+            .get("package")
+            .and_then(|package| package.get("build"))
+            .is_some_and(|value| value.as_bool() != Some(false))
+        {
+            return unknown;
+        }
+        let library = manifest.document().get("lib");
+        if library
+            .and_then(|lib| lib.get("proc-macro"))
+            .is_some_and(|value| value.as_bool() != Some(false))
+            || library
+                .and_then(|lib| lib.get("plugin"))
+                .is_some_and(|value| value.as_bool() != Some(false))
+            || library
+                .and_then(|lib| lib.get("crate-type"))
+                .is_some_and(|value| {
+                    value.as_array().is_none_or(|types| {
+                        types.is_empty()
+                            || types.iter().any(|kind| {
+                                !matches!(
+                                    kind.as_str(),
+                                    Some("lib" | "rlib" | "dylib" | "cdylib" | "staticlib")
+                                )
+                            })
+                    })
+                })
+        {
+            return unknown;
+        }
+        manifests.insert(file.rel_path().to_path_buf(), manifest);
+    }
+    let Ok(inventory) = rust_selected_workspace_profiles_from_paths(&paths, &manifests) else {
+        return unknown;
+    };
+    if !inventory.target_inventory_complete
+        || inventory
+            .profiles
+            .iter()
+            .any(|unit| unit.target_kind == RustCallerTargetKind::Build)
+    {
+        return unknown;
+    }
+    // Only roots have an established unit kind at this acquisition boundary.
+    // Module ownership and detached-file contexts are not available here; an
+    // unmapped indexed file therefore counts as possibly host compiled.
+    let roots = inventory
+        .profiles
+        .iter()
+        .filter_map(|unit| {
+            brokk_bifrost_rust::selected_context::normalize_selected_path(
+                unit.manifest_path.parent().unwrap_or(Path::new("")),
+                &unit.target_root,
+            )
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    if !paths.is_subset(&roots) {
+        return unknown;
+    }
+    RustHostUnitCensus::NoHostUnits
+}
+
+/// Use the same acquired/recorded view as package and toolchain evidence.
+fn rust_stdlib_targets(
+    project: &dyn Project,
+    host: Option<&str>,
+    limits: &DependencyPackLimits,
+    evidence_bytes_read: &mut u64,
+    cancellation: Option<&CancellationToken>,
+    configuration: &brokk_bifrost_rust::cargo_config::RustCargoConfiguration,
+) -> Result<RustStdlibActivation, DependencyPackDiagnostic> {
+    use brokk_bifrost_rust::cargo_config::{RustStdlibBuildMode, builtin_target_platform};
+    let (mut targets, defining) = configuration.configured_build_targets(Path::new(""));
+    if !defining.is_empty() && targets.is_empty() {
+        return Err(diagnostic(
+            "rust.config.invalid_target",
+            None,
+            "configured build.target does not identify a target",
+        ));
+    }
+    // A custom target JSON path is not a known target triple. Never substitute
+    // the analyzer's own build target for unknown toolchain identity.
+    if !defining.is_empty()
+        && targets
+            .iter()
+            .any(|target| builtin_target_platform(target).is_none())
+    {
+        return Err(diagnostic(
+            "rust.config.unknown_target",
+            None,
+            format!("configured build targets are not known triples: {targets:?}"),
+        ));
+    }
+    // Preserve observed invalid-target refusals above and pinned compiler
+    // mismatches in the caller. Only target-bound completeness is downgraded;
+    // runtime strict-first behavior for target-free packs stays unchanged.
+    match configuration.stdlib_build_mode(Path::new("")) {
+        RustStdlibBuildMode::BuildStd => {
+            return Ok(RustStdlibActivation::Approximate(
+                RustStdlibApproximation::StdlibRebuilt,
+            ));
+        }
+        RustStdlibBuildMode::Unknown => {
+            return Ok(RustStdlibActivation::Approximate(
+                RustStdlibApproximation::BuildModeUnknown,
+            ));
+        }
+        RustStdlibBuildMode::Prebuilt => {}
+    }
+    targets.sort();
+    targets.dedup();
+    let effective = |targets: Vec<String>| {
+        if targets.is_empty() {
+            host.map(str::to_owned).into_iter().collect::<Vec<_>>()
+        } else {
+            targets
+        }
+    };
+    let selected = effective(targets.clone());
+    for owner in configuration.acquired_owner_directories() {
+        match configuration.stdlib_build_mode(owner) {
+            RustStdlibBuildMode::Unknown => {
+                return Ok(RustStdlibActivation::Approximate(
+                    RustStdlibApproximation::BuildModeUnknown,
+                ));
+            }
+            RustStdlibBuildMode::BuildStd => {
+                return Ok(RustStdlibActivation::Approximate(
+                    RustStdlibApproximation::StdlibRebuilt,
+                ));
+            }
+            RustStdlibBuildMode::Prebuilt => {}
+        }
+        let (mut member_targets, defining) = configuration.configured_build_targets(owner);
+        if !defining.is_empty()
+            && (member_targets.is_empty()
+                || member_targets
+                    .iter()
+                    .any(|target| builtin_target_platform(target).is_none()))
+        {
+            return Ok(RustStdlibActivation::Approximate(
+                RustStdlibApproximation::BuildModeUnknown,
+            ));
+        }
+        member_targets.sort();
+        member_targets.dedup();
+        if effective(member_targets) != selected {
+            // This matcher publishes one global row. Distinct member invocation
+            // contexts cannot borrow the root's target until per-unit attachment.
+            return Ok(RustStdlibActivation::Approximate(
+                RustStdlibApproximation::MixedCompileContexts,
+            ));
+        }
+    }
+    let census = if targets.len() == 1 && host != Some(targets[0].as_str()) {
+        rust_host_unit_census(project, limits, evidence_bytes_read, cancellation)
+    } else {
+        RustHostUnitCensus::HostOrUnknownUnits
+    };
+    if is_cancelled(cancellation) {
+        return Err(cancelled_diagnostic(None));
+    }
+    Ok(rust_stdlib_activation(&targets, host, census))
 }
 
 fn resolve_rust_dependency_evidence(
@@ -2007,7 +2423,7 @@ mod tests {
             outcome
                 .dependencies
                 .iter()
-                .any(|dependency| dependency.id == "rust:stdlib:nightly-2026-08-24")
+                .any(|dependency| dependency.id.starts_with("rust:stdlib:nightly-2026-08-24"))
         );
     }
 
@@ -2059,7 +2475,7 @@ mod tests {
         fs::write(
             fixture._root.path().join("rust-toolchain.toml"),
             format!(
-                "[toolchain]\nchannel = \"{RUST_STDLIB_TOOLCHAIN_CHANNEL}\"\ncomponents = [\"rust-src\"]\n"
+                "[toolchain]\nchannel = \"{RUST_STDLIB_TOOLCHAIN_CHANNEL}-x86_64-unknown-linux-gnu\"\ncomponents = [\"rust-src\"]\n"
             ),
         )
         .unwrap();
@@ -2075,7 +2491,7 @@ mod tests {
         let dependency = outcome
             .dependencies
             .iter()
-            .find(|dependency| dependency.id == "rust:stdlib:nightly-2026-08-24")
+            .find(|dependency| dependency.id.starts_with("rust:stdlib:nightly-2026-08-24"))
             .expect("exact pinned Rust nightly should emit stdlib evidence");
         assert_eq!(dependency.evidence.ecosystem, "cargo");
         assert_eq!(dependency.evidence.package, None);
@@ -2100,6 +2516,414 @@ mod tests {
         assert!(dependency.provenance.iter().any(|entry| {
             entry.key == "rustc.commit" && entry.value == RUST_STDLIB_RUSTC_COMMIT
         }));
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12360: target-bound verified stdlib packs could not activate from pinned workspaces"
+    )]
+    fn stdlib_target_identity_matches_on_one_evidence_row() {
+        use crate::analyzer::semantic_model::*;
+        use brokk_bifrost_semantic::analyzer::semantic_model::runtime::strict_activation_match;
+        let target = "x86_64-unknown-linux-gnu";
+        let source = json!({
+            "schema_version": 2, "pack_id": "test.target-bound-stdlib", "version": "1.0.0",
+            "producer": {"name": "fixture", "version": "1.0.0"},
+            "language": "rust", "ecosystem": "cargo",
+            "compatibility": {"bifrost": "*", "toolchains": [{"name":"rust", "requirement":"=1.100.0-nightly"}]},
+            "provenance": {"source": "test-only"}, "license": "NOASSERTION",
+            "completeness": "complete",
+            "safety": {"generated_code_only": false, "review_required": false},
+            "shards": [{"id": "declarations.stdlib", "activation": [{
+                "toolchain": {"name": "rust", "version": "=1.100.0-nightly"}, "targets": [target]
+            }], "payload": {"kind": "declaration_facts", "types": [{"id":"stdlib.marker","name":"stdlib.Marker","type_kind":"struct","visibility":"public","locator":{"kind":"artifact","path":"fixture.json","symbol":"stdlib.Marker"}}], "members": [], "relations": []}}]
+        });
+        let pack = compile_source(
+            SourceFormat::Json,
+            &serde_json::to_vec(&source).unwrap(),
+            &CompilerOptions::default(),
+        )
+        .unwrap();
+        let decoded =
+            brokk_bifrost_semantic::analyzer::semantic_model::artifact::decode_shard_for_manifest(
+                &pack.manifest,
+                &pack.shards[0].descriptor,
+                &pack.shards[0].bytes,
+                &DecodeLimits::default(),
+            )
+            .unwrap();
+        let mut selectors = decoded.activation().to_vec();
+        for (suffix, config, expected_target, matches) in [
+            ("-x86_64-unknown-linux-gnu", None, Some(target), true),
+            (
+                "",
+                Some("target = \"x86_64-unknown-linux-gnu\""),
+                Some(target),
+                true,
+            ),
+            (
+                "-x86_64-unknown-linux-gnu",
+                Some("target = \"aarch64-unknown-linux-gnu\""),
+                Some("aarch64-unknown-linux-gnu"),
+                false,
+            ),
+            (
+                "",
+                Some("target = [\"x86_64-unknown-linux-gnu\", \"aarch64-unknown-linux-gnu\"]"),
+                None,
+                false,
+            ),
+            (
+                "-x86_64-unknown-linux-gnu",
+                Some("target = \"x86_64-unknown-linux-gnu\"\n[unstable]\nbuild-std=['std']"),
+                None,
+                false,
+            ),
+            (
+                "-x86_64-unknown-linux-gnu",
+                Some("target = \"x86_64-unknown-linux-gnu\"\n[unknown_configuration]\nkey=true"),
+                None,
+                false,
+            ),
+        ] {
+            let fixture = EvidenceFixture::new();
+            fs::write(
+                fixture._root.path().join("rust-toolchain.toml"),
+                format!("[toolchain]\nchannel = \"{RUST_STDLIB_TOOLCHAIN_CHANNEL}{suffix}\"\n"),
+            )
+            .unwrap();
+            if let Some(config) = config {
+                fs::create_dir_all(fixture._root.path().join(".cargo")).unwrap();
+                fs::write(
+                    fixture._root.path().join(".cargo/config.toml"),
+                    format!("[build]\n{config}\n"),
+                )
+                .unwrap();
+            }
+            let project = TestProject::new(fixture._root.path().to_path_buf(), Language::Rust);
+            let resolved = resolve_rust_stdlib_dependency(
+                &project,
+                &DependencyPackLimits::default(),
+                &mut 0,
+                None,
+            )
+            .unwrap();
+            if config.is_some_and(|config| config.contains("build-std")) {
+                assert_eq!(
+                    resolved.approximation,
+                    Some(RustStdlibApproximation::StdlibRebuilt)
+                );
+            }
+            if config.is_some_and(|config| config.contains("unknown_configuration")) {
+                assert_eq!(
+                    resolved.approximation,
+                    Some(RustStdlibApproximation::BuildModeUnknown)
+                );
+            }
+            let rows = [resolved.dependency];
+            assert_eq!(rows[0].evidence.target.as_deref(), expected_target);
+            let evidence = rows
+                .iter()
+                .map(|row| row.evidence.clone())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                strict_activation_match(
+                    &pack.manifest,
+                    &selectors,
+                    &evidence,
+                    &semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap()
+                )
+                .is_some(),
+                matches
+            );
+            // Packs without target restrictions retain their existing matching.
+            let targets = std::mem::take(&mut selectors[0].targets);
+            assert!(
+                strict_activation_match(
+                    &pack.manifest,
+                    &selectors,
+                    &evidence,
+                    &semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap()
+                )
+                .is_some()
+            );
+            selectors[0].targets = targets;
+            if expected_target.is_some() {
+                let source = if config.is_some() {
+                    "cargo.build.target"
+                } else {
+                    "rust.toolchain_host"
+                };
+                assert!(
+                    rows[0]
+                        .provenance
+                        .iter()
+                        .any(|p| p.key == "rust.build_target_source" && p.value == source)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn global_stdlib_target_requires_agreement_across_acquired_member_contexts() {
+        let root = tempfile::tempdir().unwrap();
+        let put = |path: &str, source: &str| {
+            let path = root.path().join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, source).unwrap();
+        };
+        put("Cargo.toml", "[workspace]\nmembers=['a','b']\n");
+        for member in ["a", "b"] {
+            put(
+                &format!("{member}/Cargo.toml"),
+                &format!("[package]\nname='{member}'\nversion='0.1.0'\n"),
+            );
+            put(&format!("{member}/src/lib.rs"), "pub fn example() {}\n");
+        }
+        put(
+            "rust-toolchain.toml",
+            &format!(
+                "[toolchain]\nchannel='{RUST_STDLIB_TOOLCHAIN_CHANNEL}-x86_64-unknown-linux-gnu'\n"
+            ),
+        );
+        put(
+            ".cargo/config.toml",
+            "[build]\ntarget='x86_64-unknown-linux-gnu'\n",
+        );
+        let home = root.path().join("test-cargo-home");
+        fs::create_dir(&home).unwrap();
+        let project = TestProject::new(root.path(), Language::Rust);
+        let selected = ["Cargo.toml", "a/Cargo.toml", "b/Cargo.toml"]
+            .into_iter()
+            .map(|path| {
+                let file = brokk_bifrost_core::analyzer::model::ProjectFile::new(root.path(), path);
+                let source = project.read_source_snapshot(&file).unwrap();
+                (file, source)
+            })
+            .collect::<Vec<_>>();
+        let resolve = || {
+            let acquired = super::super::cargo_configuration_acquisition::acquire_with_home(
+                &project,
+                &selected,
+                &DependencyPackLimits::default(),
+                Some(&home),
+                Vec::new(),
+            );
+            resolve_rust_stdlib_dependency_with_configuration(
+                &project,
+                &DependencyPackLimits::default(),
+                &mut 0,
+                None,
+                &acquired.configuration,
+            )
+            .unwrap()
+        };
+        let root_only = resolve();
+        assert_eq!(
+            root_only.dependency.evidence.target.as_deref(),
+            Some("x86_64-unknown-linux-gnu")
+        );
+        assert_eq!(root_only.approximation, None);
+        put(
+            "a/.cargo/config.toml",
+            "[build]\ntarget='aarch64-unknown-linux-gnu'\n",
+        );
+        put(
+            "b/.cargo/config.toml",
+            "[build]\ntarget='x86_64-unknown-linux-gnu'\n",
+        );
+        let mixed = resolve();
+        assert_eq!(mixed.dependency.evidence.target, None);
+        assert_eq!(
+            mixed.approximation,
+            Some(RustStdlibApproximation::MixedCompileContexts)
+        );
+        fs::remove_file(root.path().join("a/.cargo/config.toml")).unwrap();
+        fs::create_dir(root.path().join("a/.cargo/config.toml")).unwrap();
+        let unreadable = resolve();
+        assert_eq!(unreadable.dependency.evidence.target, None);
+        assert_eq!(
+            unreadable.approximation,
+            Some(RustStdlibApproximation::BuildModeUnknown)
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12360: plain channels must not claim an exact target identity"
+    )]
+    fn plain_rust_toolchain_requests_approximate_stdlib() {
+        let fixture = EvidenceFixture::new();
+        fs::write(
+            fixture._root.path().join("rust-toolchain.toml"),
+            format!("[toolchain]\nchannel = \"{RUST_STDLIB_TOOLCHAIN_CHANNEL}\"\n"),
+        )
+        .unwrap();
+        let project = TestProject::new(fixture._root.path().to_path_buf(), Language::Rust);
+        let outcome = resolve_rust_semantic_pack_dependencies(
+            &RustAnalyzerConfig::default(),
+            &project,
+            &DependencyPackLimits::default(),
+            None,
+        );
+        assert!(outcome.complete);
+        assert_eq!(outcome.dependencies.len(), 1);
+        assert!(outcome.dependencies[0].evidence.target.is_none());
+        assert!(outcome.diagnostics.is_empty());
+        assert!(
+            outcome
+                .standard_library_pack_expectations()
+                .next()
+                .unwrap()
+                .approximate
+        );
+        fs::write(
+            fixture._root.path().join("rust-toolchain.toml"),
+            format!("[toolchain]\nchannel = \"{RUST_STDLIB_TOOLCHAIN_CHANNEL}-unknown-host\"\n"),
+        )
+        .unwrap();
+        let unknown = resolve_rust_semantic_pack_dependencies(
+            &RustAnalyzerConfig::default(),
+            &project,
+            &DependencyPackLimits::default(),
+            None,
+        );
+        assert!(unknown.dependencies.is_empty());
+        assert_eq!(unknown.diagnostics[0].code, "rust.toolchain.unknown_host");
+        fs::write(
+            fixture._root.path().join("rust-toolchain.toml"),
+            format!("[toolchain]\nchannel = \"{RUST_STDLIB_TOOLCHAIN_CHANNEL}\"\n"),
+        )
+        .unwrap();
+
+        fs::create_dir_all(fixture._root.path().join(".cargo")).unwrap();
+        fs::write(
+            fixture._root.path().join(".cargo/config.toml"),
+            "[build]\ntarget = \"unknown-target\"\n",
+        )
+        .unwrap();
+        let outcome = resolve_rust_semantic_pack_dependencies(
+            &RustAnalyzerConfig::default(),
+            &project,
+            &DependencyPackLimits::default(),
+            None,
+        );
+        assert!(outcome.dependencies.is_empty());
+        assert_eq!(outcome.diagnostics[0].code, "rust.config.unknown_target");
+        assert!(
+            !outcome
+                .standard_library_pack_expectations()
+                .next()
+                .unwrap()
+                .approximate
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12364: B review found cross-target stdlib facts globally applied to host units"
+    )]
+    fn mixed_rust_compile_contexts_withhold_exact_target_bound_activation() {
+        let host = "x86_64-unknown-linux-gnu";
+        let cross = "aarch64-unknown-linux-gnu";
+        for (name, known_host, build_script, proc_macro, target, expected) in [
+            ("build-cross", true, true, false, cross, None),
+            ("proc-path-dependency", true, false, true, cross, None),
+            ("build-same", true, true, false, host, Some(host)),
+            ("no-host-units", true, false, false, cross, Some(cross)),
+            ("two-targets", true, false, false, "both", None),
+            ("unknown-host-build", false, true, false, host, None),
+            ("unknown-build-kind", true, false, false, cross, None),
+            ("custom-build-script", true, false, false, cross, None),
+        ] {
+            let root = TempDir::new().unwrap();
+            fs::create_dir_all(root.path().join("src")).unwrap();
+            fs::create_dir_all(root.path().join(".cargo")).unwrap();
+            let mut manifest =
+                "[package]\nname='app'\nversion='0.1.0'\nedition='2021'\n".to_string();
+            let mut lock = "version=3\n[[package]]\nname='app'\nversion='0.1.0'\n".to_string();
+            if name == "unknown-build-kind" {
+                fs::write(root.path().join("unowned.rs"), "fn other() {}\n").unwrap();
+            }
+            if name == "custom-build-script" {
+                manifest.push_str("build='builder'\n");
+                fs::write(root.path().join("builder"), "fn main() {}\n").unwrap();
+            }
+            if build_script {
+                fs::write(root.path().join("build.rs"), "fn main() {}\n").unwrap();
+            }
+            if proc_macro {
+                manifest.push_str("[dependencies]\nmacros={path='macro'}\n");
+                lock.push_str(
+                    "dependencies=['macros']\n[[package]]\nname='macros'\nversion='0.1.0'\n",
+                );
+                fs::create_dir_all(root.path().join("macro/src")).unwrap();
+                fs::write(root.path().join("macro/Cargo.toml"), "[package]\nname='macros'\nversion='0.1.0'\nedition='2021'\n[lib]\nproc-macro=true\n").unwrap();
+                fs::write(
+                    root.path().join("macro/src/lib.rs"),
+                    "extern crate proc_macro;\n",
+                )
+                .unwrap();
+            }
+            fs::write(root.path().join("Cargo.toml"), manifest).unwrap();
+            fs::write(root.path().join("Cargo.lock"), lock).unwrap();
+            fs::write(root.path().join("src/lib.rs"), "pub fn local() {}\n").unwrap();
+            let suffix = if known_host {
+                format!("-{host}")
+            } else {
+                String::new()
+            };
+            fs::write(
+                root.path().join("rust-toolchain.toml"),
+                format!("[toolchain]\nchannel='{RUST_STDLIB_TOOLCHAIN_CHANNEL}{suffix}'\n"),
+            )
+            .unwrap();
+            let value = if target == "both" {
+                format!("['{host}', '{cross}']")
+            } else {
+                format!("'{target}'")
+            };
+            fs::write(
+                root.path().join(".cargo/config.toml"),
+                format!("[build]\ntarget={value}\n"),
+            )
+            .unwrap();
+            let project = TestProject::new(root.path().to_path_buf(), Language::Rust);
+            let outcome = resolve_rust_semantic_pack_dependencies(
+                &RustAnalyzerConfig::default(),
+                &project,
+                &DependencyPackLimits::default(),
+                None,
+            );
+            let stdlib = outcome
+                .dependencies
+                .iter()
+                .find(|row| row.id.starts_with("rust:stdlib:"))
+                .unwrap_or_else(|| panic!("{name}: {outcome:#?}"));
+            assert_eq!(
+                stdlib.evidence.target.as_deref(),
+                expected,
+                "{name}: {outcome:#?}"
+            );
+            assert_eq!(
+                outcome
+                    .standard_library_pack_expectations()
+                    .next()
+                    .unwrap()
+                    .approximate,
+                expected.is_none(),
+                "{name}"
+            );
+            assert_eq!(
+                outcome
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.code == "rust.stdlib.mixed_compile_contexts"),
+                expected.is_none(),
+                "{name}: {:?}",
+                outcome.diagnostics
+            );
+        }
     }
 
     #[test]
@@ -2415,10 +3239,14 @@ mod tests {
             activation,
             crate::analyzer::semantic_model::SemanticModelRuntimeOutcome::Ready { .. }
         ));
-        let overlay = analyzer.semantic_model_overlay().unwrap();
+        let overlay = analyzer.semantic_model_overlay_read().published().unwrap();
         assert_eq!(
             overlay
-                .symbols_named_in_family("renamed_widget.clean", "rust")
+                .symbols_named_in_family(
+                    "renamed_widget.clean",
+                    "rust",
+                    SemanticModelNamespace::Unknown
+                )
                 .records
                 .len(),
             1
@@ -2542,7 +3370,7 @@ mod tests {
         fn write_exact_toolchain(&self) {
             fs::write(
                 self._root.path().join("rust-toolchain.toml"),
-                format!("[toolchain]\nchannel = \"{RUST_STDLIB_TOOLCHAIN_CHANNEL}\"\n"),
+                format!("[toolchain]\nchannel = \"{RUST_STDLIB_TOOLCHAIN_CHANNEL}-x86_64-unknown-linux-gnu\"\n"),
             )
             .unwrap();
         }

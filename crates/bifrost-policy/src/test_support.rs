@@ -543,7 +543,7 @@ pub(crate) fn taint_source_spec(
         display_name: display_name.to_string(),
         categories: vec![PolicyCategoryId::new("input.user").unwrap()],
         selector: inline_match_selector(selector_name),
-        bind: PolicyPort::ReturnValue,
+        bind: PolicyPort::ReturnValue { path: None },
         labels: vec![TaintLabel::new(label).unwrap()],
         threat_model: None,
         evidence: None,
@@ -568,6 +568,7 @@ pub(crate) fn projected_finding_report(
     proof_reason: crate::finding::ProofReason,
 ) -> crate::projection::ProjectedFindingReport {
     crate::projection::ProjectedFindingReport {
+        evaluation_location: None,
         value_type_barrier_notes: Default::default(),
         primary,
         certainty: crate::finding::FindingCertainty::Definite,

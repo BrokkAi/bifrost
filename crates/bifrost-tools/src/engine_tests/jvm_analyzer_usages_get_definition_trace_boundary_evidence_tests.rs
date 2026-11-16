@@ -2016,7 +2016,7 @@ mod boundary_evidence_tests {
         .expect("the Kotlin fixture has a Kotlin analyzer")
         .external_boundary_evidence(
             token,
-            analyzer.semantic_model_overlay(),
+            analyzer.semantic_model_overlay_read().published(),
             &kotlin.file,
             "Collections.sort",
         );
@@ -2048,7 +2048,7 @@ mod boundary_evidence_tests {
         .expect("the Scala fixture has a Scala analyzer")
         .external_boundary_evidence(
             token,
-            analyzer.semantic_model_overlay(),
+            analyzer.semantic_model_overlay_read().published(),
             &scala.file,
             "Collections.sort",
         );

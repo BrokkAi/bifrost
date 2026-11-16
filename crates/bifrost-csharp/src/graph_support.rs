@@ -17,7 +17,8 @@
 //! `CSharpAnalyzer` lives in `brokk-bifrost-analysis`; this crate never names it.
 
 use brokk_bifrost_core::analyzer::capabilities::{
-    ImportAnalysisProvider, ImportReachability, TypeHierarchyProvider, build_reverse_file_index,
+    HierarchyAnswer, HierarchyOpenReason, ImportAnalysisProvider, ImportReachability,
+    TypeHierarchyProvider, build_reverse_file_index,
 };
 use brokk_bifrost_core::analyzer::code_unit_index::file_namespace_from_top_level_declarations;
 use brokk_bifrost_core::analyzer::model::{CodeUnitType, ImportInfo, SignatureMetadata};
@@ -228,8 +229,15 @@ pub trait CSharpSource: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyPr
     ) -> LimitedQueryRows<ImportInfo>;
 
     /// Base-type and interface names as written at the declaration of
-    /// `code_unit`, unresolved and in declaration order.
-    fn raw_supertypes_of(&self, code_unit: &CodeUnit) -> Vec<String>;
+    /// `code_unit`, unresolved and in declaration order, or `None` when
+    /// source cannot establish them, so an empty list is a proven absence.
+    fn declared_raw_supertypes(&self, code_unit: &CodeUnit) -> Option<Vec<String>>;
+
+    /// [`Self::declared_raw_supertypes`], reading an unestablished list as
+    /// empty.
+    fn raw_supertypes_of(&self, code_unit: &CodeUnit) -> Vec<String> {
+        self.declared_raw_supertypes(code_unit).unwrap_or_default()
+    }
 
     /// [`Self::raw_supertypes_of`] under a budget, answered from the store's
     /// supertype rows in stored ordinal order and matched on signature and
@@ -2360,28 +2368,109 @@ pub fn unique_logical_type(mut candidates: Vec<CodeUnit>) -> Option<CodeUnit> {
     candidates.into_iter().next()
 }
 
-/// Resolve the unique logical bases of each partial type part, then sort and
-/// deduplicate the resulting hierarchy edges. The callbacks retain each
-/// caller's query and cancellation policy; returning `None` stops the walk.
-pub fn logical_direct_ancestors(
-    parts: Vec<CodeUnit>,
-    mut raw_supertypes: impl FnMut(&CodeUnit) -> Option<Vec<String>>,
-    mut resolve_candidates: impl FnMut(&CodeUnit, &str) -> Option<Vec<CodeUnit>>,
-    mut accept_ancestor: impl FnMut(&CodeUnit) -> Option<()>,
-) -> Option<Vec<CodeUnit>> {
-    let mut ancestors = Vec::new();
-    for part in parts {
-        for raw in raw_supertypes(&part)? {
-            let candidates = resolve_candidates(&part, &raw)?;
-            let Some(ancestor) = unique_logical_type(candidates) else {
-                continue;
-            };
-            accept_ancestor(&ancestor)?;
-            ancestors.push(ancestor);
+/// One type's direct ancestors as the base clauses of its partial parts name
+/// them, with every clause that does not name exactly one indexed type.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LogicalDirectAncestors {
+    /// The logical type each uniquely resolved clause names, sorted and
+    /// deduplicated.
+    pub resolved: Vec<CodeUnit>,
+    /// The logical candidates of each clause that names more than one type.
+    pub ambiguous: Vec<Vec<CodeUnit>>,
+    /// Each clause that resolves to no indexed type. A clause naming the
+    /// `object` root is not one: every class has it.
+    pub unindexed: Vec<UnindexedClause>,
+    /// The parts whose base clauses source could not establish.
+    pub unread: Vec<CodeUnit>,
+}
+
+/// A base clause that resolves to no indexed type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnindexedClause {
+    /// The partial part whose base list writes the clause.
+    pub declared_by: CodeUnit,
+    /// The clause as written.
+    pub name: String,
+    /// Whether the clause may still name an indexed type the lookup did not
+    /// find (an inherited nested type, for example). Only a clause whose
+    /// identifier no indexed type declares, and that is not a using alias, is
+    /// proven to name a type outside the index; until a caller proves that,
+    /// this stays `true`.
+    pub may_name_indexed: bool,
+}
+
+impl LogicalDirectAncestors {
+    /// The request-owned hierarchy answer: the resolved edges, each ambiguous
+    /// clause's candidates, and an open reason for every clause it could not
+    /// follow.
+    pub fn hierarchy_answer(&self) -> HierarchyAnswer {
+        HierarchyAnswer {
+            edges: self.resolved.clone(),
+            ambiguous: self.ambiguous.clone(),
+            open: self
+                .unindexed
+                .iter()
+                .map(|clause| HierarchyOpenReason::ExternalUnindexedAncestor {
+                    name: clause.name.clone(),
+                    declared_by: clause.declared_by.clone(),
+                    may_name_indexed: clause.may_name_indexed,
+                })
+                .chain(self.unread.iter().map(|declared_by| {
+                    HierarchyOpenReason::SupertypesUnread {
+                        declared_by: declared_by.clone(),
+                    }
+                }))
+                .collect(),
         }
     }
-    sort_dedup_type_candidates(&mut ancestors);
+}
+
+/// Resolve the base clauses of each partial type part. The callbacks retain
+/// each caller's query and cancellation policy: `raw_supertypes` answers
+/// `None` to stop the walk and `Some(None)` for a part whose base list source
+/// cannot establish, and the other two stop the walk with `None`.
+pub fn logical_direct_ancestors(
+    parts: Vec<CodeUnit>,
+    mut raw_supertypes: impl FnMut(&CodeUnit) -> Option<Option<Vec<String>>>,
+    mut resolve_candidates: impl FnMut(&CodeUnit, &str) -> Option<Vec<CodeUnit>>,
+    mut accept_ancestor: impl FnMut(&CodeUnit) -> Option<()>,
+) -> Option<LogicalDirectAncestors> {
+    let mut ancestors = LogicalDirectAncestors::default();
+    for part in parts {
+        let Some(raw_supertypes) = raw_supertypes(&part)? else {
+            ancestors.unread.push(part);
+            continue;
+        };
+        for raw in raw_supertypes {
+            let mut candidates = resolve_candidates(&part, &raw)?;
+            match logical_type_count(&candidates) {
+                0 if is_csharp_object_root(&csharp_normalize_full_name(&raw)) => {}
+                0 => ancestors.unindexed.push(UnindexedClause {
+                    declared_by: part.clone(),
+                    name: raw,
+                    may_name_indexed: true,
+                }),
+                1 => {
+                    let ancestor =
+                        unique_logical_type(candidates).expect("one logical candidate is unique");
+                    accept_ancestor(&ancestor)?;
+                    ancestors.resolved.push(ancestor);
+                }
+                _ => {
+                    sort_dedup_type_candidates(&mut candidates);
+                    ancestors.ambiguous.push(candidates);
+                }
+            }
+        }
+    }
+    sort_dedup_type_candidates(&mut ancestors.resolved);
     Some(ancestors)
+}
+
+/// Whether a normalized type name names `System.Object`, the root every class
+/// derives from whether or not its base list says so.
+pub fn is_csharp_object_root(normalized_name: &str) -> bool {
+    matches!(normalized_name, "object" | "System.Object")
 }
 
 // ---------------------------------------------------------------------------

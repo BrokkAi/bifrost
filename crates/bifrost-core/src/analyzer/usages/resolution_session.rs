@@ -1,4 +1,5 @@
 use crate::analyzer::query_batch::LimitedQueryRows;
+use crate::analyzer::reuse_verdict::{CarriesReuseVerdict, ExecutionCause, ReuseVerdict};
 use crate::analyzer::usages::receiver_analysis::{
     ReceiverAnalysisBudget, ReceiverAnalysisWork, ReceiverBudgetLimit,
 };
@@ -49,6 +50,21 @@ impl<T> BoundedResolution<T> {
     }
 }
 
+/// An exceeded or cancelled resolution is execution dependent by its shape;
+/// [`ResolutionSession::finish`] marks exactly these. A complete value can
+/// still depend on a caller's cancellation, which only the session's own
+/// verdict reports.
+impl<T> CarriesReuseVerdict for BoundedResolution<T> {
+    fn reuse_verdict(&self) -> ReuseVerdict {
+        match self {
+            Self::Complete { .. } | Self::Unavailable { .. } => ReuseVerdict::Content,
+            Self::Exceeded { .. } | Self::Cancelled { .. } => {
+                ReuseVerdict::ExecutionDependent(ExecutionCause::Other)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum ResolutionStop {
     Exceeded(ReceiverBudgetLimit),
@@ -59,6 +75,18 @@ enum ResolutionStop {
 struct ResolutionState {
     work: ReceiverAnalysisWork,
     stop: Option<ResolutionStop>,
+    /// Joined at every ambient mark this session makes.
+    reuse: ReuseVerdict,
+}
+
+impl ResolutionState {
+    /// Mark the ambient capture and keep the same verdict for the caller.
+    #[track_caller]
+    fn join_execution_dependence(&mut self) {
+        crate::analyzer::carried_context::mark_execution_dependent();
+        self.reuse
+            .join_in(ReuseVerdict::ExecutionDependent(ExecutionCause::Other));
+    }
 }
 
 /// One selected owner frontier in a request's expansion budget. The number
@@ -68,6 +96,12 @@ pub struct ResolutionOwnerFrontier(u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CallCancelled;
+
+impl CarriesReuseVerdict for CallCancelled {
+    fn reuse_verdict(&self) -> ReuseVerdict {
+        ReuseVerdict::ExecutionDependent(ExecutionCause::Other)
+    }
+}
 
 impl ResolutionOwnerFrontier {
     pub const fn new(operation_alias: u64) -> Self {
@@ -113,7 +147,7 @@ impl ResolutionSession {
             .iter()
             .fold(false, |cancelled, token| cancelled | token.is_cancelled());
         if cancelled {
-            crate::analyzer::carried_context::mark_execution_dependent();
+            self.join_execution_dependence();
         }
         drop(restore);
         if cancelled {
@@ -192,6 +226,7 @@ impl ResolutionSession {
             state: RefCell::new(ResolutionState {
                 work: shared_work,
                 stop: None,
+                reuse: ReuseVerdict::Content,
             }),
             expanded_owners: RefCell::default(),
         }
@@ -238,10 +273,13 @@ impl ResolutionSession {
 
     pub fn finish<T>(&self, value: T) -> BoundedResolution<T> {
         self.observe_cancellation();
-        let state = *self.state.borrow();
-        if state.stop.is_some() {
-            crate::analyzer::carried_context::mark_execution_dependent();
-        }
+        let state = {
+            let mut state = self.state.borrow_mut();
+            if state.stop.is_some() {
+                state.join_execution_dependence();
+            }
+            *state
+        };
         match state.stop {
             Some(ResolutionStop::Exceeded(limit)) => BoundedResolution::Exceeded {
                 limit,
@@ -452,7 +490,7 @@ impl ResolutionSession {
             state.stop = Some(ResolutionStop::Cancelled);
         }
         if state.stop.is_some() {
-            crate::analyzer::carried_context::mark_execution_dependent();
+            state.join_execution_dependence();
         }
         let call_cancelled = self
             .call_cancellation
@@ -460,13 +498,25 @@ impl ResolutionSession {
             .iter()
             .any(CancellationToken::is_cancelled);
         if call_cancelled {
-            crate::analyzer::carried_context::mark_execution_dependent();
+            state.join_execution_dependence();
         }
         state.stop.is_none() && !call_cancelled
     }
 
+    /// Whether a budget stop or cancellation has already ended this session.
+    /// Unlike [`Self::observe_cancellation`], this neither observes the token
+    /// nor marks the capture.
+    pub fn is_stopped(&self) -> bool {
+        self.state.borrow().stop.is_some()
+    }
+
     pub fn cancellation(&self) -> Option<&CancellationToken> {
         self.cancellation.as_ref()
+    }
+
+    #[track_caller]
+    fn join_execution_dependence(&self) {
+        self.state.borrow_mut().join_execution_dependence();
     }
 
     /// The exact remaining allowance for a demand answer memo. A stopped
@@ -535,8 +585,8 @@ impl ResolutionSession {
     }
 
     fn stop(&self, stop: ResolutionStop) {
-        crate::analyzer::carried_context::mark_execution_dependent();
         let mut state = self.state.borrow_mut();
+        state.join_execution_dependence();
         if state.stop.is_none() {
             state.stop = Some(stop);
             drop(state);
@@ -562,13 +612,14 @@ impl ResolutionSession {
             return true;
         };
         let mut state = self.state.borrow_mut();
-        if self.total_work_limit.is_some_and(|maximum| {
-            !crate::analyzer::work_budget::LimitedCounter::from_usage(
+        if let Some(Err(refused)) = self.total_work_limit.map(|maximum| {
+            crate::analyzer::work_budget::LimitedCounter::from_usage(
                 total_work(&state.work),
                 maximum,
             )
-            .allows(1)
+            .try_allow(1)
         }) {
+            state.reuse.join_in(refused.reuse_verdict());
             state.stop = Some(ResolutionStop::Exceeded(ReceiverBudgetLimit::TotalWork));
             drop(state);
             self.cancellation
@@ -595,7 +646,10 @@ impl ResolutionSession {
             ),
             ReceiverBudgetLimit::TotalWork => unreachable!("aggregate work is checked above"),
         };
-        if !crate::analyzer::work_budget::LimitedCounter::from_usage(*used, maximum).allows(1) {
+        if let Err(refused) =
+            crate::analyzer::work_budget::LimitedCounter::from_usage(*used, maximum).try_allow(1)
+        {
+            state.reuse.join_in(refused.reuse_verdict());
             state.stop = Some(ResolutionStop::Exceeded(limit));
             drop(state);
             self.cancellation
@@ -607,6 +661,15 @@ impl ResolutionSession {
             *used += 1;
             true
         }
+    }
+}
+
+/// Every execution dependence this session has marked so far: its stops,
+/// refused limits and observed caller cancellations. A caller joins it into
+/// the answer it builds from the session's lookups.
+impl CarriesReuseVerdict for ResolutionSession {
+    fn reuse_verdict(&self) -> ReuseVerdict {
+        self.state.borrow().reuse
     }
 }
 
@@ -1109,5 +1172,128 @@ mod tests {
                 }
             }
         ));
+    }
+
+    /// Counts the ambient marks that reach one capture, as a read ledger does.
+    #[derive(Default)]
+    struct CountingCapture {
+        execution: std::sync::atomic::AtomicUsize,
+        budget: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::analyzer::carried_context::ExecutionAttribution for CountingCapture {
+        fn mark_execution_dependent(&self) {
+            self.execution
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        fn mark_budget_refusal(&self) {
+            self.mark_execution_dependent();
+            self.budget
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// The verdict a value returns while its ambient marks still decide must
+    /// be exactly the verdict those marks imply, or removing the marks would
+    /// change which answers are kept.
+    fn assert_verdict_matches_ambient(
+        case: &str,
+        produce: impl FnOnce() -> crate::analyzer::reuse_verdict::ReuseVerdict,
+    ) {
+        let capture = std::sync::Arc::new(CountingCapture::default());
+        let guard = crate::analyzer::carried_context::push_with_execution_attribution(
+            std::sync::Arc::clone(&capture),
+        );
+        let explicit = produce();
+        drop(guard);
+        let ambient = crate::analyzer::reuse_verdict::ReuseVerdict::from_counts(
+            capture.execution.load(std::sync::atomic::Ordering::Relaxed),
+            capture.budget.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        assert_eq!(explicit, ambient, "{case}");
+    }
+
+    #[test]
+    fn core_refusal_verdicts_equal_their_ambient_marks() {
+        use crate::analyzer::usages::receiver_analysis::{
+            ReceiverAnalysisBudgetTracker, ReceiverAnalysisOutcome, ReceiverAnalysisReport,
+        };
+        use crate::analyzer::work_budget::LimitedCounter;
+
+        assert_verdict_matches_ambient("complete session", || {
+            let session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), None);
+            assert!(session.scope_step());
+            let finished = session.finish(());
+            session.reuse_verdict().join(finished.reuse_verdict())
+        });
+        assert_verdict_matches_ambient("scope limit", || {
+            let session = ResolutionSession::bounded(
+                ReceiverAnalysisBudget {
+                    max_scope_nodes: 0,
+                    ..ReceiverAnalysisBudget::default()
+                },
+                None,
+            );
+            assert!(!session.scope_step());
+            let finished = session.finish(());
+            assert!(matches!(finished, BoundedResolution::Exceeded { .. }));
+            session.reuse_verdict().join(finished.reuse_verdict())
+        });
+        assert_verdict_matches_ambient("total work limit", || {
+            let session = ResolutionSession::bounded_with_total_work(
+                ReceiverAnalysisBudget::default(),
+                0,
+                None,
+            );
+            assert!(!session.round_step());
+            session.reuse_verdict()
+        });
+        assert_verdict_matches_ambient("nested exceeded", || {
+            let session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), None);
+            session.mark_exceeded(ReceiverBudgetLimit::SummaryExpansions);
+            session.reuse_verdict()
+        });
+        assert_verdict_matches_ambient("operation cancelled", || {
+            let operation = CancellationToken::new();
+            let session =
+                ResolutionSession::bounded(ReceiverAnalysisBudget::default(), Some(&operation));
+            operation.cancel();
+            assert!(!session.observe_cancellation());
+            session.reuse_verdict()
+        });
+        assert_verdict_matches_ambient("caller cancelled", || {
+            let session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), None);
+            let caller = CancellationToken::new();
+            let result = session.with_call_cancellation(&caller, || caller.cancel());
+            let refused = result.expect_err("caller cancelled");
+            session.reuse_verdict().join(refused.reuse_verdict())
+        });
+        assert_verdict_matches_ambient("limited counter", || {
+            LimitedCounter::from_usage(1, 1)
+                .try_allow(1)
+                .expect_err("over the limit")
+                .reuse_verdict()
+        });
+        assert_verdict_matches_ambient("tracker limit and truncation", || {
+            let mut tracker = ReceiverAnalysisBudgetTracker::new(ReceiverAnalysisBudget {
+                max_scope_nodes: 0,
+                max_targets: 1,
+                ..ReceiverAnalysisBudget::default()
+            });
+            assert!(tracker.record_scope_node().is_err());
+            let report = tracker.report(ReceiverAnalysisOutcome::Ambiguous(vec![1, 2]));
+            tracker.reuse_verdict().join(report.reuse_verdict())
+        });
+        assert_verdict_matches_ambient("truncated cached report", || {
+            ReceiverAnalysisReport::without_work(
+                ReceiverAnalysisOutcome::Precise(vec![1, 2]),
+                ReceiverAnalysisBudget {
+                    max_targets: 1,
+                    ..ReceiverAnalysisBudget::default()
+                },
+            )
+            .reuse_verdict()
+        });
     }
 }

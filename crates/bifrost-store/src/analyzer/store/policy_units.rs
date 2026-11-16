@@ -18,7 +18,12 @@
 //!
 //! [`PolicyUnitKey`]: https://docs.rs/  (crates/bifrost-policy/src/units.rs)
 
+use brokk_bifrost_core::analyzer::external_selection::{
+    JvmDependencyBasis, JvmDependencyBasisEntry,
+};
+use brokk_bifrost_core::analyzer::reuse_verdict::SelectionView;
 use brokk_bifrost_core::gitblob::ParseVariant;
+use brokk_bifrost_semantic::analyzer::semantic::read_ledger::SelectionRead;
 #[cfg(test)]
 use brokk_bifrost_semantic::analyzer::semantic::read_ledger::{FactSubject, WorkspaceFactFamily};
 use git2::Oid;
@@ -30,7 +35,7 @@ use crate::analyzer::Language;
 use crate::analyzer::read_ledger::ReadKey;
 use crate::analyzer::store::AnalyzerStore;
 
-use super::read_keys::{ReadKeyColumns, decode_read_key};
+use super::read_keys::{ReadKeyBatch, ReadKeyColumns};
 
 /// How many base evaluations one store retains.
 ///
@@ -127,6 +132,9 @@ pub enum PolicyUnitPartitionRow {
     },
     /// The whole policy, which is what a widened evaluation publishes.
     Whole,
+    /// One ordinary-plan question, with no seed-file ownership. The question
+    /// includes its role, canonical plan and binding query's physical grant.
+    Operand { question: String },
 }
 
 impl PolicyUnitPartitionRow {
@@ -140,13 +148,18 @@ impl PolicyUnitPartitionRow {
             Self::Prefix { .. } => "prefix",
             Self::Output { .. } => "output",
             Self::Whole => "whole",
+            Self::Operand { .. } => "operand",
         }
     }
 
-    fn key_columns(&self) -> (String, String, [String; 9]) {
-        let mut digests: [String; 9] = std::array::from_fn(|_| String::new());
+    fn key_columns(&self) -> (String, String, [String; 10]) {
+        let mut digests: [String; 10] = std::array::from_fn(|_| String::new());
         let (rel_path, blob) = match self {
             Self::Whole => return (String::new(), String::new(), digests),
+            Self::Operand { question } => {
+                digests[9] = question.clone();
+                return (String::new(), String::new(), digests);
+            }
             Self::Seed { rel_path, blob, .. } => (rel_path, blob),
             Self::Binding {
                 rel_path,
@@ -222,7 +235,7 @@ impl PolicyUnitPartitionRow {
             | Self::Selector { blob, language, .. }
             | Self::Prefix { blob, language, .. }
             | Self::Output { blob, language, .. } => Some((blob, language)),
-            Self::Whole => None,
+            Self::Whole | Self::Operand { .. } => None,
         }
     }
 }
@@ -345,6 +358,9 @@ pub struct PolicyEvaluationPolicyRow {
 /// Completed policy answers published under one base-evaluation context.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyEvaluationRow {
+    /// Hint input digest when any policy was evaluator-cut; otherwise independent.
+    pub cut_hint_digest: Option<[u8; 32]>,
+
     pub evidence: Option<PolicyReplayEvidence>,
     pub evidence_complete: Option<bool>,
     pub key: PolicyEvaluationRowKey,
@@ -367,6 +383,15 @@ pub struct PolicyEvaluationRow {
     /// Policies evaluated without an exhaustive result. Remove any older
     /// answer for these ids so a prior complete row cannot mask this result.
     pub unqualified_policy_ids: Vec<String>,
+    /// The selection-authority reads the evaluation consumed: answers that
+    /// discovery or the environment decides, which the key does not fix. They
+    /// describe every policy row, so a publication whose reads differ from the
+    /// stored ones replaces the stored policy rows (#11482). A `Split` read
+    /// carries the tree part it was taken under (#11607).
+    pub selection_reads: Vec<SelectionRead>,
+    /// What the evaluation's analyzer was built over. Replay admits an
+    /// `ExportDetermined` read only for an export of the key's tree (#11607).
+    pub selection_view: SelectionView,
 }
 
 /// One loaded base evaluation.
@@ -385,6 +410,8 @@ pub struct LoadedPolicyEvaluation {
     pub aggregate_unreliable: bool,
     /// The content identity of the base workspace the evaluation analyzed.
     pub base_content_identity: [u8; 32],
+    pub selection_reads: Vec<SelectionRead>,
+    pub selection_view: SelectionView,
     pub policies: Vec<LoadedPolicyEvaluationPolicy>,
 }
 
@@ -420,7 +447,7 @@ fn replay_evidence(
 const UNIT_COLUMNS: &str = "units.unit_id, units.policy_semantic_hash, units.family, \
      units.partition_kind, units.seed_rel_path, units.seed_blob_oid, units.binding_digest, units.subjects_digest, units.root_locator, units.root_compilation, units.selector_digest, units.prefix_cut_digest, units.prefix_input_digest, units.anchor_locator, units.compilation_digest, \
      units.lang, units.configuration_fingerprint, units.active_model_set_hash, \
-     units.engine_epoch, units.product_kind, json(units.product), units.read_set_digest";
+     units.engine_epoch, units.product_kind, json(units.product), units.read_set_digest, units.operand_question_digest";
 
 impl AnalyzerStore {
     /// Publish `units`, replacing any row already published under the same key.
@@ -545,7 +572,7 @@ impl AnalyzerStore {
             if index > 0 {
                 values.push(',');
             }
-            values.push_str("(?,?,?,?,?,?,?,?,?,?,?,?)");
+            values.push_str("(?,?,?,?,?,?,?,?,?,?,?,?,?)");
         }
         let sql = policy_unit_batch_sql(&values);
         let mut statement = conn.prepare_cached(&sql)?;
@@ -553,8 +580,14 @@ impl AnalyzerStore {
         let mut keys_by_id: HashMap<i64, PolicyUnitRowKey> = HashMap::new();
         while let Some(row) = rows.next()? {
             let (unit_id, mut unit) = decode_unit_row(row)?;
-            unit.reads = load_unit_reads(&conn, unit_id)?;
+            // Unsupported products still own attestations whose stored shape
+            // must be validated before the product can be omitted.
             keys_by_id.insert(unit_id, unit.key.clone());
+            unit.reads = match load_unit_reads(&conn, unit_id) {
+                Ok(reads) => reads,
+                Err(error) if error.is_unsupported_read_key() => continue,
+                Err(error) => return Err(error),
+            };
             found.insert(unit.key.clone(), unit);
         }
         if !keys_by_id.is_empty() {
@@ -573,10 +606,11 @@ impl AnalyzerStore {
                         snapshot.len()
                     ))
                 })?;
-                let unit = found
-                    .get_mut(&keys_by_id[&unit_id])
-                    .expect("every loaded unit id names a loaded unit");
-                if unit.snapshots.len() < MAX_UNIT_SNAPSHOTS {
+                // The absent products are precisely those with unsupported
+                // receipts. Their attestation was checked above as well.
+                if let Some(unit) = found.get_mut(&keys_by_id[&unit_id])
+                    && unit.snapshots.len() < MAX_UNIT_SNAPSHOTS
+                {
                     unit.snapshots.push(snapshot);
                 }
             }
@@ -592,7 +626,20 @@ impl AnalyzerStore {
     /// optimization for the head and never part of the answer. Publishing also
     /// sweeps, because a base evaluation is keyed by a tree id and has no blob
     /// to follow out of the cache.
-    pub fn publish_policy_evaluation(&self, evaluation: PolicyEvaluationRow) -> Result<()> {
+    /// Raw rows cannot cross the durable publication boundary.
+    ///
+    /// ```compile_fail,E0308
+    /// use brokk_bifrost_store::analyzer::store::AnalyzerStore;
+    /// use brokk_bifrost_store::analyzer::store::policy_units::PolicyEvaluationRow;
+    /// fn unadmitted(store: &AnalyzerStore, row: PolicyEvaluationRow) {
+    ///     store.publish_policy_evaluation(row).unwrap();
+    /// }
+    /// ```
+    pub fn publish_policy_evaluation(
+        &self,
+        evaluation: brokk_bifrost_core::analyzer::reuse_verdict::Admitted<PolicyEvaluationRow>,
+    ) -> Result<()> {
+        let evaluation = evaluation.into_inner();
         let published_at = brokk_bifrost_core::cache_db::now_unix_seconds();
         self.conn.execute(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -605,15 +652,53 @@ impl AnalyzerStore {
                 }
             }
             let key = &evaluation.key;
+            let export_tree = match &evaluation.selection_view {
+                SelectionView::Export { tree_oid } => Some(tree_oid.to_string()),
+                SelectionView::Worktree => None,
+            };
+            // The view the stored row was produced over, read before the
+            // upsert overwrites it: a row written over another view answers a
+            // different question.
+            let stored_export_tree = tx
+                .query_row(
+                    "SELECT selection_export_tree, cut_hint_digest FROM policy_evaluations
+                     WHERE base_tree_oid = ?1 AND options_digest = ?2
+                       AND configuration_fingerprint = ?3 AND active_model_set_hash = ?4
+                       AND engine_epoch = ?5",
+                    params![
+                        key.base_tree_oid,
+                        key.options_digest,
+                        key.configuration_fingerprint,
+                        key.active_model_set_hash,
+                        key.engine_epoch,
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, Option<Vec<u8>>>(1)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            // A live worktree's answer for a tree never replaces the answer an
+            // export of that tree gave: the export is exactly the tree, while
+            // the worktree also holds untracked files and restore output.
+            if export_tree.is_none()
+                && stored_export_tree
+                    .as_ref()
+                    .is_some_and(|(view, _)| view.is_some())
+            {
+                return Ok(());
+            }
             tx.execute(
                 "INSERT INTO policy_evaluations(
                    base_tree_oid, options_digest, configuration_fingerprint,
                    active_model_set_hash, engine_epoch, policy_set_digest,
                    unreliable_detail, aggregate_unreliable, resolved_commit, published_at,
                    base_content_identity, effective_grant, census_files,
-                   census_bytes, evidence_complete
+                   census_bytes, evidence_complete, selection_export_tree, cut_hint_digest
                  ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-                          ?12, ?13, ?14, ?15)
+                          ?12, ?13, ?14, ?15, ?16, ?17)
                  ON CONFLICT(base_tree_oid, options_digest, configuration_fingerprint,
                              active_model_set_hash, engine_epoch)
                  DO UPDATE SET resolved_commit = excluded.resolved_commit,
@@ -625,7 +710,9 @@ impl AnalyzerStore {
                                effective_grant = excluded.effective_grant,
                                census_files = excluded.census_files,
                                census_bytes = excluded.census_bytes,
-                               evidence_complete = excluded.evidence_complete",
+                               evidence_complete = excluded.evidence_complete,
+                               selection_export_tree = excluded.selection_export_tree,
+                               cut_hint_digest = excluded.cut_hint_digest",
                 params![
                     key.base_tree_oid,
                     key.options_digest,
@@ -645,6 +732,11 @@ impl AnalyzerStore {
                     evaluation.evidence.as_ref().map(|e| e.census_files),
                     evaluation.evidence.as_ref().map(|e| e.census_bytes),
                     evaluation.evidence_complete,
+                    export_tree,
+                    evaluation
+                        .cut_hint_digest
+                        .as_ref()
+                        .map(|digest| digest.as_slice()),
                 ],
             )?;
             let evaluation_id = tx.query_row(
@@ -661,6 +753,79 @@ impl AnalyzerStore {
                 ],
                 |row| row.get::<_, i64>(0),
             )?;
+            // The stored policy rows answer under the stored reads. Policy
+            // rows are replaced independently, so keeping any of them under
+            // different reads would pair an answer with a discovery that did
+            // not produce it.
+            let mut reads = evaluation
+                .selection_reads
+                .iter()
+                .map(|read| Ok((intern_read_key(&tx, &read.key)?, read.basis.as_ref())))
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            reads.sort_by_key(|(read_id, _)| *read_id);
+            reads.dedup_by_key(|(read_id, _)| *read_id);
+            let stored_reads = stored_selection_bases(&tx, evaluation_id)?;
+            // A changed aggregate hint guard must not retain another policy's
+            // cut answer while replacing the parent with a different guard.
+            let unchanged = stored_export_tree.is_none_or(|(stored, hint)| {
+                stored == export_tree
+                    && hint.as_deref()
+                        == evaluation
+                            .cut_hint_digest
+                            .as_ref()
+                            .map(|digest| digest.as_slice())
+            }) && stored_reads.len() == reads.len()
+                && stored_reads.iter().zip(&reads).all(
+                    |((stored_id, stored), (read_id, basis))| {
+                        stored_id == read_id && stored.as_ref() == *basis
+                    },
+                );
+            if !unchanged {
+                tx.execute(
+                    "DELETE FROM policy_evaluation_policies WHERE evaluation_id = ?1",
+                    params![evaluation_id],
+                )?;
+                tx.execute(
+                    "DELETE FROM policy_evaluation_read_coordinates WHERE evaluation_id = ?1",
+                    params![evaluation_id],
+                )?;
+                tx.execute(
+                    "DELETE FROM policy_evaluation_reads WHERE evaluation_id = ?1",
+                    params![evaluation_id],
+                )?;
+                let mut member = tx.prepare_cached(
+                    "INSERT INTO policy_evaluation_reads(
+                       evaluation_id, read_id, basis_platform_override
+                     ) VALUES(?1, ?2, ?3)",
+                )?;
+                let mut coordinate = tx.prepare_cached(
+                    "INSERT INTO policy_evaluation_read_coordinates(
+                       evaluation_id, read_id, ordinal, group_id, artifact_id,
+                       version, scope, declared_by
+                     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                )?;
+                for (read_id, basis) in &reads {
+                    member.execute(params![
+                        evaluation_id,
+                        read_id,
+                        basis.map(|basis| basis.platform_override)
+                    ])?;
+                    for (ordinal, entry) in
+                        basis.iter().flat_map(|basis| &basis.entries).enumerate()
+                    {
+                        coordinate.execute(params![
+                            evaluation_id,
+                            read_id,
+                            ordinal as i64,
+                            entry.group_id,
+                            entry.artifact_id,
+                            entry.version,
+                            entry.scope,
+                            entry.declared_by,
+                        ])?;
+                    }
+                }
+            }
             for policy_id in &evaluation.unqualified_policy_ids {
                 tx.execute(
                     "DELETE FROM policy_evaluation_policies
@@ -727,6 +892,7 @@ impl AnalyzerStore {
     pub fn policy_evaluation_for_key(
         &self,
         key: &PolicyEvaluationRowKey,
+        hint_digest: &[u8; 32],
     ) -> Result<Option<LoadedPolicyEvaluation>> {
         let conn = self.read_conn()?;
         let row = conn
@@ -738,6 +904,7 @@ impl AnalyzerStore {
                     key.configuration_fingerprint,
                     key.active_model_set_hash,
                     key.engine_epoch,
+                    hint_digest.as_slice(),
                 ],
                 |row| {
                     Ok((
@@ -751,6 +918,7 @@ impl AnalyzerStore {
                         row.get::<_, Option<u64>>(7)?,
                         row.get::<_, Option<u64>>(8)?,
                         row.get::<_, Option<bool>>(9)?,
+                        row.get::<_, Option<String>>(10)?,
                     ))
                 },
             )
@@ -766,6 +934,7 @@ impl AnalyzerStore {
             census_files,
             census_bytes,
             evidence_complete,
+            export_tree,
         )) = row
         else {
             return Ok(None);
@@ -838,12 +1007,19 @@ impl AnalyzerStore {
             unreliable_detail,
             aggregate_unreliable,
             base_content_identity,
+            selection_reads: load_selection_reads(&conn, evaluation_id)?,
+            selection_view: match export_tree {
+                Some(tree_oid) => SelectionView::Export {
+                    tree_oid: tree_oid.into(),
+                },
+                None => SelectionView::Worktree,
+            },
             policies,
         }))
     }
 }
 
-/// The batched unit lookup, with `values` holding one 12-column row per
+/// The batched unit lookup, with `values` holding one 13-column row per
 /// requested partition.
 ///
 /// Shared with the query-plan pin, which asserts that this exact statement
@@ -854,7 +1030,7 @@ pub(crate) fn policy_unit_batch_sql(values: &str) -> String {
          WHERE policy_semantic_hash = ?1 AND family = ?2
            AND configuration_fingerprint = ?3 AND active_model_set_hash = ?4
            AND engine_epoch = ?5
-           AND (partition_kind, seed_rel_path, seed_blob_oid, binding_digest, subjects_digest, root_locator, root_compilation, selector_digest, prefix_cut_digest, prefix_input_digest, anchor_locator, compilation_digest)
+           AND (partition_kind, seed_rel_path, seed_blob_oid, binding_digest, subjects_digest, root_locator, root_compilation, selector_digest, prefix_cut_digest, prefix_input_digest, anchor_locator, compilation_digest, operand_question_digest)
                IN (VALUES {values})"
     )
 }
@@ -869,13 +1045,18 @@ pub(crate) const POLICY_UNIT_SNAPSHOTS_SQL: &str = "SELECT unit_id, content_iden
      ORDER BY unit_id, attestation DESC";
 
 /// The evaluation lookup, shared with its query-plan pin.
+/// #12413: an aggregate hint digest is sufficient to decide reuse before
+/// loading child policies. It costs a miss only when some policy was cut;
+/// uncut evaluations remain reusable after acceptance documents change.
 pub(crate) const POLICY_EVALUATION_LOOKUP_SQL: &str = "SELECT evaluation_id, resolved_commit,
             policy_set_digest, unreliable_detail, aggregate_unreliable, base_content_identity,
-            effective_grant, census_files, census_bytes, evidence_complete
+            effective_grant, census_files, census_bytes, evidence_complete,
+            selection_export_tree
      FROM policy_evaluations
      WHERE base_tree_oid = ?1 AND options_digest = ?2
        AND configuration_fingerprint = ?3 AND active_model_set_hash = ?4
-       AND engine_epoch = ?5";
+       AND engine_epoch = ?5
+       AND (cut_hint_digest IS NULL OR cut_hint_digest = ?6)";
 
 /// The identity read, shared with its query-plan pin.
 ///
@@ -905,7 +1086,7 @@ fn unit_id_for_key(
          WHERE policy_semantic_hash = ?1 AND family = ?2
            AND configuration_fingerprint = ?3 AND active_model_set_hash = ?4
            AND engine_epoch = ?5 AND partition_kind = ?6
-           AND seed_rel_path = ?7 AND seed_blob_oid = ?8 AND binding_digest = ?9 AND subjects_digest = ?10 AND root_locator = ?11 AND root_compilation = ?12 AND selector_digest = ?13 AND prefix_cut_digest = ?14 AND prefix_input_digest = ?15 AND anchor_locator = ?16 AND compilation_digest = ?17",
+           AND seed_rel_path = ?7 AND seed_blob_oid = ?8 AND binding_digest = ?9 AND subjects_digest = ?10 AND root_locator = ?11 AND root_compilation = ?12 AND selector_digest = ?13 AND prefix_cut_digest = ?14 AND prefix_input_digest = ?15 AND anchor_locator = ?16 AND compilation_digest = ?17 AND operand_question_digest = ?18",
         params![
             key.policy_semantic_hash,
             key.family,
@@ -915,7 +1096,7 @@ fn unit_id_for_key(
             key.partition.kind(),
             rel_path,
             blob_oid,
-            digests[0], digests[1], digests[2], digests[3], digests[4], digests[5], digests[6], digests[7], digests[8],
+            digests[0], digests[1], digests[2], digests[3], digests[4], digests[5], digests[6], digests[7], digests[8], digests[9],
         ],
         |row| row.get::<_, i64>(0),
     )
@@ -967,7 +1148,7 @@ fn write_unit(
          WHERE policy_semantic_hash = ?1 AND family = ?2
            AND configuration_fingerprint = ?3 AND active_model_set_hash = ?4
            AND engine_epoch = ?5 AND partition_kind = ?6
-           AND seed_rel_path = ?7 AND seed_blob_oid = ?8 AND binding_digest = ?9 AND subjects_digest = ?10 AND root_locator = ?11 AND root_compilation = ?12 AND selector_digest = ?13 AND prefix_cut_digest = ?14 AND prefix_input_digest = ?15 AND anchor_locator = ?16 AND compilation_digest = ?17",
+           AND seed_rel_path = ?7 AND seed_blob_oid = ?8 AND binding_digest = ?9 AND subjects_digest = ?10 AND root_locator = ?11 AND root_compilation = ?12 AND selector_digest = ?13 AND prefix_cut_digest = ?14 AND prefix_input_digest = ?15 AND anchor_locator = ?16 AND compilation_digest = ?17 AND operand_question_digest = ?18",
         params![
             key.policy_semantic_hash,
             key.family,
@@ -977,19 +1158,19 @@ fn write_unit(
             key.partition.kind(),
             rel_path,
             blob_oid,
-            digests[0], digests[1], digests[2], digests[3], digests[4], digests[5], digests[6], digests[7], digests[8],
+            digests[0], digests[1], digests[2], digests[3], digests[4], digests[5], digests[6], digests[7], digests[8], digests[9],
         ],
     )?;
     conn.execute(
         "INSERT INTO policy_units(
            policy_semantic_hash, family, partition_kind, seed_rel_path,
-           seed_blob_oid, binding_digest, subjects_digest, root_locator, root_compilation, selector_digest, prefix_cut_digest, prefix_input_digest, anchor_locator, compilation_digest, seed_blob_id, lang,
+           seed_blob_oid, binding_digest, subjects_digest, root_locator, root_compilation, selector_digest, prefix_cut_digest, prefix_input_digest, anchor_locator, compilation_digest, operand_question_digest, seed_blob_id, lang,
            configuration_fingerprint, active_model_set_hash, engine_epoch,
            completion, budget_mode, product_kind, product, read_set_digest,
            published_at
          ) VALUES(
-           ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, 'complete',
-           'exhaustive', ?20, jsonb(?21), ?22, ?23
+           ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, 'complete',
+           'exhaustive', ?21, jsonb(?22), ?23, ?24
          )",
         params![
             key.policy_semantic_hash,
@@ -997,7 +1178,7 @@ fn write_unit(
             key.partition.kind(),
             rel_path,
             blob_oid,
-            digests[0], digests[1], digests[2], digests[3], digests[4], digests[5], digests[6], digests[7], digests[8],
+            digests[0], digests[1], digests[2], digests[3], digests[4], digests[5], digests[6], digests[7], digests[8], digests[9],
             blob_id,
             lang,
             key.configuration_fingerprint,
@@ -1015,61 +1196,70 @@ fn write_unit(
         "a published unit's index answers hold on the snapshot that computed it"
     );
     insert_unit_snapshots(conn, unit_id, &unit.snapshots)?;
-    // policy_read_keys.digest is per-kind: File stores the parse variant
-    // (NULL means Empty); Lookup stores the answer digest; Models, Policy,
-    // Configuration and Epoch store the named non-source input's digest.
-    const INTERN_READ_KEY_SQL: &str = "INSERT INTO policy_read_keys(
-           key_digest, kind, family, languages, rel_path, name, index_key,
-           blob_oid, subject, start_byte, end_byte, digest, site_ordinal, decl_kind, decl_signature, workspace_fact_family, fact_member, fact_names, copy_owning_unit, copy_target_unit, copy_module_path, copy_target_identity_digest, copy_census_version, copy_config_digest, copy_producer_digest, parse_variant_kind, parse_variant_digest, structural_role, structural_keyword
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, jsonb(?18), ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)
-         ON CONFLICT(key_digest) DO NOTHING";
-    let mut intern = conn.prepare_cached(INTERN_READ_KEY_SQL)?;
-    let mut find =
-        conn.prepare_cached("SELECT read_id FROM policy_read_keys WHERE key_digest = ?1")?;
     let mut member = conn.prepare_cached(
         "INSERT INTO policy_unit_reads(unit_id, read_id) VALUES(?1, ?2)
          ON CONFLICT(unit_id, read_id) DO NOTHING",
     )?;
     for read in &unit.reads {
-        let columns = ReadKeyColumns::of(read)
-            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-        intern.execute(params![
-            columns.key_digest.as_slice(),
-            columns.kind,
-            columns.family,
-            columns.languages,
-            columns.rel_path,
-            columns.name,
-            columns.index_key,
-            columns.blob_oid,
-            columns.subject,
-            columns.start_byte,
-            columns.end_byte,
-            columns.digest,
-            columns.site_ordinal,
-            columns.decl_kind,
-            columns.decl_signature,
-            columns.workspace_fact_family,
-            columns.fact_member,
-            columns.fact_names,
-            columns.copy_owning_unit,
-            columns.copy_target_unit,
-            columns.copy_module_path,
-            columns.copy_target_identity_digest,
-            columns.copy_census_version,
-            columns.copy_config_digest,
-            columns.copy_producer_digest,
-            columns.parse_variant_kind,
-            columns.parse_variant_digest,
-            columns.structural_role,
-            columns.structural_keyword,
-        ])?;
-        let read_id = find.query_row(params![columns.key_digest.as_slice()], |row| {
-            row.get::<_, i64>(0)
-        })?;
-        member.execute(params![unit_id, read_id])?;
+        member.execute(params![unit_id, intern_read_key(conn, read)?])?;
     }
     Ok(())
+}
+
+/// Intern `read` in `policy_read_keys` and return its row id. Units and
+/// evaluations share this one interning, so a read key has one row however many
+/// products name it.
+fn intern_read_key(conn: &rusqlite::Connection, read: &ReadKey) -> rusqlite::Result<i64> {
+    // policy_read_keys.digest is per-kind: File stores the parse variant
+    // (NULL means Empty); Lookup stores the answer digest; Models, Policy,
+    // Configuration and Epoch store the named non-source input's digest.
+    const INTERN_READ_KEY_SQL: &str = "INSERT INTO policy_read_keys(
+           key_digest, kind, family, languages, rel_path, name, index_key,
+           blob_oid, subject, start_byte, end_byte, digest, site_ordinal, decl_kind, decl_signature, workspace_fact_family, fact_member, fact_names, copy_owning_unit, copy_target_unit, copy_module_path, copy_target_identity_digest, copy_census_version, copy_config_digest, copy_producer_digest, parse_variant_kind, parse_variant_digest, structural_role, structural_keyword, drop_owning_unit, drop_module_path, drop_identity_digest, drop_config_digest, drop_proof_version
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, jsonb(?18), ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34)
+         ON CONFLICT(key_digest) DO NOTHING";
+    let columns = ReadKeyColumns::of(read)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    conn.prepare_cached(INTERN_READ_KEY_SQL)?.execute(params![
+        columns.key_digest.as_slice(),
+        columns.kind,
+        columns.family,
+        columns.languages,
+        columns.rel_path,
+        columns.name,
+        columns.index_key,
+        columns.blob_oid,
+        columns.subject,
+        columns.start_byte,
+        columns.end_byte,
+        columns.digest,
+        columns.site_ordinal,
+        columns.decl_kind,
+        columns.decl_signature,
+        columns.workspace_fact_family,
+        columns.fact_member,
+        columns.fact_names,
+        columns.copy_owning_unit,
+        columns.copy_target_unit,
+        columns.copy_module_path,
+        columns.copy_target_identity_digest,
+        columns.copy_census_version,
+        columns.copy_config_digest,
+        columns.copy_producer_digest,
+        columns.parse_variant_kind,
+        columns.parse_variant_digest,
+        columns.structural_role,
+        columns.structural_keyword,
+        columns.drop_owning_unit,
+        columns.drop_module_path,
+        columns.drop_identity_digest,
+        columns.drop_config_digest,
+        columns.drop_proof_version,
+    ])?;
+    conn.prepare_cached("SELECT read_id FROM policy_read_keys WHERE key_digest = ?1")?
+        .query_row(params![columns.key_digest.as_slice()], |row| {
+            row.get::<_, i64>(0)
+        })
 }
 
 /// Attest `unit_id` on `snapshots`, then keep only its most recent
@@ -1135,7 +1325,8 @@ fn sweep_policy_rows(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<
     // rows that named it are already gone with their units.
     conn.execute(
         "DELETE FROM policy_read_keys
-         WHERE read_id NOT IN (SELECT read_id FROM policy_unit_reads)",
+         WHERE read_id NOT IN (SELECT read_id FROM policy_unit_reads)
+           AND read_id NOT IN (SELECT read_id FROM policy_evaluation_reads)",
         [],
     )?;
     Ok(())
@@ -1149,7 +1340,7 @@ fn decode_unit_row(row: &rusqlite::Row<'_>) -> Result<(i64, PolicyUnitRow)> {
     let partition_kind = row.get::<_, String>(3)?;
     let seed_rel_path = row.get::<_, String>(4)?;
     let seed_blob_oid = row.get::<_, String>(5)?;
-    let digests: [String; 9] = [
+    let digests: [String; 10] = [
         row.get(6)?,
         row.get(7)?,
         row.get(8)?,
@@ -1159,6 +1350,7 @@ fn decode_unit_row(row: &rusqlite::Row<'_>) -> Result<(i64, PolicyUnitRow)> {
         row.get(12)?,
         row.get(13)?,
         row.get(14)?,
+        row.get(22)?,
     ];
     let lang = row.get::<_, Option<String>>(15)?;
     let configuration_fingerprint = row.get::<_, String>(16)?;
@@ -1230,6 +1422,9 @@ fn decode_unit_row(row: &rusqlite::Row<'_>) -> Result<(i64, PolicyUnitRow)> {
             }
         }
         "whole" => PolicyUnitPartitionRow::Whole,
+        "operand" => PolicyUnitPartitionRow::Operand {
+            question: digests[9].clone(),
+        },
         other => {
             return Err(StoreError::new(format!(
                 "policy unit {unit_id} has unknown partition kind `{other}`"
@@ -1269,22 +1464,124 @@ fn language_of_rel_path(rel_path: &str) -> Language {
     Language::from_path(std::path::Path::new(rel_path))
 }
 
+macro_rules! read_keys_by_membership {
+    ($table:literal, $owner:literal) => {
+        concat!(
+            "SELECT keys.key_digest, keys.kind, keys.family, keys.languages, keys.rel_path,
+                keys.name, keys.index_key, keys.blob_oid, keys.subject,
+                keys.start_byte, keys.end_byte, keys.digest, keys.site_ordinal, keys.decl_kind, keys.decl_signature, keys.workspace_fact_family, keys.fact_member, json(keys.fact_names), keys.copy_owning_unit, keys.copy_target_unit, keys.copy_module_path, keys.copy_target_identity_digest, keys.copy_census_version, keys.copy_config_digest, keys.copy_producer_digest, keys.parse_variant_kind, keys.parse_variant_digest, keys.structural_role, keys.structural_keyword, keys.drop_owning_unit, keys.drop_module_path, keys.drop_identity_digest, keys.drop_config_digest, keys.drop_proof_version
+         FROM ",
+            $table,
+            " AS membership
+         JOIN policy_read_keys AS keys ON keys.read_id = membership.read_id
+         WHERE membership.",
+            $owner,
+            " = ?1"
+        )
+    };
+}
+const UNIT_READS_SQL: &str = read_keys_by_membership!("policy_unit_reads", "unit_id");
+const EVALUATION_READS_SQL: &str =
+    read_keys_by_membership!("policy_evaluation_reads", "evaluation_id");
+
 /// Every read key one unit recorded.
 fn load_unit_reads(conn: &rusqlite::Connection, unit_id: i64) -> Result<Vec<ReadKey>> {
-    let mut statement = conn.prepare_cached(
-        "SELECT keys.key_digest, keys.kind, keys.family, keys.languages, keys.rel_path,
-                keys.name, keys.index_key, keys.blob_oid, keys.subject,
-                keys.start_byte, keys.end_byte, keys.digest, keys.site_ordinal, keys.decl_kind, keys.decl_signature, keys.workspace_fact_family, keys.fact_member, json(keys.fact_names), keys.copy_owning_unit, keys.copy_target_unit, keys.copy_module_path, keys.copy_target_identity_digest, keys.copy_census_version, keys.copy_config_digest, keys.copy_producer_digest, keys.parse_variant_kind, keys.parse_variant_digest, keys.structural_role, keys.structural_keyword
-         FROM policy_unit_reads AS membership
-         JOIN policy_read_keys AS keys ON keys.read_id = membership.read_id
-         WHERE membership.unit_id = ?1",
-    )?;
-    let mut rows = statement.query(params![unit_id])?;
-    let mut reads = Vec::new();
+    load_read_keys(conn, UNIT_READS_SQL, unit_id)
+}
+
+/// The read keys one membership statement selects for its owner row.
+fn load_read_keys(
+    conn: &rusqlite::Connection,
+    sql: &'static str,
+    owner: i64,
+) -> Result<Vec<ReadKey>> {
+    let mut statement = conn.prepare_cached(sql)?;
+    let mut rows = statement.query(params![owner])?;
+    let mut reads = ReadKeyBatch::default();
     while let Some(row) = rows.next()? {
-        reads.push(decode_read_key(row)?);
+        reads.push(row)?;
+    }
+    reads.finish_with(|keys, _| Ok(keys))
+}
+
+/// The read ids an evaluation recorded with the tree part each carries, in read
+/// id order.
+fn stored_selection_bases(
+    conn: &rusqlite::Connection,
+    evaluation_id: i64,
+) -> rusqlite::Result<Vec<(i64, Option<JvmDependencyBasis>)>> {
+    let mut reads = conn
+        .prepare_cached(
+            "SELECT read_id, basis_platform_override FROM policy_evaluation_reads
+             WHERE evaluation_id = ?1 ORDER BY read_id",
+        )?
+        .query_map(params![evaluation_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<bool>>(1)?
+                    .map(|platform_override| JvmDependencyBasis {
+                        entries: Vec::new(),
+                        platform_override,
+                    }),
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut statement = conn.prepare_cached(
+        "SELECT read_id, group_id, artifact_id, version, scope, declared_by
+         FROM policy_evaluation_read_coordinates
+         WHERE evaluation_id = ?1 ORDER BY read_id, ordinal",
+    )?;
+    let mut rows = statement.query(params![evaluation_id])?;
+    while let Some(row) = rows.next()? {
+        let read_id = row.get::<_, i64>(0)?;
+        let entry = JvmDependencyBasisEntry {
+            group_id: row.get(1)?,
+            artifact_id: row.get(2)?,
+            version: row.get(3)?,
+            scope: row.get(4)?,
+            declared_by: row.get(5)?,
+        };
+        reads
+            .iter_mut()
+            .find(|(id, _)| *id == read_id)
+            .and_then(|(_, basis)| basis.as_mut())
+            .expect("a coordinate row belongs to a read recorded with a tree part")
+            .entries
+            .push(entry);
     }
     Ok(reads)
+}
+
+/// The selection reads one evaluation recorded, each with its tree part.
+fn load_selection_reads(
+    conn: &rusqlite::Connection,
+    evaluation_id: i64,
+) -> Result<Vec<SelectionRead>> {
+    let keys = load_read_keys(conn, EVALUATION_READS_SQL, evaluation_id)?;
+    let mut bases = stored_selection_bases(conn, evaluation_id)?;
+    let mut by_digest = HashMap::new();
+    let mut statement = conn.prepare_cached(
+        "SELECT keys.key_digest, membership.read_id FROM policy_evaluation_reads AS membership
+         JOIN policy_read_keys AS keys ON keys.read_id = membership.read_id
+         WHERE membership.evaluation_id = ?1",
+    )?;
+    let mut rows = statement.query(params![evaluation_id])?;
+    while let Some(row) = rows.next()? {
+        by_digest.insert(row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?);
+    }
+    keys.into_iter()
+        .map(|key| {
+            let digest = ReadKeyColumns::of(&key)?.key_digest;
+            let read_id = by_digest
+                .get(digest.as_slice())
+                .expect("a loaded read key is a member of its evaluation");
+            let basis = bases
+                .iter_mut()
+                .find(|(id, _)| id == read_id)
+                .and_then(|(_, basis)| basis.take());
+            Ok(SelectionRead { key, basis })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1590,6 +1887,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn operand_questions_round_trip_without_a_seed_blob() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let mut keys = Vec::new();
+        for question in ["selected calls", "different selected calls"] {
+            let mut unit = unit_row("unused.rs", every_read_key_shape());
+            unit.key.partition = PolicyUnitPartitionRow::Operand {
+                question: StableDigest::sha256(question).to_string(),
+            };
+            unit.seed_parse_variant = None;
+            unit.product_kind = "prefix".into();
+            unit.product = "{\"operand\":[]}".into();
+            keys.push(unit.key.clone());
+            store.publish_policy_units(vec![unit]).unwrap();
+        }
+        let loaded = store.policy_units_for_keys(&keys).unwrap();
+        assert_eq!(loaded.len(), 2);
+        for (answer, expected) in loaded.into_iter().zip(keys) {
+            let answer = answer.expect("a distinct operand question owns its unit");
+            assert_eq!(answer.key, expected);
+            assert_eq!(answer.product_kind, "prefix");
+            assert!(answer.seed_parse_variant.is_none());
+        }
+    }
+
     /// An assert unit and a seed unit over the same file and blob are two
     /// units, because the assert unit's key carries the digest of the subject
     /// rows it asserted over and the seed unit's does not. Without that column
@@ -1686,9 +2008,309 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10126: review found future vocabulary hid malformed known outer read envelopes"
+    )]
+    fn malformed_outer_read_envelopes_are_not_unsupported_evidence() {
+        let file = ReadKey::file(
+            Language::Python,
+            "src/app.py",
+            Oid::from_str(BLOB).unwrap(),
+            ParseVariant::Empty,
+        );
+        for (read, changes) in [
+            (
+                ReadKey::index(IndexFamily::DefinitionExact, b"name"),
+                "family='future_index', index_key=NULL",
+            ),
+            (
+                ReadKey::artifact(
+                    DerivedArtifactId::semantic_artifact(StableDigest::sha256(b"artifact")),
+                    Some("src/app.py"),
+                ),
+                "family='future_artifact', subject=NULL",
+            ),
+            (
+                file.clone(),
+                "languages='Future.Language-v2+custom', rel_path=NULL",
+            ),
+            (
+                file.clone(),
+                "languages='Future.Language-v2+custom', blob_oid=NULL",
+            ),
+            (
+                file,
+                "languages='Future.Language-v2+custom', blob_oid='zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz'",
+            ),
+            (
+                ReadKey::path_absent(Language::Python, "src/missing.py"),
+                "languages='Future.Language-v2+custom', rel_path=NULL",
+            ),
+            (
+                ReadKey::scope(
+                    [Language::Java, Language::Python],
+                    WorkspaceContentIdentity::from_digest(StableDigest::sha256(b"scope")),
+                ),
+                "languages='Future.Language-v2+custom', digest=NULL",
+            ),
+        ] {
+            let store = AnalyzerStore::open_ephemeral().unwrap();
+            let digest = read.canonical_digest();
+            let unit = unit_row("src/Main.java", vec![read]);
+            store.publish_policy_units(vec![unit.clone()]).unwrap();
+            {
+                let conn = store.conn.lock().unwrap();
+                conn.execute_batch("PRAGMA ignore_check_constraints=ON")
+                    .unwrap();
+                conn.execute(
+                    &format!("UPDATE policy_read_keys SET {changes} WHERE key_digest=?1"),
+                    [digest.as_bytes().as_slice()],
+                )
+                .unwrap();
+                conn.execute_batch("PRAGMA ignore_check_constraints=OFF")
+                    .unwrap();
+            }
+            let error = store
+                .policy_units_for_keys(std::slice::from_ref(&unit.key))
+                .expect_err("a malformed known outer envelope is not a cache miss");
+            assert!(!error.is_unsupported_read_key(), "{changes}: {error:?}");
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10126: an unsupported read hid later damaged read or snapshot evidence"
+    )]
+    fn unsupported_reads_do_not_hide_other_unit_corruption() {
+        for unsupported_index in 0..2 {
+            for corrupt_snapshot in [false, true] {
+                let store = AnalyzerStore::open_ephemeral().unwrap();
+                let unit = unit_row(
+                    "src/Main.java",
+                    vec![
+                        ReadKey::Epoch(StableDigest::sha256(b"epoch")),
+                        ReadKey::Models(StableDigest::sha256(b"models")),
+                    ],
+                );
+                store.publish_policy_units(vec![unit.clone()]).unwrap();
+                {
+                    let conn = store.conn.lock().unwrap();
+                    let ids = conn
+                        .prepare("SELECT read_id FROM policy_unit_reads ORDER BY read_id")
+                        .unwrap()
+                        .query_map([], |row| row.get::<_, i64>(0))
+                        .unwrap()
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .unwrap();
+                    conn.execute_batch("PRAGMA ignore_check_constraints=ON")
+                        .unwrap();
+                    conn.execute("UPDATE policy_read_keys SET kind='lookup', family='future_lookup' WHERE read_id=?1", [ids[unsupported_index]]).unwrap();
+                    if corrupt_snapshot {
+                        conn.execute(
+                            "UPDATE policy_unit_snapshots SET content_identity=x'00'",
+                            [],
+                        )
+                        .unwrap();
+                    } else {
+                        conn.execute(
+                            "UPDATE policy_read_keys SET digest=NULL WHERE read_id=?1",
+                            [ids[1 - unsupported_index]],
+                        )
+                        .unwrap();
+                    }
+                    conn.execute_batch("PRAGMA ignore_check_constraints=OFF")
+                        .unwrap();
+                }
+                assert!(
+                    store.policy_units_for_keys(&[unit.key]).is_err(),
+                    "unsupported_index={unsupported_index}, corrupt_snapshot={corrupt_snapshot}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10126: review found malformed language scalars and scope lists became unsupported vocabulary"
+    )]
+    fn malformed_language_syntax_is_not_future_vocabulary() {
+        for (kind, labels, unsupported) in [
+            ("file", "python,java", false),
+            ("file", "", false),
+            ("file", " ", false),
+            ("file", "Py", false),
+            ("file", "python ", false),
+            ("scope", "", false),
+            ("scope", "Future.Language-v2+custom,,python", false),
+            ("scope", "java,Future.Language-v2+custom,", false),
+            ("scope", "python,Future.Language-v2+custom,java", false),
+            ("scope", "java,java,Future.Language-v2+custom", false),
+            (
+                "scope",
+                "Future.Language-v2+custom,Future.Language-v2+custom",
+                false,
+            ),
+            ("scope", "java,Py,Future.Language-v2+custom", false),
+            ("file", "Future.Language-v2+custom", true),
+            ("file", "New language+v2", true),
+            ("scope", "java,Future.Language-v2+custom,python", true),
+        ] {
+            let store = AnalyzerStore::open_ephemeral().unwrap();
+            let read = if kind == "scope" {
+                ReadKey::scope(
+                    [Language::Java, Language::Python],
+                    WorkspaceContentIdentity::from_digest(StableDigest::sha256(b"scope")),
+                )
+            } else {
+                ReadKey::file(
+                    Language::Python,
+                    "src/app.py",
+                    Oid::from_str(BLOB).unwrap(),
+                    ParseVariant::Empty,
+                )
+            };
+            let digest = read.canonical_digest();
+            let affected = unit_row("src/Main.java", vec![read]);
+            let mut unaffected = unit_row(
+                "src/Other.java",
+                vec![ReadKey::Epoch(StableDigest::sha256(b"other"))],
+            );
+            store
+                .publish_policy_units(vec![affected.clone(), unaffected.clone()])
+                .unwrap();
+            store
+                .conn
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE policy_read_keys SET languages=?1 WHERE key_digest=?2",
+                    params![labels, digest.as_bytes().as_slice()],
+                )
+                .unwrap();
+            let result = store.policy_units_for_keys(&[affected.key, unaffected.key.clone()]);
+            if unsupported {
+                unaffected.seed_parse_variant = None;
+                assert_eq!(
+                    result.unwrap(),
+                    vec![None, Some(unaffected)],
+                    "{kind}: {labels}"
+                );
+            } else {
+                let error = result.expect_err("malformed language syntax is not a cache miss");
+                assert!(
+                    !error.is_unsupported_read_key(),
+                    "{kind}: {labels}: {error:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10126: future read vocabulary made policy-unit loads fail instead of miss"
+    )]
+    fn unsupported_read_evidence_misses_only_its_policy_unit() {
+        use crate::analyzer::semantic::derivation::{DerivationKindId, DerivationQuestion};
+        for label in ["derivation:future_kind:v1", "derivation:unit_summary:v2"] {
+            let store = AnalyzerStore::open_ephemeral().unwrap();
+            let affected = unit_row(
+                "src/Main.java",
+                vec![
+                    ReadKey::lookup(
+                        LookupKind::Derivation(DerivationKindId("derivation:unit_summary:v1")),
+                        LookupQuestion::Derivation(DerivationQuestion {
+                            language: Some(Language::Rust),
+                            subject: Some([7; 32]),
+                            rel_path: None,
+                            name: None,
+                        }),
+                        StableDigest::sha256(b"summary"),
+                    ),
+                    ReadKey::Epoch(StableDigest::sha256(b"epoch")),
+                ],
+            );
+            let mut unaffected = unit_row(
+                "src/Other.java",
+                vec![ReadKey::Epoch(StableDigest::sha256(b"other"))],
+            );
+            store
+                .publish_policy_units(vec![affected.clone(), unaffected.clone()])
+                .unwrap();
+            {
+                let conn = store.conn.lock().unwrap();
+                // A future format can use columns today's family forbids.
+                conn.execute_batch("PRAGMA ignore_check_constraints=ON")
+                    .unwrap();
+                conn.execute(
+                    "UPDATE policy_read_keys SET family=?1, languages='python,java', structural_role='callee', structural_keyword=1,
+                     parse_variant_kind='digest', parse_variant_digest=?2, copy_owning_unit=?2,
+                     workspace_fact_family='future_family' WHERE family='derivation:unit_summary:v1'",
+                    params![label, [9_u8;32].as_slice()],
+                ).unwrap();
+                conn.execute_batch("PRAGMA ignore_check_constraints=OFF")
+                    .unwrap();
+            }
+            unaffected.seed_parse_variant = None;
+            let loaded = store
+                .policy_units_for_keys(&[affected.key.clone(), unaffected.key.clone()])
+                .expect("future read vocabulary is unavailable cache evidence, not a load error");
+            assert_eq!(loaded, vec![None, Some(unaffected)], "{label}");
+            // Unsupported vocabulary cannot conceal common row corruption.
+            for (column, damaged) in [
+                ("digest", rusqlite::types::Value::Null),
+                ("digest", vec![0_u8; 31].into()),
+                ("subject", vec![0_u8; 31].into()),
+                ("key_digest", vec![0_u8; 31].into()),
+            ] {
+                let original = {
+                    let conn = store.conn.lock().unwrap();
+                    let original: Vec<u8> = conn
+                        .query_row(
+                            &format!("SELECT {column} FROM policy_read_keys WHERE family=?1"),
+                            [label],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    conn.execute_batch("PRAGMA ignore_check_constraints=ON")
+                        .unwrap();
+                    conn.execute(
+                        &format!("UPDATE policy_read_keys SET {column}=?1 WHERE family=?2"),
+                        params![damaged, label],
+                    )
+                    .unwrap();
+                    conn.execute_batch("PRAGMA ignore_check_constraints=OFF")
+                        .unwrap();
+                    original
+                };
+                let error = store
+                    .policy_units_for_keys(std::slice::from_ref(&affected.key))
+                    .unwrap_err();
+                assert!(
+                    !error.is_unsupported_read_key(),
+                    "{label}: {column}: {error:?}"
+                );
+                let conn = store.conn.lock().unwrap();
+                conn.execute_batch("PRAGMA ignore_check_constraints=ON")
+                    .unwrap();
+                conn.execute(
+                    &format!("UPDATE policy_read_keys SET {column}=?1 WHERE family=?2"),
+                    params![original, label],
+                )
+                .unwrap();
+                conn.execute_batch("PRAGMA ignore_check_constraints=OFF")
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10879: Drop receipts violated blob constraints and rolled back policy publication"
+    )]
     fn a_published_unit_round_trips_with_every_read_key_shape() {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let mut reads = every_read_key_shape();
+        reads.extend(super::super::read_keys::rust_drop_receipt_keys());
         reads.extend(
             super::super::read_keys::workspace_fact_subjects()
                 .into_iter()
@@ -1704,6 +2326,15 @@ mod tests {
                     )
                 }),
         );
+        reads.push(ReadKey::lookup(
+            LookupKind::WorkspaceFact,
+            LookupQuestion::WorkspaceFact {
+                family: WorkspaceFactFamily::CSharpCompilationMembershipCompleteness,
+                language: Language::CSharp,
+                subject: FactSubject::Whole,
+            },
+            StableDigest::sha256(b"membership"),
+        ));
         reads.sort();
         reads.dedup();
         store
@@ -1826,7 +2457,13 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .unwrap();
-        assert!(load_unit_reads(&conn, unit_id).unwrap_err().is_corrupt());
+        // A future workspace-fact family is unsupported vocabulary, distinct
+        // from the malformed known structural-role rows checked above.
+        assert!(
+            load_unit_reads(&conn, unit_id)
+                .unwrap_err()
+                .is_unsupported_read_key()
+        );
     }
 
     #[test]
@@ -1916,6 +2553,86 @@ mod tests {
         assert!(error.to_string().contains("did not rebuild"), "{error}");
     }
 
+    #[test]
+    fn hint_changes_invalidate_cut_rows_and_preserve_uncut_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = AnalyzerStore::open_persistent(&temp.path().join("policy-cache.db")).unwrap();
+        let key = evaluation_key();
+        let publish = |cut_hint_digest, policy_id| {
+            store.publish_policy_evaluation(
+                brokk_bifrost_core::analyzer::reuse_verdict::admit(
+                    brokk_bifrost_core::analyzer::reuse_verdict::CapBinding::Unbound,
+                    PolicyEvaluationRow {
+                        cut_hint_digest,
+                        evidence: None,
+                        evidence_complete: None,
+                        key: key.clone(),
+                        resolved_commit: COMMIT.to_string(),
+                        policy_set_digest: POLICY_HASH.to_string(),
+                        unreliable_detail: None,
+                        aggregate_unreliable: false,
+                        base_content_identity: SNAPSHOT,
+                        policies: vec![policy_result(policy_id, &["finding"])],
+                        unqualified_policy_ids: Vec::new(),
+                        selection_reads: Vec::new(),
+                        selection_view: SelectionView::Worktree,
+                    },
+                    brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::Content,
+                    brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::Content,
+                    brokk_bifrost_core::analyzer::reuse_verdict::SelectionEvidence::NotApplicable,
+                ).unwrap()
+            ).unwrap();
+        };
+        let original = [1; 32];
+        let suppression_edit = [2; 32];
+        let baseline_edit = [3; 32];
+        publish(Some(original), "test.cut");
+        assert!(
+            store
+                .policy_evaluation_for_key(&key, &original)
+                .unwrap()
+                .is_some()
+        );
+        for changed in [suppression_edit, baseline_edit] {
+            assert!(
+                store
+                    .policy_evaluation_for_key(&key, &changed)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        // An uncut publication must also remove the older, differently guarded
+        // child's answer rather than dropping its guard from the parent alone.
+        publish(None, "test.uncut");
+        for changed in [original, suppression_edit, baseline_edit] {
+            let loaded = store
+                .policy_evaluation_for_key(&key, &changed)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                loaded
+                    .policies
+                    .iter()
+                    .map(|policy| policy.policy_id.as_str())
+                    .collect::<Vec<_>>(),
+                ["test.uncut"]
+            );
+        }
+        publish(Some(suppression_edit), "test.new-cut");
+        assert!(
+            store
+                .policy_evaluation_for_key(&key, &original)
+                .unwrap()
+                .is_none()
+        );
+        let loaded = store
+            .policy_evaluation_for_key(&key, &suppression_edit)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.policies.len(), 1);
+        assert_eq!(loaded.policies[0].policy_id, "test.new-cut");
+    }
+
     fn evaluation_key() -> PolicyEvaluationRowKey {
         PolicyEvaluationRowKey {
             base_tree_oid: TREE.to_string(),
@@ -1956,24 +2673,36 @@ mod tests {
         let store = AnalyzerStore::open_persistent(&path).unwrap();
         let key = evaluation_key();
         store
-            .publish_policy_evaluation(PolicyEvaluationRow {
-                evidence: None,
-                evidence_complete: None,
-                key: key.clone(),
-                resolved_commit: COMMIT.to_string(),
-                policy_set_digest: POLICY_HASH.to_string(),
-                unreliable_detail: None,
-                aggregate_unreliable: false,
-                base_content_identity: SNAPSHOT,
-                policies: vec![policy_result("test.clean", &[])],
-                unqualified_policy_ids: Vec::new(),
-            })
+            .publish_policy_evaluation(
+                brokk_bifrost_core::analyzer::reuse_verdict::admit(
+                    brokk_bifrost_core::analyzer::reuse_verdict::CapBinding::Unbound,
+                    PolicyEvaluationRow {
+                        cut_hint_digest: None,
+                        evidence: None,
+                        evidence_complete: None,
+                        key: key.clone(),
+                        resolved_commit: COMMIT.to_string(),
+                        policy_set_digest: POLICY_HASH.to_string(),
+                        unreliable_detail: None,
+                        aggregate_unreliable: false,
+                        base_content_identity: SNAPSHOT,
+                        policies: vec![policy_result("test.clean", &[])],
+                        unqualified_policy_ids: Vec::new(),
+                        selection_reads: Vec::new(),
+                        selection_view: SelectionView::Worktree,
+                    },
+                    brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::Content,
+                    brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::Content,
+                    brokk_bifrost_core::analyzer::reuse_verdict::SelectionEvidence::NotApplicable,
+                )
+                .unwrap(),
+            )
             .unwrap();
         drop(store);
 
         let store = AnalyzerStore::open_persistent(&path).unwrap();
         let loaded = store
-            .policy_evaluation_for_key(&key)
+            .policy_evaluation_for_key(&key, &[0; 32])
             .unwrap()
             .expect("the shared evaluation exists");
         assert_eq!(loaded.evidence, None);
@@ -2009,7 +2738,7 @@ mod tests {
         ] {
             assert!(
                 store
-                    .policy_evaluation_for_key(&different_question)
+                    .policy_evaluation_for_key(&different_question, &[0; 32])
                     .unwrap()
                     .is_none(),
                 "a complete empty answer must not cross shared input keys: {different_question:?}"
@@ -2022,26 +2751,38 @@ mod tests {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let key = evaluation_key();
         store
-            .publish_policy_evaluation(PolicyEvaluationRow {
-                evidence: None,
-                evidence_complete: None,
-                key: key.clone(),
-                resolved_commit: COMMIT.to_string(),
-                policy_set_digest: POLICY_HASH.to_string(),
-                unreliable_detail: None,
-                aggregate_unreliable: false,
-                base_content_identity: SNAPSHOT,
-                policies: vec![PolicyEvaluationPolicyRow {
-                    evidence: None,
-                    units: vec![seed_key("src/Gone.java")],
-                    ..policy_result("test.policy", &["only"])
-                }],
-                unqualified_policy_ids: Vec::new(),
-            })
+            .publish_policy_evaluation(
+                brokk_bifrost_core::analyzer::reuse_verdict::admit(
+                    brokk_bifrost_core::analyzer::reuse_verdict::CapBinding::Unbound,
+                    PolicyEvaluationRow {
+                        cut_hint_digest: None,
+                        evidence: None,
+                        evidence_complete: None,
+                        key: key.clone(),
+                        resolved_commit: COMMIT.to_string(),
+                        policy_set_digest: POLICY_HASH.to_string(),
+                        unreliable_detail: None,
+                        aggregate_unreliable: false,
+                        base_content_identity: SNAPSHOT,
+                        policies: vec![PolicyEvaluationPolicyRow {
+                            evidence: None,
+                            units: vec![seed_key("src/Gone.java")],
+                            ..policy_result("test.policy", &["only"])
+                        }],
+                        unqualified_policy_ids: Vec::new(),
+                        selection_reads: Vec::new(),
+                        selection_view: SelectionView::Worktree,
+                    },
+                    brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::Content,
+                    brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::Content,
+                    brokk_bifrost_core::analyzer::reuse_verdict::SelectionEvidence::NotApplicable,
+                )
+                .unwrap(),
+            )
             .unwrap();
 
         let loaded = store
-            .policy_evaluation_for_key(&key)
+            .policy_evaluation_for_key(&key, &[0; 32])
             .unwrap()
             .expect("an evaluation is its identities, not its units");
         assert_eq!(loaded.policies[0].identities, vec![finding_id("only")]);
@@ -2078,37 +2819,61 @@ mod tests {
         let mut retained_policy = policy_result("test.other", &["other"]);
         retained_policy.evidence = Some(high.clone());
         store
-            .publish_policy_evaluation(PolicyEvaluationRow {
-                evidence: Some(high.clone()),
-                evidence_complete: Some(true),
-                key: key.clone(),
-                resolved_commit: COMMIT.to_string(),
-                policy_set_digest: POLICY_HASH.to_string(),
-                unreliable_detail: None,
-                aggregate_unreliable: false,
-                base_content_identity: SNAPSHOT,
-                policies: vec![first_policy, retained_policy],
-                unqualified_policy_ids: Vec::new(),
-            })
+            .publish_policy_evaluation(
+                brokk_bifrost_core::analyzer::reuse_verdict::admit(
+                    brokk_bifrost_core::analyzer::reuse_verdict::CapBinding::Unbound,
+                    PolicyEvaluationRow {
+                        cut_hint_digest: None,
+                        evidence: Some(high.clone()),
+                        evidence_complete: Some(true),
+                        key: key.clone(),
+                        resolved_commit: COMMIT.to_string(),
+                        policy_set_digest: POLICY_HASH.to_string(),
+                        unreliable_detail: None,
+                        aggregate_unreliable: false,
+                        base_content_identity: SNAPSHOT,
+                        policies: vec![first_policy, retained_policy],
+                        unqualified_policy_ids: Vec::new(),
+                        selection_reads: Vec::new(),
+                        selection_view: SelectionView::Worktree,
+                    },
+                    brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::Content,
+                    brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::Content,
+                    brokk_bifrost_core::analyzer::reuse_verdict::SelectionEvidence::NotApplicable,
+                )
+                .unwrap(),
+            )
             .unwrap();
         let mut replacement = policy_result("test.policy", &[second]);
         replacement.evidence = Some(low.clone());
         store
-            .publish_policy_evaluation(PolicyEvaluationRow {
-                evidence: Some(low.clone()),
-                evidence_complete: Some(false),
-                key: key.clone(),
-                resolved_commit: COMMIT.to_string(),
-                policy_set_digest: POLICY_HASH.to_string(),
-                unreliable_detail: None,
-                aggregate_unreliable: false,
-                base_content_identity: SNAPSHOT,
-                policies: vec![replacement],
-                unqualified_policy_ids: Vec::new(),
-            })
+            .publish_policy_evaluation(
+                brokk_bifrost_core::analyzer::reuse_verdict::admit(
+                    brokk_bifrost_core::analyzer::reuse_verdict::CapBinding::Unbound,
+                    PolicyEvaluationRow {
+                        cut_hint_digest: None,
+                        evidence: Some(low.clone()),
+                        evidence_complete: Some(false),
+                        key: key.clone(),
+                        resolved_commit: COMMIT.to_string(),
+                        policy_set_digest: POLICY_HASH.to_string(),
+                        unreliable_detail: None,
+                        aggregate_unreliable: false,
+                        base_content_identity: SNAPSHOT,
+                        policies: vec![replacement],
+                        unqualified_policy_ids: Vec::new(),
+                        selection_reads: Vec::new(),
+                        selection_view: SelectionView::Worktree,
+                    },
+                    brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::Content,
+                    brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::Content,
+                    brokk_bifrost_core::analyzer::reuse_verdict::SelectionEvidence::NotApplicable,
+                )
+                .unwrap(),
+            )
             .unwrap();
         let loaded = store
-            .policy_evaluation_for_key(&key)
+            .policy_evaluation_for_key(&key, &[0; 32])
             .unwrap()
             .expect("the evaluation is found by its key");
         assert_eq!(
@@ -2135,6 +2900,175 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rows, 2);
+    }
+
+    // An aggregate's selection reads describe every policy row under it, so a
+    // publication under different reads must not keep rows another discovery
+    // produced, and a read key that an evaluation names survives collection.
+    #[test]
+    fn an_evaluation_keeps_policy_rows_only_under_the_reads_it_recorded() {
+        use brokk_bifrost_core::analyzer::reuse_verdict::{
+            CapBinding, ReuseVerdict, SelectionEvidence, admit,
+        };
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let key = evaluation_key();
+        let read = |byte: u8| {
+            ReadKey::lookup(
+                LookupKind::WorkspaceFact,
+                LookupQuestion::WorkspaceFact {
+                    family: WorkspaceFactFamily::GoBuildSelection,
+                    language: Language::Go,
+                    subject: FactSubject::Named {
+                        name: "profile".into(),
+                    },
+                },
+                StableDigest::from_array([byte; 32]),
+            )
+        };
+        let publish = |policy: &str, reads: Vec<ReadKey>| {
+            store
+                .publish_policy_evaluation(
+                    admit(
+                        CapBinding::Unbound,
+                        PolicyEvaluationRow {
+                            cut_hint_digest: None,
+                            evidence: None,
+                            evidence_complete: None,
+                            key: key.clone(),
+                            resolved_commit: COMMIT.to_string(),
+                            policy_set_digest: POLICY_HASH.to_string(),
+                            unreliable_detail: None,
+                            aggregate_unreliable: false,
+                            base_content_identity: SNAPSHOT,
+                            policies: vec![policy_result(policy, &[policy])],
+                            unqualified_policy_ids: Vec::new(),
+                            selection_reads: reads.into_iter().map(SelectionRead::keyed).collect(),
+                            selection_view: SelectionView::Worktree,
+                        },
+                        ReuseVerdict::Content,
+                        ReuseVerdict::Content,
+                        SelectionEvidence::Complete,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            let loaded = store
+                .policy_evaluation_for_key(&key, &[0; 32])
+                .unwrap()
+                .unwrap();
+            (
+                loaded
+                    .policies
+                    .into_iter()
+                    .map(|policy| policy.policy_id)
+                    .collect::<Vec<_>>(),
+                loaded
+                    .selection_reads
+                    .into_iter()
+                    .map(|read| read.key)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let interned = || -> i64 {
+            store
+                .conn
+                .lock()
+                .expect("store mutex")
+                .query_row("SELECT COUNT(*) FROM policy_read_keys", [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        };
+        // Policies published under the same reads accumulate.
+        assert_eq!(publish("test.a", vec![read(1)]).1, vec![read(1)]);
+        assert_eq!(
+            publish("test.b", vec![read(1)]),
+            (
+                vec!["test.a".to_string(), "test.b".to_string()],
+                vec![read(1)]
+            )
+        );
+        assert_eq!(interned(), 1);
+        // A discovery that answered differently replaces them all.
+        assert_eq!(
+            publish("test.c", vec![read(2)]),
+            (vec!["test.c".to_string()], vec![read(2)])
+        );
+        assert_eq!(interned(), 1, "the superseded read key is collected");
+    }
+
+    /// A live worktree's answer for a tree must not replace the answer an
+    /// export of that tree gave, because replay admits the export's reads by
+    /// provenance (#11607).
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11607: the head's own publication for a tree overwrote the export row the next edited run would reuse"
+    )]
+    fn a_worktree_row_does_not_replace_an_export_row() {
+        use brokk_bifrost_core::analyzer::reuse_verdict::{
+            CapBinding, ReuseVerdict, SelectionEvidence, admit,
+        };
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let key = evaluation_key();
+        let publish = |policy: &str, view: SelectionView| {
+            store
+                .publish_policy_evaluation(
+                    admit(
+                        CapBinding::Unbound,
+                        PolicyEvaluationRow {
+                            cut_hint_digest: None,
+                            evidence: None,
+                            evidence_complete: None,
+                            key: key.clone(),
+                            resolved_commit: COMMIT.to_string(),
+                            policy_set_digest: POLICY_HASH.to_string(),
+                            unreliable_detail: None,
+                            aggregate_unreliable: false,
+                            base_content_identity: SNAPSHOT,
+                            policies: vec![policy_result(policy, &[policy])],
+                            unqualified_policy_ids: Vec::new(),
+                            selection_reads: Vec::new(),
+                            selection_view: view,
+                        },
+                        ReuseVerdict::Content,
+                        ReuseVerdict::Content,
+                        SelectionEvidence::Complete,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            let loaded = store
+                .policy_evaluation_for_key(&key, &[0; 32])
+                .unwrap()
+                .unwrap();
+            (
+                loaded.selection_view,
+                loaded
+                    .policies
+                    .into_iter()
+                    .map(|policy| policy.policy_id)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let export = SelectionView::Export {
+            tree_oid: TREE.into(),
+        };
+        assert_eq!(
+            publish("test.a", export.clone()),
+            (export.clone(), vec!["test.a".to_string()])
+        );
+        assert_eq!(
+            publish("test.b", SelectionView::Worktree),
+            (export.clone(), vec!["test.a".to_string()])
+        );
+        // An export evaluation does replace a worktree one.
+        let other = SelectionView::Export {
+            tree_oid: COMMIT.into(),
+        };
+        assert_eq!(
+            publish("test.c", other.clone()),
+            (other, vec!["test.c".to_string()])
+        );
     }
 
     #[test]

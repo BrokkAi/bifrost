@@ -4,9 +4,13 @@
 //! value's exact source mapping to its declaration and reads the declared
 //! type, so the scalar solver can store each binding's facts in the
 //! language's representation. A local without a written type takes the
-//! default type of an integer or Boolean literal initializer. Every other
-//! binding has no entry; the caller keeps no numeric fact for it, because an
-//! integer's width decides where its arithmetic wraps.
+//! type of an integer or Boolean literal initializer. A Rust unsuffixed
+//! integer keeps only its built-in integer category, not a width or
+//! signedness, because Rust infers those from later uses; the caller keeps
+//! an exact value that every integer type can represent, but assumes no
+//! machine domain. Every other binding has no entry; the caller keeps no
+//! numeric fact for it, because an integer's width decides where its
+//! arithmetic wraps.
 //!
 //! Floating-point types have no entry: a NaN operand falsifies both `f < c`
 //! and its negation, which the Go lowering folds into `f >= c`.
@@ -24,6 +28,8 @@ pub enum DeclaredScalarType {
     Signed(u16),
     Unsigned(u16),
     Boolean,
+    /// A built-in integer whose width and signedness require use-site inference.
+    UnknownInteger,
 }
 
 fn rust_integer_scalar_type(name: &str) -> Option<DeclaredScalarType> {
@@ -337,7 +343,7 @@ pub fn rust_scalar_type_from_literal(source: &str, node: Node<'_>) -> Option<Dec
                     )
                 })
             })
-            .unwrap_or((text, DeclaredScalarType::Signed(32)));
+            .unwrap_or((text, DeclaredScalarType::UnknownInteger));
             if !digits
                 .as_bytes()
                 .first()
@@ -375,7 +381,9 @@ pub fn rust_scalar_type_from_literal(source: &str, node: Node<'_>) -> Option<Dec
 /// operators on these types are built in; every other type can dispatch to a
 /// user implementation and is left untyped for scalar analysis.
 ///
-/// Unsuffixed integer literals use Rust's default `i32` type. `isize` and
+/// Unsuffixed integer literals keep their built-in integer category without
+/// a width or signedness, because Rust infers those from later uses; only an
+/// exact value that every integer type can represent is usable. `isize` and
 /// `usize` use the analyzer platform width. Inference from any expression
 /// other than a direct literal is intentionally excluded.
 pub fn rust_declared_scalar_types(

@@ -31,6 +31,8 @@ pub struct GoReferenceBatchProjection {
     pub reference_owner: Option<CodeUnit>,
     #[doc(hidden)]
     pub binding_targets: Vec<Option<CodeUnit>>,
+    #[doc(hidden)]
+    pub diagnostic_targets: Vec<(SemanticId, native_units::SelectedDiagnosticIdentity)>,
 }
 
 pub(crate) type GoReferenceEdgeBatchStager<'a> = dyn FnMut(
@@ -55,7 +57,16 @@ impl WorkerAnswer for GoGraphBatch {
             source: self.source.translate(translation),
             edges: self.edges.translate(translation),
             // Projected CodeUnits contain stable declaration identities, not runtime aliases.
-            projections: self.projections,
+            projections: self
+                .projections
+                .into_iter()
+                .map(|mut projection| {
+                    for (semantic, _) in &mut projection.diagnostic_targets {
+                        *semantic = translation.semantic(*semantic);
+                    }
+                    projection
+                })
+                .collect(),
         }
     }
 }
@@ -558,12 +569,22 @@ where
             )
         },
         |file, batch, projected, projector| {
-            stage_go_graph_projection(file, batch, projected, projector, cancellation, stage)
+            stage_go_graph_projection(
+                operation,
+                file,
+                batch,
+                projected,
+                projector,
+                cancellation,
+                stage,
+            )
         },
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stage_go_graph_projection(
+    operation: &SelectedResolutionOperation<'_, '_>,
     file: &ProjectFile,
     batch: &FactReferenceBatchAnswer,
     projected: &FactReferenceEdgeBatch,
@@ -571,6 +592,25 @@ fn stage_go_graph_projection(
     cancellation: &CancellationToken,
     stage: &mut GoReferenceEdgeBatchStager<'_>,
 ) -> Result<bool> {
+    let mut semantics = batch
+        .answers()
+        .iter()
+        .flat_map(|answer| {
+            crate::analyzer::usages::call_relations::call_relation_diagnostic_semantics(
+                answer.answer(),
+            )
+        })
+        .collect::<Vec<_>>();
+    semantics.sort_unstable();
+    semantics.dedup();
+    let Some(identities) = operation.diagnostic_definitions(&semantics, cancellation)? else {
+        return Ok(false);
+    };
+    assert_eq!(semantics.len(), identities.len());
+    let diagnostic_targets = semantics
+        .into_iter()
+        .zip(identities)
+        .collect::<crate::hash::HashMap<_, _>>();
     let mut projections = Vec::with_capacity(batch.answers().len());
     for answer in batch.answers() {
         if cancellation.is_cancelled() {
@@ -598,6 +638,13 @@ fn stage_go_graph_projection(
         projections.push(GoReferenceBatchProjection {
             reference_owner,
             binding_targets,
+            diagnostic_targets:
+                crate::analyzer::usages::call_relations::call_relation_diagnostic_semantics(
+                    answer.answer(),
+                )
+                .into_iter()
+                .map(|id| (id, diagnostic_targets[&id].clone()))
+                .collect(),
         });
     }
     stage(file, batch, projected, &projections)?;

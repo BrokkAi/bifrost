@@ -99,7 +99,7 @@ impl SelectedResolutionStage<'_, '_> {
             cancellation,
             |connection, producer, assigned| {
                 let Some(lexical) =
-                    lexical::prepare_lexical_fragment(assigned.lexical(), cancellation)
+                    lexical::prepare_lexical_fragment(assigned.lexical(), cancellation)?
                 else {
                     return Ok(false);
                 };
@@ -227,7 +227,7 @@ impl SelectedResolutionStage<'_, '_> {
     ) -> Result<Option<bool>> {
         assert!(!connection.is_autocommit());
         assert_eq!(lexical_fragment.fragment().ordinal(), host.ordinal().get());
-        let Some(lexical) = lexical::prepare_lexical_fragment(lexical_fragment, cancellation)
+        let Some(lexical) = lexical::prepare_lexical_fragment(lexical_fragment, cancellation)?
         else {
             return Ok(None);
         };

@@ -2,7 +2,8 @@ use std::{cell::RefCell, collections::HashMap, error::Error, fmt, sync::Arc};
 
 use crate::analyzer::semantic::{
     EvidenceCompleteness, IcfgEdgeKind, IcfgProvider, IcfgSnapshot, IcfgSnapshotLimits,
-    OracleCallContext, OracleLimits, ProcedureHandle, ProofStatus, SemanticBudget, SemanticWork,
+    LengthDelimitedDigest, OracleCallContext, OracleLimits, ProcedureHandle, ProofStatus,
+    SemanticBudget, SemanticWork,
 };
 use crate::dataflow::{
     BackwardDistributiveDataflowProblem, BackwardSnapshotDataflowError, BackwardSnapshotDemand,
@@ -64,6 +65,25 @@ impl TaintEdgeFunction {
         }
     }
 
+    /// Borrowed content check for the exact monotone removal of these classes.
+    /// This compares a function's meaning, not the admission of its producer.
+    pub fn is_kill_of(&self, classes: &TaintClassSet) -> bool {
+        self.default_identity
+            && self.generated.is_empty()
+            && self.generated.universe() == classes.universe()
+            && self.generated.class_count() == classes.class_count()
+            && self
+                .overrides
+                .iter()
+                .map(|(source, _)| *source)
+                .eq(classes.iter_dense())
+            && self.overrides.iter().all(|(_, targets)| {
+                targets.is_empty()
+                    && targets.universe() == classes.universe()
+                    && targets.class_count() == classes.class_count()
+            })
+    }
+
     pub fn transform(
         universe: &TaintUniverse,
         mappings: impl IntoIterator<Item = (SourceClassId, TaintClassSet)>,
@@ -97,6 +117,22 @@ impl TaintEdgeFunction {
         self.generated.class_count()
     }
 
+    /// Add this transfer function's stable semantic content to an identity.
+    pub fn push_stable_identity(&self, digest: &mut LengthDelimitedDigest) {
+        digest.push(b"bifrost-taint-edge-function-v1");
+        self.generated.push_stable_identity(digest);
+        digest.push(&[u8::from(self.default_identity)]);
+        digest.push(
+            &u64::try_from(self.overrides.len())
+                .expect("taint edge-function override count fits in u64")
+                .to_le_bytes(),
+        );
+        for (source, targets) in self.overrides.iter() {
+            digest.push(&source.get().to_le_bytes());
+            targets.push_stable_identity(digest);
+        }
+    }
+
     pub const fn universe(&self) -> super::TaintUniverseHash {
         self.generated.universe()
     }
@@ -111,6 +147,16 @@ impl TaintEdgeFunction {
 
     pub(crate) fn overrides(&self) -> &[(TaintClassId, TaintClassSet)] {
         &self.overrides
+    }
+
+    /// Owned leaf payload only; enclosing value or Arc storage is visited separately.
+    #[doc(hidden)]
+    pub fn retained_heap(&self, heap: &mut crate::analyzer::store::cache_budget::RetainedHeap) {
+        self.generated.retained_heap(heap);
+        heap.owned_slice(self.overrides.as_ref());
+        for (_, targets) in &self.overrides {
+            targets.retained_heap(heap);
+        }
     }
 
     pub(crate) fn retained_heap_bytes(&self) -> usize {
@@ -1387,34 +1433,28 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
         if spec.point() != step.source() {
             return self.plan.universe().empty_set();
         }
-        let carrier = self
+        // A single source event can seed several exact component carriers.
+        // Replay every such fact without replacing the original event identity.
+        let sources = self
             .plan
             .value_flow()
             .source_bindings_at(spec.point(), spec.phase())
-            .find_map(|(candidate, carrier)| (candidate == source_id).then_some(carrier));
-        let Some(carrier) = carrier else {
-            return self.plan.universe().empty_set();
-        };
-        let make_source = || ActiveTaint {
-            evidence: Default::default(),
-            carrier,
-            uncertain: !matches!(spec.proof(), ProofStatus::Proven)
-                || !matches!(spec.completeness(), EvidenceCompleteness::Complete),
-            function: self.source_function(
-                source_id,
-                self.observations
-                    .source_classes(source_id, binding.classes()),
-            ),
-        };
-        let before = if spec.phase() == ValueFlowObservationPhase::BeforeEffects {
-            vec![make_source()]
-        } else {
-            Vec::new()
-        };
-        let after = if spec.phase() == ValueFlowObservationPhase::AfterEffects {
-            vec![make_source()]
-        } else {
-            Vec::new()
+            .filter(|(candidate, _)| *candidate == source_id)
+            .map(|(_, carrier)| ActiveTaint {
+                evidence: Default::default(),
+                carrier,
+                uncertain: !matches!(spec.proof(), ProofStatus::Proven)
+                    || !matches!(spec.completeness(), EvidenceCompleteness::Complete),
+                function: self.source_function(
+                    source_id,
+                    self.observations
+                        .source_classes(source_id, binding.classes()),
+                ),
+            })
+            .collect::<Vec<_>>();
+        let (before, after) = match spec.phase() {
+            ValueFlowObservationPhase::BeforeEffects => (sources, Vec::new()),
+            ValueFlowObservationPhase::AfterEffects => (Vec::new(), sources),
         };
         self.replay_witness_step(output_fact, step, context, before, after)
             .into_iter()
@@ -3094,13 +3134,9 @@ impl TaintSummaryResult {
         complete: bool,
         authored: Option<Vec<AuthoredArmClosure>>,
     ) -> Self {
-        assert!(
-            !(complete && authored.is_some()),
-            "a composition proven by authored summaries is not derived-complete"
-        );
         use crate::dataflow::{
-            IdeMetrics, IdeSummaryDataflowResult, SummaryCoverage, SummaryDataflowResult,
-            SummaryMetrics, WitnessArena, WitnessRetentionLimits,
+            SummaryCoverage, SummaryDataflowResult, SummaryMetrics, WitnessArena,
+            WitnessRetentionLimits,
         };
         let fact_result = SummaryDataflowResult::from_parts(
             None,
@@ -3117,6 +3153,41 @@ impl TaintSummaryResult {
             WitnessArena::new(WitnessRetentionLimits::disabled()).into_store(),
             false,
         );
+        Self::from_composed_facts(plan, fact_result, complete, authored)
+    }
+
+    /// Retain the baseline fact namespace in a pair with no solved rows or values.
+    pub(crate) fn refined_pair_result(
+        &self,
+        plan: &TaintAnalysisPlan,
+        complete: bool,
+        authored: Option<Vec<AuthoredArmClosure>>,
+    ) -> Self {
+        assert!(
+            Arc::ptr_eq(&self.owner, plan.owner()),
+            "a refined pair must belong to its baseline plan"
+        );
+        Self::from_composed_facts(
+            plan,
+            self.fact_result().facts_only(self.termination()),
+            complete,
+            authored,
+        )
+    }
+
+    fn from_composed_facts(
+        plan: &TaintAnalysisPlan,
+        fact_result: crate::dataflow::SummaryDataflowResult<TaintFact>,
+        complete: bool,
+        authored: Option<Vec<AuthoredArmClosure>>,
+    ) -> Self {
+        use crate::dataflow::IdeMetrics;
+
+        assert!(
+            !(complete && authored.is_some()),
+            "a composition proven by authored summaries is not derived-complete"
+        );
+        let termination = fact_result.termination();
         let result = IdeSummaryDataflowResult::from_parts(
             fact_result,
             Vec::new(),
@@ -3212,10 +3283,18 @@ impl TaintSummaryResult {
     }
 
     pub(crate) fn retained_bytes(&self) -> usize {
-        std::mem::size_of::<Self>().saturating_add(self.result.retained_bytes_with(
-            AttributedTaintValue::retained_heap_bytes,
-            AttributedTaintFunction::retained_heap_bytes,
-        ))
+        std::mem::size_of::<Self>()
+            .saturating_add(self.result.retained_bytes_with(
+                AttributedTaintValue::retained_heap_bytes,
+                AttributedTaintFunction::retained_heap_bytes,
+            ))
+            .saturating_add(std::mem::size_of_val(self.authored_arm_closures.as_ref()))
+            .saturating_add(
+                self.authored_arm_closures
+                    .iter()
+                    .map(AuthoredArmClosure::retained_heap_bytes)
+                    .fold(0usize, usize::saturating_add),
+            )
     }
 }
 

@@ -3694,9 +3694,11 @@ identity, classifications, evidence, witnesses, and CVSS variants.
 Strong finding IDs use semantic/source anchors and occurrence ordinals—not line
 numbers or absolute native paths—so unrelated preceding-line changes do not
 churn them unless they introduce an equal earlier anchor and therefore change
-the ordinal. A weak ID is labeled inconclusive and is deliberately omitted
-from SARIF `partialFingerprints`; it is not promoted into a fake stable
-fingerprint.
+the ordinal. A strong ID also does not depend on the engine's internal
+semantic identifiers, so upgrading Bifrost does not change it when the
+analyzed code and the policy are unchanged. A weak ID is labeled inconclusive
+and is deliberately omitted from SARIF `partialFingerprints`; it is not
+promoted into a fake stable fingerprint.
 
 ## Review Findings With Exact Suppressions
 

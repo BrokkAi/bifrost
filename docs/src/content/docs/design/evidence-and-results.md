@@ -52,6 +52,30 @@ Public renderers name the axes as `proof` and `completeness`; they do not mint a
 third composite quality label. Cached policy unit rows retain the same evidence
 object as direct, CLI, MCP, and LSP query results.
 
+Policy diagnostic summaries preserve the typed causes of their input gaps even
+when the report omits diagnostic details. A semantic coverage gap does not
+become an execution failure merely because an assertion cannot conclude over
+its row set. Mixed semantic and execution causes remain distinct; cancellation
+and evaluator work limits retain their operational causes.
+Value-flow summary results retain typed discovery status after model discharge.
+A fixed-point solve with unsupported or unproven semantic coverage remains a
+content gap. Cancellation, solver or discovery budget refusal, and retained
+limit boundaries remain operational even alongside semantic gaps. Consumers
+combine this status with actual provider errors from closure discovery or
+solver errors; an incomplete result alone never establishes a provider failure.
+Pointer queries preserve partial witnesses and `semantic_analysis_partial`
+while using that typed cause.
+
+Aggregate diagnostic messages keep complete reason items while they fit the
+report prose bound. A larger message states its total and omitted item counts;
+formatting preserves the diagnostic's existing code and operational cause.
+Selected-property diagnostics preserve a compact summary of all typed cause
+kinds and capabilities before retaining detailed reason records, so long source
+locators cannot hide later kinds of uncertainty. A
+query diagnostic that still fails report validation produces an internal
+evaluation failure with the rejected code and validation error. It is not a
+retention-budget decision. Actual diagnostic retention cuts name their budget.
+
 ## Set identity and evaluation order
 
 Set operations compare source or semantic row identities, not projected field
@@ -388,3 +412,24 @@ The storage chapter specifies the corresponding
 Operational wording is in [Agent Result Safety](/agent-result-safety/). The
 identities and artifacts needed to replay a result are in
 [Reproduce an Analysis](/reproduce-analysis/).
+
+## Call-reachability observation boundary
+
+Call reachability certifies its selected source roots, traverses their call
+sites, and tests sink membership at those reached sites. Sink plans retain the
+full dependencies needed for negation, quantified predicates, sets and nonlocal
+relations. A complete traversal establishes the boundary within which absence
+is meaningful; sink diagnostics solely at certified-unreached sites are outside
+that answer.
+
+An incomplete traversal retains every encountered source, traversal and demanded
+sink-dependency cause and remains incomplete. It does not claim coverage or
+unreachability for unexplored sites and does not search them for additional sink
+diagnostics. An unavailable external body, unknown dispatch or budget cut is a
+boundary, never proof that no further matching call exists.
+
+Policies with nonlocal sink dependencies evaluate once at whole-policy
+granularity so those dependencies are shared across reached sites. Edits may
+therefore recompute such a policy as a whole. Local sink plans retain per-file
+source and continuation reuse. Cached membership answers replay the reads that
+licensed their fill, including the dependencies required to prove absence.

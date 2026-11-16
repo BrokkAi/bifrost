@@ -23,6 +23,7 @@ mod mixins;
 mod mutation_facts;
 mod rbs_artifact;
 mod semantic;
+mod signature_storage;
 mod source_artifact;
 #[doc(hidden)]
 pub mod source_facts;
@@ -32,6 +33,7 @@ pub mod source_storage;
 pub(crate) mod structural;
 mod tests;
 mod type_flow;
+pub(crate) mod workspace_signatures;
 
 pub(crate) fn artifact_logical_path(archive_sha256: &str, entry_path: &str) -> String {
     format!("gem+sha256:{archive_sha256}!/{entry_path}")
@@ -208,6 +210,22 @@ type AuthorityCell<T> =
 type ReverseImports = HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>;
 type AutoloadConstantFiles = HashMap<String, HashSet<ProjectFile>>;
 type SingletonMutationMemo = Cache<(Box<str>, Box<str>), bool>;
+/// The collection epoch at which every disk signature file of the snapshot
+/// had stored facts (`None`: some did not), checked once and again after a
+/// collection, and the answers per `(owner, member)`.
+type WorkspaceSignatureMemo = (
+    std::sync::Mutex<Option<Option<i64>>>,
+    Cache<(Box<str>, Box<str>), Arc<workspace_signatures::RubyWorkspaceSignatureAnswer>>,
+);
+
+fn weight_signature_answer(
+    key: &(Box<str>, Box<str>),
+    answer: &Arc<workspace_signatures::RubyWorkspaceSignatureAnswer>,
+) -> u32 {
+    u32::try_from(key.0.len() + key.1.len() + answer.retained_bytes())
+        .unwrap_or(u32::MAX)
+        .max(1)
+}
 type AuthorityWithFiles<M> = Arc<WorkspaceAuthorityMemo<(M, Cache<(), Arc<[ReadKey]>>)>>;
 
 fn weight_load_authority_files(_key: &(), files: &Arc<[ReadKey]>) -> u32 {
@@ -251,6 +269,8 @@ pub struct RubyAnalyzer {
     /// Workspace scans for rewrites of a model-declared singleton method,
     /// keyed by owner constant path and member name (#9336).
     singleton_member_mutation_free: Arc<WorkspaceAuthorityMemo<SingletonMutationMemo>>,
+    /// Workspace RBS declarations of one `(owner, member)` (#12967).
+    workspace_signatures: Arc<WorkspaceAuthorityMemo<WorkspaceSignatureMemo>>,
 }
 
 brokk_bifrost_analysis::analyzer::analyzer_definition_lookup::impl_forward_query_provider!(
@@ -282,6 +302,36 @@ impl RubyAnalyzer {
                 .unwrap_or(false)
             },
             |answer| mutation_facts::singleton_inputs(owner, member, *answer),
+        )
+    }
+
+    /// What the workspace's RBS signature files declare for `member` of
+    /// `owner` (a `::`-joined constant path), memoized per snapshot. A
+    /// cancelled read answers "nothing declared" and is not memoized.
+    pub(crate) fn workspace_signature(
+        &self,
+        owner: &str,
+        member: &str,
+        keep_going: &dyn Fn() -> bool,
+    ) -> Arc<workspace_signatures::RubyWorkspaceSignatureAnswer> {
+        self.workspace_signatures.read(
+            &memo_attribution(self),
+            |(heads_known, memo)| {
+                memo.optionally_get_with((owner.into(), member.into()), || {
+                    workspace_signatures::workspace_signature_answer(
+                        self,
+                        owner,
+                        member,
+                        heads_known,
+                        keep_going,
+                    )
+                    .map(Arc::new)
+                })
+                .unwrap_or_else(|| {
+                    Arc::new(workspace_signatures::RubyWorkspaceSignatureAnswer::new([]))
+                })
+            },
+            |answer| workspace_signatures::signature_inputs(owner, member, answer),
         )
     }
 
@@ -450,6 +500,13 @@ impl RubyAnalyzer {
             singleton_member_mutation_free: Arc::new(WorkspaceAuthorityMemo::new(
                 WorkspaceFactFamily::RubySingletonMemberMutation,
                 Cache::builder().max_capacity(4_096).build(),
+            )),
+            workspace_signatures: Arc::new(WorkspaceAuthorityMemo::new(
+                WorkspaceFactFamily::RubyWorkspaceSignatures,
+                (
+                    std::sync::Mutex::new(None),
+                    build_weighted_cache(memo_budget / 32, weight_signature_answer),
+                ),
             )),
         }
     }
@@ -671,6 +728,11 @@ impl CodeUnitIndex for RubyAnalyzer {
     }
 
     brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
+        fn owns_source_file(&self, file: &ProjectFile) -> bool;
+        fn indexed_source_files(&self) -> brokk_bifrost_analysis::analyzer::QueryBatch<ProjectFile>;
+    }
+
+    brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
         fn indexed_blob_oid(&self, file: &ProjectFile) -> Option<brokk_bifrost_analysis::analyzer::Oid>;
     }
 
@@ -843,11 +905,8 @@ impl IAnalyzer for RubyAnalyzer {
     }
 
     brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
-        fn record_query_failure(&self, error: brokk_bifrost_analysis::analyzer::store::StoreError);
-    }
-
-    brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
         fn workspace_file_index_cell(&self) -> Option<brokk_bifrost_analysis::analyzer::WorkspaceFileIndexCell>;
+        fn workspace_file_inventory_cell(&self) -> Option<brokk_bifrost_analysis::analyzer::WorkspaceFileInventoryCell>;
     }
 
     brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::delegate_inner_methods! {
@@ -860,6 +919,13 @@ impl IAnalyzer for RubyAnalyzer {
         fn structural_fact_providers(
         &self,
     ) -> Vec<&dyn brokk_bifrost_analysis::analyzer::structural::StructuralFactProvider>;
+    }
+
+    fn generation_membership(
+        &self,
+    ) -> &Arc<brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::GenerationWorkspaceMembership>
+    {
+        IAnalyzer::generation_membership(&self.inner)
     }
 
     fn snapshot_caches(
@@ -950,7 +1016,10 @@ impl IAnalyzer for RubyAnalyzer {
         fn contains_tests(&self, file: &ProjectFile) -> bool;
     }
 
-    fn in_test_region(&self, code_unit: &brokk_bifrost_core::analyzer::model::CodeUnit) -> bool {
+    fn in_test_region(
+        &self,
+        code_unit: &brokk_bifrost_core::analyzer::model::CodeUnit,
+    ) -> Result<bool, brokk_bifrost_analysis::analyzer::QueryReadIncomplete> {
         self.inner.in_test_region(code_unit)
     }
 
@@ -1171,6 +1240,16 @@ impl LanguageSupport for RubySupport {
         )
     }
 
+    fn is_signature_input(&self, file: &ProjectFile) -> bool {
+        workspace_signatures::is_ruby_signature_input_path(file.rel_path())
+    }
+
+    fn signature_input_root(&self, file: &ProjectFile) -> Option<std::path::PathBuf> {
+        workspace_signatures::is_ruby_signature_input_path(file.rel_path())
+            .then(|| workspace_signatures::ruby_signature_root(file.rel_path()))
+            .flatten()
+    }
+
     fn workspace_fact_answer(
         &self,
         analyzer: &dyn IAnalyzer,
@@ -1193,6 +1272,14 @@ impl LanguageSupport for RubySupport {
                 )
                 .unwrap_or(false),
             )),
+            (
+                WorkspaceFactFamily::RubyWorkspaceSignatures,
+                Language::Ruby,
+                brokk_bifrost_analysis::analyzer::FactSubject::NamedMember { owner, member },
+            ) => {
+                let ruby = resolve_analyzer::<RubyAnalyzer>(analyzer)?;
+                Some(ruby.workspace_signature(owner, member, &|| true).digest())
+            }
             _ => None,
         }
     }
@@ -1283,6 +1370,17 @@ impl LanguageSupport for RubySupport {
         crate::analyzer::usages::get_definition::ruby::ruby_site_for_focus(site, tree, source)
     }
 
+    /// A `call` node's `method` token names the called method, never a local
+    /// read: tree-sitter-ruby parses a bare local read as an `identifier`, not
+    /// a `call`. Answering it lexically let a same-named parameter or local win
+    /// `http.request(request)`, so dispatch never reached `Net::HTTP#request`
+    /// (#13057).
+    fn focus_resolves_lexically(&self, focus: tree_sitter::Node<'_>) -> bool {
+        !focus.parent().is_some_and(|parent| {
+            parent.kind() == "call" && parent.child_by_field_name("method") == Some(focus)
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn resolve_definition_dispatch<'a>(
         &self,
@@ -1320,12 +1418,47 @@ impl LanguageSupport for RubySupport {
         crate::analyzer::usages::get_definition::ruby::ruby_call_reference_candidate(node)
     }
 
+    fn honors_receiver_hypotheses(&self) -> bool {
+        true
+    }
+
+    fn argument_forwards_receiver_class(
+        &self,
+        source: &str,
+        tree: &tree_sitter::Tree,
+        span: std::ops::Range<usize>,
+    ) -> bool {
+        crate::analyzer::usages::get_definition::ruby::argument_forwards_receiver_class(
+            source, tree, span,
+        )
+    }
+
+    fn receiver_class_of_expression(
+        &self,
+        analyzer: &dyn brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer,
+        file: &ProjectFile,
+        source: &str,
+        tree: &tree_sitter::Tree,
+        span: std::ops::Range<usize>,
+        cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
+    ) -> Option<Box<str>> {
+        crate::analyzer::usages::get_definition::ruby::receiver_class_of_expression(
+            analyzer,
+            file,
+            source,
+            tree,
+            span,
+            cancellation,
+        )
+    }
+
     fn definition_boundary_evidence(
         &self,
         analyzer: &dyn brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer,
         _token: brokk_bifrost_core::analyzer::query_token::QueryToken<'_>,
         _file: &brokk_bifrost_core::analyzer::model::ProjectFile,
         name: &str,
+        _reuse: &mut brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict,
     ) -> Option<(
         brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus,
         Option<String>,
@@ -1342,7 +1475,7 @@ impl LanguageSupport for RubySupport {
             // is consulted only through the shared verdict helper: a truncated
             // discovery keeps the name accountable, while gem names are never
             // inflected into constant names.
-            let overlay = analyzer.semantic_model_overlay();
+            let overlay = analyzer.semantic_model_overlay_read().published();
             let constants = crate::analyzer::ruby::constant_identity::RubyOverlayConstants::new(
                 overlay.as_deref(),
             );
@@ -1535,6 +1668,8 @@ impl brokk_bifrost_analysis::analyzer::multi_analyzer::LanguageAnalyzer for Ruby
     ) -> Box<dyn brokk_bifrost_analysis::analyzer::multi_analyzer::LanguageAnalyzer> {
         Box::new(RubyAnalyzer::update_all_with_progress(self, progress))
     }
+
+    brokk_bifrost_analysis::delegate_generation_membership_updates!(RubyAnalyzer);
 
     fn as_any(&self) -> &dyn std::any::Any {
         self

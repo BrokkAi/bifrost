@@ -1,0 +1,9 @@
+# The jvm-context-derivation lever (#11570).
+#
+# Invalidates JVM context revisions and their project/source-root facts.
+# Add one `<issue>-<slug>` line when these derivation rules change.
+# Git merges this file with merge=union. Never edit or remove a token line.
+# See .agents/docs/cache-identity-levers.md.
+#
+# Replaced the literal: JVM_CONTEXT_DERIVATION_VERSION = 1.
+11570-slice2b-derivation-identity

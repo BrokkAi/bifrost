@@ -1,6 +1,7 @@
 -- Tags and canonical coordinates are output identity. Declaration evidence,
 -- row IDs, topology IDs, and consumed dependency digests never enter it.
-INSERT OR IGNORE INTO cr_surface_facts
+INSERT INTO cr_surface_facts
+SELECT * FROM (
 SELECT 'public_module_node', crate_key, module_path, '', '', X'', ''
 FROM cr_surface_frontier
 UNION ALL
@@ -30,4 +31,5 @@ WHERE binding.module_expected = 1
   AND NOT EXISTS (SELECT 1 FROM cr_surface_candidates AS candidate
                   WHERE candidate.crate_key = binding.crate_key
                     AND candidate.module_path = binding.module_path
-                    AND candidate.name = binding.name);
+                    AND candidate.name = binding.name)
+) WHERE true ON CONFLICT DO NOTHING;

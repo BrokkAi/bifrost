@@ -4360,12 +4360,27 @@ pub struct DependencyEvidenceFilter {
     pub declared_by: Vec<String>,
     pub scopes: Vec<String>,
     pub features: Vec<String>,
+    // A query axis added after policies were released must not change the
+    // canonical form of a query that does not use it: that form is part of
+    // every released policy's source identity (#11554). So a later axis is
+    // omitted when empty. The axes above were always written and stay so,
+    // because omitting them would move every released pin.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub lock_associations: Vec<String>,
 }
 #[derive(Debug, Clone)]
 pub struct DependencyEvidenceSeed {
     pub where_globs: QueryPathScope,
     pub filter: DependencyEvidenceFilter,
+}
+
+/// An additive relation from exact source endpoints to reached static calls.
+#[derive(Debug, Clone)]
+pub struct CallReachability {
+    pub sources: CodeQueryPlan,
+    pub sinks: CodeQueryPlan,
+    /// Omission is unbounded by depth; execution allowances still apply.
+    pub depth: Option<NonZeroUsize>,
 }
 
 /// The source of values entering one typed pipeline suffix.
@@ -4384,6 +4399,7 @@ pub enum CodeQueryPlanSource {
         op: SetOperator,
         branches: Vec<CodeQueryPlan>,
     },
+    CallReachability(Box<CallReachability>),
     Correlate(Box<CrossDomainCorrelation>),
     RequireBoth(Box<CrossDomainRequirement>),
 }
@@ -4393,6 +4409,7 @@ impl CodeQueryPlanSource {
     pub fn child_plans(&self) -> Vec<&CodeQueryPlan> {
         match self {
             Self::Set { branches, .. } => branches.iter().collect(),
+            Self::CallReachability(relation) => vec![&relation.sources, &relation.sinks],
             Self::Correlate(correlation) => vec![&correlation.code, &correlation.configuration],
             Self::RequireBoth(requirement) => vec![&requirement.code, &requirement.configuration],
             Self::Seed(_)
@@ -4411,6 +4428,7 @@ impl CodeQueryPlanSource {
     pub fn child_plans_mut(&mut self) -> Vec<&mut CodeQueryPlan> {
         match self {
             Self::Set { branches, .. } => branches.iter_mut().collect(),
+            Self::CallReachability(relation) => vec![&mut relation.sources, &mut relation.sinks],
             Self::Correlate(correlation) => {
                 vec![&mut correlation.code, &mut correlation.configuration]
             }
@@ -4478,6 +4496,7 @@ impl CodeQuery {
             | CodeQueryPlanSource::DependencyEvidence(_)
             | CodeQueryPlanSource::ConfigurationFacts(_)
             | CodeQueryPlanSource::Set { .. }
+            | CodeQueryPlanSource::CallReachability(_)
             | CodeQueryPlanSource::Correlate(_)
             | CodeQueryPlanSource::RequireBoth(_) => None,
         }
@@ -4692,6 +4711,47 @@ fn validate_plan(
                 captures: None,
                 projected_fields: None,
                 row_kinds: vec![QueryValueKind::ConfigurationFact],
+            }
+        }
+        CodeQueryPlanSource::CallReachability(relation) => {
+            let relation_path = child_path(path, "call_reachability");
+            let sources = validate_plan(
+                &relation.sources,
+                &child_path(&relation_path, "sources"),
+                depth + 1,
+                nodes,
+            )?;
+            let sinks = validate_plan(
+                &relation.sinks,
+                &child_path(&relation_path, "sinks"),
+                depth + 1,
+                nodes,
+            )?;
+            if !matches!(
+                sources.kind,
+                QueryValueKind::StructuralMatch | QueryValueKind::Declaration
+            ) {
+                return Err(QueryError::new(
+                    child_path(&relation_path, "sources"),
+                    "call-reachability sources require exact structural or declaration rows",
+                ));
+            }
+            if !matches!(
+                sinks.kind,
+                QueryValueKind::StructuralMatch
+                    | QueryValueKind::CallSite
+                    | QueryValueKind::DispatchTarget
+            ) {
+                return Err(QueryError::new(
+                    child_path(&relation_path, "sinks"),
+                    "call-reachability sinks require exact call-site or structural rows",
+                ));
+            }
+            ValidatedDomain {
+                kind: QueryValueKind::Declaration,
+                captures: None,
+                projected_fields: None,
+                row_kinds: vec![QueryValueKind::Declaration],
             }
         }
         CodeQueryPlanSource::Correlate(correlation) => {
@@ -5059,6 +5119,7 @@ pub fn plan_code_languages(plan: &CodeQueryPlan) -> Vec<Language> {
             CodeQueryPlanSource::DependencyEvidence(_)
             | CodeQueryPlanSource::ConfigurationFacts(_)
             | CodeQueryPlanSource::Set { .. }
+            | CodeQueryPlanSource::CallReachability(_)
             | CodeQueryPlanSource::Correlate(_)
             | CodeQueryPlanSource::RequireBoth(_) => {
                 pending.extend(plan.source.child_plans());

@@ -31,6 +31,7 @@ fn usable_incomplete_models_report_each_inactive_source_file() {
         report.clone(),
     ));
     let activation = WorkspacePacksActivation {
+        registration_evidence: Vec::new(),
         ecosystems: Vec::new(),
         workspace_models: vec![
             RegisteredWorkspaceSemanticModel {

@@ -158,7 +158,10 @@ mod ruby_extraction_tests {
                     assert!(facts.is_none());
                     Some("StructureUnavailable".to_owned())
                 }
-                Err(QueryReadIncomplete::SemanticEvidenceUnavailable(reason)) => {
+                Err(
+                    QueryReadIncomplete::SemanticEvidenceUnavailable(reason)
+                    | QueryReadIncomplete::SemanticEvidenceGap(reason),
+                ) => {
                     assert!(facts.is_none());
                     Some(reason.into_string())
                 }

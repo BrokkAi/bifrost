@@ -110,7 +110,11 @@ fn mcp_run_policy_reports_the_stored_flow_and_the_missing_validators() {
     let structured =
         run_policies_over_mcp(project.root(), &[TAINT_POLICY_PATH, VALIDATION_POLICY_PATH]);
     let report = &structured["report"];
-    assert_eq!(report["schema_version"], 7, "{report}");
+    assert_eq!(
+        report["schema_version"],
+        brokk_bifrost_policy::PolicyReportDocument::SCHEMA_VERSION,
+        "{report}"
+    );
 
     let taint = run_object(report, TAINT_POLICY_ID);
     assert_eq!(taint["completion"]["type"], "complete", "{taint}");

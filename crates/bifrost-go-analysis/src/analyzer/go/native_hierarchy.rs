@@ -158,7 +158,7 @@ pub fn stop_next_go_forward_scan_for_test() {
 fn open() -> HierarchyAnswer {
     HierarchyAnswer {
         open: vec![HierarchyOpenReason::DescendantIndexUnavailable],
-        ..Default::default()
+        ..HierarchyAnswer::complete(Vec::new())
     }
 }
 fn stopped() -> HierarchyAnswer {
@@ -166,7 +166,7 @@ fn stopped() -> HierarchyAnswer {
         open: vec![HierarchyOpenReason::MemberFamily(
             MemberFamilyReason::HierarchyTruncated,
         )],
-        ..Default::default()
+        ..HierarchyAnswer::complete(Vec::new())
     }
 }
 fn copy_answer(a: &HierarchyAnswer) -> HierarchyAnswer {
@@ -214,7 +214,7 @@ impl NativeQuery<'_, '_, '_> {
         let Some(mount) = self.operation.mount_table().mount_for_path("go", &path)? else {
             return Ok(open());
         };
-        let mut answer = HierarchyAnswer::default();
+        let mut answer = HierarchyAnswer::complete(Vec::new());
         for (context, _) in contexts {
             if self.token.is_cancelled() {
                 answer.merge(stopped());
@@ -502,7 +502,25 @@ enum OpenFailure {
     Store(StoreError),
     Cancelled,
     Stale(SelectedResolutionStale),
+    /// The selected model snapshot could not be pinned: stale like
+    /// [`Self::Stale`], and execution dependent as well.
+    UnpinnedModel(SelectedResolutionStale),
     Unavailable(SelectedResolutionUnavailable),
+}
+
+// The hierarchy answers that consume an open failure cannot carry a verdict
+// (they are core capability types), so `record` joins it into the current
+// captures, where the ambient mark at the pin went.
+impl brokk_bifrost_analysis::analyzer::reuse_verdict::CarriesReuseVerdict for OpenFailure {
+    fn reuse_verdict(&self) -> brokk_bifrost_analysis::analyzer::reuse_verdict::ReuseVerdict {
+        use brokk_bifrost_analysis::analyzer::reuse_verdict::{ExecutionCause, ReuseVerdict};
+        match self {
+            Self::UnpinnedModel(_) => ReuseVerdict::ExecutionDependent(ExecutionCause::Other),
+            Self::Store(_) | Self::Cancelled | Self::Stale(_) | Self::Unavailable(_) => {
+                ReuseVerdict::Content
+            }
+        }
+    }
 }
 
 impl From<StoreError> for OpenFailure {
@@ -513,6 +531,11 @@ impl From<StoreError> for OpenFailure {
 
 impl OpenFailure {
     fn record(self, go: &GoAnalyzer) {
+        go.inner.join_reuse_verdict(
+            brokk_bifrost_analysis::analyzer::reuse_verdict::CarriesReuseVerdict::reuse_verdict(
+                &self,
+            ),
+        );
         let error = match self {
             Self::Store(error) => error,
             Self::Cancelled => {
@@ -520,7 +543,7 @@ impl OpenFailure {
                     .record_query_incomplete(QueryReadIncomplete::Cancelled);
                 return;
             }
-            Self::Stale(reason) => {
+            Self::Stale(reason) | Self::UnpinnedModel(reason) => {
                 StoreError::new(format!("Go hierarchy operation stale: {reason:?}"))
             }
             Self::Unavailable(reason) => {
@@ -534,7 +557,9 @@ impl OpenFailure {
         match self {
             Self::Cancelled => MemberFamilyReason::HierarchyTruncated,
             Self::Store(_) => MemberFamilyReason::ProviderUnavailable,
-            Self::Stale(_) | Self::Unavailable(_) => MemberFamilyReason::CoverageIncomplete,
+            Self::Stale(_) | Self::UnpinnedModel(_) | Self::Unavailable(_) => {
+                MemberFamilyReason::CoverageIncomplete
+            }
         }
     }
 
@@ -552,7 +577,7 @@ fn with_open_query<T>(
         Ok(scope) => scope,
         Err(_) => {
             go.inner.mark_execution_dependent();
-            return Err(OpenFailure::Stale(
+            return Err(OpenFailure::UnpinnedModel(
                 SelectedResolutionStale::NativeContextPublication {
                     storage_language: "go".into(),
                 },
@@ -930,12 +955,24 @@ fn read_member_family(
         };
         // The coverage key names selection and context, but not the role or
         // outcome whose completeness this family call uses.
-        let raw = match query.operation.go_native_method_family(
+        let raw = match query.operation.visit_go_native_method_family(
             context.context_id,
             &role,
             id,
             &query.token,
             session,
+            |operation, methods| {
+                hydrate_family_direction(
+                    operation,
+                    query.go,
+                    &query.token,
+                    methods,
+                    session,
+                    &mut inverse,
+                    #[cfg(any(test, feature = "test-support"))]
+                    true,
+                )
+            },
         ) {
             Ok(raw) => raw,
             Err(error) => {
@@ -964,19 +1001,6 @@ fn read_member_family(
         ) {
             record_family_store_failure(query.go, error);
             forward.mark(family_provider_gap(session, &query.token));
-        }
-        if let Err(error) = hydrate_family_direction(
-            &query.operation,
-            query.go,
-            &query.token,
-            &raw.implemented_by.methods,
-            session,
-            &mut inverse,
-            #[cfg(any(test, feature = "test-support"))]
-            true,
-        ) {
-            record_family_store_failure(query.go, error);
-            inverse.mark(family_provider_gap(session, &query.token));
         }
         let scan_key = (context.context_id, role.clone());
         if let Some((scan, receipt)) = query.forward_scans.get(&scan_key) {

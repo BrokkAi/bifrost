@@ -23,7 +23,9 @@
 
 mod refinement;
 
-use std::sync::Arc;
+use super::inputs::{adopt_interior_clone, interior_clone_bytes};
+use crate::analyzer::store::cache_budget::RetainedHeap;
+use std::sync::{Arc, OnceLock};
 
 use crate::analyzer::semantic::cfg_algorithms::{
     CfgAlgorithmBudget, CfgAlgorithmError, CfgAlgorithmRequest, reverse_reachability,
@@ -35,9 +37,9 @@ use crate::analyzer::semantic::partial_flow::{
     call_input_value, heap_selectors,
 };
 use crate::analyzer::semantic::{
-    AccessPathRoot, AccessPathTail, BindingOriginIndex, CallSiteId, CallStorageSharing,
-    ControlContinuation, EvidenceCompleteness, ProcedureHandle, ProgramPointHandle, ProgramPointId,
-    ProofStatus, SemanticCallSite, SemanticRequest, ValueId,
+    AbstractLocation, AccessPathRoot, AccessPathTail, BindingOriginIndex, CallSiteId,
+    CallStorageSharing, ControlContinuation, EvidenceCompleteness, ProcedureHandle,
+    ProgramPointHandle, ProgramPointId, ProofStatus, SemanticCallSite, SemanticRequest, ValueId,
 };
 use crate::dataflow::{SemanticInputStatus, UnmodeledCallBehavior};
 use crate::hash::{HashMap, HashSet};
@@ -57,6 +59,29 @@ use super::provider::{
     StoreWriteObservation,
 };
 use super::{ComposeError, CompositionBudget};
+
+// Keep the CFG algorithm's typed stop when its ordering proof is unavailable.
+// The same cause controls reporting and whether the answer can be reused.
+fn reader_ordering_failure<Node>(
+    error: CfgAlgorithmError<Node>,
+) -> (super::IncompleteCause, &'static str) {
+    use super::{IncompleteCause, OperationalCause};
+    let (cause, reason) = match error {
+        CfgAlgorithmError::InvalidNode(_) => (
+            OperationalCause::Provider,
+            "reader ordering cannot be proven: invalid node",
+        ),
+        CfgAlgorithmError::Cancelled { .. } => (
+            OperationalCause::Cancelled,
+            "reader ordering cannot be proven: cancelled",
+        ),
+        CfgAlgorithmError::ExceededBudget(_) => (
+            OperationalCause::Budget(BudgetLane::Semantic),
+            "reader ordering cannot be proven: budget exceeded",
+        ),
+    };
+    (IncompleteCause::Operational(cause), reason)
+}
 
 /// A source that reaches a sink, with one path per distinct label function.
 /// Each path comes with the best quality of the paths that share its label
@@ -176,6 +201,7 @@ pub enum Incompleteness {
         procedure: DurableProcedureKey,
         residual: Box<[DurableCallSiteKey]>,
         residual_causes: Box<[super::IncompleteCause]>,
+        relation_cause: Option<super::IncompleteCause>,
         cause: super::IncompleteCause,
         blocked: Option<BlockedGap>,
         status: SemanticInputStatus,
@@ -539,55 +565,125 @@ struct StoreWaiter {
 /// One flow into a position of a procedure: where it starts, whether its
 /// relations are uncertain, and the calls its path classes crossed.
 #[derive(Debug, Clone)]
-struct Inflow<From> {
-    from: From,
-    function: LabelFunctionId,
-    uncertain: bool,
-    crossed: CrossedCalls,
+pub struct Inflow<From> {
+    pub from: From,
+    pub function: LabelFunctionId,
+    pub uncertain: bool,
+    pub crossed: CrossedCalls,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProjectedProcedureInput {
+    pub function: LabelFunctionId,
+    pub flows: Arc<ProcedurePartialFlows>,
 }
 
 #[derive(Debug)]
-struct ProcedureData {
-    flows: Arc<ProcedurePartialFlows>,
-    /// Stored flows by target port.
+pub struct ProcedureEndpointInputs<Function> {
+    pub sources: std::ops::Range<usize>,
+    pub sanitizers: Vec<BoundSanitizer<Function>>,
+    pub transforms: Vec<BoundTransform<Function>>,
+    pub completeness: Completeness,
+    pub causes: Vec<super::IncompleteCause>,
+}
+
+#[derive(Debug)]
+pub struct ProcedureData<Function> {
+    pub flows: Arc<ProcedurePartialFlows>,
+    pub projections: Option<Box<[Option<ProjectedProcedureInput>]>>,
+    pub endpoints: OnceLock<ProcedureEndpointInputs<Function>>,
     into: HashMap<PartialFlowPort, Vec<Inflow<PartialFlowPort>>>,
 }
 
-/// The seeds that reach one interior target.
+#[derive(Debug, Clone)]
+pub struct InteriorPartitionInput {
+    pub function: LabelFunctionId,
+    pub flows: super::provider::InteriorFlows,
+}
+
+#[derive(Debug)]
+pub enum InteriorObservations {
+    Many(Vec<InteriorObservation>),
+    One([InteriorObservation; 1]),
+    Empty,
+}
+impl InteriorObservations {
+    pub fn as_slice(&self) -> &[InteriorObservation] {
+        match self {
+            Self::Many(rows) => rows,
+            Self::One(row) => row,
+            Self::Empty => &[],
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct InteriorInput {
+    pub seeds: Vec<InteriorSeed>,
+    pub seed_ends: Vec<Endpoint>,
+    pub observations: InteriorObservations,
+    pub partitions: Box<[Option<InteriorPartitionInput>]>,
+}
+
+type InteriorRun = (
+    Vec<(LabelFunctionId, super::provider::InteriorFlow)>,
+    Option<InteriorInput>,
+);
+
+#[derive(Debug)]
+pub struct CallerInput {
+    pub answer: super::provider::Callers,
+    pub retained_len: usize,
+    pub clipped: bool,
+}
+
+impl std::ops::Deref for CallerInput {
+    type Target = [DurableCallSiteKey];
+    fn deref(&self) -> &Self::Target {
+        &self.answer.calls[..self.retained_len]
+    }
+}
+
 type Reaching = Arc<[Inflow<Endpoint>]>;
 
-/// Interior flows of one procedure by target.
 #[derive(Debug, Default)]
-struct InteriorIndex {
+pub struct InteriorIndex {
+    pub input: Option<InteriorInput>,
     into: HashMap<Endpoint, Vec<Inflow<Endpoint>>>,
 }
 
 #[derive(Debug)]
-struct DispatchAnswer {
-    candidates: Vec<Arc<DispatchCandidate>>,
-    uncertain: bool,
-    incomplete_reason: Option<Box<str>>,
-    incomplete_cause: Option<super::IncompleteCause>,
-    external_body_unavailable: Option<super::provider::ExternalBodyUnavailableGap>,
+pub struct LocationInteriorInput {
+    pub input: Option<InteriorInput>,
+    reaching: Option<Reaching>,
+}
+
+#[derive(Debug)]
+pub struct DispatchAnswer {
+    pub candidates: Vec<Arc<DispatchCandidate>>,
+    pub uncertain: bool,
+    pub incomplete_reason: Option<Box<str>>,
+    pub incomplete_cause: Option<super::IncompleteCause>,
+    pub external_body_unavailable: Option<super::provider::ExternalBodyUnavailableGap>,
     /// The best quality of the call's own continuation edges.
-    continuation: HopQuality,
+    pub continuation: HopQuality,
 }
 
 /// A sanitizer or transform placed on the ports of one call. `None` matches
 /// any input or output.
 #[derive(Debug, Clone)]
-struct Annotation {
-    input: Option<PartialFlowPort>,
-    output: Option<PartialFlowPort>,
-    hop: Hop,
+pub struct Annotation {
+    pub input: Option<PartialFlowPort>,
+    pub output: Option<PartialFlowPort>,
+    pub hop: Hop,
 }
 
 /// A matched transform: its own flow from a call input to a call output.
 #[derive(Debug, Clone)]
-struct Link {
-    input: PartialFlowPort,
-    output: PartialFlowPort,
-    hop: Hop,
+pub struct Link {
+    pub input: PartialFlowPort,
+    pub output: PartialFlowPort,
+    pub hop: Hop,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -596,25 +692,134 @@ enum Work {
     Reach(usize),
 }
 
-struct Search<'a, Provider, L>
+fn capture_completeness(
+    heap: &mut RetainedHeap,
+    completeness: &Completeness,
+) -> Option<Completeness> {
+    match completeness {
+        Completeness::Complete => (!heap.is_refused()).then_some(Completeness::Complete),
+        Completeness::Incomplete { cause, reason } => {
+            if !heap.reserve_scratch(reason.len()) {
+                return None;
+            }
+            let copied = reason.clone();
+            if !copied.is_empty() {
+                heap.adopt_allocation(copied.as_ptr() as usize, copied.len(), copied.len());
+            }
+            if heap.is_refused() {
+                let bytes = copied.len();
+                drop(copied);
+                heap.release_scratch(bytes);
+                None
+            } else {
+                Some(Completeness::Incomplete {
+                    cause: *cause,
+                    reason: copied,
+                })
+            }
+        }
+    }
+}
+
+fn capture_slots<T: Clone>(
+    heap: &mut RetainedHeap,
+    len: usize,
+    nested_bytes: usize,
+) -> Option<(Box<[Option<T>]>, usize)> {
+    let Some(bytes) = len
+        .checked_mul(std::mem::size_of::<Option<T>>())
+        .and_then(|bytes| bytes.checked_add(nested_bytes))
+    else {
+        heap.refuse();
+        return None;
+    };
+    if !heap.reserve_scratch(bytes) {
+        return None;
+    }
+    // Exact one-shot storage: no growth or replacement while a registered owner lives.
+    let mut slots = Box::<[Option<T>]>::new_uninit_slice(len);
+    for slot in &mut slots {
+        slot.write(None);
+    }
+    // SAFETY: every slot was initialized to None above.
+    let slots = unsafe { slots.assume_init() };
+    Some((slots, bytes))
+}
+
+fn finish_capture<T>(
+    heap: &mut RetainedHeap,
+    slots: Box<[Option<T>]>,
+    bytes: usize,
+) -> Option<Box<[Option<T>]>> {
+    if bytes == 0 {
+        return Some(slots);
+    }
+    let root_bytes = std::mem::size_of_val(slots.as_ref());
+    if !heap.is_refused() {
+        // Nested clones have already transferred each actual allocation. Any
+        // unused Vec-capacity allowance belongs to this grant and is refunded.
+        heap.adopt_allocation(slots.as_ptr() as usize, root_bytes, bytes);
+    }
+    if heap.is_refused() {
+        drop(slots);
+        heap.release_scratch(bytes);
+        None
+    } else {
+        Some(slots)
+    }
+}
+
+#[derive(Debug)]
+pub struct SearchInputs<Fact, Function> {
+    pub execution_roots: Vec<DurableProcedureKey>,
+    pub object_roots: Vec<ObjectAnchor>,
+    pub endpoint_projections: bool,
+    pub accepted: HashMap<ValueFlowSinkId, Fact>,
+    pub sources: Vec<BoundSource<Fact>>,
+    pub sources_in: HashMap<DurableProcedureKey, Vec<ComposedSourceId>>,
+    pub sinks_in: HashMap<DurableProcedureKey, Vec<ValueFlowSinkId>>,
+    pub annotations: HashMap<DurableCallSiteKey, Vec<Annotation>>,
+    pub links: HashMap<DurableCallSiteKey, Vec<Link>>,
+    pub sanitizers_resolved: bool,
+    pub procedures: HashMap<DurableProcedureKey, Option<Arc<ProcedureData<Function>>>>,
+    pub interiors: HashMap<DurableProcedureKey, Option<Arc<InteriorIndex>>>,
+    pub location_interiors: HashMap<(DurableProcedureKey, CallerLocation), LocationInteriorInput>,
+    pub modeled_reader_origins:
+        HashMap<(DurableProcedureKey, CallerLocation), Vec<AbstractLocation>>,
+    pub handles: HashMap<DurableProcedureKey, ProcedureHandleInput>,
+    pub dispatches: HashMap<DurableCallSiteKey, Arc<DispatchAnswer>>,
+    pub dispatched_models: HashMap<DurableCallSiteKey, Option<Arc<CallModel<Function>>>>,
+    pub models: HashMap<DurableCallSiteKey, Option<Arc<CallModel<Function>>>>,
+    pub callers: HashMap<DurableProcedureKey, Arc<CallerInput>>,
+    pub parents: HashMap<DurableProcedureKey, Option<DurableProcedureKey>>,
+    pub store_writes: Vec<StoreWriteObservation>,
+    pub store_writes_in: HashMap<DurableProcedureKey, Vec<usize>>,
+}
+
+#[derive(Debug)]
+pub struct ProcedureHandleInput {
+    pub procedure: ProcedureHandle,
+    /// The original empty request used solely to acquire a live handle.
+    pub acquisition: Option<InteriorInput>,
+}
+
+struct Search<'a, 'capture, Provider, L>
 where
     Provider: CompositionProvider,
     L: ComposeLabels<Fact = Provider::Fact, Function = Provider::Function>,
 {
-    execution_roots: Vec<DurableProcedureKey>,
-    object_roots: Vec<ObjectAnchor>,
+    inputs: SearchInputs<L::Fact, L::Function>,
+    capture: Option<&'capture mut RetainedHeap>,
+
     object_reaches: Vec<ObjectReach<L::Fact>>,
     certified_procedure_reaches: Option<Vec<ExecutionReach>>,
     value_flow: Option<&'a ValueFlowPlan>,
-    /// What each bound sink accepts.
-    accepted: HashMap<ValueFlowSinkId, L::Fact>,
     provider: &'a Provider,
     budget: CompositionBudget,
     /// The label functions of every path key and hop of this search.
     functions: LabelFunctions<L>,
     /// Every source the search can reach: the query's, then those matched on
     /// the frontier.
-    sources: Vec<BoundSource<L::Fact>>,
     execution_sources: Vec<ExecutionSource<L::Fact>>,
     execution_source_ids: HashMap<(ExecutionTarget, Box<str>, Option<ExecutionArmContext>), usize>,
     execution_reaches: Vec<ExecutionReach>,
@@ -630,27 +835,11 @@ where
         usize,
     >,
     execution_visited: HashSet<DurableProcedureKey>,
-    sources_in: HashMap<DurableProcedureKey, Vec<ComposedSourceId>>,
-    sinks_in: HashMap<DurableProcedureKey, Vec<ValueFlowSinkId>>,
-    annotations: HashMap<DurableCallSiteKey, Vec<Annotation>>,
-    links: HashMap<DurableCallSiteKey, Vec<Link>>,
-    /// Whether every sanitizer placed so far is resolved.
-    sanitizers_resolved: bool,
-    procedures: HashMap<DurableProcedureKey, Option<Arc<ProcedureData>>>,
     /// Procedures in the order their flows were read.
     visited: Vec<DurableProcedureKey>,
-    interiors: HashMap<DurableProcedureKey, Option<Arc<InteriorIndex>>>,
-    location_interiors: HashMap<(DurableProcedureKey, CallerLocation), Reaching>,
-    /// Live handles of procedures an interior run has served.
-    handles: HashMap<DurableProcedureKey, ProcedureHandle>,
-    dispatches: HashMap<DurableCallSiteKey, Arc<DispatchAnswer>>,
-    /// The model each dispatched call returned with its dispatch.
-    dispatched_models: HashMap<DurableCallSiteKey, Option<Arc<CallModel<L::Function>>>>,
-    /// Models the search has used; a model's incompleteness is noted once,
-    /// at its first use.
-    models: HashMap<DurableCallSiteKey, Option<Arc<CallModel<L::Function>>>>,
-    callers: HashMap<DurableProcedureKey, Arc<[DurableCallSiteKey]>>,
-    parents: HashMap<DurableProcedureKey, Option<DurableProcedureKey>>,
+    /// Proven origins already read for component consumption. Reuse them for
+    /// modeled-writer checks instead of asking for a second storage binding.
+    modeled_reader_origin_count: usize,
     items: Vec<Item>,
     item_ids: HashMap<ItemKey, usize>,
     reaches: Vec<Reach>,
@@ -663,8 +852,6 @@ where
     registered_call_waiters: HashSet<(usize, Root)>,
     capture_waiters: HashMap<Root, Vec<CaptureWaiter>>,
     registered_capture_waiters: HashSet<(usize, Root)>,
-    store_writes: Vec<StoreWriteObservation>,
-    store_writes_in: HashMap<DurableProcedureKey, Vec<usize>>,
     store_waiters: HashMap<Root, Vec<StoreWaiter>>,
     registered_store_waiters: HashSet<(usize, Root)>,
     work: Vec<Work>,
@@ -698,104 +885,143 @@ where
     Provider: CompositionProvider,
     L: ComposeLabels<Fact = Provider::Fact, Function = Provider::Function>,
 {
+    let (search, stats, refused) = run_search(query, provider, budget, request, None)?;
+    Ok(finish_search(search, stats, refused).0)
+}
+
+pub(super) struct RetainedSearch<L: ComposeLabels> {
+    pub outcome: SearchOutcome<L>,
+    pub inputs: SearchInputs<L::Fact, L::Function>,
+}
+
+pub(super) fn search_pairs_retaining<'a, Provider, L>(
+    query: ComposeQuery<'a, L>,
+    provider: &'a Provider,
+    budget: CompositionBudget,
+    request: &mut SemanticRequest<'_>,
+    capture: &mut RetainedHeap,
+) -> Result<RetainedSearch<L>, ComposeError>
+where
+    Provider: CompositionProvider,
+    L: ComposeLabels<Fact = Provider::Fact, Function = Provider::Function>,
+{
+    let (search, stats, refused) = run_search(query, provider, budget, request, Some(capture))?;
+    let (outcome, inputs) = finish_search(search, stats, refused);
+    Ok(RetainedSearch { outcome, inputs })
+}
+
+fn run_search<'a, 'capture, Provider, L>(
+    query: ComposeQuery<'a, L>,
+    provider: &'a Provider,
+    budget: CompositionBudget,
+    request: &mut SemanticRequest<'_>,
+    capture: Option<&'capture mut RetainedHeap>,
+) -> Result<(Search<'a, 'capture, Provider, L>, SearchStats, bool), ComposeError>
+where
+    Provider: CompositionProvider,
+    L: ComposeLabels<Fact = Provider::Fact, Function = Provider::Function>,
+{
     let value_flow = query.value_flow;
     let sinks = query
         .sinks
         .iter()
         .map(|(sink, _)| *sink)
         .collect::<Vec<_>>();
-    let mut search = Search::new(query, provider, budget);
-    for anchor in search.object_roots.clone() {
-        search.add_item(
-            anchor.procedure.clone(),
-            Root::Object(Box::new(anchor.clone())),
-            Endpoint::Object(Box::new(anchor)),
-            LabelFunctionId::IDENTITY,
-            HopQuality::CERTAIN,
-            Derivation::Root,
-        );
-    }
-    for procedure in search.execution_roots.clone() {
-        search.add_item(
-            procedure.clone(),
-            Root::Execution(Box::new(procedure.clone())),
-            Endpoint::Execution(Box::new(ExecutionTarget::Procedure(Box::new(procedure)))),
-            LabelFunctionId::IDENTITY,
-            HopQuality::CERTAIN,
-            Derivation::Root,
-        );
-    }
-    // Every bound endpoint must carry proven and complete selector evidence,
-    // as the ICFG engine's plan requires of its endpoints, whether or not a
-    // path reaches them. The plan's sources are noted as `Search::new` adds
-    // them, and a source matched on the frontier as the search enters its
-    // procedure.
-    for sink in &sinks {
-        let spec = value_flow
-            .expect("a value sink has a value plan")
-            .sink(*sink)
-            .expect("a selected sink names a bound sink of the plan");
-        if !evidence_quality(spec.proof(), spec.completeness()).is_certain() {
-            search.note(Incompleteness::SinkEvidence {
-                cause: super::IncompleteCause::Operational(super::OperationalCause::Provider),
-                point: spec.point().clone(),
-            });
+    let mut search = Search::new(query, provider, budget, capture);
+    let acquisition = (|| -> Result<(), ComposeError> {
+        for anchor in search.inputs.object_roots.clone() {
+            search.add_item(
+                anchor.procedure.clone(),
+                Root::Object(Box::new(anchor.clone())),
+                Endpoint::Object(Box::new(anchor)),
+                LabelFunctionId::IDENTITY,
+                HopQuality::CERTAIN,
+                Derivation::Root,
+            );
         }
-    }
-    for sink in sinks {
-        let spec = value_flow
-            .expect("a value sink has a value plan")
-            .sink(sink)
-            .expect("a bound sink names a sink of its plan");
-        let procedure = spec.point().procedure().durable_key();
-        // The ICFG engine materializes a meeting on the edges that leave the
-        // sink's point. At a call's point those are the call's own edges, and
-        // their best quality is the call's continuation quality: a call with
-        // an entered body or a replacing model also has the caller's proven
-        // and complete continuation edge, which no call edge can improve on.
-        let quality = match invoked_call_at(spec.point()).map_err(provider_error)? {
-            Some(call) => {
-                search
-                    .dispatch(&(procedure.clone(), call), request)?
-                    .continuation
+        for procedure in search.inputs.execution_roots.clone() {
+            search.add_item(
+                procedure.clone(),
+                Root::Execution(Box::new(procedure.clone())),
+                Endpoint::Execution(Box::new(ExecutionTarget::Procedure(Box::new(procedure)))),
+                LabelFunctionId::IDENTITY,
+                HopQuality::CERTAIN,
+                Derivation::Root,
+            );
+        }
+        // Every bound endpoint must carry proven and complete selector evidence,
+        // as the ICFG engine's plan requires of its endpoints, whether or not a
+        // path reaches them. The plan's sources are noted as `Search::new` adds
+        // them, and a source matched on the frontier as the search enters its
+        // procedure.
+        for sink in &sinks {
+            let spec = value_flow
+                .expect("a value sink has a value plan")
+                .sink(*sink)
+                .expect("a selected sink names a bound sink of the plan");
+            if !evidence_quality(spec.proof(), spec.completeness()).is_certain() {
+                search.note(Incompleteness::SinkEvidence {
+                    cause: super::IncompleteCause::Operational(super::OperationalCause::Provider),
+                    point: spec.point().clone(),
+                });
             }
-            None => HopQuality::CERTAIN,
         }
-        .conjoin(evidence_quality(spec.proof(), spec.completeness()));
-        if spec
-            .point()
-            .procedure()
-            .semantics()
-            .lexical_parent()
-            .is_some()
-            && let Some(reaches) = &search.certified_procedure_reaches
-        {
-            let matching = reaches
+        for sink in sinks {
+            let spec = value_flow
+                .expect("a value sink has a value plan")
+                .sink(sink)
+                .expect("a bound sink names a sink of its plan");
+            let procedure = spec.point().procedure().durable_key();
+            // The ICFG engine materializes a meeting on the edges that leave the
+            // sink's point. At a call's point those are the call's own edges, and
+            // their best quality is the call's continuation quality: a call with
+            // an entered body or a replacing model also has the caller's proven
+            // and complete continuation edge, which no call edge can improve on.
+            let quality = match invoked_call_at(spec.point()).map_err(provider_error)? {
+                Some(call) => {
+                    search
+                        .dispatch(&(procedure.clone(), call), request)?
+                        .continuation
+                }
+                None => HopQuality::CERTAIN,
+            }
+            .conjoin(evidence_quality(spec.proof(), spec.completeness()));
+            if spec
+                .point()
+                .procedure()
+                .semantics()
+                .lexical_parent()
+                .is_some()
+                && let Some(reaches) = &search.certified_procedure_reaches
+            {
+                let matching = reaches
                 .iter()
                 .filter(|reach| {
                     matches!(&reach.target, ExecutionReachTarget::Procedure(target) if target.as_ref() == &procedure)
                 })
                 .cloned()
                 .collect::<Vec<_>>();
-            if matching.is_empty() {
-                search.note(Incompleteness::Execution {
-                    cause: super::IncompleteCause::Operational(super::OperationalCause::Provider),
-                    procedure: procedure.clone(),
-                    reason: "nested sink has no admitted invoked instance".into(),
-                });
-                search.add_item(
-                    procedure,
-                    Root::Sink(sink, None),
-                    Endpoint::Sink(sink),
-                    LabelFunctionId::IDENTITY,
-                    quality.conjoin(HopQuality::UNCERTAIN),
-                    Derivation::Root,
-                );
-            } else {
-                // One invoked returned instance does not certify other calls
-                // of the same factory. Keep an open seed for each unmatched
-                // creation prefix so its source path cannot disappear.
-                let unmatched_factory = matching.iter().any(|invoked| {
+                if matching.is_empty() {
+                    search.note(Incompleteness::Execution {
+                        cause: super::IncompleteCause::Operational(
+                            super::OperationalCause::Provider,
+                        ),
+                        procedure: procedure.clone(),
+                        reason: "nested sink has no admitted invoked instance".into(),
+                    });
+                    search.add_item(
+                        procedure,
+                        Root::Sink(sink, None),
+                        Endpoint::Sink(sink),
+                        LabelFunctionId::IDENTITY,
+                        quality.conjoin(HopQuality::UNCERTAIN),
+                        Derivation::Root,
+                    );
+                } else {
+                    // One invoked returned instance does not certify other calls
+                    // of the same factory. Keep an open seed for each unmatched
+                    // creation prefix so its source path cannot disappear.
+                    let unmatched_factory = matching.iter().any(|invoked| {
                     let Some(instance) = invoked
                         .certificate
                         .prefix
@@ -812,153 +1038,177 @@ where
                             })
                     })
                 });
-                if unmatched_factory {
-                    search.note(Incompleteness::Execution {
-                        cause: super::IncompleteCause::Operational(
-                            super::OperationalCause::Provider,
-                        ),
-                        procedure: procedure.clone(),
-                        reason: "factory has a creation prefix without this callable invocation"
-                            .into(),
-                    });
-                    search.add_item(
-                        procedure.clone(),
-                        Root::Sink(sink, None),
-                        Endpoint::Sink(sink),
-                        LabelFunctionId::IDENTITY,
-                        quality.conjoin(HopQuality::UNCERTAIN),
-                        Derivation::Root,
-                    );
-                }
-                for reach in matching {
-                    let certified = reach.certificate.prefix.last().is_some_and(|step| {
-                        step.target == ExecutionTarget::Procedure(Box::new(procedure.clone()))
-                            && step.instance.is_some()
-                    }) || (reach.certificate.root == procedure
-                        && reach.certificate.prefix.is_empty());
-                    if !certified {
+                    if unmatched_factory {
                         search.note(Incompleteness::Execution {
                             cause: super::IncompleteCause::Operational(
                                 super::OperationalCause::Provider,
                             ),
                             procedure: procedure.clone(),
-                            reason: "nested sink instance has no exact creation certificate".into(),
+                            reason:
+                                "factory has a creation prefix without this callable invocation"
+                                    .into(),
                         });
+                        search.add_item(
+                            procedure.clone(),
+                            Root::Sink(sink, None),
+                            Endpoint::Sink(sink),
+                            LabelFunctionId::IDENTITY,
+                            quality.conjoin(HopQuality::UNCERTAIN),
+                            Derivation::Root,
+                        );
                     }
-                    search.add_item(
-                        procedure.clone(),
-                        Root::Sink(sink, Some(reach.certificate)),
-                        Endpoint::Sink(sink),
-                        LabelFunctionId::IDENTITY,
-                        quality.conjoin(if certified {
-                            reach.quality
-                        } else {
-                            HopQuality::UNCERTAIN
-                        }),
-                        Derivation::Root,
-                    );
+                    for reach in matching {
+                        let certified = reach.certificate.prefix.last().is_some_and(|step| {
+                            step.target == ExecutionTarget::Procedure(Box::new(procedure.clone()))
+                                && step.instance.is_some()
+                        }) || (reach.certificate.root == procedure
+                            && reach.certificate.prefix.is_empty());
+                        if !certified {
+                            search.note(Incompleteness::Execution {
+                                cause: super::IncompleteCause::Operational(
+                                    super::OperationalCause::Provider,
+                                ),
+                                procedure: procedure.clone(),
+                                reason: "nested sink instance has no exact creation certificate"
+                                    .into(),
+                            });
+                        }
+                        search.add_item(
+                            procedure.clone(),
+                            Root::Sink(sink, Some(reach.certificate)),
+                            Endpoint::Sink(sink),
+                            LabelFunctionId::IDENTITY,
+                            quality.conjoin(if certified {
+                                reach.quality
+                            } else {
+                                HopQuality::UNCERTAIN
+                            }),
+                            Derivation::Root,
+                        );
+                    }
                 }
-            }
-        } else {
-            search.add_item(
-                procedure,
-                Root::Sink(sink, None),
-                Endpoint::Sink(sink),
-                LabelFunctionId::IDENTITY,
-                quality,
-                Derivation::Root,
-            );
-        }
-    }
-    let trace_search = std::env::var_os("BIFROST_TIMING").is_some();
-    let mut traced_items = 0usize;
-    let search_start = std::time::Instant::now();
-    while let Some(work) = search.work.pop() {
-        traced_items += 1;
-        if trace_search && (traced_items == 1 || traced_items.is_multiple_of(100)) {
-            eprintln!(
-                "[bifrost-timing] NOTE composition.search items={traced_items} queued={} retained={} elapsed={:?}",
-                search.work.len(),
-                search.items.len(),
-                search_start.elapsed()
-            );
-        }
-        if search.stopped {
-            break;
-        }
-        if request.cancellation.is_cancelled() {
-            search.note(Incompleteness::Cancelled);
-            break;
-        }
-        if request.stop_observed() {
-            search.note(Incompleteness::Budget(BudgetLane::Semantic));
-            break;
-        }
-        match work {
-            Work::Item(item) => search.process_item(item, request)?,
-            Work::Reach(reach) => search.process_reach(reach),
-        }
-        if request.cancellation.is_cancelled() {
-            search.note(Incompleteness::Cancelled);
-            break;
-        }
-        if request.stop_observed() {
-            search.note(Incompleteness::Budget(BudgetLane::Semantic));
-            break;
-        }
-        if trace_search && traced_items == 1 {
-            eprintln!(
-                "[bifrost-timing] NOTE composition.search first_item_done elapsed={:?}",
-                search_start.elapsed()
-            );
-        }
-    }
-    if trace_search {
-        eprintln!(
-            "[bifrost-timing] NOTE composition.search complete items={traced_items} limits={budget:?} elapsed={:?}",
-            search_start.elapsed()
-        );
-    }
-    if !request.stop_observed() {
-        for procedure in search.visited.clone() {
-            if let Openness::Open {
-                residual,
-                residual_causes,
-                cause,
-                blocked,
-                status,
-                reason,
-            } = provider
-                .openness(&procedure, request)
-                .map_err(provider_error)?
-            {
-                search.note(Incompleteness::Open {
+            } else {
+                search.add_item(
                     procedure,
+                    Root::Sink(sink, None),
+                    Endpoint::Sink(sink),
+                    LabelFunctionId::IDENTITY,
+                    quality,
+                    Derivation::Root,
+                );
+            }
+        }
+        let trace_search = std::env::var_os("BIFROST_TIMING").is_some();
+        let mut traced_items = 0usize;
+        let search_start = std::time::Instant::now();
+        while let Some(work) = search.work.pop() {
+            traced_items += 1;
+            if trace_search && (traced_items == 1 || traced_items.is_multiple_of(100)) {
+                eprintln!(
+                    "[bifrost-timing] NOTE composition.search items={traced_items} queued={} retained={} elapsed={:?}",
+                    search.work.len(),
+                    search.items.len(),
+                    search_start.elapsed()
+                );
+            }
+            if search.stopped {
+                break;
+            }
+            if request.cancellation.is_cancelled() {
+                search.note(Incompleteness::Cancelled);
+                break;
+            }
+            if request.stop_observed() {
+                search.note(Incompleteness::Budget(BudgetLane::Semantic));
+                break;
+            }
+            match work {
+                Work::Item(item) => search.process_item(item, request)?,
+                Work::Reach(reach) => search.process_reach(reach),
+            }
+            if request.cancellation.is_cancelled() {
+                search.note(Incompleteness::Cancelled);
+                break;
+            }
+            if request.stop_observed() {
+                search.note(Incompleteness::Budget(BudgetLane::Semantic));
+                break;
+            }
+            if trace_search && traced_items == 1 {
+                eprintln!(
+                    "[bifrost-timing] NOTE composition.search first_item_done elapsed={:?}",
+                    search_start.elapsed()
+                );
+            }
+        }
+        if trace_search {
+            eprintln!(
+                "[bifrost-timing] NOTE composition.search complete items={traced_items} limits={budget:?} elapsed={:?}",
+                search_start.elapsed()
+            );
+        }
+        if !request.stop_observed() {
+            for procedure in search.visited.clone() {
+                if let Openness::Open {
                     residual,
                     residual_causes,
+                    relation_cause,
                     cause,
                     blocked,
                     status,
                     reason,
-                });
+                } = provider
+                    .openness(&procedure, request)
+                    .map_err(|error| classified_provider_error(provider, error))?
+                {
+                    search.note(Incompleteness::Open {
+                        procedure,
+                        residual,
+                        residual_causes,
+                        relation_cause,
+                        cause,
+                        blocked,
+                        status,
+                        reason,
+                    });
+                }
             }
         }
-    }
-    // Refinement uses recorded derivations only. It cannot spend a fresh
-    // topology budget or discover another source, edge or procedure.
-    if !request.stop_observed() && provider.has_value_type_barriers() {
-        search.refine(request)?;
-    }
-    if trace_search {
-        eprintln!(
-            "[bifrost-timing] NOTE composition.search reasons={:?} limits={budget:?}",
-            search
-                .incomplete
-                .iter()
-                .map(|reason| (reason.cause(), reason))
-                .collect::<Vec<_>>()
-        );
-    }
+        // Refinement uses recorded derivations only. It cannot spend a fresh
+        // topology budget or discover another source, edge or procedure.
+        if !request.stop_observed() && provider.has_value_type_barriers() {
+            search.refine(request)?;
+        }
+        if trace_search {
+            eprintln!(
+                "[bifrost-timing] NOTE composition.search reasons={:?} limits={budget:?}",
+                search
+                    .incomplete
+                    .iter()
+                    .map(|reason| (reason.cause(), reason))
+                    .collect::<Vec<_>>()
+            );
+        }
+        Ok(())
+    })();
+    let refused = match acquisition {
+        Ok(()) => false,
+        Err(ComposeError::AcquisitionRefused(refusal)) => {
+            search.note(Incompleteness::ExecutionRoots {
+                reason: refusal.to_string().into_boxed_str(),
+                cause: super::IncompleteCause::Content,
+            });
+            true
+        }
+        Err(error) => {
+            // Adopted cache owners drop on this error path; terminal refusal
+            // prevents address reuse in another candidate's shared census.
+            if let Some(heap) = search.capture.as_deref_mut() {
+                heap.refuse();
+            }
+            return Err(error);
+        }
+    };
     let stats = SearchStats {
         recorded_supports: search.recorded_supports,
         recorded_edges: search.recorded_edges,
@@ -973,39 +1223,79 @@ where
             + search.execution_reaches.len()
             + search.object_reaches.len()
             + search.execution_procedure_reaches.len(),
-        dispatches: search.dispatches.len(),
-        callers: search.callers.values().map(|calls| calls.len()).sum(),
+        dispatches: search.inputs.dispatches.len(),
+        callers: search
+            .inputs
+            .callers
+            .values()
+            .map(|calls| calls.len())
+            .sum(),
     };
-    let pairs = search.pairs();
-    Ok(SearchOutcome {
-        effective_budget: budget,
+    Ok((search, stats, refused))
+}
+
+fn finish_search<Provider, L>(
+    mut search: Search<'_, '_, Provider, L>,
+    stats: SearchStats,
+    refused: bool,
+) -> (SearchOutcome<L>, SearchInputs<L::Fact, L::Function>)
+where
+    Provider: CompositionProvider,
+    L: ComposeLabels<Fact = Provider::Fact, Function = Provider::Function>,
+{
+    let pairs = if refused { Vec::new() } else { search.pairs() };
+    let mut outcome = SearchOutcome {
+        effective_budget: search.budget,
         object_reaches: search.object_reaches,
         execution_sources: search.execution_sources,
         execution_reaches: search.execution_reaches,
         execution_procedure_reaches: search.execution_procedure_reaches,
         pairs,
         strict_pairs: search.strict_pairs,
-        sources: search.sources,
+        sources: std::mem::take(&mut search.inputs.sources),
         functions: search.functions,
-        sanitizers_resolved: search.sanitizers_resolved,
+        sanitizers_resolved: search.inputs.sanitizers_resolved,
         incomplete: search.incomplete,
         abstained: search.abstained,
         stats,
         barrier_notes: search.barrier_notes,
-        call_models: search.dispatched_models,
-    })
+        call_models: std::mem::take(&mut search.inputs.dispatched_models),
+    };
+    if refused {
+        outcome.object_reaches.clear();
+        outcome.execution_reaches.clear();
+        outcome.execution_procedure_reaches.clear();
+        outcome.strict_pairs.clear();
+        outcome.sanitizers_resolved = false;
+    }
+    (outcome, search.inputs)
+}
+
+fn classified_provider_error<P: CompositionProvider>(
+    provider: &P,
+    error: P::Error,
+) -> ComposeError {
+    match provider.acquisition_refusal(&error) {
+        Some(refusal) => ComposeError::AcquisitionRefused(refusal),
+        None => provider_error(error),
+    }
 }
 
 pub(super) fn provider_error(error: impl std::fmt::Display) -> ComposeError {
     ComposeError::Provider(error.to_string().into_boxed_str())
 }
 
-impl<'a, Provider, L> Search<'a, Provider, L>
+impl<'a, 'capture, Provider, L> Search<'a, 'capture, Provider, L>
 where
     Provider: CompositionProvider,
     L: ComposeLabels<Fact = Provider::Fact, Function = Provider::Function>,
 {
-    fn new(query: ComposeQuery<'a, L>, provider: &'a Provider, budget: CompositionBudget) -> Self {
+    fn new(
+        query: ComposeQuery<'a, L>,
+        provider: &'a Provider,
+        budget: CompositionBudget,
+        capture: Option<&'capture mut RetainedHeap>,
+    ) -> Self {
         let ComposeQuery {
             execution_roots,
             object_roots,
@@ -1017,6 +1307,7 @@ where
             sanitizers,
             transforms,
         } = query;
+        let endpoint_projections = super::endpoint_projections_enabled(value_flow, provider);
         let store_writes = provider.store_writes();
         let mut store_writes_in: HashMap<DurableProcedureKey, Vec<usize>> = HashMap::default();
         for (index, write) in store_writes.iter().enumerate() {
@@ -1037,16 +1328,37 @@ where
                 .push(*sink);
         }
         let mut search = Self {
-            execution_roots,
-            object_roots,
+            capture,
+            inputs: SearchInputs {
+                execution_roots,
+                object_roots,
+                endpoint_projections,
+                accepted: sinks.into_iter().collect(),
+                sources: Vec::new(),
+                sources_in: HashMap::default(),
+                sinks_in,
+                annotations: HashMap::default(),
+                links: HashMap::default(),
+                sanitizers_resolved: true,
+                procedures: HashMap::default(),
+                interiors: HashMap::default(),
+                location_interiors: HashMap::default(),
+                modeled_reader_origins: HashMap::default(),
+                handles: HashMap::default(),
+                dispatches: HashMap::default(),
+                dispatched_models: HashMap::default(),
+                models: HashMap::default(),
+                callers: HashMap::default(),
+                parents: HashMap::default(),
+                store_writes,
+                store_writes_in,
+            },
             object_reaches: Vec::new(),
             certified_procedure_reaches,
             value_flow,
-            accepted: sinks.into_iter().collect(),
             provider,
             budget,
             functions: LabelFunctions::new(labels),
-            sources: Vec::new(),
             execution_sources: Vec::new(),
             execution_source_ids: HashMap::default(),
             execution_reaches: Vec::new(),
@@ -1054,21 +1366,8 @@ where
             execution_procedure_reach_ids: HashMap::default(),
             execution_reach_ids: HashMap::default(),
             execution_visited: HashSet::default(),
-            sources_in: HashMap::default(),
-            sinks_in,
-            annotations: HashMap::default(),
-            links: HashMap::default(),
-            sanitizers_resolved: true,
-            procedures: HashMap::default(),
             visited: Vec::new(),
-            interiors: HashMap::default(),
-            location_interiors: HashMap::default(),
-            handles: HashMap::default(),
-            dispatches: HashMap::default(),
-            dispatched_models: HashMap::default(),
-            models: HashMap::default(),
-            callers: HashMap::default(),
-            parents: HashMap::default(),
+            modeled_reader_origin_count: 0,
             items: Vec::new(),
             item_ids: HashMap::default(),
             reaches: Vec::new(),
@@ -1080,8 +1379,6 @@ where
             registered_call_waiters: HashSet::default(),
             capture_waiters: HashMap::default(),
             registered_capture_waiters: HashSet::default(),
-            store_writes,
-            store_writes_in,
             store_waiters: HashMap::default(),
             registered_store_waiters: HashSet::default(),
             work: Vec::new(),
@@ -1123,13 +1420,14 @@ where
             });
         }
         let id = ComposedSourceId(
-            u32::try_from(self.sources.len()).expect("a composition's sources fit u32"),
+            u32::try_from(self.inputs.sources.len()).expect("a composition's sources fit u32"),
         );
-        self.sources_in
+        self.inputs
+            .sources_in
             .entry(source.point.procedure().durable_key())
             .or_default()
             .push(id);
-        self.sources.push(source);
+        self.inputs.sources.push(source);
     }
 
     /// Ask the provider for the endpoints of a procedure the search enters
@@ -1140,18 +1438,48 @@ where
         &mut self,
         procedure: &DurableProcedureKey,
         request: &mut SemanticRequest<'_>,
-    ) -> Result<(), ComposeError> {
-        let endpoints = self
+    ) -> Result<Option<ProcedureEndpointInputs<L::Function>>, ComposeError> {
+        let answer = self
             .provider
-            .endpoints(procedure, request)
-            .map_err(provider_error)?;
-        if let Completeness::Incomplete { reason, cause } = endpoints.completeness {
-            self.note(Incompleteness::Endpoints {
-                cause,
-                procedure: procedure.clone(),
-                reason,
-            });
+            .endpoints_with_causes(procedure, request)
+            .map_err(|error| classified_provider_error(self.provider, error))?;
+        let mut endpoints = answer.endpoints;
+        // Keep the actual consulted inventory, not only its projected primary cause.
+        let causes = answer.causes;
+        let completeness = self.capture.as_deref_mut().and_then(|heap| {
+            heap.vec(&causes);
+            capture_completeness(heap, &endpoints.completeness)
+        });
+        if !causes.is_empty() || !endpoints.completeness.is_complete() {
+            let aggregate_cause = match &endpoints.completeness {
+                Completeness::Incomplete { cause, .. } => Some(*cause),
+                Completeness::Complete => None,
+            };
+            let operational = causes
+                .iter()
+                .chain(aggregate_cause.iter())
+                .any(|cause| matches!(cause, super::IncompleteCause::Operational(_)));
+            let reason =
+                match std::mem::replace(&mut endpoints.completeness, Completeness::Complete) {
+                    Completeness::Incomplete { reason, .. } => reason,
+                    Completeness::Complete => {
+                        "the policy endpoints of this procedure may be incomplete".into()
+                    }
+                };
+            for (index, cause) in causes.iter().copied().chain(aggregate_cause).enumerate() {
+                if (operational && cause == super::IncompleteCause::Content)
+                    || causes[..index.min(causes.len())].contains(&cause)
+                {
+                    continue;
+                }
+                self.note(Incompleteness::Endpoints {
+                    cause,
+                    procedure: procedure.clone(),
+                    reason: reason.clone(),
+                });
+            }
         }
+        let first_source = self.inputs.sources.len();
         for source in endpoints.sources {
             assert_eq!(
                 &source.point.procedure().durable_key(),
@@ -1160,13 +1488,19 @@ where
             );
             self.add_source(source);
         }
-        for sanitizer in endpoints.sanitizers {
-            self.place_sanitizer(&sanitizer);
+        for sanitizer in &endpoints.sanitizers {
+            self.place_sanitizer(sanitizer);
         }
-        for transform in endpoints.transforms {
-            self.place_link(&transform);
+        for transform in &endpoints.transforms {
+            self.place_link(transform);
         }
-        Ok(())
+        Ok(completeness.map(|completeness| ProcedureEndpointInputs {
+            sources: first_source..self.inputs.sources.len(),
+            sanitizers: endpoints.sanitizers,
+            transforms: endpoints.transforms,
+            completeness,
+            causes,
+        }))
     }
 
     fn note(&mut self, reason: Incompleteness) {
@@ -1197,7 +1531,7 @@ where
     /// carrier it binds. A sanitizer that is not resolved leaves the run
     /// incomplete.
     fn place_sanitizer(&mut self, sanitizer: &BoundSanitizer<L::Function>) {
-        self.sanitizers_resolved &= sanitizer.resolved;
+        self.inputs.sanitizers_resolved &= sanitizer.resolved;
         let function = if sanitizer.proven {
             self.functions.intern(sanitizer.function.clone())
         } else {
@@ -1236,7 +1570,8 @@ where
         let mut links = 0;
         for (call, Annotation { input, output, hop }) in placed {
             if let (Some(input), Some(output)) = (input, output) {
-                self.links
+                self.inputs
+                    .links
                     .entry(call)
                     .or_default()
                     .push(Link { input, output, hop });
@@ -1265,7 +1600,11 @@ where
             return;
         }
         for (call, annotation) in placed {
-            self.annotations.entry(call).or_default().push(annotation);
+            self.inputs
+                .annotations
+                .entry(call)
+                .or_default()
+                .push(annotation);
         }
     }
 
@@ -1280,7 +1619,8 @@ where
         let Endpoint::Port(output) = output else {
             return Vec::new();
         };
-        self.annotations
+        self.inputs
+            .annotations
             .get(call)
             .into_iter()
             .flatten()
@@ -1322,7 +1662,8 @@ where
             let Some(input) = call_input_port(call, value.id()) else {
                 continue;
             };
-            let Some(annotations) = self.annotations.get(&(procedure.clone(), call.id)) else {
+            let Some(annotations) = self.inputs.annotations.get(&(procedure.clone(), call.id))
+            else {
                 continue;
             };
             placed.extend(
@@ -1399,6 +1740,7 @@ where
             + self.reaches.len()
             + self.execution_reaches.len()
             + self.execution_procedure_reaches.len()
+            + self.modeled_reader_origin_count
             >= self.budget.max_hops
         {
             self.exhaust(BudgetLane::Hops);
@@ -1470,7 +1812,9 @@ where
             }
             return;
         }
-        if self.items.len() + self.reaches.len() >= self.budget.max_hops {
+        if self.items.len() + self.reaches.len() + self.modeled_reader_origin_count
+            >= self.budget.max_hops
+        {
             self.exhaust(BudgetLane::Hops);
             self.stopped = true;
             return;
@@ -1506,19 +1850,19 @@ where
         &mut self,
         procedure: &DurableProcedureKey,
         request: &mut SemanticRequest<'_>,
-    ) -> Result<Option<Arc<ProcedureData>>, ComposeError> {
-        if let Some(data) = self.procedures.get(procedure) {
+    ) -> Result<Option<Arc<ProcedureData<L::Function>>>, ComposeError> {
+        if let Some(data) = self.inputs.procedures.get(procedure) {
             return Ok(data.clone());
         }
         if self.visited.len() >= self.budget.max_procedures {
             self.exhaust(BudgetLane::Procedures);
-            self.procedures.insert(procedure.clone(), None);
+            self.inputs.procedures.insert(procedure.clone(), None);
             return Ok(None);
         }
         let projections = self
             .provider
             .projected_partial_flows(procedure, request)
-            .map_err(provider_error)?;
+            .map_err(|error| classified_provider_error(self.provider, error))?;
         assert!(
             !projections.is_empty(),
             "a procedure has at least one label partition"
@@ -1526,9 +1870,13 @@ where
         let flows = self
             .provider
             .partial_flows(procedure, request)
-            .map_err(provider_error)?;
+            .map_err(|error| classified_provider_error(self.provider, error))?;
         let mut into: HashMap<PartialFlowPort, Vec<Inflow<PartialFlowPort>>> = HashMap::default();
-        for (function, projection) in projections {
+        let mut captured = self
+            .capture
+            .as_deref_mut()
+            .and_then(|heap| capture_slots::<ProjectedProcedureInput>(heap, projections.len(), 0));
+        for (ordinal, (function, projection)) in projections.into_iter().enumerate() {
             if projection.outcome != PartialFlowOutcome::Complete {
                 self.note(Incompleteness::PartialFlows {
                     procedure: procedure.clone(),
@@ -1559,6 +1907,12 @@ where
             let function = function.map_or(LabelFunctionId::IDENTITY, |function| {
                 self.functions.intern(function)
             });
+            if let Some((slots, _)) = &mut captured {
+                slots[ordinal] = Some(ProjectedProcedureInput {
+                    function,
+                    flows: Arc::clone(&projection),
+                });
+            }
             for flow in &projection.flows {
                 into.entry(projection.ports[flow.to.index()].clone())
                     .or_default()
@@ -1570,11 +1924,28 @@ where
                     });
             }
         }
-        let data = Arc::new(ProcedureData { flows, into });
+        let projections = captured.and_then(|(slots, bytes)| {
+            finish_capture(
+                self.capture.as_deref_mut().expect("capture has funding"),
+                slots,
+                bytes,
+            )
+        });
+        let data = Arc::new(ProcedureData {
+            flows,
+            into,
+            projections,
+            endpoints: OnceLock::new(),
+        });
         self.visited.push(procedure.clone());
-        self.procedures
+        self.inputs
+            .procedures
             .insert(procedure.clone(), Some(Arc::clone(&data)));
-        self.enter(procedure, request)?;
+        if let Some(endpoints) = self.enter(procedure, request)? {
+            data.endpoints
+                .set(endpoints)
+                .expect("procedure endpoints are entered once");
+        }
         Ok(Some(data))
     }
 
@@ -1583,14 +1954,15 @@ where
         call: &DurableCallSiteKey,
         request: &mut SemanticRequest<'_>,
     ) -> Result<Arc<DispatchAnswer>, ComposeError> {
-        if let Some(answer) = self.dispatches.get(call) {
+        if let Some(answer) = self.inputs.dispatches.get(call) {
             return Ok(Arc::clone(answer));
         }
         let (dispatch, model) = self
             .provider
             .dispatch(call, request)
-            .map_err(provider_error)?;
-        self.dispatched_models
+            .map_err(|error| classified_provider_error(self.provider, error))?;
+        self.inputs
+            .dispatched_models
             .insert(call.clone(), model.map(Arc::new));
         let (incomplete_cause, incomplete_reason) = match dispatch.completeness {
             Completeness::Complete => (None, None),
@@ -1605,7 +1977,9 @@ where
             external_body_unavailable: dispatch.external_body_unavailable,
             continuation: dispatch.continuation,
         });
-        self.dispatches.insert(call.clone(), Arc::clone(&answer));
+        self.inputs
+            .dispatches
+            .insert(call.clone(), Arc::clone(&answer));
         Ok(answer)
     }
 
@@ -1682,17 +2056,10 @@ where
         call: &DurableCallSiteKey,
         request: &mut SemanticRequest<'_>,
     ) -> Result<Option<Arc<CallModel<L::Function>>>, ComposeError> {
-        if let Some(model) = self.models.get(call) {
+        if let Some(model) = self.inputs.models.get(call) {
             return Ok(model.clone());
         }
-        if !self.dispatched_models.contains_key(call) {
-            self.dispatch(call, request)?;
-        }
-        let model = self
-            .dispatched_models
-            .get(call)
-            .expect("dispatch records the call's model")
-            .clone();
+        let model = self.model_for_discovery(call, request)?;
         if let Some(model) = &model
             && model.retains_dispatch
         {
@@ -1718,35 +2085,74 @@ where
                 reason: reason.clone(),
             });
         }
-        self.models.insert(call.clone(), model.clone());
+        self.inputs.models.insert(call.clone(), model.clone());
         Ok(model)
+    }
+
+    /// Inspect candidate component producers without consuming their quality.
+    /// The same cached dispatch supplies `model` when a discovered frontier
+    /// actually contributes; only that use records model incompleteness.
+    fn model_for_discovery(
+        &mut self,
+        call: &DurableCallSiteKey,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<Option<Arc<CallModel<L::Function>>>, ComposeError> {
+        self.dispatch(call, request)?;
+        Ok(self
+            .inputs
+            .dispatched_models
+            .get(call)
+            .expect("dispatch records the call's model")
+            .clone())
     }
 
     fn callers(
         &mut self,
         procedure: &DurableProcedureKey,
         request: &mut SemanticRequest<'_>,
-    ) -> Result<Arc<[DurableCallSiteKey]>, ComposeError> {
-        if let Some(callers) = self.callers.get(procedure) {
+    ) -> Result<Arc<CallerInput>, ComposeError> {
+        if let Some(callers) = self.inputs.callers.get(procedure) {
             return Ok(Arc::clone(callers));
         }
         let mut answer = self
             .provider
             .callers(procedure, request)
-            .map_err(provider_error)?;
-        if let Completeness::Incomplete { reason, cause } = answer.completeness {
+            .map_err(|error| classified_provider_error(self.provider, error))?;
+        let completeness = self
+            .capture
+            .as_deref_mut()
+            .and_then(|heap| capture_completeness(heap, &answer.completeness));
+        if let Completeness::Incomplete { reason, cause } =
+            std::mem::replace(&mut answer.completeness, Completeness::Complete)
+        {
             self.note(Incompleteness::Callers {
                 cause,
                 procedure: procedure.clone(),
                 reason,
             });
         }
-        if answer.calls.len() > self.budget.max_callers_per_procedure {
-            answer.calls.truncate(self.budget.max_callers_per_procedure);
+        let clipped = answer.calls.len() > self.budget.max_callers_per_procedure;
+        let retained_len = answer
+            .calls
+            .len()
+            .min(self.budget.max_callers_per_procedure);
+        if clipped {
+            if self.capture.is_none() {
+                answer.calls.truncate(retained_len);
+            }
             self.exhaust(BudgetLane::CallersPerProcedure);
         }
-        let callers: Arc<[DurableCallSiteKey]> = answer.calls.into();
-        self.callers.insert(procedure.clone(), Arc::clone(&callers));
+        if let Some(completeness) = completeness {
+            answer.completeness = completeness;
+        }
+        let callers = Arc::new(CallerInput {
+            answer,
+            retained_len,
+            clipped,
+        });
+        self.inputs
+            .callers
+            .insert(procedure.clone(), Arc::clone(&callers));
         Ok(callers)
     }
 
@@ -1755,14 +2161,15 @@ where
     fn interior_seeds(
         &self,
         procedure: &DurableProcedureKey,
-        data: &ProcedureData,
+        data: &ProcedureData<L::Function>,
         with_ports: bool,
     ) -> (Vec<InteriorSeed>, Vec<Endpoint>) {
         let mut seeds = Vec::new();
         let mut ends = Vec::new();
-        for &id in self.sources_in.get(procedure).into_iter().flatten() {
-            let source = &self.sources[id.index()];
+        for &id in self.inputs.sources_in.get(procedure).into_iter().flatten() {
+            let source = &self.inputs.sources[id.index()];
             seeds.push(InteriorSeed::Source {
+                selected_entry: source.selected_entry.clone(),
                 point: source.point.id(),
                 phase: source.phase,
                 carrier: source.carrier.clone(),
@@ -1784,23 +2191,24 @@ where
     fn writeback_seeds(
         &mut self,
         handle: &ProcedureHandle,
-        data: &ProcedureData,
+        data: &ProcedureData<L::Function>,
         seeds: &mut Vec<InteriorSeed>,
         ends: &mut Vec<Endpoint>,
         request: &mut SemanticRequest<'_>,
     ) -> Result<(), ComposeError> {
+        let endpoint_projections = self.inputs.endpoint_projections;
         let caller = handle.durable_key();
         for call in handle.semantics().call_sites() {
             if !self
                 .provider
                 .may_share_call_storage(handle, call.id, request)
-                .map_err(provider_error)?
+                .map_err(|error| classified_provider_error(self.provider, error))?
             {
                 continue;
             }
             let call_key = (caller.clone(), call.id);
             let dispatch = self.dispatch_noted(&call_key, request)?;
-            if let Some(model) = self.model(&call_key, request)? {
+            if let Some(model) = self.model_for_discovery(&call_key, request)? {
                 for binding in model.writeback.iter() {
                     let whole_storage = PartialFlowPort::Heap {
                         root: Box::new(binding.actual.clone()),
@@ -1809,6 +2217,9 @@ where
                     };
                     for heap in std::iter::once(&whole_storage).chain(data.flows.ports.iter().filter(|port| {
                         matches!(port, PartialFlowPort::Heap { root, .. } if root.as_ref() == &binding.actual)
+                    })).chain(model.transfers.iter().filter_map(|transfer| {
+                        (endpoint_projections && model.endpoint_projections && matches!(&transfer.output, PartialFlowPort::Heap { root, .. }
+                            if root.as_ref() == &binding.actual)).then_some(&transfer.output)
                     })) {
                         let PartialFlowPort::Heap { selectors, tail, .. } = heap else { unreachable!() };
                         match heap_sharing(binding, selectors, *tail) {
@@ -1927,30 +2338,82 @@ where
     fn run_interior(
         &mut self,
         procedure: &DurableProcedureKey,
-        seeds: &[InteriorSeed],
-        observations: &[InteriorObservation],
+        seeds: Vec<InteriorSeed>,
+        observations: InteriorObservations,
         request: &mut SemanticRequest<'_>,
-    ) -> Result<Vec<(LabelFunctionId, super::provider::InteriorFlow)>, ComposeError> {
+    ) -> Result<InteriorRun, ComposeError> {
         let projections = self
             .provider
-            .projected_interior_flows(procedure, seeds, observations, false, request)
-            .map_err(provider_error)?;
+            .projected_interior_flows(procedure, &seeds, observations.as_slice(), false, request)
+            .map_err(|error| classified_provider_error(self.provider, error))?;
+        let mut captured = self.capture.as_deref_mut().and_then(|heap| {
+            let nested = projections.iter().fold(0usize, |bytes, (_, flows)| {
+                bytes.saturating_add(interior_clone_bytes(flows))
+            });
+            capture_slots::<InteriorPartitionInput>(heap, projections.len(), nested)
+        });
         let mut answer = Vec::new();
-        for (function, flows) in projections {
-            if let Completeness::Incomplete { reason, cause } = flows.completeness {
+        for (ordinal, (function, mut flows)) in projections.into_iter().enumerate() {
+            let original = if let Some((_, remaining)) = captured.as_mut()
+                && !self
+                    .capture
+                    .as_deref()
+                    .expect("capture funding")
+                    .is_refused()
+            {
+                let original = flows.clone();
+                adopt_interior_clone(
+                    &original,
+                    self.capture.as_deref_mut().expect("capture funding"),
+                    remaining,
+                );
+                Some(original)
+            } else {
+                None
+            };
+            if let Completeness::Incomplete { reason, cause } =
+                std::mem::replace(&mut flows.completeness, Completeness::Complete)
+            {
                 self.note(Incompleteness::Interior {
                     cause,
                     procedure: procedure.clone(),
                     reason,
                 });
             }
-            self.handles.insert(procedure.clone(), flows.procedure);
+            self.inputs
+                .handles
+                .entry(procedure.clone())
+                .and_modify(|input| input.procedure = flows.procedure.clone())
+                .or_insert(ProcedureHandleInput {
+                    procedure: flows.procedure,
+                    acquisition: None,
+                });
             let function = function.map_or(LabelFunctionId::IDENTITY, |function| {
                 self.functions.intern(function)
             });
+            if let Some(original) = original {
+                captured.as_mut().expect("funded partitions").0[ordinal] =
+                    Some(InteriorPartitionInput {
+                        function,
+                        flows: original,
+                    });
+            }
             answer.extend(flows.flows.into_iter().map(|flow| (function, flow)));
         }
-        Ok(answer)
+        let input = captured.and_then(|(slots, bytes)| {
+            finish_capture(
+                self.capture.as_deref_mut().expect("capture has funding"),
+                slots,
+                bytes,
+            )
+            .map(|partitions| InteriorInput {
+                seeds,
+                seed_ends: Vec::new(),
+                observations,
+                partitions,
+            })
+        });
+        Ok((answer, input))
     }
 
     /// The interior flows of one procedure, run once with its sources and,
@@ -1959,20 +2422,27 @@ where
     fn interior(
         &mut self,
         procedure: &DurableProcedureKey,
-        data: &ProcedureData,
+        data: &ProcedureData<L::Function>,
         request: &mut SemanticRequest<'_>,
     ) -> Result<Option<Arc<InteriorIndex>>, ComposeError> {
-        if let Some(interior) = self.interiors.get(procedure) {
+        if let Some(interior) = self.inputs.interiors.get(procedure) {
             return Ok(interior.clone());
         }
-        let sinks = self.sinks_in.get(procedure).cloned().unwrap_or_default();
+        let sinks = self
+            .inputs
+            .sinks_in
+            .get(procedure)
+            .cloned()
+            .unwrap_or_default();
         let writes = self
+            .inputs
             .store_writes_in
             .get(procedure)
             .cloned()
             .unwrap_or_default();
-        if sinks.is_empty() && writes.is_empty() && !self.sources_in.contains_key(procedure) {
-            self.interiors.insert(procedure.clone(), None);
+        if sinks.is_empty() && writes.is_empty() && !self.inputs.sources_in.contains_key(procedure)
+        {
+            self.inputs.interiors.insert(procedure.clone(), None);
             return Ok(None);
         }
         let (mut seeds, mut seed_ends) =
@@ -1992,7 +2462,7 @@ where
             })
             .collect::<Vec<_>>();
         observations.extend(writes.iter().map(|&write| {
-            let write = &self.store_writes[write];
+            let write = &self.inputs.store_writes[write];
             InteriorObservation::Sink {
                 point: write.point,
                 phase: write.phase,
@@ -2008,12 +2478,21 @@ where
                     .procedure()
                     .clone()
             } else {
-                self.store_writes[writes[0]].owner.clone()
+                self.inputs.store_writes[writes[0]].owner.clone()
             };
             self.writeback_seeds(&handle, data, &mut seeds, &mut seed_ends, request)?;
         }
-        let mut index = InteriorIndex::default();
-        for (function, flow) in self.run_interior(procedure, &seeds, &observations, request)? {
+        let (flows, input) = self.run_interior(
+            procedure,
+            seeds,
+            InteriorObservations::Many(observations),
+            request,
+        )?;
+        let mut index = InteriorIndex {
+            input,
+            into: HashMap::default(),
+        };
+        for (function, flow) in flows {
             let seed = seed_ends[flow.seed].clone();
             let target = match flow.target {
                 InteriorTarget::Observation(observation) if observation < sinks.len() => {
@@ -2033,8 +2512,12 @@ where
                 crossed: flow.crossed,
             });
         }
+        if let Some(input) = &mut index.input {
+            input.seed_ends = seed_ends;
+        }
         let index = Arc::new(index);
-        self.interiors
+        self.inputs
+            .interiors
             .insert(procedure.clone(), Some(Arc::clone(&index)));
         Ok(Some(index))
     }
@@ -2046,23 +2529,209 @@ where
     fn location_interior(
         &mut self,
         procedure: &DurableProcedureKey,
-        data: &ProcedureData,
+        data: &ProcedureData<L::Function>,
         location: &CallerLocation,
         request: &mut SemanticRequest<'_>,
     ) -> Result<Reaching, ComposeError> {
         let key = (procedure.clone(), location.clone());
-        if let Some(reaching) = self.location_interiors.get(&key) {
-            return Ok(Arc::clone(reaching));
+        if let Some(reaching) = self.inputs.location_interiors.get(&key) {
+            return Ok(Arc::clone(
+                reaching.reaching.as_ref().expect("live search index"),
+            ));
         }
         let (mut seeds, mut seed_ends) = self.interior_seeds(procedure, data, true);
-        if !self.handles.contains_key(procedure) {
-            self.run_interior(procedure, &[], &[], request)?;
+        if !self.inputs.handles.contains_key(procedure) {
+            let (_, acquisition) =
+                self.run_interior(procedure, Vec::new(), InteriorObservations::Empty, request)?;
+            if let Some(handle) = self.inputs.handles.get_mut(procedure) {
+                handle.acquisition = acquisition;
+            }
         }
-        let handle = self.handles[procedure].clone();
+        let Some(handle) = self
+            .inputs
+            .handles
+            .get(procedure)
+            .map(|input| input.procedure.clone())
+        else {
+            self.note(Incompleteness::Interior {
+                cause: super::IncompleteCause::Content,
+                procedure: procedure.clone(),
+                reason: "component observation has no live procedure handle".into(),
+            });
+            return Ok(Arc::from([]));
+        };
+        if self.inputs.endpoint_projections {
+            // Retain explicit component productions and demanded whole-return
+            // frontiers. A frontier reaches the model before any component flow
+            // can be established; it never asserts positional identity.
+            for row in handle.semantics().call_sites() {
+                let call = (procedure.clone(), row.id);
+                let model = self.model_for_discovery(&call, request)?;
+                if model.as_ref().is_none_or(|model| model.retains_dispatch) {
+                    let dispatch = self.dispatch(&call, request)?;
+                    for candidate in &dispatch.candidates {
+                        let Some(callee) = self.procedure(&candidate.procedure, request)? else {
+                            continue;
+                        };
+                        for port in &callee.flows.ports {
+                            let PartialFlowPort::Heap {
+                                root,
+                                selectors,
+                                tail,
+                            } = port
+                            else {
+                                continue;
+                            };
+                            if !matches!(root.as_ref(), PartialFlowPort::NormalReturn) {
+                                continue;
+                            }
+                            for (formal, actual) in &candidate.returns {
+                                if formal != root.as_ref()
+                                    || !matches!(actual, PartialFlowPort::CallResult { .. })
+                                {
+                                    continue;
+                                }
+                                let output = PartialFlowPort::Heap {
+                                    root: Box::new(actual.clone()),
+                                    selectors: selectors.clone(),
+                                    tail: *tail,
+                                };
+                                let endpoint = Endpoint::Port(output.clone());
+                                // This is a search frontier, not a taint fact. The
+                                // return pairing and callee flow still have to prove it.
+                                if !seed_ends.contains(&endpoint)
+                                    && let Some(seed) =
+                                        crate::composition::projected_return_seed(&handle, &output)
+                                {
+                                    seeds.push(seed);
+                                    seed_ends.push(endpoint);
+                                }
+                            }
+                        }
+                    }
+                }
+                let Some(model) = model else {
+                    continue;
+                };
+                if !location.selectors.is_empty() {
+                    // A whole-return frontier is not evidence that the returned
+                    // aggregate is tainted. Letting it cover a child read before
+                    // visiting the model would bypass the preservation check.
+                    let is_return = |endpoint: &Endpoint| match endpoint {
+                        Endpoint::Port(PartialFlowPort::CallResult { call, .. }) => *call == row.id,
+                        Endpoint::Port(PartialFlowPort::Heap { root, .. }) => {
+                            matches!(root.as_ref(), PartialFlowPort::CallResult { call, .. } if *call == row.id)
+                        }
+                        _ => false,
+                    };
+                    let mut index = 0;
+                    seeds.retain(|_| {
+                        let retain = !is_return(&seed_ends[index]);
+                        index += 1;
+                        retain
+                    });
+                    seed_ends.retain(|endpoint| !is_return(endpoint));
+                }
+                let outputs = if !location.selectors.is_empty() {
+                    // Native field reads may have already selected a prefix of a
+                    // returned aggregate before the final modeled read. Extend
+                    // only structured ports of this procedure; the interior run
+                    // must still prove the connection to this observation.
+                    let mut outputs = Vec::new();
+                    for root in row
+                        .result
+                        .into_iter()
+                        .map(|_| PartialFlowPort::CallResult {
+                            call: row.id,
+                            ordinal: None,
+                        })
+                        .chain(row.normal_results.iter().enumerate().map(|(ordinal, _)| {
+                            PartialFlowPort::CallResult {
+                                call: row.id,
+                                ordinal: Some(
+                                    u32::try_from(ordinal).expect("result count fits u32"),
+                                ),
+                            }
+                        }))
+                    {
+                        let mut prefixes = vec![&[][..]];
+                        for (index, port) in data.flows.ports.iter().enumerate() {
+                            let PartialFlowPort::Heap {
+                                root: native_root,
+                                selectors,
+                                tail,
+                            } = port
+                            else {
+                                continue;
+                            };
+                            if native_root.as_ref() != &root || selectors.is_empty() {
+                                continue;
+                            }
+                            let exact = *tail == AccessPathTail::Exact
+                                && !selectors
+                                    .iter()
+                                    .any(|selector| matches!(selector, HeapSelector::AnyIndex))
+                                && data.flows.relations_proven()
+                                && !data.flows.flows.iter().any(|flow| {
+                                    flow.uncertain
+                                        && (flow.from.index() == index || flow.to.index() == index)
+                                });
+                            if !exact {
+                                self.note(Incompleteness::Model {
+                                    cause: super::IncompleteCause::Content,
+                                    call: (procedure.clone(), row.id),
+                                    reason: "a native modeled-return frontier is not proven exact"
+                                        .into(),
+                                });
+                                continue;
+                            }
+                            // A renamed local copy can connect this exact native
+                            // path directly, independently of the consumer's name.
+                            if !outputs.contains(port) {
+                                outputs.push(port.clone());
+                            }
+                            prefixes.push(selectors.as_ref());
+                        }
+                        for prefix in prefixes {
+                            let mut selectors = prefix.to_vec();
+                            selectors.extend_from_slice(&location.selectors);
+                            let output = PartialFlowPort::Heap {
+                                root: Box::new(root.clone()),
+                                selectors: selectors.into_boxed_slice(),
+                                tail: location.tail,
+                            };
+                            if !outputs.contains(&output) {
+                                outputs.push(output);
+                            }
+                        }
+                    }
+                    outputs
+                } else if model.endpoint_projections {
+                    model
+                        .transfers
+                        .iter()
+                        .map(|transfer| transfer.output.clone())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                for output in outputs {
+                    let endpoint = Endpoint::Port(output.clone());
+                    if !seed_ends.contains(&endpoint)
+                        && let Some(seed) =
+                            crate::composition::projected_return_seed(&handle, &output)
+                    {
+                        seeds.push(seed);
+                        seed_ends.push(endpoint);
+                    }
+                }
+            }
+        }
         self.writeback_seeds(&handle, data, &mut seeds, &mut seed_ends, request)?;
-        let observations = [InteriorObservation::Location(location.clone())];
-        let reaching: Reaching = self
-            .run_interior(procedure, &seeds, &observations, request)?
+        let observations =
+            InteriorObservations::One([InteriorObservation::Location(location.clone())]);
+        let (flows, mut input) = self.run_interior(procedure, seeds, observations, request)?;
+        let reaching: Reaching = flows
             .into_iter()
             .filter(|(_, flow)| flow.target == InteriorTarget::Observation(0))
             .map(|(function, flow)| Inflow {
@@ -2072,7 +2741,16 @@ where
                 crossed: flow.crossed,
             })
             .collect();
-        self.location_interiors.insert(key, Arc::clone(&reaching));
+        if let Some(input) = &mut input {
+            input.seed_ends = seed_ends;
+        }
+        self.inputs.location_interiors.insert(
+            key,
+            LocationInteriorInput {
+                input,
+                reaching: Some(Arc::clone(&reaching)),
+            },
+        );
         Ok(reaching)
     }
 
@@ -2098,7 +2776,7 @@ where
         let endpoints = self
             .provider
             .execution_endpoints(&target, key.execution_arm.as_ref(), request)
-            .map_err(provider_error)?;
+            .map_err(|error| classified_provider_error(self.provider, error))?;
         // An authored external summary can close a body-incomplete dispatch arm;
         // its raw arm quality remains on the invocation hop and reach.
         let closed = matches!(endpoints.status, ExecutionEndpointStatus::Complete)
@@ -2170,6 +2848,7 @@ where
                 + self.reaches.len()
                 + self.execution_reaches.len()
                 + self.execution_procedure_reaches.len()
+                + self.modeled_reader_origin_count
                 >= self.budget.max_hops
             {
                 self.exhaust(BudgetLane::Hops);
@@ -2208,6 +2887,7 @@ where
                 + self.reaches.len()
                 + self.execution_reaches.len()
                 + self.execution_procedure_reaches.len()
+                + self.modeled_reader_origin_count
                 >= self.budget.max_hops
             {
                 self.exhaust(BudgetLane::Hops);
@@ -2236,7 +2916,7 @@ where
         let inventory = self
             .provider
             .invocations(&procedure, request)
-            .map_err(provider_error)?;
+            .map_err(|error| classified_provider_error(self.provider, error))?;
         if let Completeness::Incomplete { reason, cause } = inventory.coverage {
             self.note(Incompleteness::Execution {
                 cause,
@@ -2248,7 +2928,7 @@ where
             let dispatch = self
                 .provider
                 .execution_dispatch(&site.call, key.execution_arm.as_ref(), request)
-                .map_err(provider_error)?;
+                .map_err(|error| classified_provider_error(self.provider, error))?;
             let residual_discharged = !dispatch.arms.is_empty()
                 && dispatch.coverage != crate::analyzer::semantic::CandidateCoverage::Truncated
                 && matches!(
@@ -2446,7 +3126,7 @@ where
         let relation = self
             .provider
             .object_relation(&key.procedure, &key.node, request)
-            .map_err(provider_error)?;
+            .map_err(|error| classified_provider_error(self.provider, error))?;
         if !relation.complete {
             self.note(Incompleteness::Object {
                 cause: super::IncompleteCause::Operational(super::OperationalCause::Provider),
@@ -2462,6 +3142,7 @@ where
                 + self.reaches.len()
                 + self.execution_reaches.len()
                 + self.object_reaches.len()
+                + self.modeled_reader_origin_count
                 >= self.budget.max_hops
             {
                 self.exhaust(BudgetLane::Hops);
@@ -2594,7 +3275,7 @@ where
                         &Endpoint::Port(port.clone()),
                         request,
                     )
-                    .map_err(provider_error)?;
+                    .map_err(|error| classified_provider_error(self.provider, error))?;
                 let (local, local_quality) = local.map_or(
                     (LabelFunctionId::IDENTITY, HopQuality::CERTAIN),
                     |(function, quality)| (self.functions.intern(function), quality),
@@ -2645,7 +3326,7 @@ where
                 let local = self
                     .provider
                     .local_function(&key.procedure, &seed, &key.node, request)
-                    .map_err(provider_error)?;
+                    .map_err(|error| classified_provider_error(self.provider, error))?;
                 let (local, local_quality) = local.map_or(
                     (LabelFunctionId::IDENTITY, HopQuality::CERTAIN),
                     |(function, quality)| (self.functions.intern(function), quality),
@@ -2669,7 +3350,7 @@ where
                         key.root.clone(),
                         source,
                         function,
-                        path_quality.conjoin(match self.sources[source.index()].evidence {
+                        path_quality.conjoin(match self.inputs.sources[source.index()].evidence {
                             EndpointEvidence::Known(quality) => quality,
                             // Judged at stage 3, for the sources that
                             // reach a sink.
@@ -2744,10 +3425,18 @@ where
                         .iter()
                         .any(|binding| &binding.actual == port)
                 }) {
-                    if !self.handles.contains_key(&key.procedure) {
-                        self.run_interior(&key.procedure, &[], &[], request)?;
+                    if !self.inputs.handles.contains_key(&key.procedure) {
+                        let (_, acquisition) = self.run_interior(
+                            &key.procedure,
+                            Vec::new(),
+                            InteriorObservations::Empty,
+                            request,
+                        )?;
+                        if let Some(handle) = self.inputs.handles.get_mut(&key.procedure) {
+                            handle.acquisition = acquisition;
+                        }
                     }
-                    let handle = self.handles[&key.procedure].clone();
+                    let handle = self.inputs.handles[&key.procedure].procedure.clone();
                     let site = handle
                         .semantics()
                         .call_site(*call)
@@ -2769,7 +3458,19 @@ where
             }
             Endpoint::Port(port) if is_formal_or_heap_input(port) => self.formal(id, request),
             Endpoint::Location(location) => {
-                let handle = self.handles[&key.procedure].clone();
+                let Some(handle) = self
+                    .inputs
+                    .handles
+                    .get(&key.procedure)
+                    .map(|input| input.procedure.clone())
+                else {
+                    self.note(Incompleteness::Interior {
+                        cause: super::IncompleteCause::Content,
+                        procedure: key.procedure.clone(),
+                        reason: "component observation has no live procedure handle".into(),
+                    });
+                    return Ok(());
+                };
                 let site = handle
                     .semantics()
                     .call_site(location.call)
@@ -2833,17 +3534,48 @@ where
         let dispatch = self.dispatch(&call_key, request)?;
         if let Some(model) = self.model(&call_key, request)? {
             self.note_dispatch_incomplete(&call_key, &dispatch);
-            // Scalar normal-return transfers do not describe the content of a
-            // member read through the result. A modeled dispatch may have no
-            // candidates, so dropping this demand would falsely complete it.
-            if matches!(&key.node, Endpoint::Port(PartialFlowPort::Heap { root, .. })
-                if matches!(root.as_ref(), PartialFlowPort::CallResult { .. }))
+            // The capability admits component machinery, not this call's
+            // returned contents. A model with no declared return transfers
+            // leaves member demands unknown even if another pack enables
+            // projections (#11818). Whole-preserving return transfers still
+            // use apply_model's per-transfer member preservation proof.
+            let describes_return = model.transfers.iter().any(|transfer| {
+                matches!(&transfer.output, PartialFlowPort::CallResult { .. })
+                    || matches!(&transfer.output, PartialFlowPort::Heap { root, .. }
+                        if matches!(root.as_ref(), PartialFlowPort::CallResult { .. }))
+            });
+            if !(self.inputs.endpoint_projections && describes_return)
+                && matches!(&key.node, Endpoint::Port(PartialFlowPort::Heap { root, .. })
+                    if matches!(root.as_ref(), PartialFlowPort::CallResult { .. }))
             {
-                self.note(Incompleteness::Model {
-                    cause: super::IncompleteCause::Operational(super::OperationalCause::Provider),
-                    call: call_key.clone(),
-                    reason: "a call model does not describe a returned member".into(),
-                });
+                // The missing capability is a verdict about the selected model
+                // only when its provider records that input for this consult.
+                // Union every contributing typed cause before report retention;
+                // a content certificate cannot erase an operational dependency.
+                let mut causes = vec![self.provider.certify_model_content_refusal(request)];
+                if let Completeness::Incomplete { cause, .. } = &model.completeness
+                    && !causes.contains(cause)
+                {
+                    causes.push(*cause);
+                }
+                if let Some(cause) = dispatch.incomplete_cause
+                    && !causes.contains(&cause)
+                {
+                    causes.push(cause);
+                }
+                let operational = causes
+                    .iter()
+                    .any(|cause| matches!(cause, super::IncompleteCause::Operational(_)));
+                for cause in causes {
+                    if operational && cause == super::IncompleteCause::Content {
+                        continue;
+                    }
+                    self.note(Incompleteness::Model {
+                        cause,
+                        call: call_key.clone(),
+                        reason: "a call model does not describe a returned member".into(),
+                    });
+                }
                 if !model.retains_dispatch {
                     return Ok(());
                 }
@@ -2851,7 +3583,7 @@ where
                 let Endpoint::Port(output) = &key.node else {
                     unreachable!()
                 };
-                self.apply_model(id, &call_key, &model, output);
+                self.apply_model(id, &call_key, &model, output, request)?;
             }
             if !model.retains_dispatch {
                 return Ok(());
@@ -2866,7 +3598,7 @@ where
             for continuation in self
                 .provider
                 .unproven_object_continuations(&call_key, request)
-                .map_err(provider_error)?
+                .map_err(|error| classified_provider_error(self.provider, error))?
             {
                 let function = self.functions.intern(continuation.function);
                 let function = self.functions.then(function, key.function);
@@ -2903,7 +3635,7 @@ where
                 let inventory = self
                     .provider
                     .call_handoffs(&call_key, candidate, exit, request)
-                    .map_err(provider_error)?;
+                    .map_err(|error| classified_provider_error(self.provider, error))?;
                 absent_exits_complete &= inventory.complete;
                 for handoff in inventory.handoffs {
                     assert_eq!(handoff.binding.exit, exit);
@@ -2945,7 +3677,7 @@ where
                 let rows = self
                     .provider
                     .partial_flows(&candidate.procedure, request)
-                    .map_err(provider_error)?;
+                    .map_err(|error| classified_provider_error(self.provider, error))?;
                 let callee_ports =
                     returned_member_callee_ports(candidate, result, &rows.ports, |declared| {
                         self.provider.canonical_returned_field(
@@ -2972,7 +3704,7 @@ where
             && self
                 .provider
                 .certified_object_origin(root, &call_key, result, gap, request)
-                .map_err(provider_error)?
+                .map_err(|error| classified_provider_error(self.provider, error))?
                 .is_some()
         {
             return Ok(());
@@ -3071,7 +3803,7 @@ where
                 let Endpoint::Port(output) = &key.node else {
                     unreachable!()
                 };
-                self.apply_model(id, &call_key, &model, output);
+                self.apply_model(id, &call_key, &model, output, request)?;
             }
             if !model.retains_dispatch {
                 return Ok(());
@@ -3153,7 +3885,7 @@ where
     /// engine's policy-local relation is, so a model or a callee body does
     /// not replace it.
     fn linked(&mut self, id: usize, call: &DurableCallSiteKey) {
-        let Some(links) = self.links.get(call).cloned() else {
+        let Some(links) = self.inputs.links.get(call).cloned() else {
             return;
         };
         let key = self.items[id].key.clone();
@@ -3207,7 +3939,7 @@ where
                 let ports = self
                     .provider
                     .fallback_ports(call, request)
-                    .map_err(provider_error)?;
+                    .map_err(|error| classified_provider_error(self.provider, error))?;
                 if !ports.outputs.contains(output) {
                     return Ok(());
                 }
@@ -3299,6 +4031,18 @@ where
         excluded: Option<CallSiteId>,
         request: &mut SemanticRequest<'_>,
     ) -> Result<(), ComposeError> {
+        // Storage origins matter only when a modeled writer could reach
+        // this read. The local interior already accounts for ordinary reads.
+        if self.inputs.endpoint_projections
+            && !procedure.semantics().call_sites().iter().any(|call| {
+                Some(call.id) != excluded
+                    && self
+                        .provider
+                        .may_have_modeled_storage_output(procedure, call.id)
+            })
+        {
+            return Ok(());
+        }
         let origins = BindingOriginIndex::new(procedure);
         let origin = |value: ValueId| {
             origins
@@ -3313,23 +4057,11 @@ where
             match reverse_reachability(procedure.semantics(), read_point, &mut reach_request) {
                 Ok(reachable) => reachable,
                 Err(error) => {
+                    let (cause, reason) = reader_ordering_failure(error);
                     self.note(Incompleteness::Interior {
-                        cause: super::IncompleteCause::Operational(
-                            super::OperationalCause::Provider,
-                        ),
+                        cause,
                         procedure: caller.clone(),
-                        reason: match error {
-                            CfgAlgorithmError::InvalidNode(_) => {
-                                "reader ordering cannot be proven: invalid node"
-                            }
-                            CfgAlgorithmError::Cancelled { .. } => {
-                                "reader ordering cannot be proven: cancelled"
-                            }
-                            CfgAlgorithmError::ExceededBudget(_) => {
-                                "reader ordering cannot be proven: budget exceeded"
-                            }
-                        }
-                        .into(),
+                        reason: reason.into(),
                     });
                     return Ok(());
                 }
@@ -3349,12 +4081,26 @@ where
             .semantics()
             .call_site(read_call)
             .expect("a modeled receiver read names a live call");
-        let reader_storage = read_model
+        let mut reader_storage = read_model
             .receiver_reads
             .iter()
             .filter(|binding| call_input_value(read_site, &binding.actual) == Some(value))
             .flat_map(|binding| binding.storage.iter().cloned())
             .collect::<Vec<_>>();
+        for (location, storage) in &self.inputs.modeled_reader_origins {
+            if location.0 == caller
+                && location.1.call == read_call
+                && call_input_value(read_site, &location.1.actual) == Some(value)
+                && location.1.selectors.as_ref() == selectors
+                && location.1.tail == tail
+            {
+                for origin in storage {
+                    if !reader_storage.contains(origin) {
+                        reader_storage.push(origin.clone());
+                    }
+                }
+            }
+        }
         if reader_storage.is_empty() {
             self.note(Incompleteness::Model {
                 cause: super::IncompleteCause::Operational(super::OperationalCause::Provider),
@@ -3387,7 +4133,7 @@ where
             let sharing = self
                 .provider
                 .call_input_storage_overlap(procedure, value, selectors, tail, call.id, request)
-                .map_err(provider_error)?;
+                .map_err(|error| classified_provider_error(self.provider, error))?;
             if sharing == CallStorageSharing::Isolated {
                 continue;
             }
@@ -3396,7 +4142,7 @@ where
             let (raw_dispatch, model) = self
                 .provider
                 .dispatch(&call_key, request)
-                .map_err(provider_error)?;
+                .map_err(|error| classified_provider_error(self.provider, error))?;
             let Some(model) = model.map(Arc::new) else {
                 continue;
             };
@@ -3505,7 +4251,7 @@ where
                     };
                     self.dispatch_noted(&call_key, request)?;
                     self.model(&call_key, request)?;
-                    self.apply_model(id, &call_key, &model, &heap);
+                    self.apply_model(id, &call_key, &model, &heap, request)?;
                 }
             }
         }
@@ -3521,44 +4267,323 @@ where
         call: &DurableCallSiteKey,
         model: &CallModel<L::Function>,
         output: &PartialFlowPort,
-    ) {
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<(), ComposeError> {
         let key = self.items[id].key.clone();
         let item_quality = self.items[id].quality;
         for transfer in &model.transfers {
-            let matches_output = &transfer.output == output
-                || matches!(output, PartialFlowPort::Heap { root, .. } if root.as_ref() == &transfer.output);
-            if !matches_output {
-                continue;
-            }
-            let actual = transfer.actual.clone();
-            let model_function = transfer.function.clone();
-            let hop = Hop::Model {
-                call: call.clone(),
-                actual: actual.clone(),
-                result: output.clone(),
-                summary: model.summary.clone().map(Box::new),
-                retains_dispatch: model.retains_dispatch,
-                function: self.functions.intern(model_function),
-                quality: if model.retains_dispatch {
-                    HopQuality::new(transfer.proven, false)
-                } else {
-                    model.quality()
-                },
+            let actual = if self.inputs.endpoint_projections {
+                match projected_model_actual(transfer, output) {
+                    Ok(Some(actual)) => actual,
+                    Ok(None) => continue,
+                    Err(reason) => {
+                        self.note(Incompleteness::Model {
+                            cause: super::IncompleteCause::Content,
+                            call: call.clone(),
+                            reason: reason.into(),
+                        });
+                        continue;
+                    }
+                }
+            } else {
+                let matches_output = &transfer.output == output
+                    || matches!(output, PartialFlowPort::Heap { root, .. } if root.as_ref() == &transfer.output);
+                if !matches_output {
+                    continue;
+                }
+                transfer.actual.clone()
             };
-            let mut hops = vec![hop];
-            hops.extend(self.annotations_for(call, Some(&actual), &key.node));
-            let along = self.functions.hops(&hops);
-            let function = self.functions.then(along, key.function);
-            let quality = Hop::path_quality(&hops).conjoin(item_quality);
-            self.add_item(
-                key.procedure.clone(),
-                key.root.clone(),
-                Endpoint::Port(actual),
-                function,
-                quality,
-                Derivation::Step { hops, next: id },
-            );
+            let mut actuals = vec![actual.clone()];
+            // A whole input consumes known components of the same aggregate,
+            // independently of projected siblings. Observe concrete members at invocation rather than
+            // collapsing them into a shared whole-value fact, which would
+            // contaminate the projected sibling and survive child overwrites.
+            if self.inputs.endpoint_projections
+                && matches!(
+                    actual,
+                    PartialFlowPort::CallReceiver { .. } | PartialFlowPort::CallArgument { .. }
+                )
+            {
+                'components: {
+                    let Some(handle) = self
+                        .inputs
+                        .handles
+                        .get(&key.procedure)
+                        .map(|input| input.procedure.clone())
+                    else {
+                        self.note(Incompleteness::Model {
+                            cause: super::IncompleteCause::Content,
+                            call: call.clone(),
+                            reason: "component input binding has no live procedure handle".into(),
+                        });
+                        break 'components;
+                    };
+                    let reads_projected_sibling = model.endpoint_projections
+                        && model.transfers.iter().any(|transfer| {
+                            matches!(
+                            &transfer.actual, PartialFlowPort::Heap { root, .. }
+                                if root.as_ref() == &actual)
+                        });
+                    let mut produced_locations = Vec::new();
+                    let mut proven_modeled_locations = Vec::new();
+                    for row in handle.semantics().call_sites() {
+                        let Some(producer) =
+                            self.model_for_discovery(&(key.procedure.clone(), row.id), request)?
+                        else {
+                            continue;
+                        };
+                        if !producer.endpoint_projections {
+                            continue;
+                        }
+                        let first_produced = produced_locations.len();
+                        for produced in &producer.transfers {
+                            if let Some(InteriorSeed::Source {
+                                carrier: ValueFlowCarrier::Location(location),
+                                ..
+                            }) =
+                                crate::composition::projected_return_seed(&handle, &produced.output)
+                            {
+                                produced_locations.push(*location);
+                            }
+                            if let PartialFlowPort::Heap {
+                                root,
+                                selectors,
+                                tail,
+                            } = &produced.output
+                            {
+                                for binding in producer
+                                    .writeback
+                                    .iter()
+                                    .filter(|binding| &binding.actual == root.as_ref())
+                                {
+                                    if !binding.proven
+                                        || !binding.complete
+                                        || !binding.conversion_preserves_identity
+                                        || heap_sharing(binding, selectors, *tail)
+                                            != CallStorageSharing::Shares
+                                    {
+                                        continue;
+                                    }
+                                    for origin in &binding.storage {
+                                        if let Some(location) = crate::analyzer::semantic::partial_flow::caller_exact_read_location(
+                                            &handle, origin, selectors, *tail) { produced_locations.push(location); }
+                                    }
+                                }
+                            }
+                        }
+                        let quality = producer.quality();
+                        if quality.proven && quality.complete {
+                            proven_modeled_locations
+                                .extend(produced_locations[first_produced..].iter().cloned());
+                        }
+                    }
+                    // One owner observes native and modeled components. A
+                    // schema-35 whole consumer needs this even without a
+                    // modeled producer; legacy calls retain lazy behavior.
+                    if produced_locations.is_empty() && !reads_projected_sibling {
+                        break 'components;
+                    }
+                    let quality = model.quality();
+                    if !produced_locations.is_empty() && (!quality.proven || !quality.complete) {
+                        self.note(Incompleteness::Model {
+                            cause: super::IncompleteCause::Content,
+                            call: call.clone(),
+                            reason:
+                                "component consumption requires a proven complete input binding"
+                                    .into(),
+                        });
+                        break 'components;
+                    }
+                    let answer = match self
+                        .provider
+                        .modeled_input_locations(&handle, call.1, &actual, request)
+                    {
+                        Ok(answer) => answer,
+                        Err(error) => {
+                            self.note(Incompleteness::Model {
+                                cause: super::IncompleteCause::Operational(
+                                    super::OperationalCause::Provider,
+                                ),
+                                call: call.clone(),
+                                reason: format!("modeled input origins failed: {error}").into(),
+                            });
+                            None
+                        }
+                    };
+                    if let Some(answer) = &answer {
+                        // Every actual origin needs membership evidence. A
+                        // known component on one alias branch cannot classify
+                        // another branch, and complete producers cannot repair
+                        // weak or dropped native observations.
+                        let membership_known = !answer.locations.is_empty()
+                            && answer.locations.iter().all(|origin| origin.proven_complete
+                                && answer.components.iter().filter(|member| member.proven_complete)
+                                    .map(|member| &member.location)
+                                    .chain(proven_modeled_locations.iter())
+                                    .any(|member| crate::analyzer::semantic::partial_flow::exact_location_covers_read(&origin.location, member)));
+                        if !answer.complete
+                            || (reads_projected_sibling
+                                && (!answer.components_complete || !membership_known))
+                        {
+                            self.note(Incompleteness::Model {
+                                cause: super::IncompleteCause::Content,
+                                call: call.clone(),
+                                reason: "modeled whole-input component membership is incomplete"
+                                    .into(),
+                            });
+                        }
+                        if reads_projected_sibling {
+                            produced_locations.extend(
+                                answer
+                                    .components
+                                    .iter()
+                                    .filter(|item| item.proven_complete)
+                                    .map(|item| item.location.clone()),
+                            );
+                        }
+                    }
+                    if !produced_locations.is_empty() && (!quality.proven || !quality.complete) {
+                        self.note(Incompleteness::Model {
+                            cause: super::IncompleteCause::Content,
+                            call: call.clone(),
+                            reason:
+                                "component consumption requires a proven complete input binding"
+                                    .into(),
+                        });
+                        break 'components;
+                    }
+                    let origins = match &answer {
+                        Some(answer) => answer.locations.iter().filter(|origin| origin.proven_complete).map(|origin| &origin.location).collect::<Vec<_>>(),
+                        None if model.endpoint_projections && model.transfers.iter().any(|transfer|
+                            matches!(&transfer.actual, PartialFlowPort::Heap { root, .. } if root.as_ref() == &actual)) => model.receiver_reads.iter()
+                                .filter(|binding| binding.actual == actual).flat_map(|binding| binding.storage.iter()).collect(),
+                        None => Vec::new(),
+                    };
+                    for produced_location in produced_locations {
+                        for origin in &origins {
+                            if !crate::analyzer::semantic::partial_flow::exact_location_covers_read(
+                                origin,
+                                &produced_location,
+                            ) {
+                                continue;
+                            }
+                            let Some(selectors) =
+                                crate::semantic_summary::substitute_projection_prefix(
+                                    &heap_selectors(produced_location.path().selectors()),
+                                    &heap_selectors(origin.path().selectors()),
+                                    &[],
+                                )
+                            else {
+                                continue;
+                            };
+                            if selectors.is_empty() {
+                                continue;
+                            }
+                            let component = PartialFlowPort::Heap {
+                                root: Box::new(actual.clone()),
+                                selectors: selectors.into_boxed_slice(),
+                                tail: AccessPathTail::Exact,
+                            };
+                            let PartialFlowPort::Heap {
+                                root,
+                                selectors,
+                                tail,
+                            } = &component
+                            else {
+                                unreachable!("component input is a heap port");
+                            };
+                            let origin_key = (
+                                key.procedure.clone(),
+                                CallerLocation {
+                                    call: call.1,
+                                    actual: *root.clone(),
+                                    selectors: selectors.clone(),
+                                    tail: *tail,
+                                },
+                            );
+                            if !self
+                                .inputs
+                                .modeled_reader_origins
+                                .get(&origin_key)
+                                .is_some_and(|storage| storage.contains(origin))
+                            {
+                                if self.items.len()
+                                    + self.reaches.len()
+                                    + self.execution_reaches.len()
+                                    + self.execution_procedure_reaches.len()
+                                    + self.modeled_reader_origin_count
+                                    >= self.budget.max_hops
+                                {
+                                    self.exhaust(BudgetLane::Hops);
+                                    self.stopped = true;
+                                    return Ok(());
+                                }
+                                self.inputs
+                                    .modeled_reader_origins
+                                    .entry(origin_key)
+                                    .or_default()
+                                    .push((*origin).clone());
+                                self.modeled_reader_origin_count += 1;
+                            }
+                            if !actuals.contains(&component) {
+                                actuals.push(component);
+                            }
+                        }
+                    }
+                }
+            }
+
+            for actual in actuals {
+                let model_function = transfer.function.clone();
+                let hop = Hop::Model {
+                    call: call.clone(),
+                    actual: actual.clone(),
+                    result: output.clone(),
+                    summary: model.summary.clone().map(Box::new),
+                    retains_dispatch: model.retains_dispatch,
+                    function: self.functions.intern(model_function),
+                    quality: if model.retains_dispatch {
+                        HopQuality::new(transfer.proven, false)
+                    } else {
+                        model.quality()
+                    },
+                };
+                let mut hops = vec![hop];
+                hops.extend(self.annotations_for(call, Some(&actual), &key.node));
+                let along = self.functions.hops(&hops);
+                let function = self.functions.then(along, key.function);
+                let quality = Hop::path_quality(&hops).conjoin(item_quality);
+                self.add_item(
+                    key.procedure.clone(),
+                    key.root.clone(),
+                    match actual {
+                        PartialFlowPort::Heap {
+                            root,
+                            selectors,
+                            tail,
+                        } if self.inputs.endpoint_projections
+                            && matches!(
+                                root.as_ref(),
+                                PartialFlowPort::CallReceiver { .. }
+                                    | PartialFlowPort::CallArgument { .. }
+                            ) =>
+                        {
+                            Endpoint::Location(CallerLocation {
+                                call: call.1,
+                                actual: *root,
+                                selectors,
+                                tail,
+                            })
+                        }
+                        actual => Endpoint::Port(actual),
+                    },
+                    function,
+                    quality,
+                    Derivation::Step { hops, next: id },
+                );
+            }
         }
+        Ok(())
     }
 
     /// A callee formal reached a callee root: map it back through the call
@@ -3777,14 +4802,16 @@ where
         else {
             unreachable!("a closure item is at a capture slot");
         };
-        let parent = match self.parents.get(&key.procedure) {
+        let parent = match self.inputs.parents.get(&key.procedure) {
             Some(parent) => parent.clone(),
             None => {
                 let parent = self
                     .provider
                     .lexical_parent(&key.procedure, request)
-                    .map_err(provider_error)?;
-                self.parents.insert(key.procedure.clone(), parent.clone());
+                    .map_err(|error| classified_provider_error(self.provider, error))?;
+                self.inputs
+                    .parents
+                    .insert(key.procedure.clone(), parent.clone());
                 parent
             }
         };
@@ -3937,7 +4964,7 @@ where
         }
         for link in links.writes {
             assert!(
-                link.write < self.store_writes.len(),
+                link.write < self.inputs.store_writes.len(),
                 "a store link names a selected write"
             );
             let root = Root::StoreWrite(link.write);
@@ -3948,7 +4975,7 @@ where
                     .or_default()
                     .push(waiter.clone());
             }
-            let write = &self.store_writes[waiter.link.write];
+            let write = &self.inputs.store_writes[waiter.link.write];
             self.add_item(
                 write.procedure.clone(),
                 root.clone(),
@@ -4118,7 +5145,7 @@ pub(super) fn evidence_quality(
 /// Names a call site by its file and its procedure-local ids. A durable call
 /// key also carries the workspace mount and artifact fingerprints, and replayed
 /// diagnostic text must not depend on the mount.
-fn call_site_text(((artifact, procedure), call): &DurableCallSiteKey) -> String {
+fn call_site_text(((artifact, procedure, _interpretation), call): &DurableCallSiteKey) -> String {
     format!("{} {procedure:?} {call:?}", artifact.path())
 }
 
@@ -4319,4 +5346,127 @@ fn call_output_port(call: &SemanticCallSite, value: ValueId) -> Option<PartialFl
             call: call.id,
             ordinal: Some(u32::try_from(ordinal).expect("a call's result count fits u32")),
         })
+}
+
+/// Substitute an exact modeled endpoint prefix while retaining the demanded
+/// component suffix. This keeps a tainted tuple member distinct from its sibling
+/// through a summary that moves the tuple as a whole.
+fn projected_model_actual<Function>(
+    transfer: &super::ModelTransfer<Function>,
+    demanded_output: &PartialFlowPort,
+) -> Result<Option<PartialFlowPort>, &'static str> {
+    let actual = &transfer.actual;
+    let modeled_output = &transfer.output;
+    // Identical summarized endpoints use the authored transfer as an uncertain
+    // hop. They do not justify substituting any relative member suffix.
+    if modeled_output == demanded_output {
+        return Ok(Some(actual.clone()));
+    }
+    fn parts(port: &PartialFlowPort) -> (&PartialFlowPort, &[HeapSelector], AccessPathTail) {
+        match port {
+            PartialFlowPort::Heap {
+                root,
+                selectors,
+                tail,
+            } => (root, selectors, *tail),
+            root => (root, &[], AccessPathTail::Exact),
+        }
+    }
+    let (modeled_root, prefix, modeled_tail) = parts(modeled_output);
+    let (demanded_root, selectors, demanded_tail) = parts(demanded_output);
+    if modeled_tail == AccessPathTail::Summary && modeled_root == demanded_root {
+        let demanded = PartialFlowPort::Heap {
+            root: Box::new(demanded_root.clone()),
+            selectors: selectors.into(),
+            tail: demanded_tail,
+        };
+        if heap_ports_overlap(&demanded, modeled_output) {
+            return Err("a summarized modeled output cannot close a distinct component demand");
+        }
+    }
+    if modeled_tail != AccessPathTail::Exact
+        || modeled_root != demanded_root
+        || !selectors.starts_with(prefix)
+    {
+        return Ok(None);
+    }
+    let suffix = &selectors[prefix.len()..];
+    if suffix.is_empty() && demanded_tail == AccessPathTail::Exact {
+        return Ok(Some(actual.clone()));
+    }
+    if !transfer.preserves_member_contents() {
+        return Err(
+            "a modeled transfer has no member-path preservation proof for this component demand",
+        );
+    }
+    let (actual_root, actual_selectors, actual_tail) = parts(actual);
+    if actual_tail != AccessPathTail::Exact {
+        return Ok(None);
+    }
+    Ok(Some(PartialFlowPort::Heap {
+        root: Box::new(actual_root.clone()),
+        selectors: crate::semantic_summary::substitute_projection_prefix(
+            selectors,
+            prefix,
+            actual_selectors,
+        )
+        .expect("matching exact modeled prefixes admit substitution")
+        .into_boxed_slice(),
+        tail: demanded_tail,
+    }))
+}
+
+impl<Fact, Function> SearchInputs<Fact, Function> {
+    pub(super) fn discard_indexes(&mut self) {
+        for data in self.procedures.values_mut().flatten() {
+            let data = Arc::get_mut(data).expect("search owns its procedure cache after finishing");
+            data.into = HashMap::default();
+        }
+        for data in self.interiors.values_mut().flatten() {
+            let data = Arc::get_mut(data).expect("search owns its interior cache after finishing");
+            data.into = HashMap::default();
+        }
+        for data in self.location_interiors.values_mut() {
+            data.reaching = None;
+        }
+    }
+}
+
+#[cfg(test)]
+mod reader_ordering_tests {
+    use super::*;
+    use crate::analyzer::semantic::cfg_algorithms::{
+        CfgAlgorithmBudgetExceeded, CfgAlgorithmLimit, CfgAlgorithmWork,
+    };
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#12107: interrupted reader ordering proofs lost their typed CFG execution cause")]
+    fn reader_ordering_preserves_typed_stops() {
+        let cases = [
+            (
+                CfgAlgorithmError::InvalidNode(0u32),
+                super::super::OperationalCause::Provider,
+            ),
+            (
+                CfgAlgorithmError::Cancelled {
+                    work: CfgAlgorithmWork::default(),
+                },
+                super::super::OperationalCause::Cancelled,
+            ),
+            (
+                CfgAlgorithmError::ExceededBudget(CfgAlgorithmBudgetExceeded {
+                    limit_kind: CfgAlgorithmLimit::NodeVisits,
+                    limit: 0,
+                    attempted: 1,
+                    work: CfgAlgorithmWork::default(),
+                }),
+                super::super::OperationalCause::Budget(BudgetLane::Semantic),
+            ),
+        ];
+        for (error, expected) in cases {
+            let (cause, _) = reader_ordering_failure(error);
+            assert_eq!(cause, super::super::IncompleteCause::Operational(expected));
+        }
+    }
 }

@@ -161,6 +161,7 @@ pub fn call_shape_for_call(
     facts: &FileFacts,
     file: &ProjectFile,
     call_id: u32,
+    selected: Option<&crate::analyzer::semantic::ProcedureHandle>,
 ) -> Option<CallShapeReport> {
     if !facts.node(call_id).kind.satisfies(NormalizedKind::Call) {
         return None;
@@ -180,7 +181,11 @@ pub fn call_shape_for_call(
     let site_ast_id = ast_id(content_identity, site_call_id);
 
     let callee_range = call.name.map(|span| super::range_for_span(facts, span));
-    let callee_name = call.name.map(|span| span.text(facts.source()).to_owned());
+    // A written callee is its token; a Ruby writer or element access derives
+    // `attr=`, `[]` or `[]=` from the token it records (`CalleeSpelling`).
+    let callee_name = facts
+        .node_name_text(site_call_id)
+        .map(std::borrow::Cow::into_owned);
     // The receiver is written on the innermost application: `a.f(x)(y)` reads
     // its receiver at `a`, and the outer application has none of its own.
     let receiver_range = applications
@@ -189,11 +194,15 @@ pub fn call_shape_for_call(
         .map(|target| super::range_for_span(facts, target.span));
     // Coverage is the least complete answer any application in the sequence
     // gave: one unreadable list makes the whole site's shape unreadable.
-    let coverage = applications
+    let mut coverage = applications
         .iter()
         .map(|&id| site_coverage(facts.node(id)))
         .max_by_key(|coverage| coverage_rank(*coverage))
         .unwrap_or(CallShapeCoverage::Exact);
+    let admitted = selected.and_then(|procedure| admitted_candidate_call(procedure, call.range));
+    if coverage == CallShapeCoverage::CandidateMacroDerived && admitted.is_some() {
+        coverage = CallShapeCoverage::AdmittedCandidateMacro;
+    }
     let call_kind = call_kind_for(facts, &applications);
 
     let mut groups = Vec::new();
@@ -201,7 +210,7 @@ pub fn call_shape_for_call(
     // An unreadable shape emits no group and no argument row. A fabricated
     // empty list would be indistinguishable from a real zero-argument call,
     // which is exactly the confusion the coverage field exists to prevent.
-    if coverage.is_exact() {
+    if coverage.is_exact() && admitted.is_none() {
         let mut group_index = 0usize;
         for &application in &applications {
             for (kind, members) in argument_groups_of(facts, application) {
@@ -239,6 +248,44 @@ pub fn call_shape_for_call(
         }
     }
 
+    if let Some((procedure, admitted)) = admitted {
+        let mut digest = LengthDelimitedDigest::new(CALL_SHAPE_GROUP_ID_DOMAIN);
+        digest.push(site_id.as_bytes());
+        digest.push(&0usize.to_le_bytes());
+        let group_id = digest.finish().to_string();
+        for (argument_index, argument) in admitted.arguments.iter().enumerate() {
+            let value = procedure
+                .value(argument.value)
+                .expect("validated admitted actual");
+            let mapping = procedure
+                .source_mapping(value.source)
+                .expect("validated actual source");
+            let span = mapping.locator.anchor().span();
+            let start = span.start_byte() as usize;
+            let end = span.end_byte() as usize;
+            let range = brokk_bifrost_core::analyzer::semantic_diagnostics::range_for_byte_offsets(
+                facts.line_starts(),
+                start,
+                end,
+            );
+            arguments.push(ArgumentRow {
+                id: argument_row_id(&group_id, argument_index),
+                group_id: group_id.clone(),
+                argument_index,
+                name: argument.keyword.as_deref().map(str::to_owned),
+                spread: false,
+                literal_value: None,
+                range,
+            });
+        }
+        groups.push(ArgumentGroupRow {
+            id: group_id,
+            site_id: site_id.clone(),
+            group_index: 0,
+            kind: ArgumentListKind::Ordinary,
+            argument_count: arguments.len(),
+        });
+    }
     Some(CallShapeReport {
         outcome: CallShapeOutcome {
             id: site_id.clone(),
@@ -328,11 +375,92 @@ pub fn call_shapes_in_file(
         if application_root(facts, call_id) != call_id {
             continue;
         }
-        if let Some(report) = call_shape_for_call(facts, file, call_id) {
+        if let Some(report) = call_shape_for_call(facts, file, call_id, None) {
             reports.push(report);
         }
     }
     reports
+}
+
+/// What the selected procedure does with the candidate invocation at a source
+/// range (#11251).
+#[derive(Debug)]
+pub enum AdmittedCandidateRealization<'a> {
+    /// The selected alternate lowers the invocation to this runtime call.
+    RuntimeCall(
+        &'a crate::analyzer::semantic::ProcedureSemantics,
+        &'a crate::analyzer::semantic::SemanticCallSite,
+    ),
+    /// The selected alternate lowers the invocation to control flow and values:
+    /// it is not a call, and its call-shape row is dropped.
+    Intrinsic,
+    /// No admitted alternate realizes a candidate at this range: the base
+    /// interpretation was selected (a refusal; its reason is the admission
+    /// evidence of the selection) or no candidate is anchored here.
+    NotAdmitted,
+}
+
+/// A candidate is executable only in the owner's selected alternate. The anchor
+/// is a lookup index into this blob's records; nothing here is a digest input.
+pub fn admitted_candidate_realization(
+    selected: &crate::analyzer::semantic::ProcedureHandle,
+    range: Range,
+) -> AdmittedCandidateRealization<'_> {
+    use crate::analyzer::semantic::{CandidateRealization, ProcedureInterpretation};
+    if selected.durable_key().2 != ProcedureInterpretation::CandidateAlternate {
+        return AdmittedCandidateRealization::NotAdmitted;
+    }
+    let Some(base) = selected.artifact().procedure(selected.id()) else {
+        return AdmittedCandidateRealization::NotAdmitted;
+    };
+    let Some((_, records)) = base.candidate_macro_alternate() else {
+        return AdmittedCandidateRealization::NotAdmitted;
+    };
+    let procedure = selected.semantics();
+    let Some(record) = records.iter().find(|record| {
+        record.anchor.start_byte as usize == range.start_byte
+            && record.anchor.end_byte as usize == range.end_byte
+    }) else {
+        return AdmittedCandidateRealization::NotAdmitted;
+    };
+    match record.realization {
+        CandidateRealization::RuntimeCall(id) => procedure
+            .call_site(id)
+            .map_or(AdmittedCandidateRealization::NotAdmitted, |call| {
+                AdmittedCandidateRealization::RuntimeCall(procedure, call)
+            }),
+        CandidateRealization::Intrinsic => AdmittedCandidateRealization::Intrinsic,
+        // The same logical call: find it by the shared anchor.
+        CandidateRealization::LexicalNoItemsIntroduced => procedure
+            .call_sites()
+            .iter()
+            .find(|call| {
+                procedure
+                    .source_mapping(call.source)
+                    .is_some_and(|mapping| {
+                        crate::analyzer::semantic::CandidateAnchor::of(
+                            mapping.locator.anchor().span(),
+                        ) == record.anchor
+                    })
+            })
+            .map_or(AdmittedCandidateRealization::NotAdmitted, |call| {
+                AdmittedCandidateRealization::RuntimeCall(procedure, call)
+            }),
+    }
+}
+
+/// A candidate call is executable only in the owner's selected alternate.
+pub fn admitted_candidate_call(
+    selected: &crate::analyzer::semantic::ProcedureHandle,
+    range: Range,
+) -> Option<(
+    &crate::analyzer::semantic::ProcedureSemantics,
+    &crate::analyzer::semantic::SemanticCallSite,
+)> {
+    match admitted_candidate_realization(selected, range) {
+        AdmittedCandidateRealization::RuntimeCall(procedure, call) => Some((procedure, call)),
+        AdmittedCandidateRealization::Intrinsic | AdmittedCandidateRealization::NotAdmitted => None,
+    }
 }
 
 /// One argument of one group, before it is given a row identity.
@@ -450,10 +578,10 @@ fn site_coverage(node: &NormalizedNode) -> CallShapeCoverage {
 fn coverage_rank(coverage: CallShapeCoverage) -> u8 {
     match coverage {
         CallShapeCoverage::Exact => 0,
-        CallShapeCoverage::ExactMacroDerived => 1,
+        CallShapeCoverage::ExactMacroDerived | CallShapeCoverage::AdmittedCandidateMacro => 1,
         CallShapeCoverage::Partial => 2,
         CallShapeCoverage::UnknownDynamic => 3,
-        CallShapeCoverage::UnknownMacroDerived => 4,
+        CallShapeCoverage::UnknownMacroDerived | CallShapeCoverage::CandidateMacroDerived => 4,
     }
 }
 
@@ -557,7 +685,7 @@ mod tests {
             .map(|(id, _)| u32::try_from(id).expect("node id fits u32"))
             .expect("inner application is a call fact");
         let from_inner =
-            call_shape_for_call(&facts, &file("App.scala"), inner_id).expect("call shape");
+            call_shape_for_call(&facts, &file("App.scala"), inner_id, None).expect("call shape");
         assert_eq!(&from_inner, report);
     }
 

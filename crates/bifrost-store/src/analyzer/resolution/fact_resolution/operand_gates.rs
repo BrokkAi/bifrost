@@ -1,8 +1,11 @@
 //! Completion-only operand obligations. All materialized types live for one
 //! gate evaluation; no gate is a value producer or an identity shortcut.
+use super::call_applicability::{CallFormalType, RepeatedParameterAssessment};
 use super::*;
 use crate::analyzer::resolution::fact_source::language_jvm_array_operand_rules;
-use brokk_bifrost_jvm::java::conversion::{JavaConversion, JavaConversionTypes};
+use brokk_bifrost_jvm::java::conversion::{
+    JavaConversion, JavaConversionTypes, JavaTypeView, JavaTypeViews,
+};
 use brokk_bifrost_jvm::java::primitives::{JavaPrimitive, primitive_for_name};
 
 impl FactEvaluation<'_, '_> {
@@ -123,8 +126,10 @@ impl FactEvaluation<'_, '_> {
                                         );
                                         continue;
                                     }
+                                    let roots = operand_shape_roots(&shapes, [input, target_slot]);
                                     let Some(data) = self.operand_conversion_types(
                                         &[source.identity(), target.identity()],
+                                        shapes,
                                         previous,
                                     )?
                                     else {
@@ -136,11 +141,7 @@ impl FactEvaluation<'_, '_> {
                                         data,
                                     };
                                     proven = matches!(
-                                        rules.element(
-                                            &mut types,
-                                            source.identity(),
-                                            target.identity()
-                                        )?,
+                                        rules.element(&mut types, roots[0], roots[1])?,
                                         JavaConversion::Strict | JavaConversion::Loose
                                     );
                                 }
@@ -165,9 +166,8 @@ impl FactEvaluation<'_, '_> {
         Ok(true)
     }
 
-    /// The repeated declaration publishes its component, while an actual
-    /// array has a Sequence/Element row. Equal grounded components prove that
-    /// the actual array itself represents the implicit fixed-arity formal.
+    /// Prove conversion to the implicit array formal without replacing its
+    /// component identity with the actual or publishing a synthetic type.
     #[doc(hidden)]
     pub fn jvm_repeated_sequence_parameter_type(
         &mut self,
@@ -176,9 +176,9 @@ impl FactEvaluation<'_, '_> {
         actual: ResolutionTypeRef,
         component: ResolutionTypeRef,
         states: &StateMap,
-    ) -> StoreResult<Option<ResolutionTypeRef>> {
+    ) -> StoreResult<Option<RepeatedParameterAssessment>> {
         if actual.indirection() != 0 || component.indirection() != 0 {
-            return Ok(Some(component));
+            return Ok(Some(RepeatedParameterAssessment::Component(component)));
         }
         let Some(shapes) = self.projected_type_shapes(&[actual_slot, formal_slot], states)? else {
             return Ok(None);
@@ -193,24 +193,45 @@ impl FactEvaluation<'_, '_> {
                         .any(|node| matches!(node.form(), FactProjectedTypeNodeForm::Applied(_)))
             })
         {
-            return Ok(Some(component));
+            return Ok(Some(RepeatedParameterAssessment::Component(component)));
         }
-        let Some(data) =
-            self.operand_conversion_types(&[actual.identity(), component.identity()], states)?
+        let roots = operand_shape_roots(&shapes, [actual_slot, formal_slot]);
+        let Some(data) = self.operand_conversion_types(
+            &[actual.identity(), component.identity()],
+            shapes,
+            states,
+        )?
         else {
             return Ok(None);
         };
-        let types = OperandTypes {
+        let mut types = OperandTypes {
             evaluation: self,
             states,
             data,
         };
-        let fixed_arity = types.element(actual.identity()).is_some_and(|element| {
-            types.ground(actual.identity())
-                && types.ground(component.identity())
-                && types.same(element, component.identity())
-        });
-        Ok(Some(if fixed_arity { actual } else { component }))
+        let mut views = JavaTypeViews(&mut types);
+        let source = JavaTypeView::Real(roots[0]);
+        let target = JavaTypeView::ImplicitArray(roots[1]);
+        let assessment =
+            if brokk_bifrost_jvm::java::conversion::classify(&mut views, source, target)?
+                == JavaConversion::Strict
+            {
+                RepeatedParameterAssessment::FixedArray {
+                    actual,
+                    component,
+                    kind: if views.same(source, target) {
+                        call_applicability::ConversionKind::Exact
+                    } else {
+                        call_applicability::ConversionKind::Subtype
+                    },
+                }
+            } else {
+                RepeatedParameterAssessment::Component(component)
+            };
+        if self.poll_cancelled() {
+            return Ok(None);
+        }
+        Ok(Some(assessment))
     }
 
     /// Invocation applicability uses the same selected reference conversion
@@ -239,8 +260,14 @@ impl FactEvaluation<'_, '_> {
         {
             return Ok(Some(false));
         }
-        let relation =
-            self.java_reference_type_is_subtype(source.identity(), target.identity(), states)?;
+        let roots = operand_shape_roots(&shapes, operand_slots);
+        let relation = self.java_reference_conversion_with_shapes(
+            source.identity(),
+            target.identity(),
+            roots,
+            shapes,
+            states,
+        )?;
         if self.poll_cancelled() {
             return Ok(None);
         }
@@ -256,6 +283,23 @@ impl FactEvaluation<'_, '_> {
         target: SemanticId,
         states: &StateMap,
     ) -> StoreResult<Option<bool>> {
+        self.java_reference_conversion_with_shapes(
+            source,
+            target,
+            [source, target],
+            Box::new([]),
+            states,
+        )
+    }
+
+    fn java_reference_conversion_with_shapes(
+        &mut self,
+        source: SemanticId,
+        target: SemanticId,
+        roots: [SemanticId; 2],
+        shapes: Box<[FactProjectedTypeShape]>,
+        states: &StateMap,
+    ) -> StoreResult<Option<bool>> {
         let identities = [source, target];
         let Some(descriptors) = self.session.intrinsic_call_type_descriptors(&identities)? else {
             return Ok(None);
@@ -266,7 +310,7 @@ impl FactEvaluation<'_, '_> {
         {
             return Ok(Some(false));
         }
-        let Some(data) = self.operand_conversion_types(&[source, target], states)? else {
+        let Some(data) = self.operand_conversion_types(&[source, target], shapes, states)? else {
             return Ok(None);
         };
         let mut types = OperandTypes {
@@ -275,7 +319,7 @@ impl FactEvaluation<'_, '_> {
             data,
         };
         Ok(
-            match brokk_bifrost_jvm::java::conversion::classify(&mut types, source, target)? {
+            match brokk_bifrost_jvm::java::conversion::classify(&mut types, roots[0], roots[1])? {
                 JavaConversion::Strict => Some(true),
                 JavaConversion::Unknown => None,
                 JavaConversion::Loose | JavaConversion::Inapplicable => Some(false),
@@ -283,13 +327,61 @@ impl FactEvaluation<'_, '_> {
         )
     }
 
+    /// Compare the declared formal views, including their implicit array layer.
+    #[doc(hidden)]
+    pub fn java_reference_formal_is_subtype(
+        &mut self,
+        source: CallFormalType,
+        target: CallFormalType,
+        states: &StateMap,
+    ) -> StoreResult<Option<bool>> {
+        let identity = |ty| match ty {
+            CallFormalType::Real(id) | CallFormalType::ImplicitArray(id) => id,
+        };
+        if let (CallFormalType::Real(source), CallFormalType::Real(target)) = (source, target) {
+            return self.java_reference_type_is_subtype(source, target, states);
+        }
+        let Some(data) = self.operand_conversion_types(
+            &[identity(source), identity(target)],
+            Box::new([]),
+            states,
+        )?
+        else {
+            return Ok(None);
+        };
+        let mut types = OperandTypes {
+            evaluation: self,
+            states,
+            data,
+        };
+        let relation = match brokk_bifrost_jvm::java::conversion::classify(
+            &mut JavaTypeViews(&mut types),
+            source,
+            target,
+        )? {
+            JavaConversion::Strict => Some(true),
+            JavaConversion::Unknown => None,
+            JavaConversion::Loose | JavaConversion::Inapplicable => Some(false),
+        };
+        if self.poll_cancelled() {
+            return Ok(None);
+        }
+        Ok(relation)
+    }
+
     fn operand_conversion_types(
         &mut self,
         roots: &[SemanticId],
+        shapes: Box<[FactProjectedTypeShape]>,
         states: &StateMap,
     ) -> StoreResult<Option<OperandTypeData>> {
         let mut data = OperandTypeData::default();
         let mut pending = roots.to_vec();
+        pending.extend(
+            shapes
+                .iter()
+                .flat_map(|shape| shape.nodes().iter().map(FactProjectedTypeNode::identity)),
+        );
         let mut seen = HashSet::default();
         while let Some(identity) = pending.pop() {
             if self.poll_cancelled() {
@@ -392,12 +484,50 @@ impl FactEvaluation<'_, '_> {
                 }
             }
         }
+        // Nominal-only specificity uses identities as leaf handles. Operand
+        // slots retain the projected nodes themselves, including their edges.
+        for &identity in &seen {
+            data.nodes.insert(
+                identity,
+                FactProjectedTypeNode {
+                    slot: identity,
+                    identity,
+                    indirection: 0,
+                    form: FactProjectedTypeNodeForm::Leaf,
+                },
+            );
+        }
+        for shape in shapes.into_vec() {
+            if !shape.supported || shape.completion != ResolutionCompletion::Complete {
+                data.incomplete
+                    .extend(shape.nodes.iter().map(FactProjectedTypeNode::slot));
+            }
+            for node in shape.nodes.into_vec() {
+                data.nodes.insert(node.slot(), node);
+            }
+        }
         Ok(Some(data))
     }
 }
 
+// Projected shapes are sorted by output slot, independently of request order.
+fn operand_shape_roots(
+    shapes: &[FactProjectedTypeShape],
+    outputs: [SemanticId; 2],
+) -> [SemanticId; 2] {
+    outputs.map(|output| {
+        shapes
+            .iter()
+            .find(|shape| shape.output_slot() == output)
+            .expect("validated operand shape exists")
+            .root_slot()
+    })
+}
+
 #[derive(Default)]
 struct OperandTypeData {
+    nodes: HashMap<SemanticId, FactProjectedTypeNode>,
+    incomplete: HashSet<SemanticId>,
     names: HashMap<SemanticId, String>,
     primitives: HashMap<SemanticId, JavaPrimitive>,
     elements: HashMap<SemanticId, SemanticId>,
@@ -413,32 +543,96 @@ impl JavaConversionTypes for OperandTypes<'_, '_, '_> {
     type Type = SemanticId;
     type Error = StoreError;
     fn ground(&self, ty: SemanticId) -> bool {
-        self.data.ground.contains(&ty)
+        self.data
+            .nodes
+            .get(&ty)
+            .is_some_and(|node| self.data.ground.contains(&node.identity()))
     }
     fn same(&self, a: SemanticId, b: SemanticId) -> bool {
-        a == b
-            || self
-                .data
-                .names
-                .get(&a)
-                .zip(self.data.names.get(&b))
-                .is_some_and(|(a, b)| a == b)
+        let mut pending = vec![(a, b)];
+        let mut seen = HashSet::default();
+        while let Some((a, b)) = pending.pop() {
+            let (Some(left), Some(right)) = (self.data.nodes.get(&a), self.data.nodes.get(&b))
+            else {
+                return false;
+            };
+            let same_identity = left.identity() == right.identity()
+                || self
+                    .data
+                    .names
+                    .get(&left.identity())
+                    .zip(self.data.names.get(&right.identity()))
+                    .is_some_and(|(a, b)| a == b);
+            // element() and nominal-only specificity still use erased identity
+            // coordinates. Either coordinate retains the pre-M3a rule, even
+            // when projected nodes also occupy that identity coordinate.
+            if left.slot() == left.identity() || right.slot() == right.identity() {
+                if !same_identity {
+                    return false;
+                }
+                continue;
+            }
+            if self.data.incomplete.contains(&a)
+                || self.data.incomplete.contains(&b)
+                || !seen.insert((a, b))
+            {
+                return false;
+            }
+            match (left.form(), right.form()) {
+                (FactProjectedTypeNodeForm::Alias(next), _) => pending.push((*next, right.slot())),
+                (_, FactProjectedTypeNodeForm::Alias(next)) => pending.push((left.slot(), *next)),
+                (FactProjectedTypeNodeForm::Leaf, FactProjectedTypeNodeForm::Leaf) => {
+                    if !same_identity {
+                        return false;
+                    }
+                }
+                (
+                    FactProjectedTypeNodeForm::Applied(a_args),
+                    FactProjectedTypeNodeForm::Applied(b_args),
+                ) => {
+                    if a_args.len() != b_args.len() || !same_identity {
+                        return false;
+                    }
+                    pending.extend(a_args.iter().copied().zip(b_args.iter().copied()));
+                }
+                (FactProjectedTypeNodeForm::Array(a), FactProjectedTypeNodeForm::Array(b)) => {
+                    pending.push((*a, *b))
+                }
+                _ => return false,
+            }
+        }
+        true
     }
     fn primitive(&self, ty: SemanticId) -> Option<JavaPrimitive> {
-        self.data.primitives.get(&ty).copied()
+        self.data
+            .primitives
+            .get(&self.data.nodes.get(&ty)?.identity())
+            .copied()
     }
     fn element(&self, ty: SemanticId) -> Option<SemanticId> {
-        self.data.elements.get(&ty).copied()
+        self.data
+            .elements
+            .get(&self.data.nodes.get(&ty)?.identity())
+            .copied()
     }
     fn name(&self, ty: SemanticId) -> Option<&str> {
-        self.data.names.get(&ty).map(String::as_str)
+        self.data
+            .names
+            .get(&self.data.nodes.get(&ty)?.identity())
+            .map(String::as_str)
     }
     fn named(&self, ty: SemanticId) -> bool {
-        self.data.names.contains_key(&ty) && !self.data.declared.contains(&ty)
+        self.data.nodes.get(&ty).is_some_and(|node| {
+            self.data.names.contains_key(&node.identity())
+                && !self.data.declared.contains(&node.identity())
+        })
     }
     fn nominal_widening(&mut self, a: SemanticId, b: SemanticId) -> StoreResult<Option<bool>> {
-        self.evaluation
-            .jvm_closed_type_is_subtype(a, b, self.states)
+        self.evaluation.jvm_closed_type_is_subtype(
+            self.data.nodes[&a].identity(),
+            self.data.nodes[&b].identity(),
+            self.states,
+        )
     }
     fn boxed_widening(
         &mut self,
@@ -453,9 +647,11 @@ impl JavaConversionTypes for OperandTypes<'_, '_, '_> {
             .find(|(_, n)| n.as_str() == name)
             .map(|(&identity, _)| identity);
         match source {
-            Some(source) => self
-                .evaluation
-                .jvm_closed_type_is_subtype(source, target, self.states),
+            Some(source) => self.evaluation.jvm_closed_type_is_subtype(
+                source,
+                self.data.nodes[&target].identity(),
+                self.states,
+            ),
             None => Ok(None),
         }
     }
@@ -496,6 +692,20 @@ mod tests {
                 evaluation: &mut evaluation,
                 states: &states,
                 data: OperandTypeData {
+                    nodes: [source, target]
+                        .into_iter()
+                        .map(|identity| {
+                            (
+                                identity,
+                                FactProjectedTypeNode {
+                                    slot: identity,
+                                    identity,
+                                    indirection: 0,
+                                    form: FactProjectedTypeNodeForm::Leaf,
+                                },
+                            )
+                        })
+                        .collect(),
                     names: [
                         (source, source_name.to_owned()),
                         (target, target_name.to_owned()),
@@ -751,5 +961,356 @@ mod tests {
         println!(
             "protected obligation: incomplete, UnsupportedSemantic(call-site), no complete binding witness; generic grant path not taken"
         );
+    }
+
+    #[test]
+    #[hardwon(
+        "#7196: Kotlin builtin subtype check refuted only proven nominal declarations outside builtin_supertypes"
+    )]
+    fn kotlin_builtin_subtype_refutes_only_proven_nominal_outside_builtin_supertypes() {
+        use crate::analyzer::resolution::fact_source::{
+            JavaInheritanceDeclaration, JavaInheritanceDeclarationKind, JvmDeclarationPackage,
+        };
+        use crate::analyzer::resolution::{
+            LoweredIntrinsicSeed, LoweredMemberScopeProperty, LoweredUnderlyingType,
+        };
+
+        let seed_kotlin_builtin = |service: &mut PreloadedFactResolutionService,
+                                   spelling: &str|
+         -> SemanticId {
+            let fragment = BindingFragmentId::for_test(format!("fragment:{spelling}"));
+            let slot = SemanticId::for_test(format!("seed-slot:{spelling}"));
+            let ty = SemanticId::for_test(format!("builtin-ty:{spelling}"));
+            let frontier = TypedFrontierState::new(
+                slot,
+                vec![ResolutionSlotValue::Runtime {
+                    ty: ResolutionTypeRef::new(ty, 0),
+                    addressable: false,
+                    obligation: None,
+                }],
+                ResolutionCompletion::Complete,
+            );
+            let seed =
+                LoweredIntrinsicSeed::new(IntrinsicTypeKind::LanguageBuiltin, spelling, frontier);
+            service.typed.source_row_fragments.insert(slot, fragment);
+            service.typed.intrinsic_seed_by_slot.insert(slot, seed);
+            service
+                .typed
+                .intrinsic_slots_by_identity
+                .insert(ty, vec![slot]);
+            ty
+        };
+
+        let install_type_body = |service: &mut PreloadedFactResolutionService,
+                                 target: SemanticId| {
+            let fragment = BindingFragmentId::for_test(format!("body:{target}"));
+            service.typed.source_row_fragments.insert(target, fragment);
+            service.typed.member_scope_by_definition.insert(
+                target,
+                LoweredMemberScopeProperty::new(
+                    target,
+                    BindingNodeId::for_test(target.to_string()),
+                ),
+            );
+        };
+
+        for builtin_spelling in ["kotlin.Int", "java.lang.String"] {
+            // Positive cases: proven workspace nominal declarations outside
+            // builtin_supertypes answer Some(false).
+            for (label, package, name, is_interface, is_singleton) in [
+                (
+                    "kotlin-class",
+                    JvmDeclarationPackage::Known(Some("sample".to_owned())),
+                    "KotlinBox",
+                    false,
+                    false,
+                ),
+                (
+                    "kotlin-interface",
+                    JvmDeclarationPackage::Known(Some("sample".to_owned())),
+                    "KotlinTag",
+                    true,
+                    false,
+                ),
+                (
+                    "nested-class",
+                    JvmDeclarationPackage::Known(Some("sample".to_owned())),
+                    "Outer.NestedBox",
+                    false,
+                    false,
+                ),
+                (
+                    "scala-singleton",
+                    JvmDeclarationPackage::Known(Some("sample".to_owned())),
+                    "ScalaSingleton$",
+                    false,
+                    true,
+                ),
+                (
+                    "unnamed-package-class",
+                    JvmDeclarationPackage::Known(None),
+                    "UnnamedBox",
+                    false,
+                    false,
+                ),
+                (
+                    "empty-string-package-class",
+                    JvmDeclarationPackage::Known(Some(String::new())),
+                    "int",
+                    false,
+                    false,
+                ),
+                (
+                    "synthetic-anonymous-body",
+                    JvmDeclarationPackage::Known(Some("sample".to_owned())),
+                    "",
+                    false,
+                    false,
+                ),
+            ] {
+                let mut service = PreloadedFactResolutionService::from_lowered_fragments([], []);
+                let sub = seed_kotlin_builtin(&mut service, builtin_spelling);
+                let sup = SemanticId::for_test(format!("formal:{builtin_spelling}:{label}"));
+                install_type_body(&mut service, sup);
+                service.java_inheritance_metadata.insert(
+                    sup,
+                    JavaInheritanceDeclaration {
+                        definition: sup,
+                        name: name.to_owned(),
+                        package,
+                        kind: JavaInheritanceDeclarationKind::Type {
+                            is_interface,
+                            is_singleton,
+                        },
+                    },
+                );
+                let cancellation = CancellationToken::new();
+                let mut session = preloaded_session(&service, &cancellation);
+                let mut arena = HierarchyOperationArena::default();
+                let mut evaluation = FactEvaluation::new(&mut session, &mut arena, sub);
+                assert_eq!(
+                    evaluation
+                        .kotlin_type_is_subtype(sub, sup, &StateMap::default())
+                        .unwrap(),
+                    Some(false),
+                    "{builtin_spelling} vs {label} must refute"
+                );
+                assert!(!evaluation.cancellation_observed);
+            }
+
+            // Controls: declarations without a TypeBody member scope (such as
+            // typealiases, type parameters, or unindexed default imports),
+            // aliases with underlying types, unknown packages, missing
+            // declaration metadata, and source-declared supertypes/aliases/open
+            // entries in builtin_supertypes must NOT be refuted (answer None).
+            let supertype_in_table = if builtin_spelling == "kotlin.Int" {
+                [
+                    ("kotlin", "Number", false),
+                    ("java.lang", "Comparable", false),
+                    ("scala", "Int", false),
+                ]
+            } else {
+                [
+                    ("java.lang", "CharSequence", false),
+                    ("kotlin", "Comparable", false),
+                    ("scala.Predef", "String", false),
+                ]
+            };
+            for (pkg, name, is_singleton) in supertype_in_table {
+                let mut service = PreloadedFactResolutionService::from_lowered_fragments([], []);
+                let sub = seed_kotlin_builtin(&mut service, builtin_spelling);
+                let sup = SemanticId::for_test(format!("stdlib:{builtin_spelling}:{pkg}.{name}"));
+                install_type_body(&mut service, sup);
+                service.java_inheritance_metadata.insert(
+                    sup,
+                    JavaInheritanceDeclaration {
+                        definition: sup,
+                        name: name.to_owned(),
+                        package: JvmDeclarationPackage::Known(Some(pkg.to_owned())),
+                        kind: JavaInheritanceDeclarationKind::Type {
+                            is_interface: true,
+                            is_singleton,
+                        },
+                    },
+                );
+                let cancellation = CancellationToken::new();
+                let mut session = preloaded_session(&service, &cancellation);
+                let mut arena = HierarchyOperationArena::default();
+                let mut evaluation = FactEvaluation::new(&mut session, &mut arena, sub);
+                assert_eq!(
+                    evaluation
+                        .kotlin_type_is_subtype(sub, sup, &StateMap::default())
+                        .unwrap(),
+                    None,
+                    "{builtin_spelling} vs source-declared {pkg}.{name} must stay open, not refute"
+                );
+            }
+
+            // Typealias / type parameter control: JavaInheritanceDeclaration::Type
+            // present WITHOUT a TypeBody member scope must not refute.
+            {
+                let mut service = PreloadedFactResolutionService::from_lowered_fragments([], []);
+                let sub = seed_kotlin_builtin(&mut service, builtin_spelling);
+                let alias = SemanticId::for_test(format!("typealias:{builtin_spelling}"));
+                service.java_inheritance_metadata.insert(
+                    alias,
+                    JavaInheritanceDeclaration {
+                        definition: alias,
+                        name: "NumberAlias".to_owned(),
+                        package: JvmDeclarationPackage::Known(Some("sample".to_owned())),
+                        kind: JavaInheritanceDeclarationKind::Type {
+                            is_interface: false,
+                            is_singleton: false,
+                        },
+                    },
+                );
+                let cancellation = CancellationToken::new();
+                let mut session = preloaded_session(&service, &cancellation);
+                let mut arena = HierarchyOperationArena::default();
+                let mut evaluation = FactEvaluation::new(&mut session, &mut arena, sub);
+                assert_eq!(
+                    evaluation
+                        .kotlin_type_is_subtype(sub, alias, &StateMap::default())
+                        .unwrap(),
+                    None,
+                    "{builtin_spelling} vs typealias without TypeBody must not refute"
+                );
+            }
+
+            // Underlying-type alias control: even with a TypeBody row, an alias
+            // carrying LoweredUnderlyingType must not refute.
+            {
+                let mut service = PreloadedFactResolutionService::from_lowered_fragments([], []);
+                let sub = seed_kotlin_builtin(&mut service, builtin_spelling);
+                let alias = SemanticId::for_test(format!("underlying:{builtin_spelling}"));
+                let slot = SemanticId::for_test(format!("underlying-slot:{builtin_spelling}"));
+                install_type_body(&mut service, alias);
+                service
+                    .typed
+                    .underlying_types_by_definition
+                    .insert(alias, LoweredUnderlyingType::new(alias, slot));
+                service.java_inheritance_metadata.insert(
+                    alias,
+                    JavaInheritanceDeclaration {
+                        definition: alias,
+                        name: "DefinedAlias".to_owned(),
+                        package: JvmDeclarationPackage::Known(Some("sample".to_owned())),
+                        kind: JavaInheritanceDeclarationKind::Type {
+                            is_interface: false,
+                            is_singleton: false,
+                        },
+                    },
+                );
+                let cancellation = CancellationToken::new();
+                let mut session = preloaded_session(&service, &cancellation);
+                let mut arena = HierarchyOperationArena::default();
+                let mut evaluation = FactEvaluation::new(&mut session, &mut arena, sub);
+                assert_eq!(
+                    evaluation
+                        .kotlin_type_is_subtype(sub, alias, &StateMap::default())
+                        .unwrap(),
+                    None,
+                    "{builtin_spelling} vs definition with underlying type must not refute"
+                );
+            }
+
+            // Unknown package and missing metadata controls must not refute.
+            for with_unknown_pkg in [false, true] {
+                let mut service = PreloadedFactResolutionService::from_lowered_fragments([], []);
+                let sub = seed_kotlin_builtin(&mut service, builtin_spelling);
+                let sup = SemanticId::for_test(format!(
+                    "unknown-meta:{builtin_spelling}:{with_unknown_pkg}"
+                ));
+                install_type_body(&mut service, sup);
+                if with_unknown_pkg {
+                    service.java_inheritance_metadata.insert(
+                        sup,
+                        JavaInheritanceDeclaration {
+                            definition: sup,
+                            name: "Box".to_owned(),
+                            package: JvmDeclarationPackage::Unknown,
+                            kind: JavaInheritanceDeclarationKind::Type {
+                                is_interface: false,
+                                is_singleton: false,
+                            },
+                        },
+                    );
+                }
+                let cancellation = CancellationToken::new();
+                let mut session = preloaded_session(&service, &cancellation);
+                let mut arena = HierarchyOperationArena::default();
+                let mut evaluation = FactEvaluation::new(&mut session, &mut arena, sub);
+                assert_eq!(
+                    evaluation
+                        .kotlin_type_is_subtype(sub, sup, &StateMap::default())
+                        .unwrap(),
+                    None,
+                );
+            }
+
+            // Cancelled read control: refutes nothing and records cancellation.
+            {
+                let mut service = PreloadedFactResolutionService::from_lowered_fragments([], []);
+                let sub = seed_kotlin_builtin(&mut service, builtin_spelling);
+                let sup = SemanticId::for_test(format!("cancelled:{builtin_spelling}"));
+                install_type_body(&mut service, sup);
+                service.java_inheritance_metadata.insert(
+                    sup,
+                    JavaInheritanceDeclaration {
+                        definition: sup,
+                        name: "KotlinBox".to_owned(),
+                        package: JvmDeclarationPackage::Known(Some("sample".to_owned())),
+                        kind: JavaInheritanceDeclarationKind::Type {
+                            is_interface: false,
+                            is_singleton: false,
+                        },
+                    },
+                );
+                let cancellation = CancellationToken::new();
+                cancellation.cancel();
+                let mut session = preloaded_session(&service, &cancellation);
+                let mut arena = HierarchyOperationArena::default();
+                let mut evaluation = FactEvaluation::new(&mut session, &mut arena, sub);
+                assert_eq!(
+                    evaluation
+                        .kotlin_type_is_subtype(sub, sup, &StateMap::default())
+                        .unwrap(),
+                    None,
+                    "a cancelled read must refute nothing"
+                );
+                assert!(evaluation.cancellation_observed);
+            }
+        }
+
+        // Scala singleton `scala.Unit$` in builtin.open (`scala.Unit`) must not refute.
+        {
+            let mut service = PreloadedFactResolutionService::from_lowered_fragments([], []);
+            let sub = seed_kotlin_builtin(&mut service, "kotlin.Unit");
+            let sup = SemanticId::for_test("stdlib:scala.Unit$");
+            install_type_body(&mut service, sup);
+            service.java_inheritance_metadata.insert(
+                sup,
+                JavaInheritanceDeclaration {
+                    definition: sup,
+                    name: "Unit$".to_owned(),
+                    package: JvmDeclarationPackage::Known(Some("scala".to_owned())),
+                    kind: JavaInheritanceDeclarationKind::Type {
+                        is_interface: false,
+                        is_singleton: true,
+                    },
+                },
+            );
+            let cancellation = CancellationToken::new();
+            let mut session = preloaded_session(&service, &cancellation);
+            let mut arena = HierarchyOperationArena::default();
+            let mut evaluation = FactEvaluation::new(&mut session, &mut arena, sub);
+            assert_eq!(
+                evaluation
+                    .kotlin_type_is_subtype(sub, sup, &StateMap::default())
+                    .unwrap(),
+                None,
+                "kotlin.Unit vs scala.Unit$ must stay open"
+            );
+        }
     }
 }

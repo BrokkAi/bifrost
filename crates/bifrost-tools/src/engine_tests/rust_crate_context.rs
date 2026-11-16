@@ -16,10 +16,202 @@ mod tests {
     use brokk_bifrost_analysis::analyzer::store::planner_statistics::pinned_plans::pinned_queries;
 
     use crate::inline_project::{BuiltInlineTestProject, InlineTestProject};
-    use brokk_bifrost_analysis::analyzer::store::rust_unit_summaries::RUST_UNIT_SUMMARY_DERIVATION_VERSION;
+    use brokk_bifrost_analysis::analyzer::store::rust_unit_summaries::rust_unit_summary_derivation_identity;
     use brokk_bifrost_core::cache_gc::PlannerStatisticsState;
     use brokk_bifrost_test_macros::hardwon;
     use rusqlite::types::Value;
+
+    #[test]
+    #[hardwon("#11834: a decided-false cfg mod kept unrelated crate-root lookups incomplete")]
+    fn selected_placement_gap_requires_every_membership_to_be_known_inactive() {
+        use brokk_bifrost_analysis::analyzer::resolution::LoweringGapOrigin;
+        use brokk_bifrost_analysis::analyzer::store::resolution_prepare::resolution_rows::gap_origin_code;
+        use brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind;
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        brokk_bifrost_analysis::analyzer::store::rust_crates::register_point_export_functions(
+            &conn,
+        )
+        .unwrap();
+        // A small relational boundary fixture exercises the real selected SQL
+        // and cfg evaluator, including absent context and multiple memberships.
+        conn.execute_batch("CREATE TEMP TABLE selected_resolution_mounts(mount_ordinal,blob_id,storage_language,persisted_relative_path);
+            CREATE TABLE source_rust_declaration_properties(blob_id,declaration_id,declaration_kind,cfg_condition,derive_helper_attributes,builtin_derives,nearest_declaration_boundary);
+            CREATE INDEX source_rust_declaration_properties_derive_helpers ON source_rust_declaration_properties(blob_id);
+            CREATE INDEX source_rust_declaration_properties_builtin_derives ON source_rust_declaration_properties(blob_id);
+            CREATE TABLE source_native_declaration_bridges(blob_id,declaration_id,source_site);
+            CREATE TABLE resolution_gap_reasons(blob_id,site,origin,reason);
+            CREATE INDEX resolution_gap_reasons_site ON resolution_gap_reasons(blob_id,site);
+            CREATE TABLE resolution_rust_declaration_authorities(blob_id,semantic_key,module_declaration);
+            CREATE TABLE selected_rust_container_placements(mount_ordinal,module_declaration,topology_id,container_path);
+            CREATE TABLE source_rust_macro_inputs(blob_id,cfg_condition,native_gap_site);
+            CREATE INDEX source_rust_macro_inputs_conditional_frontier ON source_rust_macro_inputs(blob_id);
+            CREATE TABLE selected_workspace_file_versions(lang,blob_oid,parse_variant,generation,rel_path);
+            CREATE TABLE blobs(id,lang,blob_oid,parse_variant,generation);
+            CREATE TABLE resolution_unit_summary_members(summary_id,member_ordinal,rel_path);
+            CREATE INDEX resolution_unit_summary_members_path ON resolution_unit_summary_members(rel_path);
+            CREATE TEMP TABLE selected_unit_member_blobs(summary_id,member_ordinal,blob_id);
+            CREATE TEMP TABLE selected_rust_unit_summaries(summary_id);
+            CREATE TABLE rust_resolution_unit_summary_contexts(summary_id,cfg_atoms);
+            INSERT INTO selected_resolution_mounts VALUES(0,1,'rust','src/lib.rs');
+            INSERT INTO source_rust_declaration_properties VALUES(1,0,5,'atom windows',NULL,NULL,0);
+            INSERT INTO source_native_declaration_bridges VALUES(1,0,10);
+            INSERT INTO selected_workspace_file_versions VALUES('rust','blob','',1,'src/lib.rs');
+            INSERT INTO blobs VALUES(1,'rust','blob','',1);
+            INSERT INTO resolution_unit_summary_members VALUES(1,0,'src/lib.rs'),(2,0,'src/lib.rs');
+            INSERT INTO selected_unit_member_blobs VALUES(1,0,1),(2,0,1);").unwrap();
+        let origin = gap_origin_code(LoweringGapOrigin::Extracted(
+            ResolutionGapKind::UnsupportedPlacementBoundary,
+        ));
+        conn.execute(
+            "INSERT INTO resolution_gap_reasons VALUES(1,10,?1,20)",
+            [origin],
+        )
+        .unwrap();
+        let query = pinned("rust_point_derive_helper_conditions");
+        let closed = || {
+            conn.prepare(&query.sql)
+                .unwrap()
+                .exists(rusqlite::params![
+                    gap_origin_code(LoweringGapOrigin::Extracted(
+                        ResolutionGapKind::UnsupportedScopeOrBinder
+                    )),
+                    "[[0,20]]",
+                    gap_origin_code(LoweringGapOrigin::Extracted(
+                        ResolutionGapKind::GeneratedItemSurface
+                    )),
+                    origin,
+                ])
+                .unwrap()
+        };
+        assert!(!closed(), "no selected membership");
+        brokk_bifrost_analysis::analyzer::store::insert_selected_rust_summary_id_for_test(&conn, 1)
+            .unwrap();
+        assert!(!closed(), "missing context");
+        let described = serde_json::to_string(&["target_endian = \"little\"", "unix"]).unwrap();
+        conn.execute(
+            "INSERT INTO rust_resolution_unit_summary_contexts VALUES(1,?1)",
+            [&described],
+        )
+        .unwrap();
+        assert!(closed(), "one known false membership");
+        brokk_bifrost_analysis::analyzer::store::insert_selected_rust_summary_id_for_test(&conn, 2)
+            .unwrap();
+        assert!(!closed(), "second membership missing context");
+        conn.execute(
+            "INSERT INTO rust_resolution_unit_summary_contexts VALUES(2,'[]')",
+            [],
+        )
+        .unwrap();
+        assert!(!closed(), "second membership unknown");
+        conn.execute("UPDATE rust_resolution_unit_summary_contexts SET cfg_atoms='[\"windows\"]' WHERE summary_id=2", []).unwrap();
+        assert!(!closed(), "second membership active");
+        conn.execute(
+            "UPDATE rust_resolution_unit_summary_contexts SET cfg_atoms=?1 WHERE summary_id=2",
+            [&described],
+        )
+        .unwrap();
+        assert!(closed(), "all memberships false");
+        conn.execute(
+            "UPDATE source_rust_declaration_properties SET cfg_condition='atom feature = \"x\"'",
+            [],
+        )
+        .unwrap();
+        conn.execute("UPDATE rust_resolution_unit_summary_contexts SET cfg_atoms='[\"bifrost_incomplete_features\"]'", []).unwrap();
+        assert!(!closed(), "unknown inferred feature never closes");
+        conn.execute(
+            "UPDATE source_rust_declaration_properties SET cfg_condition='atom windows'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE rust_resolution_unit_summary_contexts SET cfg_atoms=?1",
+            [&described],
+        )
+        .unwrap();
+
+        conn.execute("UPDATE resolution_gap_reasons SET origin=?1", [origin + 1])
+            .unwrap();
+        assert!(!closed(), "unrelated origin");
+        conn.execute(
+            "UPDATE resolution_gap_reasons SET origin=?1,site=11",
+            [origin],
+        )
+        .unwrap();
+        assert!(!closed(), "synthetic unbridged site");
+        // The existing inactive-macro arm uses the same membership rule.
+        conn.execute("DELETE FROM resolution_gap_reasons", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO resolution_gap_reasons VALUES(1,11,?1,20)",
+            [gap_origin_code(LoweringGapOrigin::Extracted(
+                ResolutionGapKind::UnexpandedItemMacro,
+            ))],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO source_rust_macro_inputs VALUES(1,'atom windows',11)",
+            [],
+        )
+        .unwrap();
+        assert!(closed(), "inactive macro input");
+        conn.execute(
+            "UPDATE rust_resolution_unit_summary_contexts SET cfg_atoms='[]' WHERE summary_id=2",
+            [],
+        )
+        .unwrap();
+        assert!(!closed(), "unknown macro membership");
+        conn.execute("UPDATE rust_resolution_unit_summary_contexts SET cfg_atoms='[\"windows\"]' WHERE summary_id=2", []).unwrap();
+        assert!(!closed(), "active macro membership");
+        conn.execute(
+            "DELETE FROM rust_resolution_unit_summary_contexts WHERE summary_id=2",
+            [],
+        )
+        .unwrap();
+        assert!(!closed(), "missing macro context");
+        brokk_bifrost_analysis::analyzer::store::clear_selected_rust_units_for_test(&conn).unwrap();
+        assert!(!closed(), "no macro membership");
+    }
+
+    #[test]
+    fn macro_gated_import_reports_module_boundary() {
+        use brokk_bifrost_analysis::analyzer::usages::get_definition::{
+            DefinitionLookupRequest, trace::resolve_definition_batch_with_trace,
+        };
+        let source = "macro_rules! allowed { ($($item:item)*) => { $( #[allow(dead_code)] $item )* }; }\nallowed! { pub mod undecided; }\nuse crate::undecided as Uncertain;\nfn caller() { Uncertain::missing(); }";
+        let project = InlineTestProject::new()
+            .file(
+                "Cargo.toml",
+                "[package]\nname='gaps'\nversion='0.1.0'\nedition='2021'\n",
+            )
+            .file("src/lib.rs", source)
+            .file("src/undecided.rs", "pub fn missing() {}")
+            .build();
+        let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+        let file = project.file("src/lib.rs");
+        let start = source.find("missing()").unwrap();
+        let result = resolve_definition_batch_with_trace(
+            analyzer.analyzer(),
+            vec![DefinitionLookupRequest {
+                file: file.clone(),
+                line: None,
+                column: None,
+                start_byte: Some(start),
+                end_byte: Some(start + "missing".len()),
+            }],
+            file,
+            std::sync::Arc::<str>::from(source),
+            &brokk_bifrost_core::cancellation::CancellationToken::new(),
+        );
+        assert_eq!(result[0].0.status, brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupStatus::Incomplete);
+        assert!(
+            result[0]
+                .0
+                .diagnostics
+                .iter()
+                .any(|reason| reason.kind == "UnsupportedMacroGeneratedModule"),
+            "{result:#?}"
+        );
+    }
 
     #[test]
     fn residual_import_routes_seek_one_module_of_a_large_crate() {
@@ -61,10 +253,7 @@ mod tests {
         let edited_blob: i64 = conn.query_row("SELECT blob.id FROM selected_workspace_file_versions AS file JOIN blobs AS blob ON blob.blob_oid=file.blob_oid AND blob.lang=file.lang WHERE file.rel_path='src/edited.rs'", [], |row| row.get(0)).unwrap();
         for state in PlannerStatisticsState::BOTH {
             state.install(&conn);
-            for name in [
-                "rust_point_module_import_prefix_starts",
-                "rust_point_macro_gated_import_route",
-            ] {
+            for name in ["rust_point_module_import_prefix_starts"] {
                 for selected_blob in [blob, edited_blob] {
                     let mut pin = pinned_queries()
                         .into_iter()
@@ -83,9 +272,6 @@ mod tests {
                     pin.params.push(Value::Integer(selected_blob));
                     if selected_blob != blob {
                         pin.params[4] = Value::Text("Renamed3".into());
-                    }
-                    if name == "rust_point_macro_gated_import_route" {
-                        pin.params[4] = Value::Text("Uncertain".into());
                     }
                     let plan = explain_pin(&conn, &pin);
                     eprintln!("{state:?} {name}: {plan:?}");
@@ -156,18 +342,13 @@ mod tests {
                             "{state:?}: wrong summary must lose the binding"
                         );
                     }
-                    // The macro reader stays dormant until its wrapped-detail defect (#11233) is fixed.
-                    assert_eq!(
-                        count,
-                        usize::from(name == "rust_point_module_import_prefix_starts"),
-                        "{state:?} {name}"
-                    );
+                    assert_eq!(count, 1, "{state:?} {name}");
                     // The member-first primary key cannot narrow module_path.
                     // This negative control must do work across the other eleven modules.
                     let wrong = pin.sql.replace("AS imports", "AS imports INDEXED BY sqlite_autoindex_rust_resolution_unit_summary_import_routes_1");
                     let (_, wrong_steps) = run(&wrong);
                     assert!(
-                        name == "rust_point_macro_gated_import_route" || steps + 20 < wrong_steps,
+                        steps + 20 < wrong_steps,
                         "{state:?} {name}: indexed={steps}, primary={wrong_steps} VM steps"
                     );
                     eprintln!(
@@ -176,6 +357,81 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The workspace of the golden `rust-route-precedence/macro-use-prelude`, inline so the
+    /// projected public tree can run it, plus `noise` unrelated crates that each re-export
+    /// `codegen` (so the binding mirrors hold rows for more than a dozen units).
+    fn macro_use_prelude_workspace(noise: usize) -> InlineTestProject {
+        let members = format!(
+            "[workspace]\nresolver=\"2\"\nmembers=[\"codegen\",\"disabled_codegen\",\"facade\",\"open_facade\",\"consumer\",\"open_consumer\"{}]\n",
+            (0..noise)
+                .map(|i| format!(",\"noise{i}\""))
+                .collect::<String>()
+        );
+        let mut builder = InlineTestProject::new()
+        .file(
+            "Cargo.toml",
+            &members,
+        )
+        .file(
+            "codegen/Cargo.toml",
+            "[package]\nname=\"codegen\"\nversion=\"0.0.0\"\nedition=\"2021\"\n[lib]\nproc-macro=true\n",
+        )
+        .file(
+            "codegen/src/lib.rs",
+            "extern crate proc_macro;\n#[proc_macro]\npub fn routes(input: proc_macro::TokenStream) -> proc_macro::TokenStream { input }\n",
+        )
+        .file(
+            "disabled_codegen/Cargo.toml",
+            "[package]\nname=\"disabled_codegen\"\nversion=\"0.0.0\"\nedition=\"2021\"\n[lib]\nproc-macro=true\n",
+        )
+        .file(
+            "disabled_codegen/src/lib.rs",
+            "extern crate proc_macro;\n#[proc_macro]\npub fn disabled_only(input: proc_macro::TokenStream) -> proc_macro::TokenStream { input }\n",
+        )
+        .file(
+            "facade/Cargo.toml",
+            "[package]\nname=\"facade\"\nversion=\"0.0.0\"\nedition=\"2021\"\n[dependencies]\ncodegen={path=\"../codegen\"}\n",
+        )
+        .file("facade/src/lib.rs", "pub use codegen::*;\n")
+        .file(
+            "open_facade/Cargo.toml",
+            "[package]\nname=\"open_facade\"\nversion=\"0.0.0\"\nedition=\"2021\"\n[dependencies]\ndisabled_codegen={path=\"../disabled_codegen\"}\n",
+        )
+        .file("open_facade/src/lib.rs", "pub use disabled_codegen::*;\nunknown_provider_items!();\n")
+        .file(
+            "consumer/Cargo.toml",
+            "[package]\nname=\"consumer\"\nversion=\"0.0.0\"\nedition=\"2021\"\n[dependencies]\nfacade={path=\"../facade\"}\nopen_facade={path=\"../open_facade\"}\n",
+        )
+        .file(
+            "consumer/src/lib.rs",
+            "#[macro_use]\nextern crate facade;\n#[cfg(any())]\n#[macro_use]\nextern crate open_facade;\npub mod nested;\n",
+        )
+        .file(
+            "consumer/src/nested.rs",
+            "pub fn run() {\n    routes!();\n    disabled_only!();\n    missing_macro!();\n}\n",
+        )
+        .file(
+            "open_consumer/Cargo.toml",
+            "[package]\nname=\"open_consumer\"\nversion=\"0.0.0\"\nedition=\"2021\"\n[dependencies]\nopen_facade={path=\"../open_facade\"}\n",
+        )
+        .file(
+            "open_consumer/src/lib.rs",
+            "#[macro_use]\nextern crate open_facade;\n#[macro_export]\nmacro_rules! owned_macro { () => {} }\n",
+        );
+        for i in 0..noise {
+            builder = builder
+                .file(
+                    format!("noise{i}/Cargo.toml"),
+                    format!("[package]\nname=\"noise{i}\"\nversion=\"0.0.0\"\nedition=\"2021\"\n[dependencies]\ncodegen={{path=\"../codegen\"}}\n"),
+                )
+                .file(
+                    format!("noise{i}/src/lib.rs"),
+                    "pub use codegen::*;\n#[macro_export]\nmacro_rules! local_noise { () => {} }\n",
+                );
+        }
+        builder
     }
 
     #[test]
@@ -188,57 +444,7 @@ mod tests {
         };
         // The same workspace as the private rust-route-precedence/macro-use-prelude
         // golden, inline so that the projected public tree can run this test.
-        let builder = InlineTestProject::new()
-            .file(
-                "Cargo.toml",
-                "[workspace]\nresolver=\"2\"\nmembers=[\"codegen\",\"disabled_codegen\",\"facade\",\"open_facade\",\"consumer\",\"open_consumer\"]\n",
-            )
-            .file(
-                "codegen/Cargo.toml",
-                "[package]\nname=\"codegen\"\nversion=\"0.0.0\"\nedition=\"2021\"\n[lib]\nproc-macro=true\n",
-            )
-            .file(
-                "codegen/src/lib.rs",
-                "extern crate proc_macro;\n#[proc_macro]\npub fn routes(input: proc_macro::TokenStream) -> proc_macro::TokenStream { input }\n",
-            )
-            .file(
-                "disabled_codegen/Cargo.toml",
-                "[package]\nname=\"disabled_codegen\"\nversion=\"0.0.0\"\nedition=\"2021\"\n[lib]\nproc-macro=true\n",
-            )
-            .file(
-                "disabled_codegen/src/lib.rs",
-                "extern crate proc_macro;\n#[proc_macro]\npub fn disabled_only(input: proc_macro::TokenStream) -> proc_macro::TokenStream { input }\n",
-            )
-            .file(
-                "facade/Cargo.toml",
-                "[package]\nname=\"facade\"\nversion=\"0.0.0\"\nedition=\"2021\"\n[dependencies]\ncodegen={path=\"../codegen\"}\n",
-            )
-            .file("facade/src/lib.rs", "pub use codegen::*;\n")
-            .file(
-                "open_facade/Cargo.toml",
-                "[package]\nname=\"open_facade\"\nversion=\"0.0.0\"\nedition=\"2021\"\n[dependencies]\ndisabled_codegen={path=\"../disabled_codegen\"}\n",
-            )
-            .file("open_facade/src/lib.rs", "pub use disabled_codegen::*;\nunknown_provider_items!();\n")
-            .file(
-                "consumer/Cargo.toml",
-                "[package]\nname=\"consumer\"\nversion=\"0.0.0\"\nedition=\"2021\"\n[dependencies]\nfacade={path=\"../facade\"}\nopen_facade={path=\"../open_facade\"}\n",
-            )
-            .file(
-                "consumer/src/lib.rs",
-                "#[macro_use]\nextern crate facade;\n#[cfg(any())]\n#[macro_use]\nextern crate open_facade;\npub mod nested;\n",
-            )
-            .file(
-                "consumer/src/nested.rs",
-                "pub fn run() {\n    routes!();\n    disabled_only!();\n    missing_macro!();\n}\n",
-            )
-            .file(
-                "open_consumer/Cargo.toml",
-                "[package]\nname=\"open_consumer\"\nversion=\"0.0.0\"\nedition=\"2021\"\n[dependencies]\nopen_facade={path=\"../open_facade\"}\n",
-            )
-            .file(
-                "open_consumer/src/lib.rs",
-                "#[macro_use]\nextern crate open_facade;\n#[macro_export]\nmacro_rules! owned_macro { () => {} }\n",
-            );
+        let builder = macro_use_prelude_workspace(0);
         let project = builder.build();
         let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
         let store = analyzer.store().unwrap();
@@ -386,6 +592,948 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The published own-binding readers (`rust_crate_published_*.sql`) read the unit-summary
+    /// mirrors `rust_resolution_unit_summary_binding_*` of the selected unit. Each statement must
+    /// seek one unit's rows by the keyed indexes, however many units are selected: 14 here, in
+    /// both planner-statistics states, with controls that show the assertions can fail.
+    #[test]
+    #[hardwon(
+        "#11173: M3 family 2 moved the published binding readers; a scan of selected units or of a unit's alternatives must not return"
+    )]
+    fn published_binding_readers_seek_one_units_mirror_rows_among_many_units() {
+        let project = macro_use_prelude_workspace(12).build();
+        let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+        let store = analyzer.store().unwrap();
+        let conn = store.conn.lock().unwrap();
+        brokk_bifrost_analysis::analyzer::store::ensure_revisioned_workspace_views(&conn).unwrap();
+        brokk_bifrost_analysis::analyzer::store::planner_statistics::pinned_plans::prepare_pin_context(&conn);
+        brokk_bifrost_analysis::analyzer::store::rust_crates::register_point_export_functions(
+            &conn,
+        )
+        .unwrap();
+        conn.execute("INSERT INTO selected_workspace_revisions SELECT workspace_id,lang,generation,revision FROM workspace_heads WHERE lang='rust'", []).unwrap();
+        brokk_bifrost_analysis::analyzer::store::fill_selected_rust_units(&conn).unwrap();
+        let selected: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM selected_rust_unit_summaries",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            selected >= 14,
+            "fixture must select 12 noise units and the macro-use workspace: {selected}"
+        );
+        conn.execute("INSERT INTO selected_resolution_mounts(mount_ordinal,blob_id,storage_language,semantic_language,persisted_relative_path) SELECT row_number() OVER(),blob_id,'rust','rust',rel_path FROM (SELECT DISTINCT blob_id,rel_path FROM selected_rust_crate_containers)",[]).unwrap();
+        conn.execute_batch(brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_crate_context::SELECTED_MODULE_PLACEMENTS_FILL_SQL).unwrap();
+        let topology = |name: &str| -> i64 {
+            conn.query_row(
+                "SELECT topology_id FROM rust_crate_topologies WHERE crate_name=?1",
+                [name],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        let consumer = topology("consumer");
+        let open_consumer = topology("open_consumer");
+        let facade = topology("facade");
+        let int = Value::Integer;
+        let text = |value: &str| Value::Text(value.to_owned());
+        // (pin, parameters, rows the statement must return, indexes its plan must show)
+        let cases: Vec<(&str, Vec<Value>, bool, Vec<&str>)> = vec![
+            (
+                "rust_published_export",
+                vec![
+                    int(consumer),
+                    text("crate::nested"),
+                    text("macro"),
+                    text("routes"),
+                    int(consumer),
+                    text("crate::nested"),
+                ],
+                true,
+                vec![
+                    "rust_summary_module_owner",
+                    "rust_summary_alternatives_owner",
+                ],
+            ),
+            (
+                "rust_published_open_inventory",
+                vec![
+                    int(open_consumer),
+                    text("crate"),
+                    text("macro"),
+                    text("missing_macro"),
+                    int(open_consumer),
+                    text("crate"),
+                ],
+                true,
+                vec![
+                    "rust_summary_module_owner",
+                    "rust_summary_alternatives_owner",
+                ],
+            ),
+            (
+                "rust_published_binding_exact",
+                vec![
+                    int(facade),
+                    text("crate"),
+                    text("macro"),
+                    text("routes"),
+                    int(facade),
+                    text("crate"),
+                ],
+                true,
+                vec![
+                    "rust_summary_module_owner (summary_id=? AND module_path=?)",
+                    "rust_summary_alternatives_owner",
+                ],
+            ),
+            (
+                "rust_published_macro_prelude",
+                vec![
+                    int(consumer),
+                    text("crate"),
+                    text("macro"),
+                    text("routes"),
+                    int(consumer),
+                    text("crate"),
+                ],
+                true,
+                vec!["rust_summary_module_owner (summary_id=? AND module_path=?)"],
+            ),
+            (
+                "rust_published_root_reexport",
+                vec![
+                    int(consumer),
+                    text("crate"),
+                    text("macro"),
+                    text("routes"),
+                    int(consumer),
+                    text("crate"),
+                ],
+                false,
+                vec![
+                    "rust_summary_module_owner",
+                    "rust_summary_alternatives_owner",
+                ],
+            ),
+            (
+                "rust_published_module_prefix",
+                vec![
+                    int(consumer),
+                    text("crate"),
+                    text("macro"),
+                    text("routes"),
+                    int(consumer),
+                    text("crate"),
+                ],
+                false,
+                vec![
+                    "rust_summary_module_owner",
+                    "rust_summary_alternatives_owner",
+                ],
+            ),
+        ];
+        let scans_and_plan = |conn: &rusqlite::Connection, sql: &str, params: &[Value]| {
+            let mut statement = conn.prepare(sql).unwrap();
+            let rows = statement
+                .query_map(rusqlite::params_from_iter(params.iter()), |_| Ok(()))
+                .unwrap()
+                .count();
+            let scans = statement.get_status(rusqlite::StatementStatus::FullscanStep);
+            let plan = explain_pin(
+                conn,
+                &brokk_bifrost_analysis::analyzer::store::planner_statistics::pinned_plans::PinnedQuery {
+                    name: "m3f2".into(),
+                    sql: sql.into(),
+                    params: params.to_vec(),
+                },
+            );
+            (rows, scans, plan)
+        };
+        for state in PlannerStatisticsState::BOTH {
+            state.install(&conn);
+            for (name, params, returns_rows, indexes) in &cases {
+                let pin = pinned(name);
+                let (rows, scans, plan) = scans_and_plan(&conn, &pin.sql, params);
+                eprintln!("{state:?} {name}: rows={rows} fullscan_steps={scans} {plan:?}");
+                assert!(
+                    !returns_rows || rows > 0,
+                    "{state:?} {name}: the fixture must make the reader answer"
+                );
+                assert!(
+                    scans < 12,
+                    "{state:?} {name}: scans over {selected} selected units: fullscan_steps={scans} {plan:?}"
+                );
+                for index in indexes {
+                    assert!(
+                        plan.iter()
+                            .any(|step| step.contains("SEARCH") && step.contains(index)),
+                        "{state:?} {name}: no keyed search of {index}: {plan:?}"
+                    );
+                }
+                assert!(
+                    plan.iter().all(|step| !step.contains("AUTOMATIC")
+                        && !(step.starts_with("SCAN")
+                            && step.contains("rust_resolution_unit_summary_binding_"))
+                        && step != "SEARCH owner USING PRIMARY KEY (summary_id=?)"
+                        && !(step.starts_with("SEARCH alternative USING PRIMARY KEY")
+                            || step.starts_with("SEARCH rust_resolution_unit_summary_binding_alternatives USING PRIMARY KEY"))),
+                    "{state:?} {name}: {plan:?}"
+                );
+            }
+            // Controls: the same assertions fail when the keyed access is removed.
+            let export = pinned("rust_published_export");
+            let params = &cases[0].1;
+            let unkeyed = export
+                .sql
+                .replace("unit.topology_id=?1", "unit.topology_id+0=?1");
+            assert_ne!(unkeyed, export.sql);
+            let (_, scans, _) = scans_and_plan(&conn, &unkeyed, params);
+            assert!(
+                scans >= 12,
+                "{state:?}: scanning selected units must show fullscan_steps>=12, got {scans}"
+            );
+            // Under representative statistics the planner finds the owner index unaided, so this
+            // control discriminates only where the planner's default is the primary key.
+            if matches!(state, PlannerStatisticsState::Absent) {
+                let pk_only = export
+                    .sql
+                    .replace("INDEXED BY rust_summary_alternatives_owner", "NOT INDEXED");
+                assert_ne!(pk_only, export.sql);
+                let (_, _, plan) = scans_and_plan(&conn, &pk_only, params);
+                assert!(
+                    plan.iter()
+                        .any(|step| step.contains("alternative USING PRIMARY KEY (summary_id=?)")),
+                    "{state:?}: without the owner index the alternatives are sought by summary only: {plan:?}"
+                );
+            }
+        }
+    }
+
+    /// The published readers answer from the unit-summary mirrors, not from the topology rows
+    /// they replaced: every case below changes only mirror rows (inside a savepoint) so that
+    /// mirror and topology disagree, and the answer must follow the mirror. A selected-set
+    /// change must also change the answer: the selected-unit join is the currency guard until M4.
+    #[test]
+    #[hardwon(
+        "#11173: M3 family 2 moved the published binding readers off rust_crate_binding_*; the topology rows must not answer"
+    )]
+    fn published_binding_readers_follow_the_summary_mirrors_and_the_selected_set() {
+        let project = macro_use_prelude_workspace(0).build();
+        let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+        let store = analyzer.store().unwrap();
+        let conn = store.conn.lock().unwrap();
+        brokk_bifrost_analysis::analyzer::store::ensure_revisioned_workspace_views(&conn).unwrap();
+        brokk_bifrost_analysis::analyzer::store::planner_statistics::pinned_plans::prepare_pin_context(&conn);
+        brokk_bifrost_analysis::analyzer::store::rust_crates::register_point_export_functions(
+            &conn,
+        )
+        .unwrap();
+        conn.execute("INSERT INTO selected_workspace_revisions SELECT workspace_id,lang,generation,revision FROM workspace_heads WHERE lang='rust'", []).unwrap();
+        brokk_bifrost_analysis::analyzer::store::fill_selected_rust_units(&conn).unwrap();
+        conn.execute("INSERT INTO selected_resolution_mounts(mount_ordinal,blob_id,storage_language,semantic_language,persisted_relative_path) SELECT row_number() OVER(),blob_id,'rust','rust',rel_path FROM (SELECT DISTINCT blob_id,rel_path FROM selected_rust_crate_containers)", []).unwrap();
+        conn.execute_batch(brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_crate_context::SELECTED_MODULE_PLACEMENTS_FILL_SQL).unwrap();
+        let topology = |name: &str| -> i64 {
+            conn.query_row(
+                "SELECT topology_id FROM rust_crate_topologies WHERE crate_name=?1",
+                [name],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        let (consumer, open_consumer, facade, open_facade) = (
+            topology("consumer"),
+            topology("open_consumer"),
+            topology("facade"),
+            topology("open_facade"),
+        );
+        let int = Value::Integer;
+        let text = |value: &str| Value::Text(value.to_owned());
+        let answer = |name: &str, params: &[Value]| -> Vec<Vec<Value>> {
+            let sql = pinned(name).sql;
+            let mut statement = conn.prepare(&sql).unwrap();
+            let width = statement.column_count();
+            statement
+                .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                    (0..width)
+                        .map(|column| row.get::<_, Value>(column))
+                        .collect()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let summary_of = |topology: i64| -> i64 {
+            conn.query_row(
+                "SELECT summary_id FROM selected_rust_unit_summaries WHERE topology_id=?1",
+                [topology],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        let exact = [
+            int(facade),
+            text("crate"),
+            text("macro"),
+            text("routes"),
+            int(facade),
+            text("crate"),
+        ];
+        let inventory = [
+            int(open_consumer),
+            text("crate"),
+            text("macro"),
+            text("missing_macro"),
+            int(open_consumer),
+            text("crate"),
+        ];
+        let prelude = [
+            int(consumer),
+            text("crate"),
+            text("macro"),
+            text("routes"),
+            int(consumer),
+            text("crate"),
+        ];
+        let export = [
+            int(consumer),
+            text("crate::nested"),
+            text("macro"),
+            text("routes"),
+            int(consumer),
+            text("crate::nested"),
+        ];
+        let base_exact = answer("rust_published_binding_exact", &exact);
+        let base_inventory = answer("rust_published_open_inventory", &inventory);
+        let base_prelude = answer("rust_published_macro_prelude", &prelude);
+        let base_export = answer("rust_published_export", &export);
+        assert!(
+            base_exact.len() >= 2
+                && base_exact.iter().any(|row| row[1] != Value::Null)
+                && !base_inventory.is_empty()
+                && !base_prelude.is_empty()
+                && !base_export.is_empty(),
+            "non-vacuous baseline: {base_exact:?} {base_inventory:?} {base_prelude:?} {base_export:?}"
+        );
+        let mutate = |statement: &str, parameter: i64| {
+            conn.execute_batch("SAVEPOINT mirror_mutation").unwrap();
+            let _fixture =
+                brokk_bifrost_analysis::analyzer::store::sealed_families::Fixture::new(&conn);
+            let changed = conn.execute(statement, [parameter]).unwrap();
+            assert!(changed > 0, "mutation changed no mirror row: {statement}");
+        };
+        let restore = || {
+            conn.execute_batch("ROLLBACK TO mirror_mutation; RELEASE mirror_mutation")
+                .unwrap()
+        };
+
+        // Certificate completeness comes from the mirror's names.
+        mutate(
+            "UPDATE rust_resolution_unit_summary_binding_names SET complete=1-complete WHERE summary_id=?1",
+            summary_of(facade),
+        );
+        let flipped = answer("rust_published_binding_exact", &exact);
+        assert_ne!(
+            flipped, base_exact,
+            "complete flag must come from the mirror"
+        );
+        assert_eq!(flipped.len(), base_exact.len());
+        restore();
+        // Endpoints come from the mirror's alternatives.
+        mutate(
+            "DELETE FROM rust_resolution_unit_summary_binding_alternatives WHERE summary_id=?1",
+            summary_of(facade),
+        );
+        assert!(
+            answer("rust_published_binding_exact", &exact)
+                .iter()
+                .all(|row| row[1] == Value::Null),
+            "endpoints must come from the mirror"
+        );
+        assert!(
+            answer("rust_published_export", &export).len() < base_export.len(),
+            "exports reached through the facade glob must follow the mirror alternatives"
+        );
+        restore();
+        // Open reasons come from the mirror's blockers.
+        mutate(
+            "DELETE FROM rust_resolution_unit_summary_binding_blockers WHERE summary_id=?1",
+            summary_of(open_facade),
+        );
+        assert_ne!(
+            answer("rust_published_open_inventory", &inventory),
+            base_inventory,
+            "open reasons must come from the mirror blockers"
+        );
+        restore();
+        // The inherited macro-use prelude comes from the provider's mirror owners.
+        mutate(
+            "DELETE FROM rust_resolution_unit_summary_binding_owners WHERE summary_id=?1 AND module_path='crate'",
+            summary_of(facade),
+        );
+        assert!(
+            answer("rust_published_macro_prelude", &prelude).is_empty(),
+            "prelude owners must come from the mirror"
+        );
+        restore();
+        // Currency: a unit that leaves the selected set publishes nothing.
+        conn.execute_batch("SAVEPOINT selection").unwrap();
+        assert_eq!(
+            brokk_bifrost_analysis::analyzer::store::drop_selected_rust_unit_for_test(
+                &conn, facade
+            )
+            .unwrap(),
+            1
+        );
+        assert!(
+            answer("rust_published_binding_exact", &exact).is_empty(),
+            "an unselected topology must publish no binding rows"
+        );
+        conn.execute_batch("ROLLBACK TO selection; RELEASE selection")
+            .unwrap();
+        assert_eq!(answer("rust_published_binding_exact", &exact), base_exact);
+        assert_eq!(
+            answer("rust_published_open_inventory", &inventory),
+            base_inventory
+        );
+        assert_eq!(
+            answer("rust_published_macro_prelude", &prelude),
+            base_prelude
+        );
+        assert_eq!(answer("rust_published_export", &export), base_export);
+    }
+
+    /// A binding alternative names its target by unit, module and name. When one name has
+    /// alternatives in two modules, the reader must return every endpoint for the caller to
+    /// treat as ambiguous, never the first it finds.
+    #[test]
+    #[hardwon(
+        "#11173: M3 family 2 name-form binding alternatives must not collapse to the first match"
+    )]
+    fn one_name_with_two_binding_alternatives_returns_every_endpoint() {
+        let project = InlineTestProject::new()
+            .file(
+                "Cargo.toml",
+                "[package]\nname='amb'\nversion='0.1.0'\nedition='2021'\n",
+            )
+            .file(
+                "src/lib.rs",
+                "mod a;\nmod b;\npub use a::item;\npub use b::item;\n",
+            )
+            .file("src/a.rs", "pub fn item() {}\n")
+            .file("src/b.rs", "pub fn item() {}\n")
+            .build();
+        let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+        let store = analyzer.store().unwrap();
+        let conn = store.conn.lock().unwrap();
+        brokk_bifrost_analysis::analyzer::store::ensure_revisioned_workspace_views(&conn).unwrap();
+        brokk_bifrost_analysis::analyzer::store::planner_statistics::pinned_plans::prepare_pin_context(&conn);
+        brokk_bifrost_analysis::analyzer::store::rust_crates::register_point_export_functions(
+            &conn,
+        )
+        .unwrap();
+        conn.execute("INSERT INTO selected_workspace_revisions SELECT workspace_id,lang,generation,revision FROM workspace_heads WHERE lang='rust'", []).unwrap();
+        brokk_bifrost_analysis::analyzer::store::fill_selected_rust_units(&conn).unwrap();
+        let topology: i64 = conn
+            .query_row(
+                "SELECT topology_id FROM rust_crate_topologies WHERE crate_name='amb'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut endpoints: Vec<String> = conn
+            .prepare(&pinned("rust_published_binding_exact").sql)
+            .unwrap()
+            .query_map(
+                rusqlite::params![topology, "crate", "value", "item", topology, "crate"],
+                |row| row.get::<_, Option<String>>(2),
+            )
+            .unwrap()
+            .filter_map(|row| row.unwrap())
+            .collect();
+        endpoints.sort();
+        assert_eq!(endpoints, ["crate::a", "crate::b"].map(String::from));
+    }
+
+    /// A macro looked up from a nested module also sees the crate root's textual-scope macro
+    /// bindings, but only for a request from inside the same crate.
+    #[test]
+    #[hardwon(
+        "#11173: M3 family 2 mutation matrix: the crate-root macro fallback of the published binding reader had no test"
+    )]
+    fn a_nested_module_macro_lookup_falls_back_to_the_crate_roots_bindings_for_its_own_crate_only()
+    {
+        use brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_crate_context::PUBLISHED_EXPORT;
+        let project = InlineTestProject::new()
+            .file("Cargo.toml", "[workspace]\nresolver=\"2\"\nmembers=[\"dep\",\"app\"]\n")
+            .file("dep/Cargo.toml", "[package]\nname='dep'\nversion='0.0.0'\nedition='2021'\n")
+            .file("dep/src/lib.rs", "#[macro_export]\nmacro_rules! shared_macro { () => {} }\n")
+            .file("app/Cargo.toml", "[package]\nname='app'\nversion='0.0.0'\nedition='2021'\n[dependencies]\ndep={path=\"../dep\"}\n")
+            .file("app/src/lib.rs", "pub use dep::shared_macro;\npub mod nested;\n")
+            .file("app/src/nested.rs", "pub fn run() {}\n")
+            .build();
+        let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+        let store = analyzer.store().unwrap();
+        let conn = store.conn.lock().unwrap();
+        brokk_bifrost_analysis::analyzer::store::ensure_revisioned_workspace_views(&conn).unwrap();
+        brokk_bifrost_analysis::analyzer::store::planner_statistics::pinned_plans::prepare_pin_context(&conn);
+        brokk_bifrost_analysis::analyzer::store::rust_crates::register_point_export_functions(
+            &conn,
+        )
+        .unwrap();
+        conn.execute("INSERT INTO selected_workspace_revisions SELECT workspace_id,lang,generation,revision FROM workspace_heads WHERE lang='rust'", []).unwrap();
+        brokk_bifrost_analysis::analyzer::store::fill_selected_rust_units(&conn).unwrap();
+        conn.execute("INSERT INTO selected_resolution_mounts(mount_ordinal,blob_id,storage_language,semantic_language,persisted_relative_path) SELECT row_number() OVER(),blob_id,'rust','rust',rel_path FROM (SELECT DISTINCT blob_id,rel_path FROM selected_rust_crate_containers)", []).unwrap();
+        conn.execute_batch(brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_crate_context::SELECTED_MODULE_PLACEMENTS_FILL_SQL).unwrap();
+        let topology = |name: &str| -> i64 {
+            conn.query_row(
+                "SELECT topology_id FROM rust_crate_topologies WHERE crate_name=?1",
+                [name],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        let (app, dep) = (topology("app"), topology("dep"));
+        let rows = |namespace: &str, requester: i64, requester_path: &str| -> usize {
+            conn.prepare_cached(PUBLISHED_EXPORT)
+                .unwrap()
+                .query_map(
+                    rusqlite::params![
+                        app,
+                        "crate::nested",
+                        namespace,
+                        "shared_macro",
+                        requester,
+                        requester_path
+                    ],
+                    |_| Ok(()),
+                )
+                .unwrap()
+                .count()
+        };
+        assert_eq!(
+            rows("macro", app, "crate::nested"),
+            1,
+            "own crate sees the root binding"
+        );
+        assert_eq!(
+            rows("type", app, "crate::nested"),
+            0,
+            "the fallback is macro-only"
+        );
+        assert_eq!(
+            rows("macro", dep, "crate"),
+            0,
+            "another crate does not inherit the root's textual scope"
+        );
+    }
+
+    /// The published readers' answers over the macro-use prelude workspace, for every crate,
+    /// module, namespace and name of interest: row counts of the open inventory, the export
+    /// and the exact lookup (cells where all three are zero are omitted). Pins the namespace,
+    /// name, completeness and owner predicates of the inventory and prelude statements.
+    #[test]
+    #[hardwon(
+        "#11173: M3 family 2 mutation matrix: inventory and prelude predicates of the published binding readers had no test"
+    )]
+    fn published_readers_answer_the_macro_use_prelude_grid() {
+        let project = macro_use_prelude_workspace(0).build();
+        let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+        let store = analyzer.store().unwrap();
+        let conn = store.conn.lock().unwrap();
+        brokk_bifrost_analysis::analyzer::store::ensure_revisioned_workspace_views(&conn).unwrap();
+        brokk_bifrost_analysis::analyzer::store::planner_statistics::pinned_plans::prepare_pin_context(&conn);
+        brokk_bifrost_analysis::analyzer::store::rust_crates::register_point_export_functions(
+            &conn,
+        )
+        .unwrap();
+        conn.execute("INSERT INTO selected_workspace_revisions SELECT workspace_id,lang,generation,revision FROM workspace_heads WHERE lang='rust'", []).unwrap();
+        brokk_bifrost_analysis::analyzer::store::fill_selected_rust_units(&conn).unwrap();
+        conn.execute("INSERT INTO selected_resolution_mounts(mount_ordinal,blob_id,storage_language,semantic_language,persisted_relative_path) SELECT row_number() OVER(),blob_id,'rust','rust',rel_path FROM (SELECT DISTINCT blob_id,rel_path FROM selected_rust_crate_containers)", []).unwrap();
+        conn.execute_batch(brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_crate_context::SELECTED_MODULE_PLACEMENTS_FILL_SQL).unwrap();
+        let mut cells = Vec::new();
+        for krate in ["consumer", "open_consumer", "facade", "open_facade"] {
+            let t: i64 = conn
+                .query_row(
+                    "SELECT topology_id FROM rust_crate_topologies WHERE crate_name=?1",
+                    [krate],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            for module in ["crate", "crate::nested"] {
+                for ns in ["type", "value", "macro"] {
+                    for name in [
+                        "missing_macro",
+                        "routes",
+                        "owned_macro",
+                        "disabled_only",
+                        "unknown",
+                    ] {
+                        let count = |q: &str| {
+                            conn.prepare(&pinned(q).sql)
+                                .unwrap()
+                                .query_map(
+                                    rusqlite::params![t, module, ns, name, t, module],
+                                    |_| Ok(()),
+                                )
+                                .unwrap()
+                                .count()
+                        };
+                        let (inv, exp, ex) = (
+                            count("rust_published_open_inventory"),
+                            count("rust_published_export"),
+                            count("rust_published_binding_exact"),
+                        );
+                        if inv + exp + ex > 0 {
+                            cells.push(format!(
+                                "{krate} {module} {ns} {name}: inv={inv} export={exp} exact={ex}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        let expected: &[&str] = &[
+            "consumer crate macro routes: inv=0 export=1 exact=0",
+            "consumer crate::nested macro routes: inv=0 export=1 exact=0",
+            "open_consumer crate macro missing_macro: inv=1 export=0 exact=0",
+            "open_consumer crate macro routes: inv=1 export=0 exact=0",
+            "open_consumer crate macro owned_macro: inv=0 export=1 exact=2",
+            "open_consumer crate macro disabled_only: inv=2 export=1 exact=0",
+            "open_consumer crate macro unknown: inv=1 export=0 exact=0",
+            "open_consumer crate::nested macro missing_macro: inv=1 export=0 exact=0",
+            "open_consumer crate::nested macro routes: inv=1 export=0 exact=0",
+            "open_consumer crate::nested macro owned_macro: inv=0 export=1 exact=0",
+            "open_consumer crate::nested macro disabled_only: inv=2 export=1 exact=0",
+            "open_consumer crate::nested macro unknown: inv=1 export=0 exact=0",
+            "facade crate value routes: inv=0 export=1 exact=2",
+            "facade crate macro routes: inv=0 export=1 exact=2",
+            "facade crate::nested macro routes: inv=0 export=1 exact=0",
+            "open_facade crate type missing_macro: inv=1 export=0 exact=0",
+            "open_facade crate type routes: inv=1 export=0 exact=0",
+            "open_facade crate type owned_macro: inv=1 export=0 exact=0",
+            "open_facade crate type disabled_only: inv=1 export=0 exact=0",
+            "open_facade crate type unknown: inv=1 export=0 exact=0",
+            "open_facade crate value missing_macro: inv=1 export=0 exact=0",
+            "open_facade crate value routes: inv=1 export=0 exact=0",
+            "open_facade crate value owned_macro: inv=1 export=0 exact=0",
+            "open_facade crate value disabled_only: inv=2 export=1 exact=2",
+            "open_facade crate value unknown: inv=1 export=0 exact=0",
+            "open_facade crate macro missing_macro: inv=1 export=0 exact=0",
+            "open_facade crate macro routes: inv=1 export=0 exact=0",
+            "open_facade crate macro owned_macro: inv=1 export=0 exact=0",
+            "open_facade crate macro disabled_only: inv=2 export=1 exact=2",
+            "open_facade crate macro unknown: inv=1 export=0 exact=0",
+            "open_facade crate::nested macro missing_macro: inv=1 export=0 exact=0",
+            "open_facade crate::nested macro routes: inv=1 export=0 exact=0",
+            "open_facade crate::nested macro owned_macro: inv=1 export=0 exact=0",
+            "open_facade crate::nested macro disabled_only: inv=2 export=1 exact=0",
+            "open_facade crate::nested macro unknown: inv=1 export=0 exact=0",
+        ];
+        assert_eq!(cells, expected);
+    }
+
+    /// The access predicate and the (namespace, name) joins of the published binding reader.
+    /// One crate binds names with every visibility; a second crate is a foreign requester.
+    #[test]
+    #[hardwon(
+        "#11173: M3 family 2 mutation matrix: visibility, namespace and name predicates of the published binding reader had no test"
+    )]
+    fn published_binding_access_and_certificate_joins_select_one_name() {
+        let project = InlineTestProject::new()
+            .file("Cargo.toml", "[workspace]\nresolver=\"2\"\nmembers=[\"dep\",\"app\"]\n")
+            .file("dep/Cargo.toml", "[package]\nname='dep'\nversion='0.0.0'\nedition='2021'\n")
+            .file("dep/src/lib.rs", "pub fn nothing() {}\n")
+            .file("app/Cargo.toml", "[package]\nname='app'\nversion='0.0.0'\nedition='2021'\n")
+            .file(
+                "app/src/lib.rs",
+                "mod a;\npub mod inner;\npub mod other;\npub use a::item;\npub use a::second;\npub(crate) use a::crate_vis;\nuse a::private_vis;\n",
+            )
+            .file(
+                "app/src/a.rs",
+                "pub mod item {}\npub fn item() {}\npub fn second() {}\npub fn crate_vis() {}\npub fn private_vis() {}\n",
+            )
+            .file("app/src/inner.rs", "mod deep;\n")
+            .file("app/src/inner/deep.rs", "pub(super) use crate::a::second as restricted_vis;\n")
+            .file("app/src/other.rs", "pub fn run() {}\n")
+            .build();
+        let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+        let store = analyzer.store().unwrap();
+        let conn = store.conn.lock().unwrap();
+        brokk_bifrost_analysis::analyzer::store::ensure_revisioned_workspace_views(&conn).unwrap();
+        brokk_bifrost_analysis::analyzer::store::planner_statistics::pinned_plans::prepare_pin_context(&conn);
+        brokk_bifrost_analysis::analyzer::store::rust_crates::register_point_export_functions(
+            &conn,
+        )
+        .unwrap();
+        conn.execute("INSERT INTO selected_workspace_revisions SELECT workspace_id,lang,generation,revision FROM workspace_heads WHERE lang='rust'", []).unwrap();
+        brokk_bifrost_analysis::analyzer::store::fill_selected_rust_units(&conn).unwrap();
+        let topology = |name: &str| -> i64 {
+            conn.query_row(
+                "SELECT topology_id FROM rust_crate_topologies WHERE crate_name=?1",
+                [name],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        let (app, dep) = (topology("app"), topology("dep"));
+        let summary: i64 = conn
+            .query_row(
+                "SELECT summary_id FROM selected_rust_unit_summaries WHERE topology_id=?1",
+                [app],
+                |row| row.get(0),
+            )
+            .unwrap();
+        // (complete, endpoint module path) rows of one exact lookup.
+        let exact = |module: &str,
+                     namespace: &str,
+                     name: &str,
+                     requester: i64,
+                     requester_path: &str|
+         -> Vec<(bool, Option<String>)> {
+            let mut rows = conn
+                .prepare(&pinned("rust_published_binding_exact").sql)
+                .unwrap()
+                .query_map(
+                    rusqlite::params![app, module, namespace, name, requester, requester_path],
+                    |row| Ok((row.get::<_, bool>(0)?, row.get::<_, Option<String>>(2)?)),
+                )
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            rows.sort();
+            rows
+        };
+        let endpoint = |module: &str, name: &str, requester: i64, requester_path: &str| -> usize {
+            exact(module, "value", name, requester, requester_path)
+                .iter()
+                .filter(|row| row.1.is_some())
+                .count()
+        };
+        // Crate-visible: the same crate, any module; never another crate.
+        assert_eq!(endpoint("crate", "crate_vis", app, "crate::other"), 1);
+        assert_eq!(endpoint("crate", "crate_vis", dep, "crate"), 0);
+        // Private: the declaring module and its descendants only.
+        assert_eq!(endpoint("crate", "private_vis", app, "crate"), 1);
+        assert_eq!(endpoint("crate", "private_vis", app, "crate::other"), 1);
+        assert_eq!(endpoint("crate", "private_vis", dep, "crate"), 0);
+        assert_eq!(
+            endpoint(
+                "crate::inner::deep",
+                "restricted_vis",
+                app,
+                "crate::inner::deep"
+            ),
+            1
+        );
+        // Restricted to the parent module `crate::inner`: it and its descendants, not a sibling.
+        assert_eq!(
+            endpoint("crate::inner::deep", "restricted_vis", app, "crate::inner"),
+            1
+        );
+        assert_eq!(
+            endpoint("crate::inner::deep", "restricted_vis", app, "crate::other"),
+            0
+        );
+        // Public: every requester.
+        assert_eq!(endpoint("crate", "second", dep, "crate"), 1);
+
+        // Namespace and name selection: a certificate of another name or namespace must not answer.
+        let base_type_second = exact("crate", "type", "second", app, "crate");
+        assert!(
+            base_type_second.iter().all(|row| row.1.is_none()),
+            "`second` has no type endpoint: {base_type_second:?}"
+        );
+        assert!(exact("crate", "value", "absent", app, "crate").is_empty());
+        let base_value = exact("crate", "value", "item", app, "crate");
+        let base_second = exact("crate", "value", "second", app, "crate");
+        assert!(
+            base_value.len() == 2 && base_second.len() == 2,
+            "{base_value:?} {base_second:?}"
+        );
+        let _fixture =
+            brokk_bifrost_analysis::analyzer::store::sealed_families::Fixture::new(&conn);
+        for (flip, flip_namespace) in [("second", "value"), ("item", "type")] {
+            conn.execute_batch("SAVEPOINT certificate").unwrap();
+            let changed = conn
+                .execute(
+                    "UPDATE rust_resolution_unit_summary_binding_names SET complete=1-complete WHERE summary_id=?1 AND name=?2 AND namespace=?3 AND owner_handle IN (SELECT owner_handle FROM rust_resolution_unit_summary_binding_owners WHERE summary_id=?1 AND module_path='crate')",
+                    rusqlite::params![summary, flip, flip_namespace],
+                )
+                .unwrap();
+            assert_eq!(changed, 1);
+            // The other name, and the same name in the other namespace, keep their own flag.
+            assert_eq!(
+                exact("crate", "value", "item", app, "crate"),
+                base_value,
+                "flipped {flip_namespace} {flip}"
+            );
+            if flip == "second" {
+                assert_eq!(
+                    exact("crate", "type", "second", app, "crate"),
+                    base_type_second
+                );
+            }
+            if flip == "item" {
+                assert_eq!(exact("crate", "value", "second", app, "crate"), base_second);
+            }
+            conn.execute_batch("ROLLBACK TO certificate; RELEASE certificate")
+                .unwrap();
+        }
+    }
+
+    /// Open reasons of the published inventory reader: blockers are selected by owner,
+    /// namespace and name; an owner-wide blocker is lifted by a complete certificate of the same
+    /// owner and name only; a blocker's evidence module is a subject only for an owner-wide one.
+    #[test]
+    #[hardwon(
+        "#11173: M3 family 2 mutation matrix: blocker selection predicates of the published inventory reader had no test"
+    )]
+    fn published_inventory_selects_blockers_by_owner_namespace_and_name() {
+        use brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_crate_context::PUBLISHED_OPEN_INVENTORY;
+        let project = InlineTestProject::new()
+            .file(
+                "Cargo.toml",
+                "[package]\nname='ex'\nversion='0.1.0'\nedition='2021'\n",
+            )
+            .file("src/lib.rs", "mod gen;\npub mod a;\n")
+            .file("src/gen.rs", "unknown_items!();\npub fn local() {}\n")
+            .file("src/a.rs", "pub fn local() {}\n")
+            .build();
+        let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+        let store = analyzer.store().unwrap();
+        let conn = store.conn.lock().unwrap();
+        brokk_bifrost_analysis::analyzer::store::ensure_revisioned_workspace_views(&conn).unwrap();
+        brokk_bifrost_analysis::analyzer::store::planner_statistics::pinned_plans::prepare_pin_context(&conn);
+        brokk_bifrost_analysis::analyzer::store::rust_crates::register_point_export_functions(
+            &conn,
+        )
+        .unwrap();
+        conn.execute("INSERT INTO selected_workspace_revisions SELECT workspace_id,lang,generation,revision FROM workspace_heads WHERE lang='rust'", []).unwrap();
+        brokk_bifrost_analysis::analyzer::store::fill_selected_rust_units(&conn).unwrap();
+        let (topology, summary): (i64, i64) = conn
+            .query_row(
+                "SELECT topology_id,summary_id FROM selected_rust_unit_summaries",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let details = |module: &str, namespace: &str, name: &str| -> usize {
+            conn.prepare_cached(PUBLISHED_OPEN_INVENTORY)
+                .unwrap()
+                .query_map(
+                    rusqlite::params![topology, module, namespace, name, topology, module],
+                    |_| Ok(()),
+                )
+                .unwrap()
+                .count()
+        };
+        // The macro-generated module `gen` is open: its name is blocked in every namespace of
+        // the crate root, and its own names by an owner-wide blocker.
+        for namespace in ["type", "value", "macro"] {
+            assert_eq!(details("crate", namespace, "gen"), 1, "{namespace}");
+            assert_eq!(details("crate", namespace, "elsewhere"), 0, "{namespace}");
+        }
+        // Both functions have own active declarations. The open inventory of
+        // gen cannot shadow its explicit value binding (#12014).
+        assert_eq!(details("crate::gen", "value", "local"), 0);
+        assert_eq!(details("crate::a", "value", "local"), 0);
+
+        let _fixture =
+            brokk_bifrost_analysis::analyzer::store::sealed_families::Fixture::new(&conn);
+        let crate_owner = "SELECT owner_handle FROM rust_resolution_unit_summary_binding_owners WHERE summary_id=?1 AND kind='module' AND module_path='crate'";
+        // Namespace selection: only the value-namespace blocker of `gen` remains.
+        conn.execute_batch("SAVEPOINT namespaces").unwrap();
+        let removed = conn
+            .execute(
+                &format!("DELETE FROM rust_resolution_unit_summary_binding_blockers WHERE summary_id=?1 AND name='gen' AND namespace<>'value' AND owner_handle=({crate_owner})"),
+                [summary],
+            )
+            .unwrap();
+        assert_eq!(removed, 2);
+        assert_eq!(details("crate", "value", "gen"), 1);
+        assert_eq!(details("crate", "type", "gen"), 0);
+        assert_eq!(details("crate", "macro", "gen"), 0);
+        conn.execute_batch("ROLLBACK TO namespaces; RELEASE namespaces")
+            .unwrap();
+        // Evidence module: a named blocker is a subject for its own name only, even when its
+        // evidence points at a module that has an open inventory.
+        conn.execute_batch("SAVEPOINT evidence").unwrap();
+        conn.execute(
+            &format!("INSERT INTO rust_resolution_unit_summary_binding_blockers(summary_id,owner_handle,namespace,name,reason,boundary,evidence_unit_key,evidence_module_path,evidence_kind,blocker_ordinal,evidence_form) SELECT ?1,({crate_owner}),'value','synthetic','OpenBoundary','synthetic',unit_key,'crate::gen','declaration',0,'unplaced' FROM selected_rust_unit_summaries WHERE summary_id=?1"),
+            [summary],
+        )
+        .unwrap();
+        assert_eq!(details("crate", "value", "synthetic"), 0);
+        assert_eq!(details("crate", "value", "gen"), 1);
+        conn.execute_batch("ROLLBACK TO evidence; RELEASE evidence")
+            .unwrap();
+    }
+
+    /// The macro-use prelude is inherited from the provider crate's root owner only, with the
+    /// provider's own open reasons.
+    #[test]
+    #[hardwon(
+        "#11173: M3 family 2 mutation matrix: prelude owner selection of the published readers had no test"
+    )]
+    fn the_inherited_macro_prelude_reads_the_providers_root_owner_and_gaps() {
+        use brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_crate_context::{
+            PUBLISHED_EXPORT, PUBLISHED_OPEN_INVENTORY,
+        };
+        let project = InlineTestProject::new()
+            .file("Cargo.toml", "[workspace]\nresolver=\"2\"\nmembers=[\"dep_one\",\"dep_two\",\"prov\",\"user\"]\n")
+            .file("dep_one/Cargo.toml", "[package]\nname='dep_one'\nversion='0.0.0'\nedition='2021'\n")
+            .file("dep_one/src/lib.rs", "#[macro_export]\nmacro_rules! shared { () => {} }\n")
+            .file("dep_two/Cargo.toml", "[package]\nname='dep_two'\nversion='0.0.0'\nedition='2021'\n")
+            .file("dep_two/src/lib.rs", "#[macro_export]\nmacro_rules! shared { () => {} }\n")
+            .file("prov/Cargo.toml", "[package]\nname='prov'\nversion='0.0.0'\nedition='2021'\n[dependencies]\ndep_one={path=\"../dep_one\"}\ndep_two={path=\"../dep_two\"}\n")
+            .file("prov/src/lib.rs", "pub use dep_one::shared;\npub mod extra {\n    pub use dep_two::shared;\n}\nmod gen;\n")
+            .file("prov/src/gen.rs", "unknown_items!();\n")
+            .file("user/Cargo.toml", "[package]\nname='user'\nversion='0.0.0'\nedition='2021'\n[dependencies]\nprov={path=\"../prov\"}\n")
+            .file("user/src/lib.rs", "#[macro_use]\nextern crate prov;\npub mod nested;\n")
+            .file("user/src/nested.rs", "pub fn run() {}\n")
+            .build();
+        let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+        let store = analyzer.store().unwrap();
+        let conn = store.conn.lock().unwrap();
+        brokk_bifrost_analysis::analyzer::store::ensure_revisioned_workspace_views(&conn).unwrap();
+        brokk_bifrost_analysis::analyzer::store::planner_statistics::pinned_plans::prepare_pin_context(&conn);
+        brokk_bifrost_analysis::analyzer::store::rust_crates::register_point_export_functions(
+            &conn,
+        )
+        .unwrap();
+        conn.execute("INSERT INTO selected_workspace_revisions SELECT workspace_id,lang,generation,revision FROM workspace_heads WHERE lang='rust'", []).unwrap();
+        brokk_bifrost_analysis::analyzer::store::fill_selected_rust_units(&conn).unwrap();
+        conn.execute("INSERT INTO selected_resolution_mounts(mount_ordinal,blob_id,storage_language,semantic_language,persisted_relative_path) SELECT row_number() OVER(),blob_id,'rust','rust',rel_path FROM (SELECT DISTINCT blob_id,rel_path FROM selected_rust_crate_containers)", []).unwrap();
+        conn.execute_batch(brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_crate_context::SELECTED_MODULE_PLACEMENTS_FILL_SQL).unwrap();
+        let user: i64 = conn
+            .query_row(
+                "SELECT topology_id FROM rust_crate_topologies WHERE crate_name='user'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let count = |sql: &str, name: &str| -> usize {
+            conn.prepare_cached(sql)
+                .unwrap()
+                .query_map(
+                    rusqlite::params![user, "crate::nested", "macro", name, user, "crate::nested"],
+                    |_| Ok(()),
+                )
+                .unwrap()
+                .count()
+        };
+        // Only the provider's root `pub use dep_one::shared` is inherited; its `extra` module's
+        // `dep_two::shared` is not part of the prelude.
+        assert_eq!(count(PUBLISHED_EXPORT, "shared"), 1);
+        // The provider's open inventory (not the user's closed one) is reported, for the name
+        // its macro-generated module blocks and for no other.
+        assert_eq!(count(PUBLISHED_OPEN_INVENTORY, "gen"), 1);
+        assert_eq!(count(PUBLISHED_OPEN_INVENTORY, "missing"), 0);
     }
 
     /// External globs can bind any namespace, while a root macro-use import
@@ -761,6 +1909,161 @@ mod tests {
         );
     }
 
+    /// A leading `::name` out of a file no Cargo target mounts has no edition:
+    /// edition 2015 reads `::foo` as the crate root's `foo`, and 2018 and later
+    /// as an extern-prelude crate that is not there. The root is undecided, and
+    /// the route used to die in the file's own synthetic crate with no
+    /// incompleteness, which the caller read as a complete missing target.
+    #[test]
+    #[hardwon("#11265: an unavailable absolute root reported a complete missing target")]
+    fn an_absolute_path_out_of_an_unmounted_file_answers_incomplete() {
+        use brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupRequest;
+
+        use brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupStatus;
+
+        use brokk_bifrost_analysis::analyzer::usages::get_definition::trace::resolve_definition_batch_with_trace;
+
+        use brokk_bifrost_rust_analysis::analyzer::rust::RustAnalyzer;
+
+        const ORPHAN: &str = "mod foo { pub fn item() {} }\nfn caller() { ::foo::item(); }";
+        let project = InlineTestProject::new()
+            .file(
+                "Cargo.toml",
+                "[package]\nname='app'\nversion='0.1.0'\nedition='2021'\n",
+            )
+            .file("src/lib.rs", "")
+            .file("extra/orphan.rs", ORPHAN)
+            .build();
+        let analyzer = RustAnalyzer::from_project(project.project().clone());
+
+        let file = project.file("extra/orphan.rs");
+        let start = ORPHAN.find("item();").expect("call site");
+        let outcome = resolve_definition_batch_with_trace(
+            &analyzer,
+            vec![DefinitionLookupRequest {
+                file: file.clone(),
+                line: None,
+                column: None,
+                start_byte: Some(start),
+                end_byte: Some(start + "item".len()),
+            }],
+            file,
+            std::sync::Arc::<str>::from(ORPHAN),
+            &brokk_bifrost_core::cancellation::CancellationToken::new(),
+        );
+        let answer = &outcome[0].0;
+        assert_eq!(
+            answer.status,
+            DefinitionLookupStatus::Incomplete,
+            "an absolute root with no edition is not a proved absence: {answer:?}"
+        );
+        assert!(
+            answer
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("UnavailableAbsoluteRoot")),
+            "the incompleteness must name the undecided root: {answer:?}"
+        );
+    }
+
+    /// The definitions the reference at `needle`'s `offset..offset+len` bytes
+    /// resolves to, by full name.
+    fn definitions_at(
+        project: &BuiltInlineTestProject,
+        source: &str,
+        needle: &str,
+        offset: usize,
+        len: usize,
+    ) -> Vec<String> {
+        use brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupRequest;
+
+        use brokk_bifrost_analysis::analyzer::usages::get_definition::trace::resolve_definition_batch_with_trace;
+
+        let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+        let file = project.file("src/lib.rs");
+        let start = source.find(needle).expect("needle") + offset;
+        let outcome = resolve_definition_batch_with_trace(
+            analyzer.analyzer(),
+            vec![DefinitionLookupRequest {
+                file: file.clone(),
+                line: None,
+                column: None,
+                start_byte: Some(start),
+                end_byte: Some(start + len),
+            }],
+            file,
+            std::sync::Arc::<str>::from(source),
+            &brokk_bifrost_core::cancellation::CancellationToken::new(),
+        );
+        outcome[0]
+            .0
+            .definitions
+            .iter()
+            .map(|definition| definition.fq_name().to_string())
+            .collect()
+    }
+
+    /// In edition 2018 and later a leading `::std` names the extern prelude's
+    /// standard library, never the crate's own `mod std`. The head of the path
+    /// is its own reference, and its root is chosen by its own spelling like
+    /// any other head; it used to take the current module and look the token
+    /// up there.
+    #[test]
+    #[hardwon(
+        "#11265: review found a leading :: head reference bound a local module of the same name"
+    )]
+    fn the_head_of_an_absolute_path_selects_its_root_by_its_own_name() {
+        const SOURCE: &str = "mod std { pub mod str { pub fn from_utf8() {} } }\nfn caller() { ::std::str::from_utf8(); }";
+        let project = InlineTestProject::new()
+            .file(
+                "Cargo.toml",
+                "[package]\nname='app'\nversion='0.1.0'\nedition='2021'\n",
+            )
+            .file("src/lib.rs", SOURCE)
+            .build();
+        assert_eq!(
+            definitions_at(&project, SOURCE, "::std::str", 2, "std".len()),
+            Vec::<String>::new(),
+            "the head names the extern crate, not the local module"
+        );
+        assert_eq!(
+            definitions_at(&project, SOURCE, "::std::str", 7, "str".len()),
+            Vec::<String>::new(),
+            "the segment after an extern head is in the extern crate"
+        );
+        assert_eq!(
+            definitions_at(&project, SOURCE, "from_utf8();", 0, "from_utf8".len()),
+            Vec::<String>::new(),
+            "the callee is in the extern crate"
+        );
+    }
+
+    /// The edition 2015 counterpart: `::std` is a crate-root name, so the head
+    /// does resolve to the crate's own `mod std`.
+    #[test]
+    #[hardwon(
+        "#11265: review found a leading :: head reference bound a local module of the same name"
+    )]
+    fn in_edition_2015_the_head_of_an_absolute_path_is_a_crate_root_name() {
+        const SOURCE: &str = "#![no_std]\nmod std { pub mod str { pub fn from_utf8() {} } }\nmod inner { pub fn caller() { ::std::str::from_utf8(); } }";
+        let project = InlineTestProject::new()
+            .file(
+                "Cargo.toml",
+                "[package]\nname='app'\nversion='0.1.0'\nedition='2015'\n",
+            )
+            .file("src/lib.rs", SOURCE)
+            .build();
+        assert_eq!(
+            definitions_at(&project, SOURCE, "::std::str", 2, "std".len()),
+            vec!["app.std".to_owned()],
+            "the head is a crate-root name"
+        );
+        assert_eq!(
+            definitions_at(&project, SOURCE, "::std::str", 7, "str".len()),
+            vec!["app.std.str".to_owned()],
+        );
+    }
+
     /// The dead-code half of the case above. The projection is incomplete
     /// with `UnmountedFile`, but the bucket abstains per candidate spelled by
     /// an unresolved reference (lane UP, 2026-09-17), and the unresolved
@@ -1062,7 +2365,7 @@ mod tests {
                         "t.rs",
                         0,
                         0,
-                        RUST_UNIT_SUMMARY_DERIVATION_VERSION
+                        rust_unit_summary_derivation_identity()
                     ],
                     |row| row.get(0),
                 )
@@ -1165,10 +2468,9 @@ mod tests {
             assert_eq!(
                 (outcome.status, outcome.definitions.len()),
                 (
-                    if matches!(
-                        label,
-                        "derive" | "unindexed deref target" | "raw pointer deref"
-                    ) {
+                    // A proven built-in derive supplies `clone` as the exact
+                    // standard trait item (#11325), so "derive" is a boundary.
+                    if matches!(label, "unindexed deref target" | "raw pointer deref") {
                         DefinitionLookupStatus::Incomplete
                     } else {
                         DefinitionLookupStatus::UnresolvableImportBoundary
@@ -1436,7 +2738,7 @@ mod tests {
             .prepare(brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_crate_context::DEPENDENCY.as_str())
             .unwrap()
             .query_map(
-                rusqlite::params![topology, "tk", RUST_UNIT_SUMMARY_DERIVATION_VERSION],
+                rusqlite::params![topology, "tk", rust_unit_summary_derivation_identity()],
                 |row| row.get::<_, i64>(0),
             )
             .unwrap()
@@ -1518,7 +2820,7 @@ mod tests {
         let parents: Vec<(String, String, Option<String>)> = conn
             .prepare("SELECT placement.module_path, member.rel_path, placement.parent_module_path
              FROM selected_rust_unit_summaries AS units
-             CROSS JOIN main.rust_unit_summary_placements AS placement
+             CROSS JOIN temp.rust_unit_summary_placements AS placement
               ON placement.summary_id=units.summary_id
              CROSS JOIN main.resolution_unit_summary_members AS member
               ON member.summary_id=placement.summary_id AND member.member_ordinal=placement.member_ordinal
@@ -1905,7 +3207,7 @@ mod tests {
                     "rust_point_demand_prefix_modules" => vec![int(0), int(0), int(topology)],
                     "rust_point_unresolved_trait_impl_files" => vec![
                         text("Unbound"),
-                        int(RUST_UNIT_SUMMARY_DERIVATION_VERSION),
+                        rusqlite::types::Value::Blob(rust_unit_summary_derivation_identity().to_vec()),
                     ],
                     "rust_point_item_macro_decisions" => {
                         vec![text(&blob_oid), text("src/lib.rs"), Value::Blob(Vec::new())]
@@ -1967,7 +3269,7 @@ mod tests {
                     "rust_point_dependency" => vec![
                         int(topology),
                         text("point"),
-                        int(RUST_UNIT_SUMMARY_DERIVATION_VERSION),
+                        rusqlite::types::Value::Blob(rust_unit_summary_derivation_identity().to_vec()),
                     ],
                     "rust_point_dependency_boundary" => vec![text("point")],
                     "rust_point_import_root_name" => vec![int(blob), int(0), text("Thing")],
@@ -2003,14 +3305,6 @@ mod tests {
                     "rust_point_anchored_import_binds" => vec![int(0), text("Alias")],
                     "rust_published_root_reexport" => vec![int(topology), text("crate"), text("type"), text("Alias"), int(topology), text("crate")],
                     "rust_point_module_import_prefix_starts" => vec![int(topology), text("crate"), int(blob), int(0), text("alias"), text("type"), int(blob)],
-                    "rust_point_macro_gated_import_route" => vec![
-                        int(topology),
-                        text("crate"),
-                        int(blob),
-                        int(0),
-                        text("Alias"),
-                        int(blob),
-                    ],
                     "rust_point_generated_surface_prefix"
                     | "rust_point_generated_surface_module_prefix"
                     | "rust_point_generated_surface_module_declaration_prefix" => {
@@ -2019,7 +3313,20 @@ mod tests {
                     "rust_point_generated_surface_source_module_prefix" => {
                         vec![int(blob), text("Thing"), text("src/lib.rs")]
                     }
-                    "rust_point_derive_helper_conditions" => vec![int(3), text("[[0,null]]")],
+                    "rust_point_derive_helper_conditions" => vec![
+                        int(3),
+                        text("[[0,null]]"),
+                        int(brokk_bifrost_analysis::analyzer::store::resolution_prepare::resolution_rows::gap_origin_code(
+                            brokk_bifrost_analysis::analyzer::resolution::LoweringGapOrigin::Extracted(
+                                brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::GeneratedItemSurface,
+                            ),
+                        )),
+                        int(brokk_bifrost_analysis::analyzer::store::resolution_prepare::resolution_rows::gap_origin_code(
+                            brokk_bifrost_analysis::analyzer::resolution::LoweringGapOrigin::Extracted(
+                                brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::UnsupportedPlacementBoundary,
+                            ),
+                        )),
+                    ],
                     "rust_point_external_binding" => vec![
                         int(topology), text("crate::inner"), text("type"), text("Thing"), int(topology), text("crate"),
                         int(brokk_bifrost_analysis::analyzer::store::resolution_prepare::resolution_rows::namespace_code(brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace::Type)),
@@ -2071,7 +3378,7 @@ mod tests {
                         text("src/inner.rs"),
                         int(0),
                         int(0),
-                        int(RUST_UNIT_SUMMARY_DERIVATION_VERSION),
+                        rusqlite::types::Value::Blob(rust_unit_summary_derivation_identity().to_vec()),
                     ],
                     "rust_point_trait_impl_member_at" => vec![
                         int(0),
@@ -2082,7 +3389,7 @@ mod tests {
                         int(target_blob),
                         int(target_site),
                         text("src/inner.rs"),
-                        int(RUST_UNIT_SUMMARY_DERIVATION_VERSION),
+                        rusqlite::types::Value::Blob(rust_unit_summary_derivation_identity().to_vec()),
                     ],
                     "rust_point_store_trait_impl_rows"
                     | "rust_point_store_trait_impl_spellings"
@@ -2093,7 +3400,7 @@ mod tests {
                             text(&blob_oid),
                             int(0),
                             text("src/lib.rs"),
-                            int(RUST_UNIT_SUMMARY_DERIVATION_VERSION),
+                            rusqlite::types::Value::Blob(rust_unit_summary_derivation_identity().to_vec()),
                             Value::Blob(Vec::new()),
                         ]
                     }
@@ -2102,7 +3409,7 @@ mod tests {
                     "rust_point_impl_item_traits" => vec![
                         int(0),
                         int(0),
-                        int(RUST_UNIT_SUMMARY_DERIVATION_VERSION),
+                        rusqlite::types::Value::Blob(rust_unit_summary_derivation_identity().to_vec()),
                     ],
                     "rust_point_external_type_identity" => {
                         let namespace = brokk_bifrost_analysis::analyzer::store::resolution_prepare::resolution_rows::namespace_code(brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace::Type);
@@ -2112,12 +3419,14 @@ mod tests {
                         vec![int(0), int(token), int(namespace)]
                     }
                     "rust_point_reference_names_macro_module" => vec![int(0), int(0), text("inner")],
+                    "rust_point_reference_unit_adds_macro_scope" => vec![int(0), int(0)],
+                    "rust_point_reference_file_adds_edge" => vec![int(0)],
                     "rust_point_reference_names_workspace_crate" => {
                         vec![
                             int(0),
                             int(0),
                             text("inner"),
-                            int(RUST_UNIT_SUMMARY_DERIVATION_VERSION),
+                            rusqlite::types::Value::Blob(rust_unit_summary_derivation_identity().to_vec()),
                         ]
                     }
                     name if name.starts_with("rust_point_targets_") => {
@@ -2205,9 +3514,9 @@ mod tests {
                     if pin.name == "rust_point_imported_macro_definition" {
                         assert!(
                             plan.iter().any(|step| {
-                                step.contains("resolution_unit_summary_members_blob (blob_id=?)")
+                                step.contains("resolution_unit_summary_members_path (rel_path=?)")
                             }),
-                            "{state:?} imported macro lookup must seek selected members from the path-selected blob: {plan:?}"
+                            "{state:?} imported macro lookup must seek selected members by path: {plan:?}"
                         );
                         assert!(
                             plan.iter().any(|step| {
@@ -2247,14 +3556,43 @@ mod tests {
                         assert!(
                             plan.iter().any(|step| {
                                 step.contains("resolution_unit_summary_members_blob (blob_id=?")
-                            }),
-                            "{state:?} placement lookup must seek the materialized blob index: {plan:?}"
+                            }) || (plan.iter().any(|step| {
+                                step.contains("selected_rust_transient_placement_attributes_declaration (module_declaration=?")
+                            }) && plan.iter().any(|step| {
+                                step.contains("selected_resolution_transient_placements_member (summary_id=? AND member_ordinal=? AND container_path=? AND mount_ordinal=? AND scope_ordinal=?")
+                            })) || (plan.iter().any(|step| {
+                                step.contains("idx_workspace_file_versions_snapshot_blob (workspace_id=? AND lang=? AND generation=? AND blob_oid=?")
+                            }) && plan.iter().any(|step| {
+                                step.contains("resolution_unit_summary_members_path (rel_path=?")
+                            }) && plan.iter().any(|step| {
+                                step.contains("selected_resolution_transient_placements_member (summary_id=? AND member_ordinal=?")
+                            })),
+                            "{state:?} placement lookup must seek by blob, declaration/full transient key, or snapshot blob/path/member: {plan:?}"
+                        );
+                    }
+                    if matches!(
+                        pin.name.as_str(),
+                        "rust_point_access_placements"
+                            | "rust_point_access_reference_placements"
+                            | "rust_point_module_placements"
+                    ) {
+                        assert!(
+                            !plan.iter().any(|step| [
+                                "SCAN members",
+                                "SCAN member",
+                                "SCAN placement",
+                                "SCAN p "
+                            ]
+                            .iter()
+                            .any(|prefix| step.starts_with(prefix))),
+                            "{state:?} placement lookup must not scan members or placements: {plan:?}"
                         );
                     }
                     if pin.name == "rust_point_boundary_import_names" {
                         assert!(
                             plan.iter().any(|step| {
-                                step.contains("resolution_unit_summary_placements_member")
+                                step.contains("resolution_unit_summary_placements_member (summary_id=? AND member_ordinal=?")
+                                    || step.contains("resolution_unit_summary_placements_surface_lookup (summary_id=? AND member_ordinal=?")
                             }),
                             "{state:?} boundary import names must seek member placements: {plan:?}"
                         );
@@ -2319,9 +3657,12 @@ mod tests {
                     if pin.name == "rust_point_item_macro_decisions" {
                         assert!(
                             plan.iter().any(|step| {
-                                step.contains("resolution_unit_summary_members_blob")
+                                step.contains("resolution_unit_summary_members_blob (blob_id=?")
+                                    || step.contains(
+                                        "resolution_unit_summary_members_path (rel_path=?",
+                                    )
                             }),
-                            "{state:?}: item macro placements must seek members by blob: {plan:?}"
+                            "{state:?}: item macro placements must seek members by blob or path: {plan:?}"
                         );
                         assert!(
                             plan.iter().any(|step| {
@@ -2453,9 +3794,12 @@ mod tests {
                         );
                         assert!(
                             plan.iter().any(|step| {
-                                step.contains("resolution_unit_summary_members_blob")
+                                step.contains("resolution_unit_summary_members_blob (blob_id=?")
+                                    || step.contains(
+                                        "resolution_unit_summary_members_path (rel_path=?",
+                                    )
                             }),
-                            "{state:?}: selected macro items must seek their live member by blob: {plan:?}"
+                            "{state:?}: selected macro items must seek their live member by blob or path: {plan:?}"
                         );
                         assert!(
                             plan.iter()
@@ -2466,13 +3810,17 @@ mod tests {
                     if pin.name == "rust_point_demand_modules" {
                         assert!(
                             plan.iter().any(|step| {
-                                step.contains("resolution_unit_summary_members_blob")
+                                step.contains("resolution_unit_summary_members_blob (blob_id=?")
+                                    || step.contains(
+                                        "resolution_unit_summary_members_path (rel_path=?",
+                                    )
                             }),
-                            "{state:?}: module enumeration must seek selected summary members by blob: {plan:?}"
+                            "{state:?}: module enumeration must seek selected summary members by blob or path: {plan:?}"
                         );
                         assert!(
                             plan.iter().any(|step| {
-                                step.contains("resolution_unit_summary_placements_member")
+                                step.contains("resolution_unit_summary_placements_member (summary_id=? AND member_ordinal=?")
+                                    || step.contains("resolution_unit_summary_placements_surface_lookup (summary_id=? AND member_ordinal=?")
                             }),
                             "{state:?}: module enumeration must seek placements by member: {plan:?}"
                         );
@@ -2487,7 +3835,10 @@ mod tests {
                     if pin.name == "rust_point_owner_declaration" {
                         assert!(
                             plan.iter().any(|step| {
-                                step.contains("resolution_unit_summary_members_blob")
+                                step.contains("resolution_unit_summary_members_blob (blob_id=?")
+                                    || step.contains(
+                                        "resolution_unit_summary_members_path (rel_path=?",
+                                    )
                             }),
                             "{state:?}: declaration membership must seek selected summary members by blob: {plan:?}"
                         );
@@ -2584,8 +3935,10 @@ mod tests {
                     }
                     if pin.name == "rust_point_overlay_import_targets" {
                         assert!(
-                            plan.iter()
-                                .any(|step| step.contains("resolution_unit_summary_members_blob")),
+                            plan.iter().any(|step| step
+                                .contains("resolution_unit_summary_members_blob (blob_id=?")
+                                || step
+                                    .contains("resolution_unit_summary_members_path (rel_path=?")),
                             "{state:?}: overlay import source must seek shared membership by blob: {plan:?}"
                         );
                         assert!(
@@ -2684,9 +4037,11 @@ mod tests {
                     }
                     if pin.name == "rust_point_file_crates" {
                         assert!(
-                            plan.iter()
-                                .any(|step| step.contains("resolution_unit_summary_members_blob")),
-                            "{state:?} {} must seek members by blob: {plan:?}",
+                            plan.iter().any(|step| step
+                                .contains("resolution_unit_summary_members_blob (blob_id=?")
+                                || step
+                                    .contains("resolution_unit_summary_members_path (rel_path=?")),
+                            "{state:?} {} must seek members by blob or path: {plan:?}",
                             pin.name
                         );
                     }
@@ -2707,9 +4062,15 @@ mod tests {
                             "{state:?} derive-helper read skips its partial index: {plan:?}"
                         );
                         assert!(
+                            plan.iter().any(|step| step
+                                .contains("source_rust_declaration_properties_builtin_derives")),
+                            "{state:?} built-in derive read skips its partial index: {plan:?}"
+                        );
+                        assert!(
                             plan.iter().all(|step| !step.starts_with("SCAN ")
                                 || step.contains("reached")
                                 || step.contains("helper")
+                                || step.contains("derive")
                                 || step == "SCAN CONSTANT ROW"
                                 || step == "SCAN aligned"),
                             "{state:?} derive-helper read scans a table: {plan:?}"
@@ -2850,8 +4211,8 @@ mod tests {
             assert!(
                 file_plan
                     .iter()
-                    .any(|step| step.contains("resolution_unit_summary_members_blob")),
-                "{state:?} file-to-crate lookup must seek members by blob: {file_plan:?}"
+                    .any(|step| step.contains("resolution_unit_summary_members_path")),
+                "{state:?} file-to-crate lookup must seek members by path: {file_plan:?}"
             );
             let cfg_plan = explain_pin(&conn, &cfg);
             assert!(
@@ -2895,15 +4256,15 @@ mod tests {
             assert!(
                 modules_plan
                     .iter()
-                    .any(|step| step.contains("SEARCH p USING PRIMARY KEY (summary_id=?)")),
+                    .any(|step| step.contains("SEARCH p USING COVERING INDEX resolution_unit_summary_placements_surface_lookup (summary_id=?)")),
                 "{state:?} module enumeration must seek Rust placements by the selected closure summary: {modules_plan:?}"
             );
             let module_placements_plan = explain_pin(&conn, &module_placements);
             assert!(
                 module_placements_plan
                     .iter()
-                    .any(|step| step.contains("resolution_unit_summary_members_blob (blob_id=?)")),
-                "{state:?} module placement lookup must seek the materialized blob index: {module_placements_plan:?}"
+                    .any(|step| step.contains("resolution_unit_summary_members_path (rel_path=?)")),
+                "{state:?} module placement lookup must seek members by path: {module_placements_plan:?}"
             );
         }
     }

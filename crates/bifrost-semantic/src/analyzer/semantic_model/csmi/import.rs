@@ -637,6 +637,7 @@ fn import_semantic_document(
             hierarchy: Vec::new(),
             aliases: Vec::new(),
             extension_surfaces: Vec::new(),
+            rust_stability: None,
             guard: None,
             locator: if let Some(key) = python_keys.get(&symbol.id) {
                 Locator::Interchange {
@@ -806,6 +807,7 @@ fn import_semantic_document(
             extension_receiver: None,
             extension_receiver_constraints: Vec::new(),
             aliases: Vec::new(),
+            rust_stability: None,
             guard: None,
             locator: if let Some(key) = python_keys.get(&symbol.id) {
                 Locator::Interchange {
@@ -935,6 +937,7 @@ fn import_semantic_document(
                 extension_receiver: None,
                 extension_receiver_constraints: Vec::new(),
                 aliases: Vec::new(),
+                rust_stability: None,
                 guard: None,
                 locator: Locator::Interchange {
                     path: format!("csmi/{pack_digest}.json"),
@@ -2829,9 +2832,10 @@ fn transfer_from_csmi(
         });
     }
     let input = match &transfer.source.root {
-        CsmiInputBoundaryRoot::Receiver(_) => AuthoredSummaryInput::Receiver {},
+        CsmiInputBoundaryRoot::Receiver(_) => AuthoredSummaryInput::Receiver { path: None },
         CsmiInputBoundaryRoot::Parameter(root) => AuthoredSummaryInput::Parameter {
             ordinal: root.position,
+            path: None,
         },
         CsmiInputBoundaryRoot::Capture(_) => {
             return Err(CsmiImportError::Unsupported {
@@ -2843,21 +2847,22 @@ fn transfer_from_csmi(
     };
     let (output, exit_kind) = match &transfer.destination.root {
         CsmiOutputBoundaryRoot::Receiver(_) => (
-            AuthoredSummaryOutput::Receiver {},
+            AuthoredSummaryOutput::Receiver { path: None },
             AuthoredSummaryExitKind::Normal,
         ),
         CsmiOutputBoundaryRoot::Result(root) if root.position == 0 => (
-            AuthoredSummaryOutput::NormalReturn {},
+            AuthoredSummaryOutput::NormalReturn { path: None },
             AuthoredSummaryExitKind::Normal,
         ),
         CsmiOutputBoundaryRoot::Result(root) => (
             AuthoredSummaryOutput::IndexedNormalReturn {
                 ordinal: root.position,
+                path: None,
             },
             AuthoredSummaryExitKind::Normal,
         ),
         CsmiOutputBoundaryRoot::Exception(_) => (
-            AuthoredSummaryOutput::ExceptionalReturn {},
+            AuthoredSummaryOutput::ExceptionalReturn { path: None },
             AuthoredSummaryExitKind::Exceptional,
         ),
         CsmiOutputBoundaryRoot::Parameter(_) => {

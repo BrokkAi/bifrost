@@ -917,7 +917,7 @@ fn symbol_key(symbol: &CommitSymbol) -> SymbolKey {
 /// whose body was edited is both `moved` and `edited` -- so each target
 /// position is yielded once, under the first label that claims it. Without
 /// that, such a symbol would be counted twice and reported twice.
-fn changed_target_symbols(
+pub(crate) fn changed_target_symbols(
     patch_symbols: &PatchSymbols,
 ) -> impl Iterator<Item = (&CommitSymbol, &'static str)> {
     let mut seen: HashSet<SymbolKey> = HashSet::new();
@@ -1051,15 +1051,23 @@ fn verification_features(
     let mut changed_production_symbols = 0usize;
 
     for (symbol, change) in changed_target_symbols(patch_symbols) {
-        if symbol.is_test {
-            continue;
-        }
         let unresolved = |reason: String| UnresolvedSymbol {
             fqn: symbol.fqn.clone(),
             path: symbol.path.clone(),
             start_line: symbol.start_line,
             reason,
         };
+        match symbol.is_test {
+            Some(true) => continue,
+            Some(false) => {}
+            None => {
+                unresolved_symbols.push(unresolved(
+                    "test status unknown: the files that decide it are outside the scoped diff image"
+                        .to_string(),
+                ));
+                continue;
+            }
+        }
         let Some(sites) = references.get(&symbol_key(symbol)) else {
             unresolved_symbols.push(unresolved(MISSING_SCAN_RESULT.to_string()));
             continue;
@@ -1173,26 +1181,38 @@ enum FileTestKind {
 impl TestFileClassifier {
     fn classify(&mut self, analyzer: &dyn IAnalyzer, site: &ReferenceFile) -> TestReference {
         let path = Path::new(site.path.as_str());
-        let kind = self.files.entry(site.path.clone()).or_insert_with(|| {
-            let Some(file) = analyzer.project().file_by_rel_path(path) else {
-                return FileTestKind::Unknown;
+        if !self.files.contains_key(&site.path) {
+            let classify = || -> Result<FileTestKind, brokk_bifrost_analysis::analyzer::QueryReadIncomplete> {
+                let Some(file) = analyzer.project().file_by_rel_path(path) else {
+                    return Ok(FileTestKind::Unknown);
+                };
+                if is_test_like_file(analyzer, &file, &site.path, path_language(path))? {
+                    return Ok(FileTestKind::TestLike);
+                }
+                if !analyzer.contains_tests(&file) {
+                    return Ok(FileTestKind::Production);
+                }
+                let mut ranges = Vec::new();
+                for unit in analyzer.get_declarations(&file) {
+                    if analyzer.in_test_region(&unit)?
+                        && let Some(range) = primary_range(&analyzer.ranges(&unit))
+                    {
+                        ranges.push((range.start_line, range.end_line));
+                    }
+                }
+                Ok(FileTestKind::InlineTests(ranges))
             };
-            if is_test_like_file(analyzer, &file, &site.path, path_language(path)) {
-                FileTestKind::TestLike
-            } else if analyzer.contains_tests(&file) {
-                FileTestKind::InlineTests(
-                    analyzer
-                        .get_declarations(&file)
-                        .into_iter()
-                        .filter(|unit| analyzer.in_test_region(unit))
-                        .filter_map(|unit| primary_range(&analyzer.ranges(&unit)))
-                        .map(|range| (range.start_line, range.end_line))
-                        .collect(),
-                )
-            } else {
-                FileTestKind::Production
+            match classify() {
+                Ok(kind) => {
+                    self.files.insert(site.path.clone(), kind);
+                }
+                Err(reason) => {
+                    analyzer.record_query_incomplete(reason);
+                    return TestReference::Undecidable("test classification unavailable");
+                }
             }
-        });
+        }
+        let kind = &self.files[&site.path];
         match kind {
             FileTestKind::TestLike => TestReference::Test,
             FileTestKind::Production => TestReference::NonTest,
@@ -1450,6 +1470,15 @@ mod tests {
             test_repo::commit_all(repo, "commit 2");
         });
 
+        // The scoped endpoint image contains only the changed non-root file,
+        // so no target root reaches it and test status is unavailable (#11385).
+        assert!(score.verification.unresolved_symbols.iter().any(|symbol| {
+            symbol.fqn.ends_with("compute")
+                && symbol.reason.contains("test status unknown")
+                && symbol
+                    .reason
+                    .contains("the files that decide it are outside the scoped diff image")
+        }));
         assert_eq!(
             score.geometry.signature_changes, 1,
             "control: adding a parameter is one signature change, got {:?}",
@@ -1504,6 +1533,14 @@ mod tests {
                 root,
                 "src/core.rs",
                 "pub fn outer(x: i32, y: i32) -> i32 {\n    x + y\n} pub fn sibling() -> i32 { 2 }\n",
+            );
+            // Scoped endpoint images hold only changed files; without a target root,
+            // module ancestry is unavailable (#11385). Touch the parent to retain
+            // production evidence and exercise the original reference behavior.
+            write(
+                root,
+                "src/lib.rs",
+                "pub mod core;\npub mod client;\n// endpoint context\n",
             );
             test_repo::commit_all(repo, "target");
         });

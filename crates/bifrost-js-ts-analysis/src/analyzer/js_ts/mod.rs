@@ -125,6 +125,8 @@ use brokk_bifrost_analysis::analyzer::languages::LocalDeclarationBindingScope;
 
 use brokk_bifrost_analysis::analyzer::languages::LocalDeclarationVisibility;
 
+use brokk_bifrost_analysis::analyzer::languages::{HeaderBinder, ScopeHeader};
+
 use brokk_bifrost_analysis::analyzer::languages::ReceiverFactsFactory;
 
 use brokk_bifrost_analysis::analyzer::languages::analyzable_file_count;
@@ -196,6 +198,28 @@ fn js_ts_local_declaration_binding_scope<'tree>(
         LocalDeclarationVisibility::Lexical
     };
     Some(LocalDeclarationBindingScope { scope, visibility })
+}
+
+/// A catch parameter (an identifier or a destructuring pattern, with an
+/// optional TypeScript annotation in a separate field) is visible only in its
+/// catch body: not in the try block, the finally block or after the try
+/// statement (ECMAScript, the catch clause's block scope). `catch { }` binds
+/// nothing.
+fn js_ts_scope_header<'tree>(node: tree_sitter::Node<'tree>) -> Option<ScopeHeader<'tree>> {
+    if node.kind() != "catch_clause" {
+        return None;
+    }
+    let pattern = node.child_by_field_name("parameter")?;
+    let body = node.child_by_field_name("body")?;
+    Some(ScopeHeader::new(
+        node,
+        vec![HeaderBinder {
+            declaration: node,
+            pattern,
+        }],
+        body,
+        None,
+    ))
 }
 
 static JS_TS_COGNITIVE_CONFIG: LazyLock<cognitive_complexity::Config> =
@@ -1093,6 +1117,13 @@ impl LanguageSupport for JavascriptSupport {
         js_ts_local_declaration_binding_scope(node)
     }
 
+    fn scope_header<'tree>(
+        &self,
+        statement: tree_sitter::Node<'tree>,
+    ) -> Option<ScopeHeader<'tree>> {
+        js_ts_scope_header(statement)
+    }
+
     fn single_segment_external_owner(
         &self,
         owner: &str,
@@ -1227,6 +1258,13 @@ impl LanguageSupport for TypescriptSupport {
         node: tree_sitter::Node<'tree>,
     ) -> Option<LocalDeclarationBindingScope<'tree>> {
         js_ts_local_declaration_binding_scope(node)
+    }
+
+    fn scope_header<'tree>(
+        &self,
+        statement: tree_sitter::Node<'tree>,
+    ) -> Option<ScopeHeader<'tree>> {
+        js_ts_scope_header(statement)
     }
 
     fn declaration_ranges_limited(
@@ -1745,6 +1783,232 @@ ruleTester.run("rule", rule, {});
             );
             let tree = parse_javascript("");
             assert!(contains_tests(&file, "", &tree), "{path}");
+        }
+    }
+
+    /// The byte where `name` starts at the end of the unique `anchor`.
+    fn at(source: &str, anchor: &str, name: &str) -> usize {
+        assert!(anchor.ends_with(name), "{anchor} must end with {name}");
+        let start = source
+            .find(anchor)
+            .unwrap_or_else(|| panic!("{anchor} in {source}"));
+        assert_eq!(
+            source.rfind(anchor),
+            Some(start),
+            "{anchor} repeats in {source}"
+        );
+        start + anchor.len() - name.len()
+    }
+
+    /// The lexical answer for the `name` that ends `anchor`, as the answer
+    /// variant with its declaration kind, and the start of the bound name.
+    fn lexical_answer(
+        language: Language,
+        tree: &Tree,
+        source: &str,
+        anchor: &str,
+        name: &str,
+    ) -> Option<(String, usize)> {
+        use brokk_bifrost_analysis::analyzer::lexical_definitions::{
+            LexicalBindingResolution, resolve_lexical_binding,
+        };
+        let focus = at(source, anchor, name);
+        match resolve_lexical_binding(
+            language,
+            tree.root_node(),
+            source,
+            focus,
+            focus + name.len(),
+            name,
+        )? {
+            LexicalBindingResolution::Parameter(definition) => Some((
+                format!("Parameter {:?}", definition.kind),
+                definition.name_range.start_byte,
+            )),
+            LexicalBindingResolution::OtherLocal(definition) => Some((
+                format!("OtherLocal {:?}", definition.kind),
+                definition.name_range.start_byte,
+            )),
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "97a35feae74c: quicksilver round 12 on brokk-bifrost-analysis: catch bindings lost to enclosing formals"
+    )]
+    fn catch_parameters_shadow_enclosing_formals() {
+        const CATCH: &str = "OtherLocal CatchParameter";
+        const FORMAL: &str = "Parameter Parameter";
+        const LET: &str = "OtherLocal LocalVariable";
+        // (source, reference anchor, expected kind, binder anchor). Every
+        // reference reads `err`; `None` for the binder means no lexical answer.
+        type Case = (
+            &'static str,
+            &'static str,
+            &'static str,
+            Option<&'static str>,
+        );
+        let shared: &[Case] = &[
+            // The catch body, plain and destructured, shadows the formal.
+            (
+                "function f(err) { try { throw 1; } catch (err) { return err; } }",
+                "return err",
+                CATCH,
+                Some("catch (err"),
+            ),
+            (
+                "function f(err) { try { throw 1; } catch ({err}) { return err; } }",
+                "return err",
+                CATCH,
+                Some("catch ({err"),
+            ),
+            (
+                "function f(err) { try { throw 1; } catch ([err]) { return err; } }",
+                "return err",
+                CATCH,
+                Some("catch ([err"),
+            ),
+            (
+                "function f(err) { try { throw 1; } catch ({ cause: err }) { return err; } }",
+                "return err",
+                CATCH,
+                Some("cause: err"),
+            ),
+            // Nested blocks and closures in the catch body still see it.
+            (
+                "function f(err) { try { throw 1; } catch (err) { if (err) { return () => err; } } }",
+                "=> err",
+                CATCH,
+                Some("catch (err"),
+            ),
+            // A closure's own formal still shadows the catch parameter.
+            (
+                "function f() { try { throw 1; } catch (err) { return (err) => err; } }",
+                "=> err",
+                "Parameter LambdaParameter",
+                Some("return (err"),
+            ),
+            // It shadows an outer lexical binding, not only formals.
+            (
+                "function f() { let err = 0; try { throw 1; } catch (err) { return err; } }",
+                "return err",
+                CATCH,
+                Some("catch (err"),
+            ),
+            // The parameter name is its own declaration site.
+            (
+                "function f(err) { try { throw 1; } catch (err) { } }",
+                "catch (err",
+                CATCH,
+                Some("catch (err"),
+            ),
+            // Negative controls: the try block, the finally block and the
+            // code after the statement read the enclosing binding.
+            (
+                "function f(err) { try { use(err); } catch (err) { } finally { last(err); } return err; }",
+                "use(err",
+                FORMAL,
+                Some("f(err"),
+            ),
+            (
+                "function f(err) { try { use(err); } catch (err) { } finally { last(err); } return err; }",
+                "last(err",
+                FORMAL,
+                Some("f(err"),
+            ),
+            (
+                "function f(err) { try { use(err); } catch (err) { } finally { last(err); } return err; }",
+                "return err",
+                FORMAL,
+                Some("f(err"),
+            ),
+            (
+                "function f() { let err = 0; try { use(err); } catch (err) { } return err; }",
+                "return err",
+                LET,
+                Some("let err"),
+            ),
+            // `catch { }` binds nothing.
+            (
+                "function f(err) { try { throw 1; } catch { return err; } }",
+                "return err",
+                FORMAL,
+                Some("f(err"),
+            ),
+            (
+                "function f() { try { throw 1; } catch { return err; } }",
+                "return err",
+                "",
+                None,
+            ),
+        ];
+        let typescript_only: &[Case] = &[(
+            "function f(err: string) { try { throw 1; } catch (err: unknown) { return err; } }",
+            "return err",
+            CATCH,
+            Some("catch (err"),
+        )];
+        let mut failures = Vec::new();
+        for (language, cases) in [
+            (Language::JavaScript, shared),
+            (Language::TypeScript, shared),
+            (Language::TypeScript, typescript_only),
+        ] {
+            for &(source, reference, kind, binder) in cases {
+                let tree = match language {
+                    Language::JavaScript => parse_javascript(source),
+                    _ => parse_typescript(source),
+                };
+                assert!(!tree.root_node().has_error(), "{source}");
+                let expected = binder.map(|binder| (kind.to_owned(), at(source, binder, "err")));
+                let actual = lexical_answer(language, &tree, source, reference, "err");
+                if actual != expected {
+                    failures.push((language, source, reference, expected, actual));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// A JavaScript `var` binds the whole callable, so a read names the
+    /// nearest `var` declaration before it, or the first one after it when
+    /// none precedes. Two mutation survivors of round 12 (#7632) needed the
+    /// real JS hook: `scope_matching_local` comparing a `for (var ...)` binder
+    /// with the focus the wrong way round, and `js_ts_hoisted_var_binder`
+    /// choosing the earliest preceding `var` declarator.
+    #[test]
+    fn hoisted_var_reads_resolve_to_the_nearest_preceding_declaration() {
+        let source = concat!(
+            "function f(x) {\n",
+            "  early(y);\n",
+            "  var y = 1;\n",
+            "  { var y = 2; }\n",
+            "  near(y);\n",
+            "  var y = 3;\n",
+            "  for (var w of x) {}\n",
+            "  for (var w of x) {}\n",
+            "  after(w);\n",
+            "}\n",
+        );
+        for (language, tree) in [
+            (Language::JavaScript, parse_javascript(source)),
+            (Language::TypeScript, parse_typescript(source)),
+        ] {
+            assert!(!tree.root_node().has_error(), "{source}");
+            for (reference, name, kind, binder) in [
+                // No `var y` precedes: the first one after the read names it.
+                ("early(y", "y", "LocalVariable", "early(y);\n  var y"),
+                // The nearest preceding `var`, even one inside a block.
+                ("near(y", "y", "LocalVariable", "{ var y"),
+                // The same holds for a `for (var ...)` binder.
+                ("after(w", "w", "EnhancedForVariable", "{}\n  for (var w"),
+            ] {
+                assert_eq!(
+                    lexical_answer(language, &tree, source, reference, name),
+                    Some((format!("OtherLocal {kind}"), at(source, binder, name))),
+                    "{language:?} {reference}"
+                );
+            }
         }
     }
 }

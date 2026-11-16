@@ -1,0 +1,17 @@
+{
+  "decoded_rows": 6509,
+  "executions": 0,
+  "executions_with_reprepare_on_every_run": 0,
+  "expanded_sql": null,
+  "expanded_truncated": false,
+  "first_run_executions": 0,
+  "kind": "statement",
+  "max_nanos": 0,
+  "max_statement_reprepares": 0,
+  "max_statement_runs": 0,
+  "reused_executions": 0,
+  "role": "writer",
+  "rows": 0,
+  "sql": "",
+  "total_nanos": "0"
+}

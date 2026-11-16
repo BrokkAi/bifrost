@@ -51,13 +51,23 @@ mod jvm_extraction_tests {
     "#6664: incomplete Java descendant cache fills panicked during member-family inversion"
 )]
 fn java_incomplete_descendant_fill_leaves_member_family_open() {
+    // #12331: a caller-only gap no longer poisons the descendant index.
+    // #12331 (7a9cabcf028) made complete_descendant_query withhold a
+    // descendant answer only when the fill's own receipt is incomplete. The
+    // old version of this test recorded a gap on the caller's scope and
+    // expected the family to be open; that gap is not a fill refusal.
+    //
+    // There is no product-surface assertion here today. The only available
+    // product queries cannot isolate the caller gap from other reasons for
+    // an open answer, so the captured query incompleteness checked below is
+    // the completion signal that policy and RQL consume.
     use crate::inline_project::InlineTestProject;
     use brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadIncomplete;
     use brokk_bifrost_analysis::analyzer::multi_analyzer::{AnalyzerDelegate, MultiAnalyzer};
     use brokk_bifrost_analysis::analyzer::usages::member_family::java_member_family;
     use brokk_bifrost_analysis::analyzer::{AnalyzerQueryScope, IAnalyzer, capture_query_reads};
     use brokk_bifrost_core::analyzer::Language;
-    use brokk_bifrost_core::analyzer::capabilities::{HierarchyOpenReason, TypeHierarchyProvider};
+    use brokk_bifrost_core::analyzer::capabilities::TypeHierarchyProvider;
     use brokk_bifrost_core::analyzer::code_unit_index::CodeUnitIndex;
     use brokk_bifrost_core::analyzer::structural::resolution::MemberFamilyOutcome;
     use brokk_bifrost_jvm_analysis::analyzer::JavaAnalyzer;
@@ -70,6 +80,23 @@ fn java_incomplete_descendant_fill_leaves_member_family_open() {
             "class Child extends Base { public void run() {} }",
         )
         .build();
+
+    // There is no in-fill refusal half for Java: no test-support seam reaches
+    // a refusal of the Java descendant fill. The fill reads declaration and
+    // supertype rows from the store and the live snapshot
+    // (JavaAnalyzer::build_direct_descendant_index in
+    // jvm-analysis java/hierarchy.rs, via
+    // TreeSitterAnalyzer::hierarchy_declaration_facts_by_kind_unrecorded and
+    // hydrate_hierarchy_declaration_facts_unrecorded), never a source file.
+    // On a cold analyzer, NUL bytes, a 20 KB line, binary bytes or deleting
+    // Child.java left the Java answer complete with Child and no fill gap.
+    // The only remaining refusal channel is a failing store query, and the
+    // store's authorizer rejects DROP TABLE and ALTER TABLE on its tables.
+    // The C# and PHP tests assert the refusal half through their file reads.
+
+    // Converse: a gap recorded only on the caller's scope leaves the
+    // descendant index complete and the descendants proven, and the caller's
+    // captured incompleteness holds exactly that gap.
     let analyzer = MultiAnalyzer::new(BTreeMap::from([(
         Language::Java,
         AnalyzerDelegate::new(JavaAnalyzer::new(project.project_dyn())),
@@ -84,34 +111,24 @@ fn java_incomplete_descendant_fill_leaves_member_family_open() {
     let (_, reads) = capture_query_reads(&analyzer, || {
         let scope = AnalyzerQueryScope::capturing_read_incompleteness(&analyzer);
         analyzer.record_query_incomplete(gap.clone());
+        let descendants = analyzer.get_direct_descendants(&owner);
+        assert!(descendants.is_complete(), "{descendants:?}");
         assert!(
-            analyzer
-                .get_direct_descendants(&owner)
-                .open
+            descendants
+                .definite()
                 .iter()
-                .any(|reason| matches!(reason, HierarchyOpenReason::DescendantIndexUnavailable))
+                .any(|unit| unit.identifier() == "Child"),
+            "{descendants:?}"
         );
-        let reasons = scope.captured_read_incompleteness();
-        assert_eq!(reasons, vec![gap.clone()]);
-    });
-    assert_eq!(reads.execution_dependences(), 0, "{reads:?}");
-    assert!(reads.unattributed_reads() > 0, "{reads:?}");
-    {
-        let _scope = AnalyzerQueryScope::new(&analyzer);
-        analyzer.record_query_incomplete(gap);
         let answer = java_member_family(&analyzer, &analyzer, &member, None);
         assert_eq!(
             answer.descendants.outcome,
-            MemberFamilyOutcome::Incomplete,
+            MemberFamilyOutcome::Proven,
             "{answer:?}"
         );
-    }
-    let descendants = analyzer.get_direct_descendants(&owner);
-    let descendants = descendants.definite();
-    assert!(
-        descendants.iter().any(|unit| unit.identifier() == "Child"),
-        "{descendants:?}"
-    );
+        assert_eq!(scope.captured_read_incompleteness(), vec![gap.clone()]);
+    });
+    assert_eq!(reads.execution_dependences(), 0, "{reads:?}");
 }
 
 #[test]
@@ -433,7 +450,7 @@ fn native_java_descendants_selector_on_and_scoped_cancellation() {
     let cancellation = CancellationToken::new();
     let exclude = |_: &brokk_bifrost_core::analyzer::model::ProjectFile| {
         cancellation.cancel();
-        false
+        Ok(false)
     };
     let scope = DescendantIndexScope::excluding_sources(&cancellation, &exclude);
     assert_eq!(

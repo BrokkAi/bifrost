@@ -8,6 +8,7 @@ fn exhausted_root_prose_preserves_complete_structured_attribution() {
             procedure: Some("process".into()),
             lane: "solver/reached_states".into(),
             stage: Some("value_flow_solve".into()),
+            budget: None,
             charge: None,
             feedback_iteration: None,
         })

@@ -281,7 +281,8 @@ pub struct CommitSymbol {
     pub start_line: usize,
     pub end_line: usize,
     pub language: String,
-    pub is_test: bool,
+    /// null when test classification was unavailable; see call_analysis/incompleteness.
+    pub is_test: Option<bool>,
 }
 
 /// Symbol-level effects of the patch, partitioned by which endpoints hold the
@@ -783,6 +784,13 @@ pub(crate) struct PreparedDiff {
 }
 
 impl PreparedDiff {
+    /// Target coordinates use the postimage path, including for renames.
+    pub(crate) fn target_line_changed(&self, path: &str, line: usize) -> bool {
+        self.changed_lines
+            .get(path)
+            .is_some_and(|lines| lines.new.contains(&line))
+    }
+
     pub(crate) fn at_root(
         root: &Path,
         params: DiffEndpointParams,
@@ -2379,6 +2387,10 @@ pub struct RevisionExport {
     image: RevisionImage,
     commit_id: String,
     tree_id: Oid,
+    /// Whether the exported tree holds no gitlink. The image classifies a
+    /// gitlink by whether the live checkout initialized it, so only a tree
+    /// without one is a function of the tree alone.
+    holds_no_gitlink: bool,
 }
 
 impl RevisionExport {
@@ -2396,6 +2408,15 @@ impl RevisionExport {
     /// untouched export the same bytes and share this id.
     pub fn tree_id(&self) -> Oid {
         self.tree_id
+    }
+
+    /// Whether everything an analyzer over this export reads is a function of
+    /// [`Self::tree_id`] (#11607). The export holds only the tree's tracked
+    /// regular files, and its listing omissions depend on the live checkout
+    /// only for a gitlink: an initialized submodule is an unknown omission,
+    /// an uninitialized one is none.
+    pub fn is_function_of_tree(&self) -> bool {
+        self.holds_no_gitlink
     }
 
     /// Workspace-relative paths of every exported regular file.
@@ -2518,10 +2539,17 @@ pub fn export_revision(workspace_root: &Path, revision: &str) -> Result<Revision
         None,
         None,
     )?;
+    let mut holds_gitlink = false;
+    tree.walk(TreeWalkMode::PreOrder, |_, entry| {
+        holds_gitlink |= entry.kind() == Some(ObjectType::Commit);
+        TreeWalkResult::Ok
+    })
+    .map_err(|error| format!("unable to inventory immutable revision tree: {error}"))?;
     Ok(RevisionExport {
         image,
         commit_id: commit_id.to_string(),
         tree_id,
+        holds_no_gitlink: !holds_gitlink,
     })
 }
 
@@ -2701,6 +2729,36 @@ pub fn worktree_paths_match_head(
         // A pathspec is relative to the work tree and always uses `/`.
         let pathspec = prefix.join(rel_path).to_string_lossy().replace('\\', "/");
         options.pathspec(pathspec);
+    }
+    let statuses = repository
+        .statuses(Some(&mut options))
+        .map_err(|err| format!("unable to read the work tree status: {err}"))?;
+    Ok(statuses
+        .iter()
+        .all(|entry| entry.status() == git2::Status::CURRENT))
+}
+
+/// Whether the tracked content of the work tree at `workspace_root` is exactly
+/// the committed tree `tree_id`: `HEAD`'s workspace subtree is that tree and no
+/// tracked file is staged, modified or deleted. Untracked and ignored files are
+/// not examined, so a caller that needs them compared checks the analyzed file
+/// set separately.
+pub fn worktree_tracked_content_is_tree(
+    workspace_root: &Path,
+    tree_id: Oid,
+) -> Result<bool, String> {
+    let (repository, head_commit) = resolve_revision_commit(workspace_root, "HEAD")?;
+    if workspace_subtree(&repository, workspace_root, head_commit, "HEAD")?.id() != tree_id {
+        return Ok(false);
+    }
+    let prefix = workspace_prefix(&repository, workspace_root)?;
+    let mut options = git2::StatusOptions::new();
+    options
+        .include_untracked(false)
+        .include_ignored(false)
+        .exclude_submodules(true);
+    if !prefix.as_os_str().is_empty() {
+        options.pathspec(prefix.to_string_lossy().replace('\\', "/"));
     }
     let statuses = repository
         .statuses(Some(&mut options))
@@ -3354,7 +3412,9 @@ struct RevisionImageProject {
     /// head applies the working tree's rules to its analyzable file set, so a
     /// revision analyzed for comparison against it must apply its own, or every
     /// finding in an ignored file looks repaired.
-    bifrost_ignore: OnceLock<BifrostIgnoreMatcher>,
+    bifrost_ignore: OnceLock<
+        Result<BifrostIgnoreMatcher, brokk_bifrost_core::analyzer::project::IgnoreObservationError>,
+    >,
 }
 
 impl Project for RevisionImageProject {
@@ -3427,12 +3487,22 @@ impl Project for RevisionImageProject {
             .collect())
     }
 
-    fn is_bifrostignored(&self, rel_path: &Path) -> bool {
+    fn is_bifrostignored(
+        &self,
+        rel_path: &Path,
+    ) -> Result<bool, brokk_bifrost_core::analyzer::project::IgnoreObservationError> {
         let _project_read = self
             .project_read_slot()
             .map(|slot| slot.ignore_rules(self.as_project()));
         self.bifrost_ignore()
-            .is_ok_and(|ignore| ignore.is_ignored_path(rel_path))
+            .map(|ignore| ignore.is_ignored_path(rel_path))
+            .map_err(|cause| {
+                brokk_bifrost_core::analyzer::project::IgnoreObservationError::new(
+                    self.root().join(rel_path),
+                    brokk_bifrost_core::analyzer::project::IgnoreObservationOperation::Matcher,
+                    cause,
+                )
+            })
     }
 
     fn file_by_rel_path(&self, rel_path: &Path) -> Option<ProjectFile> {
@@ -3576,26 +3646,52 @@ impl RevisionImageProject {
     /// in the inventory, so an ignore file the revision commits is readable
     /// through the object database like any other.
     fn bifrost_ignore(&self) -> std::io::Result<&BifrostIgnoreMatcher> {
-        if let Some(ignore) = self.bifrost_ignore.get() {
-            brokk_bifrost_core::analyzer::project_reads::publish_receipt(ignore.listing_receipt());
-            return Ok(ignore);
-        }
-        let files = self.files.all_files()?;
-        let root = self.files.root();
-        let ignore = BifrostIgnoreMatcher::build_with(root, &files, |path| {
-            let rel_path = path
-                .strip_prefix(root)
-                .expect("ignore-file candidates are the project root joined with a relative path");
-            let file = ProjectFile::new(root.to_path_buf(), rel_path.to_path_buf());
-            if self.blobs.oid_for(&file).is_some() {
-                self.read_source(&file).map(Some)
-            } else {
-                Ok(None)
+        use brokk_bifrost_core::analyzer::project::{
+            IgnoreObservationError, IgnoreObservationOperation,
+        };
+        let observation = self.bifrost_ignore.get_or_init(|| {
+            let root = self.files.root();
+            let files = self.files.all_files().map_err(|cause| {
+                IgnoreObservationError::new(root, IgnoreObservationOperation::Listing, cause)
+            });
+            let result = files.and_then(|files| {
+                BifrostIgnoreMatcher::build_with(root, &files, |path| {
+                    let rel_path = path.strip_prefix(root).expect(
+                        "ignore-file candidates are the project root joined with a relative path",
+                    );
+                    let file = ProjectFile::new(root.to_path_buf(), rel_path.to_path_buf());
+                    if self.blobs.oid_for(&file).is_some() {
+                        self.read_source(&file).map(Some)
+                    } else {
+                        Ok(None)
+                    }
+                })
+                .map_err(|cause| {
+                    IgnoreObservationError::new(root, IgnoreObservationOperation::Matcher, cause)
+                })
+            });
+            if let Err(error) = &result {
+                eprintln!("workspace ignore observation incomplete: {error}");
             }
-        })?;
-        let ignore = self.bifrost_ignore.get_or_init(|| ignore);
-        brokk_bifrost_core::analyzer::project_reads::publish_receipt(ignore.listing_receipt());
-        Ok(ignore)
+            result
+        });
+        match observation {
+            Ok(ignore) => {
+                brokk_bifrost_core::analyzer::project_reads::publish_receipt(
+                    ignore.listing_receipt(),
+                );
+                Ok(ignore)
+            }
+            Err(error) => {
+                brokk_bifrost_core::analyzer::project_reads::publish_receipt(
+                    brokk_bifrost_core::analyzer::project_reads::ProjectReadReceipt {
+                        incomplete: Some(error.clone()),
+                        ..Default::default()
+                    },
+                );
+                Err(error.clone().into())
+            }
+        }
     }
 
     /// `file`'s bytes as the revision holds them, or `None` for a file this
@@ -4844,9 +4940,21 @@ fn omit_endpoint(
                 continue;
             }
             let rel = brokk_bifrost_core::path_utils::rel_path_string(unit.source());
-            let is_test = parsed.test_region_units.contains(unit)
-                || test_paths::is_test_like_path(&rel, path_language(unit.source().rel_path()));
-            if is_test && !include_tests {
+            let is_test = if parsed.test_region_units.contains(unit)
+                || test_paths::is_test_like_path(&rel, path_language(unit.source().rel_path()))
+            {
+                Some(true)
+            } else if adapter.local_test_evidence_proves_production() {
+                Some(false)
+            } else {
+                if !include_tests {
+                    incomplete.push(unavailable(
+                        "test status unknown: the files that decide it are outside the scoped diff image",
+                    ));
+                }
+                None
+            };
+            if is_test == Some(true) && !include_tests {
                 continue;
             }
             let Some(range) =
@@ -5030,9 +5138,21 @@ fn symbol_snapshot_map(
         // Symbol-level test filtering (#1102): filter a declaration only when it
         // is itself in a structurally-evidenced test region or under a test-tree
         // path, so production symbols in a file with inline tests still surface.
-        let is_test = analyzer.in_test_region(&unit)
-            || test_paths::is_test_like_path(&path, path_language(unit.source().rel_path()));
-        if is_test && !include_tests {
+        let is_test =
+            if test_paths::is_test_like_path(&path, path_language(unit.source().rel_path())) {
+                Some(true)
+            } else {
+                match analyzer.in_test_region(&unit) {
+                    Ok(value) => Some(value),
+                    Err(reason) => {
+                        if !include_tests {
+                            analyzer.record_query_incomplete(reason);
+                        }
+                        None
+                    }
+                }
+            };
+        if is_test == Some(true) && !include_tests {
             continue;
         }
         let Some(range) = brokk_bifrost_analysis::analyzer::primary_range(&analyzer.ranges(&unit))
@@ -5798,6 +5918,19 @@ fn refuse_uncertain_moved_correspondence(
     }
 }
 
+/// Whether a usage graph was never built: it is incomplete and holds no
+/// declaration, or its call pass was refused for lack of canonical facts. Such a
+/// graph is not a graph with no edges. A graph that is incomplete for another
+/// reason (a source inventory, a truncated callee) is present: its edges stand.
+fn graph_is_absent(graph: &UsageGraphResult) -> bool {
+    !graph.complete
+        && ((graph.nodes.is_empty() && graph.edges.is_empty())
+            || graph
+                .incomplete_reasons
+                .iter()
+                .any(|reason| reason.code == "unavailable_canonical_facts"))
+}
+
 /// Compare the two scoped usage graphs and group the differences by caller.
 ///
 /// Selected-line edges compare exact declaration IDs; the explicit full-file
@@ -5838,10 +5971,19 @@ fn diff_call_edges(
     let definitions = symbols_by_edge_key(postimage, &after.nodes);
     let mut deltas: HashMap<CallerKey, CalleeDelta> = HashMap::new();
     let mut deps: BTreeMap<SymbolKey, CommitSymbol> = BTreeMap::new();
+    // A graph that is absent (refused, unavailable, cancelled) holds no edge at
+    // all, so against it every edge of the other side would read as added or
+    // removed. An absent graph classifies nothing; `DiffCallAnalysis` reports the
+    // result incomplete. A graph that is present but incomplete still holds its
+    // proven edges, and keeps the classification below (#2584).
+    let absent = graph_is_absent(before) || graph_is_absent(after);
     for (key, edge) in &new {
         // An added relation requires an absence proof on the before side;
         // a proven positive after edge alone cannot establish that delta.
-        if old.contains_key(key) || (scope == DiffCallEdges::ChangedLines && !before.complete) {
+        if absent
+            || old.contains_key(key)
+            || (scope == DiffCallEdges::ChangedLines && !before.complete)
+        {
             continue;
         }
         deltas
@@ -5861,7 +6003,10 @@ fn diff_call_edges(
         }
     }
     for (key, edge) in &old {
-        if new.contains_key(key) || (scope == DiffCallEdges::ChangedLines && !after.complete) {
+        if absent
+            || new.contains_key(key)
+            || (scope == DiffCallEdges::ChangedLines && !after.complete)
+        {
             continue;
         }
         deltas
@@ -6408,15 +6553,15 @@ mod tests {
         let full = analyze_prepared_symbol_changes(&prepared, true).unwrap();
         // The cached fallback analyzer claims this same temporary image root.
         // Capture the full analyzer's rows before that second lease drops.
-        let expected_before =
+        let mut expected_before =
             crate::diff_analysis::symbol_snapshot_map(full.context.base_analyzer.analyzer(), true);
-        let expected_after = crate::diff_analysis::symbol_snapshot_map(
+        let mut expected_after = crate::diff_analysis::symbol_snapshot_map(
             full.context.target_analyzer.analyzer(),
             true,
         );
-        let expected_before_production =
+        let mut expected_before_production =
             crate::diff_analysis::symbol_snapshot_map(full.context.base_analyzer.analyzer(), false);
-        let expected_after_production = crate::diff_analysis::symbol_snapshot_map(
+        let mut expected_after_production = crate::diff_analysis::symbol_snapshot_map(
             full.context.target_analyzer.analyzer(),
             false,
         );
@@ -6464,6 +6609,35 @@ mod tests {
                 "fixture did not exercise {language} declarations"
             );
         }
+        // Cargo context proves conventional/custom roots production in the full
+        // analyzer. Parse-only lacks that context, so Unknown is conservative.
+        // Non-root changed files lack module ancestry in scoped images (#11385).
+        for (parsed, full) in [
+            (&before.symbols, &mut expected_before),
+            (&after.symbols, &mut expected_after),
+        ] {
+            for (key, snapshot) in full.iter_mut() {
+                let local = parsed[key].symbol.is_test;
+                assert!(local.is_none() || local == snapshot.symbol.is_test);
+                if snapshot.symbol.language == "rust"
+                    && matches!(snapshot.symbol.name.as_str(), "conventional_root" | "root")
+                {
+                    assert_eq!(snapshot.symbol.is_test, Some(false));
+                    assert_eq!(local, None);
+                }
+                snapshot.symbol.is_test = local;
+            }
+        }
+        for full in [
+            &mut expected_before_production,
+            &mut expected_after_production,
+        ] {
+            for snapshot in full.values_mut() {
+                if snapshot.symbol.language == "rust" && snapshot.symbol.is_test == Some(false) {
+                    snapshot.symbol.is_test = None;
+                }
+            }
+        }
         assert_eq!(before.symbols, expected_before, "base declarations differ",);
         assert_eq!(after.symbols, expected_after, "target declarations differ",);
         assert_eq!(
@@ -6492,7 +6666,7 @@ mod tests {
             expected_after_production,
             "target production declarations differ",
         );
-        let full_result = crate::diff_analysis::DiffAnalysisResult {
+        let mut full_result = crate::diff_analysis::DiffAnalysisResult {
             incomplete: Vec::new(),
             call_analysis: crate::diff_analysis::DiffCallAnalysis::omitted(),
             endpoints: crate::diff_analysis::DiffEndpoints {
@@ -6523,10 +6697,29 @@ mod tests {
             &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .unwrap();
-        assert_eq!(
-            serde_json::to_value(light_result).unwrap(),
-            serde_json::to_value(full_result).unwrap()
-        );
+        let mut expected = serde_json::to_value(&mut full_result).unwrap();
+        fn conservative_json(value: &mut serde_json::Value) {
+            match value {
+                serde_json::Value::Object(fields) => {
+                    if fields.get("language").and_then(|v| v.as_str()) == Some("rust")
+                        && fields.get("is_test") == Some(&serde_json::Value::Bool(false))
+                    {
+                        fields.insert("is_test".into(), serde_json::Value::Null);
+                    }
+                    for child in fields.values_mut() {
+                        conservative_json(child);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for child in items {
+                        conservative_json(child);
+                    }
+                }
+                _ => {}
+            }
+        }
+        conservative_json(&mut expected);
+        assert_eq!(serde_json::to_value(light_result).unwrap(), expected);
     }
 
     #[test]
@@ -6545,7 +6738,7 @@ mod tests {
             AnalyzeDiffParams {
                 base: Some("HEAD~1".into()),
                 target: Some("HEAD".into()),
-                include_tests: true,
+                include_tests: false,
                 call_edges: crate::diff_analysis::DiffCallEdges::Omit,
             },
             &DiffAnalysisOptions::default(),
@@ -6553,6 +6746,21 @@ mod tests {
             &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .unwrap();
+        // Parse-only symbols cannot prove a Rust file is production: the
+        // parent module that could gate it is not parsed (#11385).
+        assert!(
+            result
+                .patch_symbols
+                .edited
+                .iter()
+                .any(|pair| pair.after.is_test.is_none())
+        );
+        assert!(result.incomplete.iter().any(|reason| {
+            reason.detail.as_ref().is_some_and(|detail| {
+                detail.contains("test status unknown")
+                    && detail.contains("outside the scoped diff image")
+            })
+        }));
         assert!(
             result
                 .patch_symbols
@@ -7485,6 +7693,119 @@ mod tests {
         "#2587: Checks a TypeScript import specifier expands to an untouched module and returns its newly called definition"
     )]
     fn dependency_symbols_includes_a_newly_called_function_in_an_untouched_ts_module() {
+        let result = ts_untouched_module_diff();
+        assert!(
+            result
+                .dependency_symbols
+                .iter()
+                .any(|symbol| symbol.fqn.contains("makeThing")),
+            "a newly-called function in an untouched TS module must appear in \
+             dependency_symbols, got {:?}",
+            result.dependency_symbols
+        );
+    }
+
+    /// A committed endpoint is a path-restricted image, so its listing keeps the
+    /// one `Unknown` omission and its source inventory is incomplete. The index
+    /// still resolves what the image holds, so the call edges and the dependency
+    /// symbol stand; the result is typed incomplete instead of the complete
+    /// answer an unflagged empty index used to give.
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12280: an incomplete source inventory made the rooted JS/TS call-edge pass combine an empty index into an unflagged complete graph"
+    )]
+    fn path_restricted_endpoint_call_edges_are_typed_incomplete() {
+        let result = ts_untouched_module_diff();
+        assert!(
+            matches!(
+                result.call_analysis.status,
+                crate::diff_analysis::DiffCallStatus::Incomplete
+            ),
+            "{:?}",
+            result.call_analysis
+        );
+        for endpoint in [&result.call_analysis.base, &result.call_analysis.target] {
+            let endpoint = endpoint.as_ref().unwrap();
+            assert!(!endpoint.complete);
+            assert!(
+                endpoint
+                    .incomplete_reasons
+                    .iter()
+                    .any(|reason| reason.code == "source_inventory_incomplete"),
+                "{endpoint:?}"
+            );
+        }
+        assert!(
+            result
+                .dependency_symbols
+                .iter()
+                .any(|symbol| symbol.fqn.contains("makeThing")),
+            "{:?}",
+            result.dependency_symbols
+        );
+    }
+
+    /// A before-graph that was never built holds no edge, so the edges of the
+    /// after-graph must not read as added against it.
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12280: a refused before-graph classified every after edge as added"
+    )]
+    fn a_missing_before_graph_classifies_no_edge_and_is_typed_incomplete() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        fs::write(
+            root.join("a.ts"),
+            "function helper(): number { return 1; }\n\
+             export function caller(): number { return helper(); }\n",
+        )
+        .unwrap();
+        let analyzer = build_analyzer(
+            &root,
+            &[PathBuf::from("a.ts")],
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+        )
+        .unwrap();
+        let params = || crate::searchtools::UsageGraphParams {
+            include_same_owner: false,
+            include_tests: true,
+            paths: Some(vec!["a.ts".to_string()]),
+            depth: 1,
+        };
+        let after = crate::searchtools::usage_graph_with_cancellation(
+            analyzer.analyzer(),
+            params(),
+            CancellationToken::default(),
+        );
+        assert!(!after.edges.is_empty(), "{after:?}");
+        let cancelled = CancellationToken::default();
+        cancelled.cancel();
+        let before = crate::searchtools::usage_graph_with_cancellation(
+            analyzer.analyzer(),
+            params(),
+            cancelled,
+        );
+        assert!(super::graph_is_absent(&before) && !super::graph_is_absent(&after));
+        for scope in [
+            crate::diff_analysis::DiffCallEdges::ChangedFiles,
+            crate::diff_analysis::DiffCallEdges::ChangedLines,
+        ] {
+            let diff = super::diff_call_edges(
+                &before,
+                &after,
+                &Default::default(),
+                &Default::default(),
+                scope,
+            );
+            assert!(diff.deltas.is_empty(), "{scope:?}: {:?}", diff.deltas.len());
+            assert!(matches!(
+                crate::diff_analysis::DiffCallAnalysis::from_graphs(scope, &before, &after).status,
+                crate::diff_analysis::DiffCallStatus::Incomplete
+            ));
+        }
+    }
+
+    fn ts_untouched_module_diff() -> DiffAnalysisResult {
         let dir = tempfile::tempdir().unwrap();
         let repo = test_repo::init_repo(dir.path());
         fs::write(dir.path().join("package.json"), "{\"name\": \"repro\"}\n").unwrap();
@@ -7512,7 +7833,7 @@ mod tests {
         test_repo::commit_all(&repo, "commit 2");
         drop(repo);
 
-        let result = analyze_diff_at_root(
+        analyze_diff_at_root(
             dir.path(),
             AnalyzeDiffParams {
                 call_edges: crate::diff_analysis::DiffCallEdges::ChangedFiles,
@@ -7524,17 +7845,7 @@ mod tests {
             &CancellationToken::default(),
             &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
-        .expect("analyze_diff failed");
-
-        assert!(
-            result
-                .dependency_symbols
-                .iter()
-                .any(|symbol| symbol.fqn.contains("makeThing")),
-            "a newly-called function in an untouched TS module must appear in \
-             dependency_symbols, got {:?}",
-            result.dependency_symbols
-        );
+        .expect("analyze_diff failed")
     }
 
     /// Tokenize with the production normalizer, then score -- the path a real
@@ -7604,7 +7915,7 @@ mod tests {
                 start_line: 1,
                 end_line: 4,
                 language: "rust".to_string(),
-                is_test: false,
+                is_test: Some(false),
             },
         }
     }
@@ -8105,7 +8416,7 @@ mod tests {
     fn revision_image_rust_listing_certifies_only_supplied_entries() {
         use crate::diff_analysis::{RevisionAnalyzer, WorkspaceFileOmissionReason};
         use brokk_bifrost_analysis::analyzer::store::{
-            RUST_SOURCE_LISTING_DERIVATION_VERSION, WorkspaceId,
+            WorkspaceId, rust_source_listing_derivation_identity,
         };
 
         let dir = tempfile::tempdir().unwrap();
@@ -8160,7 +8471,7 @@ mod tests {
                 .unwrap();
             let snapshot = snapshots.get("rust").expect("published Rust revision");
             store
-                .rust_source_listing_complete(snapshot, RUST_SOURCE_LISTING_DERIVATION_VERSION)
+                .rust_source_listing_complete(snapshot, rust_source_listing_derivation_identity())
                 .unwrap()
         };
         for (image, complete, omitted) in [
@@ -8408,8 +8719,8 @@ mod tests {
             ),
             BTreeSet::from([source.clone()]),
         );
-        assert!(project.is_bifrostignored(&generated));
-        assert!(!project.is_bifrostignored(&source));
+        assert!(project.is_bifrostignored(&generated).unwrap());
+        assert!(!project.is_bifrostignored(&source).unwrap());
     }
 
     #[test]
@@ -9060,6 +9371,61 @@ mod entry_point_tests {
                 "`{name}` must be rejected"
             );
         }
+    }
+
+    /// A read taken over an export is replayed without recomputation only while
+    /// the export is a function of its tree. An initialized submodule is an
+    /// unknown listing omission and an uninitialized one is none, so a tree
+    /// holding a gitlink answers by the live checkout's state.
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11607: a gitlink's listing omission depends on the live checkout, which an export-determined read cannot assume"
+    )]
+    fn an_export_holding_a_gitlink_is_not_a_function_of_its_tree() {
+        let temp = tempfile::tempdir().expect("temporary repository");
+        let root = temp.path();
+        let head = two_commit_repo(root);
+        assert!(
+            export_revision(root, "HEAD")
+                .expect("export a plain tree")
+                .is_function_of_tree()
+        );
+        let repo = Repository::open(root).unwrap();
+        let mut index = repo.index().unwrap();
+        index
+            .add(&git2::IndexEntry {
+                ctime: git2::IndexTime::new(0, 0),
+                mtime: git2::IndexTime::new(0, 0),
+                dev: 0,
+                ino: 0,
+                mode: 0o160000,
+                uid: 0,
+                gid: 0,
+                file_size: 0,
+                id: head,
+                flags: 0,
+                flags_extended: 0,
+                path: b"vendored".to_vec(),
+            })
+            .unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let signature = git2::Signature::now("Tester", "tester@example.com").unwrap();
+        let parent = repo.find_commit(head).unwrap();
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "gitlink",
+            &tree,
+            &[&parent],
+        )
+        .unwrap();
+        assert!(
+            !export_revision(root, "HEAD")
+                .expect("export a tree holding a gitlink")
+                .is_function_of_tree()
+        );
     }
 
     /// A whole-revision export analyzes through the primary repository's shared

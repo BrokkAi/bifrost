@@ -784,6 +784,7 @@ fn inherited_member(
         generic_arity: signature.type_parameters.len(),
         parameter_types: &parameter_types,
         parameter_variadics: &parameter_variadics,
+        extension_receiver: member.extension_receiver.as_ref(),
         return_type: signature.returns.as_ref(),
     });
     projected.owner = map.id.clone();
@@ -1032,6 +1033,7 @@ fn map_factory_member(
         generic_arity: 2,
         parameter_types: &[entry],
         parameter_variadics: &[true],
+        extension_receiver: None,
         return_type: Some(&returns),
     });
     Some(MemberFact {
@@ -1066,6 +1068,7 @@ fn map_factory_member(
         extension_receiver: None,
         extension_receiver_constraints: Vec::new(),
         aliases: Vec::new(),
+        rust_stability: None,
         guard: None,
         locator: map.locator.clone(),
     })

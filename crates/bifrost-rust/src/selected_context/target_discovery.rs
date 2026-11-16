@@ -4,6 +4,23 @@ use std::path::{Path, PathBuf};
 use super::{RustSelectedManifestMount, normalize_selected_path};
 use crate::cargo_routes::{cargo_dependency_tables_with_kind, cargo_workspace_exclude_covers};
 
+pub(super) fn cargo_manifest_documents(
+    manifests: &BTreeMap<PathBuf, RustSelectedManifestMount>,
+) -> super::CargoHashMap<PathBuf, crate::cargo_manifest::RustCargoManifestDocument> {
+    manifests
+        .values()
+        .map(|m| {
+            (
+                m.relative_path
+                    .parent()
+                    .expect("manifest directory")
+                    .to_path_buf(),
+                m.document.clone(),
+            )
+        })
+        .collect()
+}
+
 /// Check every root and workspace entry against the exact selected listing.
 /// Cargo workspace membership and target rules:
 /// https://doc.rust-lang.org/cargo/reference/workspaces.html
@@ -11,11 +28,26 @@ use crate::cargo_routes::{cargo_dependency_tables_with_kind, cargo_workspace_exc
 pub(super) fn target_discovery_reasons(
     manifests: &BTreeMap<PathBuf, RustSelectedManifestMount>,
     sources: &BTreeSet<&Path>,
-) -> BTreeSet<String> {
-    let mut reasons = BTreeSet::new();
+    configuration: &crate::cargo_config::RustCargoConfiguration,
+    cargo_manifests: &super::CargoHashMap<
+        PathBuf,
+        crate::cargo_manifest::RustCargoManifestDocument,
+    >,
+) -> BTreeMap<PathBuf, BTreeSet<String>> {
+    let mut reasons = BTreeMap::<PathBuf, BTreeSet<String>>::new();
     for manifest in manifests.values() {
         let path = &manifest.relative_path;
         let directory = path.parent().unwrap_or(Path::new(""));
+        if !super::broad_discovery::manifest_schema_and_edition_supported(
+            manifest,
+            manifests,
+            cargo_manifests,
+        ) {
+            reasons.entry(path.clone()).or_default().insert(format!(
+                "{}: unsupported Cargo target settings or unresolved workspace edition",
+                path.display()
+            ));
+        }
         if let Some(workspace) = manifest.document.get("workspace") {
             for key in ["members", "exclude", "default-members"] {
                 if let Some(value) = workspace.get(key) {
@@ -29,14 +61,14 @@ pub(super) fn target_discovery_reasons(
                                 Some(_) => false,
                             };
                             if invalid {
-                                reasons.insert(format!(
+                                reasons.entry(path.clone()).or_default().insert(format!(
                                     "{}: workspace.{key}[{index}] is invalid: {entry}",
                                     path.display()
                                 ));
                             }
                         }
                     } else {
-                        reasons.insert(format!(
+                        reasons.entry(path.clone()).or_default().insert(format!(
                             "{}: workspace.{key} is not an array",
                             path.display()
                         ));
@@ -46,29 +78,22 @@ pub(super) fn target_discovery_reasons(
             // Cargo requires every members entry to resolve to a manifest,
             // including globs with zero matches (Cargo metadata rejects them).
             for member in &manifest.facts.workspace_members {
-                let Some(pattern_path) = normalize_selected_path(directory, member) else {
-                    reasons.insert(format!(
+                let Some(_) = normalize_selected_path(directory, member) else {
+                    reasons.entry(path.clone()).or_default().insert(format!(
                         "{}: workspace.members {} escapes workspace",
                         path.display(),
                         member.display()
                     ));
                     continue;
                 };
-                let Ok(pattern) = glob::Pattern::new(&pattern_path.to_string_lossy()) else {
-                    continue;
-                };
                 if !manifests.keys().any(|candidate| {
                     candidate.parent().is_some_and(|parent| {
-                        pattern.matches_path_with(
-                            parent,
-                            glob::MatchOptions {
-                                require_literal_separator: true,
-                                ..Default::default()
-                            },
+                        super::crate_inventory::workspace_member_pattern_matches(
+                            directory, member, parent,
                         )
                     })
                 }) {
-                    reasons.insert(format!(
+                    reasons.entry(path.clone()).or_default().insert(format!(
                         "{}: workspace.members {} is absent from selected manifests",
                         path.display(),
                         member.display()
@@ -79,19 +104,28 @@ pub(super) fn target_discovery_reasons(
         let Some(package) = &manifest.facts.package else {
             continue;
         };
+        for gap in &package.target_configuration_gaps {
+            reasons
+                .entry(path.clone())
+                .or_default()
+                .insert(format!("{}: {gap}", path.display()));
+        }
         if manifest
             .document
             .get("package")
             .and_then(|table| table.get("workspace"))
             .is_some_and(|value| value.as_str().is_none())
         {
-            reasons.insert(format!("{}: package.workspace is invalid", path.display()));
+            reasons
+                .entry(path.clone())
+                .or_default()
+                .insert(format!("{}: package.workspace is invalid", path.display()));
         }
         if let Some(pointer) = package.workspace_path.as_deref() {
             let workspace = normalize_selected_path(directory, pointer)
                 .and_then(|root| manifests.get(&root.join("Cargo.toml")));
             if workspace.is_none_or(|root| !root.facts.is_workspace) {
-                reasons.insert(format!(
+                reasons.entry(path.clone()).or_default().insert(format!(
                     "{}: package.workspace {} has no selected workspace manifest",
                     path.display(),
                     pointer.display()
@@ -100,25 +134,51 @@ pub(super) fn target_discovery_reasons(
         }
         let mut check = |candidate: &Path, required: bool| {
             let target = normalize_selected_path(directory, candidate);
-            if target
+            let reason = if target
                 .as_ref()
                 .is_none_or(|target| !target.starts_with(directory))
             {
-                reasons.insert(format!(
+                Some(format!(
                     "{}: target path {} escapes package",
                     path.display(),
                     candidate.display()
-                ));
+                ))
             } else if required
                 && target
                     .as_ref()
                     .is_some_and(|target| !sources.contains(target.as_path()))
             {
-                reasons.insert(format!(
+                Some(format!(
                     "{}: target path {} is absent from selected sources",
                     path.display(),
                     candidate.display()
-                ));
+                ))
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                reasons
+                    .entry(path.clone())
+                    .or_default()
+                    .insert(reason.clone());
+                if target
+                    .as_ref()
+                    .is_some_and(|target| target.starts_with(directory))
+                {
+                    return;
+                }
+                // add_selected_target_profiles rejects roots outside the declaring
+                // package. A destination belongs to its enclosing package's
+                // context, but #[path] and include routes can also make it a source
+                // of sibling contexts. The selected listing cannot exclude those
+                // module-path owners. Fail closed for every candidate closure;
+                // directory enclosure alone cannot prove ownership is absent.
+                for owner in manifests.keys() {
+                    reasons
+                        .entry(owner.clone())
+                        .or_default()
+                        .insert(reason.clone());
+                }
             }
         };
         if super::cargo_library_target_enabled(package) {
@@ -147,31 +207,51 @@ pub(super) fn target_discovery_reasons(
             );
         }
     }
-    // Cargo includes path dependencies under a workspace root, including target,
-    // dev and build dependencies. Excluded paths remain outside that workspace.
-    for root in manifests.values().filter(|m| m.facts.is_workspace) {
-        let root_dir = root.relative_path.parent().unwrap_or(Path::new(""));
-        for member in manifests.values().filter(|m| m.facts.package.is_some()) {
-            let member_dir = member.relative_path.parent().unwrap_or(Path::new(""));
-            if !member_dir.starts_with(root_dir) {
-                continue;
-            }
-            for (_, _, table) in cargo_dependency_tables_with_kind(&member.document) {
-                for (name, value) in table {
-                    let Some(path) = value
-                        .as_table()
-                        .and_then(|v| v.get("path"))
-                        .and_then(toml::Value::as_str)
-                    else {
-                        continue;
-                    };
-                    let Some(target) = normalize_selected_path(member_dir, Path::new(path)) else {
-                        continue;
-                    };
-                    if !target.starts_with(root_dir) {
+    // Only real members can introduce implicit members. An unrelated fixture
+    // below a workspace is not itself a workspace-discovery input.
+    let members = super::crate_inventory::workspace_member_manifests(
+        manifests,
+        cargo_manifests,
+        configuration,
+    );
+    for member in manifests.values().filter(|m| m.facts.package.is_some()) {
+        let member_dir = member.relative_path.parent().expect("manifest directory");
+        for (_, _, table) in cargo_dependency_tables_with_kind(&member.document) {
+            for (name, value) in table {
+                let Some(target) = crate::cargo_routes::cargo_dependency_directory_with(
+                    Path::new(""),
+                    member_dir,
+                    &member.document,
+                    name,
+                    value,
+                    cargo_manifests,
+                    configuration,
+                    &mut normalize_selected_path,
+                ) else {
+                    continue;
+                };
+                if manifests.contains_key(&target.join("Cargo.toml")) {
+                    continue;
+                }
+                let reason = format!(
+                    "{}: path dependency {name} at {} is absent from selected manifests",
+                    member.relative_path.display(),
+                    target.display()
+                );
+                // A dependency gap always concerns its declaring package. Only
+                // actual membership can make it a workspace-discovery gap too.
+                reasons
+                    .entry(member.relative_path.clone())
+                    .or_default()
+                    .insert(reason.clone());
+                for (root_dir, member_paths) in &members {
+                    if !member_paths.contains(&member.relative_path) {
                         continue;
                     }
-                    let relative = target.strip_prefix(root_dir).expect("prefix checked");
+                    let root = &manifests[&root_dir.join("Cargo.toml")];
+                    let Ok(relative) = target.strip_prefix(root_dir) else {
+                        continue;
+                    };
                     if root
                         .facts
                         .workspace_excludes
@@ -180,9 +260,10 @@ pub(super) fn target_discovery_reasons(
                     {
                         continue;
                     }
-                    if !manifests.contains_key(&target.join("Cargo.toml")) {
-                        reasons.insert(format!("{}: path dependency {name} at {path} is absent from selected manifests", member.relative_path.display()));
-                    }
+                    reasons
+                        .entry(root.relative_path.clone())
+                        .or_default()
+                        .insert(reason.clone());
                 }
             }
         }

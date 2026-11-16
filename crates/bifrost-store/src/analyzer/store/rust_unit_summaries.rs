@@ -8,14 +8,22 @@ use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 
+pub(crate) mod export_walk;
+mod output_supplement;
 mod route_questions;
 pub use route_questions::{
-    RustSelectedUnitsPublication, rust_broad_file_units, rust_broad_placement_rows,
-    rust_crate_name_units, rust_file_units, rust_package_units, rust_selected_units_known,
-    rust_unit_dependents, rust_unit_inputs, rust_unit_package_rows,
+    RUST_ADDED_EDGE_TARGET_SQL, RustSelectedUnitsPublication, rust_added_edge_targets_path,
+    rust_broad_file_units, rust_broad_placement_rows, rust_crate_name_units, rust_file_units,
+    rust_local_glob_closure_reads_paths, rust_package_units, rust_selected_units_known,
+    rust_selection_has_overlay, rust_selection_overlay_paths, rust_unit_dependents,
+    rust_unit_file_activity, rust_unit_inputs, rust_unit_package_rows,
+    rust_unit_placement_activity,
 };
 #[cfg(any(test, feature = "test-support"))]
-pub use route_questions::{explain_rust_route_questions, rust_crate_name_units_sql};
+pub use route_questions::{
+    explain_rust_route_questions, rust_broad_file_units_sql, rust_broad_placement_rows_sql,
+    rust_crate_name_units_sql, take_rust_unit_inputs_trace,
+};
 
 #[cfg(any(test, feature = "test-support"))]
 use std::fmt::Debug;
@@ -24,9 +32,7 @@ use rusqlite::Connection;
 use rusqlite::OptionalExtension;
 use rusqlite::params;
 
-use super::unit_summaries::ConsumedDependency;
 use super::unit_summaries::UnitDependency;
-use super::unit_summaries::UnitExport;
 use super::unit_summaries::UnitGap;
 use super::unit_summaries::UnitImport;
 use super::unit_summaries::UnitInputs;
@@ -34,6 +40,10 @@ use super::unit_summaries::UnitMember;
 use super::unit_summaries::UnitOutputs;
 use super::unit_summaries::UnitRead;
 use super::unit_summaries::UnitSummaryLanguage;
+use super::unit_summaries::{
+    ConsumedDependency, ForeignReader, InputFileValue, MemberInput, ReadKind, UnitCoordinate,
+    UnitExport, UnitInputFile, UnitSummaryInputRole, member_input_for_derivation,
+};
 
 use super::AnalyzerStore;
 use super::Result;
@@ -65,7 +75,37 @@ use brokk_bifrost_rust::usage::direct_import_scope_for_module_with_identity;
 // Version 20 separates module inventories from binding gaps at colliding paths.
 // Version 23 preserves resolved subjects of otherwise unresolved trait impls.
 #[doc(hidden)]
-pub const RUST_UNIT_SUMMARY_DERIVATION_VERSION: i64 = 24;
+// Version 25 fills inactive inputs, placements, broad completeness and public-surface gaps.
+// Version 26 writes shared summary rows on surface coordinates (#11183 M2).
+// Version 27 fills the binding-authority owners, names, alternatives and blockers.
+// Version 28 fills the inherent and unresolved inherent impls.
+// Version 29 records every foreign unit read, settled-checked, in the consumed set (#11173 walk).
+// (27 and 28 belong to the binding-authority and inherent-impl mirrors of #11173 M2b.)
+// Version 30 resolves a foreign re-export through the consumed units' summary rows (#11173 walk).
+// Version 31 stores no coordinate of another unit's rows and hashes the name-level child rows into the output (#11173 walk).
+// Version 32 reads a trait impl's declaring unit by the name the topology gives it (#11173 walk).
+// Classifies unresolved impl halves and lists members through resolved subjects (#11904).
+// Carries foreign macro invocation name forms (#11173 gap phase B).
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn rust_unit_summary_derivation_identity_before_last_token() -> [u8; 32] {
+    brokk_bifrost_core::lever_tokens::lever_identity_before_last_token(
+        "rust-unit-summary-derivation",
+        brokk_bifrost_core::lever_file!("rust-unit-summary-derivation.tokens"),
+    )
+}
+
+pub fn rust_unit_summary_derivation_identity() -> [u8; 32] {
+    static IDENTITY: std::sync::LazyLock<[u8; 32]> = std::sync::LazyLock::new(|| {
+        brokk_bifrost_core::lever_tokens::lever_identity(
+            "rust-unit-summary-derivation",
+            brokk_bifrost_core::lever_file!("rust-unit-summary-derivation.tokens"),
+        )
+    });
+    *IDENTITY
+}
+// Preserves explicit type/value binding precedence behind open inventories (#12014).
+// Selects all workspace features plus global test (#12164).
 
 pub(crate) const IMPORTING_FILES_FOR_MEMBER_SQL: &str = r#"
 WITH target_declarations AS (
@@ -73,8 +113,12 @@ WITH target_declarations AS (
          target_export.name
   FROM main.blobs AS target_blob INDEXED BY sqlite_autoindex_blobs_1
   CROSS JOIN main.resolution_unit_summary_members AS target_member
-    INDEXED BY resolution_unit_summary_members_blob
-    ON target_member.blob_id = target_blob.id AND target_member.rel_path = ?2
+    INDEXED BY resolution_unit_summary_members_path
+    ON target_member.rel_path = ?2
+  CROSS JOIN temp.selected_unit_member_blobs AS target_attachment
+    ON target_attachment.summary_id = target_member.summary_id
+   AND target_attachment.member_ordinal = target_member.member_ordinal
+   AND target_attachment.blob_id = target_blob.id
   CROSS JOIN selected_rust_unit_summary_route_owners AS target_unit
     ON target_unit.summary_id = target_member.summary_id
   CROSS JOIN main.rust_resolution_unit_summary_exports AS target_export
@@ -177,26 +221,38 @@ WITH selected_units AS (
     AND summaries.lang = 'rust'
     AND summaries.unit_kind = 'rust_crate'
     AND summaries.publication_state = 'complete'
-    AND summaries.derivation_version = ?1
+    AND summaries.derivation_identity = ?1
 )
 SELECT members.rel_path, json(naming.package_components), contexts.crate_name,
        contexts.target_kind, blobs.blob_oid,
        EXISTS (
-         SELECT 1 FROM main.rust_unit_summary_placements AS root
+         SELECT 1 FROM temp.rust_unit_summary_placements AS root
          WHERE root.summary_id = members.summary_id
            AND root.member_ordinal = members.member_ordinal
            AND root.module_path = 'crate'
+       ),
+       EXISTS (
+         SELECT 1 FROM temp.selected_rust_unplaced_placements AS lost
+         WHERE lost.summary_id = members.summary_id
+           AND lost.member_ordinal = members.member_ordinal
+       ) AND NOT EXISTS (
+         SELECT 1 FROM temp.rust_unit_summary_placements AS kept
+         WHERE kept.summary_id = members.summary_id
+           AND kept.member_ordinal = members.member_ordinal
        )
 FROM selected_units AS units
-JOIN main.resolution_unit_summary_members AS members
+CROSS JOIN main.resolution_unit_summary_members AS members
   ON members.summary_id = units.summary_id
-JOIN temp.selected_workspace_file_versions AS files
+CROSS JOIN temp.selected_workspace_file_versions AS files
   ON files.workspace_id = units.workspace_id
  AND files.lang = 'rust'
  AND files.generation = units.generation
  AND files.rel_path = members.rel_path
+CROSS JOIN temp.selected_unit_member_blobs AS attachment
+  ON attachment.summary_id = members.summary_id
+ AND attachment.member_ordinal = members.member_ordinal
 JOIN main.blobs AS blobs
-  ON blobs.id = members.blob_id
+  ON blobs.id = attachment.blob_id
  AND blobs.blob_oid = files.blob_oid
  AND blobs.lang = files.lang
  AND blobs.generation = files.generation
@@ -249,18 +305,18 @@ WITH selected_units AS (
     AND (versions.valid_until IS NULL OR selected.revision < versions.valid_until)
     AND summaries.lang = 'rust'
     AND summaries.unit_kind = 'rust_crate'
-    AND summaries.derivation_version = ?1
+    AND summaries.derivation_identity = ?1
     AND summaries.publication_state = 'complete'
 )
 SELECT parent.unit_key, parent_manifest.rel_path,
        parent_context.target_kind, parent_context.crate_name, parent_context.edition,
        parent_context.development_capable,
-       CASE WHEN parent_blob.id IS NOT NULL THEN parent_member.rel_path END,
+       CASE WHEN parent_file.file_version_id IS NOT NULL THEN parent_member.rel_path END,
        json(parent_naming.root_components),
        dependency_names.extern_name, dependency_names.dependency_kind,
        dependencies.boundary, dependencies.dependency_unit_key,
        child_context.target_kind,
-       CASE WHEN child_blob.id IS NOT NULL THEN child_member.rel_path END,
+       CASE WHEN child_file.file_version_id IS NOT NULL THEN child_member.rel_path END,
        json(child_naming.root_components),
        child_manifest.rel_path
 FROM selected_units AS parent
@@ -282,11 +338,6 @@ LEFT JOIN main.workspace_file_versions AS parent_file
  AND parent_file.valid_from <= parent.revision
  AND (parent_file.valid_until IS NULL OR parent.revision < parent_file.valid_until)
  AND parent_file.rel_path = parent_member.rel_path
-LEFT JOIN main.blobs AS parent_blob
-  ON parent_blob.id = parent_member.blob_id
- AND parent_blob.blob_oid = parent_file.blob_oid
- AND parent_blob.lang = parent_file.lang
- AND parent_blob.generation = parent_file.generation
 LEFT JOIN main.rust_resolution_unit_summary_file_naming AS parent_naming
   ON parent_naming.summary_id = parent_member.summary_id
  AND parent_naming.member_ordinal = parent_member.member_ordinal
@@ -307,7 +358,7 @@ LEFT JOIN main.resolution_unit_summaries AS child_summaries
   ON child_summaries.summary_id = child_versions.summary_id
  AND child_summaries.lang = 'rust'
  AND child_summaries.unit_kind = 'rust_crate'
- AND child_summaries.derivation_version = ?1
+ AND child_summaries.derivation_identity = ?1
  AND child_summaries.publication_state = 'complete'
 LEFT JOIN main.resolution_producer_epochs AS child_epochs
   ON child_epochs.lang = child_versions.lang
@@ -338,11 +389,6 @@ LEFT JOIN main.workspace_file_versions AS child_file
  AND child_file.valid_from <= parent.revision
  AND (child_file.valid_until IS NULL OR parent.revision < child_file.valid_until)
  AND child_file.rel_path = child_member.rel_path
-LEFT JOIN main.blobs AS child_blob
-  ON child_blob.id = child_member.blob_id
- AND child_blob.blob_oid = child_file.blob_oid
- AND child_blob.lang = child_file.lang
- AND child_blob.generation = child_file.generation
 LEFT JOIN main.rust_resolution_unit_summary_file_naming AS child_naming
   ON child_naming.summary_id = child_member.summary_id
  AND child_naming.member_ordinal = child_member.member_ordinal
@@ -404,7 +450,7 @@ binding_roots AS (
          bindings.module_path, bindings.name, bindings.namespace,
          bindings.visibility_kind, bindings.visibility_crate_root,
          bindings.visibility_module_path, bindings.target_unit_key,
-         bindings.target_identity_id, bindings.target_declaration_key,
+         bindings.target_identity_id,
          route_source.import_id AS source_import_id,
          route_source.import_ordinal AS source_import_ordinal,
          route_source.target_unit_key AS edge_target_unit_key,
@@ -453,7 +499,7 @@ roots AS (
          roots.route_provenance_ordinal, roots.module_path, roots.name, roots.namespace,
          roots.visibility_kind, roots.visibility_crate_root,
          roots.visibility_module_path, targets.unit_key AS target_unit_key,
-         exports.identity_id AS target_identity_id, roots.target_declaration_key,
+         exports.identity_id AS target_identity_id,
          route_source.import_id AS source_import_id,
          route_source.import_ordinal AS source_import_ordinal,
          route_source.target_unit_key AS edge_target_unit_key,
@@ -486,10 +532,10 @@ roots AS (
   SELECT summary_id, member_ordinal, rel_path, root_components,
          route_provenance_ordinal, module_path, name, namespace,
          visibility_kind, visibility_crate_root, visibility_module_path,
-         target_unit_key, target_identity_id, target_declaration_key,
+         target_unit_key, target_identity_id,
          source_import_id, source_import_ordinal, edge_target_unit_key,
          target_module_path, target_name
-  FROM binding_roots WHERE target_declaration_key IS NOT NULL
+  FROM binding_roots WHERE target_identity_id IS NULL
 ),
 -- Drive both origin arms from requested roots. Reordering from historical
 -- exports/placements would scan those tables and automatically index roots.
@@ -525,6 +571,9 @@ route_graph(root_summary_id, root_member_ordinal, root_route_ordinal,
   CROSS JOIN main.resolution_unit_summary_members AS origin_member
     ON origin_member.summary_id = origin_export.summary_id
    AND origin_member.member_ordinal = origin_export.declaration_member_ordinal
+  CROSS JOIN temp.selected_unit_member_blobs AS origin_attachment
+    ON origin_attachment.summary_id = origin_member.summary_id
+   AND origin_attachment.member_ordinal = origin_member.member_ordinal
   CROSS JOIN main.rust_resolution_unit_summary_file_naming AS origin_naming
     ON origin_naming.summary_id = origin_member.summary_id
    AND origin_naming.member_ordinal = origin_member.member_ordinal
@@ -543,20 +592,23 @@ route_graph(root_summary_id, root_member_ordinal, root_route_ordinal,
   FROM roots
   CROSS JOIN selected_rust_unit_summary_route_owners AS origin_owner
     ON origin_owner.unit_key = roots.target_unit_key
-  CROSS JOIN main.rust_unit_summary_placements AS origin_placement
+  CROSS JOIN temp.rust_unit_summary_placements AS origin_placement
     ON origin_placement.summary_id = origin_owner.summary_id
    AND origin_placement.module_path = roots.target_module_path
   CROSS JOIN main.resolution_unit_summary_members AS origin_member
     ON origin_member.summary_id = origin_placement.summary_id
    AND origin_member.member_ordinal = origin_placement.member_ordinal
+  CROSS JOIN temp.selected_unit_member_blobs AS origin_attachment
+    ON origin_attachment.summary_id = origin_member.summary_id
+   AND origin_attachment.member_ordinal = origin_member.member_ordinal
   CROSS JOIN main.source_rust_module_declarations AS declaration
+    /* Rust-only derived-from blob until #11183 M3 converts Rust child rows */
     ON declaration.blob_id = origin_member.blob_id
-   AND declaration.declaration_id = roots.target_declaration_key
    AND declaration.module_name = roots.target_name
   CROSS JOIN main.rust_resolution_unit_summary_file_naming AS origin_naming
     ON origin_naming.summary_id = origin_member.summary_id
    AND origin_naming.member_ordinal = origin_member.member_ordinal
-  WHERE roots.target_declaration_key IS NOT NULL
+  WHERE roots.target_identity_id IS NULL
   UNION
   SELECT graph.root_summary_id, graph.root_member_ordinal,
          graph.root_route_ordinal, graph.root_rel_path,
@@ -624,7 +676,7 @@ SELECT members.summary_id, members.rel_path, json(naming.package_components),
        ) AND NOT EXISTS (
          SELECT 1 FROM main.rust_resolution_unit_summary_gaps AS gaps
          WHERE gaps.summary_id = members.summary_id
-           AND gaps.gap_kind NOT IN ('unresolved_import', 'unplaced_module')
+           AND gaps.gap_kind NOT IN ('unresolved_import', 'unplaced_module', 'dev_dependency_cycle_edge_dropped')
            AND NOT (gaps.gap_kind = 'open_export_inventory'
                  AND json_type(gaps.detail, '$.evidence') IS 'array'
                  AND json_array_length(gaps.detail, '$.evidence') > 0
@@ -681,10 +733,19 @@ pub struct RustSummaryPackageRow {
     pub crate_name: String,
     #[doc(hidden)]
     pub target_kind: String,
+    /// The content the member has in the reader's selection: the revision's
+    /// blob for the disk readers, the selected mount's blob (overlay content
+    /// included) for the selected readers. `None` when the selection mounts
+    /// no content at the path, as for a masked or removed file.
     #[doc(hidden)]
-    pub blob_oid: String,
+    pub blob_oid: Option<String>,
     #[doc(hidden)]
     pub is_root_member: bool,
+    /// Every persisted placement of the member is unplaced by the selection
+    /// (a removed, retargeted or gated declaring edge), so the persisted
+    /// unit no longer proves the member belongs to it.
+    #[doc(hidden)]
+    pub unplaced_by_selection: bool,
 }
 
 /// One selected Rust source file in one unit, and the manifest of that unit's
@@ -820,7 +881,12 @@ const STAGE_SCHEMA_SQL: &str = "CREATE TEMP TABLE IF NOT EXISTS rust_unit_summar
     crate_key BLOB NOT NULL UNIQUE,
     label TEXT NOT NULL
   ) STRICT;
-  DELETE FROM temp.rust_unit_summary_units;";
+  DELETE FROM temp.rust_unit_summary_units;
+  CREATE TEMP TABLE IF NOT EXISTS rust_unit_summary_owner_handles(
+    owner_id INTEGER PRIMARY KEY,
+    owner_handle INTEGER NOT NULL,
+    member_ordinal INTEGER
+  ) STRICT;";
 
 const STAGE_UNITS_SQL: &str = "INSERT INTO temp.rust_unit_summary_units(topology_id, crate_key, label)
     SELECT versions.topology_id, versions.crate_key, topologies.crate_name || ' [' || topologies.target_kind || ']'
@@ -834,13 +900,15 @@ const STAGE_UNITS_SQL: &str = "INSERT INTO temp.rust_unit_summary_units(topology
 // A library consumes its dev-dependencies, but they are inputs of its test
 // targets: they must not order the units, or a library and the dev-dependency
 // that depends on it form a cycle that unorders everything built on them.
-const STAGE_DEPENDENCY_EDGES_SQL: &str = "INSERT OR IGNORE INTO temp.unit_summary_edges(unit_id, dependency_unit_id, orders)
-    SELECT owner.unit_id, child.unit_id, MAX(dependencies.dependency_kind <> 'dev')
+const STAGE_DEPENDENCY_EDGES_SQL: &str = "INSERT INTO temp.unit_summary_edges(unit_id, dependency_unit_id, orders)
+    SELECT * FROM (
+SELECT owner.unit_id, child.unit_id, MAX(dependencies.dependency_kind <> 'dev')
     FROM temp.rust_unit_summary_units AS owner
     JOIN main.rust_crate_dependencies AS dependencies ON dependencies.topology_id = owner.topology_id
       AND dependencies.boundary = 'workspace'
     JOIN temp.rust_unit_summary_units AS child ON child.crate_key = dependencies.dependency_crate_key
-    GROUP BY owner.unit_id, child.unit_id";
+    GROUP BY owner.unit_id, child.unit_id
+) WHERE true ON CONFLICT DO NOTHING";
 
 const UNIT_SQL: &str =
     "SELECT units.topology_id, topologies.crate_key, units.label, topologies.topology_digest
@@ -855,12 +923,19 @@ const MEMBERS_SQL: &str =
     WHERE sources.topology_id = ?1
     ORDER BY sources.rel_path, sources.source_kind, sources.blob_id";
 
-const CONFIGURATION_READS_SQL: &str = "SELECT versions.rel_path, versions.blob_oid
-    FROM main.workspace_file_versions AS versions
-    WHERE versions.workspace_id = ?1 AND versions.lang = 'rust' AND versions.generation = ?2
-      AND versions.input_kind = 'configuration' AND versions.valid_from <= ?3
-      AND (versions.valid_until IS NULL OR ?3 < versions.valid_until)
-    ORDER BY versions.rel_path";
+/// The topology's inactive source files in `(role, rel_path)` order. A placement
+/// can lack a blob row while the file is selected; the selected OID then names
+/// the file, as the topology digest does for the same case.
+const INACTIVE_INPUT_FILES_SQL: &str =
+    "SELECT files.rel_path, files.blob_id, COALESCE(blobs.blob_oid, selected.blob_oid)
+    FROM (SELECT DISTINCT rel_path, blob_id FROM main.rust_crate_inactive_placements
+          WHERE topology_id = ?1) AS files
+    LEFT JOIN main.blobs AS blobs ON blobs.id = files.blob_id
+    LEFT JOIN main.workspace_file_versions AS selected
+      ON selected.workspace_id = ?2 AND selected.lang = 'rust' AND selected.generation = ?3
+     AND selected.rel_path = files.rel_path AND selected.valid_from <= ?4
+     AND (selected.valid_until IS NULL OR ?4 < selected.valid_until)
+    ORDER BY files.rel_path";
 
 const DEPENDENCIES_SQL: &str = "SELECT dependencies.extern_name, dependencies.boundary,
        dependencies.dependency_crate_key, dependencies.dependency_kind,
@@ -931,74 +1006,6 @@ pub const NAMED_REEXPORT_TARGETS_SQL: &str =
             AND member.container_path = imports.module_path AND member.blob_id = imports.blob_id
             AND scope.resolution_scope = imports.binder_scope
       )";
-
-const TARGET_IDENTITY_SQL: &str = "SELECT identities.id, identities.identity_digest,
-       exports.declaration_blob_id, exports.declaration_site
-    FROM main.rust_crate_versions AS versions
-    JOIN main.rust_crate_exports AS exports ON exports.topology_id = versions.topology_id
-    JOIN main.resolution_identities AS identities
-      ON identities.semantic_language = ?8 AND identities.namespace = ?9 AND identities.spelling = ?7
-    WHERE versions.workspace_id = ?1 AND versions.lang = 'rust' AND versions.generation = ?2
-      AND versions.crate_key = ?3 AND versions.valid_from <= ?4
-      AND (versions.valid_until IS NULL OR ?4 < versions.valid_until)
-      AND exports.module_path = ?5 AND exports.namespace = ?6 AND exports.name = ?7
-      AND (?10 OR exports.visibility = 'public')
-    LIMIT 1";
-
-// This is an export-surface proof, not dependency-graph reachability. Match
-// the canonical target coordinates and identity, or prove that the current
-// selected direct dependency topology publicly reaches that canonical module.
-pub(crate) const DEPENDENCY_REEXPORT_WITNESS_SQL: &str = concat!(
-    "WITH live AS (",
-    super::unit_summaries::live_summary_select!("zeroblob(32)"),
-    "), target_live AS (",
-    super::unit_summaries::live_summary_select!("zeroblob(32)", "?8"),
-    ")
-     SELECT EXISTS(
-       SELECT 1 FROM live
-       CROSS JOIN main.rust_resolution_unit_summary_exports AS exports
-         INDEXED BY rust_resolution_unit_summary_exports_alias_target
-         ON exports.summary_id = live.summary_id
-       WHERE exports.origin <> 'declaration'
-         AND exports.visibility = 'public' AND exports.namespace = ?10
-         AND exports.target_unit_key = ?8 AND exports.target_module_path = ?9
-         AND exports.target_name = ?11 AND exports.alias_identity_id = ?12
-       UNION ALL
-       SELECT 1 FROM live
-       CROSS JOIN main.rust_crate_versions AS versions
-         ON versions.workspace_id = ?1 AND versions.lang = ?2 AND versions.generation = ?3
-        AND versions.crate_key = ?4 AND versions.valid_from <= ?5
-        AND (versions.valid_until IS NULL OR ?5 < versions.valid_until)
-       CROSS JOIN main.rust_crate_topologies AS topology
-         ON topology.topology_id = versions.topology_id
-        AND topology.publication_state = 'complete'
-       CROSS JOIN main.rust_crate_public_module_reachability AS reachability
-         ON reachability.topology_id = topology.topology_id
-        AND reachability.target_crate_key = ?8
-        AND reachability.target_module_path = ?9
-       UNION ALL
-       SELECT 1 FROM target_live
-       CROSS JOIN main.rust_resolution_unit_summary_exports AS exports
-         INDEXED BY rust_resolution_unit_summary_exports_alias_target
-         ON exports.summary_id = target_live.summary_id
-       CROSS JOIN live
-       CROSS JOIN main.rust_crate_versions AS versions
-         ON versions.workspace_id = ?1 AND versions.lang = ?2 AND versions.generation = ?3
-        AND versions.crate_key = ?4 AND versions.valid_from <= ?5
-        AND (versions.valid_until IS NULL OR ?5 < versions.valid_until)
-       CROSS JOIN main.rust_crate_topologies AS topology
-         ON topology.topology_id = versions.topology_id
-        AND topology.publication_state = 'complete'
-       CROSS JOIN main.rust_crate_public_module_reachability AS reachability
-         ON reachability.topology_id = topology.topology_id
-        AND reachability.target_crate_key = ?8
-        AND reachability.target_module_path = exports.module_path
-       WHERE exports.origin <> 'declaration'
-         AND exports.visibility = 'public' AND exports.namespace = ?10
-         AND exports.target_unit_key = ?8 AND exports.target_module_path = ?9
-         AND exports.target_name = ?11 AND exports.alias_identity_id = ?12
-     )"
-);
 
 // A forwarded public-surface gap describes the topology's reachability graph,
 // not this unit's own export or import inventory. A declared `pub mod` whose
@@ -1172,6 +1179,11 @@ pub(super) fn assert_differential(conn: &Connection, snapshot: &WorkspaceSnapsho
         // Compare the residual reader columns, not the unrelated import-id domain.
         for (family, expected_sql, actual_sql) in [
             (
+                "broad active placement members",
+                "SELECT DISTINCT json_array(CASE container_path WHEN '' THEN 'crate' ELSE container_path END, rel_path, source_kind) FROM rust_crate_container_sources WHERE topology_id=?1",
+                "SELECT DISTINCT json_array(CASE placement.container_path WHEN '' THEN 'crate' ELSE placement.container_path END, member.rel_path, member.source_role) FROM resolution_unit_summary_placements AS placement JOIN resolution_unit_summary_members AS member USING(summary_id, member_ordinal) WHERE placement.summary_id=?1",
+            ),
+            (
                 "residual import routes",
                 "SELECT DISTINCT json_array(module_path, blob_id, import_ordinal, binder_scope, namespace, bound_name, hex(target_crate_key), target_module_path, target_name) FROM rust_crate_imports WHERE topology_id=?1",
                 "SELECT DISTINCT json_array(route.module_path, member.blob_id, route.route_ordinal, route.binder_scope, route.namespace, route.bound_name, hex(route.target_unit_key), route.target_module_path, route.target_name) FROM rust_resolution_unit_summary_import_routes AS route JOIN resolution_unit_summary_members AS member USING(summary_id, member_ordinal) WHERE route.summary_id=?1",
@@ -1184,7 +1196,7 @@ pub(super) fn assert_differential(conn: &Connection, snapshot: &WorkspaceSnapsho
             (
                 "residual parent placements",
                 "SELECT DISTINCT json_array(container_path, blob_id, rel_path, scope_ordinal, source_kind, enum_scope_node_key) FROM rust_crate_container_sources WHERE topology_id=?1",
-                "SELECT DISTINCT json_array(attr.module_path, member.blob_id, member.rel_path, placement.scope_ordinal, attr.source_kind, attr.enum_scope_node_key) FROM resolution_unit_summary_placements AS placement JOIN rust_resolution_unit_summary_placement_attributes AS attr USING(summary_id, container_path, member_ordinal) JOIN resolution_unit_summary_members AS member USING(summary_id, member_ordinal) WHERE placement.summary_id=?1",
+                "SELECT DISTINCT json_array(placement.module_path, member.blob_id, member.rel_path, placement.scope_ordinal, placement.source_kind, placement.enum_scope_node_key) FROM temp.rust_unit_summary_placements AS placement JOIN resolution_unit_summary_members AS member USING(summary_id, member_ordinal) WHERE placement.summary_id=?1",
             ),
         ] {
             let read = |sql: &str, id| {
@@ -1200,6 +1212,82 @@ pub(super) fn assert_differential(conn: &Connection, snapshot: &WorkspaceSnapsho
                 &read(expected_sql, topology_id),
                 &read(actual_sql, summary_id),
             );
+        }
+
+        let digest = brokk_bifrost_core::analyzer::canonical_hash::lower_hex_string(
+            &super::surface_relations::list_digest(super::surface_relations::RUST_RELATIONS),
+        );
+        for (family, expected, actual) in [
+            ("inactive inputs", "SELECT DISTINCT json_array('inactive_source',rel_path) FROM rust_crate_inactive_placements WHERE topology_id=?1".to_owned(),
+             "SELECT json_array(source_role,rel_path) FROM resolution_unit_summary_input_files WHERE summary_id=?1 AND source_role='inactive_source'"),
+            ("inactive placements", format!("SELECT DISTINCT json_array(p.module_path,i.input_ordinal,p.placement,ids.surface_ordinal,p.activation) FROM rust_crate_inactive_placements p JOIN resolution_unit_summary_input_files i ON i.summary_id={summary_id} AND i.source_role='inactive_source' AND i.rel_path=p.rel_path LEFT JOIN surface_sets sets ON sets.blob_id=p.blob_id AND sets.list_digest=x'{digest}' LEFT JOIN surface_ids ids ON ids.set_id=sets.set_id AND ids.id_space=7 AND ids.dense_id=p.scope_ordinal WHERE p.topology_id=?1"),
+             "SELECT json_array(module_path,input_file_ordinal,placement,module_scope_surface_ordinal,activation) FROM rust_resolution_unit_summary_inactive_placements WHERE summary_id=?1"),
+            ("broad completeness", "SELECT json_array(broad_complete) FROM rust_crate_topologies WHERE topology_id=?1".to_owned(),
+             "SELECT json_array(broad_complete) FROM rust_resolution_unit_summary_contexts WHERE summary_id=?1"),
+            ("public surface gaps", "SELECT json_array(gap_kind,subject) FROM rust_crate_gaps WHERE topology_id=?1 AND subject LIKE 'public-module-surface:%'".to_owned(),
+             "SELECT json_array(gap_kind,subject) FROM rust_resolution_unit_summary_public_surface_gaps WHERE summary_id=?1"),
+            ("all gaps", "SELECT json_array(gap_kind,subject) FROM rust_crate_gaps WHERE topology_id=?1".to_owned(),
+             "SELECT json_array(gap_kind,subject) FROM rust_resolution_unit_summary_all_gaps WHERE summary_id=?1"),
+            // Binding authority: the same rows with own references compared as the
+            // member's blob and dense ids, and every multiplicity kept. A declaration
+            // target also names the member's rel_path: the topology side derives it
+            // from the placement sources, so a member picked by blob alone differs. Handles,
+            // ordinals and row ids are summary-local and not compared.
+            ("binding owners",
+             "SELECT json_array(o.module_path,o.kind,o.rel_path,o.blob_id,o.native_scope,o.closed,(SELECT json_array(p.module_path,p.kind,p.rel_path,p.blob_id,p.native_scope) FROM rust_crate_binding_owners p WHERE p.owner_id=o.parent_owner_id)) FROM rust_crate_binding_owners o WHERE o.topology_id=?1".to_owned(),
+             "SELECT json_array(o.module_path,o.kind,COALESCE(m.rel_path,''),m.blob_id,o.native_scope,o.closed,(SELECT json_array(p.module_path,p.kind,COALESCE(pm.rel_path,''),pm.blob_id,p.native_scope) FROM rust_resolution_unit_summary_binding_owners p LEFT JOIN resolution_unit_summary_members pm ON pm.summary_id=p.summary_id AND pm.member_ordinal=p.member_ordinal WHERE p.summary_id=o.summary_id AND p.owner_handle=o.parent_owner_handle)) FROM rust_resolution_unit_summary_binding_owners o LEFT JOIN resolution_unit_summary_members m ON m.summary_id=o.summary_id AND m.member_ordinal=o.member_ordinal WHERE o.summary_id=?1"),
+            ("binding names",
+             "SELECT json_array(o.module_path,o.kind,o.rel_path,o.blob_id,o.native_scope,n.namespace,n.name,n.complete) FROM rust_crate_binding_names n JOIN rust_crate_binding_owners o ON o.owner_id=n.owner_id WHERE o.topology_id=?1".to_owned(),
+             "SELECT json_array(o.module_path,o.kind,COALESCE(m.rel_path,''),m.blob_id,o.native_scope,n.namespace,n.name,n.complete) FROM rust_resolution_unit_summary_binding_names n JOIN rust_resolution_unit_summary_binding_owners o ON o.summary_id=n.summary_id AND o.owner_handle=n.owner_handle LEFT JOIN resolution_unit_summary_members m ON m.summary_id=o.summary_id AND m.member_ordinal=o.member_ordinal WHERE n.summary_id=?1"),
+            ("binding alternatives",
+             "SELECT json_array(o.module_path,o.kind,o.rel_path,o.blob_id,o.native_scope,a.namespace,a.name,hex(a.target_crate_key),a.target_module_path,a.target_name,a.target_container_path,a.origin,a.visibility,a.restricted_module_path,a.glob_visibility,a.glob_restricted_module_path,json(CASE WHEN a.target_crate_key=t.crate_key THEN CASE WHEN a.declaration_blob_id IS NULL THEN json_array('anchor') ELSE json_array('local',a.declaration_blob_id,a.declaration_site,a.generated_declaration_id,(SELECT min(rel_path) FROM (SELECT DISTINCT s.rel_path AS rel_path FROM rust_crate_container_sources s WHERE s.topology_id=o.topology_id AND s.blob_id=a.declaration_blob_id AND (s.container_path IN (SELECT a.target_module_path WHERE a.origin='declaration' OR a.declaration_site IS NULL UNION SELECT CASE e.origin WHEN 'declaration' THEN e.module_path ELSE e.target_module_path END FROM rust_crate_exports e WHERE a.origin<>'declaration' AND a.declaration_site IS NOT NULL AND e.topology_id=o.topology_id AND e.module_path=a.target_module_path AND e.namespace=a.namespace AND e.name=a.target_name AND e.declaration_blob_id=a.declaration_blob_id AND e.declaration_site=a.declaration_site) OR NOT EXISTS(SELECT 1 FROM rust_crate_container_sources s2 WHERE s2.topology_id=o.topology_id AND s2.blob_id=a.declaration_blob_id AND s2.container_path IN (SELECT a.target_module_path WHERE a.origin='declaration' OR a.declaration_site IS NULL UNION SELECT CASE e.origin WHEN 'declaration' THEN e.module_path ELSE e.target_module_path END FROM rust_crate_exports e WHERE a.origin<>'declaration' AND a.declaration_site IS NOT NULL AND e.topology_id=o.topology_id AND e.module_path=a.target_module_path AND e.namespace=a.namespace AND e.name=a.target_name AND e.declaration_blob_id=a.declaration_blob_id AND e.declaration_site=a.declaration_site))) ))) END ELSE json_array('foreign',hex(a.target_crate_key),a.target_module_path,CASE WHEN a.declaration_blob_id IS NULL THEN 'module' WHEN a.declaration_site IS NOT NULL THEN 'declaration' ELSE 'generated' END,a.namespace,'declaration') END),json(CASE WHEN a.origin='glob' THEN json_array(hex(a.provider_crate_key),a.provider_module_path,CASE WHEN a.provider_rel_path<>'' THEN json_array(po.rel_path,po.blob_id,po.native_scope) END) END)) FROM rust_crate_binding_alternatives a JOIN rust_crate_binding_owners o ON o.owner_id=a.owner_id JOIN rust_crate_topologies t ON t.topology_id=o.topology_id LEFT JOIN rust_crate_binding_owners po ON a.provider_rel_path<>'' AND po.topology_id=o.topology_id AND po.module_path=a.provider_module_path AND po.rel_path=a.provider_rel_path AND po.scope_identity=a.provider_scope_identity WHERE o.topology_id=?1".to_owned(),
+             "SELECT json_array(o.module_path,o.kind,COALESCE(m.rel_path,''),m.blob_id,o.native_scope,a.namespace,a.name,hex(a.target_unit_key),a.target_module_path,a.target_name,a.target_container_path,a.origin,a.visibility,a.restricted_module_path,a.glob_visibility,a.glob_restricted_module_path,json(CASE a.target_form WHEN 'anchor' THEN json_array('anchor') WHEN 'foreign' THEN json_array('foreign',hex(a.target_unit_key),a.target_module_path,a.target_kind,a.target_namespace,a.target_origin) ELSE json_array('local',tm.blob_id,a.target_site,a.target_declaration_id,tm.rel_path) END),json(CASE a.provider_form WHEN 'none' THEN NULL ELSE json_array(hex(a.provider_unit_key),a.provider_module_path,CASE a.provider_form WHEN 'local' THEN json_array(pm.rel_path,pm.blob_id,a.provider_native_scope) END) END)) FROM rust_resolution_unit_summary_binding_alternatives a JOIN rust_resolution_unit_summary_binding_owners o ON o.summary_id=a.summary_id AND o.owner_handle=a.owner_handle LEFT JOIN resolution_unit_summary_members m ON m.summary_id=o.summary_id AND m.member_ordinal=o.member_ordinal LEFT JOIN resolution_unit_summary_members tm ON tm.summary_id=a.summary_id AND tm.member_ordinal=a.target_member_ordinal LEFT JOIN resolution_unit_summary_members pm ON pm.summary_id=a.summary_id AND pm.member_ordinal=a.provider_member_ordinal WHERE a.summary_id=?1"),
+            ("binding blockers",
+             "SELECT json_array(o.module_path,o.kind,o.rel_path,o.blob_id,o.native_scope,b.namespace,b.name,b.reason,b.boundary,hex(b.evidence_crate_key),b.evidence_module_path,b.evidence_kind,json(CASE WHEN b.evidence_crate_key<>t.crate_key THEN json_array('foreign',hex(b.evidence_crate_key),b.evidence_module_path) WHEN b.evidence_kind='owner' THEN json_array('owner',b.evidence_module_path) WHEN b.evidence_rel_path='' THEN json_array('unplaced') ELSE json_array('local',es.rel_path,es.blob_id,b.evidence_key) END)) FROM rust_crate_binding_blockers b JOIN rust_crate_binding_owners o ON o.owner_id=b.owner_id JOIN rust_crate_topologies t ON t.topology_id=o.topology_id LEFT JOIN rust_crate_container_sources es ON b.evidence_crate_key=t.crate_key AND b.evidence_kind<>'owner' AND es.topology_id=o.topology_id AND es.container_path=b.evidence_module_path AND es.rel_path=b.evidence_rel_path WHERE o.topology_id=?1".to_owned(),
+             "SELECT json_array(o.module_path,o.kind,COALESCE(m.rel_path,''),m.blob_id,o.native_scope,b.namespace,b.name,b.reason,b.boundary,hex(b.evidence_unit_key),b.evidence_module_path,b.evidence_kind,json(CASE b.evidence_form WHEN 'foreign' THEN json_array('foreign',hex(b.evidence_unit_key),b.evidence_module_path) WHEN 'owner' THEN json_array('owner',(SELECT eo.module_path FROM rust_resolution_unit_summary_binding_owners eo WHERE eo.summary_id=b.summary_id AND eo.owner_handle=b.evidence_owner_handle)) WHEN 'unplaced' THEN json_array('unplaced') ELSE json_array('local',em.rel_path,em.blob_id,COALESCE(b.evidence_declaration_id,b.evidence_invocation_occurrence_id,b.evidence_import_ordinal)) END)) FROM rust_resolution_unit_summary_binding_blockers b JOIN rust_resolution_unit_summary_binding_owners o ON o.summary_id=b.summary_id AND o.owner_handle=b.owner_handle LEFT JOIN resolution_unit_summary_members m ON m.summary_id=o.summary_id AND m.member_ordinal=o.member_ordinal LEFT JOIN resolution_unit_summary_members em ON em.summary_id=b.summary_id AND em.member_ordinal=b.evidence_member_ordinal WHERE b.summary_id=?1"),
+            // Inherent impls: one topology row per member role of the impl's file, because
+            // the topology coalesces the module placements of one physical impl. A subject
+            // in this unit is compared as the member's blob and path, the dense site and the
+            // member's role; one in another unit as its name form. The subject member is
+            // the one the declaring module path places.
+            ("inherent impls",
+             "SELECT json_array(i.impl_rel_path,i.impl_blob_id,src.source_kind,i.impl_site,i.impl_declaration_id,json(CASE WHEN i.subject_unit_key=t.crate_key THEN json_array('local',i.subject_rel_path,i.subject_declaration_blob_id,i.subject_declaration_site,(SELECT min(s.source_kind) FROM rust_crate_container_sources s WHERE s.topology_id=i.topology_id AND s.container_path=i.subject_module_path AND s.blob_id=i.subject_declaration_blob_id AND s.rel_path=i.subject_rel_path)) ELSE json_array('foreign',hex(i.subject_unit_key),i.subject_module_path,i.subject_kind,i.subject_namespace,i.subject_name,i.subject_origin) END)) FROM rust_crate_inherent_impls i JOIN rust_crate_topologies t ON t.topology_id=i.topology_id JOIN (SELECT DISTINCT blob_id,rel_path,source_kind FROM rust_crate_container_sources WHERE topology_id=?1) src ON src.blob_id=i.impl_blob_id AND src.rel_path=i.impl_rel_path WHERE i.topology_id=?1".to_owned(),
+             "SELECT json_array(im.rel_path,im.blob_id,im.source_role,h.impl_site,h.impl_declaration_id,json(CASE h.subject_form WHEN 'local_site' THEN json_array('local',sm.rel_path,sm.blob_id,h.subject_site,sm.source_role) ELSE json_array('foreign',hex(h.subject_unit_key),h.subject_module_path,h.subject_kind,h.subject_namespace,h.subject_name,h.subject_origin) END)) FROM rust_resolution_unit_summary_inherent_impls h JOIN resolution_unit_summary_members im ON im.summary_id=h.summary_id AND im.member_ordinal=h.impl_member_ordinal LEFT JOIN resolution_unit_summary_members sm ON sm.summary_id=h.summary_id AND sm.member_ordinal=h.subject_member_ordinal WHERE h.summary_id=?1"),
+            ("unresolved inherent impls",
+             "SELECT json_array(u.spelling,u.impl_rel_path,u.impl_blob_id,src.source_kind,u.impl_site,u.impl_declaration_id,u.reason,u.target_module_path) FROM rust_crate_unresolved_inherent_impls u JOIN (SELECT DISTINCT blob_id,rel_path,source_kind FROM rust_crate_container_sources WHERE topology_id=?1) src ON src.blob_id=u.impl_blob_id AND src.rel_path=u.impl_rel_path WHERE u.topology_id=?1".to_owned(),
+             "SELECT json_array(u.spelling,im.rel_path,im.blob_id,im.source_role,u.impl_site,u.impl_declaration_id,u.reason,u.target_module_path) FROM rust_resolution_unit_summary_unresolved_inherent_impls u JOIN resolution_unit_summary_members im ON im.summary_id=u.summary_id AND im.member_ordinal=u.impl_member_ordinal WHERE u.summary_id=?1"),
+            // Impl children and Copy absence read these in place of the topology rows
+            // (#11173 M3 family 3). Trait impls are compared as the impl member, its
+            // role, site and declaration: the pair of resolved endpoints must exist
+            // for exactly the impls the topology resolved on both ends. An impl the
+            // summary leaves unresolved on one end (the target had no live summary when
+            // the unit was derived) is a difference to report, not to bless.
+            ("trait impl endpoints",
+             "SELECT DISTINCT json_array(t.impl_rel_path,t.impl_blob_id,src.source_kind,t.impl_site,t.impl_declaration_id) FROM rust_crate_trait_impls t JOIN (SELECT DISTINCT blob_id,rel_path,source_kind FROM rust_crate_container_sources WHERE topology_id=?1) src ON src.blob_id=t.impl_blob_id AND src.rel_path=t.impl_rel_path WHERE t.topology_id=?1".to_owned(),
+             "SELECT DISTINCT json_array(m.rel_path,m.blob_id,m.source_role,s.impl_site,s.impl_declaration_id) FROM rust_resolution_unit_summary_trait_endpoints s JOIN rust_resolution_unit_summary_trait_endpoints r ON r.summary_id=s.summary_id AND r.member_ordinal=s.member_ordinal AND r.owner_module_path=s.owner_module_path AND r.source_relation_key=s.source_relation_key AND r.endpoint_role='trait' AND r.endpoint_state='resolved' JOIN resolution_unit_summary_members m ON m.summary_id=s.summary_id AND m.member_ordinal=s.member_ordinal WHERE s.summary_id=?1 AND s.endpoint_role='subject' AND s.endpoint_state='resolved'"),
+            // Copy absence counts inherent impls per impl member, no longer per blob.
+            ("inherent impl counts per member",
+             "SELECT json_array(i.impl_rel_path,src.source_kind,i.impl_declaration_id,count(*)) FROM rust_crate_inherent_impls i JOIN (SELECT DISTINCT blob_id,rel_path,source_kind FROM rust_crate_container_sources WHERE topology_id=?1) src ON src.blob_id=i.impl_blob_id AND src.rel_path=i.impl_rel_path WHERE i.topology_id=?1 GROUP BY i.impl_rel_path,src.source_kind,i.impl_declaration_id".to_owned(),
+             "SELECT json_array(m.rel_path,m.source_role,h.impl_declaration_id,count(*)) FROM rust_resolution_unit_summary_inherent_impls h JOIN resolution_unit_summary_members m ON m.summary_id=h.summary_id AND m.member_ordinal=h.impl_member_ordinal WHERE h.summary_id=?1 GROUP BY m.member_ordinal,h.impl_declaration_id"),
+            // A foreign inherent subject is a name form; it must name exactly the
+            // declaration the topology row names, through exactly one export.
+            ("foreign inherent subjects",
+             "SELECT json_array(i.subject_declaration_blob_id,i.subject_declaration_site,i.subject_rel_path,i.impl_rel_path,i.impl_declaration_id) FROM rust_crate_inherent_impls i JOIN rust_crate_topologies t ON t.topology_id=i.topology_id WHERE i.topology_id=?1 AND i.subject_unit_key<>t.crate_key".to_owned(),
+             "SELECT json_array(tm.blob_id,te.declaration_site,tm.rel_path,im.rel_path,h.impl_declaration_id) FROM rust_resolution_unit_summary_inherent_impls h JOIN resolution_unit_summary_members im ON im.summary_id=h.summary_id AND im.member_ordinal=h.impl_member_ordinal JOIN resolution_unit_summary_versions tv ON tv.unit_key=h.subject_unit_key AND tv.valid_until IS NULL AND tv.lang='rust' JOIN rust_resolution_unit_summary_exports te ON te.summary_id=tv.summary_id AND te.module_path=h.subject_module_path AND te.namespace=h.subject_namespace AND te.name=h.subject_name AND te.origin='declaration' JOIN resolution_unit_summary_members tm ON tm.summary_id=te.summary_id AND tm.member_ordinal=te.declaration_member_ordinal WHERE h.summary_id=?1 AND h.subject_form='foreign' AND (SELECT count(*) FROM rust_resolution_unit_summary_exports x WHERE x.summary_id=tv.summary_id AND x.module_path=h.subject_module_path AND x.namespace=h.subject_namespace AND x.name=h.subject_name AND x.origin='declaration')=1"),
+            // Copy absence and inventory readiness read the topology header's flags through
+            // the summary's topology id; the summary copies must agree with them.
+            ("publication flags",
+             "SELECT json_array(inventory_complete,publication_state) FROM rust_crate_topologies WHERE topology_id=?1".to_owned(),
+             "SELECT json_array(c.inventory_complete,s.publication_state) FROM rust_resolution_unit_summary_contexts c JOIN resolution_unit_summaries s ON s.summary_id=c.summary_id WHERE c.summary_id=?1"),
+        ] {
+            let read = |sql: &str, id| {
+                let mut rows = conn.prepare_cached(sql).expect("prepare representation differential")
+                    .query_map([id], |row| row.get::<_,String>(0)).expect("read representation differential")
+                    .collect::<rusqlite::Result<Vec<_>>>().expect("collect representation differential");
+                rows.sort();
+                rows
+            };
+            assert_eq!(read(&expected,topology_id),read(actual,summary_id),"{crate_name} {family}");
         }
 
         // #11173: crate-name readers consume these copied context fields.
@@ -1475,11 +1563,19 @@ impl UnitSummaryLanguage for RustUnitSummaries {
         "rust_crate"
     }
 
-    fn derivation_version(&self) -> i64 {
-        RUST_UNIT_SUMMARY_DERIVATION_VERSION
+    fn derivation_identity(&self) -> [u8; 32] {
+        rust_unit_summary_derivation_identity()
     }
 
     fn stage(&self, conn: &Connection, snapshot: &WorkspaceSnapshotId) -> Result<()> {
+        let feature_input_digest =
+            super::rust_feature_projections::current_input_digest(conn, snapshot)?.ok_or_else(
+                || StoreError::new("Rust feature discovery is not current for the selected inputs"),
+            )?;
+        conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS rust_unit_feature_selection(input_digest BLOB PRIMARY KEY) WITHOUT ROWID;
+            DELETE FROM temp.rust_unit_feature_selection;")?;
+        conn.prepare_cached("INSERT INTO temp.rust_unit_feature_selection VALUES(?1)")?
+            .execute([feature_input_digest.as_slice()])?;
         conn.execute_batch(STAGE_SCHEMA_SQL)?;
         conn.prepare_cached(STAGE_UNITS_SQL)?.execute(params![
             snapshot.workspace_id.as_str(),
@@ -1497,6 +1593,7 @@ impl UnitSummaryLanguage for RustUnitSummaries {
     }
 
     fn clear_stage(&self, conn: &Connection) -> Result<()> {
+        conn.execute_batch("DELETE FROM temp.rust_unit_feature_selection")?;
         conn.prepare_cached("DELETE FROM temp.rust_unit_summary_units")?
             .execute([])?;
         Ok(())
@@ -1527,12 +1624,68 @@ impl UnitSummaryLanguage for RustUnitSummaries {
             }
         }
 
+        let mut input_files: Vec<UnitInputFile> = Vec::new();
+        {
+            let mut statement = conn.prepare_cached(INACTIVE_INPUT_FILES_SQL)?;
+            let mut rows = statement.query(params![
+                topology_id,
+                snapshot.workspace_id.as_str(),
+                snapshot.generation.get(),
+                snapshot.revision
+            ])?;
+            while let Some(row) = rows.next()? {
+                let rel_path: String = row.get(0)?;
+                let blob_id: Option<i64> = row.get(1)?;
+                let oid: String = row.get(2)?;
+                assert!(
+                    input_files
+                        .last()
+                        .is_none_or(|last| last.rel_path != rel_path),
+                    "{label}: inactive file {rel_path} has more than one blob"
+                );
+                let value = match blob_id {
+                    Some(blob_id) => {
+                        match member_input_for_derivation(conn, "rust", blob_id, &oid)? {
+                            MemberInput::Surface(fingerprint) => {
+                                InputFileValue::Fingerprint(fingerprint)
+                            }
+                            MemberInput::NoFactsOid(oid) => InputFileValue::NoFactsOid(oid),
+                        }
+                    }
+                    None => InputFileValue::NoFactsOid(oid),
+                };
+                input_files.push(UnitInputFile {
+                    role: UnitSummaryInputRole::InactiveSource,
+                    rel_path,
+                    value,
+                });
+            }
+        }
+
         let producer_epoch: String = conn
             .prepare_cached(
                 "SELECT producer_epoch FROM resolution_producer_epochs WHERE lang = 'rust'",
             )?
             .query_row([], |row| row.get(0))?;
-        let mut reads = read_rows(conn, snapshot, &producer_epoch)?;
+        let mut reads = read_rows(&producer_epoch);
+        let (feature_digest, manifest, directory): (Vec<u8>, String, String) = conn
+            .prepare_cached("SELECT projection_digest,manifest_path,configuration_directory
+                FROM rust_feature_projections WHERE workspace_id=?1 AND generation=?2 AND unit_key=?3
+                AND input_digest=(SELECT input_digest FROM temp.rust_unit_feature_selection)")?
+            .query_row(params![snapshot.workspace_id.as_str(), snapshot.generation.get(), unit_key.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        reads.push(UnitRead {
+            kind: "configuration",
+            key_digest: read_key(
+                "rust-feature-projection",
+                Some(&brokk_bifrost_core::analyzer::canonical_hash::lower_hex_string(&unit_key)),
+            ),
+            digest: digest_from_row(feature_digest)?,
+        });
+        declare_configuration_inputs(conn, snapshot, &manifest, &directory, &mut input_files)?;
+        input_files.sort_by(|left, right| {
+            (left.role.as_str(), &left.rel_path).cmp(&(right.role.as_str(), &right.rel_path))
+        });
         // The summary consumes the crate topology, so its digest is a read.
         // It covers the crate derivation version, which changes derived
         // exports and gaps without changing any source or placement, and the
@@ -1574,7 +1727,6 @@ impl UnitSummaryLanguage for RustUnitSummaries {
                             &extern_name,
                             &dependency_kind,
                             &producer_epoch,
-                            &reads,
                         );
                         (key, None, "external", Some(provenance), Some(digest))
                     }
@@ -1624,7 +1776,7 @@ impl UnitSummaryLanguage for RustUnitSummaries {
                 container_path: path,
                 member_ordinal: member_ordinals
                     [&(row.get::<_, i64>(5)?, rel_path.as_str(), role.as_str())],
-                scope_ordinal: row.get(4)?,
+                scope_ordinal: row.get::<_, Option<i64>>(4)?.map(UnitCoordinate::Dense),
             });
         }
         Ok(UnitInputs {
@@ -1632,6 +1784,7 @@ impl UnitSummaryLanguage for RustUnitSummaries {
             unit_key,
             label,
             members,
+            input_files,
             reads,
             dependencies,
             dependency_names,
@@ -1643,10 +1796,11 @@ impl UnitSummaryLanguage for RustUnitSummaries {
     fn derive(
         &self,
         conn: &Connection,
-        snapshot: &WorkspaceSnapshotId,
+        _snapshot: &WorkspaceSnapshotId,
         unit: &UnitInputs,
         dependencies: &[ConsumedDependency],
         _producer_epoch: &str,
+        reader: &mut ForeignReader<'_>,
     ) -> Result<UnitOutputs> {
         let (topology_id, inventory_complete, public_surface_digest): (i64, bool, Vec<u8>) = conn
             .prepare_cached(
@@ -1683,6 +1837,7 @@ impl UnitSummaryLanguage for RustUnitSummaries {
         }
 
         let dependency_ordinals = super::unit_summaries::dependency_ordinals(dependencies);
+        let mut walk = export_walk::ExportWalk::default();
         let dependency_keys_by_extern = super::unit_summaries::dependency_keys_by_name(unit);
 
         let mut exports = Vec::new();
@@ -1720,10 +1875,11 @@ impl UnitSummaryLanguage for RustUnitSummaries {
                     if rust_origin == "declaration" {
                         ("declaration", None, None, None)
                     } else {
-                        let target = canonical_export_target(
+                        let target = walk.export_target(
                             conn,
-                            snapshot,
-                            unit,
+                            reader,
+                            unit.unit_key,
+                            topology_id,
                             &namespace,
                             (digest_from_row(row.get(7)?)?, row.get(8)?, row.get(9)?),
                             &dependency_ordinals,
@@ -1777,6 +1933,11 @@ impl UnitSummaryLanguage for RustUnitSummaries {
                     declaration_key,
                 );
                 let export = UnitExport {
+                    declaration_unit_key: if rust_origin == "declaration" {
+                        unit.unit_key
+                    } else {
+                        digest_from_row(row.get(7)?)?
+                    },
                     identity_id,
                     identity_digest,
                     namespace: namespace.clone(),
@@ -1786,8 +1947,8 @@ impl UnitSummaryLanguage for RustUnitSummaries {
                     alias_identity_id,
                     alias_identity_digest,
                     declaration_blob_id,
-                    declaration_site,
-                    declaration_key,
+                    declaration_site: UnitCoordinate::Dense(declaration_site),
+                    declaration_key: UnitCoordinate::Dense(declaration_key),
                 };
                 if let Some((previous, index)) = export_keys.get(&export_key).copied() {
                     if previous == export_signature {
@@ -1873,8 +2034,13 @@ impl UnitSummaryLanguage for RustUnitSummaries {
         unit: &UnitInputs,
         dependencies: &[ConsumedDependency],
         summary_id: i64,
+        reader: &mut ForeignReader<'_>,
     ) -> Result<usize> {
-        write_rust_summary_rows(conn, snapshot, unit, dependencies, summary_id)
+        write_rust_summary_rows(conn, snapshot, unit, dependencies, summary_id, reader)
+    }
+
+    fn output_supplement(&self, conn: &Connection, summary_id: i64) -> Result<Option<[u8; 32]>> {
+        output_supplement::digest(conn, summary_id).map(Some)
     }
 
     fn write_language_version(
@@ -1923,6 +2089,7 @@ impl UnitSummaryLanguage for RustUnitSummaries {
                     unit.label, unit.unit_id, snapshot.revision
                 ))
             })?;
+        // A real per-unit profile digest arrives when configured selections can coexist.
         conn.prepare_cached(
             "INSERT INTO rust_resolution_unit_summary_versions(
                  workspace_id, lang, generation, unit_key, valid_from, summary_id,
@@ -1952,7 +2119,9 @@ fn write_rust_summary_rows(
     unit: &UnitInputs,
     dependencies: &[ConsumedDependency],
     summary_id: i64,
+    reader: &mut ForeignReader<'_>,
 ) -> Result<usize> {
+    // Rust-only derived-from blob until #11183 M3 converts Rust child rows
     const RUST_SUMMARY_CONTAINER_ATTRIBUTES_SQL: &str = "INSERT INTO rust_resolution_unit_summary_container_attributes(summary_id, container_path, kind)
          SELECT ?1, CASE container_path WHEN 'crate' THEN '' ELSE container_path END, kind
          FROM rust_crate_containers WHERE topology_id=?2";
@@ -1969,6 +2138,15 @@ fn write_rust_summary_rows(
         .prepare_cached("SELECT topology_id FROM temp.rust_unit_summary_units WHERE unit_id = ?1")?
         .query_row([unit.unit_id], |row| row.get(0))?;
     for table in [
+        "rust_resolution_unit_summary_inactive_placements",
+        "rust_resolution_unit_summary_public_surface_gaps",
+        "rust_resolution_unit_summary_binding_blockers",
+        "rust_resolution_unit_summary_binding_alternatives",
+        "rust_resolution_unit_summary_binding_names",
+        "rust_resolution_unit_summary_binding_owners",
+        "rust_resolution_unit_summary_inherent_impls",
+        "rust_resolution_unit_summary_unresolved_inherent_impls",
+        "resolution_unit_summary_input_files",
         "rust_resolution_unit_summary_gaps",
         "rust_resolution_unit_summary_contexts",
         "rust_resolution_unit_summary_container_attributes",
@@ -1980,11 +2158,79 @@ fn write_rust_summary_rows(
             [summary_id],
         )?;
     }
+    // The declared list is the one the key hashed; its position is the ordinal.
+    let mut extra_rows = 0;
+    for (ordinal, file) in unit.input_files.iter().enumerate() {
+        extra_rows += conn
+            .prepare_cached(
+                "INSERT INTO resolution_unit_summary_input_files(summary_id,input_ordinal,rel_path,source_role) VALUES(?1,?2,?3,?4)",
+            )?
+            .execute(params![
+                summary_id,
+                ordinal as i64,
+                file.rel_path,
+                file.role.as_str()
+            ])?;
+    }
+    let input_role = super::unit_summaries::UnitSummaryInputRole::InactiveSource.as_str();
+    let digest = super::surface_relations::list_digest(super::surface_relations::RUST_RELATIONS);
+    let inactive = {
+        let mut statement = conn.prepare_cached(
+            "SELECT DISTINCT p.module_path,i.input_ordinal,p.placement,ids.surface_ordinal,p.activation,
+                    p.blob_id,p.scope_ordinal
+             FROM rust_crate_inactive_placements p
+             JOIN resolution_unit_summary_input_files i ON i.summary_id=?1 AND i.rel_path=p.rel_path AND i.source_role=?3
+             LEFT JOIN surface_sets sets ON sets.blob_id=p.blob_id AND sets.list_digest=?4
+             LEFT JOIN surface_ids ids ON ids.set_id=sets.set_id AND ids.id_space=7 AND ids.dense_id=p.scope_ordinal
+             WHERE p.topology_id=?2",
+        )?;
+        statement
+            .query_map(
+                params![summary_id, topology_id, input_role, digest],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                        row.get::<_, i64>(6)?,
+                    ))
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut placements = std::collections::BTreeSet::new();
+    for (module, input, placement, scope, activation, blob, dense_scope) in inactive {
+        assert!(
+            scope.is_some() || (blob.is_none() && dense_scope == 0),
+            "inactive scope missing surface translation: {:?}",
+            (
+                &module,
+                input,
+                &placement,
+                scope,
+                activation,
+                blob,
+                dense_scope
+            )
+        );
+        placements.insert((module, input, placement, scope, activation));
+    }
+    for (ordinal, (module, input, placement, scope, activation)) in
+        placements.into_iter().enumerate()
+    {
+        extra_rows += conn.prepare_cached(
+            "INSERT INTO rust_resolution_unit_summary_inactive_placements(summary_id,placement_ordinal,module_path,input_file_ordinal,placement,module_scope_surface_ordinal,activation) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+        )?.execute(params![summary_id,ordinal as i64,module,input,placement,scope,activation])?;
+    }
     let development_capable = rust_summary_development_capability(conn, snapshot, topology_id)?;
     // The remaining member/dependency children cascade as the shared children
     // are replaced by write_summary.
-    let mut rows_written = 0;
+    let mut rows_written = extra_rows;
     for sql in [
+        "INSERT INTO rust_resolution_unit_summary_public_surface_gaps SELECT ?1,gap_kind,subject FROM rust_crate_gaps WHERE topology_id=?2 AND subject LIKE 'public-module-surface:%'",
         RUST_SUMMARY_CONTAINER_ATTRIBUTES_SQL,
         RUST_SUMMARY_PLACEMENT_ATTRIBUTES_SQL,
         "INSERT INTO rust_resolution_unit_summary_file_naming(
@@ -2027,9 +2273,9 @@ fn write_rust_summary_rows(
         .prepare_cached(
             "INSERT INTO rust_resolution_unit_summary_contexts(
              summary_id, target_kind, crate_name, edition, prelude, cfg_atoms,
-             inventory_complete, development_capable)
+             inventory_complete, development_capable, broad_complete)
          SELECT ?1, target_kind, crate_name, edition, prelude, cfg_atoms,
-                inventory_complete, ?3
+                inventory_complete, ?3, broad_complete
          FROM rust_crate_topologies WHERE topology_id = ?2",
         )?
         .execute(params![summary_id, topology_id, development_capable])?;
@@ -2043,6 +2289,7 @@ fn write_rust_summary_rows(
     let member_ordinals = super::unit_summaries::member_ordinals(&unit.members);
 
     let dependency_ordinals = super::unit_summaries::dependency_ordinals(dependencies);
+    let mut walk = export_walk::ExportWalk::default();
     // The shared dependency rows list the unit's direct consumed dependencies.
     // A route can reach a unit they do not list: a unit reached through a
     // facade's re-export, or a sibling detached root. The route keeps the
@@ -2464,13 +2711,20 @@ fn write_rust_summary_rows(
             let target_unit_key = digest_from_row(row.get::<_, Vec<u8>>(8)?)?;
             let target_module_path: String = row.get(9)?;
             let target_name: String = row.get(10)?;
-            let target = canonical_export_target(
-                conn, snapshot, unit, &namespace,
-                (target_unit_key, target_module_path, target_name), &dependency_ordinals,
-            )?.ok_or_else(|| StoreError::corrupt(format!(
-                "{}: admitted canonical export {module_path}::{namespace}:{name} lacks a published dependency witness",
-                unit.label
-            )))?;
+            let target = walk.export_target(
+                conn,
+                reader,
+                unit.unit_key,
+                topology_id,
+                &namespace,
+                (target_unit_key, target_module_path, target_name),
+                &dependency_ordinals,
+            )?;
+            // A target the walk cannot prove is a gap in the shared exports
+            // (`unresolved_reexport`), and it has no child row either.
+            let Some(target) = target else {
+                continue;
+            };
             (
                 None,
                 None,
@@ -2538,15 +2792,17 @@ fn write_rust_summary_rows(
          WHERE decisions.topology_id = ?2",
         )?
         .execute(params![summary_id, topology_id])?;
+    rows_written += write_rust_binding_authority(conn, unit, topology_id, summary_id)?;
+    rows_written += write_rust_inherent_impls(conn, unit, topology_id, summary_id)?;
     rows_written += write_rust_trait_endpoints(
         conn,
-        snapshot,
         unit,
         topology_id,
         summary_id,
         &dependency_ordinal_for,
+        reader,
     )?;
-    rows_written += write_rust_effective_bindings(conn, snapshot, unit, topology_id, summary_id)?;
+    rows_written += write_rust_effective_bindings(conn, unit, topology_id, summary_id, reader)?;
 
     Ok(rows_written)
 }
@@ -2568,13 +2824,16 @@ struct RustClosureBindingKey {
     name: String,
     namespace: String,
     origin_unit_key: [u8; 32],
+    /// `None` exactly for a `module` binding, which names a module item and has no identity.
     origin_identity_id: Option<i64>,
-    origin_declaration_key: Option<i64>,
     origin_module_path: String,
     origin_name: String,
     domain: RustClosureDomain,
 }
 
+/// A binding of this unit, or one read from another unit's rows. A binding read from another
+/// unit carries no coordinate of that unit: `member_ordinal`, `binder_scope` and `route_ordinal`
+/// are -1 and `first_import` is `None`, because the consumer assigns its own.
 #[derive(Debug, Clone)]
 struct RustClosureBinding {
     owner_unit_key: [u8; 32],
@@ -2591,8 +2850,6 @@ struct RustClosureBindingRef {
     name: String,
     namespace: String,
     identity_id: Option<i64>,
-    declaration_key: Option<i64>,
-    route_ordinal: i64,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
@@ -2695,8 +2952,6 @@ fn rust_closure_binding_reference(binding: &RustClosureBinding) -> RustClosureBi
         name: binding.key.name.clone(),
         namespace: binding.key.namespace.clone(),
         identity_id: binding.key.origin_identity_id,
-        declaration_key: binding.key.origin_declaration_key,
-        route_ordinal: binding.route_ordinal,
     }
 }
 
@@ -2769,6 +3024,29 @@ fn rust_closure_insert_binding(
     (route_ordinal, true)
 }
 
+/// The effective bindings of another unit at one module, which a closure consumer reads. Only
+/// name-level columns are selected, and every one of them is in the unit's output supplement
+/// (`output_supplement::HASHED_COLUMNS`): the dense columns of the row (member, binder scope,
+/// import and route ordinals) are not read, so an edit that only moves them cannot change what a
+/// consumer derives. The order is by name too: the consumer numbers its own bindings in this order.
+pub(crate) const CLOSURE_BINDINGS_IN_MODULE_SQL: &str =
+    "SELECT DISTINCT module_path, name, namespace,
+        visibility_kind, visibility_crate_root, visibility_module_path,
+        target_unit_key, target_identity_id, target_module_path, target_name
+ FROM rust_resolution_unit_summary_effective_bindings
+ WHERE summary_id = ?1 AND module_path = ?2
+ ORDER BY name, namespace, target_unit_key, target_module_path, target_name,
+          visibility_kind, visibility_crate_root, visibility_module_path";
+
+/// [`CLOSURE_BINDINGS_IN_MODULE_SQL`] for one name.
+pub(crate) const CLOSURE_BINDINGS_NAMED_SQL: &str = "SELECT DISTINCT module_path, name, namespace,
+        visibility_kind, visibility_crate_root, visibility_module_path,
+        target_unit_key, target_identity_id, target_module_path, target_name
+ FROM rust_resolution_unit_summary_effective_bindings
+ WHERE summary_id = ?1 AND module_path = ?2 AND name = ?3
+ ORDER BY name, namespace, target_unit_key, target_module_path, target_name,
+          visibility_kind, visibility_crate_root, visibility_module_path";
+
 fn read_live_rust_closure_bindings(
     conn: &Connection,
     summary_id: i64,
@@ -2776,26 +3054,11 @@ fn read_live_rust_closure_bindings(
     module_path: &str,
     name: Option<&str>,
 ) -> Result<Vec<RustClosureBinding>> {
-    let sql = if name.is_some() {
-        "SELECT member_ordinal, module_path, binder_scope, name, namespace,
-                visibility_kind, visibility_crate_root, visibility_module_path,
-                target_unit_key, target_identity_id, target_declaration_key,
-                target_module_path, target_name, route_provenance_ordinal,
-                source_import_id, source_import_ordinal
-         FROM rust_resolution_unit_summary_effective_bindings
-         WHERE summary_id = ?1 AND module_path = ?2 AND name = ?3
-         ORDER BY name, namespace, route_provenance_ordinal"
+    let mut statement = conn.prepare_cached(if name.is_some() {
+        CLOSURE_BINDINGS_NAMED_SQL
     } else {
-        "SELECT member_ordinal, module_path, binder_scope, name, namespace,
-                visibility_kind, visibility_crate_root, visibility_module_path,
-                target_unit_key, target_identity_id, target_declaration_key,
-                target_module_path, target_name, route_provenance_ordinal,
-                source_import_id, source_import_ordinal
-         FROM rust_resolution_unit_summary_effective_bindings
-         WHERE summary_id = ?1 AND module_path = ?2
-         ORDER BY name, namespace, route_provenance_ordinal"
-    };
-    let mut statement = conn.prepare_cached(sql)?;
+        CLOSURE_BINDINGS_IN_MODULE_SQL
+    })?;
     let mut rows = if let Some(name) = name {
         statement.query(params![summary_id, module_path, name])?
     } else {
@@ -2803,27 +3066,25 @@ fn read_live_rust_closure_bindings(
     };
     let mut bindings = Vec::new();
     while let Some(row) = rows.next()? {
-        let namespace: String = row.get(4)?;
+        let namespace: String = row.get(2)?;
         let domain =
-            rust_closure_domain_from_columns(&row.get::<_, String>(5)?, row.get(6)?, row.get(7)?)?;
-        let origin_unit_key = digest_from_row(row.get(8)?)?;
-        let target_identity_id: Option<i64> = row.get(9)?;
-        let target_declaration_key: Option<i64> = row.get(10)?;
-        assert_ne!(
-            target_identity_id.is_some(),
-            target_declaration_key.is_some(),
-            "one Rust closure binding has exactly one stable declaration key"
+            rust_closure_domain_from_columns(&row.get::<_, String>(3)?, row.get(4)?, row.get(5)?)?;
+        let origin_unit_key = digest_from_row(row.get(6)?)?;
+        let target_identity_id: Option<i64> = row.get(7)?;
+        assert_eq!(
+            namespace == "module",
+            target_identity_id.is_none(),
+            "a Rust closure binding has an identity exactly when it is not a module binding"
         );
         let key = RustClosureBindingKey {
-            member_ordinal: row.get(0)?,
-            module_path: row.get(1)?,
-            name: row.get(3)?,
+            member_ordinal: -1,
+            module_path: row.get(0)?,
+            name: row.get(1)?,
             namespace,
             origin_unit_key,
             origin_identity_id: target_identity_id,
-            origin_declaration_key: target_declaration_key,
-            origin_module_path: row.get(11)?,
-            origin_name: row.get(12)?,
+            origin_module_path: row.get(8)?,
+            origin_name: row.get(9)?,
             domain: match domain {
                 RustBindingDomain::Public => RustClosureDomain::Public,
                 RustBindingDomain::Crate(crate_root) => RustClosureDomain::Crate(crate_root),
@@ -2836,69 +3097,23 @@ fn read_live_rust_closure_bindings(
                 },
             },
         };
-        let source_import_id: Option<i64> = row.get(14)?;
-        let source_import_ordinal: Option<i64> = row.get(15)?;
-        assert_eq!(
-            source_import_id.is_some(),
-            source_import_ordinal.is_some(),
-            "one Rust closure binding has both or neither source import coordinates"
-        );
         bindings.push(RustClosureBinding {
             owner_unit_key: unit_key,
             key,
-            binder_scope: row.get(2)?,
-            route_ordinal: row.get(13)?,
-            first_import: source_import_id.zip(source_import_ordinal),
+            binder_scope: -1,
+            route_ordinal: -1,
+            first_import: None,
         });
     }
     Ok(bindings)
 }
 
-fn rust_closure_live_summary_id(
-    conn: &Connection,
-    snapshot: &WorkspaceSnapshotId,
-    unit_key: [u8; 32],
-) -> Result<Option<i64>> {
-    Ok(conn
-        .prepare_cached(
-            "SELECT versions.summary_id
-             FROM resolution_unit_summary_versions AS versions
-             JOIN resolution_unit_summaries AS summaries
-               ON summaries.summary_id = versions.summary_id
-             JOIN rust_resolution_unit_summary_versions AS rust_versions
-               ON rust_versions.workspace_id = versions.workspace_id
-              AND rust_versions.lang = versions.lang
-              AND rust_versions.generation = versions.generation
-              AND rust_versions.unit_key = versions.unit_key
-              AND rust_versions.valid_from = versions.valid_from
-              AND rust_versions.summary_id = versions.summary_id
-             WHERE versions.workspace_id = ?1 AND versions.lang = 'rust'
-               AND versions.generation = ?2 AND versions.unit_key = ?3
-               AND versions.valid_from <= ?4
-               AND (versions.valid_until IS NULL OR ?4 < versions.valid_until)
-               AND summaries.lang = 'rust' AND summaries.unit_kind = 'rust_crate'
-               AND summaries.derivation_version = ?5
-               AND summaries.publication_state = 'complete'",
-        )?
-        .query_row(
-            params![
-                snapshot.workspace_id.as_str(),
-                snapshot.generation.get(),
-                unit_key.as_slice(),
-                snapshot.revision,
-                RUST_UNIT_SUMMARY_DERIVATION_VERSION
-            ],
-            |row| row.get(0),
-        )
-        .optional()?)
-}
-
 fn write_rust_effective_bindings(
     conn: &Connection,
-    snapshot: &WorkspaceSnapshotId,
     unit: &UnitInputs,
     topology_id: i64,
     summary_id: i64,
+    reader: &mut ForeignReader<'_>,
 ) -> Result<usize> {
     let mut rows_written = 0;
     for table in [
@@ -3033,7 +3248,6 @@ fn write_rust_effective_bindings(
                 namespace: namespace.clone(),
                 origin_unit_key: unit.unit_key,
                 origin_identity_id: Some(identity_id),
-                origin_declaration_key: None,
                 origin_module_path: module_path,
                 origin_name: name,
                 domain: match domain {
@@ -3062,8 +3276,7 @@ fn write_rust_effective_bindings(
     {
         let mut statement = conn.prepare_cached(
             "SELECT child.module_path, placement.parent_module_path,
-                    parent.member_ordinal, declaration.declaration_id,
-                    declaration.module_name, property.visibility
+                    parent.member_ordinal, declaration.module_name, property.visibility
              FROM rust_unit_summary_containers AS child
              JOIN rust_unit_summary_placements AS placement
                ON placement.summary_id = child.summary_id
@@ -3090,9 +3303,8 @@ fn write_rust_effective_bindings(
             let child_module_path: String = row.get(0)?;
             let parent_module_path: String = row.get(1)?;
             let member_ordinal: i64 = row.get(2)?;
-            let declaration_key: i64 = row.get(3)?;
-            let name: String = row.get(4)?;
-            let visibility: String = row.get(5)?;
+            let name: String = row.get(3)?;
+            let visibility: String = row.get(4)?;
             let identity = member_identity.get(&member_ordinal).ok_or_else(|| {
                 StoreError::corrupt(format!(
                     "Rust module declaration has no member path identity: member={member_ordinal}, module={child_module_path:?}"
@@ -3138,7 +3350,6 @@ fn write_rust_effective_bindings(
                 namespace: "module".to_owned(),
                 origin_unit_key: unit.unit_key,
                 origin_identity_id: None,
-                origin_declaration_key: Some(declaration_key),
                 origin_module_path: parent_module_path,
                 origin_name: name,
                 domain,
@@ -3154,15 +3365,11 @@ fn write_rust_effective_bindings(
         }
     }
 
-    let mut child_summary_ids: HashMap<[u8; 32], Option<i64>> = HashMap::default();
-    let mut summary_for_target = |key| -> Result<Option<i64>> {
-        if let Some(summary) = child_summary_ids.get(&key) {
-            return Ok(*summary);
-        }
-        let summary = rust_closure_live_summary_id(conn, snapshot, key)?;
-        child_summary_ids.insert(key, summary);
-        Ok(summary)
-    };
+    // The closure reads another unit's effective bindings only through the
+    // reader: that unit must have settled in this pass, and the read is recorded
+    // whether it finds bindings or none.
+    let mut summary_for_target =
+        |key| -> Result<Option<i64>> { reader.consume(key, ReadKind::ClosureBindings) };
 
     let mut imports = Vec::new();
     {
@@ -3371,7 +3578,6 @@ fn write_rust_effective_bindings(
                     namespace: candidate.key.namespace.clone(),
                     origin_unit_key: candidate.key.origin_unit_key,
                     origin_identity_id: candidate.key.origin_identity_id,
-                    origin_declaration_key: candidate.key.origin_declaration_key,
                     origin_module_path: candidate.key.origin_module_path.clone(),
                     origin_name: candidate.key.origin_name.clone(),
                     domain,
@@ -3494,10 +3700,10 @@ fn write_rust_effective_bindings(
         "INSERT INTO rust_resolution_unit_summary_effective_bindings(
              summary_id, member_ordinal, module_path, binder_scope, name, namespace,
              visibility_kind, visibility_crate_root, visibility_module_path,
-             target_unit_key, target_identity_id, target_declaration_key,
+             target_unit_key, target_identity_id,
              target_module_path, target_name, route_provenance_ordinal,
              source_import_id, source_import_ordinal)
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
     )?;
     for binding in bindings.values() {
         let (visibility_kind, visibility_crate_root, visibility_module_path) =
@@ -3528,7 +3734,6 @@ fn write_rust_effective_bindings(
             visibility_module_path,
             binding.key.origin_unit_key.as_slice(),
             binding.key.origin_identity_id,
-            binding.key.origin_declaration_key,
             binding.key.origin_module_path,
             binding.key.origin_name,
             binding.route_ordinal,
@@ -3542,9 +3747,8 @@ fn write_rust_effective_bindings(
              summary_id, member_ordinal, import_id, import_ordinal,
              route_provenance_ordinal, hop_ordinal, target_unit_key,
              target_binding_module_path, target_binding_name, namespace,
-             target_identity_id, target_declaration_key,
-             target_route_provenance_ordinal)
-         VALUES(?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+             target_identity_id)
+         VALUES(?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8, ?9, ?10)",
     )?;
     for route in provenance {
         insert_provenance.execute(params![
@@ -3557,9 +3761,7 @@ fn write_rust_effective_bindings(
             route.target.module_path,
             route.target.name,
             route.target.namespace,
-            route.target.identity_id,
-            route.target.declaration_key,
-            route.target.route_ordinal
+            route.target.identity_id
         ])?;
         rows_written += 1;
     }
@@ -3651,29 +3853,362 @@ fn rust_summary_development_capability(
     Ok(development_capable)
 }
 
-fn write_rust_trait_endpoints(
+/// Copies the published binding-authority rows of one topology into the summary.
+///
+/// Own references are the member plus the blob's dense ids, found through the
+/// placement source (module path, rel_path) and never through the path alone.
+/// A reference into another unit is the name form without a rank: it names every
+/// declaration of that name in that module, so a reader must treat a match of
+/// more than one declaration (cfg alternatives, macro textual scope) as
+/// ambiguous. Local versus foreign is decided by unit-key equality only. Handles
+/// are summary-local integers assigned in canonical order of the mapped columns,
+/// never copied from topology row ids.
+fn write_rust_binding_authority(
     conn: &Connection,
-    snapshot: &WorkspaceSnapshotId,
     unit: &UnitInputs,
     topology_id: i64,
     summary_id: i64,
-    dependency_ordinal_for: &impl Fn([u8; 32]) -> Option<usize>,
 ) -> Result<usize> {
-    const RESOLVED_ENDPOINTS_SQL: &str = "WITH impl_endpoints AS (
+    // A row whose own reference has no member is a construction failure, never a
+    // dropped row: report every offender.
+    let reject = |what: &str, offenders: Vec<String>| -> Result<()> {
+        if offenders.is_empty() {
+            Ok(())
+        } else {
+            Err(StoreError::corrupt(format!(
+                "{}: Rust binding authority {what}: {offenders:?}",
+                unit.label
+            )))
+        }
+    };
+    let offenders = |sql: &str, parameters: &[&dyn rusqlite::ToSql]| -> Result<Vec<String>> {
+        Ok(conn
+            .prepare_cached(sql)?
+            .query_map(parameters, |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    };
+
+    conn.prepare_cached("DELETE FROM temp.rust_unit_summary_owner_handles")?
+        .execute([])?;
+    let mut written = conn
+        .prepare_cached(
+            "INSERT INTO temp.rust_unit_summary_owner_handles(owner_id, owner_handle, member_ordinal)
+             SELECT owners.owner_id,
+                    row_number() OVER (ORDER BY owners.module_path, owners.kind,
+                                       members.member_ordinal, owners.native_scope) - 1,
+                    members.member_ordinal
+             FROM main.rust_crate_binding_owners AS owners
+             LEFT JOIN main.rust_crate_container_sources AS sources
+               ON owners.kind = 'local' AND sources.topology_id = owners.topology_id
+              AND sources.container_path = owners.module_path
+              AND sources.blob_id = owners.blob_id AND sources.rel_path = owners.rel_path
+             LEFT JOIN main.resolution_unit_summary_members AS members
+               ON members.summary_id = ?1 AND members.blob_id = sources.blob_id
+              AND members.rel_path = sources.rel_path AND members.source_role = sources.source_kind
+             WHERE owners.topology_id = ?2",
+        )?
+        .execute(params![summary_id, topology_id])?;
+    reject(
+        "owner has no placed member",
+        offenders(
+            "SELECT json_array(owners.module_path, owners.rel_path, owners.native_scope)
+             FROM main.rust_crate_binding_owners AS owners
+             JOIN temp.rust_unit_summary_owner_handles AS handles USING(owner_id)
+             WHERE owners.topology_id = ?1 AND owners.kind = 'local'
+               AND handles.member_ordinal IS NULL",
+            &[&topology_id],
+        )?,
+    )?;
+    written += conn
+        .prepare_cached(
+            "INSERT INTO main.rust_resolution_unit_summary_binding_owners(
+                 summary_id, owner_handle, module_path, kind, member_ordinal, native_scope,
+                 parent_owner_handle, closed)
+             SELECT ?1, handles.owner_handle, owners.module_path, owners.kind,
+                    handles.member_ordinal, owners.native_scope, parents.owner_handle,
+                    owners.closed
+             FROM main.rust_crate_binding_owners AS owners
+             JOIN temp.rust_unit_summary_owner_handles AS handles USING(owner_id)
+             LEFT JOIN temp.rust_unit_summary_owner_handles AS parents
+               ON parents.owner_id = owners.parent_owner_id
+             WHERE owners.topology_id = ?2",
+        )?
+        .execute(params![summary_id, topology_id])?;
+    written += conn
+        .prepare_cached(
+            &format!("INSERT INTO main.rust_resolution_unit_summary_binding_names(
+                 summary_id, owner_handle, namespace, name, complete) {BINDING_AUTHORITY_NAMES_SQL}"),
+        )?
+        .execute([summary_id])?;
+
+    // The member that declares an alternative's target is found through its module
+    // placement and its blob, never through the blob alone: byte-identical files
+    // share a blob yet are distinct members placed in distinct modules. A
+    // declaration names its own module; a re-exported one is followed through the
+    // topology export of its first hop, whose canonical target is the declaring
+    // module. A re-homed `#[macro_export]` macro names a module that does not place
+    // its declaring file, so that file is found by blob. Construction requires
+    // exactly one declaring module. Byte-identical files included at two paths of
+    // that one module declare once, and the lowest rel_path names them.
+    //
+    // A re-homed `#[macro_export]` macro is declared in the crate root whichever
+    // file writes it, and its topology row records only the crate root, a blob
+    // and a site. Byte-identical files carrying it are therefore twins in ONE
+    // module (the crate root), even when the files are placed in different
+    // modules: same bytes, same site, same declaration, so the lowest rel_path
+    // names them and the choice changes only provenance. Rust rejects the
+    // duplicate (E0428), but an invalid crate is still analyzed, not refused.
+    let alternatives_sql = binding_authority_alternatives_sql();
+    reject(
+        "alternative has no placed own member or has a lexical provider in another unit",
+        offenders(&format!(
+            "SELECT json_array(owner_handle, namespace, name, target_form, provider_form, target_member_matches)
+             FROM ({alternatives_sql})
+             WHERE (target_form IN ('local_site', 'local_generated') AND target_member_matches IS NOT 1)
+                OR provider_form = 'foreign'
+                OR (provider_form = 'local' AND (provider_member_ordinal IS NULL OR provider_native_scope IS NULL))"
+        ), &[&summary_id, &topology_id])?,
+    )?;
+    written += conn
+        .prepare_cached(&format!(
+            "INSERT INTO main.rust_resolution_unit_summary_binding_alternatives(
+                 summary_id, alternative_handle, owner_handle, namespace, name,
+                 target_unit_key, target_module_path, target_name,
+                 target_container_path, origin, target_form, target_member_ordinal,
+                 target_site, target_declaration_id, target_kind, target_namespace, target_origin, visibility,
+                 restricted_module_path, provider_form, provider_member_ordinal,
+                 provider_native_scope, provider_unit_key, provider_module_path,
+                 glob_visibility, glob_restricted_module_path)
+             SELECT ?1,
+                    row_number() OVER (ORDER BY owner_handle, namespace, name, origin,
+                        target_unit_key, target_module_path, target_name,
+                        target_container_path, target_form, target_member_ordinal, target_site,
+                        target_declaration_id, target_kind, visibility, restricted_module_path,
+                        provider_form, provider_unit_key, provider_module_path,
+                        provider_member_ordinal, provider_native_scope, glob_visibility,
+                        glob_restricted_module_path) - 1,
+                    owner_handle, namespace, name, target_unit_key,
+                    target_module_path, target_name, target_container_path, origin,
+                    target_form, target_member_ordinal, target_site, target_declaration_id,
+                    target_kind, target_namespace, target_origin, visibility, restricted_module_path, provider_form,
+                    provider_member_ordinal, provider_native_scope,
+                    CASE WHEN provider_form <> 'none' THEN provider_unit_key END,
+                    CASE WHEN provider_form <> 'none' THEN provider_module_path END,
+                    glob_visibility, glob_restricted_module_path
+             FROM ({alternatives_sql})"
+        ))?
+        .execute(params![summary_id, topology_id])?;
+
+    // Evidence is explanatory provenance. Only evidence in this unit carries
+    // dense ids (or, for owner-wide evidence, the owner's handle); evidence from
+    // another unit is its unit key, module path and kind.
+    let blockers_sql = BINDING_AUTHORITY_BLOCKERS_SQL;
+    reject(
+        "blocker evidence in this unit has no placed member or module owner",
+        offenders(&format!(
+            "SELECT json_array(owner_handle, namespace, name, reason, evidence_kind, evidence_module_path, evidence_rel_path, evidence_key)
+             FROM ({blockers_sql})
+             WHERE (evidence_form = 'local' AND evidence_member_ordinal IS NULL)
+                OR (evidence_form = 'owner' AND evidence_owner_handle IS NULL)"
+        ), &[&summary_id, &topology_id])?,
+    )?;
+    written += conn
+        .prepare_cached(&format!(
+            "INSERT INTO main.rust_resolution_unit_summary_binding_blockers(
+                 summary_id, owner_handle, namespace, name, reason, boundary,
+                 evidence_unit_key, evidence_module_path, evidence_kind,
+                 blocker_ordinal, evidence_form, evidence_member_ordinal,
+                 evidence_declaration_id, evidence_invocation_occurrence_id,
+                 evidence_import_ordinal, evidence_owner_handle)
+             SELECT ?1, owner_handle, namespace, name, reason, boundary,
+                    evidence_unit_key, evidence_module_path, evidence_kind,
+                    row_number() OVER (PARTITION BY owner_handle, namespace, name
+                        ORDER BY reason, boundary, evidence_unit_key,
+                                 evidence_module_path, evidence_kind, evidence_form,
+                                 evidence_member_ordinal, evidence_declaration_id,
+                                 evidence_invocation_occurrence_id, evidence_import_ordinal) - 1,
+                    evidence_form, evidence_member_ordinal, evidence_declaration_id,
+                    evidence_invocation_occurrence_id, evidence_import_ordinal,
+                    evidence_owner_handle
+             FROM ({blockers_sql})"
+        ))?
+        .execute(params![summary_id, topology_id])?;
+    conn.prepare_cached("DELETE FROM temp.rust_unit_summary_owner_handles")?
+        .execute([])?;
+    Ok(written)
+}
+
+/// Copies the topology's inherent-impl rows into the unit summary. The impl is always in
+/// this unit; its member is found through the placement sources by blob and path (the
+/// topology coalesces the module placements of one physical impl, so a file that is a
+/// member in two roles yields a row for each). The subject comes from the name form the
+/// derivation recorded at the seam where it resolved the subject: a subject in this unit
+/// is a member plus the dense definition site, with the member found through the module
+/// path that declares it, and a subject in another unit is that name form. Nothing here
+/// recomputes ownership.
+///
+/// A name-form subject names every declaration of that name in that module. When more
+/// than one matches (cfg alternatives placed in one module path, macro textual scope,
+/// producer duplicates) a consumer must treat it as ambiguous and unproven, never as its
+/// first match.
+fn write_rust_inherent_impls(
+    conn: &Connection,
+    unit: &UnitInputs,
+    topology_id: i64,
+    summary_id: i64,
+) -> Result<usize> {
+    const PLACED_MEMBERS_SQL: &str = "
+        placed AS (
+          SELECT DISTINCT sources.container_path AS container_path, sources.blob_id AS blob_id,
+                 sources.rel_path AS rel_path, members.member_ordinal AS member_ordinal
+            FROM main.rust_crate_container_sources AS sources
+            JOIN main.resolution_unit_summary_members AS members
+              ON members.summary_id = ?1 AND members.blob_id = sources.blob_id
+             AND members.rel_path = sources.rel_path AND members.source_role = sources.source_kind
+           WHERE sources.topology_id = ?2),
+        impl_members AS (
+          SELECT DISTINCT blob_id, rel_path, member_ordinal FROM placed)";
+    let reject = |what: &str, sql: String, parameters: &[&dyn rusqlite::ToSql]| -> Result<()> {
+        let offenders = conn
+            .prepare_cached(&sql)?
+            .query_map(parameters, |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if offenders.is_empty() {
+            Ok(())
+        } else {
+            Err(StoreError::corrupt(format!(
+                "{}: Rust inherent impl {what}: {offenders:?}",
+                unit.label
+            )))
+        }
+    };
+
+    let subjects_sql = format!(
+        "WITH {PLACED_MEMBERS_SQL},
+        subjects AS (
+          SELECT impl_members.member_ordinal AS impl_member_ordinal, impls.impl_site AS impl_site,
+                 impls.impl_declaration_id AS impl_declaration_id,
+                 impls.impl_blob_id AS impl_blob_id, impls.impl_rel_path AS impl_rel_path,
+                 impls.subject_declaration_blob_id AS subject_blob_id,
+                 impls.subject_rel_path AS subject_rel_path,
+                 CASE WHEN impls.subject_unit_key = ?3 THEN 'local_site' ELSE 'foreign' END AS subject_form,
+                 CASE WHEN impls.subject_unit_key = ?3 THEN
+                   (SELECT count(DISTINCT member_ordinal) FROM placed
+                     WHERE container_path = impls.subject_module_path
+                       AND blob_id = impls.subject_declaration_blob_id
+                       AND rel_path = impls.subject_rel_path) END AS subject_member_matches,
+                 CASE WHEN impls.subject_unit_key = ?3 THEN
+                   (SELECT min(member_ordinal) FROM placed
+                     WHERE container_path = impls.subject_module_path
+                       AND blob_id = impls.subject_declaration_blob_id
+                       AND rel_path = impls.subject_rel_path) END AS subject_member_ordinal,
+                 CASE WHEN impls.subject_unit_key = ?3 THEN impls.subject_declaration_site END AS subject_site,
+                 CASE WHEN impls.subject_unit_key <> ?3 THEN impls.subject_unit_key END AS subject_unit_key,
+                 CASE WHEN impls.subject_unit_key <> ?3 THEN impls.subject_module_path END AS subject_module_path,
+                 CASE WHEN impls.subject_unit_key <> ?3 THEN impls.subject_kind END AS subject_kind,
+                 CASE WHEN impls.subject_unit_key <> ?3 THEN impls.subject_namespace END AS subject_namespace,
+                 CASE WHEN impls.subject_unit_key <> ?3 THEN impls.subject_name END AS subject_name,
+                 CASE WHEN impls.subject_unit_key <> ?3 THEN impls.subject_origin END AS subject_origin,
+                 impls.subject_unit_key IS NULL AS unnamed
+            FROM main.rust_crate_inherent_impls AS impls
+            LEFT JOIN impl_members
+              ON impl_members.blob_id = impls.impl_blob_id AND impl_members.rel_path = impls.impl_rel_path
+           WHERE impls.topology_id = ?2)"
+    );
+    // A row whose impl has no member, whose subject has no name form (a topology derived
+    // before the name form was recorded), or whose own subject has no placed member is a
+    // construction failure, never a dropped row: report every offender. Several members can
+    // place an own subject only when one file is a member in two roles at the subject's
+    // module path; they share the blob and site, so they locate the same declaration and the
+    // lowest member ordinal is kept. Members are ordered by path, then role, so that is the
+    // lowest role, as the differential compares it.
+    reject(
+        "has no placed impl member, no recorded subject name form or no placed subject member",
+        format!(
+            "{subjects_sql}
+             SELECT json_array(impl_rel_path, impl_site, subject_rel_path, subject_form, subject_member_matches)
+               FROM subjects
+              WHERE impl_member_ordinal IS NULL OR unnamed
+                 OR (subject_form = 'local_site' AND subject_member_matches = 0)"
+        ),
+        &[&summary_id, &topology_id, &unit.unit_key.as_slice()],
+    )?;
+    let mut written = 0;
+    written += conn
+        .prepare_cached(&format!(
+            "{subjects_sql}
+             INSERT INTO main.rust_resolution_unit_summary_inherent_impls(
+                 summary_id, impl_member_ordinal, impl_site, impl_declaration_id, subject_ordinal,
+                 subject_form, subject_member_ordinal, subject_site, subject_unit_key,
+                 subject_module_path, subject_kind, subject_namespace, subject_name,
+                 subject_origin)
+             SELECT ?1, impl_member_ordinal, impl_site, impl_declaration_id,
+                    row_number() OVER (PARTITION BY impl_member_ordinal, impl_site
+                        ORDER BY subject_form, subject_member_ordinal, subject_site,
+                                 subject_unit_key, subject_module_path, subject_kind,
+                                 subject_namespace, subject_name, subject_origin) - 1,
+                    subject_form, subject_member_ordinal, subject_site, subject_unit_key,
+                    subject_module_path, subject_kind, subject_namespace, subject_name,
+                    subject_origin
+               FROM subjects"
+        ))?
+        .execute(params![summary_id, topology_id, unit.unit_key.as_slice()])?;
+
+    let unresolved_sql = format!(
+        "WITH {PLACED_MEMBERS_SQL},
+        unresolved AS (
+          SELECT impl_members.member_ordinal AS impl_member_ordinal, impls.impl_rel_path AS impl_rel_path,
+                 impls.impl_site AS impl_site, impls.spelling AS spelling,
+                 impls.impl_declaration_id AS impl_declaration_id, impls.reason AS reason,
+                 impls.target_module_path AS target_module_path
+            FROM main.rust_crate_unresolved_inherent_impls AS impls
+            LEFT JOIN impl_members
+              ON impl_members.blob_id = impls.impl_blob_id AND impl_members.rel_path = impls.impl_rel_path
+           WHERE impls.topology_id = ?2)"
+    );
+    reject(
+        "unresolved subject has no placed impl member",
+        format!(
+            "{unresolved_sql}
+             SELECT json_array(impl_rel_path, impl_site, reason) FROM unresolved
+              WHERE impl_member_ordinal IS NULL"
+        ),
+        &[&summary_id, &topology_id],
+    )?;
+    written += conn
+        .prepare_cached(&format!(
+            "{unresolved_sql}
+             INSERT INTO main.rust_resolution_unit_summary_unresolved_inherent_impls(
+                 summary_id, spelling, impl_member_ordinal, impl_site, impl_declaration_id,
+                 reason, target_module_path)
+             SELECT ?1, spelling, impl_member_ordinal, impl_site, impl_declaration_id, reason,
+                    target_module_path
+               FROM unresolved"
+        ))?
+        .execute(params![summary_id, topology_id])?;
+    Ok(written)
+}
+
+/// The endpoints of each trait impl placed in this unit, with the declaring item the topology
+/// names for each: the declaring crate, module and name. Nothing here reads another unit's
+/// summary; [`TRAIT_ENDPOINT_NAME_SQL`] reads the declaring unit's export by that name.
+pub(crate) const RESOLVED_ENDPOINTS_SQL: &str = "WITH impl_endpoints AS (
         SELECT topology_id, impl_blob_id, impl_site, impl_rel_path, impl_declaration_id,
-               'subject' AS endpoint_role, subject_declaration_blob_id AS target_blob_id,
-               subject_declaration_site AS target_site, subject_rel_path AS target_rel_path,
-               NULL AS impl_owner_module_path
+               'subject' AS endpoint_role, subject_declaring_crate_key AS target_crate_key,
+               subject_declaring_module_path AS target_module_path,
+               subject_declaring_name AS target_name, NULL AS impl_owner_module_path
           FROM rust_crate_trait_impls WHERE topology_id = ?2
         UNION ALL
         SELECT topology_id, impl_blob_id, impl_site, impl_rel_path, impl_declaration_id,
-               'trait', trait_declaration_blob_id, trait_declaration_site, trait_rel_path, NULL
+               'trait', trait_declaring_crate_key, trait_declaring_module_path,
+               trait_declaring_name, NULL
           FROM rust_crate_trait_impls WHERE topology_id = ?2
         UNION ALL
         -- A subject can be named independently of its trait. Keep incomplete
         -- trait rows unresolved so reverse trait enumeration retains its gap.
         SELECT topology_id, impl_blob_id, impl_site, impl_rel_path, impl_declaration_id,
-               side, declaration_blob_id, declaration_site, declaration_rel_path, owner_module_path
+               side, declaring_crate_key, declaring_module_path, declaring_name,
+               owner_module_path
           FROM rust_crate_unresolved_trait_impls
          WHERE topology_id = ?2 AND side = 'subject' AND reason = 'resolved'
       ), endpoints AS (
@@ -3712,58 +4247,46 @@ fn write_rust_trait_endpoints(
                  AND child_declarations.body_start_byte <= relation.impl_start_byte
                  AND relation.impl_end_byte <= child_declarations.body_end_byte)
       )
-      SELECT endpoints.owner_module_path, endpoints.member_ordinal,
-             endpoints.source_relation_key, endpoints.endpoint_role, endpoints.impl_site,
-             endpoints.impl_declaration_id, targets.crate_key, exports.module_path,
-             names.identity_id, names.declaration_member_ordinal, endpoints.spelling
+      SELECT owner_module_path, member_ordinal, source_relation_key, endpoint_role, impl_site,
+             impl_declaration_id, target_crate_key, target_module_path, target_name, spelling
         FROM endpoints
-        JOIN rust_crate_exports AS exports INDEXED BY rust_crate_exports_declaration
-          ON exports.declaration_blob_id = endpoints.target_blob_id
-         AND exports.declaration_site = endpoints.target_site
-         AND exports.namespace = 'type' AND exports.origin = 'declaration'
-         -- A declaration is content-addressed: a byte-identical file in another
-         -- topology declares the same (blob, site). When this unit declares it
-         -- itself, that declaration is the endpoint; the other topology's row
-         -- names a different crate.
-         AND (exports.topology_id = ?2 OR NOT EXISTS(
-               SELECT 1 FROM rust_crate_exports AS own
-               WHERE own.topology_id = ?2
-                 AND own.declaration_blob_id = endpoints.target_blob_id
-                 AND own.declaration_site = endpoints.target_site
-                 AND own.namespace = 'type' AND own.origin = 'declaration'))
-        JOIN rust_crate_container_sources AS target_sources
-          ON target_sources.topology_id = exports.topology_id
-         AND target_sources.container_path = exports.module_path
-         AND target_sources.blob_id = exports.declaration_blob_id
-         AND target_sources.rel_path = endpoints.target_rel_path
-        JOIN rust_crate_topologies AS targets ON targets.topology_id = exports.topology_id
-         -- Retained topologies can export the same content-addressed declaration.
-         -- Select the target at this snapshot before naming its summary endpoint.
-         AND (targets.topology_id = ?2 OR EXISTS(
-               SELECT 1 FROM rust_crate_versions AS versions
-                    INDEXED BY rust_crate_versions_topology
-               WHERE versions.topology_id = targets.topology_id
-                 AND versions.workspace_id = ?3 AND versions.lang = 'rust'
-                 AND versions.generation = ?4 AND versions.valid_from <= ?5
-                 AND (versions.valid_until IS NULL OR ?5 < versions.valid_until)))
-        LEFT JOIN resolution_unit_summary_versions AS target_versions
-          ON target_versions.workspace_id = ?3 AND target_versions.lang = 'rust'
-         AND target_versions.generation = ?4 AND target_versions.unit_key = targets.crate_key
-         AND target_versions.valid_from <= ?5
-         AND (target_versions.valid_until IS NULL OR ?5 < target_versions.valid_until)
-        LEFT JOIN rust_resolution_unit_summary_exports AS names
-          ON names.summary_id = CASE WHEN targets.crate_key = ?6
-                                     THEN ?1 ELSE target_versions.summary_id END
-         AND names.module_path = exports.module_path AND names.namespace = exports.namespace
-         AND names.name = exports.name AND names.origin = 'declaration'
-         AND names.declaration_site = exports.declaration_site
-       ORDER BY endpoints.owner_module_path, endpoints.member_ordinal,
-                endpoints.source_relation_key, endpoints.endpoint_role,
-                names.identity_id IS NULL";
+       ORDER BY owner_module_path, member_ordinal, source_relation_key, endpoint_role";
+
+/// What a declaring unit's live summary names at the declaring item's module and name. The
+/// columns it reads are all name-level (`identity_id`, and the member ordinal that only the
+/// unit's own endpoint uses; see `output_supplement::COLUMNS`).
+pub(crate) const TRAIT_ENDPOINT_NAME_SQL: &str = "SELECT identity_id, declaration_member_ordinal
+    FROM main.rust_resolution_unit_summary_exports
+    WHERE summary_id = ?1 AND module_path = ?2 AND namespace = 'type' AND name = ?3
+      AND origin = 'declaration'
+    ORDER BY identity_id
+    LIMIT 1";
+
+fn write_rust_trait_endpoints(
+    conn: &Connection,
+    unit: &UnitInputs,
+    topology_id: i64,
+    summary_id: i64,
+    dependency_ordinal_for: &impl Fn([u8; 32]) -> Option<usize>,
+    reader: &mut ForeignReader<'_>,
+) -> Result<usize> {
+    // unresolved_spelling is the SEEK spelling: the bound target name when a route
+    // bound the endpoint, otherwise the source terminal spelling. IMPL_GAPS_SQL in
+    // rust_crate_derivation.rs persists binding.target_name as detail.bound_name.
+    // Keep the crate row's source spelling for the relation join below.
     const UNRESOLVED_ENDPOINTS_SQL: &str = "WITH impl_placements AS (
         SELECT owners.container_path AS owner_module_path, members.member_ordinal,
                relation.relation_key, unresolved.side, unresolved.impl_site,
-               unresolved.impl_declaration_id, unresolved.spelling, unresolved.reason,
+               unresolved.impl_declaration_id,
+               CASE WHEN unresolved.reason='bound_without_declaration' THEN
+                 (SELECT json_extract(evidence.value, '$.bound_name')
+                  FROM rust_crate_gaps AS gap, json_each(gap.detail, '$.evidence') AS evidence
+                  WHERE gap.topology_id=unresolved.topology_id
+                    AND gap.gap_kind='unresolved_trait_impl'
+                    AND gap.subject=unresolved.owner_module_path || '::' || unresolved.spelling
+                    AND json_extract(evidence.value, '$.side')=unresolved.side
+                    AND json_extract(evidence.value, '$.impl_site')=unresolved.impl_site)
+               ELSE unresolved.spelling END AS spelling, unresolved.reason,
                unresolved.target_module_path, relation.impl_start_byte, relation.impl_end_byte,
                scopes.ordinal AS owner_scope
         FROM rust_crate_unresolved_trait_impls AS unresolved
@@ -3818,25 +4341,19 @@ fn write_rust_trait_endpoints(
     // Resolved rows sort before an unnamed row of the same endpoint, so an
     // endpoint another topology resolved keeps its identity.
     let mut insert_unnamed = conn.prepare_cached(
-        "INSERT OR IGNORE INTO rust_resolution_unit_summary_trait_endpoints(
+        "INSERT INTO rust_resolution_unit_summary_trait_endpoints(
              summary_id, member_ordinal, owner_module_path, source_relation_key,
              endpoint_role, endpoint_state, impl_site, impl_declaration_id,
              target_unit_key, target_module_path, target_identity_id,
              local_target_member_ordinal, dependency_ordinal,
              unresolved_spelling, unresolved_reason)
          VALUES(?1, ?2, ?3, ?4, ?5, 'unresolved', ?6, ?7, NULL, ?8, NULL, NULL, NULL, ?9,
-                'bound_without_declaration')",
+                'bound_without_declaration')
+         ON CONFLICT(summary_id, member_ordinal, owner_module_path, source_relation_key, endpoint_role) DO NOTHING",
     )?;
     let mut written = 0;
     let mut statement = conn.prepare_cached(RESOLVED_ENDPOINTS_SQL)?;
-    let mut rows = statement.query(params![
-        summary_id,
-        topology_id,
-        snapshot.workspace_id.as_str(),
-        snapshot.generation.get(),
-        snapshot.revision,
-        unit.unit_key.as_slice()
-    ])?;
+    let mut rows = statement.query(params![summary_id, topology_id])?;
     while let Some(row) = rows.next()? {
         let owner_module_path: String = row.get(0)?;
         let member_ordinal: usize = row.get(1)?;
@@ -3844,20 +4361,58 @@ fn write_rust_trait_endpoints(
         let endpoint_role: String = row.get(3)?;
         let impl_site: u32 = row.get(4)?;
         let impl_declaration_id: Option<u32> = row.get(5)?;
-        let target_unit_key = digest_from_row(row.get(6)?)?;
-        let target_module_path: String = row.get(7)?;
-        let target_identity_id: Option<i64> = row.get(8)?;
-        let target_member_ordinal: Option<usize> = row.get(9)?;
+        let target_unit_key = row
+            .get::<_, Option<Vec<u8>>>(6)?
+            .map(digest_from_row)
+            .transpose()?;
+        let target_module_path: Option<String> = row.get(7)?;
+        let target_name: Option<String> = row.get(8)?;
+        // The declaring unit's export is read by the name the topology gave. Another unit's
+        // read is recorded either way: it records the identity it found, or an absence when
+        // the unit has no such declaration or no settled summary.
+        let (target_identity_id, target_member_ordinal) =
+            match (target_unit_key, &target_module_path, &target_name) {
+                (Some(target_unit_key), Some(module_path), Some(name)) => {
+                    let summary = if target_unit_key == unit.unit_key {
+                        Some(summary_id)
+                    } else {
+                        reader.fetch(target_unit_key)?
+                    };
+                    let found: Option<(i64, Option<usize>)> = match summary {
+                        Some(summary) => conn
+                            .prepare_cached(TRAIT_ENDPOINT_NAME_SQL)?
+                            .query_row(params![summary, module_path, name], |row| {
+                                Ok((row.get(0)?, row.get(1)?))
+                            })
+                            .optional()?,
+                        None => None,
+                    };
+                    if target_unit_key != unit.unit_key {
+                        reader.note(
+                            target_unit_key,
+                            if found.is_some() {
+                                ReadKind::TraitEndpoint
+                            } else {
+                                ReadKind::Absence
+                            },
+                        );
+                    }
+                    found.map_or((None, None), |(identity, ordinal)| {
+                        (Some(identity), ordinal)
+                    })
+                }
+                // The topology named no single declaration: nothing to read.
+                _ => (None, None),
+            };
         let Some(target_identity_id) = target_identity_id else {
             // The declaration is indexed but the summary cannot name it: the
             // owning unit has no live summary in this pass (a unit on or behind
             // a dependency cycle is derived before a unit it consumes). The
-            // endpoint is an open boundary spelled as written, the same shape an
-            // unindexed trait gets.
-            let spelling: Option<String> = row.get(10)?;
+            // endpoint seeks the bound target name, including through an alias.
+            let spelling = target_name.clone();
             let spelling = spelling.ok_or_else(|| {
                 StoreError::corrupt(format!(
-                    "{}: Rust {endpoint_role} endpoint has no spelling: relation={source_relation_key}, site={impl_site}, target={target_unit_key:?}::{target_module_path}",
+                    "{}: Rust {endpoint_role} endpoint has no spelling: relation={source_relation_key}, site={impl_site}, target={target_unit_key:?}::{target_module_path:?}::{target_name:?}",
                     unit.label
                 ))
             })?;
@@ -3875,6 +4430,9 @@ fn write_rust_trait_endpoints(
             written += 1;
             continue;
         };
+        let target_unit_key = target_unit_key.expect("a named endpoint has a declaring unit");
+        let target_module_path =
+            target_module_path.expect("a named endpoint has a declaring module");
         let dependency_ordinal = dependency_ordinal_for(target_unit_key);
         let local_target_member_ordinal = if target_unit_key == unit.unit_key {
             Some(target_member_ordinal.expect("declaration exports have a member ordinal"))
@@ -3929,13 +4487,13 @@ fn write_rust_trait_endpoints(
     Ok(written)
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 struct ExportTargetIdentity {
     identity_id: i64,
     identity_digest: [u8; 32],
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 struct ExportTargetCandidate {
     target_unit_key: [u8; 32],
     target_module_path: String,
@@ -3943,80 +4501,6 @@ struct ExportTargetCandidate {
     identity: ExportTargetIdentity,
     // The consumed first hop can differ from the canonical target's unit.
     dependency_ordinal: Option<usize>,
-}
-
-fn canonical_export_target(
-    conn: &Connection,
-    snapshot: &WorkspaceSnapshotId,
-    unit: &UnitInputs,
-    namespace: &str,
-    target: ([u8; 32], String, String),
-    dependency_ordinals: &HashMap<[u8; 32], usize>,
-) -> Result<Option<ExportTargetCandidate>> {
-    let (target_unit_key, target_module_path, target_name) = target;
-    let same_unit = target_unit_key == unit.unit_key;
-    let Some(identity) = target_identity(
-        conn,
-        snapshot,
-        &target_unit_key,
-        &target_module_path,
-        namespace,
-        &target_name,
-        same_unit,
-    )?
-    else {
-        return Ok(None);
-    };
-    let dependency_ordinal = if same_unit {
-        None
-    } else {
-        let producer_epoch: String = conn
-            .prepare_cached(
-                "SELECT producer_epoch FROM main.resolution_producer_epochs WHERE lang = 'rust'",
-            )?
-            .query_row([], |row| row.get(0))?;
-        let mut statement = conn.prepare_cached(DEPENDENCY_REEXPORT_WITNESS_SQL)?;
-        let mut first_hop = dependency_ordinals.get(&target_unit_key).copied();
-        for (dependency_key, ordinal) in dependency_ordinals {
-            if first_hop.is_some_and(|previous| previous <= *ordinal) {
-                continue;
-            }
-            let witnesses_target: bool = statement.query_row(
-                params![
-                    snapshot.workspace_id.as_str(),
-                    "rust",
-                    snapshot.generation.get(),
-                    dependency_key.as_slice(),
-                    snapshot.revision,
-                    producer_epoch,
-                    RUST_UNIT_SUMMARY_DERIVATION_VERSION,
-                    target_unit_key.as_slice(),
-                    target_module_path,
-                    namespace,
-                    target_name,
-                    identity.identity_id
-                ],
-                |row| row.get(0),
-            )?;
-            if witnesses_target {
-                first_hop = Some(*ordinal);
-            }
-        }
-        let Some(first_hop) = first_hop else {
-            // Do not let an unproven candidate disappear behind another
-            // candidate and turn an incomplete export into a unique one.
-            return Ok(None);
-        };
-        Some(first_hop)
-    };
-
-    Ok(Some(ExportTargetCandidate {
-        target_unit_key,
-        target_module_path,
-        target_name,
-        identity,
-        dependency_ordinal,
-    }))
 }
 
 impl RustUnitSummaries {
@@ -4089,11 +4573,11 @@ impl RustUnitSummaries {
             };
             imports.push(UnitImport {
                 blob_id: pending.blob_id,
-                import_id: pending.import_id,
+                import_id: UnitCoordinate::Dense(pending.import_id),
                 // Rust has no Go-style package definition key. The source import
                 // declaration id is its blob-local binding key.
                 kind: if blank { "blank" } else { "named" },
-                definition_key: Some(pending.import_id),
+                definition_key: Some(UnitCoordinate::Dense(pending.import_id)),
                 spelling,
                 dependency_ordinal,
                 state,
@@ -4129,41 +4613,101 @@ impl RustUnitSummaries {
     }
 }
 
-fn read_rows(
+fn declare_configuration_inputs(
     conn: &Connection,
     snapshot: &WorkspaceSnapshotId,
-    producer_epoch: &str,
-) -> Result<Vec<UnitRead>> {
-    let mut reads = Vec::new();
-    let mut statement = conn.prepare_cached(CONFIGURATION_READS_SQL)?;
-    let mut rows = statement.query(params![
-        snapshot.workspace_id.as_str(),
-        snapshot.generation.get(),
-        snapshot.revision
-    ])?;
-    while let Some(row) = rows.next()? {
-        let path: String = row.get(0)?;
-        let oid: String = row.get(1)?;
-        reads.push(UnitRead {
-            kind: "configuration",
-            key_digest: read_key("rust-configuration", Some(path.as_str())),
-            digest: value_digest("rust-configuration-oid", oid.as_bytes()),
+    manifest: &str,
+    directory: &str,
+    inputs: &mut Vec<UnitInputFile>,
+) -> Result<()> {
+    use std::path::Path;
+    let selected = |path: &Path| -> Result<InputFileValue> {
+        let path = super::rust_crates::stable_path(path);
+        let oid: Option<String> = conn
+            .prepare_cached(
+                "SELECT blob_oid FROM workspace_file_versions WHERE workspace_id=?1 AND lang='rust'
+             AND generation=?2 AND rel_path=?3 AND COALESCE(file_present,1)=1 AND valid_from<=?4
+             AND (valid_until IS NULL OR ?4<valid_until)",
+            )?
+            .query_row(
+                params![
+                    snapshot.workspace_id.as_str(),
+                    snapshot.generation.get(),
+                    path,
+                    snapshot.revision
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(oid.map_or(InputFileValue::Absent, InputFileValue::NoFactsOid))
+    };
+    let mut paths = BTreeSet::new();
+    let own = Path::new(manifest);
+    if own.file_name().is_some_and(|name| name == "Cargo.toml") {
+        inputs.push(UnitInputFile {
+            role: UnitSummaryInputRole::OwnManifest,
+            rel_path: manifest.to_owned(),
+            value: selected(own)?,
         });
     }
-    reads.push(UnitRead {
-        kind: "epoch",
-        key_digest: read_key("rust-producer-epoch", None),
-        digest: value_digest("rust-producer-epoch", producer_epoch.as_bytes()),
-    });
-    reads.push(UnitRead {
-        kind: "derivation",
-        key_digest: read_key("rust-unit-summary-derivation", None),
-        digest: value_digest(
-            "rust-unit-summary-derivation",
-            &RUST_UNIT_SUMMARY_DERIVATION_VERSION.to_be_bytes(),
-        ),
-    });
-    Ok(reads)
+    paths.extend(
+        own.parent()
+            .into_iter()
+            .flat_map(Path::ancestors)
+            .map(|parent| parent.join("Cargo.toml")),
+    );
+    paths.extend(
+        Path::new(directory)
+            .ancestors()
+            .map(|parent| parent.join("Cargo.toml")),
+    );
+    paths.remove(own);
+    for path in paths {
+        inputs.push(UnitInputFile {
+            role: UnitSummaryInputRole::WorkspaceManifest,
+            rel_path: super::rust_crates::stable_path(&path),
+            value: selected(&path)?,
+        });
+    }
+    for (legacy, modern) in
+        brokk_bifrost_rust::cargo_config::RustCargoConfiguration::candidate_paths(Path::new(
+            directory,
+        ))
+    {
+        let value = selected(&legacy)?;
+        let absent = matches!(value, InputFileValue::Absent);
+        inputs.push(UnitInputFile {
+            role: UnitSummaryInputRole::CargoConfig,
+            rel_path: super::rust_crates::stable_path(&legacy),
+            value,
+        });
+        if absent {
+            inputs.push(UnitInputFile {
+                role: UnitSummaryInputRole::CargoConfig,
+                rel_path: super::rust_crates::stable_path(&modern),
+                value: selected(&modern)?,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn read_rows(producer_epoch: &str) -> Vec<UnitRead> {
+    vec![
+        UnitRead {
+            kind: "epoch",
+            key_digest: read_key("rust-producer-epoch", None),
+            digest: value_digest("rust-producer-epoch", producer_epoch.as_bytes()),
+        },
+        UnitRead {
+            kind: "derivation",
+            key_digest: read_key("rust-unit-summary-derivation", None),
+            digest: value_digest(
+                "rust-unit-summary-derivation",
+                &rust_unit_summary_derivation_identity(),
+            ),
+        },
+    ]
 }
 
 fn identity_for_name(
@@ -4190,43 +4734,6 @@ fn identity_for_name(
         .transpose()
 }
 
-fn target_identity(
-    conn: &Connection,
-    snapshot: &WorkspaceSnapshotId,
-    crate_key: &[u8; 32],
-    module_path: &str,
-    namespace: &str,
-    name: &str,
-    same_unit: bool,
-) -> Result<Option<ExportTargetIdentity>> {
-    let namespace_code = rust_namespace_code(namespace)?;
-    let row = conn
-        .prepare_cached(TARGET_IDENTITY_SQL)?
-        .query_row(
-            params![
-                snapshot.workspace_id.as_str(),
-                snapshot.generation.get(),
-                crate_key.as_slice(),
-                snapshot.revision,
-                module_path,
-                namespace,
-                name,
-                language_code(crate::analyzer::Language::Rust),
-                namespace_code,
-                same_unit
-            ],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
-        )
-        .optional()?;
-    row.map(|(identity_id, digest)| {
-        Ok(ExportTargetIdentity {
-            identity_id,
-            identity_digest: digest_from_row(digest)?,
-        })
-    })
-    .transpose()
-}
-
 fn rust_namespace_code(namespace: &str) -> Result<i64> {
     let namespace = match namespace {
         "type" => ResolutionNamespace::Type,
@@ -4244,6 +4751,7 @@ fn rust_namespace_code(namespace: &str) -> Result<i64> {
 fn rust_gap_kind(kind: &str) -> Result<&'static str> {
     match kind {
         "external_dependency" => Ok("external_dependency"),
+        "dev_dependency_cycle_edge_dropped" => Ok("dev_dependency_cycle_edge_dropped"),
         "unsupported_manifest" => Ok("unsupported_manifest"),
         "inactive_placement" => Ok("inactive_placement"),
         "unknown_activation" => Ok("unknown_activation"),
@@ -4288,28 +4796,22 @@ fn standard_unit_key(name: &str) -> [u8; 32] {
     hash.finish()
 }
 
+// This producer consumes external names and routes. Lockfile/artifact versions
+// and external feature activation belong to dependency evidence/pack activation.
 fn external_dependency_digest(
     extern_name: &str,
     dependency_kind: &str,
     producer_epoch: &str,
-    reads: &[UnitRead],
 ) -> [u8; 32] {
     let mut hash = CanonicalHasher::new(b"bifrost-rust-external-dependency:v1");
     hash.field("extern-name", extern_name.as_bytes());
     hash.field("dependency-kind", dependency_kind.as_bytes());
     hash.field("producer-epoch", producer_epoch.as_bytes());
-    let mut configuration: Vec<_> = reads
-        .iter()
-        .filter(|read| read.kind == "configuration")
-        .collect();
-    configuration.sort_by_key(|read| read.key_digest);
-    for read in configuration {
-        hash.field("configuration-key", &read.key_digest);
-        hash.field("configuration-oid", &read.digest);
-    }
     hash.finish()
 }
 
+// This boundary copies the source-selected prelude label without reading selected
+// sysroot declarations. Semantic dependency activation records toolchain selection.
 fn standard_dependency_digest(name: &str, producer_epoch: &str) -> [u8; 32] {
     let mut hash = CanonicalHasher::new(b"bifrost-rust-standard-dependency:v1");
     hash.field("crate-name", name.as_bytes());
@@ -4610,14 +5112,52 @@ impl AnalyzerStore {
         Self::rust_summary_package_rows_on_connection(conn, snapshot, Some(unit_key))
     }
 
+    /// The unit's package rows with each member's content taken from the
+    /// selected mount inventory of `conn`, so an overlay's content and masks
+    /// reach the route derivations. Membership stays the persisted unit's: a
+    /// path the persisted unit does not know does not join it. A member with
+    /// no selected mount has no content (`blob_oid` is `None`) and is never
+    /// given the revision's blob. Needs the selected mount table, so only a
+    /// connection of an opened selected inventory can call it.
+    #[doc(hidden)]
+    pub fn rust_selected_package_rows_for_unit(
+        conn: &Connection,
+        snapshot: &WorkspaceSnapshotId,
+        unit_key: &[u8; 32],
+    ) -> Result<Vec<RustSummaryPackageRow>> {
+        static SELECTED_SQL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let sql = SELECTED_SQL.get_or_init(|| {
+            let revision_oid = "contexts.target_kind, blobs.blob_oid,";
+            assert!(
+                PACKAGE_ROWS_SQL.contains(revision_oid),
+                "PACKAGE_ROWS_SQL no longer selects the revision blob in the expected column"
+            );
+            format!(
+                "{}\nLEFT JOIN temp.selected_resolution_mounts AS selected_mount\n  ON selected_mount.storage_language = 'rust'\n AND selected_mount.persisted_relative_path = members.rel_path\n",
+                PACKAGE_ROWS_SQL
+                    .replace(revision_oid, "contexts.target_kind, selected_mount.blob_oid,")
+            )
+        });
+        Self::rust_package_rows_from_sql(conn, snapshot, sql, Some(unit_key))
+    }
+
     fn rust_summary_package_rows_on_connection(
         conn: &Connection,
         snapshot: &WorkspaceSnapshotId,
         unit_key: Option<&[u8; 32]>,
     ) -> Result<Vec<RustSummaryPackageRow>> {
+        Self::rust_package_rows_from_sql(conn, snapshot, PACKAGE_ROWS_SQL, unit_key)
+    }
+
+    fn rust_package_rows_from_sql(
+        conn: &Connection,
+        snapshot: &WorkspaceSnapshotId,
+        package_rows_sql: &str,
+        unit_key: Option<&[u8; 32]>,
+    ) -> Result<Vec<RustSummaryPackageRow>> {
         super::require_current_generation(conn, "rust", snapshot.generation)?;
         check_rust_summary_selection(conn, snapshot)?;
-        let sql = PACKAGE_ROWS_SQL.replace(
+        let sql = package_rows_sql.replace(
             "/* UNIT_KEY_FILTER */",
             if unit_key.is_some() {
                 "AND versions.unit_key = ?2"
@@ -4630,8 +5170,10 @@ impl AnalyzerStore {
         let raw_rows = statement
             .query_map(
                 rusqlite::params_from_iter(
-                    std::iter::once(&RUST_UNIT_SUMMARY_DERIVATION_VERSION as &dyn rusqlite::ToSql)
-                        .chain(unit_key.as_ref().map(|key| key as &dyn rusqlite::ToSql)),
+                    std::iter::once(
+                        &rust_unit_summary_derivation_identity() as &dyn rusqlite::ToSql
+                    )
+                    .chain(unit_key.as_ref().map(|key| key as &dyn rusqlite::ToSql)),
                 ),
                 |row| {
                     Ok((
@@ -4639,15 +5181,23 @@ impl AnalyzerStore {
                         row.get::<_, Option<String>>(1)?,
                         row.get::<_, Option<String>>(2)?,
                         row.get::<_, Option<String>>(3)?,
-                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(4)?,
                         row.get::<_, bool>(5)?,
+                        row.get::<_, bool>(6)?,
                     ))
                 },
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut rows = Vec::with_capacity(raw_rows.len());
-        for (rel_path, package_components, crate_name, target_kind, blob_oid, is_root_member) in
-            raw_rows
+        for (
+            rel_path,
+            package_components,
+            crate_name,
+            target_kind,
+            blob_oid,
+            is_root_member,
+            unplaced_by_selection,
+        ) in raw_rows
         {
             let package_components = package_components.ok_or_else(|| {
                 StoreError::corrupt(format!(
@@ -4675,6 +5225,7 @@ impl AnalyzerStore {
                 target_kind,
                 blob_oid,
                 is_root_member,
+                unplaced_by_selection,
             });
         }
         drop(statement);
@@ -4751,8 +5302,10 @@ impl AnalyzerStore {
         let raw_rows = statement
             .query_map(
                 rusqlite::params_from_iter(
-                    std::iter::once(&RUST_UNIT_SUMMARY_DERIVATION_VERSION as &dyn rusqlite::ToSql)
-                        .chain(unit_key.as_ref().map(|key| key as &dyn rusqlite::ToSql)),
+                    std::iter::once(
+                        &rust_unit_summary_derivation_identity() as &dyn rusqlite::ToSql
+                    )
+                    .chain(unit_key.as_ref().map(|key| key as &dyn rusqlite::ToSql)),
                 ),
                 |row| {
                     Ok((
@@ -4850,3 +5403,151 @@ impl AnalyzerStore {
         Ok(rows)
     }
 }
+
+// Keep the unit handles first: a topology-wide scan multiplies work by unit count.
+// Blob-first placement probes preserve duplicate placement and macro rehoming rules.
+pub(super) fn binding_authority_alternatives_sql() -> String {
+    const DECLARING_MODULES_SQL: &str = "
+        SELECT alt.target_module_path
+         WHERE alt.origin = 'declaration' OR alt.declaration_site IS NULL
+        UNION
+        SELECT CASE exports.origin WHEN 'declaration' THEN exports.module_path
+                                   ELSE exports.target_module_path END
+          FROM main.rust_crate_exports AS exports
+         WHERE alt.origin <> 'declaration' AND alt.declaration_site IS NOT NULL
+           AND exports.topology_id = ?2 AND exports.module_path = alt.target_module_path
+           AND exports.namespace = alt.namespace AND exports.name = alt.target_name
+           AND exports.declaration_blob_id = alt.declaration_blob_id
+           AND exports.declaration_site = alt.declaration_site";
+    let target_members_sql = format!(
+        "
+        SELECT members.member_ordinal AS member_ordinal, members.rel_path AS rel_path,
+               naming.module_path AS module_path
+          FROM main.resolution_unit_summary_members AS members INDEXED BY resolution_unit_summary_members_blob
+          CROSS JOIN main.resolution_unit_summary_placements AS placement
+            ON placement.summary_id = members.summary_id
+           AND placement.member_ordinal = members.member_ordinal
+          CROSS JOIN main.rust_resolution_unit_summary_placement_attributes AS naming
+            USING(summary_id, container_path, member_ordinal)
+         WHERE members.summary_id = ?1 AND members.blob_id = alt.declaration_blob_id
+           AND naming.module_path IN ({DECLARING_MODULES_SQL})
+        UNION
+        SELECT members.member_ordinal, members.rel_path, ''
+          FROM main.resolution_unit_summary_members AS members INDEXED BY resolution_unit_summary_members_blob
+         WHERE members.summary_id = ?1 AND members.blob_id = alt.declaration_blob_id
+           AND NOT EXISTS(
+               SELECT 1 FROM main.resolution_unit_summary_members AS placed INDEXED BY resolution_unit_summary_members_blob
+                 CROSS JOIN main.resolution_unit_summary_placements AS placement
+                   ON placement.summary_id = placed.summary_id
+                  AND placement.member_ordinal = placed.member_ordinal
+                 CROSS JOIN main.rust_resolution_unit_summary_placement_attributes AS naming
+                   USING(summary_id, container_path, member_ordinal)
+                WHERE placed.summary_id = ?1 AND placed.blob_id = alt.declaration_blob_id
+                  AND naming.module_path IN ({DECLARING_MODULES_SQL}))"
+    );
+
+    // An alternative's lexical provider belongs to an own owner and is found by
+    // the same logical key the topology row carries. A lexical provider in
+    // another unit has no name form, so it is refused rather than invented.
+    let alternatives_sql = format!("
+        SELECT handles.owner_handle AS owner_handle, alt.namespace AS namespace, alt.name AS name,
+               alt.target_crate_key AS target_unit_key,
+               alt.target_module_path AS target_module_path,
+               alt.target_name AS target_name, alt.target_container_path AS target_container_path,
+               alt.origin AS origin,
+               CASE WHEN alt.target_crate_key <> topology.crate_key THEN 'foreign'
+                    WHEN alt.declaration_blob_id IS NULL THEN 'anchor'
+                    WHEN alt.declaration_site IS NOT NULL THEN 'local_site'
+                    ELSE 'local_generated' END AS target_form,
+               CASE WHEN alt.target_crate_key = topology.crate_key
+                         AND alt.declaration_blob_id IS NOT NULL
+                    THEN (SELECT member_ordinal FROM ({target_members_sql}) ORDER BY rel_path, member_ordinal LIMIT 1) END AS target_member_ordinal,
+               CASE WHEN alt.target_crate_key = topology.crate_key
+                         AND alt.declaration_blob_id IS NOT NULL
+                    THEN (SELECT count(DISTINCT module_path) FROM ({target_members_sql})) END AS target_member_matches,
+               CASE WHEN alt.target_crate_key = topology.crate_key THEN alt.declaration_site END AS target_site,
+               CASE WHEN alt.target_crate_key = topology.crate_key
+                    THEN alt.generated_declaration_id END AS target_declaration_id,
+               CASE WHEN alt.target_crate_key <> topology.crate_key
+                    THEN CASE WHEN alt.declaration_blob_id IS NULL THEN 'module'
+                              WHEN alt.declaration_site IS NOT NULL THEN 'declaration'
+                              ELSE 'generated' END END AS target_kind,
+               CASE WHEN alt.target_crate_key <> topology.crate_key THEN alt.namespace END AS target_namespace,
+               CASE WHEN alt.target_crate_key <> topology.crate_key THEN 'declaration' END AS target_origin,
+               alt.visibility AS visibility, alt.restricted_module_path AS restricted_module_path,
+               CASE WHEN alt.origin <> 'glob' THEN 'none'
+                    WHEN alt.provider_rel_path = '' THEN 'module'
+                    WHEN alt.provider_crate_key = topology.crate_key THEN 'local'
+                    ELSE 'foreign' END AS provider_form,
+               provider_handles.member_ordinal AS provider_member_ordinal,
+               provider_owner.native_scope AS provider_native_scope,
+               alt.provider_crate_key AS provider_unit_key,
+               alt.provider_module_path AS provider_module_path,
+               alt.glob_visibility AS glob_visibility,
+               alt.glob_restricted_module_path AS glob_restricted_module_path
+        FROM temp.rust_unit_summary_owner_handles AS handles
+        CROSS JOIN main.rust_crate_binding_alternatives AS alt
+          INDEXED BY rust_crate_binding_alternatives_name ON handles.owner_id = alt.owner_id
+        JOIN main.rust_crate_topologies AS topology ON topology.topology_id = ?2
+        LEFT JOIN main.rust_crate_binding_owners AS provider_owner
+          ON alt.provider_rel_path <> '' AND alt.provider_crate_key = topology.crate_key
+         AND provider_owner.topology_id = topology.topology_id
+         AND provider_owner.module_path = alt.provider_module_path
+         AND provider_owner.rel_path = alt.provider_rel_path
+         AND provider_owner.scope_identity = alt.provider_scope_identity
+        LEFT JOIN temp.rust_unit_summary_owner_handles AS provider_handles
+          ON provider_handles.owner_id = provider_owner.owner_id");
+    alternatives_sql
+}
+
+// Keep these sources shared with the planner registry. Handles bound the work to one unit.
+// Evidence paths seek the topology/path index before resolving members by blob;
+// a topology/module prefix alone would revisit every source placed in that module.
+// Module owners have empty path and scope identity by their table CHECK, so spelling
+// those equalities supplies the entire existing unique key without narrowing results.
+pub(crate) const BINDING_AUTHORITY_NAMES_SQL: &str =
+    "SELECT ?1, handles.owner_handle, names.namespace, names.name, names.complete
+             FROM temp.rust_unit_summary_owner_handles AS handles
+             CROSS JOIN main.rust_crate_binding_names AS names USING(owner_id)";
+pub(crate) const BINDING_AUTHORITY_BLOCKERS_SQL: &str = "
+        SELECT handles.owner_handle AS owner_handle, blocker.namespace AS namespace,
+               blocker.name AS name, blocker.reason AS reason, blocker.boundary AS boundary,
+               blocker.evidence_crate_key AS evidence_unit_key,
+               blocker.evidence_module_path AS evidence_module_path,
+               blocker.evidence_kind AS evidence_kind,
+               blocker.evidence_rel_path AS evidence_rel_path, blocker.evidence_key AS evidence_key,
+               CASE WHEN blocker.evidence_crate_key <> topology.crate_key THEN 'foreign'
+                    WHEN blocker.evidence_kind = 'owner' THEN 'owner'
+                    WHEN blocker.evidence_rel_path = '' THEN 'unplaced'
+                    ELSE 'local' END AS evidence_form,
+               evidence_member.member_ordinal AS evidence_member_ordinal,
+               CASE WHEN evidence_member.member_ordinal IS NOT NULL
+                         AND blocker.evidence_kind = 'declaration' THEN blocker.evidence_key END AS evidence_declaration_id,
+               CASE WHEN evidence_member.member_ordinal IS NOT NULL
+                         AND blocker.evidence_kind = 'macro' THEN blocker.evidence_key END AS evidence_invocation_occurrence_id,
+               CASE WHEN evidence_member.member_ordinal IS NOT NULL
+                         AND blocker.evidence_kind = 'import' THEN blocker.evidence_key END AS evidence_import_ordinal,
+               CASE WHEN blocker.evidence_crate_key = topology.crate_key
+                         AND blocker.evidence_kind = 'owner' THEN evidence_handles.owner_handle END AS evidence_owner_handle
+        FROM temp.rust_unit_summary_owner_handles AS handles
+        CROSS JOIN main.rust_crate_binding_blockers AS blocker ON blocker.owner_id = handles.owner_id
+        CROSS JOIN main.rust_crate_topologies AS topology ON topology.topology_id = ?2
+        LEFT JOIN main.rust_crate_container_sources AS evidence_source
+          INDEXED BY rust_crate_containers_path
+          ON blocker.evidence_crate_key = topology.crate_key AND blocker.evidence_kind <> 'owner'
+         AND blocker.evidence_rel_path <> '' AND evidence_source.topology_id = topology.topology_id
+         AND evidence_source.container_path = blocker.evidence_module_path
+         AND evidence_source.rel_path = blocker.evidence_rel_path
+        LEFT JOIN main.resolution_unit_summary_members AS evidence_member
+          INDEXED BY resolution_unit_summary_members_blob
+          ON evidence_member.summary_id = ?1 AND evidence_member.blob_id = evidence_source.blob_id
+         AND evidence_member.rel_path = evidence_source.rel_path
+         AND evidence_member.source_role = evidence_source.source_kind
+        LEFT JOIN main.rust_crate_binding_owners AS evidence_owner
+          ON blocker.evidence_crate_key = topology.crate_key AND blocker.evidence_kind = 'owner'
+         AND evidence_owner.topology_id = topology.topology_id
+         AND evidence_owner.module_path = blocker.evidence_module_path
+         AND evidence_owner.kind = 'module'
+         AND evidence_owner.rel_path = '' AND evidence_owner.scope_identity = x''
+        LEFT JOIN temp.rust_unit_summary_owner_handles AS evidence_handles
+          ON evidence_handles.owner_id = evidence_owner.owner_id";

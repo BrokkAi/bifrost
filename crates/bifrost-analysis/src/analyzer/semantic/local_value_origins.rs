@@ -197,7 +197,7 @@ pub fn derive_local_constant_origins(
                 SemanticEffect::ValueFlow {
                     target,
                     source,
-                    kind: ValueFlowKind::Local,
+                    kind: ValueFlowKind::Local | ValueFlowKind::AddressOf,
                 } => {
                     // The second row repeats the assignment's dependence. It
                     // must not become a second, independently exact producer.

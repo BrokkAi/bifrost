@@ -265,7 +265,11 @@ impl<'plan> BackwardValueFlowProblem<'plan> {
             .sources_at(point, phase)
             .filter(|source| source.activation_triggers.is_none())
         {
-            if source.carrier != demand.carrier {
+            if !self
+                .plan
+                .source_carriers(source.carrier)
+                .any(|carrier| carrier == demand.carrier)
+            {
                 continue;
             }
             let uncertainty = demand
@@ -340,7 +344,10 @@ impl<'plan> BackwardValueFlowProblem<'plan> {
                     super::ValueFlowObservationPhase::AfterEffects,
                 ] {
                     for source in self.plan.sources_at(edge.target(), phase).filter(|source| {
-                        source.carrier == rule.source && source.activation_triggers.is_none()
+                        self.plan
+                            .source_carriers(source.carrier)
+                            .any(|carrier| carrier == rule.source)
+                            && source.activation_triggers.is_none()
                     }) {
                         let uncertainty = demand
                             .uncertainty

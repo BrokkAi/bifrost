@@ -271,6 +271,9 @@ pub(super) enum ConfigurationDocumentIngestion {
 #[derive(Default)]
 pub(super) struct ConfigurationFactsTraversalCache {
     documents: CaptureScopedMemo<HashMap<ProjectFile, ConfigurationDocumentSnapshot>>,
+    /// The execution dependences marked through this cache; the query joins it
+    /// into its reuse verdict.
+    pub(super) reuse: ReuseVerdict,
 }
 
 /// Report each incomplete diagnostic once per seed execution. What was
@@ -342,6 +345,7 @@ impl ConfigurationFactsTraversalCache {
                     )
                 });
                 analyzer.mark_execution_dependent();
+                self.reuse.join_in(EXECUTION_DEPENDENT);
                 ingest_diagnostics.push(Self::file_incomplete(
                     analyzer,
                     (
@@ -373,6 +377,7 @@ impl ConfigurationFactsTraversalCache {
                     )
                 });
                 analyzer.mark_execution_dependent();
+                self.reuse.join_in(EXECUTION_DEPENDENT);
                 ingest_diagnostics.push(Self::file_incomplete(
                     analyzer,
                     (
@@ -414,11 +419,7 @@ impl ConfigurationFactsTraversalCache {
                             CodeQueryDiagnosticCode::SemanticAnalysisPartial,
                             Incompleteness::Content,
                         ),
-                        format!(
-                            "configuration ingestion of {} retained facts from a partly recovered document ({}); its rows are not the whole set",
-                            rel_path_string(file),
-                            recovery_labels(&facts)
-                        ),
+                        recovered_configuration_diagnostic(file, &facts),
                     ));
                     Some((Arc::new(*facts), Arc::clone(&source)))
                 }
@@ -508,6 +509,10 @@ impl ConfigurationFactsTraversalCache {
         super::QueryExecutionState::diagnostic(
             analyzer,
             CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                 incompleteness,
                 related: Vec::new(),
                 source: None,
@@ -522,6 +527,33 @@ impl ConfigurationFactsTraversalCache {
             incompleteness.execution_cause(),
         )
     }
+}
+
+fn recovered_configuration_diagnostic(
+    file: &ProjectFile,
+    facts: &ConfigurationDocumentFacts,
+) -> String {
+    use brokk_bifrost_core::analyzer::configuration::ConfigurationCompleteness;
+    let recoveries = match facts.completeness() {
+        ConfigurationCompleteness::Complete => &[][..],
+        ConfigurationCompleteness::Incomplete { recoveries } => recoveries.as_slice(),
+    };
+    // The label vocabulary is closed by recovery_labels' exhaustive enum match.
+    let labels = recovery_labels(facts);
+    let kinds = labels
+        .split(", ")
+        .collect::<std::collections::BTreeSet<_>>();
+    brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+        format_args!(
+            "configuration ingestion of {} retained facts from a partly recovered document ({}); its rows are not the whole set",
+            rel_path_string(file),
+            labels
+        ),
+        format_args!(
+            "configuration ingestion retained facts from a partly recovered document; recovery_kinds={kinds:?}; omitted_source_context_items=1"
+        ),
+        recoveries.iter(),
+    )
 }
 
 fn recovery_labels(facts: &ConfigurationDocumentFacts) -> String {
@@ -863,10 +895,14 @@ pub(super) fn execute_configuration_facts_seed(
                     line!()
                 )
             });
-            state.analyzer.mark_execution_dependent();
+            state.mark_execution_dependent();
             diagnostics.push(super::QueryExecutionState::diagnostic(
                 state.analyzer,
                 CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                    has_non_utf8_refusal: false,
+                    refusal_sites: Default::default(),
+                    call_relation_facts: None,
+                    uses_omissions: Vec::new(),
                     incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                     related: Vec::new(),
                     source: None,
@@ -885,6 +921,10 @@ pub(super) fn execute_configuration_facts_seed(
     };
     if files.is_empty() && !seed.where_globs.is_empty() {
         diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
             incompleteness: brokk_bifrost_rql::Incompleteness::Content,
             related: Vec::new(),
             source: None,
@@ -932,14 +972,26 @@ pub(super) fn execute_configuration_facts_seed(
         projected.scanned_source_bytes =
             projected.scanned_source_bytes.saturating_add(source.len());
         if projected.scanned_source_bytes > limits.max_scanned_source_bytes {
-            push_budget_diagnostic(diagnostics, &projected);
+            push_budget_diagnostic(
+                diagnostics,
+                &projected,
+                limits,
+                Some(&state.budget),
+                "configuration_scan",
+            );
             truncated = true;
             break;
         }
         state.budget.scanned_source_bytes = projected.scanned_source_bytes;
         projected.fact_nodes = projected.fact_nodes.saturating_add(document.facts().len());
         if projected.fact_nodes > limits.max_fact_nodes {
-            push_budget_diagnostic(diagnostics, &projected);
+            push_budget_diagnostic(
+                diagnostics,
+                &projected,
+                limits,
+                Some(&state.budget),
+                "configuration_scan",
+            );
             truncated = true;
             break;
         }
@@ -1010,6 +1062,10 @@ pub(super) fn execute_configuration_facts_seed(
             ) {
                 truncated = true;
                 diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                     incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                     related: Vec::new(),
                     source: None,
@@ -1032,4 +1088,63 @@ pub(super) fn execute_configuration_facts_seed(
     }
 
     PlanExecution::new(rows, truncated)
+}
+
+#[cfg(test)]
+mod diagnostic_prose_tests {
+    use super::*;
+    use brokk_bifrost_core::analyzer::configuration::{
+        ConfigurationCompleteness, ConfigurationRecovery, ConfigurationRecoveryReason,
+        ConfigurationSourceRange,
+    };
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12527: repeated recoveries hid later recovery kinds beyond policy prose bounds"
+    )]
+    fn configuration_recovery_prose_keeps_late_kind_and_exact_omissions() {
+        let ConfigurationIngestionOutcome::Facts(base) =
+            ingest_configuration_document(std::path::Path::new("settings.json"), b"{}")
+        else {
+            panic!("valid fixture")
+        };
+        let recoveries = (0..512)
+            .map(|i| {
+                ConfigurationRecovery::new(
+                    if i == 511 {
+                        ConfigurationRecoveryReason::UnsupportedScalar
+                    } else {
+                        ConfigurationRecoveryReason::MalformedSyntax
+                    },
+                    ConfigurationSourceRange::new(0, 0).unwrap(),
+                )
+            })
+            .collect();
+        let facts = ConfigurationDocumentFacts::new(
+            base.format(),
+            base.facts().to_vec(),
+            ConfigurationCompleteness::Incomplete { recoveries },
+            base.features().clone(),
+        )
+        .unwrap();
+        let file = ProjectFile::new(
+            std::env::temp_dir().join("bounded-fixture"),
+            "settings.json",
+        );
+        let detail = recovered_configuration_diagnostic(&file, &facts);
+        assert!(detail.len() <= brokk_bifrost_core::bounded_output::MAX_DIAGNOSTIC_MESSAGE_BYTES);
+        assert!(detail.contains("malformed syntax"));
+        assert!(detail.contains("unsupported scalar"));
+        assert!(detail.contains("total_items=512"));
+        let omitted: usize = detail
+            .rsplit_once("omitted_items=")
+            .unwrap()
+            .1
+            .parse()
+            .unwrap();
+        assert!(omitted > 0);
+        assert_eq!(
+            detail.matches("ConfigurationRecovery {").count() + omitted,
+            512
+        );
+    }
 }

@@ -12,7 +12,11 @@ use brokk_bifrost_ruby::local_bindings::{
 use brokk_bifrost_ruby::structural::ruby_unconditional_loop_body;
 use tree_sitter::Node;
 
+use brokk_bifrost_core::analyzer::structural::callable::CalleeSpelling;
 use brokk_bifrost_ruby::syntax::is_runtime_node;
+use brokk_bifrost_ruby::syntax::{
+    ruby_call_receiver, ruby_callee_spelling, ruby_callee_token, ruby_element_arguments,
+};
 
 use brokk_bifrost_ruby::syntax::ruby_semantic_identifier_range;
 
@@ -89,13 +93,12 @@ use brokk_bifrost_core::hash::HashMap;
 
 use brokk_bifrost_core::hash::HashSet;
 
-// Bumping this rotates every public wire id hashed from the adapter
-// fingerprint (`SemanticArtifactKey::push_environment_identity`). A checked-in
-// golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
-// change; the code-query tutorial pages elide such ids (#5016).
-// The lowerer reaches receiverless-loop recognition: a declared loop is not Kernel#loop.
-// #9447: structured formal roles and refusal change semantic payloads.
-const ADAPTER_VERSION: &[u8] = b"ruby-value-semantics-v16";
+/// The ruby adapter lever (#11570): `levers/ruby-adapter.tokens`. Add a line there
+/// when a change alters the semantics this lowerer publishes for unchanged
+/// source; see `.agents/docs/cache-identity-levers.md`.
+fn adapter_version() -> &'static [u8] {
+    brokk_bifrost_core::lever_label!("ruby-value-semantics", "ruby-adapter.tokens").as_bytes()
+}
 
 impl_program_semantics_provider!(RubyAnalyzer, RubySemanticLowerer);
 
@@ -423,6 +426,20 @@ fn assignment_target_dispatches(node: Node<'_>) -> bool {
         }
     }
     false
+}
+
+/// The values and points one ordinary Ruby call site joins.
+struct RubyMethodCall {
+    invoke: ProgramPointId,
+    normal: ProgramPointId,
+    exceptional: ProgramPointId,
+    callee: ValueId,
+    kind: CallableReferenceKind,
+    targets: CallableTargetResolution,
+    receiver: Option<ValueId>,
+    arguments: Box<[SemanticCallArgument]>,
+    result: Option<ValueId>,
+    thrown: ValueId,
 }
 
 fn call_arguments(node: Node<'_>) -> Vec<Node<'_>> {
@@ -1024,7 +1041,7 @@ impl ProgramSemanticsLowerer for RubySemanticLowerer {
     fn identity(&self) -> SemanticAdapterIdentity {
         SemanticAdapterIdentity::for_adapter(
             "ruby",
-            ADAPTER_VERSION,
+            adapter_version(),
             b"ruby-intrafile-execution-defaults-v1",
             DependencyFingerprint::hash_bytes(b"no-intrafile-dependencies"),
         )
@@ -4268,22 +4285,6 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         } else {
             CallableTargetResolution::Unknown
         };
-        let metadata = self.metadata(invoke)?;
-        self.append_effect(
-            builder,
-            invoke,
-            SemanticEffect::CallableReference {
-                result: callee,
-                callable: CallableValue {
-                    kind: callable_kind,
-                    targets: resolution.clone(),
-                    target_evidence: metadata.evidence,
-                    bound_receiver: (!constructor).then_some(receiver).flatten(),
-                    environment: None,
-                },
-            },
-        )?;
-
         let argument_nodes = call_arguments(node);
         let attached_block = node.child_by_field_name("block");
         let mut arguments = argument_nodes
@@ -4294,47 +4295,28 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             let value = self.expression_value(builder, block, SemanticValueKind::Callable)?;
             arguments.push(SemanticCallArgument::unclassified(value));
         }
-        let call_site = self.session.add_call_site(
+        let call_site = self.method_call_site(
             builder,
-            CallSiteScaffold {
-                point: invoke,
+            RubyMethodCall {
+                invoke,
+                normal,
+                exceptional,
                 callee,
+                kind: callable_kind,
+                targets: resolution,
                 receiver: (!constructor).then_some(receiver).flatten(),
-                member_selection: None,
                 arguments: arguments.into_boxed_slice(),
-                normal_results: Box::new([]),
                 result: Some(result),
-                thrown: Some(thrown),
-                declared_targets: resolution.clone(),
-                normal_continuation: normal,
-                exceptional_continuation: exceptional,
+                thrown,
             },
+            next,
+            scope,
+            stack,
         )?;
         if constructor {
             self.session
                 .add_allocation(builder, normal, result, AllocationKind::Object)?;
         }
-        self.session
-            .add_target_edge(builder, invoke, EdgeTarget::normal(normal))?;
-        self.session.add_target_edge(
-            builder,
-            invoke,
-            EdgeTarget {
-                point: exceptional,
-                kind: ControlEdgeKind::Exceptional,
-            },
-        )?;
-        self.session.add_target_edge(builder, normal, next)?;
-        self.route_call_exceptional(builder, exceptional, next, scope, stack)?;
-        self.resolution_gaps(builder, invoke, callee, call_site, &resolution)?;
-        self.session.record_gap(
-            builder,
-            invoke,
-            SemanticGapSubject::CallSite(call_site),
-            SemanticCapability::DynamicDispatch,
-            SemanticGapKind::Unknown,
-            "Ruby method dispatch may select an override or method_missing target; complete receiver-class coverage requires runtime refinement",
-        )?;
         self.ruby_call_gaps(
             builder,
             invoke,
@@ -4405,6 +4387,143 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             scope,
             stack,
         )
+    }
+
+    /// Publish one ordinary Ruby method call: its callable reference, call
+    /// site, continuations and the gaps every unrefined Ruby call carries.
+    fn method_call_site(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        call: RubyMethodCall,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<CallSiteId, RubyLoweringError> {
+        let RubyMethodCall {
+            invoke,
+            normal,
+            exceptional,
+            callee,
+            kind,
+            targets,
+            receiver,
+            arguments,
+            result,
+            thrown,
+        } = call;
+        let metadata = self.metadata(invoke)?;
+        self.append_effect(
+            builder,
+            invoke,
+            SemanticEffect::CallableReference {
+                result: callee,
+                callable: CallableValue {
+                    kind,
+                    targets: targets.clone(),
+                    target_evidence: metadata.evidence,
+                    bound_receiver: receiver,
+                    environment: None,
+                },
+            },
+        )?;
+        let call_site = self.session.add_call_site(
+            builder,
+            CallSiteScaffold {
+                point: invoke,
+                callee,
+                receiver,
+                member_selection: None,
+                arguments,
+                normal_results: Box::new([]),
+                result,
+                thrown: Some(thrown),
+                declared_targets: targets.clone(),
+                normal_continuation: normal,
+                exceptional_continuation: exceptional,
+            },
+        )?;
+        self.session
+            .add_target_edge(builder, invoke, EdgeTarget::normal(normal))?;
+        self.session.add_target_edge(
+            builder,
+            invoke,
+            EdgeTarget {
+                point: exceptional,
+                kind: ControlEdgeKind::Exceptional,
+            },
+        )?;
+        self.session.add_target_edge(builder, normal, next)?;
+        self.route_call_exceptional(builder, exceptional, next, scope, stack)?;
+        self.resolution_gaps(builder, invoke, callee, call_site, &targets)?;
+        self.session.record_gap(
+            builder,
+            invoke,
+            SemanticGapSubject::CallSite(call_site),
+            SemanticCapability::DynamicDispatch,
+            SemanticGapKind::Unknown,
+            "Ruby method dispatch may select an override or method_missing target; complete receiver-class coverage requires runtime refinement",
+        )?;
+        Ok(call_site)
+    }
+
+    /// Lower a call that Ruby compiles from operator syntax: `r.attr = v`
+    /// calls `attr=`, `r[i]` calls `[]` and `r[i] = v` calls `[]=`. The call
+    /// site spans `anchor`, the node the structural call shape spans, and
+    /// `callee` is the token that spells the method. The returned invoke point
+    /// is where the receiver and `operands` evaluations lead.
+    #[allow(clippy::too_many_arguments)]
+    fn operator_syntax_call(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        anchor: Node<'tree>,
+        callee: Node<'tree>,
+        operands: &[Node<'tree>],
+        result: Option<ValueId>,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<ProgramPointId, RubyLoweringError> {
+        let invoke = self.point(builder, anchor, Vec::new())?;
+        let normal = self.point(builder, anchor, Vec::new())?;
+        let exceptional = self.point(builder, anchor, Vec::new())?;
+        let callee_value =
+            self.session
+                .add_node_value(builder, callee, SemanticValueKind::Callable)?;
+        let thrown = self
+            .session
+            .add_node_value(builder, callee, SemanticValueKind::Exception)?;
+        let receiver = ruby_call_receiver(anchor)
+            .map(|receiver| {
+                self.expression_value(
+                    builder,
+                    receiver,
+                    expression_value_kind(self.source, receiver),
+                )
+            })
+            .transpose()?;
+        let arguments = operands
+            .iter()
+            .map(|operand| self.semantic_call_argument(builder, *operand))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.method_call_site(
+            builder,
+            RubyMethodCall {
+                invoke,
+                normal,
+                exceptional,
+                callee: callee_value,
+                kind: CallableReferenceKind::BoundMethod,
+                targets: CallableTargetResolution::Unknown,
+                receiver,
+                arguments: arguments.into_boxed_slice(),
+                result,
+                thrown,
+            },
+            next,
+            scope,
+            stack,
+        )?;
+        Ok(invoke)
     }
 
     fn precise_raise(
@@ -5005,6 +5124,18 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         // Keep dispatch gaps only when this structured memory model is absent.
         let mut modeled_store = false;
         let mut assigned_value = None;
+        // Without that model, a plain `r.attr = v` or `r[i] = v` is an
+        // ordinary call of the writer `attr=` or `[]=`. A safe-navigation or
+        // operator assignment also calls a reader and keeps its gaps.
+        let writer_callee = (node.kind() == "assignment"
+            && !safe_navigation
+            && matches!(
+                ruby_callee_spelling(left),
+                CalleeSpelling::AttributeWriter | CalleeSpelling::ElementAssignment
+            ))
+        .then(|| ruby_callee_token(left))
+        .flatten();
+        let mut writer_invoke = None;
         if let Some(member) = instance_field_place {
             modeled_store = true;
             let value =
@@ -5080,6 +5211,28 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     value,
                 },
             )?;
+            assigned_value = Some(value);
+        } else if let Some(callee) = writer_callee {
+            let value =
+                self.expression_value(builder, right, expression_value_kind(self.source, right))?;
+            let mut operands = if left.kind() == "element_reference" {
+                ruby_element_arguments(left)
+            } else {
+                Vec::new()
+            };
+            operands.push(right);
+            // Ruby discards the writer's return value: the assignment
+            // evaluates to the assigned value.
+            writer_invoke = Some(self.operator_syntax_call(
+                builder,
+                left,
+                callee,
+                &operands,
+                None,
+                EdgeTarget::normal(terminal),
+                scope,
+                stack,
+            )?);
             assigned_value = Some(value);
         } else if identity_assignment {
             let name = node_text(self.source, left).unwrap_or_default();
@@ -5290,7 +5443,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 stack,
             )
         } else {
-            if dispatching_target && !modeled_store && node.kind() != "operator_assignment" {
+            if dispatching_target
+                && !modeled_store
+                && writer_invoke.is_none()
+                && node.kind() != "operator_assignment"
+            {
                 self.assignment_dispatch_gaps(builder, terminal, false)?;
             }
             let mut evaluations = target_evaluations;
@@ -5299,7 +5456,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 builder,
                 entry,
                 &evaluations,
-                EdgeTarget::normal(terminal),
+                EdgeTarget::normal(writer_invoke.unwrap_or(terminal)),
                 scope,
                 stack,
             )
@@ -5455,46 +5612,72 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         scope: ScopeFrameId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), RubyLoweringError> {
-        let terminal = self.point(builder, node, Vec::new())?;
-        let mut modeled_load = false;
-        if let Some((object, index_node)) = self.element_parts(node) {
+        let object = required_field(node, "object")?;
+        let indices = ruby_element_arguments(node);
+        let mut evaluations = vec![object];
+        evaluations.extend(indices.iter().copied());
+        // A proven built-in container slot is the lookup itself. Any other
+        // receiver dispatches `[]` as an ordinary method call.
+        let Some((object, index_node)) = self.element_parts(node) else {
             let result =
                 self.expression_value(builder, node, expression_value_kind(self.source, node))?;
-            let base =
-                self.expression_value(builder, object, expression_value_kind(self.source, object))?;
-            let index = self.constant_index_value(builder, index_node)?;
-            modeled_load = index.is_some();
-            let location = self.session.add_memory_location(
+            let bracket =
+                ruby_callee_token(node).expect("an element reference writes its opening bracket");
+            let invoke = self.operator_syntax_call(
                 builder,
-                terminal,
-                MemoryLocationKind::Index {
-                    base,
-                    index,
-                    constant_index: None,
-                    identity: IndexedLocationIdentity::Element,
-                },
+                node,
+                bracket,
+                &indices,
+                Some(result),
+                next,
+                scope,
+                stack,
             )?;
-            if index.is_none() {
-                self.add_dynamic_index_gap(builder, terminal, location)?;
-            }
-            self.append_effect(
+            return self.schedule_expressions(
                 builder,
-                terminal,
-                SemanticEffect::MemoryLoad {
-                    kind: MemoryAccessKind::Index,
-                    location,
-                    result,
-                },
-            )?;
-        }
-        if !modeled_load {
-            self.session.record_gap(
+                entry,
+                &evaluations,
+                EdgeTarget::normal(invoke),
+                scope,
+                stack,
+            );
+        };
+        let terminal = self.point(builder, node, Vec::new())?;
+        let result =
+            self.expression_value(builder, node, expression_value_kind(self.source, node))?;
+        let base =
+            self.expression_value(builder, object, expression_value_kind(self.source, object))?;
+        let index = self.constant_index_value(builder, index_node)?;
+        let location = self.session.add_memory_location(
             builder,
             terminal,
-            SemanticGapSubject::Point,
-            SemanticCapability::Calls,
-            SemanticGapKind::Unsupported,
-            "Ruby element lookup dispatches through [] and is not emitted as a synthetic call site",
+            MemoryLocationKind::Index {
+                base,
+                index,
+                constant_index: None,
+                identity: IndexedLocationIdentity::Element,
+            },
+        )?;
+        if index.is_none() {
+            self.add_dynamic_index_gap(builder, terminal, location)?;
+        }
+        self.append_effect(
+            builder,
+            terminal,
+            SemanticEffect::MemoryLoad {
+                kind: MemoryAccessKind::Index,
+                location,
+                result,
+            },
+        )?;
+        if index.is_none() {
+            self.session.record_gap(
+                builder,
+                terminal,
+                SemanticGapSubject::Point,
+                SemanticCapability::Calls,
+                SemanticGapKind::Unsupported,
+                "Ruby element lookup dispatches through [] and is not emitted as a synthetic call site",
             )?;
             self.session.record_gap(
                 builder,
@@ -5506,11 +5689,6 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             )?;
         }
         self.session.add_target_edge(builder, terminal, next)?;
-        let object = required_field(node, "object")?;
-        let mut evaluations = vec![object];
-        evaluations.extend(named_children(node).into_iter().filter(|child| {
-            child.id() != object.id() && child.kind() != "block" && child.kind() != "do_block"
-        }));
         self.schedule_expressions(
             builder,
             entry,

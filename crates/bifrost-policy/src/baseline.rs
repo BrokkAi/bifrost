@@ -66,6 +66,11 @@ pub struct PolicyBaselinePolicyRecord {
 }
 
 impl PolicyBaselinePolicyRecord {
+    pub(crate) fn candidate_matches(&self, finding: &crate::PolicyFinding) -> bool {
+        self.policy_id() == finding.policy_id()
+            && self.finding_ids.binary_search(&finding.id()).is_ok()
+    }
+
     pub const fn policy_id(&self) -> &PolicyId {
         &self.policy_id
     }
@@ -156,6 +161,8 @@ impl PolicyBaselineDocument {
                 continue;
             }
             finding_ids.sort();
+            // Findings that share an id are accepted by that one id.
+            finding_ids.dedup();
             policies.push(PolicyBaselinePolicyRecord {
                 policy_id: run.policy_id().clone(),
                 policy_hash_at_acceptance: Some(AcceptedPolicyHash::from_bytes(

@@ -209,43 +209,6 @@ mod jvm_extraction_tests {
     }
 
     #[test]
-    fn writable_fallback_always_checks_interiors_and_mount_writes_fail() {
-        let fixture = crate::selection_fixture_support::JvmSelectionFixture::with_store(
-            AnalyzerStore::open_in_memory_single_connection().unwrap(),
-            1,
-            "java",
-            Language::Java,
-            false,
-            false,
-            None,
-        );
-        for _ in 0..2 {
-            let ready = fixture.open_ready(&[]);
-            assert!(!ready.connection().is_readonly(rusqlite::MAIN_DB).unwrap());
-            check_interior_count(&ready, 2);
-            check_interior_count(&ready, 2);
-            for sql in [
-                "UPDATE temp.selected_resolution_mounts SET interior_digest=zeroblob(32)",
-                "DELETE FROM temp.selected_resolution_mounts",
-                "INSERT INTO temp.selected_resolution_mounts SELECT * FROM temp.selected_resolution_mounts",
-            ] {
-                let error = ready
-                    .with_owned_temp_write(|conn| {
-                        conn.execute(sql, [])?;
-                        Ok(())
-                    })
-                    .unwrap_err();
-                assert!(
-                    error
-                        .to_string()
-                        .contains("selected resolution mounts are immutable while retained"),
-                    "{error}"
-                );
-            }
-        }
-    }
-
-    #[test]
     fn selected_inventory_handles_zero_one_and_page_boundaries() {
         for count in [0, 1, 256, 257] {
             let fixture = crate::selection_fixture_support::JvmSelectionFixture::with_language(
@@ -882,10 +845,9 @@ mod jvm_extraction_tests {
     }
     #[test]
     fn read_change_stamp_observes_schema_external_and_same_connection_changes() {
-        // The single-connection store retains the writable fallback; pooled
-        // readers permit TEMP writes but intentionally reject main writes.
+        // Pooled readers write TEMP; the writer performs main schema changes.
         let fixture = crate::selection_fixture_support::JvmSelectionFixture::with_store(
-            AnalyzerStore::open_in_memory_single_connection().unwrap(),
+            AnalyzerStore::open_ephemeral().unwrap(),
             1,
             "java",
             Language::Java,
@@ -914,7 +876,12 @@ mod jvm_extraction_tests {
             temp_schema.main_schema_version,
             original.main_schema_version
         );
-        conn.execute_batch("CREATE TABLE main.validation_probe(value INTEGER)")
+        fixture
+            .store
+            .conn
+            .execute(|writer| {
+                writer.execute_batch("CREATE TABLE main.validation_probe(value INTEGER)")
+            })
             .unwrap();
         let main_schema = ready.read_change_stamp().unwrap();
         assert_ne!(
@@ -925,7 +892,7 @@ mod jvm_extraction_tests {
             main_schema.temp_schema_version,
             temp_schema.temp_schema_version
         );
-        conn.execute("INSERT INTO main.validation_probe VALUES(1)", [])
+        conn.execute("INSERT INTO temp.validation_probe VALUES(1)", [])
             .unwrap();
         let same_connection = ready.read_change_stamp().unwrap();
         assert_eq!(
@@ -936,9 +903,17 @@ mod jvm_extraction_tests {
             same_connection.unowned_changes,
             main_schema.unowned_changes + 1
         );
-        let _fixture = brokk_bifrost_analysis::analyzer::store::sealed_families::Fixture::new(conn);
-        conn.execute_batch("VACUUM").unwrap();
-        drop(_fixture);
+        // VACUUM copies every table, sealed ones included, by INSERT; the
+        // writer's sealed-family authorizer admits that only in a fixture scope.
+        fixture
+            .store
+            .conn
+            .execute(|writer| {
+                let _fixture =
+                    brokk_bifrost_analysis::analyzer::store::sealed_families::Fixture::new(writer);
+                writer.execute_batch("VACUUM")
+            })
+            .unwrap();
         let vacuumed = ready.read_change_stamp().unwrap();
         assert_eq!(vacuumed.unowned_changes, same_connection.unowned_changes);
         assert_ne!(
@@ -996,7 +971,7 @@ mod jvm_extraction_tests {
         ));
 
         let writer_fixture = crate::selection_fixture_support::JvmSelectionFixture::with_store(
-            AnalyzerStore::open_in_memory_single_connection().unwrap(),
+            AnalyzerStore::open_ephemeral().unwrap(),
             257,
             "java",
             Language::Java,
@@ -1517,7 +1492,7 @@ mod jvm_extraction_tests {
         assert!(!ordinary.db_config(SQLITE_DBCONFIG_ENABLE_QPSG).unwrap());
     }
     #[test]
-    fn cleanup_failure_discards_pooled_reader_and_writer_fallback_fails_stop() {
+    fn cleanup_failure_discards_pooled_reader() {
         let fixture = crate::selection_fixture_support::JvmSelectionFixture::new(1);
         let ready = fixture.open_ready(&[]);
         ready
@@ -1552,16 +1527,6 @@ mod jvm_extraction_tests {
             .is_some();
         assert!(!table_exists, "failed cleanup connection returned to pool");
         drop(conn);
-
-        let fallback = AnalyzerStore::open_in_memory_single_connection().unwrap();
-        let panic = catch_unwind(AssertUnwindSafe(|| {
-            let mut conn = fallback.active_read_conn().unwrap();
-            conn.discard_before_checkin();
-        }));
-        assert!(
-            panic.is_err(),
-            "writer fallback must fail-stop on contamination"
-        );
     }
     #[test]
     fn selected_queries_are_context_first_keyed_and_sort_free() {
@@ -1916,7 +1881,7 @@ mod jvm_extraction_tests {
     #[test]
     fn named_manifest_counts_round_trip_in_family_order() {
         let fixture = crate::selection_fixture_support::JvmSelectionFixture::new(1);
-        let mut ready = fixture.open_ready(&[]);
+        let ready = fixture.open_ready(&[]);
         let expected = std::array::from_fn(|index| u64::try_from(index + 1).unwrap());
         let mut mount = ready.mounts().unwrap()[0].clone();
         mount.manifest_counts = ResolutionManifestCounts::from_array(expected);
@@ -1929,14 +1894,20 @@ mod jvm_extraction_tests {
             expected_transient_replacement_count: ready.expected_transient_replacement_count(),
         };
         // This test writes selection rows and needs a real SQLite transaction.
-        let tx = std::ops::DerefMut::deref_mut(&mut ready.conn)
-            .transaction()
-            .unwrap();
+        let tx = ready.connection().unchecked_transaction().unwrap();
         // This test deliberately replaces the selected mount rows.
         brokk_bifrost_analysis::analyzer::store::resolution_selection::drop_selected_mount_guards_for_test(&tx).unwrap();
         tx.execute("DELETE FROM temp.selected_resolution_mounts", [])
             .unwrap();
-        assert!(persist_selected_inventory(&tx, &staged, &CancellationToken::default()).unwrap());
+        assert!(
+            persist_selected_inventory(
+                &tx,
+                &staged,
+                &CancellationToken::default(),
+                &brokk_bifrost_core::retention_budget::RetentionBudget::for_test_capacity(0)
+            )
+            .unwrap()
+        );
         tx.commit().unwrap();
 
         let count_sql = format!(

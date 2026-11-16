@@ -1,6 +1,7 @@
 -- Impl headers read the same canonical target set as imports and exports.
 -- A conflicting prefix remains ambiguous even if its endpoints later converge.
-INSERT OR IGNORE INTO cr_impl_bindings
+INSERT INTO cr_impl_bindings
+SELECT * FROM (
 WITH candidates AS (
  SELECT source.blob_id,source.relation_key,source.module_path,
  target.target_crate_key,target.target_module_path,target.target_name
@@ -25,4 +26,5 @@ WITH candidates AS (
  target.target_crate_key,target.target_module_path,target.target_name
 )
 SELECT blob_id,relation_key,module_path,'{side}',target_crate_key,target_module_path,target_name
-FROM candidates GROUP BY blob_id,relation_key,module_path HAVING COUNT(*)=1;
+FROM candidates GROUP BY blob_id,relation_key,module_path HAVING COUNT(*)=1
+) WHERE true ON CONFLICT DO NOTHING;

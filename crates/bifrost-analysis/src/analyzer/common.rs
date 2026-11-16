@@ -125,6 +125,33 @@ pub fn complete_query_cache_cell<T: Clone + Send + Sync + 'static>(
     }
 }
 
+/// The success type carries its admission witness. Failed attempts and their
+/// evidence live only in the current wave; the cell never contains a failure.
+pub(crate) fn admitted_query_cache_cell<T, E>(
+    analyzer: &dyn IAnalyzer,
+    cell: &QueryCacheCell<T>,
+    build: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E>
+where
+    T: Clone + Send + Sync + 'static,
+    E: Clone + Send + Sync + 'static,
+{
+    if let Some(value) = cell.get() {
+        return Ok(value.clone());
+    }
+    let attempt = cell.attempts.get_or_try_build_wave_inline(|| {
+        let (result, receipt) = capture_query_cache_build(analyzer, build);
+        result.map_err(|value| FailedQueryCacheBuild {
+            value: Arc::new(value),
+            receipt,
+        })
+    });
+    match attempt {
+        Ok(value) => Ok(cell.value.get_or_init(|| value.as_ref().clone()).clone()),
+        Err(failure) => Err(replay_failed_query_cache_build(failure).as_ref().clone()),
+    }
+}
+
 /// Complete-only publication for an immutable owned cache result.
 #[doc(hidden)]
 pub fn complete_query_cache_arc_cell<T: Send + Sync + 'static>(
@@ -152,8 +179,19 @@ impl<T> ReplayableQueryCacheValue<T> {
         }
     }
 
+    /// Stop evidence participates in the authority digest, including on a
+    /// refused operational fill. The receipt owns and accounts for the data.
+    pub fn incomplete_reasons(&self) -> &[crate::analyzer::QueryReadIncomplete] {
+        &self.receipt.reasons
+    }
+
     pub fn retained_receipt_bytes(&self) -> usize {
         self.receipt.retained_bytes()
+    }
+
+    /// The receipt's bytes as allocated, for pure evictable caches.
+    pub fn allocated_receipt_bytes(&self) -> usize {
+        self.receipt.allocated_bytes()
     }
 
     /// The retained answer without replaying its receipt, for retention
@@ -169,6 +207,7 @@ impl<T> ReplayableQueryCacheValue<T> {
 }
 
 impl QueryCacheBuildReceipt {
+    /// Raw: compared with `MAX_REPLAYABLE_RECEIPT_BYTES`, unchanged until the R follow-up.
     fn retained_bytes(&self) -> usize {
         let mut heap = crate::analyzer::store::cache_budget::RetainedHeap::default();
         heap.slice(&self.keys);
@@ -180,20 +219,25 @@ impl QueryCacheBuildReceipt {
             + self
                 .reasons
                 .iter()
-                .map(|reason| {
-                    std::mem::size_of_val(reason)
-                        + match reason {
-                            crate::analyzer::QueryReadIncomplete::ArtifactUnavailable(text)
-                            | crate::analyzer::QueryReadIncomplete::SemanticEvidenceGap(text)
-                            | crate::analyzer::QueryReadIncomplete::SemanticEvidenceUnavailable(
-                                text,
-                            ) => text.len(),
-                            crate::analyzer::QueryReadIncomplete::StructureUnavailable(file) => {
-                                file.to_string().len()
-                            }
-                            _ => 0,
-                        }
-                })
+                .map(|reason| std::mem::size_of_val(reason) + reason.retained_payload_bytes())
+                .sum::<usize>()
+    }
+}
+
+impl QueryCacheBuildReceipt {
+    /// Allocated: the region charge.
+    fn allocated_bytes(&self) -> usize {
+        let mut heap = crate::analyzer::store::cache_budget::RetainedHeap::allocated();
+        heap.slice(&self.keys);
+        for key in self.keys.iter() {
+            crate::analyzer::store::cache_budget::retained_read_key(&mut heap, key);
+        }
+        std::mem::size_of::<QueryCacheBuildReceipt>()
+            + heap.total()
+            + self
+                .reasons
+                .iter()
+                .map(|reason| std::mem::size_of_val(reason) + reason.allocated_payload_bytes())
                 .sum::<usize>()
     }
 }
@@ -297,6 +341,17 @@ impl QueryCacheBuildReceipt {
         &self.reasons
     }
 
+    /// Whether the build recorded a store failure. Such a build's product is
+    /// handed to no other consumer, concurrent waiters included (#11534).
+    pub fn store_failed(&self) -> bool {
+        self.reasons.iter().any(|reason| {
+            matches!(
+                reason.base_cause(),
+                crate::analyzer::QueryReadIncomplete::StoreFailure(_)
+            )
+        })
+    }
+
     pub fn has_execution_dependences(&self) -> bool {
         self.channels.execution_dependences > 0
             || self
@@ -318,19 +373,17 @@ impl QueryCacheBuildReceipt {
         if self.runtime_cache_touched {
             crate::analyzer::i_analyzer::record_runtime_cache_touch_on_current_contexts();
         }
-        replay_query_cache_stable_reasons(&self.reasons);
+        replay_captured_query_read_incompleteness(&self.reasons);
         crate::analyzer::i_analyzer::replay_query_read_receipt_on_current_contexts(
             &self.keys,
-            self.channels.unattributed_reads,
-            self.channels.execution_dependences,
-            self.channels.budget_dependences,
-            self.channels.reuse_refused,
-            self.channels.persistence_refusals,
+            self.channels,
         );
     }
 }
 
-pub fn replay_query_cache_stable_reasons(reasons: &[crate::analyzer::QueryReadIncomplete]) {
+/// Record each reason on the current thread's query contexts, with the store
+/// error routing and verdict joins of a live recording. Replays every variant.
+pub fn replay_query_read_incompleteness(reasons: &[crate::analyzer::QueryReadIncomplete]) {
     for reason in reasons {
         match reason {
             crate::analyzer::QueryReadIncomplete::StoreFailure(error) => {
@@ -339,6 +392,21 @@ pub fn replay_query_cache_stable_reasons(reasons: &[crate::analyzer::QueryReadIn
             reason => crate::analyzer::i_analyzer::record_query_incomplete_on_current_contexts(
                 reason.clone(),
             ),
+        }
+    }
+}
+
+/// Completion replay for a receipt that also restores its captured channels.
+/// Reason-only receipts keep using replay_query_read_incompleteness.
+pub(crate) fn replay_captured_query_read_incompleteness(
+    reasons: &[crate::analyzer::QueryReadIncomplete],
+) {
+    for reason in reasons {
+        match reason {
+            crate::analyzer::QueryReadIncomplete::StoreFailure(error) => {
+                crate::analyzer::i_analyzer::replay_captured_store_error(error.clone())
+            }
+            reason => crate::analyzer::i_analyzer::replay_captured_query_incomplete(reason.clone()),
         }
     }
 }
@@ -510,7 +578,7 @@ pub fn replayable_query_cache_fill<T>(
                 line!()
             )
         });
-        analyzer.mark_execution_dependent();
+        crate::analyzer::i_analyzer::join_execution_dependence(analyzer);
         Err(value)
     } else {
         Ok(value)
@@ -669,7 +737,8 @@ pub fn replayable_descendant_fill<T>(
     scope: &brokk_bifrost_core::analyzer::capabilities::DescendantIndexScope<'_>,
     build: impl FnOnce() -> Option<T>,
 ) -> Result<ReplayableQueryCacheValue<Option<T>>, ReplayableQueryCacheValue<Option<T>>> {
-    replayable_optional_query_cache_value(analyzer, || {
+    let generation = analyzer.project().analysis_generation();
+    let result = replayable_query_cache_value(analyzer, || {
         let value = build();
         if scope.cancellation().is_cancelled() {
             analyzer.record_query_incomplete(
@@ -677,7 +746,38 @@ pub fn replayable_descendant_fill<T>(
             );
         }
         value
-    })
+    });
+    let (mut entry, admitted) = match result {
+        Ok(entry) => (entry, true),
+        Err(entry) => (entry, false),
+    };
+    use crate::analyzer::read_ledger::DerivationExecutionCause;
+    // Every consumer, including JS/TS's direct receipt replay, must reject
+    // invalidated products. A per-class Provider/Budget stop can keep its
+    // proven edges, but a failed store read or whole-snapshot change cannot.
+    let invalid = analyzer.project().analysis_generation() != generation
+        || scope.cancellation().is_cancelled()
+        || entry.receipt.store_failed()
+        || entry.receipt.reasons.iter().any(|reason| {
+            matches!(
+                reason.execution_cause(),
+                Some(DerivationExecutionCause::Snapshot | DerivationExecutionCause::Cancelled)
+            )
+        });
+    if invalid {
+        entry.value = None;
+    } else if entry.value.is_none() && entry.receipt.is_complete() {
+        debug_assert!(
+            false,
+            "descendant memo fill returned None without incomplete evidence"
+        );
+        return Err(entry);
+    }
+    if admitted && !invalid {
+        Ok(entry)
+    } else {
+        Err(entry)
+    }
 }
 
 /// Read a descendant memo, replaying stable refused-fill causes and receipts.
@@ -696,7 +796,7 @@ pub fn complete_descendant_query(
     use brokk_bifrost_core::analyzer::capabilities::{
         Cancelled, HierarchyAnswer, HierarchyOpenReason,
     };
-    let descendants = if scope.cancellation().is_cancelled() {
+    let answer = if scope.cancellation().is_cancelled() {
         None
     } else {
         let entry = if let Some(entry) = memo.get(&scope.variant()) {
@@ -712,14 +812,13 @@ pub fn complete_descendant_query(
                 Err(entry) => Arc::new(entry),
             }
         };
-        if !entry.receipt.is_complete() || analyzer.current_query_read_completion().is_err() {
-            None
-        } else {
-            entry
-                .value
-                .as_ref()
-                .map(|index| index.descendants(code_unit))
-        }
+        // The receipt decides retention, not availability. A stopped class
+        // contributes positive edges and an unbounded open candidate (#12288).
+        // Operational fills serve this request and are never inserted above.
+        entry.value.as_ref().and_then(|index| {
+            (entry.receipt.is_complete() || !index.open_candidates().is_empty())
+                .then(|| index.answer(code_unit))
+        })
     };
     if scope.cancellation().is_cancelled() {
         analyzer
@@ -727,17 +826,27 @@ pub fn complete_descendant_query(
         analyzer.record_unattributed_read();
         return Err(Cancelled);
     }
-    if let Some(descendants) = descendants {
-        record_complete(&descendants);
-        let mut edges: Vec<_> = descendants.into_iter().collect();
-        edges.sort();
-        Ok(HierarchyAnswer::complete(edges))
-    } else {
-        crate::analyzer::record_descendant_query_failure(analyzer);
-        Ok(HierarchyAnswer {
-            open: vec![HierarchyOpenReason::DescendantIndexUnavailable],
-            ..HierarchyAnswer::default()
-        })
+    match answer {
+        Some(answer) if answer.is_complete() => {
+            record_complete(&answer.edges.iter().cloned().collect());
+            Ok(answer)
+        }
+        // Definite edges stand and the answer carries its open candidates, so
+        // the query is not marked incomplete here: the next lookup of a
+        // transitive walk must still read its definite row. Consumers that
+        // cannot use an open answer record the failure themselves. The
+        // unattributed read keeps the unit from being retained as bounded.
+        Some(answer) => {
+            analyzer.record_unattributed_read();
+            Ok(answer)
+        }
+        None => {
+            crate::analyzer::record_descendant_query_failure(analyzer);
+            Ok(HierarchyAnswer {
+                open: vec![HierarchyOpenReason::DescendantIndexUnavailable],
+                ..HierarchyAnswer::complete(Vec::new())
+            })
+        }
     }
 }
 
@@ -783,7 +892,7 @@ impl<'a> QueryCacheFill<'a> {
             .active_query_cancellation()
             .is_some_and(|token| token.is_cancelled());
         if snapshot_changed || cancelled {
-            self.analyzer.mark_execution_dependent();
+            crate::analyzer::i_analyzer::join_execution_dependence(self.analyzer);
         }
         let completion = self
             .scope
@@ -1577,7 +1686,26 @@ pub fn external_index_incompleteness(
     diagnostic: &crate::analyzer::semantic_model::ProducerDiagnostic,
 ) -> crate::analyzer::QueryReadIncomplete {
     use crate::analyzer::QueryReadIncomplete;
-    let detail = format!("{}: {}", diagnostic.code, diagnostic.message).into_boxed_str();
+    // Only this closed vocabulary belongs in the compact summary. Unknown
+    // producer codes can contain arbitrary input and remain in the detail.
+    let code = match diagnostic.code.as_str() {
+        code @ ("artifact.kind"
+        | "artifact.role"
+        | "artifact.count"
+        | "artifact.cancelled"
+        | "csharp.metadata.invalid"
+        | "csharp.assembly_identity"
+        | "csharp.metadata.export_omitted") => code,
+        _ => "unrecognized",
+    };
+    let detail = brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+        format_args!("{}: {}", diagnostic.code, diagnostic.message),
+        format_args!(
+            "external index input is incomplete; producer_code={code}; detail_kind=ProducerDiagnostic"
+        ),
+        std::iter::once((&diagnostic.code, &diagnostic.message)),
+    )
+    .into_boxed_str();
     match diagnostic.code.as_str() {
         "artifact.kind"
         | "artifact.role"
@@ -1596,6 +1724,66 @@ mod tests {
     use crate::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
     use crate::analyzer::{CodeUnit, CodeUnitType, Language, ProjectFile};
     use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12527: overflowing external diagnostics lost distinct recognized producer codes"
+    )]
+    fn external_index_overflow_preserves_recognized_producer_codes() {
+        use crate::analyzer::QueryReadIncomplete;
+        use crate::analyzer::semantic_model::{ProducerDiagnostic, ProducerDiagnosticSeverity};
+        let mut overflow = std::collections::BTreeSet::new();
+        for code in [
+            "artifact.kind",
+            "artifact.role",
+            "artifact.count",
+            "csharp.metadata.invalid",
+            "csharp.assembly_identity",
+            "csharp.metadata.export_omitted",
+        ] {
+            let fitting = ProducerDiagnostic {
+                severity: ProducerDiagnosticSeverity::Warning,
+                code: code.into(),
+                location: None,
+                source_entry: None,
+                declaration: None,
+                message: "fits".into(),
+            };
+            assert_eq!(
+                super::external_index_incompleteness(&fitting),
+                QueryReadIncomplete::ArtifactUnavailable(format!("{code}: fits").into_boxed_str())
+            );
+            let huge = ProducerDiagnostic {
+                message: "x".repeat(10_000),
+                ..fitting
+            };
+            let QueryReadIncomplete::ArtifactUnavailable(text) =
+                super::external_index_incompleteness(&huge)
+            else {
+                panic!("preserve artifact classification")
+            };
+            assert!(text.len() <= brokk_bifrost_core::bounded_output::MAX_DIAGNOSTIC_MESSAGE_BYTES);
+            assert!(text.contains(&format!("producer_code={code};")));
+            assert!(text.ends_with("omitted_items=1"));
+            assert!(overflow.insert(text), "distinct codes must not deduplicate");
+        }
+        let arbitrary = ProducerDiagnostic {
+            severity: ProducerDiagnosticSeverity::Warning,
+            code: "input".repeat(10_000),
+            location: None,
+            source_entry: None,
+            declaration: None,
+            message: "x".repeat(10_000),
+        };
+        let QueryReadIncomplete::SemanticEvidenceUnavailable(text) =
+            super::external_index_incompleteness(&arbitrary)
+        else {
+            panic!("preserve unknown-code classification")
+        };
+        assert!(text.len() <= brokk_bifrost_core::bounded_output::MAX_DIAGNOSTIC_MESSAGE_BYTES);
+        assert!(text.contains("producer_code=unrecognized;"));
+        assert!(text.ends_with("omitted_items=1"));
+    }
 
     #[test]
     fn query_cell_hit_replays_another_units_runtime_cache_touch() {
@@ -1625,6 +1813,137 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11145: replayable fills must reject operational proof stops under advisory capture"
+    )]
+    fn replayable_fill_rejects_operational_proof_stops() {
+        use crate::analyzer::read_ledger::DerivationExecutionCause;
+        use crate::analyzer::{AnalyzerQueryScope, QueryReadIncomplete};
+        let root = tempfile::tempdir().unwrap();
+        let analyzer = crate::analyzer::workspace::EmptyAnalyzer::new(std::sync::Arc::new(
+            crate::analyzer::TestProject::new(root.path(), crate::analyzer::Language::Rust),
+        ));
+        let _scope = AnalyzerQueryScope::for_advisory_read(&analyzer);
+        for cause in [
+            DerivationExecutionCause::Cancelled,
+            DerivationExecutionCause::Budget,
+            DerivationExecutionCause::Snapshot,
+            DerivationExecutionCause::Provider,
+        ] {
+            assert_eq!(
+                super::replayable_query_cache_fill(&analyzer, || {
+                    crate::analyzer::i_analyzer::record_query_incomplete_on_current_contexts(
+                        QueryReadIncomplete::ProofStopped {
+                            reason: "test_stop",
+                            cause: Some(cause),
+                        },
+                    );
+                    17
+                }),
+                Err(17)
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#12288: JS/TS replayed invalid descendant values after store failure or snapshot change"
+    )]
+    fn descendant_fill_rejects_invalid_values_before_any_consumer_replays() {
+        use crate::analyzer::read_ledger::DerivationExecutionCause;
+        use crate::analyzer::store::StoreError;
+        use crate::analyzer::{OverlayProject, QueryReadIncomplete, TestProject};
+        use brokk_bifrost_core::analyzer::capabilities::DescendantIndexScope;
+        use std::sync::Arc;
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("model.ts"), "class Base {}\n").unwrap();
+        let project = Arc::new(OverlayProject::new(Arc::new(TestProject::new(
+            root.path(),
+            Language::TypeScript,
+        ))));
+        let analyzer = crate::analyzer::workspace::EmptyAnalyzer::new(project.clone());
+        let cancellation = crate::CancellationToken::new();
+        let scope = DescendantIndexScope::whole_workspace(&cancellation);
+
+        let failure =
+            QueryReadIncomplete::StoreFailure(StoreError::new("descendant store read failed"));
+        let attributed =
+            failure
+                .clone()
+                .attributed(crate::analyzer::i_analyzer::QueryLookupProvenance {
+                    file: ProjectFile::new(root.path(), "model.ts"),
+                    byte_span: 0..4,
+                    name: "Base".into(),
+                    tier: "test",
+                });
+        for reason in [failure, attributed] {
+            let failed = super::replayable_descendant_fill(&analyzer, &scope, || {
+                crate::analyzer::i_analyzer::record_query_incomplete_on_current_contexts(reason);
+                Some(1)
+            })
+            .unwrap_err();
+            assert!(
+                failed.replay().is_none(),
+                "direct JS/TS consumers must see no failed-store value"
+            );
+            assert!(failed.receipt.store_failed());
+        }
+
+        let changed = super::replayable_descendant_fill(&analyzer, &scope, || {
+            assert!(project.set(root.path().join("model.ts"), "class Changed {}\n".into()));
+            Some(2)
+        })
+        .unwrap_err();
+        assert!(
+            changed.replay().is_none(),
+            "a changed generation invalidates the whole value"
+        );
+
+        for cause in [
+            DerivationExecutionCause::Cancelled,
+            DerivationExecutionCause::Snapshot,
+        ] {
+            let stopped = super::replayable_descendant_fill(&analyzer, &scope, || {
+                crate::analyzer::i_analyzer::record_query_incomplete_on_current_contexts(
+                    QueryReadIncomplete::ProofStopped {
+                        reason: "test_stop",
+                        cause: Some(cause),
+                    },
+                );
+                Some(3)
+            })
+            .unwrap_err();
+            assert!(
+                stopped.replay().is_none(),
+                "whole-operation cause {cause:?}"
+            );
+        }
+        for cause in [
+            Some(DerivationExecutionCause::Provider),
+            Some(DerivationExecutionCause::Budget),
+            None,
+        ] {
+            let partial = super::replayable_descendant_fill(&analyzer, &scope, || {
+                crate::analyzer::i_analyzer::record_query_incomplete_on_current_contexts(
+                    QueryReadIncomplete::ProofStopped {
+                        reason: "test_stop",
+                        cause,
+                    },
+                );
+                Some(4)
+            })
+            .unwrap_err();
+            assert_eq!(*partial.replay(), Some(4), "class-local cause {cause:?}");
+        }
+        let clean = super::replayable_descendant_fill(&analyzer, &scope, || Some(5)).unwrap();
+        assert_eq!(*clean.replay(), Some(5));
+        // The scalar stands in for the opaque value JS/TS replay directly;
+        // this test pins the shared receipt boundary, not hierarchy inference.
+    }
+
+    #[test]
+    #[hardwon("#10984: attributed receipt admission omitted the Arc allocation counters")]
     fn replayable_receipt_admission_caps_bytes_and_keeps_unattributed_reads() {
         use super::{QueryCacheBuildReceipt, replayable_receipt_admitted};
         use crate::analyzer::QueryReadIncomplete;
@@ -1653,6 +1972,54 @@ mod tests {
             1,
             "refusal must not truncate evidence"
         );
+
+        use crate::analyzer::i_analyzer::QueryLookupProvenance;
+        use std::mem::{size_of, size_of_val};
+
+        let lookup = QueryLookupProvenance {
+            file: ProjectFile::new(std::env::current_dir().unwrap(), "Lookup.java"),
+            byte_span: 12..19,
+            name: "Missing".into(),
+            tier: "same-package",
+        };
+        let empty = QueryReadIncomplete::SemanticEvidenceGap("".into()).attributed(lookup.clone());
+        let QueryReadIncomplete::Attributed(payload) = &empty else {
+            unreachable!("test constructed an attributed reason")
+        };
+        let owned_lookup = empty.lookup_provenance().unwrap();
+        // This is the raw replay-admission boundary, independent of the
+        // allocated cache charge. Arc's two raw counters remain unchanged.
+        let arc_header = 2 * size_of::<usize>();
+        assert!(arc_header > 0);
+        assert!(receipt.keys.is_empty());
+        let payload_only_fixed = size_of::<QueryCacheBuildReceipt>()
+            + size_of::<QueryReadIncomplete>()
+            + size_of_val(payload.as_ref())
+            + owned_lookup.file.retained_heap_bytes()
+            + owned_lookup.name.len();
+        let padding = super::MAX_REPLAYABLE_RECEIPT_BYTES - payload_only_fixed;
+        // The complete requested layout fits exactly at the cap in this control.
+        receipt.reasons = vec![
+            QueryReadIncomplete::SemanticEvidenceGap("x".repeat(padding - arc_header).into())
+                .attributed(lookup.clone()),
+        ];
+        assert_eq!(
+            receipt.retained_bytes(),
+            super::MAX_REPLAYABLE_RECEIPT_BYTES
+        );
+        assert!(replayable_receipt_admitted(&receipt));
+
+        // Payload-only accounting would fit exactly, but both Arc counters
+        // put this complete reason over the cap. Refusal must keep it intact.
+        let oversized =
+            QueryReadIncomplete::SemanticEvidenceGap("x".repeat(padding).into()).attributed(lookup);
+        receipt.reasons = vec![oversized.clone()];
+        assert_eq!(
+            receipt.retained_bytes(),
+            super::MAX_REPLAYABLE_RECEIPT_BYTES + arc_header,
+        );
+        assert!(!replayable_receipt_admitted(&receipt));
+        assert_eq!(receipt.reasons.as_slice(), std::slice::from_ref(&oversized));
     }
 
     #[test]

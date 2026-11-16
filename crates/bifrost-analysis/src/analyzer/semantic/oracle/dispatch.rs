@@ -129,6 +129,83 @@ pub struct DispatchBoundary {
 }
 
 impl DispatchBoundary {
+    /// Sufficient borrowed content correspondence; grants no admission authority.
+    /// Executable handles retain their exact artifact and interpretation equality.
+    #[doc(hidden)]
+    fn has_same_content_by(
+        &self,
+        other: &Self,
+        same_relation: &impl Fn(&OracleRelationHandle, &OracleRelationHandle) -> bool,
+    ) -> bool {
+        let Self {
+            kind: l_kind,
+            external_callee_identity: l_external_callee_identity,
+            exact_external_target: l_exact_external_target,
+            unmaterialized_external_target: l_unmaterialized_external_target,
+            proof: l_proof,
+            completeness: l_completeness,
+            partial_cause: l_partial_cause,
+            provenance: l_provenance,
+        } = self;
+        let Self {
+            kind: r_kind,
+            external_callee_identity: r_external_callee_identity,
+            exact_external_target: r_exact_external_target,
+            unmaterialized_external_target: r_unmaterialized_external_target,
+            proof: r_proof,
+            completeness: r_completeness,
+            partial_cause: r_partial_cause,
+            provenance: r_provenance,
+        } = other;
+
+        l_kind == r_kind
+            && l_external_callee_identity == r_external_callee_identity
+            && l_exact_external_target == r_exact_external_target
+            && l_unmaterialized_external_target == r_unmaterialized_external_target
+            && l_proof == r_proof
+            && l_completeness == r_completeness
+            && l_partial_cause == r_partial_cause
+            && l_provenance.len() == r_provenance.len()
+            && l_provenance
+                .iter()
+                .zip(r_provenance.iter())
+                .all(|(a, b)| same_relation(a, b))
+    }
+}
+
+impl DispatchBoundary {
+    /// Owned metadata only; the caller accounts for this inline boundary.
+    #[doc(hidden)]
+    pub fn retained_artifacts(
+        &self,
+        census: &mut impl crate::analyzer::semantic::service::ArtifactRetentionVisitor,
+    ) {
+        if let Some(locator) = self.target_locator() {
+            census.locator(locator);
+        }
+        if let Some(identity) = &self.external_callee_identity {
+            census.owned_slice(identity.owner_fqn.as_bytes());
+            census.owned_slice(identity.member.as_bytes());
+        }
+        if let Some(target) = &self.exact_external_target {
+            target.retained_artifacts(census);
+        }
+        if let Some(target) = &self.unmaterialized_external_target {
+            target.retained_heap(census);
+        }
+        if let ProofStatus::Unproven(reason) = &self.proof {
+            census.owned_slice(reason.as_bytes());
+        }
+        if let EvidenceCompleteness::Partial(reason) = &self.completeness {
+            census.owned_slice(reason.as_bytes());
+        }
+        if census.owned_slice(&self.provenance) {
+            for relation in &self.provenance {
+                relation.retained_artifacts(census);
+            }
+        }
+    }
+
     #[doc(hidden)]
     pub fn target_locator(&self) -> Option<&SemanticLocator> {
         self.kind.target_locator()
@@ -308,6 +385,74 @@ pub struct DispatchResult {
 }
 
 impl DispatchResult {
+    /// Sufficient borrowed content correspondence; grants no admission authority.
+    /// Executable handles retain their exact artifact and interpretation equality.
+    #[doc(hidden)]
+    pub fn has_same_content(&self, other: &Self) -> bool {
+        let Self {
+            candidates: l_candidates,
+            boundaries: l_boundaries,
+            coverage: l_coverage,
+            complete_receiver_hint_refinable: l_complete_receiver_hint_refinable,
+            resolver_proved_no_callee: l_resolver_proved_no_callee,
+            returned_callable: l_returned_callable,
+            argument_callable: l_argument_callable,
+            stable_package_values: l_stable_package_values,
+            member_field_anchor: l_member_field_anchor,
+            member_receiver_preparation: l_member_receiver_preparation,
+        } = self;
+        let Self {
+            candidates: r_candidates,
+            boundaries: r_boundaries,
+            coverage: r_coverage,
+            complete_receiver_hint_refinable: r_complete_receiver_hint_refinable,
+            resolver_proved_no_callee: r_resolver_proved_no_callee,
+            returned_callable: r_returned_callable,
+            argument_callable: r_argument_callable,
+            stable_package_values: r_stable_package_values,
+            member_field_anchor: r_member_field_anchor,
+            member_receiver_preparation: r_member_receiver_preparation,
+        } = other;
+        let left = self.first_provenance();
+        let right = other.first_provenance();
+        if !match (left, right) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.has_same_arena_content(b),
+            _ => false,
+        } {
+            return false;
+        }
+        let same_relation = |a: &OracleRelationHandle, b: &OracleRelationHandle| match (left, right)
+        {
+            (Some(l), Some(r)) => a.same_arena(l) && b.same_arena(r) && a.id() == b.id(),
+            _ => false,
+        };
+        l_candidates.len() == r_candidates.len()
+            && l_candidates
+                .iter()
+                .zip(r_candidates.iter())
+                .all(|(a, b)| a.has_same_content_by(b, &same_relation))
+            && l_boundaries.len() == r_boundaries.len()
+            && l_boundaries
+                .iter()
+                .zip(r_boundaries.iter())
+                .all(|(a, b)| a.has_same_content_by(b, &same_relation))
+            && l_coverage == r_coverage
+            && l_complete_receiver_hint_refinable == r_complete_receiver_hint_refinable
+            && l_resolver_proved_no_callee == r_resolver_proved_no_callee
+            && l_returned_callable == r_returned_callable
+            && match (l_argument_callable, r_argument_callable) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a.has_same_content(b),
+                _ => false,
+            }
+            && l_stable_package_values == r_stable_package_values
+            && l_member_field_anchor == r_member_field_anchor
+            && l_member_receiver_preparation == r_member_receiver_preparation
+    }
+}
+
+impl DispatchResult {
     /// Publish a dispatch answer only after every retained arm has resolvable,
     /// call-scoped provenance from one finite relation arena.
     pub fn new(
@@ -410,28 +555,40 @@ impl DispatchResult {
         Ok(result)
     }
 
+    /// Visit this borrowed payload's owned children; its enclosing owner pays
+    /// the inline DispatchResult storage.
     #[doc(hidden)]
     pub fn retained_artifacts(
         &self,
-        census: &mut crate::analyzer::semantic::service::ArtifactRetentionCensus,
+        census: &mut impl crate::analyzer::semantic::service::ArtifactRetentionVisitor,
     ) {
-        for candidate in self.candidates() {
-            candidate.retained_artifacts(census);
-        }
-        for boundary in self.boundaries() {
-            for relation in boundary.provenance.iter() {
-                relation.retained_artifacts(census);
+        if census.owned_slice(&self.candidates) {
+            for candidate in self.candidates() {
+                candidate.retained_artifacts(census);
             }
         }
-        if let Some(returned) = self.returned_callable() {
+        if census.owned_slice(&self.boundaries) {
+            for boundary in self.boundaries() {
+                boundary.retained_artifacts(census);
+            }
+        }
+        if let Some(returned) = self.returned_callable.as_deref()
+            && census.owned_box(returned)
+        {
             returned.retained_artifacts(census);
         }
-        if let Some(argument) = self.argument_callable() {
+        if let Some(argument) = self.argument_callable.as_deref()
+            && census.owned_box(argument)
+        {
             argument.retained_artifacts(census);
         }
-        for value in self.stable_package_values() {
-            census.procedure(value.initializer());
+        if census.owned_slice(&self.stable_package_values) {
+            for value in self.stable_package_values() {
+                value.retained_artifacts(census);
+            }
         }
+        // member_field_anchor and member_receiver_preparation are inline IDs
+        // and a payload-free enum; coverage and the refinement flags are inline.
     }
 
     pub fn candidates(&self) -> &[DispatchCandidate] {
@@ -657,6 +814,14 @@ impl DispatchResult {
 
     pub fn validate_for_call(&self, call: &CallSiteHandle) -> Result<(), OracleContractError> {
         self.validate_provenance_for_call(call, true)
+    }
+
+    /// Borrow this result's own provenance arena anchor, if it has relations.
+    /// This identifies an owned arena only; it grants no content correspondence
+    /// or admission authority for another result or a resealed candidate.
+    #[doc(hidden)]
+    pub fn relation_anchor(&self) -> Option<&OracleRelationHandle> {
+        self.first_provenance()
     }
 
     fn first_provenance(&self) -> Option<&OracleRelationHandle> {

@@ -363,9 +363,12 @@ pub enum ExternalMemberFamilyStatus {
 /// Exact workspace declarations that can implement or override one external
 /// JVM member.
 ///
-/// Only `Complete` carries candidates. Every other status preserves a
-/// targetless dispatch boundary and publishes no partial candidate set as an
-/// exhaustive answer.
+/// `Complete` candidates are every workspace implementation. An
+/// `Incomplete(ExternalRootUnresolved)` answer may also carry candidates: the
+/// overrides a walk proved before a supertype nothing resolves left the family
+/// open (#10497). Consumers keep them as possible targets, and the open status
+/// keeps a targetless dispatch boundary, so no partial set is published as an
+/// exhaustive answer. Every other status carries no candidates.
 #[derive(Debug, Clone)]
 pub struct ExternalMemberFamilyAnswer {
     pub status: ExternalMemberFamilyStatus,

@@ -81,9 +81,24 @@ projection rows. Cargo manifests and Cargo configuration files
 (`.cargo/config.toml`) retain their exact bytes independently of parsed source
 facts, so an older revision remains interpretable after reopening the cache.
 Changing either advances the workspace revision without replacing unchanged
-source publications. Cargo interpretation, including the cfg set and patches a
-configuration file selects, is derived from those selected bytes; parsed
-manifest and configuration tables are not a second durable authority.
+source publications. Cargo acquisition also observes ancestor and Cargo-home
+configuration and contained includes. It records one immutable
+`bifrost.acquired-cargo-config.v2` input set in the existing dependency-evidence
+tables, outside selected dependency declarations. That set contains typed
+per-manifest facts, completeness, logical input identities and references to
+selected local configuration snapshots; it does not retain external TOML or
+home paths. Parsed configuration documents remain request-local.
+
+Cargo interpretation, including cfg, source replacement, build targets and
+stdlib build mode, consumes this acquired input set. Its digest binds derived
+dependency evidence and crate reconciliation. External input receipts are
+revalidated at admission, including an otherwise empty incremental update;
+changed inputs withdraw reconciliation and feature projections even when the
+repository revision is unchanged. Relative Cargo-home settings bind the process
+working directory as well; only its hash enters the durable acquired record. Incomplete acquisition cannot certify absent
+settings. The selected local bytes and acquired input set remain the durable
+authorities; parsed manifest and configuration tables are not another source
+of truth.
 
 A live source that source admission refuses (a binary file, an overlong
 structural line, a budget refusal) is never a selected source row. The revision
@@ -134,6 +149,23 @@ demand-scoped revalidation. Changed output recomputes demanded parents, while
 equal output only rebinds evidence; incomplete, corrupt, cancelled, or
 over-budget reuse falls back to a fresh witness-capable solve.
 
+#### Required process memory
+
+Independent services in one process can have separate retention allowances. Each
+allowance accounts for the same shared required storage when deciding how much
+optional data it can keep. Interned names have one process account, preserving
+their IDs across workspace changes. Local retained bytes and shared required
+bytes are reported separately; summing service totals would count the shared
+storage more than once.
+
+A service settles newly grown required storage when it next admits a retained
+value or explicitly settles its budget. Required storage can exceed the
+allowance. The service then releases optional entries and returns newly
+computed values without retaining them; indexing and queries continue.
+Caller-held allocations remain accounted until their last holder releases
+them. Request working memory and allocator overhead remain separate from the
+retained-allocation allowance.
+
 #### Reads of stored semantic IR publications
 
 A per-file semantic IR publication is the atomic unit that a reader consumes:
@@ -172,6 +204,11 @@ therefore misses. An old artifact can never be returned with a new receipt.
 Only an artifact lowered from source after a refused read uses the fixed
 "refused" provenance. Reusing it records no receipt and marks the product's
 reuse as refused again.
+
+Guarded semantic-IR alternatives use separate tables, not additional rows in
+the shared base tables. They are published and sealed with the base head, and
+deleting that head removes the guarded rows in the same transaction. Blob
+garbage collection reclaims them with the rest of the publication.
 
 ## Versions, generations, revisions, and epochs
 
@@ -213,6 +250,17 @@ between them.
 One elected build reconciles the shared store while the others wait and then
 observe its committed work. The elected build may still parallelize parsing
 internally before serialized publication.
+
+A waiting process says that it waits. The holder records its process ID, host,
+purpose, start time and Bifrost version in a file beside the lock. It keeps an
+exclusive lock on a second file, the mark, until it releases the build lock. A
+waiter shows the record only when its shared probe of the mark is refused.
+Probes from other waiters are shared and never refuse each other, so the record
+of a process that exited or crashed is not shown. The waiter writes the holder to stderr
+after two seconds and again every minute. It also puts the holder in its
+request phase, which MCP progress notifications and budget errors read. The
+operating-system lock alone decides who holds the lock. The record is for
+display only, and nothing reads it to break or skip a wait.
 
 A normal persisted-build lifecycle is:
 

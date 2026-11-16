@@ -135,6 +135,10 @@ pub fn origin(
     shard: &ActiveSemanticModelShard,
     locator: Option<&Locator>,
 ) -> SemanticModelOriginKind {
+    // Approximate activation carries positive pack facts, never verified origin.
+    if shard.approximate {
+        return SemanticModelOriginKind::DeclarativeModel;
+    }
     match shard.source_kind {
         CatalogPackSourceKind::Generated | CatalogPackSourceKind::WorkspaceProduced => {
             SemanticModelOriginKind::ExactGeneratedOutput

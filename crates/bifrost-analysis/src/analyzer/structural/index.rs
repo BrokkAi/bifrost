@@ -202,7 +202,10 @@ pub struct SnapshotStructuralIndex {
     /// these files; a query that visits only candidate files adds them.
     recovered_files: Box<[u32]>,
     fact_nodes: u64,
+    /// Raw: compared with `max_retained_bytes`, unchanged until the R follow-up.
     retained_bytes: u64,
+    /// Allocated: the region charge.
+    allocated_bytes: u64,
 }
 
 impl SelfCharged for SnapshotStructuralIndex {
@@ -1111,7 +1114,7 @@ impl SnapshotStructuralIndexCache {
                     Ok((mut index, build)) => {
                         index.charge = AllocationCharge::acquire(
                             &self.budget,
-                            index.retained_bytes.min(usize::MAX as u64) as usize,
+                            index.allocated_bytes.min(usize::MAX as u64) as usize,
                         );
                         let index = Arc::new(index);
                         let shared = SharedAllocation::new(Arc::clone(&index));
@@ -1528,29 +1531,34 @@ fn build_index(
                         metrics,
                     ));
                 }
-                if let Some(name) = node.name {
-                    let name = name.text(facts.source());
-                    if !push_string_posting(
+                if let Some(name) = facts.node_name_text(fact_id as u32)
+                    && !push_string_posting(
                         &mut name_rows,
-                        name,
+                        &name,
                         address,
                         &mut estimated_working_bytes,
                         max_retained_bytes,
-                    ) {
-                        return Err(unavailable_failure(
-                            started,
-                            "structural index construction-byte limit exceeded",
-                            metrics,
-                        ));
-                    }
+                    )
+                {
+                    return Err(unavailable_failure(
+                        started,
+                        "structural index construction-byte limit exceeded",
+                        metrics,
+                    ));
                 }
+                // A spelled call's callee answers to the derived callee name,
+                // exactly as the call's own name posting does.
+                let spelled_callee = facts.spelled_callee_name(fact_id as u32);
                 for target in facts.roles(fact_id as u32) {
                     if supports_exact_role_name_posting(target.role) {
                         let effective_name = target
                             .name
                             .or_else(|| target.node.and_then(|node| facts.node(node).name));
-                        if let Some(name) = effective_name {
-                            let value = name.text(facts.source());
+                        let value = match spelled_callee.as_deref() {
+                            Some(spelled) if target.role == Role::Callee => Some(spelled),
+                            _ => effective_name.map(|name| name.text(facts.source())),
+                        };
+                        if let Some(value) = value {
                             let value_len = value.len();
                             if !role_key_allocation_fits(
                                 estimated_working_bytes,
@@ -1739,11 +1747,13 @@ fn build_index(
         recovered_files,
         fact_nodes: metrics.fact_nodes,
         retained_bytes: 0,
+        allocated_bytes: 0,
     };
-    let Some(retained_bytes) = retained_bytes(&index, cancellation) else {
+    let Some(bytes) = retained_bytes(&index, cancellation) else {
         return Err(cancelled_failure(started, metrics));
     };
-    index.retained_bytes = retained_bytes;
+    index.retained_bytes = bytes.raw;
+    index.allocated_bytes = bytes.allocated;
     metrics.elapsed_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
     // The measured counterpart of the preflight estimate: what the finished
     // index actually retains for the source it indexed. This pair is how the
@@ -1811,79 +1821,106 @@ fn boxed_kind_name_rows(
     (!cancellation.is_cancelled()).then_some(boxed)
 }
 
+/// The retained bytes of a finished index, in both forms.
+struct IndexBytes {
+    /// Raw: compared with `max_retained_bytes`, unchanged until the R follow-up.
+    raw: u64,
+    /// Allocated: the region charge.
+    allocated: u64,
+}
+
+impl IndexBytes {
+    fn add(&mut self, raw: u64, allocated: u64) {
+        self.raw = self.raw.saturating_add(raw);
+        self.allocated = self.allocated.saturating_add(allocated);
+    }
+
+    /// One owned buffer of `bytes`: its requested size and its allocation.
+    fn add_buffer(&mut self, bytes: usize) {
+        self.add(
+            bytes as u64,
+            brokk_bifrost_core::allocation_size::allocation_size(bytes) as u64,
+        );
+    }
+
+    /// One hash table; the raw layout estimate rounded to one allocation.
+    fn add_table<K, V>(&mut self, capacity: usize) {
+        let raw = hash_table_allocation_bytes::<K, V>(capacity);
+        let allocated = brokk_bifrost_core::allocation_size::allocation_size(
+            usize::try_from(raw).unwrap_or(usize::MAX),
+        ) as u64;
+        self.add(raw, allocated);
+    }
+}
+
+/// One walk of the finished index that sums both forms.
 fn retained_bytes(
     index: &SnapshotStructuralIndex,
     cancellation: &CancellationToken,
-) -> Option<u64> {
-    let mut bytes = (size_of::<SnapshotStructuralIndex>() as u64)
-        .saturating_add((size_of::<Arc<SnapshotStructuralIndex>>() * 2) as u64)
-        .saturating_add(
-            (index.files.len() as u64)
-                .saturating_mul(size_of::<StructuralIndexFile>() as u64)
-                .saturating_add(
-                    (index
-                        .files
-                        .iter()
-                        .map(|file| file.recovered_regions.len())
-                        .sum::<usize>() as u64)
-                        .saturating_mul(size_of::<super::facts::RecoveredRegion>() as u64),
-                )
-                .saturating_add(
-                    (index.recovered_files.len() as u64).saturating_mul(size_of::<u32>() as u64),
-                )
-                .saturating_add(hash_table_allocation_bytes::<ProjectFile, u32>(
-                    index.file_ids.capacity(),
-                ))
-                .saturating_add(hash_table_allocation_bytes::<
-                    NormalizedKind,
-                    Box<[FactAddress]>,
-                >(index.kind_postings.capacity()))
-                .saturating_add(hash_table_allocation_bytes::<Box<str>, Box<[FactAddress]>>(
-                    index.name_postings.capacity(),
-                ))
-                .saturating_add(hash_table_allocation_bytes::<
-                    Box<str>,
-                    Vec<(NormalizedKind, Box<[FactAddress]>)>,
-                >(index.kind_name_postings.capacity()))
-                .saturating_add(hash_table_allocation_bytes::<
-                    RolePostingKey,
-                    Box<[FactAddress]>,
-                >(index.role_postings.capacity()))
-                .saturating_add(
-                    (index.source_trigram_filters.len() as u64)
-                        .saturating_mul(size_of::<u64>() as u64),
-                ),
+) -> Option<IndexBytes> {
+    let shallow = (size_of::<SnapshotStructuralIndex>()
+        + size_of::<Arc<SnapshotStructuralIndex>>() * 2) as u64;
+    let mut bytes = IndexBytes {
+        raw: shallow,
+        allocated: shallow,
+    };
+    bytes.add_buffer(
+        index
+            .files
+            .len()
+            .saturating_mul(size_of::<StructuralIndexFile>()),
+    );
+    for file in index.files.iter() {
+        bytes.add_buffer(
+            file.recovered_regions
+                .len()
+                .saturating_mul(size_of::<super::facts::RecoveredRegion>()),
         );
+    }
+    bytes.add_buffer(index.recovered_files.len().saturating_mul(size_of::<u32>()));
+    bytes.add_table::<ProjectFile, u32>(index.file_ids.capacity());
+    bytes.add_table::<NormalizedKind, Box<[FactAddress]>>(index.kind_postings.capacity());
+    bytes.add_table::<Box<str>, Box<[FactAddress]>>(index.name_postings.capacity());
+    bytes.add_table::<Box<str>, Vec<(NormalizedKind, Box<[FactAddress]>)>>(
+        index.kind_name_postings.capacity(),
+    );
+    bytes.add_table::<RolePostingKey, Box<[FactAddress]>>(index.role_postings.capacity());
+    bytes.add_buffer(
+        index
+            .source_trigram_filters
+            .len()
+            .saturating_mul(size_of::<u64>()),
+    );
     for (entry_index, (name, posting)) in index.name_postings.iter().enumerate() {
         if entry_index % FACT_CANCELLATION_BATCH == 0 && cancellation.is_cancelled() {
             return None;
         }
-        bytes = bytes
-            .saturating_add(name.len() as u64)
-            .saturating_add((posting.len() * size_of::<FactAddress>()) as u64);
+        bytes.add_buffer(name.len());
+        bytes.add_buffer(posting.len() * size_of::<FactAddress>());
     }
     for (entry_index, (key, posting)) in index.role_postings.iter().enumerate() {
         if entry_index % FACT_CANCELLATION_BATCH == 0 && cancellation.is_cancelled() {
             return None;
         }
-        bytes = bytes
-            .saturating_add(key.value.len() as u64)
-            .saturating_add((posting.len() * size_of::<FactAddress>()) as u64);
+        bytes.add_buffer(key.value.len());
+        bytes.add_buffer(posting.len() * size_of::<FactAddress>());
     }
     for (entry_index, (name, combinations)) in index.kind_name_postings.iter().enumerate() {
         if entry_index % FACT_CANCELLATION_BATCH == 0 && cancellation.is_cancelled() {
             return None;
         }
-        bytes = bytes.saturating_add(name.len() as u64).saturating_add(
-            (combinations.capacity() as u64)
-                .saturating_mul(size_of::<(NormalizedKind, Box<[FactAddress]>)>() as u64),
+        bytes.add_buffer(name.len());
+        bytes.add_buffer(
+            combinations
+                .capacity()
+                .saturating_mul(size_of::<(NormalizedKind, Box<[FactAddress]>)>()),
         );
         for (_, posting) in combinations {
-            bytes = bytes.saturating_add((posting.len() * size_of::<FactAddress>()) as u64);
+            bytes.add_buffer(posting.len() * size_of::<FactAddress>());
         }
     }
     for posting in index.kind_postings.values() {
-        bytes = bytes.saturating_add((posting.len() * size_of::<FactAddress>()) as u64);
+        bytes.add_buffer(posting.len() * size_of::<FactAddress>());
     }
     (!cancellation.is_cancelled()).then_some(bytes)
 }

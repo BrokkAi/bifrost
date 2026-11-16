@@ -83,6 +83,11 @@ static RUST_SEMANTIC_LOWERER: crate::analyzer::rust::semantic::RustSemanticLower
     crate::analyzer::rust::semantic::RustSemanticLowerer;
 
 impl LanguageAdapter for RustAdapter {
+    fn local_test_evidence_proves_production(&self) -> bool {
+        // An external module can be gated by cfg(test) in its declaring parent.
+        false
+    }
+
     fn for_project(
         &self,
         project: Arc<dyn brokk_bifrost_core::analyzer::project::Project>,
@@ -151,33 +156,36 @@ impl LanguageAdapter for RustAdapter {
         analyzer: &brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::TreeSitterAnalyzer<Self>,
         owner: &brokk_bifrost_core::analyzer::model::CodeUnit,
         limit: usize,
-    ) -> Option<
-        Vec<(
-            brokk_bifrost_core::analyzer::model::CodeUnit,
-            Option<brokk_bifrost_core::analyzer::model::Range>,
-        )>,
-    > {
+    ) -> Option<brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::CrossFileChildren> {
+        use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::CrossFileChildren;
+
         if !owner.is_class() {
             return None;
         }
         let Some(read) = analyzer.canonical_source_read(owner.source(), "rust") else {
-            return Some(Vec::new());
+            return Some(CrossFileChildren {
+                children: Vec::new(),
+                complete: true,
+            });
         };
-        // No complete selected derivation, or an unresolved impl subject, adds
-        // no members. direct_children has no incompleteness channel.
+        // No complete selected derivation adds no members. An impl the selected
+        // summaries cannot attribute to the owner (an endpoint left unresolved, or a
+        // name form several declarations carry) may hide children: report it as
+        // incomplete, never as an empty complete answer.
         Some(
             read.read(
                 "reading resolved impl children",
                 |store, oid, generation, adapter| {
-                    store
-                        .rust_impl_children(
-                            oid,
-                            generation,
-                            analyzer.selected_workspace_snapshots().as_ref(),
-                            adapter,
-                            owner,
-                            limit,
-                        )?
+                    let found = store.rust_impl_children(
+                        oid,
+                        generation,
+                        analyzer.selected_workspace_snapshots().as_ref(),
+                        adapter,
+                        owner,
+                        limit,
+                    )?;
+                    let children = found
+                        .rows
                         .into_iter()
                         .map(|row| {
                             let unit =
@@ -194,10 +202,18 @@ impl LanguageAdapter for RustAdapter {
                             }
                             Ok((unit, row.primary_range))
                         })
-                        .collect()
+                        .collect::<Result<Vec<_>, brokk_bifrost_analysis::analyzer::store::StoreError>>()?;
+                    Ok(CrossFileChildren {
+                        children,
+                        complete: !found.incomplete,
+                    })
                 },
             )
-            .unwrap_or_default(),
+            // A failed read keeps the previous behavior: no cross-file children.
+            .unwrap_or(CrossFileChildren {
+                children: Vec::new(),
+                complete: true,
+            }),
         )
     }
 
@@ -265,6 +281,28 @@ impl LanguageAdapter for RustAdapter {
         tree: &Tree,
     ) -> brokk_bifrost_core::analyzer::parsed_file::ParsedFile {
         parse_rust_file_with(&self.naming, file, source, tree)
+    }
+
+    fn parse_file_prepared(
+        &self,
+        file: &ProjectFile,
+        prepared: &brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree,
+    ) -> (
+        brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+        Vec<(
+            &'static str,
+            brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+        )>,
+    ) {
+        (
+            brokk_bifrost_rust::declarations::parse_rust_file_prepared_with(
+                &self.naming,
+                &self.lexical,
+                file,
+                prepared,
+            ),
+            Vec::new(),
+        )
     }
 
     fn cognitive_complexity_config(&self) -> Option<&'static cognitive_complexity::Config> {

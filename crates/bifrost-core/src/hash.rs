@@ -78,3 +78,28 @@ pub fn btree_map_slot_bytes<K, V>(map: &std::collections::BTreeMap<K, V>) -> usi
             .saturating_add(size_of::<usize>()),
     )
 }
+
+/// Allocation allowance for a vector buffer in an evictable cache.
+#[allow(clippy::ptr_arg)]
+pub fn allocated_vec_slot_bytes<T>(values: &Vec<T>) -> usize {
+    crate::allocation_size::allocation_size(vec_slot_bytes(values))
+}
+
+/// Allocation allowance for one standard hash table, including spare buckets.
+pub fn allocated_table_slot_bytes<T>(capacity: usize) -> usize {
+    if capacity == 0 {
+        return 0;
+    }
+    let Some(buckets) = capacity
+        .saturating_mul(8)
+        .div_ceil(7)
+        .checked_next_power_of_two()
+    else {
+        return usize::MAX;
+    };
+    crate::allocation_size::allocation_size(
+        buckets
+            .saturating_mul(size_of::<T>().saturating_add(1))
+            .saturating_add(16),
+    )
+}

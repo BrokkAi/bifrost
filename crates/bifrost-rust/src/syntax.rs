@@ -170,10 +170,9 @@ pub fn outer_attributes_with_parent<'tree>(
     node: Node<'tree>,
     parent: Option<Node<'tree>>,
 ) -> impl Iterator<Item = Node<'tree>> {
-    let attributes = attached_attributes(node, parent);
     RustOuterAttributes {
-        attributes,
-        index: 0,
+        cursor: attached_attributes(node, parent).map(|attributes| attributes.walk()),
+        started: false,
     }
 }
 
@@ -190,29 +189,54 @@ pub(crate) fn rust_path_root(mut node: Node<'_>) -> Node<'_> {
 /// Indexed view over an associated `attributes` group, avoiding allocation in
 /// this declaration-walk hot path.
 struct RustOuterAttributes<'tree> {
-    attributes: Option<Node<'tree>>,
-    index: usize,
+    cursor: Option<tree_sitter::TreeCursor<'tree>>,
+    started: bool,
 }
 
 impl<'tree> Iterator for RustOuterAttributes<'tree> {
     type Item = Node<'tree>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let attributes = self.attributes?;
-        while self.index < attributes.child_count() {
-            let attribute_item = attributes.child(self.index)?;
-            self.index += 1;
+        loop {
+            let cursor = self.cursor.as_mut()?;
+            let advanced = if self.started {
+                cursor.goto_next_sibling()
+            } else {
+                self.started = true;
+                cursor.goto_first_child()
+            };
+            if !advanced {
+                self.cursor = None;
+                return None;
+            }
+            let attribute_item = cursor.node();
             if attribute_item.kind() == "attribute_item" {
                 return Some(attribute_item);
             }
         }
-        None
     }
 }
 
 fn attached_attributes<'tree>(
     node: Node<'tree>,
     parent: Option<Node<'tree>>,
+) -> Option<Node<'tree>> {
+    attached_attributes_with_predecessor(node, parent, || {
+        let mut previous = node.prev_sibling();
+        while let Some(sibling) = previous {
+            match sibling.kind() {
+                "line_comment" | "block_comment" => previous = sibling.prev_sibling(),
+                _ => return Some(sibling),
+            }
+        }
+        None
+    })
+}
+
+fn attached_attributes_with_predecessor<'tree>(
+    node: Node<'tree>,
+    parent: Option<Node<'tree>>,
+    previous: impl FnOnce() -> Option<Node<'tree>>,
 ) -> Option<Node<'tree>> {
     // A wrapper owns its group. Payload nodes inherit only from the wrapper
     // that names them as its declaration/expression field.
@@ -254,15 +278,53 @@ fn attached_attributes<'tree>(
     ) {
         return None;
     }
-    let mut previous = node.prev_sibling();
-    while let Some(sibling) = previous {
-        match sibling.kind() {
-            "attributes" => return Some(sibling),
-            "line_comment" | "block_comment" => previous = sibling.prev_sibling(),
-            _ => return None,
+    previous().filter(|sibling| sibling.kind() == "attributes")
+}
+
+/// Request-local attribute ownership, prepared with one sibling cursor per
+/// owner. Canonical callers must not rediscover predecessors or parents for
+/// every tuple element/parameter: Tree-sitter searches those from the root.
+pub(crate) struct RustAttributeGroups<'tree> {
+    groups: brokk_bifrost_core::hash::HashMap<usize, Node<'tree>>,
+}
+
+impl<'tree> RustAttributeGroups<'tree> {
+    pub(crate) fn prepare<F, E>(nodes: &[Node<'tree>], charge: &mut F) -> Result<Self, E>
+    where
+        F: FnMut(usize) -> Result<(), E>,
+    {
+        let mut groups = brokk_bifrost_core::hash::HashMap::default();
+        if let Some(&root) = nodes.first()
+            && let Some(group) = attached_attributes_with_predecessor(root, None, || None)
+        {
+            groups.insert(root.id(), group);
+        }
+        for &parent in nodes {
+            charge(1)?;
+            let mut previous = None;
+            let mut cursor = parent.walk();
+            for child in parent.children(&mut cursor) {
+                charge(1)?;
+                if child.is_named()
+                    && let Some(group) =
+                        attached_attributes_with_predecessor(child, Some(parent), || previous)
+                {
+                    groups.insert(child.id(), group);
+                }
+                if !matches!(child.kind(), "line_comment" | "block_comment") {
+                    previous = Some(child);
+                }
+            }
+        }
+        Ok(Self { groups })
+    }
+
+    pub(crate) fn attributes(&self, node: Node<'tree>) -> impl Iterator<Item = Node<'tree>> {
+        RustOuterAttributes {
+            cursor: self.groups.get(&node.id()).map(|group| group.walk()),
+            started: false,
         }
     }
-    None
 }
 
 /// Whether an `attribute_item`'s path is exactly `expected`.
@@ -475,6 +537,7 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon("#11830: field owners were classified as field names")]
     fn grammar_field_name_layout() {
         use crate::field_roles::{
             RustFieldNameRole, RustStructFieldContainer, classify_rust_field_name,
@@ -565,7 +628,16 @@ mod tests {
                     extra_span.unwrap()
                 );
             }
-            for focus in [focused, node] {
+            assert!(matches!(
+                classify_rust_field_name(node),
+                RustFieldNameRole::Other
+            ));
+            assert_eq!(
+                crate::field_roles::rust_focus_resolves_lexically(focused),
+                kind == "shorthand_field_initializer"
+            );
+            {
+                let focus = focused;
                 let declared = match classify_rust_field_name(focus) {
                     RustFieldNameRole::Declaration { name } => {
                         assert_eq!(name, focused);
@@ -837,7 +909,7 @@ pub fn rust_literal_type(node: Node<'_>, source: &str) -> Option<RustLiteralType
 /// standard type in its implicit prelude. Conditional disabling attributes
 /// conservatively disable the proof as well.
 pub fn rust_implicit_prelude_contains_type(root: Node<'_>, source: &str, name: &str) -> bool {
-    debug_assert_eq!(root.kind(), "source_file");
+    debug_assert!(matches!(root.kind(), "source_file" | "declaration_list"));
     let Some(attributes) = crate::resolution::rust_effective_attributes(
         root.named_children(&mut root.walk())
             .filter(|node| node.kind() == "inner_attribute_item"),
@@ -856,4 +928,15 @@ pub fn rust_implicit_prelude_contains_type(root: Node<'_>, source: &str, name: &
     }
     matches!(name, "Option" | "Result")
         || (!has("no_std") && matches!(name, "String" | "Vec" | "Box"))
+}
+
+/// Lifetime parameters cannot change owned payload types or introduce Drop.
+pub fn rust_item_has_type_or_const_parameters(item: Node<'_>) -> bool {
+    let Some(parameters) = item.child_by_field_name("type_parameters") else {
+        return false;
+    };
+    let mut cursor = parameters.walk();
+    parameters
+        .named_children(&mut cursor)
+        .any(|parameter| !parameter.is_extra() && parameter.kind() != "lifetime_parameter")
 }

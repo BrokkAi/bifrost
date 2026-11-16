@@ -1,0 +1,9 @@
+# The go-context-derivation lever (#11570).
+#
+# Invalidates Go context selections and their package publications.
+# Add one `<issue>-<slug>` line when these derivation rules change.
+# Git merges this file with merge=union. Never edit or remove a token line.
+# See .agents/docs/cache-identity-levers.md.
+#
+# Replaced the literal: DERIVATION_VERSION = 16.
+11570-slice2b-derivation-identity

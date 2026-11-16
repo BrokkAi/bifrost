@@ -134,8 +134,7 @@ fn compilation_using_extent_migration_preserves_inputs_and_enforces_lifetimes() 
          INSERT INTO resolution_root_imports(blob_id,import_site,root_scope,anchor,kind)
          VALUES(1,1,0,'lexical','glob');",
     ).unwrap();
-    migrate(&mut conn).unwrap();
-    assert!(current_schema_is_valid(&conn).unwrap());
+    apply_migrations_before_derivation_identities(&conn);
     for table in [
         "workspace_file_versions",
         "csharp_compilations",
@@ -231,6 +230,8 @@ fn compilation_using_extent_migration_preserves_inputs_and_enforces_lifetimes() 
     .unwrap();
     validate_foreign_keys(&conn).unwrap();
     conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+    migrate(&mut conn).unwrap();
+    assert!(current_schema_is_valid(&conn).unwrap());
 }
 
 #[test]
@@ -269,7 +270,7 @@ fn csharp_open_reasons_upgrade_preserves_rows_and_rejects_unknown_reason() {
         )
         .is_err()
     );
-    migrate(&mut conn).unwrap();
+    apply_migrations_before_derivation_identities(&conn);
     assert_eq!(
         conn.query_row(
             "SELECT open_reason FROM csharp_compilations WHERE compilation_id=1",
@@ -315,9 +316,8 @@ fn csharp_open_reasons_upgrade_preserves_rows_and_rejects_unknown_reason() {
         .is_err()
     );
     validate_foreign_keys(&conn).unwrap();
-    assert!(current_schema_is_valid(&conn).unwrap());
     drop(conn);
-    let reopened = Connection::open(file.path()).unwrap();
+    let mut reopened = Connection::open(file.path()).unwrap();
     let reason: String = reopened
         .query_row(
             "SELECT open_reason FROM csharp_compilations WHERE compilation_id=1",
@@ -336,6 +336,8 @@ fn csharp_open_reasons_upgrade_preserves_rows_and_rejects_unknown_reason() {
             .unwrap(),
         1
     );
+    migrate(&mut reopened).unwrap();
+    assert!(current_schema_is_valid(&reopened).unwrap());
 }
 
 #[test]
@@ -390,17 +392,21 @@ fn structural_role_name_migration_preserves_read_ids_on_upgrade_and_downgrade_re
         .iter()
         .find(|migration| migration.version == 285)
         .expect("structural role-name migration 0285");
+    // Replay the pre-Drop shape, then restore the additive receipt columns.
+    // 0285 intentionally predates the typed Drop fields introduced in 0420.
     reopened.execute_batch(rebuild.sql).unwrap();
-    // Restore the later general-ledger definition before current-schema validation.
-    reopened
-        .execute_batch(
-            POST_BASELINE_MIGRATIONS
-                .iter()
-                .find(|m| m.version == 299)
-                .unwrap()
-                .sql,
-        )
+    // 0420 rebuilds both read ledgers with the typed Drop receipt columns.
+    // Replay only that rebuild, not the discharge widening: 0421 owns the
+    // current gap-table CHECK and is not replayed when user_version is current.
+    let drop_receipts = POST_BASELINE_MIGRATIONS
+        .iter()
+        .find(|migration| migration.version == 420)
+        .expect("rust drop inventory read keys migration 0420");
+    let (drop_ledger_rebuild, _) = drop_receipts
+        .sql
+        .split_once("-- #10879: ImplicitDropExecution is discharge code 14.")
         .unwrap();
+    reopened.execute_batch(drop_ledger_rebuild).unwrap();
     migrate(&mut reopened).unwrap();
     check_rows(&reopened);
 }
@@ -459,7 +465,7 @@ fn framework_instance_migration_preserves_compilation_ids_and_children() {
         })
     };
     let before = snapshot(&conn);
-    migrate(&mut conn).unwrap();
+    apply_migrations_before_derivation_identities(&conn);
     assert_eq!(snapshot(&conn), before);
     conn.execute_batch(
         "INSERT INTO csharp_compilations
@@ -478,6 +484,8 @@ fn framework_instance_migration_preserves_compilation_ids_and_children() {
         2
     );
     validate_foreign_keys(&conn).unwrap();
+    migrate(&mut conn).unwrap();
+    assert!(current_schema_is_valid(&conn).unwrap());
 }
 
 #[test]
@@ -503,7 +511,7 @@ fn named_open_migration_preserves_existing_environments() {
       INSERT INTO csharp_compilation_symbols VALUES(41,'DEBUG','sdk');",
     )
     .unwrap();
-    migrate(&mut conn).unwrap();
+    apply_migrations_before_derivation_identities(&conn);
     let row = conn
         .query_row(
             "SELECT c.project_path,c.symbols_closed,c.open_reason,
@@ -538,5 +546,6 @@ fn named_open_migration_preserves_existing_environments() {
     );
     conn.execute("UPDATE csharp_compilations SET named_open_symbols=jsonb('[\"RELEASE\"]') WHERE compilation_id=41",[]).unwrap();
     assert_eq!(conn.query_row("SELECT json_extract(named_open_symbols,'$[0]') FROM csharp_compilations WHERE compilation_id=41",[],|row|row.get::<_,String>(0)).unwrap(),"RELEASE");
-    assert!(current_schema_shape_is_valid(&conn).unwrap());
+    migrate(&mut conn).unwrap();
+    assert!(current_schema_is_valid(&conn).unwrap());
 }

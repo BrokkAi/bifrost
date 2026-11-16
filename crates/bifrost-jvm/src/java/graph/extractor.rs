@@ -1,7 +1,7 @@
 use super::JavaGraphSource;
 use super::hits;
 use super::resolver::{
-    ReceiverTargetMatch, TargetKind, TargetSpec, argument_list_arity,
+    ReceiverTargetMatch, SuperReceiver, TargetKind, TargetSpec, argument_list_arity,
     bare_field_context_matches_target, bare_method_context_matches_target,
     constructor_method_reference_receiver, has_proven_static_import, infer_type_from_value,
     is_declaration_name, is_ignored_type_context, is_module_type_reference,
@@ -9,7 +9,7 @@ use super::resolver::{
     nested_type_for_owner, node_text, receiver_matches_target, receiver_type_matches_target,
     resolve_field_access_type, resolve_field_access_type_segments,
     resolve_non_nested_type_from_node, resolve_type_from_node, resolve_type_segments,
-    same_owner_context, seed_class_binding,
+    same_owner_context, seed_class_binding, super_receiver, super_receiver_matches_target,
 };
 use super::return_type::{
     FileReturnCache, MethodAnonymousReturnCache, MethodReturnCache, java_type_name_components,
@@ -952,11 +952,18 @@ fn method_reference_target_resolution(
     ctx: &mut ScanCtx<'_>,
 ) -> MethodReferenceTargetResolution {
     let owners = method_reference_owner_fq_names(receiver, token, ctx);
-    let receiver_matches = owners
-        .iter()
-        .filter_map(|owner| ctx.graph.index.definitions(owner).next())
-        .map(|owner| receiver_type_matches_target(&owner, token, ctx))
-        .collect::<Vec<_>>();
+    let receiver_matches = if receiver.kind() == "super" {
+        // `super::m` names a member of the direct superclass of the class body
+        // holding the reference, and only one that body can access (#9703), so
+        // the owner list alone cannot decide the match.
+        vec![super_receiver_matches_target(receiver, token, ctx)]
+    } else {
+        owners
+            .iter()
+            .filter_map(|owner| ctx.graph.index.definitions(owner).next())
+            .map(|owner| receiver_type_matches_target(&owner, token, ctx))
+            .collect()
+    };
     if receiver_matches
         .iter()
         .all(|outcome| *outcome == ReceiverTargetMatch::Incompatible)
@@ -995,10 +1002,20 @@ fn method_reference_owner_fq_names(
     ctx: &mut ScanCtx<'_>,
 ) -> Vec<String> {
     match receiver.kind() {
-        "this" | "super" => ctx
+        "this" => ctx
             .class_ranges
             .enclosing(receiver.start_byte())
             .map(|owner| vec![owner.to_string()])
+            .unwrap_or_default(),
+        // `super::m` names a member of the direct superclass of the class body
+        // holding the reference, never of that body itself (#9703). An unknown
+        // superclass contributes no owner, the way the other arms report one
+        // they cannot resolve: no workspace target matches it, and an
+        // inherited target stays unproven instead of being attributed to the
+        // class that writes the reference.
+        "super" => super_receiver(receiver, ctx)
+            .and_then(SuperReceiver::indexed_class)
+            .map(|superclass| vec![superclass.fq_name()])
             .unwrap_or_default(),
         "identifier" => ctx
             .bindings

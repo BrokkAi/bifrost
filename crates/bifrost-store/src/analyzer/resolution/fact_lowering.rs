@@ -1031,6 +1031,7 @@ enum SupportedActivation {
 #[derive(Debug, Clone, Copy)]
 struct SupportedBinder<'facts> {
     fact: &'facts ResolutionBinderFact,
+    interval: usize,
     identifier: &'facts PositionedIdentifierFact,
     activation: SupportedActivation,
     /// The producer published this binder as the weaker half of a conditional
@@ -1797,7 +1798,25 @@ pub(super) fn lower_file_resolution_facts_with_identities(
             matches!(binder.kind, ResolutionBinderKind::Alias { .. }).then_some(binder.declaration)
         })
         .collect::<HashSet<_>>();
+    let mut binder_intervals =
+        HashMap::<ResolutionSiteId, (usize, &ResolutionBinderFact)>::default();
     for binder in &facts.binders {
+        let interval_ordinal = if let Some((ordinal, previous)) =
+            binder_intervals.get(&binder.declaration)
+        {
+            assert!(
+                binder.scope == previous.scope
+                    && binder.kind == previous.kind
+                    && binder.hoisting == HoistingClass::DeclaredHead
+                    && previous.hoisting == HoistingClass::DeclaredHead
+                    && previous.activation_end <= binder.activation_start,
+                "binder intervals must be ordered and disjoint in one scope: {previous:?}, {binder:?}"
+            );
+            ordinal + 1
+        } else {
+            0
+        };
+        binder_intervals.insert(binder.declaration, (interval_ordinal, binder));
         let scope = index.scope(binder.scope);
         let declaration = index.site(binder.declaration);
         assert_eq!(
@@ -1878,6 +1897,7 @@ pub(super) fn lower_file_resolution_facts_with_identities(
         if let Some(activation) = activation {
             supported_binders.push(SupportedBinder {
                 fact: binder,
+                interval: interval_ordinal,
                 identifier,
                 activation,
                 superseded: superseded_declarations.contains(&binder.declaration),
@@ -2218,7 +2238,7 @@ pub(super) fn lower_file_resolution_facts_with_identities(
         })
         .collect::<Vec<_>>();
     let reasons_by_site = gap_reasons_by_site(identities, &source_gap_sources);
-    let mut forward_gap_endpoints = HashMap::default();
+    let mut forward_gap_endpoints = HashMap::<ResolutionSiteId, Vec<BindingNodeId>>::default();
     let owner_references = facts
         .lexical_owner_references
         .iter()
@@ -2485,15 +2505,14 @@ pub(super) fn lower_file_resolution_facts_with_identities(
             }).map(|snapshot| snapshot.node));
         }
         assert!(
-            routed_binder_sites.insert(binder.fact.declaration),
-            "one supported binder route per declaration or alias site is required"
+            routed_binder_sites.insert((binder.fact.declaration, binder.interval)),
+            "one supported binder route per declaration or alias interval is required"
         );
         if target == binder.fact.declaration {
-            assert!(
-                forward_gap_endpoints
-                    .insert(target, gap_endpoints)
-                    .is_none()
-            );
+            forward_gap_endpoints
+                .entry(target)
+                .or_default()
+                .extend(gap_endpoints);
         } else {
             alias_gap_endpoints.push((target, gap_endpoints));
         }
@@ -2533,6 +2552,17 @@ pub(super) fn lower_file_resolution_facts_with_identities(
                 binder_path_identity(binder.fact.declaration)
             } else {
                 additional_binder_path_identity(binder.fact.declaration, namespace)
+            };
+            let identity = if binder.interval == 0 {
+                identity
+            } else {
+                ResolutionPathIdentity::new(local_digest(
+                    b"bifrost-resolution-binder-interval-path:v1",
+                    &[
+                        ("path", &identity.digest()),
+                        ("interval", &usize_bytes(binder.interval)),
+                    ],
+                ))
             };
             let id = identities.path(identity);
             paths.push((
@@ -6679,7 +6709,7 @@ pub(super) fn type_slot_semantic(
     identities.type_slot_semantic(slot)
 }
 
-pub(super) fn type_slot_semantic_identity(
+pub(crate) fn type_slot_semantic_identity(
     slot: ResolutionTypeSlotId,
 ) -> ResolutionSemanticIdentity {
     ResolutionSemanticIdentity::fragment_local(local_digest(

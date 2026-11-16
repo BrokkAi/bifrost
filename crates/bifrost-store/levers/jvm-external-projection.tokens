@@ -1,0 +1,10 @@
+# The jvm-external-projection lever (#11570).
+#
+# Invalidates JVM external provider publication certificates.
+# Add one `<issue>-<slug>` line when these derivation rules change.
+# Git merges this file with merge=union. Never edit or remove a token line.
+# See .agents/docs/cache-identity-levers.md.
+#
+# Replaced the literal: JVM_EXTERNAL_PROJECTION_VERSION = 2.
+11570-slice2b-derivation-identity
+12385-m1-external-generic-surfaces

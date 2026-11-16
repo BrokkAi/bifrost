@@ -26,7 +26,91 @@ use brokk_bifrost_analysis::analyzer::common::local_xml_name;
 
 use brokk_bifrost_semantic::analyzer::semantic::ids::StableDigest;
 
+use brokk_bifrost_core::analyzer::capabilities::{
+    CSharpCompilationMembershipCompleteness, CSharpCompilationMembershipOpenCause,
+};
 use brokk_bifrost_core::analyzer::project::Project;
+
+pub(super) type CompilationConfigIdentities = (
+    StableDigest,
+    StableDigest,
+    StableDigest,
+    bool,
+    CSharpCompilationMembershipCompleteness,
+);
+
+type GlobalUsingDependencies = (
+    HashMap<ProjectFile, HashSet<ProjectFile>>,
+    bool,
+    Option<CSharpCompilationMembershipOpenCause>,
+);
+
+/// The listing is exhaustive for membership only if it cannot hide another
+/// project anywhere, even outside every visible project's Compile roots.
+///
+/// A project file whose capture was read is present, even when the listing
+/// also records an omission for that path. A project file the capture did
+/// not read is unknown, with that omission's reason, and is not missing.
+/// Non-regular entries stay outside the analyzer universe. A directory
+/// omission wins over a project-file omission.
+fn compilation_membership_completeness(
+    omissions: &[brokk_bifrost_core::analyzer::project::WorkspaceFileOmission],
+    captured: &[brokk_bifrost_analysis::analyzer::store::WorkspaceConfigurationInput],
+) -> CSharpCompilationMembershipCompleteness {
+    use brokk_bifrost_core::analyzer::project::WorkspaceFileOmissionReason as Reason;
+    use brokk_bifrost_core::path_utils::workspace_relative_slash_path;
+    // Prefer a directory cause regardless of enumeration order. A path named
+    // like a project file still hides a directory under one of these reasons.
+    if omissions.iter().any(|omission| {
+        matches!(
+            omission.reason,
+            Reason::Unknown
+                | Reason::WalkError
+                | Reason::NonUtf8GitPath
+                | Reason::SymlinkToDirectory
+                | Reason::UnreadableSymlink
+        )
+    }) {
+        return CSharpCompilationMembershipCompleteness::Open(
+            CSharpCompilationMembershipOpenCause::DirectoryOmitted,
+        );
+    }
+    // Capture stores the lossy slash form. Compare that form, not raw Path
+    // equality, so a read non-UTF-8 project file matches its omission.
+    let present = captured
+        .iter()
+        .filter(|input| {
+            input.file_present && is_csharp_project_file(Path::new(input.relative_path()))
+        })
+        .map(|input| workspace_relative_slash_path(Path::new(input.relative_path())))
+        .collect::<BTreeSet<_>>();
+    if let Some(omission) = omissions
+        .iter()
+        .filter(|omission| {
+            omission.reason != Reason::NonRegular
+                && is_csharp_project_file(&omission.path)
+                && !present.contains(&workspace_relative_slash_path(&omission.path))
+        })
+        .min_by(|left, right| {
+            left.reason
+                .cmp(&right.reason)
+                .then_with(|| left.path.cmp(&right.path))
+        })
+    {
+        return CSharpCompilationMembershipCompleteness::Open(
+            CSharpCompilationMembershipOpenCause::ProjectFileUnknown(omission.reason),
+        );
+    }
+    CSharpCompilationMembershipCompleteness::Complete
+}
+
+/// One shared explanation for an open C# compilation membership, used by both
+/// the inventory obligation and the semantic-evidence diagnostic.
+fn open_membership_evidence(cause: CSharpCompilationMembershipOpenCause) -> String {
+    format!(
+        "C# compilation membership is open: {cause:?}. Run without --sources, or open a session over the full workspace, to get an answer."
+    )
+}
 
 use brokk_bifrost_core::analyzer::model::ProjectFile;
 
@@ -59,14 +143,231 @@ const MAX_CONFIG_FILES: usize = 16 * 1024;
 const MAX_XML_DEPTH: usize = 128;
 const MAX_XML_NODES: usize = 64 * 1024;
 
+/// The Compile items evaluated from the captured configuration inputs: the one
+/// model both the guard and the content-key fold read. It reuses
+/// `compilation_facts_with_roots`, including imported items and unresolved
+/// regions, and infers nothing from XML text or visible sources.
+struct EvaluatedConfiguration {
+    captured: Vec<CSharpConfigurationInput>,
+    facts: CSharpCompilationFacts,
+    roots: BTreeSet<PathBuf>,
+}
+
+fn evaluate_configuration(
+    inputs: &[brokk_bifrost_analysis::analyzer::store::WorkspaceConfigurationInput],
+) -> EvaluatedConfiguration {
+    let captured = inputs
+        .iter()
+        .map(|input| CSharpConfigurationInput {
+            rel_path: input.relative_path().to_owned(),
+            source: if input.file_present {
+                CSharpConfigurationSource::Bytes(input.source_bytes().into())
+            } else {
+                CSharpConfigurationSource::Absent
+            },
+        })
+        .collect::<Vec<_>>();
+    let (facts, roots) = compilation_facts_with_roots(&captured);
+    EvaluatedConfiguration {
+        captured,
+        facts,
+        roots,
+    }
+}
+
+impl EvaluatedConfiguration {
+    /// An explicit Compile item the omission replaces: the compilation holds
+    /// that file whatever its extension, so a symlink at `<Compile Include=
+    /// "Generated.code" />` is source it lost although no C# rule claims the name.
+    fn replaces_explicit_compile_item(
+        &self,
+        omission: &brokk_bifrost_core::analyzer::project::WorkspaceFileOmission,
+    ) -> bool {
+        use brokk_bifrost_core::path_utils::strip_native_path_prefix;
+        self.facts
+            .compilations
+            .iter()
+            .flat_map(|compilation| &compilation.items)
+            .filter(|item| item.kind == CSharpCompileItemKind::Include)
+            .any(|item| {
+                strip_native_path_prefix(Path::new(&item.rel_path), &omission.path)
+                    .is_some_and(|remaining| remaining.as_os_str().is_empty())
+            })
+    }
+}
+
+/// Whether an omission is relevant to the C# configuration: it can hide a C#
+/// source or configuration input, or it replaces an explicit Compile item. The
+/// guard below and the workspace content key read this one test, so the key
+/// moves exactly when the authority can change.
+fn omission_is_relevant_to_configuration(
+    omission: &brokk_bifrost_core::analyzer::project::WorkspaceFileOmission,
+    evaluated: &EvaluatedConfiguration,
+) -> bool {
+    brokk_bifrost_analysis::analyzer::languages::omission_hides_source(Language::CSharp, omission)
+        || evaluated.replaces_explicit_compile_item(omission)
+}
+
+/// Whether omissions can change discovered projects, evaluated Compile items,
+/// generated inputs, or captured configuration paths (including absence).
+/// `evaluated` is `None` exactly when there are no omissions.
+fn configuration_inputs_may_be_hidden(
+    inputs: &[brokk_bifrost_analysis::analyzer::store::WorkspaceConfigurationInput],
+    omissions: &[brokk_bifrost_core::analyzer::project::WorkspaceFileOmission],
+    evaluated: Option<&EvaluatedConfiguration>,
+) -> bool {
+    use brokk_bifrost_analysis::analyzer::languages::omission_hides_source;
+    use brokk_bifrost_core::analyzer::project::WorkspaceFileOmissionReason;
+    use brokk_bifrost_core::path_utils::strip_native_path_prefix;
+    let Some(evaluated) = evaluated else {
+        return false;
+    };
+    if !omissions
+        .iter()
+        .any(|omission| omission_is_relevant_to_configuration(omission, evaluated))
+    {
+        return false;
+    }
+    // The branches below that read the whole configuration (generated inputs,
+    // open Compile regions, roots, project files, configuration inputs) apply
+    // only to an omission that can hide a C# source or configuration input.
+    let hides = omissions
+        .iter()
+        .any(|omission| omission_hides_source(Language::CSharp, omission));
+    if hides
+        && evaluated.captured.iter().any(|input| {
+            input
+                .source
+                .as_deref()
+                .and_then(|source| std::str::from_utf8(source).ok())
+                .is_some_and(|source| parse_project(source).has_generated_inputs)
+        })
+    {
+        return true;
+    }
+    if omissions
+        .iter()
+        .any(|omission| evaluated.replaces_explicit_compile_item(omission))
+    {
+        return true;
+    }
+    let mut roots = evaluated.roots.clone();
+    for compilation in &evaluated.facts.compilations {
+        if let Some(project) = &compilation.project_path {
+            roots.insert(
+                Path::new(project)
+                    .parent()
+                    .expect("project parent")
+                    .to_path_buf(),
+            );
+        }
+        for item in &compilation.items {
+            if hides
+                && matches!(
+                    item.kind,
+                    CSharpCompileItemKind::Open | CSharpCompileItemKind::OpenTree
+                )
+            {
+                return true;
+            }
+        }
+    }
+    omissions.iter().any(|omission| {
+        if !omission_hides_source(Language::CSharp, omission) {
+            return false;
+        }
+        let may_be_directory = matches!(
+            omission.reason,
+            WorkspaceFileOmissionReason::Unknown
+                | WorkspaceFileOmissionReason::WalkError
+                | WorkspaceFileOmissionReason::NonUtf8GitPath
+                | WorkspaceFileOmissionReason::SymlinkToDirectory
+                | WorkspaceFileOmissionReason::UnreadableSymlink
+        );
+        if (omission.reason != WorkspaceFileOmissionReason::SymlinkToDirectory
+            && is_csharp_project_file(&omission.path))
+            || roots.iter().any(|root| {
+                strip_native_path_prefix(&omission.path, root).is_some()
+                    || (may_be_directory
+                        && strip_native_path_prefix(root, &omission.path).is_some())
+            })
+        {
+            return true;
+        }
+        if omission.path.as_os_str().is_empty() {
+            return true;
+        }
+        let unknown_name = omission.reason == WorkspaceFileOmissionReason::NonUtf8GitPath
+            || omission
+                .path
+                .file_name()
+                .is_none_or(|name| name.to_str().is_none());
+        inputs.iter().any(|input| {
+            let probe = Path::new(input.relative_path());
+            if strip_native_path_prefix(probe, &omission.path)
+                .is_some_and(|remaining| may_be_directory || remaining.as_os_str().is_empty())
+            {
+                return true;
+            }
+            unknown_name
+                && probe
+                    .parent()
+                    .zip(omission.path.parent())
+                    .is_some_and(|(probe, omitted)| {
+                        strip_native_path_prefix(probe, omitted)
+                            .is_some_and(|remaining| remaining.as_os_str().is_empty())
+                    })
+        })
+    })
+}
+
+/// One authority decision for memo attribution, recording and replay. Digest
+/// bytes are independent of whether the captured inventory can certify them.
+fn configuration_authority(
+    answer: Option<&CompilationConfigIdentities>,
+) -> AuthorityInputs<'static> {
+    match answer {
+        Some(answer) if !answer.3 => AuthorityInputs::Fact {
+            language: Language::CSharp,
+            subject: brokk_bifrost_analysis::analyzer::read_ledger::FactSubject::Whole,
+            answer: answer.0,
+        },
+        _ => AuthorityInputs::Unnamed,
+    }
+}
+
 /// Identity of one workspace listing's MSBuild configuration inputs, present
 /// only when every input below the cap was read.
-fn read_config_digest(project: &dyn Project) -> Option<(StableDigest, StableDigest)> {
+fn read_config_digest(project: &dyn Project) -> Option<CompilationConfigIdentities> {
+    let listing = project.all_files_with_omissions().ok()?;
+    let omissions = Arc::clone(&listing.1);
+    let snapshot = brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::WorkspaceBuildSnapshot::from_listing(
+        project, None, &[], listing,
+    );
     let inputs = brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::TreeSitterAnalyzer::workspace_configuration_inputs(
-        project, &super::adapter::CSharpAdapter, None,
+        project, &super::adapter::CSharpAdapter, Some(snapshot.as_ref()),
     ).ok()?;
     if inputs.len() > MAX_CONFIG_FILES {
         return None;
+    }
+    // Evaluated once when anything was omitted; the guard and the content-key fold
+    // below read the same model and the same relevance test.
+    let evaluated = (!omissions.is_empty()).then(|| evaluate_configuration(&inputs));
+    let configuration_inputs_may_be_hidden =
+        configuration_inputs_may_be_hidden(&inputs, &omissions, evaluated.as_ref());
+    // This digest is replayed for an export of the tree without recomputing it
+    // (#11607). That is sound only while every input is a file under the
+    // workspace root: an input from above the root, an SDK install or the
+    // user's NuGet configuration would be an environment input an export does
+    // not hold.
+    for input in &inputs {
+        assert!(
+            Path::new(input.relative_path())
+                .components()
+                .all(|component| matches!(component, Component::Normal(_))),
+            "a C# configuration input must be a path under the workspace root: {:?}",
+            input.relative_path()
+        );
     }
     let mut hasher = CanonicalHasher::new(CONFIG_IDENTITY_DOMAIN);
     let identity_items = inputs
@@ -79,6 +380,9 @@ fn read_config_digest(project: &dyn Project) -> Option<(StableDigest, StableDige
             )
         })
         .collect::<Vec<_>>();
+    // `inputs` is moved by the digest loop below. Membership has to see the
+    // captured presence bits before that move.
+    let membership = compilation_membership_completeness(&omissions, &inputs);
     for input in inputs {
         if input.source_bytes().len() > MAX_PROJECT_BYTES {
             return None;
@@ -105,9 +409,33 @@ fn read_config_digest(project: &dyn Project) -> Option<(StableDigest, StableDige
             .iter()
             .map(|(path, oid, present)| (path.as_str(), oid.as_str(), *present)),
     );
+    let config = hasher.finish();
+    let mut workspace_config = config;
+    // The authority fact describes the listed configuration files. Omissions
+    // affect only the workspace content key, and are captured by this same fill.
+    // Complete inventories retain exactly the old configuration digest.
+    if evaluated.as_ref().is_some_and(|evaluated| {
+        omissions
+            .iter()
+            .any(|omission| omission_is_relevant_to_configuration(omission, evaluated))
+    }) {
+        let mut omissions = omissions.as_ref().clone();
+        omissions.sort();
+        omissions.dedup();
+        let mut hasher = CanonicalHasher::new(b"bifrost-csharp-workspace-config-omissions:v1");
+        hasher.value(&config);
+        for omission in &omissions {
+            hasher.value(omission.path.as_os_str().as_encoded_bytes());
+            hasher.value(format!("{:?}", omission.reason).as_bytes());
+        }
+        workspace_config = hasher.finish();
+    }
     Some((
-        StableDigest::from_array(hasher.finish()),
+        StableDigest::from_array(config),
         StableDigest::from_array(identity),
+        StableDigest::from_array(workspace_config),
+        configuration_inputs_may_be_hidden,
+        membership,
     ))
 }
 
@@ -124,6 +452,13 @@ const MAX_IMPORT_DEPTH: usize = 8;
 /// across the chain and items apply in chain order, relative to the project
 /// directory. A file in the chain this parser cannot follow is a gap.
 pub(crate) fn compilation_facts(inputs: &[CSharpConfigurationInput]) -> CSharpCompilationFacts {
+    compilation_facts_with_roots(inputs).0
+}
+
+fn compilation_facts_with_roots(
+    inputs: &[CSharpConfigurationInput],
+) -> (CSharpCompilationFacts, BTreeSet<PathBuf>) {
+    let mut glob_roots = BTreeSet::new();
     let by_path = configuration_by_path(inputs);
     let mut facts = CSharpCompilationFacts {
         membership_complete: true,
@@ -175,7 +510,7 @@ pub(crate) fn compilation_facts(inputs: &[CSharpConfigurationInput]) -> CSharpCo
             );
         }
         parsed.insert(input.rel_path.as_str(), fragment);
-        if has_extension(Path::new(&input.rel_path), "csproj") {
+        if is_csharp_project_file(Path::new(&input.rel_path)) {
             projects.push(input.rel_path.as_str());
         }
     }
@@ -205,7 +540,7 @@ pub(crate) fn compilation_facts(inputs: &[CSharpConfigurationInput]) -> CSharpCo
             },
         });
         finish_compilation_facts(&mut facts);
-        return facts;
+        return (facts, glob_roots);
     }
 
     // A traversal project builds other projects and compiles no source, so
@@ -276,30 +611,43 @@ pub(crate) fn compilation_facts(inputs: &[CSharpConfigurationInput]) -> CSharpCo
         // reaches them only through its own (dynamic, so unsupported)
         // Microsoft.Common imports.
         let mut chain = Vec::<(&str, &ParsedProject)>::new();
+        let mut metadata_roots = Vec::new();
         let mut chain_gaps = Vec::<(&str, String, Option<String>)>::new();
-        let implicit_imports = |names: &[&'static str], chain: &mut Vec<_>, gaps: &mut Vec<_>| {
-            if project.sdks.is_empty() {
-                return;
-            }
-            for name in names {
-                match nearest_configuration(&by_path, directory, name) {
-                    NearestConfiguration::Found(path) => {
-                        expand_chain(&parsed, &by_path, path, 0, chain, gaps)
-                    }
-                    NearestConfiguration::Unknown(candidate) => gaps.push((
-                        project_path,
-                        format!("candidate {candidate:?} has unknown presence"),
-                        Some((*name).to_owned()),
-                    )),
-                    NearestConfiguration::Absent => {}
+        let implicit_imports =
+            |names: &[&'static str], chain: &mut Vec<_>, gaps: &mut Vec<_>, roots: &mut Vec<_>| {
+                if project.sdks.is_empty() {
+                    return;
                 }
-            }
-        };
-        implicit_imports(&["Directory.Build.props"], &mut chain, &mut chain_gaps);
+                for name in names {
+                    match nearest_configuration(&by_path, directory, name) {
+                        NearestConfiguration::Found(path) => {
+                            roots.push(path);
+                            expand_chain(&parsed, &by_path, path, 0, chain, gaps)
+                        }
+                        NearestConfiguration::Unknown(candidate) => gaps.push((
+                            project_path,
+                            format!("candidate {candidate:?} has unknown presence"),
+                            Some((*name).to_owned()),
+                        )),
+                        NearestConfiguration::Absent => {}
+                    }
+                }
+            };
+        implicit_imports(
+            &["Directory.Build.props"],
+            &mut chain,
+            &mut chain_gaps,
+            &mut metadata_roots,
+        );
         // The membership property pass assumes "empty until assigned" only for
         // this closure: later SDK, package and project props may set anything.
         let props_end = chain.len();
-        implicit_imports(&["Directory.Packages.props"], &mut chain, &mut chain_gaps);
+        implicit_imports(
+            &["Directory.Packages.props"],
+            &mut chain,
+            &mut chain_gaps,
+            &mut metadata_roots,
+        );
         let intermediate = project
             .properties
             .base_intermediate_output_path
@@ -331,9 +679,11 @@ pub(crate) fn compilation_facts(inputs: &[CSharpConfigurationInput]) -> CSharpCo
                 .get(*path)
                 .is_some_and(|input| configuration_input_is_acquired(input))
         {
+            metadata_roots.push(path);
             expand_chain(&parsed, &by_path, path, 0, &mut chain, &mut chain_gaps);
         }
         let body_start = chain.len();
+        metadata_roots.push(project_path);
         expand_chain(
             &parsed,
             &by_path,
@@ -343,7 +693,12 @@ pub(crate) fn compilation_facts(inputs: &[CSharpConfigurationInput]) -> CSharpCo
             &mut chain_gaps,
         );
         let targets_start = chain.len();
-        implicit_imports(&["Directory.Build.targets"], &mut chain, &mut chain_gaps);
+        implicit_imports(
+            &["Directory.Build.targets"],
+            &mut chain,
+            &mut chain_gaps,
+            &mut metadata_roots,
+        );
         if let Some((path, _)) = restore_paths[1]
             .as_deref()
             .and_then(|path| parsed.get_key_value(path))
@@ -351,780 +706,861 @@ pub(crate) fn compilation_facts(inputs: &[CSharpConfigurationInput]) -> CSharpCo
                 .get(*path)
                 .is_some_and(|input| configuration_input_is_acquired(input))
         {
+            metadata_roots.push(path);
             expand_chain(&parsed, &by_path, path, 0, &mut chain, &mut chain_gaps);
         }
-        let metadata_chain_complete = chain_gaps.is_empty();
-        let mut pending_regions = Vec::<(String, MembershipRegion, usize)>::new();
-        let mut inventory_gap_indices = Vec::new();
-        for (path, evidence, import) in chain_gaps {
-            facts.membership_complete = false;
-            let index = facts
-                .gaps
-                .iter()
-                .position(|gap| {
-                    gap.path == path
-                        && matches!(
-                            gap.code.as_str(),
-                            "configuration_byte_cap" | "configuration_not_utf8"
-                        )
-                })
-                .unwrap_or_else(|| gap(&mut facts, "unresolved_import", path, &evidence));
-            pending_regions.push((
-                path.to_owned(),
-                import
-                    .map(MembershipRegion::Import)
-                    .unwrap_or(MembershipRegion::Root),
-                index,
-            ));
-        }
-
-        let mut properties = DefaultItemProperties::default();
-        // Output-root exclusions are applied from the evaluated roots below.
-        // Before any authored assignment, the extra exclusion list is empty.
-        let mut default_excludes = String::new();
-        let mut default_candidates = vec!["bin/**".to_owned(), "obj/**".to_owned()];
-        let mut default_unknown = false;
-        let mut output_roots = None;
-        let mut default_position = None;
-        let mut transitive_flow = project.sdk_project;
-        let mut parsed_references_complete = true;
-        let mut references_mutated = false;
-        let mut operations = Vec::new();
-        let mut deferred_items = Vec::new();
-        let mut raw_references = Vec::new();
-        let chain_source = |path: &str| {
-            by_path
-                .get(path)
-                .and_then(|input| input.source.as_deref())
-                .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        let instances = symbols::framework_instances(&by_path, project_path);
+        // Evaluate membership in each inner build, while retaining one shared
+        // file product. A single-target authored framework is not a global.
+        let instances = if instances.is_empty() {
+            vec![None]
+        } else {
+            instances.into_iter().map(Some).collect()
         };
-        // AD3d: property groups and their conditions in import order.
-        let mut ordered = symbols::OrderedProperties::new(
-            chain.iter().filter_map(|(path, _)| chain_source(path)),
-            &Path::new(project_path)
-                .file_stem()
-                .expect("project")
-                .to_string_lossy(),
-            &[],
-        );
-        for (index, (path, fragment)) in chain.iter().enumerate() {
-            if index == props_end {
-                ordered.leave_props_phase();
+        for framework in &instances {
+            let globals = framework
+                .as_ref()
+                .map_or_else(Vec::new, |instance| instance.globals());
+            let metadata_chain_complete = chain_gaps.is_empty();
+            let mut pending_regions = Vec::<(String, MembershipRegion, usize)>::new();
+            let mut inventory_gap_indices = Vec::new();
+            for (path, evidence, import) in &chain_gaps {
+                facts.membership_complete = false;
+                let index = facts
+                    .gaps
+                    .iter()
+                    .position(|gap| {
+                        gap.path == *path
+                            && matches!(
+                                gap.code.as_str(),
+                                "configuration_byte_cap" | "configuration_not_utf8"
+                            )
+                    })
+                    .unwrap_or_else(|| gap(&mut facts, "unresolved_import", path, evidence));
+                pending_regions.push((
+                    (*path).to_owned(),
+                    import
+                        .clone()
+                        .map(MembershipRegion::Import)
+                        .unwrap_or(MembershipRegion::Root),
+                    index,
+                ));
             }
-            if index == body_start {
-                default_position = Some(operations.len());
-            }
-            if index == targets_start {
-                output_roots = Some(properties.fill_sdk_defaults());
-            }
-            let is_project = *path == project_path;
-            for issue in &fragment.issues {
-                let index = gap(
-                    &mut facts,
-                    "unsupported_project_items",
-                    path,
-                    &issue.evidence,
-                );
-                let region = match &issue.region {
-                    MembershipRegion::Root => MembershipRegion::Root,
-                    MembershipRegion::Project => MembershipRegion::Project,
-                    MembershipRegion::Pattern(value) => MembershipRegion::Pattern(value.clone()),
-                    MembershipRegion::DefaultTrees => MembershipRegion::DefaultTrees,
-                    MembershipRegion::Import(value) => MembershipRegion::Import(value.clone()),
-                };
-                pending_regions.push(((*path).to_owned(), region, index));
-            }
-            if !is_project && (fragment.sdk_project || fragment.compiles_nothing) {
-                let index = gap(
-                    &mut facts,
-                    "unsupported_project_items",
-                    path,
-                    "an imported file selects an SDK",
-                );
-                pending_regions.push(((*path).to_owned(), MembershipRegion::Root, index));
-            }
-            let fragment_source = chain_source(path);
-            for assignment in &fragment.default_assignments {
-                let (kind, value) = (&assignment.kind, &assignment.value);
-                // An assignment whose guard is definitely false never executes,
-                // so it neither opens nor narrows the default trees.
-                let decision = match (&assignment.conditions, fragment_source) {
-                    (Some(conditions), Some(source)) => {
-                        ordered.decide_at_fragment_start(conditions, source)
-                    }
-                    _ => None,
-                };
-                if decision == Some(false) {
-                    continue;
+
+            let mut properties = DefaultItemProperties::default();
+            // Output-root exclusions are applied from the evaluated roots below.
+            // Before any authored assignment, the extra exclusion list is empty.
+            let mut default_excludes = String::new();
+            let mut default_candidates = vec!["bin/**".to_owned(), "obj/**".to_owned()];
+            let mut default_unknown = false;
+            let mut output_roots = None;
+            let mut default_position = None;
+            let mut transitive_flow = project.sdk_project;
+            let mut parsed_references_complete = true;
+            let mut references_mutated = false;
+            let mut operations = Vec::new();
+            let mut deferred_items = Vec::new();
+            let mut raw_references = Vec::new();
+            let chain_source = |path: &str| {
+                by_path
+                    .get(path)
+                    .and_then(|input| input.source.as_deref())
+                    .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            };
+            // AD3d: property groups and their conditions in import order.
+            let mut ordered = symbols::OrderedProperties::new(
+                chain.iter().filter_map(|(path, _)| chain_source(path)),
+                &Path::new(project_path)
+                    .file_stem()
+                    .expect("project")
+                    .to_string_lossy(),
+                &globals,
+            );
+            for (index, (path, fragment)) in chain.iter().enumerate() {
+                if index == props_end {
+                    ordered.leave_props_phase();
                 }
-                // A definitely true guard is still conditioned here: the
-                // effective default-item properties come from the parse, which
-                // could not decide it, so only a definite false changes anything.
-                let conditioned = &assignment.conditioned;
-                let late = output_roots.is_some()
-                    && matches!(
-                        kind,
-                        PropertyKind::BaseOutputPath | PropertyKind::BaseIntermediateOutputPath
+                if index == body_start {
+                    default_position = Some(operations.len());
+                }
+                if index == targets_start {
+                    output_roots = Some(properties.fill_sdk_defaults());
+                }
+                let is_project = *path == project_path;
+                for issue in &fragment.issues {
+                    let index = gap(
+                        &mut facts,
+                        "unsupported_project_items",
+                        path,
+                        &issue.evidence,
                     );
-                let mut known = HashMap::default();
-                known.insert(
-                    "defaultitemexcludes".to_owned(),
-                    Ok(default_excludes.clone()),
-                );
-                let expanded = symbols::expand(value, &known);
-                let kind_label = match kind {
-                    PropertyKind::OutputTree(name)
-                    | PropertyKind::DefaultPattern(name)
-                    | PropertyKind::ProjectDefault(name) => (*name).to_owned(),
-                    _ => format!("{kind:?}"),
-                };
-                let unmodeled_default = matches!(
-                    kind,
-                    PropertyKind::OutputTree(_)
-                        | PropertyKind::DefaultPattern(_)
-                        | PropertyKind::ProjectDefault(_)
-                );
-                let mut patterns = Vec::new();
-                let mut project_region = false;
-                match kind {
-                    PropertyKind::DefaultItemExcludes => match expanded {
-                        Ok(value) => {
-                            patterns.extend(
+                    let region = match &issue.region {
+                        MembershipRegion::Root => MembershipRegion::Root,
+                        MembershipRegion::Project => MembershipRegion::Project,
+                        MembershipRegion::Pattern(value) => {
+                            MembershipRegion::Pattern(value.clone())
+                        }
+                        MembershipRegion::DefaultTrees => MembershipRegion::DefaultTrees,
+                        MembershipRegion::Import(value) => MembershipRegion::Import(value.clone()),
+                    };
+                    pending_regions.push(((*path).to_owned(), region, index));
+                }
+                if !is_project && (fragment.sdk_project || fragment.compiles_nothing) {
+                    let index = gap(
+                        &mut facts,
+                        "unsupported_project_items",
+                        path,
+                        "an imported file selects an SDK",
+                    );
+                    pending_regions.push(((*path).to_owned(), MembershipRegion::Root, index));
+                }
+                let fragment_source = chain_source(path);
+                let mut decisions = Vec::new();
+                let mut observed_excludes = Ok(default_excludes.clone());
+                match fragment_source {
+                    Some(source) => {
+                        ordered.apply_observing(source, |name, decision, value, state| {
+                            if let Some(kind) = property_kind(name)
+                                && !matches!(
+                                    kind,
+                                    PropertyKind::Metadata(_) | PropertyKind::ReferenceFlow
+                                )
+                            {
+                                let mut known = state.clone();
+                                known.insert(
+                                    "defaultitemexcludes".to_owned(),
+                                    observed_excludes.clone(),
+                                );
+                                let expanded = symbols::expand(value, &known);
+                                if kind == PropertyKind::DefaultItemExcludes
+                                    && decision != Some(false)
+                                {
+                                    observed_excludes = if decision == Some(true) {
+                                        expanded.clone()
+                                    } else {
+                                        Err("condition")
+                                    };
+                                }
+                                decisions.push((kind, decision, expanded.ok()));
+                            }
+                        })
+                    }
+                    None => ordered.poison(),
+                }
+                // Unsupported XML shapes may not expose the same assignments to
+                // both readers. Keep every guard open in that case.
+                let aligned = decisions.len() == fragment.default_assignments.len()
+                    && decisions
+                        .iter()
+                        .zip(&fragment.default_assignments)
+                        .all(|((kind, _, _), assignment)| *kind == assignment.kind);
+                for (index, assignment) in fragment.default_assignments.iter().enumerate() {
+                    let (kind, raw_value) = (&assignment.kind, &assignment.value);
+                    let (decision, expanded_value) = if aligned {
+                        (decisions[index].1, decisions[index].2.as_ref())
+                    } else {
+                        (None, None)
+                    };
+                    if decision == Some(false) {
+                        continue;
+                    }
+                    let conditioned = decision != Some(true) || assignment.conditions.is_none();
+                    let value = expanded_value.unwrap_or(raw_value);
+                    if !conditioned && let Some(slot) = properties.slot(*kind) {
+                        *slot = Some(value.trim().to_owned());
+                    }
+                    let late = output_roots.is_some()
+                        && matches!(
+                            kind,
+                            PropertyKind::BaseOutputPath | PropertyKind::BaseIntermediateOutputPath
+                        );
+                    let mut known = HashMap::default();
+                    known.insert(
+                        "defaultitemexcludes".to_owned(),
+                        Ok(default_excludes.clone()),
+                    );
+                    let expanded = symbols::expand(value, &known);
+                    let kind_label = match kind {
+                        PropertyKind::OutputTree(name)
+                        | PropertyKind::DefaultPattern(name)
+                        | PropertyKind::ProjectDefault(name) => (*name).to_owned(),
+                        _ => format!("{kind:?}"),
+                    };
+                    let unmodeled_default = matches!(
+                        kind,
+                        PropertyKind::OutputTree(_)
+                            | PropertyKind::DefaultPattern(_)
+                            | PropertyKind::ProjectDefault(_)
+                    );
+                    let mut patterns = Vec::new();
+                    let mut project_region = false;
+                    match kind {
+                        PropertyKind::DefaultItemExcludes => match expanded {
+                            Ok(value) => {
+                                patterns.extend(
+                                    value
+                                        .split(';')
+                                        .filter(|s| !s.trim().is_empty())
+                                        .map(str::to_owned),
+                                );
+                                if !conditioned {
+                                    default_excludes = value;
+                                }
+                            }
+                            Err(_) => project_region = true,
+                        },
+                        PropertyKind::BaseOutputPath | PropertyKind::BaseIntermediateOutputPath => {
+                            if static_property_value(value) {
+                                patterns.push(if value.is_empty() {
+                                    if matches!(kind, PropertyKind::BaseOutputPath) {
+                                        "bin"
+                                    } else {
+                                        "obj"
+                                    }
+                                    .into()
+                                } else {
+                                    value.clone()
+                                });
+                            } else {
+                                project_region = true;
+                            }
+                        }
+                        PropertyKind::OutputTree(_) => {
+                            if static_property_value(value) {
+                                if !value.trim().is_empty() {
+                                    patterns.push(value.clone());
+                                }
+                            } else {
+                                project_region = true;
+                            }
+                        }
+                        PropertyKind::DefaultPattern(_) => match expanded {
+                            Ok(value) => patterns.extend(
                                 value
                                     .split(';')
                                     .filter(|s| !s.trim().is_empty())
                                     .map(str::to_owned),
-                            );
-                            default_excludes = value;
-                        }
-                        Err(_) => project_region = true,
-                    },
-                    PropertyKind::BaseOutputPath | PropertyKind::BaseIntermediateOutputPath => {
-                        if static_property_value(value) {
-                            patterns.push(if value.is_empty() {
-                                if matches!(kind, PropertyKind::BaseOutputPath) {
-                                    "bin"
-                                } else {
-                                    "obj"
-                                }
-                                .into()
-                            } else {
-                                value.clone()
-                            });
-                        } else {
-                            project_region = true;
-                        }
-                    }
-                    PropertyKind::OutputTree(_) => {
-                        if static_property_value(value) {
-                            if !value.trim().is_empty() {
-                                patterns.push(value.clone());
-                            }
-                        } else {
-                            project_region = true;
-                        }
-                    }
-                    PropertyKind::DefaultPattern(_) => match expanded {
-                        Ok(value) => patterns.extend(
-                            value
-                                .split(';')
-                                .filter(|s| !s.trim().is_empty())
-                                .map(str::to_owned),
-                        ),
-                        Err(_) => project_region = true,
-                    },
-                    PropertyKind::ProjectDefault(_) => project_region = true,
-                    PropertyKind::EnableDefaultItems | PropertyKind::EnableDefaultCompileItems => {
-                        if *conditioned
-                            || !matches!(
-                                value.trim().to_ascii_lowercase().as_str(),
-                                "" | "true" | "false"
-                            )
-                        {
-                            project_region = true;
-                        }
-                    }
-                    PropertyKind::Unsupported => {
-                        let index = gap(
-                            &mut facts,
-                            "unsupported_project_items",
-                            path,
-                            "an unmodeled property can change imported membership",
-                        );
-                        pending_regions.push(((*path).to_owned(), MembershipRegion::Root, index));
-                    }
-                    PropertyKind::Metadata(_) | PropertyKind::ReferenceFlow => unreachable!(),
-                }
-                default_unknown |= project_region;
-                for pattern in &patterns {
-                    let candidate = if matches!(
-                        kind,
-                        PropertyKind::BaseOutputPath
-                            | PropertyKind::BaseIntermediateOutputPath
-                            | PropertyKind::OutputTree(_)
-                    ) {
-                        format!("{}/**", pattern.trim_end_matches(['/', '\\']))
-                    } else {
-                        pattern.clone()
-                    };
-                    default_candidates.push(candidate);
-                }
-                if project_region || *conditioned || late || unmodeled_default {
-                    let index = gap(
-                        &mut facts,
-                        "open_default_glob",
-                        path,
-                        &format!(
-                            "{kind_label} assignment is conditioned, late or unknown: {value}"
-                        ),
-                    );
-                    pending_regions.push((
-                        (*path).to_owned(),
-                        MembershipRegion::DefaultTrees,
-                        index,
-                    ));
-                }
-            }
-            match fragment_source {
-                Some(source) => ordered.apply(source),
-                None => ordered.poison(),
-            }
-            properties.overlay(&fragment.properties);
-            transitive_flow &= fragment.transitive_flow;
-            if !fragment.references_complete {
-                parsed_references_complete = false;
-                gap(
-                    &mut facts,
-                    "unsupported_project_reference",
-                    path,
-                    "a ProjectReference is conditioned, inside a Target, dynamic or carries unsupported metadata",
-                );
-            }
-            if fragment.references_mutated {
-                references_mutated = true;
-                gap(
-                    &mut facts,
-                    "unsupported_project_reference",
-                    path,
-                    "a ProjectReference Remove, Update or item definition can change any reference",
-                );
-            }
-            for item in &fragment.deferred_items {
-                deferred_items.push((
-                    *path,
-                    operations.len() + item.position,
-                    index < body_start,
-                    item,
-                ));
-            }
-            operations.extend(fragment.operations.iter().cloned());
-            raw_references.extend(fragment.references.iter().map(|raw| (*path, raw)));
-        }
-        // MSBuild evaluates items only after all imported property groups.
-        let mut resolved_items = Vec::new();
-        for (path, position, before_defaults, item) in deferred_items {
-            match ordered.decide_final(&item.conditions) {
-                Some(false) => continue,
-                Some(true) => {
-                    let expanded = item
-                        .attributes
-                        .iter()
-                        .map(|(name, value)| {
-                            let value = if matches!(name.as_str(), "Include" | "Remove" | "Exclude")
-                            {
-                                ordered.expand_final(value)?
-                            } else {
-                                value.clone()
-                            };
-                            Ok((name.clone(), value))
-                        })
-                        .collect::<Result<Vec<_>, &'static str>>();
-                    if let Ok(attributes) = expanded {
-                        let mut resolved = Vec::new();
-                        let mut complete = true;
-                        collect_compile_operation(&attributes, false, &mut resolved, &mut complete);
-                        if complete {
-                            if before_defaults
-                                && let Some(default_position) = default_position.as_mut()
-                            {
-                                *default_position += resolved.len();
-                            }
-                            resolved_items.push((position, resolved));
-                            continue;
-                        }
-                    }
-                }
-                None => {}
-            }
-            for issue in &item.issues {
-                let index = gap(
-                    &mut facts,
-                    "unsupported_project_items",
-                    path,
-                    &issue.evidence,
-                );
-                pending_regions.push((path.to_owned(), issue.region.clone(), index));
-            }
-        }
-        // Reverse insertion preserves positions, including adjacent deferred items.
-        for (position, resolved) in resolved_items.into_iter().rev() {
-            operations.splice(position..position, resolved);
-        }
-        // Enumeration is independent of SDK path handling. Use the acquired
-        // ordered import chain for both SDK paths and symbol instances.
-        let sources = chain
-            .iter()
-            .filter_map(|(path, _)| by_path.get(*path).copied())
-            .filter_map(|input| input.source.as_deref())
-            .filter_map(|bytes| std::str::from_utf8(bytes).ok())
-            .collect::<Vec<_>>();
-        let sdk_properties = symbols::membership_properties(sources.iter().copied());
-        let declared = symbols::declared_frameworks(&sdk_properties);
-        let instances = symbols::framework_instances(&by_path, project_path);
-        if project
-            .sdks
-            .iter()
-            .any(|sdk| sdk_path_properties(sdk).is_some())
-        {
-            // SDK paths retain their project-level evaluation in this slice.
-            // A single TargetFramework already enters that evaluation as authored.
-            let frameworks = sdk_properties.as_ref().ok().and_then(|properties| {
-                if properties.contains_key("targetframework") {
-                    return None;
-                }
-                properties
-                    .get("targetframeworks")?
-                    .as_ref()
-                    .ok()
-                    .map(|_| &declared)
-            });
-            for sdk in &project.sdks {
-                if inherited_razor_defaults(sdk) {
-                    // Generated sources can collide with checked-in files under the
-                    // intermediate directory. Keep those paths open independently
-                    // of the generated declaration inventory.
-                    let evaluations = frameworks.as_ref().map_or_else(
-                        || vec![sdk_properties.clone()],
-                        |entries| {
-                            entries
-                                .iter()
-                                .map(|entry| {
-                                    symbols::membership_properties_with_globals(
-                                        sources.iter().copied(),
-                                        &[("TargetFramework", entry)],
-                                    )
-                                })
-                                .collect()
+                            ),
+                            Err(_) => project_region = true,
                         },
-                    );
-                    let evaluations = if evaluations.is_empty() {
-                        vec![Err("empty_target_frameworks")]
-                    } else {
-                        evaluations
-                    };
-                    for properties in evaluations {
-                        let intermediate = properties
-                            .as_ref()
-                            .ok()
-                            .and_then(|properties| properties.get("intermediateoutputpath"));
-                        let reason = properties.as_ref().err().copied().or_else(|| {
-                            intermediate.and_then(|value| value.as_ref().err().copied())
-                        });
-                        let evidence = format!(
-                            "Razor generator and embedded validation declarations are unacquired{}",
-                            reason
-                                .map(|reason| format!(
-                                    "; SDK property evaluation unknown: {reason}"
-                                ))
-                                .unwrap_or_default()
-                        );
+                        PropertyKind::ProjectDefault(_) => project_region = true,
+                        PropertyKind::EnableDefaultItems
+                        | PropertyKind::EnableDefaultCompileItems => {
+                            if conditioned
+                                || !matches!(
+                                    value.trim().to_ascii_lowercase().as_str(),
+                                    "" | "true" | "false"
+                                )
+                            {
+                                project_region = true;
+                            }
+                        }
+                        PropertyKind::Unsupported => {
+                            let index = gap(
+                                &mut facts,
+                                "unsupported_project_items",
+                                path,
+                                "an unmodeled property can change imported membership",
+                            );
+                            pending_regions.push((
+                                (*path).to_owned(),
+                                MembershipRegion::Root,
+                                index,
+                            ));
+                        }
+                        PropertyKind::Metadata(_) | PropertyKind::ReferenceFlow => unreachable!(),
+                    }
+                    default_unknown |= project_region;
+                    for pattern in &patterns {
+                        let candidate = if matches!(
+                            kind,
+                            PropertyKind::BaseOutputPath
+                                | PropertyKind::BaseIntermediateOutputPath
+                                | PropertyKind::OutputTree(_)
+                        ) {
+                            format!("{}/**", pattern.trim_end_matches(['/', '\\']))
+                        } else {
+                            pattern.clone()
+                        };
+                        default_candidates.push(candidate);
+                    }
+                    if project_region || conditioned || late || unmodeled_default {
                         let index = gap(
                             &mut facts,
-                            "unsupported_project_items",
-                            project_path,
-                            &evidence,
+                            "open_default_glob",
+                            path,
+                            &format!(
+                                "{kind_label} assignment is conditioned, late or unknown: {raw_value}"
+                            ),
                         );
-                        inventory_gap_indices.push(index);
                         pending_regions.push((
-                            project_path.to_owned(),
-                            intermediate
-                                .and_then(|value| value.as_ref().ok())
-                                .map_or(MembershipRegion::Root, |path| {
-                                    MembershipRegion::Pattern(format!("{path}/**"))
-                                }),
+                            (*path).to_owned(),
+                            MembershipRegion::DefaultTrees,
                             index,
                         ));
                     }
-                    continue;
                 }
-                if let Some((names, declarations)) = sdk_path_properties(sdk) {
-                    let mut evidence = Vec::new();
-                    let mut open_root = false;
-                    let selected = frameworks.map(Vec::as_slice);
-                    if selected.is_some_and(<[_]>::is_empty) {
-                        open_root = true;
-                        evidence.push("TargetFrameworks has no selected framework".to_owned());
-                    }
-                    if selected.is_none()
-                        && sdk_properties.as_ref().ok().is_some_and(|properties| {
-                            !properties.contains_key("targetframework")
-                                && properties
-                                    .get("targetframeworks")
-                                    .is_some_and(Result::is_err)
-                        })
-                        && let Some(raw) = symbols::raw_target_frameworks(sources.iter().copied())
-                    {
-                        evidence.push(format!(
-                            "TargetFrameworks has an unenumerable entry in {raw:?}"
-                        ));
-                    }
-                    let evaluations = selected.map_or_else(
-                        || vec![(None, sdk_properties.clone())],
-                        |entries| {
-                            entries
-                                .iter()
-                                .map(|entry| {
-                                    let valid = !entry.contains(['$', '@', '%', '/', '\\', ':']);
-                                    (
-                                        Some(entry.as_str()),
-                                        if valid {
-                                            symbols::membership_properties_with_globals(
-                                                sources.iter().copied(),
-                                                &[("TargetFramework", entry)],
-                                            )
-                                        } else {
-                                            Err("unknown_framework_entry")
-                                        },
-                                    )
-                                })
-                                .collect::<Vec<_>>()
-                        },
+                transitive_flow &= fragment.transitive_flow;
+                if !fragment.references_complete {
+                    parsed_references_complete = false;
+                    gap(
+                        &mut facts,
+                        "unsupported_project_reference",
+                        path,
+                        "a ProjectReference is conditioned, inside a Target, dynamic or carries unsupported metadata",
                     );
-                    for (framework, properties) in &evaluations {
-                        if let Err(reason) = properties {
+                }
+                if fragment.references_mutated {
+                    references_mutated = true;
+                    gap(
+                        &mut facts,
+                        "unsupported_project_reference",
+                        path,
+                        "a ProjectReference Remove, Update or item definition can change any reference",
+                    );
+                }
+                for item in &fragment.deferred_items {
+                    deferred_items.push((
+                        *path,
+                        operations.len() + item.position,
+                        index < body_start,
+                        item,
+                    ));
+                }
+                operations.extend(fragment.operations.iter().cloned());
+                raw_references.extend(fragment.references.iter().map(|raw| (*path, raw)));
+            }
+            // MSBuild evaluates items only after all imported property groups.
+            let mut resolved_items = Vec::new();
+            for (path, position, before_defaults, item) in deferred_items {
+                match ordered.decide_final(&item.conditions) {
+                    Some(false) => continue,
+                    Some(true) => {
+                        let expanded = item
+                            .attributes
+                            .iter()
+                            .map(|(name, value)| {
+                                let value =
+                                    if matches!(name.as_str(), "Include" | "Remove" | "Exclude") {
+                                        ordered.expand_final(value)?
+                                    } else {
+                                        value.clone()
+                                    };
+                                Ok((name.clone(), value))
+                            })
+                            .collect::<Result<Vec<_>, &'static str>>();
+                        if let Ok(attributes) = expanded {
+                            let mut resolved = Vec::new();
+                            let mut complete = true;
+                            collect_compile_operation(
+                                &attributes,
+                                false,
+                                &mut resolved,
+                                &mut complete,
+                            );
+                            if complete {
+                                if before_defaults
+                                    && let Some(default_position) = default_position.as_mut()
+                                {
+                                    *default_position += resolved.len();
+                                }
+                                resolved_items.push((position, resolved));
+                                continue;
+                            }
+                        }
+                    }
+                    None => {}
+                }
+                for issue in &item.issues {
+                    let index = gap(
+                        &mut facts,
+                        "unsupported_project_items",
+                        path,
+                        &issue.evidence,
+                    );
+                    pending_regions.push((path.to_owned(), issue.region.clone(), index));
+                }
+            }
+            // Reverse insertion preserves positions, including adjacent deferred items.
+            for (position, resolved) in resolved_items.into_iter().rev() {
+                operations.splice(position..position, resolved);
+            }
+            // Enumeration is independent of SDK path handling. Use the acquired
+            // ordered import chain for both SDK paths and symbol instances.
+            let sources = chain
+                .iter()
+                .filter_map(|(path, _)| by_path.get(*path).copied())
+                .filter_map(|input| input.source.as_deref())
+                .filter_map(|bytes| std::str::from_utf8(bytes).ok())
+                .collect::<Vec<_>>();
+            let sdk_properties = symbols::membership_properties(sources.iter().copied());
+            let declared = symbols::declared_frameworks(&sdk_properties);
+            if project
+                .sdks
+                .iter()
+                .any(|sdk| sdk_path_properties(sdk).is_some())
+            {
+                // SDK paths retain their project-level evaluation in this slice.
+                // A single TargetFramework already enters that evaluation as authored.
+                let frameworks = sdk_properties.as_ref().ok().and_then(|properties| {
+                    if properties.contains_key("targetframework") {
+                        return None;
+                    }
+                    properties
+                        .get("targetframeworks")?
+                        .as_ref()
+                        .ok()
+                        .map(|_| &declared)
+                });
+                for sdk in &project.sdks {
+                    if inherited_razor_defaults(sdk) {
+                        // Generated sources can collide with checked-in files under the
+                        // intermediate directory. Keep those paths open independently
+                        // of the generated declaration inventory.
+                        let evaluations = frameworks.as_ref().map_or_else(
+                            || vec![sdk_properties.clone()],
+                            |entries| {
+                                entries
+                                    .iter()
+                                    .map(|entry| {
+                                        symbols::membership_properties_with_globals(
+                                            sources.iter().copied(),
+                                            &[("TargetFramework", entry)],
+                                        )
+                                    })
+                                    .collect()
+                            },
+                        );
+                        let evaluations = if evaluations.is_empty() {
+                            vec![Err("empty_target_frameworks")]
+                        } else {
+                            evaluations
+                        };
+                        for properties in evaluations {
+                            let intermediate = properties
+                                .as_ref()
+                                .ok()
+                                .and_then(|properties| properties.get("intermediateoutputpath"));
+                            let reason = properties.as_ref().err().copied().or_else(|| {
+                                intermediate.and_then(|value| value.as_ref().err().copied())
+                            });
+                            let evidence = format!(
+                                "Razor generator and embedded validation declarations are unacquired{}",
+                                reason
+                                    .map(|reason| format!(
+                                        "; SDK property evaluation unknown: {reason}"
+                                    ))
+                                    .unwrap_or_default()
+                            );
+                            let index = gap(
+                                &mut facts,
+                                "unsupported_project_items",
+                                project_path,
+                                &evidence,
+                            );
+                            inventory_gap_indices.push(index);
+                            pending_regions.push((
+                                project_path.to_owned(),
+                                intermediate
+                                    .and_then(|value| value.as_ref().ok())
+                                    .map_or(MembershipRegion::Root, |path| {
+                                        MembershipRegion::Pattern(format!("{path}/**"))
+                                    }),
+                                index,
+                            ));
+                        }
+                        continue;
+                    }
+                    if let Some((names, declarations)) = sdk_path_properties(sdk) {
+                        let mut evidence = Vec::new();
+                        let mut open_root = false;
+                        let selected = frameworks.map(Vec::as_slice);
+                        if selected.is_some_and(<[_]>::is_empty) {
                             open_root = true;
-                            if let Some(framework) = framework {
+                            evidence.push("TargetFrameworks has no selected framework".to_owned());
+                        }
+                        if selected.is_none()
+                            && sdk_properties.as_ref().ok().is_some_and(|properties| {
+                                !properties.contains_key("targetframework")
+                                    && properties
+                                        .get("targetframeworks")
+                                        .is_some_and(Result::is_err)
+                            })
+                            && let Some(raw) =
+                                symbols::raw_target_frameworks(sources.iter().copied())
+                        {
+                            evidence.push(format!(
+                                "TargetFrameworks has an unenumerable entry in {raw:?}"
+                            ));
+                        }
+                        let evaluations = selected.map_or_else(
+                            || vec![(None, sdk_properties.clone())],
+                            |entries| {
+                                entries
+                                    .iter()
+                                    .map(|entry| {
+                                        let valid =
+                                            !entry.contains(['$', '@', '%', '/', '\\', ':']);
+                                        (
+                                            Some(entry.as_str()),
+                                            if valid {
+                                                symbols::membership_properties_with_globals(
+                                                    sources.iter().copied(),
+                                                    &[("TargetFramework", entry)],
+                                                )
+                                            } else {
+                                                Err("unknown_framework_entry")
+                                            },
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                            },
+                        );
+                        for (framework, properties) in &evaluations {
+                            if let Err(reason) = properties {
+                                open_root = true;
+                                if let Some(framework) = framework {
+                                    evidence.push(format!(
+                                        "TargetFramework={framework} evaluation unknown: {reason}"
+                                    ));
+                                }
+                            }
+                            for name in names {
+                                let value = properties
+                                    .as_ref()
+                                    .ok()
+                                    .and_then(|properties| {
+                                        properties.get(&name.to_ascii_lowercase())
+                                    })
+                                    .and_then(|value| value.as_ref().ok());
+                                let inside = value.is_some_and(|value| {
+                                    static_item_path(value)
+                                        && !value.contains(':')
+                                        && resolve_item_path(directory, value)
+                                            .is_some_and(|path| path.starts_with(directory))
+                                });
+                                open_root |= !inside;
                                 evidence.push(format!(
-                                    "TargetFramework={framework} evaluation unknown: {reason}"
+                                    "{}{name}={} ({})",
+                                    framework
+                                        .map(|entry| format!("TargetFramework={entry} "))
+                                        .unwrap_or_default(),
+                                    value.map(String::as_str).unwrap_or("unknown"),
+                                    if inside {
+                                        "inside project"
+                                    } else {
+                                        "outside or unknown"
+                                    }
                                 ));
                             }
                         }
-                        for name in names {
-                            let value = properties
-                                .as_ref()
-                                .ok()
-                                .and_then(|properties| properties.get(&name.to_ascii_lowercase()))
-                                .and_then(|value| value.as_ref().ok());
-                            let inside = value.is_some_and(|value| {
-                                static_item_path(value)
-                                    && !value.contains(':')
-                                    && resolve_item_path(directory, value)
-                                        .is_some_and(|path| path.starts_with(directory))
-                            });
-                            open_root |= !inside;
-                            evidence.push(format!(
-                                "{}{name}={} ({})",
-                                framework
-                                    .map(|entry| format!("TargetFramework={entry} "))
-                                    .unwrap_or_default(),
-                                value.map(String::as_str).unwrap_or("unknown"),
-                                if inside {
-                                    "inside project"
-                                } else {
-                                    "outside or unknown"
-                                }
-                            ));
-                        }
-                    }
-                    let unknown = sdk_properties
-                        .as_ref()
-                        .err()
-                        .map(|reason| format!("; SDK property evaluation unknown: {reason}"))
-                        .unwrap_or_default();
-                    let index = gap(
-                        &mut facts,
-                        "unsupported_project_items",
-                        project_path,
-                        &format!(
-                            "{sdk} {declarations} and SDK Compile effects: {}{unknown}; workspace SDK defaults: AppDesignerFolder=Properties, BaseIntermediateOutputPath=obj/, Configuration=Debug, IntermediateOutputPath under BaseIntermediateOutputPath/Configuration/TargetFramework",
-                            evidence.join("; ")
-                        ),
-                    );
-                    pending_regions.push((
-                        project_path.to_owned(),
-                        if open_root {
-                            MembershipRegion::Root
-                        } else {
-                            MembershipRegion::Project
-                        },
-                        index,
-                    ));
-                }
-            }
-        }
-        let (base_output, base_intermediate) =
-            output_roots.unwrap_or_else(|| properties.fill_sdk_defaults());
-        let mut enabled =
-            |value: &Option<String>| match value.as_deref().map(str::to_ascii_lowercase) {
-                Some(value) if value == "true" => true,
-                // An empty value written after the SDK filled in its default is
-                // not `true`.
-                Some(value) if value.is_empty() || value == "false" => false,
-                value => {
-                    facts.membership_complete = false;
-                    gap(
-                        &mut facts,
-                        "unsupported_project_items",
-                        project_path,
-                        &format!("a default-item property has the value {value:?}"),
-                    );
-                    false
-                }
-            };
-        let default_items = project.sdk_project
-            && enabled(&properties.enable_default_items)
-            && enabled(&properties.enable_default_compile_items);
-        if default_items {
-            let mut excluded_trees = Vec::new();
-            for root in [base_output, base_intermediate] {
-                if static_item_path(&root) {
-                    excluded_trees.push(root);
-                } else {
-                    facts.membership_complete = false;
-                    let index = gap(&mut facts, "unresolved_compile_item", project_path, &root);
-                    pending_regions.push((
-                        project_path.to_owned(),
-                        MembershipRegion::Project,
-                        index,
-                    ));
-                }
-            }
-            for pattern in default_excludes.split(';').filter(|p| !p.trim().is_empty()) {
-                let pattern = pattern.trim().replace('\\', "/");
-                // Only a whole-tree exclusion can enter excluded_trees. A
-                // filename pattern opens its literal region instead of
-                // discarding every sibling in that directory.
-                let tree = tree_glob(&pattern).or_else(|| {
-                    pattern
-                        .strip_suffix("/**")
-                        .filter(|base| static_item_path(base))
-                        .map(str::to_owned)
-                });
-                if let Some(tree) = tree {
-                    excluded_trees.push(tree);
-                } else {
-                    let index = gap(&mut facts, "open_default_glob", project_path, &pattern);
-                    pending_regions.push((
-                        project_path.to_owned(),
-                        MembershipRegion::Pattern(pattern),
-                        index,
-                    ));
-                }
-            }
-            // A project its own props import revisits is not in the chain
-            // (a recorded gap); its default item position is then moot.
-            operations.insert(
-                default_position.unwrap_or(operations.len()),
-                CompileOperation {
-                    kind: CompileOperationKind::DefaultTree,
-                    path: ".".to_owned(),
-                    exclude: None,
-                    excluded_trees,
-                },
-            );
-        }
-
-        // Item paths are relative to the project directory, wherever the
-        // item was written.
-        let mut items = Vec::new();
-        for operation in operations {
-            let path = match static_membership_pattern(directory, &operation.path) {
-                MembershipPattern::Resolved { path, .. } => path,
-                region => {
-                    let index = gap(
-                        &mut facts,
-                        "unresolved_compile_item",
-                        project_path,
-                        &format!("Compile item {:?}: {}", operation.path, region.evidence()),
-                    );
-                    inventory_gap_indices.push(index);
-                    if matches!(region, MembershipPattern::Unknown) {
+                        let unknown = sdk_properties
+                            .as_ref()
+                            .err()
+                            .map(|reason| format!("; SDK property evaluation unknown: {reason}"))
+                            .unwrap_or_default();
+                        let index = gap(
+                            &mut facts,
+                            "unsupported_project_items",
+                            project_path,
+                            &format!(
+                                "{sdk} {declarations} and SDK Compile effects: {}{unknown}; workspace SDK defaults: AppDesignerFolder=Properties, BaseIntermediateOutputPath=obj/, Configuration=Debug, IntermediateOutputPath under BaseIntermediateOutputPath/Configuration/TargetFramework",
+                                evidence.join("; ")
+                            ),
+                        );
                         pending_regions.push((
                             project_path.to_owned(),
-                            MembershipRegion::Root,
+                            if open_root {
+                                MembershipRegion::Root
+                            } else {
+                                MembershipRegion::Project
+                            },
                             index,
                         ));
                     }
-                    continue;
-                }
-            };
-            if let Some(exclude) = operation.exclude.as_deref() {
-                match static_membership_pattern(directory, exclude) {
-                    MembershipPattern::Resolved { path: excluded, .. } => {
-                        if excluded == path {
-                            continue;
-                        }
-                    }
-                    region => {
-                        let index = gap(
-                            &mut facts,
-                            "unresolved_compile_item",
-                            project_path,
-                            &format!("Compile exclude {exclude:?}: {}", region.evidence()),
-                        );
-                        inventory_gap_indices.push(index);
-                        if matches!(region, MembershipPattern::Unknown) {
-                            pending_regions.push((
-                                project_path.to_owned(),
-                                MembershipRegion::Root,
-                                index,
-                            ));
-                            continue;
-                        }
-                    }
                 }
             }
-            let mut excluded_trees = Vec::new();
-            for tree in &operation.excluded_trees {
-                match static_membership_pattern(directory, tree) {
-                    MembershipPattern::Resolved { path, .. } => excluded_trees.push(path),
-                    region => {
-                        let index = gap(
+            let (base_output, base_intermediate) =
+                output_roots.unwrap_or_else(|| properties.fill_sdk_defaults());
+            let mut enabled =
+                |value: &Option<String>| match value.as_deref().map(str::to_ascii_lowercase) {
+                    Some(value) if value == "true" => true,
+                    // An empty value written after the SDK filled in its default is
+                    // not `true`.
+                    Some(value) if value.is_empty() || value == "false" => false,
+                    value => {
+                        facts.membership_complete = false;
+                        gap(
                             &mut facts,
-                            "unresolved_compile_item",
+                            "unsupported_project_items",
                             project_path,
-                            &format!("Compile excluded tree {tree:?}: {}", region.evidence()),
+                            &format!("a default-item property has the value {value:?}"),
                         );
-                        inventory_gap_indices.push(index);
-                        if matches!(region, MembershipPattern::Unknown) {
-                            pending_regions.push((
-                                project_path.to_owned(),
-                                MembershipRegion::Root,
-                                index,
-                            ));
-                        } else if matches!(region, MembershipPattern::OutsideWorkspace) {
-                            // Every pure escape is an ancestor of the workspace root,
-                            // so excluding it excludes the whole workspace.
-                            excluded_trees.push(String::new());
-                        }
+                        false
                     }
-                }
-            }
-            items.push(CSharpCompileItem {
-                kind: match operation.kind {
-                    CompileOperationKind::Include => CSharpCompileItemKind::Include,
-                    CompileOperationKind::IncludeTree => CSharpCompileItemKind::IncludeTree,
-                    CompileOperationKind::DefaultTree => CSharpCompileItemKind::DefaultTree,
-                    CompileOperationKind::Remove => CSharpCompileItemKind::Remove,
-                },
-                rel_path: path,
-                excluded_trees,
-                gap_indices: Vec::new(),
-            });
-        }
-        let packages = chain
-            .iter()
-            .flat_map(|(_, fragment)| fragment.package_references.iter())
-            .collect::<Vec<_>>();
-        if !packages.is_empty()
-            && restore_paths.iter().any(|expected| {
-                expected.as_deref().is_none_or(|expected| {
-                    !inputs.iter().any(|input| {
-                        input.rel_path == expected && configuration_input_is_acquired(input)
-                    })
-                })
-            })
-        {
-            let assets = restore_paths[0]
-                .as_deref()
-                .and_then(|path| Path::new(path).parent())
-                .map(|parent| parent.join("project.assets.json"))
-                .and_then(|assets| {
-                    inputs
-                        .iter()
-                        .find(|input| Path::new(&input.rel_path) == assets)
-                })
-                .and_then(|input| input.source.as_deref())
-                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok());
-            for (id, declared) in &packages {
-                let versions = assets
-                    .as_ref()
-                    .and_then(|assets| assets.get("libraries"))
-                    .and_then(serde_json::Value::as_object)
-                    .into_iter()
-                    .flat_map(|libraries| libraries.iter())
-                    .filter_map(|(name, value)| {
-                        let (package, version) = name.rsplit_once('/')?;
-                        (package.eq_ignore_ascii_case(id)
-                            && value.get("type").and_then(serde_json::Value::as_str)
-                                == Some("package"))
-                        .then_some(version.to_owned())
-                    })
-                    .collect::<Vec<_>>();
-                let versions = if versions.is_empty() {
-                    vec![if static_property_value(declared) {
-                        (*declared).clone()
-                    } else {
-                        "unresolved-version".to_owned()
-                    }]
-                } else {
-                    versions
                 };
-                for version in versions {
-                    inventory_gap_indices.push(gap(&mut facts,"unacquired_package_import",project_path,&format!("package ({id}, {version}): injected declarations are unacquired; a package target may remove workspace items")));
-                }
-            }
-        }
-        default_candidates.sort();
-        default_candidates.dedup();
-        let pending_regions = pending_regions
-            .into_iter()
-            .flat_map(|(path, region, index)| {
-                if matches!(region, MembershipRegion::DefaultTrees) {
-                    if default_unknown {
-                        vec![(path, MembershipRegion::Project, index)]
+            let default_items = project.sdk_project
+                && enabled(&properties.enable_default_items)
+                && enabled(&properties.enable_default_compile_items);
+            if default_items {
+                let mut excluded_trees = Vec::new();
+                for root in [base_output, base_intermediate] {
+                    if static_item_path(&root) {
+                        excluded_trees.push(root);
                     } else {
-                        default_candidates
-                            .iter()
-                            .cloned()
-                            .map(|candidate| {
-                                (path.clone(), MembershipRegion::Pattern(candidate), index)
-                            })
-                            .collect()
+                        facts.membership_complete = false;
+                        let index = gap(&mut facts, "unresolved_compile_item", project_path, &root);
+                        pending_regions.push((
+                            project_path.to_owned(),
+                            MembershipRegion::Project,
+                            index,
+                        ));
                     }
-                } else {
-                    vec![(path, region, index)]
                 }
-            })
-            .collect::<Vec<_>>();
-        for (written_in, region, index) in pending_regions {
-            if let MembershipRegion::Import(value) = &region {
-                let acquired = resolve_item_path(
-                    Path::new(&written_in).parent().unwrap_or(Path::new("")),
-                    value,
-                )
-                .map(|path| portable_rel_path(&path))
-                .is_some_and(|path| {
-                    inputs.iter().any(|input| {
-                        input.rel_path == path && configuration_input_is_acquired(input)
-                    })
+                for pattern in default_excludes.split(';').filter(|p| !p.trim().is_empty()) {
+                    let pattern = pattern.trim().replace('\\', "/");
+                    // Only a whole-tree exclusion can enter excluded_trees. A
+                    // filename pattern opens its literal region instead of
+                    // discarding every sibling in that directory.
+                    let tree = tree_glob(&pattern).or_else(|| {
+                        pattern
+                            .strip_suffix("/**")
+                            .filter(|base| static_item_path(base))
+                            .map(str::to_owned)
+                    });
+                    if let Some(tree) = tree {
+                        excluded_trees.push(tree);
+                    } else {
+                        let index = gap(&mut facts, "open_default_glob", project_path, &pattern);
+                        pending_regions.push((
+                            project_path.to_owned(),
+                            MembershipRegion::Pattern(pattern),
+                            index,
+                        ));
+                    }
+                }
+                // A project its own props import revisits is not in the chain
+                // (a recorded gap); its default item position is then moot.
+                operations.insert(
+                    default_position.unwrap_or(operations.len()),
+                    CompileOperation {
+                        kind: CompileOperationKind::DefaultTree,
+                        path: ".".to_owned(),
+                        exclude: None,
+                        excluded_trees,
+                    },
+                );
+            }
+
+            // Item paths are relative to the project directory, wherever the
+            // item was written.
+            let mut items = Vec::new();
+            for operation in operations {
+                let path = match static_membership_pattern(directory, &operation.path) {
+                    MembershipPattern::Resolved { path, tree } => {
+                        let path_value = Path::new(&path);
+                        glob_roots.insert(
+                            if tree
+                                || matches!(
+                                    operation.kind,
+                                    CompileOperationKind::IncludeTree
+                                        | CompileOperationKind::DefaultTree
+                                )
+                            {
+                                path_value.to_path_buf()
+                            } else {
+                                path_value.parent().unwrap_or(Path::new("")).to_path_buf()
+                            },
+                        );
+                        path
+                    }
+                    region => {
+                        let index = gap(
+                            &mut facts,
+                            "unresolved_compile_item",
+                            project_path,
+                            &format!("Compile item {:?}: {}", operation.path, region.evidence()),
+                        );
+                        inventory_gap_indices.push(index);
+                        if matches!(region, MembershipPattern::Unknown) {
+                            pending_regions.push((
+                                project_path.to_owned(),
+                                MembershipRegion::Root,
+                                index,
+                            ));
+                        }
+                        continue;
+                    }
+                };
+                if let Some(exclude) = operation.exclude.as_deref() {
+                    match static_membership_pattern(directory, exclude) {
+                        MembershipPattern::Resolved { path: excluded, .. } => {
+                            if excluded == path {
+                                continue;
+                            }
+                        }
+                        region => {
+                            let index = gap(
+                                &mut facts,
+                                "unresolved_compile_item",
+                                project_path,
+                                &format!("Compile exclude {exclude:?}: {}", region.evidence()),
+                            );
+                            inventory_gap_indices.push(index);
+                            if matches!(region, MembershipPattern::Unknown) {
+                                pending_regions.push((
+                                    project_path.to_owned(),
+                                    MembershipRegion::Root,
+                                    index,
+                                ));
+                                continue;
+                            }
+                        }
+                    }
+                }
+                let mut excluded_trees = Vec::new();
+                for tree in &operation.excluded_trees {
+                    match static_membership_pattern(directory, tree) {
+                        MembershipPattern::Resolved { path, .. } => excluded_trees.push(path),
+                        region => {
+                            let index = gap(
+                                &mut facts,
+                                "unresolved_compile_item",
+                                project_path,
+                                &format!("Compile excluded tree {tree:?}: {}", region.evidence()),
+                            );
+                            inventory_gap_indices.push(index);
+                            if matches!(region, MembershipPattern::Unknown) {
+                                pending_regions.push((
+                                    project_path.to_owned(),
+                                    MembershipRegion::Root,
+                                    index,
+                                ));
+                            } else if matches!(region, MembershipPattern::OutsideWorkspace) {
+                                // Every pure escape is an ancestor of the workspace root,
+                                // so excluding it excludes the whole workspace.
+                                excluded_trees.push(String::new());
+                            }
+                        }
+                    }
+                }
+                items.push(CSharpCompileItem {
+                    kind: match operation.kind {
+                        CompileOperationKind::Include => CSharpCompileItemKind::Include,
+                        CompileOperationKind::IncludeTree => CSharpCompileItemKind::IncludeTree,
+                        CompileOperationKind::DefaultTree => CSharpCompileItemKind::DefaultTree,
+                        CompileOperationKind::Remove => CSharpCompileItemKind::Remove,
+                    },
+                    rel_path: path,
+                    excluded_trees,
+                    gap_indices: Vec::new(),
                 });
-                if !acquired && let Some(subject) = package_import_subject(value, &packages) {
-                    inventory_gap_indices.push(gap(&mut facts,"unacquired_package_import",&written_in,&format!("package {subject}: injected declarations are unacquired; a package target may remove workspace items")));
-                    continue;
+            }
+            let packages = chain
+                .iter()
+                .flat_map(|(_, fragment)| fragment.package_references.iter())
+                .collect::<Vec<_>>();
+            if !packages.is_empty()
+                && restore_paths.iter().any(|expected| {
+                    expected.as_deref().is_none_or(|expected| {
+                        !inputs.iter().any(|input| {
+                            input.rel_path == expected && configuration_input_is_acquired(input)
+                        })
+                    })
+                })
+            {
+                let assets = restore_paths[0]
+                    .as_deref()
+                    .and_then(|path| Path::new(path).parent())
+                    .map(|parent| parent.join("project.assets.json"))
+                    .and_then(|assets| {
+                        inputs
+                            .iter()
+                            .find(|input| Path::new(&input.rel_path) == assets)
+                    })
+                    .and_then(|input| input.source.as_deref())
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok());
+                for (id, declared) in &packages {
+                    let versions = assets
+                        .as_ref()
+                        .and_then(|assets| assets.get("libraries"))
+                        .and_then(serde_json::Value::as_object)
+                        .into_iter()
+                        .flat_map(|libraries| libraries.iter())
+                        .filter_map(|(name, value)| {
+                            let (package, version) = name.rsplit_once('/')?;
+                            (package.eq_ignore_ascii_case(id)
+                                && value.get("type").and_then(serde_json::Value::as_str)
+                                    == Some("package"))
+                            .then_some(version.to_owned())
+                        })
+                        .collect::<Vec<_>>();
+                    let versions = if versions.is_empty() {
+                        vec![if static_property_value(declared) {
+                            (*declared).clone()
+                        } else {
+                            "unresolved-version".to_owned()
+                        }]
+                    } else {
+                        versions
+                    };
+                    for version in versions {
+                        inventory_gap_indices.push(gap(&mut facts,"unacquired_package_import",project_path,&format!("package ({id}, {version}): injected declarations are unacquired; a package target may remove workspace items")));
+                    }
                 }
             }
-            inventory_gap_indices.push(index);
-            let (tree, path) = match region {
-                MembershipRegion::Root | MembershipRegion::Import(_) => (true, String::new()),
-                MembershipRegion::Project => (true, portable_rel_path(directory)),
-                MembershipRegion::DefaultTrees => unreachable!("expanded after every assignment"),
-                MembershipRegion::Pattern(pattern) => {
-                    match static_membership_pattern(directory, &pattern) {
-                        MembershipPattern::Resolved { tree, path } => (tree, path),
-                        MembershipPattern::Unknown => (true, String::new()),
-                        MembershipPattern::OutsideWorkspace => {
-                            inventory_gap_indices.push(gap(
+            default_candidates.sort();
+            default_candidates.dedup();
+            let pending_regions = pending_regions
+                .into_iter()
+                .flat_map(|(path, region, index)| {
+                    if matches!(region, MembershipRegion::DefaultTrees) {
+                        if default_unknown {
+                            vec![(path, MembershipRegion::Project, index)]
+                        } else {
+                            default_candidates
+                                .iter()
+                                .cloned()
+                                .map(|candidate| {
+                                    (path.clone(), MembershipRegion::Pattern(candidate), index)
+                                })
+                                .collect()
+                        }
+                    } else {
+                        vec![(path, region, index)]
+                    }
+                })
+                .collect::<Vec<_>>();
+            for (written_in, region, index) in pending_regions {
+                if let MembershipRegion::Import(value) = &region {
+                    let acquired = resolve_item_path(
+                        Path::new(&written_in).parent().unwrap_or(Path::new("")),
+                        value,
+                    )
+                    .map(|path| portable_rel_path(&path))
+                    .is_some_and(|path| {
+                        inputs.iter().any(|input| {
+                            input.rel_path == path && configuration_input_is_acquired(input)
+                        })
+                    });
+                    if !acquired && let Some(subject) = package_import_subject(value, &packages) {
+                        inventory_gap_indices.push(gap(&mut facts,"unacquired_package_import",&written_in,&format!("package {subject}: injected declarations are unacquired; a package target may remove workspace items")));
+                        continue;
+                    }
+                }
+                inventory_gap_indices.push(index);
+                let (tree, path) = match region {
+                    MembershipRegion::Root | MembershipRegion::Import(_) => (true, String::new()),
+                    MembershipRegion::Project => (true, portable_rel_path(directory)),
+                    MembershipRegion::DefaultTrees => {
+                        unreachable!("expanded after every assignment")
+                    }
+                    MembershipRegion::Pattern(pattern) => {
+                        match static_membership_pattern(directory, &pattern) {
+                            MembershipPattern::Resolved { tree, path } => (tree, path),
+                            MembershipPattern::Unknown => (true, String::new()),
+                            MembershipPattern::OutsideWorkspace => {
+                                inventory_gap_indices.push(gap(
                                 &mut facts,
                                 "unresolved_compile_item",
                                 &written_in,
@@ -1132,92 +1568,91 @@ pub(crate) fn compilation_facts(inputs: &[CSharpConfigurationInput]) -> CSharpCo
                                     "Compile pattern {pattern:?}: outside the selected workspace"
                                 ),
                             ));
-                            continue;
+                                continue;
+                            }
                         }
                     }
-                }
-            };
-            items.push(CSharpCompileItem {
-                kind: if tree {
-                    CSharpCompileItemKind::OpenTree
-                } else {
-                    CSharpCompileItemKind::Open
-                },
-                rel_path: path,
-                excluded_trees: Vec::new(),
-                gap_indices: vec![index],
-            });
-        }
-        inventory_gap_indices.sort_unstable();
-        inventory_gap_indices.dedup();
-        // Only SDK projects receive their references' references by default;
-        // a legacy project's direct references still reach it.
-        if !transitive_flow {
-            gap(
-                &mut facts,
-                "unproven_transitive_reference_flow",
-                project_path,
-                if project.sdk_project {
-                    "DisableTransitiveProjectReferences is set"
-                } else {
-                    "a non-SDK project's transitive reference flow is not modeled"
-                },
-            );
-        }
-        // A mutation can withdraw or change any reference of the project,
-        // wherever that reference was written.
-        let mut references_complete = parsed_references_complete && !references_mutated;
-        let mut references = Vec::new();
-        if references_mutated {
-            raw_references.clear();
-        }
-        for (written_in, raw) in raw_references {
-            match resolve_item_path(directory, raw).map(|path| portable_rel_path(&path)) {
-                Some(target) if project_paths.contains(target.as_str()) => {
-                    if !references.contains(&target) {
-                        references.push(target);
+                };
+                items.push(CSharpCompileItem {
+                    kind: if tree {
+                        CSharpCompileItemKind::OpenTree
+                    } else {
+                        CSharpCompileItemKind::Open
+                    },
+                    rel_path: path,
+                    excluded_trees: Vec::new(),
+                    gap_indices: vec![index],
+                });
+            }
+            inventory_gap_indices.sort_unstable();
+            inventory_gap_indices.dedup();
+            // Only SDK projects receive their references' references by default;
+            // a legacy project's direct references still reach it.
+            if !transitive_flow {
+                gap(
+                    &mut facts,
+                    "unproven_transitive_reference_flow",
+                    project_path,
+                    if project.sdk_project {
+                        "DisableTransitiveProjectReferences is set"
+                    } else {
+                        "a non-SDK project's transitive reference flow is not modeled"
+                    },
+                );
+            }
+            // A mutation can withdraw or change any reference of the project,
+            // wherever that reference was written.
+            let mut references_complete = parsed_references_complete && !references_mutated;
+            let mut references = Vec::new();
+            if references_mutated {
+                raw_references.clear();
+            }
+            for (written_in, raw) in raw_references {
+                match resolve_item_path(directory, raw).map(|path| portable_rel_path(&path)) {
+                    Some(target) if project_paths.contains(target.as_str()) => {
+                        if !references.contains(&target) {
+                            references.push(target);
+                        }
+                    }
+                    // A reference outside the selected C# projects (missing, out
+                    // of the workspace, over the cap, or another language) can
+                    // still forward C# references transitively.
+                    _ => {
+                        references_complete = false;
+                        gap(&mut facts, "unresolved_project_reference", written_in, raw);
                     }
                 }
-                // A reference outside the selected C# projects (missing, out
-                // of the workspace, over the cap, or another language) can
-                // still forward C# references transitively.
-                _ => {
-                    references_complete = false;
-                    gap(&mut facts, "unresolved_project_reference", written_in, raw);
-                }
             }
-        }
-        let mut compilation = CSharpCompilationFact {
-            symbols: Default::default(),
-            project_path: Some(project_path.to_owned()),
-            items,
-            inventory_gap_indices,
-            references,
-            references_complete,
-            transitive_flow,
-            metadata: derive_metadata(
-                project_path,
-                project,
-                &chain,
-                body_start,
-                metadata_chain_complete,
-                &mut facts.gaps,
-            ),
-        };
-        if instances.is_empty() {
-            compilation.symbols = symbols::derive_indexed(&by_path, Some(project_path), None);
+            let mut compilation = CSharpCompilationFact {
+                symbols: Default::default(),
+                project_path: Some(project_path.to_owned()),
+                items,
+                inventory_gap_indices,
+                references,
+                references_complete,
+                transitive_flow,
+                metadata: derive_metadata(
+                    project_path,
+                    project,
+                    &chain,
+                    body_start,
+                    metadata_chain_complete,
+                    &symbols::metadata_properties(
+                        &by_path,
+                        project_path,
+                        framework.as_ref(),
+                        &metadata_roots,
+                    ),
+                    &mut facts.gaps,
+                ),
+            };
+            compilation.symbols =
+                symbols::derive_indexed(&by_path, Some(project_path), framework.as_ref());
             facts.compilations.push(compilation);
-        } else {
-            for framework in instances {
-                let mut instance = compilation.clone();
-                instance.symbols =
-                    symbols::derive_indexed(&by_path, Some(project_path), Some(&framework));
-                facts.compilations.push(instance);
-            }
         }
     }
     finish_compilation_facts(&mut facts);
-    facts
+    (facts, glob_roots)
 }
 fn finish_compilation_facts(facts: &mut CSharpCompilationFacts) {
     let global_gaps = facts
@@ -1395,6 +1830,7 @@ fn package_import_subject(value: &str, packages: &[&(String, String)]) -> Option
 #[derive(Debug)]
 struct MetadataOperation {
     item: String,
+    conditions: Vec<Arc<str>>,
     target: String,
     remove: bool,
     alias: Option<String>,
@@ -1408,8 +1844,8 @@ fn metadata_operation(
 ) -> Option<MetadataOperation> {
     if conditioned
         || attributes.iter().any(|(name, value)| {
-            !static_property_value(value)
-                || !["Include", "Remove", "Static", "Alias", "Label"]
+            (!name.eq_ignore_ascii_case("Condition") && !static_property_value(value))
+                || !["Include", "Remove", "Static", "Alias", "Label", "Condition"]
                     .iter()
                     .any(|allowed| name.eq_ignore_ascii_case(allowed))
         })
@@ -1447,6 +1883,7 @@ fn metadata_operation(
     }
     Some(MetadataOperation {
         item: item.to_owned(),
+        conditions: Vec::new(),
         target: target.to_owned(),
         remove: remove.is_some(),
         alias,
@@ -1460,6 +1897,7 @@ fn derive_metadata(
     chain: &[(&str, &ParsedProject)],
     body_start: usize,
     chain_complete: bool,
+    evaluated: &symbols::MetadataProperties,
     gaps: &mut Vec<CSharpCompilationGap>,
 ) -> CSharpCompilationMetadata {
     use brokk_bifrost_csharp::compilation::{ImplicitUsingCondition, SDK_IMPLICIT_USINGS};
@@ -1472,16 +1910,13 @@ fn derive_metadata(
         internals_visible_to_complete: chain_complete,
         ..Default::default()
     };
-    let mut properties = HashMap::default();
-    for (_, fragment) in chain {
-        properties.extend(
-            fragment
-                .properties
-                .metadata
-                .iter()
-                .map(|(name, value)| (name.as_str(), value.as_deref())),
-        );
-    }
+    let properties = chain
+        .iter()
+        .flat_map(|(_, fragment)| fragment.properties.metadata.keys())
+        .map(String::as_str)
+        .chain(["targetframework"])
+        .map(|name| (name, evaluated.get(name).flatten()))
+        .collect::<HashMap<_, _>>();
     let frameworks = properties
         .get("targetframework")
         .filter(|value| value.is_none_or(|value| !value.is_empty()))
@@ -1751,6 +2186,28 @@ fn derive_metadata(
             }
         }
         for operation in &fragment.metadata_operations {
+            match evaluated.decide(&operation.conditions) {
+                Some(false) => continue,
+                Some(true) => {}
+                None => {
+                    let code = if operation.item == "internalsvisibleto" {
+                        result.internals_visible_to_complete = false;
+                        "unresolved_internals_visible_to"
+                    } else {
+                        result.global_usings_complete = false;
+                        "unresolved_global_usings"
+                    };
+                    gap(
+                        code,
+                        path,
+                        format!(
+                            "undecided {} item conditions: {:?}",
+                            operation.item, operation.conditions
+                        ),
+                    );
+                    continue;
+                }
+            }
             if operation.item == "internalsvisibleto" {
                 if operation.remove {
                     result
@@ -1969,6 +2426,11 @@ impl CSharpAnalyzer {
         reference: &ProjectFile,
         candidate: &ProjectFile,
     ) -> Option<CSharpCompilationVisibility> {
+        // A hidden project can add another compiled instance with different
+        // visibility, so neither positive nor negative agreement is proven.
+        if self.compilation_membership_completeness().cause().is_some() {
+            return Some(CSharpCompilationVisibility::Unresolved);
+        }
         let Some(selection) = self.selected_compilations()? else {
             return Some(CSharpCompilationVisibility::Unresolved);
         };
@@ -2031,31 +2493,34 @@ impl CSharpAnalyzer {
         &self,
         reference: &ProjectFile,
     ) -> Option<Vec<String>> {
+        let mut reasons = self
+            .compilation_membership_completeness()
+            .cause()
+            .map(open_membership_evidence)
+            .into_iter()
+            .collect::<Vec<_>>();
         let Some(selection) = self.selected_compilations()? else {
-            return Some(vec![
-                "selected C# compilation inventory is unavailable".into(),
-            ]);
+            reasons.push("selected C# compilation inventory is unavailable".into());
+            return Some(reasons);
         };
         if selection.membership_capped() {
-            return Some(
+            reasons.extend(
                 self.record_membership_read(selection.gaps())?
                     .into_iter()
                     .filter(|gap| csharp_compilation::is_membership_cap(&gap.code))
-                    .map(|gap| format!("{} at {}: {}", gap.code, gap.path, gap.evidence))
-                    .collect(),
+                    .map(|gap| format!("{} at {}: {}", gap.code, gap.path, gap.evidence)),
             );
+            return Some(reasons);
         }
         let Some(membership) =
             self.record_membership_read(selection.compilations_of(&rel_path_string(reference)))?
         else {
-            return Some(vec![
-                "caller is not selected by the C# compilation inventory".into(),
-            ]);
+            reasons.push("caller is not selected by the C# compilation inventory".into());
+            return Some(reasons);
         };
-        let mut reasons = Vec::new();
         for open in membership.open {
-            for region in open.regions {
-                for gap in region.gaps {
+            for region in open.regions.iter() {
+                for gap in &region.gaps {
                     reasons.push(format!(
                         "compilation {:?}: {} region {}: {} at {}: {}",
                         open.project_path,
@@ -2089,9 +2554,13 @@ impl CSharpAnalyzer {
         &self,
         files: &[ProjectFile],
         global_using_files: &[ProjectFile],
-    ) -> Option<(HashMap<ProjectFile, HashSet<ProjectFile>>, bool)> {
+    ) -> Option<GlobalUsingDependencies> {
         let Some(selection) = self.selected_compilations()? else {
-            return Some((HashMap::default(), false));
+            return Some((
+                HashMap::default(),
+                false,
+                self.compilation_membership_completeness().cause(),
+            ));
         };
         // The proof boundary: membership complete, every explicit include
         // selected, and at most one project. An SDK default glob also
@@ -2100,7 +2569,9 @@ impl CSharpAnalyzer {
         // either absent. One project (or none) is the boundary the earlier
         // compilation index already certified and is kept; several projects
         // were never certified and stay incomplete.
-        let mut complete = !selection.membership_capped()
+        let membership_cause = self.compilation_membership_completeness().cause();
+        let mut complete = membership_cause.is_none()
+            && !selection.membership_capped()
             && self.record_membership_read(selection.membership_complete())?
             && self.record_membership_read(selection.includes_selected())?
             && self.record_membership_read(selection.project_count())? <= 1;
@@ -2152,56 +2623,117 @@ impl CSharpAnalyzer {
                 by_file.insert(file.clone(), dependencies);
             }
         }
-        Some((by_file, complete))
+        Some((by_file, complete, membership_cause))
     }
 
     /// Identity of the build configuration that the compilation graph reads.
     ///
     /// Snapshot freshness checks ask for it on every request, including when
     /// the graph itself is partial and so is rebuilt per request instead of
-    /// memoized. The identity is one fixed-size digest, so it is memoized for
-    /// the generation on its own. An unknown identity (incomplete source
-    /// inventory, a failed listing, a capped or unreadable configuration
-    /// file) publishes nothing, and the next lookup retries.
-    fn compilation_config_identities(&self) -> Option<(StableDigest, StableDigest)> {
+    /// memoized. The fixed-size configuration identities, including the
+    /// omission contribution to the content key, are memoized for the generation. An unknown identity (a failed listing, a
+    /// capped or unreadable configuration file) publishes nothing, and the next lookup retries.
+    pub(super) fn compilation_config_identities(&self) -> Option<CompilationConfigIdentities> {
         self.memo_caches.compilation_config_digest.read(
             &memo_attribution(self),
             |cell| {
                 cell.get_or_try_build_on_dedicated_pool(|| {
-                    let inventory =
-                    brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer::source_file_inventory(
-                        &self.inner,
-                    );
-                    if !inventory.complete {
-                        return Err(());
-                    }
                     let project = self.inner.project();
                     read_config_digest(project).ok_or(())
                 })
                 .ok()
                 .map(|digest| *digest)
             },
-            |answer| match answer {
-                Some(answer) => AuthorityInputs::Fact {
-                    language: Language::CSharp,
-                    subject: brokk_bifrost_analysis::analyzer::read_ledger::FactSubject::Whole,
-                    answer: answer.0,
-                },
-                None => AuthorityInputs::Unnamed,
-            },
+            |answer| configuration_authority(answer.as_ref()),
         )
     }
 
+    pub(crate) fn compilation_membership_completeness(
+        &self,
+    ) -> CSharpCompilationMembershipCompleteness {
+        let completeness = self
+            .compilation_config_identities()
+            .map(|answer| answer.4)
+            .unwrap_or(CSharpCompilationMembershipCompleteness::Open(
+                CSharpCompilationMembershipOpenCause::ListingUnavailable,
+            ));
+        brokk_bifrost_analysis::analyzer::workspace_authority::record_workspace_authority_read(
+            self,
+            brokk_bifrost_analysis::analyzer::WorkspaceFactFamily::CSharpCompilationMembershipCompleteness,
+            AuthorityInputs::Fact {
+                language: Language::CSharp,
+                subject: brokk_bifrost_analysis::analyzer::read_ledger::FactSubject::Whole,
+                answer: Self::compilation_membership_answer(completeness),
+            },
+        );
+        if let Some(cause) = completeness.cause() {
+            // Sets cached by the import and dead-code wrappers cannot claim
+            // exhaustive membership merely because their visible rows loaded.
+            brokk_bifrost_analysis::analyzer::IAnalyzer::record_query_incomplete(
+                self,
+                brokk_bifrost_analysis::analyzer::QueryReadIncomplete::SemanticEvidenceUnavailable(
+                    open_membership_evidence(cause).into(),
+                ),
+            );
+        }
+        completeness
+    }
+
+    pub(super) fn compilation_membership_answer(
+        completeness: CSharpCompilationMembershipCompleteness,
+    ) -> StableDigest {
+        let label = membership_answer_label(completeness);
+        StableDigest::sha256(format!("csharp-compilation-membership:v1:{label}"))
+    }
+
     pub(crate) fn compilation_config_digest(&self) -> Option<StableDigest> {
-        self.compilation_config_identities()
-            .map(|(digest, _)| digest)
+        match configuration_authority(self.compilation_config_identities().as_ref()) {
+            AuthorityInputs::Fact { answer, .. } => Some(answer),
+            _ => None,
+        }
     }
 
     // The native read slice consumes this alongside the recorded configuration fact.
     #[allow(dead_code)]
     pub(crate) fn compilation_input_digest(&self) -> Option<StableDigest> {
         self.compilation_config_identities()
-            .map(|(_, identity)| identity)
+            .map(|(_, identity, _, _, _)| identity)
+    }
+}
+
+fn membership_answer_label(completeness: CSharpCompilationMembershipCompleteness) -> String {
+    match completeness {
+        CSharpCompilationMembershipCompleteness::Complete => "complete".to_owned(),
+        CSharpCompilationMembershipCompleteness::Open(cause) => open_cause_label(cause),
+    }
+}
+
+fn open_cause_label(cause: CSharpCompilationMembershipOpenCause) -> String {
+    match cause {
+        CSharpCompilationMembershipOpenCause::DirectoryOmitted => "directory_omitted".to_owned(),
+        CSharpCompilationMembershipOpenCause::ListingUnavailable => {
+            "listing_unavailable".to_owned()
+        }
+        CSharpCompilationMembershipOpenCause::ProjectFileUnknown(reason) => {
+            format!("project_file_unknown_{}", omission_reason_label(reason))
+        }
+    }
+}
+
+fn omission_reason_label(
+    reason: brokk_bifrost_core::analyzer::project::WorkspaceFileOmissionReason,
+) -> &'static str {
+    use brokk_bifrost_core::analyzer::project::WorkspaceFileOmissionReason as Reason;
+    match reason {
+        Reason::Unknown => "unknown",
+        Reason::NotSupplied => "not_supplied",
+        Reason::WalkError => "walk_error",
+        Reason::NonUtf8GitPath => "non_utf8_git_path",
+        Reason::Symlink => "symlink",
+        Reason::SymlinkToDirectory => "symlink_to_directory",
+        Reason::UnreadableSymlink => "unreadable_symlink",
+        Reason::NonRegular => "non_regular",
+        Reason::NonUtf8Name => "non_utf8_name",
     }
 }
 
@@ -2215,6 +2747,8 @@ struct DeferredCompileItem {
 
 #[derive(Debug)]
 struct ParsedProject {
+    // Certification-only evidence; these generated items are not modeled.
+    has_generated_inputs: bool,
     sdks: Vec<String>,
     metadata_operations: Vec<MetadataOperation>,
     metadata_complete: bool,
@@ -2306,31 +2840,6 @@ impl DefaultItemProperties {
         self.base_output_path.is_some() || self.base_intermediate_output_path.is_some()
     }
 
-    /// Apply a later file's assignments.
-    fn overlay(&mut self, later: &Self) {
-        self.metadata.extend(later.metadata.clone());
-        for (value, later) in [
-            (&mut self.enable_default_items, &later.enable_default_items),
-            (
-                &mut self.enable_default_compile_items,
-                &later.enable_default_compile_items,
-            ),
-            (
-                &mut self.default_item_excludes,
-                &later.default_item_excludes,
-            ),
-            (&mut self.base_output_path, &later.base_output_path),
-            (
-                &mut self.base_intermediate_output_path,
-                &later.base_intermediate_output_path,
-            ),
-        ] {
-            if later.is_some() {
-                value.clone_from(later);
-            }
-        }
-    }
-
     /// What Sdk.targets does before Directory.Build.targets: an unset or
     /// empty `EnableDefault*Items` becomes `true`
     /// (Microsoft.NET.Sdk.DefaultItems.targets), and the default excludes
@@ -2412,12 +2921,11 @@ struct PropertyCapture {
 #[derive(Debug)]
 struct DefaultAssignment {
     kind: PropertyKind,
-    conditioned: bool,
     conditions: Option<Vec<Arc<str>>>,
     value: String,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PropertyKind {
     Metadata(&'static str),
     DefaultItemExcludes,
@@ -2441,6 +2949,7 @@ fn parse_project(source: &str) -> ParsedProject {
     // to a character reference inside it survives.
     let mut reader = Reader::from_str(source);
     let mut stack = Vec::<ElementFrame>::new();
+    let mut has_generated_inputs = false;
     let mut operations = Vec::new();
     let mut deferred_items = Vec::new();
     let mut metadata_operations = Vec::new();
@@ -2501,13 +3010,7 @@ fn parse_project(source: &str) -> ParsedProject {
             Event::GeneralRef(reference) => {
                 // A character reference or one of XML's predefined entities;
                 // a project declares no others this parser could expand.
-                let expansion = match reference.resolve_char_ref() {
-                    Ok(Some(character)) => Some(character.to_string()),
-                    Ok(None) => reference.decode().ok().and_then(|name| {
-                        quick_xml::escape::resolve_xml_entity(&name).map(str::to_owned)
-                    }),
-                    Err(_) => None,
-                };
+                let expansion = xml_reference_value(&reference);
                 match expansion {
                     Some(text) if is_xml_text(&text) => {
                         if let Some(capture) = capture.as_mut() {
@@ -2568,7 +3071,6 @@ fn parse_project(source: &str) -> ParsedProject {
                         ) {
                             default_assignments.push(DefaultAssignment {
                                 kind: property.kind,
-                                conditioned: property.conditioned,
                                 conditions: property.conditions.clone(),
                                 value: property.text.clone(),
                             });
@@ -2681,14 +3183,25 @@ fn parse_project(source: &str) -> ParsedProject {
             match metadata_operation(
                 &name,
                 &attributes,
-                conditioned || in_item_definitions || !is_empty,
+                conditions.is_none() || in_item_definitions || !is_empty,
             ) {
-                Some(operation) => metadata_operations.push(operation),
+                Some(mut operation) => {
+                    operation.conditions = conditions.clone().expect("supported item conditions");
+                    metadata_operations.push(operation);
+                }
                 None => metadata_gaps.push((
                     name.clone(),
                     format!("unsupported {name} item: {attributes:?}"),
                 )),
             }
+        }
+        if !is_property
+            && matches!(
+                name.as_str(),
+                "analyzer" | "additionalfiles" | "page" | "applicationdefinition"
+            )
+        {
+            has_generated_inputs = true;
         }
         match name.as_str() {
             "project" | "sdk" => {
@@ -2878,7 +3391,6 @@ fn parse_project(source: &str) -> ParsedProject {
                 ) {
                     default_assignments.push(DefaultAssignment {
                         kind,
-                        conditioned,
                         conditions: conditions.clone(),
                         value: String::new(),
                     });
@@ -2962,6 +3474,7 @@ fn parse_project(source: &str) -> ParsedProject {
         });
     }
     ParsedProject {
+        has_generated_inputs,
         sdks,
         metadata_operations,
         metadata_complete,
@@ -3219,6 +3732,19 @@ fn assign_property(
     }
 }
 
+/// Decode XML character references and the five predefined entities.
+fn xml_reference_value(reference: &quick_xml::events::BytesRef<'_>) -> Option<String> {
+    let value = match reference.resolve_char_ref() {
+        Ok(Some(character)) => Some(character.to_string()),
+        Ok(None) => reference
+            .decode()
+            .ok()
+            .and_then(|name| quick_xml::escape::resolve_xml_entity(&name).map(str::to_owned)),
+        Err(_) => None,
+    }?;
+    is_xml_text(&value).then_some(value)
+}
+
 fn static_property_value(value: &str) -> bool {
     !value.bytes().any(|byte| matches!(byte, b'$' | b'@' | b'%'))
 }
@@ -3407,6 +3933,10 @@ fn resolve_item_path(project_directory: &Path, raw: &str) -> Option<PathBuf> {
     Some(components.into_iter().collect())
 }
 
+pub(super) fn is_csharp_project_file(path: &Path) -> bool {
+    has_extension(path, "csproj")
+}
+
 fn has_extension(path: &Path, expected: &str) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
@@ -3424,7 +3954,10 @@ mod tests {
 
     use brokk_bifrost_core::analyzer::project::OverlayProject;
 
-    use brokk_bifrost_core::analyzer::project::TestProject;
+    use brokk_bifrost_analysis::analyzer::store::WorkspaceConfigurationInput;
+    use brokk_bifrost_core::analyzer::project::{
+        SharedWorkspaceFileListing, TestProject, WorkspaceFileOmission, WorkspaceFileOmissionReason,
+    };
     use brokk_bifrost_test_macros::hardwon;
     use std::fs;
     use std::io;
@@ -3473,9 +4006,10 @@ mod tests {
         files: &[ProjectFile],
         global: &ProjectFile,
     ) -> (HashMap<ProjectFile, HashSet<ProjectFile>>, bool) {
-        analyzer
+        let (dependencies, complete, _) = analyzer
             .global_using_dependencies(files, std::slice::from_ref(global))
-            .expect("membership reads succeed")
+            .expect("membership reads succeed");
+        (dependencies, complete)
     }
 
     #[test]
@@ -3631,7 +4165,7 @@ mod tests {
             assert!(selected.membership_capped());
             assert_eq!(selected.project_count().unwrap(), 0);
         }
-        let (dependencies, complete) = analyzer.global_using_dependencies(&[], &[]).unwrap();
+        let (dependencies, complete, _) = analyzer.global_using_dependencies(&[], &[]).unwrap();
         assert!(dependencies.is_empty());
         assert!(!complete);
     }
@@ -3834,53 +4368,67 @@ mod tests {
 
     #[test]
     fn framework_instances_keep_one_selected_file_product() {
-        let base = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/golden/compilation-symbols/Frameworks");
+        let base =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/golden/per-framework-items");
         let names = [
-            "Frameworks.csproj",
-            "Source.cs",
+            "App.csproj",
+            "Caller.cs",
+            "Peer.cs",
+            "Removed.cs",
             "obj/project.assets.json",
-            "obj/Frameworks.csproj.nuget.g.props",
-            "obj/Frameworks.csproj.nuget.g.targets",
+            "obj/App.csproj.nuget.g.props",
+            "obj/App.csproj.nuget.g.targets",
         ];
-        let mut counts = Vec::new();
-        for multi in [false, true] {
-            let owned = names
-                .iter()
-                .map(|name| {
-                    let mut source = fs::read_to_string(base.join(name)).unwrap();
-                    if !multi && *name == "Frameworks.csproj" {
-                        source = source.replace(
-                            "<TargetFrameworks>net6.0;net8.0;net8.0;net8.0-windows</TargetFrameworks>",
-                            "<TargetFramework>net8.0</TargetFramework>",
-                        );
-                    }
-                    (format!("Frameworks/{name}"), source)
-                })
-                .collect::<Vec<_>>();
-            let files = owned
-                .iter()
-                .map(|(path, source)| (path.as_str(), source.as_str()))
-                .collect::<Vec<_>>();
-            let (_root, _, _, analyzer) = analyzed(&files);
-            let declarations =
-                brokk_bifrost_analysis::CodeUnitIndex::all_declarations(&analyzer).count();
-            assert!(declarations > 0);
-            analyzer.selected_compilations().unwrap().unwrap();
+        let owned = names
+            .iter()
+            .map(|name| {
+                (
+                    format!("App/{name}"),
+                    fs::read_to_string(base.join(name)).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let files = owned
+            .iter()
+            .map(|(path, source)| (path.as_str(), source.as_str()))
+            .collect::<Vec<_>>();
+        let (_root, _, _, analyzer) = analyzed(&files);
+        assert!(brokk_bifrost_analysis::CodeUnitIndex::all_declarations(&analyzer).count() > 0);
+        let selection = analyzer.selected_compilations().unwrap().unwrap();
+        let placements = selection.compilations_of("App/Caller.cs").unwrap().unwrap();
+        assert_eq!(placements.proven.len(), 2);
+        for id in placements.proven {
+            let metadata = selection.metadata(id).unwrap().unwrap();
             let conn = analyzer.inner.analyzer_store().read_conn().unwrap();
-            let count: i64 = conn.query_row(
-                "SELECT count(*) FROM csharp_file_version_decisions d JOIN workspace_file_versions v USING(file_version_id) WHERE v.valid_until IS NULL AND v.rel_path = 'Frameworks/Source.cs'",
-                [], |row| row.get(0)).unwrap();
-            counts.push(count);
+            let framework: String = conn
+                .query_row(
+                    "SELECT target_framework FROM csharp_compilations WHERE compilation_id=?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let (namespace, friend) = match framework.as_str() {
+                "net6.0" => ("Older", "OldFriend"),
+                "net8.0" => ("Newer", "NewFriend"),
+                _ => panic!("unexpected framework {framework}"),
+            };
+            assert!(metadata.global_usings_complete);
+            assert!(metadata.internals_visible_to_complete);
+            assert_eq!(metadata.internals_visible_to, vec![friend]);
+            assert!(
+                metadata
+                    .global_usings
+                    .iter()
+                    .any(|using| using.1 == [namespace])
+            );
         }
-        assert_eq!(
-            counts,
-            vec![1, 1],
-            "single-framework and three-framework selected file products"
-        );
+        let conn = analyzer.inner.analyzer_store().read_conn().unwrap();
+        for name in ["Caller.cs", "Peer.cs", "Removed.cs"] {
+            let count: i64 = conn.query_row("SELECT count(*) FROM csharp_file_version_decisions d JOIN workspace_file_versions v USING(file_version_id) WHERE v.valid_until IS NULL AND v.rel_path = ?1", [format!("App/{name}")], |row| row.get(0)).unwrap();
+            assert_eq!(count, 1, "one selected file product for {name}");
+        }
     }
 
-    /// Evaluated configuration crosses the producer/SQLite/selected-reader boundary.
     #[test]
     #[hardwon(
         "#8147+#8837: ignored inputs and a nearer empty props file could close stale membership and symbols"
@@ -4189,6 +4737,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#7314: review found stale metadata after failed, restore, legacy and SDK-mutated property evaluation"
+    )]
     fn compilation_metadata_round_trips_configuration_golden() {
         use std::fmt::Write;
         let fixture_root =
@@ -4209,6 +4760,10 @@ mod tests {
             "Desktop",
             "Unknown",
             "Conditional",
+            "Restored",
+            "Legacy",
+            "SdkMutable",
+            "Failed",
         ];
         let mut owned = vec![
             (
@@ -4227,6 +4782,15 @@ mod tests {
                 fs::read_to_string(fixture_root.join(path)).unwrap(),
             ));
             owned.push((format!("{name}/Source.cs"), "class Source {}".to_owned()));
+            for relative in [
+                format!("{name}/obj/{name}.csproj.nuget.g.targets"),
+                format!("{name}/Directory.Build.props"),
+            ] {
+                let path = fixture_root.join(&relative);
+                if path.is_file() {
+                    owned.push((relative, fs::read_to_string(path).unwrap()));
+                }
+            }
         }
         let files = owned
             .iter()
@@ -4724,6 +5288,17 @@ mod tests {
             Some(CSharpCompilationVisibility::Unresolved)
         );
 
+        assert!(
+            analyzer
+                .selected_compilations()
+                .unwrap()
+                .unwrap()
+                .compilations_of(&rel_path_string(&app))
+                .unwrap()
+                .unwrap()
+                .proven
+                .is_empty()
+        );
         fs::remove_file(root.path().join("Directory.Build.props")).expect("remove props");
         assert!(
             analyzer.inner.workspace_configuration_changed(),
@@ -4734,6 +5309,17 @@ mod tests {
         assert_eq!(
             updated.compilation_visibility(&app, &other),
             Some(CSharpCompilationVisibility::Visible)
+        );
+        assert!(
+            !updated
+                .selected_compilations()
+                .unwrap()
+                .unwrap()
+                .compilations_of(&rel_path_string(&app))
+                .unwrap()
+                .unwrap()
+                .proven
+                .is_empty()
         );
     }
 
@@ -5062,9 +5648,21 @@ mod tests {
         }
 
         fn all_files(&self) -> io::Result<BTreeSet<ProjectFile>> {
-            let mut files = self.delegate.all_files()?;
+            self.all_files_with_omissions()
+                .map(|(files, _)| (*files).clone())
+        }
+
+        fn all_files_with_omissions(&self) -> io::Result<SharedWorkspaceFileListing> {
+            let (files, omissions) = self.delegate.all_files_with_omissions()?;
+            let mut files = (*files).clone();
             files.retain(|file| !self.ignored.iter().any(|path| file.rel_path() == path));
-            Ok(files)
+            // Ignore-rule exclusions are outside the listing's universe, not omissions.
+            let omissions = omissions
+                .iter()
+                .filter(|omission| !self.ignored.contains(&omission.path))
+                .cloned()
+                .collect();
+            Ok((Arc::new(files), Arc::new(omissions)))
         }
 
         fn analyzable_files(&self, language: Language) -> io::Result<BTreeSet<ProjectFile>> {
@@ -5092,6 +5690,263 @@ mod tests {
         (root, project, analyzer)
     }
 
+    /// A disk project whose listing drops `unlisted` paths and records
+    /// `extra_omissions`. Dropped files stay on disk, so capture can still
+    /// read a path that the listing kept.
+    struct RecordedOmissionProject {
+        delegate: TestProject,
+        unlisted: Vec<PathBuf>,
+        extra_omissions: Vec<WorkspaceFileOmission>,
+    }
+
+    impl Project for RecordedOmissionProject {
+        fn root(&self) -> &Path {
+            self.delegate.root()
+        }
+
+        fn analyzer_languages(&self) -> BTreeSet<Language> {
+            self.delegate.analyzer_languages()
+        }
+
+        fn all_files(&self) -> io::Result<BTreeSet<ProjectFile>> {
+            self.all_files_with_omissions()
+                .map(|(files, _)| (*files).clone())
+        }
+
+        fn all_files_with_omissions(&self) -> io::Result<SharedWorkspaceFileListing> {
+            let (files, omissions) = self.delegate.all_files_with_omissions()?;
+            let mut files = (*files).clone();
+            files.retain(|file| !self.unlisted.iter().any(|path| file.rel_path() == path));
+            let mut omissions = (*omissions).clone();
+            omissions.extend(self.extra_omissions.iter().cloned());
+            Ok((Arc::new(files), Arc::new(omissions)))
+        }
+
+        fn analyzable_files(&self, language: Language) -> io::Result<BTreeSet<ProjectFile>> {
+            let mut files = self.delegate.analyzable_files(language)?;
+            files.retain(|file| !self.unlisted.iter().any(|path| file.rel_path() == path));
+            Ok(files)
+        }
+
+        fn file_by_rel_path(&self, rel_path: &Path) -> Option<ProjectFile> {
+            self.delegate.file_by_rel_path(rel_path)
+        }
+    }
+
+    fn analyzed_recording(
+        files: &[(&str, &str)],
+        unlisted: &[&str],
+        extra_omissions: &[WorkspaceFileOmission],
+    ) -> (
+        tempfile::TempDir,
+        Arc<RecordedOmissionProject>,
+        CSharpAnalyzer,
+    ) {
+        let (root, delegate, _analyzed) = fixture(files);
+        let project = Arc::new(RecordedOmissionProject {
+            delegate,
+            unlisted: unlisted.iter().map(PathBuf::from).collect(),
+            extra_omissions: extra_omissions.to_vec(),
+        });
+        let analyzer = CSharpAnalyzer::new(Arc::clone(&project) as Arc<dyn Project>);
+        (root, project, analyzer)
+    }
+
+    fn project_omission(path: &str, reason: WorkspaceFileOmissionReason) -> WorkspaceFileOmission {
+        WorkspaceFileOmission {
+            path: PathBuf::from(path),
+            reason,
+        }
+    }
+
+    fn present_csproj(path: &str) -> WorkspaceConfigurationInput {
+        WorkspaceConfigurationInput::new(
+            path.to_owned(),
+            br#"<Project Sdk="Microsoft.NET.Sdk" />"#.to_vec().into_boxed_slice(),
+        )
+    }
+
+    #[test]
+    #[hardwon("#12546: a listed csproj with an omission was reported missing")]
+    fn listed_csproj_with_an_omission_is_present() {
+        let (_root, _project, analyzer) = analyzed_recording(
+            &[
+                ("App/App.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\" />"),
+                ("App/App.cs", "class App {}"),
+            ],
+            &[],
+            &[project_omission(
+                "App/App.csproj",
+                WorkspaceFileOmissionReason::Symlink,
+            )],
+        );
+        assert_eq!(
+            analyzer.compilation_membership_completeness(),
+            CSharpCompilationMembershipCompleteness::Complete,
+            "a listed project file that capture read is present"
+        );
+
+        let captured = [present_csproj("App/App.csproj")];
+        let non_utf8 = [project_omission(
+            "App/App.csproj",
+            WorkspaceFileOmissionReason::NonUtf8Name,
+        )];
+        assert_eq!(
+            super::compilation_membership_completeness(&non_utf8, &captured),
+            CSharpCompilationMembershipCompleteness::Complete,
+            "presence is the captured read, not the omission reason"
+        );
+
+        // The capture key and the omission path meet as lossy slash forms.
+        // A raw Path compare would miss a name that is not UTF-8.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let mut bytes = b"App/".to_vec();
+            bytes.push(0xFF);
+            bytes.extend_from_slice(b".csproj");
+            let path = PathBuf::from(std::ffi::OsString::from_vec(bytes));
+            assert!(
+                super::is_csharp_project_file(&path),
+                "extension csproj stays a project file when the name is not UTF-8"
+            );
+            let shown = brokk_bifrost_core::path_utils::workspace_relative_slash_path(&path);
+            let omission = WorkspaceFileOmission {
+                path,
+                reason: WorkspaceFileOmissionReason::NonUtf8Name,
+            };
+            assert_eq!(
+                super::compilation_membership_completeness(
+                    std::slice::from_ref(&omission),
+                    &[WorkspaceConfigurationInput::new(
+                        shown,
+                        br#"<Project Sdk="Microsoft.NET.Sdk" />"#.to_vec().into_boxed_slice(),
+                    )]
+                ),
+                CSharpCompilationMembershipCompleteness::Complete
+            );
+            assert_eq!(
+                super::compilation_membership_completeness(std::slice::from_ref(&omission), &[]),
+                CSharpCompilationMembershipCompleteness::Open(
+                    CSharpCompilationMembershipOpenCause::ProjectFileUnknown(
+                        WorkspaceFileOmissionReason::NonUtf8Name
+                    )
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn omitted_csproj_is_unknown_with_its_cause() {
+        let (_root, project, analyzer) = analyzed_recording(
+            &[
+                ("App/App.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\" />"),
+                ("App/App.cs", "class App {}"),
+                (
+                    "Hidden/Hidden.csproj",
+                    "<Project Sdk=\"Microsoft.NET.Sdk\" />",
+                ),
+                ("Hidden/Hidden.cs", "class Hidden {}"),
+            ],
+            &["Hidden/Hidden.csproj"],
+            &[project_omission(
+                "Hidden/Hidden.csproj",
+                WorkspaceFileOmissionReason::Symlink,
+            )],
+        );
+        assert_eq!(
+            analyzer.compilation_membership_completeness(),
+            CSharpCompilationMembershipCompleteness::Open(
+                CSharpCompilationMembershipOpenCause::ProjectFileUnknown(
+                    WorkspaceFileOmissionReason::Symlink
+                )
+            ),
+            "an unread omitted project file is unknown, not missing"
+        );
+        let caller = project
+            .file_by_rel_path(Path::new("App/App.cs"))
+            .expect("caller");
+        let reasons = analyzer
+            .compilation_inventory_obligations(&caller)
+            .expect("obligations");
+        let membership = reasons
+            .iter()
+            .find(|reason| reason.starts_with("C# compilation membership is open:"))
+            .expect("membership obligation");
+        assert_eq!(
+            membership,
+            "C# compilation membership is open: ProjectFileUnknown(Symlink). Run without --sources, or open a session over the full workspace, to get an answer."
+        );
+        assert!(
+            !membership.contains("missing") && !membership.contains("ProjectFileOmitted"),
+            "{membership}"
+        );
+
+        let captured = [present_csproj("App/App.csproj")];
+        for reason in [
+            WorkspaceFileOmissionReason::Symlink,
+            WorkspaceFileOmissionReason::NonUtf8Name,
+            WorkspaceFileOmissionReason::NotSupplied,
+        ] {
+            let omissions = [project_omission("Hidden/Hidden.csproj", reason)];
+            assert_eq!(
+                super::compilation_membership_completeness(&omissions, &captured),
+                CSharpCompilationMembershipCompleteness::Open(
+                    CSharpCompilationMembershipOpenCause::ProjectFileUnknown(reason)
+                ),
+                "{reason:?}"
+            );
+        }
+        let absent = [WorkspaceConfigurationInput::absent(
+            "Hidden/Hidden.csproj".to_owned(),
+        )];
+        let unread = [project_omission(
+            "Hidden/Hidden.csproj",
+            WorkspaceFileOmissionReason::Symlink,
+        )];
+        assert_eq!(
+            super::compilation_membership_completeness(&unread, &absent),
+            CSharpCompilationMembershipCompleteness::Open(
+                CSharpCompilationMembershipOpenCause::ProjectFileUnknown(
+                    WorkspaceFileOmissionReason::Symlink
+                )
+            ),
+            "file_present false is not a read"
+        );
+        let non_regular = [project_omission(
+            "Hidden/Hidden.csproj",
+            WorkspaceFileOmissionReason::NonRegular,
+        )];
+        assert_eq!(
+            super::compilation_membership_completeness(&non_regular, &[]),
+            CSharpCompilationMembershipCompleteness::Complete,
+            "a non-regular entry stays outside the analyzer universe"
+        );
+        let directory_wins = [
+            project_omission("Other", WorkspaceFileOmissionReason::SymlinkToDirectory),
+            project_omission("Hidden/Hidden.csproj", WorkspaceFileOmissionReason::Symlink),
+        ];
+        assert_eq!(
+            super::compilation_membership_completeness(&directory_wins, &captured),
+            CSharpCompilationMembershipCompleteness::Open(
+                CSharpCompilationMembershipOpenCause::DirectoryOmitted
+            )
+        );
+        let several = [
+            project_omission("Z/Z.csproj", WorkspaceFileOmissionReason::Symlink),
+            project_omission("A/A.csproj", WorkspaceFileOmissionReason::NotSupplied),
+        ];
+        assert_eq!(
+            super::compilation_membership_completeness(&several, &[]),
+            CSharpCompilationMembershipCompleteness::Open(
+                CSharpCompilationMembershipOpenCause::ProjectFileUnknown(
+                    WorkspaceFileOmissionReason::NotSupplied
+                )
+            ),
+            "several unknown project files keep the minimum reason, then path"
+        );
+    }
+
     /// Delegates to a disk project, but its listing fails while `fail_listing`
     /// is set: the transient failure of a workspace walk.
     struct FlakyListingProject {
@@ -5110,29 +5965,38 @@ mod tests {
         }
 
         fn all_files(&self) -> io::Result<BTreeSet<ProjectFile>> {
+            self.all_files_with_omissions()
+                .map(|(files, _)| (*files).clone())
+        }
+
+        fn all_files_with_omissions(&self) -> io::Result<SharedWorkspaceFileListing> {
             if self.fail_listing.load(Ordering::SeqCst) {
                 return Err(io::Error::other("listing interrupted"));
             }
-            self.delegate.all_files().map(|files| {
-                files
-                    .into_iter()
-                    .filter(|file| {
-                        !self.omit_build_files
-                            || !file
-                                .rel_path()
-                                .file_name()
-                                .and_then(|name| name.to_str())
-                                .is_some_and(|name| {
-                                    matches!(
-                                        name,
-                                        "Directory.Build.props"
-                                            | "Directory.Build.targets"
-                                            | "Directory.Packages.props"
-                                    )
-                                })
-                    })
-                    .collect()
-            })
+            self.delegate
+                .all_files_with_omissions()
+                .map(|(files, omissions)| {
+                    let files = files
+                        .iter()
+                        .filter(|file| {
+                            !self.omit_build_files
+                                || !file
+                                    .rel_path()
+                                    .file_name()
+                                    .and_then(|name| name.to_str())
+                                    .is_some_and(|name| {
+                                        matches!(
+                                            name,
+                                            "Directory.Build.props"
+                                                | "Directory.Build.targets"
+                                                | "Directory.Packages.props"
+                                        )
+                                    })
+                        })
+                        .cloned()
+                        .collect();
+                    (Arc::new(files), omissions)
+                })
         }
 
         fn analyzable_files(&self, language: Language) -> io::Result<BTreeSet<ProjectFile>> {
@@ -5664,6 +6528,9 @@ mod tests {
     #[hardwon(
         "#7314: AD3d EC2 r5: an unknown operand in an and hid its false operand, leaving Newtonsoft's library open"
     )]
+    #[hardwon(
+        "#7314: flattened import order made earlier default assignments claim complete membership"
+    )]
     fn ordered_property_evaluation_membership_golden() {
         use std::fmt::Write;
         // Newtonsoft.Json's shape: Directory.Build.props reads a property the
@@ -5825,8 +6692,7 @@ mod tests {
                     ("App/A.cs", "class A {}"),
                 ],
             ),
-            // Off is empty at the props, so default items are disabled; a true
-            // guard is not applied to the parse's default-item properties.
+            // Off is empty at the props, so the true guard disables defaults.
             (
                 "true-guard",
                 vec![
@@ -5834,6 +6700,83 @@ mod tests {
                     (
                         "App/App.csproj",
                         r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><Off>x</Off></PropertyGroup></Project>"#,
+                    ),
+                    ("App/A.cs", "class A {}"),
+                ],
+            ),
+            // A later group sees the executed scalar assignment in this file.
+            (
+                "same-fragment-defaults",
+                vec![
+                    (
+                        "App/App.csproj",
+                        r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><Mode>off</Mode></PropertyGroup><PropertyGroup Condition="'$(Mode)'=='off'"><EnableDefaultCompileItems>false</EnableDefaultCompileItems></PropertyGroup><PropertyGroup Condition="'$(Mode)'=='on'"><EnableDefaultCompileItems>true</EnableDefaultCompileItems></PropertyGroup></Project>"#,
+                    ),
+                    ("App/A.cs", "class A {}"),
+                ],
+            ),
+            (
+                "same-fragment-excludes",
+                vec![
+                    (
+                        "App/App.csproj",
+                        r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><Excluded>.</Excluded></PropertyGroup><PropertyGroup Condition="'$(Excluded)'=='.'"><DefaultItemExcludes>$(DefaultItemExcludes);$(Excluded)/**</DefaultItemExcludes></PropertyGroup></Project>"#,
+                    ),
+                    ("App/A.cs", "class A {}"),
+                ],
+            ),
+            (
+                "default-before-import-disables",
+                vec![
+                    (
+                        "App/App.csproj",
+                        r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><EnableDefaultCompileItems>true</EnableDefaultCompileItems></PropertyGroup><Import Project="Defaults.props" /></Project>"#,
+                    ),
+                    (
+                        "App/Defaults.props",
+                        r#"<Project><PropertyGroup><EnableDefaultCompileItems>false</EnableDefaultCompileItems></PropertyGroup></Project>"#,
+                    ),
+                    ("App/A.cs", "class A {}"),
+                ],
+            ),
+            (
+                "default-before-import-enables",
+                vec![
+                    (
+                        "App/App.csproj",
+                        r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><EnableDefaultCompileItems>false</EnableDefaultCompileItems></PropertyGroup><Import Project="Defaults.props" /></Project>"#,
+                    ),
+                    (
+                        "App/Defaults.props",
+                        r#"<Project><PropertyGroup><EnableDefaultCompileItems>true</EnableDefaultCompileItems></PropertyGroup></Project>"#,
+                    ),
+                    ("App/A.cs", "class A {}"),
+                ],
+            ),
+            (
+                "default-before-import-false-from-import",
+                vec![
+                    (
+                        "App/App.csproj",
+                        r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup Condition="'$(X)'==''"><EnableDefaultCompileItems>false</EnableDefaultCompileItems></PropertyGroup><Import Project="Defaults.props" /></Project>"#,
+                    ),
+                    (
+                        "App/Defaults.props",
+                        r#"<Project><PropertyGroup><X>set</X></PropertyGroup></Project>"#,
+                    ),
+                    ("App/A.cs", "class A {}"),
+                ],
+            ),
+            (
+                "default-after-import-enables",
+                vec![
+                    (
+                        "App/App.csproj",
+                        r#"<Project Sdk="Microsoft.NET.Sdk"><Import Project="Defaults.props" /><PropertyGroup><EnableDefaultCompileItems>true</EnableDefaultCompileItems></PropertyGroup></Project>"#,
+                    ),
+                    (
+                        "App/Defaults.props",
+                        r#"<Project><PropertyGroup><EnableDefaultCompileItems>false</EnableDefaultCompileItems></PropertyGroup></Project>"#,
                     ),
                     ("App/A.cs", "class A {}"),
                 ],

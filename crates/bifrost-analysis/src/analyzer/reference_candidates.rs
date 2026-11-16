@@ -7,6 +7,7 @@ use brokk_bifrost_csharp::graph::extractor::{
 };
 use brokk_bifrost_csharp::syntax::{
     csharp_implicit_accessor_value, csharp_is_type_position, csharp_local_binder_name,
+    is_receiver_only_keyword as csharp_is_receiver_only_keyword,
 };
 use brokk_bifrost_go::syntax::is_clause_binding_identifier as go_is_clause_binding_identifier;
 use brokk_bifrost_js_ts::syntax::{
@@ -465,7 +466,10 @@ fn is_excluded_reference_candidate(
     match language {
         Language::Cpp => cpp_is_range_for_binding_name(node),
         Language::Go => go_is_declaration_or_import_name(node),
-        Language::CSharp => is_csharp_tuple_element_name(node),
+        // A this/base receiver is syntax, not a usage (#12013); standalone this stays.
+        Language::CSharp => {
+            is_csharp_tuple_element_name(node) || csharp_is_receiver_only_keyword(node)
+        }
         Language::Rust => is_rust_associated_type_declaration_name(node),
         Language::JavaScript | Language::TypeScript => is_export_alias_identifier(node),
         _ => false,
@@ -2134,6 +2138,28 @@ func use(reader Reader) int {
                 "neighboring C# type/reference at byte {reference} must remain in the frontier: {offsets:?}"
             );
         }
+    }
+
+    #[test]
+    #[hardwon("#12013: excluding indexer receiver keywords hid unenumerated indexer targets")]
+    fn csharp_receiver_keywords_are_candidates_only_when_standalone() {
+        let csharp = "class C { object Own; object M() { var a = this.Own; var b = base.M(); var c = this[0]; var d = base[0]; return this; } }";
+        let offsets = reference_candidate_offsets(Language::CSharp, "C.cs", csharp);
+        let this_receiver = csharp.find("this.Own").expect("this receiver");
+        let base_receiver = csharp.find("base.M()").expect("base receiver");
+        let standalone_this = csharp.rfind("this").expect("standalone this");
+        assert!(!offsets.contains(&this_receiver));
+        assert!(!offsets.contains(&base_receiver));
+        assert!(offsets.contains(&standalone_this));
+        assert!(offsets.contains(&csharp.find("this[0]").expect("this indexer")));
+        assert!(offsets.contains(&csharp.find("base[0]").expect("base indexer")));
+
+        let javascript = "this.x;";
+        let offsets = reference_candidate_offsets(Language::JavaScript, "sample.js", javascript);
+        assert!(
+            offsets.contains(&0),
+            "JavaScript this remains a candidate: {offsets:?}"
+        );
     }
 
     // Both the reference frontier and the census must drop C# statement labels:

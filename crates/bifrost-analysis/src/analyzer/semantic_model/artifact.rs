@@ -1582,11 +1582,14 @@ pub(crate) mod tests {
         };
         summaries[0].preconditions = Some(vec![
             AuthoredOperationPrecondition {
-                input: AuthoredSummaryInput::Parameter { ordinal: 0 },
+                input: AuthoredSummaryInput::Parameter {
+                    ordinal: 0,
+                    path: None,
+                },
                 predicate: AuthoredResultPredicate::Null,
             },
             AuthoredOperationPrecondition {
-                input: AuthoredSummaryInput::Receiver {},
+                input: AuthoredSummaryInput::Receiver { path: None },
                 predicate: AuthoredResultPredicate::NonNull,
             },
         ]);
@@ -1619,11 +1622,14 @@ pub(crate) mod tests {
             summary.preconditions,
             Some(vec![
                 CompiledOperationPrecondition {
-                    input: CompiledSummaryInput::Receiver {},
+                    input: CompiledSummaryInput::Receiver { path: None },
                     predicate: CompiledResultPredicate::NonNull,
                 },
                 CompiledOperationPrecondition {
-                    input: CompiledSummaryInput::Parameter { ordinal: 0 },
+                    input: CompiledSummaryInput::Parameter {
+                        ordinal: 0,
+                        path: None
+                    },
                     predicate: CompiledResultPredicate::Null,
                 },
             ])
@@ -1632,11 +1638,14 @@ pub(crate) mod tests {
             authored_procedure_summary_from_compiled(summary).preconditions,
             Some(vec![
                 AuthoredOperationPrecondition {
-                    input: AuthoredSummaryInput::Receiver {},
+                    input: AuthoredSummaryInput::Receiver { path: None },
                     predicate: AuthoredResultPredicate::NonNull,
                 },
                 AuthoredOperationPrecondition {
-                    input: AuthoredSummaryInput::Parameter { ordinal: 0 },
+                    input: AuthoredSummaryInput::Parameter {
+                        ordinal: 0,
+                        path: None
+                    },
                     predicate: AuthoredResultPredicate::Null,
                 },
             ])
@@ -1659,19 +1668,28 @@ pub(crate) mod tests {
         }
 
         let receiver = AuthoredOperationPrecondition {
-            input: AuthoredSummaryInput::Receiver {},
+            input: AuthoredSummaryInput::Receiver { path: None },
             predicate: AuthoredResultPredicate::NonNull,
         };
         let out_of_range = AuthoredOperationPrecondition {
-            input: AuthoredSummaryInput::Parameter { ordinal: u32::MAX },
+            input: AuthoredSummaryInput::Parameter {
+                ordinal: u32::MAX,
+                path: None,
+            },
             predicate: AuthoredResultPredicate::NonNull,
         };
         let parameter_null = AuthoredOperationPrecondition {
-            input: AuthoredSummaryInput::Parameter { ordinal: 0 },
+            input: AuthoredSummaryInput::Parameter {
+                ordinal: 0,
+                path: None,
+            },
             predicate: AuthoredResultPredicate::Null,
         };
         let parameter_non_null = AuthoredOperationPrecondition {
-            input: AuthoredSummaryInput::Parameter { ordinal: 0 },
+            input: AuthoredSummaryInput::Parameter {
+                ordinal: 0,
+                path: None,
+            },
             predicate: AuthoredResultPredicate::NonNull,
         };
         for (pack, expected_code, expected_path_suffix) in [
@@ -1707,7 +1725,10 @@ pub(crate) mod tests {
         }
 
         let mut variadic = with_preconditions(vec![AuthoredOperationPrecondition {
-            input: AuthoredSummaryInput::Parameter { ordinal: 0 },
+            input: AuthoredSummaryInput::Parameter {
+                ordinal: 0,
+                path: None,
+            },
             predicate: AuthoredResultPredicate::NonNull,
         }]);
         let AuthoredPayload::ProcedureSummaries { summaries } = &mut variadic.shards[0].payload
@@ -1736,26 +1757,35 @@ pub(crate) mod tests {
         }
 
         let spawn = AuthoredConcurrencyEffect::TaskSpawn {
-            callable: AuthoredSummaryInput::Parameter { ordinal: 0 },
-            group: Some(AuthoredSummaryInput::Receiver {}),
+            callable: AuthoredSummaryInput::Parameter {
+                ordinal: 0,
+                path: None,
+            },
+            group: Some(AuthoredSummaryInput::Receiver { path: None }),
             condition: None,
             timer: None,
         };
         let lock = AuthoredConcurrencyEffect::LockAcquire {
-            lock: AuthoredSummaryInput::Receiver {},
+            lock: AuthoredSummaryInput::Receiver { path: None },
             mode: AuthoredLockMode::Exclusive,
             condition: Some(AuthoredLockCondition::CallResultTrue),
         };
         let atomic = AuthoredConcurrencyEffect::Atomic {
-            location: AuthoredSummaryInput::Parameter { ordinal: 0 },
+            location: AuthoredSummaryInput::Parameter {
+                ordinal: 0,
+                path: None,
+            },
             operation: AuthoredAtomicOperation::ReadModifyWrite,
         };
         let unsupported = AuthoredConcurrencyEffect::Unsupported {
             protocol: "sync.Cond".to_owned(),
         };
         let once = AuthoredConcurrencyEffect::OnceDo {
-            once: AuthoredSummaryInput::Receiver {},
-            callable: AuthoredSummaryInput::Parameter { ordinal: 0 },
+            once: AuthoredSummaryInput::Receiver { path: None },
+            callable: AuthoredSummaryInput::Parameter {
+                ordinal: 0,
+                path: None,
+            },
         };
         let mut expected = vec![spawn.clone(), lock, atomic, unsupported, once];
         expected.sort_by_cached_key(|effect| canonical_json(effect).unwrap());
@@ -1781,7 +1811,7 @@ pub(crate) mod tests {
             ),
             (
                 vec![AuthoredConcurrencyEffect::TaskSpawn {
-                    callable: AuthoredSummaryInput::Receiver {},
+                    callable: AuthoredSummaryInput::Receiver { path: None },
                     group: None,
                     condition: None,
                     timer: None,
@@ -1790,8 +1820,14 @@ pub(crate) mod tests {
             ),
             (
                 vec![AuthoredConcurrencyEffect::WaitGroupAdd {
-                    group: AuthoredSummaryInput::Parameter { ordinal: 0 },
-                    delta: AuthoredSummaryInput::Parameter { ordinal: 0 },
+                    group: AuthoredSummaryInput::Parameter {
+                        ordinal: 0,
+                        path: None,
+                    },
+                    delta: AuthoredSummaryInput::Parameter {
+                        ordinal: 0,
+                        path: None,
+                    },
                 }],
                 "summary.conflicting_concurrency_effect",
             ),
@@ -1803,15 +1839,21 @@ pub(crate) mod tests {
             ),
             (
                 vec![AuthoredConcurrencyEffect::OnceDo {
-                    once: AuthoredSummaryInput::Receiver {},
-                    callable: AuthoredSummaryInput::Receiver {},
+                    once: AuthoredSummaryInput::Receiver { path: None },
+                    callable: AuthoredSummaryInput::Receiver { path: None },
                 }],
                 "summary.invalid_once_callable",
             ),
             (
                 vec![AuthoredConcurrencyEffect::OnceDo {
-                    once: AuthoredSummaryInput::Parameter { ordinal: 0 },
-                    callable: AuthoredSummaryInput::Parameter { ordinal: 0 },
+                    once: AuthoredSummaryInput::Parameter {
+                        ordinal: 0,
+                        path: None,
+                    },
+                    callable: AuthoredSummaryInput::Parameter {
+                        ordinal: 0,
+                        path: None,
+                    },
                 }],
                 "summary.conflicting_concurrency_effect",
             ),
@@ -1845,7 +1887,10 @@ pub(crate) mod tests {
                 at_most_once: false,
                 concurrency_effects: vec![AuthoredConcurrencyEffect::ChannelClose {
                     channel: AuthoredSummaryPort::Output {
-                        output: AuthoredSummaryOutput::IndexedNormalReturn { ordinal: 0 },
+                        output: AuthoredSummaryOutput::IndexedNormalReturn {
+                            ordinal: 0,
+                            path: None,
+                        },
                     },
                     fresh: false,
                 }],
@@ -1902,7 +1947,10 @@ pub(crate) mod tests {
             unreachable!()
         };
         *channel = AuthoredSummaryPort::Output {
-            output: AuthoredSummaryOutput::IndexedNormalReturn { ordinal: 1 },
+            output: AuthoredSummaryOutput::IndexedNormalReturn {
+                ordinal: 1,
+                path: None,
+            },
         };
         assert!(
             compile_pack(&self_target, &CompilerOptions::default())
@@ -1993,14 +2041,20 @@ pub(crate) mod tests {
         };
         let escape = AuthoredSummaryEffect::Escape {
             event: "event.wrapper.escape".to_owned(),
-            input: AuthoredSummaryInput::Parameter { ordinal: 0 },
+            input: AuthoredSummaryInput::Parameter {
+                ordinal: 0,
+                path: None,
+            },
         };
         let unknown = AuthoredSummaryEffect::UnknownCallBoundary {
             event: "event.wrapper.unknown".to_owned(),
         };
         let ambiguous = AuthoredSummaryEffect::AmbiguousCall {
             event: "event.wrapper.ambiguous".to_owned(),
-            input: AuthoredSummaryInput::Parameter { ordinal: 0 },
+            input: AuthoredSummaryInput::Parameter {
+                ordinal: 0,
+                path: None,
+            },
             candidates: vec!["summary.helper".to_owned(), "summary.wrapper".to_owned()],
         };
         let conditional_write = AuthoredConditionalIndirectWrite {
@@ -2014,25 +2068,38 @@ pub(crate) mod tests {
             location_kind: AuthoredSummaryLocationKind::Heap,
         };
         let storage_transfer = AuthoredSummaryTransfer {
-            input: AuthoredSummaryInput::Parameter { ordinal: 0 },
+            input: AuthoredSummaryInput::Parameter {
+                ordinal: 0,
+                path: None,
+            },
             exit_kind: AuthoredSummaryExitKind::Normal,
             output: AuthoredSummaryOutput::Heap {
                 location: storage_location.id.clone(),
+                path: None,
             },
             value_transfer: None,
         };
         let receiver_transfer = AuthoredSummaryTransfer {
-            input: AuthoredSummaryInput::Parameter { ordinal: 0 },
+            input: AuthoredSummaryInput::Parameter {
+                ordinal: 0,
+                path: None,
+            },
             exit_kind: AuthoredSummaryExitKind::Normal,
-            output: AuthoredSummaryOutput::Receiver {},
+            output: AuthoredSummaryOutput::Receiver { path: None },
             value_transfer: None,
         };
         let atomic_store = AuthoredConcurrencyEffect::Atomic {
-            location: AuthoredSummaryInput::Parameter { ordinal: 0 },
+            location: AuthoredSummaryInput::Parameter {
+                ordinal: 0,
+                path: None,
+            },
             operation: AuthoredAtomicOperation::Store,
         };
         let spawn = AuthoredConcurrencyEffect::TaskSpawn {
-            callable: AuthoredSummaryInput::Parameter { ordinal: 0 },
+            callable: AuthoredSummaryInput::Parameter {
+                ordinal: 0,
+                path: None,
+            },
             group: None,
             condition: None,
             timer: None,
@@ -2181,7 +2248,10 @@ pub(crate) mod tests {
             (
                 with_claim(|summary| {
                     summary.concurrency_effects = vec![AuthoredConcurrencyEffect::LockAcquire {
-                        lock: AuthoredSummaryInput::Parameter { ordinal: 0 },
+                        lock: AuthoredSummaryInput::Parameter {
+                            ordinal: 0,
+                            path: None,
+                        },
                         mode: AuthoredLockMode::Exclusive,
                         condition: None,
                     }]

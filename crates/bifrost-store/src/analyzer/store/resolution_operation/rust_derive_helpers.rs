@@ -144,12 +144,20 @@ impl SelectedResolutionMountInventory<'_> {
         let origin = gap_origin_code(LoweringGapOrigin::from_kind(
             ResolutionGapOriginKind::UnsupportedScopeOrBinder,
         ));
+        let builtin_derive_origin = gap_origin_code(LoweringGapOrigin::from_kind(
+            ResolutionGapOriginKind::GeneratedItemSurface,
+        ));
+        let placement_origin = gap_origin_code(LoweringGapOrigin::from_kind(
+            ResolutionGapOriginKind::UnsupportedPlacementBoundary,
+        ));
         let rows = connection
             .prepare_cached(rust_crate_context::DERIVE_HELPER_CONDITIONS)?
             .query_map(
                 rusqlite::params![
                     origin,
-                    serde_json::to_string(&undecided).expect("reached mounts serialize")
+                    serde_json::to_string(&undecided).expect("reached mounts serialize"),
+                    builtin_derive_origin,
+                    placement_origin
                 ],
                 |row| {
                     Ok((
@@ -234,7 +242,7 @@ impl SelectedResolutionMountInventory<'_> {
 
 /// Whether `helper`, looked up as a macro from module `path` of `topology`,
 /// has no workspace macro, no external binding, and meets no open inventory.
-fn helper_absent_from_macro_lookup(
+pub(super) fn helper_absent_from_macro_lookup(
     connection: &rusqlite::Connection,
     topology: i64,
     path: &str,

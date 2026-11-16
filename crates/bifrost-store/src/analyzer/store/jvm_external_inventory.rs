@@ -10,6 +10,48 @@ use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 use rusqlite::types::Value;
 use rusqlite::{TransactionBehavior, params};
 
+/// A projected declaration parameter. Missing bounds cannot prove unboundedness.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JvmExternalTypeParameter {
+    pub name: String,
+    pub bounds: JvmExternalTypeParameterBounds,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(
+    tag = "state",
+    content = "types",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum JvmExternalTypeParameterBounds {
+    Unknown,
+    Known(Vec<TypeRef>),
+}
+
+/// SQL NULL preserves the distinction between an old projection and no formals.
+pub fn decode_jvm_external_type_parameters(
+    encoded: Option<&str>,
+) -> Result<Option<Vec<JvmExternalTypeParameter>>> {
+    encoded
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|error| StoreError::new(format!("external type parameters: {error}")))
+}
+
+fn unknown_type_parameters(names: &[String]) -> Result<String> {
+    json_value(
+        &names
+            .iter()
+            .map(|name| JvmExternalTypeParameter {
+                name: name.clone(),
+                bounds: JvmExternalTypeParameterBounds::Unknown,
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
 /// Convert one declaration shard to the exact inventory table column order.
 pub fn jvm_external_projection<'a>(
     provider_id: String,
@@ -101,6 +143,7 @@ pub fn jvm_external_projection<'a>(
                         .as_ref()
                         .is_some_and(|inventory| inventory.supertypes_complete),
             ),
+            text(&unknown_type_parameters(&owner.type_parameters)?),
         ]);
         let mut ordinal = 0i64;
         for member in owner_members
@@ -137,6 +180,11 @@ pub fn jvm_external_projection<'a>(
                     .map(json_value)
                     .transpose()?
                     .map_or(Value::Null, Value::Text),
+                boolean(member.is_abstract),
+                signature
+                    .map(|signature| unknown_type_parameters(&signature.type_parameters))
+                    .transpose()?
+                    .map_or(Value::Null, Value::Text),
             ]);
             ordinal += 1;
         }
@@ -158,6 +206,8 @@ pub fn jvm_external_projection<'a>(
                 Value::Null,
                 text("[]"),
                 text(&json_value(&TypeRef::named(&nested.owner_fqn))?),
+                Value::Null,
+                text("[]"),
             ]);
             ordinal += 1;
         }
@@ -173,6 +223,12 @@ pub fn jvm_external_projection<'a>(
                     text(&owner.name),
                     text(fqn),
                     Value::Integer(ordinal as i64),
+                    text(&json_value(match &parent.target {
+                        TypeRef::Named { arguments, .. } | TypeRef::Declared { arguments, .. } => {
+                            arguments
+                        }
+                        _ => unreachable!("projected parent has a nominal target"),
+                    })?),
                 ]);
             }
         }
@@ -277,9 +333,9 @@ impl AnalyzerStore {
                 let Value::Text(name) = &parent[1] else { unreachable!("projected owner name is text") };
                 supertypes_by_name.entry(name).or_default().push(parent);
             }
-            let mut owner_insert = transaction.prepare_cached("INSERT OR IGNORE INTO jvm_external_owners(provider_id,owner_fqn,callables_complete,values_complete,types_complete,supertypes_complete) VALUES(?1,?2,?3,?4,?5,?6)")?;
-            let mut member_insert = transaction.prepare_cached("INSERT INTO jvm_external_owner_members(provider_id,owner_fqn,ordinal,member_name,member_kind,visibility,is_static,signature_present,callable_family_complete,non_overridable,parameters_jsonb,return_type_jsonb) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,jsonb(?11),jsonb(?12))")?;
-            let mut supertype_insert = transaction.prepare_cached("INSERT INTO jvm_external_owner_supertypes(provider_id,owner_fqn,supertype_fqn,ordinal) VALUES(?1,?2,?3,?4)")?;
+            let mut owner_insert = transaction.prepare_cached("INSERT OR IGNORE INTO jvm_external_owners(provider_id,owner_fqn,callables_complete,values_complete,types_complete,supertypes_complete,type_parameters_jsonb) VALUES(?1,?2,?3,?4,?5,?6,jsonb(?7))")?;
+            let mut member_insert = transaction.prepare_cached("INSERT INTO jvm_external_owner_members(provider_id,owner_fqn,ordinal,member_name,member_kind,visibility,is_static,signature_present,callable_family_complete,non_overridable,parameters_jsonb,return_type_jsonb,is_abstract,type_parameters_jsonb) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,jsonb(?11),jsonb(?12),?13,jsonb(?14))")?;
+            let mut supertype_insert = transaction.prepare_cached("INSERT INTO jvm_external_owner_supertypes(provider_id,owner_fqn,supertype_fqn,ordinal,type_arguments_jsonb) VALUES(?1,?2,?3,?4,jsonb(?5))")?;
             for owner in &projection.owners {
                 if owner_insert.execute(rusqlite::params_from_iter(owner))? == 0 { continue; }
                 let Value::Text(name) = &owner[1] else { unreachable!("projected owner name is text") };
@@ -361,6 +417,64 @@ impl AnalyzerStore {
 mod reserved_provider_tests {
     use super::*;
     use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    fn projected_type_parameter_bounds_preserve_unknown() {
+        assert!(decode_jvm_external_type_parameters(None).unwrap().is_none());
+        assert!(
+            decode_jvm_external_type_parameters(Some("[]"))
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+        let unknown = decode_jvm_external_type_parameters(Some(
+            r#"[{"name":"T","bounds":{"state":"unknown"}}]"#,
+        ))
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            unknown[0].bounds,
+            JvmExternalTypeParameterBounds::Unknown
+        ));
+        let known = decode_jvm_external_type_parameters(Some(
+            r#"[{"name":"T","bounds":{"state":"known","types":[]}}]"#,
+        ))
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(&known[0].bounds, JvmExternalTypeParameterBounds::Known(types) if types.is_empty())
+        );
+        for invalid in [
+            r#"[{"name":"T"}]"#,
+            r#"[{"name":"T","bounds":{}}]"#,
+            r#"[{"name":"T","bounds":{"state":"known"}}]"#,
+            r#"[{"name":"T","bounds":{"state":"unexpected"}}]"#,
+        ] {
+            assert!(
+                decode_jvm_external_type_parameters(Some(invalid)).is_err(),
+                "{invalid}"
+            );
+        }
+        // An older writer omits nullable columns: missing projection remains unknown.
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        store.conn.execute(|conn| -> Result<()> {
+            conn.execute("INSERT INTO jvm_external_owners(provider_id,owner_fqn,callables_complete,values_complete,types_complete,supertypes_complete) VALUES('old','Old',0,0,0,0)", [])?;
+            Ok(())
+        }).unwrap();
+        let conn = store.read_conn().unwrap();
+        let encoded: Option<String> = conn
+            .query_row(
+                "SELECT json(type_parameters_jsonb) FROM jvm_external_owners",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            decode_jvm_external_type_parameters(encoded.as_deref())
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[test]
     #[hardwon("#9559: duplicate owner names aborted JVM inventory publication during review")]

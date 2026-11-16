@@ -7,6 +7,7 @@ pub const DIFF_TOOL_NAMES: &[&str] = &[
     "cyclomatic_complexity",
     "list_function_sources",
     "missing_tests",
+    "relation_brief",
     "score_diff",
 ];
 
@@ -26,7 +27,7 @@ pub(crate) fn diff_tool_descriptors() -> Vec<Value> {
         ),
         tool_descriptor(
             "analyze_diff",
-            "Compare Git endpoints and return changed files with insertion/deletion counts, edited/introduced/deleted/moved/resignatured symbols, import changes, dependencies and callsite truncation notices. Symbols carry is_test; edited records name both endpoints and touched old/new lines. Edited/moved records carry added_calls/removed_calls, introduced records calls, and deleted records called. Unattributed edges have no patch-symbol caller. call_edges defaults to changed_lines: resolve reference start lines changed on each side, not whole-caller relationships. Unchanged sites and import-only rebinding outside those lines are omitted. An addition needs a complete base scope; a removal needs a complete target scope. Exact selected deltas refuse ambiguous attribution and uncertain moved correspondence. changed_files retains full-file inventory and incumbent best-effort deltas, including renamed preimage comparisons. omit skips call analysis and leaves its arrays empty; import_changes remains available. call_analysis reports scope, complete/incomplete/omitted status and endpoint reasons. Completeness applies only to the requested inventory. Explicit endpoints accept commits or trees; commit resolution wins. With neither endpoint, compare the merge base of HEAD and the default branch against the live worktree (origin/HEAD selects that branch, falling back to HEAD). With target alone, compare a commit against its first parent; a tree target requires base. Labels are full commit hashes or tree:<oid>. Immutable endpoint comparisons ignore the live worktree, index and .gitattributes. Snapshot-only objects require host configuration --diff-snapshot-object-dir; the tool accepts no object-store path.",
+            "Compare Git endpoints and return changed files with insertion/deletion counts, edited/introduced/deleted/moved/resignatured symbols, import changes, dependencies and callsite truncation notices. Symbols carry is_test (null when test classification was unavailable; see call_analysis/incompleteness); edited records name both endpoints and touched old/new lines. Edited/moved records carry added_calls/removed_calls, introduced records calls, and deleted records called. Unattributed edges have no patch-symbol caller. call_edges defaults to changed_lines: resolve reference start lines changed on each side, not whole-caller relationships. Unchanged sites and import-only rebinding outside those lines are omitted. An addition needs a complete base scope; a removal needs a complete target scope. Exact selected deltas refuse ambiguous attribution and uncertain moved correspondence. changed_files retains full-file inventory and incumbent best-effort deltas, including renamed preimage comparisons. omit skips call analysis and leaves its arrays empty; import_changes remains available. call_analysis reports scope, complete/incomplete/omitted status and endpoint reasons. Completeness applies only to the requested inventory. Explicit endpoints accept commits or trees; commit resolution wins. With neither endpoint, compare the merge base of HEAD and the default branch against the live worktree (origin/HEAD selects that branch, falling back to HEAD). With target alone, compare a commit against its first parent; a tree target requires base. Labels are full commit hashes or tree:<oid>. Immutable endpoint comparisons ignore the live worktree, index and .gitattributes. Snapshot-only objects require host configuration --diff-snapshot-object-dir; the tool accepts no object-store path.",
             endpoint_schema(json!({
                 "include_tests": {
                     "type": "boolean",
@@ -69,6 +70,15 @@ pub(crate) fn diff_tool_descriptors() -> Vec<Value> {
             "missing_tests",
             "Find introduced or behavior-changed production functions for which Bifrost can establish no structured call path from test-context code. The blast-radius file graph is used only to bound each changed file's reverse importer closure; batched exact, location-anchored usage scans then follow enclosing callers within that reduced set. A complete exhausted search appears in `missing_functions`. Cancelled, incomplete, unresolved, ambiguous, or unproven searches appear in `indeterminate_functions` and are never promoted to a confident negative. Deleted functions, pure moves, and test-context functions are omitted. This is static structured reachability, not runtime coverage. Endpoint resolution is identical to analyze_diff, including the default worktree comparison and first-parent default for an explicit commit target.",
             endpoint_schema(json!({})),
+        ),
+        tool_descriptor(
+            "relation_brief",
+            "Build a reviewer relation brief with Affected callers, Paths (two-hop incoming use chains and changed outgoing calls), and Value flow sections. Every relation has target-snapshot path:line anchors and at least one anchor outside changed lines. Typed completeness accompanies subjects and relations. Deleted declarations are listed separately as not scanned; their presence makes caller and path sections incomplete. Value flow is not computed in this version. Selection alternates between sections; within a section, round-robin across changed symbols in diff order; omitted counts and incomplete scan notes remain visible. Defaults of 25 items and 7000 characters come from BrokkAi/mjolnir b1aed1fe review-arms/brief/WRITER.md and brief_driver.py. Endpoint resolution follows analyze_diff.",
+            endpoint_schema(json!({
+                "include_tests": {"type": "boolean", "default": false},
+                "max_items": {"type": "integer", "default": 25, "minimum": 1, "maximum": 200},
+                "max_chars": {"type": "integer", "default": 7000, "minimum": 1000, "maximum": 100000}
+            })),
         ),
         tool_descriptor(
             "score_diff",

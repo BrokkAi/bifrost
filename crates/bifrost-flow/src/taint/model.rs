@@ -1,10 +1,10 @@
 use std::{error::Error, fmt, mem::size_of_val};
 
-use sha2::{Digest, Sha256};
-
+use crate::analyzer::semantic::LengthDelimitedDigest;
 use crate::hash::HashMap;
 use crate::value_flow::ValueFlowEventKey;
 use brokk_bifrost_core::analyzer::dense_id::define_dense_id;
+use sha2::{Digest, Sha256};
 
 pub const MAX_TAINT_CLASSES: usize = 4_096;
 
@@ -106,6 +106,20 @@ impl TaintUniverse {
 
     pub fn classes(&self) -> &[SourceClassId] {
         &self.classes
+    }
+
+    pub(crate) fn retained_heap(
+        &self,
+        heap: &mut crate::analyzer::store::cache_budget::RetainedHeap,
+    ) {
+        heap.owned_slice(self.classes.as_ref());
+        for class in &self.classes {
+            heap.owned_slice(class.as_str().as_bytes());
+        }
+        heap.map(&self.ids);
+        for class in self.ids.keys() {
+            heap.owned_slice(class.as_str().as_bytes());
+        }
     }
 
     pub(crate) fn retained_bytes(&self) -> usize {
@@ -213,6 +227,27 @@ impl TaintClassSet {
 
     pub const fn universe(&self) -> TaintUniverseHash {
         self.universe
+    }
+
+    /// Add the stable class-set content to a persistent semantic identity.
+    pub fn push_stable_identity(&self, digest: &mut LengthDelimitedDigest) {
+        digest.push(b"bifrost-taint-class-set-v1");
+        digest.push(&self.universe.bytes());
+        digest.push(&self.class_count.to_le_bytes());
+        digest.push(
+            &u64::try_from(self.words.len())
+                .expect("taint word count fits in u64")
+                .to_le_bytes(),
+        );
+        for word in &self.words {
+            digest.push(&word.to_le_bytes());
+        }
+    }
+
+    /// Owned leaf payload only; enclosing value or Arc storage is visited separately.
+    #[doc(hidden)]
+    pub fn retained_heap(&self, heap: &mut crate::analyzer::store::cache_budget::RetainedHeap) {
+        heap.owned_slice(self.words.as_ref());
     }
 
     pub(crate) fn retained_heap_bytes(&self) -> usize {

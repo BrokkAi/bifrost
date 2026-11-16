@@ -194,6 +194,7 @@ pub(crate) enum CompositionError {
     UnsupportedMatchComposition {
         set: &'static str,
     },
+    UnsupportedEndpointProjection,
     Catalog(CatalogRegistryError),
     EndpointPrecedence(String),
     FindingCombinationPrecedence(String),
@@ -343,6 +344,10 @@ impl fmt::Display for CompositionError {
                     "{set} cannot include match endpoint sets in schema version 1"
                 )
             }
+            Self::UnsupportedEndpointProjection => write!(
+                formatter,
+                "projected return-value endpoints are not supported by typestate"
+            ),
             Self::Catalog(error) => error.fmt(formatter),
             Self::EndpointPrecedence(message)
             | Self::FindingCombinationPrecedence(message)
@@ -948,11 +953,17 @@ pub(crate) fn validate_call_phase(
 
 pub(crate) fn endpoint_binding_to_typestate(
     binding: &PolicyEndpointBinding,
-) -> ResolvedTypestateBinding {
-    match binding {
+) -> Result<ResolvedTypestateBinding, CompositionError> {
+    if matches!(
+        binding,
+        PolicyEndpointBinding::ReturnValue { path: Some(_) }
+    ) {
+        return Err(CompositionError::UnsupportedEndpointProjection);
+    }
+    Ok(match binding {
         PolicyEndpointBinding::MatchedValue => ResolvedTypestateBinding::MatchedValue,
         PolicyEndpointBinding::Receiver => ResolvedTypestateBinding::Receiver,
-        PolicyEndpointBinding::ReturnValue => ResolvedTypestateBinding::ReturnValue,
+        PolicyEndpointBinding::ReturnValue { .. } => ResolvedTypestateBinding::ReturnValue,
         PolicyEndpointBinding::ResultIndex { index } => {
             ResolvedTypestateBinding::ResultIndex { index: *index }
         }
@@ -962,14 +973,16 @@ pub(crate) fn endpoint_binding_to_typestate(
         PolicyEndpointBinding::ArgumentName { name } => {
             ResolvedTypestateBinding::ArgumentName { name: name.clone() }
         }
-    }
+    })
 }
 
 pub(crate) fn policy_port_to_endpoint_binding(port: &PolicyPort) -> PolicyEndpointBinding {
     match port {
         PolicyPort::MatchedValue => PolicyEndpointBinding::MatchedValue,
         PolicyPort::Receiver => PolicyEndpointBinding::Receiver,
-        PolicyPort::ReturnValue => PolicyEndpointBinding::ReturnValue,
+        PolicyPort::ReturnValue { path } => {
+            PolicyEndpointBinding::ReturnValue { path: path.clone() }
+        }
         PolicyPort::ResultIndex { index } => PolicyEndpointBinding::ResultIndex { index: *index },
         PolicyPort::ArgumentIndex { index } => {
             PolicyEndpointBinding::ArgumentIndex { index: *index }
@@ -1021,7 +1034,7 @@ mod tests {
                 EndpointRole::Source,
                 endpoint_id.to_string(),
                 categories.iter().map(|value| category(value)).collect(),
-                PolicyEndpointBinding::ReturnValue,
+                PolicyEndpointBinding::ReturnValue { path: None },
                 None,
                 vec![],
             ),

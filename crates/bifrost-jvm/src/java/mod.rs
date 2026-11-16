@@ -32,3 +32,4 @@ mod test_support;
 
 #[cfg(test)]
 mod source_properties;
+pub mod type_projection;

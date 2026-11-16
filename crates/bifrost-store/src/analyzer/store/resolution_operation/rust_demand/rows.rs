@@ -9,7 +9,7 @@ use super::super::rust_prefix::resolve_rust_type_prefix;
 use super::super::*;
 use crate::analyzer::resolution::DemandReferenceKey;
 use crate::analyzer::resolution::{FactResolutionAnswer, mounted_site_node};
-use crate::analyzer::store::rust_unit_summaries::RUST_UNIT_SUMMARY_DERIVATION_VERSION;
+use crate::analyzer::store::rust_unit_summaries::rust_unit_summary_derivation_identity;
 use rusqlite::{OptionalExtension, params};
 
 pub(crate) type RowRootPlan = super::super::demand_closure::RootFrame;
@@ -65,7 +65,11 @@ impl<'a, 'store> EndpointRows<'a, 'store, '_> {
         let dependencies = conn
             .prepare_cached(sql::DEPENDENCY.as_str())?
             .query_map(
-                params![module.topology, name, RUST_UNIT_SUMMARY_DERIVATION_VERSION],
+                params![
+                    module.topology,
+                    name,
+                    rust_unit_summary_derivation_identity()
+                ],
                 |row| Ok((row.get::<_, i64>(0)?, "crate".to_owned())),
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -156,7 +160,6 @@ impl<'a, 'store> EndpointRows<'a, 'store, '_> {
             sql::namespace(demand.namespace()),
             &target.2,
         )?;
-        let completion = completion.combine(&binding_inventory.completion);
         let mut exports = rows.crate_exports_from_inventory(
             module,
             target.0,
@@ -165,6 +168,9 @@ impl<'a, 'store> EndpointRows<'a, 'store, '_> {
             &target.2,
             &binding_inventory,
         )?;
+        let completion = completion
+            .combine(&binding_inventory.completion)
+            .combine(&rows.unplaced_exports_completion(&exports));
         exports.sort_unstable();
         exports.dedup();
         use super::super::demand_closure::{ExportDeclaration, export_definitions};
@@ -659,6 +665,8 @@ impl super::super::demand_closure::HalfRules for RustHalfRows<'_, '_, '_> {
             requester: module,
             anchor,
             route,
+            terminal: self.source.demand.spelling(),
+            demand_namespace: self.source.demand.namespace(),
         }
     }
     fn route_target(
@@ -752,7 +760,7 @@ impl super::super::demand_closure::HalfRules for RustHalfRows<'_, '_, '_> {
             .exists(params![
                 module.topology,
                 name,
-                RUST_UNIT_SUMMARY_DERIVATION_VERSION
+                rust_unit_summary_derivation_identity()
             ])?;
         let scope = self
             .scope_ordinals
@@ -766,7 +774,7 @@ impl super::super::demand_closure::HalfRules for RustHalfRows<'_, '_, '_> {
     fn prefix_starts(
         &mut self,
         module: &Module,
-        mut selected: StartSelection,
+        selected: StartSelection,
         facts: &mut PlacementFacts<Self::Target>,
     ) -> Result<Vec<PlacementStart<Self::Member>>> {
         let conn = self.rows.ready.inventory.connection();
@@ -774,7 +782,6 @@ impl super::super::demand_closure::HalfRules for RustHalfRows<'_, '_, '_> {
         let name = self.fallback_name.clone();
         if let Some(name) = name.as_deref() {
             let blocks_fallback = selected.blocks_fallback;
-            let prefix_import_scopes = std::mem::take(&mut selected.scopes);
             starts.extend(selected.into_containers());
             if !blocks_fallback {
                 // A module an item macro declares in this module
@@ -791,17 +798,7 @@ impl super::super::demand_closure::HalfRules for RustHalfRows<'_, '_, '_> {
             }
             if starts.is_empty() {
                 let mut details = Vec::new();
-                for binder_scope in &prefix_import_scopes {
-                    details.extend(
-                        super::super::rust_crate_context::macro_gated_import_route_details(
-                            conn,
-                            module,
-                            name,
-                            *binder_scope,
-                        )?,
-                    );
-                }
-                if details.is_empty() && module.unmounted {
+                if module.unmounted {
                     details.extend(
                         super::super::rust_crate_context::macro_gated_unmounted_file_details(
                             conn,
@@ -1207,7 +1204,7 @@ impl super::super::demand_closure::HalfRules for RustHalfRows<'_, '_, '_> {
                 .exists(params![
                     module.topology,
                     name,
-                    RUST_UNIT_SUMMARY_DERIVATION_VERSION
+                    rust_unit_summary_derivation_identity()
                 ])?;
         }
         // A qualified reference can stop at a module import whose
@@ -1253,6 +1250,9 @@ impl super::super::demand_closure::HalfRules for RustHalfRows<'_, '_, '_> {
             ready: self.rows.ready,
         };
         let demand = &self.source.demand;
+        // A keyword-rooted name that no export answers, out of a file no
+        // selected target compiles, misses in a synthetic root.
+        let unmounted = rows.unmounted_keyword_root_completion(module, &self.source.route)?;
         let mut inventory = rows.crate_inventory_completion(
             module,
             target.0,
@@ -1260,6 +1260,15 @@ impl super::super::demand_closure::HalfRules for RustHalfRows<'_, '_, '_> {
             sql::namespace(demand.namespace()),
             &target.2,
         )?;
+        // The module's open inventory and the binding's own unproven path are
+        // different scopes. A name behind such a path publishes no export, so
+        // only the binding can say the miss is not a decided absence.
+        inventory = inventory.combine(&rows.unproven_binding_completion(
+            target.0,
+            &target.1,
+            sql::namespace(demand.namespace()),
+            &target.2,
+        )?);
         let bindings = rows.crate_external_bindings(
             module,
             target.0,
@@ -1275,7 +1284,7 @@ impl super::super::demand_closure::HalfRules for RustHalfRows<'_, '_, '_> {
                 }
             }));
         }
-        Ok(inventory)
+        Ok(inventory.combine(&unmounted))
     }
     fn empty_placement(
         &mut self,
@@ -1334,6 +1343,49 @@ impl super::super::demand_closure::HalfRules for RustHalfRows<'_, '_, '_> {
             Some(segment) => Some(segment.spelling()),
             None => self.import_root_name.as_deref(),
         };
+        // The omitted edge belongs to the unit's test configuration, not to
+        // an item's attributes: Cargo permits unconditional dev imports in a
+        // test-mode library. Local/type prefixes must not inherit this cause.
+        if !self.known_prefix
+            && !self.local_type_prefix_is_decided
+            && self.prefix_kind == sql::RoutePrefixKind::Other
+            && self
+                .resolved
+                .as_ref()
+                .is_none_or(|resolved| resolved.targets.is_empty())
+            && let Some(name) = root_name.or(self.prefix_spelling.as_deref()).or_else(|| {
+                (self.source.is_import || demand.namespace() == ResolutionNamespace::Type)
+                    .then_some(demand.spelling())
+            })
+        {
+            for &topology in &self.placed_topologies {
+                let mut statement = conn.prepare_cached("SELECT json(gap.detail)
+                    FROM selected_rust_unit_summaries AS unit
+                    JOIN main.rust_resolution_unit_summary_gaps AS gap ON gap.summary_id=unit.summary_id
+                    JOIN main.rust_resolution_unit_summary_contexts AS context ON context.summary_id=unit.summary_id
+                    WHERE unit.topology_id=?1 AND gap.gap_kind='dev_dependency_cycle_edge_dropped' AND gap.subject=?2
+                    AND EXISTS(SELECT 1 FROM json_each(context.cfg_atoms) AS atom WHERE atom.value='test')")?;
+                if let Some(detail) = statement
+                    .query_row(params![topology, name], |row| row.get::<_, String>(0))
+                    .optional()?
+                {
+                    let mut digest = CanonicalHasher::new(b"bifrost-rust-dropped-dev-edge:v1");
+                    digest.field("detail", detail.as_bytes());
+                    let reason = self.rows.ready.context_identities.named_semantic(
+                        digest.finish(),
+                        "DevDependencyCycleEdgeDropped",
+                        crate::analyzer::resolution::ReasonDeterminism::Unaudited,
+                        &detail,
+                    );
+                    return Ok(Some(HalfBoundary {
+                        completion: pending_completion.combine(&ResolutionCompletion::incomplete(
+                            [ResolutionIncompleteReason::UnsupportedSemantic(reason)],
+                        )),
+                        associations: Vec::new(),
+                    }));
+                }
+            }
+        }
         // `Self` or a type parameter heading a path to one of its
         // members (`Self::check`, `T::one`) is a type and not a
         // module: the typed member route answers the member through

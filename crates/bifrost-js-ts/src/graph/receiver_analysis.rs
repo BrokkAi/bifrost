@@ -7,6 +7,7 @@
 
 use crate::access_chain::{JsTsImportedMemberChainResolution, resolve_import_member_chain};
 use crate::graph::common::{enclosing_function_scope, simple_identifier_text};
+use crate::graph::function_exits::function_body_exits;
 use crate::imports::{
     js_ts_direct_import_export_name, js_ts_module_identity, require_call_module_specifier,
 };
@@ -1061,7 +1062,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             if !candidate.is_class() || !self.is_imported_class_declaration(candidate) {
                 return ReceiverAnalysisOutcome::Unknown;
             }
-            let Some(index) = self.host.usage_index(None) else {
+            let Some(index) = self.host.complete_usage_index(None) else {
                 return ReceiverAnalysisOutcome::Unknown;
             };
             if index
@@ -2089,29 +2090,32 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
                 }
             }
         }
-        let mut outcomes = Vec::new();
-        let mut stack = vec![function];
-        while let Some(node) = stack.pop() {
-            if let Err(limit) = tracker.record_scope_node() {
-                return limit.exceeded();
-            }
-            if node.id() != function.id() && is_summary_boundary(node.kind()) {
-                continue;
-            }
-            if node.kind() == "return_statement" {
-                let mut cursor = node.walk();
-                if let Some(value) = node.named_children(&mut cursor).next() {
-                    outcomes.push(self.resolve_expression(value, depth + 1, budget, tracker));
-                } else {
-                    outcomes.push(ReceiverAnalysisOutcome::Unknown);
-                }
-                continue;
-            }
-            for index in (0..node.named_child_count()).rev() {
-                if let Some(child) = node.named_child(index) {
-                    stack.push(child);
-                }
-            }
+        // A call produces the value of whichever exit ends it, so the summary
+        // reads the reachable exits of the body rather than every `return`
+        // under it (#7239). An expression-bodied arrow function and a
+        // signature without a body have no statement body to read.
+        let Some(body) = function
+            .child_by_field_name("body")
+            .filter(|body| body.kind() == "statement_block")
+        else {
+            return ReceiverAnalysisOutcome::Unknown;
+        };
+        let exits = match function_body_exits(body, self.source, || tracker.record_scope_node()) {
+            Ok(Some(exits)) => exits,
+            Ok(None) => return ReceiverAnalysisOutcome::Unknown,
+            Err(limit) => return limit.exceeded(),
+        };
+        let mut outcomes = Vec::with_capacity(exits.returns.len() + 1);
+        for value in exits.returns {
+            outcomes.push(match value {
+                Some(value) => self.resolve_expression(value, depth + 1, budget, tracker),
+                // `return;` returns `undefined`, which has no members.
+                None => ReceiverAnalysisOutcome::Unknown,
+            });
+        }
+        if exits.falls_through {
+            // Reaching the end of the body also returns `undefined`.
+            outcomes.push(ReceiverAnalysisOutcome::Unknown);
         }
         ReceiverAnalysisOutcome::merge_branch_outcomes(outcomes, budget)
     }
@@ -3143,10 +3147,6 @@ fn is_nonlinear_control_boundary(kind: &str) -> bool {
 
 fn is_scope_boundary(kind: &str) -> bool {
     matches!(kind, "program" | "statement_block") || is_declaration_boundary(kind)
-}
-
-fn is_summary_boundary(kind: &str) -> bool {
-    is_declaration_boundary(kind)
 }
 
 fn is_declaration_boundary(kind: &str) -> bool {

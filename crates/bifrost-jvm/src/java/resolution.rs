@@ -1467,7 +1467,7 @@ impl<'source> JavaResolutionBuilder<'source> {
         }
         assert!(is_spelled_identifier(name));
         let declaration = self.add_declared_head_local(name, body.start_byte()..body.end_byte());
-        let source_declaration = self.record_declaration_source(node, declaration);
+        let source_declaration = self.record_declaration_source(node, name, declaration);
         self.source_collector
             .mark_lexical(source_declaration, DeclarationKind::EnhancedForVariable);
         if let Some(dimensions) = node.child_by_field_name("dimensions") {
@@ -1519,7 +1519,7 @@ impl<'source> JavaResolutionBuilder<'source> {
             .child_by_field_name("body")
             .expect("validated Java catch clause has a body");
         let declaration = self.add_declared_head_local(name, body.start_byte()..body.end_byte());
-        let source_declaration = self.record_declaration_source(node, declaration);
+        let source_declaration = self.record_declaration_source(node, name, declaration);
         self.source_collector
             .mark_lexical(source_declaration, DeclarationKind::CatchParameter);
 
@@ -1615,7 +1615,7 @@ impl<'source> JavaResolutionBuilder<'source> {
             ResolutionNamespace::Value,
             None,
         );
-        let source_declaration = self.record_declaration_source(node, declaration);
+        let source_declaration = self.record_declaration_source(node, name, declaration);
         self.source_collector
             .mark_lexical(source_declaration, DeclarationKind::LambdaParameter);
         self.facts.binders.push(ResolutionBinderFact {
@@ -1666,8 +1666,7 @@ impl<'source> JavaResolutionBuilder<'source> {
             ResolutionNamespace::Value,
             None,
         );
-        let source_declaration =
-            self.record_declaration_source_with_name(name, Some(name), declaration);
+        let source_declaration = self.record_declaration_source(name, name, declaration);
         self.source_collector
             .mark_lexical(source_declaration, DeclarationKind::LambdaParameter);
         self.facts.binders.push(ResolutionBinderFact {
@@ -2553,22 +2552,16 @@ impl<'source> JavaResolutionBuilder<'source> {
         id
     }
 
+    /// Every Java declaration bridge names the name token that the caller
+    /// selected. A nameless bridge would intern a second declaration for the
+    /// same occurrence, which selected readers cannot project (#12948).
     fn record_declaration_source(
         &mut self,
         node: Node<'_>,
+        name: Node<'_>,
         site: ResolutionSiteId,
     ) -> SourceDeclarationId {
-        let name = node.child_by_field_name("name");
-        self.record_declaration_source_with_name(node, name, site)
-    }
-
-    fn record_declaration_source_with_name(
-        &mut self,
-        node: Node<'_>,
-        name: Option<Node<'_>>,
-        site: ResolutionSiteId,
-    ) -> SourceDeclarationId {
-        let declaration = self.source_collector.declare_node(node, name);
+        let declaration = self.source_collector.declare_node(node, Some(name));
         self.declaration_sources.push((site, declaration));
         assert!(
             self.declaration_sites.insert(node.id(), site).is_none(),
@@ -2807,7 +2800,7 @@ impl<'source> JavaResolutionBuilder<'source> {
                 ResolutionNamespace::Type,
                 None,
             );
-            self.record_declaration_source(parameter, declaration);
+            self.record_declaration_source(parameter, name_node, declaration);
             self.facts.binders.push(ResolutionBinderFact {
                 declaration,
                 scope,
@@ -2856,7 +2849,13 @@ impl<'source> JavaResolutionBuilder<'source> {
                     Some(declaration),
                     "Java type-bound reference owner must balance"
                 );
-                let reference = self.slot(bound_slot).site;
+                let Some(reference) = self.named_type_reference(bound_slot) else {
+                    self.add_gap(
+                        declaration,
+                        ResolutionGapKind::UnsupportedHierarchyTraversal,
+                    );
+                    continue;
+                };
                 let relation = ResolutionTypeRelationId::try_from_index(
                     self.facts.declared_type_relations.len(),
                 )
@@ -2959,7 +2958,7 @@ impl<'source> JavaResolutionBuilder<'source> {
             ResolutionNamespace::Type,
             None,
         );
-        let source_declaration = self.record_declaration_source(node, declaration);
+        let source_declaration = self.record_declaration_source(node, name, declaration);
         if is_local_type {
             self.record_scoped_visibility(declaration);
         } else {
@@ -3270,7 +3269,7 @@ impl<'source> JavaResolutionBuilder<'source> {
             ResolutionNamespace::Value,
             None,
         );
-        let source_declaration = self.record_declaration_source(node, declaration);
+        let source_declaration = self.record_declaration_source(node, name, declaration);
         self.add_declaration_visibility(declaration, node, source_declaration);
         let scope = *self.scope(scope_id);
         self.facts.binders.push(ResolutionBinderFact {
@@ -3358,38 +3357,91 @@ impl<'source> JavaResolutionBuilder<'source> {
                 matches!(kind, "switch_rule" | "switch_block_statement_group")
             }),
         ) else {
-            // instanceof flow scopes do not have a match arm. Preserve the
-            // type occurrence and report the unmodeled binder locally.
-            let site = self.add_site(pattern, ResolutionSiteKind::UnsupportedDeclaration);
-            self.add_gap(site, ResolutionGapKind::UnsupportedScopeOrBinder);
+            self.lower_instanceof_pattern_binder(pattern, name, type_node);
             return;
         };
         let scope_id = self.current_scope();
         let scope = *self.scope(scope_id);
         assert_eq!(scope.start_byte, arm.start_byte());
         assert_eq!(scope.end_byte, arm.end_byte());
+        self.publish_pattern_binder(
+            pattern,
+            name,
+            type_node,
+            scope_id,
+            std::iter::once(head.end_byte()..scope.end_byte),
+        );
+    }
+
+    fn lower_instanceof_pattern_binder(&mut self, pattern: Node<'_>, name: Node<'_>, ty: Node<'_>) {
+        let mut regions = super::structural::java_pattern_binding_regions(pattern);
+        // A for statement owns a narrower native scope than its possible
+        // false-exit suffix. Position the unsupported site in the scope that
+        // contains all affected regions so its existing frontier reaches that
+        // suffix as well; no new gap route is needed.
+        let region_end = regions
+            .proven
+            .iter()
+            .chain(&regions.unknown)
+            .map(|range| range.end)
+            .max()
+            .unwrap_or(pattern.end_byte());
+        let mut scope = self.current_scope();
+        while self.scope(scope).end_byte < region_end {
+            scope = self
+                .scope(scope)
+                .parent
+                .expect("pattern regions have an enclosing lexical scope");
+        }
+        // Partial publication would hide the binder's uncertainty outside its
+        // active paths. Withhold it entirely so the existing unsupported-site
+        // frontier protects outer bindings too (#7746).
+        if pattern.has_error() || !regions.unknown.is_empty() {
+            let site =
+                self.add_site_in_scope(pattern, ResolutionSiteKind::UnsupportedDeclaration, scope);
+            self.add_gap(site, ResolutionGapKind::UnsupportedScopeOrBinder);
+            return;
+        }
+        // An unused boolean test can have no visibility regions. Retain its
+        // declaration with an empty activation, which shared lowering already
+        // represents without a binding path or a missing-binder gap.
+        if regions.proven.is_empty() {
+            regions.proven.push(pattern.end_byte()..pattern.end_byte());
+        }
+        self.publish_pattern_binder(pattern, name, ty, scope, regions.proven);
+    }
+
+    fn publish_pattern_binder(
+        &mut self,
+        pattern: Node<'_>,
+        name: Node<'_>,
+        ty: Node<'_>,
+        scope: ResolutionScopeId,
+        regions: impl IntoIterator<Item = std::ops::Range<usize>>,
+    ) {
         let declaration = self.add_identifier_site(
             name,
             ResolutionSiteKind::ValueDeclaration,
-            scope_id,
+            scope,
             ResolutionIdentifierRole::Declaration,
             ResolutionNamespace::Value,
             None,
         );
-        let source_declaration =
-            self.record_declaration_source_with_name(pattern, Some(name), declaration);
+        let source_declaration = self.record_declaration_source(pattern, name, declaration);
         self.source_collector
             .mark_lexical(source_declaration, DeclarationKind::LocalVariable);
-        self.facts.binders.push(ResolutionBinderFact {
-            declaration,
-            scope: scope_id,
-            kind: ResolutionBinderKind::Pattern,
-            hoisting: HoistingClass::DeclaredHead,
-            activation_start: head.end_byte(),
-            activation_end: scope.end_byte,
-        });
-        self.register_local_value_binder(scope_id, name, head.end_byte(), scope.end_byte);
-        self.attach_declaration_type(declaration, type_node, DeclarationTypeRole::Value);
+        for region in regions {
+            self.facts.binders.push(ResolutionBinderFact {
+                declaration,
+                scope,
+                kind: ResolutionBinderKind::Pattern,
+                hoisting: HoistingClass::DeclaredHead,
+                activation_start: region.start,
+                activation_end: region.end,
+            });
+            self.register_local_value_binder(scope, name, region.start, region.end);
+        }
+        self.attach_declaration_type(declaration, ty, DeclarationTypeRole::Value);
         self.attach_implicit_local_initializer(declaration, name);
     }
 
@@ -3580,7 +3632,7 @@ impl<'source> JavaResolutionBuilder<'source> {
             },
             None,
         );
-        let source_declaration = self.record_declaration_source(node, declaration);
+        let source_declaration = self.record_declaration_source(node, name, declaration);
         self.add_declaration_visibility(declaration, node, source_declaration);
         let signature_index = self.facts.callable_signatures.len();
         self.facts
@@ -3896,11 +3948,7 @@ impl<'source> JavaResolutionBuilder<'source> {
                 ResolutionNamespace::Value,
                 None,
             );
-            let source = self.record_declaration_source_with_name(
-                component.node,
-                Some(component.name),
-                field,
-            );
+            let source = self.record_declaration_source(component.node, component.name, field);
             self.add_declaration_visibility(field, component.node, source);
             self.facts.binders.push(ResolutionBinderFact {
                 declaration: field,
@@ -4038,7 +4086,7 @@ impl<'source> JavaResolutionBuilder<'source> {
             );
             // The component node identifies its field and the header identifies
             // its accessor. A name-node pair identifies the canonical parameter.
-            let source = self.record_declaration_source_with_name(name, Some(name), declaration);
+            let source = self.record_declaration_source(name, name, declaration);
             self.source_collector
                 .mark_lexical(source, DeclarationKind::Parameter);
             // Implicit constructors have an empty activation range. Compact
@@ -4114,7 +4162,7 @@ impl<'source> JavaResolutionBuilder<'source> {
             ResolutionNamespace::Value,
             None,
         );
-        let source_declaration = self.record_declaration_source(node, declaration);
+        let source_declaration = self.record_declaration_source(node, name, declaration);
         self.source_collector
             .mark_lexical(source_declaration, DeclarationKind::Parameter);
         self.add_parameter_binder_fact(
@@ -4192,7 +4240,7 @@ impl<'source> JavaResolutionBuilder<'source> {
             ResolutionNamespace::Value,
             None,
         );
-        let source_declaration = self.record_declaration_source(declarator, declaration);
+        let source_declaration = self.record_declaration_source(declarator, name, declaration);
         self.source_collector
             .mark_lexical(source_declaration, DeclarationKind::Parameter);
         self.add_parameter_binder_fact(
@@ -4266,7 +4314,7 @@ impl<'source> JavaResolutionBuilder<'source> {
         // Earlier resources are visible in later initializers, but not in
         // the catch or finally clauses (JLS 6.3).
         let declaration = self.add_declared_head_local(name, value.end_byte()..body.end_byte());
-        let source_declaration = self.record_declaration_source(node, declaration);
+        let source_declaration = self.record_declaration_source(node, name, declaration);
         self.source_collector
             .mark_lexical(source_declaration, DeclarationKind::ResourceVariable);
         let source_type = self.capture_source_type(type_node);
@@ -4328,7 +4376,7 @@ impl<'source> JavaResolutionBuilder<'source> {
                 ResolutionNamespace::Value,
                 None,
             );
-            let source_declaration = self.record_declaration_source(node, declaration);
+            let source_declaration = self.record_declaration_source(node, name, declaration);
             if is_field {
                 self.add_declaration_visibility(declaration, node, source_declaration);
             } else {
@@ -4640,17 +4688,10 @@ impl<'source> JavaResolutionBuilder<'source> {
         } else {
             self.lower_type(type_node)
         };
-        let supertype_reference = self.slot(supertype_slot).site;
-        if !matches!(
-            self.facts.sites[supertype_reference.index()].kind,
-            ResolutionSiteKind::TypeReference | ResolutionSiteKind::MemberReference
-        ) {
-            // Unsupported syntax has a gap site, not a positioned reference.
-            // Retain the subtype's uncertainty without inventing a hierarchy
-            // edge whose reference cannot have an owner.
+        let Some(supertype_reference) = self.named_type_reference(supertype_slot) else {
             self.add_gap(subtype, ResolutionGapKind::UnsupportedHierarchyTraversal);
             return;
-        }
+        };
         // An anonymous creation's type is lowered in its enclosing scope
         // before the synthetic body owner exists. The same written occurrence
         // becomes that body's supertype when the body is entered.
@@ -4680,11 +4721,10 @@ impl<'source> JavaResolutionBuilder<'source> {
         supertype_slot: ResolutionTypeSlotId,
         kind: ResolutionSupertypeKind,
     ) {
-        let supertype_reference = self.slot(supertype_slot).site;
-        assert!(matches!(
-            self.site(supertype_reference).kind,
-            ResolutionSiteKind::TypeReference | ResolutionSiteKind::MemberReference
-        ));
+        let Some(supertype_reference) = self.named_type_reference(supertype_slot) else {
+            self.add_gap(subtype, ResolutionGapKind::UnsupportedHierarchyTraversal);
+            return;
+        };
         let parent_ordinal = self.take_parent_ordinal(subtype);
         self.facts.supertypes.push(ResolutionSupertypeFact {
             subtype,
@@ -4697,6 +4737,16 @@ impl<'source> JavaResolutionBuilder<'source> {
             supertype_reference,
             ResolutionGapKind::UnsupportedHierarchyTraversal,
         );
+    }
+
+    // Only named type lowering publishes this projection from a registered
+    // Reference identifier. Intrinsic, array, and gap slots have no such
+    // projection, even when their site's kind is TypeReference.
+    fn named_type_reference(&mut self, slot: ResolutionTypeSlotId) -> Option<ResolutionSiteId> {
+        let site = self.slot(slot).site;
+        self.scan_index
+            .has_type_identity_projection(&self.facts, site, slot)
+            .then_some(site)
     }
 
     fn take_parent_ordinal(&mut self, subtype: ResolutionSiteId) -> u32 {
@@ -4755,6 +4805,12 @@ impl<'source> JavaResolutionBuilder<'source> {
                 .expect("captured Java source type has a shape");
             if finishing {
                 match current.kind() {
+                    "annotated_type" => {
+                        let element = java_named_type_child(current)
+                            .expect("scheduled annotated type has an underlying type");
+                        let slot = self.type_slots_by_node[&element.id()];
+                        self.type_slots_by_node.insert(current.id(), slot);
+                    }
                     "generic_type" => {
                         let base = current
                             .child_by_field_name("type")
@@ -4804,6 +4860,14 @@ impl<'source> JavaResolutionBuilder<'source> {
                 continue;
             }
             match (current.kind(), shape) {
+                ("annotated_type", _) => {
+                    if let Some(element) = java_named_type_child(current) {
+                        pending.push((current, true));
+                        pending.push((element, false));
+                    } else {
+                        self.lower_unsupported_type(current);
+                    }
+                }
                 ("generic_type", JavaTypeSyntaxShape::Generic { .. }) => {
                     let Some(base) = current
                         .child_by_field_name("type")
@@ -5165,6 +5229,9 @@ impl<'source> JavaResolutionBuilder<'source> {
                     };
                     if let Some(ty) = node.child_by_field_name("right") {
                         self.lower_type(ty);
+                        if let Some(name) = node.child_by_field_name("name") {
+                            self.lower_instanceof_pattern_binder(node, name, ty);
+                        }
                     }
                     stack.push((node, true));
                     stack.push((left, false));
@@ -6399,10 +6466,18 @@ impl<'source> JavaResolutionBuilder<'source> {
             result,
             explicit_type_argument_count(node),
         );
-        let chain_segments = self.non_owning_scoped_type_chain(type_node, constructed_type);
+        let prefix_type = if type_node.kind() == "generic_type" {
+            type_node
+                .child_by_field_name("type")
+                .or_else(|| java_named_type_child(type_node))
+                .expect("generic creation type has a base type")
+        } else {
+            type_node
+        };
+        let chain_segments = self.non_owning_scoped_type_chain(prefix_type, constructed_type);
         let has_own_root = self.scan_index.has_root(&self.facts, callee);
         if !has_own_root
-            && (type_node.kind() == "type_identifier" || chain_segments.is_some())
+            && (prefix_type.kind() == "type_identifier" || chain_segments.is_some())
             && self
                 .facts
                 .calls

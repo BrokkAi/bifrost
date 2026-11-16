@@ -30,45 +30,129 @@ pub enum RustBlobActivity {
     Unknown,
 }
 
-pub(crate) const BLOB_PLACEMENT_ACTIVITY: &str = "WITH route_evidence AS MATERIALIZED (
- SELECT unit.workspace_id, unit.generation, json_extract(gap.detail, '$.path') AS path,
-        MIN(gap.gap_kind='inactive_placement'
-            AND json_extract(gap.detail, '$.activation')=0) AS inactive
+impl RustBlobActivity {
+    /// The verdict a stored activation stands for: 1 active, 0 inactive, -1
+    /// unknown. `rust_file_activity.sql` defines the activation.
+    pub fn from_activation(activation: i64) -> Self {
+        debug_assert!((-1..=1).contains(&activation));
+        match activation {
+            1 => Self::Active,
+            0 => Self::Inactive,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// Reverse-reference gate: the activity of each requested blob, aggregated over
+/// the non-detached selected units whose summaries store a placement of the
+/// blob's path. The per-unit verdict is `file_activity`
+/// (`rust_file_activity.sql`, the one definition shared with the route index).
+/// Across units: active when any unit says active; inactive when every unit
+/// that mentions the file says inactive; unknown otherwise, including when no
+/// unit mentions it. A unit mentions a file by a placement, an inactive
+/// placement, or an undecided, unplaced or duplicate-placement gap naming it.
+///
+/// The stored rows describe the persisted files. A selection that overlays any
+/// Rust file of a unit (a replacement or removal mask, or a content mount) can
+/// change which modules its declaring files mount, so for such a unit an
+/// `Inactive` verdict is stale and becomes `Unknown`: the caller is kept. The
+/// summaries do not record which file declares an inactive module, so the
+/// downgrade covers the whole unit. A manifest overlay that differs from the
+/// selected revision makes the whole selection unavailable and has no row here.
+pub(crate) const BLOB_PLACEMENT_ACTIVITY: &str = concat!(
+    "WITH unresolved_path(summary_id, rel_path) AS MATERIALIZED (
+ SELECT unit.summary_id, json_extract(gap.detail, '$.path')
  FROM selected_rust_unit_summaries AS unit
  CROSS JOIN main.rust_resolution_unit_summary_contexts AS context
   ON context.summary_id=unit.summary_id AND context.target_kind<>'detached'
  CROSS JOIN main.rust_resolution_unit_summary_gaps AS gap
   ON gap.summary_id=unit.summary_id
- AND gap.gap_kind IN ('inactive_placement','unknown_activation','unplaced_module','duplicate_placement')
- GROUP BY unit.workspace_id, unit.generation, path
+ AND gap.gap_kind IN ('unknown_activation','unplaced_module','duplicate_placement')
+ WHERE json_extract(gap.detail, '$.path') IS NOT NULL
+), probe(summary_id, rel_path) AS MATERIALIZED (
+ SELECT unit.summary_id, mount.persisted_relative_path
+ FROM json_each(?1) AS requested
+ CROSS JOIN temp.selected_resolution_mounts AS mount ON mount.blob_id=requested.value
+ CROSS JOIN main.resolution_unit_summary_members AS member
+  INDEXED BY resolution_unit_summary_members_path
+  ON member.rel_path=mount.persisted_relative_path
+ CROSS JOIN selected_rust_unit_summaries AS unit
+  ON unit.summary_id=member.summary_id
+ AND unit.workspace_id=mount.workspace_id AND unit.generation=mount.generation
+ CROSS JOIN main.rust_resolution_unit_summary_contexts AS context
+  ON context.summary_id=unit.summary_id AND context.target_kind<>'detached'
+ UNION
+ SELECT unit.summary_id, mount.persisted_relative_path
+ FROM json_each(?1) AS requested
+ CROSS JOIN temp.selected_resolution_mounts AS mount ON mount.blob_id=requested.value
+ CROSS JOIN main.resolution_unit_summary_input_files AS input
+  INDEXED BY resolution_unit_summary_input_files_path
+  ON input.rel_path=mount.persisted_relative_path
+ CROSS JOIN selected_rust_unit_summaries AS unit
+  ON unit.summary_id=input.summary_id
+ AND unit.workspace_id=mount.workspace_id AND unit.generation=mount.generation
+ CROSS JOIN main.rust_resolution_unit_summary_contexts AS context
+  ON context.summary_id=unit.summary_id AND context.target_kind<>'detached'
+ UNION
+ SELECT unresolved_path.summary_id, mount.persisted_relative_path
+ FROM json_each(?1) AS requested
+ CROSS JOIN temp.selected_resolution_mounts AS mount ON mount.blob_id=requested.value
+ CROSS JOIN unresolved_path ON unresolved_path.rel_path=mount.persisted_relative_path
+ CROSS JOIN selected_rust_unit_summaries AS unit
+  ON unit.summary_id=unresolved_path.summary_id
+ AND unit.workspace_id=mount.workspace_id AND unit.generation=mount.generation
+), ",
+    include_str!("rust_file_activity.sql"),
+    ", overlaid_summary(summary_id) AS (
+ SELECT member.summary_id FROM (
+   SELECT persisted_relative_path FROM temp.selected_resolution_overlay_masks WHERE storage_language='rust'
+   UNION
+   SELECT persisted_relative_path FROM temp.selected_resolution_content_mounts WHERE storage_language='rust'
+  ) AS overlay
+ CROSS JOIN main.resolution_unit_summary_members AS member
+  INDEXED BY resolution_unit_summary_members_path
+  ON member.rel_path=overlay.persisted_relative_path
+ UNION
+ SELECT input.summary_id FROM (
+   SELECT persisted_relative_path FROM temp.selected_resolution_overlay_masks WHERE storage_language='rust'
+   UNION
+   SELECT persisted_relative_path FROM temp.selected_resolution_content_mounts WHERE storage_language='rust'
+  ) AS overlay
+ CROSS JOIN main.resolution_unit_summary_input_files AS input
+  INDEXED BY resolution_unit_summary_input_files_path
+  ON input.rel_path=overlay.persisted_relative_path
+), gate_activity(summary_id, rel_path, activation) AS (
+ SELECT summary_id, rel_path,
+        CASE WHEN activation=0 AND summary_id IN (SELECT summary_id FROM overlaid_summary)
+             THEN -1 ELSE activation END
+ FROM file_activity
 )
 SELECT requested.value,
  CASE WHEN EXISTS (
-  SELECT 1 FROM selected_rust_container_placements AS placement
-  CROSS JOIN main.rust_resolution_unit_summary_contexts AS context
-   ON context.summary_id=placement.summary_id AND context.target_kind<>'detached'
-  WHERE placement.placement_blob=requested.value
-   AND NOT EXISTS (
-    SELECT 1 FROM main.rust_resolution_unit_summary_gaps AS gap
-    WHERE gap.summary_id=placement.summary_id AND gap.gap_kind='unknown_activation'
-     AND (gap.subject=placement.container_path
-      OR substr(placement.container_path,1,length(gap.subject)+2)=gap.subject || '::')
-   )
+  SELECT 1 FROM temp.selected_resolution_mounts AS mount
+  CROSS JOIN gate_activity AS activity ON activity.rel_path=mount.persisted_relative_path
+  CROSS JOIN selected_rust_unit_summaries AS unit
+   ON unit.summary_id=activity.summary_id
+  AND unit.workspace_id=mount.workspace_id AND unit.generation=mount.generation
+  WHERE mount.blob_id=requested.value AND activity.activation=1
  ) THEN 1
  WHEN EXISTS (
   SELECT 1 FROM temp.selected_resolution_mounts AS mount
-  JOIN route_evidence AS evidence
-   ON evidence.workspace_id=mount.workspace_id AND evidence.generation=mount.generation
-  AND evidence.path=mount.persisted_relative_path
-  WHERE mount.blob_id=requested.value AND evidence.inactive=1
+  CROSS JOIN gate_activity AS activity ON activity.rel_path=mount.persisted_relative_path
+  CROSS JOIN selected_rust_unit_summaries AS unit
+   ON unit.summary_id=activity.summary_id
+  AND unit.workspace_id=mount.workspace_id AND unit.generation=mount.generation
+  WHERE mount.blob_id=requested.value AND activity.activation=0
  ) AND NOT EXISTS (
   SELECT 1 FROM temp.selected_resolution_mounts AS mount
-  JOIN route_evidence AS evidence
-   ON evidence.workspace_id=mount.workspace_id AND evidence.generation=mount.generation
-  AND evidence.path=mount.persisted_relative_path
-  WHERE mount.blob_id=requested.value AND evidence.inactive IS NOT 1
+  CROSS JOIN gate_activity AS activity ON activity.rel_path=mount.persisted_relative_path
+  CROSS JOIN selected_rust_unit_summaries AS unit
+   ON unit.summary_id=activity.summary_id
+  AND unit.workspace_id=mount.workspace_id AND unit.generation=mount.generation
+  WHERE mount.blob_id=requested.value AND activity.activation<>0
  ) THEN 0 ELSE -1 END
-FROM json_each(?1) AS requested ORDER BY requested.key";
+FROM json_each(?1) AS requested ORDER BY requested.key"
+);
 
 impl SelectedResolutionOperation<'_, '_> {
     /// Read one verdict per input blob, preserving input order and duplicates.
@@ -87,13 +171,7 @@ impl SelectedResolutionOperation<'_, '_> {
             .prepare_cached(BLOB_PLACEMENT_ACTIVITY)?
             .query_map([requested], |row| {
                 let activation: i64 = row.get(1)?;
-                debug_assert!((-1..=1).contains(&activation));
-                let activity = match activation {
-                    1 => RustBlobActivity::Active,
-                    0 => RustBlobActivity::Inactive,
-                    _ => RustBlobActivity::Unknown,
-                };
-                Ok((row.get(0)?, activity))
+                Ok((row.get(0)?, RustBlobActivity::from_activation(activation)))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
@@ -409,8 +487,7 @@ FROM selected_rust_unit_closure AS graph
 CROSS JOIN main.rust_resolution_unit_summary_contexts AS context
   ON context.summary_id=graph.summary_id
 WHERE graph.root_unit_key=?1 AND EXISTS (
- SELECT 1 FROM main.resolution_unit_summary_members AS member
-  INDEXED BY resolution_unit_summary_members_blob
+ SELECT 1 FROM temp.selected_unit_member_blobs AS member
  WHERE member.summary_id=graph.summary_id AND member.blob_id=?2
 )";
 

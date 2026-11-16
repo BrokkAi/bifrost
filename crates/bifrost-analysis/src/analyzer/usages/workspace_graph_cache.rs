@@ -134,9 +134,11 @@ impl WorkspaceUsageGraphCacheKey {
 
     fn retained_bytes(&self) -> usize {
         std::mem::size_of::<Self>().saturating_add(
-            self.ecosystems
-                .len()
-                .saturating_mul(std::mem::size_of::<UsageEcosystem>()),
+            brokk_bifrost_core::allocation_size::allocation_size(
+                self.ecosystems
+                    .len()
+                    .saturating_mul(std::mem::size_of::<UsageEcosystem>()),
+            ),
         )
     }
 }

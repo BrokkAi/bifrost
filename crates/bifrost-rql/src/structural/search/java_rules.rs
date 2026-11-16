@@ -217,6 +217,7 @@ fn javadoc_matches(
                     unknown_type_parameter_tag(&sites, node, &source)
                         .into_iter()
                         .map(|report| LanguageRuleMatch {
+                            selected_pattern_source: Default::default(),
                             select: node_range(node),
                             report,
                             heuristic: None,
@@ -243,6 +244,7 @@ fn javadoc_matches(
                             callable_unknown_parameter_tags(&sites, node, &source)
                                 .into_iter()
                                 .map(|report| LanguageRuleMatch {
+                                    selected_pattern_source: Default::default(),
                                     select,
                                     report,
                                     heuristic: None,
@@ -254,6 +256,7 @@ fn javadoc_matches(
                             analyzer, &sites, node, &source, undecided,
                         );
                         tag_matches.extend(reports.into_iter().map(|report| LanguageRuleMatch {
+                            selected_pattern_source: Default::default(),
                             select,
                             report,
                             heuristic: None,

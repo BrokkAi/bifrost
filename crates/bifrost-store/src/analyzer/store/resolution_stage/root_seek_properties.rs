@@ -75,6 +75,7 @@ fn populate(connection: &Connection, endpoints: &[EndpointSignature]) {
     assert!(
         super::super::lexical::prepare_lexical_fragment(&fragment, &CancellationToken::new())
             .unwrap()
+            .unwrap()
             .insert(
                 connection,
                 1,

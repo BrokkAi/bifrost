@@ -1028,7 +1028,11 @@ impl Serialize for MatchFindingAnchor {
 /// Absence violations have no offending occurrence to anchor on, so the anchor
 /// is keyed on the thing that does exist: the subject node's content-scoped AST
 /// id plus the authored assert record ID. Both are exact, so the anchor is
-/// always strong — an assertion never degrades to a positional weak key.
+/// always strong -- an assertion never degrades to a positional weak key.
+///
+/// A relational assertion's subject is a digest of its violated group instead,
+/// built from source-derived row identities and never from a `StableId` key
+/// value, because those can be lever-scoped semantic wire ids (#12029).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssertionFindingAnchor {
     path: WorkspaceRelativePath,

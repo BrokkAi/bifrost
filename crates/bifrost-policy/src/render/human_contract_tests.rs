@@ -63,6 +63,7 @@ fn evaluated_report(source: &str) -> PolicyReportDocument {
         .evaluate(
             policy,
             &PolicyEvaluationContext {
+                acceptance_hint: None,
                 analyzer: &analyzer,
                 workspace: None,
                 flow_state: &brokk_bifrost_flow::FlowWorkspaceState::new(),
@@ -88,6 +89,7 @@ fn human_views_keep_the_close_match_marker_when_contributor_details_are_cut() {
         report.runs()[0].clone(),
         Some(snapshot.as_ref()),
         &budget,
+        None,
     )
     .unwrap();
     let contributor = run.findings()[0].model_attribution().unwrap().contributors[0].clone();
@@ -132,6 +134,7 @@ fn located_selector_gap_keeps_distinct_sites() {
         "selector discovery incomplete",
         None,
         Vec::new(),
+        crate::RelatedLocationOmissions::Known(0),
     )
     .unwrap()
     .with_selector_gap(PolicySelectorGapSummary::new(
@@ -306,6 +309,9 @@ fn analysis_classification_prints_every_evidence_reference() {
 }
 
 #[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#10984: human diagnostics must expose unknown related-location omissions"
+)]
 fn related_diagnostic_prints_its_evidence_suffix() {
     let report = evaluated_report("export function other() {}\n");
     let source = &report.runs()[0];
@@ -325,6 +331,7 @@ fn related_diagnostic_prints_its_evidence_suffix() {
         "related source evidence",
         None,
         vec![related],
+        crate::RelatedLocationOmissions::Unknown,
     )
     .unwrap();
     let run = PolicyRun::try_new(
@@ -353,4 +360,60 @@ fn related_diagnostic_prints_its_evidence_suffix() {
         output.contains("src/input.ts [evidence policy:source-site]"),
         "{output}"
     );
+    assert!(
+        output.contains("Related locations omitted: unknown"),
+        "{output}"
+    );
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon("#11321: exhausted-root paths bypassed terminal escaping")]
+fn exhausted_root_text_is_escaped() {
+    let report = evaluated_report("export function other() {}\n");
+    let source = &report.runs()[0];
+    let diagnostic = PolicyDiagnostic::try_new(
+        PolicyDiagnosticCode::EvaluationFailure,
+        PolicyDiagnosticSeverity::Warning,
+        PolicyDiagnosticImpact::RunIncomplete,
+        "cut",
+        None,
+        Vec::new(),
+        crate::RelatedLocationOmissions::Known(0),
+    )
+    .unwrap()
+    .with_exhausted_roots(vec![
+        brokk_bifrost_rql::structural::CodeQueryExhaustedRoot {
+            path: "bad\x1b[31m.rs".to_string(),
+            procedure: Some("bad\x1b[2J".to_string()),
+            lane: "solver/reached_states".to_string(),
+            stage: None,
+            budget: None,
+            charge: None,
+            feedback_iteration: None,
+        },
+    ]);
+    let run = PolicyRun::try_new(
+        source.policy_id().clone(),
+        source.policy_hash(),
+        source.analysis_type(),
+        PolicyRunCompletion::inconclusive(vec![PolicyIncompleteReason::PartialDiscovery]).unwrap(),
+        Vec::new(),
+        vec![diagnostic],
+        false,
+        source.work().clone(),
+        &PolicyBudget::default(),
+    )
+    .unwrap();
+    let report = PolicyReportDocument::try_new(
+        report.rules().to_vec(),
+        vec![run],
+        Vec::new(),
+        false,
+        0,
+        None,
+    )
+    .unwrap();
+    let text = render(&report, HumanRenderDetail::Concise);
+    assert!(text.contains("Budget:"), "{text:?}");
+    assert!(!text.contains('\x1b'), "{text:?}");
 }

@@ -487,13 +487,17 @@ fn transfer(
                     state.origins.remove(&result);
                 }
             }
-            SemanticEffect::AsyncSuspend { .. } | SemanticEffect::Synchronization { .. } => {
+            SemanticEffect::MemoryInterference | SemanticEffect::Synchronization { .. } => {
                 state.open(point, event_index)
             }
             SemanticEffect::Gap { gap } => {
                 let gap = semantics.gap(gap).expect("a live gap");
                 if gap.impacts.contains(SemanticGapImpact::HeapWrite)
-                    && !snapshot.is_some_and(|snapshot| snapshot.gap_is_discharged(gap.id))
+                    && !snapshot.is_some_and(|snapshot| {
+                        semantics
+                            .logical_gaps_of(gap)
+                            .all(|logical| snapshot.gap_is_discharged(logical.key()))
+                    })
                 {
                     state.open(point, event_index);
                 }

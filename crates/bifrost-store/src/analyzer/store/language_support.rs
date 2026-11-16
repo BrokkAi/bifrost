@@ -28,8 +28,234 @@ pub trait NamespaceDefinitionClassifier {
 
 pub type NamespaceDefinitionProvider = fn() -> Box<dyn NamespaceDefinitionClassifier>;
 
+/// Exact head identity selected by the native operation. Generic applications
+/// are deliberately excluded until their selected structure is available.
+#[derive(Clone)]
+pub enum SelectedTypeOwner {
+    Source(brokk_bifrost_core::analyzer::model::CodeUnit),
+    Model(crate::analyzer::semantic_model::ModelSymbolRef),
+    Intrinsic(crate::analyzer::resolution::universe::UniverseEntry),
+    ExternalPath(Vec<String>),
+}
+
+pub struct BinaryOperationTypeProof {
+    pub value: Option<crate::analyzer::resolution::ResolutionSlotValue>,
+    pub completion: crate::analyzer::resolution::ResolutionCompletion,
+}
+
+/// Operation-owned language typing. Languages without a provider retain an
+/// unproven result; absence never certifies an empty complete value set.
+pub trait BinaryOperationTypeProvider: Send + Sync {
+    /// Selected references needed by this proof. The enclosing scheduler owns
+    /// their evaluation; a prover must never start another evaluation itself.
+    #[allow(clippy::too_many_arguments)]
+    fn prerequisites(
+        &self,
+        _source: &dyn SelectedTypeHeadSource,
+        _operator: brokk_bifrost_core::analyzer::resolution_facts::ResolutionBinaryOperator,
+        _output: crate::analyzer::resolution::SemanticId,
+        _left: crate::analyzer::resolution::ResolutionSlotValue,
+        _right: crate::analyzer::resolution::ResolutionSlotValue,
+        _right_reference: brokk_bifrost_core::analyzer::resolution_facts::ResolutionBinaryReference,
+        _cancellation: &crate::CancellationToken,
+    ) -> crate::analyzer::store::Result<Vec<crate::analyzer::resolution::SemanticId>> {
+        Ok(Vec::new())
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn prove(
+        &self,
+        source: &mut dyn SelectedTypeHeadSource,
+        operator: brokk_bifrost_core::analyzer::resolution_facts::ResolutionBinaryOperator,
+        output: crate::analyzer::resolution::SemanticId,
+        left: crate::analyzer::resolution::ResolutionSlotValue,
+        right: crate::analyzer::resolution::ResolutionSlotValue,
+        right_reference: brokk_bifrost_core::analyzer::resolution_facts::ResolutionBinaryReference,
+        cancellation: &crate::CancellationToken,
+    ) -> crate::analyzer::store::Result<BinaryOperationTypeProof>;
+}
+
+/// A selected reader must distinguish an unavailable inventory from an
+/// exhausted inventory containing no matching row.
+pub enum SelectedTypeProofRead<T> {
+    Available(T),
+    Unavailable,
+}
+
+/// Safety questions distinguish a negative proof from missing selected authority.
+pub enum SelectedTypeEvaluationRead<T> {
+    Available(T),
+    Unavailable(SelectedTypeEvaluationUnavailable),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum SelectedTypeEvaluationUnavailable {
+    SelectedAuthorityUnavailable,
+    IdentityUnavailable,
+    Cancelled,
+}
+
+pub type SelectedExternalTypeRootRead = SelectedTypeProofRead<Option<([u8; 32], String)>>;
+
+/// Complete operator inventory after the macro-occurrence guard, including
+/// the recursive import-alias closure. Ephemeral proof input, not retained.
+pub struct SelectedOperatorCandidates {
+    pub files: Vec<ProjectFile>,
+    pub spellings: Vec<String>,
+}
+
+pub enum SelectedNominalHead<'a> {
+    Reference {
+        file: &'a ProjectFile,
+        range: std::ops::Range<usize>,
+    },
+    Declaration(crate::analyzer::resolution::SemanticId),
+}
+
+/// A selected declaration head, without any instantiation or type proof.
+pub struct SelectedNominalHeadDeclaration {
+    pub identity: brokk_bifrost_core::analyzer::model::DeclarationId,
+    pub declaration: brokk_bifrost_core::analyzer::model::CodeUnit,
+}
+
 /// Generic operation accessors; language hooks interpret the selected values.
 pub trait SelectedTypeHeadSource {
+    /// Forward selected typed-read certification to the operation's recorded
+    /// derivation bridge. Standalone proof sources have no retained receipts.
+    fn record_selected_derivation(
+        &self,
+        _kind: crate::analyzer::semantic::derivation::DerivationKindId,
+        _question: &crate::analyzer::semantic::derivation::DerivationQuestion,
+    ) {
+    }
+
+    fn nominal_head_identity(
+        &self,
+        _head: SelectedNominalHead<'_>,
+    ) -> crate::analyzer::store::Result<SelectedTypeEvaluationRead<SelectedNominalHeadDeclaration>>
+    {
+        Ok(SelectedTypeEvaluationRead::Unavailable(
+            SelectedTypeEvaluationUnavailable::IdentityUnavailable,
+        ))
+    }
+    fn nominal_is_union(
+        &self,
+        _symbol: &str,
+    ) -> crate::analyzer::store::Result<SelectedTypeEvaluationRead<bool>> {
+        Ok(SelectedTypeEvaluationRead::Unavailable(
+            SelectedTypeEvaluationUnavailable::SelectedAuthorityUnavailable,
+        ))
+    }
+    fn evaluated_call_is_bit_reinterpretation(
+        &self,
+        _file: &ProjectFile,
+        _source: &str,
+        _tree: &tree_sitter::Tree,
+        _site: &brokk_bifrost_core::analyzer::usages::reference_site::ResolvedReferenceSite,
+        cancellation: &crate::CancellationToken,
+    ) -> crate::analyzer::store::Result<SelectedTypeEvaluationRead<bool>> {
+        Ok(SelectedTypeEvaluationRead::Unavailable(
+            if cancellation.is_cancelled() {
+                SelectedTypeEvaluationUnavailable::Cancelled
+            } else {
+                SelectedTypeEvaluationUnavailable::SelectedAuthorityUnavailable
+            },
+        ))
+    }
+    fn glob_may_bind_name(
+        &self,
+        _file: &ProjectFile,
+        _binding: &brokk_bifrost_core::analyzer::usages::model::ImportBinding,
+        _name: &str,
+    ) -> crate::analyzer::store::Result<SelectedTypeProofRead<bool>> {
+        Ok(SelectedTypeProofRead::Unavailable)
+    }
+    fn model_type_owner(
+        &self,
+        _file: &ProjectFile,
+        _range: std::ops::Range<usize>,
+    ) -> crate::analyzer::store::Result<SelectedTypeProofRead<SelectedTypeOwner>> {
+        Ok(SelectedTypeProofRead::Unavailable)
+    }
+    fn prelude_type(
+        &self,
+        _file: &ProjectFile,
+        _name: &str,
+    ) -> crate::analyzer::store::Result<SelectedTypeProofRead<bool>> {
+        Ok(SelectedTypeProofRead::Unavailable)
+    }
+    /// Identity of the exact selected scope, for existing request-local memos.
+    /// An unavailable identity must never share analysis-source memo entries.
+    fn proof_selection_key(&self) -> Option<(u64, u64, [u8; 32])> {
+        None
+    }
+    fn standard_type_root(
+        &self,
+        _file: &ProjectFile,
+        _name: &str,
+    ) -> crate::analyzer::store::Result<SelectedTypeProofRead<bool>> {
+        Ok(SelectedTypeProofRead::Unavailable)
+    }
+    fn external_type_root(
+        &self,
+        _file: &ProjectFile,
+        _name: &str,
+    ) -> crate::analyzer::store::Result<SelectedExternalTypeRootRead> {
+        Ok(SelectedTypeProofRead::Unavailable)
+    }
+    fn type_declaration(
+        &self,
+        _file: &ProjectFile,
+        _range: std::ops::Range<usize>,
+    ) -> crate::analyzer::store::Result<
+        SelectedTypeProofRead<brokk_bifrost_core::analyzer::model::CodeUnit>,
+    > {
+        Ok(SelectedTypeProofRead::Unavailable)
+    }
+    fn operator_candidate_files(
+        &self,
+        _trait_name: &str,
+        _cancellation: &crate::CancellationToken,
+    ) -> crate::analyzer::store::Result<SelectedTypeProofRead<SelectedOperatorCandidates>> {
+        Ok(SelectedTypeProofRead::Unavailable)
+    }
+    /// Locate a reference in the pinned selection, without resolving it.
+    fn type_reference(
+        &self,
+        _file: &ProjectFile,
+        _range: std::ops::Range<usize>,
+        _cancellation: &crate::CancellationToken,
+    ) -> crate::analyzer::store::Result<Option<crate::analyzer::resolution::SemanticId>> {
+        Ok(None)
+    }
+    /// Consume only an answer already produced by the enclosing scheduler.
+    /// Absence, incompleteness, and ambiguity all remain unavailable.
+    fn resolved_type_owner(
+        &self,
+        _reference: crate::analyzer::resolution::SemanticId,
+        _cancellation: &crate::CancellationToken,
+    ) -> crate::analyzer::store::Result<Option<SelectedTypeOwner>> {
+        Ok(None)
+    }
+    fn selected_owner(
+        &self,
+        _identity: crate::analyzer::resolution::SemanticId,
+        _cancellation: &crate::CancellationToken,
+    ) -> crate::analyzer::store::Result<Option<SelectedTypeOwner>> {
+        Ok(None)
+    }
+    fn intern_owner(
+        &self,
+        _owner: &SelectedTypeOwner,
+        _cancellation: &crate::CancellationToken,
+    ) -> crate::analyzer::store::Result<Option<crate::analyzer::resolution::SemanticId>> {
+        Ok(None)
+    }
+    fn slot_file(
+        &self,
+        _slot: crate::analyzer::resolution::SemanticId,
+    ) -> crate::analyzer::store::Result<Option<ProjectFile>> {
+        Ok(None)
+    }
     fn named_reason(
         &self,
         semantic: crate::analyzer::resolution::SemanticId,
@@ -162,6 +388,11 @@ pub struct WrapperPayloadProjection {
 }
 
 pub trait StoreLanguageSupport: Send + Sync {
+    /// Whether a complete producer inventory certifies reference absence.
+    fn certifies_reference_inventory(&self, _producer_epoch: &str) -> bool {
+        false
+    }
+
     /// Select the persisted site that owns an expression result slot.
     fn uses_point_expression_value_slot(&self) -> bool {
         false
@@ -257,6 +488,16 @@ pub trait StoreLanguageSupport: Send + Sync {
     /// The default keeps languages without the required formal facts out.
     fn callable_results_instantiate_nested_generic_projections(&self) -> bool {
         false
+    }
+
+    /// The external-owner family whose selected model callables supply this
+    /// language's call-result types. Only a language that lowers model
+    /// callable signatures reports one; the default keeps every other
+    /// language out of the modeled-result route.
+    fn model_callable_owner_language(
+        &self,
+    ) -> Option<crate::analyzer::resolution::ExternalOwnerLanguage> {
+        None
     }
 
     /// Default languages never classify a head as a wrapper. The shared
@@ -355,6 +596,31 @@ pub trait StoreLanguageSupport: Send + Sync {
     ) -> crate::analyzer::store::Result<Option<crate::analyzer::resolution::ImplicitBaseInputs>>
     {
         Ok(None)
+    }
+
+    /// Admission-only acquisition. Implementations may add contained local
+    /// includes and attach typed external facts to this request's capture.
+    /// Pure selected-evidence hooks below must never call this method.
+    fn acquire_configuration_inputs(
+        &self,
+        _project: &dyn crate::analyzer::Project,
+        _inputs: &mut Vec<super::WorkspaceConfigurationInput>,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn selected_dependency_file_evidence_with_rust_config(
+        &self,
+        root: &std::path::Path,
+        selected: &[(
+            ProjectFile,
+            crate::analyzer::ProjectSourceSnapshot,
+            Option<bool>,
+        )],
+        _acquired: Option<&brokk_bifrost_rust::cargo_config::acquired::RustCargoAcquiredConfigView>,
+        limits: &crate::analyzer::semantic_model::DependencyFileEvidenceLimits,
+    ) -> crate::analyzer::semantic_model::DependencyFileEvidence {
+        self.selected_dependency_file_evidence(root, selected, limits)
     }
 
     /// Prepare bounded static dependency evidence from already selected snapshots.
@@ -571,12 +837,19 @@ pub mod neutral_fixture {
 
     pub struct NeutralFakeStoreLanguageSupport(
         &'static dyn crate::analyzer::resolution::precedence::PrecedenceRules,
+        Option<crate::analyzer::resolution::ExternalOwnerLanguage>,
     );
     impl StoreLanguageSupport for NeutralFakeStoreLanguageSupport {
         fn precedence_rules(
             &self,
         ) -> &'static dyn crate::analyzer::resolution::precedence::PrecedenceRules {
             self.0
+        }
+        /// Store-only Go fixtures keep the capability the linked Go support reports.
+        fn model_callable_owner_language(
+            &self,
+        ) -> Option<crate::analyzer::resolution::ExternalOwnerLanguage> {
+            self.1
         }
         fn call_applicability_adapter(
             &self,
@@ -591,19 +864,21 @@ pub mod neutral_fixture {
     pub(crate) fn precedence_fixture_supports() -> StoreLanguageTable {
         use crate::analyzer::resolution::precedence::*;
         static DEFAULT: NeutralFakeStoreLanguageSupport =
-            NeutralFakeStoreLanguageSupport(&DefaultPrecedenceRules);
+            NeutralFakeStoreLanguageSupport(&DefaultPrecedenceRules, None);
         static JAVA: NeutralFakeStoreLanguageSupport =
-            NeutralFakeStoreLanguageSupport(JAVA_PRECEDENCE_RULES);
+            NeutralFakeStoreLanguageSupport(JAVA_PRECEDENCE_RULES, None);
         static KOTLIN: NeutralFakeStoreLanguageSupport =
-            NeutralFakeStoreLanguageSupport(KOTLIN_PRECEDENCE_RULES);
+            NeutralFakeStoreLanguageSupport(KOTLIN_PRECEDENCE_RULES, None);
         static SCALA: NeutralFakeStoreLanguageSupport =
-            NeutralFakeStoreLanguageSupport(SCALA_PRECEDENCE_RULES);
+            NeutralFakeStoreLanguageSupport(SCALA_PRECEDENCE_RULES, None);
         static RUST: NeutralFakeStoreLanguageSupport =
-            NeutralFakeStoreLanguageSupport(&RustPrecedenceRules);
+            NeutralFakeStoreLanguageSupport(&RustPrecedenceRules, None);
         static CSHARP: NeutralFakeStoreLanguageSupport =
-            NeutralFakeStoreLanguageSupport(CSHARP_PRECEDENCE_RULES);
-        static GO: NeutralFakeStoreLanguageSupport =
-            NeutralFakeStoreLanguageSupport(&GoPrecedenceRules);
+            NeutralFakeStoreLanguageSupport(CSHARP_PRECEDENCE_RULES, None);
+        static GO: NeutralFakeStoreLanguageSupport = NeutralFakeStoreLanguageSupport(
+            &GoPrecedenceRules,
+            Some(crate::analyzer::resolution::ExternalOwnerLanguage::Go),
+        );
         let mut table: StoreLanguageTable = [Some(&DEFAULT); Language::ANALYZABLE.len()];
         for (language, support) in [
             (Language::Java, &JAVA),

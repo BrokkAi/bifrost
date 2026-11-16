@@ -1,25 +1,20 @@
 //! Cargo configuration files, as Rust analysis reads them (#3768).
 //!
-//! Cargo reads `.cargo/config.toml`, or the legacy `.cargo/config`, in the
-//! directory a build starts in and in each of its ancestors, then
-//! `$CARGO_HOME/config.toml`, and merges what it finds: a deeper file's value
-//! replaces a shallower one, except that two arrays join with the deeper
-//! file's items last, and tables merge key by key. Analysis starts where
-//! `cargo check` for a Cargo workspace runs, the workspace root, and stops at
-//! the project root. Levels above the project root and `$CARGO_HOME` are
-//! outside the workspace: nothing watches them, and they are not read.
-//! Environment variables (`RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`,
-//! `CARGO_BUILD_TARGET`) belong to one build's process rather than to the
-//! workspace, and they are not read either.
+//! Cargo merges ancestor configuration with deeper values taking precedence,
+//! arrays concatenating, and the legacy `config` winning over `config.toml`.
+//! This module interprets caller-supplied parsed inputs; it never opens files.
+//! The caller must establish acquisition completeness before this reader can
+//! certify dependency source identity or prebuilt stdlib mode. A project-only
+//! snapshot is partial if applicable ancestors, Cargo home or includes were not
+//! acquired. The user's build-process overrides remain outside this files-only
+//! contract; the analyzer's environment is not that build's environment.
 //!
-//! Three settings change what rustc compiles, and only they are read:
-//! - `[patch]`, which Cargo routes merge with the workspace manifest's patch
-//!   tables, the configuration winning for a name both patch;
-//! - `build.target`, which selects the target whose cfg set applies;
-//! - `--cfg` in rustflags: every matching `target.<triple>.rustflags` and
-//!   `target.<cfg>.rustflags` joined, or else `build.rustflags`.
+//! Configured targets, cfg flags, source identity and stdlib build mode share
+//! this reader and its closed key classification. Unknown settings fail closed.
 //!
 //! All state belongs to the request that built it.
+
+pub mod acquired;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -43,28 +38,197 @@ pub fn is_cargo_configuration_path(path: &Path) -> bool {
             .is_some_and(|name| name == "config.toml" || name == "config")
 }
 
+/// Whether the acquired Cargo settings establish use of prebuilt standard libraries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RustStdlibBuildMode {
+    Prebuilt,
+    BuildStd,
+    Unknown,
+}
+
+/// Closed classification of configuration's effect on dependency source identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RustCargoConfigSourceEffect {
+    Preserves,
+    Changes,
+    Unknown,
+}
+
+/// One include declared by a parsed Cargo config. Acquisition resolves its
+/// path under the caller's containment policy before supplying its document.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RustCargoConfigInclude {
+    pub path: PathBuf,
+    pub optional: bool,
+}
+
+impl std::fmt::Debug for RustCargoConfigInclude {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RustCargoConfigInclude")
+            .field("optional", &self.optional)
+            .finish_non_exhaustive()
+    }
+}
+
 /// One parsed Cargo configuration file.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct RustCargoConfigDocument {
     value: toml::Table,
+    included: Vec<(PathBuf, RustCargoConfigDocument)>,
+    includes_resolved: bool,
+    workspace_paths: bool,
+}
+
+// Configuration can contain tokens and proxy credentials. Even diagnostic
+// Debug formatting must not expose parsed values or content.
+impl std::fmt::Debug for RustCargoConfigDocument {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RustCargoConfigDocument")
+            .finish_non_exhaustive()
+    }
 }
 
 impl RustCargoConfigDocument {
     pub fn from_source_bytes(source: &[u8]) -> Result<Self, String> {
         let source = std::str::from_utf8(source)
             .map_err(|error| format!("Cargo configuration is not UTF-8: {error}"))?;
-        let value = toml::from_str(source)
-            .map_err(|error| format!("invalid Cargo configuration: {error}"))?;
-        Ok(Self { value })
+        let value = toml::from_str(source).map_err(|_| "invalid Cargo configuration".to_owned())?;
+        let mut document = Self {
+            value,
+            included: Vec::new(),
+            includes_resolved: false,
+            workspace_paths: true,
+        };
+        document.includes_resolved = document
+            .include_specs()
+            .is_ok_and(|includes| includes.is_empty());
+        Ok(document)
+    }
+
+    /// Decode include syntax once, shared by acquisition and classification.
+    /// Errors contain no configured path, value or source text.
+    pub fn include_specs(&self) -> Result<Vec<RustCargoConfigInclude>, String> {
+        let Some(value) = self.value.get("include") else {
+            return Ok(Vec::new());
+        };
+        let error = || "unclassifiable Cargo config include".to_owned();
+        let item = |value: &toml::Value| -> Result<RustCargoConfigInclude, String> {
+            if let Some(path) = value.as_str() {
+                return Ok(RustCargoConfigInclude {
+                    path: path.into(),
+                    optional: false,
+                });
+            }
+            let table = value.as_table().ok_or_else(error)?;
+            if table
+                .keys()
+                .any(|key| !matches!(key.as_str(), "path" | "optional"))
+            {
+                return Err(error());
+            }
+            let path = table
+                .get("path")
+                .and_then(toml::Value::as_str)
+                .ok_or_else(error)?;
+            let optional = match table.get("optional") {
+                None => false,
+                Some(value) => value.as_bool().ok_or_else(error)?,
+            };
+            Ok(RustCargoConfigInclude {
+                path: path.into(),
+                optional,
+            })
+        };
+        if value.is_str() {
+            return Ok(vec![item(value)?]);
+        }
+        value
+            .as_array()
+            .ok_or_else(error)?
+            .iter()
+            .map(item)
+            .collect()
+    }
+
+    /// Supply acquired includes in declaration order. Each base is the
+    /// workspace-relative directory for that document's relative path values.
+    /// Missing documents are accepted only for explicitly optional includes.
+    /// Included layers precede the containing document, preserving Cargo's
+    /// array concatenation/table precedence and each patch path's provenance.
+    pub fn with_included_documents(
+        mut self,
+        documents: Vec<Option<(PathBuf, RustCargoConfigDocument)>>,
+    ) -> Result<Self, String> {
+        let specs = self.include_specs()?;
+        if specs.len() != documents.len() {
+            return Err("incomplete Cargo config includes".into());
+        }
+        let mut included = Vec::new();
+        for (spec, document) in specs.into_iter().zip(documents) {
+            match document {
+                Some((base, mut document)) if document.includes_resolved => {
+                    // Keep the layers flat, so nested includes cannot grow the
+                    // Rust call stack during interpretation, cloning or drop.
+                    included.append(&mut document.included);
+                    included.push((base, document));
+                }
+                None if spec.optional => {}
+                _ => return Err("incomplete Cargo config includes".into()),
+            }
+        }
+        self.included = included;
+        self.includes_resolved = true;
+        Ok(self)
+    }
+
+    fn external_paths(&mut self) {
+        self.workspace_paths = false;
+        for (_, document) in &mut self.included {
+            document.workspace_paths = false;
+        }
     }
 
     /// Digest of the settings this module reads: `[patch]`, `build.target`,
-    /// `build.rustflags` and each `target.<key>.rustflags`. An edit to
-    /// anything else (aliases, `[env]`, `[net]`, a linker) keeps it.
+    /// `paths`, `build.rustflags`, each `target.<key>.rustflags`, and raw
+    /// `unstable` input when present. An absent unstable key keeps the existing
+    /// encoding exactly; ordinary aliases/net/linker edits retain this digest.
     pub fn topology_digest(&self) -> [u8; 32] {
         let mut read = toml::Table::new();
+        if !self.included.is_empty() {
+            let includes = self
+                .included
+                .iter()
+                .map(|(base, document)| {
+                    toml::Value::Table(toml::Table::from_iter([
+                        (
+                            "base".to_owned(),
+                            toml::Value::String(base.to_string_lossy().into_owned()),
+                        ),
+                        (
+                            "digest".to_owned(),
+                            toml::Value::String(
+                                brokk_bifrost_core::analyzer::canonical_hash::lower_hex_string(
+                                    &document.topology_digest(),
+                                ),
+                            ),
+                        ),
+                    ]))
+                })
+                .collect();
+            read.insert("acquired-includes".to_owned(), toml::Value::Array(includes));
+        }
+        // Conditional insertion preserves all identities with no unstable input.
+        // Keep malformed/unknown unstable input too: it withdraws certification.
+        if let Some(unstable) = self.value.get("unstable") {
+            read.insert("unstable".to_owned(), unstable.clone());
+        }
         if let Some(patch) = self.value.get("patch") {
             read.insert("patch".to_string(), patch.clone());
+        }
+        if let Some(paths) = self.value.get("paths") {
+            read.insert("paths".to_string(), paths.clone());
         }
         let build = ["target", "rustflags"]
             .into_iter()
@@ -90,6 +254,163 @@ impl RustCargoConfigDocument {
         )
     }
 
+    /// Interpret source-affecting settings once for all discovery consumers.
+    /// Unknown keys and malformed known settings never certify source identity.
+    pub fn source_effect(&self) -> RustCargoConfigSourceEffect {
+        use RustCargoConfigSourceEffect::*;
+        let mut effect = self.own_source_effect();
+        for (_, document) in &self.included {
+            match document.own_source_effect() {
+                Unknown => return Unknown,
+                Changes if effect != Unknown => effect = Changes,
+                _ => {}
+            }
+        }
+        effect
+    }
+
+    fn own_source_effect(&self) -> RustCargoConfigSourceEffect {
+        use RustCargoConfigSourceEffect::*;
+        if !self.includes_resolved {
+            return Unknown;
+        }
+        let mut result = Preserves;
+        for (key, value) in &self.value {
+            let known = match key.as_str() {
+                // `[registry].global-credential-providers` only chooses how
+                // credentials are fetched. Every other `[registry]` key can
+                // name the default registry or its token, so it keeps Changes.
+                "registry"
+                    if value.as_table().is_some_and(|table| {
+                        !table.is_empty()
+                            && table.iter().all(|(key, value)| {
+                                key == "global-credential-providers" && string_array(value)
+                            })
+                    }) =>
+                {
+                    true
+                }
+                "source" | "patch" | "registries" | "registry" => {
+                    if value.as_table().is_none() {
+                        return Unknown;
+                    }
+                    result = Changes;
+                    true
+                }
+                "paths" => {
+                    if !string_array(value) {
+                        return Unknown;
+                    }
+                    result = Changes;
+                    true
+                }
+                "build" => known_table(value, |key, value| match key {
+                    "target" => string_or_array(value),
+                    "rustflags" => classified_rustflags(value),
+                    "target-dir" => value.is_str(),
+                    _ => false,
+                }),
+                "target" => known_table(value, |_, target| {
+                    known_table(target, |key, value| match key {
+                        "linker" => value.is_str(),
+                        "runner" => string_or_array(value),
+                        "rustflags" => classified_rustflags(value),
+                        _ => false,
+                    })
+                }),
+                "alias" => known_table(value, |_, value| string_or_array(value)),
+                "term" => known_table(value, |key, value| match key {
+                    "quiet" | "verbose" => value.is_bool(),
+                    "color" => value
+                        .as_str()
+                        .is_some_and(|v| matches!(v, "auto" | "always" | "never")),
+                    _ => false,
+                }),
+                "net" => known_table(value, |key, value| match key {
+                    "offline" | "git-fetch-with-cli" => value.is_bool(),
+                    "retry" => value.is_integer(),
+                    _ => false,
+                }),
+                "http" => known_table(value, |key, value| match key {
+                    "proxy" | "user-agent" | "cainfo" | "proxy-cainfo" => value.is_str(),
+                    "timeout" | "low-speed-limit" => value.is_integer(),
+                    "ssl-verify" | "multiplexing" | "debug" | "check-revoke" => value.is_bool(),
+                    _ => false,
+                }),
+                // `[env]` sets process variables for build scripts and
+                // `env!`; `[profile]` sets compiler options; the rest below
+                // configure the Cargo front end. None of them selects where
+                // a package comes from. `[env]` and `[profile]` do change
+                // values and `cfg(debug_assertions)`, which source identity
+                // does not read.
+                "env" => known_table(value, |_, entry| {
+                    entry.is_str()
+                        || known_table(entry, |key, value| match key {
+                            "value" => value.is_str(),
+                            "force" | "relative" => value.is_bool(),
+                            _ => false,
+                        })
+                }),
+                "profile" | "gc" => known_table(value, |_, value| value.is_table()),
+                "doc" => known_table(value, |key, value| {
+                    key == "browser" && string_or_array(value)
+                }),
+                "credential-alias" => known_table(value, |_, value| string_or_array(value)),
+                "cargo-new" => known_table(value, |key, value| key == "vcs" && value.is_str()),
+                "future-incompat-report" => {
+                    known_table(value, |key, value| key == "frequency" && value.is_str())
+                }
+                "install" => known_table(value, |key, value| key == "root" && value.is_str()),
+                "cache" => known_table(value, |key, value| {
+                    key == "auto-clean-frequency" && value.is_str()
+                }),
+                // `[resolver]` and `net.offline` change version selection only
+                // when no Cargo.lock exists. Without a lock the evidence is
+                // already unresolved ("missing_lockfile",
+                // `file_dependency_evidence.rs`), exact versions come only
+                // from a lock, and the `log` identity proof in
+                // `route_kinds.rs` never selects a version. Neither key can
+                // change a certified answer. An unknown key stays Unknown.
+                "resolver" => known_table(value, |key, value| {
+                    key == "incompatible-rust-versions" && value.is_str()
+                }),
+                "include" => self.include_specs().is_ok(),
+                "unstable" => self.stdlib_build_mode_setting() != RustStdlibBuildMode::Unknown,
+                _ => false,
+            };
+            if !known {
+                return Unknown;
+            }
+        }
+        result
+    }
+
+    fn stdlib_build_mode_setting(&self) -> RustStdlibBuildMode {
+        let Some(unstable) = self.value.get("unstable") else {
+            return RustStdlibBuildMode::Prebuilt;
+        };
+        let Some(table) = unstable.as_table() else {
+            return RustStdlibBuildMode::Unknown;
+        };
+        if table.keys().any(|key| key != "build-std") {
+            return RustStdlibBuildMode::Unknown;
+        }
+        match table.get("build-std") {
+            None => RustStdlibBuildMode::Prebuilt,
+            Some(value)
+                if value.as_array().is_some_and(|items| {
+                    !items.is_empty()
+                        && items
+                            .iter()
+                            .all(|item| item.as_str().is_some_and(|s| !s.is_empty()))
+                }) =>
+            {
+                RustStdlibBuildMode::BuildStd
+            }
+            Some(_) => RustStdlibBuildMode::Unknown,
+        }
+    }
+
     fn build(&self, key: &str) -> Option<&toml::Value> {
         self.value.get("build")?.get(key)
     }
@@ -111,6 +432,129 @@ impl RustCargoConfigDocument {
     }
 }
 
+fn string_array(value: &toml::Value) -> bool {
+    value
+        .as_array()
+        .is_some_and(|items| items.iter().all(toml::Value::is_str))
+}
+
+fn string_or_array(value: &toml::Value) -> bool {
+    value.is_str() || string_array(value)
+}
+
+// `--check-cfg` declares allowed names/values and does not enable them.
+// `--cfg` enables atoms through the existing shared evaluator. Malformed cfg
+// flags or a replaced sysroot cannot certify the selected toolchain artifact.
+fn classified_rustflags(value: &toml::Value) -> bool {
+    if !string_or_array(value) {
+        return false;
+    }
+    let flags = rustflags(Some(value.clone()));
+    let mut arguments = flags.iter();
+    while let Some(argument) = arguments.next() {
+        if argument == "--sysroot" || argument.starts_with("--sysroot=") {
+            return false;
+        }
+        if argument == "--cfg" {
+            if arguments
+                .next()
+                .and_then(|spec| cfg_flag_atom(spec))
+                .is_none()
+            {
+                return false;
+            }
+        } else if let Some(spec) = argument.strip_prefix("--cfg=") {
+            if cfg_flag_atom(spec).is_none() {
+                return false;
+            }
+        } else if argument == "--check-cfg" {
+            if arguments
+                .next()
+                .is_none_or(|value| value.is_empty() || value.starts_with('-'))
+            {
+                return false;
+            }
+        } else if argument == "--check-cfg=" {
+            return false;
+        }
+    }
+    true
+}
+
+/// Where the value of a build's cfg atom comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CfgAtomSource {
+    /// Cargo and rustc supply it without reading Cargo configuration.
+    Defaults,
+    /// It comes from the configuration files: `build.target` and the
+    /// `--cfg` flags of the rustflags.
+    Configuration,
+}
+
+/// The configuration files a build reads, and the targets it compiles for.
+struct ReadConfiguration<'a> {
+    levels: &'a [(&'a Path, &'a RustCargoConfigDocument)],
+    targets: &'a [String],
+}
+
+/// The one derivation of a build's cfg atoms, each tagged with its source.
+///
+/// `configuration` holds the configuration levels and the build targets when
+/// the files were read, and is `None` when the acquisition is unknown. An
+/// unknown acquisition keeps exactly the atoms whose source is not the
+/// configuration. The other atoms stay absent, which the evaluator reads as
+/// unknown (target values) or as unproven (a `--cfg` flag), never as false.
+///
+/// `test` and `debug_assertions` are `Defaults`: this reader never looks at
+/// `[profile.*]` (no `debug-assertions` key is parsed from any configuration
+/// file or manifest), so a profile override is a fidelity gap in both modes.
+fn tagged_cfg_atoms(configuration: Option<ReadConfiguration>) -> Vec<(CfgAtomSource, String)> {
+    let mut atoms = vec![
+        (CfgAtomSource::Defaults, "test".to_string()),
+        (CfgAtomSource::Defaults, "debug_assertions".to_string()),
+    ];
+    let Some(ReadConfiguration { levels, targets }) = configuration else {
+        return atoms;
+    };
+    let configured = if let [target] = targets {
+        let target_atoms = target_cfg_atoms(target);
+        let mut configured = rustflag_cfg_atoms(levels, target, &target_atoms);
+        configured.extend(target_atoms);
+        configured
+    } else {
+        targets
+            .iter()
+            .map(|target| rustflag_cfg_atoms(levels, target, &target_cfg_atoms(target)))
+            .reduce(|left, right| left.intersection(&right).cloned().collect())
+            .expect("several targets")
+    };
+    atoms.extend(
+        configured
+            .into_iter()
+            .map(|atom| (CfgAtomSource::Configuration, atom)),
+    );
+    atoms
+}
+
+/// The cfg atoms of a build whose Cargo configuration is unknown: the
+/// atoms that never depend on configuration, plus the marker that keeps
+/// `feature` atoms unproven.
+fn uncertain_cfg_atoms() -> BTreeSet<String> {
+    let mut atoms: BTreeSet<_> = tagged_cfg_atoms(None)
+        .into_iter()
+        .filter(|(source, _)| *source == CfgAtomSource::Defaults)
+        .map(|(_, atom)| atom)
+        .collect();
+    atoms.insert(crate::cfg::INCOMPLETE_FEATURES_ATOM.to_owned());
+    atoms
+}
+
+fn known_table(value: &toml::Value, known: impl Fn(&str, &toml::Value) -> bool) -> bool {
+    value
+        .as_table()
+        .is_some_and(|table| table.iter().all(|(key, value)| known(key, value)))
+}
+
 /// One `[patch.<source>.<name>]` entry of the configuration, merged across
 /// files, with the directory its relative `path` resolves against: the one
 /// that holds the `.cargo` directory that defined `path`.
@@ -122,12 +566,160 @@ pub(crate) struct RustCargoConfigPatch {
 
 /// The Cargo configuration files of one workspace, keyed by the directory
 /// that holds their `.cargo` directory, relative to the project root.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct RustCargoConfiguration {
     files: HashMap<PathBuf, RustCargoConfigDocument>,
+    base_layers: Vec<(PathBuf, RustCargoConfigDocument)>,
+    acquisition_complete: bool,
+    unclassified_inputs: bool,
+    recorded: Option<acquired::RustCargoAcquiredConfigView>,
+    recorded_layers: std::collections::BTreeMap<PathBuf, Vec<(PathBuf, RustCargoConfigDocument)>>,
+}
+
+impl std::fmt::Debug for RustCargoConfiguration {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RustCargoConfiguration")
+            .field("local_layers", &self.files.len())
+            .field("base_layers", &self.base_layers.len())
+            .field("acquisition_complete", &self.acquisition_complete)
+            .field("unclassified_inputs", &self.unclassified_inputs)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RustCargoConfiguration {
+    /// Add acquired Cargo-home/above-root layers, shallowest first. Their
+    /// labels are logical provenance, not filesystem paths to open. External
+    /// source overrides are classified but never routed as workspace paths.
+    pub fn with_base_layers(
+        mut self,
+        layers: impl IntoIterator<Item = (PathBuf, RustCargoConfigDocument)>,
+    ) -> Self {
+        for (label, mut document) in layers {
+            document.external_paths();
+            self.base_layers.push((label, document));
+        }
+        self
+    }
+
+    /// Complete means both the acquisition boundary and every applicable
+    /// included document are established and interpretable.
+    pub fn acquisition_is_complete(&self, directory: &Path) -> bool {
+        if let Some(view) = &self.recorded {
+            return view.complete && view.owner(directory).is_some_and(|owner| owner.complete);
+        }
+        self.acquisition_complete
+            && !self.unclassified_inputs
+            && self.levels(directory).iter().all(|(_, document)| {
+                document.source_effect() != RustCargoConfigSourceEffect::Unknown
+            })
+    }
+
+    /// Supply the acquisition result, not an assumption about absent files.
+    /// True requires every applicable Cargo layer/include to have been checked.
+    pub fn with_acquisition_complete(mut self, complete: bool) -> Self {
+        self.acquisition_complete = complete;
+        if let Some(view) = &mut self.recorded {
+            view.complete = complete;
+        }
+        self
+    }
+
+    /// Mark an input that could not be parsed/classified; no extracted absence
+    /// from the remaining documents can certify its effect.
+    pub fn with_unclassified_inputs(mut self) -> Self {
+        self.unclassified_inputs = true;
+        self
+    }
+
+    /// The build mode from the same parsed/merged settings as build.target.
+    /// A partial view never establishes prebuilt stdlib certification.
+    pub fn stdlib_build_mode(&self, directory: &Path) -> RustStdlibBuildMode {
+        if let Some(view) = &self.recorded {
+            return view
+                .owner(directory)
+                .filter(|_| self.acquisition_is_complete(directory))
+                .map_or(RustStdlibBuildMode::Unknown, |owner| owner.build_mode);
+        }
+        if !self.acquisition_is_complete(directory) {
+            return RustStdlibBuildMode::Unknown;
+        }
+        let mut mode = RustStdlibBuildMode::Prebuilt;
+        for (_, file) in self.levels(directory) {
+            if file.source_effect() == RustCargoConfigSourceEffect::Unknown {
+                return RustStdlibBuildMode::Unknown;
+            }
+            match file.stdlib_build_mode_setting() {
+                RustStdlibBuildMode::Unknown => return RustStdlibBuildMode::Unknown,
+                RustStdlibBuildMode::BuildStd => mode = RustStdlibBuildMode::BuildStd,
+                RustStdlibBuildMode::Prebuilt => {}
+            }
+        }
+        mode
+    }
+
+    /// Whether the completely acquired view preserves dependency source identity.
+    /// Selected snapshots alone cannot rule out an include or an external layer.
+    pub fn source_effect(&self, directory: &Path) -> RustCargoConfigSourceEffect {
+        if let Some(view) = &self.recorded {
+            return view
+                .owner(directory)
+                .filter(|_| self.acquisition_is_complete(directory))
+                .map_or(RustCargoConfigSourceEffect::Unknown, |owner| {
+                    owner.source_effect
+                });
+        }
+        if !self.acquisition_is_complete(directory) {
+            return RustCargoConfigSourceEffect::Unknown;
+        }
+        let mut effect = RustCargoConfigSourceEffect::Preserves;
+        for (_, file) in self.levels(directory) {
+            match file.source_effect() {
+                RustCargoConfigSourceEffect::Unknown => {
+                    return RustCargoConfigSourceEffect::Unknown;
+                }
+                RustCargoConfigSourceEffect::Changes => {
+                    effect = RustCargoConfigSourceEffect::Changes
+                }
+                RustCargoConfigSourceEffect::Preserves => {}
+            }
+        }
+        effect
+    }
+
+    /// Project-relative candidate paths, bounded exactly like configuration levels.
+    /// The caller records absence too; each level's legacy file takes precedence.
+    pub fn candidate_paths(directory: &Path) -> Vec<(PathBuf, PathBuf)> {
+        directory
+            .ancestors()
+            .map(|level| {
+                (
+                    level.join(".cargo/config"),
+                    level.join(".cargo/config.toml"),
+                )
+            })
+            .collect()
+    }
+
+    /// An explicit extern flag leaves primitive certification open. Include all layers
+    /// and target tables, including undecided target predicates, conservatively.
+    pub fn has_extern_rustflags(&self, directory: &Path) -> bool {
+        if let Some(view) = &self.recorded {
+            return !self.acquisition_is_complete(directory)
+                || view
+                    .owner(directory)
+                    .is_none_or(|owner| owner.has_extern_flags);
+        }
+        self.levels(directory).iter().any(|(_, file)| {
+            file.build("rustflags")
+                .into_iter()
+                .chain(file.target_rustflags().map(|(_, flags)| flags))
+                .flat_map(|flags| rustflags(Some(flags.clone())))
+                .any(|flag| flag == "--extern" || flag.starts_with("--extern="))
+        })
+    }
+
     /// Collect parsed configuration files by their project-relative paths.
     /// Where one `.cargo` directory holds both files, Cargo reads the legacy
     /// `config` and ignores `config.toml`.
@@ -152,6 +744,11 @@ impl RustCargoConfiguration {
             }
         }
         Self {
+            recorded: None,
+            recorded_layers: Default::default(),
+            acquisition_complete: false,
+            unclassified_inputs: false,
+            base_layers: Vec::new(),
             files: by_directory
                 .into_iter()
                 .map(|(directory, (_, document))| (directory, document))
@@ -162,18 +759,62 @@ impl RustCargoConfiguration {
     /// The files Cargo reads for a build started in `directory`, shallowest
     /// first, so that merging in order lets a deeper file win.
     fn levels<'a>(&'a self, directory: &'a Path) -> Vec<(&'a Path, &'a RustCargoConfigDocument)> {
-        let mut levels = directory
+        fn append<'a>(
+            levels: &mut Vec<(&'a Path, &'a RustCargoConfigDocument)>,
+            base: &'a Path,
+            document: &'a RustCargoConfigDocument,
+        ) {
+            for (base, included) in &document.included {
+                levels.push((base, included));
+            }
+            levels.push((base, document));
+        }
+        if self.recorded.is_some() {
+            return self
+                .recorded_layers
+                .get(directory)
+                .into_iter()
+                .flatten()
+                .map(|(base, document)| (base.as_path(), document))
+                .collect();
+        }
+        let mut levels = Vec::new();
+        for (label, document) in &self.base_layers {
+            append(&mut levels, label, document);
+        }
+        let local = directory
             .ancestors()
             .filter_map(|level| self.files.get(level).map(|document| (level, document)))
             .collect::<Vec<_>>();
-        levels.reverse();
+        for (base, document) in local.into_iter().rev() {
+            append(&mut levels, base, document);
+        }
         levels
+    }
+
+    /// Cargo owners whose applicable layers were acquired together. A missing
+    /// recorded view exposes no additional contexts and cannot certify absence.
+    pub fn acquired_owner_directories(&self) -> Vec<&Path> {
+        self.recorded
+            .as_ref()
+            .into_iter()
+            .flat_map(|view| view.owners.keys().map(PathBuf::as_path))
+            .collect()
     }
 
     /// Whether every selected configuration layer preserves a registry package's
     /// identity. A paths override has no package identity until its manifest is
     /// selected, so its presence cannot certify an external package.
     pub fn preserves_registry_package(&self, directory: &Path, package: &str) -> bool {
+        if !self.acquisition_is_complete(directory) {
+            return false;
+        }
+        if self.recorded.as_ref().is_some_and(|view| {
+            view.owner(directory)
+                .is_none_or(|owner| !owner.complete || owner.external_source_unresolved)
+        }) {
+            return false;
+        }
         self.levels(directory).iter().all(|(_, document)| {
             let patched = document
                 .patch()
@@ -195,6 +836,25 @@ impl RustCargoConfiguration {
         })
     }
 
+    /// Refuse an extern-prelude absence proof if any workspace configuration
+    /// layer can supply an extern. Checking all target tables is conservative
+    /// when target selection is undecided. topology_digest covers these flags.
+    pub fn has_extern_flags(&self, directory: &Path) -> bool {
+        if let Some(view) = &self.recorded {
+            return !self.acquisition_is_complete(directory)
+                || view
+                    .owner(directory)
+                    .is_none_or(|owner| owner.has_extern_flags);
+        }
+        self.levels(directory).iter().any(|(_, document)| {
+            document
+                .build("rustflags")
+                .into_iter()
+                .chain(document.target_rustflags().map(|(_, flags)| flags))
+                .any(|flags| rustflags_have_extern(&rustflags(Some(flags.clone()))))
+        })
+    }
+
     /// The cfg set Cargo compiles a build started in `directory` with: the
     /// build target's cfg values, `test` and `debug_assertions` (the selected
     /// default for every workspace member), and the `--cfg` flags of the
@@ -205,22 +865,21 @@ impl RustCargoConfiguration {
     /// of a build for several targets, whose crate rows hold one cfg set: only
     /// the flags every target's build sets are in it.
     pub fn cfg_atoms(&self, directory: &Path) -> BTreeSet<String> {
+        if let Some(view) = &self.recorded {
+            return view
+                .owner(directory)
+                .filter(|_| self.acquisition_is_complete(directory))
+                .map_or_else(uncertain_cfg_atoms, |owner| owner.cfg_atoms.clone());
+        }
         let levels = self.levels(directory);
         let targets = self.build_targets(directory);
-        let mut atoms = BTreeSet::from(["test".to_string(), "debug_assertions".to_string()]);
-        if let [target] = targets.as_slice() {
-            let target_atoms = target_cfg_atoms(target);
-            atoms.extend(rustflag_cfg_atoms(&levels, target, &target_atoms));
-            atoms.extend(target_atoms);
-        } else {
-            let flags = targets
-                .iter()
-                .map(|target| rustflag_cfg_atoms(&levels, target, &target_cfg_atoms(target)))
-                .reduce(|left, right| left.intersection(&right).cloned().collect())
-                .expect("several targets");
-            atoms.extend(flags);
-        }
-        atoms
+        tagged_cfg_atoms(Some(ReadConfiguration {
+            levels: &levels,
+            targets: &targets,
+        }))
+        .into_iter()
+        .map(|(_, atom)| atom)
+        .collect()
     }
 
     fn build_targets(&self, directory: &Path) -> Vec<String> {
@@ -239,6 +898,22 @@ impl RustCargoConfiguration {
         &'a self,
         directory: &'a Path,
     ) -> (Vec<String>, Vec<&'a Path>) {
+        if let Some(view) = &self.recorded {
+            return view.owner(directory).map_or_else(
+                || (Vec::new(), Vec::new()),
+                |owner| {
+                    let targets = if owner.target_unsupported {
+                        vec!["bifrost-unsupported-target".to_owned()]
+                    } else {
+                        owner.targets.clone()
+                    };
+                    (
+                        targets,
+                        owner.target_defining.iter().map(PathBuf::as_path).collect(),
+                    )
+                },
+            );
+        }
         let levels = self.levels(directory);
         let defining = levels
             .iter()
@@ -260,6 +935,9 @@ impl RustCargoConfiguration {
     /// Target dependency tables follow the configured build targets. If the
     /// targets disagree, one placement cannot prove whether the edge is active.
     pub(crate) fn dependency_predicate(&self, directory: &Path, key: &str) -> Option<bool> {
+        if self.recorded.is_some() && !self.acquisition_is_complete(directory) {
+            return None;
+        }
         let mut outcomes = self
             .build_targets(directory)
             .into_iter()
@@ -270,14 +948,35 @@ impl RustCargoConfiguration {
             .then_some(first)
     }
 
+    /// Cargo dependency-table selection for host-only units. Like Cargo, this
+    /// ignores test/feature cfgs and evaluates target predicates only. The host
+    /// triple comes from the recorded view, the same value its digest hashes
+    /// (#12604); only a configuration without a recorded view uses the
+    /// compile-time triple directly.
+    pub(crate) fn host_dependency_predicate(&self, key: &str) -> Option<bool> {
+        let host = self
+            .recorded
+            .as_ref()
+            .map_or(HOST_TRIPLE, |view| view.host_triple.as_str());
+        target_dependency_predicate(host, key)
+    }
+
     /// Host-only units use the host cfg set even for a configured cross build.
     pub(crate) fn host_cfg_atoms(&self, directory: &Path) -> BTreeSet<String> {
+        if let Some(view) = &self.recorded {
+            return view
+                .owner(directory)
+                .filter(|_| self.acquisition_is_complete(directory))
+                .map_or_else(uncertain_cfg_atoms, |owner| owner.host_cfg_atoms.clone());
+        }
         let levels = self.levels(directory);
-        let target_atoms = target_cfg_atoms(HOST_TRIPLE);
-        let mut atoms = BTreeSet::from(["test".to_string(), "debug_assertions".to_string()]);
-        atoms.extend(rustflag_cfg_atoms(&levels, HOST_TRIPLE, &target_atoms));
-        atoms.extend(target_atoms);
-        atoms
+        tagged_cfg_atoms(Some(ReadConfiguration {
+            levels: &levels,
+            targets: &[HOST_TRIPLE.to_string()],
+        }))
+        .into_iter()
+        .map(|(_, atom)| atom)
+        .collect()
     }
 
     /// The `[patch.<source>]` entries of the configuration Cargo reads for a
@@ -286,6 +985,11 @@ impl RustCargoConfiguration {
     pub(crate) fn patches(&self, directory: &Path, source: &str) -> Vec<RustCargoConfigPatch> {
         let mut patches = Vec::<RustCargoConfigPatch>::new();
         for (base, file) in self.levels(directory) {
+            // External source reconstruction is deliberately unresolved; a
+            // logical provenance label must never become a workspace path.
+            if !file.workspace_paths {
+                continue;
+            }
             for (name, entry) in file
                 .patch()
                 .and_then(|patch| patch.get(source))
@@ -467,6 +1171,14 @@ fn rustflag_cfg_atoms(
     atoms
 }
 
+/// Inspect parsed flag values, never Rust source syntax. Both rustc spellings
+/// introduce an extern, even when its value is missing or malformed.
+fn rustflags_have_extern(flags: &[String]) -> bool {
+    flags
+        .iter()
+        .any(|flag| flag == "--extern" || flag.starts_with("--extern="))
+}
+
 /// Rustflags as Cargo reads them: an array of arguments, or one string of
 /// arguments separated by whitespace.
 fn rustflags(value: Option<toml::Value>) -> Vec<String> {
@@ -479,12 +1191,6 @@ fn rustflags(value: Option<toml::Value>) -> Vec<String> {
         Some(toml::Value::String(flags)) => flags.split_whitespace().map(str::to_string).collect(),
         _ => Vec::new(),
     }
-}
-
-/// Cargo dependency-table selection for host-only units. Like Cargo,
-/// this ignores test/feature cfgs and evaluates target predicates only.
-pub(crate) fn host_dependency_predicate(key: &str) -> Option<bool> {
-    target_dependency_predicate(HOST_TRIPLE, key)
 }
 
 fn target_dependency_predicate(target: &str, key: &str) -> Option<bool> {
@@ -582,6 +1288,313 @@ mod tests {
             .topology_digest()
     }
 
+    #[test]
+    fn config_debug_and_parse_errors_do_not_echo_credentials() {
+        let source = "[registry]\ntoken='private-token-value'";
+        let doc = RustCargoConfigDocument::from_source_bytes(source.as_bytes()).unwrap();
+        assert!(!format!("{doc:?}").contains("private-token-value"));
+        let error =
+            RustCargoConfigDocument::from_source_bytes(b"token='private-token-value' invalid")
+                .unwrap_err();
+        assert!(!error.contains("private-token-value"));
+        let includes = document("include='/private-home-value/settings'")
+            .include_specs()
+            .unwrap();
+        assert!(!format!("{includes:?}").contains("private-home-value"));
+        let configuration =
+            configuration(&[]).with_base_layers([(PathBuf::from("private-home-value"), doc)]);
+        assert!(!format!("{configuration:?}").contains("private-home-value"));
+    }
+
+    #[test]
+    fn source_identity_classification_is_closed() {
+        for source in [
+            "",
+            "[build]\ntarget='x86_64-unknown-linux-gnu'",
+            "[alias]\ncheck-all='check --all'",
+            "[target.x86_64-unknown-linux-gnu]\nlinker='cc'",
+            "[unstable]\nbuild-std=['std']",
+            "[env]\nX='1'\nY={value='2',force=true,relative=true}",
+            "[profile.release]\ndebug-assertions=true\n[profile.dev.build-override]\nopt-level=3",
+            "[doc]\nbrowser='firefox'",
+            "[cargo-new]\nvcs='none'",
+            "[future-incompat-report]\nfrequency='always'",
+            "[install]\nroot='/opt/tools'",
+            "[cache]\nauto-clean-frequency='never'",
+            "[gc.auto]\nfrequency='1 day'",
+            "[credential-alias]\nmine=['helper','--flag']",
+            "[registry]\nglobal-credential-providers=['cargo:token']",
+            "[term]\ncolor='never'\n[http]\ntimeout=30",
+            "[resolver]\nincompatible-rust-versions='fallback'",
+            "[net]\noffline=true\nretry=2\ngit-fetch-with-cli=true",
+        ] {
+            assert_eq!(
+                configuration(&[(".cargo/config.toml", source)])
+                    .with_acquisition_complete(true)
+                    .source_effect(Path::new("")),
+                RustCargoConfigSourceEffect::Preserves,
+                "{source}"
+            );
+        }
+        for source in [
+            "[source.crates-io]\nreplace-with='local'",
+            "[patch.crates-io]\nx={path='x'}",
+            "paths=['vendor']",
+            "[registries.alt]\nindex='https://example.invalid'",
+            "[registry]\ndefault='alt'",
+            "[registry]\nglobal-credential-providers='cargo:token'",
+            "[registry]\nglobal-credential-providers=['cargo:token']\ndefault='alt'",
+            "[env]\nX='1'\n[source.crates-io]\nreplace-with='local'",
+        ] {
+            assert_eq!(
+                configuration(&[(".cargo/config.toml", source)])
+                    .with_acquisition_complete(true)
+                    .source_effect(Path::new("")),
+                RustCargoConfigSourceEffect::Changes,
+                "{source}"
+            );
+        }
+        for source in [
+            "[future]\nkey=true",
+            "[build]\nfuture=true",
+            "[unstable]\nbuild-std=true",
+            "[unstable]\nbuild-std=[]",
+            "[unstable]\nunknown=true",
+            "[resolver]\nunknown=true",
+            "[resolver]\nincompatible-rust-versions=true",
+            "[net]\nunknown=1",
+            "[env]\nX=1",
+            "[env]\nX={value='1',unknown=true}",
+            "[profile]\nrelease=1",
+        ] {
+            assert_eq!(
+                configuration(&[(".cargo/config.toml", source)])
+                    .with_acquisition_complete(true)
+                    .source_effect(Path::new("")),
+                RustCargoConfigSourceEffect::Unknown,
+                "{source}"
+            );
+        }
+    }
+
+    fn document(source: &str) -> RustCargoConfigDocument {
+        RustCargoConfigDocument::from_source_bytes(source.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn unresolved_includes_cannot_be_certified_by_a_complete_flag() {
+        let configuration = configuration(&[(".cargo/config.toml", "include='overrides.toml'")])
+            .with_acquisition_complete(true);
+        assert!(!configuration.acquisition_is_complete(Path::new("")));
+        assert_eq!(
+            configuration.source_effect(Path::new("")),
+            RustCargoConfigSourceEffect::Unknown
+        );
+        assert_eq!(
+            configuration.stdlib_build_mode(Path::new("")),
+            RustStdlibBuildMode::Unknown
+        );
+    }
+
+    #[test]
+    fn acquired_includes_keep_source_mode_flags_and_patch_bases() {
+        let included = document(
+            "[unstable]\nbuild-std=['std']\n[build]\nrustflags=['--cfg','included']\n[patch.crates-io]\nwidget={path='widget'}",
+        );
+        let root = document("include='overrides.toml'\n[build]\nrustflags=['--cfg','root']")
+            .with_included_documents(vec![Some((PathBuf::from("config-dir"), included))])
+            .unwrap();
+        let configuration =
+            RustCargoConfiguration::from_files([(PathBuf::from(".cargo/config.toml"), root)])
+                .with_acquisition_complete(true);
+        assert_eq!(
+            configuration.source_effect(Path::new("")),
+            RustCargoConfigSourceEffect::Changes
+        );
+        assert_eq!(
+            configuration.stdlib_build_mode(Path::new("")),
+            RustStdlibBuildMode::BuildStd
+        );
+        let atoms = configuration.cfg_atoms(Path::new(""));
+        assert!(atoms.contains("included") && atoms.contains("root"));
+        assert_eq!(
+            configuration.patches(Path::new(""), "crates-io")[0].base,
+            PathBuf::from("config-dir")
+        );
+    }
+
+    #[test]
+    fn acquired_include_identity_observes_effective_settings_and_patch_base() {
+        let with = |source: &str, base: &str| {
+            document("include='settings'")
+                .with_included_documents(vec![Some((PathBuf::from(base), document(source)))])
+                .unwrap()
+                .topology_digest()
+        };
+        assert_ne!(
+            with("[unstable]\nbuild-std=['std']", "config"),
+            with("", "config")
+        );
+        assert_ne!(
+            with("[patch.crates-io]\nx={path='x'}", "a"),
+            with("[patch.crates-io]\nx={path='x'}", "b")
+        );
+    }
+
+    #[test]
+    fn cargo_home_layers_apply_outside_ancestor_filter_and_preserve_precedence() {
+        let home = document(
+            "[source.crates-io]\nreplace-with='elsewhere'\n[unstable]\nbuild-std=['std']\n[build]\ntarget='aarch64-apple-darwin'\nrustflags=['--cfg','home']\n[patch.crates-io]\nwidget={path='outside'}",
+        );
+        let configuration = configuration(&[(
+            ".cargo/config.toml",
+            "[build]\ntarget='x86_64-unknown-linux-gnu'\nrustflags=['--cfg','local']",
+        )])
+        .with_base_layers([(PathBuf::from("Cargo-home"), home)])
+        .with_acquisition_complete(true);
+        assert_eq!(
+            configuration.source_effect(Path::new("nested")),
+            RustCargoConfigSourceEffect::Changes
+        );
+        assert_eq!(
+            configuration.stdlib_build_mode(Path::new("nested")),
+            RustStdlibBuildMode::BuildStd
+        );
+        assert_eq!(
+            configuration
+                .configured_build_targets(Path::new("nested"))
+                .0,
+            vec!["x86_64-unknown-linux-gnu"]
+        );
+        let atoms = configuration.cfg_atoms(Path::new("nested"));
+        assert!(atoms.contains("home") && atoms.contains("local"));
+        assert!(
+            configuration
+                .patches(Path::new("nested"), "crates-io")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn missing_and_nested_includes_remain_explicit() {
+        assert!(
+            document("include='required'")
+                .with_included_documents(vec![None])
+                .is_err()
+        );
+        let optional = document("include=[{path='missing', optional=true}]")
+            .with_included_documents(vec![None])
+            .unwrap();
+        assert_eq!(
+            optional.source_effect(),
+            RustCargoConfigSourceEffect::Preserves
+        );
+        let nested = document("include='nested'");
+        assert!(
+            document("include='outer'")
+                .with_included_documents(vec![Some((PathBuf::new(), nested))])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn source_identity_requires_acquired_includes_and_external_layers() {
+        for source in [
+            "",
+            "include='overrides.toml'",
+            "[build]\ntarget='x86_64-unknown-linux-gnu'",
+        ] {
+            let partial = configuration(&[(".cargo/config.toml", source)]);
+            assert_eq!(
+                partial.source_effect(Path::new("")),
+                RustCargoConfigSourceEffect::Unknown
+            );
+        }
+        assert_eq!(
+            configuration(&[])
+                .with_acquisition_complete(true)
+                .source_effect(Path::new("")),
+            RustCargoConfigSourceEffect::Preserves
+        );
+    }
+
+    #[test]
+    fn stdlib_build_mode_requires_complete_interpretable_acquisition() {
+        let path = Path::new("");
+        assert_eq!(
+            configuration(&[]).stdlib_build_mode(path),
+            RustStdlibBuildMode::Unknown
+        );
+        assert_eq!(
+            configuration(&[])
+                .with_acquisition_complete(true)
+                .stdlib_build_mode(path),
+            RustStdlibBuildMode::Prebuilt
+        );
+        assert_eq!(
+            configuration(&[])
+                .with_unclassified_inputs()
+                .with_acquisition_complete(true)
+                .stdlib_build_mode(path),
+            RustStdlibBuildMode::Unknown
+        );
+        for (source, expected) in [
+            (
+                "[unstable]\nbuild-std=['std','core']",
+                RustStdlibBuildMode::BuildStd,
+            ),
+            ("[unstable]\nbuild-std=[]", RustStdlibBuildMode::Unknown),
+            ("[unstable]\nbuild-std=true", RustStdlibBuildMode::Unknown),
+            ("[unknown]\nkey=true", RustStdlibBuildMode::Unknown),
+        ] {
+            let config = configuration(&[(".cargo/config.toml", source)]);
+            assert_eq!(config.stdlib_build_mode(path), RustStdlibBuildMode::Unknown);
+            assert_eq!(
+                config
+                    .with_acquisition_complete(true)
+                    .stdlib_build_mode(path),
+                expected
+            );
+        }
+        let config = configuration(&[
+            (".cargo/config.toml", "[unstable]\nbuild-std=['std']"),
+            (
+                "nested/.cargo/config.toml",
+                "[build]\ntarget='aarch64-unknown-linux-gnu'",
+            ),
+        ])
+        .with_acquisition_complete(true);
+        assert_eq!(
+            config.stdlib_build_mode(Path::new("nested")),
+            RustStdlibBuildMode::BuildStd
+        );
+    }
+
+    #[test]
+    fn build_std_digest_is_conditional_and_observes_malformed_input() {
+        let base = digest("[build]\ntarget='x86_64-unknown-linux-gnu'");
+        // Explicitly reproduce the pre-change projection for an absent key.
+        let mut old = toml::Table::new();
+        old.insert(
+            "build".into(),
+            toml::Value::Table(toml::Table::from_iter([(
+                "target".into(),
+                toml::Value::String("x86_64-unknown-linux-gnu".into()),
+            )])),
+        );
+        let old = crate::cargo_manifest::canonical_toml_digest(
+            b"cargo configuration",
+            &toml::Value::Table(old),
+            |_, _| false,
+        );
+        assert_eq!(base, old);
+        assert_ne!(
+            base,
+            digest("[build]\ntarget='x86_64-unknown-linux-gnu'\n[unstable]\nbuild-std=['std']")
+        );
+        assert_ne!(digest(""), digest("unstable=true"));
+    }
+
     #[brokk_bifrost_test_macros::hardwon(
         "#4460: a known target's target_has_atomic cfg left gated workspace modules unplaced"
     )]
@@ -627,6 +1640,34 @@ mod tests {
             !bare_metal
                 .iter()
                 .any(|atom| atom.starts_with("target_family"))
+        );
+    }
+
+    #[test]
+    fn unknown_acquisition_atoms_are_the_known_atoms_that_read_no_configuration() {
+        let known = RustCargoConfiguration::default().cfg_atoms(Path::new(""));
+        let host = RustCargoConfiguration::default().host_cfg_atoms(Path::new(""));
+        let unknown = RustCargoConfiguration::unknown_acquired();
+        let expected = BTreeSet::from([
+            "test".to_string(),
+            "debug_assertions".to_string(),
+            crate::cfg::INCOMPLETE_FEATURES_ATOM.to_string(),
+        ]);
+        assert_eq!(unknown.cfg_atoms(Path::new("")), expected);
+        assert_eq!(unknown.host_cfg_atoms(Path::new("")), expected);
+        // Every known atom is either one the unknown set keeps (its source is
+        // not the configuration) or a target or rustflag atom it leaves out.
+        let target = target_cfg_atoms(HOST_TRIPLE);
+        for atom in known.iter().chain(&host) {
+            assert!(
+                expected.contains(atom) || target.contains(atom),
+                "{atom} is neither configuration-free nor a target atom"
+            );
+        }
+        assert!(
+            tagged_cfg_atoms(None)
+                .iter()
+                .all(|(source, _)| *source == CfgAtomSource::Defaults)
         );
     }
 
@@ -847,5 +1888,28 @@ mod tests {
         ] {
             assert!(!is_cargo_configuration_path(Path::new(path)), "{path}");
         }
+    }
+
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12604: gnu and musl hosts shared a config view digest and host-dependency answer"
+    )]
+    #[test]
+    fn host_triple_is_one_fact_of_the_view_digest_and_the_host_predicate() {
+        let view = |host_triple: &str| acquired::RustCargoAcquiredConfigView {
+            host_triple: host_triple.to_owned(),
+            complete: true,
+            ..Default::default()
+        };
+        let gnu = view("x86_64-unknown-linux-gnu");
+        let musl = view("x86_64-unknown-linux-musl");
+        assert_ne!(gnu.digest(), musl.digest());
+        // The key of `[target.x86_64-unknown-linux-gnu.build-dependencies]`.
+        let key = "x86_64-unknown-linux-gnu";
+        let answer = |view: &acquired::RustCargoAcquiredConfigView| {
+            RustCargoConfiguration::from_acquired_view(view, std::iter::empty())
+                .host_dependency_predicate(key)
+        };
+        assert_eq!(answer(&gnu), Some(true));
+        assert_eq!(answer(&musl), Some(false));
     }
 }

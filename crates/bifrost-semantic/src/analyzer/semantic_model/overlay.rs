@@ -432,7 +432,9 @@ pub fn classify_model_type_owner<'a>(
 
 /// Selected composition answer semantics. Bump when G1 composition changes.
 /// #10045: authored Rust family certification now survives generated std composition.
-pub const MODEL_COMPOSITION_VERSION: u32 = 3;
+/// #10989: an authored family claim survives composition in every language,
+/// checked against the artifact's family of the same declared arity.
+pub const MODEL_COMPOSITION_VERSION: u32 = 4;
 
 /// The caller compilation's providers, canonicalized before hashing.
 #[derive(Debug, Clone)]
@@ -1038,7 +1040,41 @@ impl<T> SemanticModelOverlayMatch<T> {
     }
 }
 
+/// Namespace selected by a symbol consumer before checking uniqueness.
+/// Unknown preserves an unqualified inventory across all namespaces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SemanticModelNamespace {
+    Unknown,
+    TypeOrModule,
+    Value,
+}
+
+impl SemanticModelNamespace {
+    pub fn accepts(self, kind: SemanticModelSymbolKind) -> bool {
+        match self {
+            Self::Unknown => true,
+            Self::TypeOrModule => kind.is_type_declaration(),
+            Self::Value => matches!(
+                kind,
+                SemanticModelSymbolKind::Function
+                    | SemanticModelSymbolKind::Constant
+                    | SemanticModelSymbolKind::Static
+                    | SemanticModelSymbolKind::Constructor
+            ),
+        }
+    }
+}
+
 impl SemanticModelOverlayMatch<SemanticModelSymbol> {
+    /// Select a namespace before uniqueness, preserving unresolved reads.
+    pub fn in_namespace(mut self, namespace: SemanticModelNamespace) -> Self {
+        self.records.retain(|record| namespace.accepts(record.kind));
+        if !matches!(self.disposition, SemanticModelOverlayDisposition::Open(_)) {
+            self.disposition = disposition(&self.records, |record| record.provenance.ambiguous);
+        }
+        self
+    }
+
     /// Keeps one language family's records and recomputes their disposition.
     pub fn for_family(mut self, language: &str) -> Self {
         use brokk_bifrost_core::analyzer::model::semantic_pack_realm;

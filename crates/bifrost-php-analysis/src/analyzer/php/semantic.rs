@@ -73,13 +73,12 @@ use brokk_bifrost_core::hash::HashMap;
 use brokk_bifrost_php::graph::syntax::{clone_object_operand, object_creation_type};
 use brokk_bifrost_php::graph_support::php_is_constructor_name;
 
-// Bumping this rotates every public wire id hashed from the adapter
-// fingerprint (`SemanticArtifactKey::push_environment_identity`). A checked-in
-// golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
-// change; the code-query tutorial pages elide such ids (#5016).
-// #9447: structured formal roles and refusal change semantic payloads.
-// #9332: defaulted formals publish their saved DefaultArgument values.
-const ADAPTER_VERSION: &[u8] = b"php-value-semantics-v14";
+/// The php adapter lever (#11570): `levers/php-adapter.tokens`. Add a line there
+/// when a change alters the semantics this lowerer publishes for unchanged
+/// source; see `.agents/docs/cache-identity-levers.md`.
+fn adapter_version() -> &'static [u8] {
+    brokk_bifrost_core::lever_label!("php-value-semantics", "php-adapter.tokens").as_bytes()
+}
 
 impl_program_semantics_provider!(PhpAnalyzer, PhpSemanticLowerer);
 
@@ -89,7 +88,7 @@ impl ProgramSemanticsLowerer for PhpSemanticLowerer {
     fn identity(&self) -> SemanticAdapterIdentity {
         SemanticAdapterIdentity::for_adapter(
             "php",
-            ADAPTER_VERSION,
+            adapter_version(),
             b"php-intrafile-execution-defaults-v1",
             DependencyFingerprint::hash_bytes(b"no-intrafile-dependencies"),
         )
@@ -2316,27 +2315,35 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let native_array_iteration = !unlowered_target
             && (iterable.kind() == "array_creation_expression" || locally_bound_array);
         if !native_array_iteration {
-            for (capability, kind, detail) in [
-                (
-                    SemanticCapability::Calls,
-                    SemanticGapKind::Unknown,
-                    "foreach iterator acquisition and advancement calls require runtime refinement",
-                ),
-                (
-                    SemanticCapability::ExceptionalControlFlow,
-                    SemanticGapKind::Unsupported,
-                    "foreach iterator and destructuring failures are not lowered",
-                ),
-            ] {
-                self.session.record_gap(
-                    builder,
-                    test,
-                    SemanticGapSubject::Point,
-                    capability,
-                    kind,
-                    detail,
-                )?;
-            }
+            // Over an object, the values bound above are not the iterable's
+            // index cells: `Iterator::current()`/`key()`, the iterator that
+            // `IteratorAggregate::getIterator()` returns, or the object's
+            // visible properties produce them, and the iterator methods are
+            // user code that can read and write any heap. A Point Calls gap
+            // has no default impacts, so state them here; without them no
+            // value-flow consumer sees the gap, and a sink fed by the loop
+            // variable reads as a proven clean negative (#13434).
+            self.session.add_gap_with_impacts_and_discharge(
+                builder,
+                test,
+                SemanticGapSubject::Point,
+                SemanticCapability::Calls,
+                SemanticGapImpacts::single(SemanticGapImpact::ValueFlow)
+                    .with(SemanticGapImpact::Aliasing)
+                    .with(SemanticGapImpact::HeapRead)
+                    .with(SemanticGapImpact::HeapWrite),
+                SemanticGapKind::Unknown,
+                SemanticGapDischarge::None,
+                "foreach iterator acquisition and advancement calls require runtime refinement",
+            )?;
+            self.session.record_gap(
+                builder,
+                test,
+                SemanticGapSubject::Point,
+                SemanticCapability::ExceptionalControlFlow,
+                SemanticGapKind::Unsupported,
+                "foreach iterator and destructuring failures are not lowered",
+            )?;
         }
         self.session.add_target_edge(
             builder,
@@ -5806,13 +5813,16 @@ fn php_resolve_lifetime_closure(inventory: &mut PhpClassInventory) {
 }
 
 /// What a declared property may hold, as far as its written type states.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum PhpPropertyRelease {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PhpPropertyRelease<'tree> {
     /// Every value of this type is a scalar, so releasing it runs nothing.
     NoObject,
-    /// Exactly this in-file class, whose own release closure decides.
-    Class(Box<str>),
-    /// This file cannot follow what the property holds.
+    /// An instance of the one class this name states, whose own release
+    /// closure decides. The name is as written: the file-local rule follows
+    /// only a bare name of an in-file class, and the query-time proof
+    /// resolves it through the declaring file's namespace and imports.
+    Class(Node<'tree>),
+    /// Nobody can follow what the property holds.
     Unfollowable,
 }
 
@@ -5832,9 +5842,12 @@ fn php_scalar_type_name(name: &str) -> bool {
 /// What the `type` node of a property declaration states it may hold.
 ///
 /// An absent type node is unfollowable, and so is a nullable object, a union,
-/// and an intersection: this pass settles a whole-file question and answers it
-/// conservatively rather than reasoning about arms.
-fn php_property_release(source: &str, type_node: Option<Node<'_>>) -> PhpPropertyRelease {
+/// and an intersection: the release rules settle a closure question and answer
+/// it conservatively rather than reasoning about arms.
+pub(super) fn php_property_release<'tree>(
+    source: &str,
+    type_node: Option<Node<'tree>>,
+) -> PhpPropertyRelease<'tree> {
     let Some(mut current) = type_node else {
         return PhpPropertyRelease::Unfollowable;
     };
@@ -5855,9 +5868,12 @@ fn php_property_release(source: &str, type_node: Option<Node<'_>>) -> PhpPropert
             "name" => {
                 return match nonempty_node_text(source, current) {
                     Some(name) if php_scalar_type_name(name) => PhpPropertyRelease::NoObject,
-                    Some(name) => PhpPropertyRelease::Class(name.into()),
+                    Some(_) => PhpPropertyRelease::Class(current),
                     None => PhpPropertyRelease::Unfollowable,
                 };
+            }
+            "qualified_name" | "relative_name" | "fully_qualified_name" => {
+                return PhpPropertyRelease::Class(current);
             }
             _ => return PhpPropertyRelease::Unfollowable,
         }
@@ -5960,7 +5976,12 @@ fn php_record_property(
     }
     match php_property_release(source, type_node) {
         PhpPropertyRelease::NoObject => {}
-        PhpPropertyRelease::Class(held) => facts.released_classes.push(held),
+        // This intrafile pass follows only a bare name of a class it states;
+        // a namespace-qualified name is answered at query time instead.
+        PhpPropertyRelease::Class(held) => match php_unqualified_class_name(source, held) {
+            Some(held) => facts.released_classes.push(held.into()),
+            None => facts.holds_unfollowable = true,
+        },
         PhpPropertyRelease::Unfollowable => facts.holds_unfollowable = true,
     }
 }

@@ -457,18 +457,12 @@ impl WorkspaceSemanticOracle<'_> {
         procedure: &ProcedureHandle,
         request: &mut SemanticRequest<'_>,
     ) -> Result<bool, SemanticProviderError> {
-        let Some(gap) = procedure.semantics().gaps().iter().find(|gap| {
-            gap.discharge == crate::analyzer::semantic::SemanticGapDischarge::InertDropGlue
-        }) else {
+        if !procedure.semantics().gaps().iter().any(|gap| {
+            matches!(gap.control_flow_discharge(), crate::analyzer::semantic::SemanticGapDischarge::InertDropGlue | crate::analyzer::semantic::SemanticGapDischarge::NonRejoiningExceptionalExitAfterInertDrops)
+        }) {
             return Ok(false);
-        };
-        crate::analyzer::semantic::workspace_oracle::inert_drop_glue_discharges_gap(
-            gap,
-            procedure,
-            self.workspace,
-            request,
-            &mut None,
-        ).map(|verdict| verdict == crate::analyzer::semantic::workspace_oracle::value_flow::GapDischargeVerdict::Discharged)
+        }
+        super::cleanup_drop_obligations_discharged(procedure, self.workspace, request)
     }
 
     /// Ordinary semantic consumers pay no parse cost when the captured model
@@ -1041,10 +1035,14 @@ impl WorkspaceSemanticOracle<'_> {
             .gaps()
             .iter()
             .filter(|gap| {
-                gap_belongs_to_load(gap, &load.0, load.1, nonthrowing)
-                    || gap_belongs_to_load(gap, container, *container_location, nonthrowing)
+                // Captured read proofs have no per-owner cleanup proof.
+                !matches!(
+                    gap.subject,
+                    crate::analyzer::semantic::SemanticGapSubject::CleanupOwners(_)
+                ) && (gap_belongs_to_load(gap, &load.0, load.1, nonthrowing)
+                    || gap_belongs_to_load(gap, container, *container_location, nonthrowing))
             })
-            .map(|gap| gap.id)
+            .map(|gap| crate::analyzer::semantic::GapKey::Gap(gap.id))
             .collect::<Vec<_>>();
         let refinement_identity = identity.finish();
         let mut object_identity = LengthDelimitedDigest::new(b"bifrost.runtime-object.v1");

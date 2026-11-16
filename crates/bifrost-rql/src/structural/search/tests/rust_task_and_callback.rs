@@ -112,6 +112,9 @@ fn rust_call_selector_includes_resolved_tokio_spawn() {
 }
 
 #[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#12460: an unretained external dependency hid a local Drop absence"
+)]
 fn task_spawn_transfers_capture_and_preserves_open_object_set() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file(

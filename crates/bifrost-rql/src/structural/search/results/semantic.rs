@@ -1075,8 +1075,10 @@ pub struct CodeQueryPythonRuleFact {
     pub is_async: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_generator: Option<bool>,
-    /// Whether this assertion is enclosed by a CodeQL-style Python test scope.
-    /// `unknown` means an enclosing class identity could not be resolved.
+    /// Whether this assertion or documented declaration is test code: inside
+    /// a pytest test module, a `unittest.TestCase` subclass, or a pytest or
+    /// nose test function. `unknown` means an enclosing class identity could
+    /// not be resolved.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub test_scope: Option<&'static str>,
     /// Whether this assertion is a direct statement in the terminal `else`
@@ -1141,6 +1143,11 @@ pub struct CodeQueryPythonRuleFact {
     pub is_override: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_property_accessor: Option<bool>,
+    /// Whether this documented declaration is a module-level function that the
+    /// module's top-level `if __name__ == "__main__":` block calls. `unknown`
+    /// means a same-named call in that block did not resolve.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry_point: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub public_method_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1238,6 +1245,10 @@ pub struct CodeQueryRustPointerFinding {
     pub path: String,
     pub language: &'static str,
     pub range: CodeQueryRange,
+    /// Source evidence only; excluded from origin and finding identity.
+    pub source_ranges: Vec<super::CodeQuerySourceSpan>,
+    /// Known distinct source locations omitted from the evidence, never identity.
+    pub source_ranges_omitted: brokk_bifrost_core::omission::OmissionCount,
     pub relation: &'static str,
     pub origin_id: String,
     pub origin_kind: &'static str,

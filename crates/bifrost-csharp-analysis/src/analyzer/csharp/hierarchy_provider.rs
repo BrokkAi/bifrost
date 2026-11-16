@@ -21,7 +21,7 @@ use brokk_bifrost_core::analyzer::capabilities::build_direct_descendant_index;
 use brokk_bifrost_core::cancellation::CancellationToken;
 
 use brokk_bifrost_csharp::graph_support::CSharpSource;
-use brokk_bifrost_csharp::hierarchy::logical_direct_ancestors;
+use brokk_bifrost_csharp::hierarchy::{classify_unindexed_clauses, logical_direct_ancestors};
 use std::sync::Arc;
 
 use crate::analyzer::csharp::CSharpAnalyzer;
@@ -41,8 +41,9 @@ impl TypeHierarchyProvider for CSharpAnalyzer {
             .read(&memo_attribution(self), |cache, capture| {
                 Ok::<_, std::convert::Infallible>(cache.get(code_unit).unwrap_or_else(|| {
                     let entry = Arc::new(capture.build_weighted(|| {
-                        let ancestors = logical_direct_ancestors(self, token, code_unit, false);
-                        let bytes = super::cache::estimate_code_unit_vec(&ancestors) as usize;
+                        let mut ancestors = logical_direct_ancestors(self, token, code_unit, false);
+                        classify_unindexed_clauses(self, token, &mut ancestors);
+                        let bytes = super::cache::estimate_direct_ancestors(&ancestors) as usize;
                         (Arc::new(ancestors), bytes)
                     }));
                     if cache_fill.is_complete() {
@@ -52,7 +53,7 @@ impl TypeHierarchyProvider for CSharpAnalyzer {
                 }))
             })
             .expect("ancestor memo build is infallible");
-        HierarchyAnswer::complete((**ancestors).clone())
+        ancestors.hierarchy_answer()
     }
 
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HierarchyAnswer {

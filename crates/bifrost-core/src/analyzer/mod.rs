@@ -8,6 +8,7 @@
 pub mod canonical_hash;
 pub mod capabilities;
 pub mod carried_context;
+pub mod changed_paths;
 pub mod code_unit_index;
 pub mod cognitive_complexity;
 pub mod common;
@@ -40,6 +41,7 @@ pub mod python_facts;
 pub mod query_batch;
 pub mod query_token;
 pub mod resolution_facts;
+pub mod reuse_verdict;
 pub mod ruby_facts;
 pub mod rust_facts;
 pub mod scala_facts;

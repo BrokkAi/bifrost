@@ -1111,6 +1111,58 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         Some(SignedIntegerMagnitude::new(negative, magnitude))
     }
 
+    fn store_property_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        terminal: ProgramPointId,
+        base: ValueId,
+        member: Node<'tree>,
+        value: ValueId,
+    ) -> Result<(), KotlinLoweringError> {
+        let location = self.session.add_memory_location(
+            builder,
+            terminal,
+            MemoryLocationKind::Field {
+                base,
+                member: self.memory_member_locator(member)?,
+            },
+        )?;
+        self.add_field_identity_gap(builder, terminal, location)?;
+        self.append_effect(
+            builder,
+            terminal,
+            SemanticEffect::MemoryStore {
+                kind: MemoryAccessKind::Field,
+                location,
+                value,
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn setter_entry(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        terminal: ProgramPointId,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+        detail: &str,
+    ) -> Result<ProgramPointId, KotlinLoweringError> {
+        self.add_gap(
+            builder,
+            terminal,
+            SemanticGapSubject::Point,
+            SemanticCapability::Calls,
+            SemanticGapKind::Unsupported,
+            detail,
+        )?;
+        let entry = self.point(builder, node, Vec::new())?;
+        self.implicit_abort_edge(builder, node, entry, scope, stack)?;
+        self.edge(builder, entry, EdgeTarget::normal(terminal))?;
+        Ok(entry)
+    }
+
     fn assignment(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -1130,6 +1182,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let operand =
             self.expression_value(builder, value_node, expression_value_kind(value_node))?;
         let mut evaluations = Vec::new();
+        let mut access_entry = terminal;
         // `x op= v` reads the target, resolves through the `op` or `opAssign`
         // operator convention, and (for `op`) writes the result back. The
         // read happens before the write whichever convention resolves.
@@ -1138,9 +1191,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .then(|| self.compound_integer_offset(target_node, value_node, node))
             .flatten();
         let compound_gap = compound && compound_offset.is_none();
+        let setter_detail = if compound_gap {
+            "property assignment may invoke a setter, which is not yet a call site; compound assignment also resolves through an operator convention (op or opAssign)"
+        } else {
+            "property assignment may invoke a setter, which is not yet a call site"
+        };
         let value = if compound {
-            // A simple name is read as itself; a member or index target is
-            // read through its unlowered assignable expression.
+            // A simple name is read as itself. Field reads are scheduled
+            // after the receiver check below; indexed targets remain opaque.
             let read = match assignment_target(target_node) {
                 AssignmentTarget::Name(name) => name,
                 _ => target_node,
@@ -1165,7 +1223,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     result,
                 )?;
             }
-            evaluations.push(read);
+            if !matches!(
+                assignment_target(target_node),
+                AssignmentTarget::Field { .. }
+            ) {
+                evaluations.push(read);
+            }
             result
         } else {
             operand
@@ -1204,6 +1267,36 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         self.append_carried_assignment(
                             builder, terminal, target, value, &outcome, kind,
                         )?;
+                    } else {
+                        let direct = direct_backing_field_write(self.prepared.source(), name);
+                        if (direct || enclosing_property(self.prepared.source(), name).is_some())
+                            && let Some(base) = self.captured_receiver.or(self.receiver)
+                        {
+                            if !direct {
+                                access_entry = self.setter_entry(
+                                    builder,
+                                    node,
+                                    terminal,
+                                    scope,
+                                    stack,
+                                    setter_detail,
+                                )?;
+                                calls_gap_recorded = true;
+                            }
+                            let outcome =
+                                self.receiver_member_adaptation(Some(base), name, value_node);
+                            let stored = self.adapted_value(builder, terminal, value, &outcome)?;
+                            self.store_property_value(builder, terminal, base, name, stored)?;
+                        } else {
+                            self.add_gap(
+                                builder,
+                                terminal,
+                                SemanticGapSubject::Point,
+                                SemanticCapability::Assignments,
+                                SemanticGapKind::Unknown,
+                                "assignment target is not resolved",
+                            )?;
+                        }
                     }
                 }
                 if compound_gap && !calls_gap_recorded {
@@ -1218,38 +1311,24 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 }
             }
             AssignmentTarget::Field { base, member } => {
-                if compound_gap {
+                let direct = base.kind() == "this_expression"
+                    && !has_token(base, "@")
+                    && direct_backing_field_write(self.prepared.source(), member);
+                if !direct {
+                    access_entry =
+                        self.setter_entry(builder, node, terminal, scope, stack, setter_detail)?;
+                } else if compound_gap {
                     self.add_gap(
-                        builder,
-                        terminal,
-                        SemanticGapSubject::Point,
-                        SemanticCapability::Calls,
-                        SemanticGapKind::Unsupported,
+                        builder, terminal, SemanticGapSubject::Point,
+                        SemanticCapability::Calls, SemanticGapKind::Unsupported,
                         "compound assignment resolves through an operator convention (op or opAssign), which is not yet a call site",
                     )?;
                 }
                 let base_value =
                     self.expression_value(builder, base, expression_value_kind(base))?;
-                let location = self.session.add_memory_location(
-                    builder,
-                    terminal,
-                    MemoryLocationKind::Field {
-                        base: base_value,
-                        member: self.memory_member_locator(member)?,
-                    },
-                )?;
-                self.add_field_identity_gap(builder, terminal, location)?;
                 let outcome = self.member_adaptation(base, member, value_node);
                 let stored = self.adapted_value(builder, terminal, value, &outcome)?;
-                self.append_effect(
-                    builder,
-                    terminal,
-                    SemanticEffect::MemoryStore {
-                        kind: MemoryAccessKind::Field,
-                        location,
-                        value: stored,
-                    },
-                )?;
+                self.store_property_value(builder, terminal, base_value, member, stored)?;
                 evaluations.push(base);
             }
             AssignmentTarget::Index { base, index } => {
@@ -1309,13 +1388,84 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 evaluations.push(target);
             }
         }
+        if compound_gap {
+            // The unresolved op/opAssign call can throw independently of the
+            // final store, including when that store bypasses a setter.
+            let operation = self.point(builder, node, Vec::new())?;
+            self.implicit_abort_edge(builder, node, operation, scope, stack)?;
+            self.edge(builder, operation, EdgeTarget::normal(access_entry))?;
+            access_entry = operation;
+        }
+        if let AssignmentTarget::Field { base, member } = assignment_target(target_node) {
+            let rhs = self.point(builder, value_node, Vec::new())?;
+            stack.push(Work::Expression {
+                node: value_node,
+                entry: rhs,
+                next: EdgeTarget::normal(access_entry),
+                scope,
+            });
+            // A compound read follows receiver evaluation (including !!),
+            // precedes the RHS, and reuses that receiver instead of evaluating
+            // the assignable expression and its receiver a second time.
+            let after_receiver = if compound {
+                self.property_load(
+                    builder,
+                    target_node,
+                    base,
+                    member,
+                    EdgeTarget::normal(rhs),
+                    scope,
+                    stack,
+                )?
+            } else {
+                rhs
+            };
+            if is_safe_navigation(target_node) {
+                let gate = self.null_gate(builder, target_node, next)?;
+                self.edge(builder, terminal, EdgeTarget::normal(gate.join))?;
+                self.edge(builder, gate.gated, EdgeTarget::normal(after_receiver))?;
+                return self.schedule_expressions(
+                    builder,
+                    entry,
+                    &evaluations,
+                    EdgeTarget::normal(gate.test),
+                    scope,
+                    stack,
+                );
+            }
+            self.edge(builder, terminal, next)?;
+            let assertion = {
+                let mut cursor = target_node.walk();
+                target_node
+                    .children(&mut cursor)
+                    .find(|child| child.kind() == "!!")
+            };
+            let checked = if let Some(assertion) = assertion {
+                // The assignable grammar keeps !! on the target, rather than
+                // in a postfix expression. Check it before the read and RHS.
+                let check = self.point(builder, assertion, Vec::new())?;
+                self.implicit_abort_edge(builder, assertion, check, scope, stack)?;
+                self.edge(builder, check, EdgeTarget::normal(after_receiver))?;
+                check
+            } else {
+                after_receiver
+            };
+            return self.schedule_expressions(
+                builder,
+                entry,
+                &evaluations,
+                EdgeTarget::normal(checked),
+                scope,
+                stack,
+            );
+        }
         evaluations.push(value_node);
         self.edge(builder, terminal, next)?;
         self.schedule_expressions(
             builder,
             entry,
             &evaluations,
-            EdgeTarget::normal(terminal),
+            EdgeTarget::normal(access_entry),
             scope,
             stack,
         )
@@ -2375,6 +2525,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 receiver,
                 member,
                 EdgeTarget::normal(gate.join),
+                scope,
+                stack,
             )?;
             self.edge(builder, gate.gated, EdgeTarget::normal(access))?;
             stack.push(Work::Expression {
@@ -2385,7 +2537,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             });
             return Ok(());
         }
-        let access = self.property_load(builder, node, receiver, member, next)?;
+        let access = self.property_load(builder, node, receiver, member, next, scope, stack)?;
         self.schedule_expressions(
             builder,
             entry,
@@ -2399,6 +2551,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     /// One property read, published as a field access whose exact declaration
     /// identity — instance member, top-level property, or `object` member —
     /// stays an explicit gap.
+    #[allow(clippy::too_many_arguments)]
     fn property_load(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -2406,6 +2559,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         receiver: Node<'tree>,
         member: Node<'tree>,
         next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
     ) -> Result<ProgramPointId, KotlinLoweringError> {
         let result = self.expression_value(builder, node, expression_value_kind(node))?;
         let access = self.point(builder, node, Vec::new())?;
@@ -2426,6 +2581,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             self.edge(builder, access, next)?;
             return Ok(access);
         }
+        let fault = self.point(builder, node, Vec::new())?;
+        self.implicit_abort_edge(builder, node, fault, scope, stack)?;
+        self.edge(builder, fault, EdgeTarget::normal(access))?;
         let location = self.session.add_memory_location(
             builder,
             access,
@@ -2445,7 +2603,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             },
         )?;
         self.edge(builder, access, next)?;
-        Ok(access)
+        Ok(fault)
     }
 
     fn indexing(
@@ -3041,6 +3199,25 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             },
         );
         Ok(())
+    }
+
+    fn implicit_abort_edge(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        operation: ProgramPointId,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), KotlinLoweringError> {
+        let Some((route, abort)) =
+            self.session
+                .implicit_abort_edge(builder, node, operation, scope, None, |_| None)?
+        else {
+            return Err(KotlinLoweringError::Invalid(
+                "implicit abort has no matching structured continuation".into(),
+            ));
+        };
+        self.route(builder, abort, &route, stack)
     }
 
     #[allow(clippy::too_many_arguments)]

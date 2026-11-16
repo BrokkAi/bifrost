@@ -9,10 +9,10 @@
 
 use crate::analyzer::semantic::{
     AccessPathTail, AllocationKind, ArgumentDomain, AsyncResumeKind, BackingStoreOffset,
-    CallArgumentExpansion, CallContinuationKind, CallInvocationMode, CallableReferenceKind,
-    CallableTarget, CallableTargetResolution, CaptureMode, CaptureSource, ConstructionReturn,
-    ControlContinuation, ControlEdgeKind, DeclarationSegmentKind, DispatchExtensibility,
-    DropBehavior, EvidenceCompleteness, ExecutionTiming, FormalMultiplicity,
+    CallArgumentExpansion, CallContinuationKind, CallInvocationMode, CallTargetDispatch,
+    CallableReferenceKind, CallableTarget, CallableTargetResolution, CaptureMode, CaptureSource,
+    ConstructionReturn, ControlContinuation, ControlEdgeKind, DeclarationSegmentKind,
+    DispatchExtensibility, DropBehavior, EvidenceCompleteness, ExecutionTiming, FormalMultiplicity,
     FormalParameterPassingMode, GuardPredicate, IndexedLocationIdentity, IntegerComparison,
     LifecycleIncompleteReason, MemoryAccessKind, MemoryLocationKind, MemoryValueCopy,
     MoveInvalidation, MoveOutState, PointerAccessKind, PointerAccessWidth, PointerByteOffset,
@@ -27,8 +27,10 @@ use crate::analyzer::semantic::{
 };
 
 use super::SemanticIrLoweringOutcome;
+use crate::analyzer::semantic::cfg::CompletionKind;
 use crate::analyzer::semantic::partial_flow::fixpoint::PartialFlowOutcome;
 use crate::analyzer::semantic::partial_flow::ports::{HeapSelector, PartialFlowPort};
+use crate::analyzer::semantic::{CleanupAnchorPurpose, CleanupOwnerLifecycle};
 
 /// A fieldless enumeration stored as its declaration position.
 pub(super) trait RowCode: Copy + PartialEq + std::fmt::Debug + 'static {
@@ -63,20 +65,76 @@ macro_rules! fieldless_codes {
     };
 }
 
+// This enum's newest arm is assigned at the final pre-Ready merge. Decode
+// discriminants rather than array offsets so renumbering its one explicit
+// discriminant does not depend on the placement of independently added arms.
+impl RowCode for SemanticGapDischarge {
+    const VARIANTS: &'static [Self] = &[
+        Self::None,
+        Self::CallResolution,
+        Self::RetainedEvaluationOrder,
+        Self::RetainedControlTopology,
+        Self::CanonicalIndexIdentity,
+        Self::ExactFieldLayout,
+        Self::RuntimeReadBehavior,
+        Self::NonRejoiningExceptionalExit,
+        Self::ExitOnlyProcedureCompletion,
+        Self::ModeledEffectPartition,
+        Self::RebindAtCallOrSuspension,
+        Self::InertDropGlue,
+        Self::NonRejoiningExceptionalExitAfterInertDrops,
+        Self::ResidualConversion,
+        Self::ImplicitDropExecution,
+        Self::DataDependency,
+    ];
+
+    fn code(self) -> i64 {
+        match self {
+            Self::None
+            | Self::CallResolution
+            | Self::RetainedEvaluationOrder
+            | Self::RetainedControlTopology
+            | Self::CanonicalIndexIdentity
+            | Self::ExactFieldLayout
+            | Self::RuntimeReadBehavior
+            | Self::NonRejoiningExceptionalExit
+            | Self::ExitOnlyProcedureCompletion
+            | Self::ModeledEffectPartition
+            | Self::RebindAtCallOrSuspension
+            | Self::InertDropGlue
+            | Self::NonRejoiningExceptionalExitAfterInertDrops
+            | Self::ResidualConversion
+            | Self::ImplicitDropExecution
+            | Self::DataDependency => self as i64,
+        }
+    }
+
+    fn try_from_code(code: i64) -> Option<Self> {
+        Self::VARIANTS
+            .iter()
+            .copied()
+            .find(|value| value.code() == code)
+    }
+}
+
 fieldless_codes! {
+    CleanupOwnerLifecycle { None, ScopeEnd }
+    CleanupAnchorPurpose { Completion, LifetimeEnd, Exit }
+    CompletionKind { Normal, Return, Throw, Break, Continue, Yield }
     AccessPathTail { Exact, Summary }
     PartialFlowOutcome { Complete, Truncated, ExceededBudget, Error }
     ProcedureKind {
         Function, Method, Constructor, Initializer, LocalFunction, Lambda, Closure, Accessor,
         Operator,
     }
-    ProcedureInvocationKind { Immediate, Deferred }
+    ProcedureInvocationKind { Immediate, Deferred, DeferredBody }
     DispatchExtensibility { Open, Closed }
     ProcedureCallBoundary { Direct, Unknown }
     ProcedureReceiverBinding { Instance, Class }
     ConstructionReturn { MayReplaceAllocation, PreservesAllocation }
     FormalParameterPassingMode { PositionalOnly, PositionalOrNamed, NamedOnly }
     CallInvocationMode { Ordinary, Detached }
+    CallTargetDispatch { Unspecified, Static, Special, Virtual, Interface }
     ExecutionTiming {
         SameEvaluation, SameInvocation, LaterSameTurn, AfterSuspension, DifferentTask,
         DifferentThread, DeferredCallback, GeneratorResume, CancellationCleanup, Unknown,
@@ -91,13 +149,6 @@ fieldless_codes! {
         ExceptionalCallContinuation, Captures, CallableReferences, AsyncSuspendResume,
         GeneratorSuspension, DeferredExecution, ConcurrentSpawn, Synchronization,
         NonLocalControl, ResourceManagement, GuardFacts, SwitchFacts,
-    }
-    SemanticGapDischarge {
-        None, CallResolution, RetainedEvaluationOrder, RetainedControlTopology,
-        CanonicalIndexIdentity, ExactFieldLayout, RuntimeReadBehavior,
-        NonRejoiningExceptionalExit, ExitOnlyProcedureCompletion, ModeledEffectPartition,
-        RebindAtCallOrSuspension, InertDropGlue, NonRejoiningExceptionalExitAfterInertDrops,
-        ResidualConversion,
     }
     SemanticBudgetDimension {
         SourceBytes, Procedures, Blocks, ProgramPoints, Values, Allocations, CallSites,
@@ -210,21 +261,22 @@ payload_tags! {
     }
     ProofTag for ProofStatus { Proven, Unproven }
     CompletenessTag for EvidenceCompleteness { Complete, Partial }
+    // PLACEHOLDER discriminants 9/10: finalize in landing order for #12128.
     GapSubjectTag for SemanticGapSubject {
         Procedure, Point, Value, MemoryLocation, Capture, CallSite, CallContinuation,
-        AsyncContinuation,
+        AsyncContinuation, CleanupOwners, FutureConstruction, FutureActivation,
     }
     EffectTag for SemanticEffect {
         Entry, NormalExit, ExceptionalExit, Assignment, AggregateInitializer, ValueFlow,
         ValueUse, Allocation, MemoryLoad, MemoryStore, Synchronization, CallableCreation,
         CallableReference, CaptureBind, Invoke, CallContinuation, ProcedureReturn, Throw,
-        AsyncSuspend, AsyncResume, Gap,
+        AsyncSuspend, AsyncResume, Gap, MemoryInterference,
     }
     ValueFlowKindTag for ValueFlowKind {
         Local, Transfer, BackingStore, IntegerOffset, BackingStoreAlternative, Parameter,
         Receiver, Return, IndexedReturn, ReferenceBoxing, ReferenceUnboxing, LanguageDefined,
         // #9794 remains the existing code; #9925 appends after it.
-        ByValueCapture, OwnershipUnknown,
+        ByValueCapture, OwnershipUnknown, AddressOf, MemoryLoad,
     }
     TransferKindTag for TransferKind {
         Copy, AggregateCopy, Move, Conversion, Boxing, Unboxing,
@@ -295,7 +347,7 @@ mod tests {
     #[test]
     fn semantic_ir_codes_round_trip_and_match_check_bounds() {
         assert_codes::<ProcedureKind>(Some(8));
-        assert_codes::<ProcedureInvocationKind>(Some(1));
+        assert_codes::<ProcedureInvocationKind>(Some(2));
         assert_codes::<DispatchExtensibility>(Some(1));
         assert_codes::<ProcedureCallBoundary>(Some(1));
         assert_codes::<ProcedureReceiverBinding>(Some(1));
@@ -306,7 +358,33 @@ mod tests {
         assert_codes::<SourceMappingKind>(Some(2));
         assert_codes::<SemanticGapKind>(Some(4));
         assert_codes::<SemanticCapability>(Some(33));
-        assert_codes::<SemanticGapDischarge>(Some(13));
+        let mut discharge_codes = Vec::new();
+        for variant in SemanticGapDischarge::VARIANTS {
+            assert_eq!(
+                SemanticGapDischarge::try_from_code(variant.code()),
+                Some(*variant)
+            );
+            discharge_codes.push(variant.code());
+        }
+        discharge_codes.sort_unstable();
+        discharge_codes.dedup();
+        assert_eq!(discharge_codes.len(), SemanticGapDischarge::VARIANTS.len());
+        let maximum_discharge = *discharge_codes.last().unwrap();
+        assert_eq!(
+            SemanticGapDischarge::try_from_code(maximum_discharge + 1),
+            None
+        );
+        assert_eq!(SemanticGapDischarge::try_from_code(-1), None);
+        let schema =
+            include_str!("../../../../../bifrost-core/migrations/cache/current-schema.sql");
+        assert_eq!(
+            schema
+                .matches(&format!(
+                    "CHECK(discharge BETWEEN 0 AND {maximum_discharge})"
+                ))
+                .count(),
+            2
+        );
         assert_codes::<SemanticBudgetDimension>(Some(15));
         assert_codes::<IndexedLocationIdentity>(Some(1));
         assert_codes::<MoveInvalidation>(None);
@@ -347,8 +425,8 @@ mod tests {
         assert_codes::<ContinuationTag>(Some(5));
         assert_codes::<ProofTag>(Some(1));
         assert_codes::<CompletenessTag>(Some(1));
-        assert_codes::<GapSubjectTag>(Some(7));
-        assert_codes::<EffectTag>(Some(20));
+        assert_codes::<GapSubjectTag>(Some(10));
+        assert_codes::<EffectTag>(Some(21));
         assert_codes::<ValueFlowKindTag>(None);
         assert_codes::<TransferKindTag>(Some(5));
         assert_codes::<TransferOperationTag>(Some(4));
@@ -396,6 +474,8 @@ mod tests {
                 "LanguageDefined",
                 "ByValueCapture",
                 "OwnershipUnknown",
+                "AddressOf",
+                "MemoryLoad",
             ]
         );
     }

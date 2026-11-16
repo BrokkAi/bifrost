@@ -256,6 +256,10 @@ pub(super) fn cross_domain_diagnostic(
     message: String,
 ) -> CodeQueryDiagnostic {
     CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        has_non_utf8_refusal: false,
+        refusal_sites: Default::default(),
+        call_relation_facts: None,
+        uses_omissions: Vec::new(),
         incompleteness: brokk_bifrost_rql::Incompleteness::Operational(
             brokk_bifrost_rql::DiagnosticExecutionCause::Provider,
         ),
@@ -453,7 +457,13 @@ pub(super) fn execute_correlate_configuration_key(
             let mut projected = state.budget;
             projected.scanned_files = projected.scanned_files.saturating_add(1);
             if projected.scanned_files > limits.max_scanned_files {
-                push_budget_diagnostic(diagnostics, &projected);
+                push_budget_diagnostic(
+                    diagnostics,
+                    &projected,
+                    limits,
+                    Some(&state.budget),
+                    "configuration_correlation",
+                );
                 truncated = true;
                 break;
             }

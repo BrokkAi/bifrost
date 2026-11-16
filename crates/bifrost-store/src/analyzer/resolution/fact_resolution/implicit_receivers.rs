@@ -1910,7 +1910,12 @@ impl DemandQualifiedFrame {
                             .identity_digest(evaluation.hierarchy, key)
                     })?;
                     let name = std::str::from_utf8(reason).expect("receiver stop names are ASCII");
-                    identities.named_semantic(hash.finish(), name, name)
+                    identities.named_semantic(
+                        hash.finish(),
+                        name,
+                        crate::analyzer::resolution::ReasonDeterminism::Unaudited,
+                        name,
+                    )
                 } else {
                     canonical_service_reason(
                         evaluation.session,

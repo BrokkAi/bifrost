@@ -93,6 +93,52 @@ pub struct SemanticModelActivationEvidence {
     pub artifact_sha256: Option<String>,
 }
 
+impl SemanticModelActivationEvidence {
+    /// Visit owned children; the enclosing retained owner pays inline storage
+    /// and calls this leaf only once for that owner.
+    #[doc(hidden)]
+    pub fn retained_allocations(
+        &self,
+        census: &mut impl crate::analyzer::semantic::service::ArtifactRetentionVisitor,
+    ) {
+        let Self {
+            language,
+            ecosystem,
+            package,
+            module,
+            toolchain,
+            target,
+            configuration,
+            artifact_sha256,
+        } = self;
+        census.owned_string(language);
+        census.owned_string(ecosystem);
+        for coordinate in [package, module, toolchain].into_iter().flatten() {
+            let CatalogCoordinate { name, version } = coordinate;
+            census.owned_string(name);
+            if let Some(version) = version {
+                // semver 1.0.28 src/identifier.rs:105-137 stores 0..=8 bytes
+                // inline, otherwise len plus a base-128 length prefix. Its
+                // allocation identity is opaque: conservatively charge both
+                // nonempty components exclusively, including inline contents.
+                // This upper bound must be rechecked if the dependency changes.
+                for text in [version.pre.as_str(), version.build.as_str()] {
+                    if !text.is_empty() {
+                        census
+                            .exclusive(text.len().saturating_add(usize::BITS.div_ceil(7) as usize));
+                    }
+                }
+            }
+        }
+        for text in [target, configuration, artifact_sha256]
+            .into_iter()
+            .flatten()
+        {
+            census.owned_string(text);
+        }
+    }
+}
+
 /// The reviewed proof basis attached to a result-use obligation binding.
 ///
 /// The label is deliberately smaller than the typed basis. Query consumers
@@ -248,14 +294,45 @@ impl Default for SemanticModelRuntimeLimits {
     }
 }
 
-/// An unknown toolchain whose assumption is selected by a standard-library pack.
+/// Standard-library packs that discovery requests without exact toolchain
+/// evidence. Every shard selected through one is marked approximate.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ApproximateSemanticModelExpectation {
     /// Other toolchain-keyed packs use the version selected by this stdlib.
     pub toolchain: Option<String>,
     pub language: String,
+    /// The dependency-pack ecosystem whose discovery recorded the expectation.
     pub ecosystem: String,
-    pub pack_id: String,
+    pub selection: ApproximateStandardLibrarySelection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ApproximateStandardLibrarySelection {
+    /// The pack with this ID in the expectation's ecosystem, whatever
+    /// toolchain coordinates it names.
+    Pack(String),
+    /// Every pack of `pack_ecosystem` whose requirements on `toolchain` admit
+    /// each release version in `[floor, ceiling)`. The workspace declares
+    /// that every toolchain building it is at least `floor`, and no toolchain
+    /// reaches `ceiling`, but the toolchain itself was not observed.
+    ToolchainFloor {
+        pack_ecosystem: String,
+        toolchain: String,
+        floor: Version,
+        ceiling: Version,
+    },
+}
+
+impl ApproximateSemanticModelExpectation {
+    /// The manifest ecosystem of the packs this expectation selects.
+    pub fn pack_ecosystem(&self) -> &str {
+        match &self.selection {
+            ApproximateStandardLibrarySelection::Pack(_) => &self.ecosystem,
+            ApproximateStandardLibrarySelection::ToolchainFloor { pack_ecosystem, .. } => {
+                pack_ecosystem
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -604,6 +681,8 @@ pub struct UnmaterializedExternalSummaryCallShapeBinding {
     #[doc(hidden)]
     pub actual_to_formal: Option<Box<[u32]>>,
     #[doc(hidden)]
+    pub receiver_binds_first_formal: bool,
+    #[doc(hidden)]
     pub formal_locator: SemanticLocator,
     #[doc(hidden)]
     pub model_id: Box<str>,
@@ -624,6 +703,13 @@ impl UnmaterializedExternalSummaryCallShapeBinding {
     /// retain their established positional binding with no explicit map.
     pub fn actual_to_formal(&self) -> Option<&[u32]> {
         self.actual_to_formal.as_deref()
+    }
+
+    /// Whether the call's receiver binds formal 0, a reduced-form extension
+    /// call. `actual_to_formal` then maps the written arguments to the
+    /// formals after it.
+    pub const fn receiver_binds_first_formal(&self) -> bool {
+        self.receiver_binds_first_formal
     }
 
     pub fn formal_locator(&self) -> &SemanticLocator {
@@ -1045,7 +1131,7 @@ pub fn runtime_request_key(request: &SemanticModelActivationRequest) -> Result<S
     controls.sort_unstable();
     controls.dedup();
     let mut hasher = Sha256::new();
-    hasher.update(b"bifrost.semantic-model.runtime-request.v4\0");
+    hasher.update(b"bifrost.semantic-model.runtime-request.v5\0");
     hash_key_part(&mut hasher, &request.bifrost_version.to_string());
     hasher.update(
         (crate::analyzer::semantic_model::SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS.len() as u64)
@@ -1063,7 +1149,24 @@ pub fn runtime_request_key(request: &SemanticModelActivationRequest) -> Result<S
         hash_optional_key_part(&mut hasher, expectation.toolchain.as_deref());
         hash_key_part(&mut hasher, &expectation.language);
         hash_key_part(&mut hasher, &expectation.ecosystem);
-        hash_key_part(&mut hasher, &expectation.pack_id);
+        match &expectation.selection {
+            ApproximateStandardLibrarySelection::Pack(pack_id) => {
+                hasher.update([0]);
+                hash_key_part(&mut hasher, pack_id);
+            }
+            ApproximateStandardLibrarySelection::ToolchainFloor {
+                pack_ecosystem,
+                toolchain,
+                floor,
+                ceiling,
+            } => {
+                hasher.update([1]);
+                hash_key_part(&mut hasher, pack_ecosystem);
+                hash_key_part(&mut hasher, toolchain);
+                hash_key_part(&mut hasher, &floor.to_string());
+                hash_key_part(&mut hasher, &ceiling.to_string());
+            }
+        }
     }
     for control in controls {
         hasher.update((control.len() as u64).to_be_bytes());
@@ -1146,12 +1249,18 @@ pub fn validate_and_canonicalize_request(
         return Err("semantic-model activation control budget exceeded".to_owned());
     }
     for expectation in &request.approximate_standard_libraries {
-        if expectation.language.is_empty()
-            || expectation.ecosystem.is_empty()
-            || expectation.pack_id.is_empty()
-        {
+        let selection_named = match &expectation.selection {
+            ApproximateStandardLibrarySelection::Pack(pack_id) => !pack_id.is_empty(),
+            ApproximateStandardLibrarySelection::ToolchainFloor {
+                pack_ecosystem,
+                toolchain,
+                floor,
+                ceiling,
+            } => !pack_ecosystem.is_empty() && !toolchain.is_empty() && floor < ceiling,
+        };
+        if expectation.language.is_empty() || expectation.ecosystem.is_empty() || !selection_named {
             return Err(
-                "approximate activation expectation must name its language, ecosystem and pack"
+                "approximate activation expectation must name its language, ecosystem and a pack or nonempty toolchain interval"
                     .to_owned(),
             );
         }
@@ -1405,6 +1514,104 @@ pub fn strict_activation_match(
         matching_evidence,
         matched_requirements,
     })
+}
+
+/// Match a pack against a declared toolchain floor instead of an observed
+/// toolchain. The pack activates only when each of its toolchain requirements
+/// admits every release in `[floor, ceiling)`, so whichever release builds
+/// the workspace, an exact match would also have selected it. A selector that
+/// names any other coordinate, target, configuration or artifact needs
+/// evidence a floor does not supply, and does not match.
+#[doc(hidden)]
+pub fn toolchain_floor_activation_match(
+    manifest: &CompiledPackManifest,
+    selectors: &[ActivationSelector],
+    toolchain: &str,
+    floor: &Version,
+    ceiling: &Version,
+    bifrost_version: &Version,
+) -> Option<StrictActivationMatch> {
+    if !manifest
+        .compatibility
+        .matches_engine(manifest.schema_version, bifrost_version)
+        .ok()?
+    {
+        return None;
+    }
+    let admits = |name: &str, requirement: Option<&str>| {
+        name == toolchain
+            && requirement
+                .is_none_or(|requirement| requirement_admits_releases(requirement, floor, ceiling))
+    };
+    if !manifest
+        .compatibility
+        .toolchains
+        .iter()
+        .all(|constraint| admits(&constraint.name, Some(&constraint.requirement)))
+    {
+        return None;
+    }
+    let evidence_rank = selectors
+        .iter()
+        .filter(|selector| {
+            selector.package.is_none()
+                && selector.module.is_none()
+                && selector.targets.is_empty()
+                && selector.configurations.is_empty()
+                && selector.artifact_sha256.is_none()
+                && selector.toolchain.as_ref().is_none_or(|coordinate| {
+                    admits(&coordinate.name, coordinate.version.as_deref())
+                })
+        })
+        .map(selector_rank)
+        .max()?;
+    Some(StrictActivationMatch {
+        evidence_rank,
+        matched_evidence: SemanticModelActivationEvidence {
+            language: manifest.language.clone(),
+            ecosystem: manifest.ecosystem.clone(),
+            package: None,
+            module: None,
+            toolchain: Some(CatalogCoordinate {
+                name: toolchain.to_owned(),
+                version: Some(floor.clone()),
+            }),
+            target: None,
+            configuration: None,
+            artifact_sha256: None,
+        },
+        matching_evidence: Vec::new(),
+        matched_requirements: Vec::new(),
+    })
+}
+
+/// Whether every release version in `[floor, ceiling)` satisfies
+/// `requirement`. Only lower and upper bound comparators are decided; any
+/// other operator, and any bound the interval can cross, refuses.
+fn requirement_admits_releases(requirement: &str, floor: &Version, ceiling: &Version) -> bool {
+    let Ok(requirement) = VersionReq::parse(requirement) else {
+        return false;
+    };
+    requirement
+        .comparators
+        .iter()
+        .all(|comparator| match comparator.op {
+            // A lower bound that the floor meets holds for every later release.
+            semver::Op::Greater | semver::Op::GreaterEq => VersionReq {
+                comparators: vec![comparator.clone()],
+            }
+            .matches(floor),
+            // An upper bound at or above the ceiling holds below the ceiling.
+            semver::Op::Less | semver::Op::LessEq => {
+                comparator.pre.is_empty()
+                    && Version::new(
+                        comparator.major,
+                        comparator.minor.unwrap_or(0),
+                        comparator.patch.unwrap_or(0),
+                    ) >= *ceiling
+            }
+            _ => false,
+        })
 }
 
 /// Record one satisfied requirement, keeping the first statement of a
@@ -1808,6 +2015,31 @@ mod semantic_diagnostic_runtime_tests {
     use brokk_bifrost_test_macros::hardwon;
 
     #[test]
+    fn toolchain_floor_admits_only_requirements_every_later_release_meets() {
+        let version = |text| Version::parse(text).unwrap();
+        let ceiling = version("2.0.0");
+        for (requirement, floor, admitted) in [
+            (">=1.26.0, <2.0.0", "1.26.0", true),
+            (">=1.26.0, <2.0.0", "1.27.3", true),
+            (">=1.26.0", "1.26.0", true),
+            (">=1.26.0, <2.0.0", "1.25.0", false),
+            // A later release may leave a closed range or an exact pin.
+            (">=1.26.0, <1.27.0", "1.26.0", false),
+            ("<=1.99.0", "1.26.0", false),
+            ("=1.26.0", "1.26.0", false),
+            ("^1.26", "1.26.0", false),
+            // A prerelease floor does not meet a release lower bound.
+            (">=1.26.0, <2.0.0", "1.26.0-rc.1", false),
+        ] {
+            assert_eq!(
+                requirement_admits_releases(requirement, &version(floor), &ceiling),
+                admitted,
+                "{requirement} from {floor}"
+            );
+        }
+    }
+
+    #[test]
     #[hardwon("#6233: the activation request key ignored approximate stdlib expectations")]
     fn runtime_request_key_binds_canonical_approximate_expectations() {
         let mut request = SemanticModelActivationRequest {
@@ -1822,7 +2054,7 @@ mod semantic_diagnostic_runtime_tests {
             toolchain: Some("rust".into()),
             language: "rust".to_owned(),
             ecosystem: "cargo".to_owned(),
-            pack_id: "bifrost.rust-stdlib".to_owned(),
+            selection: ApproximateStandardLibrarySelection::Pack("bifrost.rust-stdlib".to_owned()),
         };
         request
             .approximate_standard_libraries
@@ -1837,7 +2069,7 @@ mod semantic_diagnostic_runtime_tests {
             .push(expectation.clone());
         assert_eq!(approximate_key, runtime_request_key(&request).unwrap());
         let other = ApproximateSemanticModelExpectation {
-            pack_id: "test.other-stdlib".to_owned(),
+            selection: ApproximateStandardLibrarySelection::Pack("test.other-stdlib".to_owned()),
             ..expectation.clone()
         };
         request.approximate_standard_libraries = vec![expectation.clone(), other.clone()];
@@ -1884,6 +2116,23 @@ pub struct ReceiverAdjustment {
 }
 
 impl ReceiverAdjustment {
+    /// Borrowed owned strings only; the enclosing slice pays inline storage.
+    #[doc(hidden)]
+    pub fn retained_allocations(
+        &self,
+        census: &mut impl crate::analyzer::semantic::service::ArtifactRetentionVisitor,
+    ) {
+        for text in [
+            &self.member_id,
+            &self.path,
+            &self.symbol,
+            &self.model_id,
+            &self.content,
+        ] {
+            census.owned_slice(text.as_bytes());
+        }
+    }
+
     /// The caller separately proves std trait applicability and the exact
     /// member. A summary never substitutes for callable-family completeness.
     pub fn from_selected(
@@ -2036,9 +2285,9 @@ pub fn is_complete_receiver_identity_summary(summary: &CompiledProcedureSummary)
         && summary.no_concurrency_effects
         && summary.concurrency_effects.is_empty()
         && matches!(summary.transfers.as_slice(), [transfer]
-        if matches!(transfer.input, CompiledSummaryInput::Receiver {})
+        if matches!(transfer.input, CompiledSummaryInput::Receiver { path: None })
             && transfer.exit_kind == CompiledSummaryExitKind::Normal
-            && matches!(transfer.output, CompiledSummaryOutput::NormalReturn {})
+            && matches!(transfer.output, CompiledSummaryOutput::NormalReturn { path: None })
             && transfer.value_transfer.as_ref().is_some_and(|value|
                 matches!(value.kind, SummaryValueTransferKind::Conversion {
                     preservation: SummaryValuePreservation::Identity
@@ -2077,7 +2326,7 @@ mod procedure_claim_agreement_tests {
         CompiledSummaryTransfer {
             input,
             exit_kind: CompiledSummaryExitKind::Normal,
-            output: CompiledSummaryOutput::NormalReturn {},
+            output: CompiledSummaryOutput::NormalReturn { path: None },
             value_transfer: None,
         }
     }
@@ -2106,7 +2355,10 @@ mod procedure_claim_agreement_tests {
             normal_continuation_absent: false,
             normal_result_count: None,
             locations: Vec::new(),
-            transfers: vec![transfer(CompiledSummaryInput::Parameter { ordinal: 0 })],
+            transfers: vec![transfer(CompiledSummaryInput::Parameter {
+                ordinal: 0,
+                path: None,
+            })],
             transfer_partitions: Vec::new(),
             effects: Vec::new(),
             concurrency_effects: Vec::new(),
@@ -2147,7 +2399,10 @@ mod procedure_claim_agreement_tests {
         right
             .concurrency_effects
             .push(CompiledConcurrencyEffect::TaskSpawn {
-                callable: CompiledSummaryInput::Parameter { ordinal: 0 },
+                callable: CompiledSummaryInput::Parameter {
+                    ordinal: 0,
+                    path: None,
+                },
                 group: None,
                 condition: None,
                 timer: None,
@@ -2196,7 +2451,7 @@ mod procedure_claim_agreement_tests {
         summary.target.parameter_count = 0;
         summary.ordinary_heap_unchanged = true;
         summary.no_concurrency_effects = true;
-        summary.transfers = vec![transfer(CompiledSummaryInput::Receiver {})];
+        summary.transfers = vec![transfer(CompiledSummaryInput::Receiver { path: None })];
         summary.transfers[0].value_transfer = Some(SummaryValueTransfer {
             kind: SummaryValueTransferKind::Conversion {
                 preservation: SummaryValuePreservation::Identity,
@@ -2204,6 +2459,39 @@ mod procedure_claim_agreement_tests {
             operation: SummaryValueTransferOperation::None {},
         });
         assert!(is_complete_receiver_identity_summary(&summary));
+        let mut member: crate::analyzer::semantic_model::MemberFact =
+            serde_json::from_value(serde_json::json!({
+                "id": "member.deref", "owner": "type.String", "name": "deref",
+                "member_kind": "method", "visibility": "public", "is_static": false,
+                "locator": {"kind": "artifact", "path": summary.target.path,
+                            "symbol": summary.target.symbol}
+            }))
+            .expect("test member");
+        // A declaration inventory and a complete summary are independent claims.
+        for inventory_complete in [false, true] {
+            member.callable_family_complete = inventory_complete;
+            for summary_complete in [false, true] {
+                let mut candidate = summary.clone();
+                candidate.completeness = if summary_complete {
+                    Completeness::Complete
+                } else {
+                    Completeness::Partial
+                };
+                assert_eq!(
+                    ReceiverAdjustment::from_selected(&member, &candidate).is_some(),
+                    inventory_complete && summary_complete,
+                    "inventory={inventory_complete}, summary={summary_complete}"
+                );
+                assert_eq!(
+                    candidate.completeness,
+                    if summary_complete {
+                        Completeness::Complete
+                    } else {
+                        Completeness::Partial
+                    }
+                );
+            }
+        }
         let mut changed = summary.clone();
         changed.transfers[0].value_transfer.as_mut().unwrap().kind =
             SummaryValueTransferKind::Conversion {
@@ -2217,7 +2505,10 @@ mod procedure_claim_agreement_tests {
         changed.transfers.push(changed.transfers[0].clone());
         assert!(!is_complete_receiver_identity_summary(&changed));
         let mut changed = summary.clone();
-        changed.transfers[0].input = CompiledSummaryInput::Parameter { ordinal: 0 };
+        changed.transfers[0].input = CompiledSummaryInput::Parameter {
+            ordinal: 0,
+            path: None,
+        };
         assert!(!is_complete_receiver_identity_summary(&changed));
         let mut changed = summary.clone();
         changed.transfers[0].exit_kind = CompiledSummaryExitKind::Exceptional;

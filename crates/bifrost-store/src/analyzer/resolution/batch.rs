@@ -2786,6 +2786,13 @@ pub struct HydratedCandidatePath {
     pub origin: CandidatePathOrigin,
 }
 
+/// A selected intrinsic candidate retains its lexical completion evidence.
+#[derive(Clone, Debug)]
+pub struct SelectedUniverseEntry {
+    pub entry: super::universe::UniverseEntry,
+    pub completion: ResolutionCompletion,
+}
+
 /// Batch read side for immutable resolution facts.
 ///
 /// A source is the closed-world authority for one exact selected context. Seed
@@ -2932,14 +2939,14 @@ pub trait BatchResolutionFragmentSource {
         Ok(None)
     }
 
-    /// A request-local language proof selected a universe entry after reducing
-    /// every relevant lexical cell. Unlike spelling lookup, this is unavailable
-    /// without that exact reference's completed scope certificate.
+    /// A request-local language selection retains a universe candidate and its
+    /// completion after reducing the relevant lexical cells. Unlike spelling
+    /// lookup, this requires the exact reference's published scope selection.
     fn selected_universe_entry(
         &self,
         _reference: SemanticId,
         _cancellation: &CancellationToken,
-    ) -> StoreResult<Option<super::universe::UniverseEntry>> {
+    ) -> StoreResult<Option<SelectedUniverseEntry>> {
         Ok(None)
     }
 
@@ -3607,7 +3614,7 @@ impl BatchResolutionFragmentSource for SelectedContextPathFragmentSource<'_> {
         &self,
         reference: SemanticId,
         cancellation: &CancellationToken,
-    ) -> StoreResult<Option<super::universe::UniverseEntry>> {
+    ) -> StoreResult<Option<SelectedUniverseEntry>> {
         self.base.selected_universe_entry(reference, cancellation)
     }
 
@@ -5380,7 +5387,7 @@ impl BatchResolutionFragmentSource for SelectedContextOverlayFragmentSource<'_> 
         &self,
         reference: SemanticId,
         cancellation: &CancellationToken,
-    ) -> StoreResult<Option<super::universe::UniverseEntry>> {
+    ) -> StoreResult<Option<SelectedUniverseEntry>> {
         self.base.selected_universe_entry(reference, cancellation)
     }
 
@@ -13306,16 +13313,18 @@ pub(super) fn selected_universe_binding(
     if !super::universe::requires_selected_scope(language) {
         return Ok(None);
     }
-    let Some(entry) = source.selected_universe_entry(reference, cancellation)? else {
+    let Some(selected) = source.selected_universe_entry(reference, cancellation)? else {
         return Ok(None);
     };
-    let Some(target) =
-        source.intern_shared_name_digest(super::universe::identity_digest(entry), cancellation)?
+    let Some(target) = source.intern_shared_name_digest(
+        super::universe::identity_digest(selected.entry),
+        cancellation,
+    )?
     else {
         return Ok(None);
     };
     Ok((!cancellation.is_cancelled())
-        .then(|| ResolutionAnswer::new(vec![target], Vec::new(), ResolutionCompletion::Complete)))
+        .then(|| ResolutionAnswer::new(vec![target], Vec::new(), selected.completion)))
 }
 
 #[cfg(test)]
@@ -13936,7 +13945,7 @@ mod tests {
             &self,
             _reference: SemanticId,
             _cancellation: &CancellationToken,
-        ) -> StoreResult<Option<super::super::universe::UniverseEntry>> {
+        ) -> StoreResult<Option<SelectedUniverseEntry>> {
             panic!("a non-opted-in request must not call the selected universe hook")
         }
 

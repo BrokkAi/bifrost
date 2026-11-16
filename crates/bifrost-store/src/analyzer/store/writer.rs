@@ -17,13 +17,6 @@ use super::{
 
 const WRITER_QUEUE_CAPACITY: usize = 64;
 
-/// How often a cancellable wait for the local writer connection retries it.
-const WRITER_LOCK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1);
-
-/// The phase a request publishes while it waits for the local writer.
-#[doc(hidden)]
-pub const WRITER_WAIT_PHASE: &str = "waiting for the analyzer store writer connection";
-
 /// How the writer actor thread spends its life.
 ///
 /// One actor owns the write connection for a cache path, so a saturated writer
@@ -119,41 +112,11 @@ thread_local! {
     static ON_ANALYZER_WRITER_THREAD: Cell<bool> = const { Cell::new(false) };
 }
 
-thread_local! {
-    static RETAINED_EXCLUSIVE_READERS: std::cell::RefCell<HashMap<usize, usize>> =
-        std::cell::RefCell::new(HashMap::new());
-}
-
-/// The current thread must not enter the same store writer while its file
-/// operation owns an exclusive reader, which holds that writer mutex.
-/// Pooled and shared readers do not register this exclusion.
-#[doc(hidden)]
-pub struct RetainedExclusiveReader {
-    writer: usize,
-    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
-}
-
-impl Drop for RetainedExclusiveReader {
-    fn drop(&mut self) {
-        RETAINED_EXCLUSIVE_READERS.with(|readers| {
-            let mut readers = readers.borrow_mut();
-            let count = readers
-                .get_mut(&self.writer)
-                .expect("retained reader registered");
-            *count -= 1;
-            if *count == 0 {
-                readers.remove(&self.writer);
-            }
-        });
-    }
-}
-
 /// The writable side of one analyzer store.
 ///
 /// Persistent stores share a process-local actor for their canonical cache
 /// path. Ephemeral stores retain a local mutex because their backing database
-/// is unique; the test-only single-connection store also routes reads through
-/// that mutex.
+/// is unique.
 #[doc(hidden)]
 pub enum StoreWriter {
     Local(Mutex<Connection>),
@@ -161,36 +124,6 @@ pub enum StoreWriter {
 }
 
 impl StoreWriter {
-    pub(super) fn reader_exclusion_identity(&self) -> usize {
-        match self {
-            Self::Local(conn) => conn as *const Mutex<Connection> as usize,
-            Self::Persistent(writer) => Arc::as_ptr(writer) as usize,
-        }
-    }
-
-    fn assert_no_retained_exclusive_reader(&self) {
-        debug_assert!(
-            RETAINED_EXCLUSIVE_READERS.with(|readers| {
-                !readers
-                    .borrow()
-                    .contains_key(&self.reader_exclusion_identity())
-            }),
-            "store writer acquired while this thread retains an exclusive reader"
-        );
-    }
-
-    #[doc(hidden)]
-    pub fn retain_exclusive_reader(&self) -> RetainedExclusiveReader {
-        let writer = self.reader_exclusion_identity();
-        RETAINED_EXCLUSIVE_READERS.with(|readers| {
-            *readers.borrow_mut().entry(writer).or_default() += 1;
-        });
-        RetainedExclusiveReader {
-            writer,
-            _thread: std::marker::PhantomData,
-        }
-    }
-
     pub(super) fn local(conn: Connection) -> Self {
         super::sealed_families::install(&conn);
         Self::Local(Mutex::new(conn))
@@ -248,7 +181,6 @@ impl StoreWriter {
             !brokk_bifrost_core::attribution::store_writes_forbidden(),
             "a certifying forward build may not dispatch store writes"
         );
-        self.assert_no_retained_exclusive_reader();
         match self {
             Self::Local(conn) => {
                 let mut conn = conn.lock().expect("analyzer store mutex poisoned");
@@ -278,7 +210,6 @@ impl StoreWriter {
         prepared: PreparedParsedBlob,
         counters: PreparedWriteCounters,
     ) -> Result<(), StoreError> {
-        self.assert_no_retained_exclusive_reader();
         match self {
             Self::Local(conn) => {
                 let mut conn = conn.lock().expect("analyzer store mutex poisoned");
@@ -293,48 +224,11 @@ impl StoreWriter {
     /// `execute`.
     #[doc(hidden)]
     pub fn lock(&self) -> LockResult<MutexGuard<'_, Connection>> {
-        self.assert_no_retained_exclusive_reader();
         match self {
             Self::Local(conn) => conn.lock(),
             Self::Persistent(_) => {
                 panic!("persistent analyzer connections are owned by the writer actor")
             }
-        }
-    }
-
-    /// [`Self::lock`] for a caller that holds a request's cancellation.
-    ///
-    /// `Mutex::lock` cannot be interrupted, so a request that waits there for
-    /// the test-only single-connection store's only connection stays parked
-    /// until the holder is done, whatever its own deadline says. Polling makes
-    /// the wait answerable to the caller's cancellation. `None` means it was
-    /// cancelled before the connection became free.
-    pub(super) fn lock_cancellable(
-        &self,
-        cancellation: &crate::CancellationToken,
-    ) -> Option<MutexGuard<'_, Connection>> {
-        self.assert_no_retained_exclusive_reader();
-        let Self::Local(conn) = self else {
-            panic!("persistent analyzer connections are owned by the writer actor")
-        };
-        // Entered on the first attempt that has to wait, and dropped on
-        // return, so the phase describes exactly the wait.
-        let mut phase = None;
-        loop {
-            match conn.try_lock() {
-                Ok(conn) => return Some(conn),
-                Err(std::sync::TryLockError::WouldBlock) => {}
-                Err(std::sync::TryLockError::Poisoned(_)) => {
-                    panic!("analyzer store mutex poisoned")
-                }
-            }
-            if cancellation.is_cancelled() {
-                return None;
-            }
-            if phase.is_none() {
-                phase = Some(cancellation.enter_phase(WRITER_WAIT_PHASE));
-            }
-            std::thread::sleep(WRITER_LOCK_POLL_INTERVAL);
         }
     }
 
@@ -1062,46 +956,6 @@ mod tests {
         assert!(writer.execute(|conn| {
             brokk_bifrost_core::cache_gc::planner_statistics_row_count(conn).unwrap() > 0
         }));
-    }
-
-    #[cfg(debug_assertions)]
-    fn writer_entry_panics(writer: &StoreWriter) -> bool {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| writer.execute(|_| ()))).is_err()
-    }
-
-    /// Exclusive-reader guards nest per writer and per thread: the writer
-    /// stays closed to this thread until the last guard for it drops, a guard
-    /// for one writer does not close another, and another thread is never
-    /// closed out.
-    #[cfg(debug_assertions)]
-    #[test]
-    fn exclusive_reader_guards_close_the_writer_until_the_last_one_drops() {
-        let writer = StoreWriter::local(rusqlite::Connection::open_in_memory().unwrap());
-        let other = StoreWriter::local(rusqlite::Connection::open_in_memory().unwrap());
-
-        let outer = writer.retain_exclusive_reader();
-        let inner = writer.retain_exclusive_reader();
-        assert!(writer_entry_panics(&writer));
-        assert_eq!(other.execute(|_| 7), 7);
-        std::thread::scope(|scope| {
-            scope
-                .spawn(|| assert_eq!(writer.execute(|_| 8), 8))
-                .join()
-                .unwrap();
-        });
-
-        drop(inner);
-        assert!(
-            writer_entry_panics(&writer),
-            "one remaining guard must still close the writer"
-        );
-        drop(outer);
-        assert_eq!(writer.execute(|_| 9), 9);
-
-        let again = writer.retain_exclusive_reader();
-        assert!(writer_entry_panics(&writer));
-        drop(again);
-        assert_eq!(writer.execute(|_| 10), 10);
     }
 
     /// Writer attribution separates time the actor spent running jobs from

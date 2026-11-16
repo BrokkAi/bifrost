@@ -18,7 +18,10 @@ pub use composition::SemanticModelCompositionDiagnostic;
 #[doc(hidden)]
 pub mod locations;
 mod row_entry_points;
+mod trait_owner_memo;
 use locations::SemanticModelLocations;
+#[doc(hidden)]
+pub use trait_owner_memo::ModeledTraitOwnersMemo;
 pub(crate) mod java_functional;
 #[doc(hidden)]
 pub mod java_hierarchy;
@@ -36,6 +39,7 @@ use crate::analyzer::semantic_model::HierarchyKind;
 use crate::analyzer::semantic_model::ImplicitOperation;
 use crate::analyzer::semantic_model::Locator;
 use crate::analyzer::semantic_model::MemberFact;
+use crate::analyzer::semantic_model::MemberKind;
 use crate::analyzer::semantic_model::ParameterPassingMode;
 use crate::analyzer::semantic_model::RelationFact;
 use crate::analyzer::semantic_model::ResolvedActiveSemanticModels;
@@ -83,40 +87,38 @@ pub enum RustReexportMissingEvidence {
     Cancelled,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RustReexportNamespace {
-    Value,
-    TypeOrModule,
-    Unknown,
+/// Why a generic inherent member cannot be selected independently of its
+/// receiver arguments. This evidence gate is shared with declaration selectors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RustInherentMemberArgumentRefusal {
+    MissingImplFacts,
 }
 
-impl RustReexportNamespace {
-    // RustOverlayCrates applies this same namespace rule across the crate boundary.
-    #[doc(hidden)]
-    pub fn accepts(self, kind: SemanticModelSymbolKind) -> bool {
-        match self {
-            Self::Value => rust_value_namespace(kind),
-            Self::TypeOrModule => kind.is_type_declaration(),
-            Self::Unknown => true,
-        }
-    }
+/// Require structural authority before selecting an inherent member on opaque
+/// arguments. Neither TypeFact nor MemberFact currently retains the declaring
+/// inherent impl's self type, generic binders and predicates. Their absence is
+/// not evidence of a blanket impl, even for a unique, complete member family.
+///
+/// A future producer-backed positive result must establish ALL matching impls
+/// are blanket, the defining crate is complete, and no trait or inherent
+/// candidate exists at any earlier autoref/autoderef step (including smart
+/// pointers). Keep that rule here for both receiver selection and generic declaration selectors;
+/// never substitute owner/member spelling or an empty erased inventory.
+pub fn rust_inherent_member_argument_independence(
+    _owner: &SemanticModelSymbol,
+    _member: &str,
+) -> Result<(), RustInherentMemberArgumentRefusal> {
+    Err(RustInherentMemberArgumentRefusal::MissingImplFacts)
 }
+
+/// Rust reexport routes share the overlay's namespace selection.
+pub type RustReexportNamespace = SemanticModelNamespace;
 
 #[derive(Debug)]
 pub enum RustReexportLookup {
     Absent,
     MissingEvidence(RustReexportMissingEvidence),
     Bound { symbol: Arc<SemanticModelSymbol> },
-}
-
-fn rust_value_namespace(kind: SemanticModelSymbolKind) -> bool {
-    matches!(
-        kind,
-        SemanticModelSymbolKind::Function
-            | SemanticModelSymbolKind::Constant
-            | SemanticModelSymbolKind::Static
-            | SemanticModelSymbolKind::Constructor
-    )
 }
 
 fn rust_reexport_target_path(edge: &RustExternalReexport, path: &str) -> Option<String> {
@@ -313,6 +315,7 @@ type DeclaredTypeNames = HashMap<
 
 #[derive(Debug)]
 pub struct SemanticModelOverlay {
+    identity: trait_owner_memo::OverlayIdentity,
     // Eager declaration shards also publish normalized rows. Keep their
     // existing active-set reader available to request-time forward queries.
     active_models: Option<Arc<ResolvedActiveSemanticModels>>,
@@ -477,19 +480,69 @@ struct ModelDeclarationRequest {
 
 impl RetainedBytes for ModelDeclarationRequest {
     fn retained_bytes(&self) -> usize {
+        use brokk_bifrost_core::allocation_size::allocation_size;
         std::mem::size_of::<Self>()
-            + self.active_model_set_hash.capacity()
-            + self.symbol.symbol_id.capacity()
-            + self.symbol.provider.pack_id.capacity()
-            + self.symbol.provider.pack_version.capacity()
-            + self.symbol.provider.pack_digest.capacity()
+            + allocation_size(self.active_model_set_hash.capacity())
+            + allocation_size(self.symbol.symbol_id.capacity())
+            + allocation_size(self.symbol.provider.pack_id.capacity())
+            + allocation_size(self.symbol.provider.pack_version.capacity())
+            + allocation_size(self.symbol.provider.pack_digest.capacity())
     }
 }
 
 struct ModelCacheValue<T>(T);
-impl<T: std::fmt::Debug> RetainedBytes for ModelCacheValue<T> {
+impl RetainedBytes for ModelCacheValue<Option<ModelOwnerAnswer>> {
     fn retained_bytes(&self) -> usize {
-        std::mem::size_of::<Self>() + format!("{:?}", self.0).len()
+        use crate::analyzer::store::cache_budget::RetainedHeap;
+        use crate::analyzer::store::semantic_composition::charge_symbol;
+        let mut heap = RetainedHeap::allocated();
+        heap.add(std::mem::size_of_val(self));
+        let symbol_ref = |reference: &ModelSymbolRef, heap: &mut RetainedHeap| {
+            for value in [
+                &reference.symbol_id,
+                &reference.provider.pack_id,
+                &reference.provider.pack_version,
+                &reference.provider.pack_digest,
+            ] {
+                heap.add_allocation(value.capacity());
+            }
+        };
+        match &self.0 {
+            Some(ModelOwnerAnswer::Declared(owner)) => {
+                symbol_ref(&owner.owner, &mut heap);
+                charge_symbol(&owner.declaration, &mut heap);
+                heap.vec(&owner.members);
+                for member in &owner.members {
+                    symbol_ref(&member.member, &mut heap);
+                    charge_symbol(&member.declaration, &mut heap);
+                }
+            }
+            Some(ModelOwnerAnswer::UnresolvedForward {
+                forward,
+                declaration,
+                ..
+            }) => {
+                symbol_ref(forward, &mut heap);
+                charge_symbol(declaration, &mut heap);
+            }
+            None => {}
+        }
+        heap.total()
+    }
+}
+impl RetainedBytes for ModelCacheValue<Option<Vec<Option<TypeRef>>>> {
+    fn retained_bytes(&self) -> usize {
+        use crate::analyzer::store::cache_budget::RetainedHeap;
+        let mut heap = RetainedHeap::allocated();
+        heap.add(std::mem::size_of_val(self));
+        if let Some(types) = &self.0 {
+            heap.vec(types);
+            crate::analyzer::store::semantic_composition::charge_type_refs(
+                types.iter().flatten().collect(),
+                &mut heap,
+            );
+        }
+        heap.total()
     }
 }
 
@@ -1189,6 +1242,7 @@ impl SemanticModelOverlay {
         // traverse a large analyzer to derive facts for an empty model set.
         if active.shards().is_empty() {
             return Ok(Self {
+                identity: trait_owner_memo::OverlayIdentity::new(),
                 active_models: Some(Arc::clone(active)),
                 rust_cargo_graph: rust_cargo_graph.cloned(),
                 rust_reexport_roots,
@@ -1450,6 +1504,7 @@ impl SemanticModelOverlay {
                 .push(index);
         }
         let mut overlay = Self {
+            identity: trait_owner_memo::OverlayIdentity::new(),
             active_models: Some(Arc::clone(active)),
             rust_cargo_graph: rust_cargo_graph.cloned(),
             rust_reexport_roots,
@@ -1736,6 +1791,24 @@ impl SemanticModelOverlay {
             composition::normalize_diagnostics(&mut diagnostics);
         }
         diagnostics
+    }
+
+    /// Whether activation selected declaration facts for this exact package coordinate.
+    pub fn package_active(&self, language: &str, ecosystem: &str, package: &str) -> bool {
+        self.active_models.as_ref().is_some_and(|active| {
+            active.shards.iter().any(|shard| {
+                // Only declarations establish this boundary (#2678). Preserve
+                // partial declaration admission pending the trust decision #11537.
+                shard.descriptor.payload_kind == super::PayloadKind::DeclarationFacts
+                    && std::iter::once(&shard.matched_evidence)
+                        .chain(&shard.matching_evidence)
+                        .any(|evidence| {
+                            evidence.language == language
+                                && evidence.ecosystem == ecosystem
+                                && evidence.package.as_ref().is_some_and(|p| p.name == package)
+                        })
+            })
+        })
     }
 
     pub fn active_model_set_hash(&self) -> &str {
@@ -2243,11 +2316,13 @@ impl SemanticModelOverlay {
         Self::reported(self.row_symbols_named(name))
     }
 
-    /// [`Self::symbols_named`] keeping only `language`'s records.
+    /// [`Self::symbols_named`] keeping only the selected language family and namespace.
+    /// Unknown includes every namespace; uniqueness is computed after selection.
     pub fn symbols_named_in_family(
         &self,
         name: &str,
         language: &str,
+        namespace: SemanticModelNamespace,
     ) -> SemanticModelOverlayMatch<SemanticModelSymbol> {
         let decoded = self.symbol_match(self.symbols_by_name.get(name));
         let matched = match &self.row_source {
@@ -2262,7 +2337,7 @@ impl SemanticModelOverlay {
             ),
             None => decoded,
         };
-        Self::reported(matched.for_family(language))
+        Self::reported(matched.for_family(language).in_namespace(namespace))
     }
 
     /// Keeps only the exact language's records after reading its family.
@@ -2271,8 +2346,69 @@ impl SemanticModelOverlay {
         name: &str,
         language: &str,
     ) -> SemanticModelOverlayMatch<SemanticModelSymbol> {
-        self.symbols_named_in_family(name, language)
+        self.symbols_named_in_family(name, language, SemanticModelNamespace::Unknown)
             .for_language(language)
+    }
+
+    /// The Python records named `name`, read as Python binds the name. A model
+    /// may declare a top-level class together with a module-level function of
+    /// the same qualified name that returns exactly that class (#12071). A
+    /// module attribute has one runtime binding, so the two records cannot
+    /// describe two objects: the class declaration says the name is bound to
+    /// the class, and the function can only describe calling it. That pair
+    /// answers as the class alone, whose construction applies `__new__`. A
+    /// factory that is a distinct object binds a different qualified name and
+    /// is unaffected. Every other conflict is returned unchanged.
+    pub fn python_symbols_named(
+        &self,
+        name: &str,
+    ) -> SemanticModelOverlayMatch<SemanticModelSymbol> {
+        let matched = self.symbols_named_for(name, "python");
+        if matched.disposition != SemanticModelOverlayDisposition::Conflict {
+            return matched;
+        }
+        let [first, second] = matched.records.as_slice() else {
+            return matched;
+        };
+        let (class, function) = match (first.kind, second.kind) {
+            (SemanticModelSymbolKind::Class, SemanticModelSymbolKind::Function) => (first, second),
+            (SemanticModelSymbolKind::Function, SemanticModelSymbolKind::Class) => (second, first),
+            _ => return matched,
+        };
+        let returns_class = match function.exact_return_classes.as_slice() {
+            [
+                TypeRef::Named {
+                    name,
+                    arguments,
+                    nullable: false,
+                },
+            ] => name == &class.qualified_name && arguments.is_empty(),
+            [
+                TypeRef::Declared {
+                    id,
+                    arguments,
+                    nullable: false,
+                },
+            ] => id == &class.id && arguments.is_empty(),
+            _ => false,
+        };
+        let one_binding = returns_class
+            && class.owner_id.is_none()
+            && function.owner_id.is_some()
+            && !function.has_receiver()
+            && function.qualified_name == class.qualified_name
+            && !class.provenance.ambiguous
+            && !function.provenance.ambiguous
+            && function.provenance.pack_id == class.provenance.pack_id
+            && function.provenance.pack_digest == class.provenance.pack_digest
+            && function.provenance.activation == class.provenance.activation;
+        if !one_binding {
+            return matched;
+        }
+        SemanticModelOverlayMatch {
+            records: vec![class.clone()],
+            disposition: SemanticModelOverlayDisposition::Unique,
+        }
     }
 
     /// Resolve one public Rustdoc cross-package route against the selected
@@ -3118,6 +3254,20 @@ impl SemanticModelOverlay {
             Some(rows) => Self::merge_symbol_answers(decoded, rows.symbols_at_authored_path(path)),
             None => decoded,
         })
+    }
+
+    /// Whether `touches` accepts any workspace path this overlay was authored
+    /// from, row-backed anchors included. The scan covers every authored path
+    /// and never stops at a count; when a row-backed read cannot be completed
+    /// it answers `true`, so the carry proof built on it fails closed.
+    pub fn any_authored_path(&self, mut touches: impl FnMut(&str) -> bool) -> bool {
+        self.symbols_by_authored_path
+            .keys()
+            .any(|path| touches(path))
+            || self
+                .row_source
+                .as_ref()
+                .is_some_and(|rows| rows.any_authored_path(&mut touches))
     }
 
     fn row_members_of(&self, owner_id: &str) -> SemanticModelOverlayMatch<SemanticModelSymbol> {
@@ -4257,6 +4407,63 @@ impl SemanticModelOverlay {
         })
     }
 
+    /// Declaration inventory only: E0592 forbids duplicate inherent names on a
+    /// non-type-parameterized Rust owner. This does not select a call target;
+    /// modeled_members must still check in-scope trait rivals before closing it.
+    fn callable_declaration_is_uncertified(
+        &self,
+        owner: &SemanticModelSymbol,
+        member: &SemanticModelSymbol,
+    ) -> bool {
+        if member.callable_family_complete {
+            return false;
+        }
+        let inherent_is_unique = || {
+            if member.language != "rust"
+                || !matches!(
+                    owner.kind,
+                    SemanticModelSymbolKind::Class
+                        | SemanticModelSymbolKind::Struct
+                        | SemanticModelSymbolKind::Enum
+                        | SemanticModelSymbolKind::Union
+                        | SemanticModelSymbolKind::TypeAlias
+                )
+                || member.owner_id.as_deref() != Some(owner.id.as_str())
+                // An authored partial pack can omit both generic parameters
+                // and implemented_trait. Rustdoc extraction enumerates these
+                // structural facts; serde defaults in arbitrary packs do not.
+                || !owner.provenance.extraction.as_ref().is_some_and(|extraction| {
+                    extraction.kind == crate::analyzer::semantic_model::ArtifactExtractionKind::RustdocJsonSet
+                        && member.provenance.extraction.as_ref() == Some(extraction)
+                })
+            {
+                return false;
+            }
+            let Some(active) = self.active_models.as_ref() else {
+                return false;
+            };
+            let Some(declaration) = owner_declaration(active, owner) else {
+                return false;
+            };
+            // rustdoc's generic_names includes type and const parameters but
+            // excludes lifetimes, so this also admits lifetime-only owners.
+            if !declaration.type_parameters.is_empty() {
+                return false;
+            }
+            let mut records = active.all_member_records_with_id(&member.id);
+            if records.open_for_language("rust").is_some() {
+                return false;
+            }
+            records.rows.any(|record| {
+                record.shard.manifest.semantic_sha256 == member.provenance.pack_digest
+                    && record.record.owner == owner.id
+                    && record.record.member_kind == MemberKind::Method
+                    && record.record.implemented_trait.is_none()
+            })
+        };
+        !inherent_is_unique()
+    }
+
     /// Classify collected candidates as one answer: unique, a shared binding
     /// layout, a conflict, or a typed incomplete reason.
     fn callable_match_for_candidates(
@@ -4313,13 +4520,14 @@ impl SemanticModelOverlay {
             && candidates
                 .iter()
                 .any(|candidate| candidate.provenance.ambiguous);
+        let uncertified = |candidate: &Arc<SemanticModelSymbol>| {
+            self.callable_declaration_is_uncertified(&owners[0], candidate)
+        };
         let candidate_model_is_partial = candidates.iter().any(|candidate| {
             candidate.provenance.completeness == SemanticModelCompleteness::Partial
-                && !candidate.callable_family_complete
+                && uncertified(candidate)
         });
-        let callable_family_is_complete = candidates
-            .iter()
-            .all(|candidate| candidate.callable_family_complete);
+        let callable_family_is_complete = !candidates.iter().any(uncertified);
         // Python's complete callable-shape evidence describes one exact
         // declaration. It can bind that declaration without claiming that
         // the partial pack enumerates its overload family.
@@ -4643,13 +4851,14 @@ impl SemanticModelOverlay {
             && candidates
                 .iter()
                 .any(|candidate| candidate.provenance.ambiguous);
+        let uncertified = |candidate: &Arc<SemanticModelSymbol>| {
+            self.callable_declaration_is_uncertified(&owners[0], candidate)
+        };
         let candidate_model_is_partial = candidates.iter().any(|candidate| {
             candidate.provenance.completeness == SemanticModelCompleteness::Partial
-                && !candidate.callable_family_complete
+                && uncertified(candidate)
         });
-        let callable_family_is_complete = candidates
-            .iter()
-            .all(|candidate| candidate.callable_family_complete);
+        let callable_family_is_complete = !candidates.iter().any(uncertified);
         // Python's complete callable-shape evidence describes one exact
         // declaration. It can bind that declaration without claiming that
         // the partial pack enumerates its overload family.
@@ -7502,7 +7711,8 @@ pub(crate) fn member_symbol(
             .filter(|signature| !signature.contains_unknown_types())
             .map(render_callable_shape),
         callable_shape_evidence_complete: member_callable_shape_evidence_complete(record),
-        callable_family_complete: record.callable_family_complete,
+        // Approximate activation cannot certify an exact callable family.
+        callable_family_complete: record.callable_family_complete && !shard.approximate,
         exact_return_classes: record.exact_return_classes.clone(),
         aliases: record.aliases.clone(),
         type_parameter_constraints: Vec::new(),
@@ -10524,4 +10734,66 @@ fn relation_retained_bytes(relation: &SemanticModelRelation) -> usize {
         .saturating_add(semantic_relation_source_key(relation).0.len())
         .saturating_add(semantic_relation_source_key(relation).3.len())
         .saturating_add(relation.provenance.retained_string_bytes())
+}
+
+#[cfg(test)]
+mod namespace_selection_tests {
+    use super::test_support::{class, overlay};
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#11594: uniqueness must be computed within the requested namespace")]
+    fn namespace_selection_preserves_same_namespace_conflicts_and_open_reads() {
+        let mut module = class("std.env", "rust");
+        module.kind = SemanticModelSymbolKind::Module;
+        let mut mac = module.clone();
+        mac.id = "env-macro".into();
+        mac.kind = SemanticModelSymbolKind::Macro;
+        mac.qualified_name = "core.env".into();
+        mac.aliases = vec!["std.env".into()];
+        let selected = overlay(vec![module.clone(), mac], vec![]);
+        assert_eq!(
+            selected
+                .symbols_named_in_family("std.env", "rust", SemanticModelNamespace::Unknown)
+                .disposition,
+            SemanticModelOverlayDisposition::Conflict
+        );
+        assert_eq!(
+            selected
+                .symbols_named_in_family("std.env", "rust", SemanticModelNamespace::TypeOrModule)
+                .unique()
+                .unwrap()
+                .id,
+            module.id
+        );
+        assert_eq!(
+            selected
+                .symbols_named_in_family("core.env", "rust", SemanticModelNamespace::Unknown)
+                .unique()
+                .unwrap()
+                .kind,
+            SemanticModelSymbolKind::Macro
+        );
+        let mut other = module.clone();
+        other.id = "second-module".into();
+        let conflict = overlay(vec![module, other], vec![]);
+        assert_eq!(
+            conflict
+                .symbols_named_in_family("std.env", "rust", SemanticModelNamespace::TypeOrModule)
+                .disposition,
+            SemanticModelOverlayDisposition::Conflict
+        );
+        let open = SemanticModelOverlayMatch::<SemanticModelSymbol> {
+            records: vec![],
+            disposition: SemanticModelOverlayDisposition::Open(
+                super::super::runtime::FamilyOpen::jvm_cancelled(),
+            ),
+        };
+        assert!(matches!(
+            open.in_namespace(SemanticModelNamespace::TypeOrModule)
+                .disposition,
+            SemanticModelOverlayDisposition::Open(_)
+        ));
+    }
 }

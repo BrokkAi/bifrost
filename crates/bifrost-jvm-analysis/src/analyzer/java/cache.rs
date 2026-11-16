@@ -48,6 +48,16 @@ pub(crate) struct JavaMemoCaches {
     /// byte-weighted with its read receipt.
     pub(crate) external_root_hierarchy_index:
         ReplayableQueryCache<(), ExternalRootHierarchyIndexOutcome>,
+    /// What each workspace type's written supertype names, per active model
+    /// set (#11517), with the reads of its resolution.
+    pub(crate) supertype_identities: crate::analyzer::jvm::hierarchy::DerivedMemo<
+        (
+            Option<brokk_bifrost_analysis::analyzer::semantic::StableDigest>,
+            CodeUnit,
+            String,
+        ),
+        Option<String>,
+    >,
     pub(crate) reverse_import_index: PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>,
     pub(crate) same_package_reference_index:
         PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>,
@@ -74,6 +84,7 @@ impl JavaMemoCaches {
             external_root_hierarchy_index: build_replayable_query_cache(
                 weight_external_root_hierarchy_index,
             ),
+            supertype_identities: crate::analyzer::jvm::hierarchy::derived_memo(budget_bytes / 16),
             reverse_import_index: PoolSafeMemo::new(),
             same_package_reference_index: PoolSafeMemo::new(),
         }

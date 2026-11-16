@@ -131,7 +131,7 @@ where
     let result = build_edge_output_with_completeness(files, keep_file, |file| {
         let visible_files =
             RubySemanticIndex::build_for_lookup(graph, ruby).visible_files_from(file)?;
-        let source = analyzer.project().read_source(file).ok()?;
+        let source = analyzer.indexed_source(file)?;
         if !analyzer.indexed_source_matches(file, &source) {
             return None;
         }
@@ -270,8 +270,10 @@ impl RubyQueryResolver<'_> {
             if language_for_file(file) != Language::Ruby {
                 continue;
             }
-            let Ok(source) = analyzer.project().read_source(file) else {
-                continue;
+            let Some(source) = analyzer.indexed_source(file) else {
+                return GraphUsageOutcome::TerminalFailure(
+                    brokk_bifrost_core::analyzer::usages::model::UsageAnalysisDiagnostic::indexed_source_unavailable(std::slice::from_ref(file)),
+                );
             };
             let Some(tree) = parse_ruby_tree(&source) else {
                 continue;

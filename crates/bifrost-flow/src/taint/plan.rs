@@ -5,8 +5,8 @@ use crate::analyzer::semantic::{
 };
 use crate::dataflow::UnmodeledCallBehavior;
 use crate::value_flow::{
-    ValueFlowCarrierId, ValueFlowEventKind, ValueFlowObservationPhase, ValueFlowPlan,
-    ValueFlowSinkId, ValueFlowSinkSpec, ValueFlowSourceId, ValueFlowSourceSpec,
+    ValueFlowCarrierId, ValueFlowCarrierKey, ValueFlowEventKind, ValueFlowObservationPhase,
+    ValueFlowPlan, ValueFlowSinkId, ValueFlowSinkSpec, ValueFlowSourceId, ValueFlowSourceSpec,
 };
 
 use super::{SourceEventKey, TaintClassSet, TaintEdgeFunction, TaintUniverse, TaintUniverseHash};
@@ -287,6 +287,160 @@ impl TaintLocalTransformBinding {
 
     pub const fn function(&self) -> &TaintEdgeFunction {
         &self.function
+    }
+}
+
+// Stable binding content is shared by exact batch comparison and policy-ID
+// hashing. Exhaustive destructures force new fields into that decision.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct StableSanitizerInput<'a> {
+    point: StableDigest,
+    phase: ValueFlowObservationPhase,
+    event_index: u32,
+    carrier: &'a ValueFlowCarrierKey,
+    output: &'a ValueFlowCarrierKey,
+    removed: &'a TaintClassSet,
+    proven: bool,
+    complete: bool,
+}
+
+impl TaintSanitizerBinding {
+    fn stable_input<'a>(&'a self, plan: &'a ValueFlowPlan) -> StableSanitizerInput<'a> {
+        let Self {
+            point,
+            phase,
+            event_index,
+            carrier,
+            output,
+            removed,
+            proven,
+            complete,
+        } = self;
+        StableSanitizerInput {
+            point: ValueFlowPlan::stable_program_point_digest(point),
+            phase: *phase,
+            event_index: *event_index,
+            carrier: plan
+                .carrier_key(*carrier)
+                .expect("bound carrier remains in the value-flow plan"),
+            output: plan
+                .carrier_key(*output)
+                .expect("bound carrier remains in the value-flow plan"),
+            removed,
+            proven: *proven,
+            complete: *complete,
+        }
+    }
+
+    /// Write the same canonical binding content used by batch compatibility.
+    #[doc(hidden)]
+    pub fn push_stable_identity(&self, plan: &ValueFlowPlan, digest: &mut LengthDelimitedDigest) {
+        self.stable_input(plan).push_stable_identity(digest);
+    }
+}
+
+impl StableSanitizerInput<'_> {
+    fn push_stable_identity(&self, digest: &mut LengthDelimitedDigest) {
+        let Self {
+            point,
+            phase,
+            event_index,
+            carrier,
+            output,
+            removed,
+            proven,
+            complete,
+        } = self;
+        digest.push(point.as_bytes());
+        digest.push(match phase {
+            ValueFlowObservationPhase::BeforeEffects => b"before_effects",
+            ValueFlowObservationPhase::AfterEffects => b"after_effects",
+        });
+        digest.push(&event_index.to_le_bytes());
+        carrier.push_stable_identity(digest);
+        output.push_stable_identity(digest);
+        removed.push_stable_identity(digest);
+        digest.push(&[u8::from(*proven), u8::from(*complete)]);
+    }
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct StableTransformInput<'a> {
+    point: StableDigest,
+    phase: ValueFlowObservationPhase,
+    event_index: u32,
+    carrier: &'a ValueFlowCarrierKey,
+    function: &'a TaintEdgeFunction,
+}
+
+impl TaintTransformBinding {
+    fn stable_input<'a>(&'a self, plan: &'a ValueFlowPlan) -> StableTransformInput<'a> {
+        let Self {
+            point,
+            phase,
+            event_index,
+            carrier,
+            function,
+        } = self;
+        StableTransformInput {
+            point: ValueFlowPlan::stable_program_point_digest(point),
+            phase: *phase,
+            event_index: *event_index,
+            carrier: plan
+                .carrier_key(*carrier)
+                .expect("bound carrier remains in the value-flow plan"),
+            function,
+        }
+    }
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct StableLocalTransformInput<'a> {
+    point: StableDigest,
+    input: &'a ValueFlowCarrierKey,
+    output: &'a ValueFlowCarrierKey,
+    function: &'a TaintEdgeFunction,
+}
+
+impl TaintLocalTransformBinding {
+    fn stable_input<'a>(&'a self, plan: &'a ValueFlowPlan) -> StableLocalTransformInput<'a> {
+        let Self {
+            point,
+            input,
+            output,
+            function,
+        } = self;
+        StableLocalTransformInput {
+            point: ValueFlowPlan::stable_program_point_digest(point),
+            input: plan
+                .carrier_key(*input)
+                .expect("bound carrier remains in the value-flow plan"),
+            output: plan
+                .carrier_key(*output)
+                .expect("bound carrier remains in the value-flow plan"),
+            function,
+        }
+    }
+
+    /// Write the same canonical binding content used by batch compatibility.
+    #[doc(hidden)]
+    pub fn push_stable_identity(&self, plan: &ValueFlowPlan, digest: &mut LengthDelimitedDigest) {
+        self.stable_input(plan).push_stable_identity(digest);
+    }
+}
+
+impl StableLocalTransformInput<'_> {
+    fn push_stable_identity(&self, digest: &mut LengthDelimitedDigest) {
+        let Self {
+            point,
+            input,
+            output,
+            function,
+        } = self;
+        digest.push(point.as_bytes());
+        input.push_stable_identity(digest);
+        output.push_stable_identity(digest);
+        function.push_stable_identity(digest);
     }
 }
 
@@ -587,6 +741,91 @@ fn compare_transfer_position(
 }
 
 impl TaintAnalysisPlan {
+    /// Compare actual inputs of a plan with those of its kill-free counterpart.
+    /// This is content correspondence, not admission of either executable or
+    /// evidence that either solve completed. Callers must establish both.
+    pub fn has_same_inputs_without_sanitizers(&self, other: &Self) -> bool {
+        if !self
+            .sanitizers
+            .iter()
+            .all(|kill| kill.is_proven() && kill.is_resolved())
+            || !other.sanitizers.is_empty()
+            || self.universe != other.universe
+            || self.sources.len() != other.sources.len()
+            || self.sinks != other.sinks
+            || self.value_type_barriers != other.value_type_barriers
+            || !same_stores(self, other)
+            || !same_transforms(self, other)
+            || !same_local_transforms(self, other)
+            || !self
+                .value_flow
+                .has_same_non_source_inputs(&other.value_flow)
+        {
+            return false;
+        }
+        // Source IDs are local to each executed plan. Match the unique active
+        // bindings through their event keys, then compare each plan's own input.
+        for binding in &self.sources {
+            let Ok(other_id) = remapped_source_id(self, &other.value_flow, binding.source) else {
+                return false;
+            };
+            let Some(other_binding) = other.source(other_id) else {
+                return false;
+            };
+            if binding.classes != other_binding.classes
+                || binding.origin != other_binding.origin
+                || !self.value_flow.has_same_source_input(
+                    binding.source,
+                    &other.value_flow,
+                    other_id,
+                )
+            {
+                return false;
+            }
+        }
+        // TaintClient skips an ordinary unbound observer before generating any
+        // fact, class or origin. With unchanged non-source inputs, a proven,
+        // complete observer without authority or activation is therefore passive;
+        // it need not be at a sanitizer's input point (a return is observed later).
+        // This proves semantic correspondence, not equal work: callbacks can be
+        // charged before that filter. Both actual executions must independently
+        // complete, as the caller requires. Common observers still compare fully,
+        // including activation lists by event key, never by local list IDs.
+        for (id, source) in self.value_flow.sources() {
+            if let Some((other_id, _)) = other
+                .value_flow
+                .sources()
+                .find(|(_, candidate)| candidate.key() == source.key())
+            {
+                if !self
+                    .value_flow
+                    .has_same_source_input(id, &other.value_flow, other_id)
+                {
+                    return false;
+                }
+            } else if self.sources.iter().any(|binding| binding.source == id)
+                || source.selected_entry().is_some()
+                || source.activation_triggers().is_some()
+                || !source.dispatch_obligations().is_empty()
+                || !matches!(
+                    source.proof(),
+                    crate::analyzer::semantic::ProofStatus::Proven
+                )
+                || !matches!(
+                    source.completeness(),
+                    crate::analyzer::semantic::EvidenceCompleteness::Complete
+                )
+            {
+                return false;
+            }
+        }
+        other.value_flow.sources().all(|(_, source)| {
+            self.value_flow
+                .sources()
+                .any(|(_, candidate)| candidate.key() == source.key())
+        })
+    }
+
     pub fn new(
         value_flow: ValueFlowPlan,
         universe: TaintUniverse,
@@ -943,7 +1182,9 @@ impl TaintAnalysisPlan {
         &self.sinks
     }
 
-    pub(crate) const fn sanitizers(&self) -> &[TaintSanitizerBinding] {
+    /// The actual immutable kill bindings retained by this executed plan.
+    #[doc(hidden)]
+    pub const fn sanitizers(&self) -> &[TaintSanitizerBinding] {
         &self.sanitizers
     }
 
@@ -998,6 +1239,66 @@ impl TaintAnalysisPlan {
         visit: impl FnMut(&crate::analyzer::semantic::SemanticArtifactKey),
     ) {
         self.value_flow.for_each_retained_artifact_key(visit);
+    }
+
+    /// Input-plan children only; its enclosing root pays inline storage.
+    #[doc(hidden)]
+    pub fn retained_heap(&self, heap: &mut crate::analyzer::store::cache_budget::RetainedHeap) {
+        use crate::analyzer::semantic::service::{
+            ArtifactRetentionVisitor, RetainedArtifactWalker,
+        };
+        self.value_flow.retained_heap(heap);
+        self.universe.retained_heap(heap);
+        heap.arc(&self.owner, |_, _| {});
+        heap.owned_slice(self.sources.as_ref());
+        heap.owned_slice(self.sinks.as_ref());
+        heap.owned_slice(self.sanitizers.as_ref());
+        heap.owned_slice(self.transforms.as_ref());
+        heap.owned_slice(self.local_transforms.as_ref());
+        heap.owned_slice(self.store_writes.as_ref());
+        heap.owned_slice(self.store_reads.as_ref());
+        heap.owned_slice(self.phase_transfers.as_ref());
+        heap.owned_slice(self.value_type_barriers.as_ref());
+        for (id, _) in &self.value_type_barriers {
+            heap.owned_slice(id.as_bytes());
+        }
+        for source in &self.sources {
+            source.classes.retained_heap(heap);
+        }
+        for sink in &self.sinks {
+            sink.accepted.retained_heap(heap);
+        }
+        for sanitizer in &self.sanitizers {
+            sanitizer.removed.retained_heap(heap);
+        }
+        for transform in &self.transforms {
+            transform.function.retained_heap(heap);
+        }
+        for transform in &self.local_transforms {
+            transform.function.retained_heap(heap);
+        }
+        for transfer in &self.phase_transfers {
+            transfer.function.retained_heap(heap);
+        }
+        self.identity.retained_heap(heap);
+        for channel in self
+            .store_writes
+            .iter()
+            .map(TaintStoreWriteBinding::channel)
+            .chain(self.store_reads.iter().map(TaintStoreReadBinding::channel))
+        {
+            heap.owned_slice(channel.store.as_bytes());
+            for dimension in [&channel.instance, &channel.key] {
+                if let TaintStoreDimension::ProvenSet(identities) = dimension {
+                    heap.owned_slice(identities.digests());
+                }
+            }
+        }
+        let mut census = RetainedArtifactWalker::new(heap);
+        for source in &self.sources {
+            census.locator(source.origin.value_flow_key().site());
+        }
+        census.finish();
     }
 
     pub(crate) fn retained_bytes(&self) -> usize {
@@ -1234,7 +1535,7 @@ fn compare_local_transforms(
         .then_with(|| left.function.cmp(&right.function))
 }
 
-const TAINT_PROPAGATION_SEMANTICS_DOMAIN: &[u8] = b"bifrost.taint.propagation-semantics.v1";
+const TAINT_PROPAGATION_SEMANTICS_DOMAIN: &[u8] = b"bifrost.taint.propagation-semantics.v2";
 
 /// The identity of every ingredient that decides propagation results for one
 /// solve: the workspace snapshot the plan was built from, the analysis root,
@@ -1258,16 +1559,16 @@ impl TaintPropagationSemanticsId {
     pub fn new(
         workspace_snapshot: &StableDigest,
         root: &SemanticLocator,
-        value_flow_propagation_hash: u64,
-        sanitizer_hash: u64,
-        store_hash: u64,
+        value_flow_propagation: &StableDigest,
+        auxiliary_semantics: &StableDigest,
+        store_semantics: &StableDigest,
     ) -> Self {
         let mut digest = LengthDelimitedDigest::new(TAINT_PROPAGATION_SEMANTICS_DOMAIN);
         digest.push(workspace_snapshot.as_bytes());
         root.push_stable_identity(&mut digest);
-        digest.push(&value_flow_propagation_hash.to_le_bytes());
-        digest.push(&sanitizer_hash.to_le_bytes());
-        digest.push(&store_hash.to_le_bytes());
+        digest.push(value_flow_propagation.as_bytes());
+        digest.push(auxiliary_semantics.as_bytes());
+        digest.push(store_semantics.as_bytes());
         Self(digest.finish())
     }
 
@@ -1390,6 +1691,35 @@ impl TaintPolicyProjection {
 }
 
 impl TaintBatch {
+    /// Children of one moved batch. The caller funds and visits its owning
+    /// Vec/Box once; inline Self belongs to that root allocation.
+    #[doc(hidden)]
+    pub fn retained_heap(&self, heap: &mut crate::analyzer::store::cache_budget::RetainedHeap) {
+        use crate::analyzer::semantic::service::{
+            ArtifactRetentionVisitor, RetainedArtifactWalker,
+        };
+        self.analysis.retained_heap(heap);
+        heap.owned_slice(self.projections.as_ref());
+        for projection in &self.projections {
+            heap.owned_slice(projection.policy_id.as_bytes());
+            heap.owned_slice(projection.sources.as_ref());
+            heap.owned_slice(projection.sinks.as_ref());
+            for source in &projection.sources {
+                source.classes.retained_heap(heap);
+            }
+            for sink in &projection.sinks {
+                sink.accepted.retained_heap(heap);
+            }
+        }
+        let mut census = RetainedArtifactWalker::new(heap);
+        for projection in &self.projections {
+            for source in &projection.sources {
+                census.locator(source.origin.value_flow_key().site());
+            }
+        }
+        census.finish();
+    }
+
     /// Derive the batch whose analysis has the given store-read seeds bound
     /// as taint sources. Seeding changes bindings, never propagation
     /// semantics, so the compatibility key and per-policy projections carry
@@ -1427,76 +1757,126 @@ impl TaintBatch {
 pub struct TaintBatchPlanner;
 
 impl TaintBatchPlanner {
+    /// Partition policies into batches that each share one propagation solve.
+    ///
+    /// Stable IDs carry no pointers, so plans from independent materializations
+    /// of the same input can share a compatibility key while holding different
+    /// executable owners (handles). Each such group is split into first-fit
+    /// subgroups, over policy IDs in ascending order, whose members have equal
+    /// executable owners. A batch never mixes owners.
     pub fn partition(policies: Vec<TaintPolicyPlan>) -> Result<Vec<TaintBatch>, TaintPlanError> {
         let mut groups: BTreeMap<TaintBatchCompatibilityKey, Vec<TaintPolicyPlan>> =
             BTreeMap::new();
         for policy in policies {
             groups.entry(policy.compatibility).or_default().push(policy);
         }
-        groups
-            .into_iter()
-            .map(|(compatibility, mut policies)| {
-                policies.sort_by(|left, right| left.policy_id.cmp(&right.policy_id));
-                if policies
-                    .windows(2)
-                    .any(|pair| pair[0].policy_id == pair[1].policy_id)
-                {
-                    return Err(TaintPlanError::DuplicatePolicyId);
+        let mut batches = Vec::new();
+        for (compatibility, mut policies) in groups {
+            policies.sort_by(|left, right| left.policy_id.cmp(&right.policy_id));
+            if policies
+                .windows(2)
+                .any(|pair| pair[0].policy_id == pair[1].policy_id)
+            {
+                return Err(TaintPlanError::DuplicatePolicyId);
+            }
+            let first = policies.first().ok_or(TaintPlanError::EmptyBatch)?;
+            for policy in policies.iter().skip(1) {
+                ensure_same_stable_semantics(&first.analysis, &policy.analysis)?;
+            }
+            let mut owner_groups: Vec<Vec<&TaintPolicyPlan>> = Vec::new();
+            for policy in &policies {
+                let policy_flow = policy.analysis.value_flow();
+                let owner_group = owner_groups.iter().position(|group| {
+                    group[0]
+                        .analysis
+                        .value_flow()
+                        .has_same_executable_owners(policy_flow)
+                });
+                match owner_group {
+                    Some(index) => owner_groups[index].push(policy),
+                    None => owner_groups.push(vec![policy]),
                 }
-                let first = policies.first().ok_or(TaintPlanError::EmptyBatch)?;
-                for policy in policies.iter().skip(1) {
-                    ensure_same_semantics(&first.analysis, &policy.analysis)?;
-                }
-                let value_flow = ValueFlowPlan::union_observations(
-                    &policies
+            }
+            for group in &owner_groups {
+                let indices = ValueFlowPlan::partition_observation_compatibility(
+                    &group
                         .iter()
                         .map(|policy| policy.analysis.value_flow())
                         .collect::<Vec<_>>(),
-                )
-                .map_err(|_| TaintPlanError::IncompatibleBatchMember)?;
-                let projections = policies
-                    .iter()
-                    .map(|policy| {
-                        Ok(TaintPolicyProjection {
-                            policy_id: policy.policy_id.clone(),
-                            sources: remap_sources(&policy.analysis, &value_flow)?
-                                .into_boxed_slice(),
-                            sinks: remap_sinks(&policy.analysis, &value_flow)?.into_boxed_slice(),
-                        })
-                    })
-                    .collect::<Result<Vec<_>, TaintPlanError>>()?
-                    .into_boxed_slice();
-                let mut sources = Vec::new();
-                let mut sinks = Vec::new();
-                for projection in &projections {
-                    merge_sources(&mut sources, &projection.sources)?;
-                    merge_sinks(&mut sinks, &projection.sinks)?;
+                );
+                for subgroup in indices {
+                    let policies = subgroup
+                        .iter()
+                        .map(|&index| group[index])
+                        .collect::<Vec<_>>();
+                    batches.push(build_batch(compatibility, &policies)?);
                 }
-                let analysis = TaintAnalysisPlan::new(
-                    value_flow.clone(),
-                    first.analysis.universe.clone(),
-                    sources,
-                    sinks,
-                    remap_sanitizers(&first.analysis, &value_flow)?,
-                    remap_transforms(&first.analysis, &value_flow)?,
-                )?
-                .with_local_transforms(remap_local_transforms(&first.analysis, &value_flow)?)?
-                .with_value_type_barriers(first.analysis.value_type_barriers.to_vec())
-                .with_stores(
-                    remap_store_writes(&first.analysis, &value_flow)?,
-                    remap_store_reads(&first.analysis, &value_flow)?,
-                )?;
-                Ok(TaintBatch {
-                    compatibility,
-                    projections,
-                    analysis,
-                })
-            })
-            .collect()
+            }
+        }
+        Ok(batches)
     }
 }
 
-fn ensure_same_semantics(
+/// Build one batch from policies that share a coarse group and executable
+/// owners, so every owner-bound comparison below is between like handles.
+fn build_batch(
+    compatibility: TaintBatchCompatibilityKey,
+    policies: &[&TaintPolicyPlan],
+) -> Result<TaintBatch, TaintPlanError> {
+    let first = policies.first().ok_or(TaintPlanError::EmptyBatch)?;
+    for policy in policies.iter().skip(1) {
+        ensure_same_bound_semantics(&first.analysis, &policy.analysis)?;
+    }
+    let value_flow = ValueFlowPlan::union_observations(
+        &policies
+            .iter()
+            .map(|policy| policy.analysis.value_flow())
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|_| TaintPlanError::IncompatibleBatchMember)?;
+    let projections = policies
+        .iter()
+        .map(|policy| {
+            Ok(TaintPolicyProjection {
+                policy_id: policy.policy_id.clone(),
+                sources: remap_sources(&policy.analysis, &value_flow)?.into_boxed_slice(),
+                sinks: remap_sinks(&policy.analysis, &value_flow)?.into_boxed_slice(),
+            })
+        })
+        .collect::<Result<Vec<_>, TaintPlanError>>()?
+        .into_boxed_slice();
+    let mut sources = Vec::new();
+    let mut sinks = Vec::new();
+    for projection in &projections {
+        merge_sources(&mut sources, &projection.sources)?;
+        merge_sinks(&mut sinks, &projection.sinks)?;
+    }
+    let analysis = TaintAnalysisPlan::new(
+        value_flow.clone(),
+        first.analysis.universe.clone(),
+        sources,
+        sinks,
+        remap_sanitizers(&first.analysis, &value_flow)?,
+        remap_transforms(&first.analysis, &value_flow)?,
+    )?
+    .with_local_transforms(remap_local_transforms(&first.analysis, &value_flow)?)?
+    .with_value_type_barriers(first.analysis.value_type_barriers.to_vec())
+    .with_stores(
+        remap_store_writes(&first.analysis, &value_flow)?,
+        remap_store_reads(&first.analysis, &value_flow)?,
+    )?;
+    Ok(TaintBatch {
+        compatibility,
+        projections,
+        analysis,
+    })
+}
+
+/// Comparisons that use only stable keys and values. They hold across
+/// executable owners, so the planner applies them to a whole coarse group
+/// before splitting it: a stable mismatch is an error, never a reason to
+/// split.
+fn ensure_same_stable_semantics(
     left: &TaintAnalysisPlan,
     right: &TaintAnalysisPlan,
 ) -> Result<(), TaintPlanError> {
@@ -1505,10 +1885,24 @@ fn ensure_same_semantics(
         || !left
             .value_flow
             .has_same_propagation_semantics(&right.value_flow)
-        || !same_sanitizers(left, right)
+        || !same_stores(left, right)
+        || !same_stable_bindings(left, right)
+    {
+        return Err(TaintPlanError::IncompatibleBatchMember);
+    }
+    Ok(())
+}
+
+/// Comparisons that include program-point handles, which are equal only
+/// within one executable owner. Call these only for plans whose value flows
+/// have the same executable owners; across owners they would always fail.
+fn ensure_same_bound_semantics(
+    left: &TaintAnalysisPlan,
+    right: &TaintAnalysisPlan,
+) -> Result<(), TaintPlanError> {
+    if !same_sanitizers(left, right)
         || !same_transforms(left, right)
         || !same_local_transforms(left, right)
-        || !same_stores(left, right)
     {
         return Err(TaintPlanError::IncompatibleBatchMember);
     }
@@ -1766,6 +2160,43 @@ fn same_stores(left: &TaintAnalysisPlan, right: &TaintAnalysisPlan) -> bool {
             })
 }
 
+fn sorted_inputs<T: Ord>(inputs: impl Iterator<Item = T>) -> Vec<T> {
+    let mut inputs = inputs.collect::<Vec<_>>();
+    inputs.sort_unstable();
+    inputs
+}
+
+fn same_stable_bindings(left: &TaintAnalysisPlan, right: &TaintAnalysisPlan) -> bool {
+    sorted_inputs(
+        left.sanitizers
+            .iter()
+            .map(|binding| binding.stable_input(&left.value_flow)),
+    ) == sorted_inputs(
+        right
+            .sanitizers
+            .iter()
+            .map(|binding| binding.stable_input(&right.value_flow)),
+    ) && sorted_inputs(
+        left.transforms
+            .iter()
+            .map(|binding| binding.stable_input(&left.value_flow)),
+    ) == sorted_inputs(
+        right
+            .transforms
+            .iter()
+            .map(|binding| binding.stable_input(&right.value_flow)),
+    ) && sorted_inputs(
+        left.local_transforms
+            .iter()
+            .map(|binding| binding.stable_input(&left.value_flow)),
+    ) == sorted_inputs(
+        right
+            .local_transforms
+            .iter()
+            .map(|binding| binding.stable_input(&right.value_flow)),
+    )
+}
+
 fn same_transforms(left: &TaintAnalysisPlan, right: &TaintAnalysisPlan) -> bool {
     left.transforms.len() == right.transforms.len()
         && left
@@ -1899,6 +2330,200 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#9925: a shared later-read witness masked an ordinary parameter source's positive")]
+    fn source_qualified_origins_survive_actual_batch_member_order() {
+        use super::super::{
+            IcfgTaintSession, SourceClassId, TaintAttributionBudget, TaintFindingCollectionLimits,
+        };
+        use crate::analyzer::semantic::{
+            CancellationToken, ProcedurePortHandle, SemanticBudget, SemanticRequest,
+            ValueFlowEndpoint,
+        };
+        use crate::analyzer::{AnalyzerConfig, Language};
+        use crate::dataflow::{
+            DataflowRequest, SolverBudget, WitnessReconstructionLimits, WitnessRetentionLimits,
+        };
+        use crate::inline_project::InlineTestProject;
+        use crate::value_flow::{
+            ClosureLimits, ValueFlowCarrier, ValueFlowEventKey, discover_closure,
+        };
+
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file("lib.rs", "fn sink(_: u8) {} pub fn ordinary_supported(supported_source: u8) { sink(supported_source); }")
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let cancellation = CancellationToken::default();
+        let mut semantic = SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &project.file("lib.rs"),
+                &mut SemanticRequest::new(&mut semantic, &cancellation),
+            )
+            .unwrap()
+            .available_value()
+            .cloned()
+            .unwrap();
+        let procedure = artifact
+            .procedures()
+            .iter()
+            .find(|p| {
+                p.locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|s| s.name())
+                    == Some("ordinary_supported")
+            })
+            .unwrap();
+        let root = artifact.procedure_handle(procedure.id()).unwrap();
+        let closure = discover_closure(
+            &workspace,
+            &root,
+            ClosureLimits { max_procedures: 32 },
+            &mut semantic,
+            &cancellation,
+        )
+        .unwrap();
+        assert!(!closure.truncated);
+        let call = &root.semantics().call_sites()[0];
+        let argument = root.value_handle(call.arguments[0].value).unwrap();
+        let read_point = closure
+            .snapshots
+            .iter()
+            .find(|s| s.value().procedure() == &root)
+            .unwrap()
+            .value()
+            .relations()
+            .iter()
+            .find(|r| r.target == ValueFlowEndpoint::Value(argument.clone()))
+            .unwrap()
+            .point()
+            .clone();
+        let entry = root.point_handle(root.semantics().entry_point()).unwrap();
+        let sink_point = root.point_handle(call.point).unwrap();
+        let universe = TaintUniverse::new(vec![SourceClassId::new("remote").unwrap()]).unwrap();
+        let classes = universe.class_set(universe.classes()).unwrap();
+        let make = |id: &str, later: bool| {
+            let parameter =
+                ValueFlowCarrier::Port(ProcedurePortHandle::parameter(root.clone(), 0).unwrap());
+            let mut sources = (0..4)
+                .map(|ordinal| {
+                    ValueFlowSourceSpec::at_point(&entry, ordinal, parameter.clone()).unwrap()
+                })
+                .collect::<Vec<_>>();
+            if later {
+                sources.push(ValueFlowSourceSpec::new(
+                    ValueFlowEventKey::at_point(&read_point, 5, ValueFlowEventKind::Source)
+                        .unwrap(),
+                    read_point.clone(),
+                    ValueFlowObservationPhase::AfterEffects,
+                    ValueFlowCarrier::for_value(argument.clone()),
+                    crate::analyzer::semantic::ProofStatus::Proven,
+                    crate::analyzer::semantic::EvidenceCompleteness::Complete,
+                ));
+            }
+            let flow = ValueFlowPlan::with_call_behavior(
+                root.clone(),
+                closure.snapshots.clone(),
+                closure.bindings.clone(),
+                sources,
+                vec![
+                    ValueFlowSinkSpec::at_point(
+                        &sink_point,
+                        0,
+                        ValueFlowCarrier::for_value(argument.clone()),
+                    )
+                    .unwrap(),
+                ],
+                UnmodeledCallBehavior::default(),
+            )
+            .unwrap();
+            let sources = flow
+                .sources()
+                .map(|(id, spec)| {
+                    TaintSourceBinding::new(
+                        id,
+                        classes.clone(),
+                        SourceEventKey::new(spec.key().clone()),
+                    )
+                })
+                .collect();
+            let sinks = flow
+                .sinks()
+                .map(|(id, _)| TaintSinkBinding::new(id, classes.clone()))
+                .collect();
+            let key = TaintBatchCompatibilityKey::new(
+                TaintPropagationSemanticsId::new(
+                    &root.artifact().key().fingerprint(),
+                    root.semantics().locator(),
+                    &flow.propagation_semantics_digest(),
+                    &StableDigest::from_array([0; 32]),
+                    &StableDigest::from_array([0; 32]),
+                ),
+                universe.hash(),
+            );
+            TaintPolicyPlan::new(
+                id,
+                key,
+                TaintAnalysisPlan::new(flow, universe.clone(), sources, sinks, vec![], vec![])
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        let policies = [
+            make("test.ordinary-supported-binder#root-0", false),
+            make("test.poem-union-role-first#root-4", true),
+            make("test.poem-union-role-last#root-4", true),
+        ];
+        for order in [[0, 1, 2], [2, 1, 0]] {
+            let members = order.map(|i| &policies[i]);
+            let batch = build_batch(policies[0].compatibility, &members).unwrap();
+            let plan = batch.analysis();
+            let mut solver = SolverBudget::default();
+            let mut attribution = TaintAttributionBudget::new(100000, 100000);
+            let session = IcfgTaintSession::discover(
+                plan.value_flow().root(),
+                &workspace.icfg_provider(),
+                plan,
+                WitnessRetentionLimits::new(1).unwrap(),
+                &mut SemanticBudget::default(),
+                &mut DataflowRequest::new(&mut solver, &cancellation),
+                64,
+                WitnessReconstructionLimits::default(),
+                TaintFindingCollectionLimits::new(128, 128, 10000, 10000, 16 * 1024 * 1024)
+                    .unwrap(),
+                &mut attribution,
+            )
+            .unwrap();
+            let outcome = session
+                .attribute_sources(
+                    plan,
+                    &mut DataflowRequest::new(&mut solver, &cancellation),
+                    &mut attribution,
+                )
+                .unwrap();
+            assert_eq!(outcome.source_coverage, None);
+            assert!(outcome.report.is_complete());
+            for projection in batch.projections() {
+                for source in projection.sources() {
+                    assert!(
+                        outcome
+                            .report
+                            .findings()
+                            .iter()
+                            .flat_map(|f| f.origins().evidence())
+                            .any(|e| e.origin() == source.origin() && e.has_certain_path()),
+                        "missing qualified origin {:?} in {:?}",
+                        source.origin(),
+                        outcome.report
+                    );
+                }
+            }
+            assert_eq!(outcome.report.attribution_work(), attribution.work());
+        }
+    }
+
+    #[test]
     #[hardwon(
         "536858984119: replaced Debug-formatted identity with stable length-delimited hashing; this test catches cache-key churn from rendering changes."
     )]
@@ -1914,12 +2539,19 @@ mod tests {
         let mut expected = LengthDelimitedDigest::new(TAINT_PROPAGATION_SEMANTICS_DOMAIN);
         expected.push(snapshot(1).as_bytes());
         root.push_stable_identity(&mut expected);
-        expected.push(&7_u64.to_le_bytes());
-        expected.push(&9_u64.to_le_bytes());
-        expected.push(&11_u64.to_le_bytes());
+        expected.push(StableDigest::from_array([7; 32]).as_bytes());
+        expected.push(StableDigest::from_array([9; 32]).as_bytes());
+        expected.push(StableDigest::from_array([11; 32]).as_bytes());
 
         assert_eq!(
-            TaintPropagationSemanticsId::new(&snapshot(1), &root, 7, 9, 11).as_bytes(),
+            TaintPropagationSemanticsId::new(
+                &snapshot(1),
+                &root,
+                &StableDigest::from_array([7; 32]),
+                &StableDigest::from_array([9; 32]),
+                &StableDigest::from_array([11; 32]),
+            )
+            .as_bytes(),
             expected.finish().as_bytes()
         );
     }

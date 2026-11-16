@@ -63,7 +63,10 @@ impl<K: Eq + Hash, V: Clone> RequestContextMemo<K, V> {
             return Ok(Some(value.clone()));
         }
         let value = derive()?;
-        if let Some(value) = value.as_ref().filter(|_| !cancellation.is_cancelled()) {
+        if let Some(value) = value
+            .as_ref()
+            .filter(|_| !cancellation.is_cancelled() && !cancellation.soft_deadline_passed())
+        {
             self.entries.borrow_mut().insert(key, value.clone());
         }
         Ok(value)
@@ -325,6 +328,11 @@ struct RegisteredContextCells {
 }
 
 impl<K: Eq + Hash> ContextRegistrationMemo<K> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn is_empty(&self) -> bool {
+        self.providers.is_empty()
+    }
+
     pub(super) fn register(
         &mut self,
         key: K,
@@ -361,5 +369,47 @@ impl<K: Eq + Hash> ContextRegistrationMemo<K> {
         registered.boundaries.extend(boundaries);
         registered.gaps.extend(gaps);
         Ok(outcome)
+    }
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon(
+        "#11234: Go context admission retained a completed value after cancellation at its fill boundary"
+    )]
+    fn interrupted_context_fill_is_returned_but_not_retained() {
+        for deadline in [false, true] {
+            let memo = RequestContextMemo::<u8, usize>::default();
+            let cancellation = if deadline {
+                CancellationToken::new().with_soft_deadline(std::time::Instant::now())
+            } else {
+                CancellationToken::new()
+            };
+            let value = memo
+                .prepare(0, &cancellation, || {
+                    if !deadline {
+                        cancellation.cancel();
+                    }
+                    Ok(Some(37))
+                })
+                .unwrap();
+            assert_eq!(value, Some(37));
+            assert!(memo.is_empty());
+            let value = memo
+                .prepare(0, &CancellationToken::new(), || Ok(Some(41)))
+                .unwrap();
+            assert_eq!(value, Some(41));
+            assert_eq!(
+                memo.prepare(0, &CancellationToken::new(), || panic!(
+                    "complete fill must hit"
+                ))
+                .unwrap(),
+                Some(41)
+            );
+        }
     }
 }

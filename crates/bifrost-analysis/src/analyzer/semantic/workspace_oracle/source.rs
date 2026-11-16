@@ -200,9 +200,52 @@ impl<'a> PreparedSourceDispatchSession<'a> {
             return Ok(quality.publish(None, work));
         };
 
+        // Base source indexes cannot see alternate-only operand calls. Select
+        // each body before projecting executable rows, retaining the owner's
+        // full receipt through its workspace boundary on both fill and hit.
+        let mut procedures = Vec::new();
+        for base in artifact.procedures() {
+            let base = artifact
+                .procedure_handle(base.id())
+                .expect("indexed procedure exists");
+
+            match self
+                .oracle
+                .workspace
+                .selected_procedure_handle(&base, request)?
+            {
+                SemanticOutcome::Complete {
+                    value:
+                        crate::analyzer::semantic::service::SelectedProcedureHandle {
+                            handle: procedure,
+                            ..
+                        },
+                    ..
+                } => procedures.push(procedure),
+                SemanticOutcome::Cancelled { .. } => {
+                    return Ok(SemanticOutcome::Cancelled {
+                        partial: None,
+                        work,
+                    });
+                }
+                SemanticOutcome::ExceededBudget { .. } => {
+                    return Ok(SemanticOutcome::ExceededBudget {
+                        partial: None,
+                        exceeded: request
+                            .budget
+                            .first_refusal()
+                            .expect("selection budget stop records its refusal")
+                            .exceeded,
+                        work,
+                    });
+                }
+                _ => unreachable!("selection outcome"),
+            }
+        }
         let mut staged = WorkStager::new(request);
         let projection = source_call_sites(
             &artifact,
+            &procedures,
             range,
             self.oracle.limits.source_observations(),
             &mut staged,
@@ -248,6 +291,18 @@ impl<'a> PreparedSourceDispatchSession<'a> {
         let mut any_result_truncated = false;
         let call_count = calls.len();
         for (index, call) in calls.into_iter().enumerate() {
+            // Procedure selection may move this call into the canonical
+            // guarded arena. Prepare dispatch against that exact allocation.
+            if !self
+                .calls
+                .as_ref()
+                .is_some_and(|session| Arc::ptr_eq(&session.artifact, call.procedure().artifact()))
+            {
+                self.calls = Some(
+                    self.oracle
+                        .prepare_call_dispatch_session(Arc::clone(call.procedure().artifact())),
+                );
+            }
             let outcome = self
                 .calls
                 .as_mut()
@@ -296,6 +351,8 @@ impl<'a> PreparedSourceDispatchSession<'a> {
     }
 }
 
+type SelectedPatternSourceEntries = Box<[Arc<super::SelectedPatternObservation>]>;
+
 impl<'a> WorkspaceSemanticOracle<'a> {
     /// Open a source dispatch session without reading or parsing source.
     #[doc(hidden)]
@@ -339,7 +396,7 @@ impl<'a> WorkspaceSemanticOracle<'a> {
             materialization_complete,
             mut quality,
             mut work,
-        } = match self.observe_source(file, range, request)? {
+        } = match self.observe_ownership_source(file, range, request)? {
             SourceObservation::Observed(observed) => observed,
             SourceObservation::BodylessParameter { work } => {
                 return Ok(SemanticOutcome::Complete {
@@ -455,6 +512,151 @@ impl<'a> WorkspaceSemanticOracle<'a> {
         })
     }
 
+    /// Observe selected field-pattern sources through their existing guarded
+    /// binding points. This opt-in source query leaves ordinary source lookup,
+    /// procedure snapshots and every stored gap unchanged. `None` means no
+    /// selected field source was admitted; the caller can use ordinary lookup.
+    pub fn selected_pattern_source_observations(
+        &self,
+        file: &ProjectFile,
+        field: std::ops::Range<usize>,
+        request: &mut SemanticRequest<'_>,
+        on_stop: &mut impl FnMut(&crate::analyzer::QueryReadIncomplete),
+    ) -> Result<Option<SemanticOutcome<Box<[ValueAtPoint]>>>, SemanticProviderError> {
+        Ok(self
+            .selected_pattern_source_entries(file, field, request, on_stop)?
+            .map(|outcome| {
+                outcome.map(|entries| {
+                    entries
+                        .iter()
+                        .map(|entry| entry.observation().clone())
+                        .collect()
+                })
+            }))
+    }
+
+    /// Admission proofs with the original materialization quality retained.
+    /// Only shared discovery may turn one proof into a certified source entry;
+    /// an available partial proof does not itself waive any procedure gap.
+    pub fn selected_pattern_source_entries(
+        &self,
+        file: &ProjectFile,
+        field: std::ops::Range<usize>,
+        request: &mut SemanticRequest<'_>,
+        on_stop: &mut impl FnMut(&crate::analyzer::QueryReadIncomplete),
+    ) -> Result<Option<SemanticOutcome<SelectedPatternSourceEntries>>, SemanticProviderError> {
+        let materialized = self
+            .workspace
+            .materialize_program_semantics(file, request)?;
+        let mut work = materialized.work();
+        let mut quality = SourceOutcomeQuality::from_outcome(&materialized);
+        let Some(artifact) = materialized.available_value() else {
+            return Ok(Some(materialized.map(|_| Box::default())));
+        };
+        let mut observations = Vec::new();
+        let mut undecided = false;
+        for procedure in artifact.procedures() {
+            let handle = artifact
+                .procedure_handle(procedure.id())
+                .expect("artifact procedure has a handle");
+            for candidate in procedure.guarded_pattern_projections() {
+                if request.cancellation.is_cancelled() {
+                    return Ok(Some(SemanticOutcome::Cancelled {
+                        partial: None,
+                        work,
+                    }));
+                }
+                let scan = SemanticWork {
+                    nested_entries: 1,
+                    ..SemanticWork::default()
+                };
+                request.budget.charge_work(scan);
+                work = work.conservative_add(scan);
+                let binder = procedure
+                    .source_mapping(candidate.binder_source)
+                    .expect("validated candidate has a binder source")
+                    .locator
+                    .anchor()
+                    .span();
+                let root = procedure
+                    .source_mapping(candidate.pattern_source)
+                    .expect("validated candidate has a root pattern source")
+                    .locator
+                    .anchor()
+                    .span();
+                if field.start > binder.start_byte() as usize
+                    || (binder.end_byte() as usize) > field.end
+                    || (root.start_byte() as usize) > field.start
+                    || field.end > root.end_byte() as usize
+                {
+                    continue;
+                }
+                let Some(selected) = self.selected_pattern_source_at(
+                    &handle,
+                    candidate.ordinal,
+                    field.clone(),
+                    request,
+                )?
+                else {
+                    return Ok(Some(SemanticOutcome::Cancelled {
+                        partial: None,
+                        work,
+                    }));
+                };
+                // Even a rejected proof may have observed a typed read failure.
+                // Preserve all actual reasons without changing its value verdict.
+                if !selected.receipt.incomplete_reasons().is_empty() {
+                    selected.replay_reads(self.workspace);
+                    for reason in selected.receipt.incomplete_reasons() {
+                        on_stop(reason);
+                    }
+                }
+                match &selected.binding {
+                    crate::analyzer::languages::SelectedTupleBinding::Rejected { .. } => {
+                        // Rejection of declaration-backed field admission is
+                        // not rejection of an ordinary matched-value source.
+                        // Preserve ordinary lookup for the entire selection,
+                        // including any other observations it may enumerate.
+                        return Ok(None);
+                    }
+                    crate::analyzer::languages::SelectedTupleBinding::Unavailable(_) => {
+                        undecided = true;
+                        continue;
+                    }
+                    crate::analyzer::languages::SelectedTupleBinding::Admitted(_)
+                    | crate::analyzer::languages::SelectedTupleBinding::Observed(_) => {}
+                }
+                let selected = selected
+                    .into_binding_observation()
+                    .expect("admitted field has a binding observation");
+                selected.replay_reads(self.workspace);
+                if observations.len() == self.limits.source_observations() {
+                    quality.absorb(SourceOutcomeQuality::Unproven);
+                    return Ok(Some(
+                        quality.publish(Some(observations.into_boxed_slice()), work),
+                    ));
+                }
+                observations.push(Arc::new(selected));
+            }
+        }
+        if observations.is_empty() {
+            return Ok(if undecided {
+                Some(SemanticOutcome::Unknown {
+                    partial: None,
+                    work,
+                })
+            } else {
+                None
+            });
+        }
+        if undecided {
+            quality.absorb(SourceOutcomeQuality::Unproven);
+        }
+        Ok(Some(
+            quality.publish(Some(observations.into_boxed_slice()), work),
+        ))
+    }
+
     /// Materialize `file` and project the value observations at `range`,
     /// the step [`Self::pointees_at_source`] and
     /// [`Self::value_observations_at_source`] share.
@@ -463,6 +665,54 @@ impl<'a> WorkspaceSemanticOracle<'a> {
         file: &ProjectFile,
         range: Range,
         request: &mut SemanticRequest<'_>,
+    ) -> Result<SourceObservation, SemanticProviderError> {
+        self.observe_source_with_procedures(file, range, request, |base, request| {
+            self.workspace.selected_procedure_handle(base, request)
+        })
+    }
+
+    fn observe_ownership_source(
+        &self,
+        file: &ProjectFile,
+        range: Range,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SourceObservation, SemanticProviderError> {
+        self.observe_source_with_procedures(file, range, request, |base, request| {
+            let span = base.semantics().locator().anchor().span();
+            if span.start_byte() as usize <= range.start_byte
+                && range.end_byte <= span.end_byte() as usize
+            {
+                self.workspace
+                    .ownership_procedure_handle(base, request)
+                    .map(|outcome| match outcome {
+                        SemanticOutcome::Unknown { work, .. } => SemanticOutcome::Unknown {
+                            partial: Some(crate::analyzer::semantic::service::SelectedProcedureHandle {
+                                handle: base.clone(),
+                                side: crate::analyzer::semantic::service::CandidateProcedureSide::Base,
+                                refusals: Vec::new(),
+                            }),
+                            work,
+                        },
+                        outcome => outcome,
+                    })
+            } else {
+                self.workspace.selected_procedure_handle(base, request)
+            }
+        })
+    }
+
+    fn observe_source_with_procedures(
+        &self,
+        file: &ProjectFile,
+        range: Range,
+        request: &mut SemanticRequest<'_>,
+        mut select: impl FnMut(
+            &crate::analyzer::semantic::ProcedureHandle,
+            &mut SemanticRequest<'_>,
+        ) -> Result<
+            SemanticOutcome<crate::analyzer::semantic::service::SelectedProcedureHandle>,
+            SemanticProviderError,
+        >,
     ) -> Result<SourceObservation, SemanticProviderError> {
         if request.cancellation.is_cancelled() {
             return Ok(SourceObservation::Settled(SemanticOutcome::Cancelled {
@@ -482,7 +732,7 @@ impl<'a> WorkspaceSemanticOracle<'a> {
             return Ok(SourceObservation::BodylessParameter { work });
         }
 
-        let quality = SourceOutcomeQuality::from_outcome(&materialized);
+        let mut quality = SourceOutcomeQuality::from_outcome(&materialized);
         let Some(artifact) = materialized.available_value().cloned() else {
             return Ok(SourceObservation::Settled(source_outcome_without_value(
                 materialized,
@@ -498,9 +748,40 @@ impl<'a> WorkspaceSemanticOracle<'a> {
         let projection_range = self
             .rust_literal_const_read_range(file, range)
             .unwrap_or(range);
+        let mut procedures = Vec::with_capacity(artifact.procedures().len());
+        for procedure in artifact.procedures() {
+            let base = artifact
+                .procedure_handle(procedure.id())
+                .expect("enumerated procedure");
+            let selected = select(&base, request)?;
+            match selected {
+                SemanticOutcome::Complete {
+                    value:
+                        crate::analyzer::semantic::service::SelectedProcedureHandle {
+                            handle, side, ..
+                        },
+                    ..
+                } => procedures.push(match side {
+                    crate::analyzer::semantic::service::CandidateProcedureSide::Base => base,
+                    crate::analyzer::semantic::service::CandidateProcedureSide::Alternate => handle,
+                }),
+                SemanticOutcome::Unknown {
+                    partial: Some(selected),
+                    ..
+                } => {
+                    quality.absorb(SourceOutcomeQuality::Unknown);
+                    procedures.push(selected.handle);
+                }
+                outcome => {
+                    return Ok(SourceObservation::Settled(source_outcome_without_value(
+                        outcome,
+                    )));
+                }
+            }
+        }
         let mut staged = WorkStager::new(request);
         let projection = source_value_observations(
-            &artifact,
+            procedures,
             projection_range,
             self.limits.source_observations(),
             &mut staged,
@@ -913,6 +1194,7 @@ pub fn procedure_dispatch_boundary_digest(boundary: &DispatchBoundary) -> Stable
             digest.push(&target.arity().to_le_bytes());
             digest.push(&[u8::from(target.has_receiver())]);
             digest.push(&[u8::from(target.has_resolver_owned_call_shape())]);
+            digest.push(&[u8::from(target.implicit_receiver)]);
             push_optional_bytes(
                 &mut digest,
                 target.normalized_static_owner().map(str::as_bytes),

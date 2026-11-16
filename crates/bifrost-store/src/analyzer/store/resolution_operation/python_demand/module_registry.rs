@@ -72,7 +72,9 @@ impl PythonRules<'_, '_, '_> {
              FROM python_unit_summary_imports imported
              JOIN resolution_unit_summary_members source
                ON source.summary_id=imported.summary_id AND source.member_ordinal=imported.member_ordinal
-             WHERE imported.summary_id=?1 AND source.blob_id=?2 AND source.rel_path=?3 AND imported.import_site=?4",
+ JOIN temp.selected_unit_member_mounts source_selected ON source_selected.summary_id=source.summary_id AND source_selected.member_ordinal=source.member_ordinal
+ JOIN temp.surface_dense imported_site ON imported_site.blob_id=source_selected.blob_id AND imported_site.id_space=1 AND imported_site.surface_ordinal=imported.import_surface_ordinal
+             WHERE imported.summary_id=?1 AND source_selected.blob_id=?2 AND source.rel_path=?3 AND imported_site.dense_id=?4",
         )?.query_map(rusqlite::params![self.summary,mount.blob_id(),mount.persisted_relative_path(),site], |row|
             Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -684,9 +686,10 @@ impl PythonRules<'_, '_, '_> {
                AND child.root_slot=parent.root_slot AND child.module_name=parent.module_name || '.' || ?3
              JOIN resolution_unit_summary_members member
                ON member.summary_id=child.summary_id AND member.member_ordinal=child.member_ordinal
+ JOIN temp.selected_unit_member_mounts member_selected ON member_selected.summary_id=member.summary_id AND member_selected.member_ordinal=member.member_ordinal
              WHERE parent.summary_id=?1 AND parent.container_path=?2 AND parent.kind IN ('package','namespace')
                AND child.state IN ('selected','alternative')
-               AND EXISTS(SELECT 1 FROM python_module_registry_writes writes WHERE writes.blob_id=member.blob_id)",
+               AND EXISTS(SELECT 1 FROM python_module_registry_writes writes WHERE writes.blob_id=member_selected.blob_id)",
         )?.query_map(rusqlite::params![self.summary,container,name], |row| row.get::<_,String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         self.module_registry
@@ -965,7 +968,8 @@ pub(in crate::analyzer::store::resolution_operation) fn deferred_registry_obliga
     let count: u64 = ready.inventory.connection().prepare_cached("WITH RECURSIVE execution(blob_id,reference,scope) AS (
            SELECT writes.blob_id,writes.registry_reference,observed.execution_scope
            FROM python_module_registry_writes writes
-           JOIN resolution_unit_summary_members member ON member.blob_id=writes.blob_id
+           JOIN temp.selected_unit_member_paths member_selected ON member_selected.mount_blob_id=writes.blob_id
+ JOIN resolution_unit_summary_members member ON member.summary_id=member_selected.summary_id AND member.member_ordinal=member_selected.member_ordinal
            JOIN resolution_binding_observations observed ON observed.blob_id=writes.blob_id AND observed.reference=writes.registry_reference
            WHERE member.summary_id=?1 AND writes.top_level=0
            UNION

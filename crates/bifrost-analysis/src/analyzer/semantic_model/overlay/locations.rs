@@ -60,6 +60,15 @@ pub struct SourceAnchorView<'a> {
 }
 
 impl SourceAnchorView<'_> {
+    /// Every authored path of the activation and request anchors.
+    pub fn authored_paths(&self) -> impl Iterator<Item = &str> {
+        self.activation.authored_paths().chain(
+            self.request
+                .iter()
+                .flat_map(|request| request.authored_paths()),
+        )
+    }
+
     pub fn ids_at_path(&self, path: &str) -> Vec<String> {
         let mut ids = self.activation.ids_at_path(path);
         if let Some(request) = &self.request {

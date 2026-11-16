@@ -196,7 +196,7 @@ func active(input *item) int {
             .expect("an open value-flow snapshot remains available");
         assert_eq!(snapshot.coverage(), CandidateCoverage::Open);
         assert!(
-            !snapshot.gap_is_discharged(exceptional_gap.id),
+            !snapshot.gap_is_discharged(crate::analyzer::semantic::GapKey::Gap(exceptional_gap.id)),
             "the new completion marker remains an explicit value-flow boundary: {outcome:#?}"
         );
     }
@@ -359,9 +359,8 @@ func arrayCopy() int {
                 "{name}"
             );
             assert!(
-                literal_gaps
-                    .iter()
-                    .all(|gap| literal_snapshot.gap_is_discharged(*gap)),
+                literal_gaps.iter().all(|gap| literal_snapshot
+                    .gap_is_discharged(crate::analyzer::semantic::GapKey::Gap(*gap))),
                 "{name}"
             );
         }
@@ -375,9 +374,8 @@ func arrayCopy() int {
             .available_value()
             .unwrap_or_else(|| panic!("directCallStore must retain relations: {direct_call:#?}"));
         assert!(
-            direct_call_index_gaps
-                .iter()
-                .all(|gap| direct_call_snapshot.gap_is_discharged(*gap)),
+            direct_call_index_gaps.iter().all(|gap| direct_call_snapshot
+                .gap_is_discharged(crate::analyzer::semantic::GapKey::Gap(*gap))),
             "directCallStore: {direct_call:#?}"
         );
         for (gap, capability, discharge, point, subject, detail) in direct_call_gaps {
@@ -387,7 +385,7 @@ func arrayCopy() int {
                     | SemanticGapDischarge::NonRejoiningExceptionalExit
             );
             assert_eq!(
-                direct_call_snapshot.gap_is_discharged(gap),
+                direct_call_snapshot.gap_is_discharged(crate::analyzer::semantic::GapKey::Gap(gap)),
                 must_be_discharged,
                 "directCallStore {capability:?} gap {gap:?} at {point:?} subject={subject:?} detail={detail}"
             );
@@ -404,7 +402,8 @@ func arrayCopy() int {
             assert!(
                 index_gaps
                     .iter()
-                    .all(|gap| !snapshot.gap_is_discharged(*gap)),
+                    .all(|gap| !snapshot
+                        .gap_is_discharged(crate::analyzer::semantic::GapKey::Gap(*gap))),
                 "{name}: {outcome:#?}"
             );
         }
@@ -438,10 +437,12 @@ func arrayCopy() int {
             }),
             "the proven transfer positive survives unrelated open index coverage: {array_copy:#?}"
         );
-        assert!(snapshot.gap_is_discharged(*first_store));
-        assert!(snapshot.gap_is_discharged(*first_overwrite));
+        assert!(snapshot.gap_is_discharged(crate::analyzer::semantic::GapKey::Gap(*first_store)));
         assert!(
-            !snapshot.gap_is_discharged(*copied_load),
+            snapshot.gap_is_discharged(crate::analyzer::semantic::GapKey::Gap(*first_overwrite))
+        );
+        assert!(
+            !snapshot.gap_is_discharged(crate::analyzer::semantic::GapKey::Gap(*copied_load)),
             "the copied array has no proven element-store identity: {array_copy:#?}"
         );
     }

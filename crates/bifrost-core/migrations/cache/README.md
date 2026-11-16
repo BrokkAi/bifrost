@@ -11,6 +11,25 @@ Migration SQL must contain only schema and data changes, terminate statements
 with semicolons, and omit transaction control and connection PRAGMAs. All
 pending entries run in one transaction.
 
+After merging the latest `origin/master` into a branch that adds a migration,
+including the last merge before marking it ready, run `node
+scripts/public/check-migration-landing-order.mjs --base origin/master --head
+HEAD`. A run after the pull request lands sees its migration in the base and
+proves nothing. Before publishing a batch, merge agents must run the
+check through `mm-db run` with mm-db's `base_sha` and the candidate head, and
+keep the receipt. On exit 1, renumber the offending migration to the base's
+highest version plus one, updating its file, `POST_BASELINE_MIGRATIONS`, and
+other references such as `current-schema.sql` when applicable; record the
+renumber in the batch notes. On exit 2, do not publish the batch. If an error
+is found after landing, never renumber or delete the landed migration; add a
+new higher migration that repeats the skipped migration's whole effect safely
+on stores that already applied it: its DDL guarded by schema checks or `IF NOT
+EXISTS`, and for data it changed, clearing the affected cache rows so they are
+rebuilt, never re-applying a transformation. The `verify_upgraded_store`
+function in `src/cache_db.rs` checks only that an upgraded store's schema
+matches; confirm a data repair separately, for example with an upgrade test
+that reads the affected rows.
+
 Regenerate and verify the baseline and forward chain with:
 
 ```console
@@ -391,3 +410,115 @@ is required; unknown placement is included and refusal is unavailable evidence.
 Migration `0311-rust-unit-summary-context-lookups.sql` adds crate-name and
 module/scope import-route indexes for the summary-backed context readers
 (#11173). Compatible: indexes only, with no row or answer changes.
+Migration `0314-candidate-macro-semantic-ir.sql` adds isolated candidate-macro
+alternative IR and partial-flow rows. Their typed columns mirror the ordinary
+semantic IR tables; candidate call IDs name the alternate call table. The
+ordinary decoder does not enumerate these relations. Every alternative belongs
+to the base semantic-IR publication through cascading foreign keys, including
+procedure-owned rows whose parent in turn belongs to that publication. No
+existing publication or base row is rewritten.
+
+Migration `0338-cleanup-chains.sql` adds procedure-local immutable cleanup
+nodes, ordered action and owner entries, and segment anchors, including candidate
+macro mirrors. SQL row IDs are distinct from dense procedure-local arena IDs;
+NULL chain references denote the empty sentinel. Node/ordinal uniqueness and
+nonnegative ordinals are checked in SQL; publication and hydration validate
+complete dense arenas, parent ordering and ancestor stops. Actions reuse the
+existing typed-place, destructor-resolution, source/evidence and reason codecs.
+
+The M1 cleanup relations include canonical projections and ordered projection
+members in both ordinary and candidate-macro mirrors. Owners retain typed places
+and optional complete invalidation targets. Anchors retain four direct-row
+ordering offsets and an optional projection. Action incompleteness retains its
+own evidence independently of action evidence.
+
+Migration `0369-policy-evaluation-selection-reads.sql` adds
+`policy_evaluation_reads`, the membership of the selection-authority reads an
+aggregate policy evaluation consumed (#11482). Rows reference the same
+`policy_read_keys` interning that policy units use, and cascade with their
+evaluation. Compatible: one new table and index, with no existing row rewritten.
+Rows written before it carry no reads and are retired by the policy substrate
+epoch, which is part of every evaluation key.
+
+Migration `0402-policy-unit-operands.sql` is compatible. It rebuilds
+`policy_units` without changing existing unit IDs, keys, JSONB products or
+referencing child rows. Only a seedless `operand` partition carries the new
+question digest; the uniqueness key includes it and legacy partitions keep its
+empty default. The existing Prefix product stores the typed operand output;
+output-bound continuation Prefix keys retain final Rows products. Operand keys
+require Prefix products, and Prefix products require Prefix or Operand keys.
+Versioned store filenames exclude mixed-version writers. Existing policy key bytes
+and root-cut bindings are unchanged. The same-root 08e4 master-warm/head-cold
+control matches all three ordinary retained products and complete work objects
+after preserving legacy inventory charges and ownership rules. No policy
+substrate token is needed.
+
+Migration `0404-evaluation-selection-tree-part.sql` records what an aggregate
+policy evaluation's selection reads were taken over (#11607). It adds
+`policy_evaluations.selection_export_tree` (the tree id of the revision export
+the analyzer was built over, NULL for a live worktree),
+`policy_evaluation_reads.basis_platform_override` (non-NULL when the read was
+recorded with the tree part of a JVM dependency selection) and
+`policy_evaluation_read_coordinates`, one row per declared coordinate with its
+scope and declaring target, which cascades with its read. Compatible: two
+nullable columns and one new table, with no existing row rewritten. Rows
+written before it have no view, so they are treated as taken over a live
+worktree, and no read carries a tree part.
+
+Migration `0409-cleanup-owner-gap-subject.sql` extends ordinary and candidate gap
+rows with subject tag 8 and nullable cleanup segment head/stop natural-key references.
+Shared arena validation checks ancestry on hydration.
+
+Migration `0410-candidate-macro-records.sql` (#11251) rebuilds
+`candidate_macro_semantic_ir_candidates` as source-anchored candidate records:
+`anchor_start`/`anchor_end` (a lookup index inside one blob's artifact; digests,
+receipts and read keys never use offsets), `base_call` (the base call the
+invocation replaces; an invocation nested in an opaque candidate's operands names
+the nearest enclosing base candidate call), `realization` (`call`, `intrinsic` or
+`lexical_no_items_introduced`) and `alternate_call`, which is set exactly for
+`call` (CHECK). Rows only, no blob. Breaking: old rows hold only an alternate
+call and cannot supply an anchor or base call, so the table is rebuilt empty. An
+old reader would read intrinsic rows as calls, so compatibility rests on the IR
+schema and rows versions that move with this migration: the producer epoch of an
+older publication no longer matches, its head is not valid, and the blob is
+republished.
+
+Migration `0411-store-publication-lineage.sql` preserves installed allocator
+identity while making the nonce nullable for reusable empty templates. Store
+constructors mint once before returning publication authority. Versioned imports
+from a still-live source mint a distinct destination namespace in their private
+staging transaction.
+The generator also writes `publication-lineage-nonce-guard.sql`, the identical
+nonce guard restored before any imported destination is published.
+
+Migration `0418-python-member-any-writes.sql` is COMPATIBLE: index-only, so older
+readers are unaffected and SQLite maintains it for rows an older daemon writes.
+It advances the current revision without changing the minimum compatible revision.
+0418 is provisional until the final pre-Ready merge.
+
+Migration 0419 replaces seven derived certificate version columns with raw
+32-byte lever identities, withdrawing derived rows before changing their types.
+
+Migration `0447-rust-macro-type-candidates.sql` is breaking: older readers do not
+enforce selected macro identity and all-element agreement. It stores only
+source-local candidate slots and path segments, separately from certified
+structural type productions.
+
+The 0447 candidate header also records lexical import interference as a checked
+Boolean source fact. Named imports, unclosed globs and attributed imports block
+standard-macro fallback certification at the invocation.
+Migration `0420-rust-drop-inventory-read-keys.sql` adds typed Drop inventory
+questions to both general read ledgers. The five scalar columns are present
+only for rust_drop_inventory lookups. It also widens both semantic IR gap
+CHECKs for ImplicitDropExecution. Existing rows and IDs survive the rebuilds.
+The new discharge arm is reader-breaking: older row decoders reject it.
+Version-suffixed store files and the transactional user_version check exclude
+older readers without raising the oldest importable cache version.
+
+Migration `0421-rust-async-body-execution.sql` widens the semantic IR
+vocabularies for deferred-body construction and activation, memory
+interference, and the DataDependency discharge code. It rebuilds the affected
+IR tables while preserving every retained row and ID. The new tags are
+reader-breaking: older row decoders reject them, and the version-suffixed
+store files and user_version check fence those readers without raising the
+oldest importable cache version.

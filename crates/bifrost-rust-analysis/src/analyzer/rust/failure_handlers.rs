@@ -1,5 +1,8 @@
 //! Rust-native failure-handler shapes for the empty failure-handler policy.
 
+use brokk_bifrost_analysis::analyzer::reuse_verdict::{
+    CarriesReuseVerdict, ExecutionCause, ReuseVerdict,
+};
 use brokk_bifrost_analysis::analyzer::structural::failure_handlers::HandlerBodyGap;
 
 use brokk_bifrost_analysis::analyzer::structural::failure_handlers::HandlerBodyShape;
@@ -37,9 +40,18 @@ use crate::analyzer::rust::std_types::{
 #[derive(Debug, Default)]
 pub struct RustFailureIdentities {
     proofs: HashMap<usize, HandlerIdentityProof>,
+    /// Execution dependent when a proof stopped for this run's limits.
+    reuse: ReuseVerdict,
+}
+
+impl CarriesReuseVerdict for RustFailureIdentities {
+    fn reuse_verdict(&self) -> ReuseVerdict {
+        self.reuse
+    }
 }
 
 /// Prove the identity of every native failure-branch constructor in `file`.
+/// The table carries the reuse verdict of its proofs.
 ///
 /// The walk visits the whole file, including nested callables, so it covers
 /// every constructor that [`rust_failure_handler_body_shapes`] selects for
@@ -65,7 +77,8 @@ pub fn rust_failure_handler_identities(
         return RustFailureIdentities::default();
     }
     let analyzer = workspace.analyzer();
-    let prover = completed_proof(None, || {
+    let mut reuse = ReuseVerdict::Content;
+    let prover = completed_proof(analyzer, None, || {
         RustResultVariantProver::new(analyzer, file, syntax.source())
     });
     let prover = match prover {
@@ -73,6 +86,7 @@ pub fn rust_failure_handler_identities(
         RustProofAttempt::Incomplete { .. } => {
             // Every constructor's proof would stop the same way.
             analyzer.mark_execution_dependent();
+            reuse = ReuseVerdict::ExecutionDependent(ExecutionCause::Other);
             None
         }
     };
@@ -81,9 +95,12 @@ pub fn rust_failure_handler_identities(
         .map(|(constructor, variant)| {
             let identity = match &prover {
                 Some(prover) => {
-                    let proof = completed_proof(None, || prover.variant(constructor.byte_range()));
+                    let proof = completed_proof(analyzer, None, || {
+                        prover.variant(constructor.byte_range())
+                    });
                     if matches!(&proof, RustProofAttempt::Incomplete { .. }) {
                         analyzer.mark_execution_dependent();
+                        reuse.join_in(ReuseVerdict::ExecutionDependent(ExecutionCause::Other));
                     }
                     if proof.into_value() == Some(variant) {
                         HandlerIdentityProof::Exact
@@ -96,7 +113,7 @@ pub fn rust_failure_handler_identities(
             (constructor.start_byte(), identity)
         })
         .collect();
-    RustFailureIdentities { proofs }
+    RustFailureIdentities { proofs, reuse }
 }
 
 /// Find Rust's native failure branches inside one callable.

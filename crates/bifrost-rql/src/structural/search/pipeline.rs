@@ -12,7 +12,11 @@ use crate::query::{
     QueryRowPredicateOperand,
 };
 
-fn capture_anchor_matches(fact_match: &FactMatch, capture: &str) -> Vec<FactMatch> {
+pub(super) fn capture_anchor_matches(
+    fact_match: &FactMatch,
+    facts: &FileFacts,
+    capture: &str,
+) -> Vec<FactMatch> {
     let mut seen = HashSet::default();
     fact_match
         .captures
@@ -29,6 +33,9 @@ fn capture_anchor_matches(fact_match: &FactMatch, capture: &str) -> Vec<FactMatc
                 return None;
             }
             let mut anchored = fact_match.clone();
+            if anchored.effective_range(facts) != range {
+                anchored.selected_pattern_source = Default::default();
+            }
             anchored.reported_range = Some(range);
             Some(anchored)
         })
@@ -167,6 +174,10 @@ impl PythonFactDiagnostics {
         let diagnostic = super::QueryExecutionState::diagnostic(
             analyzer,
             CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                 incompleteness,
                 related: Vec::new(),
                 source: Some(source),
@@ -385,6 +396,10 @@ fn possible_family_match_diagnostic(
         unreachable!("a possible family identity is a resolved qualified locator")
     };
     CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        has_non_utf8_refusal: false,
+        refusal_sites: Default::default(),
+        call_relation_facts: None,
+        uses_omissions: Vec::new(),
         incompleteness: Incompleteness::Content,
         related: Vec::new(),
         source: None,
@@ -434,6 +449,18 @@ fn resolved_call_receiver_is_resolved(receiver: &ResolvedCallReceiverType) -> bo
             resolved_identities,
         } => root.effective_identity().is_some() && !resolved_identities.is_empty(),
     }
+}
+
+/// Whether the call binds exactly, with exhaustive coverage, to a unique
+/// target whose identity differs from the one the filter selects: a proven
+/// non-match rather than an unresolved candidate.
+fn resolved_call_proven_different(value: &CallBindingValue, filter: &ResolvedCallFilter) -> bool {
+    filter.resolves_to.effective_identity().is_some()
+        && !resolved_call_identity_matches(value, &filter.resolves_to)
+        && value.site.selector.exact
+        && value.site.semantic_target_id.is_some()
+        && value.site.report.coverage
+            == crate::analyzer::usages::call_binding::CallBindingCoverage::Exhaustive
 }
 
 fn resolved_call_filter_matches(value: &CallBindingValue, filter: &ResolvedCallFilter) -> bool {
@@ -521,6 +548,10 @@ fn formal_annotation_undecided_diagnostic(
     let report = &value.site.report;
     let path = rel_path_string(&report.file);
     CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        has_non_utf8_refusal: false,
+        refusal_sites: Default::default(),
+        call_relation_facts: None,
+        uses_omissions: Vec::new(),
         incompleteness: Incompleteness::Content,
         related: Vec::new(),
         source: None,
@@ -552,6 +583,10 @@ fn formal_name_unrecorded_diagnostic(value: &CallBindingValue, name: &str) -> Co
     let report = &value.site.report;
     let path = rel_path_string(&report.file);
     CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        has_non_utf8_refusal: false,
+        refusal_sites: Default::default(),
+        call_relation_facts: None,
+        uses_omissions: Vec::new(),
         incompleteness: Incompleteness::Content,
         related: Vec::new(),
         source: None,
@@ -912,6 +947,10 @@ pub(super) fn apply_plan_step(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     instrumentation: Option<&mut QueryStepInstrumentation>,
 ) -> PlanExecution {
+    // Each authored expansion has its own incoming-miss allowance. Outgoing
+    // work and earlier expansions remain charged to the query-wide scan limit.
+    state.budget.callers_scanned_files = 0;
+    state.budget.callers_scanned_source_bytes = 0;
     let input_incomplete =
         code_query_completion(input_truncated, diagnostics) != CodeQueryCompletion::Complete;
     let mut truncated = false;
@@ -934,21 +973,8 @@ pub(super) fn apply_plan_step(
                 _ => None,
             })
             .collect();
-        let relation_limits = CallRelationLimits {
-            max_files: limits
-                .max_scanned_files
-                .saturating_sub(state.budget.scanned_files)
-                .min(DEFAULT_MAX_FILES),
-            max_source_bytes: limits
-                .max_scanned_source_bytes
-                .saturating_sub(state.budget.scanned_source_bytes),
-            max_candidates: limits.max_fact_nodes.saturating_sub(
-                state
-                    .budget
-                    .fact_nodes
-                    .saturating_add(state.budget.examined_references),
-            ),
-        };
+        let scan_grants = IncomingCallScanGrants::remaining(&state.budget, limits);
+        let relation_limits = scan_grants.provider;
         let answers = CallRelationService::incoming_in_file(
             state.analyzer,
             token,
@@ -968,16 +994,64 @@ pub(super) fn apply_plan_step(
                 .collect()
         });
         assert_eq!(answers.len(), targets.len());
-        for (target, mut answer) in targets.into_iter().zip(answers) {
-            answer.truncated |= charge_reference_scan(
-                &mut state.budget,
-                limits,
-                answer.work.scanned_files,
-                answer.work.scanned_source_bytes,
-                answer.work.examined_candidates,
-            );
-            if answer.truncated {
-                push_budget_diagnostic(diagnostics, &state.budget);
+        for (target, answer) in targets.into_iter().zip(answers) {
+            let relation_start = state.budget;
+            // Prefetch scans spend the operational query and expansion limits.
+            // Consumption separately charges answer-determined admission.
+            state.budget.call_scanned_files = state
+                .budget
+                .call_scanned_files
+                .saturating_add(answer.work.scanned_files);
+            state.budget.call_scanned_source_bytes = state
+                .budget
+                .call_scanned_source_bytes
+                .saturating_add(answer.work.scanned_source_bytes);
+            state.budget.call_examined_references = state
+                .budget
+                .call_examined_references
+                .saturating_add(answer.work.examined_candidates);
+            state.budget.callers_scanned_files = state
+                .budget
+                .callers_scanned_files
+                .saturating_add(answer.work.scanned_files);
+            state.budget.callers_scanned_source_bytes = state
+                .budget
+                .callers_scanned_source_bytes
+                .saturating_add(answer.work.scanned_source_bytes);
+            if !answer.cancelled
+                && (call_scan_budget_exceeded(&state.budget, limits) || answer.scan_grant_refused())
+            {
+                if call_scan_budget_exceeded(&state.budget, limits)
+                    || scan_grants.user_refused(&answer)
+                {
+                    push_call_relation_budget_diagnostics(
+                        diagnostics,
+                        &state.budget,
+                        limits,
+                        &relation_start,
+                        &answer.budget_refusals,
+                    );
+                } else {
+                    push_call_scan_budget_diagnostic(diagnostics, target.source());
+                }
+                return PlanExecution::truncated(Vec::new());
+            }
+            if !answer.cancelled
+                && (state.budget.callers_scanned_files > limits.max_call_scanned_files
+                    || state.budget.callers_scanned_source_bytes
+                        > limits.max_call_scanned_source_bytes)
+            {
+                push_call_scan_budget_diagnostic(diagnostics, target.source());
+                return PlanExecution::truncated(Vec::new());
+            }
+            if !answer.cancelled && !answer.budget_refusals.is_empty() {
+                push_call_relation_budget_diagnostics(
+                    diagnostics,
+                    &state.budget,
+                    limits,
+                    &relation_start,
+                    &answer.budget_refusals,
+                );
             }
             state
                 .call_cache
@@ -1574,6 +1648,8 @@ pub(super) fn apply_plan_step(
                     diagnostics,
                     graph.resolved_files(),
                     graph.resolved_edges(),
+                    graph.refused_file_charge(),
+                    graph.refused_edge_charge(),
                 );
             }
         }
@@ -1585,6 +1661,8 @@ pub(super) fn apply_plan_step(
                 persisted_import_adjacency
                     .as_ref()
                     .map_or(0, |adjacency| adjacency.rows_read),
+                None,
+                Some((state.budget.import_edges_resolved, limits.max_pipeline_rows)),
             );
         }
     }
@@ -1615,6 +1693,15 @@ pub(super) fn apply_plan_step(
     } else {
         state.import_graph_content
     };
+    let mut shape_context = if state.semantic.is_none()
+        && matches!(step, QueryStep::CallShape)
+        && call_shape::has_candidate_macro_input(state.analyzer, &rows)
+    {
+        (state.semantic_factory)()
+    } else {
+        None
+    };
+    state.call_cache.refusal_subject_limit = state.scope.refusal_subject_limit;
     let (mut rows, mut exhausted, mut step_truncated) = apply_pipeline_step(
         state.analyzer,
         token,
@@ -1646,13 +1733,18 @@ pub(super) fn apply_plan_step(
         &mut state.path_cache,
         &mut state.receiver_facts,
         &mut state.receiver_service,
-        &mut state.semantic,
+        if matches!(step, QueryStep::CallShape) && state.semantic.is_none() {
+            &mut shape_context
+        } else {
+            &mut state.semantic
+        },
         &mut state.budget,
         input_incomplete,
         state.scope.computes_depth_bound_status(),
         &mut state.depth_bound_status,
         &mut state.depth_answers,
         &mut state.access_failure,
+        &mut state.reuse,
         limits,
         max_step_outputs,
         state.cancellation,
@@ -1660,7 +1752,13 @@ pub(super) fn apply_plan_step(
         state.receiver_budget_override,
         &mut state.cache_profile,
         instrumentation,
+        state.scope.sink_sites.as_deref(),
     );
+    if let Some(semantic) = &mut shape_context {
+        diagnostics.extend(semantic.take_diagnostics());
+        state.call_shape_work = state.call_shape_work.saturating_add(semantic.work());
+        state.reuse.join_in(semantic.reuse());
+    }
     if let Some(semantic) = &mut state.semantic {
         diagnostics.extend(semantic.take_diagnostics());
     }
@@ -1675,6 +1773,10 @@ pub(super) fn apply_plan_step(
         state.import_graph = None;
         state.import_graph_content = None;
         diagnostics.push(super::QueryExecutionState::diagnostic(state.analyzer, CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
             incompleteness: brokk_bifrost_rql::Incompleteness::Content,
             related: Vec::new(),
             source: None,
@@ -1707,16 +1809,18 @@ pub(super) fn apply_plan_step(
     }
     if exhausted {
         truncated = true;
-        if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+        if brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
             state.budget.pipeline_rows,
             limits.max_pipeline_rows,
         )
-        .allows(1)
-            || !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+        .try_allow(1)
+        .is_err()
+            || brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
                 state.budget.provenance_steps,
                 limits.max_pipeline_rows,
             )
-            .allows(1)
+            .try_allow(1)
+            .is_err()
         {
             push_pipeline_budget_diagnostic(diagnostics, &state.budget);
         }
@@ -1740,6 +1844,9 @@ pub(super) fn fair_branch_limits(
     remaining_branches: usize,
 ) -> CodeQueryExecutionLimits {
     CodeQueryExecutionLimits {
+        // Physical scan work is operational, outside content admission sharing.
+        max_call_scanned_files: parent.max_call_scanned_files,
+        max_call_scanned_source_bytes: parent.max_call_scanned_source_bytes,
         max_scanned_files: fair_cap(
             budget.scanned_files,
             parent.max_scanned_files,
@@ -1748,6 +1855,14 @@ pub(super) fn fair_branch_limits(
         max_scanned_source_bytes: fair_cap(
             budget.scanned_source_bytes,
             parent.max_scanned_source_bytes,
+            remaining_branches,
+        ),
+        max_call_answers: fair_cap(
+            budget
+                .call_declarations
+                .saturating_add(budget.call_sites)
+                .saturating_add(budget.call_terminals),
+            parent.max_call_answers,
             remaining_branches,
         ),
         max_fact_nodes: fair_cap(
@@ -1844,6 +1959,12 @@ pub(super) fn combine_set_rows(
                 if present {
                     for contribution in contributions {
                         row.value.merge_intersect_evidence(contribution.value);
+                        if let Some(evidence) = contribution.call_path_evidence {
+                            match &mut row.call_path_evidence {
+                                Some(existing) => existing.merge(evidence),
+                                slot @ None => *slot = Some(evidence),
+                            }
+                        }
                         row.traces.extend(contribution.traces);
                         row.provenance_truncated |= contribution.provenance_truncated;
                     }
@@ -1919,6 +2040,10 @@ pub(super) fn invalid_plan_result(
         session_subset,
         diagnostics: normalize_query_diagnostics(vec![CodeQueryDiagnostic::new(
             CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                 incompleteness: brokk_bifrost_rql::Incompleteness::Operational(
                     brokk_bifrost_rql::DiagnosticExecutionCause::Provider,
                 ),
@@ -1937,7 +2062,16 @@ pub(super) fn invalid_plan_result(
 }
 
 pub(super) fn query_plan_requires_semantic(plan: &CodeQueryPlan) -> bool {
-    query_plan_has_step(plan, query_step_requires_semantic)
+    let mut pending = vec![plan];
+    while let Some(plan) = pending.pop() {
+        if matches!(plan.source, CodeQueryPlanSource::CallReachability(_))
+            || plan.steps.iter().any(query_step_requires_semantic)
+        {
+            return true;
+        }
+        pending.extend(plan.source.child_plans());
+    }
+    false
 }
 
 fn query_plan_has_step(
@@ -2079,6 +2213,7 @@ pub(super) fn python_absent_member_file<'files>(
             CodeQueryPlanSource::DependencyEvidence(_)
             | CodeQueryPlanSource::ConfigurationFacts(_) => continue,
             CodeQueryPlanSource::Set { .. }
+            | CodeQueryPlanSource::CallReachability(_)
             | CodeQueryPlanSource::Correlate(_)
             | CodeQueryPlanSource::RequireBoth(_) => {
                 pending.extend(
@@ -2172,7 +2307,8 @@ pub(super) fn query_analysis_context_error_result(
         QueryAnalysisContextError::StaleValueFlowPlanHandle => {
             CodeQueryDiagnosticCode::ValueFlowHandleStale
         }
-        QueryAnalysisContextError::ValueFlowRegistrationInvalid { .. } => {
+        QueryAnalysisContextError::ValueFlowRetentionUnavailable { .. }
+        | QueryAnalysisContextError::ValueFlowRegistrationInvalid { .. } => {
             CodeQueryDiagnosticCode::ValueFlowRegistrationStale
         }
         QueryAnalysisContextError::UnresolvedTaintResultReference { .. } => {
@@ -2212,6 +2348,10 @@ pub(super) fn query_analysis_context_error_result(
         session_subset,
         diagnostics: normalize_query_diagnostics(vec![CodeQueryDiagnostic::new(
             CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                 incompleteness: brokk_bifrost_rql::Incompleteness::Operational(
                     brokk_bifrost_rql::DiagnosticExecutionCause::Provider,
                 ),
@@ -2241,6 +2381,10 @@ pub(super) fn push_cancelled_diagnostic(diagnostics: &mut Vec<CodeQueryDiagnosti
         return;
     }
     diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        has_non_utf8_refusal: false,
+        refusal_sites: Default::default(),
+        call_relation_facts: None,
+        uses_omissions: Vec::new(),
         incompleteness: brokk_bifrost_rql::Incompleteness::Content,
         related: Vec::new(),
         source: None,
@@ -2310,6 +2454,7 @@ fn apply_pipeline_step<'a>(
     depth_bound_status: &mut Option<DepthBoundStatus>,
     depth_answers: &mut Vec<units::BoundedCallAnswer>,
     access_failure: &mut Option<String>,
+    reuse: &mut ReuseVerdict,
     limits: CodeQueryExecutionLimits,
     max_step_outputs: PipelineOutputLimit,
     cancellation: Option<&CancellationToken>,
@@ -2317,6 +2462,7 @@ fn apply_pipeline_step<'a>(
     receiver_budget_override: Option<ReceiverAnalysisBudget>,
     cache_profile: &mut Option<QueryCacheProfile>,
     instrumentation: Option<&mut QueryStepInstrumentation>,
+    sink_sites: Option<&super::reached_sinks::ReachedSinkSites>,
 ) -> (Vec<PipelineRow>, bool, bool) {
     let mut rows = rows;
     let target_rows = match step {
@@ -2391,6 +2537,7 @@ fn apply_pipeline_step<'a>(
                 budget,
                 limits,
                 max_step_outputs,
+                reuse,
                 cancellation,
                 diagnostics,
                 instrumentation,
@@ -2421,6 +2568,7 @@ fn apply_pipeline_step<'a>(
             budget,
             limits,
             max_step_outputs,
+            reuse,
             cancellation,
             diagnostics,
             instrumentation,
@@ -2464,6 +2612,7 @@ fn apply_pipeline_step<'a>(
         depth_bound_status,
         depth_answers,
         access_failure,
+        reuse,
         limits,
         max_step_outputs,
         cancellation,
@@ -2471,6 +2620,7 @@ fn apply_pipeline_step<'a>(
         receiver_budget_override,
         cache_profile,
         instrumentation,
+        sink_sites,
     )
 }
 
@@ -2491,12 +2641,25 @@ impl PipelineOutputLimit {
         self.maximum().saturating_sub(used)
     }
 
-    fn allows_next(self, used: usize) -> bool {
+    /// Whether one more output fits. The caller stops the step on `false`.
+    ///
+    /// A budget refusal leaves input rows unread, so it sets `exhausted` and
+    /// joins its verdict into `reuse`, like every other `max_pipeline_rows`
+    /// refusal (#12047). The cumulative row counter normally refuses first,
+    /// because seeds and outputs are charged to it, but a step must not rely
+    /// on that to report its truncation. An authored cap is one above the
+    /// terminal limit, so the terminal limit reports that cut.
+    fn allows_next(self, used: usize, reuse: &mut ReuseVerdict, exhausted: &mut bool) -> bool {
         match self {
             Self::Authored(maximum) => used < maximum,
             Self::Budget(maximum) => {
                 brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(used, maximum)
-                    .allows(1)
+                    .try_allow(1)
+                    .inspect_err(|refused| {
+                        reuse.join_in(refused.reuse_verdict());
+                        *exhausted = true;
+                    })
+                    .is_ok()
             }
         }
     }
@@ -2512,6 +2675,7 @@ fn apply_identical_captures_pipeline_step(
     budget: &mut CodeQueryExecutionBudget,
     limits: CodeQueryExecutionLimits,
     max_step_outputs: PipelineOutputLimit,
+    reuse: &mut ReuseVerdict,
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     mut instrumentation: Option<&mut QueryStepInstrumentation>,
@@ -2792,7 +2956,7 @@ fn apply_identical_captures_pipeline_step(
         right: right.to_owned(),
     };
     for (row, decision) in rows.into_iter().zip(decisions) {
-        if !max_step_outputs.allows_next(output.len()) {
+        if !max_step_outputs.allows_next(output.len(), reuse, &mut exhausted) {
             break;
         }
         let decision = if cancellation.is_some_and(CancellationToken::is_cancelled) {
@@ -2810,6 +2974,10 @@ fn apply_identical_captures_pipeline_step(
                     unreachable!()
                 };
                 diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                    has_non_utf8_refusal: false,
+                    refusal_sites: Default::default(),
+                    call_relation_facts: None,
+                    uses_omissions: Vec::new(),
                     incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                     related: Vec::new(),
                     source: None,
@@ -2817,10 +2985,14 @@ fn apply_identical_captures_pipeline_step(
                     impact: CodeQueryDiagnosticImpact::Incomplete,
                     branch: Vec::new(),
                     language: seed.language.config_label(),
-                    message: format!(
-                        "identical-captures in {}: {:?}",
-                        rel_path_string(&seed.file),
-                        reasons
+                    message: brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+                        format_args!(
+                            "identical-captures in {}: {:?}",
+                            rel_path_string(&seed.file),
+                            reasons
+                        ),
+                        format_args!("identical-captures in {}", rel_path_string(&seed.file)),
+                        reasons.iter(),
                     ),
                     exhausted_roots: Vec::new(),
                     withheld_rows_path: None,
@@ -2829,11 +3001,12 @@ fn apply_identical_captures_pipeline_step(
             }
             Decision::Keep => {}
         }
-        if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+        if brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
             budget.pipeline_rows,
             limits.max_pipeline_rows,
         )
-        .allows(1)
+        .try_allow(1)
+        .is_err()
         {
             exhausted = true;
             break;
@@ -2880,6 +3053,7 @@ fn apply_call_bindings_pipeline_step(
     budget: &mut CodeQueryExecutionBudget,
     limits: CodeQueryExecutionLimits,
     max_step_outputs: PipelineOutputLimit,
+    reuse: &mut ReuseVerdict,
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     instrumentation: Option<&mut QueryStepInstrumentation>,
@@ -2900,6 +3074,7 @@ fn apply_call_bindings_pipeline_step(
         budget,
         limits,
         max_step_outputs,
+        reuse,
         cancellation,
         diagnostics,
         instrumentation,
@@ -2941,6 +3116,7 @@ fn apply_call_bindings_pipeline_step_with_receipts(
     budget: &mut CodeQueryExecutionBudget,
     limits: CodeQueryExecutionLimits,
     max_step_outputs: PipelineOutputLimit,
+    reuse: &mut ReuseVerdict,
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     instrumentation: Option<&mut QueryStepInstrumentation>,
@@ -2998,6 +3174,10 @@ fn apply_call_bindings_pipeline_step_with_receipts(
             })
         {
             diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                 incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                 related: Vec::new(),
                 source: None,
@@ -3022,7 +3202,7 @@ fn apply_call_bindings_pipeline_step_with_receipts(
         let mut indexed_declarations = indexed_declarations;
 
         'rows: for row in rows {
-            if !max_step_outputs.allows_next(output.len()) {
+            if !max_step_outputs.allows_next(output.len(), reuse, &mut exhausted) {
                 break;
             }
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
@@ -3038,6 +3218,10 @@ fn apply_call_bindings_pipeline_step_with_receipts(
                 })
             {
                 diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                    has_non_utf8_refusal: false,
+                    refusal_sites: Default::default(),
+                    call_relation_facts: None,
+                    uses_omissions: Vec::new(),
                     incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                     related: Vec::new(),
                     source: None,
@@ -3054,6 +3238,7 @@ fn apply_call_bindings_pipeline_step_with_receipts(
             let indexed = indexed_declarations
                 .as_deref_mut()
                 .expect("semantic declaration index exists");
+            let refusal_subject_limit = call_cache.refusal_subject_limit;
             let expansions = call_cache
                 .bindings
                 .read_mut(&memo_attribution(analyzer), |memo| {
@@ -3067,6 +3252,7 @@ fn apply_call_bindings_pipeline_step_with_receipts(
                         identity_request,
                         value,
                         cancellation,
+                        refusal_subject_limit,
                         diagnostics,
                     )
                 });
@@ -3082,11 +3268,12 @@ fn apply_call_bindings_pipeline_step_with_receipts(
 
             for expansion in expansions {
                 if !expansion.budgeted
-                    && !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                    && brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
                         budget.pipeline_rows,
                         max_pipeline_rows,
                     )
-                    .allows(1)
+                    .try_allow(1)
+                    .is_err()
                 {
                     exhausted = true;
                     break 'rows;
@@ -3100,6 +3287,12 @@ fn apply_call_bindings_pipeline_step_with_receipts(
                     .cloned()
                     .map(|trace| advance_pipeline_trace(trace, step, &expansion.trace))
                     .collect();
+                let key = expansion.value.key();
+                let path_evidence = expansion.call_path_evidence.or_else(|| {
+                    (key == row.value.key())
+                        .then(|| row.call_path_evidence.clone())
+                        .flatten()
+                });
                 insert_pipeline_row(
                     &mut output,
                     &mut indexes,
@@ -3107,6 +3300,13 @@ fn apply_call_bindings_pipeline_step_with_receipts(
                     traces,
                     row.provenance_truncated,
                 );
+                if let Some(evidence) = path_evidence {
+                    let target = &mut output[indexes[&key]].call_path_evidence;
+                    match target {
+                        Some(existing) => existing.merge(evidence),
+                        slot @ None => *slot = Some(evidence),
+                    }
+                }
             }
             if row_exhausted {
                 exhausted = true;
@@ -3146,6 +3346,94 @@ fn apply_call_bindings_pipeline_step_with_receipts(
         result
     } else {
         execute()
+    }
+}
+
+/// The file a row carries for the `FileOf` step, if its kind has one.
+///
+/// This is a function, not one match arm per row kind inside
+/// `apply_pipeline_step_general`: a debug build gives every arm its own stack
+/// slots, and the arms together cost that frame about 60 KB (#11691).
+fn file_of_pipeline_value(value: &PipelineValue) -> Option<&ProjectFile> {
+    match value {
+        PipelineValue::Semantic(SemanticPipelineValue::ProcedureReference(reference)) => {
+            Some(&reference.file)
+        }
+        PipelineValue::Semantic(SemanticPipelineValue::ProgramPointReference(reference)) => {
+            Some(&reference.procedure.file)
+        }
+        PipelineValue::Semantic(SemanticPipelineValue::ControlEdgeReference(reference)) => {
+            Some(&reference.procedure.file)
+        }
+        PipelineValue::FailureHandlerState(value) => Some(&value.file),
+        PipelineValue::BranchRelation(value) => Some(&value.file),
+        PipelineValue::CppExpression(value) => Some(&value.file),
+        PipelineValue::LoopRelation(value) => Some(&value.file),
+        PipelineValue::StatementReachability(value) => Some(&value.file),
+        PipelineValue::PendingCleanupFlow(value) => Some(&value.file),
+        PipelineValue::StructuralMatch(seed) => Some(&seed.file),
+        PipelineValue::Declaration(declaration) => Some(declaration.unit.source()),
+        PipelineValue::AbsentMemberFinding(finding) => Some(finding.file()),
+        PipelineValue::Semantic(SemanticPipelineValue::Procedure(procedure)) => {
+            Some(procedure.file())
+        }
+        PipelineValue::Semantic(SemanticPipelineValue::ProgramPoint(point)) => Some(point.file()),
+        PipelineValue::Semantic(SemanticPipelineValue::ControlEdge(edge)) => Some(edge.file()),
+        PipelineValue::Semantic(SemanticPipelineValue::TypestateFinding(finding)) => {
+            Some(finding.file())
+        }
+        PipelineValue::Semantic(SemanticPipelineValue::TypestateWitness(witness)) => {
+            Some(witness.file())
+        }
+        PipelineValue::Semantic(SemanticPipelineValue::FlowEndpoint(endpoint)) => {
+            Some(endpoint.file())
+        }
+        PipelineValue::Semantic(SemanticPipelineValue::FlowWitness(witness)) => {
+            Some(witness.file())
+        }
+        PipelineValue::Semantic(SemanticPipelineValue::AbsentMemberWitness(witness)) => {
+            Some(witness.file())
+        }
+        PipelineValue::Semantic(SemanticPipelineValue::TaintFinding(finding)) => {
+            Some(finding.file())
+        }
+        PipelineValue::ReferenceSite(site) => Some(&site.file),
+        PipelineValue::CallSite(site) => Some(&site.0.file),
+        PipelineValue::ExpressionSite(site) => Some(&site.call_site.0.file),
+        PipelineValue::ReceiverAnalysis(value) | PipelineValue::MemberTargetAnalysis(value) => {
+            Some(&value.report.site.file)
+        }
+        PipelineValue::DispatchOutcome(value) => Some(value.file()),
+        PipelineValue::DispatchTarget(value) => Some(value.file()),
+        PipelineValue::MemberFamily(value) => Some(value.file()),
+        PipelineValue::MemberFamilyEdge(value) => Some(value.file()),
+        PipelineValue::PythonHierarchyFact(value) => Some(value.file()),
+        PipelineValue::ReceiverOutcome(value) => Some(&value.report.site.file),
+        PipelineValue::CallableApplicability(value) => Some(&value.occurrence.file),
+        PipelineValue::OverloadSelection(value) => Some(&value.occurrence.file),
+        PipelineValue::CallableSignature(value) => Some(value.file()),
+        PipelineValue::LiteralOccurrence(value) => Some(&value.file),
+        PipelineValue::CallableMetrics(value) => Some(value.file()),
+        PipelineValue::SignatureParameter(value) => Some(value.file()),
+        PipelineValue::DecoratedParameter(value) => Some(&value.file),
+        PipelineValue::CallShape(value) => Some(&value.report.outcome.file),
+        PipelineValue::CallArgumentGroup(value) => Some(&value.shape.report.outcome.file),
+        PipelineValue::CallArgument(value) => Some(&value.shape.report.outcome.file),
+        PipelineValue::CallBinding(value) => Some(value.file()),
+        PipelineValue::CallEffect(value) => Some(value.file()),
+        PipelineValue::ProcedureEffect(value) => Some(value.file()),
+        PipelineValue::ReceiverEvidence(value) => Some(&value.receiver.report.site.file),
+        PipelineValue::PointsToCandidate(value) => Some(&value.file),
+        PipelineValue::FieldWriteValue(value) => Some(&value.seed.file),
+        PipelineValue::Occurrence(value) => Some(value.file()),
+        PipelineValue::LexicalScope(value) => Some(value.file()),
+        PipelineValue::Binding(value) => Some(value.file()),
+        PipelineValue::GenerationSite(value) => Some(value.file()),
+        PipelineValue::Export(value) => Some(value.file()),
+        PipelineValue::DeclarationState(value) => Some(value.file()),
+        PipelineValue::QualifiedPath(value) => Some(&value.file),
+        PipelineValue::PathSegment(value) => Some(&value.file),
+        _ => None,
     }
 }
 
@@ -3204,6 +3492,7 @@ fn apply_pipeline_step_general<'a>(
     depth_bound_status: &mut Option<DepthBoundStatus>,
     depth_answers: &mut Vec<units::BoundedCallAnswer>,
     access_failure: &mut Option<String>,
+    reuse: &mut ReuseVerdict,
     limits: CodeQueryExecutionLimits,
     max_step_outputs: PipelineOutputLimit,
     cancellation: Option<&CancellationToken>,
@@ -3211,6 +3500,7 @@ fn apply_pipeline_step_general<'a>(
     receiver_budget_override: Option<ReceiverAnalysisBudget>,
     cache_profile: &mut Option<QueryCacheProfile>,
     instrumentation: Option<&mut QueryStepInstrumentation>,
+    sink_sites: Option<&super::reached_sinks::ReachedSinkSites>,
 ) -> (Vec<PipelineRow>, bool, bool) {
     let max_pipeline_rows = limits.max_pipeline_rows;
     let mut python_fact_diagnostics = PythonFactDiagnostics::new(diagnostics);
@@ -3283,6 +3573,10 @@ fn apply_pipeline_step_general<'a>(
             .any(|diagnostic| diagnostic.code == CodeQueryDiagnosticCode::SemanticWorkspaceRequired)
         {
             diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                 incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                 related: Vec::new(),
                 source: None,
@@ -3312,6 +3606,10 @@ fn apply_pipeline_step_general<'a>(
                 .is_some_and(|receiver| !resolved_call_receiver_is_resolved(receiver)))
     {
         diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
             incompleteness: brokk_bifrost_rql::Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Provider),
             related: Vec::new(),
             source: None,
@@ -3331,6 +3629,10 @@ fn apply_pipeline_step_general<'a>(
             || filter.proof != ResolvedCallProof::Exact)
     {
         diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            has_non_utf8_refusal: false,
+            refusal_sites: Default::default(),
+            call_relation_facts: None,
+            uses_omissions: Vec::new(),
             incompleteness: brokk_bifrost_rql::Incompleteness::Operational(
                 brokk_bifrost_rql::DiagnosticExecutionCause::Provider,
             ),
@@ -3464,7 +3766,7 @@ fn apply_pipeline_step_general<'a>(
     let merge_absent_member_findings_before_filter = matches!(step, QueryStep::AbsentMember(_));
     'rows: while let Some(mut row) = rows.next() {
         if !merge_absent_member_findings_before_filter
-            && !max_step_outputs.allows_next(output.len())
+            && !max_step_outputs.allows_next(output.len(), reuse, &mut exhausted)
         {
             call_depth_probe.undecided = true;
             break;
@@ -3488,6 +3790,8 @@ fn apply_pipeline_step_general<'a>(
             if let Some(semantic) = semantic.as_mut() {
                 semantic.release_definition_operations();
             }
+            reuse.join_in(member_step.reuse);
+            reuse.join_in(python_import_site_cache.reuse);
             return (output, true, receiver_truncated);
         }
         let mut opened_result_contract_file = false;
@@ -3552,11 +3856,12 @@ fn apply_pipeline_step_general<'a>(
                 })
                 .collect();
             record_row_local_step(&mut row, step);
-            if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+            if brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
                 budget.pipeline_rows,
                 max_pipeline_rows,
             )
-            .allows(1)
+            .try_allow(1)
+            .is_err()
             {
                 exhausted = true;
                 break;
@@ -3606,6 +3911,10 @@ fn apply_pipeline_step_general<'a>(
                 Err(message) => {
                     exhausted = true;
                     diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                        has_non_utf8_refusal: false,
+                        refusal_sites: Default::default(),
+                        call_relation_facts: None,
+                        uses_omissions: Vec::new(),
                         incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                         related: Vec::new(),
                         source: None,
@@ -3621,11 +3930,12 @@ fn apply_pipeline_step_general<'a>(
                 }
             }
             record_row_local_step(&mut row, step);
-            if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+            if brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
                 budget.pipeline_rows,
                 max_pipeline_rows,
             )
-            .allows(1)
+            .try_allow(1)
+            .is_err()
             {
                 exhausted = true;
                 break;
@@ -3805,6 +4115,10 @@ fn apply_pipeline_step_general<'a>(
             let (result, interrupted) = match semantic.as_mut() {
                 None => {
                     diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                        has_non_utf8_refusal: false,
+                        refusal_sites: Default::default(),
+                        call_relation_facts: None,
+                        uses_omissions: Vec::new(),
                         incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                         related: Vec::new(),
                         source: None,
@@ -3843,6 +4157,10 @@ fn apply_pipeline_step_general<'a>(
                             // truncation plumbing so it cannot be mistaken for a clean
                             // empty keyed-read relation.
                             diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                                has_non_utf8_refusal: false,
+                                refusal_sites: Default::default(),
+                                call_relation_facts: None,
+                                uses_omissions: Vec::new(),
                                 incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                                 related: Vec::new(),
                                 source: None,
@@ -3876,6 +4194,7 @@ fn apply_pipeline_step_general<'a>(
                         ordinal,
                     })),
                     trace: vec![],
+                    call_path_evidence: None,
                     budgeted: false,
                 })
                 .collect::<Vec<_>>();
@@ -3890,6 +4209,7 @@ fn apply_pipeline_step_general<'a>(
                         ordinal: 0,
                     })),
                     trace: vec![],
+                    call_path_evidence: None,
                     budgeted: false,
                 });
             }
@@ -3903,15 +4223,16 @@ fn apply_pipeline_step_general<'a>(
                 // source observation; allowing it to bypass either cap
                 // makes a policy query appear complete after exhausting the
                 // shared pipeline budget.
-                if !max_step_outputs.allows_next(output.len()) {
+                if !max_step_outputs.allows_next(output.len(), reuse, &mut exhausted) {
                     exhausted = true;
                     break 'rows;
                 }
-                if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                if brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
                     budget.pipeline_rows,
                     max_pipeline_rows,
                 )
-                .allows(1)
+                .try_allow(1)
+                .is_err()
                 {
                     exhausted = true;
                     break 'rows;
@@ -3946,7 +4267,7 @@ fn apply_pipeline_step_general<'a>(
         {
             let operation = receiver_operation(step);
             for trace in &row.traces {
-                if !max_step_outputs.allows_next(output.len()) {
+                if !max_step_outputs.allows_next(output.len(), reuse, &mut exhausted) {
                     break;
                 }
                 let (ranges, input) =
@@ -4008,7 +4329,7 @@ fn apply_pipeline_step_general<'a>(
                 )
             }
             (PipelineValue::StructuralMatch(seed), QueryStep::CaptureAnchor(capture)) => {
-                let expansions = capture_anchor_matches(&seed.fact_match, capture)
+                let expansions = capture_anchor_matches(&seed.fact_match, &seed.facts, capture)
                     .into_iter()
                     .map(|fact_match| {
                         let mut anchored = (**seed).clone();
@@ -4067,6 +4388,7 @@ fn apply_pipeline_step_general<'a>(
                             access_failure,
                             limits,
                             cancellation,
+                            reuse,
                         };
                         super::python_import_cycles::annotate_import_site(
                             &mut context,
@@ -4165,24 +4487,9 @@ fn apply_pipeline_step_general<'a>(
                     Some(declaration.unit.terminal_name()),
                 )
             }
-            (
-                PipelineValue::Semantic(SemanticPipelineValue::ProcedureReference(reference)),
-                QueryStep::FileOf,
-            ) => vec![pipeline_expansion(PipelineValue::File(
-                reference.file.clone(),
-            ))],
-            (
-                PipelineValue::Semantic(SemanticPipelineValue::ProgramPointReference(reference)),
-                QueryStep::FileOf,
-            ) => vec![pipeline_expansion(PipelineValue::File(
-                reference.procedure.file.clone(),
-            ))],
-            (
-                PipelineValue::Semantic(SemanticPipelineValue::ControlEdgeReference(reference)),
-                QueryStep::FileOf,
-            ) => vec![pipeline_expansion(PipelineValue::File(
-                reference.procedure.file.clone(),
-            ))],
+            (value, QueryStep::FileOf) if let Some(file) = file_of_pipeline_value(value) => {
+                vec![pipeline_expansion(PipelineValue::File(file.clone()))]
+            }
             (PipelineValue::StructuralMatch(seed), QueryStep::ProcedureOf) => {
                 let declaration =
                     exact_callable_declaration_value(analyzer, seed, &mut enclosing_declarations);
@@ -4555,220 +4862,6 @@ fn apply_pipeline_step_general<'a>(
                 .map(pipeline_expansion)
                 .collect()
             }
-            (PipelineValue::FailureHandlerState(value), QueryStep::FileOf) => {
-                vec![pipeline_expansion(PipelineValue::File(value.file.clone()))]
-            }
-            (PipelineValue::BranchRelation(value), QueryStep::FileOf) => {
-                vec![pipeline_expansion(PipelineValue::File(value.file.clone()))]
-            }
-            (PipelineValue::CppExpression(value), QueryStep::FileOf) => {
-                vec![pipeline_expansion(PipelineValue::File(value.file.clone()))]
-            }
-            (PipelineValue::LoopRelation(value), QueryStep::FileOf) => {
-                vec![pipeline_expansion(PipelineValue::File(value.file.clone()))]
-            }
-            (PipelineValue::StatementReachability(value), QueryStep::FileOf) => {
-                vec![pipeline_expansion(PipelineValue::File(value.file.clone()))]
-            }
-            (PipelineValue::PendingCleanupFlow(value), QueryStep::FileOf) => {
-                vec![pipeline_expansion(PipelineValue::File(value.file.clone()))]
-            }
-            (PipelineValue::StructuralMatch(seed), QueryStep::FileOf) => {
-                vec![pipeline_expansion(PipelineValue::File(seed.file.clone()))]
-            }
-            (PipelineValue::Declaration(declaration), QueryStep::FileOf) => {
-                vec![pipeline_expansion(PipelineValue::File(
-                    declaration.unit.source().clone(),
-                ))]
-            }
-            (PipelineValue::AbsentMemberFinding(finding), QueryStep::FileOf) => {
-                vec![pipeline_expansion(PipelineValue::File(
-                    finding.file().clone(),
-                ))]
-            }
-            (
-                PipelineValue::Semantic(SemanticPipelineValue::Procedure(procedure)),
-                QueryStep::FileOf,
-            ) => {
-                vec![pipeline_expansion(PipelineValue::File(
-                    procedure.file().clone(),
-                ))]
-            }
-            (
-                PipelineValue::Semantic(SemanticPipelineValue::ProgramPoint(point)),
-                QueryStep::FileOf,
-            ) => {
-                vec![pipeline_expansion(PipelineValue::File(
-                    point.file().clone(),
-                ))]
-            }
-            (
-                PipelineValue::Semantic(SemanticPipelineValue::ControlEdge(edge)),
-                QueryStep::FileOf,
-            ) => {
-                vec![pipeline_expansion(PipelineValue::File(edge.file().clone()))]
-            }
-            (
-                PipelineValue::Semantic(SemanticPipelineValue::TypestateFinding(finding)),
-                QueryStep::FileOf,
-            ) => {
-                vec![pipeline_expansion(PipelineValue::File(
-                    finding.file().clone(),
-                ))]
-            }
-            (
-                PipelineValue::Semantic(SemanticPipelineValue::TypestateWitness(witness)),
-                QueryStep::FileOf,
-            ) => {
-                vec![pipeline_expansion(PipelineValue::File(
-                    witness.file().clone(),
-                ))]
-            }
-            (
-                PipelineValue::Semantic(SemanticPipelineValue::FlowEndpoint(endpoint)),
-                QueryStep::FileOf,
-            ) => vec![pipeline_expansion(PipelineValue::File(
-                endpoint.file().clone(),
-            ))],
-            (
-                PipelineValue::Semantic(SemanticPipelineValue::FlowWitness(witness)),
-                QueryStep::FileOf,
-            ) => vec![pipeline_expansion(PipelineValue::File(
-                witness.file().clone(),
-            ))],
-            (
-                PipelineValue::Semantic(SemanticPipelineValue::AbsentMemberWitness(witness)),
-                QueryStep::FileOf,
-            ) => vec![pipeline_expansion(PipelineValue::File(
-                witness.file().clone(),
-            ))],
-            (
-                PipelineValue::Semantic(SemanticPipelineValue::TaintFinding(finding)),
-                QueryStep::FileOf,
-            ) => vec![pipeline_expansion(PipelineValue::File(
-                finding.file().clone(),
-            ))],
-            (PipelineValue::ReferenceSite(site), QueryStep::FileOf) => {
-                vec![pipeline_expansion(PipelineValue::File(site.file.clone()))]
-            }
-            (PipelineValue::CallSite(site), QueryStep::FileOf) => {
-                vec![pipeline_expansion(PipelineValue::File(site.0.file.clone()))]
-            }
-            (PipelineValue::ExpressionSite(site), QueryStep::FileOf) => vec![pipeline_expansion(
-                PipelineValue::File(site.call_site.0.file.clone()),
-            )],
-            (
-                PipelineValue::ReceiverAnalysis(value) | PipelineValue::MemberTargetAnalysis(value),
-                QueryStep::FileOf,
-            ) => {
-                vec![pipeline_expansion(PipelineValue::File(
-                    value.report.site.file.clone(),
-                ))]
-            }
-            (PipelineValue::DispatchOutcome(value), QueryStep::FileOf) => {
-                vec![pipeline_expansion(PipelineValue::File(
-                    value.file().clone(),
-                ))]
-            }
-            (PipelineValue::DispatchTarget(value), QueryStep::FileOf) => {
-                vec![pipeline_expansion(PipelineValue::File(
-                    value.file().clone(),
-                ))]
-            }
-            (PipelineValue::MemberFamily(value), QueryStep::FileOf) => {
-                vec![pipeline_expansion(PipelineValue::File(
-                    value.file().clone(),
-                ))]
-            }
-            (PipelineValue::MemberFamilyEdge(value), QueryStep::FileOf) => {
-                vec![pipeline_expansion(PipelineValue::File(
-                    value.file().clone(),
-                ))]
-            }
-            (PipelineValue::PythonHierarchyFact(value), QueryStep::FileOf) => {
-                vec![pipeline_expansion(PipelineValue::File(
-                    value.file().clone(),
-                ))]
-            }
-            (PipelineValue::ReceiverOutcome(value), QueryStep::FileOf) => {
-                vec![pipeline_expansion(PipelineValue::File(
-                    value.report.site.file.clone(),
-                ))]
-            }
-            (PipelineValue::CallableApplicability(value), QueryStep::FileOf) => {
-                vec![pipeline_expansion(PipelineValue::File(
-                    value.occurrence.file.clone(),
-                ))]
-            }
-            (PipelineValue::OverloadSelection(value), QueryStep::FileOf) => {
-                vec![pipeline_expansion(PipelineValue::File(
-                    value.occurrence.file.clone(),
-                ))]
-            }
-            (PipelineValue::CallableSignature(value), QueryStep::FileOf) => {
-                vec![pipeline_expansion(PipelineValue::File(
-                    value.file().clone(),
-                ))]
-            }
-            (PipelineValue::LiteralOccurrence(value), QueryStep::FileOf) => {
-                vec![pipeline_expansion(PipelineValue::File(value.file.clone()))]
-            }
-            (PipelineValue::CallableMetrics(value), QueryStep::FileOf) => {
-                vec![pipeline_expansion(PipelineValue::File(
-                    value.file().clone(),
-                ))]
-            }
-            (PipelineValue::SignatureParameter(value), QueryStep::FileOf) => {
-                vec![pipeline_expansion(PipelineValue::File(
-                    value.file().clone(),
-                ))]
-            }
-            (PipelineValue::DecoratedParameter(value), QueryStep::FileOf) => {
-                vec![pipeline_expansion(PipelineValue::File(value.file.clone()))]
-            }
-            (PipelineValue::CallShape(value), QueryStep::FileOf) => {
-                vec![pipeline_expansion(PipelineValue::File(
-                    value.report.outcome.file.clone(),
-                ))]
-            }
-            (PipelineValue::CallArgumentGroup(value), QueryStep::FileOf) => {
-                vec![pipeline_expansion(PipelineValue::File(
-                    value.shape.report.outcome.file.clone(),
-                ))]
-            }
-            (PipelineValue::CallArgument(value), QueryStep::FileOf) => {
-                vec![pipeline_expansion(PipelineValue::File(
-                    value.shape.report.outcome.file.clone(),
-                ))]
-            }
-            (PipelineValue::CallBinding(value), QueryStep::FileOf) => {
-                vec![pipeline_expansion(PipelineValue::File(
-                    value.file().clone(),
-                ))]
-            }
-            (PipelineValue::CallEffect(value), QueryStep::FileOf) => {
-                vec![pipeline_expansion(PipelineValue::File(
-                    value.file().clone(),
-                ))]
-            }
-            (PipelineValue::ProcedureEffect(value), QueryStep::FileOf) => {
-                vec![pipeline_expansion(PipelineValue::File(
-                    value.file().clone(),
-                ))]
-            }
-            (PipelineValue::ReceiverEvidence(value), QueryStep::FileOf) => {
-                vec![pipeline_expansion(PipelineValue::File(
-                    value.receiver.report.site.file.clone(),
-                ))]
-            }
-            (PipelineValue::PointsToCandidate(value), QueryStep::FileOf) => {
-                vec![pipeline_expansion(PipelineValue::File(value.file.clone()))]
-            }
-            (PipelineValue::FieldWriteValue(value), QueryStep::FileOf) => {
-                vec![pipeline_expansion(PipelineValue::File(
-                    value.seed.file.clone(),
-                ))]
-            }
             (PipelineValue::File(file), QueryStep::ImportsOf) => {
                 let graph = import_graph.expect("import graph exists for import steps");
                 match graph.imports_of(file) {
@@ -4792,6 +4885,7 @@ fn apply_pipeline_step_general<'a>(
                     access_failure,
                     limits,
                     cancellation,
+                    reuse,
                 };
                 let facts = super::python_unsafe_import_cycles::unsafe_cyclic_import_expansions(
                     &mut context,
@@ -4951,6 +5045,7 @@ fn apply_pipeline_step_general<'a>(
                     diagnostics,
                     cache_profile,
                     &mut call_depth_probe,
+                    None,
                 );
                 row_exhausted = call_exhausted;
                 expansions
@@ -4984,6 +5079,10 @@ fn apply_pipeline_step_general<'a>(
                     .is_some_and(|target| target.boundary_kind.is_some())
                 {
                     diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                         incompleteness: Incompleteness::Content,
                         related: Vec::new(), source: None,
                         code: CodeQueryDiagnosticCode::SemanticResultsOmitted,
@@ -5205,6 +5304,7 @@ fn apply_pipeline_step_general<'a>(
                 vec![PipelineExpansion {
                     value: PipelineValue::ReceiverOutcome(value.clone()),
                     trace: vec![(PipelineTraceValue::ReceiverOutcome(value.clone()), None)],
+                    call_path_evidence: None,
                     budgeted: false,
                 }]
             }
@@ -5423,6 +5523,10 @@ fn apply_pipeline_step_general<'a>(
                         && diagnostic.message == "decorator_bindings retained one or more parameter rows whose decorator binding or parameter-port identity is incomplete"
                 }) {
                     diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                         incompleteness: brokk_bifrost_rql::Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Provider),
                         related: Vec::new(),
                         source: None,
@@ -5567,7 +5671,7 @@ fn apply_pipeline_step_general<'a>(
                 let expanded = call_cache
                     .effects
                     .read_mut(&memo_attribution(analyzer), |memo| {
-                        effects::result_subject_use_expansions(
+                        let expanded = effects::result_subject_use_expansions(
                             workspace.expect(
                                 "result-subject use expansion requires a semantic workspace",
                             ),
@@ -5579,7 +5683,9 @@ fn apply_pipeline_step_general<'a>(
                             limits,
                             cancellation,
                             result,
-                        )
+                        );
+                        memo.reuse.join_in(expanded.reuse);
+                        expanded
                     });
                 expanded
                     .uses
@@ -5628,6 +5734,10 @@ fn apply_pipeline_step_general<'a>(
                                     && diagnostic.message == message
                             }) {
                                 diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                                    has_non_utf8_refusal: false,
+                                    refusal_sites: Default::default(),
+                                    call_relation_facts: None,
+                                    uses_omissions: Vec::new(),
                                     incompleteness: match row.outcome {
                                         CodeQueryResultSubjectOutcome::Cancelled => {
                                             Incompleteness::Operational(
@@ -5814,9 +5924,13 @@ fn apply_pipeline_step_general<'a>(
                         procedure,
                     )
                 }),
+            // A candidate bound exactly and exhaustively to another identity
+            // is a proven non-match, not missing evidence, so it does not
+            // count toward the step-level rejection (#11323).
             (PipelineValue::CallBinding(value), QueryStep::ResolvedCall(filter)) => {
+                let proven_different = resolved_call_proven_different(value, filter);
                 filter_witnessed_candidate |= match filter.proof {
-                    ResolvedCallProof::Exact => true,
+                    ResolvedCallProof::Exact => !proven_different,
                     ResolvedCallProof::Declared => filter
                         .resolves_to
                         .effective_identity()
@@ -5840,13 +5954,7 @@ fn apply_pipeline_step_general<'a>(
                 } else {
                     // A failed predicate alone is not a rejection proof. Retain
                     // only a unique complete target known to be different.
-                    if filter.resolves_to.effective_identity().is_some()
-                        && !resolved_call_identity_matches(value, &filter.resolves_to)
-                        && value.site.selector.exact
-                        && value.site.semantic_target_id.is_some()
-                        && value.site.report.coverage == crate::analyzer::usages::call_binding::CallBindingCoverage::Exhaustive
-                        && let Some(sink) = &call_cache.call_binding_receipts
-                    {
+                    if proven_different && let Some(sink) = &call_cache.call_binding_receipts {
                         sink.reject(value.file().clone(), value.site.shape.report.outcome.range);
                     }
                     Vec::new()
@@ -6141,21 +6249,6 @@ fn apply_pipeline_step_general<'a>(
                         Vec::new()
                     }
                 }
-            }
-            (PipelineValue::Occurrence(value), QueryStep::FileOf) => {
-                vec![pipeline_expansion(PipelineValue::File(
-                    value.file().clone(),
-                ))]
-            }
-            (PipelineValue::LexicalScope(value), QueryStep::FileOf) => {
-                vec![pipeline_expansion(PipelineValue::File(
-                    value.file().clone(),
-                ))]
-            }
-            (PipelineValue::Binding(value), QueryStep::FileOf) => {
-                vec![pipeline_expansion(PipelineValue::File(
-                    value.file().clone(),
-                ))]
             }
             (PipelineValue::Binding(value), QueryStep::ScopeOf) => {
                 vec![pipeline_expansion(PipelineValue::LexicalScope(
@@ -6777,6 +6870,7 @@ fn apply_pipeline_step_general<'a>(
                 procedure,
                 cancellation,
                 diagnostics,
+                reuse,
             ),
             (
                 PipelineValue::Semantic(SemanticPipelineValue::Procedure(procedure)),
@@ -6849,21 +6943,6 @@ fn apply_pipeline_step_general<'a>(
                         ))
                     })
                     .collect()
-            }
-            (PipelineValue::GenerationSite(value), QueryStep::FileOf) => {
-                vec![pipeline_expansion(PipelineValue::File(
-                    value.file().clone(),
-                ))]
-            }
-            (PipelineValue::Export(value), QueryStep::FileOf) => {
-                vec![pipeline_expansion(PipelineValue::File(
-                    value.file().clone(),
-                ))]
-            }
-            (PipelineValue::DeclarationState(value), QueryStep::FileOf) => {
-                vec![pipeline_expansion(PipelineValue::File(
-                    value.file().clone(),
-                ))]
             }
             (PipelineValue::Declaration(declaration), QueryStep::DeclarationStateOf(filter)) => {
                 let file = declaration.unit.source().clone();
@@ -7040,12 +7119,6 @@ fn apply_pipeline_step_general<'a>(
                         vec![pipeline_expansion(PipelineValue::Declaration(declaration))]
                     })
                     .unwrap_or_default()
-            }
-            (PipelineValue::QualifiedPath(value), QueryStep::FileOf) => {
-                vec![pipeline_expansion(PipelineValue::File(value.file.clone()))]
-            }
-            (PipelineValue::PathSegment(value), QueryStep::FileOf) => {
-                vec![pipeline_expansion(PipelineValue::File(value.file.clone()))]
             }
             (PipelineValue::QualifiedPath(value), QueryStep::SegmentsOf(options)) => {
                 // A resolved request derives the file's resolved variant and
@@ -7231,17 +7304,23 @@ fn apply_pipeline_step_general<'a>(
 
         for (expansion_index, expansion) in expansions.into_iter().enumerate() {
             if !expansion.budgeted
-                && !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                && brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
                     budget.pipeline_rows,
                     max_pipeline_rows,
                 )
-                .allows(1)
+                .try_allow(1)
+                .is_err()
             {
                 exhausted = true;
                 break 'rows;
             }
             if !expansion.budgeted {
                 budget.pipeline_rows += 1;
+            }
+            // Preserve full nonlocal dependencies, but retain only demanded
+            // terminal rows before allocating their provenance/output table.
+            if sink_sites.is_some_and(|sites| !sites.contains(&expansion.value)) {
+                continue;
             }
             if (window_result_contract_artifacts
                 && matches!(
@@ -7279,6 +7358,12 @@ fn apply_pipeline_step_general<'a>(
                     advance_pipeline_trace(trace, step, &expansion.trace)
                 })
                 .collect();
+            let key = expansion.value.key();
+            let path_evidence = expansion.call_path_evidence.or_else(|| {
+                (key == row.value.key())
+                    .then(|| row.call_path_evidence.clone())
+                    .flatten()
+            });
             insert_pipeline_row(
                 &mut output,
                 &mut indexes,
@@ -7286,6 +7371,13 @@ fn apply_pipeline_step_general<'a>(
                 traces,
                 row.provenance_truncated,
             );
+            if let Some(evidence) = path_evidence {
+                let target = &mut output[indexes[&key]].call_path_evidence;
+                match target {
+                    Some(existing) => existing.merge(evidence),
+                    slot @ None => *slot = Some(evidence),
+                }
+            }
         }
         if row_exhausted {
             exhausted = true;
@@ -7331,7 +7423,16 @@ fn apply_pipeline_step_general<'a>(
     for ((ordinal, field, path), UndecidedPredicateSites { details, sites }) in
         undecided_predicate_sites
     {
+        let items = details
+            .iter()
+            .map(|item| item as &dyn std::fmt::Debug)
+            .chain(sites.iter().map(|item| item as &dyn std::fmt::Debug))
+            .collect::<Vec<_>>();
         diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
             incompleteness: Incompleteness::Content,
             related: Vec::new(),
             source: None,
@@ -7339,8 +7440,10 @@ fn apply_pipeline_step_general<'a>(
             impact: CodeQueryDiagnosticImpact::Incomplete,
             branch: Vec::new(),
             language: "workspace",
-            message: format!(
-                "row predicate {ordinal} on {field:?} in {path:?} is undecided ({details:?}); withheld sites: {sites:?}"
+            message: brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+                format_args!("row predicate {ordinal} on {field:?} in {path:?} is undecided ({details:?}); withheld sites: {sites:?}"),
+                format_args!("row predicate {ordinal} on {field:?} in {path:?} is undecided; details_count={}, withheld_site_count={}", details.len(), sites.len()),
+                items.iter(),
             ),
             exhausted_roots: Vec::new(),
             withheld_rows_path: Some(path),
@@ -7372,6 +7475,10 @@ fn apply_pipeline_step_general<'a>(
 
     if filter_witnessed_candidate && !filter_selected_candidate {
         diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            has_non_utf8_refusal: false,
+            refusal_sites: Default::default(),
+            call_relation_facts: None,
+            uses_omissions: Vec::new(),
             incompleteness: Incompleteness::Content,
             related: Vec::new(),
             source: None,
@@ -7396,6 +7503,10 @@ fn apply_pipeline_step_general<'a>(
 
     for language in unsupported_languages {
         diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            has_non_utf8_refusal: false,
+            refusal_sites: Default::default(),
+            call_relation_facts: None,
+            uses_omissions: Vec::new(),
             incompleteness: brokk_bifrost_rql::Incompleteness::Content,
             related: Vec::new(),
             source: None,
@@ -7424,6 +7535,10 @@ fn apply_pipeline_step_general<'a>(
                     paths.sort_unstable();
                     paths.dedup();
                     diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                         incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                         related: Vec::new(),
                         source: None,
@@ -7433,9 +7548,13 @@ fn apply_pipeline_step_general<'a>(
                         language: Language::from_config_label(&language)
                             .expect("workspace language labels map to diagnostic languages")
                             .config_label(),
-                        message: format!(
-                            "dynamic include/require targets in workspace files {:?} were omitted from import traversal",
-                            paths
+                        message: brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+                            format_args!(
+                                "dynamic include/require targets in workspace files {:?} were omitted from import traversal",
+                                paths
+                            ),
+                            format_args!("dynamic include/require targets were omitted from import traversal"),
+                            paths.iter(),
                         ),
                         exhausted_roots: Vec::new(),
                         withheld_rows_path: None,
@@ -7462,6 +7581,10 @@ fn apply_pipeline_step_general<'a>(
         diagnostics.push(super::QueryExecutionState::diagnostic(
             analyzer,
             CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                 incompleteness: match cause {
                     Some(cause) => brokk_bifrost_rql::Incompleteness::Operational(cause),
                     None => brokk_bifrost_rql::Incompleteness::Content,
@@ -7479,6 +7602,8 @@ fn apply_pipeline_step_general<'a>(
             cause,
         ));
     }
+    reuse.join_in(member_step.reuse);
+    reuse.join_in(python_import_site_cache.reuse);
     diagnostics.extend(member_step.diagnostics());
     if let Some(instrumentation) = instrumentation {
         let index_bytes = indexes.capacity().saturating_mul(
@@ -7509,7 +7634,7 @@ fn apply_pipeline_step_general<'a>(
         if let Some(mut answer) = call_depth_probe.answer.take() {
             if answer.budget_stopped {
                 exhausted = true;
-                push_budget_diagnostic(diagnostics, budget);
+                push_budget_diagnostic(diagnostics, budget, limits, Some(budget), "call_depth");
             }
             answer.membership_unknown |= bounded_exhausted || input_incomplete;
             depth_answers.push(answer);
@@ -7608,12 +7733,26 @@ mod capture_anchor_tests {
             })
             .collect::<Vec<_>>();
         let matched = FactMatch {
+            selected_pattern_source: Default::default(),
             node: 0,
             captures: bindings.into(),
             reported_range: None,
             heuristic: None,
         };
-        let anchored = capture_anchor_matches(&matched, "x");
+        let facts = FileFacts::from_source_and_rows(
+            "x".into(),
+            brokk_bifrost_core::analyzer::source_facts::SourceFactRows::new(Vec::new(), Vec::new()),
+            brokk_bifrost_core::analyzer::structural::facts::StructuralFactRows::new(
+                Vec::new(),
+                brokk_bifrost_core::compact_graph::CompactRows::from_parts(vec![0], Vec::new()),
+                brokk_bifrost_core::compact_graph::CompactRows::from_parts(vec![0], Vec::new()),
+                vec![crate::structural::facts::Span {
+                    start_byte: 0,
+                    end_byte: 1,
+                }],
+            ),
+        );
+        let anchored = capture_anchor_matches(&matched, &facts, "x");
         assert_eq!(anchored.len(), 2048);
         for row in anchored {
             assert!(Arc::ptr_eq(&row.captures, &matched.captures));

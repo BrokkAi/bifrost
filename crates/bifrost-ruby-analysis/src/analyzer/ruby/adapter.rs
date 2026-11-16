@@ -19,6 +19,14 @@ use tree_sitter::Tree;
 pub struct RubyAdapter;
 
 impl LanguageAdapter for RubyAdapter {
+    fn workspace_signature_producer(
+        &self,
+    ) -> Option<
+        &'static dyn brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::WorkspaceSignatureProducer,
+    >{
+        Some(&crate::analyzer::ruby::workspace_signatures::RubyWorkspaceSignatures)
+    }
+
     fn line_data_kinds(&self) -> brokk_bifrost_core::analyzer::tree_walk::LineDataKinds {
         brokk_bifrost_core::analyzer::tree_walk::LineDataKinds {
             literals: &["string", "integer", "float", "character"],

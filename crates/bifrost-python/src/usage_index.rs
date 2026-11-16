@@ -9,7 +9,7 @@
 //! ([`PythonUsageIndex::matching_edges_for_importer`]). Candidate-file narrowing
 //! stays in the forward path's scoped import closure (`PythonProjectGraph`), not
 //! here. Module resolution reuses the analyzer's existing [`python_module_name`]
-//! + [`resolve_python_relative_module`].
+//! + [`resolve_python_module_specifier`].
 
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::usages::local_inference::LocalBindingsSnapshot;
@@ -551,7 +551,7 @@ impl PythonUsageIndex {
         module_specifier: &str,
     ) -> bool {
         self.module_spellings.project().is_some_and(|project| {
-            crate::imports::resolve_python_relative_module(
+            crate::imports::resolve_python_module_specifier(
                 project,
                 importing_file,
                 module_specifier,

@@ -274,31 +274,43 @@ pub fn read_bounded_declaration_file(
     path: &Path,
     max_bytes: u64,
 ) -> Result<Option<String>, String> {
-    let file = match std::fs::File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("could not inspect declaration file: {error}")),
-    };
-    let metadata = file
-        .metadata()
-        .map_err(|error| format!("could not inspect declaration file: {error}"))?;
-    if !metadata.is_file() || metadata.len() > max_bytes {
-        return Err(format!(
-            "declaration file is not a regular file within {max_bytes} bytes"
-        ));
+    let result = (|| {
+        let file = match brokk_bifrost_core::content_digest::open_regular_file(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                report_external_discovery_read(ExternalDiscoveryRead::AbsentFile {
+                    absolute_path: path.to_path_buf(),
+                });
+                return Ok(None);
+            }
+            Err(error) => return Err(format!("could not inspect declaration file: {error}")),
+        };
+        let metadata = file
+            .metadata()
+            .map_err(|error| format!("could not inspect declaration file: {error}"))?;
+        if !metadata.is_file() || metadata.len() > max_bytes {
+            return Err(format!(
+                "declaration file is not a regular file within {max_bytes} bytes"
+            ));
+        }
+        let mut bytes = Vec::new();
+        file.take(max_bytes.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|error| format!("could not read declaration file: {error}"))?;
+        if bytes.len() as u64 > max_bytes {
+            return Err(format!(
+                "declaration file is not a regular file within {max_bytes} bytes"
+            ));
+        }
+        report_external_discovery_read(ExternalDiscoveryRead::file(path, &bytes));
+        String::from_utf8(bytes)
+            .map(Some)
+            .map_err(|error| format!("could not read declaration file: {error}"))
+    })();
+    if result.is_err() {
+        refuse_external_discovery_reads();
     }
-    let mut bytes = Vec::new();
-    file.take(max_bytes.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|error| format!("could not read declaration file: {error}"))?;
-    if bytes.len() as u64 > max_bytes {
-        return Err(format!(
-            "declaration file is not a regular file within {max_bytes} bytes"
-        ));
-    }
-    String::from_utf8(bytes)
-        .map(Some)
-        .map_err(|error| format!("could not read declaration file: {error}"))
+    result
 }
 
 /// Read the project files a files-only dependency producer interprets.

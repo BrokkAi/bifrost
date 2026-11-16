@@ -8,6 +8,7 @@ use crate::analyzer::go::GoAnalyzer;
 use brokk_bifrost_analysis::analyzer::rename::exact::{
     ExactRenameEditIssue, ExactRenameHooks, RenameAssemblyIssue, RenameAssemblyLimits,
     RenameSourceIssue, admit_selected_native_source, assemble_exact_rename, check_rename_authority,
+    describe_incomplete_inventory,
 };
 
 use crate::analyzer::go::selected_reverse::GoSelectedReverseOutcome;
@@ -199,10 +200,16 @@ impl ExactRenameHooks for GoRenameHooks<'_> {
 fn rename_assembly_failure(issue: RenameAssemblyIssue<'_>) -> RenameFailure {
     let message = match issue {
         RenameAssemblyIssue::IncompleteInventory(result) => {
-            format!("original Go inverse inventory is incomplete: {result:?}")
+            format!(
+                "original Go inverse inventory is incomplete: {}",
+                describe_incomplete_inventory(result)
+            )
         }
         RenameAssemblyIssue::UnprovenInventory(result) => {
-            format!("original Go inverse evidence is incomplete or unproven: {result:?}")
+            format!(
+                "original Go inverse evidence is incomplete or unproven: {}",
+                describe_incomplete_inventory(result)
+            )
         }
         RenameAssemblyIssue::TooManyUsages(count) => {
             return failure(

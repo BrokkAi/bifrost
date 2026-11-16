@@ -112,7 +112,7 @@ pub fn csharp_catch_facts(
         };
     };
     let reference = reference_type_text(type_node, syntax.source());
-    let packs = csharp.semantic_model_overlay();
+    let packs = csharp.semantic_model_overlay_read().published();
     let external = csharp.external_declarations(packs);
     let (caught_type, caught_type_relation, type_reason) = resolve_caught_type(
         csharp,

@@ -4,6 +4,7 @@
 use super::imports::SelectedImportRouteKind;
 use super::*;
 use crate::analyzer::PackageAnchor;
+use crate::analyzer::resolution::SharedNameInterner;
 use crate::analyzer::resolution::{LoweredDeclarationTypeProperty, NamedArgumentLabelRead};
 use brokk_bifrost_core::analyzer::model::DeclarationKind;
 use brokk_bifrost_core::analyzer::resolution_facts::DeclarationTypeRole;
@@ -740,6 +741,8 @@ pub struct ProjectedNativeExternalMember {
     pub member_name: String,
     #[doc(hidden)]
     pub is_static: bool,
+    /// Abstract flag of this exact inventory row; NULL remains unknown.
+    pub declaration_is_abstract: Option<bool>,
     /// The parameter count of a method or constructor whose signature the
     /// inventory records; `None` for fields and signature-less rows.
     #[doc(hidden)]
@@ -768,9 +771,9 @@ pub struct ProjectedNativeModelMember {
     pub receiver_proven: bool,
     pub selected: bool,
     pub selection_complete: bool,
-    pub interface: bool,
-    pub route_exact: bool,
-    pub receiver_route_proven: bool,
+    pub abstract_owner: bool,
+    pub owner_path_members_exact: bool,
+    pub receiver_is_declaring_owner: bool,
     pub complete: bool,
     pub incomplete_reasons: Vec<String>,
     pub rejected: bool,
@@ -820,9 +823,9 @@ impl ProjectedNativeModelMember {
             receiver_proven: false,
             selected: false,
             selection_complete: false,
-            interface: false,
-            route_exact: false,
-            receiver_route_proven: false,
+            abstract_owner: false,
+            owner_path_members_exact: false,
+            receiver_is_declaring_owner: false,
             complete: false,
             incomplete_reasons: Vec::new(),
             rejected: false,
@@ -874,9 +877,9 @@ pub fn project_native_model_member_selection(
             receiver_proven: candidate.receiver_proven,
             selected: candidate.selected,
             selection_complete: candidate.selection_complete,
-            interface: candidate.interface,
-            route_exact: candidate.route_exact,
-            receiver_route_proven: candidate.receiver_route_proven,
+            abstract_owner: candidate.abstract_owner,
+            owner_path_members_exact: candidate.owner_path_members_exact,
+            receiver_is_declaring_owner: candidate.receiver_is_declaring_owner,
             complete: candidate.completion == ResolutionCompletion::Complete,
             incomplete_reasons: candidate.incomplete_reasons.clone(),
             rejected: candidate.rejected,
@@ -1153,6 +1156,11 @@ fn assignment_value_answer(
 pub type SelectedLocalDeclarationOutcome =
     SelectedResolutionOperationOutcome<Option<(SemanticId, LexicalDefinition)>>;
 
+/// A certified lexical candidate, without package-wide binding authority.
+#[doc(hidden)]
+pub type SelectedSourceDeclarationCandidateOutcome =
+    SelectedResolutionOperationOutcome<Option<(SemanticId, SelectedNativeDefinition)>>;
+
 /// The canonical path of one selected unindexed Go import, if unique.
 #[doc(hidden)]
 pub type SelectedGoUnindexedImportOutcome = SelectedResolutionOperationOutcome<
@@ -1280,6 +1288,48 @@ impl SelectedResolutionOperation<'_, '_> {
         budget: ReceiverAnalysisBudget,
         cancellation: &CancellationToken,
     ) -> Result<BoundedResolution<SelectedLocalDeclarationOutcome>> {
+        Ok(self
+            .resolve_source_declaration_candidate_bounded(locator, budget, cancellation)?
+            .map(|outcome| match outcome {
+                SelectedResolutionOperationOutcome::Native(candidate) => {
+                    SelectedResolutionOperationOutcome::Native(candidate.and_then(
+                        |(identity, definition)| match definition {
+                            SelectedNativeDefinition::Lexical(definition)
+                                if matches!(
+                                    definition.kind,
+                                    DeclarationKind::LocalVariable
+                                        | DeclarationKind::Parameter
+                                        | DeclarationKind::ReceiverParameter
+                                ) =>
+                            {
+                                Some((identity, definition))
+                            }
+                            _ => None,
+                        },
+                    ))
+                }
+                SelectedResolutionOperationOutcome::Unavailable(reason) => {
+                    SelectedResolutionOperationOutcome::Unavailable(reason)
+                }
+                SelectedResolutionOperationOutcome::Stale(reason) => {
+                    SelectedResolutionOperationOutcome::Stale(reason)
+                }
+                SelectedResolutionOperationOutcome::Cancelled(completion) => {
+                    SelectedResolutionOperationOutcome::Cancelled(completion)
+                }
+            }))
+    }
+
+    /// Select one source declaration through the existing certified lexical facts.
+    /// A package field is only a candidate: this does not finish package lookup.
+    /// Missing candidates remain unknown, not evidence of binding absence.
+    #[doc(hidden)]
+    pub fn resolve_source_declaration_candidate_bounded(
+        &mut self,
+        locator: &SelectedSemanticLocator,
+        budget: ReceiverAnalysisBudget,
+        cancellation: &CancellationToken,
+    ) -> Result<BoundedResolution<SelectedSourceDeclarationCandidateOutcome>> {
         use crate::analyzer::resolution::BatchResolutionFragmentSource;
         let session = ResolutionSession::bounded(budget, Some(cancellation));
         let lexical = self.ready.lexical_source();
@@ -1294,16 +1344,8 @@ impl SelectedResolutionOperation<'_, '_> {
             && let SelectedNativeDefinitions::Ready(mut definitions) =
                 project_native_definition_units(&self.ready, &[*identity], cancellation, &session)?
             && definitions.len() == 1
-            && let Some((identity, SelectedNativeDefinition::Lexical(definition))) =
-                definitions.pop()
-            && matches!(
-                definition.kind,
-                DeclarationKind::LocalVariable
-                    | DeclarationKind::Parameter
-                    | DeclarationKind::ReceiverParameter
-            )
         {
-            selected = Some((identity, definition));
+            selected = definitions.pop();
         }
         let outcome =
             self.finish_native(selected, &ResolutionCompletion::Complete, cancellation)?;
@@ -1441,7 +1483,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 };
                 let nominal = types.nominal_types.into_iter().map(|(identity, definition)| {
                     let definition = match definition {
-                        SelectedRustSourceDefinition::Unit(unit) => SelectedNativeDefinition::Unit(unit),
+                        SelectedRustSourceDefinition::Unit(unit, _) => SelectedNativeDefinition::Unit(unit),
                         SelectedRustSourceDefinition::Lexical(definition) => SelectedNativeDefinition::Lexical(definition),
                         SelectedRustSourceDefinition::UniverseEntry
                         | SelectedRustSourceDefinition::WithoutUnit { .. } => return Err(StoreError::new("assignment-value nominal type has no source projection")),
@@ -1467,7 +1509,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 SelectedRustCallerReferenceOutcome::Operation(outcome) => match outcome {
                     SelectedResolutionOperationOutcome::Native(located) => {
                         SelectedResolutionOperationOutcome::Native(match located {
-                            SelectedResolutionLocated::Missing => SelectedResolutionLocated::Missing,
+                            SelectedResolutionLocated::Missing(certificate) => SelectedResolutionLocated::Missing(certificate),
                             SelectedResolutionLocated::Found(mut answers) => {
                                 if answers.len() != 1 {
                                     return Err(StoreError::new("assignment-value probe requires one exact Rust reference"));
@@ -1505,7 +1547,7 @@ impl SelectedResolutionOperation<'_, '_> {
             SelectedTypeSite::Reference => None,
             SelectedTypeSite::Missing => {
                 return Ok(session.finish(SelectedResolutionOperationOutcome::Native(
-                    SelectedResolutionLocated::Missing,
+                    SelectedResolutionLocated::Missing(crate::analyzer::store::resolution_operation::ReferenceInventoryCompleteness::Unavailable),
                 )));
             }
             SelectedTypeSite::Declaration(site) => Some(site),
@@ -1713,6 +1755,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 let reason = self.ready.context_identities.named_semantic(
                     hash.finish(),
                     "ambiguous_declaration_bindings",
+                    crate::analyzer::resolution::ReasonDeterminism::Unaudited,
                     &evidence,
                 );
                 let completion = ResolutionCompletion::incomplete([
@@ -1798,7 +1841,7 @@ impl SelectedResolutionOperation<'_, '_> {
             } else {
                 BoundedResolution::Complete {
                     value: SelectedResolutionOperationOutcome::Native(
-                        SelectedResolutionLocated::Missing,
+                        SelectedResolutionLocated::Missing(crate::analyzer::store::resolution_operation::ReferenceInventoryCompleteness::Unavailable),
                     ),
                     work: Default::default(),
                 }
@@ -1951,7 +1994,7 @@ impl SelectedResolutionOperation<'_, '_> {
             SelectedTypeSite::Reference => None,
             SelectedTypeSite::Missing => {
                 return Ok(Err(session.finish(
-                    SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Missing),
+                    SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Missing(crate::analyzer::store::resolution_operation::ReferenceInventoryCompleteness::Unavailable)),
                 )));
             }
             SelectedTypeSite::Declaration(site) => Some(site),
@@ -1980,7 +2023,7 @@ impl SelectedResolutionOperation<'_, '_> {
         };
         if selected_locator.call_argument_ordinal().is_some() && query_result_slot.is_none() {
             return Ok(Err(session.finish(
-                SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Missing),
+                SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Missing(crate::analyzer::store::resolution_operation::ReferenceInventoryCompleteness::Unavailable)),
             )));
         }
         Ok(Ok((declaration, query_result_slot)))
@@ -2225,15 +2268,15 @@ impl SelectedResolutionOperation<'_, '_> {
                         if !external_source.is_jvm_external_provider(&owner.provider_id) {
                             continue;
                         }
-                        let (member_name, is_static, callable_parameter_count) = if let Some(members) = super::super::resolution_typed::external_owners::intrinsic_member_inventory_for_owner(ready.inventory.connection(), &owner)? {
-                            (members[ordinal as usize].name.to_owned(), false, None)
-                        } else { ready.inventory.connection().prepare_cached("SELECT member_name,is_static,CASE WHEN signature_present=1 AND member_kind IN ('method','function','constructor') THEN json_array_length(parameters_jsonb) END FROM jvm_external_owner_members WHERE provider_id=?1 AND owner_fqn=?2 AND ordinal=?3")?.query_row(
+                        let (member_name, is_static, callable_parameter_count, declaration_is_abstract) = if let Some(members) = super::super::resolution_typed::external_owners::intrinsic_member_inventory_for_owner(ready.inventory.connection(), &owner)? {
+                            (members[ordinal as usize].name.to_owned(), false, None, None)
+                        } else { ready.inventory.connection().prepare_cached("SELECT member_name,is_static,CASE WHEN signature_present=1 AND member_kind IN ('method','function','constructor') THEN json_array_length(parameters_jsonb) END,is_abstract FROM jvm_external_owner_members WHERE provider_id=?1 AND owner_fqn=?2 AND ordinal=?3")?.query_row(
                             rusqlite::params![owner.provider_id.as_ref(),owner.owner_fqn.as_ref(),ordinal],
-                            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)))? };
+                            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))? };
                         external_members.push(ProjectedNativeExternalMember {
                             coordinate: crate::analyzer::resolution::ExternalMemberCoordinate::InventoryOrdinal(ordinal),
                             identity: crate::analyzer::resolution::ExternalMemberIdentity { owner: owner.clone(), ordinal },
-                            member_name, is_static, callable_parameter_count,
+                            member_name, is_static, callable_parameter_count, declaration_is_abstract,
                             declaring_language: ready.model_authority().and_then(|authority| authority.active_models()).and_then(|models| {
                                 models.shards().iter().find(|shard| shard.manifest.semantic_sha256 == owner.provider_id.as_ref())
                                     .and_then(|shard| Language::from_config_label(&shard.manifest.language))
@@ -2900,11 +2943,7 @@ fn hydrate_fragment_unit(
         row.flags.synthetic,
     );
     let unit = if let Some(analyzer) = ready.analyzer {
-        ready
-            .store
-            .lend_selected_reader(ready.inventory.connection(), || {
-                analyzer.verified_declaration(&expected)
-            })
+        analyzer.verified_declaration(&expected)
     } else {
         Some(expected)
     };
@@ -3439,6 +3478,10 @@ pub fn public_reason_details(
         ResolutionIncompleteReason::Cancelled => ("Cancelled", None),
         ResolutionIncompleteReason::CyclicExpansion(_) => ("CyclicExpansion", None),
         ResolutionIncompleteReason::UnmountedFile { .. } => ("UnmountedFile", None),
+        ResolutionIncompleteReason::OverlayFrontierUnknown(id) => {
+            ("OverlayFrontierUnknown", Some(id))
+        }
+        ResolutionIncompleteReason::Unclassified(id) => ("Unclassified", Some(id)),
     }
 }
 
@@ -3905,6 +3948,114 @@ pub(super) fn project_absent_member_owners(
 /// definition with no source or intrinsic projection has `None`, while the
 /// others retain their available projections. `None` overall when cancelled.
 ///
+/// A source-free boundary for diagnostic identities. Runtime aliases and
+/// reference-site recipes never leave the selected operation through this API.
+#[derive(Debug, Clone)]
+pub enum SelectedDiagnosticIdentity {
+    Declaration(CodeUnit),
+    Lexical {
+        canonical_name: String,
+        source_file: Option<ProjectFile>,
+    },
+    Named {
+        canonical_name: String,
+    },
+    Unavailable,
+}
+
+/// Missing declaration provenance is a per-item gap for diagnostic evidence,
+/// unlike a resolver's definition query, where it stops authoritative binding.
+/// Every projectable item shares one batched declaration crosswalk read.
+pub(super) fn diagnostic_definition_units(
+    ready: &ReadySelectedResolution<'_, '_>,
+    definitions: &[SemanticId],
+    cancellation: &CancellationToken,
+) -> Result<Option<Vec<SelectedDiagnosticIdentity>>> {
+    let mut result = definitions
+        .iter()
+        .map(|_| SelectedDiagnosticIdentity::Unavailable)
+        .collect::<Vec<_>>();
+    // Reason operands can be runtime aliases with no selected authority. Read
+    // the declaration crosswalk, as selected_public_diagnostic_identity does,
+    // rather than requiring resolver provenance merely to explain a gap.
+    let mut pending = Vec::new();
+    for (index, &definition) in definitions.iter().enumerate() {
+        if let Some(owner) = ready.context_identities.external_owner_identity(definition) {
+            result[index] = SelectedDiagnosticIdentity::Named {
+                canonical_name: owner.owner_fqn.to_string(),
+            };
+        } else if let Some((kind, _)) = ready.context_identities.named_reason(definition) {
+            // A context-owned reason operand keeps its portable kind (for
+            // example UnsupportedMacroGeneratedModule). Its evidence text can
+            // carry paths and other detail, so it stays out of the identity.
+            result[index] = SelectedDiagnosticIdentity::Named {
+                canonical_name: kind.to_owned(),
+            };
+        } else if let (Some(ordinal), Some(key)) = (definition.ordinal(), definition.local_key()) {
+            let coordinate = (
+                SelectedResolutionMountOrdinal::new(ordinal),
+                ResolutionLocalKey::new(i64::from(key)),
+            );
+            pending.push((index, coordinate));
+        }
+    }
+    let mut coordinates = pending
+        .iter()
+        .map(|(_, coordinate)| *coordinate)
+        .collect::<Vec<_>>();
+    coordinates.sort_unstable();
+    coordinates.dedup();
+    let Some(mut rows) = read_fragment_definition_rows(ready, &coordinates, cancellation)? else {
+        return Ok(None);
+    };
+    let mounts = SelectedMountTable::new(&ready.inventory);
+    let mut projected = BTreeMap::new();
+    for coordinate in coordinates {
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        let mount = mounts.mount_by_ordinal(coordinate.0)?;
+        let identity = match rows.units.get(&coordinate) {
+            Some(unit_rows) if mount.semantic_language() == Language::Rust => {
+                let mut units = unit_rows
+                    .iter()
+                    .map(|row| RustMountUnits::new(ready, &mount)?.unit(row))
+                    .collect::<Result<Vec<_>>>()?;
+                units.sort_unstable();
+                units.dedup();
+                if units.len() == 1 {
+                    SelectedDiagnosticIdentity::Declaration(units.remove(0))
+                } else {
+                    SelectedDiagnosticIdentity::Unavailable
+                }
+            }
+            // A definition without a parser unit can still be a lexical
+            // declaration; dropping it would give distinct targets one fact.
+            _ => match project_fragment_definition(ready, coordinate, &mut rows)? {
+                Some(SelectedNativeDefinition::Unit(unit)) => {
+                    SelectedDiagnosticIdentity::Declaration(unit)
+                }
+                Some(SelectedNativeDefinition::Lexical(definition)) => {
+                    SelectedDiagnosticIdentity::Lexical {
+                        canonical_name: definition.identifier,
+                        source_file: definition.source_file,
+                    }
+                }
+                Some(
+                    SelectedNativeDefinition::Intrinsic { .. }
+                    | SelectedNativeDefinition::ExternalOwner { .. },
+                ) => unreachable!("a fragment-local coordinate projects a unit or lexical item"),
+                None => SelectedDiagnosticIdentity::Unavailable,
+            },
+        };
+        projected.insert(coordinate, identity);
+    }
+    for (index, coordinate) in pending {
+        result[index] = projected[&coordinate].clone();
+    }
+    Ok(Some(result))
+}
+
 /// Each entry is what [`project_native_definition_units`] returns for that
 /// definition alone, so a caller that needs per-definition outcomes does not
 /// have to call it once per definition.
@@ -4600,12 +4751,35 @@ impl SelectedResolutionOperation<'_, '_> {
     }
 }
 
+/// Selected definition crosswalks already projected, by mount. A walk that
+/// locates many units projects each mount's definitions once.
+#[derive(Default)]
+#[doc(hidden)]
+pub struct HierarchyCrosswalkCache(HashMap<u32, Vec<(SemanticId, SelectedNativeDefinition)>>);
+
 impl SelectedResolutionOperation<'_, '_> {
     /// Locate a source unit through the selected definition crosswalk. A unit's
     /// declaration extent is not its identifier span, so it is not a locator.
     pub fn selected_hierarchy_definition(
         &self,
         target: &CodeUnit,
+        cancellation: &CancellationToken,
+        session: &ResolutionSession,
+    ) -> Result<LocatedSemantic> {
+        self.selected_hierarchy_definition_cached(
+            target,
+            &mut HierarchyCrosswalkCache::default(),
+            cancellation,
+            session,
+        )
+    }
+
+    /// As `selected_hierarchy_definition`, projecting each mount's crosswalk
+    /// into `cache` the first time a unit of that mount is located.
+    pub fn selected_hierarchy_definition_cached(
+        &self,
+        target: &CodeUnit,
+        cache: &mut HierarchyCrosswalkCache,
         cancellation: &CancellationToken,
         session: &ResolutionSession,
     ) -> Result<LocatedSemantic> {
@@ -4617,45 +4791,506 @@ impl SelectedResolutionOperation<'_, '_> {
         else {
             return Ok(LocatedSemantic::Missing);
         };
-        let super::super::selected_definition::SelectedDefinitionSemanticReadOutcome::Ready(rows) =
-            self.ready
-                .inventory
-                .hierarchy_definition_semantics_for_mount(mount.ordinal(), cancellation)?
-        else {
-            return Ok(LocatedSemantic::Cancelled);
-        };
-        let mut definitions = rows
-            .iter()
-            .map(|(key, _)| {
-                let key = u32::try_from(key.get()).map_err(|_| {
-                    StoreError::new(format!("selected definition key does not fit u32: {key:?}"))
-                })?;
-                Ok(SemanticId::local(mount.ordinal().get(), key))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        definitions.sort_unstable();
-        definitions.dedup();
-        match self.selected_hierarchy_definition_units(&definitions, cancellation, session)? {
-            SelectedNativeDefinitions::Ready(units) => {
-                let found = units
+        let ordinal = mount.ordinal().get();
+        let units = match cache.0.entry(ordinal) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let super::super::selected_definition::SelectedDefinitionSemanticReadOutcome::Ready(
+                    rows,
+                ) = self
+                    .ready
+                    .inventory
+                    .hierarchy_definition_semantics_for_mount(mount.ordinal(), cancellation)?
+                else {
+                    return Ok(LocatedSemantic::Cancelled);
+                };
+                let mut definitions = rows
                     .iter()
-                    .filter_map(|(id, definition)| match definition {
-                        SelectedNativeDefinition::Unit(unit) if unit == target => Some(*id),
-                        _ => None,
+                    .map(|(key, _)| {
+                        let key = u32::try_from(key.get()).map_err(|_| {
+                            StoreError::new(format!(
+                                "selected definition key does not fit u32: {key:?}"
+                            ))
+                        })?;
+                        Ok(SemanticId::local(mount.ordinal().get(), key))
                     })
-                    .collect::<Vec<_>>();
-                match found.as_slice() {
-                    [] => Err(StoreError::new(format!(
-                        "selected JVM definition crosswalk does not contain {target:?}: {units:?}"
-                    ))),
-                    [definition] => Ok(LocatedSemantic::Found(*definition)),
-                    _ => Err(StoreError::new(format!(
-                        "selected JVM unit has several definition identities: {target:?}, {found:?}"
-                    ))),
+                    .collect::<Result<Vec<_>>>()?;
+                definitions.sort_unstable();
+                definitions.dedup();
+                match self.selected_hierarchy_definition_units(
+                    &definitions,
+                    cancellation,
+                    session,
+                )? {
+                    SelectedNativeDefinitions::Ready(units) => entry.insert(units),
+                    SelectedNativeDefinitions::Cancelled => return Ok(LocatedSemantic::Cancelled),
+                    SelectedNativeDefinitions::Unavailable => return Ok(LocatedSemantic::Missing),
                 }
             }
-            SelectedNativeDefinitions::Cancelled => Ok(LocatedSemantic::Cancelled),
-            SelectedNativeDefinitions::Unavailable => Ok(LocatedSemantic::Missing),
+        };
+        let found = units
+            .iter()
+            .filter_map(|(id, definition)| match definition {
+                SelectedNativeDefinition::Unit(unit) if unit == target => Some(*id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        match found.as_slice() {
+            // Source units can be class-shaped without hierarchy semantics,
+            // as with Python's PEP 695 type aliases.
+            [] => Ok(LocatedSemantic::Missing),
+            [definition] => Ok(LocatedSemantic::Found(*definition)),
+            _ => Err(StoreError::new(format!(
+                "selected JVM unit has several definition identities: {target:?}, {found:?}"
+            ))),
+        }
+    }
+}
+
+// These accessors use selected rows and registry identities, never source ASTs.
+impl ReadySelectedResolution<'_, '_> {
+    fn recorded_operator_inventory(
+        &self,
+        kind: crate::analyzer::read_ledger::LookupKind,
+        name: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<crate::analyzer::store::rust_inventory::RustInventoryRows>> {
+        use crate::analyzer::read_ledger::LookupQuestion;
+        use crate::analyzer::store::rust_inventory::{
+            RustInventoryReadinessMemo, rust_inventory_answer_on_connection,
+        };
+        let Some(analyzer) = self
+            .rust_macro_invocation_services
+            .as_deref()
+            .or(self.analyzer)
+        else {
+            return Ok(None);
+        };
+        let question = LookupQuestion::Name {
+            language: Some(Language::Rust),
+            name: name.into(),
+        };
+        let Some(answer) = rust_inventory_answer_on_connection(
+            self.inventory.connection(),
+            &self.snapshots,
+            kind,
+            &question,
+            cancellation,
+            usize::MAX,
+            &RustInventoryReadinessMemo::default(),
+        )?
+        else {
+            return Ok(None);
+        };
+        if !analyzer.record_selected_rust_inventory(kind, question, answer.digest)
+            || !answer.incomplete.is_empty()
+        {
+            return Ok(None);
+        }
+        Ok(Some(answer.rows))
+    }
+
+    fn selected_operator_files_for_blob(&self, oid: git2::Oid) -> Result<Vec<ProjectFile>> {
+        self.inventory
+            .connection()
+            .prepare_cached(
+                "SELECT mount.persisted_relative_path FROM main.blobs AS blob
+             JOIN temp.selected_resolution_mounts AS mount ON mount.blob_id=blob.id
+             WHERE blob.blob_oid=?1 AND blob.lang='rust' AND mount.storage_language='rust'
+             ORDER BY mount.persisted_relative_path",
+            )?
+            .query_map([oid.to_string()], |row| row.get::<_, String>(0))?
+            .map(|row| {
+                row.map(|path| ProjectFile::new(self.project.root(), path))
+                    .map_err(Into::into)
+            })
+            .collect()
+    }
+}
+
+impl ReadySelectedResolution<'_, '_> {
+    fn binary_nominal_unit(
+        &self,
+        identity: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<brokk_bifrost_core::analyzer::model::CodeUnit>> {
+        let Some(SelectedSemanticProvenance::FragmentLocal(provenance)) = self
+            .lexical_source()
+            .semantic_provenance(identity, cancellation)?
+        else {
+            return Ok(None);
+        };
+        let coordinate = (provenance.mount().ordinal(), provenance.local_key());
+        let Some(mut rows) = read_fragment_definition_rows(self, &[coordinate], cancellation)?
+        else {
+            return Ok(None);
+        };
+        let Some(unit_rows) = rows.units.remove(&coordinate) else {
+            return Ok(None);
+        };
+        let mount = SelectedMountTable::new(&self.inventory).mount_by_ordinal(coordinate.0)?;
+        if mount.semantic_language() != Language::Rust {
+            return Ok(None);
+        }
+        let units = super::RustMountUnits::new(self, &mount)?;
+        let mut selected = None;
+        for row in unit_rows {
+            let unit = units.unit(&row)?;
+            if selected.as_ref().is_some_and(|previous| previous != &unit) {
+                return Ok(None);
+            }
+            selected = Some(unit);
+        }
+        let Some(unit) = selected else {
+            return Ok(None);
+        };
+        if let Some(analyzer) = self.analyzer {
+            analyzer.record_source_read(unit.source());
+        }
+        Ok(Some(unit))
+    }
+}
+
+impl super::super::language_support::SelectedTypeHeadSource for ReadySelectedResolution<'_, '_> {
+    fn record_selected_derivation(
+        &self,
+        kind: crate::analyzer::semantic::derivation::DerivationKindId,
+        question: &crate::analyzer::semantic::derivation::DerivationQuestion,
+    ) {
+        if let Some(services) = self
+            .rust_macro_invocation_services
+            .as_deref()
+            .or(self.analyzer)
+        {
+            services.record_selected_derivation(&self.inventory, kind, question);
+        } else if let Some(reuse) = self.read_reuse {
+            reuse.refuse_read_reuse();
+        }
+    }
+
+    fn nominal_head_identity(
+        &self,
+        head: super::super::language_support::SelectedNominalHead<'_>,
+    ) -> Result<
+        super::super::language_support::SelectedTypeEvaluationRead<
+            super::super::language_support::SelectedNominalHeadDeclaration,
+        >,
+    > {
+        use super::super::language_support::{
+            SelectedNominalHead, SelectedTypeEvaluationRead as Read,
+            SelectedTypeEvaluationUnavailable as Stop,
+        };
+        let SelectedNominalHead::Declaration(identity) = head else {
+            return Ok(Read::Unavailable(Stop::IdentityUnavailable));
+        };
+        Ok(
+            match self.binary_nominal_unit(identity, &CancellationToken::default())? {
+                Some(unit) => Read::Available(
+                    super::super::language_support::SelectedNominalHeadDeclaration {
+                        identity: unit.declaration_id(),
+                        declaration: unit,
+                    },
+                ),
+                None => Read::Unavailable(Stop::IdentityUnavailable),
+            },
+        )
+    }
+    fn operator_candidate_files(
+        &self,
+        trait_name: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<
+        super::super::language_support::SelectedTypeProofRead<
+            super::super::language_support::SelectedOperatorCandidates,
+        >,
+    > {
+        use super::super::language_support::SelectedTypeProofRead;
+        use crate::analyzer::read_ledger::LookupKind;
+        use crate::analyzer::store::rust_inventory::RustInventoryRows;
+        let unavailable = || Ok(SelectedTypeProofRead::Unavailable);
+        let mut spellings = HashSet::default();
+        let mut pending = vec![trait_name.to_owned()];
+        while let Some(spelling) = pending.pop() {
+            if cancellation.is_cancelled() {
+                return unavailable();
+            }
+            if !spellings.insert(spelling.clone()) {
+                continue;
+            }
+            let Some(RustInventoryRows::Imports(blobs)) = self.recorded_operator_inventory(
+                LookupKind::RustModuleImportCandidateInventory,
+                &spelling,
+                cancellation,
+            )?
+            else {
+                return unavailable();
+            };
+            for blob in blobs {
+                let files = self.selected_operator_files_for_blob(blob)?;
+                if files.is_empty() {
+                    return unavailable();
+                }
+                for file in files {
+                    let Some((_, imports)) =
+                        self.selected_rust_import_infos(&file, None, cancellation)?
+                    else {
+                        return unavailable();
+                    };
+                    if let Some(analyzer) = self.analyzer {
+                        analyzer.record_source_read(&file);
+                    }
+                    for import in imports {
+                        if import.path.as_ref().and_then(|path| path.segments.last())
+                            == Some(&spelling)
+                            && let Some(alias) = import.alias
+                        {
+                            pending.push(alias);
+                        }
+                    }
+                }
+            }
+        }
+        let mut files = HashSet::default();
+        for spelling in &spellings {
+            let Some(RustInventoryRows::Occurrences(rows)) = self.recorded_operator_inventory(
+                LookupKind::RustIdentifierOccurrenceInventory,
+                spelling,
+                cancellation,
+            )?
+            else {
+                return unavailable();
+            };
+            if rows.iter().any(|(_, mask)| {
+                mask & brokk_bifrost_core::analyzer::rust_facts::RUST_OCCURRENCE_MACRO != 0
+            }) {
+                return unavailable();
+            }
+            let Some(RustInventoryRows::Unresolved(rows)) = self.recorded_operator_inventory(
+                LookupKind::RustUnresolvedTraitImplInventory,
+                spelling,
+                cancellation,
+            )?
+            else {
+                return unavailable();
+            };
+            for (_, path, _) in rows {
+                // The immutable summary's blob is a recipe input, not current
+                // declaration authority after a body-only edit. Parse only the
+                // operation's current selected mount for that placed path.
+                if self
+                    .inventory
+                    .mount_record_for_path("rust", &path)?
+                    .is_none()
+                {
+                    return unavailable();
+                }
+                files.insert(ProjectFile::new(self.project.root(), path));
+            }
+        }
+        Ok(SelectedTypeProofRead::Available(
+            super::super::language_support::SelectedOperatorCandidates {
+                files: files.into_iter().collect(),
+                spellings: spellings.into_iter().collect(),
+            },
+        ))
+    }
+    fn standard_type_root(
+        &self,
+        file: &ProjectFile,
+        name: &str,
+    ) -> Result<super::super::language_support::SelectedTypeProofRead<bool>> {
+        use super::super::language_support::SelectedTypeProofRead;
+        use super::rust_crate_rows::RustAbsoluteRoot;
+        // External paths also describe unindexed dependencies. A dependency
+        // named std/core is not the language's sysroot merely by spelling.
+        // Keep absolute_root as the sole route resolver and verify its external
+        // answer against the selected dependency authority before classifying
+        // an operator's standard trait identity.
+        let external_dependency = self.inventory.connection().prepare_cached(
+            "SELECT 1 FROM temp.selected_rust_unit_summaries AS unit
+ JOIN main.resolution_unit_summary_members AS member USING(summary_id)
+ JOIN main.rust_unit_summary_dependency_names AS name USING(summary_id)
+ JOIN main.resolution_unit_summary_dependencies AS dependency
+   ON dependency.summary_id=name.summary_id AND dependency.dependency_ordinal=name.dependency_ordinal
+ WHERE member.rel_path=?1 AND name.extern_name=?2 AND dependency.boundary<>'standard'
+ LIMIT 1",
+        )?.exists(rusqlite::params![selected_path_key(file.rel_path()), name])?;
+        if external_dependency {
+            return Ok(SelectedTypeProofRead::Unavailable);
+        }
+        let cancellation = CancellationToken::default();
+        Ok(
+            match self.rust_absolute_root(file, name, ResolutionNamespace::Type, &cancellation)? {
+                RustAbsoluteRoot::External(path) if path.as_slice() == [name] => {
+                    SelectedTypeProofRead::Available(true)
+                }
+                _ => SelectedTypeProofRead::Unavailable,
+            },
+        )
+    }
+    fn type_reference(
+        &self,
+        file: &ProjectFile,
+        range: std::ops::Range<usize>,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<SemanticId>> {
+        let locator = SelectedSemanticLocator::for_reference_range_in_namespace(
+            "rust",
+            selected_path_key(file.rel_path()),
+            range.start,
+            range.end,
+            ResolutionNamespace::Type,
+        );
+        Ok(
+            match self.lookup_locators_in_session(
+                &self.lexical_source(),
+                &locator,
+                cancellation,
+                &ResolutionSession::unbounded(),
+            )? {
+                LocatedSemantics::Found(references) => match references.as_slice() {
+                    [reference] => Some(*reference),
+                    _ => None,
+                },
+                LocatedSemantics::Missing | LocatedSemantics::Cancelled => None,
+            },
+        )
+    }
+    fn named_reason(&self, semantic: SemanticId) -> Option<(&'static str, std::sync::Arc<str>)> {
+        self.context_identities.named_reason(semantic)
+    }
+    fn cached_external_type_import_paths(&self, semantic: SemanticId) -> Vec<Vec<String>> {
+        self.context_identities.external_type_import_paths(semantic)
+    }
+    fn external_type_import_path(&mut self, semantic: SemanticId) -> Result<Option<Vec<String>>> {
+        let paths = self.context_identities.external_type_import_paths(semantic);
+        Ok(match paths.as_slice() {
+            [path] => Some(path.clone()),
+            _ => None,
+        })
+    }
+    fn slot_file(&self, slot: SemanticId) -> Result<Option<ProjectFile>> {
+        let Some(ordinal) = slot.ordinal() else {
+            return Ok(None);
+        };
+        let mount = SelectedMountTable::new(&self.inventory)
+            .mount_by_ordinal(SelectedResolutionMountOrdinal::new(ordinal))?;
+        Ok(Some(ProjectFile::new(
+            self.project.root(),
+            mount.persisted_relative_path(),
+        )))
+    }
+    fn selected_owner(
+        &self,
+        identity: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<super::super::language_support::SelectedTypeOwner>> {
+        use super::super::language_support::SelectedTypeOwner;
+        let typed = self.typed_source();
+        if identity.shared_name_id().is_some() {
+            let digest = self.identity_content_digest(identity.into(), cancellation)?;
+            if let Some(entry) = crate::analyzer::resolution::universe::entry_for_digest(digest) {
+                return Ok(Some(SelectedTypeOwner::Intrinsic(entry)));
+            }
+        }
+        if let Some(symbol) = self.context_identities.model_member_identity(identity) {
+            return Ok(Some(SelectedTypeOwner::Model(symbol)));
+        }
+        use crate::analyzer::resolution::SelectedTypedFactSource;
+        let paths = self.context_identities.external_type_import_paths(identity);
+        match paths.as_slice() {
+            [path] if !path.is_empty() => {
+                return Ok(Some(SelectedTypeOwner::ExternalPath(path.clone())));
+            }
+            [] | [_] => {}
+            _ => return Ok(None),
+        }
+        if let Some(path) = typed.rust_external_type_import_path(identity, cancellation)?
+            && !path.is_empty()
+        {
+            return Ok(Some(SelectedTypeOwner::ExternalPath(path)));
+        }
+        let Some(unit) = self.binary_nominal_unit(identity, cancellation)? else {
+            return Ok(None);
+        };
+        // #12237: generic and mutable-reference structure must be selected
+        // explicitly before the binary bridge can admit those operands.
+        let mut generic = false;
+        let outcome = typed.visit_generic_formal_pages_for_owners(
+            crate::analyzer::resolution::fact_source::TypedFactRequest::new(&[identity]),
+            cancellation,
+            &mut crate::analyzer::resolution::fact_source::TypedFactPageVisitor::new(&mut |rows| {
+                generic |= !rows.is_empty();
+                Ok(true)
+            }),
+        )?;
+        if generic
+            || !outcome.is_exhausted()
+            || outcome.evidence() != &ResolutionCompletion::Complete
+        {
+            return Ok(None);
+        }
+        if let Some(analyzer) = self.analyzer {
+            analyzer.record_source_read(unit.source());
+        }
+        Ok(Some(SelectedTypeOwner::Source(unit)))
+    }
+    fn intern_owner(
+        &self,
+        owner: &super::super::language_support::SelectedTypeOwner,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<SemanticId>> {
+        use super::super::language_support::SelectedTypeOwner;
+        match owner {
+            SelectedTypeOwner::Intrinsic(entry) => {
+                let names = self
+                    .inventory
+                    .shared_name_table()
+                    .interner(self.inventory.connection());
+                Ok(Some(SemanticId::shared_name(names.intern(
+                    crate::analyzer::resolution::universe::identity_digest(*entry),
+                ))))
+            }
+            SelectedTypeOwner::Model(symbol) => {
+                let names = self
+                    .inventory
+                    .shared_name_table()
+                    .interner(self.inventory.connection());
+                Ok(Some(
+                    self.context_identities
+                        .model_member_semantic(symbol, &names),
+                ))
+            }
+            SelectedTypeOwner::Source(unit) => {
+                let path = brokk_bifrost_core::path_utils::rel_path_string(unit.source());
+                let Some(ordinal) = self.inventory.mount_ordinal_for_path("rust", &path)? else {
+                    return Ok(None);
+                };
+                let super::super::selected_definition::SelectedDefinitionSemanticReadOutcome::Ready(
+                    rows,
+                ) = self
+                    .inventory
+                    .selected_definition_semantics_for_mount(ordinal, cancellation)?
+                else {
+                    return Ok(None);
+                };
+                let mount = SelectedMountTable::new(&self.inventory).mount_by_ordinal(ordinal)?;
+                let units = super::RustMountUnits::new(self, &mount)?;
+                let mut selected = None;
+                for (key, row) in rows {
+                    if units.unit(&row)? == *unit {
+                        if selected.is_some() {
+                            return Ok(None);
+                        }
+                        selected = Some(SemanticId::local(
+                            ordinal.get(),
+                            u32::try_from(key.get()).expect("catalog key fits u32"),
+                        ));
+                    }
+                }
+                Ok(selected)
+            }
+            SelectedTypeOwner::ExternalPath(_) => Ok(None),
         }
     }
 }

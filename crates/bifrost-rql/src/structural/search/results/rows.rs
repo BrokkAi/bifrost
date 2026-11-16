@@ -3,6 +3,7 @@ use crate::analyzer::semantic::{
     DurablePortIdentity, ProcedureLocalLocator, RuntimeKeyedReadEndpoint,
     SemanticArtifactLeaseCharge, ValueId,
 };
+use brokk_bifrost_core::analyzer::reuse_verdict::CarriesReuseVerdict;
 
 #[derive(Debug)]
 pub struct DetailedCodeQueryResult {
@@ -11,11 +12,26 @@ pub struct DetailedCodeQueryResult {
     /// The budgeted lanes `work` does not publish, for a caller that merges
     /// several executions and must see every cumulative cap.
     pub budgeted_work: CodeQueryBudgetedWork,
+    /// The sites behind `budgeted_work.candidate_sites`. A caller that unions
+    /// several executions of different leaves of one union needs the sites
+    /// themselves, because the sum of their counts counts a shared site twice.
+    pub(in crate::structural::search) candidate_site_set: crate::hash::HashSet<SeedSite>,
     pub evidence: Vec<DetailedCodeQueryEvidence>,
     pub profile: Option<QueryExecutionProfile>,
     #[doc(hidden)]
     pub depth_answers: Vec<super::super::units::BoundedCallAnswer>,
     pub(in crate::structural::search) semantic_receipt: Option<CodeQuerySemanticReceipt>,
+    /// Whether these rows may be kept: `Content`, or the least stable
+    /// execution dependence the execution marked. Until the ambient channel is
+    /// deleted, the marks themselves still decide and this verdict is never
+    /// stricter than them.
+    pub reuse: ReuseVerdict,
+}
+
+impl CarriesReuseVerdict for DetailedCodeQueryResult {
+    fn reuse_verdict(&self) -> ReuseVerdict {
+        self.reuse
+    }
 }
 
 /// Identity-preserving semantic charge produced by an opted-in detailed
@@ -25,7 +41,9 @@ pub struct DetailedCodeQueryResult {
 /// needs the budget's artifact/file identities; flattening this value to
 /// public work counters would make the compiler pay those materializations
 /// again. Receipt-enabled result-contract windows also retain the exact
-/// complete artifact dependency allocations behind usable rows. The policy
+/// artifact dependency allocations and selected-proof owners behind usable rows.
+/// Partial artifacts retained by a positive source proof keep their original
+/// provider quality; a lease is allocation accounting, not Complete evidence. The policy
 /// consumer must either atomically admit those dependencies under its own
 /// physical-memory authority or drop the receipt.
 pub struct CodeQuerySemanticReceipt {
@@ -89,6 +107,9 @@ impl std::fmt::Debug for CodeQuerySemanticReceipt {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DetailedCodeQueryEvidence {
+    /// Query-local language-rule admission. Never serialized or reused as a unit product.
+    pub selected_pattern_source: SelectedPatternSourceEvidence,
+    pub call_path_evidence: Option<super::super::expansions::CallPathEvidence>,
     pub result_index: usize,
     pub domain: DetailedCodeQueryDomain,
     pub key: DetailedCodeQueryKey,
@@ -107,6 +128,53 @@ pub struct DetailedCodeQueryEvidence {
     /// Runtime-only exact endpoint retained for policy matched-value binding.
     /// This is never serialized or carried by a reusable unit product.
     pub runtime_keyed_read: Option<RuntimeKeyedReadEndpoint>,
+}
+
+/// Runtime-only selected-field authority from the language rule that emitted
+/// this exact row. A conflict cannot fall back to an ordinary matched source.
+#[derive(Clone, Default)]
+pub enum SelectedPatternSourceEvidence {
+    #[default]
+    NotRequired,
+    Admitted(Arc<brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::SelectedPatternObservation>),
+    Conflict,
+}
+
+impl std::fmt::Debug for SelectedPatternSourceEvidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NotRequired => "NotRequired",
+            Self::Admitted(_) => "Admitted",
+            Self::Conflict => "Conflict",
+        })
+    }
+}
+
+impl PartialEq for SelectedPatternSourceEvidence {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::NotRequired, Self::NotRequired) | (Self::Conflict, Self::Conflict) => true,
+            (Self::Admitted(left), Self::Admitted(right)) => Arc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
+}
+impl Eq for SelectedPatternSourceEvidence {}
+
+impl SelectedPatternSourceEvidence {
+    /// Merge only after the pipeline has established identical output keys.
+    /// Allocation equality is deliberately conservative: independently produced
+    /// proofs are conflicting, even if their source spans or receipts match.
+    pub(crate) fn merge(&mut self, other: &Self) {
+        *self = match (&*self, other) {
+            (Self::Conflict, _) | (_, Self::Conflict) => Self::Conflict,
+            (Self::NotRequired, value) | (value, Self::NotRequired) => value.clone(),
+            (Self::Admitted(left), Self::Admitted(right)) if Arc::ptr_eq(left, right) => {
+                Self::Admitted(Arc::clone(left))
+            }
+            (Self::Admitted(_), Self::Admitted(_)) => Self::Conflict,
+        };
+    }
 }
 
 /// Exact semantic selection evidence for a decorated parameter.
@@ -166,7 +234,7 @@ pub struct DetailedCodeQueryIdentityCandidate {
     pub candidate: CodeQueryStableOwnerCandidate,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum CodeQueryStableOwnerCandidate {
     Declaration {
@@ -221,7 +289,7 @@ impl<'de> Deserialize<'de> for CodeQueryStableOwnerCandidate {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CodeQueryStableOwnerDerivation {
     CanonicalAstIdentity,
@@ -339,6 +407,9 @@ impl CodeQueryRowField {
     /// The source parser attaches this text to matching `filter` field names.
     pub fn rql_help_for_name(name: &str) -> Option<&'static str> {
         match name {
+            "reason_codes" => Some(
+                "Ordered Open reason codes. RQL compares the whole list; per-code membership filtering is not supported yet. Inspect the JSON open_reasons for typed per-code data.",
+            ),
             "base_branch_definition_count" => Some(
                 "Number of distinct same-name member declarations found under resolved direct base branches.",
             ),
@@ -610,8 +681,9 @@ mod value_domain {
     ];
     pub(super) const MODEL_PROOF: &[&str] = &["authored_anchor", "exact_artifact", "pack_fact"];
     pub(super) const MODEL_COMPLETENESS: &[&str] = &["partial", "complete"];
-    pub(super) const TARGET_ORIGIN: &[&str] = &["source", "semantic_model"];
-    pub(super) const SELECTOR_PROOF: &[&str] = &["derived", "authored_summary"];
+    pub(super) const TARGET_ORIGIN: &[&str] = &["source", "semantic_model", "language_intrinsic"];
+    pub(super) const SELECTOR_PROOF: &[&str] =
+        &["derived", "authored_summary", "resolver_declaration"];
     pub(super) const DISPATCH_BOUNDARY_KIND: &[&str] = DispatchBoundaryKind::LABELS;
     pub(super) const DISPATCH_BOUNDARY_REASON: &[&str] =
         crate::analyzer::semantic::DispatchBoundaryPartialCause::LABELS;
@@ -2519,6 +2591,7 @@ detailed_row_domains! {
                     CodeQueryRowField::required_enum("proof", value_domain::ASSIGNMENT_PROOF),
                     CodeQueryRowField::required_enum("coverage", value_domain::EFFECT_COVERAGE),
                     CodeQueryRowField::optional("reason", Scalar::String),
+                    CodeQueryRowField::required("reason_codes", Scalar::StringList),
         ],
     },
     DetachedTaskTransfer => "detached_task_transfer" {
@@ -3462,6 +3535,7 @@ detailed_row_domains! {
             CodeQueryRowField::optional("decorator_count", Scalar::Integer),
             CodeQueryRowField::optional("is_override", Scalar::Boolean),
             CodeQueryRowField::optional("is_property_accessor", Scalar::Boolean),
+            CodeQueryRowField::optional_constrained_enum("entry_point", value_domain::PYTHON_TRI_STATE_DOMAIN),
             CodeQueryRowField::optional("public_method_count", Scalar::Integer),
             CodeQueryRowField::optional("has_inheritance", Scalar::Boolean),
             CodeQueryRowField::optional("has_subclasses", Scalar::Boolean),
@@ -5555,6 +5629,9 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::AssignmentRelation { value }, "reason") => {
             value.reason.map(Scalar::String)
         }
+        (CodeQueryResultValue::AssignmentRelation { value }, "reason_codes") => {
+            Some(Scalar::StringList(&value.reason_codes))
+        }
         (CodeQueryResultValue::DetachedTaskTransfer { value }, "id") => {
             Some(Scalar::StableId(&value.id))
         }
@@ -6968,6 +7045,9 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::PythonRuleFact { value }, "is_property_accessor") => {
             value.is_property_accessor.map(Scalar::Boolean)
         }
+        (CodeQueryResultValue::PythonRuleFact { value }, "entry_point") => {
+            value.entry_point.map(Scalar::ConstrainedEnum)
+        }
         (CodeQueryResultValue::PythonRuleFact { value }, "public_method_count") => value
             .public_method_count
             .map(|count| Scalar::Integer(count as u64)),
@@ -7520,6 +7600,9 @@ pub enum DetailedCodeQueryKey {
         site_id: String,
         root_id: String,
         ordinal: usize,
+        /// The target's semantic locator, without the positional site or the
+        /// lever-scoped artifact fingerprint that `id` folds (#12029).
+        selection_key: String,
     },
     MemberFamily {
         id: String,

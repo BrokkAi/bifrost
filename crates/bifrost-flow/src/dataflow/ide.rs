@@ -1255,6 +1255,80 @@ pub(crate) struct RecordedIdeRelations<Fact, EdgeFunction> {
 }
 
 impl<Fact, EdgeFunction> RecordedIdeRelations<Fact, EdgeFunction> {
+    pub(crate) fn owned_bytes(&self, function_heap: impl Fn(&EdgeFunction) -> usize) -> usize {
+        use crate::analyzer::store::cache_budget::RetainedHeap;
+        let mut heap = RetainedHeap::default();
+        heap.add(std::mem::size_of::<Self>());
+        let key_heap = |key: &TransferKey<Fact>, heap: &mut RetainedHeap| {
+            heap.add(super::retained_evidence_bytes(
+                Some(&key.edge.proof),
+                Some(&key.edge.completeness),
+            ));
+            heap.add(super::witness::dispatch_boundary_heap_bytes(
+                key.edge.boundary.as_ref(),
+            ));
+            for context in key.caller_context.iter().chain(key.callee_context.iter()) {
+                heap.owned_slice(context.calls());
+            }
+            if let Some(call) = &key.call_transfer {
+                heap.add(super::retained_evidence_bytes(
+                    Some(&call.proof),
+                    Some(&call.completeness),
+                ));
+                if let Some(argument) = &call.argument_callable {
+                    heap.arc(argument, |argument, heap| {
+                        heap.slice(&argument.captures);
+                        heap.slice(&argument.capture_bindings);
+                        heap.slice(&argument.binding);
+                        heap.owned_slice(argument.caller_context.calls());
+                        if let Some(producer) = argument.producer() {
+                            heap.slice(producer.captures());
+                            heap.slice(producer.capture_bindings());
+                        }
+                    });
+                }
+            }
+        };
+        heap.vec(&self.trace.records);
+        heap.map(&self.trace.ids);
+        for record in &self.trace.records {
+            key_heap(&record.key, &mut heap);
+            heap.vec(&record.outputs);
+        }
+        for key in self.trace.ids.keys() {
+            key_heap(key, &mut heap);
+        }
+        heap.vec(&self.trace.functions);
+        heap.map(&self.trace.function_ids);
+        heap.vec(&self.functions);
+        for function in self
+            .trace
+            .functions
+            .iter()
+            .chain(self.trace.function_ids.keys())
+            .chain(self.functions.iter())
+        {
+            heap.add(function_heap(function));
+        }
+        heap.vec(&self.graph.direct_by_source);
+        for row in &self.graph.direct_by_source {
+            heap.vec(row);
+        }
+        heap.vec(&self.graph.summaries);
+        heap.vec(&self.graph.summaries_by_dependency);
+        for row in &self.graph.summaries_by_dependency {
+            heap.vec(row);
+        }
+        heap.vec(&self.graph.entry_values_by_entry);
+        for row in &self.graph.entry_values_by_entry {
+            heap.vec(row);
+        }
+        heap.vec(&self.graph.entry_rows);
+        heap.vec(&self.graph.row_entries);
+        heap.vec(&self.graph.end_summary_exit_rows);
+        heap.total()
+    }
+
     pub(crate) fn trace(&self) -> &IdeTrace<Fact, EdgeFunction> {
         &self.trace
     }

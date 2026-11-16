@@ -2,7 +2,7 @@
 //!
 //! Catalogs are machine registration inputs. They never trigger ambient
 //! discovery, network access, or solver work. Registration validates the full
-//! schema-v1 model, normalizes every semantic set, hashes canonical typed JSON,
+//! schema model, normalizes every semantic set, hashes canonical typed JSON,
 //! and then updates the bounded registry transactionally.
 
 use std::collections::{HashMap, HashSet};
@@ -679,7 +679,7 @@ impl fmt::Display for CatalogRegistryError {
             }
             Self::UnsupportedSchemaVersion { found } => write!(
                 formatter,
-                "unsupported catalog schema version {found}; expected {POLICY_DOCUMENT_SCHEMA_VERSION}"
+                "unsupported catalog schema version {found}; expected 1 or {POLICY_DOCUMENT_SCHEMA_VERSION}"
             ),
             Self::ZeroVersion => formatter.write_str("catalog version must be at least 1"),
             Self::EmptyCatalog => formatter.write_str("catalog must contain at least one entry"),
@@ -779,7 +779,7 @@ impl fmt::Display for CatalogEntryKind {
 fn normalize_and_validate_catalog(
     mut catalog: TaintCatalogDefinition,
 ) -> Result<TaintCatalogDefinition, CatalogRegistryError> {
-    if catalog.schema_version != POLICY_DOCUMENT_SCHEMA_VERSION {
+    if !matches!(catalog.schema_version, 1 | POLICY_DOCUMENT_SCHEMA_VERSION) {
         return Err(CatalogRegistryError::UnsupportedSchemaVersion {
             found: catalog.schema_version,
         });
@@ -855,19 +855,19 @@ fn normalize_and_validate_catalog(
     }
 
     for source in &mut catalog.sources {
-        normalize_source(source)?;
+        normalize_source(catalog.schema_version, source)?;
     }
     for sink in &mut catalog.sinks {
-        normalize_sink(sink)?;
+        normalize_sink(catalog.schema_version, sink)?;
     }
     for sanitizer in &mut catalog.sanitizers {
-        normalize_sanitizer(sanitizer)?;
+        normalize_sanitizer(catalog.schema_version, sanitizer)?;
     }
     for transform in &mut catalog.transforms {
-        normalize_transform(transform)?;
+        normalize_transform(catalog.schema_version, transform)?;
     }
     for model in &mut catalog.external_models {
-        normalize_external_model(model)?;
+        normalize_external_model(catalog.schema_version, model)?;
     }
 
     catalog
@@ -936,7 +936,10 @@ fn reject_field_port(
     Ok(())
 }
 
-fn normalize_source(source: &mut TaintSourceSpec) -> Result<(), CatalogRegistryError> {
+fn normalize_source(
+    schema_version: u32,
+    source: &mut TaintSourceSpec,
+) -> Result<(), CatalogRegistryError> {
     validate_selector(&source.id, &source.selector)?;
     validate_display_name(CatalogEntryKind::Source, &source.id, &source.display_name)?;
     normalize_nonempty_set(
@@ -946,7 +949,13 @@ fn normalize_source(source: &mut TaintSourceSpec) -> Result<(), CatalogRegistryE
         &mut source.categories,
     )?;
     reject_field_port(CatalogEntryKind::Source, &source.id, &source.bind)?;
-    validate_port(CatalogEntryKind::Source, &source.id, "bind", &source.bind)?;
+    validate_port(
+        schema_version,
+        CatalogEntryKind::Source,
+        &source.id,
+        "bind",
+        &source.bind,
+    )?;
     normalize_nonempty_set(
         CatalogEntryKind::Source,
         &source.id,
@@ -966,7 +975,10 @@ fn normalize_source(source: &mut TaintSourceSpec) -> Result<(), CatalogRegistryE
     Ok(())
 }
 
-fn normalize_sink(sink: &mut TaintSinkSpec) -> Result<(), CatalogRegistryError> {
+fn normalize_sink(
+    schema_version: u32,
+    sink: &mut TaintSinkSpec,
+) -> Result<(), CatalogRegistryError> {
     validate_selector(&sink.id, &sink.selector)?;
     validate_display_name(CatalogEntryKind::Sink, &sink.id, &sink.display_name)?;
     normalize_nonempty_set(
@@ -977,6 +989,7 @@ fn normalize_sink(sink: &mut TaintSinkSpec) -> Result<(), CatalogRegistryError> 
     )?;
     reject_field_port(CatalogEntryKind::Sink, &sink.id, &sink.dangerous_operand)?;
     validate_port(
+        schema_version,
         CatalogEntryKind::Sink,
         &sink.id,
         "dangerous_operand",
@@ -998,7 +1011,10 @@ fn normalize_sink(sink: &mut TaintSinkSpec) -> Result<(), CatalogRegistryError> 
     Ok(())
 }
 
-fn normalize_sanitizer(sanitizer: &mut TaintSanitizerSpec) -> Result<(), CatalogRegistryError> {
+fn normalize_sanitizer(
+    schema_version: u32,
+    sanitizer: &mut TaintSanitizerSpec,
+) -> Result<(), CatalogRegistryError> {
     normalize_set(
         CatalogEntryKind::Sanitizer,
         &sanitizer.id,
@@ -1010,8 +1026,20 @@ fn normalize_sanitizer(sanitizer: &mut TaintSanitizerSpec) -> Result<(), Catalog
         TaintSanitizerKind::Transfer { input, output } => {
             reject_field_port(CatalogEntryKind::Sanitizer, &sanitizer.id, input)?;
             reject_field_port(CatalogEntryKind::Sanitizer, &sanitizer.id, output)?;
-            validate_port(CatalogEntryKind::Sanitizer, &sanitizer.id, "input", input)?;
-            validate_port(CatalogEntryKind::Sanitizer, &sanitizer.id, "output", output)?;
+            validate_port(
+                schema_version,
+                CatalogEntryKind::Sanitizer,
+                &sanitizer.id,
+                "input",
+                input,
+            )?;
+            validate_port(
+                schema_version,
+                CatalogEntryKind::Sanitizer,
+                &sanitizer.id,
+                "output",
+                output,
+            )?;
         }
         TaintSanitizerKind::Conditional { requires, .. } => {
             if requires.len() > 64 {
@@ -1062,7 +1090,10 @@ fn normalize_sanitizer(sanitizer: &mut TaintSanitizerSpec) -> Result<(), Catalog
     )
 }
 
-fn normalize_transform(transform: &mut TaintTransformSpec) -> Result<(), CatalogRegistryError> {
+fn normalize_transform(
+    schema_version: u32,
+    transform: &mut TaintTransformSpec,
+) -> Result<(), CatalogRegistryError> {
     normalize_set(
         CatalogEntryKind::Transform,
         &transform.id,
@@ -1077,12 +1108,14 @@ fn normalize_transform(transform: &mut TaintTransformSpec) -> Result<(), Catalog
         &transform.output,
     )?;
     validate_port(
+        schema_version,
         CatalogEntryKind::Transform,
         &transform.id,
         "input",
         &transform.input,
     )?;
     validate_port(
+        schema_version,
         CatalogEntryKind::Transform,
         &transform.id,
         "output",
@@ -1111,6 +1144,7 @@ fn normalize_transform(transform: &mut TaintTransformSpec) -> Result<(), Catalog
 }
 
 fn normalize_external_model(
+    schema_version: u32,
     model: &mut TaintExternalModelSpec,
 ) -> Result<(), CatalogRegistryError> {
     normalize_set(
@@ -1139,12 +1173,14 @@ fn normalize_external_model(
     }
     for transfer in &mut model.transfers {
         validate_port(
+            schema_version,
             CatalogEntryKind::ExternalModel,
             &model.id,
             "transfer from",
             &transfer.from,
         )?;
         validate_port(
+            schema_version,
             CatalogEntryKind::ExternalModel,
             &model.id,
             "transfer to",
@@ -1276,18 +1312,32 @@ fn validate_selector(
 }
 
 fn validate_port(
+    schema_version: u32,
     kind: CatalogEntryKind,
     id: &TaintEntryId,
     field: &str,
     port: &PolicyPort,
 ) -> Result<(), CatalogRegistryError> {
     match port {
+        PolicyPort::ReturnValue { path: Some(_) }
+            if schema_version
+                < super::definition::PROJECTED_RETURN_VALUE_CATALOG_SCHEMA_VERSION =>
+        {
+            invalid_entry(
+                kind,
+                id,
+                format!(
+                    "{field}: projected returns require catalog schema {} or newer; catalog is pinned to {schema_version}",
+                    super::definition::PROJECTED_RETURN_VALUE_CATALOG_SCHEMA_VERSION,
+                ),
+            )
+        }
         PolicyPort::ArgumentName { name } => {
             validate_catalog_author_text(kind, id, &format!("{field} argument name"), name)
         }
         PolicyPort::FieldOf { base, name } => {
             validate_catalog_author_text(kind, id, &format!("{field} field name"), name)?;
-            validate_port(kind, id, field, base)
+            validate_port(schema_version, kind, id, field, base)
         }
         _ => Ok(()),
     }
@@ -1625,11 +1675,23 @@ enum TransferEffectWire {
 enum PortWire {
     MatchedValue,
     Receiver,
-    ReturnValue,
-    ResultIndex { index: u32 },
-    ArgumentIndex { index: u32 },
-    ArgumentName { name: String },
-    Field { name: String, of: Box<PortWire> },
+    ReturnValue {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        path: Option<brokk_bifrost_analysis::analyzer::semantic_model::SummaryEndpointPath>,
+    },
+    ResultIndex {
+        index: u32,
+    },
+    ArgumentIndex {
+        index: u32,
+    },
+    ArgumentName {
+        name: String,
+    },
+    Field {
+        name: String,
+        of: Box<PortWire>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -1674,6 +1736,8 @@ struct TaggedPortWire {
     name: OptionalWireField<String>,
     #[serde(default)]
     of: OptionalWireField<PortWire>,
+    #[serde(default)]
+    path: OptionalWireField<brokk_bifrost_analysis::analyzer::semantic_model::SummaryEndpointPath>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1695,6 +1759,15 @@ impl<'de> Deserialize<'de> for PortWire {
 
         let tagged = TaggedPortWire::deserialize(deserializer)?;
         let invalid_shape = || D::Error::custom("port fields do not match its type");
+        let path = match tagged.path {
+            OptionalWireField::Missing => None,
+            OptionalWireField::Present(path)
+                if matches!(tagged.kind, PortKindWire::ReturnValue) && !path.is_empty() =>
+            {
+                Some(path)
+            }
+            OptionalWireField::Present(_) => return Err(invalid_shape()),
+        };
         match (tagged.kind, tagged.index, tagged.name, tagged.of) {
             (
                 PortKindWire::MatchedValue,
@@ -1713,7 +1786,7 @@ impl<'de> Deserialize<'de> for PortWire {
                 OptionalWireField::Missing,
                 OptionalWireField::Missing,
                 OptionalWireField::Missing,
-            ) => Ok(Self::ReturnValue),
+            ) => Ok(Self::ReturnValue { path }),
             (
                 PortKindWire::ResultIndex,
                 OptionalWireField::Present(index),
@@ -2283,7 +2356,7 @@ impl From<PortWire> for PolicyPort {
         match port {
             PortWire::MatchedValue => Self::MatchedValue,
             PortWire::Receiver => Self::Receiver,
-            PortWire::ReturnValue => Self::ReturnValue,
+            PortWire::ReturnValue { path } => Self::ReturnValue { path },
             PortWire::ResultIndex { index } => Self::ResultIndex { index },
             PortWire::ArgumentIndex { index } => Self::ArgumentIndex { index },
             PortWire::ArgumentName { name } => Self::ArgumentName { name },
@@ -2300,7 +2373,7 @@ impl From<&PolicyPort> for PortWire {
         match port {
             PolicyPort::MatchedValue => Self::MatchedValue,
             PolicyPort::Receiver => Self::Receiver,
-            PolicyPort::ReturnValue => Self::ReturnValue,
+            PolicyPort::ReturnValue { path } => Self::ReturnValue { path: path.clone() },
             PolicyPort::ResultIndex { index } => Self::ResultIndex { index: *index },
             PolicyPort::ArgumentIndex { index } => Self::ArgumentIndex { index: *index },
             PolicyPort::ArgumentName { name } => Self::ArgumentName { name: name.clone() },
@@ -2405,7 +2478,9 @@ pub(crate) fn endpoint_binding_to_port(binding: &PolicyEndpointBinding) -> Polic
     match binding {
         PolicyEndpointBinding::MatchedValue => PolicyPort::MatchedValue,
         PolicyEndpointBinding::Receiver => PolicyPort::Receiver,
-        PolicyEndpointBinding::ReturnValue => PolicyPort::ReturnValue,
+        PolicyEndpointBinding::ReturnValue { path } => {
+            PolicyPort::ReturnValue { path: path.clone() }
+        }
         PolicyEndpointBinding::ResultIndex { index } => PolicyPort::ResultIndex { index: *index },
         PolicyEndpointBinding::ArgumentIndex { index } => {
             PolicyPort::ArgumentIndex { index: *index }
@@ -2420,7 +2495,7 @@ pub(crate) fn typestate_seed_binding_to_port(binding: &TypestateSeedBinding) -> 
     match binding {
         TypestateSeedBinding::MatchedValue => PolicyPort::MatchedValue,
         TypestateSeedBinding::Receiver => PolicyPort::Receiver,
-        TypestateSeedBinding::ReturnValue => PolicyPort::ReturnValue,
+        TypestateSeedBinding::ReturnValue => PolicyPort::ReturnValue { path: None },
         TypestateSeedBinding::ResultIndex { index } => PolicyPort::ResultIndex { index: *index },
         TypestateSeedBinding::ArgumentIndex { index } => {
             PolicyPort::ArgumentIndex { index: *index }
@@ -2434,7 +2509,7 @@ pub(crate) fn typestate_seed_binding_to_port(binding: &TypestateSeedBinding) -> 
 pub(crate) fn typestate_call_binding_to_port(binding: &TypestateCallBinding) -> PolicyPort {
     match binding {
         TypestateCallBinding::Receiver => PolicyPort::Receiver,
-        TypestateCallBinding::ReturnValue => PolicyPort::ReturnValue,
+        TypestateCallBinding::ReturnValue => PolicyPort::ReturnValue { path: None },
         TypestateCallBinding::ResultIndex { index } => PolicyPort::ResultIndex { index: *index },
         TypestateCallBinding::ArgumentIndex { index } => {
             PolicyPort::ArgumentIndex { index: *index }
@@ -2448,7 +2523,7 @@ pub(crate) fn typestate_call_binding_to_port(binding: &TypestateCallBinding) -> 
 pub(crate) fn phase_accepts_port(phase: EndpointObservationPhase, port: &PolicyPort) -> bool {
     match port {
         PolicyPort::MatchedValue => phase == EndpointObservationPhase::AtMatch,
-        PolicyPort::ReturnValue => phase == EndpointObservationPhase::AfterNormalReturn,
+        PolicyPort::ReturnValue { .. } => phase == EndpointObservationPhase::AfterNormalReturn,
         PolicyPort::ResultIndex { .. } => phase == EndpointObservationPhase::AfterNormalReturn,
         PolicyPort::Receiver
         | PolicyPort::ArgumentIndex { .. }
@@ -2480,7 +2555,7 @@ mod tests {
                 PolicyCategoryId::new("input.user").unwrap(),
                 PolicyCategoryId::new("sink.data").unwrap(),
             ],
-            schema_version: 1,
+            schema_version: POLICY_DOCUMENT_SCHEMA_VERSION,
             name: PolicyId::new(name).unwrap(),
             version: 1,
             sources: vec![source(source_id, display)],
@@ -2562,13 +2637,14 @@ mod tests {
     #[test]
     fn transfer_sanitizer_catalog_identity_is_unchanged() {
         let mut definition = catalog("test.sanitizers", "request", "request");
+        definition.schema_version = 1;
         definition.sanitizers.push(TaintSanitizerSpec {
             categories: vec![],
             id: TaintEntryId::new("scrub").unwrap(),
             selector: crate::test_support::inline_match_selector("clean"),
             kind: crate::definition::TaintSanitizerKind::Transfer {
                 input: PolicyPort::ArgumentIndex { index: 0 },
-                output: PolicyPort::ReturnValue,
+                output: PolicyPort::ReturnValue { path: None },
             },
             removes: vec![TaintLabel::new("secret").unwrap()],
         });
@@ -2880,7 +2956,7 @@ mod category_contract_tests {
     fn catalog_wire_validates_vocabulary_and_auxiliary_category_selection() {
         let category = |name| PolicyCategoryId::new(name).unwrap();
         let mut definition = TaintCatalogDefinition {
-            schema_version: 1,
+            schema_version: POLICY_DOCUMENT_SCHEMA_VERSION,
             name: PolicyId::new("test.auxiliary").unwrap(),
             version: 1,
             categories: vec![category("sql-injection"), category("path-injection")],
@@ -2897,7 +2973,7 @@ mod category_contract_tests {
                     selector: crate::test_support::inline_match_selector("clean"),
                     kind: crate::definition::TaintSanitizerKind::Transfer {
                         input: PolicyPort::ArgumentIndex { index: 0 },
-                        output: PolicyPort::ReturnValue,
+                        output: PolicyPort::ReturnValue { path: None },
                     },
                     removes: vec![TaintLabel::new("untrusted").unwrap()],
                 })

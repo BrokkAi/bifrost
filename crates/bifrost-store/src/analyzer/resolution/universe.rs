@@ -495,7 +495,9 @@ pub(crate) fn requires_selected_scope(language: Language) -> bool {
     language == Language::Python
 }
 
-fn table(language: Language) -> &'static [UniverseEntry] {
+/// The canonical fixed language vocabulary, also used by language type proofs.
+#[doc(hidden)]
+pub fn table(language: Language) -> &'static [UniverseEntry] {
     match language {
         Language::Python => &PYTHON_UNIVERSE,
         Language::Java => JAVA_UNIVERSE,

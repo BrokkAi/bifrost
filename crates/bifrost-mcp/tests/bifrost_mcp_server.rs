@@ -561,6 +561,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "blast_radius",
             "cyclomatic_complexity",
             "missing_tests",
+            "relation_brief",
             "score_diff",
             "query_code",
             "list_policies",
@@ -1396,7 +1397,9 @@ fn bifrost_mcp_run_policy_uses_the_active_snapshot_and_durable_suppressions() {
     )
     .expect("direct policy evaluation");
     assert_eq!(expected.exit_status(), 1);
-    let expected_report = serde_json::to_value(expected.report()).expect("serialize direct report");
+    let mut expected_report =
+        serde_json::to_value(expected.report()).expect("serialize direct report");
+    mask_batch_remaining_ms(&mut expected_report);
 
     let mut child = spawn_server(initial.root(), "searchtools", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
@@ -1480,8 +1483,13 @@ fn bifrost_mcp_run_policy_uses_the_active_snapshot_and_durable_suppressions() {
     assert_sha256_correlation(correlation);
     assert_eq!(structured["status"], "finding", "{baseline}");
     assert_eq!(structured["exit_status"], 1, "{baseline}");
-    assert_eq!(structured["report"], expected_report, "{baseline}");
-    assert_eq!(structured["report"]["schema_version"], 7);
+    let mut baseline_report = structured["report"].clone();
+    mask_batch_remaining_ms(&mut baseline_report);
+    assert_eq!(baseline_report, expected_report, "{baseline}");
+    assert_eq!(
+        structured["report"]["schema_version"],
+        brokk_bifrost_policy::PolicyReportDocument::SCHEMA_VERSION
+    );
     assert_eq!(
         structured["report"]["execution"]["stage_timings"],
         json!([])
@@ -1589,6 +1597,7 @@ fn bifrost_mcp_run_policy_uses_the_active_snapshot_and_durable_suppressions() {
             .collect::<Vec<_>>(),
         "{attributed}"
     );
+    mask_batch_remaining_ms(&mut report_without_timings);
     assert_eq!(report_without_timings, expected_report, "{attributed}");
     assert_eq!(
         attributed["report"]["execution"]["stage_timings"],
@@ -3074,6 +3083,13 @@ fn tool_names(tools: &[Value]) -> Vec<&str> {
         .collect()
 }
 
+/// A direct evaluation has no hard request deadline while an MCP `run_policy`
+/// call carries one. `batch_remaining_ms` samples that execution context, not
+/// the policy answer, so mask it when comparing reports from the two.
+fn mask_batch_remaining_ms(report: &mut Value) {
+    report["evaluation"]["budget"]["batch_remaining_ms"] = Value::Null;
+}
+
 fn assert_sha256_correlation(correlation: &str) {
     let digest = correlation.strip_prefix("sha256:").expect("sha256 prefix");
     assert_eq!(digest.len(), 64, "{correlation}");
@@ -4091,6 +4107,63 @@ fn rootless_mcp_accepts_codex_sandbox_metadata_from_a_compatible_client() {
     assert!(child.wait().expect("wait bifrost").success());
 }
 
+/// Exercise the production handler and transport, including its public-name
+/// guard. Service calls alone cannot prove a descriptor-free control is routed.
+#[test]
+fn retention_census_control_is_private_but_callable_over_stdio() {
+    let root = TempDir::new().unwrap();
+    let mut child = spawn_server(root.path(), "searchtools", &[]);
+    let mut stdin = child.stdin.take().unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().unwrap());
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+    let listed = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({"jsonrpc":"2.0", "id":1, "method":"tools/list", "params":{}}),
+    );
+    let called = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc":"2.0", "id":2, "method":"tools/call",
+            "params":{"name":"__bifrost_retention_census", "arguments":{}}
+        }),
+    );
+    drop(stdin);
+    assert!(child.wait().expect("wait census-control server").success());
+    assert!(listed["result"]["tools"].is_array(), "{listed}");
+    assert!(
+        !listed.to_string().contains("__bifrost_retention_census"),
+        "hidden control leaked into tools/list or its schemas: {listed}"
+    );
+    assert!(called["error"].is_null(), "{called}");
+    #[cfg(feature = "test-support")]
+    {
+        assert_eq!(called["result"]["isError"], false, "{called}");
+        let result = &called["result"]["structuredContent"];
+        assert!(
+            matches!(result["status"].as_str(), Some("available" | "unavailable")),
+            "hidden control was not dispatched to the census service: {called}"
+        );
+        if result["status"] == "unavailable" {
+            assert!(result["reason"].is_string(), "{called}");
+        }
+    }
+    #[cfg(not(feature = "test-support"))]
+    {
+        assert_eq!(called["result"]["isError"], true, "{called}");
+        assert!(
+            called["result"]["content"][0]["text"]
+                .as_str()
+                .is_some_and(|message| message.contains("Unknown tool: __bifrost_retention_census")),
+            "default build exposed the hidden census control: {called}"
+        );
+    }
+}
+
 fn initialize_session(
     stdin: &mut impl Write,
     reader: &mut impl BufRead,
@@ -4438,11 +4511,12 @@ fn legacy_clients_never_see_a_result_type() {
 
 /// The tools whose `structuredContent` shapes are published as contracts.
 /// published tool answers with a shape that is not yet a declared contract.
-const OUTPUT_SCHEMA_TOOLS: [&str; 14] = [
+const OUTPUT_SCHEMA_TOOLS: [&str; 15] = [
     "analyze_diff",
     "get_symbol_locations",
     "get_symbol_ancestors",
     "score_diff",
+    "relation_brief",
     "list_function_sources",
     "blast_radius",
     "cyclomatic_complexity",
@@ -4705,6 +4779,41 @@ fn output_schema_describes_real_workspace_and_policy_results() {
     );
     assert_structured_content_matches_advertised_schema(&tools, "missing_tests", &missing_tests);
 
+    let relation_brief = call_tool(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        7,
+        "relation_brief",
+        json!({}),
+    );
+    assert_eq!(
+        relation_brief["result"]["structuredContent"]["sections"][2]["state"], "not_computed",
+        "{relation_brief}"
+    );
+    assert_eq!(
+        relation_brief["result"]["structuredContent"]["sections"][0]["notes_summarized"],
+        false
+    );
+    assert_eq!(
+        relation_brief["result"]["structuredContent"]["deleted_subjects"],
+        json!([])
+    );
+    assert_structured_content_matches_advertised_schema(&tools, "relation_brief", &relation_brief);
+    // The cause vocabulary stays open for future typed scan causes. Validate
+    // the degraded shape against the same advertised contract.
+    let mut degraded = relation_brief.clone();
+    degraded["result"]["structuredContent"]["subjects"][0]["first_hop"] = json!({
+        "complete": false, "causes": ["time_budget", "future_scan_cause"]
+    });
+    degraded["result"]["structuredContent"]["sections"][0]["complete"] = json!(false);
+    degraded["result"]["structuredContent"]["sections"][0]["notes_summarized"] = json!(true);
+    degraded["result"]["structuredContent"]["deleted_subjects"] = json!([{
+        "fqn": "Described.retired", "path": "Described.java", "line": 1,
+        "completeness": {"complete": false, "causes": ["deleted_symbol_not_scanned"]}
+    }]);
+    assert_structured_content_matches_advertised_schema(&tools, "relation_brief", &degraded);
+
     drop(stdin);
     assert!(child.wait().expect("wait bifrost").success());
 }
@@ -4841,11 +4950,124 @@ fn a_held_build_lock_is_reported_as_the_request_phase() {
     assert!(child.wait().expect("wait bifrost").success());
 }
 
+#[test]
+#[hardwon(
+    "#13147: the cold MCP index build waited on the shared cache build lock without telling the client"
+)]
+fn a_cold_index_build_reports_and_clears_the_build_lock_holder() {
+    let workspace = InlineTestProject::new()
+        .file("Described.java", "class Described {}\n")
+        .build();
+    let cache_dir = workspace.root().join(".bifrost").join("cache");
+    fs::create_dir_all(&cache_dir).expect("create workspace cache");
+    let db_path = cache_dir.join(brokk_bifrost_core::cache_db::cache_db_file_name());
+    let purpose = "building the analyzer for another worktree";
+    let held = brokk_bifrost_core::cache_gc::AnalyzerCacheBuildLock::acquire(&db_path, purpose)
+        .expect("hold the cold build lock");
+    let mut child = Command::new(common::mcp_server::mcp_server_binary())
+        .arg("--root")
+        .arg(workspace.root())
+        .arg("--mcp")
+        .arg("searchtools")
+        .env("BIFROST_CACHE_DIR", &cache_dir)
+        .env_remove(MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bifrost");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+    write_line(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {
+                "name": "get_summaries", "arguments": {"targets": ["Described.java"]},
+                "_meta": {"progressToken": "cold-lock-wait"}
+            }
+        }),
+    );
+    let (response, progress) = read_response_collecting_progress(&mut reader, &mut stderr, 1);
+    let wait_text = "waiting for the analyzer cache build lock";
+    let holder = format!("pid {} on ", std::process::id());
+    let notification = progress
+        .iter()
+        .find(|notification| {
+            notification["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(wait_text))
+        })
+        .unwrap_or_else(|| panic!("cold build never reported its wait: {progress:?}"));
+    let message = notification["message"].as_str().unwrap();
+    assert!(
+        message.contains(&holder) && message.contains(purpose),
+        "{notification}"
+    );
+    let snapshot = &notification["_meta"]["io.bifrost/workspace-build"];
+    assert!(
+        snapshot["phase"]
+            .as_str()
+            .is_some_and(|phase| phase.contains(wait_text)),
+        "{notification}"
+    );
+    let error = response.to_string();
+    assert!(
+        error.contains(wait_text) && error.contains(&holder) && error.contains(purpose),
+        "{response}"
+    );
+    assert!(
+        response["error"].is_object() || response["result"]["isError"] == true,
+        "{response}"
+    );
+
+    drop(held);
+    write_line(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {
+                "name": "get_active_workspace", "arguments": {},
+                "_meta": {"progressToken": "cold-lock-released"}
+            }
+        }),
+    );
+    let (response, progress) = read_response_collecting_progress(&mut reader, &mut stderr, 2);
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    let completed = progress
+        .iter()
+        .find(|notification| {
+            notification["_meta"]["io.bifrost/workspace-build"]["status"] == "completed"
+        })
+        .unwrap_or_else(|| panic!("no completed build snapshot: {progress:?}"));
+    assert!(
+        !completed.to_string().contains(wait_text),
+        "the acquired lock must clear the wait: {completed}"
+    );
+    assert!(
+        completed["_meta"]["io.bifrost/workspace-build"]["phase"].is_null(),
+        "{completed}"
+    );
+    let response = call_tool(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        3,
+        "get_summaries",
+        json!({"targets": ["Described.java"]}),
+    );
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
 /// Take the analyzer cache build lock of the workspace rooted at `root`, the
 /// way another builder in another process holds it, and report which file it
 /// is so a test can assert the wait names it.
 fn hold_analyzer_cache_build_lock(root: &std::path::Path) -> (fs::File, std::path::PathBuf) {
-    let cache_dir = root.join(".bifrost").join("cache");
+    let cache_dir = brokk_bifrost_core::gitblob::cache_dir_path(root);
     let lock_path = fs::read_dir(&cache_dir)
         .expect("the built workspace has a cache directory")
         .filter_map(Result::ok)
@@ -5803,7 +6025,11 @@ fn assert_compact_malformed_run_policy_reply(response: &Value, task_capable: boo
             .expect("early run_policy correlation"),
     );
     let report = &structured["report"];
-    assert_eq!(report["schema_version"], 7, "{response}");
+    assert_eq!(
+        report["schema_version"],
+        brokk_bifrost_policy::PolicyReportDocument::SCHEMA_VERSION,
+        "{response}"
+    );
     assert_eq!(report["rules"], json!([]), "{response}");
     assert_eq!(report["runs"], json!([]), "{response}");
     assert_eq!(report["diagnostics"].as_array().map(Vec::len), Some(1));
@@ -5928,7 +6154,7 @@ fn mcp_tasks_run_policy_completes_through_a_task_handle() {
         &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .expect("direct policy evaluation");
-    let expected_report = serde_json::to_value(expected.report()).expect("serialize report");
+    let mut expected_report = serde_json::to_value(expected.report()).expect("serialize report");
 
     let mut child = spawn_server(workspace.root(), "searchtools", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
@@ -5967,7 +6193,10 @@ fn mcp_tasks_run_policy_completes_through_a_task_handle() {
     let structured = &result["structuredContent"];
     assert_eq!(structured["status"], "finding", "{terminal}");
     assert_eq!(structured["exit_status"], 1, "{terminal}");
-    assert_eq!(structured["report"], expected_report, "{terminal}");
+    let mut actual_report = structured["report"].clone();
+    mask_batch_remaining_ms(&mut actual_report);
+    mask_batch_remaining_ms(&mut expected_report);
+    assert_eq!(actual_report, expected_report, "{terminal}");
     assert_sha256_correlation(
         structured["request_correlation_id"]
             .as_str()
@@ -7871,4 +8100,36 @@ fn symbol_sources_accepts_exact_source_byte_budget() {
         16 * 1024 * 1024,
         "boundary fixture must reach the exact budget"
     );
+}
+
+#[test]
+#[hardwon("#12772: annotated Java bounds crashed indexing before MCP source requests")]
+fn list_function_sources_with_annotated_java_bound() {
+    let workspace = InlineTestProject::with_language(Language::Java)
+        .file("Minimal.java", "class C<T extends @Nullable Object> {}\n")
+        .file("Source.java", "class Source { void found() {} }\n")
+        .build();
+    let mut child = spawn_server(workspace.root(), "searchtools", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+    let response = call_tool(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        1,
+        "list_function_sources",
+        json!({"paths": ["Source.java"]}),
+    );
+    assert_eq!(
+        response["result"]["structuredContent"]["summary"]["record_count"], 1,
+        "{response}"
+    );
+    assert_eq!(
+        response["result"]["structuredContent"]["records"][0]["name"], "found",
+        "{response}"
+    );
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
 }

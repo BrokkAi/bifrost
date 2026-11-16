@@ -37,6 +37,7 @@ fn branch_has_applicable_language(
             LogicalQueryOperator::ExportSeed(seed) => &seed.languages,
             LogicalQueryOperator::PathSeed(seed) => &seed.languages,
             LogicalQueryOperator::Step { .. }
+            | LogicalQueryOperator::CallReachability { .. }
             | LogicalQueryOperator::Limit { .. }
             | LogicalQueryOperator::Set { .. } => {
                 pending.extend(plan.node(node).dependencies());
@@ -86,15 +87,49 @@ pub(super) fn execute_plan(
     let caps = plan.terminal_caps(node_id, terminal_cap);
     let mut current_terminal_cap = caps[node_id.index()];
     let chain_diagnostic_start = diagnostics.len();
+    let mut prepared_input = None;
 
     loop {
         let node = plan.node(current_node_id);
         let profiling = state.profile.is_some();
+        if let LogicalQueryOperator::CallReachability { sources, .. } =
+            plan.logical_node(current_node_id).operator()
+            && let Some((rows, result)) =
+                state
+                    .scope
+                    .reachability_operands
+                    .as_ref()
+                    .and_then(|operands| {
+                        operands
+                            .sources
+                            .get(&units::reachability_operands::operand_key(sources))
+                    })
+        {
+            let rows = rows.clone();
+            // Keep operand diagnostics relative to this physical plan. The
+            // enclosing leaf adds its authored path once, alongside traces.
+            diagnostics.extend(result.diagnostics.clone());
+            prepared_input = Some(PlanExecution::new(
+                rows,
+                result.completion != CodeQueryCompletion::Complete,
+            ));
+            continuations.push(UnaryPlanContinuation {
+                node_id: current_node_id,
+                terminal_cap: current_terminal_cap,
+                invocation_started: profiling.then(Instant::now),
+                dependency_started: profiling.then(Instant::now),
+            });
+            break;
+        }
         match (
             node.operator(),
             plan.logical_node(current_node_id).operator(),
         ) {
-            (PhysicalQueryOperator::PipelineStep, LogicalQueryOperator::Step { .. }) => {
+            (PhysicalQueryOperator::PipelineStep, LogicalQueryOperator::Step { .. })
+            | (
+                PhysicalQueryOperator::CallReachability,
+                LogicalQueryOperator::CallReachability { .. },
+            ) => {
                 continuations.push(UnaryPlanContinuation {
                     node_id: current_node_id,
                     terminal_cap: current_terminal_cap,
@@ -120,7 +155,9 @@ pub(super) fn execute_plan(
     }
 
     let profiling = state.profile.is_some();
-    let mut execution = if let Some(operands) = state.scope.intersect_operands() {
+    let mut execution = if let Some(input) = prepared_input {
+        input
+    } else if let Some(operands) = state.scope.intersect_operands() {
         let LogicalQueryOperator::Set { op, .. } = plan.logical_node(current_node_id).operator()
         else {
             panic!("prefix continuation requires a set cut");
@@ -212,7 +249,9 @@ fn passes_input_rows_through(operator: &LogicalQueryOperator) -> bool {
             matches!(step, QueryStep::Filter(_) | QueryStep::Project(_))
         }
         LogicalQueryOperator::Set { op, .. } => *op == SetOperator::Union,
-        LogicalQueryOperator::Correlate { .. } | LogicalQueryOperator::RequireBoth { .. } => false,
+        LogicalQueryOperator::CallReachability { .. }
+        | LogicalQueryOperator::Correlate { .. }
+        | LogicalQueryOperator::RequireBoth { .. } => false,
     }
 }
 
@@ -237,6 +276,10 @@ fn execute_plan_node(
     invocation_started: Option<Instant>,
     dependency_execution: Option<PlanDependencyExecution>,
 ) -> PlanExecution {
+    state.scope.sink_sites = state
+        .sink_demand
+        .as_ref()
+        .and_then(|demand| demand.for_node(node_id));
     let profiling = state.profile.is_some();
     let physical_node = plan.node(node_id);
     let physical_operator = physical_node.operator();
@@ -244,7 +287,9 @@ fn execute_plan_node(
     assert_eq!(
         matches!(
             physical_operator,
-            PhysicalQueryOperator::PipelineStep | PhysicalQueryOperator::Limit
+            PhysicalQueryOperator::PipelineStep
+                | PhysicalQueryOperator::Limit
+                | PhysicalQueryOperator::CallReachability
         ),
         dependency_execution.is_some(),
         "unary query operators receive exactly one completed dependency"
@@ -511,6 +556,28 @@ fn execute_plan_node(
                     disposition = QueryOperatorDisposition::Cancelled;
                 }
                 execution
+            }
+        }
+        (
+            PhysicalQueryOperator::CallReachability,
+            LogicalQueryOperator::CallReachability { sinks, depth, .. },
+        ) => {
+            let child = dependency_execution
+                .expect("call reachability has a source dependency")
+                .execution;
+            if child.is_cancelled() {
+                child
+            } else {
+                super::call_reachability::execute(
+                    token,
+                    child,
+                    sinks,
+                    *depth,
+                    state,
+                    limits,
+                    terminal_cap,
+                    diagnostics,
+                )
             }
         }
         (PhysicalQueryOperator::SeedScan, LogicalQueryOperator::Seed(seed)) => {
@@ -1055,6 +1122,7 @@ fn execute_plan_node(
                                     | CodeQueryDiagnosticCode::OccurrenceRoleUnsupported
                                     | CodeQueryDiagnosticCode::EnvironmentAxisUnsupported
                                     | CodeQueryDiagnosticCode::EnvironmentDerivationIncomplete
+                                    | CodeQueryDiagnosticCode::EnvironmentBoundedWorkLimit
                             )
                         });
                         let left_bindings_are_covered = branch_rows.first().is_some_and(|rows| {
@@ -1087,6 +1155,17 @@ fn execute_plan_node(
                     PlanExecution::new(Vec::new(), truncated)
                 } else {
                     let merge_started = profiling.then(Instant::now);
+                    if let Some(sites) = state
+                        .sink_demand
+                        .as_ref()
+                        .and_then(|demand| demand.for_node(node_id))
+                        && let Some(first) = branch_rows.first_mut()
+                    {
+                        // Full dependency rows still decide identity-based
+                        // intersection/exclusion. Only demanded left rows can
+                        // contribute terminal endpoints to the result.
+                        first.retain(|row| sites.contains(&row.value));
+                    }
                     let (mut rows, merge_measurement) =
                         combine_set_rows(*op, branch_rows, profiling);
                     if *op == SetOperator::Union {
@@ -1187,7 +1266,7 @@ fn execute_plan_node(
                 push_operator_termination(&mut terminations, QueryOperatorTermination::ResultLimit);
                 push_truncation_diagnostic(diagnostics, &state.budget, *count);
                 child.rows.truncate(*count);
-                child.mark_truncated();
+                child.mark_configured_cap();
             }
             child
         }
@@ -1336,6 +1415,16 @@ fn execute_plan_node(
         _ => unreachable!("physical operator must implement its logical query node"),
     };
 
+    // The rows an anchor seed emitted are the plan's candidates, counted before
+    // any later step filters them. Read from the emitted rows, never from the
+    // scan work, so planner pushdown into the seed or a later step cannot change
+    // the count.
+    if state.scope.counts_candidate_sites() && plan.is_anchor_seed(node_id) {
+        state
+            .candidate_sites
+            .extend(execution.rows.iter().map(|row| row.value.seed_site()));
+    }
+
     if profiling {
         append_diagnostic_terminations(
             &mut terminations,
@@ -1432,10 +1521,16 @@ fn retry_can_progress(
     let has_headroom = budget.scanned_files < parent.max_scanned_files
         && budget.scanned_source_bytes < parent.max_scanned_source_bytes
         && budget.fact_nodes.saturating_add(budget.examined_references) < parent.max_fact_nodes
-        && budget.pipeline_rows.max(budget.provenance_steps) < parent.max_pipeline_rows;
+        && budget.pipeline_rows.max(budget.provenance_steps) < parent.max_pipeline_rows
+        && budget
+            .call_declarations
+            .saturating_add(budget.call_sites)
+            .saturating_add(budget.call_terminals)
+            < parent.max_call_answers;
     let raises_a_scan_lane = retry.max_scanned_files > first.max_scanned_files
         || retry.max_scanned_source_bytes > first.max_scanned_source_bytes
-        || retry.max_fact_nodes > first.max_fact_nodes;
+        || retry.max_fact_nodes > first.max_fact_nodes
+        || retry.max_call_answers > first.max_call_answers;
     has_headroom && raises_a_scan_lane
 }
 
@@ -1484,6 +1579,7 @@ pub(super) fn execute_parallel_seed_union(
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let lease = coordinator.lease(branch);
                 let mut branch_state = QueryExecutionState {
+                    sink_demand: None,
                     analyzer,
                     // Parallel union dependencies are seed scans only; receiver
                     // steps execute later against the parent workspace state.
@@ -1492,6 +1588,7 @@ pub(super) fn execute_parallel_seed_union(
                     scope: scope.clone(),
                     scanned_languages: scanned_languages.clone(),
                     step_outputs: vec![0; plan.node_count()],
+                    candidate_sites: HashSet::default(),
                     receiver_budget_override,
                     budget: base_budget,
                     // Parallel union dependencies are seed scans only.
@@ -1528,6 +1625,8 @@ pub(super) fn execute_parallel_seed_union(
                     receiver_facts: HashMap::default(),
                     receiver_service: None,
                     semantic: None,
+                    semantic_factory: Box::new(|| None),
+                    call_shape_work: CodeQuerySemanticWork::default(),
                     import_graph: None,
                     import_graph_content: None,
                     direct_import_layer: None,
@@ -1542,6 +1641,7 @@ pub(super) fn execute_parallel_seed_union(
                     access_failure: None,
                     parallel_seed_budget: Some(lease.clone()),
                     scheduler_workers,
+                    reuse: ReuseVerdict::Content,
                 };
                 let mut branch_diagnostics = Vec::new();
                 let mut branch_path = profiling.then(|| {
@@ -1597,8 +1697,10 @@ pub(super) fn execute_parallel_seed_union(
                     || (Vec::new(), QueryAccessPathProfile::default()),
                     |profile| (profile.operators, profile.access_path),
                 );
+                let reuse = branch_state.reuse.join(branch_state.cache_reuse());
                 ParallelSeedBranchResult {
                     execution,
+                    candidate_sites: std::mem::take(&mut branch_state.candidate_sites),
                     diagnostics: branch_diagnostics,
                     seed_cache: branch_state
                         .seed_cache
@@ -1607,6 +1709,7 @@ pub(super) fn execute_parallel_seed_union(
                     operators,
                     access_path,
                     access_failure: branch_state.access_failure,
+                    reuse,
                 }
             }));
             match result {
@@ -1643,6 +1746,7 @@ pub(super) fn execute_parallel_seed_union(
             truncated |= result.execution.is_truncated();
         }
 
+        state.candidate_sites.extend(result.candidate_sites);
         for (key, cached) in result.seed_cache {
             assert!(
                 state
@@ -1665,6 +1769,9 @@ pub(super) fn execute_parallel_seed_union(
         if state.access_failure.is_none() {
             state.access_failure = result.access_failure;
         }
+        // Every branch ran under this capture, including one after a
+        // cancelled branch that contributes no rows.
+        state.reuse.join_in(result.reuse);
         if contributes_to_public_prefix {
             if result.execution.is_cancelled() {
                 cancelled_child = Some(result.execution);
@@ -1777,7 +1884,6 @@ pub(super) fn append_diagnostic_terminations(
             | CodeQueryDiagnosticCode::ReferenceCandidatesOmitted
             | CodeQueryDiagnosticCode::ReferenceCallsiteLimit
             | CodeQueryDiagnosticCode::UsesCandidateLimit
-            | CodeQueryDiagnosticCode::UsesCandidatesOmitted
             | CodeQueryDiagnosticCode::SemanticBudgetExhausted
             | CodeQueryDiagnosticCode::TypestateSolverBudgetExhausted
             | CodeQueryDiagnosticCode::TypestateFindingBudgetExhausted
@@ -1811,7 +1917,15 @@ pub(super) fn append_diagnostic_terminations(
             | CodeQueryDiagnosticCode::EffectBudgetExhausted => {
                 Some(QueryOperatorTermination::AnalysisLimit)
             }
-            CodeQueryDiagnosticCode::SemanticResultsOmitted
+            CodeQueryDiagnosticCode::UsesCandidateUnavailable
+            | CodeQueryDiagnosticCode::UsesCandidateIncomplete
+            | CodeQueryDiagnosticCode::UsesCandidateUnresolved
+            | CodeQueryDiagnosticCode::UsesReferenceProjectionMissing
+            | CodeQueryDiagnosticCode::UsesDefinitionProjectionMissing
+            | CodeQueryDiagnosticCode::UsesInverseUnconfirmed
+            | CodeQueryDiagnosticCode::UsesIndexedSourceUnavailable
+            | CodeQueryDiagnosticCode::UsesTargetRangeUnavailable
+            | CodeQueryDiagnosticCode::SemanticResultsOmitted
             | CodeQueryDiagnosticCode::SemanticAnalysisPartial
             | CodeQueryDiagnosticCode::SemanticPackAcquisitionPending
             | CodeQueryDiagnosticCode::SemanticPackActivationFailed
@@ -1847,6 +1961,7 @@ pub(super) fn append_diagnostic_terminations(
             | CodeQueryDiagnosticCode::EnclosingPatternUndecided
             | CodeQueryDiagnosticCode::OccurrenceResolutionIncomplete
             | CodeQueryDiagnosticCode::EnvironmentDerivationIncomplete
+            | CodeQueryDiagnosticCode::EnvironmentBoundedWorkLimit
             | CodeQueryDiagnosticCode::MaterializationDerivationIncomplete
             | CodeQueryDiagnosticCode::ResolutionTraceIncomplete
             | CodeQueryDiagnosticCode::PythonHierarchyDerivationIncomplete

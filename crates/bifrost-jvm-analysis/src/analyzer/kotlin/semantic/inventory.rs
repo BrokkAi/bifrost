@@ -638,27 +638,6 @@ fn dispatch_extensibility(
         })
 }
 
-/// The property a `getter`/`setter` belongs to.
-///
-/// The grammar admits both nestings: an accessor written on the same line is a
-/// child of the `property_declaration`, while one written on the following line
-/// becomes its next sibling in the class body.
-fn accessor_property<'tree>(accessor: Node<'tree>) -> Option<Node<'tree>> {
-    let parent = accessor.parent()?;
-    if parent.kind() == "property_declaration" {
-        return Some(parent);
-    }
-    let mut previous = accessor.prev_named_sibling();
-    while let Some(candidate) = previous {
-        match candidate.kind() {
-            "property_declaration" => return Some(candidate),
-            "getter" | "setter" => previous = candidate.prev_named_sibling(),
-            _ => return None,
-        }
-    }
-    None
-}
-
 fn callable_name(source: &str, node: Node<'_>, kind: ProcedureKind) -> Option<Box<str>> {
     match node.kind() {
         "function_declaration" | "enum_entry" | "class_parameter" => {

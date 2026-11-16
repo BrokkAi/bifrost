@@ -30,7 +30,7 @@ use brokk_bifrost_python::declarations::{collect_python_identifiers, python_modu
 use brokk_bifrost_python::imports::{
     PythonImportDetails, extract_package_from_python_wildcard, python_import_details,
     resolve_import_bindings, resolve_import_files_batched, resolve_imports_batched,
-    resolve_python_relative_module,
+    resolve_python_module_specifier,
 };
 use std::sync::Arc;
 
@@ -254,7 +254,7 @@ impl ImportAnalysisProvider for PythonAnalyzer {
                 && module.starts_with('.')
             {
                 let Some(resolved_module) =
-                    resolve_python_relative_module(self.project(), source_file, module)
+                    resolve_python_module_specifier(self.project(), source_file, module)
                 else {
                     return true;
                 };

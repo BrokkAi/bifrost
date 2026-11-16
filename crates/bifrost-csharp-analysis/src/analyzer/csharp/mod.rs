@@ -410,6 +410,14 @@ impl CSharpAnalyzer {
         Self::new(Arc::new(project))
     }
 
+    /// Drop every retained in-memory file state so the next read goes through
+    /// the live source, the way a freshly started process would.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn clear_retained_file_states_for_test(&mut self) {
+        self.inner.clear_retained_file_states_for_test();
+    }
+
     delegate_inner_methods! {
         #[doc(hidden)]
         pub fn reset_full_hydration_count_for_test(&self);
@@ -1066,6 +1074,11 @@ impl CSharpAnalyzer {
         AuthorityInputs::SourceOf(&[Language::CSharp])
     }
 
+    fn membership_authority_inputs(&self) -> AuthorityInputs<'static> {
+        self.compilation_membership_completeness();
+        self.compilation_authority_inputs()
+    }
+
     fn global_using_aliases(
         &self,
         token: QueryToken<'_>,
@@ -1186,7 +1199,7 @@ impl CSharpAnalyzer {
                     },
                 )
             },
-            |_| self.compilation_authority_inputs(),
+            |_| self.membership_authority_inputs(),
         )
     }
 
@@ -1207,7 +1220,7 @@ impl CSharpAnalyzer {
                     },
                 )
             },
-            |_| self.compilation_authority_inputs(),
+            |_| self.membership_authority_inputs(),
         )
     }
 }
@@ -1222,24 +1235,27 @@ impl CSharpSource for CSharpAnalyzer {
     }
     fn fenced_pack_owner_exists(&self, owner_fqn: &str) -> bool {
         self.inner
-            .semantic_model_overlay()
+            .semantic_model_overlay_read()
+            .published()
             .is_some_and(|overlay| overlay.fenced_csharp_owner_exists(owner_fqn))
     }
     fn fenced_pack_active(&self) -> bool {
         self.inner
-            .semantic_model_overlay()
+            .semantic_model_overlay_read()
+            .published()
             .is_some_and(|overlay| overlay.fenced_csharp_pack_active())
     }
     fn pack_open_reason(&self, owner_fqn: &str, member: Option<&str>) -> Option<&'static str> {
         self.inner
-            .semantic_model_overlay()
+            .semantic_model_overlay_read()
+            .published()
             .and_then(|overlay| overlay.csharp_pack_open_reason(owner_fqn, member))
     }
     fn model_extension_methods(
         &self,
         member: &str,
     ) -> brokk_bifrost_csharp::graph::resolver::CSharpModelExtensionMethods {
-        self.external_declarations(self.inner.semantic_model_overlay())
+        self.external_declarations(self.inner.semantic_model_overlay_read().published())
             .pack_extension_methods(member)
     }
 
@@ -1332,6 +1348,7 @@ impl CSharpSource for CSharpAnalyzer {
             code_unit,
             false,
         )
+        .resolved
     }
 
     fn with_usage_definitions(
@@ -1383,7 +1400,7 @@ impl CSharpSource for CSharpAnalyzer {
     }
 
     delegate_inner_methods! {
-        fn raw_supertypes_of(&self, code_unit: &CodeUnit) -> Vec<String>;
+        fn declared_raw_supertypes(&self, code_unit: &CodeUnit) -> Option<Vec<String>>;
     }
 
     fn raw_supertypes_limited(
@@ -1637,6 +1654,11 @@ impl CodeUnitIndex for CSharpAnalyzer {
     }
 
     delegate_inner_methods! {
+        fn owns_source_file(&self, file: &ProjectFile) -> bool;
+        fn indexed_source_files(&self) -> brokk_bifrost_analysis::analyzer::QueryBatch<ProjectFile>;
+    }
+
+    delegate_inner_methods! {
         fn indexed_blob_oid(&self, file: &ProjectFile) -> Option<brokk_bifrost_analysis::analyzer::Oid>;
     }
 
@@ -1774,10 +1796,16 @@ impl IAnalyzer for CSharpAnalyzer {
         use brokk_bifrost_analysis::analyzer::store::workspace_inputs::NativeConfigurationOverlayAuthority;
         assert_eq!(language, Language::CSharp);
         self.compilation_authority_inputs();
-        let Some(identity) = self.compilation_input_digest() else {
+        let Some((_, identity, _, configuration_inputs_may_be_hidden, _)) =
+            self.compilation_config_identities()
+        else {
             self.refuse_read_reuse();
             return ConfigurationCertificate::Uncertified;
         };
+        if configuration_inputs_may_be_hidden {
+            self.refuse_read_reuse();
+            return ConfigurationCertificate::Uncertified;
+        }
         let snapshots =
             brokk_bifrost_core::hash::HashMap::from_iter([("csharp".to_owned(), snapshot.clone())]);
         let overlay = self.record_membership_read(
@@ -1830,6 +1858,7 @@ impl IAnalyzer for CSharpAnalyzer {
     fn statement_source_facts(
         &self,
         file: &ProjectFile,
+        _reuse: &mut brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict,
     ) -> Option<Arc<brokk_bifrost_core::analyzer::statement_facts::StatementFactRows>> {
         use brokk_bifrost_core::analyzer::statement_facts::producer::capture_statement_facts;
         use brokk_bifrost_csharp::structural::CSHARP_STRUCTURAL_SPEC;
@@ -1949,11 +1978,8 @@ impl IAnalyzer for CSharpAnalyzer {
     }
 
     delegate_inner_methods! {
-        fn record_query_failure(&self, error: brokk_bifrost_analysis::analyzer::store::StoreError);
-    }
-
-    delegate_inner_methods! {
         fn workspace_file_index_cell(&self) -> Option<brokk_bifrost_analysis::analyzer::WorkspaceFileIndexCell>;
+        fn workspace_file_inventory_cell(&self) -> Option<brokk_bifrost_analysis::analyzer::WorkspaceFileInventoryCell>;
     }
 
     delegate_inner_methods! {
@@ -1975,6 +2001,13 @@ impl IAnalyzer for CSharpAnalyzer {
     ) -> Vec<&dyn brokk_bifrost_analysis::analyzer::structural::StructuralFactProvider>;
     }
 
+    fn generation_membership(
+        &self,
+    ) -> &Arc<brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::GenerationWorkspaceMembership>
+    {
+        IAnalyzer::generation_membership(&self.inner)
+    }
+
     fn snapshot_caches(
         &self,
     ) -> Option<&brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerSnapshotCaches> {
@@ -1985,11 +2018,16 @@ impl IAnalyzer for CSharpAnalyzer {
         &self,
     ) -> Option<brokk_bifrost_analysis::analyzer::content_identity::WorkspaceContentIdentities>
     {
-        let compilation_digest = self.compilation_config_digest()?;
+        let (_, _, compilation_digest, _, _) = self.compilation_config_identities()?;
         let mut hasher = brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher::new(
             b"bifrost-csharp-content-with-compilation-config:v1",
         );
-        hasher.field("sources", self.inner.language_content_identity().as_bytes());
+        hasher.field(
+            "sources",
+            self.inner
+                .language_content_identity_with_omissions()
+                .as_bytes(),
+        );
         hasher.field("compilation_config", compilation_digest.as_bytes());
         Some(
             brokk_bifrost_analysis::analyzer::content_identity::WorkspaceContentIdentities::new([
@@ -2087,7 +2125,10 @@ impl IAnalyzer for CSharpAnalyzer {
         self.inner.contains_tests(file) || self.hierarchy_test_files().contains(file)
     }
 
-    fn in_test_region(&self, code_unit: &brokk_bifrost_core::analyzer::model::CodeUnit) -> bool {
+    fn in_test_region(
+        &self,
+        code_unit: &brokk_bifrost_core::analyzer::model::CodeUnit,
+    ) -> Result<bool, brokk_bifrost_analysis::analyzer::QueryReadIncomplete> {
         self.inner.in_test_region(code_unit)
     }
 
@@ -2323,6 +2364,17 @@ fn csharp_declares_instance_member(owner: tree_sitter::Node<'_>, name: &str, sou
 }
 
 impl LanguageSupport for CSharpSupport {
+    /// A C# listing omission matters at a source path, at a project file and at
+    /// every MSBuild input, because those decide which sources the compilation
+    /// holds. Both predicates are the guard's own, not a second list.
+    fn is_listing_path(&self, path: &std::path::Path) -> bool {
+        Language::from_path(path) == Language::CSharp
+            || compilation::is_csharp_project_file(path)
+            || brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport::is_configuration_input_path(
+                self, path,
+            )
+    }
+
     fn residual_conversion_runs_no_user_code(
         &self,
         analyzer: &dyn IAnalyzer,
@@ -2489,17 +2541,15 @@ impl LanguageSupport for CSharpSupport {
         )
     }
 
-    // #9506: the endpoint lacks affirmative class-versus-struct authority.
+    // Index construction is linear in the file per endpoint, like the shared reparse.
     fn fresh_logical_instance(
         &self,
-        _node: tree_sitter::Node<'_>,
+        node: tree_sitter::Node<'_>,
         _allocation: &brokk_bifrost_analysis::analyzer::semantic::AllocationSite,
         _artifact: &brokk_bifrost_analysis::analyzer::semantic::SemanticArtifact,
-        _source: &str,
+        source: &str,
     ) -> brokk_bifrost_analysis::analyzer::languages::FreshEndpoint {
-        brokk_bifrost_analysis::analyzer::languages::FreshEndpoint::Unknown(
-            "class-versus-struct authority not available at the endpoint",
-        )
+        semantic::fresh_logical_instance(node, source)
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -2594,6 +2644,11 @@ impl LanguageSupport for CSharpSupport {
                     unreachable!()
                 };
                 Some(answer)
+            }
+            WorkspaceFactFamily::CSharpCompilationMembershipCompleteness => {
+                Some(CSharpAnalyzer::compilation_membership_answer(
+                    csharp.compilation_membership_completeness(),
+                ))
             }
             WorkspaceFactFamily::CSharpCompilationConfiguration => {
                 csharp.compilation_config_digest()
@@ -2867,6 +2922,7 @@ impl LanguageSupport for CSharpSupport {
         token: brokk_bifrost_core::analyzer::query_token::QueryToken<'_>,
         file: &brokk_bifrost_core::analyzer::model::ProjectFile,
         name: &str,
+        _reuse: &mut brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict,
     ) -> Option<(
         brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus,
         Option<String>,
@@ -3035,7 +3091,7 @@ impl DeadCodeBulkProof for CSharpDeadCodeBulk {
                     },
                 )
             },
-            |_| csharp.compilation_authority_inputs(),
+            |_| csharp.membership_authority_inputs(),
         )
     }
 }
@@ -3098,6 +3154,8 @@ impl brokk_bifrost_analysis::analyzer::multi_analyzer::LanguageAnalyzer for CSha
         Box::new(CSharpAnalyzer::update_all_with_progress(self, progress))
     }
 
+    brokk_bifrost_analysis::delegate_generation_membership_updates!(CSharpAnalyzer);
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -3159,6 +3217,13 @@ mod dependency_packs {
 }
 
 impl brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport for CSharpSupport {
+    fn certifies_reference_inventory(&self, producer_epoch: &str) -> bool {
+        // The fail-closed enumeration (#12013) exists only in the native-facts producer.
+        // When native C# becomes the production producer (#7314 M11), this follows its epoch.
+        producer_epoch
+            == brokk_bifrost_analysis::analyzer::store::resolution::csharp_trial_bundle_epoch()
+    }
+
     // C# native demand is a trial; without test-support the trait default
     // (no installer) keeps C# on the plain operation.
     #[cfg(any(test, feature = "test-support"))]
@@ -4443,6 +4508,65 @@ mod global_using_generation_fence_tests {
     use super::*;
     use crate::inline_project::InlineTestProject;
     use brokk_bifrost_analysis::analyzer::QueryReadIncomplete;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon(
+        "#11701: a nested cold fill under a failed enclosing scope skipped its store-generation fence"
+    )]
+    fn nested_cold_fill_is_fenced_when_only_an_enclosing_scope_failed() {
+        let fixture = InlineTestProject::with_language(Language::CSharp)
+            .file("Globals.cs", "global using Alpha;")
+            .build();
+        let analyzer = CSharpAnalyzer::from_project(fixture.project().clone());
+        let outer = AnalyzerQueryScope::capturing_read_incompleteness(&analyzer);
+        // An enclosing retained fill shares the nested fill's cache domain and
+        // has already recorded an execution-dependent failure of its own.
+        let enclosing = AnalyzerQueryScope::for_retained_fill(&analyzer);
+        let failure = QueryReadIncomplete::ProofStopped {
+            reason: "test_enclosing_stop",
+            cause: Some(
+                brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause::Provider,
+            ),
+        };
+        analyzer.record_query_incomplete(failure.clone());
+        let (answer, retained) = analyzer.memo_caches.global_using_namespaces.read(
+            &memo_attribution(&analyzer),
+            |cell| {
+                let answer = brokk_bifrost_analysis::analyzer::common::replayable_query_cache_cell(
+                    &analyzer,
+                    cell,
+                    || {
+                        Arc::new(analyzer.fenced_global_using_full(|| {
+                            let answer = graph_support::compute_global_using_namespaces(
+                                &analyzer,
+                                enclosing.token(),
+                            );
+                            analyzer
+                                .inner
+                                .analyzer_store()
+                                .ensure_language_epoch_value("csharp", "11701-test-next-generation")
+                                .expect("advance C# store generation");
+                            answer
+                        }))
+                    },
+                );
+                (answer, cell.get().is_some())
+            },
+            |_| AuthorityInputs::SourceOf(&[Language::CSharp]),
+        );
+        assert!(answer.contains("Alpha"));
+        assert!(!retained, "stale cold answer must stay request-local");
+        drop(enclosing);
+        let captured = outer.captured_read_incompleteness();
+        assert!(captured.contains(&failure), "{captured:?}");
+        assert!(
+            captured.iter().any(|reason| {
+                matches!(reason, QueryReadIncomplete::StoreFailure(error) if error.is_stale_generation())
+            }),
+            "{captured:?}"
+        );
+    }
 
     #[test]
     fn cold_global_using_fill_rejects_a_generation_flip_after_compute() {
@@ -4511,6 +4635,31 @@ mod complete_external_index_tests {
     use crate::inline_project::InlineTestProject;
     use brokk_bifrost_analysis::analyzer::QueryReadIncomplete;
     use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    fn partial_external_discovery_miss_is_declared_unindexed() {
+        let fixture = InlineTestProject::with_language(Language::CSharp)
+            .file("A.cs", "class A {}")
+            .build();
+        for i in 0..64 {
+            let assets = fixture
+                .project()
+                .root()
+                .join(format!("p{i}/obj/project.assets.json"));
+            std::fs::create_dir_all(assets.parent().unwrap()).unwrap();
+            std::fs::write(assets, r#"{"targets":{},"libraries":{}}"#).unwrap();
+        }
+        let analyzer = CSharpAnalyzer::from_project(fixture.project().clone());
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        assert_eq!(
+            analyzer.external_boundary_evidence(
+                scope.token(),
+                &fixture.file("A.cs"),
+                "MissingExternal"
+            ),
+            (BoundaryStatus::ExternalDeclaredUnindexed, None)
+        );
+    }
 
     #[test]
     #[hardwon("#7876: a degraded persistent cache fill was reused by a later request")]

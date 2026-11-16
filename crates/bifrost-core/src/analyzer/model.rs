@@ -229,6 +229,8 @@ impl Language {
         match self {
             Language::CSharp => &["razor", "cshtml"],
             Language::JavaScript | Language::TypeScript => &["vue", "svelte"],
+            // Rails and ERB view templates embed Ruby (#11370).
+            Language::Ruby => &["erb"],
             _ => &[],
         }
     }
@@ -3281,6 +3283,13 @@ struct ProjectFileInner {
 pub struct ProjectFile(Arc<ProjectFileInner>);
 
 impl ProjectFile {
+    /// Borrow the allocation owner, shared root and relative-path capacity for
+    /// an allocation-deduplicated heap census. No allocation is cloned.
+    #[doc(hidden)]
+    pub fn retained_parts(&self) -> (&Arc<impl Sized>, &Arc<Path>, usize) {
+        (&self.0, &self.0.root, self.0.rel_path.capacity())
+    }
+
     pub fn new(root: impl Into<PathBuf>, rel_path: impl Into<PathBuf>) -> Self {
         let root = root.into();
         let rel_path = rel_path.into();
@@ -3361,6 +3370,15 @@ impl ProjectFile {
         &self.0.rel_path
     }
 
+    /// The file-specific text bytes this identity owns.
+    ///
+    /// The workspace root is shared by every file under it, so accounting that
+    /// reports owned text must not include it: the same workspace mounted at a
+    /// different path must produce the same owned-text census.
+    pub fn path_text_bytes(&self) -> usize {
+        self.0.rel_path.as_os_str().len()
+    }
+
     /// Conservative retained allocation for one owned file identity.
     ///
     /// This includes the handle, both `Arc` allocation headers, the private
@@ -3384,6 +3402,17 @@ impl ProjectFile {
     pub fn retained_heap_bytes(&self) -> usize {
         self.retained_bytes()
             .saturating_sub(std::mem::size_of::<Self>())
+    }
+
+    /// Allocator-sized ownership estimate for an evictable cache. The raw
+    /// retained_* methods remain available to refusing admission authorities.
+    pub fn allocated_heap_bytes(&self) -> usize {
+        use crate::allocation_size::allocation_size;
+        allocation_size(2 * std::mem::size_of::<usize>() + std::mem::size_of::<ProjectFileInner>())
+            .saturating_add(allocation_size(self.0.rel_path.capacity()))
+            .saturating_add(allocation_size(
+                2 * std::mem::size_of::<usize>() + self.0.root.as_os_str().len(),
+            ))
     }
 
     pub fn abs_path(&self) -> PathBuf {
@@ -3622,6 +3651,21 @@ impl fmt::Display for DeclarationSiteId {
 }
 
 impl CodeUnit {
+    /// Actual declaration allocation and its exclusive owned heap. Source-file
+    /// owners are separate; identities remain valid only while this unit lives.
+    pub fn retained_parts(&self) -> (&Arc<impl Sized>, &ProjectFile, usize) {
+        (
+            &self.0,
+            &self.0.source,
+            self.0
+                .signature
+                .as_ref()
+                .map_or(0, String::capacity)
+                .saturating_add(self.0.fq.retained_heap_bytes())
+                .saturating_add(self.0.rendered_name.display.capacity()),
+        )
+    }
+
     /// Conservative allocation census, charging shared declaration storage in full.
     pub fn retained_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
@@ -3631,6 +3675,24 @@ impl CodeUnit {
             .saturating_add(self.0.signature.as_ref().map_or(0, String::capacity))
             .saturating_add(self.0.fq.retained_heap_bytes())
             .saturating_add(self.0.rendered_name.display.capacity())
+    }
+
+    /// Allocator-sized declaration ownership for P retention caches.
+    pub fn allocated_bytes(&self) -> usize {
+        use crate::allocation_size::allocation_size;
+        std::mem::size_of::<Self>()
+            .saturating_add(allocation_size(
+                2 * std::mem::size_of::<usize>() + std::mem::size_of::<CodeUnitInner>(),
+            ))
+            .saturating_add(self.0.source.allocated_heap_bytes())
+            .saturating_add(
+                self.0
+                    .signature
+                    .as_ref()
+                    .map_or(0, |text| allocation_size(text.capacity())),
+            )
+            .saturating_add(allocation_size(self.0.fq.retained_heap_bytes()))
+            .saturating_add(allocation_size(self.0.rendered_name.display.capacity()))
     }
 
     /// Compute this declaration's versioned, process-independent identity.
@@ -4216,8 +4278,10 @@ pub struct SearchSymbolCandidate {
     /// Per-declaration test-region taint (issue #1102): whether this specific
     /// symbol is inside a structurally-evidenced test region. `search_symbols`
     /// combines it with a path-based test check to decide test filtering, so a
-    /// production symbol in a file with inline tests still surfaces.
-    pub in_test_region: bool,
+    /// production symbol in a file with inline tests still surfaces. `None`
+    /// when the classifier could not decide; `search_symbols` asks it again
+    /// for the typed reason only when the verdict filters the result.
+    pub in_test_region: Option<bool>,
 }
 
 /// A tree-sitter parse-error span captured during analysis so the LSP

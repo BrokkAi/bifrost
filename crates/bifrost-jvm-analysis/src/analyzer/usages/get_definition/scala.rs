@@ -5542,7 +5542,7 @@ fn scala_focused_owner_boundary(
     let declared = ctx.scope_step().then(|| {
         ctx.scala.resolve_member_name_with_external(
             token,
-            ctx.analyzer.semantic_model_overlay(),
+            ctx.analyzer.semantic_model_overlay_read().published(),
             ctx.file,
             &spelling,
         )
@@ -9312,7 +9312,7 @@ fn scala_logical_owner_external_member_outcome(
     let spelling = format!("{owner_fqn}.{member}");
     let declared = ctx.scala.resolve_member_name_with_external(
         token,
-        ctx.analyzer.semantic_model_overlay(),
+        ctx.analyzer.semantic_model_overlay_read().published(),
         ctx.file,
         &spelling,
     );
@@ -9417,7 +9417,7 @@ fn scala_external_member_spelling(
     ctx.scala
         .resolve_member_name_with_external(
             token,
-            ctx.analyzer.semantic_model_overlay(),
+            ctx.analyzer.semantic_model_overlay_read().published(),
             ctx.file,
             &spelling,
         )
@@ -12868,7 +12868,7 @@ fn scala_external_type_fqn(
     }
     ctx.scala.external_type_name(
         token,
-        ctx.analyzer.semantic_model_overlay(),
+        ctx.analyzer.semantic_model_overlay_read().published(),
         ctx.file,
         spelling,
     )

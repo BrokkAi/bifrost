@@ -33,6 +33,7 @@ use crate::analyzer::semantic::workspace_oracle::common::value_handle;
 
 use crate::analyzer::semantic::workspace_oracle::RuntimeKeyedReadResult;
 use crate::analyzer::semantic::workspace_oracle::WorkspaceSemanticOracle;
+use brokk_bifrost_core::analyzer::reuse_verdict::Judged;
 
 use crate::analyzer::semantic::AbstractObjectIdentity;
 use crate::analyzer::semantic::AccessPath;
@@ -415,7 +416,7 @@ impl WorkspaceSemanticOracle<'_> {
                             value: source,
                         }
                         | SemanticEffect::ValueFlow {
-                            kind: ValueFlowKind::Local,
+                            kind: ValueFlowKind::Local | ValueFlowKind::AddressOf,
                             source,
                             target,
                         } if *target == current => {
@@ -565,6 +566,17 @@ impl WorkspaceSemanticOracle<'_> {
 }
 
 impl RelationProjectionHost for WorkspaceSemanticOracle<'_> {
+    fn selected_payload_projection(
+        &self,
+        procedure: &ProcedureHandle,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<
+        SemanticOutcome<crate::analyzer::semantic::SelectedPayloadProjection>,
+        SemanticProviderError,
+    > {
+        <Self as ValueFlowOracle>::selected_payload_projection(self, procedure, request)
+    }
+
     fn may_have_complete_collection_flow_contracts(&self) -> bool {
         self.semantic_model_overlay()
             .is_some_and(|overlay| overlay.may_have_complete_collection_flow_contracts())
@@ -851,7 +863,7 @@ impl RelationProjectionHost for WorkspaceSemanticOracle<'_> {
                 let binder = match event.effect {
                     SemanticEffect::Assignment { target, value } if value == thrown => target,
                     SemanticEffect::ValueFlow {
-                        kind: ValueFlowKind::Local,
+                        kind: ValueFlowKind::Local | ValueFlowKind::AddressOf,
                         source,
                         target,
                     } if source == thrown => target,
@@ -1030,12 +1042,21 @@ impl RelationProjectionHost for WorkspaceSemanticOracle<'_> {
         )
     }
 
+    fn cleanup_member_discharged(
+        &self,
+        key: crate::analyzer::semantic::GapKey,
+        procedure: &ProcedureHandle,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<GapDischargeVerdict, SemanticProviderError> {
+        super::dispatch::cleanup_member_discharges_gap(key, procedure, self.workspace, request)
+    }
+
     fn inert_drop_glue_discharged(
         &self,
         gap: &crate::analyzer::semantic::SemanticGap,
         procedure: &ProcedureHandle,
         request: &mut SemanticRequest<'_>,
-        inert: &mut Option<bool>,
+        inert: &mut Option<brokk_bifrost_semantic::analyzer::semantic::workspace_oracle::value_flow::InertDropGlueMemo>,
     ) -> Result<GapDischargeVerdict, SemanticProviderError> {
         crate::analyzer::semantic::workspace_oracle::inert_drop_glue_discharges_gap(
             gap,
@@ -1043,6 +1064,22 @@ impl RelationProjectionHost for WorkspaceSemanticOracle<'_> {
             self.workspace,
             request,
             inert,
+        )
+    }
+
+    fn selected_value_discharged(
+        &self,
+        gap: &crate::analyzer::semantic::SemanticGap,
+        procedure: &ProcedureHandle,
+        request: &mut SemanticRequest<'_>,
+        proven: &mut Option<Vec<crate::analyzer::semantic::SemanticGapId>>,
+    ) -> Result<GapDischargeVerdict, SemanticProviderError> {
+        crate::analyzer::semantic::workspace_oracle::dispatch::selected_value_discharges_gap(
+            gap,
+            procedure,
+            self.workspace,
+            request,
+            proven,
         )
     }
 
@@ -1054,6 +1091,22 @@ impl RelationProjectionHost for WorkspaceSemanticOracle<'_> {
         proven: &mut Option<Vec<crate::analyzer::semantic::SemanticGapId>>,
     ) -> Result<GapDischargeVerdict, SemanticProviderError> {
         crate::analyzer::semantic::workspace_oracle::dispatch::resolved_member_identity_discharges_gap(
+            gap,
+            procedure,
+            self.workspace,
+            request,
+            proven,
+        )
+    }
+
+    fn allocation_lifetime_discharged(
+        &self,
+        gap: &crate::analyzer::semantic::SemanticGap,
+        procedure: &ProcedureHandle,
+        request: &mut SemanticRequest<'_>,
+        proven: &mut Option<Vec<crate::analyzer::semantic::SemanticGapId>>,
+    ) -> Result<GapDischargeVerdict, SemanticProviderError> {
+        crate::analyzer::semantic::workspace_oracle::dispatch::resolved_allocation_lifetime_discharges_gap(
             gap,
             procedure,
             self.workspace,
@@ -1416,17 +1469,168 @@ impl WorkspaceSemanticOracle<'_> {
     }
 }
 
+impl WorkspaceSemanticOracle<'_> {
+    fn cached_payload_projection(
+        &self,
+        procedure: &ProcedureHandle,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<
+        SemanticOutcome<Arc<crate::analyzer::semantic::SelectedPayloadProjection>>,
+        SemanticProviderError,
+    > {
+        if request.cancellation.is_cancelled() {
+            return Ok(SemanticOutcome::Cancelled {
+                partial: None,
+                work: Default::default(),
+            });
+        }
+        let built = std::cell::Cell::new(false);
+        let guard = crate::analyzer::usages::common::query_reentrant_memo_value(
+            &self.payload_projections,
+            self.workspace.analyzer(),
+            procedure,
+            || {
+                built.set(true);
+                self.workspace.analyzer().record_read(
+                    crate::analyzer::read_ledger::ReadKey::semantic_artifact(
+                        procedure.artifact().key(),
+                    ),
+                );
+                let snapshot = self.active_semantic_model_snapshot();
+                let Some(support) = crate::analyzer::languages::language_support(
+                    procedure.artifact().key().language().language(),
+                ) else {
+                    return Ok(SemanticOutcome::Complete {
+                        value: Arc::new(Default::default()),
+                        work: Default::default(),
+                    });
+                };
+                support
+                    .selected_payload_projection(
+                        self.workspace,
+                        procedure,
+                        snapshot.as_deref(),
+                        request,
+                    )
+                    .map(|outcome| outcome.map(Arc::new))
+            },
+            |result| matches!(result, Ok(SemanticOutcome::Complete { .. })),
+        );
+        let result = (*guard).clone()?;
+        drop(guard);
+        if let SemanticOutcome::Complete { value, .. } = &result {
+            let retained = value.retained_census();
+            if retained != SemanticWork::default() && !request.budget.has_replay_holder(value) {
+                if !built.get()
+                    && let Err(exceeded) = request.budget.admit(retained)
+                {
+                    return Ok(SemanticOutcome::ExceededBudget {
+                        partial: None,
+                        exceeded,
+                        work: SemanticWork::default(),
+                    });
+                }
+                // The cold producer already admitted these rows. Name their
+                // holder so repeated hits in this ledger do not pay twice.
+                request.budget.track_replay_holder(value, retained);
+            }
+        }
+        Ok(if built.get() {
+            result
+        } else {
+            result
+                .completed_replay()
+                .expect("retained projection is complete")
+        })
+    }
+}
+
 impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
+    fn selected_payload_projection(
+        &self,
+        procedure: &ProcedureHandle,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<
+        SemanticOutcome<crate::analyzer::semantic::SelectedPayloadProjection>,
+        SemanticProviderError,
+    > {
+        Ok(self
+            .cached_payload_projection(procedure, request)?
+            .map(|projection| projection.as_ref().clone()))
+    }
+
+    fn payload_projection_identity(
+        &self,
+        procedure: &ProcedureHandle,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<
+        SemanticOutcome<Option<crate::analyzer::semantic::StableDigest>>,
+        SemanticProviderError,
+    > {
+        Ok(self
+            .cached_payload_projection(procedure, request)?
+            .map(|projection| projection.identity))
+    }
+    fn payload_constructor_output(
+        &self,
+        call: &crate::analyzer::semantic::CallSiteHandle,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<
+        SemanticOutcome<Option<crate::analyzer::semantic::ValueFlowEndpoint>>,
+        SemanticProviderError,
+    > {
+        Ok(self
+            .cached_payload_projection(call.procedure(), request)?
+            .map(|projection| projection.constructor_output(call)))
+    }
+
     fn procedure_relations(
         &self,
         procedure: &ProcedureHandle,
         context: &OracleCallContext,
         request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<ValueFlowSnapshot>, SemanticProviderError> {
-        project_procedure_relations(self, procedure, context, *self.limits(), request)
+        self.join_judged(self.procedure_relations_judged(procedure, context, request))
     }
 
     fn call_bindings(
+        &self,
+        call: &crate::analyzer::semantic::CallSiteHandle,
+        candidate: &DispatchCandidate,
+        context: &OracleCallContext,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<CallBindings>, SemanticProviderError> {
+        self.join_judged(self.call_bindings_judged(call, candidate, context, request))
+    }
+}
+
+impl WorkspaceSemanticOracle<'_> {
+    /// [`ValueFlowOracle::procedure_relations`] with the verdict of the stops
+    /// it observed, for a caller that joins it into its own capture.
+    pub fn procedure_relations_judged(
+        &self,
+        procedure: &ProcedureHandle,
+        context: &OracleCallContext,
+        request: &mut SemanticRequest<'_>,
+    ) -> Judged<Result<SemanticOutcome<ValueFlowSnapshot>, SemanticProviderError>> {
+        request.judged(|request| {
+            project_procedure_relations(self, procedure, context, *self.limits(), request)
+        })
+    }
+
+    /// [`ValueFlowOracle::call_bindings`] with the verdict of the stops it
+    /// observed, for a caller that joins it into its own capture.
+    pub fn call_bindings_judged(
+        &self,
+        call: &crate::analyzer::semantic::CallSiteHandle,
+        candidate: &DispatchCandidate,
+        context: &OracleCallContext,
+        request: &mut SemanticRequest<'_>,
+    ) -> Judged<Result<SemanticOutcome<CallBindings>, SemanticProviderError>> {
+        request.judged(|request| self.build_call_bindings(call, candidate, context, request))
+    }
+
+    fn build_call_bindings(
         &self,
         call: &crate::analyzer::semantic::CallSiteHandle,
         candidate: &DispatchCandidate,
@@ -1490,10 +1694,17 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
         );
         let unresolved_call_boundary =
             callee.semantics().properties().call_boundary == ProcedureCallBoundary::Unknown;
-        if unresolved_call_boundary && !native_incomplete_source_candidate {
+        let deferred_body_construction = callee.semantics().properties().invocation
+            == crate::analyzer::semantic::ProcedureInvocationKind::DeferredBody;
+        if (unresolved_call_boundary && !native_incomplete_source_candidate)
+            || deferred_body_construction
+        {
             // Candidate provenance remains attached to the result, while no
             // call-binding relation is minted for an authored boundary that
-            // may not be the callable the caller observes.
+            // may not be the callable the caller observes. Likewise, constructing
+            // a Rust future does not execute its body's actual/formal, heap or
+            // return transfers. Body-local analysis is independent of these
+            // withheld caller-visible bindings.
             let bindings = materialize_call_bindings(
                 call,
                 candidate,
@@ -1518,8 +1729,11 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
         let mut build =
             BindingBuild::new(unresolved_call_boundary || native_incomplete_source_candidate);
         let caller_abort_user_code = abort_paths_run_user_code(call.procedure().semantics());
+        let mut caller_inert_drops = None;
+        let mut caller_allocation_lifetimes = None;
         let caller_gaps = call.procedure().semantics().call_gap_candidates(&call_row);
-        for gap in caller_gaps {
+        for logical in caller_gaps {
+            let gap = logical.base;
             if interrupted.is_some() {
                 break;
             }
@@ -1531,10 +1745,38 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                 gaps: 1,
                 ..SemanticWork::default()
             });
-            let relevant = (gap.impacts.contains(SemanticGapImpact::CallEvaluation)
-                || gap.impacts.contains(SemanticGapImpact::ValueFlow))
-                && call_target_refinement_call(call.procedure().semantics(), gap).is_none()
-                && !implicit_abort_gap_is_discharged(gap, caller_abort_user_code);
+            let relevant =
+                !crate::analyzer::semantic::workspace_oracle::deferred_body_gap_is_caller_only(
+                    call.procedure().semantics(),
+                    gap,
+                ) && (gap.impacts.contains(SemanticGapImpact::CallEvaluation)
+                    || gap.impacts.contains(SemanticGapImpact::ValueFlow))
+                    && (call_target_refinement_call(call.procedure().semantics(), gap).is_none()
+                        && !implicit_abort_gap_is_discharged(gap, caller_abort_user_code)
+                        && {
+                            let before = staged.budget.used();
+                            let relevant = {
+                                let mut nested = staged.request(request.cancellation);
+                                logical_gap_is_discharged(
+                                    self,
+                                    logical,
+                                    call.procedure(),
+                                    &mut nested,
+                                    &mut caller_inert_drops,
+                                )? != GapDischargeVerdict::Discharged
+                                    && crate::analyzer::semantic::workspace_oracle::dispatch::resolved_allocation_lifetime_discharges_gap(
+                                        gap,
+                                        call.procedure(),
+                                        self.workspace,
+                                        &mut nested,
+                                        &mut caller_allocation_lifetimes,
+                                    )? != GapDischargeVerdict::Discharged
+                            };
+                            staged.work = staged
+                                .work
+                                .conservative_add(staged.budget.used().saturating_sub(before));
+                            relevant
+                        });
             build.open |= relevant;
             if relevant {
                 build.gap_quality = merge_gap_quality(build.gap_quality, gap);
@@ -1553,7 +1795,9 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
         let runtime_reads = runtime_outcome.available_value();
         let callee_abort_user_code = abort_paths_run_user_code(callee.semantics());
         let mut callee_inert_drops = None;
-        for gap in callee.semantics().gaps() {
+        let mut callee_allocation_lifetimes = None;
+        for logical in callee.semantics().logical_gaps() {
+            let gap = logical.base;
             if interrupted.is_some() {
                 break;
             }
@@ -1570,37 +1814,47 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
             // return-transfer gaps can weaken the binding itself.
             let relevant = (gap.impacts.contains(SemanticGapImpact::CallEvaluation)
                 || gap.impacts.contains(SemanticGapImpact::ReturnTransfer))
-                && !runtime_reads.is_some_and(|reads| reads.discharges(gap.id))
-                && call_target_refinement_call(callee.semantics(), gap).is_none()
-                && !implicit_abort_gap_is_discharged(gap, callee_abort_user_code)
-                && {
-                    let before = staged.budget.used();
-                    let relevant = {
-                        let mut nested = staged.request(request.cancellation);
-                        crate::analyzer::semantic::workspace_oracle::external_constant_field_read_discharges_gap(
+                && (!runtime_reads.is_some_and(|reads| reads.discharges(logical.key()))
+                    && call_target_refinement_call(callee.semantics(), gap).is_none()
+                    && !implicit_abort_gap_is_discharged(gap, callee_abort_user_code)
+                    && {
+                        let before = staged.budget.used();
+                        let relevant = {
+                            let mut nested = staged.request(request.cancellation);
+                            crate::analyzer::semantic::workspace_oracle::external_constant_field_read_discharges_gap(
                             gap,
                             callee,
                             self.workspace,
                             &mut nested,
-                        )? != GapDischargeVerdict::Discharged && crate::analyzer::semantic::workspace_oracle::inert_drop_glue_discharges_gap(
-                            gap,
-                            callee,
-                            self.workspace,
+                        )? != GapDischargeVerdict::Discharged && logical_gap_is_discharged(
+                            self, logical, callee,
                             &mut nested,
                             &mut callee_inert_drops,
                         )? != GapDischargeVerdict::Discharged
-                    };
-                    staged.work = staged
-                        .work
-                        .conservative_add(staged.budget.used().saturating_sub(before));
-                    relevant
-                };
+                            && crate::analyzer::semantic::workspace_oracle::dispatch::resolved_allocation_lifetime_discharges_gap(
+                                gap,
+                                callee,
+                                self.workspace,
+                                &mut nested,
+                                &mut callee_allocation_lifetimes,
+                            )? != GapDischargeVerdict::Discharged
+                        };
+                        staged.work = staged
+                            .work
+                            .conservative_add(staged.budget.used().saturating_sub(before));
+                        relevant
+                    });
             build.open |= relevant;
             if relevant {
                 build.gap_quality = merge_gap_quality(build.gap_quality, gap);
             }
         }
 
+        if request.cancellation.is_cancelled() {
+            interrupted = Some(Interruption::Cancelled);
+        } else if let Some(refusal) = staged.budget.first_refusal() {
+            interrupted = Some(Interruption::Budget(refusal.exceeded));
+        }
         if let Some(interruption) = interrupted {
             return interrupted_call_bindings(
                 call,
@@ -2130,9 +2384,11 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                             }
                         }
                     }
-                    if let Some(conversion) =
-                        support.static_class_argument_conversion(formal_class, actual_class)
-                    {
+                    if let Some(conversion) = support.static_class_argument_conversion(
+                        formal_class,
+                        actual_class,
+                        &value.kind,
+                    ) {
                         if let Err(reason) = conversion {
                             completeness = EvidenceCompleteness::Partial(
                                 format!("argument conversion unknown: {reason:?}").into(),
@@ -2458,9 +2714,12 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
 impl WorkspaceSemanticOracle<'_> {
     /// The proven external targets of `call` when that is all dispatch leaves
     /// open: each external boundary is proven with only the callee body
-    /// missing, and any other boundary is the unresolved-override residual,
-    /// which a caller that proves the receiver's exact class may discharge
-    /// (#10989). `None` when any other outcome or boundary remains.
+    /// missing, and any other boundary is an override residual: the
+    /// "may select an override" arm, or the arm for workspace implementors
+    /// of the external member that were not enumerated. Both are about
+    /// subclasses of the receiver's static type, so a caller that proves the
+    /// receiver's exact class may discharge them (#10989). `None` when any
+    /// other outcome or boundary remains.
     fn proven_external_targets(
         &self,
         call: &crate::analyzer::semantic::CallSiteHandle,
@@ -2492,7 +2751,10 @@ impl WorkspaceSemanticOracle<'_> {
                 {
                     targets.push(target.clone());
                 }
-                (DispatchBoundaryKind::Unresolved, None) => {}
+                (
+                    DispatchBoundaryKind::Unresolved | DispatchBoundaryKind::HierarchyUnenumerated,
+                    None,
+                ) => {}
                 _ => return Ok(None),
             }
         }

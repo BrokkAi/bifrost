@@ -40,7 +40,9 @@ pub use crate::analyzer::semantic::partial_flow::fixpoint::SEED_EVENT;
 
 pub use crate::analyzer::semantic::partial_flow::fixpoint::WitnessStep;
 
-pub use crate::analyzer::semantic::partial_flow::fixpoint::caller_exact_read_location;
+pub use crate::analyzer::semantic::partial_flow::fixpoint::{
+    caller_exact_read_location, caller_read_location,
+};
 
 pub use crate::analyzer::semantic::partial_flow::fixpoint::caller_location_carriers;
 pub use crate::analyzer::semantic::partial_flow::fixpoint::caller_returned_member_locator;
@@ -216,7 +218,9 @@ impl RelationProjectionHost for FileLocalProjectionHost<'_> {
         _gap: &SemanticGap,
         _procedure: &ProcedureHandle,
         _request: &mut SemanticRequest<'_>,
-        _inert: &mut Option<bool>,
+        _inert: &mut Option<
+            crate::analyzer::semantic::workspace_oracle::value_flow::InertDropGlueMemo,
+        >,
     ) -> Result<GapDischargeVerdict, SemanticProviderError> {
         Ok(GapDischargeVerdict::Undischarged)
     }

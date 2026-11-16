@@ -178,7 +178,7 @@ JOIN temp.selected_workspace_revisions AS selected
   ON selected.workspace_id = s.workspace_id AND selected.lang = s.lang
  AND selected.generation = s.generation
  AND c.valid_from<=selected.revision AND (c.valid_until IS NULL OR selected.revision<c.valid_until)
-WHERE c.context_id = ?1 AND s.derivation_version = ?2
+WHERE c.context_id = ?1 AND s.derivation_identity = ?2
 "#;
 
 // Exact file placement and import mapping, then only the selected provider's
@@ -434,7 +434,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 snapshot.generation.get(),
                 snapshot.revision,
                 base,
-                super::super::go_package_context::DERIVATION_VERSION,
+                super::super::go_package_context::derivation_identity(),
                 path
             ],
             |row: &rusqlite::Row<'_>| {
@@ -534,7 +534,7 @@ impl SelectedResolutionOperation<'_, '_> {
             .query_row(
                 rusqlite::params![
                     context_id,
-                    super::super::go_package_context::DERIVATION_VERSION,
+                    super::super::go_package_context::derivation_identity(),
                     source_role,
                 ],
                 |row| {
@@ -644,6 +644,7 @@ impl SelectedResolutionOperation<'_, '_> {
             reasons.push(identities.named_semantic(
                 hash.finish(),
                 "go-file-build-selection-unavailable",
+                crate::analyzer::resolution::ReasonDeterminism::Unaudited,
                 &evidence,
             ));
         }
@@ -654,6 +655,7 @@ impl SelectedResolutionOperation<'_, '_> {
             reasons.push(identities.named_semantic(
                 hash.finish(),
                 "go-context-incomplete",
+                crate::analyzer::resolution::ReasonDeterminism::Unaudited,
                 &selection.evidence,
             ));
         }
@@ -665,6 +667,7 @@ impl SelectedResolutionOperation<'_, '_> {
             reasons.push(identities.named_semantic(
                 hash.finish(),
                 "go-package-incomplete",
+                crate::analyzer::resolution::ReasonDeterminism::Unaudited,
                 &package_evidence,
             ));
         }
@@ -679,6 +682,7 @@ impl SelectedResolutionOperation<'_, '_> {
             reasons.push(identities.named_semantic(
                 hash.finish(),
                 "go-transient-placement-unproven",
+                crate::analyzer::resolution::ReasonDeterminism::Unaudited,
                 &evidence,
             ));
         }
@@ -917,6 +921,7 @@ impl SelectedResolutionOperation<'_, '_> {
         let reason = self.ready.context_identities.named_semantic(
             hash.finish(),
             GO_IMPORT_INCOMPLETE,
+            crate::analyzer::resolution::ReasonDeterminism::Unaudited,
             &evidence,
         );
         base_completion.combine(&ResolutionCompletion::incomplete([
@@ -1004,6 +1009,13 @@ pub(super) struct GoDefinitionContextMemo {
     // written once, in the transaction that creates its id, so these answers
     // need no authority. Keyed by path because an ordinal changes with scope.
     caller_context_files: HashMap<i64, HashMap<String, bool>>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl GoDefinitionContextMemo {
+    pub(super) fn is_empty(&self) -> bool {
+        self.authority.is_none() && self.contexts.is_empty() && self.caller_context_files.is_empty()
+    }
 }
 
 impl super::super::resolution_typed::GoDefinitionContextBinder

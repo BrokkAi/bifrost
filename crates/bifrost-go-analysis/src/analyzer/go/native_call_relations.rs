@@ -1,5 +1,9 @@
 //! Go call relations projected from selected inverse and forward operations.
 
+use brokk_bifrost_analysis::analyzer::usages::call_relations::{
+    CallRelationDiagnosticPayload, CallRelationFailure, LocatedCallRelationDiagnostic,
+};
+
 use crate::analyzer::go::GoAnalyzer;
 
 use crate::analyzer::go::selected_reverse::GoSelectedReverseOutcome;
@@ -62,34 +66,28 @@ impl CallRelationProvider for GoNativeCallRelations {
         cancellation: Option<&CancellationToken>,
     ) -> CallRelationResult {
         let cancellation = cancellation.cloned().unwrap_or_default();
-        if let Some(result) =
-            native_incoming_preflight(target, limits, &cancellation, || CallRelationDiagnostic {
-                code: CallRelationDiagnosticCode::BudgetExhausted,
-                message: format!(
-                    "native Go incoming-call budget omitted {}",
-                    target.fq_name()
-                ),
-                context: target.fq_name().to_string(),
-                semantic_count: None,
-                reason_kind: None,
-            })
-        {
+        if let Some(result) = native_incoming_preflight(target, limits, &cancellation, || {
+            CallRelationDiagnostic::new(
+                CallRelationDiagnosticCode::BudgetExhausted,
+                CallRelationDiagnosticPayload::GoIncomingBudget {
+                    target: target.fq_name().to_string(),
+                },
+                target.fq_name().to_string(),
+            )
+        }) {
             return result;
         }
         let Some(go) = resolve_analyzer::<GoAnalyzer>(analyzer) else {
-            return unavailable("native Go analyzer is unavailable", target);
+            return unavailable(CallRelationFailure::Unavailable, target);
         };
         let selected = match go_selected_inverse_for(go, target, &cancellation) {
             GoSelectedReverseOutcome::Ready(answer) => answer,
-            GoSelectedReverseOutcome::Unavailable(reason)
-            | GoSelectedReverseOutcome::TargetUncovered(reason) => {
-                return unavailable(
-                    format!("selected Go inverse is unavailable: {reason}"),
-                    target,
-                );
+            GoSelectedReverseOutcome::Unavailable(_reason)
+            | GoSelectedReverseOutcome::TargetUncovered(_reason) => {
+                return unavailable(CallRelationFailure::Unavailable, target);
             }
-            GoSelectedReverseOutcome::Stale(reason) => {
-                return unavailable(format!("selected Go inverse is stale: {reason}"), target);
+            GoSelectedReverseOutcome::Stale(_reason) => {
+                return unavailable(CallRelationFailure::Stale, target);
             }
             GoSelectedReverseOutcome::Cancelled => {
                 return CallRelationResult {
@@ -99,8 +97,8 @@ impl CallRelationProvider for GoNativeCallRelations {
                     ..CallRelationResult::default()
                 };
             }
-            GoSelectedReverseOutcome::StoreError(reason) => {
-                return unavailable(format!("selected Go inverse failed: {reason}"), target);
+            GoSelectedReverseOutcome::StoreError(_reason) => {
+                return unavailable(CallRelationFailure::StoreError, target);
             }
         };
         project_incoming_calls(go, target, selected, limits, &cancellation)
@@ -123,7 +121,7 @@ impl CallRelationProvider for GoNativeCallRelations {
             };
         }
         let Some(go) = resolve_analyzer::<GoAnalyzer>(analyzer) else {
-            return unavailable("native Go analyzer is unavailable", caller);
+            return unavailable(CallRelationFailure::Unavailable, caller);
         };
         crate::analyzer::go::native_outgoing::outgoing(
             analyzer, go,
@@ -188,7 +186,7 @@ pub(crate) fn project_incoming_calls(
     if let Some(sites) = projected.unwrap_or_else(|never| match never {}) {
         finish_incoming_sites(sites, &mut result);
     }
-    result
+    result.with_diagnostic_limits(limits)
 }
 
 struct GoIncomingProjection<'a> {
@@ -210,7 +208,7 @@ impl IncomingCallProjection for GoIncomingProjection<'_> {
         }
         let Some(source) = self.go.indexed_source(file) else {
             diagnostics.push(diagnostic(
-                format!("selected Go call source is unavailable: {file}"),
+                CallRelationDiagnosticPayload::GoSourceUnavailable.at(file, None),
                 self.target.fq_name().to_string(),
                 "native_call_source_unavailable",
             ));
@@ -225,7 +223,7 @@ impl IncomingCallProjection for GoIncomingProjection<'_> {
             .source_matches_selected_native_content(file, &source)
         {
             diagnostics.push(diagnostic(
-                format!("selected Go call source changed: {file}"),
+                CallRelationDiagnosticPayload::GoSourceStale.at(file, None),
                 self.target.fq_name().to_string(),
                 "native_call_source_stale",
             ));
@@ -241,7 +239,7 @@ impl IncomingCallProjection for GoIncomingProjection<'_> {
             .is_some_and(|facts| facts.source() != source.as_str())
         {
             diagnostics.push(diagnostic(
-                format!("selected Go structural source changed: {file}"),
+                CallRelationDiagnosticPayload::GoStructuralSourceStale.at(file, None),
                 self.target.fq_name().to_string(),
                 "native_call_source_stale",
             ));
@@ -273,16 +271,26 @@ impl IncomingCallProjection for GoIncomingProjection<'_> {
         structural_incoming_caller(self.go.structural_fact_providers(), edge, syntax)
     }
 
+    fn join_reuse_verdict(
+        &self,
+        verdict: brokk_bifrost_analysis::analyzer::reuse_verdict::ReuseVerdict,
+    ) {
+        brokk_bifrost_analysis::analyzer::IAnalyzer::join_reuse_verdict(self.go, verdict);
+    }
+
     fn report_issue(&self, issue: IncomingProjectionIssue<'_>) -> CallRelationDiagnostic {
         match issue {
             IncomingProjectionIssue::FactsUnavailable(file) => diagnostic(
-                format!("Go structural call facts are unavailable: {file}"),
-                file.to_string(),
+                CallRelationDiagnosticPayload::GoFactsUnavailable.at(file, None),
+                "call_source".to_string(),
                 "native_call_facts_unavailable",
             ),
             IncomingProjectionIssue::OwnerUnavailable(edge) => diagnostic(
-                format!("selected Go call has no callable owner: {:?}", edge.site),
-                edge.site.file.to_string(),
+                CallRelationDiagnosticPayload::GoOwnerUnavailable {
+                    enclosing: edge.site.enclosing.as_ref().map(Into::into),
+                }
+                .at(&edge.site.file, Some(edge.site.range)),
+                "call_source".to_string(),
                 "native_call_owner_unavailable",
             ),
         }
@@ -300,10 +308,10 @@ fn incomplete_diagnostics(
         .iter()
         .map(|reason| {
             diagnostic(
-                format!(
-                    "selected Go incoming-call inventory is incomplete for {}: {reason:?}",
-                    target.fq_name()
-                ),
+                CallRelationDiagnosticPayload::GoInventoryIncomplete {
+                    target: target.fq_name().to_string(),
+                    reason: reason.into(),
+                },
                 target.fq_name().to_string(),
                 "native_call_inventory_incomplete",
             )
@@ -311,12 +319,12 @@ fn incomplete_diagnostics(
         .collect()
 }
 
-fn unavailable(message: impl Into<String>, target: &CodeUnit) -> CallRelationResult {
+fn unavailable(reason: CallRelationFailure, target: &CodeUnit) -> CallRelationResult {
     CallRelationResult {
         caller_inventory: CallerInventoryCoverage::Incomplete,
         proof_authority: UsageProofAuthority::Native,
         diagnostics: vec![diagnostic(
-            message.into(),
+            CallRelationDiagnosticPayload::Failure { reason },
             target.fq_name().to_string(),
             "native_call_unavailable",
         )],
@@ -324,6 +332,10 @@ fn unavailable(message: impl Into<String>, target: &CodeUnit) -> CallRelationRes
     }
 }
 
-fn diagnostic(message: String, context: String, reason_kind: &str) -> CallRelationDiagnostic {
+fn diagnostic(
+    message: impl Into<LocatedCallRelationDiagnostic>,
+    context: String,
+    reason_kind: &str,
+) -> CallRelationDiagnostic {
     CallRelationDiagnostic::analysis_failed(message, context, reason_kind.to_owned())
 }

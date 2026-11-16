@@ -426,6 +426,9 @@ impl<'a> SarifResult<'a> {
                 related_locations_truncated: finding.related_truncated(),
                 omitted_related_locations_lower_bound: finding
                     .omitted_related_locations_lower_bound(),
+                omitted_related_locations_exactness: finding
+                    .related_locations_omitted()
+                    .exactness(),
                 evidence_refs_truncated: finding.evidence_refs_truncated(),
                 omitted_evidence_refs_lower_bound: finding.omitted_evidence_refs_lower_bound(),
                 cvss: finding.cvss(),
@@ -637,6 +640,8 @@ struct SarifResultProperties<'a> {
     related_locations_truncated: bool,
     #[serde(rename = "bifrost.omittedRelatedLocationsLowerBound")]
     omitted_related_locations_lower_bound: u64,
+    #[serde(rename = "bifrost.omittedRelatedLocationsExactness")]
+    omitted_related_locations_exactness: brokk_bifrost_core::omission::OmissionExactness,
     #[serde(rename = "bifrost.evidenceRefsTruncated")]
     evidence_refs_truncated: bool,
     #[serde(rename = "bifrost.omittedEvidenceRefsLowerBound")]
@@ -1344,6 +1349,9 @@ struct SarifPolicyRunSummary<'a> {
     completion: &'a PolicyRunCompletion,
     diagnostics: &'a [PolicyDiagnostic],
     diagnostics_truncated: bool,
+    diagnostic_causes: &'a crate::finding::PolicyDiagnosticCauses,
+    worst_omitted_diagnostic_severity: Option<PolicyDiagnosticSeverity>,
+    budget_refusals: &'a [String],
     work: &'a PolicyWorkReport,
 }
 
@@ -1356,6 +1364,9 @@ impl<'a> SarifPolicyRunSummary<'a> {
             completion: run.completion(),
             diagnostics: run.diagnostics(),
             diagnostics_truncated: run.diagnostics_truncated(),
+            diagnostic_causes: run.diagnostic_causes(),
+            worst_omitted_diagnostic_severity: run.worst_omitted_diagnostic_severity(),
+            budget_refusals: run.budget_refusals(),
             work: run.work(),
         }
     }
@@ -1611,6 +1622,7 @@ mod tests {
                 None,
                 None,
                 Vec::new(),
+                crate::RelatedLocationOmissions::Known(0),
             )
             .expect("valid report diagnostic");
             let value = serde_json::to_value(SarifNotification::report_diagnostic(&diagnostic))

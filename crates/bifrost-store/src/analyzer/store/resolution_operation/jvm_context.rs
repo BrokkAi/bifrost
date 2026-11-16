@@ -104,18 +104,36 @@ FROM main.jvm_context_revisions AS c
 JOIN temp.selected_workspace_revisions AS selected
   ON selected.workspace_id=c.workspace_id AND selected.lang=c.lang
  AND selected.generation=c.generation AND selected.revision=c.revision
-WHERE c.lang=?1 AND c.derivation_version=1
+WHERE c.lang=?1 AND c.derivation_identity=?2
 "#;
 
 const SCALA_PREDEF_DEFAULT_IMPORT: &str = "scala.Predef";
 
 /// Opt-in exact-input counts. This ledger belongs to one query, never a reader
 /// connection or an analyzer retained for a later request.
-#[derive(Default)]
 #[doc(hidden)]
 pub struct JvmContextReadProfile {
     #[doc(hidden)]
     pub calls: HashMap<(&'static str, String), u64>,
+    /// The operation's identity in the seam profile, `None` when the profile
+    /// is off (a test may install a profile by hand).
+    operation: Option<crate::analyzer::resolution::seam_profile::JvmOperation>,
+}
+
+impl JvmContextReadProfile {
+    /// Start the ledger of one JVM operation, and give the operation its id.
+    pub(crate) fn open() -> Self {
+        Self {
+            calls: HashMap::default(),
+            operation: crate::analyzer::resolution::seam_profile::open_jvm_operation(),
+        }
+    }
+}
+
+impl Default for JvmContextReadProfile {
+    fn default() -> Self {
+        Self::open()
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -132,13 +150,20 @@ impl JvmContextReadProfile {
 
 impl Drop for JvmContextReadProfile {
     fn drop(&mut self) {
-        if self.calls.is_empty() {
-            return;
-        }
+        use crate::analyzer::resolution::seam_profile::{
+            JvmOperationStatus, record_jvm_operation_reads,
+        };
         let reads = self.calls.iter().map(|((kind, key), calls)| {
             serde_json::json!({"kind": kind, "key": key, "calls": calls})
         }).collect::<Vec<_>>();
-        crate::analyzer::resolution::seam_profile::record_jvm_operation_reads(
+        let status = if std::thread::panicking() {
+            JvmOperationStatus::Panicked
+        } else {
+            JvmOperationStatus::Completed
+        };
+        record_jvm_operation_reads(
+            self.operation.take(),
+            status,
             serde_json::Value::Array(reads),
         );
     }
@@ -519,7 +544,12 @@ type RetainedHeap = super::super::cache_budget::RetainedHeap;
 
 fn charge_strings(heap: &mut RetainedHeap, strings: &Vec<String>) {
     heap.vec(strings);
-    heap.add(strings.iter().map(String::capacity).sum());
+    heap.add(
+        strings
+            .iter()
+            .map(|value| heap.allocation_bytes(value.capacity()))
+            .sum(),
+    );
 }
 
 fn charge_recipes(heap: &mut RetainedHeap, recipes: &Vec<ResolutionLookupSemanticRecipe>) {
@@ -535,7 +565,13 @@ fn charge_recipes(heap: &mut RetainedHeap, recipes: &Vec<ResolutionLookupSemanti
 fn charge_gaps(heap: &mut RetainedHeap, gaps: &Vec<JvmImportContextGap>) {
     heap.vec(gaps);
     for gap in gaps {
-        heap.add(gap.lookup.owned_bytes() + gap.owner.as_ref().map_or(0, String::capacity));
+        heap.add(
+            gap.lookup.owned_bytes()
+                + gap
+                    .owner
+                    .as_ref()
+                    .map_or(0, |value| heap.allocation_bytes(value.capacity())),
+        );
         heap.vec(&gap.external_member_targets);
         gap.pack_completion.charge_retained(heap);
     }
@@ -554,20 +590,30 @@ impl JvmContextPreparation {
     /// with no census of its own is charged a fixed allowance per element.
     fn charge_retained(&self, heap: &mut RetainedHeap) {
         heap.add(std::mem::size_of_val(self));
-        heap.add(self.source_package.as_ref().map_or(0, String::capacity));
+        heap.add(
+            self.source_package
+                .as_ref()
+                .map_or(0, |value| heap.allocation_bytes(value.capacity())),
+        );
         heap.vec(&self.binders);
         for binder in &self.binders {
             heap.add(
-                binder.head.capacity()
-                    + binder.bound.as_ref().map_or(0, String::capacity)
-                    + binder.imported.as_ref().map_or(0, String::capacity)
+                heap.allocation_bytes(binder.head.capacity())
+                    + binder
+                        .bound
+                        .as_ref()
+                        .map_or(0, |value| heap.allocation_bytes(value.capacity()))
+                    + binder
+                        .imported
+                        .as_ref()
+                        .map_or(0, |value| heap.allocation_bytes(value.capacity()))
                     + UNCENSUSED_ELEMENT_BYTES,
             );
             charge_recipes(heap, &binder.recipes);
         }
         heap.map(&self.package_plan);
         for (package, planned) in &self.package_plan {
-            heap.add(package.capacity());
+            heap.add(heap.allocation_bytes(package.capacity()));
             heap.map(&planned.candidates);
             for candidates in planned.candidates.values() {
                 heap.vec(candidates);
@@ -581,8 +627,8 @@ impl JvmContextPreparation {
                         JvmPackageCandidate::ExternalMember(member) => {
                             heap.add(
                                 UNCENSUSED_ELEMENT_BYTES
-                                    + member.pack_id.capacity()
-                                    + member.pack_version.capacity(),
+                                    + heap.allocation_bytes(member.pack_id.capacity())
+                                    + heap.allocation_bytes(member.pack_version.capacity()),
                             );
                             member.completion.charge_retained(heap);
                         }
@@ -592,9 +638,14 @@ impl JvmContextPreparation {
         }
         heap.map(&self.qualifier_names_by_demand);
         for (demand, names) in &self.qualifier_names_by_demand {
-            heap.add(demand.capacity());
+            heap.add(heap.allocation_bytes(demand.capacity()));
             heap.hash_set(names);
-            heap.add(names.iter().map(String::capacity).sum());
+            heap.add(
+                names
+                    .iter()
+                    .map(|value| heap.allocation_bytes(value.capacity()))
+                    .sum(),
+            );
         }
         for references in [
             &self.package_reference_occurrences,
@@ -606,7 +657,7 @@ impl JvmContextPreparation {
         heap.btree_set(&self.same_package_lookups);
         heap.map(&self.references_by_name);
         for (name, references) in &self.references_by_name {
-            heap.add(name.capacity());
+            heap.add(heap.allocation_bytes(name.capacity()));
             heap.vec(references);
             heap.add(references.len().saturating_mul(UNCENSUSED_ELEMENT_BYTES));
         }
@@ -647,10 +698,13 @@ impl JvmContextPreparation {
                 }
                 if let Some(alias) = &import.package_alias {
                     heap.add(std::mem::size_of_val(alias));
-                    heap.add(alias.selected_name.capacity() + alias.container.capacity());
+                    heap.add(
+                        heap.allocation_bytes(alias.selected_name.capacity())
+                            + heap.allocation_bytes(alias.container.capacity()),
+                    );
                     heap.vec(&alias.exact_hosts);
                     for (segment, hosts) in &alias.receipts {
-                        heap.add(segment.capacity());
+                        heap.add(heap.allocation_bytes(segment.capacity()));
                         heap.vec(hosts);
                     }
                 }
@@ -701,7 +755,10 @@ impl JvmContextPreparation {
         heap.hash_set(&registered);
         for (_, recipe, references) in registered.iter() {
             heap.add(
-                recipe.owned_bytes() + references.capacity() * std::mem::size_of::<SemanticId>(),
+                recipe.owned_bytes()
+                    + heap.allocation_bytes(
+                        references.capacity() * std::mem::size_of::<SemanticId>(),
+                    ),
             );
         }
         drop(registered);
@@ -716,20 +773,23 @@ impl JvmContextPreparation {
                         heap.vec(candidates);
                         for candidate in candidates {
                             heap.add(
-                                candidate.fqn.capacity()
-                                    + candidate.package.capacity()
+                                heap.allocation_bytes(candidate.fqn.capacity())
+                                    + heap.allocation_bytes(candidate.package.capacity())
                                     + UNCENSUSED_ELEMENT_BYTES,
                             );
                             if let Some(coordinate) = &candidate.coordinate {
                                 heap.vec(&coordinate.outward);
                             }
                             if let Some(declared) = &candidate.declared {
-                                heap.add(declared.fqn.capacity());
+                                heap.add(heap.allocation_bytes(declared.fqn.capacity()));
                             }
                         }
                     }
                     JvmOnDemandTypeChoice::Possible(winner) => {
-                        heap.add(winner.package.capacity() + winner.declared.fqn.capacity());
+                        heap.add(
+                            heap.allocation_bytes(winner.package.capacity())
+                                + heap.allocation_bytes(winner.declared.fqn.capacity()),
+                        );
                     }
                     JvmOnDemandTypeChoice::Unavailable
                     | JvmOnDemandTypeChoice::OpenDefault
@@ -952,7 +1012,7 @@ struct JvmTypeOnDemandImportResult {
 
 impl JvmOnDemandPackageEvidence {
     fn charge_retained(&self, heap: &mut RetainedHeap) {
-        heap.add(self.package.capacity() + self.lookup.owned_bytes());
+        heap.add(heap.allocation_bytes(self.package.capacity()) + self.lookup.owned_bytes());
         heap.vec(&self.targets);
         for target in &self.targets {
             if let Some(access) = &target.access {
@@ -1563,6 +1623,7 @@ impl crate::analyzer::resolution::fact_resolution::LexicalAnswerFinalizer
             self.operation.ready.context_identities.named_semantic(
                 CanonicalHasher::new(label.as_bytes()).finish(),
                 label,
+                crate::analyzer::resolution::ReasonDeterminism::Unaudited,
                 "Inherited member type may displace the lexical type",
             ),
         );
@@ -2250,6 +2311,7 @@ impl UnitAccessRules for JvmUnitAccessRules<'_, '_, '_> {
         let gap = self.operation.ready.context_identities.named_semantic(
     hash.finish(),
     "java-source-access-open",
+        crate::analyzer::resolution::ReasonDeterminism::Unaudited,
     &format!("Source visibility from root `{}` to root `{}` is not established by selected build dependencies or JVM source-set conventions", caller_root, target_root),
 );
         Ok(gap)
@@ -3009,7 +3071,13 @@ impl SelectedResolutionOperation<'_, '_> {
         let connection = self.ready.inventory.connection();
         let Some(context_id) = connection
             .prepare_cached(CONTEXT_SELECTION)?
-            .query_row([source_language.config_label()], |row| row.get::<_, i64>(0))
+            .query_row(
+                rusqlite::params![
+                    source_language.config_label(),
+                    super::super::jvm_package_context::jvm_context_derivation_identity()
+                ],
+                |row| row.get::<_, i64>(0),
+            )
             .optional()?
         else {
             return Ok(None);
@@ -3043,6 +3111,7 @@ impl SelectedResolutionOperation<'_, '_> {
             Some(identities.named_semantic(
                 digest,
                 "jvm-context-incomplete",
+        crate::analyzer::resolution::ReasonDeterminism::Unaudited,
                 "Selected JVM facts leave external artifacts, classpath ownership, inherited routes and peer-language inventory open",
             ))
         } else {
@@ -5236,6 +5305,7 @@ impl SelectedResolutionOperation<'_, '_> {
         let access_identity = self.ready.context_identities.named_semantic(
             CanonicalHasher::new(b"jvm-selected-declaration-access:v2-lexical-regions").finish(),
             "jvm-selected-declaration-access",
+            crate::analyzer::resolution::ReasonDeterminism::Unaudited,
             "JVM declaration visibility under exact selected package and lexical ownership",
         );
         let mut context = context;
@@ -5255,6 +5325,7 @@ impl SelectedResolutionOperation<'_, '_> {
             let reason = self.ready.context_identities.named_semantic(
                 descriptor.finish(),
                 "jvm-import-selector-open",
+                crate::analyzer::resolution::ReasonDeterminism::Unaudited,
                 "A selected JVM import has no supported selector route or selected destination",
             );
             context = context.with_additional_context_owned_inventory_reason(reason);
@@ -6918,6 +6989,7 @@ impl SelectedResolutionOperation<'_, '_> {
         let reason = self.ready.context_identities.named_semantic(
             descriptor.finish(),
             spec.kind,
+            crate::analyzer::resolution::ReasonDeterminism::Unaudited,
             &spec.detail,
         );
         self.ready.context_identities.record_named_reason_lookup(
@@ -7519,6 +7591,7 @@ impl SelectedResolutionOperation<'_, '_> {
             let reason = self.ready.context_identities.named_semantic(
                 CanonicalHasher::new(b"jvm-package-alias-route-open:v1").finish(),
                 "jvm-package-alias-route-open",
+                crate::analyzer::resolution::ReasonDeterminism::Unaudited,
                 "Selected package alias route changed before replay",
             );
             return Ok(Read::Ready {
@@ -7586,6 +7659,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 let reason = self.ready.context_identities.named_semantic(
                     CanonicalHasher::new(b"jvm-package-alias-site-ambiguous:v1").finish(),
                     "jvm-package-alias-route-open",
+                    crate::analyzer::resolution::ReasonDeterminism::Unaudited,
                     "Competing selected package aliases at one import site",
                 );
                 Ok(Read::Ready {
@@ -7858,6 +7932,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 let reason = self.ready.context_identities.named_semantic(
                     hash.finish(),
                     "JvmPackPackageMemberOpen",
+                    crate::analyzer::resolution::ReasonDeterminism::Unaudited,
                     &format!(
                         "{}@{} supplies {}.{} with incomplete package member inventory",
                         shard.manifest.pack_id, shard.manifest.version, package, name
@@ -8606,6 +8681,7 @@ impl SelectedResolutionOperation<'_, '_> {
                                 let reason = self.ready.context_identities.named_semantic(
                                     CanonicalHasher::new(b"jvm-source-domain-open:v1").finish(),
                                     "jvm-source-domain-open",
+        crate::analyzer::resolution::ReasonDeterminism::Unaudited,
                                     "Selected source package and path do not prove a source access domain",
                                 );
                                 Some(ResolutionCompletion::incomplete([
@@ -9361,6 +9437,7 @@ impl SelectedResolutionOperation<'_, '_> {
                     let alias_identity = self.ready.context_identities.named_semantic(
                         alias_hash.finish(),
                         "jvm-alias-fact",
+        crate::analyzer::resolution::ReasonDeterminism::Unaudited,
                         "Selected JVM alias rows map this binary owner and member to an authored declaration",
                     );
                     if static_alias_import {
@@ -11334,6 +11411,7 @@ impl SelectedResolutionOperation<'_, '_> {
         let gap = self.ready.context_identities.named_semantic(
             CanonicalHasher::new(b"java-import-declaration-visibility-open:v1").finish(),
             "java-import-declaration-visibility-open",
+            crate::analyzer::resolution::ReasonDeterminism::Unaudited,
             "Selected declaration visibility does not establish import access",
         );
         Ok(JvmDeclarationAccess::Ready(completion.combine(
@@ -11944,7 +12022,12 @@ fn model_declared_jvm_boundary_id(
             ),
         )
     };
-    identities.named_semantic(hash.finish(), kind, &detail)
+    identities.named_semantic(
+        hash.finish(),
+        kind,
+        crate::analyzer::resolution::ReasonDeterminism::Unaudited,
+        &detail,
+    )
 }
 
 /// Selected provider inputs and completed identity groups, owned by one file
@@ -12104,6 +12187,7 @@ fn register_jvm_external_provider_type_identities(
         let enumeration_boundary = identities.named_semantic(
             boundary_hash.finish(),
             "jvm-external-provider-type",
+            crate::analyzer::resolution::ReasonDeterminism::Unaudited,
             &format!(
                 "implicit JVM providers {provider_names:?} are unindexed for type `{}`",
                 lookup.spelling()
@@ -12197,6 +12281,7 @@ fn register_jvm_external_provider_type_identities(
             let enumeration_boundary = identities.named_semantic(
                 boundary_hash.finish(),
                 "jvm-external-provider-type",
+                crate::analyzer::resolution::ReasonDeterminism::Unaudited,
                 &format!(
                     "implicit Java provider java.lang is unindexed for type `{}`",
                     lookup.spelling()
@@ -13088,6 +13173,7 @@ impl SelectedResolutionOperation<'_, '_> {
         Ok(self.ready.context_identities.named_semantic(
             descriptor.finish(),
             "jvm-import-owner-open",
+            crate::analyzer::resolution::ReasonDeterminism::Unaudited,
             "The Scala import qualifier does not establish a fully indexed member selection",
         ))
     }
@@ -15008,9 +15094,13 @@ impl SelectedResolutionOperation<'_, '_> {
             .inventory
             .mount_record_by_ordinal(source_mount.ordinal())?;
         let connection = self.ready.inventory.connection();
-        let context = connection
-            .prepare_cached(CONTEXT_SELECTION)?
-            .query_row([source_language.config_label()], |row| row.get::<_, i64>(0))?;
+        let context = connection.prepare_cached(CONTEXT_SELECTION)?.query_row(
+            rusqlite::params![
+                source_language.config_label(),
+                super::super::jvm_package_context::jvm_context_derivation_identity()
+            ],
+            |row| row.get::<_, i64>(0),
+        )?;
         let caller_package: Option<String> = connection
             .prepare_cached(
                 "SELECT content_package FROM main.blob_meta WHERE blob_id=?1 AND is_complete=1",
@@ -15369,9 +15459,13 @@ impl SelectedResolutionOperation<'_, '_> {
             .inventory
             .connection()
             .prepare_cached(CONTEXT_SELECTION)?
-            .query_row([mount.semantic_language().config_label()], |row| {
-                row.get::<_, i64>(0)
-            })?;
+            .query_row(
+                rusqlite::params![
+                    mount.semantic_language().config_label(),
+                    super::super::jvm_package_context::jvm_context_derivation_identity()
+                ],
+                |row| row.get::<_, i64>(0),
+            )?;
         let mut package = self
             .ready
             .inventory
@@ -15556,6 +15650,7 @@ impl SelectedResolutionOperation<'_, '_> {
             let gap = self.ready.context_identities.named_semantic(
                 CanonicalHasher::new(b"jvm-external-member-source-unavailable:v1").finish(),
                 "jvm-external-member-source-unavailable",
+                crate::analyzer::resolution::ReasonDeterminism::Unaudited,
                 "External member has no source declaration to hydrate",
             );
             return Ok(Read::Unavailable {
@@ -15608,6 +15703,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 let gap = self.ready.context_identities.named_semantic(
                     CanonicalHasher::new(b"jvm-source-member-access-unavailable:v1").finish(),
                     "jvm-source-member-access-unavailable",
+                    crate::analyzer::resolution::ReasonDeterminism::Unaudited,
                     "Source declaration access preparation is unavailable",
                 );
                 return Ok(Read::Unavailable {

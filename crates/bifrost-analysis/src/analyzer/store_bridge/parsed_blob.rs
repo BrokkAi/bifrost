@@ -483,6 +483,7 @@ pub fn prepare_parsed_blob_at_generations<A: LanguageAdapter>(
         ResolutionInteriorPreparation::Cancelled => {
             return Ok(PreparedParsedBlobPreparation::Cancelled);
         }
+        ResolutionInteriorPreparation::Rejected(error) => return Err(error),
     };
     drop(lowered);
     drop(_resolution_timing);
@@ -729,7 +730,10 @@ pub fn prepare_parsed_blob_at_generations<A: LanguageAdapter>(
                 && metadata.java_type_constructor_shape().is_none()
             {
                 return Err(StoreError::new(format!(
-                    "canonical Java type constructor shape is unavailable for {unit:?}"
+                    "canonical Java type constructor shape is unavailable for declaration={}, fqn={}, path={:?}",
+                    unit.declaration_id(),
+                    unit.fq_name(),
+                    unit.source().rel_path(),
                 )));
             }
             assert!(

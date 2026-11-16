@@ -66,6 +66,18 @@ succeeds when the language resolver binds a structured reference candidate to a
 declaration identity. A best-effort binding remains unproven, and an unsupported
 operation or missing graph seed produces a typed diagnostic.
 
+A JavaScript or TypeScript receiver summary that reads a factory's body proves a
+target only when every reachable exit of that body returns a value of the
+target. A `return <expr>` contributes its value. A bare `return` and reaching
+the end of the body both contribute `undefined`. A path that exits only by
+throwing contributes no value. The statement structure decides which exits are
+reachable; the last statement alone does not. For example, each of these can
+reach the end of the body: an `if` without an `else`, a loop that may run zero
+times, a `switch` without a `default`, and a `break` that leaves a `switch`.
+A `finally` that cannot complete normally replaces the returns it guards. A
+`return` inside a nested function or class belongs to that callable. A parse
+error or a statement kind the walk does not model leaves the summary unknown.
+
 Rust method searches may exclude ordinary field-access sites before resolving
 their receivers when source structure and provenance prove that those sites
 cannot name the method. Uncertainty about such a field's binding does not make

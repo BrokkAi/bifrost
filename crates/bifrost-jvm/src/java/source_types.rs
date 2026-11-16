@@ -20,8 +20,8 @@ use tree_sitter::Node;
 use super::declarations::spread_parameter_type_node;
 use super::graph::return_type::{is_java_local_type_scope_node, java_type_name_components};
 use super::graph_support::{
-    java_declared_type_parameters, java_type_parameter_bounds, java_type_parameter_in_scope,
-    java_type_parameter_name, java_type_parameter_name_node,
+    java_declared_type_parameters, java_has_anonymous_class_body, java_type_parameter_bounds,
+    java_type_parameter_in_scope, java_type_parameter_name, java_type_parameter_name_node,
 };
 
 #[derive(Default)]
@@ -141,9 +141,9 @@ impl JavaSourceTypeCollector {
                         })
                         .or_else(|| {
                             let mut cursor = current.walk();
-                            current
-                                .named_children(&mut cursor)
-                                .find(|child| child.kind() != "annotation")
+                            current.named_children(&mut cursor).find(|child| {
+                                !matches!(child.kind(), "annotation" | "marker_annotation")
+                            })
                         })
                     else {
                         self.push_unknown_java_type(occurrence);
@@ -353,8 +353,12 @@ enum JavaTypeChildren<'tree> {
 
 pub(super) fn java_named_type_child(node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .find(|child| !matches!(child.kind(), "type_arguments" | "annotation"))
+    node.named_children(&mut cursor).find(|child| {
+        !matches!(
+            child.kind(),
+            "type_arguments" | "annotation" | "marker_annotation"
+        )
+    })
 }
 
 fn java_type_children(node: Node<'_>) -> JavaTypeChildren<'_> {
@@ -409,7 +413,7 @@ fn java_type_children(node: Node<'_>) -> JavaTypeChildren<'_> {
             let mut cursor = node.walk();
             let mut types = node
                 .named_children(&mut cursor)
-                .filter(|child| child.kind() != "annotation");
+                .filter(|child| !matches!(child.kind(), "annotation" | "marker_annotation"));
             match (types.next(), types.next()) {
                 (Some(element), None) => JavaTypeChildren::Annotated { element },
                 _ => JavaTypeChildren::Leaf,
@@ -630,12 +634,6 @@ impl JavaSourceTypeCollector {
             returns,
         });
     }
-}
-
-pub(super) fn java_has_anonymous_class_body(node: Node<'_>) -> bool {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .any(|child| child.kind() == "class_body")
 }
 
 #[cfg(test)]

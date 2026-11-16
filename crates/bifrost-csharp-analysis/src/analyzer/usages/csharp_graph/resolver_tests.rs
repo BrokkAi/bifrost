@@ -246,3 +246,42 @@ fn csharp_inverse_scans_use_overlay_source_in_revision_a_b_a() {
     }
     assert_eq!(std::fs::read_to_string(file.abs_path()).unwrap(), disk);
 }
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#12160: review found an empty C# candidate reported as unavailable source"
+)]
+fn csharp_batch_scans_an_empty_candidate_as_empty() {
+    use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_core::analyzer::code_unit_index::CodeUnitIndex;
+    use brokk_bifrost_core::analyzer::model::ProjectFile;
+
+    let fixture = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Calls.cs",
+            "class C { public void Target() {} public void Run() { Target(); } }",
+        )
+        .file("Empty.cs", "")
+        .build();
+    let analyzer = CSharpAnalyzer::from_project(fixture.project().clone());
+    let target = analyzer
+        .get_definitions("C.Target")
+        .into_iter()
+        .find(CodeUnit::is_function)
+        .expect("target declaration");
+    let roots = HashSet::from_iter([
+        ProjectFile::new(fixture.root(), "Calls.cs"),
+        ProjectFile::new(fixture.root(), "Empty.cs"),
+    ]);
+    let scope = AnalyzerQueryScope::new(&analyzer);
+    let batch = CSharpAuthoritativeUsageBatch::new(&analyzer, scope.token(), &roots)
+        .expect("C# authoritative batch");
+    let result = batch
+        .find_usages(std::slice::from_ref(&target), &roots, 100)
+        .into_fuzzy_result();
+    assert!(
+        matches!(result, FuzzyResult::Success { .. }),
+        "an empty file has nothing to scan, so the answer stays complete: {result:?}"
+    );
+    assert_eq!(csharp_usage_sites(result, &target).len(), 1);
+}

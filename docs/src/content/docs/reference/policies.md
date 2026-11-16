@@ -31,8 +31,19 @@ default runs, built-in selectors, and MCP. The directory must contain one
 subdirectory per pack. Each subdirectory name must equal the pack ID and must
 contain a `manifest.json` and the `policies/*.rqlp` files it lists. Bifrost
 verifies each manifest and each policy's authored hash. An empty value, an
-empty directory, a symlink, a malformed manifest, or a hash mismatch is an
-error, and Bifrost does not fall back to the embedded catalog.
+empty or unreadable directory, or a root that is a symlink is an error, and
+Bifrost does not fall back to the embedded catalog.
+
+Bifrost loads each entry of the directory on its own. An entry that fails is
+rejected, the other packs still load, and the catalog lists the rejection in
+`rejected_packs`. A subdirectory without `manifest.json` is not a pack, so it
+is rejected as `not-a-pack` and no policy is lost. Any other rejection may have
+lost policies: a symlinked or non-UTF-8 entry, a malformed manifest, a missing
+policy source or a missing or changed catalog document, or a pack ID, policy
+ID or catalog that an earlier pack already declares. A policy whose source is
+present but does not match its recorded identity is rejected alone, and the
+rest of its pack loads. A policy report shows each rejection as a
+`builtin-policy-pack-rejected` diagnostic.
 
 ## Policy selection
 
@@ -135,8 +146,17 @@ of the stable ID. It does not name the pack. For example,
 
 ### Catalog JSON fields
 
-`bifrost --list-policies` prints `{"schema_version": 2, "packs": [...]}`. Each
-pack object has these fields:
+`bifrost --list-policies` prints `{"schema_version": 2, "packs": [...]}`.
+`schema_version` is the pack manifest schema version. When an entry of the
+policy pack root was rejected, the object also has `rejected_packs`: one
+object per rejected entry, with `pack` (the entry name), `reason` (one of
+`not-a-pack`, `unsupported-entry`, `invalid-manifest`, `invalid-content` and
+`conflict`) and `message`. The field is absent when every pack loaded. When a
+loaded pack has a policy whose source does not match its recorded identity,
+only that policy is rejected: `rejected_policies` lists it with `pack`, `id`,
+`path`, `category`, `activation`, `reason` (`stale-policy-pin` or
+`invalid-policy-source`) and `message`, and the pack's other policies load.
+Each pack object has these fields:
 
 | Field | Meaning |
 | --- | --- |
@@ -254,7 +274,7 @@ Every row is category `effects`, severity `error`, analysis `assertion`, activat
 
 ## RQLP vocabulary
 
-RQLP has one document schema version, `1`. Nested RQL selectors also have one
+RQLP supports the original document schema version `1` and the current compatible head `2`. Nested RQL selectors also have one
 schema version, `1`. Omitting a version selects `1`. Pinning any other value
 fails with `unsupported-policy-schema-version` or
 `unsupported-rql-schema-version`.
@@ -283,6 +303,11 @@ How to read the field tables:
 ### Documents and imports
 
 #### `policy`
+
+An omitted policy schema uses the lowest compatible version that admits the
+document's constructs, at or above the last version that changed existing
+semantics. Additive vocabulary leaves unchanged policies and their canonical
+hashes at their earlier schema. Explicit `:schema-version` pins remain exact.
 
 ```lisp
 (policy [:schema-version N] :id ID :name NAME :message MESSAGE :severity SEVERITY :analysis ANALYSIS ...)
@@ -788,9 +813,52 @@ Declare one policy-local taint source. Legal in: policy, `taint`.
 | `:categories` | required | opaque exact endpoint categories; set (no duplicates) of 1 to 64 items | `:categories [CATEGORY...]`. Attach exact source categories. |
 | `:selector` | required | an inline rql or deferred rql-file selector | `:selector SELECTOR`. Select the source sites. |
 | `:bind` | required | matched-value, receiver, return-value, an indexed result record, or an argument record | `:bind PORT`. Bind the source value at each selected site. |
+
 | `:labels` | required | normalized taint labels; set (no duplicates) of 1 to 64 items | `:labels [LABEL...]`. Declare the non-empty labels introduced by the source. |
 | `:threat-model` | optional | `remote`, `commandargs`, `environment`, `stdin`, `file`, or `database` | `:threat-model KIND`. Classify the source for analysis-level threat-model selection; omission keeps it active for every selection. |
 | `:evidence` | optional | an evidence or source-evidence record | `:evidence (evidence ...)`. Attach coherent source trust/entry evidence. |
+
+Projected return ports are supported on source records. A sink, sanitizer,
+transform, store, or policy-local external model with such a port is refused
+individually with a diagnostic naming its identity and port. Supported sibling
+records continue to apply.
+
+A Rust return-value source can select a typed component instead of the entire result:
+
+```scheme
+:bind (return-value :path [
+  (variant :declaration "member.result.ok")
+  (tuple :index 0)])
+```
+
+The variant declaration is the model's authoritative member ID, not the name
+`Ok`. The shared path vocabulary also accepts `(named :name "field")` and
+further `(tuple :index N)` steps. The selected model declaration must prove the
+return type and every step. Missing type evidence produces typed incompleteness;
+it never becomes a whole-result source. The source event retains the original
+call's identity. An omitted path, written `return-value`, seeds the whole value.
+A component source leaves sibling and error payloads clean. Whole-value sources
+continue to reach component reads under the existing aggregate field-read rule.
+Use explicit component reads for projected sources. Child-to-whole aggregate
+consumption remains an open semantic question. `(element)` selects summarized
+indexed contents, using a declared array/slice element or authoritative Iterator
+or IntoIterator Item type. It keeps unknown indices possible and does not taint
+length or other non-element observations. Awaited future outputs remain separate
+semantics and cannot be expressed by this path.
+
+A complete set of input-to-return transfers does not establish what values an
+external call creates internally. A projected source can produce a definite
+finding while the run remains inconclusive because other returned content is
+undescribed. The report retains the typed returned-member diagnostic.
+
+A projected path requires policy schema 2 or newer; exact schema 1 pins reject it.
+Without a pin, a document using a projected return infers schema 2; documents
+using only older constructs retain schema 1 and their canonical policy identities.
+Adopting the new syntax or explicitly pinning schema 2 changes the policy hash,
+including its baseline, suppression, and SARIF provenance identity.
+The catalog wire likewise requires catalog schema 2. An older engine rejects the
+new schema or return-value record visibly. Reports retain the optional path in
+the endpoint binding so readers can distinguish a component from the whole value.
 
 #### `sink`
 
@@ -2450,8 +2518,9 @@ marked finding fits the report's retention budget, the run's completion remains
 unchanged and a complete finding remains complete. The marker never gives way
 to the contributor list: if the list does not fit, it is shortened first, down
 to a count of omitted contributors. If the marker still does not fit at that
-size, the run keeps the longest prefix of marked findings, in finding-ID order,
-that fits. It counts the others in `omitted_findings_lower_bound` and becomes
+size, the run keeps the longest prefix of marked findings in canonical report
+order (workspace-relative path, then source line and column) that fits. It
+counts the others in `omitted_findings_lower_bound` and becomes
 `inconclusive` with `report_retention_budget`. The marker means the finding
 **may** depend on that pack, not that a selected record was proven causal.
 Distributed approximate shards are refused at activation.
@@ -2484,9 +2553,29 @@ makes the exit status 2 unless the policy's `on-unknown` verdict is
 ## Canonical JSON report
 
 `--format json` prints the canonical policy report. MCP `run_policy` returns
-the same document. Its `schema_version` is `7`. The human and SARIF renderers
+the same document. Its `schema_version` is `19`. The human and SARIF renderers
 read the same document, so the three formats agree on finding IDs, hashes,
 locations, severity, certainty, completion, evidence, and classifications.
+
+Version `7` added request-local selected and undecided typestate subjects.
+Version `8` added the optional finding `evaluation_location`. It changes neither
+finding IDs nor SARIF partial fingerprints, suppression records, or baseline IDs.
+Version `9` adds subject identity keys, explicit root or evaluation scope for
+typestate-partial diagnostics, and tagged `sites` or `unbounded` finding-location
+bounds. These bounds describe possible finding primary locations, not discovery
+or solver completeness.
+Version `13` adds the report diagnostic codes `builtin-policy-pack-rejected`,
+`builtin-policy-rejected`, `identifier-typos-incomplete` and
+`pack-catalogs-incomplete`.
+Version `15` adds the typed `internal_error` diagnostic for a policy whose
+store read failed; it carries `cause: "store_read"`, `policy_id`, and `error`.
+
+Call-reachability completion covers certified source roots, their traversed call
+sites, and the sink dependencies those sites demand. A complete traversal can
+exclude sink diagnostics solely at certified-unreached sites. An incomplete
+traversal retains every encountered boundary cause and makes no coverage or
+unreachability claim for unexplored sites; it does not search them for additional
+sink diagnostics. See the [observation boundary](/design/evidence-and-results/#call-reachability-observation-boundary).
 
 ### Top-level object
 
@@ -2495,7 +2584,7 @@ they do not apply.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `schema_version` | integer | Always `7`. |
+| `schema_version` | integer | Always `19`. |
 | `evaluation` | object | The evaluation date and the review file sources. See below. |
 | `execution` | object | Timing and progress metadata. See below. |
 | `rules` | array | One rule descriptor per loaded policy. |
@@ -2567,11 +2656,15 @@ Each `rules[]` entry describes one loaded policy.
 | `subjects` | When present, bounded typestate subject verdicts. Selector enumeration is `certified` or `uncertified`; selected sites carry finding references, and undecided sites carry reasons; omission counts make truncation explicit. |
 | `diagnostics` | Run diagnostics. Each has `code` (tagged by `type`), `severity`, `impact`, `family`, `message`, `family_count`, `primary`, and `related`. |
 | `diagnostics_truncated` | True when run diagnostics were folded or dropped. |
+| `worst_omitted_diagnostic_severity` | Always present: null when no diagnostic was omitted, otherwise the maximum omitted severity (`note`, `warning`, `error`). Missing older metadata is unknown, never proof that no Error was lost. |
+| `diagnostic_causes` | Always-present deduplicated `{code, impact, execution_cause}` entries captured before diagnostic detail retention. Empty proves no causes; missing in older reports is unknown. |
 | `obligations` | Unmet negative-proof obligations of an assertion policy. Each names the `assertion`, the `kind` (`absence_requires_exhaustive_coverage` or `verdict_requires_witnessed_rows`), the `group`, and the `group_key`. |
 | `obligations_truncated`, `omitted_obligations_lower_bound` | Obligation truncation. |
 | `work` | Work counters: `scanned_files`, `scanned_source_bytes`, `fact_nodes`, `pipeline_rows`, `examined_references`, `retained_findings`, `omitted_findings_lower_bound`, `retained_report_bytes`, and `metrics`. `--policy-timings` adds elapsed time to `metrics`. |
 | `authored_arm_closures` | When present, evidence that an authored model closed a dispatch arm. |
 | `unknown_verdict` | When present, the policy's declared `on-unknown` verdict, applied to an inconclusive run. |
+
+Query diagnostics persist their exact producer-owned `incompleteness` alongside the diagnostic. A missing value rejects the cached product and triggers recomputation; replay never substitutes a provider cause. Row, operand-probe, assertion and intersect products use this single encoding. Publication excludes diagnostics with an operational execution cause. The unique #11321 policy-substrate token covers this product-format change and downstream evaluation identity; no SQL migration or taint output-format change is involved.
 
 Run diagnostic `impact` values: `advisory`, `declared_non_exhaustive`,
 `finding_partial`, `run_incomplete`, `run_unsupported`, `run_failed`.
@@ -2581,7 +2674,9 @@ Run diagnostic `code.type` values: `code_query` (with a nested CodeQuery
 `unknown_verdict_fail_closed`, `batch_finding_limit`,
 `report_retention_budget`, `cvss_variant_budget`,
 `projection_scenario_membership_budget`,
-`organizational_risk_overlay_budget`.
+`organizational_risk_overlay_budget`, `duplicate_finding_id` (an advisory:
+two findings of the run share an ID, and both are kept), and
+`internal_error` (with `cause`, `policy_id`, and `error`).
 
 ### Finding object
 
@@ -2596,8 +2691,9 @@ Run diagnostic `code.type` values: `code_query` (with a nested CodeQuery
 | `certainty` | `{type: "definite"}` or `{type: "possible", reasons}`. |
 | `completeness` | `{type: "complete"}` or `{type: "partial", reasons}`. |
 | `primary` | `{path, byte_span: {start, end}, region: {start_line, start_column, end_line, end_column}}`. `path` is workspace-relative with forward slashes. |
-| `related` | Related locations, each with a `relationship` such as `source`, `sink`, `origin`, `evidence`, `witness_step`, or `declaration`. |
-| `related_truncated`, `omitted_related_locations_lower_bound` | Related-location truncation. |
+| `evaluation_location` | Optional evaluation-point location with the same shape as `primary`, emitted only when it differs. Inline suppression covers either start line. This field is independent of the related-location budget and never affects finding IDs. An absent field means the evaluation location equals `primary`, including in older reports. |
+| `related` | Related locations, each with a `relationship` such as `source`, `sink`, `origin`, `evidence`, `witness_step`, or `declaration`. Source attribution is retained even when source and primary share coordinates. For a call with several tainted selected operands, each existing source pair uses its lowest-position tainted operand as primary and retains the others as related locations. |
+| `related_truncated`, `omitted_related_locations_lower_bound`, `omitted_related_locations_exactness` | Related-location truncation. Exactness is `exact` or `lower_bound`; upstream source limits and local report limits combine without claiming an exact total for a lower bound. |
 | `evidence` | Typed evidence, tagged by `type`: `match`, `taint`, `typestate`, `assertion`, or `flow`. |
 | `model_attribution` | Optional approximation marker, bounded ordered `contributors`, `contributors_complete`, and sound lower bound `omitted_at_least`. Each contributor names its role, pack digest, record ID, built-from X, resolved Y, direction, mismatch kinds, and selection-rule ID/version. Causal roles identify selected source, sink, summary, declaration, or store-end records; store read/write receipts conservatively union across taint classes until #10212. `read_dependency` means a Match, Assertion, Typestate, or composed Taint/Flow finding may depend on an active close-match pack during the temporary family gate. Absent for exact-only findings. |
 | `evidence_refs_truncated`, `omitted_evidence_refs_lower_bound` | Evidence-reference truncation. |
@@ -2641,7 +2737,7 @@ Suppression review, one per entry of `suppressions[]`:
 | `policy_hash_state` | `matching`, `drifted`, `unknown` | Comparison of `policy_hash_at_acceptance` with the current hash. `unknown` when either is missing. |
 | `orphan_state` | `resolved`, `orphaned`, `path_not_analyzed`, `path_unrecorded` | Whether the record still resolves to a finding. `orphaned` gives exit status 1. |
 | `applied` | Boolean | True when the record claimed a finding. |
-| `result_omitted` | Boolean | True when the review result did not fit the report retention budget. |
+| `result_omitted` | Boolean | As of report schema 20, true when at least one finding in this `(policy_id, finding_id)` group did not fit the report retention budget. A retained suppressed sibling may share this review only when the same policy records a finding omission. Singleton groups keep the earlier meaning. |
 | `rekey_candidates` | list of finding IDs | Only on an orphaned record: up to 8 unclaimed finding IDs of the same policy in the record's file. |
 
 Scope review, one per entry of `scope[]`: the entry's `path`, `reason`,
@@ -2784,9 +2880,9 @@ scope decision is in the run's `bifrost.scopeReviews`.
 | --- | --- |
 | `bifrost.execution` | The `execution` object. |
 | `bifrost.incremental` | The `incremental` review; omitted when absent. |
-| `bifrost.policyReportSchemaVersion` | `6`. |
+| `bifrost.policyReportSchemaVersion` | `18`. |
 | `bifrost.policyEvaluation` | The `evaluation` object. |
-| `bifrost.policyRuns` | Per policy: `policy_id`, `policy_hash`, `analysis_type`, `completion`, `diagnostics`, `diagnostics_truncated`, and `work`. |
+| `bifrost.policyRuns` | Per policy: `policy_id`, `policy_hash`, `analysis_type`, `completion`, `diagnostics`, `diagnostics_truncated`, `diagnostic_causes`, `worst_omitted_diagnostic_severity`, `budget_refusals`, and `work`. |
 | `bifrost.suppressionReviews` | The suppression reviews. |
 | `bifrost.scopeReviews` | The scope reviews. |
 | `bifrost.diffBaseline` | The diff review; omitted when absent. |
@@ -2854,6 +2950,10 @@ also a `warning`.
 | `baseline-audit-retention-exceeded` | Baselined finding results did not fit the report retention budget. | Narrow the selection. |
 | `packs-load-failed` | `.bifrost/packs.json` could not be read or parsed. | Fix the packs document. |
 | `pack-activation-failed` | Semantic-model pack activation failed. | Read the named pack and reason in the message. |
+| `identifier-typos-incomplete` | A policy that reads the identifier typo table (the `js/misspelled-identifier` language rule) ran while the table the rules packs supply may be incomplete: the built-in catalog failed to load, or it rejected a pack that may have supplied typos. Other policies are unaffected. | Fix the catalog or the rejected pack named in the message. |
+| `builtin-policy-rejected` | The built-in policy catalog rejected one policy of a loaded pack, for example because its pinned identity is stale for this engine; the pack's other policies loaded. An `error` when the run's selection names no policy ID and its packs and categories would have included the policy, which is not opt-in, or when the selection names its ID, which another pack also provides; otherwise a `warning`. | Re-pin the pack against this engine, or read the policy and reason in the message. |
+| `pack-catalogs-incomplete` | A policy that reads every registered catalog (`(catalog :any-registered true ...)`) ran while the built-in catalog failed to load or rejected a pack that may have supplied catalogs. Other policies are unaffected. | Fix the catalog or the rejected pack named in the message. |
+| `builtin-policy-pack-rejected` | The built-in policy catalog rejected an entry of the policy pack root, and the other packs loaded. An `error` when the rejected entry may have held policies and the run's selection spans the catalog: it names no policy ID, and it names no pack or every loaded pack (a default run, a category selection, or a pack list taken from `--list-policies`). It is also an `error` when the selection names the rejected entry's pack ID, which another root may also provide, or a policy ID that the rejected pack declared, which makes that ID ambiguous. Otherwise a selection of some packs, or one that names policy IDs, could not have included it, so there it is a `warning`. A directory without `manifest.json` is always a `warning`. | Read the entry and reason in the message, or in `rejected_packs` from `--list-policies`, and fix or remove the entry. |
 | `workspace-model-load-failed` | A reviewed model under `.bifrost/semantic-models/` could not be discovered, compiled, registered, or activated. | Fix the model file named in `source`. |
 | `workspace-model-inert` | Warning. A reviewed workspace model registered but stayed inactive behind its review gate, so it contributed nothing. | Add an `enable` entry for the model's pack to `.bifrost/packs.json` if you intend to use it. |
 | `policy-load-failed` | A policy file could not be read. | Check the path and permissions. |
@@ -2952,8 +3052,13 @@ fields are listed in [Review objects](#review-objects).
 | `-- reason` | for a blanket directive | one line of text | 4,096 bytes |
 
 A directive alone on its line covers the next line with code. A directive
-after code covers its own line. A finding matches when its primary location
-starts on the covered line. The finding's `inline_suppression` object has
+after code covers its own line. A finding matches when either its rendered
+`primary` or its `evaluation_location` starts on the covered line in the same
+file. For an argument-bound taint sink, `primary` identifies the selected operand;
+`evaluation_location` identifies the enclosing evaluation point. The optional
+`evaluation_location` is serialized only when it differs from `primary`, is
+independent of related-location limits, and never contributes to finding identity.
+An absent field means the evaluation location equals `primary`, so older reports keep primary-only suppression coverage. The finding's `inline_suppression` object has
 `line`, `policies` and an optional `reason`. The report's
 `inline_suppressions` object has `prefix`, `entries` (each with `path`,
 `line`, `covered_line`, `policies`, `reason`, `state`, `detail` and
@@ -3041,3 +3146,126 @@ A file is at most 16 MiB. The `--baseline-file` path is at most 1,024 bytes.
   `--baseline-file` names another path.
 - It exits 0 after writing. An unreliable run writes nothing and exits 2.
 - It cannot be combined with `--fail-on` or `--diff-base`.
+
+### Diagnostic cause inventory
+
+Schema 18 adds an always-present `runs[].diagnostic_causes` array. Each entry
+has `code`, `impact` and `execution_cause`, using existing diagnostic labels and the six policy
+impact labels. Query diagnostics use their inner code, such as
+`execution_budget_exhausted`, rather than `code_query/` family labels. The
+execution cause is copied from the product admission metadata used for reuse
+and timing output. It is null for a known content cause, or `budget`,
+`cancelled`, `snapshot` or `provider` for the existing operational causes.
+Known unclassified execution dependence uses the existing `other` value.
+`internal_error` is the130th code, always `run_failed` and never null; it uses
+a canonical producer cause when available, otherwise `other` as documented
+by core `ExecutionCause::Other` (provider/store failures and other execution
+dependence). When the product metadata is unavailable, it is `unknown`, never null. The
+array is deduplicated by `(code, execution_cause)`; distinct null and contextual
+causes remain separate, while a pair retains its strongest impact. It is
+captured before diagnostic detail retention;
+site paths, scope payloads and messages are not part of a cause.
+
+Retention causes distinguish display detail from missing answers.
+`detail_retention` certifies that no finding was omitted and that every
+retained finding keeps its identity; only optional evidence, witnesses or
+other report detail was truncated. `finding_retention` means at least one
+finding was omitted by an output budget.
+`work.retention_omitted_findings_lower_bound` records those drops;
+`work.semantic_omitted_findings_lower_bound` records separate projection or
+admission losses, whose original causes remain unchanged. Their sum is the
+existing `work.omitted_findings_lower_bound` total. A nonzero total prevents
+certification as detail-only. The engine sheds optional detail before dropping a finding as a last
+resort. Finding loss remains an execution budget refusal. These counters count
+refused records even when another retained record has the same finding ID.
+A failed append preserves all previously retained records and optional detail.
+Subject links to surviving records remain attached; any loss within their ID
+group makes the claim that further findings are absent partial.
+
+An empty array proves that the run produced no diagnostic causes. A missing
+field in an older report is unknown and must never be interpreted as empty.
+Count, family and byte retention can remove diagnostic prose while this set
+continues to name its causes. Existing completion, finding-omission and
+budget-refusal checks still apply. This is request-local report metadata,
+recomputed from diagnostic inputs when retained analysis units are reused;
+no new cross-request cache is introduced.
+
+The always-present per-run `worst_omitted_diagnostic_severity` records the
+maximum severity at diagnostic omission sites, before count, family, byte,
+validation or attribution loss. Its value is null, `note`, `warning` or
+`error`. Prefix searches and failure/byte fallbacks preserve the metadata.
+Missing older metadata is unknown. The report-level field of the same name
+covers report diagnostics only and cannot establish what a policy run lost.
+The cause inventory carries code and impact, not severity; it cannot replace
+this omission proof. No resource grant or diagnostic label changes.
+
+### Policy budget telemetry
+
+Schema 18 adds `evaluation.budget` to evaluated batches. `effective_grant` is
+an object mapping each named per-policy, query, semantic, registry and batch
+limit to the integer actually used after workspace scaling. `census` names the
+source `bytes` and `files` used to scale those limits; null means no analyzer
+snapshot was available. `policy_deadlines_ms` records configured per-policy
+time limits. `batch_remaining_ms` samples the inherited hard request time
+allowance when the grant is established; null means no hard deadline. This
+sample is telemetry and is not part of finding identity. `batch_refusals` is
+an array naming batch-wide deadline or report-byte refusals, including a
+request stopped before any policy could run. Empty arrays mean no refusal.
+Early deadline reports record zero remaining time and omit registry grants
+before the policy registry was constructed. Once constructed, its actual
+grants remain in preparation and diff-base deadline reports.
+
+Each run's `budget_refusals` lists the refused lanes, separately from semantic
+incompleteness. Query limits use `query/fact_nodes`, `query/scanned_files`,
+`query/scanned_source_bytes`, `query/pipeline_rows`, and
+`query/retained_evidence_bytes`. The fact lane includes examined references;
+the pipeline lane includes provenance and import-edge work. Diagnostic
+retention uses `policy/diagnostics`; related-location retention uses
+`policy/related_locations_per_finding` for findings and
+`policy/related_locations_per_diagnostic` for diagnostic evidence. Both use
+the existing `policy.max_related_locations_per_finding` grant; there is no
+separate diagnostic-location setting. Retained report bytes use
+`policy/retained_report_bytes` or `batch/retained_report_bytes`. Findings use
+`policy/findings`; batch retention is bounded by bytes. Selector output caps use
+`policy/selector_results`; assertion query output uses `query/pipeline_rows`.
+Deadline refusals use
+`time/policy_deadline_ms` or `time/batch_deadline_ms`. Existing semantic and
+solver exhausted-root lane names pass through unchanged.
+Each run's `work.retention_omitted_findings_by_dimension` attributes dropped
+findings to the first refusing limit. Its sorted counts sum to
+`retention_omitted_findings_lower_bound`. `policy/evaluator_retention` identifies
+an earlier evaluator cut. Batch admission reserves metadata, allocates stripped
+finding presence by acceptance tier with max-min byte shares across policies,
+then allocates optional detail. Each policy retains an ordered prefix; unused
+whole-finding slack is offered in policy identity order.
+
+The lane list is positive refusal evidence. When diagnostic details were
+omitted, it does not certify the absence of other execution or semantic causes;
+partial discovery with unknown causes remains inconclusive.
+
+Query diagnostics also carry `exhausted_roots`, preserving the refused lane
+and, when recorded at admission, its attempted charge and tested limit. The
+charge is absent when the next unit could not start because its allowance
+was already spent. A branch's tested fair-share limit can be below the batch's
+effective limit. These are bounded representative admission witnesses, not
+an inventory of exhausted sites. Family folding retains at most one witness
+per lane within fixed count and byte bounds, while the run-level
+`budget_refusals` preserves the full set of refused dimensions independently
+of witness retention. Raising a resource limit would not discharge
+unresolved types, recovered syntax or other semantic gaps.
+
+Persisted policy evaluation evidence stores the same budget and refusals in
+SQL-readable JSON beside its named effective cap map and certified census.
+Replay continues to compare caps, not elapsed time or refusal counts. Time
+terminations are not persisted as reusable completed evaluations. Output
+serialization still fails with a named byte limit if the bounded writer cannot
+emit the document; a partially written document is not a complete report.
+
+For structural execution refusals, each exhausted root records `stage` and
+`budget: {consumed, limit}` sampled at the refusing admission. These values use
+that admission's scope, including a branch or call-relation allowance, rather
+than the final cumulative work counters. A refused projected charge also has
+`charge: {attempted, limit}`; a stop with no new charge omits `charge`.
+Matcher capture retention uses `query/capture_bytes_per_row`, separately from
+`query/fact_nodes`. Older producers may omit the usage snapshot; absence does
+not mean zero consumption.

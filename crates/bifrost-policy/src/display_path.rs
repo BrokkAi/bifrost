@@ -12,6 +12,7 @@ use serde::{Serialize, Serializer};
 
 use crate::finding::PolicySourceLocation;
 use crate::finding_identity::WitnessId;
+use crate::retained::{RetainedSize, retained_extra, retained_size_with_extras};
 
 const MAX_DISPLAY_PATH_ROWS: usize = 12;
 const MAX_DISPLAY_LABEL_BYTES: usize = 160;
@@ -145,6 +146,28 @@ impl PartialEq for TaintDisplayPathCache {
     fn eq(&self, _other: &Self) -> bool {
         // Presentation data does not participate in canonical finding equality.
         true
+    }
+}
+
+impl RetainedSize for TaintDisplayStep {
+    fn retained_size(&self) -> usize {
+        retained_size_with_extras(
+            self,
+            [retained_extra(&self.location), self.label.capacity()],
+        )
+    }
+}
+
+impl RetainedSize for TaintDisplayPath {
+    fn retained_size(&self) -> usize {
+        retained_size_with_extras(
+            self,
+            [
+                retained_extra(&self.representative_witness_id),
+                retained_extra(&self.witness_ids),
+                retained_extra(&self.steps),
+            ],
+        )
     }
 }
 

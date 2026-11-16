@@ -20,6 +20,9 @@ const MAX_IMPORT_SITE_SOURCE_BYTES: usize = 1024 * 1024;
 pub(super) struct PythonImportSiteCache {
     files: CaptureScopedMemo<HashMap<ProjectFile, PythonImportFileFacts>>,
     export_surfaces: CaptureScopedMemo<HashMap<ProjectFile, ExportSurfaceFacts>>,
+    /// The execution dependences marked through this step's cache; the step
+    /// joins it into the query's reuse verdict.
+    pub(super) reuse: ReuseVerdict,
 }
 
 enum PythonImportFileFacts {
@@ -68,6 +71,7 @@ impl PythonImportSiteCache {
         let Self {
             files,
             export_surfaces,
+            reuse,
         } = self;
         let attribution = memo_attribution(analyzer);
         files.read_mut(&attribution, |files| {
@@ -98,6 +102,7 @@ impl PythonImportSiteCache {
                         .or_else(|| Some(incomplete_site(start_byte, "unavailable"))),
                     PythonImportFileFacts::Unavailable => {
                         analyzer.mark_execution_dependent();
+                        reuse.join_in(EXECUTION_DEPENDENT);
                         Some(incomplete_site(start_byte, "unavailable"))
                     }
                 }
@@ -117,6 +122,7 @@ impl PythonImportSiteCache {
         let Self {
             files,
             export_surfaces,
+            reuse,
         } = self;
         let attribution = memo_attribution(analyzer);
         files.read_mut(&attribution, |files| {
@@ -142,6 +148,7 @@ impl PythonImportSiteCache {
                     ),
                     PythonImportFileFacts::Unavailable => {
                         analyzer.mark_execution_dependent();
+                        reuse.join_in(EXECUTION_DEPENDENT);
                         None
                     }
                 }
@@ -384,7 +391,7 @@ fn import_contexts(
     Some(contexts)
 }
 
-fn python_if_is_name_eq_main(node: tree_sitter::Node<'_>, source: &str) -> bool {
+pub(super) fn python_if_is_name_eq_main(node: tree_sitter::Node<'_>, source: &str) -> bool {
     if node.kind() != "if_statement" {
         return false;
     }

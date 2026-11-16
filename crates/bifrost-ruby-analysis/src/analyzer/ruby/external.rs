@@ -640,6 +640,7 @@ fn member_callable_shape_key(
                 generic_arity: signature.type_parameters.len(),
                 parameter_types: &parameter_types,
                 parameter_variadics: &[],
+                extension_receiver: None,
                 return_type: None,
             },
         );
@@ -843,6 +844,7 @@ mod tests {
             extension_receiver: None,
             extension_receiver_constraints: Vec::new(),
             aliases: Vec::new(),
+            rust_stability: None,
             guard: None,
             locator: brokk_bifrost_analysis::analyzer::semantic_model::Locator::Source {
                 path: "sig/widget.rbs".to_owned(),

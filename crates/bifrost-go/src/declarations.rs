@@ -1321,6 +1321,7 @@ enum GoDeclarationContext {
         kind: GoMemberContainerKind,
     },
     Inactive,
+    ParseRecovery,
 }
 
 struct GoPrimaryParseState<'source, 'file, 'parsed, 'structural>
@@ -1422,7 +1423,7 @@ where
         }
     }
 
-    fn admit_structural(&mut self, node: Node<'_>, parent: Option<u32>) -> Option<u32> {
+    fn admit_structural(&mut self, node: Node<'structural>, parent: Option<u32>) -> Option<u32> {
         let mut structural_parent = parent;
         if !node.is_named() {
             return structural_parent;
@@ -1463,6 +1464,15 @@ where
         node: Node<'_>,
         context: GoDeclarationContext,
     ) -> GoDeclarationContext {
+        // Recovery invalidates declaration-owner ancestry, while ordinary
+        // unsupported semantics may still have sound structural declarations.
+        // The native collector owns the MalformedSyntax/enumeration gap.
+        if matches!(&context, GoDeclarationContext::ParseRecovery)
+            || node.is_error()
+            || node.is_missing()
+        {
+            return GoDeclarationContext::ParseRecovery;
+        }
         match &context {
             GoDeclarationContext::TypeOwnerPending {
                 unit,
@@ -2300,6 +2310,63 @@ mod coordinated_producer_tests {
     use brokk_bifrost_core::analyzer::structural::kinds::{NormalizedKind, Role};
     use brokk_bifrost_test_macros::hardwon;
     use std::collections::BTreeSet;
+
+    #[test]
+    #[hardwon("#12125: a recovered type declaration panicked without a named owner")]
+    fn recovered_declarations_keep_the_syntax_gap_and_healthy_siblings() {
+        use brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind;
+
+        // Parser-recovery witnesses, not Go programs. Keep the original
+        // 23-byte crash and a declaration outside the damaged region.
+        for (source, expected) in [
+            ("package p\n{\ntype T int\n", vec![]),
+            (
+                "package p\ntype Good struct { Field int }\n{\ntype T int\n",
+                vec!["Good", "Good.Field"],
+            ),
+        ] {
+            let tree = crate::parse::parse_go(source).expect("product Go parser");
+            assert!(tree.root_node().has_error());
+            let mut cursor = tree.walk();
+            let recovery = tree
+                .root_node()
+                .named_children(&mut cursor)
+                .find(|node| node.is_error())
+                .expect("the witness retains its recovery region");
+            let file = ProjectFile::new(
+                std::env::current_dir().unwrap().join("go-recovery-tests"),
+                "recovery.go",
+            );
+            let parsed = parse_go_file(&file, source, &tree);
+            assert_eq!(
+                declaration_names(&parsed),
+                expected.into_iter().map(str::to_owned).collect(),
+                "recovered syntax must not invent an owner: {source:?}"
+            );
+            let gap = parsed
+                .resolution_facts
+                .gaps
+                .iter()
+                .find(|gap| {
+                    gap.kind == ResolutionGapKind::MalformedSyntax
+                        && parsed.resolution_facts.sites.iter().any(|site| {
+                            site.id == gap.site
+                                && site.start_byte == recovery.start_byte()
+                                && site.end_byte == recovery.end_byte()
+                        })
+                })
+                .expect("the existing typed gap covers the recovery region");
+            assert!(
+                parsed
+                    .resolution_facts
+                    .reference_enumeration_gaps
+                    .iter()
+                    .any(|enumeration| enumeration.site == gap.site
+                        && enumeration.kind == ResolutionGapKind::MalformedSyntax),
+                "recovered syntax cannot certify an exhaustive reference set"
+            );
+        }
+    }
 
     #[test]
     #[hardwon("#5074: anonymous table rows had no field membership or native source bridge")]

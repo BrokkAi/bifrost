@@ -76,6 +76,9 @@ macro_rules! impl_policy_source_error {
 
 pub(crate) use impl_policy_source_error;
 
+mod acceptance;
+pub use acceptance::AcceptanceHint;
+
 mod assertion_policy;
 mod baseline;
 mod budget;
@@ -236,7 +239,10 @@ pub use taint_policy::with_icfg_taint_engine_for_test;
 pub use taint_policy::{OutputAnchorOrder, OutputOrderProbe, OutputRefusalProbe, OutputRetryProbe};
 
 #[cfg(any(test, feature = "test-support"))]
-pub use typestate_policy::{TypestateEngineOverride, with_typestate_engine_for_test};
+pub use typestate_policy::{
+    TypestateEngineOverride, with_typestate_attribution_allowance_for_test,
+    with_typestate_engine_for_test, with_unowned_typestate_finish_gap_for_test,
+};
 
 #[cfg(any(test, feature = "test-support"))]
 pub use taint_barriers::count_value_type_barrier_calls_for_test;

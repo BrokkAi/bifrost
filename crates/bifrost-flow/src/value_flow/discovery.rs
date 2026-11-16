@@ -16,13 +16,18 @@
 //! processed. A caller must never read incomplete coverage as a call whose
 //! result carries no values.
 
+pub use super::selected_entry::{
+    SelectedSourceEntryIdentity, SelectedSourceEntryView, SelectedSourceEntryViews,
+    SourceRootPartition, partition_source_roots,
+};
+
 use std::sync::Arc;
 
 use crate::analyzer::WorkspaceAnalyzer;
 use crate::analyzer::semantic::{
     CallBindings, CallSiteId, CancellationToken, CandidateCoverage, DispatchBoundary,
-    DispatchBoundaryKind, DispatchResult, OracleCallContext, ProcedureHandle, ProcedureId,
-    SemanticArtifactKey, SemanticBudget, SemanticProviderError, SemanticRequest, ValueFlowSnapshot,
+    DispatchBoundaryKind, DispatchResult, OracleCallContext, ProcedureHandle, SemanticBudget,
+    SemanticProviderError, SemanticRequest, ValueFlowSnapshot,
 };
 use crate::dataflow::SemanticInputStatus;
 use crate::hash::{HashMap, HashSet};
@@ -31,7 +36,7 @@ use super::{ValueFlowCache, ValueFlowInput, ValueFlowProvider, WorkspaceValueFlo
 
 /// How the closure walk names one procedure across two materializations of
 /// its artifact. `ProcedureHandle::durable_key` returns exactly this pair.
-pub type DurableProcedureKey = (SemanticArtifactKey, ProcedureId);
+pub use crate::analyzer::semantic::DurableProcedureKey;
 
 /// One call site named across materializations: its procedure's durable key
 /// and the procedure-local call site id.
@@ -261,7 +266,16 @@ pub fn discover_contextual_closure<P: ValueFlowProvider>(
             result.status = result.status.merge(SemanticInputStatus::Unknown);
             break;
         }
-        let procedure = provider.canonical_procedure(&procedure);
+        let selected = provider.selected_executable_procedure(
+            &provider.canonical_procedure(&procedure),
+            &mut SemanticRequest::new(semantic_budget, cancellation),
+        )?;
+        result.status = result
+            .status
+            .merge(SemanticInputStatus::from_outcome(&selected));
+        let Some(procedure) = selected.available_value().cloned() else {
+            break;
+        };
         let key = procedure.durable_key();
         if !acquired.contains(&key) {
             if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
@@ -321,7 +335,30 @@ pub fn discover_contextual_closure<P: ValueFlowProvider>(
                     result.status = result.status.merge(SemanticInputStatus::Unknown);
                 }
                 for candidate in dispatch.candidates() {
-                    let target = candidate.target();
+                    let selected = provider.selected_executable_procedure(
+                        candidate.target(),
+                        &mut SemanticRequest::new(semantic_budget, cancellation),
+                    )?;
+                    result.status = result
+                        .status
+                        .merge(SemanticInputStatus::from_outcome(&selected));
+                    let Some(target) = selected.available_value().cloned() else {
+                        continue;
+                    };
+                    let candidate =
+                        match crate::analyzer::semantic::service::reseal_selected_candidate(
+                            candidate,
+                            &call,
+                            &target,
+                            limits.oracle,
+                        ) {
+                            Ok(candidate) => candidate,
+                            Err(_) => {
+                                result.status = result.status.merge(SemanticInputStatus::Unknown);
+                                continue;
+                            }
+                        };
+                    let candidate = &candidate;
                     if target.artifact().key().mount() != root.artifact().key().mount() {
                         result.status = result.status.merge(SemanticInputStatus::Unknown);
                         continue;
@@ -558,7 +595,20 @@ pub fn discover_closure_with_cuts<P: ValueFlowProvider, C: ClosureCutDecider>(
         // instance, so every handle the walk mints beneath it (call sites,
         // snapshots) belongs to one instance (#2289). The default provider
         // keeps the handle as minted.
-        let procedure = provider.canonical_procedure(&procedure);
+        let selected = provider.selected_executable_procedure(
+            &provider.canonical_procedure(&procedure),
+            &mut SemanticRequest::new(semantic_budget, cancellation),
+        )?;
+        let Some(selected_procedure) = selected.available_value().cloned() else {
+            closure.skipped.push((
+                procedure,
+                SkipReason::RelationsUnavailable {
+                    status: SemanticInputStatus::from_outcome(&selected),
+                },
+            ));
+            continue;
+        };
+        let procedure = selected_procedure;
         let procedure_key = procedure.durable_key();
         if seen.contains(&procedure_key) {
             continue;
@@ -628,10 +678,24 @@ pub fn discover_closure_with_cuts<P: ValueFlowProvider, C: ClosureCutDecider>(
         let mut call_descendants = Vec::new();
         let artifact = Arc::clone(procedure.artifact());
         for &id in artifact.lexical_children(procedure.id()) {
+            // Structural child enumeration stays base; execution selects immediately below.
             let child = artifact
                 .procedure_handle(id)
                 .expect("a live artifact owns each retained procedure");
-            lexical_descendants.push(child);
+            let selected = provider.selected_executable_procedure(
+                &child,
+                &mut SemanticRequest::new(semantic_budget, cancellation),
+            )?;
+            if let Some(child) = selected.available_value().cloned() {
+                lexical_descendants.push(child);
+            } else {
+                closure.skipped.push((
+                    child,
+                    SkipReason::RelationsUnavailable {
+                        status: SemanticInputStatus::from_outcome(&selected),
+                    },
+                ));
+            }
         }
 
         let pre_dispatch_surface = if is_root {
@@ -754,7 +818,41 @@ pub fn discover_closure_with_cuts<P: ValueFlowProvider, C: ClosureCutDecider>(
                 .boundaries
                 .extend(dispatch.boundaries().iter().cloned());
             for candidate in dispatch.candidates() {
-                let target = candidate.target();
+                let selected = provider.selected_executable_procedure(
+                    candidate.target(),
+                    &mut SemanticRequest::new(semantic_budget, cancellation),
+                )?;
+                let Some(target) = selected.available_value().cloned() else {
+                    closure
+                        .coverage
+                        .get_mut(&coverage_key)
+                        .expect("dispatch coverage exists")
+                        .bindings
+                        .push(BindingCoverage::Answered {
+                            status: SemanticInputStatus::from_outcome(&selected),
+                        });
+                    continue;
+                };
+                let candidate = match crate::analyzer::semantic::service::reseal_selected_candidate(
+                    candidate,
+                    &call,
+                    &target,
+                    crate::analyzer::semantic::OracleLimits::default(),
+                ) {
+                    Ok(candidate) => candidate,
+                    Err(error) => {
+                        closure
+                            .coverage
+                            .get_mut(&coverage_key)
+                            .expect("dispatch coverage exists")
+                            .bindings
+                            .push(BindingCoverage::ProviderError {
+                                detail: error.to_string(),
+                            });
+                        continue;
+                    }
+                };
+                let candidate = &candidate;
                 let target_key = target.durable_key();
                 if target_key.0.mount() != mount {
                     continue;
@@ -959,6 +1057,44 @@ mod tests {
     impl ValueFlowProvider for ControlledProvider<'_> {
         type Error = &'static str;
 
+        fn payload_projection_identity(
+            &self,
+            procedure: &ProcedureHandle,
+            request: &mut SemanticRequest<'_>,
+        ) -> Result<SemanticOutcome<Option<crate::analyzer::semantic::StableDigest>>, Self::Error>
+        {
+            Ok(self
+                .inner
+                .payload_projection_identity(procedure, request)
+                .expect("fixture payload projection lookup succeeds"))
+        }
+
+        fn payload_constructor_output(
+            &self,
+            call: &CallSiteHandle,
+            request: &mut SemanticRequest<'_>,
+        ) -> Result<
+            SemanticOutcome<Option<crate::analyzer::semantic::ValueFlowEndpoint>>,
+            Self::Error,
+        > {
+            Ok(self
+                .inner
+                .payload_constructor_output(call, request)
+                .expect("fixture payload constructor lookup succeeds"))
+        }
+
+        fn selected_executable_procedure(
+            &self,
+            procedure: &ProcedureHandle,
+            _request: &mut SemanticRequest<'_>,
+        ) -> Result<SemanticOutcome<ProcedureHandle>, Self::Error> {
+            // This test provider has no candidate alternates.
+            Ok(SemanticOutcome::Complete {
+                value: procedure.clone(),
+                work: Default::default(),
+            })
+        }
+
         fn procedure_snapshot(
             &self,
             procedure: &ProcedureHandle,
@@ -1161,6 +1297,38 @@ mod tests {
 
     impl ValueFlowProvider for CountingProvider<'_> {
         type Error = SemanticProviderError;
+
+        fn payload_projection_identity(
+            &self,
+            procedure: &ProcedureHandle,
+            request: &mut SemanticRequest<'_>,
+        ) -> Result<SemanticOutcome<Option<crate::analyzer::semantic::StableDigest>>, Self::Error>
+        {
+            self.inner.payload_projection_identity(procedure, request)
+        }
+
+        fn payload_constructor_output(
+            &self,
+            call: &CallSiteHandle,
+            request: &mut SemanticRequest<'_>,
+        ) -> Result<
+            SemanticOutcome<Option<crate::analyzer::semantic::ValueFlowEndpoint>>,
+            Self::Error,
+        > {
+            self.inner.payload_constructor_output(call, request)
+        }
+
+        fn selected_executable_procedure(
+            &self,
+            procedure: &ProcedureHandle,
+            _request: &mut SemanticRequest<'_>,
+        ) -> Result<SemanticOutcome<ProcedureHandle>, Self::Error> {
+            // This test provider has no candidate alternates.
+            Ok(SemanticOutcome::Complete {
+                value: procedure.clone(),
+                work: Default::default(),
+            })
+        }
 
         fn canonical_procedure(&self, procedure: &ProcedureHandle) -> ProcedureHandle {
             self.inner.canonical_procedure(procedure)

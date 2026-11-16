@@ -1,8 +1,8 @@
 //! Bounded point-sensitive heap, alias, and update-oracle materialization.
 //!
 //! The implementation follows semantic IR edges and effects only. It does not
-//! reparse source, infer identities from names, or upgrade allocation-site
-//! identities into runtime singletons.
+//! reparse source or infer identities from names. Singleton population requires
+//! the shared bounded SCC, activation and capture proof.
 
 use crate::analyzer::semantic::MemoryLocationKind;
 use crate::analyzer::semantic::ObservationPhase;
@@ -455,7 +455,11 @@ pub fn gap_can_open_heap(
     gap: &SemanticGap,
     abort_user_code: &mut Option<bool>,
 ) -> bool {
-    if !gap_impacts_heap(gap) {
+    if crate::analyzer::semantic::workspace_oracle::deferred_body_gap_is_caller_only(
+        procedure.semantics(),
+        gap,
+    ) || !gap_impacts_heap(gap)
+    {
         return false;
     }
     if gap.capability != SemanticCapability::ExceptionalControlFlow {
@@ -507,11 +511,17 @@ pub fn traced_gap_affects_value(
     Ok(match gap.subject {
         // Procedure gaps are handled before tracing because they apply even
         // when an exact producer cuts the trace short.
-        SemanticGapSubject::Procedure => false,
+        SemanticGapSubject::FutureConstruction
+        | SemanticGapSubject::FutureActivation
+        | SemanticGapSubject::Procedure => false,
         SemanticGapSubject::Point
         | SemanticGapSubject::CallContinuation { .. }
         | SemanticGapSubject::AsyncContinuation { .. } => true,
         SemanticGapSubject::Value(subject) => subject == value,
+        SemanticGapSubject::CleanupOwners(segment) => procedure
+            .semantics()
+            .cleanup_chains()
+            .contains_owner(segment, value),
         SemanticGapSubject::MemoryLocation(location) => {
             staged.charge_work(SemanticWork {
                 memory_locations: 1,
@@ -637,7 +647,11 @@ pub fn complete_external_summary_escapes_value(
     call_row: &SemanticCallSite,
     value: crate::analyzer::semantic::ValueId,
 ) -> bool {
-    let inputs = std::iter::once((CompiledSummaryInput::Receiver {}, call_row.receiver)).chain(
+    let inputs = std::iter::once((
+        CompiledSummaryInput::Receiver { path: None },
+        call_row.receiver,
+    ))
+    .chain(
         call_row
             .arguments
             .iter()
@@ -646,6 +660,7 @@ pub fn complete_external_summary_escapes_value(
                 Some((
                     CompiledSummaryInput::Parameter {
                         ordinal: u32::try_from(ordinal).ok()?,
+                        path: None,
                     },
                     Some(argument.value),
                 ))
@@ -675,10 +690,14 @@ pub fn complete_external_summary_preserves_receiver(
     call_row.receiver == Some(value)
         && summary.transfers.iter().any(|transfer| {
             transfer.exit_kind == CompiledSummaryExitKind::Normal
-                && matches!(transfer.input, CompiledSummaryInput::Receiver {})
+                && matches!(
+                    transfer.input,
+                    CompiledSummaryInput::Receiver { path: None }
+                )
                 && matches!(
                     transfer.output,
-                    CompiledSummaryOutput::NormalReturn {} | CompiledSummaryOutput::Receiver {}
+                    CompiledSummaryOutput::NormalReturn { path: None }
+                        | CompiledSummaryOutput::Receiver { path: None }
                 )
         })
 }
@@ -817,18 +836,241 @@ pub fn allocation_is_captured(
     procedure: &ProcedureHandle,
     allocation: crate::analyzer::semantic::AllocationId,
     result: crate::analyzer::semantic::ValueId,
-) -> bool {
-    procedure.semantics().captures().iter().any(|capture| {
-        capture.environment == allocation
-            || capture.callable == result
-            || match capture.captured {
-                CaptureSource::Value(value) => value == result,
-                CaptureSource::Location(location) => procedure
-                    .semantics()
-                    .memory_location(location)
-                    .is_some_and(|row| row.kind.uses_value(result)),
+    staged: &mut WorkStager,
+    cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+) -> Result<bool, Interruption> {
+    allocation_site_is_captured(procedure, Some(allocation), result, staged, cancellation)
+}
+
+// Weak ledger receipts follow the actual consumer lifetime, including early
+// returns and cancellation. Neither the ledger nor this lease retains the data.
+fn retain_allocation_name_rows(
+    staged: &mut WorkStager,
+    rows: usize,
+) -> Result<std::sync::Arc<()>, Interruption> {
+    let census = SemanticWork {
+        nested_entries: rows,
+        ..SemanticWork::default()
+    };
+    let owner = std::sync::Arc::new(());
+    staged.admit(census)?;
+    staged.budget.track_replay_holder(&owner, census);
+    Ok(owner)
+}
+
+/// Query-local allocation names, charged until the escape/capture consumer
+/// finishes. Fields are ordered so the data drops before its resident lease.
+#[doc(hidden)]
+pub struct AllocationSiteNames {
+    names: HashSet<crate::analyzer::semantic::ValueId>,
+    _resident_rows: std::sync::Arc<()>,
+}
+
+impl std::ops::Deref for AllocationSiteNames {
+    type Target = HashSet<crate::analyzer::semantic::ValueId>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.names
+    }
+}
+
+/// Shared local identity-name closure for allocation capture and escape proof.
+/// Lexical cells are edges, not publication: a deferred capture of such a cell
+/// is checked separately. The graph is query-local and bounded by the input IR.
+#[doc(hidden)]
+pub fn allocation_site_names(
+    procedure: &ProcedureHandle,
+    result: crate::analyzer::semantic::ValueId,
+    staged: &mut WorkStager,
+    cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+) -> Result<AllocationSiteNames, Interruption> {
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+    enum Name {
+        Value(crate::analyzer::semantic::ValueId),
+        Cell(crate::analyzer::semantic::MemoryLocationId),
+    }
+    let semantics = procedure.semantics();
+    let mut event_count = 0usize;
+    for point in semantics.points() {
+        if cancellation.is_cancelled() {
+            return Err(Interruption::Cancelled);
+        }
+        staged.charge_work(SemanticWork {
+            program_points: 1,
+            ..SemanticWork::default()
+        });
+        event_count = event_count.saturating_add(point.events.len());
+    }
+    // At most one graph edge per event: map keys + edge payloads <= 2E,
+    // seen names <= 2E+1, and pending traversal entries <= E+1. Reserve
+    // before allocating any graph/traversal storage. This lease ends here;
+    // returned names have an independent consumer-owned admission below.
+    let _scratch_rows =
+        retain_allocation_name_rows(staged, event_count.saturating_mul(5).saturating_add(2))?;
+    let mut edges: HashMap<Name, Vec<Name>> = HashMap::default();
+    let lexical = |location| {
+        semantics
+            .memory_location(location)
+            .is_some_and(|row| matches!(row.kind, MemoryLocationKind::LexicalCell { .. }))
+    };
+    for point in semantics.points() {
+        if cancellation.is_cancelled() {
+            return Err(Interruption::Cancelled);
+        }
+        staged.charge_work(SemanticWork {
+            program_points: 1,
+            events: point.events.len(),
+            ..SemanticWork::default()
+        });
+        for (index, event) in point.events.iter().enumerate() {
+            let edge = match event.effect {
+                SemanticEffect::Assignment { target, value }
+                    if assignment_transfer(&point.events, index, value, target).is_none() =>
+                {
+                    Some((Name::Value(value), Name::Value(target)))
+                }
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::Local | ValueFlowKind::AddressOf,
+                    source,
+                    target,
+                } => Some((Name::Value(source), Name::Value(target))),
+                SemanticEffect::MemoryStore {
+                    location, value, ..
+                } if lexical(location) => Some((Name::Value(value), Name::Cell(location))),
+                SemanticEffect::MemoryLoad {
+                    location, result, ..
+                } if lexical(location) => Some((Name::Cell(location), Name::Value(result))),
+                _ => None,
+            };
+            if let Some((source, target)) = edge {
+                edges.entry(source).or_default().push(target);
             }
+        }
+    }
+    let mut seen = HashSet::default();
+    let mut pending = vec![Name::Value(result)];
+    while let Some(name) = pending.pop() {
+        if cancellation.is_cancelled() {
+            return Err(Interruption::Cancelled);
+        }
+        if !seen.insert(name) {
+            continue;
+        }
+        staged.charge_work(SemanticWork {
+            values: 1,
+            ..SemanticWork::default()
+        });
+        pending.extend(edges.get(&name).into_iter().flatten().copied());
+    }
+    staged.charge_work(SemanticWork {
+        values: seen.len().saturating_mul(2),
+        ..SemanticWork::default()
+    });
+    let count = seen
+        .iter()
+        .filter(|name| matches!(name, Name::Value(_)))
+        .count();
+    let resident_rows = retain_allocation_name_rows(staged, count)?;
+    let names = seen
+        .into_iter()
+        .filter_map(|name| match name {
+            Name::Value(value) => Some(value),
+            Name::Cell(_) => None,
+        })
+        .collect();
+    Ok(AllocationSiteNames {
+        names,
+        _resident_rows: resident_rows,
     })
+}
+
+#[doc(hidden)]
+pub fn allocation_site_is_captured(
+    procedure: &ProcedureHandle,
+    allocation: Option<crate::analyzer::semantic::AllocationId>,
+    result: crate::analyzer::semantic::ValueId,
+    staged: &mut WorkStager,
+    cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+) -> Result<bool, Interruption> {
+    if procedure.semantics().captures().is_empty() {
+        return Ok(false);
+    }
+    let names = allocation_site_names(procedure, result, staged, cancellation)?;
+    // Build the stored-location set once. Scanning the procedure separately
+    // for every captured cell would multiply work and hide cancellation.
+    let semantics = procedure.semantics();
+    let _stored_rows = retain_allocation_name_rows(staged, semantics.memory_locations().len())?;
+    let mut stored_locations = HashSet::default();
+    for point in semantics.points() {
+        if cancellation.is_cancelled() {
+            return Err(Interruption::Cancelled);
+        }
+        staged.charge_work(SemanticWork {
+            program_points: 1,
+            ..SemanticWork::default()
+        });
+        for event in &point.events {
+            if cancellation.is_cancelled() {
+                return Err(Interruption::Cancelled);
+            }
+            staged.charge_work(SemanticWork {
+                events: 1,
+                ..SemanticWork::default()
+            });
+            if let SemanticEffect::MemoryStore {
+                location, value, ..
+            } = event.effect
+                && names.contains(&value)
+            {
+                stored_locations.insert(location);
+            }
+        }
+    }
+    for capture in semantics.captures() {
+        if cancellation.is_cancelled() {
+            return Err(Interruption::Cancelled);
+        }
+        staged.charge_work(SemanticWork {
+            captures: 1,
+            ..SemanticWork::default()
+        });
+        if Some(capture.environment) == allocation || names.contains(&capture.callable) {
+            return Ok(true);
+        }
+        match capture.captured {
+            CaptureSource::Value(value) if names.contains(&value) => return Ok(true),
+            CaptureSource::Value(_) => {}
+            CaptureSource::Location(location) => {
+                if stored_locations.contains(&location) {
+                    return Ok(true);
+                }
+                staged.charge_work(SemanticWork {
+                    memory_locations: 1,
+                    ..SemanticWork::default()
+                });
+                if let Some(row) = semantics.memory_location(location) {
+                    let uses_name = match &row.kind {
+                        MemoryLocationKind::Field { base, .. }
+                        | MemoryLocationKind::Property { base, .. } => names.contains(base),
+                        MemoryLocationKind::Index { base, index, .. } => {
+                            names.contains(base)
+                                || index.is_some_and(|value| names.contains(&value))
+                        }
+                        MemoryLocationKind::Dereference { address } => names.contains(address),
+                        MemoryLocationKind::LexicalCell { binding } => names.contains(binding),
+                        MemoryLocationKind::Capture { binding, .. } => {
+                            binding.is_some_and(|value| names.contains(&value))
+                        }
+                        MemoryLocationKind::Static { .. } => false,
+                    };
+                    if uses_name {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn push_object(
@@ -1037,6 +1279,48 @@ pub fn allocation_object_draft(
                 "allocation effect has a stale allocation ID",
             ))
         })?;
+    let handle = procedure.allocation_handle(allocation).ok_or_else(|| {
+        InterruptionOrProvider::Provider(SemanticProviderError::internal(
+            "allocation handle is stale",
+        ))
+    })?;
+    allocation_site_object_draft(
+        procedure,
+        query,
+        AbstractObjectIdentity::Allocation(handle),
+        allocation_row.point,
+        allocation_row.result,
+        Some(allocation),
+        inherited_evidence,
+        &[
+            event_evidence,
+            evidence_handle(procedure, allocation_row.evidence)
+                .map_err(InterruptionOrProvider::Provider)?,
+        ],
+        cyclic,
+        staged,
+        cancellation,
+    )
+}
+
+/// The one population owner for native allocations and exact selected modeled
+/// Fresh sites. Identity is supplied by the site producer; population follows
+/// the same bounded SCC, activation and capture proof for both kinds of site.
+#[allow(clippy::too_many_arguments)]
+#[doc(hidden)]
+pub fn allocation_site_object_draft(
+    procedure: &ProcedureHandle,
+    query: &ValueAtPoint,
+    identity: AbstractObjectIdentity,
+    point: crate::analyzer::semantic::ProgramPointId,
+    result: crate::analyzer::semantic::ValueId,
+    allocation: Option<crate::analyzer::semantic::AllocationId>,
+    inherited_evidence: &[EvidenceHandle],
+    site_evidence: &[EvidenceHandle],
+    cyclic: &mut Option<Option<CyclicRegions>>,
+    staged: &mut WorkStager,
+    cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+) -> Result<ObjectDraft, InterruptionOrProvider> {
     staged.charge_work(SemanticWork {
         allocations: 1,
         ..SemanticWork::default()
@@ -1052,13 +1336,8 @@ pub fn allocation_object_draft(
         .expect("cyclic membership was derived above")
         .as_ref();
     let cycle_evidence = regions
-        .and_then(|regions| regions.cycle_evidence(allocation_row.point))
+        .and_then(|regions| regions.cycle_evidence(point))
         .map(<[_]>::to_vec);
-    let handle = procedure.allocation_handle(allocation).ok_or_else(|| {
-        InterruptionOrProvider::Provider(SemanticProviderError::internal(
-            "allocation handle is stale",
-        ))
-    })?;
     let recursive_context = query
         .context()
         .calls()
@@ -1066,17 +1345,19 @@ pub fn allocation_object_draft(
         .any(|call| call.procedure() == procedure);
     let cardinality = if cycle_evidence.is_some() || recursive_context {
         ObjectCardinality::Summary
+    } else if query.context().was_truncated() {
+        ObjectCardinality::Unknown
     } else if regions.is_some()
-        && !allocation_is_captured(procedure, allocation, allocation_row.result)
+        && !allocation_site_is_captured(procedure, allocation, result, staged, cancellation)
+            .map_err(InterruptionOrProvider::Interruption)?
     {
         ObjectCardinality::Singleton
     } else {
         ObjectCardinality::Unknown
     };
-    let object = AbstractObject::new(AbstractObjectIdentity::Allocation(handle), cardinality)
-        .map_err(|error| {
-            InterruptionOrProvider::Provider(internal_contract("invalid allocation object", error))
-        })?;
+    let object = AbstractObject::new(identity, cardinality).map_err(|error| {
+        InterruptionOrProvider::Provider(internal_contract("invalid allocation object", error))
+    })?;
     let cycle_evidence = cycle_evidence
         .unwrap_or_default()
         .into_iter()
@@ -1106,11 +1387,7 @@ pub fn allocation_object_draft(
         inherited_evidence
             .iter()
             .cloned()
-            .chain([
-                event_evidence,
-                evidence_handle(procedure, allocation_row.evidence)
-                    .map_err(InterruptionOrProvider::Provider)?,
-            ])
+            .chain(site_evidence.iter().cloned())
             .chain(cycle_evidence)
             .chain(recursive_evidence),
     );
@@ -1216,10 +1493,7 @@ pub struct IncomingActualQuery {
 
 #[doc(hidden)]
 pub type IncomingActualKey = (
-    (
-        crate::analyzer::semantic::SemanticArtifactKey,
-        crate::analyzer::semantic::ProcedureId,
-    ),
+    crate::analyzer::semantic::DurableProcedureKey,
     crate::analyzer::semantic::ValueId,
     crate::analyzer::semantic::OracleCallContext,
 );
@@ -1861,7 +2135,8 @@ pub(super) fn effect_names_any(
             names.contains(subject)
                 || matches!(payload, Some(crate::analyzer::semantic::SynchronizationPayload::Send { value, .. }) if names.contains(value))
         }
-        SemanticEffect::Entry
+        SemanticEffect::MemoryInterference
+        | SemanticEffect::Entry
         | SemanticEffect::NormalExit
         | SemanticEffect::ExceptionalExit
         | SemanticEffect::Allocation { .. }
@@ -1877,12 +2152,17 @@ pub fn publication_gap_affects_names(
 ) -> bool {
     let semantics = procedure.semantics();
     match gap.subject {
-        SemanticGapSubject::Procedure => true,
+        SemanticGapSubject::FutureConstruction
+        | SemanticGapSubject::FutureActivation
+        | SemanticGapSubject::Procedure => true,
         // A point-scoped gap is deliberately broader than its retained
         // events: the missing event may be the operation that publishes the
         // object. Only an explicit adapter-authored discharge can narrow it.
         SemanticGapSubject::Point => true,
         SemanticGapSubject::Value(value) => names.contains(&value),
+        SemanticGapSubject::CleanupOwners(segment) => names
+            .iter()
+            .any(|value| semantics.cleanup_chains().contains_owner(segment, *value)),
         SemanticGapSubject::MemoryLocation(location) => semantics
             .memory_location(location)
             .is_some_and(|location| names.iter().any(|value| location.kind.uses_value(*value))),
@@ -1998,6 +2278,7 @@ pub fn resolve_fresh_object_publications(
     limits: crate::analyzer::semantic::OracleLimits,
     staged: &mut WorkStager,
     cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+    gap_is_discharged: impl Fn(crate::analyzer::semantic::SemanticGapId) -> bool,
     mut private_cell_binding: impl FnMut(
         crate::analyzer::semantic::MemoryLocationId,
         &mut WorkStager,
@@ -2124,7 +2405,7 @@ pub fn resolve_fresh_object_publications(
                     })
                 }
                 SemanticEffect::ValueFlow {
-                    kind: ValueFlowKind::Local,
+                    kind: ValueFlowKind::Local | ValueFlowKind::AddressOf,
                     source: value,
                     target,
                 } => copies.push(NameCopy {
@@ -2237,7 +2518,8 @@ pub fn resolve_fresh_object_publications(
         // which resolved target receives it or how retained evaluations are
         // ordered. Those two structured proof obligations are therefore
         // irrelevant; every other gap remains conservative.
-        if gap.discharge != SemanticGapDischarge::RetainedEvaluationOrder
+        if !gap_is_discharged(gap.id)
+            && gap.discharge != SemanticGapDischarge::RetainedEvaluationOrder
             && call_target_refinement_call(semantics, gap).is_none()
             && publication_gap_affects_names(procedure, gap, &names)
             && gap_can_open_heap(procedure, gap, &mut abort_user_code)
@@ -2652,5 +2934,47 @@ impl crate::analyzer::semantic::workspace_oracle::IncomingActualCache {
             0
         });
         census.artifact_bytes()
+    }
+}
+
+#[cfg(test)]
+mod allocation_name_resident_tests {
+    use super::*;
+    use crate::analyzer::semantic::{SemanticBudget, SemanticRequest};
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#11547: allocation-name graph and returned names escaped resident accounting")]
+    fn allocation_names_account_scratch_and_consumer_lifetimes() {
+        let cancellation = brokk_bifrost_core::cancellation::CancellationToken::default();
+        let mut limits = SemanticBudget::default().limits();
+        limits.nested_entries = 20;
+        let mut budget = SemanticBudget::new(limits).unwrap();
+        let mut staged = WorkStager::new(&SemanticRequest::new(&mut budget, &cancellation));
+        let scratch = retain_allocation_name_rows(&mut staged, 17).unwrap();
+        assert_eq!(staged.budget.resident().nested_entries, 17);
+        assert_eq!(staged.budget.resident_peak().nested_entries, 17);
+        assert!(matches!(
+            retain_allocation_name_rows(&mut staged, 4),
+            Err(Interruption::Budget(_))
+        ));
+        let names = AllocationSiteNames {
+            names: HashSet::default(),
+            _resident_rows: retain_allocation_name_rows(&mut staged, 3).unwrap(),
+        };
+        assert_eq!(staged.budget.resident().nested_entries, 20);
+        assert_eq!(staged.budget.resident_peak().nested_entries, 20);
+        drop(scratch);
+        assert_eq!(staged.budget.resident().nested_entries, 3);
+        assert!(matches!(
+            retain_allocation_name_rows(&mut staged, 18),
+            Err(Interruption::Budget(_))
+        ));
+        drop(names);
+        assert_eq!(staged.budget.resident().nested_entries, 0);
+        assert_eq!(staged.budget.resident_peak().nested_entries, 20);
+        let reused = retain_allocation_name_rows(&mut staged, 20).unwrap();
+        drop(reused);
+        assert_eq!(staged.budget.resident().nested_entries, 0);
     }
 }

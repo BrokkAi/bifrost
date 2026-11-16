@@ -9,6 +9,7 @@ use brokk_bifrost_analysis::analyzer::semantic::{
     ValueTypeBarrierContext, ValueTypeBarrierDecision, ValueTypeBarrierReason, ValueTypePredicate,
     evaluate_value_type_barrier, open_value_type_barrier_context,
 };
+use brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution;
 use brokk_bifrost_analysis::analyzer::{Language, WorkspaceAnalyzer};
 
 #[cfg(any(test, feature = "test-support"))]
@@ -31,12 +32,15 @@ pub fn count_value_type_barrier_calls_for_test<T>(run: impl FnOnce() -> T) -> (T
     (result, count)
 }
 
+type BarrierContexts<'a> =
+    HashMap<(Language, Option<u64>), Option<Box<dyn ValueTypeBarrierContext + 'a>>>;
+
 /// Lazy language contexts retain decision and budget-failure memos only for this
 /// request. Both lenient and strict refinements borrow the same instance.
 pub(crate) struct ValueTypeBarrierService<'a> {
     workspace: &'a WorkspaceAnalyzer,
     execution_budget: SemanticExecutionBudget,
-    contexts: RefCell<HashMap<Language, Option<Box<dyn ValueTypeBarrierContext + 'a>>>>,
+    contexts: RefCell<BarrierContexts<'a>>,
     checks: Cell<u64>,
 }
 
@@ -74,8 +78,16 @@ impl<'a> ValueTypeBarrierService<'a> {
                 ValueTypeBarrierReason::UnsupportedLanguage,
             ));
         };
+        // Replaying policy memo fills introduce nested captures. Language
+        // contexts contain capture-scoped memos and must follow that boundary.
+        let key = (
+            language,
+            memo_attribution(self.workspace.analyzer())
+                .capture_identity()
+                .map(|identity| identity.0),
+        );
         let mut contexts = self.contexts.borrow_mut();
-        if let std::collections::hash_map::Entry::Vacant(entry) = contexts.entry(language) {
+        if let std::collections::hash_map::Entry::Vacant(entry) = contexts.entry(key) {
             entry.insert(
                 open_value_type_barrier_context(
                     language,
@@ -86,7 +98,7 @@ impl<'a> ValueTypeBarrierService<'a> {
             );
         }
         let mut staged = request.staged_with_execution_budget(&self.execution_budget);
-        if let Some(context) = contexts[&language].as_deref() {
+        if let Some(context) = contexts[&key].as_deref() {
             staged = staged.with_value_type_barrier_context(context);
         }
         evaluate_value_type_barrier(

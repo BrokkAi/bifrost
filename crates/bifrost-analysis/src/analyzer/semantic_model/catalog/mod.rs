@@ -29,6 +29,7 @@ use std::time::Duration;
 use std::time::Instant;
 use tempfile::TempDir;
 use uuid::Uuid;
+mod default_upgrade;
 mod pinned_reader;
 const GENERATED_SOURCE_IDENTITY_LOOKUP: &str = "SELECT gp.production_digest, gp.input_digest
                  FROM catalog_generated_source_identities AS ident
@@ -62,14 +63,24 @@ pub fn open_default_semantic_pack_catalog(
         catalog_root
             .parent()
             .expect("the default semantic-pack catalog has a cache parent"),
-    )
-    .map_err(CatalogError::Integrity)?;
+    );
+    let cache_dir = match cache_dir {
+        Ok(root) => root,
+        Err(error) => {
+            return default_upgrade::deferred_catalog(
+                options,
+                "default cache root",
+                CatalogError::Integrity(error),
+                Vec::new(),
+            );
+        }
+    };
     let directory_name = catalog_root
         .file_name()
         .expect("the default semantic-pack catalog has a directory name");
-    let mut catalog = SemanticPackCatalog::open(
+    let mut catalog = default_upgrade::open(
         &cache_dir.join(directory_name),
-        CatalogOpenMode::ReadWrite,
+        CATALOG_SCHEMA_VERSION,
         options,
     )?;
     // The local catalog owns workspace sources and activation state. Only
@@ -236,6 +247,7 @@ pub struct SemanticPackCatalog {
     sql_statements: AtomicU64,
     object_reads: AtomicU64,
     mutation_generation: AtomicU64,
+    open_diagnostics: Vec<crate::analyzer::semantic_model::dependency::DependencyPackDiagnostic>,
     shared_generated_root: Option<PathBuf>,
     // The opened host catalog at `shared_generated_root`. A read-write open
     // reconciles every stored object, and each dependency lookup that missed
@@ -419,6 +431,7 @@ impl SemanticPackCatalog {
             sql_statements: AtomicU64::new(0),
             object_reads: AtomicU64::new(0),
             mutation_generation: AtomicU64::new(0),
+            open_diagnostics: Vec::new(),
             shared_generated_root: None,
             shared_generated: OnceLock::new(),
             _ephemeral_root: None,

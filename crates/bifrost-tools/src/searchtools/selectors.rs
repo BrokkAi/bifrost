@@ -930,6 +930,29 @@ pub(crate) fn definition_candidates_with_cache(
         .collect()
 }
 
+pub(crate) fn definition_lookup_candidates_with_cache(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    outcome: &brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupOutcome,
+    render_cache: &mut DefinitionCandidateRenderCache,
+) -> (usize, Vec<DefinitionCandidate>) {
+    if outcome.selected_sites.is_empty() {
+        return (
+            outcome.definitions.len(),
+            definition_candidates_with_cache(analyzer, token, &outcome.definitions, render_cache),
+        );
+    }
+    let mut targets = outcome.selected_sites.clone();
+    targets.sort_by(|left, right| {
+        (&left.code_unit, left.declaration_range).cmp(&(&right.code_unit, right.declaration_range))
+    });
+    targets.dedup();
+    (
+        targets.len(),
+        navigation_candidates_with_cache(analyzer, token, &targets, render_cache),
+    )
+}
+
 pub(crate) fn navigation_candidates_with_cache(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
@@ -2578,6 +2601,9 @@ mod tests {
         let analyzer = CppAnalyzer::from_project(fixture.project().clone());
         let scope = AnalyzerQueryScope::new(&analyzer);
         let complete = DefinitionLookupOutcome {
+            selected_sites: Vec::new(),
+            inventory_evidence: None,
+            incomplete_evidence: None,
             modeled_definitions: Vec::new(),
             status: DefinitionLookupStatus::NoDefinition,
             reference: None,

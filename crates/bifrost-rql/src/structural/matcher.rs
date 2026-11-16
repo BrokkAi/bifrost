@@ -132,6 +132,8 @@ pub(crate) struct CallableSignatureIncomplete {
     /// `each` stopped at the fact budget or the per-row capture budget. The
     /// answer is incomplete for an execution budget, not for missing support.
     pub fact_budget_exhausted: Cell<bool>,
+    pub fact_budget_refusal: Cell<Option<(u64, u64)>>,
+    pub capture_budget_refusal: Cell<Option<(usize, usize, usize)>>,
     pub role_coverage_incomplete: Cell<bool>,
     pub selection_application_undecided: Cell<bool>,
     /// A role whose absence needs certification was missing from a fact whose
@@ -151,6 +153,21 @@ pub(crate) struct CallableSignatureIncomplete {
 }
 
 impl CallableSignatureIncomplete {
+    fn record_fact_budget(&self, consumed: u64, limit: u64) {
+        self.fact_budget_exhausted.set(true);
+        if self.fact_budget_refusal.get().is_none() {
+            self.fact_budget_refusal.set(Some((consumed, limit)));
+        }
+    }
+
+    fn record_capture_budget(&self, consumed: usize, attempted: usize, limit: usize) {
+        self.fact_budget_exhausted.set(true);
+        if self.capture_budget_refusal.get().is_none() {
+            self.capture_budget_refusal
+                .set(Some((consumed, attempted, limit)));
+        }
+    }
+
     fn flags(&self) -> [&Cell<bool>; 13] {
         let Self {
             visibility_unrecorded,
@@ -164,6 +181,8 @@ impl CallableSignatureIncomplete {
             each_incomplete,
             argument_mode_unrecorded,
             fact_budget_exhausted,
+            fact_budget_refusal: _,
+            capture_budget_refusal: _,
             role_coverage_incomplete,
             selection_application_undecided,
             role_absence_uncertified,
@@ -255,6 +274,7 @@ pub(crate) struct CaptureBinding {
 /// collected along the accepted pattern path, in pattern order.
 #[derive(Debug, Clone)]
 pub(crate) struct FactMatch {
+    pub selected_pattern_source: super::search::SelectedPatternSourceEvidence,
     pub node: u32,
     pub captures: Arc<[CaptureBinding]>,
     /// A closed language relation may select a source span nested inside the
@@ -269,14 +289,18 @@ pub(crate) struct FactMatch {
 }
 
 impl FactMatch {
+    /// Explicit and implicit native ranges name the same output location.
+    pub(crate) fn effective_range(&self, facts: &FileFacts) -> Range {
+        self.reported_range
+            .unwrap_or_else(|| facts.node(self.node).range)
+    }
+
     pub(crate) fn display_span(&self, facts: &FileFacts) -> Span {
-        self.reported_range.map_or_else(
-            || facts.node(self.node).span(),
-            |range| Span {
-                start_byte: range.start_byte,
-                end_byte: range.end_byte,
-            },
-        )
+        let range = self.effective_range(facts);
+        Span {
+            start_byte: range.start_byte,
+            end_byte: range.end_byte,
+        }
     }
 }
 
@@ -589,6 +613,7 @@ pub(crate) fn match_query_candidates(
                 .qualifying_type_sites
                 .borrow_mut()
                 .push(FactMatch {
+                    selected_pattern_source: Default::default(),
                     node: id,
                     captures: Default::default(),
                     reported_range: None,
@@ -597,6 +622,7 @@ pub(crate) fn match_query_candidates(
             continue;
         }
         matches.push(FactMatch {
+            selected_pattern_source: Default::default(),
             node: id,
             captures: captures.into(),
             reported_range: None,
@@ -725,6 +751,7 @@ fn ordered_role_scan(
                         IndexedRoleTarget {
                             target,
                             index: Some(index),
+                            name: None,
                         },
                         captures,
                         context,
@@ -738,6 +765,7 @@ fn ordered_role_scan(
                         IndexedRoleTarget {
                             target,
                             index: Some(index),
+                            name: None,
                         },
                         captures,
                         context,
@@ -955,7 +983,7 @@ fn eval_pattern_inner_with_name(
     pattern: &Pattern,
     facts: &FileFacts,
     node: u32,
-    name_override: Option<Span>,
+    name_override: Option<&str>,
     captures: &mut Vec<CaptureBinding>,
     context: &mut PatternEvalContext<'_>,
 ) -> bool {
@@ -1013,10 +1041,15 @@ fn eval_pattern_inner_with_name(
         }
     }
     if let Some(predicate) = &pattern.name {
-        let Some(name) = name_override.or(fact.name) else {
+        // A spelled call answers to its derived callee name (`attr=`, `[]`).
+        let name = match name_override {
+            Some(name) => Some(std::borrow::Cow::Borrowed(name)),
+            None => facts.node_name_text(node),
+        };
+        let Some(name) = name else {
             return false;
         };
-        if !predicate.matches(name.text(facts.source())) {
+        if !predicate.matches(&name) {
             return false;
         }
     }
@@ -1295,7 +1328,9 @@ fn eval_pattern_inner_with_name(
         while let Some(id) = owner {
             *context.examined_facts = context.examined_facts.saturating_add(1);
             if *context.examined_facts >= context.max_examined_facts {
-                context.incomplete.fact_budget_exhausted.set(true);
+                context
+                    .incomplete
+                    .record_fact_budget(*context.examined_facts, context.max_examined_facts);
                 return false;
             }
             if context.cancelled_at(*context.examined_facts) {
@@ -1333,7 +1368,9 @@ fn eval_pattern_inner_with_name(
             for target in roles {
                 *context.examined_facts = context.examined_facts.saturating_add(1);
                 if *context.examined_facts >= context.max_examined_facts {
-                    context.incomplete.fact_budget_exhausted.set(true);
+                    context
+                        .incomplete
+                        .record_fact_budget(*context.examined_facts, context.max_examined_facts);
                     return false;
                 }
                 if context.cancelled_at(*context.examined_facts) {
@@ -1389,6 +1426,7 @@ fn eval_pattern_inner_with_name(
                     IndexedRoleTarget {
                         target,
                         index: Some(index),
+                        name: None,
                     },
                     &mut child_captures,
                     context,
@@ -1449,8 +1487,11 @@ fn eval_pattern_inner_with_name(
         Some(SelectionApplication::Undecided) => undecided_kind,
         Some(SelectionApplication::NotCall) | None => false,
     };
+    // A spelled call's callee answers to the call's derived callee name.
+    let spelled_callee = facts.spelled_callee_name(node);
     for &role in Role::single_target_roles() {
         if let Some(sub_pattern) = pattern.single_role_pattern(role) {
+            let spelled_name = spelled_callee.as_deref().filter(|_| role == Role::Callee);
             let matched = qualifying_any(
                 sub_pattern
                     .constrains_qualifying_type()
@@ -1468,6 +1509,7 @@ fn eval_pattern_inner_with_name(
                         IndexedRoleTarget {
                             target,
                             index: None,
+                            name: spelled_name,
                         },
                         captures,
                         context,
@@ -1548,6 +1590,7 @@ fn eval_pattern_inner_with_name(
                         IndexedRoleTarget {
                             target,
                             index: None,
+                            name: None,
                         },
                         captures,
                         context,
@@ -1602,7 +1645,9 @@ fn eval_pattern_inner_with_name(
         context.each_depth += 1;
         for candidate in node..facts.subtree_end(node) {
             if *context.examined_facts >= context.max_examined_facts {
-                context.incomplete.fact_budget_exhausted.set(true);
+                context
+                    .incomplete
+                    .record_fact_budget(*context.examined_facts, context.max_examined_facts);
                 break;
             }
             if context.each_budget.exhausted {
@@ -1823,7 +1868,7 @@ fn eval_same_node_pattern(
     pattern: &Pattern,
     facts: &FileFacts,
     node: u32,
-    name_override: Option<Span>,
+    name_override: Option<&str>,
     captures: &mut Vec<CaptureBinding>,
     context: &mut PatternEvalContext<'_>,
 ) -> bool {
@@ -1947,7 +1992,9 @@ fn some_descendant_matches(
         |candidate, captures, context| {
             if context.each_depth > 0 {
                 if *context.examined_facts >= context.max_examined_facts {
-                    context.incomplete.fact_budget_exhausted.set(true);
+                    context
+                        .incomplete
+                        .record_fact_budget(*context.examined_facts, context.max_examined_facts);
                     stopped.set(true);
                     return false;
                 }
@@ -1973,6 +2020,9 @@ fn some_descendant_matches(
 struct IndexedRoleTarget<'a> {
     target: &'a RoleTarget,
     index: Option<usize>,
+    /// The name the target answers to when it is not its recorded name: the
+    /// derived callee name of a spelled call's callee.
+    name: Option<&'a str>,
 }
 
 fn eval_target(
@@ -1982,15 +2032,18 @@ fn eval_target(
     captures: &mut Vec<CaptureBinding>,
     context: &mut PatternEvalContext<'_>,
 ) -> bool {
-    let IndexedRoleTarget { target, index } = indexed;
+    let IndexedRoleTarget {
+        target,
+        index,
+        name,
+    } = indexed;
+    let name = name.or_else(|| target.name.map(|name| name.text(facts.source())));
     eval_with_rollback(captures, context, |captures, context| {
         pattern.index.is_none_or(|expected| {
             index.is_some_and(|index| u32::try_from(index).ok() == Some(expected))
         }) && match target.node {
-            Some(node) => {
-                eval_same_node_pattern(pattern, facts, node, target.name, captures, context)
-            }
-            None => eval_span_only(pattern, facts, target, captures, context),
+            Some(node) => eval_same_node_pattern(pattern, facts, node, name, captures, context),
+            None => eval_span_only(pattern, facts, target, name, captures, context),
         }
     })
 }
@@ -1999,6 +2052,7 @@ fn eval_span_only(
     pattern: &Pattern,
     facts: &FileFacts,
     target: &RoleTarget,
+    name: Option<&str>,
     captures: &mut Vec<CaptureBinding>,
     context: &mut PatternEvalContext<'_>,
 ) -> bool {
@@ -2075,7 +2129,7 @@ fn eval_span_only(
         let previous_budget = context.each_budget;
         let incomplete = context.incomplete;
         let absent =
-            incomplete.negate(|| eval_span_only(negated, facts, target, captures, context));
+            incomplete.negate(|| eval_span_only(negated, facts, target, name, captures, context));
         captures.truncate(checkpoint);
         context.each_budget = previous_budget;
         if !absent {
@@ -2084,7 +2138,7 @@ fn eval_span_only(
     }
     for child in &pattern.all {
         if !eval_with_rollback(captures, context, |captures, context| {
-            eval_span_only(child, facts, target, captures, context)
+            eval_span_only(child, facts, target, name, captures, context)
         }) {
             return false;
         }
@@ -2092,16 +2146,13 @@ fn eval_span_only(
     if !pattern.any.is_empty()
         && !pattern.any.iter().any(|child| {
             eval_with_rollback(captures, context, |captures, context| {
-                eval_span_only(child, facts, target, captures, context)
+                eval_span_only(child, facts, target, name, captures, context)
             })
         })
     {
         return false;
     }
-    if !pattern.name_text_matches(
-        target.name.map(|name| name.text(facts.source())),
-        target.span.text(facts.source()),
-    ) {
+    if !pattern.name_text_matches(name, target.span.text(facts.source())) {
         return false;
     }
     if let Some(label) = &pattern.capture
@@ -2137,7 +2188,11 @@ fn add_capture(
             .len()
             .saturating_add(EACH_CAPTURE_BINDING_OVERHEAD_BYTES);
         if context.each_budget.bytes.saturating_add(charge) > MAX_EACH_CAPTURE_BYTES_PER_ROW {
-            context.incomplete.fact_budget_exhausted.set(true);
+            context.incomplete.record_capture_budget(
+                context.each_budget.bytes,
+                context.each_budget.bytes.saturating_add(charge),
+                MAX_EACH_CAPTURE_BYTES_PER_ROW,
+            );
             context.each_budget.exhausted = true;
             context.capture_refusals += 1;
             return false;

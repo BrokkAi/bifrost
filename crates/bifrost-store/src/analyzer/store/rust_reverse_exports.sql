@@ -7,21 +7,41 @@ WITH RECURSIVE exposed(summary_id, topology_id, crate_key, module_path, namespac
          exports.module_path, exports.namespace, exports.name,
          exports.visibility, 0
   FROM main.resolution_unit_summary_members AS member
-    INDEXED BY resolution_unit_summary_members_blob
+    INDEXED BY resolution_unit_summary_members_path
   CROSS JOIN selected_rust_unit_summaries AS owner
     ON owner.summary_id = member.summary_id
+  -- Rust-only derived-from blob until #11183 M3 converts Rust child rows
   CROSS JOIN main.rust_resolution_unit_summary_exports AS exports
     INDEXED BY rust_resolution_unit_summary_exports_declaration
-    ON exports.summary_id = member.summary_id
-   AND exports.declaration_member_ordinal = member.member_ordinal
-   AND exports.declaration_site = ?2
+    ON exports.summary_id=member.summary_id
+   AND exports.declaration_member_ordinal=member.member_ordinal
+   AND exports.declaration_site=?2
    AND exports.origin = 'declaration'
-  CROSS JOIN main.rust_unit_summary_placements AS placement
+  LEFT JOIN main.resolution_unit_summary_exports AS shared_export
+    INDEXED BY resolution_unit_summary_exports_surface_lookup
+    ON shared_export.summary_id=member.summary_id
+   AND shared_export.declaration_member_ordinal=(
+       SELECT min(shared_member.member_ordinal)
+       FROM main.resolution_unit_summary_members AS shared_member
+        INDEXED BY resolution_unit_summary_members_blob
+       WHERE shared_member.summary_id=member.summary_id
+         AND shared_member.blob_id=member.blob_id)
+   AND shared_export.site_surface_ordinal=(
+       SELECT site.surface_ordinal
+       FROM temp.surface_dense AS site
+       WHERE site.blob_id=?1 AND site.id_space=0 AND site.dense_id=?2)
+   AND shared_export.identity_id=exports.identity_id
+   AND shared_export.namespace=exports.namespace
+   AND shared_export.target_kind='own'
+  CROSS JOIN temp.rust_unit_summary_placements AS placement
     ON placement.summary_id = member.summary_id
    AND placement.member_ordinal = member.member_ordinal
    AND (placement.module_path = exports.module_path
         OR (exports.namespace = 'macro' AND exports.module_path = 'crate'))
-  WHERE member.blob_id = ?1 AND member.rel_path = ?3
+  WHERE member.rel_path = ?3
+    -- Rust-only derived-from blob until #11183 M3 converts Rust child rows
+    AND member.blob_id=?1
+    AND (exports.visibility<>'public' OR shared_export.identity_id IS NOT NULL)
   UNION
   SELECT owner.summary_id, owner.topology_id, owner.unit_key,
          routes.module_path, target.namespace, routes.bound_name,

@@ -9,6 +9,7 @@ use crate::imports::{
     resolve_rust_module_path_with_crate, resolve_rust_module_segments_with_crate,
 };
 use crate::usage::exported_targets_from_files;
+use brokk_bifrost_core::allocation_size::allocation_size;
 use brokk_bifrost_core::analyzer::parsed_file::SourceImportFact;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::rust_facts::{
@@ -37,6 +38,9 @@ pub struct RustHierarchySourceFacts {
     pub items: RustItemSourceFacts,
     pub types: Vec<RustTypeSourceFact>,
     pub declarations: Vec<SourceDeclaration>,
+    pub lexical_identifiers: Vec<(SourceDeclarationId, String)>,
+    /// Byte spans indexed by retained declaration identity.
+    pub declaration_spans: Vec<(usize, usize)>,
     pub declaration_units: Vec<(SourceDeclarationId, CodeUnit)>,
     pub module_names: HashMap<SourceDeclarationId, String>,
     pub imports: Vec<SourceImportFact>,
@@ -51,56 +55,65 @@ impl RustHierarchySourceFacts {
         let declaration_units = self
             .declaration_units
             .iter()
-            .map(|(_, unit)| {
-                unit.fq_name().len()
-                    + unit.signature().map_or(0, str::len)
-                    + unit.source().rel_path().to_string_lossy().len()
-            })
+            .map(|(_, unit)| unit.allocated_bytes() - size_of::<CodeUnit>())
             .fold(0usize, usize::saturating_add);
         let module_names = self
             .module_names
             .values()
-            .map(|name| name.capacity())
+            .map(|name| allocation_size(name.capacity()))
             .fold(0usize, usize::saturating_add);
+        let lexical_identifiers = self
+            .lexical_identifiers
+            .iter()
+            .map(|(_, name)| allocation_size(name.capacity()))
+            .fold(0usize, usize::saturating_add);
+        let buffer =
+            |capacity: usize, element: usize| allocation_size(capacity.saturating_mul(element));
+        // The item-source aggregate is shared with refusing source admission.
+        // Keep that payload raw until both use one allocation census together.
         self.items
             .estimated_retained_bytes()
-            .saturating_add(
-                self.types
-                    .capacity()
-                    .saturating_mul(size_of::<RustTypeSourceFact>()),
-            )
+            .saturating_add(buffer(
+                self.types.capacity(),
+                size_of::<RustTypeSourceFact>(),
+            ))
             .saturating_add(
                 self.types
                     .iter()
-                    .map(RustTypeSourceFact::estimated_retained_bytes)
+                    .map(RustTypeSourceFact::allocated_retained_bytes)
                     .fold(0usize, usize::saturating_add),
             )
-            .saturating_add(
-                self.declarations
-                    .capacity()
-                    .saturating_mul(size_of::<SourceDeclaration>()),
-            )
-            .saturating_add(
-                self.declaration_units
-                    .capacity()
-                    .saturating_mul(size_of::<(SourceDeclarationId, CodeUnit)>()),
-            )
+            .saturating_add(buffer(
+                self.declarations.capacity(),
+                size_of::<SourceDeclaration>(),
+            ))
+            .saturating_add(buffer(
+                self.declaration_units.capacity(),
+                size_of::<(SourceDeclarationId, CodeUnit)>(),
+            ))
+            .saturating_add(buffer(
+                self.declaration_spans.capacity(),
+                size_of::<(usize, usize)>(),
+            ))
+            .saturating_add(buffer(
+                self.lexical_identifiers.capacity(),
+                size_of::<(SourceDeclarationId, String)>(),
+            ))
+            .saturating_add(lexical_identifiers)
             .saturating_add(declaration_units)
-            .saturating_add(
-                self.module_names
-                    .capacity()
-                    .saturating_mul(size_of::<(SourceDeclarationId, String)>()),
-            )
+            .saturating_add(brokk_bifrost_core::hash::allocated_table_slot_bytes::<(
+                SourceDeclarationId,
+                String,
+            )>(self.module_names.capacity()))
             .saturating_add(module_names)
-            .saturating_add(
-                self.imports
-                    .capacity()
-                    .saturating_mul(size_of::<SourceImportFact>()),
-            )
+            .saturating_add(buffer(
+                self.imports.capacity(),
+                size_of::<SourceImportFact>(),
+            ))
             .saturating_add(
                 self.imports
                     .iter()
-                    .map(SourceImportFact::estimated_retained_bytes)
+                    .map(SourceImportFact::allocated_retained_bytes)
                     .fold(0usize, usize::saturating_add),
             )
     }

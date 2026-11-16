@@ -521,12 +521,25 @@ rules failed closed, so production emitted neither rule.
 ## Version and extension rules
 
 Every source pack must contain a `schema_version` this build supports: `2`
-through `22`, or `26` through `32`. Versions `23`, `24`, and `25` are explicitly unsupported.
+through `22`, or `26` through `40`. Versions `23`, `24`, and `25` are explicitly unsupported.
 The field is mandatory: omitted, zero, and unsupported versions
 fail instead of falling back. Every object rejects unknown fields, and every
 variant is explicitly tagged. A schema addition takes a new version number and
 a new checked-in schema rather than silently widening a number that already
 shipped.
+
+Schema `40` adds optional `rust_stability` on Rust type, member and implemented-trait facts. A certificate records a stable release, a nonempty sorted unstable feature set, or an uncertified result. Missing evidence remains uncertified; non-Rust packs cannot carry this field. Rust dependency production uses schema `40`.
+
+Schema `35` adds optional typed `path` projections to summary receiver and
+parameter inputs and to every output kind. Omit `path` for the whole value.
+Paths require `SUMMARY_ENDPOINT_PROJECTION_MIN_SCHEMA_VERSION` (35); an engine
+older than schema 35 refuses the whole pack. Decode checks path shape and schema admission. Activation type-checks each
+path against the bound authoritative declaration. An unbound target or a failed
+check refuses that transfer with a typed diagnostic naming the pack and record;
+the rest of the pack applies. Pack repositories should test activation against
+the pinned standard-library pack in CI before release. Aggregate-to-all-fields propagation is rejected; select each intended
+field explicitly. See [endpoint paths](./reference/semantic-packs/#endpoint-paths-schema-35)
+for the JSON steps and `Result::Ok` payload examples.
 
 Schema `32` carries optional structured `alias_target` facts over each alias's
 own type parameters. Missing targets make no claim. Rust selected-type readers
@@ -538,7 +551,7 @@ event-set coverage claims; ordinary generated packs use schema `22`.
 Schema `27` carries fenced completeness claims, and `28` carries Rust artifact
 approximation provenance. Schema `29` carries public Rustdoc cross-crate
 reexports; they resolve only through the selected Cargo graph and exact
-defining artifact. Rust dependency production uses schema `29`; packs without
+defining artifact. Packs without
 these claims decode with the same declarations under their lower valid labels.
 Packs generated from pinned artifacts declare the
 lowest schema their content needs, never below `8`, so a reader that predates a
@@ -598,7 +611,7 @@ incomplete signature or body; none of those absences supplies an unknown type
 for a known port.
 
 The machine-readable contract is
-[`schemas/semantic-model-pack-v32.schema.json`](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-pack-v32.schema.json).
+[`schemas/semantic-model-pack-v40.schema.json`](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-pack-v40.schema.json).
 It is generated from `AuthoredSemanticModelPack`; a repository test requires
 the checked-in bytes to match the Rust-derived schema exactly.
 The version-two through version-eight schemas stay checked in as frozen
@@ -954,6 +967,16 @@ toolchain. The selected standard
 library, module-cache, local replacement, workspace, and vendor files become
 exact source-set inputs; normalized relative paths and retained bytes determine
 their identity, not absolute cache locations or mtimes.
+
+When no `go` executable runs, or it does not report the standard library,
+Bifrost reads the `go` line of every module's `go.mod` instead. Go 1.21 and
+later refuse to build a module whose `go` line is newer than the toolchain, so
+the lowest line is a floor for every toolchain that can build the workspace.
+A Go standard-library pack activates from that floor only when each of its
+toolchain requirements admits every Go 1 release at or above it. Such a pack
+is approximate: the report says the toolchain was not observed, and a policy
+run adds an advisory. A module with no `go` line, or a `go.mod` that could not
+be read in full, gives no floor.
 
 Generated Go packs contain exported packages, types, aliases, functions,
 variables, constants, methods, fields, structured signatures, type parameters

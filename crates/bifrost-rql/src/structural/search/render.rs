@@ -1,3 +1,5 @@
+use brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelNamespace;
+
 use super::dispatch::{DispatchCompleteness, DispatchProof};
 use super::results::CodeQueryConfigurationFact;
 use super::results::CodeQueryCrossDomain;
@@ -46,6 +48,7 @@ pub(super) fn insert_pipeline_row(
                 rows,
                 indexes,
                 PipelineRow {
+                    call_path_evidence: None,
                     value: PipelineValue::DispatchTarget(target),
                     traces: vec![trace],
                     provenance_truncated,
@@ -59,6 +62,7 @@ pub(super) fn insert_pipeline_row(
         rows,
         indexes,
         PipelineRow {
+            call_path_evidence: None,
             value,
             traces,
             provenance_truncated,
@@ -78,29 +82,13 @@ pub(super) fn merge_pipeline_row(
     if let Some(&index) = indexes.get(&key) {
         let row = &mut rows[index];
         row.value.merge_evidence(incoming.value);
-        if incoming
-            .traces
-            .first()
-            .is_some_and(|trace| trace.window_order.is_some())
-        {
-            row.traces.extend(incoming.traces);
-            row.traces.sort_by_key(|trace| {
-                trace
-                    .window_order
-                    .expect("windowed provenance carries its input order")
-            });
-            row.provenance_truncated |=
-                incoming.provenance_truncated || row.traces.len() > MAX_PROVENANCE_TRACES;
-            row.traces.truncate(MAX_PROVENANCE_TRACES);
-            return;
+        if let Some(evidence) = incoming.call_path_evidence.take() {
+            match &mut row.call_path_evidence {
+                Some(existing) => existing.merge(evidence),
+                slot @ None => *slot = Some(evidence),
+            }
         }
-        let remaining = MAX_PROVENANCE_TRACES.saturating_sub(row.traces.len());
-        if incoming.traces.len() > remaining {
-            row.provenance_truncated = true;
-        }
-        row.traces
-            .extend(incoming.traces.into_iter().take(remaining));
-        row.provenance_truncated |= incoming.provenance_truncated;
+        merge_pipeline_provenance(row, incoming.traces, incoming.provenance_truncated);
         return;
     }
 
@@ -108,6 +96,35 @@ pub(super) fn merge_pipeline_row(
     incoming.traces.truncate(MAX_PROVENANCE_TRACES);
     indexes.insert(key, rows.len());
     rows.push(incoming);
+}
+
+/// Combine bounded contributing provenance without changing either row's value.
+pub(super) fn merge_pipeline_provenance(
+    row: &mut PipelineRow,
+    traces: Vec<PipelineTrace>,
+    provenance_truncated: bool,
+) {
+    if traces
+        .first()
+        .is_some_and(|trace| trace.window_order.is_some())
+    {
+        row.traces.extend(traces);
+        row.traces.sort_by_key(|trace| {
+            trace
+                .window_order
+                .expect("windowed provenance carries its input order")
+        });
+        row.provenance_truncated |=
+            provenance_truncated || row.traces.len() > MAX_PROVENANCE_TRACES;
+        row.traces.truncate(MAX_PROVENANCE_TRACES);
+        return;
+    }
+    let remaining = MAX_PROVENANCE_TRACES.saturating_sub(row.traces.len());
+    if traces.len() > remaining {
+        row.provenance_truncated = true;
+    }
+    row.traces.extend(traces.into_iter().take(remaining));
+    row.provenance_truncated |= provenance_truncated;
 }
 
 pub(super) fn render_pipeline_item(
@@ -409,7 +426,21 @@ pub(super) fn render_provenance(
             .iter()
             .map(|step| CodeQueryProvenanceStep {
                 op: step.op.label(),
-                result: render_trace_value_ref(analyzer, &step.value, detail, cache),
+                result: {
+                    let mut result = render_trace_value_ref(analyzer, &step.value, detail, cache);
+                    if let CodeQueryResultRef::Procedure { source_owner, .. } = &mut result
+                        && let PipelineTraceValue::Semantic(value) = &step.value
+                    {
+                        *source_owner = procedure_source_owner(
+                            analyzer,
+                            &trace.seed,
+                            value.file(),
+                            value.detailed_projection().byte_span,
+                            cache,
+                        );
+                    }
+                    result
+                },
                 via: step.via.as_ref().map(|via| match via {
                     PipelineVia::ReferenceSite(site) => {
                         render_reference_site_ref(analyzer, site, detail, cache)
@@ -2489,28 +2520,32 @@ fn exact_semantic_model_declaration(
     String,
     Box<crate::analyzer::semantic_model::SemanticModelProvenance>,
 )> {
-    analyzer.semantic_model_overlay().and_then(|overlay| {
-        let matched = overlay.symbols_named_in_family(
-            fq_name,
-            brokk_bifrost_core::analyzer::model::LanguageDialect::Standard(
-                declaration.unit.source().language(),
-            )
-            .semantic_pack_label(),
-        );
-        if matched.disposition
-            != crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
-        {
-            return None;
-        }
-        let symbol = matched.records[0].clone();
-        let exact_origin = declaration.unit.is_synthetic()
-            || matches!(
-                &symbol.location,
-                crate::analyzer::semantic_model::SemanticModelLocation::Authored(anchor)
-                    if anchor.path == path && anchor.symbol == fq_name
+    analyzer
+        .semantic_model_overlay_read()
+        .published()
+        .and_then(|overlay| {
+            let matched = overlay.symbols_named_in_family(
+                fq_name,
+                brokk_bifrost_core::analyzer::model::LanguageDialect::Standard(
+                    declaration.unit.source().language(),
+                )
+                .semantic_pack_label(),
+                SemanticModelNamespace::Unknown,
             );
-        exact_origin.then(|| (symbol.id.clone(), Box::new(symbol.provenance.clone())))
-    })
+            if matched.disposition
+                != crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
+            {
+                return None;
+            }
+            let symbol = matched.records[0].clone();
+            let exact_origin = declaration.unit.is_synthetic()
+                || matches!(
+                    &symbol.location,
+                    crate::analyzer::semantic_model::SemanticModelLocation::Authored(anchor)
+                        if anchor.path == path && anchor.symbol == fq_name
+                );
+            exact_origin.then(|| (symbol.id.clone(), Box::new(symbol.provenance.clone())))
+        })
 }
 
 pub(super) fn augment_public_result_with_semantic_overlay(
@@ -2537,7 +2572,7 @@ pub(super) fn augment_public_result_with_semantic_overlay(
         | [QueryStep::EnclosingDecl, step @ QueryStep::Subtypes(_)] => Some(step),
         _ => return,
     };
-    let Some(overlay) = analyzer.semantic_model_overlay() else {
+    let Some(overlay) = analyzer.semantic_model_overlay_read().published() else {
         return;
     };
 
@@ -2576,7 +2611,9 @@ pub(super) fn augment_public_result_with_semantic_overlay(
     let candidates = match seed.root.name.as_ref() {
         Some(crate::query::StringPredicate::Exact(name)) => {
             let matched = match family_language {
-                Some(language) => overlay.symbols_named_in_family(name, language),
+                Some(language) => {
+                    overlay.symbols_named_in_family(name, language, SemanticModelNamespace::Unknown)
+                }
                 None => overlay.symbols_named(name),
             };
             if is_open(&matched.disposition) {
@@ -2748,6 +2785,10 @@ pub(super) fn augment_public_result_with_semantic_overlay(
         result
             .diagnostics
             .push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            has_non_utf8_refusal: false,
+            refusal_sites: Default::default(),
+            call_relation_facts: None,
+            uses_omissions: Vec::new(),
             incompleteness: brokk_bifrost_rql::Incompleteness::Content,
             related: Vec::new(),
             source: None,
@@ -2768,6 +2809,10 @@ pub(super) fn augment_public_result_with_semantic_overlay(
         result
             .diagnostics
             .push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                 incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                 related: Vec::new(),
                 source: None,
@@ -2794,6 +2839,10 @@ pub(super) fn augment_public_result_with_semantic_overlay(
             result
                 .diagnostics
                 .push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                    has_non_utf8_refusal: false,
+                    refusal_sites: Default::default(),
+                    call_relation_facts: None,
+                    uses_omissions: Vec::new(),
                     incompleteness: Incompleteness::Operational(
                         DerivationExecutionCause::Cancelled,
                     ),
@@ -2812,6 +2861,10 @@ pub(super) fn augment_public_result_with_semantic_overlay(
         result
             .diagnostics
             .push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                 incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                 related: Vec::new(),
                 source: None,
@@ -2896,7 +2949,11 @@ fn model_hierarchy_symbols(
             };
             let mut matched = overlay.symbols_with_id_in_family(endpoint, &root.language);
             if matched.records.is_empty() && !is_open(&matched) {
-                matched = overlay.symbols_named_in_family(endpoint, &root.language);
+                matched = overlay.symbols_named_in_family(
+                    endpoint,
+                    &root.language,
+                    SemanticModelNamespace::Unknown,
+                );
             }
             if is_open(&matched) {
                 open = true;
@@ -4117,6 +4174,8 @@ pub(super) fn render_assignment_relation(
         proof: value.proof,
         coverage: value.coverage.label(),
         reason: value.reason,
+        reason_codes: value.reason_codes.clone(),
+        open_reasons: value.open_reasons.clone(),
         replacement_events: value
             .replacement_events
             .iter()
@@ -4862,28 +4921,266 @@ fn already_reported(diagnostics: &[CodeQueryDiagnostic], code: CodeQueryDiagnost
 pub(super) fn push_budget_diagnostic(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     budget: &CodeQueryExecutionBudget,
+    limits: CodeQueryExecutionLimits,
+    consumed: Option<&CodeQueryExecutionBudget>,
+    stage: &'static str,
 ) {
+    let mut diagnostic = execution_budget_diagnostic(budget);
+    for (index, (lane, attempted, limit)) in [
+        (
+            "query/scanned_files",
+            budget
+                .scanned_files
+                .saturating_add(budget.call_scanned_files)
+                .max(budget.import_files_resolved),
+            limits.max_scanned_files,
+        ),
+        (
+            "query/scanned_source_bytes",
+            budget
+                .scanned_source_bytes
+                .saturating_add(budget.call_scanned_source_bytes),
+            limits.max_scanned_source_bytes,
+        ),
+        (
+            "query/fact_nodes",
+            budget.fact_nodes.saturating_add(budget.examined_references),
+            limits.max_fact_nodes,
+        ),
+        (
+            "query/pipeline_rows",
+            budget
+                .pipeline_rows
+                .max(budget.provenance_steps)
+                .max(budget.import_edges_resolved),
+            limits.max_pipeline_rows,
+        ),
+        (
+            "query/retained_evidence_bytes",
+            budget.retained_evidence_bytes,
+            limits.semantic.max_retained_bytes.min(8 * 1024 * 1024),
+        ),
+        (
+            "query/call_answers",
+            budget
+                .call_declarations
+                .saturating_add(budget.call_sites)
+                .saturating_add(budget.call_terminals),
+            limits.max_call_answers,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (used, attempted, limit, refused) = match budget.refused_lane {
+            Some((refused_lane, used, requested, cap)) => {
+                (Some(used), requested, cap, index == refused_lane)
+            }
+            None => (
+                consumed.map(|before| before.fair_lanes()[index]),
+                attempted,
+                limit,
+                attempted > limit,
+            ),
+        };
+        if refused {
+            diagnostic.exhausted_roots.push(CodeQueryExhaustedRoot {
+                path: ".".to_string(),
+                procedure: None,
+                lane: lane.to_string(),
+                stage: Some(stage.to_string()),
+                budget: used.map(|consumed| CodeQueryExhaustedBudget { consumed, limit }),
+                charge: (attempted > limit)
+                    .then_some(CodeQueryExhaustedCharge { attempted, limit }),
+                feedback_iteration: None,
+            });
+        }
+    }
+    merge_budget_diagnostic(diagnostics, diagnostic);
+}
+
+fn execution_budget_diagnostic(budget: &CodeQueryExecutionBudget) -> CodeQueryDiagnostic {
+    // The execution-state diagnostic this pushes carries the dependence into
+    // the query's reuse verdict.
     brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
     note_budget_work(CodeQueryDiagnosticCode::ExecutionBudgetExhausted, budget);
-    if already_reported(
-        diagnostics,
-        CodeQueryDiagnosticCode::ExecutionBudgetExhausted,
-    ) {
-        return;
-    }
-    diagnostics.push(incomplete_diagnostic(
+    incomplete_diagnostic(
         CodeQueryDiagnosticCode::ExecutionBudgetExhausted,
         brokk_bifrost_rql::Incompleteness::Content,
         "workspace",
         "query_code execution budget exhausted before the query finished; refine the query with where, languages, kind/name anchors, or a narrower pattern".to_string(),
         Vec::new(),
-    ));
+    )
+}
+
+pub(super) fn push_matcher_budget_diagnostic(
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    budget: &CodeQueryExecutionBudget,
+    incomplete: &super::super::matcher::CallableSignatureIncomplete,
+) {
+    let mut diagnostic = execution_budget_diagnostic(budget);
+    if let Some((consumed, limit)) = incomplete.fact_budget_refusal.get() {
+        diagnostic.exhausted_roots.push(CodeQueryExhaustedRoot {
+            path: ".".to_string(),
+            procedure: None,
+            lane: "query/fact_nodes".to_string(),
+            stage: Some("structural_verification".to_string()),
+            budget: Some(CodeQueryExhaustedBudget {
+                consumed: usize::try_from(consumed).unwrap_or(usize::MAX),
+                limit: usize::try_from(limit).unwrap_or(usize::MAX),
+            }),
+            charge: None,
+            feedback_iteration: None,
+        });
+    }
+    if let Some((consumed, attempted, limit)) = incomplete.capture_budget_refusal.get() {
+        diagnostic.exhausted_roots.push(CodeQueryExhaustedRoot {
+            path: ".".to_string(),
+            procedure: None,
+            lane: "query/capture_bytes_per_row".to_string(),
+            stage: Some("structural_capture".to_string()),
+            budget: Some(CodeQueryExhaustedBudget { consumed, limit }),
+            charge: Some(CodeQueryExhaustedCharge { attempted, limit }),
+            feedback_iteration: None,
+        });
+    }
+    merge_budget_diagnostic(diagnostics, diagnostic);
+}
+
+/// A shared work wall occupies one diagnostic slot, including when a unit
+/// already reported a refused charge before later units could not start.
+/// Keep one admission witness per fixed query lane so repeated refused files
+/// cannot grow the diagnostic or its duplicate checks with workspace size.
+pub(super) fn merge_budget_diagnostic(
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    mut diagnostic: CodeQueryDiagnostic,
+) {
+    let roots = std::mem::take(&mut diagnostic.exhausted_roots);
+    let index = diagnostics
+        .iter()
+        .position(|current| current.branch.is_empty() && current.code == diagnostic.code)
+        .unwrap_or_else(|| {
+            diagnostics.push(diagnostic);
+            diagnostics.len() - 1
+        });
+    extend_budget_lane_witnesses(&mut diagnostics[index].exhausted_roots, roots);
+}
+
+pub(super) fn extend_budget_lane_witnesses(
+    existing: &mut Vec<CodeQueryExhaustedRoot>,
+    roots: impl IntoIterator<Item = CodeQueryExhaustedRoot>,
+) {
+    for root in roots {
+        if !existing.iter().any(|known| known.lane == root.lane) {
+            existing.push(root);
+        }
+    }
+}
+
+/// Preserve admission refusals independently of admitted call-relation work.
+pub(super) fn push_call_relation_budget_diagnostics(
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    budget: &CodeQueryExecutionBudget,
+    limits: CodeQueryExecutionLimits,
+    relation_start: &CodeQueryExecutionBudget,
+    refusals: &[CallRelationBudgetRefusal],
+) {
+    if refusals.is_empty() {
+        push_budget_diagnostic(diagnostics, budget, limits, Some(budget), "call_relation");
+        return;
+    }
+    for refusal in refusals {
+        let mut refused = *budget;
+        let (lane, consumed, attempted, local_limit) = match *refusal {
+            CallRelationBudgetRefusal::Files { consumed, limit } => (0, consumed, consumed, limit),
+            CallRelationBudgetRefusal::SourceBytes {
+                consumed,
+                attempted,
+                limit,
+            } => (1, consumed, attempted, limit),
+            CallRelationBudgetRefusal::Candidates { consumed, limit } => {
+                (2, consumed, consumed, limit)
+            }
+        };
+        let (prior, query_limit) = [
+            (
+                relation_start
+                    .scanned_files
+                    .saturating_add(relation_start.call_scanned_files),
+                limits.max_scanned_files,
+            ),
+            (
+                relation_start
+                    .scanned_source_bytes
+                    .saturating_add(relation_start.call_scanned_source_bytes),
+                limits.max_scanned_source_bytes,
+            ),
+            (
+                relation_start
+                    .fact_nodes
+                    .saturating_add(relation_start.examined_references),
+                limits.max_fact_nodes,
+            ),
+        ][lane];
+        // The relation receives remaining allowances. Translate its local
+        // witness back to query counters, retaining a stricter provider cap
+        // when one was applied. The start precedes all admitted relation work.
+        refused.refused_lane = Some((
+            lane,
+            prior.saturating_add(consumed),
+            prior.saturating_add(attempted),
+            prior.saturating_add(local_limit).min(query_limit),
+        ));
+        push_budget_diagnostic(diagnostics, &refused, limits, Some(budget), "call_relation");
+    }
+}
+
+/// A known refusal to start more work when this lane has no allowance left.
+/// Unlike a rejected projected charge, this records no invented attempt.
+pub(super) fn push_spent_budget_diagnostic(
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    budget: &CodeQueryExecutionBudget,
+    limits: CodeQueryExecutionLimits,
+    lane: usize,
+) {
+    let used = match lane {
+        0 => budget
+            .scanned_files
+            .saturating_add(budget.call_scanned_files),
+        1 => budget
+            .scanned_source_bytes
+            .saturating_add(budget.call_scanned_source_bytes),
+        _ => budget.fair_lanes()[lane],
+    };
+    let limit = [
+        limits.max_scanned_files,
+        limits.max_scanned_source_bytes,
+        limits.max_fact_nodes,
+        limits.max_pipeline_rows,
+        limits.semantic.max_retained_bytes.min(8 * 1024 * 1024),
+        limits.max_call_answers,
+    ][lane];
+    assert!(
+        used >= limit,
+        "only a spent allowance can refuse the next work item"
+    );
+    let mut refused = *budget;
+    refused.refused_lane = Some((lane, used, used, limit));
+    push_budget_diagnostic(
+        diagnostics,
+        &refused,
+        limits,
+        Some(budget),
+        "query_admission",
+    );
 }
 
 pub(super) fn push_pipeline_budget_diagnostic(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     budget: &CodeQueryExecutionBudget,
 ) {
+    // The execution-state diagnostic this pushes carries the dependence into
+    // the query's reuse verdict.
     brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
     note_budget_work(CodeQueryDiagnosticCode::PipelineBudgetExhausted, budget);
     if already_reported(
@@ -4892,20 +5189,34 @@ pub(super) fn push_pipeline_budget_diagnostic(
     ) {
         return;
     }
-    diagnostics.push(incomplete_diagnostic(
+    let mut diagnostic = incomplete_diagnostic(
         CodeQueryDiagnosticCode::PipelineBudgetExhausted,
         brokk_bifrost_rql::Incompleteness::Content,
         "workspace",
         "query_code pipeline budget exhausted while producing seed and edge rows; refine the match, where, or languages filters".to_string(),
         Vec::new(),
-    ));
+    );
+    diagnostic.exhausted_roots.push(CodeQueryExhaustedRoot {
+        path: ".".to_string(),
+        procedure: None,
+        lane: "query/pipeline_rows".to_string(),
+        stage: None,
+        budget: None,
+        charge: None,
+        feedback_iteration: None,
+    });
+    diagnostics.push(diagnostic);
 }
 
 pub(super) fn push_import_graph_budget_diagnostic(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     resolved_files: usize,
     resolved_edges: usize,
+    refused_files: Option<(usize, usize)>,
+    refused_edges: Option<(usize, usize)>,
 ) {
+    // The execution-state diagnostic this pushes carries the dependence into
+    // the query's reuse verdict.
     brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
     crate::profiling::note_with(|| {
         format!(
@@ -4915,19 +5226,30 @@ pub(super) fn push_import_graph_budget_diagnostic(
             resolved_edges
         )
     });
-    if already_reported(
-        diagnostics,
-        CodeQueryDiagnosticCode::ImportGraphBudgetExhausted,
-    ) {
-        return;
-    }
-    diagnostics.push(incomplete_diagnostic(
+    let mut diagnostic = incomplete_diagnostic(
         CodeQueryDiagnosticCode::ImportGraphBudgetExhausted,
         brokk_bifrost_rql::Incompleteness::Content,
         "workspace",
-        "query_code import graph budget exhausted while resolving files and direct edges; import traversal results are partial".to_string(),
-        Vec::new(),
-    ));
+        "query_code import graph budget exhausted while resolving files and direct edges; import traversal results are partial".to_string(), Vec::new(),
+    );
+    for (lane, refused) in [
+        ("query/scanned_files", refused_files),
+        ("query/pipeline_rows", refused_edges),
+    ] {
+        if let Some((attempted, limit)) = refused {
+            diagnostic.exhausted_roots.push(CodeQueryExhaustedRoot {
+                path: ".".to_string(),
+                procedure: None,
+                lane: lane.to_string(),
+                stage: Some("import_graph".to_string()),
+                budget: None,
+                charge: (attempted > limit)
+                    .then_some(CodeQueryExhaustedCharge { attempted, limit }),
+                feedback_iteration: None,
+            });
+        }
+    }
+    merge_budget_diagnostic(diagnostics, diagnostic);
 }
 
 pub(super) fn push_truncation_diagnostic(
@@ -4938,7 +5260,7 @@ pub(super) fn push_truncation_diagnostic(
     note_budget_work(CodeQueryDiagnosticCode::ResultLimitReached, budget);
     diagnostics.push(incomplete_diagnostic(
         CodeQueryDiagnosticCode::ResultLimitReached,
-        brokk_bifrost_rql::Incompleteness::Content,
+        brokk_bifrost_rql::Incompleteness::ConfiguredCap,
         "workspace",
         format!(
             "query_code reached the query limit of {limit} and returned the first {limit} results; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern"
@@ -4956,7 +5278,11 @@ pub(super) fn should_report_broad_query(
     !plan.has_source_anchors()
         && query.where_globs.is_empty()
         && query.languages.is_empty()
-        && (truncated || budget.scanned_files >= BROAD_QUERY_SCANNED_FILE_HINT_THRESHOLD)
+        && (truncated
+            || budget
+                .scanned_files
+                .saturating_add(budget.call_scanned_files)
+                >= BROAD_QUERY_SCANNED_FILE_HINT_THRESHOLD)
 }
 
 pub(super) fn push_broad_query_diagnostic(
@@ -4965,6 +5291,10 @@ pub(super) fn push_broad_query_diagnostic(
 ) {
     note_budget_work(CodeQueryDiagnosticCode::BroadQuery, budget);
     diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
         incompleteness: brokk_bifrost_rql::Incompleteness::Content,
         related: Vec::new(),
         source: None,
@@ -5169,7 +5499,7 @@ pub(super) fn render_match(
         decorator_ranges,
         captures,
         enclosing_symbol: cache
-            .enclosing_unit_for_lines(analyzer, file, range.start_line, range.end_line)
+            .enclosing_unit_for_bytes(analyzer, file, span.start_byte, span.end_byte)
             .map(|code_unit| code_unit.fq_name()),
         python_import: None,
         heuristic: fact_match.heuristic,

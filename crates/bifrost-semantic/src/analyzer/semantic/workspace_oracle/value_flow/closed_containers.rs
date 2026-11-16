@@ -26,7 +26,8 @@ use crate::analyzer::semantic::ir::CallContinuationKind;
 use crate::analyzer::semantic::{CollectionCellBinding, CollectionCellTransfer};
 use crate::analyzer::semantic_model::CollectionFlowContract;
 use crate::analyzer::semantic_model::csmi::{
-    CsmiInputBoundaryRoot, CsmiOutputBoundaryRoot, CsmiProjection,
+    CsmiCollectionFlowTransfer, CsmiInputBoundaryRoot, CsmiOutputBoundaryRoot, CsmiProjection,
+    CsmiProjectionStep,
 };
 
 /// Bind every closed local container of `procedure` whose calls all carry a
@@ -87,7 +88,7 @@ pub(super) fn closed_container_cells(
         let Some(class) = host.constructed_class(&constructor, request)? else {
             continue;
         };
-        let mut calls = Vec::new();
+        let mut contracts = Vec::with_capacity(receiver_calls.len());
         for call in receiver_calls {
             let handle = procedure
                 .call_site_handle(call.id)
@@ -95,6 +96,20 @@ pub(super) fn closed_container_cells(
             let Some(contract) = host.collection_flow_contract(&handle, &class, request)? else {
                 continue 'allocations;
             };
+            contracts.push((call, handle, contract));
+        }
+        // The cells hold entry values only. An entry's key is observable
+        // only through a contract that reads `entry-key` (a key view, an
+        // entry iteration), so writes to it may be dropped exactly when no
+        // call on this container reads one.
+        if contracts
+            .iter()
+            .any(|(_, _, contract)| reads_entry_keys(contract))
+        {
+            continue;
+        }
+        let mut calls = Vec::with_capacity(contracts.len());
+        for (call, handle, contract) in contracts {
             let Some(transfers) =
                 bind_keyed_transfers(procedure, call, allocation.id, &contract, knowledge, limits)?
             else {
@@ -136,7 +151,11 @@ fn alias_flow(effect: &SemanticEffect) -> Option<(ValueId, ValueId)> {
     match effect {
         SemanticEffect::Assignment { target, value } => Some((*value, *target)),
         SemanticEffect::ValueFlow {
-            kind: ValueFlowKind::Local | ValueFlowKind::LanguageDefined,
+            kind:
+                ValueFlowKind::Local
+                | ValueFlowKind::AddressOf
+                | ValueFlowKind::MemoryLoad { .. }
+                | ValueFlowKind::LanguageDefined,
             source,
             target,
         } => Some((*source, *target)),
@@ -303,6 +322,10 @@ fn bind_keyed_transfers(
     };
     let mut transfers = Vec::new();
     for transfer in &contract.payload.transfers {
+        if writes_entry_key(transfer) {
+            // The container proof checked that no call reads entry keys.
+            continue;
+        }
         let (source, target) = match (
             &transfer.source.root,
             transfer.source.projection.as_ref(),
@@ -363,6 +386,40 @@ fn bind_keyed_transfers(
     Ok(Some(transfers))
 }
 
+/// Whether any transfer of `contract` reads an entry's key.
+fn reads_entry_keys(contract: &CollectionFlowContract) -> bool {
+    contract.payload.transfers.iter().any(|transfer| {
+        transfer
+            .source
+            .projection
+            .as_ref()
+            .is_some_and(|projection| projection.steps.iter().any(|step| step.kind == "entry-key"))
+    })
+}
+
+/// Whether `transfer` is `parameter n -> receiver.entry{key: parameter n}.entry-key`:
+/// the key argument written as its own entry's key.
+fn writes_entry_key(transfer: &CsmiCollectionFlowTransfer) -> bool {
+    let (CsmiInputBoundaryRoot::Parameter(parameter), None, CsmiOutputBoundaryRoot::Receiver(_)) = (
+        &transfer.source.root,
+        transfer.source.projection.as_ref(),
+        &transfer.destination.root,
+    ) else {
+        return false;
+    };
+    let Some([entry, component]) = transfer
+        .destination
+        .projection
+        .as_ref()
+        .map(|projection| projection.steps.as_slice())
+    else {
+        return false;
+    };
+    entry.kind == "entry"
+        && component.kind == "entry-key"
+        && parameter_key_position(entry) == Some(parameter.position)
+}
+
 /// The parameter position of `entry{key: parameter n} . entry-value`.
 fn entry_value_key(projection: &CsmiProjection) -> Option<u32> {
     let [entry, component] = projection.steps.as_slice() else {
@@ -371,6 +428,11 @@ fn entry_value_key(projection: &CsmiProjection) -> Option<u32> {
     if entry.kind != "entry" || component.kind != "entry-value" {
         return None;
     }
+    parameter_key_position(entry)
+}
+
+/// The parameter position `n` of an `entry{key: parameter n}` step.
+fn parameter_key_position(entry: &CsmiProjectionStep) -> Option<u32> {
     let key = entry.key_selector()?;
     if key.get("kind")?.as_str()? != "parameter" {
         return None;

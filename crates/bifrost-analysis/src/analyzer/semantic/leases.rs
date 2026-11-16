@@ -107,6 +107,7 @@ pub(crate) mod tests {
                 SemanticCapabilities::default(),
                 Vec::new(),
                 &mut cold,
+                &brokk_bifrost_core::cancellation::CancellationToken::default(),
             );
             let mut warm = SemanticBudget::uniform(limit).unwrap();
             let hit = warm.charge_complete_artifact(&artifact);
@@ -158,6 +159,23 @@ pub(crate) mod tests {
             .try_apply_charge(charge, 0)
             .expect("both exact allocations apply");
         assert_eq!(leases.len(), 2);
+        let retained = leases.retained_file(file.root(), file.rel_path()).unwrap();
+        assert_eq!(retained, &file);
+        assert_eq!(
+            retained.rel_path().as_os_str().as_encoded_bytes().as_ptr(),
+            file.rel_path().as_os_str().as_encoded_bytes().as_ptr(),
+            "file lookup borrows the retained handle's existing path allocation"
+        );
+        assert!(
+            leases
+                .retained_file(&file.root().join("other"), file.rel_path())
+                .is_none()
+        );
+        assert!(
+            leases
+                .retained_file(file.root(), std::path::Path::new("src/missing.ts"))
+                .is_none()
+        );
         let snapshot = leases.snapshot();
         assert!(snapshot.contains_exact(&first));
         assert!(snapshot.contains_exact(&second));

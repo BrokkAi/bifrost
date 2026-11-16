@@ -164,12 +164,51 @@ impl RustAnalyzer {
         &self,
         trait_member: &CodeUnit,
     ) -> Result<Option<Vec<CodeUnit>>, RustCargoRouteError> {
+        use brokk_bifrost_analysis::analyzer::{IAnalyzer, QueryReadIncomplete};
         let scope = AnalyzerQueryScope::new(self);
-        Ok(rust_trait_member_implementations(
-            self,
-            scope.token(),
-            trait_member,
-        )?)
+        // Every name an impl header can write the trait as. If the alias
+        // closure cannot be enumerated, the trait's own name still nominates
+        // what it can, and the answer says it is incomplete.
+        let trait_spellings = |owner: &CodeUnit| -> Vec<String> {
+            match super::trait_applicability::workspace_trait_spellings(
+                self,
+                self,
+                owner.identifier(),
+            ) {
+                Some(spellings) => {
+                    let mut spellings = spellings.into_iter().collect::<Vec<_>>();
+                    spellings.sort_unstable();
+                    spellings
+                }
+                None => {
+                    self.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceGap(
+                        format!(
+                            "trait spellings of {} could not be enumerated",
+                            owner.fq_name()
+                        )
+                        .into(),
+                    ));
+                    vec![owner.identifier().to_owned()]
+                }
+            }
+        };
+        let result =
+            rust_trait_member_implementations(self, scope.token(), trait_member, &trait_spellings)?;
+        Ok(result.map(|result| {
+            for gap in result.gaps {
+                self.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceGap(
+                    format!(
+                        "{}: {}:{}..{}",
+                        brokk_bifrost_rust::graph_support::IMPL_MEMBER_WITHOUT_DECLARATION_IDENTITY,
+                        brokk_bifrost_core::path_utils::rel_path_string(&gap.file),
+                        gap.start_byte,
+                        gap.end_byte
+                    )
+                    .into(),
+                ));
+            }
+            result.implementations
+        }))
     }
 
     /// Reached from `bifrost-lsp`; see

@@ -415,6 +415,18 @@ pub mod tests {
         let changed_procedure = changed_capabilities
             .procedure_handle(ProcedureId::new(0))
             .expect("changed-capability target procedure");
+        let original = first_artifact
+            .procedure_handle(ProcedureId::new(0))
+            .expect("original owner");
+        assert_eq!(original.durable_key(), changed_procedure.durable_key());
+        assert_ne!(
+            original.exact_identity(),
+            changed_procedure.exact_identity()
+        );
+        assert_eq!(
+            locator.validate_owner(&changed_procedure),
+            Err(ProcedureLocalLocatorError::ArtifactMaterializationMismatch)
+        );
         assert!(
             changed_procedure
                 .control_edge_handle(locator.id())
@@ -893,6 +905,7 @@ pub mod tests {
             ),
             kind: SemanticGapKind::Unknown,
             budget: None,
+            dispatch: Default::default(),
             discharge: SemanticGapDischarge::None,
             detail: "unrelated capture uncertainty".into(),
             source: SourceMappingId::new(0),
@@ -946,6 +959,7 @@ pub mod tests {
                 impacts: SemanticGapImpacts::for_gap(capability, SemanticGapSubject::Point),
                 kind: SemanticGapKind::Unknown,
                 budget: None,
+                dispatch: Default::default(),
                 discharge: SemanticGapDischarge::None,
                 detail: "implicit runtime behavior is not lowered".into(),
                 source,
@@ -1121,6 +1135,7 @@ pub mod tests {
             ),
             kind: SemanticGapKind::Unknown,
             budget: None,
+            dispatch: Default::default(),
             discharge: SemanticGapDischarge::None,
             detail: "capture mode is allegedly unknown".into(),
             source,
@@ -1162,6 +1177,7 @@ pub mod tests {
                 ),
                 kind,
                 budget: None,
+                dispatch: Default::default(),
                 discharge: SemanticGapDischarge::RetainedControlTopology,
                 detail: "fixture retained topology".into(),
                 source: SourceMappingId::new(0),
@@ -1200,6 +1216,7 @@ pub mod tests {
             ),
             kind: SemanticGapKind::Unsupported,
             budget: None,
+            dispatch: Default::default(),
             discharge: SemanticGapDischarge::RetainedControlTopology,
             detail: "spawned child execution remains open".into(),
             source: SourceMappingId::new(0),
@@ -1306,6 +1323,7 @@ pub mod tests {
                 ),
                 kind: SemanticGapKind::Unsupported,
                 budget: None,
+                dispatch: Default::default(),
                 discharge: SemanticGapDischarge::CanonicalIndexIdentity,
                 detail: "fixture canonical index identity".into(),
                 source,
@@ -1418,6 +1436,7 @@ pub mod tests {
                 ),
                 kind: gap_kind,
                 budget,
+                dispatch: Default::default(),
                 discharge: SemanticGapDischarge::None,
                 detail: "nested body target is unavailable".into(),
                 source,
@@ -1491,6 +1510,7 @@ pub mod tests {
             ),
             kind: SemanticGapKind::ExceededBudget,
             budget: Some(exceeded),
+            dispatch: Default::default(),
             discharge: SemanticGapDischarge::None,
             detail: "nested body was recognized but not materialized".into(),
             source: SourceMappingId::new(0),
@@ -1578,9 +1598,14 @@ pub mod tests {
         let mut budget = SemanticBudget::uniform(1).unwrap();
         let before = budget.used();
 
-        let error =
-            SemanticArtifact::try_new_with_budget(key, capabilities(&[]), vec![parts], &mut budget)
-                .expect_err("three points exceed a one-point artifact budget");
+        let error = SemanticArtifact::try_new_with_budget(
+            key,
+            capabilities(&[]),
+            vec![parts],
+            &mut budget,
+            &brokk_bifrost_core::cancellation::CancellationToken::default(),
+        )
+        .expect_err("three points exceed a one-point artifact budget");
 
         let exceeded = error.budget_exceeded().unwrap();
         assert_eq!(
@@ -1678,6 +1703,7 @@ pub mod tests {
                 impacts: SemanticGapImpacts::for_gap(capability, subject),
                 kind,
                 budget: None,
+                dispatch: Default::default(),
                 discharge: SemanticGapDischarge::ExitOnlyProcedureCompletion,
                 detail: "fixture exit-only procedure completion".into(),
                 source: SourceMappingId::new(0),
@@ -2102,6 +2128,7 @@ pub mod tests {
             ),
             kind: SemanticGapKind::Unknown,
             budget: None,
+            dispatch: Default::default(),
             discharge: SemanticGapDischarge::None,
             detail: "normal continuation is allegedly unknown".into(),
             source,
@@ -2136,6 +2163,7 @@ pub mod tests {
             ),
             kind: SemanticGapKind::Unknown,
             budget: None,
+            dispatch: Default::default(),
             discharge: SemanticGapDischarge::None,
             detail: "declared targets are allegedly unknown".into(),
             source,
@@ -2337,6 +2365,7 @@ pub mod tests {
             ),
             kind: SemanticGapKind::Unsupported,
             budget: None,
+            dispatch: Default::default(),
             discharge: SemanticGapDischarge::None,
             detail: "adapter does not model exceptional call continuation".into(),
             source,
@@ -2746,6 +2775,7 @@ pub mod tests {
             ),
             kind: SemanticGapKind::Unsupported,
             budget: None,
+            dispatch: Default::default(),
             discharge: SemanticGapDischarge::None,
             detail: "calls are unsupported here".into(),
             source: SourceMappingId::new(0),
@@ -2823,6 +2853,7 @@ pub mod tests {
             ),
             kind: SemanticGapKind::Unsupported,
             budget: None,
+            dispatch: Default::default(),
             discharge: SemanticGapDischarge::CanonicalIndexIdentity,
             detail: "fixture dynamic index identity".into(),
             source,
@@ -2886,6 +2917,7 @@ pub mod tests {
                 impacts: SemanticGapImpacts::for_gap(capability, subject),
                 kind,
                 budget: None,
+                dispatch: Default::default(),
                 discharge: SemanticGapDischarge::NonRejoiningExceptionalExit,
                 detail: "fixture non-rejoining exceptional exit".into(),
                 source: SourceMappingId::new(0),
@@ -2945,6 +2977,7 @@ pub mod tests {
                 impacts,
                 kind: SemanticGapKind::Unsupported,
                 budget: None,
+                dispatch: Default::default(),
                 discharge: SemanticGapDischarge::ModeledEffectPartition,
                 detail: "isolated heap effect".into(),
                 source: SourceMappingId::new(0),
@@ -3024,6 +3057,7 @@ pub mod tests {
             impacts: SemanticGapImpacts::NONE,
             kind: SemanticGapKind::Unknown,
             budget: None,
+            dispatch: Default::default(),
             discharge: SemanticGapDischarge::ModeledEffectPartition,
             detail: "exact member; declaration/type unresolved".into(),
             source,
@@ -3112,6 +3146,7 @@ pub mod tests {
                 impacts,
                 kind: SemanticGapKind::Unknown,
                 budget: None,
+                dispatch: Default::default(),
                 discharge: SemanticGapDischarge::None,
                 detail: "fixture semantic gap".into(),
                 source: SourceMappingId::new(0),
@@ -3219,6 +3254,7 @@ pub mod tests {
                 ),
                 kind: SemanticGapKind::Unsupported,
                 budget: None,
+                dispatch: Default::default(),
                 discharge: SemanticGapDischarge::None,
                 detail: detail.into(),
                 source,
@@ -3305,6 +3341,7 @@ pub mod tests {
             ),
             kind: SemanticGapKind::ExceededBudget,
             budget: Some(exceeded),
+            dispatch: Default::default(),
             discharge: SemanticGapDischarge::None,
             detail: "nested body was recognized but not materialized".into(),
             source: SourceMappingId::new(0),
@@ -3375,6 +3412,7 @@ pub mod tests {
             ),
             kind: SemanticGapKind::Unknown,
             budget: None,
+            dispatch: Default::default(),
             discharge: SemanticGapDischarge::None,
             detail: "normal resume is allegedly unknown".into(),
             source,
@@ -3475,6 +3513,109 @@ pub mod tests {
         .expect_err("async events in a non-async procedure must fail");
         assert_eq!(error.kind(), SemanticIrErrorKind::AsyncContract);
     }
+    #[cfg(test)]
+    #[test]
+    #[hardwon("#12284: unproven control edges repeatedly scanned every procedure gap")]
+    fn control_gap_validation_work_grows_linearly() {
+        use brokk_bifrost_semantic::analyzer::semantic::ir::control_edge_validation_work_for_test;
+        let key = key();
+        let caps = capabilities(&[]);
+        for n in [32, 64, 128] {
+            let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
+            parts.control_edges.clear();
+            for i in 0..n {
+                let evidence = EvidenceId::new(parts.evidence_rows.len() as u32);
+                let detail = format!("route {i}");
+                parts.evidence_rows.push(Evidence {
+                    id: evidence,
+                    proof: ProofStatus::Unproven(detail.clone().into()),
+                    completeness: EvidenceCompleteness::Partial(detail.clone().into()),
+                    sources: Box::new([SourceMappingId::new(0)]),
+                });
+                parts.control_edges.push(ControlEdge {
+                    source_point: ProgramPointId::new(0),
+                    target_point: ProgramPointId::new(1),
+                    kind: ControlEdgeKind::Normal,
+                    source: SourceMappingId::new(0),
+                    evidence,
+                });
+                parts.gaps.push(SemanticGap {
+                    id: SemanticGapId::new(i),
+                    point: ProgramPointId::new(1),
+                    subject: SemanticGapSubject::Point,
+                    capability: SemanticCapability::NormalControlFlow,
+                    impacts: SemanticGapImpacts::for_gap(
+                        SemanticCapability::NormalControlFlow,
+                        SemanticGapSubject::Point,
+                    ),
+                    kind: SemanticGapKind::Unproven,
+                    budget: None,
+                    dispatch: Default::default(),
+                    discharge: SemanticGapDischarge::None,
+                    detail: detail.into(),
+                    source: SourceMappingId::new(0),
+                    evidence,
+                });
+            }
+            // Reverse the rows so scan order cannot accidentally make the old
+            // per-edge predicate cheap. Dense gap IDs are irrelevant to this validator.
+            parts.gaps.reverse();
+            let (edges, steps) = control_edge_validation_work_for_test(&caps, &parts).unwrap();
+            assert_eq!(edges, n as usize);
+            assert_eq!(steps, 2 * n as usize);
+            eprintln!("#12284 control gaps={n} edges={edges} visits={steps}");
+            parts.gaps[0].detail = "different reason".into();
+            assert_eq!(
+                control_edge_validation_work_for_test(&caps, &parts)
+                    .unwrap_err()
+                    .kind(),
+                SemanticIrErrorKind::ControlFlowContract
+            );
+        }
+    }
+
+    #[cfg(test)]
+    #[test]
+    #[hardwon("#12284: cancelled artifact publication discarded observed lowering work")]
+    fn cancelled_publication_preserves_observed_work() {
+        use crate::analyzer::semantic::{
+            SemanticBudget, SemanticOutcome, SemanticRequest, SemanticWork,
+        };
+        let key = key();
+        let parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
+        let cancellation = brokk_bifrost_core::cancellation::CancellationToken::default();
+        cancellation.cancel();
+        let observed = SemanticWork {
+            events: 123,
+            ..SemanticWork::default()
+        };
+        let source = SemanticWork {
+            source_bytes: 456,
+            ..SemanticWork::default()
+        };
+        let mut budget = SemanticBudget::default();
+        let staged = budget.clone();
+        let mut request = SemanticRequest::new(&mut budget, &cancellation);
+        let outcome = brokk_bifrost_semantic::analyzer::semantic::service::publish_lowered(
+            &brokk_bifrost_core::retention_budget::RetentionBudget::new(u64::MAX),
+            key,
+            capabilities(&[]),
+            SemanticOutcome::Complete {
+                value: vec![parts],
+                work: observed,
+            },
+            source,
+            SemanticWork::default(),
+            staged,
+            &mut request,
+        )
+        .expect("cancelled publication is an outcome");
+        assert!(matches!(
+            outcome,
+            SemanticOutcome::Cancelled { partial: None, .. }
+        ));
+        assert_eq!(budget.performed(), source.component_max(observed));
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -3539,5 +3680,163 @@ pub mod go_extraction_support_26 {
     ) -> ProcedureSemanticsParts {
         let locator = procedure_locator(key, name, offset);
         crate::test_support::minimal_semantic_procedure(id, locator, ProcedureKind::Function)
+    }
+}
+#[cfg(test)]
+mod unbounded_production_regression {
+    use super::go_extraction_support_26::{capabilities, key, minimal_procedure};
+    use crate::analyzer::semantic::*;
+    use brokk_bifrost_core::budgeted_value_cache::BudgetedValueAcquisition;
+    use brokk_bifrost_semantic::analyzer::semantic::partial_flow::fixpoint::{
+        PartialFlowOutcome, compute_partial_flows,
+    };
+    use brokk_bifrost_semantic::analyzer::semantic::service::{
+        CompleteSemanticArtifactCache, ProvenancedArtifactKey, publish_lowered,
+        semantic_artifact_retained_bytes,
+    };
+    use brokk_bifrost_test_macros::hardwon;
+    use std::sync::Arc;
+
+    #[test]
+    #[hardwon("#12284: semantic production stopped at a fixed 32 MiB owned_text_bytes allowance")]
+    fn large_complete_artifact_is_transient_when_retention_refuses_it() {
+        let key = key();
+        let cancellation = CancellationToken::default();
+        let cache = CompleteSemanticArtifactCache::new(32 * 1024 * 1024);
+        let cache_key = ProvenancedArtifactKey {
+            artifact: key.clone(),
+            built_from: StableDigest::sha256(b"large-generated-ir"),
+        };
+        let build = || {
+            let mut parts = minimal_procedure(&key, ProcedureId::new(0), "large", 1);
+            parts.values.push(SemanticValue {
+                id: ValueId::new(0),
+                kind: SemanticValueKind::ConstantString(
+                    "x".repeat(33 * 1024 * 1024).into_boxed_str(),
+                ),
+                source: SourceMappingId::new(0),
+                evidence: EvidenceId::new(0),
+                static_type_class: Default::default(),
+                static_type_origin: None,
+            });
+            parts
+        };
+        let project = |artifact: &Arc<SemanticArtifact>| {
+            let procedure = artifact.procedure_handle(ProcedureId::new(0)).unwrap();
+            let snapshot = ValueFlowSnapshot::new(
+                procedure.clone(),
+                OracleCallContext::empty(),
+                Vec::new(),
+                CandidateCoverage::Exhaustive,
+                OracleLimits::default(),
+            )
+            .unwrap();
+            // Caller consumption is explicitly granted enough space. Its normal
+            // query limits remain independent of content-only production.
+            let mut budget = SemanticBudget::new(SemanticWork::uniform(128 * 1024 * 1024)).unwrap();
+            compute_partial_flows(
+                &procedure,
+                &snapshot,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+        };
+        let mut previous_work = None;
+        for _ in 0..2 {
+            let (acquired, _) = cache.acquire(&cache_key, &cancellation);
+            let BudgetedValueAcquisition::Leader { permit } = acquired else {
+                panic!("refused artifact must be recomputed after its last consumer drops")
+            };
+            let mut producer = SemanticBudget::producer();
+            let staged = producer.clone();
+            let outcome = publish_lowered(
+                cache.retention_budget(),
+                key.clone(),
+                capabilities(&[SemanticCapability::Values]),
+                SemanticOutcome::Complete {
+                    value: vec![build()],
+                    work: SemanticWork::default(),
+                },
+                SemanticWork::default(),
+                SemanticWork::default(),
+                staged,
+                &mut SemanticRequest::new(&mut producer, &cancellation),
+            )
+            .unwrap();
+            let SemanticOutcome::Complete {
+                value: artifact,
+                work,
+            } = outcome
+            else {
+                panic!("large production must be complete")
+            };
+            let value = &artifact.procedure(ProcedureId::new(0)).unwrap().values()[0];
+            let SemanticValueKind::ConstantString(payload) = &value.kind else {
+                panic!("the generated constant must survive publication")
+            };
+            assert_eq!(payload.len(), 33 * 1024 * 1024);
+            assert!(payload.as_bytes().iter().all(|byte| *byte == b'x'));
+            assert!(artifact.work().owned_text_bytes > 32 * 1024 * 1024);
+            assert!(semantic_artifact_retained_bytes(&artifact) > 32 * 1024 * 1024);
+            if let Some(previous) = previous_work {
+                assert_eq!(work, previous);
+            }
+            previous_work = Some(work);
+            let head = project(&artifact);
+            assert_eq!(head.outcome, PartialFlowOutcome::Complete);
+            assert!(!head.may_omit_flows());
+            let published = cache.publish(permit, &artifact);
+            assert!(cache.get_ready(&cache_key, &cancellation).is_none());
+            let weak = Arc::downgrade(&artifact);
+            drop(published);
+            drop(artifact);
+            drop(producer);
+            assert!(
+                weak.upgrade().is_none(),
+                "retention refusal must not retain the complete artifact"
+            );
+        }
+        let mut parts = build();
+        let gap = SemanticGap {
+            id: SemanticGapId::new(0),
+            point: ProgramPointId::new(0),
+            subject: SemanticGapSubject::Value(ValueId::new(0)),
+            capability: SemanticCapability::Values,
+            impacts: SemanticGapImpacts::for_gap(
+                SemanticCapability::Values,
+                SemanticGapSubject::Value(ValueId::new(0)),
+            ),
+            kind: SemanticGapKind::Unknown,
+            budget: None,
+            dispatch: Default::default(),
+            discharge: SemanticGapDischarge::None,
+            detail: "unrelated unresolved value behavior".into(),
+            source: SourceMappingId::new(0),
+            evidence: EvidenceId::new(0),
+        };
+        parts.gaps.push(gap);
+        let mut events = parts.points[0].events.to_vec();
+        events.push(SemanticEvent::new(
+            SemanticEffect::Gap {
+                gap: SemanticGapId::new(0),
+            },
+            SourceMappingId::new(0),
+            EvidenceId::new(0),
+        ));
+        parts.points[0].events = events.into_boxed_slice();
+        let artifact = Arc::new(
+            SemanticArtifact::try_new(
+                key,
+                capabilities(&[SemanticCapability::Values]),
+                vec![parts],
+            )
+            .unwrap(),
+        );
+        let head = project(&artifact);
+        assert_eq!(head.outcome, PartialFlowOutcome::Complete);
+        assert!(head.has_undischarged_gap());
+        assert!(
+            head.may_omit_flows(),
+            "removing a producer allowance must never discharge a real gap"
+        );
     }
 }

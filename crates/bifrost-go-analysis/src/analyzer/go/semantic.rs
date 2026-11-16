@@ -84,30 +84,12 @@ pub use crate::analyzer::go::semantic::callable_materialization::GoMaterializedA
 
 pub use crate::analyzer::go::semantic::callable_materialization::materialize_go_anonymous_callable;
 
-// Bumping this rotates every public wire id hashed from the adapter
-// fingerprint (`SemanticArtifactKey::push_environment_identity`). A checked-in
-// golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
-// change; the code-query tutorial pages elide such ids (#5016).
-// The lowerer reaches declaration and import helpers (decoded import names).
-// #8387: invalidate artifacts embedding ranked synthetic declaration identities.
-// #9447: structured formal roles, refusal, and stable local var function-literal
-// targets/captures change semantic payloads under the existing Go99 identity.
-// #9183: the Go footprint account changes parse-time semantic rows.
-// #9879: scoped call/control claims for receivers, results, value formals,
-// assignments, supported defers and method callees change coverage rows.
-// #9954: package-qualified callees and binary conditions change coverage rows.
-// #9794: defer capture distinguishes unresolved by-value copies (v104; #9954 has v103).
-// #10095: identifier-receiver method calls claim their selector coverage (v105).
-// #10145: fully bound var declarations claim scoped source coverage (v106).
-// #10162: direct calls and blank assignments claim full footprint coverage (v107).
-// #10162: short var, typed var and defer claims; deferred, cleanup and initialization classes from the lowered IR (v108).
-// #10267: a typed multi-name var with a multi-result call publishes every result (v109).
-// #10490: methods and unnamed-result functions claim receiver and result signature syntax and set footprint classes from the lowered rows (v110).
-// #10554: slice and map composite literals store their elements, and elided-type element literals allocate (v112).
-// #10490: returns, ifs, assignments, resolved identifier reads, value-only expressions and identifier-argument calls claim full footprint coverage, except where they convert to an interface or compare interfaces (v113).
-// #10490: `&x`, `&T{}`, empty composite literals and same-file struct literals with non-interface fields claim full footprint coverage (v114).
-// #10582: publish static underlying-type classes and declared result classes (v115).
-const ADAPTER_VERSION: &[u8] = b"go-value-semantics-v115";
+/// The go adapter lever (#11570): `levers/go-adapter.tokens`. Add a line there
+/// when a change alters the semantics this lowerer publishes for unchanged
+/// source; see `.agents/docs/cache-identity-levers.md`.
+fn adapter_version() -> &'static [u8] {
+    brokk_bifrost_core::lever_label!("go-value-semantics", "go-adapter.tokens").as_bytes()
+}
 
 impl_program_semantics_provider!(GoAnalyzer, GoSemanticLowerer);
 
@@ -117,7 +99,7 @@ impl ProgramSemanticsLowerer for GoSemanticLowerer {
     fn identity(&self) -> SemanticAdapterIdentity {
         SemanticAdapterIdentity::for_adapter(
             "go",
-            ADAPTER_VERSION,
+            adapter_version(),
             b"go-intrafile-execution-defaults-v1",
             DependencyFingerprint::hash_bytes(b"no-intrafile-dependencies"),
         )
@@ -343,8 +325,16 @@ pub(crate) fn lower_exact_go_file(
                     lowerer.capabilities(),
                     value,
                     &mut publication_budget,
+                    request.cancellation,
                 ) {
                     Ok(artifact) => Arc::new(artifact.with_query_source(Arc::from(source))),
+                    Err(SemanticArtifactBuildError::Cancelled) => {
+                        reconcile_exact_go_work(&mut staged_budget, started_work, observed_work);
+                        return Ok(SemanticOutcome::Cancelled {
+                            partial: None,
+                            work: observed_work,
+                        });
+                    }
                     Err(SemanticArtifactBuildError::Invalid(error)) => {
                         return Err(SemanticProviderError::invalid_artifact(error));
                     }
@@ -671,7 +661,11 @@ struct GoNamedTypeDefinition<'tree> {
     scope_end: usize,
 }
 
-type GoNamedTypeDefinitions<'tree> = HashMap<Box<str>, Vec<GoNamedTypeDefinition<'tree>>>;
+#[derive(Default)]
+struct GoNamedTypeDefinitions<'tree> {
+    definitions: HashMap<Box<str>, Vec<GoNamedTypeDefinition<'tree>>>,
+    imported_names: HashSet<Box<str>>,
+}
 type DirectStructFields = HashMap<usize, HashSet<Box<str>>>;
 type GoMethodInventory = HashMap<(usize, Box<str>), GoMethodTarget>;
 
@@ -938,24 +932,13 @@ impl<'tree> GoAssertionProofContext<'_, 'tree, '_> {
             let Some(kind) = self.static_type(procedure, node)? else {
                 return Ok(None);
             };
-            let underlying = go_file_underlying_type(
-                kind.node,
-                self.source,
-                self.named_types,
-                kind.node.start_byte(),
-            );
             let interface = kind.pointer_depth == 0
-                && underlying.is_some_and(|underlying| {
-                    underlying.kind() == "interface_type"
-                        || (underlying.kind() == "type_identifier"
-                            && node_text(self.source, underlying) == Some("any")
-                            && visible_go_named_type(
-                                self.named_types,
-                                "any",
-                                underlying.start_byte(),
-                            )
-                            .is_none())
-                });
+                && go_type_is_interface(
+                    kind.node,
+                    self.source,
+                    self.named_types,
+                    kind.node.start_byte(),
+                );
             if !interface {
                 return Ok(Some(GoInterfacePayloadProof {
                     r#type: kind,
@@ -1433,7 +1416,7 @@ fn enumerate_procedures<'tree>(
     let mut package_values = HashSet::default();
     let mut package_value_locators = HashMap::default();
     let mut direct_struct_fields = DirectStructFields::default();
-    let mut named_type_definitions = HashMap::default();
+    let mut named_type_definitions = GoNamedTypeDefinitions::default();
     let mut stack = vec![ProcedureEnumerationFrame {
         node: root,
         lexical_parent: None,
@@ -1460,6 +1443,16 @@ fn enumerate_procedures<'tree>(
         {
             package_shadowing.observe(name.as_ref());
         }
+        if frame.node.kind() == "import_spec"
+            && let Some(name) = brokk_bifrost_go::declarations::go_import_spec_binding_name(
+                frame.node,
+                prepared.source(),
+            )
+        {
+            named_type_definitions
+                .imported_names
+                .insert(name.into_owned().into());
+        }
         if matches!(frame.node.kind(), "type_spec" | "type_alias")
             && let Some(name_node) = frame.node.child_by_field_name("name")
             && let Some(name) = nonempty_node_text(prepared.source(), name_node)
@@ -1469,6 +1462,7 @@ fn enumerate_procedures<'tree>(
             let (scope_start, scope_end) =
                 local_scope.unwrap_or_else(|| (root.start_byte(), root.end_byte()));
             named_type_definitions
+                .definitions
                 .entry(name.into())
                 .or_insert_with(Vec::new)
                 .push(GoNamedTypeDefinition {
@@ -1677,6 +1671,7 @@ fn enumerate_procedures<'tree>(
     // every type declaration in the file is known, so this runs after the
     // traversal rather than inside it.
     let defined_type_structures = named_type_definitions
+        .definitions
         .values()
         .flatten()
         .filter(|definition| !direct_struct_fields.contains_key(&definition.declaration))
@@ -1803,15 +1798,20 @@ fn go_same_file_method_inventory(
         else {
             continue;
         };
-        let Some(definition) = named_types.get(receiver.as_str()).and_then(|definitions| {
-            visible_go_binding(definitions, root.start_byte(), |definition| {
-                (
-                    definition.visible_from,
-                    definition.scope_start,
-                    definition.scope_end,
-                )
-            })
-        }) else {
+        let Some(definition) =
+            named_types
+                .definitions
+                .get(receiver.as_str())
+                .and_then(|definitions| {
+                    visible_go_binding(definitions, root.start_byte(), |definition| {
+                        (
+                            definition.visible_from,
+                            definition.scope_start,
+                            definition.scope_end,
+                        )
+                    })
+                })
+        else {
             continue;
         };
         let Some(name) = spec
@@ -2352,19 +2352,19 @@ fn collect_call_exposure_origins(
                             .and_then(|identity| identity.declaration)
                             .and_then(|declaration| {
                                 named_type_definitions
+                                    .definitions
                                     .values()
                                     .flatten()
                                     .find(|definition| definition.declaration == declaration)
                             })
-                            .and_then(|definition| {
-                                go_file_underlying_type(
+                            .is_some_and(|definition| {
+                                go_type_is_interface(
                                     definition.underlying,
                                     source,
                                     named_type_definitions,
                                     node.start_byte(),
                                 )
-                            })
-                            .is_some_and(|underlying| underlying.kind() == "interface_type");
+                            });
                         if receiver_is_interface {
                             return Ok(WalkControl::Continue);
                         }
@@ -2605,7 +2605,7 @@ fn visible_go_named_type<'tree>(
     name: &str,
     byte: usize,
 ) -> Option<GoNamedTypeDefinition<'tree>> {
-    visible_go_binding(named_types.get(name)?, byte, |definition| {
+    visible_go_binding(named_types.definitions.get(name)?, byte, |definition| {
         (
             definition.visible_from,
             definition.scope_start,
@@ -2933,10 +2933,16 @@ fn go_file_underlying_type<'tree>(
     named_types: &GoNamedTypeDefinitions<'tree>,
     mut use_byte: usize,
 ) -> Option<Node<'tree>> {
-    let definition_count = named_types.values().map(Vec::len).sum::<usize>();
+    let definition_count = named_types
+        .definitions
+        .values()
+        .map(Vec::len)
+        .sum::<usize>();
     for _ in 0..=definition_count {
+        while kind.kind() == "parenthesized_type" {
+            kind = first_named_child(kind)?;
+        }
         match kind.kind() {
-            "parenthesized_type" => kind = first_named_child(kind)?,
             "generic_type" => {
                 let name = kind.child_by_field_name("type")?;
                 let name = node_text(source, name)?;
@@ -2970,7 +2976,11 @@ fn go_resolve_type_aliases<'tree>(
     source: &str,
     named_types: &GoNamedTypeDefinitions<'tree>,
 ) -> Option<Node<'tree>> {
-    let definition_count = named_types.values().map(Vec::len).sum::<usize>();
+    let definition_count = named_types
+        .definitions
+        .values()
+        .map(Vec::len)
+        .sum::<usize>();
     for _ in 0..=definition_count {
         if kind.kind() != "type_identifier" {
             return Some(kind);
@@ -3000,7 +3010,11 @@ fn go_type_uses_generic<'tree>(
     named_types: &GoNamedTypeDefinitions<'tree>,
     mut use_byte: usize,
 ) -> bool {
-    let definition_count = named_types.values().map(Vec::len).sum::<usize>();
+    let definition_count = named_types
+        .definitions
+        .values()
+        .map(Vec::len)
+        .sum::<usize>();
     for _ in 0..=definition_count {
         match kind.kind() {
             "generic_type" | "type_parameter_list" | "type_parameter_declaration" => {
@@ -3184,6 +3198,7 @@ fn go_assertion_types_match<'tree>(
     cancellation: &CancellationToken,
 ) -> Result<bool, GoInventoryPrepassStop> {
     let alias_limit = named_types
+        .definitions
         .values()
         .map(Vec::len)
         .sum::<usize>()
@@ -3509,27 +3524,50 @@ fn go_type_is_reference(
     )
 }
 
+/// Whether an uninitialized Go declaration of `kind` has the `nil` zero value
+/// without needing to resolve element, key, parameter, or pointee types.
+fn go_type_zero_value_is_nil(
+    kind: Node<'_>,
+    source: &str,
+    named_types: &GoNamedTypeDefinitions<'_>,
+    use_byte: usize,
+) -> bool {
+    let Some(underlying) = go_file_underlying_type(kind, source, named_types, use_byte) else {
+        return false;
+    };
+    matches!(
+        underlying.kind(),
+        "pointer_type" | "slice_type" | "map_type" | "channel_type" | "function_type"
+    )
+}
+
 /// The interface type node a type denotes, resolving parentheses and named
-/// type declarations. The predeclared `any` alias denotes the empty interface
-/// but has no `interface_type` node, so its identifier is returned instead.
+/// type declarations. The predeclared `any` and `error` interfaces have no
+/// `interface_type` node, so their unshadowed identifiers are returned instead.
 fn go_type_interface_node<'tree>(
     mut kind: Node<'tree>,
     source: &str,
     named_types: &GoNamedTypeDefinitions<'tree>,
     mut use_byte: usize,
 ) -> Option<Node<'tree>> {
-    let definition_count = named_types.values().map(Vec::len).sum::<usize>();
+    let definition_count = named_types
+        .definitions
+        .values()
+        .map(Vec::len)
+        .sum::<usize>();
     for _ in 0..=definition_count {
         match kind.kind() {
             "parenthesized_type" => kind = first_named_child(kind)?,
             "type_identifier" => {
                 let name = node_text(source, kind)?;
-                if name == "any" {
-                    return visible_go_named_type(named_types, "any", kind.start_byte())
-                        .is_none()
-                        .then_some(kind);
+                if go_type_parameter_constraint(kind, name, source, named_types).is_some() {
+                    return None;
                 }
-                let definition = visible_go_named_type(named_types, name, use_byte)?;
+                let Some(definition) = visible_go_named_type(named_types, name, use_byte) else {
+                    return (matches!(name, "any" | "error")
+                        && !named_types.imported_names.contains(name))
+                    .then_some(kind);
+                };
                 use_byte = definition.underlying.start_byte();
                 kind = definition.underlying;
             }
@@ -5381,6 +5419,12 @@ fn lower_procedure<'tree>(
                 node.start_byte(),
             );
         }
+        // Address creation proves a pointer representation even when the
+        // operand has no written type (for example `&local` after `local := 0`).
+        // Retain it before propagating types through declarations and reads.
+        if value.kind == SemanticValueKind::Address {
+            value.static_type_class = StaticTypeClass::Pointer;
+        }
     }
     for call in &parts.call_sites {
         for ordinal in 0..call
@@ -6939,18 +6983,18 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                     let identity = &self.value_types[&value];
                     let definition = identity.declaration.and_then(|declaration| {
                         self.named_type_definitions
+                            .definitions
                             .get(&identity.name)?
                             .iter()
                             .find(|definition| definition.declaration == declaration)
                     });
                     let interface = definition.is_some_and(|definition| {
-                        go_file_underlying_type(
+                        go_type_is_interface(
                             definition.underlying,
                             self.prepared.source(),
                             self.named_type_definitions,
                             definition.visible_from,
                         )
-                        .is_some_and(|underlying| underlying.kind() == "interface_type")
                     });
                     let copy = definition.map_or(MemoryValueCopy::Unknown, |definition| {
                         go_memory_value_copy_from_type(
@@ -7569,8 +7613,8 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                 | "index_expression"
                 | "receive_expression"
                 | "binary_expression"
-                | "unary_expression"
-        ) {
+        ) || (node.kind() == "unary_expression" && unary_operator_kind(node) != Some("&"))
+        {
             self.static_type_invalidated.insert(value);
         }
         if let Some(identity) = self.expression_type_identity(node, node.start_byte()) {
@@ -7877,6 +7921,7 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         declaration: usize,
     ) -> Option<GoNamedTypeDefinition<'tree>> {
         self.named_type_definitions
+            .definitions
             .values()
             .flatten()
             .find(|definition| definition.declaration == declaration)
@@ -7967,8 +8012,7 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
             // so its dynamic payload keeps its identity. A source known not
             // to be an interface is boxed, and the binding holds the box. A
             // source this file cannot classify stays unresolved: an imported
-            // or qualified type, a type parameter, and the predeclared `error`,
-            // which these helpers do not yet treat as an interface (#10436).
+            // or qualified type, or a type parameter.
             if self.type_is_interface(source, source.start_byte()) {
                 return Some(true);
             }
@@ -8077,8 +8121,7 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
     }
 
     /// Whether a binding of this declared type boxes its value: a same-file
-    /// interface or `any`. The predeclared `error` is not recognized yet
-    /// (#10436), so an `error` destination stays unresolved.
+    /// interface, `any`, or the predeclared `error` interface.
     fn type_is_interface(&self, node: Node<'tree>, byte: usize) -> bool {
         go_type_is_interface(
             node,
@@ -8090,9 +8133,8 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
 
     /// Whether a declared type is provably not an interface: a same-file or
     /// predeclared type whose underlying type this file resolves to a
-    /// concrete shape. A qualified, type-parameter or unresolvable type, the
-    /// predeclared `error`, `any` and `comparable`, and a shadowed predeclared
-    /// name are all unknown, so they are not.
+    /// concrete shape. Interfaces, constraint types, qualified or unresolvable
+    /// types, and unclassified shadowed predeclared names do not qualify.
     fn type_is_known_non_interface(&self, node: Node<'tree>) -> bool {
         let Some(underlying) = self.file_underlying_type(node, node.start_byte()) else {
             return false;
@@ -8355,31 +8397,47 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         })
     }
 
-    fn expression_type_identity(&self, node: Node<'tree>, byte: usize) -> Option<GoTypeIdentity> {
-        match node.kind() {
+    /// The proven type identity of an expression.
+    ///
+    /// Parentheses and unary address or dereference operators are transparent
+    /// wrappers around one operand. A source expression can nest them without
+    /// bound, so walking them with Rust recursion would consume stack in
+    /// proportion to the input. Descend iteratively and apply the pointer-depth
+    /// changes innermost first, which keeps the checked dereference semantics.
+    fn expression_type_identity(
+        &self,
+        mut node: Node<'tree>,
+        byte: usize,
+    ) -> Option<GoTypeIdentity> {
+        enum PointerStep {
+            Address,
+            Dereference,
+        }
+        let mut pointer_steps = Vec::new();
+        loop {
+            node = unwrap_parenthesized_expression_with(node, first_runtime_named_child);
+            match node.kind() {
+                "unary_expression" if unary_operator_kind(node) == Some("&") => {
+                    node = node.child_by_field_name("operand")?;
+                    pointer_steps.push(PointerStep::Address);
+                }
+                "unary_expression" if unary_operator_kind(node) == Some("*") => {
+                    node = node.child_by_field_name("operand")?;
+                    pointer_steps.push(PointerStep::Dereference);
+                }
+                _ => break,
+            }
+        }
+        let mut identity = match node.kind() {
             "identifier" | "true" | "false" | "nil" | "iota" => {
                 let name = node_text(self.prepared.source(), node)?;
                 let value = self.binding_value(name, byte)?;
                 self.value_types.get(&value).cloned()
             }
-            "parenthesized_expression" => first_runtime_named_child(node)
-                .and_then(|child| self.expression_type_identity(child, byte)),
             "type_assertion_expression" => self.type_identity(node.child_by_field_name("type")?),
-            "unary_expression" if unary_operator_kind(node) == Some("&") => {
-                let operand = node.child_by_field_name("operand")?;
-                let mut identity = self.expression_type_identity(operand, byte)?;
-                identity.pointer_depth = identity.pointer_depth.checked_add(1)?;
-                Some(identity)
-            }
             "unary_expression" if unary_operator_kind(node) == Some("<-") => {
                 let operand = node.child_by_field_name("operand")?;
                 self.expression_channel_payload_type(operand, byte)
-            }
-            "unary_expression" if unary_operator_kind(node) == Some("*") => {
-                let operand = node.child_by_field_name("operand")?;
-                let mut identity = self.expression_type_identity(operand, byte)?;
-                identity.pointer_depth = identity.pointer_depth.checked_sub(1)?;
-                Some(identity)
             }
             "index_expression"
                 if node
@@ -8411,7 +8469,14 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                 self.type_identity(result)
             }
             _ => None,
+        }?;
+        for step in pointer_steps.into_iter().rev() {
+            identity.pointer_depth = match step {
+                PointerStep::Address => identity.pointer_depth.checked_add(1)?,
+                PointerStep::Dereference => identity.pointer_depth.checked_sub(1)?,
+            };
         }
+        Some(identity)
     }
 
     fn expression_field_type_node(
@@ -12001,6 +12066,14 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
             let mut bound_names = 0;
             let mut recorded_gap = false;
             if values.is_empty() {
+                let nil_zero_value = spec.child_by_field_name("type").is_some_and(|type_node| {
+                    go_type_zero_value_is_nil(
+                        type_node,
+                        self.prepared.source(),
+                        self.named_type_definitions,
+                        spec.start_byte(),
+                    )
+                });
                 for name_node in &names {
                     let Some(name) = node_text(self.prepared.source(), *name_node) else {
                         continue;
@@ -12023,11 +12096,27 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                         recorded_gap = true;
                         continue;
                     };
-                    if !self.value_types.contains_key(&target)
-                        && !self
-                            .value_storage_kinds
+                    let storage = self.value_storage_kinds.get(&target).copied();
+                    let storage_is_value_aggregate =
+                        storage.is_some_and(GoStorageKind::is_value_aggregate);
+                    let storage_is_nil_zero = storage.is_some_and(|kind| {
+                        matches!(
+                            kind,
+                            GoStorageKind::Slice | GoStorageKind::Map | GoStorageKind::Channel
+                        )
+                    });
+                    // Slice, map, channel, function, and pointer types always
+                    // zero-initialize to nil even when element/key/pointee types
+                    // cannot be resolved in-file.
+                    let zero_is_nil = nil_zero_value
+                        || storage_is_nil_zero
+                        || self
+                            .value_types
                             .get(&target)
-                            .is_some_and(|storage| storage.is_value_aggregate())
+                            .is_some_and(|identity| identity.pointer_depth > 0);
+                    if !zero_is_nil
+                        && !self.value_types.contains_key(&target)
+                        && !storage_is_value_aggregate
                     {
                         self.session.record_gap(
                             builder,
@@ -12041,11 +12130,7 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                         recorded_gap = true;
                         continue;
                     }
-                    let zero_kind = if self
-                        .value_types
-                        .get(&target)
-                        .is_some_and(|identity| identity.pointer_depth > 0)
-                    {
+                    let zero_kind = if zero_is_nil {
                         SemanticValueKind::Null
                     } else {
                         SemanticValueKind::LanguageDefined("go.zero_value".into())
@@ -13911,10 +13996,26 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
             && let Some(point) = self.selector_points.get(&node.id()).copied()
         {
             let operand = required_field(node, "operand")?;
-            if matches!(
-                self.selector_resolution(node),
-                GoSelectorResolution::Method { .. }
-            ) {
+            let is_call_callee = node.parent().is_some_and(|parent| {
+                parent.kind() == "call_expression"
+                    && parent
+                        .child_by_field_name("function")
+                        .is_some_and(|function| function.id() == node.id())
+            });
+            if match self.selector_resolution(node) {
+                GoSelectorResolution::Method { .. } => true,
+                // A method another file of the package declares is open
+                // here: lowering is file-local. The call row carries the
+                // deferred member selection and its receiver, and the
+                // call's target obligation stays open until query time
+                // proves one target (#9909). Only the selector and member
+                // name are claimed; the operand scheduled below keeps its
+                // own coverage, as it does for a same-file method.
+                GoSelectorResolution::Unknown => is_call_callee,
+                GoSelectorResolution::Package
+                | GoSelectorResolution::Field
+                | GoSelectorResolution::InterfaceMethod { .. } => false,
+            } {
                 // The classifier admits this selector only as a call's
                 // callee, where the represented call covers it.
                 self.session.footprint_refuse_node_for_scoped(node);
@@ -15330,7 +15431,8 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
             {
                 // The call binds this identifier receiver; its selector is
                 // represented by the call row. Compound receiver expressions
-                // still need their own coverage and remain unclaimed.
+                // still need their own coverage and remain unclaimed here; a
+                // method callee's selector is claimed where it is evaluated.
                 self.session.footprint_refuse_subtree_for_scoped(function);
             }
         }
@@ -17667,7 +17769,7 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                             "Go fallthrough has no function return destination".into(),
                         )
                     })?;
-                if route.cleanups().is_empty() {
+                if builder.cleanup_regions(&route).next().is_none() {
                     return Ok(EdgeTarget {
                         point: route.destination().target(),
                         kind: route.destination().edge_kind(),
@@ -18111,7 +18213,7 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         let route = builder
             .resolve_completion(scope, &CompletionRequest::new(CompletionKind::Throw, None))
             .expect("a Go evaluation scope must resolve panic completion");
-        let discharge = if route.cleanups().is_empty() {
+        let discharge = if builder.cleanup_regions(&route).next().is_none() {
             SemanticGapDischarge::NonRejoiningExceptionalExit
         } else {
             SemanticGapDischarge::ExitOnlyProcedureCompletion
@@ -19141,6 +19243,7 @@ mod tests {
     use crate::analyzer::go::semantic::*;
 
     use brokk_bifrost_semantic::analyzer::semantic::service::ProgramSemanticsLowerer;
+    use brokk_bifrost_test_macros::hardwon;
 
     fn prepared_fixture(source: &str) -> PreparedSyntaxTree {
         let tree = brokk_bifrost_analysis::test_support::parse_fixture_tree(
@@ -19168,6 +19271,28 @@ mod tests {
             panic!("Go fixture lowering must complete");
         };
         value
+    }
+
+    #[test]
+    #[hardwon("#11351: 512 nested parenthesized expressions exhausted the parse-worker stack")]
+    fn deeply_parenthesized_receiver_lowering_uses_bounded_stack() {
+        const DEPTH: usize = 512;
+        let expression = format!("{}service{}.Run()", "(".repeat(DEPTH), ")".repeat(DEPTH));
+        let source = format!(
+            "package main\n\ntype Service struct{{}}\nfunc (Service) Run() {{}}\nfunc use(service Service) {{\n    {expression}\n}}\n"
+        );
+        // A depth-proportional walk uses about 1.5 MiB on x86_64 here, so this
+        // bound makes the regression deterministic instead of host-dependent.
+        std::thread::Builder::new()
+            .name("deep-go-parentheses".into())
+            .stack_size(1024 * 1024)
+            .spawn(move || {
+                let parts = lower_fixture(&source);
+                assert!(!parts.is_empty());
+            })
+            .expect("spawn a bounded-stack lowering thread")
+            .join()
+            .expect("deeply parenthesized lowering must not overflow its stack");
     }
 
     #[test]
@@ -19363,10 +19488,10 @@ func Shift(a, n int) int { return a << n }\n";
         }
         // A typed variable initializer converts through lowering's own
         // assignment path, so the claim rests on the row it emits: reference
-        // boxing into `any`, and an opaque language-defined flow into `error`.
+        // boxing into both `any` and the predeclared `error` interface (#10436).
         for (name, row) in [
             ("TypedInterfaceInit", "go.reference_boxing"),
-            ("TypedErrorInit", "go.assignment_conversion"),
+            ("TypedErrorInit", "go.reference_boxing"),
         ] {
             let lowered = procedures
                 .iter()
@@ -21867,15 +21992,20 @@ func transport() {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10436: a channel of predeclared error lost reference payload copies"
+    )]
     fn channel_send_payload_copy_follows_the_declared_element_type() {
         const SOURCE: &str = r#"package main
 type cell struct{}
+func (*cell) Error() string { return "" }
 func send(
     pointers chan *cell,
     slices chan []int,
     maps chan map[int]int,
     structs chan cell,
     interfaces chan any,
+    errors chan error,
     interfaceSlices chan any,
     pointer *cell,
     slice []int,
@@ -21887,6 +22017,7 @@ func send(
     maps <- mapping
     structs <- value
     interfaces <- pointer
+    errors <- pointer
     interfaceSlices <- slice
 }
 "#;
@@ -21933,13 +22064,18 @@ func send(
                 ..
             }))
         ));
-        assert!(matches!(
-            payloads.get("interfaces"),
-            Some(Some(SynchronizationPayload::Send {
-                copy: SynchronizationPayloadCopy::Reference,
-                ..
-            }))
-        ));
+        for channel in ["interfaces", "errors"] {
+            assert!(
+                matches!(
+                    payloads.get(channel),
+                    Some(Some(SynchronizationPayload::Send {
+                        copy: SynchronizationPayloadCopy::Reference,
+                        ..
+                    }))
+                ),
+                "{channel}: reference payload must survive interface transport: {payloads:?}"
+            );
+        }
         // An interface element boxes whatever the operand copies. A boxed
         // slice header names no single transported object here, so its send
         // endpoint stays unknown rather than claiming the reference rule.
@@ -24177,6 +24313,9 @@ func outer() {
     #[brokk_bifrost_test_macros::hardwon(
         "#10267: typed multi-result interface initialization lost pointer boxing"
     )]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10436: predeclared error lost interface boxing and assertion payload unboxing"
+    )]
     #[test]
     fn typed_multi_result_reference_boxing() {
         // `any` is the predeclared empty interface. `I` is a same-file
@@ -24185,6 +24324,7 @@ func outer() {
         for (interface, declaration) in [
             ("any", ""),
             ("I", "type I interface{ M() }\nfunc (*Resource) M() {}\n"),
+            ("error", "func (*Resource) Error() string { return \"\" }\n"),
         ] {
             let source = format!(
                 r#"package main
@@ -24194,6 +24334,11 @@ func initialize() {{
     var a, b {interface} = pair()
     pointer := a.(*Resource)
     consume(pointer, b)
+}}
+func single() {{
+    var value {interface} = &Resource{{}}
+    pointer := value.(*Resource)
+    consume(pointer)
 }}
 "#
             );
@@ -24243,62 +24388,81 @@ func initialize() {{
                     .all(|gap| gap.capability != SemanticCapability::Assignments),
                 "{interface}: a same-file interface target must not report an Assignments gap: {procedure:#?}"
             );
+            let single = named_procedure(&procedures, "single");
+            for kind in [
+                ValueFlowKind::ReferenceBoxing,
+                ValueFlowKind::ReferenceUnboxing,
+            ] {
+                assert!(single.points.iter().flat_map(|point| &point.events).any(|event| {
+                    matches!(event.effect, SemanticEffect::ValueFlow { kind: actual, .. } if actual == kind)
+                }), "{interface}: single-value initialization and assertion must retain {kind:?}: {single:#?}");
+            }
         }
-        // The predeclared `error` is not yet an interface to the boxing and
-        // payload helpers (#10436), so the binding records an assignment gap
-        // instead of claiming the pointers' identity.
-        let procedures = lower_fixture(
-            "package main\ntype Resource struct{}\nfunc (*Resource) Error() string { return \"\" }\nfunc pair() (*Resource, *Resource) { return nil, nil }\nfunc initialize() {\n    var a, b error = pair()\n    pointer := a.(*Resource)\n    consume(pointer, b)\n}\n",
-        );
-        let procedure = named_procedure(&procedures, "initialize");
-        assert!(
-            procedure
-                .gaps
-                .iter()
-                .any(|gap| gap.capability == SemanticCapability::Assignments),
-            "an error destination must stay unresolved: {procedure:#?}"
-        );
-        // An interface source keeps its payload: each result binds directly.
-        let procedures = lower_fixture(
-            "package main\ntype I interface{ M() }\nfunc pair() (I, I) { return nil, nil }\nfunc initialize() {\n    var a, b any = pair()\n    consume(a, b)\n}\n",
-        );
-        let procedure = named_procedure(&procedures, "initialize");
-        for ordinal in 0..2 {
-            let result = procedure.values.iter().position(|value| matches!(&value.kind,
-                SemanticValueKind::LanguageDefined(kind) if kind.as_ref() == format!("go.normal_result.{ordinal}")
-            )).expect("call result");
+        // Interface-to-interface initialization keeps each payload without
+        // adding another wrapper, including the predeclared error (#10436).
+        for (interface, declaration) in [("I", "type I interface{ M() }\n"), ("error", "")] {
+            let source = format!(
+                "package main\n{declaration}func pair() ({interface}, {interface}) {{ return nil, nil }}\nfunc initialize() {{\n    var a, b any = pair()\n    consume(a, b)\n}}\n",
+            );
+            let procedures = lower_fixture(&source);
+            let procedure = named_procedure(&procedures, "initialize");
+            for ordinal in 0..2 {
+                let result = procedure.values.iter().position(|value| matches!(&value.kind,
+                    SemanticValueKind::LanguageDefined(kind) if kind.as_ref() == format!("go.normal_result.{ordinal}")
+                )).expect("call result");
+                assert!(
+                    procedure
+                        .points
+                        .iter()
+                        .flat_map(|point| &point.events)
+                        .any(|event| matches!(
+                            event.effect,
+                            SemanticEffect::ValueFlow { source, kind: ValueFlowKind::Local, .. }
+                                if source.index() == result
+                        )),
+                    "{interface}: an interface result must bind without conversion: {procedure:#?}"
+                );
+            }
             assert!(
                 procedure
-                    .points
+                    .gaps
                     .iter()
-                    .flat_map(|point| &point.events)
-                    .any(|event| matches!(
-                        event.effect,
-                        SemanticEffect::ValueFlow { source, kind: ValueFlowKind::Local, .. }
-                            if source.index() == result
-                    )),
-                "an interface result must bind without conversion: {procedure:#?}"
+                    .all(|gap| gap.capability != SemanticCapability::Assignments),
+                "{interface}: interface-to-interface assignment is known: {procedure:#?}"
             );
         }
-        assert!(
-            procedure
-                .gaps
-                .iter()
-                .all(|gap| gap.capability != SemanticCapability::Assignments),
-            "interface-to-interface assignment is known: {procedure:#?}"
-        );
-        // An `error` source is not yet an interface to these helpers
-        // (#10436), so its payload stays unresolved.
+        // A closer authored type shadows the universe interface (#10436).
         let procedures = lower_fixture(
-            "package main\nfunc pair() (error, error) { return nil, nil }\nfunc initialize() {\n    var a, b any = pair()\n    consume(a, b)\n}\n",
+            "package main\nfunc shadowed() { type error struct{}; var value error = error{}; consume(value) }\n",
         );
-        let procedure = named_procedure(&procedures, "initialize");
+        let procedure = named_procedure(&procedures, "shadowed");
         assert!(
             procedure
-                .gaps
+                .values
                 .iter()
-                .any(|gap| gap.capability == SemanticCapability::Assignments),
-            "an error source must stay unresolved: {procedure:#?}"
+                .any(|value| value.static_type_class == StaticTypeClass::Value),
+            "shadowed error is a concrete struct: {procedure:#?}"
+        );
+        assert!(
+            procedure
+                .values
+                .iter()
+                .all(|value| value.static_type_class != StaticTypeClass::Interface),
+            "local error must not use the builtin interface: {procedure:#?}"
+        );
+        assert!(
+            procedure
+                .points
+                .iter()
+                .flat_map(|point| &point.events)
+                .all(|event| !matches!(
+                    event.effect,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::ReferenceBoxing | ValueFlowKind::ReferenceUnboxing,
+                        ..
+                    }
+                )),
+            "local error must not box or unbox: {procedure:#?}"
         );
         // An imported result type cannot be classified here, so it stays
         // unresolved instead of being boxed or converted.
@@ -24642,6 +24806,571 @@ func initialize(source *record) {
             gap.subject != SemanticGapSubject::Value(target)
                 || gap.capability != SemanticCapability::Values
         }));
+    }
+
+    fn local_assignment_sources<'a>(
+        procedure: &'a ProcedureSemanticsParts,
+        source: &'a str,
+        name: &str,
+    ) -> Vec<(&'a SemanticValueKind, ValueFlowKind)> {
+        let kinds_by_id: HashMap<_, _> = procedure
+            .values
+            .iter()
+            .map(|value| (value.id, &value.kind))
+            .collect();
+        procedure
+            .points
+            .iter()
+            .flat_map(|point| point.events.iter())
+            .filter_map(|event| match event.effect {
+                SemanticEffect::Assignment { target, value }
+                    if source_text(source, value_source_span(procedure, target)) == name =>
+                {
+                    let flow_kind = procedure.points.iter().find_map(|point| {
+                        point
+                            .events
+                            .iter()
+                            .find_map(|flow_event| match flow_event.effect {
+                                SemanticEffect::ValueFlow {
+                                    kind,
+                                    source: flow_source,
+                                    target: flow_target,
+                                } if flow_source == value && flow_target == target => Some(kind),
+                                _ => None,
+                            })
+                    });
+                    let flow_kind = flow_kind.unwrap_or_else(|| {
+                        panic!(
+                            "expected ValueFlow for assignment to `{name}` in `{:?}`",
+                            procedure.locator
+                        )
+                    });
+                    Some((
+                        *kinds_by_id
+                            .get(&value)
+                            .expect("assigned zero value exists in procedure values"),
+                        flow_kind,
+                    ))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn local_converted_assignment_origins<'a>(
+        procedure: &'a ProcedureSemanticsParts,
+        source: &'a str,
+        name: &str,
+    ) -> Vec<&'a SemanticValueKind> {
+        let kinds_by_id: HashMap<_, _> = procedure
+            .values
+            .iter()
+            .map(|value| (value.id, &value.kind))
+            .collect();
+        procedure
+            .points
+            .iter()
+            .flat_map(|point| point.events.iter())
+            .filter_map(|event| match event.effect {
+                SemanticEffect::Assignment { target, value }
+                    if source_text(source, value_source_span(procedure, target)) == name =>
+                {
+                    let assigned_kind = *kinds_by_id
+                        .get(&value)
+                        .expect("assigned value exists in procedure values");
+                    if matches!(
+                        assigned_kind,
+                        SemanticValueKind::LanguageDefined(kind)
+                            if kind.as_ref() == "go.assignment_conversion"
+                    ) {
+                        let origin = procedure
+                            .points
+                            .iter()
+                            .flat_map(|point| point.events.iter())
+                            .find_map(|flow_event| match flow_event.effect {
+                                SemanticEffect::ValueFlow {
+                                    kind: ValueFlowKind::LanguageDefined,
+                                    source: flow_source,
+                                    target: flow_target,
+                                } if flow_target == value => Some(flow_source),
+                                _ => None,
+                            })
+                            .unwrap_or_else(|| {
+                                panic!("expected LanguageDefined origin for conversion on `{name}`")
+                            });
+                        Some(*kinds_by_id.get(&origin).expect("origin value exists"))
+                    } else {
+                        Some(assigned_kind)
+                    }
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    #[hardwon(
+        "#8590: uninitialized Go slice, map, channel, function, and pointer declarations must lower to nil like = nil"
+    )]
+    fn uninitialized_nil_zero_declarations_agree_with_explicit_nil() {
+        let direct_and_grouped_source = r#"package main
+
+import (
+    "example.com/missing"
+    "example.com/registry"
+)
+
+type (
+    localSlice   []missing.Elem
+    localAlias   = []missing.Elem
+    parenAlias   = ([]missing.Elem)
+    genericSlice[T any] []T
+    outerSlice   genericSlice[missing.Elem]
+    localPtr     *missing.Item
+    nestedPtr    *localPtr
+    genericPtr[T any] *T
+    fnAlias      func(missing.Arg) missing.Ret
+    mapAlias     map[missing.Key]missing.Val
+    chanAlias    chan<- missing.Msg
+)
+
+func uninitDirect() {
+    var slice []*registry.FieldResult
+    var mapVal map[missing.Key]missing.Val
+    var chanVal chan missing.Msg
+    var recvChan <-chan missing.Msg
+    var sendChan chan<- missing.Msg
+    var fnVal func(missing.Arg) missing.Ret
+    var ptrVal *missing.Item
+    var dblPtr **missing.Item
+    var boxPtr *missing.Box[int]
+    var ifacePtr *interface{ Mark() }
+    var (
+        groupedSlice []missing.Item
+        groupedMap   mapAlias
+        groupedChan  chanAlias
+        groupedFn    fnAlias
+        groupedPtr   nestedPtr
+        namedSlice   localSlice
+        aliasSlice   localAlias
+        wrappedSlice parenAlias
+        genSlice     outerSlice
+        genPtr       genericPtr[missing.Item]
+    )
+    _ = slice
+    _ = mapVal
+    _ = chanVal
+    _ = recvChan
+    _ = sendChan
+    _ = fnVal
+    _ = ptrVal
+    _ = dblPtr
+    _ = boxPtr
+    _ = ifacePtr
+    _ = groupedSlice
+    _ = groupedMap
+    _ = groupedChan
+    _ = groupedFn
+    _ = groupedPtr
+    _ = namedSlice
+    _ = aliasSlice
+    _ = wrappedSlice
+    _ = genSlice
+    _ = genPtr
+}
+
+func explicitNilDirect() {
+    var slice []*registry.FieldResult = nil
+    var mapVal map[missing.Key]missing.Val = nil
+    var chanVal chan missing.Msg = nil
+    var recvChan <-chan missing.Msg = nil
+    var sendChan chan<- missing.Msg = nil
+    var fnVal func(missing.Arg) missing.Ret = nil
+    var ptrVal *missing.Item = nil
+    var dblPtr **missing.Item = nil
+    var boxPtr *missing.Box[int] = nil
+    var ifacePtr *interface{ Mark() } = nil
+    var (
+        groupedSlice []missing.Item = nil
+        groupedMap   mapAlias = nil
+        groupedChan  chanAlias = nil
+        groupedFn    fnAlias = nil
+        groupedPtr   nestedPtr = nil
+        namedSlice   localSlice = nil
+        aliasSlice   localAlias = nil
+        wrappedSlice parenAlias = nil
+        genSlice     outerSlice = nil
+        genPtr       genericPtr[missing.Item] = nil
+    )
+    _ = slice
+    _ = mapVal
+    _ = chanVal
+    _ = recvChan
+    _ = sendChan
+    _ = fnVal
+    _ = ptrVal
+    _ = dblPtr
+    _ = boxPtr
+    _ = ifacePtr
+    _ = groupedSlice
+    _ = groupedMap
+    _ = groupedChan
+    _ = groupedFn
+    _ = groupedPtr
+    _ = namedSlice
+    _ = aliasSlice
+    _ = wrappedSlice
+    _ = genSlice
+    _ = genPtr
+}
+
+func uninitGenericTypeParamPtr[T any]() {
+    var tp *T
+    _ = tp
+}
+
+func explicitNilGenericTypeParamPtr[T any]() {
+    var tp *T = nil
+    _ = tp
+}
+"#;
+        let procedures = lower_fixture(direct_and_grouped_source);
+        let uninit = named_procedure(&procedures, "uninitDirect");
+        let with_nil = named_procedure(&procedures, "explicitNilDirect");
+        assert!(
+            uninit.gaps.is_empty(),
+            "unexpected gaps: {:#?}",
+            uninit.gaps
+        );
+        assert!(
+            with_nil.gaps.is_empty(),
+            "unexpected gaps: {:#?}",
+            with_nil.gaps
+        );
+
+        let backing_zero_flow = ValueFlowKind::BackingStore {
+            offset: BackingStoreOffset::Zero,
+        };
+        for (name, expected_flow) in [
+            ("slice", backing_zero_flow),
+            ("mapVal", backing_zero_flow),
+            ("chanVal", ValueFlowKind::Local),
+            ("recvChan", ValueFlowKind::Local),
+            ("sendChan", ValueFlowKind::Local),
+            ("fnVal", ValueFlowKind::Local),
+            ("ptrVal", ValueFlowKind::Local),
+            ("dblPtr", ValueFlowKind::Local),
+            ("boxPtr", ValueFlowKind::Local),
+            ("ifacePtr", ValueFlowKind::Local),
+            ("groupedSlice", backing_zero_flow),
+            ("groupedMap", backing_zero_flow),
+            ("groupedChan", ValueFlowKind::Local),
+            ("groupedFn", ValueFlowKind::Local),
+            ("groupedPtr", ValueFlowKind::Local),
+            ("namedSlice", backing_zero_flow),
+            ("aliasSlice", backing_zero_flow),
+            ("wrappedSlice", backing_zero_flow),
+            ("genSlice", backing_zero_flow),
+            ("genPtr", ValueFlowKind::Local),
+        ] {
+            let uninit_sources = local_assignment_sources(uninit, direct_and_grouped_source, name);
+            let nil_origins =
+                local_converted_assignment_origins(with_nil, direct_and_grouped_source, name);
+            assert_eq!(
+                uninit_sources,
+                vec![(&SemanticValueKind::Null, expected_flow)],
+                "uninitialized `{name}` should lower to Null"
+            );
+            assert_eq!(
+                nil_origins,
+                vec![&SemanticValueKind::Null],
+                "explicit `= nil` `{name}` should originate at Null"
+            );
+        }
+
+        let tp_uninit = named_procedure(&procedures, "uninitGenericTypeParamPtr");
+        let tp_nil = named_procedure(&procedures, "explicitNilGenericTypeParamPtr");
+        let generic_subst_gap =
+            "generic Go callable and receiver type substitutions are not yet represented";
+        assert_eq!(
+            tp_uninit
+                .gaps
+                .iter()
+                .map(|gap| gap.detail.as_ref())
+                .collect::<Vec<_>>(),
+            vec![generic_subst_gap]
+        );
+        assert_eq!(
+            tp_nil
+                .gaps
+                .iter()
+                .map(|gap| gap.detail.as_ref())
+                .collect::<Vec<_>>(),
+            vec![generic_subst_gap]
+        );
+        assert_eq!(
+            local_assignment_sources(tp_uninit, direct_and_grouped_source, "tp"),
+            vec![(&SemanticValueKind::Null, ValueFlowKind::Local)]
+        );
+        assert_eq!(
+            local_converted_assignment_origins(tp_nil, direct_and_grouped_source, "tp"),
+            vec![&SemanticValueKind::Null]
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#12620: in a file with no type declarations, parentheses used up go_file_underlying_type's loop limit, so ([]T) and (*T) resolved to nothing"
+    )]
+    fn parenthesized_nil_zero_types_resolve_without_type_declarations() {
+        // The file declares no named types, so the alias-chain limit in
+        // go_file_underlying_type is one step. Parentheses must not use it.
+        let backing_zero_flow = ValueFlowKind::BackingStore {
+            offset: BackingStoreOffset::Zero,
+        };
+        let zero_type_def_paren_source = r#"package main
+
+import "example.com/missing"
+
+func uninitParen() {
+    var slice ([]missing.Elem)
+    var ptr ((*missing.Item))
+    var mapVal (map[string]missing.Val)
+    var fnVal ((func(missing.Arg)))
+    var chanVal (<-chan missing.Msg)
+    _ = slice
+    _ = ptr
+    _ = mapVal
+    _ = fnVal
+    _ = chanVal
+}
+
+func explicitNilParen() {
+    var slice ([]missing.Elem) = nil
+    var ptr ((*missing.Item)) = nil
+    var mapVal (map[string]missing.Val) = nil
+    var fnVal ((func(missing.Arg))) = nil
+    var chanVal (<-chan missing.Msg) = nil
+    _ = slice
+    _ = ptr
+    _ = mapVal
+    _ = fnVal
+    _ = chanVal
+}
+"#;
+        let paren_procs = lower_fixture(zero_type_def_paren_source);
+        let paren_uninit = named_procedure(&paren_procs, "uninitParen");
+        let paren_nil = named_procedure(&paren_procs, "explicitNilParen");
+        assert!(paren_uninit.gaps.is_empty(), "{:#?}", paren_uninit.gaps);
+        assert!(paren_nil.gaps.is_empty(), "{:#?}", paren_nil.gaps);
+        for (name, expected_flow) in [
+            ("slice", backing_zero_flow),
+            ("ptr", ValueFlowKind::Local),
+            ("mapVal", backing_zero_flow),
+            ("fnVal", ValueFlowKind::Local),
+            ("chanVal", ValueFlowKind::Local),
+        ] {
+            assert_eq!(
+                local_assignment_sources(paren_uninit, zero_type_def_paren_source, name),
+                vec![(&SemanticValueKind::Null, expected_flow)],
+                "parenthesized `{name}` with zero type definitions should lower to Null"
+            );
+            assert_eq!(
+                local_converted_assignment_origins(paren_nil, zero_type_def_paren_source, name),
+                vec![&SemanticValueKind::Null]
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#8590: multi-name and blank nil-zero declarations match = nil without spurious gaps"
+    )]
+    fn multi_name_and_blank_nil_zero_declarations_lower_cleanly() {
+        let source = r#"package main
+
+import "example.com/missing"
+
+func multiAndBlankUninit() {
+    var a, b []missing.Elem
+    var _ []missing.Elem
+    var _, ch <-chan missing.Msg
+    var fnVal, _ func(missing.Arg)
+    var _, _ *missing.Item
+    _ = a
+    _ = b
+    _ = ch
+    _ = fnVal
+}
+
+func singleNilBaseline() {
+    var a []missing.Elem = nil
+    var b []missing.Elem = nil
+    var _ []missing.Elem = nil
+    var ch <-chan missing.Msg = nil
+    var fnVal func(missing.Arg) = nil
+    _ = a
+    _ = b
+    _ = ch
+    _ = fnVal
+}
+
+func blankOnly() {
+    var _ []missing.Elem
+    var _, _ *missing.Item
+}
+"#;
+        let procedures = lower_fixture(source);
+        let uninit = named_procedure(&procedures, "multiAndBlankUninit");
+        let with_nil = named_procedure(&procedures, "singleNilBaseline");
+        let blank_only = named_procedure(&procedures, "blankOnly");
+        assert!(uninit.gaps.is_empty(), "{:#?}", uninit.gaps);
+        assert!(with_nil.gaps.is_empty(), "{:#?}", with_nil.gaps);
+        assert!(blank_only.gaps.is_empty(), "{:#?}", blank_only.gaps);
+        assert!(
+            local_assignment_sources(blank_only, source, "_").is_empty(),
+            "blank declaration must not create local bindings"
+        );
+        let backing_zero_flow = ValueFlowKind::BackingStore {
+            offset: BackingStoreOffset::Zero,
+        };
+        for (name, expected_flow) in [
+            ("a", backing_zero_flow),
+            ("b", backing_zero_flow),
+            ("ch", ValueFlowKind::Local),
+            ("fnVal", ValueFlowKind::Local),
+        ] {
+            assert_eq!(
+                local_assignment_sources(uninit, source, name),
+                vec![(&SemanticValueKind::Null, expected_flow)],
+                "multi-name/blank binding `{name}` should lower to Null"
+            );
+            assert_eq!(
+                local_converted_assignment_origins(with_nil, source, name),
+                vec![&SemanticValueKind::Null]
+            );
+        }
+        assert!(local_assignment_sources(uninit, source, "_").is_empty());
+        assert!(local_assignment_sources(with_nil, source, "_").is_empty());
+    }
+
+    #[test]
+    #[hardwon(
+        "#8590: scalars keep go.zero_value and unresolved nominals/interfaces keep honest gaps"
+    )]
+    fn uninitialized_declarations_preserve_scalars_aggregates_and_unresolved_nominal_gaps() {
+        let source = r#"package main
+
+import "example.com/missing"
+
+type (
+    anyAlias = any
+    shadow   struct{}
+    cycA     cycB
+    cycB     cycA
+)
+
+func scalarsAndAggregates() {
+    var count int
+    var label string
+    var flag bool
+    var fixed [2]missing.Item
+    var box struct {
+        item missing.Item
+    }
+    _ = count
+    _ = label
+    _ = flag
+    _ = fixed
+    _ = box
+}
+
+func honestGaps[T any, shadow any]() {
+    var anyVal any
+    var emptyIface interface{}
+    var nonEmptyIface interface{ Mark() }
+    var aliasedAny anyAlias
+    var errVal error
+    var externalNominal missing.Nominal
+    var externalGeneric missing.Box[int]
+    var bareTypeParam T
+    var shadowedParam shadow
+    var cyclicAlias cycA
+    _ = anyVal
+    _ = emptyIface
+    _ = nonEmptyIface
+    _ = aliasedAny
+    _ = errVal
+    _ = externalNominal
+    _ = externalGeneric
+    _ = bareTypeParam
+    _ = shadowedParam
+    _ = cyclicAlias
+}
+"#;
+        let procedures = lower_fixture(source);
+        let scalars = named_procedure(&procedures, "scalarsAndAggregates");
+        assert!(scalars.gaps.is_empty(), "{:#?}", scalars.gaps);
+        let expected_zero = SemanticValueKind::LanguageDefined("go.zero_value".into());
+        for name in ["count", "label", "flag", "fixed", "box"] {
+            assert_eq!(
+                local_assignment_sources(scalars, source, name),
+                vec![(&expected_zero, ValueFlowKind::Local)],
+                "scalar/aggregate `{name}` must preserve go.zero_value"
+            );
+        }
+
+        let gaps_proc = named_procedure(&procedures, "honestGaps");
+        for name in [
+            "anyVal",
+            "aliasedAny",
+            "errVal",
+            "externalNominal",
+            "cyclicAlias",
+        ] {
+            let sources = local_assignment_sources(gaps_proc, source, name);
+            assert!(
+                !sources
+                    .iter()
+                    .any(|(kind, _)| matches!(kind, SemanticValueKind::Null)),
+                "non-nil-zero `{name}` must never fabricate Null"
+            );
+            assert_eq!(
+                sources,
+                vec![(&expected_zero, ValueFlowKind::Local)],
+                "nominal/interface-id `{name}` should preserve go.zero_value"
+            );
+        }
+
+        for name in [
+            "emptyIface",
+            "nonEmptyIface",
+            "externalGeneric",
+            "bareTypeParam",
+            "shadowedParam",
+        ] {
+            assert!(
+                local_assignment_sources(gaps_proc, source, name).is_empty(),
+                "unresolved non-nil-zero `{name}` must not fabricate a zero value"
+            );
+            let target = gaps_proc
+                .values
+                .iter()
+                .find(|value| source_text(source, value_source_span(gaps_proc, value.id)) == name)
+                .unwrap_or_else(|| panic!("expected local value `{name}`"))
+                .id;
+            assert!(
+                gaps_proc.gaps.iter().any(|gap| {
+                    gap.subject == SemanticGapSubject::Value(target)
+                        && gap.capability == SemanticCapability::Values
+                        && gap.kind == SemanticGapKind::Unsupported
+                        && gap.detail.as_ref()
+                            == "Go zero value for an unresolved declared type is not lowered"
+                }),
+                "expected honest Unsupported zero-value gap for `{name}` in {:#?}",
+                gaps_proc.gaps
+            );
+        }
     }
 
     #[test]

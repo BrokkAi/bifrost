@@ -11,12 +11,20 @@
 //! budgeted question has to name this type without naming
 //! `brokk-bifrost-analysis`.
 
+/// Evidence that a provider could not enumerate its full input domain.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+pub enum QueryIncompleteReason {
+    WorkspaceFileOmission(super::project::WorkspaceFileOmission),
+}
+
 #[doc(hidden)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryBatch<T> {
     pub rows: Vec<T>,
     pub inspected: usize,
     pub complete: bool,
+    /// Known causes, when available; capped batches may have no detailed cause.
+    pub incomplete_reasons: Vec<QueryIncompleteReason>,
 }
 
 impl<T> QueryBatch<T> {
@@ -25,6 +33,7 @@ impl<T> QueryBatch<T> {
             rows,
             inspected,
             complete: true,
+            incomplete_reasons: Vec::new(),
         }
     }
 
@@ -33,6 +42,7 @@ impl<T> QueryBatch<T> {
             rows,
             inspected,
             complete: false,
+            incomplete_reasons: Vec::new(),
         }
     }
 
@@ -40,6 +50,7 @@ impl<T> QueryBatch<T> {
         self.rows.extend(other.rows);
         self.inspected = self.inspected.saturating_add(other.inspected);
         self.complete &= other.complete;
+        self.incomplete_reasons.extend(other.incomplete_reasons);
         self
     }
 }

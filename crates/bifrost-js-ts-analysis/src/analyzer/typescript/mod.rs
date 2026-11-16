@@ -283,7 +283,7 @@ impl JsTsSource for TypescriptAnalyzer {
     fn source_file_inventory(
         &self,
     ) -> brokk_bifrost_core::analyzer::query_batch::QueryBatch<ProjectFile> {
-        brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer::source_file_inventory(&self.inner)
+        crate::analyzer::js_ts::providers::jsts_source_inventory(&self.inner)
     }
 
     fn source_facts(
@@ -638,6 +638,11 @@ impl CodeUnitIndex for TypescriptAnalyzer {
     }
 
     delegate_inner_methods! {
+        fn owns_source_file(&self, file: &ProjectFile) -> bool;
+        fn indexed_source_files(&self) -> brokk_bifrost_analysis::analyzer::QueryBatch<ProjectFile>;
+    }
+
+    delegate_inner_methods! {
         fn indexed_blob_oid(&self, file: &ProjectFile) -> Option<brokk_bifrost_analysis::analyzer::Oid>;
     }
 
@@ -837,11 +842,8 @@ impl IAnalyzer for TypescriptAnalyzer {
     }
 
     delegate_inner_methods! {
-        fn record_query_failure(&self, error: crate::analyzer::store::StoreError);
-    }
-
-    delegate_inner_methods! {
         fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell>;
+        fn workspace_file_inventory_cell(&self) -> Option<crate::analyzer::WorkspaceFileInventoryCell>;
     }
 
     delegate_inner_methods! {
@@ -943,6 +945,13 @@ impl IAnalyzer for TypescriptAnalyzer {
     ) -> Vec<&dyn crate::analyzer::structural::StructuralFactProvider>;
     }
 
+    fn generation_membership(
+        &self,
+    ) -> &Arc<brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::GenerationWorkspaceMembership>
+    {
+        IAnalyzer::generation_membership(&self.inner)
+    }
+
     fn snapshot_caches(
         &self,
     ) -> Option<&brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerSnapshotCaches> {
@@ -965,7 +974,10 @@ impl IAnalyzer for TypescriptAnalyzer {
         fn contains_tests(&self, file: &ProjectFile) -> bool;
     }
 
-    fn in_test_region(&self, code_unit: &brokk_bifrost_core::analyzer::model::CodeUnit) -> bool {
+    fn in_test_region(
+        &self,
+        code_unit: &brokk_bifrost_core::analyzer::model::CodeUnit,
+    ) -> Result<bool, brokk_bifrost_analysis::analyzer::QueryReadIncomplete> {
         self.inner.in_test_region(code_unit)
     }
 
@@ -1137,6 +1149,8 @@ impl brokk_bifrost_analysis::analyzer::multi_analyzer::LanguageAnalyzer for Type
     ) -> Box<dyn brokk_bifrost_analysis::analyzer::multi_analyzer::LanguageAnalyzer> {
         Box::new(TypescriptAnalyzer::update_all_with_progress(self, progress))
     }
+
+    brokk_bifrost_analysis::delegate_generation_membership_updates!(TypescriptAnalyzer);
 
     fn as_any(&self) -> &dyn std::any::Any {
         self

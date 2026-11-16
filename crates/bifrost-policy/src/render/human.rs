@@ -23,11 +23,11 @@ use super::super::{
     PolicySelectionProvenance, PolicySeveritySpec, PolicySourceLocation, PolicySuppressionDecision,
     PolicySuppressionMatchState, PolicySuppressionOrphanState, PolicySuppressionPolicyHashState,
     PolicySuppressionReview, PolicySuppressionTemporalState, ProofMetadata, ProofReason,
-    ResolvedEndpointDependency, ResolvedEndpointIdentity, ResolvedEndpointManifestEntry,
-    ResolvedEndpointSelectorSchemas, ResolvedEndpointSetDependency, ResolvedMatchDirectoryManifest,
-    ResolvedPrecedenceEdge, ResolvedTypestateTerminal, SchemaVersionOrigin,
-    SchemaVersionResolution, StableSemanticIdentity, SubjectVerdict, TaintSourceEvidence,
-    TypestateViolationEvidence,
+    RelatedLocationOmissions, ResolvedEndpointDependency, ResolvedEndpointIdentity,
+    ResolvedEndpointManifestEntry, ResolvedEndpointSelectorSchemas, ResolvedEndpointSetDependency,
+    ResolvedMatchDirectoryManifest, ResolvedPrecedenceEdge, ResolvedTypestateTerminal,
+    SchemaVersionOrigin, SchemaVersionResolution, StableSemanticIdentity, SubjectVerdict,
+    TaintSourceEvidence, TypestateViolationEvidence,
 };
 
 use super::{
@@ -128,6 +128,11 @@ pub fn write_policy_human<W: Write>(
             escape_terminal_text(diagnostic.message()),
         )
         .map_err(map_io_error)?;
+        write_related_location_omissions(
+            &mut output,
+            "  ",
+            diagnostic.omitted_related_locations_lower_bound(),
+        )?;
         if let Some(source) = diagnostic.source() {
             write!(output, " ({})", escape_terminal_text(source.as_str())).map_err(map_io_error)?;
             if let Some(range) = diagnostic.byte_range() {
@@ -443,6 +448,11 @@ fn write_concise_report<W: Write>(
             escape_terminal_text(diagnostic.message()),
         )
         .map_err(map_io_error)?;
+        write_related_location_omissions(
+            output,
+            "    ",
+            diagnostic.omitted_related_locations_lower_bound(),
+        )?;
         if let Some(source) = diagnostic.source() {
             write!(
                 output,
@@ -506,6 +516,23 @@ fn write_concise_report<W: Write>(
             write_policy_diagnostic_code(output, diagnostic.code())?;
             writeln!(output, ": {}", escape_terminal_text(diagnostic.message()))
                 .map_err(map_io_error)?;
+            for root in diagnostic
+                .exhausted_roots()
+                .iter()
+                .filter(|root| root.is_budget_refusal())
+            {
+                writeln!(
+                    output,
+                    "    Budget: {}",
+                    escape_terminal_text(&root.render())
+                )
+                .map_err(map_io_error)?;
+            }
+            write_related_location_omissions(
+                output,
+                "    ",
+                diagnostic.omitted_related_locations_lower_bound(),
+            )?;
             if diagnostic.family_count() > 1 {
                 writeln!(output, "    Occurrences: {}", diagnostic.family_count())
                     .map_err(map_io_error)?;
@@ -1171,8 +1198,12 @@ fn write_finding<W: Write>(
     if finding.related_truncated() {
         writeln!(
             output,
-            "  related locations truncated: at least {} omitted",
-            finding.omitted_related_locations_lower_bound(),
+            "  related locations truncated: {}{} omitted",
+            match finding.related_locations_omitted().exactness() {
+                brokk_bifrost_core::omission::OmissionExactness::Exact => "",
+                brokk_bifrost_core::omission::OmissionExactness::LowerBound => "at least ",
+            },
+            finding.related_locations_omitted().count(),
         )
         .map_err(map_io_error)?;
     }
@@ -1837,7 +1868,10 @@ fn write_endpoint_binding<W: Write>(
     match binding {
         PolicyEndpointBinding::MatchedValue => write!(output, "matched value"),
         PolicyEndpointBinding::Receiver => write!(output, "receiver"),
-        PolicyEndpointBinding::ReturnValue => write!(output, "return value"),
+        PolicyEndpointBinding::ReturnValue { path: None } => write!(output, "return value"),
+        PolicyEndpointBinding::ReturnValue { path: Some(path) } => {
+            write!(output, "return value component {path:?}")
+        }
         PolicyEndpointBinding::ResultIndex { index } => write!(output, "result {index}"),
         PolicyEndpointBinding::ArgumentIndex { index } => write!(output, "argument {index}"),
         PolicyEndpointBinding::ArgumentName { name } => {
@@ -3121,6 +3155,9 @@ fn write_query_result_detail<W: Write>(
     result: &PolicyQueryResultRef,
 ) -> Result<(), PolicyRenderError> {
     match result {
+        PolicyQueryResultRef::Procedure { source_owner } => {
+            write_optional_stable_identity(output, Some(source_owner))?;
+        }
         PolicyQueryResultRef::DependencyEvidence {
             package,
             exact_version,
@@ -3618,6 +3655,11 @@ fn write_run_diagnostics<W: Write>(
         .map_err(map_io_error)?;
         write_policy_diagnostic_code(output, diagnostic.code())?;
         write!(output, ": {}", escape_terminal_text(diagnostic.message())).map_err(map_io_error)?;
+        write_related_location_omissions(
+            output,
+            "  ",
+            diagnostic.omitted_related_locations_lower_bound(),
+        )?;
         // A folded entry stands for every diagnostic of its reason family, so
         // the count is the only place that census survives the cap (#2356).
         if diagnostic.family_count() > 1 {
@@ -3644,6 +3686,26 @@ fn write_run_diagnostics<W: Write>(
         }
     }
     Ok(())
+}
+
+fn write_related_location_omissions<W: Write>(
+    output: &mut BoundedWriter<W>,
+    indent: &str,
+    omissions: RelatedLocationOmissions,
+) -> Result<(), PolicyRenderError> {
+    match omissions {
+        RelatedLocationOmissions::Known(0) => return Ok(()),
+        RelatedLocationOmissions::Known(count) => {
+            writeln!(
+                output,
+                "{indent}Related locations omitted: at least {count}"
+            )
+        }
+        RelatedLocationOmissions::Unknown => {
+            writeln!(output, "{indent}Related locations omitted: unknown")
+        }
+    }
+    .map_err(map_io_error)
 }
 
 /// Name the verdicts this run could not publish.
@@ -4554,6 +4616,7 @@ const fn cvss_version(value: CvssVersion) -> &'static str {
 
 const fn query_result_kind(value: &PolicyQueryResultRef) -> &'static str {
     match value {
+        PolicyQueryResultRef::Procedure { .. } => "procedure source owner",
         PolicyQueryResultRef::DependencyEvidence { .. } => "dependency_evidence",
         PolicyQueryResultRef::ConfigurationFact { .. } => "configuration_fact",
         PolicyQueryResultRef::GenerationSite { .. } => "generation_site",
@@ -4720,6 +4783,10 @@ fn report_diagnostic_code(value: super::super::PolicyReportDiagnosticCode) -> &'
         Code::BaselineAuditRetentionExceeded => "baseline-audit-retention-exceeded",
         Code::PacksLoadFailed => "packs-load-failed",
         Code::PackActivationFailed => "pack-activation-failed",
+        Code::BuiltinPolicyPackRejected => "builtin-policy-pack-rejected",
+        Code::BuiltinPolicyRejected => "builtin-policy-rejected",
+        Code::IdentifierTyposIncomplete => "identifier-typos-incomplete",
+        Code::PackCatalogsIncomplete => "pack-catalogs-incomplete",
         Code::WorkspaceModelLoadFailed => "workspace-model-load-failed",
         Code::WorkspaceModelInert => "workspace-model-inert",
         Code::ApproximateStandardLibrary => "approximate-standard-library",

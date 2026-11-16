@@ -1148,7 +1148,7 @@ fn jsts_module_export_candidates(
     exported_name: &str,
     value_position: bool,
 ) -> Vec<CodeUnit> {
-    let Some(index) = host.usage_index(None) else {
+    let Some(index) = host.complete_usage_index(None) else {
         return Vec::new();
     };
 

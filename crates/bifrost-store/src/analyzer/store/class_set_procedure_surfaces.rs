@@ -12,11 +12,12 @@ use sha2::Sha256;
 use std::sync::LazyLock;
 
 use super::class_set_summaries::ClassSetSummaryDigest;
-use super::read_keys::{ReadKeyColumns, decode_read_key};
+use super::read_keys::{ReadKeyBatch, ReadKeyColumns};
 use super::{AnalyzerStore, PARSED_BLOB_COMPLETE_CONDITION, Result, StoreError};
 use crate::CancellationToken;
 use crate::analyzer::Language;
 use crate::analyzer::read_ledger::{LookupKind, LookupQuestion, ReadKey};
+use crate::analyzer::semantic::ids::StableDigest;
 use crate::analyzer::semantic::{CandidateCoverage, SemanticCapability};
 use crate::hash::HashSet;
 
@@ -274,6 +275,13 @@ impl ClassSetProcedureSurfaceRow {
     }
 
     pub fn canonical_surface_digest(&self) -> ClassSetSummaryDigest {
+        self.surface_digest_with_reads(self.reads.iter().map(ReadKey::canonical_digest))
+    }
+
+    fn surface_digest_with_reads(
+        &self,
+        reads: impl ExactSizeIterator<Item = StableDigest>,
+    ) -> ClassSetSummaryDigest {
         let mut hash = SurfaceDigest::new(b"bifrost-class-set-procedure-surface-v1");
         let key = &self.header.key;
         hash.bytes(&key.procedure_lineage);
@@ -314,16 +322,23 @@ impl ClassSetProcedureSurfaceRow {
         for child in &self.lexical_children {
             hash.identity(child);
         }
-        hash.u64(self.reads.len() as u64);
-        for read in &self.reads {
-            hash.bytes(read.canonical_digest().as_bytes());
+        hash.u64(reads.len() as u64);
+        for digest in reads {
+            hash.bytes(digest.as_bytes());
         }
         hash.finish()
     }
 
     fn canonical_exact_provenance_digest(&self) -> ClassSetSummaryDigest {
+        self.exact_provenance_for_surface(&self.canonical_surface_digest())
+    }
+
+    fn exact_provenance_for_surface(
+        &self,
+        surface_digest: &ClassSetSummaryDigest,
+    ) -> ClassSetSummaryDigest {
         let mut hash = SurfaceDigest::new(b"bifrost-class-set-procedure-surface-provenance-v1");
-        hash.bytes(&self.canonical_surface_digest());
+        hash.bytes(surface_digest);
         hash.bytes(&self.header.exact_behavior_digest);
         hash.bytes(&self.header.artifact_public_identity);
         hash.bytes(&self.header.artifact_content_identity);
@@ -763,7 +778,14 @@ fn load_surface_for_sql(
     digest: ClassSetSummaryDigest,
 ) -> Result<Option<ClassSetProcedureSurfaceRow>> {
     let raw = load_raw_surface(conn, sql, params![digest.as_slice()])?;
-    raw.map(|raw| load_surface(conn, raw)).transpose()
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    match load_surface(conn, raw) {
+        Ok(surface) => Ok(Some(surface)),
+        Err(error) if error.is_unsupported_read_key() => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 type RawSurface = (
@@ -978,42 +1000,47 @@ fn load_surface(
             "class-set procedure surface child counts disagree",
         ));
     }
-    let row = ClassSetProcedureSurfaceRow::try_new(
-        surface_header(SurfaceHeaderFields {
-            procedure_lineage: digest(lineage, "procedure lineage")?,
-            owner_rel_path: rel_path,
-            owner_storage_language_key: crate::analyzer::semantic::StorageLanguageKey::from_store(
-                storage_lang,
-            ),
-            language,
-            schema_version: schema,
-            local_structure_digest: local_structure,
-            behavior_read_digest: behavior,
-            owner_blob_oid: blob_oid,
-            owner_parse_variant,
-            artifact_public_identity: artifact_public,
-            artifact_content_identity: artifact_content,
-            exact_behavior_digest: exact_behavior,
-            carrier_semantics_digest: carrier_semantics,
-            direct_calls_digest: direct_calls,
-        })?,
-        calls,
-        lexical,
-        reads,
-    )?;
-    let stored_digest = digest(stored_digest, "surface digest")?;
-    if row.surface_digest != stored_digest {
-        return Err(StoreError::new(
-            "class-set procedure surface digest mismatch",
-        ));
-    }
-    let stored_exact_provenance = digest(exact_provenance, "exact provenance digest")?;
-    if row.exact_provenance_digest != stored_exact_provenance {
-        return Err(StoreError::new(
-            "class-set procedure surface exact provenance digest mismatch",
-        ));
-    }
-    Ok(row)
+    reads.finish_with(|keys, digests| {
+        let mut row = ClassSetProcedureSurfaceRow::try_new(
+            surface_header(SurfaceHeaderFields {
+                procedure_lineage: digest(lineage, "procedure lineage")?,
+                owner_rel_path: rel_path,
+                owner_storage_language_key:
+                    crate::analyzer::semantic::StorageLanguageKey::from_store(storage_lang),
+                language,
+                schema_version: schema,
+                local_structure_digest: local_structure,
+                behavior_read_digest: behavior,
+                owner_blob_oid: blob_oid,
+                owner_parse_variant,
+                artifact_public_identity: artifact_public,
+                artifact_content_identity: artifact_content,
+                exact_behavior_digest: exact_behavior,
+                carrier_semantics_digest: carrier_semantics,
+                direct_calls_digest: direct_calls,
+            })?,
+            calls,
+            lexical,
+            keys,
+        )?;
+        let computed_surface = row.surface_digest_with_reads(digests.iter().copied());
+        let stored_digest = digest(stored_digest, "surface digest")?;
+        if computed_surface != stored_digest {
+            return Err(StoreError::new(
+                "class-set procedure surface digest mismatch",
+            ));
+        }
+        let computed_provenance = row.exact_provenance_for_surface(&computed_surface);
+        let stored_exact_provenance = digest(exact_provenance, "exact provenance digest")?;
+        if computed_provenance != stored_exact_provenance {
+            return Err(StoreError::new(
+                "class-set procedure surface exact provenance digest mismatch",
+            ));
+        }
+        row.surface_digest = computed_surface;
+        row.exact_provenance_digest = computed_provenance;
+        Ok(row)
+    })
 }
 
 struct LoadedCall {
@@ -1229,10 +1256,10 @@ fn load_lexical_children(
         .collect()
 }
 
-fn load_reads(conn: &rusqlite::Connection, id: i64, expected: usize) -> Result<Vec<ReadKey>> {
+fn load_reads(conn: &rusqlite::Connection, id: i64, expected: usize) -> Result<ReadKeyBatch> {
     let mut statement = conn.prepare_cached(SURFACE_READS_SQL)?;
     let mut rows = statement.query(params![id, sql_limit(expected)?])?;
-    let mut reads = Vec::new();
+    let mut reads = ReadKeyBatch::default();
     while let Some(row) = rows.next()? {
         let ordinal = row.get::<_, u32>(18)?;
         if ordinal as usize != reads.len() {
@@ -1240,7 +1267,7 @@ fn load_reads(conn: &rusqlite::Connection, id: i64, expected: usize) -> Result<V
                 "class-set procedure surface read ordinals are not dense",
             ));
         }
-        reads.push(decode_read_key(row)?);
+        reads.push(row)?;
     }
     Ok(reads)
 }
@@ -1709,6 +1736,87 @@ mod tests {
             }],
         )
         .unwrap()
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10126: future read vocabulary made a procedure surface fail to load"
+    )]
+    fn unsupported_read_evidence_misses_only_its_procedure_surface() {
+        for label in ["future_lookup", "procedure_dispatch:v2"] {
+            let store = store();
+            let affected = surface(16);
+            let unaffected = surface(17);
+            for row in [&affected, &unaffected] {
+                store
+                    .publish_class_set_procedure_surface(row.clone(), &CancellationToken::new())
+                    .unwrap();
+            }
+            {
+                let conn = store.conn.lock().unwrap();
+                // A newer writer may admit a family this schema does not know.
+                conn.execute_batch("PRAGMA ignore_check_constraints=ON")
+                    .unwrap();
+                conn.execute("UPDATE class_set_procedure_surface_reads SET family=?1 WHERE surface_id=(SELECT surface_id FROM class_set_procedure_surfaces WHERE surface_digest=?2)", params![label, affected.surface_digest().as_slice()]).unwrap();
+                conn.execute_batch("PRAGMA ignore_check_constraints=OFF")
+                    .unwrap();
+            }
+            assert_eq!(
+                store
+                    .class_set_procedure_surface_for_digest(*affected.surface_digest())
+                    .unwrap(),
+                None,
+                "{label}"
+            );
+            assert_eq!(
+                store
+                    .class_set_procedure_surface_for_digest(*unaffected.surface_digest())
+                    .unwrap(),
+                Some(unaffected),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10126: unsupported reads bypassed surface child-count and content validation"
+    )]
+    fn unsupported_reads_do_not_hide_other_surface_corruption() {
+        for damage in [
+            "read_count=read_count+1",
+            "direct_calls_digest=zeroblob(32)",
+        ] {
+            let store = store();
+            let affected = surface(16);
+            let surface_digest = *affected.surface_digest();
+            store
+                .publish_class_set_procedure_surface(affected, &CancellationToken::new())
+                .unwrap();
+            {
+                let conn = store.conn.lock().unwrap();
+                conn.execute_batch("PRAGMA ignore_check_constraints=ON")
+                    .unwrap();
+                conn.execute(
+                    "UPDATE class_set_procedure_surface_reads SET family='future_lookup'",
+                    [],
+                )
+                .unwrap();
+                conn.execute(
+                    &format!("UPDATE class_set_procedure_surfaces SET {damage}"),
+                    [],
+                )
+                .unwrap();
+                conn.execute_batch("PRAGMA ignore_check_constraints=OFF")
+                    .unwrap();
+            }
+            assert!(
+                store
+                    .class_set_procedure_surface_for_digest(surface_digest)
+                    .is_err(),
+                "{damage}"
+            );
+        }
     }
 
     #[test]

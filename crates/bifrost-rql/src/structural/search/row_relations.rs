@@ -87,6 +87,10 @@ fn undecided_owner_relation(
     row: &super::super::reference_edges::ReferenceEdgeRow,
 ) -> CodeQueryDiagnostic {
     CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        has_non_utf8_refusal: false,
+        refusal_sites: Default::default(),
+        call_relation_facts: None,
+        uses_omissions: Vec::new(),
         incompleteness: brokk_bifrost_rql::Incompleteness::Content,
         related: Vec::new(),
         source: None,
@@ -458,6 +462,10 @@ pub(super) fn binding_identity_for_range(
         .any(|target_identity| target_identity == identity);
     if reassigned {
         diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
             incompleteness: Incompleteness::Content,
             related: Vec::new(),
             source: None,
@@ -538,6 +546,11 @@ pub(super) fn binding_uses_expansions(
         OccurrenceRole::ReceiverPosition,
         OccurrenceRole::ValueReference,
     ];
+    // Called local bindings and imports are uses even though policies must
+    // opt in to callee paths when selecting variable-source occurrences.
+    if crate::analyzer::common::language_for_file(value.file()) == Language::Rust {
+        roles.push(OccurrenceRole::CalleePosition);
+    }
     // Pattern-position namespaces are currently incomplete for Rust. Import
     // binders can be used solely in a pattern, so demand that role and keep
     // their no-access proof Open until the adapter can classify it.
@@ -608,19 +621,27 @@ pub(super) fn binding_uses_expansions(
             .find(|provider| provider.structural_language() == Language::Rust)
             .and_then(|provider| provider.structural_facts(value.file()))
     });
-    let opaque_rust_macro = if rust_binding_name.is_some() {
+    let opaque_rust_macro = if let Some(name) = rust_binding_name {
         match rust_facts.as_ref() {
             Some(facts) => {
-                let scope = value
-                    .row()
-                    .node
-                    .and_then(|node| rust_nearest_callable(facts, node));
-                let Some(has_macro) =
-                    occurrence_cache.rust_scope_has_macro(value.file(), facts, scope, cancellation)
-                else {
+                let Some(index) = occurrence_cache.rust_macro_access_index(
+                    analyzer,
+                    value.file(),
+                    facts,
+                    cancellation,
+                ) else {
                     *row_exhausted = true;
                     return Vec::new();
                 };
+                let activation = value.row().activation;
+                // This is the same ScopeRow range used by the access query.
+                // Intersect it with activation once; looking up each macro's
+                // innermost scope would rescan all later file scopes.
+                let start = activation.start_byte.max(binding_scope.range.start_byte);
+                let end = activation.end_byte.min(binding_scope.range.end_byte);
+                let has_macro = index.may_access(start, end, name);
+                // Opaque expansion inside visibility stays Open after
+                // shadowing: definition-site hygiene may retain the binder.
                 rust_binding_has_decorator(facts, value.row().node) || has_macro
             }
             None => true,
@@ -698,6 +719,10 @@ pub(super) fn binding_uses_expansions(
                 && diagnostic.message == message
         }) {
             diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                 incompleteness: Incompleteness::Content,
                 related: Vec::new(),
                 source: None,
@@ -755,22 +780,6 @@ fn rust_binding_has_decorator(
         current = node.parent;
     }
     false
-}
-
-fn rust_nearest_callable(facts: &crate::analyzer::structural::FileFacts, node: u32) -> Option<u32> {
-    use brokk_bifrost_core::analyzer::structural::kinds::NormalizedKind;
-    let mut current = Some(node);
-    while let Some(index) = current {
-        let fact = facts.node(index);
-        if matches!(
-            fact.kind,
-            NormalizedKind::Function | NormalizedKind::Method | NormalizedKind::Lambda
-        ) {
-            return Some(index);
-        }
-        current = fact.parent;
-    }
-    None
 }
 
 /// The candidates the resolver considered for one reference occurrence.
@@ -1063,6 +1072,10 @@ pub(super) fn selected_property_relation_expansions<'a>(
     let public_point = point.public();
     if let Some(reason) = point.exact_selection_incomplete_reason() {
         diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
             incompleteness: brokk_bifrost_rql::Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Provider),
             related: Vec::new(),
             source: None,
@@ -1082,6 +1095,10 @@ pub(super) fn selected_property_relation_expansions<'a>(
     }
     let Some(outcome) = semantic.materialized_outcome(file) else {
         diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
             incompleteness: brokk_bifrost_rql::Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Provider),
             related: Vec::new(),
             source: None,
@@ -1164,6 +1181,133 @@ pub(super) fn selected_property_relation_expansions<'a>(
         .collect()
 }
 
+// #12482: long locator records must not hide later typed causes. This summary
+// uses only deduplicated enum vocabulary, so its memory is independent of the
+// number and size of reasons. Full Debug records remain whole detail items.
+fn selected_property_incomplete_message(
+    path: &str,
+    point_id: &str,
+    generation: u64,
+    reasons: &[brokk_bifrost_flow::flow_state::FlowStateIncompleteReason],
+) -> String {
+    use crate::analyzer::semantic::PropertyReachingIncompleteReason as PropertyReason;
+    use brokk_bifrost_flow::flow_state::FlowStateIncompleteReason as Reason;
+    use std::collections::BTreeSet;
+
+    let mut cause_kinds = BTreeSet::new();
+    let mut capabilities = BTreeSet::new();
+    let mut gap_kinds = Vec::new();
+    for reason in reasons {
+        let kind = match reason {
+            Reason::NoSemanticProvider => "NoSemanticProvider",
+            Reason::Cancelled => "Cancelled",
+            Reason::SourceGenerationChanged => "SourceGenerationChanged",
+            Reason::NoStructuralFacts => "NoStructuralFacts",
+            Reason::PropertyProviderUnavailable => "PropertyProviderUnavailable",
+            Reason::AxisUnsupported(..) => "AxisUnsupported",
+            Reason::SemanticProviderFailed { .. } => "SemanticProviderFailed",
+            Reason::SemanticAnalysisPartial { .. } => "SemanticAnalysisPartial",
+            Reason::BindingScopeLivenessUnavailable { .. } => "BindingScopeLivenessUnavailable",
+            Reason::ControlProjectionRejected { .. } => "ControlProjectionRejected",
+            Reason::ModeledControlProjectionIncomplete { .. } => {
+                "ModeledControlProjectionIncomplete"
+            }
+            Reason::BudgetExhausted { .. } => "BudgetExhausted",
+            Reason::PropertyBaseNotCanonical { .. } => "PropertyBaseNotCanonical",
+            Reason::SelectedPropertyEndpointUnavailable { .. } => {
+                "SelectedPropertyEndpointUnavailable"
+            }
+            Reason::BindingWithoutEstablishment { .. } => "BindingWithoutEstablishment",
+            Reason::BindingStateNotClosed { .. } => "BindingStateNotClosed",
+            Reason::PropertyProviderFailed { .. } => "PropertyProviderFailed",
+            Reason::PropertyAnalysisPartial { .. } => "PropertyAnalysisPartial",
+            Reason::LoweringGap {
+                capability, kind, ..
+            } => {
+                capabilities.insert(*capability);
+                if !gap_kinds.contains(kind) {
+                    gap_kinds.push(*kind);
+                }
+                "LoweringGap"
+            }
+            Reason::PropertyReaching { reason } => {
+                let kind = match reason.as_ref() {
+                    PropertyReason::SelectedReadMissing { .. } => "SelectedReadMissing",
+                    PropertyReason::SelectedReadAmbiguous { .. } => "SelectedReadAmbiguous",
+                    PropertyReason::SelectedRelationEndpointUnavailable { .. } => {
+                        "SelectedRelationEndpointUnavailable"
+                    }
+                    PropertyReason::SelectedRuntimeAccess { .. } => "SelectedRuntimeAccess",
+                    PropertyReason::SelectedAncestorStore { .. } => "SelectedAncestorStore",
+                    PropertyReason::SelectedAliasClosureUnavailable { .. } => {
+                        "SelectedAliasClosureUnavailable"
+                    }
+                    PropertyReason::InputRelationBudgetExceeded { .. } => {
+                        "InputRelationBudgetExceeded"
+                    }
+                    PropertyReason::ReachingPairBudgetExceeded { .. } => {
+                        "ReachingPairBudgetExceeded"
+                    }
+                    PropertyReason::UnsupportedLocation { .. } => "UnsupportedLocation",
+                    PropertyReason::DurableIdentityUnavailable { .. } => {
+                        "DurableIdentityUnavailable"
+                    }
+                    PropertyReason::SourceMappingUnavailable { .. } => "SourceMappingUnavailable",
+                    PropertyReason::StoreEvidenceIncomplete { .. } => "StoreEvidenceIncomplete",
+                    PropertyReason::ReadEvidenceIncomplete { .. } => "ReadEvidenceIncomplete",
+                    PropertyReason::FieldMemoryEndpointUnavailable { .. } => {
+                        "FieldMemoryEndpointUnavailable"
+                    }
+                    PropertyReason::EvaluationEndpointUnavailable { .. } => {
+                        "EvaluationEndpointUnavailable"
+                    }
+                    PropertyReason::EvaluationEvidenceIncomplete { .. } => {
+                        "EvaluationEvidenceIncomplete"
+                    }
+                    PropertyReason::CandidateCoverage(..) => "CandidateCoverage",
+                    PropertyReason::ReachingDefinitions(..) => "ReachingDefinitions",
+                    PropertyReason::Reachability(..) => "Reachability",
+                    PropertyReason::Dominators(..) => "Dominators",
+                    PropertyReason::ReachingPairs(..) => "ReachingPairs",
+                    PropertyReason::Cancelled => "Cancelled",
+                    PropertyReason::EvaluationSourceUnknown => "EvaluationSourceUnknown",
+                    PropertyReason::SelectedSemanticGap { gap }
+                    | PropertyReason::SelectedCleanupMemberGap { gap, .. } => {
+                        capabilities.insert(gap.capability);
+                        if !gap_kinds.contains(&gap.kind) {
+                            gap_kinds.push(gap.kind);
+                        }
+                        match reason.as_ref() {
+                            PropertyReason::SelectedSemanticGap { .. } => "SelectedSemanticGap",
+                            PropertyReason::SelectedCleanupMemberGap { .. } => {
+                                "SelectedCleanupMemberGap"
+                            }
+                            _ => unreachable!("matched selected gap"),
+                        }
+                    }
+                };
+                cause_kinds.insert(kind);
+                "PropertyReaching"
+            }
+        };
+        cause_kinds.insert(kind);
+    }
+    gap_kinds.sort_unstable_by_key(|kind| kind.label());
+    let summary = format!(
+        "cause_kinds={cause_kinds:?}; capabilities={capabilities:?}; gap_kinds={gap_kinds:?}"
+    );
+    brokk_bifrost_core::bounded_output::bounded_diagnostic_items_with_summary(
+        format_args!(
+            "{path} selected property-reaching relations for program point {point_id} are incomplete in generation {generation}: reasons={reasons:?}"
+        ),
+        &summary,
+        format_args!(
+            "{path} selected property-reaching relations for program point {point_id} are incomplete in generation {generation}"
+        ),
+        reasons.iter(),
+    )
+}
+
 fn report_selected_property_completeness(
     analyzer: &dyn IAnalyzer,
     procedure: &SemanticProcedureValue,
@@ -1187,22 +1331,31 @@ fn report_selected_property_completeness(
     let cause = reasons
         .iter()
         .find_map(|reason| flow_state::classify_reason(reason).2);
-    diagnostics.push(QueryExecutionState::diagnostic(analyzer, CodeQueryDiagnostic::new(CodeQueryDiagnostic {
-        incompleteness: brokk_bifrost_rql::Incompleteness::Content,
-        related: procedure.related_flow_reasons(&reasons),
-        source: procedure.diagnostic_source(),
-        code: CodeQueryDiagnosticCode::FlowStateDerivationIncomplete,
-        impact: CodeQueryDiagnosticImpact::Incomplete,
-        branch: Vec::new(),
-        language: "workspace",
-        message: format!(
-            "{} selected property-reaching relations for program point {point_id} are incomplete in generation {}: reasons={reasons:?}",
-            rel_path_string(procedure.file()),
-            scoped.generation
-        ),
-        exhausted_roots: Vec::new(),
-        withheld_rows_path: None,
-    }), cause));
+    diagnostics.push(QueryExecutionState::diagnostic(
+        analyzer,
+        CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            has_non_utf8_refusal: false,
+            refusal_sites: Default::default(),
+            call_relation_facts: None,
+            uses_omissions: Vec::new(),
+            incompleteness: brokk_bifrost_rql::Incompleteness::Content,
+            related: procedure.related_flow_reasons(&reasons),
+            source: procedure.diagnostic_source(),
+            code: CodeQueryDiagnosticCode::FlowStateDerivationIncomplete,
+            impact: CodeQueryDiagnosticImpact::Incomplete,
+            branch: Vec::new(),
+            language: "workspace",
+            message: selected_property_incomplete_message(
+                &rel_path_string(procedure.file()),
+                point_id,
+                scoped.generation,
+                &reasons,
+            ),
+            exhausted_roots: Vec::new(),
+            withheld_rows_path: None,
+        }),
+        cause,
+    ));
 }
 
 /// The flow relations incident to one state event: seeded from an event, an
@@ -1608,6 +1761,10 @@ fn binding_initializer_incomplete(
         return;
     }
     diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        has_non_utf8_refusal: false,
+        refusal_sites: Default::default(),
+        call_relation_facts: None,
+        uses_omissions: Vec::new(),
         incompleteness,
         related: Vec::new(),
         source: None,
@@ -1984,6 +2141,10 @@ pub(super) fn edge_row_expansions(
     if omitted > 0 {
         let language = omitted_language.expect("an omitted edge names its language");
         diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
             incompleteness: brokk_bifrost_rql::Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Provider),
             related: Vec::new(),
             source: None,
@@ -2010,6 +2171,78 @@ mod owner_relation_tests {
         EdgeProvenance, OwnerRelation, SiteClass,
     };
     use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#12482: oversized real locator records hid later selected-property cause kinds")]
+    fn selected_property_summary_survives_oversized_locators() {
+        use crate::analyzer::semantic::ir::SemanticGapKind;
+        use crate::analyzer::semantic::{
+            DeclarationLocator, DeclarationSegment, DeclarationSegmentKind, ProgramPointId,
+            PropertyReachingIncompleteReason, SemanticCapability, SemanticLanguage,
+            SemanticLocator, SemanticRole, SourceAnchor, SourceMappingId, SourcePosition,
+            SourceSpan, WorkspaceMountId, WorkspaceRelativePath,
+        };
+        use brokk_bifrost_flow::flow_state::FlowStateIncompleteReason;
+
+        let root = tempfile::tempdir().unwrap();
+        let anchor = SourceAnchor::new(
+            SourceSpan::new(SourcePosition::new(0, 0, 0), SourcePosition::new(1, 0, 1)).unwrap(),
+            0,
+        );
+        let locator = SemanticLocator::new(
+            WorkspaceMountId::from_root(root.path()),
+            WorkspaceRelativePath::new(format!("src/{}.js", "long".repeat(1_300))).unwrap(),
+            SemanticLanguage::Standard(Language::JavaScript),
+            DeclarationLocator::new(vec![
+                DeclarationSegment::named(DeclarationSegmentKind::File, "main.js", anchor, 0)
+                    .unwrap(),
+            ])
+            .unwrap(),
+            SemanticRole::SourceMapping,
+            anchor,
+        );
+        assert!(format!("{locator:?}").len() > 4_096);
+        let reasons = vec![
+            FlowStateIncompleteReason::PropertyReaching {
+                reason: Box::new(PropertyReachingIncompleteReason::SelectedRuntimeAccess {
+                    point: ProgramPointId::new(0),
+                    event_index: 0,
+                    source: SourceMappingId::new(0),
+                    source_locator: Some(locator.clone()),
+                    receiver: None,
+                }),
+            },
+            FlowStateIncompleteReason::PropertyReaching {
+                reason: Box::new(PropertyReachingIncompleteReason::SelectedAncestorStore {
+                    point: ProgramPointId::new(0),
+                    event_index: 1,
+                    source: SourceMappingId::new(0),
+                    source_locator: Some(locator),
+                    location: None,
+                }),
+            },
+            FlowStateIncompleteReason::LoweringGap {
+                gaps: vec![],
+                capability: SemanticCapability::IndexMemory,
+                kind: SemanticGapKind::Unsupported,
+                detail: "runtime index".to_owned(),
+            },
+        ];
+        let message = selected_property_incomplete_message("src/main.js", "point", 0, &reasons);
+        assert!(message.len() <= brokk_bifrost_core::bounded_output::MAX_DIAGNOSTIC_MESSAGE_BYTES);
+        for token in [
+            "PropertyReaching",
+            "SelectedRuntimeAccess",
+            "SelectedAncestorStore",
+            "LoweringGap",
+            "IndexMemory",
+            "Unsupported",
+        ] {
+            assert!(message.contains(token), "missing {token}: {message}");
+        }
+        assert!(message.contains("total_items=3, retained_items=[]"));
+        assert!(message.ends_with("omitted_items=3"));
+    }
 
     #[test]
     #[hardwon(

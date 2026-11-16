@@ -35,6 +35,9 @@ thread_local! {
     static LAST_GO_REVERSE_ALIAS_FALLBACKS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
+    static LAST_GO_REVERSE_CONFLICTING_NAMES_FALLBACKS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
     static LAST_GO_REVERSE_QUALIFIED_IMPORTS: std::cell::RefCell<Vec<(u32, u32, Option<i64>)>> = const {
         std::cell::RefCell::new(Vec::new())
     };
@@ -45,6 +48,10 @@ fn record_go_reverse_fallback(cause: GoReverseFallbackCause) {
     #[cfg(any(test, feature = "test-support"))]
     if matches!(cause, GoReverseFallbackCause::AliasUnresolved) {
         LAST_GO_REVERSE_ALIAS_FALLBACKS.with(|count| count.set(count.get() + 1));
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    if matches!(cause, GoReverseFallbackCause::ConflictingNames) {
+        LAST_GO_REVERSE_CONFLICTING_NAMES_FALLBACKS.with(|count| count.set(count.get() + 1));
     }
 }
 
@@ -283,13 +290,50 @@ ORDER BY semantic.semantic_key,semantic.namespace,link.unit_key
     )
 }
 
-pub(crate) const GO_REVERSE_SUMMARY_EXPORT_ROWS_SQL: &str = r#"
+/// The validity of a Go child summary joined through its version row: complete,
+/// the active producer epoch and derivation version, the selected profile read,
+/// and every member's recorded input equal to its selected blob's current input.
+/// Every hand-written reverse statement uses this one text; the arguments are the
+/// SQL parameters `[workspace, generation, revision, epoch, derivation, profile]`.
+fn go_live_child_sql(summary: &str, versions: &str, params: [&str; 6]) -> String {
+    let [workspace, generation, revision, epoch, derivation, profile] = params;
+    format!(
+        "{summary}.publication_state='complete'
+ AND {summary}.producer_epoch={epoch} AND {summary}.derivation_identity={derivation}
+ AND EXISTS(
+   SELECT 1 FROM main.resolution_unit_summary_reads AS profile
+   WHERE profile.summary_id={summary}.summary_id
+     AND profile.key_digest=bifrost_go_profile_read_key({versions}.unit_key)
+     AND profile.digest={profile})
+ AND {}",
+        super::super::surface_relations::members_current_sql(
+            "go",
+            &format!("{summary}.summary_id"),
+            workspace,
+            generation,
+            revision
+        )
+    )
+}
+
+// Keep translation views in correlated scalar lookups: outer joins can materialize
+// every stored surface set before filtering to the demanded summary coordinates.
+pub(crate) static GO_REVERSE_SUMMARY_EXPORT_ROWS_SQL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| {
+        format!(
+            r#"
 WITH demanded(identity_id,namespace) AS (
   SELECT CAST(value->>0 AS INTEGER),value->>1 FROM json_each(?2)
 )
 SELECT demanded.identity_id,demanded.namespace,
        export.visibility,export.origin,export.alias_dependency_ordinal,
-       export.alias_identity_id,export.declaration_blob_id,export.declaration_site,
+       export.alias_identity_id,(SELECT member.blob_id FROM temp.selected_unit_member_blobs AS member
+        WHERE member.summary_id=export.summary_id
+          AND member.member_ordinal=export.declaration_member_ordinal),(SELECT translated.dense_id FROM temp.surface_dense AS translated
+        WHERE translated.blob_id=(SELECT member.blob_id FROM temp.selected_unit_member_blobs AS member
+        WHERE member.summary_id=export.summary_id
+          AND member.member_ordinal=export.declaration_member_ordinal) AND translated.id_space=0
+          AND translated.surface_ordinal=export.site_surface_ordinal),
        EXISTS(
          SELECT 1 FROM main.resolution_unit_summary_gaps AS gap
          WHERE gap.summary_id=?1 AND gap.gap_kind='incomplete_provider'
@@ -303,7 +347,7 @@ SELECT demanded.identity_id,demanded.namespace,
        EXISTS(
          SELECT 1 FROM main.resolution_unit_summary_gaps AS gap
          WHERE gap.summary_id=?1 AND gap.gap_kind='conflicting_names'
-           AND gap.subject=demanded.namespace||':'||CAST(demanded.identity_id AS TEXT)),
+           AND gap.subject=demanded.namespace||':'||lower(hex((SELECT identity.identity_digest FROM main.resolution_identities AS identity WHERE identity.id=demanded.identity_id)))),
        (?4=1 AND EXISTS(
          SELECT 1 FROM main.resolution_unit_summary_members AS member
          JOIN temp.selected_resolution_overlay_masks AS mask
@@ -325,20 +369,27 @@ SELECT demanded.identity_id,demanded.namespace,
          SELECT 1 FROM json_each(?11) AS target
          JOIN temp.selected_resolution_mounts AS target_mount
            ON target_mount.mount_ordinal=CAST(target.value->>0 AS INTEGER)
-          AND target_mount.blob_id=export.declaration_blob_id
-         WHERE CAST(target.value->>1 AS INTEGER)=export.declaration_site)
+          AND target_mount.blob_id=(SELECT member.blob_id FROM temp.selected_unit_member_blobs AS member
+        WHERE member.summary_id=export.summary_id
+          AND member.member_ordinal=export.declaration_member_ordinal)
+         WHERE CAST(target.value->>1 AS INTEGER)=(SELECT translated.dense_id FROM temp.surface_dense AS translated
+        WHERE translated.blob_id=(SELECT member.blob_id FROM temp.selected_unit_member_blobs AS member
+        WHERE member.summary_id=export.summary_id
+          AND member.member_ordinal=export.declaration_member_ordinal) AND translated.id_space=0
+          AND translated.surface_ordinal=export.site_surface_ordinal))
 FROM demanded
 LEFT JOIN main.resolution_unit_summary_exports AS export
   ON export.summary_id=?1 AND export.identity_id=demanded.identity_id
  AND export.namespace=demanded.namespace
- AND (?3=0 OR export.visibility='exported')
+ AND (?3=0 OR export.visibility='exported') AND export.target_kind='own'
  AND NOT EXISTS(
        SELECT 1 FROM main.resolution_unit_summary_members AS masked_member
        JOIN temp.selected_resolution_overlay_masks AS mask
          ON mask.storage_language='go'
         AND mask.persisted_relative_path=masked_member.rel_path
        WHERE masked_member.summary_id=export.summary_id
-         AND masked_member.blob_id=export.declaration_blob_id)
+         AND masked_member.member_ordinal=export.declaration_member_ordinal)
+
 LEFT JOIN main.resolution_unit_summary_dependencies AS dependency
   ON dependency.summary_id=export.summary_id
  AND dependency.dependency_ordinal=export.alias_dependency_ordinal
@@ -350,14 +401,12 @@ LEFT JOIN main.resolution_unit_summary_versions AS versions
  AND (versions.valid_until IS NULL OR ?7<versions.valid_until)
 LEFT JOIN main.resolution_unit_summaries AS child
   ON child.summary_id=versions.summary_id
- AND child.publication_state='complete'
- AND child.producer_epoch=?8 AND child.derivation_version=?9
- AND EXISTS(
-   SELECT 1 FROM main.resolution_unit_summary_reads AS profile
-   WHERE profile.summary_id=child.summary_id
-     AND profile.key_digest=bifrost_go_profile_read_key(versions.unit_key)
-     AND profile.digest=?10)
-"#;
+ AND {child_live}
+"#,
+            child_live =
+                go_live_child_sql("child", "versions", ["?5", "?6", "?7", "?8", "?9", "?10"])
+        )
+    });
 
 /// A selected overlay's own export replaces the saved member it masks. The
 /// target's site coordinate is joined only within that transient blob.
@@ -531,9 +580,13 @@ CROSS JOIN main.source_imports AS source_import
   ON source_import.blob_id=binder.blob_id
  AND source_import.declaration_start_byte=binder.start_byte
  AND source_import.declaration_end_byte=binder.end_byte
+
 LEFT JOIN main.resolution_unit_summary_imports AS imports
-  ON imports.summary_id=?1 AND imports.blob_id=source_import.blob_id
- AND imports.import_id=source_import.import_id
+  ON imports.summary_id=?1 AND imports.member_ordinal=(SELECT member.member_ordinal FROM temp.selected_unit_member_blobs AS member
+       WHERE member.summary_id=?1 AND member.blob_id=source_import.blob_id)
+ AND imports.import_surface_ordinal=(SELECT translated.surface_ordinal FROM temp.surface_dense AS translated
+       WHERE translated.blob_id=source_import.blob_id AND translated.id_space=5
+         AND translated.dense_id=source_import.import_id)
 LEFT JOIN main.resolution_unit_summary_dependencies AS dependency
   ON dependency.summary_id=imports.summary_id
  AND dependency.dependency_ordinal=imports.dependency_ordinal
@@ -563,7 +616,10 @@ WHERE binder.kind='named'
                     AND source_import.identifier=scope.spelling))))
 "#;
 
-pub(crate) const GO_REVERSE_DOT_EXPORT_ROWS_SQL: &str = r#"
+pub(crate) static GO_REVERSE_DOT_EXPORT_ROWS_SQL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| {
+        format!(
+            r#"
 WITH dot_imports AS (
   SELECT COALESCE(imports.state,
            CASE WHEN ?14=1
@@ -579,9 +635,13 @@ WITH dot_imports AS (
            SELECT 1 FROM temp.selected_go_context_source_files AS files
            WHERE files.package_id=COALESCE(target_package.package_id,overlay_target.package_id) AND files.source_role<>'ignored') AS has_selected_sources
   FROM main.source_imports AS source_import
-  LEFT JOIN main.resolution_unit_summary_imports AS imports
-    ON imports.summary_id=?1 AND imports.blob_id=source_import.blob_id
-   AND imports.import_id=source_import.import_id
+
+LEFT JOIN main.resolution_unit_summary_imports AS imports
+    ON imports.summary_id=?1 AND imports.member_ordinal=(SELECT member.member_ordinal FROM temp.selected_unit_member_blobs AS member
+       WHERE member.summary_id=?1 AND member.blob_id=source_import.blob_id)
+   AND imports.import_surface_ordinal=(SELECT translated.surface_ordinal FROM temp.surface_dense AS translated
+       WHERE translated.blob_id=source_import.blob_id AND translated.id_space=5
+         AND translated.dense_id=source_import.import_id)
   LEFT JOIN main.resolution_unit_summary_dependencies AS dependency
     ON dependency.summary_id=imports.summary_id
    AND dependency.dependency_ordinal=imports.dependency_ordinal
@@ -613,18 +673,18 @@ WITH dot_imports AS (
    AND (versions.valid_until IS NULL OR ?6<versions.valid_until)
   LEFT JOIN main.resolution_unit_summaries AS summary
     ON summary.summary_id=versions.summary_id
-   AND summary.publication_state='complete'
-   AND summary.producer_epoch=?7 AND summary.derivation_version=?8
-   AND EXISTS(
-     SELECT 1 FROM main.resolution_unit_summary_reads AS profile
-     WHERE profile.summary_id=summary.summary_id
-       AND profile.key_digest=bifrost_go_profile_read_key(versions.unit_key)
-       AND profile.digest=?9)
+   AND {live_child}
 )
 SELECT child.state,child.unit_key,child.summary_id,
        demanded.identity_id,demanded.namespace,
        export.visibility,export.origin,export.alias_dependency_ordinal,
-       export.alias_identity_id,export.declaration_blob_id,export.declaration_site,
+       export.alias_identity_id,(SELECT member.blob_id FROM temp.selected_unit_member_blobs AS member
+        WHERE member.summary_id=export.summary_id
+          AND member.member_ordinal=export.declaration_member_ordinal),(SELECT translated.dense_id FROM temp.surface_dense AS translated
+        WHERE translated.blob_id=(SELECT member.blob_id FROM temp.selected_unit_member_blobs AS member
+        WHERE member.summary_id=export.summary_id
+          AND member.member_ordinal=export.declaration_member_ordinal) AND translated.id_space=0
+          AND translated.surface_ordinal=export.site_surface_ordinal),
        EXISTS(
          SELECT 1 FROM main.resolution_unit_summary_gaps AS gap
          WHERE gap.summary_id=child.summary_id AND gap.gap_kind='incomplete_provider'
@@ -638,7 +698,7 @@ SELECT child.state,child.unit_key,child.summary_id,
        EXISTS(
          SELECT 1 FROM main.resolution_unit_summary_gaps AS gap
          WHERE gap.summary_id=child.summary_id AND gap.gap_kind='conflicting_names'
-           AND gap.subject=demanded.namespace||':'||CAST(demanded.identity_id AS TEXT)),
+           AND gap.subject=demanded.namespace||':'||lower(hex((SELECT identity.identity_digest FROM main.resolution_identities AS identity WHERE identity.id=demanded.identity_id)))),
        EXISTS(
          SELECT 1 FROM main.resolution_unit_summary_members AS member
          JOIN temp.selected_resolution_overlay_masks AS mask
@@ -656,8 +716,14 @@ SELECT child.state,child.unit_key,child.summary_id,
          SELECT 1 FROM json_each(?10) AS target
          JOIN temp.selected_resolution_mounts AS target_mount
            ON target_mount.mount_ordinal=CAST(target.value->>0 AS INTEGER)
-          AND target_mount.blob_id=export.declaration_blob_id
-         WHERE CAST(target.value->>1 AS INTEGER)=export.declaration_site),
+          AND target_mount.blob_id=(SELECT member.blob_id FROM temp.selected_unit_member_blobs AS member
+        WHERE member.summary_id=export.summary_id
+          AND member.member_ordinal=export.declaration_member_ordinal)
+         WHERE CAST(target.value->>1 AS INTEGER)=(SELECT translated.dense_id FROM temp.surface_dense AS translated
+        WHERE translated.blob_id=(SELECT member.blob_id FROM temp.selected_unit_member_blobs AS member
+        WHERE member.summary_id=export.summary_id
+          AND member.member_ordinal=export.declaration_member_ordinal) AND translated.id_space=0
+          AND translated.surface_ordinal=export.site_surface_ordinal)),
        child.boundary,child.has_selected_sources
 FROM live_children AS child
 CROSS JOIN (SELECT CAST(value->>0 AS INTEGER) AS identity_id,
@@ -666,7 +732,8 @@ LEFT JOIN main.resolution_unit_summary_exports AS export
   ON export.summary_id=child.summary_id
  AND export.identity_id=demanded.identity_id
  AND export.namespace=demanded.namespace
- AND export.visibility='exported'
+ AND export.visibility='exported' AND export.target_kind='own'
+
 LEFT JOIN main.resolution_unit_summary_dependencies AS dependency
   ON dependency.summary_id=export.summary_id
  AND dependency.dependency_ordinal=export.alias_dependency_ordinal
@@ -679,14 +746,17 @@ LEFT JOIN main.resolution_unit_summary_versions AS alias_versions
  AND (alias_versions.valid_until IS NULL OR ?6<alias_versions.valid_until)
 LEFT JOIN main.resolution_unit_summaries AS alias_child
   ON alias_child.summary_id=alias_versions.summary_id
- AND alias_child.publication_state='complete'
- AND alias_child.producer_epoch=?7 AND alias_child.derivation_version=?8
- AND EXISTS(
-   SELECT 1 FROM main.resolution_unit_summary_reads AS profile
-   WHERE profile.summary_id=alias_child.summary_id
-     AND profile.key_digest=bifrost_go_profile_read_key(alias_versions.unit_key)
-     AND profile.digest=?9)
-"#;
+ AND {alias_live}
+"#,
+            live_child =
+                go_live_child_sql("summary", "versions", ["?4", "?5", "?6", "?7", "?8", "?9"]),
+            alias_live = go_live_child_sql(
+                "alias_child",
+                "alias_versions",
+                ["?4", "?5", "?6", "?7", "?8", "?9"]
+            )
+        )
+    });
 
 #[doc(hidden)]
 pub static GO_REVERSE_INVENTORY_COMPLETE_SQL: std::sync::LazyLock<String> =
@@ -773,13 +843,7 @@ WITH target_packages(package_id,tool_import_path,package_name,for_test,source_ro
    AND (versions.valid_until IS NULL OR ?8<versions.valid_until)
   JOIN main.resolution_unit_summaries AS summary
     ON summary.summary_id=versions.summary_id
-  WHERE summary.publication_state='complete'
-    AND summary.producer_epoch=?9 AND summary.derivation_version=?11
-    AND EXISTS(
-      SELECT 1 FROM main.resolution_unit_summary_reads AS profile
-      WHERE profile.summary_id=summary.summary_id
-        AND profile.key_digest=bifrost_go_profile_read_key(versions.unit_key)
-        AND profile.digest=?10)
+  WHERE {}
 )
 SELECT NOT EXISTS(
          SELECT 1 FROM visible_units AS visible
@@ -815,7 +879,7 @@ SELECT NOT EXISTS(
            JOIN json_each(?5) AS demanded
            WHERE gap.summary_id=live.summary_id
              AND gap.gap_kind='conflicting_names'
-             AND gap.subject=(demanded.value->>1)||':'||CAST(demanded.value->>0 AS TEXT)))
+             AND gap.subject=(demanded.value->>1)||':'||lower(hex((SELECT identity.identity_digest FROM main.resolution_identities AS identity WHERE identity.id=CAST(demanded.value->>0 AS INTEGER))))))
    AND NOT EXISTS(
          SELECT 1 FROM live_summaries AS live
          JOIN main.resolution_unit_summary_gaps AS gap
@@ -825,9 +889,15 @@ SELECT NOT EXISTS(
           AND imported.state='unresolved'
          -- Retained headers change cardinality estimates. Bound summary imports
          -- must drive the keyed source-import lookup, never a table-wide scan.
+         CROSS JOIN temp.selected_unit_member_blobs AS selected
+           ON selected.summary_id=imported.summary_id
+          AND selected.member_ordinal=imported.member_ordinal
+         CROSS JOIN temp.surface_dense AS import_surface
+           ON import_surface.blob_id=selected.blob_id AND import_surface.id_space=5
+          AND import_surface.surface_ordinal=imported.import_surface_ordinal
          CROSS JOIN main.source_imports AS source_import
-           ON source_import.blob_id=imported.blob_id
-          AND source_import.import_id=imported.import_id AND source_import.alias='.'
+           ON source_import.blob_id=selected.blob_id
+          AND source_import.import_id=import_surface.dense_id AND source_import.alias='.'
          JOIN target_units AS target ON target.tool_import_path=gap.subject
           AND gap.subject=(
             SELECT group_concat(segment,'/') FROM (
@@ -836,7 +906,12 @@ SELECT NOT EXISTS(
               ORDER BY ordinal)))
 "#,
             super::go_context::GO_SELECTED_SOURCE_FILE_BY_VERSION.as_str(),
-            super::go_context::GO_SELECTED_SOURCE_FILE_BY_VERSION.as_str()
+            super::go_context::GO_SELECTED_SOURCE_FILE_BY_VERSION.as_str(),
+            go_live_child_sql(
+                "summary",
+                "versions",
+                ["?6", "?7", "?8", "?9", "?11", "?10"]
+            )
         )
     });
 
@@ -1083,7 +1158,7 @@ fn read_go_live_reverse_summary(
     unit_key: &[u8; 32],
 ) -> Result<Option<i64>> {
     Ok(connection
-        .prepare_cached(super::super::go_unit_summaries::GO_LIVE_SUMMARY_SQL)?
+        .prepare_cached(&super::super::go_unit_summaries::GO_LIVE_SUMMARY_SQL)?
         .query_row(
             params![
                 context.workspace_id,
@@ -1092,7 +1167,7 @@ fn read_go_live_reverse_summary(
                 unit_key.as_slice(),
                 context.revision,
                 context.producer_epoch,
-                super::super::go_unit_summaries::GO_UNIT_SUMMARY_DERIVATION_VERSION,
+                super::super::go_unit_summaries::go_unit_summary_derivation_identity(),
                 super::super::go_unit_summaries::go_profile_read_key(unit_key).as_slice(),
                 context.profile.as_slice(),
             ],
@@ -1244,15 +1319,22 @@ WITH summaries(summary_id) AS (
 ), demanded(identity_id) AS (
   SELECT CAST(value AS INTEGER) FROM json_each(?2)
 )
-SELECT DISTINCT member.rel_path,export.namespace,export.declaration_site
+SELECT DISTINCT member.rel_path,export.namespace,site.dense_id
 FROM summaries
+CROSS JOIN main.resolution_unit_summary_members AS member
+  ON member.summary_id=summaries.summary_id
+CROSS JOIN temp.selected_unit_member_blobs AS selected
+  ON selected.summary_id=member.summary_id
+ AND selected.member_ordinal=member.member_ordinal
 CROSS JOIN demanded
 CROSS JOIN main.resolution_unit_summary_exports AS export
-  ON export.summary_id=summaries.summary_id
+  ON export.summary_id=member.summary_id
+ AND export.declaration_member_ordinal=member.member_ordinal
  AND export.identity_id=demanded.identity_id
-JOIN main.resolution_unit_summary_members AS member
-  ON member.summary_id=export.summary_id
- AND member.blob_id=export.declaration_blob_id
+ AND export.target_kind='own'
+CROSS JOIN temp.surface_dense AS site
+  ON site.blob_id=selected.blob_id AND site.id_space=0
+ AND site.surface_ordinal=export.site_surface_ordinal
 "#;
 
 pub(crate) static GO_RENAME_REBOUND_ROOT_REFERENCES_SQL: std::sync::LazyLock<String> =
@@ -1297,26 +1379,32 @@ WITH summaries(summary_id) AS (
         AND member.definition_key=target.semantic_key)
 )
 , candidates(blob_id,rel_path,start_byte,end_byte,site,path_body) AS (
-  SELECT member.blob_id,member.rel_path,site.start_byte,site.end_byte,site.site,path.body
+  SELECT selected.blob_id,member.rel_path,site.start_byte,site.end_byte,site.site,path.body
   FROM summaries
   CROSS JOIN main.resolution_unit_summary_members AS member
     ON member.summary_id=summaries.summary_id
+  CROSS JOIN temp.selected_unit_member_blobs AS selected
+    ON selected.summary_id=member.summary_id
+   AND selected.member_ordinal=member.member_ordinal
   CROSS JOIN names
   CROSS JOIN main.resolution_paths AS path INDEXED BY resolution_paths_root_terminal
-    ON path.blob_id=member.blob_id AND path.root_terminal=names.identity_id
+    ON path.blob_id=selected.blob_id AND path.root_terminal=names.identity_id
    AND path.end_node=-1
   JOIN main.resolution_sites AS site
     ON site.blob_id=path.blob_id AND site.site=path.start_node
    AND site.role=0 AND site.unqualified=1
   UNION
-  SELECT member.blob_id,member.rel_path,site.start_byte,site.end_byte,site.site,path.body
+  SELECT selected.blob_id,member.rel_path,site.start_byte,site.end_byte,site.site,path.body
   FROM summaries
   CROSS JOIN main.resolution_unit_summary_members AS member
     ON member.summary_id=summaries.summary_id
+  CROSS JOIN temp.selected_unit_member_blobs AS selected
+    ON selected.summary_id=member.summary_id
+   AND selected.member_ordinal=member.member_ordinal
   CROSS JOIN main.resolution_identities AS identity
     ON identity.spelling=?5
   CROSS JOIN main.resolution_paths AS path INDEXED BY resolution_paths_end_lookup_identity
-    ON path.blob_id=member.blob_id AND path.end_lead_identity=identity.id
+    ON path.blob_id=selected.blob_id AND path.end_lead_identity=identity.id
   JOIN main.resolution_node_catalog AS endpoint
     ON endpoint.blob_id=path.blob_id AND endpoint.local_key=path.end_node
    AND endpoint.kind=1
@@ -1381,7 +1469,7 @@ fn read_go_reverse_summary_exports(
 ) -> Result<Vec<GoReverseSummaryExport>> {
     let allow_transient_overlay =
         transient_caller.is_some_and(|candidate| candidate.overlay_masked && candidate.transient);
-    let mut statement = connection.prepare_cached(GO_REVERSE_SUMMARY_EXPORT_ROWS_SQL)?;
+    let mut statement = connection.prepare_cached(&GO_REVERSE_SUMMARY_EXPORT_ROWS_SQL)?;
     let mut rows = statement.query(params![
         summary_id,
         demands_json,
@@ -1391,7 +1479,7 @@ fn read_go_reverse_summary_exports(
         context.generation,
         context.revision,
         context.producer_epoch,
-        super::super::go_unit_summaries::GO_UNIT_SUMMARY_DERIVATION_VERSION,
+        super::super::go_unit_summaries::go_unit_summary_derivation_identity(),
         context.profile.as_slice(),
         target_declarations_json,
         allow_transient_overlay,
@@ -1451,7 +1539,7 @@ fn read_go_reverse_summary_exports(
             context.generation,
             context.revision,
             context.producer_epoch,
-            super::super::go_unit_summaries::GO_UNIT_SUMMARY_DERIVATION_VERSION,
+            super::super::go_unit_summaries::go_unit_summary_derivation_identity(),
             context.profile.as_slice(),
             target_declarations_json,
         ])?;
@@ -1587,7 +1675,7 @@ fn read_go_reverse_dot_exports(
     demands_json: &str,
     target_declarations_json: &str,
 ) -> Result<Vec<GoReverseDotExport>> {
-    let mut statement = connection.prepare_cached(GO_REVERSE_DOT_EXPORT_ROWS_SQL)?;
+    let mut statement = connection.prepare_cached(&GO_REVERSE_DOT_EXPORT_ROWS_SQL)?;
     let mut rows = statement.query(params![
         caller_summary_id,
         candidate.blob_id,
@@ -1596,7 +1684,7 @@ fn read_go_reverse_dot_exports(
         context.generation,
         context.revision,
         context.producer_epoch,
-        super::super::go_unit_summaries::GO_UNIT_SUMMARY_DERIVATION_VERSION,
+        super::super::go_unit_summaries::go_unit_summary_derivation_identity(),
         context.profile.as_slice(),
         target_declarations_json,
         context.context_id,
@@ -2308,7 +2396,7 @@ impl SelectedResolutionOperation<'_, '_> {
                     summary_context.revision,
                     summary_context.producer_epoch,
                     summary_context.profile.as_slice(),
-                    super::super::go_unit_summaries::GO_UNIT_SUMMARY_DERIVATION_VERSION,
+                    super::super::go_unit_summaries::go_unit_summary_derivation_identity(),
                     family_packages,
                 ],
                 |row| row.get(0),
@@ -3440,6 +3528,13 @@ pub fn reset_go_reverse_alias_fallbacks_for_test() {
 #[doc(hidden)]
 pub fn last_go_reverse_alias_fallbacks_for_test() -> usize {
     LAST_GO_REVERSE_ALIAS_FALLBACKS.with(std::cell::Cell::get)
+}
+
+/// Conflicting-name fallbacks on this thread since the last call; resets.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn take_go_reverse_conflicting_names_fallbacks_for_test() -> usize {
+    LAST_GO_REVERSE_CONFLICTING_NAMES_FALLBACKS.with(std::cell::Cell::take)
 }
 
 #[cfg(any(test, feature = "test-support"))]

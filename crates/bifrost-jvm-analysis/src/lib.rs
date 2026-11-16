@@ -156,7 +156,7 @@ pub mod native_resolution_test_support {
             matches!(outcome, SemanticModelRuntimeOutcome::Ready { .. }),
             "{outcome:?}"
         );
-        let overlay = analyzer.semantic_model_overlay().unwrap();
+        let overlay = analyzer.semantic_model_overlay_read().published().unwrap();
         let provider = brokk_bifrost_analysis::analyzer::semantic_model::overlay::jvm_external::model_declared_external_owner(
             &overlay, "scala.Enumeration",
         ).unwrap().provider_id.to_string();

@@ -14,6 +14,88 @@ use brokk_bifrost_core::analyzer::resolution_facts::{
 use rusqlite::{OptionalExtension, params};
 
 #[cfg(any(test, feature = "test-support"))]
+mod strict_positive_stop_probe {
+    use super::*;
+    use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit;
+    use std::cell::Cell;
+
+    thread_local! {
+        static ARMED: Cell<bool> = const { Cell::new(false) };
+        static MATCH_SELECTION: Cell<Option<(SemanticId, SemanticId)>> = const { Cell::new(None) };
+        static FIRED: Cell<Option<ReceiverBudgetLimit>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn fire(
+        kind: Option<&crate::analyzer::resolution::GoMemberDeclarationKind>,
+        result: &crate::analyzer::resolution::fact_resolution::go_methods::GoTypeSatisfaction,
+        session: &ResolutionSession,
+    ) {
+        if matches!(
+            kind,
+            Some(
+                crate::analyzer::resolution::GoMemberDeclarationKind::Struct { .. }
+                    | crate::analyzer::resolution::GoMemberDeclarationKind::Defined
+            )
+        ) && MATCH_SELECTION
+            .get()
+            .is_none_or(|selection| result.selections.contains(&selection))
+            && ARMED.replace(false)
+        {
+            assert!(!session.scope_steps(usize::MAX));
+            let BoundedResolution::Exceeded { limit, .. } = session.finish(()) else {
+                panic!("strict positive probe did not latch a stop");
+            };
+            FIRED.set(Some(limit));
+        }
+    }
+
+    pub(super) fn arm(selection: Option<(SemanticId, SemanticId)>) {
+        assert!(!ARMED.replace(true), "strict positive probe already armed");
+        MATCH_SELECTION.set(selection);
+        FIRED.set(None);
+    }
+    pub(super) fn fired_limit() -> Option<ReceiverBudgetLimit> {
+        FIRED.get()
+    }
+    pub(super) fn clear() {
+        ARMED.set(false);
+        MATCH_SELECTION.set(None);
+        FIRED.set(None);
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub struct GoStrictPositiveStopProbe(std::marker::PhantomData<std::rc::Rc<()>>);
+
+#[cfg(any(test, feature = "test-support"))]
+impl GoStrictPositiveStopProbe {
+    pub fn arm() -> Self {
+        strict_positive_stop_probe::arm(None);
+        Self(std::marker::PhantomData)
+    }
+    pub fn arm_matching_selection(lookup: SemanticId, method: SemanticId) -> Self {
+        strict_positive_stop_probe::arm(Some((lookup, method)));
+        Self(std::marker::PhantomData)
+    }
+    pub fn fired_limit(
+        &self,
+    ) -> Option<brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit> {
+        strict_positive_stop_probe::fired_limit()
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for GoStrictPositiveStopProbe {
+    fn drop(&mut self) {
+        let fired = self.fired_limit().is_some();
+        strict_positive_stop_probe::clear();
+        if !std::thread::panicking() {
+            assert!(fired, "strict positive probe was not consumed");
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
 mod hierarchy_preparation_stop_probe {
     use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit;
     use brokk_bifrost_core::analyzer::usages::resolution_session::{
@@ -401,14 +483,6 @@ pub struct GoNativeMethodFamilyAnswer {
     pub implemented_by: GoMethodFamilyDirection,
 }
 
-struct GoEmbeddingClosure {
-    answer: GoDirectSubtypeAnswer,
-    completed: std::collections::HashMap<
-        crate::analyzer::resolution::ResolutionTypeRef,
-        crate::analyzer::resolution::fact_resolution::go_methods::GoTypeSatisfaction,
-    >,
-}
-
 struct GoMethodContract {
     lookup: SemanticId,
     interface: SemanticId,
@@ -479,6 +553,28 @@ impl SelectedResolutionOperation<'_, '_> {
         method: SemanticId,
         cancellation: &CancellationToken,
         session: &ResolutionSession,
+    ) -> Result<GoNativeMethodFamilyAnswer> {
+        self.visit_go_native_method_family(
+            context_id,
+            source_role,
+            method,
+            cancellation,
+            session,
+            |_, _| Ok(()),
+        )
+    }
+
+    /// Visit each finalized inverse selection while its proof is still current,
+    /// before a later proof can consume the remaining allowance.
+    #[allow(clippy::too_many_arguments)]
+    pub fn visit_go_native_method_family(
+        &self,
+        context_id: i64,
+        source_role: &str,
+        method: SemanticId,
+        cancellation: &CancellationToken,
+        session: &ResolutionSession,
+        mut publish_inverse: impl FnMut(&Self, &[SemanticId]) -> Result<()>,
     ) -> Result<GoNativeMethodFamilyAnswer> {
         let mut answer = GoNativeMethodFamilyAnswer::default();
         let coverage_key = GoHierarchyCoverageReadKey {
@@ -669,6 +765,7 @@ impl SelectedResolutionOperation<'_, '_> {
                     .open_reasons
                     .push("method receiver frontier is unavailable");
             } else {
+                let mut promoted = false;
                 let closure = self.go_close_satisfying_embeddings(
                     context_id,
                     source_role,
@@ -678,23 +775,17 @@ impl SelectedResolutionOperation<'_, '_> {
                     &[0, 1],
                     cancellation,
                     session,
+                    |_, result| {
+                        promoted |= result.selections.contains(&(lookup, method));
+                        Ok(())
+                    },
                 )?;
                 answer
                     .implements
                     .read_keys
                     .names
-                    .extend(closure.answer.read_keys.names);
-                answer
-                    .implements
-                    .open_reasons
-                    .extend(closure.answer.open_reasons);
-                let promoted = closure.completed.into_values().any(|result| {
-                    result.outcome == GoMethodSatisfaction::Satisfies
-                        && result
-                            .selections
-                            .iter()
-                            .any(|&(name, selected)| name == lookup && selected == method)
-                });
+                    .extend(closure.read_keys.names);
+                answer.implements.open_reasons.extend(closure.open_reasons);
                 if promoted {
                     // The promoted proof selects the queried method, but it
                     // does not associate each earlier formal ID with that
@@ -754,10 +845,10 @@ impl SelectedResolutionOperation<'_, '_> {
         // Interface methods describe contracts, not executable implementations.
         // Type satisfaction still uses interface receivers in the hierarchy path.
         answer.implements.methods.clear();
-        let (satisfaction, seeds) = self.go_satisfying_receivers_for_lookup(
+        let (satisfaction, seeds) = self.go_discovered_receivers_for_lookup(
             context_id,
             source_role,
-            GoMethodContract { lookup, interface },
+            lookup,
             &name,
             cancellation,
             session,
@@ -768,6 +859,7 @@ impl SelectedResolutionOperation<'_, '_> {
             .collect::<Vec<_>>();
         owners.sort_unstable();
         owners.dedup();
+        let mut emitted = HashSet::default();
         let closure = self.go_close_satisfying_embeddings(
             context_id,
             source_role,
@@ -777,11 +869,49 @@ impl SelectedResolutionOperation<'_, '_> {
             &[0, 1],
             cancellation,
             session,
+            |kind, result| {
+                if cancellation.is_cancelled() || !session.scope_steps(1) {
+                    answer
+                        .implemented_by
+                        .open_reasons
+                        .push("method selection cancelled or exhausted its budget");
+                    return Ok(());
+                }
+                // Interface receivers certify contracts, not executable methods.
+                match kind {
+                    Some(crate::analyzer::resolution::GoMemberDeclarationKind::Interface {
+                        ..
+                    }) => {
+                        return Ok(());
+                    }
+                    Some(_) => {}
+                    None => {
+                        answer
+                            .implemented_by
+                            .open_reasons
+                            .push("method receiver kind is unavailable");
+                        return Ok(());
+                    }
+                }
+                let mut selected = Vec::new();
+                for &(selected_name, selected_method) in &result.selections {
+                    if selected_name == lookup
+                        && selected_method != method
+                        && emitted.insert(selected_method)
+                    {
+                        selected.push(selected_method);
+                    }
+                }
+                answer
+                    .implemented_by
+                    .methods
+                    .extend(selected.iter().copied());
+                if !selected.is_empty() {
+                    publish_inverse(self, &selected)?;
+                }
+                Ok(())
+            },
         )?;
-        let GoEmbeddingClosure {
-            answer: closure,
-            completed,
-        } = closure;
         answer
             .implemented_by
             .read_keys
@@ -800,72 +930,6 @@ impl SelectedResolutionOperation<'_, '_> {
             .implemented_by
             .open_reasons
             .extend(closure.open_reasons);
-        // Consume proofs in a fixed order so a budget stop cuts the same
-        // subset on every run.
-        let mut completed = completed.into_iter().collect::<Vec<_>>();
-        completed
-            .sort_unstable_by_key(|(receiver, _)| (receiver.identity(), receiver.indirection()));
-        // Only a method of a non-interface receiver can execute a call, so an
-        // interface that satisfies this one, directly or through embedding,
-        // contributes no member edge. Legacy Go records the same pairs.
-        let mut receivers = completed
-            .iter()
-            .map(|(receiver, _)| receiver.identity())
-            .collect::<Vec<_>>();
-        receivers.dedup();
-        let receiver_kinds = if receivers.is_empty() {
-            Some(HashMap::default())
-        } else {
-            self.ready
-                .typed_source()
-                .go_member_declarations(&receivers, cancellation)?
-                .map(|declarations| {
-                    declarations
-                        .into_iter()
-                        .map(|declaration| {
-                            let interface = matches!(
-                                declaration.kind,
-                                crate::analyzer::resolution::GoMemberDeclarationKind::Interface { .. }
-                            );
-                            (declaration.definition, interface)
-                        })
-                        .collect::<HashMap<_, _>>()
-                })
-        };
-        let Some(receiver_kinds) = receiver_kinds else {
-            answer
-                .implemented_by
-                .open_reasons
-                .push("method receiver kind is unavailable");
-            return Ok(answer);
-        };
-        for (receiver, result) in completed {
-            if cancellation.is_cancelled() || !session.scope_steps(1) {
-                answer
-                    .implemented_by
-                    .open_reasons
-                    .push("method selection cancelled or exhausted its budget");
-                break;
-            }
-            match receiver_kinds.get(&receiver.identity()) {
-                Some(false) => {}
-                Some(true) => continue,
-                None => {
-                    answer
-                        .implemented_by
-                        .open_reasons
-                        .push("method receiver kind is unavailable");
-                    continue;
-                }
-            }
-            answer.implemented_by.methods.extend(
-                result
-                    .selections
-                    .into_iter()
-                    .filter(|(selected_name, _)| *selected_name == lookup)
-                    .map(|(_, selected)| selected),
-            );
-        }
         answer.implemented_by.methods.sort_unstable();
         answer.implemented_by.methods.dedup();
         answer
@@ -1061,19 +1125,19 @@ impl SelectedResolutionOperation<'_, '_> {
             .map(|result| result.outcome))
     }
 
-    fn go_satisfying_receivers_for_lookup(
+    fn go_receiver_lookup_nominations(
         &self,
         context_id: i64,
         source_role: &str,
-        contract: GoMethodContract,
+        lookup: SemanticId,
         name: &str,
         cancellation: &CancellationToken,
         session: &ResolutionSession,
     ) -> Result<(
         GoDirectSubtypeAnswer,
         Vec<crate::analyzer::resolution::ResolutionTypeRef>,
+        Vec<SemanticId>,
     )> {
-        let GoMethodContract { lookup, interface } = contract;
         let mut answer = GoDirectSubtypeAnswer {
             edges: Vec::new(),
             ambiguous: Vec::new(),
@@ -1091,7 +1155,7 @@ impl SelectedResolutionOperation<'_, '_> {
             Some(keys) => answer.read_keys.names.extend(keys),
             None => {
                 answer.open_reasons.push("method lookup key was cancelled");
-                return Ok((answer, candidate_owners));
+                return Ok((answer, candidate_owners, Vec::new()));
             }
         }
         let mut interface_nominations = Vec::new();
@@ -1191,25 +1255,43 @@ impl SelectedResolutionOperation<'_, '_> {
         }
         methods.sort_unstable();
         methods.dedup();
+        Ok((answer, candidate_owners, methods))
+    }
+
+    fn go_discovered_receivers_for_lookup(
+        &self,
+        context_id: i64,
+        source_role: &str,
+        lookup: SemanticId,
+        name: &str,
+        cancellation: &CancellationToken,
+        session: &ResolutionSession,
+    ) -> Result<(
+        GoDirectSubtypeAnswer,
+        Vec<crate::analyzer::resolution::ResolutionTypeRef>,
+    )> {
+        let (mut answer, mut candidates, methods) = self.go_receiver_lookup_nominations(
+            context_id,
+            source_role,
+            lookup,
+            name,
+            cancellation,
+            session,
+        )?;
         for method in methods {
             if cancellation.is_cancelled() || !session.scope_steps(1) {
                 answer
                     .open_reasons
-                    .push("method confirmation cancelled or exhausted its budget");
+                    .push("method receiver discovery cancelled or exhausted its budget");
                 break;
             }
-            let Some(ordinal) = method.ordinal() else {
-                answer
-                    .open_reasons
-                    .push("method candidate has no selected mount");
-                continue;
-            };
-            let role = self.go_source_role_for_mount(
+            let ordinal = method.ordinal().expect("selected method has a mount");
+            let Some(role) = self.go_source_role_for_mount(
                 context_id,
                 SelectedResolutionMountOrdinal::new(ordinal),
                 cancellation,
-            )?;
-            let Some(role) = role else {
+            )?
+            else {
                 answer
                     .open_reasons
                     .push("method candidate source role is unavailable");
@@ -1218,55 +1300,30 @@ impl SelectedResolutionOperation<'_, '_> {
             if role != "go" && role != source_role {
                 continue;
             }
-            let Some(outcomes) = self.go_candidate_method_satisfaction(
+            let Some(result) = self.with_go_hierarchy_forward(
                 context_id,
-                source_role,
+                &role,
                 method,
-                GoMethodContract { lookup, interface },
                 cancellation,
                 session,
+                |forward| forward.go_method_receiver_candidates(method),
             )?
             else {
                 answer
                     .open_reasons
-                    .push("method satisfaction context is unavailable");
+                    .push("method receiver discovery context is unavailable");
                 continue;
             };
-            for outcome in outcomes {
-                candidate_owners.extend(outcome.candidate_receivers.iter().copied());
-                match outcome.outcome {
-                    GoMethodSatisfaction::Satisfies => {
-                        for receiver in outcome.satisfying_receivers {
-                            if receiver.indirection() != 0 {
-                                continue;
-                            }
-                            let identity = receiver.identity();
-                            match self.go_type_supports(
-                                context_id,
-                                source_role,
-                                identity,
-                                cancellation,
-                            )? {
-                                GoTypeSupport::Supported => answer.edges.push(identity),
-                                GoTypeSupport::Open => answer
-                                    .open_reasons
-                                    .push("alias endpoint has no selected declaration identity"),
-                                GoTypeSupport::Unsupported => answer
-                                    .open_reasons
-                                    .push("method receiver has no selected declaration identity"),
-                            }
-                        }
-                    }
-                    GoMethodSatisfaction::Inconclusive(reason) => answer.open_reasons.push(reason),
-                    GoMethodSatisfaction::DoesNotSatisfy => {}
-                }
+            if !result.complete {
+                answer
+                    .open_reasons
+                    .push("method receiver frontier is incomplete or ambiguous");
             }
+            candidates.extend(result.receivers);
         }
-        answer.edges.sort_unstable();
-        answer.edges.dedup();
-        candidate_owners.sort_unstable();
-        candidate_owners.dedup();
-        Ok((answer, candidate_owners))
+        candidates.sort_unstable();
+        candidates.dedup();
+        Ok((answer, candidates))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1280,14 +1337,17 @@ impl SelectedResolutionOperation<'_, '_> {
         receiver_forms: &[u32],
         cancellation: &CancellationToken,
         session: &ResolutionSession,
-    ) -> Result<GoEmbeddingClosure> {
+        mut finalized: impl FnMut(
+            Option<&crate::analyzer::resolution::GoMemberDeclarationKind>,
+            &crate::analyzer::resolution::fact_resolution::go_methods::GoTypeSatisfaction,
+        ) -> Result<()>,
+    ) -> Result<GoDirectSubtypeAnswer> {
         // The largest-form rule below holds for a value receiver and one pointer
         // level only; deeper indirections are not legal receiver forms.
         assert!(
             !receiver_forms.is_empty() && receiver_forms.iter().all(|&form| form <= 1),
             "Go receiver forms are a nonempty subset of {{0, 1}}: {receiver_forms:?}"
         );
-        let mut completed = std::collections::HashMap::new();
         let mut answer = GoDirectSubtypeAnswer {
             edges: Vec::new(),
             ambiguous: Vec::new(),
@@ -1371,7 +1431,9 @@ impl SelectedResolutionOperation<'_, '_> {
                     )? {
                         Some(result) if result.outcome == GoMethodSatisfaction::Satisfies => {
                             satisfied = true;
-                            completed.insert(receiver, result);
+                            finalized(kind.as_ref(), &result)?;
+                            #[cfg(any(test, feature = "test-support"))]
+                            strict_positive_stop_probe::fire(kind.as_ref(), &result, session);
                         }
                         Some(result) if result.outcome == GoMethodSatisfaction::DoesNotSatisfy => {}
                         Some(result) => {
@@ -1407,7 +1469,7 @@ impl SelectedResolutionOperation<'_, '_> {
         answer.edges.dedup();
         answer.open.sort_unstable();
         answer.open.dedup();
-        Ok(GoEmbeddingClosure { answer, completed })
+        Ok(answer)
     }
 
     /// Confirm inverse embedding nominations with the forward proof.
@@ -1797,42 +1859,46 @@ impl SelectedResolutionOperation<'_, '_> {
                                         .push("interface method has no selected Go name");
                                     return Ok(answer);
                                 };
-                                let (satisfaction, candidate_owners) = self
-                                    .go_satisfying_receivers_for_lookup(
+                                let (discovery, candidate_owners) = self
+                                    .go_discovered_receivers_for_lookup(
                                         context_id,
                                         source_role,
-                                        GoMethodContract {
-                                            lookup,
-                                            interface: target,
-                                        },
+                                        lookup,
                                         &name,
                                         cancellation,
                                         session,
                                     )?;
+                                // Even a pointer-only method can reach a value
+                                // subtype through a struct embedding *T. Seed
+                                // its type identity, then prove only form 0.
+                                let mut owners = candidate_owners
+                                    .iter()
+                                    .map(|receiver| receiver.identity())
+                                    .collect::<Vec<_>>();
+                                owners.sort_unstable();
+                                owners.dedup();
                                 let closure = self.go_close_satisfying_embeddings(
                                     context_id,
                                     source_role,
                                     target,
                                     Some(target),
-                                    &candidate_owners
-                                        .iter()
-                                        .filter(|receiver| receiver.indirection() == 0)
-                                        .map(|receiver| receiver.identity())
-                                        .collect::<Vec<_>>(),
+                                    &owners,
                                     &[0],
                                     cancellation,
                                     session,
+                                    |_, _| Ok(()),
                                 )?;
-                                let closure = closure.answer;
-                                answer.edges.extend(satisfaction.edges);
+                                // Discovery is enumeration, never positive
+                                // subtype evidence. Only the strict closure
+                                // contributes definite edges.
                                 answer.edges.extend(closure.edges);
-                                answer.ambiguous.extend(satisfaction.ambiguous);
+                                answer.ambiguous.extend(discovery.ambiguous);
                                 answer.ambiguous.extend(closure.ambiguous);
-                                answer.open.extend(satisfaction.open);
+                                answer.open.extend(discovery.open);
                                 answer.open.extend(closure.open);
-                                answer.open_reasons.extend(satisfaction.open_reasons);
+                                answer.open_reasons.extend(discovery.open_reasons);
                                 answer.open_reasons.extend(closure.open_reasons);
-                                answer.read_keys.names.extend(satisfaction.read_keys.names);
+                                answer.read_keys.names.extend(discovery.read_keys.names);
                                 answer.read_keys.names.extend(closure.read_keys.names);
                             }
                         }

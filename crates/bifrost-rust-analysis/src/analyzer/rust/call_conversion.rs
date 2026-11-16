@@ -6,6 +6,9 @@
 //! model borrow checking, arbitrary lifetimes or user `Deref` implementations;
 //! unsupported types and substitutions remain unknown.
 
+use brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelNamespace;
+use brokk_bifrost_core::analyzer::Language;
+
 use brokk_bifrost_analysis::analyzer::lexical_definitions::LexicalBindingResolution;
 
 use brokk_bifrost_core::analyzer::usages::model::ImportKind;
@@ -31,15 +34,15 @@ use brokk_bifrost_analysis::analyzer::usages::call_conversion::RustPrimitive;
 use brokk_bifrost_analysis::analyzer::usages::call_conversion::{
     CallConversionCache, CallConversionContext, ConversionSource,
 };
+use brokk_bifrost_analysis::analyzer::usages::call_conversion::{
+    RustStdIdentity, RustStdRouteProof,
+};
 use std::sync::Arc;
-
-use brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupRequest;
 
 use brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupStatus;
 
-use brokk_bifrost_analysis::analyzer::usages::get_definition::resolve_definition_batch_with_source_tree;
-
-use brokk_bifrost_analysis::analyzer::i_analyzer::{AnalyzerQueryScope, QueryScope};
+use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
+use brokk_bifrost_analysis::analyzer::i_analyzer::QueryScope;
 
 use brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer;
 
@@ -50,12 +53,16 @@ use brokk_bifrost_core::analyzer::model::ProjectFile;
 use crate::analyzer::RustAnalyzer;
 
 use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
+use brokk_bifrost_analysis::analyzer::store::language_support::{
+    SelectedTypeHeadSource, SelectedTypeProofRead,
+};
 use brokk_bifrost_core::analyzer::tree_walk::root_node;
 use brokk_bifrost_rust::declarations::rust_node_text;
 use brokk_bifrost_rust::ownership::{
-    rust_dereference_operand, rust_node_is_in_unsafe_context, rust_reference_expression_value,
-    rust_reference_is_mutable, rust_reference_type_referent,
+    rust_dereference_operand, rust_reference_expression_value, rust_reference_is_mutable,
+    rust_reference_type_referent,
 };
+use brokk_bifrost_rust::structural::{call_function_target, rust_method_call_parts};
 use tree_sitter::Node;
 
 pub(crate) mod selected_type;
@@ -120,15 +127,23 @@ impl CallArgumentConversionProver for RustCallArgumentConversionProver {
         // It can run while an RQL request retains a selected Rust operation, so
         // it holds its own lazily opened query frame, as other route consumers
         // do, instead of taking the unframed path that such an operation refuses.
+        let parsed = sources
+            .source(analyzer, file)
+            .ok_or(ConversionUnknown::UnsupportedExpression)?;
+        let sources = &sources.with_source(file, &parsed);
         brokk_bifrost_rust::graph_support::with_usage_read_frame(rust, || {
             let actual_context = RustTypeContext {
+                operation_source: None,
+                selected: None,
                 analyzer,
                 sources,
                 file,
                 source,
-                root: root_node(actual),
+                root: parsed.logical_root(actual),
             };
             let formal_context = RustTypeContext {
+                operation_source: None,
+                selected: None,
                 analyzer,
                 sources,
                 file: formal_file,
@@ -143,16 +158,131 @@ impl CallArgumentConversionProver for RustCallArgumentConversionProver {
                 .child_by_field_name("type")
                 .ok_or(ConversionUnknown::UnresolvedTargetType)?;
             let target_type = formal_context.type_from_node(target_node, 0)?;
-            let kind = conversion_kind(&source_type, &target_type)
-                .ok_or(ConversionUnknown::UnsupportedConversion)?;
-
-            Ok(ArgumentTypeConversion {
-                hierarchy: None,
-                source: ResolvedConversionType::Rust(source_type),
-                target: ResolvedConversionType::Rust(target_type),
-                kind,
-            })
+            prove_conversion(source_type, target_type)
         })
+    }
+
+    fn prove_model_argument(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        actual: Node<'_>,
+        source: &str,
+        formal_type: &crate::analyzer::semantic_model::TypeRef,
+    ) -> Result<ArgumentTypeConversion, ConversionUnknown> {
+        self.prove_model_argument_with_context(
+            analyzer,
+            &CallConversionContext::reference(&CallConversionCache::default()),
+            file,
+            actual,
+            source,
+            formal_type,
+        )
+    }
+
+    fn prove_model_argument_with_context(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        sources: &CallConversionContext<'_>,
+        file: &ProjectFile,
+        actual: Node<'_>,
+        source: &str,
+        formal_type: &crate::analyzer::semantic_model::TypeRef,
+    ) -> Result<ArgumentTypeConversion, ConversionUnknown> {
+        let rust = resolve_analyzer::<RustAnalyzer>(analyzer)
+            .ok_or(ConversionUnknown::UnsupportedLanguage)?;
+        let _scope = AnalyzerQueryScope::new(rust);
+        let parsed = sources
+            .source(analyzer, file)
+            .ok_or(ConversionUnknown::UnsupportedExpression)?;
+        // Reacquire the argument in this parse's forest. Embedded macro roots
+        // are connected to their enclosing scope by node identity.
+        let actual = parsed
+            .tree_for_range(actual.start_byte(), actual.end_byte())?
+            .root_node()
+            .named_descendant_for_byte_range(actual.start_byte(), actual.end_byte())
+            .filter(|node| node.byte_range() == actual.byte_range())
+            .ok_or(ConversionUnknown::UnsupportedExpression)?;
+        let sources = &sources.with_source(file, &parsed);
+        brokk_bifrost_rust::graph_support::with_usage_read_frame(rust, || {
+            let context = RustTypeContext {
+                operation_source: None,
+                selected: None,
+                analyzer,
+                sources,
+                file,
+                source,
+                root: parsed.logical_root(actual),
+            };
+            // Model references and pointers lack Rust mutability. The existing
+            // model reader refuses them; do not guess shared-reference identity.
+            let target_type = context.modeled_return_conversion(formal_type, 0).map_err(
+                |reason| match reason {
+                    ConversionUnknown::GenericSubstitution => {
+                        ConversionUnknown::UnsupportedConversion
+                    }
+                    reason => reason,
+                },
+            )?;
+            context.supported_type_context(actual)?;
+            let source_type = context.expression_type(actual, 0)?;
+            prove_conversion(source_type, target_type)
+        })
+    }
+
+    fn model_argument_applicability_with_context(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        sources: &CallConversionContext<'_>,
+        file: &ProjectFile,
+        actual: Node<'_>,
+        source: &str,
+        formal_type: &crate::analyzer::semantic_model::TypeRef,
+    ) -> brokk_bifrost_analysis::analyzer::usages::call_conversion::ModelArgumentApplicability {
+        use brokk_bifrost_analysis::analyzer::usages::call_conversion::ModelArgumentApplicability;
+        match self.prove_model_argument_with_context(
+            analyzer,
+            sources,
+            file,
+            actual,
+            source,
+            formal_type,
+        ) {
+            Ok(proof) => ModelArgumentApplicability::Applicable(Box::new(proof)),
+            Err(reason) => ModelArgumentApplicability::Unknown(reason),
+        }
+    }
+
+    fn selected_actual_may_run_user_code(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        sources: &CallConversionCache,
+        actual: ConversionSyntax<'_>,
+        selected: &brokk_bifrost_analysis::analyzer::semantic::ProcedureHandle,
+    ) -> bool {
+        let Some(parsed) = sources.source(analyzer, actual.file) else {
+            return true;
+        };
+        let reference = CallConversionContext::reference(sources);
+        let reference = reference.with_source(actual.file, &parsed);
+        let context = RustTypeContext {
+            operation_source: None,
+            analyzer,
+            sources: &reference,
+            file: actual.file,
+            source: actual.source,
+            root: parsed.logical_root(actual.node),
+            selected: Some(selected),
+        };
+        if context.log_to_value_may_run_user_code(actual.node) {
+            return true;
+        }
+        if context.admitted_macro(actual.node)
+            || context.is_standard_noncoercing_macro_operand(actual.node)
+        {
+            return false;
+        }
+        self.unknown_conversion_may_run_user_code(analyzer, sources, Some(actual), None)
     }
 
     /// Deref coercion is the one argument coercion that runs user code (a
@@ -176,18 +306,26 @@ impl CallArgumentConversionProver for RustCallArgumentConversionProver {
         let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer) else {
             return true;
         };
+        let Some(parsed) = sources.source(analyzer, actual.file) else {
+            return true;
+        };
+        let sources = &sources.with_source(actual.file, &parsed);
         let _scope = AnalyzerQueryScope::new(rust);
         // Like the proof, this answer asks route questions; see prove_argument.
         brokk_bifrost_rust::graph_support::with_usage_read_frame(rust, || {
             if let Some(formal) = formal {
                 let actual_context = RustTypeContext {
+                    operation_source: None,
+                    selected: None,
                     analyzer,
                     sources,
                     file: actual.file,
                     source: actual.source,
-                    root: root_node(actual.node),
+                    root: parsed.logical_root(actual.node),
                 };
                 let formal_context = RustTypeContext {
+                    operation_source: None,
+                    selected: None,
                     analyzer,
                     sources,
                     file: formal.file,
@@ -205,6 +343,9 @@ impl CallArgumentConversionProver for RustCallArgumentConversionProver {
                     && let Some(formal_node) = formal.node.child_by_field_name("type")
                     && let Ok(formal_type) = formal_context.type_from_node(formal_node, 0)
                 {
+                    if conversion_kind(&actual_type, &formal_type).is_some() {
+                        return false;
+                    }
                     let mut actual_type = &actual_type;
                     let mut formal_type = &formal_type;
                     while let (
@@ -226,13 +367,17 @@ impl CallArgumentConversionProver for RustCallArgumentConversionProver {
             }
             if let Some(formal) = formal {
                 let actual_context = RustTypeContext {
+                    operation_source: None,
+                    selected: None,
                     analyzer,
                     sources,
                     file: actual.file,
                     source: actual.source,
-                    root: root_node(actual.node),
+                    root: parsed.logical_root(actual.node),
                 };
                 let formal_context = RustTypeContext {
+                    operation_source: None,
+                    selected: None,
                     analyzer,
                     sources,
                     file: formal.file,
@@ -266,20 +411,31 @@ fn actual_may_deref_through_user_impl(
     sources: &CallConversionContext<'_>,
     actual: ConversionSyntax<'_>,
 ) -> bool {
+    let Some(parsed) = sources.source(analyzer, actual.file) else {
+        return true;
+    };
     let context = RustTypeContext {
+        operation_source: None,
+        selected: None,
         analyzer,
         sources,
         file: actual.file,
         source: actual.source,
-        root: root_node(actual.node),
+        root: parsed.logical_root(actual.node),
     };
+    if context.log_to_value_may_run_user_code(actual.node) {
+        return true;
+    }
     if context.is_standard_noncoercing_macro_operand(actual.node) {
         return false;
     }
     if context.supported_macro_context(actual.node).is_err() {
         return true;
     }
-    let shape = context.expression_shape(actual.node, 0);
+    let shape = context.expression_type(actual.node, 0).map_or_else(
+        |_| context.expression_shape(actual.node, 0),
+        |ty| DerefShape::from_exact(&ty),
+    );
     match shape.innermost {
         Innermost::Unknown => true,
         Innermost::Nominal => shape.reference,
@@ -319,18 +475,29 @@ struct DerefShape {
 }
 
 impl DerefShape {
-    fn from_exact(mut ty: &RustConversionType) -> Self {
-        let mut reference = false;
-        while let RustConversionType::Reference { referent, .. } = ty {
-            reference = true;
-            ty = referent;
+    fn from_exact(ty: &RustConversionType) -> Self {
+        let reference = matches!(ty, RustConversionType::Reference { .. });
+        let shared = matches!(ty, RustConversionType::Reference { mutable: false, .. });
+        let mut current = ty.clone();
+        loop {
+            // Without a formal, mutable actuals may require DerefMut. Only
+            // builtin reference layers are effect-free under that uncertainty.
+            // A known shared formal can still use conversion_kind's proof.
+            if !shared && !matches!(current, RustConversionType::Reference { .. }) {
+                break;
+            }
+            let Some(next) = shared_deref_target(&current) else {
+                break;
+            };
+            current = next;
         }
         Self {
             reference,
-            innermost: match ty {
+            innermost: match current {
                 RustConversionType::Declaration(_)
                 | RustConversionType::AppliedDeclaration { .. }
-                | RustConversionType::Model { .. } => Innermost::Nominal,
+                | RustConversionType::Model { .. }
+                | RustConversionType::StdIntrinsic { .. } => Innermost::Nominal,
                 _ => Innermost::Builtin,
             },
         }
@@ -340,6 +507,26 @@ impl DerefShape {
         reference: false,
         innermost: Innermost::Unknown,
     };
+}
+
+/// Operations whose evaluation, rather than enclosing block syntax, controls
+/// whether a conversion can use the expression as static type evidence.
+#[derive(Clone, Copy)]
+enum RustEvaluationOperation {
+    Ordinary,
+    UnexpandedMacro,
+    Await,
+    RawPointerDereference,
+    UnionFieldRead,
+    MutableStaticAccess,
+    InlineAssembly,
+    Transmute,
+}
+
+#[derive(Clone, Copy)]
+enum RustEvaluationSyntax {
+    Evaluated,
+    Pattern,
 }
 
 /// One selected result's exact type and conservative deref shape.
@@ -375,6 +562,8 @@ fn formal_may_hold_reference(
         return true;
     };
     let context = RustTypeContext {
+        operation_source: None,
+        selected: None,
         analyzer,
         sources,
         file: formal.file,
@@ -433,6 +622,7 @@ pub(crate) fn expression_conversion_type(
             referent: Box::new(RustConversionType::Primitive(RustPrimitive::Str)),
         });
     }
+    // modeled_members::select uses external_calls::call_path_for_site on the primary root.
     let cache = CallConversionCache::default();
     let sources = &CallConversionContext::reference(&cache);
     let rust = resolve_analyzer::<RustAnalyzer>(analyzer)
@@ -440,6 +630,8 @@ pub(crate) fn expression_conversion_type(
     // Type evidence asks route questions; see prove_argument.
     brokk_bifrost_rust::graph_support::with_usage_read_frame(rust, || {
         RustTypeContext {
+            operation_source: None,
+            selected: None,
             analyzer,
             sources,
             file,
@@ -457,6 +649,7 @@ pub(crate) fn type_conversion_type(
     source: &str,
     node: Node<'_>,
 ) -> Result<RustConversionType, ConversionUnknown> {
+    // modeled_members::select uses external_calls::call_path_for_site on the primary root.
     let cache = CallConversionCache::default();
     let sources = &CallConversionContext::reference(&cache);
     let rust = resolve_analyzer::<RustAnalyzer>(analyzer)
@@ -464,6 +657,8 @@ pub(crate) fn type_conversion_type(
     // Type evidence asks route questions; see prove_argument.
     brokk_bifrost_rust::graph_support::with_usage_read_frame(rust, || {
         RustTypeContext {
+            operation_source: None,
+            selected: None,
             analyzer,
             sources,
             file,
@@ -472,6 +667,56 @@ pub(crate) fn type_conversion_type(
         }
         .type_from_node(node, 0)
     })
+}
+
+/// Project one active-model type with the shared alias/default conversion.
+/// Each component carries its own reads so a consumer can prove an error
+/// argument without needing a complete success argument. `site` only anchors
+/// the source context; the model type carries no syntax of its own.
+pub(crate) fn modeled_type_projection(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    site: Node<'_>,
+    returned: &crate::analyzer::semantic_model::TypeRef,
+) -> Result<
+    brokk_bifrost_analysis::analyzer::usages::call_conversion::RustQualifyingTypeProof,
+    ConversionUnknown,
+> {
+    use brokk_bifrost_analysis::analyzer::usages::call_conversion::RustQualifyingTypeProof;
+    let cache = CallConversionCache::default();
+    let sources = &CallConversionContext::reference(&cache);
+    let rust = resolve_analyzer::<RustAnalyzer>(analyzer)
+        .expect("Rust conversion types require a Rust analyzer");
+    let mut proofs = ProjectedTypeReads::default();
+    // Publish constructor reads directly. Nested component receipts are
+    // independent, and the consumer replays only the components it uses.
+    let result = brokk_bifrost_rust::graph_support::with_usage_read_frame(rust, || {
+        RustTypeContext {
+            operation_source: None,
+            selected: None,
+            analyzer,
+            sources,
+            file,
+            source,
+            root: root_node(site),
+        }
+        .modeled_return_conversion_carrier::<RustProjectedType>(returned, 0, &mut proofs)
+    });
+    match result {
+        Ok(ty) => Ok(RustQualifyingTypeProof {
+            ty,
+            components: proofs.components,
+        }),
+        Err(reason) => {
+            // A cancelled or exhausted child must retain its refusal, even
+            // though no projected answer reaches the consumer.
+            for (_, receipt) in proofs.components {
+                receipt.replay(analyzer);
+            }
+            Err(reason)
+        }
+    }
 }
 
 /// New query-only projection; complete conversion memos never see this path.
@@ -487,8 +732,11 @@ pub(crate) fn call_qualifying_type(
 > {
     use brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadReceipt;
     use brokk_bifrost_analysis::analyzer::usages::call_conversion::RustQualifyingTypeProof;
+    // The RQL qualifying_type_matches caller selects call from parsed.tree.root_node().
     let sources = &CallConversionContext::reference(sources);
     let context = RustTypeContext {
+        operation_source: None,
+        selected: None,
         analyzer,
         sources,
         file,
@@ -503,13 +751,7 @@ pub(crate) fn call_qualifying_type(
         let function = call
             .child_by_field_name("function")
             .ok_or(ConversionUnknown::UnsupportedExpression)?;
-        let function = if function.kind() == "generic_function" {
-            function
-                .child_by_field_name("function")
-                .ok_or(ConversionUnknown::UnsupportedExpression)?
-        } else {
-            function
-        };
+        let function = call_function_target(function);
         if function.kind() == "field_expression" {
             return Err(ConversionUnknown::UnsupportedExpression);
         }
@@ -549,6 +791,9 @@ pub(crate) fn call_qualifying_type(
             .filter(|node| !node.is_extra())
             .count();
         match &ty {
+            RustProjectedType::StdIntrinsic { .. } => {
+                return Err(ConversionUnknown::UnresolvedTargetType);
+            }
             RustProjectedType::Model {
                 model_set, symbol, ..
             } => {
@@ -618,6 +863,8 @@ pub(crate) fn call_qualifying_type(
                     return Err(ConversionUnknown::UnsupportedExpression);
                 }
                 let owner_context = RustTypeContext {
+                    operation_source: None,
+                    selected: None,
                     analyzer,
                     sources,
                     file: resolved.unit.source(),
@@ -743,17 +990,6 @@ impl ResolvedDeclaration {
     }
 }
 
-#[derive(Default)]
-struct OperatorCandidatesMemo {
-    entries:
-        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<OperatorCandidates>>>,
-}
-
-struct OperatorCandidates {
-    headers: Result<Vec<(ProjectFile, std::ops::Range<usize>)>, ConversionUnknown>,
-    reads: brokk_bifrost_analysis::analyzer::usages::common::QueryMemoReads,
-}
-
 // The interpreter owns traversal and substitution. Carriers own construction
 // and whether a failed child remains a hole or stops the complete proof.
 trait SelectedTypeCarrier: Clone {
@@ -769,6 +1005,8 @@ trait SelectedTypeCarrier: Clone {
     fn declaration(value: CodeUnit) -> Self;
     fn applied(declaration: CodeUnit, arguments: Vec<Self>) -> Self;
     fn model(model_set: String, symbol: String, arguments: Vec<Self>) -> Self;
+    fn std_intrinsic(identity: RustStdIdentity, arguments: Vec<Self>) -> Self;
+    fn with_std_route(self, proof: Option<RustStdRouteProof>) -> Self;
     fn reference(mutable: bool, referent: Self) -> Self;
     fn array(element: Self, length: u64) -> Self;
     fn slice(element: Self) -> Self;
@@ -798,11 +1036,25 @@ macro_rules! selected_type_constructors {
             }
         }
         fn model(model_set: String, symbol: String, arguments: Vec<Self>) -> Self {
+            // Authority is attached only after selecting and checking the owner.
             Self::Model {
+                std_identity: None,
                 model_set,
                 symbol,
                 arguments,
             }
+        }
+        fn std_intrinsic(identity: RustStdIdentity, arguments: Vec<Self>) -> Self {
+            Self::StdIntrinsic {
+                identity,
+                arguments,
+            }
+        }
+        fn with_std_route(mut self, proof: Option<RustStdRouteProof>) -> Self {
+            if let Self::Model { std_identity, .. } = &mut self {
+                *std_identity = proof;
+            }
+            self
         }
         fn reference(mutable: bool, referent: Self) -> Self {
             Self::Reference {
@@ -840,6 +1092,7 @@ macro_rules! selected_type_constructors {
             match self {
                 Self::AppliedDeclaration { arguments, .. }
                 | Self::Model { arguments, .. }
+                | Self::StdIntrinsic { arguments, .. }
                 | Self::Tuple(arguments) => arguments,
                 Self::Reference { referent, .. } => std::slice::from_ref(referent.as_ref()),
                 Self::Array { element, .. } | Self::Slice { element } => {
@@ -952,15 +1205,30 @@ impl SelectedTypeCarrier for RustProjectedType {
     }
 }
 
-struct RustTypeContext<'a, 'tree> {
-    analyzer: &'a dyn IAnalyzer,
+struct SelectedHeadDeclaration {
+    identity: brokk_bifrost_core::analyzer::model::DeclarationId,
+    declaration: CodeUnit,
+    range: std::ops::Range<usize>,
+    kind: &'static str,
+}
+
+pub(super) struct RustTypeContext<'a, 'tree> {
+    operation_source: Option<&'a dyn SelectedTypeHeadSource>,
+    pub(super) analyzer: &'a dyn IAnalyzer,
     sources: &'a CallConversionContext<'a>,
     file: &'a ProjectFile,
     source: &'a str,
     root: Node<'tree>,
+    selected: Option<&'a brokk_bifrost_analysis::analyzer::semantic::ProcedureHandle>,
 }
 
 impl<'a, 'tree> RustTypeContext<'a, 'tree> {
+    fn proof_source(&self) -> &dyn SelectedTypeHeadSource {
+        // Keep the caller's analysis/model authority. Selected operations
+        // supply their own recorded readers and never enter this source.
+        self.operation_source.unwrap_or(self)
+    }
+
     fn type_from_node(
         &self,
         node: Node<'tree>,
@@ -1040,6 +1308,9 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
                 }
                 Ok(RustConversionType::Tuple(elements))
             }
+            "generic_type" if self.operation_source.is_some() => {
+                Err(ConversionUnknown::GenericSubstitution)
+            }
             "generic_type" => self.selected_type(node, depth, work),
             "generic_function" | "qualified_type" | "higher_ranked_trait_bound" => {
                 Err(ConversionUnknown::GenericSubstitution)
@@ -1050,7 +1321,43 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
             | "scoped_identifier"
             | "self"
             | "crate"
-            | "super" => self.selected_type(node, depth, work),
+            | "super" => {
+                // Analysis and selected proofs share one alias expansion; the
+                // selected one answers heads from completed scheduler answers.
+                if self.operation_source.is_some() {
+                    if self
+                        .selected_head_declaration(node)
+                        .is_some_and(|head| head.kind == "type_item")
+                    {
+                        return self.selected_type(node, depth, work);
+                    }
+                    match self.nominal_type(node)? {
+                        RustConversionType::Model {
+                            symbol,
+                            std_identity,
+                            ..
+                        } => self
+                            .complete_selected_model_type_carrier::<RustConversionType>(
+                                &symbol,
+                                Vec::new(),
+                                depth,
+                                work,
+                                &mut (),
+                            )
+                            .map(|ty| ty.with_std_route(std_identity)),
+                        RustConversionType::StdIntrinsic { identity, .. }
+                            if std_intrinsic_type_arity(identity) != 0 =>
+                        {
+                            // All other compiler-owned std heads require a
+                            // type argument. Preserve the existing arity check.
+                            Err(ConversionUnknown::GenericSubstitution)
+                        }
+                        nominal => Ok(nominal),
+                    }
+                } else {
+                    self.selected_type(node, depth, work)
+                }
+            }
             _ => Err(ConversionUnknown::UnsupportedConversion),
         }
     }
@@ -1097,7 +1404,28 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
             .analyzer
             .active_query_cancellation()
             .unwrap_or_default();
-        let expression = selected_type::expand_alias_head_with_work(
+        let selected_route;
+        let analysis_route;
+        let route: &dyn selected_type::AliasHeadRoute = match self.operation_source {
+            Some(source) => {
+                selected_route = selected_type::SelectedAliasRoute {
+                    source,
+                    sources: self.sources,
+                    analyzer: self.analyzer,
+                    cancellation: &cancellation,
+                };
+                &selected_route
+            }
+            None => {
+                analysis_route = selected_type::AnalysisAliasRoute {
+                    analyzer: self.analyzer,
+                    cancellation: &cancellation,
+                };
+                &analysis_route
+            }
+        };
+        let expression = selected_type::expand_alias_head_via(
+            route,
             self.analyzer,
             expression,
             &cancellation,
@@ -1141,6 +1469,8 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
             .filter(|node| node.byte_range() == (site.start..site.end) && node.kind() == site.kind)
             .ok_or(ConversionUnknown::UnresolvedTargetType)?;
         let context = RustTypeContext {
+            operation_source: self.operation_source,
+            selected: None,
             analyzer: self.analyzer,
             sources: self.sources,
             file: &site.file,
@@ -1189,12 +1519,31 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
                 _ => unreachable!(),
             });
         }
-        if context.standard_nominal_name(node).is_some() {
-            let RustConversionType::Model { symbol, .. } = context.nominal_type(node)? else {
-                return Err(ConversionUnknown::GenericSubstitution);
-            };
-            return context
-                .complete_selected_model_type_carrier(&symbol, types, depth, work, proofs);
+        if let Some(name) = context.standard_nominal_name(node) {
+            let identity = standard_identity_for_name(name);
+            // Route evidence is independent of pack presence. Keep exact model
+            // declarations and their defaults when available; an intrinsic has
+            // no declaration and can never stand in for one.
+            match context.nominal_type(node)? {
+                RustConversionType::Model {
+                    symbol,
+                    std_identity,
+                    ..
+                } => {
+                    return context
+                        .complete_selected_model_type_carrier(&symbol, types, depth, work, proofs)
+                        .map(|ty| ty.with_std_route(std_identity));
+                }
+                RustConversionType::StdIntrinsic { .. } => {
+                    let identity = identity.ok_or(ConversionUnknown::UnresolvedTargetType)?;
+                    let expected = std_intrinsic_type_arity(identity);
+                    if types.len() != expected {
+                        return Err(ConversionUnknown::GenericSubstitution);
+                    }
+                    return Ok(C::std_intrinsic(identity, types));
+                }
+                _ => return Err(ConversionUnknown::UnresolvedTargetType),
+            }
         }
         let resolved =
             match context.resolve_declaration(node.child_by_field_name("name").unwrap_or(node)) {
@@ -1214,6 +1563,8 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
         }
         if let Some(parent) = declaration.parent() {
             RustTypeContext {
+                operation_source: self.operation_source,
+                selected: None,
                 analyzer: self.analyzer,
                 sources: self.sources,
                 file: resolved.unit.source(),
@@ -1237,79 +1588,15 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
         work: &mut SelectedTypeWork,
         proofs: &mut C::Proofs,
     ) -> Result<C, ConversionUnknown> {
-        use brokk_bifrost_analysis::analyzer::semantic_model::{
-            SemanticModelSymbolKind, overlay::RustReexportNamespace,
-        };
-        let selected_node = node;
-        let node = node.child_by_field_name("name").unwrap_or(node);
-        let mut outcomes = resolve_definition_batch_with_source_tree(
-            self.analyzer,
-            vec![DefinitionLookupRequest {
-                file: self.file.clone(),
-                line: None,
-                column: None,
-                start_byte: Some(node.start_byte()),
-                end_byte: Some(node.end_byte()),
-            }],
-            self.file.clone(),
-            Arc::from(self.source),
-            None,
-        );
-        let outcome = outcomes
-            .pop()
-            .ok_or(ConversionUnknown::UnresolvedTargetType)?;
-        // Activation identity belongs to both admission and refusal. The scope
-        // route below is the same proof used by source alias expansion; a model
-        // spelling alone never establishes an external source reference.
-        let snapshot = self.analyzer.active_semantic_model_snapshot();
-        let symbol = if outcome.status == DefinitionLookupStatus::UnresolvableImportBoundary {
-            let source = Arc::from(self.source);
-            let cancellation = self
-                .analyzer
-                .active_query_cancellation()
-                .unwrap_or_default();
-            let selected_type::ExternalRoute::Selected(route) =
-                selected_type::selected_external_route(
-                    self.analyzer,
-                    self.file,
-                    &source,
-                    selected_node,
-                    &cancellation,
-                )
-            else {
-                return Err(ConversionUnknown::UnresolvedTargetType);
-            };
-            let overlay = snapshot
-                .as_ref()
-                .and_then(|snapshot| snapshot.semantic_model_overlay())
-                .map(Arc::as_ref);
-            let crates = super::crate_identity::RustOverlayCrates::new(overlay);
-            crates
-                .referenceable_symbol_in_namespace(&route, RustReexportNamespace::TypeOrModule)
-                .ok_or(ConversionUnknown::UnresolvedTargetType)?
-        } else {
-            if outcome.status != DefinitionLookupStatus::Resolved
-                || !outcome.diagnostics.is_empty()
-                || !outcome.definitions.is_empty()
-                || outcome.lexical_definition.is_some()
-            {
-                return Err(ConversionUnknown::UnresolvedTargetType);
-            }
-            let [symbol] = outcome.modeled_definitions.as_slice() else {
-                return Err(ConversionUnknown::AmbiguousBinding);
-            };
-            Arc::clone(symbol)
-        };
-        if !matches!(
-            symbol.kind,
-            SemanticModelSymbolKind::Struct
-                | SemanticModelSymbolKind::Enum
-                | SemanticModelSymbolKind::Union
-                | SemanticModelSymbolKind::TypeAlias
-        ) {
+        use brokk_bifrost_analysis::analyzer::store::language_support::SelectedTypeOwner;
+        let SelectedTypeProofRead::Available(SelectedTypeOwner::Model(symbol)) = self
+            .proof_source()
+            .model_type_owner(self.file, node.byte_range())
+            .map_err(|_| ConversionUnknown::UnresolvedTargetType)?
+        else {
             return Err(ConversionUnknown::UnresolvedTargetType);
-        }
-        self.complete_selected_model_type_carrier(&symbol.id, arguments, depth, work, proofs)
+        };
+        self.complete_selected_model_type_carrier(&symbol.symbol_id, arguments, depth, work, proofs)
     }
 
     /// One canonical default-completion path for written standard types,
@@ -1430,7 +1717,8 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
                     snapshot.active_models().active_model_set_hash().to_owned(),
                     symbol.id.clone(),
                     arguments,
-                ))
+                )
+                .with_std_route(model_sysroot_identity(&symbol, &declaration)))
             }
         })();
         C::finish_binding_scope(proofs, proof_scope);
@@ -1505,36 +1793,42 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
     }
 
     fn name_has_lexical_competitor(&self, node: Node<'tree>, spelling: &str) -> bool {
-        let rust = resolve_analyzer::<RustAnalyzer>(self.analyzer)
+        let Some(parsed) = self.sources.source(self.analyzer, self.file) else {
+            return true;
+        };
+        let context = RustTypeContext {
+            operation_source: self.operation_source,
+            root: parsed.logical_root(node),
+            ..*self
+        };
+
+        let rust = resolve_analyzer::<RustAnalyzer>(context.analyzer)
             .expect("Rust conversion requires a Rust analyzer");
         let scope = brokk_bifrost_rust::lexical_scope::rust_lexical_scope_index_with(
             rust.inner.adapter().lexical_caches(),
-            self.root,
-            self.source,
+            context.source,
         );
         let imports = brokk_bifrost_rust::lexical_scope::visible_import_binder_in_tree_with(
             rust.inner.adapter().lexical_caches(),
-            self.root,
-            self.source,
+            context.root,
+            context.source,
             node.start_byte(),
         );
         if scope.item_bound_in_enclosing_scope(spelling, node.start_byte())
             || imports.bindings.values().any(|binding| {
                 binding.kind == ImportKind::Glob && {
-                    let scope = AnalyzerQueryScope::new(rust);
-                    brokk_bifrost_rust::graph_support::reference_context_of(
-                        rust,
-                        scope.token(),
-                        self.file,
+                    !matches!(
+                        context
+                            .proof_source()
+                            .glob_may_bind_name(context.file, binding, spelling),
+                        Ok(SelectedTypeProofRead::Available(false))
                     )
-                    .glob_may_bind_name(binding, spelling)
-                    .unwrap_or(true)
                 }
             })
         {
             return true;
         }
-        let mut ancestor = node.parent();
+        let mut ancestor = parsed.logical_parent(node);
         while let Some(scope) = ancestor {
             if scope
                 .child_by_field_name("type_parameters")
@@ -1543,14 +1837,14 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
                         .named_children(&mut parameters.walk())
                         .any(|parameter| {
                             parameter.child_by_field_name("name").is_some_and(|name| {
-                                rust_node_text(name, self.source).trim() == spelling
+                                rust_node_text(name, context.source).trim() == spelling
                             })
                         })
                 })
             {
                 return true;
             }
-            ancestor = scope.parent();
+            ancestor = parsed.logical_parent(scope);
         }
         false
     }
@@ -1595,12 +1889,10 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
     }
 
     fn prelude_contains_type(&self, name: &str) -> bool {
-        let rust = resolve_analyzer::<RustAnalyzer>(self.analyzer)
-            .expect("Rust conversion requires a Rust analyzer");
-        let scope = AnalyzerQueryScope::new(rust);
-        brokk_bifrost_rust::graph_support::reference_context_of(rust, scope.token(), self.file)
-            .implicit_prelude_contains_type(name)
-            .is_ok_and(|contains| contains)
+        matches!(
+            self.proof_source().prelude_type(self.file, name),
+            Ok(SelectedTypeProofRead::Available(true))
+        )
     }
 
     fn standard_type_for_path(&self, node: Node<'tree>, parts: &[&str]) -> Option<&'static str> {
@@ -1608,6 +1900,9 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
             ["std" | "alloc", "string", "String"] => "String",
             ["std" | "alloc", "vec", "Vec"] => "Vec",
             ["std" | "alloc", "boxed", "Box"] => "Box",
+            ["std" | "alloc", "rc", "Rc"] => "Rc",
+            ["std" | "alloc", "sync", "Arc"] => "Arc",
+            ["std" | "alloc", "borrow", "Cow"] => "Cow",
             ["std" | "core", "option", "Option"] => "Option",
             ["std" | "core", "result", "Result"] => "Result",
             ["std" | "core", "ops", name] => match *name {
@@ -1625,7 +1920,11 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
             },
             _ => return None,
         };
-        let root = parts[0];
+        self.standard_path_root_is_verified(node, parts[0])?;
+        Some(name)
+    }
+
+    fn standard_path_root_is_verified(&self, node: Node<'tree>, root: &str) -> Option<()> {
         if self.name_has_lexical_competitor(node, root) {
             return None;
         }
@@ -1644,19 +1943,14 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
         if !imports.is_empty() && !explicit {
             return None;
         }
-        let routes = rust.file_routes(self.file, None).ok()?;
-        if !routes.is_complete() {
-            return None;
+        match self
+            .proof_source()
+            .standard_type_root(self.file, root)
+            .ok()?
+        {
+            SelectedTypeProofRead::Available(implicit) => (implicit || explicit).then_some(()),
+            SelectedTypeProofRead::Unavailable => None,
         }
-        if routes.type_root_identity(self.file, root).is_some() {
-            return None;
-        }
-        let implicit = match root {
-            "std" => self.prelude_contains_type("String"),
-            "core" => self.prelude_contains_type("Option"),
-            _ => false,
-        };
-        (implicit || explicit).then_some(name)
     }
 
     fn standard_nominal_name(&self, node: Node<'tree>) -> Option<&'static str> {
@@ -1678,6 +1972,9 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
             "String" => "String",
             "Vec" => "Vec",
             "Box" => "Box",
+            "Rc" => "Rc",
+            "Arc" => "Arc",
+            "Cow" => "Cow",
             "Option" => "Option",
             "Result" => "Result",
             _ => return None,
@@ -1709,29 +2006,86 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
 
     fn nominal_type(&self, node: Node<'tree>) -> Result<RustConversionType, ConversionUnknown> {
         if let Some(name) = self.standard_nominal_name(node) {
-            // Capturing the snapshot records Models even when activation is absent.
-            let snapshot = self
-                .analyzer
-                .active_semantic_model_snapshot()
-                .ok_or(ConversionUnknown::UnresolvedTargetType)?;
-            let overlay = snapshot
-                .semantic_model_overlay()
-                .ok_or(ConversionUnknown::UnresolvedTargetType)?;
-            let symbol = super::crate_identity::RustOverlayCrates::new(Some(overlay))
-                .referenceable_symbol(match name {
-                    "String" => "std.string.String",
-                    "Result" => "std.result.Result",
-                    "Option" => "std.option.Option",
-                    "Vec" => "std.vec.Vec",
-                    "Box" => "std.boxed.Box",
-                    _ => return Err(ConversionUnknown::UnresolvedTargetType),
+            // Capture model absence too. A route-proven type needs no pack,
+            // but declaration-dependent consumers still need an exact symbol.
+            let snapshot = self.analyzer.active_semantic_model_snapshot();
+            let qualified_name = match name {
+                "String" => "std.string.String",
+                "Vec" => "std.vec.Vec",
+                "Box" => "std.boxed.Box",
+                "Rc" => "std.rc.Rc",
+                "Arc" => "std.sync.Arc",
+                "Cow" => "std.borrow.Cow",
+                "Result" => "std.result.Result",
+                "Option" => "std.option.Option",
+                _ => unreachable!(),
+            };
+            let symbol = if let Some(overlay) = snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.semantic_model_overlay())
+            {
+                use brokk_bifrost_analysis::analyzer::semantic_model::overlay::{
+                    RustReexportLookup, RustReexportNamespace, SemanticModelOverlayDisposition,
+                };
+                let selected = super::crate_identity::RustOverlayCrates::new(Some(overlay))
+                    .referenceable_owner(qualified_name);
+                if selected.is_none() {
+                    // A disputed declaration is not model absence. Never
+                    // hide it by constructing an intrinsic in its place.
+                    if matches!(
+                        overlay.rust_reexport_lookup_recording(
+                            qualified_name,
+                            RustReexportNamespace::TypeOrModule,
+                        ),
+                        RustReexportLookup::MissingEvidence(_)
+                    ) || overlay
+                        .symbols_named_in_family(
+                            qualified_name,
+                            "rust",
+                            RustReexportNamespace::TypeOrModule,
+                        )
+                        .disposition
+                        != SemanticModelOverlayDisposition::Empty
+                    {
+                        return Err(ConversionUnknown::UnresolvedTargetType);
+                    }
+                }
+                selected
+            } else {
+                None
+            };
+            if let (Some(snapshot), Some(symbol)) = (snapshot, symbol) {
+                // Compare the source route with the same exact declaration
+                // whose receipt authorizes model-origin identity below.
+                let declaration_identity =
+                    brokk_bifrost_analysis::analyzer::semantic_model::overlay::owner_declaration(
+                        snapshot.active_models(),
+                        &symbol,
+                    )
+                    .filter(|owner| {
+                        matches!(
+                            owner.type_kind,
+                            crate::analyzer::semantic_model::TypeKind::Struct
+                                | crate::analyzer::semantic_model::TypeKind::Enum,
+                        )
+                    })
+                    .and_then(|owner| standard_identity_for_owner(&owner.name));
+                let std_identity = standard_identity_for_name(name)
+                    .zip(declaration_identity)
+                    .map(|(route, declaration)| RustStdRouteProof { route, declaration });
+                return Ok(RustConversionType::Model {
+                    std_identity,
+                    model_set: snapshot.active_models().active_model_set_hash().to_owned(),
+                    symbol: symbol.id.clone(),
+                    arguments: Vec::new(),
+                });
+            }
+            return standard_identity_for_name(name)
+                .map(|identity| RustConversionType::StdIntrinsic {
+                    identity,
+                    arguments: Vec::new(),
                 })
-                .ok_or(ConversionUnknown::UnresolvedTargetType)?;
-            return Ok(RustConversionType::Model {
-                model_set: snapshot.active_models().active_model_set_hash().to_owned(),
-                symbol: symbol.id.clone(),
-                arguments: Vec::new(),
-            });
+                .ok_or(ConversionUnknown::UnresolvedTargetType);
         }
         let name_node = node.child_by_field_name("name").unwrap_or(node);
         let resolved = self.resolve_declaration(name_node)?;
@@ -1740,6 +2094,8 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
         // obligations. Inspect the exact declaration, not its rendered name.
         let declaration = resolved.node()?;
         RustTypeContext {
+            operation_source: self.operation_source,
+            selected: None,
             analyzer: self.analyzer,
             sources: self.sources,
             file: resolved.unit.source(),
@@ -1907,92 +2263,173 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
         &self,
         trait_name: &str,
     ) -> Result<Vec<(ProjectFile, std::ops::Range<usize>)>, ConversionUnknown> {
-        use brokk_bifrost_rust::graph_support::RustFactSource;
         let unknown = ConversionUnknown::UnsupportedExpression;
-        let rust = resolve_analyzer::<RustAnalyzer>(self.analyzer).ok_or(unknown)?;
-        let spellings =
-            super::trait_applicability::workspace_trait_spellings(self.analyzer, rust, trait_name)
-                .ok_or(unknown)?;
-        let mut files = std::collections::HashSet::new();
-        let live = rust.live_blobs();
-        for spelling in &spellings {
-            if super::trait_applicability::macro_may_name_trait(rust, spelling).ok_or(unknown)? {
-                return Err(unknown);
-            }
-            for row in rust
-                .rust_unresolved_trait_impl_files(spelling)
-                .map_err(|_| unknown)?
-            {
-                files.extend(live.paths_for_oid(row.impl_blob));
-            }
-        }
+        let SelectedTypeProofRead::Available(files) = self
+            .proof_source()
+            .operator_candidate_files(
+                trait_name,
+                &self
+                    .analyzer
+                    .active_query_cancellation()
+                    .unwrap_or_default(),
+            )
+            .map_err(|_| unknown)?
+        else {
+            return Err(unknown);
+        };
         let mut headers = Vec::new();
-        for file in files {
+        for file in files.files {
             let parsed = self.sources.source(self.analyzer, &file).ok_or(unknown)?;
-            let context = RustTypeContext {
-                analyzer: self.analyzer,
-                sources: self.sources,
-                file: &file,
-                source: &parsed.source,
-                root: parsed.tree.root_node(),
-            };
             let mut pending = vec![parsed.tree.root_node()];
             while let Some(node) = pending.pop() {
                 if node.kind() != "impl_item" {
                     pending.extend(node.named_children(&mut node.walk()));
                     continue;
                 }
-                let Some(trait_node) = node.child_by_field_name("trait") else {
+                let Some(_) = node.child_by_field_name("trait") else {
                     continue;
                 };
-                let head = if trait_node.kind() == "generic_type" {
-                    trait_node.child_by_field_name("type").ok_or(unknown)?
-                } else {
-                    trait_node
-                };
-                // Operators dispatch through core::ops, never a workspace trait
-                // that happens to have the same identifier.
-                if context.resolve_declaration(head).is_ok() {
-                    continue;
-                }
-                let segments =
-                    brokk_bifrost_rust::graph_support::rust_path_segments(head).ok_or(unknown)?;
-                let parts = segments
-                    .iter()
-                    .map(|n| rust_node_text(*n, &parsed.source))
-                    .collect::<Vec<_>>();
-                if !parts.last().is_some_and(|name| spellings.contains(*name)) {
-                    continue;
-                }
-                let identity = if parts.len() > 1 {
-                    context.standard_type_for_path(head, &parts)
-                } else {
-                    let imports =
-                        brokk_bifrost_rust::lexical_scope::visible_import_declarations_in_tree_with(
-                            rust.inner.adapter().lexical_caches(),
-                            context.root,
-                            context.source,
-                            head.start_byte(),
-                            parts[0],
-                        );
-                    if let [import] = imports.as_slice() {
-                        import.path.as_ref().and_then(|path| {
-                            context.standard_type_for_path(
-                                head,
-                                &path.segments.iter().map(String::as_str).collect::<Vec<_>>(),
-                            )
-                        })
-                    } else {
-                        None
-                    }
-                };
-                if identity != Some(trait_name) {
-                    return Err(unknown);
-                }
                 headers.push((file.clone(), node.byte_range()));
             }
         }
         Ok(headers)
+    }
+
+    // Header caches hold structural candidates only. Classification consumes
+    // the current invocation's completed scheduler answers, never an earlier
+    // prerequisite-collection context.
+    fn operator_trait_matches(
+        &self,
+        trait_node: Node<'tree>,
+        trait_name: &str,
+    ) -> Result<bool, ConversionUnknown> {
+        use brokk_bifrost_analysis::analyzer::store::language_support::{
+            SelectedNominalHead, SelectedTypeEvaluationRead,
+        };
+        let unknown = ConversionUnknown::UnsupportedExpression;
+        let head = if trait_node.kind() == "generic_type" {
+            trait_node.child_by_field_name("type").ok_or(unknown)?
+        } else {
+            trait_node
+        };
+        // A selected source declaration is a workspace trait, not a sysroot
+        // operator. This question is name resolution, not generic typing.
+        if matches!(
+            self.proof_source()
+                .nominal_head_identity(SelectedNominalHead::Reference {
+                    file: self.file,
+                    range: head.byte_range()
+                }),
+            Ok(SelectedTypeEvaluationRead::Available(_))
+        ) {
+            return Ok(false);
+        }
+        let segments =
+            brokk_bifrost_rust::graph_support::rust_path_segments(head).ok_or(unknown)?;
+        let parts = segments
+            .iter()
+            .map(|n| rust_node_text(*n, self.source))
+            .collect::<Vec<_>>();
+        let rust = resolve_analyzer::<RustAnalyzer>(self.analyzer).ok_or(unknown)?;
+        let imports = brokk_bifrost_rust::lexical_scope::visible_import_declarations_in_tree_with(
+            rust.inner.adapter().lexical_caches(),
+            self.root,
+            self.source,
+            head.start_byte(),
+            parts[0],
+        );
+        let path = match imports.as_slice() {
+            [] => parts
+                .iter()
+                .map(|part| (*part).to_owned())
+                .collect::<Vec<_>>(),
+            [import] => {
+                let mut path = import.path.as_ref().ok_or(unknown)?.segments.clone();
+                path.extend(parts.iter().skip(1).map(|part| (*part).to_owned()));
+                path
+            }
+            _ => return Err(unknown),
+        };
+        if path.len() > 1 && matches!(path[0].as_str(), "std" | "core" | "alloc") {
+            self.standard_path_root_is_verified(head, &path[0])
+                .ok_or(unknown)?;
+            // A verified standard path is Is or IsNot, independently of the
+            // narrower standard type interpreter's supported nominal types.
+            return Ok(matches!(path.as_slice(), [root, ops, name]
+                if matches!(root.as_str(), "std" | "core") && ops == "ops" && name == trait_name));
+        }
+        if parts.len() != 1 || !imports.is_empty() {
+            return Err(unknown);
+        }
+        let binder = brokk_bifrost_rust::lexical_scope::visible_import_binder_in_tree_with(
+            rust.inner.adapter().lexical_caches(),
+            self.root,
+            self.source,
+            head.start_byte(),
+        );
+        if binder
+            .bindings
+            .values()
+            .any(|binding| binding.kind == ImportKind::Glob)
+            || self.name_has_lexical_competitor(head, parts[0])
+        {
+            return Err(unknown);
+        }
+        let SelectedTypeProofRead::Available(candidates) = self
+            .proof_source()
+            .operator_candidate_files(
+                trait_name,
+                &self
+                    .analyzer
+                    .active_query_cancellation()
+                    .unwrap_or_default(),
+            )
+            .map_err(|_| unknown)?
+        else {
+            return Err(unknown);
+        };
+        // Absence is IsNot only after the inventory's macro guard (both read
+        // sources). Operator spellings/aliases never become IsNot by absence.
+        if candidates.spellings.iter().any(|name| name == parts[0]) {
+            return Err(unknown);
+        }
+        Ok(false)
+    }
+
+    /// The declaration a type name selects and its syntax kind, from the
+    /// selected source. None when the selected answer is absent, incomplete or
+    /// ambiguous, which is never evidence that the name denotes something else.
+    fn selected_head_declaration(&self, name: Node<'tree>) -> Option<SelectedHeadDeclaration> {
+        use brokk_bifrost_analysis::analyzer::store::language_support::{
+            SelectedNominalHead, SelectedTypeEvaluationRead,
+        };
+        let Ok(SelectedTypeEvaluationRead::Available(head)) = self
+            .proof_source()
+            .nominal_head_identity(SelectedNominalHead::Reference {
+                file: self.file,
+                range: selected_type::reference_range(name),
+            })
+        else {
+            return None;
+        };
+        let unit = &head.declaration;
+        let parsed = self.sources.source(self.analyzer, unit.source())?;
+        let ranges = self.analyzer.ranges_of(unit);
+        let [range] = ranges.as_slice() else {
+            return None;
+        };
+        let kind = parsed
+            .tree
+            .root_node()
+            .named_descendant_for_byte_range(range.start_byte, range.end_byte)
+            .filter(|node| node.byte_range() == (range.start_byte..range.end_byte))?
+            .kind();
+        Some(SelectedHeadDeclaration {
+            identity: head.identity,
+            range: range.start_byte..range.end_byte,
+            declaration: head.declaration,
+            kind,
+        })
     }
 
     /// Whether an impl target's written shape can denote `actual`, decided
@@ -2002,16 +2439,33 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
     /// undecidable shape (an unresolved name, possibly a type parameter) stays
     /// a candidate and its later resolution fails closed.
     fn impl_target_may_denote(&self, target: Node<'tree>, actual: &RustConversionType) -> bool {
-        let nominal = |name: Node<'tree>, actual: &RustConversionType| {
-            let Ok(resolved) = self.resolve_declaration(name) else {
+        let nominal = |name: Node<'tree>, expression: Node<'tree>, actual: &RustConversionType| {
+            let Some(head) = self.selected_head_declaration(name) else {
                 return true;
             };
-            match actual {
-                RustConversionType::Declaration(unit)
-                | RustConversionType::AppliedDeclaration {
-                    declaration: unit, ..
-                } => unit.declaration_id() == resolved.unit.declaration_id(),
-                _ => false,
+            match head.kind {
+                // An alias compares by its expansion. An expansion that cannot
+                // complete leaves the impl a candidate; its later resolution
+                // fails closed.
+                "type_item" => self
+                    .type_from_node(expression, 0)
+                    .map_or(true, |expanded| same_type(&expanded, actual)),
+                "struct_item" | "enum_item" | "union_item" => {
+                    // Compare nominal identity only after proving declaration
+                    // kind. Aliases can denote a nominal or a reference type.
+                    let mut nominal_actual = actual;
+                    while let RustConversionType::Reference { referent, .. } = nominal_actual {
+                        nominal_actual = referent;
+                    }
+                    match nominal_actual {
+                        RustConversionType::Declaration(unit)
+                        | RustConversionType::AppliedDeclaration {
+                            declaration: unit, ..
+                        } => head.identity == unit.declaration_id(),
+                        _ => true,
+                    }
+                }
+                _ => true,
             }
         };
         let (mut target, mut actual) = (target, actual);
@@ -2030,10 +2484,10 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
                 ("generic_type", _) => {
                     return target
                         .child_by_field_name("type")
-                        .is_none_or(|base| nominal(base, actual));
+                        .is_none_or(|base| nominal(base, target, actual));
                 }
                 ("type_identifier" | "scoped_type_identifier", _) => {
-                    return nominal(target, actual);
+                    return nominal(target, target, actual);
                 }
                 ("tuple_type", RustConversionType::Tuple(_))
                 | (
@@ -2054,42 +2508,132 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
         trait_name: &str,
         depth: usize,
     ) -> Result<RustConversionType, ConversionUnknown> {
-        use brokk_bifrost_analysis::analyzer::usages::common::{
-            capture_memo_reads, replay_memo_reads,
-        };
+        self.workspace_operator_outputs(left, std::slice::from_ref(right), trait_name, depth)?
+            .pop()
+            .expect("one requested RHS")
+            .ok_or(ConversionUnknown::UnsupportedExpression)
+    }
+
+    fn native_binary_result_type(
+        &self,
+        left: &RustConversionType,
+        right: &RustConversionType,
+        operator: &str,
+        right_mutability: brokk_bifrost_core::analyzer::resolution_facts::ResolutionBinaryReference,
+    ) -> Result<RustConversionType, ConversionUnknown> {
+        use brokk_bifrost_core::analyzer::resolution_facts::ResolutionBinaryReference;
         let unknown = ConversionUnknown::UnsupportedExpression;
-        let rust = resolve_analyzer::<RustAnalyzer>(self.analyzer).ok_or(unknown)?;
-        let memo = rust
-            .inner
-            .active_query_request_memo::<OperatorCandidatesMemo>();
-        let cached = memo.as_ref().and_then(|memo| {
-            memo.entries
-                .lock()
-                .expect("operator memo poisoned")
-                .get(trait_name)
-                .cloned()
-        });
-        let candidates = cached.unwrap_or_else(|| {
-            let (headers, reads) = capture_memo_reads(self.analyzer, || {
-                self.collect_operator_candidates(trait_name)
-            });
-            let value = std::sync::Arc::new(OperatorCandidates { headers, reads });
-            if let Some(memo) = &memo {
-                memo.entries
-                    .lock()
-                    .expect("operator memo poisoned")
-                    .entry(trait_name.to_owned())
-                    .or_insert_with(|| value.clone())
-                    .clone()
-            } else {
-                value
+        if matches!(
+            (left, right),
+            (
+                RustConversionType::Primitive(_),
+                RustConversionType::Primitive(_)
+            )
+        ) {
+            return self.binary_result_type(left, right, operator, 0);
+        }
+        // The native type head erases reference mutability. Direct RHS AST
+        // evidence can recover it; unknown RHS evidence must prove every case.
+        // Left-reference and modeled ByRef dispatch remain unsupported.
+        if matches!(left, RustConversionType::Reference { .. }) {
+            return Err(unknown);
+        }
+        let trait_name = match operator {
+            "+" => "Add",
+            "-" => "Sub",
+            "*" => "Mul",
+            "/" => "Div",
+            "%" => "Rem",
+            "&" => "BitAnd",
+            "|" => "BitOr",
+            "^" => "BitXor",
+            "<<" => "Shl",
+            ">>" => "Shr",
+            _ => return Err(unknown),
+        };
+        let alternatives = if let RustConversionType::Reference { referent, .. } = right {
+            if matches!(&**referent, RustConversionType::Reference { .. })
+                || matches!(left, RustConversionType::Model { .. })
+            {
+                // Model ByRef cannot prove formal mutability.
+                return Err(unknown);
             }
-        });
-        replay_memo_reads(&candidates.reads, self.analyzer);
-        let mut selected = None;
-        for (file, range) in candidates.headers.as_ref().map_err(|error| *error)? {
+            let choices: &[bool] = match right_mutability {
+                ResolutionBinaryReference::Shared => &[false],
+                ResolutionBinaryReference::Mutable => &[true],
+                ResolutionBinaryReference::Unknown => &[false, true],
+            };
+            choices
+                .iter()
+                .map(|mutable| RustConversionType::Reference {
+                    mutable: *mutable,
+                    referent: referent.clone(),
+                })
+                .collect::<Vec<_>>()
+        } else {
+            vec![right.clone()]
+        };
+        let selected = self.workspace_operator_outputs(left, &alternatives, trait_name, 0)?;
+        let mut outputs = if alternatives.len() > 1 {
+            let Some(first) = selected[0].as_ref() else {
+                return Err(unknown);
+            };
+            if !selected.iter().all(|output| {
+                output
+                    .as_ref()
+                    .is_some_and(|output| same_type(output, first))
+            }) {
+                return Err(unknown);
+            }
+            vec![first.clone()]
+        } else {
+            selected.into_iter().flatten().collect::<Vec<_>>()
+        };
+        if matches!(left, RustConversionType::Model { .. }) {
+            let modeled = super::std_types::RustTypeProof::new(self.analyzer)
+                .and_then(|proof| proof.modeled_operator_outputs(left, right, trait_name))
+                .ok_or(unknown)?;
+            for output in modeled {
+                outputs.push(self.modeled_return_conversion(&output, 0)?);
+            }
+        }
+        match outputs.as_slice() {
+            [output] => Ok(output.clone()),
+            _ => Err(unknown),
+        }
+    }
+
+    fn operator_headers(
+        &self,
+        trait_name: &str,
+    ) -> Result<Vec<(ProjectFile, std::ops::Range<usize>)>, ConversionUnknown> {
+        let selection = self
+            .operation_source
+            .and_then(SelectedTypeHeadSource::proof_selection_key);
+        if self.operation_source.is_some() && selection.is_none() {
+            return Err(ConversionUnknown::UnsupportedExpression);
+        }
+        self.sources
+            .rust_operator_headers(self.analyzer, selection, trait_name, || {
+                self.collect_operator_candidates(trait_name)
+            })
+    }
+
+    fn workspace_operator_outputs(
+        &self,
+        left: &RustConversionType,
+        requested_rights: &[RustConversionType],
+        trait_name: &str,
+        depth: usize,
+    ) -> Result<Vec<Option<RustConversionType>>, ConversionUnknown> {
+        let unknown = ConversionUnknown::UnsupportedExpression;
+        let headers = self.operator_headers(trait_name)?;
+        let mut selected = vec![None; requested_rights.len()];
+        for (file, range) in &headers {
             let parsed = self.sources.source(self.analyzer, file).ok_or(unknown)?;
             let context = RustTypeContext {
+                operation_source: self.operation_source,
+                selected: None,
                 analyzer: self.analyzer,
                 sources: self.sources,
                 file,
@@ -2109,10 +2653,19 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
             if !context.impl_target_may_denote(target, left) {
                 continue;
             }
+            if !context.operator_trait_matches(trait_node, trait_name)? {
+                continue;
+            }
             let generic_target = target.kind() == "generic_type";
             if generic_target {
                 let base = target.child_by_field_name("type").ok_or(unknown)?;
                 let resolved = context.resolve_declaration(base)?;
+                if !matches!(
+                    resolved.node()?.kind(),
+                    "struct_item" | "enum_item" | "union_item"
+                ) {
+                    return Err(unknown);
+                }
                 let actual = match left {
                     RustConversionType::Declaration(unit) => unit,
                     RustConversionType::AppliedDeclaration { declaration, .. } => declaration,
@@ -2162,26 +2715,31 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
             } else {
                 owner.clone()
             };
-            if !same_type(&rhs, right) {
+            let matching = requested_rights
+                .iter()
+                .enumerate()
+                .filter_map(|(index, requested)| same_type(&rhs, requested).then_some(index))
+                .collect::<Vec<_>>();
+            if matching.is_empty() {
                 continue;
             }
-            if selected.is_some() {
+            if matching.iter().any(|&index| selected[index].is_some()) {
                 return Err(ConversionUnknown::AmbiguousBinding);
             }
             let ty = output.child_by_field_name("type").ok_or(unknown)?;
-            selected = Some(
-                if let Some(bound) = bindings.get(rust_node_text(ty, &parsed.source)) {
-                    self.modeled_return_conversion(bound, depth + 1)?
-                } else if ty.kind() == "type_identifier"
-                    && rust_node_text(ty, &parsed.source) == "Self"
-                {
-                    owner
-                } else {
-                    context.type_from_node(ty, depth + 1)?
-                },
-            );
+            let result = if let Some(bound) = bindings.get(rust_node_text(ty, &parsed.source)) {
+                self.modeled_return_conversion(bound, depth + 1)?
+            } else if ty.kind() == "type_identifier" && rust_node_text(ty, &parsed.source) == "Self"
+            {
+                owner
+            } else {
+                context.type_from_node(ty, depth + 1)?
+            };
+            for index in matching {
+                selected[index] = Some(result.clone());
+            }
         }
-        selected.ok_or(unknown)
+        Ok(selected)
     }
 
     fn modeled_return_conversion(
@@ -2262,7 +2820,7 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
                     .semantic_model_overlay()
                     .ok_or(ConversionUnknown::GenericSubstitution)?;
                 let symbol = overlay
-                    .symbols_named_in_family(name, "rust")
+                    .symbols_named_in_family(name, "rust", SemanticModelNamespace::TypeOrModule)
                     .unique()
                     .ok_or(ConversionUnknown::GenericSubstitution)?;
                 self.charge_selected_type(depth + 1, work)?;
@@ -2324,16 +2882,12 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
         call: Node<'tree>,
         depth: usize,
     ) -> Result<RustResultProof, ConversionUnknown> {
-        if let Some(function) = call
+        if let Some((receiver, member)) = call
             .child_by_field_name("function")
-            .filter(|function| function.kind() == "field_expression")
-            && let Some(receiver) = function.child_by_field_name("value")
+            .and_then(rust_method_call_parts)
             && let Ok(exact @ RustConversionType::Model { .. }) =
                 self.expression_type(receiver, depth + 1)
         {
-            let member = function
-                .child_by_field_name("field")
-                .ok_or(ConversionUnknown::UnsupportedExpression)?;
             let member = rust_node_text(member, self.source);
             let modeled = self.sources.rust_modeled_result(
                 self.analyzer,
@@ -2348,10 +2902,20 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
                         .ok_or(ConversionUnknown::UnsupportedExpression)?;
                     let proof = super::std_types::RustTypeProof::new(self.analyzer)
                         .ok_or(ConversionUnknown::UnsupportedExpression)?;
+                    // Conversion depth counts consumed steps; this independent
+                    // bounded proof needs its existing remaining root allowance.
                     let returned = if member == "clone" {
-                        proof.modeled_clone_result(self.file, call.byte_range(), depth + 1)
+                        proof.modeled_clone_result(
+                            self.file,
+                            call.byte_range(),
+                            super::std_types::PROOF_DEPTH,
+                        )
                     } else {
-                        proof.modeled_result(self.file, call.byte_range(), depth + 1)
+                        proof.modeled_result(
+                            self.file,
+                            call.byte_range(),
+                            super::std_types::PROOF_DEPTH,
+                        )
                     }
                     .ok_or(ConversionUnknown::UnsupportedExpression)?;
                     self.modeled_return_conversion(&returned, depth + 1)
@@ -2376,6 +2940,8 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
             });
         };
         let declaration_context = RustTypeContext {
+            operation_source: self.operation_source,
+            selected: None,
             analyzer: self.analyzer,
             sources: self.sources,
             file: resolved.unit.source(),
@@ -2397,8 +2963,8 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
             && rust_node_text(returned, &resolved.source) != "Self"
             && let Some(receiver) = call
                 .child_by_field_name("function")
-                .filter(|function| function.kind() == "field_expression")
-                .and_then(|function| function.child_by_field_name("value"))
+                .and_then(rust_method_call_parts)
+                .map(|(receiver, _)| receiver)
             && let Ok(mut actual) = self.expression_type(receiver, depth + 1)
         {
             while let RustConversionType::Reference { referent, .. } = actual {
@@ -2436,8 +3002,8 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
         {
             let receiver = call
                 .child_by_field_name("function")
-                .filter(|function| function.kind() == "field_expression")
-                .and_then(|function| function.child_by_field_name("value"))
+                .and_then(rust_method_call_parts)
+                .map(|(receiver, _)| receiver)
                 .ok_or(ConversionUnknown::UnsupportedExpression)?;
             let mut exact = self.expression_type(receiver, depth + 1)?;
             while let RustConversionType::Reference { referent, .. } = exact {
@@ -2581,7 +3147,13 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
         {
             return false;
         }
-        let mut ancestor = actual.node.parent();
+        let Some(parsed) = actual_context
+            .sources
+            .source(actual_context.analyzer, actual.file)
+        else {
+            return false;
+        };
+        let mut ancestor = parsed.logical_parent(actual.node);
         let call = loop {
             let Some(node) = ancestor else {
                 return false;
@@ -2589,7 +3161,7 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
             if node.kind() == "call_expression" {
                 break node;
             }
-            ancestor = node.parent();
+            ancestor = parsed.logical_parent(node);
         };
         let Some(function) = call.child_by_field_name("function") else {
             return false;
@@ -2638,6 +3210,8 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
                 let resolved = self.free_function(node).ok()?;
                 let declaration = resolved.node().ok()?;
                 let context = RustTypeContext {
+                    operation_source: self.operation_source,
+                    selected: None,
                     analyzer: self.analyzer,
                     sources: self.sources,
                     file: resolved.unit.source(),
@@ -2722,11 +3296,13 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
                 {
                     return None;
                 }
-                let routes = rust.file_routes(self.file, None).ok()?;
-                if !routes.is_complete() {
+                let SelectedTypeProofRead::Available(Some((unit, edition))) = self
+                    .proof_source()
+                    .external_type_root(self.file, dependency)
+                    .ok()?
+                else {
                     return None;
-                }
-                let (unit, edition) = routes.type_root_identity(self.file, dependency)?;
+                };
                 (edition.parse::<u16>().ok()? >= 2018).then_some((unit, path))
             });
             if let Some((unit, path)) = canonical {
@@ -2744,11 +3320,13 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
             if !imports.is_empty() || self.name_is_shadowed(root) {
                 return None;
             }
-            let routes = rust.file_routes(self.file, None).ok()?;
-            if !routes.is_complete() {
+            let SelectedTypeProofRead::Available(Some((unit, edition))) = self
+                .proof_source()
+                .external_type_root(self.file, name)
+                .ok()?
+            else {
                 return None;
-            }
-            let (unit, edition) = routes.type_root_identity(self.file, name)?;
+            };
             if edition.parse::<u16>().ok()? < 2018 {
                 return None;
             }
@@ -2768,15 +3346,9 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
         let function = call
             .child_by_field_name("function")
             .ok_or(ConversionUnknown::UnsupportedExpression)?;
-        if function.kind() != "field_expression" {
+        let Some((receiver, method)) = rust_method_call_parts(function) else {
             return self.free_function(call);
-        }
-        let method = function
-            .child_by_field_name("field")
-            .ok_or(ConversionUnknown::UnsupportedExpression)?;
-        let receiver = function
-            .child_by_field_name("value")
-            .ok_or(ConversionUnknown::UnsupportedExpression)?;
+        };
         let receiver_type = self.expression_type(receiver, depth + 1)?;
         let mut scope = call;
         while !matches!(scope.kind(), "block" | "source_file") {
@@ -2831,6 +3403,8 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
             .and_then(|owner| owner.child_by_field_name("type"))
             .ok_or(ConversionUnknown::UnsupportedExpression)?;
         let context = RustTypeContext {
+                          operation_source: self.operation_source,
+                selected: None,
             analyzer: self.analyzer,
             sources: self.sources,
             file: resolved.unit.source(),
@@ -2882,6 +3456,7 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
         &self,
         function: Node<'tree>,
     ) -> Result<ResolvedDeclaration, ConversionUnknown> {
+        let function = call_function_target(function);
         if function.kind() != "identifier"
             && !crate::analyzer::rust::semantic::rust_plain_scoped_callee(function)
         {
@@ -3003,6 +3578,8 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
                         return DerefShape::UNKNOWN;
                     };
                     return RustTypeContext {
+                        operation_source: self.operation_source,
+                        selected: None,
                         analyzer: self.analyzer,
                         sources: self.sources,
                         file: resolved.unit.source(),
@@ -3046,7 +3623,8 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
                             innermost: match ty {
                                 RustConversionType::Declaration(_)
                                 | RustConversionType::AppliedDeclaration { .. }
-                                | RustConversionType::Model { .. } => Innermost::Nominal,
+                                | RustConversionType::Model { .. }
+                                | RustConversionType::StdIntrinsic { .. } => Innermost::Nominal,
                                 _ => Innermost::Builtin,
                             },
                         }
@@ -3059,9 +3637,18 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
     /// The shape of `self` in a method: a reference when the receiver is
     /// `&self` or `&mut self`, around the impl's own type.
     fn self_shape(&self, node: Node<'tree>) -> DerefShape {
+        let Some(parsed) = self.sources.source(self.analyzer, self.file) else {
+            return DerefShape::UNKNOWN;
+        };
+        let context = RustTypeContext {
+            operation_source: self.operation_source,
+            root: parsed.logical_root(node),
+            ..*self
+        };
+
         let mut function = None;
         let mut owner = None;
-        let mut current = node.parent();
+        let mut current = parsed.logical_parent(node);
         while let Some(scope) = current {
             match scope.kind() {
                 "function_item" if function.is_none() => function = Some(scope),
@@ -3071,7 +3658,7 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
                 }
                 _ => {}
             }
-            current = scope.parent();
+            current = parsed.logical_parent(scope);
         }
         let (Some(function), Some(owner)) = (function, owner) else {
             return DerefShape::UNKNOWN;
@@ -3095,7 +3682,7 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
             .any(|token| token.kind() == "&");
         DerefShape {
             reference,
-            innermost: self.type_shape(owner_type).innermost,
+            innermost: context.type_shape(owner_type).innermost,
         }
     }
 
@@ -3160,6 +3747,8 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
             return DerefShape::UNKNOWN;
         };
         RustTypeContext {
+            operation_source: self.operation_source,
+            selected: None,
             analyzer: self.analyzer,
             sources: self.sources,
             file: resolved.unit.source(),
@@ -3185,12 +3774,18 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
         match node.kind() {
             "struct_expression" => self.type_struct(node.child_by_field_name("name")?),
             "self" => {
-                let mut current = node.parent();
+                let parsed = self.sources.source(self.analyzer, self.file)?;
+                let context = RustTypeContext {
+                    operation_source: self.operation_source,
+                    root: parsed.logical_root(node),
+                    ..*self
+                };
+                let mut current = parsed.logical_parent(node);
                 while let Some(scope) = current {
                     if scope.kind() == "impl_item" {
-                        return self.type_struct(scope.child_by_field_name("type")?);
+                        return context.type_struct(scope.child_by_field_name("type")?);
                     }
-                    current = scope.parent();
+                    current = parsed.logical_parent(scope);
                 }
                 None
             }
@@ -3211,6 +3806,8 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
                 let resolved = self.free_function(node).ok()?;
                 let return_type = resolved.node().ok()?.child_by_field_name("return_type")?;
                 RustTypeContext {
+                    operation_source: self.operation_source,
+                    selected: None,
                     analyzer: self.analyzer,
                     sources: self.sources,
                     file: resolved.unit.source(),
@@ -3229,6 +3826,8 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
                 let resolved = self.expression_struct(base, depth + 1)?;
                 let field_type = declared_field_type(&resolved, name)?;
                 RustTypeContext {
+                    operation_source: self.operation_source,
+                    selected: None,
                     analyzer: self.analyzer,
                     sources: self.sources,
                     file: resolved.unit.source(),
@@ -3260,6 +3859,9 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
     /// The deref-relevant shape of written type syntax: whether it is a
     /// reference, and what its innermost referent is.
     fn type_shape(&self, mut node: Node<'tree>) -> DerefShape {
+        if let Ok(ty) = self.type_from_node(node, 0) {
+            return DerefShape::from_exact(&ty);
+        }
         let mut reference = false;
         while node.kind() == "reference_type" {
             reference = true;
@@ -3267,12 +3869,6 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
                 return DerefShape::UNKNOWN;
             };
             node = referent;
-        }
-        if matches!(self.standard_nominal_name(node), Some("String" | "Vec")) {
-            return DerefShape {
-                reference,
-                innermost: Innermost::Builtin,
-            };
         }
         let innermost = match node.kind() {
             _ if node.has_error() || node.is_missing() => Innermost::Unknown,
@@ -3306,59 +3902,36 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
         &self,
         name_node: Node<'tree>,
     ) -> Result<ResolvedDeclaration, ConversionUnknown> {
-        let evidence = self.sources.declaration(
-            self.analyzer,
-            self.file,
-            name_node.byte_range(),
-            || {
-        let name = rust_node_text(name_node, self.source).trim();
-        if name.is_empty() {
-            return Err(ConversionUnknown::UnresolvedTargetType);
-        }
-        let requesting = self
-            .sources
-            .source(self.analyzer, self.file)
-            .ok_or(ConversionUnknown::UnresolvedTargetType)?;
-        let mut outcomes = resolve_definition_batch_with_source_tree(
-            self.analyzer,
-            vec![DefinitionLookupRequest {
-                file: self.file.clone(),
-                line: None,
-                column: None,
-                start_byte: Some(name_node.start_byte()),
-                end_byte: Some(name_node.end_byte()),
-            }],
-            self.file.clone(),
-            std::sync::Arc::clone(&requesting.source),
-            Some(requesting.tree.clone()),
-        );
-        let outcome = outcomes
-            .pop()
-            .expect("one native declaration request has one outcome");
-        if outcome.status != DefinitionLookupStatus::Resolved || !outcome.diagnostics.is_empty() {
-            return Err(ConversionUnknown::UnresolvedTargetType);
-        }
-        let mut candidates = outcome.definitions;
-        candidates.sort_by_key(|unit| unit.declaration_id());
-        candidates.dedup_by(|left, right| left.declaration_id() == right.declaration_id());
-        let [unit] = candidates.as_slice() else {
-            return Err(ConversionUnknown::AmbiguousBinding);
+        let lookup = || {
+            let SelectedTypeProofRead::Available(unit) = self
+                .proof_source()
+                .type_declaration(self.file, name_node.byte_range())
+                .map_err(|_| ConversionUnknown::UnresolvedTargetType)?
+            else {
+                return Err(ConversionUnknown::UnresolvedTargetType);
+            };
+            let parsed = self
+                .sources
+                .source(self.analyzer, unit.source())
+                .ok_or(ConversionUnknown::UnresolvedTargetType)?;
+            let ranges = self.analyzer.ranges_of(&unit);
+            let [range] = ranges.as_slice() else {
+                return Err(ConversionUnknown::AmbiguousBinding);
+            };
+            Ok(
+                brokk_bifrost_analysis::analyzer::usages::call_conversion::ConversionDeclaration {
+                    unit: unit.clone(),
+                    range: range.start_byte..range.end_byte,
+                    parsed,
+                },
+            )
         };
-        let parsed = self
-            .sources
-            .source(self.analyzer, unit.source())
-            .ok_or(ConversionUnknown::UnresolvedTargetType)?;
-        let ranges = self.analyzer.ranges_of(unit);
-        let [range] = ranges.as_slice() else {
-            return Err(ConversionUnknown::AmbiguousBinding);
+        let evidence = if self.operation_source.is_some() {
+            lookup()?
+        } else {
+            self.sources
+                .declaration(self.analyzer, self.file, name_node.byte_range(), lookup)?
         };
-        Ok(brokk_bifrost_analysis::analyzer::usages::call_conversion::ConversionDeclaration {
-            unit: unit.clone(),
-            range: range.start_byte..range.end_byte,
-            parsed,
-        })
-            },
-        )?;
         Ok(ResolvedDeclaration {
             unit: evidence.unit,
             parsed: evidence.parsed,
@@ -3380,6 +3953,493 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
         )
     }
 
+    fn binary_result_type(
+        &self,
+        left: &RustConversionType,
+        right: &RustConversionType,
+        operator: &str,
+        depth: usize,
+    ) -> Result<RustConversionType, ConversionUnknown> {
+        let (RustConversionType::Primitive(left), RustConversionType::Primitive(right)) =
+            (left, right)
+        else {
+            let trait_name = match operator {
+                "+" => "Add",
+                "-" => "Sub",
+                "*" => "Mul",
+                "/" => "Div",
+                "%" => "Rem",
+                "&" => "BitAnd",
+                "|" => "BitOr",
+                "^" => "BitXor",
+                "<<" => "Shl",
+                ">>" => "Shr",
+                _ => return Err(ConversionUnknown::UnsupportedExpression),
+            };
+            if !matches!(left, RustConversionType::Model { .. }) {
+                return self.workspace_operator_output(left, right, trait_name, depth);
+            }
+            let returned = super::std_types::RustTypeProof::new(self.analyzer)
+                .and_then(|proof| proof.modeled_operator_result(left, right, trait_name))
+                .ok_or(ConversionUnknown::UnsupportedExpression)?;
+            return self.modeled_return_conversion(&returned, depth);
+        };
+        let (left, right) = (*left, *right);
+        use RustPrimitive::*;
+        let integer = |ty| {
+            matches!(
+                ty,
+                U8 | U16 | U32 | U64 | U128 | Usize | I8 | I16 | I32 | I64 | I128 | Isize
+            )
+        };
+        let numeric = integer(left) || matches!(left, F32 | F64);
+        let result = match operator {
+            "+" | "-" | "*" | "/" | "%" if left == right && numeric => left,
+            "<<" | ">>" if integer(left) && integer(right) => left,
+            "&" | "|" | "^" if left == right && (integer(left) || left == Bool) => left,
+            "&&" | "||" if left == Bool && right == Bool => Bool,
+            "==" | "!=" | "<" | "<=" | ">" | ">="
+                if left == right && (numeric || matches!(left, Bool | Char)) =>
+            {
+                Bool
+            }
+            _ => return Err(ConversionUnknown::UnsupportedExpression),
+        };
+        Ok(RustConversionType::Primitive(result))
+    }
+
+    /// Inspect evaluated syntax, excluding deferred bodies and item metadata.
+    /// A call to an unsafe fn still has its declared result type; bit
+    /// reinterpretation intrinsics deliberately remain refused.
+    fn evaluation_performs_unsafe_operation(
+        &self,
+        root: Node<'tree>,
+        depth: usize,
+    ) -> Result<bool, ConversionUnknown> {
+        let cancellation = self.analyzer.active_query_cancellation();
+        let evaluated = |node| (node, RustEvaluationSyntax::Evaluated);
+        let pattern = |node| (node, RustEvaluationSyntax::Pattern);
+        let mut pending = vec![evaluated(root)];
+        while let Some((node, syntax)) = pending.pop() {
+            if cancellation
+                .as_ref()
+                .is_some_and(|token| token.is_cancelled())
+            {
+                return Err(self.selected_type_stop(ConversionUnknown::Cancelled));
+            }
+            let operation = match syntax {
+                RustEvaluationSyntax::Pattern => match node.kind() {
+                    "struct_pattern" => {
+                        let ty = node
+                            .child_by_field_name("type")
+                            .ok_or(ConversionUnknown::UnsupportedExpression)?;
+                        let ty = self
+                            .type_from_node(ty, depth + 1)
+                            .map_err(source_type_error)?;
+                        if self.conversion_type_is_union(&ty)? {
+                            RustEvaluationOperation::UnionFieldRead
+                        } else {
+                            RustEvaluationOperation::Ordinary
+                        }
+                    }
+                    "macro_invocation" => RustEvaluationOperation::UnexpandedMacro,
+                    _ => RustEvaluationOperation::Ordinary,
+                },
+                RustEvaluationSyntax::Evaluated => match node.kind() {
+                    "unary_expression" => {
+                        if let Some(operand) = rust_dereference_operand(node) {
+                            let written_pointer = self
+                                .binding_declaration(operand)
+                                .ok()
+                                .and_then(|declaration| declaration.child_by_field_name("type"))
+                                .is_some_and(|ty| ty.kind() == "pointer_type");
+                            if written_pointer {
+                                RustEvaluationOperation::RawPointerDereference
+                            } else {
+                                match self.expression_type(operand, depth + 1) {
+                                    Ok(
+                                        RustConversionType::Reference { .. }
+                                        | RustConversionType::Primitive(_)
+                                        | RustConversionType::Declaration(_)
+                                        | RustConversionType::AppliedDeclaration { .. }
+                                        | RustConversionType::Model { .. }
+                                        | RustConversionType::StdIntrinsic { .. }
+                                        | RustConversionType::Array { .. }
+                                        | RustConversionType::Slice { .. }
+                                        | RustConversionType::Tuple(_)
+                                        | RustConversionType::Unit,
+                                    ) => RustEvaluationOperation::Ordinary,
+                                    Err(
+                                        reason @ (ConversionUnknown::Cancelled
+                                        | ConversionUnknown::BudgetExhausted),
+                                    ) => return Err(reason),
+                                    Err(_) => return Err(ConversionUnknown::UnsupportedExpression),
+                                }
+                            }
+                        } else {
+                            RustEvaluationOperation::Ordinary
+                        }
+                    }
+                    "field_expression" => {
+                        let base = node
+                            .child_by_field_name("value")
+                            .ok_or(ConversionUnknown::UnsupportedExpression)?;
+                        let direct_write = node.parent().is_some_and(|parent| {
+                            parent.kind() == "assignment_expression"
+                                && parent
+                                    .child_by_field_name("left")
+                                    .is_some_and(|left| left == node)
+                        });
+                        if !direct_write && self.expression_has_union_type(base, depth + 1)? {
+                            RustEvaluationOperation::UnionFieldRead
+                        } else {
+                            RustEvaluationOperation::Ordinary
+                        }
+                    }
+                    "identifier" | "scoped_identifier" | "shorthand_field_identifier" => {
+                        // Reading a lexical local is ordinary even when the type
+                        // reader cannot infer its destructuring projection. This
+                        // resolver distinguishes local bindings from value items.
+                        if node.id() == root.id() {
+                            // The type reader resolves the root identifier itself,
+                            // including mutable-static refusal. Do not examine the
+                            // same lexical candidates a second time.
+                            RustEvaluationOperation::Ordinary
+                        } else if self
+                            .sources
+                            .lexical_binding(
+                                self.analyzer,
+                                self.file,
+                                node,
+                                self.source,
+                                rust_node_text(node, self.source).trim(),
+                            )
+                            .is_some()
+                        {
+                            RustEvaluationOperation::Ordinary
+                        } else {
+                            let resolved = self.resolve_declaration(
+                                node.child_by_field_name("name").unwrap_or(node),
+                            )?;
+                            let declaration = resolved.node()?;
+                            // A unit variant and its name can share an exact range;
+                            // the range lookup returns the deepest named node.
+                            let declaration = declaration
+                                .parent()
+                                .filter(|parent| {
+                                    parent.kind() == "enum_variant"
+                                        && parent.byte_range() == declaration.byte_range()
+                                })
+                                .unwrap_or(declaration);
+                            match declaration.kind() {
+                                "static_item" if is_mutable_static_item(declaration) => {
+                                    RustEvaluationOperation::MutableStaticAccess
+                                }
+                                "static_item" | "const_item" | "function_item" => {
+                                    RustEvaluationOperation::Ordinary
+                                }
+                                "struct_item" | "enum_variant"
+                                    if declaration.child_by_field_name("body").is_none_or(
+                                        |body| body.kind() == "ordered_field_declaration_list",
+                                    ) =>
+                                {
+                                    RustEvaluationOperation::Ordinary
+                                }
+                                _ => return Err(ConversionUnknown::UnresolvedSourceType),
+                            }
+                        }
+                    }
+                    "call_expression" => {
+                        if self.call_is_transmute_intrinsic(node, depth + 1)? {
+                            RustEvaluationOperation::Transmute
+                        } else {
+                            RustEvaluationOperation::Ordinary
+                        }
+                    }
+                    // Polling executes a deferred body that this bounded reader
+                    // cannot inspect, even when the future's body looks ordinary.
+                    "await_expression" => RustEvaluationOperation::Await,
+                    "macro_invocation" => {
+                        let assembly = node
+                            .child_by_field_name("macro")
+                            .and_then(brokk_bifrost_rust::graph_support::rust_path_segments)
+                            .and_then(|parts| parts.last().copied())
+                            .is_some_and(|terminal| rust_node_text(terminal, self.source) == "asm");
+                        if assembly {
+                            RustEvaluationOperation::InlineAssembly
+                        } else {
+                            RustEvaluationOperation::UnexpandedMacro
+                        }
+                    }
+                    _ => RustEvaluationOperation::Ordinary,
+                },
+            };
+            match operation {
+                RustEvaluationOperation::Ordinary => {}
+                RustEvaluationOperation::UnexpandedMacro | RustEvaluationOperation::Await => {
+                    return Err(ConversionUnknown::UnsupportedExpression);
+                }
+                RustEvaluationOperation::RawPointerDereference
+                | RustEvaluationOperation::UnionFieldRead
+                | RustEvaluationOperation::MutableStaticAccess
+                | RustEvaluationOperation::InlineAssembly
+                | RustEvaluationOperation::Transmute => return Ok(true),
+            }
+            if matches!(syntax, RustEvaluationSyntax::Pattern) {
+                // Constructor paths and binder names are metadata. Braced
+                // patterns can still read union fields, and guards execute.
+                let condition = (node.kind() == "match_pattern")
+                    .then(|| node.child_by_field_name("condition"))
+                    .flatten();
+                pending.extend(condition.map(evaluated));
+                pending.extend(
+                    node.named_children(&mut node.walk())
+                        .filter(|child| Some(child.id()) != condition.map(|guard| guard.id()))
+                        .map(pattern),
+                );
+                continue;
+            }
+            match node.kind() {
+                "call_expression" => {
+                    if let Some(arguments) = node.child_by_field_name("arguments") {
+                        pending.extend(
+                            arguments
+                                .named_children(&mut arguments.walk())
+                                .map(evaluated),
+                        );
+                    }
+                    if let Some((receiver, _)) = node
+                        .child_by_field_name("function")
+                        .and_then(rust_method_call_parts)
+                    {
+                        pending.push(evaluated(receiver));
+                    } else if let Some(function) = node.child_by_field_name("function") {
+                        // Plain callable names are declaration metadata, already
+                        // resolved above. Computed callable values are evaluated.
+                        if !matches!(
+                            function.kind(),
+                            "identifier" | "scoped_identifier" | "generic_function"
+                        ) {
+                            pending.push(evaluated(function));
+                        }
+                    }
+                }
+                "field_expression" => {
+                    pending.extend(node.child_by_field_name("value").map(evaluated))
+                }
+                "let_declaration" => {
+                    pending.extend(node.child_by_field_name("value").map(evaluated));
+                    pending.extend(node.child_by_field_name("alternative").map(evaluated));
+                    pending.extend(node.child_by_field_name("pattern").map(pattern));
+                }
+                "let_condition" => {
+                    pending.extend(node.child_by_field_name("value").map(evaluated));
+                    pending.extend(node.child_by_field_name("pattern").map(pattern));
+                }
+                "for_expression" => {
+                    pending.extend(node.child_by_field_name("value").map(evaluated));
+                    pending.extend(node.child_by_field_name("body").map(evaluated));
+                    pending.extend(node.child_by_field_name("pattern").map(pattern));
+                }
+                "match_arm" => {
+                    pending.extend(node.child_by_field_name("value").map(evaluated));
+                    pending.extend(node.child_by_field_name("pattern").map(pattern));
+                }
+                "identifier"
+                | "scoped_identifier"
+                | "type_identifier"
+                | "scoped_type_identifier"
+                | "closure_expression"
+                | "async_block"
+                | "gen_block"
+                | "label"
+                | "lifetime"
+                | "function_item"
+                | "function_signature_item"
+                | "static_item"
+                | "const_item"
+                | "use_declaration"
+                | "extern_crate_declaration"
+                | "type_item"
+                | "associated_type"
+                | "struct_item"
+                | "enum_item"
+                | "union_item"
+                | "trait_item"
+                | "trait_alias"
+                | "impl_item"
+                | "mod_item"
+                | "foreign_mod_item"
+                | "decl_macro"
+                | "macro_definition"
+                | "macro_invocation"
+                | "string_literal"
+                | "raw_string_literal"
+                | "char_literal"
+                | "integer_literal"
+                | "float_literal"
+                | "boolean_literal" => {}
+                _ => pending.extend(node.named_children(&mut node.walk()).map(evaluated)),
+            }
+        }
+        Ok(false)
+    }
+
+    fn expression_has_union_type(
+        &self,
+        expression: Node<'tree>,
+        depth: usize,
+    ) -> Result<bool, ConversionUnknown> {
+        // The existing source projection reader proves a struct declaration
+        // even for `self`; it never accepts a union declaration as a struct.
+        if self.expression_struct(expression, depth).is_some() {
+            return Ok(false);
+        }
+        // Failure to resolve the base is not evidence that it is non-union.
+        let ty = self.expression_type(expression, depth)?;
+        self.conversion_type_is_union(&ty)
+    }
+
+    fn conversion_type_is_union(
+        &self,
+        mut ty: &RustConversionType,
+    ) -> Result<bool, ConversionUnknown> {
+        while let RustConversionType::Reference { referent, .. } = ty {
+            ty = referent;
+        }
+        match ty {
+            RustConversionType::Declaration(unit)
+            | RustConversionType::AppliedDeclaration {
+                declaration: unit, ..
+            } => {
+                let parsed = self
+                    .sources
+                    .source(self.analyzer, unit.source())
+                    .ok_or(ConversionUnknown::UnresolvedSourceType)?;
+                let ranges = self.analyzer.ranges_of(unit);
+                let [range] = ranges.as_slice() else {
+                    return Err(ConversionUnknown::UnresolvedSourceType);
+                };
+                let declaration = parsed
+                    .tree
+                    .root_node()
+                    .named_descendant_for_byte_range(range.start_byte, range.end_byte)
+                    .ok_or(ConversionUnknown::UnresolvedSourceType)?;
+                Ok(declaration.kind() == "union_item")
+            }
+            RustConversionType::Model { symbol, .. } => {
+                self.evaluation_read(self.proof_source().nominal_is_union(symbol))
+            }
+            // Future non-nominal carriers cannot themselves be a union.
+            _ => Ok(false),
+        }
+    }
+
+    fn call_is_transmute_intrinsic(
+        &self,
+        call: Node<'tree>,
+        depth: usize,
+    ) -> Result<bool, ConversionUnknown> {
+        let function = call
+            .child_by_field_name("function")
+            .ok_or(ConversionUnknown::UnsupportedExpression)?;
+        let function = call_function_target(function);
+        // Transmute intrinsics are free functions. A direct method-call AST cannot
+        // select one, even when the method is named transmute.
+        if rust_method_call_parts(function).is_some() {
+            return Ok(false);
+        }
+        // Source shadows are ordinary functions. Their declared return type
+        // does not acquire the standard intrinsic's value interpretation.
+        match self.result_function(call, depth) {
+            Ok(_) => return Ok(false),
+            Err(reason @ (ConversionUnknown::Cancelled | ConversionUnknown::BudgetExhausted)) => {
+                return Err(reason);
+            }
+            Err(_) => {}
+        }
+        let parsed = self
+            .sources
+            .source(self.analyzer, self.file)
+            .ok_or(ConversionUnknown::UnsupportedExpression)?;
+        let name = function.child_by_field_name("name").unwrap_or(function);
+        // Source constructors are declarations in the value namespace, not
+        // function_item declarations or external calls. Generic source
+        // functions are ordinary operations even when their result type
+        // cannot be instantiated by this bounded reader.
+        match self.resolve_declaration(name) {
+            Ok(resolved) => {
+                let declaration = resolved.node()?;
+                if declaration.kind() == "function_item"
+                    || (matches!(declaration.kind(), "struct_item" | "enum_variant")
+                        && declaration
+                            .child_by_field_name("body")
+                            .is_some_and(|body| body.kind() == "ordered_field_declaration_list"))
+                {
+                    return Ok(false);
+                }
+            }
+            Err(reason @ (ConversionUnknown::Cancelled | ConversionUnknown::BudgetExhausted)) => {
+                return Err(reason);
+            }
+            Err(_) => {}
+        }
+        let cancellation = self
+            .analyzer
+            .active_query_cancellation()
+            .unwrap_or_default();
+        let spelling = rust_node_text(name, self.source).to_owned();
+        let site = brokk_bifrost_core::analyzer::usages::reference_site::ResolvedReferenceSite {
+            path: spelling.clone(),
+            text: spelling,
+            range: brokk_bifrost_core::analyzer::model::Range {
+                start_byte: name.start_byte(),
+                end_byte: name.end_byte(),
+                start_line: name.start_position().row + 1,
+                end_line: name.end_position().row + 1,
+            },
+            focus_start_byte: name.start_byte(),
+            focus_end_byte: name.end_byte(),
+        };
+        self.evaluation_read(self.proof_source().evaluated_call_is_bit_reinterpretation(
+            self.file,
+            self.source,
+            parsed.tree_for_range(call.start_byte(), call.end_byte())?,
+            &site,
+            &cancellation,
+        ))
+    }
+
+    fn evaluation_read(
+        &self,
+        read: brokk_bifrost_analysis::analyzer::store::Result<
+            brokk_bifrost_analysis::analyzer::store::language_support::SelectedTypeEvaluationRead<
+                bool,
+            >,
+        >,
+    ) -> Result<bool, ConversionUnknown> {
+        use brokk_bifrost_analysis::analyzer::store::language_support::{
+            SelectedTypeEvaluationRead, SelectedTypeEvaluationUnavailable,
+        };
+        match read {
+            Ok(SelectedTypeEvaluationRead::Available(value)) => Ok(value),
+            Ok(SelectedTypeEvaluationRead::Unavailable(
+                SelectedTypeEvaluationUnavailable::Cancelled,
+            )) => Err(self.selected_type_stop(ConversionUnknown::Cancelled)),
+            Ok(SelectedTypeEvaluationRead::Unavailable(_)) => {
+                Err(ConversionUnknown::UnresolvedSourceType)
+            }
+            Err(error) => {
+                self.analyzer.record_query_incomplete(
+                    brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadIncomplete::StoreFailure(
+                        error,
+                    ),
+                );
+                Err(ConversionUnknown::UnresolvedSourceType)
+            }
+        }
+    }
+
     fn expression_type_uncached(
         &self,
         mut node: Node<'tree>,
@@ -3388,13 +4448,16 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
         if depth >= MAX_TYPE_DEPTH {
             return Err(self.selected_type_stop(ConversionUnknown::BudgetExhausted));
         }
-        if node.has_error() || node.is_missing() || rust_node_is_in_unsafe_context(node) {
+        if node.has_error() || node.is_missing() {
             return Err(ConversionUnknown::UnsupportedExpression);
         }
         while node.kind() == "parenthesized_expression" {
             node = node
                 .named_child(0)
                 .ok_or(ConversionUnknown::UnsupportedExpression)?;
+        }
+        if self.evaluation_performs_unsafe_operation(node, depth)? {
+            return Err(ConversionUnknown::UnsupportedExpression);
         }
         match node.kind() {
             "boolean_literal" | "char_literal" | "integer_literal" | "float_literal" => {
@@ -3422,11 +4485,16 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
                     Ok(declaration) => declaration,
                     Err(_) => {
                         let resolved = self.declared_value_item(node)?;
-                        let type_node = resolved
-                            .node()?
+                        let item = resolved.node()?;
+                        if is_mutable_static_item(item) {
+                            return Err(ConversionUnknown::UnsupportedExpression);
+                        }
+                        let type_node = item
                             .child_by_field_name("type")
                             .ok_or(ConversionUnknown::UnresolvedSourceType)?;
                         return RustTypeContext {
+                            operation_source: self.operation_source,
+                            selected: None,
                             analyzer: self.analyzer,
                             sources: self.sources,
                             file: resolved.unit.source(),
@@ -3475,6 +4543,8 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
                     declared_field_type(&resolved, rust_node_text(field, self.source).trim())
                         .ok_or(ConversionUnknown::UnresolvedSourceType)?;
                 RustTypeContext {
+                    operation_source: self.operation_source,
+                    selected: None,
                     analyzer: self.analyzer,
                     sources: self.sources,
                     file: resolved.unit.source(),
@@ -3495,57 +4565,7 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
                     .ok_or(ConversionUnknown::UnsupportedExpression)?;
                 let left = self.expression_type(left, depth + 1)?;
                 let right = self.expression_type(right, depth + 1)?;
-                let (RustConversionType::Primitive(left), RustConversionType::Primitive(right)) =
-                    (&left, &right)
-                else {
-                    let trait_name = match operator.kind() {
-                        "+" => "Add",
-                        "-" => "Sub",
-                        "*" => "Mul",
-                        "/" => "Div",
-                        "%" => "Rem",
-                        "&" => "BitAnd",
-                        "|" => "BitOr",
-                        "^" => "BitXor",
-                        "<<" => "Shl",
-                        ">>" => "Shr",
-                        _ => return Err(ConversionUnknown::UnsupportedExpression),
-                    };
-                    if !matches!(left, RustConversionType::Model { .. }) {
-                        return self.workspace_operator_output(
-                            &left,
-                            &right,
-                            trait_name,
-                            depth + 1,
-                        );
-                    }
-                    let returned = super::std_types::RustTypeProof::new(self.analyzer)
-                        .and_then(|proof| proof.modeled_operator_result(&left, &right, trait_name))
-                        .ok_or(ConversionUnknown::UnsupportedExpression)?;
-                    return self.modeled_return_conversion(&returned, depth + 1);
-                };
-                let (left, right) = (*left, *right);
-                use RustPrimitive::*;
-                let integer = |ty| {
-                    matches!(
-                        ty,
-                        U8 | U16 | U32 | U64 | U128 | Usize | I8 | I16 | I32 | I64 | I128 | Isize
-                    )
-                };
-                let numeric = integer(left) || matches!(left, F32 | F64);
-                let result = match operator.kind() {
-                    "+" | "-" | "*" | "/" | "%" if left == right && numeric => left,
-                    "<<" | ">>" if integer(left) && integer(right) => left,
-                    "&" | "|" | "^" if left == right && (integer(left) || left == Bool) => left,
-                    "&&" | "||" if left == Bool && right == Bool => Bool,
-                    "==" | "!=" | "<" | "<=" | ">" | ">="
-                        if left == right && (numeric || matches!(left, Bool | Char)) =>
-                    {
-                        Bool
-                    }
-                    _ => return Err(ConversionUnknown::UnsupportedExpression),
-                };
-                Ok(RustConversionType::Primitive(result))
+                self.binary_result_type(&left, &right, operator.kind(), depth + 1)
             }
             "call_expression" => self.call_result_proof(node, depth + 1)?.exact,
             "reference_expression" => {
@@ -3568,6 +4588,143 @@ impl<'a, 'tree> RustTypeContext<'a, 'tree> {
             _ => Err(ConversionUnknown::UnsupportedExpression),
         }
     }
+}
+
+fn prove_conversion(
+    source: RustConversionType,
+    target: RustConversionType,
+) -> Result<ArgumentTypeConversion, ConversionUnknown> {
+    let kind = conversion_kind(&source, &target).ok_or(ConversionUnknown::UnsupportedConversion)?;
+    Ok(ArgumentTypeConversion {
+        hierarchy: None,
+        source: ResolvedConversionType::Rust(source),
+        target: ResolvedConversionType::Rust(target),
+        kind,
+    })
+}
+
+/// Only the producer's verified receipt can establish model-origin std
+/// authority. Its input path must cover this exact selected owner declaration;
+/// authored names and receipt-less extraction metadata do not establish it.
+fn model_sysroot_identity(
+    symbol: &crate::analyzer::semantic_model::SemanticModelSymbol,
+    declaration: &crate::analyzer::semantic_model::TypeFact,
+) -> Option<RustStdRouteProof> {
+    use crate::analyzer::semantic_model::Locator;
+    let Locator::Artifact { path, .. } = &declaration.locator else {
+        return None;
+    };
+    let extraction = symbol.provenance.extraction.as_ref()?;
+    if !extraction
+        .verified_sysroot
+        .iter()
+        .any(|receipt| receipt.path == *path)
+    {
+        return None;
+    }
+    let identity = standard_identity_for_owner(&declaration.name)?;
+    Some(RustStdRouteProof {
+        route: identity,
+        declaration: identity,
+    })
+}
+
+/// The only normalization of source-route and verified model-origin evidence.
+/// Disagreement with the selected declaration never proves std identity.
+fn std_identity(ty: &RustConversionType) -> Option<RustStdIdentity> {
+    match ty {
+        RustConversionType::StdIntrinsic { identity, .. } => Some(*identity),
+        RustConversionType::Model {
+            std_identity: Some(proof),
+            ..
+        } if proof.route == proof.declaration => Some(proof.route),
+        RustConversionType::Model {
+            std_identity: None, ..
+        } => None,
+        _ => None,
+    }
+}
+
+fn std_intrinsic_type_arity(identity: RustStdIdentity) -> usize {
+    match identity {
+        RustStdIdentity::String => 0,
+        RustStdIdentity::Vec
+        | RustStdIdentity::Box
+        | RustStdIdentity::Rc
+        | RustStdIdentity::Arc
+        | RustStdIdentity::Cow => 1,
+    }
+}
+
+fn standard_identity_for_name(name: &str) -> Option<RustStdIdentity> {
+    Some(match name {
+        "String" => RustStdIdentity::String,
+        "Vec" => RustStdIdentity::Vec,
+        "Box" => RustStdIdentity::Box,
+        "Rc" => RustStdIdentity::Rc,
+        "Arc" => RustStdIdentity::Arc,
+        "Cow" => RustStdIdentity::Cow,
+        _ => return None,
+    })
+}
+
+fn standard_identity_for_owner(name: &str) -> Option<RustStdIdentity> {
+    Some(match name {
+        "std.string.String" | "alloc.string.String" => RustStdIdentity::String,
+        "std.vec.Vec" | "alloc.vec.Vec" => RustStdIdentity::Vec,
+        "std.boxed.Box" | "alloc.boxed.Box" => RustStdIdentity::Box,
+        "std.rc.Rc" | "alloc.rc.Rc" => RustStdIdentity::Rc,
+        "std.sync.Arc" | "alloc.sync.Arc" => RustStdIdentity::Arc,
+        "std.borrow.Cow" | "alloc.borrow.Cow" => RustStdIdentity::Cow,
+        _ => return None,
+    })
+}
+
+/// One shared-reference deref step. These std entries run no observable user
+/// effects. Cow is limited to str and slices: its Owned arm invokes Borrow,
+/// which may dispatch to user code for other targets. The str and
+/// slice targets use std's String/Vec Borrow implementations. DerefMut is
+/// deliberately outside this contract.
+fn shared_deref_target(ty: &RustConversionType) -> Option<RustConversionType> {
+    if let RustConversionType::Reference { referent, .. } = ty {
+        return Some(referent.as_ref().clone());
+    }
+    let identity = std_identity(ty)?;
+    let arguments = match ty {
+        RustConversionType::StdIntrinsic { arguments, .. }
+        | RustConversionType::Model { arguments, .. } => arguments.as_slice(),
+        _ => unreachable!("standard identity requires a standard carrier"),
+    };
+    match (identity, arguments) {
+        (RustStdIdentity::String, []) => Some(RustConversionType::Primitive(RustPrimitive::Str)),
+        (RustStdIdentity::Vec, [element] | [element, _]) => Some(RustConversionType::Slice {
+            element: Box::new(element.clone()),
+        }),
+        (
+            RustStdIdentity::Box | RustStdIdentity::Rc | RustStdIdentity::Arc,
+            [target] | [target, _],
+        ) => Some(target.clone()),
+        // alloc/src/borrow.rs: Cow::Owned deref invokes
+        // <B::Owned as Borrow<B>>::borrow(). Restrict B to str and [T], whose
+        // Owned/Borrow pairs are std String/Vec; other targets may run user code.
+        (RustStdIdentity::Cow, [target])
+            if matches!(
+                target,
+                RustConversionType::Primitive(RustPrimitive::Str)
+                    | RustConversionType::Slice { .. }
+            ) =>
+        {
+            Some(target.clone())
+        }
+        _ => None,
+    }
+}
+
+fn is_mutable_static_item(node: Node<'_>) -> bool {
+    node.kind() == "static_item"
+        && node
+            .named_children(&mut node.walk())
+            .any(|child| child.kind() == "mutable_specifier")
 }
 
 fn conversion_kind(
@@ -3593,50 +4750,76 @@ fn conversion_kind(
     if *target_mutable && !*source_mutable {
         return None;
     }
-    if *source_mutable && !*target_mutable && same_type(source_referent, target_referent) {
-        return Some(ConversionKind::RustReborrow);
-    }
-    if let (
-        RustConversionType::Array {
-            element: source_element,
-            ..
-        },
-        RustConversionType::Slice {
-            element: target_element,
-        },
-    ) = (source_referent.as_ref(), target_referent.as_ref())
-        && same_type(source_element, target_element)
-    {
-        return Some(ConversionKind::RustUnsizing);
-    }
-    // Only builtin reference dereferences participate. Mutable access must
-    // survive every layer, including a shared reference to a mutable one.
-    let mut current = source_referent.as_ref();
-    while let RustConversionType::Reference { mutable, referent } = current {
-        if *target_mutable && !*mutable {
-            return None;
+    let mut current = source_referent.as_ref().clone();
+    let mut dereferenced = false;
+    // Each deref step strictly reduces nominal/reference nesting. String,
+    // Vec and the admitted Cow targets end at str or [T], which have no entry.
+    // Other Cow targets have no step. No step cap is necessary.
+    loop {
+        if same_type(&current, target_referent) {
+            return Some(if dereferenced {
+                ConversionKind::RustDeref
+            } else {
+                ConversionKind::RustReborrow
+            });
         }
-        if same_type(referent, target_referent) {
-            return Some(ConversionKind::RustDeref);
+        if let (
+            RustConversionType::Array {
+                element: source_element,
+                ..
+            },
+            RustConversionType::Slice {
+                element: target_element,
+            },
+        ) = (&current, target_referent.as_ref())
+            && same_type(source_element, target_element)
+        {
+            return Some(ConversionKind::RustUnsizing);
         }
-        current = referent;
+        // Builtin references preserve the existing mutable-access check at
+        // every layer. Nominal steps certify shared deref only.
+        if *target_mutable {
+            let RustConversionType::Reference { mutable: true, .. } = current else {
+                return None;
+            };
+        }
+        current = shared_deref_target(&current)?;
+        dereferenced = true;
     }
-    None
 }
 
 // Both inputs are producer-built under MAX_TYPE_DEPTH, so recursion is bounded.
 fn same_type(left: &RustConversionType, right: &RustConversionType) -> bool {
     match (left, right) {
         (
+            RustConversionType::StdIntrinsic {
+                identity: left,
+                arguments: left_arguments,
+            },
+            RustConversionType::StdIntrinsic {
+                identity: right,
+                arguments: right_arguments,
+            },
+        ) => {
+            left == right
+                && left_arguments.len() == right_arguments.len()
+                && left_arguments
+                    .iter()
+                    .zip(right_arguments)
+                    .all(|(left, right)| same_type(left, right))
+        }
+        (
             RustConversionType::Model {
                 model_set: left_set,
                 symbol: left_symbol,
                 arguments: left_arguments,
+                ..
             },
             RustConversionType::Model {
                 model_set: right_set,
                 symbol: right_symbol,
                 arguments: right_arguments,
+                ..
             },
         ) => {
             left_set == right_set
@@ -3657,10 +4840,12 @@ fn same_type(left: &RustConversionType, right: &RustConversionType) -> bool {
             RustConversionType::AppliedDeclaration {
                 declaration: left,
                 arguments: left_arguments,
+                ..
             },
             RustConversionType::AppliedDeclaration {
                 declaration: right,
                 arguments: right_arguments,
+                ..
             },
         ) => {
             left.declaration_id() == right.declaration_id()
@@ -3790,27 +4975,48 @@ enum OpaqueTypeIdentity {
 
 impl RustTypeContext<'_, '_> {
     fn supported_type_context(&self, node: Node<'_>) -> Result<(), ConversionUnknown> {
+        let Some(parsed) = self.sources.source(self.analyzer, self.file) else {
+            return Err(ConversionUnknown::UnsupportedExpression);
+        };
+        let context = RustTypeContext {
+            operation_source: None,
+            root: parsed.logical_root(node),
+            ..*self
+        };
+
         let mut current = Some(node);
         while let Some(scope) = current {
             if has_non_lifetime_parameters(scope) || has_type_where_predicates(scope) {
                 return Err(ConversionUnknown::GenericSubstitution);
             }
-            current = scope.parent();
+            current = parsed.logical_parent(scope);
         }
-        self.supported_macro_context(node)
+        context.supported_macro_context(node)
     }
 
     fn supported_macro_context(&self, node: Node<'_>) -> Result<(), ConversionUnknown> {
+        let Some(parsed) = self.sources.source(self.analyzer, self.file) else {
+            return Err(ConversionUnknown::UnsupportedExpression);
+        };
+        let context = RustTypeContext {
+            operation_source: None,
+            root: parsed.logical_root(node),
+            ..*self
+        };
+
         let mut current = Some(node);
         while let Some(scope) = current {
             if scope.kind() == "macro_definition"
-                || (scope.kind() == "macro_invocation" && !self.standard_statement_macro(scope))
+                || (scope.kind() == "macro_invocation" && !context.standard_statement_macro(scope))
             {
                 return Err(ConversionUnknown::UnsupportedExpression);
             }
             if matches!(scope.kind(), "block" | "source_file" | "declaration_list") {
-                self.sources
-                    .source_scope_support(self.analyzer, self.file, scope, || {
+                context.sources.source_scope_support(
+                    context.analyzer,
+                    context.file,
+                    scope,
+                    || {
                         for child in scope.named_children(&mut scope.walk()) {
                             let invocation = if child.kind() == "macro_invocation" {
                                 Some(child)
@@ -3822,34 +5028,100 @@ impl RustTypeContext<'_, '_> {
                                 None
                             };
                             if let Some(invocation) = invocation
-                                && !self.resolved_standard_statement_macro(invocation)
+                                && !context.resolved_standard_statement_macro(invocation)
                             {
                                 return Err(ConversionUnknown::UnsupportedConversion);
                             }
                         }
                         Ok(())
-                    })?;
+                    },
+                )?;
             }
             if scope.kind() == "mod_item" {
                 break;
             }
-            current = scope.parent();
+            current = parsed.logical_parent(scope);
         }
         Ok(())
     }
 
+    // Only ToValue executes a trait call here. Other captures defer formatting
+    // to the logger, just as format_args does.
+    fn log_to_value_may_run_user_code(&self, node: Node<'_>) -> bool {
+        let Some(parsed) = self.sources.source(self.analyzer, self.file) else {
+            return true;
+        };
+        let context = RustTypeContext {
+            operation_source: None,
+            root: parsed.logical_root(node),
+            ..*self
+        };
+
+        let mut ancestor = Some(node);
+        while let Some(invocation) = ancestor {
+            if invocation.kind() == "macro_invocation" {
+                if !context.standard_statement_macro(invocation) {
+                    return false;
+                }
+                let Some(operands) = brokk_bifrost_rust::macro_matcher::parse_macro_operands(
+                    invocation,
+                    context.source,
+                ) else {
+                    return false;
+                };
+                return operands.iter().any(|operand| {
+                    use brokk_bifrost_rust::macro_matcher::{RustLogCapture, RustLogOperandRole};
+                    let value = operand.node();
+                    operand.role
+                        == Some(RustLogOperandRole::KeyValue {
+                            capture: RustLogCapture::ToValue,
+                        })
+                        && (node.id() == invocation.id()
+                            || (value.start_byte() <= node.start_byte()
+                                && node.end_byte() <= value.end_byte()))
+                        && !(matches!(
+                            value.kind(),
+                            "string_literal"
+                                | "raw_string_literal"
+                                | "integer_literal"
+                                | "float_literal"
+                                | "boolean_literal"
+                                | "char_literal"
+                        ) && matches!(
+                            brokk_bifrost_rust::syntax::rust_literal_type(value, context.source),
+                            Some(
+                                brokk_bifrost_rust::syntax::RustLiteralType::Exact { .. }
+                                    | brokk_bifrost_rust::syntax::RustLiteralType::InferredNumeric
+                            )
+                        ))
+                });
+            }
+            ancestor = parsed.logical_parent(invocation);
+        }
+        false
+    }
+
     fn is_standard_noncoercing_macro_operand(&self, node: Node<'_>) -> bool {
+        let Some(parsed) = self.sources.source(self.analyzer, self.file) else {
+            return false;
+        };
+        let context = RustTypeContext {
+            operation_source: None,
+            root: parsed.logical_root(node),
+            ..*self
+        };
+
         // Only a node strictly inside the macro is its operand. A macro
         // invocation used as the argument itself, such as `sink(dbg!(w))`,
         // passes its result, which coerces like any other value.
-        let mut ancestor = node.parent();
+        let mut ancestor = parsed.logical_parent(node);
         while let Some(invocation) = ancestor {
             // A nested call still performs its own argument conversions.
             if invocation.kind() == "call_expression" {
                 return false;
             }
             if invocation.kind() == "macro_invocation" {
-                if !self.standard_statement_macro(invocation) {
+                if !context.standard_statement_macro(invocation) {
                     return false;
                 }
                 let Some(path) = invocation.child_by_field_name("macro") else {
@@ -3864,33 +5136,42 @@ impl RustTypeContext<'_, '_> {
                 };
                 if brokk_bifrost_rust::format_args::rust_logging_macro(
                     "log",
-                    rust_node_text(*name, self.source),
+                    rust_node_text(*name, context.source),
                 )
                 .is_some()
                 {
                     let Ok(arguments) =
                         brokk_bifrost_rust::format_args::rust_format_macro_arguments(
                             invocation,
-                            self.source,
+                            context.source,
                         )
                     else {
                         return false;
                     };
-                    let Some(format) = brokk_bifrost_rust::format_args::rust_logging_format_operand(
+                    let Some(_) = brokk_bifrost_rust::format_args::rust_logging_format_operand(
                         invocation,
-                        self.source,
+                        context.source,
                         &arguments,
                     ) else {
                         return false;
                     };
-                    return arguments.iter().enumerate().any(|(index, argument)| {
-                        index != format
-                            && argument.value_range.start_byte <= node.start_byte()
+                    // The format string and the `target:` operand are not
+                    // capture-only: the target is passed into a `&str` field,
+                    // so a user `Deref<Target = str>` can run in that coercion.
+                    // Both keep the ordinary conversion check.
+                    return arguments.iter().any(|argument| {
+                        !matches!(
+                            argument.role,
+                            Some(
+                                brokk_bifrost_rust::macro_matcher::RustLogOperandRole::Format
+                                    | brokk_bifrost_rust::macro_matcher::RustLogOperandRole::Target
+                            )
+                        ) && argument.value_range.start_byte <= node.start_byte()
                             && node.end_byte() <= argument.value_range.end_byte
                     });
                 }
                 return matches!(
-                    rust_node_text(*name, self.source),
+                    rust_node_text(*name, context.source),
                     "println"
                         | "print"
                         | "eprintln"
@@ -3912,12 +5193,33 @@ impl RustTypeContext<'_, '_> {
                         | "dbg"
                 );
             }
-            ancestor = invocation.parent();
+            ancestor = parsed.logical_parent(invocation);
         }
         false
     }
 
+    fn admitted_macro(&self, invocation: Node<'_>) -> bool {
+        if invocation.kind() != "macro_invocation" {
+            return false;
+        }
+        let range = brokk_bifrost_core::analyzer::model::Range {
+            start_byte: invocation.start_byte(),
+            end_byte: invocation.end_byte(),
+            start_line: invocation.start_position().row + 1,
+            end_line: invocation.end_position().row + 1,
+        };
+        self.selected.is_some_and(|selected| {
+            brokk_bifrost_analysis::analyzer::usages::call_shape::admitted_candidate_call(
+                selected, range,
+            )
+            .is_some()
+        })
+    }
+
     fn standard_statement_macro(&self, invocation: Node<'_>) -> bool {
+        if self.selected.is_some() {
+            return self.resolved_standard_statement_macro(invocation);
+        }
         self.sources
             .source_scope_support(self.analyzer, self.file, invocation, || {
                 if self.resolved_standard_statement_macro(invocation) {
@@ -3930,6 +5232,9 @@ impl RustTypeContext<'_, '_> {
     }
 
     fn resolved_standard_statement_macro(&self, invocation: Node<'_>) -> bool {
+        if self.admitted_macro(invocation) {
+            return true;
+        }
         let Some(path) = invocation.child_by_field_name("macro") else {
             return false;
         };
@@ -3989,6 +5294,9 @@ impl RustTypeContext<'_, '_> {
         let Some(parsed) = self.sources.source(self.analyzer, self.file) else {
             return false;
         };
+        let Ok(tree) = parsed.tree_for_range(invocation.start_byte(), invocation.end_byte()) else {
+            return false;
+        };
         let scope = AnalyzerQueryScope::new(rust);
         let range = brokk_bifrost_core::analyzer::model::Range {
             start_byte: invocation.start_byte(),
@@ -4002,12 +5310,14 @@ impl RustTypeContext<'_, '_> {
                 token: scope.token(),
                 file: self.file,
                 source: self.source,
-                tree: &parsed.tree,
+                tree,
+                macro_inventory: Some(parsed.macro_inventory(tree)),
                 call_span: &range,
                 member_selection: None,
                 cancellation: None,
                 work: Default::default(),
             },
+            self.selected,
         ) else {
             return false;
         };
@@ -4033,8 +5343,655 @@ impl RustTypeContext<'_, '_> {
     }
 }
 
+pub(crate) struct RustBinaryOperationTypeProvider<'a> {
+    pub(crate) analyzer: &'a dyn IAnalyzer,
+    pub(crate) cache: CallConversionCache,
+}
+
+impl RustBinaryOperationTypeProvider<'_> {
+    fn operand(
+        &self,
+        source: &dyn brokk_bifrost_analysis::analyzer::store::language_support::SelectedTypeHeadSource,
+        value: brokk_bifrost_analysis::analyzer::resolution::ResolutionSlotValue,
+        cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<Option<RustConversionType>> {
+        use brokk_bifrost_analysis::analyzer::store::language_support::SelectedTypeOwner;
+        if value.addressable().is_none() || value.obligation().is_some() {
+            return Ok(None);
+        }
+        let ty = value.ty();
+        if ty.indirection() != ty.reference_indirection()
+            || ty.indirection() as usize >= MAX_TYPE_DEPTH
+        {
+            return Ok(None);
+        }
+        let Some(owner) = source.selected_owner(ty.identity(), cancellation)? else {
+            return Ok(None);
+        };
+        let mut converted = match owner {
+            SelectedTypeOwner::Intrinsic(entry) if entry.language == Language::Rust => {
+                let Some(primitive) = primitive_for_spelling(entry.identity_spelling) else {
+                    return Ok(None);
+                };
+                RustConversionType::Primitive(primitive)
+            }
+            SelectedTypeOwner::Source(unit) => RustConversionType::Declaration(unit),
+            SelectedTypeOwner::Model(symbol) => {
+                let Some(snapshot) = self.analyzer.active_semantic_model_snapshot() else {
+                    return Ok(None);
+                };
+                let Some(overlay) = snapshot.semantic_model_overlay() else {
+                    return Ok(None);
+                };
+                let Some(selected) = overlay
+                    .symbols_with_id_in_family(&symbol.symbol_id, "rust")
+                    .unique()
+                else {
+                    return Ok(None);
+                };
+                if brokk_bifrost_analysis::analyzer::semantic_model::overlay::ModelProvider::from(
+                    &selected.provenance,
+                ) != symbol.provider
+                {
+                    return Ok(None);
+                }
+                let Some(declaration) =
+                    brokk_bifrost_analysis::analyzer::semantic_model::overlay::owner_declaration(
+                        snapshot.active_models(),
+                        &selected,
+                    )
+                else {
+                    return Ok(None);
+                };
+                if !declaration.type_parameters.is_empty() {
+                    return Ok(None);
+                }
+                RustConversionType::Model {
+                    std_identity: model_sysroot_identity(&selected, &declaration),
+                    model_set: snapshot.active_models().active_model_set_hash().to_owned(),
+                    symbol: symbol.symbol_id,
+                    arguments: Vec::new(),
+                }
+            }
+            SelectedTypeOwner::ExternalPath(path) => {
+                let Some(snapshot) = self.analyzer.active_semantic_model_snapshot() else {
+                    return Ok(None);
+                };
+                let Some(overlay) = snapshot.semantic_model_overlay() else {
+                    return Ok(None);
+                };
+                let Some(owner) = super::crate_identity::RustOverlayCrates::new(Some(overlay))
+                    .referenceable_owner(&path.join("."))
+                else {
+                    return Ok(None);
+                };
+                let Some(declaration) =
+                    brokk_bifrost_analysis::analyzer::semantic_model::overlay::owner_declaration(
+                        snapshot.active_models(),
+                        &owner,
+                    )
+                else {
+                    return Ok(None);
+                };
+                // #12237: an erased generic application or mutable-reference
+                // requirement cannot be reconstructed by this head-only bridge.
+                if !declaration.type_parameters.is_empty() {
+                    return Ok(None);
+                }
+                RustConversionType::Model {
+                    std_identity: model_sysroot_identity(&owner, &declaration),
+                    model_set: snapshot.active_models().active_model_set_hash().to_owned(),
+                    symbol: owner.id.clone(),
+                    arguments: Vec::new(),
+                }
+            }
+            _ => return Ok(None),
+        };
+        for _ in 0..ty.reference_indirection() {
+            converted = RustConversionType::Reference {
+                mutable: false,
+                referent: Box::new(converted),
+            };
+        }
+        Ok(Some(converted))
+    }
+}
+
+/// Which range locates a type name's reference.
+#[derive(Clone, Copy)]
+enum TypeNameRange {
+    /// The leaf, as the resolver locates a type reference.
+    Reference,
+    /// The whole written path, kept for the operator trait route.
+    WholePath,
+}
+
+/// A type alias whose target the prover will expand.
+struct AliasToDemand {
+    unit: CodeUnit,
+    range: std::ops::Range<usize>,
+    /// Alias hops already taken to reach it.
+    depth: usize,
+}
+
+impl RustBinaryOperationTypeProvider<'_> {
+    /// Collect the references of every type name under `roots` and queue each
+    /// name whose already-completed answer selects a type alias. A name whose
+    /// answer is absent is demanded by the caller and found on a later round.
+    #[allow(clippy::too_many_arguments)]
+    fn demand_type_names<'tree>(
+        &self,
+        source: &dyn SelectedTypeHeadSource,
+        sources: &CallConversionContext<'_>,
+        file: &ProjectFile,
+        parsed: &ConversionSource,
+        mut pending: Vec<(Node<'tree>, TypeNameRange)>,
+        type_parameters: &[&str],
+        depth: usize,
+        references: &mut Vec<brokk_bifrost_analysis::analyzer::resolution::SemanticId>,
+        aliases: &mut Vec<AliasToDemand>,
+        cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<()> {
+        let context = RustTypeContext {
+            operation_source: Some(source),
+            selected: None,
+            analyzer: self.analyzer,
+            sources,
+            file,
+            source: &parsed.source,
+            root: parsed.tree.root_node(),
+        };
+        while let Some((node, range_kind)) = pending.pop() {
+            if cancellation.is_cancelled() {
+                break;
+            }
+            if !matches!(node.kind(), "type_identifier" | "scoped_type_identifier") {
+                pending.extend(
+                    node.named_children(&mut node.walk())
+                        .map(|child| (child, range_kind)),
+                );
+                continue;
+            }
+            // An alias's own parameter is substituted before any lookup.
+            if node.kind() == "type_identifier"
+                && type_parameters.contains(&rust_node_text(node, &parsed.source))
+            {
+                continue;
+            }
+            let range = match range_kind {
+                TypeNameRange::Reference => selected_type::reference_range(node),
+                TypeNameRange::WholePath => node.byte_range(),
+            };
+            if let Some(reference) = source.type_reference(file, range, cancellation)? {
+                references.push(reference);
+            }
+            if matches!(range_kind, TypeNameRange::Reference)
+                && let Some(head) = context.selected_head_declaration(node)
+                && head.kind == "type_item"
+            {
+                aliases.push(AliasToDemand {
+                    unit: head.declaration,
+                    range: head.range,
+                    depth,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+impl brokk_bifrost_analysis::analyzer::store::language_support::BinaryOperationTypeProvider
+    for RustBinaryOperationTypeProvider<'_>
+{
+    fn prerequisites(
+        &self,
+        source: &dyn SelectedTypeHeadSource,
+        operator: brokk_bifrost_core::analyzer::resolution_facts::ResolutionBinaryOperator,
+        output: brokk_bifrost_analysis::analyzer::resolution::SemanticId,
+        left: brokk_bifrost_analysis::analyzer::resolution::ResolutionSlotValue,
+        right: brokk_bifrost_analysis::analyzer::resolution::ResolutionSlotValue,
+        _right_reference: brokk_bifrost_core::analyzer::resolution_facts::ResolutionBinaryReference,
+        cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<
+        Vec<brokk_bifrost_analysis::analyzer::resolution::SemanticId>,
+    > {
+        use brokk_bifrost_core::analyzer::resolution_facts::ResolutionBinaryOperator as Op;
+        let (Some(left), Some(right)) = (
+            self.operand(source, left, cancellation)?,
+            self.operand(source, right, cancellation)?,
+        ) else {
+            return Ok(Vec::new());
+        };
+        if matches!(
+            (left, right),
+            (
+                RustConversionType::Primitive(_),
+                RustConversionType::Primitive(_)
+            )
+        ) {
+            return Ok(Vec::new());
+        }
+        let trait_name = match operator {
+            Op::Add => "Add",
+            Op::Sub => "Sub",
+            Op::Mul => "Mul",
+            Op::Div => "Div",
+            Op::Rem => "Rem",
+            Op::BitAnd => "BitAnd",
+            Op::BitOr => "BitOr",
+            Op::BitXor => "BitXor",
+            Op::Shl => "Shl",
+            Op::Shr => "Shr",
+        };
+        let Some(file) = source.slot_file(output)? else {
+            return Ok(Vec::new());
+        };
+        let sources = CallConversionContext::reference(&self.cache);
+        let Some(parsed) = sources.source(self.analyzer, &file) else {
+            return Ok(Vec::new());
+        };
+        let context = RustTypeContext {
+            operation_source: Some(source),
+            selected: None,
+            analyzer: self.analyzer,
+            sources: &sources,
+            file: &file,
+            source: &parsed.source,
+            root: parsed.tree.root_node(),
+        };
+        let Ok(headers) = context.operator_headers(trait_name) else {
+            return Ok(Vec::new());
+        };
+        let mut references = Vec::new();
+        let mut aliases = Vec::new();
+        for (file, range) in headers {
+            if cancellation.is_cancelled() {
+                break;
+            }
+            let Some(parsed) = sources.source(self.analyzer, &file) else {
+                continue;
+            };
+            let Some(node) = parsed
+                .tree
+                .root_node()
+                .descendant_for_byte_range(range.start, range.end)
+            else {
+                continue;
+            };
+            let mut roots = Vec::new();
+            roots.extend(
+                node.child_by_field_name("type")
+                    .map(|node| (node, TypeNameRange::Reference)),
+            );
+            // Trait heads need scheduled name resolution too: workspace traits
+            // must be excluded structurally before requiring sysroot identity.
+            // Their lookup keeps the whole written path (#12536 leaves the
+            // std::ops route alone); only trait arguments are type names.
+            if let Some(trait_node) = node.child_by_field_name("trait") {
+                if trait_node.kind() == "generic_type" {
+                    roots.extend(
+                        trait_node
+                            .child_by_field_name("type")
+                            .map(|head| (head, TypeNameRange::WholePath)),
+                    );
+                    roots.extend(
+                        trait_node
+                            .child_by_field_name("type_arguments")
+                            .map(|arguments| (arguments, TypeNameRange::Reference)),
+                    );
+                } else {
+                    roots.push((trait_node, TypeNameRange::WholePath));
+                }
+            }
+            if let Some(body) = node.child_by_field_name("body") {
+                for item in body.named_children(&mut body.walk()) {
+                    if item.kind() == "type_item"
+                        && item
+                            .child_by_field_name("name")
+                            .is_some_and(|n| rust_node_text(n, &parsed.source) == "Output")
+                    {
+                        roots.extend(
+                            item.child_by_field_name("type")
+                                .map(|node| (node, TypeNameRange::Reference)),
+                        );
+                    }
+                }
+            }
+            self.demand_type_names(
+                source,
+                &sources,
+                &file,
+                &parsed,
+                roots,
+                &[],
+                0,
+                &mut references,
+                &mut aliases,
+                cancellation,
+            )?;
+        }
+        // An alias is read from its own answer, so each hop is discovered one
+        // round after the round that answered its name. The expansion consumes
+        // MAX_ALIAS_DEPTH hops, so the walk stops there; a visited set ends cycles.
+        let mut visited = std::collections::HashSet::new();
+        while let Some(step) = aliases.pop() {
+            if cancellation.is_cancelled() {
+                break;
+            }
+            if step.depth >= selected_type::MAX_ALIAS_DEPTH
+                || !visited.insert((step.unit.source().clone(), step.range.start))
+            {
+                continue;
+            }
+            let Some(parsed) = sources.source(self.analyzer, step.unit.source()) else {
+                continue;
+            };
+            let Some(alias) = parsed
+                .tree
+                .root_node()
+                .named_descendant_for_byte_range(step.range.start, step.range.end)
+                .filter(|alias| alias.kind() == "type_item" && alias.byte_range() == step.range)
+            else {
+                continue;
+            };
+            let mut roots = Vec::new();
+            roots.extend(
+                alias
+                    .child_by_field_name("type")
+                    .map(|node| (node, TypeNameRange::Reference)),
+            );
+            let mut parameters = Vec::new();
+            if let Some(list) = alias.child_by_field_name("type_parameters") {
+                for parameter in list.named_children(&mut list.walk()) {
+                    if parameter.kind() != "type_parameter" {
+                        continue;
+                    }
+                    parameters.extend(
+                        parameter
+                            .child_by_field_name("name")
+                            .map(|name| rust_node_text(name, &parsed.source)),
+                    );
+                    roots.extend(
+                        parameter
+                            .child_by_field_name("default_type")
+                            .map(|node| (node, TypeNameRange::Reference)),
+                    );
+                }
+            }
+            self.demand_type_names(
+                source,
+                &sources,
+                step.unit.source(),
+                &parsed,
+                roots,
+                &parameters,
+                step.depth + 1,
+                &mut references,
+                &mut aliases,
+                cancellation,
+            )?;
+        }
+        references.sort_unstable();
+        references.dedup();
+        Ok(references)
+    }
+
+    fn prove(
+        &self,
+        source: &mut dyn brokk_bifrost_analysis::analyzer::store::language_support::SelectedTypeHeadSource,
+        operator: brokk_bifrost_core::analyzer::resolution_facts::ResolutionBinaryOperator,
+        output: brokk_bifrost_analysis::analyzer::resolution::SemanticId,
+        left: brokk_bifrost_analysis::analyzer::resolution::ResolutionSlotValue,
+        right: brokk_bifrost_analysis::analyzer::resolution::ResolutionSlotValue,
+        right_reference: brokk_bifrost_core::analyzer::resolution_facts::ResolutionBinaryReference,
+        cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<
+        brokk_bifrost_analysis::analyzer::store::language_support::BinaryOperationTypeProof,
+    > {
+        use brokk_bifrost_analysis::analyzer::resolution::{
+            ResolutionCompletion, ResolutionIncompleteReason, ResolutionSlotValue,
+            ResolutionTypeRef,
+        };
+        use brokk_bifrost_analysis::analyzer::store::language_support::{
+            BinaryOperationTypeProof, SelectedTypeOwner,
+        };
+        use brokk_bifrost_core::analyzer::resolution_facts::ResolutionBinaryOperator as Op;
+        let incomplete = || BinaryOperationTypeProof {
+            value: None,
+            completion: ResolutionCompletion::incomplete([
+                ResolutionIncompleteReason::UnsupportedSemantic(output),
+            ]),
+        };
+        if cancellation.is_cancelled() {
+            return Ok(incomplete());
+        }
+        // Prerequisites are scheduler demands, not a workspace-wide proof gate.
+        // The shared prover checks selected identities only after filtering each
+        // impl against these operands. Primitive operations never visit impls.
+        let left_type = self.operand(source, left, cancellation);
+        let right_type = self.operand(source, right, cancellation);
+        let (Some(left_type), Some(right_type), Some(file)) =
+            (left_type?, right_type?, source.slot_file(output)?)
+        else {
+            return Ok(incomplete());
+        };
+        let spelling = match operator {
+            Op::Add => "+",
+            Op::Sub => "-",
+            Op::Mul => "*",
+            Op::Div => "/",
+            Op::Rem => "%",
+            Op::BitAnd => "&",
+            Op::BitOr => "|",
+            Op::BitXor => "^",
+            Op::Shl => "<<",
+            Op::Shr => ">>",
+        };
+        let sources = CallConversionContext::reference(&self.cache);
+        let Some(selection) = source.proof_selection_key() else {
+            return Ok(incomplete());
+        };
+        let result = sources.rust_binary_operation_type(
+            self.analyzer,
+            &file,
+            selection,
+            output,
+            operator,
+            left,
+            right,
+            || {
+                let parsed = sources
+                    .source(self.analyzer, &file)
+                    .ok_or(ConversionUnknown::UnsupportedExpression)?;
+                RustTypeContext {
+                    operation_source: Some(source),
+                    selected: None,
+                    analyzer: self.analyzer,
+                    sources: &sources,
+                    file: &file,
+                    source: &parsed.source,
+                    root: parsed.tree.root_node(),
+                }
+                .native_binary_result_type(
+                    &left_type,
+                    &right_type,
+                    spelling,
+                    right_reference,
+                )
+            },
+        );
+        let Ok(result) = result else {
+            return Ok(incomplete());
+        };
+        // Reuse an already-selected representation of the same proven type.
+        // This retains native external-owner identity across modeled Output.
+        let value = if result == left_type {
+            Some(ResolutionSlotValue::runtime(left.ty(), false))
+        } else if result == right_type {
+            Some(ResolutionSlotValue::runtime(right.ty(), false))
+        } else {
+            let mut result = &result;
+            let mut layers = 0;
+            while let RustConversionType::Reference {
+                mutable: false,
+                referent,
+            } = result
+            {
+                layers += 1;
+                result = referent;
+            }
+            let owner = match result {
+                    RustConversionType::Primitive(primitive) => brokk_bifrost_analysis::analyzer::resolution::universe::table(Language::Rust).iter()
+                        .find(|entry| primitive_for_spelling(entry.identity_spelling) == Some(*primitive))
+                        .copied().map(SelectedTypeOwner::Intrinsic),
+                    RustConversionType::Declaration(unit) => Some(SelectedTypeOwner::Source(unit.clone())),
+                    RustConversionType::Model { symbol, arguments, .. } if arguments.is_empty() => {
+                        self.analyzer.active_semantic_model_snapshot().and_then(|snapshot| snapshot.semantic_model_overlay().and_then(|overlay| overlay.symbols_with_id_in_family(symbol, "rust").unique().map(|symbol| SelectedTypeOwner::Model(brokk_bifrost_analysis::analyzer::semantic_model::overlay::ModelSymbolRef { symbol_id: symbol.id.clone(), provider: (&symbol.provenance).into() }))))
+                    }
+                    _ => None,
+                };
+            match owner {
+                Some(owner) => source.intern_owner(&owner, cancellation)?.map(|identity| {
+                    ResolutionSlotValue::runtime(
+                        ResolutionTypeRef::new_with_reference_indirection(identity, layers, layers),
+                        false,
+                    )
+                }),
+                None => None,
+            }
+        };
+        Ok(match value {
+            Some(value) if !cancellation.is_cancelled() => BinaryOperationTypeProof {
+                value: Some(value),
+                completion: ResolutionCompletion::Complete,
+            },
+            _ => incomplete(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11234: operator candidate memo hits lost typed completion and retained stopped fills"
+    )]
+    fn operator_candidates_memo_completion_conformance() {
+        use brokk_bifrost_analysis::analyzer::usages::common::{
+            QueryMemoOwner, assert_memo_owner_conformance_for_test,
+        };
+        use brokk_bifrost_core::retention_budget::RetentionBudget;
+        let source = "fn probe() {}";
+        let (_temp, analyzer) = super::super::test_support::project(&[("src/lib.rs", source)]);
+        let file = super::super::test_support::analyzed_file(&analyzer, "src/lib.rs");
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let query = |cache: &CallConversionCache| {
+            let sources = CallConversionContext::reference(cache);
+            RustTypeContext {
+                operation_source: None,
+                selected: None,
+                analyzer: &analyzer,
+                sources: &sources,
+                file: &file,
+                source,
+                root: tree.root_node(),
+            }
+            .workspace_operator_output(
+                &RustConversionType::Primitive(RustPrimitive::U8),
+                &RustConversionType::Primitive(RustPrimitive::U8),
+                "Add",
+                0,
+            )
+        };
+        assert_memo_owner_conformance_for_test(
+            QueryMemoOwner::RustOperator,
+            &analyzer,
+            || {
+                let root = std::sync::Arc::new(
+                    brokk_bifrost_analysis::analyzer::AnalyzerQueryContext::root(),
+                );
+                let attribution = root.enter();
+                let scope = brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::for_retained_fill(
+                    &analyzer,
+                );
+                let cache = CallConversionCache::with_rust_operator_budget_for_test(
+                    &RetentionBudget::for_test_capacity(8 * 1024 * 1024),
+                );
+                assert_eq!(cache.rust_operator_header_memo_stats_for_test().entries, 0);
+                (scope, attribution, cache)
+            },
+            |(_, _, cache)| format!("{:?}", query(cache)),
+            |(_, _, cache)| cache.rust_operator_header_memo_stats_for_test().entries > 0,
+        );
+
+        // Capacity refusal is an eviction decision, never a semantic stop.
+        // The same real lookup recomputes under a one-byte owner budget.
+        let root =
+            std::sync::Arc::new(brokk_bifrost_analysis::analyzer::AnalyzerQueryContext::root());
+        let _attribution = root.enter();
+        let _scope =
+            brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::for_retained_fill(&analyzer);
+        let normal_budget = RetentionBudget::for_test_capacity(8 * 1024 * 1024);
+        let tiny_budget = RetentionBudget::for_test_capacity(1);
+        let normal = CallConversionCache::with_rust_operator_budget_for_test(&normal_budget);
+        let tiny = CallConversionCache::with_rust_operator_budget_for_test(&tiny_budget);
+        let expected = query(&normal);
+        assert_eq!(query(&tiny), expected);
+        let first = tiny.rust_operator_header_memo_stats_for_test();
+        assert_eq!(first.entries, 0);
+        assert!(first.refused_admissions > 0);
+        assert_eq!(query(&tiny), expected);
+        assert!(
+            tiny.rust_operator_header_memo_stats_for_test()
+                .refused_admissions
+                > first.refused_admissions
+        );
+
+        // The native result memo uses the same budgeted owner and preserves
+        // its answer when it cannot retain it, including repeated requests.
+        use brokk_bifrost_analysis::analyzer::resolution::{
+            ResolutionSlotValue, ResolutionTypeRef, SemanticId,
+        };
+        use brokk_bifrost_core::analyzer::resolution_facts::ResolutionBinaryOperator;
+        let output = SemanticId::for_test("operator-budget-output");
+        let operand = ResolutionSlotValue::runtime(
+            ResolutionTypeRef::new(SemanticId::for_test("operator-budget-int"), 0),
+            false,
+        );
+        let fills = std::cell::Cell::new(0);
+        for _ in 0..2 {
+            assert_eq!(
+                tiny.rust_binary_operation_type(
+                    &analyzer,
+                    &file,
+                    (1, 1, [0; 32]),
+                    output,
+                    ResolutionBinaryOperator::Add,
+                    operand,
+                    operand,
+                    || {
+                        let _parsed = tiny
+                            .source(&analyzer, &file)
+                            .expect("operator proof source");
+                        fills.set(fills.get() + 1);
+                        Ok(RustConversionType::Primitive(RustPrimitive::I32))
+                    }
+                ),
+                Ok(RustConversionType::Primitive(RustPrimitive::I32))
+            );
+        }
+        assert_eq!(fills.get(), 2);
+        drop(tiny);
+        drop(normal);
+        tiny_budget.run_pending_tasks();
+        normal_budget.run_pending_tasks();
+        assert_eq!(tiny_budget.accounted_bytes(), 0);
+        assert_eq!(normal_budget.accounted_bytes(), 0);
+    }
 
     use crate::analyzer::rust::call_conversion::*;
 
@@ -4077,6 +6034,62 @@ mod tests {
             pending.extend(node.named_children(&mut node.walk()));
         }
         type_conversion_type(analyzer, &file, source, selected.unwrap())
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10930: embedded operands lost host bindings and fragment-local shadowing"
+    )]
+    fn embedded_lexical_scopes_shadow_host_bindings() {
+        let source = "fn f(value: usize, outer: usize) { vec![{ let value = 1; value + outer }]; }";
+        let (_temp, analyzer) = super::super::test_support::project(&[("src/lib.rs", source)]);
+        let file = super::super::test_support::analyzed_file(&analyzer, "src/lib.rs");
+        let cache = CallConversionCache::default();
+        let parsed = cache.source(&analyzer, &file).unwrap();
+        for (spelling, start, declaration_start) in [
+            (
+                "value",
+                source.find("value + outer").unwrap(),
+                source.find("let value").unwrap(),
+            ),
+            (
+                "outer",
+                source.find("outer }").unwrap(),
+                source.find("outer: usize").unwrap(),
+            ),
+        ] {
+            let node = parsed
+                .tree_for_range(start, start + spelling.len())
+                .unwrap()
+                .root_node()
+                .named_descendant_for_byte_range(start, start + spelling.len())
+                .unwrap();
+            let binding =
+                brokk_bifrost_analysis::analyzer::lexical_definitions::resolve_lexical_binding_with_candidate_index(
+                    brokk_bifrost_core::analyzer::model::Language::Rust,
+                    node,
+                    source,
+                    start,
+                    spelling,
+                    None,
+                    &|node| parsed.logical_parent(*node),
+                )
+                .into_legacy()
+                .unwrap()
+                .expect("logical lexical binding");
+            let definition = match binding {
+                brokk_bifrost_analysis::analyzer::lexical_definitions::LexicalBindingResolution::Parameter(
+                    definition,
+                )
+                | brokk_bifrost_analysis::analyzer::lexical_definitions::LexicalBindingResolution::OtherLocal(
+                    definition,
+                ) => definition,
+            };
+            assert_eq!(
+                definition.declaration_range.start_byte, declaration_start,
+                "{spelling}"
+            );
+        }
     }
 
     #[test]
@@ -4237,6 +6250,8 @@ mod tests {
             .unwrap();
         let sources = CallConversionCache::default();
         let context = RustTypeContext {
+            operation_source: None,
+            selected: None,
             analyzer: &analyzer,
             sources: &CallConversionContext::reference(&sources),
             file: &file,
@@ -4284,6 +6299,8 @@ mod tests {
         let cold_file = super::super::test_support::analyzed_file(&cold_analyzer, "src/lib.rs");
         let cold_sources = CallConversionCache::default();
         let cold = RustTypeContext {
+            operation_source: None,
+            selected: None,
             analyzer: &cold_analyzer,
             sources: &CallConversionContext::reference(&cold_sources),
             file: &cold_file,
@@ -4322,6 +6339,8 @@ mod tests {
         let tree = parser.parse(source, None).unwrap();
         let cache = CallConversionCache::default();
         let context = RustTypeContext {
+            operation_source: None,
+            selected: None,
             analyzer: &analyzer,
             sources: &CallConversionContext::reference(&cache),
             file: &file,
@@ -4329,6 +6348,7 @@ mod tests {
             root: tree.root_node(),
         };
         let receiver = RustConversionType::Model {
+            std_identity: None,
             model_set: "fixture".into(),
             symbol: "fixture.owner".into(),
             arguments: Vec::new(),
@@ -4396,6 +6416,8 @@ mod tests {
         let tree = parser.parse(source, None).unwrap();
         let sources = CallConversionCache::default();
         let context = RustTypeContext {
+            operation_source: None,
+            selected: None,
             analyzer: &analyzer,
             sources: &CallConversionContext::reference(&sources),
             file: &file,
@@ -4473,6 +6495,8 @@ mod tests {
         let tree = parser.parse(source, None).unwrap();
         let sources = CallConversionCache::default();
         let context = RustTypeContext {
+            operation_source: None,
+            selected: None,
             analyzer: &analyzer,
             sources: &CallConversionContext::reference(&sources),
             file: &file,
@@ -4490,7 +6514,11 @@ mod tests {
         let global = snapshot
             .semantic_model_overlay()
             .unwrap()
-            .symbols_named_in_family("std.alloc.Global", "rust")
+            .symbols_named_in_family(
+                "std.alloc.Global",
+                "rust",
+                SemanticModelNamespace::TypeOrModule,
+            )
             .unique()
             .unwrap();
         let returned = context
@@ -4762,6 +6790,8 @@ mod tests {
             .unwrap();
         let sources = CallConversionCache::default();
         let context = RustTypeContext {
+            operation_source: None,
+            selected: None,
             analyzer: &analyzer,
             sources: &CallConversionContext::reference(&sources),
             file: &file,
@@ -4950,6 +6980,57 @@ mod tests {
             Some(ConversionKind::RustDeref)
         );
     }
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12073: modeled reader accepted unresolved rustdoc IDs by spelling"
+    )]
+    fn unresolved_rustdoc_returns_cannot_bind_retained_types_or_primitives() {
+        use crate::analyzer::semantic_model::AuthoredPayload;
+        let pack = super::super::rustdoc_artifact::tests::missing_identity_pack();
+        let AuthoredPayload::DeclarationFacts { members, .. } = &pack.shards[0].payload else {
+            panic!("expected declaration facts")
+        };
+        with_model_regression_context(&serde_json::to_value(&pack).unwrap(), |context| {
+            for name in ["missing_widget", "summary_widget", "missing_u8"] {
+                let returned = members
+                    .iter()
+                    .find(|member| member.name == name)
+                    .unwrap()
+                    .signature
+                    .as_ref()
+                    .unwrap()
+                    .returns
+                    .as_ref()
+                    .unwrap();
+                assert!(
+                    matches!(
+                        context.modeled_return_conversion(returned, 0),
+                        Err(ConversionUnknown::GenericSubstitution)
+                    ),
+                    "{name}"
+                );
+            }
+            // #12140 owns marking actual rustdoc primitives. An unmarked
+            // nominal spelling must remain unproven when that marker lands.
+            assert!(matches!(
+                context.modeled_return_conversion(
+                    &crate::analyzer::semantic_model::TypeRef::named("u8"),
+                    0
+                ),
+                Err(ConversionUnknown::GenericSubstitution)
+            ));
+            assert_eq!(
+                context
+                    .modeled_return_conversion(
+                        &crate::analyzer::semantic_model::TypeRef::named("core.primitive.u8"),
+                        0
+                    )
+                    .unwrap(),
+                RustConversionType::Primitive(RustPrimitive::U8)
+            );
+        });
+    }
+
     fn named_model_regression_pack() -> serde_json::Value {
         use serde_json::json;
         let mut types = Vec::new();
@@ -4973,6 +7054,749 @@ mod tests {
             "compatibility":{"toolchains":[]},"provenance":{"source":"test-only Named substitution and work"},
             "license":"NOASSERTION","completeness":"complete","safety":{"generated_code_only":false,"review_required":false},
             "shards":[{"id":"types","activation":[{"targets":[],"configurations":[]}],"payload":{"kind":"declaration_facts","types":types}}]})
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11778: unsafe block syntax hid safe Layout and scalar argument types"
+    )]
+    fn unsafe_evaluation_proves_ordinary_values_and_refuses_actual_operations() {
+        use crate::analyzer::semantic_model::TypeRef;
+        let pack = model_argument_layout_pack();
+        let source = r#"
+            struct S { value: u8 }
+            impl S { fn transmute(&self, value: u8) -> u8 { value } }
+            struct StaticShorthand { VALUE: u8 }
+            union U { value: u8 }
+            static mut VALUE: u8 = 0;
+            unsafe fn user_fn(value: u8) -> u8 { value }
+            fn transmute(value: u8) -> u8 { value }
+            fn borrowed(_: &u8) {}
+            fn owned(_: S) {}
+            fn owned_static(_: StaticShorthand) {}
+            fn probe(layout: core::alloc::layout::Layout, x: u8, s: S, r: &u8, p: *const S, u: U, opt: Option<u8>, q: *const u8, write_target: &mut U) {
+                unsafe {
+                    alloc(layout);
+                    foo(*p, x, 1u8, s.value, &x, user_fn(x), *r, transmute(x), s.transmute(x), S::transmute(&s, x));
+                    foo((*p).value);
+                    foo(u.value);
+                    foo(StaticShorthand { VALUE });
+                    foo(VALUE);
+                    foo(core::arch::asm!(""));
+                    foo(S { value: { core::arch::asm!(""); 1u8 } });
+                    foo(S { value: { let _f = || { core::arch::asm!(""); }; 1u8 } });
+                    foo(S { value: { let Some(v) = opt else { core::arch::asm!(""); return; }; v } });
+                    foo(S { value: { let (v,) = (*q,); v } });
+                    foo(S { value: { let U { value: _v } = u; 1u8 } });
+                    foo(S { value: { write_target.value += 1u8; 1u8 } });
+                    foo(S { value: { match opt { Some(v) if *q > 0u8 => v, _ => 0u8 } } });
+                    foo(S { value: { if let (v,) = (*q,) { 1u8 } else { 0u8 } } });
+                    foo(S { value: { for (v,) in [(*q,)] {} 1u8 } });
+                    foo(S { value: { 'done: loop { break 'done (*q); } } });
+                    foo(S { value: { static mut UNUSED: u8 = 0; 1u8 } });
+                    foo(S { value: { use std::mem; core::arch::asm!(""); 1u8 } });
+                }
+                let value = 1u8;
+                foo(S { value });
+                foo(S { value: { let (v,) = (1u8,); v } });
+                foo(S { value: { let S { value: _v } = s; 1u8 } });
+                foo(S { value: { write_target.value = 1u8; 1u8 } });
+                foo(S { value: { use std::mem; 1u8 } });
+                foo(S { value: { extern crate core as local_core; 1u8 } });
+                foo(S { value: { mod item_meta { fn hidden(deferred_ptr: *const u8) { unsafe { let _ = *deferred_ptr; } } } 1u8 } });
+                foo(S { value: { let Some(_v) = opt else { return; }; 1u8 } });
+                foo(S { value: { let _future = async { unsafe { *q } }; 1u8 } });
+                foo(S { value: { match opt { Some(_) => 1u8, None => 0u8 } } });
+                foo(S { value: { if let Some(_) = opt { 1u8 } else { 0u8 } } });
+                foo(S { value: { for (v,) in [(1u8,)] {} 1u8 } });
+                foo(S { value: { 'done: loop { break 'done 1u8; } } });
+            }
+            async fn await_probe(q: *const u8) {
+                foo(S { value: 2u8 });
+                foo(S { value: async { unsafe { *q } }.await });
+                foo(S { value: async { 1u8 }.await });
+            }
+        "#;
+        with_external_nominal_context(&[pack], source, "", |context| {
+            let parsed = context
+                .sources
+                .source(context.analyzer, context.file)
+                .unwrap();
+            let node_at = |text: &str| {
+                source
+                    .rmatch_indices(text)
+                    .find_map(|(start, _)| {
+                        let end = start + text.len();
+                        let node = parsed
+                            .tree_for_range(start, end)
+                            .ok()?
+                            .root_node()
+                            .named_descendant_for_byte_range(start, end)?;
+                        (node.start_byte() == start && node.end_byte() == end).then_some(node)
+                    })
+                    .unwrap_or_else(|| panic!("missing exact syntax for {text}"))
+            };
+            let prove = |text: &str, ty: TypeRef| {
+                CALL_ARGUMENT_CONVERSION_PROVER.prove_model_argument(
+                    context.analyzer,
+                    context.file,
+                    node_at(text),
+                    source,
+                    &ty,
+                )
+            };
+            assert_eq!(
+                prove("layout", TypeRef::named("core.alloc.layout.Layout"))
+                    .unwrap()
+                    .kind,
+                ConversionKind::RustIdentity
+            );
+            for text in [
+                "x",
+                "1u8",
+                "s.value",
+                "user_fn(x)",
+                "*r",
+                "transmute(x)",
+                "s.transmute(x)",
+            ] {
+                assert_eq!(
+                    prove(text, TypeRef::named("std.primitive.u8"))
+                        .unwrap_or_else(|error| panic!("{text}: {error:?}"))
+                        .kind,
+                    ConversionKind::RustIdentity,
+                    "{text}"
+                );
+            }
+            // #12325: a user's method named transmute is ordinary with both
+            // method syntax and a UFCS path. Only the latter needs resolution.
+            // The value prover does not resolve a UFCS call to a source method,
+            // so S::transmute(&s, x) is pinned here and not in the identity list.
+            for text in ["s.transmute(x)", "S::transmute(&s, x)"] {
+                assert_eq!(
+                    context.call_is_transmute_intrinsic(node_at(text), 0),
+                    Ok(false),
+                    "{text}"
+                );
+            }
+            let formal_start = source.find("_: &u8").unwrap();
+            let formal = parsed
+                .tree
+                .root_node()
+                .named_descendant_for_byte_range(formal_start, formal_start + "_: &u8".len())
+                .unwrap();
+            let reference = CALL_ARGUMENT_CONVERSION_PROVER
+                .prove_argument(
+                    context.analyzer,
+                    context.sources,
+                    context.file,
+                    node_at("&x"),
+                    source,
+                    context.file,
+                    formal,
+                    source,
+                )
+                .unwrap();
+            assert_eq!(reference.kind, ConversionKind::RustIdentity);
+            for text in [
+                "*p",
+                "(*p).value",
+                "u.value",
+                "VALUE",
+                "core::arch::asm!(\"\")",
+            ] {
+                assert_eq!(
+                    prove(text, TypeRef::named("std.primitive.u8")),
+                    Err(ConversionUnknown::UnsupportedExpression),
+                    "{text}"
+                );
+            }
+            let owned_start = source.find("_: S").unwrap();
+            let owned = parsed
+                .tree
+                .root_node()
+                .named_descendant_for_byte_range(owned_start, owned_start + "_: S".len())
+                .unwrap();
+            let prove_owned = |text: &str, formal: Node<'_>| {
+                CALL_ARGUMENT_CONVERSION_PROVER.prove_argument(
+                    context.analyzer,
+                    context.sources,
+                    context.file,
+                    node_at(text),
+                    source,
+                    context.file,
+                    formal,
+                    source,
+                )
+            };
+            // Shorthand initializers read their binding just as explicit
+            // initializers do; the mutable static must not be proved from the
+            // enclosing struct's nominal type.
+            assert!(
+                prove_owned("StaticShorthand { VALUE }", node_at("_: StaticShorthand")).is_err(),
+                "a shorthand static read must remain unproven"
+            );
+            // #12110: match/let-condition body locals remain fail-closed until
+            // a source-aware retained native binding path proves visibility.
+            // Wildcards isolate constructor metadata from that separate gap.
+            for (text, expected) in [
+                ("S { value }", true),
+                ("S { value: { core::arch::asm!(\"\"); 1u8 } }", false),
+                (
+                    "S { value: { let _f = || { core::arch::asm!(\"\"); }; 1u8 } }",
+                    true,
+                ),
+                (
+                    "S { value: { let Some(v) = opt else { core::arch::asm!(\"\"); return; }; v } }",
+                    false,
+                ),
+                ("S { value: { let (v,) = (*q,); v } }", false),
+                ("S { value: { let U { value: _v } = u; 1u8 } }", false),
+                ("S { value: { let S { value: _v } = s; 1u8 } }", true),
+                ("S { value: { write_target.value = 1u8; 1u8 } }", true),
+                ("S { value: { write_target.value += 1u8; 1u8 } }", false),
+                ("S { value: { let (v,) = (1u8,); v } }", true),
+                (
+                    "S { value: { let Some(_v) = opt else { return; }; 1u8 } }",
+                    true,
+                ),
+                ("S { value: { static mut UNUSED: u8 = 0; 1u8 } }", true),
+                ("S { value: { use std::mem; 1u8 } }", true),
+                (
+                    "S { value: { use std::mem; core::arch::asm!(\"\"); 1u8 } }",
+                    false,
+                ),
+                (
+                    "S { value: { extern crate core as local_core; 1u8 } }",
+                    true,
+                ),
+                (
+                    "S { value: { mod item_meta { fn hidden(deferred_ptr: *const u8) { unsafe { let _ = *deferred_ptr; } } } 1u8 } }",
+                    true,
+                ),
+                (
+                    "S { value: { let _future = async { unsafe { *q } }; 1u8 } }",
+                    true,
+                ),
+                (
+                    "S { value: { match opt { Some(_) => 1u8, None => 0u8 } } }",
+                    true,
+                ),
+                (
+                    "S { value: { match opt { Some(v) if *q > 0u8 => v, _ => 0u8 } } }",
+                    false,
+                ),
+                (
+                    "S { value: { if let Some(_) = opt { 1u8 } else { 0u8 } } }",
+                    true,
+                ),
+                (
+                    "S { value: { if let (v,) = (*q,) { 1u8 } else { 0u8 } } }",
+                    false,
+                ),
+                ("S { value: { for (v,) in [(1u8,)] {} 1u8 } }", true),
+                ("S { value: { for (v,) in [(*q,)] {} 1u8 } }", false),
+                ("S { value: { 'done: loop { break 'done 1u8; } } }", true),
+                ("S { value: 2u8 }", true),
+                ("S { value: async { unsafe { *q } }.await }", false),
+                ("S { value: async { 1u8 }.await }", false),
+            ] {
+                let result = prove_owned(text, owned);
+                if expected {
+                    assert_eq!(
+                        result
+                            .unwrap_or_else(|error| panic!("{text}: {error:?}"))
+                            .kind,
+                        ConversionKind::RustIdentity
+                    );
+                } else {
+                    assert_eq!(
+                        result,
+                        Err(ConversionUnknown::UnsupportedExpression),
+                        "{text}"
+                    );
+                }
+            }
+            // Label/call parsing can leave this expression untyped before the
+            // raw dereference is reached; either way it must stay unproven.
+            let labeled_deref = "S { value: { 'done: loop { break 'done (*q); } } }";
+            assert!(
+                prove_owned(labeled_deref, owned).is_err(),
+                "{labeled_deref}"
+            );
+        });
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11778: removing the unsafe block refusal must retain transmute-family refusal"
+    )]
+    fn unsafe_evaluation_refuses_resolved_transmute_intrinsics_and_aliases() {
+        use crate::analyzer::semantic_model::TypeRef;
+        let mut pack = model_argument_layout_pack();
+        pack["shards"][0]["payload"]["types"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "id":"std-root","name":"std","type_kind":"module","visibility":"public",
+                "locator":{"kind":"artifact","path":"fixture/std.rs","symbol":"std"}
+            }));
+        pack["shards"][0]["payload"]["types"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "id":"std-mem","name":"std.mem","type_kind":"module","visibility":"public",
+                "locator":{"kind":"artifact","path":"fixture/core.rs","symbol":"std.mem"}
+            }));
+        pack["shards"][0]["payload"]["members"] = serde_json::json!([
+            {"id":"transmute","owner":"std-mem","name":"transmute","member_kind":"method","is_static":true,"callable_family_complete":true,"visibility":"public",
+             "signature":{"type_parameters":["T","U"],"parameters":[{"name":"value","type":{"kind":"type_parameter","name":"T"}}],"returns":{"kind":"type_parameter","name":"U"}},
+             "locator":{"kind":"artifact","path":"fixture/core.rs","symbol":"std.mem.transmute"}},
+            {"id":"transmute-copy","owner":"std-mem","name":"transmute_copy","member_kind":"method","is_static":true,"callable_family_complete":true,"visibility":"public",
+             "signature":{"type_parameters":["T","U"],"parameters":[{"name":"value","type":{"kind":"by_ref","element":{"kind":"type_parameter","name":"T"}}}],"returns":{"kind":"type_parameter","name":"U"}},
+             "locator":{"kind":"artifact","path":"fixture/core.rs","symbol":"std.mem.transmute_copy"}}
+        ]);
+        // #12325: even a modeled callee with a concrete return is refused
+        // when its canonical declaration is transmute-family. Alias spelling
+        // must not turn this into an ordinary call.
+        pack["shards"][0]["payload"]["members"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "id":"transmute-unchecked", "owner":"std-mem", "name":"transmute_unchecked",
+                "member_kind":"method", "is_static":true, "callable_family_complete":true,
+                "visibility":"public",
+                "signature":{
+                    "type_parameters":[],
+                    "parameters":[{"name":"value", "type":{"kind":"named", "name":"core.primitive.u8", "arguments":[]}}],
+                    "returns":{"kind":"named", "name":"core.primitive.u8", "arguments":[]}
+                },
+                "locator":{"kind":"artifact", "path":"fixture/core.rs", "symbol":"std.mem.transmute_unchecked"}
+            }));
+        let source = "use std::mem::transmute as bits; use std::mem::transmute_unchecked as convert; fn probe(x: u8) { unsafe { foo(std::mem::transmute::<u8, bool>(x)); foo(bits::<u8, bool>(x)); foo(std::mem::transmute_copy::<u8, u8>(&x)); foo(convert(x)); } }";
+        with_external_nominal_context(&[pack], source, "", |context| {
+            let parsed = context
+                .sources
+                .source(context.analyzer, context.file)
+                .unwrap();
+            for text in [
+                "std::mem::transmute::<u8, bool>(x)",
+                "bits::<u8, bool>(x)",
+                "std::mem::transmute_copy::<u8, u8>(&x)",
+                "convert(x)",
+            ] {
+                let start = source.find(text).unwrap();
+                let actual = parsed
+                    .tree
+                    .root_node()
+                    .named_descendant_for_byte_range(start, start + text.len())
+                    .unwrap();
+                if text == "convert(x)" {
+                    assert_eq!(context.call_is_transmute_intrinsic(actual, 0), Ok(true));
+                }
+                assert_eq!(
+                    CALL_ARGUMENT_CONVERSION_PROVER.prove_model_argument(
+                        context.analyzer,
+                        context.file,
+                        actual,
+                        source,
+                        &TypeRef::named("std.primitive.u8"),
+                    ),
+                    Err(ConversionUnknown::UnsupportedExpression),
+                    "{text}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11778: opaque macros and unresolved field bases bypassed unsafe initializer refusal"
+    )]
+    fn unsafe_evaluation_keeps_opaque_macros_and_field_bases_unproven() {
+        let source = r#"
+            use core::arch::asm as emit;
+            struct S { value: u8 }
+            union U { value: u8 }
+            macro_rules! read_ptr { ($p:expr) => { *$p }; }
+            fn get<T>() -> T { loop {} }
+            fn target(_: S) {}
+            fn probe(p: *const u8) {
+                unsafe {
+                    consume(S { value: read_ptr!(p) });
+                    consume(S { value: { emit!(""); 1u8 } });
+                    consume(S { value: get::<U>().value });
+                    consume(S { value: core::mem::transmute(1u8) });
+                    consume(S { value: external::MUTABLE_STATIC });
+                }
+            }
+            impl U { fn method(&self) { unsafe { consume(S { value: self.value }); } } }
+            impl S { fn method(&self) { unsafe { consume(S { value: self.value }); } } }
+        "#;
+        with_external_nominal_context(&[model_argument_layout_pack()], source, "", |context| {
+            let parsed = context
+                .sources
+                .source(context.analyzer, context.file)
+                .unwrap();
+            let formal_start = source.find("_: S").unwrap();
+            let formal = parsed
+                .tree
+                .root_node()
+                .named_descendant_for_byte_range(formal_start, formal_start + "_: S".len())
+                .unwrap();
+            let prove_at = |text: &str, start: usize| {
+                let actual = parsed
+                    .tree
+                    .root_node()
+                    .named_descendant_for_byte_range(start, start + text.len())
+                    .unwrap();
+                CALL_ARGUMENT_CONVERSION_PROVER.prove_argument(
+                    context.analyzer,
+                    context.sources,
+                    context.file,
+                    actual,
+                    source,
+                    context.file,
+                    formal,
+                    source,
+                )
+            };
+            for text in [
+                "S { value: read_ptr!(p) }",
+                "S { value: { emit!(\"\"); 1u8 } }",
+                "S { value: get::<U>().value }",
+                "S { value: core::mem::transmute(1u8) }",
+                "S { value: external::MUTABLE_STATIC }",
+            ] {
+                assert!(
+                    prove_at(text, source.find(text).unwrap()).is_err(),
+                    "{text}"
+                );
+            }
+            let text = "S { value: self.value }";
+            let union_start = source.find("impl U").unwrap();
+            let union_start = union_start + source[union_start..].find(text).unwrap();
+            assert!(prove_at(text, union_start).is_err());
+            let struct_start = source.rfind(text).unwrap();
+            assert_eq!(
+                prove_at(text, struct_start).unwrap().kind,
+                ConversionKind::RustIdentity
+            );
+        });
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11778: the unsafe evaluation walker lost source constructor conversion evidence"
+    )]
+    fn unsafe_evaluation_recognizes_source_constructors_without_hiding_arguments() {
+        let source = r#"
+            struct Wrapper(u8);
+            enum Choice { Value(u8), Empty }
+            struct S { value: Wrapper }
+            struct E { value: Choice }
+            fn generic<T>(x: T) -> T { x }
+            fn target_s(_: S) {}
+            fn target_e(_: E) {}
+            fn probe(p: *const u8) {
+                consume(S { value: Wrapper(1u8) });
+                consume(E { value: Choice::Value(1u8) });
+                consume(E { value: Choice::Empty });
+                unsafe {
+                    consume(S { value: Wrapper(2u8) });
+                    consume(E { value: Choice::Value(2u8) });
+                    consume(E { value: generic(Choice::Empty) });
+                    consume(S { value: Wrapper(*p) });
+                    consume(E { value: Choice::Value(*p) });
+                }
+            }
+        "#;
+        with_external_nominal_context(&[model_argument_layout_pack()], source, "", |context| {
+            let parsed = context
+                .sources
+                .source(context.analyzer, context.file)
+                .unwrap();
+            for (text, ty, success) in [
+                ("S { value: Wrapper(1u8) }", "S", true),
+                ("E { value: Choice::Value(1u8) }", "E", true),
+                ("E { value: Choice::Empty }", "E", true),
+                ("S { value: Wrapper(2u8) }", "S", true),
+                ("E { value: Choice::Value(2u8) }", "E", true),
+                ("E { value: generic(Choice::Empty) }", "E", true),
+                ("S { value: Wrapper(*p) }", "S", false),
+                ("E { value: Choice::Value(*p) }", "E", false),
+            ] {
+                let start = source.find(text).unwrap();
+                let actual = parsed
+                    .tree
+                    .root_node()
+                    .named_descendant_for_byte_range(start, start + text.len())
+                    .unwrap();
+                let spelling = format!("_: {ty}");
+                let start = source.find(&spelling).unwrap();
+                let formal = parsed
+                    .tree
+                    .root_node()
+                    .named_descendant_for_byte_range(start, start + spelling.len())
+                    .unwrap();
+                let result = CALL_ARGUMENT_CONVERSION_PROVER.prove_argument(
+                    context.analyzer,
+                    context.sources,
+                    context.file,
+                    actual,
+                    source,
+                    context.file,
+                    formal,
+                    source,
+                );
+                if success {
+                    let proof = result.unwrap_or_else(|reason| panic!("{text}: {reason:?}"));
+                    assert_eq!(proof.kind, ConversionKind::RustIdentity, "{text}");
+                } else {
+                    assert_eq!(
+                        result,
+                        Err(ConversionUnknown::UnsupportedExpression),
+                        "{text}"
+                    );
+                }
+            }
+        });
+    }
+
+    fn model_argument_layout_pack() -> serde_json::Value {
+        let mut pack = named_model_regression_pack();
+        let types = pack["shards"][0]["payload"]["types"]
+            .as_array_mut()
+            .unwrap();
+        for (id, name, kind) in [
+            ("core", "core", "module"),
+            ("alloc", "core.alloc", "module"),
+            ("layout", "core.alloc.layout", "module"),
+            ("layout-type", "core.alloc.layout.Layout", "struct"),
+        ] {
+            types.push(serde_json::json!({
+                "id":id,"name":name,"type_kind":kind,"visibility":"public",
+                "locator":{"kind":"artifact","path":"fixture/core.rs","symbol":name}
+            }));
+        }
+        pack
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11778: structured Rust model arguments fell through to unsupported conversion"
+    )]
+    fn model_argument_layout_identity_and_unproven_references() {
+        use crate::analyzer::semantic_model::TypeRef;
+        let pack = model_argument_layout_pack();
+        for source in [
+            "fn probe(layout: core::alloc::layout::Layout) { consume(layout); }",
+            "fn probe(layout: core::alloc::layout::Layout) { vec![consume(layout)]; }",
+            "fn probe(layout: core::alloc::layout::Layout) { consume(layout); consume(layout); consume(layout); }",
+        ] {
+            with_external_nominal_context(std::slice::from_ref(&pack), source, "", |context| {
+                let start = source.rfind("layout").unwrap();
+                let caller_parse = context
+                    .sources
+                    .source(context.analyzer, context.file)
+                    .unwrap();
+                let actual = caller_parse
+                    .tree_for_range(start, start + 6)
+                    .unwrap()
+                    .root_node()
+                    .named_descendant_for_byte_range(start, start + 6)
+                    .unwrap();
+                let prove = |formal: &TypeRef| {
+                    CALL_ARGUMENT_CONVERSION_PROVER.prove_model_argument(
+                        context.analyzer,
+                        context.file,
+                        actual,
+                        source,
+                        formal,
+                    )
+                };
+                let layout = TypeRef::named("core.alloc.layout.Layout");
+                let proof = prove(&layout).unwrap();
+                assert_eq!(proof.kind, ConversionKind::RustIdentity);
+                assert_eq!(proof.source, proof.target);
+                let query_cache = CallConversionCache::default();
+                let budget =
+                    brokk_bifrost_core::retention_budget::RetentionBudget::new(16 * 1024 * 1024);
+                let indexes =
+                    brokk_bifrost_analysis::analyzer::lexical_definitions::lexical_index_cache(
+                        &budget,
+                    );
+                let shared = query_cache.indexed_context(indexes);
+                let mut initial_scope_builds = None;
+                for (call_start, _) in source.match_indices("consume(layout)") {
+                    let start = call_start + "consume(".len();
+                    let actual = caller_parse
+                        .tree_for_range(start, start + 6)
+                        .unwrap()
+                        .root_node()
+                        .named_descendant_for_byte_range(start, start + 6)
+                        .unwrap();
+                    let shared_proof = CALL_ARGUMENT_CONVERSION_PROVER
+                        .prove_model_argument_with_context(
+                            context.analyzer,
+                            &shared,
+                            context.file,
+                            actual,
+                            source,
+                            &layout,
+                        );
+                    assert_eq!(
+                        shared_proof,
+                        CALL_ARGUMENT_CONVERSION_PROVER.prove_model_argument(
+                            context.analyzer,
+                            context.file,
+                            actual,
+                            source,
+                            &layout,
+                        )
+                    );
+                    use brokk_bifrost_analysis::analyzer::usages::call_conversion::ModelArgumentApplicability;
+                    let ModelArgumentApplicability::Applicable(applicable) =
+                        CALL_ARGUMENT_CONVERSION_PROVER.model_argument_applicability_with_context(
+                            context.analyzer,
+                            &shared,
+                            context.file,
+                            actual,
+                            source,
+                            &layout,
+                        )
+                    else {
+                        panic!("identity must be applicable")
+                    };
+                    assert_eq!(Ok(*applicable), shared_proof);
+                    assert_eq!(query_cache.source_builds(), 1);
+                    if !source.contains("vec!") {
+                        let builds = query_cache
+                            .lexical_work(context.analyzer, context.file)
+                            .scope_builds;
+                        assert!(builds > 0);
+                        assert_eq!(*initial_scope_builds.get_or_insert(builds), builds);
+                    }
+                }
+
+                let mut deep = TypeRef::named("u8");
+                for _ in 0..=MAX_TYPE_DEPTH {
+                    deep = TypeRef::Named {
+                        name: "model.Boxed".into(),
+                        arguments: vec![deep],
+                        nullable: false,
+                    };
+                }
+                assert_eq!(prove(&deep), Err(ConversionUnknown::BudgetExhausted));
+                // Neither &T nor &mut T can be distinguished by ByRef. Dealloc's
+                // historical ByRef(u8) pointer formal is equally unproven.
+                for formal in [
+                    TypeRef::ByRef {
+                        element: Box::new(layout),
+                        reference_kind: Default::default(),
+                    },
+                    TypeRef::ByRef {
+                        element: Box::new(TypeRef::named("u8")),
+                        reference_kind: Default::default(),
+                    },
+                    TypeRef::Pointer {
+                        element: Box::new(TypeRef::named("u8")),
+                    },
+                ] {
+                    assert_eq!(
+                        prove(&formal),
+                        Err(ConversionUnknown::UnsupportedConversion)
+                    );
+                }
+            });
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11778: production model conversion paths rebuilt lexical scopes for distinct actuals"
+    )]
+    fn production_model_paths_share_source_and_lexical_indexes() {
+        use crate::analyzer::semantic_model::Signature;
+        use brokk_bifrost_analysis::analyzer::lexical_definitions::{
+            FormalParameterLayout, FormalParameterSlot,
+        };
+        use brokk_bifrost_analysis::analyzer::usages::{
+            call_binding::*, call_shape::call_shapes_in_file,
+        };
+        let source = "fn probe(a: core::alloc::layout::Layout, b: core::alloc::layout::Layout, c: core::alloc::layout::Layout) { consume(a); consume(b); consume(c); }";
+        let pack = model_argument_layout_pack();
+        with_external_nominal_context(&[pack], source, "", |context| {
+            let facts = brokk_bifrost_analysis::analyzer::structural::extract::extract_file_facts(
+                &brokk_bifrost_rust::structural::RUST_STRUCTURAL_SPEC,
+                &tree_sitter_rust::LANGUAGE.into(),
+                source,
+            )
+            .unwrap();
+            let shapes = call_shapes_in_file(&facts, context.file, 10);
+            assert_eq!(shapes.len(), 3);
+            let signature: Signature = serde_json::from_value(serde_json::json!({
+                "parameters":[{"name":"layout","type":{"kind":"named","name":"core.alloc.layout.Layout"}}]
+            })).unwrap();
+            let cache = CallConversionCache::default();
+            let mut scope_builds = None;
+            for shape in shapes {
+                let selected = cache
+                    .select_model_signature(
+                        context.analyzer,
+                        &shape,
+                        None,
+                        &[("consume".into(), signature.clone())],
+                    )
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(selected.0, "consume");
+                assert!(
+                    !cache
+                        .model_signature_rejects_call(context.analyzer, &shape, None, &signature)
+                        .unwrap()
+                );
+                let layout = FormalParameterLayout {
+                    slots: vec![FormalParameterSlot {
+                        names: vec!["layout".into()],
+                        declaration_range: shape.outcome.range,
+                        receiver: false,
+                        variadic: None,
+                        passing_mode: Default::default(),
+                        default_range: None,
+                    }],
+                    python_binding: None,
+                };
+                let mut report = call_binding_report(
+                    context.analyzer,
+                    context.file,
+                    &shape,
+                    CallBindingTarget::ResolvedExternal {
+                        layout,
+                        receiver: CallReceiverBinding::Absent,
+                    },
+                    None,
+                );
+                cache.populate_model_signature(
+                    context.analyzer,
+                    &mut report,
+                    "consume",
+                    "consume-signature",
+                    &signature,
+                );
+                assert_eq!(report.conversion_facts.len(), 1);
+                assert_eq!(
+                    report.conversion_facts[0].result.as_ref().unwrap().kind,
+                    ConversionKind::RustIdentity
+                );
+                assert_eq!(cache.source_builds(), 1);
+                let builds = cache
+                    .lexical_work(context.analyzer, context.file)
+                    .scope_builds;
+                assert!(builds > 0, "production must use retained lexical indexes");
+                assert_eq!(*scope_builds.get_or_insert(builds), builds);
+            }
+        });
     }
 
     fn with_model_regression_context<R>(
@@ -5002,6 +7826,8 @@ mod tests {
         let cache = CallConversionCache::default();
         let sources = CallConversionContext::reference(&cache);
         run(&RustTypeContext {
+            operation_source: None,
+            selected: None,
             analyzer: &analyzer,
             sources: &sources,
             file: &file,
@@ -5310,6 +8136,160 @@ mod tests {
             }
         });
     }
+    /// A test-only std model: `std::fs::read_to_string(path) ->
+    /// Result<String, std::io::Error>`. `variant` keeps every id distinct so two
+    /// packs can provide the same Rust paths, as two crate versions would.
+    fn std_io_result_pack(variant: &str) -> serde_json::Value {
+        use serde_json::json;
+        let ty = |name: &str, kind: &str, parameters: Vec<&str>| {
+            json!({"id": format!("type.{variant}.{}", name.replace('.', "-").to_ascii_lowercase()), "name": name,
+                "type_kind": kind, "visibility": "public", "type_parameters": parameters,
+                "locator": {"kind": "artifact", "path": "library/std/src/lib.rs", "symbol": name}})
+        };
+        json!({"schema_version": 2, "pack_id": format!("fixture.{variant}"), "version": "1.0.0",
+            "producer": {"name": "test-only", "version": "1.0.0"}, "language": "rust",
+            "ecosystem": "cargo", "compatibility": {"bifrost": "*", "toolchains": []},
+            "provenance": {"source": "test-only external residual error"},
+            "license": "NOASSERTION", "completeness": "complete",
+            "safety": {"generated_code_only": false, "review_required": false},
+            "shards": [{"id": "declarations", "activation": [{"targets": [], "configurations": []}],
+                "payload": {"kind": "declaration_facts",
+                    "types": [ty("std", "module", vec![]), ty("std.io", "module", vec![]),
+                        ty("std.io.Error", "struct", vec![]), ty("std.result", "module", vec![]),
+                        ty("std.result.Result", "enum", vec!["T", "E"]), ty("std.fs", "module", vec![]),
+                        ty("std.string", "module", vec![]), ty("std.string.String", "struct", vec![])],
+                    "members": [{"id": format!("member.{variant}.read-to-string"),
+                        "owner": format!("type.{variant}.std-fs"), "name": "read_to_string",
+                        "member_kind": "method", "visibility": "public", "is_static": true,
+                        "callable_family_complete": true,
+                        "signature": {"parameters": [{"name": "path", "type": {"kind": "named", "name": "untyped"}}],
+                            "returns": {"kind": "named", "name": "std.result.Result", "arguments": [
+                                {"kind": "named", "name": "std.string.String"},
+                                {"kind": "named", "name": "std.io.Error"}]}},
+                        "locator": {"kind": "artifact", "path": "library/std/src/fs.rs",
+                            "symbol": "std.fs.read_to_string"}}],
+                    "relations": []}}]})
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#4967: an unproved Result success type hid an exact modeled residual error"
+    )]
+    fn residual_conversion_compares_external_errors_by_canonical_model_identity() {
+        use brokk_bifrost_analysis::analyzer::{ReadKey, capture_query_reads};
+        let source = "pub struct Local;\nfn external() -> std::result::Result<String, std::io::Error> {\n    let _ = std::fs::read_to_string(\"x\")?;\n    Ok(String::new())\n}\nfn mixed() -> std::result::Result<String, Local> {\n    let _ = std::fs::read_to_string(\"x\")?;\n    Ok(String::new())\n}\n";
+        let (_fixture, analyzer) = super::super::test_support::certified_project(&[
+            (
+                "Cargo.toml",
+                "[package]\nname=\"fixture\"\nversion=\"0.1.0\"\nedition=\"2024\"\n",
+            ),
+            ("src/lib.rs", source),
+        ]);
+        let file = super::super::test_support::analyzed_file(&analyzer, "src/lib.rs");
+        let text: Arc<str> = Arc::from(source);
+        let question = |occurrence: usize| {
+            let needle = "std::fs::read_to_string(\"x\")?";
+            let start = source.match_indices(needle).nth(occurrence).unwrap().0;
+            start..start + needle.len()
+        };
+        let inert = |occurrence: usize| {
+            super::super::std_types::residual_conversion_runs_no_user_code(
+                &analyzer,
+                &file,
+                &text,
+                question(occurrence),
+            )
+        };
+        let models = |reads: &brokk_bifrost_analysis::analyzer::read_ledger::ReadLedger| {
+            reads
+                .keys()
+                .into_iter()
+                .filter(|key| matches!(key, ReadKey::Models(_)))
+                .collect::<Vec<_>>()
+        };
+        // No active model: the external callee's return is unknown.
+        assert!(!inert(0));
+        let pack = std_io_result_pack("std-io-result");
+        activate_model_packs(&analyzer, std::slice::from_ref(&pack));
+        let (external, active_reads) = capture_query_reads(&analyzer, || inert(0));
+        assert!(
+            external,
+            "equal canonical model errors are an identity conversion"
+        );
+        assert!(
+            !models(&active_reads).is_empty(),
+            "the model lookup is a recorded read"
+        );
+        assert!(
+            !inert(1),
+            "a workspace error against a model error stays open"
+        );
+        // The success argument is irrelevant to the residual conversion.
+        // ByRef deliberately has no complete canonical conversion because the
+        // model cannot distinguish shared from mutable Rust references.
+        let mut borrowed = pack.clone();
+        borrowed["shards"][0]["payload"]["members"][0]["signature"]["returns"]["arguments"][0] = serde_json::json!({"kind": "by_ref", "element": {"kind": "named", "name": "core.primitive.str"}});
+        activate_model_packs(&analyzer, &[borrowed]);
+        {
+            let scope = AnalyzerQueryScope::capturing_read_incompleteness(&analyzer);
+            assert!(inert(0), "only the Result error argument must be exact");
+            assert!(
+                scope.captured_read_incompleteness().is_empty(),
+                "an irrelevant success component must not publish its refusal: {:?}",
+                scope.captured_read_incompleteness()
+            );
+        }
+        // A recorded type name cannot establish which version of a different
+        // package it means. Both the callable and destination remain resolvable,
+        // but moving the error declaration to another provider refuses proof.
+        let mut callee_pack = pack.clone();
+        let error = callee_pack["shards"][0]["payload"]["types"]
+            .as_array_mut()
+            .unwrap()
+            .remove(2);
+        let mut error_pack = pack.clone();
+        error_pack["pack_id"] = serde_json::json!("fixture.std-io-error-provider");
+        error_pack["shards"][0]["payload"]["types"] = serde_json::json!([error]);
+        error_pack["shards"][0]["payload"]["members"] = serde_json::json!([]);
+        activate_model_packs(&analyzer, &[callee_pack, error_pack]);
+        assert!(!inert(0), "a cross-provider error name stays unproven");
+        // A second provider of the same Rust paths, as two crate versions would
+        // be, leaves the model selection ambiguous on the same warm analyzer.
+        activate_model_packs(
+            &analyzer,
+            &[pack.clone(), std_io_result_pack("std-io-result-other")],
+        );
+        let (ambiguous, ambiguous_reads) = capture_query_reads(&analyzer, || inert(0));
+        assert!(!ambiguous, "an ambiguous model selection stays open");
+        assert_ne!(models(&active_reads), models(&ambiguous_reads));
+        // Different Cargo versions can publish different declarations under
+        // the same version-free ids; those conflicting facts stay unproven.
+        let mut conflicting = pack.clone();
+        conflicting["pack_id"] = serde_json::json!("fixture.std-io-conflicting-version");
+        conflicting["shards"][0]["payload"]["types"][2]["type_kind"] = serde_json::json!("enum");
+        activate_model_packs(&analyzer, &[pack.clone(), conflicting]);
+        assert!(!inert(0), "conflicting providers of one symbol stay open");
+        let mut equivalent = pack.clone();
+        equivalent["pack_id"] = serde_json::json!("fixture.std-io-equivalent");
+        activate_model_packs(&analyzer, &[pack.clone(), equivalent.clone()]);
+        assert!(inert(0), "equivalent providers can agree on one error");
+        equivalent["shards"][0]["payload"]["types"]
+            .as_array_mut()
+            .unwrap()
+            .remove(2);
+        activate_model_packs(&analyzer, &[pack.clone(), equivalent]);
+        assert!(
+            !inert(0),
+            "every callee provider must also declare the error"
+        );
+        activate_model_packs(&analyzer, &[pack]);
+        assert!(inert(0), "restoring one provider restores the proof");
+        activate_model_packs(&analyzer, &[]);
+        let (removed, removed_reads) = capture_query_reads(&analyzer, || inert(0));
+        assert!(!removed, "removing the pack invalidates the warm proof");
+        assert_ne!(models(&active_reads), models(&removed_reads));
+    }
+
     fn activate_model_packs(analyzer: &dyn IAnalyzer, packs: &[serde_json::Value]) {
         use brokk_bifrost_analysis::analyzer::semantic_model::*;
         let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
@@ -5830,12 +8810,154 @@ mod tests {
         let cache = CallConversionCache::default();
         let sources = CallConversionContext::reference(&cache);
         run(&RustTypeContext {
+            operation_source: None,
+            selected: None,
             analyzer: &analyzer,
             sources: &sources,
             file: &file,
             source,
             root: tree.root_node(),
         })
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11522: top-level clone passed consumed conversion depth as remaining proof allowance"
+    )]
+    fn top_level_clone_conversion_has_no_proof_stop() {
+        let mut pack = serde_json::json!({
+            "schema_version": 19,
+            "pack_id": "fixture.rust-clone-result",
+            "version": "1.0.0",
+            "producer": { "name": "rust-call-conversion-test", "version": "1.0.0" },
+            "language": "rust",
+            "ecosystem": "cargo",
+            "compatibility": { "toolchains": [] },
+            "provenance": { "source": "test-only #11522 clone result" },
+            "license": "NOASSERTION",
+            "completeness": "complete",
+            "safety": { "generated_code_only": false, "review_required": false },
+            "shards": [{
+                "id": "declarations.clone-result",
+                "activation": [{ "targets": [], "configurations": [] }],
+                "payload": {
+                    "kind": "declaration_facts",
+                    "types": [
+                        {
+                            "id": "std", "name": "std", "type_kind": "module",
+                            "visibility": "public",
+                            "locator": { "kind": "artifact", "path": "library/std/src/lib.rs", "symbol": "std" }
+                        },
+                        {
+                            "id": "std-string", "name": "std.string", "type_kind": "module",
+                            "visibility": "public",
+                            "locator": { "kind": "artifact", "path": "library/alloc/src/lib.rs", "symbol": "std.string" }
+                        },
+                        {
+                            "id": "std-string-string", "name": "std.string.String",
+                            "type_kind": "struct", "visibility": "public",
+                            "locator": { "kind": "artifact", "path": "library/alloc/src/string.rs", "symbol": "std.string.String" },
+                            "hierarchy": [{
+                                "hierarchy_kind": "implements",
+                                "target": { "kind": "named", "name": "std.clone.Clone", "arguments": [] }
+                            }],
+                            "implemented_traits_complete": true,
+                            "implemented_traits": [{
+                                "type_parameters": [],
+                                "trait_type": { "kind": "named", "name": "std.clone.Clone", "arguments": [] },
+                                "associated_types": []
+                            }]
+                        },
+                        {
+                            "id": "std-clone", "name": "std.clone", "type_kind": "module",
+                            "visibility": "public",
+                            "locator": { "kind": "artifact", "path": "library/core/src/clone.rs", "symbol": "std.clone" }
+                        },
+                        {
+                            "id": "std-clone-clone", "name": "std.clone.Clone",
+                            "type_kind": "trait", "visibility": "public",
+                            "is_abstract": true, "callable_surface_complete": false,
+                            "locator": { "kind": "artifact", "path": "library/core/src/clone.rs", "symbol": "std.clone.Clone" }
+                        }
+                    ],
+                    "members": [{
+                        "id": "std-clone-clone-clone",
+                        "owner": "std-clone-clone",
+                        "name": "clone",
+                        "member_kind": "method",
+                        "visibility": "public",
+                        "is_static": false,
+                        "is_abstract": true,
+                        "callable_family_complete": true,
+                        "signature": {
+                            "parameters": [],
+                            "returns": { "kind": "type_parameter", "name": "Self" },
+                            "type_parameters": ["Self"]
+                        },
+                        "locator": {
+                            "kind": "artifact",
+                            "path": "library/core/src/clone.rs",
+                            "symbol": "std.clone.Clone.clone"
+                        }
+                    }],
+                    "relations": []
+                }
+            }]
+        });
+        let source = "fn probe(s: String) { s.clone(); }";
+        with_external_nominal_context(std::slice::from_ref(&pack), source, "", |context| {
+            let start = source.find("s.clone()").unwrap();
+            let call = context
+                .root
+                .named_descendant_for_byte_range(start, start + "s.clone()".len())
+                .unwrap();
+            let attempt = super::super::std_types::completed_proof(context.analyzer, None, || {
+                Some(context.call_result_proof(call, 0))
+            });
+            assert!(
+                matches!(
+                    attempt,
+                    super::super::std_types::RustProofAttempt::Complete(Some(Ok(_)))
+                ),
+                "top-level clone must resolve without a proof stop"
+            );
+            assert_eq!(context.call_is_transmute_intrinsic(call, 0), Ok(false));
+        });
+        // #12325: proving the outer Clone selection must not skip evaluating
+        // its receiver's arguments. This test-only factory gives the receiver
+        // a modeled String return independently of the raw-pointer operand.
+        pack["shards"][0]["payload"]["members"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "id": "test-make", "owner": "std-string-string", "name": "test_make",
+                "member_kind": "method", "visibility": "public", "is_static": true,
+                "callable_family_complete": true,
+                "signature": {
+                    "parameters": [{"name": "value", "type": {"kind": "named", "name": "core.primitive.u8", "arguments": []}}],
+                    "returns": {"kind": "named", "name": "std.string.String", "arguments": []},
+                    "type_parameters": []
+                },
+                "locator": {"kind": "artifact", "path": "fixture/string.rs", "symbol": "std.string.String.test_make"}
+            }));
+        let source = "fn probe(p: *const u8) { unsafe { String::test_make(*p).clone(); } }";
+        with_external_nominal_context(&[pack], source, "", |context| {
+            let text = "String::test_make(*p).clone()";
+            let start = source.find(text).unwrap();
+            let call = context
+                .root
+                .named_descendant_for_byte_range(start, start + text.len())
+                .unwrap();
+            assert_eq!(context.call_is_transmute_intrinsic(call, 0), Ok(false));
+            assert_eq!(
+                context.evaluation_performs_unsafe_operation(call, 0),
+                Ok(true)
+            );
+            assert_eq!(
+                context.expression_type(call, 0),
+                Err(ConversionUnknown::UnsupportedExpression)
+            );
+        });
     }
 
     #[test]
@@ -5931,6 +9053,51 @@ mod tests {
                 assert!(context.type_from_node(node, 0).is_err());
             },
         );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11594: std.env macro alias prevented module owner selection"
+    )]
+    fn path_owner_namespace_preserves_macro_and_module_conflicts() {
+        use brokk_bifrost_analysis::analyzer::semantic_model::overlay::{
+            SemanticModelNamespace, SemanticModelOverlayDisposition,
+        };
+        let mut pack = external_nominal_pack();
+        let payload = &mut pack["shards"][0]["payload"];
+        payload["types"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "id":"std","name":"std","type_kind":"module","visibility":"public",
+                "locator":{"kind":"artifact","path":"fixture/external.rs","symbol":"std"}
+            }));
+        payload["types"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "id":"std-env","name":"std.env","type_kind":"module","visibility":"public",
+                "locator":{"kind":"artifact","path":"fixture/external.rs","symbol":"std.env"}
+            }));
+        payload["members"] = serde_json::json!([{
+            "id":"std-env-macro","owner":"std","name":"env","member_kind":"macro","visibility":"public",
+            "locator":{"kind":"artifact","path":"fixture/external.rs","symbol":"std.env"}
+        }]);
+        with_external_nominal_context(&[pack], "fn probe() {}", "cbc=\"0.1\"\n", |context| {
+            let snapshot = context.analyzer.active_semantic_model_snapshot().unwrap();
+            let overlay = snapshot.semantic_model_overlay().unwrap();
+            let crates = super::super::crate_identity::RustOverlayCrates::new(Some(overlay));
+            assert_eq!(crates.referenceable_owner("std.env").unwrap().id, "std-env");
+            let all =
+                overlay.symbols_named_in_family("std.env", "rust", SemanticModelNamespace::Unknown);
+            assert_eq!(all.disposition, SemanticModelOverlayDisposition::Conflict);
+            assert!(
+                all.records
+                    .iter()
+                    .any(|symbol| symbol.id == "std-env-macro")
+            );
+            assert!(crates.referenceable_symbol("std.env").is_none());
+        });
     }
 
     #[test]

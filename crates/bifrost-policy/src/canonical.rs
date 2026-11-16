@@ -258,12 +258,7 @@ fn policy_selector_paths(definition: &PolicyDefinition) -> HashSet<String> {
                     .events
                     .iter()
                     .filter(|event| matches!(event.trigger, TypestateEventTrigger::Calls { .. }))
-                    .map(|event| {
-                        format!(
-                            "/analysis/automaton/events/{}/calls/selector",
-                            json_pointer_segment(event.id.as_str())
-                        )
-                    }),
+                    .map(|event| typestate_event_selector_path(&event.id)),
             );
         }
         PolicyAnalysis::Assertion { spec } => {
@@ -1703,7 +1698,13 @@ pub(crate) fn endpoint_binding_to_json(binding: &PolicyEndpointBinding) -> Value
     match binding {
         PolicyEndpointBinding::MatchedValue => binding_tag_to_json("matched_value"),
         PolicyEndpointBinding::Receiver => binding_tag_to_json("receiver"),
-        PolicyEndpointBinding::ReturnValue => binding_tag_to_json("return_value"),
+        PolicyEndpointBinding::ReturnValue { path } => {
+            let mut value = binding_tag_to_json("return_value");
+            if let Some(path) = path {
+                value["path"] = json!(path);
+            }
+            value
+        }
         PolicyEndpointBinding::ResultIndex { index } => {
             binding_index_to_json("result_index", *index)
         }
@@ -2013,7 +2014,13 @@ pub(crate) fn policy_port_to_json(port: &PolicyPort) -> Value {
     match port {
         PolicyPort::MatchedValue => binding_tag_to_json("matched_value"),
         PolicyPort::Receiver => binding_tag_to_json("receiver"),
-        PolicyPort::ReturnValue => binding_tag_to_json("return_value"),
+        PolicyPort::ReturnValue { path } => {
+            let mut value = binding_tag_to_json("return_value");
+            if let Some(path) = path {
+                value["path"] = json!(path);
+            }
+            value
+        }
         PolicyPort::ResultIndex { index } => binding_index_to_json("result_index", *index),
         PolicyPort::ArgumentIndex { index } => binding_index_to_json("argument_index", *index),
         PolicyPort::ArgumentName { name } => binding_name_to_json("argument_name", name),
@@ -3354,7 +3361,7 @@ mod tests {
             }))
         );
         assert_eq!(
-            policy_port_to_json(&PolicyPort::ReturnValue),
+            policy_port_to_json(&PolicyPort::ReturnValue { path: None }),
             json!({ "type": "return_value" })
         );
         assert!(matches!(
@@ -3783,7 +3790,8 @@ mod tests {
     /// what tells a future reader which key moved.
     #[test]
     fn an_existing_relational_document_projects_byte_identical_canonical_json() {
-        let source = relational_policy(LEGACY_PLAN);
+        let source =
+            relational_policy(LEGACY_PLAN).replacen("(policy", "(policy :schema-version 1", 1);
         // Both values were read from the projection as it stood before the
         // filter, project, and extended predicate constructs existed.
         assert_eq!(
@@ -3938,7 +3946,11 @@ mod tests {
     fn the_origin_shape_record_is_hash_sensitive_and_leaves_other_documents_alone() {
         // Pinned before the record existed: a document that uses none of the
         // new vocabulary must project exactly the bytes it always projected.
-        let untouched = origin_shape_policy(PRE_ORIGIN_SHAPE_ASSERT);
+        let untouched = origin_shape_policy(PRE_ORIGIN_SHAPE_ASSERT).replacen(
+            "(policy",
+            "(policy :schema-version 1",
+            1,
+        );
         assert_eq!(
             canonical_semantic_bytes(&untouched).len(),
             642,

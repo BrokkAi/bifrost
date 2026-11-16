@@ -118,6 +118,7 @@ fn real_collector_root_seeks_have_constant_vm_work_across_history_sizes() {
                 .unwrap();
             }
             state.install(&conn);
+            roots::materialize(&conn).unwrap();
             let plan = conn
                 .prepare(&format!(
                     "EXPLAIN QUERY PLAN {DELETE_ANALYZER_CANDIDATE_SQL}"

@@ -97,6 +97,7 @@ fn loaded_finding_obeys_generation_and_caller_bounds() {
     let analyzer = TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
     let flow_state = brokk_bifrost_flow::FlowWorkspaceState::new();
     let context = PolicyEvaluationContext {
+        acceptance_hint: None,
         analyzer: &analyzer,
         workspace: None,
         flow_state: &flow_state,

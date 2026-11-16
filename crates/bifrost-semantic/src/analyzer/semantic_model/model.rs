@@ -39,8 +39,19 @@ pub const SEMANTIC_MODEL_SCHEMA_VERSION: u32 = 22;
 pub const FENCED_COMPLETENESS_MIN_SCHEMA_VERSION: u32 = 27;
 /// Rust artifact approximation provenance first appears in schema 28.
 pub const RUST_ARTIFACT_APPROXIMATION_MIN_SCHEMA_VERSION: u32 = 28;
-/// Latest supported authored schema, including Rust tuple-field layouts.
-pub const SEMANTIC_MODEL_LATEST_SUPPORTED_SCHEMA_VERSION: u32 = 32;
+/// Latest supported pack schema, including certified Rust API stability.
+pub const SEMANTIC_MODEL_LATEST_SUPPORTED_SCHEMA_VERSION: u32 = 40;
+/// The first schema that admits verified Rust sysroot receipts.
+pub const RUST_SYSROOT_RECEIPT_MIN_SCHEMA_VERSION: u32 = 38;
+/// The first schema in which a Rust trait member's signature may name the
+/// trait's implicit `Self` as a `TypeParameter` (#12733 D1a). A callable's own
+/// generics were already `TypeParameter`s of `Signature::type_parameters`.
+/// Schema 39 is this change's number.
+pub const TRAIT_SELF_SIGNATURE_MIN_SCHEMA_VERSION: u32 = 39;
+/// Typed input and output component paths first appear together in schema 35.
+pub const SUMMARY_ENDPOINT_PROJECTION_MIN_SCHEMA_VERSION: u32 = 35;
+/// Summarized indexed-element endpoint paths first appear in schema 37.
+pub const SUMMARY_ELEMENT_PROJECTION_MIN_SCHEMA_VERSION: u32 = 37;
 /// Tuple-field layouts in authored packs first appear in schema 30.
 pub const TUPLE_FIELD_LAYOUT_MIN_SCHEMA_VERSION: u32 = 30;
 pub const RUST_EXTERNAL_REEXPORTS_MIN_SCHEMA_VERSION: u32 = 29;
@@ -62,7 +73,7 @@ pub const LIFECYCLE_COVERAGE_MIN_SCHEMA_VERSION: u32 = 26;
 /// re-bless that golden with `BIFROST_BLESS=1` in the same change.
 pub const SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[
     2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 26, 27, 28, 29, 30,
-    31, 32,
+    31, 32, 35, 37, 38, 39, 40,
 ];
 /// Explicit unknown type knowledge first appeared in schema nine.
 pub const UNKNOWN_TYPE_MIN_SCHEMA_VERSION: u32 = 9;
@@ -1094,10 +1105,89 @@ pub enum ArtifactExtractionKind {
     CppHeaderSourceSet,
 }
 
+/// Typed provenance asserted by a rustdoc source pin. Assertion is not authority.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RustdocOrigin {
+    #[default]
+    Dependency,
+    ToolchainSysroot {
+        provenance: RustSysrootProvenance,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RustToolchainChannel {
+    Stable,
+    Beta,
+    Nightly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RustdocComponent {
+    RustDocsJsonPreview,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RustToolchainIdentity {
+    /// Exact semver release, including its prerelease (for example 1.100.0-nightly).
+    pub release: String,
+    pub channel: RustToolchainChannel,
+    /// Compiler (build) date. Distribution identity is pinned by archive SHA256
+    /// and archive member, rather than by this date.
+    pub date: String,
+    pub commit: String,
+}
+
+impl RustToolchainIdentity {
+    /// Check metadata consistency; this does not establish archive provenance.
+    pub fn release_channel_is_consistent(&self) -> bool {
+        let Ok(version) = semver::Version::parse(&self.release) else {
+            return false;
+        };
+        match self.channel {
+            RustToolchainChannel::Stable => version.pre.is_empty(),
+            RustToolchainChannel::Nightly => version.pre.as_str() == "nightly",
+            RustToolchainChannel::Beta => {
+                version
+                    .pre
+                    .as_str()
+                    .strip_prefix("beta.")
+                    .is_some_and(|number| {
+                        !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit())
+                    })
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RustSysrootProvenance {
+    pub toolchain: RustToolchainIdentity,
+    pub component: RustdocComponent,
+    pub target: String,
+    pub archive_sha256: String,
+    pub archive_member: String,
+}
+
+/// A production receipt, retained in manifest identity rather than authored input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct VerifiedSysrootReceipt {
+    pub path: String,
+    pub provenance: RustSysrootProvenance,
+}
+
 /// Artifact authority is carried by the production path, never authored JSON.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ArtifactExtraction {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verified_sysroot: Vec<VerifiedSysrootReceipt>,
     pub kind: ArtifactExtractionKind,
     pub inputs: ArtifactExtractionInputs,
 }
@@ -1113,6 +1203,7 @@ impl ArtifactExtraction {
     pub fn single(kind: ArtifactExtractionKind, sha256: &str) -> Self {
         Self {
             kind,
+            verified_sysroot: Vec::new(),
             inputs: ArtifactExtractionInputs::Single {
                 sha256: sha256.to_owned(),
             },
@@ -1122,6 +1213,7 @@ impl ArtifactExtraction {
     pub fn source_set(kind: ArtifactExtractionKind, digest: &str) -> Self {
         Self {
             kind,
+            verified_sysroot: Vec::new(),
             inputs: ArtifactExtractionInputs::SourceSet {
                 digest: digest.to_owned(),
             },
@@ -1662,7 +1754,9 @@ mod compatibility_tests {
 
     use crate::analyzer::semantic_model::model::Compatibility;
 
-    use crate::analyzer::semantic_model::model::SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS;
+    use crate::analyzer::semantic_model::model::{
+        SEMANTIC_MODEL_LATEST_SUPPORTED_SCHEMA_VERSION, SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS,
+    };
     use semver::Version;
 
     #[brokk_bifrost_test_macros::hardwon(
@@ -1736,10 +1830,18 @@ mod compatibility_tests {
         assert!(mixed.validate_for_schema(9).is_err());
         assert!(mixed.validate_for_schema(11).is_err());
         assert!(missing_legacy.matches_engine(11, &engine).unwrap());
+        // The supported set is not contiguous: schema 23-25, 33-34 and 36 are
+        // absent, while 35 (typed input/output
+        // components), 37 (summarized element paths), 38 (verified Rust
+        // sysroot receipts), 39 (trait-member Self signatures), and the latest 40
+        // (certified Rust API stability)
+        // are present. Derive the newest entry from the latest-supported
+        // constant so a stale maximum fails here.
         assert_eq!(
             SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS,
             (2..=22)
-                .chain([26, 27, 28, 29, 30, 31, 32])
+                .chain([26, 27, 28, 29, 30, 31, 32, 35, 37, 38, 39])
+                .chain([SEMANTIC_MODEL_LATEST_SUPPORTED_SCHEMA_VERSION])
                 .collect::<Vec<_>>()
         );
 
@@ -2573,15 +2675,23 @@ pub enum AuthoredSummaryLocationKind {
     Heap,
 }
 
+/// A typed component path shared by authored summary inputs and outputs.
+pub type SummaryEndpointPath = Box<[crate::analyzer::semantic::PatternProjectionStep]>;
+
 #[derive(
     Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
 )]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AuthoredSummaryInput {
-    Receiver {},
+    Receiver {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<SummaryEndpointPath>,
+    },
     Parameter {
         #[schemars(range(max = 65535))]
         ordinal: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<SummaryEndpointPath>,
     },
 }
 
@@ -2590,19 +2700,55 @@ pub enum AuthoredSummaryInput {
 )]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AuthoredSummaryOutput {
-    NormalReturn {},
+    NormalReturn {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<SummaryEndpointPath>,
+    },
     IndexedNormalReturn {
         #[schemars(range(max = 65535))]
         ordinal: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<SummaryEndpointPath>,
     },
-    Receiver {},
+    Receiver {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<SummaryEndpointPath>,
+    },
     Capture {
         location: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<SummaryEndpointPath>,
     },
     Heap {
         location: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<SummaryEndpointPath>,
     },
-    ExceptionalReturn {},
+    ExceptionalReturn {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<SummaryEndpointPath>,
+    },
+}
+
+impl AuthoredSummaryInput {
+    pub fn path(&self) -> Option<&SummaryEndpointPath> {
+        match self {
+            Self::Receiver { path } | Self::Parameter { path, .. } => path.as_ref(),
+        }
+    }
+}
+
+impl AuthoredSummaryOutput {
+    pub fn path(&self) -> Option<&SummaryEndpointPath> {
+        match self {
+            Self::NormalReturn { path }
+            | Self::IndexedNormalReturn { path, .. }
+            | Self::Receiver { path }
+            | Self::Capture { path, .. }
+            | Self::Heap { path, .. }
+            | Self::ExceptionalReturn { path } => path.as_ref(),
+        }
+    }
 }
 
 /// A value identity port on a procedure summary, usable for either an input
@@ -2668,6 +2814,23 @@ pub enum SummaryValueTransferKind {
     },
     Boxing {},
     Unboxing {},
+}
+
+impl SummaryValueTransferKind {
+    /// Whether member paths are preserved. False means no proof, rather than
+    /// proof that contents change; consumers must retain component uncertainty.
+    pub const fn preserves_member_contents(&self) -> bool {
+        match self {
+            Self::Copy {} | Self::AggregateCopy {} | Self::Move { .. } => true,
+            Self::Conversion { preservation } => match preservation {
+                SummaryValuePreservation::Identity => true,
+                SummaryValuePreservation::Preserving
+                | SummaryValuePreservation::Changing
+                | SummaryValuePreservation::Unknown => false,
+            },
+            Self::Boxing {} | Self::Unboxing {} => false,
+        }
+    }
 }
 
 #[derive(
@@ -3187,6 +3350,9 @@ pub struct TypeFact {
     pub extension_surfaces: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guard: Option<DeclarationGuard>,
+    /// Effective regular Rust API stability, certified by the native rustdoc producer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rust_stability: Option<RustStability>,
     pub locator: Locator,
 }
 
@@ -3255,16 +3421,19 @@ pub enum GenericParameterDefault {
     Const { value: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AssociatedTypeBinding {
     pub name: String,
     pub r#type: TypeRef,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ImplementedTraitFact {
+    /// Effective stability of this exact Rust implementation, certified by rustdoc.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rust_stability: Option<RustStability>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_negative: bool,
     /// Impl-local binders, separate from the declaration owner's binders.
@@ -3282,7 +3451,7 @@ pub struct ImplementedTraitFact {
 
 /// Rust impl patterns, including blanket parameters and reference mutability.
 /// Built-in shapes use a structured TypeRef constructor owner with no arguments.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RustSelfPattern {
     Parameter {
@@ -3298,7 +3467,66 @@ pub enum RustSelfPattern {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+impl RustSelfPattern {
+    /// Bind a structured impl target using the caller's authoritative owner lookup.
+    /// True establishes applicability, false proves a mismatch, and None keeps
+    /// unknown or conflicting substitutions unproven.
+    pub fn bind_type_arguments(
+        &self,
+        actual: &TypeRef,
+        bindings: &mut std::collections::HashMap<String, TypeRef>,
+        mut same_owner: impl FnMut(&TypeRef, &TypeRef) -> Option<bool>,
+    ) -> Option<bool> {
+        let mut pending = vec![(actual, self)];
+        let mut unproven = false;
+        while let Some((actual, pattern)) = pending.pop() {
+            match pattern {
+                Self::Parameter { name } => {
+                    if let Some(old) = bindings.get(name) {
+                        if actual.contains_unknown() || old.contains_unknown() {
+                            unproven = true;
+                        } else if old != actual {
+                            if same_owner(actual, old) == Some(false) {
+                                return Some(false);
+                            }
+                            unproven = true;
+                        }
+                    } else {
+                        bindings.insert(name.clone(), actual.clone());
+                    }
+                }
+                Self::Constructor { owner, arguments } => {
+                    match same_owner(actual, owner) {
+                        Some(false) => return Some(false),
+                        None => {
+                            unproven = true;
+                            continue;
+                        }
+                        Some(true) => {}
+                    }
+                    let actual_arguments = match actual {
+                        TypeRef::Named { arguments, .. } | TypeRef::Declared { arguments, .. } => {
+                            arguments.as_slice()
+                        }
+                        TypeRef::Slice { element } => std::slice::from_ref(element.as_ref()),
+                        _ => {
+                            unproven = true;
+                            continue;
+                        }
+                    };
+                    if actual_arguments.len() != arguments.len() {
+                        return Some(false);
+                    }
+                    pending.extend(actual_arguments.iter().zip(arguments));
+                }
+                Self::Reference { .. } => unproven = true,
+            }
+        }
+        (!unproven).then_some(true)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GenericTraitBound {
     /// A parameter or an associated projection such as P::Target for Pin<P>.
@@ -3365,13 +3593,23 @@ pub fn provably_does_not_implement(
         positive_possible |= !fact.is_negative && applicable != Some(false);
     }
     for rule in &trait_.generic_trait_impls {
+        if rule.implementation.trait_type == TypeRef::Unknown {
+            positive_possible = true;
+            continue;
+        }
         let applicable = rule_applicability(rule);
         if rule.implementation.is_negative && applicable == Some(true) {
             return true;
         }
         positive_possible |= !rule.implementation.is_negative && applicable != Some(false);
     }
-    owner.implemented_traits_complete && trait_.generic_trait_impls_complete && !positive_possible
+    owner.implemented_traits_complete
+        && trait_.generic_trait_impls_complete
+        && !owner
+            .implemented_traits
+            .iter()
+            .any(|fact| fact.trait_type == TypeRef::Unknown)
+        && !positive_possible
 }
 
 /// Whether an implementation outside the selected artifact evidence may apply.
@@ -3835,6 +4073,8 @@ pub struct MemberFact {
     /// The authored declarations contain every callable with this member's
     /// exact owner, name, receiver form, and declared arity.
     ///
+    /// Generic substitutions, conversion implementations, and effects are not covered.
+    ///
     /// This is narrower than pack or owner-surface completeness. It permits
     /// an exact external-call binding for this one structural family while a
     /// curated declaration pack remains globally partial. Same-family
@@ -3860,6 +4100,9 @@ pub struct MemberFact {
     pub aliases: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guard: Option<DeclarationGuard>,
+    /// Effective regular Rust API stability, certified by the native rustdoc producer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rust_stability: Option<RustStability>,
     pub locator: Locator,
 }
 
@@ -3982,7 +4225,7 @@ pub struct DeclarationGuard {
 /// one comparable shape, and comparing only the three release components keeps
 /// a pre-release toolchain on the same side of a bound as its release.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
 )]
 #[serde(deny_unknown_fields)]
 pub struct GuardVersion {
@@ -4402,6 +4645,111 @@ pub enum TypeRef {
 }
 
 impl TypeRef {
+    /// Deep owned type payload using only prepaid iterative traversal storage.
+    /// The enclosing value or collection pays this type's inline storage.
+    #[doc(hidden)]
+    pub fn retained_allocations(
+        &self,
+        census: &mut impl crate::analyzer::semantic::service::ArtifactRetentionVisitor,
+    ) {
+        use crate::analyzer::semantic::service::RetentionScratch;
+        let mut pending = RetentionScratch::default();
+        pending.push(self, census);
+        while !census.is_refused() {
+            let Some(ty) = pending.pop() else {
+                break;
+            };
+            match ty {
+                Self::Unknown => {}
+                Self::Projection {
+                    owner,
+                    trait_type,
+                    name,
+                    arguments,
+                } => {
+                    census.owned_string(name);
+                    if census.owned_box(owner.as_ref()) {
+                        pending.push(owner.as_ref(), census);
+                    }
+                    if let Some(trait_type) = trait_type
+                        && census.owned_box(trait_type.as_ref())
+                    {
+                        pending.push(trait_type.as_ref(), census);
+                    }
+                    if census.owned_vec(arguments) {
+                        pending.extend(arguments, census);
+                    }
+                }
+                Self::Named {
+                    name, arguments, ..
+                } => {
+                    census.owned_string(name);
+                    if census.owned_vec(arguments) {
+                        pending.extend(arguments, census);
+                    }
+                }
+                Self::Declared { id, arguments, .. } => {
+                    census.owned_string(id);
+                    if census.owned_vec(arguments) {
+                        pending.extend(arguments, census);
+                    }
+                }
+                Self::TypeParameter { name } => census.owned_string(name),
+                Self::Array { element }
+                | Self::ByRef { element, .. }
+                | Self::Pointer { element }
+                | Self::Slice { element }
+                | Self::Channel { element, .. } => {
+                    if census.owned_box(element.as_ref()) {
+                        pending.push(element.as_ref(), census);
+                    }
+                }
+                Self::FixedArray { element, length } => {
+                    census.owned_string(length);
+                    if census.owned_box(element.as_ref()) {
+                        pending.push(element.as_ref(), census);
+                    }
+                }
+                Self::Map { key, value } => {
+                    if census.owned_box(key.as_ref()) {
+                        pending.push(key.as_ref(), census);
+                    }
+                    if census.owned_box(value.as_ref()) {
+                        pending.push(value.as_ref(), census);
+                    }
+                }
+                Self::Wildcard { bound, .. } => {
+                    if let Some(bound) = bound
+                        && census.owned_box(bound.as_ref())
+                    {
+                        pending.push(bound.as_ref(), census);
+                    }
+                }
+                Self::Tuple { elements } => {
+                    if census.owned_vec(elements) {
+                        pending.extend(elements, census);
+                    }
+                }
+                Self::Function { parameters, result } => {
+                    if census.owned_vec(parameters) {
+                        for parameter in parameters {
+                            if let Some(name) = &parameter.name {
+                                census.owned_string(name);
+                            }
+                            pending.push(&parameter.r#type, census);
+                        }
+                    }
+                    if let Some(result) = result
+                        && census.owned_box(result.as_ref())
+                    {
+                        pending.push(result.as_ref(), census);
+                    }
+                }
+            }
+        }
+        pending.release(census);
+    }
+
     /// Substitute type variables simultaneously. An unbound variable leaves
     /// the result unknown to the caller.
     pub fn substitute(
@@ -4987,3 +5335,43 @@ pub struct GoPinnedPackage {
     pub name: String,
     pub files: Vec<String>,
 }
+
+/// Effective regular API stability; const stability is a separate contract.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RustStability {
+    Stable {
+        since: GuardVersion,
+    },
+    /// One sufficient set of feature gates, sorted and deduplicated.
+    Unstable {
+        #[serde(deserialize_with = "deserialize_stability_features")]
+        features: Vec<String>,
+    },
+    Uncertified,
+}
+
+impl RustStability {
+    /// Construct a canonical, non-empty sufficient feature set.
+    pub fn unstable(features: Vec<String>) -> Self {
+        assert!(!features.is_empty());
+        assert!(features.windows(2).all(|pair| pair[0] < pair[1]));
+        Self::Unstable { features }
+    }
+}
+
+fn deserialize_stability_features<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let features = Vec::<String>::deserialize(deserializer)?;
+    if features.is_empty() || !features.windows(2).all(|pair| pair[0] < pair[1]) {
+        return Err(serde::de::Error::custom(
+            "stability features must be non-empty, sorted and unique",
+        ));
+    }
+    Ok(features)
+}
+
+/// First schema carrying native rustdoc effective stability certificates.
+pub const RUST_STABILITY_MIN_SCHEMA_VERSION: u32 = 40;

@@ -56,7 +56,6 @@ use crate::analyzer::resolution::LoweredRustReferenceContext;
 use crate::analyzer::resolution::LoweredSupertypeProperty;
 use crate::analyzer::resolution::LoweredTypeArgument;
 use crate::analyzer::resolution::LoweredTypeComponent;
-use crate::analyzer::resolution::LoweredTypeProduction;
 use crate::analyzer::resolution::LoweredTypeTransfer;
 use crate::analyzer::resolution::LoweredTypedFrontier;
 use crate::analyzer::resolution::LoweredUnderlyingType;
@@ -84,6 +83,7 @@ use crate::analyzer::resolution::TypedFactRequest;
 use crate::analyzer::resolution::language_identity_domain;
 use crate::analyzer::resolution::language_type_qualifiers_search_companion_members;
 use crate::analyzer::resolution::{CompanionTypeRelation, JvmAliasProperty};
+use crate::analyzer::resolution::{LoweredBinaryOperation, LoweredTypeProduction};
 
 use super::resolution::TypedFactRelation;
 use super::resolution::json_array;
@@ -148,6 +148,7 @@ CROSS JOIN temp.selected_resolution_mounts AS target_mount
  ON target_mount.blob_id=impl_member.blob_id
 AND target_mount.persisted_relative_path=impl_member.rel_path
 AND target_mount.storage_language='rust'
+-- Rust-only derived-from blob until #11183 M3 converts Rust child rows
 CROSS JOIN source_rust_item_body_children AS child
  ON child.blob_id=impl_member.blob_id AND child.owner_declaration_id=subject.impl_declaration_id
 CROSS JOIN resolution_rust_declaration_authorities AS target
@@ -290,6 +291,22 @@ pub trait SelectedImplicitInputProvider {
         cancellation: &CancellationToken,
     ) -> StoreResult<()>;
 
+    fn workspace_module_may_shadow(
+        &self,
+        _name: &str,
+        _cancellation: &CancellationToken,
+    ) -> StoreResult<bool> {
+        Ok(true)
+    }
+
+    fn implicit_generic_factory_preserved(
+        &self,
+        _factory: Option<SemanticId>,
+        _cancellation: &CancellationToken,
+    ) -> StoreResult<bool> {
+        Ok(false)
+    }
+
     fn read_inputs(
         &self,
         language: Language,
@@ -302,6 +319,17 @@ pub trait SelectedImplicitInputProvider {
 #[doc(hidden)]
 pub struct SelectedResolutionTypedSource<'selection, 'store> {
     selection: &'selection SelectedResolutionMountInventory<'store>,
+    binding_cache: Option<&'selection super::cache_budget::StoreCacheBudget>,
+    base_guard_bindings: std::cell::RefCell<
+        HashMap<
+            i64,
+            brokk_bifrost_core::retention_budget::BudgetedValue<
+                super::python_binding_rows::PythonBindingRows,
+            >,
+        >,
+    >,
+    // Selected mutation inputs, bounded by the held operation's work callback.
+    base_guard_mutations: std::cell::RefCell<HashMap<Vec<String>, Option<Vec<SemanticId>>>>,
     implicit_environment: Option<i64>,
     implicit_language_version: Option<(u16, u16)>,
     // Memo authority: keyed by class owner only. Lifetime is this typed source,
@@ -324,6 +352,9 @@ pub struct SelectedResolutionTypedSource<'selection, 'store> {
     external_models:
         Option<std::sync::Arc<crate::analyzer::semantic_model::ResolvedActiveSemanticModels>>,
     go_context_binder: Option<&'selection dyn GoDefinitionContextBinder>,
+    type_heads: Option<&'selection dyn super::language_support::SelectedTypeHeadSource>,
+    binary_operation_type_provider:
+        Option<&'selection dyn super::language_support::BinaryOperationTypeProvider>,
     go_owner_proofs: std::cell::RefCell<go_members::OwnerProofMemo>,
     external_signatures: std::cell::RefCell<external_owners::ExternalSignatureMemo>,
     // Dropped with this operation. Completed scalar owner-index reads are cached
@@ -428,6 +459,7 @@ mod implicit_inputs_memo_tests {
             ) -> StoreResult<Option<ImplicitBaseInputs>> {
                 self.reads.set(self.reads.get() + 1);
                 Ok(Some(ImplicitBaseInputs {
+                    base_preservation: None,
                     written_inventory_complete: true,
                     written_base_count: 0,
                     creation: ClassCreationKind::Ordinary,
@@ -518,6 +550,7 @@ mod implicit_inputs_memo_tests {
                 ResolutionCompletion::Complete
             };
             let expected = ImplicitBaseInputs {
+                base_preservation: None,
                 written_inventory_complete: true,
                 written_base_count: 0,
                 creation: ClassCreationKind::Ordinary,
@@ -543,6 +576,7 @@ mod implicit_inputs_memo_tests {
 
         let stopped_owner = SemanticId::for_test("implicit-stopped");
         let stopped = ImplicitBaseInputs {
+            base_preservation: None,
             written_inventory_complete: false,
             written_base_count: 0,
             creation: ClassCreationKind::Unknown,
@@ -625,6 +659,9 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
     ) -> Self {
         Self {
             selection,
+            binding_cache: None,
+            base_guard_bindings: Default::default(),
+            base_guard_mutations: Default::default(),
             implicit_environment: None,
             implicit_language_version: None,
             implicit_inputs: Default::default(),
@@ -639,6 +676,8 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
             model_authority: None,
             external_models: None,
             go_context_binder: None,
+            type_heads: None,
+            binary_operation_type_provider: None,
             go_owner_proofs: Default::default(),
             external_signatures: Default::default(),
             intrinsic_owner_indexed: Default::default(),
@@ -648,6 +687,15 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
                 .map(|(language, _, provider)| (language.clone(), provider()))
                 .collect(),
         }
+    }
+
+    pub(super) fn with_binding_cache(
+        mut self,
+        cache: &'selection super::cache_budget::StoreCacheBudget,
+    ) -> Self {
+        assert!(self.binding_cache.is_none());
+        self.binding_cache = Some(cache);
+        self
     }
 
     /// A dormant caller supplies its exact selected environment publication.
@@ -768,6 +816,15 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
         self.external_provider_families.get(provider) == Some(&ExternalProviderFamily::Jvm)
     }
 
+    pub(super) fn with_type_heads(
+        mut self,
+        heads: &'selection dyn super::language_support::SelectedTypeHeadSource,
+        provider: Option<&'selection dyn super::language_support::BinaryOperationTypeProvider>,
+    ) -> Self {
+        self.type_heads = Some(heads);
+        self.binary_operation_type_provider = provider;
+        self
+    }
     pub(super) fn with_go_context_binder(
         mut self,
         binder: &'selection dyn GoDefinitionContextBinder,
@@ -1200,6 +1257,102 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
                 );
             }
             Ok(Some(JvmHierarchyCandidateRows { parents, aliases }))
+        })
+    }
+
+    pub(super) fn rust_macro_invocations(
+        &self,
+        question: &crate::analyzer::read_ledger::LookupQuestion,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<super::rust_macro_invocations::RustMacroInvocationsAnswer>> {
+        if !self.validate_selected_interiors(cancellation)? {
+            return Ok(None);
+        }
+        self.read_statement(cancellation, |conn| {
+            super::rust_macro_invocations::read(conn, question).map(Some)
+        })
+    }
+
+    pub(super) fn own_rust_inventory_macro_gaps(
+        &self,
+        detail: &str,
+        semantic: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<super::resolution_operation::SelectedRustMacroExpansionGap>>> {
+        use super::resolution_operation::SelectedRustMacroExpansionGap;
+        if !self.validate_selected_interiors(cancellation)? {
+            return Ok(None);
+        }
+        self.read_statement(cancellation, |conn| {
+    let mut statement = conn.prepare_cached(
+        "SELECT evidence.value ->> '$.reason', evidence.value ->> '$.macro',
+                mount.persisted_relative_path, head.start_byte, head.end_byte,
+                (SELECT properties.visibility
+                 FROM source_rust_item_macro_expansions AS expansion
+                 CROSS JOIN source_rust_module_scopes AS scope
+                   ON scope.blob_id=expansion.blob_id
+                 CROSS JOIN source_rust_module_declarations AS module
+                   ON module.blob_id=scope.blob_id AND module.declaration_id=scope.declaration_id
+                 CROSS JOIN source_declarations AS declaration
+                   ON declaration.blob_id=module.blob_id AND declaration.declaration_id=module.declaration_id
+                 CROSS JOIN source_rust_declaration_properties AS properties
+                   ON properties.blob_id=module.blob_id AND properties.declaration_id=module.declaration_id
+                 WHERE expansion.blob_id=evidence.value ->> '$.member_blob'
+                   AND scope.ordinal<>0
+                   AND expansion.invocation_occurrence_id=evidence.value ->> '$.invocation_occurrence'
+                   AND declaration.start_byte<=expansion.invocation_start_byte
+                   AND expansion.invocation_end_byte<=declaration.end_byte
+                 ORDER BY declaration.end_byte-declaration.start_byte
+                 LIMIT 1)
+         FROM json_each(?1, '$.evidence') AS evidence
+         LEFT JOIN source_rust_macro_invocations AS head
+           ON head.blob_id = evidence.value ->> '$.member_blob'
+          AND head.occurrence_id = evidence.value ->> '$.invocation_occurrence'
+         LEFT JOIN temp.selected_resolution_mounts AS mount
+           ON mount.blob_id = head.blob_id AND mount.storage_language = 'rust'",
+    )?;
+    let rows = statement.query_map([detail], |row| {
+        Ok((
+            row.get::<_, Option<String>>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<usize>>(3)?,
+            row.get::<_, Option<usize>>(4)?,
+            row.get::<_, Option<String>>(5)?,
+        ))
+    })?;
+    let mut gaps = Vec::new();
+    for row in rows {
+        let (reason, name, path, start, end, visibility) = row?;
+        if reason.as_deref() != Some("UnsupportedMacroGeneratedModule") {
+            return Ok(Some(Vec::new()));
+        }
+        let Some(macro_name) = name else {
+            return Err(StoreError::missing_required_source_facts(format!(
+                "Rust macro inventory has no macro name: {detail}"
+            )));
+        };
+        // Prepared overlays can publish evidence before invocation facts are
+        // persisted. Missing coordinates retain an unanchored obligation;
+        // they are not an integrity failure or evidence of model coverage.
+        let anchor = match (path, start, end) {
+            (Some(relative_path), Some(start_byte), Some(end_byte)) => {
+                Some(super::resolution_operation::SelectedRustMacroAnchor {
+                    relative_path,
+                    start_byte,
+                    end_byte,
+                })
+            }
+            _ => None,
+        };
+        gaps.push(SelectedRustMacroExpansionGap {
+            semantic,
+            anchor,
+            macro_name,
+            private_module_route: visibility.is_some_and(|visibility| visibility != "public"),
+        });
+    }
+    Ok(Some(gaps))
         })
     }
 
@@ -1779,7 +1932,406 @@ impl SelectedResolutionTypedSource<'_, '_> {
     }
 }
 
+const PYTHON_GUARD_DYNAMIC_WRITES_SQL: &str = "WITH candidates AS (
+ SELECT op.blob_id,op.receiver_reference FROM json_each(?1) requested
+ CROSS JOIN python_member_operation_names names INDEXED BY python_member_operation_names_spelling ON names.spelling=requested.value
+ CROSS JOIN python_member_operations op ON op.id=names.operation AND op.name_kind=0 AND op.effect IN (1,2)
+ UNION ALL
+ SELECT op.blob_id,op.receiver_reference FROM json_each(?2) requested
+ CROSS JOIN python_member_operation_names names INDEXED BY python_member_operation_names_spelling ON names.spelling=requested.value
+ CROSS JOIN python_member_operations op ON op.id=names.operation AND op.name_kind=1 AND op.effect IN (1,2)
+ UNION ALL
+ SELECT op.blob_id,op.receiver_reference FROM python_member_operations op INDEXED BY python_member_operations_any_writes
+ WHERE op.name_kind=2 AND op.effect IN (1,2))
+ SELECT mounts.mount_ordinal,receiver.semantic_key FROM candidates op
+ CROSS JOIN temp.selected_resolution_mounts mounts ON mounts.blob_id=op.blob_id AND mounts.storage_language='python'
+ LEFT JOIN resolution_semantic_sites receiver ON receiver.blob_id=op.blob_id AND receiver.source_site=op.receiver_reference AND receiver.semantic_role='reference' ";
+
+impl SelectedResolutionTypedSource<'_, '_> {
+    fn base_guard_mutation_receivers(
+        &self,
+        members: &[&str],
+        cancellation: &CancellationToken,
+        work: &mut dyn FnMut() -> bool,
+    ) -> StoreResult<Option<Vec<SemanticId>>> {
+        let key = members
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect::<Vec<_>>();
+        if let Some(receivers) = self.base_guard_mutations.borrow().get(&key) {
+            return Ok(receivers.clone());
+        }
+        let conn = self.selection.connection();
+        let names = serde_json::to_string(members).expect("member names serialize");
+        use brokk_bifrost_core::analyzer::resolution_facts::{
+            ALL_BINDING_PROJECTION_KINDS, BindingProjectionKind,
+        };
+        let result_projection = super::resolution_prepare::resolution_rows::code(
+            ALL_BINDING_PROJECTION_KINDS,
+            BindingProjectionKind::TargetCallableResultType,
+        );
+        let direct = "SELECT mounts.mount_ordinal,coalesce(direct.reference,incoming.reference)
+            FROM json_each(?1) requested
+            JOIN resolution_identities name ON name.spelling=requested.value
+            JOIN resolution_reference_lookup_identities lookup ON lookup.identity_id=name.id
+            JOIN resolution_semantic_sites target ON target.blob_id=lookup.blob_id AND target.semantic_key=lookup.semantic_key AND target.semantic_role='reference'
+            JOIN python_member_receiver_writes writes ON writes.blob_id=target.blob_id AND writes.site=target.source_site
+            JOIN temp.selected_resolution_mounts mounts ON mounts.blob_id=writes.blob_id AND mounts.storage_language='python'
+            LEFT JOIN resolution_qualified_routes qualified ON qualified.blob_id=target.blob_id AND qualified.reference=target.semantic_key
+            LEFT JOIN resolution_binding_projections direct ON direct.blob_id=qualified.blob_id AND direct.output_slot=qualified.qualifier_slot AND direct.kind<>?2
+            LEFT JOIN resolution_type_transfers transfer ON transfer.blob_id=qualified.blob_id AND transfer.target_slot=qualified.qualifier_slot
+            LEFT JOIN resolution_binding_projections incoming ON incoming.blob_id=transfer.blob_id AND incoming.output_slot=transfer.source_slot AND incoming.kind<>?2";
+        let prefixes = members
+            .iter()
+            .flat_map(|name| {
+                name.char_indices()
+                    .skip(1)
+                    .map(|(end, _)| &name[..end])
+                    .chain(std::iter::once(*name))
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let prefixes = serde_json::to_string(&prefixes).expect("member prefixes serialize");
+        let mut receivers = Vec::new();
+        for (query, parameters) in [
+            (
+                direct,
+                vec![
+                    Value::Text(names.clone()),
+                    Value::Integer(result_projection),
+                ],
+            ),
+            (
+                PYTHON_GUARD_DYNAMIC_WRITES_SQL,
+                vec![Value::Text(names.clone()), Value::Text(prefixes)],
+            ),
+        ] {
+            let mut statement = conn.prepare_cached(query)?;
+            let rows = statement.query_map(params_from_iter(parameters), |row| {
+                Ok((row.get::<_, u32>(0)?, row.get::<_, Option<u32>>(1)?))
+            })?;
+            for row in rows {
+                if cancellation.is_cancelled() || !work() {
+                    return Ok(None);
+                }
+                let (ordinal, reference) = row?;
+                let Some(reference) = reference else {
+                    self.base_guard_mutations.borrow_mut().insert(key, None);
+                    return Ok(None);
+                };
+                receivers.push(SemanticId::local(ordinal, reference));
+            }
+        }
+        receivers.sort_unstable();
+        receivers.dedup();
+        self.base_guard_mutations
+            .borrow_mut()
+            .insert(key, Some(receivers.clone()));
+        Ok(Some(receivers))
+    }
+}
+
 impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
+    fn base_preservation_reference_complete(
+        &self,
+        reference: SemanticId,
+        cancellation: &CancellationToken,
+        work: &mut dyn FnMut() -> bool,
+    ) -> StoreResult<bool> {
+        if cancellation.is_cancelled() {
+            return Ok(false);
+        }
+        let (Some(ordinal), Some(key)) = (reference.ordinal(), reference.local_key()) else {
+            return Ok(true);
+        };
+        let mount = self.mount(SelectedResolutionMountOrdinal::new(ordinal))?;
+        if mount.semantic_language() != Language::Python {
+            return Ok(true);
+        }
+        let conn = self.selection.connection();
+        let uncertain:bool=conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM resolution_gaps gap JOIN resolution_node_catalog scope ON scope.blob_id=gap.blob_id AND scope.local_key=gap.subject WHERE gap.blob_id=?1 AND gap.covers=5 AND gap.lookup=0 AND scope.source_scope=0)
+            OR EXISTS(SELECT 1 FROM resolution_reference_lookup_identities lookup JOIN resolution_identities name ON name.id=lookup.identity_id JOIN resolution_binding_slots slot ON slot.blob_id=lookup.blob_id AND slot.name=name.spelling AND slot.scope=0 JOIN resolution_binding_events event ON event.blob_id=slot.blob_id AND event.slot=slot.slot WHERE lookup.blob_id=?1 AND lookup.semantic_key=?2 AND event.execution_scope<>0)")?.query_row(rusqlite::params![mount.blob_id(),key],|row|row.get(0))?;
+        if uncertain || cancellation.is_cancelled() {
+            return Ok(false);
+        }
+        let cell_write: bool = conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM python_member_receiver_writes writes
+            JOIN resolution_semantic_sites semantic ON semantic.blob_id=writes.blob_id AND semantic.source_site=writes.site AND semantic.semantic_role='reference'
+            JOIN resolution_reference_lookup_identities lookup ON lookup.blob_id=semantic.blob_id AND lookup.semantic_key=semantic.semantic_key
+            JOIN resolution_identities name ON name.id=lookup.identity_id WHERE writes.blob_id=?1 AND name.spelling='cell_contents')")?
+            .query_row([mount.blob_id()], |row| row.get(0))?;
+        if !cell_write {
+            return Ok(true);
+        }
+        let reference: Option<(u32, String, usize)> = conn.prepare_cached("SELECT semantic.source_site,name.spelling,site.start_byte FROM resolution_semantic_sites semantic
+            JOIN resolution_sites resolution ON resolution.blob_id=semantic.blob_id AND resolution.site=semantic.semantic_key
+            JOIN resolution_reference_lookup_identities lookup ON lookup.blob_id=semantic.blob_id AND lookup.semantic_key=semantic.semantic_key
+            JOIN resolution_identities name ON name.id=lookup.identity_id
+            JOIN python_member_sites site ON site.blob_id=semantic.blob_id AND site.site=semantic.source_site
+            WHERE semantic.blob_id=?1 AND semantic.semantic_key=?2 AND semantic.semantic_role='reference' AND resolution.prefix=-1")?
+            .query_row(rusqlite::params![mount.blob_id(),key], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional()?;
+        let Some((reference, name, point)) = reference else {
+            return Ok(true);
+        };
+        let Some(cache) = self.binding_cache else {
+            return Ok(false);
+        };
+        let mut bindings = self.base_guard_bindings.borrow_mut();
+        let rows = match bindings.entry(mount.blob_id()) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let Some(rows) = super::python_binding_rows::PythonBindingRows::load(
+                    conn,
+                    cache,
+                    mount.blob_id(),
+                    Some(mount.blob_oid()),
+                    cancellation,
+                )?
+                else {
+                    return Ok(false);
+                };
+                entry.insert(rows)
+            }
+        };
+        use super::resolution_operation::python_lexical::{
+            self, PythonBindingProfile, PythonBindingProofs,
+        };
+        use brokk_bifrost_core::analyzer::resolution_facts::{
+            ResolutionScopeId, find_scope_in_chain,
+        };
+        let Some(state) = python_lexical::lexical_selection(
+            rows,
+            reference,
+            &name,
+            PythonBindingProfile::Runtime,
+            PythonBindingProofs::default(),
+        ) else {
+            return Ok(false);
+        };
+        let stopped = std::cell::Cell::new(false);
+        let scope = find_scope_in_chain(
+            Some(ResolutionScopeId::new(state.start_scope)),
+            |scope| {
+                if stopped.get() {
+                    return None;
+                }
+                python_lexical::lexical_parent(&state, rows, scope.get())
+                    .map(ResolutionScopeId::new)
+            },
+            |scope| {
+                if !work() {
+                    stopped.set(true);
+                    return false;
+                }
+                python_lexical::lexical_slot(&state, rows, scope.get()).is_some()
+            },
+        );
+        if stopped.get() || cancellation.is_cancelled() {
+            return Ok(false);
+        }
+        if scope.is_none_or(|scope| scope.get() == 0) {
+            return Ok(true);
+        }
+        let outer: Option<(usize, usize)> = conn.prepare_cached("SELECT declaration.start_byte,declaration.end_byte FROM resolution_member_scope_properties properties
+            JOIN resolution_semantic_sites semantic ON semantic.blob_id=properties.blob_id AND semantic.semantic_key=properties.definition_semantic_key AND semantic.semantic_role='definition'
+            JOIN source_native_declaration_bridges bridge ON bridge.blob_id=semantic.blob_id AND bridge.source_site=semantic.source_site
+            JOIN source_declarations declaration ON declaration.blob_id=bridge.blob_id AND declaration.declaration_id=bridge.declaration_id
+            WHERE properties.blob_id=?1 AND properties.scope_kind='executable' AND declaration.start_byte<=?2 AND declaration.end_byte>?2
+            ORDER BY declaration.start_byte LIMIT 1")?
+            .query_row(rusqlite::params![mount.blob_id(),point], |row| Ok((row.get(0)?,row.get(1)?))).optional()?;
+        let Some((start, end)) = outer else {
+            return Ok(true);
+        };
+        // Deliberately coarse within the owning function; cross-function closure reflection is not modeled, as with master.
+        let blocked: bool = conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM python_member_receiver_writes writes
+            JOIN resolution_semantic_sites semantic ON semantic.blob_id=writes.blob_id AND semantic.source_site=writes.site AND semantic.semantic_role='reference'
+            JOIN resolution_reference_lookup_identities lookup ON lookup.blob_id=semantic.blob_id AND lookup.semantic_key=semantic.semantic_key
+            JOIN resolution_identities name ON name.id=lookup.identity_id
+            JOIN python_member_sites site ON site.blob_id=writes.blob_id AND site.site=writes.site
+            WHERE writes.blob_id=?1 AND name.spelling='cell_contents' AND site.start_byte>=?2 AND site.end_byte<=?3)")?
+            .query_row(rusqlite::params![mount.blob_id(),start,end], |row| row.get(0))?;
+        Ok(!blocked && !cancellation.is_cancelled())
+    }
+    fn base_preservation_members(
+        &self,
+        owner: SemanticId,
+        members: &[&str],
+        cancellation: &CancellationToken,
+        work: &mut dyn FnMut() -> bool,
+    ) -> StoreResult<Option<crate::analyzer::resolution::BasePreservationMembers>> {
+        use crate::analyzer::resolution::BasePreservationMembers;
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        let mutations = self.base_guard_mutation_receivers(members, cancellation, work)?;
+        // The lexical spelling type is not the original terminal after a
+        // builtin-module write. Resolve these receivers in the held driver.
+        let terminal_mutations =
+            self.base_guard_mutation_receivers(&["type"], cancellation, work)?;
+        if let Some(model) = self.model_declaration(owner, cancellation)? {
+            return Ok(Some(BasePreservationMembers {
+                mutation_receivers: mutations.clone().unwrap_or_default(),
+                terminal_mutation_receivers: terminal_mutations,
+                complete: mutations.is_some()
+                    && model.declaration.values_complete
+                    && model.members_state
+                        == crate::analyzer::semantic_model::ModelMembersState::Exact,
+                names: model
+                    .members
+                    .into_iter()
+                    .filter(|member| members.contains(&member.declaration.name.as_str()))
+                    .map(|member| member.declaration.name)
+                    .collect(),
+            }));
+        }
+        let (Some(ordinal), Some(key)) = (owner.ordinal(), owner.local_key()) else {
+            return Ok(None);
+        };
+        let mount = self.mount(SelectedResolutionMountOrdinal::new(ordinal))?;
+        if mount.semantic_language() != Language::Python {
+            return Ok(None);
+        }
+        let conn = self.selection.connection();
+        let scope:Option<(u32,bool)>=conn.prepare_cached("SELECT nodes.source_scope,class.bases_complete FROM resolution_member_scope_properties properties
+             JOIN resolution_node_catalog nodes ON nodes.blob_id=properties.blob_id AND nodes.local_key=properties.scope_head_node_key
+             JOIN resolution_semantic_sites definition ON definition.blob_id=properties.blob_id AND definition.semantic_key=properties.definition_semantic_key AND definition.semantic_role='definition'
+             JOIN python_member_classes class ON class.blob_id=definition.blob_id AND class.class=definition.source_site
+             WHERE properties.blob_id=?1 AND properties.definition_semantic_key=?2 AND properties.scope_kind='type_body'")?.query_row(
+            rusqlite::params![mount.blob_id(),key],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
+        let Some((scope, complete)) = scope else {
+            return Ok(None);
+        };
+        let mut statement = conn.prepare_cached(
+            "SELECT name FROM resolution_binding_slots WHERE blob_id=?1 AND scope=?2 AND name IN (SELECT value FROM json_each(?3)) ORDER BY slot",
+        )?;
+        let mut names = Vec::new();
+        for row in statement.query_map(
+            rusqlite::params![
+                mount.blob_id(),
+                scope,
+                serde_json::to_string(members).expect("member names serialize")
+            ],
+            |row| row.get(0),
+        )? {
+            if cancellation.is_cancelled() {
+                return Ok(None);
+            }
+            names.push(row?);
+        }
+        let gap:bool=conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM resolution_gaps gap JOIN resolution_node_catalog node ON node.blob_id=gap.blob_id AND node.local_key=gap.subject WHERE gap.blob_id=?1 AND node.source_scope=?2 AND gap.covers=5)")?.query_row(rusqlite::params![mount.blob_id(),scope],|row|row.get(0))?;
+        Ok(Some(BasePreservationMembers {
+            names,
+            mutation_receivers: mutations.clone().unwrap_or_default(),
+            terminal_mutation_receivers: terminal_mutations,
+            complete: complete && !gap && mutations.is_some(),
+        }))
+    }
+    fn base_preservation_terminal_owner(
+        &self,
+        owner: SemanticId,
+        terminal: &str,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<bool> {
+        if cancellation.is_cancelled() {
+            return Ok(false);
+        }
+        Ok(self
+            .intrinsic_entry(owner)
+            .is_some_and(|entry| entry.identity_spelling == terminal)
+            || self
+                .model_declaration(owner, cancellation)?
+                .is_some_and(|model| {
+                    model.declaration.kind
+                        == crate::analyzer::semantic_model::SemanticModelSymbolKind::Class
+                        && model.declaration.qualified_name == terminal
+                }))
+    }
+    fn base_preservation_terminal_reference(
+        &self,
+        reference: SemanticId,
+        terminal: &str,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<bool> {
+        // A terminal spelling requires an exhaustive, unshadowed stored binding.
+        if terminal != "builtins.type" || cancellation.is_cancelled() {
+            return Ok(false);
+        }
+        let (Some(ordinal), Some(key)) = (reference.ordinal(), reference.local_key()) else {
+            return Ok(false);
+        };
+        let mount = self.mount(SelectedResolutionMountOrdinal::new(ordinal))?;
+        if mount.semantic_language() != Language::Python {
+            return Ok(false);
+        }
+        let conn = self.selection.connection();
+        let name:Option<String>=conn.prepare_cached("SELECT name.spelling FROM resolution_reference_lookup_identities lookup JOIN resolution_identities name ON name.id=lookup.identity_id JOIN resolution_sites site ON site.blob_id=lookup.blob_id AND site.site=lookup.semantic_key WHERE lookup.blob_id=?1 AND lookup.semantic_key=?2 AND site.prefix=-1")?.query_row(rusqlite::params![mount.blob_id(),key],|row|row.get(0)).optional()?;
+        if name.as_deref() != Some("type") {
+            return Ok(false);
+        }
+        let Some(cache) = self.binding_cache else {
+            return Ok(false);
+        };
+        let mut bindings = self.base_guard_bindings.borrow_mut();
+        let rows = match bindings.entry(mount.blob_id()) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let Some(rows) = super::python_binding_rows::PythonBindingRows::load(
+                    conn,
+                    cache,
+                    mount.blob_id(),
+                    Some(mount.blob_oid()),
+                    cancellation,
+                )?
+                else {
+                    return Ok(false);
+                };
+                entry.insert(rows)
+            }
+        };
+        Ok(rows.builtin_type_unshadowed && !cancellation.is_cancelled())
+    }
+
+    fn class_alias_source(
+        &self,
+        definition: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<SemanticId>> {
+        let (Some(ordinal), Some(key)) = (definition.ordinal(), definition.local_key()) else {
+            return Ok(None);
+        };
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        let mount = self.mount(SelectedResolutionMountOrdinal::new(ordinal))?;
+        if mount.semantic_language() != Language::Python {
+            return Ok(None);
+        }
+        let blob = mount.blob_id();
+        let connection = self.selection.connection();
+        let Some(authored) = connection
+            .prepare_cached(
+                "SELECT source_site FROM resolution_semantic_sites
+                 WHERE blob_id=?1 AND semantic_key=?2 AND semantic_role='definition'",
+            )?
+            .query_row(rusqlite::params![blob, key], |row| row.get::<_, u32>(0))
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        let Some(source_site) =
+            super::python_binding_rows::assignment_alias_source_site(connection, blob, authored)?
+        else {
+            return Ok(None);
+        };
+        Ok(connection
+            .prepare_cached(
+                "SELECT semantic_key FROM resolution_semantic_sites
+                 WHERE blob_id=?1 AND source_site=?2 AND semantic_role='reference'",
+            )?
+            .query_row(rusqlite::params![blob, source_site], |row| {
+                row.get::<_, u32>(0)
+            })
+            .optional()?
+            .map(|reference| SemanticId::local(ordinal, reference)))
+    }
     fn selected_blob_for_fragment(
         &self,
         fragment: BindingFragmentId,
@@ -1854,6 +2406,14 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
     ) -> StoreResult<bool> {
         self.external_owner_type_is_indexed(owner)
     }
+    fn binary_operation_type_provider(
+        &self,
+    ) -> Option<&dyn super::language_support::BinaryOperationTypeProvider> {
+        self.binary_operation_type_provider
+    }
+    fn selected_type_heads(&self) -> Option<&dyn super::language_support::SelectedTypeHeadSource> {
+        self.type_heads
+    }
     fn selected_model_language(
         &self,
         token: SemanticId,
@@ -1876,6 +2436,22 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         )>,
     > {
         self.project_model_value(token, kind, receivers, cancellation)
+    }
+
+    fn conditional_type_productions(
+        &self,
+        slots: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Vec<crate::analyzer::resolution::fact_source::ConditionalTypeProduction>> {
+        if !self.validate_selected_interiors(cancellation)? {
+            return Ok(Vec::new());
+        }
+        super::resolution_operation::rust_macro_types::productions(
+            self.selection,
+            self.type_heads,
+            slots,
+            cancellation,
+        )
     }
 
     fn supports_conditional_type_seeds(&self) -> bool {
@@ -1925,6 +2501,80 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         } else {
             &[]
         }
+    }
+
+    fn implicit_appended_base(
+        &self,
+        owner: SemanticId,
+        written_targets: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<crate::analyzer::resolution::ImplicitAppendedBase>> {
+        let Some(ordinal) = owner.ordinal() else {
+            return Ok(None);
+        };
+        let mount = self.mount(SelectedResolutionMountOrdinal::new(ordinal))?;
+        if mount.semantic_language() != Language::Python {
+            return Ok(None);
+        }
+        let provider = self
+            .implicit_input_provider
+            .ok_or_else(|| StoreError::new("implicit input read authority is unavailable"))?;
+        provider.validate_current_use(Language::Python, cancellation)?;
+        let mut generic = false;
+        let outcome = self.visit_generic_formal_pages_for_owners(
+            TypedFactRequest::new(&[owner]),
+            cancellation,
+            &mut TypedFactPageVisitor::new(&mut |page| {
+                generic |= !page.is_empty();
+                Ok(true)
+            }),
+        )?;
+        if !outcome.is_exhausted() || outcome.evidence() != &ResolutionCompletion::Complete {
+            return Ok(Some(crate::analyzer::resolution::ImplicitAppendedBase {
+                target: None,
+                suppressing_target: None,
+                written_objects: crate::analyzer::resolution::ImplicitWrittenBaseObjects::Unproven,
+                factory_unmodified: None,
+                completion: outcome
+                    .evidence()
+                    .combine(&ResolutionCompletion::incomplete([
+                        ResolutionIncompleteReason::UnsupportedSemantic(owner),
+                    ])),
+            }));
+        }
+        if !generic {
+            return Ok(None);
+        }
+        let completion = if provider.workspace_module_may_shadow("typing", cancellation)? {
+            ResolutionCompletion::incomplete([ResolutionIncompleteReason::UnsupportedSemantic(
+                owner,
+            )])
+        } else {
+            ResolutionCompletion::Complete
+        };
+        let factory = self.implicit_model_class("typing._GenericAlias", cancellation)?;
+        let factory_unmodified =
+            provider.implicit_generic_factory_preserved(factory, cancellation)?;
+        let written_objects =
+            self.implicit_generic_written_objects(written_targets, cancellation)?;
+        let (target, suppressing_target) = if factory_unmodified
+            && written_objects == crate::analyzer::resolution::ImplicitWrittenBaseObjects::Proven
+        {
+            (
+                self.implicit_model_class("typing.Generic", cancellation)?,
+                self.implicit_model_class("typing.Protocol", cancellation)?,
+            )
+        } else {
+            (None, None)
+        };
+        provider.validate_current_use(Language::Python, cancellation)?;
+        Ok(Some(crate::analyzer::resolution::ImplicitAppendedBase {
+            target,
+            suppressing_target,
+            written_objects,
+            factory_unmodified: Some(factory_unmodified),
+            completion,
+        }))
     }
 
     fn implicit_base_inputs(
@@ -2333,6 +2983,38 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         )
     }
 
+    fn rust_builtin_derive_member(
+        &self,
+        owner: SemanticId,
+        lookup: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<crate::analyzer::resolution::RustBuiltinDeriveMember> {
+        use crate::analyzer::resolution::RustBuiltinDeriveMember;
+        // An intrinsic or shared type identity has no source declaration.
+        if owner.ordinal().is_none() {
+            return Ok(RustBuiltinDeriveMember::NotDerived);
+        }
+        let owner = match rust_fragment_coordinate(&self.authority, owner, cancellation)? {
+            RustFragmentCoordinate::FragmentLocal(coordinate) => coordinate,
+            RustFragmentCoordinate::Cancelled => return Ok(RustBuiltinDeriveMember::Cancelled),
+            RustFragmentCoordinate::Unplaced => return Ok(RustBuiltinDeriveMember::Unproven),
+        };
+        if self
+            .selection
+            .mount_record_by_ordinal(owner.0)?
+            .semantic_language()
+            != Language::Rust
+        {
+            return Ok(RustBuiltinDeriveMember::NotDerived);
+        }
+        super::resolution_operation::rust_crate_rows::builtin_derive_member(
+            self.selection,
+            owner,
+            lookup,
+            cancellation,
+        )
+    }
+
     /// Whether the reference can name this specific Rust trait, independent of its implementor.
     fn rust_trait_nameable_at(
         &self,
@@ -2721,11 +3403,12 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
     fn model_member_callable_result(
         &self,
         member: &crate::analyzer::semantic_model::overlay::ModelSymbolRef,
+        owner_language: crate::analyzer::resolution::ExternalOwnerLanguage,
         cancellation: &CancellationToken,
     ) -> StoreResult<
         Option<Option<crate::analyzer::resolution::fact_source::ModelCallableResultDeclaration>>,
     > {
-        self.read_model_member_callable_result(member, cancellation)
+        self.read_model_member_callable_result(member, owner_language, cancellation)
     }
 
     fn go_model_owner_declarations(
@@ -3290,6 +3973,45 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         )
     }
 
+    fn visit_binary_operation_pages_for_outputs(
+        &self,
+        outputs: TypedFactRequest<'_, SemanticId>,
+        cancellation: &CancellationToken,
+        visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredBinaryOperation>>,
+    ) -> StoreResult<TypedFactReadOutcome> {
+        let Some(mounts) = self.local_keys_by_mount(
+            outputs.as_slice(),
+            TypedFactRelation::BinaryOperationOutput,
+            cancellation,
+        )?
+        else {
+            return cancelled();
+        };
+        visit_combined_typed_rows(
+            cancellation,
+            visitor,
+            |visitor| {
+                self.visit_typed_rows(&mounts, typed_rows::BINARY_OPERATIONS_BY_OUTPUT_SQL, cancellation, visitor, |context, row| {
+                Ok(SelectedTypedRow::new(context.fragment, LoweredBinaryOperation {
+                    output: context.semantic(row.get(0)?),
+                    left: context.semantic(row.get(1)?),
+                    right: context.semantic(row.get(2)?),
+                    right_reference: super::resolution_prepare::resolution_rows::from_code(brokk_bifrost_core::analyzer::resolution_facts::ALL_RESOLUTION_BINARY_REFERENCES, row.get(4)?, "binary RHS reference"),
+                    operator: super::resolution_prepare::resolution_rows::from_code(brokk_bifrost_core::analyzer::resolution_facts::ALL_RESOLUTION_BINARY_OPERATORS, row.get(3)?, "binary operator"),
+                }))
+            })
+            },
+            |visitor| {
+                super::resolution_stage::typed::visit_binary_operation_pages_for_outputs(
+                    self.selection,
+                    outputs,
+                    cancellation,
+                    visitor,
+                )
+            },
+        )
+    }
+
     fn visit_type_component_pages_for_containers(
         &self,
         containers: TypedFactRequest<'_, SemanticId>,
@@ -3525,11 +4247,24 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
                 )
             },
             |visitor| {
-                super::resolution_stage::typed::visit_generic_formal_pages_for_owners(
-                    self.selection,
-                    owners,
+                visit_combined_typed_rows(
                     cancellation,
                     visitor,
+                    |visitor| {
+                        super::resolution_stage::typed::visit_generic_formal_pages_for_owners(
+                            self.selection,
+                            owners,
+                            cancellation,
+                            visitor,
+                        )
+                    },
+                    |visitor| {
+                        self.visit_external_generic_formals(
+                            owners.as_slice(),
+                            cancellation,
+                            visitor,
+                        )
+                    },
                 )
             },
         )
@@ -5188,18 +5923,26 @@ fn decode_supertype(
     context: TypedRowContext,
     row: &Row<'_>,
 ) -> StoreResult<SelectedTypedRow<LoweredSupertypeProperty>> {
-    Ok(SelectedTypedRow::new(
-        context.fragment,
-        typed_rows::decode_supertype(
-            context,
-            row.get(0)?,
-            row.get(1)?,
-            row.get(2)?,
-            row.get(3)?,
-            row.get(4)?,
-        )
-        .into(),
+    let frontier = context.semantic(row.get(2)?);
+    let arguments: Vec<i64> = serde_json::from_str(&row.get::<_, String>(5)?)
+        .map_err(|error| invalid_fact(format!("supertype arguments: {error}")))?;
+    let arguments = arguments
+        .into_iter()
+        .enumerate()
+        .map(|(position, argument)| {
+            LoweredDeclaredTypeArgument::new(frontier, position as u32, context.semantic(argument))
+        })
+        .collect::<Vec<_>>();
+    let property = LoweredSupertypeProperty::from(typed_rows::decode_supertype(
+        context,
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
     ))
+    .with_source_arguments(&arguments);
+    Ok(SelectedTypedRow::new(context.fragment, property))
 }
 
 fn decode_call_obligation(
@@ -5787,6 +6530,7 @@ impl TypedRowEvidence for SelectedTypedRow<LoweredTypeTransfer> {
 
 impl TypedRowEvidence for SelectedTypedRow<LoweredTypeComponent> {}
 impl TypedRowEvidence for SelectedTypedRow<LoweredTypeProduction> {}
+impl TypedRowEvidence for SelectedTypedRow<LoweredBinaryOperation> {}
 impl TypedRowEvidence for SelectedTypedRow<LoweredTypeArgument> {}
 impl TypedRowEvidence for SelectedTypedRow<LoweredGenericTypeAliasParameter> {}
 impl TypedRowEvidence for SelectedTypedRow<LoweredGenericFormal> {}
@@ -6011,5 +6755,39 @@ pub mod row_evidence_tests {
             assert_eq!(actual.terminal(), expected.terminal());
             assert_eq!(actual.evidence(), expected.evidence());
         }
+    }
+}
+
+#[cfg(test)]
+mod guard_mutation_plan_tests {
+    use super::PYTHON_GUARD_DYNAMIC_WRITES_SQL;
+    use crate::analyzer::store::AnalyzerStore;
+    use crate::analyzer::store::planner_statistics::pinned_plans::prepare_pin_context;
+    use brokk_bifrost_core::cache_gc::PlannerStatisticsState;
+
+    #[test]
+    fn any_write_discovery_seeks_sparse_index() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        store.conn.execute_fixture(|conn| {
+            prepare_pin_context(conn);
+            conn.execute_batch("PRAGMA foreign_keys=OFF;
+                INSERT INTO temp.selected_resolution_mounts(mount_ordinal,blob_id,storage_language) VALUES(1,1,'python');
+                INSERT INTO python_member_operations(blob_id,site,name_site,form,effect,name_kind) VALUES(1,1,1,1,1,2);").unwrap();
+            for state in PlannerStatisticsState::BOTH {
+                state.install(conn);
+                let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {PYTHON_GUARD_DYNAMIC_WRITES_SQL}")).unwrap();
+                let plan = statement.query_map(rusqlite::params!["[\"__new__\"]", "[\"_\",\"__\",\"__n\",\"__ne\",\"__new\",\"__new_\",\"__new__\"]"], |row| row.get::<_,String>(3)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+                assert!(plan.iter().any(|step| step.contains("SEARCH op USING INDEX python_member_operations_any_writes")), "{state}: {plan:?}");
+                assert!(!plan.iter().any(|step| step.starts_with("SCAN mounts") || step.contains("AUTOMATIC")), "{state}: {plan:?}");
+                let indexed = conn.prepare(PYTHON_GUARD_DYNAMIC_WRITES_SQL).unwrap().query_map(rusqlite::params!["[]", "[]"], |row| Ok((row.get::<_,i64>(0)?,row.get::<_,Option<i64>>(1)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+                // Removing only the access-path hint gives the same relational query
+                // on an older schema without the index.
+                conn.execute_batch("DROP INDEX python_member_operations_any_writes;").unwrap();
+                let unhinted = PYTHON_GUARD_DYNAMIC_WRITES_SQL.replace("INDEXED BY python_member_operations_any_writes", "");
+                let unindexed = conn.prepare(&unhinted).unwrap().query_map(rusqlite::params!["[]", "[]"], |row| Ok((row.get::<_,i64>(0)?,row.get::<_,Option<i64>>(1)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+                assert_eq!(indexed,unindexed);
+                conn.execute_batch(include_str!("../../../../bifrost-core/migrations/cache/0418-python-member-any-writes.sql")).unwrap();
+            }
+        });
     }
 }

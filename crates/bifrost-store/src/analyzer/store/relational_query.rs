@@ -3745,16 +3745,10 @@ mod batched_query_tests {
         let header = memo.counts_for_test();
         assert!(header.hydrated_keys > cold.hydrated_keys, "{header:?}");
 
-        // A different lineage nonce: no entry from the earlier one can hit.
-        {
-            let conn = fixture.store.conn.lock().unwrap();
-            conn.execute(
-                "UPDATE blob_publication_witness_sequence SET store_nonce = randomblob(16)",
-                [],
-            )
-            .unwrap();
-        }
-        assert_eq!(fixture.values_with(&run_request(), &memo), expected);
+        // A genuinely independent store is a different lineage. Reuse the
+        // same memo and inputs without mutating an opened store's identity.
+        let second = self::fixture();
+        assert_eq!(second.values_with(&run_request(), &memo), expected);
         let lineage = memo.counts_for_test();
         assert!(lineage.hydrated_keys > header.hydrated_keys, "{lineage:?}");
     }

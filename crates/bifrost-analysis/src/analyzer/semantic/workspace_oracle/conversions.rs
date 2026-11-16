@@ -34,6 +34,28 @@ pub(super) struct ConversionCandidate {
     examined: usize,
 }
 
+// A stopped selection cannot supply executable semantics to either conversion query.
+fn selection_without_value<T, U>(
+    outcome: SemanticOutcome<T>,
+    work: SemanticWork,
+) -> SemanticOutcome<U> {
+    match outcome {
+        SemanticOutcome::Cancelled { .. } => SemanticOutcome::Cancelled {
+            partial: None,
+            work,
+        },
+        SemanticOutcome::ExceededBudget { exceeded, .. } => SemanticOutcome::ExceededBudget {
+            partial: None,
+            exceeded,
+            work,
+        },
+        _ => SemanticOutcome::Unknown {
+            partial: None,
+            work,
+        },
+    }
+}
+
 impl WorkspaceSemanticOracle<'_> {
     /// Whether argument conversion at this call can execute user code.
     /// Charge the same discovery reads on hits; only language proofs are memoized.
@@ -154,11 +176,31 @@ impl WorkspaceSemanticOracle<'_> {
             call.procedure().artifact().key().path().as_path(),
         );
         let range = exact_call_range(call)?;
+        let selected = match self
+            .workspace
+            .selected_procedure_handle(call.procedure(), request)?
+        {
+            SemanticOutcome::Complete {
+                value:
+                    crate::analyzer::semantic::service::SelectedProcedureHandle {
+                        handle: selected, ..
+                    },
+                ..
+            } => selected,
+            outcome => {
+                return Ok(selection_without_value(
+                    outcome,
+                    request.budget.used().saturating_sub(before),
+                ));
+            }
+        };
+
         match self.conversion_sources.actuals_may_run_user_code(
             analyzer,
             &file,
             &range,
             request.budget,
+            Some(&selected),
         ) {
             Ok(false) => {
                 return Ok(SemanticOutcome::Complete {
@@ -208,21 +250,24 @@ impl WorkspaceSemanticOracle<'_> {
                 *crate::analyzer::usages::common::query_memo_value(
                     &self.conversion_effects,
                     analyzer,
-                    &(call.clone(), (*candidate).clone()),
+                    &(call.clone(), (*candidate).clone(), selected.clone()),
                     || {
                         rows.iter().any(|row| row.may_run_user_code)
                             || self
                                 .conversion_sources
-                                .shape(analyzer, &file, &range)
+                                .shape(analyzer, &file, &range, Some(&selected))
                                 .as_ref()
                                 .is_none_or(|shape| {
                                     shape.arguments.iter().any(|actual| {
                                         !rows.iter().any(|row| row.range == actual.range)
-                                            && self.conversion_sources.actual_may_run_user_code(
-                                                analyzer,
-                                                &file,
-                                                &actual.range,
-                                            )
+                                            && self
+                                                .conversion_sources
+                                                .selected_actual_may_run_user_code(
+                                                    analyzer,
+                                                    &file,
+                                                    &actual.range,
+                                                    &selected,
+                                                )
                                     })
                                 })
                     },
@@ -248,6 +293,7 @@ impl WorkspaceSemanticOracle<'_> {
             self.workspace.analyzer(),
             self.active_semantic_model_snapshot(),
         );
+        let before = request.budget.used();
         let mut work = SemanticWork::default();
         macro_rules! charge {
             ($cost:expr) => {{
@@ -309,6 +355,25 @@ impl WorkspaceSemanticOracle<'_> {
         let (file, _source) = &sources[0];
         let analyzer = self.workspace.analyzer();
         let range = exact_call_range(call)?;
+        let selected = match self
+            .workspace
+            .selected_procedure_handle(call.procedure(), request)?
+        {
+            SemanticOutcome::Complete {
+                value:
+                    crate::analyzer::semantic::service::SelectedProcedureHandle {
+                        handle: selected, ..
+                    },
+                ..
+            } => selected,
+            outcome => {
+                return Ok(selection_without_value(
+                    outcome,
+                    request.budget.used().saturating_sub(before),
+                ));
+            }
+        };
+
         let Some(facts) = analyzer
             .structural_fact_providers()
             .into_iter()
@@ -342,7 +407,7 @@ impl WorkspaceSemanticOracle<'_> {
         let conversion_context = self
             .conversion_sources
             .indexed_context(self.lexical_indexes.clone());
-        let cache_key = (call.clone(), candidate.clone());
+        let cache_key = (call.clone(), candidate.clone(), selected.clone());
         // A cancelled lookup is not an answer: neither memo retains it, so a
         // later request with a live token recomputes it.
         struct LookupCancelled;
@@ -358,7 +423,9 @@ impl WorkspaceSemanticOracle<'_> {
                     .map(str::to_owned);
                 let lookup_status_incomplete = lookup_incomplete_reason.is_some();
                 let result = (|| {
-                    let shape = self.conversion_sources.shape(analyzer, file, &range)?;
+                    let shape =
+                        self.conversion_sources
+                            .shape(analyzer, file, &range, Some(&selected))?;
                     if !candidate
                         .proof()
                         .establishes_complete_evidence(candidate.completeness())
@@ -616,5 +683,53 @@ impl WorkspaceSemanticOracle<'_> {
         } else {
             Ok(SemanticOutcome::Complete { value, work })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::semantic::SemanticBudget;
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10972: review: candidate selection turned budget exhaustion into Unknown"
+    )]
+    fn conversion_rows_selection_preserves_typed_stop_and_work() {
+        let mut limits = SemanticBudget::default().limits();
+        limits.nested_entries = 1;
+        let mut budget = SemanticBudget::new(limits).unwrap();
+        budget.charge_work(SemanticWork {
+            source_bytes: 17,
+            ..Default::default()
+        });
+        let exceeded = budget
+            .admit(SemanticWork {
+                nested_entries: 2,
+                ..Default::default()
+            })
+            .unwrap_err();
+        let outcome: SemanticOutcome<Vec<ArgumentConversion>> = selection_without_value(
+            SemanticOutcome::<()>::ExceededBudget {
+                partial: None,
+                exceeded,
+                work: budget.used(),
+            },
+            budget.used(),
+        );
+        assert!(
+            matches!(outcome, SemanticOutcome::ExceededBudget { exceeded: actual, .. } if actual == exceeded)
+        );
+        assert_eq!(outcome.work(), budget.used());
+        assert_eq!(outcome.work().source_bytes, 17);
+        let cancelled: SemanticOutcome<Vec<ArgumentConversion>> = selection_without_value(
+            SemanticOutcome::<()>::Cancelled {
+                partial: None,
+                work: budget.used(),
+            },
+            budget.used(),
+        );
+        assert!(matches!(cancelled, SemanticOutcome::Cancelled { .. }));
+        assert_eq!(cancelled.work(), budget.used());
     }
 }

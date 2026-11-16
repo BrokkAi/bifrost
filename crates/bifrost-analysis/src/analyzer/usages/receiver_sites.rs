@@ -59,6 +59,7 @@ pub(crate) enum ReceiverSiteIndexBuild {
     },
     Exceeded {
         inspected_work: usize,
+        refused: brokk_bifrost_core::analyzer::work_budget::LimitRefused,
     },
     Cancelled {
         inspected_work: usize,
@@ -70,7 +71,7 @@ impl ReceiverSiteIndexBuild {
     pub(crate) fn inspected_work(&self) -> usize {
         match self {
             Self::Complete { inspected_work, .. }
-            | Self::Exceeded { inspected_work }
+            | Self::Exceeded { inspected_work, .. }
             | Self::Cancelled { inspected_work } => *inspected_work,
         }
     }
@@ -85,6 +86,7 @@ pub(crate) enum ReceiverSiteSelection {
     },
     Exceeded {
         inspected_sites: usize,
+        refused: brokk_bifrost_core::analyzer::work_budget::LimitRefused,
     },
     Cancelled {
         inspected_sites: usize,
@@ -98,7 +100,9 @@ impl ReceiverSiteSelection {
             Self::Complete {
                 inspected_sites, ..
             }
-            | Self::Exceeded { inspected_sites }
+            | Self::Exceeded {
+                inspected_sites, ..
+            }
             | Self::Cancelled { inspected_sites } => *inspected_sites,
         }
     }
@@ -167,13 +171,17 @@ impl ReceiverSiteIndex {
             if is_cancelled(cancellation) {
                 return ReceiverSiteSelection::Cancelled { inspected_sites };
             }
-            if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
-                inspected_sites,
-                limit.max_inspected_sites,
-            )
-            .allows(1)
+            if let Err(refused) =
+                brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                    inspected_sites,
+                    limit.max_inspected_sites,
+                )
+                .try_allow(1)
             {
-                return ReceiverSiteSelection::Exceeded { inspected_sites };
+                return ReceiverSiteSelection::Exceeded {
+                    inspected_sites,
+                    refused,
+                };
             }
             inspected_sites += 1;
 
@@ -275,13 +283,16 @@ pub(crate) fn build_receiver_site_index(
         if is_cancelled(cancellation) {
             return ReceiverSiteIndexBuild::Cancelled { inspected_work };
         }
-        if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+        if let Err(refused) = brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
             inspected_work,
             limit.max_work_items,
         )
-        .allows(1)
+        .try_allow(1)
         {
-            return ReceiverSiteIndexBuild::Exceeded { inspected_work };
+            return ReceiverSiteIndexBuild::Exceeded {
+                inspected_work,
+                refused,
+            };
         }
         inspected_work += 1;
 
@@ -309,13 +320,17 @@ pub(crate) fn build_receiver_site_index(
             if is_cancelled(cancellation) {
                 return ReceiverSiteIndexBuild::Cancelled { inspected_work };
             }
-            if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
-                inspected_work,
-                limit.max_work_items,
-            )
-            .allows(1)
+            if let Err(refused) =
+                brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                    inspected_work,
+                    limit.max_work_items,
+                )
+                .try_allow(1)
             {
-                return ReceiverSiteIndexBuild::Exceeded { inspected_work };
+                return ReceiverSiteIndexBuild::Exceeded {
+                    inspected_work,
+                    refused,
+                };
             }
             inspected_work += 1;
 
@@ -521,7 +536,10 @@ mod tests {
 
         assert!(matches!(
             &outcome,
-            ReceiverSiteIndexBuild::Exceeded { inspected_work: 1 }
+            ReceiverSiteIndexBuild::Exceeded {
+                inspected_work: 1,
+                ..
+            }
         ));
         assert_eq!(outcome.inspected_work(), 1);
     }
@@ -544,7 +562,8 @@ mod tests {
         assert!(matches!(
             outcome,
             ReceiverSiteIndexBuild::Exceeded {
-                inspected_work
+                inspected_work,
+                ..
             } if inspected_work == node_count
         ));
     }
@@ -564,10 +583,13 @@ mod tests {
             None,
         );
 
-        assert_eq!(
+        assert!(matches!(
             outcome,
-            ReceiverSiteSelection::Exceeded { inspected_sites: 1 }
-        );
+            ReceiverSiteSelection::Exceeded {
+                inspected_sites: 1,
+                ..
+            }
+        ));
         assert_eq!(outcome.inspected_sites(), 1);
     }
 

@@ -391,7 +391,7 @@ impl GoBarrierState<'_> {
             *selected_request = match GoNativePointRequest::open_for_file(
                 go,
                 file,
-                self.analyzer.semantic_model_overlay(),
+                self.analyzer.semantic_model_overlay_read().published(),
                 request.cancellation,
             )
             .map_err(|error| SemanticProviderError::source_access(error.to_string()))?

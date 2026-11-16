@@ -444,6 +444,7 @@ pub enum ValueShape {
     ConfigurationProvenanceList,
     ConfigurationCompletenessList,
     ConfigurationFactsFilter,
+    CallReachability,
     CrossDomainCorrelation,
     CrossDomainRequirement,
     CrossDomainRelation,
@@ -868,7 +869,7 @@ query_step_ops! {
     PythonImportCycles { shape: RowLocal, label: "python_import_cycles", signature: "structural_match -> structural_match", description: "Annotate Python import sites with confirmed cycles from the persisted workspace file graph. Missing paths remain incomplete because unresolved, external, dynamic, and path-derived package identities are not authoritative." }
     PythonCommentedOutCode { shape: RowLocal, label: "python_commented_out_code", signature: "structural_match -> python_rule_fact", description: "Return one row for each Python comment block recognized by CodeQL's commented-out-code heuristics. The row preserves the full source span and exact comment lines; example-heavy, documentation-like, filler, path, URL, doctest, and end-of-line comments are excluded." }
     PythonUnsafeCyclicImport { shape: RowLocal, label: "python_unsafe_cyclic_import", signature: "structural_match -> python_rule_fact", description: "Report module-level Python member uses and from-imports reached through a persisted import cycle before the target module binds that name. Function-body uses are deferred, while guarded routes and dynamic module attributes remain typed incomplete." }
-    PythonDocumentation { shape: RowLocal, label: "python_documentation", signature: "declaration -> python_rule_fact", description: "Report Python module, class, function, and method documentation facts, including public scope, decoded docstring, CodeQL-style code-line count, override status, property-accessor status, and typed incompleteness." }
+    PythonDocumentation { shape: RowLocal, label: "python_documentation", signature: "declaration -> python_rule_fact", description: "Report Python module, class, function, and method documentation facts, including public scope, decoded docstring, CodeQL-style code-line count, override status, property-accessor status, tri-state test scope and script entry-point status, and typed incompleteness." }
     PythonUselessClass { shape: RowLocal, label: "python_useless_class", signature: "declaration -> python_rule_fact", description: "Report Python class method counts and the inheritance, subclass, special-method, decorator, mixin, statefulness, and top-level exclusions used by the useless-class policy, with typed incompleteness." }
     PythonAttributeShadowsMethod { shape: RowLocal, label: "python_attribute_shadows_method", signature: "declaration -> python_rule_fact", description: "Report a Python descendant method hidden by an attribute written through an ancestor initializer's self value. Uses complete C3 ancestry and direct declarations; unknown bases, dynamic setattr names, escaped self values, and unresolved local aliases remain typed incomplete." }
     PythonModificationOfDefaultValue { shape: RowLocal, label: "python_modification_of_default_value", signature: "declaration -> python_rule_fact", description: "Report local mutations that can reach a list, dictionary, or set parameter default through direct local aliases. Rebinding and known emptiness guards stop flow; unresolved escapes and conditional local flow remain typed incomplete." }
@@ -1320,6 +1321,7 @@ macro_rules! rql_forms {
                     | Self::ConfigurationFacts
                     | Self::ConfigurationAbsence
                     | Self::ConfigurationCode
+                    | Self::CallReachability
                     | Self::Correlate
                     | Self::RequireBoth
                     | Self::ConfigurationKey
@@ -2687,6 +2689,13 @@ rql_forms! {
         description: "Retain any configuration fact when no authored fact in the selected document or subtree matches the filter. Incomplete ingestion is never treated as absence.",
         step: ConfigurationAbsence,
     }
+    CallReachability {
+        labels: ["call-reachability"],
+        class: Wrapper,
+        shape: CallReachability,
+        signature: "(call-reachability :sources query :sinks query [:depth positive-integer])",
+        description: "Return each source-owning callable with certified static paths to selected reached calls. Known paths survive unknown branches, which report incompleteness. Sinks are evaluated on reached call sites. Omitted depth introduces no depth cap; authored depth uses existing traversal limits and reports open frontiers.",
+    }
     Correlate {
         labels: ["correlate"],
         class: Wrapper,
@@ -3716,6 +3725,7 @@ json_fields! {
     Exports { label: "exports", shape: ExportFilter, signature: "\"exports\": { \"form\": [...], \"name\": [...] }", description: "Seed export rows directly from recorded materialization provenance." }
     DependencyEvidence { label: "dependency_evidence", shape: DependencyEvidenceFilter, signature: "\"dependency_evidence\": { \"ecosystems\": [...], \"packages\": [...], \"kinds\": [...], \"exact_versions\": [...], \"version_ranges\": [...], \"sources\": [...], \"declared_by\": [...], \"scopes\": [...], \"features\": [...], \"lock_associations\": [...] }", description: "Read stored static dependency evidence with exact identity, ownership, scope and provenance. Uncertainty remains explicit." }
     ConfigurationFacts { label: "configuration_facts", shape: ConfigurationFactsFilter, signature: "\"configuration_facts\": { \"formats\": [...], \"node_kinds\": [...], \"roles\": [...], \"scalar_kinds\": [...], \"keys\": [...], \"values\": [...], \"values_ignore_case\": [...], \"value_regex\": \"pattern\", \"value_lt\": \"number\", \"value_le\": \"number\", \"value_gt\": \"number\", \"value_ge\": \"number\", \"xml_parent_keys\": [...], \"xml_preceding_sibling_keys\": [...], \"xml_sibling_attribute_keys\": [...], \"xml_sibling_attribute_values\": [...], \"xml_sibling_attribute_values_ignore_case\": [...], \"xml_reference_source_keys\": [...], \"xml_reference_target_keys\": [...], \"xml_reference_target_element_keys\": [...], \"xml_reference_target_child_keys\": [...], \"xml_peer_element_keys\": [...], \"xml_peer_attribute_keys\": [...], \"xml_peer_child_keys\": [...], \"xml_peer_min_shared_children\": 3, \"routes\": [...], \"fact_ordinals\": [...], \"provenances\": [...], \"completenesses\": [...] }", description: "Seed authored configuration-document facts with exact key/value, XML structural relations, same-document references, peer child-set comparisons, route, node, provenance, and document-completeness constraints. Unsupported formats and recovered documents remain typed diagnostics instead of becoming clean empty answers." }
+    CallReachability { label: "call_reachability", shape: CallReachability, signature: "call_reachability: { sources: query, sinks: query, depth?: positive-integer }", description: "Source-root static call reachability with correlated positive path certificates and typed incomplete coverage." }
     Correlate { label: "correlate", shape: CrossDomainCorrelation, signature: "\"correlate\": { \"relation\": { \"configuration_key\": { \"documents\": [\"path\", ...] } }, \"code\": { query }, \"configuration\": { query } }", description: "Use a registered structural relation to pair input evidence, retaining dependency witnesses whenever mitigation cannot be proved." }
     RequireBoth { label: "require_both", shape: CrossDomainRequirement, signature: "\"require_both\": { \"code\": { query }, \"configuration\": { query } }", description: "Require a programming-code query and a configuration query to both produce rows, without pairing them." }
 }
@@ -3734,6 +3744,7 @@ pub const ALL_QUERY_PLAN_SOURCES: &[QueryField] = &[
     QueryField::Exports,
     QueryField::DependencyEvidence,
     QueryField::ConfigurationFacts,
+    QueryField::CallReachability,
     QueryField::Correlate,
     QueryField::RequireBoth,
     QueryField::Paths,
@@ -5196,3 +5207,17 @@ pub(crate) const DECLARATION_TYPE_KINDS: &[&str] = &[
 
 #[cfg(test)]
 mod authoring_tests;
+
+json_fields! {
+    CallReachabilityField,
+    ALL_CALL_REACHABILITY_FIELDS,
+    Sources { label: "sources", shape: Query, signature: ":sources query", description: "Select exact source endpoints with a source-owning callable." }
+    Sinks { label: "sinks", shape: Query, signature: ":sinks query", description: "Select reached call endpoints using an ordinary RQL plan." }
+    Depth { label: "depth", shape: PositiveInteger, signature: ":depth positive-integer", description: "Optional existing call-depth bound. Omission adds no depth cap. An open frontier reports typed truncation." }
+}
+
+pub fn call_reachability_field_for_rql_label(label: &str) -> Option<CallReachabilityField> {
+    label
+        .strip_prefix(':')
+        .and_then(CallReachabilityField::from_label)
+}

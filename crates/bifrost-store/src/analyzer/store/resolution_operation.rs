@@ -6,6 +6,8 @@
 //! lease after return: `Current` is authorization at that final boundary, not
 //! a long transaction or workspace lock.
 
+use brokk_bifrost_rust::cfg::RustMacroDefinitionOutcome;
+
 mod services;
 pub(in crate::analyzer::store) use services::selected_jvm_declaration_owner;
 pub(in crate::analyzer::store) mod python_models;
@@ -72,9 +74,24 @@ pub use python_demand::{
     PythonDefinitionAnswer, PythonExternalSelectionState, PythonSelectedExternalImport,
     PythonSelectedImportBoundary,
 };
+mod python_hierarchy;
 #[path = "resolution_operation/python_demand/lexical.rs"]
 pub(crate) mod python_lexical;
+#[doc(hidden)]
+pub use python_hierarchy::{
+    PythonClassHierarchy, PythonHierarchyOwner, PythonHierarchyRead, python_model_c3,
+};
 mod python_members;
+#[cfg(any(test, feature = "test-support"))]
+pub(super) use python_members::operations::{
+    PYTHON_STRUCTURAL_IMPORT_CONTAINERS_SQL, PYTHON_STRUCTURAL_IMPORTED_BUILTINS_SQL,
+    PYTHON_STRUCTURAL_IMPORTED_CELLS_SQL,
+};
+#[cfg(test)]
+pub(crate) fn python_hierarchy_policy_for_test()
+-> &'static dyn crate::analyzer::resolution::fact_resolution::HierarchyPolicy {
+    &python_members::PYTHON_HIERARCHY
+}
 #[doc(hidden)]
 pub use python_members::operations::PythonMutationQuery;
 #[doc(hidden)]
@@ -149,6 +166,7 @@ mod root_bridges;
 #[doc(hidden)]
 pub mod rust_crate_context;
 pub(super) mod rust_derive_helpers;
+pub mod rust_macro_types;
 pub use super::resolution_stage::SelectedResolutionStageOutcome;
 
 use crate::analyzer::resolution::SeamProfiled;
@@ -398,6 +416,7 @@ use super::selected_definition::SelectedLexicalDefinitionReadOutcome;
 
 use super::selected_read_memo::ExactReadMemo;
 use brokk_bifrost_core::analyzer::memo_attribution::ReadReuseRefusal;
+use brokk_bifrost_core::retention_budget::{BudgetRegion, BudgetedValue, RetentionBudget};
 
 use super::AnalyzerStore;
 use super::Result;
@@ -830,9 +849,12 @@ pub(crate) fn rust_declaration_context_sources(
 /// selected database read.
 #[doc(hidden)]
 pub struct SelectedResolutionOperationInput<'project, 'selection> {
+    binary_operation_type_provider:
+        Option<Arc<dyn super::language_support::BinaryOperationTypeProvider + 'project>>,
     project: &'project dyn Project,
     analyzer: Option<&'project dyn SelectedAnalyzerServices>,
     read_reuse: Option<&'project dyn ReadReuseRefusal>,
+    rust_macro_invocation_services: Option<Arc<dyn SelectedAnalyzerServices + 'project>>,
     analysis_generation: u64,
     workspace_id: &'selection WorkspaceId,
     snapshots: &'selection WorkspaceSnapshots,
@@ -847,9 +869,12 @@ pub struct SelectedResolutionOperationInput<'project, 'selection> {
 #[doc(hidden)]
 #[derive(Clone)]
 pub struct CapturedSelectedResolutionInput<'project> {
+    binary_operation_type_provider:
+        Option<Arc<dyn super::language_support::BinaryOperationTypeProvider + 'project>>,
     project: &'project dyn Project,
     analyzer: Option<&'project dyn SelectedAnalyzerServices>,
     read_reuse: Option<&'project dyn ReadReuseRefusal>,
+    rust_macro_invocation_services: Option<Arc<dyn SelectedAnalyzerServices + 'project>>,
     analysis_generation: u64,
     workspace_id: WorkspaceId,
     snapshots: WorkspaceSnapshots,
@@ -863,9 +888,11 @@ impl<'project> CapturedSelectedResolutionInput<'project> {
     #[doc(hidden)]
     pub fn capture(input: &SelectedResolutionOperationInput<'project, '_>) -> Self {
         Self {
+            binary_operation_type_provider: input.binary_operation_type_provider.clone(),
             project: input.project,
             analyzer: input.analyzer,
             read_reuse: input.read_reuse,
+            rust_macro_invocation_services: input.rust_macro_invocation_services.clone(),
             analysis_generation: input.analysis_generation,
             workspace_id: input.workspace_id.clone(),
             snapshots: input.snapshots.clone(),
@@ -879,9 +906,11 @@ impl<'project> CapturedSelectedResolutionInput<'project> {
     #[doc(hidden)]
     pub fn input(&self) -> SelectedResolutionOperationInput<'project, '_> {
         SelectedResolutionOperationInput {
+            binary_operation_type_provider: self.binary_operation_type_provider.clone(),
             project: self.project,
             analyzer: self.analyzer,
             read_reuse: self.read_reuse,
+            rust_macro_invocation_services: self.rust_macro_invocation_services.clone(),
             analysis_generation: self.analysis_generation,
             workspace_id: &self.workspace_id,
             snapshots: &self.snapshots,
@@ -903,9 +932,11 @@ impl<'project, 'selection> SelectedResolutionOperationInput<'project, 'selection
         overlay_masks: &'selection [SelectedResolutionOverlayMask],
     ) -> Self {
         Self {
+            binary_operation_type_provider: None,
             project,
             analyzer: None,
             read_reuse: None,
+            rust_macro_invocation_services: None,
             analysis_generation: project.analysis_generation(),
             workspace_id,
             snapshots,
@@ -914,6 +945,26 @@ impl<'project, 'selection> SelectedResolutionOperationInput<'project, 'selection
             content_mounts: Vec::new(),
             explicit_model_authority: None,
         }
+    }
+
+    /// Supply read attribution without declaration or model authority. Rust
+    /// invocation and operator readers share this operation-owned adapter.
+    #[doc(hidden)]
+    pub fn with_rust_read_attribution(
+        mut self,
+        services: Arc<dyn SelectedAnalyzerServices + 'project>,
+    ) -> Self {
+        assert!(self.rust_macro_invocation_services.is_none());
+        self.rust_macro_invocation_services = Some(services);
+        self
+    }
+
+    pub fn with_binary_operation_type_provider(
+        mut self,
+        provider: Arc<dyn super::language_support::BinaryOperationTypeProvider + 'project>,
+    ) -> Self {
+        self.binary_operation_type_provider = Some(provider);
+        self
     }
 
     #[doc(hidden)]
@@ -1040,7 +1091,16 @@ impl<T> SelectedResolutionOperationOutcome<T> {
 #[doc(hidden)]
 pub enum SelectedResolutionLocated<T> {
     Found(T),
-    Missing,
+    Missing(ReferenceInventoryCompleteness),
+}
+
+/// Evidence for absence from the selected producer reference inventory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum ReferenceInventoryCompleteness {
+    Certified,
+    Incomplete(ResolutionCompletion),
+    Unavailable,
 }
 
 /// Bounded broad-result staging that rolls back on drop until `publish`.
@@ -1066,76 +1126,72 @@ pub struct MacroOverlaySlot {
     pub prepared_files: HashSet<String>,
 }
 
-/// One bounded macro frontier snapshot on a pooled SQLite reader.
-/// Its bounded shadow rows live in the reader's TEMP database.
-pub(in crate::analyzer::store) struct RetainedMacroFrontier {
-    stage_tables: Vec<String>,
-    requested_files: Vec<PathBuf>,
-    checked_files: HashSet<PathBuf>,
-    overlay: MacroOverlaySlot,
-    prepared_files: HashSet<PathBuf>,
-    receipt: Box<dyn std::any::Any + Send + Sync>,
-    selection_fingerprint: [u8; 32],
-    routing_digest: [u8; 32],
-    scope_identity: [u8; 32],
-    analysis_generation: u64,
-    main_data_version: i64,
+// Cleared pooled readers still need a TEMP-page bound, independent of front retention.
+pub(super) fn macro_temp_within_cap(connection: &rusqlite::Connection) -> Result<bool> {
+    let pages: i64 = connection.query_row("PRAGMA temp.page_count", [], |row| row.get(0))?;
+    let page_size: i64 = connection.query_row("PRAGMA temp.page_size", [], |row| row.get(0))?;
+    Ok(pages.saturating_mul(page_size) <= 16 * 1024 * 1024)
 }
-
-#[cfg(test)]
-impl RetainedMacroFrontier {
-    pub(super) fn empty_for_test() -> Self {
-        Self {
-            stage_tables: Vec::new(),
-            requested_files: Vec::new(),
-            checked_files: HashSet::default(),
-            overlay: MacroOverlaySlot {
-                prepared_files: HashSet::default(),
-            },
-            prepared_files: HashSet::default(),
-            receipt: Box::new(()),
-            selection_fingerprint: [0; 32],
-            routing_digest: [0; 32],
-            scope_identity: [0; 32],
-            analysis_generation: 0,
-            main_data_version: 0,
-        }
-    }
-}
-
-// A retained reader may hold one snapshot of one small request set. The row
-// and page caps bound both the live TEMP stage and its shadow copy.
-const MAX_RETAINED_MACRO_FILES: usize = 8;
-const MAX_RETAINED_MACRO_PATH_BYTES: usize = 4096;
-const MAX_RETAINED_MACRO_RECEIPT_BYTES: usize = 16 * 1024;
-const MAX_RETAINED_MACRO_STAGE_ROWS: i64 = 20_000;
-const MAX_RETAINED_MACRO_STAGE_BYTES: i64 = 16 * 1024 * 1024;
-const RETAINED_MACRO_PREFIX: &str = "retained_macro_";
 
 #[cfg(any(test, feature = "test-support"))]
 thread_local! {
-    static FORCE_MACRO_POST_COPY_CAP_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static MACRO_READER_DISCARDS_FOR_TEST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static MACRO_READER_DISCARDS_FOR_TEST: Cell<usize> = const { Cell::new(0) };
+    static MACRO_FRONT_LEGACY_DROPS: Cell<usize> = const { Cell::new(0) };
+    static FORCE_MACRO_ADMISSION_REFUSAL: Cell<bool> = const { Cell::new(false) };
 }
-
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
-pub fn set_macro_post_copy_cap_failure_for_test(force: bool) {
-    FORCE_MACRO_POST_COPY_CAP_FOR_TEST.with(|cell| cell.set(force));
+pub(in crate::analyzer::store) fn note_macro_reader_discard_for_test() {
+    MACRO_READER_DISCARDS_FOR_TEST.with(|cell| cell.set(cell.get() + 1));
 }
-
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub fn take_macro_reader_discards_for_test() -> usize {
     MACRO_READER_DISCARDS_FOR_TEST.with(|cell| cell.replace(0))
 }
-
 #[cfg(any(test, feature = "test-support"))]
-pub(in crate::analyzer::store) fn note_macro_reader_discard_for_test() {
-    MACRO_READER_DISCARDS_FOR_TEST.with(|cell| cell.set(cell.get() + 1));
+#[doc(hidden)]
+pub fn set_macro_admission_refusal_for_test(refused: bool) {
+    FORCE_MACRO_ADMISSION_REFUSAL.with(|cell| cell.set(refused));
 }
 
-fn macro_frontier_cache_note(reads: &dyn SelectedMacroFrontierReads, hit: bool, reason: &str) {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn take_macro_front_legacy_drops_for_test() -> usize {
+    MACRO_FRONT_LEGACY_DROPS.with(|count| count.replace(0))
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static FORCE_MACRO_RESTORE_FAILURE: Cell<bool> = const { Cell::new(false) };
+    static MACRO_RESTORED_ROWS_FOR_TEST: Cell<usize> = const { Cell::new(0) };
+}
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn set_macro_restore_failure_for_test(force: bool) {
+    FORCE_MACRO_RESTORE_FAILURE.with(|flag| flag.set(force));
+    if force {
+        MACRO_RESTORED_ROWS_FOR_TEST.with(|count| count.set(0));
+    }
+}
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn macro_restored_rows_for_test() -> usize {
+    MACRO_RESTORED_ROWS_FOR_TEST.with(Cell::get)
+}
+
+mod macro_front_retention;
+pub(in crate::analyzer::store) use macro_front_retention::RetainedMacroFrontier;
+use macro_front_retention::{MacroFrontKey, MacroFrontOutput};
+
+fn macro_frontier_cache_note(
+    reads: Option<&dyn SelectedMacroFrontierReads>,
+    reader: Option<brokk_bifrost_core::attribution::ConnectionTag>,
+    hit: bool,
+    reason: &'static str,
+) {
+    #[cfg(any(test, feature = "test-support"))]
+    MACRO_FRONT_LAST_REASON.with(|last| last.set(Some(reason)));
     #[cfg(any(test, feature = "test-support"))]
     if hit && reason == "exact_set" {
         MACRO_FRONTIER_CACHE_HITS.with(|cell| cell.set(cell.get() + 1));
@@ -1146,9 +1202,9 @@ fn macro_frontier_cache_note(reads: &dyn SelectedMacroFrontierReads, hit: bool, 
     }
     crate::profiling::note_with(|| {
         format!(
-            "rust_caller::macro_frontier_cache hit={hit} reason={reason} policy_unit={}",
+            "rust_caller::macro_frontier_cache reader={reader:?} hit={hit} reason={reason} policy_unit={}",
             reads
-                .policy_unit_label()
+                .and_then(|reads| reads.policy_unit_label())
                 .unwrap_or_else(|| "none".to_owned())
         )
     });
@@ -1157,6 +1213,7 @@ fn macro_frontier_cache_note(reads: &dyn SelectedMacroFrontierReads, hit: bool, 
 // These test counters follow synchronous selected-operation reads on the caller thread.
 #[cfg(any(test, feature = "test-support"))]
 thread_local! {
+    static MACRO_FRONT_LAST_REASON: Cell<Option<&'static str>> = const { Cell::new(None) };
     static MACRO_FRONTIER_CACHE_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static MACRO_FRONTIER_PREPARATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static MACRO_FRONTIER_DATA_VERSION_MISSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -1175,6 +1232,12 @@ pub fn take_macro_frontier_cache_counts_for_test() -> (usize, usize) {
 #[doc(hidden)]
 pub fn take_macro_frontier_data_version_misses_for_test() -> usize {
     MACRO_FRONTIER_DATA_VERSION_MISSES.with(|cell| cell.replace(0))
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn macro_front_last_reason_for_test() -> Option<&'static str> {
+    MACRO_FRONT_LAST_REASON.with(Cell::get)
 }
 
 fn macro_stage_tables(connection: &rusqlite::Connection) -> Result<Vec<String>> {
@@ -1202,112 +1265,6 @@ fn macro_stage_tables(connection: &rusqlite::Connection) -> Result<Vec<String>> 
         _ => 5,
     });
     Ok(tables)
-}
-
-pub(super) fn discard_macro_stage_snapshot(connection: &rusqlite::Connection) -> Result<()> {
-    for table in macro_stage_tables(connection)? {
-        let shadow = format!("{RETAINED_MACRO_PREFIX}{table}");
-        if shadow_table_exists(connection, &shadow)? {
-            connection.execute_batch(&format!("DELETE FROM temp.{shadow}"))?;
-        }
-    }
-    Ok(())
-}
-
-pub(super) fn macro_temp_within_cap(connection: &rusqlite::Connection) -> Result<bool> {
-    let pages: i64 = connection.query_row("PRAGMA temp.page_count", [], |row| row.get(0))?;
-    let page_size: i64 = connection.query_row("PRAGMA temp.page_size", [], |row| row.get(0))?;
-    Ok(pages.saturating_mul(page_size) <= MAX_RETAINED_MACRO_STAGE_BYTES)
-}
-
-fn shadow_table_exists(connection: &rusqlite::Connection, name: &str) -> Result<bool> {
-    Ok(connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM temp.sqlite_schema WHERE type='table' AND name=?1)",
-        [name],
-        |row| row.get(0),
-    )?)
-}
-
-fn with_accounted_macro_snapshot_write<T>(
-    inventory: &super::resolution_selection::SelectedResolutionMountInventory<'_>,
-    write: impl FnOnce(&rusqlite::Connection) -> Result<T>,
-) -> Result<T> {
-    let connection = inventory.connection();
-    let before_changes = connection.total_changes();
-    let before_schema: i64 =
-        connection.query_row("PRAGMA temp.schema_version", [], |row| row.get(0))?;
-    let result = write(connection);
-    inventory.account_committed_request_changes(connection.total_changes() - before_changes);
-    let after_schema: i64 =
-        connection.query_row("PRAGMA temp.schema_version", [], |row| row.get(0))?;
-    inventory.account_committed_schema_changes(after_schema - before_schema);
-    result
-}
-
-fn snapshot_macro_stage(connection: &rusqlite::Connection) -> Result<Option<Vec<String>>> {
-    if !connection.is_autocommit() {
-        return Ok(None);
-    }
-    let tables = macro_stage_tables(connection)?;
-    let mut rows = 0i64;
-    for table in &tables {
-        rows += connection.query_row(&format!("SELECT COUNT(*) FROM temp.{table}"), [], |row| {
-            row.get::<_, i64>(0)
-        })?;
-        if rows > MAX_RETAINED_MACRO_STAGE_ROWS {
-            return Ok(None);
-        }
-    }
-    let pages: i64 = connection.query_row("PRAGMA temp.page_count", [], |row| row.get(0))?;
-    let page_size: i64 = connection.query_row("PRAGMA temp.page_size", [], |row| row.get(0))?;
-    if pages.saturating_mul(page_size) > MAX_RETAINED_MACRO_STAGE_BYTES / 2 {
-        return Ok(None);
-    }
-    discard_macro_stage_snapshot(connection)?;
-    for table in &tables {
-        let shadow = format!("{RETAINED_MACRO_PREFIX}{table}");
-        if shadow_table_exists(connection, &shadow)? {
-            connection.execute_batch(&format!(
-                "INSERT INTO temp.{shadow} SELECT * FROM temp.{table}"
-            ))?;
-        } else {
-            connection.execute_batch(&format!(
-                "CREATE TEMP TABLE {shadow} AS SELECT * FROM temp.{table}"
-            ))?;
-        }
-    }
-    let pages: i64 = connection.query_row("PRAGMA temp.page_count", [], |row| row.get(0))?;
-    let within_cap = pages.saturating_mul(page_size) <= MAX_RETAINED_MACRO_STAGE_BYTES && {
-        #[cfg(any(test, feature = "test-support"))]
-        {
-            !FORCE_MACRO_POST_COPY_CAP_FOR_TEST.with(|cell| cell.get())
-        }
-        #[cfg(not(any(test, feature = "test-support")))]
-        {
-            true
-        }
-    };
-    if !within_cap {
-        discard_macro_stage_snapshot(connection)?;
-    }
-    Ok(within_cap.then_some(tables))
-}
-
-fn restore_macro_stage_snapshot(
-    inventory: &super::resolution_selection::SelectedResolutionMountInventory<'_>,
-    tables: &[String],
-) -> Result<()> {
-    inventory.with_owned_temp_transaction(|connection| {
-        for table in tables {
-            let shadow = format!("{RETAINED_MACRO_PREFIX}{table}");
-            connection.execute_batch(&format!(
-                "INSERT INTO temp.{table} SELECT * FROM temp.{shadow}"
-            ))?;
-        }
-        Ok(super::resolution_selection::SelectedResolutionTempTransaction::Commit(()))
-    })?;
-    inventory.note_restored_macro_stage();
-    Ok(())
 }
 
 #[derive(Clone)]
@@ -1461,12 +1418,12 @@ impl SelectedResolutionOperation<'_, '_> {
     #[doc(hidden)]
     #[doc(hidden)]
     pub fn pooled_reader_serial_for_test(&self) -> Option<u64> {
-        self.ready.inventory.conn.pooled_reader_serial_for_test()
+        self.ready.inventory.pooled_reader_serial_for_test()
     }
 
     #[doc(hidden)]
     pub fn idle_reader_serials_for_test(&self) -> Vec<u64> {
-        self.ready.inventory.conn.idle_reader_serials_for_test()
+        self.ready.inventory.idle_reader_serials_for_test()
     }
 }
 
@@ -1533,8 +1490,8 @@ pub struct QueryResolutionPreparation {
     rust_workspace_relations: RefCell<ClosedRelations>,
 }
 
-/// Whether the operation's consumers allow its macro frontier snapshot to stay
-/// with the reader. One incomplete site invalidates the whole operation.
+/// Consumer completion under the old gate, retained only to measure its cost.
+/// Reuse now depends on the front builder's own captured certification.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MacroRetention {
     /// No consumer has reported yet.
@@ -2137,6 +2094,13 @@ pub struct SelectedPointReadMemos {
 
 impl SelectedPointReadMemos {
     #[cfg(any(test, feature = "test-support"))]
+    fn is_empty_for_test(&self) -> bool {
+        self.reference_evidence.borrow().is_empty()
+            && self.candidate_paths.borrow().is_empty_for_test()
+            && self.import_references.borrow().is_empty()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
     pub fn observe_candidate_paths_for_test(&self) {
         self.candidate_paths.borrow_mut().observed = Some(Vec::new());
     }
@@ -2664,14 +2628,62 @@ impl<'a, 'store> RustForwardBuildView<'a, 'store> {
     }
 }
 
+/// One operation's private region, invalidated even when it unwinds. The
+/// owner budget accounts caller-held rows after eviction until their last drop.
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct AllocatedMacroInputRows(Vec<rust_facts::RustMacroInvocationInputSourceFact>);
+impl std::fmt::Debug for AllocatedMacroInputRows {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl std::ops::Deref for AllocatedMacroInputRows {
+    type Target = Vec<rust_facts::RustMacroInvocationInputSourceFact>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl brokk_bifrost_core::retention_budget::RetainedBytes for AllocatedMacroInputRows {
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of_val(self)
+            + brokk_bifrost_core::hash::allocated_vec_slot_bytes(&self.0)
+            + self
+                .0
+                .iter()
+                .map(|r| r.allocated_retained_bytes() - std::mem::size_of_val(r))
+                .sum::<usize>()
+    }
+}
+struct SelectedMacroInputRows(BudgetRegion<String, AllocatedMacroInputRows>);
+
+impl SelectedMacroInputRows {
+    fn new(budget: &RetentionBudget) -> Self {
+        Self(budget.region("store.selected-macro-inputs", None))
+    }
+
+    fn clear(&self) {
+        self.0.invalidate_all();
+    }
+}
+
+impl Drop for SelectedMacroInputRows {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
 pub struct ReadySelectedResolution<'store, 'input> {
     store: &'store AnalyzerStore,
     #[doc(hidden)]
     pub inventory: Rc<SelectedResolutionMountInventory<'store>>,
     query_preparation: Option<Box<QueryResolutionPreparation>>,
     content_mounts: Vec<SelectedResolutionContentMountRequest>,
+    binary_operation_type_provider:
+        Option<Arc<dyn super::language_support::BinaryOperationTypeProvider + 'input>>,
     project: &'input dyn Project,
     analyzer: Option<&'input dyn SelectedAnalyzerServices>,
+    // One borrowed analyzer wrapper, owned only for this operation's lifetime.
+    rust_macro_invocation_services: Option<Arc<dyn SelectedAnalyzerServices + 'input>>,
     read_reuse: Option<&'input dyn ReadReuseRefusal>,
     /// Captured request authority, including an explicit captured absence.
     model_authority: Option<Arc<dyn SelectedModelAuthority + Send + Sync>>,
@@ -2681,6 +2693,8 @@ pub struct ReadySelectedResolution<'store, 'input> {
     /// returns, so nothing here outlives the query; the retained preparation
     /// beside it never sees these answers.
     macro_walk: RefCell<SelectedTextualMacroWalkMemo>,
+    // Private, owner-budgeted immutable rows; cleared between crate stages.
+    macro_inputs: SelectedMacroInputRows,
     /// The current crate stage's `rust_crate_point_export.sql` answers.
     /// `None` outside a crate stage; see `rust_crate_rows::CrateExportMemo`.
     crate_rows: RefCell<Option<rust_crate_rows::CrateRowMemo>>,
@@ -2794,14 +2808,23 @@ struct SelectedTextualMacroWalkMemo {
     /// Only answers from a walk that broke no import cycle are recorded: a
     /// cyclic walk's answer depends on where it entered the cycle, so it is
     /// not a property of the question alone.
-    visible: HashMap<(String, PathBuf, usize), Option<(PathBuf, SourceDeclarationId)>>,
+    visible: HashMap<
+        (String, PathBuf, usize),
+        RustMacroDefinitionOutcome<(PathBuf, SourceDeclarationId)>,
+    >,
     /// What `select_textual_macro_definition` answered for the same key, the
     /// imported-macro fallback included.
-    selected: HashMap<(String, PathBuf, usize), Option<(PathBuf, SourceDeclarationId)>>,
+    selected: HashMap<
+        (String, PathBuf, usize),
+        RustMacroDefinitionOutcome<(PathBuf, SourceDeclarationId)>,
+    >,
     /// The usage facts of every file the walk has read. Shared rather than
     /// cloned because a file's facts carry every identifier occurrence in it
     /// and the walk reads the caller's once per invocation.
     sources: HashMap<PathBuf, Option<std::rc::Rc<RustUsageFacts>>>,
+    // Overlay/import consumers need import targets as well as module inputs.
+    // Clear these with the crate-stage module walk, just as before projection.
+    overlay_sources: HashMap<PathBuf, Option<std::rc::Rc<RustUsageFacts>>>,
     /// The parents of every file an ancestry read has reached, keyed by the
     /// file's workspace-relative path: the file that declares or includes it
     /// and the byte at which it does. A file's parents do not depend on the
@@ -2832,13 +2855,14 @@ impl std::ops::DerefMut for ReadySelectedResolution<'_, '_> {
 impl<'store> ReadySelectedResolution<'store, '_> {
     pub(super) fn certified_csharp_view(
         &self,
-    ) -> Result<Option<super::csharp_compilation::CertifiedCSharpHandle>> {
+    ) -> Result<Option<super::csharp_compilation::CertifiedCSharpHandle<'_>>> {
         let snapshot = self.snapshot("csharp");
         if self.csharp_view.get().is_none() {
             let handle = match snapshot {
                 Some(snapshot) => super::csharp_compilation::selected_csharp_handle(
                     self.inventory.connection(),
                     snapshot,
+                    self.store.retention_budget(),
                 )?,
                 None => None,
             };
@@ -2854,19 +2878,15 @@ impl<'store> ReadySelectedResolution<'store, '_> {
         assert_eq!(&handle.snapshot, snapshot);
         // Nested reads use immutable (workspace, generation, revision) rows, so
         // their answers do not depend on which connection snapshot sees them.
-        Ok((self
-            .store
-            .lend_selected_reader(self.inventory.connection(), || {
-                analyzer.certify_selected_configuration(
-                    Language::CSharp,
-                    snapshot,
-                    &handle.input_digest,
-                    self.inventory.connection(),
-                )
-            })
-            == ConfigurationCertificate::Certified)
+        Ok((analyzer.certify_selected_configuration(
+            Language::CSharp,
+            snapshot,
+            &handle.input_digest,
+            self.inventory.connection(),
+        ) == ConfigurationCertificate::Certified)
             .then_some(super::csharp_compilation::CertifiedCSharpHandle(
                 handle.clone(),
+                std::marker::PhantomData,
             )))
     }
 
@@ -2885,7 +2905,10 @@ impl<'store> ReadySelectedResolution<'store, '_> {
             )]);
         Ok((
             persisted_gap_frontier(self, ordinal, key)?,
-            format!("{:?}", unexpanded_item_macro_gaps(self, &completion)?),
+            format!(
+                "{:?}",
+                unexpanded_item_macro_gaps(self, &completion, &CancellationToken::new())?
+            ),
             native_units::selected_public_diagnostic_site(self, semantic)?,
             obligation_site_details(self, ordinal, site)?,
         ))
@@ -3042,7 +3065,9 @@ impl<'store> ReadySelectedResolution<'store, '_> {
             .as_ref()
             .and_then(|authority| authority.active_models());
         SelectedResolutionTypedSource::new_on_demand(&self.inventory)
+            .with_binding_cache(&self.store.cache_budget)
             .with_go_context_binder(self)
+            .with_type_heads(self, self.binary_operation_type_provider.as_deref())
             .with_context_identities(self.context_identities.clone())
             .with_external_providers(providers)
             .with_external_provider_families(families)
@@ -3096,17 +3121,19 @@ impl Drop for ReadySelectedResolution<'_, '_> {
         );
         if self.first_macro_frontier_request_seen.get()
             && self.macro_retention.get() != MacroRetention::Completed
-            && self
-                .inventory
-                .retained_macro_frontier
-                .borrow_mut()
-                .take()
-                .is_some()
+            && let Some(cache) = self.inventory.retained_macro_frontier.borrow().as_ref()
         {
-            // A failed site cannot publish a reusable stage or read receipt.
-            // Close the pooled connection with its TEMP shadow snapshot.
-            self.inventory
-                .raise_macro_reader_checkin(super::resolution_selection::MacroReaderCheckin::Clear);
+            // #8410's gate followed consumer completion, not the front builder.
+            // Keep its measured cost visible without invalidating a certified front.
+            let entries = cache.region.stats().entries;
+            let reader = brokk_bifrost_core::cache_db::sql_profile::connection_tag(
+                self.inventory.connection(),
+            );
+            crate::profiling::note_with(|| {
+                format!("rust_caller::macro_front_legacy_drop reader={reader:?} entries={entries}")
+            });
+            #[cfg(any(test, feature = "test-support"))]
+            MACRO_FRONT_LEGACY_DROPS.with(|count| count.set(count.get() + entries));
         }
         let preparation = self
             .query_preparation
@@ -3718,6 +3745,85 @@ impl Drop for RustSelectedNestingGuard {
 }
 
 impl<'store, 'input> SelectedResolutionOperation<'store, 'input> {
+    /// Roll back request-local Go products after shared memo admission rejects
+    /// a fill. Immutable store-budget snapshots have their own completed
+    /// capture and are independent of this request's discarded state.
+    #[doc(hidden)]
+    pub fn discard_go_request_derived_state(&mut self) {
+        *self.go_context_selections.get_mut() = Default::default();
+        *self.go_import_inputs.get_mut() = Default::default();
+        self.go_prepared_contexts.clear();
+        *self.go_context_registrations.get_mut() = Default::default();
+        *self.go_receiver_anchor_types_memo.get_mut() = Default::default();
+        *self.go_point_receiver_anchor_memo.get_mut() = Default::default();
+        *self.go_point_receiver_anchor_stats.get_mut() = None;
+        *self.go_source_roles.get_mut() = Default::default();
+        *self.ready.go_publications.get_mut() = Default::default();
+        *self.ready.go_publication_rechecks.get_mut() = Default::default();
+        self.ready.go_base_profile.set(None);
+        self.ready.go_active_package.set(None);
+        *self.ready.go_definition_contexts.get_mut() = Default::default();
+        *self.ready.go_package_inventory_complete.get_mut() = None;
+        *self.ready.go_package_inventory_fragments.get_mut() = Default::default();
+        self.ready
+            .operation_demand_state
+            .discard_completed_answers();
+        self.ready.operation_candidate_cache =
+            std::rc::Rc::new(UnconditionalCandidateCache::for_operation());
+        *self.ready.graph_stage_candidate_cache.get_mut() = None;
+        self.ready.boundary_candidate_read_memo = std::rc::Rc::new(RefCell::default());
+        self.ready.point_read_memos = std::rc::Rc::default();
+        self.ready.package_reference_read_memo = std::rc::Rc::new(RefCell::default());
+        self.ready.definition_module_anchors.get_mut().clear();
+        // Interned identity values and the selected input/mount inventory are
+        // authority, not derived answers. Existing local results can still
+        // refer to these stable identities while discarded memos rebuild.
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn go_request_derived_state_empty_for_test(&self) -> bool {
+        self.go_context_selections.borrow().is_empty()
+            && self.go_import_inputs.borrow().is_empty()
+            && self.go_prepared_contexts.is_empty()
+            && self.go_context_registrations.borrow().is_empty()
+            && self.go_receiver_anchor_types_memo.borrow().is_empty()
+            && self.go_point_receiver_anchor_memo.borrow().is_empty()
+            && self.go_point_receiver_anchor_stats.borrow().is_none()
+            && self.go_source_roles.borrow().is_empty()
+            && self.ready.go_publications.borrow().is_empty()
+            && self.ready.go_publication_rechecks.borrow().is_empty()
+            && self.ready.go_base_profile.get().is_none()
+            && self.ready.go_active_package.get().is_none()
+            && self.ready.go_definition_contexts.borrow().is_empty()
+            && self.ready.go_package_inventory_complete.borrow().is_none()
+            && self
+                .ready
+                .go_package_inventory_fragments
+                .borrow()
+                .is_empty()
+            && self.ready.operation_demand_state.completed_answers_empty()
+            && self.ready.operation_candidate_cache.is_empty_for_test()
+            && self.ready.boundary_candidate_read_memo.borrow().is_empty()
+            && self.ready.point_read_memos.is_empty_for_test()
+            && self.ready.graph_stage_candidate_cache.borrow().is_none()
+            && self.ready.package_reference_read_memo.borrow().is_empty()
+            && self.ready.definition_module_anchors.borrow().is_empty()
+    }
+
+    /// Install read attribution for invocation lookups on a Rust operation.
+    /// The wrapper borrows the analyzer; it retains no ledger or source rows.
+    pub fn with_rust_macro_invocation_services(
+        mut self,
+        services: Box<dyn SelectedAnalyzerServices + 'input>,
+    ) -> Self {
+        assert!(self.ready.rust_macro_invocation_services.is_none());
+        let services: Arc<dyn SelectedAnalyzerServices> = services.into();
+        self.captured_input.rust_macro_invocation_services = Some(services.clone());
+        self.ready.rust_macro_invocation_services = Some(services);
+        self
+    }
+
     /// Install the engine's read attribution for reusable Rust frontier work.
     pub fn with_macro_frontier_reads(
         mut self,
@@ -3960,13 +4066,61 @@ pub enum SelectedRustDefinitionProjection {
 #[doc(hidden)]
 pub enum SelectedRustSourceDefinitionProjection {
     Complete(Vec<(SemanticId, SelectedRustSourceDefinition)>),
-    Unavailable,
+    Unavailable(super::resolution_selection::MissingDefinitionReason),
     Cancelled,
+}
+
+/// Certify only a selected target file whose exact content identity is known.
+pub fn unprojected_definition_reason(
+    mounts: SelectedMountTable<'_, '_>,
+    path: &str,
+) -> Result<super::resolution_selection::MissingDefinitionReason> {
+    use super::resolution_selection::MissingDefinitionReason;
+    Ok(match mounts.blob_oid_for_path("rust", path)? {
+        Some(target_oid) => MissingDefinitionReason::UnprojectedDefinition {
+            target_files: vec![(path.to_owned(), target_oid)],
+        },
+        None => MissingDefinitionReason::UncertifiedDefinition,
+    })
+}
+
+#[doc(hidden)]
+pub fn unprojected_rows_reason(
+    mounts: SelectedMountTable<'_, '_>,
+    rows: &[(SemanticId, SelectedRustSourceDefinition)],
+) -> Result<super::resolution_selection::MissingDefinitionReason> {
+    use super::resolution_selection::MissingDefinitionReason;
+    if !rows.is_empty()
+        && rows
+            .iter()
+            .all(|(_, row)| matches!(row, SelectedRustSourceDefinition::UniverseEntry))
+    {
+        return Ok(MissingDefinitionReason::UniverseDefinition);
+    }
+    let mut target_files = BTreeMap::new();
+    for (_, row) in rows {
+        if let SelectedRustSourceDefinition::WithoutUnit { source_file, .. } = row {
+            let path = crate::path_utils::rel_path_string(source_file);
+            let Some(oid) = mounts.blob_oid_for_path("rust", &path)? else {
+                return Ok(MissingDefinitionReason::UncertifiedDefinition);
+            };
+            target_files.insert(path, oid);
+        }
+    }
+    Ok(if target_files.is_empty() {
+        MissingDefinitionReason::UncertifiedDefinition
+    } else {
+        MissingDefinitionReason::UnprojectedDefinition {
+            target_files: target_files.into_iter().collect(),
+        }
+    })
 }
 
 #[doc(hidden)]
 pub enum SelectedRustSourceDefinition {
-    Unit(CodeUnit),
+    /// Nominal identity and the selected source declaration's own range.
+    /// Generated items without an authored declaration site carry `None`.
+    Unit(CodeUnit, Option<Range>),
     Lexical(LexicalDefinition),
     /// A resolved target that is an entry of the language's fixed universe
     /// table: `i64` in a Rust type position, which the request interns as a
@@ -4136,15 +4290,20 @@ pub struct SelectedRustMacroExpansionGap {
     #[doc(hidden)]
     pub semantic: SemanticId,
     #[doc(hidden)]
-    pub relative_path: String,
-    #[doc(hidden)]
-    pub start_byte: usize,
-    #[doc(hidden)]
-    pub end_byte: usize,
+    pub anchor: Option<SelectedRustMacroAnchor>,
     #[doc(hidden)]
     pub macro_name: String,
     #[doc(hidden)]
     pub private_module_route: bool,
+}
+
+/// Source coordinates available only when invocation facts are persisted.
+#[derive(Clone, Debug)]
+#[doc(hidden)]
+pub struct SelectedRustMacroAnchor {
+    pub relative_path: String,
+    pub start_byte: usize,
+    pub end_byte: usize,
 }
 
 /// Whether a Rust reference that reached a block-local item is decided.
@@ -4192,6 +4351,12 @@ pub fn rust_block_local_binding_is_decided(
 
 #[doc(hidden)]
 pub struct SelectedRustReferenceAnswer<T = ()> {
+    /// The `UnsupportedSemantic` reasons of the binding's completion whose
+    /// minting site declared them snapshot-determined
+    /// ([`ReasonDeterminism::Snapshot`]). An `UnsupportedSemantic` outside this
+    /// list is not known to be a snapshot fact (#11510).
+    #[doc(hidden)]
+    pub snapshot_stops: Vec<SemanticId>,
     #[doc(hidden)]
     pub macro_expansion_gaps: Vec<SelectedRustMacroExpansionGap>,
     #[doc(hidden)]
@@ -4211,6 +4376,8 @@ pub struct SelectedRustReferenceAnswer<T = ()> {
     pub resolution: FactResolutionAnswer,
     #[doc(hidden)]
     pub definitions: Vec<CodeUnit>,
+    #[doc(hidden)]
+    pub definition_sites: Vec<(CodeUnit, Option<Range>)>,
     #[doc(hidden)]
     pub lexical_definitions: Vec<LexicalDefinition>,
     /// The name each of the binding's own targets projects to, in the order
@@ -4251,6 +4418,7 @@ impl<T> SelectedRustReferenceAnswer<T> {
         projection: T,
     ) -> Self {
         Self {
+            snapshot_stops: Vec::new(),
             boundary_import_names,
             macro_expansion_gaps,
             generated_surface_gaps,
@@ -4260,6 +4428,7 @@ impl<T> SelectedRustReferenceAnswer<T> {
             named_reasons,
             resolution,
             definitions,
+            definition_sites: Vec::new(),
             lexical_definitions,
             definition_names,
             diagnostic_identities: Vec::new(),
@@ -4277,6 +4446,7 @@ struct SelectedRustDefinitionVocabularies {
     /// declared under two `cfg`s -- and that is one definition here, because
     /// this vocabulary is a set of `CodeUnit`s and nothing else.
     units: Vec<CodeUnit>,
+    sites: Vec<(CodeUnit, Option<Range>)>,
     lexical: Vec<LexicalDefinition>,
     /// The name each target is published under, in projection order. This one
     /// keeps a row per target, so a caller can still see how many targets one
@@ -4301,11 +4471,13 @@ fn split_projected_rust_definitions(
 ) -> Option<SelectedRustDefinitionVocabularies> {
     let requested = rows.len();
     let mut units = Vec::new();
+    let mut sites = Vec::new();
     let mut lexical = Vec::new();
     let mut names = Vec::with_capacity(requested);
     for (semantic, definition) in rows {
         match definition {
-            SelectedRustSourceDefinition::Unit(unit) => {
+            SelectedRustSourceDefinition::Unit(unit, range) => {
+                sites.push((unit.clone(), range));
                 names.push((semantic, unit.fq_name()));
                 if !units.contains(&unit) {
                     units.push(unit);
@@ -4324,6 +4496,7 @@ fn split_projected_rust_definitions(
     }
     Some(SelectedRustDefinitionVocabularies {
         units,
+        sites,
         lexical,
         names,
     })
@@ -4866,33 +5039,12 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
         // this reader below, so a crate stage's snapshot must end before the
         // publication and start again after it.
         self.ready.inventory.pause_stage_read()?;
-        let published = if self.ready.inventory.conn.excludes_store_access() {
-            // The in-memory fallback's reader is the writer connection, which
-            // this operation holds: the store's writer would wait for it.
-            // The operation's cancellation registration on that connection
-            // also interrupts the publication.
-            let result = super::resolution::with_resolution_read_progress_handler(
-                self.ready.inventory.connection(),
-                cancellation,
-                |connection| {
-                    super::resolution_publication::publish_resolution_capsule_on(
-                        connection,
-                        owner,
-                        host.persisted_relative_path().to_owned(),
-                        prepared,
-                        cancellation,
-                    )
-                },
-            );
-            super::resolution_publication::interrupted_capsule_publication(result, cancellation)
-        } else {
-            self.ready.store.publish_selected_resolution_capsule(
-                &owner,
-                host.persisted_relative_path(),
-                prepared,
-                cancellation,
-            )
-        };
+        let published = self.ready.store.publish_selected_resolution_capsule(
+            &owner,
+            host.persisted_relative_path(),
+            prepared,
+            cancellation,
+        );
         self.ready.inventory.resume_stage_read()?;
         let content = match published? {
             ResolutionContentPublicationOutcome::Ready(content) => content,
@@ -4957,19 +5109,65 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
         file: &Path,
         cancellation: &CancellationToken,
     ) -> Result<Option<RustUsageFacts>> {
-        Ok(self
-            .selected_rust_usage_facts_shared(file, cancellation)?
-            .map(|facts| (*facts).clone()))
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        let Some(mount) = self
+            .ready
+            .inventory
+            .mount_record_for_path("rust", &selected_path_key(file))?
+        else {
+            return Ok(None);
+        };
+        let facts = super::read_rust_usage_facts_with_session(
+            self.ready.inventory.connection(),
+            &super::BlobKey::unvaried(mount.blob_oid(), "rust"),
+            None,
+        )?;
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        Ok(facts)
     }
 
-    /// The same read, shared with this request's other readers of the file.
+    fn selected_rust_usage_facts_shared(
+        &self,
+        file: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<Rc<RustUsageFacts>>> {
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        if let Some(facts) = self
+            .ready
+            .macro_walk
+            .borrow()
+            .overlay_sources
+            .get(file)
+            .cloned()
+        {
+            return Ok(facts);
+        }
+        let facts = self.selected_rust_usage_facts(file, cancellation)?;
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        let facts = facts.map(Rc::new);
+        let mut memo = self.ready.macro_walk.borrow_mut();
+        memo.sources.remove(file);
+        memo.overlay_sources
+            .insert(file.to_path_buf(), facts.clone());
+        Ok(facts)
+    }
+
+    /// Only route/include inputs, shared with this operation's module walks.
     ///
     /// The module walk reads the caller's facts once per macro invocation in
     /// it and every module it climbs through once per invocation as well. On
     /// tract that was 60,450 executions of the three usage-fact statements in
     /// one 40-request arm. The result of the read belongs to the request, so
     /// the request holds it.
-    fn selected_rust_usage_facts_shared(
+    fn selected_rust_module_walk_facts_shared(
         &self,
         file: &Path,
         cancellation: &CancellationToken,
@@ -4977,11 +5175,23 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
         if cancellation.is_cancelled() {
             return Ok(None);
         }
+        // A previously loaded full bundle contains the same immutable walk
+        // projection, so there is no reason to hydrate it a second time.
+        if let Some(facts) = self
+            .ready
+            .macro_walk
+            .borrow()
+            .overlay_sources
+            .get(file)
+            .cloned()
+        {
+            return Ok(facts);
+        }
         let recorded = self.ready.macro_walk.borrow().sources.get(file).cloned();
         if let Some(shared) = recorded {
             return Ok(shared);
         }
-        let facts = self.read_selected_rust_usage_facts(file, cancellation)?;
+        let facts = self.read_selected_rust_module_walk_facts(file, cancellation)?;
         if cancellation.is_cancelled() {
             return Ok(None);
         }
@@ -4994,7 +5204,7 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
         Ok(shared)
     }
 
-    fn read_selected_rust_usage_facts(
+    fn read_selected_rust_module_walk_facts(
         &self,
         file: &Path,
         cancellation: &CancellationToken,
@@ -5009,11 +5219,21 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
         else {
             return Ok(None);
         };
-        super::read_rust_usage_facts_with_session(
+        super::read_rust_module_walk_facts(
             self.ready.inventory.connection(),
             &super::BlobKey::unvaried(mount.blob_oid(), "rust"),
-            None,
         )
+        .map(Some)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn selected_rust_module_walk_facts_for_test(
+        &self,
+        file: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<RustUsageFacts>> {
+        self.read_selected_rust_module_walk_facts(file, cancellation)
     }
 
     /// Replay a parent-module textual macro using selected source authority.
@@ -5030,7 +5250,8 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
         invocation_start: usize,
         name: &str,
         cancellation: &CancellationToken,
-    ) -> Result<RustSelectedBuildOutcome<Option<(PathBuf, SourceDeclarationId)>>> {
+    ) -> Result<RustSelectedBuildOutcome<RustMacroDefinitionOutcome<(PathBuf, SourceDeclarationId)>>>
+    {
         let question = (name.to_owned(), caller.to_path_buf(), invocation_start);
         let recorded = self
             .ready
@@ -5048,8 +5269,14 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
             return Ok(RustSelectedBuildOutcome::Stopped);
         };
         let selected = match visible {
-            Some(selected) => Some(selected),
-            None => {
+            RustMacroDefinitionOutcome::Resolved(selected) => {
+                RustMacroDefinitionOutcome::Resolved(selected)
+            }
+            RustMacroDefinitionOutcome::UnprovenActivation
+            | RustMacroDefinitionOutcome::Ambiguous => {
+                return Ok(RustSelectedBuildOutcome::Ready(visible));
+            }
+            RustMacroDefinitionOutcome::Missing => {
                 let RustSelectedBuildOutcome::Ready(imported) = self
                     .select_imported_macro_definition(
                         caller,
@@ -5060,7 +5287,10 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
                 else {
                     return Ok(RustSelectedBuildOutcome::Stopped);
                 };
-                imported
+                imported.map_or(
+                    RustMacroDefinitionOutcome::Missing,
+                    RustMacroDefinitionOutcome::Resolved,
+                )
             }
         };
         self.ready
@@ -5086,7 +5316,8 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
         invocation_start: usize,
         name: &str,
         cancellation: &CancellationToken,
-    ) -> Result<RustSelectedBuildOutcome<Option<(PathBuf, SourceDeclarationId)>>> {
+    ) -> Result<RustSelectedBuildOutcome<RustMacroDefinitionOutcome<(PathBuf, SourceDeclarationId)>>>
+    {
         type Query = (PathBuf, usize);
         type Definition = (PathBuf, SourceDeclarationId);
         type Rank = (usize, std::cmp::Reverse<usize>);
@@ -5103,7 +5334,7 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
         let initial = (caller.to_path_buf(), invocation_start);
         let mut pending = vec![Frame::Visit(initial.clone())];
         let mut active = BTreeSet::new();
-        let mut answers = BTreeMap::<Query, Option<Definition>>::new();
+        let mut answers = BTreeMap::<Query, RustMacroDefinitionOutcome<Definition>>::new();
         let mut broke_a_cycle = false;
         while let Some(frame) = pending.pop() {
             if cancellation.is_cancelled() {
@@ -5127,13 +5358,14 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
                     }
                     if !active.insert(query.clone()) {
                         broke_a_cycle = true;
-                        answers.insert(query, None);
+                        answers.insert(query, RustMacroDefinitionOutcome::Missing);
                         continue;
                     }
                     let (file, position) = &query;
-                    let Some(facts) = self.selected_rust_usage_facts_shared(file, cancellation)?
+                    let Some(facts) =
+                        self.selected_rust_module_walk_facts_shared(file, cancellation)?
                     else {
-                        answers.insert(query.clone(), None);
+                        answers.insert(query.clone(), RustMacroDefinitionOutcome::Missing);
                         active.remove(&query);
                         continue;
                     };
@@ -5218,7 +5450,7 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
                         for child in children {
                             let child = PathBuf::from(child);
                             let child_facts =
-                                self.selected_rust_usage_facts_shared(&child, cancellation)?;
+                                self.selected_rust_module_walk_facts_shared(&child, cancellation)?;
                             let Some(target) = child_facts
                                 .as_ref()
                                 .and_then(|facts| facts.module_routes.scopes.first())
@@ -5267,8 +5499,8 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
                             .collect::<rusqlite::Result<BTreeSet<_>>>()?;
                         for included in included {
                             let included = PathBuf::from(included);
-                            let included_facts =
-                                self.selected_rust_usage_facts_shared(&included, cancellation)?;
+                            let included_facts = self
+                                .selected_rust_module_walk_facts_shared(&included, cancellation)?;
                             let Some(target) = included_facts
                                 .as_ref()
                                 .and_then(|facts| facts.module_routes.scopes.first())
@@ -5320,33 +5552,106 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
                     imported,
                     parents,
                 } => {
+                    let mut candidates = Vec::new();
                     for (rank, dependency) in imported {
-                        if let Some(Some(definition)) = answers.get(&dependency) {
-                            local.push((rank, definition.clone()));
+                        match answers.get(&dependency) {
+                            Some(RustMacroDefinitionOutcome::Resolved(definition)) => {
+                                local.push((rank, definition.clone()))
+                            }
+                            Some(
+                                RustMacroDefinitionOutcome::UnprovenActivation
+                                | RustMacroDefinitionOutcome::Ambiguous,
+                            ) => {
+                                candidates.push((rank, None, brokk_bifrost_rust::selected_context::RustSelectedActivation::Unknown));
+                            }
+                            Some(RustMacroDefinitionOutcome::Missing) | None => {}
                         }
                     }
                     local.sort();
-                    let selected = if let Some((rank, definition)) = local.first() {
-                        local
-                            .iter()
-                            .take_while(|(other, _)| other == rank)
-                            .all(|(_, candidate)| candidate == definition)
-                            .then(|| definition.clone())
-                    } else {
-                        let candidates = parents
-                            .iter()
-                            .map(|parent| answers.get(parent).cloned().flatten())
-                            .collect::<BTreeSet<_>>();
-                        (candidates.len() == 1)
-                            .then(|| candidates.into_iter().next().flatten())
-                            .flatten()
+                    for (rank, (file, declaration)) in local {
+                        let capsule = self
+                            .rust_macro_capsule(&selected_path_key(&file))?
+                            .expect("visible macro has a selected capsule");
+                        let encoded: String = self.ready.inventory.connection().prepare_cached(
+                            "SELECT cfg_condition FROM source_rust_declaration_properties WHERE blob_id=?1 AND declaration_id=?2"
+                        )?.query_row(rusqlite::params![capsule.blob_id(), declaration.get()], |row| row.get(0))?;
+                        let condition =
+                            brokk_bifrost_core::analyzer::rust_facts::decode_rust_cfg_condition(
+                                &encoded,
+                            )
+                            .ok_or_else(|| {
+                                StoreError::corrupt(format!("invalid macro cfg: {encoded:?}"))
+                            })?;
+                        let Some(activation) =
+                            self.rust_cfg_activation_for_caller(&file, &condition, cancellation)?
+                        else {
+                            return Ok(RustSelectedBuildOutcome::Stopped);
+                        };
+                        candidates.push((rank, Some((file, declaration)), activation));
+                    }
+                    candidates.sort_by_key(|candidate| candidate.0);
+                    let selected = match brokk_bifrost_rust::cfg::select_textual_macro(
+                        &candidates,
+                        |candidate| candidate.2,
+                    ) {
+                        RustMacroDefinitionOutcome::Resolved((rank, definition, _)) => {
+                            use brokk_bifrost_rust::selected_context::RustSelectedActivation;
+                            let peers = candidates.iter().filter(|candidate| candidate.0 == *rank);
+                            if peers
+                                .clone()
+                                .any(|candidate| candidate.2 == RustSelectedActivation::Unknown)
+                            {
+                                RustMacroDefinitionOutcome::UnprovenActivation
+                            } else if peers
+                                .filter(|candidate| candidate.2 == RustSelectedActivation::Active)
+                                .any(|candidate| &candidate.1 != definition)
+                            {
+                                RustMacroDefinitionOutcome::Ambiguous
+                            } else {
+                                RustMacroDefinitionOutcome::Resolved(
+                                    definition
+                                        .clone()
+                                        .expect("active macro candidate has a declaration"),
+                                )
+                            }
+                        }
+                        RustMacroDefinitionOutcome::UnprovenActivation => {
+                            RustMacroDefinitionOutcome::UnprovenActivation
+                        }
+                        RustMacroDefinitionOutcome::Ambiguous => {
+                            RustMacroDefinitionOutcome::Ambiguous
+                        }
+                        RustMacroDefinitionOutcome::Missing => {
+                            let candidates = parents
+                                .iter()
+                                .filter_map(|parent| answers.get(parent))
+                                .collect::<Vec<_>>();
+                            if candidates.iter().any(|candidate| {
+                                matches!(
+                                    candidate,
+                                    RustMacroDefinitionOutcome::UnprovenActivation
+                                        | RustMacroDefinitionOutcome::Ambiguous
+                                )
+                            }) {
+                                RustMacroDefinitionOutcome::UnprovenActivation
+                            } else if let Some(first) = candidates.first().filter(|first| {
+                                candidates.iter().all(|candidate| candidate == *first)
+                            }) {
+                                (*first).clone()
+                            } else {
+                                RustMacroDefinitionOutcome::Missing
+                            }
+                        }
                     };
                     active.remove(&query);
                     answers.insert(query, selected);
                 }
             }
         }
-        let selected = answers.get(&initial).cloned().flatten();
+        let selected = answers
+            .get(&initial)
+            .cloned()
+            .unwrap_or(RustMacroDefinitionOutcome::Missing);
         if !broke_a_cycle {
             let mut memo = self.ready.macro_walk.borrow_mut();
             for (query, answer) in answers {
@@ -5441,8 +5746,14 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
             name,
             cancellation,
         )? {
-            RustSelectedBuildOutcome::Ready(Some(selected)) => selected,
-            RustSelectedBuildOutcome::Ready(None) => return Ok(None),
+            RustSelectedBuildOutcome::Ready(RustMacroDefinitionOutcome::Resolved(selected)) => {
+                selected
+            }
+            RustSelectedBuildOutcome::Ready(
+                RustMacroDefinitionOutcome::Missing
+                | RustMacroDefinitionOutcome::UnprovenActivation
+                | RustMacroDefinitionOutcome::Ambiguous,
+            ) => return Ok(None),
             RustSelectedBuildOutcome::Stopped => {
                 return Ok(Some(Err(
                     brokk_bifrost_rust::macro_matcher::MacroMatchError::Interrupted,
@@ -5674,8 +5985,14 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
                 })?;
             let selected = self.select_visible_textual_macro(file, start, name, cancellation)?;
             let (definition_file, declaration) = match selected {
-                RustSelectedBuildOutcome::Ready(Some(selected)) => selected,
-                RustSelectedBuildOutcome::Ready(None) => continue,
+                RustSelectedBuildOutcome::Ready(RustMacroDefinitionOutcome::Resolved(selected)) => {
+                    selected
+                }
+                RustSelectedBuildOutcome::Ready(
+                    RustMacroDefinitionOutcome::Missing
+                    | RustMacroDefinitionOutcome::UnprovenActivation
+                    | RustMacroDefinitionOutcome::Ambiguous,
+                ) => continue,
                 RustSelectedBuildOutcome::Stopped => {
                     return Ok(SelectedResolutionStageOutcome::Cancelled);
                 }
@@ -5777,18 +6094,12 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
                 SelectedResolutionStageOutcome::Ready => {}
                 terminal => return Ok(terminal),
             }
-            let Some(inputs) =
-                capsule
-                    .macro_rows()
-                    .input_rows(connection, capsule.blob_id(), &|| {
-                        !cancellation.is_cancelled()
-                    })?
-            else {
+            let Some(inputs) = self.selected_macro_input_rows(&capsule, cancellation)? else {
                 return Ok(SelectedResolutionStageOutcome::Cancelled);
             };
             input_identity.field("path", file.as_bytes());
             input_identity.field("content_oid", capsule.content_oid().as_bytes());
-            for input in &inputs {
+            for input in inputs.iter() {
                 input_identity.field("invocation", &input.invocation.get().to_be_bytes());
                 input_identity.field(
                     "input_start_byte",
@@ -5806,7 +6117,7 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
                 }
             }
             let mut occurrence_start_lines = None;
-            for input in inputs {
+            for input in inputs.iter() {
                 let invocation = connection
                     .prepare_cached(MACRO_INVOCATION_START_AND_NAME_SQL)?
                     .query_row(
@@ -5837,8 +6148,10 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
                 let seed = seeds.rows()[0]
                     .seed()
                     .expect("located macro head has a reference seed");
-                let RustSelectedBuildOutcome::Ready(Some((definition_file, declaration))) =
-                    self.select_textual_macro_definition(caller, start, &name, cancellation)?
+                let RustSelectedBuildOutcome::Ready(RustMacroDefinitionOutcome::Resolved((
+                    definition_file,
+                    declaration,
+                ))) = self.select_textual_macro_definition(caller, start, &name, cancellation)?
                 else {
                     continue;
                 };
@@ -6619,6 +6932,7 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
     #[doc(hidden)]
     pub fn clear_selected_macro_walk_answers(&self) {
         *self.ready.macro_walk.borrow_mut() = SelectedTextualMacroWalkMemo::default();
+        self.ready.macro_inputs.clear();
     }
 
     /// Prepare generated frontiers only for files admitted by this query.
@@ -6628,11 +6942,62 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
         files: &[&Path],
         cancellation: &CancellationToken,
     ) -> Result<SelectedResolutionStageOutcome> {
-        if cancellation.is_cancelled() {
-            return Ok(SelectedResolutionStageOutcome::Cancelled);
+        let inventory = &self.ready.inventory;
+        let reader =
+            brokk_bifrost_core::cache_db::sql_profile::connection_tag(inventory.connection());
+        let reads = self.macro_frontier_reads.as_deref();
+        let note = |hit, reason| macro_frontier_cache_note(reads, reader, hit, reason);
+        crate::profiling::note_with(|| {
+            format!("rust_caller::macro_front_request reader={reader:?}")
+        });
+        if let Some((reason, terminal)) = self.macro_front_interruption(cancellation) {
+            note(false, reason);
+            return Ok(terminal);
         }
-        let Some(reads) = self.macro_frontier_reads.as_deref() else {
-            return self.prepare_selected_macro_frontiers_uncached(files, cancellation);
+        let uncached = |reason| {
+            let outcome = self.prepare_selected_macro_frontiers_uncached(files, cancellation);
+            if matches!(&outcome, Ok(SelectedResolutionStageOutcome::Ready))
+                && let Some((reason, terminal)) = self.macro_front_interruption(cancellation)
+            {
+                note(false, reason);
+                return Ok(terminal);
+            }
+            note(
+                false,
+                match &outcome {
+                    Ok(SelectedResolutionStageOutcome::Ready) => reason,
+                    Ok(SelectedResolutionStageOutcome::Cancelled) => "builder_cancelled",
+                    Ok(SelectedResolutionStageOutcome::Stale(_)) => "builder_stale",
+                    Ok(SelectedResolutionStageOutcome::Unavailable(_)) => "builder_unavailable",
+                    Err(_) => "builder_error",
+                },
+            );
+            outcome
+        };
+        let Some(reads) = reads else {
+            return uncached("no_receipt_channel");
+        };
+        self.ready.first_macro_frontier_request_seen.set(true);
+        if !self.macro_front_is_pristine() {
+            return uncached("non_pristine");
+        }
+        let masks = match inventory.overlay_masks() {
+            Ok(masks) => masks,
+            Err(error) => {
+                note(false, "overlay_validation_error");
+                return Err(error);
+            }
+        };
+        if !masks.is_empty() || !self.ready.content_mounts.is_empty() {
+            return uncached("transient_overlay");
+        }
+        let data_version = match inventory.publication_data_version() {
+            Ok(Some(version)) => version,
+            Ok(None) => return uncached("data_version_unavailable"),
+            Err(error) => {
+                note(false, "data_version_error");
+                return Err(error);
+            }
         };
         let mut requested_files = files
             .iter()
@@ -6640,224 +7005,227 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
             .collect::<Vec<_>>();
         requested_files.sort_unstable();
         requested_files.dedup();
-        let first = !self.ready.first_macro_frontier_request_seen.replace(true);
-        let retained = self
+        let key = MacroFrontKey {
+            requested_files,
+            selection_fingerprint: inventory.fingerprint(),
+            routing_digest: inventory.routing_digest(),
+            scope_identity: inventory.scope_identity(),
+            analysis_generation: self.ready.analysis_generation,
+            main_data_version: data_version,
+        };
+        if inventory.retained_macro_frontier.borrow().is_none() {
+            inventory
+                .retained_macro_frontier
+                .replace(Some(Box::new(RetainedMacroFrontier::new(
+                    self.ready.store.retention_budget(),
+                ))));
+        }
+        let mut cache = inventory.retained_macro_frontier.borrow_mut();
+        let cache = cache.as_mut().expect("macro region initialized");
+        let miss_reason = cache.miss_reason(&key);
+        if cache
+            .main_data_version
+            .is_some_and(|prior| prior != data_version)
+        {
+            cache.region.invalidate_all();
+        }
+        cache.main_data_version = Some(data_version);
+        if let Some(retained) = cache.region.get(&key) {
+            if let Some((reason, terminal)) = self.macro_front_interruption(cancellation) {
+                note(false, reason);
+                return Ok(terminal);
+            }
+            if let Err(error) = retained.restore(self) {
+                note(false, "restore_error");
+                return Err(error);
+            }
+            if let Some((reason, terminal)) = self.macro_front_interruption(cancellation) {
+                note(false, reason);
+                return Ok(terminal);
+            }
+            match inventory.publication_data_version() {
+                Ok(Some(version)) if version == key.main_data_version => {}
+                Ok(_) => {
+                    note(false, "restore_data_version_changed");
+                    return Ok(SelectedResolutionStageOutcome::Stale(
+                        SelectedResolutionStale::MountInventoryChanged,
+                    ));
+                }
+                Err(error) => {
+                    note(false, "restore_data_version_error");
+                    return Err(error);
+                }
+            }
+            *self.ready.checked_macro_frontier_files.borrow_mut() = retained.checked_files.clone();
+            *self.ready.macro_overlay.borrow_mut() = retained.overlay.clone();
+            *self.ready.prepared_macro_files.borrow_mut() = retained.prepared_files.clone();
+            inventory.enable_derive_helper_decisions();
+            if let Some((reason, terminal)) = self.macro_front_interruption(cancellation) {
+                note(false, reason);
+                return Ok(terminal);
+            }
+            reads.replay(retained.receipt.as_ref());
+            cache.observe_key(&key);
+            note(true, "exact_set");
+            return Ok(SelectedResolutionStageOutcome::Ready);
+        }
+        crate::profiling::note_with(|| {
+            format!("rust_caller::macro_front_lookup_miss reader={reader:?} reason={miss_reason}")
+        });
+        let mut prepare = || self.prepare_selected_macro_frontiers_uncached(files, cancellation);
+        let (outcome, receipt) = reads.capture(&mut prepare);
+        match &outcome {
+            Ok(SelectedResolutionStageOutcome::Ready) => {}
+            Ok(SelectedResolutionStageOutcome::Cancelled) => {
+                note(false, "builder_cancelled");
+                return outcome;
+            }
+            Ok(SelectedResolutionStageOutcome::Stale(_)) => {
+                note(false, "builder_stale");
+                return outcome;
+            }
+            Ok(SelectedResolutionStageOutcome::Unavailable(_)) => {
+                note(false, "builder_unavailable");
+                return outcome;
+            }
+            Err(_) => {
+                note(false, "builder_error");
+                return outcome;
+            }
+        }
+        // A terminal requester state is never merely an optional-admission refusal.
+        if let Some((reason, terminal)) = self.macro_front_interruption(cancellation) {
+            note(false, reason);
+            return Ok(terminal);
+        }
+        if !reads.receipt_is_reusable(receipt.as_ref()) {
+            note(false, "receipt_uncertifiable");
+            return outcome;
+        }
+        // A certified builder can publish immutable capsules itself. Like the pre-PR
+        // cold path, this is Ready, but its pre-build key must not retain the result.
+        match inventory.publication_data_version() {
+            Ok(Some(version)) if version == key.main_data_version => {}
+            Ok(_) => {
+                note(false, "unretained_data_version_advanced_during_build");
+                return outcome;
+            }
+            Err(error) => {
+                note(false, "post_build_data_version_error");
+                return Err(error);
+            }
+        }
+        let captured = MacroFrontOutput::capture(self, receipt, reads);
+        if let Some((reason, terminal)) = self.macro_front_interruption(cancellation) {
+            note(false, reason);
+            return Ok(terminal);
+        }
+        let output = match captured {
+            Ok(Some(output)) => output,
+            Ok(None) => {
+                note(false, "construction_refused");
+                return outcome;
+            }
+            Err(error) => {
+                eprintln!("macro frontier retention skipped: {error}");
+                note(false, "capture_error");
+                return outcome;
+            }
+        };
+        match inventory.publication_data_version() {
+            Ok(Some(version)) if version == key.main_data_version => {}
+            Ok(_) => {
+                note(false, "unretained_data_version_advanced_during_copy");
+                return outcome;
+            }
+            Err(error) => {
+                note(false, "post_copy_data_version_error");
+                return Err(error);
+            }
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        if FORCE_MACRO_ADMISSION_REFUSAL.with(Cell::get) {
+            note(false, "forced_admission_refusal");
+            return outcome;
+        }
+        cache.observe_key(&key);
+        let reserved_bytes = output.reserved_bytes();
+        let admitted = matches!(cache.region.insert(key, output), BudgetedValue::Retained(_));
+        note(
+            false,
+            if admitted {
+                miss_reason
+            } else {
+                "admission_refused"
+            },
+        );
+        crate::profiling::note_with(|| {
+            let stats = cache.region.stats();
+            format!(
+                "rust_caller::macro_front_admission reader={reader:?} admitted={admitted} reserved_bytes={reserved_bytes} entries={} entry_metadata_bytes={} held_entry_metadata_bytes={} evictions={} refusals={}",
+                stats.entries,
+                stats.accounted_bytes,
+                stats.deferred_bytes,
+                stats.evictions,
+                stats.refused_admissions
+            )
+        });
+        outcome
+    }
+
+    fn macro_front_is_pristine(&self) -> bool {
+        // Empty fronts advance ready bookkeeping without committing SQL, so
+        // the SQL epochs correctly stay unchanged. Ready bookkeeping is also
+        // input state: both must be pristine to reuse or retain a front.
+        self.ready.inventory.macro_stage_is_pristine()
+            && self.ready.checked_macro_frontier_files.borrow().is_empty()
+            && self.ready.prepared_macro_files.borrow().is_empty()
+            && self.ready.macro_overlay.borrow().prepared_files.is_empty()
+    }
+
+    fn macro_front_interruption(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Option<(&'static str, SelectedResolutionStageOutcome)> {
+        if cancellation.is_cancelled() {
+            return Some(("cancelled", SelectedResolutionStageOutcome::Cancelled));
+        }
+        let actual = self.ready.project.analysis_generation();
+        (actual != self.ready.analysis_generation).then_some((
+            "generation_stale",
+            SelectedResolutionStageOutcome::Stale(
+                SelectedResolutionStale::TransientAnalysisGeneration {
+                    expected: self.ready.analysis_generation,
+                    actual,
+                },
+            ),
+        ))
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn macro_front_state_digest_for_test(&self) -> Result<[u8; 32]> {
+        MacroFrontOutput::state_digest(self)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn evict_macro_fronts_for_test(&self) {
+        if let Some(cache) = self
             .ready
             .inventory
             .retained_macro_frontier
-            .borrow_mut()
-            .take();
-        // A replaced frontier leaves the reader to be cleaned unless a new
-        // snapshot is admitted below; this is the disposition to restore then.
-        let mut restore_after_snapshot = None;
-        if let Some(retained) = retained {
-            let discard_was_already_required = self.ready.inventory.macro_reader_checkin.get();
-            // Ownership of the shadow has left the reader. Any failed validation,
-            // restore, or discard must close it rather than pool orphaned TEMP pages.
-            self.ready
-                .inventory
-                .raise_macro_reader_checkin(super::resolution_selection::MacroReaderCheckin::Close);
-            if retained.requested_files == requested_files {
-                if first {
-                    let current_generation = self.ready.project.analysis_generation();
-                    if cancellation.is_cancelled() {
-                        self.ready.inventory.raise_macro_reader_checkin(
-                            super::resolution_selection::MacroReaderCheckin::Close,
-                        );
-                        return Ok(SelectedResolutionStageOutcome::Cancelled);
-                    }
-                    if current_generation != self.ready.analysis_generation {
-                        self.ready.inventory.raise_macro_reader_checkin(
-                            super::resolution_selection::MacroReaderCheckin::Close,
-                        );
-                        return Ok(SelectedResolutionStageOutcome::Stale(
-                            SelectedResolutionStale::TransientAnalysisGeneration {
-                                expected: self.ready.analysis_generation,
-                                actual: current_generation,
-                            },
-                        ));
-                    }
-                    let miss = if retained.analysis_generation != self.ready.analysis_generation {
-                        Some("generation")
-                    } else if self.ready.inventory.publication_data_version()?
-                        != Some(retained.main_data_version)
-                    {
-                        Some("data_version")
-                    } else if retained.selection_fingerprint != self.ready.inventory.fingerprint()
-                        || retained.routing_digest != self.ready.inventory.routing_digest()
-                        || retained.scope_identity != self.ready.inventory.scope_identity()
-                    {
-                        Some("authority")
-                    } else if !self.ready.inventory.macro_stage_is_pristine() {
-                        Some("stage")
-                    } else {
-                        None
-                    };
-                    if let Some(reason) = miss {
-                        with_accounted_macro_snapshot_write(
-                            &self.ready.inventory,
-                            discard_macro_stage_snapshot,
-                        )?;
-                        macro_frontier_cache_note(reads, false, reason);
-                    } else {
-                        restore_macro_stage_snapshot(
-                            &self.ready.inventory,
-                            &retained.stage_tables,
-                        )?;
-                        *self.ready.checked_macro_frontier_files.borrow_mut() =
-                            retained.checked_files.clone();
-                        *self.ready.macro_overlay.borrow_mut() = retained.overlay.clone();
-                        *self.ready.prepared_macro_files.borrow_mut() =
-                            retained.prepared_files.clone();
-                        self.ready.inventory.enable_derive_helper_decisions();
-                        reads.replay(retained.receipt.as_ref());
-                        self.ready
-                            .inventory
-                            .retained_macro_frontier
-                            .replace(Some(retained));
-                        self.ready
-                            .inventory
-                            .macro_reader_checkin
-                            .set(discard_was_already_required);
-                        macro_frontier_cache_note(reads, true, "exact_set");
-                        return Ok(SelectedResolutionStageOutcome::Ready);
-                    }
-                } else {
-                    self.ready
-                        .inventory
-                        .retained_macro_frontier
-                        .replace(Some(retained));
-                    self.ready.inventory.enable_derive_helper_decisions();
-                    self.ready
-                        .inventory
-                        .macro_reader_checkin
-                        .set(discard_was_already_required);
-                    macro_frontier_cache_note(reads, true, "same_operation");
-                    return Ok(SelectedResolutionStageOutcome::Ready);
-                }
-            } else {
-                if first {
-                    with_accounted_macro_snapshot_write(
-                        &self.ready.inventory,
-                        discard_macro_stage_snapshot,
-                    )?;
-                } else {
-                    self.ready
-                        .inventory
-                        .retained_macro_frontier
-                        .replace(Some(retained));
-                    self.ready
-                        .inventory
-                        .macro_reader_checkin
-                        .set(discard_was_already_required);
-                    return self.prepare_selected_macro_frontiers_uncached(files, cancellation);
-                }
-                // The old shadow's rows are gone. If no new snapshot is admitted
-                // below, the reader still holds whatever this request staged, so it
-                // is cleaned and size-checked at check-in rather than closed. An
-                // admitted snapshot restores the prior disposition: the snapshot
-                // cap already bounded its pages.
-                self.ready.inventory.macro_reader_checkin.set(
-                    discard_was_already_required
-                        .max(super::resolution_selection::MacroReaderCheckin::Clear),
-                );
-                restore_after_snapshot = Some(discard_was_already_required);
-                macro_frontier_cache_note(reads, false, "set");
-            }
-        } else if first {
-            macro_frontier_cache_note(reads, false, "empty");
-        }
-        if !first {
-            return self.prepare_selected_macro_frontiers_uncached(files, cancellation);
-        }
-        let pristine = self.ready.inventory.macro_stage_is_pristine();
-        let mut prepare = || self.prepare_selected_macro_frontiers_uncached(files, cancellation);
-        let (outcome, receipt) = reads.capture(&mut prepare);
-        if matches!(&outcome, Ok(SelectedResolutionStageOutcome::Ready))
-            && pristine
-            && self.ready.inventory.conn.is_pooled()
-            && requested_files.len() <= MAX_RETAINED_MACRO_FILES
-            && requested_files
-                .iter()
-                .map(|file| file.as_os_str().len())
-                .sum::<usize>()
-                <= MAX_RETAINED_MACRO_PATH_BYTES
-            && reads.receipt_bytes(receipt.as_ref()) <= MAX_RETAINED_MACRO_RECEIPT_BYTES
-            && self.ready.checked_macro_frontier_files.borrow().len()
-                <= MAX_RETAINED_MACRO_FILES * 8
-            && self.ready.macro_overlay.borrow().prepared_files.len()
-                <= MAX_RETAINED_MACRO_FILES * 8
-            && self.ready.prepared_macro_files.borrow().len() <= MAX_RETAINED_MACRO_FILES * 8
-            && self
-                .ready
-                .checked_macro_frontier_files
-                .borrow()
-                .iter()
-                .map(|path| path.as_os_str().len())
-                .sum::<usize>()
-                + self
-                    .ready
-                    .macro_overlay
-                    .borrow()
-                    .prepared_files
-                    .iter()
-                    .map(String::len)
-                    .sum::<usize>()
-                + self
-                    .ready
-                    .prepared_macro_files
-                    .borrow()
-                    .iter()
-                    .map(|path| path.as_os_str().len())
-                    .sum::<usize>()
-                <= MAX_RETAINED_MACRO_PATH_BYTES
-            && let Some(data_version) = self.ready.inventory.publication_data_version()?
+            .borrow()
+            .as_ref()
         {
-            let snapshot =
-                with_accounted_macro_snapshot_write(&self.ready.inventory, snapshot_macro_stage);
-            match snapshot {
-                Ok(Some(stage_tables)) => {
-                    self.ready
-                        .inventory
-                        .retained_macro_frontier
-                        .replace(Some(Box::new(RetainedMacroFrontier {
-                            stage_tables,
-                            requested_files,
-                            checked_files: self.ready.checked_macro_frontier_files.borrow().clone(),
-                            overlay: self.ready.macro_overlay.borrow().clone(),
-                            prepared_files: self.ready.prepared_macro_files.borrow().clone(),
-                            receipt,
-                            selection_fingerprint: self.ready.inventory.fingerprint(),
-                            routing_digest: self.ready.inventory.routing_digest(),
-                            scope_identity: self.ready.inventory.scope_identity(),
-                            analysis_generation: self.ready.analysis_generation,
-                            main_data_version: data_version,
-                        })));
-                    if let Some(prior) = restore_after_snapshot
-                        && self.ready.inventory.macro_reader_checkin.get()
-                            == super::resolution_selection::MacroReaderCheckin::Clear
-                    {
-                        self.ready.inventory.macro_reader_checkin.set(prior);
-                    }
-                }
-                Ok(None) => {
-                    self.ready.inventory.raise_macro_reader_checkin(
-                        super::resolution_selection::MacroReaderCheckin::Close,
-                    );
-                    macro_frontier_cache_note(reads, false, "stage_cap");
-                }
-                Err(error) => {
-                    eprintln!("macro frontier cache snapshot skipped: {error}");
-                    self.ready.inventory.raise_macro_reader_checkin(
-                        super::resolution_selection::MacroReaderCheckin::Close,
-                    );
-                    macro_frontier_cache_note(reads, false, "snapshot_error");
-                }
-            }
-        } else {
-            macro_frontier_cache_note(reads, false, "cap_or_unavailable");
+            cache.region.invalidate_all();
         }
-        outcome
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn macro_front_data_version_for_test(&self) -> Result<Option<i64>> {
+        self.ready.inventory.publication_data_version()
     }
 
     fn prepare_selected_macro_frontiers_uncached(
@@ -6996,6 +7364,57 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
         self.prepare_selected_macro_frontiers_for_files(&[caller], cancellation)
     }
 
+    fn selected_macro_input_rows(
+        &self,
+        capsule: &SelectedMacroCapsule,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<BudgetedValue<AllocatedMacroInputRows>>> {
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        // Keyed by the exact fill input. Blob rows are unique per (oid, lang,
+        // parse_variant), so a content OID alone does not name one row set.
+        let key = capsule.blob_id().to_string();
+        if let Some(inputs) = self.ready.macro_inputs.0.get(&key) {
+            return Ok(Some(BudgetedValue::Retained(inputs)));
+        }
+        let Some(inputs) = capsule.macro_rows().input_rows(
+            self.ready.inventory.connection(),
+            capsule.blob_id(),
+            &|| !cancellation.is_cancelled(),
+        )?
+        else {
+            return Ok(None);
+        };
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.ready
+                .macro_inputs
+                .0
+                .insert(key, AllocatedMacroInputRows(inputs)),
+        ))
+    }
+
+    /// One read of a capsule's macro input rows, and how many row sets the
+    /// operation's memo holds afterwards.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn selected_macro_input_rows_probe_for_test(
+        &self,
+        capsule: &SelectedMacroCapsule,
+        cancellation: &CancellationToken,
+    ) -> Result<(String, usize)> {
+        let rows = self
+            .selected_macro_input_rows(capsule, cancellation)?
+            .expect("an uncancelled read returns rows");
+        Ok((
+            format!("{:?}", *rows),
+            self.ready.macro_inputs.0.stats().entries,
+        ))
+    }
+
     fn prepare_selected_macro_file_frontiers(
         &self,
         caller: &Path,
@@ -7008,12 +7427,7 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
             return Ok(SelectedResolutionStageOutcome::Ready);
         };
         let connection = self.ready.inventory.connection();
-        let Some(inputs) = mount
-            .macro_rows()
-            .input_rows(connection, mount.blob_id(), &|| {
-                !cancellation.is_cancelled()
-            })?
-        else {
+        let Some(inputs) = self.selected_macro_input_rows(&mount, cancellation)? else {
             return Ok(SelectedResolutionStageOutcome::Cancelled);
         };
         if inputs.is_empty() {
@@ -7046,7 +7460,7 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
             .inventory
             .persisted_mount_record(mount.mount().ordinal())?
             .expect("macro frontier host is selected");
-        for input in inputs {
+        for input in inputs.iter() {
             if cancellation.is_cancelled() {
                 return Ok(SelectedResolutionStageOutcome::Cancelled);
             }
@@ -7063,6 +7477,24 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
             let Some((start, name)) = invocation else {
                 continue;
             };
+            // A source-owned activation gap can be discharged only after the
+            // same textual fold proves the defining crate's selected definition.
+            let activation_gap: bool = connection.prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM resolution_gap_reasons WHERE blob_id=?1 AND site=?2 AND origin=?3)"
+            )?.query_row(rusqlite::params![mount.blob_id(), input.native_frontier.expect("frontier was checked").0.get(), super::resolution_prepare::resolution_rows::gap_origin_code(crate::analyzer::resolution::LoweringGapOrigin::Extracted(brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::UnprovenActivation))], |row| row.get(0))?;
+            if activation_gap {
+                match self.select_textual_macro_definition(caller, start, &name, cancellation)? {
+                    RustSelectedBuildOutcome::Ready(RustMacroDefinitionOutcome::Resolved(_)) => {}
+                    RustSelectedBuildOutcome::Ready(
+                        RustMacroDefinitionOutcome::UnprovenActivation
+                        | RustMacroDefinitionOutcome::Missing
+                        | RustMacroDefinitionOutcome::Ambiguous,
+                    ) => continue,
+                    RustSelectedBuildOutcome::Stopped => {
+                        return Ok(SelectedResolutionStageOutcome::Cancelled);
+                    }
+                }
+            }
             let mut included = false;
             for (_, path, blob) in included_sources
                 .iter()
@@ -7131,8 +7563,14 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
             }
             let (definition_file, declaration) =
                 match self.select_textual_macro_definition(caller, start, &name, cancellation)? {
-                    RustSelectedBuildOutcome::Ready(Some(selected)) => selected,
-                    RustSelectedBuildOutcome::Ready(None) => {
+                    RustSelectedBuildOutcome::Ready(RustMacroDefinitionOutcome::Resolved(
+                        selected,
+                    )) => selected,
+                    RustSelectedBuildOutcome::Ready(
+                        RustMacroDefinitionOutcome::Missing
+                        | RustMacroDefinitionOutcome::UnprovenActivation
+                        | RustMacroDefinitionOutcome::Ambiguous,
+                    ) => {
                         panic!("matched macro has a selected definition")
                     }
                     RustSelectedBuildOutcome::Stopped => {
@@ -7560,63 +7998,120 @@ fn inventory_macro_gaps(
     ready: &ReadySelectedResolution<'_, '_>,
     detail: &str,
     semantic: SemanticId,
+    cancellation: &CancellationToken,
 ) -> Result<Vec<SelectedRustMacroExpansionGap>> {
-    let mut statement = ready.inventory.connection().prepare_cached(
-        "SELECT evidence.value ->> '$.reason', head.macro_name,
-                mount.persisted_relative_path, head.start_byte, head.end_byte,
-                (SELECT properties.visibility
-                 FROM source_rust_item_macro_expansions AS expansion
-                 CROSS JOIN source_rust_module_scopes AS scope
-                   ON scope.blob_id=expansion.blob_id
-                 CROSS JOIN source_rust_module_declarations AS module
-                   ON module.blob_id=scope.blob_id AND module.declaration_id=scope.declaration_id
-                 CROSS JOIN source_declarations AS declaration
-                   ON declaration.blob_id=module.blob_id AND declaration.declaration_id=module.declaration_id
-                 CROSS JOIN source_rust_declaration_properties AS properties
-                   ON properties.blob_id=module.blob_id AND properties.declaration_id=module.declaration_id
-                 WHERE expansion.blob_id=evidence.value ->> '$.member_blob'
-                   AND scope.ordinal<>0
-                   AND expansion.invocation_occurrence_id=evidence.value ->> '$.invocation_occurrence'
-                   AND declaration.start_byte<=expansion.invocation_start_byte
-                   AND expansion.invocation_end_byte<=declaration.end_byte
-                 ORDER BY declaration.end_byte-declaration.start_byte
-                 LIMIT 1)
-         FROM json_each(?1, '$.evidence') AS evidence
-         LEFT JOIN source_rust_macro_invocations AS head
-           ON head.blob_id = evidence.value ->> '$.member_blob'
-          AND head.occurrence_id = evidence.value ->> '$.invocation_occurrence'
-         LEFT JOIN temp.selected_resolution_mounts AS mount
-           ON mount.blob_id = head.blob_id AND mount.storage_language = 'rust'",
-    )?;
-    let rows = statement.query_map([detail], |row| {
-        Ok((
-            row.get::<_, Option<String>>(0)?,
-            row.get::<_, Option<String>>(1)?,
-            row.get::<_, Option<String>>(2)?,
-            row.get::<_, Option<usize>>(3)?,
-            row.get::<_, Option<usize>>(4)?,
-            row.get::<_, Option<String>>(5)?,
-        ))
-    })?;
+    use crate::analyzer::read_ledger::LookupQuestion;
+    let detail_value: serde_json::Value =
+        serde_json::from_str(detail).map_err(|error| StoreError::corrupt(error.to_string()))?;
+    let evidence = detail_value
+        .get("evidence")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            StoreError::missing_required_source_facts(format!(
+                "Rust macro inventory evidence missing: {detail}"
+            ))
+        })?;
+    if evidence
+        .iter()
+        .any(|item| item["reason"] != "UnsupportedMacroGeneratedModule")
+    {
+        return Ok(Vec::new());
+    }
+    let typed = ready.typed_source();
     let mut gaps = Vec::new();
-    for row in rows {
-        let (reason, name, path, start, end, visibility) = row?;
-        let (Some(macro_name), Some(relative_path), Some(start_byte), Some(end_byte)) =
-            (name, path, start, end)
-        else {
-            return Ok(Vec::new());
-        };
-        if reason.as_deref() != Some("UnsupportedMacroGeneratedModule") {
-            return Ok(Vec::new());
+    for item in evidence {
+        if item.get("member_blob").is_some() {
+            let own_detail = serde_json::json!({"evidence": [item]}).to_string();
+            let Some(own) =
+                typed.own_rust_inventory_macro_gaps(&own_detail, semantic, cancellation)?
+            else {
+                assert!(
+                    cancellation.is_cancelled(),
+                    "typed invocation read only stops for cancellation"
+                );
+                return Ok(Vec::new());
+            };
+            gaps.extend(own);
+        } else {
+            if item["kind"] != "macro_invocation"
+                || item["namespace"] != "macro"
+                || item["origin"] != "invocation"
+            {
+                return Err(StoreError::missing_required_source_facts(format!(
+                    "Rust macro inventory invocation cannot be resolved: {detail}"
+                )));
+            }
+            let unit = item["unit_key"]
+                .as_str()
+                .and_then(|key| {
+                    brokk_bifrost_core::analyzer::canonical_hash::parse_lower_sha256(
+                        &key.to_ascii_lowercase(),
+                    )
+                })
+                .map(crate::analyzer::semantic::ids::StableDigest::from_array);
+            let (Some(unit_key), Some(module_path), Some(macro_name)) =
+                (unit, item["module_path"].as_str(), item["name"].as_str())
+            else {
+                return Err(StoreError::missing_required_source_facts(format!(
+                    "Rust macro inventory invocation cannot be resolved: {detail}"
+                )));
+            };
+            let question = LookupQuestion::RustMacroInvocations {
+                unit_key,
+                module_path: module_path.into(),
+                macro_name: macro_name.into(),
+            };
+            let Some(answer) = typed.rust_macro_invocations(&question, cancellation)? else {
+                assert!(
+                    cancellation.is_cancelled(),
+                    "typed invocation read only stops for cancellation"
+                );
+                return Ok(Vec::new());
+            };
+            if let Some(services) = ready
+                .rust_macro_invocation_services
+                .as_deref()
+                .or(ready.analyzer)
+            {
+                services.record_rust_macro_invocations(question, answer.digest);
+            } else if ready
+                .project
+                .project_read_slot()
+                .is_some_and(|slot| slot.is_capturing())
+            {
+                return Err(missing_read_reuse_authority("Rust macro invocation"));
+            }
+            // No producer verdict matched the name form, or a matching verdict
+            // has no anchor (the reader then answers empty). Keep the obligation
+            // unanchored: model coverage is refused and the answer stays
+            // incomplete, as for an own invocation whose facts are unpersisted.
+            if answer.invocations.is_empty() {
+                gaps.push(SelectedRustMacroExpansionGap {
+                    semantic,
+                    anchor: None,
+                    macro_name: macro_name.to_owned(),
+                    private_module_route: false,
+                });
+                continue;
+            }
+            gaps.extend(answer.invocations.into_iter().map(|invocation| {
+                SelectedRustMacroExpansionGap {
+                    semantic,
+                    anchor: Some(SelectedRustMacroAnchor {
+                        relative_path: invocation.relative_path,
+                        start_byte: invocation.start_byte,
+                        end_byte: invocation.end_byte,
+                    }),
+                    macro_name: invocation.macro_name,
+                    private_module_route: invocation.private_module_route,
+                }
+            }));
         }
-        gaps.push(SelectedRustMacroExpansionGap {
-            semantic,
-            relative_path,
-            start_byte,
-            end_byte,
-            macro_name,
-            private_module_route: visibility.is_some_and(|visibility| visibility != "public"),
-        });
+    }
+    if gaps.is_empty() {
+        return Err(StoreError::missing_required_source_facts(format!(
+            "Rust macro inventory invocation cannot be resolved: {detail}"
+        )));
     }
     Ok(gaps)
 }
@@ -7624,13 +8119,15 @@ fn inventory_macro_gaps(
 fn unexpanded_item_macro_gaps(
     ready: &ReadySelectedResolution<'_, '_>,
     completion: &ResolutionCompletion,
+    cancellation: &CancellationToken,
 ) -> Result<Vec<SelectedRustMacroExpansionGap>> {
     let ResolutionCompletion::Incomplete(reasons) = completion else {
         return Ok(Vec::new());
     };
-    let [item_origin, impl_origin] = [
+    let [item_origin, impl_origin, activation_origin] = [
         brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::UnexpandedItemMacro,
         brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::UnexpandedImplMacro,
+        brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::UnprovenActivation,
     ]
     .map(|kind| {
         crate::analyzer::store::resolution_prepare::resolution_rows::gap_origin_code(
@@ -7654,7 +8151,12 @@ fn unexpanded_item_macro_gaps(
             ready.context_identities.named_reason(*semantic)
         {
             if inventories.insert(*semantic) {
-                names.extend(inventory_macro_gaps(ready, &detail, *semantic)?);
+                names.extend(inventory_macro_gaps(
+                    ready,
+                    &detail,
+                    *semantic,
+                    cancellation,
+                )?);
             }
             continue;
         }
@@ -7691,10 +8193,10 @@ fn unexpanded_item_macro_gaps(
                  JOIN source_rust_macro_invocations AS head
                    ON head.blob_id = input.blob_id
                   AND head.occurrence_id = input.invocation_occurrence_id
-                 WHERE gap.blob_id = ?1 AND gap.reason = ?2 AND gap.origin IN (?3, ?4)",
+                 WHERE gap.blob_id = ?1 AND gap.reason = ?2 AND gap.origin IN (?3, ?4, ?5)",
             )?
             .query_row(
-                rusqlite::params![mount.blob_id(), key, item_origin, impl_origin],
+                rusqlite::params![mount.blob_id(), key, item_origin, impl_origin, activation_origin],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, usize>(1)?, row.get::<_, usize>(2)?)),
             )
                 .optional()?;
@@ -7712,9 +8214,11 @@ fn unexpanded_item_macro_gaps(
         if let Some((macro_name, start_byte, end_byte)) = name {
             names.push(SelectedRustMacroExpansionGap {
                 semantic: *semantic,
-                relative_path: mount.persisted_relative_path().to_owned(),
-                start_byte,
-                end_byte,
+                anchor: Some(SelectedRustMacroAnchor {
+                    relative_path: mount.persisted_relative_path().to_owned(),
+                    start_byte,
+                    end_byte,
+                }),
                 macro_name,
                 private_module_route: false,
             });
@@ -8141,7 +8645,7 @@ fn project_rust_reference_owners(
         &ResolutionSession::unbounded(),
     )? {
         SelectedRustSourceDefinitionProjection::Complete(projected) => projected,
-        SelectedRustSourceDefinitionProjection::Unavailable => {
+        SelectedRustSourceDefinitionProjection::Unavailable(_) => {
             return Ok(SelectedRustReferenceOwnerProjection::Unavailable);
         }
         SelectedRustSourceDefinitionProjection::Cancelled => {
@@ -8154,7 +8658,7 @@ fn project_rust_reference_owners(
             (
                 semantic,
                 match definition {
-                    SelectedRustSourceDefinition::Unit(unit) => Some(unit),
+                    SelectedRustSourceDefinition::Unit(unit, _) => Some(unit),
                     SelectedRustSourceDefinition::Lexical(_)
                     | SelectedRustSourceDefinition::UniverseEntry
                     | SelectedRustSourceDefinition::WithoutUnit { .. } => None,
@@ -8193,7 +8697,7 @@ fn project_rust_definitions(
                 let units = rows
                     .into_iter()
                     .map(|(_, definition)| match definition {
-                        SelectedRustSourceDefinition::Unit(unit) => Some(unit),
+                        SelectedRustSourceDefinition::Unit(unit, _) => Some(unit),
                         SelectedRustSourceDefinition::Lexical(_)
                         | SelectedRustSourceDefinition::UniverseEntry
                         | SelectedRustSourceDefinition::WithoutUnit { .. } => None,
@@ -8204,7 +8708,7 @@ fn project_rust_definitions(
                     None => SelectedRustDefinitionProjection::Unavailable,
                 }
             }
-            SelectedRustSourceDefinitionProjection::Unavailable => {
+            SelectedRustSourceDefinitionProjection::Unavailable(_) => {
                 SelectedRustDefinitionProjection::Unavailable
             }
             SelectedRustSourceDefinitionProjection::Cancelled => {
@@ -8268,7 +8772,7 @@ pub fn project_rust_source_definitions(
                     universe_entries.insert(definition);
                     continue;
                 }
-                return Ok(SelectedRustSourceDefinitionProjection::Unavailable);
+                return Ok(SelectedRustSourceDefinitionProjection::Unavailable(crate::analyzer::store::resolution_selection::MissingDefinitionReason::UncertifiedDefinition));
             }
         };
         let coordinate = (provenance.mount().ordinal(), provenance.local_key());
@@ -8337,14 +8841,12 @@ pub fn project_rust_source_definitions(
         }
     }
 
-    let missing = persisted
-        .iter()
-        .filter(|coordinate| !rows_by_coordinate.contains_key(coordinate))
-        .copied()
-        .collect::<Vec<_>>();
+    // Read every selected declaration through its exact source bridge. The
+    // unit crosswalk intentionally merges cfg alternatives and cannot supply
+    // their physical site; nominal unit ranges are not selection evidence.
     let lexical_rows = match ready
         .inventory
-        .selected_lexical_definitions(&missing, cancellation)?
+        .selected_lexical_definitions(&persisted, cancellation)?
     {
         SelectedLexicalDefinitionReadOutcome::Ready(rows) => rows,
         SelectedLexicalDefinitionReadOutcome::Cancelled => {
@@ -8371,7 +8873,9 @@ pub fn project_rust_source_definitions(
         if let Some(&host) = stage_coordinates.get(definition) {
             let mount = mounts.mount_by_ordinal(host)?;
             if mount.semantic_language() != Language::Rust {
-                return Ok(SelectedRustSourceDefinitionProjection::Unavailable);
+                return Ok(SelectedRustSourceDefinitionProjection::Unavailable(
+                    unprojected_definition_reason(mounts, mount.persisted_relative_path())?,
+                ));
             }
             let source_file = ProjectFile::new(
                 ready.project.root().to_path_buf(),
@@ -8402,6 +8906,7 @@ pub fn project_rust_source_definitions(
                     None => return Ok(SelectedRustSourceDefinitionProjection::Cancelled),
                     Some(Some(row)) => SelectedRustSourceDefinition::Unit(
                         RustMountUnits::new(ready, &mount)?.unit(&row)?,
+                        None,
                     ),
                     Some(None) => SelectedRustSourceDefinition::WithoutUnit {
                         source_file,
@@ -8413,16 +8918,36 @@ pub fn project_rust_source_definitions(
             continue;
         }
         let Some(&coordinate) = coordinates.get(definition) else {
-            return Ok(SelectedRustSourceDefinitionProjection::Unavailable);
+            return Ok(SelectedRustSourceDefinitionProjection::Unavailable(
+                super::resolution_selection::MissingDefinitionReason::UncertifiedDefinition,
+            ));
         };
         let mount = mounts.mount_by_ordinal(coordinate.0)?;
         if mount.semantic_language() != Language::Rust {
-            return Ok(SelectedRustSourceDefinitionProjection::Unavailable);
+            return Ok(SelectedRustSourceDefinitionProjection::Unavailable(
+                unprojected_definition_reason(mounts, mount.persisted_relative_path())?,
+            ));
         }
         if let Some(row) = rows_by_coordinate.remove(&coordinate) {
+            let Some(declaration_range) =
+                declaration_by_coordinate
+                    .remove(&coordinate)
+                    .map(|site| match site {
+                        SelectedDeclarationDefinition::Lexical(site) => site.declaration_range,
+                        SelectedDeclarationDefinition::WithoutUnit(range)
+                        | SelectedDeclarationDefinition::Module(range) => range,
+                    })
+            else {
+                return Ok(SelectedRustSourceDefinitionProjection::Unavailable(
+                    super::resolution_selection::MissingDefinitionReason::UncertifiedDefinition,
+                ));
+            };
             projected.push((
                 *definition,
-                SelectedRustSourceDefinition::Unit(RustMountUnits::new(ready, &mount)?.unit(&row)?),
+                SelectedRustSourceDefinition::Unit(
+                    RustMountUnits::new(ready, &mount)?.unit(&row)?,
+                    Some(declaration_range),
+                ),
             ));
         } else if let Some(row) = declaration_by_coordinate.remove(&coordinate) {
             let source_file = ProjectFile::new(
@@ -8446,7 +8971,9 @@ pub fn project_rust_source_definitions(
                 },
             ));
         } else {
-            return Ok(SelectedRustSourceDefinitionProjection::Unavailable);
+            return Ok(SelectedRustSourceDefinitionProjection::Unavailable(
+                unprojected_definition_reason(mounts, mount.persisted_relative_path())?,
+            ));
         }
     }
     if cancellation.is_cancelled() {
@@ -8474,6 +9001,9 @@ fn project_rust_reference_types(
             identities.insert(value.ty().identity());
         }
     }
+    for shape in resolution.projected_type_shapes() {
+        identities.extend(shape.nodes().iter().map(|node| node.identity()));
+    }
     let identities = identities.into_iter().collect::<Vec<_>>();
     let Some(intrinsic_types) = operation.read_intrinsic_type_descriptors(&identities)? else {
         return Ok(SelectedResolutionOperationOutcome::Cancelled(
@@ -8496,7 +9026,7 @@ fn project_rust_reference_types(
     let nominal_types =
         match project_rust_source_definitions(ready, mounts, &nominal, cancellation, session)? {
             SelectedRustSourceDefinitionProjection::Complete(rows) => rows,
-            SelectedRustSourceDefinitionProjection::Unavailable => {
+            SelectedRustSourceDefinitionProjection::Unavailable(_) => {
                 let mut rows = Vec::new();
                 for identity in nominal {
                     match project_rust_source_definitions(
@@ -8509,7 +9039,7 @@ fn project_rust_reference_types(
                         SelectedRustSourceDefinitionProjection::Complete(projected) => {
                             rows.extend(projected);
                         }
-                        SelectedRustSourceDefinitionProjection::Unavailable => {}
+                        SelectedRustSourceDefinitionProjection::Unavailable(_) => {}
                         SelectedRustSourceDefinitionProjection::Cancelled => {
                             return Ok(SelectedResolutionOperationOutcome::Cancelled(
                                 cancelled_completion(),
@@ -8528,7 +9058,7 @@ fn project_rust_reference_types(
     let mut diagnostic_identities = nominal_types
         .iter()
         .filter_map(|(semantic, definition)| match definition {
-            SelectedRustSourceDefinition::Unit(unit) => Some((
+            SelectedRustSourceDefinition::Unit(unit, _) => Some((
                 *semantic,
                 native_units::public_diagnostic_identity("semantic", Some(unit), None, None),
             )),
@@ -8784,6 +9314,32 @@ fn persisted_obligation_details(
 /// The named reasons among a completion's incompleteness reasons, sorted:
 /// those a context minted by name, and the request-staged reasons, which carry
 /// supplemental coordinates no persisted row names.
+/// The `UnsupportedSemantic` reasons of `completion` that were minted with a
+/// snapshot determinism (#11510). An identity the context did not name has no
+/// declaration, so it is not listed.
+pub(super) fn snapshot_stop_semantics(
+    ready: &ReadySelectedResolution<'_, '_>,
+    completion: &ResolutionCompletion,
+) -> Vec<SemanticId> {
+    let ResolutionCompletion::Incomplete(reasons) = completion else {
+        return Vec::new();
+    };
+    let mut stops = reasons
+        .iter()
+        .filter_map(|reason| match reason {
+            ResolutionIncompleteReason::UnsupportedSemantic(semantic) => ready
+                .context_identities
+                .named_reason_determinism(*semantic)
+                .filter(|determinism| determinism.is_snapshot())
+                .map(|_| *semantic),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    stops.sort_unstable();
+    stops.dedup();
+    stops
+}
+
 fn named_reason_details(
     ready: &ReadySelectedResolution<'_, '_>,
     completion: &ResolutionCompletion,
@@ -9045,13 +9601,14 @@ fn assemble_rust_reference_answer<T>(
     let mut diagnostic_identities = Vec::new();
     let SelectedRustDefinitionVocabularies {
         units: definitions,
+        sites: definition_sites,
         lexical: lexical_definitions,
         names: mut definition_names,
     } = match project_rust_source_definitions(ready, mounts, &targets, cancellation, session)? {
         SelectedRustSourceDefinitionProjection::Complete(rows) => {
             diagnostic_identities.extend(rows.iter().filter_map(|(semantic, definition)| {
                 match definition {
-                    SelectedRustSourceDefinition::Unit(unit) => Some((
+                    SelectedRustSourceDefinition::Unit(unit, _) => Some((
                         *semantic,
                         native_units::public_diagnostic_identity(
                             "semantic",
@@ -9063,11 +9620,13 @@ fn assemble_rust_reference_answer<T>(
                     _ => None,
                 }
             }));
+            let missing_reason = unprojected_rows_reason(mounts, &rows)?;
             match split_projected_rust_definitions(rows) {
                 Some(vocabularies) => vocabularies,
                 None => {
                     return Ok(SelectedResolutionOperationOutcome::Unavailable(
                         SelectedResolutionUnavailable::MissingDefinitionUnit {
+                            reason: missing_reason,
                             storage_language: locator.storage_language().to_owned(),
                             persisted_relative_path: locator.relative_path().to_owned(),
                         },
@@ -9075,9 +9634,10 @@ fn assemble_rust_reference_answer<T>(
                 }
             }
         }
-        SelectedRustSourceDefinitionProjection::Unavailable => {
+        SelectedRustSourceDefinitionProjection::Unavailable(missing_reason) => {
             return Ok(SelectedResolutionOperationOutcome::Unavailable(
                 SelectedResolutionUnavailable::MissingDefinitionUnit {
+                    reason: missing_reason,
                     storage_language: locator.storage_language().to_owned(),
                     persisted_relative_path: locator.relative_path().to_owned(),
                 },
@@ -9124,7 +9684,7 @@ fn assemble_rust_reference_answer<T>(
     }
     let named_reasons = named_reason_details(ready, resolution.binding().completion())?;
     let mut macro_expansion_gaps =
-        unexpanded_item_macro_gaps(ready, resolution.binding().completion())?;
+        unexpanded_item_macro_gaps(ready, resolution.binding().completion(), cancellation)?;
     let mut generated_surface_gaps =
         generated_item_surface_gaps(ready, resolution.binding().completion())?;
     // #5487: an item-position function-like macro invocation keeps the member
@@ -9169,7 +9729,12 @@ fn assemble_rust_reference_answer<T>(
                 // Keep its invocation coordinates without publishing the same
                 // inventory again through a differently ordered JSON object.
                 if ready.context_identities.named_reason(semantic).is_none() {
-                    macro_expansion_gaps.extend(inventory_macro_gaps(ready, &detail, semantic)?);
+                    macro_expansion_gaps.extend(inventory_macro_gaps(
+                        ready,
+                        &detail,
+                        semantic,
+                        cancellation,
+                    )?);
                     inventory_details.push(public_rust_evidence(ready, &detail)?);
                 }
             }
@@ -9205,6 +9770,15 @@ fn assemble_rust_reference_answer<T>(
         cancellation,
     )? {
         resolution.combine_binding_completion(&boundary);
+    }
+    if let Some(added) = rust_added_edge_scope_completion(
+        ready,
+        provenance.ordinal(),
+        reference,
+        &resolution,
+        cancellation,
+    )? {
+        resolution.combine_binding_completion(&added);
     }
     let retained_gap_frontiers = retained_gap_frontiers(ready, resolution.binding().completion())?;
     let enumeration =
@@ -9264,6 +9838,7 @@ fn assemble_rust_reference_answer<T>(
     diagnostic_identities.extend(remaining_diagnostic_identities);
     Ok(SelectedResolutionOperationOutcome::Native(
         SelectedRustReferenceAnswer {
+            snapshot_stops: snapshot_stop_semantics(ready, resolution.binding().completion()),
             macro_expansion_gaps,
             generated_surface_gaps,
             retained_gap_frontiers,
@@ -9276,6 +9851,7 @@ fn assemble_rust_reference_answer<T>(
             boundary_import_names: boundary_import_names(ready, resolution.binding().completion())?,
             resolution,
             definitions,
+            definition_sites,
             lexical_definitions,
             definition_names,
             diagnostic_identities,
@@ -9337,7 +9913,7 @@ fn project_rust_member_attributions(
         // An owner the parser published no declaration for leaves every member
         // it owns unattributed, which is the honest report: absence, never a
         // plausible-looking depth zero.
-        SelectedRustSourceDefinitionProjection::Unavailable => return Ok(Some(Vec::new())),
+        SelectedRustSourceDefinitionProjection::Unavailable(_) => return Ok(Some(Vec::new())),
         SelectedRustSourceDefinitionProjection::Cancelled => return Ok(None),
     };
     let intrinsic_owners = owners
@@ -9349,7 +9925,7 @@ fn project_rust_member_attributions(
     let owner_units = owners
         .into_iter()
         .filter_map(|(identity, definition)| match definition {
-            SelectedRustSourceDefinition::Unit(unit) => Some((identity, unit)),
+            SelectedRustSourceDefinition::Unit(unit, _) => Some((identity, unit)),
             SelectedRustSourceDefinition::Lexical(_)
             | SelectedRustSourceDefinition::UniverseEntry
             | SelectedRustSourceDefinition::WithoutUnit { .. } => None,
@@ -9615,7 +10191,7 @@ fn rust_reference_workspace_crate(
                 mount.get(),
                 key,
                 name,
-                super::rust_unit_summaries::RUST_UNIT_SUMMARY_DERIVATION_VERSION
+                super::rust_unit_summaries::rust_unit_summary_derivation_identity()
             ],
             |row| row.get(0),
         )
@@ -9729,6 +10305,72 @@ fn rust_path_root_boundary(
             semantic: reference,
             status: crate::analyzer::structural::BoundaryStatus::ExternalDeclaredUnindexed,
         },
+    ])))
+}
+
+/// A name that the lexical chain found nowhere is a proven absence only while
+/// the modules and includes that can bring names into scope are placed. The
+/// selection can add such an edge (`temp.selected_rust_added_edges`, empty
+/// without an overlay), and two kinds of reference then owe an open answer:
+///
+/// - A reference with no targets that is written in a file that declares an
+///   added edge. `foo::bar` binds `foo` to the file's own `mod foo;`
+///   declaration, which has no placement, so the lookup cannot enter the module
+///   and would report a complete miss. (A path through the parent from another
+///   file dead-ends in the route walk, which reads the gap view.)
+/// - An unqualified macro name, with or without targets, when the reference's
+///   unit holds an added `#[macro_use] mod` or include. The textual macro walk
+///   reads child modules and included files from persisted placements, so the
+///   macros such an edge moves into scope are invisible to it. A target the
+///   walk did find is no proof either: the added file can define a later macro
+///   of the same name that shadows it (textual scope is order-dependent).
+fn rust_added_edge_scope_completion(
+    ready: &ReadySelectedResolution<'_, '_>,
+    mount: SelectedResolutionMountOrdinal,
+    reference: SemanticId,
+    resolution: &FactResolutionAnswer,
+    cancellation: &CancellationToken,
+) -> Result<Option<ResolutionCompletion>> {
+    if *resolution.binding().completion() != ResolutionCompletion::Complete
+        || cancellation.is_cancelled()
+    {
+        return Ok(None);
+    }
+    let Some(key) = reference.local_key() else {
+        return Ok(None);
+    };
+    let connection = ready.inventory.connection();
+    let in_declaring_file = resolution.binding().targets().is_empty()
+        && connection
+            .prepare_cached(rust_crate_rows::REFERENCE_FILE_ADDS_EDGE)?
+            .exists(rusqlite::params![mount.get()])?;
+    let unqualified_macro = resolution.site_metadata().is_some_and(|metadata| {
+        metadata.namespace() == ResolutionNamespace::Macro
+            && metadata.site_kind() == ResolutionSiteKind::MacroReference
+            && metadata.unqualified()
+    });
+    if !in_declaring_file
+        && !(unqualified_macro
+            && connection
+                .prepare_cached(rust_crate_rows::REFERENCE_UNIT_ADDS_MACRO_SCOPE)?
+                .exists(rusqlite::params![mount.get(), key])?)
+    {
+        return Ok(None);
+    }
+    let mut digest = CanonicalHasher::new(b"bifrost-rust-added-edge-scope:v1");
+    digest.field(
+        "mount",
+        &ready
+            .inventory
+            .mount_record_by_ordinal(mount)?
+            .fragment_digest()
+            .as_bytes(),
+    );
+    digest.field("reference", &key.to_be_bytes());
+    Ok(Some(ResolutionCompletion::incomplete([
+        ResolutionIncompleteReason::UnsupportedSemantic(
+            ready.context_identities.semantic(digest.finish()),
+        ),
     ])))
 }
 
@@ -9929,7 +10571,7 @@ fn rust_type_parameter_member_reason(
                     None => return Ok(None),
                 }
             }
-            SelectedRustSourceDefinitionProjection::Unavailable
+            SelectedRustSourceDefinitionProjection::Unavailable(_)
             | SelectedRustSourceDefinitionProjection::Cancelled => return Ok(None),
         };
     let parameter_name = lexical
@@ -9969,6 +10611,7 @@ fn rust_type_parameter_member_reason(
         ResolutionIncompleteReason::UnsupportedSemantic(identities.named_semantic(
             digest.finish(),
             GENERIC_PARAMETER_MEMBER,
+            crate::analyzer::resolution::ReasonDeterminism::Unaudited,
             &evidence,
         )),
     ])))
@@ -10761,6 +11404,13 @@ impl AnalyzerStore {
                 return Ok(PreparedSelectedResolution::Stale(reason));
             }
         };
+        if input
+            .languages
+            .iter()
+            .any(|language| language.storage_language() == "rust")
+        {
+            inventory.capture_project_overlay_oids(input.project)?;
+        }
         match validate_selected_content_mounts(&inventory, cancellation)? {
             SelectedContentValidationOutcome::Ready => {}
             SelectedContentValidationOutcome::Unavailable(reason) => {
@@ -10815,12 +11465,15 @@ impl AnalyzerStore {
                 inventory: Rc::from(inventory),
                 query_preparation: Some(query_preparation),
                 content_mounts: input.content_mounts,
+                binary_operation_type_provider: input.binary_operation_type_provider.clone(),
                 project: input.project,
                 analyzer: input.analyzer,
+                rust_macro_invocation_services: input.rust_macro_invocation_services.clone(),
                 read_reuse: input.read_reuse,
                 model_authority,
                 analysis_generation: input.analysis_generation,
                 macro_walk: RefCell::default(),
+                macro_inputs: SelectedMacroInputRows::new(self.retention_budget()),
                 crate_rows: RefCell::default(),
                 context_identities: SelectedContextIdentities::new(),
                 operation_demand_state: Arc::default(),
@@ -10844,9 +11497,18 @@ impl AnalyzerStore {
                 unexpanded_item_macro_gaps: RefCell::default(),
                 public_diagnostic_sites: RefCell::default(),
                 obligation_site_ranges: RefCell::default(),
+                // The one place that decides which operations are inventoried:
+                // a selection that includes a JVM language, while the seam
+                // profile is on. Widening to other languages is this predicate.
                 jvm_context_profile: RefCell::new(
-                    crate::analyzer::resolution::seam_profile::enabled()
-                        .then(jvm_context::JvmContextReadProfile::default),
+                    (crate::analyzer::resolution::seam_profile::enabled()
+                        && input.languages.iter().any(|language| {
+                            matches!(
+                                language.semantic_language(),
+                                Language::Java | Language::Kotlin | Language::Scala
+                            )
+                        }))
+                    .then(jvm_context::JvmContextReadProfile::open),
                 ),
                 package_reference_read_memo: std::rc::Rc::new(RefCell::default()),
                 definition_module_anchors: RefCell::default(),
@@ -11143,6 +11805,15 @@ impl SelectedResolutionOperation<'_, '_> {
             _ => None,
         };
         let ready = &self.ready;
+        // Summary rows the persisted environment holds for uncovered overlay
+        // members are stale; every binding of this request says so.
+        let python_coverage = match &language_demand {
+            NativeLanguageDemand::Python { environment } => {
+                Some(self.python_coverage_completion(environment))
+                    .filter(|completion| *completion != ResolutionCompletion::Complete)
+            }
+            _ => None,
+        };
         let mut resolution_metrics = ResolutionBatchMetrics::default();
         let (projected, completion) = {
             let persisted_lexical = ready.lexical_source();
@@ -11222,6 +11893,9 @@ impl SelectedResolutionOperation<'_, '_> {
                                     &mut resolution_metrics,
                                 )?,
                             };
+                            if let Some(coverage) = &python_coverage {
+                                answer.combine_binding_completion(coverage);
+                            }
                             if let Some((installer, prepared)) = selected {
                                 let completion = installer.selected_target_completion(prepared, ready, &answer)?;
                                 if completion != ResolutionCompletion::Complete {
@@ -11405,10 +12079,41 @@ impl SelectedResolutionOperation<'_, '_> {
                         )?
                     }
                 }
-                LocatedSemantic::Missing => (
-                    SelectedResolutionLocated::Missing,
-                    ResolutionCompletion::Complete,
-                ),
+                LocatedSemantic::Missing => {
+                    let (certificate, completion) = if let Some(mount) =
+                        ready.inventory.mount_record_for_path(
+                            locator.storage_language(),
+                            locator.relative_path(),
+                        )? {
+                        let completion = persisted_lexical.reference_inventory_completion(
+                            mount.fragment_id(),
+                            cancellation,
+                            session,
+                        )?;
+                        let capable = brokk_bifrost_core::analyzer::model::LanguageDialect::from_config_label(
+                            locator.storage_language(),
+                        ).and_then(|dialect| super::store_language_support(dialect.language()))
+                            .is_some_and(|support| support.certifies_reference_inventory(mount.producer_epoch()));
+                        let certificate = match &completion {
+                            ResolutionCompletion::Complete if capable => {
+                                ReferenceInventoryCompleteness::Certified
+                            }
+                            ResolutionCompletion::Complete => {
+                                ReferenceInventoryCompleteness::Unavailable
+                            }
+                            ResolutionCompletion::Incomplete(_) => {
+                                ReferenceInventoryCompleteness::Incomplete(completion.clone())
+                            }
+                        };
+                        (certificate, completion)
+                    } else {
+                        (
+                            ReferenceInventoryCompleteness::Unavailable,
+                            ResolutionCompletion::Complete,
+                        )
+                    };
+                    (SelectedResolutionLocated::Missing(certificate), completion)
+                }
                 LocatedSemantic::Cancelled => {
                     return Ok(SelectedResolutionOperationOutcome::Cancelled(
                         cancelled_completion(),
@@ -12304,7 +13009,7 @@ impl SelectedResolutionOperation<'_, '_> {
                                     .collect(),
                             )
                         }
-                        ReverseSessionReport::Missing { .. } => SelectedResolutionLocated::Missing,
+                        ReverseSessionReport::Missing { .. } => SelectedResolutionLocated::Missing(crate::analyzer::store::resolution_operation::ReferenceInventoryCompleteness::Unavailable),
                     })
                     .collect(),
             ),
@@ -12513,7 +13218,7 @@ impl SelectedResolutionOperation<'_, '_> {
                         }
                     }
                 }
-                LocatedSemantics::Missing => SelectedResolutionLocated::Missing,
+                LocatedSemantics::Missing => SelectedResolutionLocated::Missing(crate::analyzer::store::resolution_operation::ReferenceInventoryCompleteness::Unavailable),
                 LocatedSemantics::Cancelled => {
                     return Ok(SelectedResolutionOperationOutcome::Cancelled(
                         cancelled_completion(),
@@ -12533,7 +13238,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 };
                 completion
             }
-            SelectedResolutionLocated::Missing => ResolutionCompletion::Complete,
+            SelectedResolutionLocated::Missing(_) => ResolutionCompletion::Complete,
         };
         note_rust_point_work("search_answers", session);
         // `finish` re-reads the analysis generation and the selection's change
@@ -12671,7 +13376,7 @@ impl SelectedResolutionOperation<'_, '_> {
         for (result, attempt) in results.iter_mut().zip(attempts) {
             if let BoundedResolution::Complete { value, .. } = result
                 && let SelectedRustCallerReferenceOutcome::Operation(
-                    SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Missing),
+                    SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Missing(crate::analyzer::store::resolution_operation::ReferenceInventoryCompleteness::Unavailable)),
                 ) = value
             {
                 *value = SelectedRustCallerReferenceOutcome::Operation(
@@ -12791,7 +13496,7 @@ impl SelectedResolutionOperation<'_, '_> {
             )?;
             let point_outcome = match located {
                 LocatedSemantics::Missing => Ok(SelectedResolutionOperationOutcome::Native(
-                    SelectedResolutionLocated::Missing,
+                    SelectedResolutionLocated::Missing(crate::analyzer::store::resolution_operation::ReferenceInventoryCompleteness::Unavailable),
                 )),
                 LocatedSemantics::Cancelled => Ok(SelectedResolutionOperationOutcome::Cancelled(
                     cancelled_completion(),
@@ -12895,29 +13600,29 @@ impl SelectedResolutionOperation<'_, '_> {
                     results.push(BoundedResolution::Complete {
                         value: SelectedRustCallerReferenceOutcome::Operation(
                             SelectedResolutionOperationOutcome::Native(
-                                SelectedResolutionLocated::Missing,
+                                SelectedResolutionLocated::Missing(crate::analyzer::store::resolution_operation::ReferenceInventoryCompleteness::Unavailable),
                             ),
                         ),
                         work,
                     });
                 }
                 BoundedResolution::Complete { value, work } => {
-                    attempts.push(SelectedResolutionLocated::Missing);
+                    attempts.push(SelectedResolutionLocated::Missing(crate::analyzer::store::resolution_operation::ReferenceInventoryCompleteness::Unavailable));
                     results.push(BoundedResolution::Complete {
                         value: SelectedRustCallerReferenceOutcome::Operation(value),
                         work,
                     });
                 }
                 BoundedResolution::Exceeded { limit, work } => {
-                    attempts.push(SelectedResolutionLocated::Missing);
+                    attempts.push(SelectedResolutionLocated::Missing(crate::analyzer::store::resolution_operation::ReferenceInventoryCompleteness::Unavailable));
                     results.push(BoundedResolution::Exceeded { limit, work });
                 }
                 BoundedResolution::Unavailable { reason, work } => {
-                    attempts.push(SelectedResolutionLocated::Missing);
+                    attempts.push(SelectedResolutionLocated::Missing(crate::analyzer::store::resolution_operation::ReferenceInventoryCompleteness::Unavailable));
                     results.push(BoundedResolution::Unavailable { reason, work });
                 }
                 BoundedResolution::Cancelled { work } => {
-                    attempts.push(SelectedResolutionLocated::Missing);
+                    attempts.push(SelectedResolutionLocated::Missing(crate::analyzer::store::resolution_operation::ReferenceInventoryCompleteness::Unavailable));
                     results.push(BoundedResolution::Cancelled { work });
                 }
             }
@@ -12969,6 +13674,7 @@ impl SelectedResolutionOperation<'_, '_> {
             SelectedRustDefinitionSemanticOutcome::Missing => {
                 return Ok(SelectedResolutionOperationOutcome::Unavailable(
                     SelectedResolutionUnavailable::MissingDefinitionUnit {
+            reason: crate::analyzer::store::resolution_selection::MissingDefinitionReason::UncertifiedDefinition,
                         storage_language: "rust".to_owned(),
                         persisted_relative_path: crate::path_utils::rel_path_string(
                             target.source(),
@@ -13112,6 +13818,7 @@ impl SelectedResolutionOperation<'_, '_> {
                             SelectedRustReferenceOwnerProjection::Unavailable => {
                                 return Ok(SelectedResolutionOperationOutcome::Unavailable(
                                     SelectedResolutionUnavailable::MissingDefinitionUnit {
+            reason: crate::analyzer::store::resolution_selection::MissingDefinitionReason::UncertifiedDefinition,
                                         storage_language: "rust".to_owned(),
                                         persisted_relative_path: target_path.clone(),
                                     },
@@ -13129,7 +13836,7 @@ impl SelectedResolutionOperation<'_, '_> {
                         source_sites,
                     })
                 }
-                LocatedSemantic::Missing => SelectedResolutionLocated::Missing,
+                LocatedSemantic::Missing => SelectedResolutionLocated::Missing(crate::analyzer::store::resolution_operation::ReferenceInventoryCompleteness::Unavailable),
                 LocatedSemantic::Cancelled => {
                     return Ok(SelectedResolutionOperationOutcome::Cancelled(
                         blueprint
@@ -13141,7 +13848,7 @@ impl SelectedResolutionOperation<'_, '_> {
         };
         let completion = match &attempt {
             SelectedResolutionLocated::Found(answer) => answer.completion().clone(),
-            SelectedResolutionLocated::Missing => ResolutionCompletion::Complete,
+            SelectedResolutionLocated::Missing(_) => ResolutionCompletion::Complete,
         };
         ready.finish(attempt, &completion, cancellation)
     }
@@ -13743,12 +14450,7 @@ impl ReadySelectedResolution<'_, '_> {
                 &self.go_publication_rechecks,
                 publication,
                 publication_data_version,
-                || {
-                    self.store
-                        .lend_selected_reader(self.inventory.connection(), || {
-                            self.store.go_context_head_status(publication, cancellation)
-                        })
-                },
+                || self.store.go_context_head_status(publication, cancellation),
             )?;
             match status {
                 super::GoContextHeadStatus::Current => {}
@@ -13792,9 +14494,8 @@ impl ReadySelectedResolution<'_, '_> {
             for publication in self.go_publications.borrow().values() {
                 match self
                     .store
-                    .lend_selected_reader(self.inventory.connection(), || {
-                        self.store.go_context_head_status(publication, cancellation)
-                    })? {
+                    .go_context_head_status(publication, cancellation)?
+                {
                     super::GoContextHeadStatus::Current => {}
                     super::GoContextHeadStatus::Withdrawn => {
                         return Ok(SelectedResolutionOperationOutcome::Stale(
@@ -14259,7 +14960,7 @@ impl<'store, 'input> SelectedResolutionOperation<'store, 'input> {
 
 impl super::cache_budget::RetainedBytes for PreparedMacroIncludeOverlay {
     fn retained_bytes(&self) -> usize {
-        let mut heap = super::cache_budget::RetainedHeap::default();
+        let mut heap = super::cache_budget::RetainedHeap::allocated();
         heap.add(std::mem::size_of_val(self));
         heap.vec(&self.components);
         for component in &self.components {
@@ -14275,17 +14976,27 @@ impl super::cache_budget::RetainedBytes for PreparedMacroIncludeOverlay {
                     let import = &glob.import;
                     heap.vec(&import.module_path);
                     for part in &import.module_path {
-                        heap.add(part.capacity());
+                        heap.add(heap.allocation_bytes(part.capacity()));
                     }
-                    heap.add(import.bound_name.as_ref().map_or(0, String::capacity));
-                    heap.add(import.imported_name.as_ref().map_or(0, String::capacity));
-                    heap.add(import.owner_module.capacity());
+                    heap.add(
+                        import
+                            .bound_name
+                            .as_ref()
+                            .map_or(0, |value| heap.allocation_bytes(value.capacity())),
+                    );
+                    heap.add(
+                        import
+                            .imported_name
+                            .as_ref()
+                            .map_or(0, |value| heap.allocation_bytes(value.capacity())),
+                    );
+                    heap.add(heap.allocation_bytes(import.owner_module.capacity()));
                     if let brokk_bifrost_core::analyzer::rust_facts::RustVisibility::InPath(path) =
                         &import.visibility
                     {
                         heap.vec(path);
                         for part in path {
-                            heap.add(part.capacity());
+                            heap.add(heap.allocation_bytes(part.capacity()));
                         }
                     }
                     heap.add(import.cfg_condition.estimated_retained_bytes());
@@ -14388,6 +15099,96 @@ mod go_publication_recheck_tests {
 }
 
 #[cfg(test)]
+mod macro_input_budget_tests {
+    use super::*;
+    use brokk_bifrost_core::retention_budget::RetainedBytes;
+
+    fn rows(bytes: usize) -> AllocatedMacroInputRows {
+        AllocatedMacroInputRows(vec![rust_facts::RustMacroInvocationInputSourceFact {
+            invocation: brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceId::new(1),
+            macro_name: Some("m".to_owned()),
+            cfg_condition: rust_facts::RustCfgCondition::Always,
+            native_frontier: None,
+            occurrences: vec![
+                brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceId::new(1),
+            ],
+            tree: rust_facts::RustMacroTokenTree {
+                start_byte: 0,
+                source: "x".repeat(bytes),
+                tokens: vec![rust_facts::RustMacroInputToken {
+                    parent: None,
+                    syntax_kind: "token_tree".to_owned(),
+                    start_byte: 0,
+                    end_byte: bytes,
+                }],
+            },
+        }])
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11281: operation macro inputs escaped owner accounting and stage cleanup"
+    )]
+    fn macro_inputs_are_private_and_clear_without_losing_held_accounting() {
+        let budget = RetentionBudget::for_test_capacity(100_000);
+        let inputs = SelectedMacroInputRows::new(&budget);
+        let other = SelectedMacroInputRows::new(&budget);
+        let held = inputs.0.insert("blob".to_owned(), rows(1024));
+        assert!(matches!(held, BudgetedValue::Retained(_)));
+        assert!(
+            other.0.get(&"blob".to_owned()).is_none(),
+            "operation namespaces are private"
+        );
+        inputs.clear();
+        assert!(inputs.0.get(&"blob".to_owned()).is_none());
+        assert!(
+            budget.accounted_bytes() > 1024,
+            "a consumer still holds the evicted token backing"
+        );
+        drop(held);
+        budget.run_pending_tasks();
+        assert_eq!(budget.accounted_bytes(), 0);
+        drop(inputs.0.insert("blob".to_owned(), rows(1024)));
+        drop(inputs);
+        budget.run_pending_tasks();
+        assert_eq!(
+            budget.accounted_bytes(),
+            0,
+            "operation drop invalidates private residents"
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11281: decoded macro token strings had no eviction or oversized fallback"
+    )]
+    fn macro_inputs_evict_under_owner_pressure_and_return_oversized_values_uncached() {
+        // One large row set fits; retaining the small set as well does not.
+        let capacity = rows(8192).retained_bytes()
+            + "second".to_owned().retained_bytes()
+            + brokk_bifrost_core::retention_budget::ENTRY_OVERHEAD_BYTES
+            + 1;
+        let budget = RetentionBudget::for_test_capacity(capacity as u64);
+        let inputs = SelectedMacroInputRows::new(&budget);
+        drop(inputs.0.insert("first".to_owned(), rows(1024)));
+        assert!(inputs.0.get(&"first".to_owned()).is_some());
+        drop(inputs.0.insert("second".to_owned(), rows(8192)));
+        assert!(
+            inputs.0.get(&"first".to_owned()).is_none(),
+            "owner pressure evicts the older token backing"
+        );
+        assert!(inputs.0.get(&"second".to_owned()).is_some());
+        let tiny = RetentionBudget::for_test_capacity(512);
+        let uncached = SelectedMacroInputRows::new(&tiny);
+        let value = rows(8192);
+        let actual = uncached.0.insert("blob".to_owned(), value.clone());
+        assert!(matches!(actual, BudgetedValue::RequestOwned { .. }));
+        assert_eq!(*actual, value, "admission refusal does not refuse the read");
+        assert!(uncached.0.get(&"blob".to_owned()).is_none());
+    }
+}
+
+#[cfg(test)]
 mod cache_budget_tests {
     use super::*;
     use crate::analyzer::resolution::SharedNameId;
@@ -14399,9 +15200,9 @@ mod cache_budget_tests {
             retention_budget_bytes: Some(4 * (256 * 1024)),
             ..Default::default()
         };
-        let store = AnalyzerStore::open_in_memory_single_connection_with_config(
+        let store = AnalyzerStore::open_ephemeral_with_config(
             &config,
-            &brokk_bifrost_core::retention_budget::RetentionBudget::new(
+            &brokk_bifrost_core::retention_budget::RetentionBudget::for_test_capacity(
                 config.retention_budget_bytes(),
             ),
         )
@@ -14471,4 +15272,58 @@ mod cache_budget_tests {
             "shared-name admissions evict the earlier overlay"
         );
     }
+}
+
+impl SelectedResolutionOperation<'_, '_> {
+    /// Project diagnostic operands through this operation's selected identities.
+    #[doc(hidden)]
+    pub fn diagnostic_definitions(
+        &self,
+        definitions: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> Result<Option<Vec<native_units::SelectedDiagnosticIdentity>>> {
+        native_units::diagnostic_definition_units(&self.ready, definitions, cancellation)
+    }
+}
+
+#[cfg(all(feature = "test-support", target_os = "linux"))]
+pub(super) fn allocation_test_macro_overlay() -> PreparedMacroIncludeOverlay {
+    PreparedMacroIncludeOverlay {
+        components: (0..4)
+            .map(|_| PreparedMacroIncludeComponent {
+                scopes: Vec::with_capacity(16),
+                origins: Vec::with_capacity(8),
+            })
+            .collect(),
+        path_count: 0,
+        binding_pair_count: 0,
+    }
+}
+
+#[cfg(all(feature = "test-support", target_os = "linux"))]
+pub(super) fn allocation_test_selected_macro_inputs() -> AllocatedMacroInputRows {
+    use brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceId;
+    AllocatedMacroInputRows(
+        (0..12)
+            .map(|i| rust_facts::RustMacroInvocationInputSourceFact {
+                invocation: SourceOccurrenceId::new(i + 1),
+                macro_name: Some(format!("selected_macro_{i}")),
+                cfg_condition: rust_facts::RustCfgCondition::Atom("selected_feature".into()),
+                native_frontier: None,
+                occurrences: vec![SourceOccurrenceId::new(i + 1); 8],
+                tree: rust_facts::RustMacroTokenTree {
+                    start_byte: 0,
+                    source: "x".repeat(128),
+                    tokens: (0..4)
+                        .map(|j| rust_facts::RustMacroInputToken {
+                            parent: None,
+                            syntax_kind: "identifier".into(),
+                            start_byte: j,
+                            end_byte: j + 1,
+                        })
+                        .collect(),
+                },
+            })
+            .collect(),
+    )
 }

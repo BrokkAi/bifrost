@@ -351,6 +351,8 @@ fn tasks_2026_07_28_session_wire_is_schema_valid_outside_the_extension() {
             "name": "run_policy",
             "arguments": {
                 "policy_files": ["policies/dynamic-eval.rqlp"],
+                "sources": ["src/app.py"],
+                "inline_suppression_prefix": "review",
                 "evaluation_date": "2026-07-27",
                 "fail_on": "warning"
             },

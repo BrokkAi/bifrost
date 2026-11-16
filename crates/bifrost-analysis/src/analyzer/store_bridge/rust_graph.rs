@@ -25,9 +25,22 @@ enum RustGraphStageUnit {
     OutsideCrates,
 }
 
+/// Entered for every graph unit, on the thread and operation that run it,
+/// after the unit narrows to its crate. Pooled workers do not inherit the
+/// owner thread's frame. The W=1 path runs units on the owner and enters a
+/// nested frame there. `OperationReadFrame` does not borrow the operation, so
+/// the higher-ranked lifetime is the unit operation's own store lifetime.
+type RustGraphFrameOpener<'a> = dyn for<'store, 'input> Fn(
+        &SelectedResolutionOperation<'store, 'input>,
+    ) -> Result<
+        crate::analyzer::derivation_host::read_frame::OperationReadFrame<'store>,
+    > + Sync
+    + 'a;
+
 struct RustGraphStageAdapter<'a> {
     project_root: &'a Path,
     analyzer: &'a dyn IAnalyzer,
+    frame: &'a RustGraphFrameOpener<'a>,
 }
 
 impl GraphStageAdapter for RustGraphStageAdapter<'_> {
@@ -144,6 +157,7 @@ impl GraphStageAdapter for RustGraphStageAdapter<'_> {
             maximum_batch_size,
             cancellation,
             context_metrics,
+            self.frame,
             &mut |edges| {
                 batches.push(edges.clone());
                 Ok(())
@@ -165,6 +179,7 @@ pub trait RustGraphStageExt {
         worker_count: usize,
         cancellation: &CancellationToken,
         context_metrics: &mut SelectedResolutionContextMetrics,
+        frame: &RustGraphFrameOpener<'_>,
         stage: &mut dyn FnMut(&FactReferenceEdgeBatch) -> Result<()>,
     ) -> Result<SelectedResolutionOperationOutcome<GraphStageResult>>;
 
@@ -178,6 +193,7 @@ pub trait RustGraphStageExt {
         maximum_batch_size: usize,
         cancellation: &CancellationToken,
         context_metrics: &mut SelectedResolutionContextMetrics,
+        frame: &RustGraphFrameOpener<'_>,
         stage: &mut dyn FnMut(&FactReferenceEdgeBatch) -> Result<()>,
     ) -> Result<SelectedResolutionOperationOutcome<FactResolutionBatchSummary>>;
 }
@@ -194,11 +210,13 @@ impl RustGraphStageExt for SelectedResolutionOperation<'_, '_> {
         worker_count: usize,
         cancellation: &CancellationToken,
         context_metrics: &mut SelectedResolutionContextMetrics,
+        frame: &RustGraphFrameOpener<'_>,
         stage: &mut dyn FnMut(&FactReferenceEdgeBatch) -> Result<()>,
     ) -> Result<SelectedResolutionOperationOutcome<GraphStageResult>> {
         let adapter = RustGraphStageAdapter {
             project_root,
             analyzer,
+            frame,
         };
         run_analyzer_graph_stages(
             self,
@@ -223,6 +241,7 @@ impl RustGraphStageExt for SelectedResolutionOperation<'_, '_> {
         maximum_batch_size: usize,
         cancellation: &CancellationToken,
         context_metrics: &mut SelectedResolutionContextMetrics,
+        frame: &RustGraphFrameOpener<'_>,
         stage: &mut dyn FnMut(&FactReferenceEdgeBatch) -> Result<()>,
     ) -> Result<SelectedResolutionOperationOutcome<FactResolutionBatchSummary>> {
         let unit_files = files.iter().cloned().collect::<Vec<_>>();
@@ -230,6 +249,7 @@ impl RustGraphStageExt for SelectedResolutionOperation<'_, '_> {
             context: Some(context),
             crate_keys,
             cancellation,
+            frame,
         };
         let mut projector = NativeReferenceEdgeBatchProjector::new(analyzer);
         let trace = crate::profiling::enabled();
@@ -273,6 +293,7 @@ struct RustGraphUnitRules<'a> {
     context: Option<SelectedResolutionContextSet>,
     crate_keys: &'a [[u8; 32]],
     cancellation: &'a CancellationToken,
+    frame: &'a RustGraphFrameOpener<'a>,
 }
 
 impl GraphUnitRules for RustGraphUnitRules<'_> {
@@ -338,7 +359,12 @@ impl GraphUnitRules for RustGraphUnitRules<'_> {
         operation: &SelectedResolutionOperation<'_, '_>,
         run: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
-        operation.with_rust_forward_crate_scope(self.crate_keys, self.cancellation, run)
+        operation.with_rust_forward_crate_scope(
+            self.crate_keys,
+            self.cancellation,
+            |operation| (self.frame)(operation),
+            run,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -381,7 +407,7 @@ fn project_rust_graph_definitions(
         SelectedRustSourceDefinitionProjection::Complete(definitions) => {
             for (semantic, definition) in definitions {
                 match definition {
-                    SelectedRustSourceDefinition::Unit(unit) => edge_projector
+                    SelectedRustSourceDefinition::Unit(unit, _) => edge_projector
                         .catalog_mut()
                         .insert_graph_declaration(semantic, unit)?,
                     // A lexical binding has no `CodeUnit`, and
@@ -409,7 +435,7 @@ fn project_rust_graph_definitions(
         // 14,985 edges were available. Each definition becomes
         // an endpoint the graph does not draw, and the request
         // says so.
-        SelectedRustSourceDefinitionProjection::Unavailable => {
+        SelectedRustSourceDefinitionProjection::Unavailable(_) => {
             for &semantic in definitions {
                 edge_projector
                     .catalog_mut()

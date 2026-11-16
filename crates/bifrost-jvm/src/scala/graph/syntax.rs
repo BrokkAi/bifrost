@@ -1062,6 +1062,13 @@ fn is_union_type(node: Node<'_>, source: &str) -> bool {
 }
 
 fn enclosing_extension_receiver_type_path(node: Node<'_>, source: &str) -> Option<Vec<String>> {
+    let (_, type_node) = enclosing_extension_receiver(node)?;
+    Some(scala_type_lookup_segments(type_node, source)).filter(|segments| !segments.is_empty())
+}
+
+/// The `extension_definition` that directly encloses callable `node`, and the
+/// type node of its receiver parameter.
+fn enclosing_extension_receiver(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
     let mut current = node.parent();
     while let Some(ancestor) = current {
         if ancestor.kind() == "extension_definition" {
@@ -1071,8 +1078,7 @@ fn enclosing_extension_receiver_type_path(node: Node<'_>, source: &str) -> Optio
                 .named_children(&mut cursor)
                 .find(|parameter| matches!(parameter.kind(), "parameter" | "class_parameter"))
                 .and_then(|parameter| parameter.child_by_field_name("type"))
-                .map(|type_node| scala_type_lookup_segments(type_node, source))
-                .filter(|segments| !segments.is_empty());
+                .map(|type_node| (ancestor, type_node));
         }
         if matches!(
             ancestor.kind(),
@@ -1083,6 +1089,27 @@ fn enclosing_extension_receiver_type_path(node: Node<'_>, source: &str) -> Optio
         current = ancestor.parent();
     }
     None
+}
+
+/// The receiver a Scala 3 `extension` clause gives the callables it encloses.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScalaExtensionReceiver {
+    /// The clause's own type parameters. They are in scope in the receiver
+    /// and in the signature of every callable the clause encloses.
+    pub type_parameters: Vec<String>,
+    /// The parsed receiver type, absent when the type has a form that
+    /// `ScalaTypeExpressionPath` does not represent.
+    pub receiver_type: Option<ScalaTypeExpressionPath>,
+}
+
+/// The extension receiver of callable `node`, or `None` when no `extension`
+/// clause directly encloses it.
+pub fn scala_extension_receiver(node: Node<'_>, source: &str) -> Option<ScalaExtensionReceiver> {
+    let (extension, type_node) = enclosing_extension_receiver(node)?;
+    Some(ScalaExtensionReceiver {
+        type_parameters: scala_declared_type_parameter_names(extension, source),
+        receiver_type: scala_type_expression_path(type_node, source),
+    })
 }
 
 pub(crate) fn callable_arity_for_parameters(parameters: Node<'_>) -> CallableArity {

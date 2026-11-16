@@ -51,6 +51,7 @@ fn assessed_threat_and_truncated_scenario_render_in_report() {
         .evaluate(
             policy,
             &PolicyEvaluationContext {
+                acceptance_hint: None,
                 analyzer: &analyzer,
                 workspace: None,
                 flow_state: &brokk_bifrost_flow::FlowWorkspaceState::default(),
@@ -87,6 +88,7 @@ fn assessed_threat_and_truncated_scenario_render_in_report() {
         .evaluate(
             policy,
             &PolicyEvaluationContext {
+                acceptance_hint: None,
                 analyzer: &analyzer,
                 workspace: None,
                 flow_state: &brokk_bifrost_flow::FlowWorkspaceState::default(),
@@ -236,7 +238,7 @@ fn catalog_schema_and_exact_match_origin_have_distinct_report_labels() {
         TaintCatalogRegistry::new_without_workspace(CatalogRegistryLimits::default());
     catalogs
         .register(TaintCatalogDefinition {
-            schema_version: 1,
+            schema_version: crate::definition::POLICY_DOCUMENT_SCHEMA_VERSION,
             name: PolicyId::new("test.catalog").unwrap(),
             version: 1,
             categories: vec![PolicyCategoryId::new("input.user").unwrap()],
@@ -255,7 +257,7 @@ fn catalog_schema_and_exact_match_origin_have_distinct_report_labels() {
                     .unwrap(),
                     resolved_locators: Vec::new(),
                 },
-                bind: PolicyPort::ReturnValue,
+                bind: PolicyPort::ReturnValue { path: None },
                 labels: vec![TaintLabel::new("untrusted").unwrap()],
                 threat_model: None,
                 evidence: None,
@@ -299,6 +301,7 @@ fn catalog_schema_and_exact_match_origin_have_distinct_report_labels() {
         .evaluate(
             policy,
             &PolicyEvaluationContext {
+                acceptance_hint: None,
                 analyzer: &analyzer,
                 workspace: None,
                 flow_state: &brokk_bifrost_flow::FlowWorkspaceState::default(),
@@ -331,7 +334,10 @@ fn catalog_schema_and_exact_match_origin_have_distinct_report_labels() {
     .unwrap();
     let rendered = String::from_utf8(bytes).unwrap();
     assert!(
-        rendered.contains("definition schema: catalog document 1"),
+        rendered.contains(&format!(
+            "definition schema: catalog document {}",
+            crate::definition::POLICY_DOCUMENT_SCHEMA_VERSION
+        )),
         "{rendered}"
     );
     assert!(

@@ -2,6 +2,16 @@
 //! inputs in SQL and persists outputs without retaining a workspace index.
 // Python-only summaries use the empty parse variant.
 
+fn python_unit_summary_derivation_identity() -> [u8; 32] {
+    static IDENTITY: std::sync::LazyLock<[u8; 32]> = std::sync::LazyLock::new(|| {
+        brokk_bifrost_core::lever_tokens::lever_identity(
+            "python-unit-summary-derivation",
+            brokk_bifrost_core::lever_file!("python-unit-summary-derivation.tokens"),
+        )
+    });
+    *IDENTITY
+}
+
 use std::path::{Path, PathBuf};
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::Arc;
@@ -17,8 +27,8 @@ use super::Result;
 use super::WorkspaceId;
 use super::WorkspaceSnapshotId;
 use super::unit_summaries::{
-    self, ConsumedDependency, UnitContainer, UnitGap, UnitInputs, UnitMember, UnitOutputs,
-    UnitPlacement, UnitRead, UnitSummaryLanguage,
+    self, ConsumedDependency, ForeignReader, UnitContainer, UnitGap, UnitInputs, UnitMember,
+    UnitOutputs, UnitPlacement, UnitRead, UnitSummaryLanguage,
 };
 use crate::CancellationToken;
 
@@ -122,11 +132,78 @@ impl PythonSummaryProfile {
     }
 }
 
-/// Scalar authority for one selected Python environment within a request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Authority for one selected Python environment within a request.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PythonSelectedEnvironment {
     pub summary: i64,
     pub python_version: Option<brokk_bifrost_python::intrinsics::PythonVersion>,
+    pub coverage: PythonSummaryCoverage,
+}
+
+/// Why the persisted summary does not describe one overlay member.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PythonUncoveredCause {
+    /// The overlay adds a path the persisted selection lacks.
+    Added,
+    /// The overlay removes a persisted path.
+    Removed,
+    /// The replacement's member input differs from the persisted blob's.
+    InputChanged,
+    /// A member input is unreadable: an admitted blob lacks the current surface list.
+    InputUnproved,
+}
+
+impl PythonUncoveredCause {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Added => "added",
+            Self::Removed => "removed",
+            Self::InputChanged => "input_changed",
+            Self::InputUnproved => "input_unproved",
+        }
+    }
+}
+
+/// Request-local proof of which overlay members the selected persisted summary
+/// still describes. The selected mount inventory owns membership; this value
+/// holds only the overlay delta (sorted by path), never a workspace copy.
+/// A replacement keeps coverage when its `MemberInput` equals the recorded
+/// member input and the selected path set is unchanged; `retained` lists those
+/// covered replacements and `uncovered` the rest, each with its cause. The
+/// predicate is the shared `selected_unit_member_mounts` witness. Roots and spellings derive
+/// from selected paths, package markers (surface inputs) and configuration;
+/// configuration changes re-project the analyzer and select another summary.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PythonSummaryCoverage {
+    retained: Vec<String>,
+    uncovered: Vec<(String, PythonUncoveredCause)>,
+}
+
+impl PythonSummaryCoverage {
+    pub fn new(retained: Vec<String>, uncovered: Vec<(String, PythonUncoveredCause)>) -> Self {
+        debug_assert!(retained.windows(2).all(|pair| pair[0] < pair[1]));
+        debug_assert!(uncovered.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        Self {
+            retained,
+            uncovered,
+        }
+    }
+    /// Replacements with an equal member input, in path order.
+    pub fn retained(&self) -> &[String] {
+        &self.retained
+    }
+    /// Members the summary does not describe, in path order.
+    pub fn uncovered(&self) -> &[(String, PythonUncoveredCause)] {
+        &self.uncovered
+    }
+    /// Members whose summary rows cannot be used, with typed cause labels.
+    /// Covered replacements read current mount facts through the shared view.
+    pub fn unusable(&self) -> Vec<(&str, &'static str)> {
+        self.uncovered
+            .iter()
+            .map(|(path, cause)| (path.as_str(), cause.label()))
+            .collect()
+    }
 }
 
 /// Receipt counts summary reconciliation separately from parse/lowering input work.
@@ -212,19 +289,27 @@ pub(crate) fn stage_candidates_prefix() -> &'static str {
 (container,module,parent,depth,root,kind,rel_path,blob_id,scope,provider_digest) VALUES"
 }
 pub(crate) const STAGE_CANDIDATE_ROW: &str = "(?,?,?,?,?,?,?,?,?,?)";
+// The bound name is a scalar subquery, not LEFT JOINs. A generated surface view
+// is a join of its source, the surface set and the id map, and SQLite never
+// flattens a join that is the right operand of a LEFT JOIN: it materialized
+// every event and slot in the store and probed them through an automatic index.
+// A binding event and a slot are unique per (blob, id), so the subquery returns
+// the same row the joins did. It compares surface_ordinal, the view's
+// membership ordinal, which equals the `event` and `slot` columns but is the
+// column SQLite can seek: the id map has a unique key on it.
 pub(crate) const STAGE_IMPORTS: &str = "INSERT INTO temp.py_env_imports
 SELECT f.rel_path,i.import_site,i.relative_level,
  CASE i.form WHEN 0 THEN 'module' WHEN 1 THEN 'from' WHEN 2 THEN 'star' END,
  CASE WHEN i.form=1 THEN json_extract(i.route,'$[' || i.module_segments || ']') ELSE '' END,
- CASE WHEN i.form=2 THEN '' ELSE slots.name END
+ CASE WHEN i.form=2 THEN '' ELSE (SELECT slots.name FROM temp.surface_python_events AS e
+  CROSS JOIN temp.surface_python_slots AS slots ON slots.blob_id=e.blob_id AND slots.surface_ordinal=e.slot
+  WHERE e.blob_id=i.blob_id AND e.surface_ordinal=i.binding_event) END
 FROM temp.py_env_files AS f
-CROSS JOIN python_binding_imports AS i ON i.blob_id=f.blob_id
-LEFT JOIN resolution_binding_events AS e ON e.blob_id=i.blob_id AND e.event=i.binding_event
-LEFT JOIN resolution_binding_slots AS slots ON slots.blob_id=e.blob_id AND slots.slot=e.slot";
+CROSS JOIN temp.surface_python_imports AS i ON i.blob_id=f.blob_id";
 pub(crate) const STAGE_SEGMENTS: &str = "INSERT INTO temp.py_env_segments
 SELECT f.rel_path,i.import_site,CAST(j.key AS INTEGER),j.value
 FROM temp.py_env_files AS f
-CROSS JOIN python_binding_imports AS i ON i.blob_id=f.blob_id
+CROSS JOIN temp.surface_python_imports AS i ON i.blob_id=f.blob_id
 CROSS JOIN json_each(i.route) AS j WHERE CAST(j.key AS INTEGER)<i.module_segments";
 pub(crate) const STAGE_SURFACES: &str = "INSERT INTO temp.py_env_surfaces
 SELECT f.rel_path,surface.value,
@@ -232,13 +317,13 @@ SELECT f.rel_path,surface.value,
  WHEN 'curated' THEN CASE s.export_curated WHEN 0 THEN 'absent' WHEN 1 THEN 'curated' WHEN 2 THEN 'unknown' END
  WHEN 'wildcard' THEN CASE s.export_wildcard WHEN 0 THEN 'public_names' WHEN 1 THEN 'curated' WHEN 2 THEN 'unknown' END END
 FROM temp.py_env_files AS f
-CROSS JOIN python_binding_source AS s ON s.blob_id=f.blob_id
+CROSS JOIN temp.surface_python_source AS s ON s.blob_id=f.blob_id
 CROSS JOIN json_each('[\"module\",\"curated\",\"wildcard\"]') AS surface";
 pub(crate) const STAGE_MODULE_NAMES: &str = "INSERT INTO temp.py_env_names
 SELECT f.rel_path,'module',slots.name,min(slots.slot)
 FROM temp.py_env_files AS f
-CROSS JOIN resolution_binding_slots AS slots ON slots.blob_id=f.blob_id
-WHERE slots.scope=0 GROUP BY f.rel_path,slots.name";
+CROSS JOIN temp.surface_python_slots AS slots ON slots.blob_id=f.blob_id
+WHERE slots.module_scope=1 GROUP BY f.rel_path,slots.name";
 // A Listed surface implies readable operations after the last reset. The
 // producer in bifrost-python/src/resolution/exports.rs::produce sets Listed
 // only for a readable operation, and non-replacement operations require the
@@ -249,12 +334,12 @@ pub(crate) const STAGE_CURATED_NAMES: &str = "INSERT OR IGNORE INTO temp.py_env_
 SELECT f.rel_path,'curated',member.value,slots.site
 FROM temp.py_env_surfaces AS surface
 CROSS JOIN temp.py_env_files AS f ON f.rel_path=surface.rel_path
-CROSS JOIN python_binding_export_operations AS op ON op.blob_id=f.blob_id
+CROSS JOIN temp.surface_python_exports AS op ON op.blob_id=f.blob_id
 CROSS JOIN json_each(op.members) AS member
 LEFT JOIN temp.py_env_names AS slots
  ON slots.rel_path=f.rel_path AND slots.surface='module' AND slots.name=member.value
 WHERE surface.surface='curated' AND surface.policy='curated'
- AND op.ordinal>=(SELECT max(reset.ordinal) FROM python_binding_export_operations AS reset
+ AND op.surface_ordinal>=(SELECT max(reset.surface_ordinal) FROM temp.surface_python_exports AS reset
   WHERE reset.blob_id=f.blob_id AND reset.kind IN (0,1,6))";
 pub(crate) const STAGE_WILDCARD_NAMES: &str = "INSERT INTO temp.py_env_names
 SELECT names.rel_path,'wildcard',names.name,names.site
@@ -485,9 +570,10 @@ impl PythonEnvironmentPublication {
         let mut store = AnalyzerStore::open_persistent(path)?;
         // Native validation sessions need connection-private TEMP inventories even
         // when another profile uses the same database and persistent writer actor.
-        store.conn = super::writer::StoreWriter::local(
-            crate::cache_db::open_unified_connection(path).map_err(super::StoreError::new)?,
-        );
+        let connection =
+            crate::cache_db::open_unified_connection(path).map_err(super::StoreError::new)?;
+        super::ensure_revisioned_workspace_views(&connection)?;
+        store.conn = super::writer::StoreWriter::local(connection);
         *store.crate_statement_counter.lock().expect("counter lock") =
             Some(Arc::new(std::sync::atomic::AtomicUsize::new(0)));
         let generation = store.ensure_language_epoch_value("python", source_epoch)?;
@@ -716,7 +802,20 @@ struct PythonUnitSummaries {
     profile: PythonSummaryProfile,
     staging: Option<PythonEnvironmentStaging>,
 }
-pub(super) const LIVE: &str = unit_summaries::live_summary_select!("?8");
+/// The shared validity predicate plus the recorded member inputs.
+pub(super) static LIVE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "{} AND {}",
+        unit_summaries::live_summary_select!("?8"),
+        super::surface_relations::members_current_sql(
+            "python",
+            "versions.summary_id",
+            "?1",
+            "?3",
+            "?5"
+        )
+    )
+});
 impl UnitSummaryLanguage for PythonUnitSummaries {
     fn lang(&self) -> &'static str {
         "python"
@@ -724,8 +823,8 @@ impl UnitSummaryLanguage for PythonUnitSummaries {
     fn unit_kind(&self) -> &'static str {
         "python_environment"
     }
-    fn derivation_version(&self) -> i64 {
-        1
+    fn derivation_identity(&self) -> [u8; 32] {
+        python_unit_summary_derivation_identity()
     }
     fn profile_digest(&self) -> [u8; 32] {
         self.profile.digest()
@@ -738,7 +837,7 @@ impl UnitSummaryLanguage for PythonUnitSummaries {
         unit: &[u8; 32],
     ) -> Result<Option<(i64, Vec<u8>)>> {
         Ok(conn
-            .prepare_cached(LIVE)?
+            .prepare_cached(&LIVE)?
             .query_row(
                 params![
                     snapshot.workspace_id.as_str(),
@@ -747,7 +846,7 @@ impl UnitSummaryLanguage for PythonUnitSummaries {
                     unit.as_slice(),
                     snapshot.revision,
                     epoch,
-                    1,
+                    self.derivation_identity(),
                     self.profile.digest().as_slice()
                 ],
                 |row| Ok((row.get(0)?, row.get(1)?)),
@@ -789,6 +888,15 @@ impl UnitSummaryLanguage for PythonUnitSummaries {
                     "python_retained_input_unavailable: path={path:?} oid={oid:?} blob={blob:?} format={format:?}"
                 )));
             };
+            // The native binding header above claims facts for this selected source.
+            // Missing publication here is corruption/unavailability, unlike an
+            // unclaimed no-facts member's legitimate tagged-OID key contribution.
+            if super::unit_summaries::member_surface_fingerprint(conn, "python", blob_id)?.is_none()
+            {
+                return Err(StoreError::missing_required_source_facts(format!(
+                    "python_retained_surface_unavailable: path={path:?} oid={oid:?} blob={blob_id}"
+                )));
+            }
             let roots = if matches!(self.profile.authority, PythonSummaryAuthority::Workspace) {
                 let selection = (staging.workspace_root)(Path::new(&path), &inputs)?;
                 if let Some(root) = selection.declared {
@@ -821,6 +929,16 @@ impl UnitSummaryLanguage for PythonUnitSummaries {
         roots_batch.flush(conn, &staging.cancellation)?;
         candidates.flush(conn, &staging.cancellation)?;
         declared_roots.flush(conn, &staging.cancellation)?;
+        super::surface_relations::create_surface_views(
+            conn,
+            super::surface_relations::PYTHON_RELATIONS,
+        )?;
+        conn.execute_batch(&format!("DROP VIEW IF EXISTS temp.py_env_current_list; CREATE TEMP VIEW py_env_current_list AS SELECT x'{}' AS list_digest", lower_hex_string(&super::surface_relations::list_digest(super::surface_relations::PYTHON_RELATIONS))))?;
+        #[cfg(any(test, feature = "test-support"))]
+        let _fence = super::surface_relations::SurfaceReadGuard::new(
+            conn,
+            super::surface_relations::PYTHON_RELATIONS,
+        )?;
         for sql in [
             STAGE_IMPORTS,
             STAGE_SEGMENTS,
@@ -933,7 +1051,7 @@ impl UnitSummaryLanguage for PythonUnitSummaries {
                 placements.push(UnitPlacement {
                     container_path: container,
                     member_ordinal: ordinals[&(blob, path.as_str(), "python")],
-                    scope_ordinal: scope,
+                    scope_ordinal: scope.map(super::unit_summaries::UnitCoordinate::Surface),
                 });
             }
         }
@@ -946,6 +1064,7 @@ impl UnitSummaryLanguage for PythonUnitSummaries {
             unit_key: unit_key(),
             label: "Python environment".into(),
             members,
+            input_files: Vec::new(),
             reads: vec![
                 UnitRead {
                     kind: "configuration",
@@ -971,6 +1090,7 @@ impl UnitSummaryLanguage for PythonUnitSummaries {
         _unit: &UnitInputs,
         _dependencies: &[ConsumedDependency],
         _epoch: &str,
+        _consumed: &mut ForeignReader<'_>,
     ) -> Result<UnitOutputs> {
         let mut gaps = vec![UnitGap { kind:"python_environment_open",subject:"provider/activation/package_path".into(),
             detail:"{\"activation\":\"unproven\",\"package_path\":\"dynamic_uninspected\",\"external_providers\":\"unacquired\"}".into() }];
@@ -999,63 +1119,21 @@ impl UnitSummaryLanguage for PythonUnitSummaries {
         &self,
         conn: &Connection,
         _snapshot: &WorkspaceSnapshotId,
-        unit: &UnitInputs,
+        _unit: &UnitInputs,
         _dependencies: &[ConsumedDependency],
         summary: i64,
+        _reader: &mut ForeignReader<'_>,
     ) -> Result<usize> {
         let before = conn.total_changes();
         // Replacement of a corrupt/incomplete shared summary may reuse its id.
         conn.prepare_cached("DELETE FROM python_unit_summary_roots WHERE summary_id=?1")?
             .execute([summary])?;
-        let mut roots =
-            conn.prepare_cached("SELECT slot,path FROM temp.py_env_roots ORDER BY slot")?;
-        for row in roots.query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        })? {
-            let (slot, path) = row?;
-            conn.prepare_cached(
-                "INSERT INTO python_unit_summary_roots VALUES(?1,?2,?3,?4,?5,?6,?7)",
-            )?
-            .execute(params![
-                summary,
-                slot,
-                path,
-                self.profile.authority.label(),
-                self.profile.ordered,
-                self.profile.observation.label(),
-                self.profile.target_digest.as_slice()
-            ])?;
-        }
-        let ordinals = super::unit_summaries::member_ordinals(&unit.members);
-        let mut statement=conn.prepare_cached("SELECT container,module,parent,root,kind,state,rel_path,blob_id,provider_digest FROM temp.py_env_candidates ORDER BY container")?;
-        for row in statement.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, Option<i64>>(7)?,
-                row.get::<_, Vec<u8>>(8)?,
-            ))
-        })? {
-            let (container, module, parent, root, kind, state, path, blob, digest) = row?;
-            let ordinal = blob.map(|blob| ordinals[&(blob, path.as_str(), "python")] as i64);
-            conn.prepare_cached(
-                "INSERT INTO python_unit_summary_providers VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-            )?
-            .execute(params![
-                summary, container, module, parent, root, kind, state, path, ordinal, digest
-            ])?;
-        }
+        conn.prepare_cached("INSERT INTO python_unit_summary_roots SELECT ?1,slot,path,?2,?3,?4,?5 FROM temp.py_env_roots")?.execute(params![summary,self.profile.authority.label(),self.profile.ordered,self.profile.observation.label(),self.profile.target_digest.as_slice()])?;
+        conn.prepare_cached("INSERT INTO python_unit_summary_providers SELECT ?1,c.container,c.module,c.parent,c.root,c.kind,c.state,c.rel_path,m.member_ordinal,c.provider_digest FROM temp.py_env_candidates c LEFT JOIN resolution_unit_summary_members m ON m.summary_id=?1 AND m.rel_path=c.rel_path AND c.blob_id IS NOT NULL")?.execute([summary])?;
         conn.prepare_cached("INSERT INTO python_unit_summary_spellings SELECT ?1,module,source_root,target,admitted FROM temp.py_env_spellings")?.execute( [summary])?;
-        for (ordinal, member) in unit.members.iter().enumerate() {
-            conn.prepare_cached("INSERT INTO python_unit_summary_imports SELECT ?1,?2,site,importer,target,module,level,requested,bound,form,state FROM temp.py_env_routes WHERE rel_path=?3")?.execute( params![summary,ordinal as i64,member.rel_path])?;
-        }
-        conn.prepare_cached("INSERT INTO python_unit_summary_surfaces SELECT ?1,providers.container,surfaces.surface,surfaces.policy FROM temp.py_env_candidates AS providers JOIN temp.py_env_surfaces AS surfaces ON surfaces.rel_path=providers.rel_path WHERE providers.blob_id IS NOT NULL")?.execute( [summary])?;
-        conn.prepare_cached("INSERT INTO python_unit_summary_export_names SELECT ?1,providers.container,names.surface,names.name,names.site FROM temp.py_env_candidates AS providers JOIN temp.py_env_names AS names ON names.rel_path=providers.rel_path WHERE providers.blob_id IS NOT NULL")?.execute( [summary])?;
+        conn.prepare_cached("INSERT INTO python_unit_summary_imports(summary_id,member_ordinal,import_surface_ordinal,importer_container,target_container,module_name,relative_level,requested_name,bound_name,form,state) SELECT ?1,m.member_ordinal,r.site,r.importer,r.target,r.module,r.level,r.requested,r.bound,r.form,r.state FROM temp.py_env_routes r JOIN resolution_unit_summary_members m ON m.summary_id=?1 AND m.rel_path=r.rel_path")?.execute([summary])?;
+        conn.prepare_cached("INSERT INTO python_unit_summary_surfaces SELECT ?1,providers.container,surfaces.surface,surfaces.policy FROM temp.py_env_candidates AS providers JOIN temp.py_env_surfaces AS surfaces ON surfaces.rel_path=providers.rel_path WHERE providers.blob_id IS NOT NULL")?.execute([summary])?;
+        conn.prepare_cached("INSERT INTO python_unit_summary_export_names(summary_id,container_path,surface,name,slot_surface_ordinal) SELECT ?1,p.container,n.surface,n.name,n.site FROM temp.py_env_candidates p JOIN temp.py_env_names n ON n.rel_path=p.rel_path WHERE p.blob_id IS NOT NULL")?.execute([summary])?;
         Ok((conn.total_changes() - before) as usize)
     }
 }
@@ -1133,7 +1211,7 @@ fn stage_spellings(
                         })
                     {
                         let expected = root.join(implied);
-                        let mut statement = conn.prepare_cached("SELECT extension.directory FROM temp.py_env_files marker JOIN python_package_path_extensions extension ON extension.blob_id=marker.blob_id WHERE marker.rel_path=?1 ORDER BY extension.ordinal")?;
+                        let mut statement = conn.prepare_cached("SELECT extension.directory FROM temp.py_env_files marker JOIN temp.surface_python_path_extensions extension ON extension.blob_id=marker.blob_id WHERE marker.rel_path=?1 ORDER BY extension.surface_ordinal")?;
                         let mut extensions =
                             statement.query([portable(&root.join("__init__.py"))])?;
                         let mut retained = false;
@@ -1318,10 +1396,7 @@ fn staging_input_digest(conn: &Connection) -> Result<[u8; 32]> {
         &[
             "SELECT path FROM temp.py_env_roots ORDER BY path",
             "SELECT module,source_root,target,admitted FROM temp.py_env_spellings ORDER BY module,source_root,target",
-            "SELECT rel_path,surface,policy FROM temp.py_env_surfaces ORDER BY rel_path,surface",
-            "SELECT rel_path,surface,name,site FROM temp.py_env_names ORDER BY rel_path,surface,name",
-            "SELECT rel_path,site,level,form,requested,bound FROM temp.py_env_imports ORDER BY rel_path,site",
-            "SELECT rel_path,site,ordinal,name FROM temp.py_env_segments ORDER BY rel_path,site,ordinal",
+            "SELECT files.rel_path,sets.fingerprint FROM temp.py_env_files files JOIN surface_sets sets ON sets.blob_id=files.blob_id WHERE sets.list_digest=(SELECT list_digest FROM temp.py_env_current_list) ORDER BY files.rel_path",
         ],
     )
 }
@@ -1408,7 +1483,7 @@ fn render(
         ),
         (
             "imports",
-            "SELECT members.rel_path,imports.import_site,importer.module_name,imports.module_name,coalesce(target.rel_path,''),imports.requested_name,imports.bound_name,imports.form,imports.state FROM python_unit_summary_imports AS imports JOIN resolution_unit_summary_members AS members ON members.summary_id=imports.summary_id AND members.member_ordinal=imports.member_ordinal LEFT JOIN python_unit_summary_providers AS importer ON importer.summary_id=imports.summary_id AND importer.container_path=imports.importer_container LEFT JOIN python_unit_summary_providers AS target ON target.summary_id=imports.summary_id AND target.container_path=imports.target_container WHERE imports.summary_id=?1 ORDER BY members.rel_path,imports.import_site,importer.rel_path,target.rel_path",
+            "SELECT members.rel_path,site.dense_id,importer.module_name,imports.module_name,coalesce(target.rel_path,''),imports.requested_name,imports.bound_name,imports.form,imports.state FROM python_unit_summary_imports AS imports JOIN resolution_unit_summary_members AS members ON members.summary_id=imports.summary_id AND members.member_ordinal=imports.member_ordinal JOIN translated_members selected ON selected.member_ordinal=members.member_ordinal JOIN translated_sites site ON site.blob_id=selected.blob_id AND site.id_space=1 AND site.surface_ordinal=imports.import_surface_ordinal LEFT JOIN python_unit_summary_providers AS importer ON importer.summary_id=imports.summary_id AND importer.container_path=imports.importer_container LEFT JOIN python_unit_summary_providers AS target ON target.summary_id=imports.summary_id AND target.container_path=imports.target_container WHERE imports.summary_id=?1 ORDER BY members.rel_path,site.dense_id,importer.rel_path,target.rel_path",
         ),
         (
             "surfaces",
@@ -1416,14 +1491,34 @@ fn render(
         ),
         (
             "names",
-            "SELECT providers.rel_path,names.surface,names.name,CASE WHEN names.slot_site IS NULL THEN 'unbound' ELSE 'slot' END FROM python_unit_summary_export_names AS names JOIN python_unit_summary_providers AS providers USING(summary_id,container_path) WHERE summary_id=?1 ORDER BY providers.rel_path,names.surface,names.name",
+            "SELECT providers.rel_path,names.surface,names.name,CASE WHEN names.slot_surface_ordinal IS NULL THEN 'unbound' ELSE 'slot' END FROM python_unit_summary_export_names AS names JOIN python_unit_summary_providers AS providers USING(summary_id,container_path) WHERE summary_id=?1 ORDER BY providers.rel_path,names.surface,names.name",
         ),
     ];
     for (label, query) in queries {
         writeln!(output, "[{label}]").expect("String write");
-        let mut statement = conn.prepare_cached(query)?;
+        let translated_query;
+        let mut statement = if label == "imports" {
+            translated_query = format!(
+                "WITH translated_members AS ({}), translated_sites AS ({}) {}",
+                super::surface_relations::member_blobs_at_revision_sql(),
+                super::surface_relations::surface_dense_sql(),
+                query
+            );
+            conn.prepare_cached(&translated_query)?
+        } else {
+            conn.prepare_cached(query)?
+        };
         let columns = statement.column_count();
-        let mut rows = statement.query([summary])?;
+        let mut rows = if label == "imports" {
+            statement.query(params![
+                summary,
+                snapshot.workspace_id.as_str(),
+                snapshot.generation.0,
+                snapshot.revision
+            ])?
+        } else {
+            statement.query([summary])?
+        };
         while let Some(row) = rows.next()? {
             for column in 0..columns {
                 if column > 0 {
@@ -1464,4 +1559,165 @@ pub(crate) fn selected_binding_summary(
     }
     .live_summary(conn, snapshot, &epoch, &unit_key())
     .map(|selected| selected.map(|(summary, _)| summary))
+}
+
+#[cfg(test)]
+mod surface_admission_tests {
+    use super::*;
+
+    fn language() -> PythonUnitSummaries {
+        PythonUnitSummaries {
+            profile: PythonSummaryProfile {
+                authority: PythonSummaryAuthority::SuppliedAnalysis,
+                observation: PythonSummaryObservation::Runtime,
+                roots: vec![],
+                ordered: false,
+                target_digest: [0; 32],
+                python_version: None,
+            },
+            staging: Some(PythonEnvironmentStaging {
+                workspace_root: Box::new(|_, _| {
+                    unreachable!("supplied roots do not call the hook")
+                }),
+                cancellation: CancellationToken::default(),
+            }),
+        }
+    }
+    fn snapshot() -> WorkspaceSnapshotId {
+        WorkspaceSnapshotId {
+            workspace_id: super::super::WorkspaceId("a".repeat(64)),
+            lang: "python".into(),
+            generation: super::super::GenerationId::from_persisted(0),
+            revision: 1,
+        }
+    }
+
+    #[test]
+    fn unclaimed_no_facts_member_uses_content_oid() {
+        let store = super::super::AnalyzerStore::open_ephemeral().unwrap();
+        store
+            .conn
+            .execute(|conn| -> Result<()> {
+                conn.execute(
+                    "INSERT INTO blobs(id,blob_oid,lang) VALUES(1,?1,'python')",
+                    ["a".repeat(40)],
+                )?;
+                let mut unit = UnitInputs {
+                    unit_id: 1,
+                    unit_key: [0; 32],
+                    label: "unclaimed".into(),
+                    members: vec![UnitMember {
+                        blob_id: 1,
+                        blob_oid: "a".repeat(40),
+                        rel_path: "main.py".into(),
+                        source_role: "unclaimed".into(),
+                    }],
+                    input_files: Vec::new(),
+                    reads: vec![],
+                    dependencies: vec![],
+                    dependency_names: vec![],
+                    containers: vec![],
+                    placements: vec![],
+                };
+                let inputs = unit_summaries::member_inputs(conn, &language(), &unit)?;
+                let before = unit_summaries::lookup_digest(
+                    &language(),
+                    &snapshot(),
+                    "epoch",
+                    &unit,
+                    &inputs,
+                    &[],
+                )?;
+                conn.execute("UPDATE blobs SET blob_oid=?1 WHERE id=1", ["b".repeat(40)])?;
+                unit.members[0].blob_oid = "b".repeat(40);
+                let inputs = unit_summaries::member_inputs(conn, &language(), &unit)?;
+                let after = unit_summaries::lookup_digest(
+                    &language(),
+                    &snapshot(),
+                    "epoch",
+                    &unit,
+                    &inputs,
+                    &[],
+                )?;
+                assert_ne!(before, after, "a no-facts member must track content edits");
+                let count: i64 =
+                    conn.query_row("SELECT count(*) FROM surface_sets", [], |row| row.get(0))?;
+                assert_eq!(count, 0, "no empty fingerprint is published");
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11183: M2-rows review: a repair keeping the OID must re-key Go/Python summaries without withdrawal"
+    )]
+    fn repaired_no_facts_member_rekeys_without_content_change() {
+        let store = super::super::AnalyzerStore::open_ephemeral().unwrap();
+        store
+            .conn
+            .execute(|conn| -> Result<()> {
+                conn.execute(
+                    "INSERT INTO blobs(id,blob_oid,lang) VALUES(1,?1,'python')",
+                    ["a".repeat(40)],
+                )?;
+                let unit = UnitInputs {
+                    unit_id: 1,
+                    unit_key: [0; 32],
+                    label: "unclaimed".into(),
+                    members: vec![UnitMember {
+                        blob_id: 1,
+                        blob_oid: "a".repeat(40),
+                        rel_path: "main.py".into(),
+                        source_role: "unclaimed".into(),
+                    }],
+                    input_files: Vec::new(),
+                    reads: vec![],
+                    dependencies: vec![],
+                    dependency_names: vec![],
+                    containers: vec![],
+                    placements: vec![],
+                };
+                let inputs = unit_summaries::member_inputs(conn, &language(), &unit)?;
+                let before = unit_summaries::lookup_digest(
+                    &language(),
+                    &snapshot(),
+                    "epoch",
+                    &unit,
+                    &inputs,
+                    &[],
+                )?;
+                // Model the publication boundary: the same member now has a
+                // complete surface set instead of unavailable facts.
+                conn.execute("INSERT INTO surface_sets(blob_id,generation,source_facts_version,go_source_version,producer_epoch,publication_witness,list_digest,fingerprint) VALUES(1,0,1,NULL,'repair',1,?1,?2)",params![super::super::surface_relations::list_digest(super::super::surface_relations::PYTHON_RELATIONS),[7u8;32].as_slice()])?;
+                let inputs = unit_summaries::member_inputs(conn, &language(), &unit)?;
+                let after = unit_summaries::lookup_digest(
+                    &language(),
+                    &snapshot(),
+                    "epoch",
+                    &unit,
+                    &inputs,
+                    &[],
+                )?;
+                assert_ne!(before, after, "same-OID repair must leave the no-facts key");
+                assert_eq!(unit.members[0].blob_oid, "a".repeat(40));
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn claimed_python_facts_without_complete_publication_fail_closed() {
+        let store = super::super::AnalyzerStore::open_ephemeral().unwrap();
+        store.conn.execute(|conn| -> Result<()> {
+            conn.pragma_update(None,"foreign_keys",false)?;
+            conn.execute("INSERT INTO blobs(id,blob_oid,lang) VALUES(1,?1,'python')", ["a".repeat(40)])?;
+            conn.execute("INSERT INTO python_binding_source VALUES(1,?1,0,0)", [python_binding_rows::NATIVE_SOURCE_FORMAT])?;
+            conn.execute("INSERT INTO workspace_file_versions(workspace_id,lang,generation,rel_path,blob_oid,projection_digest,valid_from) VALUES(?1,'python',0,'main.py',?2,?3,1)",params!["a".repeat(64),"a".repeat(40),"b".repeat(64)])?;
+            let error=language().stage(conn,&snapshot()).unwrap_err();
+            assert!(error.is_missing_required_source_facts(),"{error:?}");
+            assert!(error.to_string().contains("python_retained_surface_unavailable"),"{error:?}");
+            Ok(())
+        }).unwrap();
+    }
 }

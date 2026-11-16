@@ -41,7 +41,6 @@ use crate::analyzer::semantic::OracleCallContext;
 use crate::analyzer::semantic::OracleLimits;
 use crate::analyzer::semantic::PointsToResult;
 use crate::analyzer::semantic::ProcedureHandle;
-use crate::analyzer::semantic::ProcedureInvocationKind;
 use crate::analyzer::semantic::ProgramPointHandle;
 use crate::analyzer::semantic::ProgramPointId;
 use crate::analyzer::semantic::ProofStatus;
@@ -50,6 +49,7 @@ use crate::analyzer::semantic::SemanticCallSite;
 use crate::analyzer::semantic::SemanticCapability;
 use crate::analyzer::semantic::SemanticGap;
 use crate::analyzer::semantic::SemanticGapDischarge;
+use crate::analyzer::semantic::SemanticGapImpact;
 use crate::analyzer::semantic::SemanticOutcome;
 use crate::analyzer::semantic::SemanticProviderError;
 use crate::analyzer::semantic::SemanticRequest;
@@ -228,8 +228,8 @@ impl IcfgProviderBehaviorIdentity {
             python_saved_default_safety,
             limits,
             (
-                WORKSPACE_ICFG_PROVIDER_BEHAVIOR_DOMAIN,
-                WORKSPACE_ICFG_PROVIDER_READ_BEHAVIOR_DOMAIN,
+                workspace_icfg_provider_behavior_domain(),
+                workspace_icfg_provider_read_behavior_domain(),
             ),
         )
     }
@@ -1246,10 +1246,26 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
     ) -> Result<SemanticOutcome<IcfgExitProfile>, SemanticProviderError> {
         let mut publication = None;
         let (outcome, reads) = crate::analyzer::usages::common::capture_memo_reads(
+            crate::analyzer::usages::common::QueryMemoOwner::ExitProfile,
             self.workspace().analyzer(),
-            || self.exit_profile_with_memo(callee_entry, callee_exit, request, &mut publication),
+            || {
+                let outcome = self.exit_profile_with_memo(
+                    callee_entry,
+                    callee_exit,
+                    request,
+                    &mut publication,
+                );
+                // A provider failure carries its verdict; it joins this capture
+                // before the capture closes.
+                if let Err(error) = &outcome {
+                    self.workspace().analyzer().join_reuse_verdict(
+                        crate::analyzer::reuse_verdict::CarriesReuseVerdict::reuse_verdict(error),
+                    );
+                }
+                outcome
+            },
         );
-        if let Some((key, cached, admission)) = publication {
+        if let (Some((key, cached, admission)), Some(reads)) = (publication, reads.admitted()) {
             self.outcome_cache
                 .exit_profiles
                 .lock()
@@ -1356,23 +1372,66 @@ impl WorkspaceIcfgProvider<'_> {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        // A proven inert-drop obligation discharges the procedure's omitted
-        // drops and turns the aborts whose only active cleanups are those
-        // drops into non-rejoining exits (#3757).
         let mut non_rejoining = Vec::new();
-        if self
-            .oracle
-            .procedure_drops_proven_inert(callee_entry.procedure(), request)?
-        {
-            for gap in callee_entry.procedure().semantics().gaps() {
-                match gap.discharge {
-                    SemanticGapDischarge::InertDropGlue => discharged.push(gap.id),
-                    SemanticGapDischarge::NonRejoiningExceptionalExitAfterInertDrops => {
-                        non_rejoining.push(gap.id)
+        let procedure = callee_entry.procedure();
+        let mut inert = None;
+        let mut whole_set = None;
+        let mut allocation_lifetimes = None;
+        for logical in procedure.semantics().logical_gaps() {
+            match logical.base.control_flow_discharge() {
+                SemanticGapDischarge::InertDropGlue => {
+                    if crate::analyzer::semantic::workspace_oracle::value_flow::logical_gap_is_discharged(
+                        &self.oracle, logical, procedure, request, &mut inert,
+                    )? == crate::analyzer::semantic::workspace_oracle::value_flow::GapDischargeVerdict::Discharged {
+                        discharged.push(logical.key());
                     }
-                    _ => {}
                 }
+                SemanticGapDischarge::NonRejoiningExceptionalExitAfterInertDrops => {
+                    let proven = match whole_set {
+                        Some(proven) => proven,
+                        None => {
+                            let proven = self.oracle.procedure_drops_proven_inert(procedure, request)?;
+                            whole_set = Some(proven);
+                            proven
+                        }
+                    };
+                    if proven { non_rejoining.push(logical.base.id); }
+                }
+                // An allocation lifetime gap the workspace resolver retires
+                // (#11428) asks nothing of this exit profile either. Only a
+                // gap that can weaken the return transfer is asked about.
+                SemanticGapDischarge::None
+                    if logical.member.is_none()
+                        && logical.base.impacts.contains(SemanticGapImpact::ReturnTransfer) =>
+                {
+                    let verdict = crate::analyzer::semantic::workspace_oracle::dispatch::resolved_allocation_lifetime_discharges_gap(
+                        logical.base,
+                        procedure,
+                        self.workspace(),
+                        request,
+                        &mut allocation_lifetimes,
+                    )?;
+                    if verdict == crate::analyzer::semantic::workspace_oracle::value_flow::GapDischargeVerdict::Discharged {
+                        discharged.push(logical.key());
+                    }
+                }
+                _ => {}
             }
+        }
+        if request.cancellation.is_cancelled() {
+            return Ok(SemanticOutcome::Cancelled {
+                partial: None,
+                work: refinements.work(),
+            });
+        }
+        if request.stop_observed()
+            && let Some(refusal) = request.budget.first_refusal()
+        {
+            return Ok(SemanticOutcome::ExceededBudget {
+                partial: None,
+                exceeded: refusal.exceeded,
+                work: refinements.work(),
+            });
         }
         let mut outcome = materialize_exit_profile_with_runtime_reads(
             callee_entry,
@@ -1410,10 +1469,24 @@ impl WorkspaceIcfgProvider<'_> {
     ) -> Result<SemanticOutcome<CallTransferSet>, SemanticProviderError> {
         let mut publication = None;
         let (outcome, reads) = crate::analyzer::usages::common::capture_memo_reads(
+            crate::analyzer::usages::common::QueryMemoOwner::CallTransfer,
             self.workspace().analyzer(),
-            || self.call_transfers_with_memo(caller, call, context, request, &mut publication),
+            || {
+                let outcome =
+                    self.call_transfers_with_memo(caller, call, context, request, &mut publication);
+                // A provider failure carries its verdict; it joins this capture
+                // before the capture closes.
+                if let Err(error) = &outcome {
+                    self.workspace().analyzer().join_reuse_verdict(
+                        crate::analyzer::reuse_verdict::CarriesReuseVerdict::reuse_verdict(error),
+                    );
+                }
+                outcome
+            },
         );
-        if let Some((key, cached, dispatch_read, admission)) = publication {
+        if let (Some((key, cached, dispatch_read, admission)), Some(reads)) =
+            (publication, reads.admitted())
+        {
             self.outcome_cache
                 .call_transfers
                 .lock()
@@ -1474,7 +1547,36 @@ impl WorkspaceIcfgProvider<'_> {
             .call_site(call)
             .expect("a scoped semantic call remains in its owning procedure")
             .clone();
-        let call_evaluation_gaps = scoped_call_evaluation_gaps(caller, &semantic_call);
+        // An allocation lifetime gap the workspace resolver retires (#11428)
+        // does not weaken this call's transfers. The proof's reads are
+        // captured with this fill, so a cache hit replays them.
+        let mut allocation_lifetimes = None;
+        let mut call_evaluation_gaps = Vec::new();
+        for gap in scoped_call_evaluation_gaps(caller, &semantic_call) {
+            if crate::analyzer::semantic::workspace_oracle::dispatch::resolved_allocation_lifetime_discharges_gap(
+                gap,
+                caller,
+                self.workspace(),
+                request,
+                &mut allocation_lifetimes,
+            )? != crate::analyzer::semantic::workspace_oracle::value_flow::GapDischargeVerdict::Discharged
+            {
+                call_evaluation_gaps.push(gap);
+            }
+        }
+        // A lifetime proof the request budget refused leaves its gap open and
+        // makes this fill's answer execution-dependent: report the stop, as
+        // the exit-profile fill does, so the outcome is never stored as a
+        // finished one.
+        if request.stop_observed()
+            && let Some(refusal) = request.budget.first_refusal()
+        {
+            return Ok(SemanticOutcome::ExceededBudget {
+                partial: None,
+                exceeded: refusal.exceeded,
+                work: SemanticWork::default(),
+            });
+        }
         let mut staged_budget = request.budget.clone();
         // Context proof can acquire entering-caller source in another artifact.
         // Keep every newly paid session private until transfer projection commits.
@@ -1700,7 +1802,7 @@ impl WorkspaceIcfgProvider<'_> {
                         });
                     continue;
                 }
-                if properties.invocation == ProcedureInvocationKind::Deferred {
+                if properties.invocation.is_deferred() {
                     let previous_reason_bytes = completeness_reason_bytes(&candidate.completeness);
                     let completeness = EvidenceCompleteness::Partial(
                         "callee body execution requires a later resume transfer".into(),
@@ -2800,6 +2902,118 @@ mod tests {
 
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
+        "#11234: ICFG outcome cache hits lost typed completion and retained operational fills"
+    )]
+    fn icfg_outcome_memo_completion_conformance() {
+        use super::*;
+        use crate::analyzer::semantic::ir::go_extraction_support_26::{
+            capabilities, key, minimal_procedure,
+        };
+        use crate::analyzer::usages::common::{
+            QueryMemoOwner, assert_memo_owner_conformance_for_test, capture_memo_reads,
+        };
+        let analyzer = crate::analyzer::MultiAnalyzer::default();
+        let analyzer: &dyn crate::analyzer::IAnalyzer = &analyzer;
+        let key = key();
+        let artifact = Arc::new(
+            crate::analyzer::semantic::SemanticArtifact::try_new(
+                key.clone(),
+                capabilities(&[]),
+                vec![minimal_procedure(
+                    &key,
+                    crate::analyzer::semantic::ProcedureId::new(0),
+                    "test",
+                    1,
+                )],
+            )
+            .unwrap(),
+        );
+        let procedure = artifact
+            .procedure_handle(crate::analyzer::semantic::ProcedureId::new(0))
+            .unwrap();
+        let entry = procedure
+            .point_handle(procedure.semantics().entry_point())
+            .unwrap();
+        let exit = procedure
+            .point_handle(procedure.semantics().normal_exit_point())
+            .unwrap();
+        let exit_key = (entry.clone(), exit.clone());
+        let call_key = (procedure, CallSiteId::new(0), OracleCallContext::empty());
+        let mut budget = SemanticBudget::default();
+        let before = budget.replay_snapshot();
+        let admission = budget.memo_admission_since(&before, &Arc::new(()));
+        for owner in [QueryMemoOwner::CallTransfer, QueryMemoOwner::ExitProfile] {
+            assert_memo_owner_conformance_for_test(
+                owner,
+                analyzer,
+                QueryLocalIcfgOutcomeCache::default,
+                |cache| {
+                    let mut budget = SemanticBudget::default();
+                    if matches!(owner, QueryMemoOwner::CallTransfer) {
+                        if let Some(cached) = cache.call_transfer(analyzer, &mut budget, &call_key)
+                        {
+                            return cached.outcome.is_complete();
+                        }
+                        let (outcome, receipt) =
+                            capture_memo_reads(owner, analyzer, || SemanticOutcome::Complete {
+                                value: CallTransferSet::default(),
+                                work: SemanticWork::default(),
+                            });
+                        if let Some(reads) = receipt.admitted() {
+                            cache.call_transfers.lock().unwrap().insert(
+                                call_key.clone(),
+                                CachedCallTransferOutcome {
+                                    reads: Arc::new(reads),
+                                    outcome: outcome.clone(),
+                                    admission: admission.clone(),
+                                    dispatch_read: DispatchReadAttribution::Unattributed(
+                                        DispatchReadUnattributedReason::SourceRangeUnavailable,
+                                    ),
+                                },
+                            );
+                        }
+                        outcome.is_complete()
+                    } else {
+                        if let Some(cached) = cache.exit_profile(analyzer, &mut budget, &exit_key) {
+                            return cached.is_complete();
+                        }
+                        let (outcome, receipt) =
+                            capture_memo_reads(owner, analyzer, || SemanticOutcome::Complete {
+                                value: IcfgExitProfile {
+                                    callee_entry: entry.clone(),
+                                    callee_exit: exit.clone(),
+                                    kind: ReturnTransferKind::Normal,
+                                    gap_reason: None,
+                                    matched_return_has_gaps: false,
+                                    matched_return_gap_reason: None,
+                                    matched_return_gaps_are_implicit_abort_only: false,
+                                    quality: SnapshotQuality::Complete,
+                                },
+                                work: SemanticWork::default(),
+                            });
+                        if let Some(reads) = receipt.admitted() {
+                            cache.exit_profiles.lock().unwrap().insert(
+                                exit_key.clone(),
+                                CachedExitProfileOutcome {
+                                    reads: Arc::new(reads),
+                                    outcome: outcome.clone(),
+                                    admission: admission.clone(),
+                                },
+                            );
+                        }
+                        outcome.is_complete()
+                    }
+                },
+                |cache| {
+                    !cache.call_transfers.lock().unwrap().is_empty()
+                        || !cache.exit_profiles.lock().unwrap().is_empty()
+                },
+            );
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
         "#10893: ICFG memo hits skipped their fill's transient admission"
     )]
     fn call_transfer_memo_admits_cold_peak_before_replaying() {
@@ -2842,10 +3056,13 @@ mod tests {
                 CachedCallTransferOutcome {
                     reads: Arc::new(
                         crate::analyzer::usages::common::capture_memo_reads(
+                            crate::analyzer::usages::common::QueryMemoOwner::CallTransfer,
                             fixture.analyzer().analyzer(),
                             || (),
                         )
-                        .1,
+                        .1
+                        .admitted()
+                        .expect("complete test fill"),
                     ),
                     outcome: SemanticOutcome::Complete {
                         value: CallTransferSet::default(),

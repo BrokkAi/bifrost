@@ -2,7 +2,8 @@
 -- interpretation. The selected origin controls precedence: a named winner
 -- cannot expand shadowed globs, and only an actual declaration names a
 -- physical child here. Both helpers contain only local or exact-wave targets.
-INSERT OR IGNORE INTO cr_surface_candidates
+INSERT INTO cr_surface_candidates
+SELECT * FROM (
 SELECT selected.owner_crate_key, selected.owner_module_path, selected.owner_name,
        child.crate_key, child.container_path
 FROM cr_surface_lookup AS selected
@@ -20,4 +21,5 @@ CROSS JOIN cr_reexport_closure AS named
 CROSS JOIN cr_containers_all AS target
   ON target.crate_key = named.target_crate_key
  AND target.container_path = named.target_container_path
-WHERE selected.owner_namespace = 'type' AND selected.origin = 'reexport';
+WHERE selected.owner_namespace = 'type' AND selected.origin = 'reexport'
+) WHERE true ON CONFLICT DO NOTHING;

@@ -54,6 +54,7 @@ fn evaluated_report_with_policy(source: &str) -> PolicyReportDocument {
         .evaluate(
             policy,
             &PolicyEvaluationContext {
+                acceptance_hint: None,
                 analyzer: &analyzer,
                 workspace: None,
                 flow_state: &brokk_bifrost_flow::FlowWorkspaceState::new(),
@@ -199,18 +200,24 @@ fn sarif_error_policy_marks_rule_and_finding_error() {
 }
 
 #[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#10984: SARIF diagnostic projections must preserve omission counts"
+)]
 fn sarif_reports_diagnostics_and_incomplete_obligations() {
     let report = evaluated_report();
     let complete = &report.runs()[0];
     let diagnostic = PolicyDiagnostic::try_new(
         PolicyDiagnosticCode::CodeQuery {
-            code: CodeQueryDiagnosticCode::SemanticBudgetExhausted,
+            code: CodeQueryDiagnosticCode::SemanticBudgetExhausted
+                .try_into()
+                .expect("non-partial query code"),
         },
         PolicyDiagnosticSeverity::Warning,
         PolicyDiagnosticImpact::RunIncomplete,
         "query budget exhausted",
         None,
         vec![],
+        crate::RelatedLocationOmissions::Known(4),
     )
     .unwrap();
     let mut run = PolicyRun::try_new(
@@ -234,6 +241,7 @@ fn sarif_reports_diagnostics_and_incomplete_obligations() {
         None,
         None,
         vec![],
+        crate::RelatedLocationOmissions::Unknown,
     )
     .unwrap();
     let note = PolicyReportDiagnostic::try_new(
@@ -243,6 +251,7 @@ fn sarif_reports_diagnostics_and_incomplete_obligations() {
         None,
         None,
         vec![],
+        crate::RelatedLocationOmissions::Known(0),
     )
     .unwrap();
     let report = PolicyReportDocument::try_new(
@@ -256,7 +265,16 @@ fn sarif_reports_diagnostics_and_incomplete_obligations() {
     .unwrap();
     let value = render(&report, &SarifToolIdentity::default());
     let run = &value["runs"][0];
+    assert_eq!(value["version"], "2.1.0");
+    assert_eq!(
+        run["properties"]["bifrost.policyReportSchemaVersion"],
+        PolicyReportDocument::SCHEMA_VERSION
+    );
     assert_eq!(run["invocations"][0]["executionSuccessful"], false);
+    assert_eq!(
+        run["properties"]["bifrost.policyRuns"][0]["diagnostics"][0]["omitted_related_locations_lower_bound"],
+        4
+    );
     let notifications = run["invocations"][0]["toolExecutionNotifications"]
         .as_array()
         .unwrap();
@@ -271,6 +289,21 @@ fn sarif_reports_diagnostics_and_incomplete_obligations() {
         notifications
             .iter()
             .any(|n| n["descriptor"]["id"] == "policy-parse-failed" && n["level"] == "note")
+    );
+    assert_eq!(
+        notifications
+            .iter()
+            .find(|n| n["descriptor"]["id"] == "policy-parse-failed")
+            .unwrap()["properties"]["bifrost.reportDiagnostic"]["omitted_related_locations_lower_bound"],
+        0
+    );
+    let report_diagnostic = notifications
+        .iter()
+        .find(|n| n["descriptor"]["id"] == "policy-load-failed")
+        .unwrap();
+    assert_eq!(
+        report_diagnostic["properties"]["bifrost.reportDiagnostic"]["omitted_related_locations_lower_bound"],
+        serde_json::json!({"kind": "unknown"})
     );
     assert_eq!(
         run["properties"]["bifrost.policyRuns"][0]["diagnostics"]

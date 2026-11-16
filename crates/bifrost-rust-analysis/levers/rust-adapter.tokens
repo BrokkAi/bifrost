@@ -1,0 +1,49 @@
+# The rust semantic adapter lever (#11570).
+#
+# Add one `<issue>-<slug>` line when a change alters the value semantics the
+# rust lowerer publishes for unchanged source: its identity is hashed into
+# every semantic artifact key, every public id derived from the adapter
+# fingerprint, the lowered-IR producer epoch and the policy lowering identity.
+# No other language's identity moves. Git merges this file with merge=union, so
+# two branches that each add a line keep both. Never edit or remove a line;
+# compaction replaces a prefix with a checkpoint line and keeps the identity.
+# See .agents/docs/cache-identity-levers.md.
+#
+# Replaced the numbered literal `rust-value-semantics-v106`.
+11570-slice2a-token-files
+11491-short-circuit-operand-producers
+11683-operator-result-drop-proof
+11755-ordered-constant-guard-opaque
+11547-cookie-coverage-stage1
+11251-matches-intrinsic
+12030-uninitialized-local-values-gap
+12030-unsupported-destructuring-target-values
+11830-struct-literal-field-value-resolution
+11988-callee-position-role
+12076-rust-lowering-orphan-forms
+4318-reference-storage-origins
+12239-macro-cfg-shadowing
+10879-rust-drop-inventory
+12128-rust-async-body-execution
+12249-prelude-trait-authority
+9925-poem-field-binders
+12363-linear-macro-operands
+12450-inert-pointer-cleanup-dead-writes
+12506-modeled-bare-import-drop-identity
+12008-route-obligation-membership
+12664-lowering-binding-climbs
+13018-let-pattern-bindings
+12527-bounded-producer-diagnostic-prose
+12838-struct-literal-call-control
+12911-self-expression-call-control
+9891-implicit-access-call-control
+12956-nonnominal-trait-impls
+12985-nondropping-replacement-proofs
+12986-uninit-assignment-discharge
+12986-uninit-assignment-review-corrections
+13055-unsuffixed-integer-width
+12729-rust-lexical-scope-index
+13087-rust-pattern-binding-captures
+13096-rust-tail-single-consume
+13310-cq11-array-copy-elements
+13365-rust-array-copy-allocation

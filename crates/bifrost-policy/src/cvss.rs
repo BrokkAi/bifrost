@@ -612,6 +612,23 @@ pub struct CvssAssessmentSet {
 }
 
 impl CvssAssessmentSet {
+    pub(crate) fn omit_optional_detail(&mut self) -> bool {
+        let mut changed = false;
+        for variant in &mut self.variants {
+            changed |= !variant.witness_refs.is_empty() || !variant.source_scenarios.is_empty();
+            variant.witness_refs_truncated |= !variant.witness_refs.is_empty();
+            variant.witness_refs = Vec::new();
+            if !variant.source_scenarios.is_empty() {
+                variant.source_scenarios_truncated = true;
+                variant.omitted_source_scenarios_lower_bound = variant
+                    .omitted_source_scenarios_lower_bound
+                    .saturating_add(variant.source_scenarios.len() as u64);
+                variant.source_scenarios = Vec::new();
+            }
+        }
+        changed
+    }
+
     pub(crate) fn try_new(
         mut variants: Vec<CvssAssessmentVariant>,
         selected_for_display: Option<CvssAssessmentVariantId>,

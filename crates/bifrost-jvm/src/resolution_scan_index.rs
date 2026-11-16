@@ -1,8 +1,8 @@
 //! Per-file catch-up indexes for resolution checks during JVM fact lowering.
 
 use brokk_bifrost_core::analyzer::resolution_facts::{
-    FileResolutionFacts, ResolutionIdentifierRole, ResolutionSiteId, ResolutionTypeSlotId,
-    ResolutionTypeTransferKind,
+    BindingProjectionKind, FileResolutionFacts, ResolutionIdentifierRole, ResolutionSiteId,
+    ResolutionTypeSlotId, ResolutionTypeTransferKind,
 };
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 
@@ -30,6 +30,7 @@ pub(crate) struct ResolutionScanIndex {
     root_segments: HashSet<ResolutionSiteId>,
     projection_watermark: usize,
     projections: HashSet<(ResolutionSiteId, ResolutionTypeSlotId)>,
+    type_identity_projections: HashSet<(ResolutionSiteId, ResolutionTypeSlotId)>,
     super_watermark: usize,
     super_outputs: HashSet<ResolutionTypeSlotId>,
 }
@@ -43,6 +44,7 @@ impl ResolutionScanIndex {
     pub(crate) fn invalidate_projections(&mut self) {
         self.projection_watermark = 0;
         self.projections.clear();
+        self.type_identity_projections.clear();
     }
 
     pub(crate) fn invalidate_super_receivers(&mut self) {
@@ -182,19 +184,37 @@ impl ResolutionScanIndex {
         self.roots.contains(&site)
     }
 
+    fn catch_up_projections(&mut self, facts: &FileResolutionFacts) {
+        let rows = &facts.binding_projections;
+        assert!(rows.len() >= self.projection_watermark);
+        for row in &rows[self.projection_watermark..] {
+            self.projections.insert((row.reference, row.output));
+            if row.kind == BindingProjectionKind::TargetTypeIdentity {
+                self.type_identity_projections
+                    .insert((row.reference, row.output));
+            }
+        }
+        self.projection_watermark = rows.len();
+    }
+
     pub(crate) fn has_projection(
         &mut self,
         facts: &FileResolutionFacts,
         site: ResolutionSiteId,
         output: ResolutionTypeSlotId,
     ) -> bool {
-        let rows = &facts.binding_projections;
-        assert!(rows.len() >= self.projection_watermark);
-        for row in &rows[self.projection_watermark..] {
-            self.projections.insert((row.reference, row.output));
-        }
-        self.projection_watermark = rows.len();
+        self.catch_up_projections(facts);
         self.projections.contains(&(site, output))
+    }
+
+    pub(crate) fn has_type_identity_projection(
+        &mut self,
+        facts: &FileResolutionFacts,
+        site: ResolutionSiteId,
+        output: ResolutionTypeSlotId,
+    ) -> bool {
+        self.catch_up_projections(facts);
+        self.type_identity_projections.contains(&(site, output))
     }
 
     pub(crate) fn has_super_receiver(

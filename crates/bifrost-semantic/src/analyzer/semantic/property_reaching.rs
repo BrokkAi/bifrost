@@ -543,6 +543,11 @@ pub enum PropertyReachingIncompleteReason {
     },
     /// A structured semantic gap can affect the selected property result.
     SelectedSemanticGap { gap: SemanticGap },
+    /// An exact member cause; the compact base is not a discharge identity.
+    SelectedCleanupMemberGap {
+        gap: SemanticGap,
+        member: crate::analyzer::semantic::GapMemberRef,
+    },
     /// The value-flow snapshot did not establish an exhaustive candidate set.
     CandidateCoverage(CandidateCoverage),
     /// The input relation bound stopped collection with partial rows retained.
@@ -638,7 +643,8 @@ fn property_reason_execution_dependent(reason: &PropertyReachingIncompleteReason
         PropertyReachingIncompleteReason::CandidateCoverage(coverage) => {
             *coverage == CandidateCoverage::Truncated
         }
-        PropertyReachingIncompleteReason::SelectedSemanticGap { gap } => {
+        PropertyReachingIncompleteReason::SelectedSemanticGap { gap }
+        | PropertyReachingIncompleteReason::SelectedCleanupMemberGap { gap, .. } => {
             gap.kind == crate::analyzer::semantic::ir::SemanticGapKind::ExceededBudget
         }
         PropertyReachingIncompleteReason::SelectedReadMissing { .. }
@@ -965,19 +971,14 @@ pub trait PropertyReachingProvider: Send + Sync {
 }
 
 thread_local! {
-    static ACTIVE_PROPERTY_PROCEDURES: RefCell<HashSet<(super::ids::SemanticArtifactKey, super::ids::ProcedureId)>> = RefCell::new(HashSet::new());
+    static ACTIVE_PROPERTY_PROCEDURES: RefCell<HashSet<super::DurableProcedureKey>> = RefCell::new(HashSet::new());
 }
 
 /// Oracle dispatch can call definition resolution in the same procedure.
 /// Nested acquisition retains its CFG evidence but cannot recursively acquire
 /// the same unfinished heap relation. Removal on drop also covers unwinding.
 #[doc(hidden)]
-pub struct ActivePropertyProcedure(
-    (
-        crate::analyzer::semantic::ids::SemanticArtifactKey,
-        crate::analyzer::semantic::ids::ProcedureId,
-    ),
-);
+pub struct ActivePropertyProcedure(super::DurableProcedureKey);
 
 impl ActivePropertyProcedure {
     #[doc(hidden)]
@@ -1808,12 +1809,16 @@ fn selected_property_scope_reasons(
     Vec<PropertyReachingIncompleteReason>,
     HashSet<(ProgramPointId, u32)>,
 ) {
+    let ownership = crate::analyzer::semantic::workspace_oracle::MemoryInterferenceOwnership::new(
+        snapshot.procedure(),
+    );
     let (mut reasons, mut scoped_event_keys) = selected_property_coordinate_reasons(
         snapshot,
         relations,
         relation_limit,
         selected_read,
         projected_stores,
+        &ownership,
         cancellation,
     );
     for relation in relations.iter().take(relation_limit).filter(|relation| {
@@ -1837,6 +1842,7 @@ fn selected_property_scope_reasons(
                 relation_limit,
                 &read,
                 projected_stores,
+                &ownership,
                 cancellation,
             );
             reasons.extend(original_reasons);
@@ -1852,6 +1858,7 @@ fn selected_property_coordinate_reasons(
     relation_limit: usize,
     selected_read: &PropertyReadRecord,
     projected_stores: &[PropertyStoreRecord],
+    ownership: &crate::analyzer::semantic::workspace_oracle::MemoryInterferenceOwnership<'_>,
     cancellation: &CancellationToken,
 ) -> (
     Vec<PropertyReachingIncompleteReason>,
@@ -1866,6 +1873,51 @@ fn selected_property_coordinate_reasons(
         .filter(|store| store.location == selected_read.location)
     {
         scoped_event_keys.insert((store.point.id(), store.event_index));
+    }
+
+    // A selected load can observe a different shared value after suspension.
+    // Retain may store/read rows, but use the existing scoped runtime-access
+    // refusal to prevent a complete same-value or reaching-store claim.
+    let affected = crate::analyzer::semantic::workspace_oracle::memory_interference_successors(
+        procedure.semantics(),
+    );
+    let prefix_interference = procedure
+        .semantics()
+        .point(selected_read.point.id())
+        .is_some_and(|point| {
+            point
+                .events
+                .iter()
+                .take(selected_read.event_index as usize)
+                .any(|event| event.effect == SemanticEffect::MemoryInterference)
+        });
+    let selected_shared = (affected.contains(&selected_read.point.id()) || prefix_interference)
+        && relations
+            .iter()
+            .filter(|relation| {
+                relation.point.id() == selected_read.point.id()
+                    && relation.event_index == selected_read.event_index
+            })
+            .any(|relation| match &relation.source {
+                ValueFlowEndpoint::Location(location) => ownership.may_modify(location),
+                _ => false,
+            });
+    if selected_shared {
+        for point in procedure.semantics().points() {
+            for (index, event) in point.events.iter().enumerate() {
+                if event.effect == SemanticEffect::MemoryInterference {
+                    let event_index = u32::try_from(index).expect("validated event index");
+                    scoped_event_keys.insert((point.id, event_index));
+                    reasons.push(PropertyReachingIncompleteReason::SelectedRuntimeAccess {
+                        point: point.id,
+                        event_index,
+                        source: event.source,
+                        source_locator: None,
+                        receiver: Some(selected_read.location.receiver.clone()),
+                    });
+                }
+            }
+        }
     }
 
     let selected_aliases = closed_local_allocation_aliases(
@@ -2120,14 +2172,15 @@ fn selected_property_coordinate_reasons(
         }
     }
 
-    for gap in procedure.semantics().gaps() {
-        // A scoped storage projection does not invent a new discharge for
-        // executable runtime behavior or control. Only the exact publishing
-        // snapshot's reviewed discharge can close these obligations. Preserve
-        // full gap provenance even when its value is not a selected endpoint.
-        if !snapshot.gap_is_discharged(gap.id) {
-            reasons
-                .push(PropertyReachingIncompleteReason::SelectedSemanticGap { gap: gap.clone() });
+    for logical in procedure.semantics().logical_gaps() {
+        if !snapshot.gap_is_discharged(logical.key()) {
+            let gap = logical.base.clone();
+            reasons.push(match logical.member {
+                Some(member) => {
+                    PropertyReachingIncompleteReason::SelectedCleanupMemberGap { gap, member }
+                }
+                None => PropertyReachingIncompleteReason::SelectedSemanticGap { gap },
+            });
         }
     }
 
@@ -2563,12 +2616,13 @@ fn closed_local_allocation_aliases(
     }) {
         return None;
     }
-    if semantics.gaps().iter().any(|gap| {
-        !snapshot.gap_is_discharged(gap.id)
+    if semantics.logical_gaps().any(|logical| {
+        let gap = logical.base;
+        !snapshot.gap_is_discharged(logical.key())
             && (gap.impacts.contains(SemanticGapImpact::Aliasing)
                 || gap.impacts.contains(SemanticGapImpact::HeapRead)
                 || gap.impacts.contains(SemanticGapImpact::HeapWrite))
-            && property_gap_mentions_alias(semantics, gap.subject, &aliases)
+            && property_gap_mentions_alias(semantics, logical.subject(), &aliases)
     }) {
         return None;
     }
@@ -2581,10 +2635,15 @@ fn property_gap_mentions_alias(
     aliases: &HashSet<ValueId>,
 ) -> bool {
     match subject {
-        SemanticGapSubject::Procedure
+        SemanticGapSubject::FutureConstruction
+        | SemanticGapSubject::FutureActivation
+        | SemanticGapSubject::Procedure
         | SemanticGapSubject::Point
         | SemanticGapSubject::AsyncContinuation { .. } => true,
         SemanticGapSubject::Value(value) => aliases.contains(&value),
+        SemanticGapSubject::CleanupOwners(segment) => aliases
+            .iter()
+            .any(|value| semantics.cleanup_chains().contains_owner(segment, *value)),
         SemanticGapSubject::MemoryLocation(location) => semantics
             .memory_location(location)
             .is_some_and(|location| aliases.iter().any(|value| location.kind.uses_value(*value))),

@@ -132,7 +132,7 @@ fn the_neutral_records_decode_into_the_shared_taint_shaped_model() {
         panic!("expected exactly one origin");
     };
     assert_eq!(origin.id.as_str(), "raw-input");
-    assert_eq!(origin.bind, PolicyPort::ReturnValue);
+    assert_eq!(origin.bind, PolicyPort::ReturnValue { path: None });
     assert_eq!(
         origin.labels.iter().map(|l| l.as_str()).collect::<Vec<_>>(),
         vec![FLOW_INTERNAL_LABEL],
@@ -164,7 +164,7 @@ fn the_neutral_records_decode_into_the_shared_taint_shaped_model() {
         &kill.kind,
         crate::definition::TaintSanitizerKind::Transfer {
             input: PolicyPort::ArgumentIndex { index: 0 },
-            output: PolicyPort::ReturnValue
+            output: PolicyPort::ReturnValue { path: None }
         }
     ));
     assert_eq!(
@@ -302,7 +302,7 @@ fn exact_catalog_predicate_requires_the_named_registered_version() {
         TaintCatalogRegistry::new_without_workspace(CatalogRegistryLimits::default());
     catalogs
         .register(TaintCatalogDefinition {
-            schema_version: 1,
+            schema_version: crate::definition::POLICY_DOCUMENT_SCHEMA_VERSION,
             name: PolicyId::new("test.inputs").unwrap(),
             version: 1,
             categories: vec![PolicyCategoryId::new("input.user").unwrap()],

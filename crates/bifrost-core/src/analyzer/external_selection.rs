@@ -10,12 +10,57 @@ use super::config::{JvmAnalyzerConfig, JvmDependencyDiscoveryMode};
 
 /// Change this when the JVM selection algorithm changes. It enters both
 /// question digests; see `.agents/docs/cache-identity-levers.md`.
-pub const JVM_SELECTION_CODE_DOMAIN: &[u8] = b"bifrost-jvm-external-selection-code:v1";
+///
+/// v2 (#11607): a dependency selection recorded for an aggregate evaluation is
+/// verified by recomputing it from the coordinates its manifests declared, so
+/// the recorded answers of v1 name no such tree part.
+pub const JVM_SELECTION_CODE_DOMAIN: &[u8] = b"bifrost-jvm-external-selection-code:v2";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExternalSelectionQuestionKind {
     Dependencies,
     Jdk,
+    RustToolchain,
+}
+
+impl ExternalSelectionQuestionKind {
+    /// Which tree content the answer depends on. Dependency selection reads
+    /// workspace manifests (the coordinates it declares) and then resolves them
+    /// in the environment. The JDK question reads only JDK discovery, never
+    /// workspace manifests, dependency artifacts or build tools (see
+    /// `verify_jdk`), so its answer is a function of configuration and
+    /// environment. Rust toolchains also depend on workspace selector files;
+    /// without a recorded tree basis they are tree-dependent.
+    pub const fn class(&self) -> super::reuse_verdict::SelectionClass {
+        match self {
+            Self::Dependencies => super::reuse_verdict::SelectionClass::Split,
+            Self::RustToolchain => super::reuse_verdict::SelectionClass::TreeDependent,
+            Self::Jdk => super::reuse_verdict::SelectionClass::EnvironmentOnly,
+        }
+    }
+}
+
+/// One dependency the manifests declared, with the properties of its
+/// declaration (#11607). The coordinate and these properties are the tree part
+/// of a JVM dependency selection: what resolving them finds is the environment
+/// part. `scope` is the dependency scope's stable label.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct JvmDependencyBasisEntry {
+    pub group_id: String,
+    pub artifact_id: String,
+    pub version: String,
+    pub scope: String,
+    pub declared_by: Option<String>,
+}
+
+/// The tree part of a JVM dependency selection: every coordinate the manifests
+/// declared, sorted, and whether the build model overrides the platform. It is
+/// recorded beside the read so that replay can resolve the same coordinates
+/// under the head's roots without reading a manifest.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct JvmDependencyBasis {
+    pub entries: Vec<JvmDependencyBasisEntry>,
+    pub platform_override: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +128,29 @@ pub trait ExternalSelectionAuthority: Send + Sync {
         retry: &SelectionRetry,
         cancellation: &crate::cancellation::CancellationToken,
     ) -> Result<Arc<VerifiedSelection>, SelectionRefused>;
+
+    /// The tree part of a `Split` question: what this authority's project
+    /// declares, recorded beside an aggregate evaluation's read (#11607). It is
+    /// returned only when resolving it again reproduces `answer`, so a tree part
+    /// that cannot stand for the answer is never recorded.
+    fn basis(
+        &self,
+        _question: &ExternalSelectionQuestion,
+        _answer: [u8; 32],
+    ) -> Option<JvmDependencyBasis> {
+        None
+    }
+
+    /// The answer of a `Split` question when its tree part is `basis` and the
+    /// environment is this authority's, read from no workspace manifest. `None`
+    /// when the answer is incomplete or cannot be certified.
+    fn answer_under_basis(
+        &self,
+        _question: &ExternalSelectionQuestion,
+        _basis: &JvmDependencyBasis,
+    ) -> Option<[u8; 32]> {
+        None
+    }
 }
 
 /// Collect one current question per digest across language delegates.

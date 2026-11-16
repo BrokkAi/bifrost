@@ -32,10 +32,10 @@ impl TypedBodyDecoder for StageBodyDecoder {
     }
 }
 
-fn completion_value(completion: &ResolutionCompletion) -> Value {
-    codec::encode_completion(completion)
+fn completion_value(completion: &ResolutionCompletion) -> Result<Value> {
+    Ok(codec::encode_completion(completion)?
         .map(|body| serde_json::from_str(&body).expect("stage completion JSON"))
-        .unwrap_or(Value::Null)
+        .unwrap_or(Value::Null))
 }
 
 // The row builder is alive for one fragment conversion. Semantic pairs name
@@ -122,8 +122,32 @@ fn encode_rows(
             "value_transform",
             typed_rows::value_transform_code(item.rule().value_transform()),
         );
-        row.body("completion", completion_value(item.rule().completion()));
+        row.body("completion", completion_value(item.rule().completion())?);
         emit("type_transfers", sequence, row)?;
+    }
+    for (sequence, item) in typed.binary_operations().iter().enumerate() {
+        if cancellation.is_cancelled() {
+            return Ok(false);
+        }
+        let mut row = EncodedRow::new();
+        row.semantic("output_slot", item.output);
+        row.semantic("left_slot", item.left);
+        row.semantic("right_slot", item.right);
+        row.cell(
+            "operator",
+            code(
+                brokk_bifrost_core::analyzer::resolution_facts::ALL_RESOLUTION_BINARY_OPERATORS,
+                item.operator,
+            ),
+        );
+        row.cell(
+            "right_reference",
+            code(
+                brokk_bifrost_core::analyzer::resolution_facts::ALL_RESOLUTION_BINARY_REFERENCES,
+                item.right_reference,
+            ),
+        );
+        emit("binary_operations", sequence, row)?;
     }
     for (sequence, item) in typed.type_productions().iter().enumerate() {
         if cancellation.is_cancelled() {
@@ -235,7 +259,10 @@ fn encode_rows(
                     .collect(),
             ),
         );
-        row.body("completion", completion_value(item.frontier().completion()));
+        row.body(
+            "completion",
+            completion_value(item.frontier().completion())?,
+        );
         emit("intrinsic_seeds", sequence, row)?;
     }
     // Identity membership is a set even when different seed kinds share values.
@@ -493,7 +520,7 @@ fn encode_rows(
                     .collect::<Vec<_>>()
             ),
         );
-        row.body("completion", completion_value(item.completion()));
+        row.body("completion", completion_value(item.completion())?);
         emit("call_obligations", sequence, row)?;
     }
     let mut parameter_sequence = 0;
@@ -515,7 +542,7 @@ fn encode_rows(
                         i64::from(parameter.repeated())
                     ]))
                     .collect::<Vec<_>>(),
-                completion_value(item.completion()),
+                completion_value(item.completion())?,
                 item.result_bindings()
                     .iter()
                     .map(|binding| json!([
@@ -791,6 +818,24 @@ pub fn decode_transfer(row: &Row<'_>) -> Result<LoweredTypeTransfer> {
     ))
 }
 #[doc(hidden)]
+pub fn decode_binary_operation(row: &Row<'_>) -> Result<LoweredBinaryOperation> {
+    Ok(LoweredBinaryOperation {
+        output: row_semantic(row, "output_slot")?,
+        left: row_semantic(row, "left_slot")?,
+        right: row_semantic(row, "right_slot")?,
+        right_reference: from_code(
+            brokk_bifrost_core::analyzer::resolution_facts::ALL_RESOLUTION_BINARY_REFERENCES,
+            row.get("right_reference")?,
+            "binary RHS reference",
+        ),
+        operator: from_code(
+            brokk_bifrost_core::analyzer::resolution_facts::ALL_RESOLUTION_BINARY_OPERATORS,
+            row.get("operator")?,
+            "binary operator",
+        ),
+    })
+}
+#[doc(hidden)]
 pub fn decode_type_production(row: &Row<'_>) -> Result<LoweredTypeProduction> {
     Ok(LoweredTypeProduction {
         output: row_semantic(row, "output_slot")?,
@@ -982,14 +1027,33 @@ fn decode_construction_requirement(
     ))
 }
 fn decode_supertype(row: &Row<'_>) -> Result<LoweredSupertypeProperty> {
-    Ok(typed_rows::decode_supertype_fields(
-        row_semantic(row, "definition")?,
-        row_semantic(row, "reference")?,
-        row_semantic(row, "frontier")?,
-        row.get("kind")?,
-        row.get("parent_ordinal")?,
+    let frontier = row_semantic(row, "frontier")?;
+    let arguments: Vec<(Option<i64>, Option<i64>)> =
+        serde_json::from_str(&row.get::<_, String>("applied_arguments")?).map_err(|error| {
+            super::super::StoreError::new(format!("supertype arguments: {error}"))
+        })?;
+    let arguments = arguments
+        .into_iter()
+        .enumerate()
+        .map(|(position, pair)| {
+            let identity = match pair {
+                (Some(key), None) => codec::decode_semantic(key),
+                (None, Some(shared)) => codec::decode_semantic(-shared),
+                _ => panic!("one argument semantic coordinate"),
+            };
+            LoweredDeclaredTypeArgument::new(frontier, position as u32, identity)
+        })
+        .collect::<Vec<_>>();
+    Ok(
+        LoweredSupertypeProperty::from(typed_rows::decode_supertype_fields(
+            row_semantic(row, "definition")?,
+            row_semantic(row, "reference")?,
+            frontier,
+            row.get("kind")?,
+            row.get("parent_ordinal")?,
+        ))
+        .with_source_arguments(&arguments),
     )
-    .into())
 }
 fn decode_property_gap(row: &Row<'_>) -> Result<LoweredDefinitionPropertyGap> {
     Ok(typed_rows::decode_definition_property_gap_fields(
@@ -1103,6 +1167,26 @@ pub(in crate::analyzer::store) fn visit_type_production_pages_for_outputs(
         cancellation,
         visitor,
         decode_type_production,
+        |_, _| {},
+    )
+}
+
+pub(in crate::analyzer::store) const VISIT_BINARY_OPERATION_PAGES_FOR_OUTPUTS_SQL: &str = "SELECT fact.* FROM json_each(?1) request CROSS JOIN temp.selected_resolution_stage_binary_operations fact ON fact.output_slot_key IS request.value->>0 AND fact.output_slot_shared IS request.value->>1 JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=fact.host_ordinal";
+
+pub(in crate::analyzer::store) fn visit_binary_operation_pages_for_outputs(
+    selection: &SelectedResolutionMountInventory<'_>,
+    request: TypedFactRequest<'_, SemanticId>,
+    cancellation: &CancellationToken,
+    visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredBinaryOperation>>,
+) -> Result<TypedFactReadOutcome> {
+    visit_stage_rows(
+        &[StageFamily::BinaryOperations],
+        selection,
+        VISIT_BINARY_OPERATION_PAGES_FOR_OUTPUTS_SQL,
+        &[&semantic_request_json(request)],
+        cancellation,
+        visitor,
+        decode_binary_operation,
         |_, _| {},
     )
 }
@@ -1472,7 +1556,7 @@ pub(in crate::analyzer::store) fn visit_construction_requirement_pages_for_defin
     )
 }
 
-pub(in crate::analyzer::store) const VISIT_SUPERTYPE_PAGES_FOR_DEFINITIONS_SQL: &str = "SELECT fact.* FROM json_each(?1) request CROSS JOIN temp.selected_resolution_stage_supertypes fact ON fact.definition_key IS request.value->>0 AND fact.definition_shared IS request.value->>1 JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=fact.host_ordinal";
+pub(in crate::analyzer::store) const VISIT_SUPERTYPE_PAGES_FOR_DEFINITIONS_SQL: &str = "SELECT fact.*, (SELECT json_group_array(json_array(argument_slot_key,argument_slot_shared)) FROM (SELECT argument_slot_key,argument_slot_shared FROM temp.selected_resolution_stage_declared_type_arguments args WHERE args.host_ordinal=fact.host_ordinal AND args.owner_slot_key IS fact.frontier_key AND args.owner_slot_shared IS fact.frontier_shared ORDER BY ordinal)) AS applied_arguments FROM json_each(?1) request CROSS JOIN temp.selected_resolution_stage_supertypes fact ON fact.definition_key IS request.value->>0 AND fact.definition_shared IS request.value->>1 JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=fact.host_ordinal";
 
 pub(in crate::analyzer::store) fn visit_supertype_pages_for_definitions(
     selection: &SelectedResolutionMountInventory<'_>,
@@ -1481,7 +1565,7 @@ pub(in crate::analyzer::store) fn visit_supertype_pages_for_definitions(
     visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredSupertypeProperty>>,
 ) -> Result<TypedFactReadOutcome> {
     visit_stage_rows(
-        &[StageFamily::Supertypes],
+        &[StageFamily::Supertypes, StageFamily::DeclaredTypeArguments],
         selection,
         VISIT_SUPERTYPE_PAGES_FOR_DEFINITIONS_SQL,
         &[&semantic_request_json(request)],
@@ -1492,7 +1576,7 @@ pub(in crate::analyzer::store) fn visit_supertype_pages_for_definitions(
     )
 }
 
-pub(in crate::analyzer::store) const VISIT_SUPERTYPE_PAGES_FOR_REFERENCES_SQL: &str = "SELECT fact.* FROM json_each(?1) request CROSS JOIN temp.selected_resolution_stage_supertypes fact ON fact.reference_key IS request.value->>0 AND fact.reference_shared IS request.value->>1 JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=fact.host_ordinal";
+pub(in crate::analyzer::store) const VISIT_SUPERTYPE_PAGES_FOR_REFERENCES_SQL: &str = "SELECT fact.*, (SELECT json_group_array(json_array(argument_slot_key,argument_slot_shared)) FROM (SELECT argument_slot_key,argument_slot_shared FROM temp.selected_resolution_stage_declared_type_arguments args WHERE args.host_ordinal=fact.host_ordinal AND args.owner_slot_key IS fact.frontier_key AND args.owner_slot_shared IS fact.frontier_shared ORDER BY ordinal)) AS applied_arguments FROM json_each(?1) request CROSS JOIN temp.selected_resolution_stage_supertypes fact ON fact.reference_key IS request.value->>0 AND fact.reference_shared IS request.value->>1 JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=fact.host_ordinal";
 
 pub(in crate::analyzer::store) fn visit_supertype_pages_for_references(
     selection: &SelectedResolutionMountInventory<'_>,
@@ -1501,7 +1585,7 @@ pub(in crate::analyzer::store) fn visit_supertype_pages_for_references(
     visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredSupertypeProperty>>,
 ) -> Result<TypedFactReadOutcome> {
     visit_stage_rows(
-        &[StageFamily::Supertypes],
+        &[StageFamily::Supertypes, StageFamily::DeclaredTypeArguments],
         selection,
         VISIT_SUPERTYPE_PAGES_FOR_REFERENCES_SQL,
         &[&semantic_request_json(request)],
@@ -1512,7 +1596,7 @@ pub(in crate::analyzer::store) fn visit_supertype_pages_for_references(
     )
 }
 
-pub(in crate::analyzer::store) const VISIT_SUPERTYPE_PAGES_FOR_FRONTIERS_SQL: &str = "SELECT fact.* FROM json_each(?1) request CROSS JOIN temp.selected_resolution_stage_supertypes fact ON fact.frontier_key IS request.value->>0 AND fact.frontier_shared IS request.value->>1 JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=fact.host_ordinal";
+pub(in crate::analyzer::store) const VISIT_SUPERTYPE_PAGES_FOR_FRONTIERS_SQL: &str = "SELECT fact.*, (SELECT json_group_array(json_array(argument_slot_key,argument_slot_shared)) FROM (SELECT argument_slot_key,argument_slot_shared FROM temp.selected_resolution_stage_declared_type_arguments args WHERE args.host_ordinal=fact.host_ordinal AND args.owner_slot_key IS fact.frontier_key AND args.owner_slot_shared IS fact.frontier_shared ORDER BY ordinal)) AS applied_arguments FROM json_each(?1) request CROSS JOIN temp.selected_resolution_stage_supertypes fact ON fact.frontier_key IS request.value->>0 AND fact.frontier_shared IS request.value->>1 JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=fact.host_ordinal";
 
 pub(in crate::analyzer::store) fn visit_supertype_pages_for_frontiers(
     selection: &SelectedResolutionMountInventory<'_>,
@@ -1521,7 +1605,7 @@ pub(in crate::analyzer::store) fn visit_supertype_pages_for_frontiers(
     visitor: &mut TypedFactPageVisitor<'_, SelectedTypedRow<LoweredSupertypeProperty>>,
 ) -> Result<TypedFactReadOutcome> {
     visit_stage_rows(
-        &[StageFamily::Supertypes],
+        &[StageFamily::Supertypes, StageFamily::DeclaredTypeArguments],
         selection,
         VISIT_SUPERTYPE_PAGES_FOR_FRONTIERS_SQL,
         &[&semantic_request_json(request)],

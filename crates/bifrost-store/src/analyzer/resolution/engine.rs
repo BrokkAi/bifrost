@@ -2367,21 +2367,47 @@ pub(super) fn endpoint_is_balanced(endpoint: &EndpointSignature) -> bool {
         && super::endpoint_has_empty_scopes(endpoint)
 }
 
+/// The fact evaluator retains the stored edge kind through rule refinement.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum EvaluatedTypeTransfer {
+    DeclaredType(TypeTransferRule),
+    Other(TypeTransferRule),
+}
+
+impl EvaluatedTypeTransfer {
+    pub(super) fn from_kind(
+        rule: TypeTransferRule,
+        kind: brokk_bifrost_core::analyzer::resolution_facts::ResolutionTypeTransferKind,
+    ) -> Self {
+        if kind == brokk_bifrost_core::analyzer::resolution_facts::ResolutionTypeTransferKind::DeclaredType {
+            Self::DeclaredType(rule)
+        } else {
+            Self::Other(rule)
+        }
+    }
+
+    fn rule(&self) -> &TypeTransferRule {
+        match self {
+            Self::DeclaredType(rule) | Self::Other(rule) => rule,
+        }
+    }
+}
+
 pub(super) fn apply_type_transfer_rules(
     state: &TypedFrontierState,
-    mut rules: Vec<TypeTransferRule>,
+    mut rules: Vec<EvaluatedTypeTransfer>,
     source_completion: ResolutionCompletion,
     cancellation: &CancellationToken,
 ) -> StoreResult<(Vec<TypedFrontierState>, ResolutionCompletion)> {
-    rules.sort_unstable();
+    rules.sort_unstable_by_key(|input| input.rule().semantic());
     for duplicate in rules
         .windows(2)
-        .filter(|pair| pair[0].semantic() == pair[1].semantic())
+        .filter(|pair| pair[0].rule().semantic() == pair[1].rule().semantic())
     {
         if duplicate[0] != duplicate[1] {
             return Err(StoreError::new(format!(
                 "type-transfer semantic {} names conflicting rules: {:?}",
-                duplicate[0].semantic(),
+                duplicate[0].rule().semantic(),
                 duplicate
             )));
         }
@@ -2392,7 +2418,7 @@ pub(super) fn apply_type_transfer_rules(
     let mut completion = rules
         .iter()
         .fold(base_completion.clone(), |completion, rule| {
-            completion.combine(rule.completion())
+            completion.combine(rule.rule().completion())
         });
     if cancellation.is_cancelled() {
         return Ok((Vec::new(), completion.combine(&cancelled_completion())));
@@ -2400,7 +2426,8 @@ pub(super) fn apply_type_transfer_rules(
 
     let mut alternatives = Vec::with_capacity(rules.len());
     let mut work = 0_usize;
-    for rule in rules {
+    for input in rules {
+        let rule = input.rule();
         work += 1;
         if work.is_multiple_of(CANCELLATION_QUANTUM) && cancellation.is_cancelled() {
             return Ok((Vec::new(), completion.combine(&cancelled_completion())));
@@ -2427,11 +2454,21 @@ pub(super) fn apply_type_transfer_rules(
             ]));
         }
         completion = completion.combine(&rule_completion);
-        alternatives.push(TypedFrontierState::new(
-            rule.target_slot(),
-            values,
-            rule_completion,
-        ));
+        let mut target = TypedFrontierState::new(rule.target_slot(), values, rule_completion);
+        if let EvaluatedTypeTransfer::DeclaredType(_) = input {
+            // Source completeness is checked separately by the shape walk. This
+            // record describes only this edge and gaps introduced by applying it.
+            let mut edge_completion = rule.completion().clone();
+            if adjustment_failed {
+                edge_completion = edge_completion.combine(&ResolutionCompletion::incomplete([
+                    ResolutionIncompleteReason::UnsupportedSemantic(rule.semantic()),
+                ]));
+            }
+            target
+                .declared_type_edges
+                .insert(rule.semantic(), edge_completion);
+        }
+        alternatives.push(target);
     }
     if cancellation.is_cancelled() {
         return Ok((Vec::new(), completion.combine(&cancelled_completion())));
@@ -2441,6 +2478,7 @@ pub(super) fn apply_type_transfer_rules(
             .cmp(&right.slot())
             .then_with(|| left.possible_values().cmp(right.possible_values()))
             .then_with(|| left.completion().cmp(right.completion()))
+            .then_with(|| left.declared_type_edges.cmp(&right.declared_type_edges))
     });
     alternatives.dedup();
     Ok((alternatives, completion))
@@ -2465,7 +2503,8 @@ pub(super) fn transfer_types_with_source(
         if super::poll_resolution_work(cancellation, &mut visited) {
             return Ok(false);
         }
-        rules.push(rule.clone());
+        // These batch states never reach projected_type_shapes, built only by fact evaluation.
+        rules.push(EvaluatedTypeTransfer::Other(rule.clone()));
         Ok(true)
     })?;
     apply_type_transfer_rules(state, rules, source_completion, cancellation)

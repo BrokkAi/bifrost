@@ -5,6 +5,10 @@
 //! topology, and uncertainty; the session owns dense IDs, exact provenance,
 //! common call rows, and batch-level budget/cancellation semantics.
 
+mod normal_returns;
+#[doc(hidden)]
+pub use normal_returns::{NormalReturnDomainCertificate, certify_normal_return_domain};
+
 use crate::analyzer::semantic::lexical_definitions::FormalVariadicKind;
 
 use brokk_bifrost_core::analyzer::language_knowledge::GuardConditionSyntax;
@@ -15,7 +19,9 @@ use tree_sitter::Node;
 
 use crate::analyzer::semantic::cfg::CleanupRegionId;
 
-use crate::analyzer::semantic::cfg::CleanupRouteOperation;
+use crate::analyzer::semantic::ir::{
+    CleanupActionCursor, CleanupAnchorPurpose, CleanupChainNodeId,
+};
 
 use crate::analyzer::semantic::cfg::CompletionKind;
 
@@ -26,8 +32,6 @@ use crate::analyzer::semantic::cfg::DriveError;
 use crate::analyzer::semantic::cfg::ProcedureCfgBuilder;
 
 use crate::analyzer::semantic::cfg::ScopeBinding;
-
-use crate::analyzer::semantic::cfg::ScopeCleanupAction;
 
 use crate::analyzer::semantic::cfg::ScopeFrameId;
 
@@ -74,9 +78,9 @@ use crate::analyzer::semantic::EvidenceCompleteness;
 use crate::analyzer::semantic::EvidenceId;
 
 use crate::analyzer::semantic::{
-    CallControlBranch, CallControlDisposition, CallControlKind, CallTargetObligation,
-    FootprintClass, FootprintDisposition, FootprintExclusion, FootprintRefusal,
-    ProcedureCallControlCoverage, ProcedureFootprintCoverage, call_target_gap_pair,
+    CallControlBranch, CallControlDisposition, CallControlKind, CallTargetDispatch,
+    CallTargetGapIndex, CallTargetObligation, FootprintClass, FootprintDisposition,
+    FootprintExclusion, FootprintRefusal, ProcedureCallControlCoverage, ProcedureFootprintCoverage,
     present_footprint_classes,
 };
 
@@ -1025,7 +1029,8 @@ pub fn ordered_decomposition_steps<T: Copy, S: Copy, B>(
 
 /// Seal detached control regions and freeze a procedure whose adapter work is
 /// complete.
-pub(crate) fn finish_procedure(
+#[doc(hidden)]
+pub fn finish_procedure(
     mut builder: ProcedureCfgBuilder,
     entry: ProgramPointId,
     normal_exit: ProgramPointId,
@@ -1042,8 +1047,15 @@ pub(crate) fn finish_procedure(
     }
     let work_before_freeze = builder.prospective_work();
     builder
-        .finish_with_work()
-        .map_err(|error| ProcedureLoweringError::Budget(error, Box::new(work_before_freeze)))
+        .finish_with_work(cancellation)
+        .map_err(|error| match error {
+            crate::analyzer::semantic::cfg::FinishError::Cancelled => {
+                ProcedureLoweringError::Cancelled(Box::new(work_before_freeze))
+            }
+            crate::analyzer::semantic::cfg::FinishError::ExceededBudget(error) => {
+                ProcedureLoweringError::Budget(error, Box::new(work_before_freeze))
+            }
+        })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1200,7 +1212,7 @@ pub struct CleanupSpecialization<R> {
 #[doc(hidden)]
 pub struct CleanupActionSpecialization {
     #[doc(hidden)]
-    pub action: ScopeCleanupAction,
+    pub action: CleanupActionCursor,
     #[doc(hidden)]
     pub entry: ProgramPointId,
     #[doc(hidden)]
@@ -1218,43 +1230,42 @@ pub enum CleanupRouteStep<R> {
 #[doc(hidden)]
 pub struct CleanupRoutePlanner<'route> {
     route: &'route CompletionRoute,
-    next_index: usize,
-    next_operation_index: usize,
-    #[doc(hidden)]
+    initialized: bool,
+    projection_position: Option<usize>,
+    stack: Vec<CleanupChainNodeId>,
+    active: Option<CleanupChainNodeId>,
+    chunks: Vec<CleanupChainNodeId>,
+    region_pending: bool,
+    chunk_index: usize,
+    action_index: usize,
     pub next: ControlTarget,
 }
-
 impl<'route> CleanupRoutePlanner<'route> {
-    #[doc(hidden)]
     pub fn new(route: &'route CompletionRoute) -> Self {
         Self {
             route,
-            next_index: route.cleanups().len(),
-            next_operation_index: route.operations().len(),
+            initialized: false,
+            projection_position: None,
+            stack: Vec::new(),
+            active: None,
+            chunks: Vec::new(),
+            region_pending: false,
+            chunk_index: 0,
+            action_index: 0,
             next: ControlTarget {
                 point: route.destination().target(),
                 kind: route.destination().edge_kind(),
             },
         }
     }
-
-    /// Advance through reused entries and return the next newly allocated step.
-    ///
-    /// Yielding one step at a time lets the adapter finish its relay, body, or
-    /// gaps before the outer cleanup is allocated, preserving deterministic
-    /// point order and tight-budget outcomes.
-    #[doc(hidden)]
-    pub fn next<'tree, R>(
+    pub fn next<'tree, R: Copy>(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
         session: &mut ProcedureLoweringSession<'_>,
         regions: &[R],
         region_id: impl Fn(R) -> CleanupRegionId,
         source_node: impl Fn(R) -> Node<'tree>,
-    ) -> Result<Option<CleanupSpecialization<R>>, ProcedureLoweringError>
-    where
-        R: Copy,
-    {
+    ) -> Result<Option<CleanupSpecialization<R>>, ProcedureLoweringError> {
         self.next_with_lookup(
             builder,
             session,
@@ -1267,140 +1278,116 @@ impl<'route> CleanupRoutePlanner<'route> {
             source_node,
         )
     }
-
-    /// Advance using an adapter-owned cleanup lookup.
-    ///
-    /// Adapters whose cleanup IDs index dense storage can avoid repeatedly
-    /// scanning all registered regions as continuation histories specialize.
-    #[doc(hidden)]
-    pub fn next_with_lookup<'tree, R>(
+    pub fn next_with_lookup<'tree, R: Copy>(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
         session: &mut ProcedureLoweringSession<'_>,
-        mut lookup_region: impl FnMut(CleanupRegionId) -> Option<R>,
+        lookup_region: impl FnMut(CleanupRegionId) -> Option<R>,
         source_node: impl Fn(R) -> Node<'tree>,
-    ) -> Result<Option<CleanupSpecialization<R>>, ProcedureLoweringError>
-    where
-        R: Copy,
-    {
-        assert!(
-            self.route
-                .operations()
-                .iter()
-                .all(|operation| matches!(operation, CleanupRouteOperation::Region { .. })),
-            "routes with lifecycle actions must use next_step_with_lookup"
-        );
-        while self.next_index > 0 {
-            self.next_index -= 1;
-            let index = self.next_index;
-            self.next_operation_index -= 1;
-            assert!(matches!(
-                self.route.operations()[self.next_operation_index],
-                CleanupRouteOperation::Region { cleanup_index, .. } if cleanup_index == index
-            ));
-            let expected = self.route.cleanups()[index];
-            let region = lookup_region(expected)
-                .ok_or_else(|| ProcedureLoweringError::Invalid("missing cleanup region".into()))?;
-            let (entry, step) =
-                if let Some(entry) = builder.cleanup_specialization_entry(self.route, index) {
-                    (entry, None)
-                } else {
-                    let metadata = session.add_node_mapping(builder, source_node(region))?;
-                    let (entry, created) = builder.cleanup_specialization(
-                        self.route,
-                        index,
-                        metadata.source,
-                        metadata.evidence,
-                    )?;
-                    debug_assert!(created, "cleanup lookup and allocation must agree");
-                    session.register_point(
-                        entry,
-                        metadata,
-                        "cleanup specialization broke dense point allocation",
-                    )?;
-                    (
-                        entry,
-                        Some(CleanupSpecialization {
-                            region,
-                            entry,
-                            next: self.next,
-                        }),
-                    )
-                };
-            self.next = ControlTarget {
-                point: entry,
-                kind: ControlEdgeKind::Cleanup,
-            };
-            if step.is_some() {
-                return Ok(step);
+    ) -> Result<Option<CleanupSpecialization<R>>, ProcedureLoweringError> {
+        match self.next_step_with_lookup(builder, session, lookup_region, source_node)? {
+            Some(CleanupRouteStep::Region(step)) => Ok(Some(step)),
+            Some(CleanupRouteStep::Action(_)) => {
+                panic!("routes with lifecycle actions must use next_step_with_lookup")
             }
+            None => Ok(None),
         }
-        Ok(None)
     }
-
-    /// Advance through the route's mixed action and cleanup-region sequence.
-    ///
-    /// Operations are returned from the outer continuation toward the inner
-    /// entry, matching the existing region planner's allocation order. The
-    /// caller completes each returned action or cleanup body before asking
-    /// for another step so point allocation remains deterministic.
-    #[allow(dead_code)] // Lane C consumes this planner entry point.
-    #[doc(hidden)]
-    pub fn next_step_with_lookup<'tree, R>(
+    pub fn next_step_with_lookup<'tree, R: Copy>(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
         session: &mut ProcedureLoweringSession<'_>,
         mut lookup_region: impl FnMut(CleanupRegionId) -> Option<R>,
         source_node: impl Fn(R) -> Node<'tree>,
-    ) -> Result<Option<CleanupRouteStep<R>>, ProcedureLoweringError>
-    where
-        R: Copy,
-    {
-        while self.next_operation_index > 0 {
-            self.next_operation_index -= 1;
-            match self.route.operations()[self.next_operation_index].clone() {
-                CleanupRouteOperation::Action(action) => {
-                    let metadata = PointMetadata {
-                        source: action.source(),
-                        evidence: action.evidence(),
-                    };
-                    let entry = session.add_point(builder, metadata, Vec::new())?;
-                    builder.emit_cleanup_action_fact(entry, &action)?;
-                    let next = self.next;
+    ) -> Result<Option<CleanupRouteStep<R>>, ProcedureLoweringError> {
+        builder.note_cleanup_construction_step();
+        if !self.initialized {
+            self.initialized = true;
+            self.projection_position = builder.cleanup_projection(self.route).map(<[_]>::len);
+            let mut cursor = self.route.segment.head;
+            while cursor != self.route.segment.stop {
+                builder.note_cleanup_construction_step();
+                let head = cursor.expect("valid cleanup segment");
+                if let Some(point) = builder.cleanup_plan(self.route, head) {
+                    // Parents precede children. Unplanned inner scopes' action
+                    // nodes all follow this cached outer group's newest chunk;
+                    // every action in its cached suffix is at or before it.
+                    self.projection_position =
+                        builder.cleanup_projection(self.route).map(|selected| {
+                            debug_assert!(
+                                selected
+                                    .windows(2)
+                                    .all(|pair| pair[0].node().index() > head.index()
+                                        || pair[1].node().index() <= head.index()),
+                                "selected-action suffix predicate must be monotone"
+                            );
+                            selected.partition_point(|cursor| cursor.node().index() > head.index())
+                        });
                     self.next = ControlTarget {
-                        point: entry,
+                        point,
                         kind: ControlEdgeKind::Cleanup,
                     };
-                    return Ok(Some(CleanupRouteStep::Action(Box::new(
-                        CleanupActionSpecialization {
-                            action,
-                            entry,
-                            next,
-                        },
-                    ))));
+                    break;
                 }
-                CleanupRouteOperation::Region {
-                    cleanup_index,
-                    region: expected,
-                } => {
-                    assert_eq!(self.next_index.checked_sub(1), Some(cleanup_index));
-                    self.next_index -= 1;
+                self.stack.push(head);
+                loop {
+                    builder.note_cleanup_construction_step();
+                    let node = builder.cleanup_node(cursor.expect("region has an oldest chunk"));
+                    cursor = node.parent;
+                    if node.region.is_some() || cursor == self.route.segment.stop {
+                        break;
+                    }
+                }
+            }
+        }
+        loop {
+            if self.active.is_none() {
+                let Some(head) = self.stack.pop() else {
+                    debug_assert!(
+                        self.projection_position
+                            .is_none_or(|position| position == 0),
+                        "all selected actions must be planned"
+                    );
+                    return Ok(None);
+                };
+                self.active = Some(head);
+                self.chunks.clear();
+                let mut cursor = Some(head);
+                while cursor != self.route.segment.stop {
+                    builder.note_cleanup_construction_step();
+                    let id = cursor.expect("valid region chunk");
+                    let node = builder.cleanup_node(id);
+                    self.chunks.push(id);
+                    cursor = node.parent;
+                    if node.region.is_some() {
+                        break;
+                    }
+                }
+                self.region_pending = true;
+                self.chunk_index = 0;
+                self.action_index = builder.cleanup_node(self.chunks[0]).actions.len();
+            }
+            let head = self.active.expect("active cleanup group");
+            if self.region_pending {
+                self.region_pending = false;
+                let oldest = *self.chunks.last().expect("nonempty cleanup group");
+                if let Some(expected) = builder.cleanup_node(oldest).region {
                     let region = lookup_region(expected).ok_or_else(|| {
                         ProcedureLoweringError::Invalid("missing cleanup region".into())
                     })?;
                     let (entry, step) = if let Some(entry) =
-                        builder.cleanup_specialization_entry(self.route, cleanup_index)
+                        builder.cleanup_specialization_entry(self.route, head)
                     {
                         (entry, None)
                     } else {
                         let metadata = session.add_node_mapping(builder, source_node(region))?;
                         let (entry, created) = builder.cleanup_specialization(
                             self.route,
-                            cleanup_index,
+                            head,
                             metadata.source,
                             metadata.evidence,
                         )?;
-                        debug_assert!(created, "cleanup lookup and allocation must agree");
+                        debug_assert!(created);
                         session.register_point(
                             entry,
                             metadata,
@@ -1424,16 +1411,56 @@ impl<'route> CleanupRoutePlanner<'route> {
                     }
                 }
             }
+            while self.chunk_index < self.chunks.len() {
+                let node = self.chunks[self.chunk_index];
+                while self.action_index > 0 {
+                    builder.note_cleanup_construction_step();
+                    self.action_index -= 1;
+                    let cursor = builder.cleanup_action_cursor(node, self.action_index);
+                    if let Some(position) = &mut self.projection_position {
+                        let selected = builder
+                            .cleanup_projection(self.route)
+                            .expect("projection position has a projection");
+                        if *position == 0 || selected[*position - 1] != cursor {
+                            continue;
+                        }
+                        *position -= 1;
+                    }
+                    let action = &builder.cleanup_action(cursor).action;
+                    let metadata = PointMetadata {
+                        source: action.source(),
+                        evidence: action.evidence(),
+                    };
+                    let entry = session.add_point(builder, metadata, Vec::new())?;
+                    // This is one executable specialization, shared by memoized routes.
+                    let action = builder.cleanup_action(cursor).action.clone();
+                    builder.emit_cleanup_action_fact(entry, &action)?;
+                    let next = self.next;
+                    self.next = ControlTarget {
+                        point: entry,
+                        kind: ControlEdgeKind::Cleanup,
+                    };
+                    return Ok(Some(CleanupRouteStep::Action(Box::new(
+                        CleanupActionSpecialization {
+                            action: cursor,
+                            entry,
+                            next,
+                        },
+                    ))));
+                }
+                self.chunk_index += 1;
+                if let Some(node) = self.chunks.get(self.chunk_index) {
+                    self.action_index = builder.cleanup_node(*node).actions.len();
+                }
+            }
+            builder.remember_cleanup_plan(self.route, head, self.next.point)?;
+            self.active = None;
         }
-        Ok(None)
     }
-
-    #[doc(hidden)]
     pub fn target(&self) -> ControlTarget {
-        debug_assert_eq!(self.next_index, 0, "cleanup region planning is incomplete");
-        debug_assert_eq!(
-            self.next_operation_index, 0,
-            "cleanup action planning is incomplete"
+        debug_assert!(
+            self.initialized && self.stack.is_empty() && self.active.is_none(),
+            "cleanup planning is incomplete"
         );
         self.next
     }
@@ -1449,11 +1476,13 @@ pub fn emit_cleanup_completion_route(
     from: ProgramPointId,
     route: &CompletionRoute,
 ) -> Result<(), ProcedureLoweringError> {
-    for operation in route.operations() {
-        if let CleanupRouteOperation::Action(action) = operation {
-            builder.emit_cleanup_action_fact(from, action)?;
-        }
-    }
+    builder.append_cleanup_anchor(
+        from,
+        route.segment,
+        route.destination(),
+        CleanupAnchorPurpose::Completion,
+        route.projection(),
+    )?;
     let destination = route.destination();
     session.add_target_edge(
         builder,
@@ -1839,19 +1868,19 @@ pub fn scoped_call_control_accounting(
     call_sites: &[SemanticCallSite],
     gaps: &[SemanticGap],
 ) -> ScopedCallControlAccounting {
+    let gap_index = CallTargetGapIndex::new(gaps);
     let mut covered_gap_ids = brokk_bifrost_core::hash::HashSet::default();
     let mut obligations = Vec::new();
     let mut missing_unknown_pair = false;
+    let mut covered_callable_values = brokk_bifrost_core::hash::HashSet::default();
     for call in call_sites {
-        if let Some((gap, callable_gap)) = call_target_gap_pair(call, gaps) {
+        if let Some((gap, callable_gap)) = gap_index.pair(call) {
             covered_gap_ids.insert(gap.id);
             covered_gap_ids.insert(callable_gap.id);
-            for related_gap in gaps.iter().filter(|related_gap| {
-                related_gap.subject == SemanticGapSubject::Value(call.callee)
-                    && related_gap.capability == SemanticCapability::CallableReferences
-                    && related_gap.kind == SemanticGapKind::Unknown
-            }) {
-                covered_gap_ids.insert(related_gap.id);
+            if covered_callable_values.insert(call.callee) {
+                for related_gap in gap_index.callable_gaps(call.callee) {
+                    covered_gap_ids.insert(related_gap.id);
+                }
             }
             obligations.push(CallTargetObligation {
                 call: call.id,
@@ -1861,16 +1890,24 @@ pub fn scoped_call_control_accounting(
         } else if matches!(call.declared_targets, CallableTargetResolution::Unknown) {
             missing_unknown_pair = true;
         }
-        for gap in gaps.iter().filter(|gap| {
-            gap.subject == SemanticGapSubject::CallSite(call.id)
-                && gap.capability == SemanticCapability::DynamicDispatch
-        }) {
+        for gap in gap_index.dynamic_gaps(call.id) {
             covered_gap_ids.insert(gap.id);
             obligations.push(CallTargetObligation {
                 call: call.id,
                 gap: gap.id,
                 impacts: gap.impacts,
             });
+        }
+    }
+    // These cleanup rows are explicit query-time obligations. The root and
+    // full-footprint consumers discharge each value, or keep the root open.
+    for gap in gaps {
+        if matches!(
+            gap.control_flow_discharge(),
+            SemanticGapDischarge::InertDropGlue
+                | SemanticGapDischarge::NonRejoiningExceptionalExitAfterInertDrops
+        ) {
+            covered_gap_ids.insert(gap.id);
         }
     }
     let unaccounted_gap_ids = gaps
@@ -2300,6 +2337,70 @@ impl FootprintBoundaryAccount {
     }
 }
 
+/// Transient evidence for one emitted access; never persisted independently.
+struct ImplicitAccessRecord {
+    point: ProgramPointId,
+    ordinal: usize,
+    requires_abort: bool,
+    abort: Option<(ProgramPointId, ProgramPointId)>,
+}
+
+fn exceptional_edge_endpoints(
+    edges: &[crate::analyzer::semantic::ControlEdge],
+) -> brokk_bifrost_core::hash::HashSet<(ProgramPointId, ProgramPointId)> {
+    edges
+        .iter()
+        .filter(|edge| edge.kind == ControlEdgeKind::Exceptional)
+        .map(|edge| (edge.source_point, edge.target_point))
+        .collect()
+}
+
+impl ImplicitAccessRecord {
+    /// `exceptional` holds every exceptional edge's (source, target) points,
+    /// indexed once per procedure so verification stays linear.
+    fn disposition(
+        &self,
+        points: &[crate::analyzer::semantic::ProgramPoint],
+        exceptional: &brokk_bifrost_core::hash::HashSet<(ProgramPointId, ProgramPointId)>,
+    ) -> CallControlDisposition {
+        let event = points
+            .get(self.point.index())
+            .and_then(|point| point.events.get(self.ordinal));
+        let memory = event.is_some_and(|event| {
+            matches!(
+                event.effect,
+                SemanticEffect::MemoryLoad { .. }
+                    | SemanticEffect::MemoryStore { .. }
+                    | SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::MemoryLoad { .. },
+                        ..
+                    }
+            )
+        });
+        let index = event.is_some_and(|event| {
+            matches!(
+                event.effect,
+                SemanticEffect::MemoryLoad {
+                    kind: crate::analyzer::semantic::MemoryAccessKind::Index,
+                    ..
+                } | SemanticEffect::MemoryStore {
+                    kind: crate::analyzer::semantic::MemoryAccessKind::Index,
+                    ..
+                }
+            )
+        });
+        let abort = !(self.requires_abort || index)
+            || self
+                .abort
+                .is_some_and(|endpoints| exceptional.contains(&endpoints));
+        if memory && abort {
+            CallControlDisposition::Represented
+        } else {
+            CallControlDisposition::Refused(FootprintRefusal::UnclassifiedBranch)
+        }
+    }
+}
+
 /// Source-anchor-aware emission state shared by every language adapter.
 #[doc(hidden)]
 pub struct ProcedureLoweringSession<'a> {
@@ -2319,11 +2420,76 @@ pub struct ProcedureLoweringSession<'a> {
     next_switch_fact: usize,
     source_occurrences: HashMap<(usize, usize), u32>,
     footprint: FootprintBoundaryAccount,
+    implicit_accesses: HashMap<usize, ImplicitAccessRecord>,
     #[doc(hidden)]
     pub cancellation: &'a CancellationToken,
 }
 
 impl<'a> ProcedureLoweringSession<'a> {
+    /// Record the memory event just emitted by the adapter.
+    pub fn record_implicit_access(
+        &mut self,
+        builder: &ProcedureCfgBuilder,
+        node: Node<'_>,
+        point: ProgramPointId,
+        requires_abort: bool,
+    ) {
+        let ordinal = builder
+            .event_count(point)
+            .checked_sub(1)
+            .expect("access event exists");
+        debug_assert!(
+            builder.last_event_is_memory(point),
+            "implicit access must reference a memory event"
+        );
+        // The recorded event is also the lowering's footprint claim for the
+        // access node; without it the source boundary refuses the node as
+        // unaccounted before its call/control branch is classified. The
+        // adapter claims the node's syntax children (a field name) itself.
+        self.footprint_register(node, BoundaryDisposition::Lowered);
+        self.implicit_accesses.insert(
+            node.id(),
+            ImplicitAccessRecord {
+                point,
+                ordinal,
+                requires_abort,
+                abort: None,
+            },
+        );
+    }
+
+    /// Attach an emitted exceptional edge to its access evidence. Adapters
+    /// route every implicit abort through one helper, so most calls come from
+    /// sites that recorded no access; those keep no evidence.
+    pub fn record_implicit_access_abort(
+        &mut self,
+        node: Node<'_>,
+        source: ProgramPointId,
+        target: ProgramPointId,
+    ) {
+        if let Some(record) = self.implicit_accesses.get_mut(&node.id()) {
+            record.abort = Some((source, target));
+        }
+    }
+
+    /// Whether lowering has claimed every evaluated node in this subtree.
+    pub fn footprint_subtree_claimed(&self, node: Node<'_>) -> bool {
+        let mut pending = vec![node];
+        while let Some(node) = pending.pop() {
+            let Some(&index) = self.footprint.claim_indices.get(&node.id()) else {
+                return false;
+            };
+            let claim = &self.footprint.claims[index];
+            if matches!(claim.disposition, BoundaryDisposition::Refused(_)) {
+                return false;
+            }
+            if !claim.consumed {
+                pending.extend(node.named_children(&mut node.walk()));
+            }
+        }
+        true
+    }
+
     pub fn footprint_register(&mut self, node: Node<'_>, disposition: BoundaryDisposition) {
         self.footprint.register(FootprintBoundaryClaim {
             node_id: node.id(),
@@ -2438,36 +2604,26 @@ impl<'a> ProcedureLoweringSession<'a> {
         F: for<'tree> Fn(Node<'tree>) -> (CallControlKind, CallControlDisposition),
     {
         let account = std::mem::take(&mut self.footprint);
-        let (footprint, call_control) = account.assemble(boundary, classify);
+        let exceptional = exceptional_edge_endpoints(&parts.control_edges);
+        let (footprint, call_control) = account.assemble(boundary, |node| {
+            let Some(record) = self.implicit_accesses.get(&node.id()) else {
+                return classify(node);
+            };
+            (
+                CallControlKind::ImplicitAccess,
+                record.disposition(&parts.points, &exceptional),
+            )
+        });
         parts.footprint_coverage = footprint;
         parts.call_control_coverage = call_control;
-        let unrepresented_call = parts
-            .call_control_coverage
-            .branches
-            .iter()
-            .filter(|branch| {
-                branch.kind == CallControlKind::ExplicitCall
-                    && branch.disposition == CallControlDisposition::Represented
-            })
-            .any(|branch| {
-                !parts.call_sites.iter().any(|call| {
-                    parts
-                        .source_mappings
-                        .get(call.source.index())
-                        .is_some_and(|mapping| {
-                            let span = mapping.locator.anchor().span();
-                            mapping.kind == SourceMappingKind::Exact
-                                && span.start_byte() as usize == branch.start
-                                && span.end_byte() as usize == branch.end
-                        })
-                })
-            });
+        let unrepresented_call = unrepresented_explicit_call(parts);
         if unrepresented_call && parts.call_control_coverage.admission.is_ok() {
             parts.call_control_coverage.admission = Err(FootprintRefusal::RelevantGap);
         }
+        let gap_index = CallTargetGapIndex::new(&parts.gaps);
         let mut target_gap_ids = brokk_bifrost_core::hash::HashSet::default();
         for call in &parts.call_sites {
-            let Some((gap, callable_gap)) = call_target_gap_pair(call, &parts.gaps) else {
+            let Some((gap, callable_gap)) = gap_index.pair(call) else {
                 break;
             };
             target_gap_ids.insert(gap.id);
@@ -2491,11 +2647,14 @@ impl<'a> ProcedureLoweringSession<'a> {
         {
             parts.call_control_coverage.admission = Err(FootprintRefusal::RelevantGap);
         }
-        if parts
-            .gaps
-            .iter()
-            .any(|gap| !target_gap_ids.contains(&gap.id))
-            && parts.footprint_coverage.boundary.is_ok()
+        if parts.gaps.iter().any(|gap| {
+            !target_gap_ids.contains(&gap.id)
+                && !matches!(
+                    gap.control_flow_discharge(),
+                    SemanticGapDischarge::InertDropGlue
+                        | SemanticGapDischarge::NonRejoiningExceptionalExitAfterInertDrops
+                )
+        }) && parts.footprint_coverage.boundary.is_ok()
         {
             parts.footprint_coverage.boundary = Err(FootprintRefusal::RelevantGap);
         }
@@ -2690,6 +2849,7 @@ impl<'a> ProcedureLoweringSession<'a> {
             next_switch_fact: 0,
             source_occurrences: HashMap::default(),
             footprint: FootprintBoundaryAccount::default(),
+            implicit_accesses: HashMap::default(),
             cancellation,
         };
         Ok((
@@ -3114,6 +3274,7 @@ impl<'a> ProcedureLoweringSession<'a> {
         let normal_resume = self.add_point(builder, normal_metadata, Vec::new())?;
         let exceptional_metadata = add_mapping(self, builder)?;
         let exceptional_resume = self.add_point(builder, exceptional_metadata, Vec::new())?;
+        self.append_effect(builder, suspend, SemanticEffect::MemoryInterference)?;
         self.append_effect(
             builder,
             suspend,
@@ -3345,6 +3506,48 @@ impl<'a> ProcedureLoweringSession<'a> {
             return Ok(None);
         };
         let abort = self.add_node_point(builder, node, Vec::new())?;
+        Ok(Some((route, abort)))
+    }
+
+    /// Emit an access fault before its effects. The adapter supplies catch
+    /// binding identity and schedules its language-specific cleanup bodies.
+    #[allow(clippy::too_many_arguments)]
+    #[doc(hidden)]
+    pub fn implicit_abort_edge(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'_>,
+        operation: ProgramPointId,
+        scope: ScopeFrameId,
+        carried: Option<ValueId>,
+        catch_binder: impl FnOnce(&CompletionRoute) -> Option<ValueId>,
+    ) -> Result<Option<(CompletionRoute, ProgramPointId)>, ProcedureLoweringError> {
+        let Some((route, abort)) = self.prepare_implicit_abort(builder, node, scope)? else {
+            return Ok(None);
+        };
+        if let Some(binder) = catch_binder(&route) {
+            let thrown = self.add_value(builder, abort, SemanticValueKind::Exception)?;
+            if let Some(carried) = carried {
+                self.append_effect(
+                    builder,
+                    abort,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Local,
+                        source: carried,
+                        target: thrown,
+                    },
+                )?;
+            }
+            self.append_assignment_value_flow(
+                builder,
+                abort,
+                ValueFlowKind::Local,
+                thrown,
+                binder,
+            )?;
+        }
+        self.add_edge(builder, operation, abort, ControlEdgeKind::Exceptional)?;
+        self.record_implicit_access_abort(node, operation, abort);
         Ok(Some((route, abort)))
     }
 
@@ -3607,6 +3810,32 @@ impl<'a> ProcedureLoweringSession<'a> {
         callable_detail: impl Into<Box<str>>,
         call_detail: impl Into<Box<str>>,
     ) -> Result<(), ProcedureLoweringError> {
+        self.add_callable_resolution_gaps_with_dispatch(
+            builder,
+            point,
+            callee,
+            call_site,
+            resolution,
+            CallTargetDispatch::Unspecified,
+            callable_detail,
+            call_detail,
+        )
+    }
+
+    /// Publish a target obligation with source-proven invocation semantics.
+    #[allow(clippy::too_many_arguments)]
+    #[doc(hidden)]
+    pub fn add_callable_resolution_gaps_with_dispatch(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        callee: ValueId,
+        call_site: CallSiteId,
+        resolution: &CallableTargetResolution,
+        dispatch: CallTargetDispatch,
+        callable_detail: impl Into<Box<str>>,
+        call_detail: impl Into<Box<str>>,
+    ) -> Result<(), ProcedureLoweringError> {
         let kind = match resolution {
             CallableTargetResolution::Proven(_) => return Ok(()),
             CallableTargetResolution::Ambiguous(_) => SemanticGapKind::Ambiguous,
@@ -3623,7 +3852,7 @@ impl<'a> ProcedureLoweringSession<'a> {
             kind,
             callable_detail,
         )?;
-        self.add_gap(
+        let gap = self.add_gap(
             builder,
             point,
             SemanticGapSubject::CallSite(call_site),
@@ -3631,6 +3860,7 @@ impl<'a> ProcedureLoweringSession<'a> {
             kind,
             call_detail,
         )?;
+        builder.set_call_target_dispatch(gap, dispatch);
         Ok(())
     }
 
@@ -3800,7 +4030,8 @@ impl<'a> ProcedureLoweringSession<'a> {
             point,
             subject,
             capability,
-            SemanticGapImpacts::for_gap(capability, subject).union(additional_impacts),
+            SemanticGapImpacts::for_gap_with_discharge(capability, subject, discharge)
+                .union(additional_impacts),
             kind,
             None,
             discharge,
@@ -3833,6 +4064,7 @@ impl<'a> ProcedureLoweringSession<'a> {
             kind,
             budget,
             discharge,
+            dispatch: Default::default(),
             detail: detail.into(),
             source: metadata.source,
             evidence: metadata.evidence,
@@ -3909,6 +4141,7 @@ impl<'a> ProcedureLoweringSession<'a> {
             impacts: SemanticGapImpacts::for_gap(capability, SemanticGapSubject::Point),
             kind: SemanticGapKind::Unproven,
             budget: None,
+            dispatch: Default::default(),
             discharge: SemanticGapDischarge::None,
             detail: reason.into(),
             source,
@@ -4301,4 +4534,99 @@ where
         value: procedures,
         work: observed,
     })
+}
+
+fn unrepresented_explicit_call(parts: &ProcedureSemanticsParts) -> bool {
+    let exact_call_spans = parts
+        .call_sites
+        .iter()
+        .filter_map(|call| {
+            let mapping = parts.source_mappings.get(call.source.index())?;
+            let span = mapping.locator.anchor().span();
+            (mapping.kind == SourceMappingKind::Exact)
+                .then_some((span.start_byte() as usize, span.end_byte() as usize))
+        })
+        .collect::<brokk_bifrost_core::hash::HashSet<_>>();
+    parts
+        .call_control_coverage
+        .branches
+        .iter()
+        .filter(|branch| {
+            branch.kind == CallControlKind::ExplicitCall
+                && branch.disposition == CallControlDisposition::Represented
+        })
+        .any(|branch| !exact_call_spans.contains(&(branch.start, branch.end)))
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn explicit_call_coverage_for_test(parts: &ProcedureSemanticsParts) -> bool {
+    unrepresented_explicit_call(parts)
+}
+
+#[cfg(test)]
+mod implicit_access_tests {
+    use super::*;
+
+    #[test]
+    fn implicit_access_requires_memory_event_and_index_abort() {
+        let point = ProgramPointId::try_from_index(0).unwrap();
+        let mut record = ImplicitAccessRecord {
+            point,
+            ordinal: 0,
+            requires_abort: false,
+            abort: None,
+        };
+        let refused = CallControlDisposition::Refused(FootprintRefusal::UnclassifiedBranch);
+        let none = brokk_bifrost_core::hash::HashSet::default();
+        assert_eq!(record.disposition(&[], &none), refused);
+        // Even a real memory event does not prove a bounds check was emitted.
+        let source = SourceMappingId::try_from_index(0).unwrap();
+        let evidence = EvidenceId::try_from_index(0).unwrap();
+        let points = [crate::analyzer::semantic::ProgramPoint {
+            id: point,
+            block: crate::analyzer::semantic::BlockId::try_from_index(0).unwrap(),
+            events: vec![SemanticEvent::new(
+                SemanticEffect::MemoryStore {
+                    kind: crate::analyzer::semantic::MemoryAccessKind::Index,
+                    location: MemoryLocationId::try_from_index(0).unwrap(),
+                    value: ValueId::try_from_index(0).unwrap(),
+                },
+                source,
+                evidence,
+            )]
+            .into_boxed_slice(),
+            source,
+            evidence,
+        }];
+        assert_eq!(record.disposition(&points, &none), refused);
+        record.requires_abort = true;
+        assert_eq!(record.disposition(&points, &none), refused);
+        // A normal edge to the recorded abort target is not the abort.
+        let abort_point = ProgramPointId::try_from_index(1).unwrap();
+        record.abort = Some((point, abort_point));
+        let mut edge = crate::analyzer::semantic::ControlEdge {
+            source_point: point,
+            target_point: abort_point,
+            kind: ControlEdgeKind::Normal,
+            source,
+            evidence,
+        };
+        assert_eq!(
+            record.disposition(
+                &points,
+                &exceptional_edge_endpoints(std::slice::from_ref(&edge))
+            ),
+            refused
+        );
+        // The emitted exceptional edge completes the evidence.
+        edge.kind = ControlEdgeKind::Exceptional;
+        assert_eq!(
+            record.disposition(
+                &points,
+                &exceptional_edge_endpoints(std::slice::from_ref(&edge))
+            ),
+            CallControlDisposition::Represented
+        );
+    }
 }

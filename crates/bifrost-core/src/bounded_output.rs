@@ -1,4 +1,4 @@
-//! Shared transactional output for balanced, bounded IR renderers.
+//! Shared transactional output for bounded IR renderers and diagnostic prose.
 
 use std::fmt;
 use std::fmt::Write as _;
@@ -41,6 +41,107 @@ impl fmt::Write for CapacityWriter<'_> {
         self.output.push_str(value);
         Ok(())
     }
+}
+
+/// The policy diagnostic prose limit, shared with diagnostic producers.
+pub const MAX_DIAGNOSTIC_MESSAGE_BYTES: usize = 4_096;
+
+/// Preserve a complete diagnostic when it fits; otherwise retain whole items
+/// with exact total/omitted counts. Formatting is transactional, including
+/// Debug implementations that write an item in multiple fragments. A context
+/// that cannot fit is omitted as one whole context item with its own count.
+pub fn bounded_diagnostic_items<I>(
+    original: fmt::Arguments<'_>,
+    context: fmt::Arguments<'_>,
+    items: I,
+) -> String
+where
+    I: IntoIterator,
+    I::IntoIter: ExactSizeIterator,
+    I::Item: fmt::Debug,
+{
+    bounded_diagnostic_items_with_summary(original, "", context, items)
+}
+
+/// Like [`bounded_diagnostic_items`], but an overflow preserves a compact typed
+/// summary before context and detail items. The summary must contain only a
+/// finite vocabulary, not user-controlled details. Its allowance leaves room
+/// for context and exact omission metadata inside the existing prose bound.
+pub fn bounded_diagnostic_items_with_summary<I>(
+    original: fmt::Arguments<'_>,
+    summary: &str,
+    context: fmt::Arguments<'_>,
+    items: I,
+) -> String
+where
+    I: IntoIterator,
+    I::IntoIter: ExactSizeIterator,
+    I::Item: fmt::Debug,
+{
+    assert!(
+        summary.len() <= 3_072,
+        "diagnostic summary vocabulary grew beyond its reserve"
+    );
+    let mut output = String::new();
+    let complete = {
+        let mut writer = CapacityWriter {
+            output: &mut output,
+            max_len: MAX_DIAGNOSTIC_MESSAGE_BYTES,
+            rejected: false,
+        };
+        fmt::write(&mut writer, original).is_ok() && !writer.rejected
+    };
+    if complete {
+        return output;
+    }
+    output.clear();
+    if !summary.is_empty() {
+        output.push_str(summary);
+        output.push_str("; ");
+    }
+    let context_start = output.len();
+    let context_fits = {
+        let mut writer = CapacityWriter {
+            output: &mut output,
+            max_len: context_start + 768,
+            rejected: false,
+        };
+        fmt::write(&mut writer, context).is_ok() && !writer.rejected
+    };
+    if !context_fits {
+        output.truncate(context_start);
+        output.push_str(
+            "diagnostic context omitted (total_context_items=1, omitted_context_items=1)",
+        );
+    }
+    let items = items.into_iter();
+    let total = items.len();
+    write!(output, "; total_items={total}, retained_items=[").expect("string formatting");
+    let mut retained = 0;
+    for item in items {
+        let checkpoint = output.len();
+        let fits = {
+            let mut writer = CapacityWriter {
+                output: &mut output,
+                max_len: 3_900,
+                rejected: false,
+            };
+            let result = if retained == 0 {
+                write!(writer, "{item:?}")
+            } else {
+                write!(writer, ", {item:?}")
+            };
+            result.is_ok() && !writer.rejected
+        };
+        if !fits {
+            output.truncate(checkpoint);
+            break;
+        }
+        retained += 1;
+    }
+    write!(output, "], omitted_items={}", total - retained).expect("string formatting");
+    debug_assert!(output.len() <= MAX_DIAGNOSTIC_MESSAGE_BYTES);
+    output
 }
 
 impl BalancedWriter {
@@ -232,6 +333,76 @@ impl fmt::Display for Quoted<'_> {
 mod bounded_output_properties {
     use super::{BalancedWriter, TruncationStyle, quoted};
     use proptest::prelude::*;
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12312: aggregated diagnostic reasons exceeded the policy prose bound"
+    )]
+    fn diagnostic_items_preserve_complete_text_and_omit_only_whole_items() {
+        use super::bounded_diagnostic_items;
+        let short = ["one", "two"];
+        assert_eq!(
+            bounded_diagnostic_items(
+                format_args!("reasons: {short:?}"),
+                format_args!("reasons"),
+                &short
+            ),
+            "reasons: [\"one\", \"two\"]"
+        );
+        let items = [
+            "first".to_owned(),
+            "\u{e9}".repeat(30_000),
+            "last".to_owned(),
+        ];
+        let message = bounded_diagnostic_items(
+            format_args!("reasons: {items:?}"),
+            format_args!("reasons"),
+            &items,
+        );
+        assert!(message.len() <= super::MAX_DIAGNOSTIC_MESSAGE_BYTES);
+        assert!(message.contains("total_items=3, retained_items=[\"first\"]"));
+        assert!(message.ends_with("omitted_items=2"));
+        let context = "x".repeat(5_000);
+        let message = bounded_diagnostic_items(
+            format_args!("{context}: {short:?}"),
+            format_args!("{context}"),
+            &short,
+        );
+        assert!(message.len() <= super::MAX_DIAGNOSTIC_MESSAGE_BYTES);
+        assert!(message.contains("omitted_context_items=1"));
+        assert!(message.ends_with("omitted_items=0"));
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12482: summary causes must survive oversized context and detail records"
+    )]
+    fn diagnostic_summary_precedes_context_and_whole_details() {
+        use super::bounded_diagnostic_items_with_summary;
+        let context = "c".repeat(5_000);
+        let items = ["x".repeat(5_000), "last".to_owned()];
+        let summary = "cause_kinds={SelectedRuntimeAccess, SelectedAncestorStore}";
+        let message = bounded_diagnostic_items_with_summary(
+            format_args!("{context}: {items:?}"),
+            summary,
+            format_args!("{context}"),
+            &items,
+        );
+        assert!(message.starts_with(summary));
+        assert!(message.len() <= super::MAX_DIAGNOSTIC_MESSAGE_BYTES);
+        assert!(message.contains("omitted_context_items=1"));
+        assert!(message.contains("total_items=2, retained_items=[]"));
+        assert!(message.ends_with("omitted_items=2"));
+        assert_eq!(
+            bounded_diagnostic_items_with_summary(
+                format_args!("complete"),
+                summary,
+                format_args!("context"),
+                &items,
+            ),
+            "complete"
+        );
+    }
 
     /// Large enough for the longest marker plus its trailing newlines.
     const RESERVE: usize = 60;

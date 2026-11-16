@@ -945,6 +945,9 @@ pub struct ScalaAnalyzer {
     >,
     referencing_files: Arc<WorkspaceAuthorityMemo<Cache<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     direct_ancestors: crate::analyzer::jvm::hierarchy::AncestorMemo,
+    /// Where each template's written supertypes land, for the external-root
+    /// member-family walk (#11162).
+    supertype_landings: hierarchy::ScalaSupertypeLandingMemo,
     source_facts: Cache<
         (
             brokk_bifrost_analysis::analyzer::store::GenerationId,
@@ -1409,6 +1412,7 @@ impl ScalaAnalyzer {
             imported_code_units: crate::analyzer::jvm::hierarchy::derived_memo(memo_budget / 4),
             referencing_files: new_scala_referencing_files_authority(memo_budget / 8),
             direct_ancestors: crate::analyzer::jvm::hierarchy::ancestor_memo(memo_budget / 8),
+            supertype_landings: crate::analyzer::jvm::hierarchy::derived_memo(memo_budget / 16),
             source_facts: build_weighted_cache(
                 memo_budget / 8,
                 |_, facts: &Arc<brokk_bifrost_jvm::scala::source_facts::ScalaFileSourceFacts>| {
@@ -1555,13 +1559,18 @@ impl ScalaAnalyzer {
     /// Scala's given/implicit and extension discovery cannot be stated per
     /// lookup, so every read of the index reports every gap it carries,
     /// whichever language's builder filled the shared cell (#10470).
+    pub(crate) fn jvm_selection_config(
+        &self,
+    ) -> &brokk_bifrost_core::analyzer::config::JvmAnalyzerConfig {
+        &self.java_config
+    }
+
     pub(crate) fn external_declaration_index(&self) -> Arc<JvmExternalDeclarationIndex> {
         let index = crate::analyzer::jvm::external::get_or_build_external_declaration_index(
             self,
             &self.external_index,
             (Language::Scala, WorkspaceFactFamily::ScalaExternalIndex),
             &self.java_config,
-            self.inner.project(),
             self.inner.analyzer_store(),
         );
         crate::analyzer::jvm::external::QueryGapRecorder::new(self).all(&index);
@@ -2341,6 +2350,11 @@ impl CodeUnitIndex for ScalaAnalyzer {
     }
 
     delegate_inner_methods! {
+        fn owns_source_file(&self, file: &ProjectFile) -> bool;
+        fn indexed_source_files(&self) -> brokk_bifrost_analysis::analyzer::QueryBatch<ProjectFile>;
+    }
+
+    delegate_inner_methods! {
         fn indexed_blob_oid(&self, file: &ProjectFile) -> Option<brokk_bifrost_analysis::analyzer::Oid>;
     }
 
@@ -2531,11 +2545,8 @@ impl IAnalyzer for ScalaAnalyzer {
     }
 
     delegate_inner_methods! {
-        fn record_query_failure(&self, error: brokk_bifrost_analysis::analyzer::store::StoreError);
-    }
-
-    delegate_inner_methods! {
         fn workspace_file_index_cell(&self) -> Option<brokk_bifrost_analysis::analyzer::WorkspaceFileIndexCell>;
+        fn workspace_file_inventory_cell(&self) -> Option<brokk_bifrost_analysis::analyzer::WorkspaceFileInventoryCell>;
     }
 
     delegate_inner_methods! {
@@ -2548,6 +2559,13 @@ impl IAnalyzer for ScalaAnalyzer {
         fn structural_fact_providers(
         &self,
     ) -> Vec<&dyn brokk_bifrost_analysis::analyzer::structural::StructuralFactProvider>;
+    }
+
+    fn generation_membership(
+        &self,
+    ) -> &Arc<brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::GenerationWorkspaceMembership>
+    {
+        IAnalyzer::generation_membership(&self.inner)
     }
 
     fn snapshot_caches(
@@ -2712,7 +2730,10 @@ impl IAnalyzer for ScalaAnalyzer {
         fn contains_tests(&self, file: &ProjectFile) -> bool;
     }
 
-    fn in_test_region(&self, code_unit: &brokk_bifrost_core::analyzer::model::CodeUnit) -> bool {
+    fn in_test_region(
+        &self,
+        code_unit: &brokk_bifrost_core::analyzer::model::CodeUnit,
+    ) -> Result<bool, brokk_bifrost_analysis::analyzer::QueryReadIncomplete> {
         self.inner.in_test_region(code_unit)
     }
 
@@ -2949,6 +2970,8 @@ impl brokk_bifrost_analysis::analyzer::multi_analyzer::LanguageAnalyzer for Scal
     ) -> Box<dyn brokk_bifrost_analysis::analyzer::multi_analyzer::LanguageAnalyzer> {
         Box::new(ScalaAnalyzer::update_all_with_progress(self, progress))
     }
+
+    brokk_bifrost_analysis::delegate_generation_membership_updates!(ScalaAnalyzer);
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -3414,6 +3437,7 @@ impl LanguageSupport for ScalaSupport {
         token: brokk_bifrost_core::analyzer::query_token::QueryToken<'_>,
         file: &brokk_bifrost_core::analyzer::model::ProjectFile,
         name: &str,
+        _reuse: &mut brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict,
     ) -> Option<(
         brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus,
         Option<String>,
@@ -3422,7 +3446,12 @@ impl LanguageSupport for ScalaSupport {
 
         use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
         resolve_analyzer::<ScalaAnalyzer>(analyzer).map(|scala| {
-            scala.external_boundary_evidence(token, analyzer.semantic_model_overlay(), file, name)
+            scala.external_boundary_evidence(
+                token,
+                analyzer.semantic_model_overlay_read().published(),
+                file,
+                name,
+            )
         })
     }
 
@@ -3990,6 +4019,7 @@ struct ScalaDeadCodeMemo {
     file_count: Option<usize>,
     overloaded_fqns: HashMap<String, bool>,
     bulk_context: Option<Option<ScalaDeadCodeBulkContext>>,
+    jvm_peer_files_present: Option<bool>,
 }
 
 struct ScalaDeadCodeBulk;
@@ -4020,6 +4050,7 @@ impl DeadCodeBulkProof for ScalaDeadCodeBulk {
             file_count,
             overloaded_fqns,
             bulk_context,
+            jvm_peer_files_present,
         } = memo.downcast_mut().expect("Scala bulk memo");
         if *file_count.get_or_insert_with(|| analyzable_file_count(analyzer, Language::Scala))
             > file_cap
@@ -4043,8 +4074,21 @@ impl DeadCodeBulkProof for ScalaDeadCodeBulk {
             return true;
         };
 
+        let has_jvm_peer_files = candidate.is_class()
+            && *jvm_peer_files_present.get_or_insert_with(|| {
+                analyzable_file_count(analyzer, Language::Java) > 0
+                    || analyzable_file_count(analyzer, Language::Kotlin) > 0
+            });
+
         matches!(
-            dead_code_bulk_eligibility(analyzer, token, candidate, &overloads, context),
+            dead_code_bulk_eligibility(
+                analyzer,
+                token,
+                candidate,
+                &overloads,
+                context,
+                has_jvm_peer_files,
+            ),
             ScalaDeadCodeBulkEligibility::NeedsPrecise
         )
     }

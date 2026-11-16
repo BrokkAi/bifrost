@@ -1,0 +1,14 @@
+# The go resolution bundle lever (#11570).
+#
+# Add one `<issue>-<slug>` line when a change alters the persisted per-file
+# go resolution bundle for unchanged source: stored interiors and unit
+# summaries produced under an earlier identity are withdrawn and relowered.
+# Whoever adds a line must also ask whether both ICFG provider domains rotate
+# (see .agents/docs/cache-identity-levers.md). Git merges this file with
+# merge=union, so two branches that each add a line keep both. Never edit or
+# remove a line; compaction replaces a prefix with a checkpoint line and keeps
+# the identity.
+#
+# Replaced the string literal:
+# resolution-bundle-go-v77-compact-identity-digests-9628-8762-anonymous-interface-identity-slot-7509-alias-target-lookup-8387-ranked-synthetic-names-type-assertion-results-7391-classified-route-gaps-5658-root-import-publication-receiver-applicability-binding-result-separation-index-slice-component-projections-stable-transfer-codes-qualified-call-conversions-2026-10-7509-clause-guard-initializer-gap-7509-sole-alias-owner-7509-channel-direction
+11570-slice2a-token-files

@@ -69,7 +69,7 @@ impl Producer<'_, '_> {
         Some(parts)
     }
 
-    fn reference(
+    pub(super) fn reference(
         &mut self,
         node: Node<'_>,
         ctx: Context,
@@ -161,6 +161,72 @@ impl Producer<'_, '_> {
                     name,
                 });
         }
+    }
+
+    // ECMA-334 (7th ed.) 12.8.13 and 12.8.14: instance access starts at the
+    // enclosing type, independently of locals in the executable scope.
+    pub(super) fn instance_member(&mut self, node: Node<'_>, ctx: Context) {
+        let receiver = node
+            .child_by_field_name("expression")
+            .expect("instance receiver");
+        let name = node.child_by_field_name("name").expect("member name");
+        let mut scope = ctx.scope;
+        loop {
+            let row = &self.facts.scopes[scope.index()];
+            if row.kind == ResolutionScopeKind::TypeBody && row.owner == ctx.owner {
+                break;
+            }
+            let Some(parent) = row.parent else { break };
+            scope = parent;
+        }
+        let reference = self.reference(name, Context { scope, ..ctx }, reference_namespace(node));
+        let site = self.facts.sites.last_mut().expect("new member site");
+        debug_assert_eq!(site.id, reference);
+        site.kind = ResolutionSiteKind::MemberReference;
+        let base = receiver.kind() == "base";
+        // Until M6a3 publishes base lists, even this-member lookup has an
+        // open hierarchy. A qualified unknown receiver prevents lexical
+        // lookup from escaping into an enclosing type's declarations.
+        let slot = self
+            .facts
+            .allocate_type_slot(reference, ResolutionTypeSlotRole::Receiver);
+        self.facts
+            .identifiers
+            .last_mut()
+            .expect("member identifier")
+            .qualifier = Some(slot);
+        self.facts
+            .add_gap(reference, ResolutionGapKind::UnsupportedTypeSyntax);
+        let mut ancestor = node.parent();
+        while let Some(parent) = ancestor {
+            if matches!(
+                parent.kind(),
+                "class_declaration"
+                    | "struct_declaration"
+                    | "record_declaration"
+                    | "interface_declaration"
+            ) {
+                break;
+            }
+            if csharp_has_modifier(self.source, parent, "static") {
+                self.facts
+                    .add_gap(reference, ResolutionGapKind::UnsupportedExpression);
+                break;
+            }
+            ancestor = parent.parent();
+        }
+        self.facts
+            .callable_receiver_origins
+            .push(ResolutionCallableReceiverOriginFact {
+                reference,
+                origin: if base {
+                    ResolutionCallableReceiverOrigin::Super
+                } else {
+                    ResolutionCallableReceiverOrigin::CurrentInstance
+                },
+            });
+        self.claimed.insert(receiver.id());
+        self.claimed.insert(node.id());
     }
 
     pub(super) fn reference_path(&mut self, node: Node<'_>, ctx: Context) {

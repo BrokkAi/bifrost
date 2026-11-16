@@ -7,8 +7,9 @@
 //! prelude under `#![no_core]`. Bifrost indexes neither std nor core, so such
 //! a name is an open boundary on the unindexed crate, never a proved absence.
 //!
-//! The table covers the type and value namespaces. Prelude macros and derive
-//! macros are the macro namespace, which this table does not model.
+//! The table covers the type and value namespaces and, in the macro namespace,
+//! only the built-in derives ([`RUST_BUILTIN_DERIVES`]). Other prelude macros
+//! (`println!`, `vec!`) are not modeled here.
 
 /// Which crate supplies a crate's implicit prelude.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -31,6 +32,8 @@ impl RustPreludeCrate {
 pub enum RustPreludeNamespace {
     Type,
     Value,
+    /// Derive macros. Only the built-in derives are listed.
+    Macro,
 }
 
 /// A Rust edition, in the order editions were introduced.
@@ -91,7 +94,7 @@ const fn name(
 }
 
 use RustEdition::{E2015, E2021, E2024};
-use RustPreludeNamespace::{Type, Value};
+use RustPreludeNamespace::{Macro, Type, Value};
 
 /// Every prelude name of every edition, std and core, type and value.
 pub const RUST_PRELUDE_NAMES: &[RustPreludeName] = &[
@@ -152,6 +155,17 @@ pub const RUST_PRELUDE_NAMES: &[RustPreludeName] = &[
     // rust_2024
     name("Future", Type, false, E2024),
     name("IntoFuture", Type, false, E2024),
+    // The built-in derive macros, re-exported by every edition's prelude.
+    // `Debug` and `Hash` are prelude names only in the macro namespace.
+    name("Clone", Macro, false, E2015),
+    name("Copy", Macro, false, E2015),
+    name("Debug", Macro, false, E2015),
+    name("Default", Macro, false, E2015),
+    name("Eq", Macro, false, E2015),
+    name("Hash", Macro, false, E2015),
+    name("Ord", Macro, false, E2015),
+    name("PartialEq", Macro, false, E2015),
+    name("PartialOrd", Macro, false, E2015),
 ];
 
 /// The canonical module of a trait injected by a standard prelude. This is
@@ -246,6 +260,124 @@ pub fn rust_marker_trait_without_associated_items(
     RUST_MARKER_TRAITS_WITHOUT_ASSOCIATED_ITEMS
         .iter()
         .find(|marker| marker.name == name)
+}
+
+/// One associated function of a trait that a built-in derive implements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RustDerivedTraitItem {
+    pub name: &'static str,
+    /// Whether the function takes a `self` receiver (`x.clone()`), as opposed
+    /// to an associated function reached only through a path (`T::default()`).
+    pub receiver: bool,
+    /// The parameter count, excluding the receiver.
+    pub arity: usize,
+}
+
+/// A derive macro the standard prelude injects whose expansion is exactly one
+/// `impl ::core::<module>::<name> for Type` (#11325).
+///
+/// rustc implements these derives itself. The impl adds no inherent member and
+/// no other trait, so the derived type's member surface is its authored impls
+/// plus `items`. `items` lists every associated function of the standard
+/// trait, including `#[doc(hidden)]` ones, because an item missing here would
+/// turn into a false absence. The derives of `PartialEq` and `Eq` also emit
+/// unstable structural marker impls, which have no items.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RustBuiltinDerive {
+    /// The derive name, which is also the trait name.
+    pub name: &'static str,
+    /// The trait's module under `core` (and its `std` re-export).
+    pub module: &'static str,
+    pub items: &'static [RustDerivedTraitItem],
+}
+
+const fn item(name: &'static str, receiver: bool, arity: usize) -> RustDerivedTraitItem {
+    RustDerivedTraitItem {
+        name,
+        receiver,
+        arity,
+    }
+}
+
+/// The built-in derives, by name.
+pub const RUST_BUILTIN_DERIVES: &[RustBuiltinDerive] = &[
+    RustBuiltinDerive {
+        name: "Clone",
+        module: "clone",
+        items: &[item("clone", true, 0), item("clone_from", true, 1)],
+    },
+    RustBuiltinDerive {
+        name: "Copy",
+        module: "marker",
+        items: &[],
+    },
+    RustBuiltinDerive {
+        name: "Debug",
+        module: "fmt",
+        items: &[item("fmt", true, 1)],
+    },
+    RustBuiltinDerive {
+        name: "Default",
+        module: "default",
+        items: &[item("default", false, 0)],
+    },
+    RustBuiltinDerive {
+        name: "Eq",
+        module: "cmp",
+        items: &[item("assert_receiver_is_total_eq", true, 0)],
+    },
+    RustBuiltinDerive {
+        name: "Hash",
+        module: "hash",
+        items: &[item("hash", true, 1), item("hash_slice", false, 2)],
+    },
+    RustBuiltinDerive {
+        name: "Ord",
+        module: "cmp",
+        items: &[
+            item("cmp", true, 1),
+            item("max", true, 1),
+            item("min", true, 1),
+            item("clamp", true, 2),
+        ],
+    },
+    RustBuiltinDerive {
+        name: "PartialEq",
+        module: "cmp",
+        items: &[item("eq", true, 1), item("ne", true, 1)],
+    },
+    RustBuiltinDerive {
+        name: "PartialOrd",
+        module: "cmp",
+        items: &[
+            item("partial_cmp", true, 1),
+            item("lt", true, 1),
+            item("le", true, 1),
+            item("gt", true, 1),
+            item("ge", true, 1),
+            item("__chaining_lt", true, 1),
+            item("__chaining_le", true, 1),
+            item("__chaining_gt", true, 1),
+            item("__chaining_ge", true, 1),
+        ],
+    },
+];
+
+/// The built-in derive a derive path names, if any: a bare prelude name or a
+/// `core`/`std` path to the trait's own module.
+///
+/// Like [`rust_marker_trait_without_associated_items`], this does not resolve
+/// the spelling. A bare name is the built-in derive only when no binding in
+/// the macro namespace shadows the prelude, which the caller must establish.
+pub fn rust_builtin_derive(segments: &[&str]) -> Option<&'static RustBuiltinDerive> {
+    let (name, module) = match segments {
+        [name] => (*name, None),
+        ["core" | "std", module, name] => (*name, Some(*module)),
+        _ => return None,
+    };
+    RUST_BUILTIN_DERIVES
+        .iter()
+        .find(|derive| derive.name == name && module.is_none_or(|module| module == derive.module))
 }
 
 /// What dropping a value of a reviewed standard type can execute (#3757).
@@ -430,6 +562,68 @@ pub fn rust_std_associated_fact(
     arity: usize,
 ) -> Option<&'static RustStdAssociatedFact> {
     RUST_STD_ASSOCIATED_FACTS
+        .iter()
+        .find(|fact| fact.owner == owner && fact.function == function && fact.arity == arity)
+}
+
+/// An associated function of a reviewed std prelude type whose result is a
+/// value of that same type (`Self`), such as `String::from(..)`.
+///
+/// This table states drop authority only: what dropping the result can run.
+/// It says nothing about how the arguments reach the result, so it must not
+/// feed a taint transfer; [`RUST_STD_ASSOCIATED_FACTS`] does that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RustStdSelfConstructorFact {
+    /// The [`RUST_STD_TYPE_FACTS`] type the function is associated with.
+    pub owner: &'static str,
+    pub function: &'static str,
+    /// The written argument count.
+    pub arity: usize,
+    /// An inherent function cannot be displaced by a trait in scope. A trait
+    /// function (`From::from`) is the standard one only while the standard
+    /// prelude is in effect. A qualified or imported owner proves only
+    /// external identity, so that route accepts inherent facts only.
+    pub inherent: bool,
+}
+
+/// Reviewed `Self`-returning associated functions. A function that is not
+/// listed leaves its result class unproven.
+pub const RUST_STD_SELF_CONSTRUCTOR_FACTS: &[RustStdSelfConstructorFact] = &[
+    RustStdSelfConstructorFact {
+        owner: "String",
+        function: "new",
+        arity: 0,
+        inherent: true,
+    },
+    RustStdSelfConstructorFact {
+        owner: "String",
+        function: "from",
+        arity: 1,
+        inherent: false,
+    },
+    RustStdSelfConstructorFact {
+        owner: "Vec",
+        function: "new",
+        arity: 0,
+        inherent: true,
+    },
+    RustStdSelfConstructorFact {
+        owner: "Vec",
+        function: "with_capacity",
+        arity: 1,
+        inherent: true,
+    },
+];
+
+/// The reviewed `Self` constructor `owner::function` with `arity` written
+/// arguments, if any. Callers may use it only after the owner's selected
+/// resolution proves the `std` or `alloc` type.
+pub fn rust_std_self_constructor_fact(
+    owner: &str,
+    function: &str,
+    arity: usize,
+) -> Option<&'static RustStdSelfConstructorFact> {
+    RUST_STD_SELF_CONSTRUCTOR_FACTS
         .iter()
         .find(|fact| fact.owner == owner && fact.function == function && fact.arity == arity)
 }

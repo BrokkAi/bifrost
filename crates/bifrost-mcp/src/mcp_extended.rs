@@ -8,10 +8,10 @@ use crate::rql::{
 use brokk_bifrost_rql::schema::{
     ALL_CODE_QUERY_EXECUTION_MODES, ALL_CONFIGURATION_FACTS_FILTER_FIELDS,
     ALL_CROSS_DOMAIN_RELATION_FIELDS, ALL_QUERY_PLAN_SOURCES, ALL_QUERY_STEP_OPS,
-    ALL_REFERENCE_KINDS, ALL_USAGE_KINDS, ConfigurationFactsFilterField, ExportFilterField,
-    GenerationSiteFilterField, QueryField, QueryStepField, constrained_step_option_labels,
-    control_relation_filter_labels, environment_filter_labels, export_form_labels,
-    flow_state_filter_labels, generation_input_labels, generation_kind_labels,
+    ALL_REFERENCE_KINDS, ALL_USAGE_KINDS, CallReachabilityField, ConfigurationFactsFilterField,
+    ExportFilterField, GenerationSiteFilterField, QueryField, QueryStepField,
+    constrained_step_option_labels, control_relation_filter_labels, environment_filter_labels,
+    export_form_labels, flow_state_filter_labels, generation_input_labels, generation_kind_labels,
     occurrence_filter_labels, reference_kind_label, rewrite_path_filter_labels,
     supported_query_schema_versions,
 };
@@ -885,6 +885,7 @@ fn query_plan_properties(
         "generation_sites": generation_site_filter_schema(),
         "exports": export_filter_schema(),
         "configuration_facts": configuration_facts_filter_schema(),
+        "call_reachability": call_reachability_filter_schema(),
         "correlate": correlate_filter_schema(),
         "require_both": require_both_filter_schema(),
         "steps": {
@@ -1027,6 +1028,24 @@ fn require_both_filter_schema() -> Value {
     })
 }
 
+fn call_reachability_filter_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "sources": { "$ref": "#/$defs/queryPlan" },
+            "sinks": { "$ref": "#/$defs/queryPlan" },
+            "depth": {
+                "type": "integer",
+                "minimum": 1,
+                "description": CallReachabilityField::Depth.description()
+            }
+        },
+        "required": ["sources", "sinks"],
+        "additionalProperties": false,
+        "description": QueryField::CallReachability.description()
+    })
+}
+
 fn dependency_evidence_filter_schema() -> Value {
     let properties=brokk_bifrost_rql::schema::ALL_DEPENDENCY_EVIDENCE_FILTER_FIELDS.iter().map(|field| {
         (field.label().to_owned(),json!({"type":"array","maxItems":128,"items":{"type":"string","minLength":1},"description":field.description()}))
@@ -1058,7 +1077,7 @@ fn query_plan_source_variants() -> Vec<Value> {
                     excluded.extend(["inside", "inside_decl", "not_inside", "languages"])
                 }
                 "occurrences" | "scopes" | "bindings" | "paths" | "generation_sites"
-                | "exports" | "correlate" | "require_both" => {
+                | "exports" | "call_reachability" | "correlate" | "require_both" => {
                     excluded.extend(["inside", "inside_decl", "not_inside"]);
                 }
                 _ => excluded.extend(seed_scope_fields),
@@ -1221,6 +1240,19 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
             json!({
                 "type": "object",
                 "properties": {
+                    "sources": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "CLI source selection: files, directories or globs within the workspace. Omitted or empty selects the whole workspace. No count limit; stdio has no finite request-size limit."
+                    },
+                    "inline_suppression_prefix": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": crate::policy::MAX_INLINE_SUPPRESSION_PREFIX_BYTES,
+                        "pattern": "^[A-Za-z0-9_-]+$",
+                        "description": "Inline suppression directive prefix (default bifrost), as in the CLI's --inline-suppression-prefix."
+                    },
+
                     "policy_files": {
                         "type": "array",
                         "items": {
@@ -1600,6 +1632,33 @@ mod tests {
                 "query plan has no oneOf variant for source {label}"
             );
         }
+        assert_eq!(
+            properties["call_reachability"]["required"],
+            json!(["sources", "sinks"])
+        );
+        assert_eq!(
+            properties["call_reachability"]["properties"]["depth"]["minimum"],
+            1
+        );
+        let call_reachability = variants
+            .iter()
+            .find(|variant| variant["required"] == json!(["call_reachability"]))
+            .expect("call_reachability source variant");
+        let excluded = call_reachability["not"]["anyOf"]
+            .as_array()
+            .expect("call_reachability exclusions")
+            .iter()
+            .map(|entry| entry["required"][0].as_str().expect("excluded field"))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            excluded,
+            ALL_QUERY_PLAN_SOURCES
+                .iter()
+                .map(|source| source.label())
+                .chain(["inside", "inside_decl", "not_inside"])
+                .filter(|field| *field != "call_reachability")
+                .collect()
+        );
     }
 
     #[test]
@@ -2323,6 +2382,12 @@ mod tests {
             .expect("run_policy descriptor");
         let schema = &descriptor["inputSchema"];
         let policy_files = &schema["properties"]["policy_files"];
+        assert_eq!(schema["properties"]["sources"]["type"], "array");
+        assert!(schema["properties"]["sources"].get("maxItems").is_none());
+        assert_eq!(
+            schema["properties"]["inline_suppression_prefix"]["maxLength"],
+            crate::policy::MAX_INLINE_SUPPRESSION_PREFIX_BYTES
+        );
         assert_eq!(schema["required"], json!(["evaluation_date"]));
         assert_eq!(schema["anyOf"].as_array().map(Vec::len), Some(4));
         assert_eq!(schema["additionalProperties"], false);

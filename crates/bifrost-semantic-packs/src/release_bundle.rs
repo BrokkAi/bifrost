@@ -93,7 +93,7 @@ use brokk_bifrost_analysis::analyzer::semantic_model::{NameSelector, VersionCons
 #[cfg(feature = "download")]
 use brokk_bifrost_analysis::analyzer::semantic_model::AcquisitionReceiptRequest;
 
-pub const PACK_SPEC_SCHEMA_VERSION: u32 = 2;
+pub const PACK_SPEC_SCHEMA_VERSION: u32 = 3;
 /// Schema 4 added the `rule` and `runtime_exposure` measurement lookups
 /// (#8324). Readers that know only schema 3 reject them, so a packs release
 /// declares the schema in its `release_index` axis and older engines skip it.
@@ -277,6 +277,8 @@ pub struct PinnedTypeScriptLibrary {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PinnedRustdocCrate {
+    #[serde(default)]
+    pub origin: brokk_bifrost_analysis::analyzer::semantic_model::model::RustdocOrigin,
     pub name: String,
     pub path: String,
 }
@@ -1054,13 +1056,31 @@ fn generate_one(
                 license: spec.license.clone(),
                 safety: spec.safety.clone(),
             };
-            let production = produce_pinned_pack(
-                &spec.kind,
-                &request,
-                &producer_limits,
-                &cancellation,
-                &artifact,
-            );
+            let verified = verify_pinned_sysroot(spec, input, &artifact, &producer_limits)?;
+            let production = if let (Some(verified), PinnedPackKind::RustdocJsonSet { crates }) =
+                (&verified, &spec.kind)
+            {
+                let crates = crates
+                    .iter()
+                    .map(|c| (c.name.clone(), c.path.clone()))
+                    .collect::<Vec<_>>();
+                RustdocJsonPackProducer.produce_verified_source_set(
+                    &request,
+                    &producer_limits,
+                    Some(&cancellation),
+                    &artifact,
+                    &crates,
+                    verified,
+                )
+            } else {
+                produce_pinned_pack(
+                    &spec.kind,
+                    &request,
+                    &producer_limits,
+                    &cancellation,
+                    &artifact,
+                )
+            };
             let mut authored = production.pack.ok_or_else(|| {
                 BundleError::new(format!(
                     "pack production failed: {}",
@@ -1185,7 +1205,7 @@ fn read_authored_semantic_model(
         PinnedPackKind::AuthoredSemanticModel {
             shard_activation_pins: Some(pins),
         } => {
-            if spec.schema_version != PACK_SPEC_SCHEMA_VERSION {
+            if spec.schema_version < 2 {
                 return Err(BundleError::new(
                     "per-shard activation pins require pinned spec schema version 2",
                 ));
@@ -1593,6 +1613,82 @@ fn read_pinned_artifact(
     .map_err(|diagnostic| BundleError::new(render_diagnostics(&[diagnostic])))
 }
 
+fn verify_pinned_sysroot(
+    spec: &PinnedPackSpec,
+    input: &BundleInput,
+    artifact: &ExactArtifact,
+    limits: &ArtifactProducerLimits,
+) -> Result<
+    Option<brokk_bifrost_rust_analysis::analyzer::rust::VerifiedSysrootDocuments>,
+    BundleError,
+> {
+    use brokk_bifrost_analysis::analyzer::semantic_model::model::RustdocOrigin;
+    let PinnedPackKind::RustdocJsonSet { crates } = &spec.kind else {
+        return Ok(None);
+    };
+    // Legacy pins cannot grant authority, even if origin was explicitly supplied.
+    if spec.schema_version < 3 {
+        return Ok(None);
+    }
+    let pins = crates
+        .iter()
+        .filter_map(|c| match &c.origin {
+            RustdocOrigin::Dependency => None,
+            RustdocOrigin::ToolchainSysroot { provenance } => {
+                Some((c.path.clone(), provenance.clone()))
+            }
+        })
+        .collect::<Vec<_>>();
+    if pins.is_empty() {
+        return Ok(None);
+    }
+    let container = spec
+        .artifact
+        .container
+        .as_ref()
+        .ok_or_else(|| BundleError::new("sysroot pins require a pinned archive container"))?;
+    if pins
+        .iter()
+        .any(|(_, pin)| pin.archive_sha256 != container.sha256)
+    {
+        return Err(BundleError::new(
+            "sysroot origin must match pinned container digest",
+        ));
+    }
+    let archive_path = input
+        .artifact_path
+        .parent()
+        .ok_or_else(|| BundleError::new("artifact requires a parent directory"))?
+        .join(&container.file_name);
+    let archive_file = fs::File::open(&archive_path).map_err(|e| {
+        BundleError::new(format!(
+            "read sysroot archive {}: {e}",
+            archive_path.display()
+        ))
+    })?;
+    let mut archive = Vec::new();
+    archive_file
+        .take(limits.max_artifact_bytes.saturating_add(1))
+        .read_to_end(&mut archive)
+        .map_err(|e| {
+            BundleError::new(format!(
+                "read sysroot archive {}: {e}",
+                archive_path.display()
+            ))
+        })?;
+    if archive.len() as u64 > limits.max_artifact_bytes {
+        return Err(BundleError::new(format!(
+            "sysroot archive exceeds byte limit: {} bytes",
+            archive.len()
+        )));
+    }
+    brokk_bifrost_rust_analysis::analyzer::rust::VerifiedSysrootDocuments::verify(
+        &archive, artifact, &pins, limits,
+    )
+    .map(Some)
+    .map_err(BundleError::new)
+}
+
 fn produce_pinned_pack(
     kind: &PinnedPackKind,
     request: &ArtifactProductionRequest,
@@ -1840,7 +1936,7 @@ fn validate_spec(spec: &PinnedPackSpec, spec_path: &Path) -> Result<(), BundleEr
             spec_path.display()
         )));
     }
-    if !matches!(spec.schema_version, 1 | PACK_SPEC_SCHEMA_VERSION) {
+    if !matches!(spec.schema_version, 1 | 2 | PACK_SPEC_SCHEMA_VERSION) {
         return Err(BundleError::new(format!(
             "spec {} has unsupported schema version {}",
             spec_path.display(),
@@ -5612,6 +5708,132 @@ mod tests {
     }
 
     #[test]
+    fn v2_rustdoc_pins_have_no_sysroot_authority() {
+        use brokk_bifrost_analysis::analyzer::semantic_model::model::RustdocOrigin;
+        let crate_pin: PinnedRustdocCrate =
+            serde_json::from_value(serde_json::json!({"name":"core", "path":"core.json"})).unwrap();
+        assert_eq!(crate_pin.origin, RustdocOrigin::Dependency);
+        let mut spec = pinned_spec(
+            "fixture.std",
+            "1.0.0",
+            "cargo",
+            PinnedPackKind::RustdocJsonSet {
+                crates: vec![crate_pin],
+            },
+            PinnedArtifact {
+                file_name: "stdlib".into(),
+                sha256: "a".repeat(64),
+                url: None,
+                container: None,
+            },
+            "rust",
+            "core",
+            Vec::new(),
+        );
+        spec.schema_version = 2;
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("core.json"), b"{}").unwrap();
+        let limits = ArtifactProducerLimits::default();
+        let artifact =
+            read_exact_source_set(dir.path(), &[PathBuf::from("core.json")], 1, 8, &limits)
+                .unwrap();
+        let input = BundleInput {
+            spec_path: dir.path().join("pin.json"),
+            artifact_path: dir.path().to_owned(),
+        };
+        assert!(
+            verify_pinned_sysroot(&spec, &input, &artifact, &limits)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12357: an oversized sysroot archive was read whole before its size check"
+    )]
+    fn oversized_sysroot_archive_is_refused_through_a_bounded_read() {
+        use brokk_bifrost_analysis::analyzer::semantic_model::model::{
+            RustSysrootProvenance, RustToolchainChannel, RustToolchainIdentity, RustdocComponent,
+            RustdocOrigin,
+        };
+        let digest = "b".repeat(64);
+        let crate_pin = PinnedRustdocCrate {
+            origin: RustdocOrigin::ToolchainSysroot {
+                provenance: RustSysrootProvenance {
+                    toolchain: RustToolchainIdentity {
+                        release: "1.0.0".into(),
+                        channel: RustToolchainChannel::Stable,
+                        date: "2026-08-23".into(),
+                        commit: "0".repeat(40),
+                    },
+                    component: RustdocComponent::RustDocsJsonPreview,
+                    target: "x86_64-unknown-linux-gnu".into(),
+                    archive_sha256: digest.clone(),
+                    archive_member: "dist/rust-docs-json-preview/share/doc/rust/json/core.json"
+                        .into(),
+                },
+            },
+            name: "core".into(),
+            path: "core.json".into(),
+        };
+        let spec = pinned_spec(
+            "fixture.std",
+            "1.0.0",
+            "cargo",
+            PinnedPackKind::RustdocJsonSet {
+                crates: vec![crate_pin],
+            },
+            PinnedArtifact {
+                file_name: "stdlib".into(),
+                sha256: "a".repeat(64),
+                url: None,
+                container: Some(PinnedArtifactContainer {
+                    file_name: "rust-docs-json.tar.xz".into(),
+                    sha256: digest,
+                    url: "https://example.invalid/rust-docs-json.tar.xz".into(),
+                    artifact_path: "dist".into(),
+                }),
+            },
+            "rust",
+            "core",
+            Vec::new(),
+        );
+        assert_eq!(spec.schema_version, 3);
+        let dir = tempfile::tempdir().unwrap();
+        let stdlib = dir.path().join("stdlib");
+        fs::create_dir(&stdlib).unwrap();
+        fs::write(stdlib.join("core.json"), b"{}").unwrap();
+        let artifact = read_exact_source_set(
+            &stdlib,
+            &[PathBuf::from("core.json")],
+            1,
+            8,
+            &ArtifactProducerLimits::default(),
+        )
+        .unwrap();
+        fs::write(dir.path().join("rust-docs-json.tar.xz"), vec![0_u8; 4096]).unwrap();
+        let input = BundleInput {
+            spec_path: dir.path().join("pin.json"),
+            artifact_path: stdlib,
+        };
+        let limits = ArtifactProducerLimits {
+            max_artifact_bytes: 1024,
+            ..ArtifactProducerLimits::default()
+        };
+        let Err(error) = verify_pinned_sysroot(&spec, &input, &artifact, &limits) else {
+            panic!("an archive over the byte limit must be refused");
+        };
+        let error = error.to_string();
+        // limit + 1 bytes shows the read stopped at the bound instead of
+        // loading the whole 4096-byte file.
+        assert!(
+            error.contains("sysroot archive exceeds byte limit: 1025 bytes"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn codeql_rust_summary_release_requires_matching_stdlib_source_set() {
         let mut stdlib = pinned_spec(
             "bifrost.rust-stdlib",
@@ -5619,6 +5841,7 @@ mod tests {
             "cargo",
             PinnedPackKind::RustdocJsonSet {
                 crates: vec![PinnedRustdocCrate {
+                    origin: Default::default(),
                     name: "std".into(),
                     path: "std.json".into(),
                 }],
@@ -6066,12 +6289,12 @@ mod tests {
         );
 
         let mut unknown_version = base_spec.clone();
-        unknown_version.schema_version = 3;
+        unknown_version.schema_version = PACK_SPEC_SCHEMA_VERSION + 1;
         assert!(
             validate_spec(&unknown_version, Path::new("unknown.spec.json"))
                 .unwrap_err()
                 .to_string()
-                .contains("unsupported schema version 3")
+                .contains("unsupported schema version 4")
         );
 
         assert!(
@@ -8342,6 +8565,7 @@ mod tests {
         fs::write(root.join("core.json"), r#"{"format_version":60}"#).unwrap();
         fs::write(fixture.path().join("NOTICE.txt"), "fixture notice\n").unwrap();
         let crates = vec![PinnedRustdocCrate {
+            origin: Default::default(),
             name: "core".to_owned(),
             path: "core.json".to_owned(),
         }];

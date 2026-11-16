@@ -108,6 +108,9 @@ fn kotlin_model_outcome(
     let mut reference = site.clone();
     reference.text = target;
     DefinitionLookupOutcome {
+        selected_sites: Vec::new(),
+        inventory_evidence: None,
+        incomplete_evidence: None,
         modeled_definitions: Vec::new(),
         status: DefinitionLookupStatus::Resolved,
         reference: Some(reference),
@@ -133,7 +136,7 @@ pub(crate) fn kotlin_import_model_outcome(
     site: &ResolvedReferenceSite,
     candidate: &str,
 ) -> Option<DefinitionLookupOutcome> {
-    let overlay = analyzer.semantic_model_overlay()?;
+    let overlay = analyzer.semantic_model_overlay_read().published()?;
     let matched = overlay.symbols_named(candidate);
     if matches!(
         matched.disposition,

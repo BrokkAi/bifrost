@@ -66,7 +66,7 @@ pub(crate) fn collect_rust_semantic_diagnostics(
             Language::None,
         );
     let external = RetainedRustDependencies {
-        overlay: analyzer.semantic_model_overlay(),
+        overlay: analyzer.semantic_model_overlay_read().published(),
         discovery: analyzer.dependency_discovery_evidence(Language::Rust),
     };
     let scope = AnalyzerQueryScope::new(analyzer);

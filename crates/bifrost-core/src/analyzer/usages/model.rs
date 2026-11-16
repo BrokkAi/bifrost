@@ -507,6 +507,38 @@ pub struct UsageAnalysisDiagnostic {
     pub reason: String,
 }
 
+impl UsageAnalysisDiagnostic {
+    /// A usage query refused because the source inventory it would resolve over
+    /// is incomplete. A source the inventory missed may hold a use of the target,
+    /// so any answer would be unsound. This is not a missing canonical
+    /// publication: the cause names the inventory and the remedy says how to get
+    /// an answer. The registered `reason_kind` label stays
+    /// `unavailable_canonical_facts`; the cause leads the reason text.
+    pub fn source_inventory_incomplete(
+        fq_name: impl Into<String>,
+        strategy: &str,
+        incomplete_rows: &str,
+    ) -> Self {
+        Self {
+            fq_name: fq_name.into(),
+            strategy: strategy.to_string(),
+            reason_kind: "unavailable_canonical_facts".to_string(),
+            reason: format!(
+                "{strategy}: source_inventory_incomplete: the workspace source inventory is incomplete ({incomplete_rows}), so this query cannot prove which sources use the target and refuses instead of answering unsoundly. Run without --sources, or open a session over the full workspace, to get an answer. If a listed path is a symlink or an entry that could not be read, the sources behind it were not indexed."
+            ),
+        }
+    }
+
+    pub fn indexed_source_unavailable(files: &[ProjectFile]) -> Self {
+        Self {
+            fq_name: String::new(),
+            strategy: "source_admission".to_string(),
+            reason_kind: "indexed_source_unavailable".to_string(),
+            reason: format!("indexed sources unavailable: {files:?}"),
+        }
+    }
+}
+
 /// Outcome of a usage analyzer's `find_usages`.
 ///
 /// Modelled after the brokk Java sealed interface `FuzzyResult`. The raw enum keeps the

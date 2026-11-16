@@ -69,6 +69,11 @@ of an older version parse every pack that it accepts by number.
 | 30 | `tuple_fields` on Rust struct facts: every ordinal is public with a reference to a same-shard, public field member named by decimal position and a structured type, or opaque with its visibility reason. Absence means unknown; completeness is derived only when every slot is public and the owner is neither hidden nor non-exhaustive. Schema 29 carries the SQLx facade re-export carrier. | `declaration.tuple_fields_schema_version` |
 | 31 | Reviewed Rust destruction: `drop_effects` and the required `drop_review` scope on Rust struct and enum facts. | `declaration.drop_effects_schema_version` |
 | 32 | Optional `alias_target` on type aliases, expressed over their own parameters. | `declaration.alias_target_schema_version` |
+| 35 | Optional typed `path` on summary inputs and outputs. | `summary.endpoint_projection_schema_version` |
+| 37 | Summarized indexed `element` steps on summary endpoint paths. | `summary.element_projection_schema_version` |
+| 38 | Verified Rust toolchain sysroot receipts on compiled extraction. Authored and curated packs cannot carry them. | `extraction.schema_version` |
+| 39 | A Rust trait member's signature may name the trait's implicit `Self` as a type parameter. | `signature.trait_self_schema_version` |
+| 40 | Optional `rust_stability` on Rust types, members and implemented-trait facts: stable release, unstable feature set, or uncertified. Non-Rust packs cannot carry this field. | `declaration.rust_stability_schema_version`, `declaration.rust_stability_language` |
 
 A declaration payload can record its provider's `assembly_identity` and a
 `type_forwards` vector. Forward names retain CLR spelling, including generic
@@ -86,12 +91,12 @@ forward rows.
 ### JSON schema files
 
 The generated JSON schema is
-[`schemas/semantic-model-pack-v32.schema.json`](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-pack-v32.schema.json).
+[`schemas/semantic-model-pack-v40.schema.json`](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-pack-v40.schema.json).
 `cargo run --profile measure --example generate_semantic_model_schema` writes it from the Rust
 type `AuthoredSemanticModelPack`, and a repository test requires the
 checked-in file to match the generated schema exactly. The file describes
 every field of every supported version, and it accepts `schema_version` from
-`2` through `22` and `26` through `32`, and rejects `23` through `25`. It
+`2` through `22` and `26` through `40`, and rejects `23` through `25`. It
 requires `compatibility.bifrost` for versions `2` through `7` and forbids it
 for versions `8` and newer. It does not express the other per-field version
 gates in the table above; the validator enforces them.
@@ -108,7 +113,7 @@ fields. Every variant is tagged by a `kind` (or `op`) field.
 
 | Field | Type | Required | Meaning |
 | --- | --- | --- | --- |
-| `schema_version` | integer, 2 to 22, 26 to 30 | yes | The pack format version. See [Schema versions](#schema-versions). |
+| `schema_version` | integer, 2 to 22, 26 to 40 | yes | The pack format version. See [Schema versions](#schema-versions). |
 | `pack_id` | stable ID | yes | The pack identity. |
 | `version` | SemVer version | yes | The pack version. |
 | `producer` | `{name, version}` | yes | The tool that produced the pack. `name` is non-empty text; `version` is a SemVer version. |
@@ -130,7 +135,7 @@ Compiled schema-19 manifests and shard envelopes may contain `extraction`:
 paths supply this claim in memory; authored documents reject the field. Every
 shard must agree with its manifest. Both semantic digests include the claim,
 and older or curated packs without it have no extraction authority. The
-[compiled-manifest schema](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-compiled-manifest-v32.schema.json)
+[compiled-manifest schema](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-compiled-manifest-v37.schema.json)
 describes this envelope separately from the authoring format.
 
 A **stable ID** is 1 to 256 bytes of lowercase ASCII letters, digits, `.`,
@@ -296,7 +301,7 @@ effects; those require separate behavior evidence.
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `parameters` | list of `Parameter` | `[]` | Formal parameters, in order. Order is significant. |
-| `returns` | [`TypeRef`](#typeref) | absent | The return type. Absent means no return type is recorded. |
+| `returns` | [`TypeRef`](#typeref) | absent | The return type. Absent means the callable declares no results; use `unknown` for a declared result whose type is unknown. |
 | `type_parameters` | list of names | `[]` | Generic parameters of the member. |
 
 `Parameter`:
@@ -336,6 +341,15 @@ type. A bare `named` spelling of a Go universe type means the universe type.
 | `wildcard` | `variance` (`any`, `extends`, or `super`), `bound` | A wildcard. `extends` and `super` require `bound`; `any` forbids it. |
 | `tuple` | `elements` | A tuple type. Empty elements represent Rust unit `()` at schema 18; other languages require at least one element. |
 | `function` | `parameters` (list of `Parameter`), `result` (optional `TypeRef`) | A function type. |
+
+A Rust return of `Self` carries the owner's type parameters as `type_parameter`
+arguments: `Mutex::new` in `impl<T> Mutex<T>` returns
+`declared{Mutex, [type_parameter T]}`. The in-repo rustdoc producer writes it
+this way. Consumers bind the receiver's written arguments to those parameters,
+for example `Mutex::<()>::new(())` returns `Mutex<()>`. Empty `arguments` on an
+owner that has type parameters mean elided or defaulted arguments, not `Self`:
+a consumer pads them from the owner's `type_parameter_defaults` and otherwise
+treats them as unknown, so the result is refused rather than guessed.
 
 ### Locator
 
@@ -660,8 +674,8 @@ do not bind exactly. Summary claims cannot reference a rest formal itself.
 
 | `kind` | Fields | Meaning |
 | --- | --- | --- |
-| `receiver` | none | The receiver. The target must have `has_receiver: true`. |
-| `parameter` | `ordinal` (0 to 65,535) | A zero-based parameter. The ordinal must be less than `parameter_count`. |
+| `receiver` | optional `path` | The receiver. The target must have `has_receiver: true`. |
+| `parameter` | `ordinal` (0 to 65,535), optional `path` | A zero-based parameter. The ordinal must be less than `parameter_count`. |
 
 `AuthoredSummaryOutput` (tagged by `kind`):
 
@@ -669,10 +683,82 @@ do not bind exactly. Summary claims cannot reference a rest formal itself.
 | --- | --- | --- |
 | `normal_return` | none | The normal return value. |
 | `indexed_normal_return` | `ordinal` | One normal result of a multi-result procedure. Requires `normal_result_count`, and `ordinal` must be less than it. |
-| `receiver` | none | The receiver. |
+| `receiver` | optional `path` | The receiver. |
 | `capture` | `location` | A declared `capture` location. |
 | `heap` | `location` | A declared `heap` location. |
 | `exceptional_return` | none | The exceptional exit. |
+
+### Endpoint paths (schemas 35 and 37)
+
+Both input kinds (`receiver` and `parameter`) and every output kind accept an
+optional `path`. Omit it to select the whole value. A path selects one part of
+that value, in order, using these JSON steps:
+
+| Step | JSON | Meaning |
+| --- | --- | --- |
+| Tuple field | `{"tuple":0}` | Select the zero-based tuple field. |
+| Named field | `{"named":"field"}` | Select the named field. |
+| Indexed element (schema 37) | `"element"` | Select a summarized indexed element, with unknown-index certainty. |
+| Enum variant | `{"variant":{"declaration":"<stable member id>"}}` | Select the variant's payload-field tuple using its stable member identity. |
+
+For a `Result` return, select the `Ok` payload with a variant step followed by
+`tuple(0)`. Here `result.Ok` stands for the actual stable member ID of `Ok`:
+
+```json
+{"kind":"normal_return","path":[{"variant":{"declaration":"result.Ok"}},{"tuple":0}]}
+```
+
+If that payload is itself a tuple, append another tuple step to select one
+of its fields. For example, its second field uses:
+
+```json
+{"kind":"normal_return","path":[{"variant":{"declaration":"result.Ok"}},{"tuple":0},{"tuple":1}]}
+```
+
+Paths require schema `35` (`SUMMARY_ENDPOINT_PROJECTION_MIN_SCHEMA_VERSION`).
+An engine whose highest supported schema is below 35 refuses the whole pack.
+Element steps require schema 37 (`SUMMARY_ELEMENT_PROJECTION_MIN_SCHEMA_VERSION`);
+schema 35 does not admit them. The selected declared type must establish array
+or slice elements, or an unconditional authoritative Iterator/IntoIterator Item
+binding. Missing or conditional evidence produces typed incompleteness. Element
+locations use summarized indices rather than exact field identities.
+Decode checks that paths are well formed and meet their introducing schema floor. Activation
+type-checks each path against the bound authoritative declaration's receiver,
+parameter, or return type. An unbound target or a failed check refuses that one
+transfer with a typed diagnostic naming the pack and record; the rest of the
+pack still applies. Run activation in pack CI against the pinned
+standard-library pack so authors see errors before release. The activation
+snapshot exposes `summary_endpoint_projection_diagnostics()`; pack CI must
+reject a release when this list is nonempty, even when other claims activated.
+
+An input path uses the ordinary field-read rule: a tainted whole value covers
+an exact component read beneath that same value. A known tainted component
+also satisfies a read of that component when the whole value is clean; it does
+not taint a sibling or create a whole-value fact. An output path writes only
+its selected destination. The engine does not expand a whole-value output
+transfer into transfers to every field. Author an exact destination path when
+only one component depends on the input.
+
+A whole input consumes known components even when the summary has no projected
+input sibling. Carrying a demanded member path through a whole-value transfer
+requires an explicit `value_transfer` proof: `copy`, `aggregate_copy`, `move`,
+or an `identity` conversion. A `preserving` conversion can change member
+identities, and boxing or unboxing shifts the path, so these profiles do not
+supply that proof. An absent or insufficient profile leaves the component
+demand incomplete; the engine never guesses that field positions agree.
+
+Activation verifies declaration paths, not every caller's binding. A call whose
+argument or receiver binding remains unknown stays incomplete. Consuming known
+components through a whole input requires a proven, complete model; an unclosed
+model does not create component inputs by guessing.
+
+This first stage connects modeled output paths to modeled input paths, such as
+those on `unwrap` and `unwrap_err`, then supports ordinary tuple-field reads.
+Rust is the first supported language for endpoint paths; other languages refuse
+projected transfers with `UnsupportedLanguage` until their adapter supports them.
+Native `match` and `if let` variant-pattern integration is outside this stage.
+Variant steps are allowed on summary endpoints, but are forbidden in persisted
+guarded-pattern IR.
 
 ### Transfers
 
@@ -1343,13 +1429,14 @@ The optional `ACTIVATION.json` argument of `list`:
 ### Pinned pack specs
 
 `generate` reads one pinned spec per artifact. A spec is JSON with
-`schema_version` `1` or `2` and rejects unknown fields. Version `1` is the
-legacy pinned input schema. Version `2` adds optional per-shard activation
-pins for authored semantic models.
+`schema_version` `1`, `2`, or `3` and rejects unknown fields. Version `1` is
+the legacy pinned input schema. Version `2` adds optional per-shard activation
+pins for authored semantic models. Version `3` adds optional per-document
+origin to `rustdoc_json_set` pins.
 
 | Field | Meaning |
 | --- | --- |
-| `schema_version` | Must be `1` or `2`. Version `1` does not accept `shard_activation_pins`. |
+| `schema_version` | Must be `1`, `2`, or `3`. Version `1` does not accept `shard_activation_pins`. |
 | `pack_id`, `pack_version`, `ecosystem` | The pack identity. |
 | `kind` | The producer family, tagged by `artifact_kind` (table below). |
 | `artifact` | `{file_name, sha256, url?, container?}`. `container` is `{file_name, sha256, url, artifact_path}` when the artifact is inside another archive. |
@@ -1390,7 +1477,7 @@ and configurations to the compiled output; this does not relax input matching.
 | `type_script_library_set` | `manifest`, `libraries` (`[{name, path}]`) | A set of TypeScript library files. |
 | `dot_net_assembly` | none | A .NET assembly. |
 | `rustdoc_json` | none | One rustdoc JSON file. |
-| `rustdoc_json_set` | `crates` (`[{name, path}]`) | Several rustdoc JSON files. |
+| `rustdoc_json_set` | `crates` (`[{name, path, origin?}]`) | Several rustdoc JSON files. `origin` is `dependency` by default, or `toolchain_sysroot` with verified archive provenance. |
 | `python_stub` | `stubs` (relative seed `.pyi` paths) | A pinned stub tree; local imports determine the loaded closure. |
 | `authored_semantic_model` | `shard_activation_pins` (optional in spec version `2`; exact complete per-shard selector list) | An authored pack source, compiled directly. |
 | `npm_package` | `manifest`, `declarations` (`[{module, path}]`) | An npm package manifest and its declaration files. |
@@ -1398,6 +1485,14 @@ and configurations to the compiled output; this does not relax input matching.
 | `ruby_gem_archive` | none | A `.gem` archive. |
 | `composer_package` | `rules` (tagged by `rule`: `psr4` with `namespace_prefix` and `files`; `classmap` with `files`; `files` with `files`) | A Composer package source set. |
 | `php_declaration_stub` | `stubs` (relative `.php` paths) | A tree of PHP declaration stubs. |
+
+Pin spec version 3 adds `origin` to each `rustdoc_json_set` crate. An omitted
+origin reads as `dependency`, so version-1 and version-2 pins keep their
+existing behavior. `toolchain_sysroot` carries the toolchain release, channel,
+date and commit, component, target, archive SHA-256, and archive member. The
+producer verifies the pinned container digest and the selected member bytes
+before granting cross-document sysroot correspondence. An authored or curated
+pack cannot carry that receipt.
 
 For `python_stub`, the artifact directory is an import root, such as a pinned
 typeshed `stdlib` tree. Generation follows AST imports, including module aliases,
@@ -1444,9 +1539,9 @@ this build supports. A host passes it to pack selection tools.
 | `schemas.policy_document` | Supported policy document versions. |
 | `schemas.rql` | Supported RQL schema versions. |
 | `schemas.builtin_catalog` | Supported built-in policy catalog versions. |
-| `schemas.semantic_model_read` | `[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]`. |
-| `schemas.semantic_model_write` | `[17]`, the newest version. Generated packs may declare a lower one. |
-| `schemas.release_index` | `[3]`, the release bundle index version. |
+| `schemas.semantic_model_read` | `[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 26, 27, 28, 29, 30, 31, 32, 35, 37, 38, 39, 40]`. |
+| `schemas.semantic_model_write` | `[22]`, the newest version. Generated packs may declare a lower one. |
+| `schemas.release_index` | `[3, 4]`, the readable release bundle index versions. |
 | `schemas.policy_bundle`, `schemas.semantic_spec`, `schemas.runtime` | Empty lists. |
 | `capabilities` | Always an empty list. This build advertises no pack capability requirements. |
 

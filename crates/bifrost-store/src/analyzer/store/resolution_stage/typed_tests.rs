@@ -195,7 +195,7 @@ fn stage_body_decoder_retains_raw_completion_and_independent_observation() {
         let body = serde_json::to_string(&json!([
             0,
             [],
-            completion_value(&completion),
+            completion_value(&completion).unwrap(),
             [],
             null,
             null,

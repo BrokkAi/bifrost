@@ -34,17 +34,29 @@ pub struct SourceAnchors {
 impl SourceAnchors {
     pub fn retained_bytes_lower_bound(&self) -> usize {
         std::mem::size_of::<Self>()
-            .saturating_add(self.anchors.capacity().saturating_mul(std::mem::size_of::<(
-                SourceRecordIdentity,
-                SemanticModelAuthoredAnchor,
-            )>()))
+            .saturating_add(brokk_bifrost_core::allocation_size::allocation_size(
+                self.anchors.capacity().saturating_mul(std::mem::size_of::<(
+                    SourceRecordIdentity,
+                    SemanticModelAuthoredAnchor,
+                )>()),
+            ))
             .saturating_add(self.anchors.iter().fold(0usize, |bytes, (key, anchor)| {
                 bytes
-                    .saturating_add(key.pack_digest.capacity())
-                    .saturating_add(key.record_kind.capacity())
-                    .saturating_add(key.record_id.capacity())
-                    .saturating_add(anchor.path.capacity())
-                    .saturating_add(anchor.symbol.capacity())
+                    .saturating_add(brokk_bifrost_core::allocation_size::allocation_size(
+                        key.pack_digest.capacity(),
+                    ))
+                    .saturating_add(brokk_bifrost_core::allocation_size::allocation_size(
+                        key.record_kind.capacity(),
+                    ))
+                    .saturating_add(brokk_bifrost_core::allocation_size::allocation_size(
+                        key.record_id.capacity(),
+                    ))
+                    .saturating_add(brokk_bifrost_core::allocation_size::allocation_size(
+                        anchor.path.capacity(),
+                    ))
+                    .saturating_add(brokk_bifrost_core::allocation_size::allocation_size(
+                        anchor.symbol.capacity(),
+                    ))
             }))
     }
 
@@ -80,6 +92,12 @@ impl SourceAnchors {
         self.anchors
             .keys()
             .any(|key| other.anchors.contains_key(key))
+    }
+
+    /// Every authored path these anchors name. Complete: a prefix or
+    /// containment question scans all of them, and the caller owns the bound.
+    pub fn authored_paths(&self) -> impl Iterator<Item = &str> {
+        self.anchors.values().map(|anchor| anchor.path.as_str())
     }
 
     pub fn ids_at_path(&self, path: &str) -> Vec<String> {
@@ -182,7 +200,10 @@ pub struct SearchCandidateKey {
 
 impl RetainedBytes for SearchCandidateKey {
     fn retained_bytes(&self) -> usize {
-        std::mem::size_of::<Self>() + self.realm.as_ref().map_or(0, String::capacity)
+        std::mem::size_of::<Self>()
+            + self.realm.as_ref().map_or(0, |value| {
+                brokk_bifrost_core::allocation_size::allocation_size(value.capacity())
+            })
     }
 }
 
@@ -225,25 +246,32 @@ impl RetainedBytes for ComposedGroupCacheKey {
 impl RetainedBytes for CompositionDiscoveryCacheKey {
     fn retained_bytes(&self) -> usize {
         std::mem::size_of_val(self)
-            + self.realm.as_ref().map_or(0, String::capacity)
+            + self.realm.as_ref().map_or(0, |value| {
+                brokk_bifrost_core::allocation_size::allocation_size(value.capacity())
+            })
             + match &self.lookup {
                 CompositionLookup::SelectedId { language, id } => {
-                    language.capacity() + id.capacity()
+                    brokk_bifrost_core::allocation_size::allocation_size(language.capacity())
+                        + brokk_bifrost_core::allocation_size::allocation_size(id.capacity())
                 }
                 CompositionLookup::SelectedName { language, name } => {
-                    language.capacity() + name.capacity()
+                    brokk_bifrost_core::allocation_size::allocation_size(language.capacity())
+                        + brokk_bifrost_core::allocation_size::allocation_size(name.capacity())
                 }
                 CompositionLookup::OwnerIdentity(key) => group_owned_bytes(key),
                 CompositionLookup::RecordId(s)
                 | CompositionLookup::Name(s)
                 | CompositionLookup::MembersOf(s)
                 | CompositionLookup::Uri(s)
-                | CompositionLookup::AuthoredPath(s) => s.capacity(),
+                | CompositionLookup::AuthoredPath(s) => {
+                    brokk_bifrost_core::allocation_size::allocation_size(s.capacity())
+                }
             }
     }
 }
 fn group_owned_bytes(key: &CompositionGroupKey) -> usize {
-    key.language.capacity() + key.identity.capacity()
+    brokk_bifrost_core::allocation_size::allocation_size(key.language.capacity())
+        + brokk_bifrost_core::allocation_size::allocation_size(key.identity.capacity())
 }
 impl RetainedBytes for CompositionGroupKey {
     fn retained_bytes(&self) -> usize {
@@ -252,7 +280,7 @@ impl RetainedBytes for CompositionGroupKey {
 }
 impl RetainedBytes for ComposedGroup {
     fn retained_bytes(&self) -> usize {
-        let mut heap = RetainedHeap::default();
+        let mut heap = RetainedHeap::allocated();
         heap.add(std::mem::size_of_val(self));
         heap.vec(&self.symbols);
         heap.vec(&self.source_indices);
@@ -263,30 +291,36 @@ impl RetainedBytes for ComposedGroup {
         }
         for (_, relation) in &self.relations {
             for s in [&relation.id, &relation.kind, &relation.from, &relation.to] {
-                heap.add(s.capacity());
+                heap.add(heap.allocation_bytes(s.capacity()));
             }
             if let Some((from, to)) = &relation.pre_composition_endpoints {
-                heap.add(from.capacity() + to.capacity());
+                heap.add(
+                    heap.allocation_bytes(from.capacity()) + heap.allocation_bytes(to.capacity()),
+                );
             }
             charge_provenance(&relation.provenance, &mut heap);
         }
         for d in &self.diagnostics {
-            heap.add(d.pack_id.capacity() + d.declaration_id.capacity() + d.artifact_id.capacity());
+            heap.add(
+                heap.allocation_bytes(d.pack_id.capacity())
+                    + heap.allocation_bytes(d.declaration_id.capacity())
+                    + heap.allocation_bytes(d.artifact_id.capacity()),
+            );
             heap.add(
                 d.conflicting_artifact_id
                     .as_ref()
-                    .map_or(0, String::capacity),
+                    .map_or(0, |value| heap.allocation_bytes(value.capacity())),
             );
         }
         heap.add(
             self.representative
                 .representative_id
                 .as_ref()
-                .map_or(0, String::capacity),
+                .map_or(0, |value| heap.allocation_bytes(value.capacity())),
         );
         heap.vec(&self.representative.replacements);
         for (from, to) in &self.representative.replacements {
-            heap.add(from.capacity() + to.capacity());
+            heap.add(heap.allocation_bytes(from.capacity()) + heap.allocation_bytes(to.capacity()));
         }
         heap.total()
     }
@@ -295,7 +329,7 @@ impl RetainedBytes for ComposedGroup {
 fn charge_strings(values: &Vec<String>, heap: &mut RetainedHeap) {
     heap.vec(values);
     for value in values {
-        heap.add(value.capacity());
+        heap.add(heap.allocation_bytes(value.capacity()));
     }
 }
 fn charge_provenance(p: &SemanticModelProvenance, heap: &mut RetainedHeap) {
@@ -308,37 +342,52 @@ fn charge_provenance(p: &SemanticModelProvenance, heap: &mut RetainedHeap) {
         &p.producer_version,
         &p.record_id,
     ] {
-        heap.add(s.capacity());
+        heap.add(heap.allocation_bytes(s.capacity()));
     }
-    heap.add(p.rule_id.as_ref().map_or(0, String::capacity));
+    heap.add(
+        p.rule_id
+            .as_ref()
+            .map_or(0, |value| heap.allocation_bytes(value.capacity())),
+    );
     if let Some(extraction) = &p.extraction {
         heap.add(match &extraction.inputs {
-            ArtifactExtractionInputs::Single { sha256 } => sha256.capacity(),
-            ArtifactExtractionInputs::SourceSet { digest } => digest.capacity(),
+            ArtifactExtractionInputs::Single { sha256 } => heap.allocation_bytes(sha256.capacity()),
+            ArtifactExtractionInputs::SourceSet { digest } => {
+                heap.allocation_bytes(digest.capacity())
+            }
         });
     }
     let a = &p.activation;
     for s in [&a.status, &a.reason, &a.source_kind, &a.source_id] {
-        heap.add(s.capacity());
+        heap.add(heap.allocation_bytes(s.capacity()));
     }
     let e = &a.matched_evidence;
-    heap.add(e.language.capacity() + e.ecosystem.capacity());
+    heap.add(
+        heap.allocation_bytes(e.language.capacity())
+            + heap.allocation_bytes(e.ecosystem.capacity()),
+    );
     for c in [&e.package, &e.module, &e.toolchain].into_iter().flatten() {
-        heap.add(c.name.capacity() + c.version.as_ref().map_or(0, String::capacity));
+        heap.add(
+            heap.allocation_bytes(c.name.capacity())
+                + c.version
+                    .as_ref()
+                    .map_or(0, |value| heap.allocation_bytes(value.capacity())),
+        );
     }
     for s in [&e.target, &e.configuration, &e.artifact_sha256]
         .into_iter()
         .flatten()
     {
-        heap.add(s.capacity());
+        heap.add(heap.allocation_bytes(s.capacity()));
     }
 }
-fn charge_symbol(s: &SemanticModelSymbol, heap: &mut RetainedHeap) {
+#[doc(hidden)]
+pub fn charge_symbol(s: &SemanticModelSymbol, heap: &mut RetainedHeap) {
     if let Some(mark) = &s.promoted_from {
-        heap.add(mark.declaring_member_id.capacity());
+        heap.add(heap.allocation_bytes(mark.declaring_member_id.capacity()));
     }
     for v in [&s.id, &s.name, &s.qualified_name, &s.language] {
-        heap.add(v.capacity());
+        heap.add(heap.allocation_bytes(v.capacity()));
     }
     for v in [
         &s.pre_composition_qualified_name,
@@ -351,7 +400,7 @@ fn charge_symbol(s: &SemanticModelSymbol, heap: &mut RetainedHeap) {
     .into_iter()
     .flatten()
     {
-        heap.add(v.capacity());
+        heap.add(heap.allocation_bytes(v.capacity()));
     }
     heap.vec(&s.semantic_contributors);
     for p in &s.semantic_contributors {
@@ -359,7 +408,11 @@ fn charge_symbol(s: &SemanticModelSymbol, heap: &mut RetainedHeap) {
     }
     charge_provenance(&s.provenance, heap);
     if let Some(scope) = &s.rust_generated_scope {
-        heap.add(std::mem::size_of_val(&**scope) + scope.file.capacity() + scope.module.capacity());
+        heap.add(
+            heap.allocation_bytes(std::mem::size_of_val(&**scope))
+                + heap.allocation_bytes(scope.file.capacity())
+                + heap.allocation_bytes(scope.module.capacity()),
+        );
     }
     charge_strings(&s.aliases, heap);
     let mut types = Vec::new();
@@ -375,12 +428,15 @@ fn charge_symbol(s: &SemanticModelSymbol, heap: &mut RetainedHeap) {
     types.extend(s.extension_receiver.as_ref());
     heap.vec(&s.type_parameter_constraints);
     for c in &s.type_parameter_constraints {
-        heap.add(c.parameter.capacity() + c.constraint.display.capacity());
+        heap.add(
+            heap.allocation_bytes(c.parameter.capacity())
+                + heap.allocation_bytes(c.constraint.display.capacity()),
+        );
         heap.vec(&c.constraint.referenced_types);
         types.extend(&c.constraint.referenced_types);
     }
     if let Some(t) = &s.underlying_type {
-        heap.add(t.display.capacity());
+        heap.add(heap.allocation_bytes(t.display.capacity()));
         heap.vec(&t.referenced_types);
         types.extend(&t.referenced_types);
     }
@@ -389,7 +445,7 @@ fn charge_symbol(s: &SemanticModelSymbol, heap: &mut RetainedHeap) {
     if let Some(TypeCopySemantics::ViaMember { member }) =
         s.value_semantics.as_ref().and_then(|v| v.copy.as_ref())
     {
-        heap.add(member.capacity());
+        heap.add(heap.allocation_bytes(member.capacity()));
     }
     if let Some(signature) = &s.structured_signature {
         charge_strings(&signature.type_parameters, heap);
@@ -397,19 +453,22 @@ fn charge_symbol(s: &SemanticModelSymbol, heap: &mut RetainedHeap) {
         types.extend(signature.returns.as_ref());
     }
     match &s.location {
-        SemanticModelLocation::Authored(a) => heap.add(a.path.capacity() + a.symbol.capacity()),
-        SemanticModelLocation::Model(m) => heap.add(m.uri.capacity()),
+        SemanticModelLocation::Authored(a) => heap.add(
+            heap.allocation_bytes(a.path.capacity()) + heap.allocation_bytes(a.symbol.capacity()),
+        ),
+        SemanticModelLocation::Model(m) => heap.add(heap.allocation_bytes(m.uri.capacity())),
     }
     charge_type_refs(types, heap);
 }
 
 /// Charge the heap that type trees own below the given roots. The roots'
 /// inline size belongs to their owner and is not charged here.
-pub(crate) fn charge_type_refs(mut types: Vec<&TypeRef>, heap: &mut RetainedHeap) {
+#[doc(hidden)]
+pub fn charge_type_refs(mut types: Vec<&TypeRef>, heap: &mut RetainedHeap) {
     while let Some(t) = types.pop() {
         match t {
             TypeRef::Unknown => {}
-            TypeRef::TypeParameter { name } => heap.add(name.capacity()),
+            TypeRef::TypeParameter { name } => heap.add(heap.allocation_bytes(name.capacity())),
             TypeRef::Named {
                 name, arguments, ..
             }
@@ -418,7 +477,7 @@ pub(crate) fn charge_type_refs(mut types: Vec<&TypeRef>, heap: &mut RetainedHeap
                 arguments,
                 ..
             } => {
-                heap.add(name.capacity());
+                heap.add(heap.allocation_bytes(name.capacity()));
                 heap.vec(arguments);
                 types.extend(arguments);
             }
@@ -428,10 +487,11 @@ pub(crate) fn charge_type_refs(mut types: Vec<&TypeRef>, heap: &mut RetainedHeap
                 name,
                 arguments,
             } => {
-                heap.add(std::mem::size_of_val(&**owner) + name.capacity());
+                heap.add_allocation(std::mem::size_of_val(&**owner));
+                heap.add(heap.allocation_bytes(name.capacity()));
                 types.push(owner);
                 if let Some(t) = trait_type {
-                    heap.add(std::mem::size_of_val(&**t));
+                    heap.add_allocation(std::mem::size_of_val(&**t));
                     types.push(t);
                 }
                 heap.vec(arguments);
@@ -442,20 +502,22 @@ pub(crate) fn charge_type_refs(mut types: Vec<&TypeRef>, heap: &mut RetainedHeap
             | TypeRef::Pointer { element }
             | TypeRef::Slice { element }
             | TypeRef::Channel { element, .. } => {
-                heap.add(std::mem::size_of_val(&**element));
+                heap.add_allocation(std::mem::size_of_val(&**element));
                 types.push(element);
             }
             TypeRef::FixedArray { element, length } => {
-                heap.add(std::mem::size_of_val(&**element) + length.capacity());
+                heap.add_allocation(std::mem::size_of_val(&**element));
+                heap.add(heap.allocation_bytes(length.capacity()));
                 types.push(element);
             }
             TypeRef::Map { key, value } => {
-                heap.add(std::mem::size_of_val(&**key) + std::mem::size_of_val(&**value));
+                heap.add_allocation(std::mem::size_of_val(&**key));
+                heap.add_allocation(std::mem::size_of_val(&**value));
                 types.extend([&**key, &**value]);
             }
             TypeRef::Wildcard { bound, .. } => {
                 if let Some(t) = bound {
-                    heap.add(std::mem::size_of_val(&**t));
+                    heap.add_allocation(std::mem::size_of_val(&**t));
                     types.push(t);
                 }
             }
@@ -466,7 +528,7 @@ pub(crate) fn charge_type_refs(mut types: Vec<&TypeRef>, heap: &mut RetainedHeap
             TypeRef::Function { parameters, result } => {
                 charge_parameters(parameters, heap, &mut types);
                 if let Some(t) = result {
-                    heap.add(std::mem::size_of_val(&**t));
+                    heap.add_allocation(std::mem::size_of_val(&**t));
                     types.push(t);
                 }
             }
@@ -480,7 +542,11 @@ fn charge_parameters<'a>(
 ) {
     heap.vec(parameters);
     for p in parameters {
-        heap.add(p.name.as_ref().map_or(0, String::capacity));
+        heap.add(
+            p.name
+                .as_ref()
+                .map_or(0, |value| heap.allocation_bytes(value.capacity())),
+        );
         types.push(&p.r#type);
     }
 }
@@ -542,14 +608,17 @@ impl RetainedBytes for SemanticOverlayBuildIdentity {
 }
 impl RetainedBytes for SearchCandidateStream {
     fn retained_bytes(&self) -> usize {
-        let mut heap = RetainedHeap::default();
+        let mut heap = RetainedHeap::allocated();
         heap.add(std::mem::size_of_val(self));
         heap.vec(&self.candidates);
         for c in &self.candidates {
             for s in [&c.0, &c.2, &c.3, &c.6, &c.7, &c.8, &c.9] {
-                heap.add(s.capacity());
+                heap.add(heap.allocation_bytes(s.capacity()));
             }
-            heap.add(c.1.as_ref().map_or(0, String::capacity));
+            heap.add(
+                c.1.as_ref()
+                    .map_or(0, |value| heap.allocation_bytes(value.capacity())),
+            );
         }
         heap.vec(&self.groups);
         for group in &self.groups {
@@ -557,7 +626,7 @@ impl RetainedBytes for SearchCandidateStream {
             for set in [&group.identities, &group.standalone, &group.members] {
                 heap.hash_set(set);
                 for s in set {
-                    heap.add(s.capacity());
+                    heap.add(heap.allocation_bytes(s.capacity()));
                 }
             }
         }
@@ -565,23 +634,35 @@ impl RetainedBytes for SearchCandidateStream {
         for seeds in &self.seeds_by_group {
             heap.vec(seeds);
             for (language, owner) in seeds {
-                heap.add(language.capacity() + owner.capacity());
+                heap.add(
+                    heap.allocation_bytes(language.capacity())
+                        + heap.allocation_bytes(owner.capacity()),
+                );
             }
         }
         heap.vec(&self.single_contributors);
         for digest in self.single_contributors.iter().flatten() {
-            heap.add(digest.capacity());
+            heap.add(heap.allocation_bytes(digest.capacity()));
         }
         heap.map(&self.owner_qualifications);
         for ((realm, id), name) in &self.owner_qualifications {
-            heap.add(realm.capacity() + id.capacity() + name.as_ref().map_or(0, String::capacity));
+            heap.add(
+                heap.allocation_bytes(realm.capacity())
+                    + heap.allocation_bytes(id.capacity())
+                    + name
+                        .as_ref()
+                        .map_or(0, |value| heap.allocation_bytes(value.capacity())),
+            );
         }
         heap.vec(&self.orphans);
         for ((language, owner), spellings) in &self.orphans {
-            heap.add(language.capacity() + owner.capacity());
+            heap.add(
+                heap.allocation_bytes(language.capacity())
+                    + heap.allocation_bytes(owner.capacity()),
+            );
             heap.vec(spellings);
             for s in spellings {
-                heap.add(s.capacity());
+                heap.add(heap.allocation_bytes(s.capacity()));
             }
         }
         heap.total()

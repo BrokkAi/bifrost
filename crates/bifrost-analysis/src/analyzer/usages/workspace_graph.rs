@@ -777,30 +777,17 @@ impl WorkspaceUsageRankingGraph {
     }
 
     pub(crate) fn retained_bytes(&self) -> usize {
+        use brokk_bifrost_core::hash::{allocated_table_slot_bytes, allocated_vec_slot_bytes};
         let mut retained = std::mem::size_of::<Self>()
-            .saturating_add(
-                self.nodes
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<WorkspaceUsageRankingNode>()),
-            )
-            .saturating_add(
-                self.edges
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<WorkspaceUsageEdge>()),
-            )
-            .saturating_add(
-                self.node_indices_by_file
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<(ProjectFile, Vec<usize>)>()),
-            );
+            .saturating_add(allocated_vec_slot_bytes(&self.nodes))
+            .saturating_add(allocated_vec_slot_bytes(&self.edges))
+            .saturating_add(allocated_table_slot_bytes::<(ProjectFile, Vec<usize>)>(
+                self.node_indices_by_file.capacity(),
+            ));
         for node in &self.nodes {
             retained = retained
                 .saturating_add(project_file_retained_bytes(&node.primary_file))
-                .saturating_add(
-                    node.seed_files
-                        .capacity()
-                        .saturating_mul(std::mem::size_of::<ProjectFile>()),
-                );
+                .saturating_add(allocated_vec_slot_bytes(&node.seed_files));
             for file in &node.seed_files {
                 retained = retained.saturating_add(project_file_retained_bytes(file));
             }
@@ -808,20 +795,14 @@ impl WorkspaceUsageRankingGraph {
         for (file, indices) in &self.node_indices_by_file {
             retained = retained
                 .saturating_add(project_file_retained_bytes(file))
-                .saturating_add(
-                    indices
-                        .capacity()
-                        .saturating_mul(std::mem::size_of::<usize>()),
-                );
+                .saturating_add(allocated_vec_slot_bytes(indices));
         }
         retained
     }
 }
 
 fn project_file_retained_bytes(file: &ProjectFile) -> usize {
-    std::mem::size_of::<ProjectFile>()
-        .saturating_add(file.root().as_os_str().len())
-        .saturating_add(file.rel_path().as_os_str().len())
+    std::mem::size_of::<ProjectFile>().saturating_add(file.allocated_heap_bytes())
 }
 
 #[doc(hidden)]
@@ -874,7 +855,9 @@ pub fn build_workspace_usage_graph_with_passes(
     // for exactly the reason the preflight exists to report.
     // `source_file_inventory` is the listing that keeps such a file, and it
     // reads the project's shared file listing rather than the store.
-    let analyzable_files = analyzer.source_file_inventory().rows;
+    let inventory = crate::analyzer::i_analyzer::SourceInventoryPreflight::acquire(analyzer);
+    let analyzable_files = &inventory.rows;
+    passes_complete &= inventory.completion.is_complete();
     for entry in passes {
         if !selected_ecosystems.contains(&entry.ecosystem) {
             continue;
@@ -887,7 +870,7 @@ pub fn build_workspace_usage_graph_with_passes(
         // file and reports a complete graph with no edges for them.
         if entry
             .backend
-            .input_failure(analyzer, &analyzable_files)
+            .input_failure(analyzer, analyzable_files)
             .is_some()
         {
             passes_complete = false;

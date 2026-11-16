@@ -238,6 +238,13 @@ pub(super) fn produce(
     nodes: &[Node<'_>],
     events: &HashMap<usize, u32>,
 ) {
+    let mut root = *nodes.first().expect("parsed Python file contains a root");
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    let hazards =
+        crate::source_facts::PythonDynamicHazards::collect_bounded(root, t.p.source, || true)
+            .expect("unbounded hazard collection completes");
     let mut parents: Vec<_> = t.p.facts.scopes.iter().map(|scope| scope.parent).collect();
     for continuation in &t.p.facts.scope_continuations {
         parents[continuation.scope.index()] = continuation.parent;
@@ -375,7 +382,7 @@ pub(super) fn produce(
         if python_node_is_in_annotation(node) {
             continue;
         }
-        if crate::source_facts::python_module_dynamic_write_candidate(node, t.p.source) {
+        if crate::source_facts::python_module_dynamic_write_candidate(node, t.p.source, &hazards) {
             let site = t.p.site(
                 node,
                 t.scopes[&node.id()],

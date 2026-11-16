@@ -174,7 +174,7 @@ pub trait LanguageKnowledge: Send + Sync {
 
     /// The complete supertypes of a builtin type whose supertypes no indexed
     /// declaration supplies. A builtin with this answer is a subtype of its
-    /// own, each `aliases` and each `nominal` spelling, of no other builtin
+    /// own, each `aliases` and each `nominal` spelling, of no other
     /// spelling, and leaves an `open` spelling undecided.
     fn builtin_supertypes(&self, _spelling: &str) -> Option<BuiltinSupertypes> {
         None

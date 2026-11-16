@@ -94,12 +94,10 @@ fn report_open(
     analyzer: &dyn IAnalyzer,
     procedure: &semantic::SemanticProcedureValue,
     reason: &str,
+    cause: Option<brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) {
-    let (code, cause) = CodeQueryDiagnosticCode::from_execution_reason(
-        CodeQueryDiagnosticCode::StatementReachabilityDerivationIncomplete,
-        reason,
-    );
+    let code = CodeQueryDiagnosticCode::StatementReachabilityDerivationIncomplete;
     let mut diagnostic = super::QueryExecutionState::diagnostic(
         analyzer,
         super::incomplete_diagnostic(
@@ -141,7 +139,9 @@ pub(super) fn statement_reachability_expansions(
             procedure,
             assessments
                 .reason
+                .as_deref()
                 .unwrap_or(derivation_reason::ASSESSMENT_INCOMPLETE),
+            assessments.execution_cause,
             diagnostics,
         );
         return Vec::new();
@@ -149,7 +149,11 @@ pub(super) fn statement_reachability_expansions(
     let mut rows = Vec::with_capacity(assessments.rows.len());
     for assessment in assessments.rows {
         if let StatementVerdict::Open(reason) = assessment.verdict {
-            report_open(workspace.analyzer(), procedure, reason, diagnostics);
+            report_open(
+                workspace.analyzer(), procedure, reason,
+                brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause::from_reason(reason),
+                diagnostics,
+            );
         }
         rows.push(row(procedure, assessment));
     }

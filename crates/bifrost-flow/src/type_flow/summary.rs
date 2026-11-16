@@ -359,6 +359,46 @@ struct TypeFlowSummaryPartition {
 }
 
 impl TypeFlowSummaryPartitions {
+    #[cfg(feature = "test-support")]
+    pub(crate) fn retention_census_for_test(
+        &self,
+        census: &mut brokk_bifrost_core::retention_census::RetentionCensus<'_>,
+    ) {
+        use brokk_bifrost_core::retention_census::{
+            AllocationAccounting, FamilyLifetime, UnknownKind,
+        };
+
+        let entries = self.entries.lock().expect("type-flow partitions poisoned");
+        let family = "flow.type_flow_partitions";
+        census.record_arc_allocation(
+            Arc::clone(&self.entries),
+            family,
+            FamilyLifetime::Persistent,
+            "type-flow-partition-root",
+            std::mem::size_of::<Vec<TypeFlowSummaryPartition>>() as u64,
+            AllocationAccounting::OutsideBudget,
+        );
+        census.record_unknown(
+            family,
+            FamilyLifetime::Persistent,
+            UnknownKind::NativeBytes,
+            "partition-vector-capacity-and-evicted-reader-pins",
+        );
+
+        for partition in entries.iter() {
+            let state = &partition.state;
+            state
+                .semantic
+                .retention_census_for_test(census, "flow.type_flow.semantic_summaries");
+            state
+                .class_set
+                .retention_census_for_test(census, "flow.type_flow.class_set_summaries");
+            state
+                .field_slots
+                .retention_census_for_test(census, "flow.type_flow.field_slots");
+        }
+    }
+
     pub fn select(
         &self,
         workspace: &WorkspaceAnalyzer,
@@ -822,6 +862,35 @@ struct ClassSetProcedureSummary {
     inputs: RuntimeSummaryInputs,
 }
 
+#[cfg(feature = "test-support")]
+fn class_set_summary_inline_estimate(summary: &ClassSetProcedureSummary) -> usize {
+    std::mem::size_of_val(summary)
+        .saturating_add(
+            summary
+                .exits
+                .len()
+                .saturating_mul(std::mem::size_of::<StableEndSummary>()),
+        )
+        .saturating_add(
+            summary
+                .reached
+                .len()
+                .saturating_mul(std::mem::size_of::<StableReachedFact>()),
+        )
+        .saturating_add(
+            summary
+                .dependencies
+                .len()
+                .saturating_mul(std::mem::size_of::<ClassSetRelationDependency>()),
+        )
+        .saturating_add(
+            summary
+                .reads
+                .len()
+                .saturating_mul(std::mem::size_of::<ReadKey>()),
+        )
+}
+
 /// Publication provenance can differ while the exact derived relation agrees.
 fn same_summary_derivation(
     left: &ClassSetProcedureSummary,
@@ -1063,6 +1132,73 @@ struct RuntimeSummaryPublication {
 }
 
 impl ClassSetSummaryRepository {
+    #[cfg(feature = "test-support")]
+    fn retention_census_for_test(
+        self: &Arc<Self>,
+        census: &mut brokk_bifrost_core::retention_census::RetentionCensus<'_>,
+        family: &'static str,
+    ) {
+        use brokk_bifrost_core::retention_census::{
+            AllocationAccounting, FamilyLifetime, ResidentWeightUnit, UnknownKind,
+        };
+
+        census.record_arc_allocation(
+            Arc::clone(self),
+            family,
+            FamilyLifetime::Persistent,
+            "class-set-summary-repository",
+            std::mem::size_of::<Self>() as u64,
+            AllocationAccounting::OutsideBudget,
+        );
+        let runtime = self
+            .runtime
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let surfaces = self
+            .surfaces
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        census.record_resident_reading(
+            family,
+            FamilyLifetime::Persistent,
+            runtime.values.len().saturating_add(surfaces.len()) as u64,
+            runtime.receipt_bytes as u64,
+            ResidentWeightUnit::BytesEstimate,
+        );
+        for summary in runtime.values.values() {
+            census.record_arc_allocation(
+                Arc::clone(summary),
+                family,
+                FamilyLifetime::Persistent,
+                "class-set-runtime-summary",
+                class_set_summary_inline_estimate(summary) as u64,
+                AllocationAccounting::OutsideBudget,
+            );
+        }
+        for surface in surfaces.values() {
+            census.record_arc_allocation(
+                Arc::clone(surface),
+                family,
+                FamilyLifetime::Persistent,
+                "class-set-procedure-surface",
+                std::mem::size_of_val(surface.as_ref()) as u64,
+                AllocationAccounting::OutsideBudget,
+            );
+        }
+        census.record_unknown(
+            family,
+            FamilyLifetime::Persistent,
+            UnknownKind::NativeBytes,
+            "class-set-map-capacity-and-nested-boxes-and-receipt-arena-identity",
+        );
+        census.record_unknown(
+            family,
+            FamilyLifetime::Persistent,
+            UnknownKind::ActivePins,
+            "partition_reader_arc_pins_not_enumerated",
+        );
+    }
+
     fn get_runtime(&self, key: ClassSetRuntimeLookupKey) -> Option<Arc<ClassSetProcedureSummary>> {
         self.runtime
             .lock()
@@ -6427,14 +6563,25 @@ pub(super) fn class_set_local_structure_digest(
     );
     push_semantic_input_status(&mut digest, snapshot.status());
     digest.push(snapshot.value().coverage().label().as_bytes());
-    let gaps = procedure.semantics().gaps();
+    let gaps = procedure.semantics().logical_gaps().collect::<Vec<_>>();
     digest.push(
         &u64::try_from(gaps.len())
             .expect("semantic gap count fits in u64")
             .to_le_bytes(),
     );
     for gap in gaps {
-        digest.push(if snapshot.value().gap_is_discharged(gap.id) {
+        match gap.key() {
+            crate::analyzer::semantic::GapKey::Gap(id) => {
+                digest.push(b"gap");
+                digest.push(&id.get().to_le_bytes());
+            }
+            crate::analyzer::semantic::GapKey::Member(member) => {
+                digest.push(b"member");
+                digest.push(&member.base_gap_id.get().to_le_bytes());
+                digest.push(&member.owner.get().to_le_bytes());
+            }
+        }
+        digest.push(if snapshot.value().gap_is_discharged(gap.key()) {
             b"discharged"
         } else {
             b"live"
@@ -6493,6 +6640,293 @@ mod tests {
         );
     }
 
+    #[test]
+    #[hardwon("#11443: provider rotation must reject old exact surfaces after Go no-write refusal")]
+    fn go_no_write_provider_rotation_rejects_old_exact_workspace_surface() {
+        use crate::analyzer::semantic::icfg::IcfgProviderBehaviorIdentity;
+        use crate::analyzer::semantic::workspace_oracle::one_call_dispatch_answer_digest;
+        use crate::analyzer::semantic::{
+            DispatchCandidate, DispatchResult, EvidenceCompleteness, OracleLimits, ProofStatus,
+            SemanticOutcome,
+        };
+        use crate::analyzer::usages::{FuzzyResult, UsageFinder, UsageQueryCompletion};
+        let declaration = "package census\nvar F = func() {}\nfunc Caller() { F() }\n";
+        // Go has no class-set adapter. The global provider identity is shared
+        // with this supported Python surface in the same mixed workspace.
+        let mut project = InlineTestProject::new()
+            .file("go.mod", "module example.com/census\n\ngo 1.23\n")
+            .file("a.go", declaration)
+            .file(
+                "app.py",
+                concat!(
+                    "class Present:\n    def member(self):\n        pass\n",
+                    "def leaf(value):\n    return value.member\n",
+                    "def wrapper(value):\n    return leaf(value)\n",
+                    "def root():\n    return wrapper(Present())\n",
+                ),
+            );
+        for index in 0..1001 {
+            project = project.file(
+                format!("f{index:04}.go"),
+                format!("package census\nfunc Local{index}() {{ F := 1; _ = F }}\n"),
+            );
+        }
+        let project = project
+            .file(
+                "zzz_writer.go",
+                "package census\nfunc Write() { F = func() {} }\n",
+            )
+            .build();
+        let (project, workspace, fields, procedures) = runtime_fixture_from_project(project);
+        let root = &procedures["wrapper"];
+        let analyzer = workspace.analyzer();
+        let variable = analyzer
+            .get_declarations(&project.file("a.go"))
+            .into_iter()
+            .find(|unit| unit.identifier() == "F")
+            .expect("package variable");
+        let bounded =
+            UsageFinder::new().query(analyzer, std::slice::from_ref(&variable), 1000, 1000);
+        assert_eq!(
+            bounded.completion,
+            UsageQueryCompletion::CandidateFilesBudgetExhausted
+        );
+        assert!(
+            !bounded
+                .candidate_files
+                .contains(&project.file("zzz_writer.go"))
+        );
+        assert!(matches!(bounded.result, FuzzyResult::Success { .. }));
+        // The old result-only validator saw only the declaring name and a
+        // proven direct call: no unproven site or retained write already refused it.
+        // These byte ranges name the fixed fixture's F declaration and F() callee.
+        let FuzzyResult::Success {
+            hits_by_overload,
+            unproven_by_overload,
+            unproven_total_by_overload,
+        } = &bounded.result
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            unproven_total_by_overload
+                .get(&variable)
+                .copied()
+                .unwrap_or_default(),
+            0
+        );
+        assert!(
+            unproven_by_overload
+                .get(&variable)
+                .is_none_or(|hits| hits.is_empty())
+        );
+        let hits = hits_by_overload
+            .get(&variable)
+            .expect("retained direct call");
+        assert!(
+            hits.iter()
+                .any(|hit| (hit.start_offset, hit.end_offset) == (49, 50))
+        );
+        assert!(
+            hits.iter().all(|hit| hit.file == project.file("a.go")
+                && ((hit.start_offset, hit.end_offset) == (19, 20)
+                    || ((hit.start_offset, hit.end_offset) == (49, 50)
+                        && hit.kind
+                            == brokk_bifrost_core::analyzer::usages::model::UsageHitKind::Reference))),
+            "unexpected bounded evidence: {hits:?}"
+        );
+        let complete =
+            UsageFinder::new().query(analyzer, std::slice::from_ref(&variable), 2000, 2000);
+        assert!(complete.has_complete_coverage());
+        assert!(
+            complete
+                .result
+                .all_hits_including_imports()
+                .iter()
+                .any(|hit| hit.file == project.file("zzz_writer.go"))
+        );
+
+        let token = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let mut request = SemanticRequest::new(&mut budget, &token);
+        let provider = WorkspaceValueFlowProvider::new(&workspace, ValueFlowCache::default());
+        let go_artifact = workspace
+            .materialize_program_semantics(&project.file("a.go"), &mut request)
+            .expect("Go semantics")
+            .available_value()
+            .cloned()
+            .expect("Go artifact");
+        let go_caller = go_artifact
+            .procedures()
+            .iter()
+            .find(|p| {
+                p.locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|s| s.name())
+                    == Some("Caller")
+            })
+            .and_then(|p| go_artifact.procedure_handle(p.id()))
+            .expect("Go Caller");
+        let call = go_caller
+            .call_site_handle(go_caller.semantics().call_sites()[0].id)
+            .expect("F call");
+        let current = provider
+            .resolve_call(&call, &mut request)
+            .expect("current Go dispatch");
+        assert!(
+            format!("{current:#?}").contains("incomplete coverage"),
+            "dispatch must reach the rejected no-write proof: {current:#?}"
+        );
+        assert!(
+            current
+                .available_value()
+                .expect("diagnostic dispatch answer")
+                .stable_package_values()
+                .is_empty()
+        );
+        // Reconstruct the historical false complete target set as saved data,
+        // without keeping its old no-write proof algorithm in production.
+        let lambda = go_artifact
+            .procedures()
+            .iter()
+            .find(|p| {
+                p.kind() == crate::analyzer::semantic::ProcedureKind::Lambda
+                    && p.lexical_parent().is_none()
+            })
+            .and_then(|p| go_artifact.procedure_handle(p.id()))
+            .expect("initializer lambda");
+        let limits = OracleLimits::default();
+        let mut candidates = vec![
+            DispatchCandidate::new(
+                lambda,
+                ProofStatus::Proven,
+                EvidenceCompleteness::Complete,
+                std::iter::empty(),
+                limits,
+            )
+            .expect("historical initializer candidate"),
+        ];
+        let mut boundaries = Vec::new();
+        crate::analyzer::semantic::workspace_oracle::dispatch::attach_dispatch_provenance(
+            &call,
+            &mut candidates,
+            &mut boundaries,
+            None,
+            None,
+            limits,
+        )
+        .expect("call-scoped historical candidate provenance");
+        let old_dispatch = SemanticOutcome::Complete {
+            value: DispatchResult::new(
+                &call,
+                candidates,
+                boundaries,
+                CandidateCoverage::Exhaustive,
+                limits,
+            )
+            .expect("historical false complete dispatch"),
+            work: SemanticWork::default(),
+        };
+        assert_ne!(
+            one_call_dispatch_answer_digest(&call, &old_dispatch),
+            one_call_dispatch_answer_digest(&call, &current)
+        );
+
+        let current_provider = WorkspaceIcfgProvider::new(&workspace);
+        let current_behavior = current_provider.behavior_identity();
+        let legacy_behavior = IcfgProviderBehaviorIdentity::for_test_workspace_with_domains(
+            &current_provider,
+            (
+                b"bifrost-icfg-provider/workspace-behavior/v848",
+                b"bifrost-icfg-provider/workspace-read-behavior/v847",
+            ),
+        );
+        assert_ne!(current_behavior.as_bytes(), legacy_behavior.as_bytes());
+        assert_ne!(current_behavior.read_bytes(), legacy_behavior.read_bytes());
+        let (plan, _) = runtime_plan(&workspace, &fields, &procedures["root"]);
+        let state = TypeFlowSummaryState::new(&workspace);
+        let prepared = PreparedClassSetSummaries::new(
+            state.clone(),
+            &workspace,
+            &plan,
+            &fields,
+            legacy_behavior,
+        );
+        let legacy_surface = prepared
+            .surfaces
+            .get(root)
+            .cloned()
+            .expect("real supported Python surface");
+        assert!(legacy_surface.has_valid_exact_provenance());
+        assert_eq!(legacy_surface.header.key.language, Language::Python);
+        let root_outcome = provider
+            .procedure_snapshot(root, &OracleCallContext::empty(), &mut request)
+            .expect("Python wrapper snapshot");
+        let root_snapshot = ValueFlowInput::new(
+            root_outcome
+                .available_value()
+                .cloned()
+                .expect("Python flow"),
+            SemanticInputStatus::from_outcome(&root_outcome),
+        );
+        let mut legacy_cuts = ClassSetAcquisitionCuts::new(
+            state.clone(),
+            &workspace,
+            &provider,
+            legacy_behavior,
+            &fields,
+            HashSet::default(),
+        );
+        let mut current_cuts = ClassSetAcquisitionCuts::new(
+            state.clone(),
+            &workspace,
+            &provider,
+            current_behavior,
+            &fields,
+            HashSet::default(),
+        );
+        let new_key = current_cuts
+            .surface_family_key(root, &root_snapshot)
+            .expect("new family");
+        assert_ne!(legacy_surface.header.key, new_key);
+        assert!(
+            legacy_cuts
+                .replay_exact_workspace_surface(root, &root_snapshot, &legacy_surface, &mut request)
+                .is_some(),
+            "old identity permits its exact shortcut"
+        );
+        assert!(
+            current_cuts
+                .replay_exact_workspace_surface(root, &root_snapshot, &legacy_surface, &mut request)
+                .is_none(),
+            "global pair rotation rejects the old shortcut for unchanged bytes"
+        );
+        assert!(state.class_set.publish_surface(legacy_surface));
+        assert!(
+            current_cuts
+                .surface_candidates(&new_key, &mut request)
+                .expect("family lookup")
+                .is_empty()
+        );
+        let after_miss = provider
+            .resolve_call(&call, &mut request)
+            .expect("Go dispatch after rotation check");
+        let fresh_provider = WorkspaceValueFlowProvider::new(&workspace, ValueFlowCache::default());
+        let fresh = fresh_provider
+            .resolve_call(&call, &mut request)
+            .expect("fresh Go dispatch");
+        assert_eq!(
+            one_call_dispatch_answer_digest(&call, &after_miss),
+            one_call_dispatch_answer_digest(&call, &fresh)
+        );
+        assert_eq!(
+            one_call_dispatch_answer_digest(&call, &current),
+            one_call_dispatch_answer_digest(&call, &fresh)
+        );
+    }
+
     fn runtime_fixture(
         source: &str,
     ) -> (
@@ -6531,11 +6965,21 @@ mod tests {
         HashMap<Box<str>, ProcedureHandle>,
     ) {
         let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let (field_slots, procedures) =
+            runtime_inputs(&workspace, adapter, &project.file(fixture_file));
+        (project, workspace, field_slots, procedures)
+    }
+
+    fn runtime_inputs(
+        workspace: &WorkspaceAnalyzer,
+        adapter: &dyn TypeFlowAdapter,
+        file: &ProjectFile,
+    ) -> (FieldSlotIndex, HashMap<Box<str>, ProcedureHandle>) {
         let cancellation = CancellationToken::default();
         let mut semantic_budget = SemanticBudget::default();
         let artifact = workspace
             .materialize_program_semantics(
-                &project.file(fixture_file),
+                file,
                 &mut SemanticRequest::new(&mut semantic_budget, &cancellation),
             )
             .expect("runtime fixture semantics materialize")
@@ -6562,9 +7006,9 @@ mod tests {
             .collect();
         let mut field_budget = SemanticBudget::default();
         let field_slots =
-            FieldSlotIndex::build(&workspace, adapter, &mut field_budget, &cancellation)
+            FieldSlotIndex::build(workspace, adapter, &mut field_budget, &cancellation)
                 .expect("runtime fixture field slots build");
-        (project, workspace, field_slots, procedures)
+        (field_slots, procedures)
     }
 
     fn solve_runtime_root(
@@ -8640,6 +9084,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#11536: an overlay replacement absent from the persisted Python summary panicked reverse nomination"
+    )]
     fn changed_open_dispatch_answer_rotates_the_wrapper_and_misses() {
         let source = concat!(
             "def leaf():\n",
@@ -8652,7 +9099,8 @@ mod tests {
             "    return wrapper()\n",
         );
         let changed_source = format!("{source}def unresolved_call():\n    return 2\n");
-        let (_first_project, first_workspace, first_fields, first_procedures) =
+        let changed_on_disk = changed_source.clone();
+        let (first_project, first_workspace, first_fields, first_procedures) =
             runtime_fixture(source);
         let state = TypeFlowSummaryState::new(&first_workspace);
         solve_runtime_root(
@@ -8677,23 +9125,112 @@ mod tests {
         assert_eq!(retained.dependencies.len(), 1, "{retained:#?}");
         assert_eq!(retained.reads.len(), 2, "{retained:#?}");
 
-        let (_second_project, second_workspace, second_fields, second_procedures) =
-            runtime_fixture(&changed_source);
+        let store = first_workspace.store().expect("fixture store");
+        assert!(
+            store
+                .class_set_summary_for_digest(
+                    *class_set_lookup_fingerprint(&retained.key).as_bytes()
+                )
+                .expect("stored summary lookup")
+                .is_some(),
+            "wrapper row must be stored before the edit"
+        );
+        let live = Arc::new(brokk_bifrost_core::analyzer::project::OverlayProject::new(
+            first_project.project_dyn(),
+        ));
+        assert!(live.set(first_project.file("app.py").abs_path(), changed_source));
+        let second_workspace = first_workspace.clone_with_project(Arc::new(live.snapshot()));
+        let adapter = type_flow_adapter(Language::Python).expect("Python type flow");
+        let (second_fields, second_procedures) =
+            runtime_inputs(&second_workspace, adapter, &first_project.file("app.py"));
+        let changed_read = retained
+            .reads
+            .iter()
+            .find(|read| {
+                let cancellation = CancellationToken::default();
+                let mut budget = SemanticBudget::default();
+                !crate::analyzer::verify_procedure_dispatch_read(
+                    &second_workspace,
+                    &second_workspace.semantic_oracle_provider(),
+                    read,
+                    &mut SemanticRequest::new(&mut budget, &cancellation),
+                )
+            })
+            .expect("an overlay that changes dispatch must invalidate a stored certificate");
+        let ReadKey::Lookup {
+            kind,
+            question,
+            digest,
+        } = changed_read
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            crate::analyzer::replay_lookup(
+                &first_workspace,
+                *kind,
+                question,
+                Default::default(),
+                &crate::analyzer::NoSummaryAnswers
+            ),
+            Some(*digest)
+        );
+        let replayed = crate::analyzer::replay_lookup(
+            &second_workspace,
+            *kind,
+            question,
+            Default::default(),
+            &crate::analyzer::NoSummaryAnswers,
+        )
+        .expect("changed dispatch has a replayable answer");
+        assert_ne!(
+            replayed, *digest,
+            "the dispatch answer, not only the source, changes"
+        );
+        // The overlay adds a definition the persisted Python summary does not
+        // describe, so native dispatch for it is explicitly incomplete and the
+        // wrapper has no complete dispatch contract: nothing stored can be served.
         let (second_plan, second_behavior) = runtime_plan(
             &second_workspace,
             &second_fields,
             &second_procedures["root"],
         );
-        let mut prepared = PreparedClassSetSummaries::new(
-            state,
+        let overlay_prepared = PreparedClassSetSummaries::new(
+            state.clone(),
             &second_workspace,
             &second_plan,
             &second_fields,
             second_behavior,
         );
+        assert!(
+            overlay_prepared
+                .lookup_key(&second_procedures["wrapper"], StableEntryFact::Zero)
+                .is_none(),
+            "an overlay the persisted summary does not cover cannot form a complete dispatch contract"
+        );
+
+        // A normal refresh derives a summary that describes the edit.
+        std::fs::write(first_project.file("app.py").abs_path(), &changed_on_disk).unwrap();
+        let refreshed_workspace = first_workspace.update(&std::collections::BTreeSet::from([
+            first_project.file("app.py"),
+        ]));
+        let (refreshed_fields, refreshed_procedures) =
+            runtime_inputs(&refreshed_workspace, adapter, &first_project.file("app.py"));
+        let (refreshed_plan, refreshed_behavior) = runtime_plan(
+            &refreshed_workspace,
+            &refreshed_fields,
+            &refreshed_procedures["root"],
+        );
+        let mut prepared = PreparedClassSetSummaries::new(
+            state.clone(),
+            &refreshed_workspace,
+            &refreshed_plan,
+            &refreshed_fields,
+            refreshed_behavior,
+        );
         let changed_key = prepared
-            .lookup_key(&second_procedures["wrapper"], StableEntryFact::Zero)
-            .expect("the wrapper remains eligible after the call resolves");
+            .lookup_key(&refreshed_procedures["wrapper"], StableEntryFact::Zero)
+            .expect("the wrapper is eligible once the refreshed summary describes the call");
         assert_ne!(
             retained.key.dispatch_reads, changed_key.dispatch_reads,
             "the exact open-boundary dispatch answer rotates its read evidence"
@@ -8713,7 +9250,7 @@ mod tests {
         assert!(
             prepared
                 .validated_runtime_summary(
-                    &second_procedures["wrapper"],
+                    &refreshed_procedures["wrapper"],
                     &changed_key,
                     None,
                     &mut request,
@@ -8721,6 +9258,40 @@ mod tests {
                 .expect("changed-dispatch validation completes")
                 .is_none(),
             "a changed relevant dispatch answer cannot reuse the open-boundary relation"
+        );
+        let fresh_state = TypeFlowSummaryState::new(&refreshed_workspace);
+        let fresh = solve_runtime_root(
+            &refreshed_workspace,
+            &refreshed_fields,
+            &refreshed_procedures["root"],
+            fresh_state.clone(),
+            ValueFlowCache::default(),
+        );
+        assert!(fresh.published_summaries > 0, "{fresh:?}");
+        let dispatch_answers = |summary: &ClassSetProcedureSummary| {
+            summary
+                .reads
+                .iter()
+                .filter_map(|read| match read {
+                    ReadKey::Lookup {
+                        kind: crate::analyzer::read_ledger::LookupKind::ProcedureDispatch,
+                        digest,
+                        ..
+                    } => Some(*digest),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let refreshed_wrapper = fresh_state
+            .class_set
+            .runtime_snapshot()
+            .into_iter()
+            .find(|summary| summary_name(summary) == "wrapper")
+            .expect("the refreshed solve publishes the wrapper");
+        assert_ne!(
+            dispatch_answers(&refreshed_wrapper),
+            dispatch_answers(&retained),
+            "the refreshed wrapper stores the changed dispatch answers"
         );
     }
 
@@ -9201,6 +9772,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#11516: provider-keyed class-set rows retained incomplete source receipts")]
     fn rotated_provider_read_behavior_separates_and_republishes_a_summary() {
         let source = concat!(
             "def wrapper(value):\n",
@@ -9228,7 +9800,28 @@ mod tests {
             .find(|summary| summary_name(summary) == "wrapper")
             .map(|summary| summary.as_ref().clone())
             .expect("the source solve publishes a wrapper relation");
-        assert!(!current.reads.is_empty(), "{current:#?}");
+        // Summaries retain the dispatch certificate. The public definition
+        // receipt regression checks the raw overlay inputs beneath it (#11516).
+        assert!(
+            current.reads.iter().any(|read| matches!(
+                read,
+                ReadKey::Lookup {
+                    kind: crate::analyzer::read_ledger::LookupKind::ProcedureDispatch,
+                    ..
+                }
+            )),
+            "{current:?}"
+        );
+        let provider = WorkspaceIcfgProvider::new(&source_workspace);
+        // These are the domains under which pre-#11516 receipts could lose reads.
+        let old_provider = IcfgProviderBehaviorIdentity::for_test_workspace_with_domains(
+            &provider,
+            (
+                b"bifrost-icfg-provider/workspace-behavior/v848",
+                b"bifrost-icfg-provider/workspace-read-behavior/v847",
+            ),
+        );
+        let old_behavior = class_set_behavior(old_provider, source_fields.digest());
 
         let identity = current.key.procedure.identity();
         let legacy_identity = ProcedureSummaryIdentity::new(
@@ -9237,8 +9830,13 @@ mod tests {
             identity.schema(),
             identity.semantics(),
             identity.context(),
-            SummaryBehaviorKey::hash_bytes(b"pre-procedure-dispatch-answer-v2"),
+            old_behavior,
             identity.origin().clone(),
+        );
+        assert_ne!(
+            old_behavior,
+            identity.behavior(),
+            "the current provider domains must rotate beyond the old receipt producer"
         );
         let mut legacy = current.clone();
         legacy.key.procedure = ProcedureSummaryKey::try_new(legacy_identity, &[], None)
@@ -9261,6 +9859,31 @@ mod tests {
 
         let state = TypeFlowSummaryState::new(&source_workspace);
         assert!(state.class_set.publish(legacy));
+        let (plan, behavior) = runtime_plan(
+            &source_workspace,
+            &source_fields,
+            &source_procedures["root"],
+        );
+        let mut prepared = PreparedClassSetSummaries::new(
+            state.clone(),
+            &source_workspace,
+            &plan,
+            &source_fields,
+            behavior,
+        );
+        let key = prepared
+            .lookup_key(&source_procedures["wrapper"], current.key.entry.clone())
+            .expect("wrapper remains eligible under the current domain");
+        let cancellation = CancellationToken::default();
+        let mut budget = SolverBudget::default();
+        let mut request = DataflowRequest::new(&mut budget, &cancellation);
+        assert!(
+            prepared
+                .validated_runtime_summary(&source_procedures["wrapper"], &key, None, &mut request)
+                .expect("old-domain lookup completes")
+                .is_none(),
+            "old-domain row must not be reused"
+        );
         assert!(
             state.class_set.publish(current.clone()),
             "the current answer publishes rather than colliding with stale read behavior"

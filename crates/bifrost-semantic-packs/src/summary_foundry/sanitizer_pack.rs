@@ -601,10 +601,11 @@ fn build_summary(
 
 fn summary_input(port: &SanitizerPort) -> AuthoredSummaryInput {
     match port {
-        SanitizerPort::Receiver => AuthoredSummaryInput::Receiver {},
-        SanitizerPort::Parameter { ordinal } => {
-            AuthoredSummaryInput::Parameter { ordinal: *ordinal }
-        }
+        SanitizerPort::Receiver => AuthoredSummaryInput::Receiver { path: None },
+        SanitizerPort::Parameter { ordinal } => AuthoredSummaryInput::Parameter {
+            ordinal: *ordinal,
+            path: None,
+        },
     }
 }
 

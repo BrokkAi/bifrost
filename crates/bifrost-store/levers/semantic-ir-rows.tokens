@@ -1,0 +1,23 @@
+# The semantic IR rows lever (#11570).
+#
+# Add one `<issue>-<slug>` line when the semantic IR row encoder or decoder
+# changes what a stored row means, or when the partial-flow derivation changes
+# (the port table, the kill rules, the fixpoint) so stored rows differ for
+# unchanged source. It is folded into `semantic_ir_producer_epoch`, so every
+# stored lowered-IR and partial-flow row of every language is withdrawn once.
+# Git merges this file with merge=union, so two branches that each add a line
+# keep both. Never edit or remove a line; compaction replaces a prefix with a
+# checkpoint line and keeps the identity.
+# See .agents/docs/cache-identity-levers.md.
+#
+# Replaced the numbered literal `SEMANTIC_IR_ROWS_VERSION = 32`.
+11570-slice2a-token-files
+11360-m2-cleanup-owner-gaps
+11251-matches-intrinsic
+11910-alternate-materialization-identity
+4318-address-of-flow
+4318-pointer-memory-load-flow
+12128-rust-async-body-execution
+9925-poem-field-binders
+12986-uninit-assignment-discharge
+12986-uninit-assignment-review-corrections

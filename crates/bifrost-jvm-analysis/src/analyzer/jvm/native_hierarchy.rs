@@ -57,7 +57,7 @@ pub(crate) fn stopped() -> HierarchyAnswer {
         open: vec![HierarchyOpenReason::MemberFamily(
             MemberFamilyReason::HierarchyTruncated,
         )],
-        ..Default::default()
+        ..HierarchyAnswer::complete(Vec::new())
     }
 }
 
@@ -76,7 +76,7 @@ fn convert(
     session: &ResolutionSession,
     normalize: impl FnOnce(&mut Vec<MappedParent>),
 ) -> Result<HierarchyAnswer> {
-    let mut answer = HierarchyAnswer::default();
+    let mut answer = HierarchyAnswer::complete(Vec::new());
     if raw.completion != ResolutionCompletion::Complete {
         answer.open.extend(stopped().open);
     }
@@ -417,7 +417,7 @@ fn open_native_query<A: LanguageAdapter>(
                             inner.record_read(inner.workspace_scope_read_key(&[language]));
                         }
                     }
-                    let mut answer = HierarchyAnswer::default();
+                    let mut answer = HierarchyAnswer::complete(Vec::new());
                     if brokk_bifrost_jvm::intrinsics::intrinsic_root_owner(unit.fq_name().as_str()).is_some() {
                         answer.open.extend(operation.jvm_intrinsic_descendant_cut().answer.open_reasons);
                         return Ok(answer);

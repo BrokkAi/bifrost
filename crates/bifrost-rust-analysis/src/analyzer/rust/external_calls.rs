@@ -1,5 +1,7 @@
 //! External callable evidence from native scope authority and activated models.
 
+use brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_crate_rows::RustAbsoluteRoot;
+use brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace;
 use std::sync::Arc;
 
 use crate::analyzer::rust::native_points;
@@ -16,7 +18,7 @@ use brokk_bifrost_analysis::analyzer::languages::ExternalCalleeSite;
 
 use crate::analyzer::semantic_model::{
     SemanticModelCallApplication, SemanticModelCallableDisposition, SemanticModelCallableKey,
-    SemanticModelCallableMatch, SemanticModelSymbolKind,
+    SemanticModelCallableMatch, SemanticModelMemberTargetDisposition, SemanticModelSymbolKind,
 };
 use brokk_bifrost_analysis::analyzer::semantic::oracle::dispatch::ResolverOwnedExternalCalleeIdentity;
 use brokk_bifrost_analysis::analyzer::semantic_model::overlay::{
@@ -113,6 +115,24 @@ fn native_external_root(
     operation_factory: &native_points::RustDefinitionOperationFactory<'_>,
     operation: &mut brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<'_, '_>,
 ) -> bool {
+    if rust_path_is_leading_absolute(root) {
+        // The root of a written `use ::std::str` path is the scoped identifier
+        // `::std`; the extern name is its `name` field. A call path's root is
+        // already that identifier.
+        let head = root.child_by_field_name("name").unwrap_or(root);
+        match selected_absolute_root(
+            analyzer,
+            operation,
+            file,
+            rust_node_text(head, source),
+            ResolutionNamespace::Type,
+            cancellation,
+        ) {
+            Some(RustAbsoluteRoot::External(_)) => return true,
+            Some(RustAbsoluteRoot::Indexed { .. } | RustAbsoluteRoot::CrateRootImport { .. }) => {}
+            Some(RustAbsoluteRoot::Unavailable { .. }) | None => return false,
+        }
+    }
     let selected_imports;
     let imports = if let Some(imports) = imports {
         imports
@@ -162,19 +182,13 @@ pub(crate) fn native_external_root_with_resolver(
     if matches!(name, "crate" | "self" | "super") {
         return false;
     }
-    // A leading :: selects the extern prelude; local binders do not shadow
-    // it. The caller still requires the activated model's callable proof.
-    if rust_path_is_leading_absolute(root) {
-        return true;
-    }
     {
         for import in imports {
             if !import.is_wildcard
                 && import.local_name() == Some(name)
-                && import
-                    .path
-                    .as_ref()
-                    .is_some_and(|path| rust_import_binder_visible_at_byte(path, root.start_byte()))
+                && import.path.as_ref().is_some_and(|path| {
+                    rust_import_binder_visible_at_byte(path, root.start_byte(), tree)
+                })
             {
                 return false;
             }
@@ -223,9 +237,10 @@ pub(crate) fn native_external_root_with_resolver(
         return true;
     }
     if analyzer
-        .semantic_model_overlay()
+        .semantic_model_overlay_read()
+        .published()
         .as_deref()
-        .and_then(|overlay| RustOverlayCrates::new(Some(overlay)).referenceable_symbol(name))
+        .and_then(|overlay| RustOverlayCrates::new(Some(overlay)).referenceable_owner(name))
         .is_some_and(|symbol| {
             symbol.kind == crate::analyzer::semantic_model::SemanticModelSymbolKind::Module
         })
@@ -238,12 +253,202 @@ pub(crate) fn native_external_root_with_resolver(
     // root must not make an otherwise structured external call disappear.
     // Explicit import binders were rejected above; a leading `::` was handled
     // above as well. This keeps the fallback at the root/prelude boundary and
-    // does not classify arbitrary missing paths as external.
+    // does not classify arbitrary missing paths as external. A point
+    // operation that could not answer (`native_unavailable`, for example a
+    // resolved declaration that has no definition unit) reports Incomplete
+    // too, but its target may be a local item spelled `std`, so it never
+    // certifies the root.
     matches!(&resolution, BoundedResolution::Complete { value, .. }
         if value.status == DefinitionLookupStatus::Incomplete
             && value.definitions.is_empty()
             && value.lexical_definition.is_none()
+            && !value.diagnostics.iter().any(|diagnostic| diagnostic.kind == "native_unavailable")
             && matches!(name, "alloc" | "core" | "std"))
+}
+
+pub(super) fn selected_absolute_root(
+    analyzer: &dyn IAnalyzer,
+    operation: &brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<'_, '_>,
+    file: &ProjectFile,
+    name: &str,
+    namespace: ResolutionNamespace,
+    cancellation: Option<&CancellationToken>,
+) -> Option<RustAbsoluteRoot> {
+    selected_absolute_root_with_files(analyzer, operation, file, name, namespace, cancellation)
+        .map(|(answer, _)| answer)
+}
+
+fn selected_absolute_root_with_files(
+    analyzer: &dyn IAnalyzer,
+    operation: &brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<'_, '_>,
+    file: &ProjectFile,
+    name: &str,
+    namespace: ResolutionNamespace,
+    cancellation: Option<&CancellationToken>,
+) -> Option<(RustAbsoluteRoot, Vec<ProjectFile>)> {
+    let rust = brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<
+        crate::analyzer::rust::RustAnalyzer,
+    >(analyzer)
+    .expect("Rust proof requires Rust analyzer");
+    // Route derivations record Cargo configuration (including edition), target
+    // membership and dependency names. Bind the lookup to this exact selection.
+    let _frame = match rust.operation_read_frame(operation) {
+        Ok(frame) => frame,
+        Err(error) => {
+            rust.inner.record_store_error(error);
+            crate::analyzer::rust::std_types::operational_proof_stop(
+                "absolute root route frame unavailable",
+                brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause::Provider,
+            );
+            return None;
+        }
+    };
+    let keep_going = || !cancellation.is_some_and(CancellationToken::is_cancelled);
+    let roots = match rust.file_routes(file, Some(&keep_going)) {
+        Ok(routes) => {
+            let roots = routes.target_roots(file);
+            if !routes.is_complete() {
+                crate::analyzer::rust::std_types::operational_proof_stop(
+                    "absolute root routes incomplete",
+                    brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause::Provider,
+                );
+            }
+            // No Cargo target reaches a detached file; it is its own crate root,
+            // and the complete routes just read prove that no target does.
+            let import_files = if roots.is_empty() {
+                std::slice::from_ref(file)
+            } else {
+                roots.as_slice()
+            };
+            for root in import_files {
+                // The source key covers extern-crate binders and no_std, even
+                // when the import list itself is empty.
+                crate::analyzer::rust::std_types::selected_import_infos(
+                    analyzer,
+                    operation,
+                    root,
+                    &cancellation.cloned().unwrap_or_default(),
+                )?;
+            }
+            roots
+        }
+        Err(error) => {
+            crate::analyzer::rust::std_types::operational_proof_stop(
+                "absolute root routes unavailable",
+                crate::analyzer::rust::std_types::cargo_route_execution_cause(&error),
+            );
+            return None;
+        }
+    };
+    let answer = match operation.rust_absolute_root(
+        file,
+        name,
+        namespace,
+        &cancellation.cloned().unwrap_or_default(),
+    ) {
+        Ok(answer) => answer,
+        Err(error) => {
+            let rust = brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<
+                crate::analyzer::rust::RustAnalyzer,
+            >(analyzer)
+            .expect("Rust proof requires Rust analyzer");
+            rust.inner.record_store_error(error);
+            crate::analyzer::rust::std_types::operational_proof_stop(
+                "absolute root store unavailable",
+                brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause::Provider,
+            );
+            return None;
+        }
+    };
+    if let RustAbsoluteRoot::Unavailable { reason, .. } = &answer {
+        // Provider until certified (#11510): an unavailable absolute root is
+        // refused for retention even when the store marks it content-determined,
+        // because no read-closure proof covers that decision yet.
+        crate::analyzer::rust::std_types::operational_proof_stop(
+            reason,
+            brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause::Provider,
+        );
+    }
+    Some((answer, roots))
+}
+
+pub(crate) fn absolute_external_components(
+    analyzer: &dyn IAnalyzer,
+    operation: &brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<'_, '_>,
+    file: &ProjectFile,
+    name: &str,
+    cancellation: Option<&CancellationToken>,
+) -> Option<Vec<String>> {
+    match selected_absolute_root(
+        analyzer,
+        operation,
+        file,
+        name,
+        ResolutionNamespace::Type,
+        cancellation,
+    )? {
+        RustAbsoluteRoot::External(path) => Some(path),
+        RustAbsoluteRoot::Indexed { .. }
+        | RustAbsoluteRoot::CrateRootImport { .. }
+        | RustAbsoluteRoot::Unavailable { .. } => None,
+    }
+}
+
+fn canonical_absolute_owner(
+    analyzer: &dyn IAnalyzer,
+    operation: &brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<'_, '_>,
+    file: &ProjectFile,
+    head: &str,
+    remaining: impl Iterator<Item = String>,
+    cancellation: Option<&CancellationToken>,
+) -> Option<Vec<String>> {
+    Some(
+        absolute_external_components(analyzer, operation, file, head, cancellation)?
+            .into_iter()
+            .chain(remaining)
+            .collect(),
+    )
+}
+
+/// The crate root file whose active top-level `use` binds the leading-`::`
+/// head `name` (edition 2015), when the selected absolute root says one does.
+///
+/// Edition 2015 resolves `::name` in the crate root module, so the binder is a
+/// top-level `use` of the crate root file, wherever the call is written. A
+/// file that several Cargo targets hold has several roots; they are not
+/// proven to agree, so that answer is refused and recorded as a stop rather
+/// than dropped.
+pub(crate) fn crate_root_import_file(
+    analyzer: &dyn IAnalyzer,
+    operation: &brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<'_, '_>,
+    file: &ProjectFile,
+    name: &str,
+    namespace: ResolutionNamespace,
+    cancellation: Option<&CancellationToken>,
+) -> Option<ProjectFile> {
+    // Keep the route-derived files together with the absolute-root proof. No
+    // second lookup may outlive the selected read frame that certified them.
+    let (answer, roots) = selected_absolute_root_with_files(
+        analyzer,
+        operation,
+        file,
+        name,
+        namespace,
+        cancellation,
+    )?;
+    if !matches!(answer, RustAbsoluteRoot::CrateRootImport { .. }) {
+        return None;
+    }
+    match roots.as_slice() {
+        [root] => Some(root.clone()),
+        _ => {
+            crate::analyzer::rust::std_types::operational_proof_stop(
+                "crate-root import has no single crate root",
+                brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause::Provider,
+            );
+            None
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -257,6 +462,26 @@ fn canonical_rust_external_owner_components(
     operation_factory: &native_points::RustDefinitionOperationFactory<'_>,
     operation: &mut brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<'_, '_>,
 ) -> Vec<String> {
+    if let Some(root) = owners
+        .first()
+        .filter(|root| rust_path_is_leading_absolute(**root))
+    {
+        let head = root.child_by_field_name("name").unwrap_or(*root);
+        if let Some(owner) = canonical_absolute_owner(
+            analyzer,
+            operation,
+            file,
+            rust_node_text(head, source),
+            owners
+                .iter()
+                .skip(1)
+                .map(|node| rust_node_text(*node, source).to_owned()),
+            cancellation,
+        ) {
+            return owner;
+        }
+    }
+
     canonical_rust_external_owner_components_with_resolver(
         analyzer,
         file,
@@ -268,7 +493,7 @@ fn canonical_rust_external_owner_components(
     )
 }
 
-fn canonical_rust_external_owner_components_with_resolver(
+pub(crate) fn canonical_rust_external_owner_components_with_resolver(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     source: &str,
@@ -309,7 +534,11 @@ fn canonical_rust_external_owner_components_with_resolver(
     let resolution = resolve(query);
     crate::analyzer::rust::std_types::observe_proof_resolution(&resolution);
     let BoundedResolution::Complete { value, .. } = resolution else {
-        return components;
+        return if rust_path_is_leading_absolute(root) {
+            Vec::new()
+        } else {
+            components
+        };
     };
     if let Some(path) = crate::analyzer::rust::std_types::standard_wrapper_owner(&value) {
         return path
@@ -359,7 +588,11 @@ fn canonical_rust_external_owner_components_with_resolver(
             }
         }
     }
-    components
+    if rust_path_is_leading_absolute(root) {
+        Vec::new()
+    } else {
+        components
+    }
 }
 
 fn external_call_proof_and_identity(
@@ -369,9 +602,12 @@ fn external_call_proof_and_identity(
     parameter_count: u32,
     cancellation: Option<&CancellationToken>,
 ) -> Option<(ExactExternalCallProof, ResolverOwnedExternalCalleeIdentity)> {
+    if owner_components.is_empty() {
+        return None;
+    }
     let written_owner = owner_components.join(".");
     let qualified_name = format!("{written_owner}.{member}");
-    let canonical = if let Some(overlay) = analyzer.semantic_model_overlay() {
+    let canonical = if let Some(overlay) = analyzer.semantic_model_overlay_read().published() {
         let owner_lookup = overlay.rust_reexport_lookup_recording_with_cancellation(
             &written_owner,
             RustReexportNamespace::TypeOrModule,
@@ -423,6 +659,37 @@ fn external_call_proof_and_identity(
     ))
 }
 
+// Keep probe reads, but defer completion until we know which route supplied the answer.
+struct ExternalCallProbe<T> {
+    value: Option<T>,
+    reasons: Vec<brokk_bifrost_analysis::analyzer::QueryReadIncomplete>,
+}
+
+impl<T> ExternalCallProbe<T> {
+    fn capture(analyzer: &dyn IAnalyzer, probe: impl FnOnce() -> Option<T>) -> Self {
+        use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
+        let _advisory = AnalyzerQueryScope::for_advisory_read(analyzer);
+        let capture = AnalyzerQueryScope::capturing_read_incompleteness(analyzer);
+        let value = probe();
+        Self {
+            value,
+            reasons: capture.captured_read_incompleteness(),
+        }
+    }
+
+    fn or_else(self, analyzer: &dyn IAnalyzer, fallback: impl FnOnce() -> Option<T>) -> Option<T> {
+        if (self.value.is_none() || !self.reasons.is_empty())
+            && let Some(answer) = fallback()
+        {
+            return Some(answer);
+        }
+        for reason in self.reasons {
+            analyzer.record_query_incomplete(reason);
+        }
+        self.value
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_exact_rust_external_call_with_operation<'analyzer, 'factory, 'selection>(
     analyzer: &'analyzer dyn IAnalyzer,
@@ -436,134 +703,142 @@ pub(crate) fn resolve_exact_rust_external_call_with_operation<'analyzer, 'factor
     operation_factory: &'factory native_points::RustDefinitionOperationFactory<'analyzer>,
     operation: &mut brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<'analyzer, 'selection>,
 ) -> Option<(ExactExternalCallProof, ResolverOwnedExternalCalleeIdentity)> {
-    let callee = call_path_for_site(tree, site)?;
+    let function = call_path_for_site(tree, site)?;
+    let callee = brokk_bifrost_rust::structural::call_function_target(function);
     if callee.kind() == "field_expression" {
-        if let Some(proof) = exact_rust_external_method_call_with_operation(
-            analyzer,
-            file,
-            source,
-            site,
-            cancellation,
-            operation_factory,
-            &mut *operation,
-        ) {
-            return Some(proof);
-        }
-        let receiver_facts = receiver_facts()?;
-        return exact_rust_external_receiver_call(
+        let proof = ExternalCallProbe::capture(analyzer, || {
+            exact_rust_external_method_call_with_operation(
+                analyzer,
+                file,
+                source,
+                site,
+                cancellation,
+                operation_factory,
+                &mut *operation,
+            )
+        });
+        return proof.or_else(analyzer, || {
+            let receiver_facts = receiver_facts()?;
+            exact_rust_external_receiver_call(
+                analyzer,
+                file,
+                source,
+                tree,
+                site,
+                function,
+                &receiver_facts,
+                cancellation,
+                operation_factory,
+                operation,
+            )
+        });
+    }
+    let proof = ExternalCallProbe::capture(analyzer, || {
+        exact_rust_external_type_call_with_operation(
             analyzer,
             file,
             source,
             tree,
             site,
-            callee,
-            &receiver_facts,
+            operation_factory,
+            &mut *operation,
+            cancellation,
+        )
+    });
+    proof.or_else(analyzer, || {
+        let segments = rust_path_segments(callee)?;
+        let (terminal, owners) = segments.split_last()?;
+        // A crate-level free function such as `tokio::spawn` has one owner
+        // segment. A bare `spawn` has none and cannot establish an external crate
+        // identity; focus must cover only the terminal name.
+        if owners.is_empty()
+            || terminal.start_byte() > site.focus_start_byte
+            || site.focus_end_byte > terminal.end_byte()
+        {
+            return None;
+        }
+        // The import binder decides first, for any owner depth: `net::TcpStream::connect`
+        // with `use std::net as net;` binds through the leading segment `net` (#3491).
+        // A binder that proves nothing leaves the written path to the native root check.
+        let file_evidence = ExternalCalleeFileEvidence::default();
+        let external_site = ExternalCalleeSite {
+            source,
+            tree,
+            callee_start_byte: site.focus_start_byte,
+            file_evidence: &file_evidence,
+        };
+        if let Some(imported) =
+            crate::analyzer::rust::expand_rust_imported_external_callee_with_operation(
+                analyzer,
+                file,
+                "",
+                Some(&external_site),
+                operation_factory,
+                &mut *operation,
+            )
+        {
+            return Some((
+                imported.exact_external_call?,
+                imported.external_callee_identity?,
+            ));
+        }
+        let root = owners.first()?;
+        if !native_external_root(
+            analyzer,
+            token,
+            file,
+            source,
+            tree,
+            *root,
+            cancellation,
+            None,
+            operation_factory,
+            &mut *operation,
+        ) {
+            return None;
+        }
+        let parameter_count = rust_call_written_arity(tree, callee.start_byte())?;
+        let owner_components = canonical_rust_external_owner_components(
+            analyzer,
+            file,
+            source,
+            tree,
+            owners,
             cancellation,
             operation_factory,
             operation,
         );
-    }
-    if let Some(proof) = exact_rust_external_type_call_with_operation(
-        analyzer,
-        file,
-        source,
-        tree,
-        site,
-        operation_factory,
-        &mut *operation,
-        cancellation,
-    ) {
-        return Some(proof);
-    }
-    let segments = rust_path_segments(callee)?;
-    let (terminal, owners) = segments.split_last()?;
-    // A crate-level free function such as `tokio::spawn` has one owner
-    // segment. A bare `spawn` has none and cannot establish an external crate
-    // identity; focus must cover only the terminal name.
-    if owners.is_empty()
-        || terminal.start_byte() > site.focus_start_byte
-        || site.focus_end_byte > terminal.end_byte()
-    {
-        return None;
-    }
-    // The import binder decides first, for any owner depth: `net::TcpStream::connect`
-    // with `use std::net as net;` binds through the leading segment `net` (#3491).
-    // A binder that proves nothing leaves the written path to the native root check.
-    let file_evidence = ExternalCalleeFileEvidence::default();
-    let external_site = ExternalCalleeSite {
-        source,
-        tree,
-        callee_start_byte: site.focus_start_byte,
-        file_evidence: &file_evidence,
-    };
-    if let Some(imported) =
-        crate::analyzer::rust::expand_rust_imported_external_callee_with_operation(
+        let member = rust_node_text(*terminal, source);
+        let declared = rust_external_callable_declaration(
             analyzer,
-            file,
-            "",
-            Some(&external_site),
-            operation_factory,
-            &mut *operation,
+            &owner_components,
+            member,
+            parameter_count,
+            cancellation,
+        );
+        // The unmodeled-std identity is for a path the author wrote as an extern
+        // crate: a leading `::` or the root identifier alloc, core or std. A
+        // prelude spelling such as `String::from` canonicalizes to a std owner
+        // too, but it stays outside this path (#4317).
+        let written_extern_root = rust_path_is_leading_absolute(*root)
+            || matches!(rust_node_text(*root, source), "alloc" | "core" | "std");
+        if !(written_extern_root
+            && rust_external_identity_is_unmodeled_std_path(analyzer, &owner_components, member))
+            && !declared
+        {
+            return None;
+        }
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return None;
+        }
+        external_call_proof_and_identity(
+            analyzer,
+            &owner_components,
+            member,
+            parameter_count,
+            cancellation,
         )
-    {
-        return Some((
-            imported.exact_external_call?,
-            imported.external_callee_identity?,
-        ));
-    }
-    let root = owners.first()?;
-    if !native_external_root(
-        analyzer,
-        token,
-        file,
-        source,
-        tree,
-        *root,
-        cancellation,
-        None,
-        operation_factory,
-        &mut *operation,
-    ) {
-        return None;
-    }
-    let parameter_count = rust_call_written_arity(tree, callee.start_byte())?;
-    let owner_components = canonical_rust_external_owner_components(
-        analyzer,
-        file,
-        source,
-        tree,
-        owners,
-        cancellation,
-        operation_factory,
-        operation,
-    );
-    let member = rust_node_text(*terminal, source);
-    let declared = rust_external_callable_declaration(
-        analyzer,
-        &owner_components,
-        member,
-        parameter_count,
-        cancellation,
-    );
-    if !rust_external_identity_is_unmodeled_std_path(
-        analyzer,
-        rust_node_text(*root, source),
-        &owner_components,
-        member,
-    ) && !declared
-    {
-        return None;
-    }
-    if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        return None;
-    }
-    external_call_proof_and_identity(
-        analyzer,
-        &owner_components,
-        member,
-        parameter_count,
-        cancellation,
-    )
+    })
 }
 
 /// Select a member written through a proven nominal type, such as
@@ -579,7 +854,8 @@ pub(crate) fn exact_rust_external_type_call_with_operation<'analyzer>(
     operation: &mut brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<'analyzer, '_>,
     cancellation: Option<&CancellationToken>,
 ) -> Option<(ExactExternalCallProof, ResolverOwnedExternalCalleeIdentity)> {
-    let callee = call_path_for_site(tree, site)?;
+    let function = call_path_for_site(tree, site)?;
+    let callee = brokk_bifrost_rust::structural::call_function_target(function);
     let terminal = callee.child_by_field_name("name")?;
     let mut qualifier = callee.child_by_field_name("path")?;
     let mut trait_node = None;
@@ -590,7 +866,7 @@ pub(crate) fn exact_rust_external_type_call_with_operation<'analyzer>(
             qualifier = qualifier.child_by_field_name("type")?;
         }
     }
-    let overlay = analyzer.semantic_model_overlay()?;
+    let overlay = analyzer.semantic_model_overlay_read().published()?;
     let resolve_owner = |node: Node<'_>, operation: &mut brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<'analyzer, '_>| {
         let owners = rust_path_segments(node)?;
         let root = *owners.first()?;
@@ -620,7 +896,7 @@ pub(crate) fn exact_rust_external_type_call_with_operation<'analyzer>(
             return None;
         }
         let owner = components.join(".");
-        let symbol = RustOverlayCrates::new(Some(&overlay)).referenceable_symbol(&owner)?;
+        let symbol = RustOverlayCrates::new(Some(&overlay)).referenceable_owner(&owner)?;
         if symbol.kind != SemanticModelSymbolKind::Trait {
             if node.kind() == "generic_type" {
                 return None;
@@ -641,17 +917,20 @@ pub(crate) fn exact_rust_external_type_call_with_operation<'analyzer>(
         }
         Some(symbol.qualified_name.clone())
     };
-    let mut owner = crate::analyzer::rust::std_types::rust_nominal_receiver_owner_with_operation(
-        analyzer,
-        file,
-        source,
-        qualifier,
-        factory,
-        &mut *operation,
-        None,
-    )
-    .or_else(|| resolve_owner(qualifier, &mut *operation))?;
-    let mut symbol = RustOverlayCrates::new(Some(&overlay)).referenceable_symbol(&owner)?;
+    let nominal_owner = ExternalCallProbe::capture(analyzer, || {
+        crate::analyzer::rust::std_types::rust_nominal_receiver_owner_with_operation(
+            analyzer,
+            file,
+            source,
+            qualifier,
+            factory,
+            &mut *operation,
+            None,
+        )
+    });
+    let mut owner =
+        nominal_owner.or_else(analyzer, || resolve_owner(qualifier, &mut *operation))?;
+    let mut symbol = RustOverlayCrates::new(Some(&overlay)).referenceable_owner(&owner)?;
     // A bare/imported trait path fixes the trait, while its explicit self
     // supplies the implementing type. A bracketed type fixes that type itself.
     if trait_node.is_none() && symbol.kind == SemanticModelSymbolKind::Trait {
@@ -659,14 +938,13 @@ pub(crate) fn exact_rust_external_type_call_with_operation<'analyzer>(
     }
     let constraint = if let Some(node) = trait_node {
         let trait_owner = resolve_owner(node, &mut *operation)?;
-        let symbol = RustOverlayCrates::new(Some(&overlay)).referenceable_symbol(&trait_owner)?;
+        let symbol = RustOverlayCrates::new(Some(&overlay)).referenceable_owner(&trait_owner)?;
         if symbol.kind != SemanticModelSymbolKind::Trait {
             return None;
         }
-        let arguments = node.child_by_field_name("type_arguments").map(|arguments| {
-            let mut cursor = arguments.walk();
-            arguments.named_children(&mut cursor).collect::<Vec<_>>()
-        });
+        let arguments = node
+            .child_by_field_name("type_arguments")
+            .map(super::trait_applicability::source_type_arguments);
         Some(crate::analyzer::rust::modeled_members::UfcsTrait {
             owner: trait_owner,
             arguments,
@@ -690,7 +968,7 @@ pub(crate) fn exact_rust_external_type_call_with_operation<'analyzer>(
         if members.is_empty() || members.iter().any(|record| !record.has_receiver()) {
             return None;
         }
-        let call = callee
+        let call = function
             .parent()
             .filter(|node| node.kind() == "call_expression")?;
         let actual = call.child_by_field_name("arguments")?.named_child(0)?;
@@ -706,7 +984,7 @@ pub(crate) fn exact_rust_external_type_call_with_operation<'analyzer>(
                     None,
                 )
             })?;
-        symbol = RustOverlayCrates::new(Some(&overlay)).referenceable_symbol(&owner)?;
+        symbol = RustOverlayCrates::new(Some(&overlay)).referenceable_owner(&owner)?;
     }
     if !matches!(
         symbol.kind,
@@ -744,7 +1022,7 @@ pub(crate) fn exact_rust_external_type_call_with_operation<'analyzer>(
     }
     let (declaring_owner, has_receiver, parameter_count) = selected?;
     if has_receiver {
-        let actual = callee
+        let actual = function
             .parent()?
             .child_by_field_name("arguments")?
             .named_child(0)?;
@@ -788,16 +1066,16 @@ fn exact_rust_external_receiver_call<'analyzer>(
     source: &str,
     tree: &Tree,
     site: &ResolvedReferenceSite,
-    callee: Node<'_>,
+    function: Node<'_>,
     receiver_facts: &crate::analyzer::rust::semantic::RustReceiverTypeFacts,
     cancellation: Option<&CancellationToken>,
     operation_factory: &native_points::RustDefinitionOperationFactory<'analyzer>,
     operation: &mut brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<'analyzer, '_>,
 ) -> Option<(ExactExternalCallProof, ResolverOwnedExternalCalleeIdentity)> {
-    let receiver = callee.child_by_field_name("value")?;
-    let member_node = callee.child_by_field_name("field")?;
-    if site.focus_start_byte < callee.start_byte()
-        || site.focus_end_byte > callee.end_byte()
+    let (receiver, member_node) = brokk_bifrost_rust::structural::rust_method_call_parts(function)?;
+    // A reference site may include the wrapper's explicit type arguments.
+    if site.focus_start_byte < function.start_byte()
+        || site.focus_end_byte > function.end_byte()
         || site.focus_start_byte > member_node.start_byte()
         || member_node.end_byte() > site.focus_end_byte
         || cancellation.is_some_and(CancellationToken::is_cancelled)
@@ -806,7 +1084,7 @@ fn exact_rust_external_receiver_call<'analyzer>(
     }
     let member = rust_node_text(member_node, source);
     let parameter_count = rust_call_written_arity(tree, member_node.start_byte())?;
-    let overlay = analyzer.semantic_model_overlay()?;
+    let overlay = analyzer.semantic_model_overlay_read().published()?;
     let owner =
         receiver_facts.owner_of_expression(source, tree, receiver, &overlay, &mut |ty| {
             crate::analyzer::rust::std_types::rust_nominal_receiver_owner_with_operation(
@@ -849,12 +1127,17 @@ fn exact_rust_external_receiver_call<'analyzer>(
     ))
 }
 
+/// `file`, `source` and `tree` are the file that declares `import` and
+/// `imports`; `parameter_count` is the written arity of the call being proved,
+/// which may sit in another file (a crate-root import used from a descendant).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn rust_import_binder_external_callee(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
     file: &ProjectFile,
-    site: &ExternalCalleeSite<'_>,
+    source: &str,
+    tree: &Tree,
+    parameter_count: u32,
     import: &ImportInfo,
     imports: &[ImportInfo],
     member: &str,
@@ -863,14 +1146,29 @@ pub(crate) fn rust_import_binder_external_callee(
     operation: &mut brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<'_, '_>,
     cancellation: Option<&CancellationToken>,
 ) -> Option<(ExactExternalCallProof, ResolverOwnedExternalCalleeIdentity)> {
-    let source = site.source;
-    let tree = site.tree;
     let path = import.path.as_ref()?;
     if path.segments.len() < 2 {
         return None;
     }
-    let parameter_count = rust_call_written_arity(tree, site.callee_start_byte)?;
     let (written, _) = import_path_in_tree(import, tree, source)?;
+    let canonical_owner;
+    let owner_components = if rust_path_is_leading_absolute(written.root) {
+        let head = written
+            .root
+            .child_by_field_name("name")
+            .unwrap_or(written.root);
+        canonical_owner = canonical_absolute_owner(
+            analyzer,
+            operation,
+            file,
+            rust_node_text(head, source),
+            owner_components.iter().skip(1).cloned(),
+            cancellation,
+        )?;
+        canonical_owner.as_slice()
+    } else {
+        owner_components
+    };
     if written.segments != path.segments
         || !native_external_root(
             analyzer,
@@ -884,18 +1182,14 @@ pub(crate) fn rust_import_binder_external_callee(
             operation_factory,
             operation,
         )
-        || (!rust_external_identity_is_unmodeled_std_path(
-            analyzer,
-            rust_node_text(written.root, source),
-            owner_components,
-            member,
-        ) && !rust_external_callable_declaration(
-            analyzer,
-            owner_components,
-            member,
-            parameter_count,
-            cancellation,
-        ))
+        || (!rust_external_identity_is_unmodeled_std_path(analyzer, owner_components, member)
+            && !rust_external_callable_declaration(
+                analyzer,
+                owner_components,
+                member,
+                parameter_count,
+                cancellation,
+            ))
     {
         return None;
     }
@@ -906,6 +1200,232 @@ pub(crate) fn rust_import_binder_external_callee(
         parameter_count,
         cancellation,
     )
+}
+
+/// The external free function that a bare call names only through glob
+/// imports, such as `stdout()` under `use std::io::*;` (#9949).
+///
+/// The caller passes only a site whose selected answer stopped at an unindexed
+/// import boundary with no definition and no lexical binding, so the selected
+/// resolver has already applied Rust's precedence and namespaces: no local
+/// value, no workspace item and no workspace glob binds the name in the value
+/// namespace. A glob is the weakest binder, so what is left to prove is which
+/// glob binds the name. Each glob visible at the call in the call's own module
+/// is decided by the activated models' enumeration of the module it names.
+/// One glob whose module exports a free function of the name, with every other
+/// visible glob proven to export no value of that name, selects the function.
+/// Anything less leaves the call open: a named import of the same spelling,
+/// which the named-binder route decides; a glob into the workspace, whose
+/// exports are the resolver's to enumerate and which may forward an external
+/// glob; a glob under a `cfg` attribute; a module that no model enumerates
+/// completely; and two globs that both export the name.
+///
+/// Returns the proof, the identity and the glob's written module path, which
+/// is the witness that the glob route, not the call's spelling, selected it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_rust_glob_external_call_with_operation(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+    source: &str,
+    tree: &Tree,
+    site: &ResolvedReferenceSite,
+    cancellation: Option<&CancellationToken>,
+    operation_factory: &native_points::RustDefinitionOperationFactory<'_>,
+    operation: &mut brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<'_, '_>,
+) -> Option<(
+    ExactExternalCallProof,
+    ResolverOwnedExternalCalleeIdentity,
+    String,
+)> {
+    let callee = call_path_for_site(tree, site)?;
+    if callee.kind() != "identifier"
+        || callee.start_byte() > site.focus_start_byte
+        || site.focus_end_byte > callee.end_byte()
+    {
+        return None;
+    }
+    let name = rust_node_text(callee, source);
+    let parameter_count = rust_call_written_arity(tree, callee.start_byte())?;
+    // Missing authority stays open: without an activated model no glob's
+    // module can be enumerated.
+    let overlay = analyzer.semantic_model_overlay_read().published()?;
+    let selected_cancellation = cancellation.cloned().unwrap_or_default();
+    let imports = crate::analyzer::rust::std_types::selected_import_infos(
+        analyzer,
+        operation,
+        file,
+        &selected_cancellation,
+    )?;
+    let mut selected: Option<RustPathRoute> = None;
+    for import in &imports {
+        let Some(path) = import.path.as_ref() else {
+            // A route-less glob names no module this proof could enumerate.
+            if import.is_wildcard {
+                return None;
+            }
+            continue;
+        };
+        if !rust_import_binder_visible_at_byte(path, callee.start_byte(), tree) {
+            continue;
+        }
+        if !import.is_wildcard {
+            // An explicit import outranks every glob. Whether it binds a
+            // value is the named-binder route's question, not this one's.
+            // Only a same-name import can decide this call; an unrelated
+            // named import has no route to extract here (`{self}` has no
+            // binder span) and must not abort the glob proof.
+            if import.local_name() == Some(name) {
+                return None;
+            }
+            continue;
+        }
+        let (written, _) = import_path_in_tree(import, tree, source)?;
+        let declaration = enclosing_use_declaration(written.root)?;
+        if brokk_bifrost_rust::lexical_scope::rust_cfg_condition(declaration, source)
+            != brokk_bifrost_rust::lexical_scope::RustCfgCondition::Always
+        {
+            return None;
+        }
+        if !native_external_root(
+            analyzer,
+            token,
+            file,
+            source,
+            tree,
+            written.root,
+            cancellation,
+            Some(&imports),
+            operation_factory,
+            &mut *operation,
+        ) {
+            return None;
+        }
+        match rust_glob_value_binding(
+            analyzer,
+            &overlay,
+            &written.segments,
+            name,
+            parameter_count,
+            cancellation,
+        ) {
+            RustGlobValueBinding::Function => match &selected {
+                // Two globs of one module bind one item.
+                Some(route) if route.segments == written.segments => {}
+                Some(_) => return None,
+                None => {
+                    selected = Some(RustPathRoute {
+                        segments: written.segments,
+                        written: written.full_path,
+                    });
+                }
+            },
+            RustGlobValueBinding::Absent => {}
+            RustGlobValueBinding::Open => return None,
+        }
+    }
+    let route = selected?;
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return None;
+    }
+    let (proof, identity) = external_call_proof_and_identity(
+        analyzer,
+        &route.segments,
+        name,
+        parameter_count,
+        cancellation,
+    )?;
+    Some((proof, identity, route.written))
+}
+
+/// One glob's module route: its segments and its written spelling.
+struct RustPathRoute {
+    segments: Vec<String>,
+    written: String,
+}
+
+/// What the enumerated surface of one glob's module says about one
+/// value-namespace name.
+enum RustGlobValueBinding {
+    /// The module exports a free function of that name at the written arity.
+    Function,
+    /// The module's complete surface holds no value of that name: no member,
+    /// or only a module, type, trait or macro, which other namespaces hold.
+    Absent,
+    /// The surface cannot decide: no model declares the module, its surface is
+    /// partial or conflicting, or the name is a value other than a free
+    /// function of the written arity.
+    Open,
+}
+
+fn rust_glob_value_binding(
+    analyzer: &dyn IAnalyzer,
+    overlay: &brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay,
+    module: &[String],
+    name: &str,
+    parameter_count: u32,
+    cancellation: Option<&CancellationToken>,
+) -> RustGlobValueBinding {
+    let Some(owner) = RustOverlayCrates::new(Some(overlay))
+        .referenceable_symbol(&RustOverlayCrates::pack_name(module))
+    else {
+        return RustGlobValueBinding::Open;
+    };
+    if owner.kind != SemanticModelSymbolKind::Module {
+        return RustGlobValueBinding::Open;
+    }
+    // A declared public callable is a positive fact even in a partial pack: a
+    // module's value namespace holds at most one item of a name.
+    if rust_external_callable_declaration(analyzer, module, name, parameter_count, cancellation) {
+        return RustGlobValueBinding::Function;
+    }
+    let members = overlay.member_target_on_owner(&owner.id, name);
+    match members.disposition {
+        SemanticModelMemberTargetDisposition::Absent => RustGlobValueBinding::Absent,
+        SemanticModelMemberTargetDisposition::Unique => {
+            let [member] = members.records.as_slice() else {
+                unreachable!("a unique member target has one record: {members:?}");
+            };
+            // A unique record of the owner's own surface needs only that
+            // record to be complete, but a record in another namespace leaves
+            // room for a same-named value that a partial surface omitted, so
+            // the absence also needs the whole surface (the same test
+            // `member_target_on_owner` applies before it reports Absent).
+            // Unit and tuple structs also declare a value constructor, so a
+            // struct does not prove the value namespace empty.
+            if matches!(
+                member.kind,
+                SemanticModelSymbolKind::Module
+                    | SemanticModelSymbolKind::Trait
+                    | SemanticModelSymbolKind::TypeAlias
+                    | SemanticModelSymbolKind::Enum
+                    | SemanticModelSymbolKind::Union
+                    | SemanticModelSymbolKind::Macro
+            ) && overlay.owner_surface(&owner).proves_absence()
+                && overlay
+                    .gapped_member_surface(&owner.qualified_name, name)
+                    .is_none()
+            {
+                RustGlobValueBinding::Absent
+            } else {
+                RustGlobValueBinding::Open
+            }
+        }
+        SemanticModelMemberTargetDisposition::Incomplete
+        | SemanticModelMemberTargetDisposition::Conflict => RustGlobValueBinding::Open,
+    }
+}
+
+/// The `use` declaration that contains one node of its route.
+fn enclosing_use_declaration(node: Node<'_>) -> Option<Node<'_>> {
+    let mut current = Some(node);
+    while let Some(candidate) = current {
+        if candidate.kind() == "use_declaration" {
+            return Some(candidate);
+        }
+        current = candidate.parent();
+    }
+    None
 }
 
 /// The parser-backed route of one import binder, shared by member selection
@@ -1012,7 +1532,7 @@ pub(crate) fn exact_rust_external_method_call_attempt_with_operation<
     ExactExternalCallProof,
     ResolverOwnedExternalCalleeIdentity,
 )> {
-    crate::analyzer::rust::std_types::completed_proof(cancellation, || {
+    crate::analyzer::rust::std_types::completed_proof(analyzer, cancellation, || {
         let method = site.focus_start_byte..site.focus_end_byte;
         let (owner, arity) =
             crate::analyzer::rust::std_types::rust_method_receiver_owner_with_operation(
@@ -1058,11 +1578,11 @@ fn rust_external_callable_declaration(
     parameter_count: u32,
     cancellation: Option<&CancellationToken>,
 ) -> bool {
-    let Some(overlay) = analyzer.semantic_model_overlay() else {
+    let Some(overlay) = analyzer.semantic_model_overlay_read().published() else {
         return false;
     };
     let owner = RustOverlayCrates::pack_name(owner_components);
-    let Some(owner_symbol) = RustOverlayCrates::new(Some(&overlay)).referenceable_symbol(&owner)
+    let Some(owner_symbol) = RustOverlayCrates::new(Some(&overlay)).referenceable_owner(&owner)
     else {
         return false;
     };
@@ -1101,11 +1621,13 @@ fn rust_external_callable_declaration(
 /// conflicts, private members, and incomplete overload sets.
 fn rust_external_identity_is_unmodeled_std_path(
     analyzer: &dyn IAnalyzer,
-    root: &str,
     owner_components: &[String],
     member: &str,
 ) -> bool {
-    if !matches!(root, "alloc" | "core" | "std") {
+    if !owner_components
+        .first()
+        .is_some_and(|root| matches!(root.as_str(), "alloc" | "core" | "std"))
+    {
         return false;
     }
     let owner = RustOverlayCrates::pack_name(owner_components);
@@ -1124,7 +1646,7 @@ fn rust_external_identity_is_unmodeled_std_path(
     }) {
         return false;
     }
-    let Some(overlay) = analyzer.semantic_model_overlay() else {
+    let Some(overlay) = analyzer.semantic_model_overlay_read().published() else {
         return true;
     };
     let member_name = format!("{owner}.{member}");
@@ -1200,7 +1722,7 @@ fn rust_external_callable_match_with_overlay(
     } else {
         None
     };
-    let owner = RustOverlayCrates::new(Some(overlay)).referenceable_symbol(owner);
+    let owner = RustOverlayCrates::new(Some(overlay)).referenceable_owner(owner);
     let (callable_owner, callable_member) = reexported
         .as_ref()
         .and_then(|symbol| {
@@ -1253,4 +1775,46 @@ pub(crate) fn rust_call_written_arity(tree: &Tree, callee_start_byte: usize) -> 
     let arguments = node.child_by_field_name("arguments")?;
     let mut cursor = arguments.walk();
     u32::try_from(arguments.named_children(&mut cursor).count()).ok()
+}
+
+#[cfg(test)]
+mod probe_completion_tests {
+    use super::*;
+    use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
+    use brokk_bifrost_analysis::analyzer::{MultiAnalyzer, QueryReadIncomplete};
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#11145: optional external probes hid stops without a successful fallback")]
+    fn stopped_external_probe_completion_follows_selected_route() {
+        for (probe_value, fallback, incomplete) in [
+            (Some(7), None, true),
+            (Some(7), Some(8), false),
+            (None, None, true),
+            (None, Some(8), false),
+        ] {
+            let analyzer = MultiAnalyzer::default();
+            let outer = AnalyzerQueryScope::new(&analyzer);
+            let probe = ExternalCallProbe::capture(&analyzer, || {
+                crate::analyzer::rust::std_types::completed_proof(&analyzer, None, || {
+                    crate::analyzer::rust::std_types::operational_proof_stop("depth_limit", brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause::Budget);
+                    probe_value
+                })
+                .into_value()
+            });
+            let result = probe.or_else(&analyzer, || fallback);
+            assert_eq!(result, fallback.or(probe_value));
+            assert_eq!(
+                outer.read_completion(),
+                if incomplete {
+                    Err(QueryReadIncomplete::ProofStopped {
+                        reason: "depth_limit",
+                        cause: Some(brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause::Budget),
+                    })
+                } else {
+                    Ok(())
+                }
+            );
+        }
+    }
 }

@@ -12,7 +12,8 @@ use crate::{
     analyzer::IndexWarmer,
     analyzer::packs_document::{
         ReleaseCoverage, WORKSPACE_PACKS_DOCUMENT_PATH, WorkspaceActivationSources,
-        WorkspacePacksConfig, activate_selected_installed_workspace_semantic_sources_in_catalog,
+        WorkspaceActivationUpdateSource, WorkspacePacksConfig,
+        activate_selected_installed_workspace_semantic_sources_in_catalog,
         activate_selected_workspace_semantic_sources_in_catalog, bootstrap_semantic_model_catalog,
         install_semantic_model_catalog_bootstrap as install_shared_semantic_model_catalog_bootstrap,
         intrinsic_language_evidence, load_workspace_packs_config_at, node_runtime_evidence,
@@ -243,6 +244,7 @@ fn parse_workspace_semantic_models_setting(
 #[derive(Debug)]
 struct WorkspacePackActivationState {
     config: Option<Arc<WorkspacePacksConfig>>,
+    update_source: Option<Arc<WorkspaceActivationUpdateSource>>,
     ecosystems: Vec<crate::analyzer::DependencyPackEcosystem>,
     failure: Option<String>,
     overlay: SemanticModelOverlayStatus,
@@ -300,6 +302,7 @@ impl WorkspacePackActivationState {
         reason: String,
     ) -> Self {
         Self {
+            update_source: None,
             config,
             ecosystems,
             failure: Some(reason.clone()),
@@ -444,7 +447,23 @@ fn activate_configured_semantic_models_selected(
     catalog
         .release_leases(&leases)
         .map_err(|error| error.to_string())?;
+    let update_source = activation
+        .as_ref()
+        .ok()
+        .and_then(|activation| activation.as_ref())
+        .map(|activation| {
+            WorkspaceActivationUpdateSource::new(
+                Arc::clone(&catalog),
+                activation.registration_evidence.clone(),
+                packs_config.as_deref(),
+                workspace.retention_budget(),
+            )
+            .map(Arc::new)
+        })
+        .transpose()
+        .map_err(|error| error.to_string())?;
     let mut state = WorkspacePackActivationState {
+        update_source,
         config: packs_config,
         ecosystems,
         failure: activation.as_ref().err().cloned(),
@@ -493,6 +512,7 @@ fn activate_configured_semantic_models_installed_stage_selected(
         let ecosystems = workspace_pack_ecosystems(workspace, packs_config.as_deref());
         return Ok(InstalledPackStageOutcome::AcquisitionPending(
             WorkspacePackActivationState {
+                update_source: None,
                 config: packs_config,
                 ecosystems,
                 failure: None,
@@ -546,7 +566,17 @@ fn activate_configured_semantic_models_installed_stage_selected(
         .map_err(|error| error.to_string())?;
     match activation {
         Ok(Some(installed)) => {
+            let update_source = Some(Arc::new(
+                WorkspaceActivationUpdateSource::new(
+                    Arc::clone(&catalog),
+                    installed.activation.registration_evidence.clone(),
+                    packs_config.as_deref(),
+                    workspace.retention_budget(),
+                )
+                .map_err(|error| error.to_string())?,
+            ));
             let mut state = WorkspacePackActivationState {
+                update_source,
                 config: packs_config,
                 ecosystems,
                 failure: None,
@@ -564,6 +594,7 @@ fn activate_configured_semantic_models_installed_stage_selected(
         }
         Ok(None) => Ok(InstalledPackStageOutcome::Settled(
             WorkspacePackActivationState {
+                update_source: None,
                 config: packs_config,
                 ecosystems,
                 failure: None,
@@ -596,7 +627,7 @@ fn configured_explicit_legacy(configured: &Option<ConfiguredSemanticModels>) -> 
 struct SessionPackCatalogPrelude {
     workspace_models: bool,
     ecosystems: Vec<crate::analyzer::DependencyPackEcosystem>,
-    catalog: SemanticPackCatalog,
+    catalog: Arc<SemanticPackCatalog>,
     additional_evidence: Vec<SemanticModelActivationEvidence>,
     leases: Vec<crate::analyzer::semantic_model::CatalogLeaseToken>,
     coverage: PinnedPackCoverage,
@@ -692,7 +723,7 @@ fn open_session_pack_catalog(
     Ok(SessionPackCatalogPrelude {
         workspace_models,
         ecosystems,
-        catalog,
+        catalog: Arc::new(catalog),
         additional_evidence,
         leases,
         coverage: PinnedPackCoverage {
@@ -889,6 +920,7 @@ fn activate_legacy_configured_semantic_models_with_bootstrap(
         }
     }
     let mut state = WorkspacePackActivationState {
+        update_source: None,
         config: None,
         ecosystems: Vec::new(),
         failure: None,
@@ -944,6 +976,653 @@ mod workspace_semantic_model_configuration_tests {
     }
   }]
 }"#;
+
+    /// Bootstrap registration is process-wide. Run `test_name` again in a child
+    /// process so its provider cannot collide with the recording provider of
+    /// release_coverage_tests, including when libtest runs both in one process.
+    /// Returns true in the parent, which has then already checked the child.
+    fn rerun_in_isolated_bootstrap_child(test_name: &str) -> bool {
+        const CHILD: &str = "BIFROST_TEST_ISOLATED_BOOTSTRAP_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            return false;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!(
+                    "searchtools_service::workspace_semantic_model_configuration_tests::{test_name}"
+                ),
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("run graph activation with an isolated bootstrap");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("test result: ok. 1 passed"),
+            "{test_name} child did not pass exactly one test: stdout={stdout} stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
+
+    /// A real MCP session over a durable test catalog whose pack the workspace
+    /// activation published. With `authored_source`, the pack's type is
+    /// anchored to the declaration `Anchored` in `src/lib.rs`, so the published
+    /// overlay is row-backed and carries a workspace-authored path.
+    struct GraphFixture {
+        _temp: tempfile::TempDir,
+        root: PathBuf,
+        catalog: SemanticPackCatalog,
+        source: crate::analyzer::semantic_model::DurablePackSource,
+        model: serde_json::Value,
+        service: SearchToolsService,
+    }
+
+    fn graph_fixture(authored_source: bool) -> GraphFixture {
+        use crate::analyzer::semantic_model::{
+            CompilerOptions, DurablePackSource, DurablePackSourceKind, SourceFormat, compile_source,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap().normalize();
+        std::fs::write(root.join("lib.rs"), "pub struct Local;\n").unwrap();
+        std::fs::create_dir_all(root.join(".bifrost")).unwrap();
+        std::fs::write(
+            root.join(".bifrost/packs.json"),
+            r#"{"schema_version":1,"catalog":".bifrost/catalog","ecosystems":[]}"#,
+        )
+        .unwrap();
+        let catalog = SemanticPackCatalog::open(
+            &root.join(".bifrost/catalog"),
+            CatalogOpenMode::ReadWrite,
+            CatalogOptions::default(),
+        )
+        .unwrap();
+        let source = DurablePackSource {
+            kind: DurablePackSourceKind::PreShipped,
+            source_id: "test:reexport-graph".into(),
+        };
+        let mut model: serde_json::Value = serde_json::from_str(WORKSPACE_PACK).unwrap();
+        model["schema_version"] = serde_json::json!(29);
+        model["compatibility"]
+            .as_object_mut()
+            .unwrap()
+            .remove("bifrost");
+        model["rust_external_reexports"] = serde_json::json!([{
+            "kind": "explicit_use", "facade_path": "facade::first", "use_item_id": 1,
+            "target": {"external_crate_id": 1, "external_crate_name": "core",
+                       "item_id": 2, "path": ["core", "item"]}
+        }]);
+        if authored_source {
+            std::fs::create_dir_all(root.join("src")).unwrap();
+            std::fs::write(root.join("src/lib.rs"), "pub struct Anchored;\n").unwrap();
+            model["shards"][0]["payload"]["types"][0]["locator"] = serde_json::json!({
+                "kind": "source", "path": "src/lib.rs", "symbol": "Anchored"
+            });
+        }
+        let first = compile_source(
+            SourceFormat::Json,
+            &serde_json::to_vec(&model).unwrap(),
+            &CompilerOptions::default(),
+        )
+        .unwrap();
+        catalog.install(&first, &source).unwrap();
+        // Enable the host's intrinsic-evidence route without registering any
+        // product packs. The durable test pack above is the entire catalog.
+        install_semantic_model_catalog_bootstrap(|_, _| Ok(Vec::new())).unwrap();
+        let service = SearchToolsService::new_manual_ephemeral(root.clone()).unwrap();
+        GraphFixture {
+            _temp: temp,
+            root,
+            catalog,
+            source,
+            model,
+            service,
+        }
+    }
+
+    /// The published overlay and the warm worker that produced it.
+    fn wait_for_graph_publication(
+        service: &SearchToolsService,
+    ) -> (
+        Arc<crate::analyzer::semantic_model::SemanticModelOverlay>,
+        Arc<SemanticPackWarm>,
+    ) {
+        use crate::analyzer::semantic_model::SemanticModelOverlayRead;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let status = service
+                .call_tool_value("get_active_workspace", serde_json::json!({}))
+                .unwrap();
+            let guard = service.session.read().unwrap();
+            let session = guard.as_ref().unwrap();
+            if status["semantic_packs_ready"] == true
+                && let SemanticModelOverlayRead::Published(overlay) =
+                    session.snapshot.analyzer().semantic_model_overlay_read()
+            {
+                assert_eq!(
+                    overlay
+                        .symbols_named("workspace.GeneratedJobMaker")
+                        .disposition,
+                    SemanticModelOverlayDisposition::Unique
+                );
+                return (overlay, Arc::clone(&session.semantic_packs));
+            }
+            assert!(
+                Instant::now() < deadline,
+                "activation never published: {status}"
+            );
+            drop(guard);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn reexport_graph_change_schedules_warm_and_republishes() {
+        if rerun_in_isolated_bootstrap_child("reexport_graph_change_schedules_warm_and_republishes")
+        {
+            return;
+        }
+        use crate::analyzer::semantic_model::{
+            CompilerOptions, SemanticModelOverlayRead, SourceFormat, compile_source,
+        };
+        let GraphFixture {
+            _temp,
+            root,
+            catalog,
+            source,
+            mut model,
+            service,
+        } = graph_fixture(false);
+        let wait_for_publication = || wait_for_graph_publication(&service);
+        let (before, worker) = wait_for_publication();
+        // Change only the pack's re-export graph. Workspace files and pack
+        // declarations are byte-identical; a no-op source notification asks
+        // the host to compare fresh activation inputs.
+        model["rust_external_reexports"][0]["facade_path"] = serde_json::json!("facade::second");
+        let second = compile_source(
+            SourceFormat::Json,
+            &serde_json::to_vec(&model).unwrap(),
+            &CompilerOptions::default(),
+        )
+        .unwrap();
+        assert!(catalog.remove_source(&source).unwrap());
+        catalog.install(&second, &source).unwrap();
+        {
+            let mut guard = service.session.write().unwrap();
+            let session = guard.as_mut().unwrap();
+            let changes = BTreeSet::from([ProjectFile::new(root.clone(), "lib.rs")]);
+            // Observe the update decision before a warm can publish onto its
+            // cache. A second notification must retain Pending and schedule.
+            session.snapshot = Arc::new(SearchToolsService::update_session_snapshot(
+                session,
+                Some(&changes),
+                None,
+            ));
+            assert!(matches!(
+                session.snapshot.analyzer().semantic_model_overlay_read(),
+                SemanticModelOverlayRead::Pending(_)
+            ));
+            SearchToolsService::apply_changed_files(session, changes, None).unwrap();
+            assert!(!Arc::ptr_eq(&worker, &session.semantic_packs));
+        }
+        let (after, _) = wait_for_publication();
+        assert_ne!(
+            before.active_model_set_hash(),
+            after.active_model_set_hash()
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("lib.rs")).unwrap(),
+            "pub struct Local;\n"
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12435: a directory-only or alias change event carried a stale published overlay and the pack warm never ran"
+    )]
+    fn directory_and_alias_changes_refuse_publication_carry_through_the_update_path() {
+        if rerun_in_isolated_bootstrap_child(
+            "directory_and_alias_changes_refuse_publication_carry_through_the_update_path",
+        ) {
+            return;
+        }
+        use crate::analyzer::semantic_model::SemanticModelOverlayRead;
+        let GraphFixture {
+            _temp,
+            root,
+            service,
+            ..
+        } = graph_fixture(true);
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("docs/readme.md"), "unrelated\n").unwrap();
+        let (mut overlay, mut worker) = wait_for_graph_publication(&service);
+        // The row-backed overlay was authored from this workspace path.
+        assert!(
+            overlay.any_authored_path(|path| path == "src/lib.rs"),
+            "{:?}",
+            overlay.symbols_named("workspace.GeneratedJobMaker").records
+        );
+        let cases: [(&str, bool); 6] = [
+            // An unrelated sibling carries, and so do spellings that only
+            // share a string prefix with a protected path.
+            ("docs/readme.md", true),
+            ("docs/deleted-since.md", true),
+            (".bifrost2", true),
+            ("src2", true),
+            // A directory event names only the directory.
+            (".bifrost", false),
+            ("src", false),
+        ];
+        for (path, carries) in cases {
+            let mut guard = service.session.write().unwrap();
+            let session = guard.as_mut().unwrap();
+            let changes = BTreeSet::from([ProjectFile::new(root.clone(), path)]);
+            session.snapshot = Arc::new(SearchToolsService::update_session_snapshot(
+                session,
+                Some(&changes),
+                None,
+            ));
+            let read = session.snapshot.analyzer().semantic_model_overlay_read();
+            if carries {
+                let SemanticModelOverlayRead::Published(carried) = read else {
+                    panic!("{path} must carry the published overlay");
+                };
+                assert!(Arc::ptr_eq(&overlay, &carried), "{path}");
+                SearchToolsService::apply_changed_files(session, changes, None).unwrap();
+                assert!(
+                    Arc::ptr_eq(&worker, &session.semantic_packs),
+                    "{path} must not schedule a warm"
+                );
+            } else {
+                assert!(
+                    matches!(read, SemanticModelOverlayRead::Pending(_)),
+                    "{path} must leave the overlay Pending"
+                );
+                SearchToolsService::apply_changed_files(session, changes, None).unwrap();
+                assert!(
+                    !Arc::ptr_eq(&worker, &session.semantic_packs),
+                    "{path} must schedule the warm"
+                );
+                drop(guard);
+                (overlay, worker) = wait_for_graph_publication(&service);
+            }
+        }
+        // An alias spelling that no listing certifies, such as another case
+        // for a path that no longer exists, could name the authored file.
+        let mut guard = service.session.write().unwrap();
+        let session = guard.as_mut().unwrap();
+        let changes = BTreeSet::from([ProjectFile::new(root.clone(), "SRC/Lib.rs")]);
+        session.snapshot = Arc::new(SearchToolsService::update_session_snapshot(
+            session,
+            Some(&changes),
+            None,
+        ));
+        assert!(matches!(
+            session.snapshot.analyzer().semantic_model_overlay_read(),
+            SemanticModelOverlayRead::Pending(_)
+        ));
+        SearchToolsService::apply_changed_files(session, changes, None).unwrap();
+        assert!(!Arc::ptr_eq(&worker, &session.semantic_packs));
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11573: a refreshed snapshot lost the semantic-model overlay and get_symbol_sources reported a complete not_found"
+    )]
+    fn real_workspace_models_republish_only_unchanged_inputs() {
+        use crate::analyzer::packs_document::{
+            activate_workspace_semantic_sources_in_catalog, parse_workspace_packs_config,
+        };
+        use crate::analyzer::semantic_model::SemanticModelOverlayRead;
+        let mut external_model: serde_json::Value = serde_json::from_str(WORKSPACE_PACK).unwrap();
+        external_model["schema_version"] = serde_json::json!(29);
+        external_model["compatibility"]
+            .as_object_mut()
+            .unwrap()
+            .remove("bifrost");
+        external_model["carried_sources"] = serde_json::json!(["dependency/generated.rs"]);
+        external_model["shards"][0]["payload"]["types"][0]["locator"] = serde_json::json!({
+            "kind": "source", "path": "dependency/generated.rs", "symbol": "workspace.GeneratedJobMaker"
+        });
+        let (temp, analyzer) = workspace(&external_model.to_string());
+        let root = analyzer.analyzer().project().root().to_path_buf();
+        let config = workspace_activation_config(&analyzer);
+        let packs =
+            parse_workspace_packs_config(r#"{"schema_version":1,"ecosystems":[]}"#).unwrap();
+        let catalog =
+            Arc::new(SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap());
+        let cancellation = CancellationToken::default();
+        let sources = WorkspaceActivationSources {
+            catalog_root: &root,
+            workspace_model_root: Some(&root),
+            config: Some(&packs),
+            intrinsic_shipped_models: false,
+        };
+        let activation = activate_workspace_semantic_sources_in_catalog(
+            &analyzer,
+            &config,
+            &catalog,
+            sources,
+            &[],
+            &cancellation,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(activation.outcome.complete(), "{:?}", activation.outcome);
+        let original = analyzer
+            .analyzer()
+            .semantic_model_overlay_read()
+            .published()
+            .unwrap();
+        assert_eq!(
+            original
+                .symbols_named("workspace.GeneratedJobMaker")
+                .disposition,
+            SemanticModelOverlayDisposition::Unique
+        );
+        let source = WorkspaceActivationUpdateSource::new(
+            Arc::clone(&catalog),
+            activation.registration_evidence,
+            Some(&packs),
+            analyzer.retention_budget(),
+        )
+        .unwrap();
+        let context = || source.context(&config, sources, &[], &cancellation);
+        std::fs::write(root.join("src/lib.rs"), "pub struct Changed;\n").unwrap();
+        // The pack's carried locator is not an indexed workspace definition.
+        // An unrelated local file at that archive-entry path must not make
+        // its typed model description refresh the workspace.
+        std::fs::create_dir_all(root.join("dependency")).unwrap();
+        std::fs::write(
+            root.join("dependency/generated.rs"),
+            "pub struct Unrelated;\n",
+        )
+        .unwrap();
+        let mut service = SearchToolsService::new_manual_ephemeral(root.clone()).unwrap();
+        service.update_strategy = UpdateStrategy::WatchFiles;
+        let query = |snapshot: &WorkspaceAnalyzer| {
+            let published = Arc::new(snapshot.clone());
+            {
+                let mut guard = service.session.write().unwrap();
+                guard.as_mut().unwrap().snapshot = Arc::clone(&published);
+            }
+            let answer = service
+                .call_tool_value(
+                    "get_symbol_sources",
+                    serde_json::json!({
+                        "symbols": ["workspace.GeneratedJobMaker"]
+                    }),
+                )
+                .unwrap();
+            let guard = service.session.read().unwrap();
+            assert!(
+                Arc::ptr_eq(&published, &guard.as_ref().unwrap().snapshot),
+                "model source blocks must not refresh the workspace"
+            );
+            answer
+        };
+        let before = query(&analyzer);
+        assert_eq!(before["not_found"], serde_json::json!([]), "{before}");
+        assert!(
+            before["sources"].as_array().unwrap().iter().any(|source| {
+                source["presentation"] == "semantic_model"
+                    && source["path"] == "dependency/generated.rs"
+            }),
+            "{before}"
+        );
+        let changed = BTreeSet::from([ProjectFile::new(root.clone(), "src/lib.rs")]);
+        let updated = analyzer.update_with_activation_context(&changed, context());
+        let after = query(&updated);
+        assert_eq!(before["sources"], after["sources"]);
+        assert_eq!(after["not_found"], serde_json::json!([]), "{after}");
+        let carried = updated
+            .analyzer()
+            .semantic_model_overlay_read()
+            .published()
+            .unwrap();
+        assert!(Arc::ptr_eq(&original, &carried));
+        std::fs::write(
+            temp.path().join(".bifrost/semantic-models/job-maker.json"),
+            WORKSPACE_PACK.replace("GeneratedJobMaker", "Replacement"),
+        )
+        .unwrap();
+        let model_changed = BTreeSet::from([ProjectFile::new(
+            root.clone(),
+            ".bifrost/semantic-models/job-maker.json",
+        )]);
+        let pending = updated.update_with_activation_context(&model_changed, context());
+        assert!(matches!(
+            pending.analyzer().semantic_model_overlay_read(),
+            SemanticModelOverlayRead::Pending(_)
+        ));
+        std::fs::write(root.join("src/lib.rs"), "pub struct Later;\n").unwrap();
+        let pending = pending.update_with_activation_context(&changed, context());
+        assert!(matches!(
+            pending.analyzer().semantic_model_overlay_read(),
+            SemanticModelOverlayRead::Pending(_)
+        ));
+        let incomplete = query(&pending);
+        assert_eq!(incomplete["complete"], false, "{incomplete}");
+        assert!(
+            incomplete.to_string().contains("SemanticModelsPending"),
+            "{incomplete}"
+        );
+        // A host warm opens a fresh ephemeral catalog; prior session-only
+        // registrations belong to its previous activation.
+        let catalog =
+            Arc::new(SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap());
+        let activation = activate_workspace_semantic_sources_in_catalog(
+            &pending,
+            &config,
+            &catalog,
+            sources,
+            &[],
+            &cancellation,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(activation.outcome.complete(), "{:?}", activation.outcome);
+        let republished = pending
+            .analyzer()
+            .semantic_model_overlay_read()
+            .published()
+            .unwrap();
+        assert_eq!(
+            republished
+                .symbols_named("workspace.Replacement")
+                .disposition,
+            SemanticModelOverlayDisposition::Unique
+        );
+        // Bind a model locator to a real parsed declaration, then invalidate
+        // only that declaration's source while all activation inputs stay put.
+        let mut anchored: serde_json::Value = serde_json::from_str(WORKSPACE_PACK).unwrap();
+        anchored["shards"][0]["payload"]["types"][0]["locator"] = serde_json::json!({
+            "kind": "source", "path": "src/lib.rs", "symbol": "Later"
+        });
+        std::fs::write(
+            root.join(".bifrost/semantic-models/job-maker.json"),
+            serde_json::to_vec(&anchored).unwrap(),
+        )
+        .unwrap();
+        // A host warm opens a fresh ephemeral catalog; prior session-only
+        // registrations belong to its previous activation.
+        let catalog =
+            Arc::new(SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap());
+        let activation = activate_workspace_semantic_sources_in_catalog(
+            &pending,
+            &config,
+            &catalog,
+            sources,
+            &[],
+            &cancellation,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(activation.outcome.complete(), "{:?}", activation.outcome);
+        let overlay = pending
+            .analyzer()
+            .semantic_model_overlay_read()
+            .published()
+            .unwrap();
+        assert!(matches!(
+            overlay.symbols_named("workspace.GeneratedJobMaker").records[0].location,
+            crate::analyzer::semantic_model::SemanticModelLocation::Authored(_)
+        ));
+        let anchor_source = WorkspaceActivationUpdateSource::new(
+            Arc::clone(&catalog),
+            activation.registration_evidence,
+            Some(&packs),
+            pending.retention_budget(),
+        )
+        .unwrap();
+        let workspace_source = get_symbol_sources(
+            pending.analyzer(),
+            SymbolLookupParams {
+                symbols: vec!["workspace.GeneratedJobMaker".into()],
+            },
+        );
+        assert!(!workspace_source.sources.is_empty());
+        assert!(workspace_source.sources.iter().all(|source| {
+            source.origin == brokk_bifrost_tools::searchtools::SourceOrigin::Workspace
+        }));
+        std::fs::write(root.join("src/lib.rs"), "pub struct Rebound;\n").unwrap();
+        let candidates = symbol_source_candidate_files(pending.analyzer(), &workspace_source);
+        assert_eq!(
+            stale_symbol_source_files(pending.analyzer(), candidates).unwrap(),
+            changed
+        );
+        let invalidated = pending.update_with_activation_context(
+            &changed,
+            anchor_source.context(&config, sources, &[], &cancellation),
+        );
+        assert!(matches!(
+            invalidated.analyzer().semantic_model_overlay_read(),
+            SemanticModelOverlayRead::Pending(_)
+        ));
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12435: a directory-only or alias change event carried a stale published overlay"
+    )]
+    fn workspace_models_refuse_carry_for_directory_and_alias_changes() {
+        use crate::analyzer::packs_document::{
+            activate_workspace_semantic_sources_in_catalog, parse_workspace_packs_config,
+        };
+        use crate::analyzer::semantic_model::SemanticModelOverlayRead;
+        let mut anchored: serde_json::Value = serde_json::from_str(WORKSPACE_PACK).unwrap();
+        anchored["shards"][0]["payload"]["types"][0]["locator"] = serde_json::json!({
+            "kind": "source", "path": "src/lib.rs", "symbol": "Local"
+        });
+        let (_temp, analyzer) = workspace(&anchored.to_string());
+        let root = analyzer.analyzer().project().root().to_path_buf();
+        let config = workspace_activation_config(&analyzer);
+        let packs =
+            parse_workspace_packs_config(r#"{"schema_version":1,"ecosystems":[]}"#).unwrap();
+        let catalog =
+            Arc::new(SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap());
+        let cancellation = CancellationToken::default();
+        let sources = WorkspaceActivationSources {
+            catalog_root: &root,
+            workspace_model_root: Some(&root),
+            config: Some(&packs),
+            intrinsic_shipped_models: false,
+        };
+        let activation = activate_workspace_semantic_sources_in_catalog(
+            &analyzer,
+            &config,
+            &catalog,
+            sources,
+            &[],
+            &cancellation,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(activation.outcome.complete(), "{:?}", activation.outcome);
+        let original = analyzer
+            .analyzer()
+            .semantic_model_overlay_read()
+            .published()
+            .unwrap();
+        assert!(original.any_authored_path(|path| path == "src/lib.rs"));
+        let source = WorkspaceActivationUpdateSource::new(
+            Arc::clone(&catalog),
+            activation.registration_evidence,
+            Some(&packs),
+            analyzer.retention_budget(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("docs/readme.md"), "unrelated\n").unwrap();
+        let carries = |paths: &[&str]| {
+            let changed = paths
+                .iter()
+                .map(|path| ProjectFile::new(root.clone(), *path))
+                .collect::<BTreeSet<_>>();
+            let updated = analyzer.update_with_activation_context(
+                &changed,
+                source.context(&config, sources, &[], &cancellation),
+            );
+            match updated.analyzer().semantic_model_overlay_read() {
+                SemanticModelOverlayRead::Published(overlay) => Arc::ptr_eq(&overlay, &original),
+                SemanticModelOverlayRead::Pending(_) => false,
+                other => panic!("{paths:?}: unexpected overlay read {other:?}"),
+            }
+        };
+        // Unrelated siblings carry: an existing file, a deleted one, and
+        // spellings that only share a string prefix with a protected path.
+        assert!(carries(&["docs/readme.md"]));
+        assert!(carries(&["docs/deleted-since.md"]));
+        assert!(carries(&[".bifrost2"]));
+        assert!(carries(&["src2"]));
+        // A directory event may name only the directory that holds a model
+        // source, the model directory, or the directory above it.
+        assert!(!carries(&[".bifrost"]));
+        assert!(!carries(&[".bifrost/semantic-models"]));
+        assert!(!carries(&["src"]));
+        // An uncertified alias spelling may name a protected path.
+        assert!(!carries(&["SRC/LIB.RS"]));
+        // Spellings with `.` and `..` components name the authored file too.
+        assert!(!carries(&["./src/lib.rs"]));
+        assert!(!carries(&["docs/../src/lib.rs"]));
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join("src"), root.join("linked")).unwrap();
+            assert!(!carries(&["linked/lib.rs"]));
+            assert!(!carries(&["docs/readme.md", "linked/lib.rs"]));
+        }
+        // A real rename of the authored source's directory.
+        std::fs::rename(root.join("src"), root.join("moved")).unwrap();
+        assert!(!carries(&["src"]));
+    }
+
+    #[test]
+    fn semantic_model_update_without_activation_context_is_pending() {
+        use crate::analyzer::semantic_model::SemanticModelOverlayRead;
+        let (temp, analyzer) = workspace(WORKSPACE_PACK);
+        let state = activate_configured_semantic_models(
+            temp.path(),
+            &analyzer,
+            Some(workspace_configuration()),
+        )
+        .unwrap();
+        assert!(state.failure.is_none(), "{:?}", state.failure);
+        assert!(matches!(
+            analyzer.analyzer().semantic_model_overlay_read(),
+            SemanticModelOverlayRead::Published(_)
+        ));
+        std::fs::write(temp.path().join("src/lib.rs"), "pub struct Changed;\n").unwrap();
+        let changed = BTreeSet::from([ProjectFile::new(
+            analyzer.analyzer().project().root().to_path_buf(),
+            "src/lib.rs",
+        )]);
+        let updated = analyzer.update(&changed);
+        assert!(matches!(
+            updated.analyzer().semantic_model_overlay_read(),
+            SemanticModelOverlayRead::Pending(_)
+        ));
+    }
 
     #[test]
     fn pending_overlay_status_serializes_warm_stage_and_acquisitions() {
@@ -1126,7 +1805,8 @@ mod workspace_semantic_model_configuration_tests {
         .unwrap();
         let first_overlay = first
             .analyzer()
-            .semantic_model_overlay()
+            .semantic_model_overlay_read()
+            .published()
             .expect("workspace activation publishes an overlay");
         let first_match = first_overlay.symbols_named("workspace.GeneratedJobMaker");
         assert_eq!(
@@ -1155,7 +1835,8 @@ mod workspace_semantic_model_configuration_tests {
         .unwrap();
         let second_overlay = second
             .analyzer()
-            .semantic_model_overlay()
+            .semantic_model_overlay_read()
+            .published()
             .expect("repeated workspace activation publishes an overlay");
         let second_symbol = std::sync::Arc::clone(
             &second_overlay
@@ -1230,6 +1911,7 @@ mod workspace_semantic_model_configuration_tests {
                 report,
             };
             let mut partial = WorkspacePackActivationState {
+                update_source: None,
                 config: None,
                 ecosystems: Vec::new(),
                 failure: None,
@@ -1337,6 +2019,7 @@ mod issue_1228_response_budget_tests {
     fn oversized_symbol_source_response_is_rejected_before_rendering() {
         let result = SymbolSourcesResult {
             sources: vec![SourceBlock {
+                origin: brokk_bifrost_tools::searchtools::SourceOrigin::Workspace,
                 label: "large".to_string(),
                 path: "large.rs".to_string(),
                 start_line: 1,
@@ -1375,6 +2058,7 @@ mod issue_1228_response_budget_tests {
     fn partial_symbol_source_response_keeps_completed_sources_and_typed_cancellation() {
         let result = SymbolSourcesResult {
             sources: vec![SourceBlock {
+                origin: brokk_bifrost_tools::searchtools::SourceOrigin::Workspace,
                 label: "ready".to_string(),
                 path: "ready.rs".to_string(),
                 start_line: 1,
@@ -1422,6 +2106,9 @@ const GET_SYMBOL_SOURCES_RESPONSE_BUDGET_BYTES: usize = 16 * 1024 * 1024;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RunPolicyParams {
+    #[serde(default)]
+    sources: Vec<String>,
+    inline_suppression_prefix: Option<String>,
     #[serde(default)]
     policy_files: Vec<String>,
     #[serde(default)]
@@ -1508,6 +2195,8 @@ pub(crate) struct PreparedRunPolicyPreflight {
 }
 
 struct DecodedRunPolicy {
+    sources: Vec<String>,
+    inline_suppression_prefix: Option<String>,
     policy_inputs: Vec<PolicyEvaluationInput>,
     selected_policy_ids: Vec<PolicyId>,
     options: PolicyEvaluationOptions,
@@ -2232,9 +2921,12 @@ fn start_pack_warm_worker(
     analyzer: Arc<WorkspaceAnalyzer>,
     selected: Vec<crate::analyzer::DependencyPackEcosystem>,
 ) -> Result<std::thread::JoinHandle<()>, String> {
+    // Background work counts as activity for the idle heap release (#12661): taken before the spawn, held until the thread ends.
+    let heap_activity = brokk_bifrost_core::heap_release::IdleHeapRelease::process().warm();
     std::thread::Builder::new()
         .name("bifrost-semantic-pack-warm".to_string())
         .spawn(move || {
+            let _heap_activity = heap_activity;
             brokk_bifrost_analysis::analyzer::without_project_reads(|| {
                 #[cfg(test)]
                 if let Some(hold) = &warm.hold {
@@ -3463,6 +4155,8 @@ pub fn handle() {
     }
 }
 pub(crate) struct PreparedRunPolicy {
+    sources: Vec<String>,
+    workspace_generation: u64,
     snapshot: WorkspaceQueryScope,
     root: PathBuf,
     policy_inputs: Vec<PolicyEvaluationInput>,
@@ -3475,6 +4169,7 @@ pub(crate) struct PreparedRunPolicy {
 }
 
 struct RunPolicySnapshotPreparation {
+    sources: Vec<String>,
     policy_inputs: Vec<PolicyEvaluationInput>,
     selected_policy_ids: Vec<PolicyId>,
     options: PolicyEvaluationOptions,
@@ -3537,10 +4232,18 @@ impl WorkspaceQueryScope {
     }
 
     fn scope_snapshot(&self, source_snapshot: Arc<WorkspaceAnalyzer>) -> Self {
+        // Activation metadata must describe the replacement analyzer's owner,
+        // rather than a settled publication from the previous generation.
+        let pack_activation = match source_snapshot.analyzer().semantic_model_overlay_read() {
+            crate::analyzer::semantic_model::SemanticModelOverlayRead::Pending(_) => {
+                SessionPackActivation::WarmPending
+            }
+            _ => self.pack_activation.clone(),
+        };
         Self::with_context(
             source_snapshot,
             Arc::clone(&self.document_root),
-            self.pack_activation.clone(),
+            pack_activation,
             Arc::clone(&self.context),
         )
     }
@@ -3556,7 +4259,7 @@ impl WorkspaceQueryScope {
     ) -> Result<T, SearchToolsServiceError> {
         match result {
             Err(error) => Err(error),
-            Ok(value) => match self.context.store_error() {
+            Ok(value) => match self.context.unacknowledged_store_error() {
                 Some(error) => {
                     let message =
                         format!("Analyzer store failure while running `{operation}`: {error}");
@@ -3694,6 +4397,10 @@ fn mark_pack_activation_incomplete(
         .diagnostics
         .push(crate::rql::CodeQueryDiagnostic::new(
             crate::rql::CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                 incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                 related: Vec::new(),
                 source: None,
@@ -3741,6 +4448,10 @@ fn mark_workspace_semantic_models_not_loaded(
         .diagnostics
         .push(crate::rql::CodeQueryDiagnostic::new(
             crate::rql::CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                 incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                 related: Vec::new(),
                 source: None,
@@ -3806,6 +4517,7 @@ mod pack_acquisition_pending_tests {
 
     fn pending_state(entries: &[(&str, &str)]) -> Arc<WorkspacePackActivationState> {
         Arc::new(WorkspacePackActivationState {
+            update_source: None,
             config: None,
             ecosystems: Vec::new(),
             failure: None,
@@ -4426,17 +5138,26 @@ impl WorkspaceSession {
     }
 }
 
+/// A directory event can name only the directory, so a change refreshes the
+/// global pack inputs when it equals, contains or lies inside the packs
+/// document or the workspace model directory. The relation is the one the
+/// publication carry proof uses; a spelling it cannot certify leaves the
+/// overlay Pending there, and the Pending branch of `apply_changed_files`
+/// refreshes the activation.
 fn changed_files_refresh_global_pack_inputs(changed_files: &BTreeSet<ProjectFile>) -> bool {
-    changed_files.iter().any(|file| {
-        let relative = file.rel_path();
-        relative == Path::new(WORKSPACE_PACKS_DOCUMENT_PATH)
-            || relative
-                .starts_with(crate::analyzer::semantic_model::WORKSPACE_SEMANTIC_MODEL_DIRECTORY)
-            || matches!(
-                relative.to_str(),
+    let changed = brokk_bifrost_core::analyzer::changed_paths::ChangedPaths::literal(
+        changed_files.iter().map(ProjectFile::rel_path),
+    );
+    changed.touches(Path::new(WORKSPACE_PACKS_DOCUMENT_PATH))
+        || changed.touches(Path::new(
+            crate::analyzer::semantic_model::WORKSPACE_SEMANTIC_MODEL_DIRECTORY,
+        ))
+        || changed_files.iter().any(|file| {
+            matches!(
+                file.rel_path().to_str(),
                 Some(".nvmrc" | ".node-version" | "package.json")
             )
-    })
+        })
 }
 
 #[cfg(test)]
@@ -4568,6 +5289,7 @@ mod release_coverage_tests {
             session
                 .semantic_packs
                 .publish_final(Some(Arc::new(WorkspacePackActivationState {
+                    update_source: None,
                     config: None,
                     ecosystems: Vec::new(),
                     failure: None,
@@ -4622,6 +5344,38 @@ mod release_coverage_tests {
 mod pack_input_change_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12435: malformed packs configuration blocked source updates before activation could report it"
+    )]
+    fn malformed_packs_document_does_not_block_source_updates() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap().normalize();
+        std::fs::write(root.join("app.ts"), "export const value = 1;\n").unwrap();
+        let service = SearchToolsService::new_manual_ephemeral(root.clone()).unwrap();
+        std::fs::create_dir_all(root.join(".bifrost")).unwrap();
+        std::fs::write(root.join(".bifrost/packs.json"), "{").unwrap();
+        for value in [2, 3] {
+            let source = format!("export const value = {value};\n");
+            std::fs::write(root.join("app.ts"), &source).unwrap();
+            service
+                .call_tool_value(
+                    "update_paths",
+                    json!({"paths": ["app.ts", ".bifrost/packs.json"]}),
+                )
+                .unwrap();
+            let guard = service.session.read().unwrap();
+            assert!(
+                guard
+                    .as_ref()
+                    .unwrap()
+                    .snapshot
+                    .analyzer()
+                    .indexed_source_matches(&ProjectFile::new(root.clone(), "app.ts"), &source,)
+            );
+        }
+    }
 
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
@@ -4896,6 +5650,33 @@ mod pack_input_change_tests {
 
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
+        "#12435: a directory event or a case alias of the packs document or model directory skipped the global pack refresh"
+    )]
+    fn directory_and_alias_events_refresh_global_pack_inputs() {
+        let root = std::env::temp_dir();
+        let refreshes = |path: &str| {
+            changed_files_refresh_global_pack_inputs(&BTreeSet::from([ProjectFile::new(
+                root.clone(),
+                path,
+            )]))
+        };
+        for path in [
+            ".bifrost",
+            ".bifrost/packs.json",
+            ".bifrost/semantic-models",
+            ".bifrost/semantic-models/pack.json",
+            ".BIFROST/PACKS.JSON",
+            ".Bifrost/Semantic-Models/pack.json",
+        ] {
+            assert!(refreshes(path), "{path}");
+        }
+        for path in [".bifrost2", ".bifrost2/packs.json", "bifrost/packs.json"] {
+            assert!(!refreshes(path), "{path}");
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
         "#6397: Node declaration edits left the published pack activation stale"
     )]
     fn node_runtime_declarations_invalidate_pack_activation() {
@@ -5033,14 +5814,21 @@ fn decode_run_policy_arguments(
         .filter(|id| !selection.policy_ids.contains(id))
         .map(|id| PolicyId::new(&id).expect("policy-bundle IDs are validated"))
         .collect::<Vec<_>>();
-    let selected = built_in_policy_catalog()
-        .map_err(|error| {
-            SearchToolsServiceError::internal(format!(
-                "failed to load built-in policy catalog: {error}"
-            ))
-        })?
+    let catalog = built_in_policy_catalog().map_err(|error| {
+        SearchToolsServiceError::internal(format!(
+            "failed to load built-in policy catalog: {error}"
+        ))
+    })?;
+    let selected = catalog
         .select(&selection)
         .map_err(|error| SearchToolsServiceError::invalid_params(error.to_string()))?;
+    // A run that selects no built-in policy reads nothing from the catalog,
+    // so it reports none of the catalog's rejected packs.
+    let builtin_pack_rejections = if selection.is_empty() {
+        Vec::new()
+    } else {
+        catalog.rejection_notices(&selection)
+    };
     let mut selected_policy_ids = selected
         .iter()
         .map(|policy| {
@@ -5105,7 +5893,8 @@ fn decode_run_policy_arguments(
             .with_policy_timings(params.include_stage_timings)
             .with_policy_cost_hints(params.policy_cost_hints)
             .with_policy_deadlines(params.policy_deadlines_ms)
-            .with_run_streaming(params.stream_runs);
+            .with_run_streaming(params.stream_runs)
+            .with_builtin_pack_rejections(builtin_pack_rejections);
     if let Some(revision) = params.diff_base {
         if revision.is_empty()
             || revision.len() > crate::mcp_extended::MAX_RUN_POLICY_DIFF_BASE_BYTES
@@ -5131,6 +5920,8 @@ fn decode_run_policy_arguments(
         options = options.with_range(PolicyRangeRequest::DiffBase);
     }
     Ok(DecodedRunPolicy {
+        sources: params.sources,
+        inline_suppression_prefix: params.inline_suppression_prefix,
         policy_inputs,
         selected_policy_ids,
         options,
@@ -5235,7 +6026,11 @@ impl SearchToolsService {
         }
         matches!(
             name,
-            "analyze_diff" | "blast_radius" | "cyclomatic_complexity" | "missing_tests"
+            "analyze_diff"
+                | "blast_radius"
+                | "cyclomatic_complexity"
+                | "missing_tests"
+                | "relation_brief"
         )
     }
 
@@ -5378,6 +6173,7 @@ impl SearchToolsService {
                 config,
                 &budget,
                 progress,
+                CancellationToken::default(),
             ),
         )
     }
@@ -5454,6 +6250,277 @@ impl SearchToolsService {
                 .map_err(|panic| format!("startup index warm panicked: {panic:?}"))?;
         }
         warmer.wait_until_idle();
+        Ok(())
+    }
+
+    /// Explicit, invocation-scoped measurement outside the timed request phase.
+    /// The harness must exclude concurrent requests and edits. This does not
+    /// activate a workspace, publish pending packs, apply watcher changes, or
+    /// fill caches. Generation and watcher checks refuse an unstable sample.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn retention_census_for_test(&self) -> Result<Value, String> {
+        use brokk_bifrost_core::retention_census::{
+            FamilyLifetime, ResidentWeightUnit, RetentionCensus, UnknownKind,
+        };
+
+        let unavailable = |reason: &str| {
+            serde_json::json!({
+                "status": "unavailable", "reason": reason,
+            })
+        };
+        let generation = self.workspace_generation();
+        let (snapshot, packs, retired_packs, listing) = {
+            let guard = self.session.read().map_err(|_| "session lock poisoned")?;
+            let Some(session) = guard.as_ref() else {
+                return Ok(unavailable("workspace_not_ready"));
+            };
+            if let Err(reason) = self.retention_census_current_for_test(generation, session, None) {
+                return Ok(unavailable(reason));
+            }
+            let phase = self
+                .phase
+                .lock()
+                .map_err(|_| "workspace phase lock poisoned")?;
+            let listing = match &*phase {
+                WorkspacePhase::Bound(bound) => bound.listing.clone(),
+                WorkspacePhase::Unbound => None,
+            };
+            (
+                Arc::clone(&session.snapshot),
+                Arc::clone(&session.semantic_packs),
+                session.retired_pack_warms.clone(),
+                listing,
+            )
+        };
+        // Capture only immutable handles under the session lock. Join workers
+        // after releasing it, following the existing M5a index-warm barrier.
+        packs.wait_for_worker();
+        for warm in retired_packs {
+            warm.wait_for_worker();
+        }
+        self.wait_for_index_warm_for_test()?;
+        {
+            let guard = self.session.read().map_err(|_| "session lock poisoned")?;
+            let Some(session) = guard.as_ref() else {
+                return Ok(unavailable("workspace_closed_during_capture"));
+            };
+            if let Err(reason) =
+                self.retention_census_current_for_test(generation, session, Some(&snapshot))
+            {
+                return Ok(unavailable(reason));
+            }
+            if !session.usage_index_ready() {
+                return Ok(unavailable("usage_index_not_ready"));
+            }
+        }
+
+        // This is deliberately a SETTLED budget sample, distinct from the
+        // passive structural traversal below. It is never added to its totals.
+        let settled = self.retention_budget.snapshot();
+        let mut census = RetentionCensus::new();
+        snapshot.retention_census_for_test(&mut census);
+        self.flow_state.retention_census_for_test(&mut census);
+        if let Some(listing) = listing {
+            listing.retention_census_for_test(&mut census);
+        } else {
+            census.record_unknown(
+                "cached_workspace_file_listing",
+                FamilyLifetime::Persistent,
+                UnknownKind::Coverage,
+                "no_service_listing_handle",
+            );
+        }
+        // These O(1) counters describe residency, not structural capacity. No
+        // payload estimator or cache fill is run by this service boundary.
+        {
+            let protocols = self
+                .query_protocols
+                .read()
+                .map_err(|_| "protocol lock poisoned")?;
+            for (family, bytes) in [
+                (
+                    "query_protocols.protocols",
+                    protocols.retained_protocol_bytes(),
+                ),
+                (
+                    "query_protocols.plans",
+                    protocols.retained_binding_plan_bytes(),
+                ),
+                (
+                    "query_protocols.artifacts",
+                    protocols.retained_artifact_bytes(),
+                ),
+            ] {
+                census.record_resident_reading(
+                    family,
+                    FamilyLifetime::Persistent,
+                    protocols.registration_count() as u64,
+                    bytes as u64,
+                    ResidentWeightUnit::BytesEstimate,
+                );
+                census.record_unknown(
+                    family,
+                    FamilyLifetime::Persistent,
+                    UnknownKind::Coverage,
+                    "structural_capacity_not_yet_walked",
+                );
+            }
+        }
+        {
+            let plans = self
+                .query_value_flows
+                .read()
+                .map_err(|_| "value-flow lock poisoned")?;
+            for (family, bytes) in [
+                ("query_value_flows.plans", plans.retained_plan_bytes()),
+                (
+                    "query_value_flows.artifacts",
+                    plans.retained_artifact_bytes(),
+                ),
+            ] {
+                census.record_resident_reading(
+                    family,
+                    FamilyLifetime::Persistent,
+                    plans.registration_count() as u64,
+                    bytes as u64,
+                    ResidentWeightUnit::BytesEstimate,
+                );
+                census.record_unknown(
+                    family,
+                    FamilyLifetime::Persistent,
+                    UnknownKind::Coverage,
+                    "structural_capacity_not_yet_walked",
+                );
+            }
+        }
+        {
+            let results = self
+                .query_taint_results
+                .read()
+                .map_err(|_| "taint lock poisoned")?;
+            for (family, bytes) in [
+                ("query_taint_results.plans", results.retained_plan_bytes()),
+                (
+                    "query_taint_results.reports_and_outputs",
+                    results.retained_report_bytes(),
+                ),
+                (
+                    "query_taint_results.artifacts",
+                    results.retained_artifact_bytes(),
+                ),
+            ] {
+                census.record_resident_reading(
+                    family,
+                    FamilyLifetime::Persistent,
+                    results.registration_count() as u64,
+                    bytes as u64,
+                    ResidentWeightUnit::BytesEstimate,
+                );
+                census.record_unknown(
+                    family,
+                    FamilyLifetime::Persistent,
+                    UnknownKind::Coverage,
+                    "structural_capacity_not_yet_walked",
+                );
+            }
+        }
+        for family in ["query_protocols.outputs", "query_value_flows.outputs"] {
+            census.record_unknown(
+                family,
+                FamilyLifetime::Persistent,
+                UnknownKind::Coverage,
+                "actual_outputs_have_no_service_residency_or_structural_visitor",
+            );
+        }
+        census.record_unknown(
+            "diff_scoring_reference_cache",
+            FamilyLifetime::Persistent,
+            UnknownKind::Coverage,
+            "no_passive_residency_or_structural_visitor",
+        );
+        census.record_unknown(
+            "ordinary_query_read_cache",
+            FamilyLifetime::RequestOnly,
+            UnknownKind::Coverage,
+            "operation_only_excluded_by_quiescent_harness",
+        );
+        census.record_unknown(
+            "prepared_dispatch_pool",
+            FamilyLifetime::ProviderOnly,
+            UnknownKind::Coverage,
+            "operation_only_excluded_by_quiescent_harness",
+        );
+        let census = census.finish();
+        {
+            let guard = self.session.read().map_err(|_| "session lock poisoned")?;
+            let Some(session) = guard.as_ref() else {
+                return Ok(unavailable("workspace_closed_during_traversal"));
+            };
+            if let Err(reason) =
+                self.retention_census_current_for_test(generation, session, Some(&snapshot))
+            {
+                return Ok(unavailable(reason));
+            }
+            if !session.usage_index_ready() {
+                return Ok(unavailable("usage_index_not_ready"));
+            }
+        }
+        Ok(serde_json::json!({
+            "status": "available", "workspace_generation": generation,
+            "assumption": "no_in_flight_requests_or_edits",
+            "settled_retention_budget": {
+                "owner_id": settled.owner_id, "sample_sequence": settled.sample_sequence,
+                "capacity_bytes": settled.capacity_bytes, "accounted_bytes": settled.accounted_bytes,
+                "process_required_owner_id": settled.process_required_owner_id,
+                "process_required_bytes": settled.process_required_bytes,
+                "occupied_bytes": settled.occupied_bytes,
+                "regions": settled.regions.iter().map(|region| serde_json::json!({
+                    "name": region.name, "namespace": region.namespace,
+                    "entries": region.stats.entries, "accounted_bytes": region.stats.accounted_bytes,
+                    "deferred_bytes": region.stats.deferred_bytes, "evictions": region.stats.evictions,
+                    "refused_admissions": region.stats.refused_admissions, "revivals": region.stats.revivals,
+                })).collect::<Vec<_>>(),
+            },
+            "passive_outside_census": census,
+        }))
+    }
+
+    #[cfg(feature = "test-support")]
+    fn retention_census_current_for_test(
+        &self,
+        generation: u64,
+        session: &WorkspaceSession,
+        snapshot: Option<&Arc<WorkspaceAnalyzer>>,
+    ) -> Result<(), &'static str> {
+        if self.workspace_generation() != generation {
+            return Err("workspace_generation_changed");
+        }
+        if Self::session_watcher_has_pending(session) {
+            return Err("pending_watcher_changes");
+        }
+        if snapshot.is_some_and(|snapshot| !Arc::ptr_eq(snapshot, &session.snapshot)) {
+            return Err("workspace_snapshot_changed");
+        }
+        if !session.semantic_packs.is_ready() || session.refresh != PackRefresh::Idle {
+            return Err("semantic_packs_not_ready");
+        }
+        if session
+            .retired_pack_warms
+            .iter()
+            .any(|warm| !warm.is_ready())
+        {
+            return Err("retired_semantic_packs_not_ready");
+        }
+        if session
+            .semantic_packs
+            .installed_snapshot
+            .lock()
+            .map_err(|_| "semantic_pack_snapshot_lock_poisoned")?
+            .is_some()
+        {
+            return Err("semantic_pack_publication_pending");
+        }
         Ok(())
     }
 
@@ -5724,6 +6791,21 @@ impl SearchToolsService {
         render_options: RenderOptions,
         cancellation: Option<&CancellationToken>,
     ) -> Result<ToolOutput, SearchToolsServiceError> {
+        #[cfg(feature = "test-support")]
+        if name == "__bifrost_retention_census" {
+            if !arguments
+                .as_object()
+                .is_some_and(|object| object.is_empty())
+            {
+                return Err(SearchToolsServiceError::invalid_params(
+                    "retention census arguments must be an empty object",
+                ));
+            }
+            return Self::structured_only(
+                self.retention_census_for_test()
+                    .map_err(SearchToolsServiceError::internal)?,
+            );
+        }
         self.call_tool_output_with_transport_queue_wait(
             name,
             arguments,
@@ -5769,6 +6851,11 @@ impl SearchToolsService {
         cancellation: Option<&CancellationToken>,
         transport_timings: TransportTimings,
     ) -> Result<ToolOutput, SearchToolsServiceError> {
+        // Declared first so it drops last: a release starts only after the
+        // index warm this request schedules at its end has been registered.
+        let _heap_activity = brokk_bifrost_core::heap_release::IdleHeapRelease::process().request();
+        let _retention =
+            profiling::retention_scope(&self.retention_budget, "service_request", name);
         let retry_arguments = arguments.clone();
         let _product_entry = brokk_bifrost_analysis::analyzer::enter_product_entry();
         let workspace_generation = self.workspace_generation();
@@ -5810,6 +6897,11 @@ impl SearchToolsService {
         transport_timings: TransportTimings,
         suppression_preflight: Option<PreparedRunPolicyPreflight>,
     ) -> Result<ToolOutput, SearchToolsServiceError> {
+        // Declared first so it drops last: a release starts only after the
+        // index warm this request schedules at its end has been registered.
+        let _heap_activity = brokk_bifrost_core::heap_release::IdleHeapRelease::process().request();
+        let _retention =
+            profiling::retention_scope(&self.retention_budget, "service_request", name);
         let retry_arguments = arguments.clone();
         let workspace_generation = self.workspace_generation();
         let result = self.call_tool_output_with_transport_queue_wait_inner(
@@ -5952,6 +7044,30 @@ impl SearchToolsService {
             let result = missing_tests_at_root(
                 &root,
                 None,
+                params,
+                &DiffAnalysisOptions {
+                    snapshot_object_dir: self.diff_snapshot_object_dir.clone(),
+                },
+                cancellation.unwrap_or(&uncancelled),
+                &self.retention_budget,
+            )
+            .map_err(SearchToolsServiceError::internal)?;
+            return Self::rendered_structured(result, render_options);
+        }
+        if name == "relation_brief" {
+            let params = serde_json::from_value::<
+                brokk_bifrost_tools::relation_brief::RelationBriefParams,
+            >(arguments)
+            .map_err(|err| {
+                SearchToolsServiceError::invalid_params(format!("Invalid tool arguments: {err}"))
+            })?;
+            params
+                .validate()
+                .map_err(SearchToolsServiceError::invalid_params)?;
+            let root = self.service_root()?;
+            let uncancelled = CancellationToken::default();
+            let result = brokk_bifrost_tools::relation_brief::relation_brief_at_root(
+                &root,
                 params,
                 &DiffAnalysisOptions {
                     snapshot_object_dir: self.diff_snapshot_object_dir.clone(),
@@ -6120,9 +7236,10 @@ impl SearchToolsService {
                 )
             }
             "classify_test_files" => {
-                Self::decode_and_run(&snapshot, arguments, |workspace, params| {
-                    classify_test_files(workspace.analyzer(), params)
-                })
+                let params = Self::decode_tool_params(arguments)?;
+                let result = classify_test_files(snapshot.analyzer(), params)
+                    .map_err(SearchToolsServiceError::internal)?;
+                Self::structured_only(result)
             }
             "most_relevant_files" => Self::decode_render_and_try_run(
                 &snapshot,
@@ -7170,10 +8287,13 @@ impl SearchToolsService {
         let startup_index_warm = self.startup_index_warm;
         let watcher_starter = Arc::clone(&self.watcher_starter);
         let budget = self.retention_budget.clone();
+        // Background work counts as activity for the idle heap release (#12661): taken before the spawn, held until the thread ends.
+        let heap_activity = brokk_bifrost_core::heap_release::IdleHeapRelease::process().warm();
         std::thread::Builder::new()
             .name("bifrost-index-build".to_string())
             .spawn(
                 move || -> Result<(u64, PathBuf, WorkspaceSession), String> {
+                    let _heap_activity = heap_activity;
                     // Cache resolution is the same one every other entry point
                     // uses (`gitblob::cache_db_path`): a linked worktree shares
                     // the primary checkout's oid-keyed database, so a client
@@ -7260,6 +8380,8 @@ impl SearchToolsService {
             AnalyzerConfig::default().retention_budget_bytes(),
         );
         let observation = build_progress.begin(1);
+        // Background work counts as activity for the idle heap release (#12661): taken before the spawn, held until the thread ends.
+        let heap_activity = brokk_bifrost_core::heap_release::IdleHeapRelease::process().warm();
         let handle = std::thread::Builder::new()
             .name("bifrost-index-build".to_string())
             .spawn({
@@ -7268,6 +8390,7 @@ impl SearchToolsService {
                 let file_listing = file_listing.clone();
                 let budget = budget.clone();
                 move || -> Result<(u64, PathBuf, WorkspaceSession), String> {
+                    let _heap_activity = heap_activity;
                     let _scope = profiling::scope("mcp_cold.analyzer_construction");
                     let project = build_project(canonical.clone(), file_listing)?;
                     let workspace = build_persisted_analyzer_with_budget(
@@ -7491,10 +8614,22 @@ impl SearchToolsService {
             }
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 return Err(SearchToolsServiceError::deadline_exceeded(
-                    WORKSPACE_SNAPSHOT_NOT_READY_MESSAGE,
+                    self.workspace_snapshot_not_ready_message(),
                 ));
             }
             std::thread::park_timeout(std::time::Duration::from_millis(5));
+        }
+    }
+
+    fn workspace_snapshot_not_ready_message(&self) -> String {
+        let phase = self
+            .workspace_build_progress(self.workspace_generation())
+            .and_then(|snapshot| snapshot.phase);
+        match phase {
+            Some(phase) => {
+                format!("{WORKSPACE_SNAPSHOT_NOT_READY_MESSAGE}; the workspace build is {phase}")
+            }
+            None => WORKSPACE_SNAPSHOT_NOT_READY_MESSAGE.to_owned(),
         }
     }
 
@@ -7510,7 +8645,9 @@ impl SearchToolsService {
                 return None;
             }
             Some(if cancellation.is_timed_out() {
-                SearchToolsServiceError::deadline_exceeded(WORKSPACE_SNAPSHOT_NOT_READY_MESSAGE)
+                SearchToolsServiceError::deadline_exceeded(
+                    self.workspace_snapshot_not_ready_message(),
+                )
             } else {
                 SearchToolsServiceError::internal("workspace snapshot acquisition was cancelled")
             })
@@ -7811,40 +8948,37 @@ impl SearchToolsService {
         &self,
         cancellation: Option<&CancellationToken>,
     ) -> Result<WorkspaceQueryScope, SearchToolsServiceError> {
-        // Manual sessions never mutate the snapshot from this path (no
-        // watcher, no implicit updates driven by this call), so a read lock
-        // always suffices — never take the write lock at all.
-        if self.update_strategy == UpdateStrategy::Manual {
-            let guard = self.read_session()?;
-            let session = guard.as_ref().ok_or_else(Self::closed_error)?;
-            return Ok(WorkspaceQueryScope::new(
-                Arc::clone(&session.snapshot),
-                Arc::clone(&session.document_root),
-                session.pack_activation(),
-            ));
-        }
-
-        {
-            let guard = self.read_session()?;
-            let session = guard.as_ref().ok_or_else(Self::closed_error)?;
-            if !Self::session_watcher_has_pending(session) {
-                return Ok(WorkspaceQueryScope::new(
-                    Arc::clone(&session.snapshot),
-                    Arc::clone(&session.document_root),
-                    session.pack_activation(),
-                ));
-            }
-        }
-
-        // Only reached for `WatchFiles` sessions with a pending delta.
-        let mut guard = self.write_session()?;
-        let session = guard.as_mut().ok_or_else(Self::closed_error)?;
-        Self::apply_watcher_delta(session, cancellation)?;
+        self.apply_pending_watcher_delta(cancellation)?;
+        let guard = self.read_session()?;
+        let session = guard.as_ref().ok_or_else(Self::closed_error)?;
         Ok(WorkspaceQueryScope::new(
             Arc::clone(&session.snapshot),
             Arc::clone(&session.document_root),
             session.pack_activation(),
         ))
+    }
+
+    /// Apply the watcher's pending delta, taking the write lock only when
+    /// there is one. Manual sessions never mutate the snapshot from this path
+    /// (no watcher, no implicit updates driven by this call), so they never
+    /// take the write lock at all.
+    fn apply_pending_watcher_delta(
+        &self,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<(), SearchToolsServiceError> {
+        if self.update_strategy == UpdateStrategy::Manual {
+            return Ok(());
+        }
+        {
+            let guard = self.read_session()?;
+            let session = guard.as_ref().ok_or_else(Self::closed_error)?;
+            if !Self::session_watcher_has_pending(session) {
+                return Ok(());
+            }
+        }
+        let mut guard = self.write_session()?;
+        let session = guard.as_mut().ok_or_else(Self::closed_error)?;
+        Self::apply_watcher_delta(session, cancellation)
     }
 
     /// Wait for the warm's installed stage, then report.
@@ -7869,32 +9003,46 @@ impl SearchToolsService {
     /// bounded stage and reports through its own later checkpoints. The
     /// session lock is released before waiting, because the stage can take a
     /// moment and every other caller has to keep working.
+    ///
+    /// Settling can itself start a replacement warm: a coalesced refresh whose
+    /// worker has now exited, or an installed stage published for a snapshot
+    /// that has since moved. The request then waits for that warm's installed
+    /// stage too, so it never answers under a warm it started (#12441).
     fn settle_installed_pack_stage(
         &self,
         cancellation: Option<&CancellationToken>,
     ) -> Result<(), SearchToolsServiceError> {
-        if cancellation.is_some_and(CancellationToken::is_timed_out) {
-            return Ok(());
-        }
-        let semantic_packs = {
-            let guard = self.read_session()?;
-            match guard.as_ref() {
-                Some(session) => Arc::clone(&session.semantic_packs),
-                None => return Ok(()),
+        loop {
+            if cancellation.is_some_and(CancellationToken::is_timed_out) {
+                return Ok(());
             }
-        };
-        semantic_packs.wait_for_installed_stage();
-        let mut guard = self.write_session()?;
-        let session = guard.as_mut().ok_or_else(Self::closed_error)?;
-        session.settle_pack_stage(&semantic_packs);
-        Ok(())
+            let semantic_packs = {
+                let guard = self.read_session()?;
+                match guard.as_ref() {
+                    Some(session) => Arc::clone(&session.semantic_packs),
+                    None => return Ok(()),
+                }
+            };
+            semantic_packs.wait_for_installed_stage();
+            let mut guard = self.write_session()?;
+            let session = guard.as_mut().ok_or_else(Self::closed_error)?;
+            session.settle_pack_stage(&semantic_packs);
+            if Arc::ptr_eq(&session.semantic_packs, &semantic_packs) {
+                return Ok(());
+            }
+        }
     }
 
+    /// Apply the watcher's delta before settling the pack warm: an edit can
+    /// restart activation, and settling first would leave the answer under a
+    /// warm that has not published (#12441). A delta that arrives after the
+    /// settle is applied by `snapshot_after_updates` and reported as pending.
     fn snapshot_for_query_with_cancellation(
         &self,
         cancellation: Option<&CancellationToken>,
     ) -> Result<WorkspaceQueryScope, SearchToolsServiceError> {
         self.ensure_ready_with_cancellation(cancellation)?;
+        self.apply_pending_watcher_delta(cancellation)?;
         self.settle_installed_pack_stage(cancellation)?;
         self.snapshot_after_updates(cancellation)
     }
@@ -8085,13 +9233,16 @@ impl SearchToolsService {
     ) -> Result<(), SearchToolsServiceError> {
         brokk_bifrost_analysis::analyzer::without_project_reads(|| {
             let _scope = profiling::scope("SearchToolsService::apply_watcher_delta");
-            let watcher = match &session.watcher {
+            let watcher = match &mut session.watcher {
                 SessionWatcher::Disabled => return Ok(()),
                 SessionWatcher::Active(watcher) => watcher,
             };
 
             let delta = {
                 let _scope = profiling::scope("SearchToolsService::take_changed_files");
+                watcher
+                    .rearm_exclude_watch()
+                    .map_err(SearchToolsServiceError::internal)?;
                 watcher.take_changed_files()
             };
             if profiling::enabled() {
@@ -8104,20 +9255,74 @@ impl SearchToolsService {
             if delta.requires_full_refresh {
                 session.snapshot = Arc::new({
                     let _scope = profiling::scope("SearchToolsService::snapshot_update_all");
-                    session.snapshot.update_all()
+                    Self::update_session_snapshot(session, None, cancellation)
                 });
                 session.refresh_pack_activation();
                 session.schedule_index_warm();
                 return Ok(());
             }
 
-            if delta.files.is_empty() {
-                return Ok(());
-            }
-
-            let changed_files: BTreeSet<ProjectFile> = delta.files.into_iter().collect();
+            // An event can name content the snapshot already indexed: an edit
+            // that `refresh` or `update_paths` read before the watcher
+            // reported it. Applying it would build an identical snapshot and
+            // restart pack activation for nothing, leaving the next answer
+            // pending on that warm (#12441). Unindexed inputs such as
+            // manifests and deleted files never match, so they always apply.
+            let changed_files = stale_symbol_source_files(
+                session.snapshot.analyzer(),
+                delta.files.into_iter().collect(),
+            )?;
             Self::apply_changed_files(session, changed_files, cancellation)
         })
+    }
+
+    fn update_session_snapshot(
+        session: &WorkspaceSession,
+        changed_files: Option<&BTreeSet<ProjectFile>>,
+        cancellation: Option<&CancellationToken>,
+    ) -> WorkspaceAnalyzer {
+        let root = session.snapshot.analyzer().project().root();
+        let prospective = load_workspace_packs_config_at(root)
+            .map_err(|error| error.to_string())
+            .and_then(|packs| configured_semantic_models().map(|configured| (packs, configured)));
+        let prospective = match prospective {
+            Ok(inputs) => Some(inputs),
+            Err(error) => {
+                // Missing fresh authority disallows reuse, but the source
+                // update still proceeds. Activation reports the input error.
+                tracing::warn!(%error, "semantic-model reuse proof unavailable; updating workspace with Pending models");
+                None
+            }
+        };
+        let state = session.semantic_packs.best_known_state();
+        let source = state
+            .as_ref()
+            .and_then(|state| state.update_source.as_ref());
+        let config = workspace_activation_config(&session.snapshot);
+        let uncancelled = CancellationToken::default();
+        let context = source.and_then(|source| {
+            let (packs_config, configured) = prospective.as_ref()?;
+            source.context(
+                &config,
+                WorkspaceActivationSources {
+                    catalog_root: root,
+                    workspace_model_root: configured
+                        .as_ref()
+                        .is_some_and(|config| config.workspace_models)
+                        .then_some(root),
+                    config: packs_config.as_ref(),
+                    intrinsic_shipped_models: crate::analyzer::packs_document::semantic_model_catalog_bootstrap_configured(),
+                },
+                &[],
+                cancellation.unwrap_or(&uncancelled),
+            )
+        });
+        match changed_files {
+            Some(changed) => session
+                .snapshot
+                .update_with_activation_context(changed, context),
+            None => session.snapshot.update_all_with_activation_context(context),
+        }
     }
 
     fn apply_changed_files(
@@ -8135,7 +9340,7 @@ impl SearchToolsService {
             let refresh_global_inputs = changed_files_refresh_global_pack_inputs(&changed_files);
             session.snapshot = Arc::new({
                 let _scope = profiling::scope("SearchToolsService::snapshot_update");
-                session.snapshot.update(&changed_files)
+                Self::update_session_snapshot(session, Some(&changed_files), cancellation)
             });
             let refresh_packs = refresh_global_inputs || session.pack_activation_scope_changed();
             if !refresh_packs {
@@ -8147,6 +9352,14 @@ impl SearchToolsService {
                 session.refresh_pack_activation();
             } else if !stale.is_empty() {
                 session.refresh_dependency_ecosystems(&stale);
+            } else if matches!(
+                session.snapshot.analyzer().semantic_model_overlay_read(),
+                crate::analyzer::semantic_model::SemanticModelOverlayRead::Pending(_)
+            ) {
+                // Scoped dependency refreshes preserve sibling evidence. Only
+                // model-only invalidation needs the whole activation path.
+                // That path coalesces with an already running warm.
+                session.refresh_pack_activation();
             }
             session.schedule_index_warm();
             Ok(())
@@ -8393,11 +9606,21 @@ impl SearchToolsService {
         let decoded = decode_run_policy_arguments(arguments)?;
         let decode_selection_elapsed = preparation_started.elapsed();
         let DecodedRunPolicy {
+            sources,
+            inline_suppression_prefix,
             policy_inputs,
             selected_policy_ids,
             options,
             include_stage_timings,
         } = decoded;
+        let root = self.service_root()?;
+        let (sources, options) = crate::scoped_project::prepare_policy_source_request(
+            &root,
+            &sources,
+            inline_suppression_prefix.as_deref(),
+            options,
+        )
+        .map_err(SearchToolsServiceError::invalid_params)?;
         let (suppression_preflight, selection_elapsed, suppression_preflight_elapsed) =
             match supplied_preflight {
                 Some(preflight) => (
@@ -8419,6 +9642,7 @@ impl SearchToolsService {
             };
         if suppression_preflight.is_valid() {
             let preparation = RunPolicySnapshotPreparation {
+                sources,
                 policy_inputs,
                 selected_policy_ids,
                 options,
@@ -8457,6 +9681,7 @@ impl SearchToolsService {
         cancellation: Option<&CancellationToken>,
     ) -> Result<RunPolicyPreparation, SearchToolsServiceError> {
         let RunPolicySnapshotPreparation {
+            sources,
             policy_inputs,
             selected_policy_ids,
             options,
@@ -8507,6 +9732,8 @@ impl SearchToolsService {
             }
             let root = snapshot.enter().analyzer().project().root().to_path_buf();
             return Ok(RunPolicyPreparation::Ready(Box::new(PreparedRunPolicy {
+                sources,
+                workspace_generation,
                 snapshot,
                 root,
                 policy_inputs,
@@ -8603,6 +9830,8 @@ impl SearchToolsService {
         cancellation: Option<&CancellationToken>,
     ) -> Result<ToolOutput, SearchToolsServiceError> {
         let PreparedRunPolicy {
+            sources,
+            workspace_generation,
             snapshot,
             root,
             policy_inputs,
@@ -8613,13 +9842,138 @@ impl SearchToolsService {
             snapshot_elapsed,
             include_stage_timings,
         } = prepared;
+        let refuse_stale_sources = |message: String| SearchToolsServiceError {
+            code: ExplanationGeneration::of(snapshot.enter().analyzer())
+                .map(
+                    |requested| SearchToolsServiceErrorCode::StaleWorkspaceGeneration {
+                        requested,
+                        current: None,
+                    },
+                )
+                .unwrap_or(SearchToolsServiceErrorCode::Internal),
+            message,
+            // A server-side reload would silently publish unreported edits.
+            retryable_stale_generation: false,
+        };
+        // This is the publication lock used by update_paths and watcher application.
+        // Keep it until scoped consumption finishes, including snapshot validation.
+        let publication_guard = if sources.is_empty() {
+            None
+        } else {
+            Some(self.write_session()?)
+        };
+        if publication_guard
+            .as_ref()
+            .is_some_and(|guard| guard.is_some())
+            && workspace_generation != self.workspace_generation()
+        {
+            return Err(refuse_stale_sources(
+                "workspace changed before scoped policy evaluation; update_paths and retry"
+                    .to_owned(),
+            ));
+        }
+        let mut resident_members = std::collections::BTreeSet::new();
+        if publication_guard
+            .as_ref()
+            .is_some_and(|guard| guard.is_some())
+        {
+            let resident = snapshot.enter();
+            let inventory = resident.analyzer().indexed_source_files();
+            if !inventory.complete {
+                return Err(refuse_stale_sources(
+                    "resident indexed membership is incomplete; update_paths and retry".to_owned(),
+                ));
+            }
+            let paths: Vec<String> = inventory
+                .rows
+                .iter()
+                .map(|file| file.rel_path().to_string_lossy().replace('\\', "/"))
+                .collect();
+            for source in &sources {
+                if source.trim().is_empty() {
+                    continue;
+                }
+                let expected =
+                    crate::scoped_project::resident_source_members(&root, source, &paths)
+                        .map_err(SearchToolsServiceError::invalid_params)?;
+                resident_members.extend(expected.iter().cloned());
+                let live =
+                    crate::scoped_project::resolve_sources(&root, std::slice::from_ref(source));
+                match live {
+                    Ok(live)
+                        if owned_policy_source_paths(resident.analyzer(), &root, &live)
+                            == expected => {}
+                    Err(error) if expected.is_empty() => {
+                        return Err(SearchToolsServiceError::invalid_params(error));
+                    }
+                    _ => {
+                        return Err(refuse_stale_sources(format!(
+                            "source membership differs from resident snapshot: {source}; update_paths and retry"
+                        )));
+                    }
+                }
+            }
+        }
+        let scoped_service = if sources.is_empty() {
+            None
+        } else {
+            Some(
+                crate::scoped_project::create_scoped_service(root.clone(), &sources, None)
+                    .map_err(SearchToolsServiceError::invalid_params)?,
+            )
+        };
+        let snapshot = if let Some(scoped) = &scoped_service {
+            let scoped_snapshot = scoped.snapshot_for_query_with_cancellation(cancellation)?;
+            if publication_guard
+                .as_ref()
+                .is_some_and(|guard| guard.is_some())
+            {
+                let resident = snapshot.enter();
+                let selected = scoped_snapshot.enter();
+                let selected_paths: std::collections::BTreeSet<_> = selected
+                    .analyzer()
+                    .project()
+                    .all_files()
+                    .map_err(|error| SearchToolsServiceError::internal(error.to_string()))?
+                    .iter()
+                    .filter(|file| resident.analyzer().owns_source_file(file))
+                    .map(|file| file.rel_path().to_path_buf())
+                    .collect();
+                if selected_paths != resident_members {
+                    return Err(refuse_stale_sources("source membership changed during scoped construction; update_paths and retry".to_owned()));
+                }
+                for file in selected
+                    .analyzer()
+                    .project()
+                    .all_files()
+                    .map_err(|error| SearchToolsServiceError::internal(error.to_string()))?
+                    .iter()
+                {
+                    if !resident.analyzer().owns_source_file(file) {
+                        continue;
+                    }
+                    let oid = selected.analyzer().indexed_blob_oid(file);
+                    if oid.is_none() || oid != resident.analyzer().indexed_blob_oid(file) {
+                        return Err(refuse_stale_sources(format!(
+                            "scoped source differs from resident snapshot: {file:?}; update_paths and retry"
+                        )));
+                    }
+                }
+            }
+            snapshot.finish("run_policy.source_fence", Ok(()))?;
+            scoped_snapshot
+        } else {
+            snapshot
+        };
         let result = (|| {
             let snapshot = snapshot.enter();
             let _scope = profiling::scope("run_policy.evaluate_policy_inputs");
             // The coordinator analyzes this session's project under the policy
             // configuration and activates the policy's semantic sources itself,
             // as every entry point does (#3735).
-            let runtime = CodeIntelligenceRuntime::new(&snapshot, &self.flow_state, cancellation);
+            let policy_service = scoped_service.as_ref().unwrap_or(self);
+            let runtime =
+                CodeIntelligenceRuntime::new(&snapshot, &policy_service.flow_state, cancellation);
             // The head evaluation is the other long stretch of a policy
             // request: name it so a budgeted host reports the phase that spent
             // the budget rather than the tool (issue #3170).
@@ -8636,13 +9990,13 @@ impl SearchToolsService {
                         &policy_inputs,
                         &options,
                         preflight,
-                        &self.retention_budget,
+                        &policy_service.retention_budget,
                     ),
                     None => runtime.evaluate_policy_inputs(
                         &root,
                         &policy_inputs,
                         &options,
-                        &self.retention_budget,
+                        &policy_service.retention_budget,
                     ),
                 }
                 .map_err(|error| {
@@ -8762,6 +10116,13 @@ impl SearchToolsService {
     ) -> Result<std::sync::RwLockWriteGuard<'_, Option<WorkspaceSession>>, SearchToolsServiceError>
     {
         self.ensure_ready()?;
+        #[cfg(test)]
+        crate::scoped_project::SESSION_LOCK_BLOCKED_HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                assert!(self.session.try_write().is_err());
+                hook();
+            }
+        });
         self.session
             .write()
             .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))
@@ -8888,7 +10249,7 @@ fn build_persisted_workspace_reporting(
     update_strategy: UpdateStrategy,
     observation: Option<&crate::workspace_progress::BuildObservation>,
 ) -> Result<(Arc<dyn Project>, WorkspaceAnalyzer), String> {
-    let budget = brokk_bifrost_core::retention_budget::RetentionBudget::new(
+    let budget = brokk_bifrost_core::retention_budget::RetentionBudget::for_test_capacity(
         AnalyzerConfig::default().retention_budget_bytes(),
     );
     build_persisted_workspace_reporting_with_budget(
@@ -8931,8 +10292,9 @@ fn build_persisted_analyzer(
     update_strategy: UpdateStrategy,
     observation: Option<&crate::workspace_progress::BuildObservation>,
 ) -> Result<WorkspaceAnalyzer, crate::analyzer::store::StoreError> {
-    let budget =
-        brokk_bifrost_core::retention_budget::RetentionBudget::new(config.retention_budget_bytes());
+    let budget = brokk_bifrost_core::retention_budget::RetentionBudget::for_test_capacity(
+        config.retention_budget_bytes(),
+    );
     build_persisted_analyzer_with_budget(project, config, update_strategy, observation, &budget)
 }
 
@@ -8951,6 +10313,7 @@ fn build_persisted_analyzer_with_budget(
                     config,
                     budget,
                     observation.sink(),
+                    observation.cancellation.clone(),
                 )
             }
             UpdateStrategy::Manual => {
@@ -8959,6 +10322,7 @@ fn build_persisted_analyzer_with_budget(
                     config,
                     budget,
                     observation.sink(),
+                    observation.cancellation.clone(),
                 )
             }
         };
@@ -9157,10 +10521,13 @@ fn assemble_session_with_warm(
     // query that needs it.
     let usage_index_warm = if startup_index_warm == StartupIndexWarm::AtStartup {
         let snapshot = Arc::clone(&snapshot);
+        // Background work counts as activity for the idle heap release (#12661): taken before the spawn, held until the thread ends.
+        let heap_activity = brokk_bifrost_core::heap_release::IdleHeapRelease::process().warm();
         Some(
             std::thread::Builder::new()
                 .name("bifrost-usage-index-warm".to_string())
                 .spawn(move || {
+                    let _heap_activity = heap_activity;
                     brokk_bifrost_analysis::analyzer::without_project_reads(|| {
                         let _scope =
                             profiling::scope("mcp_cold.query_index_construction.rust_usage");
@@ -9314,6 +10681,104 @@ fn unbound_test_service(
     }
 }
 
+#[cfg(all(test, feature = "test-support"))]
+mod retention_census_control_tests {
+    use super::*;
+
+    #[test]
+    fn retention_census_control_does_not_start_an_unready_workspace() {
+        let service = unbound_test_service(UpdateStrategy::Manual, production_watcher_starter());
+        let result = service
+            .call_tool_value("__bifrost_retention_census", serde_json::json!({}))
+            .unwrap();
+        assert_eq!(result["status"], "unavailable");
+        assert_eq!(result["reason"], "workspace_not_ready");
+        assert!(service.session.read().unwrap().is_none());
+        assert!(matches!(
+            *service.phase.lock().unwrap(),
+            WorkspacePhase::Unbound
+        ));
+        assert!(
+            service
+                .call_tool_value(
+                    "__bifrost_retention_census",
+                    serde_json::json!({"fill":true})
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn retention_census_control_refuses_pending_changes_and_changed_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("lib.rs"), "pub fn answer() {}\n").unwrap();
+        let service = SearchToolsService::new_manual_ephemeral(root.clone()).unwrap();
+        let report = service
+            .call_tool_value("__bifrost_retention_census", serde_json::json!({}))
+            .unwrap();
+        assert_eq!(report["status"], "available", "{report}");
+        assert!(report["settled_retention_budget"]["owner_id"].is_u64());
+        assert!(report["passive_outside_census"]["families"].is_array());
+        let generation = service.workspace_generation();
+        {
+            let guard = service.session.read().unwrap();
+            let session = guard.as_ref().unwrap();
+            assert_eq!(
+                service.retention_census_current_for_test(
+                    generation.wrapping_add(1),
+                    session,
+                    None
+                ),
+                Err("workspace_generation_changed"),
+            );
+        }
+        let project = Arc::new(FilesystemProject::new(root.clone()).unwrap());
+        let watcher = ProjectChangeWatcher::start_polling_for_tests(project).unwrap();
+        service.session.write().unwrap().as_mut().unwrap().watcher =
+            SessionWatcher::Active(watcher);
+        std::fs::write(root.join("lib.rs"), "pub fn changed() {}\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let pending = {
+                let guard = service.session.read().unwrap();
+                SearchToolsService::session_watcher_has_pending(guard.as_ref().unwrap())
+            };
+            if pending {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "poll watcher did not receive edit"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let result = service.retention_census_for_test().unwrap();
+        assert_eq!(result["status"], "unavailable");
+        assert_eq!(result["reason"], "pending_watcher_changes");
+        let guard = service.session.read().unwrap();
+        assert!(
+            SearchToolsService::session_watcher_has_pending(guard.as_ref().unwrap()),
+            "census must not consume or publish watcher changes"
+        );
+    }
+}
+
+/// Keep unknown ownership conservative when comparing live and indexed membership.
+fn owned_policy_source_paths(
+    index: &dyn brokk_bifrost_core::analyzer::code_unit_index::CodeUnitIndex,
+    root: &Path,
+    paths: &[PathBuf],
+) -> std::collections::BTreeSet<PathBuf> {
+    paths
+        .iter()
+        .filter(|path| {
+            index.owns_source_file(&ProjectFile::new(root.to_path_buf(), (*path).clone()))
+        })
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod watcher_startup_tests {
     use super::*;
@@ -9330,6 +10795,125 @@ mod watcher_startup_tests {
     fn workspace(file: &str, source: &str) -> (tempfile::TempDir, PathBuf) {
         let (temp, root) = super::test_workspace(file, source);
         (temp, root.normalize())
+    }
+
+    #[test]
+    #[hardwon("#12999: default ownership hid new files against a complete empty inventory")]
+    fn empty_inventory_keeps_new_policy_sources_visible() {
+        use brokk_bifrost_core::analyzer::code_unit_index::CodeUnitIndex;
+        use brokk_bifrost_core::analyzer::model::{CodeUnit, Range};
+        use brokk_bifrost_core::analyzer::project::Project;
+        use brokk_bifrost_core::analyzer::query_batch::QueryBatch;
+        use std::collections::BTreeSet;
+
+        struct EmptyIndex;
+        impl CodeUnitIndex for EmptyIndex {
+            fn project(&self) -> &dyn Project {
+                unimplemented!()
+            }
+            fn languages(&self) -> BTreeSet<Language> {
+                BTreeSet::new()
+            }
+            fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
+                Box::new(std::iter::empty())
+            }
+            fn search_definitions(&self, _: &str, _: bool) -> BTreeSet<CodeUnit> {
+                BTreeSet::new()
+            }
+            fn enclosing_code_unit(&self, _: &ProjectFile, _: &Range) -> Option<CodeUnit> {
+                None
+            }
+            fn enclosing_code_unit_for_lines(
+                &self,
+                _: &ProjectFile,
+                _: usize,
+                _: usize,
+            ) -> Option<CodeUnit> {
+                None
+            }
+            fn get_skeleton(&self, _: &CodeUnit) -> Option<String> {
+                None
+            }
+            fn get_skeleton_header(&self, _: &CodeUnit) -> Option<String> {
+                None
+            }
+            fn get_sources(&self, _: &CodeUnit, _: bool) -> BTreeSet<String> {
+                BTreeSet::new()
+            }
+            fn indexed_source_files(&self) -> QueryBatch<ProjectFile> {
+                QueryBatch::complete(Vec::new(), 0)
+            }
+        }
+        let (_temp, root) = workspace("README.md", "empty resident inventory\n");
+        std::fs::create_dir(root.join("src")).unwrap();
+        let index = EmptyIndex;
+        let inventory = index.indexed_source_files();
+        assert!(inventory.complete);
+        assert!(inventory.rows.is_empty());
+        std::fs::write(root.join("src/new.ts"), "export function added() {}\n").unwrap();
+        for source in ["src", "src/*.ts"] {
+            let expected =
+                crate::scoped_project::resident_source_members(&root, source, &[]).unwrap();
+            let live = crate::scoped_project::resolve_sources(&root, &[source.to_owned()]).unwrap();
+            let owned = owned_policy_source_paths(&index, &root, &live);
+            assert_eq!(owned, BTreeSet::from([PathBuf::from("src/new.ts")]));
+            assert_ne!(
+                owned, expected,
+                "new source must reach the stale-refusal branch"
+            );
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12999: scoped policy rebuilt live sources outside the resident publication fence"
+    )]
+    fn scoped_policy_refuses_overlapping_unreported_edit() {
+        let (_temp, root) = workspace("selected.ts", "export function target() {}\n");
+        std::fs::write(root.join("policy.rqlp"), r#"(policy :schema-version 1 :id "test.fence" :name "Fence" :message "target" :severity warning :analysis (analysis :type match :selector (rql :schema-version 1 (language typescript (function :name "target")))))"#).unwrap();
+        let service = Arc::new(SearchToolsService::new_manual_ephemeral(root.clone()).unwrap());
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let policy_service = service.clone();
+        let policy = std::thread::spawn(move || {
+            crate::scoped_project::CONSTRUCTION_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+                }))
+            });
+            policy_service.call_tool_value("run_policy", json!({"sources": ["selected.ts"], "policy_files": ["policy.rqlp"], "evaluation_date": "2026-11-14"}))
+        });
+        started_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        // Construction holds precisely the lock the concurrent updater needs.
+        assert!(service.session.try_write().is_err());
+        std::fs::write(root.join("selected.ts"), "export function changed() {}\n").unwrap();
+        let update_service = service.clone();
+        let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
+        let update = std::thread::spawn(move || {
+            crate::scoped_project::SESSION_LOCK_BLOCKED_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || blocked_tx.send(()).unwrap()));
+            });
+            update_service.call_tool_value("update_paths", json!({"paths": ["selected.ts"]}))
+        });
+        blocked_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        // An independent disk edit is not published to the resident snapshot.
+        std::fs::write(
+            root.join("selected.ts"),
+            "export function unreported() {}\n",
+        )
+        .unwrap();
+        release_tx.send(()).unwrap();
+        let error = policy.join().unwrap().unwrap_err();
+        assert!(
+            matches!(
+                error.code,
+                SearchToolsServiceErrorCode::StaleWorkspaceGeneration { .. }
+            ),
+            "{error:?}"
+        );
+        assert!(!error.retryable_stale_generation);
+        update.join().unwrap().unwrap();
     }
 
     #[test]
@@ -9703,7 +11287,9 @@ mod watcher_startup_tests {
                 .analyzer()
                 .project();
             for _ in 0..8 {
-                project.is_bifrostignored(Path::new("Independent.java"));
+                project
+                    .is_bifrostignored(Path::new("Independent.java"))
+                    .expect("ignore observation");
             }
         }
 
@@ -9726,6 +11312,52 @@ mod watcher_startup_tests {
             service.bound_root_and_listing().unwrap().1.is_none(),
             "a long-lived manual service must keep re-walking; it cannot invalidate a cache"
         );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11534: acknowledging one policy store failure must not hide another"
+    )]
+    fn query_finish_requires_every_store_error_acknowledged() {
+        use crate::analyzer::store::StoreError;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("Model.java"), "class Model {}\n").unwrap();
+        let (_project, workspace) = build_ephemeral_workspace(root, None).unwrap();
+        let document_root =
+            Arc::new(WorkspaceRoot::open(workspace.analyzer().project().root()).unwrap());
+        let workspace = Arc::new(workspace);
+        for acknowledged in 0..=2 {
+            let scope = WorkspaceQueryScope::new(
+                Arc::clone(&workspace),
+                Arc::clone(&document_root),
+                SessionPackActivation::Settled(None),
+            );
+            scope.context.record_store_error(StoreError::new("first"));
+            scope.context.record_store_error(StoreError::new("second"));
+            let records = scope.context.recorded_store_errors();
+            assert_eq!(records.len(), 2);
+            assert_ne!(records[0].id(), records[1].id());
+            let ids = records
+                .iter()
+                .take(acknowledged)
+                .map(|r| r.id())
+                .collect::<Vec<_>>();
+            scope.context.acknowledge_store_errors(&ids);
+            let result = scope.finish("ack_test", Ok(42));
+            if acknowledged == 2 {
+                assert_eq!(result.unwrap(), 42);
+            } else {
+                let error = result.unwrap_err();
+                assert!(!error.is_stale_analyzer_generation());
+                assert!(
+                    error
+                        .message
+                        .contains(if acknowledged == 0 { "first" } else { "second" })
+                );
+            }
+        }
     }
 
     #[test]
@@ -10069,6 +11701,76 @@ mod watcher_startup_tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11534: a store failure inside one policy made the real finish discard every sibling's report"
+    )]
+    fn policy_store_error_real_finish_preserves_siblings() {
+        use brokk_bifrost_analysis::test_support::cache_row_count;
+        // SAFETY: nextest runs this test in its own process.
+        unsafe { std::env::set_var("BIFROST_POLICY_PARALLELISM", "1") };
+        let inputs: Vec<_> = ["alpha", "beta", "gamma"]
+            .into_iter()
+            .map(|name| {
+                PolicyEvaluationInput::embedded(
+                    brokk_bifrost_policy::PolicySourceIdentity::new(format!("{name}.rqlp")),
+                    format!(
+                        r#"(policy :schema-version 1 :id "test.{name}" :name "Target"
+                    :message "Avoid target" :severity warning :analysis (analysis :type match
+                    :selector (rql :schema-version 1
+                        (language python (function :name "target")))))"#
+                    ),
+                )
+            })
+            .collect();
+        let options =
+            PolicyEvaluationOptions::new(PolicyEvaluationDate::from_ymd(2026, 9, 3).unwrap());
+        // Two identical workspaces, each with its own persisted cache: one
+        // runs the batch healthy, the other runs it with the first policy's
+        // evaluation recording a store failure.
+        let (_healthy_temp, healthy_root) = workspace("target.py", "def target():\n    return 1\n");
+        let (_failed_temp, failed_root) = workspace("target.py", "def target():\n    return 1\n");
+        let healthy = SearchToolsService::new_manual_persisted(healthy_root.clone())
+            .unwrap()
+            .evaluate_policy_inputs(&healthy_root, &inputs, &options)
+            .unwrap();
+        let failed_options = options
+            .clone()
+            .with_store_error_probe(brokk_bifrost_policy::PolicyId::new("test.alpha").unwrap());
+        // `evaluate_policy_inputs` runs the whole batch inside one
+        // `WorkspaceQueryScope` and returns through `finish`, so an
+        // unattributed store error would turn this `Ok` into `Err`.
+        let failed = SearchToolsService::new_manual_persisted(failed_root.clone())
+            .unwrap()
+            .evaluate_policy_inputs(&failed_root, &inputs, &failed_options)
+            .expect("finish must return the batch with the failed policy isolated");
+
+        assert_eq!(failed.exit_status(), 2);
+        let report = serde_json::to_value(failed.report()).unwrap();
+        let failed_run = report["runs"][0].to_string();
+        assert!(failed_run.contains("internal_error"), "{failed_run}");
+        assert!(failed_run.contains("test.alpha"), "{failed_run}");
+        assert!(failed_run.contains("injected policy read"), "{failed_run}");
+        // Healthy siblings are byte-identical to the run without the failure.
+        for index in 1..3 {
+            assert_eq!(
+                serde_json::to_vec(&failed.report().runs()[index]).unwrap(),
+                serde_json::to_vec(&healthy.report().runs()[index]).unwrap(),
+                "sibling {index} changed"
+            );
+        }
+        // The failed policy's provisional unit is discarded, including the
+        // publication its evaluation had already committed; the healthy
+        // siblings' units persist; no aggregate evaluation row is admitted
+        // for the failed policy.
+        assert_eq!(cache_row_count(&healthy_root, "policy_units"), 3);
+        assert_eq!(cache_row_count(&failed_root, "policy_units"), 2);
+        assert_eq!(
+            cache_row_count(&failed_root, "policy_evaluations"),
+            cache_row_count(&healthy_root, "policy_evaluations") * 2 / 3
+        );
+    }
+
+    #[test]
     fn policy_observer_receives_every_selected_run() {
         let (_temp, root) = workspace("Observed.js", "eval(userInput);\n");
         let service = SearchToolsService::new_manual_ephemeral(root.clone()).unwrap();
@@ -10283,7 +11985,10 @@ mod watcher_startup_tests {
 
         assert_eq!(result.status, "unreliable");
         assert_eq!(result.exit_status, POLICY_EXIT_UNRELIABLE);
-        assert_eq!(result.report.schema_version(), 7);
+        assert_eq!(
+            result.report.schema_version(),
+            brokk_bifrost_policy::PolicyReportDocument::SCHEMA_VERSION
+        );
         assert!(result.report.rules().is_empty());
         assert!(result.report.runs().is_empty());
         assert_eq!(
@@ -10380,7 +12085,10 @@ mod watcher_startup_tests {
         };
         assert_eq!(result.status, "unreliable");
         assert_eq!(result.exit_status, POLICY_EXIT_UNRELIABLE);
-        assert_eq!(result.report.schema_version(), 7);
+        assert_eq!(
+            result.report.schema_version(),
+            brokk_bifrost_policy::PolicyReportDocument::SCHEMA_VERSION
+        );
         assert!(result.report.rules().is_empty());
         assert!(result.report.runs().is_empty());
         assert_eq!(result.report.diagnostics().len(), 1);
@@ -10757,7 +12465,10 @@ mod watcher_startup_tests {
         };
 
         assert_eq!(structured["status"], "unreliable");
-        assert_eq!(structured["report"]["schema_version"], 7);
+        assert_eq!(
+            structured["report"]["schema_version"],
+            brokk_bifrost_policy::PolicyReportDocument::SCHEMA_VERSION
+        );
         assert_eq!(
             structured["report"]["execution"]["termination"],
             "deadline_exceeded"
@@ -11589,8 +13300,8 @@ mod watcher_startup_tests {
         let entry = scope.enter();
         let conn = entry.store().unwrap().read_conn().unwrap();
         let (publications, open, context_id, digest): (i64,i64,i64,Vec<u8>) = conn.query_row(
-            "SELECT count(*),sum(p.valid_until IS NULL),max(p.context_id),p.input_digest FROM go_context_selections s JOIN go_context_publications p USING(selection_id) WHERE s.workspace_id=?1 AND s.lang='go' AND s.generation=?2 AND s.profile_digest=?3 AND s.derivation_version=?4",
-            rusqlite::params![latest.workspace_id.as_str(),latest.generation.get(),profile,brokk_bifrost_analysis::analyzer::store::go_package_context::DERIVATION_VERSION],
+            "SELECT count(*),sum(p.valid_until IS NULL),max(p.context_id),p.input_digest FROM go_context_selections s JOIN go_context_publications p USING(selection_id) WHERE s.workspace_id=?1 AND s.lang='go' AND s.generation=?2 AND s.profile_digest=?3 AND s.derivation_identity=?4",
+            rusqlite::params![latest.workspace_id.as_str(),latest.generation.get(),profile,brokk_bifrost_analysis::analyzer::store::go_package_context::derivation_identity()],
             |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
         ).unwrap();
         assert_eq!(
@@ -11907,19 +13618,23 @@ mod watcher_startup_tests {
             Arc::clone(&guard.as_ref().unwrap().semantic_packs)
         };
         warm.wait_for_installed_stage();
-        let replacement = {
+        {
             let mut guard = service.session.write().unwrap();
             let session = guard.as_mut().unwrap();
             std::fs::write(root.join("a.go"), "package a\ntype Updated int\n").unwrap();
             session.snapshot = Arc::new(
                 session
                     .snapshot
-                    .update(&BTreeSet::from([ProjectFile::new(root, "a.go")])),
+                    .update(&BTreeSet::from([ProjectFile::new(root.clone(), "a.go")])),
             );
-            Arc::clone(&session.snapshot)
-        };
+        }
         let request = service.snapshot_for_query_with_cancellation(None).unwrap();
-        assert!(request.has_source(&replacement));
+        // The request may answer under the replacement warm's activated copy
+        // of the updated snapshot, but never under the superseded one.
+        assert!(request.enter().analyzer().indexed_source_matches(
+            &ProjectFile::new(root, "a.go"),
+            "package a\ntype Updated int\n"
+        ));
     }
 
     #[test]
@@ -12814,6 +14529,52 @@ mod watcher_startup_tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12441: the watcher's event for an edit refresh had already read restarted pack activation, so query_code answered before the installed stage"
+    )]
+    fn query_after_refresh_answers_after_the_installed_pack_stage() {
+        let (_temp, root) = workspace("app.py", "def run(value):\n    return eval(value)\n");
+        let service = SearchToolsService::new(root.clone()).unwrap();
+        let query = json!({
+            "schema_version": "1",
+            "languages": ["python"],
+            "match": {"kind": "call", "callee": {"name": "eval"}},
+        });
+        // Whether acquisition is still running depends on the host's pack
+        // cache and download setting; a request that answers before the
+        // installed stage published is the defect, whatever the host.
+        let answers_after_installed_stage = |service: &SearchToolsService| {
+            let prepared = service.prepare_query_code(query.clone(), None).unwrap();
+            !matches!(
+                prepared.snapshot.pack_activation,
+                SessionPackActivation::WarmPending
+            )
+        };
+        assert!(answers_after_installed_stage(&service));
+
+        std::fs::write(
+            root.join("app.py"),
+            "def run(value):\n    return parse(value)\n",
+        )
+        .unwrap();
+        service.call_tool_value("refresh", json!({})).unwrap();
+        // `refresh` read the edit from disk, but the watcher still reports
+        // it; the next query drains that delta itself.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !{
+            let guard = service.session.read().unwrap();
+            SearchToolsService::session_watcher_has_pending(guard.as_ref().unwrap())
+        } {
+            assert!(
+                Instant::now() < deadline,
+                "the watcher never reported the edit"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(answers_after_installed_stage(&service));
     }
 
     #[test]
@@ -14157,6 +15918,157 @@ mod client_roots_tests {
             !root.join(crate::gitblob::PROJECT_DIR_NAME).exists(),
             "an ephemeral service must not create any generated checkout state"
         );
+    }
+
+    #[test]
+    fn independent_manual_services_share_process_interner_accounting() {
+        use brokk_bifrost_core::analyzer::fq_name::{SegmentKind, segment_interner};
+        use brokk_bifrost_core::retention_budget::ProcessRequiredMemory;
+
+        const CHILD: &str = "BIFROST_TWO_SERVICE_INTERNER_ACCOUNTING_CHILD";
+        const COMPLETE: &str = "two-service process interner accounting complete";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("current test executable"),
+            )
+            .args([
+                "--exact",
+                "searchtools_service::client_roots_tests::independent_manual_services_share_process_interner_accounting",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("run isolated two-service interner accounting control");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "child status {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                output.status
+            );
+            assert!(
+                stdout.lines().any(|line| line == COMPLETE),
+                "child completion marker missing\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+            assert!(
+                stdout.lines().any(|line| line
+                    .starts_with("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured;")),
+                "child must execute exactly one test\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+            eprintln!("two-service accounting child stdout:\n{stdout}\nstderr:\n{stderr}");
+            return;
+        }
+
+        let (_left_temp, left_root) = super::test_workspace("Left.java", "class Left {}\n");
+        let (_right_temp, right_root) = super::test_workspace("Right.java", "class Right {}\n");
+        let left = SearchToolsService::new_manual_ephemeral_footgun_for_project(
+            Arc::new(FilesystemProject::new(left_root).unwrap()),
+            AnalyzerConfig {
+                retention_budget_bytes: Some(512 * 1024 * 1024),
+                ..AnalyzerConfig::default()
+            },
+        )
+        .unwrap();
+        let right = SearchToolsService::new_manual_ephemeral_footgun_for_project(
+            Arc::new(FilesystemProject::new(right_root).unwrap()),
+            AnalyzerConfig {
+                retention_budget_bytes: Some(1024 * 1024 * 1024),
+                ..AnalyzerConfig::default()
+            },
+        )
+        .unwrap();
+        let interner = segment_interner();
+        let process = ProcessRequiredMemory::global();
+        // Snapshot explicitly settles each real service budget; accounting
+        // does not depend on enabling timing or formatting an observer report.
+        let left_before = left.retention_budget.snapshot();
+        let right_before = right.retention_budget.snapshot();
+        let names_before = interner.snapshot();
+        let global_before = process.bytes();
+        assert_ne!(left_before.owner_id, right_before.owner_id);
+        assert_ne!(left_before.capacity_bytes, right_before.capacity_bytes);
+        for before in [&left_before, &right_before] {
+            assert_eq!(before.process_required_owner_id, process.owner_id());
+            assert_eq!(before.process_required_bytes, global_before);
+            assert_eq!(
+                before.occupied_bytes,
+                before.accounted_bytes + global_before
+            );
+        }
+
+        let names = (0..512)
+            .map(|index| {
+                let name = format!(
+                    "service_process_accounting_{}_{}",
+                    std::process::id(),
+                    index
+                );
+                let id = interner.intern(&name, SegmentKind::Type);
+                (name, id)
+            })
+            .collect::<Vec<_>>();
+        let global_after = process.bytes();
+        let names_after = interner.snapshot();
+        let delta = global_after.checked_sub(global_before).unwrap();
+        assert!(delta > 0);
+        assert_eq!(names_after.entries - names_before.entries, names.len());
+        assert_eq!(
+            delta,
+            u64::try_from(
+                names_after.estimated_retained_bytes - names_before.estimated_retained_bytes
+            )
+            .unwrap(),
+            "the process owner charges actual interner growth once"
+        );
+        let left_after = left.retention_budget.snapshot();
+        let right_after = right.retention_budget.snapshot();
+        eprintln!(
+            "service budgets before: {left_before:?}, {right_before:?}; after: {left_after:?}, {right_after:?}; global delta: {delta}"
+        );
+        for (before, after) in [(&left_before, &left_after), (&right_before, &right_after)] {
+            assert_eq!(after.owner_id, before.owner_id);
+            assert_eq!(after.process_required_owner_id, process.owner_id());
+            assert_eq!(after.process_required_bytes, global_after);
+            assert_eq!(
+                after.process_required_bytes - before.process_required_bytes,
+                delta
+            );
+            assert_eq!(
+                after.accounted_bytes, before.accounted_bytes,
+                "sufficient capacity leaves local retained allocations unchanged"
+            );
+            assert_eq!(after.occupied_bytes, after.accounted_bytes + global_after);
+            assert!(after.occupied_bytes < after.capacity_bytes, "{after:?}");
+            let free_before = before.capacity_bytes - before.occupied_bytes;
+            let free_after = after.capacity_bytes - after.occupied_bytes;
+            assert_eq!(free_before - free_after, delta);
+        }
+        assert_eq!(process.bytes(), global_after);
+        // Existing-name hits and one service's destruction cannot release or
+        // duplicate the required process charge or invalidate global IDs.
+        for (name, id) in &names {
+            assert_eq!(interner.intern(name, SegmentKind::Type), *id);
+        }
+        assert_eq!(process.bytes(), global_after);
+        drop(left);
+        assert_eq!(process.bytes(), global_after);
+        for (name, id) in &names {
+            assert_eq!(interner.resolve(*id), (name.as_str(), SegmentKind::Type));
+        }
+        let remaining = right.retention_budget.snapshot();
+        assert_eq!(remaining.process_required_owner_id, process.owner_id());
+        assert_eq!(remaining.process_required_bytes, global_after);
+        let result = right
+            .call_tool_value(
+                "search_symbols",
+                json!({
+                    "patterns": ["Right"], "include_tests": true, "limit": 10
+                }),
+            )
+            .unwrap();
+        assert_eq!(result["total_files"], 1, "{result:#}");
+        assert!(process.bytes() >= global_after);
+        println!("\n{COMPLETE}");
     }
 
     /// A client-bound linked worktree resolves its cache the way every other

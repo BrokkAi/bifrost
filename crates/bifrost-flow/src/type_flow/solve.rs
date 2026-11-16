@@ -2291,7 +2291,10 @@ fn receiver_read(site: &MemberAccessSite) -> Option<ReceiverRead> {
             }
             if !matches!(
                 kind,
-                ValueFlowKind::Local | ValueFlowKind::Parameter | ValueFlowKind::Receiver
+                ValueFlowKind::Local
+                    | ValueFlowKind::AddressOf
+                    | ValueFlowKind::Parameter
+                    | ValueFlowKind::Receiver
             ) {
                 return None;
             }

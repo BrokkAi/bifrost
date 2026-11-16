@@ -552,6 +552,7 @@ fn project_type<'tree>(
         hierarchy: hierarchy_of(work.node, source, ctx),
         aliases: Vec::new(),
         extension_surfaces: Vec::new(),
+        rust_stability: None,
         guard: None,
         locator: artifact_locator(origin, artifact_sha256, entry_path, &qualified),
     });
@@ -679,6 +680,7 @@ fn project_callable(
         generic_arity: 0,
         parameter_types: &parameter_types,
         parameter_variadics: &parameter_variadics,
+        extension_receiver: None,
         return_type: signature.returns.as_ref(),
     });
     Some(MemberFact {
@@ -705,6 +707,7 @@ fn project_callable(
         extension_receiver: None,
         extension_receiver_constraints: Vec::new(),
         aliases: Vec::new(),
+        rust_stability: None,
         guard: None,
         locator: artifact_locator(
             origin,
@@ -808,6 +811,7 @@ fn project_properties(
             generic_arity: 0,
             parameter_types: &[],
             parameter_variadics: &[],
+            extension_receiver: None,
             return_type: signature.returns.as_ref(),
         });
         members.push(MemberFact {
@@ -834,6 +838,7 @@ fn project_properties(
             extension_receiver: None,
             extension_receiver_constraints: Vec::new(),
             aliases: Vec::new(),
+            rust_stability: None,
             guard: None,
             locator: artifact_locator(
                 origin,
@@ -898,6 +903,7 @@ fn constant_member(
         generic_arity: 0,
         parameter_types: &[],
         parameter_variadics: &[],
+        extension_receiver: None,
         return_type: None,
     });
     MemberFact {
@@ -924,6 +930,7 @@ fn constant_member(
         extension_receiver: None,
         extension_receiver_constraints: Vec::new(),
         aliases: Vec::new(),
+        rust_stability: None,
         guard: None,
         locator: artifact_locator(
             origin,
@@ -973,6 +980,7 @@ fn namespace_fact(
         hierarchy: Vec::new(),
         aliases: Vec::new(),
         extension_surfaces: Vec::new(),
+        rust_stability: None,
         guard: None,
         locator: artifact_locator(origin, artifact_sha256, entry_path, namespace),
     }

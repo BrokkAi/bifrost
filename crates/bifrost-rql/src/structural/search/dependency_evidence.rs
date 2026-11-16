@@ -1,7 +1,7 @@
 //! Query execution reads the selected durable publication, never build files.
 use super::*;
 use crate::query::{DependencyEvidenceFilter, DependencyEvidenceSeed};
-use brokk_bifrost_analysis::analyzer::semantic_model::DependencyEvidence;
+use brokk_bifrost_analysis::analyzer::semantic_model::{DependencyEvidence, DependencyEvidenceGap};
 
 #[derive(Debug, Clone)]
 pub(super) struct DependencyEvidenceValue {
@@ -247,6 +247,39 @@ fn version_matches(row: &DependencyEvidence, ranges: &[VersionRange]) -> Result<
     }
     Ok(matched)
 }
+fn dependency_gap_diagnostic(gap: &DependencyEvidenceGap) -> CodeQueryDiagnostic {
+    CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        has_non_utf8_refusal: false,
+        refusal_sites: Default::default(),
+        call_relation_facts: None,
+        uses_omissions: Vec::new(),
+        incompleteness: Incompleteness::Content,
+        related: Vec::new(),
+        source: None,
+        code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+        impact: CodeQueryDiagnosticImpact::Incomplete,
+        branch: Vec::new(),
+        language: "workspace",
+        message: brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+            format_args!(
+                "dependency evidence {:?} at {}:{}..{}: {}",
+                gap.kind,
+                crate::path_utils::workspace_relative_slash_path(&gap.build_file),
+                gap.byte_range.start,
+                gap.byte_range.end,
+                gap.message
+            ),
+            format_args!(
+                "dependency evidence {:?} is incomplete; detail_kind=DependencyEvidenceGap; omitted_source_context_items=1",
+                gap.kind
+            ),
+            std::iter::once(gap),
+        ),
+        exhausted_roots: Vec::new(),
+        withheld_rows_path: None,
+    })
+}
+
 pub(super) fn execute_dependency_evidence_seed(
     seed: &DependencyEvidenceSeed,
     terminal_cap: Option<usize>,
@@ -281,10 +314,14 @@ pub(super) fn execute_dependency_evidence_seed(
                     line!()
                 )
             });
-            state.analyzer.mark_execution_dependent();
+            state.mark_execution_dependent();
             diagnostics.push(super::QueryExecutionState::diagnostic(
                 state.analyzer,
                 CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                    has_non_utf8_refusal: false,
+                    refusal_sites: Default::default(),
+                    call_relation_facts: None,
+                    uses_omissions: Vec::new(),
                     incompleteness: brokk_bifrost_rql::Incompleteness::Operational(
                         brokk_bifrost_rql::DiagnosticExecutionCause::Provider,
                     ),
@@ -305,25 +342,7 @@ pub(super) fn execute_dependency_evidence_seed(
     };
     let mut incomplete = !evidence.complete();
     for gap in &evidence.gaps {
-        diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
-            incompleteness: Incompleteness::Content,
-            related: Vec::new(),
-            source: None,
-            code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
-            impact: CodeQueryDiagnosticImpact::Incomplete,
-            branch: Vec::new(),
-            language: "workspace",
-            message: format!(
-                "dependency evidence {:?} at {}:{}..{}: {}",
-                gap.kind,
-                crate::path_utils::workspace_relative_slash_path(&gap.build_file),
-                gap.byte_range.start,
-                gap.byte_range.end,
-                gap.message
-            ),
-            exhausted_roots: Vec::new(),
-            withheld_rows_path: None,
-        }));
+        diagnostics.push(dependency_gap_diagnostic(gap));
     }
     let locations = match state.analyzer.dependency_file_locations() {
         Ok(locations) => locations.into_iter().collect::<HashMap<_, _>>(),
@@ -332,6 +351,10 @@ pub(super) fn execute_dependency_evidence_seed(
             diagnostics.push(super::QueryExecutionState::diagnostic(
                 state.analyzer,
                 CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                    has_non_utf8_refusal: false,
+                    refusal_sites: Default::default(),
+                    call_relation_facts: None,
+                    uses_omissions: Vec::new(),
                     incompleteness: brokk_bifrost_rql::Incompleteness::Operational(
                         brokk_bifrost_rql::DiagnosticExecutionCause::Provider,
                     ),
@@ -371,6 +394,10 @@ pub(super) fn execute_dependency_evidence_seed(
             Err((predicate, reason)) => {
                 truncated = true;
                 diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                    has_non_utf8_refusal: false,
+                    refusal_sites: Default::default(),
+                    call_relation_facts: None,
+                    uses_omissions: Vec::new(),
                     incompleteness: Incompleteness::Content,
                     related: Vec::new(),
                     source: None,
@@ -393,6 +420,10 @@ pub(super) fn execute_dependency_evidence_seed(
             missing_location_reported = true;
             truncated = true;
             diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                 incompleteness: Incompleteness::Content,
                 related: Vec::new(),
                 source: None,
@@ -468,5 +499,45 @@ pub(super) fn evidence_key(value: &DependencyEvidenceValue) -> DetailedCodeQuery
         exact_version: row.exact_version.clone(),
         source: row.source.clone(),
         declared_by: row.declared_by.clone(),
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_prose_tests {
+    use super::*;
+    use brokk_bifrost_analysis::analyzer::semantic_model::DependencyEvidenceGapKind;
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12527: a forwarded dependency gap can carry an upstream collection beyond the prose bound"
+    )]
+    fn dependency_gap_prose_retains_typed_gap_and_cause() {
+        let mut gap = DependencyEvidenceGap {
+            kind: DependencyEvidenceGapKind::Conflict,
+            build_file: std::path::PathBuf::from("Cargo.toml"),
+            byte_range: 1..2,
+            message: "two declarations".into(),
+        };
+        let fitting = dependency_gap_diagnostic(&gap);
+        assert_eq!(
+            fitting.message,
+            "dependency evidence Conflict at Cargo.toml:1..2: two declarations"
+        );
+        gap.message = "x".repeat(10_000);
+        let bounded = dependency_gap_diagnostic(&gap);
+        assert_eq!(bounded.code, fitting.code);
+        assert_eq!(bounded.impact, fitting.impact);
+        assert_eq!(bounded.incompleteness, fitting.incompleteness);
+        assert_eq!(bounded.incompleteness, Incompleteness::Content);
+        assert!(
+            bounded.message.len()
+                <= brokk_bifrost_core::bounded_output::MAX_DIAGNOSTIC_MESSAGE_BYTES
+        );
+        assert!(bounded.message.contains("Conflict"));
+        assert!(
+            bounded
+                .message
+                .contains("detail_kind=DependencyEvidenceGap")
+        );
+        assert!(bounded.message.ends_with("omitted_items=1"));
     }
 }

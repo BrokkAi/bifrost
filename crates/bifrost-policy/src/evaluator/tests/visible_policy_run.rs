@@ -17,6 +17,7 @@ fn unsupported_typestate_reports_its_type_and_one_diagnostic() {
     let policy = registry.policies().next().unwrap();
     let flow_state = brokk_bifrost_flow::FlowWorkspaceState::new();
     let context = PolicyEvaluationContext {
+        acceptance_hint: None,
         analyzer: &analyzer,
         workspace: None,
         flow_state: &flow_state,
@@ -57,6 +58,7 @@ fn explicit_scope_refuses_typestate_with_scope_capability() {
     let policy = registry.policies().next().unwrap();
     let flow_state = brokk_bifrost_flow::FlowWorkspaceState::new();
     let context = PolicyEvaluationContext {
+        acceptance_hint: None,
         analyzer: &analyzer,
         workspace: None,
         flow_state: &flow_state,
@@ -91,6 +93,7 @@ fn incomplete_typestate_compile_keeps_caller_budget_and_diagnostic() {
     let policy = registry.policies().next().unwrap();
     let flow_state = brokk_bifrost_flow::FlowWorkspaceState::new();
     let context = PolicyEvaluationContext {
+        acceptance_hint: None,
         analyzer: &analyzer,
         workspace: None,
         flow_state: &flow_state,
@@ -162,6 +165,7 @@ fn failed_typestate_compile_retains_one_failure_diagnostic() {
     let policy = registry.policies().next().unwrap();
     let flow_state = brokk_bifrost_flow::FlowWorkspaceState::new();
     let context = PolicyEvaluationContext {
+        acceptance_hint: None,
         analyzer: &analyzer,
         workspace: None,
         flow_state: &flow_state,
@@ -216,6 +220,7 @@ fn match_finding_keeps_organizational_risk_overlay() {
     }];
     let flow_state = brokk_bifrost_flow::FlowWorkspaceState::new();
     let context = PolicyEvaluationContext {
+        acceptance_hint: None,
         analyzer: &analyzer,
         workspace: None,
         flow_state: &flow_state,
@@ -253,6 +258,7 @@ fn explicit_scope_refuses_relational_binding_outside_scope() {
     let policy = registry.policies().next().unwrap();
     let flow_state = brokk_bifrost_flow::FlowWorkspaceState::new();
     let context = PolicyEvaluationContext {
+        acceptance_hint: None,
         analyzer: &analyzer,
         workspace: None,
         flow_state: &flow_state,
@@ -308,6 +314,7 @@ fn proven_subset_and_overlay_cap_report_distinct_reasons() {
     }];
     let flow_state = brokk_bifrost_flow::FlowWorkspaceState::new();
     let context = PolicyEvaluationContext {
+        acceptance_hint: None,
         analyzer: &analyzer,
         workspace: None,
         flow_state: &flow_state,
@@ -366,6 +373,7 @@ fn declared_subset_survives_zero_diagnostic_budget() {
     );
     let flow_state = brokk_bifrost_flow::FlowWorkspaceState::new();
     let context = PolicyEvaluationContext {
+        acceptance_hint: None,
         analyzer: &analyzer,
         workspace: None,
         flow_state: &flow_state,
@@ -457,6 +465,7 @@ fn two_match_run_with_budget(
     let policy = registry.policies().next().unwrap();
     let flow_state = brokk_bifrost_flow::FlowWorkspaceState::new();
     let context = PolicyEvaluationContext {
+        acceptance_hint: None,
         analyzer: &analyzer,
         workspace: None,
         flow_state: &flow_state,
@@ -594,6 +603,7 @@ fn distinct_overlay_evidence_omissions_are_counted_once_each() {
     }];
     let flow_state = brokk_bifrost_flow::FlowWorkspaceState::new();
     let context = PolicyEvaluationContext {
+        acceptance_hint: None,
         analyzer: &analyzer,
         workspace: None,
         flow_state: &flow_state,
@@ -653,7 +663,7 @@ impl TaintPolicyEvaluator for ReferenceRichTaintAdapter {
             scope: None,
             projections: vec![projection],
             completion: PolicyRunCompletion::Complete,
-            diagnostics: Vec::new(),
+            diagnostics: Vec::new().into(),
             diagnostics_truncated: false,
             work: PolicyWorkReport::default(),
             authored_arm_closures: Vec::new(),
@@ -690,6 +700,7 @@ fn risk_overlay_preserves_proof_and_origin_reference_priority() {
     }];
     let flow_state = brokk_bifrost_flow::FlowWorkspaceState::new();
     let context = PolicyEvaluationContext {
+        acceptance_hint: None,
         analyzer: &analyzer,
         workspace: None,
         flow_state: &flow_state,

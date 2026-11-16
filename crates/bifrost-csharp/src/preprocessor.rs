@@ -43,6 +43,9 @@ pub struct PreprocessorScan {
     pub has_inactive_regions: bool,
     /// Conditional directives and their branch spans, including skipped text.
     pub branches: Vec<ConditionalBranch>,
+    // Final region projection, computed once and shared by the key and facts.
+    conditional_region_projection:
+        Vec<brokk_bifrost_core::analyzer::structural::conditional_regions::ConditionalRegion>,
     /// File-local symbol assignments, in source order.
     pub symbol_directives: Vec<SymbolDirective>,
 }
@@ -66,6 +69,7 @@ impl brokk_bifrost_core::analyzer::prepared_syntax::SourcePreprocessor for Prepr
                 r.capacity() * std::mem::size_of::<tree_sitter::Range>()
             })
             + self.branches.capacity() * std::mem::size_of::<ConditionalBranch>()
+            + self.conditional_region_projection.capacity() * std::mem::size_of::<brokk_bifrost_core::analyzer::structural::conditional_regions::ConditionalRegion>()
             + self
                 .branches
                 .iter()
@@ -176,8 +180,18 @@ impl PreprocessorScan {
         &self,
         source: &str,
     ) -> brokk_bifrost_core::analyzer::structural::conditional_regions::ConditionalRegions {
+        brokk_bifrost_core::analyzer::structural::conditional_regions::ConditionalRegions::new(
+            self.conditional_region_projection.clone(),
+            source,
+        )
+    }
+
+    // The authoritative projection used both by the fact producer and its key.
+    fn build_conditional_region_projection(
+        &self,
+    ) -> Vec<brokk_bifrost_core::analyzer::structural::conditional_regions::ConditionalRegion> {
         use brokk_bifrost_core::analyzer::structural::conditional_regions::{
-            Activation, ConditionalRegion, ConditionalRegions,
+            Activation, ConditionalRegion,
         };
         let chains = self.chain_activations();
         let mut indices = vec![0; chains.len()];
@@ -204,7 +218,7 @@ impl PreprocessorScan {
                 });
             }
         }
-        ConditionalRegions::new(regions, source)
+        regions
     }
 }
 
@@ -224,6 +238,18 @@ pub struct SymbolEnvironment {
     pub named_open: std::collections::BTreeSet<String>,
     pub closed: bool,
     pub open_reason: Option<String>,
+}
+
+impl SymbolEnvironment {
+    fn initial_lookup(&self, name: &str) -> Option<bool> {
+        if self.defined.contains(name) {
+            Some(true)
+        } else if self.closed && !self.named_open.contains(name) {
+            Some(false)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -423,16 +449,12 @@ impl OwnerState<'_> {
     }
 
     fn lookup(&self, name: &str) -> Option<bool> {
-        self.local.get(name).copied().unwrap_or_else(|| {
-            if self.owner.defined.contains(name) {
-                Some(true)
-            } else if self.owner.closed && !self.owner.named_open.contains(name) {
-                Some(false)
-            } else {
-                None
-            }
-        })
+        self.local
+            .get(name)
+            .copied()
+            .unwrap_or_else(|| self.owner.initial_lookup(name))
     }
+
     fn branch(
         &mut self,
         chain: usize,
@@ -582,7 +604,11 @@ pub fn assignment_digest(
     })
 }
 
+const DECISION_FORMAT: &[u8] = b"csharp-preprocessor-decisions-v2";
+
 /// The decision digest of a source with no conditional chains.
+/// No owner can affect its parser mask or regions, so preserve its existing key.
+/// Source-only directives are already fenced by the source OID in BlobKey.
 pub fn empty_decision_digest() -> [u8; 32] {
     brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher::new(
         b"csharp-preprocessor-decisions-v1",
@@ -596,7 +622,8 @@ fn assignment_digest_for_owners<'a>(
     has_chains: bool,
 ) -> [u8; 32] {
     use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
-    let mut assignment = CanonicalHasher::new(b"csharp-preprocessor-assignment-v1");
+    let mut assignment = CanonicalHasher::new(b"csharp-preprocessor-assignment-v2");
+    assignment.value(DECISION_FORMAT);
     for owner in owners.into_iter().filter(|_| has_chains) {
         assignment.value(owner.compilation_key.as_bytes());
         assignment.value(&[u8::from(owner.closed)]);
@@ -606,12 +633,10 @@ fn assignment_digest_for_owners<'a>(
         }
         for symbol in referenced_symbols {
             assignment.value(symbol.as_bytes());
-            assignment.value(&[if owner.defined.contains(symbol) {
-                1
-            } else if owner.closed {
-                0
-            } else {
-                2
+            assignment.value(&[match owner.initial_lookup(symbol) {
+                Some(true) => 1,
+                Some(false) => 0,
+                None => 2,
             }]);
         }
     }
@@ -623,7 +648,6 @@ fn finish_decisions(
     count: usize,
     referenced_symbols: std::collections::BTreeSet<String>,
 ) -> PreprocessorDecisions {
-    use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
     let assignment_digest = assignment_digest_for_owners(
         owners.iter().map(|state| state.owner),
         &referenced_symbols,
@@ -638,8 +662,23 @@ fn finish_decisions(
             }
         })
         .collect();
-    let mut digest = CanonicalHasher::new(b"csharp-preprocessor-decisions-v1");
-    for decision in &chains {
+    PreprocessorDecisions {
+        chains,
+        referenced_symbols,
+        decision_digest: empty_decision_digest(),
+        assignment_digest,
+    }
+}
+
+// Called only after the actual parser mask and branch inactivity are final.
+fn final_decision_digest(scan: &PreprocessorScan) -> [u8; 32] {
+    use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
+    use brokk_bifrost_core::analyzer::structural::conditional_regions::Activation;
+    if scan.decisions.chains.is_empty() {
+        return empty_decision_digest();
+    }
+    let mut digest = CanonicalHasher::new(DECISION_FORMAT);
+    for decision in &scan.decisions.chains {
         match decision {
             ChainDecision::Decided(index) => {
                 digest.value(b"decided");
@@ -658,12 +697,39 @@ fn finish_decisions(
             }
         }
     }
-    PreprocessorDecisions {
-        chains,
-        referenced_symbols,
-        decision_digest: digest.finish(),
-        assignment_digest,
+    digest.value(&[u8::from(scan.has_inactive_regions)]);
+    digest.value(&[u8::from(scan.included_ranges.is_some())]);
+    if let Some(ranges) = &scan.included_ranges {
+        digest.sequence("parser-ranges", ranges, |h, range| {
+            for offset in [
+                range.start_byte,
+                range.end_byte,
+                range.start_point.row,
+                range.start_point.column,
+                range.end_point.row,
+                range.end_point.column,
+            ] {
+                h.value(&(offset as u64).to_be_bytes());
+            }
+        });
     }
+    digest.sequence(
+        "conditional-regions",
+        &scan.conditional_region_projection,
+        |h, region| {
+            h.value(&(region.range.start as u64).to_be_bytes());
+            h.value(&(region.range.end as u64).to_be_bytes());
+            h.value(&[
+                match region.activation {
+                    Activation::CertainActive => 0,
+                    Activation::DecidedInactive => 1,
+                    Activation::Uncertain => 2,
+                },
+                u8::from(region.omitted),
+            ]);
+        },
+    );
+    digest.finish()
 }
 /// Lexical mode carried across lines while scanning for directive lines.
 ///
@@ -919,6 +985,7 @@ fn scan_with_owners(source: &str, owners: &[&SymbolEnvironment]) -> Preprocessor
             has_inactive_regions: false,
             branches,
             symbol_directives,
+            conditional_region_projection: Vec::new(),
         };
     }
 
@@ -948,14 +1015,18 @@ fn scan_with_owners(source: &str, owners: &[&SymbolEnvironment]) -> Preprocessor
             })
         })
         .collect();
-    PreprocessorScan {
+    let mut scan = PreprocessorScan {
         decisions,
         undecided_chains,
         included_ranges: Some(build_ranges(bytes, &kept)),
         has_inactive_regions,
         branches,
         symbol_directives,
-    }
+        conditional_region_projection: Vec::new(),
+    };
+    scan.conditional_region_projection = scan.build_conditional_region_projection();
+    scan.decisions.decision_digest = final_decision_digest(&scan);
+    scan
 }
 
 /// Merge adjacent kept spans and turn them into tree-sitter ranges.
@@ -1228,6 +1299,131 @@ mod tests {
     use brokk_bifrost_test_macros::hardwon;
 
     use super::*;
+
+    #[test]
+    #[hardwon(
+        "#11273: named-open and closed-absent symbols shared the parse-carry assignment guard"
+    )]
+    fn assignment_guard_fences_both_named_open_transitions_and_v1_receipts() {
+        use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
+
+        let absent = SymbolEnvironment {
+            compilation_key: "App/App.csproj [TargetFramework=net8.0]".into(),
+            defined: Default::default(),
+            named_open: Default::default(),
+            closed: true,
+            open_reason: None,
+        };
+        let mut named_open = absent.clone();
+        named_open.named_open.insert("DEBUG".into());
+        let source = "#if DEBUG\nclass DebugBranch {}\n#else\nclass OtherBranch {}\n#endif\n";
+        // Authentic v1 receipt: both states encoded a missing DEBUG as zero.
+        let mut legacy = CanonicalHasher::new(b"csharp-preprocessor-assignment-v1");
+        legacy.value(absent.compilation_key.as_bytes());
+        legacy.value(&[1]);
+        legacy.value(&[0]);
+        legacy.value(b"DEBUG");
+        legacy.value(&[0]);
+        let legacy = legacy.finish();
+        let mut dev_v2 = CanonicalHasher::new(b"csharp-preprocessor-assignment-v2");
+        dev_v2.value(absent.compilation_key.as_bytes());
+        dev_v2.value(&[1]);
+        dev_v2.value(&[0]);
+        dev_v2.value(b"DEBUG");
+        dev_v2.value(&[0]);
+        let dev_v2 = dev_v2.finish();
+        for (before, after) in [(&named_open, &absent), (&absent, &named_open)] {
+            let old = scan_and_decide_preprocessor(
+                source,
+                OwnerEnvironments::Known(std::slice::from_ref(before)),
+            );
+            let fresh = scan_and_decide_preprocessor(
+                source,
+                OwnerEnvironments::Known(std::slice::from_ref(after)),
+            );
+            let carried = assignment_digest(
+                OwnerEnvironments::Known(std::slice::from_ref(after)),
+                &old.decisions.referenced_symbols,
+                true,
+            );
+            assert_ne!(
+                old.decisions.decision_digest,
+                fresh.decisions.decision_digest
+            );
+            assert_ne!(
+                old.decisions.assignment_digest, carried,
+                "a changed symbol interpretation must force a fresh scan"
+            );
+            assert_ne!(
+                legacy, carried,
+                "v1 receipts must not carry in either direction"
+            );
+            assert_ne!(
+                dev_v2, carried,
+                "pre-format-binding development receipts must miss"
+            );
+            assert_eq!(carried, fresh.decisions.assignment_digest);
+        }
+    }
+
+    #[test]
+    #[hardwon("#11273: equal uncertainty reasons hid different parser masks and inactive regions")]
+    fn decision_keys_fence_mask_and_region_changes_with_equal_reasons() {
+        let absent = SymbolEnvironment {
+            compilation_key: "App [net8.0]".into(),
+            defined: Default::default(),
+            named_open: ["Q".into()].into(),
+            closed: true,
+            open_reason: None,
+        };
+        let mut defined = absent.clone();
+        defined.defined.insert("P".into());
+        for bodies in [true, false] {
+            let source = if bodies {
+                "#if P && Q\nclass First {}\n#elif Q\nclass Second {}\n#else\nclass Third {}\n#endif\n"
+            } else {
+                "#if Q\nclass First {}\n#elif P\nclass Second {}\n#else\nclass Third {}\n#endif\n"
+            };
+            let scan = |owner| {
+                scan_and_decide_preprocessor(
+                    source,
+                    OwnerEnvironments::Known(std::slice::from_ref(owner)),
+                )
+            };
+            let first = scan(&defined);
+            let second = scan(&absent);
+            assert_eq!(first.decisions.chains, second.decisions.chains);
+            assert_eq!(first.included_ranges == second.included_ranges, !bodies);
+            let byte = source
+                .find(if bodies {
+                    "class First"
+                } else {
+                    "class Second"
+                })
+                .unwrap();
+            assert_ne!(
+                first.conditional_regions(source).activation_at(byte),
+                second.conditional_regions(source).activation_at(byte)
+            );
+            if bodies {
+                let tree = |scan: &PreprocessorScan| {
+                    parse_csharp_scan_with_cancellation(source, scan, None)
+                        .unwrap()
+                        .root_node()
+                        .named_child(0)
+                        .unwrap()
+                        .utf8_text(source.as_bytes())
+                        .unwrap()
+                        .to_owned()
+                };
+                assert_ne!(tree(&first), tree(&second));
+            }
+            assert_ne!(
+                first.decisions.decision_digest, second.decisions.decision_digest,
+                "equal reasons must not alias different mask or region projections"
+            );
+        }
+    }
 
     /// The `StringSlice` shape: a member signature split across `#if NET`.
     const STRING_SLICE: &str = r#"namespace Markdig.Helpers

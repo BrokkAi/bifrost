@@ -1,0 +1,18 @@
+# The csharp semantic adapter lever (#11570).
+#
+# Add one `<issue>-<slug>` line when a change alters the value semantics the
+# csharp lowerer publishes for unchanged source: its identity is hashed into
+# every semantic artifact key, every public id derived from the adapter
+# fingerprint, the lowered-IR producer epoch and the policy lowering identity.
+# No other language's identity moves. Git merges this file with merge=union, so
+# two branches that each add a line keep both. Never edit or remove a line;
+# compaction replaces a prefix with a checkpoint line and keeps the identity.
+# See .agents/docs/cache-identity-levers.md.
+#
+# Replaced the numbered literal `csharp-value-semantics-v50`.
+11570-slice2a-token-files
+12128-memory-interference-at-await
+10319-csharp-constructor-chaining-calls
+12804-csharp-walk-incompleteness
+12546-csharp-membership-completeness
+8785-csharp-expression-variable-locals

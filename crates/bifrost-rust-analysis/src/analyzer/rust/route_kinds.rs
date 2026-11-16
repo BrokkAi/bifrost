@@ -1,11 +1,17 @@
+pub use super::configuration_kinds::{
+    RustUnitConfiguration, RustUnitConfigurationFacts, RustUnitConfigurationKey,
+};
 use brokk_bifrost_analysis::analyzer::derivation_host::{self, AnalyzerDerivations};
 use brokk_bifrost_analysis::analyzer::store::AnalyzerStore;
+use brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_crate_access::RustBlobActivity;
 use brokk_bifrost_analysis::analyzer::store::rust_unit_summaries::{
     RustSelectedUnitsPublication, rust_broad_file_units, rust_broad_placement_rows,
     rust_crate_name_units, rust_file_units, rust_package_units, rust_selected_units_known,
-    rust_unit_dependents, rust_unit_inputs, rust_unit_package_rows,
+    rust_unit_dependents, rust_unit_file_activity, rust_unit_inputs, rust_unit_package_rows,
+    rust_unit_placement_activity,
 };
 use brokk_bifrost_analysis::analyzer::{IAnalyzer, QueryReadIncomplete};
+use brokk_bifrost_core::allocation_size::allocation_size;
 use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
 use brokk_bifrost_core::analyzer::model::{Language, ProjectFile};
 use brokk_bifrost_core::analyzer::rust_facts::{
@@ -13,12 +19,14 @@ use brokk_bifrost_core::analyzer::rust_facts::{
 };
 use brokk_bifrost_core::attribution::{self, CoverageClass};
 use brokk_bifrost_core::gitblob::BlobKey;
-use brokk_bifrost_core::hash::{HashMap, HashSet};
+use brokk_bifrost_core::hash::{
+    HashMap, HashSet, allocated_table_slot_bytes, allocated_vec_slot_bytes,
+};
 use brokk_bifrost_core::retention_budget::RetainedBytes;
 use brokk_bifrost_rust::cargo_manifest::normalize_crate_name;
 use brokk_bifrost_rust::cargo_routes::{
-    RustCargoDependencyKind, RustCargoRouteIndex, RustCargoRouteSummaryRow,
-    SelectedRustRoutePathFacts,
+    RustCargoDependencyKind, RustCargoRouteIndex, RustCargoRouteSummaryRow, RustInactivePlacements,
+    RustPlacementState, SelectedRustRoutePathFacts,
 };
 use brokk_bifrost_rust::crate_naming::RustSelectedCargoNaming;
 use brokk_bifrost_semantic::analyzer::semantic::derivation::Demanded;
@@ -194,12 +202,44 @@ impl HashAnswer for Vec<(SelectedRustUnit, String, String)> {
 /// from the memo still records it.
 pub fn record_route_evidence_gap(analyzer: &dyn IAnalyzer, units: &[[u8; 32]]) {
     analyzer.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceGap(
-        format!("{ROUTE_EVIDENCE_GAP} {units:02x?}").into(),
+        brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+            format_args!("{ROUTE_EVIDENCE_GAP} {units:02x?}"),
+            format_args!("{ROUTE_EVIDENCE_GAP}; detail_kind=UnitKey"),
+            units.iter(),
+        )
+        .into(),
     ));
+}
+
+/// The gap text for a file whose test classification an undecided `cfg` leaves
+/// open: no build proves it production, and an undecided route may.
+pub fn uncertain_test_verdict_gap_text(file: &ProjectFile) -> String {
+    format!(
+        "Rust test classification is undecided for a file an undecided cfg route may compile: {:?}",
+        file.rel_path()
+    )
 }
 
 /// The text a route evidence gap starts with.
 const ROUTE_EVIDENCE_GAP: &str = "Rust route evidence is incomplete for units";
+
+/// The text a gap for a file placed only under an inactive or unknown `cfg`
+/// starts with.
+const INACTIVE_PLACEMENT_GAP: &str =
+    "Rust route evidence is incomplete for a file placed only under an inactive or unknown cfg:";
+
+pub fn inactive_placement_gap_text(file: &ProjectFile) -> String {
+    format!("{INACTIVE_PLACEMENT_GAP} {:?}", file.rel_path())
+}
+
+/// Records that the routes of `file` are incomplete because no selected build
+/// compiles it. Like [`record_route_evidence_gap`], it runs inside the
+/// memoized build, so a hit replays it.
+pub fn record_inactive_placement_gap(analyzer: &dyn IAnalyzer, file: &ProjectFile) {
+    analyzer.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceGap(
+        inactive_placement_gap_text(file).into(),
+    ));
+}
 
 /// The route evidence gaps among `reasons`, as the text each recorded. A usage
 /// entry point that captured the read incompleteness of its walk turns a
@@ -209,7 +249,8 @@ pub fn route_evidence_gaps(reasons: &[QueryReadIncomplete]) -> Vec<String> {
         .iter()
         .filter_map(|reason| match reason {
             QueryReadIncomplete::SemanticEvidenceGap(text)
-                if text.starts_with(ROUTE_EVIDENCE_GAP) =>
+                if text.starts_with(ROUTE_EVIDENCE_GAP)
+                    || text.starts_with(INACTIVE_PLACEMENT_GAP) =>
             {
                 Some(text.to_string())
             }
@@ -233,6 +274,7 @@ fn read<T: UnitRows>(
             value: rows.select(complete),
             complete,
             validity: ReuseValidity::Reusable,
+            reuse: brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::Content,
         },
         Err(e) => Computed::Unavailable(UnavailableCause::Failed(e.into())),
     }
@@ -264,18 +306,29 @@ fn selected_route_index(
     facts: &HashMap<ProjectFile, RustModuleRouteFacts>,
     rows: &[RustCargoRouteSummaryRow],
     records: &[(PathBuf, String, PathBuf)],
+    inactive: &RustInactivePlacements,
 ) -> Result<(RustCargoRouteIndex, Vec<ProjectFile>), UnavailableCause> {
     let naming = RustSelectedCargoNaming::from_naming_records(
         files.iter().map(|file| file.rel_path().to_path_buf()),
         records,
     );
     let selected = files.iter().cloned().collect::<HashSet<_>>();
-    let paths = SelectedRustRoutePathFacts::new(&selected, &naming);
+    // A file the selection mounts that is not a member of this unit: the
+    // persisted unit does not know it, and a declaration naming it is unproven.
+    // A failed lookup proves nothing, so it counts as held.
+    let held_by_selection = |candidate: &ProjectFile| {
+        let path =
+            brokk_bifrost_core::path_utils::workspace_relative_slash_path(candidate.rel_path());
+        derivation_host::with_bound_inventory(|i| i.mount_record_for_path("rust", &path))
+            .map_or(true, |mount| mount.is_some())
+    };
+    let paths = SelectedRustRoutePathFacts::new(&selected, &naming, &held_by_selection);
     let index = RustCargoRouteIndex::build_from_summary_rows_with_path_facts(
         files,
         facts,
         rows,
         &paths,
+        inactive,
         &route_build_progress(),
     )
     .ok_or(UnavailableCause::Cancelled)?;
@@ -345,7 +398,7 @@ impl DerivationKind for RustSelectedUnitsKnown {
             let listing = AnalyzerStore::rust_source_listing_complete_on_connection(
                 i.connection(),
                 &s,
-                brokk_bifrost_analysis::analyzer::store::RUST_SOURCE_LISTING_DERIVATION_VERSION,
+                brokk_bifrost_analysis::analyzer::store::rust_source_listing_derivation_identity(),
             )
             .map_err(|e| e.to_string())?;
             Ok((units, listing))
@@ -362,7 +415,7 @@ impl DerivationKind for RustSelectedUnitsKnown {
                 if !partial.is_empty() {
                     derivation_host::with_current_analyzer(|a| {
                         a.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceGap(
-                            format!("selected Rust crate membership is incomplete: {partial:02x?}")
+                            brokk_bifrost_core::bounded_output::bounded_diagnostic_items(format_args!("selected Rust crate membership is incomplete: {partial:02x?}"), format_args!("selected Rust crate membership is incomplete; detail_kind=UnitKey"), partial.iter())
                                 .into(),
                         ))
                     });
@@ -376,6 +429,7 @@ impl DerivationKind for RustSelectedUnitsKnown {
                     value: hash.finish(),
                     complete: listing && partial.is_empty(),
                     validity: ReuseValidity::Reusable,
+                    reuse: brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::Content,
                 }
             }
             Ok((RustSelectedUnitsPublication::Unpublished(units), _)) => {
@@ -403,27 +457,75 @@ fn selected_units_known<R: DerivationRevision, A: DerivationAuthority>(
 type UnitMembers = (
     Vec<brokk_bifrost_analysis::analyzer::store::rust_unit_summaries::RustSummaryPackageRow>,
     Vec<(ProjectFile, Option<Oid>)>,
+    RustInactivePlacements,
 );
 
+/// The persisted unit's members, each with the content the request's selection
+/// mounts at its path: an overlay's content for an edited file, `None` for a
+/// masked or removed one (never the revision's blob). Membership is the
+/// persisted unit's; a path the unit does not know does not join it.
 fn unit_members(unit: &[u8; 32]) -> Result<UnitMembers, String> {
     let root = derivation_host::with_current_analyzer(|a| a.project().root().to_path_buf());
     derivation_host::with_bound_inventory(|i| {
         let snapshot = derivation_host::selected_rust_snapshot(i)?;
         let package =
-            AnalyzerStore::rust_summary_package_rows_for_unit(i.connection(), &snapshot, unit)
+            AnalyzerStore::rust_selected_package_rows_for_unit(i.connection(), &snapshot, unit)
                 .map_err(|e| e.to_string())?;
         let placements = rust_broad_placement_rows(i.connection(), &snapshot, unit)
             .map_err(|e| e.to_string())?;
+        // Files no selected build is proved to compile, split by what the
+        // activation proves. The activity is the store's one definition
+        // (`rust_file_activity.sql`); a file without a stored placement is not
+        // listed and keeps its existing treatment.
+        let mut not_active = RustInactivePlacements::default();
+        for (path, activity) in
+            rust_unit_file_activity(i.connection(), &snapshot, unit).map_err(|e| e.to_string())?
+        {
+            match activity {
+                RustBlobActivity::Active => {}
+                RustBlobActivity::Inactive => {
+                    not_active
+                        .proven_inactive
+                        .insert(ProjectFile::new(root.clone(), path));
+                }
+                RustBlobActivity::Unknown => {
+                    not_active
+                        .undecided
+                        .insert(ProjectFile::new(root.clone(), path));
+                }
+            }
+        }
+        for (path, module_path, activity) in
+            rust_unit_placement_activity(i.connection(), &snapshot, unit)
+                .map_err(|e| e.to_string())?
+        {
+            not_active
+                .placements
+                .entry(ProjectFile::new(root.clone(), path))
+                .or_default()
+                .push((
+                    module_path,
+                    match activity {
+                        RustBlobActivity::Active => RustPlacementState::Active,
+                        RustBlobActivity::Inactive => RustPlacementState::Inactive,
+                        RustBlobActivity::Unknown => RustPlacementState::Undecided,
+                    },
+                ));
+        }
         let mut members = package
             .iter()
             .map(|r| {
                 Ok((
                     ProjectFile::new(root.clone(), &r.rel_path),
-                    Some(Oid::from_str(&r.blob_oid).map_err(|e| e.to_string())?),
+                    r.blob_oid
+                        .as_deref()
+                        .map(Oid::from_str)
+                        .transpose()
+                        .map_err(|e| e.to_string())?,
                 ))
             })
             .collect::<Result<Vec<_>, String>>()?;
-        for (path, _, _, _, _, _, _, oid) in placements {
+        for (path, _, _, _, oid) in placements {
             members.push((
                 ProjectFile::new(root.clone(), path),
                 oid.map(|oid| Oid::from_str(&oid))
@@ -433,7 +535,7 @@ fn unit_members(unit: &[u8; 32]) -> Result<UnitMembers, String> {
         }
         members.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         members.dedup();
-        Ok((package, members))
+        Ok((package, members, not_active))
     })
 }
 
@@ -468,7 +570,7 @@ impl DerivationKind for RustUnitNaming {
         let _scope =
             attribution::enter_scope("rust_unit_naming", CoverageClass::RecomputeOnCurrency);
         let result = (|| {
-            let (_, members) = unit_members(unit)?;
+            let (_, members, _) = unit_members(unit)?;
             let mut paths = members
                 .iter()
                 .flat_map(|(file, _)| {
@@ -512,9 +614,7 @@ impl DerivationKind for RustUnitNaming {
                 if !unreadable.is_empty() {
                     derivation_host::with_current_analyzer(|a| {
                         a.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceGap(
-                            format!(
-                                "Rust unit {unit:02x?} has unreadable manifests: {unreadable:?}"
-                            )
+                            brokk_bifrost_core::bounded_output::bounded_diagnostic_items(format_args!("Rust unit {unit:02x?} has unreadable manifests: {unreadable:?}"), format_args!("Rust unit {unit:02x?} has unreadable manifests; detail_kind=Manifest"), unreadable.iter())
                             .into(),
                         ))
                     });
@@ -523,6 +623,7 @@ impl DerivationKind for RustUnitNaming {
                     value,
                     complete: unreadable.is_empty(),
                     validity: ReuseValidity::Reusable,
+                    reuse: brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::Content,
                 }
             }
             Err(e) => Computed::Unavailable(UnavailableCause::Failed(e.into())),
@@ -537,10 +638,23 @@ impl DerivationKind for RustUnitNaming {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RustDependencyPackageIdentity(pub Result<String, String>);
+
+impl RetainedBytes for RustDependencyPackageIdentity {
+    fn retained_bytes(&self) -> usize {
+        match &self.0 {
+            Ok(value) | Err(value) => {
+                std::mem::size_of::<Self>() + allocation_size(value.capacity())
+            }
+        }
+    }
+}
+
 pub struct RustUnitDependencyIdentities;
 impl DerivationKind for RustUnitDependencyIdentities {
     type Key = [u8; 32];
-    type Output = Vec<(PathBuf, String, String)>;
+    type Output = Vec<(PathBuf, String, RustDependencyPackageIdentity)>;
     const ID: DerivationKindId = DerivationKindId("derivation:rust_unit_dependency_identities:v1");
     const QUESTION_SHAPE:
         brokk_bifrost_semantic::analyzer::semantic::read_ledger::PersistedDerivationFamily =
@@ -655,7 +769,11 @@ impl DerivationKind for RustUnitDependencyIdentities {
                 .filter(|mount| mount.relative_path == manifest)
             {
                 // Preserve package boundaries even with no dependencies.
-                records.push((mount.relative_path.clone(), String::new(), String::new()));
+                records.push((
+                    mount.relative_path.clone(),
+                    String::new(),
+                    RustDependencyPackageIdentity(Err("package boundary".to_owned())),
+                ));
                 for dependency in &mount.facts.dependencies {
                     let table = match dependency.kind {
                         brokk_bifrost_rust::selected_context::RustCargoDependencyKind::Normal => "dependencies",
@@ -674,7 +792,7 @@ impl DerivationKind for RustUnitDependencyIdentities {
                     let package = brokk_bifrost_rust::cargo_routes::cargo_dependency_value(
                         std::path::Path::new(""), directory, mount.document(),
                         &dependency.manifest_name, raw, &documents,
-                    ).and_then(|(value, _)| {
+                    ).ok_or_else(|| "dependency value or inherited workspace identity is unavailable".to_owned()).and_then(|(value, _)| {
                         let package = value.get("package").and_then(|value| value.as_str())
                             .unwrap_or(&dependency.manifest_name);
                         if package == "log" {
@@ -683,12 +801,12 @@ impl DerivationKind for RustUnitDependencyIdentities {
                             let requirement = value.as_str().or_else(|| value.get("version").and_then(|v| v.as_str()));
                             if requirement.is_none() || value.get("path").is_some() || value.get("git").is_some()
                                 || value.get("registry").is_some() || value.get("registry-index").is_some() {
-                                return None;
+                                return Err("log dependency is not an unmodified default-registry requirement".to_owned());
                             }
                             let root = brokk_bifrost_rust::cargo_routes::cargo_workspace_manifest_directory(
                                 std::path::Path::new(""), directory, mount.document(), &documents,
-                            )?;
-                            let root_manifest = documents.get(&root)?;
+                            ).ok_or_else(|| "owning workspace manifest is unavailable".to_owned())?;
+                            let root_manifest = documents.get(&root).ok_or_else(|| "workspace manifest document is unavailable".to_owned())?;
                             let patched = root_manifest.get("patch").and_then(|v| v.as_table())
                                 .is_some_and(|sources| sources.values().any(|entries| entries.as_table().is_some_and(|entries|
                                     entries.iter().any(|(name, entry)| name == "log" || entry.get("package").and_then(|v| v.as_str()) == Some("log"))
@@ -699,14 +817,16 @@ impl DerivationKind for RustUnitDependencyIdentities {
                                     || entry.get("package").and_then(|v| v.as_str()) == Some("log")));
                             // Cargo reads configuration from the directory it runs in, which may
                             // be the member, so every level from the member up must preserve it.
-                            if patched || replaced || !configuration.preserves_registry_package(directory, "log") { return None; }
+                            if patched { return Err("log package is patched".to_owned()); }
+                            if replaced { return Err("log package is replaced".to_owned()); }
+                            if !configuration.preserves_registry_package(directory, "log") { return Err("log package is config-overridden".to_owned()); }
                         }
-                        Some(package.to_owned())
+                        Ok(package.to_owned())
                     });
                     records.push((
                         mount.relative_path.clone(),
                         dependency.exposed_name.clone(),
-                        package.unwrap_or_default(),
+                        RustDependencyPackageIdentity(package),
                     ));
                 }
             }
@@ -720,9 +840,7 @@ impl DerivationKind for RustUnitDependencyIdentities {
                 if !unreadable.is_empty() {
                     derivation_host::with_current_analyzer(|a| {
                         a.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceGap(
-                            format!(
-                                "Rust unit {unit:02x?} has unreadable manifests: {unreadable:?}"
-                            )
+                            brokk_bifrost_core::bounded_output::bounded_diagnostic_items(format_args!("Rust unit {unit:02x?} has unreadable manifests: {unreadable:?}"), format_args!("Rust unit {unit:02x?} has unreadable manifests; detail_kind=Manifest"), unreadable.iter())
                             .into(),
                         ))
                     });
@@ -731,6 +849,7 @@ impl DerivationKind for RustUnitDependencyIdentities {
                     value,
                     complete: unreadable.is_empty(),
                     validity: ReuseValidity::Reusable,
+                    reuse: brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::Content,
                 }
             }
             Err(e) => Computed::Unavailable(UnavailableCause::Failed(e.into())),
@@ -740,7 +859,16 @@ impl DerivationKind for RustUnitDependencyIdentities {
         for (path, name, library) in v {
             h.value(&path_bytes(path));
             h.value(name.as_bytes());
-            h.value(library.as_bytes());
+            match &library.0 {
+                Ok(package) => {
+                    h.value(b"package");
+                    h.value(package.as_bytes());
+                }
+                Err(reason) => {
+                    h.value(b"refusal");
+                    h.value(reason.as_bytes());
+                }
+            }
         }
     }
 }
@@ -752,7 +880,7 @@ pub struct RustUnitInputs;
 impl DerivationKind for RustUnitInputs {
     type Key = [u8; 32];
     type Output = [u8; 32];
-    const ID: DerivationKindId = DerivationKindId("derivation:rust_unit_inputs:v1");
+    const ID: DerivationKindId = DerivationKindId("derivation:rust_unit_inputs:v2");
     const QUESTION_SHAPE:
         brokk_bifrost_semantic::analyzer::semantic::read_ledger::PersistedDerivationFamily =
         brokk_bifrost_semantic::analyzer::semantic::read_ledger::PersistedDerivationFamily::new(
@@ -797,15 +925,17 @@ impl DerivationKind for RustUnitInputs {
                     value,
                     complete,
                     validity: ReuseValidity::Reusable,
+                    reuse: brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::Content,
                 }
             }
             Ok(None) => {
-                let mut h = CanonicalHasher::new(b"derivation:rust_unit_inputs:absent:v1");
+                let mut h = CanonicalHasher::new(b"derivation:rust_unit_inputs:absent:v2");
                 h.value(k);
                 Computed::Available {
                     value: h.finish(),
                     complete: true,
                     validity: ReuseValidity::Reusable,
+                    reuse: brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::Content,
                 }
             }
             Err(error) => Computed::Unavailable(UnavailableCause::Failed(error.into())),
@@ -955,6 +1085,9 @@ pub struct RustUnitRouteFragment {
     pub(crate) packages: Vec<(ProjectFile, Vec<String>)>,
     pub(crate) facts: HashMap<ProjectFile, RustModuleRouteFacts>,
     pub(crate) rows: Vec<RustCargoRouteSummaryRow>,
+    /// Member files with no active placement in this unit, proven inactive or
+    /// undecided (#11639).
+    pub(crate) inactive: RustInactivePlacements,
     pub(crate) index: Arc<RustCargoRouteIndex>,
     /// Module candidates the build found missing from the selection and the
     /// listing certificate cannot prove absent: a `#[path]` target that is not
@@ -1082,17 +1215,21 @@ fn facts_projection(facts: &RustModuleRouteFacts, h: &mut CanonicalHasher) {
     });
 }
 fn string_weight(value: &Option<String>) -> usize {
-    value.as_ref().map_or(0, String::capacity)
+    value
+        .as_ref()
+        .map_or(0, |text| allocation_size(text.capacity()))
 }
 fn route_weight(row: &RustCargoRouteSummaryRow) -> usize {
-    row.manifest_directory.as_ref().map_or(0, PathBuf::capacity)
-        + row.target_kind.capacity()
-        + row.crate_name.capacity()
-        + row.edition.capacity()
+    row.manifest_directory
+        .as_ref()
+        .map_or(0, |path| allocation_size(path.capacity()))
+        + allocation_size(row.target_kind.capacity())
+        + allocation_size(row.crate_name.capacity())
+        + allocation_size(row.edition.capacity())
         + row
             .root_file
             .as_ref()
-            .map_or(0, ProjectFile::retained_heap_bytes)
+            .map_or(0, ProjectFile::allocated_heap_bytes)
         + string_weight(&row.root_package)
         + string_weight(&row.dependency_extern_name)
         + string_weight(&row.dependency_boundary)
@@ -1100,103 +1237,87 @@ fn route_weight(row: &RustCargoRouteSummaryRow) -> usize {
         + row
             .dependency_root_file
             .as_ref()
-            .map_or(0, ProjectFile::retained_heap_bytes)
+            .map_or(0, ProjectFile::allocated_heap_bytes)
         + string_weight(&row.dependency_root_package)
         + row
             .dependency_manifest_directory
             .as_ref()
-            .map_or(0, PathBuf::capacity)
+            .map_or(0, |path| allocation_size(path.capacity()))
 }
-fn visibility_weight(v: &brokk_bifrost_core::analyzer::rust_facts::RustVisibility) -> usize {
-    match v {
-        brokk_bifrost_core::analyzer::rust_facts::RustVisibility::InPath(parts) => {
-            parts.capacity() * std::mem::size_of::<String>()
-                + parts.iter().map(String::capacity).sum::<usize>()
-        }
-        _ => 0,
-    }
-}
-fn facts_weight(v: &RustModuleRouteFacts) -> usize {
-    v.scopes.capacity()
-        * std::mem::size_of::<brokk_bifrost_core::analyzer::rust_facts::RustModuleScopeFact>()
-        + v.scopes
+fn strings_weight(parts: &Vec<String>) -> usize {
+    allocated_vec_slot_bytes(parts)
+        + parts
             .iter()
-            .map(|s| {
-                s.module_name.capacity()
-                    + s.path_attribute.as_ref().map_or(0, String::capacity)
-                    + visibility_weight(&s.visibility)
-            })
-            .sum::<usize>()
-        + v.routes.capacity()
-            * std::mem::size_of::<brokk_bifrost_core::analyzer::rust_facts::RustModuleRouteFact>()
-        + v.routes
-            .iter()
-            .map(|r| {
-                r.module_name.capacity()
-                    + r.path_attribute.as_ref().map_or(0, String::capacity)
-                    + visibility_weight(&r.visibility)
-                    + r.cfg_condition.estimated_retained_bytes()
-                    + r.gates.capacity()
-                        * std::mem::size_of::<
-                            brokk_bifrost_core::analyzer::rust_facts::RustMacroGateFact,
-                        >()
-                    + r.gates
-                        .iter()
-                        .map(|g| g.macro_name.capacity())
-                        .sum::<usize>()
-            })
-            .sum::<usize>()
-        + v.item_macros.capacity()
-            * std::mem::size_of::<
-                brokk_bifrost_core::analyzer::rust_facts::RustRulesItemMacroDefinition,
-            >()
-        + v.item_macros
-            .iter()
-            .map(|m| {
-                m.name.capacity()
-                    + m.decoration
-                        .as_ref()
-                        .map_or(0, |c| c.estimated_retained_bytes())
-            })
+            .map(|part| allocation_size(part.capacity()))
             .sum::<usize>()
 }
 impl RetainedBytes for RustUnitRouteFragment {
     fn retained_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
-            + self.naming.retained_bytes()
-            + self.files.capacity() * std::mem::size_of::<ProjectFile>()
+            + allocated_vec_slot_bytes(&self.naming)
+            + self
+                .naming
+                .iter()
+                .map(|(manifest, name, library)| {
+                    allocation_size(manifest.capacity())
+                        + allocation_size(name.capacity())
+                        + allocation_size(library.capacity())
+                })
+                .sum::<usize>()
+            + allocated_vec_slot_bytes(&self.files)
             + self
                 .files
                 .iter()
-                .map(ProjectFile::retained_heap_bytes)
+                .map(ProjectFile::allocated_heap_bytes)
                 .sum::<usize>()
-            + self.packages.capacity() * std::mem::size_of::<(ProjectFile, Vec<String>)>()
+            + allocated_vec_slot_bytes(&self.packages)
             + self
                 .packages
                 .iter()
-                .map(|(f, c)| {
-                    f.retained_heap_bytes()
-                        + c.capacity() * std::mem::size_of::<String>()
-                        + c.iter().map(String::capacity).sum::<usize>()
-                })
+                .map(|(f, c)| f.allocated_heap_bytes() + strings_weight(c))
                 .sum::<usize>()
-            + self.facts.capacity()
-                * (std::mem::size_of::<ProjectFile>()
-                    + std::mem::size_of::<RustModuleRouteFacts>()
-                    + 2 * std::mem::size_of::<usize>())
+            + allocated_table_slot_bytes::<(ProjectFile, RustModuleRouteFacts)>(
+                self.facts.capacity(),
+            )
             + self
                 .facts
                 .iter()
-                .map(|(f, v)| f.retained_heap_bytes() + facts_weight(v))
+                .map(|(f, v)| f.allocated_heap_bytes() + v.allocated_retained_bytes())
                 .sum::<usize>()
-            + self.rows.capacity() * std::mem::size_of::<RustCargoRouteSummaryRow>()
+            + allocated_vec_slot_bytes(&self.rows)
             + self.rows.iter().map(route_weight).sum::<usize>()
+            + [&self.inactive.proven_inactive, &self.inactive.undecided]
+                .into_iter()
+                .map(|files| {
+                    allocated_table_slot_bytes::<ProjectFile>(files.capacity())
+                        + files
+                            .iter()
+                            .map(ProjectFile::allocated_heap_bytes)
+                            .sum::<usize>()
+                })
+                .sum::<usize>()
+            + allocated_table_slot_bytes::<(ProjectFile, Vec<(String, RustPlacementState)>)>(
+                self.inactive.placements.capacity(),
+            )
+            + self
+                .inactive
+                .placements
+                .iter()
+                .map(|(file, placements)| {
+                    file.allocated_heap_bytes()
+                        + allocated_vec_slot_bytes(placements)
+                        + placements
+                            .iter()
+                            .map(|(path, _)| allocation_size(path.capacity()))
+                            .sum::<usize>()
+                })
+                .sum::<usize>()
             + self.index.retained_bytes()
-            + self.unproven_candidates.capacity() * std::mem::size_of::<ProjectFile>()
+            + allocated_vec_slot_bytes(&self.unproven_candidates)
             + self
                 .unproven_candidates
                 .iter()
-                .map(ProjectFile::retained_heap_bytes)
+                .map(ProjectFile::allocated_heap_bytes)
                 .sum::<usize>()
     }
 }
@@ -1301,7 +1422,7 @@ impl DerivationKind for RustUnitRoutes {
         let root = derivation_host::with_current_analyzer(|analyzer| {
             analyzer.project().root().to_path_buf()
         });
-        let (package, members) = match unit_members(unit) {
+        let (package, members, not_active) = match unit_members(unit) {
             Ok(v) => v,
             Err(e) => return Computed::Unavailable(UnavailableCause::Failed(e.into())),
         };
@@ -1366,7 +1487,7 @@ impl DerivationKind for RustUnitRoutes {
             Demanded::Unavailable(cause) => return Computed::Unavailable(cause),
         };
         let (index, unproven_candidates) =
-            match selected_route_index(&files, &facts, &rows, &naming) {
+            match selected_route_index(&files, &facts, &rows, &naming, &not_active) {
                 Ok(built) => built,
                 Err(cause) => return Computed::Unavailable(cause),
             };
@@ -1375,10 +1496,7 @@ impl DerivationKind for RustUnitRoutes {
             causes.push("module files the listing cannot prove absent".to_owned());
             derivation_host::with_current_analyzer(|a| {
                 a.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceGap(
-                    format!(
-                        "Rust unit {unit:02x?} names module files the listing certificate \
-                         cannot prove absent: {unproven_candidates:?}"
-                    )
+                    brokk_bifrost_core::bounded_output::bounded_diagnostic_items(format_args!("Rust unit {unit:02x?} names module files the listing certificate cannot prove absent: {unproven_candidates:?}"), format_args!("Rust unit {unit:02x?} names module files the listing certificate cannot prove absent; detail_kind=ModuleFile"), unproven_candidates.iter())
                     .into(),
                 ))
             });
@@ -1386,9 +1504,7 @@ impl DerivationKind for RustUnitRoutes {
         if !complete {
             derivation_host::with_current_analyzer(|a| {
                 a.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceGap(
-                    format!(
-                        "Rust unit {unit:02x?} has incomplete published route evidence: {causes:?}"
-                    )
+                    brokk_bifrost_core::bounded_output::bounded_diagnostic_items(format_args!("Rust unit {unit:02x?} has incomplete published route evidence: {causes:?}"), format_args!("Rust unit {unit:02x?} has incomplete published route evidence; detail_kind=RouteCause"), causes.iter())
                     .into(),
                 ))
             });
@@ -1401,11 +1517,13 @@ impl DerivationKind for RustUnitRoutes {
                 packages,
                 facts,
                 rows,
+                inactive: not_active,
                 index: Arc::new(index),
                 unproven_candidates,
             },
             complete,
             validity,
+            reuse: brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::Content,
         }
     }
     fn output_projection(v: &Self::Output, hash: &mut CanonicalHasher) {
@@ -1452,6 +1570,41 @@ impl DerivationKind for RustUnitRoutes {
             .collect::<Vec<_>>();
         facts.sort_unstable();
         hash.sequence("module-facts", &facts, |h, row| h.value(row));
+        for (label, files) in [
+            ("inactive-files", &v.inactive.proven_inactive),
+            ("undecided-files", &v.inactive.undecided),
+        ] {
+            if !files.is_empty() {
+                let mut paths = files
+                    .iter()
+                    .map(|file| path_bytes(file.rel_path()))
+                    .collect::<Vec<_>>();
+                paths.sort_unstable();
+                hash.sequence(label, &paths, |h, file| h.value(file));
+            }
+        }
+        if !v.inactive.placements.is_empty() {
+            let mut placements = v
+                .inactive
+                .placements
+                .iter()
+                .flat_map(|(file, placements)| {
+                    placements.iter().map(move |(module_path, state)| {
+                        (
+                            path_bytes(file.rel_path()),
+                            module_path.clone(),
+                            *state as u8,
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            placements.sort_unstable();
+            hash.sequence("placement-activity", &placements, |h, row| {
+                h.value(&row.0);
+                h.value(row.1.as_bytes());
+                h.value(&[row.2]);
+            });
+        }
     }
 }
 
@@ -1488,15 +1641,11 @@ pub struct RustReachableFiles {
 impl RetainedBytes for RustReachableFiles {
     fn retained_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
-            + self.roots.capacity() * std::mem::size_of::<RustRootReachability>()
+            + allocated_vec_slot_bytes(&self.roots)
             + self
                 .roots
                 .iter()
-                .map(|entry| {
-                    entry.root.capacity()
-                        + entry.files.capacity() * std::mem::size_of::<String>()
-                        + entry.files.iter().map(String::capacity).sum::<usize>()
-                })
+                .map(|entry| allocation_size(entry.root.capacity()) + strings_weight(&entry.files))
                 .sum::<usize>()
     }
 }
@@ -1564,6 +1713,7 @@ impl DerivationKind for RustTargetReachability {
         let mut files = target.files.clone();
         let mut facts = target.facts.clone();
         let mut rows = target.rows.clone();
+        let mut inactive = target.inactive.clone();
         let target_roots = target
             .rows
             .iter()
@@ -1605,13 +1755,14 @@ impl DerivationKind for RustTargetReachability {
                     .map(|(file, fact)| (file.clone(), fact.clone())),
             );
             rows.extend(fragment.rows.iter().cloned());
+            inactive.extend(&fragment.inactive);
         }
         files.sort_unstable();
         files.dedup();
         // Every unproven candidate of this merged build is a candidate of one
         // of the fragments demanded above, and each of those already made
         // `complete` false.
-        let (index, _) = match selected_route_index(&files, &facts, &rows, &naming) {
+        let (index, _) = match selected_route_index(&files, &facts, &rows, &naming, &inactive) {
             Ok(built) => built,
             Err(cause) => return Computed::Unavailable(cause),
         };
@@ -1639,6 +1790,7 @@ impl DerivationKind for RustTargetReachability {
             value: RustReachableFiles { roots: answer },
             complete,
             validity: ReuseValidity::Reusable,
+            reuse: brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::Content,
         }
     }
     fn output_projection(v: &Self::Output, hash: &mut CanonicalHasher) {
@@ -1662,15 +1814,10 @@ pub struct RustUnitPackageRow {
 impl RetainedBytes for RustUnitPackageRow {
     fn retained_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
-            + self.rel_path.capacity()
-            + self.package_components.capacity() * std::mem::size_of::<String>()
-            + self
-                .package_components
-                .iter()
-                .map(String::capacity)
-                .sum::<usize>()
-            + self.crate_name.capacity()
-            + self.target_kind.capacity()
+            + allocation_size(self.rel_path.capacity())
+            + strings_weight(&self.package_components)
+            + allocation_size(self.crate_name.capacity())
+            + allocation_size(self.target_kind.capacity())
     }
 }
 
@@ -1715,7 +1862,7 @@ impl DerivationKind for RustUnitPackageRows {
             rust_unit_package_rows(inventory.connection(), &snapshot, unit)
                 .map_err(|error| error.to_string())
         });
-        let (rows, complete) = match read {
+        let (rows, mut complete) = match read {
             Ok(Some((rows, complete))) => {
                 let complete = complete && !rows.is_empty();
                 (rows, complete)
@@ -1727,6 +1874,25 @@ impl DerivationKind for RustUnitPackageRows {
             derivation_host::with_current_analyzer(|a| {
                 a.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceGap(
                     format!("Rust unit {unit:02x?} has incomplete inventory").into(),
+                ))
+            });
+        }
+        // A member whose every declaring edge the selection removed, retargeted
+        // or gated off is no longer proven to belong to the unit, and the
+        // selection may place it elsewhere in a way the persisted unit cannot
+        // see: leave it out and say the listing is partial.
+        let (rows, unplaced): (Vec<_>, Vec<_>) =
+            rows.into_iter().partition(|row| !row.unplaced_by_selection);
+        if !unplaced.is_empty() {
+            complete = false;
+            let unplaced = unplaced
+                .iter()
+                .map(|row| row.rel_path.as_str())
+                .collect::<Vec<_>>();
+            derivation_host::with_current_analyzer(|a| {
+                a.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceGap(
+                    brokk_bifrost_core::bounded_output::bounded_diagnostic_items(format_args!("Rust unit {unit:02x?} members unplaced by the selection: {unplaced:?}"), format_args!("Rust unit {unit:02x?} members unplaced by the selection; detail_kind=Member"), unplaced.iter())
+                    .into(),
                 ))
             });
         }
@@ -1745,6 +1911,7 @@ impl DerivationKind for RustUnitPackageRows {
             value: rows,
             complete,
             validity: ReuseValidity::Reusable,
+            reuse: brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::Content,
         }
     }
     fn output_projection(v: &Self::Output, hash: &mut CanonicalHasher) {
@@ -1763,6 +1930,7 @@ impl DerivationKind for RustUnitPackageRows {
 pub fn register(d: &AnalyzerDerivations) {
     d.register(RustSelectedUnitsKnown);
     d.register(RustUnitInputs);
+    d.register(RustUnitConfiguration);
     d.register(RustUnitNaming);
     d.register(RustUnitDependencyIdentities);
     d.register(RustUnitDependents);
@@ -1773,6 +1941,7 @@ pub fn register(d: &AnalyzerDerivations) {
     d.register(RustUnitRoutes);
     d.register(RustTargetReachability);
     d.register(RustUnitPackageRows);
+    d.register(RustLocalGlobNameAbsence);
 }
 
 // Shared by whole-index and per-unit route composition.
@@ -1837,6 +2006,152 @@ pub(super) fn summary_route_rows(
         .collect::<Vec<_>>()
 }
 
+/// The encoded name holds parser-projected import coordinates and the queried
+/// namespace/name. It is a question codec, not source syntax to reparse.
+pub struct RustLocalGlobNameAbsence;
+impl DerivationKind for RustLocalGlobNameAbsence {
+    type Key = (String, String);
+    type Output = brokk_bifrost_rust::graph_support::RustGlobNameAbsence;
+    const ID: DerivationKindId = DerivationKindId("derivation:rust_local_glob_name_absence:v1");
+    const QUESTION_SHAPE:
+        brokk_bifrost_semantic::analyzer::semantic::read_ledger::PersistedDerivationFamily =
+        brokk_bifrost_semantic::analyzer::semantic::read_ledger::PersistedDerivationFamily::new(
+            Self::ID,
+            true,
+            false,
+            true,
+            true,
+        );
+    const STRATUM: u16 = 2;
+    // File membership and every local closure unit are recorded below. Their
+    // identities cover import facts, export alternatives, gaps and selected
+    // member content, so an unchanged input set can reuse this exact answer
+    // across the Main bridge's successive reader leases.
+    const VERIFY: Verification = Verification::BaseInputs;
+    const CHILDREN: &'static [(DerivationKindId, u16)] =
+        &[(RustFileUnits::ID, 1), (RustUnitInputs::ID, 0)];
+    fn question(key: &Self::Key) -> DerivationQuestion {
+        DerivationQuestion {
+            language: Some(Language::Rust),
+            subject: None,
+            rel_path: Some(key.0.clone().into()),
+            name: Some(key.1.clone().into()),
+        }
+    }
+    fn key_from_question(q: &DerivationQuestion) -> Option<Self::Key> {
+        if q.language != Some(Language::Rust) || q.subject.is_some() {
+            return None;
+        }
+        Some((q.rel_path.as_deref()?.into(), q.name.as_deref()?.into()))
+    }
+    fn compute<R: DerivationRevision, A: DerivationAuthority>(
+        &self,
+        frame: &mut DerivationFrame<'_, R, A>,
+        key: &Self::Key,
+    ) -> Computed<Self::Output> {
+        let _scope = attribution::enter_scope(
+            "rust_local_glob_name_absence",
+            CoverageClass::DeclaredInputs,
+        );
+        let result = (|| -> Result<_, String> {
+            let (start, segments, namespace, name): (usize, Vec<String>, String, String) =
+                serde_json::from_str(&key.1).map_err(|e| e.to_string())?;
+            let namespace = match namespace.as_str() {
+                "type" => brokk_bifrost_rust::graph_support::RustGlobNamespace::Type,
+                "macro" => brokk_bifrost_rust::graph_support::RustGlobNamespace::Macro,
+                _ => return Err(format!("invalid local glob namespace: {namespace:?}")),
+            };
+            derivation_host::with_bound_inventory(|inventory| {
+                // The bridge admits only a selection whose changes cannot reach
+                // this glob's closure; a bound inventory that still overlays a
+                // file the closure lists answers from rows that file made stale.
+                let overlaid = brokk_bifrost_analysis::analyzer::store::rust_unit_summaries::rust_selection_overlay_paths(inventory.connection()).map_err(|e| e.to_string())?;
+                if !overlaid.is_empty()
+                    && brokk_bifrost_analysis::analyzer::store::rust_unit_summaries::rust_local_glob_closure_reads_paths(inventory.connection(), &key.0, &overlaid).map_err(|e| e.to_string())?
+                {
+                    return Ok(brokk_bifrost_rust::graph_support::RustGlobNameAbsence::Incomplete);
+                }
+                AnalyzerStore::rust_local_glob_name_absence(
+                    inventory.connection(),
+                    &key.0,
+                    start,
+                    &segments,
+                    namespace,
+                    &name,
+                )
+                .map_err(|e| e.to_string())
+            })
+        })();
+        let answer = match result {
+            Ok(answer) => answer,
+            Err(error) => return Computed::Unavailable(UnavailableCause::Failed(error.into())),
+        };
+        if answer != brokk_bifrost_rust::graph_support::RustGlobNameAbsence::ClosedAbsent {
+            // Refusal and positive competition are operational outcomes. Do
+            // not retain them as reusable proofs or erase their typed cause
+            // behind a crate-wide inventory incompleteness diagnostic.
+            return Computed::Available {
+                value: answer,
+                complete: true,
+                validity: ReuseValidity::NotReusable(
+                    brokk_bifrost_semantic::analyzer::semantic::derivation::NotReusableCause::InvalidDependencyEvidence),
+                reuse: brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::Content,
+            };
+        }
+        let units = match frame.demand::<RustFileUnits>(&key.0) {
+            Demanded::Available {
+                value,
+                complete: true,
+                ..
+            } => value,
+            Demanded::Available { .. } => {
+                return Computed::Unavailable(UnavailableCause::ValidationFailed);
+            }
+            Demanded::Unavailable(cause) => return Computed::Unavailable(cause),
+        };
+        // Record the summaries that the local selected dependency closure can
+        // read, including empty-name answers. The recursive relation is SQL's
+        // deduplicated fixed point and never becomes a retained workspace map.
+        for unit in units.iter() {
+            let dependencies = derivation_host::with_bound_inventory(|inventory| {
+                let mut statement = inventory.connection().prepare_cached(
+                    "SELECT unit_key FROM temp.selected_rust_unit_closure WHERE root_unit_key=?1 ORDER BY unit_key")?;
+                statement
+                    .query_map([unit.key().as_slice()], |row| row.get::<_, Vec<u8>>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            });
+            let dependencies = match dependencies {
+                Ok(value) => value,
+                Err(error) => {
+                    return Computed::Unavailable(UnavailableCause::Failed(
+                        error.to_string().into(),
+                    ));
+                }
+            };
+            for dependency in dependencies {
+                let dependency: [u8; 32] =
+                    dependency.try_into().expect("selected unit digest width");
+                match frame.demand::<RustUnitInputs>(&dependency) {
+                    Demanded::Available { complete: true, .. } => (),
+                    Demanded::Available { .. } => {
+                        return Computed::Unavailable(UnavailableCause::ValidationFailed);
+                    }
+                    Demanded::Unavailable(cause) => return Computed::Unavailable(cause),
+                }
+            }
+        }
+        Computed::Available {
+            value: answer,
+            complete: true,
+            validity: ReuseValidity::Reusable,
+            reuse: brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::Content,
+        }
+    }
+    fn output_projection(value: &Self::Output, hash: &mut CanonicalHasher) {
+        hash.value(&[*value as u8]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1863,7 +2178,7 @@ mod tests {
         let missing = "src/missing.rs".to_string();
         let complete = |fixture: &SelectionFixture| {
             let read = fixture.open_ready(&[]);
-            let host = AnalyzerDerivations::new(&RetentionBudget::new(1_000_000));
+            let host = AnalyzerDerivations::new(&RetentionBudget::for_test_capacity(1_000_000));
             match host.demand::<RustFileUnits>(&analyzer, &read, &missing) {
                 Demanded::Available { complete, .. } => complete,
                 Demanded::Unavailable(cause) => panic!("unavailable: {cause:?}"),
@@ -1878,8 +2193,9 @@ mod tests {
             .store
             .publish_rust_source_listing(
                 &uncertified,
-                brokk_bifrost_analysis::analyzer::store::RUST_SOURCE_LISTING_DERIVATION_VERSION,
+                brokk_bifrost_analysis::analyzer::store::rust_source_listing_derivation_identity(),
                 vec![("x.rs".to_string(), "unreadable".to_string())],
+                Default::default(),
             )
             .unwrap();
         assert_eq!(failed.revision, uncertified.revision + 1);
@@ -1893,8 +2209,9 @@ mod tests {
             .store
             .publish_rust_source_listing(
                 &failed,
-                brokk_bifrost_analysis::analyzer::store::RUST_SOURCE_LISTING_DERIVATION_VERSION,
+                brokk_bifrost_analysis::analyzer::store::rust_source_listing_derivation_identity(),
                 Vec::new(),
+                Default::default(),
             )
             .unwrap();
         assert_eq!(certified.revision, failed.revision + 1);
@@ -1921,6 +2238,7 @@ mod tests {
             packages: vec![(file.clone(), Vec::new())],
             facts: HashMap::default(),
             rows: Vec::new(),
+            inactive: RustInactivePlacements::default(),
             index: Arc::new(RustCargoRouteIndex::default()),
             unproven_candidates: Vec::new(),
         };
@@ -1957,7 +2275,7 @@ mod tests {
             )
             .unwrap();
         let brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionMountInventoryOutcome::Ready(read) = read else { panic!("selected inventory unavailable") };
-        let host = AnalyzerDerivations::new(&RetentionBudget::new(1_000_000));
+        let host = AnalyzerDerivations::new(&RetentionBudget::for_test_capacity(1_000_000));
         assert!(matches!(
             host.demand::<RustUnitInputs>(analyzer, &read, &[0; 32]),
             Demanded::Available { .. }

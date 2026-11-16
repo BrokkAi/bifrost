@@ -49,6 +49,73 @@ use brokk_bifrost_test_macros::hardwon;
 use std::sync::Arc;
 use tree_sitter::Parser;
 
+#[test]
+#[hardwon("#12125: public definition lookup panicked on a recovered Go type declaration")]
+fn public_recovered_type_lookup_is_not_complete_empty() {
+    use brokk_bifrost_analysis::analyzer::usages::get_definition::{
+        DefinitionLookupRequest, resolve_definition_batch_with_source_tree,
+    };
+
+    let source = "package p\n{\ntype T int\n";
+    let fixture = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.test/recovery\n\ngo 1.22\n")
+        .file(CALLER, source)
+        .build();
+    let mut config = AnalyzerConfig::default();
+    config.go.dependency_discovery.mode = GoDependencyDiscoveryMode::Disabled;
+    let workspace = fixture.workspace_analyzer(config);
+    let analyzer = workspace.analyzer();
+    let file = fixture.file(CALLER);
+    let errors = analyzer
+        .parse_errors(&file)
+        .expect("retained parser recovery");
+    assert!(
+        !errors.is_empty(),
+        "the damaged source must report recovery"
+    );
+
+    let tree = brokk_bifrost_go::parse::parse_go(source).expect("product Go parser");
+    let mut pending = vec![tree.root_node()];
+    let mut selected = None;
+    while let Some(node) = pending.pop() {
+        if node.kind() == "type_spec" {
+            let name = node.child_by_field_name("name").unwrap();
+            assert_eq!(name.utf8_text(source.as_bytes()).unwrap(), "T");
+            assert!(selected.is_none(), "the witness has one selected type");
+            selected = Some((name.start_byte(), name.end_byte()));
+        }
+        for index in (0..node.named_child_count()).rev() {
+            pending.push(node.named_child(index).unwrap());
+        }
+    }
+    let (start, end) = selected.expect("the type survives inside recovery");
+    let outcomes = resolve_definition_batch_with_source_tree(
+        analyzer,
+        vec![DefinitionLookupRequest {
+            file: file.clone(),
+            line: None,
+            column: None,
+            start_byte: Some(start),
+            end_byte: Some(end),
+        }],
+        file,
+        Arc::from(source),
+        Some(tree.clone()),
+    );
+    assert_eq!(outcomes.len(), 1);
+    let outcome = &outcomes[0];
+    eprintln!("recovered_public_definition={outcome:?}");
+    assert!(
+        matches!(
+            outcome.status,
+            DefinitionLookupStatus::Incomplete | DefinitionLookupStatus::Unavailable
+        ),
+        "parser recovery cannot certify a complete empty answer: {outcome:?}"
+    );
+    assert!(outcome.definitions.is_empty(), "{outcome:?}");
+    assert!(!outcome.diagnostics.is_empty(), "{outcome:?}");
+}
+
 const PROVIDER: &str = "provider/item.go";
 const CALLER: &str = "consumer/use.go";
 
@@ -707,6 +774,86 @@ fn go_native_point_projects_direct_composite_type_shapes() {
 }
 
 #[test]
+#[hardwon("#7509: namespace projection required a memo entry after rejected admission")]
+fn go_namespace_projection_uses_returned_unretained_context() {
+    use brokk_bifrost_analysis::analyzer::i_analyzer::capture_read_execution_cause;
+    use brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause;
+    use brokk_bifrost_analysis::analyzer::usages::common::{
+        QueryMemoOwner, with_memo_fill_reason_for_test,
+    };
+    use brokk_bifrost_analysis::analyzer::{AnalyzerQueryScope, QueryReadIncomplete};
+
+    let source = "package consumer\nimport renamed \"example.test/native/provider\"\nvar value renamed.Item\n";
+    let fixture = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.test/native\n\ngo 1.22\n")
+        .file(PROVIDER, "package vocabulary; type Item struct {}")
+        .file(CALLER, source)
+        .build();
+    let mut config = AnalyzerConfig::default();
+    config.go.dependency_discovery.mode = GoDependencyDiscoveryMode::Disabled;
+    let workspace = fixture.workspace_analyzer(config);
+    let analyzer = workspace.analyzer();
+    let go = resolve_analyzer::<GoAnalyzer>(analyzer).unwrap();
+    let _attempt = AnalyzerQueryScope::for_advisory_read(analyzer);
+    let cancellation = CancellationToken::new();
+    let file = fixture.file(CALLER);
+    let GoNativePointRequestOpen::Ready(mut request) = GoNativePointRequest::open_for_file(
+        go,
+        &file,
+        analyzer.semantic_model_overlay_read().published(),
+        &cancellation,
+    )
+    .unwrap() else {
+        panic!("the selected source context must open")
+    };
+    let site = site_for(source, "renamed");
+    let tree = crate::analyzer::usages::get_definition::go::parse_go_tree(source).unwrap();
+    let (result, cause) = capture_read_execution_cause(analyzer, || {
+        with_memo_fill_reason_for_test(
+            QueryMemoOwner::GoFileContext,
+            QueryReadIncomplete::ProofStopped {
+                reason: "namespace completed preparation is not reusable",
+                cause: Some(DerivationExecutionCause::Budget),
+            },
+            || {
+                request.resolve_definition_with_evidence(BoundedReceiverQuery {
+                    analyzer,
+                    file: &file,
+                    source,
+                    tree: Some(&tree),
+                    site: &site,
+                    budget: ReceiverAnalysisBudget::default(),
+                    cancellation: Some(&cancellation),
+                })
+            },
+        )
+    });
+    assert_eq!(cause, Some(DerivationExecutionCause::Budget));
+    let BoundedResolution::Complete { value, .. } = result else {
+        panic!("completed source projection must return its value: {result:?}")
+    };
+    assert_eq!(
+        value.outcome.status,
+        DefinitionLookupStatus::NoDefinition,
+        "{:?}",
+        value.outcome
+    );
+    assert!(
+        value
+            .outcome
+            .diagnostics
+            .iter()
+            .any(|reason| reason.kind == "workspace_package_namespace"),
+        "{:?}",
+        value.outcome
+    );
+    assert!(
+        request.files.is_empty(),
+        "the rejected fill must not remain memoized"
+    );
+}
+
+#[test]
 fn go_native_point_request_reuses_operation_and_path_context_per_file() {
     // The points are value references. A type-name site answers no_type, so the
     // reuse check reads the imported type through the declared values instead.
@@ -1155,7 +1302,11 @@ fn go_native_point_binds_model_backed_import_without_discovery() {
         .file("go.mod", "module example.test/native\n\ngo 1.22\n")
         .file(CALLER, source)
         .build();
-    let workspace = fixture.workspace_analyzer(AnalyzerConfig::default());
+    // This fixture selects source inventory explicitly: a host Go toolchain
+    // must not replace the session pack as the modeled import authority.
+    let mut config = AnalyzerConfig::default();
+    config.go.dependency_discovery.mode = GoDependencyDiscoveryMode::Disabled;
+    let workspace = fixture.workspace_analyzer(config);
     let analyzer = workspace.analyzer();
     let _catalog = activate_receiver_models_for_test(analyzer);
     let file = fixture.file(CALLER);
@@ -1354,9 +1505,12 @@ func useUnknown[T interface{ Release() error }](receiver T) {
     // GoTool confirms these packages; selected model packs declare their types.
     // Keep that provenance intact while minting through the native request.
     let go = resolve_analyzer::<GoAnalyzer>(analyzer).expect("Go delegate");
-    let GoNativePointRequestOpen::Ready(mut request) =
-        GoNativePointRequest::open(go, analyzer.semantic_model_overlay(), &cancellation).unwrap()
-    else {
+    let GoNativePointRequestOpen::Ready(mut request) = GoNativePointRequest::open(
+        go,
+        analyzer.semantic_model_overlay_read().published(),
+        &cancellation,
+    )
+    .unwrap() else {
         panic!("native Go request")
     };
     let context = request
@@ -4141,6 +4295,227 @@ func use(value Result, imported vocabulary.Item) {
 }
 
 #[test]
+#[hardwon("#11688: a retained Go type endpoint lost the refused import's incomplete binding")]
+fn go_native_refused_import_keeps_type_and_call_obligations_on_repeated_points() {
+    use brokk_bifrost_analysis::analyzer::resolution::model::ResolutionCompletion;
+
+    if !go_toolchain_available() {
+        return;
+    }
+    type Case<'a> = (&'a str, &'a [&'a str], &'a [&'a str], Option<&'a str>);
+    let cases: [Case<'_>; 8] = [
+        (
+            "package consumer\nimport renamed \"./store\"\nfunc use() { renamed.Present(); _ = renamed.Item{} }\n",
+            &["go-import-incomplete", "go-package-incomplete"],
+            &["Item", "Present"],
+            None,
+        ),
+        (
+            "package consumer\nimport _ \"strange\"\nvar Use provider.Item\n",
+            &[],
+            &["Item"],
+            None,
+        ),
+        (
+            "package consumer\nimport known \"strange\"\nvar Use provider.Item\n",
+            &[],
+            &["Item"],
+            None,
+        ),
+        (
+            "package consumer\nimport \"example.test/native/consumer/store\"\nvar Use provider.Item\n",
+            &[],
+            &["Item"],
+            None,
+        ),
+        (
+            "package consumer\nimport \"strange\"\nvar Use provider.Item\n",
+            &["go-import-incomplete"],
+            &["Item"],
+            None,
+        ),
+        (
+            "package consumer\nimport \"example.test/native/consumer/store\"\nvar Use provider.Item\n",
+            &["go-import-incomplete"],
+            &["Item"],
+            Some("package provider\ntype Other struct{}\n"),
+        ),
+        (
+            "package consumer\nimport \"strange\"\nfunc use() { provider := struct{}{}; _ = provider.Item }\n",
+            &[],
+            &["Item"],
+            None,
+        ),
+        (
+            "package consumer\nimport \"strange\"\nfunc use(provider struct{}) { _ = provider.Item }\n",
+            &[],
+            &["Item"],
+            None,
+        ),
+    ];
+    for (source, expected_gaps, expected_points, peer) in cases {
+        let mut builder = InlineTestProject::with_language(Language::Go)
+            .file("go.mod", "module example.test/native\n\ngo 1.22\n")
+            .file(CALLER, source)
+            .file(
+                "consumer/store/store.go",
+                "package vocabulary\nfunc Present() {}\ntype Item struct{}\n",
+            );
+        if let Some(peer) = peer {
+            builder = builder.file("consumer/store/zz_peer.go", peer);
+        }
+        let fixture = builder.build();
+        let config = AnalyzerConfig {
+            go: GoAnalyzerConfig {
+                dependency_discovery: GoDependencyDiscoveryConfig {
+                    mode: GoDependencyDiscoveryMode::CuratedPackEvidence,
+                    ..GoDependencyDiscoveryConfig::default()
+                },
+            },
+            ..AnalyzerConfig::default()
+        };
+        let workspace = fixture.workspace_analyzer(config);
+        let analyzer = workspace.analyzer();
+        let file = fixture.file(CALLER);
+        let cancellation = CancellationToken::default();
+        let GoNativePointRequestOpen::Ready(mut request) = GoNativePointRequest::open_for_file(
+            resolve_analyzer::<GoAnalyzer>(analyzer).unwrap(),
+            &file,
+            analyzer.semantic_model_overlay_read().published(),
+            &cancellation,
+        )
+        .unwrap() else {
+            panic!("refused imports still have a native caller context");
+        };
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_go::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let mut pending = vec![tree.root_node()];
+        let mut points = Vec::new();
+        while let Some(node) = pending.pop() {
+            let member = match node.kind() {
+                "qualified_type" => node.child_by_field_name("name"),
+                "selector_expression" => node.child_by_field_name("field"),
+                _ => None,
+            };
+            if let Some(member) = member {
+                let name = member.utf8_text(source.as_bytes()).unwrap();
+                if matches!(name, "Item" | "Present") {
+                    points.push((name, member));
+                }
+            }
+            pending
+                .extend((0..node.named_child_count()).filter_map(|index| node.named_child(index)));
+        }
+        // Type first: the initial read must preserve the obligation, before a
+        // call query or any public legacy finisher could populate other state.
+        points.sort_by_key(|(name, _)| *name);
+        let names: Vec<_> = points.iter().map(|(name, _)| *name).collect();
+        assert_eq!(names, expected_points);
+        for repeat in 0..2 {
+            for (name, node) in &points {
+                let site = brokk_bifrost_analysis::analyzer::usages::common::build_reference_site(
+                    CALLER.into(),
+                    (*name).into(),
+                    brokk_bifrost_core::analyzer::tree_walk::node_range(*node),
+                    node.start_byte(),
+                    node.end_byte(),
+                );
+                let (native, _) = request.resolve_definition_native(BoundedReceiverQuery {
+                    analyzer,
+                    file: &file,
+                    source,
+                    tree: Some(&tree),
+                    site: &site,
+                    budget: ReceiverAnalysisBudget::default(),
+                    cancellation: Some(&cancellation),
+                });
+                let BoundedResolution::Complete {
+                    value: (outcome, Some(evidence)),
+                    ..
+                } = native
+                else {
+                    panic!("native evidence missing for {name} repeat{repeat}");
+                };
+                assert!(
+                    outcome.definitions.is_empty(),
+                    "{name} repeat{repeat}: {outcome:?}"
+                );
+                assert!(
+                    evidence.answer.binding().targets().is_empty(),
+                    "{:?}",
+                    evidence.answer
+                );
+                if expected_gaps.is_empty() {
+                    // Known import names cannot bind this qualifier, and a
+                    // complete local or parameter binding shadows unknown ones.
+                    // Unrelated package errors do not weaken either proof.
+                    assert_eq!(
+                        evidence.answer.binding().completion(),
+                        &ResolutionCompletion::Complete
+                    );
+                    assert_eq!(
+                        evidence.answer.completion(),
+                        &ResolutionCompletion::Complete
+                    );
+                    assert_eq!(outcome.status, DefinitionLookupStatus::NoDefinition);
+                    assert!(outcome.diagnostics.is_empty(), "{outcome:?}");
+                } else {
+                    assert!(
+                        matches!(
+                            evidence.answer.binding().completion(),
+                            ResolutionCompletion::Incomplete(_)
+                        ),
+                        "{name} repeat{repeat}: {:?}",
+                        evidence.answer
+                    );
+                    assert!(
+                        matches!(
+                            evidence.answer.completion(),
+                            ResolutionCompletion::Incomplete(_)
+                        ),
+                        "{name} repeat{repeat}: {:?}",
+                        evidence.answer
+                    );
+                    assert_ne!(
+                        outcome.status,
+                        DefinitionLookupStatus::NoDefinition,
+                        "{outcome:?}"
+                    );
+                    for kind in expected_gaps {
+                        assert!(
+                            outcome
+                                .diagnostics
+                                .iter()
+                                .any(|diagnostic| diagnostic.kind == *kind),
+                            "{name} repeat{repeat} lost {kind}: {outcome:?}"
+                        );
+                    }
+                    assert!(
+                        !outcome
+                            .diagnostics
+                            .iter()
+                            .any(|diagnostic| diagnostic.kind == "go-external-member-unprovided"),
+                        "an ineligible owner lookup must not invent an unprovided-owner reason: {outcome:?}"
+                    );
+                }
+            }
+        }
+        if peer.is_some() {
+            let context_id = request.files.get(CALLER).unwrap().context.demand.context_id;
+            let (name, complete): (String, bool) = request.operation.ready().inventory.connection()
+                .query_row("SELECT package_name,complete FROM main.go_package_instances WHERE context_id=?1 AND tool_import_path='example.test/native/consumer/store' AND for_test=''", [context_id], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+            assert!(
+                !name.is_empty() && !complete,
+                "named incomplete provider: {name:?}, {complete}"
+            );
+        }
+    }
+}
+
+#[test]
 #[hardwon("#6482: superseding a bound interval must not certify an empty native answer")]
 fn go_native_point_reports_superseded_interval_context() {
     let source = r#"package consumer; import renamed "example.test/native/provider"; var Value renamed.Item"#;
@@ -4546,7 +4921,11 @@ func f(p string) {
             .file("go.mod", "module example.test/native\n\ngo 1.22\n")
             .file(CALLER, source)
             .build();
-        let workspace = fixture.workspace_analyzer(AnalyzerConfig::default());
+        // This fixture selects source inventory explicitly: a host Go toolchain
+        // must not add declaration authority for the unmodeled iteration.
+        let mut config = AnalyzerConfig::default();
+        config.go.dependency_discovery.mode = GoDependencyDiscoveryMode::Disabled;
+        let workspace = fixture.workspace_analyzer(config);
         let cancellation = CancellationToken::default();
         if modeled {
             let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
@@ -4587,7 +4966,7 @@ func f(p string) {
         let file = fixture.file(CALLER);
         let GoNativePointRequestOpen::Ready(mut request) = GoNativePointRequest::open(
             resolve_analyzer::<GoAnalyzer>(analyzer).unwrap(),
-            analyzer.semantic_model_overlay(),
+            analyzer.semantic_model_overlay_read().published(),
             &cancellation,
         )
         .unwrap() else {
@@ -4671,7 +5050,8 @@ fn go_point_answer_keeps_model_snapshot_after_republish() {
         .active_semantic_model_snapshot()
         .expect("activated models");
     let overlay = analyzer
-        .semantic_model_overlay()
+        .semantic_model_overlay_read()
+        .published()
         .expect("activated overlay");
     let expected_key = brokk_bifrost_analysis::analyzer::ReadKey::Models(
         brokk_bifrost_analysis::analyzer::semantic::StableDigest::sha256(
@@ -4740,7 +5120,7 @@ fn go_point_answer_keeps_model_snapshot_after_republish() {
         .filter(|key| matches!(key, brokk_bifrost_analysis::analyzer::ReadKey::Models(_)))
         .collect();
     assert_eq!(model_keys, [expected_key]);
-    assert!(analyzer.semantic_model_overlay().is_none());
+    assert!(analyzer.semantic_model_overlay_read().published().is_none());
 }
 
 #[test]
@@ -4761,10 +5141,16 @@ fn go_hierarchy_entries_preserve_outer_model_selection() {
     let workspace = fixture.workspace_analyzer(AnalyzerConfig::default());
     let analyzer = workspace.analyzer();
     let _catalog = activate_receiver_models_for_test(analyzer);
-    let old_overlay = analyzer.semantic_model_overlay().expect("first overlay");
+    let old_overlay = analyzer
+        .semantic_model_overlay_read()
+        .published()
+        .expect("first overlay");
     assert!(workspace.invalidate_dependency_pack_state(&[DependencyPackEcosystem::Go]));
     let _catalog2 = activate_receiver_models_for_test(analyzer);
-    let current = analyzer.semantic_model_overlay().expect("second overlay");
+    let current = analyzer
+        .semantic_model_overlay_read()
+        .published()
+        .expect("second overlay");
     assert!(!Arc::ptr_eq(&old_overlay, &current));
     let go = resolve_analyzer::<GoAnalyzer>(analyzer).unwrap();
     let member = go
@@ -4830,7 +5216,10 @@ fn go_model_scope_preserves_outer_selection_and_lazy_receiver() {
     let workspace = fixture.workspace_analyzer(AnalyzerConfig::default());
     let analyzer = workspace.analyzer();
     let _catalog = activate_receiver_models_for_test(analyzer);
-    let old_overlay = analyzer.semantic_model_overlay().expect("first overlay");
+    let old_overlay = analyzer
+        .semantic_model_overlay_read()
+        .published()
+        .expect("first overlay");
     {
         let _none = brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::with_active_semantic_model_snapshot(analyzer, None);
         let ledger = Arc::new(brokk_bifrost_analysis::analyzer::read_ledger::ReadLedger::new());
@@ -4854,7 +5243,7 @@ fn go_model_scope_preserves_outer_selection_and_lazy_receiver() {
                 .all(|key| !matches!(key, brokk_bifrost_analysis::analyzer::ReadKey::Models(_)))
         );
         // Reading the overlay records that no model set is active.
-        assert!(analyzer.semantic_model_overlay().is_none());
+        assert!(analyzer.semantic_model_overlay_read().published().is_none());
         assert_eq!(
             ledger
                 .keys()
@@ -4884,7 +5273,10 @@ fn go_model_scope_preserves_outer_selection_and_lazy_receiver() {
     }
     assert!(workspace.invalidate_dependency_pack_state(&[DependencyPackEcosystem::Go]));
     let _catalog2 = activate_receiver_models_for_test(analyzer);
-    let new_overlay = analyzer.semantic_model_overlay().expect("second overlay");
+    let new_overlay = analyzer
+        .semantic_model_overlay_read()
+        .published()
+        .expect("second overlay");
     assert!(!Arc::ptr_eq(&old_overlay, &new_overlay));
     assert_eq!(
         old_overlay.active_model_set_hash(),

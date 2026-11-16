@@ -9,8 +9,10 @@
 //! solve, or a failed root is a diagnostic, never an empty answer that reads
 //! as "no classes" or "no finding".
 
+use super::EXECUTION_DEPENDENT;
 use super::{DerivationExecutionCause, Incompleteness};
 use brokk_bifrost_core::analyzer::memo_attribution::ReadChannels;
+use brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -338,20 +340,17 @@ fn retained_text(heap: &mut RetainedHeap, value: &String) {
     heap.add_entries(1);
 }
 fn retained_file(heap: &mut RetainedHeap, value: &ProjectFile) {
-    heap.add(
-        value
-            .retained_bytes()
-            .saturating_sub(std::mem::size_of_val(value)),
-    );
+    // The workspace root is shared by every file and is not product-owned
+    // text. Charging it here made a type-flow root's owned-text census depend
+    // on the mount path (#12816).
+    heap.add(value.path_text_bytes());
     heap.add_entries(1);
 }
 fn retained_class(heap: &mut RetainedHeap, value: &ClassIdentity) {
     match value {
         ClassIdentity::Workspace(unit) => {
-            heap.add(
-                unit.retained_bytes()
-                    .saturating_sub(std::mem::size_of_val(unit)),
-            );
+            let (_, source, exclusive) = unit.retained_parts();
+            heap.add(exclusive.saturating_add(source.path_text_bytes()));
             heap.add_entries(1);
         }
         ClassIdentity::External {
@@ -610,10 +609,8 @@ impl TypeFlowRootProduct {
                 retained_class(&mut heap, class);
                 match &hit.declaration {
                     MemberDeclaration::Workspace(unit) => {
-                        heap.add(
-                            unit.retained_bytes()
-                                .saturating_sub(std::mem::size_of_val(unit)),
-                        );
+                        let (_, source, exclusive) = unit.retained_parts();
+                        heap.add(exclusive.saturating_add(source.path_text_bytes()));
                         heap.add_entries(1);
                     }
                     MemberDeclaration::External(decl) => {
@@ -767,6 +764,12 @@ pub(super) struct TypeFlowQueryState {
     work: CodeQueryTypeFlowWork,
     semantic_budget_exhausted: bool,
     witness_render_cache: super::PipelineRenderCache,
+    /// The execution dependences these findings and witnesses marked.
+    pub(super) reuse: ReuseVerdict,
+    /// Store failures still to inject inside a root solve's read capture.
+    /// `usize::MAX` injects on every solve.
+    #[cfg(test)]
+    solve_store_failures: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl Drop for TypeFlowQueryState {
@@ -807,6 +810,13 @@ impl TypeFlowQueryState {
         self.root_memo = memo;
     }
 
+    /// Fail the store read of the next `remaining` root solves, inside the
+    /// solve's own read capture, as a real summary or field-slot read would.
+    #[cfg(test)]
+    pub(super) fn set_solve_store_failures(&mut self, remaining: usize) {
+        self.solve_store_failures = Some(Arc::new(std::sync::atomic::AtomicUsize::new(remaining)));
+    }
+
     pub(super) fn release_file_window(&mut self) {
         // Bound query-owned output and refund its holders at each window.
         // The products themselves do not depend on resident artifacts.
@@ -838,6 +848,9 @@ impl TypeFlowQueryState {
             work: CodeQueryTypeFlowWork::default(),
             semantic_budget_exhausted: false,
             witness_render_cache: super::PipelineRenderCache::default(),
+            reuse: ReuseVerdict::Content,
+            #[cfg(test)]
+            solve_store_failures: None,
         }
     }
 }
@@ -1357,6 +1370,7 @@ impl TypeFlowQueryState {
             });
             let Some(public) = public else {
                 workspace.analyzer().mark_execution_dependent();
+                self.reuse.join_in(EXECUTION_DEPENDENT);
                 push_deduplicated_diagnostic(
                     &mut self.diagnostics,
                     CodeQueryDiagnosticCode::TypeFlowWitnessUnavailable,
@@ -1927,8 +1941,26 @@ impl TypeFlowQueryState {
         // Each root gets a fresh ledger, independent of the parent's live census.
         let mut child_budget =
             SemanticBudget::new_child(self.allotment.semantic, &semantic_budget.scope_snapshot());
+        #[cfg(test)]
+        let solve_store_failures = self.solve_store_failures.clone();
         let (product, reads) = capture_query_reads(workspace.analyzer(), || {
             crate::analyzer::i_analyzer::replay_query_reads(workspace.analyzer(), &input_reads);
+            #[cfg(test)]
+            if solve_store_failures.as_ref().is_some_and(|remaining| {
+                remaining
+                    .try_update(
+                        std::sync::atomic::Ordering::Relaxed,
+                        std::sync::atomic::Ordering::Relaxed,
+                        |count| count.checked_sub(1),
+                    )
+                    .is_ok()
+            }) {
+                workspace.analyzer().record_query_failure(
+                    brokk_bifrost_analysis::analyzer::store::StoreError::new(
+                        "injected root solve read",
+                    ),
+                );
+            }
             let mut request = DataflowRequest::new(&mut solver_budget, cancellation);
             let outcome = solve_type_flow_for_root_with_refinements(
                 workspace,
@@ -1953,7 +1985,15 @@ impl TypeFlowQueryState {
             match outcome {
                 Ok(result) => {
                     let projected_rows = project_class_sets(&result);
+                    // A store read that failed inside this solve leaves a result that
+                    // must not outlive the request either (#11534): the durable row
+                    // would answer later requests as finding-free without the read.
+                    let solve_store_failed = workspace
+                        .analyzer()
+                        .current_thread_read_ledger()
+                        .is_some_and(|ledger| ledger.store_failed());
                     if !persistent_store_failed
+                    && !solve_store_failed
                     && result.persistence_status() == TypeFlowRootPersistenceStatus::Eligible
                     && result.findings.is_empty()
                     // Constructor-origin evidence is request-local:
@@ -2015,10 +2055,16 @@ impl TypeFlowQueryState {
                     semantic_budget.absorb_root_work(child_budget);
                     let code = match &error {
                         TypeFlowError::Cancelled => CodeQueryDiagnosticCode::Cancelled,
+                        TypeFlowError::Plan(
+                            TypeFlowPlanError::RootBudget(_)
+                            | TypeFlowPlanError::RefinementBudget(_),
+                        ) => CodeQueryDiagnosticCode::SemanticBudgetExhausted,
                         TypeFlowError::Plan(_) | TypeFlowError::Solve(_) | TypeFlowError::Io(_) => {
                             CodeQueryDiagnosticCode::SemanticProviderFailed
                         }
                     };
+                    let semantic_budget_exhausted =
+                        code == CodeQueryDiagnosticCode::SemanticBudgetExhausted;
                     let product = TypeFlowRootProduct {
                         root: SemanticProcedureReference::of(&procedure.handle),
                         failure: Some((code, format!("class-set analysis failed: {error}"))),
@@ -2026,11 +2072,13 @@ impl TypeFlowQueryState {
                         class_sets: Vec::new(),
                         findings: Vec::new(),
                         complete: false,
-                        semantic_budget_exhausted: false,
+                        semantic_budget_exhausted,
                         incomplete_evidence: RootIncompleteEvidence::default(),
                         persistence_status: TypeFlowRootPersistenceStatus::Ineligible(
                             if code == CodeQueryDiagnosticCode::Cancelled {
                                 TypeFlowRootPersistenceRejection::SolverIncomplete
+                            } else if semantic_budget_exhausted {
+                                TypeFlowRootPersistenceRejection::SemanticBudget
                             } else {
                                 TypeFlowRootPersistenceRejection::ProviderFailure
                             },
@@ -2116,10 +2164,18 @@ impl TypeFlowQueryState {
             }
         }
         if let Some((code, message)) = &product.failure {
+            // A root that never reached a plan carries no exhausted lanes; its
+            // budget stop is reported here with its operational cause.
+            let cause = if product.semantic_budget_exhausted {
+                self.semantic_budget_exhausted = true;
+                DerivationExecutionCause::Budget
+            } else {
+                DerivationExecutionCause::Provider
+            };
             push_deduplicated_diagnostic(
                 &mut self.diagnostics,
                 *code,
-                Incompleteness::Operational(DerivationExecutionCause::Provider),
+                Incompleteness::Operational(cause),
                 message.clone(),
             );
         } else {
@@ -2814,6 +2870,7 @@ fn exhausted_root_entries<'lane>(
                 procedure: Some(name.clone()),
                 lane: lane_label,
                 stage,
+                budget: None,
                 charge,
                 feedback_iteration: Some(evidence.feedback_iteration),
             }
@@ -3628,7 +3685,10 @@ mod tests {
                 ReadKey::Lookup { question, .. } => match question {
                     LookupQuestion::Declaration { rel_path, .. }
                     | LookupQuestion::File { rel_path }
-                    | LookupQuestion::CallSite { rel_path, .. } => rel_path.as_ref() == path,
+                    | LookupQuestion::CallSite { rel_path, .. }
+                    | LookupQuestion::ReceiverCallSite { rel_path, .. } => {
+                        rel_path.as_ref() == path
+                    }
                     LookupQuestion::Name { .. }
                     | LookupQuestion::Summary { .. }
                     | LookupQuestion::WorkspaceFact { .. }
@@ -3638,7 +3698,10 @@ mod tests {
                     // #9737 M3: derivation questions have no persisted replay yet.
                     | LookupQuestion::Derivation(_)
                     | LookupQuestion::RustCopyAbsence { .. }
+                    | LookupQuestion::RustMacroInvocations { .. }
                     | LookupQuestion::RustPlacedDeclaration { .. }
+                    | LookupQuestion::RustDropSubject { .. }
+                    | LookupQuestion::RustDropInventory { .. }
                     | LookupQuestion::CertifiedDefinition { .. }
                     | LookupQuestion::ExternalSelection { .. }
                     | LookupQuestion::StoredSemanticIrPublication(..) => false,
@@ -4425,6 +4488,9 @@ mod tests {
             );
         }
         #[test]
+        #[hardwon(
+            "#12153: native Python hierarchy certified every type-flow root with the whole Python scope"
+        )]
         fn read_set_mutation_unrelated() {
             check(
                 "unrelated",
@@ -5136,6 +5202,154 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11534: a root product built while a store read failed was published to the shared memo and replayed to the next policy with no store error of its own"
+    )]
+    fn root_memo_refuses_a_product_built_under_a_store_failure() {
+        use super::super::semantic::SemanticQueryContext;
+        use super::{CachedTypeFlowAnalysis, TypeFlowRootMemo, TypeFlowRootProduct};
+        use brokk_bifrost_analysis::analyzer::i_analyzer::PolicyCompletionOwner;
+        use brokk_bifrost_analysis::analyzer::{AnalyzerQueryScope, ReadAttribution};
+        use std::sync::Arc;
+
+        let filename = "app.py";
+        let source = "class Item:\n    pass\n\ndef normalize(x):\n    return x.missing\n\ndef first():\n    return normalize(Item())\n";
+        let project = InlineTestProject::with_language(Language::Python)
+            .with_git()
+            .file(filename, source)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        assert!(workspace.analyzer().workspace_content_identity().is_some());
+        let mut context = SemanticQueryContext::new(&workspace, None, Default::default());
+        let references = context.procedure_references(&project.file(filename));
+        let mut roots = references
+            .iter()
+            .map(|reference| {
+                context
+                    .resolve_procedure_reference(reference)
+                    .expect("fixture procedure")
+            })
+            .collect::<Vec<_>>();
+        roots.sort_by_key(|root| root.handle.semantics().locator().clone());
+        let root = roots.first().expect("fixture root");
+        let cancellation = CancellationToken::default();
+        let snapshot = workspace.analyzer().active_semantic_model_snapshot();
+        // One policy evaluation: its own completion owner and policy scope, as
+        // the coordinator installs them, around one query state on the batch's
+        // shared memo. Returns the product and the owner's recorded errors.
+        let solve_as_policy = |state: &mut TypeFlowQueryState| {
+            let owner = Arc::new(PolicyCompletionOwner::default());
+            let _owner = owner.install();
+            let _attribution = ReadAttribution::for_request().install();
+            let _scope = AnalyzerQueryScope::for_policy_evaluation(workspace.analyzer());
+            let mut budget = SemanticBudget::default();
+            let (result, reads) =
+                brokk_bifrost_analysis::analyzer::capture_query_reads(workspace.analyzer(), || {
+                    state.solve_live(
+                        &workspace,
+                        root,
+                        &mut budget,
+                        CodeQueryValueFlowLimits::default(),
+                        &cancellation,
+                        snapshot.clone(),
+                    )
+                });
+            let Some(CachedTypeFlowAnalysis::Owned(result)) = result else {
+                panic!(
+                    "fixture root must produce evidence: {:?}",
+                    state.take_diagnostics()
+                );
+            };
+            (result.product, owner.errors(), reads.store_failed())
+        };
+        let observations = |product: &TypeFlowRootProduct| {
+            format!(
+                "{:?}",
+                (
+                    &product.root,
+                    &product.failure,
+                    &product.projected_rows,
+                    &product.class_sets,
+                    product.complete,
+                    &product.incomplete_evidence,
+                )
+            )
+        };
+        let state_on = |memo: &TypeFlowRootMemo, failures: usize| {
+            let mut state = TypeFlowQueryState::default();
+            state.set_root_memo(Some(memo.clone()));
+            if failures > 0 {
+                state.set_solve_store_failures(failures);
+            }
+            state
+        };
+
+        let (healthy, errors, failed) =
+            solve_as_policy(&mut state_on(&TypeFlowRootMemo::default(), 0));
+        assert!(
+            errors.is_empty() && !failed,
+            "a healthy solve records nothing"
+        );
+        let healthy_observations = observations(&healthy);
+
+        // Policy A fails inside the shared producer. Policy B, on the same
+        // memo and key, must recompute rather than replay A's product.
+        let memo = TypeFlowRootMemo::default();
+        let (failed_product, errors, failed) = solve_as_policy(&mut state_on(&memo, 1));
+        // Receipt replays re-record a captured failure as a fresh record, so
+        // the count is not fixed; what matters is that A owns failures.
+        assert!(
+            !errors.is_empty()
+                && errors.iter().all(|error| error
+                    .error()
+                    .to_string()
+                    .contains("injected root solve read")),
+            "A owns its failure: {errors:?}"
+        );
+        assert!(failed, "the solve capture saw the failed read");
+        assert!(failed_product.channels.reuse_refused);
+        let mut policy_b = state_on(&memo, 0);
+        let (product_b, errors_b, failed_b) = solve_as_policy(&mut policy_b);
+        assert!(
+            errors_b.is_empty() && !failed_b,
+            "B's own read succeeded: {errors_b:?}"
+        );
+        assert_eq!(
+            policy_b.work.root_memo_hits, 0,
+            "A's product was not published"
+        );
+        assert_eq!(policy_b.work.solves, 1);
+        assert!(!Arc::ptr_eq(&product_b, &failed_product));
+        assert_eq!(observations(&product_b), healthy_observations);
+        // B's healthy product is published: a later policy reuses it.
+        let mut policy_c = state_on(&memo, 0);
+        let (product_c, errors_c, _) = solve_as_policy(&mut policy_c);
+        assert!(errors_c.is_empty());
+        assert_eq!(policy_c.work.root_memo_hits, 1);
+        assert!(Arc::ptr_eq(&product_c, &product_b));
+
+        // A persisting failure reaches every policy as its own error.
+        let memo = TypeFlowRootMemo::default();
+        let mut policy_a = state_on(&memo, usize::MAX);
+        let (_, errors_a, _) = solve_as_policy(&mut policy_a);
+        let mut policy_b = state_on(&memo, usize::MAX);
+        let (_, errors_b, _) = solve_as_policy(&mut policy_b);
+        assert!(!errors_a.is_empty());
+        assert!(
+            !errors_b.is_empty(),
+            "B records its own failure instead of replaying A's product"
+        );
+        assert!(
+            errors_b
+                .iter()
+                .all(|b| errors_a.iter().all(|a| a.id() != b.id())),
+            "B's errors are its own records: a={errors_a:?} b={errors_b:?}"
+        );
+        assert_eq!(policy_b.work.root_memo_hits, 0);
+        assert_eq!(policy_b.work.solves, 1);
+    }
+
+    #[test]
     fn absent_member_owned_witness_matches_consumer_capped_projection() {
         use super::super::witness_projection::{
             ProjectedSummaryWitness, public_absent_member_witness,
@@ -5257,6 +5471,25 @@ mod tests {
         );
         assert_eq!(budget.resident().owned_text_bytes, 0);
         assert_eq!(budget.resident().nested_entries, 0);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12816: type-flow owned text charged the workspace root, so the class-factory golden moved with TMPDIR"
+    )]
+    fn type_flow_owned_text_does_not_depend_on_the_workspace_root() {
+        use super::{RetainedHeap, retained_file};
+        use crate::analyzer::ProjectFile;
+        let short = ProjectFile::new(std::env::temp_dir().join("w"), "src/app.py");
+        let long = ProjectFile::new(
+            std::env::temp_dir().join("a-much-longer-workspace-root"),
+            "src/app.py",
+        );
+        let mut short_heap = RetainedHeap::default();
+        let mut long_heap = RetainedHeap::default();
+        retained_file(&mut short_heap, &short);
+        retained_file(&mut long_heap, &long);
+        assert_eq!(short_heap.total(), long_heap.total());
     }
 
     #[test]

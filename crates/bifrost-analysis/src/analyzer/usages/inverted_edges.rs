@@ -38,9 +38,7 @@ use brokk_bifrost_core::analyzer::usages::inverted_edges::{TerminalCatalog, term
 
 use crate::analyzer::common::declaration_language_for_file;
 use crate::analyzer::tree_sitter_analyzer::{FileState, enclosing_code_unit_order};
-use crate::analyzer::usages::parsed_tree::{
-    ParseSpec, ParsedTreeFile, parse_tree_sitter_file, parse_tree_sitter_source,
-};
+use crate::analyzer::usages::parsed_tree::{ParseSpec, ParsedTreeFile, parse_tree_sitter_source};
 use crate::analyzer::{AnalyzerQueryScope, CodeUnit, IAnalyzer, ProjectFile, QueryScope, Range};
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
@@ -532,7 +530,7 @@ fn build_file_declarations_from_declaration_ranges_with_filter<K: NodeKey>(
 /// This owns the language-agnostic parts — the parallel fan-out and the final
 /// merge/cap — and leaves each language a single `scan(file) -> Option<PerFileEdges>`
 /// closure. The closure obtains the file's source/tree/line starts (the local-parse
-/// languages parse it on demand via [`super::parsed_tree::parse_tree_sitter_file`];
+/// languages parse it on demand via [`super::parsed_tree::parse_tree_sitter_source`];
 /// the graph-based languages borrow it from their project graph), then builds its
 /// edges with [`collect_file_edges`]. Because nothing is borrowed across the walk,
 /// a closure that parses on demand can drop its tree before returning — so at most a
@@ -742,9 +740,9 @@ where
 
 /// Parse `file` on demand, build its edges via [`collect_file_edges`], and drop the
 /// tree / source / line starts when this returns — bounding live trees to ≈ the rayon
-/// worker count. Returns `None` to skip an unreadable or empty file. The `scan`
+/// worker count. Returns `None` for unavailable source or a failed parse. The `scan`
 /// closure receives the file's [`FileEdgeScanInput`] and owns the language AST walk.
-/// Centralizing the parse, the skip-on-failure, and the tree-lifetime scoping here
+/// Centralizing source access, parsing, and tree-lifetime scoping here
 /// keeps the six local-parse adapters from each repeating them, and gives a single
 /// home for any later parse-failure handling, tracing, or memory instrumentation.
 /// See the Java builder for the shape.
@@ -764,7 +762,7 @@ pub fn parse_and_collect_with_domain<S>(
 where
     S: FnOnce(&FileEdgeScanInput<'_>) -> PerFileEdges,
 {
-    let parsed = parse_tree_sitter_file(file, spec)?;
+    let parsed = parse_tree_sitter_source(analyzer.indexed_source(file)?, spec)?;
     let declarations = build_file_declarations(analyzer, file);
     Some(collect_file_edges_with_domain(
         file,
@@ -777,6 +775,7 @@ where
 
 #[doc(hidden)]
 pub fn parse_and_collect_with_declarations_and_domain<S>(
+    analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     domain: EdgeNodeDomain<'_>,
     spec: ParseSpec<'_>,
@@ -786,7 +785,7 @@ pub fn parse_and_collect_with_declarations_and_domain<S>(
 where
     S: FnOnce(&FileEdgeScanInput<'_>) -> PerFileEdges,
 {
-    let parsed = parse_tree_sitter_file(file, spec)?;
+    let parsed = parse_tree_sitter_source(analyzer.indexed_source(file)?, spec)?;
     Some(collect_file_edges_with_domain(
         file,
         domain,
@@ -972,6 +971,7 @@ fn cap_edge_sites<K: NodeKey>(
         unproven_sites,
         unproven_sites_complete,
         unresolved_relative_imports: BTreeMap::new(),
+        incomplete_inventory: None,
     }
 }
 

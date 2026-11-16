@@ -38,6 +38,15 @@ limits before publishing the artifact as immutable. A partially understood
 construct retains its facts and records a scoped gap; missing edges remain
 explicit.
 
+Cleanup actions are represented by immutable procedure-local chains. A route
+refers to a segment by its inclusive head and exclusive ancestor stop, so
+routes can share prefixes without copying the actions they contain. A cleanup
+gap over a segment represents one logical value gap per distinct owner in that
+segment; its borrowed member identity is the pair of the base gap and owner.
+Consumers may discharge an individual member only with proof for that owner. A
+whole-segment proof succeeds only when every member is discharged, including
+when inert and non-inert owners are mixed.
+
 A declaration's body does not always describe the callable exposed to its
 callers. Python decorators can replace that callable, changing its arguments
 and results. Decorated bodies remain available for analysis, but their call
@@ -46,6 +55,30 @@ the callable's behavior is established. Decorator names and copied metadata
 alone do not establish that behavior.
 The modeled built-in `staticmethod` and `classmethod` descriptors retain their
 supported bindings when their identities and class namespace are proven.
+
+### Rust deferred bodies
+
+A Rust async body has a `DeferredBody` invocation kind. Its local flows and
+sink arguments can be analyzed independently of a caller that constructs its
+future. `FutureConstruction` and `FutureActivation` obligations keep actual
+parameter transfer, caller-visible effects and return transfer deferred. A SQL
+builder argument sink identifies the supplied data; it does not assert that a
+database operation completed.
+
+Locals owned by the future survive suspension. Awaited outputs remain unknown
+until an activation contract supplies them, and reads of shared or heap-reachable
+memory after suspension are unknown unless exclusivity is proved. A generic
+`MemoryInterference` event expresses that mutation in Rust, Python, C# and
+JavaScript/TypeScript. Memory and call-summary consumers retain uncertainty;
+existing Rust closed-local ownership proofs preserve exclusive heap contents.
+Scalar and field-refinement writer releases consume the same event. Unknown
+await results carry `DataDependency` obligations on their exact values.
+Value-flow admission follows requested data dependencies, conservatively
+including every operand of a call whose result matters. An unrelated local
+path can be analyzed without claiming that an unknown output was produced.
+May-analysis explores both successors of an unknown condition. Must-return
+profiles and other control proofs retain the activation obligations. This
+stage does not simulate polling, executors, scheduling or cancellation.
 
 Artifact keys are durable validity identities. Handles used inside one
 materialization also retain artifact-instance identity. This prevents a dense
@@ -531,6 +564,53 @@ Each client keeps separate plans and result types. A taint class, protocol
 state, and inferred class identity retain distinct types. Language-specific
 facts outside the semantic IR remain behind narrow adapter contracts.
 
+### Parametric receiver summaries in procedure effects (#12968)
+
+A call whose receiver is the unchanged value of a parameter, such as
+`lines[0]` in `def self.sum_lines(lines)`, cannot be dispatched from the
+callee alone: what runs depends on what the caller passed. The
+`procedure-effects` derivation on the call-graph path therefore treats such a
+procedure's effect summary as a function of its parameter classes, tabulated
+for the contexts call edges demand. A graph node is a procedure together with
+a receiver context, a sorted list of parameter ordinals and classes; the
+existing bounded fixpoint runs unchanged over that specialized graph.
+
+The summary is parametric, never a union over the workspace's call sites. A
+union ("every caller passes an Array") is unsound whenever the procedure is the
+query root, is reached through `send`, a method object or a framework
+callback, or is called from outside the analyzed workspace, and it would make
+one site's answer depend on a workspace-wide caller inventory. The root is
+always evaluated in the empty context, so its own parameter-receiver calls
+stay open. A specialized copy is reached only along an edge whose call proves
+the argument classes, and its answer is used only for that edge; every other
+invocation reaches the context-free node or is outside the root's answer.
+
+Three steps are shared: the identity-preserving walk from a receiver to the
+formal parameter it is (`parameter_origin`), the selection of the one actual an
+entering call binds to a formal (`unique_argument_for_parameter`, also used by
+Go's argument-callable dispatch), and the specialization itself. Two are
+language hooks: the class of an argument expression in the caller
+(`LanguageSupport::receiver_class_of_expression`, a class name in that
+language's own vocabulary) and dispatch under a receiver hypothesis, which runs
+the ordinary dispatch entry with the hypothesis in a carried-context slot so
+every guard on a written receiver of that class still applies. A class
+proves the object's class, not its singleton method table, so Ruby proves an
+argument class only for a freshly built object (a literal, or a block-free
+constructor of a modeled external class the workspace leaves alone) and only
+while neither the caller nor the callee rewrites or hands on the variable;
+anything else proves nothing and the call stays open. A workspace class proves
+no argument class, because its constructor or initializer can install
+singleton methods. A language opts in with
+`LanguageSupport::honors_receiver_hypotheses`; others ask nothing new.
+
+Nothing is kept across requests. The argument-class and hypothesis answers are
+recorded as `argument_classes` and `conditional_dispatch` read keys whose
+digests read verification replays, so a policy unit whose answer depended on a
+discharged site is not reused after the workspace changes what that site
+dispatches to. A per-procedure context cap bounds specialization; an edge past
+the cap keeps the context-free node and its caller reports the budget, so a
+limit-dependent answer is never persisted.
+
 ## Composed taint over stored partial flows
 
 Rust taint policies can run on a second engine, the composition engine. It
@@ -539,14 +619,36 @@ per-procedure work once per file content instead of once per query. After an
 edit, only the changed files' rows are rewritten, and a diff-scoped query
 searches only from the sinks in the edited procedures.
 
-An explicit rule chooses the engine once per policy compile, and the run's
-execution record names the choice. A policy with bound sinks uses composition
-when every sink is in Rust, every sink's file carries complete, current rows,
-and the policy uses no store ends, entry points, or flow-candidate pass.
-Otherwise it uses the ICFG engine. A changed-range request that binds no sink,
-in a policy without those features, is recorded as an empty composition result
-and runs no search. The rule is not a fallback: a composition that cannot
+An explicit rule chooses the engine at policy compilation, and the run's
+execution record names the choice. Composition requires a language with a
+certified caller inventory at every bound sink, and composition rows or an
+admitted complete rowless interpretation for each sink artifact. Candidate
+questions bind their endpoint universe before applying the same rule to all
+observation sinks. Otherwise compilation selects the ICFG engine. An empty
+sink set needs no search. The rule is not a fallback: a composition that cannot
 finish reports an incomplete result and never restarts on the other engine.
+
+A negative candidate explanation can execute the authored policy and a second
+question with its declared sanitizers removed. Both executions must retain
+corresponding actual input products within one query-local report allowance;
+shared allocations count once, traversal storage is funded before allocation,
+and the second execution uses the remaining allowance. Missing retained inputs,
+unsupported nested or barrier replay inputs, unrepresented conditional or
+store inputs, open coverage, or differing non-sanitizer inputs leave collective
+sanitizer dependence unknown. A complete
+strict relation with no accepted source-to-observation meeting and a
+corresponding relaxed relation with an accepted path from the candidate's own
+source to its observation can establish dependence on the bound sanitizer set
+collectively. Bounded representative witnesses illustrate
+that conclusion; they cannot establish universal absence or the necessity of
+each sanitizer individually.
+
+The pre-allocation requirement applies to additional candidate-input retention
+and traversal storage. Existing producers retain their allocation contracts:
+copy-on-write filtering may clone shared backing before a later retained census.
+That census accounts for surviving owned bytes; it does not establish
+pre-allocation funding of the clone's temporary peak, allocator overhead, or
+process RSS.
 
 ### What each file stores
 
@@ -574,6 +676,14 @@ output: the stored fixpoint seeds it at entry. A value that a caller stores in
 an argument's field therefore reaches the callee's read of that field. The
 stored fixpoint does not seed capture-rooted heap locations; a query-time
 interior run can seed one explicitly.
+
+For a non-standard-library macro whose syntax resembles a supported built-in,
+the base procedure stays opaque until the selected workspace proves the macro's
+identity. Its exact alternate events and matching partial flows are stored
+separately from the base rows. A query selects that alternate only when every
+candidate macro in the procedure is admitted; otherwise it uses the complete
+opaque base procedure and its matching flows. Admission reads are retained with
+the query-local selection and replayed when that selection is reused.
 
 A file-local fixpoint computes the partial flows. Its result must equal the
 solver's own propagation inside one procedure, and a differential test over the

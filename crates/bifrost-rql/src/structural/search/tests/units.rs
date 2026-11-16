@@ -95,7 +95,7 @@ fn derived_occurrence_intersect_prefix_is_not_cacheable() {
         )
         .build();
     let workspace = project.workspace_analyzer(AnalyzerConfig::default());
-    let query = CodeQuery::from_sexp("(result-detail full (intersect (filter :where ((role eq (enum value_reference)) (target_kind eq (enum resolved))) (occurrences-in :class reference :role value_reference (language rust (call :callee (name \"target\"))))) (occurrences-in :class reference :role value_reference (language rust (call :callee (name \"target\"))))))")
+    let query = CodeQuery::from_sexp("(result-detail full (intersect (filter :where ((role eq (enum callee_position)) (target_kind eq (enum resolved))) (occurrences-in :class reference :role callee_position (language rust (call :callee (name \"target\"))))) (occurrences-in :class reference :role callee_position (language rust (call :callee (name \"target\"))))))")
         .expect("reviewer occurrence intersect");
     let whole = whole_execution(&workspace, &query);
     assert_eq!(
@@ -1155,12 +1155,93 @@ fn per_unit_counter_sums_cover_the_whole_execution() {
     assert!(
         merged.budgeted_work.import_edges_resolved >= whole.budgeted_work.import_edges_resolved
     );
-    for (index, whole_outputs) in whole.budgeted_work.step_outputs.iter().enumerate() {
+    let merged_steps = merged.budgeted_work.step_outputs.as_ref().unwrap();
+    for (index, whole_outputs) in whole
+        .budgeted_work
+        .step_outputs
+        .as_ref()
+        .unwrap()
+        .iter()
+        .enumerate()
+    {
         assert!(
-            merged.budgeted_work.step_outputs[index] >= *whole_outputs,
+            merged_steps[index] >= *whole_outputs,
             "per-unit sums over-count, so they can only widen more often than the whole run"
         );
     }
+}
+
+#[test]
+#[hardwon(
+    "#11709: a unit cancelled before it started counted no steps, and merging it with a counted unit panicked on the length"
+)]
+fn a_unit_stopped_before_it_started_merges_with_counted_units() {
+    let project = eight_file_project();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let files = seed_files_of(&workspace);
+    let query = CodeQuery::from_json(&json!({
+        "schema_version": 1,
+        "match": { "kind": "function" },
+        "steps": [{ "op": "enclosing_decl" }],
+        "limit": 500,
+        "result_detail": "full"
+    }))
+    .expect("declaration query");
+    let uncancelled = units(&workspace, &query, &files);
+
+    let mut counted_and_unknown = 0;
+    let mut finished = false;
+    for checks in 0..2000 {
+        let token = CancellationToken::cancel_after_checks_for_test(checks);
+        let stopped: Vec<_> = files
+            .iter()
+            .map(|file| {
+                execute_code_query_unit(
+                    workspace.analyzer(),
+                    &brokk_bifrost_flow::FlowWorkspaceState::default(),
+                    None,
+                    &query,
+                    CodeQueryExecutionLimits::default(),
+                    Some(&token),
+                    CodeQueryExecutionScope::for_seed_files(std::slice::from_ref(file), &files),
+                )
+            })
+            .collect();
+        for (unit, whole) in stopped.iter().zip(&uncancelled) {
+            if !unit.truncated {
+                assert_eq!(
+                    unit.budgeted_work, whole.budgeted_work,
+                    "checks={checks}: a unit that finished counts what it counts uncancelled"
+                );
+            }
+        }
+        finished = stopped.iter().all(|unit| !unit.truncated);
+        let any_unknown = stopped
+            .iter()
+            .any(|unit| unit.budgeted_work.step_outputs.is_none());
+        let any_counted = stopped
+            .iter()
+            .any(|unit| unit.budgeted_work.step_outputs.is_some());
+
+        let merged = merge_unit_rows(&query, stopped);
+        if any_unknown {
+            assert_eq!(merged.budgeted_work.step_outputs, None, "checks={checks}");
+            assert_eq!(
+                merged.reached_limit(&CodeQueryExecutionLimits::default(), query.limit),
+                Some(MergedLimit::UnitTruncated),
+                "checks={checks}: unknown per-step counts decide no cap"
+            );
+            counted_and_unknown += usize::from(any_counted);
+        }
+        if finished {
+            break;
+        }
+    }
+    assert!(finished, "the sweep reaches an undisturbed execution");
+    assert!(
+        counted_and_unknown > 0,
+        "the sweep stops a unit mid-way and the units after it before they start"
+    );
 }
 
 /// The one diagnostic a merge cannot reproduce, pinned as the behavior it is.
@@ -1393,6 +1474,19 @@ fn intersect_prefix_codec_properties() {
         let product_json = prefix
             .encode_product_json(&query.plan)
             .expect("complete product");
+        let mut old_product = product_json.clone();
+        old_product.as_object_mut().unwrap().remove("admission");
+        assert!(
+            crate::structural::search::IntersectPrefixProduct::decode_product_json(
+                workspace.analyzer(),
+                &query.plan,
+                seed.clone(),
+                prefix.reads.clone(),
+                old_product,
+            )
+            .is_err(),
+            "old prefixes must recompute rather than assume zero admission"
+        );
         let decoded = crate::structural::search::IntersectPrefixProduct::decode_product_json(
             workspace.analyzer(),
             &query.plan,
@@ -1404,6 +1498,16 @@ fn intersect_prefix_codec_properties() {
         assert_eq!(identity(&decoded), before);
         assert_eq!(decoded.work, prefix.work);
         assert_eq!(decoded.budgeted_work, prefix.budgeted_work);
+        let limits = CodeQueryExecutionLimits::default();
+        let fresh_remaining = remaining_unit_limits(limits, &prefix.work, &prefix.budgeted_work);
+        let mut stored_telemetry = decoded.work;
+        stored_telemetry.scanned_source_bytes =
+            stored_telemetry.scanned_source_bytes.saturating_add(10_000);
+        assert_eq!(
+            fresh_remaining,
+            remaining_unit_limits(limits, &stored_telemetry, &decoded.budgeted_work),
+            "decoded stored prefix and fresh prefix leave the same next-unit allowance despite telemetry differences",
+        );
         assert_eq!(decoded.completion, prefix.completion);
         assert_eq!(decoded.reads, prefix.reads);
         assert_eq!(
@@ -1979,33 +2083,127 @@ fn a_row_local_unit_records_no_language_scope() {
     );
 }
 
-/// A step whose answer is a whole-workspace derived value still records that
-/// value, because a change anywhere in it changes the unit's rows.
+/// A caller expansion records the exact questions it asks, including the
+/// empty at-bound question used to certify the frontier.
 #[test]
-fn a_callers_unit_records_the_whole_workspace_value_it_consumed() {
-    let project = two_file_project();
-    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
-    let files = seed_files_of(&workspace);
-    let callee = project.file("src/callee.ts");
-    let keys = unit_read_keys(&workspace, &callers_query(), &callee, &files);
-
-    assert!(
-        keys.iter().any(|key| matches!(
-            key,
-            crate::analyzer::ReadKey::Scope { .. } | crate::analyzer::ReadKey::Artifact { .. }
-        )),
-        "a callers step consumes a whole-workspace derived value and must record it: {keys:?}"
+#[hardwon("#11836: broad Scope reads invalidated unchanged caller expansions")]
+fn a_callers_unit_records_every_consulted_answer() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .with_git()
+        .file("go.mod", "module example.com/repro\n\ngo 1.23\n")
+        .file("target.go", "package repro\nfunc target() {}\n")
+        .file("caller.go", "package repro\nfunc caller() { target() }\n")
+        .file("other.go", "package repro\nfunc other() {}\n")
+        .build();
+    let base = project.workspace_analyzer(AnalyzerConfig::default());
+    let keys = unit_read_keys(
+        &base,
+        &callers_query(),
+        &project.file("target.go"),
+        &seed_files_of(&base),
     );
-    assert!(
-        keys.iter().any(|key| matches!(
-            key,
+    let callers = |keys: Vec<crate::analyzer::ReadKey>| {
+        keys.into_iter()
+            .filter(|key| {
+                matches!(
+                    key,
+                    crate::analyzer::ReadKey::Lookup {
+                        kind: crate::analyzer::LookupKind::Callers,
+                        ..
+                    }
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let reads = callers(keys);
+    let mut names = reads
+        .iter()
+        .filter_map(|key| match key {
             crate::analyzer::ReadKey::Lookup {
-                kind: crate::analyzer::LookupKind::Callers,
+                question: crate::analyzer::LookupQuestion::Declaration { fq_name, .. },
                 ..
-            }
-        )),
-        "the callers answer is itself a recorded input: {keys:?}"
+            } => Some(fq_name.as_ref()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        ["example.com/repro.caller", "example.com/repro.target"],
+        "{reads:?}"
     );
+    // Verify only these relation dependencies so incidental provider reads
+    // cannot make a missing caller question pass the staleness checks.
+    for (path, source, expected_unchanged, truncated) in [
+        (
+            "other.go",
+            "package repro\nfunc other() {}\nfunc added() { other() }\n",
+            true,
+            false,
+        ),
+        (
+            "other.go",
+            "package repro\nfunc other() {}\nfunc added() { target() }\n",
+            false,
+            false,
+        ),
+        (
+            "other.go",
+            "package repro\nfunc other() {}\nfunc added() { caller() }\n",
+            false,
+            false,
+        ),
+        (
+            "caller.go",
+            "package repro\nfunc caller() {}\n",
+            false,
+            false,
+        ),
+        (
+            "other.go",
+            "package repro\nfunc other() { var x = 1; _ = x }\n",
+            false,
+            true,
+        ),
+    ] {
+        project
+            .file("other.go")
+            .write("package repro\nfunc other() {}\n")
+            .expect("reset other");
+        project
+            .file("caller.go")
+            .write("package repro\nfunc caller() { target() }\n")
+            .expect("reset caller");
+        project
+            .file(path)
+            .write(source)
+            .expect("edit caller fixture");
+        let head = project.workspace_analyzer(AnalyzerConfig::default());
+        let changed = crate::analyzer::ChangedFacts::between(&base, &head);
+        let artifact = crate::analyzer::invalidation::DerivedArtifactId::new(
+            crate::analyzer::invalidation::DerivedArtifactKind::PolicyEvaluationUnit,
+            crate::analyzer::read_ledger::read_set_digest(&reads).digest(),
+        );
+        let mut replay_limits = crate::analyzer::LookupReplayLimits::default();
+        if truncated {
+            replay_limits.call_relations.max_candidates = 0;
+        }
+        let verdict = crate::analyzer::verify_read_set_for_artifact(
+            artifact,
+            &head,
+            &changed,
+            &brokk_bifrost_analysis::test_support::read_ledger_test_inputs(),
+            &reads,
+            replay_limits,
+            &crate::analyzer::NoSummaryAnswers,
+            &mut crate::analyzer::LookupMemo::new(),
+        );
+        assert_eq!(
+            verdict == crate::analyzer::ReadVerdict::Unchanged,
+            expected_unchanged,
+            "{source}: {verdict:?}"
+        );
+    }
 }
 
 // A warm hierarchy memo must retain the cross-file authority of its cold build.
@@ -2760,6 +2958,7 @@ fn call_site_unit_key_distinguishes_external_target_arms() {
         CallSiteIdentityFacts::default(),
     );
     first.6 = Some(CallSiteTargetEvidence {
+        static_proof: None,
         target_id: Some("external-one".to_string()),
         target_fq_name: Some("std.io.stdout".to_string()),
         boundary_kind: Some("external"),
@@ -2961,11 +3160,11 @@ fn an_execution_exports_the_budgeted_lanes_its_public_work_drops() {
     );
     assert_eq!(
         unit.budgeted_work.max_step_outputs(),
-        u64::try_from(unit.rows.len()).expect("row count fits"),
+        Some(u64::try_from(unit.rows.len()).expect("row count fits")),
         "the final step's output count is the row count it produced"
     );
     assert!(
-        unit.budgeted_work.step_outputs.len() >= query.plan.steps.len(),
+        unit.budgeted_work.step_outputs.as_ref().unwrap().len() >= query.plan.steps.len(),
         "every plan operator has an entry, so every step has one"
     );
 }
@@ -3998,4 +4197,1072 @@ fn union_empty_operand_never_discards_depth_witnesses() {
             );
         }
     }
+}
+
+#[test]
+#[hardwon("#11267: retained pointer rows lost source evidence and independent sources")]
+fn pointer_sources_survive_retained_terminal_json() {
+    // Pin legacy non-pointer bytes as well as the new, plural wire boundary.
+    let legacy = r#"{"terminal_kind":"source_position"}"#;
+    let old: UnitRowItemTerminal = serde_json::from_str(legacy).expect("legacy terminal");
+    assert_eq!(serde_json::to_string(&old).unwrap(), legacy);
+    let range = CodeQueryRange {
+        start_line: 1,
+        start_column: 1,
+        end_line: 1,
+        end_column: 3,
+    };
+    let sources = vec![
+        CodeQuerySourceSpan {
+            path: "first.rs".into(),
+            range,
+            start_byte: 0,
+            end_byte: 2,
+        },
+        CodeQuerySourceSpan {
+            path: "second.rs".into(),
+            range,
+            start_byte: 0,
+            end_byte: 2,
+        },
+    ];
+    let terminal = UnitRowItemTerminal::RustPointerFinding {
+        source_ranges: sources.clone(),
+        source_ranges_omitted: brokk_bifrost_core::omission::OmissionCount::lower_bound(1),
+    };
+    let bytes = serde_json::to_vec(&terminal).expect("retained pointer terminal");
+    let decoded: UnitRowItemTerminal =
+        serde_json::from_slice(&bytes).expect("replayed pointer terminal");
+    assert_eq!(decoded, terminal);
+    assert_eq!(serde_json::to_vec(&decoded).unwrap(), bytes);
+    let UnitRowItemTerminal::RustPointerFinding {
+        source_ranges,
+        source_ranges_omitted,
+    } = decoded
+    else {
+        panic!("pointer terminal");
+    };
+    assert_eq!(source_ranges, sources);
+    assert_eq!(
+        source_ranges_omitted,
+        brokk_bifrost_core::omission::OmissionCount::lower_bound(1)
+    );
+}
+
+#[test]
+#[hardwon("#11552: nested source diagnostics kept inner paths and panicked in an outer union leaf")]
+fn call_reachability_nested_source_diagnostics_keep_the_outer_leaf_path() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("app.rs", "fn unrelated() { selected_sink_0(); unknown_external(); }\nfn selected_sink_0() {}\nfn entry_1() { selected_sink_1(); }\nfn selected_sink_1() {}\n")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let files = seed_files_of(&workspace);
+    assert_eq!(files.len(), 1);
+    let flow = brokk_bifrost_flow::FlowWorkspaceState::default();
+    let partial = r#"(callees (enclosing-decl (language rust (function :name "unrelated"))))"#;
+    let definite = r#"(language rust (function :name "entry_1"))"#;
+    for incomplete_branch in [0, 1] {
+        let sources = if incomplete_branch == 0 {
+            format!("(union {partial} {definite})")
+        } else {
+            format!("(union {definite} {partial})")
+        };
+        let query = CodeQuery::from_source(&format!(
+            r#"(union (call-reachability
+                    :sources (language rust (function :name "missing"))
+                    :sinks (language rust (call :callee (name "selected_sink_1"))))
+                (call-reachability :sources {sources}
+                    :sinks (language rust (call :callee (name "selected_sink_1")))))"#,
+        ))
+        .unwrap();
+        assert!(
+            crate::query::PlanPartitioning::classify(&query.plan).is_seed_union(),
+            "the regression must execute authored union leaves, not widen"
+        );
+        let cold = execute_code_query_unit(
+            workspace.analyzer(),
+            &flow,
+            Some(&workspace),
+            &query,
+            CodeQueryExecutionLimits::default(),
+            None,
+            CodeQueryExecutionScope::whole_workspace(),
+        );
+        assert_ne!(cold.completion, CodeQueryCompletion::Complete);
+        assert_eq!(
+            cold.rows.len(),
+            1,
+            "the independently certified path remains additive"
+        );
+        let CodeQueryPlanSource::Set { branches, .. } = &query.plan.source else {
+            panic!("outer union");
+        };
+        let CodeQueryPlanSource::CallReachability(operator) = &branches[1].source else {
+            panic!("projecting leaf");
+        };
+        for prepared in [false, true] {
+            let mut scope = CodeQueryExecutionScope::for_seed_files(&files, &files);
+            if prepared {
+                let source_query = CodeQuery {
+                    plan: operator.sources.clone(),
+                    limit: usize::MAX,
+                    ..query.clone()
+                };
+                let source = execute_call_reachability_source(
+                    workspace.analyzer(),
+                    &flow,
+                    Some(&workspace),
+                    &source_query,
+                    CodeQueryExecutionLimits::default(),
+                    None,
+                    CodeQueryExecutionScope::for_seed_files(&files, &files),
+                );
+                let mut operands = CallReachabilityOperands::default();
+                operands.insert_source(&operator.sources, source);
+                scope = scope.with_call_reachability_operands(std::sync::Arc::new(operands));
+            }
+            // Inner branch 0 differs from the outer leaf's 1. Inner branch 1
+            // coincides with it, so starts_with cannot detect an omitted prefix.
+            // Prepared operands must receive that prefix exactly once as well.
+            let narrowed = execute_code_query_unit(
+                workspace.analyzer(),
+                &flow,
+                Some(&workspace),
+                &query,
+                CodeQueryExecutionLimits::default(),
+                None,
+                scope,
+            );
+            assert_eq!(narrowed.completion, cold.completion);
+            assert_eq!(
+                serde_json::to_value(&narrowed.rows).unwrap(),
+                serde_json::to_value(&cold.rows).unwrap()
+            );
+            let expected = vec![1, incomplete_branch];
+            assert!(
+                narrowed
+                    .diagnostics
+                    .iter()
+                    .any(
+                        |diagnostic| diagnostic.impact == CodeQueryDiagnosticImpact::Incomplete
+                            && diagnostic.branch == expected
+                    ),
+                "inner diagnostic belongs to {expected:?}: {:?}",
+                narrowed.diagnostics
+            );
+            for diagnostic in &narrowed.diagnostics {
+                if diagnostic.impact == CodeQueryDiagnosticImpact::Incomplete {
+                    assert!(
+                        diagnostic.branch == [1] || diagnostic.branch == expected,
+                        "an outer prefix is neither omitted nor duplicated: {diagnostic:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[hardwon("#11836: an earlier caller query's scan work consumed a later query's allowance")]
+fn caller_budget_ignores_unrelated_scan_work_increase() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .with_git()
+        .file(
+            "target.ts",
+            "export function earlier() {}\nexport function later() {}\n",
+        )
+        .file(
+            "caller.ts",
+            "import { later } from './target';\nexport function caller() { later(); }\n",
+        )
+        .file("other.ts", "export function unrelated() { return 1; }\n")
+        .build();
+    // The aggregate user cap must cover both physical scans to isolate admission from scan work.
+    let limits = CodeQueryExecutionLimits {
+        max_scanned_source_bytes: 65_536,
+        ..CodeQueryExecutionLimits::default()
+    };
+    let run = |workspace: &WorkspaceAnalyzer| {
+        let analyzer = workspace.analyzer();
+        let declarations = analyzer.declarations(&project.file("target.ts"));
+        let earlier = declarations
+            .iter()
+            .find(|unit| unit.fq_name().to_string().ends_with("earlier"))
+            .expect("earlier");
+        let later = declarations
+            .iter()
+            .find(|unit| unit.fq_name().to_string().ends_with("later"))
+            .expect("later");
+        let ledger = std::sync::Arc::new(crate::analyzer::read_ledger::ReadLedger::new());
+        let scope = AnalyzerQueryScope::with_read_ledger(analyzer, std::sync::Arc::clone(&ledger));
+        let mut cache = CallTraversalCache::default();
+        let mut budget = CodeQueryExecutionBudget::default();
+        let first = cached_call_relation(
+            analyzer,
+            scope.token(),
+            earlier,
+            true,
+            &mut cache,
+            &mut budget,
+            limits,
+            None,
+            &mut Vec::new(),
+            &mut None,
+        );
+        let fresh = budgeted_execution_work(budget, Some(Vec::new()), Some(0));
+        let mut reused_budget = CodeQueryExecutionBudget::default();
+        let reused = cached_call_relation(
+            analyzer,
+            scope.token(),
+            earlier,
+            true,
+            &mut cache,
+            &mut reused_budget,
+            limits,
+            None,
+            &mut Vec::new(),
+            &mut None,
+        );
+        assert!(!reused.truncated);
+        let replayed = budgeted_execution_work(reused_budget, Some(Vec::new()), Some(0));
+        assert_eq!(fresh.admission, replayed.admission);
+        assert_eq!(
+            remaining_unit_limits(limits, &CodeQueryExecutionWork::default(), &fresh),
+            remaining_unit_limits(limits, &CodeQueryExecutionWork::default(), &replayed),
+            "fresh and reused earlier answers leave the same next-unit allowances",
+        );
+        let second = cached_call_relation(
+            analyzer,
+            scope.token(),
+            later,
+            true,
+            &mut cache,
+            &mut budget,
+            limits,
+            None,
+            &mut Vec::new(),
+            &mut None,
+        );
+        assert!(
+            !first.truncated && !second.truncated,
+            "{first:?} {second:?}"
+        );
+        let reads = ledger
+            .keys()
+            .into_iter()
+            .filter(|key| {
+                matches!(
+                    key,
+                    crate::analyzer::ReadKey::Lookup {
+                        kind: crate::analyzer::LookupKind::Callers,
+                        ..
+                    }
+                )
+            })
+            .collect::<Vec<_>>();
+        (first.work.scanned_source_bytes, second.sites.len(), reads)
+    };
+    let base = project.workspace_analyzer(AnalyzerConfig::default());
+    let before = run(&base);
+    project
+        .file("other.ts")
+        .write(format!(
+            "export function unrelated() {{ return 1; }}\n/*{}*/\n",
+            "x\n".repeat(10_000)
+        ))
+        .expect("raise unrelated scan work");
+    let head = project.workspace_analyzer(AnalyzerConfig::default());
+    let after = run(&head);
+    assert!(
+        after.0 > before.0,
+        "earlier scan work must increase: {before:?} {after:?}"
+    );
+    assert_eq!(before.1, after.1, "later fresh answer");
+    assert_eq!(before.2, after.2, "both consumed answers stay equal");
+    let changed = crate::analyzer::ChangedFacts::between(&base, &head);
+    let artifact = crate::analyzer::invalidation::DerivedArtifactId::new(
+        crate::analyzer::invalidation::DerivedArtifactKind::PolicyEvaluationUnit,
+        crate::analyzer::read_ledger::read_set_digest(&before.2).digest(),
+    );
+    assert_eq!(
+        crate::analyzer::verify_read_set_for_artifact(
+            artifact,
+            &head,
+            &changed,
+            &brokk_bifrost_analysis::test_support::read_ledger_test_inputs(),
+            &before.2,
+            crate::analyzer::LookupReplayLimits::default(),
+            &crate::analyzer::NoSummaryAnswers,
+            &mut crate::analyzer::LookupMemo::new(),
+        ),
+        crate::analyzer::ReadVerdict::Unchanged
+    );
+}
+
+#[test]
+#[hardwon("#11836: a single caller answer exceeded the remaining traversal allowance")]
+fn caller_answer_allowance_cuts_warm_and_cold_identically() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("target.ts", "export function target() {}\nexport function caller() { target(); target(); target(); target(); }\n")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let analyzer = workspace.analyzer();
+    let declarations = analyzer.declarations(&project.file("target.ts"));
+    let target = declarations
+        .iter()
+        .find(|unit| unit.fq_name().to_string().ends_with("target"))
+        .unwrap();
+    let scope = AnalyzerQueryScope::with_read_ledger(
+        analyzer,
+        std::sync::Arc::new(crate::analyzer::read_ledger::ReadLedger::new()),
+    );
+    let mut cache = CallTraversalCache::default();
+    let limits = CodeQueryExecutionLimits {
+        max_call_answers: 3,
+        ..CodeQueryExecutionLimits::default()
+    };
+    let mut answers = Vec::new();
+    for _ in 0..2 {
+        let mut budget = CodeQueryExecutionBudget::default();
+        let mut diagnostics = Vec::new();
+        let answer = cached_call_relation(
+            analyzer,
+            scope.token(),
+            target,
+            true,
+            &mut cache,
+            &mut budget,
+            limits,
+            None,
+            &mut diagnostics,
+            &mut None,
+        );
+        assert_eq!(answer.sites.len(), 2);
+        assert!(answer.truncated);
+        assert_eq!(
+            budget.call_declarations + budget.call_sites + budget.call_terminals,
+            3
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code
+                    == CodeQueryDiagnosticCode::ExecutionBudgetExhausted)
+        );
+        answers.push(format!("{:?}", answer.sites));
+    }
+    assert_eq!(answers[0], answers[1]);
+    cache
+        .incoming
+        .read_mut(&memo_attribution(analyzer), |memo| {
+            assert_eq!(memo.get(target).unwrap().sites.len(), 4)
+        });
+}
+
+#[test]
+#[hardwon("#11836: incoming-file prefetch cached answers using default scan limits")]
+fn caller_prefetch_uses_request_scan_limits() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"prefetch_limits\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .file("src/lib.rs", "mod zcaller;\npub fn target() {}\n")
+        .file(
+            "src/zcaller.rs",
+            format!(
+                "pub fn caller() {{ crate::target(); }}\n/*{}*/\n",
+                "padding".repeat(100)
+            ),
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["rust"],
+        "match": {"kind": "callable", "name": "target"},
+        "steps": [{"op": "enclosing_decl"}, {"op": "call_sites_to"}],
+        "limit": 100
+    }))
+    .unwrap();
+    let flow = brokk_bifrost_flow::FlowWorkspaceState::default();
+    let files = workspace.analyzer().analyzed_files();
+    let file = project.file("src/zcaller.rs");
+    let run = |limits| {
+        execute_code_query_unit(
+            workspace.analyzer(),
+            &flow,
+            Some(&workspace),
+            &query,
+            limits,
+            None,
+            CodeQueryExecutionScope::for_reverse_entered_file(&file, &files),
+        )
+    };
+    let full = run(CodeQueryExecutionLimits::default());
+    assert_eq!(full.completion, CodeQueryCompletion::Complete, "{full:?}");
+    assert_eq!(full.rows.len(), 1);
+    let limited = run(CodeQueryExecutionLimits {
+        max_scanned_source_bytes: 100,
+        ..CodeQueryExecutionLimits::default()
+    });
+    assert_ne!(
+        limited.completion,
+        CodeQueryCompletion::Complete,
+        "{limited:?}"
+    );
+    assert!(
+        limited
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.incompleteness
+                == Incompleteness::Operational(DiagnosticExecutionCause::Budget)),
+        "{limited:?}"
+    );
+}
+
+#[test]
+#[hardwon(
+    "#11836: a callers expansion could rescan the workspace once per declaration without an aggregate bound"
+)]
+fn callers_physical_allowance_memo_hits_and_retry() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "target.ts",
+            "export function first() {}\nexport function second() {}\nexport function third() {}\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let analyzer = workspace.analyzer();
+    let declarations = analyzer.declarations(&project.file("target.ts"));
+    let scope = AnalyzerQueryScope::with_read_ledger(
+        analyzer,
+        std::sync::Arc::new(crate::analyzer::read_ledger::ReadLedger::new()),
+    );
+    let run = |cache: &mut CallTraversalCache, limits| {
+        let mut budget = CodeQueryExecutionBudget::default();
+        let mut diagnostics = Vec::new();
+        let answers = declarations
+            .iter()
+            .map(|unit| {
+                cached_call_relation(
+                    analyzer,
+                    scope.token(),
+                    unit,
+                    true,
+                    cache,
+                    &mut budget,
+                    limits,
+                    None,
+                    &mut diagnostics,
+                    &mut None,
+                )
+            })
+            .collect::<Vec<_>>();
+        (answers, budget, diagnostics)
+    };
+    let mut cache = CallTraversalCache::default();
+    let (cold, cold_work, diagnostics) = run(&mut cache, CodeQueryExecutionLimits::default());
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    assert!(cold.iter().all(|answer| !answer.truncated));
+    assert!(cold_work.call_scanned_files > 0);
+    let small = CodeQueryExecutionLimits {
+        max_call_scanned_files: 0,
+        max_call_scanned_source_bytes: 0,
+        ..CodeQueryExecutionLimits::default()
+    };
+    let (warm, warm_work, diagnostics) = run(&mut cache, small);
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    assert_eq!(warm_work.call_scanned_files, 0);
+    assert_eq!(warm_work.call_scanned_source_bytes, 0);
+    assert_eq!(format!("{cold:?}"), format!("{warm:?}"));
+
+    // Outgoing work earlier in the pipeline leaves the incoming allowance intact.
+    let mut mixed_cache = CallTraversalCache::default();
+    let mut mixed_budget = CodeQueryExecutionBudget::default();
+    let mut mixed_diagnostics = Vec::new();
+    for unit in &declarations {
+        let answer = cached_call_relation(
+            analyzer,
+            scope.token(),
+            unit,
+            false,
+            &mut mixed_cache,
+            &mut mixed_budget,
+            CodeQueryExecutionLimits::default(),
+            None,
+            &mut mixed_diagnostics,
+            &mut None,
+        );
+        assert!(!answer.truncated);
+    }
+    assert!(
+        mixed_budget.call_scanned_files > 0,
+        "outgoing queries scanned source"
+    );
+    assert_eq!(mixed_budget.callers_scanned_files, 0);
+    assert_eq!(mixed_budget.callers_scanned_source_bytes, 0);
+    let exact = CodeQueryExecutionLimits {
+        max_call_scanned_files: cold_work.callers_scanned_files,
+        max_call_scanned_source_bytes: cold_work.callers_scanned_source_bytes,
+        ..CodeQueryExecutionLimits::default()
+    };
+    let mixed = declarations
+        .iter()
+        .map(|unit| {
+            cached_call_relation(
+                analyzer,
+                scope.token(),
+                unit,
+                true,
+                &mut mixed_cache,
+                &mut mixed_budget,
+                exact,
+                None,
+                &mut mixed_diagnostics,
+                &mut None,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(mixed_diagnostics.is_empty(), "{mixed_diagnostics:?}");
+    assert_eq!(format!("{cold:?}"), format!("{mixed:?}"));
+
+    // This hardwon guard originally allowed one crossing scan. The allowance
+    // now bounds the provider grant, so refusal must happen without overshoot.
+    for (limits, code) in [
+        (
+            CodeQueryExecutionLimits {
+                max_call_scanned_source_bytes: 1,
+                max_scanned_files: 1,
+                ..Default::default()
+            },
+            CodeQueryDiagnosticCode::SemanticBudgetExhausted,
+        ),
+        (
+            CodeQueryExecutionLimits {
+                max_call_scanned_files: 1,
+                ..Default::default()
+            },
+            CodeQueryDiagnosticCode::SemanticBudgetExhausted,
+        ),
+        (
+            CodeQueryExecutionLimits {
+                max_scanned_source_bytes: 1,
+                ..Default::default()
+            },
+            CodeQueryDiagnosticCode::ExecutionBudgetExhausted,
+        ),
+        (
+            CodeQueryExecutionLimits {
+                max_scanned_source_bytes: 1,
+                max_call_scanned_source_bytes: 1,
+                ..Default::default()
+            },
+            CodeQueryDiagnosticCode::ExecutionBudgetExhausted,
+        ),
+        (
+            CodeQueryExecutionLimits {
+                max_scanned_files: 1,
+                ..Default::default()
+            },
+            CodeQueryDiagnosticCode::ExecutionBudgetExhausted,
+        ),
+        (
+            CodeQueryExecutionLimits {
+                max_scanned_files: 1,
+                max_call_scanned_files: 1,
+                ..Default::default()
+            },
+            CodeQueryDiagnosticCode::ExecutionBudgetExhausted,
+        ),
+    ] {
+        let mut stopped_cache = CallTraversalCache::default();
+        let (stopped, work, diagnostics) = run(&mut stopped_cache, limits);
+        assert!(
+            work.call_scanned_source_bytes
+                <= limits
+                    .max_scanned_source_bytes
+                    .min(limits.max_call_scanned_source_bytes),
+            "{limits:?}: {work:?}"
+        );
+        assert!(
+            work.call_scanned_files <= limits.max_scanned_files.min(limits.max_call_scanned_files),
+            "{limits:?}: {work:?}"
+        );
+        assert!(
+            stopped.iter().all(|answer| answer.truncated),
+            "{limits:?}: {stopped:?}"
+        );
+        assert!(!diagnostics.is_empty(), "{limits:?}");
+        assert!(
+            diagnostics.iter().all(|diagnostic| {
+                diagnostic.code == code
+                    && diagnostic.incompleteness
+                        == Incompleteness::Operational(DiagnosticExecutionCause::Budget)
+            }),
+            "{limits:?}: {diagnostics:?}"
+        );
+        stopped_cache
+            .incoming
+            .read_mut(&memo_attribution(analyzer), |memo| {
+                assert!(declarations.iter().all(|unit| memo.get(unit).is_none()));
+            });
+        let (retry, _, diagnostics) = run(&mut stopped_cache, CodeQueryExecutionLimits::default());
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(format!("{cold:?}"), format!("{retry:?}"));
+    }
+}
+
+#[test]
+#[hardwon(
+    "#11836: a callers expansion could rescan the workspace once per declaration without an aggregate bound"
+)]
+fn callers_physical_allowance_marks_unit_operational() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "target.ts",
+            "export function first() {}\nexport function second() {}\nexport function third() {}\nexport function driver() { first(); }\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["typescript"],
+        "match": {"kind": "callable"},
+        "steps": [{"op": "enclosing_decl"}, {"op": "callers"}],
+        "limit": 100
+    }))
+    .unwrap();
+    let flow = brokk_bifrost_flow::FlowWorkspaceState::default();
+    let files = workspace.analyzer().analyzed_files();
+    let run = |limits| {
+        execute_code_query_unit(
+            workspace.analyzer(),
+            &flow,
+            Some(&workspace),
+            &query,
+            limits,
+            None,
+            CodeQueryExecutionScope::for_seed_files(
+                std::slice::from_ref(&project.file("target.ts")),
+                &files,
+            ),
+        )
+    };
+    let mixed_query = CodeQuery::from_json(&json!({
+        "languages": ["typescript"],
+        "match": {"kind": "callable", "name": "driver"},
+        "steps": [{"op": "enclosing_decl"}, {"op": "callees"}, {"op": "callers"}],
+        "limit": 100
+    }))
+    .unwrap();
+    // One source file causes multiple physical file events: incoming candidate
+    // scanning also reads outgoing edges to recover recursion. Measure that
+    // cold incoming work, without any preceding outgoing pipeline work.
+    let declarations = workspace
+        .analyzer()
+        .declarations(&project.file("target.ts"));
+    let target = declarations
+        .iter()
+        .find(|unit| unit.fq_name().to_string().ends_with("first"))
+        .unwrap();
+    let scope = AnalyzerQueryScope::new(workspace.analyzer());
+    let mut cold_budget = CodeQueryExecutionBudget::default();
+    let mut cold_diagnostics = Vec::new();
+    let cold = cached_call_relation(
+        workspace.analyzer(),
+        scope.token(),
+        target,
+        true,
+        &mut CallTraversalCache::default(),
+        &mut cold_budget,
+        CodeQueryExecutionLimits::default(),
+        None,
+        &mut cold_diagnostics,
+        &mut None,
+    );
+    assert!(!cold.truncated, "{cold:?}");
+    assert!(cold_diagnostics.is_empty(), "{cold_diagnostics:?}");
+    assert!(cold_budget.callers_scanned_files > 1, "{cold_budget:?}");
+    drop(scope);
+    let mixed = execute_code_query_unit(
+        workspace.analyzer(),
+        &flow,
+        Some(&workspace),
+        &mixed_query,
+        CodeQueryExecutionLimits {
+            max_call_scanned_files: cold_budget.callers_scanned_files,
+            max_call_scanned_source_bytes: cold_budget.callers_scanned_source_bytes,
+            ..CodeQueryExecutionLimits::default()
+        },
+        None,
+        CodeQueryExecutionScope::for_seed_files(
+            std::slice::from_ref(&project.file("target.ts")),
+            &files,
+        ),
+    );
+    assert_eq!(mixed.completion, CodeQueryCompletion::Complete, "{mixed:?}");
+    assert!(
+        mixed.work.scanned_files > cold_budget.callers_scanned_files as u64,
+        "pipeline performs extra outgoing work without spending the incoming allowance: {mixed:?}"
+    );
+    assert_eq!(
+        mixed.rows.len(),
+        1,
+        "outgoing then incoming pipeline returns driver"
+    );
+
+    let ledger = std::sync::Arc::new(crate::analyzer::read_ledger::ReadLedger::new());
+    let ledger_scope = AnalyzerQueryScope::with_read_ledger(workspace.analyzer(), ledger.clone());
+    let stopped = run(CodeQueryExecutionLimits {
+        max_call_scanned_files: 1,
+        ..CodeQueryExecutionLimits::default()
+    });
+    assert_ne!(
+        stopped.completion,
+        CodeQueryCompletion::Complete,
+        "{stopped:?}"
+    );
+    assert!(
+        stopped.diagnostics.iter().any(|diagnostic| {
+            diagnostic.incompleteness
+                == Incompleteness::Operational(DiagnosticExecutionCause::Budget)
+                && diagnostic.message.contains("callers expansion")
+        }),
+        "{stopped:?}"
+    );
+    // The unit's consumer joins the verdict the execution returned.
+    assert!(!stopped.reuse.is_content(), "{stopped:?}");
+    ledger.join_verdict(stopped.reuse);
+    assert!(
+        !ledger.is_bounded(),
+        "operationally stopped unit cannot be published"
+    );
+    drop(ledger_scope);
+    let retry = run(CodeQueryExecutionLimits::default());
+    assert_eq!(retry.completion, CodeQueryCompletion::Complete, "{retry:?}");
+}
+
+#[test]
+#[hardwon("#11836: depth-probe memo hits bypassed call-answer admission")]
+fn depth_probe_memo_hits_obey_call_answer_admission() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", "fn root() { middle(); }\nfn middle() { a(); b(); c(); }\nfn a() {}\nfn b() {}\nfn c() {}\n")
+        .build();
+    let workspace = project.workspace_analyzer(Default::default());
+    let analyzer = workspace.analyzer();
+    let root = analyzer
+        .declarations(&project.file("src/lib.rs"))
+        .into_iter()
+        .find(|unit| unit.fq_name() == "root")
+        .unwrap();
+    let declaration = IndexedDeclarations::default().get(analyzer, &root).unwrap();
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let filter = CallTraversalFilter::default();
+    let step = QueryStep::Callees(filter.clone());
+    let mut cache = CallTraversalCache::default();
+    let mut run = || {
+        let mut input = CallDepthProbeInput::default();
+        let (_, exhausted) = call_declaration_expansions(
+            analyzer,
+            scope.token(),
+            &declaration,
+            &step,
+            &filter,
+            &mut IndexedDeclarations::default(),
+            &mut cache,
+            &mut CodeQueryExecutionBudget::default(),
+            CodeQueryExecutionLimits::default(),
+            16,
+            None,
+            &mut Vec::new(),
+            &mut None,
+            &mut input,
+            None,
+        );
+        assert!(!exhausted);
+        let mut budget = CodeQueryExecutionBudget::default();
+        let status = probe_call_depth_bound(
+            analyzer,
+            scope.token(),
+            &step,
+            &filter,
+            &mut cache,
+            &mut budget,
+            CodeQueryExecutionLimits {
+                max_call_answers: 2,
+                ..CodeQueryExecutionLimits::default()
+            },
+            None,
+            &mut input,
+        );
+        let answer = input.answer.unwrap();
+        assert!(answer.budget_stopped);
+        assert_eq!(answer.frontier.len(), 1);
+        assert_eq!(
+            (
+                budget.call_declarations,
+                budget.call_sites,
+                budget.call_terminals
+            ),
+            (1, 1, 0)
+        );
+        (status, format!("{answer:?}"), budget.call_scanned_files)
+    };
+    let cold = run();
+    let warm = run();
+    assert_eq!(cold.0, DepthBoundStatus::Reached);
+    assert_eq!(cold.0, warm.0);
+    assert_eq!(cold.1, warm.1);
+    assert_eq!(warm.2, 0, "memo hits perform no physical scan");
+}
+
+#[test]
+#[hardwon("#11836: the user's max_scanned_source_bytes stopped bounding call-relation scans")]
+fn caller_scans_obey_user_physical_limits() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("old.ts", "export function target() {}\n")
+        .file(
+            "app.ts",
+            "import { target } from './old';\nexport function caller() { target(); }\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["typescript"],
+        "match": {"kind": "callable", "name": "target"},
+        "steps": [{"op": "enclosing_decl"}, {"op": "call_sites_to"}],
+        "limit": 100
+    }))
+    .unwrap();
+    let flow = brokk_bifrost_flow::FlowWorkspaceState::default();
+    let files = workspace.analyzer().analyzed_files();
+    let run = |limits| {
+        execute_code_query_unit(
+            workspace.analyzer(),
+            &flow,
+            Some(&workspace),
+            &query,
+            limits,
+            None,
+            CodeQueryExecutionScope::for_seed_files(
+                std::slice::from_ref(&project.file("old.ts")),
+                &files,
+            ),
+        )
+    };
+    for limits in [
+        CodeQueryExecutionLimits {
+            max_scanned_source_bytes: 1,
+            ..Default::default()
+        },
+        CodeQueryExecutionLimits {
+            max_scanned_files: 1,
+            ..Default::default()
+        },
+    ] {
+        let ledger = std::sync::Arc::new(crate::analyzer::read_ledger::ReadLedger::new());
+        let scope = AnalyzerQueryScope::with_read_ledger(workspace.analyzer(), ledger.clone());
+        let stopped = run(limits);
+        assert_ne!(
+            stopped.completion,
+            CodeQueryCompletion::Complete,
+            "{stopped:?}"
+        );
+        assert!(
+            stopped.diagnostics.iter().any(|diagnostic| {
+                diagnostic.incompleteness
+                    == Incompleteness::Operational(DiagnosticExecutionCause::Budget)
+            }),
+            "{stopped:?}"
+        );
+        assert!(!stopped.reuse.is_content(), "{stopped:?}");
+        ledger.join_verdict(stopped.reuse);
+        assert!(
+            !ledger.is_bounded(),
+            "operational stop must not be published"
+        );
+        drop(scope);
+    }
+    let retry = run(CodeQueryExecutionLimits::default());
+    assert_eq!(retry.completion, CodeQueryCompletion::Complete, "{retry:?}");
+    assert_eq!(retry.rows.len(), 1);
+}
+
+fn assert_call_projection_cancellation(
+    analyzer: &dyn IAnalyzer,
+    unit: &CodeUnit,
+    provider: &dyn Fn(&CancellationToken) -> CallRelationResult,
+    query: &dyn Fn(
+        &CancellationToken,
+        &mut CallTraversalCache,
+        &mut Vec<CodeQueryDiagnostic>,
+    ) -> CallRelationResult,
+) {
+    // Warm both routes before counting checkpoints, so memo initialization
+    // cannot shift the provider's cancellation window between the two runs.
+    let complete = provider(&CancellationToken::new());
+    assert!(!complete.cancelled && !complete.truncated, "{complete:?}");
+    assert_eq!(complete.sites.len(), 3);
+    let warm = query(
+        &CancellationToken::new(),
+        &mut CallTraversalCache::default(),
+        &mut Vec::new(),
+    );
+    assert_eq!(warm.sites, complete.sites);
+    let mut projection_checkpoints = Vec::new();
+    let mut finished = false;
+    // The first untripped run counts the complete path. Every preceding
+    // checkpoint must preserve the provider's cancellation and partial sites.
+    for checks in 0..=4096 {
+        let provider_token = CancellationToken::cancel_after_checks_for_test(checks);
+        let expected = provider(&provider_token);
+        let cancellation = CancellationToken::cancel_after_checks_for_test(checks);
+        let mut cache = CallTraversalCache::default();
+        let mut diagnostics = Vec::new();
+        let answer = query(&cancellation, &mut cache, &mut diagnostics);
+        let tripped = provider_token.cancel_after_checks_tripped_for_test();
+        assert_eq!(
+            cancellation.cancel_after_checks_tripped_for_test(),
+            tripped,
+            "checks={checks}: provider and RQL must poll the same projection"
+        );
+        if !tripped {
+            assert!(!expected.cancelled && !answer.cancelled);
+            assert_eq!(expected.sites, complete.sites);
+            assert_eq!(answer.sites, complete.sites);
+            finished = true;
+            break;
+        }
+        assert!(expected.cancelled, "checks={checks}: {expected:?}");
+        assert!(
+            answer.cancelled,
+            "checks={checks}: {answer:?} {diagnostics:?}"
+        );
+        assert_eq!(answer.sites, expected.sites, "checks={checks}");
+        assert_eq!(answer.diagnostics, expected.diagnostics, "checks={checks}");
+        assert!(
+            diagnostics.iter().all(|diagnostic| {
+                diagnostic.code != CodeQueryDiagnosticCode::ExecutionBudgetExhausted
+                    && diagnostic.code != CodeQueryDiagnosticCode::SemanticBudgetExhausted
+            }),
+            "checks={checks}: {diagnostics:?}"
+        );
+        for memo in [&mut cache.incoming, &mut cache.outgoing] {
+            memo.read_mut(&memo_attribution(analyzer), |memo| {
+                assert!(
+                    memo.get(unit).is_none(),
+                    "cancelled answers must not be memoized"
+                );
+            });
+        }
+        if expected.work.scanned_source_bytes > 0
+            && !expected.sites.is_empty()
+            && expected.sites.len() < complete.sites.len()
+        {
+            projection_checkpoints.push(checks);
+        }
+        let retry = query(&CancellationToken::new(), &mut cache, &mut Vec::new());
+        assert!(!retry.cancelled, "checks={checks}: {retry:?}");
+        assert_eq!(retry.sites, complete.sites, "checks={checks}: retry");
+    }
+    assert!(finished, "must reach the untripped complete projection");
+    assert!(
+        !projection_checkpoints.is_empty(),
+        "must cancel inside projection after scanning and retaining a strict partial set of sites"
+    );
+}
+
+#[test]
+#[hardwon(
+    "549ad74f88ba: a truncated call relation below the candidate cap was reported as a budget stop, hiding cancellation"
+)]
+fn call_relation_projection_preserves_cancellation() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("target.ts", "export function target() {}\n")
+        .file("caller.ts", "import { target } from './target';\nexport function caller() { target(); target(); target(); }\n")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let analyzer = workspace.analyzer();
+    let target = analyzer
+        .declarations(&project.file("target.ts"))
+        .into_iter()
+        .find(|unit| unit.identifier() == "target")
+        .unwrap();
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let limits = CodeQueryExecutionLimits::default();
+    let relation_limits = remaining_call_scan_limits(&CodeQueryExecutionBudget::default(), limits);
+    assert_call_projection_cancellation(
+        analyzer,
+        &target,
+        &|cancellation| {
+            CallRelationService::incoming_bounded(
+                analyzer,
+                scope.token(),
+                &target,
+                relation_limits,
+                Some(cancellation),
+            )
+        },
+        &|cancellation, cache, diagnostics| {
+            cached_call_relation(
+                analyzer,
+                scope.token(),
+                &target,
+                true,
+                cache,
+                &mut CodeQueryExecutionBudget::default(),
+                limits,
+                Some(cancellation),
+                diagnostics,
+                &mut None,
+            )
+        },
+    );
+}
+
+#[test]
+#[hardwon(
+    "549ad74f88ba: outgoing call projection stopped on cancellation but reported cancelled=false"
+)]
+fn outgoing_call_relation_projection_preserves_cancellation() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("target.ts", "export function target() {}\n")
+        .file("caller.ts", "import { target } from './target';\nexport function caller() { target(); target(); target(); }\n")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let analyzer = workspace.analyzer();
+    let caller = analyzer
+        .declarations(&project.file("caller.ts"))
+        .into_iter()
+        .find(|unit| unit.identifier() == "caller")
+        .unwrap();
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let limits = CodeQueryExecutionLimits::default();
+    let relation_limits = remaining_call_scan_limits(&CodeQueryExecutionBudget::default(), limits);
+    assert_call_projection_cancellation(
+        analyzer,
+        &caller,
+        &|cancellation| {
+            CallRelationService::outgoing_bounded(
+                analyzer,
+                scope.token(),
+                &caller,
+                relation_limits,
+                Some(cancellation),
+            )
+        },
+        &|cancellation, cache, diagnostics| {
+            cached_call_relation(
+                analyzer,
+                scope.token(),
+                &caller,
+                false,
+                cache,
+                &mut CodeQueryExecutionBudget::default(),
+                limits,
+                Some(cancellation),
+                diagnostics,
+                &mut None,
+            )
+        },
+    );
 }

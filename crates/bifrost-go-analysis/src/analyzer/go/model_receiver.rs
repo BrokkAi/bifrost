@@ -44,7 +44,7 @@ pub(crate) fn transient_selection(
         member: query.source.get(member.byte_range())?.into(),
         receiver_place: None,
         receiver_pointer_depth: match candidates.as_slice() {
-            [candidate] if candidate.receiver_route_proven => {
+            [candidate] if candidate.receiver_is_declaring_owner => {
                 Some(candidate.receiver_pointer_depth)
             }
             _ => None,
@@ -69,6 +69,9 @@ pub(crate) fn go_selected_model_receiver_call(
     };
     let mut result = GoSelectedModelReceiverCall {
         outcome: DefinitionLookupOutcome {
+            selected_sites: Vec::new(),
+            inventory_evidence: None,
+            incomplete_evidence: None,
             modeled_definitions: Vec::new(),
             status: if selection.native_target_count > 1 {
                 DefinitionLookupStatus::Ambiguous
@@ -114,11 +117,11 @@ pub(crate) fn go_selected_model_receiver_call(
         .as_mut()
         .expect("selected site")
         .text = canonical.clone();
-    result.interface = candidate.interface;
+    result.interface = candidate.abstract_owner;
     let complete = candidate.complete;
     let runtime = candidate.receiver_runtime;
     let pointer = candidate.receiver_pointer_depth;
-    let matches_hint = !candidate.receiver_route_proven
+    let matches_hint = !candidate.receiver_is_declaring_owner
         || descriptor
             .receiver_pointer_depth
             .is_none_or(|hint| hint == pointer);
@@ -136,7 +139,7 @@ pub(crate) fn go_selected_model_receiver_call(
         let support = AnalyzerGoDefinitionProvider::bounded(
             go,
             session,
-            query.analyzer.semantic_model_overlay(),
+            query.analyzer.semantic_model_overlay_read().published(),
         );
         go_selected_receiver_argument_shape(
             &support,
@@ -170,7 +173,7 @@ pub(crate) fn go_selected_model_receiver_call(
         .declaration
         .receiver
         .map(|receiver| receiver.pointer);
-    let receiver_applicable = candidate.interface
+    let receiver_applicable = candidate.abstract_owner
         || declared_receiver.is_some_and(|declared| {
             !declared
                 || pointer == 1
@@ -183,8 +186,8 @@ pub(crate) fn go_selected_model_receiver_call(
         && matches_member
         && receiver_applicable
         && candidate.receiver_proven
-        && candidate.route_exact;
-    let proven = declared && (candidate.selection_complete || candidate.interface) && complete;
+        && candidate.owner_path_members_exact;
+    let proven = declared && (candidate.selection_complete || candidate.abstract_owner) && complete;
     if let Some((count, _)) =
         applicable_shape.filter(|_| selection.native_target_count == 1 && runtime && matches_member)
     {
@@ -203,7 +206,7 @@ pub(crate) fn go_selected_model_receiver_call(
                 candidate.declaration.name.clone(),
             ));
         }
-        result.proof = Some(if proven && candidate.interface {
+        result.proof = Some(if proven && candidate.abstract_owner {
             ExactExternalCallProof::go_interface_receiver(canonical.clone(), count)
         } else if proven {
             ExactExternalCallProof::go_concrete_receiver(canonical.clone(), count)
@@ -214,7 +217,7 @@ pub(crate) fn go_selected_model_receiver_call(
     result
         .reasons
         .extend(candidate.incomplete_reasons.iter().cloned());
-    if !candidate.route_exact {
+    if !candidate.owner_path_members_exact {
         result
             .reasons
             .push("go-model-members-not-depth-exact".into());
@@ -224,11 +227,11 @@ pub(crate) fn go_selected_model_receiver_call(
             .reasons
             .push("go-model-receiver-applicability-unproven".into());
     }
-    if !candidate.receiver_route_proven {
+    if !candidate.receiver_is_declaring_owner {
         result
             .reasons
             .push("go-model-promoted-receiver-storage-unavailable".into());
-    } else if proven && candidate.interface {
+    } else if proven && candidate.abstract_owner {
         // Any implementation may have a pointer receiver that writes the
         // boxed object, whichever one the open family selects. Go has no
         // method set on a pointer to an interface.
@@ -245,7 +248,7 @@ pub(crate) fn go_selected_model_receiver_call(
             )
         });
     }
-    if candidate.interface {
+    if candidate.abstract_owner {
         result
             .reasons
             .push("go-model-interface-implementation-family-open".into());

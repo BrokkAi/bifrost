@@ -366,7 +366,7 @@ impl SummaryWitnessStep {
         self.output_fact
     }
 
-    fn retained_owned_bytes(&self) -> usize {
+    pub(crate) fn retained_owned_bytes(&self) -> usize {
         super::retained_evidence_bytes(Some(&self.proof), Some(&self.completeness))
             .saturating_add(dispatch_boundary_heap_bytes(self.boundary.as_ref()))
             .saturating_add(
@@ -645,16 +645,6 @@ impl SummaryWitness {
         }
     }
 
-    /// Refined reports reconstruct semantic paths directly, as composition
-    /// does, and use the zero fact in their small per-pair fact table. Concrete
-    /// value identities remain in source/sink events and barrier observations.
-    pub(crate) fn clear_carrier_facts(&mut self) {
-        for step in &mut self.steps {
-            step.input_fact = FactId::new(0);
-            step.output_fact = FactId::new(0);
-        }
-    }
-
     pub(crate) fn retention_truncated_marker(quality: PathQuality) -> Self {
         Self {
             steps: Box::new([]),
@@ -686,6 +676,13 @@ impl SummaryWitness {
         self
     }
 
+    /// Include an observed fact's independent uncertainty without changing
+    /// the retained native steps or strengthening their path quality.
+    pub(crate) fn with_observation_quality(mut self, quality: PathQuality) -> Self {
+        self.quality = self.quality.conjoin(quality);
+        self
+    }
+
     pub fn steps(&self) -> &[SummaryWitnessStep] {
         &self.steps
     }
@@ -710,6 +707,10 @@ impl SummaryWitness {
 
     pub const fn alternatives_truncated(&self) -> bool {
         self.alternatives_truncated
+    }
+
+    pub(crate) fn mark_alternatives_truncated(&mut self) {
+        self.alternatives_truncated = true;
     }
 
     /// Whether best-effort retention exhausted its independent sidecar budget.
@@ -963,7 +964,7 @@ enum WitnessEvidenceKind {
     },
 }
 
-fn dispatch_boundary_heap_bytes(boundary: Option<&DispatchBoundaryKind>) -> usize {
+pub(crate) fn dispatch_boundary_heap_bytes(boundary: Option<&DispatchBoundaryKind>) -> usize {
     boundary
         .and_then(DispatchBoundaryKind::target_locator)
         .map_or(0, crate::value_flow::semantic_locator_heap_bytes)

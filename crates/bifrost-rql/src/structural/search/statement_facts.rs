@@ -37,7 +37,15 @@ pub(super) fn statement_fact_expansions(
             diagnostics,
         );
     }
-    let rows = analyzer.statement_source_facts(&seed.file);
+    let mut reuse = brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::Content;
+    let rows = analyzer.statement_source_facts(&seed.file, &mut reuse);
+    // The facts' verdict joins the query's; without a semantic context there
+    // is no query verdict here, so it joins the current captures, where the
+    // producer's ambient mark went.
+    match semantic.as_mut() {
+        Some(semantic) => semantic.join_reuse(reuse),
+        None => analyzer.join_reuse_verdict(reuse),
+    }
     let range = super::relations::seed_range(seed);
     report_undecided(
         seed,
@@ -136,6 +144,10 @@ fn report_nested_loop_incomplete(
     diagnostics.push(super::QueryExecutionState::diagnostic(
         analyzer,
         CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            has_non_utf8_refusal: false,
+            refusal_sites: Default::default(),
+            call_relation_facts: None,
+            uses_omissions: Vec::new(),
             incompleteness: match cause {
                 Some(cause) => brokk_bifrost_rql::Incompleteness::Operational(cause),
                 None => brokk_bifrost_rql::Incompleteness::Content,
@@ -219,6 +231,7 @@ fn nested_loop_fact_expansions(
                     )
                 });
                 workspace.analyzer().mark_execution_dependent();
+                semantic.join_reuse(EXECUTION_DEPENDENT);
             }
             incomplete = true;
             report_nested_loop_incomplete(

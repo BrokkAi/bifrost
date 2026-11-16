@@ -88,7 +88,7 @@ pub fn resolve_csharp_attribute_type(
             "attribute has no lookup context",
         );
     };
-    let external = csharp.external_declarations(analyzer.semantic_model_overlay());
+    let external = csharp.external_declarations(analyzer.semantic_model_overlay_read().published());
     let usings = csharp.using_namespaces_of(token, file);
     let aliases = csharp.using_aliases_of(token, file);
     let mut identities = Vec::new();

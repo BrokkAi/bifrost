@@ -12,6 +12,14 @@ pub fn table_with_items(items: usize) -> String {
 }
 
 use super::*;
+
+/// Source-admission tests assert a classification, not latency. The production
+/// [`COMPLETE_FILE_PARSE_BUDGET`] is deliberately tight, so a loaded host can
+/// turn a correct budget refusal into [`BoundedParse::TimedOut`] (issue
+/// #11726). Keep the test-only deadline well clear of the production budget;
+/// nextest's profile-wide terminate-after remains the hang detector.
+const TEST_SOURCE_ADMISSION_BUDGET: Duration = Duration::from_secs(300);
+
 #[doc(hidden)]
 pub fn parse<A: LanguageAdapter>(adapter: &A, source: &str, setting: Option<&str>) -> BoundedParse {
     let mut parser = Parser::new();
@@ -21,7 +29,7 @@ pub fn parse<A: LanguageAdapter>(adapter: &A, source: &str, setting: Option<&str
         adapter,
         source,
         None,
-        Instant::now() + COMPLETE_FILE_PARSE_BUDGET,
+        Instant::now() + TEST_SOURCE_ADMISSION_BUDGET,
         SourceAdmissionPolicy::from_setting(setting),
     )
 }

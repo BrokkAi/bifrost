@@ -87,7 +87,7 @@ pub(crate) fn collect_python_semantic_diagnostics(
             Language::None,
         );
     let environment = RetainedPythonEnvironment {
-        overlay: analyzer.semantic_model_overlay(),
+        overlay: analyzer.semantic_model_overlay_read().published(),
         evidence: analyzer.dependency_discovery_evidence(Language::Python),
     };
     let report = brokk_bifrost_python::diagnostics::collect_python_semantic_diagnostics(

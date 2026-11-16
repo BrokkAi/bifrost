@@ -67,6 +67,112 @@ pub trait JavaConversionTypes {
     ) -> Result<Option<bool>, Self::Error>;
 }
 
+/// A query-local formal array needs no invented persisted type identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum JavaTypeView<T> {
+    Real(T),
+    ImplicitArray(T),
+}
+
+/// Delegate selected type evidence while exposing one implicit array layer.
+pub struct JavaTypeViews<'a, T>(pub &'a mut T);
+
+impl<T: JavaConversionTypes> JavaConversionTypes for JavaTypeViews<'_, T> {
+    type Type = JavaTypeView<T::Type>;
+    type Error = T::Error;
+    fn ground(&self, ty: Self::Type) -> bool {
+        match ty {
+            JavaTypeView::Real(t) | JavaTypeView::ImplicitArray(t) => self.0.ground(t),
+        }
+    }
+    fn same(&self, a: Self::Type, b: Self::Type) -> bool {
+        match (a, b) {
+            (JavaTypeView::Real(a), JavaTypeView::Real(b)) => self.0.same(a, b),
+            (JavaTypeView::ImplicitArray(a), JavaTypeView::ImplicitArray(b)) => self.0.same(a, b),
+            (JavaTypeView::Real(array), JavaTypeView::ImplicitArray(component))
+            | (JavaTypeView::ImplicitArray(component), JavaTypeView::Real(array)) => self
+                .0
+                .element(array)
+                .is_some_and(|element| self.0.same(element, component)),
+        }
+    }
+    fn primitive(&self, ty: Self::Type) -> Option<JavaPrimitive> {
+        match ty {
+            JavaTypeView::Real(t) => self.0.primitive(t),
+            JavaTypeView::ImplicitArray(_) => None,
+        }
+    }
+    fn element(&self, ty: Self::Type) -> Option<Self::Type> {
+        match ty {
+            JavaTypeView::Real(t) => self.0.element(t).map(JavaTypeView::Real),
+            JavaTypeView::ImplicitArray(t) => Some(JavaTypeView::Real(t)),
+        }
+    }
+    fn name(&self, ty: Self::Type) -> Option<&str> {
+        match ty {
+            JavaTypeView::Real(t) => self.0.name(t),
+            JavaTypeView::ImplicitArray(_) => None,
+        }
+    }
+    fn named(&self, ty: Self::Type) -> bool {
+        match ty {
+            JavaTypeView::Real(t) => self.0.named(t),
+            JavaTypeView::ImplicitArray(_) => false,
+        }
+    }
+    fn arguments(&self, ty: Self::Type) -> Option<Vec<Self::Type>> {
+        match ty {
+            JavaTypeView::Real(t) => self
+                .0
+                .arguments(t)
+                .map(|args| args.into_iter().map(JavaTypeView::Real).collect()),
+            JavaTypeView::ImplicitArray(_) => None,
+        }
+    }
+    fn wildcard(&self, ty: Self::Type) -> Option<JavaWildcard<Self::Type>> {
+        match ty {
+            JavaTypeView::Real(t) => self.0.wildcard(t).map(|w| match w {
+                JavaWildcard::Any => JavaWildcard::Any,
+                JavaWildcard::Extends(t) => JavaWildcard::Extends(JavaTypeView::Real(t)),
+                JavaWildcard::Super(t) => JavaWildcard::Super(JavaTypeView::Real(t)),
+            }),
+            JavaTypeView::ImplicitArray(_) => None,
+        }
+    }
+    fn nominal_widening(
+        &mut self,
+        a: Self::Type,
+        b: Self::Type,
+    ) -> Result<Option<bool>, Self::Error> {
+        match (a, b) {
+            (JavaTypeView::Real(a), JavaTypeView::Real(b)) => self.0.nominal_widening(a, b),
+            _ => Ok(None),
+        }
+    }
+    fn different_owner_arguments(
+        &mut self,
+        a: Self::Type,
+        b: Self::Type,
+    ) -> Result<JavaDifferentOwner, Self::Error> {
+        match (a, b) {
+            (JavaTypeView::Real(a), JavaTypeView::Real(b)) => {
+                self.0.different_owner_arguments(a, b)
+            }
+            _ => Ok(JavaDifferentOwner::Open),
+        }
+    }
+    fn boxed_widening(
+        &mut self,
+        a: JavaPrimitive,
+        b: Self::Type,
+    ) -> Result<Option<bool>, Self::Error> {
+        match b {
+            JavaTypeView::Real(b) => self.0.boxed_widening(a, b),
+            JavaTypeView::ImplicitArray(_) => Ok(Some(false)),
+        }
+    }
+}
+
 /// JLS 4.5.1 containment of each actual type argument by the formal's
 /// argument at the same position, for two applications of one erased owner.
 fn contains_arguments<T: JavaConversionTypes>(
@@ -179,6 +285,24 @@ pub fn wrapper_primitive(name: &str) -> Option<JavaPrimitive> {
     })
 }
 
+/// A primitive actual against a reference formal known only by its fully
+/// qualified name. The wrapper of the primitive and `java.lang.Object` accept
+/// it by boxing (JLS 5.3), and `java.lang.String` never does. Any other name
+/// needs the formal's supertypes to decide a widening after boxing, so the
+/// answer is `None`.
+pub fn primitive_to_named_reference(
+    primitive: JavaPrimitive,
+    name: &str,
+) -> Option<JavaConversion> {
+    if name == wrapper_name(primitive) || name == "java.lang.Object" {
+        Some(JavaConversion::Loose)
+    } else if name == "java.lang.String" {
+        Some(JavaConversion::Inapplicable)
+    } else {
+        None
+    }
+}
+
 pub fn classify<T: JavaConversionTypes>(
     types: &mut T,
     mut actual: T::Type,
@@ -270,11 +394,8 @@ pub fn classify<T: JavaConversionTypes>(
             let Some(name) = types.name(formal) else {
                 return Ok(Unknown);
             };
-            if name == wrapper_name(a) || name == "java.lang.Object" {
-                return Ok(Loose);
-            }
-            if name == "java.lang.String" {
-                return Ok(Inapplicable);
+            if let Some(decided) = primitive_to_named_reference(a, name) {
+                return Ok(decided);
             }
             return Ok(match types.boxed_widening(a, formal)? {
                 Some(true) => Loose,

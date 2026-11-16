@@ -5,7 +5,7 @@ use brokk_bifrost_core::analyzer::fq_name::{
 };
 use brokk_bifrost_core::analyzer::model::StructuredTypeIdentityBuilder;
 use brokk_bifrost_core::analyzer::model::{
-    CallableArity, CallableOverrideModifier, ClassLikeKind, CodeUnitType, DispatchExtensibility,
+    CallableArity, CallableOverrideModifier, CodeUnitType, DispatchExtensibility,
     ParameterMetadata, Range, SignatureMetadata, StructuredTypeIdentity, StructuredTypeName,
 };
 use brokk_bifrost_core::analyzer::parsed_file::{
@@ -702,13 +702,7 @@ impl CSharpVisitor<'_, '_, '_> {
                     node,
                     self.source,
                 ))
-                .with_class_like_kind(match node.kind() {
-                    "class_declaration" | "record_declaration" => ClassLikeKind::Class,
-                    "interface_declaration" => ClassLikeKind::Interface,
-                    "struct_declaration" | "record_struct_declaration" => ClassLikeKind::Struct,
-                    "enum_declaration" => ClassLikeKind::Enum,
-                    _ => unreachable!("admitted C# type declaration"),
-                }),
+                .with_class_like_kind(crate::syntax::csharp_nominal_kind(node)),
         );
         self.visit_primary_constructor(node, scope, &code_unit, &name);
 
@@ -1281,6 +1275,11 @@ fn csharp_type_signature(node: Node<'_>, source: &str) -> String {
 }
 
 fn extract_csharp_supertypes(node: Node<'_>, source: &str) -> Vec<String> {
+    // An enum's base list names its underlying integral type, not a supertype
+    // (#7363).
+    if node.kind() == "enum_declaration" {
+        return Vec::new();
+    }
     let Some(base_list) = first_named_child_of_kind(node, "base_list") else {
         return Vec::new();
     };
@@ -2078,6 +2077,7 @@ fn csharp_overload_discriminator(node: Node<'_>, source: &str) -> [u8; 32] {
 #[cfg(test)]
 mod primary_source_tests {
     use super::*;
+    use brokk_bifrost_core::analyzer::model::ClassLikeKind;
     use brokk_bifrost_core::analyzer::structural::kinds::NormalizedKind;
     use brokk_bifrost_test_macros::hardwon;
 
@@ -2085,6 +2085,26 @@ mod primary_source_tests {
         let tree = crate::preprocessor::parse_csharp(source).expect("C# primary tree");
         let file = ProjectFile::new(std::env::temp_dir(), "Primary.cs");
         parse_csharp_file(&file, source, &tree)
+    }
+
+    #[test]
+    #[hardwon("#11253: record structs published class source signature metadata")]
+    fn record_struct_signature_kind_is_struct() {
+        let parsed = parse("record struct Value(int X); record Reference(int X);");
+        for (name, expected) in [
+            ("Value", ClassLikeKind::Struct),
+            ("Reference", ClassLikeKind::Class),
+        ] {
+            let link = parsed
+                .source_declaration_metadata
+                .iter()
+                .find(|link| link.unit.short_name() == name)
+                .expect("nominal metadata");
+            assert_eq!(
+                parsed.signature_metadata[&link.unit][link.metadata_ordinal].class_like_kind(),
+                Some(expected)
+            );
+        }
     }
 
     #[test]

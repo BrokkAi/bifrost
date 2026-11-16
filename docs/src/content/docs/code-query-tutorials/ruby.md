@@ -542,7 +542,8 @@ Only fully static strings provide a `module` role. The interpolated `plugins/#{t
       "code": "unsupported_structural_feature",
       "impact": "incomplete",
       "language": "ruby",
-      "message": "structural adapter for ruby does not support role(s): decorators"
+      "message": "structural adapter for ruby does not support role(s): decorators",
+      "incompleteness": "content"
     }
   ],
   "results": [],

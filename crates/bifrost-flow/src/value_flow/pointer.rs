@@ -2,13 +2,14 @@
 
 use crate::analyzer::semantic::{
     CallBinding, CallBindings, ControlContinuation, ControlEdgeKind, EvidenceCompleteness,
-    IcfgProvider, OracleLimits, PointerAccess, PointerAccessWidth, PointerAlias, PointerByteOffset,
-    PointerIncompleteReason, PointerInvalidation, PointerInvalidationTarget, PointerOrigin,
-    PointerOriginId, PointerOriginKind, PointerRelationStrength, ProcedureHandle, ProcedureId,
-    ProcedurePortKind, ProcedureSemantics, ProgramPointHandle, ProgramPointId, ProofStatus,
-    ScopeEndAt, ScopeEndFact, SemanticArtifactKey, SemanticBudget, SemanticEffect, SemanticPlace,
-    SemanticValueKind, ValueFlowEndpoint, ValueFlowKind, ValueFlowRelation, ValueFlowRelationKind,
-    ValueFlowSnapshot, ValueId,
+    IcfgProvider, LogicalIncompleteSubject, OracleLimits, PointerAccess, PointerAccessWidth,
+    PointerAlias, PointerByteOffset, PointerIncompleteReason, PointerInvalidation,
+    PointerInvalidationTarget, PointerOrigin, PointerOriginId, PointerOriginKind,
+    PointerRelationStrength, ProcedureHandle, ProcedurePortHandle, ProcedurePortKind,
+    ProcedureSemantics, ProgramPointHandle, ProgramPointId, ProofStatus, ScopeEndAt, ScopeEndFact,
+    SemanticBudget, SemanticEffect, SemanticIncompleteReason, SemanticPlace, SemanticValueKind,
+    ValueFlowEndpoint, ValueFlowKind, ValueFlowRelation, ValueFlowRelationKind, ValueFlowSnapshot,
+    ValueId,
 };
 use crate::analyzer::{Language, LanguageDialect};
 use crate::dataflow::{DataflowRequest, IcfgSolveInput, WitnessRetentionLimits};
@@ -109,7 +110,7 @@ struct OriginIdentity {
     id: PointerOriginId,
 }
 
-type ProcedureKey = (SemanticArtifactKey, ProcedureId);
+type ProcedureKey = crate::analyzer::semantic::DurableProcedureKey;
 
 impl OriginIdentity {
     fn new(procedure: &ProcedureHandle, id: PointerOriginId) -> Self {
@@ -157,12 +158,22 @@ struct LifecyclePlacement {
 enum SourceMetadata {
     Alias(usize),
     Lifecycle { alias: usize, fact: usize },
+    Incomplete(PointerIncompleteReason),
 }
 
 #[derive(Debug, Clone)]
 struct AccessSeed {
     procedure: ProcedureHandle,
     access: PointerAccess,
+}
+
+type PointerValueKey = (ProcedureKey, ValueId);
+type PointerTransitions = HashMap<PointerValueKey, Vec<PointerTransition>>;
+
+#[derive(Debug)]
+struct PointerTransition {
+    target: PointerValueKey,
+    boundary: Option<ProgramPointId>,
 }
 
 /// A pointer solve plan contains only rows reachable from its discovered
@@ -175,7 +186,10 @@ pub struct PointerProvenancePlan {
     sources: HashMap<ValueFlowSourceId, SourceMetadata>,
     sinks: HashMap<ValueFlowSinkId, AccessSeed>,
     placement_observations: Box<[ValueFlowSinkId]>,
-    unsupported_procedures: HashSet<(SemanticArtifactKey, ProcedureId)>,
+    unsupported_procedures: HashSet<crate::analyzer::semantic::DurableProcedureKey>,
+    storage_by_procedure:
+        HashMap<crate::analyzer::semantic::DurableProcedureKey, PointerStorageIndex>,
+    pointer_transitions: PointerTransitions,
 }
 
 impl PointerProvenancePlan {
@@ -251,6 +265,20 @@ impl PointerProvenancePlan {
         let mut aliases_by_origin =
             HashMap::<OriginIdentity, Vec<(usize, ValueFlowSourceId)>>::default();
 
+        let mut storage_by_procedure = procedures
+            .iter()
+            .map(|procedure| {
+                let mut index = PointerStorageIndex::new(procedure.semantics());
+                for (owner, alias) in &additional_facts.aliases {
+                    if owner.durable_key() == procedure.durable_key() {
+                        index.record_alias(alias, procedure.semantics());
+                    }
+                }
+                (procedure.durable_key(), index)
+            })
+            .collect::<HashMap<_, _>>();
+        let pointer_transitions =
+            propagate_projected_pointers(&procedures, &bindings, &mut storage_by_procedure);
         for procedure in &procedures {
             let semantics = procedure.semantics();
             for alias in semantics.pointer_aliases() {
@@ -338,11 +366,41 @@ impl PointerProvenancePlan {
                     .push((alias_index, trigger_id));
             }
 
-            for invalidation in semantics.pointer_invalidations() {
+            for fact in semantics.logical_incomplete_facts() {
+                let (
+                    LogicalIncompleteSubject::Value(pointer),
+                    SemanticIncompleteReason::Pointer(
+                        PointerIncompleteReason::UnsupportedOperation,
+                    ),
+                ) = (fact.subject, fact.reason)
+                else {
+                    continue;
+                };
+                if source_specs.len() == MAX_VALUE_FLOW_SOURCES {
+                    return Err(ValueFlowPlanError::LimitExceeded);
+                }
+                let point = procedure
+                    .point_handle(fact.point)
+                    .expect("validated incomplete point");
+                let key = source_event_key(&point, source_specs.len())?;
+                source_specs.push(ValueFlowSourceSpec::new(
+                    key.clone(),
+                    point,
+                    ValueFlowObservationPhase::AfterEffects,
+                    value_carrier(procedure, pointer),
+                    ProofStatus::Proven,
+                    EvidenceCompleteness::Complete,
+                ));
+                source_metadata.insert(
+                    key,
+                    SourceMetadata::Incomplete(PointerIncompleteReason::UnsupportedOperation),
+                );
+            }
+            for invalidation in semantics.logical_pointer_invalidations() {
                 lifecycle.push(LifecycleFact::Invalidation {
                     procedure: procedure.clone(),
                     target: invalidation.target,
-                    row: invalidation.clone(),
+                    row: invalidation,
                     placement: None,
                 });
             }
@@ -351,21 +409,21 @@ impl PointerProvenancePlan {
             for origin in semantics.pointer_origins() {
                 if let PointerOriginKind::StackPlace { place } = &origin.kind {
                     stack_origins_by_place
-                        .entry(place.clone())
+                        .entry(storage_by_procedure[&procedure.durable_key()].base(place))
                         .or_default()
                         .push(origin.id);
                 }
             }
-            for scope_end in semantics.scope_ends() {
+            for scope_end in semantics.logical_scope_ends() {
                 for origin in stack_origins_by_place
-                    .get(&scope_end.place)
+                    .get(scope_end.place)
                     .into_iter()
                     .flatten()
                 {
                     lifecycle.push(LifecycleFact::ScopeEnd {
                         procedure: procedure.clone(),
                         origin: Box::new(OriginIdentity::new(procedure, *origin)),
-                        row: scope_end.clone(),
+                        row: scope_end.to_owned(),
                     });
                 }
             }
@@ -725,6 +783,7 @@ impl PointerProvenancePlan {
             .into_iter()
             .map(|input| {
                 let (snapshot, status) = input.into_parts();
+                let snapshot = snapshot.without_pointer_operand_dependencies();
                 let procedure = snapshot.procedure().clone();
                 let mut pointer_values = aliases
                     .iter()
@@ -760,6 +819,8 @@ impl PointerProvenancePlan {
                     .filter(|relation| !retained_relations.contains(&relation.id))
                 {
                     if go_pointer_assignment_conversion(relation).is_none()
+                        && !storage_by_procedure[&procedure.durable_key()]
+                            .proves_pointer_identity(relation)
                         && relation_touches_values(relation, &pointer_values)
                     {
                         unsupported_procedures.insert(procedure.durable_key());
@@ -818,6 +879,8 @@ impl PointerProvenancePlan {
             sinks,
             placement_observations,
             unsupported_procedures,
+            storage_by_procedure,
+            pointer_transitions,
         })
     }
 }
@@ -871,6 +934,7 @@ impl PointerProvenancePlan {
             .enumerate()
             .map(|(index, (id, _))| (**id, index))
             .collect::<HashMap<_, _>>();
+        let mut moved_values_by_alias = HashMap::<usize, PointerMoveOrder>::default();
         let mut origins_by_access =
             HashMap::<(usize, OriginIdentity, PointerByteOffset), usize>::default();
         let observation_meetings = flow
@@ -890,16 +954,29 @@ impl PointerProvenancePlan {
             let (alias_index, lifecycle_fact) = match source {
                 SourceMetadata::Alias(alias_index) => (alias_index, None),
                 SourceMetadata::Lifecycle { alias, fact } => (alias, Some(fact)),
+                SourceMetadata::Incomplete(reason) => {
+                    push_reason(&mut accesses[access_index].incomplete_reasons, reason);
+                    continue;
+                }
             };
             let seed = &self.aliases[alias_index];
+            let access = &accesses[access_index];
+            let byte_offset = if self.storage_by_procedure[&access.procedure.durable_key()]
+                .projected_pointers
+                .contains(&access.access.pointer)
+            {
+                PointerByteOffset::Unknown
+            } else {
+                seed.alias.byte_offset
+            };
             let result_origin_index = *origins_by_access
-                .entry((access_index, seed.identity.clone(), seed.alias.byte_offset))
+                .entry((access_index, seed.identity.clone(), byte_offset))
                 .or_insert_with(|| {
                     let bounds = bounds_for(
                         &seed.origin_procedure,
                         &accesses[access_index].procedure,
                         &seed.origin,
-                        seed.alias.byte_offset,
+                        byte_offset,
                         accesses[access_index].access.width,
                     );
                     if let PointerBounds::Incomplete(reason) = bounds {
@@ -910,7 +987,7 @@ impl PointerProvenancePlan {
                         .push(PointerProvenanceOrigin {
                             procedure: seed.origin_procedure.clone(),
                             origin: seed.origin.clone(),
-                            byte_offset: seed.alias.byte_offset,
+                            byte_offset,
                             strength: seed.alias.strength,
                             bounds,
                             invalidations_before: Vec::new(),
@@ -925,6 +1002,33 @@ impl PointerProvenancePlan {
                     &mut accesses[access_index].incomplete_reasons,
                     PointerIncompleteReason::AmbiguousAlias,
                 );
+            }
+            if let PointerOriginKind::StackPlace { place } = &seed.origin.kind {
+                let semantics = seed.origin_procedure.semantics();
+                let storage = &self.storage_by_procedure[&seed.origin_procedure.durable_key()];
+                let base = storage.base(place);
+                let move_before = storage.move_reaches.get(&base).is_some_and(|reached| {
+                    if seed.origin_procedure == accesses[access_index].procedure {
+                        reached.contains(&access_point)
+                    } else {
+                        let order = moved_values_by_alias.entry(alias_index).or_insert_with(|| {
+                            pointer_values_after_move(&self.pointer_transitions, seed, reached)
+                        });
+                        let access = (
+                            accesses[access_index].procedure.durable_key(),
+                            accesses[access_index].access.pointer,
+                        );
+                        order.affected.contains(&access) || !order.reached.contains(&access)
+                    }
+                });
+                if semantics.locator().language() == LanguageDialect::Standard(Language::Rust)
+                    && move_before
+                {
+                    push_reason(
+                        &mut accesses[access_index].incomplete_reasons,
+                        PointerIncompleteReason::UnsupportedOperation,
+                    );
+                }
             }
             let access_procedure = accesses[access_index].procedure.clone();
             let output = &mut accesses[access_index].origins[result_origin_index];
@@ -1056,6 +1160,438 @@ impl PointerProvenancePlan {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum StorageNode {
+    Place(SemanticPlace),
+    Value(ValueId),
+}
+
+/// Index structural storage producers once, then memoize each functional
+/// projection chain. Ambiguous producers and cycles retain unresolved places.
+#[derive(Debug)]
+struct PointerStorageIndex {
+    bases: HashMap<SemanticPlace, SemanticPlace>,
+    move_reaches: HashMap<SemanticPlace, HashSet<ProgramPointId>>,
+    projected_pointers: HashSet<ValueId>,
+    exact_aliases: HashMap<ValueId, HashSet<(PointerOriginId, i128)>>,
+    exact_aliases_at: HashMap<(ProgramPointId, ValueId), HashSet<(PointerOriginId, i128)>>,
+    inexact_aliases: HashSet<ValueId>,
+}
+
+impl PointerStorageIndex {
+    fn new(semantics: &ProcedureSemantics) -> Self {
+        use crate::analyzer::semantic::{MemoryLocationKind, SemanticLocator, SemanticRole};
+        let mut next = HashMap::<StorageNode, StorageNode>::default();
+        let mut ambiguous = HashSet::default();
+        let mut insert = |source: StorageNode, target: StorageNode| {
+            if ambiguous.contains(&source) {
+                return;
+            }
+            if next.get(&source).is_some_and(|old| *old != target) {
+                next.remove(&source);
+                ambiguous.insert(source);
+            } else {
+                next.insert(source, target);
+            }
+        };
+        for value in semantics.values() {
+            if matches!(
+                value.kind,
+                SemanticValueKind::Local | SemanticValueKind::Parameter { .. }
+            ) && let Some(source) = semantics.source_mapping(value.source)
+            {
+                let locator = &source.locator;
+                insert(
+                    StorageNode::Value(value.id),
+                    StorageNode::Place(SemanticPlace::LocalBinding(SemanticLocator::new(
+                        locator.mount(),
+                        locator.path().clone(),
+                        locator.language(),
+                        locator.declaration().clone(),
+                        SemanticRole::Value,
+                        locator.anchor(),
+                    ))),
+                );
+            }
+        }
+        for location in semantics.memory_locations() {
+            if let MemoryLocationKind::Field { base, .. } = location.kind {
+                insert(
+                    StorageNode::Place(SemanticPlace::MemoryLocation(location.id)),
+                    StorageNode::Value(base),
+                );
+            }
+        }
+        for event in semantics
+            .points()
+            .iter()
+            .flat_map(|point| point.events.iter())
+        {
+            match event.effect {
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::Local | ValueFlowKind::Parameter | ValueFlowKind::Receiver,
+                    source,
+                    target,
+                } if !matches!(
+                    semantics.value(target).map(|value| &value.kind),
+                    Some(SemanticValueKind::Local | SemanticValueKind::Parameter { .. })
+                ) =>
+                {
+                    insert(StorageNode::Value(target), StorageNode::Value(source));
+                }
+                SemanticEffect::MemoryLoad {
+                    location, result, ..
+                } => {
+                    insert(
+                        StorageNode::Value(result),
+                        StorageNode::Place(SemanticPlace::MemoryLocation(location)),
+                    );
+                }
+                _ => {}
+            }
+        }
+        let mut resolved = HashMap::<StorageNode, Option<SemanticPlace>>::default();
+        for start in next.keys() {
+            if resolved.contains_key(start) {
+                continue;
+            }
+            let mut path = Vec::new();
+            let mut seen = HashSet::default();
+            let mut current = start.clone();
+            let result = loop {
+                if let Some(result) = resolved.get(&current) {
+                    break result.clone();
+                }
+                if !seen.insert(current.clone()) {
+                    break None;
+                }
+                path.push(current.clone());
+                if let StorageNode::Place(SemanticPlace::LocalBinding(binding)) = &current {
+                    break Some(SemanticPlace::LocalBinding(binding.clone()));
+                }
+                let Some(target) = next.get(&current) else {
+                    break None;
+                };
+                current = target.clone();
+            };
+            for node in path {
+                resolved.insert(node, result.clone());
+            }
+        }
+        let bases = resolved
+            .into_iter()
+            .filter_map(|(node, base)| match (node, base) {
+                (StorageNode::Place(place), Some(base)) => Some((place, base)),
+                _ => None,
+            })
+            .collect();
+        let field_loads = semantics
+            .points()
+            .iter()
+            .flat_map(|point| point.events.iter())
+            .filter_map(|event| match event.effect {
+                SemanticEffect::MemoryLoad {
+                    location, result, ..
+                } if semantics.memory_location(location).is_some_and(|location| {
+                    matches!(location.kind, MemoryLocationKind::Field { .. })
+                }) =>
+                {
+                    Some(result)
+                }
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        let mut projected = HashSet::default();
+        let mut successors = HashMap::<ValueId, Vec<ValueId>>::default();
+        for point in semantics.points() {
+            for event in &point.events {
+                match event.effect {
+                    SemanticEffect::ValueFlow { kind: ValueFlowKind::AddressOf, source, target }
+                        if field_loads.contains(&source) && point.events.iter().any(|event| matches!(event.effect,
+                            SemanticEffect::ValueFlow { kind: ValueFlowKind::Local, target: alias, .. } if alias == target)) => { projected.insert(target); }
+                    SemanticEffect::ValueFlow { kind: ValueFlowKind::AddressOf, .. } => {}
+                    SemanticEffect::ValueFlow { source, target, .. } => { successors.entry(source).or_default().push(target); }
+                    SemanticEffect::Assignment { target, value } => { successors.entry(value).or_default().push(target); }
+                    _ => {}
+                }
+            }
+        }
+        let mut pending = projected.iter().copied().collect::<Vec<_>>();
+        while let Some(value) = pending.pop() {
+            for target in successors.get(&value).into_iter().flatten() {
+                if projected.insert(*target) {
+                    pending.push(*target);
+                }
+            }
+        }
+        let mut index = Self {
+            bases,
+            move_reaches: HashMap::default(),
+            projected_pointers: projected,
+            exact_aliases: HashMap::default(),
+            exact_aliases_at: HashMap::default(),
+            inexact_aliases: HashSet::default(),
+        };
+        for alias in semantics.pointer_aliases() {
+            index.record_alias(alias, semantics);
+        }
+        if semantics.locator().language() == LanguageDialect::Standard(Language::Rust) {
+            let addressed = semantics
+                .pointer_origins()
+                .iter()
+                .filter_map(|origin| match &origin.kind {
+                    PointerOriginKind::StackPlace { place } => Some(index.base(place)),
+                    PointerOriginKind::Allocation { .. } => None,
+                })
+                .collect::<HashSet<_>>();
+            for moved in semantics.move_outs() {
+                let base = index.base(&moved.place);
+                if addressed.contains(&base) {
+                    index
+                        .move_reaches
+                        .entry(base)
+                        .or_default()
+                        .insert(moved.point);
+                }
+            }
+        }
+        let mut control = HashMap::<ProgramPointId, Vec<ProgramPointId>>::default();
+        for edge in semantics.control_edges() {
+            control
+                .entry(edge.source_point)
+                .or_default()
+                .push(edge.target_point);
+        }
+        for reached in index.move_reaches.values_mut() {
+            let mut pending = reached.iter().copied().collect::<Vec<_>>();
+            while let Some(point) = pending.pop() {
+                for target in control.get(&point).into_iter().flatten() {
+                    if reached.insert(*target) {
+                        pending.push(*target);
+                    }
+                }
+            }
+        }
+        index
+    }
+
+    fn record_alias(&mut self, alias: &PointerAlias, semantics: &ProcedureSemantics) {
+        if let PointerByteOffset::Exact(offset) = alias.byte_offset
+            && alias.strength == PointerRelationStrength::Must
+            && semantics
+                .evidence_row(alias.evidence)
+                .is_some_and(|evidence| {
+                    evidence
+                        .proof
+                        .establishes_complete_evidence(&evidence.completeness)
+                })
+        {
+            self.exact_aliases
+                .entry(alias.pointer)
+                .or_default()
+                .insert((alias.origin, offset));
+            self.exact_aliases_at
+                .entry((alias.point, alias.pointer))
+                .or_default()
+                .insert((alias.origin, offset));
+        } else {
+            self.inexact_aliases.insert(alias.pointer);
+        }
+    }
+
+    /// Native Must aliases can prove an address-preserving coercion even
+    /// when a generic runtime-class conversion cannot preserve class.
+    fn proves_pointer_identity(&self, relation: &ValueFlowRelation) -> bool {
+        let (ValueFlowEndpoint::Value(source), ValueFlowEndpoint::Value(target)) =
+            (&relation.source, &relation.target)
+        else {
+            return false;
+        };
+        if source.procedure() != relation.point.procedure()
+            || target.procedure() != relation.point.procedure()
+            || self.inexact_aliases.contains(&source.id())
+            || self.inexact_aliases.contains(&target.id())
+        {
+            return false;
+        }
+        self.exact_aliases
+            .get(&source.id())
+            .zip(
+                self.exact_aliases_at
+                    .get(&(relation.point.id(), target.id())),
+            )
+            .is_some_and(|(source, target)| !source.is_empty() && source == target)
+    }
+
+    fn base(&self, place: &SemanticPlace) -> SemanticPlace {
+        self.bases.get(place).unwrap_or(place).clone()
+    }
+}
+
+/// Propagate unknown projected offsets through the same local and exact call
+/// bindings as pointer values, including callee-formal reborrows and returns.
+fn propagate_projected_pointers(
+    procedures: &[ProcedureHandle],
+    bindings: &[ValueFlowInput<CallBindings>],
+    storage: &mut HashMap<ProcedureKey, PointerStorageIndex>,
+) -> PointerTransitions {
+    let mut next = PointerTransitions::default();
+    let mut ports = HashMap::<(ProcedureKey, ProcedurePortKind), Vec<ValueId>>::default();
+    for procedure in procedures {
+        let owner = procedure.durable_key();
+        for value in procedure.semantics().values() {
+            let kind = match value.kind {
+                SemanticValueKind::Parameter { ordinal, .. } => {
+                    Some(ProcedurePortKind::Parameter { ordinal })
+                }
+                SemanticValueKind::Receiver { .. } => Some(ProcedurePortKind::Receiver),
+                SemanticValueKind::Return => Some(ProcedurePortKind::NormalReturn),
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                ports
+                    .entry((owner.clone(), kind))
+                    .or_default()
+                    .push(value.id);
+            }
+        }
+        for event in procedure
+            .semantics()
+            .points()
+            .iter()
+            .flat_map(|point| point.events.iter())
+        {
+            let pair = match event.effect {
+                SemanticEffect::Assignment { target, value } => Some((value, target)),
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::AddressOf,
+                    ..
+                } => None,
+                SemanticEffect::ValueFlow { source, target, .. } => Some((source, target)),
+                _ => None,
+            };
+            if let Some((source, target)) = pair {
+                next.entry((owner.clone(), source))
+                    .or_default()
+                    .push(PointerTransition {
+                        target: (owner.clone(), target),
+                        boundary: None,
+                    });
+            }
+        }
+    }
+    for input in bindings {
+        let bindings = input.value();
+        if !call_binding_is_proven_complete(bindings) {
+            continue;
+        }
+        let caller = bindings.call().procedure().durable_key();
+        let callee = bindings.callee();
+        for (kind, actual) in proven_pointer_actuals(bindings) {
+            for formal in ports
+                .get(&(callee.durable_key(), kind))
+                .into_iter()
+                .flatten()
+            {
+                next.entry((caller.clone(), actual))
+                    .or_default()
+                    .push(PointerTransition {
+                        target: (callee.durable_key(), *formal),
+                        boundary: Some(
+                            bindings
+                                .call()
+                                .procedure()
+                                .semantics()
+                                .call_site(bindings.call().id())
+                                .expect("validated call")
+                                .point,
+                        ),
+                    });
+            }
+        }
+        for binding in bindings.bindings() {
+            if let CallBinding::NormalReturn { result, formal, .. } = binding {
+                for value in ports
+                    .get(&(callee.durable_key(), formal.kind()))
+                    .into_iter()
+                    .flatten()
+                {
+                    next.entry((callee.durable_key(), *value))
+                        .or_default()
+                        .push(PointerTransition {
+                            target: (caller.clone(), result.id()),
+                            boundary: Some(callee.semantics().normal_exit_point()),
+                        });
+                }
+            }
+        }
+    }
+    let mut seen = storage
+        .iter()
+        .flat_map(|(owner, index)| {
+            index
+                .projected_pointers
+                .iter()
+                .map(|value| (owner.clone(), *value))
+        })
+        .collect::<HashSet<_>>();
+    let mut pending = seen.iter().cloned().collect::<Vec<_>>();
+    while let Some(key) = pending.pop() {
+        for target in next.get(&key).into_iter().flatten() {
+            if seen.insert(target.target.clone()) {
+                pending.push(target.target.clone());
+            }
+        }
+    }
+    for (owner, value) in seen {
+        if let Some(index) = storage.get_mut(&owner) {
+            index.projected_pointers.insert(value);
+        }
+    }
+    next
+}
+
+#[derive(Default)]
+struct PointerMoveOrder {
+    affected: HashSet<PointerValueKey>,
+    reached: HashSet<PointerValueKey>,
+}
+
+/// Reuse indexed carrier/call transitions once per alias. A move affects a
+/// helper only across a call boundary reachable after that move, and only
+/// when this pointer value reaches the matching actual/formal binding.
+fn pointer_values_after_move(
+    transitions: &PointerTransitions,
+    seed: &AliasSeed,
+    move_reaches: &HashSet<ProgramPointId>,
+) -> PointerMoveOrder {
+    let origin = seed.origin_procedure.durable_key();
+    let after_return = seed.procedure != seed.origin_procedure
+        && move_reaches.contains(&seed.origin_procedure.semantics().normal_exit_point());
+    let start = (seed.procedure.durable_key(), seed.alias.pointer);
+    let mut seen = HashSet::default();
+    let mut order = PointerMoveOrder::default();
+    let mut pending = vec![(start, after_return)];
+    while let Some((key, after_move)) = pending.pop() {
+        if !seen.insert((key.clone(), after_move)) {
+            continue;
+        }
+        order.reached.insert(key.clone());
+        if after_move {
+            order.affected.insert(key.clone());
+        }
+        for transition in transitions.get(&key).into_iter().flatten() {
+            let after_move = after_move
+                || (key.0 == origin
+                    && transition
+                        .boundary
+                        .is_some_and(|point| move_reaches.contains(&point)));
+            pending.push((transition.target.clone(), after_move));
+        }
+    }
+    order
+}
+
 /// Go emits this descriptor for assignment-context conversions, which retain
 /// the pointer's address. Other class-identity-excluded operations stay typed
 /// incomplete when they touch a tracked pointer value.
@@ -1145,13 +1681,25 @@ fn normal_return_value_facts(procedure: &ProcedureHandle) -> NormalReturnValueFa
     let mut predecessors = HashMap::<ValueId, Vec<ValueId>>::default();
     let mut reachable_values = HashSet::default();
     let mut return_points = Vec::new();
+    let rust = semantics.locator().language() == LanguageDialect::Standard(Language::Rust);
     for point in semantics.points() {
-        for event in &point.events {
+        for (index, event) in point.events.iter().enumerate() {
             match event.effect {
-                SemanticEffect::Assignment { target, value } => {
+                SemanticEffect::Assignment { target, value }
+                    if !rust || !point.assignment_has_transfer_marker(index) =>
+                {
                     predecessors.entry(target).or_default().push(value);
                 }
-                SemanticEffect::ValueFlow { source, target, .. } => {
+                SemanticEffect::ValueFlow {
+                    source,
+                    target,
+                    kind,
+                } if !rust
+                    || (kind.preserves_runtime_class()
+                        && !matches!(kind, ValueFlowKind::AddressOf)) =>
+                {
+                    // A returned address does not return the pointer stored
+                    // there; a loaded pointer likewise needs contents evidence.
                     predecessors.entry(target).or_default().push(source);
                 }
                 SemanticEffect::ProcedureReturn { value: Some(value) } => {
@@ -1407,6 +1955,16 @@ fn lifecycle_observation(
 }
 
 fn value_carrier(procedure: &ProcedureHandle, value: ValueId) -> ValueFlowCarrier {
+    // Return effects use the normal-return port, including while explicit
+    // returns traverse cleanup continuations before the actual exit edge.
+    // A Return value carrier would miss sources that already reached that port.
+    if procedure
+        .semantics()
+        .value(value)
+        .is_some_and(|value| matches!(value.kind, SemanticValueKind::Return))
+    {
+        return ValueFlowCarrier::Port(ProcedurePortHandle::normal_return(procedure.clone()));
+    }
     ValueFlowCarrier::for_value(
         procedure
             .value_handle(value)
@@ -1563,6 +2121,7 @@ mod tests {
     use crate::dataflow::SolverBudget;
     use crate::inline_project::InlineTestProject;
     use crate::value_flow::{ClosureLimits, discover_closure};
+    use brokk_bifrost_test_macros::hardwon;
 
     #[test]
     fn extent_checks_cover_exact_ranges_and_checked_overflow() {
@@ -1589,6 +2148,299 @@ mod tests {
     }
 
     #[test]
+    fn rust_field_storage_ends_with_its_base_only() {
+        const PROJECTED_REBORROW: &str = "let p; { let x = P { f: 1 }; p = &x as *const P; } let q = unsafe { &(*p).f as *const i32 }; unsafe { *q }";
+        const MOVED_BEFORE_HELPER: &str =
+            "let p; { let x: P = P { f: 1 }; p = &x as *const P; let moved = x; } inspect(p)";
+        const MOVED_AFTER_HELPER: &str =
+            "let x: P = P { f: 1 }; let result = inspect(&x as *const P); let moved = x; result";
+        const UNKNOWN_POINTER_JOIN: &str = "let x: i32 = 1; let p = if flag { &x as *const i32 } else { 1usize as *const i32 }; unsafe { *p }";
+        const LOADED_POINTER: &str = "let x: i32 = 1; let q: *const i32 = &x; let p: *const *const i32 = &q; let loaded: *const i32 = unsafe { *p }; unsafe { *loaded }";
+        const CONDITIONAL_DEFERRED_DROP: &str = "let p; { let x: Dropping; if flag { x = Dropping { f: 1 }; } else { x = Dropping { f: 2 }; } p = &x.f as *const i32; } unsafe { *p }";
+        const UNINITIALIZED_UNUSED: &str = "let x: Dropping; 0";
+        const RETURNED_LOAD: &str =
+            "let x: i32 = 1; let loaded = load_return(&x as *const i32); unsafe { *loaded }";
+        const EXTERNALLY_WRITTEN_POINTER: &str = "let x: i32 = 1; let mut q: *const i32 = &x; let p: *mut *const i32 = &mut q; unsafe { opaque(p); } let loaded: *const i32 = unsafe { *p }; unsafe { *loaded }";
+        for (body, expired) in [
+            (
+                "let pointer; { let x = P { f: 1 }; pointer = &x.f as *const i32; } unsafe { *pointer }",
+                true,
+            ),
+            (
+                "let pointer; { let x = Outer { inner: P { f: 1 } }; pointer = &x.inner.f as *const i32; } unsafe { *pointer }",
+                true,
+            ),
+            (
+                "let x = P { f: 1 }; let pointer = &x.f as *const i32; unsafe { *pointer }",
+                false,
+            ),
+            (
+                "let y = P { f: 1 }; let pointer = &y.f as *const i32; { let x = P { f: 2 }; let other = &x.f; } unsafe { *pointer }",
+                false,
+            ),
+            (
+                "let p; { let x: i32 = 1; p = &x as *const i32; } let pp = &p as *const *const i32; unsafe { let value = *pp; } 0",
+                false,
+            ),
+            (
+                "let p; { let x: i32 = 1; p = &x as *const i32; } let q = unsafe { &*p as *const i32 }; unsafe { *q }",
+                true,
+            ),
+            (PROJECTED_REBORROW, true),
+            (MOVED_BEFORE_HELPER, true),
+            (MOVED_AFTER_HELPER, false),
+            (UNKNOWN_POINTER_JOIN, false),
+            (LOADED_POINTER, false),
+            (EXTERNALLY_WRITTEN_POINTER, false),
+            ("let p = scalar_return(1); unsafe { *p }", true),
+            ("let p = explicit_return(1); unsafe { *p }", true),
+            ("let p = explicit_local_return(); unsafe { *p }", true),
+            ("let p = explicit_mut_return(); unsafe { *p }", true),
+            ("let p = explicit_raw_return(); unsafe { *p }", true),
+            ("let p = explicit_raw_mut_return(); unsafe { *p }", true),
+            ("let p = dropping_field_return(); unsafe { *p }", true),
+            (CONDITIONAL_DEFERRED_DROP, true),
+            (UNINITIALIZED_UNUSED, false),
+            ("live_parameter(Outer { inner: P { f: 1 } })", false),
+            ("let p = field_return(P { f: 1 }); unsafe { *p }", true),
+            (
+                "let p = nested_return(Outer { inner: P { f: 1 } }); unsafe { *p }",
+                true,
+            ),
+            (
+                "let pp = address_return(); unsafe { let value = *pp; } 0",
+                true,
+            ),
+            (RETURNED_LOAD, false),
+        ] {
+            // The ownership producer deliberately leaves a plain nominal
+            // type open. An exact negative Copy impl proves these moves.
+            let move_proof = if body == MOVED_BEFORE_HELPER || body == MOVED_AFTER_HELPER {
+                "impl !core::marker::Copy for P {}"
+            } else {
+                ""
+            };
+            let source = format!(
+                "struct P {{ f: i32 }} {move_proof} struct Outer {{ inner: P }} fn inspect(pointer: *const P) -> i32 {{ unsafe {{ (*pointer).f }} }} struct Dropping {{ f: i32 }} impl Drop for Dropping {{ fn drop(&mut self) {{}} }} fn dropping_field_return() -> *const i32 {{ let x: Dropping; x = Dropping {{ f: 1 }}; return &x.f; }} fn explicit_local_return() -> *const i32 {{ let x: i32 = 1; return &x; }} fn explicit_mut_return() -> *mut i32 {{ let mut x: i32 = 1; return &mut x; }} fn explicit_raw_return() -> *const i32 {{ let x: i32 = 1; return &raw const x; }} fn explicit_raw_mut_return() -> *mut i32 {{ let mut x: i32 = 1; return &raw mut x; }} fn explicit_return(x: i32) -> *const i32 {{ return &x; }} fn live_parameter(x: Outer) -> i32 {{ let p = &x.inner.f as *const i32; unsafe {{ *p }} }} fn scalar_return(x: i32) -> *const i32 {{ &x }} fn field_return(x: P) -> *const i32 {{ &x.f }} fn nested_return(x: Outer) -> *const i32 {{ &x.inner.f }} fn address_return() -> *const *const i32 {{ let x: i32 = 1; let p: *const i32 = &x; &p }} fn load_return(x: *const i32) -> *const i32 {{ let q = x; let p = &q as *const *const i32; unsafe {{ *p }} }} fn entry(flag: bool) -> i32 {{ {body} }}"
+            );
+            let project = InlineTestProject::with_language(Language::Rust)
+                .file("pointers.rs", &source)
+                .build();
+            let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+            let cancellation = CancellationToken::default();
+            let mut budget = SemanticBudget::default();
+            let artifact = workspace
+                .materialize_program_semantics(
+                    &project.file("pointers.rs"),
+                    &mut SemanticRequest::new(&mut budget, &cancellation),
+                )
+                .unwrap()
+                .available_value()
+                .cloned()
+                .unwrap();
+            let root = artifact
+                .procedures()
+                .iter()
+                .find(|procedure| {
+                    procedure
+                        .locator()
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some("entry")
+                })
+                .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+                .unwrap();
+            if body == MOVED_BEFORE_HELPER || body == MOVED_AFTER_HELPER {
+                assert!(
+                    !root.semantics().move_outs().is_empty(),
+                    "move ordering controls require a native move fact: {source}"
+                );
+            }
+            let closure = discover_closure(
+                &workspace,
+                &root,
+                ClosureLimits { max_procedures: 32 },
+                &mut budget,
+                &cancellation,
+            )
+            .unwrap();
+            let plan = PointerProvenancePlan::try_new(
+                root.clone(),
+                closure.snapshots.clone(),
+                closure.bindings.clone(),
+            )
+            .unwrap();
+            let provider = workspace.icfg_provider();
+            let icfg = provider
+                .snapshot(
+                    &root,
+                    IcfgSnapshotLimits::default(),
+                    &mut SemanticRequest::new(&mut budget, &cancellation),
+                )
+                .unwrap();
+            let input = IcfgSolveInput::from_outcome(&icfg).unwrap();
+            let mut solver_budget = SolverBudget::default();
+            let result = solve_pointer_provenance_on_snapshot(
+                &provider,
+                &plan,
+                input,
+                OracleLimits::default(),
+                &mut budget,
+                &mut DataflowRequest::new(&mut solver_budget, &cancellation),
+            )
+            .unwrap();
+            if body == UNINITIALIZED_UNUSED {
+                assert!(result.accesses().is_empty(), "{source}");
+                assert!(root.semantics().logical_drops().next().is_none());
+                continue;
+            }
+            if body == CONDITIONAL_DEFERRED_DROP {
+                assert!(root.semantics().logical_incomplete_facts().any(|fact| matches!(
+                    fact.reason,
+                    SemanticIncompleteReason::Lifecycle(crate::analyzer::semantic::LifecycleIncompleteReason::UnsupportedCleanup)
+                )));
+                assert!(root.semantics().logical_drops().next().is_none());
+            }
+            assert!(!result.accesses().is_empty(), "{source}");
+            if body == LOADED_POINTER || body == EXTERNALLY_WRITTEN_POINTER || body == RETURNED_LOAD
+            {
+                let final_read = u32::try_from(source.rfind("*loaded").unwrap()).unwrap();
+                let access = result
+                    .accesses()
+                    .iter()
+                    .find(|access| {
+                        access
+                            .procedure
+                            .semantics()
+                            .source_mapping(access.access.source)
+                            .unwrap()
+                            .locator
+                            .anchor()
+                            .span()
+                            .start()
+                            .byte_offset()
+                            == final_read
+                    })
+                    .expect("loaded pointer is dereferenced");
+                assert!(
+                    access.origins.is_empty(),
+                    "an address is not its contents: {access:?}"
+                );
+                assert!(
+                    access
+                        .incomplete_reasons
+                        .contains(&PointerIncompleteReason::UnsupportedOperation),
+                    "{access:?}"
+                );
+                continue;
+            }
+            assert!(
+                result
+                    .accesses()
+                    .iter()
+                    .any(|access| !access.origins.is_empty()),
+                "{source}"
+            );
+            assert!(
+                result
+                    .accesses()
+                    .iter()
+                    .all(|access| access.origins.len() == 1),
+                "{source}: {:?}",
+                result.accesses()
+            );
+            if body == MOVED_AFTER_HELPER {
+                for (strength, offset) in [
+                    (PointerRelationStrength::May, PointerByteOffset::Exact(0)),
+                    (PointerRelationStrength::Must, PointerByteOffset::Unknown),
+                ] {
+                    let mut alias = root.semantics().pointer_aliases()[0].clone();
+                    alias.strength = strength;
+                    alias.byte_offset = offset;
+                    let altered = PointerProvenancePlan::try_new_with_additional_facts(
+                        root.clone(),
+                        closure.snapshots.clone(),
+                        closure.bindings.clone(),
+                        PointerProvenanceAdditionalFacts {
+                            aliases: vec![(root.clone(), alias)],
+                            ..PointerProvenanceAdditionalFacts::default()
+                        },
+                    )
+                    .unwrap();
+                    assert!(!altered.unsupported_procedures.is_empty());
+                }
+                assert!(
+                    result.accesses().iter().all(|access| {
+                        !access
+                            .incomplete_reasons
+                            .contains(&PointerIncompleteReason::UnsupportedOperation)
+                    }),
+                    "unsupported={:?}; accesses={:?}",
+                    plan.unsupported_procedures,
+                    result.accesses()
+                );
+            }
+            if body == UNKNOWN_POINTER_JOIN {
+                assert!(result.accesses().iter().any(|access| {
+                    access
+                        .incomplete_reasons
+                        .contains(&PointerIncompleteReason::UnsupportedOperation)
+                }));
+            }
+            if body == MOVED_BEFORE_HELPER {
+                assert!(result.accesses().iter().any(|access| {
+                    access
+                        .incomplete_reasons
+                        .contains(&PointerIncompleteReason::UnsupportedOperation)
+                }));
+            }
+            if body == PROJECTED_REBORROW {
+                let final_read = u32::try_from(source.rfind("*q").unwrap()).unwrap();
+                let access = result
+                    .accesses()
+                    .iter()
+                    .find(|access| {
+                        access
+                            .procedure
+                            .semantics()
+                            .source_mapping(access.access.source)
+                            .unwrap()
+                            .locator
+                            .anchor()
+                            .span()
+                            .start()
+                            .byte_offset()
+                            == final_read
+                    })
+                    .unwrap();
+                assert!(
+                    access
+                        .origins
+                        .iter()
+                        .all(|origin| origin.byte_offset == PointerByteOffset::Unknown
+                            && matches!(origin.bounds, PointerBounds::Incomplete(_))),
+                    "{access:?}"
+                );
+            }
+            assert_eq!(
+                result
+                    .accesses()
+                    .iter()
+                    .flat_map(|access| &access.origins)
+                    .any(|origin| !origin.scope_ends_before.is_empty()),
+                expired,
+                "{source}; accesses={:?}",
+                result.accesses()
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#10561: an address-derived Go pointer actual lost its static class and weakened helper provenance"
+    )]
     fn origins_cross_helper_parameters_returns_and_loop_cycles() {
         let project = InlineTestProject::with_language(Language::Go)
             .file(
@@ -1646,6 +2498,58 @@ mod tests {
             &cancellation,
         )
         .expect("fixture call closure resolves");
+        assert_eq!(closure.bindings.len(), 3, "three selected helper calls");
+        let mut callees = closure
+            .bindings
+            .iter()
+            .map(|input| {
+                input
+                    .value()
+                    .callee()
+                    .semantics()
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    .expect("named pointer helper")
+            })
+            .collect::<Vec<_>>();
+        callees.sort_unstable();
+        assert_eq!(callees, ["bounce", "read", "readExact"]);
+        for input in &closure.bindings {
+            let groups = input
+                .value()
+                .bindings()
+                .iter()
+                .filter_map(|binding| match binding {
+                    CallBinding::ArgumentGroup(group) => Some(group),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                groups.len(),
+                1,
+                "one argument group per helper call: {input:?}"
+            );
+            for group in groups {
+                assert!(group.coverage().is_exhaustive(), "{input:?}");
+                assert_eq!(
+                    group.mappings().len(),
+                    1,
+                    "one pointer actual per helper: {input:?}"
+                );
+                for mapping in group.mappings() {
+                    assert_eq!(mapping.proof(), &ProofStatus::Proven, "{input:?}");
+                    assert_eq!(
+                        mapping.completeness(),
+                        &EvidenceCompleteness::Complete,
+                        "{input:?}"
+                    );
+                    assert_eq!(mapping.value().conversion(), None, "{input:?}");
+                }
+            }
+        }
         let closure_binding_count = closure.bindings.len();
         let plan =
             PointerProvenancePlan::try_new(root.clone(), closure.snapshots, closure.bindings)
@@ -1775,6 +2679,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#10561: an inferred Go pointer actual lost its static class and hid helper invalidation"
+    )]
     fn helper_pointer_invalidation_reaches_only_later_caller_accesses() {
         let project = InlineTestProject::with_language(Language::Go)
             .file(
@@ -1832,6 +2739,14 @@ mod tests {
                 &cancellation,
             )
             .expect("helper call closure resolves");
+            assert!(
+                closure
+                    .bindings
+                    .iter()
+                    .all(|binding| binding.status().is_complete()),
+                "pointer helper conversions must be complete: {:?}",
+                closure.bindings
+            );
             let release = closure
                 .procedures
                 .iter()

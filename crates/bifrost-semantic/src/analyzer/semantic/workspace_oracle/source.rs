@@ -482,9 +482,7 @@ pub struct ObservedSource {
 /// Only the artifact's own honest failure state survives; no projection is
 /// invented for a file whose semantics never materialized.
 #[doc(hidden)]
-pub fn source_outcome_without_value<T>(
-    outcome: SemanticOutcome<Arc<SemanticArtifact>>,
-) -> SemanticOutcome<T> {
+pub fn source_outcome_without_value<T, U>(outcome: SemanticOutcome<U>) -> SemanticOutcome<T> {
     match outcome {
         SemanticOutcome::Unknown { work, .. } => SemanticOutcome::Unknown {
             partial: None,
@@ -526,6 +524,7 @@ pub fn source_outcome_without_value<T>(
 #[doc(hidden)]
 pub fn source_call_sites(
     artifact: &Arc<SemanticArtifact>,
+    procedures: &[ProcedureHandle],
     range: Range,
     limit: usize,
     staged: &mut WorkStager,
@@ -533,7 +532,14 @@ pub fn source_call_sites(
 ) -> Result<(Vec<CallSiteHandle>, bool), Interruption> {
     let mut best_width = None;
     let mut calls = Vec::new();
-    for procedure_id in artifact.procedures_with_call_source_containing(range) {
+    let indexed = artifact.procedures_with_call_source_containing(range);
+    for procedure_handle in procedures {
+        if procedure_handle.durable_key().2
+            == crate::analyzer::semantic::ProcedureInterpretation::Base
+            && !indexed.contains(&procedure_handle.id())
+        {
+            continue;
+        }
         if cancellation.is_cancelled() {
             return Err(Interruption::Cancelled);
         }
@@ -541,12 +547,7 @@ pub fn source_call_sites(
             procedures: 1,
             ..SemanticWork::default()
         });
-        let procedure = artifact
-            .procedure(procedure_id)
-            .expect("an indexed procedure belongs to its artifact");
-        let Some(procedure_handle) = artifact.procedure_handle(procedure_id) else {
-            continue;
-        };
+        let procedure = procedure_handle.semantics();
         for call in procedure.call_sites() {
             if cancellation.is_cancelled() {
                 return Err(Interruption::Cancelled);
@@ -633,13 +634,13 @@ pub fn terminal_rust_name_range(node: Node<'_>) -> Range {
 
 #[doc(hidden)]
 pub fn source_value_observations(
-    artifact: &Arc<SemanticArtifact>,
+    procedures: impl IntoIterator<Item = ProcedureHandle>,
     range: Range,
     limit: usize,
     staged: &mut WorkStager,
     cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
 ) -> Result<(Vec<ValueAtPoint>, bool), Interruption> {
-    let candidate_groups = source_value_candidates(artifact, range, staged, cancellation)?;
+    let candidate_groups = source_value_candidates(procedures, range, staged, cancellation)?;
     let mut observations = Vec::new();
     let mut selected_width = None;
     for group in candidate_groups {
@@ -681,14 +682,14 @@ struct ProcedureSourceCandidates {
 }
 
 fn source_value_candidates(
-    artifact: &Arc<SemanticArtifact>,
+    procedures: impl IntoIterator<Item = ProcedureHandle>,
     range: Range,
     staged: &mut WorkStager,
     cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
 ) -> Result<Vec<ProcedureSourceCandidates>, Interruption> {
     let mut groups = Vec::new();
     let range_width = range.end_byte - range.start_byte;
-    for procedure in artifact.procedures() {
+    for procedure_handle in procedures {
         if cancellation.is_cancelled() {
             return Err(Interruption::Cancelled);
         }
@@ -696,9 +697,7 @@ fn source_value_candidates(
             procedures: 1,
             ..SemanticWork::default()
         });
-        let Some(procedure_handle) = artifact.procedure_handle(procedure.id()) else {
-            continue;
-        };
+        let procedure = procedure_handle.semantics();
         let implicit_preparations = procedure.implicit_receiver_preparation_values();
         let mut candidates_by_width = HashMap::<usize, Vec<SourceValueCandidate>>::default();
         for value in procedure.values() {

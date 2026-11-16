@@ -348,37 +348,108 @@ pub struct CallTargetObligation {
     pub impacts: SemanticGapImpacts,
 }
 
+type CallGapFactKey = (ProgramPointId, SemanticGapSubject, SemanticCapability);
+
+fn unknown_call_gap_fact(gap: &SemanticGap) -> Option<CallGapFactKey> {
+    (gap.kind == SemanticGapKind::Unknown).then_some((gap.point, gap.subject, gap.capability))
+}
+
+fn call_gap_pair_keys(call: &SemanticCallSite) -> [CallGapFactKey; 2] {
+    [
+        (
+            call.point,
+            SemanticGapSubject::CallSite(call.id),
+            SemanticCapability::Calls,
+        ),
+        (
+            call.point,
+            SemanticGapSubject::Value(call.callee),
+            SemanticCapability::CallableReferences,
+        ),
+    ]
+}
+
+/// Allocation-free lookup for a single query call. Bulk construction uses
+/// CallTargetGapIndex with the same keys, avoiding repeated procedure scans.
+pub fn call_target_gap_pair<'a>(
+    call: &SemanticCallSite,
+    gaps: &'a [SemanticGap],
+) -> Option<(&'a SemanticGap, &'a SemanticGap)> {
+    let unique = |key| {
+        let mut matching = gaps
+            .iter()
+            .filter(|gap| unknown_call_gap_fact(gap) == Some(key));
+        let found = matching.next()?;
+        matching.next().is_none().then_some(found)
+    };
+    let [resolution, callable] = call_gap_pair_keys(call);
+    Some((unique(resolution)?, unique(callable)?))
+}
+
 /// The unresolved-target gap pair of one call site: its unique Unknown Calls
 /// gap and its callee's unique Unknown callable-reference gap. A declared
 /// discharge is not required here; the obligation stays open until the
 /// query-time proof discharges the call. Both coverage writers and the
 /// footprint reader apply this pairing.
-pub fn call_target_gap_pair<'a>(
-    call: &SemanticCallSite,
-    gaps: &'a [SemanticGap],
-) -> Option<(&'a SemanticGap, &'a SemanticGap)> {
-    let mut resolution = gaps.iter().filter(|gap| {
-        gap.point == call.point
-            && gap.subject == SemanticGapSubject::CallSite(call.id)
-            && gap.capability == SemanticCapability::Calls
-            && gap.kind == SemanticGapKind::Unknown
-    });
-    let mut callable = gaps.iter().filter(|gap| {
-        gap.point == call.point
-            && gap.subject == SemanticGapSubject::Value(call.callee)
-            && gap.capability == SemanticCapability::CallableReferences
-            && gap.kind == SemanticGapKind::Unknown
-    });
-    let pair = (resolution.next()?, callable.next()?);
-    if resolution.next().is_some() || callable.next().is_some() {
-        return None;
+#[derive(Default)]
+pub struct CallTargetGapIndex<'a> {
+    facts: brokk_bifrost_core::hash::HashMap<CallGapFactKey, Option<&'a SemanticGap>>,
+    callable: brokk_bifrost_core::hash::HashMap<ValueId, Vec<&'a SemanticGap>>,
+    dynamic: brokk_bifrost_core::hash::HashMap<CallSiteId, Vec<&'a SemanticGap>>,
+}
+
+impl<'a> CallTargetGapIndex<'a> {
+    pub fn new(gaps: &'a [SemanticGap]) -> Self {
+        let mut index = Self::default();
+        for gap in gaps {
+            index.insert(gap);
+        }
+        index
     }
-    Some(pair)
+
+    /// Add one observed gap. Query callers can poll cancellation and admit
+    /// temporary residency before inserting, using the same producer predicate.
+    pub fn insert(&mut self, gap: &'a SemanticGap) {
+        if gap.capability == SemanticCapability::DynamicDispatch
+            && let SemanticGapSubject::CallSite(call) = gap.subject
+        {
+            self.dynamic.entry(call).or_default().push(gap);
+        }
+        let Some(fact) = unknown_call_gap_fact(gap) else {
+            return;
+        };
+        self.facts
+            .entry(fact)
+            .and_modify(|previous| *previous = None)
+            .or_insert(Some(gap));
+        if gap.capability == SemanticCapability::CallableReferences
+            && let SemanticGapSubject::Value(value) = gap.subject
+        {
+            self.callable.entry(value).or_default().push(gap);
+        }
+    }
+
+    pub fn pair(&self, call: &SemanticCallSite) -> Option<(&'a SemanticGap, &'a SemanticGap)> {
+        let [resolution, callable] = call_gap_pair_keys(call);
+        Some((
+            self.facts.get(&resolution).copied().flatten()?,
+            self.facts.get(&callable).copied().flatten()?,
+        ))
+    }
+
+    pub fn dynamic_gaps(&self, call: CallSiteId) -> &[&'a SemanticGap] {
+        self.dynamic.get(&call).map_or(&[], Vec::as_slice)
+    }
+
+    pub fn callable_gaps(&self, value: ValueId) -> &[&'a SemanticGap] {
+        self.callable.get(&value).map_or(&[], Vec::as_slice)
+    }
 }
 
 /// A stable category for one validation failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SemanticIrErrorKind {
+    Cancelled,
     ArtifactIdentity,
     ResourceLimit,
     CapabilityContract,
@@ -409,6 +480,7 @@ pub enum SemanticIrErrorKind {
 impl SemanticIrErrorKind {
     pub const fn label(self) -> &'static str {
         match self {
+            Self::Cancelled => "cancelled",
             Self::ArtifactIdentity => "artifact_identity",
             Self::ResourceLimit => "resource_limit",
             Self::CapabilityContract => "capability_contract",
@@ -540,6 +612,9 @@ pub enum ProcedureInvocationKind {
     #[default]
     Immediate,
     Deferred,
+    /// PLACEHOLDER persisted discriminant 2; finalize in landing order (#12128).
+    /// The body can be analyzed locally, but invoking it only constructs a future.
+    DeferredBody,
 }
 
 impl ProcedureInvocationKind {
@@ -547,7 +622,12 @@ impl ProcedureInvocationKind {
         match self {
             Self::Immediate => "immediate",
             Self::Deferred => "deferred",
+            Self::DeferredBody => "deferred_body",
         }
+    }
+
+    pub const fn is_deferred(self) -> bool {
+        matches!(self, Self::Deferred | Self::DeferredBody)
     }
 }
 
@@ -986,6 +1066,13 @@ impl SemanticValueKind {
             Self::AwaitResult => "await_result",
             Self::LanguageDefined(_) => "language_defined",
         }
+    }
+
+    /// Whether the value carries an integer the IR represents exactly. An
+    /// ordered integer guard compares against only such a value, so a
+    /// lowering decides from this predicate and the validator enforces it.
+    pub const fn is_represented_integer(&self) -> bool {
+        matches!(self, Self::UnsignedInteger(_) | Self::SignedInteger(_))
     }
 
     pub const fn is_constant(&self) -> bool {
@@ -1715,8 +1802,13 @@ impl SemanticGapKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SemanticGapSubject {
     Procedure,
+    /// Caller-visible effects of constructing a future, distinct from its body.
+    FutureConstruction,
+    /// Conversion/polling and output effects of activating a future.
+    FutureActivation,
     Point,
     Value(ValueId),
+    CleanupOwners(super::CleanupSegment),
     MemoryLocation(MemoryLocationId),
     Capture(CaptureId),
     CallSite(CallSiteId),
@@ -1730,12 +1822,82 @@ pub enum SemanticGapSubject {
     },
 }
 
+/// Stable identity of one borrowed logical member of a compact cleanup gap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct GapMemberRef {
+    pub base_gap_id: SemanticGapId,
+    pub owner: ValueId,
+}
+
+/// Procedure-local identity of a discharge verdict.
+/// Compact rows use Gap only for owner-independent predicates. Owner-specific
+/// proofs always use Member and never discharge the other owners.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum GapKey {
+    Gap(SemanticGapId),
+    Member(GapMemberRef),
+}
+
+impl GapKey {
+    /// An owner-independent stored-gap verdict also covers its logical members.
+    /// Only uniform predicates may record a compact row's Gap key; owner proofs
+    /// always record Member keys and cannot discharge sibling owners.
+    pub fn is_discharged_by(self, mut contains: impl FnMut(Self) -> bool) -> bool {
+        contains(self)
+            || match self {
+                Self::Member(member) => contains(Self::Gap(member.base_gap_id)),
+                Self::Gap(_) => false,
+            }
+    }
+}
+
+/// Borrowed logical gap; member identity never allocates a global gap ID.
+#[derive(Debug, Clone, Copy)]
+pub struct LogicalGapRef<'a> {
+    pub base: &'a SemanticGap,
+    pub member: Option<GapMemberRef>,
+}
+impl LogicalGapRef<'_> {
+    pub fn key(self) -> GapKey {
+        self.member
+            .map_or(GapKey::Gap(self.base.id), GapKey::Member)
+    }
+
+    pub fn subject(self) -> SemanticGapSubject {
+        self.member.map_or(self.base.subject, |member| {
+            SemanticGapSubject::Value(member.owner)
+        })
+    }
+}
+
 impl SemanticGapSubject {
+    /// Whether the old point/value guard holds for the logical subjects.
+    /// Compact rows use the shared ancestry index, without owner postings.
+    pub fn is_point_or_value(self, chains: &super::CleanupChains) -> bool {
+        match self {
+            Self::Point | Self::Value(_) => true,
+            Self::CleanupOwners(segment) => chains.has_member_owners(segment),
+            _ => false,
+        }
+    }
+
+    /// Exact value-subject membership without expanding compact owner sets.
+    pub fn contains_value(self, chains: &super::CleanupChains, value: ValueId) -> bool {
+        match self {
+            Self::Value(subject) => subject == value,
+            Self::CleanupOwners(segment) => chains.contains_owner(segment, value),
+            _ => false,
+        }
+    }
+
     pub const fn label(self) -> &'static str {
         match self {
             Self::Procedure => "procedure",
+            Self::FutureConstruction => "future_construction",
+            Self::FutureActivation => "future_activation",
             Self::Point => "point",
             Self::Value(_) => "value",
+            Self::CleanupOwners(_) => "cleanup_owners",
             Self::MemoryLocation(_) => "memory_location",
             Self::Capture(_) => "capture",
             Self::CallSite(_) => "call_site",
@@ -1896,15 +2058,37 @@ impl SemanticGapImpacts {
             | SemanticCapability::ResourceManagement => Self::CALL_EVALUATION,
         };
         let subject_impacts = match subject {
-            SemanticGapSubject::Value(_) => Self::VALUE,
+            SemanticGapSubject::Value(_) | SemanticGapSubject::CleanupOwners(_) => Self::VALUE,
             SemanticGapSubject::MemoryLocation(_) | SemanticGapSubject::Capture(_) => Self::MEMORY,
             SemanticGapSubject::CallContinuation { .. }
             | SemanticGapSubject::AsyncContinuation { .. } => Self::CALL_EVALUATION,
-            SemanticGapSubject::Procedure
+            SemanticGapSubject::FutureConstruction
+            | SemanticGapSubject::FutureActivation
+            | SemanticGapSubject::Procedure
             | SemanticGapSubject::Point
             | SemanticGapSubject::CallSite(_) => Self::NONE,
         };
         capability_impacts.union(subject_impacts)
+    }
+
+    /// A dropped owner identifies the cleanup obligation, not an omitted
+    /// transfer of that owner's value. Keep capability-derived consequences.
+    pub const fn for_gap_with_discharge(
+        capability: SemanticCapability,
+        subject: SemanticGapSubject,
+        discharge: SemanticGapDischarge,
+    ) -> Self {
+        let impact_subject = if !matches!(capability, SemanticCapability::ExceptionalControlFlow)
+            && matches!(discharge, SemanticGapDischarge::InertDropGlue)
+            && matches!(
+                subject,
+                SemanticGapSubject::Value(_) | SemanticGapSubject::CleanupOwners(_)
+            ) {
+            SemanticGapSubject::Point
+        } else {
+            subject
+        };
+        Self::for_gap(capability, impact_subject)
     }
 
     /// Iterate in [`SemanticGapImpact::ALL`] order, which is part of the
@@ -2024,6 +2208,8 @@ pub enum SemanticGapDischarge {
     RebindAtCallOrSuspension,
     /// Every value the omitted drop can destroy is a parameter or a `let`
     /// binding whose drop glue a language proof can show runs no user code.
+    /// An exceptional omission retains this marker; control_flow_discharge
+    /// interprets its conditional non-rejoining exit proof.
     InertDropGlue,
     /// `NonRejoiningExceptionalExit`, provided the procedure's `InertDropGlue`
     /// proof holds: the evaluation scope's active cleanups destroy only
@@ -2035,6 +2221,17 @@ pub enum SemanticGapDischarge {
     /// enclosing function's declared return type for Rust's `?`, the
     /// initializer's resolved type for a typed C# local.
     ResidualConversion,
+    /// An omitted implicit destructor invocation whose effects remain open.
+    /// An analysis that excludes implicit drops may ignore this obligation;
+    /// it never certifies inert drop glue or complete cleanup effects.
+    /// An exceptional omission retains this marker; control_flow_discharge
+    /// interprets its exit-only completion proof.
+    ImplicitDropExecution = 14,
+    /// Persisted discriminant 15, assigned in landing order after
+    /// `ImplicitDropExecution` (#12128).
+    /// The producer of this value is withheld. A query can set this obligation
+    /// aside only when none of its requested data dependencies uses the value.
+    DataDependency = 15,
 }
 
 /// One Go predeclared builtin whose call lowering relies on package-level
@@ -2110,6 +2307,18 @@ impl GoPredeclaredBuiltin {
     }
 }
 
+/// Dispatch obligation attached to the call-target half of a gap pair.
+/// Unspecified preserves producers that refine dispatch entirely at query time.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CallTargetDispatch {
+    #[default]
+    Unspecified,
+    Static,
+    Special,
+    Virtual,
+    Interface,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SemanticGap {
     pub id: SemanticGapId,
@@ -2123,12 +2332,38 @@ pub struct SemanticGap {
     /// The declared structured proof obligation, when this gap is
     /// dischargeable by a downstream consumer.
     pub discharge: SemanticGapDischarge,
+    /// Dispatch semantics of the call-target gap; other gaps use Unspecified.
+    pub dispatch: CallTargetDispatch,
     pub detail: Box<str>,
     pub source: SourceMappingId,
     pub evidence: EvidenceId,
 }
 
 impl SemanticGap {
+    /// Whether the omitted work is an implicit destructor invocation, rather
+    /// than a generic cleanup, deferred call, or exceptional completion.
+    pub const fn is_implicit_drop_omission(&self) -> bool {
+        matches!(
+            self.discharge,
+            SemanticGapDischarge::InertDropGlue | SemanticGapDischarge::ImplicitDropExecution
+        )
+    }
+
+    /// Interpret an exceptional implicit-drop omission's control-flow proof
+    /// without erasing its drop-specific identity for write liveness.
+    pub const fn control_flow_discharge(&self) -> SemanticGapDischarge {
+        match (self.capability, self.discharge) {
+            (SemanticCapability::ExceptionalControlFlow, SemanticGapDischarge::InertDropGlue) => {
+                SemanticGapDischarge::NonRejoiningExceptionalExitAfterInertDrops
+            }
+            (
+                SemanticCapability::ExceptionalControlFlow,
+                SemanticGapDischarge::ImplicitDropExecution,
+            ) => SemanticGapDischarge::ExitOnlyProcedureCompletion,
+            _ => self.discharge,
+        }
+    }
+
     /// Whether this gap leaves a procedure's return-value transfer incomplete.
     pub fn is_return_transfer_gap(&self) -> bool {
         self.capability == SemanticCapability::Values
@@ -2220,7 +2455,11 @@ pub enum TransferKind {
     Move { invalidation: MoveInvalidation },
     /// The target holds a converted form of the source's value.
     Conversion { preservation: ValuePreservation },
-    /// The source value is wrapped in an object, separate from primitive storage.
+    /// The source value is wrapped in an object or interface representation,
+    /// separate from the payload's storage. A reference payload remains a
+    /// dependence of the wrapper, not an alias of the wrapper. This is the
+    /// call-boundary equivalent of `ValueFlowKind::ReferenceBoxing` when the
+    /// source is a reference, and also covers boxing primitive/value payloads.
     /// This does not prove freshness or sharing with another boxing operation;
     /// allocation and language runtime caches require independent identity proof.
     Boxing,
@@ -2400,6 +2639,9 @@ impl ValueTransfer {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+// Variant order reaches materialization/cache digests through derived Hash.
+// Append new variants LAST. `value_flow_hash_stability::encoded_hash_is_stable`
+// pins canonical hash bytes and digests in value-flow-kind-hash-v1.txt.
 pub enum ValueFlowKind {
     Local,
     /// The target receives the exact logical value selected from a field, but
@@ -2459,6 +2701,15 @@ pub enum ValueFlowKind {
     /// The target copies the source at capture time. Referent identity is
     /// preserved only when a language hook proves a static reference type.
     ByValueCapture,
+    /// The target is the address of the source storage. Ordinary value
+    /// dependence is transparent, but the operand's pointer identity does
+    /// not become the identity of the resulting address.
+    AddressOf,
+    /// A read through an address. Ordinary value dependence follows the
+    /// address, while pointer identity comes from the named storage contents.
+    MemoryLoad {
+        location: MemoryLocationId,
+    },
 }
 
 impl ValueFlowKind {
@@ -2475,8 +2726,10 @@ impl ValueFlowKind {
             | Self::ReferenceUnboxing
             | Self::BackingStoreAlternative { .. }
             | Self::LanguageDefined
+            | Self::MemoryLoad { .. }
             | Self::ByValueCapture => false,
             Self::Local
+            | Self::AddressOf
             | Self::Parameter
             | Self::Receiver
             | Self::Return
@@ -2487,6 +2740,8 @@ impl ValueFlowKind {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Local => "local",
+            Self::AddressOf => "address_of",
+            Self::MemoryLoad { .. } => "pointer_memory_load",
             Self::OwnershipUnknown => "ownership_unknown",
             Self::Transfer(_) => "transfer",
             Self::BackingStore { .. } => "backing_store",
@@ -2737,6 +2992,10 @@ pub enum SemanticEffect {
     Gap {
         gap: SemanticGapId,
     },
+    /// PLACEHOLDER event discriminant 21; finalize in landing order (#12128).
+    /// Other execution may modify every memory location that existing facts do
+    /// not prove exclusively owned. Scalar locals and object identities survive.
+    MemoryInterference,
 }
 
 impl SemanticEffect {
@@ -2763,6 +3022,7 @@ impl SemanticEffect {
             Self::AsyncSuspend { .. } => "async_suspend",
             Self::AsyncResume { .. } => "async_resume",
             Self::Gap { .. } => "gap",
+            Self::MemoryInterference => "memory_interference",
         }
     }
 }
@@ -3504,15 +3764,37 @@ pub struct GuardedPatternProjection {
     pub binder: ValueId,
     pub pattern_source: SourceMappingId,
     pub binder_source: SourceMappingId,
+    /// Exact omitted binding-projection obligation, identified by its ordinal
+    /// within this procedure. An unlinked candidate discharges nothing.
+    pub gap: Option<SemanticGapId>,
     pub declared_path_len: u8,
     pub path: Box<[PatternProjectionStep]>,
     pub status: PatternProjectionStatus,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum PatternProjectionStep {
     Tuple(u32),
     Named(Box<str>),
+    /// An authored model member declaration ID, never a variant display name.
+    /// Endpoint paths admit this step; stored guarded-pattern IR rejects it.
+    Variant {
+        declaration: Box<str>,
+    },
+    /// The summarized indexed element of an authored endpoint, never stored IR.
+    Element,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -3522,6 +3804,7 @@ pub enum PatternProjectionStatus {
 
 #[derive(Debug, Clone)]
 pub struct ProcedureSemanticsParts {
+    pub(super) candidate_alternate: Option<Box<CandidateMacroAlternateParts>>,
     /// None means unavailable signature; Some([]) means declared zero results.
     pub declared_result_classes: Option<Box<[StaticTypeClass]>>,
     pub id: ProcedureId,
@@ -3554,6 +3837,7 @@ pub struct ProcedureSemanticsParts {
     pub control_edges: Vec<ControlEdge>,
     pub guard_facts: Vec<GuardFactParts>,
     pub switch_facts: Vec<SwitchFactParts>,
+    pub cleanup_chains: super::CleanupChains,
     pub drops: Vec<DropFact>,
     pub move_outs: Vec<MoveOutFact>,
     pub scope_ends: Vec<ScopeEndFact>,
@@ -3573,7 +3857,232 @@ pub struct ProcedureSemanticsParts {
     pub go_predeclared_builtin_assumptions: Vec<GoPredeclaredBuiltin>,
 }
 
+/// A complete alternative, isolated from ordinary executable rows (#10972).
+#[derive(Debug, Clone)]
+pub(super) struct CandidateMacroAlternateParts {
+    pub parts: ProcedureSemanticsParts,
+    /// One record per candidate invocation, in canonical order.
+    pub candidates: Box<[CandidateRecord]>,
+}
+
+/// The byte extent of a candidate invocation in its file. It is only a lookup
+/// index inside one blob's artifact: digests, receipts and read keys use the
+/// position-free base call identity and never an offset (#11251).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CandidateAnchor {
+    pub start_byte: u32,
+    pub end_byte: u32,
+}
+
+impl CandidateAnchor {
+    pub fn of(span: crate::analyzer::semantic::SourceSpan) -> Self {
+        Self {
+            start_byte: span.start_byte(),
+            end_byte: span.end_byte(),
+        }
+    }
+
+    /// The extent of a call's source mapping in `parts`.
+    pub fn of_call(parts: &ProcedureSemanticsParts, call: CallSiteId) -> Option<Self> {
+        let call = parts
+            .call_sites
+            .get(call.index())
+            .filter(|site| site.id == call)?;
+        let mapping = parts.source_mappings.get(call.source.index())?;
+        Some(Self::of(mapping.locator.anchor().span()))
+    }
+
+    pub const fn contains(self, inner: Self) -> bool {
+        self.start_byte <= inner.start_byte && inner.end_byte <= self.end_byte
+    }
+}
+
+/// What the alternate does with one candidate invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CandidateRealization {
+    /// The alternate lowers the invocation to this runtime call.
+    RuntimeCall(CallSiteId),
+    /// The alternate lowers the invocation to control flow and values; it has
+    /// no call at the anchor.
+    Intrinsic,
+    /// The alternate keeps the same logical call and proves that the
+    /// invocation introduces no items into the lexical scope.
+    LexicalNoItemsIntroduced,
+}
+
+/// One candidate invocation of a guarded alternate (#11251).
+///
+/// `base_call` is the base call the invocation replaces. An invocation nested
+/// in the operands of an opaque candidate has no base call of its own (the base
+/// does not lower the operands); it names the nearest enclosing base candidate
+/// call, whose anchor contains this one. Records are ordered by
+/// (`base_call`, `anchor`); the ordinal among records sharing a `base_call`
+/// completes the position-free identity of a candidate within one procedure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CandidateRecord {
+    pub anchor: CandidateAnchor,
+    pub base_call: CallSiteId,
+    pub realization: CandidateRealization,
+}
+
+impl CandidateRecord {
+    /// The record of an alternate that keeps `call` as a runtime call replacing
+    /// the base call with the same id and anchor.
+    pub fn same_call(parts: &ProcedureSemanticsParts, call: CallSiteId) -> Self {
+        Self {
+            anchor: CandidateAnchor::of_call(parts, call).expect("a call with a source mapping"),
+            base_call: call,
+            realization: CandidateRealization::RuntimeCall(call),
+        }
+    }
+}
+
+/// The shared validation of an alternate's candidate records, used by lowering
+/// and by artifact construction. `Err` names the violated rule.
+pub fn validate_candidate_records(
+    base: &ProcedureSemanticsParts,
+    alternate: &ProcedureSemanticsParts,
+    records: &[CandidateRecord],
+) -> Result<(), String> {
+    validate_candidate_records_with_anchor(
+        |call| CandidateAnchor::of_call(base, call),
+        alternate,
+        records,
+    )
+}
+
+pub(super) fn validate_candidate_records_with_anchor(
+    base_anchor: impl Fn(CallSiteId) -> Option<CandidateAnchor>,
+    alternate: &ProcedureSemanticsParts,
+    records: &[CandidateRecord],
+) -> Result<(), String> {
+    if records.is_empty() {
+        return Err("an alternate needs at least one candidate record".to_owned());
+    }
+    let alternate_anchors = (0..alternate.call_sites.len())
+        .filter_map(|index| CandidateAnchor::of_call(alternate, CallSiteId::new(index as u32)))
+        .collect::<std::collections::HashSet<_>>();
+    let mut previous = None;
+    let mut alternate_calls = std::collections::HashSet::new();
+    for record in records {
+        let key = (record.base_call, record.anchor);
+        if record.anchor.start_byte >= record.anchor.end_byte {
+            return Err(format!("candidate anchor {:?} is empty", record.anchor));
+        }
+        if previous.is_some_and(|previous| previous >= key) {
+            return Err(format!(
+                "candidate records are not strictly ordered by (base call, anchor): {record:?}"
+            ));
+        }
+        previous = Some(key);
+        let Some(base_anchor) = base_anchor(record.base_call) else {
+            return Err(format!(
+                "candidate {record:?} has no base call mapping in the base procedure"
+            ));
+        };
+        if !base_anchor.contains(record.anchor) {
+            return Err(format!(
+                "candidate {record:?} is not inside its base call anchor {base_anchor:?}"
+            ));
+        }
+        match record.realization {
+            CandidateRealization::RuntimeCall(call) => {
+                if CandidateAnchor::of_call(alternate, call) != Some(record.anchor) {
+                    return Err(format!(
+                        "runtime-call candidate {record:?} has no alternate call at its anchor"
+                    ));
+                }
+                if !alternate_calls.insert(call) {
+                    return Err(format!(
+                        "alternate call {call:?} realizes more than one candidate"
+                    ));
+                }
+            }
+            CandidateRealization::Intrinsic => {
+                if alternate_anchors.contains(&record.anchor) {
+                    return Err(format!(
+                        "intrinsic candidate {record:?} still has an alternate call at its anchor"
+                    ));
+                }
+                if !alternate.source_mappings.iter().any(|mapping| {
+                    CandidateAnchor::of(mapping.locator.anchor().span()) == record.anchor
+                }) {
+                    return Err(format!(
+                        "intrinsic candidate {record:?} has no alternate source mapping at its anchor"
+                    ));
+                }
+            }
+            CandidateRealization::LexicalNoItemsIntroduced => {
+                if base_anchor != record.anchor || !alternate_anchors.contains(&record.anchor) {
+                    return Err(format!(
+                        "lexical-guard candidate {record:?} does not keep the same logical call"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 impl ProcedureSemanticsParts {
+    /// Every direct or anchor-derived place destruction, in publication order.
+    pub fn logical_drops(&self) -> impl Iterator<Item = LogicalDropFact<'_>> {
+        super::artifact::logical_drops(&self.drops, &self.cleanup_chains)
+    }
+
+    // The row census includes alternate payloads but not their boxed headers.
+    pub(crate) fn retained_layout(&self) -> (usize, usize) {
+        let mut headers =
+            std::mem::size_of::<Self>().saturating_add(self.cleanup_chains.index_retained_bytes());
+        let mut invalidations = self.pointer_invalidations.len();
+        if let Some(alternate) = &self.candidate_alternate {
+            headers = headers
+                .saturating_add(std::mem::size_of::<CandidateMacroAlternateParts>())
+                .saturating_add(alternate.parts.cleanup_chains.index_retained_bytes());
+            invalidations =
+                invalidations.saturating_add(alternate.parts.pointer_invalidations.len());
+        }
+        (headers, invalidations)
+    }
+
+    /// Split a completed demand reconstruction into a shared native base
+    /// and the single requested alternate. Nothing partial is published.
+    #[doc(hidden)]
+    pub fn take_candidate_macro_alternate_parts(
+        &mut self,
+    ) -> Option<(Self, Box<[CandidateRecord]>)> {
+        self.candidate_alternate
+            .take()
+            .map(|alternate| (alternate.parts, alternate.candidates))
+    }
+
+    /// Isolated parts for the guarded publication encoder.
+    #[doc(hidden)]
+    pub fn candidate_macro_alternate_parts(&self) -> Option<(&Self, &[CandidateRecord])> {
+        self.candidate_alternate
+            .as_ref()
+            .map(|alternate| (&alternate.parts, alternate.candidates.as_ref()))
+    }
+
+    /// Attach an alternative for later validated artifact construction.
+    pub fn attach_candidate_macro_alternate(
+        &mut self,
+        alternate: ProcedureSemanticsParts,
+        candidates: Box<[CandidateRecord]>,
+    ) {
+        assert!(self.candidate_alternate.is_none());
+        assert!(alternate.candidate_alternate.is_none());
+        assert_eq!(self.id, alternate.id);
+        assert_eq!(self.locator, alternate.locator);
+        if let Err(violation) = validate_candidate_records(self, &alternate, &candidates) {
+            panic!("invalid candidate records for {:?}: {violation}", self.id);
+        }
+        self.candidate_alternate = Some(Box::new(CandidateMacroAlternateParts {
+            parts: alternate,
+            candidates,
+        }));
+    }
+
     pub fn new(
         id: ProcedureId,
         locator: SemanticLocator,
@@ -3584,6 +4093,7 @@ impl ProcedureSemanticsParts {
         Self {
             id,
             locator,
+            candidate_alternate: None,
             declared_result_classes: None,
             source_range_holes: Vec::new(),
             lexical_parent: None,
@@ -3608,6 +4118,7 @@ impl ProcedureSemanticsParts {
             control_edges: Vec::new(),
             guard_facts: Vec::new(),
             switch_facts: Vec::new(),
+            cleanup_chains: super::CleanupChains::default(),
             drops: Vec::new(),
             move_outs: Vec::new(),
             scope_ends: Vec::new(),
@@ -3620,5 +4131,155 @@ impl ProcedureSemanticsParts {
             guarded_pattern_projections: Vec::new(),
             go_predeclared_builtin_assumptions: Vec::new(),
         }
+    }
+}
+
+/// Borrowed destruction fact, including a point projected from a cleanup anchor.
+#[derive(Debug, Clone, Copy)]
+pub struct LogicalDropFact<'a> {
+    pub place: &'a SemanticPlace,
+    pub point: ProgramPointId,
+    pub behavior: &'a DropBehavior,
+    pub source: SourceMappingId,
+    pub evidence: EvidenceId,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct LogicalScopeEndFact<'a> {
+    pub place: &'a SemanticPlace,
+    pub at: ScopeEndAt,
+    pub source: SourceMappingId,
+    pub evidence: EvidenceId,
+}
+impl LogicalScopeEndFact<'_> {
+    pub fn to_owned(self) -> ScopeEndFact {
+        ScopeEndFact {
+            place: self.place.clone(),
+            at: self.at,
+            source: self.source,
+            evidence: self.evidence,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum LogicalIncompleteSubject<'a> {
+    Procedure,
+    Place(&'a SemanticPlace),
+    Value(ValueId),
+    PointerOrigin(PointerOriginId),
+}
+#[derive(Debug, Clone, Copy)]
+pub struct LogicalIncompleteFact<'a> {
+    pub point: ProgramPointId,
+    pub subject: LogicalIncompleteSubject<'a>,
+    pub reason: SemanticIncompleteReason,
+    pub source: SourceMappingId,
+    pub evidence: EvidenceId,
+}
+
+#[cfg(test)]
+mod value_flow_hash_stability {
+    use super::*;
+    use std::hash::{Hash, Hasher};
+
+    #[derive(Default)]
+    struct HashBytes(Vec<Vec<u8>>);
+
+    macro_rules! numeric_write {
+        ($name:ident, $ty:ty) => {
+            fn $name(&mut self, value: $ty) {
+                self.write(&value.to_le_bytes());
+            }
+        };
+    }
+
+    impl Hasher for HashBytes {
+        fn finish(&self) -> u64 {
+            0
+        }
+        fn write(&mut self, bytes: &[u8]) {
+            self.0.push(bytes.to_vec());
+        }
+        numeric_write!(write_u8, u8);
+        numeric_write!(write_u16, u16);
+        numeric_write!(write_u32, u32);
+        numeric_write!(write_u64, u64);
+        numeric_write!(write_u128, u128);
+        numeric_write!(write_i8, i8);
+        numeric_write!(write_i16, i16);
+        numeric_write!(write_i32, i32);
+        numeric_write!(write_i64, i64);
+        numeric_write!(write_i128, i128);
+        fn write_usize(&mut self, value: usize) {
+            self.write_u64(u64::try_from(value).unwrap());
+        }
+        fn write_isize(&mut self, value: isize) {
+            self.write_i64(i64::try_from(value).unwrap());
+        }
+    }
+
+    #[test]
+    fn encoded_hash_is_stable() {
+        use crate::analyzer::semantic::ids::SemanticDigestHasher;
+        let kinds = [
+            ValueFlowKind::Local,
+            ValueFlowKind::OwnershipUnknown,
+            ValueFlowKind::Transfer(ValueTransfer {
+                kind: TransferKind::Copy,
+                operation: TransferOperation::None,
+            }),
+            ValueFlowKind::BackingStore {
+                offset: BackingStoreOffset::Zero,
+            },
+            ValueFlowKind::IntegerOffset {
+                offset: SignedIntegerMagnitude::new(false, 3),
+            },
+            ValueFlowKind::BackingStoreAlternative {
+                offset: BackingStoreOffset::Zero,
+                allocation: AllocationId::new(2),
+            },
+            ValueFlowKind::Parameter,
+            ValueFlowKind::Receiver,
+            ValueFlowKind::Return,
+            ValueFlowKind::IndexedReturn { ordinal: 2 },
+            ValueFlowKind::ReferenceBoxing,
+            ValueFlowKind::ReferenceUnboxing,
+            ValueFlowKind::LanguageDefined,
+            ValueFlowKind::ByValueCapture,
+            ValueFlowKind::AddressOf,
+            ValueFlowKind::MemoryLoad {
+                location: MemoryLocationId::new(2),
+            },
+        ];
+        let mut actual = String::new();
+        for kind in kinds {
+            let mut bytes = HashBytes::default();
+            kind.hash(&mut bytes);
+            let encoded = bytes
+                .0
+                .iter()
+                .map(|chunk| {
+                    chunk
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("/");
+            let mut digest =
+                SemanticDigestHasher::new(b"bifrost-value-flow-kind-hash-stability-v1");
+            kind.hash(&mut digest);
+            actual.push_str(&format!(
+                "{} {} {}\n",
+                kind.label(),
+                encoded,
+                digest.finish_digest()
+            ));
+        }
+        assert_eq!(
+            actual,
+            include_str!("../../../../tests/fixtures/value-flow-kind-hash-v1.txt")
+        );
     }
 }

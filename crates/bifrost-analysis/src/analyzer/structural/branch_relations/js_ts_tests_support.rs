@@ -45,6 +45,7 @@ pub fn rows(language: Language, path: &str, source: &str) -> Vec<BranchRelationR
         &ReferenceProofs::default(),
         &Default::default(),
     )
+    .rows
 }
 #[doc(hidden)]
 pub fn verdicts(

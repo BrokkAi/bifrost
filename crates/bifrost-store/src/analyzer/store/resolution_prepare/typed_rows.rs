@@ -94,6 +94,7 @@ pub(crate) const TYPE_TRANSFERS_BY_TARGET_SQL: &str = "SELECT source_slot, rule,
      WHERE blob_id = ?1 AND target_slot IN (SELECT value FROM json_each(?2)) \
      ORDER BY target_slot, source_slot, rule";
 
+pub(crate) const BINARY_OPERATIONS_BY_OUTPUT_SQL: &str = "SELECT output_slot, left_slot, right_slot, operator, right_reference FROM resolution_binary_operations WHERE blob_id = ?1 AND output_slot IN (SELECT value FROM json_each(?2)) ORDER BY output_slot";
 pub(crate) const TYPE_PRODUCTIONS_BY_OUTPUT_SQL: &str = "SELECT output_slot, constructor, length_token, element_slot FROM resolution_type_productions WHERE blob_id = ?1 AND output_slot IN (SELECT value FROM json_each(?2)) ORDER BY output_slot";
 
 pub(crate) const TYPE_COMPONENTS_BY_CONTAINER_SQL: &str = "SELECT container_slot, constructor, kind, component_slot \
@@ -286,15 +287,15 @@ pub(crate) const CONSTRUCTION_REQUIREMENTS_BY_DEFINITION_SQL: &str = "SELECT def
      WHERE blob_id = ?1 AND definition IN (SELECT value FROM json_each(?2)) \
      ORDER BY definition, required_owner_definition, kind";
 
-pub(crate) const SUPERTYPES_BY_DEFINITION_SQL: &str = "SELECT definition, reference, frontier, kind, parent_ordinal FROM resolution_supertypes \
+pub(crate) const SUPERTYPES_BY_DEFINITION_SQL: &str = "SELECT definition, reference, frontier, kind, parent_ordinal, (SELECT json_group_array(argument_slot) FROM (SELECT argument_slot FROM resolution_declared_type_arguments args WHERE args.blob_id=resolution_supertypes.blob_id AND args.owner_slot=resolution_supertypes.frontier ORDER BY ordinal)) FROM resolution_supertypes \
      WHERE blob_id = ?1 AND definition IN (SELECT value FROM json_each(?2)) \
      ORDER BY definition, parent_ordinal, reference";
 
-pub(crate) const SUPERTYPES_BY_REFERENCE_SQL: &str = "SELECT definition, reference, frontier, kind, parent_ordinal FROM resolution_supertypes \
+pub(crate) const SUPERTYPES_BY_REFERENCE_SQL: &str = "SELECT definition, reference, frontier, kind, parent_ordinal, (SELECT json_group_array(argument_slot) FROM (SELECT argument_slot FROM resolution_declared_type_arguments args WHERE args.blob_id=resolution_supertypes.blob_id AND args.owner_slot=resolution_supertypes.frontier ORDER BY ordinal)) FROM resolution_supertypes \
      INDEXED BY resolution_supertypes_reference \
      WHERE blob_id = ?1 AND reference IN (SELECT value FROM json_each(?2))";
 
-pub(crate) const SUPERTYPES_BY_FRONTIER_SQL: &str = "SELECT definition, reference, frontier, kind, parent_ordinal FROM resolution_supertypes \
+pub(crate) const SUPERTYPES_BY_FRONTIER_SQL: &str = "SELECT definition, reference, frontier, kind, parent_ordinal, (SELECT json_group_array(argument_slot) FROM (SELECT argument_slot FROM resolution_declared_type_arguments args WHERE args.blob_id=resolution_supertypes.blob_id AND args.owner_slot=resolution_supertypes.frontier ORDER BY ordinal)) FROM resolution_supertypes \
      INDEXED BY resolution_supertypes_frontier \
      WHERE blob_id = ?1 AND frontier IN (SELECT value FROM json_each(?2))";
 
@@ -366,6 +367,15 @@ pub(crate) struct PreparedTypeComponentRow {
     pub(crate) constructor: i64,
     pub(crate) kind: i64,
     pub(crate) component_slot: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PreparedBinaryOperationRow {
+    pub(crate) output_slot: i64,
+    pub(crate) left_slot: i64,
+    pub(crate) right_slot: i64,
+    pub(crate) operator: i64,
+    pub(crate) right_reference: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -527,6 +537,7 @@ pub(crate) struct PreparedTypedRows {
     pub(crate) type_transfers: Vec<PreparedTypeTransferRow>,
     pub(crate) type_components: Vec<PreparedTypeComponentRow>,
     pub(crate) type_productions: Vec<PreparedTypeProductionRow>,
+    pub(crate) binary_operations: Vec<PreparedBinaryOperationRow>,
     pub(crate) declared_type_arguments: Vec<PreparedDeclaredTypeArgumentRow>,
     pub(crate) type_arguments: Vec<PreparedTypeArgumentRow>,
     pub(crate) underlying_types: Vec<PreparedUnderlyingTypeRow>,
@@ -722,6 +733,21 @@ pub(super) fn prepare_typed_rows(
         });
     }
 
+    for operation in typed.binary_operations() {
+        rows.binary_operations.push(PreparedBinaryOperationRow {
+            output_slot: local(keys, identities, operation.output, "binary output"),
+            left_slot: local(keys, identities, operation.left, "binary left operand"),
+            right_slot: local(keys, identities, operation.right, "binary right operand"),
+            right_reference: code(
+                brokk_bifrost_core::analyzer::resolution_facts::ALL_RESOLUTION_BINARY_REFERENCES,
+                operation.right_reference,
+            ),
+            operator: code(
+                brokk_bifrost_core::analyzer::resolution_facts::ALL_RESOLUTION_BINARY_OPERATORS,
+                operation.operator,
+            ),
+        });
+    }
     for production in typed.type_productions() {
         rows.type_productions.push(PreparedTypeProductionRow {
             output_slot: local(

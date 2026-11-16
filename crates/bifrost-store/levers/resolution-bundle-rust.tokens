@@ -1,0 +1,27 @@
+# The rust resolution bundle lever (#11570).
+#
+# Add one `<issue>-<slug>` line when a change alters the persisted per-file
+# rust resolution bundle for unchanged source: stored interiors and unit
+# summaries produced under an earlier identity are withdrawn and relowered.
+# Whoever adds a line must also ask whether both ICFG provider domains rotate
+# (see .agents/docs/cache-identity-levers.md). Git merges this file with
+# merge=union, so two branches that each add a line keep both. Never edit or
+# remove a line; compaction replaces a prefix with a checkpoint line and keeps
+# the identity.
+#
+# Replaced the string literal:
+# resolution-bundle-rust-v134-10930-log-macro-target-operands-11111-certified-absent-module-topology-11060-unplaced-module-topology-9737-route-completeness-10987-scoped-symlink-omissions-10953-target-dependencies-and-lib-names-10774-manifests-only-cargo-toml-compact-identity-digests-9628-duplicate-export-uncertainty-replay-call-roles-6861-inherent-impl-subjects-6394-cfg-import-precedence-6242-classified-route-gaps-5658-root-import-publication-cfg-if-conditional-macro-frontiers-5172-unique-macro-reference-gaps-5133-local-write-joins-5015-2026-10-generic-default-reference-6950-cfg-if-self-frontier-6949-macro-item-attributes-derive-sites-6912-wrapper-identity-conditional-payload-6844
+11570-slice2a-token-files
+11786-unsatisfiable-cfg-mod-no-placement-gap
+11265-extern-prelude-roots
+11325-builtin-derive-prelude
+11825-cfg-use-binders
+11834-selected-cfg-placement-gap
+12267-chained-projection-sites
+12239-macro-cfg-shadowing
+10879-rust-drop-inventory
+12363-linear-macro-operands
+12241-string-add-str-type
+12159-vec-result-type
+12778-rust-valuejoin-panic
+12956-nonnominal-trait-impls

@@ -730,6 +730,19 @@ pub struct ProcedureSummaryKey {
 }
 
 impl ProcedureSummaryKey {
+    /// Owned identity below the inline key, with no temporary identity copy.
+    #[doc(hidden)]
+    pub fn retained_allocations(
+        &self,
+        census: &mut impl crate::analyzer::semantic::service::ArtifactRetentionVisitor,
+    ) {
+        census.artifact_key(self.identity.artifact());
+        census.declaration(self.identity.declaration());
+        if let SummaryOrigin::External(origin) = self.identity.origin() {
+            census.owned_slice(origin.model().as_str().as_bytes());
+        }
+    }
+
     pub fn try_new(
         identity: ProcedureSummaryIdentity,
         dependencies: &[SummaryDependencyKey],
@@ -985,12 +998,47 @@ pub enum SummaryPort {
     ExceptionalReturn,
     Capture(SummaryLocationKey),
     Heap(SummaryLocationKey),
+    Projected {
+        root: Box<SummaryPort>,
+        path: crate::analyzer::semantic_model::SummaryEndpointPath,
+    },
 }
 
 impl SummaryPort {
+    pub fn root(&self) -> &Self {
+        match self {
+            Self::Projected { root, .. } => root,
+            port => port,
+        }
+    }
+
+    pub fn projection(&self) -> Option<&crate::analyzer::semantic_model::SummaryEndpointPath> {
+        match self {
+            Self::Projected { path, .. } => Some(path),
+            _ => None,
+        }
+    }
+
+    pub fn projected(
+        self,
+        path: Option<&crate::analyzer::semantic_model::SummaryEndpointPath>,
+    ) -> Self {
+        assert!(
+            self.projection().is_none(),
+            "summary projection roots cannot be nested"
+        );
+        match path {
+            Some(path) => Self::Projected {
+                root: Box::new(self),
+                path: path.clone(),
+            },
+            None => self,
+        }
+    }
+
     fn is_return(&self) -> bool {
         matches!(
-            self,
+            self.root(),
             Self::NormalReturn | Self::IndexedNormalReturn(_) | Self::ExceptionalReturn
         )
     }
@@ -1015,7 +1063,7 @@ impl SummaryExit {
         port: SummaryPort,
     ) -> Result<Self, SummaryValidationError> {
         if matches!(
-            (kind, &port),
+            (kind, port.root()),
             (SummaryExitKind::Normal, SummaryPort::ExceptionalReturn)
                 | (
                     SummaryExitKind::Exceptional,
@@ -1171,6 +1219,7 @@ pub struct SummaryTransfer {
     input: SummaryPort,
     exit: SummaryExit,
     evidence: SummaryEvidence,
+    preserves_member_contents: bool,
 }
 
 impl SummaryTransfer {
@@ -1186,7 +1235,19 @@ impl SummaryTransfer {
             input,
             exit,
             evidence,
+            preserves_member_contents: false,
         })
+    }
+
+    /// Record an independently established member-path preservation proof.
+    pub fn with_preserved_member_contents(mut self) -> Self {
+        self.preserves_member_contents = true;
+        self
+    }
+
+    /// False means preservation is not proven, rather than contents change.
+    pub fn preserves_member_contents(&self) -> bool {
+        self.preserves_member_contents
     }
 
     pub fn input(&self) -> &SummaryPort {
@@ -2864,6 +2925,28 @@ impl ExternalSummaryTarget {
             && actual_last.anchor() == formal_last.anchor()
     }
 
+    /// A reduced-form extension call's alias names the same declaration at
+    /// the same declared arity, behind a call-shape namespace. Its receiver
+    /// fills formal 0, so the written arguments map into the formals after it.
+    fn is_receiver_first_alias_of(&self, formal: &Self, mapping: &[u32]) -> bool {
+        if self.mount != formal.mount
+            || self.path != formal.path
+            || self.language != formal.language
+        {
+            return false;
+        }
+        let actual = self.declaration.segments();
+        let formal = formal.declaration.segments();
+        let (Some(actual_last), Some(formal_last)) = (actual.last(), formal.last()) else {
+            return false;
+        };
+        actual.len() == formal.len() + 1
+            && actual.ends_with(formal)
+            && is_valid_actual_to_formal_mapping(mapping, formal_last.sibling_ordinal())
+            && !mapping.contains(&0)
+            && actual_last.sibling_ordinal() == formal_last.sibling_ordinal()
+    }
+
     fn is_mapped_call_shape_alias_of(&self, formal: &Self, mapping: &[u32]) -> bool {
         if self.mount != formal.mount
             || self.path != formal.path
@@ -2936,7 +3019,7 @@ fn mapped_summary_uses_supported_transfer_ports(
     summary: &SemanticProcedureSummary,
     formal_parameter_count: usize,
 ) -> bool {
-    let supported = |port: &SummaryPort| match port {
+    let supported = |port: &SummaryPort| match port.root() {
         SummaryPort::Parameter(ordinal) => {
             usize::try_from(*ordinal).is_ok_and(|ordinal| ordinal < formal_parameter_count)
         }
@@ -2945,6 +3028,7 @@ fn mapped_summary_uses_supported_transfer_ports(
         | SummaryPort::NormalReturn
         | SummaryPort::IndexedNormalReturn(_)
         | SummaryPort::ExceptionalReturn => true,
+        SummaryPort::Projected { .. } => unreachable!("summary projection roots cannot be nested"),
     };
     summary
         .transfers()
@@ -2975,14 +3059,23 @@ fn push_actual_to_formal_fingerprint(bytes: &mut Vec<u8>, mapping: &[u32]) {
     }
 }
 
+/// Positional binding adds no bytes, so the fingerprints of established
+/// sets do not move.
+fn push_call_shape_fingerprint(bytes: &mut Vec<u8>, shape: ExternalSummaryCallShape<'_>) {
+    if let Some(mapping) = shape.actual_to_formal {
+        push_actual_to_formal_fingerprint(bytes, mapping);
+    }
+    if shape.receiver_binds_first_formal {
+        bytes.extend_from_slice(b"bifrost.external-summary-receiver-first-formal.v1\0");
+    }
+}
+
 fn summary_binding_fingerprint(
     summary_fingerprint: StableDigest,
-    mapping: Option<&[u32]>,
+    shape: ExternalSummaryCallShape<'_>,
 ) -> ExternalSummarySetFingerprint {
     let mut bytes = summary_fingerprint.as_bytes().to_vec();
-    if let Some(mapping) = mapping {
-        push_actual_to_formal_fingerprint(&mut bytes, mapping);
-    }
+    push_call_shape_fingerprint(&mut bytes, shape);
     ExternalSummarySetFingerprint::hash_bytes(&bytes)
 }
 
@@ -3096,6 +3189,19 @@ struct ExternalSummaryEntry {
     target: ExternalSummaryTarget,
     summary: SemanticProcedureSummary,
     actual_to_formal: Option<Box<[u32]>>,
+    receiver_binds_first_formal: bool,
+}
+
+/// How one bound target's call actuals reach its summary's formals.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExternalSummaryCallShape<'a> {
+    /// Formal ordinal of each written argument, or `None` for positional
+    /// binding.
+    pub actual_to_formal: Option<&'a [u32]>,
+    /// The call's receiver binds formal 0: a reduced-form extension call
+    /// `v.M(args...)` of a static method. `actual_to_formal` then maps the
+    /// written arguments to the formals after it.
+    pub receiver_binds_first_formal: bool,
 }
 
 /// Canonical query-scoped index for compatible externally supplied procedure
@@ -3141,6 +3247,7 @@ impl ExternalSemanticSummarySet {
                 target: ExternalSummaryTarget::from_summary(&summary),
                 summary,
                 actual_to_formal: None,
+                receiver_binds_first_formal: false,
             })
             .collect();
         Self::try_new_entries(entries, compatibility)
@@ -3170,6 +3277,7 @@ impl ExternalSemanticSummarySet {
             target: ExternalSummaryTarget::from_summary(&summary),
             summary,
             actual_to_formal: None,
+            receiver_binds_first_formal: false,
         }));
         for (binding, summary) in bindings {
             let Some(actual) = ExternalSummaryTarget::from_locator(binding.actual_locator()) else {
@@ -3199,7 +3307,15 @@ impl ExternalSemanticSummarySet {
                 .last()
                 .map(|segment| segment.sibling_ordinal())
                 .and_then(|count| usize::try_from(count).ok());
+            let receiver_binds_first_formal = binding.receiver_binds_first_formal();
             let valid_alias = match actual_to_formal.as_deref() {
+                Some(mapping) if receiver_binds_first_formal => {
+                    formal_parameter_count.is_some_and(|formal_count| {
+                        actual.is_receiver_first_alias_of(&formal, mapping)
+                            && mapped_summary_uses_supported_transfer_ports(&summary, formal_count)
+                    })
+                }
+                None if receiver_binds_first_formal => false,
                 Some(mapping) => formal_parameter_count.is_some_and(|formal_count| {
                     actual.is_mapped_call_shape_alias_of(&formal, mapping)
                         && (is_identity_actual_to_formal_mapping(mapping)
@@ -3220,6 +3336,7 @@ impl ExternalSemanticSummarySet {
                 target: actual,
                 summary,
                 actual_to_formal,
+                receiver_binds_first_formal,
             });
         }
         Self::try_new_entries(entries, compatibility)
@@ -3263,6 +3380,7 @@ impl ExternalSemanticSummarySet {
                  target,
                  summary,
                  actual_to_formal: mapping,
+                 ..
              }| {
                 *target != ExternalSummaryTarget::from_summary(summary) || mapping.is_some()
             },
@@ -3274,13 +3392,18 @@ impl ExternalSemanticSummarySet {
                 target,
                 summary,
                 actual_to_formal: mapping,
+                receiver_binds_first_formal,
             } in &entries
             {
                 bytes.extend_from_slice(target.stable_fingerprint().as_bytes());
                 bytes.extend_from_slice(summary.key().fingerprint().as_bytes());
-                if let Some(mapping) = mapping.as_deref() {
-                    push_actual_to_formal_fingerprint(&mut bytes, mapping);
-                }
+                push_call_shape_fingerprint(
+                    &mut bytes,
+                    ExternalSummaryCallShape {
+                        actual_to_formal: mapping.as_deref(),
+                        receiver_binds_first_formal: *receiver_binds_first_formal,
+                    },
+                );
             }
         } else {
             // Preserve the established fingerprint of ordinary one-target-per-
@@ -3360,7 +3483,7 @@ impl ExternalSemanticSummarySet {
     pub fn summary_for_boundary(
         &self,
         boundary: &DispatchBoundaryKind,
-    ) -> Option<(&SemanticProcedureSummary, Option<&[u32]>)> {
+    ) -> Option<(&SemanticProcedureSummary, ExternalSummaryCallShape<'_>)> {
         if matches!(boundary, DispatchBoundaryKind::Deferred { .. }) {
             return None;
         }
@@ -3375,7 +3498,7 @@ impl ExternalSemanticSummarySet {
     pub fn summary_and_actual_to_formal_for(
         &self,
         locator: &SemanticLocator,
-    ) -> Option<(&SemanticProcedureSummary, Option<&[u32]>)> {
+    ) -> Option<(&SemanticProcedureSummary, ExternalSummaryCallShape<'_>)> {
         if locator.role() != SemanticRole::Procedure {
             return None;
         }
@@ -3384,7 +3507,13 @@ impl ExternalSemanticSummarySet {
             .ok()
             .map(|index| {
                 let entry = &self.entries[index];
-                (&entry.summary, entry.actual_to_formal.as_deref())
+                (
+                    &entry.summary,
+                    ExternalSummaryCallShape {
+                        actual_to_formal: entry.actual_to_formal.as_deref(),
+                        receiver_binds_first_formal: entry.receiver_binds_first_formal,
+                    },
+                )
             })
     }
 
@@ -3409,9 +3538,7 @@ impl ExternalSemanticSummarySet {
         locator: &SemanticLocator,
     ) -> Option<ExternalSummarySetFingerprint> {
         self.summary_and_actual_to_formal_for(locator)
-            .map(|(summary, mapping)| {
-                summary_binding_fingerprint(summary.key().fingerprint(), mapping)
-            })
+            .map(|(summary, shape)| summary_binding_fingerprint(summary.key().fingerprint(), shape))
     }
 
     /// Conservative retained heap estimate for the set's boxed entries and
@@ -3439,6 +3566,7 @@ impl ExternalSemanticSummarySet {
                              target,
                              summary,
                              actual_to_formal: mapping,
+                             ..
                          }| {
                             target
                                 .path
@@ -4050,7 +4178,7 @@ fn compose_summary_transfers(
         invocation_outputs,
         mut work,
     } = productive_continuations(second, boundaries)?;
-    let mut composed: HashMap<(SummaryPort, SummaryExit), SummaryEvidence> =
+    let mut composed: HashMap<(SummaryPort, SummaryExit), (SummaryEvidence, bool)> =
         map_with_capacity(first.len().min(MAX_SUMMARY_TRANSFERS));
     let mut invocation_evidence: Option<SummaryEvidence> = None;
     for left in first {
@@ -4072,7 +4200,7 @@ fn compose_summary_transfers(
         };
         work = checked_composition_work(work, rows.len())?;
         for right in rows {
-            let transfer = SummaryTransfer::try_new(
+            let mut transfer = SummaryTransfer::try_new(
                 left.input.clone(),
                 right.exit.clone(),
                 left.evidence
@@ -4080,16 +4208,21 @@ fn compose_summary_transfers(
                     .map_err(SummaryCompositionError::InvalidResult)?,
             )
             .map_err(SummaryCompositionError::InvalidResult)?;
+            transfer.preserves_member_contents =
+                left.preserves_member_contents && right.preserves_member_contents;
             insert_composed_transfer(&mut composed, transfer)?;
         }
     }
     let rows = composed
         .into_iter()
-        .map(|((input, exit), evidence)| SummaryTransfer {
-            input,
-            exit,
-            evidence,
-        })
+        .map(
+            |((input, exit), (evidence, preserves_member_contents))| SummaryTransfer {
+                input,
+                exit,
+                evidence,
+                preserves_member_contents,
+            },
+        )
         .collect();
     Ok((
         canonicalize_transfers(rows).map_err(SummaryCompositionError::InvalidResult)?,
@@ -4457,6 +4590,50 @@ impl ProductionSemanticSummaryStorage {
             storage: Arc::clone(self),
             attribution,
         }
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn retention_census_for_test(
+        self: &Arc<Self>,
+        census: &mut brokk_bifrost_core::retention_census::RetentionCensus,
+        family: &'static str,
+    ) {
+        use brokk_bifrost_core::retention_census::{
+            AllocationAccounting, FamilyLifetime, ResidentWeightUnit, UnknownKind,
+        };
+
+        const LIFETIME: FamilyLifetime = FamilyLifetime::Persistent;
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        census.record_arc_allocation(
+            Arc::clone(self),
+            family,
+            LIFETIME,
+            "semantic-summary-storage-owner",
+            std::mem::size_of::<Self>() as u64,
+            AllocationAccounting::OutsideBudget,
+        );
+        census.record_resident_reading(
+            family,
+            LIFETIME,
+            state.len() as u64,
+            state.retained_bytes() as u64,
+            ResidentWeightUnit::BytesEstimate,
+        );
+        census.record_unknown(
+            family,
+            LIFETIME,
+            UnknownKind::NativeBytes,
+            "semantic-entry-map-reverse-index-and-nested-summary-capacity",
+        );
+        census.record_unknown(
+            family,
+            LIFETIME,
+            UnknownKind::ActivePins,
+            "semantic_summary_reader_arc_pins_not_enumerated",
+        );
     }
 }
 
@@ -5366,6 +5543,7 @@ fn canonicalize_transfers(
                 if existing.input == transfer.input && existing.exit == transfer.exit =>
             {
                 existing.evidence = existing.evidence.join(&transfer.evidence)?;
+                existing.preserves_member_contents &= transfer.preserves_member_contents;
             }
             _ => canonical.push(transfer),
         }
@@ -5586,14 +5764,16 @@ fn checked_composition_work(
 }
 
 fn insert_composed_transfer(
-    composed: &mut HashMap<(SummaryPort, SummaryExit), SummaryEvidence>,
+    composed: &mut HashMap<(SummaryPort, SummaryExit), (SummaryEvidence, bool)>,
     transfer: SummaryTransfer,
 ) -> Result<(), SummaryCompositionError> {
     let key = (transfer.input, transfer.exit);
     if let Some(existing) = composed.get_mut(&key) {
-        *existing = existing
+        existing.0 = existing
+            .0
             .join(&transfer.evidence)
             .map_err(SummaryCompositionError::InvalidResult)?;
+        existing.1 &= transfer.preserves_member_contents;
         return Ok(());
     }
     if composed.len() == MAX_SUMMARY_TRANSFERS {
@@ -5601,7 +5781,7 @@ fn insert_composed_transfer(
             limit: MAX_SUMMARY_TRANSFERS,
         });
     }
-    composed.insert(key, transfer.evidence);
+    composed.insert(key, (transfer.evidence, transfer.preserves_member_contents));
     Ok(())
 }
 

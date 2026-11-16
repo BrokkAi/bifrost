@@ -369,11 +369,12 @@ pub(in crate::analyzer::store) fn publish(
     snapshot: &WorkspaceSnapshotId,
     head: Option<i64>,
     changed: &[i64],
+    budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
 ) -> Result<()> {
     if snapshot.lang != STORAGE_LANGUAGE {
         return Ok(());
     }
-    let Some(view) = CSharpCompilationView::selected(tx, snapshot)? else {
+    let Some(view) = CSharpCompilationView::selected(tx, snapshot, budget)? else {
         close_inventory(tx, snapshot)?;
         return Ok(());
     };
@@ -773,6 +774,7 @@ CREATE TEMP VIEW IF NOT EXISTS selected_csharp_compilation_using_coverage AS
 pub(in crate::analyzer::store) fn stage(
     tx: &Transaction<'_>,
     cancellation: &crate::CancellationToken,
+    budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
 ) -> Result<bool> {
     tx.execute_batch(OVERLAY_SCHEMA)?;
     // A retained selection can rebuild its inventory on the same connection.
@@ -813,7 +815,7 @@ pub(in crate::analyzer::store) fn stage(
         "INSERT INTO temp.selected_csharp_extent_state VALUES(0,?1)",
         [open],
     )?;
-    let Some(view) = CSharpCompilationView::selected(tx, &snapshot)? else {
+    let Some(view) = CSharpCompilationView::selected(tx, &snapshot, budget)? else {
         return Ok(true);
     };
     if !open {

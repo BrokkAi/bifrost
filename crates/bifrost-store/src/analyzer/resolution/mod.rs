@@ -443,7 +443,6 @@ pub use batch::BatchDefinitionNode;
 pub use batch::BatchEndpointClassification;
 pub use batch::BatchReferenceSeed;
 pub use batch::BatchResolutionEngine;
-pub use batch::BatchResolutionFragmentSource;
 pub use batch::BatchedReferenceAnswer;
 pub use batch::CandidatePathIdentity;
 pub use batch::ClassificationMemberOwnerReader;
@@ -465,6 +464,7 @@ pub use batch::SeedReadAuthority;
 pub use batch::SeededPartialPath;
 pub use batch::SeededPathKey;
 pub use batch::SeededReferenceRequest;
+pub use batch::{BatchResolutionFragmentSource, SelectedUniverseEntry};
 
 pub(crate) use batch::ForwardCandidateArtifactCache;
 pub(crate) use batch::MAX_REVERSE_TARGETS_PER_BATCH;
@@ -653,6 +653,7 @@ pub use fact_resolution::{
     canonical_projected_type_identity, canonical_type_identity,
 };
 
+pub(crate) use fact_resolution::linearize;
 #[cfg(any(test, feature = "test-support"))]
 pub use fact_resolution::reset_reverse_fact_evaluation_count_for_test;
 #[cfg(any(test, feature = "test-support"))]
@@ -661,7 +662,7 @@ pub use fact_resolution::reverse_fact_evaluation_count_for_test;
 #[doc(hidden)]
 pub use fact_resolution::with_full_typed_pass_for_test;
 pub(crate) use fact_resolution::{
-    CloseContinuationId, CloseProgress, CloseResume, HierarchyCursorScope,
+    CloseContinuationId, CloseProgress, CloseResume, HierarchyCursorScope, HierarchyDemandRequest,
     HierarchyLinearizationPolicy, HierarchyOrderBudget, HierarchyOrderDecision,
     HierarchyOrderFrontier, HierarchyOrderHead, HierarchyOrderOutcome, HierarchyOrderOutcomeId,
     HierarchyOrderPolicyId, HierarchyOrderRequest, HierarchyOrderStatus, HierarchyOrderedOwner,
@@ -670,6 +671,13 @@ pub(crate) use fact_resolution::{
     HierarchySelectionProvenance, HierarchySequenceId, HierarchySequenceRole,
     HierarchyTailMembership, ProviderObservationStore, RootClosure,
 };
+#[doc(hidden)]
+pub use fact_resolution::{
+    HierarchyEdgeProjection, HierarchyNodeProjection, HierarchyProjection, HierarchyStop,
+    RootUnavailableReason,
+};
+#[doc(hidden)]
+pub use fact_resolution::{LinearizationFailure, SupertypeSource};
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub use fact_resolution::{
@@ -710,8 +718,8 @@ pub(crate) use fact_source::language_jvm_package_requires_directory_agreement;
 pub(crate) use fact_source::language_type_qualifiers_search_companion_members;
 pub(crate) use fact_source::visit_mapped_typed_pages;
 pub use fact_source::{
-    ClassCreationKind, ConditionalTypeSeed, ImplicitBaseAuthority, ImplicitBaseInputs,
-    ImplicitRootObject,
+    ClassCreationKind, ConditionalTypeSeed, ImplicitAppendedBase, ImplicitBaseAuthority,
+    ImplicitBaseInputs, ImplicitRootObject, ImplicitWrittenBaseObjects,
 };
 
 pub use fact_source::DeferredMemberOwnerLookupName;
@@ -742,6 +750,7 @@ pub use fact_source::MAX_TYPED_FACT_ROWS_PER_PAGE;
 pub use fact_source::NamedArgumentLabel;
 pub use fact_source::NamedArgumentLabelRead;
 pub use fact_source::QualifiedRouteSlotLookup;
+pub use fact_source::RustBuiltinDeriveMember;
 pub use fact_source::RustImplementedTraits;
 pub use fact_source::SelectedFactRow;
 pub use fact_source::SelectedGapReasonProvenance;
@@ -854,6 +863,7 @@ pub(crate) use remount::retarget_lexical;
 pub use seam_profile::SeamProfiled;
 
 pub(crate) use selected_context::CatalogRootImportAnchors;
+pub use selected_context::ReasonDeterminism;
 pub(crate) use selected_context::SelectedContextIdentities;
 pub(crate) use selected_context::SelectedContextOverlay;
 pub(crate) use selected_context::SelectedContextOverlayCompilation;
@@ -889,6 +899,7 @@ pub(crate) use selected_context::SelectedGoImportBindingDescriptor;
 pub(crate) use selected_context::SelectedPackageBridgeDescriptor;
 
 pub use typed_fact_lowering::ExternalMemberCoverage;
+pub use typed_fact_lowering::LoweredBinaryOperation;
 pub use typed_fact_lowering::LoweredBindingProjection;
 pub use typed_fact_lowering::LoweredCallApplicabilityObligation;
 pub use typed_fact_lowering::LoweredCallArgumentProperty;
@@ -912,7 +923,6 @@ pub use typed_fact_lowering::LoweredMemberOwnerProperty;
 pub use typed_fact_lowering::LoweredMemberScopeProperty;
 pub use typed_fact_lowering::LoweredQualifiedSeededRoute;
 pub use typed_fact_lowering::LoweredSourceSupertypeProperty;
-pub use typed_fact_lowering::LoweredSupertypeProperty;
 pub use typed_fact_lowering::LoweredSupertypeTarget;
 pub use typed_fact_lowering::LoweredTypeArgument;
 pub use typed_fact_lowering::LoweredTypeComponent;
@@ -921,6 +931,7 @@ pub use typed_fact_lowering::LoweredTypeTransfer;
 pub use typed_fact_lowering::LoweredTypedFragment;
 pub use typed_fact_lowering::LoweredTypedFrontier;
 pub use typed_fact_lowering::LoweredUnderlyingType;
+pub use typed_fact_lowering::{LoweredSupertypeArguments, LoweredSupertypeProperty};
 
 pub(crate) use typed_fact_lowering::call_semantic_identity;
 pub(crate) use typed_fact_lowering::validate_type_identity_transfer;
@@ -1339,6 +1350,9 @@ fn assert_lookup_recipes_reach_emitted_artifact(
     );
     // The spelled impl-header paths crate derivation walks. A bare `Self`
     // subject has no lexical route, so its lookup is emitted only here.
+    for implementation in &common.structural_trait_impls {
+        emitted.insert(implementation.trait_terminal);
+    }
     for implementation in &common.trait_implementations {
         for path in [&implementation.subject, &implementation.implemented_trait] {
             emitted.extend(path.segments.iter().copied());
@@ -1574,3 +1588,5 @@ pub use selected_context::ExternalOwnerLanguage;
 
 #[doc(hidden)]
 pub use batch::{CandidatePathOrigin, HydratedCandidatePath};
+
+pub use fact_source::{BasePreservationGuard, BasePreservationMembers, BasePreservationRule};

@@ -12,14 +12,22 @@
         import.cfg_condition, context.cfg_atoms
  FROM targets
  CROSS JOIN selected_rust_unit_summaries AS unit ON unit.topology_id=targets.topology_id
- CROSS JOIN main.rust_unit_summary_placements AS source
+ CROSS JOIN temp.rust_unit_summary_placements AS source
   ON source.summary_id=unit.summary_id AND source.module_path=targets.module_path
  CROSS JOIN main.resolution_unit_summary_members AS member
   ON member.summary_id=source.summary_id AND member.member_ordinal=source.member_ordinal
+ CROSS JOIN main.resolution_unit_summary_placements AS shared_placement
+  INDEXED BY resolution_unit_summary_placements_member
+  ON shared_placement.summary_id=source.summary_id
+ AND shared_placement.member_ordinal=source.member_ordinal
+ AND shared_placement.container_path=CASE source.module_path WHEN 'crate' THEN '' ELSE source.module_path END
  CROSS JOIN source_rust_module_scopes AS scope
-  ON scope.blob_id=member.blob_id AND scope.ordinal=source.scope_ordinal
+  ON scope.blob_id=member.blob_id
+ AND scope.ordinal=(SELECT dense.dense_id FROM temp.surface_dense AS dense
+                    WHERE dense.blob_id=scope.blob_id AND dense.id_space=7
+                     AND dense.surface_ordinal=shared_placement.scope_surface_ordinal)
  CROSS JOIN source_rust_import_targets AS import
-  ON import.blob_id=member.blob_id AND import.native_scope=scope.resolution_scope
+  ON import.blob_id=scope.blob_id AND import.native_scope=scope.resolution_scope
  AND import.is_glob=1 AND import.local_start IS NULL
  CROSS JOIN source_rust_import_module_segments AS root
   ON root.blob_id=import.blob_id AND root.import_ordinal=import.ordinal
@@ -47,14 +55,22 @@ UNION
 SELECT 1
 FROM targets
 CROSS JOIN selected_rust_unit_summaries AS unit ON unit.topology_id=targets.topology_id
-CROSS JOIN main.rust_unit_summary_placements AS source
+CROSS JOIN temp.rust_unit_summary_placements AS source
  ON source.summary_id=unit.summary_id AND source.module_path='crate'
 CROSS JOIN main.resolution_unit_summary_members AS member
  ON member.summary_id=source.summary_id AND member.member_ordinal=source.member_ordinal
+ CROSS JOIN main.resolution_unit_summary_placements AS shared_placement
+  INDEXED BY resolution_unit_summary_placements_member
+  ON shared_placement.summary_id=source.summary_id
+ AND shared_placement.member_ordinal=source.member_ordinal
+ AND shared_placement.container_path=CASE source.module_path WHEN 'crate' THEN '' ELSE source.module_path END
 CROSS JOIN source_rust_module_scopes AS scope
- ON scope.blob_id=member.blob_id AND scope.ordinal=source.scope_ordinal
+ ON scope.blob_id=member.blob_id
+AND scope.ordinal=(SELECT dense.dense_id FROM temp.surface_dense AS dense
+                   WHERE dense.blob_id=scope.blob_id AND dense.id_space=7
+                    AND dense.surface_ordinal=shared_placement.scope_surface_ordinal)
 CROSS JOIN source_rust_import_targets AS import
- ON import.blob_id=member.blob_id AND import.native_scope=scope.resolution_scope
+ ON import.blob_id=scope.blob_id AND import.native_scope=scope.resolution_scope
  AND import.is_extern_crate=1 AND import.is_macro_use=1
  AND import.local_start IS NULL
 CROSS JOIN main.rust_resolution_unit_summary_gaps AS dependency
@@ -64,4 +80,13 @@ CROSS JOIN main.rust_resolution_unit_summary_gaps AS dependency
   OR (dependency.subject=source.module_path || '::' || COALESCE(import.bound_name,'*')
       AND json_extract(dependency.detail,'$.imported_name')=import.imported_name))
 CROSS JOIN main.rust_resolution_unit_summary_contexts AS context ON context.summary_id=unit.summary_id
-WHERE ?3='macro' AND cr_cfg(import.cfg_condition,json(context.cfg_atoms))<>0;
+WHERE ?3='macro' AND cr_cfg(import.cfg_condition,json(context.cfg_atoms))<>0
+UNION
+-- A module on the walk that this selection unplaced has no placement row, so the
+-- arms above read none of its imports and the lookup would look closed. Its
+-- inventory is unknown, which is open.
+SELECT 1
+FROM targets
+CROSS JOIN selected_rust_unit_summaries AS unit ON unit.topology_id=targets.topology_id
+CROSS JOIN temp.selected_rust_unplaced_gaps AS gap
+ ON gap.summary_id=unit.summary_id AND gap.subject=targets.module_path;

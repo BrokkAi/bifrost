@@ -5,7 +5,7 @@ use brokk_bifrost_core::attribution::ConnectionTag;
 use brokk_bifrost_core::cache_db::sql_profile::{connection_tag, on_connection_close};
 #[cfg(any(debug_assertions, test, feature = "test-support"))]
 use rusqlite::Connection;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use rusqlite::hooks::AuthAction;
 #[cfg(any(debug_assertions, test, feature = "test-support"))]
 use rusqlite::hooks::{AuthContext, Authorization};
@@ -13,13 +13,13 @@ use rusqlite::hooks::{AuthContext, Authorization};
 use std::collections::BTreeSet;
 #[cfg(any(debug_assertions, test, feature = "test-support"))]
 use std::collections::HashMap;
-#[cfg(test)]
+#[cfg(any(debug_assertions, test, feature = "test-support"))]
 use std::sync::Arc;
 #[cfg(any(debug_assertions, test, feature = "test-support"))]
 use std::sync::{Mutex, Once, OnceLock};
 
 #[cfg(any(debug_assertions, test, feature = "test-support"))]
-type Guard = for<'a> fn(AuthContext<'a>) -> Authorization;
+type Guard = Arc<dyn for<'a> Fn(AuthContext<'a>) -> Authorization + Send + Sync>;
 #[cfg(any(debug_assertions, test, feature = "test-support"))]
 #[derive(Default)]
 struct State {
@@ -47,14 +47,64 @@ fn clear_connection(tag: ConnectionTag) {
 }
 
 #[cfg(any(debug_assertions, test, feature = "test-support"))]
-pub(super) fn install_writer_guard(conn: &Connection, guard: Guard) {
+pub(super) fn install_writer_guard(
+    conn: &Connection,
+    guard: for<'a> fn(AuthContext<'a>) -> Authorization,
+) {
+    install_guard(conn, Arc::new(guard)).expect("install sealed-family authorizer");
+}
+
+#[cfg(any(debug_assertions, test, feature = "test-support"))]
+fn install_guard(conn: &Connection, guard: Guard) -> rusqlite::Result<()> {
+    // In-memory fixture connections also need a lifetime-safe registry key.
+    if connection_tag(conn).is_none() {
+        brokk_bifrost_core::cache_db::sql_profile::install_catalog_durable(conn);
+    }
+    let callback = Arc::clone(&guard);
+    conn.authorizer(Some(move |ctx: AuthContext<'_>| callback(ctx)))?;
     if let Some(tag) = connection_tag(conn) {
         with_state(|state| {
             state.guards.insert(tag, guard);
         });
     }
-    conn.authorizer(Some(guard))
-        .expect("install sealed-family authorizer");
+    Ok(())
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(super) fn compose_guard(
+    conn: &Connection,
+    guard: impl for<'a> Fn(AuthContext<'a>) -> Authorization + Send + Sync + 'static,
+) -> rusqlite::Result<()> {
+    let previous =
+        connection_tag(conn).and_then(|tag| with_state(|state| state.guards.get(&tag).cloned()));
+    install_guard(
+        conn,
+        Arc::new(move |ctx| {
+            let result = guard(ctx);
+            if result == Authorization::Allow {
+                previous
+                    .as_ref()
+                    .map_or(Authorization::Allow, |guard| guard(ctx))
+            } else {
+                result
+            }
+        }),
+    )
+}
+
+/// Restore the composed authorizer even on an early return or unwind.
+#[cfg(any(test, feature = "test-support"))]
+pub(super) fn without_member_blob_reads<T>(conn: &Connection, derive: impl FnOnce() -> T) -> T {
+    let _restore = restore_guard_on_drop(conn);
+    compose_guard(conn, |ctx| match ctx.action {
+        AuthAction::Read {
+            table_name: "resolution_unit_summary_members",
+            column_name: "blob_id",
+        } => Authorization::Deny,
+        _ => Authorization::Allow,
+    })
+    .expect("install member blob read guard");
+    derive()
 }
 
 /// Functions whose value is a function of their SQL arguments alone, so a
@@ -162,6 +212,9 @@ const DETERMINISTIC_FUNCTIONS: &[&str] = &[
     // resolution_lexical.rs, go_unit_summaries.rs).
     "cr_parent",
     "cr_join",
+    "cr_module_candidate",
+    "cr_module_candidates",
+    "cr_module_file_dir",
     "cr_authority_namespace",
     "cr_authority_cfg",
     "cr_cfg",
@@ -177,13 +230,13 @@ const DETERMINISTIC_FUNCTIONS: &[&str] = &[
 #[cfg(test)]
 fn with_read_recorder<T>(conn: &Connection, prepare: impl FnOnce(&Arc<Mutex<Reads>>) -> T) -> T {
     let tag = connection_tag(conn);
-    let previous = tag.and_then(|tag| with_state(|state| state.guards.get(&tag).copied()));
+    let previous = tag.and_then(|tag| with_state(|state| state.guards.get(&tag).cloned()));
     let reads = Arc::new(Mutex::new(Reads::default()));
     let sink = Arc::clone(&reads);
     // sqlite3_set_authorizer expires the connection's prepared statements, so
     // its next use re-prepares them. The read-set cache exists to avoid
     // repeating that for a statement text already classified.
-    conn.authorizer(Some(move |ctx: AuthContext<'_>| {
+    compose_guard(conn, move |ctx: AuthContext<'_>| {
         let mut reads = sink.lock().expect("read authorizer poisoned");
         if let Some(accessor) = ctx.accessor {
             reads.accessors.insert(accessor.to_owned());
@@ -240,19 +293,22 @@ fn with_read_recorder<T>(conn: &Connection, prepare: impl FnOnce(&Arc<Mutex<Read
             _ => reads.invalid = true,
         }
         Authorization::Allow
-    }))
+    })
     .expect("install read recorder");
     struct Restore<'a>(&'a Connection, Option<Guard>);
     impl Drop for Restore<'_> {
         fn drop(&mut self) {
-            if let Some(guard) = self.1 {
-                self.0
-                    .authorizer(Some(guard))
-                    .expect("restore writer guard");
+            if let Some(guard) = self.1.take() {
+                install_guard(self.0, guard).expect("restore writer guard");
             } else {
                 self.0
-                    .authorizer(None::<Guard>)
+                    .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
                     .expect("remove read recorder");
+                if let Some(tag) = connection_tag(self.0) {
+                    with_state(|state| {
+                        state.guards.remove(&tag);
+                    });
+                }
             }
         }
     }
@@ -293,4 +349,31 @@ pub(super) fn record_accesses(
                 .collect(),
         )
     })
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(super) struct Restore<'a>(&'a Connection, Option<Guard>);
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for Restore<'_> {
+    fn drop(&mut self) {
+        if let Some(guard) = self.1.take() {
+            install_guard(self.0, guard).expect("restore derivation authorizer");
+        } else {
+            self.0
+                .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+                .expect("remove derivation authorizer");
+            if let Some(tag) = connection_tag(self.0) {
+                with_state(|state| {
+                    state.guards.remove(&tag);
+                });
+            }
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(super) fn restore_guard_on_drop(conn: &Connection) -> Restore<'_> {
+    let previous =
+        connection_tag(conn).and_then(|tag| with_state(|state| state.guards.get(&tag).cloned()));
+    Restore(conn, previous)
 }

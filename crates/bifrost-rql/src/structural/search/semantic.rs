@@ -1,6 +1,7 @@
 use super::dispatch::{DispatchBoundaryClass, DispatchProof};
-use super::{DerivationExecutionCause, Incompleteness};
+use super::{DerivationExecutionCause, EXECUTION_DEPENDENT, Incompleteness};
 use brokk_bifrost_analysis::analyzer::workspace_authority::{CaptureScopedMemo, memo_attribution};
+use brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict;
 use std::mem::{align_of, size_of};
 use std::sync::Arc;
 
@@ -44,6 +45,7 @@ use crate::analyzer::semantic_model::{
     ActiveSemanticModelSnapshot, CompiledConcurrencyEffect, CompiledSummaryInput, Completeness,
     ProcedureSummaryMemberKey, SemanticModelMatchDisposition, SemanticModelOverlay,
 };
+use crate::analyzer::store::cache_budget::RetainedHeap;
 use crate::analyzer::{ProjectFile, WorkspaceAnalyzer};
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
@@ -51,6 +53,7 @@ use crate::structural::analysis_context::{
     ProtocolRef, QueryAnalysisContext, TaintResultRef, ValueFlowPlanRef,
 };
 use crate::text_utils::compute_line_starts;
+use brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::SelectedPatternObservation;
 use brokk_bifrost_core::analyzer::model::Language;
 use brokk_bifrost_rql::WitnessTraversal;
 
@@ -154,6 +157,7 @@ impl SemanticProcedureReferenceValue {
             path: self.public.path.clone(),
             procedure_kind: self.public.procedure_kind,
             range: self.public.range,
+            source_owner: None,
         }
     }
 }
@@ -345,6 +349,10 @@ pub(super) struct SemanticQueryContext<'a> {
     artifact_window_file: Option<ProjectFile>,
     initial_artifact_lease_error: Option<crate::analyzer::semantic::SemanticArtifactLeaseError>,
     promote_artifact_windows: bool,
+    // Admission census only. The lease storage pins every visited owner across
+    // file windows and receipts. A failed transaction drops this census before
+    // the rejected owner can die, so no unpinned address can be reused.
+    selected_pattern_heap: Option<RetainedHeap>,
     materialized_files: HashSet<ProjectFile>,
     cache_hits: usize,
     active_retained_bytes: usize,
@@ -360,6 +368,9 @@ pub(super) struct SemanticQueryContext<'a> {
     value_flow: ValueFlowQueryState,
     taint: TaintQueryState,
     type_flow: super::type_flow::TypeFlowQueryState,
+    /// The execution dependences this context marked; the query result joins
+    /// it into its reuse verdict.
+    reuse: ReuseVerdict,
 }
 
 pub(super) struct ModeledTaskSpawn {
@@ -497,6 +508,28 @@ fn callback_invoked_formals(
 }
 
 impl<'a> SemanticQueryContext<'a> {
+    /// Dual write while the ambient channel still decides: mark the active
+    /// captures and join the dependence into this context's verdict.
+    #[track_caller]
+    pub(super) fn mark_execution_dependent(&mut self) {
+        self.workspace.analyzer().mark_execution_dependent();
+        self.reuse.join_in(EXECUTION_DEPENDENT);
+    }
+
+    /// Join a dependence that a caller marked on its own analyzer receiver.
+    pub(super) fn join_reuse(&mut self, verdict: ReuseVerdict) {
+        self.reuse.join_in(verdict);
+    }
+
+    /// This context's verdict joined with its row families'.
+    pub(super) fn reuse(&self) -> ReuseVerdict {
+        self.reuse
+            .join(self.typestate.reuse)
+            .join(self.value_flow.reuse)
+            .join(self.taint.reuse)
+            .join(self.type_flow.reuse)
+    }
+
     pub(super) fn cancellation(&self) -> &CancellationToken {
         self.cancellation.unwrap_or(&self.uncancelled)
     }
@@ -699,6 +732,12 @@ impl<'a> SemanticQueryContext<'a> {
         let promote_artifact_windows = artifact_leases.is_some();
         let artifact_leases = artifact_leases
             .unwrap_or_else(|| SemanticArtifactLeaseSet::new(limits.max_retained_bytes).snapshot());
+        let mut selected_pattern_heap = RetainedHeap::default();
+        artifact_leases.census_owners(|owner| {
+            if let Some(proof) = owner.downcast_ref::<SelectedPatternObservation>() {
+                selected_pattern_heap.arc(owner, |_, heap| proof.retained_heap(heap));
+            }
+        });
         let mut artifact_leases = artifact_leases
             .restrict_to(limits.max_retained_bytes)
             .into_child();
@@ -731,6 +770,7 @@ impl<'a> SemanticQueryContext<'a> {
             artifact_window_file: None,
             initial_artifact_lease_error,
             promote_artifact_windows,
+            selected_pattern_heap: Some(selected_pattern_heap),
             materialized_files: HashSet::default(),
             cache_hits: 0,
             active_retained_bytes: 0,
@@ -740,6 +780,7 @@ impl<'a> SemanticQueryContext<'a> {
             source_call_indexes: CaptureScopedMemo::default(),
             prepared_source_dispatch: CaptureScopedMemo::default(),
             budget_exhausted: false,
+            reuse: ReuseVerdict::Content,
             effect_work: super::CodeQueryEffectWork::default(),
             typestate: TypestateQueryState::default(),
             value_flow: ValueFlowQueryState::default(),
@@ -765,10 +806,20 @@ impl<'a> SemanticQueryContext<'a> {
     /// retain the exact activation while continuing to materialize semantic
     /// rows through this mutable context.
     pub(super) fn semantic_model_overlay(&self) -> Option<Arc<SemanticModelOverlay>> {
-        self.active_semantic_model_snapshot
-            .as_ref()?
-            .semantic_model_overlay()
-            .cloned()
+        let analyzer = self.workspace.analyzer();
+        let _scope = analyzer
+            .active_query_semantic_model_overlay()
+            .is_none()
+            .then(|| {
+                crate::analyzer::AnalyzerQueryScope::with_active_semantic_model_snapshot(
+                    analyzer,
+                    self.active_semantic_model_snapshot.clone(),
+                )
+            });
+        self.workspace
+            .analyzer()
+            .semantic_model_overlay_read()
+            .published()
     }
 
     /// Require Python declaration-model coverage before a query can claim an
@@ -1085,7 +1136,7 @@ impl<'a> SemanticQueryContext<'a> {
             };
             let (answer, dispatch_incompleteness) = self.dispatch_at_source_with_cause(file, range);
             if dispatch_incompleteness.execution_cause().is_some() {
-                self.workspace.analyzer().mark_execution_dependent();
+                self.mark_execution_dependent();
             }
             let contexts = answer
                 .call_contexts
@@ -1109,7 +1160,7 @@ impl<'a> SemanticQueryContext<'a> {
         file: &ProjectFile,
         range: crate::analyzer::Range,
     ) -> (super::dispatch::DispatchSiteAnswer, Incompleteness) {
-        use super::dispatch::{DispatchArm, DispatchSiteAnswer, DispatchStatus};
+        use super::dispatch::{DispatchSiteAnswer, DispatchStatus};
 
         // Release before materializing the next file: materialization may publish.
         self.prepared_source_dispatch.read_mut(
@@ -1189,10 +1240,14 @@ impl<'a> SemanticQueryContext<'a> {
                         Incompleteness::Operational(DerivationExecutionCause::Budget),
                     );
                 }
+                // The provider could not analyze this file, which says nothing
+                // about its content: the diagnostic carries the same operational
+                // cause as the dispatch answer returned beside it, so no
+                // reader can treat the gap as a content finding.
                 let reason = error.to_string();
                 self.push_diagnostic(
                     CodeQueryDiagnosticCode::SemanticProviderFailed,
-                    Incompleteness::Content,
+                    Incompleteness::Operational(DerivationExecutionCause::Provider),
                     CodeQueryDiagnosticImpact::Incomplete,
                     file,
                     &reason,
@@ -1209,6 +1264,223 @@ impl<'a> SemanticQueryContext<'a> {
                 Incompleteness::Operational(DerivationExecutionCause::Budget),
             );
         }
+
+        self.project_source_dispatch(file, outcome)
+    }
+
+    /// The live call a durable call key names in `file`'s retained artifact,
+    /// or `None` when the artifact is unavailable or no longer holds it.
+    fn call_for_key(
+        &mut self,
+        file: &ProjectFile,
+        call: &brokk_bifrost_flow::value_flow::DurableCallSiteKey,
+    ) -> Option<crate::analyzer::semantic::CallSiteHandle> {
+        let outcome = self.materialized_outcome(file)?;
+        let artifact = outcome.available_value()?;
+        if artifact.key() != &call.0.0 {
+            return None;
+        }
+        let procedure = artifact.procedure_handle(call.0.1)?;
+        if procedure.durable_key() != call.0 {
+            return None;
+        }
+        procedure.call_site_handle(call.1)
+    }
+
+    /// Run one oracle question about `call` under this query's semantic
+    /// budget, cancellation and artifact window.
+    fn with_call_oracle<T>(
+        &mut self,
+        file: &ProjectFile,
+        call: &brokk_bifrost_flow::value_flow::DurableCallSiteKey,
+        ask: impl FnOnce(
+            &crate::analyzer::semantic::WorkspaceSemanticOracle<'a>,
+            &crate::analyzer::semantic::CallSiteHandle,
+            &mut SemanticRequest<'_>,
+        )
+            -> Result<SemanticOutcome<T>, crate::analyzer::semantic::SemanticProviderError>,
+    ) -> Option<Result<SemanticOutcome<T>, crate::analyzer::semantic::SemanticProviderError>> {
+        let handle = self.call_for_key(file, call)?;
+        let oracle = crate::analyzer::semantic::WorkspaceSemanticOracle::with_dispatch_hints(
+            self.workspace,
+            self.active_semantic_model_snapshot.clone(),
+            DispatchHints::empty(),
+        );
+        let cancellation = self.cancellation.unwrap_or(&self.uncancelled);
+        let collector = self
+            .artifact_window
+            .as_ref()
+            .map(SemanticArtifactLeaseWindow::collector);
+        let mut request = SemanticRequest::new(&mut self.budget, cancellation);
+        if let Some(collector) = &collector {
+            request = request.with_artifact_collector(collector);
+        }
+        Some(ask(&oracle, &handle, &mut request))
+    }
+
+    /// #12968: the formal parameter of `call`'s own procedure whose unchanged
+    /// value is the call's receiver on every execution, through the shared
+    /// identity-preserving walk. `None` when the call has no receiver, the
+    /// walk refuses, or the question was interrupted.
+    pub(super) fn receiver_parameter_origin(
+        &mut self,
+        file: &ProjectFile,
+        call: &brokk_bifrost_flow::value_flow::DurableCallSiteKey,
+    ) -> Option<u32> {
+        let handle = self.call_for_key(file, call)?;
+        // The walk reads only the call's own semantic artifact.
+        self.workspace
+            .analyzer()
+            .record_read(crate::analyzer::ReadKey::semantic_artifact(
+                handle.procedure().artifact().key(),
+            ));
+        let receiver = handle
+            .procedure()
+            .semantics()
+            .call_site(handle.id())?
+            .receiver?;
+        let cancellation = self.cancellation.unwrap_or(&self.uncancelled);
+        let mut request = SemanticRequest::new(&mut self.budget, cancellation);
+        let outcome = crate::analyzer::semantic::workspace_oracle::dispatch::parameter_origin(
+            handle.procedure(),
+            receiver,
+            &mut request,
+        );
+        match outcome {
+            Ok(SemanticOutcome::Complete { value, .. }) => value,
+            Ok(SemanticOutcome::Cancelled { .. } | SemanticOutcome::ExceededBudget { .. })
+            | Err(_) => {
+                self.mark_execution_dependent();
+                None
+            }
+            Ok(_) => None,
+        }
+    }
+
+    /// Whether the artifact window still fits after a contextual oracle
+    /// question, which can materialize a callee's artifact. An overflow is a
+    /// budget stop, reported once, never a content answer.
+    fn contextual_window_fits(&mut self, file: &ProjectFile) -> bool {
+        if self.artifact_window_fits(file) {
+            return true;
+        }
+        self.budget_exhausted = true;
+        self.push_diagnostic(
+            CodeQueryDiagnosticCode::SemanticBudgetExhausted,
+            Incompleteness::Operational(DerivationExecutionCause::Budget),
+            CodeQueryDiagnosticImpact::Incomplete,
+            file,
+            "a receiver-context question exceeded its artifact window",
+        );
+        false
+    }
+
+    /// #12968: the classes the entering call `call` in `file` proves for the
+    /// formal parameters of its unique callee, handle-free. `None` proves
+    /// nothing; the incompleteness says whether that was content or an
+    /// interrupted question.
+    pub(super) fn argument_classes(
+        &mut self,
+        file: &ProjectFile,
+        call: &brokk_bifrost_flow::value_flow::DurableCallSiteKey,
+    ) -> (Option<ArgumentClassesAnswer>, Incompleteness) {
+        let outcome = self.with_call_oracle(file, call, |oracle, call, request| {
+            oracle.argument_classes_recorded(call, request)
+        });
+        if !self.contextual_window_fits(file) {
+            return (
+                None,
+                Incompleteness::Operational(DerivationExecutionCause::Budget),
+            );
+        }
+        let outcome = match outcome {
+            None => return (None, Incompleteness::Content),
+            Some(Err(_)) => {
+                return (
+                    None,
+                    Incompleteness::Operational(DerivationExecutionCause::Provider),
+                );
+            }
+            Some(Ok(outcome)) => outcome,
+        };
+        let incompleteness = Self::partial_outcome_code(&outcome).1;
+        let answer = match outcome {
+            SemanticOutcome::Complete {
+                value: Some(answer),
+                ..
+            } => Some(ArgumentClassesAnswer {
+                callee: answer.callee.durable_key(),
+                classes: answer.classes,
+            }),
+            _ => None,
+        };
+        (answer, incompleteness)
+    }
+
+    /// #12968: dispatch of `call` in `file` under the hypothesis that its
+    /// receiver holds an instance of `class`, projected exactly as
+    /// [`Self::dispatch_at_source_with_cause`] projects ordinary dispatch.
+    pub(super) fn conditional_dispatch(
+        &mut self,
+        file: &ProjectFile,
+        call: &brokk_bifrost_flow::value_flow::DurableCallSiteKey,
+        class: &str,
+    ) -> (super::dispatch::DispatchSiteAnswer, Incompleteness) {
+        use super::dispatch::{DispatchSiteAnswer, DispatchStatus};
+        use crate::analyzer::semantic::workspace_oracle::source::{
+            SourceOutcomeQuality, projected_source_coverage,
+        };
+        use crate::analyzer::semantic::{SourceDispatchObservation, SourceDispatchResult};
+        let mut observed = None;
+        let outcome = self.with_call_oracle(file, call, |oracle, call, request| {
+            observed = Some(call.clone());
+            oracle.resolve_call_with_receiver_class_recorded(call, class, request)
+        });
+        if !self.contextual_window_fits(file) {
+            return (
+                DispatchSiteAnswer::interrupted(DispatchStatus::ExceededBudget, None, None),
+                Incompleteness::Operational(DerivationExecutionCause::Budget),
+            );
+        }
+        let (outcome, call) = match (outcome, observed) {
+            (Some(Ok(outcome)), Some(call)) => (outcome, call),
+            (Some(Err(_)), _) => {
+                return (
+                    DispatchSiteAnswer::interrupted(DispatchStatus::Unknown, None, None),
+                    Incompleteness::Operational(DerivationExecutionCause::Provider),
+                );
+            }
+            _ => {
+                return (
+                    DispatchSiteAnswer::interrupted(DispatchStatus::Unknown, None, None),
+                    Incompleteness::Content,
+                );
+            }
+        };
+        let quality = SourceOutcomeQuality::from_outcome(&outcome);
+        let outcome = outcome.map(|dispatch| SourceDispatchResult {
+            coverage: projected_source_coverage(
+                quality,
+                dispatch.coverage().is_truncated(),
+                dispatch.coverage().is_exhaustive(),
+            ),
+            observations: Box::new([SourceDispatchObservation {
+                call,
+                quality,
+                dispatch,
+            }]),
+        });
+        self.project_source_dispatch(file, outcome)
+    }
+
+    /// Project one oracle source-dispatch answer into the row vocabulary,
+    /// without re-deriving anything.
+    fn project_source_dispatch(
+        &mut self,
+        file: &ProjectFile,
+        outcome: SemanticOutcome<crate::analyzer::semantic::SourceDispatchResult>,
+    ) -> (super::dispatch::DispatchSiteAnswer, Incompleteness) {
+        use super::dispatch::{DispatchArm, DispatchSiteAnswer, DispatchStatus};
 
         let status = DispatchStatus::from_outcome(&outcome);
         let label = status.label();
@@ -1291,9 +1563,17 @@ impl<'a> SemanticQueryContext<'a> {
                     ));
                 }
                 let target = candidate.target();
+                let target_file = super::witness_projection::locator_file(
+                    self.workspace,
+                    target.semantics().locator(),
+                );
+                let Some(target) = self.select_procedure(&target_file, target.clone()) else {
+                    continue;
+                };
                 let locator = target.semantics().locator();
                 arms.push(DispatchArm {
                     call_context,
+                    target_kind: Some(target.semantics().kind()),
                     target_procedure: Some(target.durable_key()),
                     target_locator: Some(locator.clone()),
                     boundary: None,
@@ -1341,6 +1621,7 @@ impl<'a> SemanticQueryContext<'a> {
                     .map(|target| target.artifact().public_fingerprint().to_string());
                 arms.push(DispatchArm {
                     call_context,
+                    target_kind: None,
                     target_procedure: None,
                     target_locator: Some(locator.clone()),
                     boundary: Some(boundary.kind.clone()),
@@ -1586,7 +1867,10 @@ impl<'a> SemanticQueryContext<'a> {
         file: &ProjectFile,
         range: crate::analyzer::Range,
         source_identity: ContentIdentity,
-    ) -> Option<CallSiteHandle> {
+    ) -> Option<(
+        CallSiteHandle,
+        Vec<crate::analyzer::semantic::service::CandidateMacroRefusalEvidence>,
+    )> {
         let (artifact, _, quality) = self.materialize(file)?;
         if source_identity != artifact.key().revision().content() {
             self.push_source_generation_changed(file);
@@ -1603,7 +1887,65 @@ impl<'a> SemanticQueryContext<'a> {
         let end = index
             .candidates
             .partition_point(|candidate| (candidate.span.start, candidate.span.end) <= exact_key);
-        (end.saturating_sub(start) == 1).then(|| index.candidates[start].call.clone())
+        let call =
+            (end.saturating_sub(start) == 1).then(|| index.candidates[start].call.clone())?;
+        let selected = self.select_procedure_with_evidence(file, call.procedure().clone())?;
+        Some((call, selected.refusals))
+    }
+
+    /// Whether the selected procedure realizes the candidate invocation at this
+    /// source range as an intrinsic (#11251). An intrinsic is not a call, so its
+    /// call-shape row is dropped. A refused or unproven candidate is not one: it
+    /// keeps its candidate row and its refusal reason.
+    pub(super) fn admitted_intrinsic_at_source(
+        &mut self,
+        file: &ProjectFile,
+        range: crate::analyzer::Range,
+        source_identity: ContentIdentity,
+    ) -> bool {
+        let Some((artifact, _, quality)) = self.materialize(file) else {
+            return false;
+        };
+        if source_identity != artifact.key().revision().content() {
+            self.push_source_generation_changed(file);
+            return false;
+        }
+        if !quality.is_complete() {
+            return false;
+        }
+        // A candidate macro invocation is lowered in the innermost procedure
+        // whose source span contains it, directly or nested in another
+        // candidate macro (log::info!("{}", matches!(x, 1))). The candidate
+        // records live on that procedure's selected alternate, so only it is
+        // selected. A file-wide query therefore makes one procedure pass and
+        // one selection per candidate, and an unrelated procedure's selection
+        // cannot refuse it.
+        let contains = |procedure: &&ProcedureSemantics| {
+            let span = procedure.locator().anchor().span();
+            span.start_byte() as usize <= range.start_byte
+                && range.end_byte <= span.end_byte() as usize
+        };
+        let Some(owner) = artifact
+            .procedures()
+            .iter()
+            .filter(contains)
+            .min_by_key(|procedure| {
+                let span = procedure.locator().anchor().span();
+                span.end_byte() - span.start_byte()
+            })
+        else {
+            return false;
+        };
+        let base = artifact
+            .procedure_handle(owner.id())
+            .expect("indexed procedure exists");
+        let Some(selected) = self.select_procedure(file, base) else {
+            return false;
+        };
+        matches!(
+            crate::analyzer::usages::call_shape::admitted_candidate_realization(&selected, range),
+            crate::analyzer::usages::call_shape::AdmittedCandidateRealization::Intrinsic
+        )
     }
 
     /// Charge the query's shared traversal ledger for each inspected source
@@ -1912,6 +2254,73 @@ impl<'a> SemanticQueryContext<'a> {
         Ok(run(workspace, snapshot, artifact, &mut request))
     }
 
+    /// Admit one language-rule proof before publishing its positive row role.
+    /// Exact artifacts and proof heaps join the same existing lease authority;
+    /// neither a partial materialization nor its diagnostics are upgraded.
+    pub(super) fn retain_selected_pattern_source(
+        &mut self,
+        file: &ProjectFile,
+        proof: &Arc<SelectedPatternObservation>,
+    ) -> bool {
+        let Some(heap) = self.selected_pattern_heap.as_mut() else {
+            return false;
+        };
+        let before = heap.bytes();
+        heap.arc(proof, |proof, heap| proof.retained_heap(heap));
+        let owned_bytes = heap
+            .bytes()
+            .checked_sub(before)
+            .expect("owner census is monotonic");
+        let artifact = proof.observation().point().procedure().artifact();
+        // A cached partial artifact was charged as active, unleased memory.
+        // Transfer that charge to its exact lease rather than counting twice.
+        let transfer_bytes = if !self.artifact_leases.contains_exact(artifact)
+            && self
+                .artifact_window
+                .as_ref()
+                .is_none_or(|window| !window.contains_exact(artifact))
+            && self.cache.get(file).is_some_and(|cached| {
+                matches!(cached,
+                CachedSemanticMaterialization::Outcome { outcome, .. }
+                    if outcome.available_value().is_some_and(|value| Arc::ptr_eq(value, artifact)))
+            }) {
+            usize::try_from(semantic_artifact_retained_bytes(artifact)).unwrap_or(usize::MAX)
+        } else {
+            0
+        };
+        let active_bytes = self
+            .active_retained_bytes
+            .checked_sub(transfer_bytes)
+            .expect("cached unleased artifact has an active memory charge");
+        let window = self
+            .artifact_window
+            .take()
+            .unwrap_or_else(|| self.artifact_leases.begin_window(active_bytes));
+        let retained = window.retain_exact_owner(file, artifact, proof, owned_bytes);
+        let result = match retained {
+            Ok(()) => window.commit(&mut self.artifact_leases),
+            Err(error) => {
+                window.discard();
+                Err(error)
+            }
+        };
+        if let Err(error) = result {
+            self.selected_pattern_heap = None;
+            self.budget_exhausted = true;
+            self.push_exhausted_diagnostic(
+                file,
+                &error.to_string(),
+                "semantic/retained_bytes",
+                None,
+            );
+            return false;
+        }
+        self.active_retained_bytes = active_bytes;
+        self.observe_transient_active_retained_bytes(0);
+        proof.replay_reads(self.workspace);
+        true
+    }
+
     /// How many files this query has materialized so far.
     #[cfg(test)]
     pub(super) fn materialization_attempts(&self) -> usize {
@@ -1927,6 +2336,13 @@ impl<'a> SemanticQueryContext<'a> {
         file: &ProjectFile,
         artifact: &Arc<SemanticArtifact>,
     ) -> Option<Arc<SemanticSourceCallIndex>> {
+        let mut procedures = Vec::new();
+        for procedure in artifact.procedures() {
+            let base = artifact
+                .procedure_handle(procedure.id())
+                .expect("indexed procedure exists");
+            procedures.push(self.select_procedure(file, base)?);
+        }
         if self
             .source_call_indexes
             .read(&memo_attribution(self.workspace.analyzer()), |indexes| {
@@ -1952,14 +2368,17 @@ impl<'a> SemanticQueryContext<'a> {
             );
             return None;
         }
-        let reservation_bytes =
-            match SemanticSourceCallIndex::reservation_bytes(artifact.work().call_sites) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    self.reject_retained_bytes_error(file, error);
-                    return None;
-                }
-            };
+        let call_count = procedures
+            .iter()
+            .map(|handle| handle.semantics().call_sites().len())
+            .sum();
+        let reservation_bytes = match SemanticSourceCallIndex::reservation_bytes(call_count) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.reject_retained_bytes_error(file, error);
+                return None;
+            }
+        };
         if self.artifact_window.is_some() {
             // Index metadata is mandatory for this row family. An idle parsed
             // dispatch cache is optional and must not participate in (or
@@ -1984,13 +2403,14 @@ impl<'a> SemanticQueryContext<'a> {
             }
             None
         };
-        let mut candidates = Vec::with_capacity(artifact.work().call_sites);
+        let mut candidates = Vec::with_capacity(call_count);
         let candidate_storage_bytes =
-            SemanticSourceCallIndex::candidate_storage_retained_bytes(artifact.work().call_sites)
+            SemanticSourceCallIndex::candidate_storage_retained_bytes(call_count)
                 .expect("a successful total reservation includes candidate storage");
         self.observe_transient_active_retained_bytes(candidate_storage_bytes);
-        let cancellation = self.cancellation.unwrap_or(&self.uncancelled);
-        for procedure in artifact.procedures() {
+        let cancellation = self.cancellation.cloned().unwrap_or_default();
+        for procedure_handle in procedures {
+            let procedure = procedure_handle.semantics();
             if cancellation.is_cancelled() {
                 self.push_diagnostic(
                     CodeQueryDiagnosticCode::Cancelled,
@@ -2012,9 +2432,6 @@ impl<'a> SemanticQueryContext<'a> {
             }
             self.traversal_steps = self.traversal_steps.saturating_add(1);
 
-            let Some(procedure_handle) = artifact.procedure_handle(procedure.id()) else {
-                continue;
-            };
             for call in procedure.call_sites() {
                 self.traversal_steps = self.traversal_steps.saturating_add(1);
 
@@ -2033,7 +2450,7 @@ impl<'a> SemanticQueryContext<'a> {
         }
         assert_eq!(
             candidates.len(),
-            artifact.work().call_sites,
+            call_count,
             "complete artifact call census matches its source-call index"
         );
         candidates.sort_unstable_by(|left, right| {
@@ -2517,9 +2934,16 @@ impl<'a> SemanticQueryContext<'a> {
             Incompleteness::Content,
             CodeQueryDiagnosticImpact::Incomplete,
             &seed.file,
-            &format!(
-                "program-point-of requires a {purpose} for structural node {:?}; matched program point ids: {mapped_ids:?}",
-                seed.fact_match.node
+            &brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+                format_args!(
+                    "program-point-of requires a {purpose} for structural node {:?}; matched program point ids: {mapped_ids:?}",
+                    seed.fact_match.node
+                ),
+                format_args!(
+                    "program-point-of requires a {purpose} for structural node {:?}",
+                    seed.fact_match.node
+                ),
+                mapped_ids.iter(),
             ),
         );
         Vec::new()
@@ -2572,9 +2996,16 @@ impl<'a> SemanticQueryContext<'a> {
             Incompleteness::Content,
             CodeQueryDiagnosticImpact::Incomplete,
             &procedure.file,
-            &format!(
-                "program-point-by-id requires one content-scoped point {id:?} in procedure {}; matched program point ids: {matched_ids:?}",
-                procedure.wire_id()
+            &brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+                format_args!(
+                    "program-point-by-id requires one content-scoped point {id:?} in procedure {}; matched program point ids: {matched_ids:?}",
+                    procedure.wire_id()
+                ),
+                format_args!(
+                    "program-point-by-id requires one content-scoped point {id:?} in procedure {}",
+                    procedure.wire_id()
+                ),
+                matched_ids.iter(),
             ),
         );
         Vec::new()
@@ -2783,9 +3214,12 @@ impl<'a> SemanticQueryContext<'a> {
             return None;
         };
         Some(SemanticProcedureValue {
-            handle: artifact
-                .procedure_handle(id)
-                .expect("indexed procedure exists"),
+            handle: self.select_procedure(
+                &reference.file,
+                artifact
+                    .procedure_handle(id)
+                    .expect("indexed procedure exists"),
+            )?,
             file: reference.file.clone(),
             source,
             quality,
@@ -2835,7 +3269,13 @@ impl<'a> SemanticQueryContext<'a> {
             },
             CodeQueryDiagnosticImpact::Incomplete,
             file,
-            &format!("selected source callable input inventory is incomplete: {refusals:?}"),
+            &brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+                format_args!(
+                    "selected source callable input inventory is incomplete: {refusals:?}"
+                ),
+                format_args!("selected source callable input inventory is incomplete"),
+                refusals.iter(),
+            ),
         );
         false
     }
@@ -2862,7 +3302,10 @@ impl<'a> SemanticQueryContext<'a> {
             self.push_source_generation_changed(&file);
             return None;
         }
-        let handle = artifact.procedure_handle(key.1)?;
+        let handle = self.select_procedure(&file, artifact.procedure_handle(key.1)?)?;
+        if handle.durable_key() != *key {
+            return None;
+        }
         if handle.semantics().locator() != locator {
             return None;
         }
@@ -3079,7 +3522,7 @@ impl<'a> SemanticQueryContext<'a> {
                     self.work().budget_exhausted
                 )
             });
-            self.workspace.analyzer().mark_execution_dependent();
+            self.mark_execution_dependent();
         }
         self.reported.clear();
         let mut diagnostics = std::mem::take(&mut self.diagnostics);
@@ -3237,7 +3680,13 @@ impl<'a> SemanticQueryContext<'a> {
                         CodeQueryDiagnosticCode::SemanticAnalysisPartial,
                         dispatch_incompleteness,
                     ),
-                    format!("task spawn has no unique exact external target: {dispatch:#?}"),
+                    brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+                        format_args!(
+                            "task spawn has no unique exact external target: {dispatch:#?}"
+                        ),
+                        format_args!("task spawn has no unique exact external target"),
+                        std::iter::once(&dispatch),
+                    ),
                 ));
                 continue;
             };
@@ -3310,9 +3759,13 @@ impl<'a> SemanticQueryContext<'a> {
                     continue;
                 };
                 found_task_spawn = true;
+                assert!(
+                    callable.path().is_none(),
+                    "validated task-spawn endpoints cannot contain transfer projections"
+                );
                 let callable = match callable {
-                    CompiledSummaryInput::Receiver {} => site.receiver,
-                    CompiledSummaryInput::Parameter { ordinal } => {
+                    CompiledSummaryInput::Receiver { .. } => site.receiver,
+                    CompiledSummaryInput::Parameter { ordinal, .. } => {
                         let index = usize::try_from(*ordinal)
                             .expect("u32 call parameter ordinal fits usize");
                         site.arguments.get(index).map(|argument| argument.value)
@@ -3321,10 +3774,10 @@ impl<'a> SemanticQueryContext<'a> {
                 let Some(callable) = callable else {
                     pending_diagnostics.push((
                         (CodeQueryDiagnosticCode::SemanticAnalysisPartial, Incompleteness::Content),
-                        format!(
-                            "task spawn model input is not bound at {}.{} (receiver={has_receiver}, parameter_count={parameter_count}): {effect:#?}",
-                            identity.owner_fqn(),
-                            identity.member(),
+                        brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+                            format_args!("task spawn model input is not bound at {}.{} (receiver={has_receiver}, parameter_count={parameter_count}): {effect:#?}", identity.owner_fqn(), identity.member()),
+                            format_args!("task spawn model input is not bound; effect_kind=TaskSpawn; omitted_source_context_items=1"),
+                            std::iter::once(effect),
                         ),
                     ));
                     continue;
@@ -3377,6 +3830,9 @@ impl<'a> SemanticQueryContext<'a> {
                     continue;
                 };
                 let Some(target) = caller.handle.artifact().procedure_handle(*target_id) else {
+                    continue;
+                };
+                let Some(target) = self.select_procedure(&caller.file, target) else {
                     continue;
                 };
                 let value = caller
@@ -3493,10 +3949,17 @@ impl<'a> SemanticQueryContext<'a> {
                             Incompleteness::Content
                         },
                     ),
-                    format!(
-                        "callback dispatch has open target coverage: coverage={}, boundaries={:?}",
-                        dispatch.coverage().label(),
-                        dispatch.boundaries()
+                    brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+                        format_args!(
+                            "callback dispatch has open target coverage: coverage={}, boundaries={:?}",
+                            dispatch.coverage().label(),
+                            dispatch.boundaries()
+                        ),
+                        format_args!(
+                            "callback dispatch has open target coverage: coverage={}",
+                            dispatch.coverage().label()
+                        ),
+                        dispatch.boundaries().iter(),
                     ),
                 ));
             }
@@ -3865,7 +4328,7 @@ impl<'a> SemanticQueryContext<'a> {
                     line!()
                 )
             });
-            self.workspace.analyzer().mark_execution_dependent();
+            self.mark_execution_dependent();
         }
         self.typestate.witness_truncated(count);
     }
@@ -4025,25 +4488,39 @@ impl<'a> SemanticQueryContext<'a> {
         {
             return Vec::new();
         }
+        let max_source_bytes = self
+            .limits
+            .max_retained_bytes
+            .saturating_sub(self.physical_retained_bytes());
+        let _models = crate::analyzer::AnalyzerQueryScope::with_active_semantic_model_snapshot(
+            self.workspace.analyzer(),
+            self.active_semantic_model_snapshot.clone(),
+        );
+        let Some(ownership) =
+            self.select_ownership_procedure(procedure.file(), procedure.handle.clone())
+        else {
+            return Vec::new();
+        };
         let cancellation = self.cancellation.unwrap_or(&self.uncancelled);
         match super::rust_pointer_safety::analyze(
             self.workspace,
-            &procedure.handle,
+            &ownership,
             self.active_semantic_model_snapshot.clone(),
             &mut self.budget,
             self.value_flow_limits.solver_work,
+            max_source_bytes,
             cancellation,
         ) {
             Ok(findings) => {
+                self.record_active_retained_bytes(findings.retained_source_bytes);
                 if !findings.complete {
                     self.push_diagnostic(
                         CodeQueryDiagnosticCode::SemanticAnalysisPartial,
                         findings.incompleteness,
                         CodeQueryDiagnosticImpact::Incomplete,
                         procedure.file(),
-                        &format!(
-                            "Rust pointer provenance is incomplete: {:#?}",
-                            findings.reasons
+                        &super::rust_pointer_safety::incomplete_diagnostic_message(
+                            &findings.reasons,
                         ),
                     );
                 }
@@ -4130,6 +4607,7 @@ impl<'a> SemanticQueryContext<'a> {
         }
         candidates
             .into_iter()
+            .filter_map(|handle| self.select_procedure(file, handle))
             .map(|handle| SemanticProcedureValue {
                 handle,
                 file: file.clone(),
@@ -4397,6 +4875,152 @@ impl<'a> SemanticQueryContext<'a> {
             ));
         }
         Ok(Some(source))
+    }
+
+    /// Select at the procedure boundary before minting any executable local ID.
+    /// The workspace owner replays the complete admission receipt on every read.
+    fn select_procedure(
+        &mut self,
+        file: &ProjectFile,
+        base: ProcedureHandle,
+    ) -> Option<ProcedureHandle> {
+        self.select_procedure_with_evidence(file, base)
+            .map(|selected| selected.handle)
+    }
+
+    fn select_procedure_with_evidence(
+        &mut self,
+        file: &ProjectFile,
+        base: ProcedureHandle,
+    ) -> Option<crate::analyzer::semantic::service::SelectedProcedureHandle> {
+        self.select_procedure_using(file, base, WorkspaceAnalyzer::executable_procedure_handle)
+    }
+
+    pub(super) fn ownership_procedure(
+        &mut self,
+        procedure: &SemanticProcedureValue,
+    ) -> Option<SemanticProcedureValue> {
+        if procedure.handle.artifact().key().language().language() != Language::Rust {
+            return Some(procedure.clone());
+        }
+        // Ownership selection captures/replays the standard-macro guard reads,
+        // including on memo hits. Its service preserves executable alternates.
+        let handle = self.select_ownership_procedure(procedure.file(), procedure.handle.clone())?;
+        Some(SemanticProcedureValue {
+            handle,
+            ..procedure.clone()
+        })
+    }
+
+    fn select_ownership_procedure(
+        &mut self,
+        file: &ProjectFile,
+        base: ProcedureHandle,
+    ) -> Option<ProcedureHandle> {
+        let omissions = crate::analyzer::AnalyzerQueryScope::capturing_read_incompleteness(
+            self.workspace.analyzer(),
+        );
+        let mut unknown = false;
+        let baseline = base.clone();
+        let selected = self.select_procedure_using(file, base, |workspace, base, request| {
+            let outcome = workspace.ownership_procedure_handle(base, request)?;
+            unknown = matches!(
+                outcome,
+                crate::analyzer::semantic::SemanticOutcome::Unknown { .. }
+            );
+            Ok(outcome)
+        });
+        if unknown {
+            let operational = omissions
+                .captured_read_incompleteness()
+                .iter()
+                .find_map(|reason| match reason.base_cause() {
+                    crate::analyzer::i_analyzer::QueryReadIncomplete::ProofStopped {
+                        cause,
+                        ..
+                    } => *cause,
+                    crate::analyzer::i_analyzer::QueryReadIncomplete::Cancelled => {
+                        Some(super::DerivationExecutionCause::Cancelled)
+                    }
+                    _ => None,
+                });
+            let cause = operational.map_or(Incompleteness::Content, Incompleteness::Operational);
+            if operational.is_some() {
+                self.mark_execution_dependent();
+            }
+            self.push_diagnostic(
+                CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                cause,
+                CodeQueryDiagnosticImpact::Incomplete,
+                file,
+                "Rust ownership acquisition is unknown",
+            );
+        }
+        // Keep master's already-proven facts; only the requested refinement
+        // is unknown. The typed omission prevents operational base-only answers
+        // from being retained beyond this request.
+        selected
+            .map(|selected| selected.handle)
+            .or_else(|| unknown.then_some(baseline))
+    }
+
+    fn select_procedure_using(
+        &mut self,
+        file: &ProjectFile,
+        base: ProcedureHandle,
+        acquire: impl FnOnce(
+            &WorkspaceAnalyzer,
+            &ProcedureHandle,
+            &mut SemanticRequest<'_>,
+        ) -> Result<
+            crate::analyzer::semantic::SemanticOutcome<
+                crate::analyzer::semantic::service::SelectedProcedureHandle,
+            >,
+            crate::analyzer::semantic::SemanticProviderError,
+        >,
+    ) -> Option<crate::analyzer::semantic::service::SelectedProcedureHandle> {
+        use crate::analyzer::semantic::SemanticOutcome;
+        let cancellation = self.cancellation.unwrap_or(&self.uncancelled);
+        let collector = self
+            .artifact_window
+            .as_ref()
+            .map(SemanticArtifactLeaseWindow::collector);
+        let mut request = SemanticRequest::new(&mut self.budget, cancellation);
+        if let Some(collector) = &collector {
+            request = request.with_artifact_collector(collector);
+        }
+        let outcome = acquire(self.workspace, &base, &mut request);
+        drop(request);
+        match outcome {
+            Ok(SemanticOutcome::Complete {
+                value: selected, ..
+            }) => Some(selected),
+            Ok(SemanticOutcome::Cancelled { .. }) => {
+                self.push_diagnostic(
+                    CodeQueryDiagnosticCode::Cancelled,
+                    Incompleteness::Content,
+                    CodeQueryDiagnosticImpact::Incomplete,
+                    file,
+                    "procedure selection was cancelled",
+                );
+                None
+            }
+            Ok(SemanticOutcome::ExceededBudget { .. }) => {
+                self.exhaust_traversal_budget(file, "procedure selection");
+                None
+            }
+            Ok(_) => None,
+            Err(error) => {
+                self.push_diagnostic(
+                    CodeQueryDiagnosticCode::SemanticProviderFailed,
+                    Incompleteness::Content,
+                    CodeQueryDiagnosticImpact::Incomplete,
+                    file,
+                    &error.to_string(),
+                );
+                None
+            }
+        }
     }
 
     fn materialize(
@@ -4716,7 +5340,7 @@ impl<'a> SemanticQueryContext<'a> {
                     .map(|(value, source)| (value, source, quality))
             }
             CachedSemanticMaterialization::ProviderFailed(reason) => {
-                self.workspace.analyzer().mark_execution_dependent();
+                self.mark_execution_dependent();
                 self.push_diagnostic(
                     CodeQueryDiagnosticCode::SemanticProviderFailed,
                     Incompleteness::Content,
@@ -4797,7 +5421,7 @@ impl<'a> SemanticQueryContext<'a> {
         if ContentIdentity::from_source_bytes(source.source.as_bytes(), file.language(), variant)
             != artifact.key().revision().content()
         {
-            self.workspace.analyzer().mark_execution_dependent();
+            self.mark_execution_dependent();
             self.push_diagnostic_with_cause(
                 (CodeQueryDiagnosticCode::SemanticResultsOmitted, Incompleteness::Operational(DerivationExecutionCause::Snapshot)),
                 CodeQueryDiagnosticImpact::Incomplete,
@@ -4817,7 +5441,7 @@ impl<'a> SemanticQueryContext<'a> {
                 line!()
             )
         });
-        self.workspace.analyzer().mark_execution_dependent();
+        self.mark_execution_dependent();
         self.push_diagnostic_with_cause(
             (CodeQueryDiagnosticCode::SemanticResultsOmitted, Incompleteness::Operational(DerivationExecutionCause::Snapshot)),
             CodeQueryDiagnosticImpact::Incomplete,
@@ -4897,12 +5521,13 @@ impl<'a> SemanticQueryContext<'a> {
                 line!()
             )
         });
-        self.workspace.analyzer().mark_execution_dependent();
+        self.mark_execution_dependent();
         let entry = CodeQueryExhaustedRoot {
             path: crate::path_utils::rel_path_string(file),
             procedure: None,
             lane: lane.to_string(),
             stage: None,
+            budget: None,
             charge,
             feedback_iteration: None,
         };
@@ -4952,7 +5577,7 @@ impl<'a> SemanticQueryContext<'a> {
                 ),
             ),
             SemanticOutcome::ExceededBudget { exceeded, .. } => {
-                self.workspace.analyzer().mark_execution_dependent();
+                self.mark_execution_dependent();
                 self.budget_exhausted = true;
                 (
                     CodeQueryDiagnosticCode::SemanticBudgetExhausted,
@@ -4974,7 +5599,7 @@ impl<'a> SemanticQueryContext<'a> {
     }
 
     fn report_cancelled_outcome(&mut self, file: &ProjectFile, message: &str) {
-        self.workspace.analyzer().mark_execution_dependent();
+        self.mark_execution_dependent();
         self.push_diagnostic(
             CodeQueryDiagnosticCode::Cancelled,
             Incompleteness::Content,
@@ -5025,6 +5650,10 @@ impl<'a> SemanticQueryContext<'a> {
         let diagnostic = super::QueryExecutionState::diagnostic(
             self.workspace.analyzer(),
             CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                 incompleteness,
                 related: Vec::new(),
                 source: None,
@@ -5333,6 +5962,7 @@ impl SemanticProcedureValue {
             path: public.path,
             procedure_kind: public.procedure_kind,
             range: public.range,
+            source_owner: None,
         }
     }
 
@@ -5956,6 +6586,7 @@ pub(crate) fn semantic_value_wire_id(value: &ValueHandle) -> String {
     let identity = crate::analyzer::semantic::DurableValueIdentity::of(value)
         .expect("validated semantic value has a durable source identity");
     let mut digest = LengthDelimitedDigest::new(b"bifrost.code_query.semantic_value.v1");
+    push_selected_interpretation(&mut digest, value.procedure());
     digest.push(
         value
             .procedure()
@@ -5993,6 +6624,7 @@ pub(crate) fn control_edge_wire_id(handle: &ControlEdgeHandle) -> String {
         .evidence_row(edge.evidence)
         .expect("validated control edge has evidence");
     let mut digest = semantic_wire_digest(procedure.artifact().as_ref(), b"control_edge");
+    push_selected_interpretation(&mut digest, procedure);
     push_locator(&mut digest, procedure.semantics().locator());
     // Source and evidence rows are allowed to carry distinct provenance even
     // when their public content is otherwise identical. Keep their local IDs
@@ -6020,10 +6652,23 @@ pub(crate) fn call_site_wire_id(handle: &CallSiteHandle) -> String {
         .source_mapping(call.source)
         .expect("validated semantic call site has a source mapping");
     let mut digest = semantic_wire_digest(procedure.artifact().as_ref(), b"call_site");
+    push_selected_interpretation(&mut digest, procedure);
     push_locator(&mut digest, procedure.semantics().locator());
     push_locator(&mut digest, &mapping.locator);
     digest.push(&call.id.get().to_le_bytes());
     digest.finish().to_string()
+}
+
+fn push_selected_interpretation(digest: &mut LengthDelimitedDigest, procedure: &ProcedureHandle) {
+    match procedure.interpretation() {
+        crate::analyzer::semantic::ProcedureInterpretation::Base => {}
+        crate::analyzer::semantic::ProcedureInterpretation::CandidateAlternate => {
+            digest.push(b"candidate-alternate");
+        }
+        crate::analyzer::semantic::ProcedureInterpretation::ExecutableAlternate => {
+            digest.push(b"executable-alternate");
+        }
+    }
 }
 
 fn semantic_wire_digest(artifact: &SemanticArtifact, domain: &[u8]) -> LengthDelimitedDigest {
@@ -6094,6 +6739,196 @@ mod tests {
     use crate::structural::search::dispatch::DispatchCompleteness;
     use brokk_bifrost_analysis::test_support::source_anchor;
     use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon(
+        "#11532: an unavailable ownership refinement must preserve master's base pointer findings"
+    )]
+    fn ownership_omission_preserves_base_pointer_findings() {
+        const SOURCE: &str = r#"fn subject() {
+            let owner: Box<u8> = Box::new(7u8);
+            let p = Box::into_raw(owner);
+            { println!("hello"); }
+            let rebuilt = unsafe { Box::from_raw(p) };
+            let _ = unsafe { core::ptr::read(p) };
+            drop(rebuilt);
+        }"#;
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname='ownership_omission'\nversion='0.1.0'\nedition='2021'\n",
+            )
+            .file("src/lib.rs", SOURCE)
+            .build();
+        let workspace = project.certified_workspace_analyzer(AnalyzerConfig::default());
+        let _scope = crate::analyzer::AnalyzerQueryScope::new(workspace.analyzer());
+        let file = ProjectFile::new(project.root().to_path_buf(), "src/lib.rs");
+        let cancellation = CancellationToken::default();
+        let mut context = SemanticQueryContext::new(
+            &workspace,
+            Some(&cancellation),
+            CodeQuerySemanticLimits::default(),
+        );
+        let (artifact, source, quality) = context.materialize(&file).expect("base artifact");
+        let base = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure.locator().declaration().last_segment_name() == Some("subject")
+            })
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .unwrap();
+        assert!(
+            !base.semantics().pointer_origins().is_empty(),
+            "allocator is outside the guarded inner block"
+        );
+        let mut baseline_budget = context.budget.clone();
+        let baseline = super::super::rust_pointer_safety::analyze(
+            &workspace,
+            &base,
+            None,
+            &mut baseline_budget,
+            context.value_flow_limits.solver_work,
+            context.limits.max_retained_bytes,
+            &cancellation,
+        )
+        .expect("master's base pointer analysis");
+        assert!(
+            !baseline.rows.is_empty(),
+            "the control must contain an independently proven base finding; reasons={:?}, origins={:?}, aliases={:?}, invalidations={:?}, accesses={:?}",
+            baseline.reasons,
+            base.semantics().pointer_origins(),
+            base.semantics().pointer_aliases(),
+            base.semantics().pointer_invalidations(),
+            base.semantics().pointer_accesses()
+        );
+        let expected = baseline
+            .rows
+            .iter()
+            .map(|finding| serde_json::to_vec(&finding.row).unwrap())
+            .collect::<Vec<_>>();
+        let procedure = SemanticProcedureValue {
+            handle: base.clone(),
+            file: file.clone(),
+            source,
+            quality,
+        };
+        let actual = context.rust_pointer_findings(&procedure);
+        let actual = actual
+            .iter()
+            .map(|finding| serde_json::to_vec(&finding.row).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual, expected,
+            "an unknown audit adds an omission, not a finding suppression"
+        );
+        assert!(context.take_diagnostics().iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("ownership acquisition is unknown")
+        }));
+        assert!(base.semantics().candidate_macro_alternate().is_none());
+    }
+
+    #[test]
+    fn code_query_candidate_selection_keeps_executable_locators_and_wire_ids_scoped() {
+        const SOURCE: &str =
+            "fn operand() -> i32 { 7 }\nfn target() { log::info!(\"{}\", operand()); }\n";
+        for (dependency, alternate) in [
+            ("log = \"0.4\"", true),
+            ("log = { package = \"other\", version = \"0.4\" }", false),
+        ] {
+            let manifest = format!(
+                "[package]\nname='selection_query'\nversion='0.1.0'\nedition='2021'\n[dependencies]\n{dependency}\n"
+            );
+            let project = InlineTestProject::with_language(Language::Rust)
+                .file("Cargo.toml", &manifest)
+                .file("src/lib.rs", SOURCE)
+                .build();
+            let workspace = project.certified_workspace_analyzer(AnalyzerConfig::default());
+            let file = ProjectFile::new(project.root().to_path_buf(), "src/lib.rs");
+            let mut context =
+                SemanticQueryContext::new(&workspace, None, CodeQuerySemanticLimits::default());
+            let (artifact, _, _) = context.materialize(&file).expect("fixture artifact");
+            let base = artifact
+                .procedures()
+                .iter()
+                .find(|procedure| !procedure.call_sites().is_empty())
+                .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+                .expect("candidate body");
+            let selected = context
+                .select_procedure(&file, base.clone())
+                .expect("owner selection");
+            assert_eq!(
+                selected.durable_key().2
+                    == crate::analyzer::semantic::ProcedureInterpretation::CandidateAlternate,
+                alternate
+            );
+            let old_procedure =
+                crate::analyzer::semantic::SemanticProcedureReference::public_digest_for(
+                    base.artifact().key(),
+                    base.semantics().locator(),
+                )
+                .to_string();
+            assert_eq!(procedure_wire_id(&base), old_procedure);
+            let base_call = base
+                .call_site_handle(base.semantics().call_sites()[0].id)
+                .expect("base call");
+            let selected_call = selected
+                .call_site_handle(base_call.id())
+                .expect("same dense ID");
+            let mut old_call = semantic_wire_digest(base.artifact(), b"call_site");
+            push_locator(&mut old_call, base.semantics().locator());
+            let call = base.semantics().call_site(base_call.id()).unwrap();
+            push_locator(
+                &mut old_call,
+                &base
+                    .semantics()
+                    .source_mapping(call.source)
+                    .unwrap()
+                    .locator,
+            );
+            old_call.push(&call.id.get().to_le_bytes());
+            assert_eq!(call_site_wire_id(&base_call), old_call.finish().to_string());
+            assert_eq!(
+                call_site_wire_id(&base_call) != call_site_wire_id(&selected_call),
+                alternate
+            );
+            assert_eq!(
+                procedure_wire_id(&base) != procedure_wire_id(&selected),
+                alternate
+            );
+            for call in selected.semantics().call_sites() {
+                let handle = selected.call_site_handle(call.id).unwrap();
+                assert!(handle.durable_locator().validate_owner(&selected).is_ok());
+                for value in &call.arguments {
+                    let value = selected.value_handle(value.value).unwrap();
+                    assert!(value.durable_locator().validate_owner(&selected).is_ok());
+                }
+            }
+            let query = crate::CodeQuery::from_json(&serde_json::json!({
+                "schema_version": 1,
+                "match": {"kind": "call", "callee": {"name": "operand"}},
+                "steps": [{"op": "call_shape"}, {"op": "call_results"}]
+            }))
+            .expect("real query");
+            let result = crate::execute_workspace(
+                &workspace,
+                &brokk_bifrost_flow::FlowWorkspaceState::new(),
+                &query,
+            );
+            let rendered = serde_json::to_value(&result).expect("query rows serialize");
+            assert_eq!(
+                rendered["results"][0]["range"]["start_column"],
+                if alternate { 32 } else { 15 }
+            );
+            assert_eq!(
+                rendered["results"][0]["procedure_id"],
+                procedure_wire_id(&selected),
+                "{result:?}"
+            );
+        }
+    }
 
     #[test]
     fn dispatch_file_operations_release_before_next_file_and_discard_stale() {
@@ -6240,13 +7075,14 @@ mod tests {
 
     #[test]
     fn caught_statement_entry_snapshot_mismatch_is_execution_dependent() {
-        use crate::analyzer::capture_query_reads;
+        use crate::analyzer::i_analyzer::capture_query_reads_judged;
         use crate::analyzer::semantic::statement_entries::{
             StatementEntryIndex, StatementEntryOpen,
         };
         use brokk_bifrost_core::analyzer::prepared_syntax::{
             PreparedSourceOrigin, PreparedSyntaxSource, PreparedSyntaxTree,
         };
+        use brokk_bifrost_core::analyzer::reuse_verdict::CarriesReuseVerdict;
         let (project, workspace) = receipt_workspace();
         let file = project.file("subject.go");
         let mut context =
@@ -6270,15 +7106,25 @@ mod tests {
             None,
         );
         assert!(StatementEntryIndex::new(&procedure, &file, &prepared).is_ok());
-        let (answer, reads) = capture_query_reads(workspace.analyzer(), || {
-            assert!(matches!(
-                StatementEntryIndex::new(&procedure, &project.file("other.go"), &prepared),
-                Err(StatementEntryOpen::SourceSnapshotMismatch)
-            ));
-            17 // A consumer catches the mismatch without emitting a diagnostic.
+        let (answer, reads) = capture_query_reads_judged(workspace.analyzer(), || {
+            let Err(open) =
+                StatementEntryIndex::new(&procedure, &project.file("other.go"), &prepared)
+            else {
+                panic!("another file's source does not match the artifact");
+            };
+            assert_eq!(open, StatementEntryOpen::SourceSnapshotMismatch);
+            // A consumer catches the mismatch without emitting a diagnostic,
+            // and keeps its verdict.
+            (17, open.reuse_verdict())
         });
         assert_eq!(answer, 17);
         assert!(reads.execution_dependences() > 0);
+        assert_eq!(
+            reads.explicit_verdict(),
+            brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::ExecutionDependent(
+                brokk_bifrost_core::analyzer::reuse_verdict::ExecutionCause::Other
+            )
+        );
         assert!(!reads.is_bounded());
     }
 
@@ -7701,4 +8547,11 @@ mod tests {
             "an ordinary materialized arm retains the source call timing"
         );
     }
+}
+
+/// #12968: the handle-free answer of one argument-classes question.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ArgumentClassesAnswer {
+    pub(super) callee: brokk_bifrost_flow::value_flow::DurableProcedureKey,
+    pub(super) classes: Vec<(u32, crate::analyzer::semantic::ArgumentClass)>,
 }

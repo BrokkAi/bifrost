@@ -64,6 +64,7 @@ stage_families! {
     TypeFrontiers => "type_frontiers",
     TypeTransfers => "type_transfers",
     TypeProductions => "type_productions",
+    BinaryOperations => "binary_operations",
     TypeComponents => "type_components",
     DeclaredTypeArguments => "declared_type_arguments",
     TypeArguments => "type_arguments",

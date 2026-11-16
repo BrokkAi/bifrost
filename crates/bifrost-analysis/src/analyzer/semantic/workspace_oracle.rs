@@ -4,7 +4,9 @@
 //! Workspace-backed implementations of the language-neutral semantic oracles.
 
 pub use brokk_bifrost_semantic::analyzer::semantic::workspace_oracle::*;
+mod argument_receivers;
 pub(crate) mod conversions;
+pub use argument_receivers::{argument_classes_answer_digest, receiver_hypothesis};
 #[doc(hidden)]
 pub mod dispatch;
 mod footprint;
@@ -43,7 +45,7 @@ pub use dispatch::{
 };
 pub(crate) use dispatch::{
     exact_call_range, exact_source_for_procedure, external_constant_field_read_discharges_gap,
-    inert_drop_glue_discharges_gap, residual_conversion_discharges_gap,
+    residual_conversion_discharges_gap,
 };
 #[doc(hidden)]
 pub use source::PreparedSourceDispatchSession;
@@ -67,6 +69,16 @@ type ConversionJavaTargets = crate::analyzer::usages::common::QueryReadMemo<
     Option<(crate::analyzer::CodeUnit, Option<Box<str>>)>,
 >;
 
+type PayloadProjectionMemo = crate::analyzer::usages::common::QueryReadMemo<
+    crate::analyzer::semantic::ProcedureHandle,
+    Result<
+        crate::analyzer::semantic::SemanticOutcome<
+            Arc<crate::analyzer::semantic::SelectedPayloadProjection>,
+        >,
+        crate::analyzer::semantic::SemanticProviderError,
+    >,
+>;
+
 #[derive(Clone)]
 pub struct WorkspaceSemanticOracle<'a> {
     // Tracks cold session lifetime only; real source allocations pay residency.
@@ -84,6 +96,7 @@ pub struct WorkspaceSemanticOracle<'a> {
     conversion_bindings: Arc<std::sync::Mutex<crate::analyzer::usages::CallBindingCache>>,
     // Provider-owned memos share the immutable captured model snapshot.
     conversion_java_targets: Arc<ConversionJavaTargets>,
+    payload_projections: Arc<PayloadProjectionMemo>,
     conversion_candidates: Arc<
         crate::analyzer::usages::common::QueryReadMemo<
             crate::analyzer::semantic::ProcedureHandle,
@@ -95,6 +108,7 @@ pub struct WorkspaceSemanticOracle<'a> {
             (
                 crate::analyzer::semantic::CallSiteHandle,
                 crate::analyzer::semantic::DispatchCandidate,
+                crate::analyzer::semantic::ProcedureHandle,
             ),
             conversions::ConversionRows,
         >,
@@ -104,6 +118,7 @@ pub struct WorkspaceSemanticOracle<'a> {
             (
                 crate::analyzer::semantic::CallSiteHandle,
                 crate::analyzer::semantic::DispatchCandidate,
+                crate::analyzer::semantic::ProcedureHandle,
             ),
             bool,
         >,
@@ -122,10 +137,116 @@ pub struct WorkspaceSemanticOracle<'a> {
 pub struct SelectedPatternProjection {
     pub candidate: crate::analyzer::semantic::GuardedPatternProjection,
     pub binding: SelectedTupleBinding,
+    procedure: ProcedureHandle,
     receipt: crate::analyzer::i_analyzer::QueryReadReceipt,
 }
 
+/// A selected binding observed after its existing guarded assignment. The
+/// observation and its admission receipt travel together; this never creates
+/// a value or changes the source-derived procedure.
+pub struct SelectedPatternObservation {
+    projection: SelectedPatternProjection,
+    observation: crate::analyzer::semantic::ValueAtPoint,
+}
+
+impl SelectedPatternObservation {
+    /// Census owned admission heaps, excluding this value's inline/Arc storage
+    /// and semantic artifacts (which the artifact census accounts separately).
+    #[doc(hidden)]
+    pub fn retained_heap(&self, heap: &mut crate::analyzer::store::cache_budget::RetainedHeap) {
+        crate::analyzer::languages::retained_pattern_path(&self.projection.candidate.path, heap);
+        self.projection.binding.retained_heap(heap);
+        self.projection.receipt.retained_heap(heap);
+        heap.owned_slice(self.observation.context().calls());
+    }
+
+    /// Validate the exact source-entry identity against this retained IR.
+    /// Canonical declaration and AST path proof remain in the admission receipt.
+    pub fn entry_certificate(
+        &self,
+    ) -> Result<
+        crate::analyzer::semantic::SelectedPatternEntry,
+        crate::analyzer::semantic::OracleContractError,
+    > {
+        let SelectedTupleBinding::Observed(source) = &self.projection.binding else {
+            return Err(crate::analyzer::semantic::OracleContractError::InvalidRelationIdentity);
+        };
+        crate::analyzer::semantic::SelectedPatternEntry::validate(
+            self.observation.clone(),
+            self.projection.candidate.ordinal,
+            source.constructor,
+            source.field,
+            &source.root_to_constructor,
+            &source.constructor_to_binding,
+        )
+    }
+
+    pub fn observation(&self) -> &crate::analyzer::semantic::ValueAtPoint {
+        &self.observation
+    }
+
+    pub fn projection(&self) -> &SelectedPatternProjection {
+        &self.projection
+    }
+
+    /// Source observation alone installs no field relation. Every gap remains
+    /// visible until a consumer installs the selected relation and discharges
+    /// its exact linked obligation together, including gaps on this binder.
+    pub fn retained_gaps(&self) -> &[crate::analyzer::semantic::SemanticGap] {
+        self.projection.procedure.semantics().gaps()
+    }
+
+    /// The producer's exact omitted-projection obligation. This is an
+    /// identity link, not permission to clear the gap merely because this
+    /// binder is a source; a composed relation consumer needs both proofs.
+    pub fn projection_obligation(&self) -> Option<&crate::analyzer::semantic::SemanticGap> {
+        self.projection.candidate.gap.map(|id| {
+            self.projection
+                .procedure
+                .semantics()
+                .gaps()
+                .get(id.index())
+                .expect("validated candidate links an existing procedure-local gap")
+        })
+    }
+
+    pub fn replay_reads(&self, workspace: &WorkspaceAnalyzer) {
+        self.projection.replay_reads(workspace);
+    }
+}
+
 impl SelectedPatternProjection {
+    /// Observe only an admitted binding, in the exact procedure instance that
+    /// supplied the guarded candidate. In particular, the root whole value is
+    /// not projected or relabelled as an inner constructor value.
+    pub fn into_binding_observation(self) -> Option<SelectedPatternObservation> {
+        if !matches!(
+            &self.binding,
+            SelectedTupleBinding::Admitted(_) | SelectedTupleBinding::Observed(_)
+        ) {
+            return None;
+        }
+        let value = self
+            .procedure
+            .value_handle(self.candidate.binder)
+            .expect("validated guarded candidate has a binder");
+        let point = self
+            .procedure
+            .point_handle(self.candidate.point)
+            .expect("validated guarded candidate has a binding point");
+        let observation = crate::analyzer::semantic::ValueAtPoint::new(
+            value,
+            point,
+            crate::analyzer::semantic::ObservationPhase::AfterEffects,
+            crate::analyzer::semantic::OracleCallContext::empty(),
+        )
+        .expect("guarded binder and binding point share their procedure");
+        Some(SelectedPatternObservation {
+            projection: self,
+            observation,
+        })
+    }
+
     /// Stable content identity for the source, declaration, and model reads.
     pub fn receipt_id(&self) -> crate::analyzer::read_ledger::ReadSetDigest {
         self.receipt.digest()
@@ -138,6 +259,17 @@ impl SelectedPatternProjection {
 }
 
 impl<'a> WorkspaceSemanticOracle<'a> {
+    /// Hand a judged producer's value to a caller whose result type cannot
+    /// carry the verdict. The verdict joins the captures open on this thread,
+    /// which are the ones its ambient marks reached.
+    pub(crate) fn join_judged<T>(
+        &self,
+        judged: brokk_bifrost_core::analyzer::reuse_verdict::Judged<T>,
+    ) -> T {
+        self.workspace.analyzer().join_reuse_verdict(judged.reuse);
+        judged.value
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn conversion_lexical_work(
         &self,
@@ -177,7 +309,7 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                 continue;
             }
             let Some(projection) =
-                self.admit_pattern_candidate(support, procedure, candidate, request)?
+                self.admit_pattern_candidate(support, procedure, candidate, None, request)?
             else {
                 return Ok(None);
             };
@@ -196,6 +328,30 @@ impl<'a> WorkspaceSemanticOracle<'a> {
         request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
     ) -> Result<Option<SelectedPatternProjection>, crate::analyzer::semantic::SemanticProviderError>
     {
+        self.select_pattern_at(procedure, ordinal, None, request)
+    }
+
+    /// Select a field-pattern source without changing the meaning of the
+    /// candidate's root value or its stored path.
+    pub fn selected_pattern_source_at(
+        &self,
+        procedure: &ProcedureHandle,
+        ordinal: u32,
+        field: std::ops::Range<usize>,
+        request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+    ) -> Result<Option<SelectedPatternProjection>, crate::analyzer::semantic::SemanticProviderError>
+    {
+        self.select_pattern_at(procedure, ordinal, Some(field), request)
+    }
+
+    fn select_pattern_at(
+        &self,
+        procedure: &ProcedureHandle,
+        ordinal: u32,
+        field: Option<std::ops::Range<usize>>,
+        request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+    ) -> Result<Option<SelectedPatternProjection>, crate::analyzer::semantic::SemanticProviderError>
+    {
         let Some(candidate) = procedure
             .semantics()
             .guarded_pattern_projections()
@@ -208,7 +364,7 @@ impl<'a> WorkspaceSemanticOracle<'a> {
         ) else {
             return Ok(None);
         };
-        self.admit_pattern_candidate(support, procedure, candidate, request)
+        self.admit_pattern_candidate(support, procedure, candidate, field, request)
     }
 
     fn admit_pattern_candidate(
@@ -216,23 +372,34 @@ impl<'a> WorkspaceSemanticOracle<'a> {
         support: &dyn crate::analyzer::languages::LanguageSupport,
         procedure: &ProcedureHandle,
         candidate: &crate::analyzer::semantic::GuardedPatternProjection,
+        field: Option<std::ops::Range<usize>>,
         request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
     ) -> Result<Option<SelectedPatternProjection>, crate::analyzer::semantic::SemanticProviderError>
     {
         if request.cancellation.is_cancelled() {
             return Ok(None);
         }
-        let (answer, receipt) = crate::analyzer::i_analyzer::QueryReadReceipt::capture(
+        let (answer, mut receipt) = crate::analyzer::i_analyzer::QueryReadReceipt::capture(
             self.workspace.analyzer(),
             || {
                 self.active_semantic_models();
-                support.admit_selected_tuple_binding(
-                    self.workspace,
-                    procedure,
-                    candidate,
-                    self.active_semantic_model_snapshot.as_deref(),
-                    request,
-                )
+                match field {
+                    Some(field) => support.admit_selected_pattern_source(
+                        self.workspace,
+                        procedure,
+                        candidate,
+                        field,
+                        self.active_semantic_model_snapshot.as_deref(),
+                        request,
+                    ),
+                    None => support.admit_selected_tuple_binding(
+                        self.workspace,
+                        procedure,
+                        candidate,
+                        self.active_semantic_model_snapshot.as_deref(),
+                        request,
+                    ),
+                }
             },
         );
         let binding = answer?;
@@ -243,9 +410,13 @@ impl<'a> WorkspaceSemanticOracle<'a> {
         ) {
             return Ok(None);
         }
+        if matches!(binding, SelectedTupleBinding::Observed(_)) {
+            request.budget.charge_work(receipt.retain_root());
+        }
         Ok(Some(SelectedPatternProjection {
             candidate: candidate.clone(),
             binding,
+            procedure: procedure.clone(),
             receipt,
         }))
     }
@@ -387,6 +558,7 @@ impl<'a> WorkspaceSemanticOracle<'a> {
             conversion_sources: Arc::new(Default::default()),
             conversion_bindings: Arc::new(Default::default()),
             conversion_java_targets: Arc::new(crate::analyzer::usages::common::query_read_memo()),
+            payload_projections: Arc::new(crate::analyzer::usages::common::query_read_memo()),
             conversion_candidates: Arc::new(crate::analyzer::usages::common::query_read_memo()),
             conversion_rows: Arc::new(crate::analyzer::usages::common::query_read_memo()),
             conversion_effects: Arc::new(crate::analyzer::usages::common::query_read_memo()),
@@ -459,6 +631,14 @@ impl<'a> WorkspaceSemanticOracle<'a> {
         }
     }
 
+    pub(crate) fn admitted_external_procedure_summaries(
+        &self,
+        target: &crate::analyzer::semantic::UnmaterializedExternalTarget,
+    ) -> Option<crate::analyzer::semantic_model::ProcedureSummaryMatch> {
+        let snapshot = self.active_semantic_model_snapshot()?;
+        Some(snapshot.procedure_summaries_for_external_target(target))
+    }
+
     #[doc(hidden)]
     pub fn active_semantic_model_snapshot(&self) -> Option<Arc<ActiveSemanticModelSnapshot>> {
         self.active_semantic_models();
@@ -468,10 +648,20 @@ impl<'a> WorkspaceSemanticOracle<'a> {
 
     pub(super) fn semantic_model_overlay(&self) -> Option<Arc<SemanticModelOverlay>> {
         self.active_semantic_models();
-
-        self.active_semantic_model_snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.overlay())
+        let analyzer = self.workspace.analyzer();
+        let _scope = analyzer
+            .active_query_semantic_model_overlay()
+            .is_none()
+            .then(|| {
+                crate::analyzer::AnalyzerQueryScope::with_active_semantic_model_snapshot(
+                    analyzer,
+                    self.active_semantic_model_snapshot.clone(),
+                )
+            });
+        self.workspace
+            .analyzer()
+            .semantic_model_overlay_read()
+            .published()
     }
 
     pub const fn dispatch_hints(&self) -> &Arc<DispatchHints> {
@@ -499,3 +689,5 @@ impl fmt::Debug for WorkspaceSemanticOracle<'_> {
 
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use value_flow::project_procedure_relations;
+
+pub use dispatch::{cleanup_drop_obligations_discharged, inert_drop_glue_discharges_gap};

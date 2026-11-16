@@ -539,14 +539,13 @@ pub(crate) fn render_definition_reference_lookup(
             }],
         };
     }
+    let (candidate_count, definitions) =
+        definition_lookup_candidates_with_cache(analyzer, token, &outcome, render_cache);
     let mut diagnostics: Vec<_> = outcome
         .diagnostics
         .into_iter()
         .map(|diagnostic| definition_by_reference_diagnostic(&query, diagnostic))
         .collect();
-    let candidate_count = outcome.definitions.len();
-    let definitions =
-        definition_candidates_with_cache(analyzer, token, &outcome.definitions, render_cache);
     if definitions.len() < candidate_count {
         diagnostics.push(DefinitionDiagnostic {
             claim: None,
@@ -614,12 +613,9 @@ pub(crate) fn semantic_outcome_key(
     outcome: &brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupOutcome,
     render_cache: &mut DefinitionCandidateRenderCache,
 ) -> DefinitionOutcomeKey {
-    let definition = outcome
-        .definitions
-        .iter()
-        .filter_map(|unit| definition_candidate_with_cache(analyzer, token, unit, render_cache))
-        .map(|candidate| definition_candidate_key(&candidate))
-        .collect();
+    let (_, candidates) =
+        definition_lookup_candidates_with_cache(analyzer, token, outcome, render_cache);
+    let definition = candidates.iter().map(definition_candidate_key).collect();
     let incomplete_reason = outcome
         .diagnostics
         .iter()

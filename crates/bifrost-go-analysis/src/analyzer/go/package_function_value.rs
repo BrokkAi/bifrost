@@ -34,7 +34,9 @@ use brokk_bifrost_core::analyzer::usages::model::UsageHit;
 
 use brokk_bifrost_core::analyzer::usages::model::UsageHitKind;
 
-use brokk_bifrost_analysis::analyzer::usages::find_usages;
+use brokk_bifrost_analysis::analyzer::usages::{
+    DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, query_usages,
+};
 
 use brokk_bifrost_core::analyzer::model::CodeUnit;
 
@@ -112,7 +114,24 @@ fn prove_package_var_spec(
     };
     let initializer = single_function_literal_initializer(*spec)?;
 
-    let hits = match find_usages(analyzer, std::slice::from_ref(variable)) {
+    let query = query_usages(
+        analyzer,
+        std::slice::from_ref(variable),
+        DEFAULT_MAX_FILES,
+        DEFAULT_MAX_USAGES,
+    );
+    if !query.has_complete_coverage() {
+        return Err(format!(
+            "the usage census has incomplete coverage: {:?}",
+            query.completion
+        ));
+    }
+    if query.proof_authority
+        != brokk_bifrost_core::analyzer::usages::model::UsageProofAuthority::Native
+    {
+        return Err("the usage census has no native inventory authority".to_string());
+    }
+    let hits = match query.result {
         FuzzyResult::Success {
             mut hits_by_overload,
             unproven_by_overload,

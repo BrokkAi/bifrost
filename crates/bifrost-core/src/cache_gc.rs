@@ -16,6 +16,17 @@ use rusqlite::{Connection, TransactionBehavior};
 use crate::path_normalization::NormalizePath;
 use crate::{cache_db, gitblob};
 
+#[path = "cache_gc_roots.rs"]
+mod roots;
+
+#[cfg(any(test, feature = "test-support"))]
+pub use roots::{GcRootPhaseForTest, gc_root_phases_for_test, gc_root_setup_sql_for_test};
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn gc_delete_sql_for_test() -> &'static str {
+    DELETE_ANALYZER_CANDIDATE_SQL
+}
+
 pub use crate::cache_db::{VERSION_STORE_GRACE_SECS, sweep_disused_version_stores};
 
 /// git-gc.auto-style blob growth threshold.
@@ -60,15 +71,14 @@ const DELETE_ANALYZER_CANDIDATE_SQL: &str = "DELETE FROM blobs
          SELECT 1 FROM workspace_resolution_content_roots AS roots
          WHERE roots.blob_id = blobs.id
        )
-       AND NOT EXISTS (SELECT 1 FROM csharp_global_using_extent e
-         INDEXED BY idx_csharp_globals_import WHERE e.blob_id = blobs.id)
-       AND NOT EXISTS (SELECT 1 FROM csharp_using_publications p WHERE p.blob_id = blobs.id)";
+       AND NOT EXISTS (SELECT 1 FROM temp.gc_roots roots WHERE roots.kind='blobs' AND roots.row_id = blobs.id)";
 
 // Deterministic test rendezvous after the real candidate snapshot and before
 // its deletion transaction. The hook belongs only to its collector test thread.
 #[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static RESOLUTION_ROOT_HOOK_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static AFTER_RESOLUTION_ROOT_WRITE_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static AFTER_RESOLUTION_ROOT_CANDIDATE_SNAPSHOT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
@@ -80,6 +90,9 @@ pub struct ResolutionRootSnapshotGuard(std::marker::PhantomData<std::rc::Rc<()>>
 impl Drop for ResolutionRootSnapshotGuard {
     fn drop(&mut self) {
         AFTER_RESOLUTION_ROOT_CANDIDATE_SNAPSHOT.with(|hook| {
+            hook.borrow_mut().take();
+        });
+        AFTER_RESOLUTION_ROOT_WRITE_LOCK.with(|hook| {
             hook.borrow_mut().take();
         });
         RESOLUTION_ROOT_HOOK_ACTIVE.with(|active| active.set(false));
@@ -101,6 +114,17 @@ pub fn after_resolution_candidate_snapshot_for_test(
     ResolutionRootSnapshotGuard(std::marker::PhantomData)
 }
 
+/// Rendezvous after the real collector has acquired its immediate write lock.
+#[cfg(any(test, feature = "test-support"))]
+pub fn after_resolution_write_lock_for_test(
+    publish: impl FnOnce() + 'static,
+) -> ResolutionRootSnapshotGuard {
+    RESOLUTION_ROOT_HOOK_ACTIVE
+        .with(|active| assert!(!active.replace(true), "nested resolution root hook"));
+    AFTER_RESOLUTION_ROOT_WRITE_LOCK.with(|hook| *hook.borrow_mut() = Some(Box::new(publish)));
+    ResolutionRootSnapshotGuard(std::marker::PhantomData)
+}
+
 #[cfg(test)]
 #[path = "cache_gc_resolution_roots_tests.rs"]
 mod resolution_roots_tests;
@@ -114,8 +138,20 @@ static MIN_INTERVAL_SECS: AtomicI64 = AtomicI64::new(GC_MIN_INTERVAL_SECS);
 /// that retains them. Collection must therefore hold this same lock: SQLite
 /// transaction boundaries alone cannot distinguish that publication window
 /// from an unreachable blob left by a completed build.
+///
+/// The holder also writes a [`BuildLockHolder`] record beside the lock, so a
+/// process that waits can say who it is waiting for (issue #13147).
 #[doc(hidden)]
 pub struct AnalyzerCacheBuildLock {
+    /// The holder mark file, open with the exclusive lock that makes this
+    /// process's record current, or `None` when the record could not be
+    /// written and marked.
+    ///
+    /// The declaration order is load-bearing: fields drop in order, so this
+    /// file closes, withdrawing the record, before `_file` closes and releases
+    /// the build lock. A waiter therefore never sees a current record from a
+    /// process that has already released the lock.
+    _holder_mark: Option<File>,
     _file: File,
 }
 
@@ -125,6 +161,229 @@ const BUILD_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// it ends in the lock being taken. Below it the wait is ordinary
 /// serialization between a build and a collection and says nothing.
 const BUILD_LOCK_REPORT_THRESHOLD: Duration = Duration::from_millis(100);
+/// When a waiter first tells the person running it that it is waiting. A
+/// display choice, not a limit on work: below it the wait is the ordinary
+/// serialization between a build and a collection, and above it a silent
+/// process starts to look hung.
+const BUILD_LOCK_FIRST_NOTICE: Duration = Duration::from_secs(2);
+/// How often a waiter repeats that notice. A display choice, not a limit on
+/// work: often enough that a long wait never looks hung, and rarely enough
+/// that a half-hour wait prints about thirty lines.
+const BUILD_LOCK_NOTICE_INTERVAL: Duration = Duration::from_secs(60);
+/// How often a waiter rereads the holder record, so that its request phase
+/// names a new holder when the lock passes between other processes. A display
+/// choice, not a limit on work; the phase is published again only when the
+/// holder it names changes.
+const BUILD_LOCK_HOLDER_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+/// How often a holder tries to mark its record, and how long it pauses between
+/// tries. A waiter's probe refuses a try for microseconds, so a few tries 5 ms
+/// apart get past one; the bound keeps a holder whose record cannot be written
+/// or marked (a sidecar another user owns) from losing more than about 15 ms
+/// before it gives up and builds without one.
+const BUILD_LOCK_HOLDER_MARK_ATTEMPTS: u32 = 4;
+const BUILD_LOCK_HOLDER_MARK_RETRY: Duration = Duration::from_millis(5);
+
+/// Who holds the build lock, as the holder recorded it when it took the lock.
+///
+/// Display only. The OS file lock alone decides who holds the lock: nothing
+/// reads this record to break a lock, skip a wait, or decide anything else.
+///
+/// Two files carry it, beside the lock file. The record file holds the JSON
+/// and is never locked, so any process can read it; it cannot live in the lock
+/// file, because on Windows the lock covers the whole lock file and another
+/// process cannot read it. The mark file makes the record current: the holder
+/// keeps an exclusive lock on it while it holds the build lock, and a reader
+/// shows the record only when a shared probe of the mark is refused. Shared
+/// probes never refuse each other, so only a live holder's mark can refuse
+/// one. The OS drops the mark when the holder exits or crashes, and a holder
+/// running an older Bifrost never takes it, so a record left behind by a
+/// process that no longer holds the build lock reads as an unknown holder
+/// instead of naming that process, whose pid may since belong to another one.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct BuildLockHolder {
+    pid: u32,
+    /// Pids repeat across containers and hosts that share one cache, so the
+    /// pid alone does not name a process.
+    host: String,
+    purpose: String,
+    started_unix_ms: u64,
+    bifrost_version: String,
+}
+
+impl BuildLockHolder {
+    fn this_process(purpose: &str) -> Self {
+        Self {
+            pid: std::process::id(),
+            host: host_name(),
+            purpose: purpose.to_string(),
+            started_unix_ms: unix_millis_now(),
+            bifrost_version: env!("CARGO_PKG_VERSION").to_string(),
+        }
+    }
+
+    /// Write this process's record and mark it current, returning the mark
+    /// file that holds the mark.
+    ///
+    /// The record is complete before the mark is taken, so a marked record is
+    /// whole. Never waits on another process: a waiter's shared probe refuses
+    /// the mark for an instant, so a refused try is retried a few times,
+    /// briefly, and a blocking lock instead would stall the build behind a
+    /// probing process that stopped mid-probe. When the tries run out, the
+    /// only cost is that waiters report an unknown holder.
+    fn record(db_path: &Path, purpose: &str) -> std::io::Result<File> {
+        let record = serde_json::to_vec(&Self::this_process(purpose))
+            .expect("a build lock holder record serializes");
+        // Staged beside the record and renamed over it, never written in
+        // place: a rename replaces a symbolic link planted at the record's
+        // path instead of truncating the file it points to, and a reader never
+        // sees half a record.
+        let record_path = build_lock_holder_path(db_path);
+        let file_name = record_path
+            .file_name()
+            .expect("a cache store path has a file name");
+        let mut staged = tempfile::Builder::new();
+        staged.prefix(file_name).suffix(".tmp");
+        // A temporary file is private to its owner by default. The record is
+        // for every process that waits on this cache, and those may run as
+        // other users, so create it as an ordinary file is, under the umask.
+        #[cfg(unix)]
+        staged.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o666));
+        let mut staged = staged.tempfile_in(
+            record_path
+                .parent()
+                .expect("a cache store path has a directory"),
+        )?;
+        std::io::Write::write_all(&mut staged, &record)?;
+        staged.persist(&record_path).map_err(|error| error.error)?;
+        // Opened for reading when it exists: the mark is never written, and a
+        // lock needs only read access, so a holder running as another user than
+        // the one who created the mark can still take it.
+        let mark_path = build_lock_holder_mark_path(db_path);
+        let mark = match File::open(&mark_path) {
+            Ok(mark) => mark,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&mark_path)?,
+            Err(error) => return Err(error),
+        };
+        let mut attempt = 1;
+        loop {
+            match mark.try_lock() {
+                Ok(()) => return Ok(mark),
+                Err(std::fs::TryLockError::Error(error)) => return Err(error),
+                Err(std::fs::TryLockError::WouldBlock)
+                    if attempt == BUILD_LOCK_HOLDER_MARK_ATTEMPTS =>
+                {
+                    return Err(std::io::ErrorKind::WouldBlock.into());
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    attempt += 1;
+                    std::thread::sleep(BUILD_LOCK_HOLDER_MARK_RETRY);
+                }
+            }
+        }
+    }
+
+    /// The record the current holder wrote, or `None` when no live holder
+    /// marks one current (an older holder, one that is still writing its
+    /// record, or one that exited) or it cannot be read.
+    fn read(db_path: &Path) -> Option<Self> {
+        let mark = File::open(build_lock_holder_mark_path(db_path)).ok()?;
+        match mark.try_lock_shared() {
+            // Only a holder's exclusive mark refuses a shared probe.
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            // Nobody marks the record current. Dropping `mark` releases the
+            // probe at once.
+            Ok(()) | Err(std::fs::TryLockError::Error(_)) => return None,
+        }
+        let bytes = std::fs::read(build_lock_holder_path(db_path)).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+}
+
+/// The one description of a wait for the build lock. The stderr notices, the
+/// request phase (which MCP progress notifications and budget errors read) and
+/// the cancellation error all use it, so every surface names the same holder.
+///
+/// It gives start times, not durations: a host shows the phase when it reads
+/// it, which can be long after it was entered, and a duration would then be
+/// out of date. It changes only when the holder does. Surfaces that render a
+/// line themselves (stderr, the cancellation error) add how long the wait has
+/// lasted.
+fn describe_build_lock_wait(
+    lock_path: &Path,
+    db_path: &Path,
+    waiting_since_unix_ms: u64,
+) -> String {
+    let holder = match BuildLockHolder::read(db_path) {
+        Some(holder) => format!(
+            "pid {} on {} has held it since {} ({}, Bifrost {})",
+            holder.pid,
+            holder.host,
+            display_utc_time_of_day(holder.started_unix_ms),
+            holder.purpose,
+            holder.bifrost_version
+        ),
+        None => "holder unknown".to_string(),
+    };
+    format!(
+        "waiting for the analyzer cache build lock at {} since {}: {holder}",
+        lock_path.display(),
+        display_utc_time_of_day(waiting_since_unix_ms)
+    )
+}
+
+/// The UTC time of day of a Unix time in milliseconds, as `12:03:04Z`. A wait
+/// for the build lock, and the hold it waits on, last minutes, not days.
+fn display_utc_time_of_day(unix_ms: u64) -> String {
+    let seconds = unix_ms / 1000 % 86_400;
+    format!(
+        "{:02}:{:02}:{:02}Z",
+        seconds / 3600,
+        seconds / 60 % 60,
+        seconds % 60
+    )
+}
+
+/// Whole seconds as `42s`, `5m02s` or `1h03m00s`.
+fn display_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    match (seconds / 3600, seconds / 60 % 60, seconds % 60) {
+        (0, 0, second) => format!("{second}s"),
+        (0, minute, second) => format!("{minute}m{second:02}s"),
+        (hour, minute, second) => format!("{hour}h{minute:02}m{second:02}s"),
+    }
+}
+
+fn unix_millis_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+#[cfg(unix)]
+fn host_name() -> String {
+    let mut buffer = [0u8; 256];
+    // SAFETY: the pointer and length describe `buffer`, which gethostname
+    // writes at most `buffer.len()` bytes into.
+    let status = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) };
+    if status != 0 {
+        return "an unknown host".to_string();
+    }
+    let end = buffer
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(buffer.len());
+    String::from_utf8_lossy(&buffer[..end]).into_owned()
+}
+
+#[cfg(not(unix))]
+fn host_name() -> String {
+    std::env::var("COMPUTERNAME").unwrap_or_else(|_| "an unknown host".to_string())
+}
 
 impl AnalyzerCacheBuildLock {
     /// Take the lock, waiting for as long as the current holder needs.
@@ -133,22 +392,27 @@ impl AnalyzerCacheBuildLock {
     /// forced collection. A caller inside a budgeted request must use
     /// [`Self::acquire_cancellable`] instead, or its wait outlives the budget
     /// and is reported as the budget rather than as the lock (issue #3170).
-    pub fn acquire(db_path: &Path) -> Result<Self, String> {
-        Self::wait_for_lock(db_path, None)
+    ///
+    /// `purpose` says what this process will do while it holds the lock, for
+    /// the processes that wait for it, such as "building the analyzer for
+    /// /src/app".
+    pub fn acquire(db_path: &Path, purpose: &str) -> Result<Self, String> {
+        Self::wait_for_lock(db_path, purpose, None)
     }
 
     /// Take the lock, giving up when the caller's request is cancelled.
     ///
-    /// The error names the lock, its path, and how long this caller waited, so
-    /// a recurrence is reported as contention on a named lock instead of as an
-    /// unattributed timeout. The wait also publishes itself as the request's
-    /// phase for as long as it lasts (see
+    /// The error names the lock, its path, its holder, and how long this
+    /// caller waited, so a recurrence is reported as contention on a named lock
+    /// instead of as an unattributed timeout. The wait also publishes itself as
+    /// the request's phase for as long as it lasts (see
     /// [`CancellationToken::enter_phase`](crate::CancellationToken::enter_phase)).
     pub fn acquire_cancellable(
         db_path: &Path,
+        purpose: &str,
         cancellation: &crate::CancellationToken,
     ) -> Result<Self, String> {
-        Self::wait_for_lock(db_path, Some(cancellation))
+        Self::wait_for_lock(db_path, purpose, Some(cancellation))
     }
 
     /// Poll for the lock instead of parking in the kernel on it.
@@ -158,20 +422,38 @@ impl AnalyzerCacheBuildLock {
     /// request whose budget expired mid-wait returned a budget error while its
     /// analyzer thread stayed parked. Polling is what makes the wait
     /// answerable to the caller's own cancellation.
+    ///
+    /// The same loop tells the person running this process that it waits, and
+    /// for whom, on stderr and in the request phase. A wait that said nothing
+    /// for half an hour read as a hang and was killed (issue #13147).
     fn wait_for_lock(
         db_path: &Path,
+        purpose: &str,
         cancellation: Option<&crate::CancellationToken>,
     ) -> Result<Self, String> {
         let (file, lock_path) = open_build_lock_file(db_path)?;
         let started = std::time::Instant::now();
-        // Entered on the first attempt that has to wait, and dropped with this
-        // function, so the phase describes exactly the wait.
-        let mut phase = None;
+        let waiting_since = unix_millis_now();
+        // Entered on the first attempt that has to wait, updated when the
+        // holder changes, and dropped with this function, so the phase
+        // describes exactly the wait.
+        let mut phase: Option<(crate::cancellation::PhaseGuard, String)> = None;
+        let mut next_holder_check = Duration::ZERO;
+        let mut next_notice = BUILD_LOCK_FIRST_NOTICE;
+        let mut noticed = false;
         loop {
             match file.try_lock() {
                 Ok(()) => {
-                    report_build_lock_wait(&lock_path, started.elapsed());
-                    return Ok(Self { _file: file });
+                    let waited = started.elapsed();
+                    report_build_lock_wait(&lock_path, waited);
+                    if noticed {
+                        eprintln!(
+                            "bifrost: took the analyzer cache build lock at {} after waiting {}",
+                            lock_path.display(),
+                            display_duration(waited)
+                        );
+                    }
+                    return Ok(Self::holding(file, db_path, purpose));
                 }
                 Err(std::fs::TryLockError::WouldBlock) => {}
                 Err(std::fs::TryLockError::Error(error)) => {
@@ -181,23 +463,40 @@ impl AnalyzerCacheBuildLock {
                     ));
                 }
             }
+            let waited = started.elapsed();
             if let Some(cancellation) = cancellation {
                 if cancellation.is_cancelled() {
-                    let waited = started.elapsed();
                     report_build_lock_wait(&lock_path, waited);
                     return Err(format!(
-                        "the analyzer cache build lock at {} was held by another builder or \
-                         collector for {waited:?}, and this request was cancelled before it \
-                         became free",
-                        lock_path.display()
+                        "{}; this request was cancelled after waiting {}",
+                        describe_build_lock_wait(&lock_path, db_path, waiting_since),
+                        display_duration(waited)
                     ));
                 }
-                if phase.is_none() {
-                    phase = Some(cancellation.enter_phase(format!(
-                        "waiting for the analyzer cache build lock at {}",
-                        lock_path.display()
-                    )));
+                if waited >= next_holder_check {
+                    let description = describe_build_lock_wait(&lock_path, db_path, waiting_since);
+                    match &mut phase {
+                        Some((_, current)) if *current == description => {}
+                        Some((guard, current)) => {
+                            guard.update(description.clone());
+                            *current = description;
+                        }
+                        None => {
+                            phase =
+                                Some((cancellation.enter_phase(description.clone()), description));
+                        }
+                    }
+                    next_holder_check = waited + BUILD_LOCK_HOLDER_CHECK_INTERVAL;
                 }
+            }
+            if waited >= next_notice {
+                eprintln!(
+                    "bifrost: {}; this process has waited {}",
+                    describe_build_lock_wait(&lock_path, db_path, waiting_since),
+                    display_duration(waited)
+                );
+                noticed = true;
+                next_notice = waited + BUILD_LOCK_NOTICE_INTERVAL;
             }
             std::thread::sleep(BUILD_LOCK_POLL_INTERVAL);
         }
@@ -209,10 +508,10 @@ impl AnalyzerCacheBuildLock {
     /// collection uses this: it runs behind interactive work, so waiting for
     /// the lock would put the collection in front of the next request that
     /// needs it, which is the convoy the claim above exists to avoid.
-    pub fn try_acquire(db_path: &Path) -> Result<Option<Self>, String> {
+    pub fn try_acquire(db_path: &Path, purpose: &str) -> Result<Option<Self>, String> {
         let (file, lock_path) = open_build_lock_file(db_path)?;
         match file.try_lock() {
-            Ok(()) => Ok(Some(Self { _file: file })),
+            Ok(()) => Ok(Some(Self::holding(file, db_path, purpose))),
             Err(std::fs::TryLockError::WouldBlock) => Ok(None),
             Err(std::fs::TryLockError::Error(error)) => Err(format!(
                 "failed to acquire workspace analyzer build lock {}: {error}",
@@ -220,7 +519,47 @@ impl AnalyzerCacheBuildLock {
             )),
         }
     }
+
+    /// Record this process as the holder of the lock `file` now holds.
+    ///
+    /// Best effort: the record is display only, so a record that cannot be
+    /// written or marked (a sidecar another user owns, say) leaves waiters
+    /// reporting an unknown holder and must not stop a build or collection that
+    /// holds the lock.
+    fn holding(file: File, db_path: &Path, purpose: &str) -> Self {
+        let holder_mark = match BuildLockHolder::record(db_path, purpose) {
+            Ok(mark) => Some(mark),
+            Err(error) => {
+                eprintln!(
+                    "bifrost: could not record this process as the analyzer cache build lock \
+                     holder in {}; processes that wait for the lock will report an unknown \
+                     holder: {error}",
+                    build_lock_holder_path(db_path).display()
+                );
+                None
+            }
+        };
+        Self {
+            _holder_mark: holder_mark,
+            _file: file,
+        }
+    }
 }
+
+/// The file the build lock's holder records itself in, beside the lock file.
+pub(crate) fn build_lock_holder_path(db_path: &Path) -> PathBuf {
+    analyzer_sidecar_path(db_path, BUILD_LOCK_HOLDER_SUFFIX)
+}
+
+/// The file whose exclusive lock marks the holder record current.
+pub(crate) fn build_lock_holder_mark_path(db_path: &Path) -> PathBuf {
+    analyzer_sidecar_path(db_path, BUILD_LOCK_HOLDER_MARK_SUFFIX)
+}
+
+/// Appended to the store's file name to name [`build_lock_holder_path`].
+pub(crate) const BUILD_LOCK_HOLDER_SUFFIX: &str = ".initial-build.holder";
+/// Appended to the store's file name to name [`build_lock_holder_mark_path`].
+pub(crate) const BUILD_LOCK_HOLDER_MARK_SUFFIX: &str = ".initial-build.holder.lock";
 
 /// Leave a wait for the build lock in the timing log, so a wait that ends is
 /// as visible as one that does not.
@@ -343,8 +682,12 @@ impl Collection {
 
     fn acquire_build_lock(self, db_path: &Path) -> Result<Option<AnalyzerCacheBuildLock>, String> {
         match self {
-            Self::Opportunistic => AnalyzerCacheBuildLock::try_acquire(db_path),
-            Self::Forced => AnalyzerCacheBuildLock::acquire(db_path).map(Some),
+            Self::Opportunistic => {
+                AnalyzerCacheBuildLock::try_acquire(db_path, "collecting the analyzer cache")
+            }
+            Self::Forced => {
+                AnalyzerCacheBuildLock::acquire(db_path, "collecting the analyzer cache").map(Some)
+            }
         }
     }
 }
@@ -814,6 +1157,13 @@ fn sweep_with_claim(
     // The Git reachability walk reads the repository, not the store, and it is
     // the longest part of a collection. It runs before the build lock is
     // taken, so a request that needs the lock never queues behind it.
+    // Ruby signature heads published after the walk below are not in its
+    // bloom, so only heads that exist before it are candidates.
+    let signature_head_floor: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(signature_file_id), 0) FROM ruby_signature_files",
+        [],
+        |row| row.get(0),
+    )?;
     let live = live_bloom(repo, workspace_root)?;
 
     // From here to the deletion commit, and no further.
@@ -857,6 +1207,13 @@ fn sweep_with_claim(
         }
     });
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    #[cfg(any(test, feature = "test-support"))]
+    AFTER_RESOLUTION_ROOT_WRITE_LOCK.with(|hook| {
+        let publish = hook.borrow_mut().take();
+        if let Some(publish) = publish {
+            publish();
+        }
+    });
     collect_superseded_csharp_sets(&tx)?;
     // Retained versions pin exact identities in the deletion SQL. Their OIDs
     // must not enter the Git bloom and retain another language or variant.
@@ -887,9 +1244,8 @@ fn sweep_with_claim(
     // #4994: orphan topologies retain blobs through non-cascading FKs in
     // rust_crate_container_members/container_sources. Sweep summaries first,
     // then topologies, before collecting the blobs they no longer reference.
-    tx.execute(DELETE_UNBOUND_SUMMARIES_SQL, [])?;
-    tx.execute(DELETE_UNBOUND_TOPOLOGIES_SQL, [])?;
-    let analyzer_dropped = delete_analyzer_candidates(&tx, &dead_analyzer)?;
+    let analyzer_dropped = delete_analyzer_candidates(&tx, &dead_analyzer)?
+        + delete_unreachable_ruby_signature_files(&tx, &live, signature_head_floor)?;
     tx.commit()?;
     drop(build_lock);
 
@@ -926,6 +1282,47 @@ fn sweep_with_claim(
         total_blobs_after,
         version_stores_removed,
     })
+}
+
+/// Ruby workspace signature heads (#12967) are keyed by content OID alone,
+/// not by a `blobs` row, so they leave with their blob's liveness: a head no
+/// live blob names is deleted with its rows. A bloom false positive only
+/// retains a head, and a head above `floor` was published after the liveness
+/// walk, so it waits for the next collection. Readers treat a missing head
+/// as unknown facts, and the collection epoch tells a reader that checked
+/// its heads earlier that one may be gone.
+fn delete_unreachable_ruby_signature_files(
+    tx: &rusqlite::Transaction<'_>,
+    live: &GrowableBloom,
+    floor: i64,
+) -> Result<usize, GcStopped> {
+    let dead = {
+        let mut heads = tx.prepare(
+            "SELECT signature_file_id, content_oid FROM ruby_signature_files
+             WHERE signature_file_id <= ?1",
+        )?;
+        heads
+            .query_map([floor], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|(_, oid)| !live.contains(oid))
+            .map(|(head, _)| head)
+            .collect::<Vec<_>>()
+    };
+    let mut delete = tx.prepare("DELETE FROM ruby_signature_files WHERE signature_file_id = ?1")?;
+    let mut dropped = 0;
+    for head in dead {
+        dropped += delete.execute([head])?;
+    }
+    if dropped > 0 {
+        tx.execute(
+            "UPDATE ruby_signature_collection_epoch SET epoch = epoch + 1 WHERE id = 1",
+            [],
+        )?;
+    }
+    Ok(dropped)
 }
 
 /// Return the freed pages, refresh the statistics the deletions invalidated,
@@ -970,10 +1367,53 @@ fn maintain_collected_store(
     Ok(total)
 }
 
+/// Exercise the production deletion path on an ephemeral test connection.
+#[cfg(any(test, feature = "test-support"))]
+pub fn collect_candidates_for_test(
+    conn: &mut Connection,
+    keep: impl Fn(&str) -> bool,
+) -> Result<usize, String> {
+    let mut collect = || -> Result<usize, GcStopped> {
+        let candidates = {
+            let mut stmt = conn.prepare(
+                "SELECT blob_oid, blobs.lang, blobs.generation, parse_variant
+                FROM blobs LEFT JOIN analysis_epochs e ON e.lang=blobs.lang
+                WHERE blobs.generation=COALESCE(e.generation,0)",
+            )?;
+            stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, ParseVariant>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut dead = Vec::new();
+        for (oid, lang, generation, variant) in candidates {
+            if variant != ParseVariant::Empty || !keep(&oid) {
+                let oid = Oid::from_str(&oid).map_err(|e| GcStopped::from(e.to_string()))?;
+                dead.push((BlobKey { oid, lang, variant }, generation));
+            }
+        }
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        collect_superseded_csharp_sets(&tx)?;
+        let dropped = delete_analyzer_candidates(&tx, &dead)?;
+        tx.commit()?;
+        Ok(dropped)
+    };
+    collect().map_err(|error| match error {
+        GcStopped::StoreBusy => "cache GC SQLite database is busy".to_string(),
+        GcStopped::Failed(message) => message,
+    })
+}
+
 fn delete_analyzer_candidates(
     tx: &rusqlite::Transaction<'_>,
     candidates: &[(BlobKey, i64)],
 ) -> Result<usize, GcStopped> {
+    roots::materialize(tx)?;
     // Use the parent's exact liveness predicate before removing its children.
     let predicate = DELETE_ANALYZER_CANDIDATE_SQL
         .strip_prefix("DELETE FROM blobs")
@@ -1071,7 +1511,7 @@ fn collect_superseded_csharp_sets(tx: &rusqlite::Transaction<'_>) -> rusqlite::R
         WHERE NOT EXISTS (SELECT 1 FROM csharp_compilation_selections AS selected WHERE selected.set_id = old.set_id)
           AND EXISTS (SELECT 1 FROM csharp_compilation_sets AS newer
               WHERE newer.workspace_id = old.workspace_id AND newer.lang = old.lang
-                AND newer.generation = old.generation AND newer.derivation_version = old.derivation_version
+                AND newer.generation = old.generation AND newer.derivation_identity = old.derivation_identity
                 AND newer.set_id > old.set_id);
         DELETE FROM csharp_compilation_symbols WHERE compilation_id IN
             (SELECT compilation_id FROM csharp_compilations WHERE set_id IN (SELECT set_id FROM gc_csharp_sets));
@@ -1568,7 +2008,7 @@ mod tests {
         let repo = gitblob::test_repo::init_repo(&repo_root);
         let db_path = store_with_one_collectable_blob(&repo_root);
 
-        let build_lock = AnalyzerCacheBuildLock::acquire(&db_path).unwrap();
+        let build_lock = AnalyzerCacheBuildLock::acquire(&db_path, "a test holder").unwrap();
         let started = std::time::Instant::now();
         let outcome = maybe_gc(&db_path, &repo, &repo_root).unwrap();
         let elapsed = started.elapsed();
@@ -1655,7 +2095,7 @@ mod tests {
             .unwrap();
         }
 
-        let build_lock = AnalyzerCacheBuildLock::acquire(&db_path).unwrap();
+        let build_lock = AnalyzerCacheBuildLock::acquire(&db_path, "a test holder").unwrap();
         let gc_root = repo_root.clone();
         let gc_db = db_path.clone();
         let gc = std::thread::spawn(move || {
@@ -1757,13 +2197,14 @@ mod tests {
             }
         };
 
-        let held = AnalyzerCacheBuildLock::acquire(&db_path).unwrap();
+        let held = AnalyzerCacheBuildLock::acquire(&db_path, "a test holder").unwrap();
         let token = crate::CancellationToken::new();
         let waiter = {
             let db_path = db_path.clone();
             let token = token.clone();
             std::thread::spawn(move || {
-                AnalyzerCacheBuildLock::acquire_cancellable(&db_path, &token).map(|_| ())
+                AnalyzerCacheBuildLock::acquire_cancellable(&db_path, "a test waiter", &token)
+                    .map(|_| ())
             })
         };
         wait_for_phase(&token);
@@ -1776,13 +2217,14 @@ mod tests {
             "the wait's phase must end with the wait"
         );
 
-        let held = AnalyzerCacheBuildLock::acquire(&db_path).unwrap();
+        let held = AnalyzerCacheBuildLock::acquire(&db_path, "a test holder").unwrap();
         let token = crate::CancellationToken::new();
         let waiter = {
             let db_path = db_path.clone();
             let token = token.clone();
             std::thread::spawn(move || {
-                AnalyzerCacheBuildLock::acquire_cancellable(&db_path, &token).map(|_| ())
+                AnalyzerCacheBuildLock::acquire_cancellable(&db_path, "a test waiter", &token)
+                    .map(|_| ())
             })
         };
         wait_for_phase(&token);
@@ -1791,6 +2233,99 @@ mod tests {
         drop(held);
         assert!(error.contains(&lock_path), "{error}");
         assert!(error.contains("cancelled"), "{error}");
+    }
+
+    /// A waiter names the process that holds the build lock and what it is
+    /// doing, in its phase and in its cancellation error; a released lock, or
+    /// another waiter's probe, names nobody.
+    #[test]
+    #[hardwon("#13147: processes waiting for the shared cache build lock never said who held it")]
+    fn a_build_lock_waiter_names_the_holder() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("cache.db");
+        let lock_path = temp.path().join("cache.db.initial-build.lock");
+        let holder_path = build_lock_holder_path(&db_path);
+        let purpose = "building the analyzer for /worktrees/first";
+        let holder = format!("pid {} on {}", std::process::id(), host_name());
+
+        let held = AnalyzerCacheBuildLock::acquire(&db_path, purpose).unwrap();
+        let token = crate::CancellationToken::new();
+        let waiter = {
+            let db_path = db_path.clone();
+            let token = token.clone();
+            std::thread::spawn(move || {
+                AnalyzerCacheBuildLock::acquire_cancellable(
+                    &db_path,
+                    "building the analyzer for /worktrees/second",
+                    &token,
+                )
+                .map(|_| ())
+            })
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !token
+            .phase()
+            .is_some_and(|phase| phase.contains(&holder) && phase.contains(purpose))
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the waiter's phase never named the holder: {:?}",
+                token.phase()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        token.cancel();
+        let error = waiter.join().unwrap().unwrap_err();
+        assert!(error.contains(&holder), "{error}");
+        assert!(error.contains(purpose), "{error}");
+
+        // The released holder's record is still in the file, as a crashed
+        // holder's would be, but nobody marks it current any more.
+        drop(held);
+        assert!(!std::fs::read(&holder_path).unwrap().is_empty());
+        let after_release = describe_build_lock_wait(&lock_path, &db_path, 0);
+        assert!(
+            after_release.contains("holder unknown"),
+            "a released lock must not name its last holder: {after_release}"
+        );
+
+        // Another waiter probing the mark at the same moment is not a holder.
+        let probe = File::open(build_lock_holder_mark_path(&db_path)).unwrap();
+        probe.try_lock_shared().unwrap();
+        let while_probed = describe_build_lock_wait(&lock_path, &db_path, 0);
+        assert!(
+            while_probed.contains("holder unknown"),
+            "another waiter's probe must not make a stale record current: {while_probed}"
+        );
+        drop(probe);
+
+        // A symbolic link planted at the record's path is replaced, not
+        // written through.
+        #[cfg(unix)]
+        {
+            let victim = temp.path().join("victim");
+            std::fs::write(&victim, b"keep").unwrap();
+            std::fs::remove_file(&holder_path).unwrap();
+            std::os::unix::fs::symlink(&victim, &holder_path).unwrap();
+            let held = AnalyzerCacheBuildLock::acquire(&db_path, purpose).unwrap();
+            assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+            assert!(
+                !std::fs::symlink_metadata(&holder_path)
+                    .unwrap()
+                    .is_symlink()
+            );
+            drop(held);
+        }
+
+        // A record that cannot be written does not keep the lock from being
+        // taken; it only leaves the holder unknown.
+        std::fs::remove_file(&holder_path).unwrap();
+        std::fs::create_dir(&holder_path).unwrap();
+        let held = AnalyzerCacheBuildLock::acquire(&db_path, purpose)
+            .expect("an unwritable holder record must not refuse the lock");
+        let unrecorded = describe_build_lock_wait(&lock_path, &db_path, 0);
+        assert!(unrecorded.contains("holder unknown"), "{unrecorded}");
+        drop(held);
     }
 
     /// Set or clear `BIFROST_CACHE_GC` for `run`, then restore it. Callers hold
@@ -1941,11 +2476,11 @@ mod tests {
         let root = temp.path().canonicalize().unwrap();
         let db = store_with_one_collectable_blob(&root);
         let mut conn = cache_db::open_unified_connection(&db).unwrap();
-        conn.execute_batch("INSERT INTO csharp_compilation_sets(set_id, workspace_id, lang, generation, derivation_version, input_digest, output_digest, gaps)
-            VALUES (1, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'csharp', 0, 1, zeroblob(32), zeroblob(32), jsonb('[]')),
-                   (2, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'csharp', 0, 1, randomblob(32), zeroblob(32), jsonb('[]')),
-                   (3, 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'csharp', 0, 1, randomblob(32), zeroblob(32), jsonb('[]')),
-                   (4, 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'csharp', 0, 1, randomblob(32), zeroblob(32), jsonb('[]'));
+        conn.execute_batch("INSERT INTO csharp_compilation_sets(set_id, workspace_id, lang, generation, derivation_identity, input_digest, output_digest, gaps)
+            VALUES (1, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'csharp', 0, zeroblob(32), zeroblob(32), zeroblob(32), jsonb('[]')),
+                   (2, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'csharp', 0, zeroblob(32), randomblob(32), zeroblob(32), jsonb('[]')),
+                   (3, 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'csharp', 0, zeroblob(32), randomblob(32), zeroblob(32), jsonb('[]')),
+                   (4, 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'csharp', 0, zeroblob(32), randomblob(32), zeroblob(32), jsonb('[]'));
             INSERT INTO workspace_revisions(workspace_id, lang, generation, revision) VALUES('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'csharp', 0, 1);
             INSERT INTO csharp_compilation_selections(workspace_id, lang, generation, revision, set_id) VALUES('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'csharp', 0, 1, 3);").unwrap();
         let tx = conn.transaction().unwrap();
@@ -2132,6 +2667,76 @@ mod tests {
                 "SELECT COUNT(*) FROM blobs WHERE blob_oid = ?1 AND lang = 'java' AND parse_variant = x''",
                 [retained_oid],
                 |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    /// #12967: Ruby workspace signature heads have no `blobs` row, so the
+    /// sweep collects them by their own content OID: a head for a live
+    /// working-tree file stays, a head no live blob names leaves with its
+    /// method and positional rows.
+    #[test]
+    fn forced_gc_collects_ruby_signature_heads_by_blob_liveness() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo_root = temp.path().canonicalize().unwrap();
+        let repo = gitblob::test_repo::init_repo(&repo_root);
+        std::fs::create_dir_all(repo_root.join("sig")).unwrap();
+        let live_source = b"class A\n  def m: (Hash[String, untyped] x) -> void\nend\n";
+        std::fs::write(repo_root.join("sig/a.rbs"), live_source).unwrap();
+        let live_oid = git2::Oid::hash_object(git2::ObjectType::Blob, live_source)
+            .unwrap()
+            .to_string();
+        let dead_oid = "5555555555555555555555555555555555555555";
+        let db_path = gitblob::cache_db_path(&repo_root);
+        {
+            let conn = cache_db::open_unified_connection(&db_path).unwrap();
+            for (head, oid) in [(1, live_oid.as_str()), (2, dead_oid)] {
+                conn.execute(
+                    "INSERT INTO ruby_signature_files(signature_file_id, content_oid, producer_identity, parse_state)
+                     VALUES(?1, ?2, zeroblob(32), 'complete')",
+                    rusqlite::params![head, oid],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO ruby_signature_methods(signature_file_id, method_ordinal, owner, member, is_singleton, overload_count, leading_required)
+                     VALUES(?1, 0, 'A', 'm', 0, 1, 1)",
+                    [head],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO ruby_signature_positionals(signature_file_id, method_ordinal, ordinal, receiver_absolute, receiver_name, argument_count)
+                     VALUES(?1, 0, 0, 0, 'Hash', 2)",
+                    [head],
+                )
+                .unwrap();
+            }
+        }
+
+        let outcome = force_gc(&db_path, &repo, &repo_root).unwrap();
+        assert!(outcome.ran);
+
+        let conn = Connection::open(&db_path).unwrap();
+        for table in [
+            "ruby_signature_files",
+            "ruby_signature_methods",
+            "ruby_signature_positionals",
+        ] {
+            let heads = conn
+                .prepare(&format!("SELECT signature_file_id FROM {table}"))
+                .unwrap()
+                .query_map([], |row| row.get::<_, i64>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(heads, vec![1], "{table}");
+        }
+        assert_eq!(
+            conn.query_row(
+                "SELECT epoch FROM ruby_signature_collection_epoch",
+                [],
+                |row| row.get::<_, i64>(0)
             )
             .unwrap(),
             1
@@ -2497,8 +3102,8 @@ mod tests {
             .unwrap();
             conn.execute_batch("INSERT INTO blobs(id,blob_oid,lang,generation) VALUES(2,'6666666666666666666666666666666666666666','csharp',1);
                 INSERT INTO workspace_revisions VALUES(printf('%064d',0),'csharp',1,1);
-                INSERT INTO csharp_compilation_sets(set_id,workspace_id,lang,generation,derivation_version,input_digest,output_digest,gaps)
-                VALUES(1,printf('%064d',0),'csharp',1,4,zeroblob(32),zeroblob(32),jsonb('[]'));
+                INSERT INTO csharp_compilation_sets(set_id,workspace_id,lang,generation,derivation_identity,input_digest,output_digest,gaps)
+                VALUES(1,printf('%064d',0),'csharp',1,zeroblob(32),zeroblob(32),zeroblob(32),jsonb('[]'));
                 INSERT INTO csharp_compilations(compilation_id,set_id,project_path,references_complete,transitive_flow,global_usings_complete,internals_visible_to_complete,global_usings,internals_visible_to)
                 VALUES(1,1,'App.csproj',1,1,1,1,jsonb('[]'),jsonb('[]'));
                 INSERT INTO resolution_fragment_interiors(blob_id,lang,semantic_language,producer_epoch,interior_digest,expected_semantic_site_count,logical_rows,payload_bytes,publication_state)
@@ -2553,6 +3158,7 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         cache_db::configure_connection(&mut conn).unwrap();
         cache_db::migrate(&mut conn).unwrap();
+        roots::materialize(&conn).unwrap();
         let details = conn
             .prepare(&format!(
                 "EXPLAIN QUERY PLAN {DELETE_ANALYZER_CANDIDATE_SQL}"

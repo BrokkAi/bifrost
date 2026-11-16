@@ -49,8 +49,6 @@ use brokk_bifrost_core::analyzer::usages::parsed_tree::ParseSpec;
 
 use brokk_bifrost_core::analyzer::usages::parsed_tree::ParsedTreeFile;
 
-use brokk_bifrost_core::analyzer::usages::parsed_tree::parse_tree_sitter_file;
-
 use brokk_bifrost_core::analyzer::usages::parsed_tree::parse_tree_sitter_source;
 
 use brokk_bifrost_analysis::analyzer::usages::traits::UsageQueryResolver;
@@ -166,6 +164,20 @@ impl<'a> UsageQueryResolver<'a> for KotlinQueryResolver {
 
         let _prepare_scope = brokk_bifrost_core::profiling::scope("kotlin_graph::prepare_files");
         let prepared_files = prepare_kotlin_scan_files(analyzer, &ordered);
+        let prepared_paths: HashSet<_> = prepared_files
+            .iter()
+            .map(|prepared| &prepared.file)
+            .collect();
+        let omitted: Vec<_> = ordered
+            .iter()
+            .filter(|file| !prepared_paths.contains(file))
+            .cloned()
+            .collect();
+        if !omitted.is_empty() {
+            return GraphUsageOutcome::TerminalFailure(
+                brokk_bifrost_core::analyzer::usages::model::UsageAnalysisDiagnostic::indexed_source_unavailable(&omitted),
+            );
+        }
         drop(_prepare_scope);
 
         let mut usages = UsageAccumulator::bounded(max_usages);
@@ -481,11 +493,9 @@ fn build_kotlin_inbound_edges_with_completeness(
             omitted_files.push(file.clone());
             continue;
         };
-        let parsed = if state.source.is_empty() {
-            parse_tree_sitter_file(file, ParseSpec::whole(&language))
-        } else {
-            parse_tree_sitter_source(state.source.clone(), ParseSpec::whole(&language))
-        };
+        let parsed = analyzer
+            .indexed_source(file)
+            .and_then(|source| parse_tree_sitter_source(source, ParseSpec::whole(&language)));
         let Some(parsed) = parsed else {
             omitted_files.push(file.clone());
             continue;
@@ -601,6 +611,7 @@ where
                 .map(class_range_index_from_state)
                 .unwrap_or_else(|| ClassRangeIndex::build(analyzer, file));
             parse_and_collect_with_declarations_and_domain(
+                analyzer,
                 file,
                 domain,
                 ParseSpec::whole(&language),

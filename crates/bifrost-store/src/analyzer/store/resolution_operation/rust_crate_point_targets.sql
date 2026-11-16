@@ -42,39 +42,91 @@ WITH RECURSIVE targets(topology_id, module_path, name, followed) AS (
                    AND declared.namespace=?3 AND declared.name=targets.name
                    AND declared.origin IN ('declaration','reexport'))
   AND NOT EXISTS(
-       SELECT 1 FROM main.rust_unit_summary_placements AS source
+       SELECT 1 FROM temp.rust_unit_summary_placements AS source
        CROSS JOIN main.resolution_unit_summary_members AS member
          ON member.summary_id=source.summary_id
         AND member.member_ordinal=source.member_ordinal
+       CROSS JOIN main.resolution_unit_summary_placements AS shared_placement
+        INDEXED BY resolution_unit_summary_placements_member
+        ON shared_placement.summary_id=source.summary_id
+       AND shared_placement.member_ordinal=source.member_ordinal
+       AND shared_placement.container_path=CASE source.module_path WHEN 'crate' THEN '' ELSE source.module_path END
        CROSS JOIN source_rust_module_scopes AS scope
-         ON scope.blob_id=member.blob_id AND scope.ordinal=source.scope_ordinal
+         ON scope.blob_id=member.blob_id
+        AND scope.ordinal=(SELECT dense.dense_id FROM temp.surface_dense AS dense
+                           WHERE dense.blob_id=scope.blob_id AND dense.id_space=7
+                            AND dense.surface_ordinal=shared_placement.scope_surface_ordinal)
        CROSS JOIN main.rust_resolution_unit_summary_import_routes AS spelled
         INDEXED BY rust_resolution_unit_summary_import_routes_binder
          ON spelled.summary_id=source.summary_id
         AND spelled.member_ordinal=source.member_ordinal
         AND spelled.module_path=source.module_path
+        /* Rust-only derived-from blob until #11183 M3 converts Rust child rows */
         AND spelled.binder_scope=scope.resolution_scope
         AND spelled.namespace=?3 AND spelled.bound_name=targets.name
+        AND (spelled.target_unit_key=owner.unit_key OR EXISTS(
+          -- Rust-only derived-from blob until #11183 M3 converts Rust child rows.
+          SELECT 1 FROM main.source_import_segments AS local_root
+          WHERE local_root.blob_id=member.blob_id AND local_root.import_id=spelled.import_id
+           AND local_root.ordinal=0 AND local_root.segment IN ('crate','self','super'))
+         OR EXISTS(SELECT 1 FROM main.resolution_unit_summary_imports AS shared_import
+
+          WHERE shared_import.summary_id=source.summary_id
+           AND shared_import.member_ordinal=(SELECT min(shared_member.member_ordinal)
+            FROM main.resolution_unit_summary_members AS shared_member
+             INDEXED BY resolution_unit_summary_members_blob
+            WHERE shared_member.summary_id=member.summary_id
+             AND shared_member.blob_id=member.blob_id)
+           AND shared_import.import_surface_ordinal=(SELECT import_surface.surface_ordinal
+            FROM temp.surface_dense AS import_surface
+            WHERE import_surface.blob_id=member.blob_id AND import_surface.id_space=4
+             AND import_surface.dense_id=spelled.import_id)))
        WHERE source.summary_id=owner.summary_id
          AND source.module_path=targets.module_path
-         AND source.scope_ordinal IS NOT NULL)
+         AND shared_placement.scope_surface_ordinal IS NOT NULL)
  UNION
  SELECT dependency.topology_id, route.target_module_path, route.target_name, 1
  FROM targets
  CROSS JOIN selected_rust_unit_summaries AS owner ON owner.topology_id=targets.topology_id
- CROSS JOIN main.rust_unit_summary_placements AS source
+ CROSS JOIN temp.rust_unit_summary_placements AS source
   ON source.summary_id=owner.summary_id AND source.module_path=targets.module_path
- AND source.scope_ordinal IS NOT NULL
+ AND shared_placement.scope_surface_ordinal IS NOT NULL
  CROSS JOIN main.resolution_unit_summary_members AS member
   ON member.summary_id=source.summary_id AND member.member_ordinal=source.member_ordinal
+ CROSS JOIN main.resolution_unit_summary_placements AS shared_placement
+  INDEXED BY resolution_unit_summary_placements_member
+  ON shared_placement.summary_id=source.summary_id
+ AND shared_placement.member_ordinal=source.member_ordinal
+ AND shared_placement.container_path=CASE source.module_path WHEN 'crate' THEN '' ELSE source.module_path END
  CROSS JOIN source_rust_module_scopes AS scope
-  ON scope.blob_id=member.blob_id AND scope.ordinal=source.scope_ordinal
+  ON scope.blob_id=member.blob_id
+ AND scope.ordinal=(SELECT dense.dense_id FROM temp.surface_dense AS dense
+                    WHERE dense.blob_id=scope.blob_id AND dense.id_space=7
+                     AND dense.surface_ordinal=shared_placement.scope_surface_ordinal)
  CROSS JOIN main.rust_resolution_unit_summary_import_routes AS route
   INDEXED BY rust_resolution_unit_summary_import_routes_binder
   ON route.summary_id=source.summary_id AND route.member_ordinal=source.member_ordinal
  AND route.module_path=source.module_path
+ /* Rust-only derived-from blob until #11183 M3 converts Rust child rows */
  AND route.binder_scope=scope.resolution_scope AND route.namespace=?3
  AND route.bound_name=targets.name
+ AND (route.target_unit_key=owner.unit_key OR EXISTS(
+  -- Rust-only derived-from blob until #11183 M3 converts Rust child rows.
+  SELECT 1 FROM main.source_import_segments AS local_root
+  WHERE local_root.blob_id=member.blob_id AND local_root.import_id=route.import_id
+   AND local_root.ordinal=0 AND local_root.segment IN ('crate','self','super'))
+ OR EXISTS(SELECT 1 FROM main.resolution_unit_summary_imports AS shared_import
+
+  WHERE shared_import.summary_id=source.summary_id
+   AND shared_import.member_ordinal=(SELECT min(shared_member.member_ordinal)
+    FROM main.resolution_unit_summary_members AS shared_member
+     INDEXED BY resolution_unit_summary_members_blob
+    WHERE shared_member.summary_id=member.summary_id
+     AND shared_member.blob_id=member.blob_id)
+   AND shared_import.import_surface_ordinal=(SELECT import_surface.surface_ordinal
+    FROM temp.surface_dense AS import_surface
+    WHERE import_surface.blob_id=member.blob_id AND import_surface.id_space=4
+     AND import_surface.dense_id=route.import_id)))
  CROSS JOIN selected_rust_unit_summaries AS dependency
   ON dependency.unit_key=route.target_unit_key
  -- A row that binds a crate's root (`use dep as alias;`, target `crate`/`self`,
@@ -93,14 +145,22 @@ WITH RECURSIVE targets(topology_id, module_path, name, followed) AS (
  CROSS JOIN selected_rust_unit_summaries AS owner ON owner.topology_id=targets.topology_id
  CROSS JOIN main.rust_resolution_unit_summary_gaps AS gap ON gap.summary_id=owner.summary_id
   AND gap.gap_kind='unresolved_import' AND gap.subject=targets.module_path || '::' || targets.name
- CROSS JOIN main.rust_unit_summary_placements AS source
+ CROSS JOIN temp.rust_unit_summary_placements AS source
   ON source.summary_id=owner.summary_id AND source.module_path=targets.module_path
- AND source.scope_ordinal IS NOT NULL
+ AND shared_placement.scope_surface_ordinal IS NOT NULL
  CROSS JOIN main.resolution_unit_summary_members AS member
   ON member.summary_id=source.summary_id AND member.member_ordinal=source.member_ordinal
+ CROSS JOIN main.resolution_unit_summary_placements AS shared_placement
+  INDEXED BY resolution_unit_summary_placements_member
+  ON shared_placement.summary_id=source.summary_id
+ AND shared_placement.member_ordinal=source.member_ordinal
+ AND shared_placement.container_path=CASE source.module_path WHEN 'crate' THEN '' ELSE source.module_path END
  CROSS JOIN source_rust_module_scopes AS scope
-  ON scope.blob_id=member.blob_id AND scope.ordinal=source.scope_ordinal
- CROSS JOIN source_rust_import_targets AS imported ON imported.blob_id=member.blob_id
+  ON scope.blob_id=member.blob_id
+ AND scope.ordinal=(SELECT dense.dense_id FROM temp.surface_dense AS dense
+                    WHERE dense.blob_id=scope.blob_id AND dense.id_space=7
+                     AND dense.surface_ordinal=shared_placement.scope_surface_ordinal)
+CROSS JOIN source_rust_import_targets AS imported ON imported.blob_id=scope.blob_id
   AND imported.native_scope=scope.resolution_scope AND imported.bound_name=targets.name AND imported.is_glob=0
  CROSS JOIN main.rust_resolution_unit_summary_root_routes AS route
   INDEXED BY rust_resolution_unit_summary_root_routes_owner
@@ -126,16 +186,25 @@ WITH RECURSIVE targets(topology_id, module_path, name, followed) AS (
  SELECT dependency.topology_id, glob.target_module_path, targets.name, 1
  FROM targets
  CROSS JOIN selected_rust_unit_summaries AS owner ON owner.topology_id=targets.topology_id
- CROSS JOIN main.rust_unit_summary_placements AS source
+ CROSS JOIN temp.rust_unit_summary_placements AS source
   ON source.summary_id=owner.summary_id AND source.module_path=targets.module_path
- AND source.scope_ordinal IS NOT NULL
+ AND shared_placement.scope_surface_ordinal IS NOT NULL
  CROSS JOIN main.resolution_unit_summary_members AS member
   ON member.summary_id=source.summary_id AND member.member_ordinal=source.member_ordinal
+ CROSS JOIN main.resolution_unit_summary_placements AS shared_placement
+  INDEXED BY resolution_unit_summary_placements_member
+  ON shared_placement.summary_id=source.summary_id
+ AND shared_placement.member_ordinal=source.member_ordinal
+ AND shared_placement.container_path=CASE source.module_path WHEN 'crate' THEN '' ELSE source.module_path END
  CROSS JOIN source_rust_module_scopes AS scope
-  ON scope.blob_id=member.blob_id AND scope.ordinal=source.scope_ordinal
+  ON scope.blob_id=member.blob_id
+ AND scope.ordinal=(SELECT dense.dense_id FROM temp.surface_dense AS dense
+                    WHERE dense.blob_id=scope.blob_id AND dense.id_space=7
+                     AND dense.surface_ordinal=shared_placement.scope_surface_ordinal)
  CROSS JOIN main.rust_resolution_unit_summary_glob_imports AS glob
   ON glob.summary_id=source.summary_id AND glob.member_ordinal=source.member_ordinal
  AND glob.module_path=source.module_path
+ /* Rust-only derived-from blob until #11183 M3 converts Rust child rows */
  AND glob.binder_scope=scope.resolution_scope
  CROSS JOIN selected_rust_unit_summaries AS dependency
   ON dependency.unit_key=glob.target_unit_key
@@ -164,6 +233,7 @@ WITH RECURSIVE targets(topology_id, module_path, name, followed) AS (
                  WHERE spelled.summary_id=source.summary_id
                    AND spelled.member_ordinal=source.member_ordinal
                    AND spelled.module_path=source.module_path
+                   /* Rust-only derived-from blob until #11183 M3 converts Rust child rows */
                    AND spelled.binder_scope=scope.resolution_scope
                    AND spelled.namespace=?3 AND spelled.bound_name=targets.name)
  UNION

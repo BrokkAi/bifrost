@@ -41,6 +41,47 @@ pub fn record_identity_walk_inputs<'a, A: LanguageAdapter>(
     }
 }
 
+#[derive(Debug)]
+struct CandidateArenaEvidence {
+    receipt: crate::analyzer::i_analyzer::QueryReadReceipt,
+    flows: Vec<(
+        crate::analyzer::semantic::ProcedureId,
+        crate::analyzer::semantic::partial_flow::ProcedurePartialFlows,
+    )>,
+}
+
+// Shares the evidence allocation already owned and charged by the arena.
+#[derive(Clone)]
+struct CandidateArenaFlows(Arc<CandidateArenaEvidence>);
+
+impl CandidateArenaFlows {
+    fn from_evidence(evidence: &Arc<dyn std::any::Any + Send + Sync>) -> Self {
+        Self(
+            Arc::clone(evidence)
+                .downcast::<CandidateArenaEvidence>()
+                .expect("candidate evidence type"),
+        )
+    }
+}
+
+impl
+    AsRef<
+        [(
+            crate::analyzer::semantic::ProcedureId,
+            crate::analyzer::semantic::partial_flow::ProcedurePartialFlows,
+        )],
+    > for CandidateArenaFlows
+{
+    fn as_ref(
+        &self,
+    ) -> &[(
+        crate::analyzer::semantic::ProcedureId,
+        crate::analyzer::semantic::partial_flow::ProcedurePartialFlows,
+    )] {
+        &self.0.flows
+    }
+}
+
 use super::source_admission::{AdmissionStop, SourceAdmissionPolicy, SourceAdmissionRefusal};
 use crate::analyzer::read_ledger::reason as derivation_reason;
 use crate::analyzer::store_bridge::AnalyzerStoreEngineExt;
@@ -181,10 +222,45 @@ macro_rules! delegate_inner_methods {
 #[doc(hidden)]
 pub use crate::delegate_inner_methods;
 
+/// Shared owner propagation for language wrappers around TreeSitterAnalyzer.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! delegate_generation_membership_updates {
+    ($concrete:ty) => {
+        fn update_all_with_membership(
+            &self,
+            progress: Option<$crate::analyzer::BuildProgress>,
+            membership: std::sync::Arc<
+                $crate::analyzer::tree_sitter_analyzer::GenerationWorkspaceMembership,
+            >,
+        ) -> Box<dyn $crate::analyzer::multi_analyzer::LanguageAnalyzer> {
+            let mut next = self.clone();
+            next.inner = self.inner.prepare_generation_rebuild(membership);
+            Box::new(<$concrete>::update_all_with_progress(&next, progress))
+        }
+        fn with_generation_membership(
+            &self,
+            membership: std::sync::Arc<
+                $crate::analyzer::tree_sitter_analyzer::GenerationWorkspaceMembership,
+            >,
+        ) -> Box<dyn $crate::analyzer::multi_analyzer::LanguageAnalyzer> {
+            let mut next = self.clone();
+            next.inner = self.inner.with_generation_membership(membership);
+            Box::new(next)
+        }
+    };
+}
+
 #[doc(hidden)]
 #[macro_export]
 macro_rules! delegate_inner_procedure_fact_methods {
     () => {
+        fn owned_lookup_memo(
+            &self,
+        ) -> Option<std::sync::Arc<$crate::analyzer::read_verification::OwnedLookupMemo>> {
+            $crate::analyzer::IAnalyzer::owned_lookup_memo(&self.inner)
+        }
+
         fn relational_frontier_read_recorder(
             &self,
         ) -> $crate::analyzer::relational_frontier::FrontierReadRecorder {
@@ -263,7 +339,7 @@ fn publish_statement_assessments<K>(
     >,
     value: crate::analyzer::semantic::StatementAssessments,
     execution_dependent: bool,
-    reads: &crate::analyzer::ReadLedger,
+    reads: &Arc<crate::analyzer::ReadLedger>,
 ) -> Arc<Accounted<crate::analyzer::semantic::statement_entries::AccountedStatementAssessments>>
 where
     K: Eq + std::hash::Hash + Clone + Send + Sync + RetainedBytes + 'static,
@@ -276,11 +352,12 @@ where
                 unattributed_reads: reads.unattributed_reads(),
                 execution_dependences: usize::from(execution_dependent),
                 reuse_refused: reads.reuse_refused(),
+                store_failed: reads.store_failed(),
                 ..Default::default()
             },
         );
         let value = Arc::new(Accounted::uncharged(
-            crate::analyzer::semantic::statement_entries::AccountedStatementAssessments(value),
+            crate::analyzer::semantic::statement_entries::AccountedStatementAssessments::new(value),
         ));
         if let Some(permit) = permit {
             permit.publish_rejected();
@@ -289,7 +366,10 @@ where
     }
     let value = Arc::new(Accounted::charged(
         budget,
-        crate::analyzer::semantic::statement_entries::AccountedStatementAssessments(value),
+        crate::analyzer::semantic::statement_entries::AccountedStatementAssessments(
+            value,
+            Some(reads.clone()),
+        ),
     ));
     if let Some(permit) = permit {
         permit.publish_complete(SharedAllocation::new(Arc::clone(&value)));
@@ -440,47 +520,203 @@ pub const COMPLETE_FILE_PARSE_BUDGET: Duration = Duration::from_secs(10);
 /// reader sees only a slow build and reaches for the persistence knobs.
 const SLOW_FILE_ANALYSIS_NOTE_NANOS: usize = 5_000_000_000;
 
-/// The process-wide parse pool for `language` with `threads` workers (#3751).
+/// The one process-wide parse pool (#3751, #11801).
 ///
 /// Building a rayon pool per parse batch spawned and joined `threads` OS
-/// threads on every call, which an interactive one-file update paid in full.
-/// The pools live for the process, one per language and thread count, so the
-/// map is bounded by the languages the process builds and never grows with
-/// the workspace. Languages keep separate pools because a workspace build
-/// parses its languages concurrently: on a shared one-worker pool, one
-/// language's slow or blocked file would stall every other language.
+/// threads on every call, which an interactive one-file update paid in full, so
+/// the pool lives for the process. It is one pool for every language and every
+/// batch, because a pool per language multiplied the thread count by the number
+/// of languages parsed: twelve languages on a 120-core host held 1440 parse
+/// threads (#11801). A batch bounds its own width inside the pool with
+/// [`map_on_parse_pool`], so `AnalyzerConfig::parallelism` still limits it.
+///
+/// Sharing is safe because no parse worker waits for anything that needs a
+/// parse worker. The one wait a worker has on another thread is the bounded
+/// channel `send` of a result to the persist consumer
+/// ([`TreeSitterAnalyzer::analyze_prepare_and_persist_files`]); the consumer
+/// runs on the batch's calling thread and never on this pool, and it is
+/// released by the single writer, not by parsing. Progress callbacks and
+/// project reads run on a worker, but they only take leaf locks or read files;
+/// none waits for another build. Concurrent batches therefore share the
+/// workers and serialize at worst, and cannot deadlock. Both batch functions
+/// assert the two ways to break that rule: a caller that is itself a parse
+/// worker, and a persist consumer that starts another batch while its own
+/// producers hold every worker blocked on `send` to it.
 ///
 /// This is deliberately not the dedicated index-build pool. A background
 /// catch-up occupies a worker of that pool while its parse producer, which
 /// runs on a scoped thread outside every pool, waits for parse workers. With
 /// one worker, parsing on the dedicated pool would queue the producer behind
-/// the catch-up that waits for it. Builds of one language that share a parse
-/// pool only serialize: a producer blocks on its own consumer, which holds no
-/// pool worker and no lock while it waits for results. Progress callbacks and
-/// project reads run on a parse worker, so they must not wait for another
-/// thread's build of the same language: at one worker that build's parse would
-/// queue behind them.
-fn parse_pool(language: Language, threads: usize) -> &'static rayon::ThreadPool {
-    static POOLS: OnceLock<Mutex<HashMap<(Language, usize), &'static rayon::ThreadPool>>> =
-        OnceLock::new();
-    let _scope = profiling::scope("TreeSitterAnalyzer::parse_pool");
-    // A failed pool build panics before inserting, so a poisoned map is still
-    // consistent and the next build can retry.
-    let mut pools = POOLS
-        .get_or_init(Mutex::default)
+/// the catch-up that waits for it. It is not the global rayon pool either: that
+/// pool's workers run persist consumers (the per-language update fan-out and
+/// inline catch-up), which park in `recv`, so at width one a consumer would
+/// wait for a parse task that only its own pool can run. Parse tasks also run
+/// for seconds and would starve interactive query fan-outs there.
+fn parse_pool() -> &'static rayon::ThreadPool {
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(pool) = *PARSE_POOL_OVERRIDE
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    pools.entry((language, threads)).or_insert_with(|| {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
+        .expect("parse pool override mutex poisoned")
+    {
+        return pool;
+    }
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(brokk_bifrost_core::analyzer::config::default_parallelism())
             .thread_name(|index| format!("bifrost-parse-{index}"))
             .build()
-            .expect("failed to build analyzer parse pool");
-        Box::leak(Box::new(pool))
+            .expect("failed to build analyzer parse pool")
     })
 }
 
+#[cfg(any(test, feature = "test-support"))]
+static PARSE_POOL_OVERRIDE: Mutex<Option<&'static rayon::ThreadPool>> = Mutex::new(None);
+
+/// Holds a parse pool override; see [`override_parse_pool_for_test`].
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
+pub struct ParsePoolOverride {
+    _callers: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for ParsePoolOverride {
+    fn drop(&mut self) {
+        *PARSE_POOL_OVERRIDE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+}
+
+/// Make every parse batch that any thread starts use a pool of `workers`
+/// instead of the process pool until the guard drops. A test uses it to choose
+/// how many workers every language shares: `.cargo/config.toml` makes the
+/// process pool one worker wide under Cargo, so a fixture that parks one worker
+/// needs a second and a test that compares a parallel build with a serial one
+/// needs the width it asks for. The pool is leaked, like the process pool.
+///
+/// Holders are serialized, so two overriding tests in one process do not see
+/// each other's pool.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn override_parse_pool_for_test(workers: usize) -> ParsePoolOverride {
+    static CALLERS: Mutex<()> = Mutex::new(());
+    let callers = CALLERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let pool: &'static rayon::ThreadPool = Box::leak(Box::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .thread_name(|index| format!("test-parse-{index}"))
+            .build()
+            .expect("test parse pool"),
+    ));
+    *PARSE_POOL_OVERRIDE
+        .lock()
+        .expect("parse pool override mutex poisoned") = Some(pool);
+    ParsePoolOverride { _callers: callers }
+}
+
+thread_local! {
+    /// Set while this thread runs a persist consumer loop. A consumer that
+    /// started another parse batch would wait on workers that its own producers
+    /// hold blocked on `send` to it.
+    static IN_PARSE_CONSUMER: Cell<bool> = const { Cell::new(false) };
+}
+
+struct ParseConsumerScope(bool);
+
+impl ParseConsumerScope {
+    fn enter() -> Self {
+        Self(IN_PARSE_CONSUMER.with(|flag| flag.replace(true)))
+    }
+}
+
+impl Drop for ParseConsumerScope {
+    fn drop(&mut self) {
+        IN_PARSE_CONSUMER.with(|flag| flag.set(self.0));
+    }
+}
+
+/// The checks both parse batch functions make before they touch the pool.
+fn assert_parse_batch_may_start(pool: &rayon::ThreadPool) {
+    debug_assert!(
+        pool.current_thread_index().is_none(),
+        "a parse batch started on a parse worker, which would wait for its own pool"
+    );
+    debug_assert!(
+        !IN_PARSE_CONSUMER.with(Cell::get),
+        "a parse batch started from inside a persist consumer, whose producers hold the pool"
+    );
+}
+
+/// Apply `work` to every item on at most `width` workers of `pool`, returning
+/// the results in input order. `init` builds each worker's private state once.
+///
+/// The same pull-by-index loop as `map_bounded` in the policy crate, but on the
+/// shared pool's workers instead of fresh threads: a policy runs for seconds
+/// and fans out on the global pool itself, so it must not be a pool worker,
+/// while a parse batch must reuse threads. The calling thread waits in
+/// `in_place_scope` and is not a pool worker, so every worker only ever runs
+/// leaf loops. An `install` closure would occupy a worker that waits for its
+/// tasks while stealing another batch's loops, and could not resume until a
+/// stolen loop it cannot influence had finished. A loop never waits for a
+/// queued loop of its own batch, so a batch that finds the pool busy only
+/// waits. A panic in `work` surfaces from the scope after the other loops
+/// finish, as it did from `par_iter`.
+fn map_on_parse_pool<T, S, R>(
+    pool: &rayon::ThreadPool,
+    width: usize,
+    items: Vec<T>,
+    init: impl Fn() -> S + Sync,
+    work: impl Fn(&mut S, T) -> R + Sync,
+) -> Vec<R>
+where
+    T: Send,
+    R: Send,
+{
+    let workers = width
+        .min(pool.current_num_threads())
+        .min(items.len())
+        .max(1);
+    let slots: Vec<Mutex<Option<T>>> = items
+        .into_iter()
+        .map(|item| Mutex::new(Some(item)))
+        .collect();
+    let next = AtomicUsize::new(0);
+    let collected = Mutex::new(Vec::with_capacity(slots.len()));
+    pool.in_place_scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|_| {
+                let mut state = init();
+                let mut local = Vec::new();
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(slot) = slots.get(index) else {
+                        break;
+                    };
+                    let item = slot
+                        .lock()
+                        .expect("parse item slot poisoned")
+                        .take()
+                        .expect("each parse item is taken once");
+                    local.push((index, work(&mut state, item)));
+                }
+                collected
+                    .lock()
+                    .expect("parse results poisoned")
+                    .append(&mut local);
+            });
+        }
+    });
+    let mut collected = collected.into_inner().expect("parse results poisoned");
+    collected.sort_unstable_by_key(|(index, _)| *index);
+    collected.into_iter().map(|(_, result)| result).collect()
+}
+
+#[doc(hidden)]
+#[derive(Debug)]
 pub enum BoundedParse {
     Complete(Tree),
     Refused(SourceAdmissionRefusal),
@@ -995,6 +1231,11 @@ pub struct AnalyzerStoreContext {
     /// retained by the long-lived workspace build context.
     #[doc(hidden)]
     pub workspace_snapshot: Option<Arc<WorkspaceBuildSnapshot>>,
+    /// Membership owned by this generation; None only during standalone setup.
+    #[doc(hidden)]
+    pub membership: Option<Arc<GenerationWorkspaceMembership>>,
+    #[doc(hidden)]
+    pub prepared_membership: Option<Arc<GenerationWorkspaceMembership>>,
     /// Whether the most recent full workspace enumeration completed. A
     /// package-membership hit remains useful when this is false, but an exact
     /// miss cannot prove absence from the current workspace.
@@ -1044,6 +1285,142 @@ pub struct AnalyzerStoreContext {
         Arc<OnceLock<crate::analyzer::structural::provider::StructuralFactsCache>>,
 }
 
+/// Immutable membership observed by one generation's build. This is required
+/// owner state, not an evictable memo. Future atomic input publications must
+/// reference this same Arc rather than copying or independently listing files.
+pub struct GenerationWorkspaceMembership {
+    listing: Option<SharedWorkspaceFileListing>,
+    listing_error: Option<String>,
+    /// The digest of the omissions every language's identity folds, computed
+    /// once from the immutable listing.
+    omission_digest: Option<StableDigest>,
+    charge: brokk_bifrost_core::retention_budget::AllocationCharge,
+}
+
+/// No listing was observed for this generation. An empty observed listing is
+/// complete and is represented by Ok, never by this unavailable state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GenerationListingUnavailable;
+impl std::fmt::Display for GenerationListingUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("discovery.generation_listing_unavailable")
+    }
+}
+impl std::error::Error for GenerationListingUnavailable {}
+
+impl GenerationWorkspaceMembership {
+    pub(crate) fn unavailable() -> &'static Arc<Self> {
+        static ABSENT: std::sync::OnceLock<Arc<GenerationWorkspaceMembership>> =
+            std::sync::OnceLock::new();
+        ABSENT.get_or_init(|| {
+            Arc::new(Self {
+                listing: None,
+                listing_error: None,
+                omission_digest: None,
+                charge: Default::default(),
+            })
+        })
+    }
+
+    pub fn new(
+        listing: Option<SharedWorkspaceFileListing>,
+        budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
+    ) -> Arc<Self> {
+        Self::from_observation(listing, None, budget)
+    }
+
+    pub(crate) fn capture(
+        project: &dyn Project,
+        budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
+    ) -> Arc<Self> {
+        match project.all_files_with_omissions() {
+            Ok(listing) => Self::new(Some(listing), budget),
+            Err(error) => Self::from_observation(None, Some(error.to_string()), budget),
+        }
+    }
+
+    pub(crate) fn listing_failure(&self) -> StoreError {
+        StoreError::new(
+            self.listing_error
+                .as_deref()
+                .unwrap_or("generation listing unavailable"),
+        )
+    }
+
+    fn from_observation(
+        listing: Option<SharedWorkspaceFileListing>,
+        listing_error: Option<String>,
+        budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
+    ) -> Arc<Self> {
+        // Use the existing ProjectFile estimate (the root is interned). Include
+        // tree links/occupancy conservatively and the omissions vector capacity.
+        let bytes = std::mem::size_of::<Self>()
+            + 2 * std::mem::size_of::<usize>()
+            + listing_error.as_ref().map_or(0, String::capacity)
+            + listing.as_ref().map_or(0, |(files, omissions)| {
+                std::mem::size_of_val(files.as_ref())
+                    + files
+                        .iter()
+                        .map(|file| file.retained_bytes() + 4 * std::mem::size_of::<usize>())
+                        .sum::<usize>()
+                    + std::mem::size_of_val(omissions.as_ref())
+                    + omissions.capacity()
+                        * std::mem::size_of::<
+                            brokk_bifrost_core::analyzer::project::WorkspaceFileOmission,
+                        >()
+                    + omissions
+                        .iter()
+                        .map(|omission| omission.path.capacity())
+                        .sum::<usize>()
+            });
+        let omission_digest = listing.as_ref().and_then(|(files, omissions)| {
+            // The same rule as the inventory these keys stand for.
+            let languages = files
+                .iter()
+                .map(ProjectFile::language)
+                .filter(|language| *language != Language::None)
+                .collect::<BTreeSet<_>>();
+            crate::analyzer::content_identity::listing_omissions_digest(omissions.iter().filter(
+                |omission| {
+                    crate::analyzer::languages::omission_hides_workspace_source(
+                        languages.iter().copied(),
+                        omission,
+                    )
+                },
+            ))
+        });
+        Arc::new(Self {
+            listing,
+            listing_error,
+            omission_digest,
+            charge: brokk_bifrost_core::retention_budget::AllocationCharge::acquire_required(
+                budget, bytes,
+            ),
+        })
+    }
+
+    pub fn listing(&self) -> Result<&SharedWorkspaceFileListing, GenerationListingUnavailable> {
+        self.listing.as_ref().ok_or(GenerationListingUnavailable)
+    }
+
+    pub fn accounted_bytes(&self) -> u64 {
+        self.charge.bytes()
+    }
+
+    /// The digest of the omissions that keep the whole-workspace source
+    /// inventory from being complete, or `None` when none do.
+    ///
+    /// The inventory a graph consumer reads is whole-workspace, so a graph of
+    /// one ecosystem is incomplete when an omission hides a source of another
+    /// language, present or not. Every language's identity folds the same set.
+    fn listing_omissions_digest(
+        &self,
+    ) -> Result<Option<StableDigest>, GenerationListingUnavailable> {
+        self.listing()?;
+        Ok(self.omission_digest)
+    }
+}
+
 /// Build-scoped view shared by all language delegates in one workspace build.
 ///
 /// The listing is captured once before the language fan-out and the live path
@@ -1068,26 +1445,7 @@ const RUST_LISTING_UNAVAILABLE_PATH: &str = "";
 const RUST_LISTING_UNAVAILABLE_REASON: &str = "listing unavailable";
 const RUST_LISTING_OMISSION_PREFIX: &str = "omission: ";
 
-/// Whether an omission can hide a workspace source for any language. A walk
-/// error, an undecodable Git path, or a project that cannot say why
-/// (`Unknown`, which is also the default listing's single row) may drop a
-/// source this analyzer should have indexed. So may a symbolic link to a
-/// directory, which the listing does not descend into, or an unreadable
-/// symbolic link. Ignore rules, configured excludes and other non-regular
-/// entries are outside the analyzer's universe.
-fn omission_may_hide_source(
-    reason: brokk_bifrost_core::analyzer::project::WorkspaceFileOmissionReason,
-) -> bool {
-    use brokk_bifrost_core::analyzer::project::WorkspaceFileOmissionReason;
-    matches!(
-        reason,
-        WorkspaceFileOmissionReason::WalkError
-            | WorkspaceFileOmissionReason::NonUtf8GitPath
-            | WorkspaceFileOmissionReason::Unknown
-            | WorkspaceFileOmissionReason::SymlinkToDirectory
-            | WorkspaceFileOmissionReason::UnreadableSymlink
-    )
-}
+use super::languages::omission_hides_source;
 
 /// A complete listing proof was granted under an empty set of omissions that
 /// can hide source. Compare that set with the new observation without walking
@@ -1095,12 +1453,13 @@ fn omission_may_hide_source(
 pub(crate) fn listing_may_withdraw_proof(
     project: &dyn Project,
     listing: Option<&SharedWorkspaceFileListing>,
+    language: Language,
 ) -> Result<bool, StoreError> {
     Ok(
         current_listing_omissions(project, listing)?.is_none_or(|omissions| {
             omissions
                 .iter()
-                .any(|omission| omission_may_hide_source(omission.reason))
+                .any(|omission| omission_hides_source(language, omission))
         }),
     )
 }
@@ -1122,15 +1481,6 @@ fn current_listing_omissions(
     })
 }
 
-/// Whether a path the listing omitted keeps the Rust listing from proving a
-/// module or manifest absent: every omission that can hide a source, and any
-/// other omission of a `.rs` or `Cargo.toml` path.
-fn omission_fails_rust_listing(
-    omission: &brokk_bifrost_core::analyzer::project::WorkspaceFileOmission,
-) -> bool {
-    omission_may_hide_source(omission.reason) || is_rust_listing_path(&omission.path)
-}
-
 impl WorkspaceBuildSnapshot {
     #[doc(hidden)]
     pub fn capture(
@@ -1138,10 +1488,28 @@ impl WorkspaceBuildSnapshot {
         liveness: Option<&Liveness>,
         selected_languages: &[Language],
     ) -> Option<Arc<Self>> {
-        let (files, omissions) = {
+        let listing = {
             let _scope = profiling::scope("WorkspaceBuildSnapshot::list_files");
             project.all_files_with_omissions().ok()?
         };
+        Some(Self::from_listing(
+            project,
+            liveness,
+            selected_languages,
+            listing,
+        ))
+    }
+
+    /// Project language-specific identities from a listing captured by the
+    /// enclosing build. This performs no workspace enumeration, so delegates
+    /// can share membership even if files change during their construction.
+    #[doc(hidden)]
+    pub fn from_listing(
+        project: &dyn Project,
+        liveness: Option<&Liveness>,
+        selected_languages: &[Language],
+        (files, omissions): SharedWorkspaceFileListing,
+    ) -> Arc<Self> {
         let mut live_entries = map_with_capacity(files.len());
         let mut disk_stats = map_with_capacity(files.len());
         let analysis_generation = project.analysis_generation();
@@ -1184,13 +1552,17 @@ impl WorkspaceBuildSnapshot {
                 live_entries.insert(file.clone(), LivePathEntry::overlay(file.clone(), oid));
             }
         }
-        Some(Arc::new(Self {
+        Arc::new(Self {
             files,
             omissions,
             live_entries: Arc::new(live_entries),
             disk_stats: Arc::new(disk_stats),
             analysis_generation,
-        }))
+        })
+    }
+
+    pub(crate) fn shared_listing(&self) -> SharedWorkspaceFileListing {
+        (Arc::clone(&self.files), Arc::clone(&self.omissions))
     }
 
     pub(crate) fn files(&self) -> &BTreeSet<ProjectFile> {
@@ -1339,7 +1711,8 @@ pub struct StructuralSnapshotKey {
 
 impl RetainedBytes for StructuralSnapshotKey {
     fn retained_bytes(&self) -> usize {
-        std::mem::size_of::<Self>() + self.blob.lang.capacity()
+        std::mem::size_of::<Self>()
+            + brokk_bifrost_core::allocation_size::allocation_size(self.blob.lang.capacity())
     }
 }
 
@@ -1358,18 +1731,6 @@ impl StructuralSnapshotKey {
     }
 }
 
-/// Exercise the test-only single-connection store without depending on a
-/// temporary-file failure.
-#[cfg(any(test, feature = "test-support"))]
-#[doc(hidden)]
-pub fn single_connection_store_context_for_test(
-    project: &dyn Project,
-) -> std::result::Result<AnalyzerStoreContext, StoreError> {
-    let store = AnalyzerStore::open_in_memory_single_connection()?;
-    assert!(store.uses_single_connection_reads());
-    Ok(store_context_from_store(project, store, false))
-}
-
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub fn ephemeral_store_context(
@@ -1383,8 +1744,9 @@ pub(crate) fn ephemeral_store_context_with_config(
     project: &dyn Project,
     config: &AnalyzerConfig,
 ) -> std::result::Result<AnalyzerStoreContext, StoreError> {
-    let budget =
-        brokk_bifrost_core::retention_budget::RetentionBudget::new(config.retention_budget_bytes());
+    let budget = brokk_bifrost_core::retention_budget::RetentionBudget::for_test_capacity(
+        config.retention_budget_bytes(),
+    );
     ephemeral_store_context_with_budget(project, config, &budget)
 }
 
@@ -1412,8 +1774,9 @@ pub(crate) fn persistent_store_context_with_config(
     config: &AnalyzerConfig,
     automatic_gc: bool,
 ) -> std::result::Result<AnalyzerStoreContext, StoreError> {
-    let budget =
-        brokk_bifrost_core::retention_budget::RetentionBudget::new(config.retention_budget_bytes());
+    let budget = brokk_bifrost_core::retention_budget::RetentionBudget::for_test_capacity(
+        config.retention_budget_bytes(),
+    );
     persistent_store_context_with_budget(project, config, automatic_gc, &budget)
 }
 
@@ -1479,8 +1842,9 @@ pub(crate) fn scoped_store_context_with_config(
     project: &dyn Project,
     config: &AnalyzerConfig,
 ) -> std::result::Result<AnalyzerStoreContext, StoreError> {
-    let budget =
-        brokk_bifrost_core::retention_budget::RetentionBudget::new(config.retention_budget_bytes());
+    let budget = brokk_bifrost_core::retention_budget::RetentionBudget::for_test_capacity(
+        config.retention_budget_bytes(),
+    );
     scoped_store_context_with_budget(project, config, &budget)
 }
 
@@ -1597,6 +1961,8 @@ pub fn store_context_from_shared_store(
         gc: Arc::new(gc),
         liveness,
         workspace_snapshot: None,
+        membership: None,
+        prepared_membership: None,
         workspace_listing_complete: true,
         revision_blobs: None,
         live_paths: Arc::new(LivePathMap::trust_filesystem_generation()),
@@ -1608,9 +1974,34 @@ pub fn store_context_from_shared_store(
     }
 }
 
+/// Language-owned parse rules carried opaquely by a parse configuration.
+///
+/// Clones share one allocation, so the language that produced the state keeps
+/// its lazy index and its request-local lifetime.
+#[derive(Clone)]
+pub struct ParseRulesState(Arc<dyn Any + Send + Sync>);
+
+impl ParseRulesState {
+    pub fn new<T: Any + Send + Sync>(rules: T) -> Self {
+        Self(Arc::new(rules))
+    }
+
+    /// `None` when another language produced this state.
+    pub fn downcast<T: Any + Send + Sync>(&self) -> Option<&T> {
+        self.0.downcast_ref()
+    }
+}
+
+impl std::fmt::Debug for ParseRulesState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ParseRulesState(..)")
+    }
+}
+
 /// Captured configuration used to choose one path's parse product.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ParseConfiguration {
+    pub rules: ParseRulesState,
     pub set: Option<i64>,
     pub output_digest: Option<[u8; 32]>,
 }
@@ -1645,9 +2036,9 @@ struct OverlayVariant {
 
 impl RetainedBytes for OverlayVariant {
     fn retained_bytes(&self) -> usize {
+        use brokk_bifrost_core::allocation_size::allocation_size;
         std::mem::size_of::<Self>()
-            + self.undecided_chains.capacity()
-                * std::mem::size_of::<crate::analyzer::store::UndecidedChainRow>()
+            + brokk_bifrost_core::hash::allocated_vec_slot_bytes(&self.undecided_chains)
             + self
                 .undecided_chains
                 .iter()
@@ -1659,8 +2050,11 @@ impl RetainedBytes for OverlayVariant {
                     ]
                     .into_iter()
                     .map(|strings| {
-                        strings.capacity() * std::mem::size_of::<String>()
-                            + strings.iter().map(String::capacity).sum::<usize>()
+                        brokk_bifrost_core::hash::allocated_vec_slot_bytes(strings)
+                            + strings
+                                .iter()
+                                .map(|text| allocation_size(text.capacity()))
+                                .sum::<usize>()
                     })
                     .sum::<usize>()
                 })
@@ -1668,9 +2062,35 @@ impl RetainedBytes for OverlayVariant {
     }
 }
 
+/// A language's workspace signature files: non-source files that declare
+/// types for the language's own sources, such as Ruby's `sig/**/*.rbs`
+/// (#12967). Their facts are persisted per blob when the analyzer builds or
+/// updates; the analyzer keeps the path-to-blob inventory and folds it into
+/// the language content identity, so an edit to one is an incremental update.
+pub trait WorkspaceSignatureProducer: Sync {
+    /// Whether the workspace-relative `path` is a signature input.
+    fn is_signature_input_path(&self, path: &std::path::Path) -> bool;
+    /// Persist the facts of the signature file `source`, whose blob is `oid`,
+    /// and report whether they are complete: `false` when the file did not
+    /// parse or exceeded a limit, so a declaration it holds may be missing.
+    /// Publishing a blob that already has facts writes nothing.
+    fn publish(&self, store: &AnalyzerStore, oid: Oid, source: &[u8]) -> Result<bool, StoreError>;
+}
+
 pub trait LanguageAdapter:
     crate::analyzer::store::StoreLanguageAdapter + Send + Sync + 'static
 {
+    /// The language's workspace signature files, if it reads any.
+    fn workspace_signature_producer(&self) -> Option<&'static dyn WorkspaceSignatureProducer> {
+        None
+    }
+
+    /// Whether absence of local test evidence proves a declaration is production.
+    /// Languages whose parent files can gate a whole module must return false.
+    fn local_test_evidence_proves_production(&self) -> bool {
+        true
+    }
+
     /// Apply obligations carried by a consumed read key. The default language
     /// has no key-specific obligation.
     fn record_read_obligation(
@@ -1764,7 +2184,7 @@ pub trait LanguageAdapter:
         _analyzer: &TreeSitterAnalyzer<Self>,
         _owner: &CodeUnit,
         _limit: usize,
-    ) -> Option<Vec<(CodeUnit, Option<Range>)>>
+    ) -> Option<CrossFileChildren>
     where
         Self: Sized,
     {
@@ -2084,6 +2504,20 @@ pub trait LanguageAdapter:
     ) -> (ParsedFile, Vec<(&'static str, ParsedFile)>) {
         (self.parse_file(file, source, tree), Vec::new())
     }
+    /// Collect declarations from the admitted whole-file parse used by indexing.
+    fn parse_file_prepared(
+        &self,
+        file: &ProjectFile,
+        prepared: &PreparedSyntaxTree,
+    ) -> (ParsedFile, Vec<(&'static str, ParsedFile)>) {
+        self.parse_file_preprocessed(
+            file,
+            prepared.source(),
+            prepared.tree(),
+            prepared.preprocessor().map(|p| p.as_ref()),
+        )
+    }
+
     fn parse_file_preprocessed(
         &self,
         file: &ProjectFile,
@@ -2206,6 +2640,7 @@ pub fn full_source_range(source: &str) -> Range {
 #[doc(hidden)]
 pub struct PreparedSyntaxLimitExceeded {
     minimum_source_bytes: usize,
+    refused: brokk_bifrost_core::analyzer::work_budget::LimitRefused,
 }
 
 impl PreparedSyntaxLimitExceeded {
@@ -2214,11 +2649,29 @@ impl PreparedSyntaxLimitExceeded {
     }
 }
 
+/// The refused source-size limit stopped this run, not the content.
+impl crate::analyzer::reuse_verdict::CarriesReuseVerdict for PreparedSyntaxLimitExceeded {
+    fn reuse_verdict(&self) -> crate::analyzer::reuse_verdict::ReuseVerdict {
+        self.refused.reuse_verdict()
+    }
+}
+
 #[derive(Debug)]
 #[doc(hidden)]
 pub enum PreparedSourceFailure {
     Exceeded(PreparedSyntaxLimitExceeded),
     Refused(SourceAdmissionRefusal),
+}
+
+/// An exceeded limit carries its refusal; an admission refusal depends on
+/// content.
+impl crate::analyzer::reuse_verdict::CarriesReuseVerdict for PreparedSourceFailure {
+    fn reuse_verdict(&self) -> crate::analyzer::reuse_verdict::ReuseVerdict {
+        match self {
+            Self::Exceeded(exceeded) => exceeded.reuse_verdict(),
+            Self::Refused(_) => crate::analyzer::reuse_verdict::ReuseVerdict::Content,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -2233,6 +2686,19 @@ pub enum PreparedSyntaxLimitedOutcome {
     Refused(SourceAdmissionRefusal),
     Cancelled,
     Unavailable,
+}
+
+/// By shape: an exceeded source limit and a cancellation stopped for this
+/// run's execution state; the other outcomes depend on content.
+impl crate::analyzer::reuse_verdict::CarriesReuseVerdict for PreparedSyntaxLimitedOutcome {
+    fn reuse_verdict(&self) -> crate::analyzer::reuse_verdict::ReuseVerdict {
+        use crate::analyzer::reuse_verdict::{ExecutionCause, ReuseVerdict};
+        match self {
+            Self::Exceeded(exceeded) => exceeded.reuse_verdict(),
+            Self::Cancelled => ReuseVerdict::ExecutionDependent(ExecutionCause::Other),
+            Self::Available(..) | Self::Refused(_) | Self::Unavailable => ReuseVerdict::Content,
+        }
+    }
 }
 
 /// One complete parse: the file state the walk produced and the exact tree
@@ -2280,6 +2746,15 @@ impl AsMut<HierarchyDeclarationFacts> for HierarchyDeclarationFacts {
     fn as_mut(&mut self) -> &mut HierarchyDeclarationFacts {
         self
     }
+}
+
+/// Members declared outside the owner's file, and whether the language could
+/// attribute every candidate impl to the owner. An unattributable one means
+/// children may be missing: the rows are a partial answer.
+#[doc(hidden)]
+pub struct CrossFileChildren {
+    pub children: Vec<(CodeUnit, Option<Range>)>,
+    pub complete: bool,
 }
 
 /// One exact source identity selected without hydration or publication retry.
@@ -2437,12 +2912,32 @@ impl PackageIdentityInputDigest {
 /// the blobs travel with it. A comparison against a committed tree needs them
 /// (`WorkspaceFactIndex::selected_configuration_input_blobs`). Holding both in
 /// one value keeps them from disagreeing at any write site.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct SelectedConfiguration {
     digest: StableDigest,
+    // Admission-only freshness receipts; no external source text is retained.
+    rust_cargo_external_reads: Arc<[crate::analyzer::semantic_model::ExternalDiscoveryRead]>,
+    rust_cargo_acquisition_complete: bool,
+    /// [`RustCargoAcquiredConfigView::effective_digest`] of the acquisition:
+    /// what the configuration means, without the bytes that say it. A warm
+    /// update rebuilds on a configuration edit only when this changes.
+    rust_cargo_effective_digest: Option<[u8; 32]>,
     /// Workspace-relative path to blob, for inputs that were present.
     /// A retained absence has no blob.
     present_blobs: HashMap<Box<str>, Oid>,
+    /// Retained local absences, including optional Cargo includes.
+    absent_paths: HashSet<Box<str>>,
+}
+
+impl std::fmt::Debug for SelectedConfiguration {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SelectedConfiguration")
+            .field("digest", &self.digest)
+            .field("present_blobs", &self.present_blobs.len())
+            .field("external_reads", &self.rust_cargo_external_reads.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl SelectedConfiguration {
@@ -2450,13 +2945,33 @@ impl SelectedConfiguration {
         let mut ordered = inputs.iter().collect::<Vec<_>>();
         ordered.sort_by_key(|input| input.relative_path());
         Self {
-            digest: crate::analyzer::store::configuration_digest(ordered.iter().map(|input| {
-                (
-                    input.relative_path(),
-                    input.content_oid(),
-                    Some(input.file_present),
-                )
-            })),
+            rust_cargo_external_reads: WorkspaceConfigurationInput::rust_cargo_external_reads(
+                inputs,
+            ),
+            rust_cargo_acquisition_complete: WorkspaceConfigurationInput::rust_cargo_acquisition(
+                inputs,
+            )
+            .is_none_or(|view| view.complete),
+            rust_cargo_effective_digest: WorkspaceConfigurationInput::rust_cargo_acquisition(
+                inputs,
+            )
+            .map(|view| view.effective_digest()),
+            digest: crate::analyzer::store::bind_acquired_configuration_digest(
+                crate::analyzer::store::configuration_digest(ordered.iter().map(|input| {
+                    (
+                        input.relative_path(),
+                        input.content_oid(),
+                        Some(input.file_present),
+                    )
+                })),
+                WorkspaceConfigurationInput::rust_cargo_acquisition(inputs)
+                    .map(|view| view.digest()),
+            ),
+            absent_paths: inputs
+                .iter()
+                .filter(|input| !input.file_present)
+                .map(|input| Box::from(input.relative_path()))
+                .collect(),
             present_blobs: inputs
                 .iter()
                 .filter(|input| input.file_present)
@@ -2465,9 +2980,14 @@ impl SelectedConfiguration {
         }
     }
 
+    fn contains_input(&self, path: &str) -> bool {
+        self.present_blobs.contains_key(path) || self.absent_paths.contains(path)
+    }
+
     /// The selection after one present input was republished in place.
     /// `digest` is the store's digest of the resulting revision.
     fn with_replaced_input(mut self, path: &str, blob: Oid, digest: StableDigest) -> Self {
+        self.absent_paths.remove(path);
         self.present_blobs.insert(Box::from(path), blob);
         self.digest = digest;
         self
@@ -2501,6 +3021,12 @@ pub struct AnalyzerRuntimeState {
     /// workspace declarations.
     #[doc(hidden)]
     pub workspace_package_identity_input_digests: HashMap<ProjectFile, PackageIdentityInputDigest>,
+    /// The workspace signature files this generation read, by workspace-
+    /// relative path, with the blob whose facts were published. The zero
+    /// OID marks a file whose bytes could not be read or published, which
+    /// readers must treat as unknown. Empty for a language without a
+    /// [`WorkspaceSignatureProducer`].
+    signature_inputs: Arc<BTreeMap<Box<str>, Oid>>,
     /// Canonical disk configuration identity and the blobs it covers; exact
     /// historical bytes live in SQL.
     selected_configuration: Option<SelectedConfiguration>,
@@ -2590,11 +3116,12 @@ impl WorkspaceInventoryCompleteness {
     fn require_observed_listing(
         &mut self,
         omissions: Option<&[brokk_bifrost_core::analyzer::project::WorkspaceFileOmission]>,
+        language: Language,
     ) {
         let hidden = omissions.is_none_or(|omissions| {
             omissions
                 .iter()
-                .any(|omission| omission_may_hide_source(omission.reason))
+                .any(|omission| omission_hides_source(language, omission))
         });
         if hidden {
             self.listed = false;
@@ -2691,6 +3218,7 @@ impl AnalyzerRuntimeState {
             listed_snapshots: arc_swap::ArcSwap::from_pointee(WorkspaceSnapshots::default()),
             listing_withdrawn: arc_swap::ArcSwap::from_pointee(HashSet::default()),
             workspace_package_identity_input_digests: HashMap::default(),
+            signature_inputs: Arc::default(),
             selected_configuration: None,
             workspace_package_inventory_error: None,
             update_resolution_error: None,
@@ -2714,6 +3242,7 @@ impl AnalyzerRuntimeState {
             listed_snapshots: _,
             listing_withdrawn: _,
             workspace_package_identity_input_digests,
+            signature_inputs: _,
             selected_configuration: _,
             workspace_package_inventory_error,
             update_resolution_error,
@@ -2937,7 +3466,10 @@ struct SourceParseabilityCacheKey {
 
 impl RetainedBytes for SourceParseabilityCacheKey {
     fn retained_bytes(&self) -> usize {
-        std::mem::size_of::<Self>() + self.file_state.rel_path.as_os_str().len()
+        std::mem::size_of::<Self>()
+            + brokk_bifrost_core::allocation_size::allocation_size(
+                self.file_state.rel_path.capacity(),
+            )
     }
 }
 
@@ -3852,56 +4384,77 @@ impl QueryFileStateCache {
 
 type FileStateCache = SegmentedFileStateCache;
 type SummaryFileProjectionCache = BoundedFileCache<SummaryFileProjection>;
-/// Request-local absence is a legal answer. Incomplete attempts retain their
-/// value and provenance for this invocation, but must never enter a shared memo.
+/// An admitted complete request-source result, including legal absence.
+/// Only the shared admission receipt can construct a value retained by a map.
 #[derive(Clone)]
-enum RequestRead<T> {
-    Present(T),
-    Absent,
-    Incomplete(Option<T>, Box<[QueryReadIncomplete]>),
+struct RequestRead<T> {
+    value: Option<T>,
+    reads: Arc<crate::analyzer::usages::common::QueryMemoReads>,
 }
 
 impl<T: Clone> RequestRead<T> {
-    fn capture<A: LanguageAdapter>(
-        analyzer: &TreeSitterAnalyzer<A>,
+    fn capture(
+        analyzer: &dyn IAnalyzer,
         build: impl FnOnce() -> Option<T>,
-    ) -> Self {
-        let scope = crate::analyzer::AnalyzerQueryScope::capturing_read_incompleteness(analyzer);
-        Self::from_scope(build(), &scope)
-    }
-
-    fn from_scope(value: Option<T>, scope: &crate::analyzer::AnalyzerQueryScope<'_>) -> Self {
-        let reasons = scope.captured_read_incompleteness();
-        if !reasons.is_empty() {
-            Self::Incomplete(value, reasons.into_boxed_slice())
-        } else {
-            value.map_or(Self::Absent, Self::Present)
+    ) -> (Option<T>, Option<Self>) {
+        enum Infallible {}
+        impl crate::analyzer::reuse_verdict::CarriesReuseVerdict for Infallible {
+            fn reuse_verdict(&self) -> crate::analyzer::reuse_verdict::ReuseVerdict {
+                match *self {}
+            }
+        }
+        match Self::try_capture(analyzer, || Ok::<_, Infallible>(build())) {
+            Ok(captured) => captured,
+            Err(never) => match never {},
         }
     }
 
-    fn can_publish(&self) -> bool {
-        !matches!(self, Self::Incomplete(..))
+    /// A failure's verdict joins the capture it stopped, before the capture
+    /// closes.
+    fn try_capture<E: crate::analyzer::reuse_verdict::CarriesReuseVerdict>(
+        analyzer: &dyn IAnalyzer,
+        build: impl FnOnce() -> Result<Option<T>, E>,
+    ) -> Result<(Option<T>, Option<Self>), E> {
+        use crate::analyzer::usages::common::{QueryMemoOwner, capture_memo_reads};
+        let (result, admission) = capture_memo_reads(QueryMemoOwner::RequestRead, analyzer, || {
+            let result = build();
+            if let Err(failure) = &result {
+                analyzer.join_reuse_verdict(failure.reuse_verdict());
+            }
+            result
+        });
+        let value = result?;
+        let admitted = admission
+            .admitted()
+            .filter(|reads| reads.is_complete(analyzer))
+            .map(|reads| Self {
+                value: value.clone(),
+                reads: Arc::new(reads),
+            });
+        if let Some(read) = &admitted {
+            read.replay(analyzer);
+        }
+        Ok((value, admitted))
     }
 
-    fn replay<A: LanguageAdapter>(&self, analyzer: &TreeSitterAnalyzer<A>) -> Option<T> {
-        match self {
-            Self::Present(value) => Some(value.clone()),
-            Self::Absent => None,
-            Self::Incomplete(value, reasons) => {
-                assert!(
-                    !reasons.is_empty(),
-                    "a failed request read needs provenance"
-                );
-                for reason in reasons {
-                    match reason {
-                        QueryReadIncomplete::StoreFailure(error) => {
-                            analyzer.record_store_error(error.clone())
-                        }
-                        reason => analyzer.record_query_incomplete(reason.clone()),
-                    }
-                }
-                value.clone()
-            }
+    fn replay(&self, analyzer: &dyn IAnalyzer) -> Option<T> {
+        crate::analyzer::usages::common::replay_memo_reads(&self.reads, analyzer);
+        self.value.clone()
+    }
+}
+
+impl<T: Clone + Send + Sync + 'static> RequestRead<T> {
+    fn read_cell(
+        analyzer: &dyn IAnalyzer,
+        cell: &crate::analyzer::common::QueryCacheCell<Self>,
+        build: impl FnOnce() -> Option<T>,
+    ) -> Option<T> {
+        match crate::analyzer::common::admitted_query_cache_cell(analyzer, cell, || {
+            let (value, admitted) = Self::capture(analyzer, build);
+            admitted.ok_or(value)
+        }) {
+            Ok(admitted) => admitted.replay(analyzer),
+            Err(current) => current,
         }
     }
 }
@@ -3983,8 +4536,54 @@ enum ScopeCertification {
 static CSHARP_CERTIFICATE_CENSUSES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-type ProducedUnseenBranches =
-    HashMap<(String, [u8; 32]), Vec<crate::analyzer::store::UndecidedChainRow>>;
+// Only nonempty payloads can witness an obligation. Ordering the keys at insertion
+// preserves the former sort-then-first witness without scanning on every read.
+#[derive(Default)]
+struct ProducedUnseenBranches {
+    rows: HashMap<(String, [u8; 32]), Vec<crate::analyzer::store::UndecidedChainRow>>,
+    witnesses: std::collections::BTreeSet<(String, [u8; 32])>,
+    #[cfg(test)]
+    touched: std::sync::atomic::AtomicUsize,
+}
+
+impl ProducedUnseenBranches {
+    fn insert(
+        &mut self,
+        key: (String, [u8; 32]),
+        chains: Vec<crate::analyzer::store::UndecidedChainRow>,
+    ) {
+        if chains.is_empty() {
+            self.witnesses.remove(&key);
+            self.rows.remove(&key);
+        } else {
+            self.witnesses.insert(key.clone());
+            self.rows.insert(key, chains);
+        }
+    }
+
+    fn select(
+        &self,
+        file: Option<(&str, brokk_bifrost_core::gitblob::ParseVariant)>,
+    ) -> Option<crate::analyzer::store::UnseenBranchFile> {
+        let key;
+        let key = match file {
+            Some((path, brokk_bifrost_core::gitblob::ParseVariant::Digest(variant))) => {
+                key = (path.to_owned(), variant);
+                &key
+            }
+            Some(_) => return None,
+            None => self.witnesses.first()?,
+        };
+        #[cfg(test)]
+        self.touched.fetch_add(1, Ordering::Relaxed);
+        let chains = self.rows.get(key)?;
+        Some(crate::analyzer::store::UnseenBranchFile {
+            rel_path: key.0.clone(),
+            variant: key.1,
+            chains: chains.clone(),
+        })
+    }
+}
 
 type SelectedCsharpRefusals = OnceLock<Result<HashMap<String, Oid>, StoreError>>;
 
@@ -4038,6 +4637,7 @@ pub struct QueryReadCache {
     /// non-single-flight cache would let concurrent misses each redo the
     /// ignore-aware tree walk this exists to eliminate.
     workspace_file_index: crate::analyzer::WorkspaceFileIndexCell,
+    workspace_file_inventory: crate::analyzer::WorkspaceFileInventoryCell,
     /// Owner units keyed by owner fq name, resolved at most once per name per
     /// request (#1230 item 6).
     ///
@@ -4240,6 +4840,7 @@ impl QueryReadCache {
                 crate::analyzer::common::QueryCacheCell::new(),
             ),
             workspace_file_index: Arc::new(OnceLock::new()),
+            workspace_file_inventory: Arc::new(OnceLock::new()),
             parent_units: Arc::new(RwLock::new(HashMap::default())),
             definition_units: Arc::new(KeyedPoolSafeMemo::new()),
             identifier_candidate_units: Arc::new(KeyedPoolSafeMemo::new()),
@@ -4270,6 +4871,7 @@ impl QueryReadCache {
             self.top_level_class_units_by_package =
                 Arc::new(crate::analyzer::common::QueryCacheCell::new());
             self.workspace_file_index = Arc::new(OnceLock::new());
+            self.workspace_file_inventory = Arc::new(OnceLock::new());
         }
         if self
             .contexts
@@ -4278,7 +4880,6 @@ impl QueryReadCache {
         {
             return false;
         }
-        crate::analyzer::i_analyzer::inherit_query_incompleteness(context);
         if let Some(owner) = context.identifier_candidate_memo_owner() {
             self.identifier_candidate_memo_owners.insert(owner);
         }
@@ -4318,6 +4919,7 @@ impl QueryReadCache {
             self.top_level_class_units_by_package =
                 Arc::new(crate::analyzer::common::QueryCacheCell::new());
             self.workspace_file_index = Arc::new(OnceLock::new());
+            self.workspace_file_inventory = Arc::new(OnceLock::new());
         }
         removed
     }
@@ -4396,6 +4998,14 @@ impl QueryReadCache {
         )
     }
 
+    fn active_semantic_model_overlay_read(
+        &self,
+    ) -> Option<crate::analyzer::semantic_model::runtime::SemanticModelOverlayRead> {
+        self.registered_model_override(|context| {
+            context.semantic_model_overlay_read_override_for_current_thread()
+        })
+    }
+
     fn active_semantic_model_overlay(
         &self,
     ) -> Option<Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>> {
@@ -4450,6 +5060,11 @@ impl QueryReadCache {
     fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
         self.is_active()
             .then(|| Arc::clone(&self.workspace_file_index))
+    }
+
+    fn workspace_file_inventory_cell(&self) -> Option<crate::analyzer::WorkspaceFileInventoryCell> {
+        self.is_active()
+            .then(|| Arc::clone(&self.workspace_file_inventory))
     }
 }
 
@@ -4621,6 +5236,8 @@ pub struct TreeSitterAnalyzer<A> {
     pub adapter: Arc<A>,
     config: AnalyzerConfig,
     pending_updates: BTreeSet<ProjectFile>,
+    // A point update cannot discharge an unsuccessful full refresh.
+    full_refresh_pending: bool,
     #[doc(hidden)]
     pub state: Arc<AnalyzerRuntimeState>,
     /// Structural-search facts cache (issue #328). Shared across clones and
@@ -4801,6 +5418,7 @@ impl<A: LanguageAdapter> Clone for TreeSitterAnalyzer<A> {
             adapter: Arc::clone(&self.adapter),
             config: self.config.clone(),
             pending_updates: self.pending_updates.clone(),
+            full_refresh_pending: self.full_refresh_pending,
             state: Arc::clone(&self.state),
             structural_cache: Arc::clone(&self.structural_cache),
             structural_index_cache: Arc::clone(&self.structural_index_cache),
@@ -4929,6 +5547,15 @@ impl<A> TreeSitterAnalyzer<A> {
                 self.config.memo_cache_budget_bytes() / 8,
                 self.analyzer_store().retention_budget(),
             ));
+        // Assessments discharge cleanup gaps against project-wide inventories.
+        // A request overlay can change those inputs without changing the
+        // procedure artifact used as this memo's key.
+        snapshot.statement_assessments_by_procedure = BudgetedValueCache::new(
+            self.store_context
+                .store
+                .retention_budget()
+                .region("analysis.statement_assessments_by_procedure", None),
+        );
         snapshot.adapter = Self::bind_selected_adapter(
             &snapshot.project,
             Arc::clone(&snapshot.adapter),
@@ -5082,6 +5709,28 @@ where
 
     #[doc(hidden)]
     pub fn update_all_with_progress(&self, progress: Option<BuildProgress>) -> Self {
+        let membership = match &self.store_context.prepared_membership {
+            Some(membership) => Arc::clone(membership),
+            None => {
+                self.project.invalidate_cached_file_listing();
+                let listing = match self.project.all_files_with_omissions() {
+                    Ok(listing) => listing,
+                    Err(error) => {
+                        let mut failed = self.failed_configured_update(error.into());
+                        failed.full_refresh_pending = true;
+                        return failed;
+                    }
+                };
+                GenerationWorkspaceMembership::new(
+                    Some(listing),
+                    self.store_context.store.retention_budget(),
+                )
+            }
+        };
+        self.update_all_with_membership(progress, membership)
+    }
+
+    fn rebuild_with_membership(&self, progress: Option<BuildProgress>) -> Self {
         without_project_reads(|| {
             #[cfg(any(test, feature = "test-support"))]
             count_full_update_for_test(self.project.root());
@@ -5096,11 +5745,7 @@ where
                     .live_paths
                     .fork_from_snapshot(Arc::clone(&self.indexed_live_snapshot)),
             );
-            store_context.workspace_snapshot = WorkspaceBuildSnapshot::capture(
-                self.project.as_ref(),
-                store_context.liveness.as_deref(),
-                &[self.adapter.language()],
-            );
+
             store_context.workspace_listing_complete = store_context.workspace_snapshot.is_some();
             let mut state = Self::build_state(
                 Arc::clone(&self.project),
@@ -5118,7 +5763,10 @@ where
             if let Some(snapshot) = relational_workspace_snapshots.get("rust")
                 && self.adapter.language() == Language::Rust
             {
-                match store_context.store.reconcile_rust_crates(snapshot) {
+                match store_context
+                    .store
+                    .reconcile_rust_crates_unless_current(snapshot)
+                {
                     Ok(report) => self
                         .snapshot_caches
                         .derivations()
@@ -5202,15 +5850,59 @@ where
         // A supplied store can still belong to a directly constructed analyzer.
         // Only a workspace build snapshot delegates crate publication to the
         // WorkspaceAnalyzer boundary after its language workers finish.
-        let standalone = store_context.workspace_snapshot.is_none();
         let mut store_context = store_context;
-        if standalone {
-            store_context.workspace_snapshot = WorkspaceBuildSnapshot::capture(
-                project.as_ref(),
-                store_context.liveness.as_deref(),
-                &[adapter.language()],
-            );
-            store_context.workspace_listing_complete = store_context.workspace_snapshot.is_some();
+        let standalone = store_context.workspace_snapshot.is_none();
+        // A workspace marks the membership it captured before its language
+        // fan-out as prepared. A membership left in a store context without
+        // that mark belongs to the analyzer that supplied the context;
+        // constructing a new analyzer starts a new generation and must observe
+        // the current worktree.
+        let supplied_membership = match store_context.prepared_membership.take() {
+            Some(membership) => {
+                store_context.membership = Some(Arc::clone(&membership));
+                Some(membership)
+            }
+            None if store_context.workspace_snapshot.is_some() => store_context.membership.clone(),
+            None => None,
+        };
+        if let Some(membership) = &supplied_membership
+            && store_context.workspace_snapshot.is_none()
+        {
+            store_context.workspace_snapshot = membership.listing().ok().map(|listing| {
+                WorkspaceBuildSnapshot::from_listing(
+                    project.as_ref(),
+                    store_context.liveness.as_deref(),
+                    &[adapter.language()],
+                    listing.clone(),
+                )
+            });
+        }
+        if supplied_membership.is_none() {
+            // An explicitly supplied snapshot and its completeness belong to
+            // this build, even when the caller has not made a membership yet.
+            let membership = match &store_context.workspace_snapshot {
+                Some(snapshot) => GenerationWorkspaceMembership::new(
+                    Some(snapshot.shared_listing()),
+                    store_context.store.retention_budget(),
+                ),
+                None => {
+                    let membership = GenerationWorkspaceMembership::capture(
+                        project.as_ref(),
+                        store_context.store.retention_budget(),
+                    );
+                    store_context.workspace_snapshot = membership.listing().ok().map(|listing| {
+                        WorkspaceBuildSnapshot::from_listing(
+                            project.as_ref(),
+                            store_context.liveness.as_deref(),
+                            &[adapter.language()],
+                            listing.clone(),
+                        )
+                    });
+                    store_context.workspace_listing_complete = membership.listing().is_ok();
+                    membership
+                }
+            };
+            store_context.membership = Some(membership);
         }
         let epochs = adapter
             .storage_language_keys()
@@ -5446,6 +6138,60 @@ where
         })
     }
 
+    /// The source inventory, incomplete for the omissions `hides` selects. The
+    /// trait's inventory selects those that can hide a source of any language;
+    /// a consumer of one language family (JS/TS) selects only its own.
+    #[doc(hidden)]
+    pub fn source_file_inventory_where(
+        &self,
+        hides: impl Fn(&brokk_bifrost_core::analyzer::project::WorkspaceFileOmission) -> bool,
+    ) -> crate::analyzer::QueryBatch<ProjectFile> {
+        let mut inventory =
+            crate::analyzer::i_analyzer::project_source_file_inventory_where(self, hides);
+        let live = self.live_snapshot();
+        for file in live.all_paths() {
+            inventory.inspected = inventory.inspected.saturating_add(1);
+            let Some(file) = self.rebase_live_file_to_project_root(file) else {
+                continue;
+            };
+            if self.adapter_owns_file(&file, &live)
+                && (!inventory.complete || file.has_unclaimed_extension())
+                && (file.exists() || self.project.has_overlay(&file))
+            {
+                inventory.rows.push(file);
+            }
+        }
+        inventory.rows.sort();
+        inventory.rows.dedup();
+        inventory
+    }
+
+    /// [`Self::language_content_identity`] folded with the listing omissions
+    /// that keep the source inventory incomplete.
+    ///
+    /// Products that depend on the inventory being complete are keyed by this
+    /// identity, so the omissions that make it incomplete belong in the key. A
+    /// generation that observed no listing cannot show that none were hidden;
+    /// a build that captured no generation membership has nothing to fold.
+    #[doc(hidden)]
+    pub fn language_content_identity_with_omissions(&self) -> StableDigest {
+        let omissions = self
+            .store_context
+            .membership
+            .as_deref()
+            .and_then(|membership| {
+                membership.listing_omissions_digest().unwrap_or_else(
+                    |GenerationListingUnavailable| {
+                        Some(StableDigest::sha256(b"listing-unavailable"))
+                    },
+                )
+            });
+        crate::analyzer::content_identity::fold_listing_omissions(
+            self.language_content_identity(),
+            omissions,
+        )
+    }
+
     /// Everything [`Self::language_content_identity`] folds except the
     /// analyzed file set, as one digest: the epoch, the analyzer
     /// configuration, the selected configuration, the package-identity
@@ -5468,11 +6214,20 @@ where
             .iter()
             .map(|(file, digest)| (crate::path_utils::rel_path_string(file), digest.content))
             .collect::<BTreeMap<_, _>>();
+        // Signature files type this language's sources (#12967), so an edit
+        // to one moves the identity exactly as a source edit does.
+        overlay_paths.extend(self.state.signature_inputs.iter().map(|(path, oid)| {
+            (
+                path.to_string(),
+                *StableDigest::sha256(oid.as_bytes()).as_bytes(),
+            )
+        }));
         if let Some(overlays) = overlays.as_deref() {
             for (file, digest) in overlays.entries() {
                 if crate::analyzer::common::language_for_file(file) == language
                     || self.adapter.workspace_package_identity_input(file)
                     || Self::workspace_configuration_input(self.adapter.as_ref(), file)
+                    || Self::signature_input(self.adapter.as_ref(), file)
                 {
                     overlay_paths.insert(crate::path_utils::rel_path_string(file), *digest);
                 }
@@ -5518,6 +6273,81 @@ where
             hasher.field("selected_configuration", configuration.digest.as_bytes());
         }
         StableDigest::from_array(hasher.finish())
+    }
+
+    fn membership_for_listing(
+        &self,
+        listing: &SharedWorkspaceFileListing,
+    ) -> Arc<GenerationWorkspaceMembership> {
+        self.store_context
+            .membership
+            .as_ref()
+            .filter(|record| {
+                record.listing().is_ok_and(|retained| {
+                    Arc::ptr_eq(&retained.0, &listing.0) && Arc::ptr_eq(&retained.1, &listing.1)
+                })
+            })
+            .cloned()
+            .unwrap_or_else(|| {
+                GenerationWorkspaceMembership::new(
+                    Some(listing.clone()),
+                    self.store_context.store.retention_budget(),
+                )
+            })
+    }
+
+    /// Install the enclosing generation's immutable owner on a cloned delegate.
+    #[doc(hidden)]
+    pub fn with_generation_membership(
+        &self,
+        membership: Arc<GenerationWorkspaceMembership>,
+    ) -> Self {
+        let mut next = self.clone();
+        if self
+            .store_context
+            .membership
+            .as_ref()
+            .is_none_or(|old| !Arc::ptr_eq(old, &membership))
+        {
+            // Discovery publication belongs to a generation even when a metadata
+            // edit leaves every parsed source unchanged. Content-keyed products
+            // carry forward; a published activation must be acquired again.
+            next.snapshot_caches =
+                Arc::new(self.snapshot_caches.carry_content_keyed_values_forward());
+        }
+        next.store_context.workspace_listing_complete = membership.listing().is_ok();
+        next.store_context.membership = Some(membership);
+        next
+    }
+
+    #[doc(hidden)]
+    pub fn prepare_generation_rebuild(
+        &self,
+        membership: Arc<GenerationWorkspaceMembership>,
+    ) -> Self {
+        let mut next = self.clone();
+        next.store_context.prepared_membership = Some(membership);
+        next
+    }
+
+    /// Rebuild using membership captured before the enclosing language fan-out.
+    #[doc(hidden)]
+    pub fn update_all_with_membership(
+        &self,
+        progress: Option<BuildProgress>,
+        membership: Arc<GenerationWorkspaceMembership>,
+    ) -> Self {
+        let mut next = self.with_generation_membership(Arc::clone(&membership));
+        next.store_context.prepared_membership = None;
+        next.store_context.workspace_snapshot = membership.listing().ok().map(|listing| {
+            WorkspaceBuildSnapshot::from_listing(
+                next.project.as_ref(),
+                next.store_context.liveness.as_deref(),
+                &[next.adapter.language()],
+                listing.clone(),
+            )
+        });
+        next.rebuild_with_membership(progress)
     }
 
     #[doc(hidden)]
@@ -5609,6 +6439,441 @@ where
         crate::analyzer::semantic::SemanticProviderError,
     > {
         crate::analyzer::semantic::service::stored_partial_flows(self, file, key, procedure)
+    }
+
+    fn candidate_procedure_present(
+        &self,
+        file: &ProjectFile,
+        base: &crate::analyzer::semantic::ProcedureHandle,
+        request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+    ) -> Result<bool, crate::analyzer::semantic::SemanticProviderError> {
+        if !crate::analyzer::languages::language_support(
+            base.artifact().key().language().language(),
+        )
+        .is_some_and(|support| support.publishes_candidate_macro_alternates())
+        {
+            return Ok(false);
+        }
+        use crate::analyzer::semantic::service::*;
+        let (read, present) = stored_semantic_ir_publication_read(
+            self,
+            file,
+            |store, blob| store.semantic_ir_candidate_macro_presence(blob, base.id()),
+            None,
+            request.cancellation,
+        )?;
+        if let crate::analyzer::semantic::StoredSemanticIrRead::Observed(observation) = read {
+            record_stored_publication(
+                self,
+                &observation,
+                *base.artifact().key().revision().content().as_bytes(),
+            );
+        }
+        Ok(present.unwrap_or(false))
+    }
+
+    fn prepared_candidate_arena(
+        &self,
+        analyzer: &dyn crate::analyzer::IAnalyzer,
+        file: &ProjectFile,
+        base: &crate::analyzer::semantic::ProcedureHandle,
+        request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+    ) -> Result<
+        crate::analyzer::semantic::SemanticOutcome<
+            Option<crate::analyzer::semantic::StoredCandidateMacroArtifact<CandidateArenaFlows>>,
+        >,
+        crate::analyzer::semantic::SemanticProviderError,
+    > {
+        use crate::analyzer::semantic::SemanticOutcome;
+        let mut stopped = None;
+        let mut filled = false;
+        let arena = if base.artifact().candidate_evidence().is_some() {
+            Some(Arc::clone(base.artifact()))
+        } else {
+            base.artifact().try_candidate_arena(|| {
+                filled = true;
+                // Construction owns scratch and a pre-evidence artifact. Admit the
+                // final retained census below, identically for fills and hits.
+                let mut fill_budget = request.budget.clone();
+                let mut fill_request = request.staged(&mut fill_budget);
+                let (outcome, receipt) =
+                    crate::analyzer::i_analyzer::QueryReadReceipt::capture(analyzer, || {
+                        self.stored_candidate_macro_artifact(
+                            file,
+                            base.artifact().key(),
+                            base.artifact().capabilities(),
+                            &mut fill_request,
+                        )
+                    });
+                receipt.replay(analyzer);
+                match outcome? {
+                    SemanticOutcome::Complete {
+                        value: Some(prepared),
+                        ..
+                    } => {
+                        let mut artifact = Arc::try_unwrap(prepared.artifact)
+                            .expect("unpublished candidate arena");
+                        let bytes = std::mem::size_of::<CandidateArenaEvidence>()
+                            + receipt.retained_bytes()
+                            + prepared.flows.capacity()
+                                * std::mem::size_of::<(
+                                    crate::analyzer::semantic::ProcedureId,
+                                    crate::analyzer::semantic::partial_flow::ProcedurePartialFlows,
+                                )>()
+                            + prepared
+                                .flows
+                                .iter()
+                                .map(|(_, flows)| flows.retained_bytes())
+                                .sum::<usize>();
+                        artifact.attach_candidate_evidence(
+                            Arc::new(CandidateArenaEvidence {
+                                receipt,
+                                flows: prepared.flows,
+                            }),
+                            bytes,
+                        );
+                        artifact.charge_guarded_arena(self.analyzer_store().retention_budget());
+                        Ok::<_, crate::analyzer::semantic::SemanticProviderError>(Some(Arc::new(
+                            artifact,
+                        )))
+                    }
+                    outcome => {
+                        stopped = Some(outcome.map(|value| {
+                            assert!(value.is_none(), "candidate fill did not complete");
+                            None
+                        }));
+                        Ok(None)
+                    }
+                }
+            })?
+        };
+        crate::profiling::note_with(|| {
+            format!(
+                "semantic.candidate_arena {} {}",
+                if filled { "fill" } else { "hit" },
+                file.rel_path().display()
+            )
+        });
+        let Some(artifact) = arena else {
+            return Ok(stopped.expect("candidate fill outcome"));
+        };
+        let flows = CandidateArenaFlows::from_evidence(
+            artifact
+                .candidate_evidence()
+                .expect("candidate fill evidence"),
+        );
+        let evidence = &flows.0;
+        evidence.receipt.replay(analyzer);
+        if let Err(exceeded) = request.budget.charge_complete_artifact(&artifact) {
+            return Ok(SemanticOutcome::ExceededBudget {
+                partial: None,
+                exceeded,
+                work: Default::default(),
+            });
+        }
+        Ok(SemanticOutcome::Complete {
+            value: Some(crate::analyzer::semantic::StoredCandidateMacroArtifact {
+                artifact,
+                flows,
+            }),
+            work: Default::default(),
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn selected_procedure_handle(
+        &self,
+        analyzer: &dyn crate::analyzer::IAnalyzer,
+        file: &ProjectFile,
+        base: &crate::analyzer::semantic::ProcedureHandle,
+        request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+    ) -> Result<
+        crate::analyzer::semantic::SemanticOutcome<
+            crate::analyzer::semantic::service::SelectedProcedureHandle,
+        >,
+        crate::analyzer::semantic::SemanticProviderError,
+    > {
+        let base_handle = base.base_interpretation();
+        let base = &base_handle;
+        use crate::analyzer::semantic::{
+            SemanticOutcome, SemanticWork, service::CandidateProcedureSide,
+        };
+        let work = SemanticWork::default();
+        if request.cancellation.is_cancelled() {
+            return Ok(SemanticOutcome::Cancelled {
+                partial: None,
+                work,
+            });
+        }
+        if !self.candidate_procedure_present(file, base, request)? {
+            return Ok(SemanticOutcome::Complete {
+                value: crate::analyzer::semantic::service::SelectedProcedureHandle {
+                    handle: base.clone(),
+                    side: CandidateProcedureSide::Base,
+                    refusals: Vec::new(),
+                },
+                work,
+            });
+        }
+        let prepared = self.prepared_candidate_arena(analyzer, file, base, request)?;
+        let mut guarded = match prepared {
+            SemanticOutcome::Complete {
+                value: Some(value), ..
+            } => value,
+            SemanticOutcome::Cancelled { .. } => {
+                return Ok(SemanticOutcome::Cancelled {
+                    partial: None,
+                    work,
+                });
+            }
+            SemanticOutcome::ExceededBudget { exceeded, .. } => {
+                return Ok(SemanticOutcome::ExceededBudget {
+                    partial: None,
+                    exceeded,
+                    work,
+                });
+            }
+            _ => {
+                return Err(crate::analyzer::semantic::SemanticProviderError::internal(
+                    "guarded handles unavailable".to_owned(),
+                ));
+            }
+        };
+        guarded.artifact = if base
+            .artifact()
+            .procedure(base.id())
+            .is_some_and(|procedure| procedure.candidate_macro_alternate().is_some())
+        {
+            Arc::clone(base.artifact())
+        } else {
+            base.artifact().canonical_candidate_arena(guarded.artifact)
+        };
+        if let Err(exceeded) = request.budget.charge_complete_artifact(&guarded.artifact) {
+            return Ok(SemanticOutcome::ExceededBudget {
+                partial: None,
+                exceeded,
+                work,
+            });
+        }
+        let scope = crate::analyzer::AnalyzerQueryScope::new(analyzer);
+        let token = brokk_bifrost_core::analyzer::query_token::QueryScope::token(&scope);
+        let syntax = self.prepared_syntax(token, file).ok_or_else(|| {
+            crate::analyzer::semantic::SemanticProviderError::internal(
+                "selected procedure syntax is unavailable".to_owned(),
+            )
+        })?;
+        let entry = crate::analyzer::semantic::service::candidate_procedure_decision(
+            &guarded,
+            base,
+            crate::analyzer::languages::CandidateMacroAdmissionRequest {
+                analyzer,
+                token,
+                file,
+                head: base.artifact().key(),
+                procedure: base.id(),
+                candidates: &[],
+                syntax: &syntax,
+                cancellation: request.cancellation,
+            },
+            request,
+        )?;
+        use crate::analyzer::semantic::service::CandidateSelectionStatus;
+        match entry.status {
+            CandidateSelectionStatus::Cancelled => {
+                return Ok(SemanticOutcome::Cancelled {
+                    partial: None,
+                    work,
+                });
+            }
+            CandidateSelectionStatus::ExceededBudget(exceeded) => {
+                return Ok(SemanticOutcome::ExceededBudget {
+                    partial: None,
+                    exceeded,
+                    work,
+                });
+            }
+            CandidateSelectionStatus::ExecutionDependent(reason) => {
+                return Err(crate::analyzer::semantic::SemanticProviderError::internal(
+                    format!("candidate admission stopped: {reason:?}"),
+                ));
+            }
+            CandidateSelectionStatus::Complete => {}
+        }
+        let side = entry.side;
+        let refusals = entry.refusals;
+        let procedure = entry.handle;
+        debug_assert!(side != CandidateProcedureSide::Base || !procedure.is_candidate_alternate());
+        Ok(SemanticOutcome::Complete {
+            value: crate::analyzer::semantic::service::SelectedProcedureHandle {
+                handle: procedure,
+                side,
+                refusals,
+            },
+            work,
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn selected_procedure_and_flows(
+        &self,
+        analyzer: &dyn crate::analyzer::IAnalyzer,
+        file: &ProjectFile,
+        base: &crate::analyzer::semantic::ProcedureHandle,
+        request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+    ) -> Result<
+        crate::analyzer::semantic::service::CandidateProcedureOutcome<()>,
+        crate::analyzer::semantic::SemanticProviderError,
+    > {
+        let base_handle = base.base_interpretation();
+        let base = &base_handle;
+        use crate::analyzer::semantic::{
+            OracleCallContext, SemanticOutcome,
+            service::{
+                CandidateProcedureOutcome, CandidateProcedureSide, SelectedCandidateProcedure,
+            },
+        };
+        let scope = crate::analyzer::AnalyzerQueryScope::new(analyzer);
+        let token = brokk_bifrost_core::analyzer::query_token::QueryScope::token(&scope);
+        let present = self.candidate_procedure_present(file, base, request)?;
+        let prepared = if present {
+            self.prepared_candidate_arena(analyzer, file, base, request)?
+        } else {
+            SemanticOutcome::Complete {
+                value: None,
+                work: Default::default(),
+            }
+        };
+        let guarded = match prepared {
+            SemanticOutcome::Complete { value, .. } => value,
+            SemanticOutcome::Cancelled { .. } => return Ok(CandidateProcedureOutcome::Cancelled),
+            SemanticOutcome::ExceededBudget { exceeded, .. } => {
+                return Ok(CandidateProcedureOutcome::ExceededBudget(exceeded));
+            }
+            _ => {
+                return Err(crate::analyzer::semantic::SemanticProviderError::internal(
+                    "guarded procedure preparation is unavailable".to_owned(),
+                ));
+            }
+        };
+        let base_flows = self.stored_partial_flows(file, base.artifact().key(), base.id())?;
+        // A stored file publication can exist without an alternate for this
+        // procedure. Such bodies use only the base acquisition: no admission
+        // syntax (which may differ from a language's effective semantic source).
+        let guarded = guarded.filter(|guarded| {
+            guarded
+                .artifact
+                .procedure(base.id())
+                .is_some_and(|procedure| procedure.candidate_macro_alternate().is_some())
+        });
+        let Some(mut guarded) = guarded else {
+            let flows = if let Some(flows) = base_flows {
+                if let Err(exceeded) = request.budget.admit(flows.semantic_work()) {
+                    return Ok(CandidateProcedureOutcome::ExceededBudget(exceeded));
+                }
+                flows
+            } else {
+                let projected =
+                    crate::analyzer::semantic::partial_flow::file_local_procedure_relations(
+                        base,
+                        &OracleCallContext::empty(),
+                        request,
+                    );
+                let Some(flows) = crate::analyzer::semantic::partial_flow::fixpoint::partial_flows_from_projection(base, projected, request) else {
+                    return Ok(CandidateProcedureOutcome::Cancelled);
+                };
+                flows
+            };
+            if request.cancellation.is_cancelled() {
+                return Ok(CandidateProcedureOutcome::Cancelled);
+            }
+            return Ok(CandidateProcedureOutcome::Selected(
+                SelectedCandidateProcedure {
+                    side: CandidateProcedureSide::Base,
+                    procedure: base.clone(),
+                    flows,
+                    admissions: (),
+                },
+            ));
+        };
+        guarded.artifact = if base
+            .artifact()
+            .procedure(base.id())
+            .is_some_and(|procedure| procedure.candidate_macro_alternate().is_some())
+        {
+            Arc::clone(base.artifact())
+        } else {
+            base.artifact().canonical_candidate_arena(guarded.artifact)
+        };
+        if let Err(exceeded) = request.budget.charge_complete_artifact(&guarded.artifact) {
+            return Ok(CandidateProcedureOutcome::ExceededBudget(exceeded));
+        }
+        let syntax = self.prepared_syntax(token, file).ok_or_else(|| {
+            crate::analyzer::semantic::SemanticProviderError::internal(
+                "selected procedure syntax is unavailable".to_owned(),
+            )
+        })?;
+        let outcome = crate::analyzer::semantic::service::procedure_semantics_and_partial_flows(
+            &guarded,
+            base,
+            base_flows.as_ref(),
+            crate::analyzer::languages::CandidateMacroAdmissionRequest {
+                analyzer,
+                token,
+                file,
+                head: base.artifact().key(),
+                procedure: base.id(),
+                candidates: &[],
+                syntax: &syntax,
+                cancellation: request.cancellation,
+            },
+            request,
+        )?;
+        Ok(match outcome {
+            CandidateProcedureOutcome::Selected(selected) => {
+                if selected.side == CandidateProcedureSide::Alternate {
+                    debug_assert_eq!(
+                        selected.procedure.durable_key(),
+                        guarded
+                            .artifact
+                            .candidate_alternate_handle(base.id())
+                            .expect("paired guarded procedure")
+                            .durable_key()
+                    );
+                }
+                CandidateProcedureOutcome::Selected(SelectedCandidateProcedure {
+                    side: selected.side,
+                    procedure: selected.procedure,
+                    flows: selected.flows,
+                    admissions: (),
+                })
+            }
+            CandidateProcedureOutcome::Cancelled => CandidateProcedureOutcome::Cancelled,
+            CandidateProcedureOutcome::ExceededBudget(exceeded) => {
+                CandidateProcedureOutcome::ExceededBudget(exceeded)
+            }
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn stored_candidate_macro_artifact(
+        &self,
+        file: &ProjectFile,
+        key: &crate::analyzer::semantic::SemanticArtifactKey,
+        capabilities: &crate::analyzer::semantic::SemanticCapabilities,
+        request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+    ) -> Result<
+        crate::analyzer::semantic::SemanticOutcome<
+            Option<crate::analyzer::semantic::StoredCandidateMacroArtifact>,
+        >,
+        crate::analyzer::semantic::SemanticProviderError,
+    > {
+        crate::analyzer::semantic::service::stored_candidate_macro_artifact(
+            self,
+            file,
+            key,
+            capabilities,
+            request,
+        )
     }
 
     #[doc(hidden)]
@@ -5891,9 +7156,10 @@ where
                 None
             }
             BoundedParse::TimedOut => {
-                self.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceUnavailable(
-                    format!("syntax preparation timed out for {file:?}").into_boxed_str(),
-                ));
+                self.record_query_incomplete(QueryReadIncomplete::ProofStopped {
+                    reason: "syntax_preparation_deadline",
+                    cause: Some(crate::analyzer::read_ledger::DerivationExecutionCause::Budget),
+                });
                 None
             }
             BoundedParse::Rejected => {
@@ -6255,11 +7521,16 @@ where
             Option<Arc<crate::analyzer::store::dependency_file_evidence::ScopedDependencyEvidence>>,
         >,
     ) -> Self {
+        let full_refresh_pending = store_context
+            .membership
+            .as_ref()
+            .is_some_and(|membership| membership.listing().is_err());
         let mut analyzer = Self {
             project,
             adapter,
             config,
             pending_updates: BTreeSet::new(),
+            full_refresh_pending,
             state,
             structural_cache,
             structural_index_cache,
@@ -6470,12 +7741,26 @@ where
             BoundedParse::Cancelled => unreachable!("no cancellation token supplied"),
             BoundedParse::Rejected | BoundedParse::Refused(_) => return None,
         };
+        let admitted_root_id = tree.root_node().id();
+        let syntax = Arc::new(
+            PreparedSyntaxTree::new(
+                PreparedSyntaxSource::Exact(Arc::<str>::from(source.as_str())),
+                tree,
+                compute_line_starts(&source),
+                LanguageDialect::for_path(adapter.language(), file.rel_path()),
+                PreparedSourceOrigin::Disk,
+                None,
+            )
+            .with_preprocessor(preprocessor)
+            .with_parse_variant(parse.variant),
+        );
+        let tree = syntax.tree();
+        debug_assert_eq!(tree.root_node().id(), admitted_root_id);
         // Every reading of this blob at once, and before the file scope is
         // added: `add_file_scope` contributes the identical module unit to
         // every reading, so an implementor comparing its readings against each
         // other compares only what the language walk itself produced.
-        let (mut parsed, projections) =
-            adapter.parse_file_preprocessed(file, &source, &tree, preprocessor.as_deref());
+        let (mut parsed, projections) = adapter.parse_file_prepared(file, &syntax);
         // Validate freshly produced metadata, never values read from persisted rows.
         // Synthetic lambdas without signature metadata have no row to validate.
         for (language, declarations) in
@@ -6497,7 +7782,7 @@ where
             );
         }
         parsed.add_file_scope(file, &source);
-        let contains_tests = adapter.contains_tests(file, &source, &tree, &parsed);
+        let contains_tests = adapter.contains_tests(file, &source, tree, &parsed);
         let parse_errors = {
             let mut errors = Vec::new();
             collect_parse_errors(tree.root_node(), &mut errors);
@@ -6562,18 +7847,6 @@ where
         // subtracts it again before `blob_payload_costs` is written.
         // The tree the walk read, handed to blob preparation so the source is
         // not parsed twice. The state keeps the source for the rest of the build.
-        let syntax = Arc::new(
-            PreparedSyntaxTree::new(
-                PreparedSyntaxSource::Exact(Arc::<str>::from(source.as_str())),
-                tree,
-                compute_line_starts(&source),
-                LanguageDialect::for_path(adapter.language(), file.rel_path()),
-                PreparedSourceOrigin::Disk,
-                None,
-            )
-            .with_preprocessor(preprocessor)
-            .with_parse_variant(parse.variant),
-        );
         let mut state =
             Self::file_state_from_parsed(source, parsed, contains_tests, parse_errors, true);
         state.additional_projections = additional_projections;
@@ -6708,6 +7981,8 @@ where
             adapter.language(),
             files.len()
         ));
+        let pool = parse_pool();
+        assert_parse_batch_may_start(pool);
         if files.is_empty() {
             return Vec::new();
         }
@@ -6715,39 +7990,36 @@ where
         let total = files.len();
         let language = adapter.parser_language();
         let completed = AtomicUsize::new(0);
-        let pool = parse_pool(adapter.language(), config.parallelism());
         // Parsing publishes source facts; maintenance reads belong to no query.
         // Suppression is thread-local, so install it on every parser worker.
 
-        let states = pool.install(|| {
-            files
-                .into_par_iter()
-                .map_init(
-                    || carried_context.run(|| Self::build_parser(language.clone())),
-                    |parser, file| {
-                        carried_context.run(|| {
-                            without_project_reads(|| {
-                                store_context
-                                    .build_tier_access
-                                    .record_tier_access(InformationTier::Syntax);
-                                let state = Self::analyze_file(parser, adapter, project, &file);
-                                if let Some(progress) = progress.as_ref() {
-                                    let current = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                                    progress(BuildProgressEvent::new(
-                                        adapter.language(),
-                                        BuildProgressPhase::Parse,
-                                        current,
-                                        total,
-                                        Some(file.clone()),
-                                    ));
-                                }
-                                (file, state)
-                            })
-                        })
-                    },
-                )
-                .collect::<Vec<_>>()
-        });
+        let states = map_on_parse_pool(
+            pool,
+            config.parallelism(),
+            files,
+            || carried_context.run(|| Self::build_parser(language.clone())),
+            |parser, file| {
+                carried_context.run(|| {
+                    without_project_reads(|| {
+                        store_context
+                            .build_tier_access
+                            .record_tier_access(InformationTier::Syntax);
+                        let state = Self::analyze_file(parser, adapter, project, &file);
+                        if let Some(progress) = progress.as_ref() {
+                            let current = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                            progress(BuildProgressEvent::new(
+                                adapter.language(),
+                                BuildProgressPhase::Parse,
+                                current,
+                                total,
+                                Some(file.clone()),
+                            ));
+                        }
+                        (file, state)
+                    })
+                })
+            },
+        );
         note_additional_projection_totals(adapter.language());
         states
     }
@@ -6764,6 +8036,8 @@ where
         let carried_context =
             brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();
         const PREPARED_CHANNEL_CAPACITY: usize = 8;
+        let pool = parse_pool();
+        assert_parse_batch_may_start(pool);
         if targets.is_empty() {
             return PersistBatchStats::default();
         }
@@ -6772,7 +8046,6 @@ where
         let language = adapter.parser_language();
         let completed = AtomicUsize::new(0);
         let started = AtomicUsize::new(0);
-        let pool = parse_pool(adapter.language(), config.parallelism());
         // Source publication is maintenance, including catch-up inside a query.
         // Every parser worker suppresses its own project-input recording.
         let (prepared_tx, prepared_rx) = std::sync::mpsc::sync_channel(PREPARED_CHANNEL_CAPACITY);
@@ -6819,8 +8092,10 @@ where
             let analyze_nanos = &analyze_nanos;
             scope.spawn(move || {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    pool.install(|| {
-                        targets.into_par_iter().for_each_init(
+                    map_on_parse_pool(
+                            pool,
+                            config.parallelism(),
+                            targets,
                             || carried_context.run(|| Self::build_parser(language.clone())),
                             |parser, target| carried_context.run(|| without_project_reads(|| {
                                 let PreparedAnalysisTarget {
@@ -7048,8 +8323,7 @@ where
                                     Ordering::Relaxed,
                                 );
                             })),
-                        );
-                    });
+                    );
                 }));
                 if let Err(payload) = outcome {
                     *producer_panic
@@ -7058,6 +8332,13 @@ where
                 }
             });
             drop(prepared_tx);
+            // Owned by this scope body, so a panic in the consumer drops the
+            // receiver before the scope joins the producer: its sends then
+            // fail instead of blocking on a channel nobody drains.
+            let prepared_rx = prepared_rx;
+            // Everything below, the flush, progress and outcome callbacks
+            // included, is the consumer: it must not start another parse batch.
+            let _consumer = ParseConsumerScope::enter();
 
             let mut pending = Vec::new();
             let mut pending_files = HashMap::default();
@@ -7857,7 +9138,7 @@ where
                 PreparedPathInput {
                     source,
                     parse,
-                    configuration,
+                    configuration: configuration.clone(),
                 },
             );
             if inputs.len() >= 64 || batch_bytes >= 32 * 1024 * 1024 {
@@ -7921,12 +9202,144 @@ where
         progress: Option<BuildProgress>,
         store_context: &AnalyzerStoreContext,
     ) -> AnalyzerRuntimeState {
+        let mut state = Self::build_source_state(
+            Arc::clone(&build_project),
+            adapter,
+            config,
+            progress,
+            store_context,
+        );
+        state.signature_inputs = Self::capture_signature_inputs(
+            build_project.as_ref(),
+            adapter,
+            &store_context.store,
+            store_context.workspace_snapshot.as_deref(),
+        );
+        state
+    }
+
+    /// Read and publish every workspace signature file. Like the
+    /// configuration capture, this reads the disk generation, not a request
+    /// overlay.
+    fn capture_signature_inputs(
+        project: &dyn Project,
+        adapter: &A,
+        store: &AnalyzerStore,
+        workspace_snapshot: Option<&WorkspaceBuildSnapshot>,
+    ) -> Arc<BTreeMap<Box<str>, Oid>> {
+        let Some(producer) = adapter.workspace_signature_producer() else {
+            return Arc::default();
+        };
+        let files = match workspace_snapshot {
+            Some(snapshot) => Cow::Borrowed(snapshot.files()),
+            None => match project.all_files_shared() {
+                Ok(files) => Cow::Owned((*files).clone()),
+                // Without a listing no signature file is known; the
+                // analyzer's own inventory error reports the listing.
+                Err(_) => return Arc::default(),
+            },
+        };
+        let mut inputs = BTreeMap::new();
+        for file in files
+            .iter()
+            .filter(|file| producer.is_signature_input_path(file.rel_path()))
+        {
+            if let Some(oid) = Self::publish_signature_input(producer, store, file) {
+                inputs.insert(crate::path_utils::rel_path_string(file).into(), oid);
+            }
+        }
+        Arc::new(inputs)
+    }
+
+    /// The blob of the signature file `file` after publishing its facts,
+    /// `None` when the file is absent, or the zero OID when its facts are
+    /// not known: unreadable, incomplete or not published.
+    fn publish_signature_input(
+        producer: &dyn WorkspaceSignatureProducer,
+        store: &AnalyzerStore,
+        file: &ProjectFile,
+    ) -> Option<Oid> {
+        let source = match std::fs::read(file.abs_path()) {
+            Ok(source) => source,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(_) => return Some(Oid::zero()),
+        };
+        let Ok(oid) = Oid::hash_object(ObjectType::Blob, &source) else {
+            return Some(Oid::zero());
+        };
+        Some(match producer.publish(store, oid, &source) {
+            Ok(true) => oid,
+            Ok(false) => Oid::zero(),
+            Err(error) => {
+                eprintln!(
+                    "could not publish signature facts of {}: {error}",
+                    file.abs_path().display()
+                );
+                Oid::zero()
+            }
+        })
+    }
+
+    /// This generation's signature inventory with each of `changes` re-read.
+    fn edited_signature_inputs(
+        &self,
+        changes: &BTreeSet<ProjectFile>,
+    ) -> Arc<BTreeMap<Box<str>, Oid>> {
+        let Some(producer) = self.adapter.workspace_signature_producer() else {
+            return Arc::clone(&self.state.signature_inputs);
+        };
+        if changes.is_empty() {
+            return Arc::clone(&self.state.signature_inputs);
+        }
+        let mut inputs = self.state.signature_inputs.as_ref().clone();
+        for file in changes {
+            let path: Box<str> = crate::path_utils::rel_path_string(file).into();
+            match Self::publish_signature_input(producer, &self.store_context.store, file) {
+                Some(oid) => inputs.insert(path, oid),
+                None => inputs.remove(&path),
+            };
+        }
+        Arc::new(inputs)
+    }
+
+    fn signature_input(adapter: &A, file: &ProjectFile) -> bool {
+        adapter
+            .workspace_signature_producer()
+            .is_some_and(|producer| producer.is_signature_input_path(file.rel_path()))
+    }
+
+    /// The workspace signature files this generation read and the blobs whose
+    /// facts it published; the zero OID marks an unknown file.
+    #[doc(hidden)]
+    pub fn signature_inputs(&self) -> &BTreeMap<Box<str>, Oid> {
+        &self.state.signature_inputs
+    }
+
+    fn build_source_state(
+        build_project: Arc<dyn Project>,
+        adapter: &A,
+        config: &AnalyzerConfig,
+        progress: Option<BuildProgress>,
+        store_context: &AnalyzerStoreContext,
+    ) -> AnalyzerRuntimeState {
         let _scope = profiling::scope(format!(
             "TreeSitterAnalyzer::{:?}::build_state",
             adapter.language()
         ));
         let project = build_project.as_ref();
         let workspace_snapshot = store_context.workspace_snapshot.as_deref();
+        if let Some(membership) = store_context.membership.as_ref()
+            && membership.listing().is_err()
+        {
+            let mut state = AnalyzerRuntimeState::new(
+                HashMap::default(),
+                HashMap::default(),
+                HashMap::default(),
+                Vec::new(),
+            );
+            state.record_workspace_package_inventory_error(membership.listing_failure());
+            return state;
+        }
 
         let (analyzable_files, enumeration_complete): (Vec<_>, bool) = {
             let _scope = profiling::scope(format!(
@@ -7936,6 +9349,9 @@ where
             let files = match workspace_snapshot {
                 Some(snapshot) => {
                     project.analyzable_files_from(snapshot.files(), adapter.language())
+                }
+                None if store_context.membership.is_some() => {
+                    Err(std::io::Error::other("generation listing unavailable"))
                 }
                 None => project.analyzable_files(adapter.language()),
             };
@@ -8303,6 +9719,9 @@ where
             }
         }
         captured.sort_by(|left, right| left.relative_path().cmp(right.relative_path()));
+        if let Some(support) = support {
+            support.acquire_configuration_inputs(project, &mut captured)?;
+        }
         Ok(captured)
     }
 
@@ -8310,6 +9729,39 @@ where
     /// selected. A failed read takes the full reconciliation path, where the
     /// normal configuration diagnostic marks the inventory incomplete.
     #[doc(hidden)]
+    /// Admission-only receipts from this generation's one configuration
+    /// acquisition. Dependency discovery forwards these to its existing
+    /// external-read capture so reuse revalidates home/include files too.
+    #[doc(hidden)]
+    pub fn configuration_external_reads(
+        &self,
+    ) -> Arc<[crate::analyzer::semantic_model::ExternalDiscoveryRead]> {
+        self.state
+            .selected_configuration
+            .as_ref()
+            .map_or_else(Default::default, |selected| {
+                Arc::clone(&selected.rust_cargo_external_reads)
+            })
+    }
+
+    #[doc(hidden)]
+    pub fn selected_configuration_contains_input(&self, file: &ProjectFile) -> bool {
+        self.state
+            .selected_configuration
+            .as_ref()
+            .is_some_and(|selected| {
+                selected.contains_input(crate::path_utils::rel_path_string(file).as_str())
+            })
+    }
+
+    #[doc(hidden)]
+    pub fn configuration_acquisition_inputs_complete(&self) -> bool {
+        self.state
+            .selected_configuration
+            .as_ref()
+            .is_some_and(|selected| selected.rust_cargo_acquisition_complete)
+    }
+
     pub fn workspace_configuration_changed(&self) -> bool {
         let Ok(inputs) = Self::workspace_configuration_inputs(
             self.project.as_ref(),
@@ -8544,7 +9996,16 @@ where
                     .into_iter()
                     // Applied here rather than to the whole claimable universe: this
                     // set is small, and the ignore probe is a per-path listing scan.
-                    .filter(|file| !project.is_bifrostignored(file.rel_path()))
+                    .filter_map(|file| match project.is_bifrostignored(file.rel_path()) {
+                        Ok(false) => Some(file),
+                        Ok(true) => None,
+                        Err(error) => {
+                            state.record_workspace_package_inventory_error(StoreError::new(
+                                error.to_string(),
+                            ));
+                            None
+                        }
+                    })
                     .collect()
             };
             if frontier.is_empty() {
@@ -8855,7 +10316,7 @@ where
         let mut live_files = Vec::new();
         // Ignore rules, configured excludes, ignored untracked files and
         // uninitialized submodule gitlinks are outside the analyzer's universe.
-        // See `omission_fails_rust_listing` for which omissions fail the proof.
+        // See `omission_hides_source` for which omissions fail the proof.
         let mut rust_listing_failures = BTreeMap::<String, String>::new();
         if !enumeration_complete || store_context.workspace_snapshot.is_none() {
             rust_listing_failures.insert(
@@ -8865,7 +10326,7 @@ where
         }
         if let Some(listing) = &store_context.workspace_snapshot {
             for omission in listing.omissions.iter() {
-                if omission_fails_rust_listing(omission) {
+                if omission_hides_source(Language::Rust, omission) {
                     rust_listing_failures.insert(
                         brokk_bifrost_core::path_utils::workspace_relative_slash_path(
                             &omission.path,
@@ -8883,6 +10344,7 @@ where
                 .workspace_snapshot
                 .as_ref()
                 .map(|listing| listing.omissions.as_slice()),
+            adapter.language(),
         );
         for file in files {
             let Some(blob_oid) = snapshot.validated_oid_for_path(file) else {
@@ -9121,7 +10583,7 @@ where
                     &inventories,
                     (lang == "rust").then(|| {
                         (
-                            crate::analyzer::store::RUST_SOURCE_LISTING_DERIVATION_VERSION,
+                            crate::analyzer::store::rust_source_listing_derivation_identity(),
                             std::mem::take(&mut rust_listing_failures)
                                 .into_iter()
                                 .collect(),
@@ -9378,7 +10840,7 @@ where
         dirty: &mut HashMap<ProjectFile, (String, PathSymbolRow)>,
         inventory: &mut WorkspaceInventoryCompleteness,
         decisions: &HashMap<ProjectFile, FileVersionDecision>,
-        last_certificate: Option<&(i64, Vec<(String, String)>)>,
+        last_certificate: Option<&crate::analyzer::store::RustListingInput>,
     ) -> Result<(), StoreError> {
         let storage_languages = adapter
             .storage_language_keys()
@@ -9619,7 +11081,7 @@ where
                 RUST_LISTING_UNAVAILABLE_REASON.to_string(),
             )]);
         };
-        let version = crate::analyzer::store::RUST_SOURCE_LISTING_DERIVATION_VERSION;
+        let version = crate::analyzer::store::rust_source_listing_derivation_identity();
         let prior = previous
             .map(|snapshot| {
                 store_context
@@ -10184,16 +11646,31 @@ where
         if let Some(source) = self.analyzed_blob_source(file) {
             return Some(source);
         }
-        self.fetch_file_state(file)
-            .or_else(|| self.fetch_file_state_from_current_source(file))
+        if let Some(state) = self.fetch_file_state(file) {
+            return Some(state.source.clone());
+        }
+        // Current source can supply the generation's bytes only after proving
+        // their identity. Never pair a newer revision with retained ranges.
+        let oid = self.indexed_live_snapshot.oid_for_path(file);
+        let verified =
+            |source: &String| oid.is_some_and(|oid| self.blob_oids.oid_of(file, source) == oid);
+        let source = self
+            .fetch_file_state_from_current_source(file)
             .map(|state| state.source.clone())
+            .filter(verified)
             .or_else(|| match self.project.read_source(file) {
-                Ok(source) => Some(source),
+                Ok(source) => Some(source).filter(verified),
                 Err(error) => {
                     self.record_source_read_failure(file, &error);
                     None
                 }
-            })
+            });
+        if source.is_none() {
+            // Report at the shared boundary so even Option-returning helpers
+            // that skip this file preserve incompleteness in their query scope.
+            self.record_query_incomplete(QueryReadIncomplete::StructureUnavailable(file.clone()));
+        }
+        source
     }
 
     /// The analyzed blob's source text for `file`, without hydrating its
@@ -10264,15 +11741,21 @@ where
         let adapter = Arc::downgrade(&self.adapter);
         let project = Arc::downgrade(&self.project);
         let snapshots = self.selected_workspace_snapshots();
-        let memo = self.overlay_variants.clone();
+        // The project's read slot outlives this analyzer. A strong memo clone
+        // would keep the analyzer's whole retention budget, and every value it
+        // caches (open catalog connections included), alive with the project.
+        let memo = self.overlay_variants.downgrade();
         let query_cache = Arc::downgrade(&self.query_read_cache);
         Arc::new(move |file| {
             if !file.language().uses_configured_parse_variants() {
                 return Ok(Some(brokk_bifrost_core::gitblob::ParseVariant::Empty));
             }
-            let (Some(store), Some(adapter), Some(project)) =
-                (store.upgrade(), adapter.upgrade(), project.upgrade())
-            else {
+            let (Some(store), Some(adapter), Some(project), Some(memo)) = (
+                store.upgrade(),
+                adapter.upgrade(),
+                project.upgrade(),
+                memo.upgrade(),
+            ) else {
                 return Err(StoreError::new("parse variant owner has been released"));
             };
             Self::variant_for_project(
@@ -11243,7 +12726,7 @@ where
             self.record_file_read(file, source.oid);
             return Some(source);
         }
-        let source = RequestRead::capture(self, || {
+        let (source, admitted) = RequestRead::capture(self, || {
             let text = self
                 .project
                 .read_source(file)
@@ -11257,15 +12740,13 @@ where
                 oid,
             })
         });
-        if source.can_publish()
-            && let Some(sources) = sources
-        {
+        if let (Some(admitted), Some(sources)) = (admitted, sources) {
             sources
                 .write()
                 .expect("query current-source cache write lock poisoned")
-                .insert(file.clone(), source.clone());
+                .insert(file.clone(), admitted);
         }
-        let source = source.replay(self)?;
+        let source = source?;
         self.record_file_read(file, source.oid);
         Some(source)
     }
@@ -11500,6 +12981,7 @@ where
                         line!()
                     )
                 });
+                // The outcome carries this verdict by its shape.
                 crate::analyzer::IAnalyzer::mark_execution_dependent(self);
                 return PreparedSyntaxLimitedOutcome::Exceeded(exceeded);
             }
@@ -11536,76 +13018,68 @@ where
                     PreparedSyntaxLimitedOutcome::Available(resolved.oid, prepared)
                 });
         }
-        let scope = crate::analyzer::AnalyzerQueryScope::capturing_read_incompleteness(self);
-        if let Some(retained) = self.prepared_syntax_store_get(&prepared_key) {
-            let read = RequestRead::from_scope(Some(Arc::clone(&retained)), &scope);
-            if read.can_publish()
-                && let Some(cell) = &cell
-            {
-                cell.get_or_init(|| read);
-            }
-            return PreparedSyntaxLimitedOutcome::Available(resolved.oid, retained);
-        }
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return PreparedSyntaxLimitedOutcome::Cancelled;
-        }
-
         let oid = resolved.oid;
-        let indexed_key = PreparedSyntaxCacheKey {
-            flavor: PreparedSyntaxCacheFlavor::Indexed,
-            ..prepared_key.clone()
-        };
-        let prepared = if let Some(indexed) = self.cached_prepared_syntax(&indexed_key) {
-            Some(Arc::new(
-                PreparedSyntaxTree::new(
-                    PreparedSyntaxSource::Exact(resolved.snapshot.into_source()),
-                    indexed.tree().clone(),
-                    indexed.line_starts().to_vec(),
-                    indexed.dialect(),
+        let (prepared, admitted) = match RequestRead::try_capture(self, || {
+            if let Some(retained) = self.prepared_syntax_store_get(&prepared_key) {
+                return Ok(Some(retained));
+            }
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return Err(PreparedSyntaxLimitedOutcome::Cancelled);
+            }
+
+            let indexed_key = PreparedSyntaxCacheKey {
+                flavor: PreparedSyntaxCacheFlavor::Indexed,
+                ..prepared_key.clone()
+            };
+            let prepared = if let Some(indexed) = self.cached_prepared_syntax(&indexed_key) {
+                Some(Arc::new(
+                    PreparedSyntaxTree::new(
+                        PreparedSyntaxSource::Exact(resolved.snapshot.into_source()),
+                        indexed.tree().clone(),
+                        indexed.line_starts().to_vec(),
+                        indexed.dialect(),
+                        origin,
+                        overlay_revision,
+                    )
+                    .with_preprocessor(indexed.preprocessor().cloned())
+                    .with_parse_variant(indexed.parse_variant()),
+                ))
+            } else {
+                match self.prepare_exact_syntax_cancellable(
+                    file,
                     origin,
                     overlay_revision,
-                )
-                .with_preprocessor(indexed.preprocessor().cloned())
-                .with_parse_variant(indexed.parse_variant()),
-            ))
-        } else {
-            match self.prepare_exact_syntax_cancellable(
-                file,
-                origin,
-                overlay_revision,
-                resolved.snapshot.into_source(),
-                cancellation,
-            ) {
-                PreparedSyntaxPreparation::Complete(prepared) => prepared,
-                PreparedSyntaxPreparation::Refused(reason) => {
-                    return PreparedSyntaxLimitedOutcome::Refused(reason);
+                    resolved.snapshot.into_source(),
+                    cancellation,
+                ) {
+                    PreparedSyntaxPreparation::Complete(prepared) => prepared,
+                    PreparedSyntaxPreparation::Refused(reason) => {
+                        return Err(PreparedSyntaxLimitedOutcome::Refused(reason));
+                    }
+                    PreparedSyntaxPreparation::TimedOut => {
+                        return Err(PreparedSyntaxLimitedOutcome::Unavailable);
+                    }
+                    PreparedSyntaxPreparation::Cancelled => {
+                        return Err(PreparedSyntaxLimitedOutcome::Cancelled);
+                    }
                 }
-                PreparedSyntaxPreparation::TimedOut => {
-                    return PreparedSyntaxLimitedOutcome::Unavailable;
-                }
-                PreparedSyntaxPreparation::Cancelled => {
-                    return PreparedSyntaxLimitedOutcome::Cancelled;
-                }
+            };
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return Err(PreparedSyntaxLimitedOutcome::Cancelled);
             }
+            Ok(prepared)
+        }) {
+            Ok(read) => read,
+            Err(outcome) => return outcome,
         };
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return PreparedSyntaxLimitedOutcome::Cancelled;
-        }
-
-        // A cancelled parse is deliberately never stored. Completed parse
-        // failures retain the existing negative-cache behavior. If another
-        // request won the race, its coherent result is authoritative.
-        let prepared = if let Some(cell) = cell {
-            let read = RequestRead::from_scope(prepared, &scope);
-            if read.can_publish() {
-                cell.get_or_init(|| read).replay(self)
-            } else {
-                read.replay(self)
-            }
-        } else {
-            prepared
+        // A cancelled parse never reaches this point. Completed parse failures
+        // retain their negative-cache behavior and their fill dependencies.
+        let complete = admitted.is_some();
+        let prepared = match (cell, admitted) {
+            (Some(cell), Some(admitted)) => cell.get_or_init(|| admitted).replay(self),
+            _ => prepared,
         };
-        if scope.captured_read_incompleteness().is_empty() {
+        if complete {
             self.prepared_syntax_store_retain(prepared_key, prepared.as_ref());
         }
         prepared.map_or(PreparedSyntaxLimitedOutcome::Unavailable, |prepared| {
@@ -11691,19 +13165,16 @@ where
         if let Some(read) = cell.get() {
             return read.replay(self);
         }
-        crate::analyzer::common::complete_query_cache_cell(self, &cell, || {
-            RequestRead::capture(self, || {
-                self.retained_or_prepared_syntax_for_key(
-                    prepared_key,
-                    file,
-                    &key,
-                    origin,
-                    overlay_revision,
-                    resolved.snapshot.source(),
-                )
-            })
+        RequestRead::read_cell(self, &cell, || {
+            self.retained_or_prepared_syntax_for_key(
+                prepared_key,
+                file,
+                &key,
+                origin,
+                overlay_revision,
+                resolved.snapshot.source(),
+            )
         })
-        .replay(self)
     }
 
     /// Read-through against the cross-request store, which sits behind the
@@ -11799,6 +13270,7 @@ where
         );
         state.workspace_package_inventory_error =
             self.state.workspace_package_inventory_error.clone();
+        state.signature_inputs = Arc::clone(&self.state.signature_inputs);
         state.update_resolution_error = Some(error);
         let snapshots = self.selected_workspace_snapshots();
         let mut context = self.store_context.clone();
@@ -11822,11 +13294,23 @@ where
         )
     }
 
-    fn update_configured_sources(&self) -> Result<Self, StoreError> {
+    fn update_configured_sources(
+        &self,
+        membership: Arc<GenerationWorkspaceMembership>,
+    ) -> Result<Self, StoreError> {
+        let listing = membership
+            .listing()
+            .map_err(|_| StoreError::new("generation listing unavailable"))?;
+        let snapshot = WorkspaceBuildSnapshot::from_listing(
+            self.project.as_ref(),
+            self.store_context.liveness.as_deref(),
+            &[self.adapter.language()],
+            listing.clone(),
+        );
         let captured = Self::workspace_configuration_inputs(
             self.project.as_ref(),
             self.adapter.as_ref(),
-            None,
+            Some(&snapshot),
         )
         .map_err(StoreError::from)?;
         let configuration = self
@@ -11840,13 +13324,15 @@ where
             .expect("snapshot configuration has a derivation hook");
         let files: Vec<_> = self
             .project
-            .analyzable_files(self.adapter.language())
+            .analyzable_files_from(snapshot.files(), self.adapter.language())
             .map_err(|error| {
                 StoreError::new(format!("cannot enumerate configured sources: {error}"))
             })?
             .into_iter()
             .collect();
         let mut store_context = self.store_context.clone();
+        store_context.membership = Some(membership);
+        store_context.workspace_snapshot = Some(Arc::clone(&snapshot));
         store_context.live_paths = Arc::new(
             self.store_context
                 .live_paths
@@ -11869,8 +13355,15 @@ where
             Self::workspace_package_identity_input_digests(
                 self.project.as_ref(),
                 self.adapter.as_ref(),
-                None,
+                Some(&snapshot),
             );
+        state.signature_inputs = Self::capture_signature_inputs(
+            self.project.as_ref(),
+            self.adapter.as_ref(),
+            &store_context.store,
+            Some(&snapshot),
+        );
+        store_context.workspace_snapshot = None;
         Ok(Self::from_state(
             Arc::clone(&self.project),
             Arc::clone(&self.adapter),
@@ -12043,9 +13536,10 @@ where
                 self.record_admission_refusal(file, reason.clone())
             }
             PreparedSyntaxPreparation::TimedOut => {
-                self.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceUnavailable(
-                    format!("syntax preparation timed out for {file:?}").into_boxed_str(),
-                ))
+                self.record_query_incomplete(QueryReadIncomplete::ProofStopped {
+                    reason: "syntax_preparation_deadline",
+                    cause: Some(crate::analyzer::read_ledger::DerivationExecutionCause::Budget),
+                })
             }
             _ => {}
         }
@@ -12469,8 +13963,10 @@ where
 
     fn refuse_uncertified_csharp_gap_fill(&self) {
         // Publication state is not part of a retained answer's named input set.
-        // Keep the caller's best-effort reason while refusing this fill.
-        self.mark_execution_dependent();
+        // Keep the caller's best-effort reason while refusing this fill. The
+        // obligation it records carries no verdict, so the verdict joins the
+        // current captures.
+        crate::analyzer::i_analyzer::join_execution_dependence(self);
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -12492,29 +13988,21 @@ where
         let Some(overlays) = self.csharp_overlay_unseen_branch_files() else {
             return;
         };
-        let mut produced = self
+        let produced = self
             .active_query_request_memo::<UnseenBranchFilesMemo>()
-            .map(|memo| {
+            .filter(|_| match file {
+                Some((path, variant)) => !overlays.iter().any(|row| {
+                    row.rel_path == path
+                        && variant == brokk_bifrost_core::gitblob::ParseVariant::Digest(row.variant)
+                }),
+                None => overlays.is_empty(),
+            })
+            .and_then(|memo| {
                 memo.produced
                     .lock()
                     .expect("produced unseen branch memo poisoned")
-                    .iter()
-                    .filter(|(_, chains)| !chains.is_empty())
-                    .map(
-                        |((rel_path, variant), chains)| crate::analyzer::store::UnseenBranchFile {
-                            rel_path: rel_path.clone(),
-                            variant: *variant,
-                            chains: chains.clone(),
-                        },
-                    )
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        produced.sort_by(|left, right| {
-            left.rel_path
-                .cmp(&right.rel_path)
-                .then(left.variant.cmp(&right.variant))
-        });
+                    .select(file)
+            });
         let best_effort = match file {
             Some((file, variant)) => overlays
                 .iter()
@@ -12538,7 +14026,7 @@ where
                     })
                     .flatten()
                 }),
-            None => overlays.first().or_else(|| produced.first()).or_else(|| {
+            None => overlays.first().or(produced.as_ref()).or_else(|| {
                 rows.iter().find(|row| {
                     !self
                         .project
@@ -12626,11 +14114,38 @@ where
                 )
             })
             .collect::<Vec<_>>();
-        let detail = format!(
-            "{}: {}: {}",
-            derivation_reason::CSHARP_CONDITIONAL_BRANCH_UNSEEN,
-            chosen.rel_path,
-            clauses.join("; "),
+        let unknown_symbols: usize = chosen
+            .chains
+            .iter()
+            .map(|chain| chain.unknown_symbols.len())
+            .sum();
+        let open_reasons: usize = chosen
+            .chains
+            .iter()
+            .map(|chain| chain.open_reasons.len())
+            .sum();
+        let disagreeing_owners: usize = chosen
+            .chains
+            .iter()
+            .map(|chain| chain.disagreeing_owners.len())
+            .sum();
+        let invalid_conditions = chosen
+            .chains
+            .iter()
+            .filter(|chain| chain.invalid_condition)
+            .count();
+        let detail = brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+            format_args!(
+                "{}: {}: {}",
+                derivation_reason::CSHARP_CONDITIONAL_BRANCH_UNSEEN,
+                chosen.rel_path,
+                clauses.join("; ")
+            ),
+            format_args!(
+                "{}: conditional chains incomplete; unknown_symbol_items={unknown_symbols}, open_configuration_items={open_reasons}, disagreeing_owner_items={disagreeing_owners}, invalid_conditions={invalid_conditions}; omitted_source_context_items=1",
+                derivation_reason::CSHARP_CONDITIONAL_BRANCH_UNSEEN
+            ),
+            clauses.iter(),
         );
         self.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceGap(detail.into()));
     }
@@ -13289,73 +14804,75 @@ where
         {
             let cached = cached.replay(self);
             if let (Some(source), Some(max_source_bytes)) = (&cached, max_source_bytes)
-                && !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
-                    source.snapshot.source().len(),
-                    max_source_bytes,
-                )
-                .allows(0)
+                && let Err(refused) =
+                    brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                        source.snapshot.source().len(),
+                        max_source_bytes,
+                    )
+                    .try_allow(0)
             {
                 return Err(PreparedSourceFailure::Exceeded(
                     PreparedSyntaxLimitExceeded {
                         minimum_source_bytes: source.snapshot.source().len(),
+                        refused,
                     },
                 ));
             }
             return Ok(cached);
         }
 
-        let scope = crate::analyzer::AnalyzerQueryScope::capturing_read_incompleteness(self);
-        let snapshot = match max_source_bytes {
-            Some(limit) => self.project.read_source_snapshot_limited(file, limit),
-            None => self.project.read_source_snapshot(file).map(Some),
-        };
-        let snapshot = match snapshot {
-            Ok(Some(snapshot)) => Some(snapshot),
-            Ok(None) => {
-                let limit =
-                    max_source_bytes.expect("only a bounded source read returns no snapshot");
-                brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(limit, limit)
-                    .allows(1);
-                return Err(PreparedSourceFailure::Exceeded(
-                    PreparedSyntaxLimitExceeded {
-                        minimum_source_bytes: max_source_bytes
-                            .expect("only a bounded source read returns no snapshot")
-                            .saturating_add(1),
-                    },
-                ));
-            }
-            Err(error) => {
-                self.record_source_read_failure(file, &error);
-                if error.get_ref().is_some_and(|cause| {
-                    cause.is::<brokk_bifrost_core::analyzer::project::BinarySourceRejection>()
-                }) {
-                    return Err(PreparedSourceFailure::Refused(
-                        SourceAdmissionRefusal::Binary,
+        let (resolved, admitted) = RequestRead::try_capture(self, || {
+            let snapshot = match max_source_bytes {
+                Some(limit) => self.project.read_source_snapshot_limited(file, limit),
+                None => self.project.read_source_snapshot(file).map(Some),
+            };
+            let snapshot = match snapshot {
+                Ok(Some(snapshot)) => Some(snapshot),
+                Ok(None) => {
+                    let limit =
+                        max_source_bytes.expect("only a bounded source read returns no snapshot");
+                    let refused =
+                        brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                            limit, limit,
+                        )
+                        .try_allow(1)
+                        .expect_err("a source longer than the limit never fits it");
+                    return Err(PreparedSourceFailure::Exceeded(
+                        PreparedSyntaxLimitExceeded {
+                            minimum_source_bytes: limit.saturating_add(1),
+                            refused,
+                        },
                     ));
                 }
-                None
-            }
-        };
-        // The snapshot carries the raw disk identity alongside its decoded
-        // parser text. Retaining that identity keeps lossy source publication
-        // mounted to the blob the live path map names; overlays already carry
-        // the UTF-8 identity of their admitted text.
-        let resolved = snapshot.map(|snapshot| ResolvedPreparedSource {
-            oid: snapshot.oid(),
-            snapshot,
-        });
-
-        let read = RequestRead::from_scope(resolved.clone(), &scope);
-        if read.can_publish()
-            && let Some(prepared_sources) = prepared_sources.as_ref()
-        {
+                Err(error) => {
+                    self.record_source_read_failure(file, &error);
+                    if error.get_ref().is_some_and(|cause| {
+                        cause.is::<brokk_bifrost_core::analyzer::project::BinarySourceRejection>()
+                    }) {
+                        return Err(PreparedSourceFailure::Refused(
+                            SourceAdmissionRefusal::Binary,
+                        ));
+                    }
+                    None
+                }
+            };
+            // The snapshot carries the raw disk identity alongside its decoded
+            // parser text. Retaining that identity keeps lossy source publication
+            // mounted to the blob the live path map names; overlays already carry
+            // the UTF-8 identity of their admitted text.
+            Ok(snapshot.map(|snapshot| ResolvedPreparedSource {
+                oid: snapshot.oid(),
+                snapshot,
+            }))
+        })?;
+        if let (Some(admitted), Some(prepared_sources)) = (admitted, prepared_sources.as_ref()) {
             let mut prepared_sources = prepared_sources
                 .write()
                 .expect("query prepared-source cache write lock poisoned");
             if prepared_sources.contains_key(file)
                 || prepared_sources.len() < QUERY_PREPARED_SYNTAX_CACHE_CAPACITY
             {
-                prepared_sources.insert(file.clone(), read);
+                prepared_sources.insert(file.clone(), admitted);
             }
         }
         Ok(resolved)
@@ -13387,7 +14904,7 @@ where
                 .entry(file.clone())
                 .or_default() += 1;
         }
-        let source = RequestRead::capture(self, || {
+        let (source, admitted) = RequestRead::capture(self, || {
             if self.project.has_overlay(file) {
                 // Keep identity and text from one admitted snapshot. Resolving an
                 // OID from separately read text would capture the overlay twice.
@@ -13432,15 +14949,13 @@ where
                     .map(|oid| ResolvedLiveSource { oid })
             }
         });
-        if source.can_publish()
-            && let Some(live_sources) = live_sources.as_ref()
-        {
+        if let (Some(admitted), Some(live_sources)) = (admitted, live_sources.as_ref()) {
             live_sources
                 .write()
                 .expect("query live-source cache write lock poisoned")
-                .insert(file.clone(), source.clone());
+                .insert(file.clone(), admitted);
         }
-        source.replay(self)
+        source
     }
 
     #[doc(hidden)]
@@ -13473,13 +14988,21 @@ where
 
     #[doc(hidden)]
     pub fn source_for_oid(&self, file: &ProjectFile, oid: Oid) -> Option<String> {
-        if let Ok(snapshot) = self.project.read_source_snapshot(file)
-            && snapshot.oid() == oid
-        {
-            return Some(snapshot.source().to_owned());
-        }
+        let pending_error = match self.project.read_source_snapshot(file) {
+            Ok(snapshot) if snapshot.oid() == oid => {
+                return Some(snapshot.source().to_owned());
+            }
+            Ok(_) => None,
+            Err(error) => Some(error),
+        };
         if let Some(source) = self.source_from_git_blob(oid) {
             return Some(source);
+        }
+        // A historical blob can supply the exact requested source even when
+        // the working-tree file is unavailable. Only a failed fallback makes
+        // that earlier failure part of this read's outcome.
+        if let Some(error) = pending_error {
+            self.record_source_read_failure(file, &error);
         }
         None
     }
@@ -13500,6 +15023,13 @@ where
     }
 
     fn record_admission_refusal(&self, file: &ProjectFile, reason: SourceAdmissionRefusal) {
+        // These counts are fixed per source, unlike the parser's wall-clock deadline.
+        if matches!(reason, SourceAdmissionRefusal::Budget { .. }) {
+            self.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceGap(
+                format!("fixed source admission limit for {file:?}: {reason}").into_boxed_str(),
+            ));
+            return;
+        }
         if !matches!(
             reason,
             SourceAdmissionRefusal::Binary | SourceAdmissionRefusal::StructuralLine { .. }
@@ -13552,12 +15082,12 @@ where
                         return true;
                     }
                     Err(AdmissionStop::TimedOut) => {
-                        self.record_query_incomplete(
-                            QueryReadIncomplete::SemanticEvidenceUnavailable(
-                                format!("source admission proof timed out for {file:?}")
-                                    .into_boxed_str(),
+                        self.record_query_incomplete(QueryReadIncomplete::ProofStopped {
+                            reason: "source_admission_deadline",
+                            cause: Some(
+                                crate::analyzer::read_ledger::DerivationExecutionCause::Budget,
                             ),
-                        );
+                        });
                         return true;
                     }
                 };
@@ -13577,7 +15107,15 @@ where
 
     fn source_from_git_blob(&self, oid: Oid) -> Option<String> {
         let repo = gitblob::discover(self.project.root())?;
-        let bytes = gitblob::read_blob(&repo, &oid.to_string()).ok()?;
+        let bytes = match gitblob::read_blob(&repo, &oid.to_string()) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.record_store_error(StoreError::new(format!(
+                    "reading Git source blob {oid}: {error}"
+                )));
+                return None;
+            }
+        };
         crate::analyzer::project::decode_source_bytes(bytes).ok()
     }
 
@@ -13814,30 +15352,42 @@ where
                         }
                     },
                 );
-                if self.adapter.language() == Language::Rust {
-                    // Re-persisting a blob withdraws every Rust summary version that
-                    // lists it (`WITHDRAW_VERSIONS_OF_REPLACED_BLOB_SQL`). A warm start
-                    // runs no other reconcile, and the Rust route readers answer only
-                    // from live summary rows, so derive those units again here.
-                    let (snapshots, _) = self.capture_relational_workspace_snapshots();
-                    if let Some(snapshot) = snapshots.get("rust") {
-                        match self
-                            .store_context
-                            .store
-                            .reconcile_rust_crates_unless_current(snapshot)
-                        {
-                            Ok(report) => self
-                                .snapshot_caches
-                                .derivations()
-                                .forget_rust_units(&report),
-                            Err(error) => self
-                                .record_store_error(error.context(
-                                    "re-deriving Rust summaries after a live blob repair",
-                                )),
-                        }
-                    }
-                }
             });
+        }
+    }
+
+    /// Re-derive the Rust unit summaries that re-persisting a repaired blob
+    /// withdraws.
+    ///
+    /// Re-persisting a blob withdraws every Rust summary version that lists it
+    /// (`WITHDRAW_VERSIONS_OF_REPLACED_BLOB_SQL`). A warm start runs no other
+    /// reconcile, and the Rust route readers answer only from live summary
+    /// rows, so the units must be derived again.
+    ///
+    /// The caller must first prove that every live file has published facts. A
+    /// unit summary translates each member's sites through that member's
+    /// surface set, and a blob whose facts are not admitted has no surface
+    /// set, so a unit that lists it cannot be derived. Callers report that
+    /// publication failure instead; deriving the unit anyway would try to
+    /// write a -1 coordinate that the summary CHECK constraints reject.
+    #[doc(hidden)]
+    pub fn rederive_rust_summaries_after_live_repair(&self) {
+        let (snapshots, _) = self.capture_relational_workspace_snapshots();
+        let Some(snapshot) = snapshots.get("rust") else {
+            return;
+        };
+        match self
+            .store_context
+            .store
+            .reconcile_rust_crates_unless_current(snapshot)
+        {
+            Ok(report) => self
+                .snapshot_caches
+                .derivations()
+                .forget_rust_units(&report),
+            Err(error) => self.record_store_error(
+                error.context("re-deriving Rust summaries after a live blob repair"),
+            ),
         }
     }
 
@@ -13867,12 +15417,16 @@ where
     /// Fence a cold memo build against store generations captured at analyzer
     /// construction. Call this inside the build's read-completion capture, after
     /// its own computation has finished and before it offers a value to a cell.
+    ///
+    /// A build that already failed in its own capture keeps that outcome. An
+    /// enclosing scope's failure is not the build's own: the build is still
+    /// offered to a cell, so it is fenced unless its own capture has failed.
     #[doc(hidden)]
     pub fn record_cold_compute_generation_fence(&self) {
         use crate::analyzer::i_analyzer::IAnalyzer;
 
         if IAnalyzer::active_query_cancellation(self).is_some_and(|token| token.is_cancelled())
-            || IAnalyzer::current_query_read_completion(self)
+            || crate::analyzer::i_analyzer::current_own_read_completion()
                 .err()
                 .is_some_and(|reason| reason.is_execution_dependent())
         {
@@ -14080,6 +15634,8 @@ where
         let mut files = Vec::new();
         let mut persisted_candidates = Vec::new();
         let mut live_source_entries = HashMap::default();
+        let mut live_source_reads = HashMap::default();
+        let mut live_source_reads_admitted = true;
         for file in snapshot.all_paths() {
             let Some(project_file) = self.rebase_live_file_to_project_root(file) else {
                 continue;
@@ -14101,15 +15657,19 @@ where
                 // the published live-source memo so the bulk seed cannot
                 // publish a stale disk OID for an overlay that was installed
                 // before this request began.
-                let live_oid = if self.project.has_overlay(&project_file) {
-                    self.project
-                        .read_source(&project_file)
-                        .ok()
-                        .and_then(|source| self.content_oid_of(&project_file, &source))
-                } else {
-                    None
-                }
-                .unwrap_or(oid);
+                let (source, admitted) = RequestRead::capture(self, || {
+                    let live_oid = if self.project.has_overlay(&project_file) {
+                        self.project
+                            .read_source(&project_file)
+                            .ok()
+                            .and_then(|source| self.content_oid_of(&project_file, &source))
+                    } else {
+                        None
+                    }
+                    .unwrap_or(oid);
+                    Some(ResolvedLiveSource { oid: live_oid })
+                });
+                let source = source.expect("bulk seed constructs a live source");
                 // The bulk seed is a fresh live-OID derivation: later
                 // `resolve_live_source_for_file` calls hit the published memo
                 // instead of re-deriving, so the validation count records the
@@ -14123,8 +15683,12 @@ where
                         .entry(project_file.clone())
                         .or_default() += 1;
                 }
-                live_source_entries
-                    .insert(project_file.clone(), ResolvedLiveSource { oid: live_oid });
+                if let Some(admitted) = admitted {
+                    live_source_entries.insert(project_file.clone(), source);
+                    live_source_reads.insert(project_file.clone(), admitted);
+                } else {
+                    live_source_reads_admitted = false;
+                }
             }
             let storage_key = self.adapter.storage_language_key_for_file(&project_file);
             let Some(key) = self.variant_cache_key(oid, &project_file) else {
@@ -14173,18 +15737,15 @@ where
         // detached and harmless. Recheck both identities under the outer lock
         // before publishing the generation-wide immutable snapshot so it can
         // never leak into a later request.
-        if scope.captured_read_incompleteness().is_empty()
+        if live_source_reads_admitted
+            && scope.captured_read_incompleteness().is_empty()
             && let (Some(analyzed_live_files), Some(live_sources)) =
                 (analyzed_live_files.as_ref(), live_sources.as_ref())
         {
             live_sources
                 .write()
                 .expect("query live-source cache write lock poisoned")
-                .extend(
-                    live_source_entries
-                        .iter()
-                        .map(|(file, source)| (file.clone(), RequestRead::Present(*source))),
-                );
+                .extend(live_source_reads);
             *analyzed_live_files
                 .write()
                 .expect("query analyzed-live cache write lock poisoned") = Some(files.clone());
@@ -14312,6 +15873,7 @@ where
     fn resolve_candidate_rows_limited(
         &self,
         rows: Vec<HydratedCandidateRow>,
+        mounts: Option<&HashSet<ProjectFile>>,
         limit: usize,
         mut continue_query: impl FnMut() -> bool,
     ) -> LimitedQueryRows<CodeUnit> {
@@ -14338,6 +15900,12 @@ where
                     || self.adapter.storage_language_key_for_file(&file) != row.lang
                     || snapshot.validated_oid_for_path(&file) != Some(row.blob_oid)
                 {
+                    continue;
+                }
+                // The exact-name inventory is a conservative mount superset.
+                // Unknown inventory leaves this unconstrained; final hydrated
+                // name equality still decides which candidates match.
+                if mounts.is_some_and(|paths| !paths.contains(&file)) {
                     continue;
                 }
                 let (fq, package_segment_count) = crate::analyzer::store::hydrate_unit_fq(
@@ -14734,9 +16302,15 @@ where
             let generation = self.project.analysis_generation();
             let scope = crate::analyzer::AnalyzerQueryScope::capturing_read_incompleteness(self);
             let (result, reads) =
-                crate::analyzer::i_analyzer::capture_subsumed_query_read_receipt(self, || {
-                    self.build_workspace_modules_limited(&mut continue_query)
-                });
+                crate::analyzer::i_analyzer::capture_subsumed_query_read_receipt_judged(
+                    self,
+                    || {
+                        let mut reuse = crate::analyzer::reuse_verdict::ReuseVerdict::Content;
+                        let result =
+                            self.build_workspace_modules_limited(&mut continue_query, &mut reuse);
+                        (result, reuse)
+                    },
+                );
             let result = match result {
                 Ok(result) => result,
                 Err(error) => {
@@ -14763,7 +16337,7 @@ where
                 inspected: result.inspected,
             });
             if self.project.analysis_generation() != generation {
-                self.mark_execution_dependent();
+                crate::analyzer::i_analyzer::join_execution_dependence(self);
                 return Ok(None);
             }
             if reads.channels.unattributed_reads == 0
@@ -14797,9 +16371,12 @@ where
         Ok(Some(modules))
     }
 
+    /// Joins into `reuse` the verdict of every execution dependence the rows
+    /// carry.
     fn build_workspace_modules_limited(
         &self,
         mut continue_query: impl FnMut() -> bool,
+        reuse: &mut crate::analyzer::reuse_verdict::ReuseVerdict,
     ) -> std::result::Result<LimitedQueryRows<(String, PathSymbolRow, bool)>, StoreError> {
         if !self.adapter.has_path_synthetic_module_units() {
             return Ok(LimitedQueryRows::complete(Vec::new(), 0));
@@ -14903,7 +16480,7 @@ where
             HashSet::default()
         };
         if !dirty_modules.is_empty() {
-            self.mark_execution_dependent();
+            reuse.join_in(crate::analyzer::i_analyzer::execution_dependent(self));
         }
         let rows = rows
             .into_iter()
@@ -15215,9 +16792,12 @@ where
         (LimitedQueryRows::complete(rows, inspected), paths)
     }
 
+    // Mount admission and authoritative-unit filtering govern separate sources.
+    #[allow(clippy::too_many_arguments)]
     fn finish_limited_declaration_lookup(
         &self,
         persisted: LimitedQueryRows<HydratedCandidateRow>,
+        mounts: Option<&HashSet<ProjectFile>>,
         include_definition_lookup_units: bool,
         include_path_synthetic_modules: bool,
         limit: usize,
@@ -15231,6 +16811,7 @@ where
 
         let resolved = self.resolve_candidate_rows_limited(
             persisted.rows,
+            mounts,
             limit - inspected,
             &mut continue_query,
         );
@@ -15641,9 +17222,11 @@ where
         }
 
         if let Some(cross_file) = self.adapter.cross_file_children(self, owner, limit) {
-            let mut rows = self.merge_children(self.direct_children_in_file(owner), cross_file);
+            let attributed = cross_file.complete;
+            let mut rows =
+                self.merge_children(self.direct_children_in_file(owner), cross_file.children);
             let inspected = rows.len();
-            let complete = inspected < limit;
+            let complete = attributed && inspected < limit;
             rows.truncate(limit);
             return if complete {
                 LimitedQueryRows::complete(rows, inspected)
@@ -15931,7 +17514,7 @@ where
     ) -> BTreeMap<String, String> {
         omissions
             .iter()
-            .filter(|omission| omission_fails_rust_listing(omission))
+            .filter(|omission| omission_hides_source(Language::Rust, omission))
             .map(|omission| {
                 (
                     brokk_bifrost_core::path_utils::workspace_relative_slash_path(&omission.path),
@@ -15963,7 +17546,7 @@ where
         };
         let prior = self.store_context.store.rust_source_listing_failures(
             &snapshot,
-            crate::analyzer::store::RUST_SOURCE_LISTING_DERIVATION_VERSION,
+            crate::analyzer::store::rust_source_listing_derivation_identity(),
         )?;
         Ok(prior.is_some_and(|rows| {
             // A certificate written while no listing was readable holds the
@@ -16001,6 +17584,18 @@ where
     #[doc(hidden)]
     pub fn selected_workspace_snapshots(&self) -> Arc<WorkspaceSnapshots> {
         self.relational_workspace_snapshots.load_full()
+    }
+
+    /// The selection captured when this request opened. This accessor never
+    /// reloads the publication source or creates an implicit lifecycle owner.
+    #[doc(hidden)]
+    pub fn request_workspace_snapshots(
+        &self,
+    ) -> Result<Arc<WorkspaceSnapshots>, crate::analyzer::i_analyzer::RequestWorkspaceSelectionError>
+    {
+        crate::analyzer::i_analyzer::request_workspace_snapshots(
+            &self.relational_workspace_snapshots,
+        )
     }
 
     /// Load selected indexed usage source, preserving caller work between
@@ -17483,6 +19078,32 @@ where
         }
     }
 
+    fn bounded_declaration_rows_by_identifier(
+        &self,
+        identifier: &str,
+        langs: &[String],
+        limit: usize,
+    ) -> LimitedQueryRows<HydratedCandidateRow> {
+        self.store_query_or_record(
+            |sink| {
+                sink.push(ReadKey::index(
+                    IndexFamily::DefinitionIdentifier,
+                    identifier,
+                ))
+            },
+            self.store_context
+                .store
+                .declaration_candidate_rows_by_identifier_for_langs_limited(
+                    langs,
+                    self.store_context.generations.as_ref(),
+                    identifier,
+                    limit,
+                ),
+            format!("querying bounded declarations by identifier `{identifier}`"),
+        )
+        .unwrap_or_else(|| LimitedQueryRows::incomplete(Vec::new(), 0))
+    }
+
     fn lookup_declarations_by_identifier_limited_uncached(
         &self,
         identifier: &str,
@@ -17490,27 +19111,10 @@ where
         limit: usize,
         continue_query: impl FnMut() -> bool,
     ) -> LimitedQueryRows<CodeUnit> {
-        let persisted = self
-            .store_query_or_record(
-                |sink| {
-                    sink.push(ReadKey::index(
-                        IndexFamily::DefinitionIdentifier,
-                        identifier,
-                    ))
-                },
-                self.store_context
-                    .store
-                    .declaration_candidate_rows_by_identifier_for_langs_limited(
-                        langs,
-                        self.store_context.generations.as_ref(),
-                        identifier,
-                        limit,
-                    ),
-                format!("querying bounded declarations by identifier `{identifier}`"),
-            )
-            .unwrap_or_else(|| LimitedQueryRows::incomplete(Vec::new(), 0));
+        let persisted = self.bounded_declaration_rows_by_identifier(identifier, langs, limit);
         self.finish_limited_declaration_lookup(
             persisted,
+            None,
             true,
             true,
             limit,
@@ -17530,27 +19134,10 @@ where
             return LimitedQueryRows::complete(Vec::new(), 0);
         }
         let langs = self.storage_language_keys_for_queries();
-        let persisted = self
-            .store_query_or_record(
-                |sink| {
-                    sink.push(ReadKey::index(
-                        IndexFamily::DefinitionIdentifier,
-                        identifier,
-                    ))
-                },
-                self.store_context
-                    .store
-                    .declaration_candidate_rows_by_identifier_for_langs_limited(
-                        &langs,
-                        self.store_context.generations.as_ref(),
-                        identifier,
-                        limit,
-                    ),
-                format!("querying bounded non-module declarations by identifier `{identifier}`"),
-            )
-            .unwrap_or_else(|| LimitedQueryRows::incomplete(Vec::new(), 0));
+        let persisted = self.bounded_declaration_rows_by_identifier(identifier, &langs, limit);
         self.finish_limited_declaration_lookup(
             persisted,
+            None,
             true,
             false,
             limit,
@@ -17559,19 +19146,71 @@ where
         )
     }
 
+    fn exact_fqn_candidate_mounts(
+        &self,
+        fqn: &str,
+        langs: &[String],
+        persisted: &LimitedQueryRows<HydratedCandidateRow>,
+        limit: usize,
+        continue_query: &mut impl FnMut() -> bool,
+    ) -> Option<HashSet<ProjectFile>> {
+        if !persisted.complete || persisted.inspected >= limit || !continue_query() {
+            return None;
+        }
+        let mut remaining = limit - persisted.inspected;
+        let listed = self.workspace_listing_proof();
+        let mut paths = HashSet::default();
+        for lang in langs {
+            let candidates = self.store_query_or_record(
+                |sink| sink.push(ReadKey::index(IndexFamily::DefinitionExact, fqn)),
+                self.store_context
+                    .store
+                    .index_blob_candidates_for_key_at_limited(
+                        &listed,
+                        lang,
+                        IndexFamily::DefinitionExact,
+                        fqn.as_bytes(),
+                        &mut remaining,
+                        &mut *continue_query,
+                    ),
+                format!("querying selected exact-name mounts for `{fqn}`"),
+            )??;
+            paths.extend(candidates.into_iter().map(|candidate| {
+                ProjectFile::new(self.project.root().to_path_buf(), candidate.mounted_path)
+            }));
+        }
+        Some(paths)
+    }
+
     #[doc(hidden)]
     pub fn lookup_declarations_by_fqn_limited(
         &self,
         fqn: &str,
         limit: usize,
-        continue_query: impl FnMut() -> bool,
+        mut continue_query: impl FnMut() -> bool,
     ) -> LimitedQueryRows<CodeUnit> {
         let Some(identifier) = fqn.rsplit('.').next().filter(|name| !name.is_empty()) else {
             return LimitedQueryRows::complete(Vec::new(), 0);
         };
+        if !self.workspace_declaration_identities_authoritative() {
+            self.record_unattributed_read();
+            return LimitedQueryRows::complete(Vec::new(), 0);
+        }
+        let langs = self.storage_language_keys_for_queries();
+        let persisted = self.bounded_declaration_rows_by_identifier(identifier, &langs, limit);
+        let mounts =
+            self.exact_fqn_candidate_mounts(fqn, &langs, &persisted, limit, &mut continue_query);
         Self::filter_complete_fqn_candidates(
             fqn,
-            self.lookup_declarations_by_identifier_limited(identifier, limit, continue_query),
+            self.finish_limited_declaration_lookup(
+                persisted,
+                mounts.as_ref(),
+                true,
+                true,
+                limit,
+                |unit| unit.fq_name() == fqn,
+                continue_query,
+            ),
         )
     }
 
@@ -17580,16 +19219,27 @@ where
         &self,
         fqn: &str,
         limit: usize,
-        continue_query: impl FnMut() -> bool,
+        mut continue_query: impl FnMut() -> bool,
     ) -> LimitedQueryRows<CodeUnit> {
         let Some(identifier) = fqn.rsplit('.').next().filter(|name| !name.is_empty()) else {
             return LimitedQueryRows::complete(Vec::new(), 0);
         };
+        if !self.workspace_declaration_identities_authoritative() {
+            return LimitedQueryRows::complete(Vec::new(), 0);
+        }
+        let langs = self.storage_language_keys_for_queries();
+        let persisted = self.bounded_declaration_rows_by_identifier(identifier, &langs, limit);
+        let mounts =
+            self.exact_fqn_candidate_mounts(fqn, &langs, &persisted, limit, &mut continue_query);
         Self::filter_complete_fqn_candidates(
             fqn,
-            self.lookup_non_module_declarations_by_identifier_limited(
-                identifier,
+            self.finish_limited_declaration_lookup(
+                persisted,
+                mounts.as_ref(),
+                true,
+                false,
                 limit,
+                |unit| !unit.is_module() && unit.fq_name() == fqn,
                 continue_query,
             ),
         )
@@ -17748,6 +19398,7 @@ where
             .unwrap_or_else(|| LimitedQueryRows::incomplete(Vec::new(), 0));
         self.finish_limited_declaration_lookup(
             persisted,
+            None,
             false,
             true,
             limit,
@@ -17857,6 +19508,7 @@ where
         let exact_member = format!("{owner_fqn}.{name}");
         let exact = self.finish_limited_declaration_lookup(
             exact_persisted,
+            None,
             false,
             true,
             limit,
@@ -17898,6 +19550,7 @@ where
             .normalize_full_name(&format!("{owner_fqn}.{name}"));
         let normalized = self.finish_limited_declaration_lookup(
             normalized_persisted,
+            None,
             false,
             true,
             remaining,
@@ -18249,6 +19902,22 @@ where
     }
 
     #[doc(hidden)]
+    /// The test verdict a search candidate carries. This analyzer sees only
+    /// local evidence: a test region in the file or its declaration. Where a
+    /// parent can gate a whole file (Rust's `#[cfg(test)] mod tests;`), the
+    /// absence of local evidence proves nothing, so the verdict is unknown and
+    /// `search_symbols` asks the language's full classifier when the verdict
+    /// filters the result (#11385).
+    fn search_candidate_test_verdict(&self, local_test_region: bool) -> Option<bool> {
+        if local_test_region {
+            Some(true)
+        } else if self.adapter.local_test_evidence_proves_production() {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
     pub fn search_symbol_candidates_reconciled(
         &self,
         patterns: &SearchSymbolPatternBatch,
@@ -18452,7 +20121,7 @@ where
                         secondary_range,
                         has_more_ranges,
                         all_ranges_are_definitions,
-                        in_test_region,
+                        in_test_region: self.search_candidate_test_verdict(in_test_region),
                         is_type_alias,
                     });
             }
@@ -18478,6 +20147,12 @@ where
             }
             let physical = code_unit;
             let code_unit = canonicalize.map_or(physical.clone(), |normalize| normalize(&physical));
+            // None is an unknown verdict; search_symbols asks the language's
+            // full classifier when the verdict filters the result (#11385).
+            let in_test_region = self
+                .in_test_region(&code_unit)
+                .ok()
+                .and_then(|local| self.search_candidate_test_verdict(local));
             candidates.entry(code_unit.clone()).or_insert_with(|| {
                 let ranges = self.ranges(&physical);
                 SearchSymbolCandidate {
@@ -18489,7 +20164,7 @@ where
                     secondary_range: ranges.get(1).copied(),
                     has_more_ranges: ranges.len() > 2,
                     all_ranges_are_definitions: false,
-                    in_test_region: self.in_test_region(&code_unit),
+                    in_test_region,
                     is_type_alias: self.is_type_alias(&code_unit),
                     code_unit,
                 }
@@ -18508,6 +20183,12 @@ where
                 break;
             }
             inspected = inspected.saturating_add(1);
+            // None is an unknown verdict; search_symbols asks the language's
+            // full classifier when the verdict filters the result (#11385).
+            let in_test_region = self
+                .in_test_region(&code_unit)
+                .ok()
+                .and_then(|local| self.search_candidate_test_verdict(local));
             candidates.entry(code_unit.clone()).or_insert_with(|| {
                 let ranges = self.ranges(&code_unit);
                 SearchSymbolCandidate {
@@ -18519,7 +20200,7 @@ where
                     secondary_range: ranges.get(1).copied(),
                     has_more_ranges: ranges.len() > 2,
                     all_ranges_are_definitions: false,
-                    in_test_region: self.in_test_region(&code_unit),
+                    in_test_region,
                     is_type_alias: self.is_type_alias(&code_unit),
                     code_unit,
                 }
@@ -19082,28 +20763,37 @@ where
 
     #[doc(hidden)]
     pub fn raw_supertypes_of(&self, code_unit: &CodeUnit) -> Vec<String> {
+        self.declared_raw_supertypes(code_unit).unwrap_or_default()
+    }
+
+    /// The supertype spellings written at `code_unit`'s declaration, or
+    /// `None` when source cannot establish them: declaration identities are
+    /// not authoritative, the file state is unavailable, or the file does not
+    /// declare `code_unit`. Storage drops empty lists, so a declared unit
+    /// without a list wrote none, provided the adapter records a list for
+    /// every type declaration it parses, as C# does.
+    #[doc(hidden)]
+    pub fn declared_raw_supertypes(&self, code_unit: &CodeUnit) -> Option<Vec<String>> {
         if !self.workspace_declaration_identities_authoritative() {
-            return Vec::new();
+            return None;
         }
-        let Some(state) = self.fetch_file_state(code_unit.source()) else {
-            return Vec::new();
+        let state = self.fetch_file_state(code_unit.source())?;
+        let same_declaration = |owner: &CodeUnit| {
+            owner.source() == code_unit.source()
+                && owner.kind() == code_unit.kind()
+                && owner.fq_name() == code_unit.fq_name()
         };
-        state
-            .raw_supertypes
-            .get(code_unit)
-            .cloned()
-            .or_else(|| {
-                state
-                    .raw_supertypes
-                    .iter()
-                    .find(|(owner, _)| {
-                        owner.source() == code_unit.source()
-                            && owner.kind() == code_unit.kind()
-                            && owner.fq_name() == code_unit.fq_name()
-                    })
-                    .map(|(_, raw)| raw.clone())
-            })
-            .unwrap_or_default()
+        if let Some(raw) = state.raw_supertypes.get(code_unit).or_else(|| {
+            state
+                .raw_supertypes
+                .iter()
+                .find(|(owner, _)| same_declaration(owner))
+                .map(|(_, raw)| raw)
+        }) {
+            return Some(raw.clone());
+        }
+        (state.declarations.contains(code_unit) || state.declarations.iter().any(same_declaration))
+            .then(Vec::new)
     }
 
     #[doc(hidden)]
@@ -19463,6 +21153,15 @@ where
         let mut cache = self.query_read_cache_write();
         (cache.is_active() && !cache.identifier_candidate_memo_only_on_current_thread())
             .then(|| cache.request_memos.get_or_init::<T>())
+    }
+
+    pub(crate) fn active_query_semantic_model_overlay_read(
+        &self,
+    ) -> Option<crate::analyzer::semantic_model::runtime::SemanticModelOverlayRead> {
+        self.query_read_cache
+            .read()
+            .expect("query read cache poisoned")
+            .active_semantic_model_overlay_read()
     }
 
     pub(crate) fn active_query_semantic_model_overlay(
@@ -20645,6 +22344,25 @@ where
         self.file_source(file)
     }
 
+    fn owns_source_file(&self, file: &ProjectFile) -> bool {
+        self.adapter_owns_file(file, &self.indexed_live_snapshot)
+    }
+
+    fn indexed_source_files(&self) -> crate::analyzer::QueryBatch<ProjectFile> {
+        let rows: Vec<_> = self
+            .indexed_live_snapshot
+            .all_paths()
+            .filter_map(|file| self.rebase_live_file_to_project_root(file))
+            .filter(|file| self.adapter_owns_file(file, &self.indexed_live_snapshot))
+            .collect();
+        let inspected = rows.len();
+        if self.state.workspace_inventory.indexed {
+            crate::analyzer::QueryBatch::complete(rows, inspected)
+        } else {
+            crate::analyzer::QueryBatch::incomplete(rows, inspected)
+        }
+    }
+
     fn indexed_blob_oid(&self, file: &ProjectFile) -> Option<Oid> {
         self.indexed_live_snapshot.oid_for_path(file)
     }
@@ -20968,7 +22686,15 @@ where
             .adapter
             .cross_file_children(self, code_unit, usize::MAX)
         {
-            Some(cross_file) => self.merge_children(in_file, cross_file),
+            Some(cross_file) => {
+                if !cross_file.complete {
+                    // This API returns no completeness; the request still reports it.
+                    self.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceGap(
+                        "cross_file_children.unattributed_impl".into(),
+                    ));
+                }
+                self.merge_children(in_file, cross_file.children)
+            }
             None => in_file,
         }
     }
@@ -21161,10 +22887,424 @@ where
     }
 }
 
+#[cfg(feature = "test-support")]
+mod retention_census_support {
+    use super::*;
+    use brokk_bifrost_core::retention_census::{
+        AllocationAccounting, FamilyLifetime, ResidentWeightUnit, RetentionCensus, UnknownKind,
+    };
+
+    const PERSISTENT: FamilyLifetime = FamilyLifetime::Persistent;
+    const OUTSIDE: AllocationAccounting = AllocationAccounting::OutsideBudget;
+
+    fn slots<T>(capacity: usize) -> usize {
+        capacity.saturating_mul(std::mem::size_of::<T>())
+    }
+
+    fn key_heap(key: &FileStateCacheKey) -> usize {
+        key.rel_path.capacity()
+    }
+
+    fn container_unknowns(census: &mut RetentionCensus, family: &'static str) {
+        census.record_unknown(
+            family,
+            PERSISTENT,
+            UnknownKind::Coverage,
+            "allocator_hash_control_and_arc_control_bytes_not_estimated",
+        );
+    }
+
+    fn file_states(
+        states: Vec<Arc<FileState>>,
+        census: &mut RetentionCensus,
+        family: &'static str,
+    ) {
+        let mut pending = states;
+        let mut seen = HashSet::default();
+        while let Some(state) = pending.pop() {
+            if !seen.insert(Arc::as_ptr(&state)) {
+                continue;
+            }
+            // The existing conservative estimator excludes additional projections.
+            // Count their edge buffer here and visit their backing iteratively.
+            let bytes = state.estimated_retained_bytes().saturating_add(slots::<(
+                &'static str,
+                Arc<FileState>,
+            )>(
+                state.additional_projections.capacity(),
+            ));
+            census.record_arc_allocation(
+                Arc::clone(&state),
+                family,
+                PERSISTENT,
+                "file_state_structural_estimate",
+                bytes as u64,
+                OUTSIDE,
+            );
+            pending.extend(
+                state
+                    .additional_projections
+                    .iter()
+                    .map(|(_, state)| Arc::clone(state)),
+            );
+        }
+        census.record_unknown(
+            family,
+            PERSISTENT,
+            UnknownKind::Coverage,
+            "file_state_estimator_does_not_traverse_all_shared_nested_backing",
+        );
+        census.record_unknown(
+            family,
+            PERSISTENT,
+            UnknownKind::ActivePins,
+            "external_file_state_leases_are_not_enumerable",
+        );
+    }
+
+    pub(super) fn transient(cache: &Arc<Mutex<FileStateCache>>, census: &mut RetentionCensus) {
+        let family = "analyzer.transient_file_states";
+        let states = {
+            let guard = cache.lock().expect("file state cache poisoned");
+            let bytes = std::mem::size_of_val(cache.as_ref())
+                .saturating_add(slots::<(FileStateCacheKey, FileStateCacheEntry)>(
+                    guard.entries.capacity(),
+                ))
+                .saturating_add(slots::<(FileStateCacheKey, u64)>(
+                    guard.probation_order.capacity(),
+                ))
+                .saturating_add(slots::<(FileStateCacheKey, u64)>(
+                    guard.protected_order.capacity(),
+                ))
+                .saturating_add(guard.entries.keys().map(key_heap).sum::<usize>())
+                .saturating_add(
+                    guard
+                        .probation_order
+                        .iter()
+                        .chain(&guard.protected_order)
+                        .map(|(key, _)| key_heap(key))
+                        .sum::<usize>(),
+                );
+            census.record_arc_allocation(
+                Arc::clone(cache),
+                family,
+                PERSISTENT,
+                "segmented_file_state_cache_container",
+                bytes as u64,
+                OUTSIDE,
+            );
+            census.record_resident_reading(
+                family,
+                PERSISTENT,
+                guard.entries.len() as u64,
+                guard.retained_bytes as u64,
+                ResidentWeightUnit::BytesEstimate,
+            );
+            guard
+                .entries
+                .values()
+                .map(|entry| Arc::clone(&entry.state))
+                .collect()
+        };
+        container_unknowns(census, family);
+        // Walk immutable states only after releasing the mutable cache's lock.
+        file_states(states, census, family);
+    }
+
+    pub(super) fn source_index(
+        index: &Arc<SourceSnapshotFileStateIndex>,
+        census: &mut RetentionCensus,
+    ) {
+        let family = "analyzer.source_snapshot_file_states";
+        let bytes = std::mem::size_of_val(index.as_ref())
+            .saturating_add(slots::<(FileStateCacheKey, Arc<FileState>)>(
+                index.capacity(),
+            ))
+            .saturating_add(index.keys().map(key_heap).sum::<usize>());
+        census.record_arc_allocation(
+            Arc::clone(index),
+            family,
+            PERSISTENT,
+            "source_snapshot_file_state_index",
+            bytes as u64,
+            OUTSIDE,
+        );
+        census.record_resident_reading(
+            family,
+            PERSISTENT,
+            index.len() as u64,
+            index.len() as u64,
+            ResidentWeightUnit::Entries,
+        );
+        container_unknowns(census, family);
+        file_states(index.values().cloned().collect(), census, family);
+    }
+
+    fn byte_store<K: Send + 'static, V: Send + 'static>(
+        store: &Arc<Mutex<ByteBoundedStore<K, V>>>,
+        census: &mut RetentionCensus,
+        family: &'static str,
+    ) {
+        let guard = store.lock().expect("projection store poisoned");
+        let bytes = std::mem::size_of_val(store.as_ref()).saturating_add(slots::<(
+            K,
+            ByteBoundedStoreEntry<V>,
+        )>(
+            guard.entries.capacity(),
+        ));
+        census.record_arc_allocation(
+            Arc::clone(store),
+            family,
+            PERSISTENT,
+            "byte_bounded_store_container",
+            bytes as u64,
+            OUTSIDE,
+        );
+        census.record_resident_reading(
+            family,
+            PERSISTENT,
+            guard.entries.len() as u64,
+            guard.retained_bytes as u64,
+            ResidentWeightUnit::BytesEstimate,
+        );
+        container_unknowns(census, family);
+        census.record_unknown(
+            family,
+            PERSISTENT,
+            UnknownKind::Coverage,
+            "store_key_and_value_heap_not_structurally_traversed",
+        );
+        census.record_unknown(
+            family,
+            PERSISTENT,
+            UnknownKind::ActivePins,
+            "external_projection_leases_are_not_enumerable",
+        );
+    }
+
+    fn summaries(cache: &Arc<Mutex<SummaryFileProjectionCache>>, census: &mut RetentionCensus) {
+        let family = "analyzer.summary_file_projections";
+        let values = {
+            let guard = cache.lock().expect("summary projection cache poisoned");
+            let bytes = std::mem::size_of_val(cache.as_ref())
+                .saturating_add(slots::<(
+                    FileStateCacheKey,
+                    (Arc<SummaryFileProjection>, u64),
+                )>(guard.entries.capacity()))
+                .saturating_add(slots::<(FileStateCacheKey, u64)>(guard.order.capacity()))
+                .saturating_add(guard.entries.keys().map(key_heap).sum::<usize>())
+                .saturating_add(
+                    guard
+                        .order
+                        .iter()
+                        .map(|(key, _)| key_heap(key))
+                        .sum::<usize>(),
+                );
+            census.record_arc_allocation(
+                Arc::clone(cache),
+                family,
+                PERSISTENT,
+                "summary_file_projection_cache_container",
+                bytes as u64,
+                OUTSIDE,
+            );
+            census.record_resident_reading(
+                family,
+                PERSISTENT,
+                guard.entries.len() as u64,
+                guard.entries.len() as u64,
+                ResidentWeightUnit::Entries,
+            );
+            guard
+                .entries
+                .values()
+                .map(|(value, _)| Arc::clone(value))
+                .collect::<Vec<_>>()
+        };
+        for projection in values {
+            let bytes = std::mem::size_of_val(projection.as_ref())
+                .saturating_add(slots::<CodeUnit>(
+                    projection.top_level_declarations.capacity(),
+                ))
+                .saturating_add(slots::<CodeUnit>(projection.declarations.capacity()))
+                .saturating_add(slots::<(CodeUnit, Vec<String>)>(
+                    projection.signatures.capacity(),
+                ))
+                .saturating_add(slots::<(CodeUnit, Vec<Range>)>(
+                    projection.ranges.capacity(),
+                ))
+                .saturating_add(slots::<(CodeUnit, Vec<CodeUnit>)>(
+                    projection.children.capacity(),
+                ))
+                .saturating_add(
+                    projection
+                        .signatures
+                        .values()
+                        .map(|values| {
+                            slots::<String>(values.capacity())
+                                + values.iter().map(String::capacity).sum::<usize>()
+                        })
+                        .sum::<usize>(),
+                )
+                .saturating_add(
+                    projection
+                        .ranges
+                        .values()
+                        .map(|values| slots::<Range>(values.capacity()))
+                        .sum::<usize>(),
+                )
+                .saturating_add(
+                    projection
+                        .children
+                        .values()
+                        .map(|values| slots::<CodeUnit>(values.capacity()))
+                        .sum::<usize>(),
+                );
+            census.record_arc_allocation(
+                Arc::clone(&projection),
+                family,
+                PERSISTENT,
+                "summary_file_projection",
+                bytes as u64,
+                OUTSIDE,
+            );
+        }
+        container_unknowns(census, family);
+        census.record_unknown(
+            family,
+            PERSISTENT,
+            UnknownKind::Coverage,
+            "shared_code_unit_backing_not_walked",
+        );
+        census.record_unknown(
+            family,
+            PERSISTENT,
+            UnknownKind::ActivePins,
+            "external_summary_projection_leases_are_not_enumerable",
+        );
+    }
+
+    pub(super) fn analyzer<A: LanguageAdapter>(
+        analyzer: &TreeSitterAnalyzer<A>,
+        census: &mut RetentionCensus,
+    ) {
+        transient(&analyzer.transient_file_states, census);
+        source_index(&analyzer.source_snapshot_file_states, census);
+        summaries(&analyzer.summary_file_projections, census);
+        let state = &analyzer.state;
+        let (dirty, dirty_container_bytes) = {
+            let dirty = state
+                .dirty_file_states
+                .lock()
+                .expect("dirty file states poisoned");
+            let bytes = slots::<(FileStateCacheKey, DirtyFileState)>(dirty.capacity())
+                + dirty.keys().map(key_heap).sum::<usize>();
+            (
+                dirty
+                    .values()
+                    .map(|dirty| Arc::clone(&dirty.state))
+                    .collect(),
+                bytes,
+            )
+        };
+        let bytes = std::mem::size_of_val(state.as_ref())
+            + slots::<(FileStateCacheKey, Arc<FileState>)>(state.seeded_file_states.capacity())
+            + state
+                .seeded_file_states
+                .iter()
+                .map(|(key, _)| key_heap(key))
+                .sum::<usize>()
+            + dirty_container_bytes;
+        census.record_arc_allocation(
+            Arc::clone(state),
+            "analyzer.generation_state",
+            PERSISTENT,
+            "analyzer_runtime_state_partial_capacity",
+            bytes as u64,
+            OUTSIDE,
+        );
+        census.record_unknown(
+            "analyzer.generation_state",
+            PERSISTENT,
+            UnknownKind::Coverage,
+            "runtime_maps_claim_relations_and_dirty_metadata_heap_not_fully_traversed",
+        );
+        file_states(dirty, census, "analyzer.dirty_file_states");
+        file_states(
+            state
+                .seeded_file_states
+                .iter()
+                .map(|(_, state)| Arc::clone(state))
+                .collect(),
+            census,
+            "analyzer.seeded_file_states",
+        );
+        byte_store(
+            &analyzer.prepared_syntax_store,
+            census,
+            "analyzer.prepared_syntax_store",
+        );
+        census.record_unknown(
+            "analyzer.prepared_syntax_store",
+            PERSISTENT,
+            UnknownKind::NativeBytes,
+            "tree_sitter_tree_and_preprocessor_native_payload_unavailable",
+        );
+        byte_store(
+            &analyzer.import_info_store,
+            census,
+            "analyzer.import_info_store",
+        );
+        byte_store(
+            &analyzer.type_alias_store,
+            census,
+            "analyzer.type_alias_store",
+        );
+        byte_store(
+            &analyzer.enclosing_code_unit_store,
+            census,
+            "analyzer.enclosing_code_unit_store",
+        );
+        for family in [
+            "analyzer.language_memos",
+            "analyzer.indexed_live_snapshot",
+            "analyzer.tier_access_counts",
+            "analyzer.already_budgeted_regions",
+        ] {
+            census.record_unknown(
+                family,
+                PERSISTENT,
+                UnknownKind::Coverage,
+                "retained_root_has_no_structural_payload_visitor",
+            );
+        }
+        census.record_unknown(
+            "analyzer.query_read_state",
+            FamilyLifetime::RequestOnly,
+            UnknownKind::Coverage,
+            "query_file_states_and_broad_request_snapshots_are_operation_scoped",
+        );
+        census.record_unknown(
+            "analyzer.prepared_dispatch_provider",
+            FamilyLifetime::ProviderOnly,
+            UnknownKind::ActivePins,
+            "external_retained_provider_roots_are_not_enumerable_from_workspace",
+        );
+    }
+}
+
 impl<A> crate::analyzer::IAnalyzer for TreeSitterAnalyzer<A>
 where
     A: LanguageAdapter,
 {
+    #[cfg(feature = "test-support")]
+    fn retention_census_for_test(
+        &self,
+        census: &mut brokk_bifrost_core::retention_census::RetentionCensus,
+    ) {
+        retention_census_support::analyzer(self, census);
+    }
+
     fn declaration_candidates_for_question(
         &self,
         file: &ProjectFile,
@@ -21264,6 +23404,7 @@ where
                 brokk_bifrost_core::analyzer::memo_attribution::ReadChannels {
                     execution_dependences: usize::from(execution_dependent),
                     reuse_refused: reads.reuse_refused(),
+                    store_failed: reads.store_failed(),
                     ..Default::default()
                 },
             );
@@ -21298,48 +23439,45 @@ where
             .statement_assessments_by_procedure
             .acquire(&key, cancellation.unwrap_or(&no_cancellation));
         let permit = match acquisition {
-            BudgetedValueAcquisition::Cached { value } => return Arc::clone(value.arc()),
+            BudgetedValueAcquisition::Cached { value } => {
+                if let Some(reads) = &value.1 {
+                    crate::analyzer::i_analyzer::replay_query_reads(self, reads);
+                }
+                return Arc::clone(value.arc());
+            }
             BudgetedValueAcquisition::Leader { permit } => Some(permit),
             BudgetedValueAcquisition::Rejected | BudgetedValueAcquisition::Cancelled => None,
         };
         let ((value, completion), reads) =
-            crate::analyzer::i_analyzer::capture_query_reads(self, || {
+            crate::analyzer::i_analyzer::capture_query_reads_judged(self, || {
                 let scope = crate::analyzer::AnalyzerQueryScope::new(self);
-                (
+                let (value, reuse) =
                     crate::analyzer::semantic::statement_entries::build_statement_assessments(
                         workspace,
                         procedure,
                         cancellation,
-                    ),
-                    scope.read_completion(),
-                )
+                    );
+                ((value, scope.read_completion()), reuse)
             });
-        let execution_reason = value
-            .reason
-            .into_iter()
-            .chain(value.rows.iter().filter_map(|row| match row.verdict {
-                crate::analyzer::semantic::StatementVerdict::Open(reason) => Some(reason),
-                _ => None,
-            }))
-            .any(|reason| {
-                crate::analyzer::read_ledger::DerivationExecutionCause::from_reason(reason)
-                    .is_some()
+        let execution_reason = value.execution_cause.is_some()
+            || value.rows.iter().any(|row| match row.verdict {
+                crate::analyzer::semantic::StatementVerdict::Open(reason) => {
+                    crate::analyzer::read_ledger::DerivationExecutionCause::from_reason(reason)
+                        .is_some()
+                }
+                _ => false,
             });
         if let Err(reason) = completion {
             if let Some(permit) = permit {
                 permit.publish_rejected();
             }
             if reason.is_execution_dependent() {
-                self.mark_execution_dependent();
+                crate::analyzer::i_analyzer::join_execution_dependence(self);
             }
             self.record_query_incomplete(reason.clone());
             return Arc::new(Accounted::uncharged(
-                crate::analyzer::semantic::statement_entries::AccountedStatementAssessments(
-                    crate::analyzer::semantic::StatementAssessments {
-                        rows: Vec::new(),
-                        complete: false,
-                        reason: Some(derivation_reason::QUERY_INCOMPLETE),
-                    },
+                crate::analyzer::semantic::statement_entries::AccountedStatementAssessments::new(
+                    crate::analyzer::semantic::statement_entries::incomplete_read(&reason),
                 ),
             ));
         }
@@ -21433,23 +23571,13 @@ where
     }
 
     fn source_file_inventory(&self) -> crate::analyzer::QueryBatch<ProjectFile> {
-        let mut inventory = crate::analyzer::i_analyzer::project_source_file_inventory(self);
-        let live = self.live_snapshot();
-        for file in live.all_paths() {
-            inventory.inspected = inventory.inspected.saturating_add(1);
-            let Some(file) = self.rebase_live_file_to_project_root(file) else {
-                continue;
-            };
-            if self.adapter_owns_file(&file, &live)
-                && (!inventory.complete || file.has_unclaimed_extension())
-                && (file.exists() || self.project.has_overlay(&file))
-            {
-                inventory.rows.push(file);
-            }
-        }
-        inventory.rows.sort();
-        inventory.rows.dedup();
-        inventory
+        let languages = self.languages();
+        self.source_file_inventory_where(|omission| {
+            crate::analyzer::languages::omission_hides_workspace_source(
+                languages.iter().copied(),
+                omission,
+            )
+        })
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -21546,6 +23674,7 @@ where
     }
 
     fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
+        context.bind_workspace_snapshots(&self.relational_workspace_snapshots);
         if let Some(error) = self.state.workspace_package_inventory_error.clone() {
             context.record_store_error(error);
         }
@@ -21584,6 +23713,10 @@ where
             self.live_source_snapshot.store(None);
             self.query_file_state_snapshot.store(None);
         }
+    }
+
+    fn supports_selected_read_recording(&self) -> bool {
+        true
     }
 
     fn record_read(&self, key: crate::analyzer::read_ledger::ReadKey) {
@@ -21656,6 +23789,23 @@ where
         );
     }
 
+    fn join_reuse_verdict(
+        &self,
+        verdict: brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict,
+    ) {
+        crate::analyzer::i_analyzer::record_reuse_verdict(
+            verdict,
+            || IAnalyzer::read_ledger_attached(self),
+            || {
+                self.query_read_cache
+                    .read()
+                    .expect("query read cache poisoned")
+                    .contexts
+                    .clone()
+            },
+        );
+    }
+
     fn record_budget_dependences(&self, count: usize) {
         crate::analyzer::i_analyzer::record_budget_dependence(
             count,
@@ -21704,6 +23854,12 @@ where
         TreeSitterAnalyzer::prefetch_definitions(self, fq_names);
     }
 
+    fn active_query_semantic_model_overlay_read(
+        &self,
+    ) -> Option<crate::analyzer::semantic_model::runtime::SemanticModelOverlayRead> {
+        TreeSitterAnalyzer::active_query_semantic_model_overlay_read(self)
+    }
+
     fn active_query_semantic_model_overlay(
         &self,
     ) -> Option<Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>> {
@@ -21728,12 +23884,18 @@ where
         self.query_read_cache_lock().workspace_file_index_cell()
     }
 
-    fn definition_lookup_memo(&self) -> Option<Arc<crate::analyzer::DefinitionLookupMemo>> {
-        self.active_query_cache_handle(|cache| &cache.definition_lookup)
+    fn workspace_file_inventory_cell(&self) -> Option<crate::analyzer::WorkspaceFileInventoryCell> {
+        self.query_read_cache_lock().workspace_file_inventory_cell()
     }
 
-    fn record_query_failure(&self, error: StoreError) {
-        TreeSitterAnalyzer::record_store_error(self, error);
+    fn owned_lookup_memo(
+        &self,
+    ) -> Option<Arc<crate::analyzer::read_verification::OwnedLookupMemo>> {
+        self.active_query_request_memo()
+    }
+
+    fn definition_lookup_memo(&self) -> Option<Arc<crate::analyzer::DefinitionLookupMemo>> {
+        self.active_query_cache_handle(|cache| &cache.definition_lookup)
     }
 
     fn current_query_read_completion(&self) -> Result<(), QueryReadIncomplete> {
@@ -21775,7 +23937,23 @@ where
         changed_files: &BTreeSet<ProjectFile>,
         listing: Option<&SharedWorkspaceFileListing>,
     ) -> Self {
-        let pending = super::pending_update_paths(changed_files, &self.pending_updates);
+        if self.full_refresh_pending {
+            return match listing {
+                Some(listing) => {
+                    self.update_all_with_membership(None, self.membership_for_listing(listing))
+                }
+                None => self.update_all_with_progress(None),
+            };
+        }
+        let supplied_listing = listing.is_some();
+        if !supplied_listing {
+            self.project.revalidate_symlink_omissions(changed_files);
+        }
+        let pending = if supplied_listing {
+            changed_files.clone()
+        } else {
+            super::pending_update_paths(changed_files, &self.pending_updates)
+        };
         let changed_files = &pending;
         let mut updated = without_project_reads(|| {
             // A failed read cannot show the listing unchanged, so it routes as
@@ -21810,16 +23988,38 @@ where
                     Err(error) => return self.failed_configured_update(error.into()),
                 },
             };
+            // The enclosing workspace resolved the watcher paths against its
+            // refreshed listing before fan-out. Re-resolving here could walk
+            // again and admit files created after that generation's capture.
             let resolved_files =
-                match brokk_bifrost_core::analyzer::project::resolve_update_paths_with_refresh(
-                    self.project.as_ref(),
-                    changed_files,
-                    &mut refreshed_listing,
-                    &|file| Self::workspace_configuration_input(self.adapter.as_ref(), file),
-                ) {
-                    Ok(files) => files,
-                    Err(error) => return self.failed_configured_update(error.into()),
+                if supplied_listing {
+                    changed_files.clone()
+                } else {
+                    match brokk_bifrost_core::analyzer::project::resolve_update_paths_with_refresh(
+                        self.project.as_ref(),
+                        changed_files,
+                        &mut refreshed_listing,
+                        &|file| {
+                            Self::workspace_configuration_input(self.adapter.as_ref(), file)
+                                || self.state.selected_configuration.as_ref().is_some_and(
+                                    |selected| {
+                                        selected.contains_input(
+                                            crate::path_utils::rel_path_string(file).as_str(),
+                                        )
+                                    },
+                                )
+                        },
+                    ) {
+                        Ok(files) => files,
+                        Err(error) => return self.failed_configured_update(error.into()),
+                    }
                 };
+            // A signature file is not a source: its facts are published here
+            // and the rest of the update never sees it.
+            let (signature_changes, resolved_files): (BTreeSet<_>, BTreeSet<_>) = resolved_files
+                .into_iter()
+                .partition(|file| Self::signature_input(self.adapter.as_ref(), file));
+            let membership = self.membership_for_listing(&refreshed_listing);
             let listing = Some(&refreshed_listing);
             let changed_files = &resolved_files;
             let rust_listing_changed = self.adapter.language() == Language::Rust
@@ -21827,20 +24027,81 @@ where
                     listing_read_error = Some(error);
                     true
                 });
-            let listing_withdrawn = listing_may_withdraw_proof(self.project.as_ref(), listing)
-                .unwrap_or_else(|error| {
-                    listing_read_error = Some(error);
-                    true
-                });
+            let listing_withdrawn =
+                listing_may_withdraw_proof(self.project.as_ref(), listing, self.adapter.language())
+                    .unwrap_or_else(|error| {
+                        listing_read_error = Some(error);
+                        true
+                    });
+            // The acquisition a configuration edit republished with, when the
+            // edit leaves the acquired configuration's meaning unchanged.
+            let mut refreshed_acquisition = None;
+            if self.adapter.language() == Language::Rust {
+                let configuration_changed =
+                    self.state
+                        .selected_configuration
+                        .as_ref()
+                        .is_none_or(|selected| {
+                            !selected.rust_cargo_acquisition_complete || !selected.rust_cargo_external_reads.iter().all(
+                            crate::analyzer::semantic_model::ExternalDiscoveryRead::still_matches,
+                        )
+                        });
+                if configuration_changed {
+                    return self.update_all_with_membership(None, Arc::clone(&membership));
+                }
+                // An edited configuration input rebuilds only when what the
+                // acquired configuration means changed. The effective digest
+                // covers every owner fact the update consumes: targets, cfg
+                // atoms, build mode, extern flags, source effect and layer
+                // paths. A manifest or Cargo configuration edit that keeps it,
+                // and keeps its package identity digest below, rekeys nothing.
+                let selected = self
+                    .state
+                    .selected_configuration
+                    .as_ref()
+                    .expect("a missing selected configuration rebuilt above");
+                // A retained input that is neither a native configuration file
+                // nor a package-identity input (a Cargo `include`d file) has no
+                // in-place republication below, so its edit still rebuilds.
+                if changed_files.iter().any(|file| {
+                    !Self::workspace_configuration_input(self.adapter.as_ref(), file)
+                        && selected
+                            .contains_input(crate::path_utils::rel_path_string(file).as_str())
+                }) {
+                    return self.update_all_with_membership(None, Arc::clone(&membership));
+                }
+                if changed_files
+                    .iter()
+                    .any(|file| Self::workspace_configuration_input(self.adapter.as_ref(), file))
+                {
+                    let Ok(inputs) = Self::workspace_configuration_inputs(
+                        self.project.as_ref(),
+                        self.adapter.as_ref(),
+                        None,
+                    ) else {
+                        return self.update_all_with_membership(None, Arc::clone(&membership));
+                    };
+                    let fresh = SelectedConfiguration::from_inputs(&inputs);
+                    if !fresh.rust_cargo_acquisition_complete
+                        || fresh.rust_cargo_effective_digest.is_none()
+                        || fresh.rust_cargo_effective_digest != selected.rust_cargo_effective_digest
+                    {
+                        return self.update_all_with_membership(None, Arc::clone(&membership));
+                    }
+                    refreshed_acquisition =
+                        WorkspaceConfigurationInput::rust_cargo_acquisition(&inputs).cloned();
+                }
+            }
             // Once every proof is withdrawn, a persisting omission has nothing
             // left to withdraw, so an update with no changed file stays a no-op.
             if changed_files.is_empty()
+                && signature_changes.is_empty()
                 && self.state.update_resolution_error.is_none()
                 && !rust_listing_changed
                 && !(listing_withdrawn
                     && crate::analyzer::read_verification::WorkspaceFactIndex::holds_workspace_listing_proof(self))
             {
-                return self.clone();
+                return self.with_generation_membership(membership);
             }
             let snapshots = self.selected_workspace_snapshots();
             let parse_configuration = match snapshots
@@ -21925,7 +24186,7 @@ where
             // main changes package ownership. Rebuild with a fresh configuration
             // capture, just like a created package-identity input below.
             if added_rust_manifest || target_layout_changed {
-                return self.update_all();
+                return self.update_all_with_membership(None, Arc::clone(&membership));
             }
             if parse_configuration.is_some()
                 && changed_files
@@ -21933,7 +24194,7 @@ where
                     .any(|file| Self::workspace_configuration_input(self.adapter.as_ref(), file))
             {
                 return self
-                    .update_configured_sources()
+                    .update_configured_sources(Arc::clone(&membership))
                     .unwrap_or_else(|error| self.failed_configured_update(error));
             }
             // A changed package-identity input rekeys declarations in files it did
@@ -21951,12 +24212,12 @@ where
                     Self::workspace_configuration_input(self.adapter.as_ref(), file);
                 if !self.adapter.workspace_package_identity_input(file) {
                     if configuration {
-                        return self.update_all();
+                        return self.update_all_with_membership(None, Arc::clone(&membership));
                     }
                     continue;
                 }
                 let Ok(source) = std::fs::read(file.abs_path()) else {
-                    return self.update_all();
+                    return self.update_all_with_membership(None, Arc::clone(&membership));
                 };
                 let digest = PackageIdentityInputDigest::new(self.adapter.as_ref(), file, &source);
                 let previous = self
@@ -21966,14 +24227,14 @@ where
                 if digest.identity.is_none()
                     || previous.is_none_or(|previous| previous.identity != digest.identity)
                 {
-                    return self.update_all();
+                    return self.update_all_with_membership(None, Arc::clone(&membership));
                 }
                 identity_inputs.push((file.clone(), digest));
                 if configuration {
                     // A generation that failed to capture configuration has no
                     // baseline row to replace.
                     if self.state.selected_configuration.is_none() {
-                        return self.update_all();
+                        return self.update_all_with_membership(None, Arc::clone(&membership));
                     }
                     configuration_inputs.push(WorkspaceConfigurationInput::new(
                         crate::path_utils::rel_path_string(file),
@@ -21987,6 +24248,7 @@ where
                 .collect::<BTreeSet<_>>();
 
             let mut store_context = self.store_context.clone();
+            store_context.membership = Some(Arc::clone(&membership));
             store_context.live_paths = Arc::new(
                 self.store_context
                     .live_paths
@@ -22103,6 +24365,7 @@ where
             match current_listing_omissions(self.project.as_ref(), listing) {
                 Ok(omissions) => state.workspace_inventory.require_observed_listing(
                     omissions.as_ref().map(|omissions| omissions.as_slice()),
+                    self.adapter.language(),
                 ),
                 Err(error) => state.record_workspace_package_inventory_error(error),
             }
@@ -22115,6 +24378,7 @@ where
             }
             state.workspace_package_identity_input_digests =
                 self.state.workspace_package_identity_input_digests.clone();
+            state.signature_inputs = self.edited_signature_inputs(&signature_changes);
             state.selected_configuration = self.state.selected_configuration.clone();
             state
                 .workspace_package_identity_input_digests
@@ -22168,7 +24432,7 @@ where
                     listing,
                 ) {
                     Ok(failures) => Some((
-                        crate::analyzer::store::RUST_SOURCE_LISTING_DERIVATION_VERSION,
+                        crate::analyzer::store::rust_source_listing_derivation_identity(),
                         failures,
                     )),
                     Err(error) => {
@@ -22214,6 +24478,15 @@ where
                     .iter()
                     .map(|lang| (lang.clone(), store_context.generations[lang]))
                     .collect::<HashMap<_, _>>();
+                let mut input = input;
+                // The republished revision records the acquisition that saw
+                // these exact bytes, so its local input references stay valid.
+                if let Some(view) = &refreshed_acquisition {
+                    WorkspaceConfigurationInput::attach_rust_cargo_acquisition(
+                        std::slice::from_mut(&mut input),
+                        view.clone(),
+                    );
+                }
                 let path = input.relative_path().to_owned();
                 assert!(input.file_present, "only present inputs are republished");
                 let blob = input.content_oid();
@@ -22260,10 +24533,40 @@ where
                 // of its own. Every other update's certificate went with its
                 // last publication.
                 if !publishes && let Some((version, failures)) = rust_listing {
-                    match store_context
-                        .store
-                        .publish_rust_source_listing(&snapshot, version, failures)
+                    // A listing-only revision must not drop or blindly carry its
+                    // acquired Cargo inputs. Reacquire at the existing filesystem
+                    // boundary, including includes and Cargo home. A changed
+                    // capture needs configuration publication before certification.
+                    let captured = match Self::workspace_configuration_inputs(
+                        self.project.as_ref(),
+                        self.adapter.as_ref(),
+                        None,
+                    ) {
+                        Ok(captured) => captured,
+                        Err(error) => return self.failed_configured_update(error.into()),
+                    };
+                    let selected = SelectedConfiguration::from_inputs(&captured);
+                    if self
+                        .state
+                        .selected_configuration
+                        .as_ref()
+                        .is_none_or(|previous| previous.digest != selected.digest)
                     {
+                        return self.update_all_with_membership(None, Arc::clone(&membership));
+                    }
+                    let Some(acquired) =
+                        WorkspaceConfigurationInput::rust_cargo_acquisition(&captured)
+                    else {
+                        return self.failed_configured_update(StoreError::new(
+                            "Rust listing publication requires acquired Cargo configuration",
+                        ));
+                    };
+                    match store_context.store.publish_rust_source_listing(
+                        &snapshot,
+                        version,
+                        failures,
+                        acquired.clone(),
+                    ) {
                         Ok(certified) => {
                             relational_workspace_snapshots.insert("rust".into(), certified.clone());
                             snapshot = certified;
@@ -22308,7 +24611,9 @@ where
                         &changed_paths,
                     ),
                     // No crate rows were reconciled for this workspace before.
-                    None => store_context.store.reconcile_rust_crates(&snapshot),
+                    None => store_context
+                        .store
+                        .reconcile_rust_crates_unless_current(&snapshot),
                 };
                 match reconciled {
                     Ok(report) => {
@@ -22431,6 +24736,13 @@ where
         }
     }
 
+    fn generation_membership(&self) -> &Arc<GenerationWorkspaceMembership> {
+        self.store_context
+            .membership
+            .as_ref()
+            .unwrap_or_else(|| GenerationWorkspaceMembership::unavailable())
+    }
+
     fn snapshot_caches(&self) -> Option<&crate::analyzer::AnalyzerSnapshotCaches> {
         self.snapshot_caches()
             .semantic_models()
@@ -22444,7 +24756,7 @@ where
         Some(
             crate::analyzer::content_identity::WorkspaceContentIdentities::new([(
                 self.adapter.language(),
-                self.language_content_identity(),
+                self.language_content_identity_with_omissions(),
             )]),
         )
     }
@@ -22559,9 +24871,25 @@ where
             .unwrap_or(false)
     }
 
-    fn in_test_region(&self, code_unit: &CodeUnit) -> bool {
-        self.fetch_file_state(code_unit.source())
-            .is_some_and(|state| state.test_region_units.contains(code_unit))
+    fn in_test_region(
+        &self,
+        code_unit: &CodeUnit,
+    ) -> Result<bool, crate::analyzer::QueryReadIncomplete> {
+        let (state, cause) =
+            crate::analyzer::i_analyzer::capture_read_execution_cause(self, || {
+                self.fetch_file_state(code_unit.source())
+            });
+        state
+            .map(|state| state.test_region_units.contains(code_unit))
+            .ok_or_else(|| match cause {
+                Some(cause) => crate::analyzer::QueryReadIncomplete::ProofStopped {
+                    reason: "test_region_source_unavailable",
+                    cause: Some(cause),
+                },
+                None => crate::analyzer::QueryReadIncomplete::StructureUnavailable(
+                    code_unit.source().clone(),
+                ),
+            })
     }
 }
 
@@ -22910,10 +25238,22 @@ impl<A: LanguageAdapter> crate::analyzer::read_verification::WorkspaceFactIndex
     fn package_identity_input_blobs(&self) -> Option<Vec<(ProjectFile, Oid)>> {
         // The generation recorded the digest of the bytes it read, so bytes
         // that differ now are not what the head read.
+        let configuration = self.state.selected_configuration.as_ref()?;
         self.state
             .workspace_package_identity_input_digests
             .iter()
             .filter(|(file, _)| self.adapter.workspace_package_identity_input(file))
+            // A retained absence has no bytes and no blob. Its presence bit
+            // is part of the selected configuration, and the committed-tree
+            // comparison still detects a base file the head no longer reads
+            // through the committed path list. Reading it would report the
+            // whole inventory as unavailable for a file that is correctly
+            // absent.
+            .filter(|(file, _)| {
+                !configuration
+                    .absent_paths
+                    .contains(crate::path_utils::rel_path_string(file).as_str())
+            })
             .map(|(file, retained)| {
                 let bytes = std::fs::read(file.abs_path()).ok()?;
                 if crate::analyzer::canonical_hash::sha256_bytes(&bytes) != retained.content {
@@ -23444,6 +25784,69 @@ mod memo_input_tests {
     use brokk_bifrost_test_macros::hardwon;
 
     #[test]
+    #[hardwon("#11234: request-source cells must use shared admission and replay every hit")]
+    fn request_read_memo_completion_conformance() {
+        use crate::analyzer::usages::common::{
+            QueryMemoOwner, assert_memo_owner_conformance_for_test,
+        };
+        let analyzer = MultiAnalyzer::default();
+        let source = ReadKey::file(
+            Language::Rust,
+            "src/request-source.rs",
+            crate::test_support::synthetic_oid(7),
+            brokk_bifrost_core::gitblob::ParseVariant::Empty,
+        );
+        let configuration = ReadKey::Configuration(
+            crate::analyzer::semantic::ids::StableDigest::sha256(b"request-source-configuration"),
+        );
+        let record_inputs = || {
+            analyzer.record_read(source.clone());
+            analyzer.record_read(configuration.clone());
+        };
+        let (_, inputs) = capture_query_reads(&analyzer, record_inputs);
+        for value in [Some(37usize), None] {
+            assert_memo_owner_conformance_for_test(
+                QueryMemoOwner::RequestRead,
+                &analyzer,
+                crate::analyzer::common::QueryCacheCell::<RequestRead<usize>>::new,
+                |cell| {
+                    let (current, reads) = capture_query_reads(&analyzer, || {
+                        RequestRead::read_cell(&analyzer, cell, || {
+                            record_inputs();
+                            value
+                        })
+                    });
+                    assert_eq!(
+                        reads.keys(),
+                        inputs.keys(),
+                        "every request-source fill and hit replays its inputs"
+                    );
+                    current
+                },
+                |cell| cell.get().is_some(),
+            );
+            let cell = crate::analyzer::common::QueryCacheCell::<RequestRead<usize>>::new();
+            let fills = AtomicUsize::new(0);
+            for _ in 0..2 {
+                let (current, reads) = capture_query_reads(&analyzer, || {
+                    RequestRead::read_cell(&analyzer, &cell, || {
+                        fills.fetch_add(1, Ordering::Relaxed);
+                        record_inputs();
+                        value
+                    })
+                });
+                assert_eq!(current, value);
+                assert_eq!(reads.keys(), inputs.keys());
+            }
+            assert_eq!(
+                fills.load(Ordering::Relaxed),
+                1,
+                "complete absence is cached like a complete value"
+            );
+        }
+    }
+
+    #[test]
     #[hardwon("#10952: statement_assessments_for dropped unattributed reads on a hit")]
     fn statement_assessments_unattributed_fill_is_not_reused() {
         let analyzer = MultiAnalyzer::default();
@@ -23466,6 +25869,7 @@ mod memo_input_tests {
                             rows: Vec::new(),
                             complete: true,
                             reason: None,
+                            execution_cause: None,
                         }
                     });
                     publish_statement_assessments(
@@ -23507,6 +25911,7 @@ mod memo_input_tests {
         let memo = cache.request_memos.get_or_init::<AtomicUsize>();
         let definitions = Arc::clone(&cache.definition_lookup);
         let listing = Arc::clone(&cache.workspace_file_index);
+        let inventory = Arc::clone(&cache.workspace_file_inventory);
         let analyzer = MultiAnalyzer::default();
         let (_, reads) = capture_query_reads(&analyzer, || {
             assert!(Arc::ptr_eq(
@@ -23515,6 +25920,7 @@ mod memo_input_tests {
             ));
             assert!(Arc::ptr_eq(&definitions, &cache.definition_lookup));
             assert!(Arc::ptr_eq(&listing, &cache.workspace_file_index));
+            assert!(Arc::ptr_eq(&inventory, &cache.workspace_file_inventory));
         });
         assert!(reads.keys().is_empty());
     }
@@ -23792,27 +26198,31 @@ impl ProjectReadRegistry {
         Some(Self { queries, attached })
     }
 
-    /// Use the same capture and forwarding machinery as analyzer queries.
-    /// The borrowed registry stays alive through both the action and forwarding,
-    /// including when the action returns an error.
+    /// Use the same capture and forwarding machinery as analyzer queries, for
+    /// a query that returns its reuse verdict. The verdict joins the captured
+    /// ledger before it is forwarded. The borrowed registry stays alive
+    /// through both the action and forwarding, including when the action
+    /// returns an error.
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn capture<T>(
+    pub(crate) fn capture_judged<T>(
         &self,
-        query: impl FnOnce() -> T,
+        query: impl FnOnce() -> (T, crate::analyzer::reuse_verdict::ReuseVerdict),
     ) -> (T, Arc<crate::analyzer::ReadLedger>) {
         let enclosing = crate::analyzer::i_analyzer::current_thread_read_ledger();
-        let (result, reads) = crate::analyzer::i_analyzer::capture_with_read_registration(
-            enclosing.as_ref(),
-            |context| {
-                self.begin_query(&context);
-                ProjectReadRegistration {
-                    queries: Some(Arc::clone(&self.queries)),
-                    attached: Some(Arc::clone(&self.attached)),
-                    context,
-                }
-            },
-            query,
-        );
+        let ((result, verdict), reads) =
+            crate::analyzer::i_analyzer::capture_with_read_registration(
+                enclosing.as_ref(),
+                |context| {
+                    self.begin_query(&context);
+                    ProjectReadRegistration {
+                        queries: Some(Arc::clone(&self.queries)),
+                        attached: Some(Arc::clone(&self.attached)),
+                        context,
+                    }
+                },
+                query,
+            );
+        reads.join_verdict(verdict);
         if let Some(enclosing) = enclosing {
             crate::analyzer::i_analyzer::forward_captured_query_reads(&enclosing, &reads);
         }
@@ -23888,3 +26298,195 @@ mod declaration_candidate_tests;
 
 #[cfg(test)]
 mod build_state_tests;
+
+#[cfg(test)]
+mod candidate_flow_sharing_tests {
+    use super::*;
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10972: review: handle selection deep-copied every procedure's flows"
+    )]
+    fn candidate_handle_preparation_shares_stored_flow_collection() {
+        use crate::analyzer::semantic::{
+            ProcedureId,
+            partial_flow::{PartialFlowOutcome, ProcedurePartialFlows},
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let project =
+            Arc::new(crate::analyzer::FilesystemProject::new(temp.path().to_path_buf()).unwrap());
+        let analyzer = crate::analyzer::workspace::EmptyAnalyzer::new(project);
+        let (_, receipt) = crate::analyzer::i_analyzer::QueryReadReceipt::capture(&analyzer, || ());
+        let evidence = Arc::new(CandidateArenaEvidence {
+            receipt,
+            flows: (0..3)
+                .map(|id| {
+                    (
+                        ProcedureId::new(id),
+                        ProcedurePartialFlows::new(
+                            PartialFlowOutcome::Complete,
+                            Some(format!("procedure {id}")),
+                            vec![],
+                            vec![],
+                            false,
+                            true,
+                            vec![],
+                        ),
+                    )
+                })
+                .collect(),
+        });
+        let erased: Arc<dyn std::any::Any + Send + Sync> = evidence.clone();
+        for _ in 0..3 {
+            let shared = CandidateArenaFlows::from_evidence(&erased);
+            assert_eq!(Arc::strong_count(&evidence), 3);
+            assert!(std::ptr::eq(shared.as_ref(), evidence.flows.as_slice()));
+            for (stored, selected) in evidence.flows.iter().zip(shared.as_ref()) {
+                assert_eq!(
+                    stored.1.detail.as_ref().unwrap().as_ptr(),
+                    selected.1.detail.as_ref().unwrap().as_ptr()
+                );
+            }
+        }
+        assert_eq!(Arc::strong_count(&evidence), 2);
+    }
+}
+
+#[cfg(test)]
+mod produced_unseen_branch_index_tests {
+    use super::*;
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12143: C# unseen-branch obligation rescanned and sorted every produced row on each read"
+    )]
+    fn unseen_branch_selection_touches_one_payload_independent_of_file_count() {
+        use brokk_bifrost_core::gitblob::ParseVariant;
+        for count in [8, 16] {
+            let mut produced = ProducedUnseenBranches::default();
+            let chain = crate::analyzer::store::UndecidedChainRow {
+                chain: 0,
+                directive_start: 0,
+                directive_end: 10,
+                omitted_nonblank: true,
+                invalid_condition: false,
+                unknown_symbols: vec!["UNKNOWN".into()],
+                open_reasons: vec![],
+                disagreeing_owners: vec![],
+            };
+            for n in (0..count).rev() {
+                produced.insert((format!("{n:02}.cs"), [1; 32]), vec![chain.clone()]);
+                produced.insert((format!("{n:02}.cs"), [2; 32]), vec![chain.clone()]);
+            }
+            // Replacement can remove the current first witness, including one
+            // variant while retaining another variant of the same path.
+            produced.insert(("00.cs".into(), [1; 32]), vec![]);
+            let mut legacy = produced.rows.iter().collect::<Vec<_>>();
+            legacy.sort_by_key(|(key, _)| *key);
+            let first = produced.select(None).unwrap();
+            assert_eq!(
+                (&first.rel_path, &first.variant),
+                (&legacy[0].0.0, &legacy[0].0.1)
+            );
+            assert_eq!(&first.chains, legacy[0].1);
+            for ((path, variant), chains) in legacy {
+                let selected = produced
+                    .select(Some((path, ParseVariant::Digest(*variant))))
+                    .unwrap();
+                assert_eq!(&selected.chains, chains);
+            }
+            assert_eq!(produced.touched.load(Ordering::Relaxed), 2 * count);
+            assert!(
+                produced
+                    .select(Some(("00.cs", ParseVariant::Digest([1; 32]))))
+                    .is_none()
+            );
+            for key in produced.rows.keys().cloned().collect::<Vec<_>>() {
+                produced.insert(key, vec![]);
+            }
+            assert!(produced.select(None).is_none());
+            assert!(
+                produced
+                    .select(Some(("01.cs", ParseVariant::Digest([1; 32]))))
+                    .is_none()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod shared_build_listing_tests {
+    use super::*;
+    use brokk_bifrost_core::analyzer::project::FilesystemProject;
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11902: generation membership must survive retention refusal and distinguish missing from empty"
+    )]
+    fn workspace_build_membership_is_required_owner_state() {
+        let budget = brokk_bifrost_core::retention_budget::RetentionBudget::for_test_capacity(0);
+        let record = GenerationWorkspaceMembership::new(
+            Some((Arc::new(BTreeSet::new()), Arc::new(Vec::new()))),
+            &budget,
+        );
+        assert!(record.listing().unwrap().0.is_empty());
+        let bytes = record.accounted_bytes();
+        assert!(bytes > 0);
+        assert_eq!(budget.accounted_bytes(), bytes);
+        let retained = Arc::clone(&record);
+        drop(record);
+        assert_eq!(budget.accounted_bytes(), bytes);
+        drop(retained);
+        assert_eq!(budget.accounted_bytes(), 0);
+        let missing = GenerationWorkspaceMembership::new(None, &budget);
+        assert_eq!(missing.listing().unwrap_err(), GenerationListingUnavailable);
+    }
+
+    #[test]
+    fn workspace_build_membership_repository_accounting() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let project = FilesystemProject::new(root).unwrap();
+        let listing = project.all_files_with_omissions().unwrap();
+        let budget = brokk_bifrost_core::retention_budget::RetentionBudget::for_test_capacity(0);
+        let record = GenerationWorkspaceMembership::new(Some(listing), &budget);
+        let count = record.listing().unwrap().0.len();
+        assert_eq!(budget.accounted_bytes(), record.accounted_bytes());
+        eprintln!(
+            "generation_membership root={} files={} omissions={} bytes={} bytes_per_file={:.2}",
+            root.display(),
+            count,
+            record.listing().unwrap().1.len(),
+            record.accounted_bytes(),
+            record.accounted_bytes() as f64 / count.max(1) as f64
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11902: delegate identity projections could observe different workspace memberships"
+    )]
+    fn workspace_build_projections_share_membership_during_worktree_edits() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("first.rs"), "fn first() {}\n").unwrap();
+        let project = FilesystemProject::new(root.path()).unwrap();
+        let listing = project.all_files_with_omissions().unwrap();
+        let first = WorkspaceBuildSnapshot::from_listing(
+            &project,
+            None,
+            &[Language::Rust],
+            listing.clone(),
+        );
+        std::fs::write(root.path().join("later.go"), "package later\n").unwrap();
+        let second =
+            WorkspaceBuildSnapshot::from_listing(&project, None, &[Language::Go], listing.clone());
+        assert!(Arc::ptr_eq(&first.files, &second.files));
+        assert!(Arc::ptr_eq(&first.omissions, &second.omissions));
+        assert!(Arc::ptr_eq(&first.files, &listing.0));
+        assert_eq!(first.files.len(), 1);
+        assert_eq!(second.files.len(), 1);
+    }
+}

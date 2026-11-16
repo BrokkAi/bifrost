@@ -210,7 +210,56 @@ impl ExecutionInputs<'_, '_> {
                 }
             }
         }
-        for gap in semantics.gaps() {
+        // Render logical obligations in the original owner-major publication
+        // order. Expansion here is bounded by the diagnostic's output size.
+        let mut diagnostic_gaps = Vec::new();
+        let rows = semantics.gaps();
+        let mut cursor = 0;
+        while cursor < rows.len() {
+            let first = &rows[cursor];
+            if !matches!(first.subject, SemanticGapSubject::CleanupOwners(_)) {
+                diagnostic_gaps.extend(semantics.logical_gaps_of(first));
+                cursor += 1;
+                continue;
+            }
+            let start = cursor;
+            while cursor < rows.len()
+                && rows[cursor].point == first.point
+                && rows[cursor].subject == first.subject
+            {
+                cursor += 1;
+            }
+            // The companion exit chunk belongs to this same publication.
+            if first.point != semantics.normal_exit_point()
+                && first.point != semantics.exceptional_exit_point()
+                && let Some(exit) = rows.get(cursor)
+                && (exit.point == semantics.normal_exit_point()
+                    || exit.point == semantics.exceptional_exit_point())
+                && matches!(exit.subject, SemanticGapSubject::CleanupOwners(_))
+            {
+                let point = exit.point;
+                let subject = exit.subject;
+                while cursor < rows.len()
+                    && rows[cursor].point == point
+                    && rows[cursor].subject == subject
+                {
+                    cursor += 1;
+                }
+            }
+            let mut members = rows[start..cursor]
+                .iter()
+                .flat_map(|gap| semantics.logical_gaps_of(gap))
+                .collect::<Vec<_>>();
+            members.sort_by_key(|logical| {
+                (
+                    logical.member.expect("compact row has members").owner,
+                    logical.base.id,
+                )
+            });
+            diagnostic_gaps.extend(members);
+        }
+        for logical in diagnostic_gaps {
+            let gap = logical.base;
             // Partial is an adapter-wide support declaration. The selected
             // body's omitted calls are scoped gaps, including Point gaps for
             // unlowered statement bodies. A retained CallSite's value-only
@@ -224,7 +273,7 @@ impl ExecutionInputs<'_, '_> {
                 reasons.push(format!(
                     "{} at {} ({}): {}",
                     gap.capability.label(),
-                    gap.subject.label(),
+                    logical.subject().label(),
                     gap.kind.label(),
                     gap.detail,
                 ));
@@ -300,7 +349,11 @@ impl ExecutionInputs<'_, '_> {
                     .unit
                     .as_ref()
                     .and_then(|unit| self.analyzer.ranges_of(unit).first().copied()),
-                format!("{} invocation inventory: {reasons:?}", input.name),
+                brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+                    format_args!("{} invocation inventory: {reasons:?}", input.name),
+                    format_args!("{} invocation inventory", input.name),
+                    reasons.iter(),
+                ),
                 if budget_stopped {
                     Incompleteness::Operational(DerivationExecutionCause::Budget)
                 } else {
@@ -315,10 +368,20 @@ impl ExecutionInputs<'_, '_> {
             } else if budget_stopped {
                 InventoryCompleteness::operational(
                     OperationalCause::Budget(compose::BudgetLane::Semantic),
-                    format!("{reasons:?}"),
+                    brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+                        format_args!("{reasons:?}"),
+                        format_args!("invocation inventory is incomplete"),
+                        reasons.iter(),
+                    ),
                 )
             } else {
-                InventoryCompleteness::content(format!("{reasons:?}"))
+                InventoryCompleteness::content(
+                    brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+                        format_args!("{reasons:?}"),
+                        format_args!("invocation inventory is incomplete"),
+                        reasons.iter(),
+                    ),
+                )
             },
         }
     }
@@ -511,10 +574,28 @@ impl ExecutionInputs<'_, '_> {
                 self.diagnostics,
                 &input.file,
                 Some(input.range),
-                format!(
-                    "native invocation: outcome={}, coverage={:?}, residuals={residuals:?}, reasons={:?}",
-                    raw.outcome, raw.coverage, raw.coverage_reasons
-                ),
+                {
+                    let items = residuals
+                        .iter()
+                        .map(|item| item as &dyn std::fmt::Debug)
+                        .chain(
+                            raw.coverage_reasons
+                                .iter()
+                                .map(|item| item as &dyn std::fmt::Debug),
+                        )
+                        .collect::<Vec<_>>();
+                    brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+                        format_args!(
+                            "native invocation: outcome={}, coverage={:?}, residuals={residuals:?}, reasons={:?}",
+                            raw.outcome, raw.coverage, raw.coverage_reasons
+                        ),
+                        format_args!(
+                            "native invocation: outcome={}, coverage={:?}; residuals and reasons",
+                            raw.outcome, raw.coverage
+                        ),
+                        items.iter(),
+                    )
+                },
                 dispatch_incompleteness,
             );
         }
@@ -861,7 +942,7 @@ impl ExecutionInputs<'_, '_> {
             if ast.content() != facts.source_identity() {
                 return None;
             }
-            call_shape_for_call(&facts, &input.file, ast.node_id())
+            call_shape_for_call(&facts, &input.file, ast.node_id(), None)
         } else {
             self.cache
                 .result_member_call_shapes(self.semantic, &input.file, Some(&facts))

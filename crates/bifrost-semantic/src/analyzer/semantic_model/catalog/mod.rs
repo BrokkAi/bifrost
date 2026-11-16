@@ -265,7 +265,14 @@ pub const CATALOG_SCHEMA_VERSION: i64 = db::CURRENT_CATALOG_VERSION;
 // JVM-1: Java class-jar productions record an outer class that cannot be
 // reread, report it, and certify no callable family of its nested classes, so
 // an unchanged jar with such an entry produces different facts.
-pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 89;
+// #5997: Scala source-jar extension methods carry their typed receiver in their
+// member identity and facts, and their extension-clause type parameters are type
+// parameters, so an unchanged source jar produces different member ids.
+// #12189: Scala source-jar object forwarders compare alpha-renamed type
+// parameters by their positions and hash them positionally in their ids, so an
+// unchanged source jar produces a different set of static forwarders and
+// different forwarder ids.
+pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 92;
 pub const SEMANTIC_PACK_CACHE_ROOT_ENV: &str = "BIFROST_SEMANTIC_PACK_CACHE_ROOT";
 
 /// Resolve the generated catalog used when no explicit catalog is configured.
@@ -1128,7 +1135,7 @@ pub const DECODED_MANIFEST_MEMO_BYTES: usize = 32 * 1024 * 1024;
 #[doc(hidden)]
 // 11: validate schema-18 Rust defaults, trait impls and associated projections.
 pub // 12: schema-19 extraction envelopes and implementation conditions.
-const SHARD_VALIDATION_VERSION: u32 = 12;
+const SHARD_VALIDATION_VERSION: u32 = 13;
 
 #[doc(hidden)]
 pub fn decode_limits_digest(limits: &DecodeLimits) -> String {

@@ -66,7 +66,7 @@ use brokk_bifrost_core::analyzer::usages::outcome::GraphUsageOutcome;
 
 use brokk_bifrost_core::analyzer::usages::outcome::union_candidate_usages_with_limit;
 
-use brokk_bifrost_core::analyzer::usages::parsed_tree::parse_tree_sitter_file;
+use brokk_bifrost_core::analyzer::usages::parsed_tree::parse_tree_sitter_source;
 
 use brokk_bifrost_analysis::analyzer::usages::traits::GraphUsageAnalyzer;
 
@@ -92,8 +92,11 @@ use brokk_bifrost_core::analyzer::query_token::QueryToken;
 
 use brokk_bifrost_core::cancellation::CancellationToken;
 
+use brokk_bifrost_core::analyzer::usages::model::UsageAnalysisDiagnostic;
 use brokk_bifrost_core::hash::HashSet;
-use brokk_bifrost_js_ts::graph::resolver::{combine_jsts_usage_indices, target_language};
+use brokk_bifrost_js_ts::graph::resolver::{
+    IndexInventory, combine_jsts_usage_indices, target_language,
+};
 use brokk_bifrost_js_ts::graph::{JsTsHosts, inverted, scan_js_ts_target_usages};
 use brokk_bifrost_js_ts::parse::{js_ts_tree_sitter_language_for_file, tree_sitter_language_for};
 use brokk_bifrost_js_ts::providers::JsTsSource;
@@ -237,6 +240,14 @@ where
         unproven_sites,
         unproven_sites_complete,
         unresolved_relative_imports,
+        // The edges resolve over what the index was given. Name the inventory it
+        // was built under, so the graph reports what it cannot rule out.
+        incomplete_inventory: match &combined_index.inventory {
+            brokk_bifrost_js_ts::graph::resolver::IndexInventory::Complete => None,
+            brokk_bifrost_js_ts::graph::resolver::IndexInventory::Incomplete(reasons) => {
+                Some(reasons.clone())
+            }
+        },
     })
 }
 
@@ -248,7 +259,10 @@ fn prepare_and_scan_jsts_scoped_file<T>(
     scan: impl FnOnce(&ParsedTreeFile, brokk_bifrost_js_ts::graph::inverted::ScopedFilePrep) -> T,
 ) -> Option<T> {
     let parser_language = js_ts_tree_sitter_language_for_file(file, language)?;
-    let parsed = parse_tree_sitter_file(file, ParseSpec::whole(&parser_language))?;
+    let parsed = parse_tree_sitter_source(
+        analyzer.indexed_source(file)?,
+        ParseSpec::whole(&parser_language),
+    )?;
     let file_prep = inverted::prepare_scoped_file(
         prep,
         analyzer,
@@ -262,7 +276,9 @@ fn prepare_and_scan_jsts_scoped_file<T>(
 
 /// Borrow the analyzer-cached [`JsTsUsageIndex`] for `language` off the concrete TS/JS
 /// analyzer behind `analyzer`, building it on first use. `None` when the analyzer does
-/// not expose the matching JS/TS analyzer, or when a cancellation token fires mid-build.
+/// not expose the matching JS/TS analyzer, when a cancellation token fires mid-build,
+/// or when the index was built over an incomplete source inventory: its callers make
+/// absence claims (see `JsTsSource::complete_usage_index`).
 ///
 /// The downcasting half of the pair: framework callers that hold only a
 /// `&dyn IAnalyzer` (the definition trace, the dead-code pass, the edge builders)
@@ -273,7 +289,32 @@ pub(crate) fn cached_jsts_index(
     language: Language,
     cancellation: Option<&CancellationToken>,
 ) -> Option<Arc<JsTsUsageIndex>> {
-    resolve_js_ts_source(analyzer, language)?.usage_index(cancellation)
+    resolve_js_ts_source(analyzer, language)?.complete_usage_index(cancellation)
+}
+
+/// The incomplete-inventory causes in plain terms: each omitted path and why.
+/// A project that lists only a subset of its workspace states the single row
+/// `"" Unknown`.
+fn describe_incomplete_inventory(
+    reasons: &[brokk_bifrost_core::analyzer::query_batch::QueryIncompleteReason],
+) -> String {
+    if reasons.is_empty() {
+        return "no cause was recorded".to_string();
+    }
+    reasons
+        .iter()
+        .map(|reason| {
+            let brokk_bifrost_core::analyzer::query_batch::QueryIncompleteReason::WorkspaceFileOmission(
+                omission,
+            ) = reason;
+            format!(
+                "{:?} {:?}",
+                brokk_bifrost_core::path_utils::workspace_relative_slash_path(&omission.path),
+                omission.reason
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// JS/TS resolves usages off the project file set rather than a single concrete
@@ -314,7 +355,7 @@ fn plan_js_ts_usage_candidates(
         }
         let language = target_language(target);
         let host = resolve_js_ts_source(analyzer, language)?;
-        let index = host.usage_index(Some(cancellation))?;
+        let index = host.complete_usage_index(Some(cancellation))?;
         candidate_files.extend(js_ts_target_candidate_files(
             host, analyzer, &index, target, language,
         ));
@@ -363,6 +404,9 @@ impl<'a> UsageQueryResolver<'a> for JsTsQueryResolver {
                         )
                         .diagnostic(target.fq_name(), JS_TS_STRATEGY));
                     };
+                    // The usage graph is where #2744's defect lives: a graph over an
+                    // incomplete inventory proves no absence, so graph construction
+                    // refuses it. The index itself builds and resolves positively.
                     let Some(index) = host.usage_index(cancellation) else {
                         if cancellation.is_some_and(CancellationToken::is_cancelled) {
                             // The scan stopped mid-flight; the group keeps whatever
@@ -374,6 +418,13 @@ impl<'a> UsageQueryResolver<'a> for JsTsQueryResolver {
                         )
                         .diagnostic(target.fq_name(), JS_TS_STRATEGY));
                     };
+                    if let IndexInventory::Incomplete(reasons) = &index.inventory {
+                        return Err(UsageAnalysisDiagnostic::source_inventory_incomplete(
+                            target.fq_name(),
+                            JS_TS_STRATEGY,
+                            &describe_incomplete_inventory(reasons),
+                        ));
+                    }
                     hosts.push((language, host, index));
                 }
                 let (_, host, index) = hosts

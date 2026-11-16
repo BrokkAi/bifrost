@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::io;
 
 use brokk_bifrost_core::cancellation::CancellationToken;
+use brokk_bifrost_core::path_utils::rel_path_string;
 
 use crate::analyzer::declaration_range::code_unit_declaration_name_range;
 use crate::analyzer::structural::reference_edges::{
@@ -17,6 +18,31 @@ use crate::analyzer::{CodeUnit, IAnalyzer, Project, ProjectFile, Range};
 use brokk_bifrost_core::analyzer::usages::model::UsageProof;
 
 use super::{RenameEdit, RenameFileEdits, RenameResult};
+
+/// Render incomplete native reference evidence without exposing process-local
+/// identities or absolute workspace paths.
+pub fn describe_incomplete_inventory(result: &EdgeDerivationResult) -> String {
+    let reasons = match &result.completeness {
+        EdgeCompleteness::Complete => "none".to_owned(),
+        EdgeCompleteness::Incomplete { reasons } => format!("{reasons:?}"),
+    };
+    let mut edges: Vec<_> = result
+        .edges
+        .iter()
+        .map(|edge| {
+            format!(
+                "{}:{}..{} -> {} ({:?})",
+                rel_path_string(&edge.site.file),
+                edge.site.range.start_byte,
+                edge.site.range.end_byte,
+                edge.target.fq_name(),
+                edge.proof
+            )
+        })
+        .collect();
+    edges.sort();
+    format!("reasons: {reasons}; references: [{}]", edges.join(", "))
+}
 
 pub struct RenameAssemblyLimits {
     pub max_usages: usize,

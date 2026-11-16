@@ -782,7 +782,9 @@ pub fn project_modeled_call_target_lookup(
                     DefinitionLookupStatus::Resolved | DefinitionLookupStatus::Ambiguous => {
                         potentially_modeled_residual = true;
                     }
-                    DefinitionLookupStatus::NoDefinition | DefinitionLookupStatus::NotFound => {
+                    DefinitionLookupStatus::NotAReference
+                    | DefinitionLookupStatus::NoDefinition
+                    | DefinitionLookupStatus::NotFound => {
                         potentially_modeled_residual = true;
                     }
                     DefinitionLookupStatus::Unavailable | DefinitionLookupStatus::Incomplete
@@ -1231,6 +1233,10 @@ pub struct ProcedureEffectBudget {
     /// component in reverse topological order; the bound exists so a
     /// pathological input cannot spin.
     pub max_iterations: usize,
+    /// How many receiver-class contexts one procedure may be specialized for
+    /// when callers discharge its parameter-receiver calls (#12968). An edge
+    /// past the bound is not specialized and its caller reports the bound.
+    pub max_receiver_contexts_per_procedure: usize,
 }
 
 impl Default for ProcedureEffectBudget {
@@ -1242,6 +1248,7 @@ impl Default for ProcedureEffectBudget {
             max_effects_per_procedure: 64,
             max_witness_steps: 16,
             max_iterations: 64,
+            max_receiver_contexts_per_procedure: 4,
         }
     }
 }
@@ -1475,6 +1482,14 @@ pub struct ProcedureEffectWork {
 pub struct ProcedureEffectSummary {
     pub reports: Vec<ProcedureEffectReport>,
     pub work: ProcedureEffectWork,
+    /// The per-procedure effect limits this summary refused.
+    pub reuse: crate::analyzer::reuse_verdict::ReuseVerdict,
+}
+
+impl crate::analyzer::reuse_verdict::CarriesReuseVerdict for ProcedureEffectSummary {
+    fn reuse_verdict(&self) -> crate::analyzer::reuse_verdict::ReuseVerdict {
+        self.reuse
+    }
 }
 
 /// Run the bounded deterministic fixpoint and project one report per procedure.
@@ -1555,6 +1570,7 @@ pub fn summarize_procedure_effects(
         .collect();
 
     let mut effect_budget_exhausted = vec![false; node_count];
+    let mut reuse = crate::analyzer::reuse_verdict::ReuseVerdict::Content;
     let mut depth_exhausted = vec![false; node_count];
     let mut sweeps = 0usize;
     let mut unconverged = false;
@@ -1617,7 +1633,8 @@ pub fn summarize_procedure_effects(
                                 changed |= existing.merge(candidate);
                             }
                             None => {
-                                if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(effects[node].len(), budget.max_effects_per_procedure).allows(1) {
+                                if let Err(refused) = brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(effects[node].len(), budget.max_effects_per_procedure).try_allow(1) {
+                                    reuse.join_in(crate::analyzer::reuse_verdict::CarriesReuseVerdict::reuse_verdict(&refused));
                                     effect_budget_exhausted[node] = true;
                                     continue;
                                 }
@@ -1719,7 +1736,11 @@ pub fn summarize_procedure_effects(
             report
         })
         .collect();
-    ProcedureEffectSummary { reports, work }
+    ProcedureEffectSummary {
+        reports,
+        work,
+        reuse,
+    }
 }
 
 /// Render one procedure's attributed effects, including a terminal row when

@@ -70,6 +70,7 @@ pub(super) fn validate_rql_query(
             RqlForm::Union
                 | RqlForm::Intersect
                 | RqlForm::Except
+                | RqlForm::CallReachability
                 | RqlForm::Correlate
                 | RqlForm::RequireBoth
         ) && !plan_budget.enter(depth, expr.range.clone(), analysis)
@@ -148,6 +149,62 @@ fn validate_wrapper(
     depth: usize,
     plan_budget: &mut SourcePlanBudget,
 ) {
+    if form == RqlForm::CallReachability {
+        let operator_path = child_path(path, "call_reachability");
+        analysis.path(&operator_path, head_range.clone());
+        if !args.len().is_multiple_of(2) {
+            analysis.error(
+                head_range.clone(),
+                "wrong-value-shape",
+                "call-reachability expects option/value pairs",
+            );
+            return;
+        }
+        let mut seen = HashSet::new();
+        for pair in args.as_chunks::<2>().0 {
+            let Some(field) = pair[0]
+                .as_symbol()
+                .and_then(schema::call_reachability_field_for_rql_label)
+            else {
+                analysis.error(
+                    pair[0].range.clone(),
+                    "unknown-property",
+                    "unknown call-reachability option",
+                );
+                continue;
+            };
+            if !seen.insert(field) {
+                analysis.error(
+                    pair[0].range.clone(),
+                    "duplicate-property",
+                    "duplicate call-reachability option",
+                );
+                continue;
+            }
+            analysis.add_help(
+                pair[0].range.clone(),
+                field.signature(),
+                field.description(),
+            );
+            let field_path = child_path(&operator_path, field.label());
+            match field {
+                schema::CallReachabilityField::Sources | schema::CallReachabilityField::Sinks => {
+                    validate_rql_query(&pair[1], &field_path, analysis, depth + 1, plan_budget)
+                }
+                schema::CallReachabilityField::Depth => {
+                    analysis.path(field_path, pair[1].range.clone());
+                    if !pair[1].as_number().is_some_and(|depth| depth > 0) {
+                        analysis.error(
+                            pair[1].range.clone(),
+                            "wrong-value-shape",
+                            "depth must be a positive integer",
+                        );
+                    }
+                }
+            }
+        }
+        return;
+    }
     if matches!(form, RqlForm::Explain | RqlForm::Profile) {
         let mode_path = child_path(path, "execution_mode");
         analysis.path(&mode_path, head_range.clone());
@@ -300,7 +357,7 @@ fn validate_wrapper(
                 );
             }
         }
-        RqlForm::Correlate | RqlForm::RequireBoth => {
+        RqlForm::CallReachability | RqlForm::Correlate | RqlForm::RequireBoth => {
             unreachable!("cross-domain operators are handled as sources")
         }
         RqlForm::Filter | RqlForm::Project => {
@@ -3528,6 +3585,7 @@ fn validate_property_value(
         | super::schema::ValueShape::ConfigurationCompletenessList
         | super::schema::ValueShape::DependencyEvidenceFilter
         | super::schema::ValueShape::ConfigurationFactsFilter
+        | super::schema::ValueShape::CallReachability
         | super::schema::ValueShape::CrossDomainCorrelation
         | super::schema::ValueShape::CrossDomainRequirement
         | super::schema::ValueShape::CrossDomainRelation

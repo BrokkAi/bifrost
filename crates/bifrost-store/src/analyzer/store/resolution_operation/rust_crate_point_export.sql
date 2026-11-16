@@ -9,6 +9,14 @@
 -- declaration id in the invoking file, which the caller maps to the item's
 -- request-scoped capsule definition. Its visibility predicate is the same one
 -- the persisted arm applies.
+--
+-- The seventh column is the gap row of the exporting module when this
+-- selection unplaced it (`rust_selected_module_placements_fill.sql`), else NULL.
+-- The persisted exports of such a module are still true facts about its file,
+-- but the selected root no longer mounts the file, so the caller owes an
+-- incomplete answer instead of a resolved one. A scalar column costs no
+-- statement, and the selection's own gap rows are the only source, so a
+-- connection without an overlay returns NULL.
 , changed_sources AS (
  -- The module's own files are reached by the summary placement key. A macro
  -- lookup at the crate root additionally considers every member placement.
@@ -17,7 +25,7 @@
         mount.blob_id AS selected_blob, mount.mount_ordinal
  FROM targets
  CROSS JOIN selected_rust_unit_summaries AS unit ON unit.topology_id=targets.topology_id
- CROSS JOIN main.rust_unit_summary_placements AS source
+ CROSS JOIN temp.rust_unit_summary_placements AS source
   ON source.summary_id=unit.summary_id AND source.module_path=targets.module_path
  CROSS JOIN main.resolution_unit_summary_members AS member
   ON member.summary_id=source.summary_id AND member.member_ordinal=source.member_ordinal
@@ -30,7 +38,7 @@
         mount.blob_id AS selected_blob, mount.mount_ordinal
  FROM targets
  CROSS JOIN selected_rust_unit_summaries AS unit ON unit.topology_id=targets.topology_id
- CROSS JOIN main.rust_unit_summary_placements AS source
+ CROSS JOIN temp.rust_unit_summary_placements AS source
   ON source.summary_id=unit.summary_id
  CROSS JOIN main.resolution_unit_summary_members AS member
   ON member.summary_id=source.summary_id AND member.member_ordinal=source.member_ordinal
@@ -39,7 +47,7 @@
  WHERE ?3='macro' AND targets.module_path='crate' AND mount.blob_id<>member.blob_id
 ), selected_exports AS (
  SELECT source.selected_blob, source.mount_ordinal, authority.source_site, source.topology_id,
-        source.module_path,
+        source.summary_id, source.module_path,
         CASE WHEN properties.macro_exported=1 OR source.enum_scope_node_key IS NOT NULL
              THEN 'public' ELSE properties.visibility END AS visibility,
         cr_restriction(properties.visibility,source.module_path,
@@ -78,7 +86,10 @@
   AND cr_cfg(properties.cfg_condition,json(owner.cfg_atoms))=1
 )
 SELECT DISTINCT member.blob_id, exports.declaration_site, unit.topology_id,
-       exports.module_path, mount.mount_ordinal, NULL
+       exports.module_path, mount.mount_ordinal, NULL,
+       (SELECT json(gap.detail) FROM temp.selected_rust_unplaced_gaps AS gap
+        WHERE gap.summary_id=unit.summary_id AND gap.gap_kind='unplaced_module'
+          AND gap.subject=exports.module_path LIMIT 1)
 FROM targets
 CROSS JOIN selected_rust_unit_summaries AS unit ON unit.topology_id=targets.topology_id
 CROSS JOIN main.rust_resolution_unit_summary_exports AS exports
@@ -90,11 +101,30 @@ AND member.member_ordinal=exports.declaration_member_ordinal
 CROSS JOIN temp.selected_resolution_mounts AS mount
  ON mount.storage_language='rust' AND mount.persisted_relative_path=member.rel_path
 AND mount.blob_id=member.blob_id
+LEFT JOIN main.resolution_unit_summary_exports AS shared_export
+ INDEXED BY resolution_unit_summary_exports_surface_lookup
+ ON shared_export.summary_id=unit.summary_id
+AND shared_export.declaration_member_ordinal=(
+ SELECT min(shared_member.member_ordinal)
+ FROM main.resolution_unit_summary_members AS shared_member
+ WHERE shared_member.summary_id=member.summary_id
+   AND shared_member.blob_id=member.blob_id)
+AND shared_export.site_surface_ordinal=(
+ SELECT site.surface_ordinal FROM temp.surface_dense AS site
+ WHERE site.blob_id=mount.blob_id AND site.id_space=0
+   AND site.dense_id=exports.declaration_site)
+AND shared_export.identity_id=exports.identity_id
+AND shared_export.namespace=exports.namespace
+AND shared_export.target_kind='own'
 WHERE exports.origin='declaration' AND (exports.visibility='public' OR (targets.topology_id=?5 AND (exports.visibility='crate' OR (exports.visibility='private' AND (?6=exports.module_path OR substr(?6,1,length(exports.module_path)+2)=exports.module_path || '::')) OR (exports.visibility='restricted' AND (?6=exports.restricted_module_path OR substr(?6,1,length(exports.restricted_module_path)+2)=exports.restricted_module_path || '::')))))
+AND (exports.visibility<>'public' OR shared_export.identity_id IS NOT NULL)
 
 UNION
 SELECT member.blob_id, NULL, unit.topology_id, item.module_path,
-       mount.mount_ordinal, item.declaration_id
+       mount.mount_ordinal, item.declaration_id,
+       (SELECT json(gap.detail) FROM temp.selected_rust_unplaced_gaps AS gap
+        WHERE gap.summary_id=unit.summary_id AND gap.gap_kind='unplaced_module'
+          AND gap.subject=item.module_path LIMIT 1)
 FROM targets
 CROSS JOIN selected_rust_unit_summaries AS unit ON unit.topology_id=targets.topology_id
 CROSS JOIN main.rust_resolution_unit_summary_generated_names AS item
@@ -107,7 +137,10 @@ CROSS JOIN temp.selected_resolution_mounts AS mount
 AND mount.blob_id=member.blob_id
 WHERE item.visibility='public' OR (targets.topology_id=?5 AND (item.visibility='crate' OR (item.visibility='private' AND (?6=item.module_path OR substr(?6,1,length(item.module_path)+2)=item.module_path || '::')) OR (item.visibility='restricted' AND (?6=item.restricted_module_path OR substr(?6,1,length(item.restricted_module_path)+2)=item.restricted_module_path || '::'))))
 UNION
-SELECT selected_blob,source_site,topology_id,module_path,mount_ordinal,NULL FROM selected_exports AS exports
+SELECT selected_blob,source_site,topology_id,module_path,mount_ordinal,NULL,
+       (SELECT json(gap.detail) FROM temp.selected_rust_unplaced_gaps AS gap
+        WHERE gap.summary_id=exports.summary_id AND gap.gap_kind='unplaced_module'
+          AND gap.subject=exports.module_path LIMIT 1) FROM selected_exports AS exports
 WHERE cr_visibility(exports.visibility)='public'
  OR (exports.topology_id=?5 AND (
   cr_visibility(exports.visibility)='crate'

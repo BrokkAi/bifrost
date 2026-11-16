@@ -39,7 +39,7 @@ mod rust_departing_tests_tests {
         let call_id = brokk_bifrost_analysis::analyzer::usages::test_support::call_node_id(
             source, &facts, call,
         );
-        call_shape_for_call(&facts, &file, call_id).expect("exact Rust call shape")
+        call_shape_for_call(&facts, &file, call_id, None).expect("exact Rust call shape")
     }
 
     #[test]

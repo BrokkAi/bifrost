@@ -470,8 +470,13 @@ pub fn generate_jdk_summaries(
                 );
                 if !method.has_receiver
                     && entry.transfers.iter().any(|transfer| {
-                        matches!(transfer.input, AuthoredSummaryInput::Receiver {})
-                            || matches!(transfer.output, AuthoredSummaryOutput::Receiver {})
+                        matches!(
+                            transfer.input,
+                            AuthoredSummaryInput::Receiver { path: None }
+                        ) || matches!(
+                            transfer.output,
+                            AuthoredSummaryOutput::Receiver { path: None }
+                        )
                     })
                 {
                     row_skip_reasons.insert("receiver_on_static_method".to_owned());

@@ -11,7 +11,8 @@ use crate::analyzer::store::{
 };
 use rusqlite::types::Value;
 
-pub const PLACEMENT_SQL: &str = "SELECT compilation.compilation_id, compilation.project_path
+pub const PLACEMENT_SQL: &str =
+    "SELECT compilation.compilation_id, compilation.project_path, compilation.target_framework
     FROM csharp_compilations AS compilation
     JOIN csharp_compilation_selections AS selected ON selected.set_id = compilation.set_id
     JOIN temp.selected_workspace_revisions AS revision
@@ -26,6 +27,7 @@ pub const ACCESS_UNKNOWN: &str = "csharp-compilation-access-unknown";
 pub struct CSharpUnitPlacement {
     pub compilation_id: i64,
     pub project_path: Option<String>,
+    pub target_framework: Option<String>,
     key: PlacementKey,
 }
 
@@ -43,7 +45,7 @@ impl<'a, 'selection> CSharpUnitReader<'a, 'selection> {
     pub fn new(
         selection: &'a SelectedResolutionMountInventory<'selection>,
         snapshot: &'a WorkspaceSnapshotId,
-        certified: &CertifiedCSharpHandle,
+        certified: &CertifiedCSharpHandle<'_>,
         identities: &'a SelectedContextIdentities,
     ) -> Result<Self> {
         Ok(Self {
@@ -137,6 +139,7 @@ impl<'a, 'selection> CSharpUnitReader<'a, 'selection> {
                         Ok(CSharpUnitPlacement {
                             compilation_id: row.get(0)?,
                             project_path: row.get(1)?,
+                            target_framework: row.get(2)?,
                             key,
                         })
                     },
@@ -236,8 +239,12 @@ impl CSharpAccessRules<'_> {
         );
         let mut hash = CanonicalHasher::new(b"bifrost-csharp-compilation-access-unknown:v1");
         hash.field("evidence", evidence.as_bytes());
-        self.identities
-            .named_semantic(hash.finish(), ACCESS_UNKNOWN, &evidence)
+        self.identities.named_semantic(
+            hash.finish(),
+            ACCESS_UNKNOWN,
+            crate::analyzer::resolution::ReasonDeterminism::Unaudited,
+            &evidence,
+        )
     }
 }
 
@@ -324,7 +331,7 @@ pub const SELECTED_GLOBAL_USING_COVERAGE: &str =
  v.publications_installed,json(v.reasons)
  FROM temp.selected_csharp_compilation_using_coverage v
  JOIN main.csharp_compilations c ON c.compilation_id=v.compilation_id
- JOIN main.csharp_compilation_sets s ON s.set_id=c.set_id AND s.derivation_version=?2
+ JOIN main.csharp_compilation_sets s ON s.set_id=c.set_id AND s.derivation_identity=?2
  WHERE v.compilation_id=?1";
 // The extent holds only installed publications of selected members; the reader
 // checks each row's blob against the selected mount, and coverage proves the
@@ -356,6 +363,7 @@ impl CSharpUnitReader<'_, '_> {
         let placement = CSharpUnitPlacement {
             compilation_id,
             project_path,
+            target_framework: None,
             key: PlacementKey {
                 language: Language::CSharp,
                 unit_digest: [0; 32],
@@ -386,7 +394,7 @@ impl CSharpUnitReader<'_, '_> {
             .query_row(
                 rusqlite::params![
                     placement.compilation_id,
-                    super::super::csharp_compilation::DERIVATION_VERSION
+                    super::super::csharp_compilation::derivation_identity()
                 ],
                 |row| {
                     Ok((
@@ -486,6 +494,7 @@ impl CSharpUnitReader<'_, '_> {
             let reason = self.identities.named_semantic(
                 hash.finish(),
                 "csharp_compilation_usings_incomplete",
+                crate::analyzer::resolution::ReasonDeterminism::Unaudited,
                 &format!("compilation {:?}: {missing:?}", placement.project_path),
             );
             ResolutionCompletion::incomplete([ResolutionIncompleteReason::UnsupportedSemantic(

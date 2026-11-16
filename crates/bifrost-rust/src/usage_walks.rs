@@ -26,7 +26,7 @@ use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 
 use brokk_bifrost_core::analyzer::capabilities::{
     ImportLookupDependency, ImportResolutionDependencies,
@@ -47,8 +47,8 @@ use crate::cargo_routes::{
     RustUnscopedLibraries,
 };
 use crate::graph_support::{
-    RustPackageFileIndex, rust_module_files_at, rust_relative_module_path,
-    rust_relative_module_segments,
+    RustPackageFileIndex, is_rust_macro_export_declaration, rust_module_files_at,
+    rust_relative_module_path, rust_relative_module_segments,
 };
 use crate::imports::{
     RustImportBindingName, resolve_rust_module_path_with_crate,
@@ -68,6 +68,20 @@ use crate::usage::{
 use crate::usage_queries::{RustImportBinding, RustUsageQueries};
 use brokk_bifrost_core::analyzer::rust_facts::RUST_OCCURRENCE_CODE;
 
+// Opt-in measurement of false-to-true route transitions, without changing routing.
+static PARTIAL_TRANSITIONS: AtomicU64 = AtomicU64::new(0);
+
+fn partial_transition_diagnostics_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let enabled = std::env::var_os("BIFROST_11799_WALK_DIAGNOSTICS").is_some();
+        if enabled {
+            eprintln!("11799 partial_transition/walk=0");
+        }
+        enabled
+    })
+}
+
 /// One module's bindings are asked for by `(file, module)`.
 pub type RustModuleBindingKey = (ProjectFile, ModuleKey);
 type ModuleDeclarations = HashMap<String, Vec<ProjectFile>>;
@@ -85,7 +99,11 @@ impl RetainedBytes for ModuleKey {
 
 impl RetainedBytes for RustSymbolIdentity {
     fn retained_bytes(&self) -> usize {
-        self.name.len() + self.module.weight_bytes() + self.file.retained_bytes()
+        std::mem::size_of::<Self>()
+            + crate::cache::string_bytes(&self.name)
+            + self.module.weight_bytes()
+            - std::mem::size_of::<ModuleKey>()
+            + self.file.allocated_heap_bytes()
     }
 }
 
@@ -369,16 +387,18 @@ where
                         values.push((key.clone(), value));
                         values.extend(also);
                         let bytes = values.iter().fold(
-                            std::mem::size_of_val(values.as_slice()),
+                            std::mem::size_of_val(&values)
+                                + crate::cache::vec_buffer_bytes(&values),
                             |bytes, (key, value)| {
                                 bytes
                                     .saturating_add((self.weigh)(key, value) as usize)
                                     .saturating_add(key.retained_bytes())
+                                    .saturating_sub(std::mem::size_of::<(K, T)>())
                             },
                         );
                         let mut fill =
                             ReplayingMemoEntry::from_parts_weighted(values, filled, bytes);
-                        fill.charge(&self.budget, OpaqueReadReceipt::retained_bytes);
+                        fill.charge_allocated(&self.budget, OpaqueReadReceipt::retained_bytes);
                         let fill = Arc::new(fill);
                         // A fill the budget cannot take stays request-only, and
                         // so do the keys it settled.
@@ -405,6 +425,10 @@ where
             index,
         })
     }
+
+    fn invalidate_all(&self) {
+        self.memo.invalidate_all();
+    }
 }
 
 /// The bounded caches the walks memoize into.
@@ -424,6 +448,7 @@ where
 /// which is the correct invalidation for analyzer-derived state and the same
 /// argument the Milestone 2b Decision Log records for `declaration_facts`.
 pub struct RustWalkCaches {
+    budget: RetentionBudget,
     module_files: ReplayingWalkCache<String, Vec<ProjectFile>>,
     /// Module declarations of one short name, grouped by the module package
     /// each names. The store lookup is keyed on this short name.
@@ -459,6 +484,7 @@ pub struct RustWalkCaches {
 impl RustWalkCaches {
     pub fn new(budget: &RetentionBudget) -> Self {
         Self {
+            budget: budget.clone(),
             module_files: ReplayingWalkCache::new(
                 budget,
                 "rust.walk.module_files",
@@ -531,6 +557,22 @@ impl RustWalkCaches {
         }
     }
 
+    fn invalidate_all(&self) {
+        self.module_files.invalidate_all();
+        self.module_declarations.invalidate_all();
+        self.module_probes.invalidate_all();
+        self.owner_roots.invalidate_all();
+        self.module_domains.invalidate_all();
+        self.alias_routes.invalidate_all();
+        self.forward_import_edges.invalidate_all();
+        self.binding_edges.invalidate_all();
+        self.module_bindings.invalidate_all();
+        self.origin_routes.invalidate_all();
+        self.macro_scope_edges.invalidate_all();
+        self.macro_visible_ranges.invalidate_all();
+        self.include_routes.invalidate_all();
+    }
+
     /// How many times the four-candidate filesystem probe actually ran, for the
     /// memo's regression pin.
     pub fn module_probe_computations(&self) -> u64 {
@@ -583,16 +625,33 @@ impl RustWalkCaches {
     }
 }
 
+/// Request-private caches used after a walk sees a partial route answer.
+/// Dropping the guard clears every region; caller-held values remain charged
+/// until their final holder drops.
+struct RequestWalkCaches {
+    caches: RustWalkCaches,
+}
+
+impl RequestWalkCaches {
+    fn new(owner: &RustWalkCaches) -> Self {
+        Self {
+            caches: RustWalkCaches::new(&owner.budget),
+        }
+    }
+}
+
+impl Drop for RequestWalkCaches {
+    fn drop(&mut self) {
+        self.caches.invalidate_all();
+    }
+}
+
 /// A view that answers the cross-file usage questions by walking, borrowing the
 /// analyzer for its store handle, its Cargo routes, and its bounded caches.
 ///
 /// Cheap to construct: everything expensive is behind a cache on the analyzer,
 /// and the only per-walker state is the cycle bookkeeping the alias recursion
 /// needs.
-/// The budget of one walker's own caches, used after it sees a partial route
-/// answer.
-const PARTIAL_WALK_CACHE_BYTES: u64 = 128 << 20;
-
 pub struct RustUsageWalks<'a> {
     analyzer: &'a dyn RustFactSource,
     /// Proof that the request scope this walker serves is open. The walker is
@@ -609,7 +668,7 @@ pub struct RustUsageWalks<'a> {
     /// so it goes to `partial_caches` and not to the caches that outlive the
     /// request (see `walk_caches`).
     routes_partial: Cell<bool>,
-    partial_caches: std::cell::OnceCell<RustWalkCaches>,
+    partial_caches: std::cell::OnceCell<RequestWalkCaches>,
     /// The packages whose member list came from an answer that may omit
     /// members. An empty list for one of them is unknown, not a proof.
     partial_packages: RefCell<HashSet<String>>,
@@ -718,6 +777,7 @@ fn resolve_with_cycles<K, V, E>(
 ) -> Result<CycleAnswer<K, Arc<Vec<V>>>, E>
 where
     K: Clone + Eq + std::hash::Hash,
+    V: Eq + std::hash::Hash,
 {
     // A nested request is a dependency edge, not a recursive call. Return the
     // value currently known for the dependency and queue it for computation.
@@ -793,11 +853,17 @@ where
             state.current = None;
             state.resolved.insert(next.clone());
             let value = Arc::new(value);
-            let grew = state
+            // A round rebuilds the value from scratch, so the same elements can
+            // come back in another order. Compare the two rounds as sets: equal
+            // sets are an unchanged value for every field, including route
+            // files merged into a binding that was already present.
+            let changed = state
                 .partial
                 .insert(next.clone(), Arc::clone(&value))
-                .is_none_or(|previous| previous.len() != value.len());
-            if grew {
+                .is_none_or(|previous| {
+                    previous.iter().collect::<HashSet<_>>() != value.iter().collect::<HashSet<_>>()
+                });
+            if changed {
                 state.dependents.get(&next).cloned().unwrap_or_default()
             } else {
                 HashSet::default()
@@ -842,7 +908,7 @@ where
 /// worklist in `build_origin_routes` seeded every declaration identity in the
 /// workspace and pushed propagated aliases onto the same queue. Asking one
 /// module what it binds is the same relation read from the other end.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RustModuleBinding {
     pub name: String,
     pub namespace: RustSymbolNamespace,
@@ -889,6 +955,17 @@ impl<'a> RustUsageWalks<'a> {
         Self::with_progress(analyzer, token, Some(keep_going))
     }
 
+    /// Macro identity used by a primitive proof requires strict Main topology.
+    pub fn new_certified_while(
+        analyzer: &'a dyn RustFactSource,
+        token: QueryToken<'a>,
+        keep_going: &'a dyn Fn() -> bool,
+    ) -> Result<Self, RustCargoRouteError> {
+        let mut walks = Self::with_progress(analyzer, token, Some(keep_going))?;
+        walks.files = RustPackageFileIndex::certified(analyzer, token, Some(keep_going));
+        Ok(walks)
+    }
+
     /// A walk starts from the publication currently visible to the caller.
     /// Missing canonical facts are an explicit route error; this constructor
     /// never performs an unbounded parser catch-up inline.
@@ -897,6 +974,7 @@ impl<'a> RustUsageWalks<'a> {
         token: QueryToken<'a>,
         keep_going: Option<&'a dyn Fn() -> bool>,
     ) -> Result<Self, RustCargoRouteError> {
+        partial_transition_diagnostics_enabled();
         let files = RustPackageFileIndex::new(analyzer, token, keep_going);
         Ok(Self {
             analyzer,
@@ -914,6 +992,13 @@ impl<'a> RustUsageWalks<'a> {
             binding_walk: RefCell::new(CycleWalk::default()),
             computations: Cell::new(0),
         })
+    }
+
+    fn observe_partial_transition(&self) {
+        if !self.routes_partial.get() && partial_transition_diagnostics_enabled() {
+            let count = PARTIAL_TRANSITIONS.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+            eprintln!("11799 partial_transition/walk={count}");
+        }
     }
 
     pub fn package_files(&self) -> &RustPackageFileIndex<'a> {
@@ -982,9 +1067,18 @@ impl<'a> RustUsageWalks<'a> {
             }
         };
         if !routes.is_complete() {
+            self.observe_partial_transition();
             self.routes_partial.set(true);
         }
         routes
+    }
+
+    /// Whether every route answer consulted by this walk was complete.
+    /// Callers proving a negative must first ask their subject's routes, then
+    /// check this again after resolution: another consulted route can be partial
+    /// even when the subject has a positive target root (#11527, #12015).
+    pub fn routes_are_complete(&self) -> bool {
+        !self.routes_partial.get()
     }
 
     /// The caches this walker reads and writes. The shared caches outlive the
@@ -994,9 +1088,10 @@ impl<'a> RustUsageWalks<'a> {
     /// walker uses caches of its own, which still memoize within the walk.
     pub(crate) fn walk_caches(&self) -> &RustWalkCaches {
         if self.routes_partial.get() {
-            self.partial_caches.get_or_init(|| {
-                RustWalkCaches::new(&RetentionBudget::new(PARTIAL_WALK_CACHE_BYTES))
-            })
+            &self
+                .partial_caches
+                .get_or_init(|| RequestWalkCaches::new(&self.caches))
+                .caches
         } else {
             &self.caches
         }
@@ -1111,11 +1206,13 @@ impl<'a> RustUsageWalks<'a> {
         {
             Ok(reaching) => {
                 if !reaching.complete {
+                    self.observe_partial_transition();
                     self.routes_partial.set(true);
                 }
                 reaching.value
             }
             Err(_) => {
+                self.observe_partial_transition();
                 self.routes_partial.set(true);
                 Vec::new()
             }
@@ -1162,11 +1259,13 @@ impl<'a> RustUsageWalks<'a> {
         {
             Ok(libraries) => {
                 if !libraries.complete {
+                    self.observe_partial_transition();
                     self.routes_partial.set(true);
                 }
                 libraries
             }
             Err(_) => {
+                self.observe_partial_transition();
                 self.routes_partial.set(true);
                 RustUnscopedLibraries::incomplete(Vec::new())
             }
@@ -1228,6 +1327,7 @@ impl<'a> RustUsageWalks<'a> {
             Ok(answer) if answer.value => true,
             Ok(answer) if answer.complete => false,
             Ok(_) | Err(_) => {
+                self.observe_partial_transition();
                 self.routes_partial.set(true);
                 true
             }
@@ -1288,6 +1388,7 @@ impl<'a> RustUsageWalks<'a> {
     }
 
     fn mark_package_partial(&self, package: &str) {
+        self.observe_partial_transition();
         self.routes_partial.set(true);
         self.partial_packages
             .borrow_mut()
@@ -1352,7 +1453,7 @@ impl<'a> RustUsageWalks<'a> {
     ) -> Walked<Vec<ProjectFile>> {
         self.probed_module_files_for_relative_path(
             file,
-            rust_relative_module_path(file, module_specifier),
+            rust_relative_module_path(self.analyzer.crate_naming_caches(), file, module_specifier),
         )
     }
 
@@ -1364,7 +1465,7 @@ impl<'a> RustUsageWalks<'a> {
     ) -> Walked<Vec<ProjectFile>> {
         self.probed_module_files_for_relative_path(
             file,
-            rust_relative_module_segments(file, segments),
+            rust_relative_module_segments(self.analyzer.crate_naming_caches(), file, segments),
         )
     }
 
@@ -1526,8 +1627,8 @@ impl<'a> RustUsageWalks<'a> {
         };
 
         let mut routes = Vec::new();
+        let probed_files = self.probed_module_files_from_segments(importing_file, segments);
         for resolved_module in &resolved_modules {
-            let probed_files = self.probed_module_files_from_segments(importing_file, segments);
             let files = self.module_candidate_files(resolved_module, &probed_files);
             routes.extend(files.into_iter().map(|file| RustResolvedModuleRoute {
                 target_module: self.queries.module_key_of(&file, resolved_module),
@@ -3462,7 +3563,10 @@ impl<'a> RustUsageWalks<'a> {
                         "Option",
                     )
                 });
-        if !implicit_prelude_enabled {
+        // The standard prelude is selected only when no unindexed
+        // `#[macro_use] extern crate` could export the same name ahead of it.
+        if !implicit_prelude_enabled || !self.unenumerated_macro_use_extern_crates(file)?.is_empty()
+        {
             return Ok(candidates);
         }
         for root in seeds.roots().filter(|root| {
@@ -3506,53 +3610,123 @@ impl<'a> RustUsageWalks<'a> {
         Ok(seeds.resolve_macro_invocation_targets(&candidates))
     }
 
+    /// Every crate-root `#[macro_use] extern crate` binding that reaches `file`,
+    /// with the crate root that holds it. `#[macro_use]` on an extern crate is
+    /// only legal at the crate root, so these are all the bindings that can put
+    /// a crate's macros into `file`'s macro-use prelude.
+    fn macro_use_extern_crate_bindings(
+        &self,
+        file: &ProjectFile,
+    ) -> Result<Vec<(ProjectFile, RustImportBinding)>, RustCargoRouteError> {
+        let mut bindings = Vec::new();
+        for root in self.owner_roots_of(file)?.iter() {
+            let Some(root_module) = self.queries.module_at_byte(root, 0)? else {
+                continue;
+            };
+            bindings.extend(
+                self.queries
+                    .import_bindings_of(root)?
+                    .iter()
+                    .filter(|binding| {
+                        binding.is_extern_crate
+                            && binding.is_macro_use
+                            && !binding.extent.is_local_only()
+                            && binding.importer_module == root_module
+                    })
+                    .map(|binding| (root.clone(), binding.clone())),
+            );
+        }
+        Ok(bindings)
+    }
+
+    /// The crates named by a `#[macro_use] extern crate` that reaches `file`
+    /// and whose macro exports this walk cannot enumerate: no indexed source
+    /// backs the crate (a registry dependency, an unresolved name). Its macros
+    /// are unknown, so it might export a macro that shadows a standard-prelude
+    /// macro of the same name, and a standard identity is not proven while any
+    /// such crate is in scope. `std`, `core` and `alloc` export the standard
+    /// macros themselves. A crate with indexed source is enumerable: its
+    /// `#[macro_export]` macros are found by `macro_use_extern_crate_candidates_named`.
+    pub fn unenumerated_macro_use_extern_crates(
+        &self,
+        file: &ProjectFile,
+    ) -> Result<Vec<String>, RustCargoRouteError> {
+        let mut unenumerated = Vec::new();
+        for (root, binding) in self.macro_use_extern_crate_bindings(file)? {
+            if matches!(binding.path.as_slice(), [name] if matches!(name.as_str(), "std" | "core" | "alloc"))
+            {
+                continue;
+            }
+            if self
+                .resolve_segments(&root, &binding.owner_module, &binding.path)?
+                .is_empty()
+            {
+                unenumerated.push(binding.path.join("::"));
+            }
+        }
+        unenumerated.sort_unstable();
+        unenumerated.dedup();
+        Ok(unenumerated)
+    }
+
     fn macro_use_extern_crate_candidates_named(
         &self,
         file: &ProjectFile,
         name: &str,
     ) -> Result<Vec<RustMacroInvocationCandidate>, RustCargoRouteError> {
         let mut candidates = Vec::new();
-        for root in self.owner_roots_of(file)?.iter() {
-            let Some(root_module) = self.queries.module_at_byte(root, 0)? else {
-                continue;
-            };
-            for binding in self
-                .queries
-                .import_bindings_of(root)?
-                .iter()
-                .filter(|binding| {
-                    binding.is_extern_crate
-                        && binding.is_macro_use
-                        && !binding.extent.is_local_only()
-                        && binding.importer_module == root_module
-                })
-            {
-                for route in self.resolve_segments(root, &binding.owner_module, &binding.path)? {
-                    let module_files = [route.target_file];
-                    for (target_file, target_name) in
-                        self.export_targets_from_files(self.analyzer, &module_files, name)?
+        // `#[macro_use] extern crate` imports every `#[macro_export]` macro of the
+        // crate. Such a macro lives at the crate root wherever it is defined, and
+        // the export index lists items, not macro_rules! definitions, so name the
+        // exporting declarations directly. Without them a dependency's matches!
+        // was invisible here and the call read as the standard macro (#11251).
+        let named_macros = self.macro_declarations_named(name)?;
+        for (root, binding) in self.macro_use_extern_crate_bindings(file)? {
+            let root = &root;
+            let binding = &binding;
+            for route in self.resolve_segments(root, &binding.owner_module, &binding.path)? {
+                for declaration in &named_macros {
+                    let Some(identity) = self.macro_identity_of(declaration)? else {
+                        continue;
+                    };
+                    if identity.module.crate_root == route.target_module.crate_root
+                        && is_rust_macro_export_declaration(self.analyzer, declaration)?
                     {
-                        for declaration in
-                            self.analyzer
-                                .declarations(&target_file)
-                                .iter()
-                                .filter(|candidate| {
-                                    candidate.identifier() == target_name && candidate.is_macro()
-                                })
-                        {
-                            let Some(identity) = self.macro_identity_of(declaration)? else {
-                                continue;
-                            };
-                            candidates.push(RustMacroInvocationCandidate {
-                                identity,
-                                route: RustMacroInvocationRoute::MacroUseExternCrate {
-                                    crate_root: root.clone(),
-                                    importer_module: binding.importer_module.clone(),
-                                    extent: binding.extent.clone(),
-                                },
-                                provenance: route.provenance,
-                            });
-                        }
+                        candidates.push(RustMacroInvocationCandidate {
+                            identity,
+                            route: RustMacroInvocationRoute::MacroUseExternCrate {
+                                crate_root: root.clone(),
+                                importer_module: binding.importer_module.clone(),
+                                extent: binding.extent.clone(),
+                            },
+                            provenance: route.provenance,
+                        });
+                    }
+                }
+                let module_files = [route.target_file];
+                for (target_file, target_name) in
+                    self.export_targets_from_files(self.analyzer, &module_files, name)?
+                {
+                    for declaration in
+                        self.analyzer
+                            .declarations(&target_file)
+                            .iter()
+                            .filter(|candidate| {
+                                candidate.identifier() == target_name && candidate.is_macro()
+                            })
+                    {
+                        let Some(identity) = self.macro_identity_of(declaration)? else {
+                            continue;
+                        };
+                        candidates.push(RustMacroInvocationCandidate {
+                            identity,
+                            route: RustMacroInvocationRoute::MacroUseExternCrate {
+                                crate_root: root.clone(),
+                                importer_module: binding.importer_module.clone(),
+                                extent: binding.extent.clone(),
+                            },
+                            provenance: route.provenance,
+                        });
                     }
                 }
             }
@@ -4246,7 +4420,7 @@ mod replaying_walk_cache_budget {
 
     #[test]
     fn evicting_a_cycle_fill_frees_its_shared_receipt() {
-        let budget = RetentionBudget::new(CAPACITY);
+        let budget = RetentionBudget::for_test_capacity(CAPACITY);
         let cache = ReplayingWalkCache::<u8, Vec<u8>>::new(&budget, "test.walk", |_, value| {
             value.len() as u32
         });
@@ -4280,6 +4454,169 @@ mod replaying_walk_cache_budget {
             budget.accounted_bytes()
         );
     }
+
+    #[test]
+    fn request_private_walk_caches_are_isolated_and_released_on_exit() {
+        type CheckReply = std::sync::mpsc::Sender<Result<String, &'static str>>;
+
+        struct Worker {
+            commands: Option<std::sync::mpsc::Sender<CheckReply>>,
+            ready: std::sync::mpsc::Receiver<Result<String, &'static str>>,
+            thread: Option<std::thread::JoinHandle<()>>,
+        }
+
+        impl Worker {
+            fn check(&self) -> Result<String, &'static str> {
+                let (reply, result) = std::sync::mpsc::channel();
+                self.commands
+                    .as_ref()
+                    .expect("worker command channel is open")
+                    .send(reply)
+                    .expect("worker accepts cache check");
+                result.recv().expect("worker replies to cache check")
+            }
+
+            fn finish(mut self) {
+                self.commands.take();
+                self.thread
+                    .take()
+                    .expect("worker thread is joined once")
+                    .join()
+                    .expect("worker thread did not panic");
+            }
+        }
+
+        impl Drop for Worker {
+            fn drop(&mut self) {
+                // Closing the channel stops a live worker on every exit path.
+                self.commands.take();
+                if let Some(thread) = self.thread.take()
+                    && let Err(panic) = thread.join()
+                {
+                    if std::thread::panicking() {
+                        eprintln!("request-cache worker also panicked: {panic:?}");
+                    } else {
+                        std::panic::resume_unwind(panic);
+                    }
+                }
+            }
+        }
+
+        fn read_label(
+            request: &RequestWalkCaches,
+            reads: &ReadCapability,
+            label: &'static str,
+        ) -> Result<String, &'static str> {
+            let walked = request
+                .caches
+                .module_declarations
+                .get_or_try_fill(reads, &"same-key".to_owned(), || {
+                    let mut value = HashMap::default();
+                    value.insert(label.to_owned(), Vec::new());
+                    Ok::<_, std::convert::Infallible>(WalkFill::settled(value))
+                })
+                .expect("the fixture cache fill is infallible");
+            walked
+                .keys()
+                .next()
+                .cloned()
+                .ok_or("private cache entry had no label")
+        }
+
+        fn spawn_worker(owner: Arc<RustWalkCaches>, label: &'static str) -> Worker {
+            let (commands, command_receiver) = std::sync::mpsc::channel::<CheckReply>();
+            let (ready_sender, ready) = std::sync::mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                let request = RequestWalkCaches::new(&owner);
+                let reads = ReadCapability::new(LargeReceipt);
+                if ready_sender
+                    .send(read_label(&request, &reads, label))
+                    .is_err()
+                {
+                    return;
+                }
+                while let Ok(reply) = command_receiver.recv() {
+                    // A vanished receiver means the test is already unwinding;
+                    // stop this worker and release its private request regions.
+                    if reply.send(read_label(&request, &reads, label)).is_err() {
+                        break;
+                    }
+                }
+            });
+            Worker {
+                commands: Some(commands),
+                ready,
+                thread: Some(thread),
+            }
+        }
+
+        let budget = RetentionBudget::for_tests();
+        let owner = Arc::new(RustWalkCaches::new(&budget));
+        let baseline = budget.accounted_bytes();
+        let first = spawn_worker(Arc::clone(&owner), "first");
+        let second = spawn_worker(Arc::clone(&owner), "second");
+        assert_eq!(
+            first.ready.recv().expect("first worker reached ready"),
+            Ok("first".into())
+        );
+        assert_eq!(
+            second.ready.recv().expect("second worker reached ready"),
+            Ok("second".into())
+        );
+        assert_eq!(first.check(), Ok("first".into()));
+        assert_eq!(second.check(), Ok("second".into()));
+
+        let private_regions = || {
+            budget
+                .snapshot()
+                .regions
+                .into_iter()
+                .filter(|region| {
+                    region.name == "rust.walk.module_declarations" && region.stats.entries > 0
+                })
+                .collect::<Vec<_>>()
+        };
+        let regions = private_regions();
+        assert_eq!(
+            regions.len(),
+            2,
+            "each request owns a separate region: {regions:#?}"
+        );
+        assert_ne!(regions[0].namespace, regions[1].namespace);
+        assert!(regions.iter().all(|region| region.stats.entries == 1));
+        let occupied = budget.accounted_bytes();
+        assert!(occupied > baseline);
+
+        first.finish();
+        assert!(budget.accounted_bytes() < occupied);
+        assert!(budget.accounted_bytes() > baseline);
+        assert_eq!(private_regions().len(), 1);
+        assert_eq!(second.check(), Ok("second".into()));
+
+        // Error and unwind exits use the same request guard cleanup. No returned
+        // cache value escapes these scopes, so all private charges are released.
+        let before_error = budget.accounted_bytes();
+        let cancelled: Result<(), RustCargoRouteError> = {
+            let request = RequestWalkCaches::new(&owner);
+            let reads = ReadCapability::new(LargeReceipt);
+            read_label(&request, &reads, "cancelled").expect("cancelled walk filled cache");
+            Err(RustCargoRouteError::Cancelled)
+        };
+        assert!(matches!(cancelled, Err(RustCargoRouteError::Cancelled)));
+        assert_eq!(budget.accounted_bytes(), before_error);
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let request = RequestWalkCaches::new(&owner);
+            let reads = ReadCapability::new(LargeReceipt);
+            read_label(&request, &reads, "unwind").expect("unwinding walk filled cache");
+            panic!("exercise request guard unwind");
+        }));
+        assert!(unwind.is_err());
+        assert_eq!(budget.accounted_bytes(), before_error);
+
+        second.finish();
+        assert_eq!(budget.accounted_bytes(), baseline);
+    }
 }
 
 #[cfg(test)]
@@ -4308,6 +4645,82 @@ mod cycle_walk_properties {
         assert_eq!(settled.len(), 1);
         assert_eq!(settled[0].0, 0);
         assert_eq!(*settled[0].1, vec![0]);
+    }
+}
+
+#[cfg(test)]
+mod cycle_walk_growth {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    /// A binding whose only varying part is the files that carried it.
+    fn binding(route_files: &[&ProjectFile]) -> RustModuleBinding {
+        let module = ModuleKey {
+            crate_root: "krate".to_owned(),
+            components: Vec::new(),
+        };
+        let file = ProjectFile::new(std::env::temp_dir(), "src/lib.rs");
+        RustModuleBinding {
+            name: "Item".to_owned(),
+            namespace: RustSymbolNamespace::Type,
+            origin: RustSymbolIdentity {
+                file,
+                module,
+                name: "Item".to_owned(),
+                namespace: RustSymbolNamespace::Type,
+            },
+            domain: Domain::Public,
+            route_files: route_files.iter().map(|file| (*file).clone()).collect(),
+        }
+    }
+
+    #[test]
+    #[hardwon("#11799: a merge that only added route_files did not re-queue dependents")]
+    fn a_round_that_only_adds_route_files_requeues_dependents() {
+        type Value = Arc<Vec<RustModuleBinding>>;
+        let root = std::env::temp_dir();
+        let carried_by_a = ProjectFile::new(root.clone(), "src/a.rs");
+        let carried_by_b = ProjectFile::new(root, "src/b.rs");
+        let walk: RefCell<CycleWalk<usize, Value>> = RefCell::new(CycleWalk::default());
+        let seed = |_: &usize| Ok::<_, &'static str>(Vec::new());
+        let ask = |key: usize| match resolve_with_cycles(&walk, &key, &|| false, &seed, &|_| {
+            panic!("a nested lookup must not run compute")
+        })
+        .expect("nested lookup")
+        {
+            CycleAnswer::Provisional(value) => value,
+            CycleAnswer::Settled { .. } => panic!("a nested lookup is provisional"),
+        };
+
+        // 0 republishes what 1 publishes, and 1 publishes one binding carried by
+        // itself plus whatever 2 carries. 2 is asked for before it has run, so
+        // 1's first round binds the item with 1's own file only; 2's later
+        // answer makes 1's second round carry both files in a binding that is
+        // already there. The binding count never changes after round one.
+        let answer = resolve_with_cycles(&walk, &0, &|| false, &seed, &|key| {
+            Ok(match *key {
+                0 => ask(1).as_ref().clone(),
+                1 => {
+                    let mut carried = vec![&carried_by_a];
+                    let from_two = ask(2);
+                    carried.extend(from_two.iter().flat_map(|binding| &binding.route_files));
+                    vec![binding(&carried)]
+                }
+                2 => vec![binding(&[&carried_by_b])],
+                _ => unreachable!(),
+            })
+        })
+        .expect("uncancelled walk");
+        let CycleAnswer::Settled { value, .. } = answer else {
+            panic!("the outermost walk settles")
+        };
+        let carried: Vec<&Vec<ProjectFile>> =
+            value.iter().map(|binding| &binding.route_files).collect();
+        assert_eq!(
+            carried,
+            vec![&vec![carried_by_a, carried_by_b]],
+            "0 must carry the files that 1's second round added"
+        );
     }
 }
 

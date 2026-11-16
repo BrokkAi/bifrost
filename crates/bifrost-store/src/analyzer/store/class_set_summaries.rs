@@ -10,8 +10,9 @@ use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use sha2::Sha256;
 use std::sync::LazyLock;
 
-use super::read_keys::{ReadKeyColumns, decode_read_key};
+use super::read_keys::{ReadKeyBatch, ReadKeyColumns};
 use super::{AnalyzerStore, PARSED_BLOB_COMPLETE_CONDITION, Result, StoreError};
+use crate::analyzer::semantic::ids::StableDigest;
 use crate::hash::{HashMap, HashSet};
 use crate::{CancellationToken, analyzer::Language, analyzer::read_ledger::ReadKey};
 
@@ -293,6 +294,17 @@ impl ClassSetSummaryRow {
     /// Hash every logical stored value except publication time and the digest
     /// itself. Length framing makes this independent of SQLite row encoding.
     pub fn canonical_content_digest(&self) -> ClassSetSummaryDigest {
+        self.content_digest_with_reads(
+            self.reads
+                .iter()
+                .map(|row| (row.ordinal, row.key.canonical_digest())),
+        )
+    }
+
+    fn content_digest_with_reads(
+        &self,
+        reads: impl ExactSizeIterator<Item = (u32, StableDigest)>,
+    ) -> ClassSetSummaryDigest {
         let mut hash = CanonicalDigest::new(b"bifrost-class-set-store-row-v3");
         hash.bytes(&self.header.key.lookup_digest);
         hash.bytes(&self.header.key.procedure_lineage);
@@ -391,10 +403,10 @@ impl ClassSetSummaryRow {
             }
         }
         hash.text("reads");
-        hash.u64(self.reads.len() as u64);
-        for row in &self.reads {
-            hash.u64(u64::from(row.ordinal));
-            hash.bytes(row.key.canonical_digest().as_bytes());
+        hash.u64(reads.len() as u64);
+        for (ordinal, digest) in reads {
+            hash.u64(u64::from(ordinal));
+            hash.bytes(digest.as_bytes());
         }
         hash.text("charges");
         hash.u64(self.charges.len() as u64);
@@ -876,7 +888,7 @@ pub(crate) const DEPENDENCY_SOURCES_SQL: &str =
      WHERE summary_id=?1 ORDER BY dependency_ordinal,source_ordinal";
 pub(crate) const READS_SQL: &str =
     "SELECT key_digest,kind,family,languages,rel_path,name,index_key,
-        blob_oid,subject,start_byte,end_byte,digest,site_ordinal,decl_kind,decl_signature,workspace_fact_family,fact_member,json(fact_names),NULL AS copy_owning_unit,NULL AS copy_target_unit,NULL AS copy_module_path,NULL AS copy_target_identity_digest,NULL AS copy_census_version,NULL AS copy_config_digest,NULL AS copy_producer_digest,parse_variant_kind,parse_variant_digest,structural_role,structural_keyword,read_ordinal
+        blob_oid,subject,start_byte,end_byte,digest,site_ordinal,decl_kind,decl_signature,workspace_fact_family,fact_member,json(fact_names),NULL AS copy_owning_unit,NULL AS copy_target_unit,NULL AS copy_module_path,NULL AS copy_target_identity_digest,NULL AS copy_census_version,NULL AS copy_config_digest,NULL AS copy_producer_digest,parse_variant_kind,parse_variant_digest,structural_role,structural_keyword,read_ordinal, drop_owning_unit, drop_module_path, drop_identity_digest, drop_config_digest, drop_proof_version
      FROM class_set_summary_reads WHERE summary_id=?1 ORDER BY read_ordinal";
 pub(crate) const CHARGES_SQL: &str = "SELECT charge_kind,amount
      FROM class_set_summary_charges WHERE summary_id=?1 ORDER BY charge_kind";
@@ -1137,8 +1149,14 @@ fn load_summary_for_digest(
             },
         )
         .optional()?;
-    raw.map(|raw| load_summary(conn, lookup_digest, raw))
-        .transpose()
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    match load_summary(conn, lookup_digest, raw) {
+        Ok(summary) => Ok(Some(summary)),
+        Err(error) if error.is_unsupported_read_key() => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn validate_summary_for_publication(
@@ -1469,8 +1487,8 @@ fn insert_summary(
         conn.execute(
             "INSERT INTO class_set_summary_reads(
                 summary_id,read_ordinal,key_digest,kind,family,languages,rel_path,name,
-                index_key,blob_oid,subject,start_byte,end_byte,digest,site_ordinal,decl_kind,decl_signature,workspace_fact_family,fact_member,fact_names,parse_variant_kind,parse_variant_digest,structural_role,structural_keyword
-             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,jsonb(?20),?21,?22,?23,?24)",
+                index_key,blob_oid,subject,start_byte,end_byte,digest,site_ordinal,decl_kind,decl_signature,workspace_fact_family,fact_member,fact_names,parse_variant_kind,parse_variant_digest,structural_role,structural_keyword,drop_owning_unit,drop_module_path,drop_identity_digest,drop_config_digest,drop_proof_version
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,jsonb(?20),?21,?22,?23,?24,?25,?26,?27,?28,?29)",
             params![
                 id,
                 row.ordinal,
@@ -1496,6 +1514,12 @@ fn insert_summary(
             columns.parse_variant_digest,
             columns.structural_role,
             columns.structural_keyword,
+            columns.drop_owning_unit,
+            columns.drop_module_path,
+            columns.drop_identity_digest,
+            columns.drop_config_digest,
+            columns.drop_proof_version,
+
             ],
         )?;
     }
@@ -1644,56 +1668,64 @@ fn load_summary(
             "class-set summary child counts disagree: stored {expected:?}, found {actual:?}"
         )));
     }
-    let summary = ClassSetSummaryRow::try_new(
-        ClassSetSummaryHeaderRow {
-            key: ClassSetSummaryRowKey {
-                lookup_digest: lookup,
-                procedure_lineage: digest(procedure, "procedure lineage")?,
+    reads.finish_with(|keys, digests| {
+        let mut summary = ClassSetSummaryRow::try_new(
+            ClassSetSummaryHeaderRow {
+                key: ClassSetSummaryRowKey {
+                    lookup_digest: lookup,
+                    procedure_lineage: digest(procedure, "procedure lineage")?,
+                },
+                attachment: ClassSetSummaryAttachment {
+                    rel_path,
+                    blob_oid,
+                    parse_variant,
+                    storage_language_key: crate::analyzer::semantic::StorageLanguageKey::from_store(
+                        storage_lang,
+                    ),
+                    language,
+                },
+                artifact_public_identity: digest(artifact_public, "artifact public identity")?,
+                artifact_content_identity: digest(artifact_content, "artifact content identity")?,
+                schema_version: schema,
+                semantics_digest: digest(semantics, "semantics digest")?,
+                context_digest: digest(context, "context digest")?,
+                behavior_read_digest: digest(behavior, "behavior digest")?,
+                dependency_digest: digest(dependency_digest, "dependency digest")?,
+                carrier_digest: digest(carrier, "carrier digest")?,
+                field_slots_digest: digest(fields, "field-slots digest")?,
+                root_surface_digest: digest(root_surface, "root surface digest")?,
+                direct_calls_digest: digest(direct_calls, "direct calls digest")?,
+                entry_fact_ordinal: entry,
             },
-            attachment: ClassSetSummaryAttachment {
-                rel_path,
-                blob_oid,
-                parse_variant,
-                storage_language_key: crate::analyzer::semantic::StorageLanguageKey::from_store(
-                    storage_lang,
-                ),
-                language,
-            },
-            artifact_public_identity: digest(artifact_public, "artifact public identity")?,
-            artifact_content_identity: digest(artifact_content, "artifact content identity")?,
-            schema_version: schema,
-            semantics_digest: digest(semantics, "semantics digest")?,
-            context_digest: digest(context, "context digest")?,
-            behavior_read_digest: digest(behavior, "behavior digest")?,
-            dependency_digest: digest(dependency_digest, "dependency digest")?,
-            carrier_digest: digest(carrier, "carrier digest")?,
-            field_slots_digest: digest(fields, "field-slots digest")?,
-            root_surface_digest: digest(root_surface, "root surface digest")?,
-            direct_calls_digest: digest(direct_calls, "direct calls digest")?,
-            entry_fact_ordinal: entry,
-        },
-        facts,
-        exits,
-        reached,
-        dependencies,
-        reads,
-        charges,
-    )?;
-    let stored_content = digest(stored_content, "content digest")?;
-    if summary.content_digest != stored_content {
-        return Err(StoreError::new(format!(
-            "class-set summary content digest mismatch: stored {stored_content:?}, computed {:?}",
-            summary.content_digest
+            facts,
+            exits,
+            reached,
+            dependencies,
+            keys.into_iter().enumerate().map(|(ordinal, key)| ClassSetSummaryReadRow {
+                ordinal: u32::try_from(ordinal).expect("validated dense read ordinal"),
+                key,
+            }).collect(),
+            charges,
+        )?;
+        let content = summary.content_digest_with_reads(digests.iter().copied().enumerate().map(|(ordinal, digest)| (
+            u32::try_from(ordinal).expect("validated dense read ordinal"), digest,
         )));
-    }
-    let stored_output = ClassSetSummaryOutputDigest::new(digest(stored_output, "output digest")?);
-    let computed_output = summary.output_digest();
-    if computed_output != stored_output {
-        return Err(StoreError::new(format!(
-            "class-set summary output digest mismatch: stored {stored_output:?}, computed {computed_output:?}"
-        )));
-    }
-    Ok(summary)
+        let stored_content = digest(stored_content, "content digest")?;
+        if content != stored_content {
+            return Err(StoreError::new(format!(
+                "class-set summary content digest mismatch: stored {stored_content:?}, computed {content:?}"
+            )));
+        }
+        let stored_output = ClassSetSummaryOutputDigest::new(digest(stored_output, "output digest")?);
+        let computed_output = summary.output_digest();
+        if computed_output != stored_output {
+            return Err(StoreError::new(format!(
+                "class-set summary output digest mismatch: stored {stored_output:?}, computed {computed_output:?}"
+            )));
+        }
+        summary.content_digest = content;
+        Ok(summary)
+    })
 }
 
 fn load_facts(conn: &rusqlite::Connection, id: i64) -> Result<Vec<ClassSetSummaryFactRow>> {
@@ -1839,15 +1871,18 @@ fn dependency_entry(
         )),
     }
 }
-fn load_reads(conn: &rusqlite::Connection, id: i64) -> Result<Vec<ClassSetSummaryReadRow>> {
+fn load_reads(conn: &rusqlite::Connection, id: i64) -> Result<ReadKeyBatch> {
     let mut s = conn.prepare_cached(READS_SQL)?;
     let mut rows = s.query(params![id])?;
-    let mut reads = Vec::new();
+    let mut reads = ReadKeyBatch::default();
     while let Some(row) = rows.next()? {
-        reads.push(ClassSetSummaryReadRow {
-            ordinal: row.get(29)?,
-            key: decode_read_key(row)?,
-        });
+        let ordinal: u32 = row.get(29)?;
+        if ordinal as usize != reads.len() {
+            return Err(StoreError::corrupt(
+                "class-set summary read ordinals are not dense",
+            ));
+        }
+        reads.push(row)?;
     }
     Ok(reads)
 }
@@ -2650,11 +2685,93 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10126: future read vocabulary made a class-set summary fail to load"
+    )]
+    fn unsupported_read_evidence_misses_only_its_class_set_summary() {
+        for label in ["future_lookup", "procedure_dispatch:v2"] {
+            let store = store_with_blob();
+            let affected = row(1);
+            let unaffected = row(2);
+            for summary in [&affected, &unaffected] {
+                store
+                    .publish_class_set_summary(summary.clone(), &CancellationToken::new())
+                    .unwrap();
+            }
+            {
+                let conn = store.conn.lock().unwrap();
+                // Simulate a newer schema admitting the future lookup family.
+                conn.execute_batch("PRAGMA ignore_check_constraints=ON")
+                    .unwrap();
+                conn.execute("UPDATE class_set_summary_reads SET family=?1 WHERE summary_id=(SELECT summary_id FROM class_set_summaries WHERE lookup_digest=?2)", params![label, digest_byte(1).as_slice()]).unwrap();
+                conn.execute_batch("PRAGMA ignore_check_constraints=OFF")
+                    .unwrap();
+            }
+            assert_eq!(
+                store.class_set_summary_for_digest(digest_byte(1)).unwrap(),
+                None,
+                "{label}"
+            );
+            assert_eq!(
+                store.class_set_summary_for_digest(digest_byte(2)).unwrap(),
+                Some(unaffected),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10126: unsupported reads bypassed summary child-count and content validation"
+    )]
+    fn unsupported_reads_do_not_hide_other_summary_corruption() {
+        for damage in [
+            "charge_count=charge_count+1",
+            "semantics_digest=zeroblob(32)",
+            "output_digest=zeroblob(32)",
+        ] {
+            let store = store_with_blob();
+            let affected = row(1);
+            store
+                .publish_class_set_summary(affected, &CancellationToken::new())
+                .unwrap();
+            {
+                let conn = store.conn.lock().unwrap();
+                conn.execute_batch("PRAGMA ignore_check_constraints=ON")
+                    .unwrap();
+                conn.execute(
+                    "UPDATE class_set_summary_reads SET family='future_lookup'",
+                    [],
+                )
+                .unwrap();
+                conn.execute(&format!("UPDATE class_set_summaries SET {damage}"), [])
+                    .unwrap();
+                conn.execute_batch("PRAGMA ignore_check_constraints=OFF")
+                    .unwrap();
+            }
+            assert!(
+                store.class_set_summary_for_digest(digest_byte(1)).is_err(),
+                "{damage}"
+            );
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10879: normalized summaries rejected blob-bearing Drop receipts"
+    )]
     fn a_complete_normalized_summary_round_trips_and_republishes_as_a_noop() {
         let store = store_with_blob();
         use crate::analyzer::read_ledger::{LookupKind, LookupQuestion, WorkspaceFactFamily};
         use crate::analyzer::semantic::ids::StableDigest;
         let mut expected = row(1);
+        for key in super::super::read_keys::rust_drop_receipt_keys() {
+            expected.reads.push(ClassSetSummaryReadRow {
+                ordinal: u32::try_from(expected.reads.len()).unwrap(),
+                key,
+            });
+        }
+
         for subject in super::super::read_keys::workspace_fact_subjects() {
             expected.reads.push(ClassSetSummaryReadRow {
                 ordinal: u32::try_from(expected.reads.len()).unwrap(),

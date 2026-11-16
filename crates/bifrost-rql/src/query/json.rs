@@ -81,6 +81,20 @@ pub(crate) fn plan_to_json(plan: &CodeQueryPlan) -> Map<String, Value> {
             );
             object
         }
+        CodeQueryPlanSource::CallReachability(relation) => {
+            let mut body = Map::new();
+            body.insert(
+                "sources".into(),
+                Value::Object(plan_to_json(&relation.sources)),
+            );
+            body.insert("sinks".into(), Value::Object(plan_to_json(&relation.sinks)));
+            if let Some(depth) = relation.depth {
+                body.insert("depth".into(), json!(depth.get()));
+            }
+            let mut object = Map::new();
+            object.insert("call_reachability".into(), Value::Object(body));
+            object
+        }
         CodeQueryPlanSource::Correlate(correlation) => {
             let body = match &correlation.relation {
                 CrossDomainRelation::ConfigurationKey(relation) => {

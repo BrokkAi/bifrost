@@ -364,20 +364,29 @@ mod tests {
 
     #[test]
     fn source_layout_and_version_origin_do_not_change_loaded_policy_semantics() {
-        let implicit = include_str!(concat!(
+        let implicit_source = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/testdata/policies/dynamic-eval.rqlp"
         ));
-        let commented = implicit.replacen(
+        let commented_source = implicit_source.replacen(
             "(policy",
             "(policy\n  ; an origin-only comment and different layout",
             1,
         );
-        let explicit = implicit.replacen("(policy", "(policy\n  :schema-version 1", 1);
+        let implicit = load_match_policy(implicit_source);
+        // Origin-only difference: the explicit pin must name the version the
+        // omitted document infers, not the newest supported version.
+        let explicit_source = implicit_source.replacen(
+            "(policy",
+            &format!(
+                "(policy\n  :schema-version {}",
+                implicit.schema_resolution().version
+            ),
+            1,
+        );
 
-        let implicit = load_match_policy(implicit);
-        let commented = load_match_policy(&commented);
-        let explicit = load_match_policy(&explicit);
+        let commented = load_match_policy(&commented_source);
+        let explicit = load_match_policy(&explicit_source);
 
         assert_ne!(implicit.source_hash(), commented.source_hash());
         assert_ne!(implicit.source_hash(), explicit.source_hash());
@@ -599,7 +608,7 @@ mod tests {
             EndpointRole::Source,
             format!("Example revision {revision}"),
             Vec::new(),
-            PolicyEndpointBinding::ReturnValue,
+            PolicyEndpointBinding::ReturnValue { path: None },
             None,
             Vec::new(),
         );

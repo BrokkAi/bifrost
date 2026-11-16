@@ -410,16 +410,18 @@ fn with_default_evidence(
 /// conversions; a complete single-target answer is that proof. The call shape
 /// comes from the selected inventory row, never from the callee's spelling.
 struct SelectedExternalCall {
+    implicit_receiver: bool,
     declaring_language: Language,
     owner: String,
     member: String,
     is_static: bool,
+    declaration_is_abstract: Option<bool>,
     parameter_count: u32,
 }
 
 impl SelectedExternalCall {
     fn evidence(&self) -> CallEvidence {
-        let proof = if self.member == "<init>" {
+        let mut proof = if self.member == "<init>" {
             ExactExternalCallProof::java_external_constructor(
                 &self.owner,
                 &self.member,
@@ -438,6 +440,8 @@ impl SelectedExternalCall {
                 self.parameter_count,
             )
         };
+        proof.implicit_receiver = self.implicit_receiver;
+        proof.declaration_is_abstract = self.declaration_is_abstract;
         CallEvidence::selected_external_call(
             self.declaring_language,
             proof,
@@ -453,7 +457,7 @@ fn selected_external_call(
     units: &SelectedNativeReferenceUnits,
 ) -> Option<SelectedExternalCall> {
     let binding = units.answer.binding();
-    let ([_], [member]) = (binding.targets(), units.external_members.as_slice()) else {
+    let ([target], [member]) = (binding.targets(), units.external_members.as_slice()) else {
         return None;
     };
     (binding.completion() == &ResolutionCompletion::Complete).then_some(())?;
@@ -464,10 +468,12 @@ fn selected_external_call(
     )
     .then_some(())?;
     Some(SelectedExternalCall {
+        implicit_receiver: !member.is_static && units.answer.proves_implicit_receiver(*target),
         declaring_language,
         owner: member.identity.owner.owner_fqn.to_string(),
         member: member.member_name.clone(),
         is_static: member.is_static,
+        declaration_is_abstract: member.declaration_is_abstract,
         parameter_count: member.callable_parameter_count?,
     })
 }
@@ -929,86 +935,87 @@ fn project_kotlin_external_boundary(
     } else {
         None
     };
-    let projected =
-        if let Some(segments) = type_segments {
-            kotlin_external_type_route(kotlin, query, token, &segments)
-                .filter(|(_, target, _)| {
-                    if focus.kind() == "type_identifier" {
-                        return true;
-                    }
-                    let Some(target) = target else {
-                        return false;
-                    };
-                    let Some(owner) = kotlin
-                        .external_declarations(query.analyzer.semantic_model_overlay())
-                        .resolve_qualified_name(
-                            &crate::analyzer::jvm::external::QueryGapRecorder::new(kotlin),
-                            target,
-                            "",
-                        )
-                    else {
-                        return false;
-                    };
-                    let crate::analyzer::jvm::external::JvmExternalDeclarationSource::SemanticPack {
-                    declaration_id, ..
-                } = owner.source() else {
+    let projected = if let Some(segments) = type_segments {
+        kotlin_external_type_route(kotlin, query, token, &segments)
+            .filter(|(_, target, _)| {
+                if focus.kind() == "type_identifier" {
+                    return true;
+                }
+                let Some(target) = target else {
                     return false;
                 };
-                    let Some(active) = query.analyzer.active_semantic_models() else {
-                        return false;
-                    };
-                    active.types_named(target).records.iter().any(|candidate| {
-                        brokk_bifrost_core::analyzer::model::semantic_pack_realm(
-                            &candidate.shard.manifest.language,
-                        ) == "jvm"
-                            && candidate.record.id == *declaration_id
-                            && (!candidate
-                                .shard
-                                .independently_enumerates_jvm_owner(&candidate.record)
-                                || !candidate
-                                    .record
-                                    .jvm_inventory
-                                    .as_ref()
-                                    .is_some_and(|inventory| inventory.callables_complete))
-                    })
-                })
-                .map(|(route_name, external_target, boundary_status)| {
-                    (
-                        route_name,
-                        external_target,
-                        ClaimSubjectRole::Type,
-                        Some(boundary_status),
+                let Some(owner) = kotlin
+                    .external_declarations(query.analyzer.semantic_model_overlay_read().published())
+                    .resolve_qualified_name(
+                        &crate::analyzer::jvm::external::QueryGapRecorder::new(kotlin),
+                        target,
+                        "",
                     )
+                else {
+                    return false;
+                };
+                let crate::analyzer::jvm::external::JvmExternalDeclarationSource::SemanticPack {
+                    declaration_id,
+                    ..
+                } = owner.source()
+                else {
+                    return false;
+                };
+                let Some(active) = query.analyzer.active_semantic_models() else {
+                    return false;
+                };
+                active.types_named(target).records.iter().any(|candidate| {
+                    brokk_bifrost_core::analyzer::model::semantic_pack_realm(
+                        &candidate.shard.manifest.language,
+                    ) == "jvm"
+                        && candidate.record.id == *declaration_id
+                        && (!candidate
+                            .shard
+                            .independently_enumerates_jvm_owner(&candidate.record)
+                            || !candidate
+                                .record
+                                .jvm_inventory
+                                .as_ref()
+                                .is_some_and(|inventory| inventory.callables_complete))
                 })
-        } else {
-            // Only the shared resolver can prove absence. A known receiver type
-            // does not certify complete member or extension-provider inventories.
-            match kotlin_external_member_target(kotlin, query, token, focus) {
-                Some(KotlinReceiverOwner::Typed(target)) => {
-                    Some((target.clone(), Some(target), ClaimSubjectRole::Member, None))
-                }
-                Some(KotlinReceiverOwner::Unproven(target)) => {
-                    // External evidence declares the member, so the shared
-                    // resolver has not proven it absent. The receiver is not
-                    // proven to name its owner type either, so no boundary is
-                    // claimed: the answer stays Incomplete until a prefix
-                    // decision proves the receiver.
-                    if value.status == DefinitionLookupStatus::NoDefinition {
-                        value.status = DefinitionLookupStatus::Incomplete;
-                        value.diagnostics.push(DefinitionLookupDiagnostic {
-                            kind: "kotlin_external_member_prefix_unproven".to_owned(),
-                            message: format!(
-                                "`{target}` is declared outside the indexed workspace, but no \
-                                 type-name decision proves the receiver names its owner"
-                            ),
-                            claim: None,
-                        });
-                    }
-                    return BoundedResolution::Complete { value, work };
-                }
-                None => None,
+            })
+            .map(|(route_name, external_target, boundary_status)| {
+                (
+                    route_name,
+                    external_target,
+                    ClaimSubjectRole::Type,
+                    Some(boundary_status),
+                )
+            })
+    } else {
+        // Only the shared resolver can prove absence. A known receiver type
+        // does not certify complete member or extension-provider inventories.
+        match kotlin_external_member_target(kotlin, query, token, focus) {
+            Some(KotlinReceiverOwner::Typed(target)) => {
+                Some((target.clone(), Some(target), ClaimSubjectRole::Member, None))
             }
-        };
+            Some(KotlinReceiverOwner::Unproven(target)) => {
+                // External evidence declares the member, so the shared
+                // resolver has not proven it absent. The receiver is not
+                // proven to name its owner type either, so no boundary is
+                // claimed: the answer stays Incomplete until a prefix
+                // decision proves the receiver.
+                if value.status == DefinitionLookupStatus::NoDefinition {
+                    value.status = DefinitionLookupStatus::Incomplete;
+                    value.diagnostics.push(DefinitionLookupDiagnostic {
+                        kind: "kotlin_external_member_prefix_unproven".to_owned(),
+                        message: format!(
+                            "`{target}` is declared outside the indexed workspace, but no \
+                                 type-name decision proves the receiver names its owner"
+                        ),
+                        claim: None,
+                    });
+                }
+                return BoundedResolution::Complete { value, work };
+            }
+            None => None,
+        }
+    };
     let Some((route_name, external_target, role, boundary_status)) = projected else {
         if focus.kind() == "type_identifier"
             && value.status == DefinitionLookupStatus::NoDefinition
@@ -1172,6 +1179,9 @@ pub(crate) fn project_jvm_declaration_site(
     }
     BoundedResolution::Complete {
         value: DefinitionLookupOutcome {
+            selected_sites: Vec::new(),
+            inventory_evidence: None,
+            incomplete_evidence: None,
             modeled_definitions: Vec::new(),
             status: DefinitionLookupStatus::NoDefinition,
             reference: Some(query.site.clone()),
@@ -1343,7 +1353,7 @@ fn scala_enclosing_external_supertype_names(
     >(query.analyzer) else {
         return Vec::new();
     };
-    let model = query.analyzer.semantic_model_overlay();
+    let model = query.analyzer.semantic_model_overlay_read().published();
     let mut names = Vec::new();
     let mut ancestor = Some(focus);
     while let Some(node) = ancestor {
@@ -1763,7 +1773,7 @@ fn kotlin_external_type_route(
 
     let (status, external_target) = kotlin.external_boundary_evidence(
         token,
-        query.analyzer.semantic_model_overlay(),
+        query.analyzer.semantic_model_overlay_read().published(),
         query.file,
         &written,
     );
@@ -1805,7 +1815,7 @@ fn kotlin_external_member_target(
     let definitions = AnalyzerDefinitionLookup::new(query.analyzer, Language::Kotlin);
     let (_, owner_target) = kotlin.external_boundary_evidence(
         token,
-        query.analyzer.semantic_model_overlay(),
+        query.analyzer.semantic_model_overlay_read().published(),
         query.file,
         owner,
     );
@@ -1826,7 +1836,7 @@ fn kotlin_external_member_target(
     let member = kotlin
         .resolve_member_name_with_external(
             token,
-            query.analyzer.semantic_model_overlay(),
+            query.analyzer.semantic_model_overlay_read().published(),
             query.file,
             &spelling,
         )?
@@ -2229,7 +2239,7 @@ fn prepare_definition_context(
     let import_route =
         explicit_import_model_route(query.analyzer, query_scope.token(), query.file, query.site);
     let selected_model = import_route.as_ref().and_then(|route| {
-        let overlay = query.analyzer.semantic_model_overlay()?;
+        let overlay = query.analyzer.semantic_model_overlay_read().published()?;
         let matched = qualified_model_symbols(&overlay, &route.target);
         if matches!(
             matched.disposition,

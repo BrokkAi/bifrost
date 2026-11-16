@@ -109,7 +109,7 @@ mod jvm_extraction_tests {
             params![host.get(), [1u8; 32].as_slice(), [2u8; 32].as_slice()],
         )?;
         assert!(brokk_bifrost_analysis::analyzer::store::resolution_stage::lexical::prepare_lexical_fragment(&continuation, &cancellation)
-            .unwrap().insert(connection, connection.last_insert_rowid(), host, &cancellation)?);
+            .unwrap().unwrap().insert(connection, connection.last_insert_rowid(), host, &cancellation)?);
         Ok(())
     }).unwrap();
         let candidate = CandidatePathIdentity::new(fragment, path_id);
@@ -174,7 +174,7 @@ mod jvm_extraction_tests {
         let cancellation = CancellationToken::default();
         selection.with_owned_temp_write(|connection| {
         connection.execute("INSERT INTO temp.selected_resolution_stage_producers(host_ordinal,bridge_identity,content_digest) VALUES(0,?1,?2)",params![[5u8;32].as_slice(),[6u8;32].as_slice()])?;
-        assert!(brokk_bifrost_analysis::analyzer::store::resolution_stage::lexical::prepare_lexical_fragment(&lowered,&cancellation).unwrap()
+        assert!(brokk_bifrost_analysis::analyzer::store::resolution_stage::lexical::prepare_lexical_fragment(&lowered,&cancellation).unwrap().unwrap()
             .insert(connection,connection.last_insert_rowid(),SelectedResolutionMountOrdinal::new(0),&cancellation)?);
         Ok(())
     }).unwrap();
@@ -554,7 +554,7 @@ mod jvm_extraction_tests {
         let cancellation = CancellationToken::default();
         selection.with_owned_temp_write(|connection| {
         connection.execute("INSERT INTO temp.selected_resolution_stage_producers(host_ordinal,bridge_identity,content_digest) VALUES(0,?1,?2)",params![[25u8;32].as_slice(),[26u8;32].as_slice()])?;
-        assert!(brokk_bifrost_analysis::analyzer::store::resolution_stage::lexical::prepare_lexical_fragment(&lowered,&cancellation).unwrap()
+        assert!(brokk_bifrost_analysis::analyzer::store::resolution_stage::lexical::prepare_lexical_fragment(&lowered,&cancellation).unwrap().unwrap()
             .insert(connection,connection.last_insert_rowid(),SelectedResolutionMountOrdinal::new(0),&cancellation)?);
         let metadata: i64 = connection.query_row("SELECT count(*) FROM temp.selected_resolution_stage_semantics", [], |row| row.get(0))?;
         assert_eq!(metadata, 0);
@@ -1273,7 +1273,7 @@ mod jvm_extraction_tests {
         let cancellation = CancellationToken::default();
         selection.with_owned_temp_write(|connection| {
         connection.execute("INSERT INTO temp.selected_resolution_stage_producers(host_ordinal,bridge_identity,content_digest) VALUES(0,?1,?2)",params![[75u8;32].as_slice(),[76u8;32].as_slice()])?;
-        assert!(brokk_bifrost_analysis::analyzer::store::resolution_stage::lexical::prepare_lexical_fragment(&lowered,&cancellation).unwrap().insert(connection,connection.last_insert_rowid(),SelectedResolutionMountOrdinal::new(0),&cancellation)?);
+        assert!(brokk_bifrost_analysis::analyzer::store::resolution_stage::lexical::prepare_lexical_fragment(&lowered,&cancellation).unwrap().unwrap().insert(connection,connection.last_insert_rowid(),SelectedResolutionMountOrdinal::new(0),&cancellation)?);
         Ok(())
     }).unwrap();
         let rows = reference_seed_rows(
@@ -1391,7 +1391,7 @@ mod jvm_extraction_tests {
             );
             selection.with_owned_temp_write(|connection| {
             connection.execute("INSERT INTO temp.selected_resolution_stage_producers(host_ordinal,bridge_identity,content_digest) VALUES(?1,?2,?3)",params![host,[91u8;32].as_slice(),[92u8;32].as_slice()])?;
-            assert!(brokk_bifrost_analysis::analyzer::store::resolution_stage::lexical::prepare_lexical_fragment(&lowered,&cancellation).unwrap().insert(connection,connection.last_insert_rowid(),SelectedResolutionMountOrdinal::new(host),&cancellation)?);
+            assert!(brokk_bifrost_analysis::analyzer::store::resolution_stage::lexical::prepare_lexical_fragment(&lowered,&cancellation).unwrap().unwrap().insert(connection,connection.last_insert_rowid(),SelectedResolutionMountOrdinal::new(host),&cancellation)?);
             if host == 0 {
                 let identity = brokk_bifrost_analysis::analyzer::resolution::fact_lowering::root_import_anchor_semantic_identity(
                     brokk_bifrost_core::analyzer::resolution_facts::ResolutionRootImportAnchor::Lexical,
@@ -1821,7 +1821,7 @@ mod jvm_extraction_tests {
             );
             selection.with_owned_temp_write(|connection| {
             connection.execute("INSERT INTO temp.selected_resolution_stage_producers(host_ordinal,bridge_identity,content_digest) VALUES(?1,?2,?3)",params![host,[211u8;32].as_slice(),[212u8;32].as_slice()])?;
-            assert!(brokk_bifrost_analysis::analyzer::store::resolution_stage::lexical::prepare_lexical_fragment(&lowered,&cancellation).unwrap().insert(connection,connection.last_insert_rowid(),SelectedResolutionMountOrdinal::new(host),&cancellation)?);
+            assert!(brokk_bifrost_analysis::analyzer::store::resolution_stage::lexical::prepare_lexical_fragment(&lowered,&cancellation).unwrap().unwrap().insert(connection,connection.last_insert_rowid(),SelectedResolutionMountOrdinal::new(host),&cancellation)?);
             Ok(())
         }).unwrap();
             identities.push((fragment, node, CandidatePathIdentity::new(fragment, path)));
@@ -1911,7 +1911,8 @@ mod jvm_extraction_tests {
                 Vec::new(),
                 Vec::new(),
                 ResolutionCompletion::Complete,
-            ));
+            ))
+            .expect("encode fixture path");
             let references = (0..256_u32)
                 .map(|index| {
                     if index % 2 == 0 {
@@ -2673,7 +2674,7 @@ mod jvm_extraction_tests {
             )?;
             assert!(
                 brokk_bifrost_analysis::analyzer::store::resolution_stage::lexical::prepare_lexical_fragment(&lowered, &cancellation)
-                    .unwrap()
+                    .unwrap().unwrap()
                     .insert(
                         connection,
                         connection.last_insert_rowid(),

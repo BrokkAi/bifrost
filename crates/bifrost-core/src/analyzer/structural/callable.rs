@@ -31,7 +31,9 @@ labelled_enum! {
     /// - `Method`: a receiver-qualified application (`r.f(x)`).
     /// - `Constructor`: an instance-creating application (`new T(x)`, `T(x)`
     ///   where the language routes it to a constructor, implicit struct
-    ///   construction).
+    ///   construction), and a constructor-chaining application (Java
+    ///   `this(...)`, `super(...)` and `outer.super(...)`; C# `: base(...)`
+    ///   and `: this(...)`).
     /// - `Extractor`: a pattern-position application (`case T(x)`, an unapply).
     /// - `Infix`: an infix application whose operator token names the callable
     ///   (`a op b` in Scala or Kotlin).
@@ -47,6 +49,52 @@ labelled_enum! {
         Infix => "infix",
         Operator => "operator",
         MethodValue => "method_value",
+    }
+}
+
+labelled_enum! {
+    /// How a call site's callee name relates to the token the lowering
+    /// recorded as its name.
+    ///
+    /// Most calls write their callee: the recorded name token is the whole
+    /// callee name. A Ruby attribute writer (`r.attr = v`) calls `attr=` and
+    /// writes only `attr`; a Ruby element reference (`r[i]`) calls `[]` and an
+    /// element assignment (`r[i] = v`) calls `[]=`, writing only brackets. The
+    /// grammar node says which form it is, so the callee name is derived from
+    /// this fact and the recorded token rather than from re-read source text.
+    ///
+    /// - `Written`: the recorded name token is the callee name.
+    /// - `AttributeWriter`: the recorded name token followed by `=`.
+    /// - `ElementReference`: `[]`; the recorded token is the opening bracket.
+    /// - `ElementAssignment`: `[]=`; the recorded token is the opening bracket.
+    CalleeSpelling, ALL_CALLEE_SPELLINGS {
+        Written => "written",
+        AttributeWriter => "attribute_writer",
+        ElementReference => "element_reference",
+        ElementAssignment => "element_assignment",
+    }
+}
+
+impl CalleeSpelling {
+    /// The callee name this spelling denotes, given the recorded name token.
+    pub fn callee_name(self, recorded: &str) -> String {
+        match self {
+            Self::Written => recorded.to_owned(),
+            Self::AttributeWriter => format!("{recorded}="),
+            Self::ElementReference => "[]".to_owned(),
+            Self::ElementAssignment => "[]=".to_owned(),
+        }
+    }
+
+    /// The recorded token a spelled callee `name` is written with, when some
+    /// spelling derives `name` from a different token: `attr` for `attr=`
+    /// and `[` for `[]` or `[]=`. Source prefilters use it, because the
+    /// derived name itself never appears in the source.
+    pub fn recorded_token_of(name: &str) -> Option<&str> {
+        match name {
+            "[]" | "[]=" => Some("["),
+            _ => name.strip_suffix('=').filter(|token| !token.is_empty()),
+        }
     }
 }
 
@@ -86,6 +134,10 @@ labelled_enum! {
     /// - `Exact`: every group and argument is read from source structure.
     /// - `ExactMacroDerived`: the language adapter read a macro token tree
     ///   and recorded the complete argument shape implied by its lowering.
+    /// - `AdmittedCandidateMacro`: the selected procedure realizes every
+    ///   candidate and supplies the complete runtime actuals.
+    /// - `CandidateMacroDerived`: supported syntax awaiting package identity
+    ///   admission; operands have no executable argument shape yet.
     /// - `Partial`: some groups or arguments are known, but the shape is not
     ///   complete (for example, one argument's structure is unreadable).
     /// - `UnknownMacroDerived`: the argument list is produced by a macro or
@@ -99,6 +151,8 @@ labelled_enum! {
         UnknownMacroDerived => "unknown_macro_derived",
         UnknownDynamic => "unknown_dynamic",
         ExactMacroDerived => "exact_macro_derived",
+        CandidateMacroDerived => "candidate_macro_derived",
+        AdmittedCandidateMacro => "admitted_candidate_macro",
     }
 }
 
@@ -106,7 +160,10 @@ impl CallShapeCoverage {
     /// Whether the complete ordered argument shape is available to shared
     /// call-shape and binding algorithms.
     pub const fn is_exact(self) -> bool {
-        matches!(self, Self::Exact | Self::ExactMacroDerived)
+        matches!(
+            self,
+            Self::Exact | Self::ExactMacroDerived | Self::AdmittedCandidateMacro
+        )
     }
 }
 
@@ -392,6 +449,8 @@ pub struct CallSiteFacts {
     /// `f(a)(b)` does. False everywhere the outer application applies the
     /// *result* of the inner one, which is what `f(a)(b)` means in JavaScript.
     pub continues_callee_groups: bool,
+    /// How the callee name follows from the recorded name token.
+    pub callee_spelling: CalleeSpelling,
 }
 
 impl CallSiteFacts {
@@ -409,6 +468,7 @@ impl CallSiteFacts {
             coverage: CallShapeCoverage::Exact,
             continues_callee_groups: false,
             callee_provenance: None,
+            callee_spelling: CalleeSpelling::Written,
         }
     }
 
@@ -420,6 +480,7 @@ impl CallSiteFacts {
             coverage,
             continues_callee_groups: false,
             callee_provenance: None,
+            callee_spelling: CalleeSpelling::Written,
         }
     }
 
@@ -427,6 +488,12 @@ impl CallSiteFacts {
     /// callee position.
     pub const fn continuing(mut self) -> Self {
         self.continues_callee_groups = true;
+        self
+    }
+
+    /// Mark this site's callee name as derived from its recorded token.
+    pub const fn spelled(mut self, callee_spelling: CalleeSpelling) -> Self {
+        self.callee_spelling = callee_spelling;
         self
     }
 }

@@ -93,17 +93,73 @@ pub enum RetainedNode<'a> {
     ValueFlowEndpoint(&'a ValueFlowEndpoint),
 }
 
+enum RetainedAllocation<'a> {
+    Artifact(&'a Arc<SemanticArtifact>),
+    #[cfg(feature = "test-support")]
+    Relation(&'a OracleRelationHandle),
+}
+
 #[doc(hidden)]
 pub fn visit_retained_artifacts<'a>(
     root: RetainedNode<'a>,
     mut visit: impl FnMut(&Arc<SemanticArtifact>),
 ) {
-    let mut stack = vec![root];
+    visit_retained_graph(root, |allocation| match allocation {
+        RetainedAllocation::Artifact(artifact) => visit(artifact),
+        #[cfg(feature = "test-support")]
+        RetainedAllocation::Relation(_) => {}
+    });
+}
+
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn visit_retained_allocations<'a>(
+    root: RetainedNode<'a>,
+    census: &mut brokk_bifrost_core::retention_census::RetentionCensus<'_>,
+    family: &'static str,
+) {
+    visit_retained_allocations_from_roots([root], census, family);
+}
+
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn visit_retained_allocations_from_roots<'a>(
+    roots: impl IntoIterator<Item = RetainedNode<'a>>,
+    census: &mut brokk_bifrost_core::retention_census::RetentionCensus<'_>,
+    family: &'static str,
+) {
+    visit_retained_graph_roots(roots, |allocation| match allocation {
+        RetainedAllocation::Artifact(artifact) => {
+            artifact.retention_census_for_test(census, family)
+        }
+        RetainedAllocation::Relation(relation) => {
+            relation.record_arena_allocation_for_test(census, family);
+            census.record_unknown(
+                family,
+                brokk_bifrost_core::retention_census::FamilyLifetime::Persistent,
+                brokk_bifrost_core::retention_census::UnknownKind::Coverage,
+                "oracle_relation_arena_estimate_omits_nested_owner_payloads_and_arc_control_block",
+            );
+        }
+    });
+}
+
+fn visit_retained_graph<'a>(root: RetainedNode<'a>, visit: impl FnMut(RetainedAllocation<'_>)) {
+    visit_retained_graph_roots([root], visit);
+}
+
+fn visit_retained_graph_roots<'a>(
+    roots: impl IntoIterator<Item = RetainedNode<'a>>,
+    mut visit: impl FnMut(RetainedAllocation<'_>),
+) {
+    let mut stack = roots.into_iter().collect::<Vec<_>>();
     let mut visited_relation_arenas = HashSet::new();
 
     while let Some(node) = stack.pop() {
         match node {
-            RetainedNode::Procedure(procedure) => visit(procedure.artifact()),
+            RetainedNode::Procedure(procedure) => {
+                visit(RetainedAllocation::Artifact(procedure.artifact()))
+            }
             RetainedNode::CallContext(context) => {
                 for call in context.calls().iter().rev() {
                     stack.push(RetainedNode::Procedure(call.procedure()));
@@ -142,7 +198,9 @@ pub fn visit_retained_artifacts<'a>(
                 AccessPathRoot::Static(locator)
                 | AccessPathRoot::TypeSummary(locator)
                 | AccessPathRoot::ModuleObject(locator)
-                | AccessPathRoot::External(locator) => visit(locator.scope()),
+                | AccessPathRoot::External(locator) => {
+                    visit(RetainedAllocation::Artifact(locator.scope()))
+                }
                 AccessPathRoot::RuntimeObject(_) => {}
                 AccessPathRoot::FieldPath { base, .. } => {
                     stack.push(RetainedNode::AccessRoot(base));
@@ -157,7 +215,9 @@ pub fn visit_retained_artifacts<'a>(
             RetainedNode::AccessPath(path) => {
                 for selector in path.selectors().iter().rev() {
                     match selector {
-                        AccessSelector::Field(field) => visit(field.scope()),
+                        AccessSelector::Field(field) => {
+                            visit(RetainedAllocation::Artifact(field.scope()))
+                        }
                         AccessSelector::Property(_) => {}
                         AccessSelector::Index(IndexSelector::Exact(index)) => {
                             stack.push(RetainedNode::Procedure(index.procedure()));
@@ -212,6 +272,8 @@ pub fn visit_retained_artifacts<'a>(
                 if !visited_relation_arenas.insert(relation.arena_identity()) {
                     continue;
                 }
+                #[cfg(feature = "test-support")]
+                visit(RetainedAllocation::Relation(relation));
                 let arena = relation.arena();
                 for record in arena.records().iter().rev() {
                     stack.push(RetainedNode::RelationRecord(record));

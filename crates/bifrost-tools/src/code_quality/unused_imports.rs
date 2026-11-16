@@ -161,7 +161,7 @@ pub const fn unused_import_support(language: Language) -> UnusedImportSupport {
 /// role to a role it does emit, so the token still carries a row. Each entry
 /// records a checked claim; a role that is merely absent must not be added.
 ///
-/// `PatternPosition` is the only such role for the reporting languages.
+/// `PatternPosition` is routed to existing roles in these reporting languages.
 /// Python classifies `case Color.RED` as a `PathSegment` plus a
 /// `ValueReference`, and `case Shape()` as a `ValueReference`; JavaScript and
 /// TypeScript classify a destructuring pattern's tokens as binders; Java
@@ -170,7 +170,13 @@ pub const fn unused_import_support(language: Language) -> UnusedImportSupport {
 /// so its `match` arms are ordinary expressions. In every case the token that
 /// spells an imported name still has a row. Rust and Scala emit the role
 /// themselves and need no entry.
-const ROUTED_ELSEWHERE: &[OccurrenceRole] = &[OccurrenceRole::PatternPosition];
+// CalleePosition is Rust-specific. Other reporting adapters already emit
+// callee identifiers as their existing value/member/type reference roles.
+// Rust emits CalleePosition itself, so its callee rows remain required.
+const ROUTED_ELSEWHERE: &[OccurrenceRole] = &[
+    OccurrenceRole::PatternPosition,
+    OccurrenceRole::CalleePosition,
+];
 
 /// One import binder whose local name the file never spells.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -537,7 +543,7 @@ fn refine_import_certainties(
     let outcomes =
         resolve_definition_batch_with_source(analyzer, requests, file.clone(), source.into());
     assert_eq!(outcomes.len(), findings.len());
-    let overlay = analyzer.semantic_model_overlay();
+    let overlay = analyzer.semantic_model_overlay_read().published();
     let crates = RustOverlayCrates::new(overlay.as_deref());
     let mut syntax = HashMap::default();
     for (finding, outcome) in findings.iter_mut().zip(outcomes) {

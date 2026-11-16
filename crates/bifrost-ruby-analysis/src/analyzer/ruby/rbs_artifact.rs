@@ -92,7 +92,7 @@ impl RubyMemberAlias {
 /// the produced pack to `Completeness::Partial`, so surface this projection
 /// skipped can never be mistaken for surface it proved absent (#1624).
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct UnmodeledShape {
+pub(super) struct UnmodeledShape {
     node_kind: &'static str,
     expected: String,
 }
@@ -494,6 +494,7 @@ fn project_constant(
             hierarchy: Vec::new(),
             aliases: Vec::new(),
             extension_surfaces: Vec::new(),
+            rust_stability: None,
             guard: None,
             locator: Locator::Artifact {
                 path: crate::analyzer::ruby::artifact_logical_path(archive_sha256, entry_path),
@@ -536,6 +537,7 @@ pub(crate) fn constant_member_fact(
             generic_arity: 0,
             parameter_types: &[],
             parameter_variadics: &[],
+            extension_receiver: None,
             return_type: Some(&return_type),
         }),
         owner: owner_id.to_owned(),
@@ -554,6 +556,7 @@ pub(crate) fn constant_member_fact(
         extension_receiver: None,
         extension_receiver_constraints: Vec::new(),
         aliases: Vec::new(),
+        rust_stability: None,
         guard: None,
         locator,
     }
@@ -856,6 +859,7 @@ fn project_type(
         hierarchy,
         aliases: Vec::new(),
         extension_surfaces: Vec::new(),
+        rust_stability: None,
         guard: None,
         locator,
     });
@@ -929,6 +933,7 @@ fn project_attribute(
             generic_arity: 0,
             parameter_types: &[],
             parameter_variadics: &[],
+            extension_receiver: None,
             return_type: signature.returns.as_ref(),
         }),
         owner: owner_id.to_owned(),
@@ -947,6 +952,7 @@ fn project_attribute(
         extension_receiver: None,
         extension_receiver_constraints: Vec::new(),
         aliases: Vec::new(),
+        rust_stability: None,
         guard: None,
         locator: locator.clone(),
     })
@@ -1044,6 +1050,7 @@ fn project_method(
             generic_arity: signature.type_parameters.len(),
             parameter_types: &parameter_types,
             parameter_variadics: &[],
+            extension_receiver: None,
             return_type: signature.returns.as_ref(),
         });
         projected.push(MemberFact {
@@ -1070,6 +1077,7 @@ fn project_method(
             extension_receiver: None,
             extension_receiver_constraints: Vec::new(),
             aliases: Vec::new(),
+            rust_stability: None,
             guard: None,
             locator: locator.clone(),
         });
@@ -1480,7 +1488,7 @@ fn modeled_visibility(node_kind: &'static str, token: &str) -> Result<Visibility
     }
 }
 
-fn declaration_body(node: Node<'_>) -> Result<Node<'_>, UnmodeledShape> {
+pub(super) fn declaration_body(node: Node<'_>) -> Result<Node<'_>, UnmodeledShape> {
     if matches!(node.kind(), "decl" | "member" | "interface_member") {
         required_field(node, "body")
     } else {
@@ -1509,7 +1517,7 @@ fn required_child<'tree>(node: Node<'tree>, kind: &str) -> Result<Node<'tree>, U
 /// tree-sitter keeps comments as named siblings of declarations and members.
 /// They carry no declared surface, so skipping one loses nothing and must not
 /// demote the pack the way an unmodeled construct does.
-fn is_trivia(kind: &str) -> bool {
+pub(super) fn is_trivia(kind: &str) -> bool {
     kind == "comment"
 }
 
@@ -1532,7 +1540,7 @@ fn unsupported_declaration_kind(kind: &str) -> &str {
     kind.strip_suffix("_decl").unwrap_or(kind)
 }
 
-fn unwrap_type(mut node: Node<'_>) -> Node<'_> {
+pub(super) fn unwrap_type(mut node: Node<'_>) -> Node<'_> {
     while node.kind() == "type" {
         let Some(child) = named_children(node)
             .into_iter()

@@ -33,12 +33,19 @@ pub mod definition_inventory;
 pub mod git_file;
 pub mod gitblob;
 pub mod hash;
+pub mod heap_release;
+pub mod lever_tokens;
+pub mod omission;
 pub mod panic_report;
 pub mod path_normalization;
 pub mod path_utils;
 pub mod process;
 pub mod profiling;
+pub mod request_memo;
 pub mod retention_budget;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod retention_census;
 pub mod schema_version;
 pub mod sqlite_template;
 #[cfg(any(test, feature = "test-support"))]
@@ -52,3 +59,5 @@ pub mod util;
 pub(crate) mod test_git_support;
 
 pub use cancellation::CancellationToken;
+
+pub mod allocation_size;

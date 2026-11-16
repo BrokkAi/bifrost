@@ -81,6 +81,7 @@ use crate::analyzer::usages::effects::{
     ProcedureEffectReport, call_effect_report, modeled_call_targets_for_shapes,
     modeled_procedure_key_for_unit, native_call_targets_for_shapes, summarize_procedure_effects,
 };
+use brokk_bifrost_flow::value_flow::{DurableCallSiteKey, DurableProcedureKey};
 use brokk_bifrost_go_analysis::analyzer::GoCallResultUseIndex;
 
 use crate::structural::NormalizedKind;
@@ -250,6 +251,8 @@ pub(super) struct AssignmentRelationValue {
     pub(super) proof: &'static str,
     pub(super) coverage: EffectCoverage,
     pub(super) reason: Option<&'static str>,
+    pub(super) reason_codes: Vec<String>,
+    pub(super) open_reasons: Vec<CodeQueryWriteLivenessOpenReason>,
     pub(super) replacement_events: Vec<brokk_bifrost_flow::flow_state::StateEventRow>,
     pub(super) read_event: Option<brokk_bifrost_flow::flow_state::StateEventRow>,
     pub(super) related: Vec<CodeQueryRelatedSource>,
@@ -703,6 +706,21 @@ pub(super) struct EffectTraversalCache {
     keys: CaptureScopedMemo<HashMap<CodeUnit, Option<ModeledProcedureKey>>>,
     answers: CaptureScopedMemo<HashMap<ModeledProcedureKey, ModelAnswer>>,
     dispatch_answers: CaptureScopedMemo<HashMap<(ProjectFile, Range), DispatchAnswerWithCause>>,
+    /// #12968: the parameter whose unchanged value is a call's receiver.
+    receiver_parameters: CaptureScopedMemo<HashMap<DurableCallSiteKey, Option<u32>>>,
+    /// #12968: the argument classes one entering call proves.
+    argument_classes: CaptureScopedMemo<
+        HashMap<
+            DurableCallSiteKey,
+            (
+                Option<super::semantic::ArgumentClassesAnswer>,
+                Incompleteness,
+            ),
+        >,
+    >,
+    /// #12968: one call's dispatch under one receiver-class hypothesis.
+    conditional_dispatch_answers:
+        CaptureScopedMemo<HashMap<(DurableCallSiteKey, Box<str>), DispatchAnswerWithCause>>,
     result_contract_names: CaptureScopedMemo<Option<Arc<ResultContractNameInventory>>>,
     reports: CaptureScopedMemo<HashMap<String, Arc<ProcedureEffectReport>>>,
     facts: CaptureScopedMemo<HashMap<ProjectFile, Option<Arc<FileFacts>>>>,
@@ -738,6 +756,9 @@ pub(super) struct EffectTraversalCache {
     pub(super) incomplete: bool,
     /// Whether a bound rather than a missing fact caused the incompleteness.
     pub(super) truncated: bool,
+    /// The execution dependences the derived rows marked, which the query
+    /// joins into its reuse verdict with `truncated`.
+    pub(super) reuse: ReuseVerdict,
 }
 
 struct ModeledCallTargetWindow {
@@ -831,6 +852,7 @@ pub(super) struct NormalResultSubjectUse {
 #[derive(Debug, Clone)]
 pub(super) struct NormalResultSubjectUses {
     pub(super) uses: Vec<NormalResultSubjectUse>,
+    pub(super) reuse: ReuseVerdict,
 }
 
 fn open_result_subject_use(
@@ -896,6 +918,7 @@ pub(super) fn result_subject_use_expansions<'a>(
     use CodeQueryResultSubjectOutcome as Outcome;
 
     let open = |outcome, reason| {
+        let mut reuse = ReuseVerdict::Content;
         if matches!(outcome, Outcome::Cancelled | Outcome::BudgetExhausted) {
             brokk_bifrost_core::profiling::note_with(|| {
                 format!(
@@ -905,9 +928,11 @@ pub(super) fn result_subject_use_expansions<'a>(
                 )
             });
             workspace.analyzer().mark_execution_dependent();
+            reuse.join_in(EXECUTION_DEPENDENT);
         }
         NormalResultSubjectUses {
             uses: vec![open_result_subject_use(result, outcome, reason)],
+            reuse,
         }
     };
     let stopped = || {
@@ -980,16 +1005,18 @@ pub(super) fn result_subject_use_expansions<'a>(
         .saturating_mul(32)
         .saturating_add(graph_size.saturating_mul(128))
         .saturating_add(events.saturating_mul(events).saturating_mul(256));
-    if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+    if brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
         source.len(),
         limits.semantic.max_source_bytes,
     )
-    .allows(0)
-        || !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+    .try_allow(0)
+    .is_err()
+        || brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
             retained_bound,
             limits.semantic.max_retained_bytes,
         )
-        .allows(0)
+        .try_allow(0)
+        .is_err()
         || !semantic.charge_consumer_traversal(
             file,
             source.len().saturating_add(walk_work),
@@ -1117,6 +1144,7 @@ pub(super) fn result_subject_use_expansions<'a>(
     candidate_calls.sort_unstable();
     candidate_calls.dedup();
     let mut uses = Vec::new();
+    let mut reuse = ReuseVerdict::Content;
     let mut partition_complete = complete;
     let origin = result.public();
     let mut subject_digest = LengthDelimitedDigest::new(RESULT_SUBJECT_ID_DOMAIN);
@@ -1237,6 +1265,7 @@ pub(super) fn result_subject_use_expansions<'a>(
                                 )
                             });
                             analyzer.mark_execution_dependent();
+                            reuse.join_in(EXECUTION_DEPENDENT);
                         }
                         observation.row.outcome = match reason {
                             ConversionUnknown::Cancelled => Outcome::Cancelled,
@@ -1250,6 +1279,7 @@ pub(super) fn result_subject_use_expansions<'a>(
                             | ConversionUnknown::UnresolvedSourceType
                             | ConversionUnknown::UnresolvedTargetType
                             | ConversionUnknown::IncompleteHierarchy
+                            | ConversionUnknown::FixedLimit
                             | ConversionUnknown::SignatureApplicability => Outcome::Incomplete,
                         };
                         observation.row.reason = Some(reason.label());
@@ -1292,7 +1322,7 @@ pub(super) fn result_subject_use_expansions<'a>(
             "partial"
         };
     }
-    NormalResultSubjectUses { uses }
+    NormalResultSubjectUses { uses, reuse }
 }
 
 impl ResultUseIndex {
@@ -1681,13 +1711,16 @@ fn go_assignment_conversion_types_exact(
         let result_types = if let Some(cached) = result_types {
             cached
         } else {
-            let lowered =
+            // This memo and `semantic` belong to one query, so joining the
+            // fill's verdict once covers every later hit.
+            let (lowered, reuse) =
                 brokk_bifrost_go_analysis::analyzer::go_selected_callable_result_type_identities(
                     proof.analyzer,
                     proof.file,
                     proof.selected_callable,
                     &cancellation,
                 );
+            semantic.join_reuse(reuse);
             let types = lowered.and_then(|(types, work)| {
                 let charged = semantic.charge_consumer_traversal(
                     proof.file,
@@ -1720,13 +1753,15 @@ fn go_assignment_conversion_types_exact(
         } else {
             use brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution;
             let mut binding_stopped = false;
-            let answer = brokk_bifrost_go_analysis::analyzer::go_explicit_binding_type_identity(
-                proof.analyzer,
-                proof.file,
-                proof.source,
-                binding_declaration,
-                &cancellation,
-            );
+            let (answer, reuse) =
+                brokk_bifrost_go_analysis::analyzer::go_explicit_binding_type_identity(
+                    proof.analyzer,
+                    proof.file,
+                    proof.source,
+                    binding_declaration,
+                    &cancellation,
+                );
+            semantic.join_reuse(reuse);
             let (ty, work) = match answer {
                 BoundedResolution::Complete { value, work } => (value, work),
                 BoundedResolution::Exceeded { limit, work } => {
@@ -1870,13 +1905,16 @@ fn build_result_use_index(
             }
             if gap.capability == SemanticCapability::Assignments {
                 match gap.subject {
-                    SemanticGapSubject::Procedure => {
+                    SemanticGapSubject::FutureConstruction
+                    | SemanticGapSubject::FutureActivation
+                    | SemanticGapSubject::Procedure => {
                         index.assignment_value_flow_gap_at_procedure = true;
                     }
                     SemanticGapSubject::Point => {
                         index.assignment_value_flow_gap_points.insert(gap.point);
                     }
                     SemanticGapSubject::Value(_)
+                    | SemanticGapSubject::CleanupOwners(_)
                     | SemanticGapSubject::MemoryLocation(_)
                     | SemanticGapSubject::CallSite(_)
                     | SemanticGapSubject::CallContinuation { .. }
@@ -1919,6 +1957,7 @@ fn build_result_use_index(
                     SemanticEffect::ValueFlow {
                         kind:
                             ValueFlowKind::Local
+                            | ValueFlowKind::AddressOf
                             | ValueFlowKind::BackingStore {
                                 offset: BackingStoreOffset::Zero,
                             },
@@ -2510,18 +2549,83 @@ impl EffectTraversalCache {
             let key = (file.clone(), range);
             if let Some((answer, cause)) = dispatch_answers.get(&key) {
                 if cause.execution_cause().is_some() {
-                    semantic.analyzer().mark_execution_dependent();
+                    semantic.mark_execution_dependent();
                 }
                 return (Arc::clone(answer), *cause);
             }
             let (answer, incompleteness) = semantic.dispatch_at_source_with_cause(file, range);
             if incompleteness.execution_cause().is_some() {
-                semantic.analyzer().mark_execution_dependent();
+                semantic.mark_execution_dependent();
             }
             let answer = Arc::new(answer);
             dispatch_answers.insert(key, (Arc::clone(&answer), incompleteness));
             (answer, incompleteness)
         })
+    }
+
+    /// #12968: [`SemanticQueryContext::receiver_parameter_origin`], once per
+    /// call for this query.
+    fn receiver_parameter(
+        &mut self,
+        semantic: &mut SemanticQueryContext<'_>,
+        file: &ProjectFile,
+        call: &DurableCallSiteKey,
+    ) -> Option<u32> {
+        let attribution = memo_attribution(semantic.analyzer());
+        self.receiver_parameters.read_mut(&attribution, |memo| {
+            *memo
+                .entry(call.clone())
+                .or_insert_with(|| semantic.receiver_parameter_origin(file, call))
+        })
+    }
+
+    /// #12968: [`SemanticQueryContext::argument_classes`], once per entering
+    /// call for this query.
+    fn argument_classes(
+        &mut self,
+        semantic: &mut SemanticQueryContext<'_>,
+        file: &ProjectFile,
+        call: &DurableCallSiteKey,
+    ) -> Option<super::semantic::ArgumentClassesAnswer> {
+        let attribution = memo_attribution(semantic.analyzer());
+        self.argument_classes.read_mut(&attribution, |memo| {
+            let (answer, cause) = memo
+                .entry(call.clone())
+                .or_insert_with(|| semantic.argument_classes(file, call));
+            if cause.execution_cause().is_some() {
+                semantic.mark_execution_dependent();
+            }
+            answer.clone()
+        })
+    }
+
+    /// #12968: [`SemanticQueryContext::conditional_dispatch`], once per call
+    /// and hypothesis for this query.
+    fn conditional_dispatch(
+        &mut self,
+        semantic: &mut SemanticQueryContext<'_>,
+        file: &ProjectFile,
+        call: &DurableCallSiteKey,
+        class: &str,
+    ) -> DispatchAnswerWithCause {
+        let attribution = memo_attribution(semantic.analyzer());
+        self.conditional_dispatch_answers
+            .read_mut(&attribution, |memo| {
+                let key = (call.clone(), Box::<str>::from(class));
+                if let Some((answer, cause)) = memo.get(&key) {
+                    if cause.execution_cause().is_some() {
+                        semantic.mark_execution_dependent();
+                    }
+                    return (Arc::clone(answer), *cause);
+                }
+                let (answer, cause) = semantic.conditional_dispatch(file, call, class);
+                if cause.execution_cause().is_some() {
+                    semantic.mark_execution_dependent();
+                }
+                let answer = Arc::new(answer);
+                memo.insert(key, (Arc::clone(&answer), cause));
+                (answer, cause)
+            })
     }
 
     fn native_cpp_dispatch_for_shape(
@@ -2592,6 +2696,7 @@ impl EffectTraversalCache {
             );
         if cause.execution_cause().is_some() {
             analyzer.mark_execution_dependent();
+            self.reuse.join_in(EXECUTION_DEPENDENT);
         }
         Arc::clone(ranges)
     }
@@ -2897,6 +3002,7 @@ impl EffectTraversalCache {
         let Self {
             exact_source_identities,
             exact_sources,
+            reuse,
             ..
         } = self;
         let attribution = memo_attribution(analyzer);
@@ -2910,6 +3016,7 @@ impl EffectTraversalCache {
                     let source = analyzer.indexed_source(file).map(Arc::from);
                     if source.is_none() {
                         analyzer.mark_execution_dependent();
+                        reuse.join_in(EXECUTION_DEPENDENT);
                     }
                     exact_sources.insert(file.clone(), source);
                 }
@@ -3227,7 +3334,7 @@ fn lookup_declared_effects(
                         matches!(
                             effect,
                             crate::analyzer::semantic_model::CompiledSummaryEffect::Allocation {
-                                output: crate::analyzer::semantic_model::CompiledSummaryOutput::IndexedNormalReturn { ordinal },
+                                output: crate::analyzer::semantic_model::CompiledSummaryOutput::IndexedNormalReturn { ordinal, path: None },
                                 ..
                             } if *ordinal == contract.result_ordinal
                         )
@@ -3381,13 +3488,15 @@ pub(super) fn result_contract_call_expansions(
                 | ModeledCallTargetCoverage::Cancelled
         ) && cache.may_name_result_contract(analyzer, shape, answer.call_application)
         {
+            let coverage =
+                modeled_call_target_coverage(analyzer, &mut cache.reuse, answer.coverage);
             record_result_contract_dispatch_coverage(
                 analyzer,
                 cache,
                 diagnostics,
                 &outcome.file,
                 EffectDerivationCoverage::new(
-                    modeled_call_target_coverage(analyzer, answer.coverage),
+                    coverage,
                     match answer.coverage {
                         ModeledCallTargetCoverage::Cancelled => {
                             Incompleteness::Operational(DerivationExecutionCause::Cancelled)
@@ -3430,7 +3539,7 @@ pub(super) fn result_contract_call_expansions(
     if common_contracts.as_ref().is_none_or(Vec::is_empty) {
         return Vec::new();
     }
-    let coverage = modeled_call_target_coverage(analyzer, answer.coverage);
+    let coverage = modeled_call_target_coverage(analyzer, &mut cache.reuse, answer.coverage);
     if coverage != EffectCoverage::Exhaustive {
         record_result_contract_dispatch_coverage(
             analyzer,
@@ -3469,6 +3578,7 @@ pub fn cancelled_modeled_call_coverages_for_test() -> usize {
 
 fn modeled_call_target_coverage(
     analyzer: &dyn IAnalyzer,
+    reuse: &mut ReuseVerdict,
     coverage: ModeledCallTargetCoverage,
 ) -> EffectCoverage {
     match coverage {
@@ -3486,6 +3596,7 @@ fn modeled_call_target_coverage(
                 )
             });
             analyzer.mark_execution_dependent();
+            reuse.join_in(EXECUTION_DEPENDENT);
             EffectCoverage::Open
         }
         ModeledCallTargetCoverage::Truncated => {
@@ -3497,6 +3608,7 @@ fn modeled_call_target_coverage(
                 )
             });
             analyzer.mark_execution_dependent();
+            reuse.join_in(EXECUTION_DEPENDENT);
             EffectCoverage::Truncated
         }
         ModeledCallTargetCoverage::Unsupported => EffectCoverage::Unsupported,
@@ -3829,7 +3941,7 @@ pub(super) fn call_result_contract_expansions<'a>(
         .as_ref()
         .filter(|key| key.language == "go")
         .and_then(|key| {
-            let overlay = analyzer.semantic_model_overlay()?;
+            let overlay = analyzer.semantic_model_overlay_read().published()?;
             let descriptor = single_arm
                 .and_then(|arm| arm.unmaterialized_target.as_ref())
                 .and_then(|target| target.selected_external_descriptor.as_ref());
@@ -7790,7 +7902,12 @@ fn receiver_requires_non_null(preconditions: Option<&[CompiledOperationPrecondit
     };
     let receiver = preconditions
         .iter()
-        .filter(|precondition| matches!(precondition.input, CompiledSummaryInput::Receiver {}))
+        .filter(|precondition| {
+            matches!(
+                precondition.input,
+                CompiledSummaryInput::Receiver { path: None }
+            )
+        })
         .collect::<Vec<_>>();
     matches!(
         receiver.as_slice(),
@@ -8085,6 +8202,7 @@ pub(super) fn nilness_operation_expansions<'a>(
             seed: None,
             facts: None,
             resolved_external_callee: None,
+            fixed_array_invocation: None,
         })
         .collect::<Vec<_>>();
     for shape in contract_shapes {
@@ -8586,7 +8704,7 @@ fn call_result_return_classification(
     // below still proves the positive `Returned` classification.
     let mut open = derivation.is_none()
         || semantics.gaps().iter().any(|gap| {
-            gap.discharge == SemanticGapDischarge::ExitOnlyProcedureCompletion
+            gap.control_flow_discharge() == SemanticGapDischarge::ExitOnlyProcedureCompletion
                 && gap.impacts.contains(SemanticGapImpact::ReturnTransfer)
         });
     for result in results {
@@ -8637,7 +8755,7 @@ fn call_result_return_classification(
                     return false;
                 }
                 if matches!(
-                    gap.discharge,
+                    gap.control_flow_discharge(),
                     SemanticGapDischarge::RetainedEvaluationOrder
                         | SemanticGapDischarge::RetainedControlTopology
                         | SemanticGapDischarge::NonRejoiningExceptionalExit
@@ -8645,7 +8763,9 @@ fn call_result_return_classification(
                     return false;
                 }
                 match gap.subject {
-                    SemanticGapSubject::Procedure => true,
+                    SemanticGapSubject::FutureConstruction
+                    | SemanticGapSubject::FutureActivation
+                    | SemanticGapSubject::Procedure => true,
                     SemanticGapSubject::Point => {
                         gap.point == call.point
                             || call.normal_continuation.target() == Some(gap.point)
@@ -8660,6 +8780,9 @@ fn call_result_return_classification(
                             })
                     }
                     SemanticGapSubject::Value(value) => value == result,
+                    SemanticGapSubject::CleanupOwners(_) => gap
+                        .subject
+                        .contains_value(semantics.cleanup_chains(), result),
                     SemanticGapSubject::CallSite(site) => site == call.id,
                     SemanticGapSubject::CallContinuation { call_site, .. } => call_site == call.id,
                     SemanticGapSubject::MemoryLocation(_)
@@ -8732,7 +8855,7 @@ fn failure_use_candidates(
     // axes.
     for gap in semantics.gaps().iter().filter(|gap| {
         !matches!(
-            gap.discharge,
+            gap.control_flow_discharge(),
             SemanticGapDischarge::RetainedEvaluationOrder
                 | SemanticGapDischarge::RetainedControlTopology
                 | SemanticGapDischarge::NonRejoiningExceptionalExit
@@ -8973,7 +9096,9 @@ fn failure_use_origin(
             return false;
         }
         match gap.subject {
-            SemanticGapSubject::Procedure => true,
+            SemanticGapSubject::FutureConstruction
+            | SemanticGapSubject::FutureActivation
+            | SemanticGapSubject::Procedure => true,
             SemanticGapSubject::Point => {
                 relevant_points.contains(&gap.point)
                     || operand_span.is_some_and(|operand| {
@@ -8987,6 +9112,10 @@ fn failure_use_origin(
                     })
             }
             SemanticGapSubject::Value(value) => relevant_values.contains(&value),
+            SemanticGapSubject::CleanupOwners(_) => relevant_values.iter().any(|value| {
+                gap.subject
+                    .contains_value(semantics.cleanup_chains(), *value)
+            }),
             SemanticGapSubject::MemoryLocation(location) => relevant_locations.contains(&location),
             SemanticGapSubject::Capture(_) => operand_span.is_some_and(|operand| {
                 semantics
@@ -10419,7 +10548,12 @@ fn classify_result_member_operation(
     }
     let receiver_preconditions = preconditions
         .iter()
-        .filter(|precondition| matches!(&precondition.input, CompiledSummaryInput::Receiver {}))
+        .filter(|precondition| {
+            matches!(
+                &precondition.input,
+                CompiledSummaryInput::Receiver { path: None }
+            )
+        })
         .collect::<Vec<_>>();
     let [receiver] = receiver_preconditions.as_slice() else {
         // Parameter-only operation requirements are not requirements on this
@@ -10623,7 +10757,7 @@ fn classify_call_argument_operation(
             .filter(|precondition| {
                 matches!(
                     &precondition.input,
-                    CompiledSummaryInput::Parameter { ordinal }
+                    CompiledSummaryInput::Parameter { ordinal, path: None }
                         if *ordinal == parameter_ordinal
                 )
             })
@@ -11639,6 +11773,7 @@ fn exact_conditional_wrapper_shape(
             | SemanticEffect::CaptureBind { .. }
             | SemanticEffect::Throw { .. }
             | SemanticEffect::AsyncSuspend { .. }
+            | SemanticEffect::MemoryInterference
             | SemanticEffect::AsyncResume { .. } => false,
         });
     if !pure
@@ -12028,6 +12163,7 @@ fn conditional_result_consumption(
             }
             SemanticEffect::AsyncSuspend { awaited, .. } => *awaited == Some(result),
             SemanticEffect::Entry
+            | SemanticEffect::MemoryInterference
             | SemanticEffect::NormalExit
             | SemanticEffect::ExceptionalExit
             | SemanticEffect::Allocation { .. }
@@ -12041,7 +12177,7 @@ fn conditional_result_consumption(
     let gap_consumes = semantics.gaps().iter().any(|gap| {
         if !gap.impacts.contains(SemanticGapImpact::ValueFlow)
             || matches!(
-                gap.discharge,
+                gap.control_flow_discharge(),
                 SemanticGapDischarge::RetainedEvaluationOrder
                     | SemanticGapDischarge::RetainedControlTopology
                     | SemanticGapDischarge::NonRejoiningExceptionalExit
@@ -12051,6 +12187,9 @@ fn conditional_result_consumption(
         }
         match gap.subject {
             SemanticGapSubject::Value(value) => value == result,
+            SemanticGapSubject::CleanupOwners(_) => gap
+                .subject
+                .contains_value(semantics.cleanup_chains(), result),
             SemanticGapSubject::MemoryLocation(location) => semantics
                 .memory_location(location)
                 .is_some_and(|location| location.kind.uses_value(result)),
@@ -12070,7 +12209,10 @@ fn conditional_result_consumption(
             // the exact result span to be nested in the gap keeps unsupported
             // parent expressions open without letting a later capture or
             // spawn contaminate an already-discarded boolean.
-            SemanticGapSubject::Procedure | SemanticGapSubject::Point => gap_encloses_result(gap),
+            SemanticGapSubject::FutureConstruction
+            | SemanticGapSubject::FutureActivation
+            | SemanticGapSubject::Procedure
+            | SemanticGapSubject::Point => gap_encloses_result(gap),
             SemanticGapSubject::CallSite(_)
             | SemanticGapSubject::CallContinuation { .. }
             | SemanticGapSubject::AsyncContinuation { .. } => false,
@@ -14247,6 +14389,10 @@ fn record_effect_coverage_incomplete(
     let diagnostic = super::QueryExecutionState::diagnostic(
         analyzer,
         CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            has_non_utf8_refusal: false,
+            refusal_sites: Default::default(),
+            call_relation_facts: None,
+            uses_omissions: Vec::new(),
             incompleteness,
             related: Vec::new(),
             source: None,
@@ -14288,6 +14434,10 @@ fn record_coverage(
             if !cache.truncated {
                 cache.truncated = true;
                 diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                     incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                     related: Vec::new(),
                     source: None,
@@ -14322,6 +14472,10 @@ fn record_open_callee(
     incompleteness: Incompleteness,
 ) {
     diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        has_non_utf8_refusal: false,
+        refusal_sites: Default::default(),
+        call_relation_facts: None,
+        uses_omissions: Vec::new(),
         incompleteness,
         source: range.map(|range| CodeQuerySourceSpan {
             path: rel_path_string(file),
@@ -14530,11 +14684,33 @@ fn dispatch_arms(
 ) -> DispatchedArms {
     let (answer, dispatch_incompleteness) =
         cache.dispatch_at_source_with_cause(semantic, file, range);
-    let arms = classify_dispatch_arms(analyzer, cache, &answer);
+    dispatched_arms_from_answer(
+        analyzer,
+        cache,
+        diagnostics,
+        file,
+        range,
+        &answer,
+        dispatch_incompleteness,
+    )
+}
+
+/// Classify one dispatch answer at one call range, pairing every arm with
+/// its pack answer and reporting the site when it stays open.
+fn dispatched_arms_from_answer(
+    analyzer: &dyn IAnalyzer,
+    cache: &mut EffectTraversalCache,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    file: &ProjectFile,
+    range: Range,
+    answer: &super::dispatch::DispatchSiteAnswer,
+    dispatch_incompleteness: Incompleteness,
+) -> DispatchedArms {
+    let arms = classify_dispatch_arms(analyzer, cache, answer);
     // The site's coverage is read after the arms are classified: whether an
     // unresolved residual is discharged depends on what the activated packs
     // answered for the arms beside it.
-    let coverage = site_coverage(&answer, &arms);
+    let coverage = site_coverage(answer, &arms);
     let status = match answer.outcome {
         "resolved" | "ambiguous" => CallEffectSiteStatus::Answered { coverage },
         "unsupported" => CallEffectSiteStatus::Interrupted {
@@ -14566,18 +14742,38 @@ fn dispatch_arms(
             diagnostics,
             file,
             Some(range),
-            format!(
-                "{site}: dispatch={}, coverage={coverage:?}, unsupported={:?}, limit={:?}, residuals={:?}, reasons={:?}",
-                answer.outcome,
-                answer.semantic_unsupported,
-                answer.exceeded_limit,
-                answer
+            {
+                let items = answer
                     .unnamed_boundaries
                     .iter()
-                    .map(|boundary| boundary.label())
-                    .collect::<Vec<_>>(),
-                answer.coverage_reasons
-            ),
+                    .map(|item| item as &dyn std::fmt::Debug)
+                    .chain(
+                        answer
+                            .coverage_reasons
+                            .iter()
+                            .map(|item| item as &dyn std::fmt::Debug),
+                    )
+                    .collect::<Vec<_>>();
+                brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+                    format_args!(
+                        "{site}: dispatch={}, coverage={coverage:?}, unsupported={:?}, limit={:?}, residuals={:?}, reasons={:?}",
+                        answer.outcome,
+                        answer.semantic_unsupported,
+                        answer.exceeded_limit,
+                        answer
+                            .unnamed_boundaries
+                            .iter()
+                            .map(|boundary| boundary.label())
+                            .collect::<Vec<_>>(),
+                        answer.coverage_reasons
+                    ),
+                    format_args!(
+                        "{site}: dispatch={}, coverage={coverage:?}, unsupported={:?}, limit={:?}; residuals and reasons",
+                        answer.outcome, answer.semantic_unsupported, answer.exceeded_limit
+                    ),
+                    items.iter(),
+                )
+            },
             dispatch_incompleteness,
         );
     }
@@ -14917,68 +15113,129 @@ fn procedure_effect_expansions_for_root(
         .collect()
 }
 
-/// Walk the reachable call graph of one declaration, breadth first, bounded.
-///
-/// A callee is either a workspace callable the dispatch answer named, which the
-/// walk queues and reads the body of, or an external member a complete
-/// activated summary models, which enters the graph as a leaf: its own callees
-/// are outside the workspace and are not analyzable, so it has no outgoing
-/// edge, and the summary is what establishes its effect set. Admitting the leaf
-/// is what lets a positive declaration on an external member reach a workspace
-/// caller's `procedure_effect` rows instead of only closing the call site's own
-/// coverage.
-///
-/// A call whose target the workspace does not index and no pack models, an
-/// ambiguous dispatch and an exhausted bound each become a typed gap on the
-/// *calling* procedure, so the fixpoint can degrade that procedure's coverage
-/// rather than losing the fact.
-#[allow(clippy::too_many_arguments)]
-fn discover_effect_graph(
-    analyzer: &dyn IAnalyzer,
-    semantic: &mut SemanticQueryContext<'_>,
-    cache: &mut EffectTraversalCache,
-    budget: &mut CodeQueryExecutionBudget,
+/// One procedure node's identity in the effect graph: its declaration and,
+/// for a root selected by its semantic procedure row, that procedure.
+type EffectUnitKey = (CodeUnit, Option<String>);
+
+/// The receiver classes one specialized procedure node assumes: sorted
+/// `(parameter ordinal, class)` pairs, classes named in the procedure's own
+/// language (#12968). The empty context is the context-free node.
+type ReceiverContext = Box<[(u32, Box<str>)]>;
+
+/// One call site of a walked procedure body, kept so a copy of the procedure
+/// specialized for receiver classes can be assembled without re-reading its
+/// facts (#12968).
+struct WalkedSite {
+    file: ProjectFile,
+    range: Range,
+    site_id: String,
+    /// The exact semantic call of the site's one matching call context.
+    call: Option<DurableCallSiteKey>,
+    /// The typed gaps this site contributes to its procedure.
+    gaps: Vec<EffectReason>,
+    /// The callees this site contributes, in dispatch order.
+    arms: Vec<SiteArm>,
+    /// For each arm with a workspace callee, the edge the context-free walk
+    /// created for it, so specialization can retarget that edge.
+    workspace_edges: Vec<Option<usize>>,
+    /// The diagnostics this site pushed, as indices into the query's list.
+    diagnostics: std::ops::Range<usize>,
+    /// When the site's dispatch named no arm and its receiver is the unchanged
+    /// value of one of the procedure's parameters, that parameter.
+    receiver_parameter: Option<u32>,
+}
+
+/// One callee a call site contributes.
+#[derive(Clone)]
+struct SiteArm {
+    callee: Option<CodeUnit>,
+    external: Option<ExternalEffectCallee>,
+    certainty: EffectCertainty,
+    execution_timing: crate::analyzer::semantic::ExecutionTiming,
+}
+
+/// The context-free walk of one procedure body.
+struct WalkedProcedure {
+    unit: EffectUnitKey,
+    depth: usize,
+    /// The one semantic procedure every matching call context of the body
+    /// names, or `None` when there is none or they disagree. Argument classes
+    /// apply to a specialized copy only for this exact procedure.
+    procedure: Option<DurableProcedureKey>,
+    procedure_disagrees: bool,
+    sites: Vec<WalkedSite>,
+}
+
+/// A procedure node specialized for one receiver context.
+struct SpecializedNode {
+    index: usize,
+    unit: EffectUnitKey,
+    walked: usize,
+    context: ReceiverContext,
+    /// Diagnostics pushed while assembling this node's discharged sites.
+    diagnostics: std::ops::Range<usize>,
+    /// Sites whose recorded diagnostics this node still depends on.
+    kept_sites: Vec<usize>,
+}
+
+/// The query inputs one effect-graph discovery runs under.
+struct EffectWalkInputs<'q, 's> {
+    analyzer: &'q dyn IAnalyzer,
+    semantic: &'q mut SemanticQueryContext<'s>,
+    cache: &'q mut EffectTraversalCache,
+    budget: &'q mut CodeQueryExecutionBudget,
     limits: CodeQueryExecutionLimits,
-    cancellation: Option<&CancellationToken>,
-    diagnostics: &mut Vec<CodeQueryDiagnostic>,
-    cache_profile: &mut Option<QueryCacheProfile>,
-    root: &DeclarationValue,
-    root_procedure: Option<&SemanticProcedureValue>,
+    cancellation: Option<&'q CancellationToken>,
+    diagnostics: &'q mut Vec<CodeQueryDiagnostic>,
+    cache_profile: &'q mut Option<QueryCacheProfile>,
+}
+
+struct EffectGraphBuilder {
+    graph: EffectGraph,
     bounds: ProcedureEffectBudget,
-) -> EffectGraph {
-    let mut graph = EffectGraph::default();
-    let mut index_by_unit: HashMap<(CodeUnit, Option<String>), usize> = HashMap::default();
+    index_by_unit: HashMap<EffectUnitKey, usize>,
     // External leaves are keyed by their canonical member identity rather than
     // by a workspace unit, so two call sites naming the same external member
     // share one node and one edge target.
-    let mut index_by_external: HashMap<ModeledProcedureKey, usize> = HashMap::default();
-    let mut queue: Vec<((CodeUnit, Option<String>), usize)> = Vec::new();
+    index_by_external: HashMap<ModeledProcedureKey, usize>,
+    queue: Vec<(EffectUnitKey, usize)>,
+    cursor: usize,
+    root_unit: CodeUnit,
+    root_procedure_id: Option<String>,
+    root_procedure_span: Option<std::ops::Range<usize>>,
+    root_procedure_is_declaration: bool,
+    /// Context-free walks by node index.
+    walked: Vec<WalkedProcedure>,
+    walked_by_node: HashMap<usize, usize>,
+    /// Parameters whose receiver class could discharge a call of the procedure,
+    /// directly or by passing the parameter on.
+    interest: HashMap<EffectUnitKey, Vec<u32>>,
+    specialized: Vec<SpecializedNode>,
+    specialized_by_context: HashMap<(EffectUnitKey, ReceiverContext), usize>,
+    contexts_per_unit: HashMap<EffectUnitKey, usize>,
+}
 
-    let push_node = |graph: &mut EffectGraph,
-                     index_by_unit: &mut HashMap<(CodeUnit, Option<String>), usize>,
-                     cache: &mut EffectTraversalCache,
-                     unit: &CodeUnit,
-                     procedure_id: Option<&str>,
-                     display_name: Option<String>|
-     -> Option<usize> {
+impl EffectGraphBuilder {
+    fn push_node(
+        &mut self,
+        inputs: &mut EffectWalkInputs<'_, '_>,
+        unit: &CodeUnit,
+        procedure_id: Option<&str>,
+        display_name: Option<String>,
+    ) -> Option<usize> {
         let key = (unit.clone(), procedure_id.map(str::to_owned));
-        if let Some(index) = index_by_unit.get(&key) {
+        if let Some(index) = self.index_by_unit.get(&key) {
             return Some(*index);
         }
-        if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
-            graph.procedures.len(),
-            bounds.max_procedures,
-        )
-        .allows(1)
-        {
-            graph.truncated = true;
+        if !self.admit_node() {
             return None;
         }
+        let analyzer = inputs.analyzer;
         let identity = procedure_id.map_or_else(|| declaration_identity(unit), str::to_owned);
         let declaration_only =
             SignatureMetadata::unit_is_declaration_only(&analyzer.signature_metadata(unit));
-        let (declared, basis) = match cache.key_for(analyzer, unit) {
-            Some(key) => match cache.answer_for(analyzer, &key) {
+        let (declared, basis) = match inputs.cache.key_for(analyzer, unit) {
+            Some(key) => match inputs.cache.answer_for(analyzer, &key) {
                 ModelAnswer::Modeled {
                     complete,
                     covers_overrides,
@@ -15007,8 +15264,8 @@ fn discover_effect_graph(
             },
             None => (Vec::new(), EffectNodeBasis::Unestablished),
         };
-        let index = graph.procedures.len();
-        graph.procedures.push(EffectGraphProcedure {
+        let index = self.graph.procedures.len();
+        self.graph.procedures.push(EffectGraphProcedure {
             declaration_id: identity,
             display_name: display_name.unwrap_or_else(|| unit.fq_name()),
             declared,
@@ -15016,30 +15273,50 @@ fn discover_effect_graph(
             declaration_only,
             local_gaps: Vec::new(),
         });
-        index_by_unit.insert(key, index);
+        self.index_by_unit.insert(key, index);
         Some(index)
-    };
+    }
 
-    // The leaf admission charges the same procedure bound a workspace node
-    // does, so an authored external member cannot buy extra graph capacity.
-    let push_external_node = |graph: &mut EffectGraph,
-                              index_by_external: &mut HashMap<ModeledProcedureKey, usize>,
-                              external: &ExternalEffectCallee|
-     -> Option<usize> {
-        if let Some(index) = index_by_external.get(&external.key) {
+    /// Charge one node against the procedure bound, as every node does, so
+    /// neither an authored external member nor a receiver specialization can
+    /// buy extra graph capacity.
+    fn admit_node(&mut self) -> bool {
+        if brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+            self.graph.procedures.len(),
+            self.bounds.max_procedures,
+        )
+        .try_allow(1)
+        .is_err()
+        {
+            self.graph.truncated = true;
+            return false;
+        }
+        true
+    }
+
+    fn admit_edge(&mut self) -> bool {
+        if brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+            self.graph.edges.len(),
+            self.bounds.max_edges,
+        )
+        .try_allow(1)
+        .is_err()
+        {
+            self.graph.truncated = true;
+            return false;
+        }
+        true
+    }
+
+    fn push_external_node(&mut self, external: &ExternalEffectCallee) -> Option<usize> {
+        if let Some(index) = self.index_by_external.get(&external.key) {
             return Some(*index);
         }
-        if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
-            graph.procedures.len(),
-            bounds.max_procedures,
-        )
-        .allows(1)
-        {
-            graph.truncated = true;
+        if !self.admit_node() {
             return None;
         }
-        let index = graph.procedures.len();
-        graph.procedures.push(EffectGraphProcedure {
+        let index = self.graph.procedures.len();
+        self.graph.procedures.push(EffectGraphProcedure {
             declaration_id: external_procedure_identity(&external.key),
             display_name: external.key.display(),
             declared: external.declared.clone(),
@@ -15047,86 +15324,102 @@ fn discover_effect_graph(
             declaration_only: false,
             local_gaps: Vec::new(),
         });
-        index_by_external.insert(external.key.clone(), index);
+        self.index_by_external.insert(external.key.clone(), index);
         Some(index)
-    };
-
-    let root_procedure_id = root_procedure.map(SemanticProcedureValue::wire_id);
-    let root_procedure_span = root_procedure.map(SemanticProcedureValue::byte_span);
-    let root_procedure_is_declaration = root_procedure_span
-        .as_ref()
-        .is_some_and(|span| span.start == root.range.start_byte && span.end == root.range.end_byte);
-    let root_key = (root.unit.clone(), root_procedure_id.clone());
-    let root_display_name = root_procedure.map(|procedure| {
-        format!(
-            "{} ({})",
-            root.unit.fq_name(),
-            procedure.public().procedure_kind
-        )
-    });
-    if push_node(
-        &mut graph,
-        &mut index_by_unit,
-        cache,
-        &root.unit,
-        root_procedure_id.as_deref(),
-        root_display_name,
-    )
-    .is_none()
-    {
-        return graph;
     }
-    queue.push((root_key, 0));
 
-    let mut cursor = 0usize;
-    while cursor < queue.len() {
-        let (unit_key, depth) = queue[cursor].clone();
-        cursor += 1;
-        let (unit, procedure_scope) = unit_key;
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            graph.truncated = true;
-            break;
+    /// The graph key of a workspace callee: the root keeps its selected
+    /// semantic procedure when the selection is the whole declaration.
+    fn callee_key(&self, callee: &CodeUnit) -> EffectUnitKey {
+        let procedure_id = (self.root_procedure_is_declaration && *callee == self.root_unit)
+            .then(|| self.root_procedure_id.clone())
+            .flatten();
+        (callee.clone(), procedure_id)
+    }
+
+    /// Admit a workspace callee's context-free node and queue its body.
+    fn workspace_callee(
+        &mut self,
+        inputs: &mut EffectWalkInputs<'_, '_>,
+        callee: &CodeUnit,
+        depth: usize,
+    ) -> Option<usize> {
+        let key = self.callee_key(callee);
+        let index = self.push_node(inputs, &key.0, key.1.as_deref(), None)?;
+        // A callee already queued is already going to be walked at a depth no
+        // greater than this one. The fixpoint, rather than this walk, resolves
+        // cycles.
+        if self.queue.iter().all(|(queued, _)| queued != &key) {
+            self.queue.push((key, depth.saturating_add(1)));
         }
-        let Some(node) = index_by_unit
-            .get(&(unit.clone(), procedure_scope.clone()))
-            .copied()
-        else {
-            continue;
-        };
-        if depth > bounds.max_depth {
-            graph.truncated = true;
-            continue;
+        Some(index)
+    }
+
+    /// Walk every queued body that has not been walked yet.
+    fn walk_pending(&mut self, inputs: &mut EffectWalkInputs<'_, '_>) {
+        while self.cursor < self.queue.len() {
+            let (unit_key, depth) = self.queue[self.cursor].clone();
+            self.cursor += 1;
+            if inputs
+                .cancellation
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                self.graph.truncated = true;
+                self.cursor = self.queue.len();
+                break;
+            }
+            let Some(node) = self.index_by_unit.get(&unit_key).copied() else {
+                continue;
+            };
+            if depth > self.bounds.max_depth {
+                self.graph.truncated = true;
+                continue;
+            }
+            self.walk_body(inputs, node, unit_key, depth);
         }
+    }
+
+    fn walk_body(
+        &mut self,
+        inputs: &mut EffectWalkInputs<'_, '_>,
+        node: usize,
+        unit_key: EffectUnitKey,
+        depth: usize,
+    ) {
+        let analyzer = inputs.analyzer;
+        let (unit, procedure_scope) = &unit_key;
         let file = unit.source().clone();
-        let Some(facts) = cache.facts_for_effects(
+        let Some(facts) = inputs.cache.facts_for_effects(
             analyzer,
-            semantic,
+            inputs.semantic,
             &file,
-            budget,
-            limits,
-            cancellation,
-            diagnostics,
-            cache_profile,
+            inputs.budget,
+            inputs.limits,
+            inputs.cancellation,
+            inputs.diagnostics,
+            inputs.cache_profile,
         ) else {
-            continue;
+            return;
         };
         let static_const_initializer_calls =
-            cache.rust_static_const_initializer_calls(analyzer, &file, facts.source());
-        let ranges = analyzer.ranges_of(&unit);
+            inputs
+                .cache
+                .rust_static_const_initializer_calls(analyzer, &file, facts.source());
+        let ranges = analyzer.ranges_of(unit);
         // A declaration with no runnable entry has no body to enumerate: its
         // sites are declaration sites, and reading one as a body would claim an
         // empty effect set it never proved (#3508). The node keeps the basis
         // `push_node` decided from the summary answer.
-        if ranges.is_empty() || graph.procedures[node].declaration_only {
-            continue;
+        if ranges.is_empty() || self.graph.procedures[node].declaration_only {
+            return;
         }
-        graph.procedures[node].basis = EffectNodeBasis::BodyRead;
+        self.graph.procedures[node].basis = EffectNodeBasis::BodyRead;
         // One declaration can own several source sites -- a prototype and its
         // out-of-line definition inside one translation unit (#1650) -- and the
         // body is the union of the calls they contain.
         let body_spans = ranges.as_slice();
-        let procedure_body_span = if root_procedure_id == procedure_scope {
-            root_procedure_span.as_ref()
+        let procedure_body_span = if self.root_procedure_id == *procedure_scope {
+            self.root_procedure_span.clone()
         } else {
             None
         };
@@ -15144,7 +15437,7 @@ fn discover_effect_graph(
                     .contains(&(fact.range.start_byte, fact.range.end_byte))
             })
             .filter(|(_, fact)| {
-                procedure_body_span.map_or_else(
+                procedure_body_span.as_ref().map_or_else(
                     || {
                         body_spans.iter().any(|span| {
                             fact.range.start_byte >= span.start_byte
@@ -15159,24 +15452,30 @@ fn discover_effect_graph(
         call_nodes.sort_unstable();
         if call_nodes.len() > MAX_CALL_SITES_PER_PROCEDURE {
             call_nodes.truncate(MAX_CALL_SITES_PER_PROCEDURE);
-            graph.truncated = true;
+            self.graph.truncated = true;
         }
 
+        let honors_hypotheses = crate::analyzer::languages::language_support_for_hook(
+            crate::analyzer::common::language_for_file(&file),
+            "honors_receiver_hypotheses",
+        )
+        .is_some_and(|support| support.honors_receiver_hypotheses());
+        let mut walked = WalkedProcedure {
+            unit: unit_key.clone(),
+            depth,
+            procedure: None,
+            procedure_disagrees: false,
+            sites: Vec::new(),
+        };
         for (_, _, call_id) in call_nodes {
-            if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
-                graph.edges.len(),
-                bounds.max_edges,
-            )
-            .allows(1)
-            {
-                graph.truncated = true;
+            if !self.admit_edge() {
                 break;
             }
             let call_id = match u32::try_from(call_id) {
                 Ok(value) => value,
                 Err(_) => continue,
             };
-            let Some(shape) = call_shape_for_call(&facts, &file, call_id) else {
+            let Some(shape) = call_shape_for_call(&facts, &file, call_id, None) else {
                 continue;
             };
             // A curried sequence reports one site from any of its nodes, so
@@ -15185,157 +15484,763 @@ fn discover_effect_graph(
             if shape.outcome.range.start_byte != facts.node(call_id).range.start_byte {
                 continue;
             }
+            let diagnostics_start = inputs.diagnostics.len();
             let DispatchedArms {
                 status,
                 arms,
                 call_contexts,
             } = dispatch_arms(
                 analyzer,
-                semantic,
-                cache,
-                diagnostics,
+                inputs.semantic,
+                inputs.cache,
+                inputs.diagnostics,
                 &shape.outcome.file,
                 shape.outcome.range,
             );
-            let in_scope = |context: &super::dispatch::DispatchCallContext| {
-                procedure_scope.as_ref().map_or_else(
-                    || context.caller_is_exact && context.caller.as_ref() == Some(&unit),
-                    |procedure_id| context.procedure_id == *procedure_id,
-                )
+            let mut site = WalkedSite {
+                file: shape.outcome.file.clone(),
+                range: shape.outcome.range,
+                site_id: shape.outcome.site_id.clone(),
+                call: None,
+                gaps: Vec::new(),
+                arms: Vec::new(),
+                workspace_edges: Vec::new(),
+                diagnostics: diagnostics_start..inputs.diagnostics.len(),
+                receiver_parameter: None,
             };
-            let matching_contexts = call_contexts
-                .iter()
-                .enumerate()
-                .filter_map(|(index, context)| in_scope(context).then_some(index))
-                .collect::<HashSet<_>>();
-            let unknown_caller = call_contexts
-                .iter()
-                .any(|context| in_scope(context) && context.caller.is_none());
-            if matching_contexts.is_empty() {
-                if call_contexts.is_empty() || unknown_caller {
-                    graph.procedures[node]
-                        .local_gaps
-                        .push(EffectReason::DispatchUnresolved);
+            if let Some(call) = classify_site(
+                unit,
+                procedure_scope.as_deref(),
+                status,
+                arms,
+                &call_contexts,
+                &mut site,
+            ) {
+                match &walked.procedure {
+                    None if !walked.procedure_disagrees => walked.procedure = Some(call.0.clone()),
+                    Some(procedure) if *procedure != call.0 => {
+                        walked.procedure = None;
+                        walked.procedure_disagrees = true;
+                    }
+                    _ => {}
                 }
-                // Every exact context belongs to another semantic procedure:
-                // this is a source-contained call in a nested declaration,
-                // not an edge of the procedure currently being summarized.
-                continue;
-            }
-            if unknown_caller {
-                graph.procedures[node]
-                    .local_gaps
-                    .push(EffectReason::DispatchUnresolved);
-            }
-            let arms = arms
-                .into_iter()
-                .filter(|arm| matching_contexts.contains(&arm.call_context))
-                .collect::<Vec<_>>();
-            let site_coverage = match status {
-                CallEffectSiteStatus::Answered { coverage } => coverage,
-                CallEffectSiteStatus::Interrupted { reason } => {
-                    graph.procedures[node].local_gaps.push(reason);
-                    EffectCoverage::Open
+                if honors_hypotheses && site.arms.is_empty() && !site.gaps.is_empty() {
+                    site.receiver_parameter =
+                        inputs
+                            .cache
+                            .receiver_parameter(inputs.semantic, &site.file, &call);
                 }
-            };
-            if !site_coverage.is_exhaustive() {
-                graph.procedures[node]
-                    .local_gaps
-                    .push(EffectReason::DispatchUnresolved);
+                site.call = Some(call);
             }
-            let exact_site = site_coverage.is_exhaustive() && arms.len() == 1 && !unknown_caller;
-            for arm in &arms {
-                match &arm.effect.lookup {
-                    ArmLookup::Unkeyable => {
-                        graph.procedures[node]
-                            .local_gaps
-                            .push(EffectReason::CalleeUnkeyable);
-                    }
-                    ArmLookup::Conflict => {
-                        graph.procedures[node]
-                            .local_gaps
-                            .push(EffectReason::ModelConflict);
-                    }
-                    ArmLookup::InputUnavailable => {
-                        graph.procedures[node]
-                            .local_gaps
-                            .push(EffectReason::ModelInputUnavailable);
-                    }
-                    ArmLookup::Unmodeled { analyzable: false } => {
-                        graph.procedures[node]
-                            .local_gaps
-                            .push(EffectReason::CalleeUnmodeled);
-                    }
-                    ArmLookup::Declared(_)
-                    | ArmLookup::SummarizedExternal(_)
-                    | ArmLookup::Unmodeled { analyzable: true } => {}
-                }
-            }
-            for arm in arms {
-                let certainty = if exact_site {
-                    EffectCertainty::Definite
-                } else {
-                    EffectCertainty::Possible
-                };
-                if let Some(callee_unit) = arm.callee {
-                    let callee_procedure_id = (root_procedure_is_declaration
-                        && callee_unit == root.unit)
-                        .then_some(root_procedure_id.as_deref())
-                        .flatten();
-                    let callee_key = (callee_unit.clone(), callee_procedure_id.map(str::to_owned));
-                    let Some(callee) = push_node(
-                        &mut graph,
-                        &mut index_by_unit,
-                        cache,
-                        &callee_unit,
-                        callee_procedure_id,
-                        None,
-                    ) else {
-                        graph.procedures[node]
-                            .local_gaps
-                            .push(EffectReason::ProcedureBudgetExhausted);
-                        continue;
-                    };
-                    graph.edges.push(EffectGraphEdge {
-                        caller: node,
-                        callee,
-                        site_id: shape.outcome.site_id.clone(),
-                        certainty,
-                        execution_timing: arm.effect.execution_timing,
-                    });
-                    // A callee already queued is already going to be walked at
-                    // a depth no greater than this one. The fixpoint below,
-                    // rather than this walk, resolves cycles.
-                    if queue.iter().all(|(queued, _)| queued != &callee_key) {
-                        queue.push((callee_key, depth.saturating_add(1)));
+            self.graph.procedures[node]
+                .local_gaps
+                .extend(site.gaps.iter().copied());
+            for arm in &site.arms {
+                let mut workspace_edge = None;
+                if let Some(callee_unit) = &arm.callee {
+                    match self.workspace_callee(inputs, callee_unit, depth) {
+                        Some(callee) => {
+                            workspace_edge = Some(self.graph.edges.len());
+                            self.graph.edges.push(EffectGraphEdge {
+                                caller: node,
+                                callee,
+                                site_id: site.site_id.clone(),
+                                certainty: arm.certainty,
+                                execution_timing: arm.execution_timing,
+                            });
+                        }
+                        None => {
+                            self.graph.procedures[node]
+                                .local_gaps
+                                .push(EffectReason::ProcedureBudgetExhausted);
+                            site.workspace_edges.push(None);
+                            continue;
+                        }
                     }
                 }
+                site.workspace_edges.push(workspace_edge);
                 // An external modeled member is a graph leaf: there is no
                 // workspace body to queue, but the exact call timing still
                 // composes with its declared effects.
-                if let Some(external) = arm.external_callee {
-                    let Some(callee) =
-                        push_external_node(&mut graph, &mut index_by_external, &external)
-                    else {
-                        graph.procedures[node]
+                if let Some(external) = &arm.external {
+                    let Some(callee) = self.push_external_node(external) else {
+                        self.graph.procedures[node]
                             .local_gaps
                             .push(EffectReason::ProcedureBudgetExhausted);
                         continue;
                     };
-                    graph.edges.push(EffectGraphEdge {
+                    self.graph.edges.push(EffectGraphEdge {
                         caller: node,
                         callee,
-                        site_id: shape.outcome.site_id.clone(),
-                        certainty,
-                        execution_timing: arm.effect.execution_timing,
+                        site_id: site.site_id.clone(),
+                        certainty: arm.certainty,
+                        execution_timing: arm.execution_timing,
+                    });
+                }
+            }
+            walked.sites.push(site);
+        }
+        self.graph.procedures[node].local_gaps.sort_unstable();
+        self.graph.procedures[node].local_gaps.dedup();
+        self.walked_by_node.insert(node, self.walked.len());
+        self.walked.push(walked);
+    }
+
+    /// Recompute, to a fixpoint over the context-free walks, the parameters
+    /// whose receiver class could discharge a call of each procedure: its own
+    /// parameter-receiver sites, plus each parameter it passes unchanged to a
+    /// callee parameter that is itself of interest. Only edges into a
+    /// procedure of interest pay for argument classification.
+    fn compute_interest(&mut self, inputs: &mut EffectWalkInputs<'_, '_>) {
+        for walked in &self.walked {
+            let mut parameters = walked
+                .sites
+                .iter()
+                .filter_map(|site| site.receiver_parameter)
+                .collect::<Vec<_>>();
+            parameters.sort_unstable();
+            parameters.dedup();
+            if !parameters.is_empty() {
+                let entry = self.interest.entry(walked.unit.clone()).or_default();
+                entry.extend(parameters);
+                entry.sort_unstable();
+                entry.dedup();
+            }
+        }
+        loop {
+            let mut grew = false;
+            for walked_index in 0..self.walked.len() {
+                for site_index in 0..self.walked[walked_index].sites.len() {
+                    let site = &self.walked[walked_index].sites[site_index];
+                    let Some(call) = site.call.clone() else {
+                        continue;
+                    };
+                    let file = site.file.clone();
+                    let callees = site
+                        .arms
+                        .iter()
+                        .filter_map(|arm| arm.callee.as_ref())
+                        .map(|callee| self.callee_key(callee))
+                        .collect::<Vec<_>>();
+                    for callee in callees {
+                        let Some(wanted) = self.interest.get(&callee).cloned() else {
+                            continue;
+                        };
+                        let Some(facts) = self.argument_facts(inputs, &file, &call, &callee) else {
+                            continue;
+                        };
+                        for ordinal in wanted {
+                            let Some(crate::analyzer::semantic::ArgumentClass::CallerParameter(
+                                caller,
+                            )) = facts
+                                .iter()
+                                .find(|(candidate, _)| *candidate == ordinal)
+                                .map(|(_, class)| class.clone())
+                            else {
+                                continue;
+                            };
+                            let unit = self.walked[walked_index].unit.clone();
+                            let entry = self.interest.entry(unit).or_default();
+                            if !entry.contains(&caller) {
+                                entry.push(caller);
+                                entry.sort_unstable();
+                                grew = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+    }
+
+    /// The argument classes `call` proves for `callee`, when the call's unique
+    /// callee is exactly the semantic procedure the callee's body was walked
+    /// as.
+    fn argument_facts(
+        &self,
+        inputs: &mut EffectWalkInputs<'_, '_>,
+        file: &ProjectFile,
+        call: &DurableCallSiteKey,
+        callee: &EffectUnitKey,
+    ) -> Option<Vec<(u32, crate::analyzer::semantic::ArgumentClass)>> {
+        let walked = self
+            .index_by_unit
+            .get(callee)
+            .and_then(|node| self.walked_by_node.get(node))
+            .map(|walked| &self.walked[*walked])?;
+        let procedure = walked.procedure.as_ref()?;
+        let facts = inputs.cache.argument_classes(inputs.semantic, file, call)?;
+        (facts.callee == *procedure).then_some(facts.classes)
+    }
+
+    /// The receiver context an edge through `call` gives `callee` when its
+    /// caller runs under `caller_context`.
+    fn callee_context(
+        &self,
+        inputs: &mut EffectWalkInputs<'_, '_>,
+        file: &ProjectFile,
+        call: Option<&DurableCallSiteKey>,
+        callee: &EffectUnitKey,
+        caller_context: &[(u32, Box<str>)],
+    ) -> ReceiverContext {
+        let (Some(call), Some(wanted)) = (call, self.interest.get(callee)) else {
+            return Box::default();
+        };
+        let wanted = wanted.clone();
+        let Some(facts) = self.argument_facts(inputs, file, call, callee) else {
+            return Box::default();
+        };
+        let mut context = Vec::new();
+        for ordinal in wanted {
+            let class = match facts
+                .iter()
+                .find(|(candidate, _)| *candidate == ordinal)
+                .map(|(_, class)| class)
+            {
+                Some(crate::analyzer::semantic::ArgumentClass::Class(class)) => class.clone(),
+                Some(crate::analyzer::semantic::ArgumentClass::CallerParameter(caller)) => {
+                    match caller_context
+                        .iter()
+                        .find(|(candidate, _)| candidate == caller)
+                    {
+                        Some((_, class)) => class.clone(),
+                        None => continue,
+                    }
+                }
+                None => continue,
+            };
+            context.push((ordinal, class));
+        }
+        context.into_boxed_slice()
+    }
+
+    /// The node for `callee` under `context`: the context-free node for the
+    /// empty context, otherwise a specialized copy, created on first use.
+    /// `None` when the per-procedure context cap or the procedure bound
+    /// refuses a new copy.
+    fn node_for_context(
+        &mut self,
+        callee: &EffectUnitKey,
+        context: ReceiverContext,
+    ) -> Option<usize> {
+        let base = *self.index_by_unit.get(callee)?;
+        if context.is_empty() {
+            return Some(base);
+        }
+        let key = (callee.clone(), context);
+        if let Some(index) = self.specialized_by_context.get(&key) {
+            return Some(*index);
+        }
+        let walked = *self.walked_by_node.get(&base)?;
+        // Past the cap the edge keeps the context-free node, and its caller
+        // reports the bound: an answer that depends on a limit is operational.
+        let count = self
+            .contexts_per_unit
+            .get(callee)
+            .copied()
+            .unwrap_or_default();
+        if count >= self.bounds.max_receiver_contexts_per_procedure || !self.admit_node() {
+            return None;
+        }
+        self.contexts_per_unit.insert(callee.clone(), count + 1);
+        let template = &self.graph.procedures[base];
+        let mut digest = LengthDelimitedDigest::new(b"bifrost.effects.receiver_context.v1");
+        for (ordinal, class) in key.1.iter() {
+            digest.push(&ordinal.to_le_bytes());
+            digest.push(class.as_bytes());
+        }
+        let procedure = EffectGraphProcedure {
+            declaration_id: format!("{}|receivers:{}", template.declaration_id, digest.finish()),
+            // Witness chains render procedure names; the context is visible
+            // in the node's diagnostic instead.
+            display_name: template.display_name.clone(),
+            declared: template.declared.clone(),
+            basis: template.basis,
+            declaration_only: template.declaration_only,
+            local_gaps: Vec::new(),
+        };
+        let index = self.graph.procedures.len();
+        self.graph.procedures.push(procedure);
+        self.specialized.push(SpecializedNode {
+            index,
+            unit: callee.clone(),
+            walked,
+            context: key.1.clone(),
+            diagnostics: 0..0,
+            kept_sites: Vec::new(),
+        });
+        self.specialized_by_context.insert(key, index);
+        Some(index)
+    }
+
+    /// Retarget the context-free node's workspace edges whose call proves
+    /// receiver classes for an interested callee.
+    fn specialize_context_free_edges(
+        &mut self,
+        inputs: &mut EffectWalkInputs<'_, '_>,
+        walked_index: usize,
+    ) {
+        let node = *self
+            .index_by_unit
+            .get(&self.walked[walked_index].unit)
+            .expect("a walked procedure has a node");
+        for site_index in 0..self.walked[walked_index].sites.len() {
+            let site = &self.walked[walked_index].sites[site_index];
+            let file = site.file.clone();
+            let call = site.call.clone();
+            let targets = site
+                .arms
+                .iter()
+                .zip(&site.workspace_edges)
+                .filter_map(|(arm, edge)| Some((arm.callee.as_ref()?, (*edge)?)))
+                .map(|(callee, edge)| (self.callee_key(callee), edge))
+                .collect::<Vec<_>>();
+            for (callee, edge) in targets {
+                let context = self.callee_context(inputs, &file, call.as_ref(), &callee, &[]);
+                if context.is_empty() {
+                    continue;
+                }
+                match self.node_for_context(&callee, context) {
+                    Some(target) => self.graph.edges[edge].callee = target,
+                    None => self.graph.procedures[node]
+                        .local_gaps
+                        .push(EffectReason::ProcedureBudgetExhausted),
+                }
+            }
+        }
+    }
+
+    /// Assemble one specialized copy from its procedure's context-free walk:
+    /// each parameter-receiver site whose parameter the context names is
+    /// answered again under that receiver class; every other site contributes
+    /// what it contributed to the context-free node, with its workspace
+    /// callees specialized by the same rule.
+    fn assemble_specialized(&mut self, inputs: &mut EffectWalkInputs<'_, '_>, specialized: usize) {
+        let SpecializedNode {
+            index: node,
+            walked: walked_index,
+            ..
+        } = self.specialized[specialized];
+        let context = self.specialized[specialized].context.clone();
+        let (unit, procedure_scope) = self.walked[walked_index].unit.clone();
+        let depth = self.walked[walked_index].depth;
+        let procedure = self.walked[walked_index].procedure.clone();
+        let diagnostics_start = inputs.diagnostics.len();
+        let mut gaps = Vec::new();
+        let mut kept_sites = Vec::new();
+        for site_index in 0..self.walked[walked_index].sites.len() {
+            let site = &self.walked[walked_index].sites[site_index];
+            let file = site.file.clone();
+            let range = site.range;
+            let site_id = site.site_id.clone();
+            let call = site.call.clone();
+            let hypothesis = site
+                .receiver_parameter
+                .and_then(|ordinal| context.iter().find(|(candidate, _)| *candidate == ordinal))
+                .filter(|_| {
+                    call.as_ref()
+                        .zip(procedure.as_ref())
+                        .is_some_and(|(call, procedure)| call.0 == *procedure)
+                })
+                .map(|(_, class)| class.clone());
+            let arms = match (hypothesis, &call) {
+                (Some(class), Some(call_key)) => {
+                    let (answer, incompleteness) =
+                        inputs
+                            .cache
+                            .conditional_dispatch(inputs.semantic, &file, call_key, &class);
+                    let DispatchedArms {
+                        status,
+                        arms,
+                        call_contexts,
+                    } = dispatched_arms_from_answer(
+                        inputs.analyzer,
+                        inputs.cache,
+                        inputs.diagnostics,
+                        &file,
+                        range,
+                        &answer,
+                        incompleteness,
+                    );
+                    let mut discharged = WalkedSite {
+                        file: file.clone(),
+                        range,
+                        site_id: site_id.clone(),
+                        call: None,
+                        gaps: Vec::new(),
+                        arms: Vec::new(),
+                        workspace_edges: Vec::new(),
+                        diagnostics: 0..0,
+                        receiver_parameter: None,
+                    };
+                    classify_site(
+                        &unit,
+                        procedure_scope.as_deref(),
+                        status,
+                        arms,
+                        &call_contexts,
+                        &mut discharged,
+                    );
+                    gaps.extend(discharged.gaps);
+                    discharged.arms
+                }
+                _ => {
+                    gaps.extend(site.gaps.iter().copied());
+                    kept_sites.push(site_index);
+                    site.arms.clone()
+                }
+            };
+            for arm in arms {
+                if !self.admit_edge() {
+                    break;
+                }
+                if let Some(callee_unit) = &arm.callee {
+                    let Some(base) = self.workspace_callee(inputs, callee_unit, depth) else {
+                        gaps.push(EffectReason::ProcedureBudgetExhausted);
+                        continue;
+                    };
+                    // A callee first named under this hypothesis has no walk
+                    // yet; read its body before specializing the edge.
+                    if !self.walked_by_node.contains_key(&base) {
+                        self.walk_pending(inputs);
+                        self.compute_interest(inputs);
+                    }
+                    let callee = self.callee_key(callee_unit);
+                    let callee_context =
+                        self.callee_context(inputs, &file, call.as_ref(), &callee, &context);
+                    let target = match self.node_for_context(&callee, callee_context) {
+                        Some(target) => target,
+                        None => {
+                            gaps.push(EffectReason::ProcedureBudgetExhausted);
+                            base
+                        }
+                    };
+                    self.graph.edges.push(EffectGraphEdge {
+                        caller: node,
+                        callee: target,
+                        site_id: site_id.clone(),
+                        certainty: arm.certainty,
+                        execution_timing: arm.execution_timing,
+                    });
+                }
+                if let Some(external) = &arm.external {
+                    let Some(callee) = self.push_external_node(external) else {
+                        gaps.push(EffectReason::ProcedureBudgetExhausted);
+                        continue;
+                    };
+                    self.graph.edges.push(EffectGraphEdge {
+                        caller: node,
+                        callee,
+                        site_id: site_id.clone(),
+                        certainty: arm.certainty,
+                        execution_timing: arm.execution_timing,
                     });
                 }
             }
         }
-        graph.procedures[node].local_gaps.sort_unstable();
-        graph.procedures[node].local_gaps.dedup();
+        gaps.sort_unstable();
+        gaps.dedup();
+        self.graph.procedures[node].local_gaps = gaps;
+        self.specialized[specialized].diagnostics = diagnostics_start..inputs.diagnostics.len();
+        self.specialized[specialized].kept_sites = kept_sites;
     }
 
+    /// Specialize procedures for the receiver classes their callers prove
+    /// (#12968). Every context-free node's edges are retargeted first, then
+    /// each specialized copy is assembled; assembling one can name new
+    /// callees and new copies, which join the same worklists.
+    fn specialize(&mut self, inputs: &mut EffectWalkInputs<'_, '_>) {
+        if self.walked.iter().all(|walked| {
+            walked
+                .sites
+                .iter()
+                .all(|site| site.receiver_parameter.is_none())
+        }) {
+            return;
+        }
+        self.compute_interest(inputs);
+        let mut walked_cursor = 0;
+        let mut specialized_cursor = 0;
+        loop {
+            if inputs
+                .cancellation
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                self.graph.truncated = true;
+                return;
+            }
+            if walked_cursor < self.walked.len() {
+                self.specialize_context_free_edges(inputs, walked_cursor);
+                walked_cursor += 1;
+            } else if specialized_cursor < self.specialized.len() {
+                self.assemble_specialized(inputs, specialized_cursor);
+                specialized_cursor += 1;
+            } else {
+                return;
+            }
+        }
+    }
+
+    /// The node indices the root reaches.
+    fn reachable(&self) -> Vec<bool> {
+        let mut reachable = vec![false; self.graph.procedures.len()];
+        let mut outgoing = vec![Vec::new(); self.graph.procedures.len()];
+        for edge in &self.graph.edges {
+            outgoing[edge.caller].push(edge.callee);
+        }
+        let mut stack = vec![0usize];
+        while let Some(node) = stack.pop() {
+            if std::mem::replace(&mut reachable[node], true) {
+                continue;
+            }
+            stack.extend(outgoing[node].iter().copied());
+        }
+        reachable
+    }
+}
+
+/// Reduce one site's classified dispatch answer to the gaps and callees it
+/// contributes to the procedure `unit` (scoped to `procedure_scope` for a root
+/// selected by its procedure row). Returns the exact call of the site's one
+/// matching call context, if there is exactly one.
+fn classify_site(
+    unit: &CodeUnit,
+    procedure_scope: Option<&str>,
+    status: CallEffectSiteStatus,
+    arms: Vec<DispatchedArm>,
+    call_contexts: &[super::dispatch::DispatchCallContext],
+    site: &mut WalkedSite,
+) -> Option<DurableCallSiteKey> {
+    let in_scope = |context: &super::dispatch::DispatchCallContext| {
+        procedure_scope.map_or_else(
+            || context.caller_is_exact && context.caller.as_ref() == Some(unit),
+            |procedure_id| context.procedure_id == *procedure_id,
+        )
+    };
+    let matching_contexts = call_contexts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, context)| in_scope(context).then_some(index))
+        .collect::<HashSet<_>>();
+    let unknown_caller = call_contexts
+        .iter()
+        .any(|context| in_scope(context) && context.caller.is_none());
+    if matching_contexts.is_empty() {
+        if call_contexts.is_empty() || unknown_caller {
+            site.gaps.push(EffectReason::DispatchUnresolved);
+        }
+        // Every exact context belongs to another semantic procedure: this is
+        // a source-contained call in a nested declaration, not an edge of the
+        // procedure currently being summarized.
+        return None;
+    }
+    if unknown_caller {
+        site.gaps.push(EffectReason::DispatchUnresolved);
+    }
+    let call = match matching_contexts.iter().collect::<Vec<_>>().as_slice() {
+        [index] => call_contexts[**index].call.clone(),
+        _ => None,
+    };
+    let arms = arms
+        .into_iter()
+        .filter(|arm| matching_contexts.contains(&arm.call_context))
+        .collect::<Vec<_>>();
+    let site_coverage = match status {
+        CallEffectSiteStatus::Answered { coverage } => coverage,
+        CallEffectSiteStatus::Interrupted { reason } => {
+            site.gaps.push(reason);
+            EffectCoverage::Open
+        }
+    };
+    if !site_coverage.is_exhaustive() {
+        site.gaps.push(EffectReason::DispatchUnresolved);
+    }
+    let exact_site = site_coverage.is_exhaustive() && arms.len() == 1 && !unknown_caller;
+    for arm in &arms {
+        match &arm.effect.lookup {
+            ArmLookup::Unkeyable => site.gaps.push(EffectReason::CalleeUnkeyable),
+            ArmLookup::Conflict => site.gaps.push(EffectReason::ModelConflict),
+            ArmLookup::InputUnavailable => site.gaps.push(EffectReason::ModelInputUnavailable),
+            ArmLookup::Unmodeled { analyzable: false } => {
+                site.gaps.push(EffectReason::CalleeUnmodeled)
+            }
+            ArmLookup::Declared(_)
+            | ArmLookup::SummarizedExternal(_)
+            | ArmLookup::Unmodeled { analyzable: true } => {}
+        }
+    }
+    let certainty = if exact_site {
+        EffectCertainty::Definite
+    } else {
+        EffectCertainty::Possible
+    };
+    site.arms = arms
+        .into_iter()
+        .map(|arm| SiteArm {
+            callee: arm.callee,
+            external: arm.external_callee,
+            certainty,
+            execution_timing: arm.effect.execution_timing,
+        })
+        .collect();
+    call
+}
+
+/// Walk the reachable call graph of one declaration, breadth first, bounded.
+///
+/// A callee is either a workspace callable the dispatch answer named, which the
+/// walk queues and reads the body of, or an external member a complete
+/// activated summary models, which enters the graph as a leaf: its own callees
+/// are outside the workspace and are not analyzable, so it has no outgoing
+/// edge, and the summary is what establishes its effect set. Admitting the leaf
+/// is what lets a positive declaration on an external member reach a workspace
+/// caller's `procedure_effect` rows instead of only closing the call site's own
+/// coverage.
+///
+/// A call whose target the workspace does not index and no pack models, an
+/// ambiguous dispatch and an exhausted bound each become a typed gap on the
+/// *calling* procedure, so the fixpoint can degrade that procedure's coverage
+/// rather than losing the fact.
+///
+/// #12968: a call whose receiver is the unchanged value of a parameter is
+/// answered per receiver context. The root is always the context-free node,
+/// so its own parameters stay open; a procedure is specialized only along an
+/// edge whose call proves the classes of the arguments it passes, and that
+/// copy's answer is used only for that edge. Every other way of invoking the
+/// procedure reaches its context-free node or is not part of the root's
+/// answer. The summary is parametric, never a union over the workspace's
+/// call sites.
+#[allow(clippy::too_many_arguments)]
+fn discover_effect_graph(
+    analyzer: &dyn IAnalyzer,
+    semantic: &mut SemanticQueryContext<'_>,
+    cache: &mut EffectTraversalCache,
+    budget: &mut CodeQueryExecutionBudget,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    cache_profile: &mut Option<QueryCacheProfile>,
+    root: &DeclarationValue,
+    root_procedure: Option<&SemanticProcedureValue>,
+    bounds: ProcedureEffectBudget,
+) -> EffectGraph {
+    let root_procedure_id = root_procedure.map(SemanticProcedureValue::wire_id);
+    let root_procedure_span = root_procedure.map(SemanticProcedureValue::byte_span);
+    let root_procedure_is_declaration = root_procedure_span
+        .as_ref()
+        .is_some_and(|span| span.start == root.range.start_byte && span.end == root.range.end_byte);
+    let mut builder = EffectGraphBuilder {
+        graph: EffectGraph::default(),
+        bounds,
+        index_by_unit: HashMap::default(),
+        index_by_external: HashMap::default(),
+        queue: Vec::new(),
+        cursor: 0,
+        root_unit: root.unit.clone(),
+        root_procedure_id: root_procedure_id.clone(),
+        root_procedure_span,
+        root_procedure_is_declaration,
+        walked: Vec::new(),
+        walked_by_node: HashMap::default(),
+        interest: HashMap::default(),
+        specialized: Vec::new(),
+        specialized_by_context: HashMap::default(),
+        contexts_per_unit: HashMap::default(),
+    };
+    let mut inputs = EffectWalkInputs {
+        analyzer,
+        semantic,
+        cache,
+        budget,
+        limits,
+        cancellation,
+        diagnostics,
+        cache_profile,
+    };
+    let root_key = (root.unit.clone(), root_procedure_id.clone());
+    let root_display_name = root_procedure.map(|procedure| {
+        format!(
+            "{} ({})",
+            root.unit.fq_name(),
+            procedure.public().procedure_kind
+        )
+    });
+    if builder
+        .push_node(
+            &mut inputs,
+            &root.unit,
+            root_procedure_id.as_deref(),
+            root_display_name,
+        )
+        .is_none()
+    {
+        return builder.graph;
+    }
+    builder.queue.push((root_key, 0));
+    builder.walk_pending(&mut inputs);
+    builder.specialize(&mut inputs);
+
+    // Diagnostics of sites only an unreachable node depends on are dropped:
+    // a context-free node every edge into which was specialized away, or a
+    // copy specialized for an edge out of such a node. Nothing else moves, so
+    // the order of every retained diagnostic is the order it was found in.
+    let reachable = builder.reachable();
+    let mut dropped = vec![false; inputs.diagnostics.len()];
+    let site_ranges = builder
+        .walked
+        .iter()
+        .flat_map(|walked| walked.sites.iter().map(|site| site.diagnostics.clone()))
+        .chain(
+            builder
+                .specialized
+                .iter()
+                .map(|node| node.diagnostics.clone()),
+        )
+        .collect::<Vec<_>>();
+    for range in &site_ranges {
+        for index in range.clone() {
+            dropped[index] = true;
+        }
+    }
+    let mut keep = |range: &std::ops::Range<usize>| {
+        for index in range.clone() {
+            dropped[index] = false;
+        }
+    };
+    for walked in &builder.walked {
+        let node = builder.index_by_unit[&walked.unit];
+        if reachable[node] {
+            for site in &walked.sites {
+                keep(&site.diagnostics);
+            }
+        }
+    }
+    for specialized in &builder.specialized {
+        if reachable[specialized.index] {
+            keep(&specialized.diagnostics);
+            for site in &specialized.kept_sites {
+                keep(&builder.walked[specialized.walked].sites[*site].diagnostics);
+            }
+        }
+    }
+    if dropped.iter().any(|dropped| *dropped) {
+        let mut index = 0;
+        inputs.diagnostics.retain(|_| {
+            let keep = !dropped[index];
+            index += 1;
+            keep
+        });
+    }
+
+    let EffectGraphBuilder {
+        mut graph,
+        index_by_unit,
+        specialized,
+        ..
+    } = builder;
     graph.edges.sort_by(|left, right| {
         (
             left.caller,
@@ -15352,23 +16257,52 @@ fn discover_effect_graph(
     });
     graph.edges.dedup();
     // Preserve discovery order for raw query diagnostics as well as policy reports.
-    let mut indexed_units = index_by_unit.iter().collect::<Vec<_>>();
-    indexed_units.sort_unstable_by_key(|(_, node)| **node);
-    for ((unit, _), &node) in indexed_units {
+    let mut indexed_units = index_by_unit
+        .iter()
+        .map(|((unit, _), node)| (unit, *node, None))
+        .chain(
+            specialized
+                .iter()
+                .map(|node| (&node.unit.0, node.index, Some(&node.context))),
+        )
+        .collect::<Vec<_>>();
+    indexed_units.sort_unstable_by_key(|(_, node, _)| *node);
+    for (unit, node, context) in indexed_units {
+        if !reachable[node] {
+            continue;
+        }
         let procedure = &graph.procedures[node];
         if !procedure.basis.is_established() || !procedure.local_gaps.is_empty() {
+            let receivers = context.map_or_else(String::new, |context| {
+                format!(
+                    ", receivers={:?}",
+                    context
+                        .iter()
+                        .map(|(ordinal, class)| format!("parameter {ordinal}: {class}"))
+                        .collect::<Vec<_>>()
+                )
+            });
             record_open_callee(
                 analyzer,
-                &mut cache.diagnostic_sources,
-                diagnostics,
+                &mut inputs.cache.diagnostic_sources,
+                inputs.diagnostics,
                 unit.source(),
                 analyzer.ranges_of(unit).first().copied(),
-                format!(
-                    "callee={}, identity={}, basis={:?}, reasons={:?}",
-                    unit.fq_name(),
-                    procedure.declaration_id,
-                    procedure.basis,
-                    procedure.local_gaps,
+                brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+                    format_args!(
+                        "callee={}, identity={}, basis={:?}{receivers}, reasons={:?}",
+                        unit.fq_name(),
+                        procedure.declaration_id,
+                        procedure.basis,
+                        procedure.local_gaps,
+                    ),
+                    format_args!(
+                        "callee={}, identity={}, basis={:?}{receivers}; reasons",
+                        unit.fq_name(),
+                        procedure.declaration_id,
+                        procedure.basis
+                    ),
+                    procedure.local_gaps.iter(),
                 ),
                 procedure
                     .local_gaps
@@ -16035,7 +16969,9 @@ func inspect(input *item) (result int) {
                 source,
                 binding_declaration,
                 &live,
-            ) {
+            )
+            .0
+            {
                 brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution::Complete {
                     value: Some(identity), ..
                 } => identity,

@@ -625,6 +625,19 @@ fn python_workspace_native_environment_lifecycle() {
         fixture.root(),
         "src/pkg/model.py",
     )]));
+    // The environment summary is keyed on member surface fingerprints (#11183).
+    // A method added inside a class body is not a module-level surface change,
+    // so the summary is reused; a new module-level class changes the surface.
+    assert_eq!(selected(&workspace, &token), first);
+    std::fs::write(
+        fixture.root().join("src/pkg/model.py"),
+        "class Widget:\n    def render(self): pass\nclass Gadget: pass\n",
+    )
+    .unwrap();
+    let workspace = workspace.update(&BTreeSet::from([ProjectFile::new(
+        fixture.root(),
+        "src/pkg/model.py",
+    )]));
     let second = selected(&workspace, &token);
     assert_ne!(second, first);
     std::fs::write(

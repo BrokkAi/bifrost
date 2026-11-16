@@ -16,7 +16,10 @@ use crate::graph_support::{
     rust_path_segments_bounded,
 };
 use crate::imports::RustImportBindingName;
-use crate::lexical_scope::{RustTypeHead, RustTypeHeadMemo, rust_type_head_at_bounded};
+use crate::lexical_scope::{
+    RustTypeAuthority, RustTypeAuthorityUnknown, RustTypeHead, RustTypeHeadMemo,
+    rust_type_head_at_bounded, rust_type_prelude_authority_at_bounded,
+};
 use crate::prelude::rust_std_type_fact;
 use crate::syntax::{attribute_payload, unwrap_attributes};
 use brokk_bifrost_core::analyzer::tree_walk::{
@@ -47,6 +50,29 @@ pub enum RustOwnershipClass {
     Incomplete(RustOwnershipIncomplete),
 }
 
+impl RustOwnershipClass {
+    /// The ownership of every builtin scalar, whether written or inferred.
+    pub const PRIMITIVE_SCALAR: Self = Self::ScalarCopy;
+
+    /// Apply the same element rule as a declared array type.
+    pub fn array_of(element: Self) -> Self {
+        let state = match element {
+            Self::ScalarCopy | Self::AggregateCopy | Self::SharedReference => EvalState::Copy,
+            Self::MutableReference | Self::Move => EvalState::Move,
+            Self::Incomplete(reason) => EvalState::Incomplete(reason),
+        };
+        array_element_result(state).into_public()
+    }
+
+    /// Copy values and references cannot run Drop when replaced.
+    pub fn is_definitely_non_dropping(&self) -> bool {
+        matches!(
+            self,
+            Self::ScalarCopy | Self::AggregateCopy | Self::SharedReference | Self::MutableReference
+        )
+    }
+}
+
 /// Why a Rust ownership classification is incomplete.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RustOwnershipIncomplete {
@@ -56,6 +82,8 @@ pub enum RustOwnershipIncomplete {
     RawPointer,
     MacroExpansion,
     WrongTraitIdentity,
+    /// A bare builtin trait spelling has no closed standard-prelude proof.
+    UnprovenPreludeAuthority,
     CyclicNominal,
     MissingType,
     UnsupportedType,
@@ -91,6 +119,7 @@ struct TraitEvidence {
     drop_count: usize,
     negative_copy: bool,
     wrong_builtin_count: usize,
+    unproven_prelude: Option<RustTypeAuthorityUnknown>,
     malformed_derive: bool,
     derive_copy: bool,
     derive_clone: bool,
@@ -198,6 +227,7 @@ enum StandardPathProof {
 /// The bounded ownership/type/trait producer for one Rust syntax tree.
 #[derive(Debug)]
 pub struct RustOwnershipIndex<'tree, 'source> {
+    plain_scope: Option<&'source crate::lexical_scope::RustPlainScope<'tree>>,
     source: &'source str,
     root: Node<'tree>,
     declarations: Vec<NominalDeclaration<'tree>>,
@@ -214,6 +244,7 @@ pub struct RustOwnershipIndex<'tree, 'source> {
     module_context_by_node: HashMap<usize, Option<usize>>,
     lexical_modules: Vec<LexicalModuleContext>,
     type_heads: RustTypeHeadMemo,
+    prelude_type_heads: RustTypeHeadMemo,
     #[cfg(test)]
     lexical_module_context_steps: AtomicUsize,
     #[cfg(test)]
@@ -221,11 +252,61 @@ pub struct RustOwnershipIndex<'tree, 'source> {
 }
 
 impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
+    /// Select a type head through the paired plain index when the site is in
+    /// its tree; fragment sites keep the walk.
+    fn type_head_at<F, E>(
+        &self,
+        site: Node<'tree>,
+        name: &str,
+        memo: &RustTypeHeadMemo,
+        charge: &mut F,
+    ) -> Result<RustTypeHead<'tree>, E>
+    where
+        F: FnMut(usize) -> Result<(), E>,
+    {
+        if let Some(scope) = self.plain_scope
+            && scope.contains(site)
+        {
+            return scope.type_head_with_memo(site, name, memo, charge);
+        }
+        rust_type_head_at_bounded(self.root, self.source, site, name, memo, charge)
+    }
+
     /// Scan declarations, exact local trait evidence, and lexical imports,
     /// then solve nominal payload dependencies to a fixed point.
     pub fn build<F, E>(
         root: Node<'tree>,
         source: &'source str,
+        standard_path_work_limit: usize,
+        charge: F,
+    ) -> Result<Self, E>
+    where
+        F: FnMut(usize) -> Result<(), E>,
+    {
+        Self::build_with_scope_input(root, source, None, standard_path_work_limit, charge)
+    }
+
+    pub fn build_with_plain_scope<F, E>(
+        scope: &'source crate::lexical_scope::RustPlainScope<'tree>,
+        standard_path_work_limit: usize,
+        charge: F,
+    ) -> Result<Self, E>
+    where
+        F: FnMut(usize) -> Result<(), E>,
+    {
+        Self::build_with_scope_input(
+            scope.root(),
+            scope.source(),
+            Some(scope),
+            standard_path_work_limit,
+            charge,
+        )
+    }
+
+    fn build_with_scope_input<F, E>(
+        root: Node<'tree>,
+        source: &'source str,
+        plain_scope: Option<&'source crate::lexical_scope::RustPlainScope<'tree>>,
         standard_path_work_limit: usize,
         mut charge: F,
     ) -> Result<Self, E>
@@ -370,6 +451,7 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
         }
 
         let mut index = Self {
+            plain_scope,
             source,
             root,
             declarations,
@@ -381,6 +463,7 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
             lexical_modules,
             standard_path_work_limit,
             type_heads: RustTypeHeadMemo::default(),
+            prelude_type_heads: RustTypeHeadMemo::default(),
             standard_path_proofs: RefCell::new(HashMap::new()),
             #[cfg(test)]
             lexical_module_context_steps: AtomicUsize::new(0),
@@ -395,7 +478,7 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
 
         for implementation in pending_impls {
             charge(1)?;
-            index.apply_impl(implementation);
+            index.apply_impl(implementation, &mut charge)?;
         }
 
         // A monotonic fixed point is enough: Pending becomes Copy, Move, or
@@ -594,7 +677,7 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
         charge(0)?;
         Ok(
             if type_node.kind() == "primitive_type" && state == EvalState::Copy {
-                RustOwnershipClass::ScalarCopy
+                RustOwnershipClass::PRIMITIVE_SCALAR
             } else {
                 state.into_public()
             },
@@ -654,14 +737,7 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
             return Ok(None);
         };
         let absolute = rust_path_is_leading_absolute_bounded(name, &mut *charge)?;
-        let actual_head = rust_type_head_at_bounded(
-            self.root,
-            self.source,
-            name,
-            first,
-            &self.type_heads,
-            charge,
-        )?;
+        let actual_head = self.type_head_at(name, first, &self.type_heads, charge)?;
         let head = if absolute {
             // Keep activation/opaque-scope refusal at the actual site even
             // though an absolute name selects its head at the crate root.
@@ -670,14 +746,7 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
                     RustOwnershipIncomplete::UnresolvedPath,
                 ))));
             }
-            rust_type_head_at_bounded(
-                self.root,
-                self.source,
-                self.root,
-                first,
-                &self.type_heads,
-                charge,
-            )?
+            self.type_head_at(self.root, first, &self.type_heads, charge)?
         } else {
             actual_head
         };
@@ -756,14 +825,7 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
                     // the shared selector, before it can supply std identity.
                     let root_unbound = if let Some(first) = target.first() {
                         matches!(
-                            rust_type_head_at_bounded(
-                                self.root,
-                                self.source,
-                                declaration,
-                                first,
-                                &self.type_heads,
-                                charge
-                            )?,
+                            self.type_head_at(declaration, first, &self.type_heads, charge)?,
                             RustTypeHead::Unbound
                         )
                     } else {
@@ -928,6 +990,32 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
         }
     }
 
+    /// Lower one guarded alternate with isolated lexical and path proof memos.
+    /// These syntax assumptions are not executable facts until every guard is
+    /// admitted by the query-time standard macro identity owner.
+    pub fn with_lexical_no_items_guards<T>(
+        &self,
+        guards: &[Node<'tree>],
+        lower: impl FnOnce() -> T,
+    ) -> T {
+        struct Restore<'a> {
+            paths: &'a RefCell<HashMap<usize, StandardPathProof>>,
+            old_paths: Option<HashMap<usize, StandardPathProof>>,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.paths
+                    .replace(self.old_paths.take().expect("saved path proofs"));
+            }
+        }
+        let _restore = Restore {
+            paths: &self.standard_path_proofs,
+            old_paths: Some(self.standard_path_proofs.take()),
+        };
+        self.type_heads
+            .with_no_items_macros(guards.iter().map(Node::id).collect(), lower)
+    }
+
     /// The part of a standard-path proof that does not depend on the expected
     /// item. Exhausting the work cap means not proven.
     fn standard_path_proof_bounded<F, E>(
@@ -954,28 +1042,14 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
             return Ok(StandardPathProof::NotProven);
         };
         let absolute = rust_path_is_leading_absolute_bounded(path_node, &mut *charge)?;
-        let actual_head = rust_type_head_at_bounded(
-            self.root,
-            self.source,
-            path_node,
-            first,
-            &self.type_heads,
-            charge,
-        )?;
+        let actual_head = self.type_head_at(path_node, first, &self.type_heads, charge)?;
         let head = if absolute {
             // As in conditional Copy, a leading root does not erase an
             // opaque or conditionally active use site.
             if matches!(actual_head, RustTypeHead::Unknown) {
                 return Ok(StandardPathProof::NotProven);
             }
-            rust_type_head_at_bounded(
-                self.root,
-                self.source,
-                self.root,
-                first,
-                &self.type_heads,
-                charge,
-            )?
+            self.type_head_at(self.root, first, &self.type_heads, charge)?
         } else {
             actual_head
         };
@@ -992,14 +1066,7 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
                 };
                 if !is_standard_root(root)
                     || !matches!(
-                        rust_type_head_at_bounded(
-                            self.root,
-                            self.source,
-                            declaration,
-                            root,
-                            &self.type_heads,
-                            charge
-                        )?,
+                        self.type_head_at(declaration, root, &self.type_heads, charge)?,
                         RustTypeHead::Unbound
                     )
                 {
@@ -1108,10 +1175,10 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
                     pending.push((left_referent, right_referent));
                 }
                 "array_type" => {
-                    let left_element =
-                        sequence_element(left).ok_or(RustOwnershipIncomplete::MissingType)?;
-                    let right_element =
-                        sequence_element(right).ok_or(RustOwnershipIncomplete::MissingType)?;
+                    let left_element = rust_sequence_element_type(left)
+                        .ok_or(RustOwnershipIncomplete::MissingType)?;
+                    let right_element = rust_sequence_element_type(right)
+                        .ok_or(RustOwnershipIncomplete::MissingType)?;
                     match (
                         left.child_by_field_name("length"),
                         right.child_by_field_name("length"),
@@ -1139,10 +1206,10 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
                     pending.extend(left_children.into_iter().zip(right_children));
                 }
                 "slice_type" => {
-                    let left_element =
-                        sequence_element(left).ok_or(RustOwnershipIncomplete::MissingType)?;
-                    let right_element =
-                        sequence_element(right).ok_or(RustOwnershipIncomplete::MissingType)?;
+                    let left_element = rust_sequence_element_type(left)
+                        .ok_or(RustOwnershipIncomplete::MissingType)?;
+                    let right_element = rust_sequence_element_type(right)
+                        .ok_or(RustOwnershipIncomplete::MissingType)?;
                     pending.push((left_element, right_element));
                 }
                 "type_identifier"
@@ -1234,10 +1301,10 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
                 || (target_referent.kind() == "array_type"
                     && target_referent.child_by_field_name("length").is_none()))
         {
-            let Some(source_element) = sequence_element(source_referent) else {
+            let Some(source_element) = rust_sequence_element_type(source_referent) else {
                 return RustReferenceCoercion::Incomplete(RustOwnershipIncomplete::MissingType);
             };
-            let Some(target_element) = sequence_element(target_referent) else {
+            let Some(target_element) = rust_sequence_element_type(target_referent) else {
                 return RustReferenceCoercion::Incomplete(RustOwnershipIncomplete::MissingType);
             };
             match self.exact_type_equivalence(source_element, target_element) {
@@ -1293,7 +1360,11 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
                         }
                     },
                     TypeEvaluation::Aggregate(children) => {
-                        aggregate_result(children.iter().map(|child| values[&child.id()]))
+                        if node.kind() == "array_type" {
+                            array_element_result(values[&children[0].id()])
+                        } else {
+                            aggregate_result(children.iter().map(|child| values[&child.id()]))
+                        }
                     }
                     TypeEvaluation::Leaf(_) => unreachable!("leaves finish immediately"),
                 };
@@ -1318,7 +1389,7 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
                 ))
             } else {
                 match node.kind() {
-                    "array_type" => match sequence_element(node) {
+                    "array_type" => match rust_sequence_element_type(node) {
                         Some(element) => TypeEvaluation::Aggregate(vec![element]),
                         None => TypeEvaluation::Leaf(EvalState::Incomplete(
                             RustOwnershipIncomplete::MissingType,
@@ -1512,6 +1583,9 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
         if declaration.malformed_payload {
             return NominalState::Incomplete(RustOwnershipIncomplete::MissingType);
         }
+        if declaration.evidence.unproven_prelude.is_some() {
+            return NominalState::Incomplete(RustOwnershipIncomplete::UnprovenPreludeAuthority);
+        }
         let builtin_root_shadowed = self
             .name_is_shadowed(&declaration.identity.module_path, "core")
             || self.name_is_shadowed(&declaration.identity.module_path, "std");
@@ -1551,17 +1625,24 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
         }
     }
 
-    fn apply_impl(&mut self, implementation: PendingImpl<'tree>) {
+    fn apply_impl<F, E>(
+        &mut self,
+        implementation: PendingImpl<'tree>,
+        charge: &mut F,
+    ) -> Result<(), E>
+    where
+        F: FnMut(usize) -> Result<(), E>,
+    {
         if implementation.generic || has_macro_ancestor(implementation.node) {
-            return;
+            return Ok(());
         }
         if !valid_path_shape(implementation.target_node)
             || contains_generic(implementation.target_node)
         {
-            return;
+            return Ok(());
         }
         let Some(target_path_nodes) = rust_path_segments(implementation.target_node) else {
-            return;
+            return Ok(());
         };
         let target_path = target_path_nodes
             .iter()
@@ -1570,36 +1651,41 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
         let Some(candidates) =
             self.resolve_nominal_candidates(&implementation.module_path, &target_path)
         else {
-            return;
+            return Ok(());
         };
         if candidates.len() != 1 {
             for candidate in candidates {
                 self.declarations[candidate].evidence.wrong_builtin_count += 1;
             }
-            return;
+            return Ok(());
         }
         let declaration_index = candidates[0];
         let Some(trait_node) = implementation.trait_node else {
-            return;
+            return Ok(());
         };
-        let Some(trait_kind) = builtin_trait_kind(
-            trait_node,
-            self.source,
-            &implementation.module_path,
-            &self.shadowed_names,
-        ) else {
-            if path_terminal_is_builtin(trait_node, self.source) {
-                self.declarations[declaration_index]
-                    .evidence
-                    .wrong_builtin_count += 1;
-            }
-            return;
-        };
+        let trait_kind =
+            match self.builtin_trait_kind(trait_node, &implementation.module_path, charge)? {
+                Ok(Some(kind)) => kind,
+                Ok(None) => {
+                    if path_terminal_is_builtin(trait_node, self.source) {
+                        self.declarations[declaration_index]
+                            .evidence
+                            .wrong_builtin_count += 1;
+                    }
+                    return Ok(());
+                }
+                Err(reason) => {
+                    self.declarations[declaration_index]
+                        .evidence
+                        .unproven_prelude = Some(reason);
+                    return Ok(());
+                }
+            };
         if implementation.negative {
             if trait_kind == BuiltinTrait::Copy {
                 self.declarations[declaration_index].evidence.negative_copy = true;
             }
-            return;
+            return Ok(());
         }
         let drop_method = if trait_kind == BuiltinTrait::Drop {
             let methods = implementation
@@ -1631,6 +1717,61 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
                     }
                     _ => declaration.drop_impl_ambiguous = true,
                 }
+            }
+        }
+        Ok(())
+    }
+
+    fn builtin_trait_kind<F, E>(
+        &self,
+        node: Node<'tree>,
+        module_path: &[String],
+        charge: &mut F,
+    ) -> Result<Result<Option<BuiltinTrait>, RustTypeAuthorityUnknown>, E>
+    where
+        F: FnMut(usize) -> Result<(), E>,
+    {
+        let Some(kind) = builtin_trait_path_kind(node, self.source) else {
+            return Ok(Ok(None));
+        };
+        let segments = rust_path_segments_bounded(node, &mut *charge)?
+            .expect("builtin trait path already has structured segments");
+        if segments.len() != 1 {
+            return Ok(Ok(qualified_builtin_trait_kind(
+                node,
+                self.source,
+                module_path,
+                &self.shadowed_names,
+            )));
+        }
+        let name = rust_node_text(segments[0], self.source);
+        let selection = if let Some(scope) = self.plain_scope
+            && scope.contains(node)
+            && self.prelude_type_heads.no_items_macros.borrow().is_empty()
+        {
+            scope.prelude_type_head(node, name, charge)?
+        } else {
+            rust_type_prelude_authority_at_bounded(
+                self.root,
+                self.source,
+                node,
+                name,
+                &self.prelude_type_heads,
+                charge,
+            )?
+        };
+        match selection.authority {
+            RustTypeAuthority::ProvenPrelude => Ok(Ok(Some(kind))),
+            RustTypeAuthority::Unknown(reason) => Ok(Err(reason)),
+            RustTypeAuthority::Bound => {
+                // An explicit import is not implicit-prelude evidence. Its
+                // written root needs the selected crate edition: a 2015 use
+                // resolves from the crate root, including inside a child
+                // module. This file-only producer has no edition authority.
+                Ok(Err(match selection.head {
+                    RustTypeHead::Import { .. } => RustTypeAuthorityUnknown::ExplicitImport,
+                    _ => RustTypeAuthorityUnknown::LocalBinding,
+                }))
             }
         }
     }
@@ -1721,13 +1862,7 @@ fn nominal_declaration<'tree>(
         struct_drop_fields,
         generic: node.child_by_field_name("type_parameters").is_some() || has_where_clause(node),
         generic_drop_obligation: has_where_clause(node)
-            || node
-                .child_by_field_name("type_parameters")
-                .is_some_and(|parameters| {
-                    named_children(parameters)
-                        .into_iter()
-                        .any(|parameter| parameter.kind() != "lifetime_parameter")
-                }),
+            || crate::syntax::rust_item_has_type_or_const_parameters(node),
         malformed_payload,
         evidence,
         drop_impl_method: None,
@@ -1962,7 +2097,7 @@ where
     Ok(())
 }
 
-fn builtin_trait_kind(
+fn qualified_builtin_trait_kind(
     node: Node<'_>,
     source: &str,
     module_path: &[String],
@@ -1973,9 +2108,10 @@ fn builtin_trait_kind(
         .iter()
         .map(|segment| rust_node_text(*segment, source))
         .collect::<Vec<_>>();
-    if names.len() == 1 {
-        return None;
-    }
+    debug_assert!(
+        names.len() > 1,
+        "bare traits require lexical prelude authority"
+    );
     let rooted = rust_path_is_leading_absolute(node);
     (rooted || !name_is_shadowed(shadowed, module_path, names[0])).then_some(kind)
 }
@@ -2033,6 +2169,10 @@ fn path_terminal_is_builtin(node: Node<'_>, source: &str) -> bool {
     rust_path_segments(node)
         .and_then(|segments| segments.last().copied())
         .is_some_and(|last| is_builtin_name(rust_node_text(last, source)))
+}
+
+fn array_element_result(element: EvalState) -> EvalState {
+    aggregate_result(std::iter::once(element))
 }
 
 fn aggregate_result(states: impl Iterator<Item = EvalState>) -> EvalState {
@@ -2288,7 +2428,8 @@ where
     Ok(class)
 }
 
-fn sequence_element(node: Node<'_>) -> Option<Node<'_>> {
+/// The grammar-owned element type of an array or slice.
+pub fn rust_sequence_element_type(node: Node<'_>) -> Option<Node<'_>> {
     matches!(node.kind(), "array_type" | "slice_type")
         .then(|| node.child_by_field_name("element"))?
 }
@@ -2433,6 +2574,103 @@ pub fn rust_dereference_operand(node: Node<'_>) -> Option<Node<'_>> {
 mod tests {
     use super::*;
     use crate::test_helpers::parse_rust as parse;
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11532: standard macro statements vetoed allocation path proofs"
+    )]
+    fn guarded_macro_standard_path_proofs_restore_base_memos() {
+        for argument in ["1", "{ struct X; 1 }"] {
+            let source =
+                format!("fn f() {{ println!(\"{{}}\", {argument}); std::alloc::alloc(layout); }}");
+            let tree = parse(&source);
+            let root = tree.root_node();
+            let index =
+                RustOwnershipIndex::build(root, &source, 100_000, |_| Ok::<_, ()>(())).unwrap();
+            let mut stack = vec![root];
+            let mut invocation = None;
+            let mut path = None;
+            while let Some(node) = stack.pop() {
+                if node.kind() == "macro_invocation" {
+                    invocation = Some(node);
+                }
+                if node.kind() == "call_expression" {
+                    path = node.child_by_field_name("function");
+                }
+                stack.extend(named_children(node));
+            }
+            let path = path.expect("allocator call");
+            let expected = &["std", "alloc", "alloc"];
+            assert!(!index.resolves_standard_path(path, expected));
+            index.with_lexical_no_items_guards(&[invocation.unwrap()], || {
+                assert!(index.resolves_standard_path(path, expected));
+                assert!(index.resolves_standard_path(path, expected));
+            });
+            assert!(!index.resolves_standard_path(path, expected));
+        }
+    }
+
+    #[test]
+    fn bounded_primitives_require_complete_no_items_guards() {
+        for primitive_name in [
+            "i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "i128", "u128", "isize", "usize",
+            "f32", "f64", "bool", "char",
+        ] {
+            for (extra, copy) in [
+                (String::new(), true),
+                ("opaque!();".to_owned(), false),
+                (format!("struct {primitive_name};"), false),
+            ] {
+                let source = format!(
+                    "fn f() {{ let value: {primitive_name}; println!(\"hello\"); {extra} }}"
+                );
+                let tree = parse(&source);
+                let root = tree.root_node();
+                let index =
+                    RustOwnershipIndex::build(root, &source, 100_000, |_| Ok::<_, ()>(())).unwrap();
+                let mut pending = vec![root];
+                let mut primitive = None;
+                let mut guarded = None;
+                while let Some(node) = pending.pop() {
+                    if node.kind() == "primitive_type" {
+                        primitive = Some(node);
+                    }
+                    if node.kind() == "macro_invocation"
+                        && node
+                            .child_by_field_name("macro")
+                            .is_some_and(|name| rust_node_text(name, &source) == "println")
+                    {
+                        guarded = Some(node);
+                    }
+                    pending.extend(named_children(node));
+                }
+                let ty = primitive.unwrap();
+                let classify = || {
+                    index
+                        .classify_type_bounded(ty, |_| Ok::<_, ()>(()))
+                        .unwrap()
+                };
+                assert_ne!(classify(), RustOwnershipClass::PRIMITIVE_SCALAR);
+                index.with_lexical_no_items_guards(&[guarded.unwrap()], || {
+                    assert_eq!(
+                        classify() == RustOwnershipClass::PRIMITIVE_SCALAR,
+                        copy,
+                        "{source}"
+                    );
+                    assert_eq!(
+                        classify() == RustOwnershipClass::PRIMITIVE_SCALAR,
+                        copy,
+                        "memo replay: {source}"
+                    );
+                });
+                assert_ne!(
+                    classify(),
+                    RustOwnershipClass::PRIMITIVE_SCALAR,
+                    "base memo restored: {source}"
+                );
+            }
+        }
+    }
 
     fn all_type_nodes<'tree>(root: Node<'tree>) -> Vec<Node<'tree>> {
         let mut result = Vec::new();
@@ -2588,7 +2826,7 @@ mod tests {
     }
 
     #[test]
-    fn absolute_builtin_trait_path_survives_shadowing_but_prelude_does_not() {
+    fn absolute_builtin_trait_path_and_unshadowed_prelude_are_proven() {
         let source = "mod Copy {}\n#[derive(core::marker::Copy, core::clone::Clone)]\nstruct Qualified(u8);\n#[derive(Copy, Clone)]\nstruct Shadowed(u8);\nstruct Good(u8);\nimpl core::marker::Copy for Good {}\nimpl core::clone::Clone for Good {}\nstruct Bad(u8);\nimpl Copy for Bad {}\nimpl Clone for Bad {}\n";
         let tree = parse(source);
         let index =
@@ -2608,7 +2846,7 @@ mod tests {
         );
         assert!(matches!(
             index.classify_type(type_named(tree.root_node(), source, "Bad")),
-            RustOwnershipClass::Incomplete(RustOwnershipIncomplete::WrongTraitIdentity)
+            RustOwnershipClass::Incomplete(RustOwnershipIncomplete::UnprovenPreludeAuthority)
         ));
 
         let source = "struct Spelled(u8);\nimpl Copy for Spelled {}\nimpl Clone for Spelled {}\n";
@@ -2618,7 +2856,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             index.classify_type(type_named(tree.root_node(), source, "Spelled")),
-            RustOwnershipClass::Incomplete(RustOwnershipIncomplete::WrongTraitIdentity)
+            RustOwnershipClass::AggregateCopy
         );
     }
 
@@ -3056,7 +3294,7 @@ mod tests {
         );
         assert_eq!(
             index.classify_type(type_named(tree.root_node(), source, "Inner")),
-            RustOwnershipClass::Incomplete(RustOwnershipIncomplete::WrongTraitIdentity)
+            RustOwnershipClass::Incomplete(RustOwnershipIncomplete::UnprovenPreludeAuthority)
         );
     }
 

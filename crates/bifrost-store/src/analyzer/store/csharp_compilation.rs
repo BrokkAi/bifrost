@@ -9,18 +9,31 @@
 //! and contents and the derivation version, so every revision with the same
 //! configuration shares it, and a source edit publishes no new rules.
 //!
-//! Readers evaluate the rules per demand against the revision's selected
-//! source rows and walk references with a recursive query. No reader retains
-//! the relation: a structure keyed by workspace files that outlived a request
-//! is the forbidden heap shape of the architecture guidance.
+//! Readers share an immutable, owner-budgeted index of one set publication
+//! within their operation. Source selection and revision checks stay at the
+//! read boundary; shared rule evidence lives only as long as its operation
+//! and returned answers. Reference traversal remains a recursive SQL query.
 //!
 //! Validity rule, used by publisher and readers alike: a revision's selection
-//! names a set whose `derivation_version` is [`DERIVATION_VERSION`]. A
+//! names a set whose `derivation_identity` is [`derivation_identity()`]. A
 //! revision without one (unpublished, published by an older derivation, or
 //! whose retained configuration bytes were missing) proves nothing; the next
 //! publication of that revision retries.
 
+pub(super) fn framework_qualified_label(label: String, framework: Option<&str>) -> String {
+    match framework {
+        Some(framework) => format!("{label} [TargetFramework={framework}]"),
+        None => label,
+    }
+}
+
 pub(super) mod extent;
+mod rule_index;
+use brokk_bifrost_core::retention_budget::RetentionBudget;
+pub use rule_index::{CSharpOpenRegions, CSharpRuleIndex, CSharpRuleIndexHandle};
+#[cfg(any(test, feature = "test-support"))]
+pub(super) use rule_index::{RULE_COMPILATIONS_SQL, RULE_GAPS_SQL, RULE_ITEMS_SQL};
+use std::sync::Arc;
 
 use super::{
     AnalyzerStore, GenerationId, ReaderGuard, Result, StoreError, WorkspaceId, WorkspaceSnapshotId,
@@ -40,19 +53,17 @@ pub const MEMBERSHIP_CAP_CODES: [&str; 3] = [
     CONFIGURATION_FILE_CAP,
     CONFIGURATION_TOTAL_BYTE_CAP,
 ];
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn derivation_identity_before_last_token() -> [u8; 32] {
+    brokk_bifrost_core::lever_tokens::lever_identity_before_last_token(
+        "csharp-compilation-derivation",
+        brokk_bifrost_core::lever_file!("csharp-compilation-derivation.tokens"),
+    )
+}
+
 pub fn is_membership_cap(code: &str) -> bool {
     MEMBERSHIP_CAP_CODES.contains(&code)
-}
-pub const MEMBERSHIP_CAP_SQL: &str = "SELECT EXISTS(SELECT 1 FROM csharp_compilation_sets s, json_each(s.gaps) g WHERE s.set_id=?1 AND json_extract(g.value,'$[0]') IN (SELECT value FROM json_each(?2)))";
-fn membership_capped(conn: &Connection, set_id: i64) -> Result<bool> {
-    Ok(conn.query_row(
-        MEMBERSHIP_CAP_SQL,
-        params![
-            set_id,
-            serde_json::to_string(&MEMBERSHIP_CAP_CODES).expect("codes serialize")
-        ],
-        |r| r.get(0),
-    )?)
 }
 
 // #8632: parent-relative open items resolve before workspace portability.
@@ -68,8 +79,18 @@ fn membership_capped(conn: &Connection, set_id: i64) -> Result<bool> {
 // #7314 M10a0: framework instances change compilation identity; 17 above master's 16.
 // #10342: count only compilation import enumeration evidence; derivation 18 remains above master.
 // #7314 M10a0 part 2 final merge: derivation 19 above master 18.
-pub const DERIVATION_VERSION: i64 = 20;
-/// Rotate this table identity and DERIVATION_VERSION together when SDK rules change.
+// #7314 M10a0: per-framework Compile items change membership for unchanged configuration bytes.
+// Per-instance metadata uses the evaluated import chain and retained item guards.
+pub fn derivation_identity() -> [u8; 32] {
+    static IDENTITY: std::sync::LazyLock<[u8; 32]> = std::sync::LazyLock::new(|| {
+        brokk_bifrost_core::lever_tokens::lever_identity(
+            "csharp-compilation-derivation",
+            brokk_bifrost_core::lever_file!("csharp-compilation-derivation.tokens"),
+        )
+    });
+    *IDENTITY
+}
+/// Rotate this table identity and derivation_identity() together when SDK rules change.
 pub const IMPLICIT_SYMBOL_TABLE_VERSION: &[u8] = b"sdk-10.0.403-named-open-v2";
 /// The storage language whose revisions publish compilation membership.
 pub const STORAGE_LANGUAGE: &str = "csharp";
@@ -305,10 +326,6 @@ pub(super) const DELETE_STALE_EPOCH_CHAINS_SQL: &str =
     "DELETE FROM csharp_undecided_chains WHERE blob_id IN (
                                    SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2
                                      AND parse_variant = ?4 AND generation <> ?3)";
-pub(super) const DELETE_UNROOTED_CHAINS_SQL: &str = "DELETE FROM csharp_undecided_chains WHERE blob_id IN (
-                               SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2 AND parse_variant = ?3
-                                 AND generation = COALESCE((SELECT generation FROM analysis_epochs WHERE lang = ?2), 0)
-                                 AND NOT EXISTS (SELECT 1 FROM workspace_resolution_content_roots AS roots WHERE roots.blob_id = blobs.id))";
 pub(super) const DELETE_REPLACED_CHAINS_SQL: &str =
     "DELETE FROM csharp_undecided_chains WHERE blob_id IN (
                SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2 AND parse_variant = ?3)";
@@ -428,15 +445,15 @@ pub(super) const REFERENCED_SYMBOLS_SQL: &str = "SELECT symbols.symbol FROM blob
      ORDER BY symbols.symbol";
 
 pub(super) const SET_MEMBERSHIP_SQL: &str = "SELECT 1 FROM csharp_compilation_sets
-     WHERE set_id = ?1 AND derivation_version = ?2";
+     WHERE set_id = ?1 AND derivation_identity = ?2";
 
 pub(super) const EXISTING_SET_SQL: &str =
     "SELECT set_id, output_digest FROM csharp_compilation_sets
              WHERE workspace_id = ?1 AND lang = ?2 AND generation = ?3
-               AND derivation_version = ?4 AND input_digest = ?5";
+               AND derivation_identity = ?4 AND input_digest = ?5";
 
 pub(super) const SELECTED_SET_SQL: &str =
-    "SELECT sets.set_id, sets.derivation_version, sets.output_digest
+    "SELECT sets.set_id, sets.derivation_identity, sets.output_digest
      FROM csharp_compilation_selections AS selections
      JOIN csharp_compilation_sets AS sets ON sets.set_id = selections.set_id
      WHERE selections.workspace_id = ?1 AND selections.lang = ?2
@@ -472,46 +489,15 @@ pub(super) const SELECTED_SOURCE_SQL: &str = "SELECT 1
        AND input_kind = 'source' AND rel_path = ?4
        AND valid_from <= ?5 AND (valid_until IS NULL OR ?5 < valid_until)";
 
-pub(super) const IMPLICIT_COMPILATION_SQL: &str = "SELECT compilation_id
-     FROM csharp_compilations
-     WHERE set_id = ?1 AND project_path IS NULL";
-
-pub(super) const PATH_ITEMS_SQL: &str = "SELECT item.compilation_id, item.ordinal, item.kind,
-     item.rel_path, json(item.excluded_trees), compilation.project_path,
-     (SELECT json_group_array(json_extract(rules.gaps,'$[' || gap.value || ']'))
-      FROM json_each(item.gap_indices) gap)
-     FROM csharp_compilation_items item
-     JOIN csharp_compilations compilation ON compilation.compilation_id=item.compilation_id
-     JOIN csharp_compilation_sets rules ON rules.set_id=item.set_id
-     WHERE item.set_id=?1 AND item.rel_path=?2 AND item.kind IN ('include','remove','open')";
-
-/// Trees rooted at an ancestor directory of a path, including open regions.
-pub(super) const TREE_ITEMS_SQL: &str = "SELECT item.compilation_id, item.ordinal, item.kind,
-     item.rel_path, json(item.excluded_trees), compilation.project_path,
-     (SELECT json_group_array(json_extract(rules.gaps,'$[' || gap.value || ']'))
-      FROM json_each(item.gap_indices) gap)
-     FROM csharp_compilation_items item
-     JOIN csharp_compilations compilation ON compilation.compilation_id=item.compilation_id
-     JOIN csharp_compilation_sets rules ON rules.set_id=item.set_id
-     WHERE item.set_id=?1 AND item.kind IN ('include_tree','default_tree','open_tree')
-       AND item.rel_path IN (SELECT value FROM json_each(?2))";
-
 pub(super) const MEMBERSHIP_COVERAGE_SQL: &str = "SELECT NOT EXISTS(
  SELECT 1 FROM csharp_compilation_membership_coverage WHERE set_id=?1 AND membership_complete=0)";
-pub(super) const INVENTORY_SQL: &str = "SELECT compilation.inventory_open,
- (SELECT json_group_array(json_extract(rules.gaps,'$[' || gap.value || ']'))
-  FROM json_each(compilation.inventory_gap_indices) gap)
- FROM csharp_compilations compilation JOIN csharp_compilation_sets rules USING(set_id)
- WHERE compilation.compilation_id=?1";
 
 pub(super) const OPEN_INVENTORIES_SQL: &str = "WITH RECURSIVE reach(compilation_id) AS (
  SELECT ?1 UNION SELECT edge.target_compilation_id FROM csharp_project_references edge
  JOIN reach ON edge.from_compilation_id=reach.compilation_id)
  SELECT compilation.compilation_id,compilation.project_path,
- (SELECT json_group_array(json_extract(rules.gaps,'$[' || gap.value || ']'))
-  FROM json_each(compilation.inventory_gap_indices) gap)
+ json(compilation.inventory_gap_indices)
  FROM reach JOIN csharp_compilations compilation USING(compilation_id)
- JOIN csharp_compilation_sets rules USING(set_id)
  WHERE compilation.inventory_open=1 ORDER BY compilation.compilation_id";
 
 /// Every compilation `?1` reaches over any edge, with whether its direct
@@ -583,7 +569,7 @@ pub(super) fn publish(tx: &Transaction<'_>, snapshot: &WorkspaceSnapshotId) -> R
         return Ok(());
     }
     let selected = selected_set_record(tx, snapshot)?.map(|(_, version)| version);
-    if selected == Some(DERIVATION_VERSION) {
+    if selected == Some(derivation_identity()) {
         return Ok(());
     }
 
@@ -657,7 +643,7 @@ fn existing_set(
                 workspace_id.as_str(),
                 STORAGE_LANGUAGE,
                 generation.0,
-                DERIVATION_VERSION,
+                derivation_identity(),
                 input_digest.as_slice()
             ],
             |row| {
@@ -879,14 +865,14 @@ fn insert_set(
     .expect("string triples serialize");
     tx.execute(
         "INSERT INTO csharp_compilation_sets(
-           workspace_id, lang, generation, derivation_version, input_digest, output_digest,
+           workspace_id, lang, generation, derivation_identity, input_digest, output_digest,
            gaps
          ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, jsonb(?7))",
         params![
             workspace_id.as_str(),
             STORAGE_LANGUAGE,
             generation.0,
-            DERIVATION_VERSION,
+            derivation_identity(),
             input_digest.as_slice(),
             output_digest.as_slice(),
             gaps
@@ -1026,9 +1012,11 @@ pub struct SelectedCSharpCompilations<'a> {
     conn: ReaderGuard<'a>,
     snapshot: WorkspaceSnapshotId,
     set_id: i64,
+    output_digest: [u8; 32],
     input_digest: [u8; 32],
     // Derived predicate of this immutable selected set; never declaration authority.
     membership_capped: bool,
+    index: Arc<CSharpRuleIndex>,
 }
 
 #[derive(Debug, Clone)]
@@ -1070,10 +1058,8 @@ impl AnalyzerStore {
         let owner_key = row
             .get::<_, Option<String>>(0)?
             .unwrap_or_else(|| "\0loose".into());
-        let owner_key = match row.get::<_, Option<String>>(5)? {
-            Some(framework) => format!("{owner_key} [TargetFramework={framework}]"),
-            None => owner_key,
-        };
+        let owner_key =
+            framework_qualified_label(owner_key, row.get::<_, Option<String>>(5)?.as_deref());
         let mut environment = CSharpOwnerEnvironment {
             owner_key,
             symbols: Vec::new(),
@@ -1388,17 +1374,23 @@ impl AnalyzerStore {
         let complete = conn
             .query_row(
                 SET_MEMBERSHIP_SQL,
-                params![set_id, DERIVATION_VERSION],
+                params![set_id, derivation_identity()],
                 |row| row.get::<_, i64>(0),
             )
             .optional()?;
-        if complete.is_none() || membership_capped(&conn, set_id)? {
+        if complete.is_none() {
             return Ok(None);
         }
-        match compilations_of_set(&conn, set_id, candidate_path)? {
-            SelectedCSharpMembership::Proven(membership) => Ok(Some(membership)),
-            _ => Ok(None),
+        let digest = conn.query_row(
+            "SELECT output_digest FROM csharp_compilation_sets WHERE set_id=?1",
+            [set_id],
+            |row| row.get(0),
+        )?;
+        let index = CSharpRuleIndex::load(&conn, self.retention_budget(), set_id, digest)?;
+        if index.membership_capped() {
+            return Ok(None);
         }
+        Ok(Some(index.membership(candidate_path)))
     }
 
     /// The compilation rules `snapshot` selects, or `None` when the revision
@@ -1412,14 +1404,22 @@ impl AnalyzerStore {
         let Some(set_id) = selected_set(&conn, snapshot)? else {
             return Ok(None);
         };
-        let membership_capped = membership_capped(&conn, set_id.id)?;
+        let index = CSharpRuleIndex::load(
+            &conn,
+            self.retention_budget(),
+            set_id.id,
+            set_id.output_digest,
+        )?;
+        let membership_capped = index.membership_capped();
         let input_digest = selected_input_digest(&conn, set_id.id)?;
         Ok(Some(SelectedCSharpCompilations {
             conn,
             snapshot: snapshot.clone(),
             set_id: set_id.id,
+            output_digest: set_id.output_digest,
             input_digest,
             membership_capped,
+            index,
         }))
     }
 }
@@ -1435,7 +1435,7 @@ fn selected_input_digest(conn: &Connection, set_id: i64) -> Result<[u8; 32]> {
 fn selected_set_record(
     conn: &Connection,
     snapshot: &WorkspaceSnapshotId,
-) -> Result<Option<(CSharpCompilationSetRef, i64)>> {
+) -> Result<Option<(CSharpCompilationSetRef, [u8; 32])>> {
     Ok(conn
         .query_row(SELECTED_SET_SQL, snapshot_params(snapshot), |row| {
             Ok((
@@ -1454,13 +1454,15 @@ fn selected_set(
     snapshot: &WorkspaceSnapshotId,
 ) -> Result<Option<CSharpCompilationSetRef>> {
     let selected = selected_set_record(conn, snapshot)?;
-    let Some((set_id, DERIVATION_VERSION)) = selected else {
+    let Some((set_id, _identity)) =
+        selected.filter(|(_, identity)| *identity == derivation_identity())
+    else {
         return Ok(None);
     };
     Ok(Some(set_id))
 }
 
-/// A borrowed view of one revision's compilation rules, with no retained rows.
+/// One operation's borrowed connection and shared immutable compilation rules.
 /// The shared selection's connection is the one an operation already holds;
 /// a second checkout would deadlock a test-only single-connection store. The production
 /// owner keeps its ReaderGuard and delegates each read through this view.
@@ -1468,32 +1470,57 @@ pub(super) struct CSharpCompilationView<'a> {
     conn: &'a Connection,
     snapshot: &'a WorkspaceSnapshotId,
     set_id: i64,
+    output_digest: [u8; 32],
     #[allow(dead_code)] // Consumed when the native read slice adds certification.
     input_digest: [u8; 32],
     // Derived predicate of this immutable selected set; never declaration authority.
     membership_capped: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct CSharpSelectedHandle {
-    pub snapshot: WorkspaceSnapshotId,
-    pub set_id: i64,
-    pub input_digest: [u8; 32],
-    pub membership_capped: bool,
+    index: Arc<CSharpRuleIndex>,
 }
 
 #[derive(Clone, Debug)]
+pub(super) struct CSharpSelectedHandle {
+    pub snapshot: WorkspaceSnapshotId,
+    pub set_id: i64,
+    pub output_digest: [u8; 32],
+    pub input_digest: [u8; 32],
+    pub membership_capped: bool,
+    index: Arc<CSharpRuleIndex>,
+}
+
+impl PartialEq for CSharpSelectedHandle {
+    fn eq(&self, other: &Self) -> bool {
+        self.snapshot == other.snapshot
+            && self.set_id == other.set_id
+            && self.output_digest == other.output_digest
+            && self.input_digest == other.input_digest
+            && self.membership_capped == other.membership_capped
+    }
+}
+impl Eq for CSharpSelectedHandle {}
+
+#[derive(Debug)]
 #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
-pub struct CertifiedCSharpHandle(pub(super) CSharpSelectedHandle);
+pub struct CertifiedCSharpHandle<'op>(
+    pub(super) CSharpSelectedHandle,
+    pub(super) std::marker::PhantomData<&'op ()>,
+);
 
 #[cfg(any(test, feature = "test-support"))]
-impl CertifiedCSharpHandle {
+impl<'op> CertifiedCSharpHandle<'op> {
     /// Direct reader fixtures only; production obtains this through certification.
     pub fn unchecked_for_test(
-        conn: &Connection,
+        conn: &'op Connection,
         snapshot: &WorkspaceSnapshotId,
     ) -> Result<Option<Self>> {
-        Ok(CSharpCompilationView::selected(conn, snapshot)?.map(|view| Self(view.handle())))
+        Ok(
+            CSharpCompilationView::selected(
+                conn,
+                snapshot,
+                &RetentionBudget::for_test_capacity(0),
+            )?
+            .map(|view| Self(view.handle(), std::marker::PhantomData)),
+        )
     }
 }
 
@@ -1546,8 +1573,10 @@ impl SelectedCSharpCompilations<'_> {
             conn: &self.conn,
             snapshot: &self.snapshot,
             set_id: self.set_id,
+            output_digest: self.output_digest,
             input_digest: self.input_digest,
             membership_capped: self.membership_capped,
+            index: self.index.clone(),
         }
     }
 
@@ -1628,7 +1657,7 @@ pub struct CSharpMembership {
 pub struct CSharpOpenPlacement {
     pub compilation_id: i64,
     pub project_path: Option<String>,
-    pub regions: Vec<CSharpOpenRegion>,
+    pub regions: CSharpOpenRegions,
 }
 #[derive(Debug)]
 pub struct CSharpOpenRegion {
@@ -1666,13 +1695,20 @@ pub(super) enum SelectedCSharpMembership {
 }
 
 impl<'a> CSharpCompilationView<'a> {
+    fn index(&self) -> &CSharpRuleIndex {
+        self.index.validate(self.set_id, self.output_digest);
+        &self.index
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub(super) fn handle(&self) -> CSharpSelectedHandle {
         CSharpSelectedHandle {
             snapshot: self.snapshot.clone(),
             set_id: self.set_id,
+            output_digest: self.output_digest,
             input_digest: self.input_digest,
             membership_capped: self.membership_capped,
+            index: self.index.clone(),
         }
     }
 
@@ -1680,15 +1716,17 @@ impl<'a> CSharpCompilationView<'a> {
     pub(super) fn certified(
         conn: &'a Connection,
         snapshot: &'a WorkspaceSnapshotId,
-        certified: &CertifiedCSharpHandle,
+        certified: &CertifiedCSharpHandle<'_>,
     ) -> Self {
         assert_eq!(snapshot, &certified.0.snapshot);
         Self {
             conn,
             snapshot,
             set_id: certified.0.set_id,
+            output_digest: certified.0.output_digest,
             input_digest: certified.0.input_digest,
             membership_capped: certified.0.membership_capped,
+            index: certified.0.index.clone(),
         }
     }
     // The native read slice consumes this captured identity.
@@ -1699,17 +1737,21 @@ impl<'a> CSharpCompilationView<'a> {
     pub(in crate::analyzer::store::csharp_compilation) fn selected(
         conn: &'a Connection,
         snapshot: &'a WorkspaceSnapshotId,
+        budget: &RetentionBudget,
     ) -> Result<Option<Self>> {
         let Some(set_id) = selected_set(conn, snapshot)? else {
             return Ok(None);
         };
-        let membership_capped = membership_capped(conn, set_id.id)?;
+        let index = CSharpRuleIndex::load(conn, budget, set_id.id, set_id.output_digest)?;
+        let membership_capped = index.membership_capped();
         Ok(Some(Self {
             conn,
             snapshot,
             set_id: set_id.id,
+            output_digest: set_id.output_digest,
             input_digest: selected_input_digest(conn, set_id.id)?,
             membership_capped,
+            index,
         }))
     }
 
@@ -1771,7 +1813,7 @@ impl<'a> CSharpCompilationView<'a> {
         let mut rows = statement.query([compilation])?;
         let mut result = Vec::new();
         while let Some(row) = rows.next()? {
-            let gaps = decode_gaps(&row.get::<_, String>(2)?)?;
+            let gaps = self.index().indexed_gaps(&row.get::<_, String>(2)?)?;
             if gaps.is_empty() {
                 return Err(super::StoreError::corrupt(
                     "open C# inventory lacks evidence",
@@ -1787,17 +1829,7 @@ impl<'a> CSharpCompilationView<'a> {
     }
 
     pub(super) fn inventory_gaps(&self, compilation: i64) -> Result<Vec<CSharpCompilationGap>> {
-        let (open, encoded): (bool, String) = self
-            .conn
-            .prepare_cached(INVENTORY_SQL)?
-            .query_row([compilation], |r| Ok((r.get(0)?, r.get(1)?)))?;
-        let gaps = decode_gaps(&encoded)?;
-        if open && gaps.is_empty() {
-            return Err(super::StoreError::corrupt(
-                "open C# inventory has no gap evidence",
-            ));
-        }
-        Ok(gaps)
+        self.index().inventory_gaps(compilation)
     }
 
     /// The compilations that contain the selected source `rel_path`, possibly
@@ -1864,9 +1896,9 @@ impl<'a> CSharpCompilationView<'a> {
             return self.unproven_selected_membership(rel_path, "configuration_replaced");
         }
         let membership = if self.membership_capped {
-            capped_membership(self.conn, self.set_id, rel_path)?
+            capped_membership(self.index(), rel_path)?
         } else {
-            compilations_of_set(self.conn, self.set_id, rel_path)?
+            SelectedCSharpMembership::Proven(self.index().membership(rel_path))
         };
         self.with_file_program_evidence(membership, mount.blob_id(), rel_path)
     }
@@ -1894,9 +1926,9 @@ impl<'a> CSharpCompilationView<'a> {
     /// of how the caller proved that the source belongs to its selection.
     pub(super) fn evaluate_membership(&self, rel_path: &str) -> Result<SelectedCSharpMembership> {
         if self.membership_capped {
-            return capped_membership(self.conn, self.set_id, rel_path);
+            return capped_membership(self.index(), rel_path);
         }
-        let membership = compilations_of_set(self.conn, self.set_id, rel_path)?;
+        let membership = SelectedCSharpMembership::Proven(self.index().membership(rel_path));
         // The file-program obligation applies only to a source no compilation
         // claims. The selected-blob lookup it needs is one statement per
         // membership evaluation, so ordinary members must not pay for it.
@@ -2019,56 +2051,39 @@ impl<'a> CSharpCompilationView<'a> {
 
     /// The set's recorded gaps, for diagnostics.
     pub(super) fn gaps(&self) -> Result<Vec<CSharpCompilationGap>> {
-        let gaps: String = self.conn.query_row(
-            "SELECT json(gaps) FROM csharp_compilation_sets WHERE set_id = ?1",
-            [self.set_id],
-            |row| row.get(0),
-        )?;
-        let gaps: Vec<[String; 3]> =
-            serde_json::from_str(&gaps).expect("gaps column holds string triples");
-        Ok(gaps
-            .into_iter()
-            .map(|[code, path, evidence]| CSharpCompilationGap {
-                code,
-                path,
-                evidence,
-            })
-            .collect())
+        Ok(self.index().gaps())
     }
 }
 
 pub(super) fn selected_csharp_handle(
     conn: &Connection,
     snapshot: &WorkspaceSnapshotId,
+    budget: &RetentionBudget,
 ) -> Result<Option<CSharpSelectedHandle>> {
     let Some(set_id) = selected_set(conn, snapshot)? else {
         return Ok(None);
     };
+    let index = CSharpRuleIndex::load(conn, budget, set_id.id, set_id.output_digest)?;
     Ok(Some(CSharpSelectedHandle {
         snapshot: snapshot.clone(),
         set_id: set_id.id,
+        output_digest: set_id.output_digest,
         input_digest: selected_input_digest(conn, set_id.id)?,
-        membership_capped: membership_capped(conn, set_id.id)?,
+        membership_capped: index.membership_capped(),
+        index,
     }))
 }
 
 fn capped_membership(
-    _conn: &Connection,
-    _set_id: i64,
+    _index: &CSharpRuleIndex,
     _rel_path: &str,
 ) -> Result<SelectedCSharpMembership> {
     #[cfg(any(test, feature = "test-support"))]
-    let gaps = {
-        let encoded: String = _conn.query_row(
-            "SELECT json(gaps) FROM csharp_compilation_sets WHERE set_id=?1",
-            [_set_id],
-            |row| row.get(0),
-        )?;
-        decode_gaps(&encoded)?
-    }
-    .into_iter()
-    .filter(|gap| is_membership_cap(&gap.code))
-    .collect::<Vec<_>>();
+    let gaps = _index
+        .gaps()
+        .into_iter()
+        .filter(|gap| is_membership_cap(&gap.code))
+        .collect::<Vec<_>>();
     #[cfg(any(test, feature = "test-support"))]
     let entries = gaps
         .iter()
@@ -2083,120 +2098,6 @@ fn capped_membership(
         #[cfg(any(test, feature = "test-support"))]
         gaps,
     })
-}
-
-// Both revision readers and the producer's candidate inventory use this walk.
-fn compilations_of_set(
-    conn: &Connection,
-    set_id: i64,
-    rel_path: &str,
-) -> Result<SelectedCSharpMembership> {
-    let mut ancestors = vec![String::new()];
-    for (index, byte) in rel_path.bytes().enumerate() {
-        if byte == b'/' {
-            ancestors.push(rel_path[..index].to_owned());
-        }
-    }
-    let encoded = serde_json::to_string(&ancestors).expect("paths serialize");
-    let mut items = Vec::new();
-    for (sql, argument) in [
-        (PATH_ITEMS_SQL, rel_path),
-        (TREE_ITEMS_SQL, encoded.as_str()),
-    ] {
-        let mut statement = conn.prepare_cached(sql)?;
-        let mut rows = statement.query(params![set_id, argument])?;
-        while let Some(row) = rows.next()? {
-            let kind: String = row.get(2)?;
-            let root: String = row.get(3)?;
-            let tree = matches!(kind.as_str(), "include_tree" | "default_tree" | "open_tree");
-            if tree {
-                if !rel_path
-                    .rsplit_once('.')
-                    .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("cs"))
-                {
-                    continue;
-                }
-                let excluded: Vec<String> = serde_json::from_str(&row.get::<_, String>(4)?)
-                    .map_err(|e| {
-                        super::StoreError::corrupt(format!("invalid C# excluded trees: {e}"))
-                    })?;
-                let relative = if root.is_empty() {
-                    rel_path
-                } else {
-                    &rel_path[root.len() + 1..]
-                };
-                let hidden = kind == "default_tree"
-                    && relative
-                        .split('/')
-                        .rev()
-                        .skip(1)
-                        .any(|d| d.starts_with('.'));
-                if hidden
-                    || excluded.iter().any(|d| {
-                        d.is_empty()
-                            || rel_path
-                                .strip_prefix(d)
-                                .is_some_and(|rest| rest.starts_with('/'))
-                    })
-                {
-                    continue;
-                }
-            }
-            items.push((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                kind,
-                root,
-                row.get::<_, Option<String>>(5)?,
-                decode_gaps(&row.get::<_, String>(6)?)?,
-            ));
-        }
-    }
-    let mut result = CSharpMembership::default();
-    let mut members = crate::hash::HashMap::default();
-    if let Some(id) = conn
-        .prepare_cached(IMPLICIT_COMPILATION_SQL)?
-        .query_row([set_id], |r| r.get::<_, i64>(0))
-        .optional()?
-    {
-        members.insert(id, true);
-    }
-    items.sort_by_key(|item| (item.0, item.1));
-    for (id, _, kind, path, project, gaps) in items {
-        if matches!(kind.as_str(), "open" | "open_tree") {
-            if gaps.is_empty() {
-                return Err(super::StoreError::corrupt(
-                    "open C# item lacks gap evidence",
-                ));
-            }
-            let index = match result.open.iter().position(|p| p.compilation_id == id) {
-                Some(index) => index,
-                None => {
-                    result.open.push(CSharpOpenPlacement {
-                        compilation_id: id,
-                        project_path: project,
-                        regions: Vec::new(),
-                    });
-                    result.open.len() - 1
-                }
-            };
-            result.open[index].regions.push(CSharpOpenRegion {
-                kind,
-                rel_path: path,
-                gaps,
-            });
-        } else {
-            members.insert(id, kind != "remove");
-        }
-    }
-    result.proven = members
-        .into_iter()
-        .filter_map(|(id, member)| {
-            (member && !result.open.iter().any(|p| p.compilation_id == id)).then_some(id)
-        })
-        .collect();
-    result.proven.sort_unstable();
-    Ok(SelectedCSharpMembership::Proven(result))
 }
 
 /// Cross-check incremental certificates against the independent membership recount.
@@ -2485,14 +2386,14 @@ mod tests {
         }
         conn.execute(
             "INSERT INTO csharp_compilation_sets(
-               set_id, workspace_id, lang, generation, derivation_version,
+               set_id, workspace_id, lang, generation, derivation_identity,
                input_digest, output_digest, gaps
              ) VALUES(?1, ?2, 'csharp', ?3, ?4, ?5, ?5, jsonb(?6))",
             params![
                 SET_ID,
                 WORKSPACE,
                 GENERATION,
-                DERIVATION_VERSION,
+                derivation_identity(),
                 &[0_u8; 32][..],
                 "[]"
             ],
@@ -2577,6 +2478,7 @@ mod tests {
                 },
                 None,
                 &[],
+                &RetentionBudget::for_test_capacity(0),
             )
             .unwrap();
             tx.commit().unwrap();
@@ -2612,7 +2514,14 @@ mod tests {
             )
             .unwrap();
             let tx = conn.unchecked_transaction().unwrap();
-            assert!(extent::stage(&tx, &crate::CancellationToken::new()).unwrap());
+            assert!(
+                extent::stage(
+                    &tx,
+                    &crate::CancellationToken::new(),
+                    store.retention_budget()
+                )
+                .unwrap()
+            );
             let first: i64 = tx
                 .query_row(
                     "SELECT count(*) FROM temp.selected_csharp_compilation_using_coverage",
@@ -2621,7 +2530,14 @@ mod tests {
                 )
                 .unwrap();
             assert!(first > 0, "staging ran");
-            assert!(extent::stage(&tx, &crate::CancellationToken::new()).unwrap());
+            assert!(
+                extent::stage(
+                    &tx,
+                    &crate::CancellationToken::new(),
+                    store.retention_budget()
+                )
+                .unwrap()
+            );
             assert_eq!(
                 tx.query_row(
                     "SELECT count(*) FROM temp.selected_csharp_compilation_using_coverage",
@@ -2715,14 +2631,6 @@ mod tests {
                 ]],
             ),
             (
-                "csharp_implicit_compilation",
-                vec![vec!["sqlite_autoindex_csharp_compilations"]],
-            ),
-            (
-                "csharp_path_items",
-                vec![vec!["idx_csharp_compilation_items_path"]],
-            ),
-            (
                 "csharp_reference_closure",
                 vec![vec![
                     "edges USING PRIMARY KEY",
@@ -2735,10 +2643,6 @@ mod tests {
                     "edges USING PRIMARY KEY",
                     "csharp_project_references USING PRIMARY KEY",
                 ]],
-            ),
-            (
-                "csharp_tree_items",
-                vec![vec!["idx_csharp_compilation_items_path"]],
             ),
             (
                 "csharp_project_count",
@@ -2804,6 +2708,15 @@ mod tests {
                         "idx_workspace_file_versions_snapshot_path",
                     ],
                 ],
+            ),
+            ("csharp_rule_gaps", vec![vec!["USING INTEGER PRIMARY KEY"]]),
+            (
+                "csharp_rule_compilations",
+                vec![vec!["idx_csharp_compilations_set_instance"]],
+            ),
+            (
+                "csharp_rule_items",
+                vec![vec!["idx_csharp_compilation_items_path"]],
             ),
         ];
         for state in PlannerStatisticsState::BOTH {

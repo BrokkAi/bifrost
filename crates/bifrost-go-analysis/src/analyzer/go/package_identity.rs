@@ -12,6 +12,8 @@
 //! Every method reads retained overlay state. None of them starts dependency
 //! discovery, runs the Go toolchain, or touches a module cache.
 
+use brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelNamespace;
+
 use brokk_bifrost_analysis::analyzer::semantic::MemoryValueCopy;
 use brokk_bifrost_go::packages::GO_MODULE_SCOPE_SEGMENT;
 use std::sync::Arc;
@@ -196,7 +198,7 @@ impl<'a> GoOverlayPackages<'a> {
     /// neither navigation nor a diagnostic picks an arbitrary winner.
     pub(crate) fn unique_symbol(&self, qualified_name: &str) -> Option<Arc<SemanticModelSymbol>> {
         self.overlay?
-            .symbols_named_in_family(qualified_name, "go")
+            .symbols_named_in_family(qualified_name, "go", SemanticModelNamespace::Unknown)
             .unique()
     }
 

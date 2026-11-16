@@ -1483,6 +1483,60 @@ impl ClosureFacts<'_> {
         }
         Ok(true)
     }
+
+    /// The generated root continuations this relation publishes, each with the
+    /// base authority of its owning route. The continuation keeps reading the
+    /// base relation unless a Reference half's prefix resolved to declarations
+    /// that `owns_members_outside_base` says hold their members elsewhere; the
+    /// continuation is then a closed negative, because a base lookup would
+    /// answer for a name the prefix owner does not have. The hook gets the
+    /// targets of that one prefix answer.
+    pub(super) fn generated_continuations(
+        &self,
+        halves: &[SelectedRootPathHalf],
+        mut owns_members_outside_base: impl FnMut(&[SemanticId]) -> Result<bool>,
+    ) -> Result<Box<[GeneratedContinuation]>> {
+        self.generated
+            .iter()
+            .map(|(candidate, source)| {
+                let mut suppress = false;
+                for half in halves {
+                    let SelectedRootPathHalf::Reference {
+                        identity,
+                        token,
+                        demand,
+                        prefix_reference: Some(prefix),
+                        ..
+                    } = half
+                    else {
+                        continue;
+                    };
+                    if identity.fragment() != source.fragment
+                        || *token != source.token
+                        || *demand != source.demand
+                    {
+                        continue;
+                    }
+                    for answer in self.prefixes.entries {
+                        if answer.key == DemandReferenceKey::caller(*prefix)
+                            && owns_members_outside_base(answer.answer.binding().targets())?
+                        {
+                            suppress = true;
+                        }
+                    }
+                }
+                Ok(GeneratedContinuation {
+                    candidate: *candidate,
+                    source: *source,
+                    base: if suppress {
+                        BaseEligibility::Exclude
+                    } else {
+                        BaseEligibility::Retain
+                    },
+                })
+            })
+            .collect()
+    }
 }
 
 #[doc(hidden)]
@@ -1570,7 +1624,8 @@ pub enum ProviderPreparation<K> {
 #[doc(hidden)]
 pub struct ProviderRows {
     /// Explicit keyed admission evidence, separate from closure completion.
-    /// Only a successful Go model-owner mint behind an open import sets this.
+    /// Carries this endpoint's open obligations into later retained-base reads,
+    /// including an incomplete import or provider with no exported rows.
     pub endpoint_completion: Option<ResolutionCompletion>,
     pub language: Language,
     pub exports: Vec<SelectedRootPathHalf>,
@@ -4323,20 +4378,55 @@ impl ClosedRelations {
         {
             return None;
         }
-        self.selected_universe
-            .values()
-            .any(|(owner, source, entry)| {
-                source.demand == demand.symbol()
-                    && source.token == token.symbol()
-                    && entry.is_some()
-                    && self.endpoints.contains_key(owner)
-            })
-            .then_some(ResolutionCompletion::Complete)
-        // The selected lexical proof discharges the source terminal's missing
-        // declaration obligation. An intrinsic has no authored definition path.
+        let mut completion: Option<ResolutionCompletion> = None;
+        for (owner, source, entry) in self.selected_universe.values() {
+            if source.demand == demand.symbol()
+                && source.token == token.symbol()
+                && entry.is_some()
+                && self.endpoints.contains_key(owner)
+            {
+                // A possible intrinsic discharges the missing authored path,
+                // but cannot discharge its owner's namespace uncertainty.
+                let owner_completion = self
+                    .endpoint_completions
+                    .get(owner)
+                    .cloned()
+                    .unwrap_or(ResolutionCompletion::Complete);
+                completion = Some(match completion {
+                    Some(previous) => previous.combine(&owner_completion),
+                    None => owner_completion,
+                });
+            }
+        }
+        completion
     }
 
-    pub(crate) fn generated_base_completion(
+    /// Admits a generated ROOT continuation through the authority its owning
+    /// closed relation published: that relation's completion, and whether the
+    /// endpoint may read the base relation. Rust, C# and Python use this admission
+    /// instead of source discovery, which has no authored anchor for a generated
+    /// terminal.
+    ///
+    /// A matching endpoint is always the universal root: publication indexes only
+    /// universal-root endings, and concatenation rejects unequal nodes. Rust also
+    /// returns early for positioned nodes before checking generated admission.
+    pub(crate) fn generated_base_admission(
+        &self,
+        endpoint: &EndpointSignature,
+        session: &ResolutionSession,
+    ) -> Option<Admission> {
+        let (completion, use_base) = self.generated_base_completion(endpoint, session)?;
+        Some(Admission::BaseOwned {
+            completion,
+            base: if use_base {
+                BaseEligibility::Retain
+            } else {
+                BaseEligibility::Exclude
+            },
+        })
+    }
+
+    fn generated_base_completion(
         &self,
         endpoint: &EndpointSignature,
         session: &ResolutionSession,

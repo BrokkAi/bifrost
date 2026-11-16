@@ -36,8 +36,8 @@ use crate::analyzer::semantic::{
 use crate::analyzer::{ProjectFile, WorkspaceAnalyzer};
 use crate::dataflow::SemanticInputStatus;
 use crate::dataflow::{
-    ExternalSummaryCompatibilityKey, SummaryBehaviorKey, SummaryContextKey, SummarySchemaVersion,
-    SummarySemanticsVersion, UnmodeledCallBehavior,
+    ExternalSemanticSummarySet, ExternalSummaryCompatibilityKey, SummaryBehaviorKey,
+    SummaryContextKey, SummarySchemaVersion, SummarySemanticsVersion, UnmodeledCallBehavior,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::value_flow::{
@@ -48,7 +48,7 @@ use crate::value_flow::{
     ValueFlowSinkSpec, ValueFlowSourceId, ValueFlowSourceListId, ValueFlowSourceLists,
     ValueFlowSourceSpec, ValueFlowSources, WorkspaceValueFlowProvider, discover_closure_with_cuts,
 };
-use crate::{ProcedureSummaryBindingError, bind_active_unmaterialized_procedure_summaries};
+use crate::{ProcedureSummaryBindingError, bind_snapshot_unmaterialized_procedure_summaries};
 use brokk_bifrost_analysis::analyzer::semantic::type_flow::file_for_locator;
 
 use super::binding_refinement::{self, GuardBindings};
@@ -290,7 +290,9 @@ fn local_copy_edges(procedure: &ProcedureHandle) -> Vec<(ValueId, ValueId)> {
                 value: source,
             }
             | SemanticEffect::ValueFlow {
-                kind: crate::analyzer::semantic::ValueFlowKind::Local,
+                kind:
+                    crate::analyzer::semantic::ValueFlowKind::Local
+                    | crate::analyzer::semantic::ValueFlowKind::AddressOf,
                 source,
                 target,
             } => Some((source, target)),
@@ -366,7 +368,12 @@ fn observable_value_dependencies(procedure: &ProcedureHandle) -> HashSet<ValueId
                     kind,
                     source,
                     target,
-                } if kind != crate::analyzer::semantic::ValueFlowKind::Local => {
+                } if !matches!(
+                    kind,
+                    crate::analyzer::semantic::ValueFlowKind::Local
+                        | crate::analyzer::semantic::ValueFlowKind::AddressOf
+                ) =>
+                {
                     relevant.insert(source);
                     relevant.insert(target);
                 }
@@ -574,6 +581,10 @@ pub enum TypeFlowPlanError {
     Discovery(SemanticProviderError),
     /// The root's relations were unavailable, so no plan can seed its body.
     RootRelationsUnavailable,
+    /// Acquiring the root's own body stopped on the semantic budget. A root
+    /// handle minted under another request pays its artifact's census here,
+    /// so this is an operational stop, not missing relations.
+    RootBudget(SemanticBudgetExceeded),
     WorkspaceEnumeration(std::io::Error),
     Cancelled,
     RefinementBudget(SemanticBudgetExceeded),
@@ -588,6 +599,12 @@ impl fmt::Display for TypeFlowPlanError {
             Self::Discovery(error) => write!(formatter, "type-flow discovery failed: {error}"),
             Self::RootRelationsUnavailable => {
                 formatter.write_str("the root procedure's value-flow relations are unavailable")
+            }
+            Self::RootBudget(error) => {
+                write!(
+                    formatter,
+                    "type-flow root acquisition budget exhausted: {error}"
+                )
             }
             Self::WorkspaceEnumeration(error) => {
                 write!(formatter, "type-flow workspace enumeration failed: {error}")
@@ -1896,11 +1913,16 @@ impl<'provider, 'workspace> TypeFlowDiscovery<'provider, 'workspace> {
                 })
             && self.closure.snapshots.iter().all(|input| {
                 let snapshot = input.value();
-                snapshot.procedure().semantics().gaps().iter().all(|gap| {
-                    gap.capability != SemanticCapability::NormalControlFlow
-                        || gap.discharge == SemanticGapDischarge::RetainedControlTopology
-                        || snapshot.gap_is_discharged(gap.id)
-                })
+                snapshot
+                    .procedure()
+                    .semantics()
+                    .logical_gaps()
+                    .all(|logical| {
+                        let gap = logical.base;
+                        gap.capability != SemanticCapability::NormalControlFlow
+                            || gap.discharge == SemanticGapDischarge::RetainedControlTopology
+                            || snapshot.gap_is_discharged(logical.key())
+                    })
             })
             && self.closure.coverage.values().all(|coverage| {
                 !coverage.truncated
@@ -2019,7 +2041,33 @@ impl TypeFlowPlan {
         } = discovery;
         let _scope = profiling::scope("type_flow.plan_build");
         if closure.root_snapshot.is_none() {
-            return Err(TypeFlowPlanError::RootRelationsUnavailable);
+            // Only the root's own processing queues more work, so a root that
+            // produced no snapshot is the closure's only skip. Keep an
+            // operational stop typed instead of reporting missing relations.
+            debug_assert!(
+                closure.skipped.len() <= 1,
+                "a rootless closure skipped more than its root: {:?}",
+                closure.skipped
+            );
+            return Err(match closure.skipped.as_slice() {
+                [
+                    (
+                        _,
+                        SkipReason::RelationsUnavailable {
+                            status: SemanticInputStatus::ExceededBudget { exceeded },
+                        },
+                    ),
+                ] => TypeFlowPlanError::RootBudget(*exceeded),
+                [
+                    (
+                        _,
+                        SkipReason::RelationsUnavailable {
+                            status: SemanticInputStatus::Cancelled,
+                        },
+                    ),
+                ] => TypeFlowPlanError::Cancelled,
+                _ => TypeFlowPlanError::RootRelationsUnavailable,
+            });
         }
         let dispatch_reads = canonical_dispatch_read_contracts(
             &closure.procedures,
@@ -2316,7 +2364,37 @@ impl TypeFlowPlan {
             sink_specs.push(spec);
         }
         let call_behavior = UnmodeledCallBehavior::Optimistic;
-        let mut value_flow = ValueFlowPlan::with_call_behavior_and_edge_kills(
+        let external_summaries = if let Some(active) =
+            provider.oracle().active_semantic_model_snapshot()
+            && !unmaterialized_external_targets.is_empty()
+        {
+            let compatibility = ExternalSummaryCompatibilityKey::new(
+                SummarySchemaVersion::CURRENT,
+                SummarySemanticsVersion::hash_bytes(
+                    b"bifrost.production-value-flow.semantic-pack.v1",
+                ),
+                SummaryContextKey::hash_bytes(
+                    b"bifrost.production-value-flow.empty-call-context.v1",
+                ),
+                SummaryBehaviorKey::hash_bytes(
+                    b"bifrost.production-value-flow.external-boundary.v1",
+                )
+                .with_unmodeled_call_behavior(call_behavior),
+                root.artifact().key().dependencies(),
+                call_behavior,
+            );
+            bind_snapshot_unmaterialized_procedure_summaries(
+                &active,
+                &unmaterialized_external_targets,
+                root.artifact().key(),
+                compatibility,
+            )
+            .map_err(TypeFlowPlanError::ExternalSummary)?
+            .unwrap_or_default()
+        } else {
+            ExternalSemanticSummarySet::default()
+        };
+        let mut value_flow = ValueFlowPlan::with_external_summary_inputs(
             root.clone(),
             closure
                 .snapshots
@@ -2342,38 +2420,12 @@ impl TypeFlowPlan {
             sink_specs,
             edge_kills,
             call_behavior,
+            Vec::new(),
+            external_summaries,
+            &closure.boundaries,
         )?;
         value_flow = value_flow.without_call_value_inputs_to(&container_parameter_ports);
         let field_store_receivers = retained_field_store_receivers(&value_flow);
-        if let Some(active) = provider.oracle().active_semantic_models()
-            && !unmaterialized_external_targets.is_empty()
-        {
-            let compatibility = ExternalSummaryCompatibilityKey::new(
-                SummarySchemaVersion::CURRENT,
-                SummarySemanticsVersion::hash_bytes(
-                    b"bifrost.production-value-flow.semantic-pack.v1",
-                ),
-                SummaryContextKey::hash_bytes(
-                    b"bifrost.production-value-flow.empty-call-context.v1",
-                ),
-                SummaryBehaviorKey::hash_bytes(
-                    b"bifrost.production-value-flow.external-boundary.v1",
-                )
-                .with_unmodeled_call_behavior(call_behavior),
-                root.artifact().key().dependencies(),
-                call_behavior,
-            );
-            if let Some(summaries) = bind_active_unmaterialized_procedure_summaries(
-                active,
-                &unmaterialized_external_targets,
-                root.artifact().key(),
-                compatibility,
-            )
-            .map_err(TypeFlowPlanError::ExternalSummary)?
-            {
-                value_flow = value_flow.with_external_summaries(summaries)?;
-            }
-        }
         // Refinement evidence is queried on carriers that need not have an
         // ordinary transfer edge to the value the refinement replaces. For
         // example, an indexed load from a call result asks which classes reach
@@ -2853,12 +2905,30 @@ impl TypeFlowPlan {
                             SemanticValueKind::Parameter { ordinal, .. } => adapter
                                 .declared_parameter_class(workspace, &store.procedure, *ordinal),
                             SemanticValueKind::Receiver { .. } => {
+                                let partial = adapter
+                                    .enclosing_class(workspace, &store.procedure)
+                                    .and_then(|class| {
+                                        let hierarchy = adapter.class_hierarchy(workspace, &class);
+                                        (!hierarchy.descendants.is_complete()
+                                            && !hierarchy.unresolved_base
+                                            && !hierarchy.dynamic_attributes)
+                                            .then(|| {
+                                                ClassSeed::classes_with_open_bound(
+                                                    std::iter::once(class)
+                                                        .chain(hierarchy.descendants.edges),
+                                                )
+                                            })
+                                    });
+                                if let Some(partial) = partial {
+                                    return partial;
+                                }
                                 let safe_class = adapter
                                     .enclosing_class(workspace, &store.procedure)
                                     .and_then(|class| {
                                         let hierarchy = adapter.class_hierarchy(workspace, &class);
                                         (matches!(class, ClassIdentity::Workspace(_))
-                                            && hierarchy.descendants.as_deref() == Some(&[])
+                                            && (hierarchy.descendants.is_complete()
+                                                && hierarchy.descendants.edges.is_empty())
                                             && !hierarchy.unresolved_base
                                             && !hierarchy.dynamic_attributes)
                                             .then_some(class)
@@ -3431,9 +3501,9 @@ pub(crate) fn uncovered_reason(coverage: Option<&CallSiteCoverage>) -> Option<Un
             {
                 Some(UnknownReason::SemanticBudget)
             } else if coverage.entered.iter().any(|callee| {
-                callee.semantics().gaps().iter().any(|gap| {
-                    gap.capability == SemanticCapability::NormalControlFlow
-                        && gap.discharge != SemanticGapDischarge::RetainedControlTopology
+                callee.semantics().logical_gaps().any(|gap| {
+                    gap.base.capability == SemanticCapability::NormalControlFlow
+                        && gap.base.discharge != SemanticGapDischarge::RetainedControlTopology
                 })
             }) {
                 // An unsupported continuation can hide a normal return even
@@ -3627,12 +3697,52 @@ fn seed_procedure(
                     let span = mapping_span(procedure, value.source);
                     let port = ProcedurePortHandle::receiver(procedure.clone())
                         .expect("a Receiver value exists, so the receiver port is valid");
+                    if let Some(class) = enclosing_class.as_ref() {
+                        let hierarchy = adapter.class_hierarchy(workspace, class);
+                        if matches!(
+                            class,
+                            crate::analyzer::semantic::ClassIdentity::Workspace(_)
+                        ) && !hierarchy.descendants.is_complete()
+                            && !hierarchy.unresolved_base
+                            && !hierarchy.dynamic_attributes
+                        {
+                            let span = mapping_span(procedure, value.source);
+                            let Some(site) = source_site(
+                                workspace,
+                                procedure,
+                                span,
+                                SourceSiteKind::RootReceiver,
+                            ) else {
+                                continue;
+                            };
+                            for candidate in
+                                std::iter::once(class).chain(&hierarchy.descendants.edges)
+                            {
+                                tables.push_source(
+                                    &entry,
+                                    ValueFlowObservationPhase::AfterEffects,
+                                    ValueFlowCarrier::Port(port.clone()),
+                                    ClassAtom::Class(candidate.clone()),
+                                    site.clone(),
+                                );
+                            }
+                            tables.push_source(
+                                &entry,
+                                ValueFlowObservationPhase::AfterEffects,
+                                ValueFlowCarrier::Port(port),
+                                ClassAtom::Unknown(UnknownReason::OpenTypeBound),
+                                site,
+                            );
+                            continue;
+                        }
+                    }
                     let safe_class = enclosing_class.clone().and_then(|class| {
                         let hierarchy = adapter.class_hierarchy(workspace, &class);
                         (matches!(
                             class,
                             crate::analyzer::semantic::ClassIdentity::Workspace(_)
-                        ) && hierarchy.descendants.as_deref() == Some(&[])
+                        ) && (hierarchy.descendants.is_complete()
+                            && hierarchy.descendants.edges.is_empty())
                             && !hierarchy.unresolved_base
                             && !hierarchy.dynamic_attributes)
                             .then_some(class)

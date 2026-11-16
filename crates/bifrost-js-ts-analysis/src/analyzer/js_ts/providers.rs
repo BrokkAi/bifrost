@@ -357,16 +357,15 @@ pub(crate) fn get_direct_descendants_within(
         brokk_bifrost_analysis::analyzer::record_descendant_query_failure(host.analyzer());
         return Ok(HierarchyAnswer {
             open: vec![HierarchyOpenReason::DescendantIndexUnavailable],
-            ..HierarchyAnswer::default()
+            ..HierarchyAnswer::complete(Vec::new())
         });
     };
-    let mut edges: Vec<_> = descendants
-        .index
-        .descendants(code_unit)
-        .into_iter()
-        .collect();
-    edges.sort();
-    Ok(HierarchyAnswer::complete(edges))
+    let answer = descendants.index.answer(code_unit);
+    if !answer.is_complete() {
+        // The answer carries its open candidates; see `complete_descendant_query`.
+        host.analyzer().record_unattributed_read();
+    }
+    Ok(answer)
 }
 
 // --- Usage index -----------------------------------------------------------
@@ -430,6 +429,24 @@ fn memoized_usage_index_with_receipt_limit(
         })
         .ok()?;
     Some(Arc::clone(&index))
+}
+
+/// The inventory the JS/TS index is built over: incomplete only for the
+/// omissions that can hide a JavaScript or TypeScript source. A symlinked
+/// `.py` in a TypeScript workspace is not one; an omitted `.js` is, whichever of
+/// the two the workspace holds. The other whole-workspace consumers (dead code,
+/// the usage-ranking graph) keep the unfiltered inventory.
+pub(crate) fn jsts_source_inventory<A>(
+    inner: &brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::TreeSitterAnalyzer<A>,
+) -> brokk_bifrost_core::analyzer::query_batch::QueryBatch<ProjectFile>
+where
+    A: brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::LanguageAdapter,
+{
+    use brokk_bifrost_analysis::analyzer::languages::omission_hides_source;
+    inner.source_file_inventory_where(|omission| {
+        omission_hides_source(Language::JavaScript, omission)
+            || omission_hides_source(Language::TypeScript, omission)
+    })
 }
 
 fn record_usage_index_source_scope(host: &dyn JsTsMemoSource) {

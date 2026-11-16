@@ -50,6 +50,32 @@ pub(crate) struct UseSite<'a> {
     pub(crate) node: Node<'a>,
 }
 
+/// The class declarations that enclose the byte `start` of `file`, innermost
+/// first. Empty when no declaration covers it.
+pub(crate) fn enclosing_class_units_at(
+    java: &JavaAnalyzer,
+    file: &ProjectFile,
+    start: usize,
+) -> Vec<CodeUnit> {
+    use brokk_bifrost_analysis::analyzer::Range;
+    let Some(start) = java.enclosing_code_unit(
+        file,
+        &Range {
+            start_byte: start,
+            end_byte: start.saturating_add(1),
+            start_line: 0,
+            end_line: 0,
+        },
+    ) else {
+        return Vec::new();
+    };
+    brokk_bifrost_core::analyzer::usages::common::enclosing_owner_chain(start, |unit| {
+        java.parent_of(unit)
+    })
+    .filter(CodeUnit::is_class)
+    .collect()
+}
+
 /// Proof that nothing in scope at a use site can shadow or obscure one simple
 /// name, so a single-type import of a JDK type in an unshadowable package binds
 /// it whatever a missing jar holds. `UnshadowedScope::check` is the only
@@ -114,6 +140,49 @@ impl UnshadowedScope {
             simple_name: simple_name.to_owned(),
         })
     }
+}
+
+/// Whether no scope, import or enclosing type at `site` can bind `simple_name`
+/// except Java's implicit `java.lang.*` on-demand import (JLS 6.4.1, 7.3).
+///
+/// This is a scoping fact, not a lookup: it does not resolve the name, so it
+/// needs no JDK declaration. It holds when
+///
+/// * the build model shows no platform override;
+/// * no class or method type parameter in scope has the name;
+/// * the file has no import naming the simple name and no on-demand import,
+///   static or not, because an on-demand package or type could supply it and
+///   nothing here proves the package lacks it;
+/// * the external surface carries no gap, so no missing dependency can supply
+///   the name through the same package;
+/// * every supertype in the closure of every enclosing type declaration is
+///   inspectable and none declares or inherits a member type with the name
+///   (the closure rule of [`UnshadowedScope::check`]). A JDK supertype needs
+///   the JDK pack, so without one this refuses, which fails closed.
+///
+/// The caller must have read the same-package and single-type tiers of the
+/// type ladder as unbound; this function covers the rest.
+pub(crate) fn names_only_through_implicit_java_lang(
+    java: &JavaAnalyzer,
+    packs: Option<
+        Arc<brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay>,
+    >,
+    selected_jdk_artifact_sha256: Option<&str>,
+    external: &JvmExternalDeclarations<'_>,
+    file: &ProjectFile,
+    site: &UseSite<'_>,
+    simple_name: &str,
+) -> bool {
+    ScopeCheck {
+        java,
+        packs,
+        selected_jdk_artifact_sha256,
+        external,
+        file,
+        site,
+        simple_name,
+    }
+    .implicit_java_lang_only()
 }
 
 struct ScopeCheck<'a, 'q> {
@@ -184,6 +253,30 @@ impl ScopeCheck<'_, '_> {
         matches!(self.read_closure(seeds), ClosureReading::Clear)
     }
 
+    fn implicit_java_lang_only(&self) -> bool {
+        if self.external.platform_override_visible()
+            || !self.external.carries_no_gaps()
+            || java_type_parameter_in_scope(self.site.node, self.site.source, self.simple_name)
+                .is_some()
+        {
+            return false;
+        }
+        let names_it = |import: &brokk_bifrost_core::analyzer::model::ImportInfo| {
+            import.is_wildcard || import.identifier.as_deref() == Some(self.simple_name)
+        };
+        if self
+            .java
+            .inner
+            .import_info_of(self.site.token, self.file)
+            .iter()
+            .any(names_it)
+        {
+            return false;
+        }
+        self.enclosing_seeds()
+            .is_some_and(|seeds| matches!(self.read_closure(seeds), ClosureReading::Clear))
+    }
+
     /// The enclosing type declarations of the use site, innermost first, with
     /// the implicit supertype of each already checked. `None` means a
     /// declaration could not be read, which refuses.
@@ -245,23 +338,7 @@ impl ScopeCheck<'_, '_> {
     }
 
     fn enclosing_class_units(&self) -> Vec<CodeUnit> {
-        use brokk_bifrost_analysis::analyzer::Range;
-        let Some(start) = self.java.enclosing_code_unit(
-            self.file,
-            &Range {
-                start_byte: self.site.node.start_byte(),
-                end_byte: self.site.node.start_byte().saturating_add(1),
-                start_line: 0,
-                end_line: 0,
-            },
-        ) else {
-            return Vec::new();
-        };
-        brokk_bifrost_core::analyzer::usages::common::enclosing_owner_chain(start, |unit| {
-            self.java.parent_of(unit)
-        })
-        .filter(CodeUnit::is_class)
-        .collect()
+        enclosing_class_units_at(self.java, self.file, self.site.node.start_byte())
     }
 
     /// The closure member a written supertype name denotes in `file`'s scope,

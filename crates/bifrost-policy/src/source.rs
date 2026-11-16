@@ -38,14 +38,19 @@ use super::schema::{
     AtomDomain, CollectionOrder, CvssBaseMetricSchema, CvssMetricScopeSchema, FieldPlacement,
     PolicyAnalysisKind, PolicyAtomValue, PolicyField, PolicyRecord, PolicyRecordContext,
     PolicyValueShape, RqlpDocumentKind, ValueMultiplicity, applicable_fields_for_record,
-    atom_values, lookup_applicable_field, lookup_atom, lookup_cvss_base_metric, lookup_field,
-    positional_field, records_from_label, required_fields_for_record,
-    resolve_policy_schema_version, variadic_positional_field,
+    atom_values, decode_policy_schema_version, infer_policy_schema_version,
+    lookup_applicable_field, lookup_atom, lookup_cvss_base_metric, lookup_field, positional_field,
+    records_from_label, required_fields_for_record, resolve_policy_schema_version,
+    variadic_positional_field,
 };
 
 pub const MAX_RQLP_SOURCE_BYTES: usize = 256 * 1024;
 pub const MAX_RQLP_SEXP_DEPTH: usize = 128;
-pub const MAX_RQLP_SEXP_NODES: usize = 4_096;
+// Each Expr consumes a distinct first source byte: a container's opening
+// delimiter or an atom's first token byte. This also holds for incomplete
+// strings and containers. The byte guard therefore makes this finite generic
+// parser ceiling non-binding; there is no smaller policy-authoring node limit.
+pub const MAX_RQLP_SEXP_NODES: usize = MAX_RQLP_SOURCE_BYTES;
 pub const MAX_RQLP_SOURCE_DIAGNOSTICS: usize = 64;
 pub const MAX_POLICY_SOURCE_IDENTITY_BYTES: usize = 1_024;
 
@@ -668,6 +673,20 @@ fn help_description(base_description: &str, record: PolicyRecord, items: &[Expr]
     format!("{base_description}\n\n{status}")
 }
 
+// Complete editor documents use the same typed inference as activation.
+// Partial documents retain the ordinary minimum-version suggestion.
+fn editor_policy_schema_version(items: &[Expr]) -> Option<SchemaVersionResolution> {
+    let expr = Expr {
+        kind: ExprKind::List(items.to_vec()),
+        range: items.first()?.range.start..items.last()?.range.end,
+    };
+    Decoder::new(PolicySourceIdentity::new("editor"))
+        .decode_document(&expr)
+        .ok()
+        .map(|document| document.schema_resolution())
+        .or_else(|| resolve_policy_schema_version(None).ok())
+}
+
 fn schema_status(record: PolicyRecord, items: &[Expr]) -> Option<String> {
     let authored = authored_schema_version(items);
     match record {
@@ -679,9 +698,9 @@ fn schema_status(record: PolicyRecord, items: &[Expr]) -> Option<String> {
             };
             Some(match authored {
                 AuthoredSchemaVersion::Omitted => {
-                    let resolution = resolve_policy_schema_version(None).ok()?;
+                    let resolution = editor_policy_schema_version(items)?;
                     format!(
-                        "Policy schema: `:schema-version` is omitted, so this {kind} document resolves to the latest compatible policy schema version (currently `{}`). Add `:schema-version {}` to pin it exactly.",
+                        "Policy schema: `:schema-version` is omitted, so this {kind} document resolves to the lowest compatible policy schema admitting its constructs (currently `{}`). Add `:schema-version {}` to pin it exactly.",
                         resolution.version, resolution.version
                     )
                 }
@@ -831,7 +850,7 @@ fn schema_version_completion(
     let descriptor = lookup_field(record, "schema-version")?;
     let version = match record {
         PolicyRecord::Policy | PolicyRecord::Endpoint => {
-            resolve_policy_schema_version(None).ok()?.version
+            editor_policy_schema_version(items)?.version
         }
         PolicyRecord::Rql | PolicyRecord::RqlFile => resolve_rql_schema_version(None).ok()?.version,
         _ => return None,
@@ -898,7 +917,106 @@ fn keyword_completion(
     }
 }
 
+fn policy_document_required_schema_version(document: &RqlpDocument) -> u32 {
+    fn projected(port: &PolicyPort) -> bool {
+        matches!(port, PolicyPort::ReturnValue { path: Some(_) })
+    }
+
+    fn taint_has_projection(spec: &TaintPolicySpec) -> bool {
+        let sources = spec
+            .sources
+            .entries
+            .iter()
+            .chain(
+                spec.without_flow
+                    .iter()
+                    .flat_map(|filter| &filter.sources.entries),
+            )
+            .map(|entry| &entry.bind);
+        let sanitizers = spec
+            .sanitizers
+            .entries
+            .iter()
+            .chain(
+                spec.without_flow
+                    .iter()
+                    .flat_map(|filter| &filter.sanitizers.entries),
+            )
+            .filter_map(|entry| entry.kind.transfer_ports())
+            .flat_map(|(input, output)| [input, output]);
+        let transforms = spec
+            .transforms
+            .entries
+            .iter()
+            .chain(
+                spec.without_flow
+                    .iter()
+                    .flat_map(|filter| &filter.transforms.entries),
+            )
+            .flat_map(|entry| [&entry.input, &entry.output]);
+        let models = spec
+            .external_models
+            .entries
+            .iter()
+            .chain(
+                spec.without_flow
+                    .iter()
+                    .flat_map(|filter| &filter.external_models.entries),
+            )
+            .flat_map(|entry| &entry.transfers)
+            .flat_map(|transfer| [&transfer.from, &transfer.to]);
+        let writes = spec.store_writes.iter().flat_map(|entry| {
+            std::iter::once(&entry.input)
+                .chain(entry.key.iter())
+                .chain(entry.instance.iter())
+        });
+        let reads = spec.store_reads.iter().flat_map(|entry| {
+            std::iter::once(&entry.output)
+                .chain(entry.key.iter())
+                .chain(entry.instance.iter())
+        });
+        sources
+            .chain(
+                spec.sinks
+                    .entries
+                    .iter()
+                    .map(|entry| &entry.dangerous_operand),
+            )
+            .chain(sanitizers)
+            .chain(
+                spec.entry_points
+                    .entries
+                    .iter()
+                    .map(|entry| &entry.parameter),
+            )
+            .chain(transforms)
+            .chain(models)
+            .chain(writes)
+            .chain(reads)
+            .any(projected)
+    }
+
+    let has_projection = match document {
+        RqlpDocument::Policy { definition } => definition
+            .analysis
+            .taint_shaped_spec()
+            .is_some_and(taint_has_projection),
+        RqlpDocument::Endpoint { definition } => matches!(
+            definition.binding,
+            PolicyEndpointBinding::ReturnValue { path: Some(_) }
+        ),
+        RqlpDocument::EndpointSet { definition } => taint_has_projection(&definition.spec),
+        RqlpDocument::DeclarationSelection { .. } => false,
+    };
+    if has_projection {
+        super::schema::PROJECTED_RETURN_VALUE_SCHEMA_VERSION
+    } else {
+        1
+    }
+}
+
 struct Decoder {
+    schema_version: u32,
     identity: PolicySourceIdentity,
     source_map: Vec<PolicySourceMapEntry>,
     unresolved_file_selectors: Vec<UnresolvedPolicySelectorReference>,
@@ -924,6 +1042,7 @@ struct DecodedAnalysis {
 impl Decoder {
     fn new(identity: PolicySourceIdentity) -> Self {
         Self {
+            schema_version: super::schema::POLICY_SCHEMA_VERSION,
             identity,
             source_map: Vec::new(),
             unresolved_file_selectors: Vec::new(),
@@ -946,7 +1065,7 @@ impl Decoder {
         inherited_context: PolicySelectorContext,
     ) -> Result<ParsedRqlpDocument, PolicySourceError> {
         self.selector_context = inherited_context;
-        let (document, schema_resolution) = match select_record(
+        let (mut document, mut schema_resolution) = match select_record(
             expr,
             &[
                 PolicyRecord::Policy,
@@ -998,6 +1117,27 @@ impl Decoder {
             }
             record => unreachable!("document selector returned {record:?}"),
         };
+        if schema_resolution.origin == SchemaVersionOrigin::ImplicitCompatible {
+            // Infer only from decoded constructs, so an additive syntax
+            // version cannot rotate identities for untouched policies.
+            schema_resolution =
+                infer_policy_schema_version(policy_document_required_schema_version(&document))
+                    .expect("the decoded policy vocabulary has a compatible schema");
+            match &mut document {
+                RqlpDocument::Policy { definition } => {
+                    definition.schema_version = schema_resolution
+                }
+                RqlpDocument::Endpoint { definition } => {
+                    definition.schema_version = schema_resolution
+                }
+                RqlpDocument::EndpointSet { definition } => {
+                    definition.schema_version = schema_resolution
+                }
+                RqlpDocument::DeclarationSelection { definition } => {
+                    definition.schema_version = schema_resolution
+                }
+            }
+        }
         self.source_map
             .sort_by(|left, right| left.path.cmp(&right.path));
         Ok(ParsedRqlpDocument {
@@ -1031,13 +1171,14 @@ impl Decoder {
         let authored_version = version_expr
             .map(|value| expect_u32(value, "policy schema version", false))
             .transpose()?;
-        let schema_version = resolve_policy_schema_version(authored_version).map_err(|error| {
+        let schema_version = decode_policy_schema_version(authored_version).map_err(|error| {
             source_error(
                 "unsupported-policy-schema-version",
                 version_expr.map_or_else(|| expr.range.clone(), |value| value.range.clone()),
                 error.to_string(),
             )
         })?;
+        self.schema_version = schema_version.version;
         // Top-level policy fields are common to all variants. A concrete
         // analysis context is still supplied so the applicability registry is
         // exercised consistently by RecordCursor.
@@ -1240,13 +1381,14 @@ impl Decoder {
         let authored_version = version_expr
             .map(|value| expect_u32(value, "endpoint schema version", false))
             .transpose()?;
-        let schema_version = resolve_policy_schema_version(authored_version).map_err(|error| {
+        let schema_version = decode_policy_schema_version(authored_version).map_err(|error| {
             source_error(
                 "unsupported-policy-schema-version",
                 version_expr.map_or_else(|| expr.range.clone(), |value| value.range.clone()),
                 error.to_string(),
             )
         })?;
+        self.schema_version = schema_version.version;
         let fields = RecordCursor::parse(expr, PolicyRecord::Endpoint, DecodeContext::ENDPOINT)?;
         let role = decode_endpoint_role(fields.required("role"))?;
         let taint = fields
@@ -1323,13 +1465,14 @@ impl Decoder {
         let authored_version = version_expr
             .map(|value| expect_u32(value, "endpoint-set document schema version", false))
             .transpose()?;
-        let schema_version = resolve_policy_schema_version(authored_version).map_err(|error| {
+        let schema_version = decode_policy_schema_version(authored_version).map_err(|error| {
             source_error(
                 "unsupported-policy-schema-version",
                 version_expr.map_or_else(|| expr.range.clone(), |value| value.range.clone()),
                 error.to_string(),
             )
         })?;
+        self.schema_version = schema_version.version;
         let kind = decode_endpoint_set_kind(fields.required("kind"))?;
 
         // Standalone documents inherit selector defaults from the importing
@@ -1484,13 +1627,14 @@ impl Decoder {
                 )
             })
             .transpose()?;
-        let schema_version = resolve_policy_schema_version(authored_version).map_err(|error| {
+        let schema_version = decode_policy_schema_version(authored_version).map_err(|error| {
             source_error(
                 "unsupported-policy-schema-version",
                 version_expr.map_or_else(|| expr.range.clone(), |value| value.range.clone()),
                 error.to_string(),
             )
         })?;
+        self.schema_version = schema_version.version;
         let language_expr = fields.required("language");
         let language = decode_declaration_selection_language(language_expr)?;
         let mut selector_context = PolicySelectorContext {
@@ -2232,7 +2376,7 @@ impl Decoder {
         port_field: &str,
     ) -> Result<(PolicySelector, PolicyPort), PolicySourceError> {
         let selector = self.decode_selector(fields.required("selector"), context, selector_path)?;
-        let port = decode_policy_port(fields.required(port_field), context)?;
+        let port = decode_policy_port(self.schema_version, fields.required(port_field), context)?;
         Ok((selector, port))
     }
 
@@ -2244,7 +2388,7 @@ impl Decoder {
     ) -> Result<(PolicySelector, PolicyPort, PolicyPort), PolicySourceError> {
         let (selector, input) =
             self.decode_selector_and_port(fields, context, selector_path, "input")?;
-        let output = decode_policy_port(fields.required("output"), context)?;
+        let output = decode_policy_port(self.schema_version, fields.required("output"), context)?;
         Ok((selector, input, output))
     }
 
@@ -2687,7 +2831,7 @@ impl Decoder {
             store,
             key,
             instance,
-            input: decode_policy_port(fields.required("input"), context)?,
+            input: decode_policy_port(self.schema_version, fields.required("input"), context)?,
         })
     }
 
@@ -2711,7 +2855,7 @@ impl Decoder {
             store,
             key,
             instance,
-            output: decode_policy_port(fields.required("output"), context)?,
+            output: decode_policy_port(self.schema_version, fields.required("output"), context)?,
         })
     }
 
@@ -2726,11 +2870,11 @@ impl Decoder {
             store: parse_identifier(fields.required("store"), "store name")?,
             key: fields
                 .get("key")
-                .map(|value| decode_policy_port(value, context))
+                .map(|value| decode_policy_port(self.schema_version, value, context))
                 .transpose()?,
             instance: fields
                 .get("instance")
-                .map(|value| decode_policy_port(value, context))
+                .map(|value| decode_policy_port(self.schema_version, value, context))
                 .transpose()?,
         })
     }
@@ -3172,8 +3316,8 @@ impl Decoder {
             fields.get("requires"),
         ) {
             (Some(input), Some(output), None, None, None) => Ok(TaintSanitizerKind::Transfer {
-                input: decode_policy_port(input, context)?,
-                output: decode_policy_port(output, context)?,
+                input: decode_policy_port(self.schema_version, input, context)?,
+                output: decode_policy_port(self.schema_version, output, context)?,
             }),
             (None, None, Some(when), Some(sanitizes), requires) => {
                 let result = RecordCursor::parse(when, PolicyRecord::Result, context)?;
@@ -3199,7 +3343,7 @@ impl Decoder {
                         .map(|value| expect_u32(value, "result index", true))
                         .transpose()?,
                 };
-                let sanitizes = decode_sanitizer_operand(sanitizes, context)?;
+                let sanitizes = decode_sanitizer_operand(self.schema_version, sanitizes, context)?;
                 let mut decoded_requires = Vec::new();
                 if let Some(requires) = requires {
                     for (index, requirement) in
@@ -3402,11 +3546,13 @@ impl Decoder {
         let fields = RecordCursor::parse(expr, PolicyRecord::Transfer, context)?;
         Ok(TaintTransferSpec {
             from: decoded_binding_to_port(decode_binding(
+                self.schema_version,
                 fields.required("from"),
                 context,
                 PolicyValueShape::ExternalModelPort,
             )?),
             to: decoded_binding_to_port(decode_binding(
+                self.schema_version,
                 fields.required("to"),
                 context,
                 PolicyValueShape::ExternalModelWritePort,
@@ -3624,6 +3770,7 @@ impl Decoder {
             let selector =
                 self.decode_selector(record.required("selector"), context, &selector_path)?;
             let subject = decoded_binding_to_seed(decode_binding(
+                self.schema_version,
                 record.required("subject"),
                 context,
                 PolicyValueShape::TypestateBinding,
@@ -3981,7 +4128,7 @@ impl Decoder {
         let event_path = format!("{path}/events/{}", json_pointer_segment(id.as_str()));
         self.map(event_path.clone(), expr);
         let trigger = match (fields.get("calls"), fields.get("matches"), fields.get("on")) {
-            (Some(value), None, None) => self.decode_calls_trigger(value, &event_path)?,
+            (Some(value), None, None) => self.decode_calls_trigger(value, &id)?,
             (None, Some(value), None) => {
                 let parsed = self.decode_match_endpoint_set(
                     value,
@@ -4072,13 +4219,14 @@ impl Decoder {
     fn decode_calls_trigger(
         &mut self,
         expr: &Expr,
-        path: &str,
+        id: &TypestateEventId,
     ) -> Result<TypestateEventTrigger, PolicySourceError> {
         let context = DecodeContext::policy(PolicyAnalysisKind::Typestate);
         let fields = RecordCursor::parse(expr, PolicyRecord::Calls, context)?;
         let subject_expr = fields.required("subject");
         let subject = decoded_binding_to_call(
             decode_binding(
+                self.schema_version,
                 subject_expr,
                 context,
                 PolicyValueShape::TypestateCallBinding,
@@ -4114,7 +4262,7 @@ impl Decoder {
             selector: self.decode_selector(
                 fields.required("selector"),
                 context,
-                &format!("{path}/calls/selector"),
+                &typestate_event_selector_path(id),
             )?,
             subject,
             phase,
@@ -4130,6 +4278,7 @@ impl Decoder {
         let fields = RecordCursor::parse(expr, PolicyRecord::ArgumentCondition, context)?;
         let argument_expr = fields.required("argument");
         let argument = decode_binding(
+            self.schema_version,
             argument_expr,
             context,
             PolicyValueShape::TypestateCallBinding,
@@ -4144,7 +4293,7 @@ impl Decoder {
                 ));
             }
             DecodedBinding::Receiver
-            | DecodedBinding::ReturnValue
+            | DecodedBinding::ReturnValue(_)
             | DecodedBinding::ResultIndex(_)
             | DecodedBinding::MatchedValue
             | DecodedBinding::FieldOf { .. } => {
@@ -5087,13 +5236,14 @@ impl Decoder {
         expr: &Expr,
     ) -> Result<PolicyEndpointBinding, PolicySourceError> {
         match decode_binding(
+            self.schema_version,
             expr,
             DecodeContext::ENDPOINT,
             PolicyValueShape::EndpointBinding,
         )? {
             DecodedBinding::MatchedValue => Ok(PolicyEndpointBinding::MatchedValue),
             DecodedBinding::Receiver => Ok(PolicyEndpointBinding::Receiver),
-            DecodedBinding::ReturnValue => Ok(PolicyEndpointBinding::ReturnValue),
+            DecodedBinding::ReturnValue(path) => Ok(PolicyEndpointBinding::ReturnValue { path }),
             DecodedBinding::ResultIndex(index) => Ok(PolicyEndpointBinding::ResultIndex { index }),
             DecodedBinding::ArgumentIndex(index) => {
                 Ok(PolicyEndpointBinding::ArgumentIndex { index })
@@ -6439,7 +6589,7 @@ fn decode_observation_phase(expr: &Expr) -> Result<EndpointObservationPhase, Pol
 enum DecodedBinding {
     MatchedValue,
     Receiver,
-    ReturnValue,
+    ReturnValue(Option<brokk_bifrost_analysis::analyzer::semantic_model::SummaryEndpointPath>),
     ResultIndex(u32),
     ArgumentIndex(u32),
     ArgumentName(String),
@@ -6452,6 +6602,7 @@ enum DecodedBinding {
 }
 
 fn decode_binding(
+    schema_version: u32,
     expr: &Expr,
     context: DecodeContext,
     value_shape: PolicyValueShape,
@@ -6484,9 +6635,9 @@ fn decode_binding(
                 "matched-value is not allowed in this call-signature binding",
             )),
             PolicyAtomValue::PortReceiver => Ok(DecodedBinding::Receiver),
-            PolicyAtomValue::PortReturnValue => Ok(DecodedBinding::ReturnValue),
+            PolicyAtomValue::PortReturnValue => Ok(DecodedBinding::ReturnValue(None)),
             PolicyAtomValue::CallPortReceiver => Ok(DecodedBinding::Receiver),
-            PolicyAtomValue::CallPortReturnValue => Ok(DecodedBinding::ReturnValue),
+            PolicyAtomValue::CallPortReturnValue => Ok(DecodedBinding::ReturnValue(None)),
             value => unreachable!("binding registry returned {value:?}"),
         };
     }
@@ -6506,7 +6657,12 @@ fn decode_binding(
     if record == PolicyRecord::Field {
         let name = expect_string(fields.required("name"), "field name", MAX_HUMAN_NAME_BYTES)?;
         let of = fields.required("of");
-        let base = decode_binding(of, context, PolicyValueShape::ExternalModelPort)?;
+        let base = decode_binding(
+            schema_version,
+            of,
+            context,
+            PolicyValueShape::ExternalModelPort,
+        )?;
         return match base {
             DecodedBinding::Receiver
             | DecodedBinding::ArgumentIndex(_)
@@ -6520,6 +6676,61 @@ fn decode_binding(
                 "a field base must be an argument or the receiver",
             )),
         };
+    }
+    if record == PolicyRecord::ReturnValue {
+        if schema_version < super::schema::PROJECTED_RETURN_VALUE_SCHEMA_VERSION {
+            return Err(source_error(
+                "projected-return-schema-version",
+                expr.range.clone(),
+                format!(
+                    "projected returns require policy schema {} or newer; document is pinned to {schema_version}",
+                    super::schema::PROJECTED_RETURN_VALUE_SCHEMA_VERSION
+                ),
+            ));
+        }
+        if !matches!(
+            value_shape,
+            PolicyValueShape::PolicyPort | PolicyValueShape::EndpointBinding
+        ) {
+            return Err(source_error(
+                "binding-not-allowed",
+                expr.range.clone(),
+                "projected return values are only supported for policy endpoints",
+            ));
+        }
+        use brokk_bifrost_analysis::analyzer::semantic::PatternProjectionStep;
+        let values = expect_vector(fields.required("path"), "return projection steps", 1, 64)?;
+        let mut path = Vec::with_capacity(values.len());
+        for value in values {
+            let step = select_record(
+                value,
+                PolicyValueShape::ProjectionPath.accepted_records(),
+                "projection step",
+            )?;
+            let fields = RecordCursor::parse(value, step, context)?;
+            path.push(match step {
+                PolicyRecord::ProjectionElement => PatternProjectionStep::Element,
+                PolicyRecord::ProjectionTuple => PatternProjectionStep::Tuple(expect_u32(
+                    fields.required("index"),
+                    "tuple index",
+                    true,
+                )?),
+                PolicyRecord::ProjectionNamed => PatternProjectionStep::Named(
+                    expect_string(fields.required("name"), "field name", MAX_HUMAN_NAME_BYTES)?
+                        .into(),
+                ),
+                PolicyRecord::ProjectionVariant => PatternProjectionStep::Variant {
+                    declaration: expect_string(
+                        fields.required("declaration"),
+                        "variant declaration ID",
+                        MAX_HUMAN_NAME_BYTES,
+                    )?
+                    .into(),
+                },
+                _ => unreachable!("projection path registry admits only typed steps"),
+            });
+        }
+        return Ok(DecodedBinding::ReturnValue(Some(path.into_boxed_slice())));
     }
     if record == PolicyRecord::Result {
         return Ok(DecodedBinding::ResultIndex(expect_u32(
@@ -6592,7 +6803,7 @@ fn decoded_binding_to_port(binding: DecodedBinding) -> PolicyPort {
     match binding {
         DecodedBinding::MatchedValue => PolicyPort::MatchedValue,
         DecodedBinding::Receiver => PolicyPort::Receiver,
-        DecodedBinding::ReturnValue => PolicyPort::ReturnValue,
+        DecodedBinding::ReturnValue(path) => PolicyPort::ReturnValue { path },
         DecodedBinding::ResultIndex(index) => PolicyPort::ResultIndex { index },
         DecodedBinding::ArgumentIndex(index) => PolicyPort::ArgumentIndex { index },
         DecodedBinding::ArgumentName(name) => PolicyPort::ArgumentName { name },
@@ -6632,10 +6843,11 @@ fn decode_sanitizer_literal(expr: &Expr) -> Result<serde_json::Value, PolicySour
 }
 
 fn decode_sanitizer_operand(
+    schema_version: u32,
     expr: &Expr,
     context: DecodeContext,
 ) -> Result<TaintSanitizerOperand, PolicySourceError> {
-    match decode_policy_port(expr, context)? {
+    match decode_policy_port(schema_version, expr, context)? {
         PolicyPort::Receiver => Ok(TaintSanitizerOperand::Receiver),
         PolicyPort::ArgumentIndex { index } => Ok(TaintSanitizerOperand::Argument { index }),
         _ => Err(source_error(
@@ -6647,17 +6859,19 @@ fn decode_sanitizer_operand(
 }
 
 fn decode_policy_port(
+    schema_version: u32,
     expr: &Expr,
     context: DecodeContext,
 ) -> Result<PolicyPort, PolicySourceError> {
-    decode_binding(expr, context, PolicyValueShape::PolicyPort).map(decoded_binding_to_port)
+    decode_binding(schema_version, expr, context, PolicyValueShape::PolicyPort)
+        .map(decoded_binding_to_port)
 }
 
 fn decoded_binding_to_seed(binding: DecodedBinding) -> TypestateSeedBinding {
     match binding {
         DecodedBinding::MatchedValue => TypestateSeedBinding::MatchedValue,
         DecodedBinding::Receiver => TypestateSeedBinding::Receiver,
-        DecodedBinding::ReturnValue => TypestateSeedBinding::ReturnValue,
+        DecodedBinding::ReturnValue(_) => TypestateSeedBinding::ReturnValue,
         DecodedBinding::ResultIndex(index) => TypestateSeedBinding::ResultIndex { index },
         DecodedBinding::ArgumentIndex(index) => TypestateSeedBinding::ArgumentIndex { index },
         DecodedBinding::ArgumentName(name) => TypestateSeedBinding::ArgumentName { name },
@@ -6678,7 +6892,7 @@ fn decoded_binding_to_call(
             "matched-value is not a valid call binding",
         )),
         DecodedBinding::Receiver => Ok(TypestateCallBinding::Receiver),
-        DecodedBinding::ReturnValue => Ok(TypestateCallBinding::ReturnValue),
+        DecodedBinding::ReturnValue(_) => Ok(TypestateCallBinding::ReturnValue),
         DecodedBinding::ResultIndex(index) => Ok(TypestateCallBinding::ResultIndex { index }),
         DecodedBinding::ArgumentIndex(index) => Ok(TypestateCallBinding::ArgumentIndex { index }),
         DecodedBinding::ArgumentName(name) => Ok(TypestateCallBinding::ArgumentName { name }),
@@ -8368,9 +8582,171 @@ mod tests {
     use crate::test_support::error_at as assert_error_token;
     use brokk_bifrost_analysis::schema_version::SchemaVersionOrigin;
     use brokk_bifrost_rql::QueryStep;
+    use brokk_bifrost_test_macros::hardwon;
 
     fn parse(source: &str) -> Result<ParsedRqlpDocument, PolicySourceError> {
         parse_rqlp_source(source, PolicySourceIdentity::new("test.rqlp"))
+    }
+
+    #[test]
+    #[hardwon("70e5fa666ddc: schema-one pins admitted projected return syntax")]
+    fn projected_returns_require_the_declared_schema_in_every_document_kind() {
+        for projection in [
+            "(return-value :path [(tuple :index 0)])",
+            "(return-value :path [(element)])",
+        ] {
+            let entry = format!(
+                r#"(source :id input :display-name "Input" :categories [input.user]
+            :selector (rql :schema-version 1 (call)) :bind {projection} :labels [untrusted])"#
+            );
+            let introducing_version = super::super::schema::PROJECTED_RETURN_VALUE_SCHEMA_VERSION;
+            for version in [Some(1), Some(introducing_version), None] {
+                let version_field = version
+                    .map(|version| format!(" :schema-version {version}"))
+                    .unwrap_or_default();
+                let documents = [
+                    format!(
+                        r#"(policy{version_field} :id "test.pin" :name "Pin" :message "M" :severity warning
+                    :analysis (analysis :type taint :mode may :sources (endpoint-set :entries [{entry}]) :sinks (endpoint-set)))"#
+                    ),
+                    format!(
+                        r#"(endpoint{version_field} :id "test.pin" :name "Pin" :display-name "Pin" :role source
+                    :categories [input.user] :selector (rql :schema-version 1 (call)) :binding {projection}
+                    :taint (source-semantics :labels [untrusted]) :supersedes [])"#
+                    ),
+                    format!(
+                        "(endpoint-set-document{version_field} :kind sources :set (endpoint-set :entries [{entry}]))"
+                    ),
+                ];
+                for document in documents {
+                    let whole = document.replace(projection, "return-value");
+                    let whole = parse(&whole).expect("whole return syntax stays readable");
+                    assert_eq!(whole.schema_resolution().version, version.unwrap_or(1));
+                    if version == Some(1) {
+                        let error = parse(&document).unwrap_err();
+                        assert_eq!(
+                            error.diagnostic.code, "projected-return-schema-version",
+                            "{document}"
+                        );
+                    } else {
+                        let projected =
+                            parse(&document).expect("the introducing schema admits the typed path");
+                        assert_eq!(projected.schema_resolution().version, introducing_version);
+                        assert_eq!(
+                            projected.schema_resolution().origin,
+                            if version.is_some() {
+                                SchemaVersionOrigin::Explicit
+                            } else {
+                                SchemaVersionOrigin::ImplicitCompatible
+                            }
+                        );
+                        if version.is_none() {
+                            let expr = parse_rqlp_expr(&document).unwrap();
+                            let items = expr.as_list().unwrap();
+                            assert_eq!(
+                                editor_policy_schema_version(items).unwrap().version,
+                                introducing_version
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11547: a 40 KiB cookie policy exceeded the unrelated 4096-node authoring limit"
+    )]
+    fn dense_rqlp_sources_at_byte_limit_parse_without_a_smaller_node_limit() {
+        // Stress the syntax stage before record validation. Adjacent atoms and
+        // empty lists, or single-atom lists, need only three bytes for two
+        // nodes. The second input has a policy head; neither payload relies
+        // on semantic decoding to limit parser allocation.
+        for (pattern, head, head_atoms) in [("a()", "", 0), ("(a)", "policy ", 1)] {
+            let count = (MAX_RQLP_SOURCE_BYTES - head.len() - 2) / pattern.len();
+            let padding = MAX_RQLP_SOURCE_BYTES - head.len() - 2 - count * pattern.len();
+            let source = format!("({head}{}{})", pattern.repeat(count), " ".repeat(padding));
+            assert_eq!(source.len(), MAX_RQLP_SOURCE_BYTES);
+            let resident_kib = || {
+                std::fs::read_to_string("/proc/self/status")
+                    .ok()?
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("VmRSS:")?
+                            .split_whitespace()
+                            .next()?
+                            .parse::<usize>()
+                            .ok()
+                    })
+            };
+            let rss_before = resident_kib();
+            let started = std::time::Instant::now();
+            let expr =
+                parse_rqlp_expr(&source).expect("the source byte limit must bound its syntax");
+            let elapsed = started.elapsed();
+            let rss_after = resident_kib();
+            let mut pending = vec![&expr];
+            let mut nodes = 0usize;
+            let mut retained_bytes = std::mem::size_of::<Expr>();
+            while let Some(expr) = pending.pop() {
+                assert!(
+                    expr.range.start < expr.range.end,
+                    "parser nodes consume source bytes"
+                );
+                nodes += 1;
+                match &expr.kind {
+                    ExprKind::List(items) | ExprKind::Vector(items) => {
+                        retained_bytes += items.capacity() * std::mem::size_of::<Expr>();
+                        pending.extend(items);
+                    }
+                    ExprKind::String(value) | ExprKind::Symbol(value) => {
+                        retained_bytes += value.capacity()
+                    }
+                    ExprKind::Number(_) => {}
+                }
+            }
+            assert_eq!(nodes, 1 + head_atoms + 2 * count);
+            assert!(
+                nodes > MAX_RQLP_SOURCE_BYTES / 2,
+                "two bytes per node is not a valid bound"
+            );
+            eprintln!(
+                "dense-rqlp pattern={pattern:?} bytes={} nodes={nodes} sizeof_expr={} live_expr_bytes={} retained_tree_bytes={retained_bytes} parse_us={} rss_before_kib={rss_before:?} rss_after_kib={rss_after:?}",
+                source.len(),
+                std::mem::size_of::<Expr>(),
+                nodes * std::mem::size_of::<Expr>(),
+                elapsed.as_micros()
+            );
+        }
+    }
+
+    #[test]
+    fn rqlp_source_byte_and_depth_guards_remain_enforced() {
+        let policy = taint_policy("");
+        let padded = format!(
+            "{policy}{}",
+            " ".repeat(MAX_RQLP_SOURCE_BYTES - policy.len())
+        );
+        assert!(
+            parse(&padded).is_ok(),
+            "a valid policy at the byte boundary is admitted"
+        );
+        let oversized = format!("{padded} ");
+        assert_eq!(
+            parse_rqlp_expr(&oversized).unwrap_err().diagnostic.code,
+            "source-too-large"
+        );
+        let at_depth = format!(
+            "{}a{}",
+            "(".repeat(MAX_RQLP_SEXP_DEPTH),
+            ")".repeat(MAX_RQLP_SEXP_DEPTH)
+        );
+        assert!(parse_rqlp_expr(&at_depth).is_ok());
+        let too_deep = format!("({at_depth})");
+        let error = parse_rqlp_expr(&too_deep).unwrap_err();
+        assert_eq!(error.diagnostic.code, "invalid-s-expression");
+        assert!(error.diagnostic.message.contains("maximum depth"));
     }
 
     fn taint_policy(extra: &str) -> String {
@@ -8528,6 +8904,7 @@ mod tests {
         let source = taint_policy(r#":sanitizers (endpoint-set :entries [(sanitizer :id scrub :selector (rql (call)) :input (argument :index 0) :output return-value :removes [secret])])"#)
             .replace(":sources (endpoint-set)", r#":sources (endpoint-set :entries [(source :id source :display-name "Source" :categories [input] :selector (rql (call)) :bind return-value :labels [secret])])"#)
             .replace(":sinks (endpoint-set)", r#":sinks (endpoint-set :entries [(sink :id sink :display-name "Sink" :categories [output] :selector (rql (call)) :dangerous-operand (argument :index 0) :accepts [secret])])"#);
+        let source = source.replacen("(policy", "(policy :schema-version 1", 1);
         let registry = crate::test_support::registry_with_policy(
             "test.transfer.identity",
             &source,
@@ -8555,6 +8932,7 @@ mod tests {
         let source = taint_policy(
             r#":sanitizers (endpoint-set :entries [(sanitizer :id scrub :selector (rql (call)) :input (argument :index 0) :output return-value :removes [secret])])"#,
         );
+        let source = source.replacen("(policy", "(policy :schema-version 1", 1);
         let parsed = parse(&source).unwrap();
         let value = parsed
             .document()
@@ -9780,7 +10158,7 @@ mod tests {
         };
         assert_eq!(transform.id.as_str(), "normalize");
         assert_eq!(transform.input, PolicyPort::ArgumentIndex { index: 0 });
-        assert_eq!(transform.output, PolicyPort::ReturnValue);
+        assert_eq!(transform.output, PolicyPort::ReturnValue { path: None });
         assert!(transform.removes.is_empty() && transform.adds.is_empty());
 
         let canonical = parsed.document().to_normalized_authored_json();

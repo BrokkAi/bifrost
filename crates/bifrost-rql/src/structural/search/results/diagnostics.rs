@@ -134,7 +134,14 @@ code_query_labeled_enum! {
         UsesParserUnsupported => "uses_parser_unsupported",
         UsesCandidateLimit => "uses_candidate_limit",
         UsesTargetsAmbiguous => "uses_targets_ambiguous",
-        UsesCandidatesOmitted => "uses_candidates_omitted",
+        UsesCandidateUnavailable => "uses_candidate_unavailable",
+UsesCandidateIncomplete => "uses_candidate_incomplete",
+UsesCandidateUnresolved => "uses_candidate_unresolved",
+UsesReferenceProjectionMissing => "uses_reference_projection_missing",
+UsesDefinitionProjectionMissing => "uses_definition_projection_missing",
+UsesInverseUnconfirmed => "uses_inverse_unconfirmed",
+UsesIndexedSourceUnavailable => "uses_indexed_source_unavailable",
+UsesTargetRangeUnavailable => "uses_target_range_unavailable",
         ExecutionBudgetExhausted => "execution_budget_exhausted",
         PipelineBudgetExhausted => "pipeline_budget_exhausted",
         ImportGraphBudgetExhausted => "import_graph_budget_exhausted",
@@ -146,6 +153,7 @@ code_query_labeled_enum! {
         MaterializationDerivationIncomplete => "materialization_derivation_incomplete",
         MaterializationRowBudgetExhausted => "materialization_row_budget_exhausted",
         EnvironmentDerivationIncomplete => "environment_derivation_incomplete",
+        EnvironmentBoundedWorkLimit => "environment_bounded_work_limit",
         EnvironmentRowBudgetExhausted => "environment_row_budget_exhausted",
         ResolutionTraceIncomplete => "resolution_trace_incomplete",
         PythonHierarchyDerivationIncomplete => "python_hierarchy_derivation_incomplete",
@@ -213,8 +221,7 @@ impl CodeQueryDiagnosticCode {
             | Self::OccurrenceRowBudgetExhausted
             | Self::MaterializationRowBudgetExhausted
             | Self::EnvironmentRowBudgetExhausted
-            | Self::EffectBudgetExhausted
-            | Self::ResultLimitReached => Some(DiagnosticExecutionCause::Budget),
+            | Self::EffectBudgetExhausted => Some(DiagnosticExecutionCause::Budget),
             Self::SemanticProviderFailed
             | Self::SemanticPackAcquisitionPending
             | Self::SemanticPackActivationFailed
@@ -269,9 +276,12 @@ code_query_labeled_enum! {
 
 /// Why a producer could not close a partial result. Content gaps are stable
 /// under their recorded reads; operational stops cannot authorize unit reuse.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
 pub enum Incompleteness {
     Content,
+    /// A terminal result cap, whose replay requires a recorded grant.
+    ConfiguredCap,
     Operational(DiagnosticExecutionCause),
 }
 
@@ -282,6 +292,10 @@ impl Incompleteness {
         match self {
             Self::Operational(_) => self,
             Self::Content => other,
+            Self::ConfiguredCap => match other {
+                Self::Operational(_) => other,
+                _ => self,
+            },
         }
     }
 
@@ -292,19 +306,64 @@ impl Incompleteness {
         }
     }
 
-    pub(crate) fn execution_cause(self) -> Option<DiagnosticExecutionCause> {
+    /// The producer's cause, also used by reuse admission and timing output.
+    pub const fn execution_cause(self) -> Option<DiagnosticExecutionCause> {
         match self {
-            Self::Content => None,
+            Self::Content | Self::ConfiguredCap => None,
             Self::Operational(cause) => Some(cause),
         }
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum UsesOmissionEvidence {
+    Unavailable {
+        inventory_evidence:
+            Option<crate::analyzer::store::resolution_operation::ReferenceInventoryCompleteness>,
+    },
+    Incomplete {
+        evidence: Option<crate::analyzer::usages::get_definition::DefinitionLookupEvidence>,
+    },
+    Unresolved {
+        status: crate::analyzer::usages::get_definition::DefinitionLookupStatus,
+    },
+    ReferenceProjectionMissing,
+    DefinitionProjectionMissing,
+    InverseUnconfirmed {
+        target: CodeUnit,
+        range: (usize, usize),
+    },
+    IndexedSourceUnavailable,
+    TargetRangeUnavailable,
+}
+
+#[derive(Debug, Clone)]
+pub struct UsesOmissionSite {
+    pub range: Option<(usize, usize)>,
+    pub evidence: UsesOmissionEvidence,
+}
+
 #[derive(Clone, Serialize, JsonSchema)]
 pub struct CodeQueryDiagnostic {
-    /// Admission metadata, excluded from the public result and its identity.
+    /// A native non-UTF-8 call site was refused. Such sites have no report
+    /// location and are excluded from the exact rendered omission count.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub has_non_utf8_refusal: bool,
+    /// Query-local call-shape keys. Never written to a unit product.
     #[serde(skip)]
     #[schemars(skip)]
+    pub refusal_sites: std::collections::BTreeSet<String>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub uses_omissions: Vec<UsesOmissionSite>,
+    /// Internal attribution used when promoting call ambiguity impact. It is
+    /// not part of the public wire representation or rendered evidence.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub call_relation_facts: Option<
+        Box<brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationDiagnosticFacts>,
+    >,
+    /// Producer-owned admission provenance. Missing provenance rejects replay.
     pub incompleteness: Incompleteness,
     pub code: CodeQueryDiagnosticCode,
     pub impact: CodeQueryDiagnosticImpact,
@@ -353,10 +412,26 @@ impl CodeQueryDiagnostic {
     }
 }
 
+/// An execution-state diagnostic is execution dependent: the query marks
+/// every one it returns (`QueryExecutionState::diagnostic`).
+impl brokk_bifrost_core::analyzer::reuse_verdict::CarriesReuseVerdict for CodeQueryDiagnostic {
+    fn reuse_verdict(&self) -> brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict {
+        if self.incompleteness.execution_cause().is_some() {
+            super::super::EXECUTION_DEPENDENT
+        } else {
+            brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::Content
+        }
+    }
+}
+
 impl PartialEq for CodeQueryDiagnostic {
     fn eq(&self, other: &Self) -> bool {
         let Self {
+            has_non_utf8_refusal,
+            refusal_sites: _,
+            call_relation_facts: _,
             incompleteness: _,
+            uses_omissions: _,
             code,
             impact,
             branch,
@@ -367,7 +442,8 @@ impl PartialEq for CodeQueryDiagnostic {
             exhausted_roots,
             withheld_rows_path,
         } = self;
-        code == &other.code
+        has_non_utf8_refusal == &other.has_non_utf8_refusal
+            && code == &other.code
             && impact == &other.impact
             && branch == &other.branch
             && language == &other.language
@@ -382,7 +458,11 @@ impl Eq for CodeQueryDiagnostic {}
 impl std::hash::Hash for CodeQueryDiagnostic {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         let Self {
+            has_non_utf8_refusal,
+            refusal_sites: _,
+            call_relation_facts: _,
             incompleteness: _,
+            uses_omissions: _,
             code,
             impact,
             branch,
@@ -393,6 +473,7 @@ impl std::hash::Hash for CodeQueryDiagnostic {
             exhausted_roots,
             withheld_rows_path,
         } = self;
+        std::hash::Hash::hash(has_non_utf8_refusal, state);
         std::hash::Hash::hash(code, state);
         std::hash::Hash::hash(impact, state);
         std::hash::Hash::hash(branch, state);
@@ -421,6 +502,9 @@ impl std::fmt::Debug for CodeQueryDiagnostic {
         }
         if !self.related.is_empty() {
             diagnostic.field("related", &self.related);
+        }
+        if self.has_non_utf8_refusal {
+            diagnostic.field("has_non_utf8_refusal", &true);
         }
         diagnostic.field("exhausted_roots", &self.exhausted_roots);
         if self.withheld_rows_path.is_some() {
@@ -464,6 +548,9 @@ pub struct CodeQueryExhaustedRoot {
     /// analysis has one stage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage: Option<String>,
+    /// The consumed counter and the tested allowance, when recorded at admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<CodeQueryExhaustedBudget>,
     /// The charge that did not fit, and the limit it was checked against.
     /// Absent when the producing code records the stop without a charge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -474,6 +561,13 @@ pub struct CodeQueryExhaustedRoot {
     pub feedback_iteration: Option<usize>,
 }
 
+/// Usage observed at a refusing admission, in that admission's budget scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+pub struct CodeQueryExhaustedBudget {
+    pub consumed: usize,
+    pub limit: usize,
+}
+
 /// The exact charge one lane refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct CodeQueryExhaustedCharge {
@@ -482,6 +576,11 @@ pub struct CodeQueryExhaustedCharge {
 }
 
 impl CodeQueryExhaustedRoot {
+    /// Cancellation shares the root-attribution wire, but refuses no budget.
+    pub fn is_budget_refusal(&self) -> bool {
+        self.lane != "solver/cancelled"
+    }
+
     /// The one-line rendering the diagnostic message carries.
     pub fn render(&self) -> String {
         let mut line = self.path.clone();
@@ -492,12 +591,19 @@ impl CodeQueryExhaustedRoot {
         if let Some(stage) = &self.stage {
             line.push_str(&format!(" stage {stage}"));
         }
+        if let Some(budget) = self.budget {
+            line.push_str(&format!(
+                " consumed {} limit {}",
+                budget.consumed, budget.limit
+            ));
+        }
         match self.charge {
             Some(charge) => line.push_str(&format!(
                 " charged {} limit {}",
                 charge.attempted, charge.limit
             )),
-            None => line.push_str(" charge unrecorded"),
+            None if self.budget.is_none() => line.push_str(" charge unrecorded"),
+            None => {}
         }
         if let Some(iteration) = self.feedback_iteration {
             line.push_str(&format!(" iteration {iteration}"));
@@ -554,6 +660,9 @@ impl<'de> Deserialize<'de> for CodeQueryDiagnostic {
     {
         #[derive(Deserialize)]
         struct Wire {
+            #[serde(default)]
+            has_non_utf8_refusal: bool,
+            incompleteness: Incompleteness,
             code: CodeQueryDiagnosticCode,
             impact: CodeQueryDiagnosticImpact,
             #[serde(default)]
@@ -578,9 +687,11 @@ impl<'de> Deserialize<'de> for CodeQueryDiagnostic {
             ))
         })?;
         Ok(Self {
-            // Wire diagnostics do not carry execution provenance. Only an
-            // admitted unit's read receipt can certify that cached provenance.
-            incompleteness: Incompleteness::Operational(DiagnosticExecutionCause::Provider),
+            has_non_utf8_refusal: wire.has_non_utf8_refusal,
+            refusal_sites: Default::default(),
+            call_relation_facts: None,
+            uses_omissions: Vec::new(),
+            incompleteness: wire.incompleteness,
             code: wire.code,
             impact: wire.impact,
             branch: wire.branch,
@@ -626,6 +737,10 @@ pub struct CodeQueryExecutionLimits {
     pub max_scanned_files: usize,
     pub max_scanned_source_bytes: usize,
     pub max_fact_nodes: usize,
+    pub max_call_answers: usize,
+    /// Operational physical work allowance; excluded from content admission.
+    pub max_call_scanned_files: usize,
+    pub max_call_scanned_source_bytes: usize,
     pub max_pipeline_rows: usize,
     pub semantic: CodeQuerySemanticLimits,
     pub typestate: CodeQueryTypestateLimits,
@@ -909,8 +1024,11 @@ impl CodeQueryExecutionWork {
 /// caller-facing measurement and its shape is pinned by consumers, so the
 /// three budgeted lanes it drops and the per-step counts it never had live
 /// here, beside it, rather than changing it.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodeQueryBudgetedWork {
+    /// Admission counters exclude observational caller scan telemetry.
+    #[serde(default)]
+    pub admission: CodeQueryAdmissionWork,
     /// Provenance trace steps charged against `max_pipeline_rows`.
     pub provenance_steps: u64,
     /// Files resolved by import traversal, charged against
@@ -925,7 +1043,106 @@ pub struct CodeQueryBudgetedWork {
     /// truncation. Two executions of the same query lower to the same plan and
     /// therefore index identically; a node that is not a pipeline step
     /// contributes zero.
-    pub step_outputs: Vec<u64>,
+    ///
+    /// `None` means the execution stopped before it counted any step (it was
+    /// cancelled before it started, or its plan was invalid): the counts are
+    /// unknown, which is not the same as empty or zero. A merge with an
+    /// unknown side is unknown, so no per-step cap can be decided from it, and
+    /// the execution that produced it always carries its own typed
+    /// incompleteness. Only a counted execution is ever stored: a stored row
+    /// holds the array, and serializing `None` is an error.
+    #[serde(with = "counted_step_outputs")]
+    pub step_outputs: Option<Vec<u64>>,
+    /// The number of distinct sites the plan's anchor seeds selected, before
+    /// any later step filtered them.
+    ///
+    /// Only the anchor seed leaves count: every operand of a union, operand
+    /// zero of an intersect, except or correlate, and the sources of a call
+    /// reachability relation. A seed on the other side of those operators holds
+    /// exclusions or sinks, not candidates, and counting it would show
+    /// candidates a rule could never report. A site counts once however many
+    /// seed leaves or retried branches reach it; the key is the site's file
+    /// and its position, never the full row, so one site that carries several
+    /// binding or role rows still counts once.
+    ///
+    /// An incremental run that executes call reachability sources as separate
+    /// queries reports the sum only when every reachability operator is on the
+    /// anchor spine (the root source and its sources); otherwise it reports
+    /// `None`, because the sum could include an excluded operand or count a
+    /// shared site twice.
+    ///
+    /// `None` is "not measured": the execution stopped before it counted, or
+    /// a stored product predates the counter. It is never read as zero. A sum
+    /// with an unmeasured side is unmeasured, so a total never reports fewer
+    /// candidates than were seen, and a real zero (an evaluated scope with no
+    /// anchor site) stays distinguishable from an absent measurement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_sites: Option<u64>,
+}
+
+/// Work admitted from recorded content reads and call answers.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeQueryAdmissionWork {
+    pub scanned_files: u64,
+    pub scanned_source_bytes: u64,
+    pub fact_nodes: u64,
+    pub pipeline_rows: u64,
+    pub call_answers: u64,
+}
+
+impl CodeQueryAdmissionWork {
+    pub fn saturating_add(self, other: Self) -> Self {
+        Self {
+            scanned_files: self.scanned_files.saturating_add(other.scanned_files),
+            scanned_source_bytes: self
+                .scanned_source_bytes
+                .saturating_add(other.scanned_source_bytes),
+            fact_nodes: self.fact_nodes.saturating_add(other.fact_nodes),
+            pipeline_rows: self.pipeline_rows.saturating_add(other.pipeline_rows),
+            call_answers: self.call_answers.saturating_add(other.call_answers),
+        }
+    }
+}
+
+/// The stored shape of [`CodeQueryBudgetedWork::step_outputs`]: the plain
+/// array a counted execution always had. An execution that never counted its
+/// steps has nothing to store, so serializing it fails instead of writing a
+/// value that reads back as an empty count.
+mod counted_step_outputs {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer, ser::Error};
+
+    pub fn serialize<S: Serializer>(
+        step_outputs: &Option<Vec<u64>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match step_outputs {
+            Some(counts) => counts.serialize(serializer),
+            None => Err(S::Error::custom(
+                "an execution that never counted its steps has no stored per-step counts",
+            )),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Vec<u64>>, D::Error> {
+        Vec::<u64>::deserialize(deserializer).map(Some)
+    }
+}
+
+/// The identity of a sum: nothing executed, so no step was counted and none
+/// stopped.
+impl Default for CodeQueryBudgetedWork {
+    fn default() -> Self {
+        Self {
+            admission: CodeQueryAdmissionWork::default(),
+            provenance_steps: 0,
+            import_files_resolved: 0,
+            import_edges_resolved: 0,
+            step_outputs: Some(Vec::new()),
+            candidate_sites: Some(0),
+        }
+    }
 }
 
 impl CodeQueryBudgetedWork {
@@ -933,14 +1150,27 @@ impl CodeQueryBudgetedWork {
     ///
     /// Sums over-count whatever two units both reached, so a rule that widens
     /// when a sum reaches its cap widens more often than strictly necessary,
-    /// never less.
+    /// never less. The per-step counts of a sum with an unknown side are
+    /// unknown.
     pub fn saturating_add(&self, other: &Self) -> Self {
-        assert_eq!(
-            self.step_outputs.len(),
-            other.step_outputs.len(),
-            "per-step output counts of one query's executions have one entry per plan node"
-        );
+        let step_outputs = match (&self.step_outputs, &other.step_outputs) {
+            (Some(left), Some(right)) => {
+                assert_eq!(
+                    left.len(),
+                    right.len(),
+                    "per-step output counts of one query's executions have one entry per plan node"
+                );
+                Some(
+                    left.iter()
+                        .zip(right)
+                        .map(|(left, right)| left.saturating_add(*right))
+                        .collect(),
+                )
+            }
+            _ => None,
+        };
         Self {
+            admission: self.admission.saturating_add(other.admission),
             provenance_steps: self.provenance_steps.saturating_add(other.provenance_steps),
             import_files_resolved: self
                 .import_files_resolved
@@ -948,18 +1178,20 @@ impl CodeQueryBudgetedWork {
             import_edges_resolved: self
                 .import_edges_resolved
                 .saturating_add(other.import_edges_resolved),
-            step_outputs: self
-                .step_outputs
-                .iter()
-                .zip(&other.step_outputs)
-                .map(|(left, right)| left.saturating_add(*right))
-                .collect(),
+            step_outputs,
+            candidate_sites: self
+                .candidate_sites
+                .zip(other.candidate_sites)
+                .map(|(left, right)| left.saturating_add(right)),
         }
     }
 
-    /// The largest number of rows any one step emitted.
-    pub fn max_step_outputs(&self) -> u64 {
-        self.step_outputs.iter().copied().max().unwrap_or(0)
+    /// The largest number of rows any one step emitted, or `None` when the
+    /// execution never counted its steps.
+    pub fn max_step_outputs(&self) -> Option<u64> {
+        self.step_outputs
+            .as_ref()
+            .map(|counts| counts.iter().copied().max().unwrap_or(0))
     }
 }
 
@@ -1376,6 +1608,9 @@ impl Default for CodeQueryExecutionLimits {
             max_scanned_files: MAX_SCANNED_FILES,
             max_scanned_source_bytes: MAX_SCANNED_SOURCE_BYTES,
             max_fact_nodes: MAX_FACT_NODES,
+            max_call_answers: MAX_CALL_ANSWERS,
+            max_call_scanned_files: MAX_CALL_SCANNED_FILES,
+            max_call_scanned_source_bytes: MAX_CALL_SCANNED_SOURCE_BYTES,
             max_pipeline_rows: MAX_PIPELINE_ROWS,
             semantic: CodeQuerySemanticLimits::default(),
             typestate: CodeQueryTypestateLimits::default(),
@@ -1599,6 +1834,88 @@ mod type_flow_summary_profile_tests {
         assert_eq!(
             CodeQueryTypeFlowWork::default().saturating_sub(saturated),
             CodeQueryTypeFlowWork::default()
+        );
+    }
+}
+
+#[cfg(test)]
+mod budgeted_work_storage_tests {
+    use super::CodeQueryBudgetedWork;
+
+    fn with_candidates(candidate_sites: Option<u64>) -> CodeQueryBudgetedWork {
+        CodeQueryBudgetedWork {
+            candidate_sites,
+            ..CodeQueryBudgetedWork::default()
+        }
+    }
+
+    // A total is only as measured as its least measured part: an unmeasured
+    // unit makes the sum unmeasured, so a warm run that reads one unit stored
+    // before the counter existed reports no count rather than a short one
+    // (#12581). A measured zero is a count, and sums as one.
+    #[test]
+    fn candidate_sites_sum_only_when_every_part_was_measured() {
+        let sum = |parts: &[Option<u64>]| {
+            parts
+                .iter()
+                .map(|part| with_candidates(*part))
+                .fold(CodeQueryBudgetedWork::default(), |total, part| {
+                    total.saturating_add(&part)
+                })
+                .candidate_sites
+        };
+        assert_eq!(sum(&[]), Some(0), "nothing executed is a measured zero");
+        assert_eq!(sum(&[Some(0)]), Some(0));
+        assert_eq!(sum(&[Some(2), Some(0), Some(5)]), Some(7));
+        assert_eq!(sum(&[Some(2), None, Some(5)]), None);
+        assert_eq!(sum(&[Some(u64::MAX), Some(1)]), Some(u64::MAX));
+    }
+
+    // A row stored before the counter has no such field, and a row never
+    // stores an unmeasured one; both read back as unmeasured, never as zero.
+    #[test]
+    fn candidate_sites_survive_storage_without_becoming_zero() {
+        let measured = serde_json::to_value(with_candidates(Some(0))).expect("serializes");
+        assert_eq!(measured["candidate_sites"], 0);
+        let read: CodeQueryBudgetedWork = serde_json::from_value(measured).expect("deserializes");
+        assert_eq!(read.candidate_sites, Some(0));
+
+        let mut stored = serde_json::to_value(with_candidates(Some(4))).expect("serializes");
+        stored
+            .as_object_mut()
+            .expect("an object")
+            .remove("candidate_sites");
+        let old: CodeQueryBudgetedWork = serde_json::from_value(stored).expect("deserializes");
+        assert_eq!(old.candidate_sites, None);
+        let unmeasured = serde_json::to_value(with_candidates(None)).expect("serializes");
+        assert!(unmeasured.get("candidate_sites").is_none(), "{unmeasured}");
+    }
+
+    // Stored rows hold only counted executions: the counts are the same plain
+    // array they always were, and an uncounted execution refuses to serialize,
+    // so it can never reach a row that reads back as an empty count (#11709).
+    #[test]
+    fn only_counted_step_outputs_serialize() {
+        let counted = CodeQueryBudgetedWork {
+            step_outputs: Some(vec![2, 0, 5]),
+            ..CodeQueryBudgetedWork::default()
+        };
+        let stored = serde_json::to_value(&counted).expect("counted work serializes");
+        assert_eq!(stored["step_outputs"], serde_json::json!([2, 0, 5]));
+        let read: CodeQueryBudgetedWork =
+            serde_json::from_value(stored).expect("a stored row deserializes");
+        assert_eq!(read, counted);
+
+        let uncounted = CodeQueryBudgetedWork {
+            step_outputs: None,
+            ..CodeQueryBudgetedWork::default()
+        };
+        let error = serde_json::to_value(&uncounted).expect_err("uncounted work never serializes");
+        assert!(
+            error.to_string().contains(
+                "an execution that never counted its steps has no stored per-step counts"
+            ),
+            "{error}"
         );
     }
 }

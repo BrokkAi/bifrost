@@ -229,8 +229,11 @@ impl SelectedResolutionTypedSource<'_, '_> {
         )>,
     > {
         use crate::analyzer::resolution::local_identity::SharedNameInterner;
-        let Some(Some(declaration)) =
-            self.read_model_member_callable_result(member, cancellation)?
+        let Some(Some(declaration)) = self.read_model_member_callable_result(
+            member,
+            ExternalOwnerLanguage::Go,
+            cancellation,
+        )?
         else {
             return Ok(None);
         };
@@ -449,14 +452,20 @@ impl SelectedResolutionTypedSource<'_, '_> {
         )
     }
 
+    /// `owner_language` is the family of the callable's owner; it selects the
+    /// model family the authority reads the declaration and its owner under.
     pub(super) fn read_model_member_callable_result(
         &self,
         member: &ModelSymbolRef,
+        owner_language: ExternalOwnerLanguage,
         cancellation: &CancellationToken,
     ) -> StoreResult<Option<Option<ModelCallableResultDeclaration>>> {
         if cancellation.is_cancelled() {
             return Ok(None);
         }
+        let family = owner_language
+            .model_family()
+            .expect("a callable read names an owner language with one model family");
         let (Some(authority), Some(models)) = (
             self.model_authority.as_deref(),
             self.external_models.as_deref(),
@@ -465,7 +474,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
         };
         let selection = models.model_provider_selection();
         let groups = authority.model_selected_groups(
-            "go",
+            family,
             &TypeRef::Declared {
                 id: member.symbol_id.clone(),
                 arguments: Vec::new(),
@@ -477,8 +486,8 @@ impl SelectedResolutionTypedSource<'_, '_> {
         if cancellation.is_cancelled() {
             return Ok(None);
         }
-        let groups =
-            groups.map_err(|error| StoreError::new(format!("Go model callable: {error:?}")))?;
+        let groups = groups
+            .map_err(|error| StoreError::new(format!("{family} model callable: {error:?}")))?;
         let Some(declaration) = groups.into_iter().flatten().find(|declaration| {
             declaration.id == member.symbol_id
                 && crate::analyzer::semantic_model::overlay::ModelProvider::from(
@@ -491,7 +500,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
             return Ok(Some(None));
         };
         let owners = authority.model_selected_groups(
-            "go",
+            family,
             &TypeRef::Declared {
                 id: owner_id.clone(),
                 arguments: Vec::new(),
@@ -503,8 +512,8 @@ impl SelectedResolutionTypedSource<'_, '_> {
         if cancellation.is_cancelled() {
             return Ok(None);
         }
-        let owners =
-            owners.map_err(|error| StoreError::new(format!("Go callable owner: {error:?}")))?;
+        let owners = owners
+            .map_err(|error| StoreError::new(format!("{family} callable owner: {error:?}")))?;
         let Some(owner) = owners.into_iter().flatten().find(|owner| {
             owner.id == *owner_id
                 && crate::analyzer::semantic_model::overlay::ModelProvider::from(&owner.provenance)
@@ -865,6 +874,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
                     let reason = source.context_identities.named_semantic(
                         member_digest(&owner, b"bifrost-go-model-embedding-unproven:v1").finish(),
                         "GoModelEmbeddingUnproven",
+                        crate::analyzer::resolution::ReasonDeterminism::Unaudited,
                         "go-model-embedding-field-join-unproven",
                     );
                     completion = completion.combine(&ResolutionCompletion::incomplete([

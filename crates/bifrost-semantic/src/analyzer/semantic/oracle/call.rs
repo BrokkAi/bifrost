@@ -184,16 +184,15 @@ pub fn direct_formal_store_fields(
         })
         .collect::<HashSet<_>>();
     let blocked_points = semantics
-        .gaps()
-        .iter()
+        .logical_gaps()
         .filter(|gap| {
             matches!(
-                gap.capability,
+                gap.base.capability,
                 SemanticCapability::FieldMemory | SemanticCapability::Calls
-            ) || matches!(gap.subject, SemanticGapSubject::Point)
-                && gap.capability == SemanticCapability::Assignments
+            ) || matches!(gap.subject(), SemanticGapSubject::Point)
+                && gap.base.capability == SemanticCapability::Assignments
         })
-        .map(|gap| gap.point)
+        .map(|gap| gap.base.point)
         .collect::<HashSet<_>>();
     let mut fields = HashMap::new();
     for point in semantics.points() {
@@ -245,6 +244,23 @@ pub struct CallStorageRelationIndex {
 }
 
 impl CallStorageRelationIndex {
+    /// Owned index tables and their actual vector buffers only; no query.
+    #[doc(hidden)]
+    pub fn retained_artifacts(
+        &self,
+        census: &mut impl crate::analyzer::semantic::service::ArtifactRetentionVisitor,
+    ) {
+        census.map(&self.incoming);
+        census.map(&self.construction_points);
+        for entries in self
+            .incoming
+            .values()
+            .chain(self.construction_points.values())
+        {
+            census.owned_vec(entries);
+        }
+    }
+
     pub fn new(snapshot: &ValueFlowSnapshot) -> Self {
         let mut incoming = std::collections::HashMap::<ValueId, Vec<usize>>::new();
         for (index, relation) in snapshot.relations().iter().enumerate() {
@@ -494,9 +510,10 @@ fn scalar_object_allocation(
     // A partial struct update can store scalar fields while leaving an
     // omitted reference field unresolved. Its value-scoped initialization
     // gap is outside the relation projection, so check the snapshot itself.
-    if semantics.gaps().iter().any(|gap| {
-        !snapshot.gap_is_discharged(gap.id)
-            && match gap.subject {
+    if semantics.logical_gaps().any(|logical| {
+        let gap = logical.base;
+        !snapshot.gap_is_discharged(logical.key())
+            && match logical.subject() {
                 SemanticGapSubject::Value(subject) if subject == value => {
                     gap.capability == SemanticCapability::FieldMemory
                         || gap.point == allocation.point
@@ -642,6 +659,9 @@ impl CallArgumentMapping {
     }
 
     /// Conversion typing is independent of argument binding and runtime safety.
+    /// A boxing transfer makes the formal the distinct wrapper value; the
+    /// actual remains its payload dependence. It must not transport actual
+    /// scalar facts or wrapper aliases into that formal.
     #[doc(hidden)]
     pub fn with_conversion(
         mut self,
@@ -712,6 +732,45 @@ pub struct CallArgumentGroup {
     sources: Box<[u32]>,
     mappings: Box<[EvidenceBacked<CallArgumentMapping>]>,
     coverage: CandidateCoverage,
+}
+
+impl CallArgumentGroup {
+    /// Sufficient borrowed content correspondence; grants no admission authority.
+    /// Executable handles retain their exact artifact and interpretation equality.
+    #[doc(hidden)]
+    fn has_same_content_by(
+        &self,
+        other: &Self,
+        same_relation: &impl Fn(&OracleRelationHandle, &OracleRelationHandle) -> bool,
+    ) -> bool {
+        let Self {
+            closure_relation: l_closure_relation,
+            sources: l_sources,
+            mappings: l_mappings,
+            coverage: l_coverage,
+        } = self;
+        let Self {
+            closure_relation: r_closure_relation,
+            sources: r_sources,
+            mappings: r_mappings,
+            coverage: r_coverage,
+        } = other;
+
+        same_relation(l_closure_relation, r_closure_relation)
+            && l_sources == r_sources
+            && l_mappings.len() == r_mappings.len()
+            && l_mappings.iter().zip(r_mappings.iter()).all(|(a, b)| {
+                a.value() == b.value()
+                    && a.proof() == b.proof()
+                    && a.completeness() == b.completeness()
+                    && a.provenance().len() == b.provenance().len()
+                    && a.provenance()
+                        .iter()
+                        .zip(b.provenance())
+                        .all(|(x, y)| same_relation(x, y))
+            })
+            && l_coverage == r_coverage
+    }
 }
 
 impl CallArgumentGroup {
@@ -878,6 +937,118 @@ pub enum CallBinding {
         formal: ProcedurePortHandle,
         result: ValueHandle,
     },
+}
+
+impl CallBinding {
+    fn content_relation(&self) -> &OracleRelationHandle {
+        match self {
+            Self::Receiver {
+                relation,
+                actual: _,
+                formal: _,
+            } => relation,
+            Self::ArgumentGroup(group) => &group.closure_relation,
+            Self::ImplicitArgument {
+                relation,
+                formal_ordinal: _,
+                source: _,
+                formal: _,
+                kind: _,
+            } => relation,
+            Self::NormalReturn {
+                relation,
+                formal: _,
+                result: _,
+            } => relation,
+            Self::ExceptionalReturn {
+                relation,
+                formal: _,
+                result: _,
+            } => relation,
+        }
+    }
+    fn has_same_content_by(
+        &self,
+        other: &Self,
+        same_relation: &impl Fn(&OracleRelationHandle, &OracleRelationHandle) -> bool,
+    ) -> bool {
+        match (self, other) {
+            (
+                Self::Receiver {
+                    relation: l_relation,
+                    actual: l_actual,
+                    formal: l_formal,
+                },
+                Self::Receiver {
+                    relation: r_relation,
+                    actual: r_actual,
+                    formal: r_formal,
+                },
+            ) => {
+                same_relation(l_relation, r_relation)
+                    && l_actual == r_actual
+                    && l_formal == r_formal
+            }
+            (Self::ArgumentGroup(l), Self::ArgumentGroup(r)) => {
+                l.has_same_content_by(r, same_relation)
+            }
+            (
+                Self::ImplicitArgument {
+                    relation: l_relation,
+                    formal_ordinal: l_formal_ordinal,
+                    source: l_source,
+                    formal: l_formal,
+                    kind: l_kind,
+                },
+                Self::ImplicitArgument {
+                    relation: r_relation,
+                    formal_ordinal: r_formal_ordinal,
+                    source: r_source,
+                    formal: r_formal,
+                    kind: r_kind,
+                },
+            ) => {
+                same_relation(l_relation, r_relation)
+                    && l_formal_ordinal == r_formal_ordinal
+                    && l_source == r_source
+                    && l_formal == r_formal
+                    && l_kind == r_kind
+            }
+            (
+                Self::NormalReturn {
+                    relation: l_relation,
+                    formal: l_formal,
+                    result: l_result,
+                },
+                Self::NormalReturn {
+                    relation: r_relation,
+                    formal: r_formal,
+                    result: r_result,
+                },
+            ) => {
+                same_relation(l_relation, r_relation)
+                    && l_formal == r_formal
+                    && l_result == r_result
+            }
+            (
+                Self::ExceptionalReturn {
+                    relation: l_relation,
+                    formal: l_formal,
+                    result: l_result,
+                },
+                Self::ExceptionalReturn {
+                    relation: r_relation,
+                    formal: r_formal,
+                    result: r_result,
+                },
+            ) => {
+                same_relation(l_relation, r_relation)
+                    && l_formal == r_formal
+                    && l_result == r_result
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Actual/formal and return bindings for one exact dispatch candidate.
@@ -1063,6 +1234,135 @@ pub fn constructor_call_result(
 }
 
 impl CallBindings {
+    /// Sufficient borrowed content correspondence; grants no admission authority.
+    /// Executable handles retain their exact artifact and interpretation equality.
+    #[doc(hidden)]
+    pub fn has_same_content(&self, other: &Self) -> bool {
+        self.has_same_content_by(other, &DispatchCandidate::has_same_content)
+    }
+
+    /// Compare binding contents with an independently justified candidate predicate.
+    /// Reusing dispatch arena content requires actual own-arena membership on
+    /// both sides; independently resealed candidates still need full comparison.
+    /// This comparison grants no admission authority.
+    #[doc(hidden)]
+    pub fn has_same_content_by(
+        &self,
+        other: &Self,
+        same_candidate: &impl Fn(&DispatchCandidate, &DispatchCandidate) -> bool,
+    ) -> bool {
+        let Self {
+            call: l_call,
+            candidate: l_candidate,
+            context: l_context,
+            bindings: l_bindings,
+            coverage: l_coverage,
+        } = self;
+        let Self {
+            call: r_call,
+            candidate: r_candidate,
+            context: r_context,
+            bindings: r_bindings,
+            coverage: r_coverage,
+        } = other;
+
+        l_call == r_call
+            && same_candidate(l_candidate, r_candidate)
+            && l_context == r_context
+            && l_bindings.len() == r_bindings.len()
+            && match (l_bindings.first(), r_bindings.first()) {
+                (None, None) => true,
+                (Some(l), Some(r)) => {
+                    let left = l.content_relation();
+                    let right = r.content_relation();
+                    left.has_same_arena_content(right)
+                        && l_bindings.iter().zip(r_bindings.iter()).all(|(a, b)| {
+                            a.has_same_content_by(b, &|x, y| {
+                                x.same_arena(left) && y.same_arena(right) && x.id() == y.id()
+                            })
+                        })
+                }
+                _ => false,
+            }
+            && l_coverage == r_coverage
+    }
+}
+
+impl CallBindings {
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn retention_census_for_test(
+        &self,
+        census: &mut brokk_bifrost_core::retention_census::RetentionCensus<'_>,
+        family: &'static str,
+    ) {
+        use crate::analyzer::semantic::oracle::retained::{
+            RetainedNode, visit_retained_allocations_from_roots,
+        };
+
+        let mut roots = vec![
+            RetainedNode::Procedure(self.call().procedure()),
+            RetainedNode::CallContext(self.context()),
+            RetainedNode::Procedure(self.candidate().target()),
+        ];
+        for target in self.candidate().excluded_targets() {
+            roots.push(RetainedNode::Procedure(target));
+        }
+        for relation in self.candidate().provenance() {
+            roots.push(RetainedNode::Relation(relation));
+        }
+        for binding in self.bindings() {
+            match binding {
+                CallBinding::Receiver {
+                    relation,
+                    actual,
+                    formal,
+                } => {
+                    roots.push(RetainedNode::Relation(relation));
+                    roots.push(RetainedNode::Procedure(actual.procedure()));
+                    roots.push(RetainedNode::Procedure(formal.procedure()));
+                }
+                CallBinding::ImplicitArgument {
+                    relation,
+                    source,
+                    formal,
+                    ..
+                } => {
+                    roots.push(RetainedNode::Relation(relation));
+                    roots.push(RetainedNode::Procedure(source.procedure()));
+                    roots.push(RetainedNode::Procedure(formal.procedure()));
+                }
+                CallBinding::NormalReturn {
+                    relation,
+                    formal,
+                    result,
+                }
+                | CallBinding::ExceptionalReturn {
+                    relation,
+                    formal,
+                    result,
+                } => {
+                    roots.push(RetainedNode::Relation(relation));
+                    roots.push(RetainedNode::Procedure(formal.procedure()));
+                    roots.push(RetainedNode::Procedure(result.procedure()));
+                }
+                CallBinding::ArgumentGroup(group) => {
+                    roots.push(RetainedNode::Relation(&group.closure_relation));
+                    for mapping in group.mappings() {
+                        for relation in mapping.provenance() {
+                            roots.push(RetainedNode::Relation(relation));
+                        }
+                        roots.extend([
+                            RetainedNode::Procedure(mapping.value().actual().value().procedure()),
+                            RetainedNode::Procedure(mapping.value().formal().procedure()),
+                        ]);
+                    }
+                }
+            }
+        }
+        visit_retained_allocations_from_roots(roots, census, family);
+    }
+
     pub fn new<I>(
         call: CallSiteHandle,
         candidate: &DispatchCandidate,
@@ -1545,10 +1845,45 @@ impl CallBindings {
         })
     }
 
+    /// Full retained binding children beneath the enclosing inline value.
+    #[doc(hidden)]
+    pub fn retained_allocations(
+        &self,
+        census: &mut impl crate::analyzer::semantic::service::ArtifactRetentionVisitor,
+    ) {
+        census.owned_slice(self.bindings.as_ref());
+        for binding in self.bindings() {
+            if let CallBinding::ArgumentGroup(group) = binding {
+                census.owned_slice(group.sources.as_ref());
+                census.owned_slice(group.mappings.as_ref());
+                for mapping in group.mappings() {
+                    census.owned_slice(mapping.provenance());
+                    census.exclusive(mapping.proof().retained_heap_bytes());
+                    census.exclusive(mapping.completeness().retained_heap_bytes());
+                    match &mapping.value().member {
+                        CallArgumentMember::Keyword(name)
+                        | CallArgumentMember::LanguageDefined(name) => {
+                            census.owned_slice(name.as_bytes());
+                        }
+                        _ => {}
+                    }
+                    if let CallArgumentEndpoint::Location { location, .. } = &mapping.value().actual
+                        && census.owned_box(location.as_ref())
+                    {
+                        location.path().retained_artifacts(census);
+                        census.context(location.context());
+                        census.procedure(location.point().procedure());
+                    }
+                }
+            }
+        }
+        self.retained_artifacts(census);
+    }
+
     #[doc(hidden)]
     pub fn retained_artifacts(
         &self,
-        census: &mut crate::analyzer::semantic::service::ArtifactRetentionCensus,
+        census: &mut impl crate::analyzer::semantic::service::ArtifactRetentionVisitor,
     ) {
         census.procedure(self.call().procedure());
         census.context(self.context());

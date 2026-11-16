@@ -18,6 +18,7 @@ use brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_reverse:
 
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation;
 
+#[cfg(test)]
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperationInput;
 
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperationOpenOutcome;
@@ -525,14 +526,9 @@ fn with_rust_selected_reverse_reference_admission<T>(
         }
         Err(error) => return RustSelectedReverseOutcome::StoreError(error.to_string()),
     };
-    let input = SelectedResolutionOperationInput::new(
-        rust.inner.project(),
-        rust.inner.workspace_id(),
-        snapshots.as_ref(),
-        &languages,
-        &masks,
-    )
-    .with_content_mounts(content_mounts);
+    let input = rust
+        .selected_resolution_operation_input(snapshots.as_ref(), &languages, &masks)
+        .with_content_mounts(content_mounts);
     let open_timing = brokk_bifrost_core::profiling::scope("rust_selected::reverse_open");
     let operation = match rust
         .inner
@@ -679,7 +675,6 @@ mod tests {
             None,
         )
         .expect("build selected Rust fixture");
-        assert!(!rust.inner.analyzer_store().uses_single_connection_reads());
         let target = rust
             .declarations(&fixture.file("src/lib.rs"))
             .into_iter()
@@ -847,7 +842,6 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(!reader.inner.analyzer_store().uses_single_connection_reads());
         let admitted = reader.analyzed_files().into_iter().collect::<HashSet<_>>();
         let run = |rust: &RustAnalyzer| {
             let target = rust
@@ -982,16 +976,10 @@ mod tests {
                     .iter()
                     .find(|diagnostic| {
                         diagnostic.code == CallRelationDiagnosticCode::BudgetExhausted
-                            && diagnostic.message.contains(lane)
+                            && diagnostic.message().contains(lane)
                     })
                     .unwrap_or_else(|| panic!("{result:?}"));
-                let count = diagnostic
-                    .message
-                    .split_whitespace()
-                    .next()
-                    .unwrap()
-                    .parse::<usize>()
-                    .unwrap();
+                let count = diagnostic.facts.omitted_count.expect("omitted site count");
                 assert!(count > 0, "{diagnostic:?}");
                 if let Some(expected_count) = expected_count {
                     assert_eq!(count, expected_count, "{diagnostic:?}");
@@ -1128,6 +1116,30 @@ mod tests {
 
     #[test]
     fn reverse_usages_retained_bytes_are_independent_of_workspace_size() {
+        // The counter charges deallocations to the thread running them, even
+        // when another test allocated the value. Concurrent tests can therefore
+        // distort these small deltas through shared-cache eviction. Measure in
+        // a fresh process, preserving both cold/warm fixtures and every bound.
+        const CHILD_ENV: &str = "BIFROST_12398_REVERSE_HEAP_MEASUREMENT_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "analyzer::rust::selected_reverse::tests::reverse_usages_retained_bytes_are_independent_of_workspace_size",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .output()
+                .unwrap();
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+            eprint!("{}", String::from_utf8_lossy(&output.stderr));
+            assert!(
+                output.status.success(),
+                "isolated reverse heap measurement failed: {}",
+                output.status
+            );
+            return;
+        }
         use brokk_bifrost_analysis::analyzer::store::resolution_operation::heap_pin_bytes;
         // Repeat with warm process state: fixed first-use allocations in the
         // first small fixture must not hide retention in the larger fixture.

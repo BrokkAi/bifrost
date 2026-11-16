@@ -329,7 +329,9 @@ impl ExternalSupertypeClosure {
     }
 }
 
-pub(crate) fn hierarchy_descendants_from_edges<T>(
+/// Every workspace declaration reached from the external descendants over the
+/// workspace-to-workspace edges, sorted. `None` when cancelled.
+pub fn hierarchy_descendants_from_edges<T>(
     candidates: &[T],
     workspace_edges: &[Vec<usize>],
     external_descendants: Vec<usize>,

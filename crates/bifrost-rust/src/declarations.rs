@@ -1229,8 +1229,7 @@ impl RustPrimaryMacroState {
         scope_start: usize,
         scope_end: usize,
         source: &str,
-        declaration: SourceDeclarationId,
-        exported: bool,
+        property: &brokk_bifrost_core::analyzer::rust_facts::RustDeclarationPropertyFact,
     ) -> Option<RustRulesItemMacroDefinition> {
         let name = rust_macro_definition_name(node, source)?;
         let (passthrough, decoration) =
@@ -1258,7 +1257,8 @@ impl RustPrimaryMacroState {
                 }
             };
         Some(RustRulesItemMacroDefinition {
-            declaration,
+            cfg_condition: property.cfg_condition.clone(),
+            declaration: property.declaration,
             name: name.to_string(),
             visible_after: node.end_byte(),
             scope_start,
@@ -1268,7 +1268,7 @@ impl RustPrimaryMacroState {
             decoration,
             declares_no_item: rust_macro_definition_declares_no_item(node, source),
             writes_only_impls: rust_macro_definition_writes_only_impls(node, source),
-            exported,
+            exported: property.macro_exported,
         })
     }
 
@@ -1951,12 +1951,14 @@ impl<'source, 'parsed, 'tree> RustPrimaryParseState<'source, 'parsed, 'tree> {
             ) || (crate::cfg_if::is_cfg_if(node, self.declarations.source)
                 && rust_item_macro_invocation_name(node, self.declarations.source).is_some_and(
                     |name| {
-                        rust_latest_visible_rules_item_macro(
-                            self.primary_macros.as_slice(),
-                            name,
-                            node.start_byte(),
+                        matches!(
+                            rust_select_visible_rules_item_macro_definition(
+                                self.primary_macros.as_slice(),
+                                name,
+                                node.start_byte(),
+                            ),
+                            crate::cfg::RustMacroDefinitionOutcome::Missing
                         )
-                        .is_none()
                     },
                 ));
         if let Some(request) = replay_request
@@ -2031,8 +2033,7 @@ impl<'source, 'parsed, 'tree> RustPrimaryParseState<'source, 'parsed, 'tree> {
                         scope_start,
                         scope_end,
                         self.declarations.source,
-                        property.declaration,
-                        property.macro_exported,
+                        property,
                     )
                 });
         let projected_imports =
@@ -2113,19 +2114,31 @@ impl<'source, 'parsed, 'tree> RustPrimaryParseState<'source, 'parsed, 'tree> {
             if let Some(unit) = code_unit {
                 self.native
                     .add_definition_unit(ResolutionDefinitionUnitFact { declaration, unit });
-            } else if node.kind() == "field_declaration" {
-                // Fields of block-local types retain native member and type
-                // facts, but their owner has no parser CodeUnit. Publish the
+            } else if node.kind() == "field_declaration"
+                || (matches!(node.kind(), "function_item" | "type_item")
+                    && node.parent().is_some_and(|body| {
+                        body.kind() == "declaration_list"
+                            && body
+                                .parent()
+                                .is_some_and(|owner| owner.kind() == "impl_item")
+                    }))
+            {
+                // Members whose owner has no nominal parser unit retain native
+                // declarations. Publish the
                 // existing source declaration's lexical interpretation so a
                 // resolved member never becomes an unprojectable definition.
                 let source_declaration = self
                     .native
                     .declaration_property_for_node(node)
-                    .expect("a native field owns its source declaration")
+                    .expect("a native member owns its source declaration")
                     .declaration;
-                self.native
-                    .source_collector_mut()
-                    .mark_lexical(source_declaration, DeclarationKind::Field);
+                self.native.source_collector_mut().mark_lexical(
+                    source_declaration,
+                    match node.kind() {
+                        "function_item" | "type_item" => DeclarationKind::BlockLocalItem,
+                        _ => DeclarationKind::Field,
+                    },
+                );
             }
         }
         if let Some(definition) = macro_candidate {
@@ -2313,6 +2326,7 @@ impl<'source, 'parsed, 'tree> RustPrimaryParseState<'source, 'parsed, 'tree> {
                 | brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::UnexpandedItemMacro
                 | brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::UnexpandedImplMacro
                 | brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::GeneratedItemSurface
+                | brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::UnprovenActivation
             )
         }).map(|gap| {
             let site = native.facts.sites[gap.site.index()];
@@ -2380,6 +2394,25 @@ pub fn parse_rust_file_with(
         source,
         tree,
         rust_package_name_with(caches, file),
+        None,
+    )
+}
+
+/// Collect declarations using the producer's admitted whole-file parse and warm cache.
+pub fn parse_rust_file_prepared_with(
+    naming: &crate::crate_naming::RustCrateNamingCaches,
+    lexical: &crate::lexical_scope::RustLexicalCaches,
+    file: &ProjectFile,
+    prepared: &brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree,
+) -> ParsedFile {
+    let scope = crate::lexical_scope::RustPlainScope::new(prepared, lexical);
+    parse_rust_file_with_package(
+        naming,
+        file,
+        prepared.source(),
+        prepared.tree(),
+        rust_package_name_with(naming, file),
+        Some(&scope),
     )
 }
 
@@ -2389,6 +2422,7 @@ fn parse_rust_file_with_package(
     source: &str,
     tree: &Tree,
     package: String,
+    scope: Option<&crate::lexical_scope::RustPlainScope<'_>>,
 ) -> ParsedFile {
     let mut parsed = ParsedFile::new(package);
     let root = tree.root_node();
@@ -2431,6 +2465,7 @@ fn parse_rust_file_with_package(
             None,
         )
         .expect("unbounded canonical syntax preparation cannot be cancelled");
+    let hooks = scope.map(|scope| crate::structural::RustStructuralFileHooks { scope });
     let mut traversal = RustPrimaryParseState::new(
         naming,
         file,
@@ -2443,6 +2478,11 @@ fn parse_rust_file_with_package(
         &call_site_context,
         &operand_forest,
     );
+    traversal.structural = traversal
+        .structural
+        .with_file_hooks(hooks.as_ref().map(|hooks| {
+            hooks as &dyn brokk_bifrost_core::analyzer::structural::spec::StructuralFileHooks<'_>
+        }));
     walk_rust_primary_tree(
         root,
         &mut traversal,
@@ -3760,6 +3800,7 @@ pub use brokk_bifrost_core::analyzer::rust_facts::RustRulesItemMacroDefinition;
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RustRawRulesItemMacroDefinition {
+    pub(crate) cfg_condition: RustCfgCondition,
     pub(crate) name: String,
     pub(crate) visible_after: usize,
     pub(crate) scope_start: usize,
@@ -3787,6 +3828,9 @@ pub(crate) fn rust_rules_item_macro_definitions(
                 if let Some(name) = rust_macro_definition_name(child, source) {
                     definitions.push((
                         RustRawRulesItemMacroDefinition {
+                            cfg_condition: crate::lexical_scope::rust_effective_cfg_condition(
+                                child, source,
+                            ),
                             name: name.to_string(),
                             visible_after: child.end_byte(),
                             scope_start: scope.start_byte(),
@@ -3828,7 +3872,7 @@ pub(crate) fn rust_rules_item_macro_definitions(
                 continue;
             };
             let wrapper = &definitions[index].0;
-            let delegated = definitions[..index]
+            let mut candidates = definitions[..index]
                 .iter()
                 .filter(|(definition, _, _)| {
                     definition.name == delegate
@@ -3836,7 +3880,21 @@ pub(crate) fn rust_rules_item_macro_definitions(
                         && definition.scope_start <= wrapper.visible_after
                         && wrapper.visible_after < definition.scope_end
                 })
-                .max_by_key(|(definition, _, _)| (definition.scope_start, definition.visible_after))
+                .collect::<Vec<_>>();
+            candidates.sort_by_key(|(definition, _, _)| {
+                std::cmp::Reverse((definition.scope_start, definition.visible_after))
+            });
+            let delegated =
+                match crate::cfg::select_textual_macro(candidates, |(definition, _, _)| {
+                    crate::cfg::blob_activation(&definition.cfg_condition)
+                }) {
+                    crate::cfg::RustMacroDefinitionOutcome::Resolved(definition) => {
+                        Some(definition)
+                    }
+                    crate::cfg::RustMacroDefinitionOutcome::Missing
+                    | crate::cfg::RustMacroDefinitionOutcome::Ambiguous
+                    | crate::cfg::RustMacroDefinitionOutcome::UnprovenActivation => None,
+                }
                 .filter(|(definition, _, _)| definition.passthrough)
                 .map(|(definition, _, _)| definition.decoration.clone());
             if let Some(inner) = delegated {
@@ -4308,7 +4366,20 @@ fn rust_latest_visible_rules_item_macro_definition<'a>(
     name: &str,
     invocation_start: usize,
 ) -> Option<&'a RustRulesItemMacroDefinition> {
-    definitions
+    match rust_select_visible_rules_item_macro_definition(definitions, name, invocation_start) {
+        crate::cfg::RustMacroDefinitionOutcome::Resolved(definition) => Some(definition),
+        crate::cfg::RustMacroDefinitionOutcome::Missing
+        | crate::cfg::RustMacroDefinitionOutcome::Ambiguous
+        | crate::cfg::RustMacroDefinitionOutcome::UnprovenActivation => None,
+    }
+}
+
+fn rust_select_visible_rules_item_macro_definition<'a>(
+    definitions: &'a [RustRulesItemMacroDefinition],
+    name: &str,
+    invocation_start: usize,
+) -> crate::cfg::RustMacroDefinitionOutcome<&'a RustRulesItemMacroDefinition> {
+    let mut candidates = definitions
         .iter()
         .filter(|definition| {
             definition.name == name
@@ -4316,7 +4387,13 @@ fn rust_latest_visible_rules_item_macro_definition<'a>(
                 && definition.scope_start <= invocation_start
                 && invocation_start < definition.scope_end
         })
-        .max_by_key(|definition| (definition.scope_start, definition.visible_after))
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|definition| {
+        std::cmp::Reverse((definition.scope_start, definition.visible_after))
+    });
+    crate::cfg::select_textual_macro(candidates, |definition| {
+        crate::cfg::blob_activation(&definition.cfg_condition)
+    })
 }
 
 /// What one attribute a transcriber adds to the item it replays does to it.
@@ -5356,15 +5433,20 @@ fn rust_signature_metadata(signature: String, node: Node<'_>, source: &str) -> S
     }
 }
 
-pub(crate) fn rust_parameters_have_self(parameters: Node<'_>) -> bool {
+/// A receiver is identified by its pattern, independently of its written type.
+pub fn rust_parameter_is_receiver(parameter: Node<'_>) -> bool {
+    parameter.kind() == "self_parameter"
+        || parameter.kind() == "parameter"
+            && parameter
+                .child_by_field_name("pattern")
+                .is_some_and(|pattern| pattern.kind() == "self")
+}
+
+pub fn rust_parameters_have_self(parameters: Node<'_>) -> bool {
     let mut cursor = parameters.walk();
-    parameters.named_children(&mut cursor).any(|parameter| {
-        parameter.kind() == "self_parameter"
-            || parameter.kind() == "parameter"
-                && parameter
-                    .child_by_field_name("pattern")
-                    .is_some_and(|pattern| pattern.kind() == "self")
-    })
+    parameters
+        .named_children(&mut cursor)
+        .any(rust_parameter_is_receiver)
 }
 
 fn rust_callable_parameter_type_spellings(
@@ -10915,6 +10997,21 @@ mod inner {
             items: facts.rust_items.clone(),
             types: facts.rust_types.clone(),
             declarations: facts.occurrences.declarations().to_vec(),
+            lexical_identifiers: facts
+                .occurrences
+                .lexical_declarations()
+                .iter()
+                .map(|f| (f.declaration, f.identifier.clone()))
+                .collect(),
+            declaration_spans: facts
+                .occurrences
+                .declarations()
+                .iter()
+                .map(|d| {
+                    let r = facts.occurrences.occurrence(d.occurrence).range;
+                    (r.start_byte, r.end_byte)
+                })
+                .collect(),
             declaration_units: parsed.source_declaration_units.clone(),
             module_names: HashMap::default(),
             imports: facts.imports.clone(),

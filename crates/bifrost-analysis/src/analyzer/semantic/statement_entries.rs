@@ -7,6 +7,7 @@
 use crate::analyzer::languages::ProcedureSyntaxRoles;
 use crate::analyzer::languages::language_support_for_hook;
 use crate::analyzer::read_ledger::reason as derivation_reason;
+use crate::analyzer::reuse_verdict::{CarriesReuseVerdict, ReuseVerdict};
 use crate::analyzer::semantic::cfg_algorithms::{
     CfgAlgorithmBudget, CfgAlgorithmRequest, DenseBidirectionalGraph, FeasibleSuccessors,
     forward_reachability_with_filtered_successors, forward_reachability_with_successors,
@@ -42,8 +43,14 @@ pub fn rust_infeasible_control_edges(
     if procedure.artifact().key().language().language() != crate::analyzer::Language::Rust {
         return Vec::new();
     }
-    let Ok(prepared) = ProcedureSyntax::prepare(workspace, procedure, cancellation) else {
-        return Vec::new();
+    let prepared = match ProcedureSyntax::prepare(workspace, procedure, cancellation) {
+        Ok(prepared) => prepared,
+        Err(open) => {
+            workspace
+                .analyzer()
+                .join_reuse_verdict(open.reuse_verdict());
+            return Vec::new();
+        }
     };
     rust_infeasible_edges(procedure.semantics(), &prepared.syntax)
 }
@@ -136,20 +143,55 @@ pub(crate) struct ProcedureSyntax {
     pub(crate) roles: ProcedureSyntaxRoles,
 }
 
+/// Why [`ProcedureSyntax::prepare`] could not open a procedure's syntax.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ProcedureSyntaxOpen {
+    pub(crate) reason: &'static str,
+    reuse: ReuseVerdict,
+}
+
+impl ProcedureSyntaxOpen {
+    /// An open reason that depends on content alone. A cancellation is a token
+    /// observation, which stays ambient until the token latch replaces it.
+    fn content(reason: &'static str) -> Self {
+        Self {
+            reason,
+            reuse: ReuseVerdict::Content,
+        }
+    }
+
+    /// The open reason, for a caller whose own answer cannot carry a verdict
+    /// yet. The verdict joins the analyzer's current captures, where the
+    /// ambient mark that accompanied it went.
+    pub(crate) fn reason_joined(self, analyzer: &dyn crate::analyzer::IAnalyzer) -> &'static str {
+        analyzer.join_reuse_verdict(self.reuse);
+        self.reason
+    }
+}
+
+impl CarriesReuseVerdict for ProcedureSyntaxOpen {
+    fn reuse_verdict(&self) -> ReuseVerdict {
+        self.reuse
+    }
+}
+
 impl ProcedureSyntax {
-    /// Load and validate the prepared tree for `procedure`. The error is a
-    /// stable open reason for the caller's row or diagnostic.
+    /// Load and validate the prepared tree for `procedure`. The error carries
+    /// a stable open reason for the caller's row or diagnostic, and its reuse
+    /// verdict.
     pub(crate) fn prepare(
         workspace: &WorkspaceAnalyzer,
         procedure: &ProcedureHandle,
         cancellation: Option<&CancellationToken>,
-    ) -> Result<Self, &'static str> {
+    ) -> Result<Self, ProcedureSyntaxOpen> {
         let language = procedure.artifact().key().language().language();
         let roles = language_support_for_hook(language, "procedure_syntax_roles")
             .and_then(|support| support.procedure_syntax_roles())
-            .ok_or(derivation_reason::UNSUPPORTED_LANGUAGE)?;
+            .ok_or(ProcedureSyntaxOpen::content(
+                derivation_reason::UNSUPPORTED_LANGUAGE,
+            ))?;
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return Err(derivation_reason::CANCELLED);
+            return Err(ProcedureSyntaxOpen::content(derivation_reason::CANCELLED));
         }
         let file = ProjectFile::new(
             workspace.analyzer().project().root().to_path_buf(),
@@ -173,11 +215,13 @@ impl ProcedureSyntax {
                         line!()
                     )
                 });
-                workspace.analyzer().mark_execution_dependent();
-                return Err(derivation_reason::SOURCE_BUDGET_EXHAUSTED);
+                return Err(ProcedureSyntaxOpen {
+                    reason: derivation_reason::SOURCE_BUDGET_EXHAUSTED,
+                    reuse: crate::analyzer::i_analyzer::execution_dependent(workspace.analyzer()),
+                });
             }
             Some(StructuralSyntaxLimitedOutcome::Cancelled) => {
-                return Err(derivation_reason::CANCELLED);
+                return Err(ProcedureSyntaxOpen::content(derivation_reason::CANCELLED));
             }
             Some(StructuralSyntaxLimitedOutcome::Unavailable) | None => {
                 brokk_bifrost_core::profiling::note_with(|| {
@@ -187,8 +231,10 @@ impl ProcedureSyntax {
                         line!()
                     )
                 });
-                workspace.analyzer().mark_execution_dependent();
-                return Err(derivation_reason::PREPARED_SYNTAX_UNAVAILABLE);
+                return Err(ProcedureSyntaxOpen {
+                    reason: derivation_reason::PREPARED_SYNTAX_UNAVAILABLE,
+                    reuse: crate::analyzer::i_analyzer::execution_dependent(workspace.analyzer()),
+                });
             }
         };
         let syntax = validate_prepared_syntax_source_for_procedure(
@@ -197,7 +243,7 @@ impl ProcedureSyntax {
             &file,
             syntax.into_inner(),
         )
-        .map_err(|_| derivation_reason::SOURCE_IDENTITY_MISMATCH)?;
+        .map_err(|_| ProcedureSyntaxOpen::content(derivation_reason::SOURCE_IDENTITY_MISMATCH))?;
         Ok(Self {
             file,
             syntax,
@@ -271,7 +317,9 @@ pub fn statement_assessments(
     cancellation: Option<&CancellationToken>,
 ) -> StatementAssessments {
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        return build_statement_assessments(workspace, procedure, cancellation);
+        let (assessments, reuse) = build_statement_assessments(workspace, procedure, cancellation);
+        workspace.analyzer().join_reuse_verdict(reuse);
+        return assessments;
     }
     (*workspace
         .analyzer()
@@ -279,14 +327,30 @@ pub fn statement_assessments(
     .clone()
 }
 
+/// Build the assessments with the reuse verdict of every refusal that shaped
+/// them.
 pub(crate) fn build_statement_assessments(
     workspace: &WorkspaceAnalyzer,
     procedure: &ProcedureHandle,
     cancellation: Option<&CancellationToken>,
+) -> (StatementAssessments, ReuseVerdict) {
+    let mut reuse = ReuseVerdict::Content;
+    let assessments = assess_statements(workspace, procedure, cancellation, &mut reuse);
+    (assessments, reuse)
+}
+
+fn assess_statements(
+    workspace: &WorkspaceAnalyzer,
+    procedure: &ProcedureHandle,
+    cancellation: Option<&CancellationToken>,
+    reuse: &mut ReuseVerdict,
 ) -> StatementAssessments {
     let prepared = match ProcedureSyntax::prepare(workspace, procedure, cancellation) {
         Ok(prepared) => prepared,
-        Err(reason) => return unavailable(reason),
+        Err(open) => {
+            reuse.join_in(open.reuse_verdict());
+            return unavailable(open.reason);
+        }
     };
     let ProcedureSyntax {
         file,
@@ -301,7 +365,9 @@ pub(crate) fn build_statement_assessments(
                 line!()
             )
         });
-        workspace.analyzer().mark_execution_dependent();
+        reuse.join_in(crate::analyzer::i_analyzer::execution_dependent(
+            workspace.analyzer(),
+        ));
         return unavailable(derivation_reason::SOURCE_IDENTITY_MISMATCH);
     };
     let semantics = procedure.semantics();
@@ -374,6 +440,7 @@ pub(crate) fn build_statement_assessments(
         &feasible,
         cancellation.unwrap_or(&uncancelled),
         &mut request,
+        reuse,
     ) {
         Ok(projection) => projection,
         Err(reason) => return unavailable(reason),
@@ -389,7 +456,9 @@ pub(crate) fn build_statement_assessments(
         &mut request,
     ) {
         Ok(reachable) => reachable,
-        Err(error) => return unavailable(execution_open_reason(workspace.analyzer(), error)),
+        Err(error) => {
+            return unavailable(execution_open_reason(workspace.analyzer(), error, reuse));
+        }
     };
     let may_reach = match forward_reachability_with_successors(
         &feasible,
@@ -404,7 +473,9 @@ pub(crate) fn build_statement_assessments(
         &mut request,
     ) {
         Ok(reachable) => reachable,
-        Err(error) => return unavailable(execution_open_reason(workspace.analyzer(), error)),
+        Err(error) => {
+            return unavailable(execution_open_reason(workspace.analyzer(), error, reuse));
+        }
     };
     // Rust's prepared source has no expansion nodes. Every mapped statement is
     // visible, including a macro invocation; an isolated statement has no
@@ -425,7 +496,7 @@ pub(crate) fn build_statement_assessments(
     let mut rows = Vec::with_capacity(candidates.len());
     for (span, malformed, mut row) in candidates.iter().cloned() {
         if let Err(error) = request.visit_node::<ProgramPointId>() {
-            return unavailable(execution_open_reason(workspace.analyzer(), error));
+            return unavailable(execution_open_reason(workspace.analyzer(), error, reuse));
         }
         if !malformed {
             row.verdict = if span_counts[&span] != 1 {
@@ -477,7 +548,7 @@ pub(crate) fn build_statement_assessments(
             ) {
                 Ok(verdict) => first.push(verdict),
                 Err(error) => {
-                    return unavailable(execution_open_reason(workspace.analyzer(), error));
+                    return unavailable(execution_open_reason(workspace.analyzer(), error, reuse));
                 }
             }
         }
@@ -490,6 +561,7 @@ pub(crate) fn build_statement_assessments(
         rows,
         complete: true,
         reason: None,
+        execution_cause: None,
     }
 }
 
@@ -570,6 +642,9 @@ type ControlProjection = (
     Vec<ProgramPointId>,
 );
 
+// The verdict sink is the eighth input; bundling unrelated inputs to dodge the
+// lint would only add indirection.
+#[allow(clippy::too_many_arguments)]
 fn control_projection(
     workspace: &WorkspaceAnalyzer,
     procedure: &ProcedureHandle,
@@ -578,6 +653,7 @@ fn control_projection(
     feasible: &FeasibleSuccessors<'_, ProcedureSemantics>,
     cancellation: &CancellationToken,
     request: &mut CfgAlgorithmRequest<'_>,
+    reuse: &mut ReuseVerdict,
 ) -> Result<ControlProjection, &'static str> {
     let (syntax, index) = source;
     let semantics = procedure.semantics();
@@ -608,29 +684,33 @@ fn control_projection(
     // This proof is already provided by LanguageSupport and used by the
     // workspace oracle. It consumes the same exact prepared source and span;
     // the answer is memoized only for this procedure assessment.
-    let inert_drops = if rust
-        && semantics.gaps().iter().any(|gap| {
-            gap.capability == SemanticCapability::CleanupControlFlow
-                && gap.discharge == SemanticGapDischarge::InertDropGlue
-        }) {
-        language_support_for_hook(
-            crate::analyzer::Language::Rust,
-            "procedure_drops_run_no_user_code",
-        )
-        .is_some_and(|support| {
-            support.procedure_drops_run_no_user_code(
-                workspace.analyzer(),
-                &ProjectFile::new(
-                    workspace.analyzer().project().root().to_path_buf(),
-                    procedure.artifact().key().path().as_path(),
-                ),
-                &std::sync::Arc::<str>::from(syntax.source()),
-                procedure_node.start_byte()..procedure_node.end_byte(),
-            )
-        })
-    } else {
-        false
-    };
+    let mut drop_budget = crate::analyzer::semantic::SemanticBudget::default();
+    let mut drop_request =
+        crate::analyzer::semantic::SemanticRequest::new(&mut drop_budget, request.cancellation);
+    let mut inert_drop_gaps = std::collections::HashSet::new();
+    let mut inert_drop_memo = None;
+    if rust {
+        for logical in semantics.logical_gaps() {
+            let verdict =
+                crate::analyzer::semantic::workspace_oracle::value_flow::logical_gap_is_discharged(
+                    &workspace.semantic_oracle_provider(),
+                    logical,
+                    procedure,
+                    &mut drop_request,
+                    &mut inert_drop_memo,
+                )
+                .map_err(|_| "cleanup proof unavailable")?;
+            if drop_request.stop_observed() {
+                reuse.join_in(crate::analyzer::i_analyzer::execution_dependent(
+                    workspace.analyzer(),
+                ));
+                return Err("cleanup proof stopped");
+            }
+            if verdict == crate::analyzer::semantic::workspace_oracle::value_flow::GapDischargeVerdict::Discharged {
+                inert_drop_gaps.insert(logical.key());
+            }
+        }
+    }
     let macro_points = semantics
         .gaps()
         .iter()
@@ -644,9 +724,11 @@ fn control_projection(
     for gap in semantics.gaps() {
         request
             .visit_node::<ProgramPointId>()
-            .map_err(|error| execution_open_reason(workspace.analyzer(), error))?;
-        if gap.discharge == SemanticGapDischarge::RetainedControlTopology
-            || (!rust && gap.discharge == SemanticGapDischarge::NonRejoiningExceptionalExit)
+            .map_err(|error| execution_open_reason(workspace.analyzer(), error, reuse))?;
+        if gap.control_flow_discharge() == SemanticGapDischarge::RetainedControlTopology
+            || (!rust
+                && gap.control_flow_discharge()
+                    == SemanticGapDischarge::NonRejoiningExceptionalExit)
             || !matches!(
                 gap.capability,
                 SemanticCapability::NormalControlFlow
@@ -687,15 +769,16 @@ fn control_projection(
             (
                 targets,
                 ordered_points.len(),
-                gap.discharge == SemanticGapDischarge::InertDropGlue && inert_drops,
+                semantics.logical_gaps_of(gap).all(|logical| {
+                    logical
+                        .key()
+                        .is_discharged_by(|key| inert_drop_gaps.contains(&key))
+                }),
             )
         } else if gap.capability == SemanticCapability::ExceptionalControlFlow
+            && gap.subject.is_point_or_value(semantics.cleanup_chains())
             && matches!(
-                gap.subject,
-                SemanticGapSubject::Point | SemanticGapSubject::Value(_)
-            )
-            && matches!(
-                gap.discharge,
+                gap.control_flow_discharge(),
                 SemanticGapDischarge::NonRejoiningExceptionalExit
                     | SemanticGapDischarge::NonRejoiningExceptionalExitAfterInertDrops
                     | SemanticGapDischarge::ExitOnlyProcedureCompletion
@@ -707,7 +790,7 @@ fn control_projection(
             // uncertain while MayReach adds only exit routes.
             (exits.to_vec(), ordered_points.len(), false)
         } else if matches!(
-            gap.discharge,
+            gap.control_flow_discharge(),
             SemanticGapDischarge::InertDropGlue
                 | SemanticGapDischarge::NonRejoiningExceptionalExitAfterInertDrops
         ) {
@@ -746,7 +829,7 @@ fn control_projection(
     for point in semantics.points() {
         request
             .visit_node::<ProgramPointId>()
-            .map_err(|error| execution_open_reason(workspace.analyzer(), error))?;
+            .map_err(|error| execution_open_reason(workspace.analyzer(), error, reuse))?;
         if !complete_evidence(point.evidence)
             || (point.id != exits[0]
                 && point.id != exits[1]
@@ -776,7 +859,7 @@ fn control_projection(
     for edge in semantics.control_edges() {
         request
             .visit_edge::<ProgramPointId>()
-            .map_err(|error| execution_open_reason(workspace.analyzer(), error))?;
+            .map_err(|error| execution_open_reason(workspace.analyzer(), error, reuse))?;
         if !complete_evidence(edge.evidence) {
             uncertain[edge.source_point.index()] = true;
             if rust {
@@ -941,6 +1024,7 @@ fn rust_structured_successors(
 fn execution_open_reason(
     analyzer: &dyn crate::analyzer::IAnalyzer,
     error: crate::analyzer::semantic::cfg_algorithms::CfgAlgorithmError<ProgramPointId>,
+    reuse: &mut ReuseVerdict,
 ) -> &'static str {
     let cause = crate::analyzer::read_ledger::DerivationExecutionCause::from_cfg_error(&error);
     brokk_bifrost_core::profiling::note_with(|| {
@@ -950,12 +1034,20 @@ fn execution_open_reason(
             line!()
         )
     });
-    analyzer.mark_execution_dependent();
+    reuse.join_in(crate::analyzer::i_analyzer::execution_dependent(analyzer));
     algorithm_open_reason(error)
 }
 
 #[derive(Debug)]
-pub struct AccountedStatementAssessments(pub StatementAssessments);
+pub struct AccountedStatementAssessments(
+    pub StatementAssessments,
+    pub(crate) Option<std::sync::Arc<crate::analyzer::ReadLedger>>,
+);
+impl AccountedStatementAssessments {
+    pub(crate) fn new(value: StatementAssessments) -> Self {
+        Self(value, None)
+    }
+}
 impl std::ops::Deref for AccountedStatementAssessments {
     type Target = StatementAssessments;
     fn deref(&self) -> &Self::Target {
@@ -964,10 +1056,86 @@ impl std::ops::Deref for AccountedStatementAssessments {
 }
 impl brokk_bifrost_core::retention_budget::RetainedBytes for AccountedStatementAssessments {
     fn retained_bytes(&self) -> usize {
-        std::mem::size_of::<StatementAssessments>()
-            + self.0.rows.capacity() * std::mem::size_of::<StatementAssessment>()
+        let mut heap = crate::analyzer::store::cache_budget::RetainedHeap::allocated();
+        heap.add(std::mem::size_of_val(self));
+        heap.vec(&self.0.rows);
+        if let Some(reads) = &self.1 {
+            heap.arc(reads, |reads, heap| reads.retained_heap(heap));
+        }
+        if let Some(reason) = &self.0.reason {
+            heap.add_allocation(reason.capacity());
+        }
+        heap.total()
+    }
+}
+
+/// Withhold all rows while preserving the read producer's classification.
+pub(crate) fn incomplete_read(
+    reason: &crate::analyzer::i_analyzer::QueryReadIncomplete,
+) -> StatementAssessments {
+    StatementAssessments {
+        rows: Vec::new(),
+        complete: false,
+        reason: Some(format!("{:?}", reason.base_cause())),
+        execution_cause: reason.execution_cause(),
     }
 }
 
 #[cfg(test)]
-pub(crate) mod tests {}
+pub(crate) mod tests {
+    use super::*;
+    use crate::analyzer::i_analyzer::QueryReadIncomplete;
+    use crate::analyzer::read_ledger::DerivationExecutionCause;
+
+    #[test]
+    fn incomplete_reads_preserve_content_and_operational_causes() {
+        let mut cases = vec![
+            (
+                QueryReadIncomplete::SemanticEvidenceGap("inventory incomplete".into()),
+                None,
+            ),
+            (
+                QueryReadIncomplete::ProofStopped {
+                    reason: "depth_limit",
+                    cause: None,
+                },
+                None,
+            ),
+            (
+                QueryReadIncomplete::Cancelled,
+                Some(DerivationExecutionCause::Cancelled),
+            ),
+            (
+                QueryReadIncomplete::SemanticEvidenceUnavailable("provider failed".into()),
+                Some(DerivationExecutionCause::Provider),
+            ),
+        ];
+        for cause in [
+            DerivationExecutionCause::Provider,
+            DerivationExecutionCause::Cancelled,
+            DerivationExecutionCause::Budget,
+            DerivationExecutionCause::Snapshot,
+        ] {
+            cases.push((
+                QueryReadIncomplete::ProofStopped {
+                    reason: "depth_limit",
+                    cause: Some(cause),
+                },
+                Some(cause),
+            ));
+        }
+        for (reason, expected) in cases {
+            let cold = incomplete_read(&reason);
+            let repeated = incomplete_read(&reason);
+            assert!(!cold.complete);
+            assert!(cold.rows.is_empty());
+            assert_eq!(cold.execution_cause, expected);
+            assert_eq!(repeated.execution_cause, cold.execution_cause);
+            assert_eq!(repeated.reason, cold.reason);
+            assert_eq!(
+                cold.reason.as_deref(),
+                Some(format!("{:?}", reason.base_cause()).as_str())
+            );
+        }
+    }
+}

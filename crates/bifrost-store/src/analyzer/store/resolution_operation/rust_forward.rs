@@ -7,6 +7,13 @@ use crate::analyzer::resolution::{FactResolutionOperation, ResolutionCompletionA
 /// operation performs the final authority check before publishing them.
 #[doc(hidden)]
 pub trait SelectedRustForwardQueries {
+    /// Canonical declarations and intrinsic names, in input order. None stops
+    /// publication; a missing per-item projection remains explicit evidence.
+    fn diagnostic_definitions(
+        &mut self,
+        definitions: &[SemanticId],
+    ) -> Result<Option<Vec<native_units::SelectedDiagnosticIdentity>>>;
+
     /// Certify the producer's reference inventory for one admitted source
     /// fragment, including a fragment with no reference rows. This does not
     /// certify typing or invocation applicability of individual references.
@@ -60,6 +67,17 @@ impl RustForwardQueryState {
 }
 
 impl SelectedRustForwardQueries for RustForwardQueries<'_, '_, '_, '_> {
+    fn diagnostic_definitions(
+        &mut self,
+        definitions: &[SemanticId],
+    ) -> Result<Option<Vec<native_units::SelectedDiagnosticIdentity>>> {
+        native_units::diagnostic_definition_units(
+            &self.selected.ready,
+            definitions,
+            self.cancellation,
+        )
+    }
+
     fn reference_inventory_completion(
         &mut self,
         fragment: BindingFragmentId,
@@ -125,7 +143,7 @@ impl SelectedRustForwardQueries for RustForwardQueries<'_, '_, '_, '_> {
             LocatedSemantic::Found(reference) => reference,
             LocatedSemantic::Missing => {
                 return Ok(SelectedResolutionOperationOutcome::Native(
-                    SelectedResolutionLocated::Missing,
+                    SelectedResolutionLocated::Missing(crate::analyzer::store::resolution_operation::ReferenceInventoryCompleteness::Unavailable),
                 ));
             }
             LocatedSemantic::Cancelled => return Ok(self.cancelled()),
@@ -144,6 +162,7 @@ impl SelectedRustForwardQueries for RustForwardQueries<'_, '_, '_, '_> {
         let targets = targets.to_vec();
         let SelectedRustDefinitionVocabularies {
             units: definitions,
+            sites: definition_sites,
             lexical: lexical_definitions,
             names: definition_names,
         } = match project_rust_source_definitions(
@@ -154,10 +173,13 @@ impl SelectedRustForwardQueries for RustForwardQueries<'_, '_, '_, '_> {
             self.session,
         )? {
             SelectedRustSourceDefinitionProjection::Complete(rows) => {
+                let missing_reason =
+                    super::unprojected_rows_reason(self.selected.mount_table(), &rows)?;
                 match split_projected_rust_definitions(rows) {
                     Some(vocabularies) => vocabularies,
                     None => {
                         let reason = SelectedResolutionUnavailable::MissingDefinitionUnit {
+                            reason: missing_reason,
                             storage_language: locator.storage_language().to_owned(),
                             persisted_relative_path: locator.relative_path().to_owned(),
                         };
@@ -166,8 +188,9 @@ impl SelectedRustForwardQueries for RustForwardQueries<'_, '_, '_, '_> {
                     }
                 }
             }
-            SelectedRustSourceDefinitionProjection::Unavailable => {
+            SelectedRustSourceDefinitionProjection::Unavailable(missing_reason) => {
                 let reason = SelectedResolutionUnavailable::MissingDefinitionUnit {
+                    reason: missing_reason,
                     storage_language: locator.storage_language().to_owned(),
                     persisted_relative_path: locator.relative_path().to_owned(),
                 };
@@ -183,7 +206,12 @@ impl SelectedRustForwardQueries for RustForwardQueries<'_, '_, '_, '_> {
         }
         Ok(SelectedResolutionOperationOutcome::Native(
             SelectedResolutionLocated::Found(SelectedRustReferenceAnswer {
+                snapshot_stops: super::snapshot_stop_semantics(
+                    &self.selected.ready,
+                    resolution.binding().completion(),
+                ),
                 macro_expansion_gaps: Vec::new(),
+                definition_sites,
                 generated_surface_gaps: Vec::new(),
                 retained_gap_frontiers: Vec::new(),
                 enumeration: None,

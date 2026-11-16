@@ -61,6 +61,7 @@ fn replaced_findings_are_reconciled_with_subject_verdicts() {
             location: crate::test_support::policy_test_location("src/app.rs", 1, 2, 1),
             verdict: SubjectVerdict::Selected {
                 bindings: 1,
+                subject_keys: vec![AnalysisSubjectRef::try_new("bifrost", "test-subject").unwrap()],
                 findings: vec![finding_id],
                 further_findings_absent: FurtherFindingsAbsent::Complete,
                 finding_location_bound: None,
@@ -71,8 +72,9 @@ fn replaced_findings_are_reconciled_with_subject_verdicts() {
         .with_subjects(subjects, &PolicyBudget::default())
         .unwrap();
 
+    let original_counts = finding_record_counts(run.findings());
     run.replace_findings(Vec::new());
-    run.reconcile_subject_findings(&PolicyBudget::default())
+    run.reconcile_subject_findings(&original_counts, &PolicyBudget::default())
         .unwrap();
 
     assert_eq!(run.validate_subjects(), Ok(()));
@@ -138,7 +140,7 @@ fn fail_closed_unknown_verdict_is_an_error() {
 
 #[test]
 fn diagnostic_cap_retains_exactly_two_distinct_families() {
-    let mut diagnostics = ["alpha", "beta", "gamma"]
+    let diagnostics: Vec<_> = ["alpha", "beta", "gamma"]
         .into_iter()
         .map(|family| {
             PolicyDiagnostic::try_new_in_family(
@@ -149,10 +151,12 @@ fn diagnostic_cap_retains_exactly_two_distinct_families() {
                 family,
                 None,
                 Vec::new(),
+                crate::RelatedLocationOmissions::Known(0),
             )
             .unwrap()
         })
         .collect();
+    let mut diagnostics: PolicyDiagnostics = diagnostics.into();
     assert!(normalize_policy_diagnostics_bounded(&mut diagnostics, 2));
     assert_eq!(diagnostics.len(), 2);
 }
@@ -210,10 +214,12 @@ fn folded_multisite_diagnostic_has_no_single_site_location() {
                 PolicyDisplayRegion::new(line, 1, line, 2).unwrap(),
             )),
             Vec::new(),
+            crate::RelatedLocationOmissions::Known(0),
         )
         .unwrap()
     };
-    let mut diagnostics = vec![diagnostic(1), diagnostic(2)];
+    let diagnostics = vec![diagnostic(1), diagnostic(2)];
+    let mut diagnostics: PolicyDiagnostics = diagnostics.into();
     assert!(normalize_policy_diagnostics_bounded(&mut diagnostics, 1));
     assert_eq!(diagnostics.len(), 1);
     assert_eq!(diagnostics[0].family_count(), 2);
@@ -632,4 +638,74 @@ fn partial_finding_reasons_count_at_byte_edge() {
             + reasons.capacity() * size_of::<FindingIncompleteReason>()
     );
     assert_run_byte_edge(&run_with_finding(finding), expected);
+}
+
+#[test]
+fn typestate_partial_policy_wire_requires_scope_and_preserves_evaluation_attribution() {
+    let raw = CodeQueryDiagnosticCode::TypestateAnalysisPartial;
+    assert_eq!(
+        PolicyCodeQueryDiagnostic::try_from(raw),
+        Err(ReportValueError::TypestatePartialScopeRequired)
+    );
+    let subject_key = AnalysisSubjectRef::try_new("bifrost", "subject").unwrap();
+    let diagnostic = |scope| {
+        PolicyDiagnostic::try_new(
+            PolicyDiagnosticCode::CodeQuery {
+                code: PolicyCodeQueryDiagnostic::TypestatePartial { scope },
+            },
+            PolicyDiagnosticSeverity::Warning,
+            PolicyDiagnosticImpact::RunIncomplete,
+            "analysis incomplete",
+            None,
+            Vec::new(),
+            crate::RelatedLocationOmissions::Known(0),
+        )
+        .unwrap()
+    };
+    let root = diagnostic(TypestatePartialScope::Root {
+        subject_key: subject_key.clone(),
+    });
+    let evaluation = diagnostic(TypestatePartialScope::Evaluation);
+    assert_eq!(
+        serde_json::to_value(root.code()).unwrap(),
+        serde_json::json!({
+            "type": "code_query", "code": "typestate_analysis_partial",
+            "scope": {"type": "root", "subject_key": "bifrost:subject"}
+        })
+    );
+    let other = PolicyDiagnosticCode::CodeQuery {
+        code: CodeQueryDiagnosticCode::SemanticBudgetExhausted
+            .try_into()
+            .unwrap(),
+    };
+    assert_eq!(
+        serde_json::to_value(other).unwrap(),
+        serde_json::json!({
+            "type": "code_query", "code": "semantic_budget_exhausted"
+        })
+    );
+    assert_eq!(
+        root.code().retained_size(),
+        size_of::<PolicyDiagnosticCode>() + subject_key.as_str().len()
+    );
+    let mut other_root = root.clone();
+    other_root.message = "another root gap".into();
+    let mut other_evaluation = evaluation.clone();
+    other_evaluation.message = "another evaluation gap".into();
+    let diagnostics = vec![root, other_root, evaluation, other_evaluation];
+    let mut diagnostics: PolicyDiagnostics = diagnostics.into();
+    assert!(normalize_policy_diagnostics_bounded(&mut diagnostics, 2));
+    assert!(diagnostics.iter().any(|diagnostic| matches!(
+        diagnostic.code(),
+        PolicyDiagnosticCode::CodeQuery {
+            code: PolicyCodeQueryDiagnostic::TypestatePartial {
+                scope: TypestatePartialScope::Evaluation
+            }
+        }
+    )));
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.family_count() == 2)
+    );
 }

@@ -81,6 +81,36 @@ impl ExternalSelectionAuthority for JvmSelectionAuthority {
             &self.config,
         )
     }
+
+    fn basis(
+        &self,
+        question: &brokk_bifrost_core::analyzer::external_selection::ExternalSelectionQuestion,
+        answer: [u8; 32],
+    ) -> Option<brokk_bifrost_core::analyzer::external_selection::JvmDependencyBasis> {
+        let basis = super::external::jvm_dependency_basis(&self.config, self.project.as_ref())?;
+        (self.answer_under_basis(question, &basis)? == answer).then_some(basis)
+    }
+
+    fn answer_under_basis(
+        &self,
+        question: &brokk_bifrost_core::analyzer::external_selection::ExternalSelectionQuestion,
+        basis: &brokk_bifrost_core::analyzer::external_selection::JvmDependencyBasis,
+    ) -> Option<[u8; 32]> {
+        use brokk_bifrost_core::analyzer::external_selection::ExternalSelectionQuestionKind;
+        match question.kind {
+            ExternalSelectionQuestionKind::Dependencies => {
+                super::verified_selection::dependencies_answer_under_basis(
+                    &self.config,
+                    self.project.root(),
+                    question,
+                    basis,
+                )
+            }
+            ExternalSelectionQuestionKind::Jdk | ExternalSelectionQuestionKind::RustToolchain => {
+                None
+            }
+        }
+    }
 }
 
 pub struct JvmRequestRowReaderSource {
@@ -1899,6 +1929,9 @@ mod tests {
                 request.external_selection(self.project.as_ref(), question.digest, || {
                     self.fills.fetch_add(1, Ordering::SeqCst);
                     let records: Arc<dyn std::any::Any + Send + Sync> = match question.kind {
+                        ExternalSelectionQuestionKind::RustToolchain => {
+                            unreachable!("JVM question")
+                        }
                         ExternalSelectionQuestionKind::Dependencies => Arc::new(
                             (!self.failed_capture)
                                 .then(ExternalInventorySelection::empty_for_catalog_reader_test),
@@ -2446,6 +2479,7 @@ mod tests {
         ) -> Result<Arc<VerifiedSelection>, SelectionRefused> {
             request.external_selection(self.project.as_ref(), question.digest, || {
                 let records: Arc<dyn std::any::Any + Send + Sync> = match question.kind {
+                    ExternalSelectionQuestionKind::RustToolchain => unreachable!("JVM question"),
                     ExternalSelectionQuestionKind::Dependencies => Arc::new(Some(
                         ExternalInventorySelection::empty_for_catalog_reader_test()
                             .with_generated_key_for_catalog_reader_test(self.key.clone()),
@@ -3306,6 +3340,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#11148: catalog-backed JVM projection must preserve abstract flags from the same typed declarations as decoded facts"
+    )]
     fn pinned_declaration_projection_matches_decoded_facts() {
         use brokk_bifrost_analysis::analyzer::semantic_model::catalog::{
             SessionPackSource, SessionPackSourceKind, validate_pack,
@@ -3331,6 +3368,11 @@ mod tests {
         let mut additional = member.clone();
         additional["id"] = json!("member.additional");
         additional["name"] = json!("additional");
+        additional["is_abstract"] = json!(true);
+        additional["is_static"] = json!(false);
+        additional["is_virtual"] = json!(true);
+        payload["types"][0]["is_abstract"] = json!(true);
+        payload["members"][0]["is_abstract"] = json!(false);
         payload["types"][0]["jvm_inventory"] = json!({"callables_complete":true,"values_complete":true,"types_complete":true,"supertypes_complete":true,"supertypes":[{"hierarchy_kind":"extends","target":{"kind":"declared","id":"type.base"}}],"nested_types":[{"name":"Inner","owner_fqn":"com.acme.Widget.Inner","visibility":"public","is_static":true}],"additional_members":[additional]});
         let mut base_owner = base;
         base_owner["id"] = json!("type.base");
@@ -3426,6 +3468,25 @@ mod tests {
         assert_eq!(actual.supertypes.len(), 1);
         assert_eq!(actual.provider_id, expected.provider_id);
         assert_eq!(actual.owners, expected.owners);
+        let flags = actual
+            .members
+            .iter()
+            .map(|row| (row[3].clone(), row[12].clone()))
+            .collect::<Vec<_>>();
+        assert!(
+            flags
+                .iter()
+                .any(|(name, flag)| name == &Value::Text("additional".into())
+                    && flag == &Value::Integer(1)),
+            "{flags:?}"
+        );
+        assert!(
+            flags
+                .iter()
+                .any(|(name, flag)| name != &Value::Text("additional".into())
+                    && flag == &Value::Integer(0)),
+            "{flags:?}"
+        );
         assert_eq!(actual.members, expected.members);
         assert_eq!(actual.supertypes, expected.supertypes);
     }

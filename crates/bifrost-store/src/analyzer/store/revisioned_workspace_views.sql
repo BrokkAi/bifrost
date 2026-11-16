@@ -845,6 +845,8 @@ CREATE INDEX IF NOT EXISTS temp.selected_rust_unit_closure_topology
  ON selected_rust_unit_closure(root_unit_key, topology_id);
 CREATE INDEX IF NOT EXISTS temp.selected_rust_unit_closure_summary
  ON selected_rust_unit_closure(root_unit_key, summary_id);
+CREATE INDEX IF NOT EXISTS temp.selected_rust_unit_closure_dependents
+ ON selected_rust_unit_closure(summary_id, root_unit_key);
 
 
 -- Every complete Rust summary publishes its context before its version.

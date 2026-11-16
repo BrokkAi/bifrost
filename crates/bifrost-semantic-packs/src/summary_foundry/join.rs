@@ -350,12 +350,12 @@ mod tests {
     fn entry(corpus: FoundryCorpus, member: &str, types: &[&str], to_return: bool) -> FoundryEntry {
         let mut builder = FoundryEntryBuilder::default();
         builder.add_transfer(AuthoredSummaryTransfer {
-            input: AuthoredSummaryInput::Receiver {},
+            input: AuthoredSummaryInput::Receiver { path: None },
             exit_kind: AuthoredSummaryExitKind::Normal,
             output: if to_return {
-                AuthoredSummaryOutput::NormalReturn {}
+                AuthoredSummaryOutput::NormalReturn { path: None }
             } else {
-                AuthoredSummaryOutput::Receiver {}
+                AuthoredSummaryOutput::Receiver { path: None }
             },
             value_transfer: None,
         });

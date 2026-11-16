@@ -64,6 +64,21 @@ fn fixture_facts(
             items: canonical.rust_items.clone(),
             types: canonical.rust_types.clone(),
             declarations: canonical.occurrences.declarations().to_vec(),
+            lexical_identifiers: canonical
+                .occurrences
+                .lexical_declarations()
+                .iter()
+                .map(|f| (f.declaration, f.identifier.clone()))
+                .collect(),
+            declaration_spans: canonical
+                .occurrences
+                .declarations()
+                .iter()
+                .map(|d| {
+                    let r = canonical.occurrences.occurrence(d.occurrence).range;
+                    (r.start_byte, r.end_byte)
+                })
+                .collect(),
             declaration_units: parsed.source_declaration_units.clone(),
             module_names,
             imports: canonical.imports.clone(),

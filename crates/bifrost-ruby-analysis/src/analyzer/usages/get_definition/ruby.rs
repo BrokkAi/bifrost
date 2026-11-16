@@ -38,8 +38,35 @@ use brokk_bifrost_ruby::graph::syntax::{
     symbol_or_string_value as ruby_symbol_or_string_value,
     yield_argument_for_block_parameter as ruby_yield_argument_for_block_parameter,
 };
+use brokk_bifrost_ruby::syntax::{
+    RubyWriterPosition, ruby_call_receiver, ruby_callee_spelling, ruby_callee_token,
+    ruby_element_arguments, ruby_writer_position,
+};
 use std::sync::Arc;
 use tree_sitter::{Node, Tree};
+
+/// The method a Ruby call site calls, from the name token it writes: `attr`
+/// in `r.attr = v` calls `attr=`, and the bracket of `r[i]` calls `[]`.
+fn ruby_called_member(call: Option<Node<'_>>, token: Node<'_>, source: &str) -> String {
+    let written = ruby_node_text(token, source);
+    call.map_or_else(
+        || written.to_owned(),
+        |call| ruby_callee_spelling(call).callee_name(written),
+    )
+}
+
+/// The call a resolved focus names: the `call` whose method is `callee`, or
+/// the element reference itself when the focus is its opening bracket (the
+/// smallest named node covering a bracket is the reference).
+fn ruby_call_for_focus(callee: Node<'_>) -> Option<Node<'_>> {
+    if callee.kind() == "element_reference" {
+        return Some(callee);
+    }
+    let call = callee.parent()?;
+    (call.kind() == "call"
+        && ruby_callee_token(call).is_some_and(|method| method.id() == callee.id()))
+    .then_some(call)
+}
 
 use crate::analyzer::RubyAnalyzer;
 
@@ -60,6 +87,8 @@ use brokk_bifrost_ruby::declarations::RubyNamePath;
 use brokk_bifrost_ruby::declarations::ruby_field_short_name;
 
 use brokk_bifrost_analysis::analyzer::semantic::oracle::dispatch::ResolverOwnedExternalCalleeIdentity;
+use brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelCallApplication;
+use brokk_bifrost_ruby::syntax::ruby_semantic_identifier_range;
 
 use brokk_bifrost_core::analyzer::query_batch::LimitedQueryRows;
 
@@ -78,6 +107,9 @@ use brokk_bifrost_ruby::graph::scope::{RubyScopeFrame, RubyScopeStack};
 use brokk_bifrost_ruby::mixins::ruby_forward_superclass_targets;
 
 mod instance_fields;
+use crate::analyzer::ruby::workspace_signatures::{
+    RbsClassType, RbsTypeName, RubySignatureDeclaration, RubyWorkspaceSignatureAnswer,
+};
 use brokk_bifrost_ruby::declarations::parse_ruby_tree;
 use brokk_bifrost_ruby::graph_support::RubySource;
 use brokk_bifrost_ruby::local_bindings::{
@@ -154,6 +186,19 @@ impl<'a> RubyDefinitionProvider<'a> {
 
     fn scope_step(&self) -> bool {
         self.session.scope_step()
+    }
+
+    /// The workspace RBS declarations of `member` of `owner`, or `None` when
+    /// the scope budget is spent.
+    fn workspace_signature(
+        &self,
+        owner: &str,
+        member: &str,
+    ) -> Option<Arc<RubyWorkspaceSignatureAnswer>> {
+        self.scope_step().then(|| {
+            self.ruby
+                .workspace_signature(owner, member, &|| self.session.observe_cancellation())
+        })
     }
 
     fn visible_files_from(
@@ -361,7 +406,7 @@ pub(crate) fn ruby_site_for_focus(
             call: Some(call),
             method,
         }) => {
-            let receiver = call.child_by_field_name("receiver");
+            let receiver = ruby_call_receiver(call);
             let (owner, instance_receiver) = receiver.map_or((None, false), |receiver| {
                 if matches!(receiver.kind(), "constant" | "scope_resolution") {
                     return (
@@ -391,9 +436,9 @@ pub(crate) fn ruby_site_for_focus(
                 }
                 (None, false)
             });
-            let member = ruby_node_text(method, source);
+            let member = ruby_called_member(Some(call), method, source);
             site.text = owner.map_or_else(
-                || member.to_owned(),
+                || member.clone(),
                 |owner| {
                     if instance_receiver {
                         format!("{owner}#{member}")
@@ -557,7 +602,7 @@ pub(crate) fn ruby_modeled_result_class_bounded(
     let session = ResolutionSession::bounded(budget, cancellation);
     let result = (|| {
         let ruby = resolve_analyzer::<RubyAnalyzer>(analyzer)?;
-        let overlay = analyzer.semantic_model_overlay()?;
+        let overlay = analyzer.semantic_model_overlay_read().published()?;
         let mut provider = RubyDefinitionProvider::new(ruby, &session);
         provider.overlay = Some(&overlay);
         let context = BoundedRubyLookupContext::build(
@@ -601,11 +646,12 @@ fn ruby_bounded_method_outcome(
             "Ruby send/public_send dispatch remains explicitly unsupported",
         );
     }
-    let member = ruby_node_text(method, source);
+    let member = ruby_called_member(call, method, source);
+    let member = member.as_str();
     if member.is_empty() {
         return no_definition("no_reference_text", "Ruby method reference is blank");
     }
-    let receiver = match call.and_then(|call| call.child_by_field_name("receiver")) {
+    let receiver = match call.and_then(ruby_call_receiver) {
         Some(receiver) => context.expression_receiver_type(receiver),
         None => context.enclosing_receiver(),
     };
@@ -1066,6 +1112,14 @@ struct RubyInstanceFields {
     types: HashMap<Box<str>, Option<RubyReceiverType>>,
 }
 
+/// What a Sorbet signature type or a workspace RBS type proves about a
+/// value: its class, and for an array its elements' class.
+#[derive(PartialEq, Eq)]
+struct RubySignatureType {
+    receiver: RubyReceiverType,
+    element: Option<RubyReceiverType>,
+}
+
 struct BoundedRubyLookupContext<'a, 'tree> {
     provider: &'a RubyDefinitionProvider<'a>,
     file: &'a ProjectFile,
@@ -1167,6 +1221,7 @@ impl<'a, 'tree> BoundedRubyLookupContext<'a, 'tree> {
                 self.scope.enter_method(node, ());
                 self.local_scopes.push(HashMap::default());
                 self.seed_parameter_shadows(node);
+                self.seed_signature_parameters(node);
                 return BoundedRubyWalkAction::DescendWithExit;
             }
             "singleton_class" => {
@@ -1182,6 +1237,7 @@ impl<'a, 'tree> BoundedRubyLookupContext<'a, 'tree> {
                 return BoundedRubyWalkAction::DescendWithExit;
             }
             "assignment" => self.seed_assignment(node),
+            "for" => self.seed_for_loop(node),
             _ => {}
         }
         BoundedRubyWalkAction::Descend
@@ -1262,28 +1318,389 @@ impl<'a, 'tree> BoundedRubyLookupContext<'a, 'tree> {
     fn modeled_constant_owner(&self, node: Node<'_>) -> Option<String> {
         let constants = RubyOverlayConstants::new(Some(self.provider.overlay?));
         let path = self.constant_name_path(node)?;
-        // A workspace declaration of any prefix can shadow this external
-        // path, even when the declaring file is not required by this file.
+        if self.workspace_shadows_path(&path) {
+            return None;
+        }
+        constants
+            .unique_type(&path.segments.join("::"))
+            .map(|owner| owner.qualified_name.clone())
+    }
+
+    /// A workspace declaration of any prefix can shadow an external path,
+    /// even when the declaring file is not required by this file.
+    fn workspace_shadows_path(&self, path: &RubyNamePath) -> bool {
+        self.workspace_shadows_path_in(path, self.scope.lexical())
+    }
+
+    /// [`Self::workspace_shadows_path`] with an explicit lexical chain of
+    /// `$`-joined owners, for a path written somewhere other than the walk's
+    /// position.
+    fn workspace_shadows_path_in(&self, path: &RubyNamePath, lexical_chain: &[String]) -> bool {
         for end in 1..=path.segments.len() {
             let relative = path.segments[..end].join("$");
             if !self.provider.fqn(&relative).is_empty() {
-                return None;
+                return true;
             }
             if !path.absolute {
-                for lexical in self.scope.lexical() {
+                for lexical in lexical_chain {
                     if !self
                         .provider
                         .fqn(&format!("{lexical}${relative}"))
                         .is_empty()
                     {
-                        return None;
+                        return true;
                     }
                 }
             }
         }
-        constants
-            .unique_type(&path.segments.join("::"))
-            .map(|owner| owner.qualified_name.clone())
+        false
+    }
+
+    /// #12887: what a Sorbet signature type proves: the class it admits, and
+    /// for `T::Array[E]` the class of its elements. Only types that name an
+    /// external class qualify: `T::Hash[K, V]`, `T::Array[E]`, or a constant
+    /// an activated model declares. A workspace class, a module, `T.nilable`
+    /// or any other form types nothing. A declared type admits subclasses
+    /// too; the model's `covers_overrides` claim is what answers for them.
+    fn signature_type(&self, node: Node<'_>) -> Option<RubySignatureType> {
+        let receiver = self.signature_class(node)?;
+        let element = if receiver.owner_fq_name == "Array" && node.kind() == "element_reference" {
+            ruby_type_arguments(node)
+                .first()
+                .and_then(|element| self.signature_class(*element))
+        } else {
+            None
+        };
+        Some(RubySignatureType { receiver, element })
+    }
+
+    /// The class one Sorbet type admits, without looking inside its type
+    /// arguments.
+    fn signature_class(&self, node: Node<'_>) -> Option<RubyReceiverType> {
+        if !self.provider.scope_step() {
+            return None;
+        }
+        let owner = match node.kind() {
+            "element_reference" => {
+                let path = self.constant_name_path(node.child_by_field_name("object")?)?;
+                if self.workspace_shadows_path(&path) {
+                    return None;
+                }
+                match (path.segments.as_slice(), ruby_type_arguments(node).len()) {
+                    ([t, array], 1) if t == "T" && array == "Array" => "Array".to_owned(),
+                    ([t, hash], 2) if t == "T" && hash == "Hash" => "Hash".to_owned(),
+                    _ => return None,
+                }
+            }
+            "constant" | "scope_resolution" => {
+                let constants = RubyOverlayConstants::new(Some(self.provider.overlay?));
+                let path = self.constant_name_path(node)?;
+                if self.workspace_shadows_path(&path) {
+                    return None;
+                }
+                let owner = constants.unique_type(&path.segments.join("::"))?;
+                if owner.kind
+                    != brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelSymbolKind::Class
+                {
+                    return None;
+                }
+                owner.qualified_name.clone()
+            }
+            _ => return None,
+        };
+        Some(RubyReceiverType {
+            owner_fq_name: owner,
+            mode: RubyReceiverMode::Instance,
+        })
+    }
+
+    /// The type declared for `method`'s required positional parameter
+    /// `name`, when nothing in the method writes `name`. Such a parameter
+    /// holds the caller's value at every read, which is what a declaration
+    /// describes. Two sources declare parameter types: an inline Sorbet
+    /// `sig { params(name: Type) }` directly before `method`, and the
+    /// workspace's RBS signature files (#12967). When both declare the
+    /// parameter, the type holds only if they agree; a disagreement means
+    /// one claim is wrong.
+    fn signature_parameter_type(&self, method: Node<'_>, name: &str) -> Option<RubySignatureType> {
+        let parameters = method.child_by_field_name("parameters")?;
+        let mut cursor = parameters.walk();
+        if !parameters.named_children(&mut cursor).any(|parameter| {
+            parameter.kind() == "identifier" && ruby_node_text(parameter, self.source) == name
+        }) {
+            return None;
+        }
+        let sorbet = self.sorbet_parameter_type(method, name);
+        let rbs = self.rbs_parameter_type(method, name);
+        if sorbet.is_none() && rbs.is_none() {
+            return None;
+        }
+        if ruby_writes_local(self, method, name)? {
+            return None;
+        }
+        match (sorbet, rbs) {
+            (Some(declared), None) | (None, Some(declared)) => declared,
+            (Some(sorbet), Some(rbs)) => sorbet.filter(|sorbet| Some(sorbet) == rbs.as_ref()),
+            (None, None) => None,
+        }
+    }
+
+    /// `Some` when an inline Sorbet signature declares the parameter `name`,
+    /// holding the type when it is one the typer uses.
+    fn sorbet_parameter_type(
+        &self,
+        method: Node<'_>,
+        name: &str,
+    ) -> Option<Option<RubySignatureType>> {
+        let declared = ruby_sorbet_signature_params(method, self.source)?;
+        if !self.signature_call_unshadowed(method) {
+            return None;
+        }
+        let mut cursor = declared.walk();
+        let value = declared.named_children(&mut cursor).find_map(|pair| {
+            let key = pair.child_by_field_name("key")?;
+            (pair.kind() == "pair"
+                && key.kind() == "hash_key_symbol"
+                && ruby_node_text(key, self.source) == name)
+                .then(|| pair.child_by_field_name("value"))
+                .flatten()
+        })?;
+        Some(self.signature_type(value))
+    }
+
+    /// `Some` when the workspace's RBS files declare `method` on its owner's
+    /// side, holding the type of the parameter `name` when the declaration
+    /// types it in a way the typer uses (#12967).
+    ///
+    /// Parameters match by position among the leading required positionals:
+    /// Ruby binds those to the first arguments, so index i is the same slot
+    /// on both sides, while RBS parameter names are documentary. Keywords and
+    /// blocks do not shift positions. The method must have exactly one RBS
+    /// overload, since the typer cannot select one per call, and both sides
+    /// the same number of leading required positionals. A top-level method,
+    /// a method in a block, and a method whose owner the walk did not
+    /// resolve are not matched.
+    fn rbs_parameter_type(
+        &self,
+        method: Node<'_>,
+        name: &str,
+    ) -> Option<Option<RubySignatureType>> {
+        if !self.scope.method_in_resolved_type_body() {
+            return None;
+        }
+        let receiver = self.enclosing_receiver()?;
+        let singleton = match receiver.mode {
+            RubyReceiverMode::Instance => false,
+            RubyReceiverMode::Class => true,
+            RubyReceiverMode::TopLevel => return None,
+        };
+        // `def other.name` defines on another object.
+        if method.kind() == "singleton_method"
+            && method
+                .child_by_field_name("object")
+                .is_none_or(|object| object.kind() != "self")
+        {
+            return None;
+        }
+        // `class << other` defines on another object, and `def self.m` in
+        // `class << self` defines on the singleton class's own singleton.
+        if let Some(singleton_class) =
+            ruby_enclosing_scope_node(method).filter(|owner| owner.kind() == "singleton_class")
+            && (method.kind() == "singleton_method"
+                || singleton_class
+                    .child_by_field_name("value")
+                    .is_none_or(|value| value.kind() != "self"))
+        {
+            return None;
+        }
+        let member = ruby_node_text(method.child_by_field_name("name")?, self.source);
+        let owner = receiver.owner_fq_name.replace('$', "::");
+        let Some(answer) = self.provider.workspace_signature(&owner, member) else {
+            // Out of budget: the declaration may exist, so it may disagree.
+            return Some(None);
+        };
+        let declared = match answer.declaration(singleton) {
+            RubySignatureDeclaration::None => return None,
+            RubySignatureDeclaration::Ambiguous => return Some(None),
+            RubySignatureDeclaration::One(declared) => declared,
+        };
+        if declared.overload_count != 1 {
+            return Some(None);
+        }
+        let parameters = method.child_by_field_name("parameters");
+        let mut cursor = parameters.map(|parameters| parameters.walk());
+        let leading = parameters
+            .zip(cursor.as_mut())
+            .map(|(parameters, cursor)| {
+                parameters
+                    .named_children(cursor)
+                    .filter(|parameter| parameter.kind() != "comment")
+                    .take_while(|parameter| {
+                        matches!(parameter.kind(), "identifier" | "destructured_parameter")
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if u32::try_from(leading.len()).ok() != Some(declared.leading_required) {
+            return Some(None);
+        }
+        let Some(index) = leading.iter().position(|parameter| {
+            parameter.kind() == "identifier" && ruby_node_text(*parameter, self.source) == name
+        }) else {
+            return Some(None);
+        };
+        Some(
+            declared
+                .positionals
+                .get(index)
+                .and_then(Option::as_ref)
+                .and_then(|class| self.rbs_type(class, &declared.owner)),
+        )
+    }
+
+    /// What an RBS class type proves, under the rules of
+    /// [`Self::signature_type`]: only a class an activated model declares,
+    /// and no workspace declaration may shadow the name, read relative to
+    /// the RBS declaration's namespace. `Array[E]` also types its elements.
+    fn rbs_type(&self, class: &RbsClassType, owner: &[Box<str>]) -> Option<RubySignatureType> {
+        let lexical = (1..=owner.len())
+            .map(|end| owner[..end].join("$"))
+            .collect::<Vec<_>>();
+        let receiver = self.rbs_class(&class.name, &lexical)?;
+        let element = if receiver.owner_fq_name == "Array" && class.argument_count == 1 {
+            class
+                .element
+                .as_ref()
+                .and_then(|element| self.rbs_class(element, &lexical))
+        } else {
+            None
+        };
+        Some(RubySignatureType { receiver, element })
+    }
+
+    fn rbs_class(&self, name: &RbsTypeName, lexical: &[String]) -> Option<RubyReceiverType> {
+        if !self.provider.scope_step() {
+            return None;
+        }
+        let constants = RubyOverlayConstants::new(Some(self.provider.overlay?));
+        let path = RubyNamePath {
+            segments: name
+                .segments
+                .iter()
+                .map(|segment| segment.to_string())
+                .collect(),
+            absolute: name.absolute,
+        };
+        if self.workspace_shadows_path_in(&path, lexical) {
+            return None;
+        }
+        let written = path.segments.join("::");
+        // RBS resolves a relative name in the enclosing namespaces first, so
+        // a model class nested there would be the one named.
+        if !path.absolute
+            && lexical.iter().any(|namespace| {
+                constants.publishes_type(&format!("{}::{written}", namespace.replace('$', "::")))
+            })
+        {
+            return None;
+        }
+        let owner = constants.unique_type(&written)?;
+        if owner.kind
+            != brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelSymbolKind::Class
+        {
+            return None;
+        }
+        Some(RubyReceiverType {
+            owner_fq_name: owner.qualified_name.clone(),
+            mode: RubyReceiverMode::Instance,
+        })
+    }
+
+    /// `sig` is an ordinary bare call in the body that declares `method`. It
+    /// is Sorbet's only while the workspace declares no `sig`, and no
+    /// `method_missing`, that the call could select instead, and the
+    /// enclosing type bodies define no method dynamically (the guard the
+    /// Kernel#system proof uses). A method in a `class << self` body is not
+    /// followed.
+    fn signature_call_unshadowed(&self, method: Node<'_>) -> bool {
+        if method
+            .parent()
+            .and_then(|body| body.parent())
+            .is_some_and(|owner| owner.kind() == "singleton_class")
+            || ruby_has_dynamic_bare_dispatch(self.root, self.scope.lexical(), method, self.source)
+        {
+            return false;
+        }
+        let Some(receiver) = ruby_enclosing_receiver(self.scope.lexical(), None) else {
+            return false;
+        };
+        ["sig", "method_missing"].into_iter().all(|member| {
+            ruby_bare_method_candidates(self.provider, self, &receiver, member)
+                .is_some_and(|candidates| candidates.is_empty())
+        })
+    }
+
+    fn seed_signature_parameters(&mut self, method: Node<'_>) {
+        let Some(parameters) = method.child_by_field_name("parameters") else {
+            return;
+        };
+        let mut cursor = parameters.walk();
+        let names = parameters
+            .named_children(&mut cursor)
+            .filter(|parameter| parameter.kind() == "identifier")
+            .map(|parameter| ruby_node_text(parameter, self.source))
+            .collect::<Vec<_>>();
+        for name in names {
+            if let Some(declared) = self.signature_parameter_type(method, name) {
+                self.set_local(name, Some(declared.receiver));
+            }
+        }
+    }
+
+    /// #12887: `for name in collection` whose body holds the focus. Every
+    /// local the loop writes is unknown at the loop head, since a later
+    /// iteration can reach the focus after any of those writes. When the
+    /// body never writes the loop variable, so `redo` cannot carry another
+    /// value to the focus, the variable holds an element of the collection,
+    /// which a Sorbet signature types when the collection is a
+    /// signature-typed parameter.
+    ///
+    /// The element class assumes the collection's `each` yields its
+    /// elements. An Array subclass can override `each`; Ruby lowering does
+    /// not emit the iteration protocol call (an Unsupported gap at the loop
+    /// head), so effects already take that assumption for every `for` loop.
+    /// #12971 emits the call, after which this element type must also
+    /// require that dispatch to close.
+    fn seed_for_loop(&mut self, node: Node<'_>) {
+        let (Some(pattern), Some(value), Some(body)) = (
+            node.child_by_field_name("pattern"),
+            node.child_by_field_name("value"),
+            node.child_by_field_name("body"),
+        ) else {
+            return;
+        };
+        if body.start_byte() > self.focus_start {
+            return;
+        }
+        let element = ruby_first_named_child(value)
+            .filter(|collection| collection.kind() == "identifier")
+            .and_then(|collection| {
+                let name = ruby_node_text(collection, self.source);
+                let method = ruby_parameter_owner(collection, name, self.source)?;
+                self.signature_parameter_type(method, name)
+            })
+            .and_then(|collection| collection.element)
+            .filter(|_| {
+                pattern.kind() == "identifier"
+                    && ruby_writes_local(self, body, ruby_node_text(pattern, self.source))
+                        == Some(false)
+            });
+        if !ruby_invalidate_completed(self, node) {
+            return;
+        }
+        if pattern.kind() == "identifier" {
+            self.set_local(ruby_node_text(pattern, self.source), element);
+        }
     }
 
     fn expression_receiver_type(&self, node: Node<'_>) -> Option<RubyReceiverType> {
@@ -1298,6 +1715,9 @@ impl<'a, 'tree> BoundedRubyLookupContext<'a, 'tree> {
         if depth >= 12 || !self.provider.scope_step() {
             return None;
         }
+        if let Some(hypothesized) = ruby_hypothesized_receiver(self.file, self.source, node) {
+            return Some(hypothesized);
+        }
         while matches!(node.kind(), "parenthesized_statements") {
             if !self.provider.scope_step() {
                 return None;
@@ -1310,6 +1730,17 @@ impl<'a, 'tree> BoundedRubyLookupContext<'a, 'tree> {
         match node.kind() {
             "string" | "string_content" => Some(RubyReceiverType {
                 owner_fq_name: "String".to_owned(),
+                mode: RubyReceiverMode::Instance,
+            }),
+            // Literals construct the core class itself, as Ruby type flow
+            // seeds them; a workspace `Hash` or `Array` still shadows the
+            // model where the caller checks the owner.
+            "hash" => Some(RubyReceiverType {
+                owner_fq_name: "Hash".to_owned(),
+                mode: RubyReceiverMode::Instance,
+            }),
+            "array" => Some(RubyReceiverType {
+                owner_fq_name: "Array".to_owned(),
                 mode: RubyReceiverMode::Instance,
             }),
             "constant" | "scope_resolution" => self.constant_receiver_type(node),
@@ -1363,8 +1794,11 @@ impl<'a, 'tree> BoundedRubyLookupContext<'a, 'tree> {
         if let Some(owner) = constants.unique_type(&receiver.owner_fq_name)
             && self.provider.fqn(&receiver.owner_fq_name).is_empty()
         {
-            let member =
-                constants.callable(&owner, method_name, ruby_positional_argument_count(call)?)?;
+            let member = constants.callable(
+                &owner,
+                method_name,
+                &ruby_written_application(call, self.source)?,
+            )?;
             if member.is_static() != (receiver.mode == RubyReceiverMode::Class) {
                 return None;
             }
@@ -1656,6 +2090,155 @@ fn ruby_first_named_child(node: Node<'_>) -> Option<Node<'_>> {
     brokk_bifrost_core::analyzer::structural::adapter_helpers::first_named_child(node)
 }
 
+/// The bracketed arguments of a generic type written as an element
+/// reference, such as `K` and `V` in `T::Hash[K, V]`.
+fn ruby_type_arguments(node: Node<'_>) -> Vec<Node<'_>> {
+    let object = node.child_by_field_name("object");
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .filter(|child| Some(*child) != object)
+        .collect()
+}
+
+/// The `params(...)` argument list of the inline Sorbet signature written as
+/// the statement directly before `method`:
+/// `sig { params(name: Type, ...).returns(Type) }` or `.void`, in brace or
+/// `do` form, optionally with `override`, `overridable`, `final` or
+/// `checked(:always)`. A receiver on `sig` is not this shape.
+fn ruby_sorbet_signature_params<'tree>(method: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+    let mut previous = method.prev_named_sibling();
+    while let Some(node) = previous
+        && node.kind() == "comment"
+    {
+        previous = node.prev_named_sibling();
+    }
+    let sig = previous?;
+    if sig.kind() != "call"
+        || sig.has_error()
+        || sig.child_by_field_name("receiver").is_some()
+        || sig.child_by_field_name("arguments").is_some()
+        || ruby_node_text(sig.child_by_field_name("method")?, source) != "sig"
+    {
+        return None;
+    }
+    let body = sig
+        .child_by_field_name("block")?
+        .child_by_field_name("body")?;
+    if body.named_child_count() != 1 {
+        return None;
+    }
+    // A declared signature is trusted as a contract the way a Python
+    // parameter annotation is; Sorbet's runtime check covers only the outer
+    // class anyway. A modifier that makes the contract advisory types
+    // nothing: `checked(:never)`, `checked(:tests)` and `on_failure` let a
+    // mismatched argument through by design, and `bind`, `type_parameters`
+    // and `abstract` change what the declared types mean.
+    let mut params = None;
+    let mut current = Some(body.named_child(0)?);
+    while let Some(call) = current {
+        if call.kind() != "call" {
+            return None;
+        }
+        let arguments = call.child_by_field_name("arguments");
+        match ruby_node_text(call.child_by_field_name("method")?, source) {
+            "params" if params.is_none() => params = Some(arguments?),
+            "returns" | "void" | "override" | "overridable" | "final" => {}
+            "checked"
+                if arguments.is_some_and(|arguments| {
+                    arguments.named_child_count() == 1
+                        && arguments.named_child(0).is_some_and(|argument| {
+                            argument.kind() == "simple_symbol"
+                                && ruby_node_text(argument, source) == ":always"
+                        })
+                }) => {}
+            _ => return None,
+        }
+        current = call.child_by_field_name("receiver");
+    }
+    params
+}
+
+/// Whether anything in `scope` (a method or a loop body), including its
+/// blocks and lambdas, writes the local `name`. `None` when the scan ran out
+/// of budget.
+fn ruby_writes_local(
+    context: &impl RubyCompletedLocals,
+    scope: Node<'_>,
+    name: &str,
+) -> Option<bool> {
+    let mut pending = vec![scope];
+    while let Some(node) = pending.pop() {
+        if !context.step() {
+            return None;
+        }
+        if node != scope
+            && matches!(
+                node.kind(),
+                "method" | "singleton_method" | "class" | "module" | "singleton_class"
+            )
+        {
+            continue;
+        }
+        let writes =
+            collect_local_write(context.source(), node, &mut RubyWriteBudget(context)).ok()?;
+        if writes.activations().any(|(written, _)| written == name) {
+            return Some(true);
+        }
+        push_named_children_reversed_as(node, &mut pending, |child| child);
+    }
+    Some(false)
+}
+
+/// The nearest class, module, singleton class, method or program node that
+/// encloses `node`, through any intervening statements such as `if` or
+/// `begin`.
+fn ruby_enclosing_scope_node(node: Node<'_>) -> Option<Node<'_>> {
+    let mut current = node.parent();
+    while let Some(candidate) = current {
+        if matches!(
+            candidate.kind(),
+            "class" | "module" | "singleton_class" | "method" | "singleton_method" | "program"
+        ) {
+            return Some(candidate);
+        }
+        current = candidate.parent();
+    }
+    None
+}
+
+/// The method whose parameter `name` the read `identifier` names: the nearest
+/// enclosing method, when no block or lambda in between declares a parameter
+/// of the same name.
+fn ruby_parameter_owner<'tree>(
+    identifier: Node<'tree>,
+    name: &str,
+    source: &str,
+) -> Option<Node<'tree>> {
+    let mut current = identifier.parent();
+    while let Some(node) = current {
+        match node.kind() {
+            "method" | "singleton_method" => return Some(node),
+            "class" | "module" | "singleton_class" | "program" => return None,
+            "block" | "do_block" | "lambda" => {
+                let mut declared = node
+                    .child_by_field_name("parameters")
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                while let Some(parameter) = declared.pop() {
+                    if parameter.kind() == "identifier" && ruby_node_text(parameter, source) == name
+                    {
+                        return None;
+                    }
+                    push_named_children_reversed_as(parameter, &mut declared, |child| child);
+                }
+            }
+            _ => {}
+        }
+        current = node.parent();
+    }
+    None
+}
+
 pub(crate) fn resolve_ruby(
     analyzer: &dyn IAnalyzer,
     support: &dyn BoundedDefinitionLookup,
@@ -1813,12 +2396,12 @@ fn ruby_reference_node<'tree>(node: Node<'tree>, source: &str) -> Option<RubyRef
             }
             Some(RubyReferenceNode::Identifier(node))
         }
-        "call" => node
-            .child_by_field_name("method")
-            .map(|method| RubyReferenceNode::Method {
+        "call" | "element_reference" => {
+            ruby_callee_token(node).map(|method| RubyReferenceNode::Method {
                 call: Some(node),
                 method,
-            }),
+            })
+        }
         _ => {
             let parent = node.parent()?;
             match parent.kind() {
@@ -2054,12 +2637,13 @@ fn ruby_method_outcome(
         );
     }
 
-    let member = ruby_node_text(method, source);
+    let member = ruby_called_member(call, method, source);
+    let member = member.as_str();
     if member.is_empty() {
         return no_definition("no_reference_text", "Ruby method reference is blank");
     }
 
-    let receiver_node = call.and_then(|call| call.child_by_field_name("receiver"));
+    let receiver_node = call.and_then(ruby_call_receiver);
     let receiver = match receiver_node {
         Some(receiver) => context.receiver_type(receiver),
         None => context.enclosing_receiver(),
@@ -2068,9 +2652,7 @@ fn ruby_method_outcome(
         return ruby_unresolved_receiver_outcome(semantic, context, receiver_node, member, source);
     };
 
-    let bare = call
-        .and_then(|call| call.child_by_field_name("receiver"))
-        .is_none();
+    let bare = receiver_node.is_none();
     // The traced entry points report where the winning group was found
     // (#1477). An untraced lookup takes the plain ones and records nothing.
     let mut find = None;
@@ -2191,10 +2773,38 @@ pub(crate) fn exact_ruby_external_call(
     site: &ResolvedReferenceSite,
     cancellation: Option<&CancellationToken>,
 ) -> Option<(ExactExternalCallProof, ResolverOwnedExternalCalleeIdentity)> {
-    let ruby = resolve_analyzer::<RubyAnalyzer>(analyzer)?;
     let session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), cancellation);
-    let overlay = analyzer.semantic_model_overlay();
-    let mut provider = RubyDefinitionProvider::new(ruby, &session);
+    let proof = exact_ruby_external_call_in_session(
+        analyzer,
+        file,
+        source,
+        tree,
+        site,
+        &session,
+        cancellation,
+    );
+    // The proof cannot carry a verdict; the session's joins the current
+    // captures, where its ambient marks went.
+    analyzer.join_reuse_verdict(
+        brokk_bifrost_analysis::analyzer::reuse_verdict::CarriesReuseVerdict::reuse_verdict(
+            &session,
+        ),
+    );
+    proof
+}
+
+fn exact_ruby_external_call_in_session(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    tree: &Tree,
+    site: &ResolvedReferenceSite,
+    session: &ResolutionSession,
+    cancellation: Option<&CancellationToken>,
+) -> Option<(ExactExternalCallProof, ResolverOwnedExternalCalleeIdentity)> {
+    let ruby = resolve_analyzer::<RubyAnalyzer>(analyzer)?;
+    let overlay = analyzer.semantic_model_overlay_read().published();
+    let mut provider = RubyDefinitionProvider::new(ruby, session);
     provider.overlay = overlay.as_deref();
     let root = tree.root_node();
     let callee = ruby_smallest_named_node_covering_bounded(
@@ -2203,34 +2813,29 @@ pub(crate) fn exact_ruby_external_call(
         site.focus_start_byte,
         site.focus_end_byte,
     )?;
-    if callee.kind() != "identifier" {
+    if !matches!(callee.kind(), "identifier" | "element_reference") {
         return None;
     }
-    let call = callee.parent()?;
-    if call.kind() != "call"
-        || call
-            .child_by_field_name("method")
-            .is_none_or(|method| method.id() != callee.id())
-    {
-        return None;
-    }
+    let call = ruby_call_for_focus(callee)?;
     let context =
         BoundedRubyLookupContext::build(&provider, file, source, root, site.focus_start_byte);
-    let receiver_node = call.child_by_field_name("receiver");
-    let member_name = ruby_node_text(callee, source);
-    let parameter_count = ruby_positional_argument_count(call)?;
+    let receiver_node = ruby_call_receiver(call);
+    let member_name = ruby_called_member(Some(call), ruby_callee_token(call)?, source);
+    let member_name = member_name.as_str();
+    let application = ruby_written_application(call, source)?;
+    let parameter_count = ruby_written_arity(&application)?;
 
     if receiver_node.is_none() && member_name == "system" {
         if !ruby_bare_core_method_is_proven(&provider, &context, call, source) {
             return None;
         }
         let constants = RubyOverlayConstants::new(overlay.as_deref());
-        let owner = ruby_unshadowed_external_type(ruby, &session, constants, "Kernel")?;
-        let member = constants.callable(&owner, "system", parameter_count)?;
+        let owner = ruby_unshadowed_external_type(ruby, session, constants, "Kernel")?;
+        let member = constants.callable(&owner, "system", &application)?;
         let proof = ExactExternalCallProof::ruby_bound_external_member(
             &owner.qualified_name,
             &member.name,
-            u32::try_from(parameter_count).ok()?,
+            parameter_count,
         );
         let identity = ResolverOwnedExternalCalleeIdentity::new(
             Language::Ruby,
@@ -2267,8 +2872,8 @@ pub(crate) fn exact_ruby_external_call(
     let constants = RubyOverlayConstants::new(overlay.as_deref());
     // The declared result can name a different class from the constructor's
     // owner, so check this result identity independently.
-    let owner = ruby_unshadowed_external_type(ruby, &session, constants, &receiver.owner_fq_name)?;
-    let member = constants.callable(&owner, member_name, parameter_count)?;
+    let owner = ruby_unshadowed_external_type(ruby, session, constants, &receiver.owner_fq_name)?;
+    let member = constants.callable(&owner, member_name, &application)?;
     if member.is_static() != (receiver.mode == RubyReceiverMode::Class) {
         return None;
     }
@@ -2288,7 +2893,7 @@ pub(crate) fn exact_ruby_external_call(
     let proof = ExactExternalCallProof::ruby_bound_external_member(
         &owner.qualified_name,
         &member.name,
-        u32::try_from(parameter_count).ok()?,
+        parameter_count,
     );
     let identity = ResolverOwnedExternalCalleeIdentity::new(
         Language::Ruby,
@@ -2743,7 +3348,7 @@ pub(crate) fn ruby_member_selection_closed(
         return false;
     };
     let session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), cancellation);
-    let overlay = analyzer.semantic_model_overlay();
+    let overlay = analyzer.semantic_model_overlay_read().published();
     let mut provider = RubyDefinitionProvider::new(ruby, &session);
     provider.overlay = overlay.as_deref();
     let root = tree.root_node();
@@ -2755,18 +3360,19 @@ pub(crate) fn ruby_member_selection_closed(
     ) else {
         return false;
     };
-    let Some(call) = callee.parent().filter(|call| {
-        call.kind() == "call"
-            && call
-                .child_by_field_name("method")
-                .is_some_and(|method| method.id() == callee.id())
-    }) else {
+    let Some(call) = ruby_call_for_focus(callee) else {
         return false;
     };
-    let Some(receiver_node) = call.child_by_field_name("receiver") else {
+    let Some(receiver_node) = ruby_call_receiver(call) else {
         return false;
     };
-    let member = ruby_node_text(callee, source);
+    let Some(token) = ruby_callee_token(call) else {
+        return false;
+    };
+    // The method table must keep the member the call selects: `cap=` for
+    // `r.cap = v`, not the written `cap`.
+    let member = ruby_called_member(Some(call), token, source);
+    let member = member.as_str();
     let context =
         BoundedRubyLookupContext::build(&provider, file, source, root, site.focus_start_byte);
     let Some(receiver) = ruby_exact_receiver(&context, call, receiver_node) else {
@@ -2835,7 +3441,7 @@ pub(crate) fn ruby_member_selection_closed(
         if facts.has_parse_errors || facts.runtime_boundary.is_some() {
             return false;
         }
-        let Ok(scope_source) = analyzer.project().read_source(scope_file) else {
+        let Some(scope_source) = analyzer.indexed_source(scope_file) else {
             return false;
         };
         let Some(scope_tree) = parse_ruby_tree(&scope_source) else {
@@ -3236,6 +3842,9 @@ fn ruby_reference_keeps_singleton(reference: Node<'_>, source: &str, member: &st
             .child_by_field_name("name")
             .is_some_and(|name| ruby_node_text(name, source) != member),
         "class" | "module" if is_field("name") => true,
+        // `Owner[k]` and `Owner[k] = v` call `[]` and `[]=` on the singleton;
+        // neither rewrites its method table.
+        "element_reference" if is_field("object") => true,
         "superclass" => true,
         "argument_list" => parent.parent().is_some_and(|call| {
             call.kind() == "call"
@@ -3251,34 +3860,70 @@ fn ruby_reference_keeps_singleton(reference: Node<'_>, source: &str, member: &st
     }
 }
 
-/// A splat, keyword group or block argument does not prove written positional
-/// arity. Keep that call open instead of counting the group as one argument.
-fn ruby_positional_argument_count(call: Node<'_>) -> Option<usize> {
+/// The written application of one call: how many positional actuals it
+/// passes and the labels of its keyword actuals, in written order (#11368).
+///
+/// A splat, double splat, block or forwarded argument does not prove a
+/// written application, and neither does a `pair` whose key is not a symbol
+/// label (`"name" => value`). Keep those calls open instead of counting a
+/// group as one argument.
+fn ruby_written_application(call: Node<'_>, source: &str) -> Option<SemanticModelCallApplication> {
     if call.child_by_field_name("block").is_some() {
         return None;
     }
-    let Some(arguments) = call.child_by_field_name("arguments") else {
-        return Some(0);
+    // A writer passes its assigned value as the last positional argument. A
+    // destructured target's value has no source expression to count.
+    let value: usize = match ruby_writer_position(call) {
+        RubyWriterPosition::Reader => 0,
+        RubyWriterPosition::PlainAssignment => 1,
+        RubyWriterPosition::DestructuredAssignment => return None,
     };
-    let mut cursor = arguments.walk();
-    let mut count = 0;
-    for argument in arguments.named_children(&mut cursor) {
+    let arguments = if call.kind() == "element_reference" {
+        ruby_element_arguments(call)
+    } else {
+        let Some(arguments) = call.child_by_field_name("arguments") else {
+            return Some(SemanticModelCallApplication::structured(
+                value,
+                Vec::new(),
+                false,
+            ));
+        };
+        let mut cursor = arguments.walk();
+        arguments.named_children(&mut cursor).collect()
+    };
+    let mut positional = value;
+    let mut keywords = Vec::new();
+    for argument in arguments {
         if argument.is_extra() {
             continue;
         }
-        if matches!(
-            argument.kind(),
-            "splat_argument"
-                | "hash_splat_argument"
-                | "block_argument"
-                | "pair"
-                | "forward_argument"
-        ) {
-            return None;
+        match argument.kind() {
+            "splat_argument" | "hash_splat_argument" | "block_argument" | "forward_argument" => {
+                return None;
+            }
+            "pair" => {
+                let key = argument
+                    .child_by_field_name("key")
+                    .filter(|key| matches!(key.kind(), "simple_symbol" | "hash_key_symbol"))?;
+                let range = ruby_semantic_identifier_range(key, source);
+                let label = source
+                    .get(range.start_byte..range.end_byte)
+                    .filter(|label| !label.is_empty())?;
+                keywords.push(label.to_owned());
+            }
+            _ => positional += 1,
         }
-        count += 1;
     }
-    Some(count)
+    Some(SemanticModelCallApplication::structured(
+        positional, keywords, false,
+    ))
+}
+
+/// The proof arity of a written application: every written actual, keyword
+/// actuals included, as other languages count a call with named actuals.
+fn ruby_written_arity(application: &SemanticModelCallApplication) -> Option<u32> {
+    let (positional, keywords, _) = application.written()?;
+    u32::try_from(positional + keywords.len()).ok()
 }
 
 /// The route the Ruby method walk took from the receiver's own owner to the
@@ -3628,13 +4273,7 @@ impl<'s, 'a> RubyLookupContext<'s, 'a> {
         if !callee.is_function() {
             return Vec::new();
         }
-        let Ok(callee_source) = self
-            .semantic
-            .graph
-            .index
-            .project()
-            .read_source(callee.source())
-        else {
+        let Some(callee_source) = self.semantic.graph.index.indexed_source(callee.source()) else {
             return Vec::new();
         };
         let Some(callee_tree) = parse_ruby_tree(&callee_source) else {
@@ -3706,6 +4345,9 @@ impl<'s, 'a> RubyLookupContext<'s, 'a> {
     }
 
     fn receiver_type(&self, node: Node<'_>) -> Option<RubyReceiverType> {
+        if let Some(hypothesized) = ruby_hypothesized_receiver(self.file, self.source, node) {
+            return Some(hypothesized);
+        }
         ruby_receiver_type(
             self.semantic,
             self.file,
@@ -3819,6 +4461,317 @@ pub(crate) fn ruby_call_reference_candidate(node: Node<'_>) -> bool {
         }
     }
     false
+}
+
+/// #12968: the instance class a receiver hypothesis assigns to `node` while
+/// the oracle resolves the call `node` is the written receiver of. A
+/// hypothesis types only that receiver expression; every rule that guards a
+/// written receiver of the same class still applies to it.
+fn ruby_hypothesized_receiver(
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+) -> Option<RubyReceiverType> {
+    let call = node.parent()?;
+    if ruby_call_receiver(call).is_none_or(|receiver| receiver.id() != node.id()) {
+        return None;
+    }
+    let class = brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::receiver_hypothesis(
+        file,
+        call.start_byte(),
+        call.end_byte(),
+    )?;
+    // The caller proved the object's class, not its singleton method table.
+    // The callee keeps that table only while it never rewrites it.
+    let name = (node.kind() == "identifier").then(|| ruby_node_text(node, source))?;
+    let method = ruby_parameter_owner(node, name, source)?;
+    if !ruby_declares_parameter(method, name, source)
+        || !ruby_local_singleton_kept(method, name, source, Some(node))
+    {
+        return None;
+    }
+    Some(RubyReceiverType {
+        owner_fq_name: class.into(),
+        mode: RubyReceiverMode::Instance,
+    })
+}
+
+/// The innermost method body, or the whole program, that scopes the local
+/// variable `node` reads.
+fn ruby_local_scope(node: Node<'_>) -> Node<'_> {
+    let mut scope = node;
+    while let Some(parent) = scope.parent() {
+        scope = parent;
+        if matches!(
+            scope.kind(),
+            "method" | "singleton_method" | "class" | "module"
+        ) {
+            break;
+        }
+    }
+    scope
+}
+
+/// #12968: whether the local `name` provably keeps its object's singleton
+/// method table throughout `scope`. A class proven for the object says
+/// nothing about that table, which any code holding the object can rewrite
+/// (`def name.[]`, `class << name`, `extend`, an alias, a method returning
+/// `self`). So every occurrence of `name` must be harmless: its declaration,
+/// the target of a plain assignment, the receiver of an element read, or
+/// `except`, the one occurrence being judged. Any other use, including a
+/// parenthesized one, refuses. Nested method, class and module bodies are
+/// other scopes.
+fn ruby_local_singleton_kept(
+    scope: Node<'_>,
+    name: &str,
+    source: &str,
+    except: Option<Node<'_>>,
+) -> bool {
+    let mut pending = vec![scope];
+    while let Some(node) = pending.pop() {
+        match node.kind() {
+            "identifier" if ruby_node_text(node, source) == name => {
+                let harmless = except.is_some_and(|except| except.id() == node.id())
+                    || node.parent().is_some_and(|parent| {
+                        parent.kind().ends_with("parameters")
+                            || (parent.kind() == "assignment"
+                                && parent
+                                    .child_by_field_name("left")
+                                    .is_some_and(|left| left.id() == node.id()))
+                            || (parent.kind() == "element_reference"
+                                && parent
+                                    .child_by_field_name("object")
+                                    .is_some_and(|object| object.id() == node.id()))
+                    });
+                if !harmless {
+                    return false;
+                }
+            }
+            // A nested body is another scope, but the object a singleton
+            // method is defined on (`def name.[]`) is read in this one.
+            "method" | "singleton_method" | "class" | "module" if node.id() != scope.id() => {
+                pending.extend(node.child_by_field_name("object"));
+                continue;
+            }
+            _ => {}
+        }
+        push_named_children_reversed_as(node, &mut pending, |child| child);
+    }
+    true
+}
+
+/// #12968: the constructor calls an argument expression's freshness rests
+/// on, or `None` when it is not provably a freshly built object whose
+/// singleton method table nothing has rewritten. A proven class says nothing
+/// about that table, so only these qualify: a literal (no constructor), a
+/// block-free `Const.new(...)` (a default block, as `Hash.new` takes, can
+/// rewrite the instance later), or a local that every assignment in its scope
+/// binds to one and that its scope never rewrites or hands elsewhere. A
+/// factory call or any other expression may return an object some other code
+/// already rewrote. The caller still proves each constructor returns its
+/// receiver's class.
+fn ruby_argument_singleton_fresh<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<Vec<Node<'tree>>> {
+    let fresh = |node: Node<'tree>, constructors: &mut Vec<Node<'tree>>| {
+        let node = ruby_unwrapped_expression(node);
+        match node.kind() {
+            "array" | "hash" | "string" => true,
+            "call" => {
+                let constructs = node
+                    .child_by_field_name("method")
+                    .is_some_and(|method| ruby_node_text(method, source) == "new")
+                    && node
+                        .child_by_field_name("receiver")
+                        .is_some_and(|receiver| {
+                            matches!(receiver.kind(), "constant" | "scope_resolution")
+                        })
+                    && node.child_by_field_name("block").is_none()
+                    && node
+                        .child_by_field_name("arguments")
+                        .is_none_or(|arguments| {
+                            let mut cursor = arguments.walk();
+                            arguments
+                                .named_children(&mut cursor)
+                                .all(|argument| argument.kind() != "block_argument")
+                        });
+                if constructs {
+                    constructors.push(node);
+                }
+                constructs
+            }
+            _ => false,
+        }
+    };
+    let mut constructors = Vec::new();
+    let Some(identifier) = ruby_unwrapped_identifier(node) else {
+        return fresh(node, &mut constructors).then_some(constructors);
+    };
+    let name = ruby_node_text(identifier, source);
+    let scope = ruby_local_scope(identifier);
+    if !ruby_local_singleton_kept(scope, name, source, Some(identifier)) {
+        return None;
+    }
+    let mut assigned = false;
+    let mut pending = vec![scope];
+    while let Some(node) = pending.pop() {
+        match node.kind() {
+            "assignment"
+                if node.child_by_field_name("left").is_some_and(|left| {
+                    left.kind() == "identifier" && ruby_node_text(left, source) == name
+                }) =>
+            {
+                if !node
+                    .child_by_field_name("right")
+                    .is_some_and(|right| fresh(right, &mut constructors))
+                {
+                    return None;
+                }
+                assigned = true;
+            }
+            "method" | "singleton_method" | "class" | "module" if node.id() != scope.id() => {
+                continue;
+            }
+            _ => {}
+        }
+        push_named_children_reversed_as(node, &mut pending, |child| child);
+    }
+    assigned.then_some(constructors)
+}
+
+/// An expression with its enclosing single-statement parentheses removed.
+fn ruby_unwrapped_expression(mut node: Node<'_>) -> Node<'_> {
+    while node.kind() == "parenthesized_statements" && node.named_child_count() == 1 {
+        match node.named_child(0) {
+            Some(inner) => node = inner,
+            None => break,
+        }
+    }
+    node
+}
+
+/// Whether `method` declares a plain positional parameter named `name`. A
+/// receiver or forwarded argument qualifies for a caller's class only as the
+/// parameter itself: an alias is a second name the singleton-table guard
+/// would not follow, and the guard refuses the assignment that makes one.
+fn ruby_declares_parameter(method: Node<'_>, name: &str, source: &str) -> bool {
+    method
+        .child_by_field_name("parameters")
+        .is_some_and(|parameters| {
+            let mut cursor = parameters.walk();
+            parameters.named_children(&mut cursor).any(|parameter| {
+                parameter.kind() == "identifier" && ruby_node_text(parameter, source) == name
+            })
+        })
+}
+
+/// The identifier an argument expression names once parentheses are
+/// removed, if it names one.
+fn ruby_unwrapped_identifier(node: Node<'_>) -> Option<Node<'_>> {
+    let node = ruby_unwrapped_expression(node);
+    (node.kind() == "identifier").then_some(node)
+}
+
+/// #12968: whether the argument exactly spanning `span`, the unchanged value
+/// of one of the caller's parameters, still has the singleton method table
+/// the caller's own caller proved a class for. Forwarding a parameter whose
+/// table the forwarding method may rewrite would carry a stale class on.
+pub(crate) fn argument_forwards_receiver_class(
+    source: &str,
+    tree: &Tree,
+    span: std::ops::Range<usize>,
+) -> bool {
+    smallest_named_node_covering(tree.root_node(), span.start, span.end)
+        .filter(|node| node.start_byte() == span.start && node.end_byte() == span.end)
+        .and_then(ruby_unwrapped_identifier)
+        .is_some_and(|identifier| {
+            let name = ruby_node_text(identifier, source);
+            ruby_parameter_owner(identifier, name, source).is_some_and(|method| {
+                ruby_declares_parameter(method, name, source)
+                    && ruby_local_singleton_kept(method, name, source, Some(identifier))
+            })
+        })
+}
+
+/// #12968: the class of the instance the expression exactly spanning `span`
+/// evaluates to, as the bounded receiver typer proves it at that point: the
+/// same answer the typer would give if the expression were written as a
+/// call's receiver there. A class object, or an expression the typer cannot
+/// type, proves nothing.
+pub(crate) fn receiver_class_of_expression(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    tree: &Tree,
+    span: std::ops::Range<usize>,
+    cancellation: Option<&CancellationToken>,
+) -> Option<Box<str>> {
+    let ruby = resolve_analyzer::<RubyAnalyzer>(analyzer)?;
+    let session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), cancellation);
+    let overlay = analyzer.semantic_model_overlay_read().published();
+    let mut provider = RubyDefinitionProvider::new(ruby, &session);
+    provider.overlay = overlay.as_deref();
+    let root = tree.root_node();
+    let class = ruby_smallest_named_node_covering_bounded(&provider, root, span.start, span.end)
+        .filter(|node| node.start_byte() == span.start && node.end_byte() == span.end)
+        .and_then(|node| {
+            let constructors = ruby_argument_singleton_fresh(node, source)?;
+            let context =
+                BoundedRubyLookupContext::build(&provider, file, source, root, span.start);
+            // The typer assumes `Const.new` builds a `Const`. A modeled
+            // external class keeps that promise while the workspace leaves its
+            // `new` alone, the guard the external-call path applies to a
+            // constructor call. A workspace class proves nothing: `new`,
+            // `allocate` and `initialize` (and anything it calls) can install
+            // singleton methods no bounded check rules out, and a
+            // workspace-class hypothesis could never close a call anyway.
+            let constructors_kept = constructors.iter().all(|constructor| {
+                constructor
+                    .child_by_field_name("receiver")
+                    .and_then(|receiver| context.constant_receiver_type(receiver))
+                    .is_some_and(|receiver| {
+                        provider.fqn(&receiver.owner_fq_name).is_empty()
+                            && ruby_caller_file_keeps_method_table(
+                                &provider,
+                                file,
+                                root,
+                                *constructor,
+                                source,
+                                "new",
+                            )
+                            && ruby.external_singleton_mutation_free(
+                                &receiver.owner_fq_name,
+                                "new",
+                                &|| {
+                                    cancellation
+                                        .is_none_or(|cancellation| !cancellation.is_cancelled())
+                                },
+                            )
+                    })
+            });
+            if !constructors_kept {
+                return None;
+            }
+            context.expression_receiver_type(node)
+        })
+        .filter(|receiver| {
+            receiver.mode == RubyReceiverMode::Instance
+                && provider.fqn(&receiver.owner_fq_name).is_empty()
+        })
+        .map(|receiver| receiver.owner_fq_name.into_boxed_str());
+    let class = match session.finish(class) {
+        BoundedResolution::Complete { value, .. } => value,
+        _ => None,
+    };
+    // The class cannot carry a verdict; the session's joins the current
+    // captures, where its ambient marks went.
+    analyzer.join_reuse_verdict(
+        brokk_bifrost_analysis::analyzer::reuse_verdict::CarriesReuseVerdict::reuse_verdict(
+            &session,
+        ),
+    );
+    class
 }
 
 #[allow(clippy::too_many_arguments)]

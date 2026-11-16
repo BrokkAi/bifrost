@@ -27,7 +27,12 @@ fn enum_switch_cache_replays_reads_and_tracks_overlay_changes() {
     let query = || {
         let ledger = Arc::new(ReadLedger::new());
         let scope = AnalyzerQueryScope::with_read_ledger(&analyzer, Arc::clone(&ledger));
-        let rows = analyzer.statement_source_facts(&use_file).expect("facts");
+        let rows = analyzer
+            .statement_source_facts(
+                &use_file,
+                &mut brokk_bifrost_analysis::analyzer::reuse_verdict::ReuseVerdict::Content,
+            )
+            .expect("facts");
         drop(scope);
         (rows, ledger.keys())
     };
@@ -53,7 +58,10 @@ fn enum_switch_cache_replays_reads_and_tracks_overlay_changes() {
     assert!(overlay.set(enum_file.abs_path(), "enum Mode { A }".into()));
     let complete = analyzer.clone_with_project(Arc::new(overlay.snapshot()) as Arc<dyn Project>);
     let rows = complete
-        .statement_source_facts(&use_file)
+        .statement_source_facts(
+            &use_file,
+            &mut brokk_bifrost_analysis::analyzer::reuse_verdict::ReuseVerdict::Content,
+        )
         .expect("overlay facts");
     assert!(!rows.switches[0].missing_enum_case, "{rows:?}");
     assert!(!rows.switches[0].enum_proof_undecided, "{rows:?}");
@@ -61,11 +69,17 @@ fn enum_switch_cache_replays_reads_and_tracks_overlay_changes() {
     assert!(overlay.set(enum_file.abs_path(), "enum Mode { A, B, C }".into()));
     let missing = analyzer.clone_with_project(Arc::new(overlay.snapshot()) as Arc<dyn Project>);
     let rows = missing
-        .statement_source_facts(&use_file)
+        .statement_source_facts(
+            &use_file,
+            &mut brokk_bifrost_analysis::analyzer::reuse_verdict::ReuseVerdict::Content,
+        )
         .expect("updated facts");
     assert!(rows.switches[0].missing_enum_case, "{rows:?}");
     let rows = complete
-        .statement_source_facts(&use_file)
+        .statement_source_facts(
+            &use_file,
+            &mut brokk_bifrost_analysis::analyzer::reuse_verdict::ReuseVerdict::Content,
+        )
         .expect("old snapshot facts");
     assert!(!rows.switches[0].missing_enum_case, "{rows:?}");
 }

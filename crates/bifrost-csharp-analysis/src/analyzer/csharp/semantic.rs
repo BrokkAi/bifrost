@@ -150,45 +150,12 @@ fn compound_division_can_throw(context: CSharpCompoundContext) -> bool {
     )
 }
 
-// Bumping this rotates every public wire id hashed from the adapter
-// fingerprint (`SemanticArtifactKey::push_environment_identity`). A checked-in
-// golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
-// change; the code-query tutorial pages elide such ids (#5016).
-// Initializer, event-accessor, arity and parser changes reach the lowerer (v23).
-// Compound assignments and built-in binary result types reach it (v24, #7344, #7345).
-// Operator aborts and gaps follow operand evaluation (v27, #8019).
-// Location assignments convert before accessor checks and stores (v29, #8259).
-// #8269: defer simple-write access checks until the store after the right operand.
-// #8338: infer exact local array and numeric literal conversion identities.
-// #8339: null/default values and unknown explicit conversion calls.
-// #8306: await binds its operand and result values; async returns complete a
-// task value; the procedure-scope async gap becomes per-await awaiter gaps.
-// #8308: a call's invoke point names its structural fact (`ast_identity`);
-// `string` equality with a literal is a constant-equality guard; a
-// predefined-type receiver (`string.Equals`) no longer ends control flow.
-// #8613: array/string foreach lowers its abort and iteration binding.
-// #8601: lower collection elements, spread enumeration, and construction.
-// #8600: tuple literal deconstruction now publishes ordered leaf stores.
-// #8708: publish captured lexical cells in the enclosing procedure.
-// #8717: array initializers record that their elements are not stored.
-// #8803: constructed expressions need conversion proofs before preserving identity.
-// #9270: yield return retains its partial normal continuation and disposal gaps.
-// #9447: structured formal roles and refusal change semantic payloads.
-// #9651: a store to a declared slot with a decided conversion records no
-// accessor gap.
-// #10394: an over-cap struct copy publishes its slot limit as budget data.
-// #9408: a qualified type name resolves to its same-file declaration.
-// #9408: a qualified path declines through an inaccessible nested type.
-// #10270: target-typed `new()` becomes a structural call fact, which shifts the
-// StructuralNodeIndex identities that call-point mapping reads.
-// #10270 under the 2026-11-07 lever rule: master is at v45 (#10394), so #10270
-// takes v46.
-// #10270 final merge: master is at v47 (#9408), so #10270 takes v48.
-// #9402: an unresolved member is keyed by its name within the procedure.
-// #8299: a typed local whose initializer this file cannot type keeps its value
-// and records a residual-conversion gap instead of an unknown conversion call.
-// Merge of master v49 (#9402) with #8299 v49: max of both sides + 1 gives v50.
-const ADAPTER_VERSION: &[u8] = b"csharp-value-semantics-v50";
+/// The csharp adapter lever (#11570): `levers/csharp-adapter.tokens`. Add a line there
+/// when a change alters the semantics this lowerer publishes for unchanged
+/// source; see `.agents/docs/cache-identity-levers.md`.
+fn adapter_version() -> &'static [u8] {
+    brokk_bifrost_core::lever_label!("csharp-value-semantics", "csharp-adapter.tokens").as_bytes()
+}
 
 /// How many declared slots one value-type copy duplicates.
 ///
@@ -246,7 +213,7 @@ impl ProgramSemanticsLowerer for CSharpSemanticLowerer {
         // from bifrost-analysis semantic/lowering.rs instead.
         SemanticAdapterIdentity::for_adapter(
             "csharp",
-            ADAPTER_VERSION,
+            adapter_version(),
             if self.trial {
                 b"csharp-intrafile-execution-defaults-v1-native-trial".as_slice()
             } else {
@@ -721,6 +688,18 @@ impl CSharpTypeIdentity {
         }
     }
 
+    const fn is_reference_type(self) -> bool {
+        matches!(
+            self,
+            Self::Predefined(CSharpPredefinedType::Object | CSharpPredefinedType::String)
+                | Self::Array { .. }
+                | Self::Declared {
+                    kind: CSharpDeclaredTypeKind::Reference,
+                    ..
+                }
+        )
+    }
+
     /// The copy an exact same-type carry performs: one scalar, or a whole
     /// aggregate whose copied member contents remain a separate concern.
     const fn same_type_copy(self) -> Option<TransferKind> {
@@ -899,10 +878,10 @@ struct CSharpStaticCallable {
 /// unresolved identity can still compare two occurrences (#2847, #8576).
 #[derive(Debug, Default)]
 struct CSharpTypeIndex {
-    /// Query-local canonical element identities, discarded after lowering this
-    /// file. Equal nested array shapes receive equal element IDs.
+    /// Query-local canonical element identities, discarded with this
+    /// index. Equal nested array shapes receive equal element IDs.
     array_elements: std::cell::RefCell<CSharpArrayElements>,
-    /// Interned only while this file is lowered; no workspace-wide index.
+    /// Interned only for this file index; no workspace-wide index.
     unresolved: std::cell::RefCell<CSharpUnresolvedTypes>,
     declarations: TypeDeclarations,
     qualified: CSharpQualifiedTypes,
@@ -963,6 +942,86 @@ impl<K: Clone + Eq + std::hash::Hash + std::fmt::Debug> CSharpInterner<K> {
     }
 }
 
+pub(super) fn fresh_logical_instance(
+    node: Node<'_>,
+    source: &str,
+) -> brokk_bifrost_analysis::analyzer::languages::FreshEndpoint {
+    use brokk_bifrost_analysis::analyzer::languages::FreshEndpoint;
+    if node.kind() != "object_creation_expression" || node.has_error() {
+        return FreshEndpoint::Unknown("not an error-free object creation");
+    }
+    let Some(created_type) = node.child_by_field_name("type") else {
+        return FreshEndpoint::Unknown("creation has no type field");
+    };
+    let root = std::iter::successors(Some(node), |node| node.parent())
+        .last()
+        .unwrap();
+    let index = match CSharpTypeIndex::from_tree(root, source) {
+        Ok(index) => index,
+        Err(reason) => return FreshEndpoint::Unknown(reason),
+    };
+    match index.qualified_declaration(created_type, source) {
+        Some(CSharpTypeIdentity::Declared { start_byte, kind }) => {
+            if matches!(
+                kind,
+                CSharpDeclaredTypeKind::Struct | CSharpDeclaredTypeKind::Enum
+            ) {
+                return FreshEndpoint::Unknown("created type is a value type");
+            }
+            let declaration = root
+                .named_descendant_for_byte_range(start_byte, start_byte)
+                .unwrap();
+            let declaration =
+                std::iter::successors(Some(declaration), |node| node.parent()).find(|node| {
+                    node.start_byte() == start_byte
+                        && matches!(
+                            node.kind(),
+                            "class_declaration"
+                                | "record_declaration"
+                                | "interface_declaration"
+                                | "delegate_declaration"
+                        )
+                });
+            match declaration {
+                Some(declaration)
+                    if matches!(
+                        declaration.kind(),
+                        "class_declaration" | "record_declaration"
+                    ) =>
+                {
+                    if created_type.kind() != "identifier" {
+                        return FreshEndpoint::Unknown(
+                            "qualified class binding requires selected namespace authority",
+                        );
+                    }
+                    // A closer namespace can declare a shadowing type in another file.
+                    if enclosing_namespace_path(source, declaration)
+                        != enclosing_namespace_path(source, created_type)
+                    {
+                        return FreshEndpoint::Unknown(
+                            "class binding crosses an open namespace boundary",
+                        );
+                    }
+                    FreshEndpoint::Proven
+                }
+                _ => FreshEndpoint::Unknown("created declaration is not a reference class"),
+            }
+        }
+        _ if created_type.kind() == "identifier"
+            && nonempty_node_text(source, created_type)
+                .is_some_and(|name| type_parameter_binds(created_type, name, source)) =>
+        {
+            FreshEndpoint::Unknown("created type is a type parameter")
+        }
+        None if created_type.kind() == "nullable_type" => {
+            FreshEndpoint::Unknown("nullable value type or unavailable type identity")
+        }
+        _ => FreshEndpoint::Unknown(
+            "created type is unresolved, ambiguous, aliased, or outside this file",
+        ),
+    }
+}
+
 /// One instance member whose storage a value-type copy duplicates.
 ///
 /// The anchor is the *declaration's*, which is the same anchor an ordinary
@@ -994,6 +1053,45 @@ struct CSharpTypeMembers {
 }
 
 impl CSharpTypeIndex {
+    fn from_tree(root: Node<'_>, source: &str) -> Result<Self, &'static str> {
+        let mut index = Self::default();
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            // The lowering index compares raw spellings. Do not use it as
+            // binding authority when C# identifier equality needs normalization.
+            if node.kind() == "identifier"
+                && let Some(name) = nonempty_node_text(source, node)
+                && brokk_bifrost_csharp::syntax::csharp_lookup_identifier(name) != name
+            {
+                return Err("file requires normalized C# identifier authority");
+            }
+            index.record_node(node, source);
+            stack.extend(named_children(node).into_iter().rev());
+        }
+        Ok(index)
+    }
+
+    fn record_node(&mut self, node: Node<'_>, source: &str) {
+        record_type_declaration(
+            &mut self.declarations,
+            &mut self.qualified,
+            &mut self.members,
+            &mut self.kinds,
+            node,
+            source,
+        );
+        // Aliases must not resolve to same-named nominal declarations.
+        if node.kind() == "using_directive"
+            && has_direct_token(node, "=")
+            && let Some(alias) = node
+                .child_by_field_name("name")
+                .filter(|name| name.kind() == "identifier")
+                .and_then(|name| nonempty_node_text(source, name))
+        {
+            self.aliases.insert(Box::from(alias));
+        }
+    }
+
     fn unresolved_name(
         &self,
         node: Node<'_>,
@@ -1854,11 +1952,7 @@ fn enumerate_procedures<'tree>(
         return Ok(stop.into_outcome());
     }
     let mut type_receiver_shadows = TypeReceiverShadowIndex::default();
-    let mut type_declarations = TypeDeclarations::default();
-    let mut qualified_types = CSharpQualifiedTypes::default();
-    let mut type_aliases = HashSet::<Box<str>>::default();
-    let mut type_members = HashMap::<usize, CSharpTypeMembers>::default();
-    let mut type_kinds = HashMap::<usize, CSharpDeclaredTypeKind>::default();
+    let mut type_index = CSharpTypeIndex::default();
     let mut pending_base_types: Vec<PendingBaseType<'tree>> = Vec::new();
     let mut pending_members: Vec<PendingTypeMember<'tree>> = Vec::new();
     let mut callable_nodes = Vec::new();
@@ -1899,18 +1993,11 @@ fn enumerate_procedures<'tree>(
                 );
             }
         }
+        type_index.record_node(frame.node, prepared.source());
         record_type_receiver_shadow(&mut type_receiver_shadows, frame.node, prepared.source());
         if frame.node.kind() == "method_declaration" {
             callable_nodes.push(frame.node);
         }
-        record_type_declaration(
-            &mut type_declarations,
-            &mut qualified_types,
-            &mut type_members,
-            &mut type_kinds,
-            frame.node,
-            prepared.source(),
-        );
         record_type_bases(&mut pending_base_types, frame.node);
         if frame.node.kind() == "operator_declaration"
             && frame
@@ -1918,7 +2005,7 @@ fn enumerate_procedures<'tree>(
                 .child_by_field_name("operator")
                 .is_some_and(|operator| operator.kind() == "+")
             && let Some(owner) = enclosing_type_node(frame.node)
-            && let Some(members) = type_members.get_mut(&owner.start_byte())
+            && let Some(members) = type_index.members.get_mut(&owner.start_byte())
         {
             members.has_user_defined_add_operator = true;
         }
@@ -1928,19 +2015,6 @@ fn enumerate_procedures<'tree>(
             frame.node,
             prepared.source(),
         );
-        // `using X = ...;` binds one name to another type, so a declaration in
-        // this file that spells the same name is not what an occurrence means.
-        if frame.node.kind() == "using_directive"
-            && has_direct_token(frame.node, "=")
-            && let Some(alias) = frame
-                .node
-                .child_by_field_name("name")
-                .filter(|name| name.kind() == "identifier")
-                .and_then(|name| nonempty_node_text(prepared.source(), name))
-        {
-            type_aliases.insert(Box::from(alias));
-        }
-
         let mut child_parent = frame.lexical_parent;
         if let Some((kind, segment_kind, body, properties)) =
             callable_shape(prepared.source(), frame.node, &ancestry)
@@ -1991,17 +2065,6 @@ fn enumerate_procedures<'tree>(
     // A slot's own declared type, and an operator's source and target types,
     // are ordinary type nodes: they resolve only now that every declaration in
     // the file is recorded.
-    let mut type_index = CSharpTypeIndex {
-        array_elements: Default::default(),
-        unresolved: Default::default(),
-        declarations: type_declarations,
-        qualified: qualified_types,
-        aliases: type_aliases,
-        base_types: HashMap::default(),
-        members: type_members,
-        kinds: type_kinds,
-        callables: HashMap::default(),
-    };
     for owner in inexact_types {
         if let Some(row) = type_index.members.get_mut(&owner) {
             row.exact = false;
@@ -2794,6 +2857,13 @@ fn lower_procedure<'tree, 'targets>(
         is_async: spec.properties.is_async,
         awaited_calls: HashMap::default(),
     };
+    let constructor_initializer = (spec.kind == ProcedureKind::Constructor)
+        .then(|| {
+            named_children(spec.callable)
+                .into_iter()
+                .find(|child| child.kind() == "constructor_initializer")
+        })
+        .flatten();
     context.emit_procedure_inputs(
         &mut builder,
         entry,
@@ -2802,6 +2872,11 @@ fn lower_procedure<'tree, 'targets>(
         spec.properties,
     )?;
     context.emit_capture_inputs(&mut builder, spec, entry)?;
+    // Constructor-initializer expression variables remain visible in the body.
+    // Inventory every executable root before lowering either one.
+    if let Some(initializer) = constructor_initializer {
+        context.emit_local_bindings(&mut builder, initializer)?;
+    }
     context.emit_local_bindings(&mut builder, spec.body)?;
     context.resolve_implicit_local_types();
     context.emit_local_function_captures(&mut builder, spec.body, entry)?;
@@ -2848,13 +2923,6 @@ fn lower_procedure<'tree, 'targets>(
         )?;
     }
 
-    let constructor_initializer = (spec.kind == ProcedureKind::Constructor)
-        .then(|| {
-            named_children(spec.callable)
-                .into_iter()
-                .find(|child| child.kind() == "constructor_initializer")
-        })
-        .flatten();
     let implicit_base =
         spec.kind == ProcedureKind::Constructor && constructor_initializer.is_none();
     if implicit_base {
@@ -3187,73 +3255,72 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             if is_csharp_nested_execution_boundary(node) {
                 return Ok(WalkControl::SkipChildren);
             }
+            // Foreach bindings are inventoried at the statement. Deconstruction
+            // remains unsupported, including its declaration-expression leaves.
+            if node.parent().is_some_and(|parent| {
+                parent.kind() == "foreach_statement"
+                    && parent.child_by_field_name("left") == Some(node)
+            }) {
+                return Ok(WalkControl::SkipChildren);
+            }
+            // One extractor defines both this inventory and closure publication.
+            let names = csharp_local_binding_names(node, self.prepared.source());
             let mut bindings = Vec::new();
-            if node.kind() == "variable_declarator" && is_local_variable_declarator(node) {
-                let declared_type = node
-                    .parent()
-                    .and_then(|parent| parent.child_by_field_name("type"));
-                if let Some(name) = csharp_local_binding_names(node)
-                    .into_iter()
-                    .find(|name| node.child_by_field_name("name") == Some(*name))
-                {
-                    bindings.push((
-                        name,
-                        node,
-                        declared_type,
-                        variable_declarator_initializer(node),
-                    ));
-                } else if let Some(pattern) = named_children(node)
+            if !names.is_empty() && node.kind() != "foreach_statement" {
+                let declared_type = if node.kind() == "variable_declarator" {
+                    node.parent()
+                        .and_then(|parent| parent.child_by_field_name("type"))
+                } else {
+                    node.child_by_field_name("type")
+                };
+                let tuple_sources = named_children(node)
                     .into_iter()
                     .find(|child| child.kind() == "tuple_pattern")
-                {
-                    let sources = variable_declarator_initializer(node)
-                        .and_then(|initializer| csharp_tuple_leaf_pairs(pattern, initializer))
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter(|(name, _)| name.kind() == "identifier")
-                        .map(|(name, source)| (name.id(), source))
-                        .collect::<HashMap<_, _>>();
-                    bindings.extend(
-                        csharp_local_binding_names(node).into_iter().map(|name| {
-                            (name, node, declared_type, sources.get(&name.id()).copied())
-                        }),
-                    );
+                    .and_then(|pattern| {
+                        csharp_tuple_leaf_pairs(pattern, variable_declarator_initializer(node)?)
+                    })
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(name, source)| (name.id(), source))
+                    .collect::<HashMap<_, _>>();
+                for name in names.iter().copied() {
+                    let initializer = match node.kind() {
+                        "variable_declarator" if node.child_by_field_name("name") == Some(name) => {
+                            variable_declarator_initializer(node)
+                        }
+                        "variable_declarator" => tuple_sources.get(&name.id()).copied(),
+                        "declaration_expression" => {
+                            brokk_bifrost_core::analyzer::tree_walk::find_ancestor(
+                                node,
+                                |ancestor| ancestor.kind() == "assignment_expression",
+                            )
+                            .and_then(|assignment| {
+                                csharp_tuple_leaf_pairs(
+                                    assignment.child_by_field_name("left")?,
+                                    assignment.child_by_field_name("right")?,
+                                )
+                            })
+                            .and_then(|leaves| {
+                                leaves.into_iter().find(|(target, _)| *target == node)
+                            })
+                            .map(|(_, source)| source)
+                        }
+                        "declaration_pattern"
+                        | "var_pattern"
+                        | "recursive_pattern"
+                        | "list_pattern" => csharp_pattern_input(node),
+                        _ => None,
+                    };
+                    bindings.push((name, node, declared_type, initializer));
                 }
-            } else if node.kind() == "declaration_expression"
-                && brokk_bifrost_core::analyzer::tree_walk::find_ancestor(node, |ancestor| {
-                    ancestor.kind() == "assignment_expression"
-                })
-                .and_then(|assignment| assignment.child_by_field_name("left"))
-                .is_some_and(|left| {
-                    left.kind() == "tuple_expression"
-                        && left.start_byte() <= node.start_byte()
-                        && node.end_byte() <= left.end_byte()
-                })
-                && let Some(name) = node.child_by_field_name("name")
-            {
-                let source =
-                    brokk_bifrost_core::analyzer::tree_walk::find_ancestor(node, |ancestor| {
-                        ancestor.kind() == "assignment_expression"
-                    })
-                    .and_then(|assignment| {
-                        csharp_tuple_leaf_pairs(
-                            assignment.child_by_field_name("left")?,
-                            assignment.child_by_field_name("right")?,
-                        )
-                    })
-                    .and_then(|leaves| {
-                        leaves
-                            .into_iter()
-                            .find(|(target, _)| target.id() == node.id())
-                    })
-                    .map(|(_, source)| source);
-                bindings.push((name, node, node.child_by_field_name("type"), source));
             }
             for (name, owner, declared_type, initializer) in bindings {
                 let Some(text) = node_text(self.prepared.source(), name) else {
                     continue;
                 };
-                let Some((scope_start, scope_end)) = csharp_local_scope(owner) else {
+                let Some((visible_from, scope_start, scope_end)) =
+                    csharp_local_binding_range(owner)
+                else {
                     continue;
                 };
                 let metadata = self.session.add_value_mapping(builder, name)?;
@@ -3271,7 +3338,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 // A `var` local has no declared type node at all; it takes the
                 // type of the value it is initialized with, which is resolved
                 // once every binding in the body exists.
-                if declared_type.is_some_and(|type_node| type_node.kind() == "implicit_type")
+                if (declared_type.is_some_and(|type_node| type_node.kind() == "implicit_type")
+                    || (declared_type.is_none() && csharp_pattern_input(node).is_some()))
                     && let Some(initializer) = initializer
                 {
                     self.implicit_locals.push(ImplicitLocalBinding {
@@ -3285,7 +3353,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     .or_default()
                     .push(LocalBinding {
                         declaration_start: name.start_byte(),
-                        visible_from: owner.end_byte(),
+                        visible_from,
                         scope_start,
                         scope_end,
                         value,
@@ -3294,10 +3362,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     });
             }
             if node.kind() == "foreach_statement"
-                && let Some(binding) = node.child_by_field_name("left")
-                && binding.kind() == "identifier"
+                && node
+                    .child_by_field_name("left")
+                    .is_some_and(|left| left.kind() == "identifier")
+                && let Some(binding) = names.first().copied()
                 && let Some(name) = node_text(self.prepared.source(), binding)
             {
+                let (visible_from, scope_start, scope_end) =
+                    csharp_local_binding_range(node).expect("foreach introduces its binding scope");
                 let metadata = self.session.add_value_mapping(builder, binding)?;
                 let value = self.session.add_value_with_metadata(
                     builder,
@@ -3327,9 +3399,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     .or_default()
                     .push(LocalBinding {
                         declaration_start: binding.start_byte(),
-                        visible_from: binding.end_byte(),
-                        scope_start: node.start_byte(),
-                        scope_end: node.end_byte(),
+                        visible_from,
+                        scope_start,
+                        scope_end,
                         value,
                         type_identity,
                         resolved_type,
@@ -6607,6 +6679,87 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 });
                 Ok(())
             }
+            ("is_pattern_expression", _) => {
+                let operand = required_field(node, "expression")?;
+                let mut pattern = required_field(node, "pattern")?;
+                let (mut matched, mut unmatched) = (when_true, when_false);
+                let mut negated = false;
+                while matches!(pattern.kind(), "parenthesized_pattern" | "negated_pattern") {
+                    if pattern.kind() == "negated_pattern" {
+                        std::mem::swap(&mut matched, &mut unmatched);
+                        negated = !negated;
+                    }
+                    pattern = first_named_child(pattern).expect("wrapped pattern has an operand");
+                }
+                let value = self.expression_value(
+                    builder,
+                    operand,
+                    expression_value_kind(self.prepared.source(), operand),
+                )?;
+                let bound =
+                    self.establish_pattern_bindings(builder, pattern, operand, value, matched)?;
+                let matched = EdgeTarget {
+                    point: bound,
+                    kind: matched.kind,
+                };
+                let decision = self.session.add_node_point(builder, node, Vec::new())?;
+                let result = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
+                self.pattern_operation_gaps(builder, decision, pattern)?;
+                let irrefutable =
+                    brokk_bifrost_csharp::syntax::csharp_is_irrefutable_pattern(pattern);
+                if irrefutable {
+                    let constant =
+                        self.value(builder, decision, SemanticValueKind::Boolean(!negated))?;
+                    self.emit_assignment_flow(
+                        builder,
+                        decision,
+                        ValueFlowKind::Local,
+                        constant,
+                        result,
+                    )?;
+                } else {
+                    self.append_effect(
+                        builder,
+                        decision,
+                        SemanticEffect::ValueFlow {
+                            kind: ValueFlowKind::LanguageDefined,
+                            source: value,
+                            target: result,
+                        },
+                    )?;
+                    self.session.add_target_edge(builder, decision, unmatched)?;
+                }
+                self.session.add_target_edge(builder, decision, matched)?;
+                self.record_guard(
+                    builder,
+                    decision,
+                    if irrefutable {
+                        GuardPredicate::ConstantBoolean { value: !negated }
+                    } else {
+                        GuardPredicate::Opaque {
+                            digest: GuardConditionDigest::from_syntax_kind(node.kind()),
+                        }
+                    },
+                    (!irrefutable).then_some(result),
+                    if negated {
+                        (!irrefutable).then_some(unmatched)
+                    } else {
+                        Some(matched)
+                    },
+                    if negated {
+                        Some(matched)
+                    } else {
+                        (!irrefutable).then_some(unmatched)
+                    },
+                )?;
+                stack.push(Work::Expression {
+                    node: operand,
+                    entry,
+                    next: EdgeTarget::normal(decision),
+                    scope,
+                });
+                Ok(())
+            }
             ("conditional_expression", _) => {
                 let condition = required_field(node, "condition")?;
                 let consequence = required_field(node, "consequence")?;
@@ -6693,6 +6846,143 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 Ok(())
             }
         }
+    }
+
+    /// Simple type and var tests run no user conversions. Recursive and list
+    /// patterns can invoke getters, Deconstruct or indexers; retain the old
+    /// open operation boundary until those operations are lowered.
+    fn pattern_operation_gaps(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        pattern: Node<'tree>,
+    ) -> Result<(), CSharpLoweringError> {
+        if brokk_bifrost_core::analyzer::tree_walk::subtree_contains(pattern, |node| {
+            matches!(
+                node.kind(),
+                "recursive_pattern" | "list_pattern" | "parenthesized_variable_designation"
+            )
+        }) {
+            for capability in [
+                SemanticCapability::Calls,
+                SemanticCapability::ExceptionalControlFlow,
+            ] {
+                self.session.record_gap(builder, point, SemanticGapSubject::Point,
+                    capability, SemanticGapKind::Unsupported,
+                    "recursive, positional and list pattern operations and their exceptions are not lowered")?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Only the selected match edge reaches these assignments. Nested property,
+    /// positional and list projections need their own value producer; until it
+    /// exists they retain a scoped gap rather than impersonating the whole input.
+    fn establish_pattern_bindings(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        pattern: Node<'tree>,
+        operand: Node<'tree>,
+        value: ValueId,
+        next: EdgeTarget,
+    ) -> Result<ProgramPointId, CSharpLoweringError> {
+        let bindings = csharp_local_binding_inventory(pattern, self.prepared.source(), true);
+        if bindings.is_empty() {
+            return Ok(next.point);
+        }
+        let point = self.session.add_node_point(builder, pattern, Vec::new())?;
+        for (name, owner, declaration) in bindings {
+            let target = self
+                .local_declaration_value(&name, declaration.start_byte())
+                .expect("pattern binding was inventoried");
+            if csharp_pattern_input(owner) != Some(operand) {
+                self.establish_unknown_local(
+                    builder,
+                    point,
+                    declaration,
+                    target,
+                    SemanticValueKind::Temporary,
+                    "nested pattern component value is not lowered",
+                )?;
+                continue;
+            }
+            let source_type = self.expression_type_identity(operand);
+            let destination = match owner.child_by_field_name("type") {
+                Some(ty) if ty.kind() != "implicit_type" => self.type_node_identity(ty),
+                _ => source_type,
+            };
+            // Pattern matching never invokes user-defined conversions. On a
+            // successful type test reference casts alias and value casts unbox.
+            let carry = source_type
+                .zip(destination)
+                .and_then(|(source, destination)| self.language_carry(source, destination))
+                .or_else(|| match (source_type, destination) {
+                    (Some(source), Some(destination))
+                        if source.is_reference_type() && destination.is_value_type() =>
+                    {
+                        Some(CSharpValueCarry::Transfer(TransferKind::Unboxing))
+                    }
+                    (Some(source), Some(destination))
+                        if destination.is_reference_type() && source.is_reference_type() =>
+                    {
+                        Some(CSharpValueCarry::Alias)
+                    }
+                    _ => None,
+                });
+            if let Some(carry) = carry {
+                self.emit_carried_value(
+                    builder,
+                    point,
+                    carry,
+                    ValueFlowKind::Local,
+                    (
+                        source_type.expect("known source"),
+                        destination.expect("known destination"),
+                    ),
+                    value,
+                    target,
+                )?;
+            } else {
+                self.emit_assignment_flow(
+                    builder,
+                    point,
+                    ValueFlowKind::LanguageDefined,
+                    value,
+                    target,
+                )?;
+                self.session.record_gap(
+                    builder,
+                    point,
+                    SemanticGapSubject::Value(target),
+                    SemanticCapability::Values,
+                    SemanticGapKind::Unknown,
+                    "pattern conversion is not lowered for these operand and binding types",
+                )?;
+            }
+        }
+        self.session.add_target_edge(builder, point, next)?;
+        Ok(point)
+    }
+
+    fn establish_unknown_local(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        declaration: Node<'tree>,
+        target: ValueId,
+        kind: SemanticValueKind,
+        detail: &'static str,
+    ) -> Result<(), CSharpLoweringError> {
+        let value = self.session.add_node_value(builder, declaration, kind)?;
+        self.session.record_gap(
+            builder,
+            point,
+            SemanticGapSubject::Value(value),
+            SemanticCapability::Values,
+            SemanticGapKind::Unknown,
+            detail,
+        )?;
+        self.emit_assignment_flow(builder, point, ValueFlowKind::Local, value, target)
     }
 
     /// A guard the scalar solver can decide: a truth test, an ordered or
@@ -7379,6 +7669,25 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             | "constructor_initializer" => {
                 self.call_expression(builder, node, entry, next, scope, stack)
             }
+            "is_pattern_expression" => {
+                let merge = self.session.add_node_point(builder, node, Vec::new())?;
+                self.session.add_target_edge(builder, merge, next)?;
+                self.condition(
+                    builder,
+                    node,
+                    entry,
+                    EdgeTarget {
+                        point: merge,
+                        kind: ControlEdgeKind::ConditionalTrue,
+                    },
+                    EdgeTarget {
+                        point: merge,
+                        kind: ControlEdgeKind::ConditionalFalse,
+                    },
+                    scope,
+                    stack,
+                )
+            }
             "switch_expression" => self.switch_expression(builder, node, entry, next, scope, stack),
             "lambda_expression" | "anonymous_method_expression" => {
                 self.callable_expression(builder, node, entry, next)
@@ -7850,7 +8159,6 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             | "prefix_unary_expression"
             | "postfix_unary_expression"
             | "is_expression"
-            | "is_pattern_expression"
             | "array_creation_expression"
             | "implicit_array_creation_expression"
             | "collection_expression"
@@ -8261,11 +8569,34 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     "switch when-clause evaluation failures are not lowered",
                 )?;
             }
+            let input = self.expression_value(
+                builder,
+                value,
+                expression_value_kind(self.prepared.source(), value),
+            )?;
+            // The grammar gives each label its own section. Adjacent empty
+            // sections fall through to the body without binding another label.
+            let selected = if let Some(pattern) = control
+                .iter()
+                .copied()
+                .find(|child| child.kind() != "when_clause" && is_pattern_syntax(child.kind()))
+            {
+                self.pattern_operation_gaps(builder, dispatch, pattern)?;
+                self.establish_pattern_bindings(
+                    builder,
+                    pattern,
+                    value,
+                    input,
+                    EdgeTarget::normal(entries[index]),
+                )?
+            } else {
+                entries[index]
+            };
             self.session.add_target_edge(
                 builder,
                 dispatch,
                 EdgeTarget {
-                    point: entries[index],
+                    point: selected,
                     kind: ControlEdgeKind::SwitchCase,
                 },
             )?;
@@ -8386,11 +8717,28 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
 
         for arm in arms {
             let arm_entry = self.session.add_node_point(builder, arm, Vec::new())?;
+            let input = self.expression_value(
+                builder,
+                value,
+                expression_value_kind(self.prepared.source(), value),
+            )?;
+            let pattern = named_children(arm)
+                .into_iter()
+                .find(|child| child.kind() != "when_clause" && is_pattern_syntax(child.kind()))
+                .expect("switch-expression arm has a pattern");
+            self.pattern_operation_gaps(builder, dispatch, pattern)?;
+            let selected = self.establish_pattern_bindings(
+                builder,
+                pattern,
+                value,
+                input,
+                EdgeTarget::normal(arm_entry),
+            )?;
             self.session.add_target_edge(
                 builder,
                 dispatch,
                 EdgeTarget {
-                    point: arm_entry,
+                    point: selected,
                     kind: ControlEdgeKind::SwitchCase,
                 },
             )?;
@@ -8544,6 +8892,25 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         for ((catch, catch_body), catch_entry) in
             catches.iter().zip(&catch_bodies).zip(&catch_entries)
         {
+            for declaration in named_children(*catch)
+                .into_iter()
+                .filter(|child| child.kind() == "catch_declaration")
+            {
+                for name in csharp_local_binding_names(declaration, self.prepared.source()) {
+                    let text = node_text(self.prepared.source(), name).expect("catch binding name");
+                    let target = self
+                        .local_declaration_value(text, name.start_byte())
+                        .expect("catch binding was inventoried");
+                    self.establish_unknown_local(
+                        builder,
+                        *catch_entry,
+                        name,
+                        target,
+                        SemanticValueKind::Exception,
+                        "caught exception carrier is not lowered",
+                    )?;
+                }
+            }
             if named_children(*catch)
                 .into_iter()
                 .any(|child| child.kind() == "catch_filter_clause")
@@ -9053,7 +9420,26 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             let Some(value_node) = first_argument_value(argument) else {
                 continue;
             };
-            argument_nodes.push(value_node);
+            let out_declaration =
+                has_direct_token(argument, "out") && value_node.kind() == "declaration_expression";
+            if out_declaration {
+                for name in csharp_local_binding_names(value_node, self.prepared.source()) {
+                    let text = node_text(self.prepared.source(), name).expect("out binding name");
+                    let target = self
+                        .local_declaration_value(text, name.start_byte())
+                        .expect("out binding was inventoried");
+                    self.establish_unknown_local(
+                        builder,
+                        normal,
+                        name,
+                        target,
+                        SemanticValueKind::Temporary,
+                        "call out-argument write value is not lowered",
+                    )?;
+                }
+            } else {
+                argument_nodes.push(value_node);
+            }
             let mut value = self.expression_value(
                 builder,
                 value_node,
@@ -9524,8 +9910,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     /// The edge leaves `operation`, the point that carries the operation's own
     /// effect, so every value its operands established is already live on the
     /// abort path. The failing operation's exception object is a fresh value
-    /// this adapter does not type, and a catch declaration's binding stays the
-    /// separate unlowered question it already was.
+    /// this adapter does not type. Catch bindings retain their own typed gap
+    /// until exception carriers are linked across handler selection.
     fn implicit_abort_route(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -10038,8 +10424,35 @@ fn csharp_deconstruction_names(pattern: Node<'_>) -> Vec<Node<'_>> {
     names
 }
 
-fn csharp_local_binding_names(node: Node<'_>) -> Vec<Node<'_>> {
-    match node.kind() {
+/// A designation gets the selector itself only when no component projection
+/// lies between it and the test. Logical wrappers do not project a new value.
+fn csharp_pattern_input(mut node: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        let parent = node.parent()?;
+        match parent.kind() {
+            "parenthesized_pattern" | "negated_pattern" | "and_pattern" | "or_pattern" => {
+                node = parent
+            }
+            "is_pattern_expression" => return parent.child_by_field_name("expression"),
+            "switch_section" => {
+                return brokk_bifrost_core::analyzer::tree_walk::find_ancestor(
+                    parent,
+                    |ancestor| ancestor.kind() == "switch_statement",
+                )?
+                .child_by_field_name("value");
+            }
+            "switch_expression_arm" => {
+                return named_children(parent.parent()?)
+                    .into_iter()
+                    .find(|child| child.kind() != "switch_expression_arm");
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn csharp_local_binding_names<'tree>(node: Node<'tree>, source: &str) -> Vec<Node<'tree>> {
+    let mut names = match node.kind() {
         "variable_declarator" if is_local_variable_declarator(node) => {
             if let Some(name) = node.child_by_field_name("name") {
                 if name.kind() == "identifier" {
@@ -10055,24 +10468,43 @@ fn csharp_local_binding_names(node: Node<'_>) -> Vec<Node<'_>> {
                 .map(csharp_deconstruction_names)
                 .unwrap_or_default()
         }
-        "declaration_expression" | "catch_declaration" | "foreach_statement" => node
-            .child_by_field_name(if node.kind() == "foreach_statement" {
+        "declaration_expression"
+        | "catch_declaration"
+        | "foreach_statement"
+        | "declaration_pattern"
+        | "var_pattern"
+        | "recursive_pattern"
+        | "list_pattern"
+        | "parenthesized_variable_designation" => {
+            // The pinned grammar exposes single designations as name fields,
+            // and a parenthesized designation can have several such fields.
+            let field = if node.kind() == "foreach_statement" {
                 "left"
             } else {
                 "name"
-            })
-            .map(|name| {
-                if name.kind() == "tuple_pattern" {
-                    csharp_deconstruction_names(name)
-                } else if name.kind() == "identifier" {
-                    vec![name]
-                } else {
-                    Vec::new()
-                }
-            })
-            .unwrap_or_default(),
+            };
+            children_by_field_name(node, field)
+                .into_iter()
+                .flat_map(|name| {
+                    if name.kind() == "tuple_pattern" {
+                        csharp_deconstruction_names(name)
+                    } else if name.kind() == "identifier" {
+                        vec![name]
+                    } else {
+                        Vec::new()
+                    }
+                })
+                .collect()
+        }
         _ => Vec::new(),
-    }
+    };
+    names.retain(|name| {
+        (matches!(node.kind(), "catch_declaration" | "foreach_statement")
+            || node_text(source, *name) != Some("_"))
+            && (node.kind() != "declaration_expression"
+                || brokk_bifrost_csharp::syntax::csharp_local_binder_name(*name))
+    });
+    names
 }
 
 fn first_runtime_named_child(node: Node<'_>) -> Option<Node<'_>> {
@@ -10253,7 +10685,12 @@ fn csharp_bound_capture_references<'tree>(
         let Some(owner) = specs.iter().find(|candidate| candidate.id == id) else {
             break;
         };
-        parent_bindings.insert(id, csharp_local_binding_inventory(owner.body, source, true));
+        // Constructor-initializer expression variables remain visible in the
+        // body, so the parent inventory must include the whole callable.
+        parent_bindings.insert(
+            id,
+            csharp_local_binding_inventory(owner.callable, source, true),
+        );
         current = owner.lexical_parent;
     }
     csharp_capture_references(spec.callable, source)
@@ -10355,7 +10792,7 @@ fn csharp_local_binding_inventory<'tree>(
         if node != root && skip_nested && is_csharp_nested_execution_boundary(node) {
             continue;
         }
-        for declaration in csharp_local_binding_names(node) {
+        for declaration in csharp_local_binding_names(node, source) {
             if let Some(name) = nonempty_node_text(source, declaration) {
                 bindings.push((Box::from(name), node, declaration));
             }
@@ -10367,15 +10804,25 @@ fn csharp_local_binding_inventory<'tree>(
 }
 
 fn csharp_local_declaration_in_scope(node: Node<'_>, reference: Node<'_>) -> bool {
-    if node.kind() == "foreach_statement" {
-        return node.start_byte() <= reference.start_byte()
-            && reference.end_byte() <= node.end_byte();
-    }
-    csharp_local_scope(node).is_some_and(|(start, end)| {
+    csharp_local_binding_range(node).is_some_and(|(visible_from, start, end)| {
         start <= reference.start_byte()
             && reference.end_byte() <= end
-            && node.end_byte() <= reference.start_byte()
+            && visible_from <= reference.start_byte()
     })
+}
+
+/// C# expression variables in an if condition belong to the enclosing block,
+/// while case, arm and catch binders belong to their section, arm or clause.
+/// Collection and capture publication must use the same visibility interval.
+fn csharp_local_binding_range(node: Node<'_>) -> Option<(usize, usize, usize)> {
+    if node.kind() == "foreach_statement" {
+        return Some((
+            node.child_by_field_name("left")?.end_byte(),
+            node.start_byte(),
+            node.end_byte(),
+        ));
+    }
+    csharp_local_scope(node).map(|(start, end)| (node.end_byte(), start, end))
 }
 
 fn is_local_variable_declarator(node: Node<'_>) -> bool {
@@ -10393,6 +10840,7 @@ fn csharp_local_scope(node: Node<'_>) -> Option<(usize, usize)> {
                 | "for_statement"
                 | "foreach_statement"
                 | "switch_section"
+                | "switch_expression_arm"
                 | "using_statement"
                 | "fixed_statement"
                 | "catch_clause"
@@ -11397,6 +11845,182 @@ mod tests {
     use brokk_bifrost_core::text_utils::compute_line_starts;
     use brokk_bifrost_test_macros::hardwon;
     use std::sync::Arc;
+
+    #[test]
+    #[hardwon("#8785: pattern binders must be established only after a successful match")]
+    fn pattern_binding_is_only_on_matched_edge() {
+        for (condition, matched_kind, can_fail) in [
+            ("o is string n", ControlEdgeKind::ConditionalTrue, true),
+            ("!(o is string n)", ControlEdgeKind::ConditionalFalse, true),
+            ("o is not string n", ControlEdgeKind::ConditionalFalse, true),
+            ("o is var n", ControlEdgeKind::ConditionalTrue, false),
+        ] {
+            let source =
+                format!("class C {{ static void F(object o) {{ if ({condition}) return; }} }}");
+            let procedures = lower(&source);
+            let [procedure] = procedures.as_slice() else {
+                panic!("one procedure");
+            };
+            let locals = procedure
+                .values
+                .iter()
+                .filter(|value| value.kind == SemanticValueKind::Local)
+                .collect::<Vec<_>>();
+            let [local] = locals.as_slice() else {
+                panic!("one pattern local: {locals:#?}");
+            };
+            let writes = procedure.points.iter().filter(|point| point.events.iter().any(|event| matches!(event.effect, SemanticEffect::Assignment { target, .. } if target == local.id))).collect::<Vec<_>>();
+            let [write] = writes.as_slice() else {
+                panic!("one establishment: {writes:#?}");
+            };
+            let incoming = procedure
+                .control_edges
+                .iter()
+                .filter(|edge| edge.target_point == write.id)
+                .collect::<Vec<_>>();
+            let [matched] = incoming.as_slice() else {
+                panic!("one matched predecessor: {incoming:#?}");
+            };
+            assert_eq!(matched.kind, matched_kind, "{source}");
+            let other = procedure.control_edges.iter().find(|edge| {
+                edge.source_point == matched.source_point && edge.target_point != write.id
+            });
+            assert_eq!(other.is_some(), can_fail, "{source}");
+            let Some(other) = other else {
+                continue;
+            };
+            let mut pending = vec![other.target_point];
+            let mut seen = HashSet::default();
+            while let Some(point) = pending.pop() {
+                if seen.insert(point) {
+                    assert_ne!(point, write.id, "failed match reaches binding: {source}");
+                    pending.extend(
+                        procedure
+                            .control_edges
+                            .iter()
+                            .filter(|edge| edge.source_point == point)
+                            .map(|edge| edge.target_point),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon("#8785: case and arm binders must receive the selector only on selection")]
+    fn switch_bindings_are_only_on_selected_edges() {
+        for body in [
+            "{ switch (o) { case string n: return; case int n: return; } }",
+            "{ switch (o) { case string n: case int m: return; } }",
+            "=> o switch { string n => n, int n => n };",
+        ] {
+            let returns = if body.starts_with("=>") {
+                "object"
+            } else {
+                "void"
+            };
+            let source = format!("class C {{ static {returns} F(object o) {body} }}");
+            let procedures = lower(&source);
+            let [procedure] = procedures.as_slice() else {
+                panic!("one procedure");
+            };
+            let locals = procedure
+                .values
+                .iter()
+                .filter(|value| value.kind == SemanticValueKind::Local)
+                .collect::<Vec<_>>();
+            assert_eq!(locals.len(), 2, "{source}: {locals:#?}");
+            for local in locals {
+                let writes = procedure.points.iter().filter(|point| point.events.iter().any(|event| matches!(event.effect, SemanticEffect::Assignment { target, .. } if target == local.id))).collect::<Vec<_>>();
+                let [write] = writes.as_slice() else {
+                    panic!("one establishment: {writes:#?}");
+                };
+                let incoming = procedure
+                    .control_edges
+                    .iter()
+                    .filter(|edge| edge.target_point == write.id)
+                    .collect::<Vec<_>>();
+                let [selected] = incoming.as_slice() else {
+                    panic!("one selected predecessor: {incoming:#?}");
+                };
+                assert_eq!(selected.kind, ControlEdgeKind::SwitchCase, "{source}");
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon("#8785: a recovered multiplication argument must not invent an out-var local")]
+    fn recovered_multiplication_argument_declares_no_local() {
+        let source = "class C { int Width; int Height; void M() { Sink(Width?* Height); } }";
+        let prepared = prepare(source);
+        // The pinned grammar recovers `Width?* Height` as a declaration
+        // expression whose pointer type is `Width?*` and whose name field is
+        // `Height`, with no out, ref or in modifier. Without the
+        // multiplication guard the local inventory would collect `Height` as
+        // an out-var binder.
+        let mut pending = vec![prepared.tree().root_node()];
+        let mut declaration = None;
+        while let Some(node) = pending.pop() {
+            if node.kind() == "declaration_expression" {
+                declaration = Some(node);
+            }
+            pending.extend(named_children(node));
+        }
+        let declaration = declaration.expect("the argument parses as a declaration expression");
+        let name = declaration
+            .child_by_field_name("name")
+            .expect("the recovered declaration names a binder");
+        assert_eq!(node_text(source, name), Some("Height"));
+        let argument = declaration
+            .parent()
+            .expect("the declaration expression is an argument value");
+        assert_eq!(argument.kind(), "argument");
+        for modifier in ["out", "ref", "in"] {
+            assert!(!has_direct_token(argument, modifier));
+        }
+        assert!(!brokk_bifrost_csharp::syntax::csharp_local_binder_name(
+            name
+        ));
+
+        let procedures = lower(source);
+        let [procedure] = procedures.as_slice() else {
+            panic!("one procedure");
+        };
+        let locals = procedure
+            .values
+            .iter()
+            .filter(|value| value.kind == SemanticValueKind::Local)
+            .collect::<Vec<_>>();
+        assert!(locals.is_empty(), "no local may be declared: {locals:#?}");
+    }
+
+    #[test]
+    #[hardwon("#8785: an undecided pattern conversion must keep a typed Values gap")]
+    fn undecided_pattern_conversion_keeps_a_typed_values_gap() {
+        let procedures = lower(
+            "class C { static int F(object o) { if (o is Missing.Thing t) return t.GetHashCode(); return 0; } }",
+        );
+        let [procedure] = procedures.as_slice() else {
+            panic!("one procedure");
+        };
+        let locals = procedure
+            .values
+            .iter()
+            .filter(|value| value.kind == SemanticValueKind::Local)
+            .collect::<Vec<_>>();
+        let [local] = locals.as_slice() else {
+            panic!("one pattern local: {locals:#?}");
+        };
+        assert!(
+            procedure.gaps.iter().any(|gap| {
+                gap.subject == SemanticGapSubject::Value(local.id)
+                    && gap.capability == SemanticCapability::Values
+                    && gap.kind == SemanticGapKind::Unknown
+            }),
+            "{:#?}",
+            procedure.gaps
+        );
+    }
 
     #[test]
     #[hardwon("#8339: a null literal published a Values gap")]

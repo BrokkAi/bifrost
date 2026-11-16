@@ -62,10 +62,11 @@ use crate::analyzer::usages::receiver_query::{
     ReceiverQueryOperation, ReceiverQueryReport, ReceiverQueryService,
 };
 use crate::analyzer::usages::{
-    CallBindingCache, CallBindingStatus, CallRelationDiagnostic, CallRelationDiagnosticCode,
-    CallRelationLimits, CallRelationResult, CallRelationService, CallSite, DEFAULT_MAX_FILES,
-    ExplicitCandidateProvider, FuzzyResult, ReferenceHit, ReferenceKind, UsageFinder, UsageHitKind,
-    UsageProof, UsageProofAuthority, bind_call_site_arguments,
+    CallBindingCache, CallBindingStatus, CallRelationBudgetRefusal, CallRelationDiagnostic,
+    CallRelationDiagnosticCode, CallRelationLimits, CallRelationResult, CallRelationScanLimit,
+    CallRelationService, CallSite, ExplicitCandidateProvider, FuzzyResult, ReferenceHit,
+    ReferenceKind, UsageFinder, UsageHitKind, UsageProof, UsageProofAuthority,
+    bind_call_site_arguments,
 };
 use crate::analyzer::{
     CodeUnit, IAnalyzer, Language, PersistedImportAdjacency, PersistedImportDirection, ProjectFile,
@@ -92,6 +93,9 @@ use brokk_bifrost_analysis::native_resolution_test_support::{
     SelectedReferenceInverseIndexBuildOutcome, build_selected_reference_inverse_index,
 };
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
+use brokk_bifrost_core::analyzer::reuse_verdict::{
+    CarriesReuseVerdict, ExecutionCause, ReuseVerdict,
+};
 use brokk_bifrost_core::analyzer::structural::materialization::SourceExportLocalDefinition;
 use brokk_bifrost_core::analyzer::usages::model::ReferenceFacets;
 use brokk_bifrost_core::util::elapsed_ns;
@@ -148,6 +152,7 @@ mod java_language_rules {
 mod js_language_rules {
     include!(concat!("js", "_rules.rs"));
 }
+pub(crate) mod call_reachability;
 mod callable_metrics;
 mod decorator_binding;
 mod dependency_configuration;
@@ -156,7 +161,12 @@ mod edges;
 mod effects;
 mod environment;
 mod execution;
-pub(crate) mod expansions;
+mod expansions;
+mod reached_sinks;
+pub use expansions::{
+    CallPathCoverage, CallPathEdge, CallPathEvidence, CallPathGap, CallPathLocation,
+    CallPathSource, StaticCallPath, StaticCallProof,
+};
 mod failure_handler_state;
 mod field_metadata;
 mod field_write;
@@ -298,6 +308,31 @@ pub(crate) mod test_support {
 }
 
 impl QueryExecutionState<'_> {
+    /// Dual write while the ambient channel still decides: mark the active
+    /// captures and join the dependence into the execution's own verdict.
+    #[track_caller]
+    fn mark_execution_dependent(&mut self) {
+        self.analyzer.mark_execution_dependent();
+        self.reuse.join_in(EXECUTION_DEPENDENT);
+    }
+
+    /// The verdicts of the query-owned caches whose methods mark execution
+    /// dependences, which this execution's verdict joins when it closes. The
+    /// effect cache is a capture-scoped memo; only the query boundary reads it.
+    fn cache_reuse(&self) -> ReuseVerdict {
+        [
+            self.call_cache.reuse,
+            self.flow_state_cache.reuse,
+            self.path_cache.reuse,
+            self.configuration_cache.reuse,
+            self.topology_cache.reuse,
+            self.branch_relation_cache.reuse,
+            self.failure_handler_state_cache.reuse,
+        ]
+        .into_iter()
+        .fold(ReuseVerdict::Content, ReuseVerdict::join)
+    }
+
     fn diagnostic(
         analyzer: &dyn IAnalyzer,
         mut diagnostic: CodeQueryDiagnostic,
@@ -305,6 +340,13 @@ impl QueryExecutionState<'_> {
     ) -> CodeQueryDiagnostic {
         if let Some(cause) = cause {
             diagnostic.incompleteness = Incompleteness::Operational(cause);
+        }
+        if diagnostic.incompleteness == Incompleteness::ConfiguredCap {
+            analyzer.join_reuse_verdict(
+                brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::ExecutionDependent(
+                    brokk_bifrost_core::analyzer::reuse_verdict::ExecutionCause::ConfiguredCap,
+                ),
+            );
         }
         let cause = diagnostic.incompleteness.execution_cause();
         assert!(
@@ -320,32 +362,172 @@ impl QueryExecutionState<'_> {
                     diagnostic.code.as_str()
                 )
             });
+            // The returned diagnostic carries this dependence: the query
+            // joins the verdict of every execution-state diagnostic it returns.
             analyzer.mark_execution_dependent();
         }
         diagnostic
     }
 }
 
-/// Keep the first exact public diagnostic value, combining its execution
-/// provenance. Source, branch and related evidence are part of its identity.
+/// Join refusal evidence before any presentation bound. Persisted products
+/// keep full UTF-8 sites; their private native-path spelling is never a report
+/// location. Query-only shape keys are unioned and never serialized.
+fn merge_refused_sites(diagnostics: Vec<CodeQueryDiagnostic>) -> Vec<CodeQueryDiagnostic> {
+    struct Group {
+        output_index: usize,
+        incompleteness: Incompleteness,
+        sites: Vec<CodeQueryRelatedSource>,
+        reason: String,
+    }
+    let mut merged: Vec<CodeQueryDiagnostic> = Vec::new();
+    let mut groups: Vec<Group> = Vec::new();
+    // Cause provenance is a finite inventory. Keep it separate from the
+    // hashed presentation identity, as normalize_query_diagnostics does.
+    let mut by_identity: HashMap<_, Vec<usize>> = HashMap::default();
+    for mut diagnostic in diagnostics {
+        let reason = diagnostic
+            .message
+            .split_once("\ncall-binding refusal:")
+            .map(|(base, reason)| (base.to_owned(), format!("call-binding refusal:{reason}")));
+        let refusal = matches!(
+            diagnostic.code,
+            CodeQueryDiagnosticCode::SemanticAnalysisPartial
+                | CodeQueryDiagnosticCode::CallBindingDispatchPartial
+        ) && (reason.is_some()
+            || diagnostic
+                .related
+                .iter()
+                .any(|site| site.label.starts_with("call-binding refusal:")));
+        if !refusal {
+            merged.push(diagnostic);
+            continue;
+        }
+        let (base, reason) = reason.unwrap_or_else(|| {
+            (
+                diagnostic.message.clone(),
+                diagnostic.related[0].label.clone(),
+            )
+        });
+        let mut sites = std::mem::take(&mut diagnostic.related);
+        if let Some(source) = diagnostic.source.take() {
+            sites.push(CodeQueryRelatedSource {
+                source,
+                label: reason.clone(),
+            });
+        }
+        diagnostic.message.truncate(base.len());
+        let candidates = by_identity
+            .entry((
+                diagnostic.code,
+                diagnostic.impact,
+                diagnostic.language,
+                diagnostic.branch.clone(),
+                base,
+            ))
+            .or_default();
+        if let Some(index) = candidates
+            .iter()
+            .copied()
+            .find(|&index| groups[index].incompleteness == diagnostic.incompleteness)
+        {
+            let group = &mut groups[index];
+            group.sites.append(&mut sites);
+            if reason < group.reason {
+                group.reason = reason;
+            }
+            let prior = &mut merged[group.output_index];
+            // Insert only the incoming keys. BTreeSet::append can rebuild the
+            // entire accumulated tree for each small incoming diagnostic.
+            for site_id in diagnostic.refusal_sites {
+                prior.refusal_sites.insert(site_id);
+            }
+            prior.has_non_utf8_refusal |= diagnostic.has_non_utf8_refusal;
+        } else {
+            candidates.push(groups.len());
+            groups.push(Group {
+                output_index: merged.len(),
+                incompleteness: diagnostic.incompleteness,
+                sites,
+                reason,
+            });
+            merged.push(diagnostic);
+        }
+    }
+    // Each group owns all its evidence now. Sort once and retain one private
+    // path/offset identity per site, regardless of incoming branch or unit.
+    for mut group in groups {
+        group.sites.sort_by(|a, b| {
+            (
+                &a.source.path,
+                a.source.start_byte,
+                a.source.end_byte,
+                &a.label,
+            )
+                .cmp(&(
+                    &b.source.path,
+                    b.source.start_byte,
+                    b.source.end_byte,
+                    &b.label,
+                ))
+        });
+        group.sites.dedup_by(|a, b| {
+            a.source.path == b.source.path && a.source.start_byte == b.source.start_byte
+        });
+        let diagnostic = &mut merged[group.output_index];
+        diagnostic.source = group.sites.first().map(|site| site.source.clone());
+        let reason = group
+            .sites
+            .first()
+            .map_or(group.reason, |site| site.label.clone());
+        diagnostic.related = group.sites.into_iter().skip(1).collect();
+        diagnostic.message.push('\n');
+        diagnostic.message.push_str(&reason);
+    }
+    merged
+}
+
+/// Keep each diagnostic's finite cause inventory in a stable order.
+/// A content duplicate cannot erase an operational or configured-cap cause.
 fn normalize_query_diagnostics(diagnostics: Vec<CodeQueryDiagnostic>) -> Vec<CodeQueryDiagnostic> {
     use std::collections::hash_map::Entry;
     let mut indices = HashMap::<CodeQueryDiagnostic, usize>::default();
-    let mut result: Vec<CodeQueryDiagnostic> = Vec::new();
-    for diagnostic in diagnostics {
+    let mut groups: Vec<(CodeQueryDiagnostic, Vec<Incompleteness>)> = Vec::new();
+    for diagnostic in merge_refused_sites(diagnostics) {
+        let cause = diagnostic.incompleteness;
         match indices.entry(diagnostic.clone()) {
             Entry::Vacant(entry) => {
-                entry.insert(result.len());
-                result.push(diagnostic);
+                entry.insert(groups.len());
+                groups.push((diagnostic, vec![cause]));
             }
             Entry::Occupied(entry) => {
-                let retained = &mut result[*entry.get()];
-                retained.incompleteness =
-                    retained.incompleteness.combine(diagnostic.incompleteness);
+                let causes = &mut groups[*entry.get()].1;
+                if !causes.contains(&cause) {
+                    causes.push(cause);
+                }
             }
         }
     }
-    result
+    // Release the cloned evidence keys before expanding distinct causes.
+    drop(indices);
+    groups
+        .into_iter()
+        .flat_map(|(diagnostic, mut causes)| {
+            if causes.iter().any(|cause| *cause != Incompleteness::Content) {
+                causes.retain(|cause| *cause != Incompleteness::Content);
+            }
+            causes.sort_by_key(|cause| match cause {
+                Incompleteness::Content => (0, None),
+                Incompleteness::ConfiguredCap => (1, None),
+                Incompleteness::Operational(cause) => (2, Some(*cause)),
+            });
+            causes.into_iter().map(move |cause| {
+                let mut answer = diagnostic.clone();
+                answer.incompleteness = cause;
+                answer
+            })
+        })
+        .collect()
 }
 
 fn incomplete_diagnostic(
@@ -356,6 +538,10 @@ fn incomplete_diagnostic(
     exhausted_roots: Vec<CodeQueryExhaustedRoot>,
 ) -> CodeQueryDiagnostic {
     CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        has_non_utf8_refusal: false,
+        refusal_sites: Default::default(),
+        call_relation_facts: None,
+        uses_omissions: Vec::new(),
         incompleteness,
         related: Vec::new(),
         source: None,
@@ -376,12 +562,15 @@ fn push_deduplicated_diagnostic(
     message: String,
 ) {
     let diagnostic = incomplete_diagnostic(code, incompleteness, "workspace", message, Vec::new());
-    if let Some(existing) = diagnostics
-        .iter_mut()
-        .find(|existing| existing.code == code && existing.message == diagnostic.message)
-    {
-        existing.incompleteness = existing.incompleteness.combine(diagnostic.incompleteness);
-    } else {
+    if !diagnostics.iter().any(|existing| {
+        existing.code == code
+            && existing
+                .message
+                .split_once("\ncall-binding refusal:")
+                .map_or(existing.message.as_str(), |(base, _)| base)
+                == diagnostic.message
+            && existing.incompleteness == diagnostic.incompleteness
+    }) {
         diagnostics.push(diagnostic);
     }
 }
@@ -398,7 +587,27 @@ pub fn fold_query_read_incompleteness(
             None => Incompleteness::Content,
             Some(cause) => Incompleteness::Operational(cause),
         };
-        let (code, message) = match reason {
+        let (code, message) = match reason.base_cause() {
+            QueryReadIncomplete::Attributed(_) => {
+                unreachable!("base cause has no provenance layer")
+            }
+            QueryReadIncomplete::ProofStopped { reason, cause } => (
+                match cause {
+                    Some(DerivationExecutionCause::Cancelled) => CodeQueryDiagnosticCode::Cancelled,
+                    Some(DerivationExecutionCause::Budget) => {
+                        CodeQueryDiagnosticCode::ExecutionBudgetExhausted
+                    }
+                    Some(
+                        DerivationExecutionCause::Provider | DerivationExecutionCause::Snapshot,
+                    )
+                    | None => CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                },
+                reason.to_string(),
+            ),
+            QueryReadIncomplete::SemanticModelsPending => (
+                CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                "semantic models selected but not published".to_owned(),
+            ),
             QueryReadIncomplete::Cancelled => (
                 CodeQueryDiagnosticCode::Cancelled,
                 "query cancelled; already-produced results are partial".to_owned(),
@@ -409,7 +618,7 @@ pub fn fold_query_read_incompleteness(
             ),
             QueryReadIncomplete::SemanticEvidenceUnavailable(detail) => (
                 CodeQueryDiagnosticCode::SemanticAnalysisPartial,
-                detail.into_string(),
+                detail.to_string(),
             ),
             QueryReadIncomplete::StructureUnavailable(file) => (
                 CodeQueryDiagnosticCode::SemanticAnalysisPartial,
@@ -417,11 +626,11 @@ pub fn fold_query_read_incompleteness(
             ),
             QueryReadIncomplete::ArtifactUnavailable(detail) => (
                 CodeQueryDiagnosticCode::SemanticAnalysisPartial,
-                detail.into_string(),
+                detail.to_string(),
             ),
             QueryReadIncomplete::SemanticEvidenceGap(detail) => (
                 CodeQueryDiagnosticCode::SemanticAnalysisPartial,
-                detail.into_string(),
+                detail.to_string(),
             ),
         };
         push_deduplicated_diagnostic(diagnostics, code, incompleteness, message);
@@ -436,6 +645,7 @@ fn same_range(left: &Range, right: &Range) -> bool {
 /// Converting a workspace state alone deliberately supplies no run memo.
 #[derive(Clone)]
 pub struct SemanticFlowResources {
+    value_flow_retention: Option<Arc<brokk_bifrost_flow::value_flow::ValueFlowRetentionScope>>,
     state: brokk_bifrost_flow::FlowWorkspaceState,
     root_memo: Option<TypeFlowRootMemo>,
     /// The run's known identifier misspellings. Every execution that receives
@@ -446,11 +656,23 @@ pub struct SemanticFlowResources {
 impl SemanticFlowResources {
     pub fn from_workspace_state(state: &brokk_bifrost_flow::FlowWorkspaceState) -> Self {
         Self {
+            value_flow_retention: brokk_bifrost_analysis::analyzer::current_outer_request()
+                .and_then(|request| {
+                    brokk_bifrost_flow::value_flow::ValueFlowRetentionScope::current(&request)
+                }),
             state: state.clone(),
             root_memo: None,
             identifier_typos: None,
         }
     }
+    /// An already-bound request capability, safe to carry through read captures.
+    /// Unscoped callers receive None rather than a fresh transient authority.
+    pub fn value_flow_retention_scope(
+        &self,
+    ) -> Option<&Arc<brokk_bifrost_flow::value_flow::ValueFlowRetentionScope>> {
+        self.value_flow_retention.as_ref()
+    }
+
     pub fn with_root_memo(mut self, memo: Option<TypeFlowRootMemo>) -> Self {
         self.root_memo = memo;
         self
@@ -602,6 +824,11 @@ use expansions::{
 };
 use imports::*;
 use pipeline::*;
+#[cfg(any(test, feature = "test-support"))]
+pub use reached_sinks::{
+    CallReachabilityDemandProbe, call_reachability_global_reference_active,
+    with_global_call_reachability_reference,
+};
 use receiver::*;
 use relations::*;
 use render::*;
@@ -617,7 +844,8 @@ use typestate::{SemanticTypestateFindingValue, SemanticTypestateWitnessValue};
 #[cfg(any(test, feature = "test-support"))]
 pub use units::CallBindingCandidateProbe;
 pub use units::{
-    CallBindingReadReceipts, CodeQueryExecutionScope, CompleteEmptyFromOperandZero,
+    CallBindingReadReceipts, CallReachabilityOperands, CallReachabilitySinkProduct,
+    CallReachabilitySourceProduct, CodeQueryExecutionScope, CompleteEmptyFromOperandZero,
     CorruptIntersectProduct, IntersectContinuationResult, IntersectPrefixProduct, MergedLimit,
     MergedUnitRows, SelectorUnitExecution, UnitExecutionResult, UnitRow, UnitRowCapture,
     UnitRowDependencyMitigation, UnitRowEvidence, UnitRowField, UnitRowIdentities,
@@ -625,6 +853,7 @@ pub use units::{
     UnitRowItemRef, UnitRowItemRefValue, UnitRowItemTerminal, UnitRowKey, UnitRowProvenance,
     UnitRowProvenanceRef, UnitRowProvenanceStep, UnitRowReferenceFacets, UnitRowScalar,
     UnitRowUnknownField, continue_empty_operand_zero, continue_intersect_prefix,
+    execute_call_reachability_sink, execute_call_reachability_source,
     execute_code_query_selector_unit, execute_code_query_unit, execute_intersect_prefix,
     merge_unit_rows, merge_unit_rows_in_scope, plan_seed_files, push_skipped_unit_diagnostic,
     push_unit_budget_diagnostic, remaining_unit_limits, seed_file_order,
@@ -704,6 +933,7 @@ pub use results::CodeQueryEffectWork;
 pub use results::CodeQueryEnumDomain;
 pub use results::CodeQueryExecutionLimits;
 pub use results::CodeQueryExecutionWork;
+pub use results::CodeQueryExhaustedBudget;
 pub use results::CodeQueryExhaustedCharge;
 pub use results::CodeQueryExhaustedRoot;
 pub use results::CodeQueryExport;
@@ -819,6 +1049,7 @@ pub use results::CodeQueryTypestateWitnessStepKind;
 pub use results::CodeQueryTypestateWork;
 pub use results::CodeQueryValueFlowLimits;
 pub use results::CodeQueryValueFlowWork;
+pub use results::CodeQueryWriteLivenessOpenReason;
 pub use results::DepthBoundStatus;
 pub use results::DetailedCodeQueryDecoratedParameterEvidence;
 pub use results::DetailedCodeQueryDomain;
@@ -832,6 +1063,7 @@ pub use results::DetailedCodeQueryProvenanceRefEvidence;
 pub(crate) use results::DetailedCodeQueryProvenanceStepEvidence;
 pub use results::DetailedCodeQueryResult;
 pub use results::SUPPRESSED_ROW_SET_CAPABILITY;
+pub use results::SelectedPatternSourceEvidence;
 pub(crate) use results::UnionExecutionStrategy;
 pub use results::VALUE_FLOW_CAPABILITY;
 pub use results::code_query_completion;
@@ -844,6 +1076,7 @@ pub use results::{CodeQueryRewritePath, CodeQueryRewriteStep};
 pub use results::{CodeQueryRustMarkerImpl, CodeQueryRustMarkerUse};
 pub use results::{DiagnosticExecutionCause, Incompleteness};
 pub use results::{MAX_DIAGNOSTIC_LIST_MESSAGE_BYTES, render_exhausted_roots};
+pub use results::{UsesOmissionEvidence, UsesOmissionSite};
 pub use type_flow::{CodeQueryRootAllotment, TypeFlowRootMemo};
 
 /// Longest match/capture snippet reported inline; full content is always
@@ -852,6 +1085,21 @@ const SNIPPET_MAX_CHARS: usize = 160;
 const MAX_SCANNED_FILES: usize = 20_000;
 const MAX_SCANNED_SOURCE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_FACT_NODES: usize = 2_000_000;
+// Call-answer lane per expansion: declarations visited plus sites and
+// terminals returned (answer-determined, so reused and fresh units agree).
+// Census, posted on #11836: the largest Rust expansion used 5,983 answers
+// (Nushell, depth 3; Tantivy and Tokio below it) and the largest legacy-finder
+// expansion 31,696 (Commons Lang `append`, depth 1); 131,072 leaves 4x
+// headroom over the largest measured expansion.
+const MAX_CALL_ANSWERS: usize = 131_072;
+// Operational allowance for incoming Callers memo misses per expansion.
+// Legacy census at production 1 GiB retention: TypeORM 0.3.25's depth-3
+// helper reached 58,135 file events (131,072 allows 2.25x headroom);
+// commons-lang 3.17.0's append at depth 1 reached 552,313,241 source bytes
+// (1 GiB allows 1.94x headroom). Samples are censored by existing per-question
+// limits. Full census posted on #11836; re-evaluate and remove when #12043 lands.
+const MAX_CALL_SCANNED_FILES: usize = 131_072;
+const MAX_CALL_SCANNED_SOURCE_BYTES: usize = 1024 * 1024 * 1024;
 const MAX_PIPELINE_ROWS: usize = 50_000;
 const MAX_SEMANTIC_MATERIALIZED_FILES: usize = 256;
 const MAX_SEMANTIC_SOURCE_BYTES: usize = 16 * 1024 * 1024;
@@ -1069,6 +1317,7 @@ impl Default for CallSiteIdentityFacts {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CallSiteTargetEvidence {
+    static_proof: Option<StaticCallProof>,
     target_id: Option<String>,
     target_fq_name: Option<String>,
     boundary_kind: Option<&'static str>,
@@ -1294,6 +1543,7 @@ struct CallShapeValue {
     /// Exact external identity from the language resolver, independent of
     /// call-binding or semantic-model coverage.
     resolved_external_callee: Option<String>,
+    fixed_array_invocation: Option<crate::analyzer::semantic::call_binding::FixedArrayInvocation>,
 }
 
 impl CallShapeValue {
@@ -1455,6 +1705,7 @@ fn primary_range_key(range: &Range) -> (usize, usize, usize, usize) {
 }
 
 struct PipelineExpansion {
+    call_path_evidence: Option<CallPathEvidence>,
     value: PipelineValue,
     trace: Vec<(PipelineTraceValue, Option<PipelineVia>)>,
     budgeted: bool,
@@ -1661,6 +1912,34 @@ struct DetailedSemanticProjection<'a> {
     stable_id: String,
 }
 
+/// Where a seed row sits, for counting candidate sites.
+///
+/// This is deliberately coarser than [`PipelineKey`]: a binding row carries
+/// whether it is shadowed and where it was reached from, and an occurrence row
+/// carries its role, so one site can emit several rows with distinct keys. Every
+/// variant but `Fact` names the file, so the sites of two seed files are
+/// disjoint and the counts of per-file units add up to the whole execution's.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum SeedSite {
+    /// A syntax node of a file: structural matches, occurrences, paths.
+    Node(ProjectFile, u32),
+    /// A numbered row of one family in a file: scopes, bindings, generation
+    /// sites and exports.
+    Indexed(ProjectFile, SeedFamily, usize),
+    /// A row whose family has no file-local position. Such a seed is whole-plan
+    /// only, so it is never split across units. Boxed because a pipeline key is
+    /// large and a census holds one site per candidate.
+    Fact(Box<PipelineKey>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum SeedFamily {
+    Scope,
+    Binding,
+    GenerationSite,
+    Export,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum PipelineKey {
     StructuralMatch(ProjectFile, u32, Option<Range>),
@@ -1777,10 +2056,14 @@ impl PipelineValue {
             }
             // One branch that selects the match structurally makes it a fact,
             // whichever branch came first.
-            (Self::StructuralMatch(value), Self::StructuralMatch(other))
-                if value.fact_match.heuristic.is_some() && other.fact_match.heuristic.is_none() =>
-            {
-                Arc::make_mut(value).fact_match.heuristic = None;
+            (Self::StructuralMatch(value), Self::StructuralMatch(other)) => {
+                let fact_match = &mut Arc::make_mut(value).fact_match;
+                if other.fact_match.heuristic.is_none() {
+                    fact_match.heuristic = None;
+                }
+                fact_match
+                    .selected_pattern_source
+                    .merge(&other.fact_match.selected_pattern_source);
             }
             _ => {}
         }
@@ -1810,9 +2093,13 @@ impl PipelineValue {
             // Every branch must hold, so a heuristic branch leaves the
             // survivor a guess.
             (Self::StructuralMatch(value), Self::StructuralMatch(other)) => {
-                if value.fact_match.heuristic.is_none() && other.fact_match.heuristic.is_some() {
-                    Arc::make_mut(value).fact_match.heuristic = other.fact_match.heuristic;
+                let fact_match = &mut Arc::make_mut(value).fact_match;
+                if fact_match.heuristic.is_none() && other.fact_match.heuristic.is_some() {
+                    fact_match.heuristic = other.fact_match.heuristic;
                 }
+                fact_match
+                    .selected_pattern_source
+                    .merge(&other.fact_match.selected_pattern_source);
                 return;
             }
             (Self::ReferenceSite(value), Self::ReferenceSite(other)) => {
@@ -1830,13 +2117,53 @@ impl PipelineValue {
         self.merge_evidence(other);
     }
 
+    /// The site a seed emitted this row at. Only seed leaves call this.
+    fn seed_site(&self) -> SeedSite {
+        match self {
+            Self::StructuralMatch(seed) => SeedSite::Node(seed.file.clone(), seed.fact_match.node),
+            Self::Occurrence(value) => {
+                let key = value.key();
+                SeedSite::Node(key.file, key.node)
+            }
+            Self::QualifiedPath(value) => {
+                let key = value.key();
+                SeedSite::Node(key.file, key.terminal_node)
+            }
+            Self::LexicalScope(value) => {
+                let key = value.key();
+                SeedSite::Indexed(
+                    key.file,
+                    SeedFamily::Scope,
+                    usize::try_from(key.index).expect("a scope index fits in usize"),
+                )
+            }
+            Self::Binding(value) => {
+                let key = value.key();
+                SeedSite::Indexed(key.file, SeedFamily::Binding, key.index)
+            }
+            Self::GenerationSite(value) => {
+                let key = value.key();
+                SeedSite::Indexed(key.file, SeedFamily::GenerationSite, key.index)
+            }
+            Self::Export(value) => {
+                let key = value.key();
+                SeedSite::Indexed(key.file, SeedFamily::Export, key.index)
+            }
+            other => SeedSite::Fact(Box::new(other.key())),
+        }
+    }
+
     fn key(&self) -> PipelineKey {
         match self {
-            Self::StructuralMatch(seed) => PipelineKey::StructuralMatch(
-                seed.file.clone(),
-                seed.fact_match.node,
-                seed.fact_match.reported_range,
-            ),
+            Self::StructuralMatch(seed) => {
+                let native = seed.facts.node(seed.fact_match.node).range;
+                let effective = seed.fact_match.effective_range(&seed.facts);
+                PipelineKey::StructuralMatch(
+                    seed.file.clone(),
+                    seed.fact_match.node,
+                    (effective != native).then_some(effective),
+                )
+            }
             Self::Declaration(declaration) => PipelineKey::Declaration(declaration.clone()),
             Self::Semantic(value) => PipelineKey::Semantic(value.key()),
             Self::File(file) => PipelineKey::File(file.clone()),
@@ -2474,12 +2801,18 @@ struct ReferenceTraversalCache {
 
 #[derive(Default)]
 struct CallTraversalCache {
+    refusal_subject_limit: Option<usize>,
     isolated_call_binding_receipts: Option<units::CallBindingReadReceipts>,
     call_binding_receipts: Option<units::CallBindingReadReceipts>,
     owned_call_anchors: Option<Arc<OwnedCallAnchors>>,
     #[cfg(any(test, feature = "test-support"))]
     binding_candidate_probe: Option<CallBindingCandidateProbe>,
+    source_call_inventory:
+        CaptureScopedMemo<HashMap<ProjectFile, Arc<relations::SourceCallInventory>>>,
     incoming_file: Option<ProjectFile>,
+    // Reverse-in-file plans allow only filter/project after CallSitesTo
+    // (CodeQueryPlan::is_reverse_in_file), so file-local answers cannot
+    // reach a caller expansion in this execution-local memo.
     incoming: CaptureScopedMemo<HashMap<CodeUnit, CallRelationResult>>,
     outgoing: CaptureScopedMemo<HashMap<CodeUnit, CallRelationResult>>,
     reported_incoming: HashSet<CodeUnit>,
@@ -2492,6 +2825,9 @@ struct CallTraversalCache {
     reported_suppressed_shapes: HashSet<String>,
     /// Advisory frontier diagnostics are isolated; scans use the shared query budget.
     depth_probe: Option<Box<CallDepthProbeCache>>,
+    /// The execution dependences marked through this cache; the query joins
+    /// it into its reuse verdict.
+    reuse: ReuseVerdict,
 }
 
 #[derive(Default)]
@@ -2528,6 +2864,7 @@ impl CallTraversalCache {
 
 #[derive(Debug, Clone)]
 struct PipelineRow {
+    call_path_evidence: Option<CallPathEvidence>,
     value: PipelineValue,
     traces: Vec<PipelineTrace>,
     provenance_truncated: bool,
@@ -2543,14 +2880,74 @@ struct CachedSourceCoordinates {
 }
 
 type CachedFileDeclarations = Arc<Vec<(CodeUnit, Vec<Range>)>>;
+/// Work to certify source-owner uniqueness shares the query's provenance lane.
+struct ProcedureOwnerWork {
+    used: usize,
+    limit: usize,
+    refused: Option<usize>,
+    cancelled: bool,
+    cancellation: Option<CancellationToken>,
+}
+
+impl Default for ProcedureOwnerWork {
+    fn default() -> Self {
+        Self::new(
+            0,
+            CodeQueryExecutionLimits::default().max_pipeline_rows,
+            None,
+        )
+    }
+}
+
+impl ProcedureOwnerWork {
+    fn new(used: usize, limit: usize, cancellation: Option<CancellationToken>) -> Self {
+        Self {
+            used,
+            limit,
+            refused: None,
+            cancelled: false,
+            cancellation,
+        }
+    }
+
+    fn charge(&mut self, amount: usize) -> bool {
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            self.cancelled = true;
+        }
+        if self.cancelled || self.refused.is_some() {
+            return false;
+        }
+        let attempted = self.used.saturating_add(amount);
+        if attempted > self.limit {
+            self.refused = Some(attempted);
+            return false;
+        }
+        self.used = attempted;
+        true
+    }
+}
+
+type CachedProcedureSourceOwners = (
+    Arc<FileFacts>,
+    HashMap<(usize, usize), CodeQueryStableOwnerCandidate>,
+);
 
 #[derive(Default)]
 struct PipelineRenderCache {
     rendered_capture_bytes: usize,
     capture_truncated_rows: usize,
     sources: HashMap<ProjectFile, Option<CachedSourceCoordinates>>,
+    procedure_owners: HashMap<ProjectFile, CachedProcedureSourceOwners>,
+    procedure_owner_work: ProcedureOwnerWork,
+    procedure_owner_target_facts: HashMap<ProjectFile, Arc<FileFacts>>,
+    procedure_owner_unavailable: HashSet<ProjectFile>,
     conflicting_sources: HashSet<ProjectFile>,
     declaration_ranges: HashMap<DeclarationValue, (Option<CodeQueryRange>, Option<git2::Oid>)>,
+    /// Keyed by `(file, start_byte, end_byte)` so same-line siblings never alias.
     enclosing_units: HashMap<(ProjectFile, usize, usize), Option<CodeUnit>>,
     file_declarations: traversal_memo::TraversalMemo<ProjectFile, CachedFileDeclarations>,
     source_loads_sealed: bool,
@@ -2710,17 +3107,21 @@ impl PipelineRenderCache {
         range
     }
 
-    fn enclosing_unit_for_lines(
+    fn enclosing_unit_for_bytes(
         &mut self,
         analyzer: &dyn IAnalyzer,
         file: &ProjectFile,
-        start_line: usize,
-        end_line: usize,
+        start_byte: usize,
+        end_byte: usize,
     ) -> Option<CodeUnit> {
+        assert!(
+            start_byte <= end_byte,
+            "enclosing byte span end ({end_byte}) precedes start ({start_byte})"
+        );
         if !record_render_source_read(analyzer, file, analyzer.indexed_blob_oid(file)) {
             return None;
         }
-        let cache_key = (file.clone(), start_line, end_line);
+        let cache_key = (file.clone(), start_byte, end_byte);
         // An enclosing-unit hit consumes the declaration list's receipt too.
         let (declarations, _) = traversal_memo::derive(
             &self.file_declarations,
@@ -2747,12 +3148,12 @@ impl PipelineRenderCache {
             return enclosing.clone();
         }
         let enclosing =
-            brokk_bifrost_core::analyzer::code_unit_index::narrowest_enclosing_by_lines(
+            brokk_bifrost_core::analyzer::code_unit_index::narrowest_enclosing_by_bytes(
                 declarations
                     .iter()
                     .map(|(code_unit, ranges)| (code_unit, ranges.iter().copied())),
-                start_line,
-                end_line,
+                start_byte,
+                end_byte,
             )
             .cloned();
         self.enclosing_units.insert(cache_key, enclosing.clone());
@@ -2861,15 +3262,11 @@ pub fn execute_workspace_request_with_registration_limits(
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
 ) -> CodeQueryResponse {
-    let value_flow_registrations = ValueFlowPlanRegistrationSet::default();
-    let taint_registrations = TaintResultRegistrationSet::default();
-    execute_workspace_request_with_all_analysis_registrations(
+    execute_workspace_request_with_registrations_and_limits(
         workspace,
         flow_state,
         workspace_generation,
         registrations,
-        &value_flow_registrations,
-        &taint_registrations,
         query,
         limits,
         None,
@@ -2878,6 +3275,17 @@ pub fn execute_workspace_request_with_registration_limits(
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct CodeQueryExecutionBudget {
+    // Query-wide physical relation scans; excluded from content admission.
+    call_scanned_files: usize,
+    call_scanned_source_bytes: usize,
+    // Incoming-only operational work, reset at each expansion; never admission.
+    callers_scanned_files: usize,
+    callers_scanned_source_bytes: usize,
+    call_examined_references: usize,
+    call_declarations: usize,
+    call_sites: usize,
+    call_terminals: usize,
+    refused_lane: Option<(usize, usize, usize, usize)>,
     scanned_files: usize,
     scanned_source_bytes: usize,
     fact_nodes: usize,
@@ -2892,6 +3300,27 @@ struct CodeQueryExecutionBudget {
 impl CodeQueryExecutionBudget {
     fn saturating_sub(self, earlier: Self) -> Self {
         Self {
+            call_scanned_files: self
+                .call_scanned_files
+                .saturating_sub(earlier.call_scanned_files),
+            call_scanned_source_bytes: self
+                .call_scanned_source_bytes
+                .saturating_sub(earlier.call_scanned_source_bytes),
+            callers_scanned_files: self
+                .callers_scanned_files
+                .saturating_sub(earlier.callers_scanned_files),
+            callers_scanned_source_bytes: self
+                .callers_scanned_source_bytes
+                .saturating_sub(earlier.callers_scanned_source_bytes),
+            call_examined_references: self
+                .call_examined_references
+                .saturating_sub(earlier.call_examined_references),
+            call_declarations: self
+                .call_declarations
+                .saturating_sub(earlier.call_declarations),
+            call_sites: self.call_sites.saturating_sub(earlier.call_sites),
+            call_terminals: self.call_terminals.saturating_sub(earlier.call_terminals),
+            refused_lane: self.refused_lane,
             scanned_files: self.scanned_files.saturating_sub(earlier.scanned_files),
             scanned_source_bytes: self
                 .scanned_source_bytes
@@ -2918,6 +3347,27 @@ impl CodeQueryExecutionBudget {
 
     fn saturating_add(self, other: Self) -> Self {
         Self {
+            call_scanned_files: self
+                .call_scanned_files
+                .saturating_add(other.call_scanned_files),
+            call_scanned_source_bytes: self
+                .call_scanned_source_bytes
+                .saturating_add(other.call_scanned_source_bytes),
+            callers_scanned_files: self
+                .callers_scanned_files
+                .saturating_add(other.callers_scanned_files),
+            callers_scanned_source_bytes: self
+                .callers_scanned_source_bytes
+                .saturating_add(other.callers_scanned_source_bytes),
+            call_examined_references: self
+                .call_examined_references
+                .saturating_add(other.call_examined_references),
+            call_declarations: self
+                .call_declarations
+                .saturating_add(other.call_declarations),
+            call_sites: self.call_sites.saturating_add(other.call_sites),
+            call_terminals: self.call_terminals.saturating_add(other.call_terminals),
+            refused_lane: self.refused_lane.or(other.refused_lane),
             scanned_files: self.scanned_files.saturating_add(other.scanned_files),
             scanned_source_bytes: self
                 .scanned_source_bytes
@@ -2940,13 +3390,16 @@ impl CodeQueryExecutionBudget {
         }
     }
 
-    fn fair_lanes(self) -> [usize; 5] {
+    fn fair_lanes(self) -> [usize; 6] {
         [
             self.scanned_files,
             self.scanned_source_bytes,
             self.fact_nodes.saturating_add(self.examined_references),
             self.pipeline_rows.max(self.provenance_steps),
             self.retained_evidence_bytes,
+            self.call_declarations
+                .saturating_add(self.call_sites)
+                .saturating_add(self.call_terminals),
         ]
     }
 }
@@ -3086,23 +3539,24 @@ impl FairSeedBudgetCoordinator {
         self.limits.max_pipeline_rows
     }
 
-    fn limits_lanes(&self) -> [usize; 5] {
+    fn limits_lanes(&self) -> [usize; 6] {
         [
             self.limits.max_scanned_files,
             self.limits.max_scanned_source_bytes,
             self.limits.max_fact_nodes,
             self.limits.max_pipeline_rows,
             self.limits.semantic.max_retained_bytes.min(8 * 1024 * 1024),
+            self.limits.max_call_answers,
         ]
     }
 
-    fn branch_allowance(&self, state: &FairSeedBudgetState, branch: usize) -> [usize; 5] {
+    fn branch_allowance(&self, state: &FairSeedBudgetState, branch: usize) -> [usize; 6] {
         let base = self.base.fair_lanes();
         let limits = self.limits_lanes();
         let mut used = base;
         for earlier in 0..branch {
             let remaining = self.branch_count.saturating_sub(earlier).max(1);
-            let earlier_allowance: [usize; 5] = std::array::from_fn(|lane| {
+            let earlier_allowance: [usize; 6] = std::array::from_fn(|lane| {
                 limits[lane].saturating_sub(used[lane]).div_ceil(remaining)
             });
             let actual = state.usage[earlier].fair_lanes();
@@ -3168,6 +3622,8 @@ impl FairSeedBudgetLease {
             .expect("fair seed budget lock poisoned");
         loop {
             if state.failed {
+                // A cancelled admission cancels the branch's execution, which
+                // the query returns as its verdict.
                 brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
                 return FairSeedBudgetAdmission::Cancelled;
             }
@@ -3196,13 +3652,26 @@ impl FairSeedBudgetLease {
                     brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
                         used, limit,
                     )
-                    .allows(0);
+                    .try_allow(0)
+                    .ok();
                 }
-                return FairSeedBudgetAdmission::Rejected(self.coordinator.global_projected(
-                    &state,
-                    self.branch,
-                    local_delta,
-                ));
+                let mut projected =
+                    self.coordinator
+                        .global_projected(&state, self.branch, local_delta);
+                projected.refused_lane = requested
+                    .iter()
+                    .zip(allowance)
+                    .enumerate()
+                    .find(|(_, (used, limit))| **used > *limit)
+                    .map(|(lane, (used, limit))| {
+                        (
+                            lane,
+                            state.usage[self.branch].fair_lanes()[lane],
+                            *used,
+                            limit,
+                        )
+                    });
+                return FairSeedBudgetAdmission::Rejected(projected);
             }
             let wait_started = Instant::now();
             self.coordinator.waiters.fetch_add(1, Ordering::AcqRel);
@@ -3242,6 +3711,7 @@ impl FairSeedBudgetLease {
                 return FairSeedBudgetSharedAdmission::AlreadyCharged;
             }
             if state.failed {
+                // As in `admit`: the cancelled execution carries the verdict.
                 brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
                 return FairSeedBudgetSharedAdmission::Cancelled;
             }
@@ -3271,13 +3741,26 @@ impl FairSeedBudgetLease {
                     brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
                         used, limit,
                     )
-                    .allows(0);
+                    .try_allow(0)
+                    .ok();
                 }
-                return FairSeedBudgetSharedAdmission::Rejected(self.coordinator.global_projected(
-                    &state,
-                    self.branch,
-                    local_delta,
-                ));
+                let mut projected =
+                    self.coordinator
+                        .global_projected(&state, self.branch, local_delta);
+                projected.refused_lane = requested
+                    .iter()
+                    .zip(allowance)
+                    .enumerate()
+                    .find(|(_, (used, limit))| **used > *limit)
+                    .map(|(lane, (used, limit))| {
+                        (
+                            lane,
+                            state.usage[self.branch].fair_lanes()[lane],
+                            *used,
+                            limit,
+                        )
+                    });
+                return FairSeedBudgetSharedAdmission::Rejected(projected);
             }
             let wait_started = Instant::now();
             self.coordinator.waiters.fetch_add(1, Ordering::AcqRel);
@@ -3324,6 +3807,7 @@ struct QueryFileInventory {
     captured: std::cell::OnceCell<(
         Vec<ProjectFile>,
         brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadReceipt,
+        ReuseVerdict,
     )>,
 }
 
@@ -3334,37 +3818,49 @@ impl QueryFileInventory {
         list: impl FnOnce() -> Vec<ProjectFile>,
     ) -> &[ProjectFile] {
         let mut filled = false;
-        let (files, receipt) = self.captured.get_or_init(|| {
+        let (files, receipt, _) = self.captured.get_or_init(|| {
             filled = true;
-            brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadReceipt::capture(
-                analyzer,
-                || {
-                    let scope = crate::analyzer::AnalyzerQueryScope::new(analyzer);
-                    let stopped_before = analyzer
-                        .active_query_cancellation()
-                        .is_some_and(|token| token.is_cancelled());
-                    let files = list();
-                    if stopped_before
-                        || analyzer
+            let ((files, reuse), receipt) =
+                brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadReceipt::capture(
+                    analyzer,
+                    || {
+                        let mut reuse = ReuseVerdict::Content;
+                        let scope = crate::analyzer::AnalyzerQueryScope::new(analyzer);
+                        let stopped_before = analyzer
                             .active_query_cancellation()
-                            .is_some_and(|token| token.is_cancelled())
-                        || scope.store_error().is_some()
-                        || scope.read_completion().is_err()
-                    {
-                        analyzer.mark_execution_dependent();
-                    }
-                    files
-                },
-            )
+                            .is_some_and(|token| token.is_cancelled());
+                        let files = list();
+                        if stopped_before
+                            || analyzer
+                                .active_query_cancellation()
+                                .is_some_and(|token| token.is_cancelled())
+                            || scope.store_error().is_some()
+                            || scope.read_completion().is_err()
+                        {
+                            analyzer.mark_execution_dependent();
+                            reuse = EXECUTION_DEPENDENT;
+                        }
+                        (files, reuse)
+                    },
+                );
+            (files, receipt, reuse)
         });
         if !filled {
             receipt.replay(analyzer);
         }
         files
     }
+
+    /// The listing's verdict, `Content` while nothing has listed it.
+    fn reuse(&self) -> ReuseVerdict {
+        self.captured
+            .get()
+            .map_or(ReuseVerdict::Content, |(_, _, reuse)| *reuse)
+    }
 }
 
 struct QueryExecutionState<'a> {
+    sink_demand: Option<reached_sinks::SinkDemandExecution>,
     analyzer: &'a dyn IAnalyzer,
     workspace: Option<&'a WorkspaceAnalyzer>,
     cancellation: Option<&'a CancellationToken>,
@@ -3377,6 +3873,10 @@ struct QueryExecutionState<'a> {
     /// Rows each plan operator emitted, indexed by its physical plan node.
     /// `max_step_outputs` is enforced per step and has no other counter.
     step_outputs: Vec<u64>,
+    /// The distinct sites the plan's anchor seeds emitted, for
+    /// `CodeQueryBudgetedWork::candidate_sites`. Parallel union branches own
+    /// forks of this set and the parent merges them back.
+    candidate_sites: HashSet<SeedSite>,
     receiver_budget_override: Option<ReceiverAnalysisBudget>,
     budget: CodeQueryExecutionBudget,
     depth_bound_status: Option<DepthBoundStatus>,
@@ -3430,6 +3930,8 @@ struct QueryExecutionState<'a> {
     /// receiver steps that resolve additional selected native sites.
     receiver_service: Option<ReceiverQueryService<'a>>,
     semantic: Option<SemanticQueryContext<'a>>,
+    semantic_factory: Box<dyn Fn() -> Option<SemanticQueryContext<'a>> + Send + Sync + 'a>,
+    call_shape_work: CodeQuerySemanticWork,
     import_graph: Option<RequestLocalDirectImportGraph>,
     import_graph_content: Option<WorkspaceContentIdentity>,
     direct_import_layer: Option<DerivedLayerHandle>,
@@ -3443,7 +3945,14 @@ struct QueryExecutionState<'a> {
     access_failure: Option<String>,
     parallel_seed_budget: Option<FairSeedBudgetLease>,
     scheduler_workers: usize,
+    /// The execution dependences this execution marked, joined as each is
+    /// marked. The result returns it as its reuse verdict.
+    reuse: ReuseVerdict,
 }
+
+/// The verdict of every execution dependence RQL marks today: none of them is
+/// a refused budget charge.
+const EXECUTION_DEPENDENT: ReuseVerdict = ReuseVerdict::ExecutionDependent(ExecutionCause::Other);
 
 #[derive(Clone, Copy)]
 enum DirectImportAccess<'a> {
@@ -3492,7 +4001,9 @@ struct PlanExecution {
 enum PlanStop {
     /// The node produced every row its caps allowed.
     Ran,
-    /// A cap or budget bounded the rows.
+    /// A configured terminal result cap bounded otherwise complete rows.
+    ConfiguredCap,
+    /// A budget or unclassified stop bounded the rows.
     Truncated,
     /// An intermediate authored pipeline step exhausted its budget, so the
     /// remaining steps in that same suffix must not run.
@@ -3544,8 +4055,14 @@ impl PlanExecution {
     /// Record a cap or budget stop. A halted or cancelled execution is
     /// already truncated and keeps its stronger stop.
     fn mark_truncated(&mut self) {
-        if self.stop == PlanStop::Ran {
+        if matches!(self.stop, PlanStop::Ran | PlanStop::ConfiguredCap) {
             self.stop = PlanStop::Truncated;
+        }
+    }
+
+    fn mark_configured_cap(&mut self) {
+        if self.stop == PlanStop::Ran {
+            self.stop = PlanStop::ConfiguredCap;
         }
     }
 
@@ -3556,12 +4073,14 @@ impl PlanExecution {
 
 struct ParallelSeedBranchResult {
     execution: PlanExecution,
+    candidate_sites: HashSet<SeedSite>,
     diagnostics: Vec<CodeQueryDiagnostic>,
     seed_cache: HashMap<String, CachedSeedExecution>,
     cache_profile: Option<QueryCacheProfile>,
     operators: Vec<QueryOperatorProfile>,
     access_path: QueryAccessPathProfile,
     access_failure: Option<String>,
+    reuse: ReuseVerdict,
 }
 
 struct ParallelUnionExecution {
@@ -3811,6 +4330,7 @@ fn query_plan_has_explicit_java_only_seeds(plan: &CodeQueryPlan) -> bool {
         CodeQueryPlanSource::Exports(seed) => explicit_java_only(&seed.languages),
         CodeQueryPlanSource::DependencyEvidence(_)
         | CodeQueryPlanSource::ConfigurationFacts(_)
+        | CodeQueryPlanSource::CallReachability(_)
         | CodeQueryPlanSource::Correlate(_)
         | CodeQueryPlanSource::RequireBoth(_) => false,
         CodeQueryPlanSource::Set { branches, .. } => {
@@ -3838,6 +4358,7 @@ fn query_plan_has_retryable_branch_local_edges_of(plan: &CodeQueryPlan) -> bool 
                 | CodeQueryPlanSource::Exports(_)
                 | CodeQueryPlanSource::DependencyEvidence(_)
                 | CodeQueryPlanSource::ConfigurationFacts(_)
+                | CodeQueryPlanSource::CallReachability(_)
                 | CodeQueryPlanSource::Correlate(_)
                 | CodeQueryPlanSource::RequireBoth(_) => false,
             }
@@ -3854,6 +4375,7 @@ fn query_plan_has_retryable_branch_local_edges_of(plan: &CodeQueryPlan) -> bool 
         | CodeQueryPlanSource::Exports(_)
         | CodeQueryPlanSource::DependencyEvidence(_)
         | CodeQueryPlanSource::ConfigurationFacts(_)
+        | CodeQueryPlanSource::CallReachability(_)
         | CodeQueryPlanSource::Correlate(_)
         | CodeQueryPlanSource::RequireBoth(_) => false,
     }
@@ -3953,16 +4475,22 @@ pub fn execute_workspace_request_with_registrations_and_limits(
     limits: CodeQueryExecutionLimits,
     cancellation: Option<&CancellationToken>,
 ) -> CodeQueryResponse {
-    let value_flow_registrations = ValueFlowPlanRegistrationSet::default();
-    execute_workspace_request_with_analysis_registrations(
-        workspace,
-        flow_state,
-        workspace_generation,
-        registrations,
-        &value_flow_registrations,
+    let taint_registrations = TaintResultRegistrationSet::default();
+    let scope = AnalyzerQueryScope::capturing_read_incompleteness(workspace.analyzer());
+    execute_request_internal(
+        workspace.analyzer(),
+        &scope,
+        Some(workspace),
+        Some(flow_state),
         query,
         limits,
         cancellation,
+        Some((
+            workspace_generation,
+            registrations,
+            None,
+            &taint_registrations,
+        )),
     )
 }
 
@@ -4015,7 +4543,7 @@ pub fn execute_workspace_request_with_all_analysis_registrations(
         Some((
             workspace_generation,
             registrations,
-            value_flow_registrations,
+            Some(value_flow_registrations),
             taint_registrations,
         )),
     )
@@ -4044,7 +4572,7 @@ fn execute_request_internal(
     registrations: Option<(
         u64,
         &ProtocolRegistrationSet,
-        &ValueFlowPlanRegistrationSet,
+        Option<&ValueFlowPlanRegistrationSet>,
         &TaintResultRegistrationSet,
     )>,
 ) -> CodeQueryResponse {
@@ -4084,6 +4612,16 @@ fn execute_request_internal(
             &CodeQueryExecutionScope::whole_workspace(),
         ));
     }
+    if let Some((_, _, Some(value_flow_registrations), _)) = registrations
+        && let Some(request) = brokk_bifrost_analysis::analyzer::current_outer_request()
+        && let Err(error) = value_flow_registrations.bind_retention_scope(&request)
+    {
+        return CodeQueryResponse::Results(unexecuted_depth_result(
+            query_analysis_context_error_result(session_subset(analyzer),
+                crate::structural::analysis_context::QueryAnalysisContextError::ValueFlowRetentionUnavailable { detail: error.to_string().into_boxed_str() }),
+            query, &CodeQueryExecutionScope::whole_workspace(),
+        ));
+    }
     let analysis_context = if query.execution_mode == CodeQueryExecutionMode::Explain {
         None
     } else if let (
@@ -4097,13 +4635,18 @@ fn execute_request_internal(
         let summaries = flow_state
             .expect("workspace query execution requires host-owned flow state")
             .typestate_summaries(workspace);
-        match QueryAnalysisContext::new_with_all_registrations_and_summaries(
+        let value_flow_retention = brokk_bifrost_analysis::analyzer::current_outer_request()
+            .and_then(|request| {
+                brokk_bifrost_flow::value_flow::ValueFlowRetentionScope::current(&request)
+            });
+        match QueryAnalysisContext::import_registrations_and_summaries(
             workspace,
             workspace_generation,
             registrations,
             &requested,
             value_flow_registrations,
             &requested_value_flows,
+            value_flow_retention,
             taint_registrations,
             &requested_taint_results,
             QueryAnalysisValidationLimits::new(
@@ -5157,7 +5700,13 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
             files.dedup();
             files
         };
-        relation_capabilities::preflight(&query.plan, &selected_files, workspace, &mut diagnostics);
+        relation_capabilities::preflight(
+            &query.plan,
+            &selected_files,
+            analyzer,
+            workspace,
+            &mut diagnostics,
+        );
     }
     let scanned_languages = if physical_plan.needs_scanned_languages() {
         scope
@@ -5169,68 +5718,13 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
     } else {
         HashSet::default()
     };
-    let mut state = QueryExecutionState {
-        analyzer,
-        workspace,
-        cancellation,
-        scope: scope.clone(),
-        scanned_languages,
-        step_outputs: vec![0; physical_plan.node_count()],
-        receiver_budget_override,
-        budget: CodeQueryExecutionBudget::default(),
-        depth_bound_status: (scope.computes_depth_bound_status()
-            && query_plan_has_bounded_call_step(&query.plan))
-        .then_some(DepthBoundStatus::NotReached),
-        depth_answers: Vec::new(),
-        seed_cache: CaptureScopedMemo::default(),
-        seed_scan_ledger: SeedScanLedger::default(),
-        indexed_declarations: IndexedDeclarations::default(),
-        reference_cache: ReferenceTraversalCache::default(),
-        occurrence_cache,
-        environment_cache,
-        configuration_cache: ConfigurationFactsTraversalCache::default(),
-        materialization_cache: materialization::MaterializationTraversalCache::default(),
-        edge_cache,
-        flow_state_cache: FlowStateTraversalCache::new(active_semantic_model_snapshot.clone()),
-        control_relation_cache: ControlRelationTraversalCache::default(),
-        branch_relation_cache: BranchRelationTraversalCache::default(),
-        cpp_expression_cache: HashMap::default(),
-        cpp_class_fact_cache: HashMap::default(),
-        cpp_class_declaration_cache: HashMap::default(),
-        rust_marker_impls_cache: rust_marker_impls::RustMarkerImplsCache::default(),
-        callable_metrics_cache: HashMap::default(),
-        failure_handler_state_cache: FailureHandlerStateCache::default(),
-        topology_cache: TopologyTraversalCache::default(),
-        rewrite_path_cache: RewritePathTraversalCache::default(),
-        path_cache: PathTraversalCache::default(),
-        call_cache: {
-            let cache = CallTraversalCache::with_active_semantic_models(
-                active_models.clone(),
-                shared_call_target_outcomes,
-            );
-            let cache = CallTraversalCache {
-                owned_call_anchors,
-                call_binding_receipts,
-                isolated_call_binding_receipts,
-                ..cache
-            };
-            #[cfg(any(test, feature = "test-support"))]
-            let cache = CallTraversalCache {
-                binding_candidate_probe,
-                ..cache
-            };
-            CallTraversalCache {
-                incoming_file,
-                ..cache
-            }
-        },
-        call_binding_identity_request,
-        comparison_chain_operators: HashMap::default(),
-        receiver_facts: HashMap::default(),
-        receiver_service: None,
-        semantic: workspace
-            .filter(|_| requires_semantic || optional_call_site_identity)
-            .map(|workspace| match semantic_continuation {
+    let root_memo = semantic_flow_resources
+        .as_ref()
+        .and_then(|resources| resources.root_memo.clone());
+    let factory_models = active_semantic_model_snapshot.clone();
+    let semantic_factory = Box::new(move || {
+        workspace
+            .map(|workspace| match semantic_continuation.as_ref() {
                 Some(continuation) => SemanticQueryContext::new_with_parent_scope(
                     workspace,
                     cancellation,
@@ -5240,15 +5734,15 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
                     limits.taint,
                     workspace_generation,
                     analysis_context,
-                    active_semantic_model_snapshot,
+                    factory_models.clone(),
                     value_flow_cache.clone(),
                     type_flow_summaries.clone(),
                     &continuation.parent_scope,
                     continuation.child_semantic_limits,
                     continuation.root_allotment,
-                    continuation.execution_before,
-                    continuation.execution_child,
-                    continuation.artifact_leases,
+                    continuation.execution_before.clone(),
+                    continuation.execution_child.clone(),
+                    continuation.artifact_leases.clone(),
                 ),
                 None => SemanticQueryContext::new_with_analysis(
                     workspace,
@@ -5259,9 +5753,9 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
                     limits.taint,
                     workspace_generation,
                     analysis_context,
-                    active_semantic_model_snapshot,
-                    value_flow_cache,
-                    type_flow_summaries,
+                    factory_models.clone(),
+                    value_flow_cache.clone(),
+                    type_flow_summaries.clone(),
                     CodeQueryRootAllotment::from_execution_limits(&limits),
                 ),
             })
@@ -5269,26 +5763,99 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
                 semantic.set_value_flow_witness_demand(pipeline::query_plan_requests_witnesses(
                     &query.plan,
                 ));
+                semantic.set_root_memo(root_memo.clone());
                 semantic
+            })
+    });
+    // Built in its own frame and boxed: a debug build would otherwise keep the
+    // struct literal's temporaries, and the state itself, in this frame for
+    // the whole of `execute_plan` (#11691).
+    let build_state = || {
+        Box::new(QueryExecutionState {
+            sink_demand: None,
+            analyzer,
+            workspace,
+            cancellation,
+            scope: scope.clone(),
+            scanned_languages,
+            step_outputs: vec![0; physical_plan.node_count()],
+            candidate_sites: HashSet::default(),
+            receiver_budget_override,
+            budget: CodeQueryExecutionBudget::default(),
+            depth_bound_status: (scope.computes_depth_bound_status()
+                && query_plan_has_bounded_call_step(&query.plan))
+            .then_some(DepthBoundStatus::NotReached),
+            depth_answers: Vec::new(),
+            seed_cache: CaptureScopedMemo::default(),
+            seed_scan_ledger: SeedScanLedger::default(),
+            indexed_declarations: IndexedDeclarations::default(),
+            reference_cache: ReferenceTraversalCache::default(),
+            occurrence_cache,
+            environment_cache,
+            configuration_cache: ConfigurationFactsTraversalCache::default(),
+            materialization_cache: materialization::MaterializationTraversalCache::default(),
+            edge_cache,
+            flow_state_cache: FlowStateTraversalCache::new(active_semantic_model_snapshot.clone()),
+            control_relation_cache: ControlRelationTraversalCache::default(),
+            branch_relation_cache: BranchRelationTraversalCache::default(),
+            cpp_expression_cache: HashMap::default(),
+            cpp_class_fact_cache: HashMap::default(),
+            cpp_class_declaration_cache: HashMap::default(),
+            rust_marker_impls_cache: rust_marker_impls::RustMarkerImplsCache::default(),
+            callable_metrics_cache: HashMap::default(),
+            failure_handler_state_cache: FailureHandlerStateCache::default(),
+            topology_cache: TopologyTraversalCache::default(),
+            rewrite_path_cache: RewritePathTraversalCache::default(),
+            path_cache: PathTraversalCache::default(),
+            call_cache: {
+                let cache = CallTraversalCache::with_active_semantic_models(
+                    active_models.clone(),
+                    shared_call_target_outcomes,
+                );
+                let cache = CallTraversalCache {
+                    owned_call_anchors,
+                    call_binding_receipts,
+                    isolated_call_binding_receipts,
+                    ..cache
+                };
+                #[cfg(any(test, feature = "test-support"))]
+                let cache = CallTraversalCache {
+                    binding_candidate_probe,
+                    ..cache
+                };
+                CallTraversalCache {
+                    incoming_file,
+                    ..cache
+                }
+            },
+            call_binding_identity_request,
+            comparison_chain_operators: HashMap::default(),
+            receiver_facts: HashMap::default(),
+            receiver_service: None,
+            semantic: (requires_semantic || optional_call_site_identity)
+                .then(&semantic_factory)
+                .flatten(),
+            semantic_factory,
+            call_shape_work: CodeQuerySemanticWork::default(),
+            import_graph: None,
+            import_graph_content: None,
+            direct_import_layer: None,
+            direct_import_layer_content: None,
+            deferred_derived_builds: HashSet::default(),
+            cache_profile: capture_profile.then(QueryCacheProfile::default),
+            profile: capture_profile.then(|| {
+                QueryExecutionProfile::new(&physical_plan, planning_ns, scheduler_workers)
             }),
-        import_graph: None,
-        import_graph_content: None,
-        direct_import_layer: None,
-        direct_import_layer_content: None,
-        deferred_derived_builds: HashSet::default(),
-        cache_profile: capture_profile.then(QueryCacheProfile::default),
-        profile: capture_profile
-            .then(|| QueryExecutionProfile::new(&physical_plan, planning_ns, scheduler_workers)),
-        retained_value_census: capture_profile.then(QueryRetainedValueCensus::default),
-        structural_index_session: QueryStructuralIndexSession::default(),
-        access_mode,
-        access_failure: None,
-        parallel_seed_budget: None,
-        scheduler_workers,
+            retained_value_census: capture_profile.then(QueryRetainedValueCensus::default),
+            structural_index_session: QueryStructuralIndexSession::default(),
+            access_mode,
+            access_failure: None,
+            parallel_seed_budget: None,
+            scheduler_workers,
+            reuse: ReuseVerdict::Content,
+        })
     };
-    if let Some(semantic) = state.semantic.as_mut() {
-        semantic.set_root_memo(semantic_flow_resources.and_then(|resources| resources.root_memo));
-    }
+    let mut state = build_state();
     let python_gate_file = python_absent_member_file(&query.plan, || {
         state
             .scope
@@ -5310,35 +5877,42 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
         &mut diagnostics,
         &mut profile_branch,
     );
-    // The root `Limit` operator (query.limit, e.g. a policy's
-    // `budget.max_findings()` override) is the only node in the plan that is
-    // ever handed a terminal row cap: it names its own truncation via
-    // `push_truncation_diagnostic` whenever it cuts its child's rows down to
-    // `count`. Nothing else in the plan is guaranteed to explain a cap it did
-    // not itself enforce -- issue #2779 is exactly that gap, discovered as a
-    // policy selector that truncated with `truncated=true` and zero
-    // diagnostics, which downstream collapsed to a bare, unexplained
-    // `PartialDiscovery`. This is a defense-in-depth backstop, not the
-    // primary reporting path: see `needs_root_terminal_cap_diagnostic`.
-    if needs_root_terminal_cap_diagnostic(
-        execution.is_truncated(),
-        execution.is_cancelled(),
-        execution.rows.len(),
-        query.limit,
-        &diagnostics,
-    ) {
-        push_truncation_diagnostic(&mut diagnostics, &state.budget, query.limit);
-    }
-    if !state
-        .structural_index_session
-        .selections_are_current(|content| state.analyzer.workspace_content_matches(content))
-    {
-        execution.rows.clear();
-        execution.mark_truncated();
-        state
-            .access_failure
-            .get_or_insert_with(|| "workspace content changed before result rendering".to_string());
-        diagnostics.push(QueryExecutionState::diagnostic(analyzer, CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+    // Rendering runs in its own frame, for the same reason: its locals are dead
+    // before the plan runs again, but a debug build keeps them under it.
+    let render = || {
+        // The root `Limit` operator (query.limit, e.g. a policy's
+        // `budget.max_findings()` override) is the only node in the plan that is
+        // ever handed a terminal row cap: it names its own truncation via
+        // `push_truncation_diagnostic` whenever it cuts its child's rows down to
+        // `count`. Nothing else in the plan is guaranteed to explain a cap it did
+        // not itself enforce -- issue #2779 is exactly that gap, discovered as a
+        // policy selector that truncated with `truncated=true` and zero
+        // diagnostics, which downstream collapsed to a bare, unexplained
+        // `PartialDiscovery`. This is a defense-in-depth backstop, not the
+        // primary reporting path: see `needs_root_terminal_cap_diagnostic`.
+        if needs_root_terminal_cap_diagnostic(
+            execution.is_truncated(),
+            execution.is_cancelled(),
+            execution.rows.len(),
+            query.limit,
+            &diagnostics,
+        ) {
+            push_truncation_diagnostic(&mut diagnostics, &state.budget, query.limit);
+        }
+        if !state
+            .structural_index_session
+            .selections_are_current(|content| state.analyzer.workspace_content_matches(content))
+        {
+            execution.rows.clear();
+            execution.mark_truncated();
+            state.access_failure.get_or_insert_with(|| {
+                "workspace content changed before result rendering".to_string()
+            });
+            diagnostics.push(QueryExecutionState::diagnostic(analyzer, CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
             incompleteness: brokk_bifrost_rql::Incompleteness::Content,
             related: Vec::new(),
             source: None,
@@ -5350,146 +5924,238 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
         exhausted_roots: Vec::new(),
             withheld_rows_path: None,
         }), Some(DerivationExecutionCause::Snapshot)));
-    }
-    if let (Some(profile), Some(started)) = (&mut state.profile, execution_started) {
-        profile.execution_ns = elapsed_ns(started);
-    }
-    let semantic_work = state
-        .semantic
-        .as_ref()
-        .map_or_else(CodeQuerySemanticWork::default, SemanticQueryContext::work);
-    // Observe sticky query-local execution state before dropping its ledgers.
-    if execution.is_cancelled()
-        || execution.is_truncated()
-        || state.access_failure.is_some()
-        || semantic_work.budget_exhausted
-        || state
-            .call_cache
-            .effects
-            .read(&memo_attribution(state.analyzer), |effects| {
-                effects.truncated
-            })
-        || state.control_relation_cache.refusal_count() > 0
-    {
-        brokk_bifrost_core::profiling::note_with(|| {
-            format!(
-                "policy.units unbounded origin={}:{} cause=query_boundary cancelled={} truncated={} provider={} semantic={} effect_coverage={} cfg={}",
-                file!(),
-                line!(),
-                execution.is_cancelled(),
-                execution.is_truncated(),
-                state.access_failure.is_some(),
-                semantic_work.budget_exhausted,
-                state
-                    .call_cache
-                    .effects
-                    .read(&memo_attribution(state.analyzer), |effects| effects
-                        .truncated),
-                state.control_relation_cache.refusal_count() > 0
-            )
-        });
-        state.analyzer.mark_execution_dependent();
-    }
-    let execution_work_profile =
-        capture_profile.then(|| execution_work_snapshot(state.budget, semantic_work));
-    let rendering_started = capture_profile.then(Instant::now);
-    let mut cancelled = execution.is_cancelled();
-    let mut truncated = execution.is_truncated();
-    // A narrowed union leaf keeps the executor's actual traces and carries
-    // the authored path through every projection. The ordinary root query
-    // retains its historical plain-structural response shape, which omits
-    // seed-only traces.
-    if let Some(native_rows) = native_rows_out {
-        native_rows.extend(execution.rows.iter().cloned());
-    }
-    if !scope.branch_path().is_empty() {
-        let branch_path = scope.branch_path();
-        for row in &mut execution.rows {
-            for trace in &mut row.traces {
-                assert!(
-                    trace.branch.is_empty(),
-                    "a union leaf trace must not already carry a set branch"
-                );
-                trace.branch.extend_from_slice(branch_path);
+        }
+        if let (Some(profile), Some(started)) = (&mut state.profile, execution_started) {
+            profile.execution_ns = elapsed_ns(started);
+        }
+        let semantic_work = state
+            .semantic
+            .as_ref()
+            .map_or_else(CodeQuerySemanticWork::default, SemanticQueryContext::work)
+            .saturating_add(state.call_shape_work);
+        let configured_cap = execution.stop == PlanStop::ConfiguredCap;
+        if configured_cap {
+            state.analyzer.join_reuse_verdict(
+                brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::ExecutionDependent(
+                    brokk_bifrost_core::analyzer::reuse_verdict::ExecutionCause::ConfiguredCap,
+                ),
+            );
+            state.reuse.join_in(ReuseVerdict::ExecutionDependent(
+                ExecutionCause::ConfiguredCap,
+            ));
+        }
+        let cache_reuse = state.cache_reuse().join(
+            state
+                .call_cache
+                .effects
+                .read(&memo_attribution(state.analyzer), |effects| effects.reuse),
+        );
+        state.reuse.join_in(cache_reuse);
+        // Observe sticky query-local execution state before dropping its ledgers.
+        if execution.is_cancelled()
+            || (execution.is_truncated() && !configured_cap)
+            || state.access_failure.is_some()
+            || semantic_work.budget_exhausted
+            || state
+                .call_cache
+                .effects
+                .read(&memo_attribution(state.analyzer), |effects| {
+                    effects.truncated
+                })
+            || state.control_relation_cache.refusal_count() > 0
+        {
+            brokk_bifrost_core::profiling::note_with(|| {
+                format!(
+                    "policy.units unbounded origin={}:{} cause=query_boundary cancelled={} truncated={} provider={} semantic={} effect_coverage={} cfg={}",
+                    file!(),
+                    line!(),
+                    execution.is_cancelled(),
+                    execution.is_truncated(),
+                    state.access_failure.is_some(),
+                    semantic_work.budget_exhausted,
+                    state
+                        .call_cache
+                        .effects
+                        .read(&memo_attribution(state.analyzer), |effects| effects
+                            .truncated),
+                    state.control_relation_cache.refusal_count() > 0
+                )
+            });
+            state.mark_execution_dependent();
+        }
+        let execution_work_profile =
+            capture_profile.then(|| execution_work_snapshot(state.budget, semantic_work));
+        let rendering_started = capture_profile.then(Instant::now);
+        let mut cancelled = execution.is_cancelled();
+        let mut truncated = execution.is_truncated();
+        let mut rendering_truncated = false;
+        // A narrowed union leaf keeps the executor's actual traces and carries
+        // the authored path through every projection. The ordinary root query
+        // retains its historical plain-structural response shape, which omits
+        // seed-only traces.
+        if let Some(native_rows) = native_rows_out {
+            native_rows.extend(execution.rows.iter().cloned());
+        }
+        if !scope.branch_path().is_empty() {
+            let branch_path = scope.branch_path();
+            // Execution, including prepared operands, reports paths relative
+            // to this leaf. Prefix before rendering; its later diagnostics
+            // start empty and receive the same path at the final check.
+            for diagnostic in &mut diagnostics {
+                diagnostic.branch.splice(0..0, branch_path.iter().copied());
+            }
+            for row in &mut execution.rows {
+                for trace in &mut row.traces {
+                    // A projecting leaf may itself select ordinary set-plan
+                    // sources. Preserve that inner branch below the leaf's path.
+                    trace.branch.splice(0..0, branch_path.iter().copied());
+                }
+            }
+        } else if query.seed().is_some() && query.plan.steps.is_empty() {
+            for row in &mut execution.rows {
+                row.traces.clear();
+                row.provenance_truncated = false;
             }
         }
-    } else if query.seed().is_some() && query.plan.steps.is_empty() {
-        for row in &mut execution.rows {
-            row.traces.clear();
-            row.provenance_truncated = false;
+        if scope.branch_path().is_empty()
+            && let Some(seed) = query.seed()
+        {
+            let plan = QueryPlan::for_query(seed);
+            if should_report_broad_query(&plan, seed, &state.budget, truncated) {
+                push_broad_query_diagnostic(&mut diagnostics, &state.budget);
+            }
         }
-    }
-    if scope.branch_path().is_empty()
-        && let Some(seed) = query.seed()
-    {
-        let plan = QueryPlan::for_query(seed);
-        if should_report_broad_query(&plan, seed, &state.budget, truncated) {
-            push_broad_query_diagnostic(&mut diagnostics, &state.budget);
-        }
-    }
-    let mut render_cache = PipelineRenderCache::default();
-    if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        cancelled = true;
-        push_cancelled_diagnostic(&mut diagnostics);
-    }
-    let mut results = Vec::with_capacity(execution.rows.len());
-    let mut evidence = Vec::with_capacity(execution.rows.len());
-    for (result_index, row) in execution.rows.into_iter().enumerate() {
+        let mut render_cache = PipelineRenderCache {
+            procedure_owner_work: ProcedureOwnerWork::new(
+                state.budget.provenance_steps,
+                limits.max_pipeline_rows,
+                cancellation.cloned(),
+            ),
+            ..PipelineRenderCache::default()
+        };
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             cancelled = true;
-            truncated = true;
             push_cancelled_diagnostic(&mut diagnostics);
-            break;
         }
-        if retain_budgeted_pipeline_sources(
-            analyzer,
-            &row,
-            &mut render_cache,
-            &mut state.budget,
-            limits,
-            &mut diagnostics,
-        ) {
+        let mut results = Vec::with_capacity(execution.rows.len());
+        let mut evidence = Vec::with_capacity(execution.rows.len());
+        for (result_index, row) in execution.rows.into_iter().enumerate() {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                cancelled = true;
+                truncated = true;
+                push_cancelled_diagnostic(&mut diagnostics);
+                break;
+            }
+            if retain_budgeted_pipeline_sources(
+                analyzer,
+                &row,
+                &mut render_cache,
+                &mut state.budget,
+                limits,
+                &mut diagnostics,
+            ) {
+                truncated = true;
+                rendering_truncated = true;
+            }
+            if retain_procedure_owner_facts(
+                analyzer,
+                &row,
+                &mut render_cache,
+                &mut state.receiver_facts,
+                &mut state.budget,
+                limits,
+                cancellation,
+                &mut diagnostics,
+            ) {
+                truncated = true;
+                rendering_truncated = true;
+            }
+            render_cache.seal_source_loads();
+            if let Some(row_keys) = row_keys_out.as_deref_mut() {
+                row_keys.push(unit_row_key(&row.value.key()));
+            }
+            let terminal_source_file = terminal_source_file(&row.value);
+            let retained_source =
+                terminal_source_file.and_then(|file| render_cache.source_snapshot(analyzer, file));
+            let binding_range = pipeline_export_binding_range(analyzer, &row.value, &render_cache);
+            let mut row_evidence = detailed_evidence_for_pipeline_value(
+                result_index,
+                &row.value,
+                retained_source,
+                binding_range,
+            );
+            if matches!(
+                row_evidence.selected_pattern_source,
+                SelectedPatternSourceEvidence::Conflict
+            ) {
+                diagnostics.push(incomplete_diagnostic(
+                    CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                    Incompleteness::Content,
+                    "rust",
+                    format!(
+                        "selected source-entry proofs conflict for {} at {:?}",
+                        rel_path_string(&row_evidence.file),
+                        row_evidence.byte_span
+                    ),
+                    Vec::new(),
+                ));
+            }
+            row_evidence.call_path_evidence = row.call_path_evidence.clone();
+            row_evidence.provenance =
+                detailed_provenance_for_row(analyzer, &row, &mut render_cache);
+            evidence.push(row_evidence);
+            results.push(render_pipeline_item(
+                analyzer,
+                row,
+                query.result_detail,
+                &mut render_cache,
+            ));
+        }
+        state.budget.provenance_steps = render_cache.procedure_owner_work.used;
+        if let Some(attempted) = render_cache.procedure_owner_work.refused {
+            if !diagnostics.iter().any(|diagnostic| {
+                matches!(
+                    diagnostic.code,
+                    CodeQueryDiagnosticCode::PipelineBudgetExhausted
+                        | CodeQueryDiagnosticCode::ExecutionBudgetExhausted
+                )
+            }) {
+                let mut projected = state.budget;
+                projected.provenance_steps = attempted;
+                push_budget_diagnostic(
+                    &mut diagnostics,
+                    &projected,
+                    limits,
+                    Some(&state.budget),
+                    "procedure_source_owner",
+                );
+            }
             truncated = true;
         }
-        render_cache.seal_source_loads();
-        if let Some(row_keys) = row_keys_out.as_deref_mut() {
-            row_keys.push(unit_row_key(&row.value.key()));
+        if render_cache.procedure_owner_work.cancelled {
+            cancelled = true;
+            push_cancelled_diagnostic(&mut diagnostics);
         }
-        let terminal_source_file = terminal_source_file(&row.value);
-        let retained_source =
-            terminal_source_file.and_then(|file| render_cache.source_snapshot(analyzer, file));
-        let binding_range = pipeline_export_binding_range(analyzer, &row.value, &render_cache);
-        let mut row_evidence = detailed_evidence_for_pipeline_value(
-            result_index,
-            &row.value,
-            retained_source,
-            binding_range,
-        );
-        row_evidence.provenance = detailed_provenance_for_row(analyzer, &row, &render_cache);
-        evidence.push(row_evidence);
-        results.push(render_pipeline_item(
-            analyzer,
-            row,
-            query.result_detail,
-            &mut render_cache,
-        ));
-    }
-    render_cache.report_capture_truncation(&mut diagnostics);
-    let structural_index_stale = !state
-        .structural_index_session
-        .selections_are_current(|content| state.analyzer.workspace_content_matches(content));
-    if structural_index_stale {
-        results.clear();
-        evidence.clear();
-        truncated = true;
-        state
-            .access_failure
-            .get_or_insert_with(|| "workspace content changed during result rendering".to_string());
-        if !diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == CodeQueryDiagnosticCode::SemanticResultsOmitted
-                && diagnostic.message.contains("structural posting")
-        }) {
-            diagnostics.push(QueryExecutionState::diagnostic(analyzer, CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        render_cache.report_capture_truncation(&mut diagnostics);
+        let structural_index_stale = !state
+            .structural_index_session
+            .selections_are_current(|content| state.analyzer.workspace_content_matches(content));
+        if structural_index_stale {
+            results.clear();
+            evidence.clear();
+            truncated = true;
+            state.access_failure.get_or_insert_with(|| {
+                "workspace content changed during result rendering".to_string()
+            });
+            if !diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == CodeQueryDiagnosticCode::SemanticResultsOmitted
+                    && diagnostic.message.contains("structural posting")
+            }) {
+                diagnostics.push(QueryExecutionState::diagnostic(analyzer, CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                 incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                 related: Vec::new(),
                 source: None,
@@ -5501,98 +6167,118 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
             exhausted_roots: Vec::new(),
                 withheld_rows_path: None,
             }), Some(DerivationExecutionCause::Snapshot)));
-        }
-    }
-    if !cancelled && !structural_index_stale {
-        state.structural_index_session.publish_auto_observations();
-    }
-    if !scope.branch_path().is_empty() {
-        let branch_path = scope.branch_path();
-        for diagnostic in &mut diagnostics {
-            if diagnostic.branch.is_empty() {
-                diagnostic.branch.extend_from_slice(branch_path);
-            } else {
-                assert!(
-                    diagnostic.branch.starts_with(branch_path),
-                    "a union leaf diagnostic must carry its full branch path"
-                );
             }
         }
-    }
-    // Rendering can itself exhaust provenance/output limits or observe a
-    // stale source after the plan has finished.
-    if cancelled || truncated || state.access_failure.is_some() {
-        brokk_bifrost_core::profiling::note_with(|| {
-            format!(
-                "policy.units unbounded origin={}:{} cause=render_boundary cancelled={} truncated={} provider={}",
-                file!(),
-                line!(),
-                cancelled,
-                truncated,
-                state.access_failure.is_some()
+        if !cancelled && !structural_index_stale {
+            state.structural_index_session.publish_auto_observations();
+        }
+        if !scope.branch_path().is_empty() {
+            let branch_path = scope.branch_path();
+            for diagnostic in &mut diagnostics {
+                if diagnostic.branch.is_empty() {
+                    diagnostic.branch.extend_from_slice(branch_path);
+                } else {
+                    assert!(
+                        diagnostic.branch.starts_with(branch_path),
+                        "a union leaf diagnostic must carry its full branch path"
+                    );
+                }
+            }
+        }
+        // Rendering can itself exhaust provenance/output limits or observe a
+        // stale source after the plan has finished.
+        if cancelled
+            || (truncated && !configured_cap)
+            || rendering_truncated
+            || state.access_failure.is_some()
+        {
+            brokk_bifrost_core::profiling::note_with(|| {
+                format!(
+                    "policy.units unbounded origin={}:{} cause=render_boundary cancelled={} truncated={} provider={}",
+                    file!(),
+                    line!(),
+                    cancelled,
+                    truncated,
+                    state.access_failure.is_some()
+                )
+            });
+            state.mark_execution_dependent();
+        }
+        let total_work = execution_work_snapshot(state.budget, semantic_work);
+        let work = public_execution_work(total_work);
+        let candidate_site_set = std::mem::take(&mut state.candidate_sites);
+        let budgeted_work = budgeted_execution_work(
+            state.budget,
+            Some(std::mem::take(&mut state.step_outputs)),
+            Some(candidate_site_set.len()),
+        );
+        if let Some(profile) = &mut state.profile {
+            let execution_work = execution_work_profile.unwrap_or_default();
+            profile.rendering_ns = rendering_started.map(elapsed_ns).unwrap_or(0);
+            profile.total_elapsed_ns = request_started.map(elapsed_ns).unwrap_or(0);
+            profile.execution_work = execution_work;
+            profile.rendering_work = total_work.saturating_sub(execution_work);
+            profile.work = total_work;
+            profile.cache = state.cache_profile.unwrap_or_default();
+        }
+        let profile = state.profile;
+        if let Some(out) = access_failure_out {
+            *out = state.access_failure.take();
+        }
+        let semantic = state.semantic.take();
+        let mut reuse = semantic
+            .as_ref()
+            .map_or(state.reuse, |semantic| state.reuse.join(semantic.reuse()))
+            .join(preflight_files.reuse());
+        let semantic_receipt = semantic.and_then(SemanticQueryContext::into_receipt);
+        let mut result = CodeQueryResult {
+            results,
+            truncated: truncated || cancelled,
+            depth_bound_status: state.depth_bound_status,
+            session_subset: session_subset(analyzer),
+            diagnostics: normalize_query_diagnostics(
+                diagnostics
+                    .into_iter()
+                    .map(|diagnostic| QueryExecutionState::diagnostic(analyzer, diagnostic, None))
+                    .collect(),
+            ),
+        };
+        // Every returned execution-state diagnostic was marked as it was mapped
+        // above, so each carries its dependence into the verdict. This is the
+        // verdict of the marks whose only product is such a diagnostic.
+        for diagnostic in &result.diagnostics {
+            reuse.join_in(diagnostic.reuse_verdict());
+        }
+        fold_query_read_incompleteness(
+            &mut result.diagnostics,
+            read_scope.captured_read_incompleteness(),
+        );
+        result.cap_flow_status_by_run();
+        if result.depth_bound_status == Some(DepthBoundStatus::NotReached)
+            && !matches!(
+                result.completion(),
+                CodeQueryCompletion::Complete | CodeQueryCompletion::ProvenSubset { .. }
             )
-        });
-        state.analyzer.mark_execution_dependent();
-    }
-    let total_work = execution_work_snapshot(state.budget, semantic_work);
-    let work = public_execution_work(total_work);
-    let budgeted_work =
-        budgeted_execution_work(state.budget, std::mem::take(&mut state.step_outputs));
-    if let Some(profile) = &mut state.profile {
-        let execution_work = execution_work_profile.unwrap_or_default();
-        profile.rendering_ns = rendering_started.map(elapsed_ns).unwrap_or(0);
-        profile.total_elapsed_ns = request_started.map(elapsed_ns).unwrap_or(0);
-        profile.execution_work = execution_work;
-        profile.rendering_work = total_work.saturating_sub(execution_work);
-        profile.work = total_work;
-        profile.cache = state.cache_profile.unwrap_or_default();
-    }
-    let profile = state.profile;
-    if let Some(out) = access_failure_out {
-        *out = state.access_failure.take();
-    }
-    let semantic_receipt = state
-        .semantic
-        .take()
-        .and_then(SemanticQueryContext::into_receipt);
-    let mut result = CodeQueryResult {
-        results,
-        truncated: truncated || cancelled,
-        depth_bound_status: state.depth_bound_status,
-        session_subset: session_subset(analyzer),
-        diagnostics: normalize_query_diagnostics(
-            diagnostics
-                .into_iter()
-                .map(|diagnostic| QueryExecutionState::diagnostic(analyzer, diagnostic, None))
-                .collect(),
-        ),
+        {
+            // An early stop cannot certify a negative depth frontier. The real
+            // query incompleteness remains the policy run's primary cause.
+            result.depth_bound_status = Some(DepthBoundStatus::Unknown);
+        }
+        let detailed = DetailedCodeQueryResult {
+            result,
+            work,
+            budgeted_work,
+            candidate_site_set,
+            evidence,
+            profile,
+            semantic_receipt,
+            depth_answers: state.depth_answers,
+            reuse,
+        };
+        detailed.assert_invariants();
+        detailed
     };
-    fold_query_read_incompleteness(
-        &mut result.diagnostics,
-        read_scope.captured_read_incompleteness(),
-    );
-    result.cap_flow_status_by_run();
-    if result.depth_bound_status == Some(DepthBoundStatus::NotReached)
-        && !matches!(
-            result.completion(),
-            CodeQueryCompletion::Complete | CodeQueryCompletion::ProvenSubset { .. }
-        )
-    {
-        // An early stop cannot certify a negative depth frontier. The real
-        // query incompleteness remains the policy run's primary cause.
-        result.depth_bound_status = Some(DepthBoundStatus::Unknown);
-    }
-    let detailed = DetailedCodeQueryResult {
-        result,
-        work,
-        budgeted_work,
-        evidence,
-        profile,
-        semantic_receipt,
-        depth_answers: state.depth_answers,
-    };
-    detailed.assert_invariants();
-    detailed
+    render()
 }
 
 /// Whether the root terminal-cap backstop (issue #2779) must push its own
@@ -5701,11 +6387,14 @@ fn detailed_result_without_evidence(
             budget,
             CodeQuerySemanticWork::default(),
         )),
-        budgeted_work: budgeted_execution_work(budget, Vec::new()),
+        // This execution stopped before it counted any step: unknown, not zero.
+        budgeted_work: budgeted_execution_work(budget, None, None),
+        candidate_site_set: HashSet::default(),
         evidence: Vec::new(),
         profile: None,
         semantic_receipt: None,
         depth_answers: Vec::new(),
+        reuse: ReuseVerdict::Content,
     };
     detailed.assert_invariants();
     detailed
@@ -5715,14 +6404,28 @@ fn detailed_result_without_evidence(
 /// counts, for a caller that merges several executions of one query.
 fn budgeted_execution_work(
     budget: CodeQueryExecutionBudget,
-    step_outputs: Vec<u64>,
+    step_outputs: Option<Vec<u64>>,
+    candidate_sites: Option<usize>,
 ) -> CodeQueryBudgetedWork {
     let as_u64 = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
     CodeQueryBudgetedWork {
+        admission: results::CodeQueryAdmissionWork {
+            scanned_files: as_u64(budget.scanned_files),
+            scanned_source_bytes: as_u64(budget.scanned_source_bytes),
+            fact_nodes: as_u64(budget.fact_nodes.saturating_add(budget.examined_references)),
+            pipeline_rows: as_u64(budget.pipeline_rows),
+            call_answers: as_u64(
+                budget
+                    .call_declarations
+                    .saturating_add(budget.call_sites)
+                    .saturating_add(budget.call_terminals),
+            ),
+        },
         provenance_steps: as_u64(budget.provenance_steps),
         import_files_resolved: as_u64(budget.import_files_resolved),
         import_edges_resolved: as_u64(budget.import_edges_resolved),
         step_outputs,
+        candidate_sites: candidate_sites.map(as_u64),
     }
 }
 
@@ -5743,11 +6446,23 @@ fn execution_work_snapshot(
 ) -> QueryOperatorWorkProfile {
     let as_u64 = |value| u64::try_from(value).unwrap_or(u64::MAX);
     QueryOperatorWorkProfile {
-        scanned_files: as_u64(budget.scanned_files),
-        scanned_source_bytes: as_u64(budget.scanned_source_bytes),
+        scanned_files: as_u64(
+            budget
+                .scanned_files
+                .saturating_add(budget.call_scanned_files),
+        ),
+        scanned_source_bytes: as_u64(
+            budget
+                .scanned_source_bytes
+                .saturating_add(budget.call_scanned_source_bytes),
+        ),
         fact_nodes: as_u64(budget.fact_nodes),
         pipeline_rows: as_u64(budget.pipeline_rows),
-        examined_references: as_u64(budget.examined_references),
+        examined_references: as_u64(
+            budget
+                .examined_references
+                .saturating_add(budget.call_examined_references),
+        ),
         provenance_steps: as_u64(budget.provenance_steps),
         import_files_resolved: as_u64(budget.import_files_resolved),
         import_edges_resolved: as_u64(budget.import_edges_resolved),
@@ -5838,6 +6553,7 @@ fn detailed_evidence_for_pipeline_value(
             let path = rel_path_string(&seed.file);
             let stable_owner_candidate = canonical_ast_candidate(seed);
             DetailedCodeQueryEvidence {
+                selected_pattern_source: seed.fact_match.selected_pattern_source.clone(),
                 result_index,
                 domain: DetailedCodeQueryDomain::StructuralMatch,
                 key: DetailedCodeQueryKey::StructuralMatch {
@@ -5858,6 +6574,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
             }
         }
@@ -5867,6 +6584,7 @@ fn detailed_evidence_for_pipeline_value(
             let fq_name = declaration.unit.fq_name();
             let byte_span = range_byte_span(declaration.range);
             DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
                 result_index,
                 domain: DetailedCodeQueryDomain::Declaration,
                 key: DetailedCodeQueryKey::Declaration {
@@ -5884,6 +6602,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: stable_owner_candidate_for_unit(&file, &declaration.unit),
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
             }
         }
@@ -5901,6 +6620,7 @@ fn detailed_evidence_for_pipeline_value(
             )
         }
         PipelineValue::File(file) => DetailedCodeQueryEvidence {
+            selected_pattern_source: Default::default(),
             result_index,
             domain: DetailedCodeQueryDomain::File,
             key: DetailedCodeQueryKey::File,
@@ -5911,12 +6631,14 @@ fn detailed_evidence_for_pipeline_value(
             source_slice_sha256: None,
             provenance: Vec::new(),
             decorated_parameter: None,
+            call_path_evidence: None,
             runtime_keyed_read: None,
         },
         PipelineValue::ReferenceSite(site) => {
             let target_fq_name = site.target.unit.fq_name();
             let byte_span = range_byte_span(site.range);
             DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
                 result_index,
                 domain: DetailedCodeQueryDomain::ReferenceSite,
                 key: DetailedCodeQueryKey::ReferenceSite {
@@ -5935,6 +6657,7 @@ fn detailed_evidence_for_pipeline_value(
                 }),
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
             }
         }
@@ -5942,6 +6665,7 @@ fn detailed_evidence_for_pipeline_value(
             let file = &site.0.file;
             let byte_span = range_byte_span(site.0.range);
             DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
                 result_index,
                 domain: DetailedCodeQueryDomain::CallSite,
                 key: DetailedCodeQueryKey::CallSite {
@@ -5976,6 +6700,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: stable_owner_candidate_for_unit(file, &site.0.caller),
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
             }
         }
@@ -6003,6 +6728,7 @@ fn detailed_evidence_for_pipeline_value(
                 ),
             };
             DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
                 domain: DetailedCodeQueryDomain::CrossDomain,
                 key: DetailedCodeQueryKey::CrossDomain {
                     id: value.id(),
@@ -6012,6 +6738,7 @@ fn detailed_evidence_for_pipeline_value(
                 identities: DetailedCodeQueryProvenanceIdentities::None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
                 ..anchor
             }
@@ -6021,6 +6748,7 @@ fn detailed_evidence_for_pipeline_value(
             let byte_span = range_byte_span(site.range);
             let (input_kind, parameter_index, parameter_name) = expression_input_parts(&site.input);
             DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
                 result_index,
                 domain: DetailedCodeQueryDomain::ExpressionSite,
                 key: DetailedCodeQueryKey::ExpressionSite {
@@ -6041,6 +6769,7 @@ fn detailed_evidence_for_pipeline_value(
                 ),
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
             }
         }
@@ -6050,6 +6779,7 @@ fn detailed_evidence_for_pipeline_value(
             let ast_id = value.ast_id();
             let candidate = canonical_ast_candidate_for_node(&value.seed, value.value_node);
             DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
                 result_index,
                 domain: DetailedCodeQueryDomain::JsxAttributeValue,
                 key: DetailedCodeQueryKey::JsxAttributeValue {
@@ -6069,6 +6799,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: candidate,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
             }
         }
@@ -6076,6 +6807,7 @@ fn detailed_evidence_for_pipeline_value(
             let site = &value.report.site;
             let byte_span = range_byte_span(site.range);
             DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
                 result_index,
                 domain: DetailedCodeQueryDomain::ReceiverAnalysis,
                 key: DetailedCodeQueryKey::ReceiverAnalysis {
@@ -6090,6 +6822,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
             }
         }
@@ -6097,6 +6830,7 @@ fn detailed_evidence_for_pipeline_value(
             let site = &value.report.site;
             let byte_span = range_byte_span(site.range);
             DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
                 result_index,
                 domain: DetailedCodeQueryDomain::MemberTargetAnalysis,
                 key: DetailedCodeQueryKey::MemberTargetAnalysis {
@@ -6109,12 +6843,14 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
             }
         }
         PipelineValue::ReceiverOutcome(value) => {
             let site = &value.report.site;
             DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
                 result_index,
                 domain: DetailedCodeQueryDomain::ReceiverOutcome,
                 key: DetailedCodeQueryKey::ReceiverOutcome {
@@ -6128,12 +6864,14 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
             }
         }
         PipelineValue::ReceiverEvidence(value) => {
             let site = &value.receiver.report.site;
             DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
                 result_index,
                 domain: DetailedCodeQueryDomain::ReceiverEvidence,
                 key: DetailedCodeQueryKey::ReceiverEvidence {
@@ -6147,10 +6885,12 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
             }
         }
         PipelineValue::PointsToCandidate(value) => DetailedCodeQueryEvidence {
+            selected_pattern_source: Default::default(),
             result_index,
             domain: DetailedCodeQueryDomain::PointsToCandidate,
             key: DetailedCodeQueryKey::PointsToCandidate {
@@ -6164,6 +6904,7 @@ fn detailed_evidence_for_pipeline_value(
             stable_owner_candidate: None,
             provenance: Vec::new(),
             decorated_parameter: None,
+            call_path_evidence: None,
             runtime_keyed_read: None,
         },
         PipelineValue::FieldWriteValue(value) => {
@@ -6172,6 +6913,7 @@ fn detailed_evidence_for_pipeline_value(
             let rhs_ast_id = value.rhs_ast_id();
             let candidate = canonical_ast_candidate_for_node(&value.seed, value.rhs_node);
             DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
                 result_index,
                 domain: DetailedCodeQueryDomain::FieldWriteValue,
                 key: DetailedCodeQueryKey::FieldWriteValue {
@@ -6197,10 +6939,12 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: candidate,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
             }
         }
         PipelineValue::RuntimeKeyedReadValue(value) => DetailedCodeQueryEvidence {
+            selected_pattern_source: Default::default(),
             result_index,
             domain: DetailedCodeQueryDomain::RuntimeKeyedReadValue,
             key: DetailedCodeQueryKey::RuntimeKeyedReadValue { id: value.id() },
@@ -6212,12 +6956,14 @@ fn detailed_evidence_for_pipeline_value(
             stable_owner_candidate: None,
             provenance: Vec::new(),
             decorated_parameter: None,
+            call_path_evidence: None,
             runtime_keyed_read: value.endpoint.clone(),
         },
         PipelineValue::CallShape(value) => {
             let outcome = &value.report.outcome;
             let byte_span = range_byte_span(outcome.range);
             DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
                 result_index,
                 domain: DetailedCodeQueryDomain::CallShape,
                 key: DetailedCodeQueryKey::CallShape {
@@ -6232,6 +6978,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
             }
         }
@@ -6239,6 +6986,7 @@ fn detailed_evidence_for_pipeline_value(
             let outcome = &value.shape.report.outcome;
             let group = &value.shape.report.groups[value.group_index];
             DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
                 result_index,
                 domain: DetailedCodeQueryDomain::CallArgumentGroup,
                 key: DetailedCodeQueryKey::CallArgumentGroup {
@@ -6252,6 +7000,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
             }
         }
@@ -6259,6 +7008,7 @@ fn detailed_evidence_for_pipeline_value(
             let outcome = &value.shape.report.outcome;
             let argument = &value.shape.report.arguments[value.argument_index];
             DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
                 result_index,
                 domain: DetailedCodeQueryDomain::CallArgument,
                 key: DetailedCodeQueryKey::CallArgument {
@@ -6272,12 +7022,14 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
             }
         }
         PipelineValue::CallBinding(value) => {
             let row = value.row();
             DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
                 result_index,
                 domain: DetailedCodeQueryDomain::CallBinding,
                 key: DetailedCodeQueryKey::CallBinding {
@@ -6291,12 +7043,14 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
             }
         }
         PipelineValue::CallEffect(value) => {
             let row = value.row();
             DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
                 result_index,
                 domain: DetailedCodeQueryDomain::CallEffect,
                 key: DetailedCodeQueryKey::CallEffect {
@@ -6310,10 +7064,12 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
             }
         }
         PipelineValue::CallResultContract(value) => DetailedCodeQueryEvidence {
+            selected_pattern_source: Default::default(),
             result_index,
             domain: DetailedCodeQueryDomain::CallResultContract,
             key: DetailedCodeQueryKey::CallResultContract {
@@ -6327,9 +7083,11 @@ fn detailed_evidence_for_pipeline_value(
             stable_owner_candidate: None,
             provenance: Vec::new(),
             decorated_parameter: None,
+            call_path_evidence: None,
             runtime_keyed_read: None,
         },
         PipelineValue::CallResultObligation(value) => DetailedCodeQueryEvidence {
+            selected_pattern_source: Default::default(),
             result_index,
             domain: DetailedCodeQueryDomain::CallResultObligation,
             key: DetailedCodeQueryKey::CallResultObligation {
@@ -6343,9 +7101,11 @@ fn detailed_evidence_for_pipeline_value(
             stable_owner_candidate: None,
             provenance: Vec::new(),
             decorated_parameter: None,
+            call_path_evidence: None,
             runtime_keyed_read: None,
         },
         PipelineValue::ResultSubjectUse(value) => DetailedCodeQueryEvidence {
+            selected_pattern_source: Default::default(),
             result_index,
             domain: DetailedCodeQueryDomain::ResultSubjectUse,
             key: DetailedCodeQueryKey::ResultSubjectUse {
@@ -6362,9 +7122,11 @@ fn detailed_evidence_for_pipeline_value(
             }),
             provenance: Vec::new(),
             decorated_parameter: None,
+            call_path_evidence: None,
             runtime_keyed_read: None,
         },
         PipelineValue::ResultContractUse(value) => DetailedCodeQueryEvidence {
+            selected_pattern_source: Default::default(),
             result_index,
             domain: DetailedCodeQueryDomain::ResultContractUse,
             key: DetailedCodeQueryKey::ResultContractUse {
@@ -6378,9 +7140,11 @@ fn detailed_evidence_for_pipeline_value(
             stable_owner_candidate: None,
             provenance: Vec::new(),
             decorated_parameter: None,
+            call_path_evidence: None,
             runtime_keyed_read: None,
         },
         PipelineValue::ResultContractFailureUse(value) => DetailedCodeQueryEvidence {
+            selected_pattern_source: Default::default(),
             result_index,
             domain: DetailedCodeQueryDomain::ResultContractFailureUse,
             key: DetailedCodeQueryKey::ResultContractFailureUse {
@@ -6394,9 +7158,11 @@ fn detailed_evidence_for_pipeline_value(
             stable_owner_candidate: None,
             provenance: Vec::new(),
             decorated_parameter: None,
+            call_path_evidence: None,
             runtime_keyed_read: None,
         },
         PipelineValue::NilnessOperation(value) => DetailedCodeQueryEvidence {
+            selected_pattern_source: Default::default(),
             result_index,
             domain: DetailedCodeQueryDomain::NilnessOperation,
             key: DetailedCodeQueryKey::NilnessOperation {
@@ -6410,9 +7176,11 @@ fn detailed_evidence_for_pipeline_value(
             stable_owner_candidate: None,
             provenance: Vec::new(),
             decorated_parameter: None,
+            call_path_evidence: None,
             runtime_keyed_read: None,
         },
         PipelineValue::SwitchCoverage(value) => DetailedCodeQueryEvidence {
+            selected_pattern_source: Default::default(),
             result_index,
             domain: DetailedCodeQueryDomain::SwitchCoverage,
             key: DetailedCodeQueryKey::SwitchCoverage {
@@ -6426,9 +7194,11 @@ fn detailed_evidence_for_pipeline_value(
             stable_owner_candidate: None,
             provenance: Vec::new(),
             decorated_parameter: None,
+            call_path_evidence: None,
             runtime_keyed_read: None,
         },
         PipelineValue::AssignmentRelation(value) => DetailedCodeQueryEvidence {
+            selected_pattern_source: Default::default(),
             result_index,
             domain: DetailedCodeQueryDomain::AssignmentRelation,
             key: DetailedCodeQueryKey::AssignmentRelation {
@@ -6442,9 +7212,11 @@ fn detailed_evidence_for_pipeline_value(
             stable_owner_candidate: None,
             provenance: Vec::new(),
             decorated_parameter: None,
+            call_path_evidence: None,
             runtime_keyed_read: None,
         },
         PipelineValue::ClassSetRow(value) => DetailedCodeQueryEvidence {
+            selected_pattern_source: Default::default(),
             result_index,
             domain: DetailedCodeQueryDomain::ClassSetRow,
             key: DetailedCodeQueryKey::ClassSetRow {
@@ -6457,9 +7229,11 @@ fn detailed_evidence_for_pipeline_value(
             stable_owner_candidate: None,
             provenance: Vec::new(),
             decorated_parameter: None,
+            call_path_evidence: None,
             runtime_keyed_read: None,
         },
         PipelineValue::AbsentMemberFinding(value) => DetailedCodeQueryEvidence {
+            selected_pattern_source: Default::default(),
             result_index,
             domain: DetailedCodeQueryDomain::AbsentMemberFinding,
             key: DetailedCodeQueryKey::AbsentMemberFinding {
@@ -6472,9 +7246,11 @@ fn detailed_evidence_for_pipeline_value(
             stable_owner_candidate: None,
             provenance: Vec::new(),
             decorated_parameter: None,
+            call_path_evidence: None,
             runtime_keyed_read: None,
         },
         PipelineValue::DetachedTaskTransfer(value) => DetailedCodeQueryEvidence {
+            selected_pattern_source: Default::default(),
             result_index,
             domain: DetailedCodeQueryDomain::DetachedTaskTransfer,
             key: DetailedCodeQueryKey::DetachedTaskTransfer {
@@ -6488,11 +7264,13 @@ fn detailed_evidence_for_pipeline_value(
             stable_owner_candidate: None,
             provenance: Vec::new(),
             decorated_parameter: None,
+            call_path_evidence: None,
             runtime_keyed_read: None,
         },
         PipelineValue::ProcedureEffect(value) => {
             let row = value.row();
             DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
                 result_index,
                 domain: DetailedCodeQueryDomain::ProcedureEffect,
                 key: DetailedCodeQueryKey::ProcedureEffect {
@@ -6507,12 +7285,14 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
             }
         }
         PipelineValue::CallableSignature(value) => {
             let byte_span = range_byte_span(value.declaration.range);
             DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
                 result_index,
                 domain: DetailedCodeQueryDomain::CallableSignature,
                 key: DetailedCodeQueryKey::CallableSignature {
@@ -6528,12 +7308,14 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
             }
         }
         PipelineValue::LiteralOccurrence(value) => {
             let byte_span = range_byte_span(value.source_range);
             DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
                 result_index,
                 domain: DetailedCodeQueryDomain::LiteralOccurrence,
                 key: DetailedCodeQueryKey::LiteralOccurrence {
@@ -6547,10 +7329,12 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
             }
         }
         PipelineValue::CallableMetrics(value) => DetailedCodeQueryEvidence {
+            selected_pattern_source: Default::default(),
             result_index,
             domain: DetailedCodeQueryDomain::CallableMetrics,
             key: DetailedCodeQueryKey::CallableMetrics {
@@ -6567,11 +7351,13 @@ fn detailed_evidence_for_pipeline_value(
             stable_owner_candidate: None,
             provenance: Vec::new(),
             decorated_parameter: None,
+            call_path_evidence: None,
             runtime_keyed_read: None,
         },
         PipelineValue::SignatureParameter(value) => {
             let byte_span = range_byte_span(value.signature.declaration.range);
             DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
                 result_index,
                 domain: DetailedCodeQueryDomain::SignatureParameter,
                 key: DetailedCodeQueryKey::SignatureParameter {
@@ -6586,10 +7372,12 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
             }
         }
         PipelineValue::DecoratedParameter(value) => DetailedCodeQueryEvidence {
+            selected_pattern_source: Default::default(),
             result_index,
             domain: DetailedCodeQueryDomain::DecoratedParameter,
             key: DetailedCodeQueryKey::DecoratedParameter {
@@ -6604,9 +7392,11 @@ fn detailed_evidence_for_pipeline_value(
             stable_owner_candidate: None,
             provenance: Vec::new(),
             decorated_parameter: value.semantic.as_deref().cloned(),
+            call_path_evidence: None,
             runtime_keyed_read: None,
         },
         PipelineValue::CallableApplicability(value) => DetailedCodeQueryEvidence {
+            selected_pattern_source: Default::default(),
             result_index,
             domain: DetailedCodeQueryDomain::CallableApplicability,
             key: DetailedCodeQueryKey::CallableApplicability {
@@ -6620,9 +7410,11 @@ fn detailed_evidence_for_pipeline_value(
             stable_owner_candidate: None,
             provenance: Vec::new(),
             decorated_parameter: None,
+            call_path_evidence: None,
             runtime_keyed_read: None,
         },
         PipelineValue::OverloadSelection(value) => DetailedCodeQueryEvidence {
+            selected_pattern_source: Default::default(),
             result_index,
             domain: DetailedCodeQueryDomain::OverloadSelection,
             key: DetailedCodeQueryKey::OverloadSelection {
@@ -6636,11 +7428,13 @@ fn detailed_evidence_for_pipeline_value(
             stable_owner_candidate: None,
             provenance: Vec::new(),
             decorated_parameter: None,
+            call_path_evidence: None,
             runtime_keyed_read: None,
         },
         PipelineValue::MemberSelection(value) => {
             let row = &value.occurrence;
             DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
                 result_index,
                 domain: DetailedCodeQueryDomain::MemberSelection,
                 key: DetailedCodeQueryKey::MemberSelection {
@@ -6654,6 +7448,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
             }
         }
@@ -6661,6 +7456,7 @@ fn detailed_evidence_for_pipeline_value(
             let row = &value.row;
             let byte_span = row.range.start_byte..row.range.end_byte;
             DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
                 result_index,
                 domain: DetailedCodeQueryDomain::Occurrence,
                 key: DetailedCodeQueryKey::Occurrence {
@@ -6679,6 +7475,7 @@ fn detailed_evidence_for_pipeline_value(
                     .and_then(|unit| stable_owner_candidate_for_unit(&row.file, unit)),
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
             }
         }
@@ -6686,6 +7483,7 @@ fn detailed_evidence_for_pipeline_value(
             let row = value.row();
             let byte_span = row.range.start_byte..row.range.end_byte;
             DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
                 result_index,
                 domain: DetailedCodeQueryDomain::LexicalScope,
                 key: DetailedCodeQueryKey::LexicalScope {
@@ -6701,6 +7499,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
             }
         }
@@ -6708,6 +7507,7 @@ fn detailed_evidence_for_pipeline_value(
             let row = value.row();
             let byte_span = row.range.start_byte..row.range.end_byte;
             DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
                 result_index,
                 domain: DetailedCodeQueryDomain::Binding,
                 key: DetailedCodeQueryKey::Binding {
@@ -6723,6 +7523,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
             }
         }
@@ -6730,6 +7531,7 @@ fn detailed_evidence_for_pipeline_value(
             let row = value.row();
             let byte_span = row.site.start_byte..row.site.end_byte;
             DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
                 result_index,
                 domain: DetailedCodeQueryDomain::GenerationSite,
                 key: DetailedCodeQueryKey::GenerationSite {
@@ -6745,6 +7547,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
             }
         }
@@ -6752,6 +7555,7 @@ fn detailed_evidence_for_pipeline_value(
             let row = value.row();
             let byte_span = row.range.start_byte..row.range.end_byte;
             DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
                 result_index,
                 domain: DetailedCodeQueryDomain::Export,
                 key: DetailedCodeQueryKey::Export {
@@ -6771,6 +7575,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
             }
         }
@@ -6780,6 +7585,7 @@ fn detailed_evidence_for_pipeline_value(
                 .declaration
                 .map(|declaration| declaration.start_byte..declaration.end_byte);
             DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
                 result_index,
                 domain: DetailedCodeQueryDomain::DeclarationState,
                 key: DetailedCodeQueryKey::DeclarationState {
@@ -6796,6 +7602,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
             }
         }
@@ -6803,6 +7610,7 @@ fn detailed_evidence_for_pipeline_value(
             let row = value.row();
             let byte_span = row.site.range.start_byte..row.site.range.end_byte;
             DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
                 result_index,
                 domain: DetailedCodeQueryDomain::StateEvent,
                 key: DetailedCodeQueryKey::StateEvent {
@@ -6819,6 +7627,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
             }
         }
@@ -6826,6 +7635,7 @@ fn detailed_evidence_for_pipeline_value(
             let row = &value.row;
             let byte_span = row.start_byte..row.end_byte;
             DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
                 result_index,
                 domain: DetailedCodeQueryDomain::BindingInitializerCall,
                 key: DetailedCodeQueryKey::BindingInitializerCall {
@@ -6841,6 +7651,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
             }
         }
@@ -6849,6 +7660,7 @@ fn detailed_evidence_for_pipeline_value(
         // span, so it carries no range and its evidence anchors on the whole
         // file, exactly as a `file` row does.
         PipelineValue::SourceSet(value) => DetailedCodeQueryEvidence {
+            selected_pattern_source: Default::default(),
             result_index,
             domain: DetailedCodeQueryDomain::SourceSet,
             key: topology_rows::source_set_key(value),
@@ -6859,9 +7671,11 @@ fn detailed_evidence_for_pipeline_value(
             source_slice_sha256: None,
             provenance: Vec::new(),
             decorated_parameter: None,
+            call_path_evidence: None,
             runtime_keyed_read: None,
         },
         PipelineValue::BuildTarget(value) => DetailedCodeQueryEvidence {
+            selected_pattern_source: Default::default(),
             result_index,
             domain: DetailedCodeQueryDomain::BuildTarget,
             key: topology_rows::build_target_key(value),
@@ -6872,9 +7686,11 @@ fn detailed_evidence_for_pipeline_value(
             source_slice_sha256: None,
             provenance: Vec::new(),
             decorated_parameter: None,
+            call_path_evidence: None,
             runtime_keyed_read: None,
         },
         PipelineValue::TopologyEdge(value) => DetailedCodeQueryEvidence {
+            selected_pattern_source: Default::default(),
             result_index,
             domain: DetailedCodeQueryDomain::TopologyEdge,
             key: topology_rows::topology_edge_key(value),
@@ -6885,9 +7701,11 @@ fn detailed_evidence_for_pipeline_value(
             source_slice_sha256: None,
             provenance: Vec::new(),
             decorated_parameter: None,
+            call_path_evidence: None,
             runtime_keyed_read: None,
         },
         PipelineValue::BuildConfiguration(value) => DetailedCodeQueryEvidence {
+            selected_pattern_source: Default::default(),
             result_index,
             domain: DetailedCodeQueryDomain::BuildConfiguration,
             key: value.detailed_key(),
@@ -6898,12 +7716,14 @@ fn detailed_evidence_for_pipeline_value(
             source_slice_sha256: None,
             provenance: Vec::new(),
             decorated_parameter: None,
+            call_path_evidence: None,
             runtime_keyed_read: None,
         },
         PipelineValue::ControlRelation(value) => {
             let (file, range) = control_relations::anchor(value);
             let byte_span = range.start_byte..range.end_byte;
             DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
                 result_index,
                 domain: DetailedCodeQueryDomain::ControlRelation,
                 key: control_relations::detailed_key(value),
@@ -6915,12 +7735,14 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
             }
         }
         PipelineValue::FailureHandlerState(value) => {
             let byte_span = value.anchor.start_byte..value.anchor.end_byte;
             DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
                 result_index,
                 domain: DetailedCodeQueryDomain::FailureHandlerState,
                 key: failure_handler_state::detailed_key(value),
@@ -6932,12 +7754,14 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
             }
         }
         PipelineValue::BranchRelation(value) => {
             let byte_span = value.anchor.start_byte..value.anchor.end_byte;
             DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
                 result_index,
                 domain: DetailedCodeQueryDomain::BranchRelation,
                 key: branch_relations::detailed_key(value),
@@ -6949,12 +7773,14 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
             }
         }
         PipelineValue::LoopRelation(value) => {
             let byte_span = value.anchor.start_byte..value.anchor.end_byte;
             DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
                 result_index,
                 domain: DetailedCodeQueryDomain::LoopRelation,
                 key: loop_relations::detailed_key(value),
@@ -6966,12 +7792,14 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
             }
         }
         PipelineValue::CppExpression(value) => {
             let byte_span = value.anchor.start_byte..value.anchor.end_byte;
             DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
                 result_index,
                 domain: DetailedCodeQueryDomain::CppExpression,
                 key: cpp_expressions::detailed_key(value),
@@ -6983,12 +7811,14 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
             }
         }
         PipelineValue::StatementReachability(value) => {
             let byte_span = value.anchor.start_byte..value.anchor.end_byte;
             DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
                 result_index,
                 domain: DetailedCodeQueryDomain::StatementReachability,
                 key: statement_reachability::detailed_key(value),
@@ -7000,12 +7830,14 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
             }
         }
         PipelineValue::PendingCleanupFlow(value) => {
             let byte_span = value.anchor.start_byte..value.anchor.end_byte;
             DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
                 result_index,
                 domain: DetailedCodeQueryDomain::PendingCleanupFlow,
                 key: pending_cleanup_flow::detailed_key(value),
@@ -7017,12 +7849,14 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
             }
         }
         PipelineValue::PythonRuleFact(value) => {
             let byte_span = value.anchor.start_byte..value.anchor.end_byte;
             DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
                 result_index,
                 domain: DetailedCodeQueryDomain::PythonRuleFact,
                 key: python_rule_facts::detailed_key(value),
@@ -7034,6 +7868,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
             }
         }
@@ -7041,6 +7876,7 @@ fn detailed_evidence_for_pipeline_value(
             let (file, range) = guards::anchor(value);
             let byte_span = range.start_byte..range.end_byte;
             DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
                 result_index,
                 domain: DetailedCodeQueryDomain::Guard,
                 key: guards::detailed_key(value),
@@ -7052,6 +7888,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
             }
         }
@@ -7059,6 +7896,7 @@ fn detailed_evidence_for_pipeline_value(
             let row = value.row();
             let byte_span = row.origin.range.start_byte..row.origin.range.end_byte;
             DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
                 result_index,
                 domain: DetailedCodeQueryDomain::RewritePath,
                 key: DetailedCodeQueryKey::RewritePath {
@@ -7075,6 +7913,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
             }
         }
@@ -7082,6 +7921,7 @@ fn detailed_evidence_for_pipeline_value(
             let target = value.target();
             let byte_span = target.site.range.start_byte..target.site.range.end_byte;
             DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
                 result_index,
                 domain: DetailedCodeQueryDomain::FlowRelation,
                 key: DetailedCodeQueryKey::FlowRelation {
@@ -7098,6 +7938,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
             }
         }
@@ -7105,6 +7946,7 @@ fn detailed_evidence_for_pipeline_value(
             let row = &value.row;
             let byte_span = row.site.range.start_byte..row.site.range.end_byte;
             DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
                 result_index,
                 domain: DetailedCodeQueryDomain::ReferenceEdge,
                 key: DetailedCodeQueryKey::ReferenceEdge {
@@ -7125,10 +7967,12 @@ fn detailed_evidence_for_pipeline_value(
                     .and_then(|unit| stable_owner_candidate_for_unit(&row.site.file, unit)),
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
             }
         }
         PipelineValue::DispatchOutcome(value) => DetailedCodeQueryEvidence {
+            selected_pattern_source: Default::default(),
             result_index,
             domain: DetailedCodeQueryDomain::DispatchOutcome,
             key: DetailedCodeQueryKey::DispatchOutcome {
@@ -7142,9 +7986,11 @@ fn detailed_evidence_for_pipeline_value(
             stable_owner_candidate: None,
             provenance: Vec::new(),
             decorated_parameter: None,
+            call_path_evidence: None,
             runtime_keyed_read: None,
         },
         PipelineValue::DispatchTarget(value) => DetailedCodeQueryEvidence {
+            selected_pattern_source: Default::default(),
             result_index,
             domain: DetailedCodeQueryDomain::DispatchTarget,
             key: DetailedCodeQueryKey::DispatchTarget {
@@ -7152,18 +7998,25 @@ fn detailed_evidence_for_pipeline_value(
                 site_id: value.site.site_id.clone(),
                 ordinal: value.ordinal,
                 root_id: value.root_id.clone(),
+                selection_key: value.selection_key(),
             },
             file: value.file().clone(),
             source_slice_sha256: retained_source
                 .and_then(|source| source_slice_sha256(source, &range_byte_span(value.site.range))),
             byte_span: Some(range_byte_span(value.site.range)),
             identities: DetailedCodeQueryProvenanceIdentities::None,
-            stable_owner_candidate: None,
+            stable_owner_candidate: value
+                .site
+                .enclosing
+                .as_ref()
+                .and_then(|declaration| stable_owner_candidate_for_unit(value.file(), declaration)),
             provenance: Vec::new(),
             decorated_parameter: None,
+            call_path_evidence: None,
             runtime_keyed_read: None,
         },
         PipelineValue::MemberFamily(value) => DetailedCodeQueryEvidence {
+            selected_pattern_source: Default::default(),
             result_index,
             domain: DetailedCodeQueryDomain::MemberFamily,
             key: DetailedCodeQueryKey::MemberFamily {
@@ -7177,9 +8030,11 @@ fn detailed_evidence_for_pipeline_value(
             stable_owner_candidate: None,
             provenance: Vec::new(),
             decorated_parameter: None,
+            call_path_evidence: None,
             runtime_keyed_read: None,
         },
         PipelineValue::MemberFamilyEdge(value) => DetailedCodeQueryEvidence {
+            selected_pattern_source: Default::default(),
             result_index,
             domain: DetailedCodeQueryDomain::MemberFamilyEdge,
             key: DetailedCodeQueryKey::MemberFamilyEdge {
@@ -7194,11 +8049,13 @@ fn detailed_evidence_for_pipeline_value(
             stable_owner_candidate: None,
             provenance: Vec::new(),
             decorated_parameter: None,
+            call_path_evidence: None,
             runtime_keyed_read: None,
         },
         PipelineValue::PythonHierarchyFact(value) => {
             let byte_span = range_byte_span(value.site_range.unwrap_or(value.root.range));
             DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
                 result_index,
                 domain: DetailedCodeQueryDomain::PythonHierarchyFact,
                 key: DetailedCodeQueryKey::PythonHierarchyFact {
@@ -7222,6 +8079,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
             }
         }
@@ -7229,6 +8087,7 @@ fn detailed_evidence_for_pipeline_value(
             let row = &value.occurrence;
             let byte_span = row.range.start_byte..row.range.end_byte;
             DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
                 result_index,
                 domain: DetailedCodeQueryDomain::CandidateHop,
                 key: DetailedCodeQueryKey::CandidateHop {
@@ -7247,6 +8106,7 @@ fn detailed_evidence_for_pipeline_value(
                     .and_then(|unit| stable_owner_candidate_for_unit(&row.file, unit)),
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
             }
         }
@@ -7254,6 +8114,7 @@ fn detailed_evidence_for_pipeline_value(
             let row = &value.occurrence;
             let byte_span = row.range.start_byte..row.range.end_byte;
             DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
                 result_index,
                 domain: DetailedCodeQueryDomain::ResolutionCandidate,
                 key: DetailedCodeQueryKey::ResolutionCandidate {
@@ -7272,6 +8133,7 @@ fn detailed_evidence_for_pipeline_value(
                     .and_then(|unit| stable_owner_candidate_for_unit(&row.file, unit)),
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
             }
         }
@@ -7279,6 +8141,7 @@ fn detailed_evidence_for_pipeline_value(
             let row = value.row();
             let byte_span = row.range.start_byte..row.range.end_byte;
             DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
                 result_index,
                 domain: DetailedCodeQueryDomain::QualifiedPath,
                 key: DetailedCodeQueryKey::QualifiedPath {
@@ -7293,6 +8156,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
             }
         }
@@ -7300,6 +8164,7 @@ fn detailed_evidence_for_pipeline_value(
             let row = value.row();
             let byte_span = row.range.start_byte..row.range.end_byte;
             DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
                 result_index,
                 domain: DetailedCodeQueryDomain::PathSegment,
                 key: DetailedCodeQueryKey::PathSegment {
@@ -7315,10 +8180,12 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
             }
         }
         PipelineValue::DependencyEvidence(value) => DetailedCodeQueryEvidence {
+            selected_pattern_source: Default::default(),
             result_index,
             domain: DetailedCodeQueryDomain::DependencyEvidence,
             key: dependency_evidence::evidence_key(value),
@@ -7329,12 +8196,14 @@ fn detailed_evidence_for_pipeline_value(
             stable_owner_candidate: None,
             provenance: Vec::new(),
             decorated_parameter: None,
+            call_path_evidence: None,
             runtime_keyed_read: None,
         },
         PipelineValue::ConfigurationFact(value) => {
             let fact = value.fact();
             let byte_span = fact.evidence().start_byte()..fact.evidence().end_byte();
             DetailedCodeQueryEvidence {
+                selected_pattern_source: Default::default(),
                 result_index,
                 domain: DetailedCodeQueryDomain::ConfigurationFact,
                 key: DetailedCodeQueryKey::ConfigurationFact {
@@ -7348,6 +8217,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                call_path_evidence: None,
                 runtime_keyed_read: None,
             }
         }
@@ -7367,6 +8237,7 @@ fn detailed_semantic_evidence(
 ) -> DetailedCodeQueryEvidence {
     let candidate = detailed_semantic_wire_id_candidate(language, wire_id);
     DetailedCodeQueryEvidence {
+        selected_pattern_source: Default::default(),
         result_index,
         domain,
         key,
@@ -7383,6 +8254,7 @@ fn detailed_semantic_evidence(
         stable_owner_candidate: Some(candidate),
         provenance: Vec::new(),
         decorated_parameter: None,
+        call_path_evidence: None,
         runtime_keyed_read: None,
     }
 }
@@ -7554,6 +8426,83 @@ macro_rules! held_configuration_fact {
     };
 }
 
+/// Procedure provenance may leave the seed file. Hydrate the target's certified
+/// facts while source/fact acquisition is still bounded and attributable.
+#[allow(clippy::too_many_arguments)]
+fn retain_procedure_owner_facts(
+    analyzer: &dyn IAnalyzer,
+    row: &PipelineRow,
+    cache: &mut PipelineRenderCache,
+    facts_cache: &mut HashMap<ProjectFile, Arc<FileFacts>>,
+    budget: &mut CodeQueryExecutionBudget,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+) -> bool {
+    let mut targets = BTreeSet::new();
+    for trace in &row.traces {
+        for step in &trace.steps {
+            if let PipelineTraceValue::Semantic(value) = &step.value
+                && value.domain == DetailedCodeQueryDomain::Procedure
+                && value.file != trace.seed.file
+            {
+                targets.insert(value.file.clone());
+            }
+        }
+    }
+    let mut halted = false;
+    for file in targets {
+        if cache.procedure_owner_target_facts.contains_key(&file)
+            || cache.procedure_owner_unavailable.contains(&file)
+        {
+            continue;
+        }
+        if !procedure_owner_file_is_certified(analyzer, &file)
+            || cache.sources.get(&file).is_none_or(Option::is_none)
+        {
+            cache.procedure_owner_unavailable.insert(file);
+            continue;
+        }
+        match receiver::receiver_facts_for_pipeline_row(
+            analyzer,
+            &row.traces,
+            &file,
+            facts_cache,
+            budget,
+            limits,
+            cancellation,
+            diagnostics,
+            &mut None,
+        ) {
+            receiver::PipelineReceiverFacts::Available(facts) => {
+                if retain_held_source_snapshot(
+                    analyzer,
+                    cache,
+                    &file,
+                    facts.source(),
+                    crate::analyzer::common::language_for_file(&file),
+                    Vec::new(),
+                    diagnostics,
+                ) {
+                    halted = true;
+                } else {
+                    cache.procedure_owner_target_facts.insert(file, facts);
+                }
+            }
+            receiver::PipelineReceiverFacts::Unavailable => {
+                cache.procedure_owner_unavailable.insert(file);
+            }
+            receiver::PipelineReceiverFacts::Halted => {
+                halted = true;
+                if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                    cache.procedure_owner_work.cancelled = true;
+                }
+            }
+        }
+    }
+    halted
+}
+
 /// Retain every source that full-detail terminal and provenance rendering can
 /// consult, before rendering is sealed against untracked cache misses.
 fn retain_budgeted_pipeline_sources(
@@ -7654,6 +8603,10 @@ fn retain_held_source_snapshot(
     }
     if !conflict_before {
         diagnostics.push(QueryExecutionState::diagnostic(analyzer, CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
             incompleteness: brokk_bifrost_rql::Incompleteness::Content,
             related: Vec::new(),
             source: None,
@@ -8023,14 +8976,23 @@ fn retain_budgeted_source_snapshot(
 
     let mut projected = *budget;
     projected.scanned_files = projected.scanned_files.saturating_add(1);
-    if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
-        projected.scanned_files,
+    if brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+        projected
+            .scanned_files
+            .saturating_add(projected.call_scanned_files),
         limits.max_scanned_files,
     )
-    .allows(0)
+    .try_allow(0)
+    .is_err()
     {
         cache.retain_loaded_source(file, None);
-        push_budget_diagnostic(diagnostics, &projected);
+        push_budget_diagnostic(
+            diagnostics,
+            &projected,
+            limits,
+            Some(budget),
+            "source_hydration",
+        );
         return true;
     }
 
@@ -8038,14 +9000,23 @@ fn retain_budgeted_source_snapshot(
     projected.scanned_source_bytes = projected
         .scanned_source_bytes
         .saturating_add(source.as_ref().map_or(0, String::len));
-    if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
-        projected.scanned_source_bytes,
+    if brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+        projected
+            .scanned_source_bytes
+            .saturating_add(projected.call_scanned_source_bytes),
         limits.max_scanned_source_bytes,
     )
-    .allows(0)
+    .try_allow(0)
+    .is_err()
     {
         cache.retain_loaded_source(file, None);
-        push_budget_diagnostic(diagnostics, &projected);
+        push_budget_diagnostic(
+            diagnostics,
+            &projected,
+            limits,
+            Some(budget),
+            "source_hydration",
+        );
         return true;
     }
 
@@ -8058,7 +9029,7 @@ fn retain_budgeted_source_snapshot(
 fn detailed_provenance_for_row(
     analyzer: &dyn crate::analyzer::IAnalyzer,
     row: &PipelineRow,
-    cache: &PipelineRenderCache,
+    cache: &mut PipelineRenderCache,
 ) -> Vec<DetailedCodeQueryProvenanceEvidence> {
     row.traces
         .iter()
@@ -8070,7 +9041,31 @@ fn detailed_provenance_for_row(
                 .iter()
                 .map(|step| DetailedCodeQueryProvenanceStepEvidence {
                     op: step.op.label().to_string(),
-                    result: detailed_trace_provenance_ref(analyzer, &step.value, cache),
+                    result: {
+                        let mut result =
+                            detailed_trace_provenance_ref(analyzer, &step.value, cache);
+                        if result.domain == DetailedCodeQueryDomain::Procedure {
+                            result.identities = DetailedCodeQueryProvenanceIdentities::Primary(
+                                result
+                                    .byte_span
+                                    .clone()
+                                    .and_then(|span| {
+                                        procedure_source_owner(
+                                            analyzer,
+                                            &trace.seed,
+                                            &result.file,
+                                            span,
+                                            cache,
+                                        )
+                                    })
+                                    .map(|candidate| DetailedCodeQueryIdentityCandidate {
+                                        file: result.file.clone(),
+                                        candidate,
+                                    }),
+                            );
+                        }
+                        result
+                    },
                     via: step
                         .via
                         .as_ref()
@@ -8578,6 +9573,7 @@ fn detailed_trace_provenance_ref(
                 site_id: value.site.site_id.clone(),
                 ordinal: value.ordinal,
                 root_id: value.root_id.clone(),
+                selection_key: value.selection_key(),
             },
             value.file(),
             value.site.range,
@@ -9396,6 +10392,136 @@ fn stable_identity_candidate_for_unit(unit: &CodeUnit) -> Option<CodeQueryStable
     })
 }
 
+/// A source owner, independent of selected executable interpretation. The target
+/// file's complete parser facts certify the owner and uniqueness of its key.
+fn procedure_source_owners(
+    language: Language,
+    facts: &FileFacts,
+    work: &mut ProcedureOwnerWork,
+) -> Option<HashMap<(usize, usize), CodeQueryStableOwnerCandidate>> {
+    if !facts.recovered_regions().is_empty() {
+        return Some(HashMap::default());
+    }
+    let mut candidates = Vec::new();
+    let mut counts = HashMap::<String, usize>::default();
+    for (id, node) in facts.nodes().iter().enumerate() {
+        if !work.charge(1) {
+            return None;
+        }
+        if !node.kind.satisfies(NormalizedKind::Callable) {
+            continue;
+        }
+        let Ok(id) = u32::try_from(id) else {
+            return None;
+        };
+        let Some(candidate) =
+            canonical_ast_candidate_for_node_with_visit(language, facts, id, |node| {
+                work.charge(
+                    1usize
+                        .saturating_add(node.kind.label().len())
+                        .saturating_add(
+                            node.name.map_or(0, |name| name.text(facts.source()).len()),
+                        ),
+                )
+            })
+        else {
+            if work.cancelled || work.refused.is_some() {
+                return None;
+            }
+            continue;
+        };
+        let CodeQueryStableOwnerCandidate::Derived { semantic_key, .. } = &candidate else {
+            continue;
+        };
+        *counts.entry(semantic_key.clone()).or_default() += 1;
+        if node.name.is_some()
+            && matches!(
+                node.kind,
+                NormalizedKind::Function | NormalizedKind::Method | NormalizedKind::Constructor
+            )
+        {
+            candidates.push(((node.range.start_byte, node.range.end_byte), candidate));
+        }
+    }
+    let mut owners = HashMap::default();
+    for (range, candidate) in candidates {
+        if !work.charge(1) {
+            return None;
+        }
+        let CodeQueryStableOwnerCandidate::Derived { semantic_key, .. } = &candidate else {
+            continue;
+        };
+        if counts.get(semantic_key) == Some(&1) {
+            owners.insert(range, candidate);
+        }
+    }
+    Some(owners)
+}
+
+fn procedure_owner_file_is_certified(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> bool {
+    let language = crate::analyzer::common::language_for_file(file);
+    let path = rel_path_string(file);
+    analyzer.structural_fact_providers().iter().any(|provider| {
+        provider.structural_language() == language
+            && provider.structural_inventory_complete()
+            && provider.structural_selection_authority().is_some()
+            && matches!(provider.structural_file_read_key(file), Some(crate::analyzer::ReadKey::File { language: selected_language, rel_path, .. }) if selected_language == language && rel_path.as_ref() == path)
+    })
+}
+
+fn procedure_source_owner(
+    analyzer: &dyn IAnalyzer,
+    seed: &SeedMatch,
+    file: &ProjectFile,
+    span: std::ops::Range<usize>,
+    cache: &mut PipelineRenderCache,
+) -> Option<CodeQueryStableOwnerCandidate> {
+    if !cache.procedure_owner_work.charge(0)
+        || !procedure_owner_file_is_certified(analyzer, file)
+        || cache.conflicting_sources.contains(file)
+        || matches!(cache.sources.get(file), Some(None))
+    {
+        return None;
+    }
+    let target_facts = if &seed.file == file {
+        Arc::clone(&seed.facts)
+    } else {
+        Arc::clone(cache.procedure_owner_target_facts.get(file)?)
+    };
+    if !cache.procedure_owners.contains_key(file) {
+        let owners = procedure_source_owners(
+            crate::analyzer::common::language_for_file(file),
+            &target_facts,
+            &mut cache.procedure_owner_work,
+        )?;
+        cache
+            .procedure_owners
+            .insert(file.clone(), (Arc::clone(&target_facts), owners));
+    }
+    let (facts, owners) = cache.procedure_owners.get_mut(file)?;
+    if !Arc::ptr_eq(facts, &target_facts) {
+        if !cache.procedure_owner_work.charge(
+            facts
+                .source()
+                .len()
+                .saturating_add(target_facts.source().len())
+                .saturating_add(facts.nodes().len())
+                .saturating_add(target_facts.nodes().len())
+                .saturating_add(facts.role_count())
+                .saturating_add(target_facts.role_count())
+                .saturating_add(facts.occurrence_role_count())
+                .saturating_add(target_facts.occurrence_role_count()),
+        ) {
+            return None;
+        }
+        if facts.selection_digest() != target_facts.selection_digest() {
+            return None;
+        }
+        *facts = target_facts;
+    }
+    owners.get(&(span.start, span.end)).cloned()
+}
+
 /// Hard cap on a stable semantic key, mirrored from the policy finding
 /// identity validator. Keys over this limit are rejected there, which would
 /// downgrade the finding to a weak anchor and mark the whole policy run
@@ -9410,20 +10536,32 @@ fn canonical_ast_candidate_for_node(
     seed: &SeedMatch,
     node_id: u32,
 ) -> Option<CodeQueryStableOwnerCandidate> {
+    canonical_ast_candidate_for_node_with_visit(seed.language, &seed.facts, node_id, |_| true)
+}
+
+fn canonical_ast_candidate_for_node_with_visit(
+    language: Language,
+    facts: &FileFacts,
+    node_id: u32,
+    mut visit: impl FnMut(&crate::analyzer::structural::facts::NormalizedNode) -> bool,
+) -> Option<CodeQueryStableOwnerCandidate> {
     let mut segments = Vec::new();
     let mut current = Some(node_id);
     while let Some(node_id) = current {
-        let node = seed.facts.node(node_id);
+        let node = facts.node(node_id);
+        if !visit(node) {
+            return None;
+        }
         segments.push((
             node.kind.label(),
-            node.name.map(|name| name.text(seed.facts.source())),
+            node.name.map(|name| name.text(facts.source())),
         ));
         current = node.parent;
     }
     segments.reverse();
     let semantic_key = bounded_canonical_ast_key(&segments)?;
     Some(CodeQueryStableOwnerCandidate::Derived {
-        namespace: seed.language.config_label().to_string(),
+        namespace: language.config_label().to_string(),
         derivation: CodeQueryStableOwnerDerivation::CanonicalAstIdentity,
         semantic_key,
     })
@@ -9504,6 +10642,7 @@ fn pipeline_expansion_with_via(
     PipelineExpansion {
         value,
         trace: vec![(trace_value, via)],
+        call_path_evidence: None,
         budgeted: false,
     }
 }
@@ -9512,6 +10651,7 @@ fn budgeted_declaration_expansion(declaration: DeclarationValue) -> PipelineExpa
     PipelineExpansion {
         value: PipelineValue::Declaration(declaration.clone()),
         trace: vec![(PipelineTraceValue::Declaration(declaration), None)],
+        call_path_evidence: None,
         budgeted: true,
     }
 }
@@ -9698,5 +10838,105 @@ fn pipeline_trace_value(value: &PipelineValue) -> Option<PipelineTraceValue> {
             Some(PipelineTraceValue::ConfigurationFact(value.clone()))
         }
         PipelineValue::CrossDomain(value) => Some(PipelineTraceValue::CrossDomain(value.clone())),
+    }
+}
+
+#[cfg(test)]
+mod proof_stop_diagnostic_tests {
+    use super::*;
+    use brokk_bifrost_analysis::analyzer::QueryReadIncomplete;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#12936: refusal grouping attributed both operands to the first branch")]
+    fn refusal_groups_preserve_branch_provenance() {
+        let make = |branch, offset| {
+            serde_json::from_value::<CodeQueryDiagnostic>(serde_json::json!({
+                "code":"semantic_analysis_partial", "impact":"incomplete", "incompleteness":"content",
+                "language":"rust", "branch":[branch],
+                "message":"call_bindings incomplete\ncall-binding refusal: CalleeUnresolved",
+                "source":{"path":"main.rs","start_byte":offset,"end_byte":offset+1,
+                    "range":{"start_line":1,"end_line":1,"start_column":offset+1,"end_column":offset+2}}
+            })).unwrap()
+        };
+        let result = merge_refused_sites(vec![make(1, 8), make(0, 2), make(0, 0)]);
+        assert_eq!(result.len(), 2);
+        let first = result
+            .iter()
+            .find(|diagnostic| diagnostic.branch == [0])
+            .unwrap();
+        assert_eq!(first.source.as_ref().unwrap().start_byte, 0);
+        assert_eq!(first.related.len(), 1);
+        assert_eq!(first.related[0].source.start_byte, 2);
+        let second = result
+            .iter()
+            .find(|diagnostic| diagnostic.branch == [1])
+            .unwrap();
+        assert_eq!(second.source.as_ref().unwrap().start_byte, 8);
+        assert!(second.related.is_empty());
+    }
+
+    #[test]
+    #[hardwon("#12936: repeatedly sorting accumulated refusal sites made grouping quadratic")]
+    fn many_refused_sites_merge_once_in_stable_order() {
+        let prototype: CodeQueryDiagnostic = serde_json::from_value(serde_json::json!({
+            "code": "semantic_analysis_partial", "impact": "incomplete",
+            "incompleteness": "content", "language": "rust",
+            "message": "call_bindings incomplete\ncall-binding refusal: CalleeUnresolved",
+            "source": {"path": "main.rs", "start_byte": 0, "end_byte": 1,
+                "range": {"start_line": 1, "end_line": 1, "start_column": 1, "end_column": 2}}
+        }))
+        .unwrap();
+        let mut diagnostics = Vec::new();
+        for offset in (0..8192).rev() {
+            let mut diagnostic = prototype.clone();
+            let source = diagnostic.source.as_mut().unwrap();
+            source.start_byte = offset;
+            source.end_byte = offset + 1;
+            source.range.start_column = offset + 1;
+            source.range.end_column = offset + 2;
+            diagnostic.refusal_sites.insert(format!("site-{offset}"));
+            // Overlapping branches and reused units can repeat the same site.
+            diagnostics.push(diagnostic.clone());
+            diagnostics.push(diagnostic);
+        }
+        let reversed = diagnostics.iter().rev().cloned().collect();
+        let merged = merge_refused_sites(diagnostics);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].source.as_ref().unwrap().start_byte, 0);
+        assert_eq!(merged[0].related.len(), 8191);
+        assert_eq!(merged[0].refusal_sites.len(), 8192);
+        for (index, related) in merged[0].related.iter().enumerate() {
+            assert_eq!(related.source.start_byte, index + 1);
+        }
+        let repeated = merge_refused_sites(reversed);
+        assert_eq!(merged, repeated);
+        assert_eq!(merged[0].refusal_sites, repeated[0].refusal_sites);
+    }
+
+    #[test]
+    #[hardwon("#11145: cancelled proof stops lost the public cancellation diagnostic")]
+    fn proof_stop_diagnostic_preserves_operational_channel() {
+        for (cause, expected) in [
+            (
+                DerivationExecutionCause::Cancelled,
+                CodeQueryDiagnosticCode::Cancelled,
+            ),
+            (
+                DerivationExecutionCause::Budget,
+                CodeQueryDiagnosticCode::ExecutionBudgetExhausted,
+            ),
+        ] {
+            let mut diagnostics = Vec::new();
+            fold_query_read_incompleteness(
+                &mut diagnostics,
+                [QueryReadIncomplete::ProofStopped {
+                    reason: "stopped",
+                    cause: Some(cause),
+                }],
+            );
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(diagnostics[0].code, expected);
+        }
     }
 }

@@ -24,7 +24,7 @@ enum Node {
     Reach(usize),
 }
 
-impl<Provider, L> Search<'_, Provider, L>
+impl<Provider, L> Search<'_, '_, Provider, L>
 where
     Provider: CompositionProvider,
     L: ComposeLabels<Fact = Provider::Fact, Function = Provider::Function>,
@@ -56,13 +56,13 @@ where
                 let Root::Sink(sink, _) = &reach.key.root else {
                     return None;
                 };
-                let accepted = &self.accepted[sink];
+                let accepted = &self.inputs.accepted[sink];
                 let labels = self.functions.labels();
                 labels
                     .intersects(
                         &labels.apply(
                             self.functions.function(reach.key.function),
-                            &self.sources[reach.key.source.index()].classes,
+                            &self.inputs.sources[reach.key.source.index()].classes,
                         ),
                         accepted,
                     )
@@ -95,7 +95,7 @@ where
                 }
                 Node::Reach(id) => {
                     chop.insert(
-                        self.sources[self.reaches[id].key.source.index()]
+                        self.inputs.sources[self.reaches[id].key.source.index()]
                             .point
                             .procedure()
                             .durable_key(),
@@ -134,7 +134,7 @@ where
             // its already materialized source observations without projecting
             // more relations or asking the native resolver for more work.
             for pair in self.current_pairs() {
-                let source = &self.sources[pair.source.index()];
+                let source = &self.inputs.sources[pair.source.index()];
                 let endpoint = match &source.carrier {
                     ValueFlowCarrier::Value(value) => {
                         crate::analyzer::semantic::ValueFlowEndpoint::Value(value.clone())
@@ -164,7 +164,7 @@ where
                 let mut checks = self
                     .provider
                     .value_type_barrier_checks(&[observation], request)
-                    .map_err(provider_error)?;
+                    .map_err(|error| classified_provider_error(self.provider, error))?;
                 for check in &mut checks {
                     check.decision = crate::analyzer::semantic::ValueTypeBarrierDecision::Undecided(
                         crate::analyzer::semantic::ValueTypeBarrierReason::Cancelled,
@@ -255,9 +255,9 @@ where
                 labels.intersects(
                     &labels.apply(
                         &self.functions.hops_value(hops),
-                        &self.sources[pair.source.index()].classes,
+                        &self.inputs.sources[pair.source.index()].classes,
                     ),
-                    &self.accepted[&pair.sink],
+                    &self.inputs.accepted[&pair.sink],
                 )
             }) {
                 continue;
@@ -309,9 +309,9 @@ where
                         labels.intersects(
                             &labels.apply(
                                 &self.functions.hops_value(hops),
-                                &self.sources[pair.source.index()].classes,
+                                &self.inputs.sources[pair.source.index()].classes,
                             ),
-                            &self.accepted[&pair.sink],
+                            &self.inputs.accepted[&pair.sink],
                         )
                     })
             });
@@ -320,7 +320,7 @@ where
             }
             self.barrier_notes
                 .push(super::super::ValueTypeBarrierFindingNotes {
-                    source: self.sources[pair.source.index()].origin.clone(),
+                    source: self.inputs.sources[pair.source.index()].origin.clone(),
                     sink: self
                         .value_flow
                         .expect("value refinement has a value plan")
@@ -370,13 +370,13 @@ where
                         checks.extend(
                             self.provider
                                 .value_type_barrier_port_checks(procedure, port, request)
-                                .map_err(provider_error)?,
+                                .map_err(|error| classified_provider_error(self.provider, error))?,
                         );
                     }
                     continue;
                 }
             };
-            let seed = super::super::report::interior_seed(&self.sources, &from)
+            let seed = super::super::report::interior_seed(&self.inputs.sources, &from)
                 .expect("a recorded seed is a source or port");
             let (observations, target) = match &to {
                 Endpoint::StoreWrite(write) => {
@@ -423,7 +423,7 @@ where
                 self.provider
                     .interior_flows(procedure, &[seed], &observations, true, request)
             }
-            .map_err(provider_error)?;
+            .map_err(|error| classified_provider_error(self.provider, error))?;
             let mut values = Vec::new();
             if let Some(steps) = flows
                 .flows
@@ -451,7 +451,7 @@ where
             checks.extend(
                 self.provider
                     .value_type_barrier_checks(&values, request)
-                    .map_err(provider_error)?,
+                    .map_err(|error| classified_provider_error(self.provider, error))?,
             );
         }
         Ok(checks)
@@ -530,7 +530,12 @@ where
             .iter()
             .flat_map(|class| class.iter())
             .copied()
-            .filter(|call| !self.dispatches.contains_key(&(procedure.clone(), *call)))
+            .filter(|call| {
+                !self
+                    .inputs
+                    .dispatches
+                    .contains_key(&(procedure.clone(), *call))
+            })
             .collect::<HashSet<_>>();
         self.extra_proof_lookups += extra.len();
         // This only reads continuation evidence. It never calls descend,
@@ -554,7 +559,7 @@ where
             let checks = self
                 .provider
                 .value_type_barrier_port_checks(procedure, port, request)
-                .map_err(provider_error)?;
+                .map_err(|error| classified_provider_error(self.provider, error))?;
             if checks
                 .iter()
                 .any(|check| !self.provider.permits_value_type_barrier(check.decision))
@@ -579,7 +584,7 @@ where
                 let projections = self
                     .provider
                     .projected_partial_flows(procedure, request)
-                    .map_err(provider_error)?;
+                    .map_err(|error| classified_provider_error(self.provider, error))?;
                 let selected = self.functions.function(*function);
                 let partial = projections
                     .iter()
@@ -637,8 +642,9 @@ where
             } => {
                 let seed = match from {
                     Endpoint::Source(id) => {
-                        let source = &self.sources[id.index()];
+                        let source = &self.inputs.sources[id.index()];
                         InteriorSeed::Source {
+                            selected_entry: source.selected_entry.clone(),
                             point: source.point.id(),
                             phase: source.phase,
                             carrier: source.carrier.clone(),
@@ -703,7 +709,7 @@ where
                 let projections = self
                     .provider
                     .projected_interior_flows(procedure, &[seed], &observations, false, request)
-                    .map_err(provider_error)?;
+                    .map_err(|error| classified_provider_error(self.provider, error))?;
                 let selected = self.functions.function(*function);
                 let flows = projections.into_iter().find_map(|(restriction, flows)| {
                     (restriction
@@ -881,8 +887,9 @@ where
                                 Hop::path_quality(hops)
                                     .conjoin(self.items[*next].quality)
                                     .conjoin(
-                                        match self.sources[self.reaches[id].key.source.index()]
-                                            .evidence
+                                        match self.inputs.sources
+                                            [self.reaches[id].key.source.index()]
+                                        .evidence
                                         {
                                             EndpointEvidence::Known(quality) => quality,
                                             EndpointEvidence::Unknown => HopQuality::CERTAIN,

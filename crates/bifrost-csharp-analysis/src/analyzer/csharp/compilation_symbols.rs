@@ -312,16 +312,32 @@ impl OrderedProperties {
     }
 
     /// Execute one fragment's property operations in document order.
+    #[cfg(test)]
     pub(super) fn apply(&mut self, source: &str) {
+        self.apply_observing(source, |_, _, _, _| {});
+    }
+
+    /// Observe assignments at their execution point, before SDK uncertainty is
+    /// propagated to later guards. A false guard is observed but never applied.
+    pub(super) fn apply_observing(
+        &mut self,
+        source: &str,
+        mut observe: impl FnMut(&str, Option<bool>, &str, &Properties),
+    ) {
         let Ok(operations) = operations(source) else {
             self.poisoned = true;
             return;
         };
+        // The chain flattens imports ahead of their importer. Only the suffix
+        // after the last import can supply a final observed constant assignment.
+        let last_import = operations
+            .iter()
+            .rposition(|operation| matches!(operation, Operation::Import(_)));
         // MSBuild decides a PropertyGroup's condition once, on entry. Sibling
         // properties share that condition's text, so its first decision holds
         // for the whole group even if a sibling changes a property it reads.
         let mut entered = EnteredConditions::default();
-        for operation in operations {
+        for (index, operation) in operations.into_iter().enumerate() {
             match operation {
                 Operation::Property(name, PropertyValue { value, conditions }) => {
                     if self.globals.contains(&name) {
@@ -330,6 +346,14 @@ impl OrderedProperties {
                     let decision = self.decide_with(&conditions, |condition| {
                         entered.decide(condition, &self.state)
                     });
+                    let observed_decision = if self.order_ambiguous.contains(&name)
+                        && last_import.is_some_and(|last| index < last)
+                    {
+                        None
+                    } else {
+                        decision
+                    };
+                    observe(&name, observed_decision, &value, &self.state);
                     let value = match decision {
                         Some(false) => continue,
                         _ if self.order_ambiguous.contains(&name) => Err("import_order"),
@@ -342,6 +366,7 @@ impl OrderedProperties {
                     self.state.insert(name, value);
                 }
                 Operation::TargetProperty(name) => {
+                    observe(&name, None, "", &self.state);
                     if !self.globals.contains(&name) {
                         self.state.insert(name, Err("target_assignment"));
                     }
@@ -360,6 +385,7 @@ impl OrderedProperties {
     /// The caller has not applied that fragment yet, so a condition reading a
     /// property the fragment itself assigns is undecided: its value at the
     /// assignment may differ from the value at the fragment's start.
+    #[cfg(test)]
     pub(super) fn decide_at_fragment_start(
         &self,
         conditions: &[Arc<str>],
@@ -929,10 +955,11 @@ fn operations(source: &str) -> Result<Vec<Operation>, &'static str> {
             }
             Event::Text(text) => {
                 if let Some(frame) = stack.last_mut() {
-                    let decoded = text.decode().map_err(|_| "dynamic_property")?;
-                    frame.2.push_str(
-                        &quick_xml::escape::unescape(&decoded).map_err(|_| "dynamic_property")?,
-                    );
+                    let decoded = text.xml10_content().map_err(|_| "dynamic_property")?;
+                    if !is_xml_text(&decoded) {
+                        return Err("dynamic_property");
+                    }
+                    frame.2.push_str(&decoded);
                 }
             }
             Event::CData(text) => {
@@ -956,7 +983,13 @@ fn operations(source: &str) -> Result<Vec<Operation>, &'static str> {
                 }
             }
             Event::Eof => break,
-            Event::DocType(_) | Event::GeneralRef(_) => return Err("dynamic_property"),
+            Event::GeneralRef(reference) => {
+                let value = xml_reference_value(&reference).ok_or("dynamic_property")?;
+                if let Some(frame) = stack.last_mut() {
+                    frame.2.push_str(&value);
+                }
+            }
+            Event::DocType(_) => return Err("dynamic_property"),
             _ => {}
         }
     }
@@ -986,6 +1019,15 @@ pub(super) struct FrameworkInstance {
     global_properties: Vec<(&'static str, String)>,
 }
 
+impl FrameworkInstance {
+    pub(super) fn globals(&self) -> Vec<(&str, &str)> {
+        self.global_properties
+            .iter()
+            .map(|(name, value)| (*name, value.as_str()))
+            .collect()
+    }
+}
+
 fn evaluate(
     inputs: &ConfigurationByPath<'_>,
     paths: &[&str],
@@ -1005,6 +1047,7 @@ fn evaluate(
                 entered.decide(condition, properties)
             })
         },
+        expand,
     )?
     .map_or(Ok(()), Err)
 }
@@ -1016,6 +1059,7 @@ fn evaluate_properties(
     configurations: &mut BTreeSet<String>,
     globals: &[(&str, String)],
     mut decide: impl FnMut(&[Arc<str>], &Properties) -> Option<bool>,
+    expand_property: impl Fn(&str, &Properties) -> Result<String, &'static str>,
 ) -> Result<Option<&'static str>, &'static str> {
     let mut work = paths
         .iter()
@@ -1041,7 +1085,7 @@ fn evaluate_properties(
                     if name == "configuration" {
                         // A project-authored default is a possible configuration,
                         // even though no selected configuration is assumed here.
-                        match expand(&value.value, properties) {
+                        match expand_property(&value.value, properties) {
                             Ok(name) => {
                                 configurations.insert(name);
                             }
@@ -1059,7 +1103,7 @@ fn evaluate_properties(
                         continue;
                     }
                     let value = if condition == Some(true) {
-                        expand(&value.value, properties)
+                        expand_property(&value.value, properties)
                     } else {
                         Err("condition")
                     };
@@ -1177,6 +1221,7 @@ pub(super) fn framework_instances(
                 entered.decide(condition, properties)
             })
         },
+        expand,
     )
     .is_err()
     {
@@ -1224,6 +1269,130 @@ pub(super) fn declared_frameworks(properties: &Result<Properties, &'static str>)
         .unwrap_or_default()
 }
 
+fn evaluate_project_properties(
+    inputs: &ConfigurationByPath<'_>,
+    project: &str,
+    properties: &mut Properties,
+    configuration_names: &mut BTreeSet<String>,
+    globals: &[(&str, String)],
+) -> Result<Option<&'static str>, &'static str> {
+    let mut property_reason = None;
+    if let Some(props) = nearest(inputs, project, "Directory.Build.props")? {
+        property_reason =
+            evaluate(inputs, &[props], properties, configuration_names, globals).err();
+    }
+    if let Some(packages) = nearest(inputs, project, "Directory.Packages.props")?
+        && let Err(reason) = evaluate(
+            inputs,
+            &[packages],
+            properties,
+            configuration_names,
+            globals,
+        )
+    {
+        property_reason.get_or_insert(reason);
+    }
+    let defines = properties
+        .get("defineconstants")
+        .expect("default defines")
+        .as_ref()
+        .map(|defines| format!("{defines};TRACE"))
+        .map_err(|reason| *reason);
+    properties.insert("defineconstants".into(), defines);
+    let mut body = vec![project];
+    if let Some(targets) = nearest(inputs, project, "Directory.Build.targets")? {
+        body.push(targets);
+    }
+    if let Err(reason) = evaluate(inputs, &body, properties, configuration_names, globals) {
+        property_reason.get_or_insert(reason);
+    }
+    Ok(property_reason)
+}
+
+// Framework selection and the project name have established values. Other
+// SDK-assigned properties can still change after the authored property pass,
+// including empty TargetFrameworkIdentifier and configuration/framework defines.
+fn metadata_expand(value: &str, properties: &Properties) -> Result<String, &'static str> {
+    if referenced_properties(value).any(|name| {
+        sdk_or_reserved_property(&name)
+            && !matches!(
+                name.as_str(),
+                "msbuildprojectname" | "targetframework" | "targetframeworks"
+            )
+    }) {
+        return Err("sdk_property");
+    }
+    expand(value, properties)
+}
+
+pub(super) struct MetadataProperties {
+    values: Properties,
+    complete: bool,
+}
+
+impl MetadataProperties {
+    pub(super) fn get(&self, name: &str) -> Option<Option<&str>> {
+        if !self.complete {
+            return Some(None);
+        }
+        self.values.get(name).map(|value| value.as_deref().ok())
+    }
+
+    pub(super) fn decide(&self, conditions: &[Arc<str>]) -> Option<bool> {
+        if !self.complete {
+            return None;
+        }
+        decide_conditions(conditions, |condition| {
+            metadata_expand(condition, &self.values).ok()?;
+            evaluate_condition(condition, &self.values)
+        })
+    }
+}
+
+pub(super) fn metadata_properties(
+    inputs: &ConfigurationByPath<'_>,
+    project: &str,
+    instance: Option<&FrameworkInstance>,
+    roots: &[&str],
+) -> MetadataProperties {
+    let mut values = initial_properties();
+    values.insert(
+        "msbuildprojectname".into(),
+        Ok(Path::new(project)
+            .file_stem()
+            .expect("project name")
+            .to_string_lossy()
+            .into_owned()),
+    );
+    values.insert("targetframework".into(), Ok(String::new()));
+    values.insert("configuration".into(), Err("dynamic_property"));
+    let globals = instance
+        .map(|instance| instance.global_properties.as_slice())
+        .unwrap_or(&[]);
+    for (name, value) in globals {
+        values.insert(name.to_ascii_lowercase(), Ok(value.clone()));
+    }
+    let mut entered = EnteredConditions::default();
+    // A scalar condition can leave individual values unknown while traversal
+    // finishes. An evaluation error stops traversal and poisons every value.
+    let complete = evaluate_properties(
+        inputs,
+        roots,
+        &mut values,
+        &mut BTreeSet::new(),
+        globals,
+        |conditions, properties| {
+            decide_conditions(conditions, |condition| {
+                metadata_expand(condition, properties).ok()?;
+                entered.decide(condition, properties)
+            })
+        },
+        metadata_expand,
+    )
+    .is_ok();
+    MetadataProperties { values, complete }
+}
+
 pub(super) fn derive_indexed(
     inputs: &ConfigurationByPath<'_>,
     project: Option<&str>,
@@ -1256,48 +1425,13 @@ pub(super) fn derive_indexed(
         if parsed.sdks != ["Microsoft.NET.Sdk"] {
             return Err("unevaluated_import");
         }
-        let mut property_reason = None;
-        if let Some(props) = nearest(inputs, project, "Directory.Build.props")? {
-            property_reason = evaluate(
-                inputs,
-                &[props],
-                &mut properties,
-                &mut configuration_names,
-                globals,
-            )
-            .err();
-        }
-        if let Some(packages) = nearest(inputs, project, "Directory.Packages.props")?
-            && let Err(reason) = evaluate(
-                inputs,
-                &[packages],
-                &mut properties,
-                &mut configuration_names,
-                globals,
-            )
-        {
-            property_reason.get_or_insert(reason);
-        }
-        let defines = properties
-            .get("defineconstants")
-            .expect("default defines")
-            .as_ref()
-            .map(|defines| format!("{defines};TRACE"))
-            .map_err(|reason| *reason);
-        properties.insert("defineconstants".into(), defines);
-        let mut body = vec![project];
-        if let Some(targets) = nearest(inputs, project, "Directory.Build.targets")? {
-            body.push(targets);
-        }
-        if let Err(reason) = evaluate(
+        let property_reason = evaluate_project_properties(
             inputs,
-            &body,
+            project,
             &mut properties,
             &mut configuration_names,
             globals,
-        ) {
-            property_reason.get_or_insert(reason);
-        }
+        )?;
         let intermediate = properties
             .get("baseintermediateoutputpath")
             .expect("default path")
@@ -1557,7 +1691,7 @@ pub(crate) fn capture_ancestor_configuration_paths(
 ) {
     for file in files
         .iter()
-        .filter(|file| has_extension(file.rel_path(), "csproj"))
+        .filter(|file| is_csharp_project_file(file.rel_path()))
     {
         for directory in file
             .rel_path()
@@ -1596,7 +1730,7 @@ pub(crate) fn restore_paths_from_retained_inputs(
     let mut paths = Vec::new();
     for file in inputs
         .iter()
-        .filter(|input| has_extension(Path::new(input.relative_path()), "csproj"))
+        .filter(|input| is_csharp_project_file(Path::new(input.relative_path())))
     {
         let path = file.relative_path();
         let mut properties = initial_properties();
@@ -1609,6 +1743,7 @@ pub(crate) fn restore_paths_from_retained_inputs(
                     &mut BTreeSet::new(),
                     &[],
                     |conditions, _| conditions.is_empty().then_some(true),
+                    expand,
                 )
                 .and_then(|reason| reason.map_or(Ok(()), Err))
             })

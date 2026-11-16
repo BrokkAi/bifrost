@@ -1,0 +1,6 @@
+# The Ruby workspace signature facts lever (#12967).
+#
+# Add one `<issue>-<slug>` line when a change alters the facts the
+# workspace RBS signature producer publishes for unchanged `sig/**/*.rbs`
+# bytes: its identity keys every `ruby_signature_files` head.
+12967-ruby-workspace-signatures

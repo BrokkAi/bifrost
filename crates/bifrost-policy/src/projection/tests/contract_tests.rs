@@ -54,7 +54,7 @@ fn one_typestate_projection_fits_a_one_finding_budget() {
     let batch = authority.seal_batch(TypestateProjectionPayload {
         projections: vec![typestate_projected_finding(&authority)],
         completion: PolicyRunCompletion::Complete,
-        diagnostics: Vec::new(),
+        diagnostics: Vec::new().into(),
         diagnostics_truncated: false,
         work: PolicyWorkReport::default(),
         subjects: None,
@@ -121,7 +121,7 @@ fn finding_budget_reports_its_own_incomplete_reason() {
             taint_projection_envelope(facts.clone(), vec![taint_pair(&facts, 0, "call:second")]),
         ],
         PolicyRunCompletion::Complete,
-        Vec::new(),
+        Vec::new().into(),
         false,
         PolicyWorkReport::default(),
     );
@@ -227,7 +227,7 @@ fn truncated_taint_origins_remain_marked_in_validated_batch() {
         &authority,
         vec![taint_projection_envelope(facts, vec![pair])],
         PolicyRunCompletion::Complete,
-        Vec::new(),
+        Vec::new().into(),
         false,
         PolicyWorkReport::default(),
     );
@@ -257,7 +257,7 @@ fn truncated_typestate_witnesses_remain_marked_in_validated_batch() {
     let batch = authority.seal_batch(TypestateProjectionPayload {
         projections: vec![projection],
         completion: PolicyRunCompletion::Complete,
-        diagnostics: Vec::new(),
+        diagnostics: Vec::new().into(),
         diagnostics_truncated: false,
         work: PolicyWorkReport::default(),
         subjects: None,
@@ -411,7 +411,7 @@ fn truncated_typestate_diagnostics_make_batch_inconclusive() {
     let batch = authority.seal_batch(TypestateProjectionPayload {
         projections: Vec::new(),
         completion: PolicyRunCompletion::Complete,
-        diagnostics: Vec::new(),
+        diagnostics: Vec::new().into(),
         diagnostics_truncated: true,
         work: PolicyWorkReport::default(),
         subjects: None,
@@ -566,4 +566,105 @@ fn endpoint_terminal_accepts_its_declared_phase() {
     )
     .unwrap();
     assert!(validate_typestate_facts(&authority, facts, &PolicyBudget::default()).is_ok());
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#11321: projection diagnostic clipping erased refused lanes before run assembly"
+)]
+fn budget_telemetry_projection_cuts_preserve_refused_lanes() {
+    use crate::finding::{
+        PolicyDiagnosticCode, PolicyDiagnosticImpact, PolicyDiagnosticSeverity, PolicyRun,
+    };
+    use brokk_bifrost_rql::structural::CodeQueryExhaustedRoot;
+
+    let budget = PolicyBudget::builder()
+        .with_max_diagnostics(0)
+        .unwrap()
+        .build()
+        .unwrap();
+    let registry = registry(&[
+        ("test:taint", taint_policy("test.taint-telemetry")),
+        (
+            "test:state",
+            crate::test_support::typestate_policy_source("test.state-telemetry", "State telemetry"),
+        ),
+    ]);
+    for policy in registry.policies() {
+        let diagnostic = PolicyDiagnostic::try_new(
+            PolicyDiagnosticCode::EvaluationFailure,
+            PolicyDiagnosticSeverity::Warning,
+            PolicyDiagnosticImpact::RunIncomplete,
+            "solver stopped",
+            None,
+            Vec::new(),
+            crate::RelatedLocationOmissions::Known(0),
+        )
+        .unwrap()
+        .with_exhausted_roots(vec![CodeQueryExhaustedRoot {
+            path: "src/example.rs".to_string(),
+            procedure: None,
+            lane: "solver/reached_states".to_string(),
+            stage: None,
+            budget: None,
+            charge: None,
+            feedback_iteration: None,
+        }]);
+        let completion =
+            PolicyRunCompletion::inconclusive(vec![PolicyIncompleteReason::PartialDiscovery])
+                .unwrap();
+        let (completion, diagnostics, truncated, work) =
+            if policy.definition().analysis.analysis_type() == PolicyAnalysisType::Taint {
+                let authority = TaintProjectionAuthority::from_loaded(policy).unwrap();
+                let batch = taint_batch(
+                    &authority,
+                    Vec::new(),
+                    completion,
+                    vec![diagnostic].into(),
+                    false,
+                    PolicyWorkReport::default(),
+                );
+                let validated = validate_taint_batch(&authority, batch, &budget).unwrap();
+                (
+                    validated.completion,
+                    validated.diagnostics,
+                    validated.diagnostics_truncated,
+                    validated.work,
+                )
+            } else {
+                let authority = typestate_authority(policy);
+                let batch = authority.seal_batch(TypestateProjectionPayload {
+                    projections: Vec::new(),
+                    completion,
+                    diagnostics: vec![diagnostic].into(),
+                    diagnostics_truncated: false,
+                    work: PolicyWorkReport::default(),
+                    subjects: None,
+                });
+                let validated = validate_typestate_batch(&authority, batch, &budget).unwrap();
+                (
+                    validated.completion,
+                    validated.diagnostics,
+                    validated.diagnostics_truncated,
+                    validated.work,
+                )
+            };
+        let run = PolicyRun::try_new(
+            policy.definition().metadata.id.clone(),
+            policy.semantic_hash(),
+            policy.definition().analysis.analysis_type(),
+            completion,
+            Vec::new(),
+            diagnostics,
+            truncated,
+            work,
+            &budget,
+        )
+        .unwrap();
+        assert!(run.findings().is_empty() && run.diagnostics().is_empty());
+        assert_eq!(
+            run.budget_refusals(),
+            ["policy/diagnostics", "solver/reached_states"]
+        );
+    }
 }

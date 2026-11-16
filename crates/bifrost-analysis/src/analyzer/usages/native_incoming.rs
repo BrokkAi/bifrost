@@ -8,14 +8,16 @@ use std::sync::Arc;
 use crate::analyzer::structural::facts::FileFacts;
 use crate::analyzer::structural::reference_edges::{EdgeDerivationResult, ReferenceEdgeRow};
 use crate::analyzer::usages::call_relations::{
-    CallRelationDiagnostic, CallRelationLimits, CallRelationResult, CallRelationWork, CallSite,
-    CallerInventoryCoverage, is_call_relation_unit, raw_call_site,
+    CallRelationBudgetRefusal, CallRelationDiagnostic, CallRelationDiagnosticCode,
+    CallRelationDiagnosticPayload, CallRelationLimits, CallRelationResult, CallRelationScanLimit,
+    CallRelationWork, CallSite, CallerInventoryCoverage, is_call_relation_unit, raw_call_site,
 };
 use crate::analyzer::usages::get_definition::call_sites::{
     CallSiteSyntax, call_site_syntax_for_reference,
 };
 use crate::analyzer::usages::proof_rank;
 use brokk_bifrost_core::analyzer::model::{CodeUnit, ProjectFile};
+use brokk_bifrost_core::analyzer::reuse_verdict::{CarriesReuseVerdict, ReuseVerdict};
 use brokk_bifrost_core::analyzer::usages::model::{ReferenceKind, UsageHitKind, UsageProof};
 use brokk_bifrost_core::cancellation::CancellationToken;
 use brokk_bifrost_core::hash::HashMap;
@@ -31,26 +33,54 @@ pub struct IncomingFileBudget<'a> {
     limits: CallRelationLimits,
     work: &'a mut CallRelationWork,
     truncated: &'a mut bool,
+    refused_scan_limit: Option<CallRelationScanLimit>,
+    budget_refusals: &'a mut Vec<CallRelationBudgetRefusal>,
+    /// The refused scan limits, joined into the projection's captures once
+    /// the file is loaded.
+    reuse: ReuseVerdict,
 }
 
 impl IncomingFileBudget<'_> {
     pub fn file_capacity_exhausted(&mut self) -> bool {
-        let exhausted = !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+        let refused = brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
             self.work.scanned_files,
             self.limits.max_files,
         )
-        .allows(1);
+        .try_allow(1)
+        .err();
+        let exhausted = refused.is_some();
         *self.truncated |= exhausted;
+        if let Some(refused) = refused {
+            self.reuse.join_in(refused.reuse_verdict());
+            self.refused_scan_limit = Some(CallRelationScanLimit::Files);
+            CallRelationBudgetRefusal::Files {
+                consumed: self.work.scanned_files,
+                limit: self.limits.max_files,
+            }
+            .record(self.budget_refusals);
+        }
         exhausted
     }
 
     pub fn source_fits(&mut self, bytes: usize) -> bool {
-        let fits = brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+        let refused = brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
             self.work.scanned_source_bytes,
             self.limits.max_source_bytes,
         )
-        .allows(bytes);
+        .try_allow(bytes)
+        .err();
+        let fits = refused.is_none();
         *self.truncated |= !fits;
+        if let Some(refused) = refused {
+            self.reuse.join_in(refused.reuse_verdict());
+            self.refused_scan_limit = Some(CallRelationScanLimit::SourceBytes);
+            CallRelationBudgetRefusal::SourceBytes {
+                consumed: self.work.scanned_source_bytes,
+                attempted: self.work.scanned_source_bytes.saturating_add(bytes),
+                limit: self.limits.max_source_bytes,
+            }
+            .record(self.budget_refusals);
+        }
         fits
     }
 
@@ -114,6 +144,11 @@ pub trait IncomingCallProjection {
     }
 
     fn report_issue(&self, issue: IncomingProjectionIssue<'_>) -> CallRelationDiagnostic;
+
+    /// Join a refused scan limit into the language's current captures. The
+    /// incoming sites cannot carry a verdict, so the projection, which owns
+    /// the analyzer, routes it.
+    fn join_reuse_verdict(&self, verdict: ReuseVerdict);
 }
 
 /// Pending calls and paired language metadata for exactly one requested target.
@@ -160,15 +195,29 @@ pub fn project_selected_incoming<'e, M, P: IncomingCallProjection>(
         );
         let file = &edge.site.file;
         if !files.contains_key(file) {
-            let loaded = projection.load_file(
-                file,
-                &mut IncomingFileBudget {
-                    limits,
-                    work: &mut result.work,
-                    truncated: &mut result.truncated,
-                },
-                &mut result.diagnostics,
-            )?;
+            let mut budget = IncomingFileBudget {
+                limits,
+                work: &mut result.work,
+                truncated: &mut result.truncated,
+                refused_scan_limit: None,
+                budget_refusals: &mut result.budget_refusals,
+                reuse: ReuseVerdict::Content,
+            };
+            let loaded = projection.load_file(file, &mut budget, &mut result.diagnostics);
+            projection.join_reuse_verdict(budget.reuse);
+            let loaded = loaded?;
+            if let Some(limit) = budget.refused_scan_limit {
+                result.diagnostics.push(CallRelationDiagnostic::new(
+                    CallRelationDiagnosticCode::ScanGrantRefused(limit),
+                    CallRelationDiagnosticPayload::IncomingScanGrantRefused {
+                        path: crate::path_utils::rel_path_string(file),
+                        target: target.fq_name().to_string(),
+                        limit,
+                    }
+                    .at(file, None),
+                    target.fq_name().to_string(),
+                ));
+            }
             // Missing facts are charged once but reported only once per file.
             let loaded = match loaded {
                 IncomingFile::Loaded(None) => {
@@ -223,6 +272,11 @@ pub fn project_selected_incoming<'e, M, P: IncomingCallProjection>(
         }
         if result.work.examined_candidates >= limits.max_candidates {
             result.truncated = true;
+            CallRelationBudgetRefusal::Candidates {
+                consumed: result.work.examined_candidates,
+                limit: limits.max_candidates,
+            }
+            .record(&mut result.budget_refusals);
             result.caller_inventory = CallerInventoryCoverage::Incomplete;
             continue;
         }

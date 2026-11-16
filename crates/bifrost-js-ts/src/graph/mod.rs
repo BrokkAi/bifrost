@@ -12,6 +12,7 @@
 
 pub mod common;
 pub mod extractor;
+mod function_exits;
 pub mod hits;
 pub mod inverted;
 pub mod receiver_analysis;

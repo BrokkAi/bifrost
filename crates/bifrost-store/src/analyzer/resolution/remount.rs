@@ -471,7 +471,9 @@ pub(super) fn remount_completion(
             reason @ (ResolutionIncompleteReason::CyclicPrefixDependency(_)
             | ResolutionIncompleteReason::ReceiverBudgetExhausted(_)
             | ResolutionIncompleteReason::TimeBudgetExceeded(_)
-            | ResolutionIncompleteReason::UnmountedFile { .. }) => {
+            | ResolutionIncompleteReason::UnmountedFile { .. }
+            | ResolutionIncompleteReason::OverlayFrontierUnknown(_)
+            | ResolutionIncompleteReason::Unclassified(_)) => {
                 translation.operation_local_reason(reason)
             }
             ResolutionIncompleteReason::CyclicExpansion(path) => {
@@ -806,6 +808,19 @@ fn remount_typed(
                 })
                 .collect(),
         )
+        .with_binary_operations(
+            typed
+                .binary_operations()
+                .iter()
+                .map(|row| super::typed_fact_lowering::LoweredBinaryOperation {
+                    output: translation.semantic(row.output),
+                    left: translation.semantic(row.left),
+                    right: translation.semantic(row.right),
+                    operator: row.operator,
+                    right_reference: row.right_reference,
+                })
+                .collect(),
+        )
         .with_declared_type_arguments(declared_type_arguments)
         .with_generic_formal_defaults(generic_formal_defaults)
         .with_generic_formals(generic_formals)
@@ -874,14 +889,22 @@ pub(super) fn remount_frontier_state(
             }),
         });
     }
-    Some(
-        TypedFrontierState::new(
-            translation.semantic(frontier.slot()),
-            possible_values,
-            remount_completion(frontier.completion(), translation, cancellation)?,
-        )
-        .with_unindexed_external(unindexed_external),
+    let mut result = TypedFrontierState::new(
+        translation.semantic(frontier.slot()),
+        possible_values,
+        remount_completion(frontier.completion(), translation, cancellation)?,
     )
+    .with_unindexed_external(unindexed_external);
+    for (edge, completion) in &frontier.declared_type_edges {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        result.declared_type_edges.insert(
+            translation.semantic(*edge),
+            remount_completion(completion, translation, cancellation)?,
+        );
+    }
+    Some(result)
 }
 
 pub(super) fn remount_slot_value(
@@ -962,6 +985,7 @@ fn remount_common(
         go_package_imports,
         reference_lookup_identities,
         rust_reverse_gap_candidates,
+        structural_trait_impls,
         trait_implementations,
         inherent_implementations,
         shared_language,
@@ -1118,6 +1142,11 @@ fn remount_common(
             lookup: translation.semantic(row.lookup),
         });
     }
+    let mut remounted_structural_trait_impls = structural_trait_impls;
+    for row in &mut remounted_structural_trait_impls {
+        row.relation = translation.semantic(row.relation);
+        row.trait_terminal = translation.semantic(row.trait_terminal);
+    }
     let mut remounted_trait_implementations = Vec::with_capacity(trait_implementations.len());
     for row in trait_implementations {
         if cancellation.is_cancelled() {
@@ -1185,6 +1214,7 @@ fn remount_common(
     let shared_language = LoweredSharedLanguageFacts {
         aliases: shared_language.aliases,
         extern_aliases: shared_language.extern_aliases,
+        csharp_friend_attributes: shared_language.csharp_friend_attributes,
         compilation_imports: shared_language.compilation_imports,
         call_argument_lists: shared_language.call_argument_lists,
         call_arguments: remounted_call_arguments,
@@ -1218,6 +1248,7 @@ fn remount_common(
         remounted_go_package_imports,
         remounted_reference_lookup_identities,
         rust_reverse_gap_candidates,
+        remounted_structural_trait_impls,
         remounted_trait_implementations,
         remounted_inherent_implementations,
         shared_language,

@@ -5,12 +5,43 @@ use std::fs::{File, Metadata};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Open a regular file without blocking on Unix special files, including a
+/// FIFO installed between the metadata check and open.
+pub fn open_regular_file(path: &Path) -> std::io::Result<File> {
+    let reject = || std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file");
+    if !std::fs::metadata(path)?.is_file() {
+        return Err(reject());
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(reject());
+    }
+    Ok(file)
+}
+
 /// Regular-file identity from metadata. Unix reports device, inode, size, mtime
 /// and ctime. Other platforms report size, the modification time and, where the
 /// platform records it, the creation time in the ctime slot; stable std exposes
 /// no device or inode there, so both are zero. Timestamps are only as fine as
 /// the filesystem keeps them: FAT's 2 s modification granularity can hide a
 /// same-size rewrite within that window, an accepted limit shared with IntelliJ.
+/// Directory timestamps can also miss transient ignore/config candidates. On
+/// ZFS (statfs 0x2fc12fc1), kernel 7.0.0-42-generic, directory ctime stayed equal
+/// in 46,817/50,000 stat-create-stat trials; full identity stayed equal in
+/// 45,288/50,000 create-delete trials (#13309). Ignore-input receipts therefore
+/// require a second agreeing listing when a pre-known proxy is racy. Two agreeing
+/// observations are strong evidence, not proof: a writer that repeats the same
+/// create-read-delete of the exact ignore/config filename, aligned with both
+/// reads while absent at all four candidate stat points, can still certify.
+/// That repeating, read-aligned writer is an accepted limit (#13309); the
+/// confirmation is bounded to two listings, with no retry loop.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct FileIdentity {
     device: u64,
@@ -197,8 +228,8 @@ pub struct ContentDigestCache {
 
 impl RetainedBytes for Key {
     fn retained_bytes(&self) -> usize {
-        // The region retains key copies for lookup and registration.
-        2 * (std::mem::size_of::<Self>() + self.root.retained_bytes())
+        // The region's Arc-backed key is shared by lookup and registration.
+        std::mem::size_of::<Self>() + crate::allocation_size::allocation_size(self.root.capacity())
     }
 }
 
@@ -348,7 +379,7 @@ mod tests {
     fn identity_cache_invalidation_and_trust() -> std::io::Result<()> {
         let dir = tempfile::tempdir()?;
         let trusted = on_trusted_local_file_system(dir.path());
-        let cache = ContentDigestCache::new(&RetentionBudget::new(1_000_000));
+        let cache = ContentDigestCache::new(&RetentionBudget::for_test_capacity(1_000_000));
         let a = PathBuf::from("a");
         let b = PathBuf::from("b");
         fs::write(dir.path().join(&a), b"old")?;
@@ -442,7 +473,7 @@ mod tests {
         }
         symlink("first", root.join("link"))?;
         std::thread::sleep(Duration::from_millis(2100));
-        let cache = ContentDigestCache::new(&RetentionBudget::new(1_000_000));
+        let cache = ContentDigestCache::new(&RetentionBudget::for_test_capacity(1_000_000));
         let members = [PathBuf::from("link/a")];
         // The handle keeps reading the file it opened, but the path now names
         // another file, so the read is refused rather than returned.
@@ -505,7 +536,7 @@ mod tests {
     fn racy_before_long_compute() -> std::io::Result<()> {
         let dir = tempfile::tempdir()?;
         fs::write(dir.path().join("a"), b"fresh")?;
-        let cache = ContentDigestCache::new(&RetentionBudget::new(1_000_000));
+        let cache = ContentDigestCache::new(&RetentionBudget::for_test_capacity(1_000_000));
         let root = dir.path().canonicalize()?;
         let members = [PathBuf::from("a")];
         cache.digest(
@@ -534,7 +565,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let root = dir.path().canonicalize()?;
         fs::write(root.join("a"), b"before")?;
-        let cache = ContentDigestCache::new(&RetentionBudget::new(1_000_000));
+        let cache = ContentDigestCache::new(&RetentionBudget::for_test_capacity(1_000_000));
         let result = cache.digest(
             b"rewrite",
             &root,
@@ -563,7 +594,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(2100));
         let members = [PathBuf::from("a"), PathBuf::from("b")];
         for limit in [0, 1_000_000] {
-            let budget = RetentionBudget::new(limit);
+            let budget = RetentionBudget::for_test_capacity(limit);
             let cache = ContentDigestCache::new(&budget);
             let calls = Cell::new(0);
             for paths in [members.clone(), [members[1].clone(), members[0].clone()]] {

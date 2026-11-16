@@ -28,6 +28,7 @@ struct Lease {
     scope: [u8; 32],
     stage: (u64, u64),
     main_only: bool,
+    configuration_only: bool,
 }
 
 impl ReaderBinding {
@@ -49,6 +50,7 @@ impl ReaderBinding {
         stage: (u64, u64),
         current: bool,
         main_only: bool,
+        configuration_only: bool,
     ) -> Self {
         if !current {
             return Self::unestablished();
@@ -67,6 +69,7 @@ impl ReaderBinding {
                 scope,
                 stage,
                 main_only,
+                configuration_only,
             }),
         }
     }
@@ -76,7 +79,34 @@ impl ReaderBinding {
         self.lease.as_ref().is_some_and(|lease| lease.main_only)
     }
 
+    pub fn proves_configuration_selection(&self) -> bool {
+        self.lease
+            .as_ref()
+            .is_some_and(|lease| lease.configuration_only)
+    }
+
+    pub(crate) fn matches_configuration_route_recipe(
+        &self,
+        routing: [u8; 32],
+        selection: [u8; 32],
+        scope: [u8; 32],
+        stage: (u64, u64),
+    ) -> bool {
+        self.proves_configuration_selection()
+            && self.matches_route_recipe(routing, selection, scope, stage)
+    }
+
     pub(crate) fn matches_declared_route_recipe(
+        &self,
+        routing: [u8; 32],
+        selection: [u8; 32],
+        scope: [u8; 32],
+        stage: (u64, u64),
+    ) -> bool {
+        self.proves_main_selection() && self.matches_route_recipe(routing, selection, scope, stage)
+    }
+
+    fn matches_route_recipe(
         &self,
         routing: [u8; 32],
         selection: [u8; 32],
@@ -88,7 +118,6 @@ impl ReaderBinding {
                 && lease.selection == selection
                 && lease.scope == scope
                 && lease.stage == stage
-                && lease.main_only
         })
     }
 

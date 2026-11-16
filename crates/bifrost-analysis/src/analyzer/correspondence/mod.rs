@@ -156,7 +156,8 @@ pub mod declarations;
 use std::fmt;
 
 use crate::analyzer::canonical_hash::CanonicalHasher;
-use crate::analyzer::semantic::{SEMANTIC_IR_SCHEMA_VERSION, StableDigest, WorkspaceRelativePath};
+use crate::analyzer::semantic::ids::semantic_ir_schema_label;
+use crate::analyzer::semantic::{StableDigest, WorkspaceRelativePath};
 
 /// The revision of this schema itself.
 ///
@@ -603,10 +604,7 @@ fn analyzer_schema_identity() -> StableDigest {
         "correspondence_schema",
         &CORRESPONDENCE_SCHEMA_VERSION.to_be_bytes(),
     );
-    hasher.field(
-        "semantic_ir_schema",
-        &SEMANTIC_IR_SCHEMA_VERSION.to_be_bytes(),
-    );
+    hasher.field("semantic_ir_schema", semantic_ir_schema_label().as_bytes());
     StableDigest::from_array(hasher.finish())
 }
 
@@ -957,10 +955,7 @@ mod tests {
         schema.field("correspondence_schema", 1u32.to_be_bytes());
         // The semantic IR schema is another component's version; the vector
         // pins how it is framed, not its value.
-        schema.field(
-            "semantic_ir_schema",
-            SEMANTIC_IR_SCHEMA_VERSION.to_be_bytes(),
-        );
+        schema.field("semantic_ir_schema", semantic_ir_schema_label());
         let schema = schema.digest();
         assert_eq!(pin.analyzer_schema(), schema);
         let mut frames = Frames::new("bifrost.correspondence.revision-pin.v1");

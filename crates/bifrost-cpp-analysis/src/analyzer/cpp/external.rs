@@ -12,6 +12,10 @@ use brokk_bifrost_core::analyzer::canonical_hash::sha256_bytes;
 
 use crate::analyzer::cpp::CppAnalyzer;
 
+use brokk_bifrost_analysis::analyzer::reuse_verdict::{
+    CarriesReuseVerdict, ExecutionCause, ReuseVerdict,
+};
+
 use brokk_bifrost_analysis::analyzer::semantic_model::ActivationSelector;
 
 use producer::ArtifactProducerLimits;
@@ -138,7 +142,7 @@ use brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus;
 
 use brokk_bifrost_analysis::analyzer::semantic::topology::DependencyScope;
 
-use brokk_bifrost_analysis::analyzer::i_analyzer::{AnalyzerQueryScope, IAnalyzer};
+use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
 
 use brokk_bifrost_core::analyzer::query_token::QueryScope;
 
@@ -844,11 +848,16 @@ fn build_directly_reached_external_headers(
 ) -> Option<ReachedExternalHeaders> {
     let reached = walk_directly_reached_external_headers(analyzer, file, keep_going);
     // Cancellation and the execution-dependent causes depend on this run, not
-    // on the source, so they must not be cached as a permanent answer.
+    // on the source, so they must not be cached as a permanent answer. A
+    // stopped walk (`None`) and an unavailable closure carry that verdict by
+    // their shape. The fill runs inside the cache's capture, so the verdict
+    // joins it beside the ambient mark.
     match &reached {
-        None => analyzer.mark_execution_dependent(),
-        Some(ReachedExternalHeaders::Unavailable(cause)) => {
-            if let Some(note) = cause.execution_dependent_note() {
+        None => brokk_bifrost_analysis::analyzer::i_analyzer::join_execution_dependence(analyzer),
+        Some(closure) if !closure.reuse_verdict().is_content() => {
+            if let ReachedExternalHeaders::Unavailable(cause) = closure
+                && let Some(note) = cause.execution_dependent_note()
+            {
                 brokk_bifrost_core::profiling::note_with(|| {
                     format!(
                         "policy.units unbounded origin={}:{} cause={note}",
@@ -856,10 +865,10 @@ fn build_directly_reached_external_headers(
                         line!()
                     )
                 });
-                analyzer.mark_execution_dependent();
             }
+            brokk_bifrost_analysis::analyzer::i_analyzer::join_execution_dependence(analyzer);
         }
-        Some(ReachedExternalHeaders::Complete(_)) => {}
+        Some(_) => {}
     }
     reached
 }
@@ -995,6 +1004,18 @@ impl UnavailableCause {
     }
 }
 
+impl CarriesReuseVerdict for ReachedExternalHeaders {
+    fn reuse_verdict(&self) -> ReuseVerdict {
+        match self {
+            Self::Complete(_) => ReuseVerdict::Content,
+            Self::Unavailable(cause) => match cause.execution_dependent_note() {
+                Some(_) => ReuseVerdict::ExecutionDependent(ExecutionCause::Other),
+                None => ReuseVerdict::Content,
+            },
+        }
+    }
+}
+
 impl ReachedExternalHeaders {
     fn headers(&self) -> Option<&[ReachedExternalHeader]> {
         match self {
@@ -1081,6 +1102,7 @@ fn header_module_fact(dependency_name: &str, header: &str) -> Option<TypeFact> {
         hierarchy: Vec::new(),
         aliases: Vec::new(),
         extension_surfaces: Vec::new(),
+        rust_stability: None,
         guard: None,
         locator: Locator::Artifact {
             path: header.to_owned(),
@@ -1598,6 +1620,7 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                     .into_iter()
                     .collect(),
                 extension_surfaces: Vec::new(),
+                rust_stability: None,
                 guard: None,
                 locator: Locator::Artifact {
                     path: stable_path(&record.source_path),
@@ -1718,6 +1741,7 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                 generic_arity: 0,
                 parameter_types: &parameter_types,
                 parameter_variadics: &parameter_variadics,
+                extension_receiver: None,
                 return_type: return_type.as_ref(),
             });
             let signature = (record.kind == CppExternalMemberKind::Function).then(|| Signature {
@@ -1779,6 +1803,7 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                 extension_receiver: None,
                 extension_receiver_constraints: Vec::new(),
                 aliases: Vec::new(),
+                rust_stability: None,
                 guard: None,
                 locator: Locator::Artifact {
                     path: stable_path(&record.source_path),
@@ -1924,6 +1949,7 @@ pub fn resolve_cpp_semantic_pack_dependencies(
             ));
             let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
             return DependencyDiscoveryOutcome {
+                incomplete_reason: None,
                 dependencies,
                 diagnostics,
                 suppressed_diagnostics,
@@ -1959,6 +1985,7 @@ pub fn resolve_cpp_semantic_pack_dependencies(
         Err(HeaderDiscoveryError::Cancelled) => {
             let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
             return DependencyDiscoveryOutcome {
+                incomplete_reason: None,
                 dependencies,
                 diagnostics,
                 suppressed_diagnostics,
@@ -2026,6 +2053,7 @@ pub fn resolve_cpp_semantic_pack_dependencies(
         .warnings
         .saturating_add(undiscovered_dependencies);
     DependencyDiscoveryOutcome {
+        incomplete_reason: None,
         profile: DependencyDiscoveryProfile {
             metadata_inputs_considered: 1,
             dependencies_resolved: dependencies.len(),
@@ -4008,7 +4036,8 @@ mod tests {
         ));
         let overlay = workspace
             .analyzer()
-            .semantic_model_overlay()
+            .semantic_model_overlay_read()
+            .published()
             .expect("C++ overlay");
         let cpp =
             brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<CppAnalyzer>(
@@ -4861,7 +4890,8 @@ mod tests {
         );
         let overlay = workspace
             .analyzer()
-            .semantic_model_overlay()
+            .semantic_model_overlay_read()
+            .published()
             .expect("C++ overlay");
         let published = overlay
             .symbols_named_for("connect", "cpp")

@@ -1,4 +1,16 @@
 //! Retained member syntax for one selected source owner. Every result is query-local.
+pub(crate) const PYTHON_BASE_PRESERVATION_RULE: crate::analyzer::resolution::BasePreservationRule =
+    crate::analyzer::resolution::BasePreservationRule {
+        terminal: "builtins.type",
+        absent_members: &["__new__", "__init__", "mro"],
+        enclosing_absent_members: &["__new__", "__init__", "__call__", "__prepare__"],
+    };
+pub(crate) const PYTHON_MRO_ONLY_RULE: crate::analyzer::resolution::BasePreservationRule =
+    crate::analyzer::resolution::BasePreservationRule {
+        absent_members: &["mro"],
+        ..PYTHON_BASE_PRESERVATION_RULE
+    };
+
 use super::{Result, StoreError};
 use crate::CancellationToken;
 use crate::analyzer::resolution::SharedNameInterner;
@@ -13,7 +25,10 @@ pub(crate) const LATE_OPERATIONS_SQL: &str = r#"
 SELECT mounts.mount_ordinal,op.site,op.form,callee.semantic_key,receiver.semantic_key
 FROM temp.selected_resolution_mounts mounts
 JOIN resolution_unit_summary_members member ON member.summary_id=?3
- AND member.blob_id=mounts.blob_id AND member.rel_path=mounts.persisted_relative_path
+ AND member.rel_path=mounts.persisted_relative_path
+JOIN temp.selected_unit_member_paths selected
+ ON selected.summary_id=member.summary_id AND selected.member_ordinal=member.member_ordinal
+ AND selected.mount_blob_id=mounts.blob_id
 JOIN python_binding_source source ON source.blob_id=mounts.blob_id AND source.format=?1
 CROSS JOIN python_member_operations op INDEXED BY python_member_operations_inventory
  ON op.blob_id=mounts.blob_id AND op.name_kind IN (0,1,2) AND op.effect IN (1,2)
@@ -51,7 +66,10 @@ SELECT mounts.mount_ordinal,op.site,op.form,callee.semantic_key,receiver.semanti
 FROM candidates op
 JOIN temp.selected_resolution_mounts mounts ON mounts.blob_id=op.blob_id
 JOIN resolution_unit_summary_members member ON member.summary_id=?3
- AND member.blob_id=mounts.blob_id AND member.rel_path=mounts.persisted_relative_path
+ AND member.rel_path=mounts.persisted_relative_path
+JOIN temp.selected_unit_member_paths selected
+ ON selected.summary_id=member.summary_id AND selected.member_ordinal=member.member_ordinal
+ AND selected.mount_blob_id=mounts.blob_id
 JOIN python_binding_source source ON source.blob_id=op.blob_id AND source.format=?1
 LEFT JOIN resolution_semantic_sites callee
  ON callee.blob_id=op.blob_id AND callee.source_site=op.callee_reference AND callee.semantic_role='reference'
@@ -63,25 +81,29 @@ ORDER BY mounts.mount_ordinal,op.site,op.form
 
 /// Direct attribute writes already have reference lookup and receiver-slot
 /// coordinates. Reuse them rather than publishing a duplicate operation form.
+/// CROSS JOIN preserves the spelling-first candidate bound through translation.
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) const DIRECT_MEMBER_WRITES_SQL: &str = r#"
 SELECT DISTINCT mounts.mount_ordinal,writes.site,7,NULL,coalesce(direct.reference,incoming.reference)
 FROM resolution_identities name INDEXED BY resolution_identities_spelling
 CROSS JOIN resolution_reference_lookup_identities lookup INDEXED BY resolution_reference_lookup_identities_identity
  ON lookup.identity_id=name.id
-JOIN resolution_semantic_sites target ON target.blob_id=lookup.blob_id
+CROSS JOIN resolution_semantic_sites target ON target.blob_id=lookup.blob_id
  AND target.semantic_key=lookup.semantic_key AND target.semantic_role='reference'
-JOIN python_member_receiver_writes writes ON writes.blob_id=target.blob_id AND writes.site=target.source_site
-JOIN resolution_qualified_routes qualified ON qualified.blob_id=target.blob_id AND qualified.reference=target.semantic_key
+CROSS JOIN python_member_receiver_writes writes ON writes.blob_id=target.blob_id AND writes.site=target.source_site
+CROSS JOIN resolution_qualified_routes qualified ON qualified.blob_id=target.blob_id AND qualified.reference=target.semantic_key
 LEFT JOIN resolution_binding_projections direct ON direct.blob_id=qualified.blob_id
  AND direct.output_slot=qualified.qualifier_slot AND direct.kind<>?4
 LEFT JOIN resolution_type_transfers transfer ON transfer.blob_id=qualified.blob_id AND transfer.target_slot=qualified.qualifier_slot
 LEFT JOIN resolution_binding_projections incoming ON incoming.blob_id=transfer.blob_id
  AND incoming.output_slot=transfer.source_slot AND incoming.kind<>?4
-JOIN temp.selected_resolution_mounts mounts ON mounts.blob_id=writes.blob_id
-JOIN resolution_unit_summary_members member ON member.summary_id=?3
- AND member.blob_id=mounts.blob_id AND member.rel_path=mounts.persisted_relative_path
-JOIN python_binding_source source ON source.blob_id=mounts.blob_id AND source.format=?1
+CROSS JOIN temp.selected_resolution_mounts mounts ON mounts.blob_id=writes.blob_id
+CROSS JOIN resolution_unit_summary_members member ON member.summary_id=?3
+ AND member.rel_path=mounts.persisted_relative_path
+CROSS JOIN temp.selected_unit_member_paths selected
+ ON selected.summary_id=member.summary_id AND selected.member_ordinal=member.member_ordinal
+ AND selected.mount_blob_id=mounts.blob_id
+CROSS JOIN python_binding_source source ON source.blob_id=mounts.blob_id AND source.format=?1
 WHERE name.spelling=?2 AND mounts.storage_language='python'
 ORDER BY mounts.mount_ordinal,writes.site
 "#;
@@ -92,11 +114,13 @@ pub(crate) const UNIVERSE_REFERENCE_NAME_SQL: &str = "SELECT name.spelling,site.
 /// Retained lexical hazards and a structurally selected class namespace.
 /// Neither is a second authority for builtin-module mutation operations.
 pub(crate) const BUILTIN_NAMESPACE_CLOSED_SQL: &str = r#"
-SELECT NOT EXISTS (
- SELECT 1 FROM resolution_gaps gap JOIN resolution_gap_reasons reason
+WITH namespace_gap AS (
+ SELECT gap.reason FROM resolution_gaps gap CROSS JOIN resolution_gap_reasons reason
  ON reason.blob_id=gap.blob_id AND reason.reason=gap.reason
  WHERE gap.blob_id=?1 AND gap.covers IN (2,5) AND gap.lookup=0 AND reason.origin=?3
-) AND NOT EXISTS (
+ ORDER BY gap.covers,gap.subject,gap.lookup,gap.gap LIMIT 1
+)
+SELECT NOT EXISTS (SELECT 1 FROM namespace_gap) AND NOT EXISTS (
  SELECT 1 FROM python_member_sites site
  JOIN resolution_node_catalog node ON node.blob_id=site.blob_id AND node.source_scope=site.scope
  JOIN resolution_member_scope_properties scope ON scope.blob_id=node.blob_id
@@ -108,7 +132,7 @@ SELECT NOT EXISTS (
  AND (class.metaclass IS NOT NULL OR class.bases_complete=0
  OR EXISTS(SELECT 1 FROM python_member_base_operands base WHERE base.blob_id=class.blob_id AND base.class=class.class)
  OR EXISTS(SELECT 1 FROM python_member_class_keywords keyword WHERE keyword.blob_id=class.blob_id AND keyword.class=class.class))
-)
+), (SELECT reason FROM namespace_gap)
 "#;
 
 /// Structural nodes already retain the AST-decoded string at tuple field 16
@@ -160,6 +184,33 @@ pub(crate) fn patch_target_literal(
     )
 }
 
+fn member_names_code(names: &PythonMemberNames) -> i64 {
+    match names {
+        PythonMemberNames::Exact(_) => 0,
+        PythonMemberNames::Prefix(_) => 1,
+        PythonMemberNames::Any => 2,
+    }
+}
+
+fn member_effect_code(effect: &PythonMemberEffect) -> i64 {
+    code(
+        &[
+            PythonMemberEffect::Read,
+            PythonMemberEffect::Write,
+            PythonMemberEffect::Delete,
+        ],
+        effect,
+    )
+}
+
+#[test]
+fn any_write_index_predicate_matches_enum_conversions() {
+    assert_eq!(member_names_code(&PythonMemberNames::Any), 2);
+    assert_eq!(member_effect_code(&PythonMemberEffect::Write), 1);
+    assert_eq!(member_effect_code(&PythonMemberEffect::Delete), 2);
+    assert_eq!(member_effect_code(&PythonMemberEffect::Read), 0);
+}
+
 fn code<T: PartialEq>(variants: &[T], value: &T) -> i64 {
     variants
         .iter()
@@ -203,6 +254,12 @@ pub fn publish(
     // Retain the two reader domains plus every python_member_* foreign-key
     // target. This set belongs to this one file's publication transaction.
     let mut retained = crate::hash::HashSet::default();
+    // Mutation gaps and their enclosing control statements need positions so
+    // import-time reads can be ordered against the earliest possible write.
+    retained.extend(facts.gaps.iter().filter_map(|gap| {
+        matches!(gap.route(), Some(ResolutionRouteGap::UnknownBinder { .. })).then_some(gap.site)
+    }));
+    retained.extend(facts.python_guards.iter().map(|guard| guard.site));
     retained.extend(facts.type_slots.iter().map(|row| row.site));
     for row in &facts.python_classes {
         retained.insert(row.class);
@@ -628,7 +685,7 @@ pub fn publish(
         if cancellation.is_cancelled() {
             return Err(StoreError::new("cancelled retaining member operations"));
         }
-        let (name_kind, names) = match &row.names {
+        let (_, names) = match &row.names {
             PythonMemberNames::Exact(names) => (0, names.as_slice()),
             PythonMemberNames::Prefix(name) => {
                 assert!(
@@ -644,8 +701,8 @@ pub fn publish(
                 PythonMemberForm::Getattr, PythonMemberForm::Setattr, PythonMemberForm::Delattr,
                 PythonMemberForm::DictWrite, PythonMemberForm::DictUpdate,
                 PythonMemberForm::PatchObject, PythonMemberForm::PatchPath,
-            ], &row.form), code(&[PythonMemberEffect::Read, PythonMemberEffect::Write, PythonMemberEffect::Delete], &row.effect),
-                name_kind, row.callee_reference.map(|id| id.get()), row.receiver_reference.map(|id| id.get()), row.receiver_slot.map(|id| id.get())])?;
+            ], &row.form), member_effect_code(&row.effect),
+                member_names_code(&row.names), row.callee_reference.map(|id| id.get()), row.receiver_reference.map(|id| id.get()), row.receiver_slot.map(|id| id.get())])?;
         let operation = tx.last_insert_rowid();
         for (ordinal, name) in names.iter().enumerate() {
             tx.prepare_cached("INSERT INTO python_member_operation_names VALUES(?1,?2,?3)")?
@@ -751,7 +808,9 @@ pub(crate) fn admitted_python_import_member(
                             AND provider.state IN ('selected','alternative') AND (provider.member_ordinal IS NOT NULL OR provider.kind='namespace'))
                          FROM python_unit_summary_imports imported
                          JOIN resolution_unit_summary_members source ON source.summary_id=imported.summary_id AND source.member_ordinal=imported.member_ordinal
-                         WHERE imported.summary_id=?1 AND source.blob_id=?2 AND imported.import_site=?3 AND source.rel_path=?4",
+ JOIN temp.selected_unit_member_mounts source_selected ON source_selected.summary_id=source.summary_id AND source_selected.member_ordinal=source.member_ordinal
+ JOIN temp.surface_dense imported_site ON imported_site.blob_id=source_selected.blob_id AND imported_site.id_space=1 AND imported_site.surface_ordinal=imported.import_surface_ordinal
+                         WHERE imported.summary_id=?1 AND source_selected.blob_id=?2 AND imported_site.dense_id=?3 AND source.rel_path=?4",
                     )?.query_map(params![environment, blob, import.import_site.get(), path], |row|
                         Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,u32>(3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?,row.get::<_,bool>(6)?)))?
                         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -939,7 +998,12 @@ fn class_decorator_completion(
             let label = format!("{kind}:{path}#class={class_site}:{spelling}");
             let mut hash = CanonicalHasher::new(b"python-class-decorator-unproven:v1");
             hash.field("subject", label.as_bytes());
-            let reason = identities.named_semantic(hash.finish(), kind, &label);
+            let reason = identities.named_semantic(
+                hash.finish(),
+                kind,
+                crate::analyzer::resolution::ReasonDeterminism::Unaudited,
+                &label,
+            );
             completion = completion.combine(&ResolutionCompletion::incomplete([
                 ResolutionIncompleteReason::UnsupportedSemantic(reason),
             ]));
@@ -974,7 +1038,7 @@ pub fn implicit_inputs(
         "SELECT class.class,class.bases_complete,class.metaclass,
           (SELECT count(*) FROM python_member_base_operands base WHERE base.blob_id=class.blob_id AND base.class=class.class),
           EXISTS(SELECT 1 FROM python_member_base_operands base WHERE base.blob_id=class.blob_id AND base.class=class.class AND base.kind<>0),
-          EXISTS(SELECT 1 FROM python_member_class_keywords keyword WHERE keyword.blob_id=class.blob_id AND keyword.class=class.class),
+          EXISTS(SELECT 1 FROM python_member_class_keywords keyword WHERE keyword.blob_id=class.blob_id AND keyword.class=class.class AND (keyword.name IS NULL OR keyword.name<>'metaclass')),
           EXISTS(SELECT 1 FROM python_member_decorators decorator WHERE decorator.blob_id=class.blob_id AND decorator.declaration=class.class)
          FROM resolution_semantic_sites semantic
          JOIN python_member_classes class ON class.blob_id=semantic.blob_id AND class.class=semantic.source_site
@@ -1010,6 +1074,11 @@ pub fn implicit_inputs(
     } else {
         ResolutionCompletion::Complete
     };
+    let preservation_completion = if complete && !expanded {
+        ResolutionCompletion::Complete
+    } else {
+        ResolutionCompletion::incomplete([ResolutionIncompleteReason::UnsupportedSemantic(owner)])
+    };
     let completion = if decorated {
         let decorator_completion = class_decorator_completion(
             selection,
@@ -1032,6 +1101,33 @@ pub fn implicit_inputs(
         return Ok(None);
     }
     Ok(Some(ImplicitBaseInputs {
+        // __init_subclass__ or later module __bases__ writes remain known residuals, unchanged from master.
+        base_preservation: if let Some(reference_site) = metaclass {
+            let reference = conn.prepare_cached("SELECT semantic_key FROM resolution_semantic_sites WHERE blob_id=?1 AND source_site=?2 AND semantic_role='reference'")?.query_row(params![mount.blob_id(),reference_site],|row|row.get::<_,u32>(0)).optional()?;
+            let references = reference
+                .into_iter()
+                .map(|key| SemanticId::local(ordinal, key))
+                .collect::<Vec<_>>();
+            let completion = if keywords || references.is_empty() {
+                ResolutionCompletion::incomplete([ResolutionIncompleteReason::UnsupportedSemantic(
+                    owner,
+                )])
+            } else if decorated {
+                preservation_completion.combine(&completion)
+            } else {
+                preservation_completion
+            };
+            Some(crate::analyzer::resolution::BasePreservationGuard {
+                references,
+                terminal: PYTHON_BASE_PRESERVATION_RULE.terminal,
+                absent_members: PYTHON_BASE_PRESERVATION_RULE.absent_members,
+                // Namespace preparation can inject members absent from the authored inventory.
+                enclosing_absent_members: PYTHON_BASE_PRESERVATION_RULE.enclosing_absent_members,
+                completion,
+            })
+        } else {
+            None
+        },
         written_inventory_complete: complete,
         written_base_count: count,
         creation,

@@ -39,6 +39,7 @@ pub(super) fn project_direct_receiver_terminal(
                 projected.push(PipelineExpansion {
                     value: PipelineValue::ReceiverOutcome(value),
                     trace,
+                    call_path_evidence: None,
                     budgeted: false,
                 });
             }
@@ -49,6 +50,7 @@ pub(super) fn project_direct_receiver_terminal(
                     projected.push(PipelineExpansion {
                         value: evidence.value,
                         trace,
+                        call_path_evidence: None,
                         budgeted: false,
                     });
                 }
@@ -102,6 +104,7 @@ pub(super) fn receiver_evidence_expansions(
             expansions.push(PipelineExpansion {
                 value: PipelineValue::ReceiverEvidence(evidence.clone()),
                 trace: vec![(PipelineTraceValue::ReceiverEvidence(evidence), None)],
+                call_path_evidence: None,
                 budgeted: false,
             });
             let Some(returned) = returned else {
@@ -169,6 +172,7 @@ pub(super) fn points_to_candidate_expansions(
             PipelineExpansion {
                 value: PipelineValue::PointsToCandidate(Box::new(row.clone())),
                 trace: vec![(PipelineTraceValue::PointsToCandidate(Box::new(row)), None)],
+                call_path_evidence: None,
                 budgeted: false,
             }
         })
@@ -370,7 +374,13 @@ pub(super) fn receiver_facts_for_pipeline_row(
     let mut projected = *budget;
     projected.scanned_files = projected.scanned_files.saturating_add(1);
     if projected.scanned_files > limits.max_scanned_files {
-        push_budget_diagnostic(diagnostics, &projected);
+        push_budget_diagnostic(
+            diagnostics,
+            &projected,
+            limits,
+            Some(budget),
+            "receiver_analysis",
+        );
         return PipelineReceiverFacts::Halted;
     }
     budget.scanned_files = projected.scanned_files;
@@ -391,7 +401,13 @@ pub(super) fn receiver_facts_for_pipeline_row(
                 projected.scanned_source_bytes = projected
                     .scanned_source_bytes
                     .saturating_add(minimum_source_bytes);
-                push_budget_diagnostic(diagnostics, &projected);
+                push_budget_diagnostic(
+                    diagnostics,
+                    &projected,
+                    limits,
+                    Some(budget),
+                    "receiver_analysis",
+                );
                 return PipelineReceiverFacts::Halted;
             }
             StructuralSourceLimitedOutcome::Cancelled => {
@@ -404,7 +420,13 @@ pub(super) fn receiver_facts_for_pipeline_row(
     projected = *budget;
     projected.scanned_source_bytes = projected.scanned_source_bytes.saturating_add(source.len());
     if projected.scanned_source_bytes > limits.max_scanned_source_bytes {
-        push_budget_diagnostic(diagnostics, &projected);
+        push_budget_diagnostic(
+            diagnostics,
+            &projected,
+            limits,
+            Some(budget),
+            "receiver_analysis",
+        );
         return PipelineReceiverFacts::Halted;
     }
     budget.scanned_source_bytes = projected.scanned_source_bytes;
@@ -430,7 +452,13 @@ pub(super) fn receiver_facts_for_pipeline_row(
         StructuralFactsLimitedOutcome::Exceeded { minimum_fact_nodes } => {
             projected = *budget;
             projected.fact_nodes = projected.fact_nodes.saturating_add(minimum_fact_nodes);
-            push_budget_diagnostic(diagnostics, &projected);
+            push_budget_diagnostic(
+                diagnostics,
+                &projected,
+                limits,
+                Some(budget),
+                "receiver_analysis",
+            );
             return PipelineReceiverFacts::Halted;
         }
         StructuralFactsLimitedOutcome::Cancelled => {
@@ -458,7 +486,13 @@ pub(super) fn receiver_facts_for_pipeline_row(
         .saturating_add(projected.examined_references)
         > limits.max_fact_nodes
     {
-        push_budget_diagnostic(diagnostics, &projected);
+        push_budget_diagnostic(
+            diagnostics,
+            &projected,
+            limits,
+            Some(budget),
+            "receiver_analysis",
+        );
         return PipelineReceiverFacts::Halted;
     }
     budget.fact_nodes = projected.fact_nodes;
@@ -488,11 +522,12 @@ pub(super) fn receiver_analysis_expansions_for_pipeline_row(
     shared_budget_exhausted: &mut bool,
     receiver_truncated: &mut bool,
 ) -> Vec<PipelineExpansion> {
-    if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+    if brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
         budget.pipeline_rows,
         limits.max_pipeline_rows,
     )
-    .allows(1)
+    .try_allow(1)
+    .is_err()
     {
         *shared_budget_exhausted = true;
         *receiver_truncated = true;
@@ -577,11 +612,12 @@ pub(super) fn receiver_analysis_expansions(
     let mut expansions = Vec::with_capacity(ranges.len());
     let range_count = ranges.len();
     for (range_index, range) in ranges.into_iter().enumerate() {
-        if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+        if brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
             budget.pipeline_rows,
             limits.max_pipeline_rows,
         )
-        .allows(1)
+        .try_allow(1)
+        .is_err()
         {
             *shared_budget_exhausted = true;
             *receiver_truncated = true;
@@ -633,6 +669,7 @@ pub(super) fn receiver_analysis_expansions(
                     )
                 });
                 analyzer.mark_execution_dependent();
+                member_step.reuse.join_in(EXECUTION_DEPENDENT);
                 receiver_diagnostics.push((
                     CodeQueryDiagnosticCode::ReceiverAnalysisFailed,
                     crate::analyzer::common::language_for_file(file),
@@ -656,16 +693,18 @@ pub(super) fn receiver_analysis_expansions(
             .pipeline_rows
             .saturating_add(1)
             .saturating_add(candidate_count);
-        if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+        if brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
             budget.fact_nodes.saturating_add(budget.examined_references),
             limits.max_fact_nodes,
         )
-        .allows(0)
-            || !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+        .try_allow(0)
+        .is_err()
+            || brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
                 budget.pipeline_rows,
                 limits.max_pipeline_rows,
             )
-            .allows(0)
+            .try_allow(0)
+            .is_err()
         {
             *shared_budget_exhausted = true;
         }
@@ -702,6 +741,7 @@ pub(super) fn receiver_analysis_expansions(
                     )
                 });
                 analyzer.mark_execution_dependent();
+                member_step.reuse.join_in(EXECUTION_DEPENDENT);
                 *receiver_truncated = true;
                 receiver_diagnostics.push((
                     CodeQueryDiagnosticCode::ReceiverAnalysisPartial,
@@ -789,6 +829,7 @@ pub(super) fn receiver_analysis_expansions(
                 )
             });
             analyzer.mark_execution_dependent();
+            member_step.reuse.join_in(EXECUTION_DEPENDENT);
             *receiver_truncated = true;
             receiver_diagnostics.push((
                 CodeQueryDiagnosticCode::ReceiverAnalysisPartial,
@@ -802,6 +843,7 @@ pub(super) fn receiver_analysis_expansions(
             receiver_site_identity(analyzer, &report, structural_facts)
         else {
             analyzer.mark_execution_dependent();
+            member_step.reuse.join_in(EXECUTION_DEPENDENT);
             receiver_diagnostics.push((
                 CodeQueryDiagnosticCode::ReceiverAnalysisFailed,
                 language,
@@ -833,6 +875,7 @@ pub(super) fn receiver_analysis_expansions(
             value.member_forms = member_forms;
             if member_form_refused {
                 analyzer.mark_execution_dependent();
+                member_step.reuse.join_in(EXECUTION_DEPENDENT);
                 receiver_diagnostics.push((
                     CodeQueryDiagnosticCode::ReceiverAnalysisPartial,
                     value.report.site.language,
@@ -860,6 +903,7 @@ pub(super) fn receiver_analysis_expansions(
         expansions.push(PipelineExpansion {
             value,
             trace: vec![(trace, None)],
+            call_path_evidence: None,
             budgeted: true,
         });
     }
@@ -887,6 +931,8 @@ pub(super) struct MemberFormStep<'f> {
     files: HashMap<ProjectFile, Option<MemberDeclarationForms>>,
     /// Rows the filter could neither keep nor drop, with the reason.
     withheld: Vec<(Language, String)>,
+    /// The execution dependences this step's receiver rows marked.
+    pub(super) reuse: ReuseVerdict,
 }
 
 enum MemberFormVerdict {
@@ -906,6 +952,7 @@ impl<'f> MemberFormStep<'f> {
             memo: HashMap::default(),
             files: HashMap::default(),
             withheld: Vec::new(),
+            reuse: ReuseVerdict::Content,
         }
     }
 
@@ -926,6 +973,7 @@ impl<'f> MemberFormStep<'f> {
                 // The row is gone, so the answer no longer follows from the
                 // source files alone.
                 analyzer.mark_execution_dependent();
+                self.reuse.join_in(EXECUTION_DEPENDENT);
                 let site = &value.report.site;
                 self.withheld.push((
                     site.language,
@@ -956,6 +1004,10 @@ impl<'f> MemberFormStep<'f> {
                 sites.sort();
                 sites.dedup();
                 CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                     incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                     related: Vec::new(),
                     source: None,
@@ -963,8 +1015,14 @@ impl<'f> MemberFormStep<'f> {
                     impact: CodeQueryDiagnosticImpact::Incomplete,
                     branch: Vec::new(),
                     language,
-                    message: format!(
-                        "member-targets withheld rows whose member form or property triviality was undecided: {sites:?}"
+                    message: brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+                        format_args!(
+                            "member-targets withheld rows whose member form or property triviality was undecided: {sites:?}"
+                        ),
+                        format_args!(
+                            "member-targets withheld rows with undecided member form or property triviality"
+                        ),
+                        sites.iter(),
                     ),
                     exhausted_roots: Vec::new(),
                     withheld_rows_path: None,
@@ -1124,7 +1182,10 @@ fn budgeted_member_syntax(
 ) -> StructuralSyntaxLimitedOutcome {
     use brokk_bifrost_core::analyzer::work_budget::LimitedCounter;
     let scanned_files = budget.scanned_files.saturating_add(1);
-    if !LimitedCounter::from_usage(scanned_files, limits.max_scanned_files).allows(0) {
+    if LimitedCounter::from_usage(scanned_files, limits.max_scanned_files)
+        .try_allow(0)
+        .is_err()
+    {
         *refused = true;
         return StructuralSyntaxLimitedOutcome::Unavailable;
     }

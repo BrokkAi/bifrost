@@ -1,7 +1,14 @@
 //! Go outgoing call relations from one selected forward operation.
 
+use brokk_bifrost_analysis::analyzer::usages::call_relations::{
+    CallRelationCanonicalTarget, CallRelationCompletion, CallRelationReceiverDisposition,
+};
+
 use crate::analyzer::go::GoAnalyzer;
 use brokk_bifrost_analysis::analyzer::store_bridge::go_graph::GoGraphStageExt;
+use brokk_bifrost_analysis::analyzer::usages::call_relations::{
+    CallRelationDiagnosticPayload, CallRelationFailure, LocatedCallRelationDiagnostic,
+};
 
 use brokk_bifrost_core::cancellation::CancellationToken;
 
@@ -39,7 +46,9 @@ use brokk_bifrost_analysis::analyzer::usages::call_relations::CallArgument;
 
 use brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationDiagnostic;
 
-use brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationDiagnosticCode;
+use brokk_bifrost_analysis::analyzer::usages::call_relations::{
+    CallRelationDiagnosticCode, CallRelationScanLimit,
+};
 
 use brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationLimits;
 
@@ -106,7 +115,11 @@ impl CallRelationProvider for GoNativeCallRelationProvider {
         }
         failed(
             "native_go_incoming_unavailable",
-            "native Go incoming call relations are not part of this test-support slice",
+            CallRelationDiagnosticPayload::Failure {
+                reason: CallRelationFailure::Upstream {
+                    kind: "native_go_incoming_unavailable".into(),
+                },
+            },
             target,
         )
     }
@@ -123,7 +136,11 @@ impl CallRelationProvider for GoNativeCallRelationProvider {
         let Some(go) = resolve_analyzer::<GoAnalyzer>(analyzer) else {
             return failed(
                 "native_analyzer_unavailable",
-                "Go analyzer is unavailable",
+                CallRelationDiagnosticPayload::Failure {
+                    reason: CallRelationFailure::Upstream {
+                        kind: "native_analyzer_unavailable".into(),
+                    },
+                },
                 caller,
             );
         };
@@ -138,15 +155,19 @@ impl CallRelationProvider for GoNativeCallRelationProvider {
     }
 }
 
-fn diagnostic(kind: &str, message: impl Into<String>, caller: &CodeUnit) -> CallRelationDiagnostic {
-    CallRelationDiagnostic::analysis_failed(
-        message.into(),
-        caller.fq_name().to_string(),
-        kind.to_owned(),
-    )
+fn diagnostic(
+    kind: &str,
+    message: impl Into<LocatedCallRelationDiagnostic>,
+    caller: &CodeUnit,
+) -> CallRelationDiagnostic {
+    CallRelationDiagnostic::analysis_failed(message, caller.fq_name().to_string(), kind.to_owned())
 }
 
-fn failed(kind: &str, message: impl Into<String>, caller: &CodeUnit) -> CallRelationResult {
+fn failed(
+    kind: &str,
+    message: impl Into<LocatedCallRelationDiagnostic>,
+    caller: &CodeUnit,
+) -> CallRelationResult {
     CallRelationResult {
         diagnostics: vec![diagnostic(kind, message, caller)],
         proof_authority: UsageProofAuthority::Native,
@@ -176,6 +197,7 @@ pub(crate) fn outgoing(
     cancellation: &CancellationToken,
 ) -> CallRelationResult {
     outgoing_after_open(analyzer, go, caller, limits, budget, cancellation, || {})
+        .with_diagnostic_limits(limits)
 }
 
 fn outgoing_after_open(
@@ -195,7 +217,11 @@ fn outgoing_after_open(
             Err(_) => {
                 return failed(
                     "native_model_authority_stale",
-                    "Go model snapshot conflicts with the outer overlay",
+                    CallRelationDiagnosticPayload::Failure {
+                        reason: CallRelationFailure::Upstream {
+                            kind: "native_model_authority_stale".into(),
+                        },
+                    },
                     caller,
                 );
             }
@@ -234,35 +260,60 @@ fn resolve_outgoing(
     if !is_call_relation_unit(caller) {
         return failed(
             "native_caller_not_callable",
-            "requested caller is not callable",
+            CallRelationDiagnosticPayload::Failure {
+                reason: CallRelationFailure::Upstream {
+                    kind: "native_caller_not_callable".into(),
+                },
+            },
             caller,
         );
     }
     if limits.max_files == 0 || limits.max_source_bytes == 0 || limits.max_candidates == 0 {
         let mut result = failed(
             "native_call_budget",
-            "outgoing call admission budget is zero",
+            CallRelationDiagnosticPayload::Failure {
+                reason: CallRelationFailure::Upstream {
+                    kind: "native_call_budget".into(),
+                },
+            },
             caller,
         );
         result.truncated = true;
-        result.diagnostics[0].code = CallRelationDiagnosticCode::BudgetExhausted;
+        result.diagnostics[0].code = if limits.max_files == 0 {
+            CallRelationDiagnosticCode::ScanGrantRefused(CallRelationScanLimit::Files)
+        } else if limits.max_source_bytes == 0 {
+            CallRelationDiagnosticCode::ScanGrantRefused(CallRelationScanLimit::SourceBytes)
+        } else {
+            CallRelationDiagnosticCode::BudgetExhausted
+        };
+        result.diagnostics[0].reason_kind = None;
         return result;
     }
     let Some(source) = go.indexed_source(caller.source()) else {
         return failed(
             "native_source_unavailable",
-            "indexed caller source is unavailable",
+            CallRelationDiagnosticPayload::Failure {
+                reason: CallRelationFailure::Upstream {
+                    kind: "native_source_unavailable".into(),
+                },
+            },
             caller,
         );
     };
     if source.len() > limits.max_source_bytes {
         let mut result = failed(
             "native_call_budget",
-            "caller source exceeds the source-byte budget",
+            CallRelationDiagnosticPayload::Failure {
+                reason: CallRelationFailure::Upstream {
+                    kind: "native_call_budget".into(),
+                },
+            },
             caller,
         );
         result.truncated = true;
-        result.diagnostics[0].code = CallRelationDiagnosticCode::BudgetExhausted;
+        result.diagnostics[0].code =
+            CallRelationDiagnosticCode::ScanGrantRefused(CallRelationScanLimit::SourceBytes);
+        result.diagnostics[0].reason_kind = None;
         return result;
     }
     if !go
@@ -271,7 +322,11 @@ fn resolve_outgoing(
     {
         return failed(
             "native_source_mismatch",
-            "caller source differs from the selected Go source",
+            CallRelationDiagnosticPayload::Failure {
+                reason: CallRelationFailure::Upstream {
+                    kind: "native_source_mismatch".into(),
+                },
+            },
             caller,
         );
     }
@@ -282,7 +337,11 @@ fn resolve_outgoing(
     else {
         return failed(
             "native_caller_range_unavailable",
-            "caller has no structured source range",
+            CallRelationDiagnosticPayload::Failure {
+                reason: CallRelationFailure::Upstream {
+                    kind: "native_caller_range_unavailable".into(),
+                },
+            },
             caller,
         );
     };
@@ -381,7 +440,7 @@ fn resolve_outgoing(
             &caller_path,
             cancellation,
         )?;
-        let semantic_model_overlay = analyzer.semantic_model_overlay();
+        let semantic_model_overlay = analyzer.semantic_model_overlay_read().published();
         let unresolved_imports = operation.go_selected_unresolved_imports(
             context.context_id,
             &caller_path,
@@ -405,21 +464,33 @@ fn resolve_outgoing(
         else {
             return Ok(SelectedResolutionOperationOutcome::Native(failed(
                 "native_structural_facts_unavailable",
-                "caller structural facts are unavailable",
+                CallRelationDiagnosticPayload::Failure {
+                    reason: CallRelationFailure::Upstream {
+                        kind: "native_structural_facts_unavailable".into(),
+                    },
+                },
                 caller,
             )));
         };
         if facts.source() != source.as_str() {
             return Ok(SelectedResolutionOperationOutcome::Native(failed(
                 "native_source_mismatch",
-                "caller structural facts do not match indexed source",
+                CallRelationDiagnosticPayload::Failure {
+                    reason: CallRelationFailure::Upstream {
+                        kind: "native_source_mismatch".into(),
+                    },
+                },
                 caller,
             )));
         }
         let Some(tree) = crate::analyzer::usages::get_definition::go::parse_go_tree(&source) else {
             return Ok(SelectedResolutionOperationOutcome::Native(failed(
                 "native_parse_failed",
-                "caller Go source could not be parsed",
+                CallRelationDiagnosticPayload::Failure {
+                    reason: CallRelationFailure::Upstream {
+                        kind: "native_parse_failed".into(),
+                    },
+                },
                 caller,
             )));
         };
@@ -436,7 +507,7 @@ fn resolve_outgoing(
                 continue;
             }
             let call_id = u32::try_from(node_id).expect("source node ID fits u32");
-            let Some(shape) = call_shape_for_call(&facts, caller.source(), call_id) else {
+            let Some(shape) = call_shape_for_call(&facts, caller.source(), call_id, None) else {
                 continue;
             };
             if !seen_call_spans
@@ -459,7 +530,10 @@ fn resolve_outgoing(
             if !shape.coverage.is_exact() {
                 result.diagnostics.push(diagnostic(
                     "native_call_shape_incomplete",
-                    format!("Go call shape is {:?} at {:?}", shape.coverage, shape.range),
+                    CallRelationDiagnosticPayload::GoShape {
+                        coverage: shape.coverage,
+                    }
+                    .at(caller.source(), Some(shape.range)),
                     caller,
                 ));
                 continue;
@@ -467,10 +541,8 @@ fn resolve_outgoing(
             let Some(callee_range) = shape.callee_range else {
                 result.diagnostics.push(diagnostic(
                     "native_call_reference_unavailable",
-                    format!(
-                        "Go call has no structured callee reference at {:?}",
-                        shape.range
-                    ),
+                    CallRelationDiagnosticPayload::GoStructuredReferenceUnavailable
+                        .at(caller.source(), Some(shape.range)),
                     caller,
                 ));
                 continue;
@@ -518,11 +590,7 @@ fn resolve_outgoing(
                         else {
                             result.diagnostics.push(diagnostic(
                                 "native_call_owner_unavailable",
-                                format!(
-                                    "call has no canonical owner at {}..{}",
-                                    metadata.start_byte(),
-                                    metadata.end_byte()
-                                ),
+                                CallRelationDiagnosticPayload::GoCanonicalOwnerUnavailable.at(caller.source(), Some(shapes[call_index].range)),
                                 caller,
                             ));
                             continue;
@@ -549,6 +617,11 @@ fn resolve_outgoing(
                             continue;
                         }
                         let projected_targets = &projections[answer_index].binding_targets;
+                        let canonical = projections[answer_index].diagnostic_targets.iter()
+                            .map(|(id, target)| (*id, CallRelationCanonicalTarget::from_projection(target)))
+                            .collect::<brokk_bifrost_core::hash::HashMap<_, _>>();
+                        let project = |id| canonical.get(&id)
+                            .expect("every diagnostic semantic has a projection slot").clone();
                         let mut callees = binding
                             .targets()
                             .iter()
@@ -601,27 +674,13 @@ fn resolve_outgoing(
                                 if completion != ResolutionCompletion::Complete {
                                     result.diagnostics.push(diagnostic(
                                         "native_call_resolution_incomplete",
-                                        format!(
-                                            "call resolution at {}..{}: {:?}; receiver dispositions: {:?}",
-                                            metadata.start_byte(),
-                                            metadata.end_byte(),
-                                            completion,
-                                            answer.callable_receiver_dispositions(),
-                                        ),
+                                        CallRelationDiagnosticPayload::GoIncomplete { completion: CallRelationCompletion::from_resolution(&completion, project), receivers: CallRelationReceiverDisposition::from_resolution(answer.callable_receiver_dispositions(), project) }.at(caller.source(), Some(shapes[call_index].range)),
                                         caller,
                                     ));
                                 }
                                 receiver_candidate_calls.push((call_index, model_selection.is_none() && binding.targets().is_empty(), diagnostic(
                                     "native_call_target_unavailable",
-                                    format!(
-                                        "call at {}..{} has no workspace target and no exact external proof; site kind {:?}, namespace {:?}, targets {:?}, completion {:?}",
-                                        shapes[call_index].range.start_byte,
-                                        shapes[call_index].range.end_byte,
-                                        metadata.site_kind(),
-                                        metadata.namespace(),
-                                        binding.targets(),
-                                        binding.completion(),
-                                    ),
+                                    CallRelationDiagnosticPayload::GoNoWorkspaceTarget { site_kind: metadata.site_kind(), namespace: metadata.namespace(), targets: { let mut targets = binding.targets().iter().copied().map(project).collect::<Vec<_>>(); targets.sort(); targets }, completion: CallRelationCompletion::from_resolution(binding.completion(), project) }.at(caller.source(), Some(shapes[call_index].range)),
                                     caller,
                                 )));
                             }
@@ -634,35 +693,19 @@ fn resolve_outgoing(
                         {
                             result.diagnostics.push(diagnostic(
                                 "native_call_target_unavailable",
-                                format!(
-                                    "call at {}..{} has one or more targets without a callable workspace unit",
-                                    metadata.start_byte(),
-                                    metadata.end_byte()
-                                ),
+                                CallRelationDiagnosticPayload::GoTargetUnavailable.at(caller.source(), Some(shapes[call_index].range)),
                                 caller,
                             ));
                         }
                         if completion != ResolutionCompletion::Complete {
                             result.diagnostics.push(diagnostic(
                                 "native_call_resolution_incomplete",
-                                format!(
-                                    "call resolution at {}..{}: {:?}; receiver dispositions: {:?}",
-                                    metadata.start_byte(),
-                                    metadata.end_byte(),
-                                    completion,
-                                    answer.callable_receiver_dispositions(),
-                                ),
+                                CallRelationDiagnosticPayload::GoIncomplete { completion: CallRelationCompletion::from_resolution(&completion, project), receivers: CallRelationReceiverDisposition::from_resolution(answer.callable_receiver_dispositions(), project) }.at(caller.source(), Some(shapes[call_index].range)),
                                 caller,
                             ));
                         }
                         if binding.targets().len() > 1 {
-                            result.diagnostics.push(CallRelationDiagnostic {
-                                code: CallRelationDiagnosticCode::TargetsAmbiguous,
-                                message: format!("Go call at {}..{} has ambiguous canonical targets: {:?}", metadata.start_byte(), metadata.end_byte(), callees),
-                                context: caller.fq_name().to_string(),
-                                semantic_count: Some(binding.targets().len()),
-                                reason_kind: Some("native_call_targets_ambiguous".to_owned()),
-                            });
+                            result.diagnostics.push(CallRelationDiagnostic::new(CallRelationDiagnosticCode::TargetsAmbiguous, CallRelationDiagnosticPayload::GoAmbiguous { targets: { let mut targets = callees.iter().map(|(unit, _)| unit.into()).collect::<Vec<CallRelationCanonicalTarget>>(); targets.sort(); targets } }.at(caller.source(), Some(shapes[call_index].range)), caller.fq_name().to_string()).with_count(binding.targets().len()));
                         }
                         let proof = if binding.targets().len() == 1
                             && completion == ResolutionCompletion::Complete
@@ -676,13 +719,7 @@ fn resolve_outgoing(
                         };
                         if callees.len() > limits.max_candidates {
                             result.truncated = true;
-                            result.diagnostics.push(CallRelationDiagnostic {
-                                code: CallRelationDiagnosticCode::CandidateLimit,
-                                message: format!("Go call at {}..{} exceeds its candidate bound", metadata.start_byte(), metadata.end_byte()),
-                                context: caller.fq_name().to_string(),
-                                semantic_count: Some(callees.len().saturating_sub(limits.max_candidates)),
-                                reason_kind: Some("native_call_candidates_omitted".to_owned()),
-                            });
+                            result.diagnostics.push(CallRelationDiagnostic::new(CallRelationDiagnosticCode::CandidateLimit, CallRelationDiagnosticPayload::GoCandidateBound { limit: limits.max_candidates }.at(caller.source(), Some(shapes[call_index].range)), caller.fq_name().to_string()).with_count(callees.len().saturating_sub(limits.max_candidates)).with_limit(limits.max_candidates));
                         }
                         let shape = &shapes[call_index];
                         let callee_range = shape.callee_range.expect("call candidates have a callee range");
@@ -787,10 +824,9 @@ fn resolve_outgoing(
                 if let Some(proof) = proof {
                     result.diagnostics.push(diagnostic(
                         "native_call_resolution_incomplete",
-                        format!(
-                            "external Go receiver member {} has no indexed declaration",
-                            proof.canonical_callee()
-                        ),
+                        CallRelationDiagnosticPayload::GoExternalReceiver {
+                            target: proof.canonical_callee().to_string(),
+                        },
                         caller,
                     ));
                 } else {
@@ -835,10 +871,8 @@ fn resolve_outgoing(
                 }
                 result.diagnostics.push(diagnostic(
                     "native_call_reference_unavailable",
-                    format!(
-                        "call has no selected native reference at {:?}",
-                        shape.callee_range
-                    ),
+                    CallRelationDiagnosticPayload::GoSelectedReferenceUnavailable
+                        .at(caller.source(), shape.callee_range),
                     caller,
                 ));
             }
@@ -873,37 +907,55 @@ fn resolve_outgoing(
             cancelled: true,
             ..CallRelationResult::default()
         },
-        BoundedResolution::Exceeded {
-            limit,
-            work: analysis_work,
-        } => {
+        BoundedResolution::Exceeded { limit, work: _ } => {
             let mut result = failed(
                 "native_call_budget",
-                format!("native Go outgoing resolution exceeded {limit:?}: {analysis_work:?}"),
+                CallRelationDiagnosticPayload::GoBudget { limit },
                 caller,
             );
             result.truncated = true;
             result.diagnostics[0].code = CallRelationDiagnosticCode::BudgetExhausted;
+            result.diagnostics[0].reason_kind = None;
             result
         }
-        BoundedResolution::Unavailable { reason, .. } => {
-            let mut result = failed("native_input_unavailable", reason, caller);
+        BoundedResolution::Unavailable { .. } => {
+            let mut result = failed(
+                "native_input_unavailable",
+                CallRelationDiagnosticPayload::Failure {
+                    reason: CallRelationFailure::InputUnavailable,
+                },
+                caller,
+            );
             result.truncated = true;
             result
         }
         BoundedResolution::Complete {
-            value: Err(error), ..
-        } => failed("native_store_error", error.to_string(), caller),
+            value: Err(_error), ..
+        } => failed(
+            "native_store_error",
+            CallRelationDiagnosticPayload::Failure {
+                reason: CallRelationFailure::StoreError,
+            },
+            caller,
+        ),
         BoundedResolution::Complete {
             value: Ok(outcome), ..
         } => match outcome {
             SelectedResolutionOperationOutcome::Native(result) => result,
-            SelectedResolutionOperationOutcome::Unavailable(reason) => {
-                failed("native_unavailable", format!("{reason:?}"), caller)
-            }
-            SelectedResolutionOperationOutcome::Stale(reason) => {
-                failed("native_stale", format!("{reason:?}"), caller)
-            }
+            SelectedResolutionOperationOutcome::Unavailable(reason) => failed(
+                "native_unavailable",
+                CallRelationDiagnosticPayload::NativeUnavailable {
+                    reason: (&reason).into(),
+                },
+                caller,
+            ),
+            SelectedResolutionOperationOutcome::Stale(reason) => failed(
+                "native_stale",
+                CallRelationDiagnosticPayload::NativeStale {
+                    reason: (&reason).into(),
+                },
+                caller,
+            ),
             SelectedResolutionOperationOutcome::Cancelled(_) => CallRelationResult {
                 cancelled: true,
                 ..CallRelationResult::default()
@@ -962,7 +1014,7 @@ fn exact_external_call(
                     query,
                     go,
                     session,
-                    analyzer.semantic_model_overlay(),
+                    analyzer.semantic_model_overlay_read().published(),
                     selected,
                 )
             {
@@ -1114,7 +1166,8 @@ mod tests {
             .active_semantic_model_snapshot()
             .expect("activated models");
         let overlay = analyzer
-            .semantic_model_overlay()
+            .semantic_model_overlay_read()
+            .published()
             .expect("activated overlay");
         let expected_key = brokk_bifrost_analysis::analyzer::ReadKey::Models(
             brokk_bifrost_analysis::analyzer::semantic::StableDigest::sha256(
@@ -1191,7 +1244,7 @@ mod tests {
             .filter(|key| matches!(key, brokk_bifrost_analysis::analyzer::ReadKey::Models(_)))
             .collect();
         assert_eq!(model_keys, [expected_key]);
-        assert!(analyzer.semantic_model_overlay().is_none());
+        assert!(analyzer.semantic_model_overlay_read().published().is_none());
     }
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
@@ -1234,7 +1287,8 @@ mod tests {
         let (_fixture, go, caller) = fixture();
         let _catalog = crate::analyzer::go::native_points::activate_receiver_models_for_test(&go);
         let overlay = go
-            .semantic_model_overlay()
+            .semantic_model_overlay_read()
+            .published()
             .expect("activated receiver models");
         let result = GoNativeCallRelationProvider.outgoing(
             &go,

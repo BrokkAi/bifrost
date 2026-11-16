@@ -402,6 +402,7 @@ mod tests {
             .evaluate(
                 policy,
                 &PolicyEvaluationContext {
+                    acceptance_hint: None,
                     analyzer: &analyzer,
                     workspace: None,
                     flow_state: &brokk_bifrost_flow::FlowWorkspaceState::new(),
@@ -654,6 +655,7 @@ mod tests {
             Some(PolicySourceIdentity::new(source)),
             None,
             Vec::new(),
+            crate::RelatedLocationOmissions::Known(0),
         )
         .unwrap();
         PolicyReportDocument::try_new(Vec::new(), Vec::new(), vec![diagnostic], false, 0, None)
@@ -696,7 +698,15 @@ mod tests {
         );
         assert_eq!(first, second);
         assert_eq!(usize::try_from(exact).unwrap(), first.len());
-        assert!(first.starts_with(br#"{"schema_version":7,"evaluation":{"#));
+        assert!(
+            first.starts_with(
+                format!(
+                    r#"{{"schema_version":{},"evaluation":{{"#,
+                    PolicyReportDocument::SCHEMA_VERSION
+                )
+                .as_bytes()
+            )
+        );
 
         let limit = first.len() - 1;
         let mut bounded = Vec::new();

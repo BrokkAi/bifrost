@@ -370,7 +370,8 @@ impl JavaAnalyzer {
         // below follows artifact intermediates, but an unresolved workspace
         // supertype still records the independent semantic evidence gap as well
         // as the hierarchy's typed incomplete status.
-        let external = self.external_declarations(analyzer.semantic_model_overlay());
+        let external =
+            self.external_declarations(analyzer.semantic_model_overlay_read().published());
         external.record_all_gaps(&crate::analyzer::jvm::external::QueryGapRecorder::new(self));
         let hierarchy = self.external_root_hierarchy_with_external(
             analyzer,
@@ -447,33 +448,18 @@ impl JavaAnalyzer {
         external_root_fqn: &str,
         hierarchy: &JavaExternalRootHierarchyAnswer,
     ) {
-        use crate::analyzer::java::imports::TypeNameOutcome;
-        use brokk_bifrost_jvm::java::graph_support::JavaTypeName;
         let scope = AnalyzerQueryScope::new(self);
         let token = scope.token();
-        let packs = analyzer.semantic_model_overlay();
+        let packs = analyzer.semantic_model_overlay_read().published();
         let mut seen = brokk_bifrost_core::hash::HashSet::default();
         for (descendant, raw) in &hierarchy.unmatched_supertypes {
             if !seen.insert((descendant.source().clone(), raw.as_str())) {
                 continue;
             }
-            let resolves = resolve_java_lexical_type_name(self, descendant, raw)
-                .or_else(|| self.resolve_imported_type_name(token, descendant.source(), raw))
-                .is_some()
-                || JavaTypeName::from_normalized_spelling(raw).is_some_and(|name| {
-                    matches!(
-                        self.resolve_type_name_outcome_at(
-                            token,
-                            packs.clone(),
-                            descendant.source(),
-                            &name,
-                            None,
-                            None,
-                        ),
-                        TypeNameOutcome::Resolved(_)
-                    )
-                });
-            if !resolves {
+            if self
+                .supertype_identity(token, &packs, descendant, raw)
+                .is_none()
+            {
                 analyzer.record_query_incomplete(
                     brokk_bifrost_analysis::analyzer::QueryReadIncomplete::SemanticEvidenceGap(
                         format!(
@@ -488,6 +474,77 @@ impl JavaAnalyzer {
         }
     }
 
+    /// The type a workspace declaration's written supertype names: a lexically
+    /// visible or imported workspace type, or else what Java's type-name ladder
+    /// binds against the external surface.
+    ///
+    /// The answer depends on the declaration's file, the snapshot and the
+    /// active model set, never on the root a hierarchy query asks about, so it
+    /// is memoized across queries with the reads of its resolution. Each
+    /// external-owner family query used to resolve every unmatched supertype
+    /// of every workspace type again through SQL, once for the closure walk
+    /// and once for the unresolved-supertype report (#11517).
+    fn supertype_identity(
+        &self,
+        token: QueryToken<'_>,
+        packs: &Option<
+            Arc<brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay>,
+        >,
+        descendant: &CodeUnit,
+        raw: &str,
+    ) -> Option<String> {
+        use crate::analyzer::java::imports::{JavaTypeResolution, TypeNameOutcome};
+        use brokk_bifrost_analysis::analyzer::semantic::StableDigest;
+        use brokk_bifrost_jvm::java::graph_support::JavaTypeName;
+        let key = (
+            packs
+                .as_ref()
+                .map(|overlay| StableDigest::sha256(overlay.active_model_set_hash())),
+            descendant.clone(),
+            raw.to_owned(),
+        );
+        let identity = crate::analyzer::jvm::hierarchy::derived_read(
+            &self.memo_caches.supertype_identities,
+            self,
+            &key,
+            || {
+                let identity = resolve_java_lexical_type_name(self, descendant, raw)
+                    .or_else(|| self.resolve_imported_type_name(token, descendant.source(), raw))
+                    .map(|unit| unit.fq_name())
+                    .or_else(|| {
+                        let name = JavaTypeName::from_normalized_spelling(raw)?;
+                        match self.resolve_type_name_outcome_at(
+                            token,
+                            packs.clone(),
+                            descendant.source(),
+                            &name,
+                            None,
+                            None,
+                        ) {
+                            TypeNameOutcome::Resolved(JavaTypeResolution::External(hit)) => {
+                                Some(hit.fqn().to_owned())
+                            }
+                            TypeNameOutcome::Resolved(JavaTypeResolution::Source(unit)) => {
+                                Some(unit.fq_name())
+                            }
+                            _ => None,
+                        }
+                    });
+                let bytes = std::mem::size_of_val(&key)
+                    + usize::try_from(
+                        brokk_bifrost_analysis::analyzer::cache_weight::estimate_code_unit(
+                            descendant,
+                        ),
+                    )
+                    .unwrap_or(usize::MAX)
+                    + raw.len()
+                    + identity.as_ref().map_or(0, String::len);
+                (Arc::new(identity), bytes)
+            },
+        );
+        (*identity).clone()
+    }
+
     fn external_root_hierarchy_with_external(
         &self,
         analyzer: &dyn IAnalyzer,
@@ -495,8 +552,6 @@ impl JavaAnalyzer {
         max_visits: usize,
         cancellation: Option<&CancellationToken>,
     ) -> JavaExternalRootHierarchyAnswer {
-        use crate::analyzer::java::imports::{JavaTypeResolution, TypeNameOutcome};
-        use brokk_bifrost_jvm::java::graph_support::JavaTypeName;
         let index = match self.external_root_hierarchy_index(cancellation) {
             Ok(index) => index,
             Err(status) => {
@@ -508,7 +563,7 @@ impl JavaAnalyzer {
                 };
             }
         };
-        let packs = analyzer.semantic_model_overlay();
+        let packs = analyzer.semantic_model_overlay_read().published();
         let external = self.external_declarations(packs.clone());
         let recorder = crate::analyzer::jvm::external::QueryGapRecorder::new(self);
         let scope = AnalyzerQueryScope::new(self);
@@ -524,36 +579,7 @@ impl JavaAnalyzer {
                     visited,
                     max_visits,
                     cancellation,
-                    |raw| {
-                        if let Some(unit) = resolve_java_lexical_type_name(self, descendant, raw)
-                            .or_else(|| {
-                                self.resolve_imported_type_name(
-                                    scope.token(),
-                                    descendant.source(),
-                                    raw,
-                                )
-                            })
-                        {
-                            return Some(unit.fq_name());
-                        }
-                        let name = JavaTypeName::from_normalized_spelling(raw)?;
-                        match self.resolve_type_name_outcome_at(
-                            scope.token(),
-                            packs.clone(),
-                            descendant.source(),
-                            &name,
-                            None,
-                            None,
-                        ) {
-                            TypeNameOutcome::Resolved(JavaTypeResolution::External(hit)) => {
-                                Some(hit.fqn().to_owned())
-                            }
-                            TypeNameOutcome::Resolved(JavaTypeResolution::Source(unit)) => {
-                                Some(unit.fq_name())
-                            }
-                            _ => None,
-                        }
-                    },
+                    |raw| self.supertype_identity(scope.token(), &packs, descendant, raw),
                     |identity| external.hierarchy_supertypes(&recorder, identity),
                 )
             },
@@ -1767,5 +1793,102 @@ mod tests {
             exhausted.status,
             JavaExternalRootHierarchyStatus::BudgetExhausted
         );
+    }
+
+    #[test]
+    #[hardwon(
+        "#11517: every external-owner family query re-resolved each workspace class's external supertype through SQL, doubling OWASP taint compile CPU"
+    )]
+    fn external_member_families_resolve_each_supertype_once_per_snapshot() {
+        use crate::analyzer::jvm::external::{TestClassFile, write_test_class_jar};
+        use brokk_bifrost_core::analyzer::config::{
+            AnalyzerConfig, JvmAnalyzerConfig, JvmExternalArtifact, JvmExternalDependencies,
+        };
+        const CLASSES: usize = 8;
+        let mut project = InlineTestProject::with_language(Language::Java);
+        for index in 0..CLASSES {
+            project = project.file(
+                format!("app/Servlet{index}.java"),
+                format!(
+                    "package app;\nimport dep.Base;\nclass Servlet{index} extends Base {{ public void close() {{}} }}\n"
+                ),
+            );
+        }
+        let project = project.build();
+        let dir = tempfile::tempdir().unwrap();
+        let jar = dir.path().join("dependency.jar");
+        let class = |internal_name, super_internal_name| TestClassFile {
+            internal_name,
+            super_internal_name,
+            methods: &[],
+            private_nested: false,
+        };
+        write_test_class_jar(
+            &jar,
+            &[
+                class("dep/Base", "dep/Middle"),
+                class("dep/Middle", "java/lang/Object"),
+                class("dep/Unrelated", "java/lang/Object"),
+                class("java/lang/Object", "java/lang/Object"),
+            ],
+        );
+        let java = JavaAnalyzer::new_with_config(
+            project.project_dyn(),
+            AnalyzerConfig {
+                jvm: JvmAnalyzerConfig {
+                    external_dependencies: JvmExternalDependencies {
+                        artifact_paths: vec![JvmExternalArtifact {
+                            artifact_path: jar,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let statements = Arc::new(AtomicUsize::new(0));
+        let probe = rusqlite::Connection::open_in_memory().unwrap();
+        let counter = Arc::clone(&statements);
+        let _subscription = brokk_bifrost_core::cache_db::sql_profile::subscribe_test_statements(
+            &probe,
+            Arc::new(move |_| {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }),
+        );
+        let family = |root: &str| {
+            let answer = java.resolve_external_member_family(
+                &java,
+                &JvmExternalMemberIdentity::new(
+                    Language::Java,
+                    root,
+                    "close",
+                    0,
+                    JvmReceiverSemantics::Instance,
+                ),
+                usize::MAX,
+                None,
+            );
+            assert_eq!(
+                answer.status,
+                ExternalMemberFamilyStatus::Complete,
+                "{answer:?}"
+            );
+            answer.candidates.len()
+        };
+
+        let (cold, cold_reads) = capture_query_reads(&java, || family("dep.Middle"));
+        assert_eq!(cold, CLASSES, "every servlet overrides through dep.Base");
+
+        // The supertype `Base` of each servlet names the same external type
+        // whatever root a query asks about, so another root resolves nothing.
+        statements.store(0, Ordering::Relaxed);
+        assert_eq!(family("dep.Unrelated"), 0);
+        assert_eq!(statements.load(Ordering::Relaxed), 0);
+
+        let (warm, warm_reads) = capture_query_reads(&java, || family("dep.Middle"));
+        assert_eq!(warm, cold);
+        assert_eq!(warm_reads.keys(), cold_reads.keys());
     }
 }

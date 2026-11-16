@@ -586,7 +586,7 @@ fn wildcard_identity_tracks_only_contributing_catalogs() {
             let category = PolicyCategoryId::new(category).unwrap();
             catalogs
                 .register(TaintCatalogDefinition {
-                    schema_version: 1,
+                    schema_version: crate::definition::POLICY_DOCUMENT_SCHEMA_VERSION,
                     name: PolicyId::new(name).unwrap(),
                     version: 1,
                     categories: vec![category.clone()],

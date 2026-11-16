@@ -956,6 +956,7 @@ impl OutputArtifactKeyRow {
 pub struct OutputCallRow {
     pub artifact: OutputArtifactKeyRow,
     pub procedure: u32,
+    pub interpretation: crate::analyzer::semantic::ProcedureInterpretation,
     pub call: u32,
 }
 
@@ -964,13 +965,18 @@ impl OutputCallRow {
         Self {
             artifact: OutputArtifactKeyRow::encode(&key.0.0),
             procedure: key.0.1.get(),
+            interpretation: key.0.2,
             call: key.1.get(),
         }
     }
 
     pub fn decode(&self) -> Result<crate::value_flow::DurableCallSiteKey, OutputProductError> {
         Ok((
-            (self.artifact.decode()?, ProcedureId::new(self.procedure)),
+            (
+                self.artifact.decode()?,
+                ProcedureId::new(self.procedure),
+                self.interpretation,
+            ),
             CallSiteId::new(self.call),
         ))
     }
@@ -1194,7 +1200,10 @@ impl OutputPathQualityRow {
 // summaries keep an absent provenance field.
 // #10687 B: V8 renders finding diagnostics for partial findings in any run state with
 // residual causes appended, and the final preparation strip exempts composition payloads.
-const OUTPUT_REPORT_VERSION: u32 = 8;
+// #11266: selected endpoint evidence locations are separate from event identity.
+// #4967: V10 keeps the full selected-body interpretation in every call row.
+// A boolean cannot distinguish an executable body from Base.
+const OUTPUT_REPORT_VERSION: u32 = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutputReportRow {
@@ -1224,6 +1233,12 @@ pub struct OutputReportRow {
 }
 
 impl OutputReportRow {
+    /// The stored Output format fence. Readers check it before interpreting
+    /// any nested procedure coordinate or applying a legacy default.
+    pub const fn format_version() -> u32 {
+        OUTPUT_REPORT_VERSION
+    }
+
     /// The row of an anchor whose composition was stopped by a budget before it
     /// produced anything: no findings, nothing proven, and incomplete. It is
     /// never stored; the unit that holds it is refused.
@@ -1579,6 +1594,11 @@ impl OutputReportRow {
     }
 
     pub fn decode(value: serde_json::Value) -> Result<Self, OutputProductError> {
+        if value.get("version").and_then(serde_json::Value::as_u64)
+            != Some(u64::from(OUTPUT_REPORT_VERSION))
+        {
+            return Err(OutputProductError::Corrupt);
+        }
         let row: Self = serde_json::from_value(value).map_err(|_| OutputProductError::Corrupt)?;
         row.validate()?;
         Ok(row)

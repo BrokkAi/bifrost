@@ -1,0 +1,19 @@
+# The rust-unit-summary-derivation lever (#11570).
+#
+# Invalidates Rust resolution unit summaries and their derived children.
+# Add one `<issue>-<slug>` line when these derivation rules change.
+# Git merges this file with merge=union. Never edit or remove a token line.
+# See .agents/docs/cache-identity-levers.md.
+#
+# Replaced the literal: RUST_UNIT_SUMMARY_DERIVATION_VERSION = 32.
+11570-slice2b-derivation-identity
+11173-impl-children-review-fixes
+11173-foreign-gap-name-forms
+11904-impl-half-classification
+11173-gap-macro-invocation-forms
+# Replaces the literal 41 -> 42 bump from PR #12106 (#12014).
+12014-explicit-binding-precedence
+12239-macro-cfg-shadowing
+# Replaces the literal 42 -> 43 bump from the #12164 checkpoint.
+12164-all-features-test
+10381-per-unit-feature-projection

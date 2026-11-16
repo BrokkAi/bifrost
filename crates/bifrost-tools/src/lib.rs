@@ -8,6 +8,7 @@ pub mod diff_scoring;
 pub mod file_tools;
 pub mod function_sources;
 pub mod model_context;
+pub mod relation_brief;
 pub mod relevance;
 pub mod result_incomplete;
 pub mod searchtools;
@@ -40,6 +41,10 @@ pub mod engine_tests;
 // Engine fixture paths used by relocated unit-test modules.
 #[cfg(test)]
 use brokk_bifrost_analysis::*;
+
+#[cfg(test)]
+#[path = "../../../test-support/scratch_cache.rs"]
+mod scratch_cache;
 
 mod language_registry;
 

@@ -133,87 +133,12 @@ use brokk_bifrost_core::hash::HashSet;
 use brokk_bifrost_core::text_utils::find_line_index_for_offset;
 use std::sync::Arc;
 
-// Bumped for #3508, B2/B3, and call-site control hazards: the declared type of a call whose target declaration
-// publishes several occurrence rows -- an in-class prototype beside the
-// definition that completes it -- now reads the body-bearing row from an
-// occurrence query that asks for one row beyond the pair it decides, so a warm
-// value-semantics result computed while that reader refused the declaration
-// must not be reused. That covers results written before the lookahead row
-// stopped a capped store answer from being read as a refusal.
-// Bumping this rotates every public wire id hashed from the adapter
-// fingerprint (`SemanticArtifactKey::push_environment_identity`). A checked-in
-// golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
-// change; the code-query tutorial pages elide such ids (#5016).
-// #5441: C compound assignment cannot invoke C++ operators or conversions.
-// #5868: resolved-call lowering consumes reconciled callable ownership. Its
-// semantic artifact key does not include the C++ source epoch; give the combined
-// ownership/receiver correction a fresh lowering identity even for unchanged bytes.
-// #6318: a declaration whose specifier run holds a `macro_modifier` (including
-// C11 `_Thread_local`) no longer lowers to a closed scalar type, so stored IR for
-// unchanged bytes can still carry the false definite value; rotate it.
-// #6309: a callable whose return type follows a `macro_modifier` or is a
-// `macro_type_specifier` no longer publishes a structured return identity, so
-// its procedure return model changes for unchanged bytes. v38 is reserved for
-// the independently published #6318 macro-modifier scalar-typing change, so
-// the two corrections never share one lowering identity.
-// #6346: a macro-decorated constructor's member initializers no longer publish
-// false member functions, so a call such as `grow_(...)` reaches the real
-// function-pointer field instead of a callable for unchanged bytes. v39 is
-// reserved for the concurrent #6309 return-identity repair, so the two
-// corrections never share one lowering identity.
-// #3298: the constructor and members under an access label a class-scope macro
-// invocation swallowed are now published, with that label's access, so the
-// callables lowered for unchanged bytes change. v40 is reserved for the
-// concurrent #6346 macro-initialized constructor repair.
-// #6325: resolved-call lowering reads guard-based visibility, and a displaced
-// `#else` now places its declarations in the alternative branch. v40 is the
-// published #6346 identity and v41 is reserved for the concurrent #3298
-// access-label repair, so this guard correction takes v42.
-// #6373: a type parameter defaulted to an abstract declarator (`typename U =
-// T*`) is a type parameter again under grammar 0.24.4, so its forward-declared
-// default reaches receiver selection and resolved calls change for unchanged
-// bytes.
-// #2928: a function-like export-macro class head without a base clause again
-// publishes its class and member ownership, so resolved-call lowering changes
-// for unchanged bytes. v42 is the published #6325 guard identity and v43 is
-// reserved for the concurrent #6373 type-parameter repair, so this takes v44.
-// v43 (#6373 alone) and v44 (#2928 alone) are both published standalone
-// identities whose lowerings lack the other repair, so the producer combining
-// them takes v45.
-// #2184: a type spelled after a leading `macro_modifier` again takes the
-// physical same-file alias, so receiver types and resolved calls change for
-// unchanged bytes. v43, v44 and the combined v45 are published identities
-// whose lowerings lack this repair, so the producer adding it takes v46.
-// #3093: parsed namespace Modules carry their source facts again, so bounded
-// visibility reaches their dependency names and resolved calls change for
-// unchanged bytes.
-// Quicksilver round 4: the lowerer reaches declaration helpers whose output
-// changed (class_like_name through cpp_callable_declaration_return_type_identity,
-// and procedure inventory and resolved-call lookup through the declaration
-// products), so unchanged bytes lower differently.
-// #6898: declarator_name_node and macro_fracture_boundary changed.
-// Grammar 0.24.6 changes unnamed enum-base trees (#6902).
-// #6902 item 8: resolved-call lookup reaches foreign declaration visibility,
-// which now requires guard implication, so unchanged bytes lower differently.
-// #6902 item 12: definition lookup now rebinds namespace-alias qualifiers, so
-// resolved type references change for unchanged bytes.
-// #7033 (#6902 item 7): declarations.rs functions this lowerer imports
-// changed; bumped without a trace because no checked-in golden prints C/C++
-// semantic ids, so the rotation costs nothing and a stale lowering would.
-// #7082 (#6902 items 1, 3, 5, 6): grammar 0.24.8 changes the trees this
-// lowerer reads for unchanged bytes; no checked-in golden prints C/C++
-// semantic ids.
-// #6902 item 10: definition lookup applies reference guards to conditional
-// alias arms before canonicalizing them, so resolved type references change
-// for unchanged bytes.
-// #7078: every reference guard check uses the effective context (source
-// guards, build-proven defines, stable __cplusplus state), and the lowerer's
-// bounded call resolver reaches declaration_visible_at through it, so
-// resolved calls change for unchanged bytes. Also covers #7074, which changed
-// the same checks without a bump.
-// #8387: invalidate artifacts embedding ranked synthetic declaration identities.
-// #9447: structured formal roles and refusal change semantic payloads.
-const ADAPTER_VERSION: &[u8] = b"cpp-cfg-values-v58";
+/// The cpp adapter lever (#11570): `levers/cpp-adapter.tokens`. Add a line there
+/// when a change alters the semantics this lowerer publishes for unchanged
+/// source; see `.agents/docs/cache-identity-levers.md`.
+fn adapter_version() -> &'static [u8] {
+    brokk_bifrost_core::lever_label!("cpp-cfg-values", "cpp-adapter.tokens").as_bytes()
+}
 
 /// Procedure-local source roles for both C and C++. The two dialects share
 /// tree-sitter syntax for the control constructs covered by B2 and B3; their
@@ -355,7 +280,7 @@ fn policy_lowering_identity_for_dependencies(
 ) -> SemanticAdapterIdentity {
     SemanticAdapterIdentity::for_adapter(
         "cpp",
-        ADAPTER_VERSION,
+        adapter_version(),
         b"cpp-intrafile-execution-defaults-v1",
         dependencies,
     )
@@ -3140,7 +3065,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     /// Resolve a parser-derived type occurrence through the active generated
     /// header model. No model id is derived from rendered source text.
     fn resolved_model_owner(&self, identity: &StructuredTypeIdentity) -> Option<Box<str>> {
-        let overlay = self.analyzer.semantic_model_overlay();
+        let overlay = self.analyzer.semantic_model_overlay_read().published();
         match external_structured_type_model_resolution(
             self.analyzer,
             overlay.as_deref(),
@@ -3700,10 +3625,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             DeclaredScalarType::Signed(_) | DeclaredScalarType::Unsigned(_)
         );
         let subject_is_boolean = subject_type == DeclaredScalarType::Boolean;
-        let constant_is_integer = matches!(
-            constant_kind,
-            SemanticValueKind::UnsignedInteger(_) | SemanticValueKind::SignedInteger(_)
-        );
+        let constant_is_integer = constant_kind.is_represented_integer();
         let constant_is_boolean = matches!(constant_kind, SemanticValueKind::Boolean(_));
         let constant = self.expression_value(builder, constant, constant_kind)?;
         let predicate = if subject_is_boolean && constant_is_boolean {
@@ -4327,7 +4249,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         owner_id: &str,
         operation: ExactModeledOperation,
     ) -> Option<ExactModeledTransfer> {
-        let overlay = self.analyzer.semantic_model_overlay()?;
+        let overlay = self.analyzer.semantic_model_overlay_read().published()?;
         if operation.is_move() {
             let owners = overlay.symbols_with_id_in_family(owner_id, "cpp");
             let [owner] = owners.records.as_slice() else {
@@ -4598,7 +4520,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         member: &str,
         argument_count: usize,
     ) -> Option<ExplicitValueOperation> {
-        let overlay = self.analyzer.semantic_model_overlay()?;
+        let overlay = self.analyzer.semantic_model_overlay_read().published()?;
         let matched = overlay.explicit_member_target_on_owner(owner_id, member, argument_count);
         if matched.disposition != SemanticModelMemberTargetDisposition::Unique {
             return None;
@@ -4670,7 +4592,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         if self.namespace_name_is_shadowed(function, namespace) {
             return None;
         }
-        let overlay = self.analyzer.semantic_model_overlay();
+        let overlay = self.analyzer.semantic_model_overlay_read().published();
         let owner_id = external_namespace_model_resolution(
             self.analyzer,
             overlay.as_deref(),

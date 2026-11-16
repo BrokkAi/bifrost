@@ -11,6 +11,22 @@ use crate::analyzer::usages::python_class_hierarchy::{
     PythonMroMembersAnswer, PythonOverrideAnswer, PythonOverrideOutcome,
 };
 
+/// An acquired, open index is content uncertainty, not a provider failure.
+pub(super) fn descendant_answer_incompleteness(
+    answer: &brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer,
+) -> Incompleteness {
+    if answer.stopped_short()
+        || answer.open.iter().any(|reason| {
+            matches!(reason,
+        brokk_bifrost_core::analyzer::capabilities::HierarchyOpenReason::DescendantIndexUnavailable)
+        })
+    {
+        Incompleteness::Operational(DerivationExecutionCause::Provider)
+    } else {
+        Incompleteness::Content
+    }
+}
+
 pub(super) fn hierarchy_incompleteness(reason: Option<PythonHierarchyReason>) -> Incompleteness {
     match reason {
         Some(PythonHierarchyReason::Cancelled) => {
@@ -24,6 +40,8 @@ pub(super) fn hierarchy_incompleteness(reason: Option<PythonHierarchyReason>) ->
             | PythonHierarchyReason::UnresolvedBase
             | PythonHierarchyReason::NonClassBase
             | PythonHierarchyReason::ExternalBase
+            | PythonHierarchyReason::ImplicitGenericUndecidedSourceBase
+            | PythonHierarchyReason::ImplicitGenericUndecidedFactory
             | PythonHierarchyReason::MissingRuntimeBases
             | PythonHierarchyReason::ConflictingRuntimeBases
             | PythonHierarchyReason::AmbiguousRuntimeBase
@@ -77,6 +95,8 @@ pub(super) const PYTHON_HIERARCHY_REASON_LABELS: &[&str] = &[
     "unresolved_base",
     "non_class_base",
     "external_base",
+    "implicit_generic_undecided_source_base",
+    "implicit_generic_undecided_factory",
     "missing_runtime_bases",
     "conflicting_runtime_bases",
     "ambiguous_runtime_base",
@@ -1026,12 +1046,27 @@ fn base_fact(
         PythonBaseResolution::Unresolved => Some(
             match base.origin {
                 PythonBaseOrigin::Source => PythonHierarchyReason::UnresolvedBase,
-                PythonBaseOrigin::ImplicitObject => PythonHierarchyReason::MissingRuntimeBases,
+                PythonBaseOrigin::ImplicitGenericUndecidedFactory => {
+                    PythonHierarchyReason::ImplicitGenericUndecidedFactory
+                }
+                PythonBaseOrigin::ImplicitGenericUndecided => {
+                    PythonHierarchyReason::ImplicitGenericUndecidedSourceBase
+                }
+                PythonBaseOrigin::ImplicitObject | PythonBaseOrigin::ImplicitGeneric => {
+                    PythonHierarchyReason::MissingRuntimeBases
+                }
             }
             .label(),
         ),
         PythonBaseResolution::NonClass => Some(PythonHierarchyReason::NonClassBase.label()),
-        PythonBaseResolution::External => Some(PythonHierarchyReason::ExternalBase.label()),
+        PythonBaseResolution::External => Some(
+            if base.origin == PythonBaseOrigin::ImplicitGenericUndecided {
+                PythonHierarchyReason::ImplicitGenericUndecidedSourceBase
+            } else {
+                PythonHierarchyReason::ExternalBase
+            }
+            .label(),
+        ),
     };
     fact_expansion(
         hierarchy_incompleteness(hierarchy.reason),
@@ -1058,7 +1093,7 @@ fn inference_failure_fact(
     root_id: &str,
     base: &PythonBaseFact,
 ) -> Option<PipelineExpansion> {
-    if base.origin == PythonBaseOrigin::ImplicitObject {
+    if base.origin != PythonBaseOrigin::Source {
         return None;
     }
     let reason = match base.resolution {
@@ -1143,7 +1178,7 @@ fn mro_base_branch_definition_counts(
                 DerivationExecutionCause::Cancelled,
             ));
         }
-        if base.origin == PythonBaseOrigin::ImplicitObject {
+        if base.origin != PythonBaseOrigin::Source {
             // The language-supplied object root is not a source branch.
             continue;
         }
@@ -1161,11 +1196,12 @@ fn mro_base_branch_definition_counts(
             ));
         }
         visits = visits.saturating_add(branch.members.len());
-        if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+        if brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
             visits,
             MAX_PYTHON_BASE_BRANCH_MEMBER_VISITS,
         )
-        .allows(0)
+        .try_allow(0)
+        .is_err()
         {
             return Err(Incompleteness::Operational(
                 DerivationExecutionCause::Budget,

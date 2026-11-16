@@ -183,6 +183,7 @@ pub fn resolve_php_semantic_pack_dependencies(
     }
     let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
     let mut outcome = DependencyDiscoveryOutcome {
+        incomplete_reason: None,
         profile: DependencyDiscoveryProfile {
             metadata_inputs_considered,
             dependencies_resolved: dependencies.len(),

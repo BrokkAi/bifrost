@@ -141,3 +141,39 @@ fn syntax_error_facts_are_selectable_without_recovered_syntax_incomplete() {
         "a recovered parser span must be a syntax_error fact"
     );
 }
+
+#[test]
+#[hardwon("#11673: a recovered-syntax gap lost the file whose rows it withheld")]
+fn a_recovered_gap_names_its_file_until_a_later_operator_crosses_files() {
+    let (_temp, workspace) = kotlin_workspace(
+        "fun f(c: Boolean): Boolean {\n    if c return true else return false\n}\n",
+    );
+    let seed = json!({ "languages": ["kotlin"], "match": { "kind": "if" } });
+    let withheld = |query: serde_json::Value| {
+        let result = execute_code_query_with_access_mode(
+            workspace.analyzer(),
+            &CodeQuery::from_json(&query).expect("query"),
+            CodeQueryExecutionLimits::default(),
+            StructuralAccessMode::ScanOnly,
+            false,
+        )
+        .expect("scan access")
+        .result;
+        result
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code == CodeQueryDiagnosticCode::RecoveredSyntaxIncomplete
+            })
+            .map(|diagnostic| diagnostic.withheld_rows_path.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(withheld(seed.clone()), [Some("Sample.kt".to_owned())]);
+    // An intersection derives its rows from both operands, so the executor
+    // withdraws the attribution rather than let a reader trust it.
+    assert!(
+        withheld(json!({ "intersect": [seed.clone(), seed] }))
+            .iter()
+            .all(Option::is_none)
+    );
+}

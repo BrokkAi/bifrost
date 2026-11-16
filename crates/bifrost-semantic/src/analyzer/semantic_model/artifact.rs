@@ -734,6 +734,44 @@ pub fn decode_manifest_with_census(
             "invalid artifact extraction authority".into(),
         ));
     }
+    if manifest.extraction.as_ref().is_some_and(|extraction| {
+        !extraction.verified_sysroot.is_empty()
+            && (manifest.schema_version < RUST_SYSROOT_RECEIPT_MIN_SCHEMA_VERSION
+                || manifest.producer.name != "bifrost-rustdoc-json"
+                || extraction.kind != ArtifactExtractionKind::RustdocJsonSet
+                || extraction
+                    .verified_sysroot
+                    .iter()
+                    .any(|receipt| !receipt.provenance.toolchain.release_channel_is_consistent()))
+    }) {
+        return Err(ArtifactError::InvalidDescriptor(
+            "invalid verified sysroot authority".into(),
+        ));
+    }
+    if let Some(extraction) = &manifest.extraction {
+        for receipt in &extraction.verified_sysroot {
+            let origin = &receipt.provenance;
+            for text in [
+                &receipt.path,
+                &origin.toolchain.release,
+                &origin.toolchain.date,
+                &origin.toolchain.commit,
+                &origin.target,
+                &origin.archive_sha256,
+                &origin.archive_member,
+            ] {
+                validate_text(text, limits, &mut census, "sysroot receipt")?;
+            }
+            if !is_canonical_relative_path(&receipt.path)
+                || !is_canonical_relative_path(&origin.archive_member)
+                || !is_lower_sha256(&origin.archive_sha256)
+            {
+                return Err(ArtifactError::InvalidDescriptor(
+                    "invalid sysroot receipt path or digest".into(),
+                ));
+            }
+        }
+    }
     manifest
         .compatibility
         .validate_for_schema(manifest.schema_version)

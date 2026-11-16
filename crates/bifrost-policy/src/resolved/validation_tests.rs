@@ -126,7 +126,7 @@ fn loaded_catalog_policy(
             display_name: "request".into(),
             categories: vec![PolicyCategoryId::new("input.user").unwrap()],
             selector: selector("request"),
-            bind: PolicyPort::ReturnValue,
+            bind: PolicyPort::ReturnValue { path: None },
             labels: vec![TaintLabel::new("untrusted").unwrap()],
             threat_model: None,
             evidence,
@@ -644,7 +644,7 @@ fn external_model_transfer_list_cannot_gain_or_lose_entries() {
         .transfers
         .push(TaintTransferSpec {
             from: PolicyPort::ArgumentIndex { index: 2 },
-            to: PolicyPort::ReturnValue,
+            to: PolicyPort::ReturnValue { path: None },
             labels: vec![TaintLabel::new("untrusted").unwrap()],
             effect: TaintTransferEffect::Propagate,
         });

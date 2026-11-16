@@ -922,9 +922,7 @@ fn add_structural_assignment_findings(
         let Some(literal) = literal_value_node(value) else {
             continue;
         };
-        if literal.start_position().row != literal.end_position().row
-            || contains_descendant_kind(literal, "escape_sequence")
-        {
+        if contains_descendant_kind(literal, "escape_sequence") {
             continue;
         }
         let Some((start, end)) = literal_content_range(literal, text) else {
@@ -934,6 +932,12 @@ fn add_structural_assignment_findings(
             continue;
         }
         let value_text = &text[start..end];
+        // The value itself must stay on one line. A literal node is not a
+        // reliable line marker: a PHP heredoc or nowdoc encloses its delimiter
+        // lines, and a multi-line value is not one secret.
+        if value_text.contains('\n') {
+            continue;
+        }
         let confidence = if value_text.chars().count() >= 12 {
             SecretConfidence::Medium
         } else if include_low_confidence {
@@ -944,6 +948,7 @@ fn add_structural_assignment_findings(
         if !is_plausible_assignment_secret(value_text, confidence) {
             continue;
         }
+        // Computed only for a finding: it scans the text before the value.
         let span = redaction_span(text, start, end);
         result.keys.insert(SecretKey {
             path: path.to_string(),
@@ -992,6 +997,13 @@ fn assignment_parts(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
     }
 }
 
+// PHP gives its strings their own node shapes: a single-quoted string is a
+// `string` that the quote strip below already covers, while a double-quoted
+// string is an `encapsed_string`, and a heredoc and a nowdoc are separate nodes
+// whose body sits in their `value` field. The three kinds below interleave
+// literal content with interpolation, so their content needs its own reading.
+const PHP_STRING_KINDS: &[&str] = &["encapsed_string", "heredoc", "nowdoc"];
+
 fn literal_value_node(mut node: Node<'_>) -> Option<Node<'_>> {
     loop {
         if matches!(
@@ -1016,6 +1028,10 @@ fn literal_value_node(mut node: Node<'_>) -> Option<Node<'_>> {
             }
             return Some(node);
         }
+        if PHP_STRING_KINDS.contains(&node.kind()) {
+            php_string_content(node)?;
+            return Some(node);
+        }
         if !matches!(
             node.kind(),
             "flow_node" | "block_node" | "equals_value_clause" | "parenthesized_expression"
@@ -1027,7 +1043,38 @@ fn literal_value_node(mut node: Node<'_>) -> Option<Node<'_>> {
     }
 }
 
+/// The one literal content node of a PHP double-quoted string, heredoc or
+/// nowdoc, or `None` when the body is not a single literal.
+///
+/// A double-quoted string holds `string_content` between its quotes; a heredoc
+/// body holds `string_content` lines; a nowdoc body holds `nowdoc_string`
+/// lines. Interpolation adds a `variable_name`, `dynamic_variable_name`,
+/// `member_access_expression` or `subscript_expression` beside the content, an
+/// escape adds an `escape_sequence` beside it, and a multi-line body adds one
+/// content node per line, so each of those shapes has no single content node.
+/// The returned node's range is the content alone: the quote, `<<<EOT` and
+/// `EOT` delimiters stay outside it.
+fn php_string_content(node: Node<'_>) -> Option<Node<'_>> {
+    let container = if node.kind() == "encapsed_string" {
+        node
+    } else {
+        node.child_by_field_name("value")?
+    };
+    let mut cursor = container.walk();
+    let mut children = container.named_children(&mut cursor);
+    let content = children.next()?;
+    if children.next().is_some() {
+        return None;
+    }
+    matches!(content.kind(), "string_content" | "nowdoc_string").then_some(content)
+}
+
 fn literal_content_range(node: Node<'_>, text: &str) -> Option<(usize, usize)> {
+    if PHP_STRING_KINDS.contains(&node.kind()) {
+        let content = php_string_content(node)?;
+        let (start, end) = (content.start_byte(), content.end_byte());
+        return (start < end).then_some((start, end));
+    }
     let mut start = node.start_byte();
     let mut end = node.end_byte();
     let bytes = text.as_bytes().get(start..end)?;
@@ -1689,6 +1736,295 @@ mod tests {
 
         assert!(scan_text("config.ts", escaped, false).is_empty());
         assert!(scan_text("config.ts", multiline, false).is_empty());
+    }
+
+    const PHP_SECRET: &str = "aB3dE5fG7hJ9kL1m";
+
+    fn named_child_kinds(node: Node<'_>) -> Vec<&'static str> {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
+            .map(|child| child.kind())
+            .collect()
+    }
+
+    #[test]
+    fn php_literal_shapes_are_pinned() {
+        // The scan reads these node kinds, field names and content nodes, so
+        // the grammar's shapes are an input contract, not an implementation
+        // detail.
+        let text = r#"<?php
+$token = 'Zx8Cv6Bn4Mm2Qq0W';
+$token = "aB3dE5fG7hJ9kL1m";
+$token = <<<EOT
+aB3dE5fG7hJ9kL1m
+EOT;
+$token = <<<'EOT'
+Zx8Cv6Bn4Mm2Qq0W
+EOT;
+"#;
+        let mut parser = Parser::new();
+        parser
+            .set_language(&assignment_grammar("config.php").expect("PHP grammar"))
+            .unwrap();
+        let tree = parser.parse(text, None).expect("PHP parse");
+        assert!(!tree.root_node().has_error());
+        let mut pending = vec![tree.root_node()];
+        let mut rights = Vec::new();
+        while let Some(node) = pending.pop() {
+            let mut cursor = node.walk();
+            pending.extend(node.named_children(&mut cursor));
+            if let Some((_, right)) = assignment_parts(node) {
+                rights.push(right);
+            }
+        }
+        rights.sort_by_key(|node| node.start_byte());
+
+        assert_eq!(
+            rights.iter().map(|node| node.kind()).collect::<Vec<_>>(),
+            vec!["string", "encapsed_string", "heredoc", "nowdoc"]
+        );
+        assert_eq!(
+            named_child_kinds(rights[1]),
+            vec!["string_content"],
+            "a double-quoted string holds its text in one string_content node"
+        );
+        assert_eq!(
+            named_child_kinds(rights[0]),
+            vec!["string_content"],
+            "a single-quoted string is a `string` with one string_content node"
+        );
+        let heredoc = rights[2];
+        assert_eq!(
+            heredoc.child_by_field_name("identifier").unwrap().kind(),
+            "heredoc_start"
+        );
+        assert_eq!(
+            heredoc.child_by_field_name("value").unwrap().kind(),
+            "heredoc_body"
+        );
+        assert_eq!(
+            heredoc.child_by_field_name("end_tag").unwrap().kind(),
+            "heredoc_end"
+        );
+        assert_eq!(
+            named_child_kinds(heredoc.child_by_field_name("value").unwrap()),
+            vec!["string_content"]
+        );
+        let nowdoc = rights[3];
+        assert_eq!(
+            nowdoc.child_by_field_name("value").unwrap().kind(),
+            "nowdoc_body"
+        );
+        assert_eq!(
+            named_child_kinds(nowdoc.child_by_field_name("value").unwrap()),
+            vec!["nowdoc_string"]
+        );
+
+        for (node, value) in [
+            (rights[0], "Zx8Cv6Bn4Mm2Qq0W"),
+            (rights[1], PHP_SECRET),
+            (rights[2], PHP_SECRET),
+            (rights[3], "Zx8Cv6Bn4Mm2Qq0W"),
+        ] {
+            let (start, end) = literal_content_range(node, text).expect("content range");
+            assert_eq!(&text[start..end], value);
+            assert!(
+                start > node.start_byte(),
+                "the opening delimiter is outside"
+            );
+            assert!(end < node.end_byte(), "the closing delimiter is outside");
+        }
+    }
+
+    #[test]
+    fn php_interpolation_and_escape_shapes_are_pinned() {
+        let text = r#"<?php
+$token = "aB3d{$x}";
+$token = "aB3dE5f${x}";
+$token = "$obj->prop";
+$token = "$arr[key]";
+$token = "aB3dE5f\nG7hJ9kL1m";
+$token = <<<EOT
+aB3dE5f$x
+EOT;
+"#;
+        let mut parser = Parser::new();
+        parser
+            .set_language(&assignment_grammar("config.php").expect("PHP grammar"))
+            .unwrap();
+        let tree = parser.parse(text, None).expect("PHP parse");
+        let mut pending = vec![tree.root_node()];
+        let mut rights = Vec::new();
+        while let Some(node) = pending.pop() {
+            let mut cursor = node.walk();
+            pending.extend(node.named_children(&mut cursor));
+            if let Some((_, right)) = assignment_parts(node) {
+                rights.push(right);
+            }
+        }
+        rights.sort_by_key(|node| node.start_byte());
+
+        assert_eq!(
+            named_child_kinds(rights[0]),
+            vec!["string_content", "variable_name"]
+        );
+        assert_eq!(
+            named_child_kinds(rights[1]),
+            vec!["string_content", "dynamic_variable_name"]
+        );
+        assert_eq!(
+            named_child_kinds(rights[2]),
+            vec!["member_access_expression"]
+        );
+        assert_eq!(named_child_kinds(rights[3]), vec!["subscript_expression"]);
+        assert_eq!(
+            named_child_kinds(rights[4]),
+            vec!["string_content", "escape_sequence", "string_content"]
+        );
+        assert_eq!(
+            named_child_kinds(rights[5].child_by_field_name("value").unwrap()),
+            vec!["string_content", "variable_name"]
+        );
+        for right in &rights {
+            assert!(
+                php_string_content(*right).is_none(),
+                "{} interpolates or escapes its content",
+                right.kind()
+            );
+            assert!(literal_value_node(*right).is_none(), "{}", right.kind());
+        }
+    }
+
+    #[test]
+    fn php_double_quoted_assignment_reports_content_only_span() {
+        let text = r#"<?php
+$token = "aB3dE5fG7hJ9kL1m";
+$token = 'Zx8Cv6Bn4Mm2Qq0W';
+$token = ("Pp3Rr5Tt7Vv9Xx1Y");
+"#;
+        let mut findings = scan_text("config.php", text, false)
+            .into_iter()
+            .collect::<Vec<_>>();
+        findings.sort_by_key(|finding| finding.line);
+
+        assert_eq!(findings.len(), 3, "{findings:?}");
+        assert_eq!(
+            findings[0].redaction_span,
+            SecretRedactionSpan {
+                start_byte: 16,
+                end_byte: 32,
+                start_line: 2,
+                start_column: 11,
+                end_line: 2,
+                end_column: 27,
+            }
+        );
+        for (finding, value) in
+            findings
+                .iter()
+                .zip([PHP_SECRET, "Zx8Cv6Bn4Mm2Qq0W", "Pp3Rr5Tt7Vv9Xx1Y"])
+        {
+            let start = text.find(value).expect("fixture holds the value once");
+            assert_eq!(finding.redaction_span.start_byte, start);
+            assert_eq!(finding.redaction_span.end_byte, start + value.len());
+            assert_eq!(
+                &text[finding.redaction_span.start_byte..finding.redaction_span.end_byte],
+                value
+            );
+            assert_eq!(finding.redaction_span.start_line, finding.line);
+            assert_eq!(finding.redaction_span.end_line, finding.line);
+            assert_eq!(finding.rule, "Credential assignment");
+            assert_eq!(finding.confidence, SecretConfidence::Medium);
+            assert!(!finding.sample.contains(value), "{}", finding.sample);
+        }
+    }
+
+    #[test]
+    fn php_heredoc_and_nowdoc_single_literal_line_is_found() {
+        let text = r#"<?php
+$token = <<<EOT
+aB3dE5fG7hJ9kL1m
+EOT;
+$password = <<<'EOT'
+Zx8Cv6Bn4Mm2Qq0W
+EOT;
+"#;
+        let mut findings = scan_text("config.php", text, false)
+            .into_iter()
+            .collect::<Vec<_>>();
+        findings.sort_by_key(|finding| finding.line);
+
+        assert_eq!(findings.len(), 2, "{findings:?}");
+        for (finding, (value, line)) in findings
+            .iter()
+            .zip([(PHP_SECRET, 3), ("Zx8Cv6Bn4Mm2Qq0W", 6)])
+        {
+            let span = &finding.redaction_span;
+            assert_eq!(&text[span.start_byte..span.end_byte], value);
+            assert_eq!(span.start_line, line);
+            assert_eq!(span.end_line, line);
+            assert_eq!(finding.line, line);
+            // The delimiters and the line break that frames the content stay
+            // outside the reported span.
+            assert_eq!(&text[span.start_byte - 1..span.start_byte], "\n");
+            assert_eq!(&text[span.end_byte..span.end_byte + 1], "\n");
+            assert!(!finding.sample.contains(value), "{}", finding.sample);
+        }
+    }
+
+    #[test]
+    fn php_interpolated_escaped_and_multiline_values_are_near_misses() {
+        let text = r#"<?php
+$token = "aB3d{$x}G7hJ9kL1m";
+$token = "aB3dE5fG7hJ9kL1m$x";
+$token = "aB3dE5f${x}G7hJ9kL1m";
+$token = "$obj->prop";
+$token = "$arr[key]";
+$token = "aB3dE5f\nG7hJ9kL1m";
+$token = "aB3dE5fG7hJ9kL1m" . $suffix;
+$token = getenv('APP_TOKEN');
+$token = '';
+$token = <<<EOT
+aB3dE5f$x
+EOT;
+$token = <<<EOT
+aB3dE5f\nG7hJ9kL1m
+EOT;
+$token = <<<EOT
+aB3dE5fG7hJ9kL1m
+Zx8Cv6Bn4Mm2Qq0W
+EOT;
+$token = <<<EOT
+EOT;
+$token = <<<'EOT'
+aB3dE5fG7hJ9kL1m
+Zx8Cv6Bn4Mm2Qq0W
+EOT;
+"#;
+        assert!(
+            scan_text_detailed("config.php", text, false)
+                .diagnostics
+                .is_empty()
+        );
+        assert!(
+            scan_text("config.php", text, false).is_empty(),
+            "{:?}",
+            scan_text("config.php", text, false)
+        );
+        assert!(
+            scan_text("config.php", text, true).is_empty(),
+            "{:?}",
+            scan_text("config.php", text, true)
+        );
+        // The placeholder rule must reach PHP code: without the `<?php` tag the
+        // file is HTML text and no assignment is read. A non-placeholder value
+        // of the same shape is reported at low confidence, so only the
+        // placeholder rule suppresses `changeme`.
+        assert_eq!(
+            scan_text("config.php", "<?php\n$token = \"kQ9zR4wT\";\n", true).len(),
+            1
+        );
+        assert!(scan_text("config.php", "<?php\n$token = \"changeme\";\n", true).is_empty());
     }
 
     #[test]

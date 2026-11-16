@@ -146,7 +146,8 @@ impl Liveness {
     /// identities -- can reuse the index entries and dirty set this scan already
     /// read instead of re-reading the index and re-diffing the working tree. On
     /// the firefox workspace that duplicate cost 4.1 s over 401,804 index
-    /// entries at cold start.
+    /// entries at cold start. This is OID evidence, not generation membership;
+    /// discovery uses the generation's retained build/update listing.
     ///
     /// `None` means no scan has been taken yet, or one was invalidated by
     /// [`Self::invalidate_startup_oids`]; the caller then does its own.

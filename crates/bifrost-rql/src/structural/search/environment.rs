@@ -613,6 +613,11 @@ impl EnvironmentTraversalCache {
             });
             let code = if unsupported {
                 CodeQueryDiagnosticCode::EnvironmentAxisUnsupported
+            } else if reasons
+                .iter()
+                .any(|reason| matches!(reason, EnvironmentIncompleteReason::BoundedWorkLimit(_)))
+            {
+                CodeQueryDiagnosticCode::EnvironmentBoundedWorkLimit
             } else {
                 CodeQueryDiagnosticCode::EnvironmentDerivationIncomplete
             };
@@ -623,6 +628,10 @@ impl EnvironmentTraversalCache {
                     continue;
                 }
                 diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                     incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                     related: Vec::new(),
                     source: None,
@@ -644,7 +653,11 @@ impl EnvironmentTraversalCache {
                 continue;
             }
             diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
-                incompleteness: brokk_bifrost_rql::Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Provider),
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
+                incompleteness: environment_incompleteness(reasons),
                 related: Vec::new(),
                 source: None,
                 code,
@@ -685,6 +698,10 @@ impl EnvironmentTraversalCache {
             return;
         }
         diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
             incompleteness: brokk_bifrost_rql::Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Provider),
             related: Vec::new(),
             source: None,
@@ -703,8 +720,48 @@ impl EnvironmentTraversalCache {
     }
 }
 
-fn incomplete_reason_label(reason: &EnvironmentIncompleteReason) -> &'static str {
-    match reason {
+/// Keep operational evidence when a deterministic gap accompanies an interrupted
+/// derivation. A missing identity alone says nothing about execution quality.
+fn environment_incompleteness(
+    reasons: &[EnvironmentIncompleteReason],
+) -> brokk_bifrost_rql::Incompleteness {
+    use brokk_bifrost_rql::{DiagnosticExecutionCause, Incompleteness};
+    reasons
+        .iter()
+        .fold(Incompleteness::Content, |combined, reason| {
+            let cause = match reason {
+                EnvironmentIncompleteReason::AxisUnsupported(_) => Incompleteness::Content,
+                // Absent source anchors and current Rust semantic Open roles
+                // describe source uncertainty, never preparation exhaustion.
+                // Its budget/cancellation exits emit BindingActivationUnknown instead;
+                // those reasons must dominate this one when both are present.
+                EnvironmentIncompleteReason::BindingIdentityUnknown => Incompleteness::Content,
+                // ConfiguredCap is a terminal result grant, not a fixed source
+                // bound. Preserve this engine limit in its own diagnostic code
+                // while Content here records only determinism for cache admission.
+                EnvironmentIncompleteReason::BoundedWorkLimit(_) => Incompleteness::Content,
+                EnvironmentIncompleteReason::BindingRoleUnknown
+                | EnvironmentIncompleteReason::NoStructuralAdapter
+                | EnvironmentIncompleteReason::FactsUnavailable
+                | EnvironmentIncompleteReason::SyntaxUnavailable
+                | EnvironmentIncompleteReason::BindingActivationUnknown
+                | EnvironmentIncompleteReason::ImportTargetUnstructured => {
+                    Incompleteness::Operational(DiagnosticExecutionCause::Provider)
+                }
+            };
+            combined.combine(cause)
+        })
+}
+
+fn incomplete_reason_label(reason: &EnvironmentIncompleteReason) -> String {
+    if let EnvironmentIncompleteReason::BoundedWorkLimit(limit) = reason {
+        return format!(
+            "bounded_work_limit(bound={:?}, limit={}, value={})",
+            limit.bound, limit.limit, limit.value
+        );
+    }
+    let label = match reason {
+        EnvironmentIncompleteReason::BoundedWorkLimit(_) => unreachable!("handled above"),
         EnvironmentIncompleteReason::AxisUnsupported(_) => "axis unsupported",
         EnvironmentIncompleteReason::NoStructuralAdapter => "no structural adapter",
         EnvironmentIncompleteReason::FactsUnavailable => "no structural facts",
@@ -712,13 +769,15 @@ fn incomplete_reason_label(reason: &EnvironmentIncompleteReason) -> &'static str
         EnvironmentIncompleteReason::BindingActivationUnknown => {
             "an activation interval could not be stated"
         }
+        EnvironmentIncompleteReason::BindingRoleUnknown => "a binder identity could not be proven",
         EnvironmentIncompleteReason::BindingIdentityUnknown => {
             "a binder identity could not be proven"
         }
         EnvironmentIncompleteReason::ImportTargetUnstructured => {
             "an import records no structured target"
         }
-    }
+    };
+    label.to_owned()
 }
 
 /// One lexical scope row travelling through the pipeline.
@@ -1130,6 +1189,303 @@ pub(super) fn candidate_unit(candidate: &TraceCandidateRef) -> Option<&crate::an
 mod tests {
     use super::*;
     use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    fn fixed_anchor_bounds_are_deterministic_and_separately_named() {
+        use super::super::tests::inline_project::InlineTestProject;
+        use crate::analyzer::AnalyzerConfig;
+        use brokk_bifrost_core::analyzer::structural::spec::{BindingWorkBound, BindingWorkLimit};
+        let cases = [
+            (
+                vec!["A(x)".to_owned(); 129],
+                BindingWorkBound::OrPatternCandidates,
+                128,
+            ),
+            (
+                vec![format!("A(x) /*{}*/", "a".repeat(8_192)), "B(x)".to_owned()],
+                BindingWorkBound::OrPatternBytes,
+                8_192,
+            ),
+            (
+                vec![
+                    format!("Outer({})", vec!["A(x)"; 128].join("|")),
+                    "Other(A(x))".to_owned(),
+                ],
+                BindingWorkBound::OrPatternCandidates,
+                128,
+            ),
+        ];
+        for (alternatives, bound, limit) in cases {
+            for embedded in [false, true] {
+                let pattern = alternatives.join(" | ");
+                let expression = format!("match v {{ {pattern} => () }}");
+                let expression = if embedded {
+                    format!("format!(\"{{}}\", {{ {expression} }})")
+                } else {
+                    expression
+                };
+                let source =
+                    format!("enum E {{ A(i32), B(i32) }} fn f(v: E) {{ let _ = {expression}; }}");
+                let project = InlineTestProject::with_language(Language::Rust)
+                    .file("main.rs", &source)
+                    .build();
+                let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+                let file = project.file("main.rs");
+                let provider = workspace
+                    .analyzer()
+                    .structural_fact_providers()
+                    .into_iter()
+                    .find(|provider| provider.structural_language() == Language::Rust)
+                    .unwrap();
+                let facts_before = provider.structural_facts(&file).unwrap();
+                let rows_before = facts_before.persisted_rows().unwrap();
+                let identity_before = facts_before.source_identity();
+                let selection_before = facts_before.selection_digest();
+                let mut previous = None;
+                for _ in 0..2 {
+                    let result = environment_for_file(workspace.analyzer(), &file);
+                    let EnvironmentCompleteness::Incomplete { reasons, .. } = &result.completeness
+                    else {
+                        panic!("bound must remain incomplete")
+                    };
+                    let stops: Vec<_> = reasons
+                        .iter()
+                        .filter_map(|reason| match reason {
+                            EnvironmentIncompleteReason::BoundedWorkLimit(stop) => Some(*stop),
+                            _ => None,
+                        })
+                        .collect();
+                    assert_eq!(stops.len(), 1, "{reasons:?}");
+                    assert!(
+                        matches!(stops[0], BindingWorkLimit { bound: actual, limit: cap, value } if actual == bound && cap == limit && value > cap)
+                    );
+                    assert_eq!(
+                        reasons.contains(&EnvironmentIncompleteReason::BindingIdentityUnknown),
+                        embedded,
+                        "{reasons:?}"
+                    );
+                    // Anchor stops and semantic Open are both source-determined.
+                    assert!(!reasons.contains(&EnvironmentIncompleteReason::BindingRoleUnknown));
+                    let bound_only = environment_incompleteness(&[
+                        EnvironmentIncompleteReason::BoundedWorkLimit(stops[0]),
+                    ]);
+                    assert_eq!(bound_only, brokk_bifrost_rql::Incompleteness::Content);
+                    assert_eq!(bound_only.execution_cause(), None);
+                    let expected_cause = None;
+                    assert_eq!(
+                        environment_incompleteness(reasons).execution_cause(),
+                        expected_cause,
+                        "{reasons:?}"
+                    );
+                    let mut diagnostics = Vec::new();
+                    EnvironmentTraversalCache::default().report_completeness(
+                        &file,
+                        &result,
+                        &[EnvironmentAxis::BindingIntervals],
+                        &mut diagnostics,
+                    );
+                    assert_eq!(diagnostics.len(), 1);
+                    assert_eq!(
+                        diagnostics[0].code,
+                        CodeQueryDiagnosticCode::EnvironmentBoundedWorkLimit
+                    );
+                    assert_eq!(diagnostics[0].impact, CodeQueryDiagnosticImpact::Incomplete);
+                    assert_eq!(
+                        diagnostics[0].incompleteness.execution_cause(),
+                        expected_cause
+                    );
+                    assert!(diagnostics[0].message.contains("bounded_work_limit"));
+                    if let Some(previous) = &previous {
+                        assert_eq!(previous, reasons);
+                    }
+                    previous = Some(reasons.clone());
+                    // Query-time anchor stops have no source/provenance writer.
+                    // The complete persisted payload (including role/coverage rows)
+                    // and the provider's admitted snapshot must stay unchanged.
+                    let facts_after = provider.structural_facts(&file).unwrap();
+                    assert!(std::sync::Arc::ptr_eq(&facts_before, &facts_after));
+                    assert_eq!(facts_after.source_identity(), identity_before);
+                    assert_eq!(facts_after.selection_digest(), selection_before);
+                    assert_eq!(facts_after.persisted_rows().unwrap(), rows_before);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exact_anchor_bounds_keep_embedded_forest_roots_separate() {
+        use super::super::tests::inline_project::InlineTestProject;
+        use crate::analyzer::AnalyzerConfig;
+        let unpadded = "A(x) /**/ | B(x)";
+        for pattern in [
+            format!("A(x) /*{}*/ | B(x)", "a".repeat(8_192 - unpadded.len())),
+            std::iter::repeat_n("A(x)", 128)
+                .collect::<Vec<_>>()
+                .join("|"),
+        ] {
+            let operand = format!("format!(\"{{}}\", {{ match v {{ {pattern} => () }} }})");
+            let source = format!("fn f(v: i32) {{ let _ = {operand}; let _ = {operand}; }}");
+            let project = InlineTestProject::with_language(Language::Rust)
+                .file("main.rs", &source)
+                .build();
+            let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+            let result = environment_for_file(workspace.analyzer(), &project.file("main.rs"));
+            if let EnvironmentCompleteness::Incomplete { reasons, .. } = &result.completeness {
+                assert!(
+                    !reasons.iter().any(|reason| matches!(
+                        reason,
+                        EnvironmentIncompleteReason::BoundedWorkLimit(_)
+                    )),
+                    "{reasons:?}"
+                );
+            }
+            // Semantic Open macro roles may withhold environment rows. Check
+            // the equality boundary directly on each admitted fragment rather
+            // than inventing completed identities for those stored roles.
+            let spec =
+                brokk_bifrost_analysis::analyzer::structural_spec_for(Language::Rust).unwrap();
+            let tree =
+                brokk_bifrost_analysis::analyzer::usages::get_definition::parse_tree_for_language(
+                    &project.file("main.rs"),
+                    Language::Rust,
+                    &source,
+                )
+                .unwrap();
+            let forest =
+                brokk_bifrost_core::analyzer::structural::spec::EmbeddedSyntaxForest::parse(
+                    spec,
+                    tree.root_node(),
+                    &source,
+                    source.len().saturating_mul(4),
+                    None,
+                )
+                .unwrap();
+            let mut candidate_roots = std::collections::BTreeSet::new();
+            let mut canonical_anchors = std::collections::BTreeSet::new();
+            for fragment in forest.trees() {
+                let mut pending = vec![fragment.root()];
+                let mut binders = Vec::new();
+                while let Some(node) = pending.pop() {
+                    if node.kind() == "identifier" && source.get(node.byte_range()) == Some("x") {
+                        binders.push(node);
+                    }
+                    let mut cursor = node.walk();
+                    pending.extend(node.named_children(&mut cursor));
+                }
+                if binders.is_empty() {
+                    continue;
+                }
+                candidate_roots.insert(fragment.range.start_byte);
+                let answers = spec.logical_binding_anchors_checked(&binders, &source);
+                assert_eq!(answers.len(), binders.len());
+                assert!(answers.iter().all(Result::is_ok), "{answers:?}");
+                let first = binders
+                    .iter()
+                    .min_by_key(|binder| binder.start_byte())
+                    .unwrap();
+                let expected = (first.start_byte(), first.end_byte());
+                let actual: std::collections::BTreeSet<_> = answers
+                    .into_iter()
+                    .map(|answer| {
+                        answer
+                            .expect("equality has no work stop")
+                            .expect("the checked fragment proves its local binder identity")
+                    })
+                    .collect();
+                assert_eq!(
+                    actual,
+                    std::collections::BTreeSet::from([expected]),
+                    "all alternatives within one fragment share its first source anchor"
+                );
+                assert!(
+                    canonical_anchors.insert(*actual.first().unwrap()),
+                    "different forest roots must not receive the same anchor"
+                );
+            }
+            assert_eq!(
+                candidate_roots.len(),
+                2,
+                "both forest roots were checked independently"
+            );
+            assert_eq!(
+                canonical_anchors.len(),
+                2,
+                "both actual identities remain distinct"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon("63ef9ddc7d01: source-only identity gaps were mislabeled Provider")]
+    fn inconsistent_or_pattern_identity_gap_repeats_from_source() {
+        use super::super::tests::inline_project::InlineTestProject;
+        use crate::analyzer::AnalyzerConfig;
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "main.rs",
+                "enum E { A(i32), B(i32) } fn f(v: E) { match v { E::A(x) | E::B(y) => {} } }",
+            )
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let file = project.file("main.rs");
+        for _ in 0..2 {
+            let result = environment_for_file(workspace.analyzer(), &file);
+            let EnvironmentCompleteness::Incomplete { reasons, .. } = &result.completeness else {
+                panic!("inconsistent binder alternatives must remain incomplete");
+            };
+            assert!(reasons.contains(&EnvironmentIncompleteReason::BindingIdentityUnknown));
+            assert_eq!(
+                environment_incompleteness(reasons),
+                brokk_bifrost_rql::Incompleteness::Content
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon("63ef9ddc7d01: source-only identity gaps were mislabeled Provider")]
+    fn identity_gap_is_content_but_operational_reasons_dominate() {
+        use EnvironmentIncompleteReason::*;
+        use brokk_bifrost_rql::{DiagnosticExecutionCause, Incompleteness};
+        assert_eq!(
+            environment_incompleteness(&[BindingIdentityUnknown]),
+            Incompleteness::Content
+        );
+        let work_limit = brokk_bifrost_core::analyzer::structural::spec::BindingWorkLimit {
+            bound: brokk_bifrost_core::analyzer::structural::spec::BindingWorkBound::OrPatternCandidates,
+            limit: 128, value: 129,
+        };
+        assert_eq!(
+            environment_incompleteness(&[BoundedWorkLimit(work_limit)]),
+            Incompleteness::Content
+        );
+        assert_eq!(
+            environment_incompleteness(&[BoundedWorkLimit(work_limit), BindingActivationUnknown]),
+            Incompleteness::Operational(DiagnosticExecutionCause::Provider)
+        );
+        assert_eq!(
+            environment_incompleteness(&[BoundedWorkLimit(work_limit), BindingRoleUnknown]),
+            Incompleteness::Operational(DiagnosticExecutionCause::Provider)
+        );
+
+        for reason in [
+            BindingRoleUnknown,
+            NoStructuralAdapter,
+            FactsUnavailable,
+            SyntaxUnavailable,
+            BindingActivationUnknown,
+            ImportTargetUnstructured,
+        ] {
+            for reasons in [
+                vec![BindingIdentityUnknown, reason.clone()],
+                vec![reason, BindingIdentityUnknown],
+            ] {
+                assert_eq!(
+                    environment_incompleteness(&reasons),
+                    Incompleteness::Operational(DiagnosticExecutionCause::Provider)
+                );
+            }
+        }
+    }
 
     #[test]
     fn or_pattern_keeps_selected_occurrence_beside_canonical_identity() {

@@ -7,6 +7,8 @@
 //! separate callable seed.
 
 use crate::analyzer::go::GoAnalyzer;
+use crate::analyzer::go::execution_dependent;
+use brokk_bifrost_analysis::analyzer::reuse_verdict::ReuseVerdict;
 
 use crate::analyzer::go::type_identity_proof::go_predeclared_type_name_is_exact;
 
@@ -92,43 +94,46 @@ struct HandlerEvidence<'a> {
     cancellation: &'a CancellationToken,
     lexical: Option<SelectedResolutionOperationOpenOutcome<'a, 'a>>,
     types: HashMap<SemanticId, BindingProof>,
+    /// Joined wherever this pass marks its capture execution dependent.
+    reuse: ReuseVerdict,
 }
 
-/// Find Go's native failure branches inside one callable.
+/// Find Go's native failure branches inside one callable, with the reuse
+/// verdict of the pass that found them.
 pub fn go_failure_handler_body_shapes(
     workspace: &WorkspaceAnalyzer,
     file: &ProjectFile,
     syntax: &PreparedSyntaxTree,
     callable: Range,
     cancellation: &CancellationToken,
-) -> Vec<NativeFailureBranch> {
+) -> (Vec<NativeFailureBranch>, ReuseVerdict) {
     let _model_scope =
         match brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::pin_selected_model_snapshot(
             workspace.analyzer(),
         ) {
             Ok(scope) => scope,
-            Err(_) => {
-                workspace.analyzer().mark_execution_dependent();
-                return Vec::new();
-            }
+            Err(_) => return (Vec::new(), execution_dependent(workspace.analyzer())),
         };
     let mut evidence = HandlerEvidence {
         request: None,
         cancellation,
         lexical: None,
         types: HashMap::default(),
+        reuse: ReuseVerdict::Content,
     };
-    callable_body_shapes(workspace, file, syntax, callable, &mut evidence)
+    let branches = callable_body_shapes(workspace, file, syntax, callable, &mut evidence);
+    (branches, evidence.reuse)
 }
 
 /// Classify a file in one pass, sharing lazy native type work across callables.
-/// The caller retains only these completed rows for its query lifetime.
+/// The caller retains only these completed rows for its query lifetime, and
+/// only when the returned verdict is content.
 pub fn go_failure_handler_file_body_shapes(
     workspace: &WorkspaceAnalyzer,
     file: &ProjectFile,
     syntax: &PreparedSyntaxTree,
     cancellation: &CancellationToken,
-) -> HashMap<Range, Vec<NativeFailureBranch>> {
+) -> (HashMap<Range, Vec<NativeFailureBranch>>, ReuseVerdict) {
     use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_tree_preorder};
     let _model_scope =
         match brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::pin_selected_model_snapshot(
@@ -136,8 +141,10 @@ pub fn go_failure_handler_file_body_shapes(
         ) {
             Ok(scope) => scope,
             Err(_) => {
-                workspace.analyzer().mark_execution_dependent();
-                return HashMap::default();
+                return (
+                    HashMap::default(),
+                    execution_dependent(workspace.analyzer()),
+                );
             }
         };
     let mut evidence = HandlerEvidence {
@@ -145,6 +152,7 @@ pub fn go_failure_handler_file_body_shapes(
         cancellation,
         lexical: None,
         types: HashMap::default(),
+        reuse: ReuseVerdict::Content,
     };
     let mut result = HashMap::default();
     walk_tree_preorder(syntax.tree().root_node(), true, |node| {
@@ -164,10 +172,12 @@ pub fn go_failure_handler_file_body_shapes(
         WalkControl::Continue
     });
     if cancellation.is_cancelled() {
-        workspace.analyzer().mark_execution_dependent();
+        evidence
+            .reuse
+            .join_in(execution_dependent(workspace.analyzer()));
         result.clear();
     }
-    result
+    (result, evidence.reuse)
 }
 
 fn callable_body_shapes<'go>(
@@ -204,7 +214,7 @@ fn callable_body_shapes<'go>(
     let mut branches = Vec::new();
     while let Some(node) = stack.pop() {
         if cancellation.is_cancelled() {
-            analyzer.mark_execution_dependent();
+            evidence.reuse.join_in(execution_dependent(analyzer));
             return Vec::new();
         }
         if node.id() != body.id() && node.kind() == "func_literal" {
@@ -214,7 +224,9 @@ fn callable_body_shapes<'go>(
             "if_statement" => {
                 classify_if(analyzer, go, file, syntax, node, callable_node, evidence)
             }
-            "defer_statement" => classify_defer(analyzer, go, file, syntax, node),
+            "defer_statement" => {
+                classify_defer(analyzer, go, file, syntax, node, &mut evidence.reuse)
+            }
             _ => None,
         };
         if let Some(branch) = branch {
@@ -288,6 +300,7 @@ fn classify_if<'go>(
             syntax,
             call.child_by_field_name("function")?,
             "recover",
+            &mut evidence.reuse,
         ) {
             BuiltinProof::Exact => Some(NativeFailureBranch {
                 handler: node_range(if_node),
@@ -325,6 +338,7 @@ fn classify_defer(
     file: &ProjectFile,
     syntax: &PreparedSyntaxTree,
     defer_node: Node<'_>,
+    reuse: &mut ReuseVerdict,
 ) -> Option<NativeFailureBranch> {
     let call = defer_node
         .named_child(0)
@@ -357,6 +371,7 @@ fn classify_defer(
                 syntax,
                 call.child_by_field_name("function")?,
                 "recover",
+                reuse,
             ) {
                 BuiltinProof::Exact => saw_recover = true,
                 BuiltinProof::Open => unknown_recover = true,
@@ -505,7 +520,7 @@ fn native_binding_static_type<'tree, 'go>(
                 };
             }
             _ => {
-                analyzer.mark_execution_dependent();
+                evidence.reuse.join_in(execution_dependent(analyzer));
                 return unknown();
             }
         }
@@ -538,7 +553,7 @@ fn native_binding_static_type<'tree, 'go>(
             ..
         } => return unknown(),
         _ => {
-            analyzer.mark_execution_dependent();
+            evidence.reuse.join_in(execution_dependent(analyzer));
             return unknown();
         }
     };
@@ -592,8 +607,14 @@ fn native_binding_static_type<'tree, 'go>(
         _ => None,
     };
     if let Some(type_node) = explicit
-        && explicit_type_proof(analyzer, file, syntax.source(), root, type_node)
-            != BindingProof::Open
+        && explicit_type_proof(
+            analyzer,
+            file,
+            syntax.source(),
+            root,
+            type_node,
+            &mut evidence.reuse,
+        ) != BindingProof::Open
     {
         return BoundedResolution::Complete {
             value: Some(SelectedBindingEvidence::Syntax(type_node)),
@@ -616,7 +637,7 @@ fn native_binding_static_type<'tree, 'go>(
             match GoNativePointRequest::open_for_file(
                 go,
                 file,
-                analyzer.semantic_model_overlay(),
+                analyzer.semantic_model_overlay_read().published(),
                 cancellation,
             ) {
                 Ok(opened) => opened,
@@ -635,7 +656,7 @@ fn native_binding_static_type<'tree, 'go>(
             };
         }
         _ => {
-            analyzer.mark_execution_dependent();
+            evidence.reuse.join_in(execution_dependent(analyzer));
             return unknown();
         }
     };
@@ -797,9 +818,18 @@ fn binding_proof<'go>(
         BoundedResolution::Complete {
             value: Some(SelectedBindingEvidence::Syntax(type_node)),
             ..
-        } => return explicit_type_proof(analyzer, file, source, root, type_node),
+        } => {
+            return explicit_type_proof(
+                analyzer,
+                file,
+                source,
+                root,
+                type_node,
+                &mut evidence.reuse,
+            );
+        }
         BoundedResolution::Exceeded { .. } | BoundedResolution::Cancelled { .. } => {
-            analyzer.mark_execution_dependent();
+            evidence.reuse.join_in(execution_dependent(analyzer));
         }
         _ => {}
     }
@@ -821,7 +851,14 @@ fn binding_proof<'go>(
             && declaration_visible(node, scope, use_node)
         {
             let candidate = BindingCandidate {
-                proof: explicit_type_proof(analyzer, file, source, root, type_node),
+                proof: explicit_type_proof(
+                    analyzer,
+                    file,
+                    source,
+                    root,
+                    type_node,
+                    &mut evidence.reuse,
+                ),
                 scope_depth: depth,
                 start_byte: node.start_byte(),
             };
@@ -1020,6 +1057,7 @@ fn explicit_type_proof(
     source: &str,
     root: Node<'_>,
     type_node: Node<'_>,
+    reuse: &mut ReuseVerdict,
 ) -> BindingProof {
     if type_node.has_error() || type_node.is_missing() {
         return BindingProof::Open;
@@ -1071,11 +1109,11 @@ fn explicit_type_proof(
     }
     // A source-backed identity gap is reusable, but these limited provider
     // proofs can also stop without an answer. Preserve that distinction.
-    let predeclared = |name| {
+    let mut predeclared = |name| {
         let proof =
             go_predeclared_type_name_is_exact(analyzer, file, source, root, type_node, name);
         if proof.is_none() {
-            analyzer.mark_execution_dependent();
+            reuse.join_in(execution_dependent(analyzer));
         }
         proof
     };
@@ -1121,7 +1159,7 @@ fn call_result_proof(
         cancellation: Some(evidence.cancellation),
     });
     let BoundedResolution::Complete { value, .. } = result else {
-        analyzer.mark_execution_dependent();
+        evidence.reuse.join_in(execution_dependent(analyzer));
         return BindingProof::Open;
     };
     if !matches!(
@@ -1131,7 +1169,7 @@ fn call_result_proof(
             | DefinitionLookupStatus::UnresolvableImportBoundary
             | DefinitionLookupStatus::Ambiguous
     ) {
-        analyzer.mark_execution_dependent();
+        evidence.reuse.join_in(execution_dependent(analyzer));
     }
     if value.status != DefinitionLookupStatus::Resolved
         || !value.modeled_definitions.is_empty()
@@ -1142,23 +1180,23 @@ fn call_result_proof(
     let declaration = &value.definitions[0];
     let metadata = go.signature_metadata_limited(declaration, 64);
     if !metadata.complete {
-        analyzer.mark_execution_dependent();
+        evidence.reuse.join_in(execution_dependent(analyzer));
         return BindingProof::Open;
     }
     if metadata.rows.len() != 1 {
         return BindingProof::Open;
     }
     let Some(source) = analyzer.indexed_source(declaration.source()) else {
-        analyzer.mark_execution_dependent();
+        evidence.reuse.join_in(execution_dependent(analyzer));
         return BindingProof::Open;
     };
     let Some(tree) = parse_go_tree(&source) else {
-        analyzer.mark_execution_dependent();
+        evidence.reuse.join_in(execution_dependent(analyzer));
         return BindingProof::Open;
     };
     let ranges = go.ranges_limited(declaration, 8);
     if !ranges.complete {
-        analyzer.mark_execution_dependent();
+        evidence.reuse.join_in(execution_dependent(analyzer));
         return BindingProof::Open;
     }
     let Some(callable) = ranges.rows.into_iter().find_map(|range| {
@@ -1181,6 +1219,7 @@ fn call_result_proof(
         &source,
         tree.root_node(),
         type_node,
+        &mut evidence.reuse,
     )
 }
 
@@ -1363,6 +1402,7 @@ fn predeclared_builtin_status(
     syntax: &PreparedSyntaxTree,
     identifier: Node<'_>,
     expected: &str,
+    reuse: &mut ReuseVerdict,
 ) -> BuiltinProof {
     if !is_identifier(identifier) || syntax.source().get(identifier.byte_range()) != Some(expected)
     {
@@ -1393,7 +1433,7 @@ fn predeclared_builtin_status(
         Some(true) => BuiltinProof::Shadowed,
         Some(false) => BuiltinProof::Exact,
         None => {
-            analyzer.mark_execution_dependent();
+            reuse.join_in(execution_dependent(analyzer));
             BuiltinProof::Open
         }
     }
@@ -1531,6 +1571,7 @@ mod tests {
             callable,
             &CancellationToken::default(),
         )
+        .0
     }
 
     fn states(source: &str) -> Vec<HandlerBodyState> {
@@ -1694,6 +1735,7 @@ func work(err error) {
                 node_range(literal),
                 &CancellationToken::default(),
             )
+            .0
             .into_iter()
             .map(|branch| branch.shape.state)
             .collect::<Vec<_>>(),
@@ -1732,6 +1774,7 @@ func work(err error) {
                 node_range(callable),
                 &cancellation
             )
+            .0
             .len(),
             1,
             "uncancelled pass actually finds a handler"
@@ -1745,7 +1788,8 @@ func work(err error) {
             &syntax,
             node_range(callable),
             &cancellation,
-        );
+        )
+        .0;
         let cost = finish_production_selected_sql_trace(store);
         assert!(
             branches.is_empty(),

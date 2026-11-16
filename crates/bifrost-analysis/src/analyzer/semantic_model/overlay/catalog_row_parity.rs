@@ -3744,7 +3744,8 @@ fn catalog_row_composition_cache_eviction_preserves_answers() {
         &brokk_bifrost_core::retention_budget::RetentionBudget::for_tests(),
     )
     .unwrap();
-    let cache = StoreCacheBudget::new(&crate::retention_budget::RetentionBudget::new(1));
+    let cache =
+        StoreCacheBudget::new(&crate::retention_budget::RetentionBudget::for_test_capacity(1));
     Arc::make_mut(after.row_source.as_mut().unwrap()).cache = Some(cache.clone());
     assert_overlay_entry_parity(
         &active,
@@ -4039,7 +4040,7 @@ fn model_selected_composition_keeps_member_surfaces_per_provider() {
             &[],
         );
         source.cache = Some(crate::analyzer::store::cache_budget::StoreCacheBudget::new(
-            &crate::retention_budget::RetentionBudget::new(1024 * 1024),
+            &crate::retention_budget::RetentionBudget::for_test_capacity(1024 * 1024),
         ));
         overlay.selected_source = Some(Arc::new(source));
         let mut selected_owners = Vec::new();
@@ -4778,6 +4779,70 @@ mod partition_tests {
         assert_eq!(rows.rows.count(), 0);
         assert_eq!(activation_calls.load(Ordering::Relaxed), 0);
         assert_eq!(request_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11811: package activation ignored nonrepresentative matching evidence"
+    )]
+    fn package_active_requires_declarations_in_all_matching_evidence() {
+        for kind in [
+            "declaration_facts",
+            "procedure_summaries",
+            "generator_rules",
+        ] {
+            let payload: Value = serde_json::from_slice(match kind {
+                "procedure_summaries" => include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/testdata/semantic-model-packs/procedure-summaries-v1.json"
+                ))
+                .as_slice(),
+                "generator_rules" => include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/testdata/semantic-model-packs/generator-rules-v1.json"
+                ))
+                .as_slice(),
+                _ => include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/testdata/semantic-model-packs/declarations-v1.json"
+                ))
+                .as_slice(),
+            })
+            .unwrap();
+            let mut active = mixed_active_edited(false, false, |source, _| {
+                source["shards"][0]["payload"] = payload["shards"][0]["payload"].clone();
+                source["safety"] = payload["safety"].clone();
+            });
+            let shard = Arc::get_mut(&mut Arc::get_mut(&mut active).unwrap().shards[0]).unwrap();
+            let metadata = Arc::make_mut(&mut shard.metadata);
+            let mut evidence = metadata.matched_evidence.clone();
+            evidence.language = "ruby".into();
+            evidence.ecosystem = "rubygems".into();
+            evidence.package = Some(
+                crate::analyzer::semantic_model::catalog::CatalogCoordinate {
+                    name: "second-gem".into(),
+                    version: None,
+                },
+            );
+            metadata.matching_evidence.push(evidence);
+            let directory = TempDir::new().unwrap();
+            let analyzer =
+                EmptyAnalyzer::new(Arc::new(TestProject::new(directory.path(), Language::Java)));
+            let overlay = SemanticModelOverlay::build(
+                &analyzer,
+                &active,
+                &crate::CancellationToken::default(),
+                u64::MAX,
+                &brokk_bifrost_core::retention_budget::RetentionBudget::for_tests(),
+            )
+            .unwrap();
+            assert_eq!(
+                overlay.package_active("ruby", "rubygems", "second-gem"),
+                kind == "declaration_facts",
+                "{kind}"
+            );
+            assert!(!overlay.package_active("ruby", "rubygems", "missing-gem"));
+        }
     }
 
     fn mixed_active(empty: bool, carried: bool) -> Arc<ResolvedActiveSemanticModels> {
@@ -6639,5 +6704,46 @@ fn java_direct_hierarchy_reads_row_backed_inventory() {
             results.push((answer, visited));
         }
         assert_eq!(results[0], results[1]);
+    }
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#12360: approximate activation projected exact family completeness and generated origin"
+)]
+fn approximate_activation_withholds_exact_declaration_claims() {
+    use crate::analyzer::semantic_model::{CompilerOptions, SourceFormat, compile_source};
+    let pack = compile_source(
+        SourceFormat::Json,
+        include_bytes!("../../../../testdata/semantic-model-packs/declarations-v1.json"),
+        &CompilerOptions::default(),
+    )
+    .unwrap();
+    let validated = validate_pack(&pack, &DecodeLimits::default()).unwrap();
+    let mut shards = fixture_shards(&pack, validated.shards, "approximate identity guard");
+    let mut shard = shards.remove(0);
+    let record = &shard.decoded().payload().declaration_facts().unwrap().1[0];
+    let mut record = record.as_ref().clone();
+    record.callable_family_complete = true;
+    let active = active(Vec::new());
+    let directory = TempDir::new().unwrap();
+    let analyzer = EmptyAnalyzer::new(Arc::new(TestProject::new(directory.path(), Language::Java)));
+    Arc::get_mut(&mut shard.metadata).unwrap().source_kind = CatalogPackSourceKind::Generated;
+    for approximate in [false, true] {
+        Arc::get_mut(&mut shard.metadata).unwrap().approximate = approximate;
+        let member = super::member_symbol(
+            &analyzer,
+            &active,
+            &shard,
+            &record,
+            Some("com.acme.Widget"),
+            false,
+        );
+        assert_eq!(member.callable_family_complete, !approximate);
+        assert_eq!(
+            member.provenance.origin == SemanticModelOriginKind::ExactGeneratedOutput,
+            !approximate
+        );
+        assert_eq!(member.provenance.activation.approximate, approximate);
     }
 }

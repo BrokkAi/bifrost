@@ -9,12 +9,13 @@ use std::hash::Hash;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use crate::analyzer::reuse_verdict::{CarriesReuseVerdict, ReuseVerdict};
 use crate::analyzer::semantic::partial_flow::rules::GuardEdgeKill;
 use crate::analyzer::semantic::partial_flow::{
     ExtendedPartialFlows, ExtraObservation, ExtraPhase, ExtraSeed, ExtraTarget, ImplicitHeapRead,
     PartialFlowOutcome, PartialFlowPort, ProcedurePartialFlows, call_input_value,
-    caller_exact_read_location, caller_location_carriers, compute_partial_flows,
-    compute_partial_flows_with_implicit_reads, exact_location_covers_read,
+    caller_exact_read_location, caller_location_carriers, caller_read_location,
+    compute_partial_flows, compute_partial_flows_with_implicit_reads, exact_location_covers_read,
     file_local_procedure_relations, input_port_seed, join_crossed,
     ports::{call_port_values, written_heap_ports},
 };
@@ -26,12 +27,12 @@ use crate::analyzer::semantic::{
     AccessPath, AccessPathAtPoint, AccessPathRoot, AliasQuery, AliasRelation, CallArgumentEndpoint,
     CallBinding, CallBindings, CallSiteHandle, CallSiteId, CallStorageRelationIndex,
     CandidateCoverage, ControlContinuation, DispatchBoundary, DispatchResult, EvidenceCompleteness,
-    FreshObjectPublicationQuery, HeapOracle, IntrinsicCall, IntrinsicTransfer, ObservationPhase,
-    OracleCallContext, ProcedureHandle, ProcedurePortHandle, ProcedurePortKind, ProofStatus,
-    SemanticArtifact, SemanticArtifactKey, SemanticCallSite, SemanticCapability,
-    SemanticExecutionBudget, SemanticGapId, SemanticGapKind, SemanticOutcome,
-    SemanticProviderError, SemanticRequest, ValueAtPoint, ValueFlowEndpoint, ValueFlowSnapshot,
-    ValueId,
+    ExactCallSiteKey, ExactProcedureIdentity, FreshObjectPublicationQuery, HeapOracle,
+    IntrinsicCall, IntrinsicTransfer, ObservationPhase, OracleCallContext, ProcedureHandle,
+    ProcedurePortHandle, ProcedurePortKind, ProgramPointId, ProofStatus, SemanticArtifact,
+    SemanticArtifactKey, SemanticCallSite, SemanticCapability, SemanticExecutionBudget,
+    SemanticGapKind, SemanticOutcome, SemanticProviderError, SemanticRequest, ValueAtPoint,
+    ValueFlowEndpoint, ValueFlowSnapshot, ValueId,
 };
 use crate::analyzer::usages::call_relations::CallerInventoryCoverage;
 use crate::analyzer::usages::{CallRelationLimits, CallRelationService, CallSite};
@@ -61,7 +62,8 @@ use crate::value_flow::{
 pub struct WorkspaceCompositionDiscovery<'a> {
     workspace: &'a WorkspaceAnalyzer,
     provider: WorkspaceValueFlowProvider<'a>,
-    artifacts: RefCell<HashMap<SemanticArtifactKey, Arc<SemanticArtifact>>>,
+    attribution: OwnedMemoCapability,
+    artifacts: CompositionMap<SemanticArtifactKey, Arc<SemanticArtifact>>,
 }
 
 /// The calling language's proven intrinsic, shared by composition clients.
@@ -106,6 +108,7 @@ impl<'a> UnitCallModels<'a> {
             IntrinsicTransfer::FreshResult => None,
         };
         Ok(Some(CallModel {
+            endpoint_projections: false,
             summary: None,
             summary_target: None,
             transfers: actual
@@ -119,6 +122,7 @@ impl<'a> UnitCallModels<'a> {
                     function: (),
                     proven: true,
                     unresolved_output_storage: false,
+                    preserves_member_contents: false,
                 })
                 .collect(),
             writeback: Box::default(),
@@ -208,7 +212,8 @@ impl<'a> WorkspaceCompositionDiscovery<'a> {
         Self {
             workspace,
             provider,
-            artifacts: RefCell::new(HashMap::new()),
+            attribution: workspace_memo_attribution(workspace),
+            artifacts: ReplayingMemo::new(RefCell::new(HashMap::new())),
         }
     }
 
@@ -236,6 +241,29 @@ impl<'a> WorkspaceCompositionDiscovery<'a> {
 
 impl ValueFlowProvider for WorkspaceCompositionDiscovery<'_> {
     type Error = SemanticProviderError;
+    fn payload_projection_identity(
+        &self,
+        procedure: &ProcedureHandle,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<Option<crate::analyzer::semantic::StableDigest>>, Self::Error> {
+        self.provider
+            .payload_projection_identity(procedure, request)
+    }
+
+    fn payload_constructor_output(
+        &self,
+        call: &CallSiteHandle,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<Option<ValueFlowEndpoint>>, Self::Error> {
+        self.provider.payload_constructor_output(call, request)
+    }
+    fn selected_executable_procedure(
+        &self,
+        procedure: &ProcedureHandle,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<ProcedureHandle>, Self::Error> {
+        WorkspaceValueFlowProvider::select_executable_procedure(self.workspace, procedure, request)
+    }
 
     fn procedure_snapshot(
         &self,
@@ -283,38 +311,66 @@ impl LocalTransferDiscovery for WorkspaceCompositionDiscovery<'_> {
         self.workspace
     }
 
+    fn refuse_locator(
+        &self,
+        refusal: crate::analyzer::semantic::CandidateLocatorRefusal,
+    ) -> Self::Error {
+        SemanticProviderError::CandidateLocatorRefusal(refusal)
+    }
+
+    fn locator_refusal(
+        &self,
+        error: &Self::Error,
+    ) -> Option<crate::analyzer::semantic::CandidateLocatorRefusal> {
+        match error {
+            SemanticProviderError::CandidateLocatorRefusal(refusal) => Some(*refusal),
+            _ => None,
+        }
+    }
+
     fn procedure(
         &self,
         key: &DurableProcedureKey,
         request: &mut SemanticRequest<'_>,
     ) -> Result<ProcedureHandle, Self::Error> {
-        let artifact = if let Some(cached) = self.artifacts.borrow().get(&key.0).cloned() {
-            cached
-        } else {
-            let root = self.workspace.analyzer().project().root();
-            let file =
-                crate::analyzer::ProjectFile::new(root.to_path_buf(), key.0.path().as_path());
-            let outcome = self
-                .workspace
-                .materialize_program_semantics(&file, request)?;
-            self.require_outcome(&outcome, "composition procedure lookup")?;
-            let artifact = outcome.available_value().cloned().ok_or_else(|| {
-                self.unavailable(format!(
-                    "composition could not materialize {}",
-                    key.0.path()
-                ))
+        // A hit replays the reads of the fill that materialized the artifact,
+        // the semantic-model read among them, so a warm query records the
+        // same inputs as a cold one (#11953).
+        let artifact = self
+            .artifacts
+            .read(&self.attribution.capability(), |memo, capture| {
+                if let Some(entry) = memo.borrow().get(&key.0).cloned() {
+                    return Ok::<_, SemanticProviderError>(entry);
+                }
+                let entry = Arc::new(capture.try_build(|| {
+                    let root = self.workspace.analyzer().project().root();
+                    let file = crate::analyzer::ProjectFile::new(
+                        root.to_path_buf(),
+                        key.0.path().as_path(),
+                    );
+                    let outcome = self
+                        .workspace
+                        .materialize_program_semantics(&file, request)?;
+                    self.require_outcome(&outcome, "composition procedure lookup")?;
+                    let artifact = outcome.available_value().cloned().ok_or_else(|| {
+                        self.unavailable(format!(
+                            "composition could not materialize {}",
+                            key.0.path()
+                        ))
+                    })?;
+                    if artifact.key() != &key.0 {
+                        return Err(self.unavailable(format!(
+                            "the artifact of {} changed during composition",
+                            key.0.path()
+                        )));
+                    }
+                    Ok::<_, SemanticProviderError>(artifact)
+                })?);
+                memo.borrow_mut().insert(key.0.clone(), Arc::clone(&entry));
+                Ok(entry)
             })?;
-            if artifact.key() != &key.0 {
-                return Err(self.unavailable(format!(
-                    "the artifact of {} changed during composition",
-                    key.0.path()
-                )));
-            }
-            self.artifacts
-                .borrow_mut()
-                .insert(key.0.clone(), Arc::clone(&artifact));
-            artifact
-        };
+        let artifact = Arc::clone(&artifact);
+        // Structural discovery supplies the base body to the selection owner.
         let handle = artifact.procedure_handle(key.1).ok_or_else(|| {
             self.unavailable(format!("procedure {:?} is not in {}", key.1, key.0.path()))
         })?;
@@ -361,6 +417,197 @@ impl LocalTransferDiscovery for WorkspaceCompositionDiscovery<'_> {
 /// Query-local discovery for shared composition. Implementations replay their
 /// consumer's artifact and dispatch reads even when a memo supplies the answer.
 pub trait LocalTransferDiscovery: ValueFlowProvider {
+    fn refuse_locator(
+        &self,
+        refusal: crate::analyzer::semantic::CandidateLocatorRefusal,
+    ) -> Self::Error;
+    fn locator_refusal(
+        &self,
+        error: &Self::Error,
+    ) -> Option<crate::analyzer::semantic::CandidateLocatorRefusal>;
+
+    /// Reacquire a body before reading a retained procedure-local locator.
+    fn locator_procedure(
+        &self,
+        key: &DurableProcedureKey,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<ProcedureHandle, Self::Error> {
+        let handle = self.selected_procedure(key, request)?;
+        handle
+            .validate_durable_locator(key)
+            .map_err(|error| self.refuse_locator(error))?;
+        Ok(handle)
+    }
+
+    /// Select an executable handle without acquiring its flows.
+    fn selected_procedure(
+        &self,
+        key: &DurableProcedureKey,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<ProcedureHandle, Self::Error> {
+        let base = self.procedure(key, request)?;
+        self.selected_procedure_handle(&base, request)
+    }
+
+    fn selected_procedure_handle(
+        &self,
+        base: &ProcedureHandle,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<ProcedureHandle, Self::Error> {
+        let outcome = self
+            .workspace()
+            .executable_procedure_handle(base, request)
+            .map_err(|error| self.provider_error(error.to_string()))?;
+        self.require_outcome(&outcome, "selected procedure handle")?;
+        outcome
+            .available_value()
+            .map(|selected| {
+                let handle = &selected.handle;
+                let side = &selected.side;
+                debug_assert!(
+                    *side != crate::analyzer::semantic::service::CandidateProcedureSide::Base
+                        || !handle.is_candidate_alternate()
+                );
+                handle.clone()
+            })
+            .ok_or_else(|| self.unavailable("selected procedure handle unavailable".to_owned()))
+    }
+
+    /// Acquire one executable interpretation, paired flows, and all underlying reads.
+    fn selected_procedure_and_flows(
+        &self,
+        key: &DurableProcedureKey,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<
+        crate::analyzer::semantic::service::SelectedCandidateProcedure<
+            crate::analyzer::i_analyzer::QueryReadReceipt,
+        >,
+        Self::Error,
+    > {
+        let (selected, receipt) = crate::analyzer::i_analyzer::QueryReadReceipt::capture(
+            self.workspace().analyzer(),
+            || {
+                let base = self.procedure(key, request)?;
+                self.selected_procedure_and_flows_handle(&base, request)
+            },
+        );
+        receipt.replay(self.workspace().analyzer());
+        let mut selected = selected?;
+        selected.admissions = receipt;
+        Ok(selected)
+    }
+
+    fn selected_procedure_and_flows_handle(
+        &self,
+        base: &ProcedureHandle,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<
+        crate::analyzer::semantic::service::SelectedCandidateProcedure<
+            crate::analyzer::i_analyzer::QueryReadReceipt,
+        >,
+        Self::Error,
+    > {
+        use crate::analyzer::semantic::service::CandidateProcedureOutcome;
+        let (outcome, receipt) = crate::analyzer::i_analyzer::QueryReadReceipt::capture(
+            self.workspace().analyzer(),
+            || {
+                use crate::analyzer::semantic::ProcedureInterpretation;
+                use crate::analyzer::semantic::service::SelectedCandidateProcedure;
+                let executable = self
+                    .workspace()
+                    .executable_procedure_handle(base, request)
+                    .map_err(|error| self.provider_error(error.to_string()))?;
+                self.require_outcome(&executable, "selected executable procedure")?;
+                let selected = executable.available_value().ok_or_else(|| {
+                    self.unavailable("selected executable procedure unavailable".to_owned())
+                })?;
+                let (side, procedure, flows) = if selected.handle.interpretation()
+                    == ProcedureInterpretation::ExecutableAlternate
+                {
+                    // A refined body cannot consume the base body's stored flows.
+                    (selected.side, selected.handle.clone(), None)
+                } else {
+                    match self
+                        .workspace()
+                        .selected_procedure_and_flows(base, request)
+                        .map_err(|error| self.provider_error(error.to_string()))?
+                    {
+                        CandidateProcedureOutcome::Selected(selected) => {
+                            (selected.side, selected.procedure, Some(selected.flows))
+                        }
+                        CandidateProcedureOutcome::Cancelled => {
+                            return Ok(CandidateProcedureOutcome::Cancelled);
+                        }
+                        CandidateProcedureOutcome::ExceededBudget(exceeded) => {
+                            return Ok(CandidateProcedureOutcome::ExceededBudget(exceeded));
+                        }
+                    }
+                };
+                let projection = self.payload_projection_identity(&procedure, request)?;
+                self.require_outcome(&projection, "selected payload projection")?;
+                let flows = match flows {
+                    Some(flows) if !projection.available_value().is_some_and(Option::is_some) => {
+                        flows
+                    }
+                    _ => {
+                        let snapshot = self.procedure_snapshot(
+                            &procedure,
+                            &OracleCallContext::empty(),
+                            request,
+                        )?;
+                        self.require_outcome(&snapshot, "selected payload relations")?;
+                        let snapshot = snapshot.available_value().ok_or_else(|| {
+                            self.unavailable("selected payload relations unavailable".to_owned())
+                        })?;
+                        crate::analyzer::semantic::partial_flow::compute_partial_flows(
+                            &procedure, snapshot, request,
+                        )
+                    }
+                };
+                Ok(CandidateProcedureOutcome::Selected(
+                    SelectedCandidateProcedure {
+                        side,
+                        procedure,
+                        flows,
+                        admissions: (),
+                    },
+                ))
+            },
+        );
+        receipt.replay(self.workspace().analyzer());
+        match outcome? {
+            CandidateProcedureOutcome::Selected(selected) => Ok(
+                crate::analyzer::semantic::service::SelectedCandidateProcedure {
+                    side: selected.side,
+                    procedure: selected.procedure,
+                    flows: selected.flows,
+                    admissions: receipt,
+                },
+            ),
+            CandidateProcedureOutcome::Cancelled => {
+                self.require_outcome(
+                    &SemanticOutcome::<()>::Cancelled {
+                        partial: None,
+                        work: Default::default(),
+                    },
+                    "selected procedure acquisition",
+                )?;
+                unreachable!("discovery must reject a cancelled acquisition")
+            }
+            CandidateProcedureOutcome::ExceededBudget(exceeded) => {
+                self.require_outcome(
+                    &SemanticOutcome::<()>::ExceededBudget {
+                        partial: None,
+                        exceeded,
+                        work: Default::default(),
+                    },
+                    "selected procedure acquisition",
+                )?;
+                unreachable!("discovery must reject a budget-stopped acquisition")
+            }
+        }
+    }
+
     fn call_conversion_may_run_user_code(
         &self,
         call: &CallSiteHandle,
@@ -437,10 +684,18 @@ pub trait LocalOpennessClient<D: LocalTransferDiscovery> {
     ) -> Result<Arc<ProcedurePartialFlows>, D::Error>;
     fn openness_sweep(
         &self,
-        procedure: &DurableProcedureKey,
         handle: &ProcedureHandle,
         request: &mut SemanticRequest<'_>,
     ) -> Result<ProcedureOpenness, D::Error>;
+    /// A client may retire a global value obligation only after its actual
+    /// interior requests have accounted for that exact obligation.
+    fn value_obligation_accounted(
+        &self,
+        _handle: &ProcedureHandle,
+        _gap: crate::analyzer::semantic::GapKey,
+    ) -> bool {
+        false
+    }
     fn dispatch_completeness(
         &self,
         call: &DurableCallSiteKey,
@@ -453,6 +708,15 @@ pub trait LocalOpennessClient<D: LocalTransferDiscovery> {
 pub trait InteriorProjectionClient {
     type Error: std::fmt::Display;
 
+    fn selected_entry_workspace(&self) -> &WorkspaceAnalyzer;
+
+    fn record_value_obligation_accounting(
+        &self,
+        _handle: &ProcedureHandle,
+        _gaps: &[crate::analyzer::semantic::GapKey],
+        _request: &mut SemanticRequest<'_>,
+    ) {
+    }
     fn implicit_heap_reads(&self) -> bool;
     #[allow(clippy::too_many_arguments)]
     fn run_interior_fixpoint(
@@ -469,7 +733,7 @@ pub trait InteriorProjectionClient {
 }
 
 /// One admitted RQL value-flow search. All memos die with this value.
-type UnitDispatchMemo = CompositionMap<DurableCallSiteKey, (Dispatch, Option<CallModel<()>>)>;
+type UnitDispatchMemo = CompositionMap<ExactCallSiteKey, (Dispatch, Option<CallModel<()>>)>;
 
 /// Owned by the per-query composition provider and released when it drops.
 /// All composition and ordered answer memos share this query-local limit.
@@ -502,10 +766,11 @@ type CompositionMap<K, V> = ReplayingMemo<RefCell<HashMap<K, CompositionEntry<V>
 pub(crate) fn admit_composition_entry<K: Eq + Hash + Clone, V>(
     memo: &RefCell<HashMap<K, CompositionEntry<V>>>,
     key: &K,
-    entry: ReplayingMemoEntry<V, crate::analyzer::ReadKey>,
+    entry: impl Into<CompositionEntry<V>>,
     budget: &CompositionMemoBudget,
     operational_stop: bool,
 ) -> CompositionEntry<V> {
+    let entry = entry.into();
     if !operational_stop {
         let heap = RefCell::new(crate::analyzer::store::cache_budget::RetainedHeap::default());
         let bytes = entry
@@ -518,50 +783,17 @@ pub(crate) fn admit_composition_entry<K: Eq + Hash + Clone, V>(
             })
             .saturating_add(heap.into_inner().total());
         if budget.try_charge(bytes) {
-            let entry = Arc::new(entry);
             memo.borrow_mut().insert(key.clone(), Arc::clone(&entry));
             return entry;
         }
     }
     // Not retained. The build already forwarded its reads to the live
     // capture, and `MemoReadCapture::finish` does not replay them twice.
-    Arc::new(entry)
+    entry
 }
 
 fn partial_flows_weight(flows: &ProcedurePartialFlows) -> usize {
-    let mut bytes = std::mem::size_of::<Arc<ProcedurePartialFlows>>()
-        + std::mem::size_of::<ProcedurePartialFlows>()
-        + flows.detail.as_ref().map_or(0, String::capacity)
-        + flows.ports.capacity() * std::mem::size_of::<PartialFlowPort>()
-        + flows.flows.capacity()
-            * std::mem::size_of::<crate::analyzer::semantic::partial_flow::PartialFlow>()
-        + flows.discharged_gaps.capacity() * std::mem::size_of::<SemanticGapId>();
-    for port in &flows.ports {
-        let mut current = port;
-        while let PartialFlowPort::Heap {
-            root, selectors, ..
-        } = current
-        {
-            bytes +=
-                std::mem::size_of::<PartialFlowPort>() + std::mem::size_of_val(selectors.as_ref());
-            for selector in selectors.iter() {
-                use crate::analyzer::semantic::partial_flow::ports::HeapSelector;
-                if let HeapSelector::Property(name) | HeapSelector::ConstantIndex(name) = selector {
-                    bytes += name.len();
-                }
-            }
-            current = root;
-        }
-    }
-    for flow in &flows.flows {
-        bytes += std::mem::size_of_val(flow.crossed.as_ref());
-        bytes += flow
-            .crossed
-            .iter()
-            .map(|calls| std::mem::size_of_val(calls.as_ref()))
-            .sum::<usize>();
-    }
-    bytes
+    std::mem::size_of::<Arc<ProcedurePartialFlows>>() + flows.retained_bytes()
 }
 
 fn openness_weight(openness: &Openness) -> usize {
@@ -604,10 +836,13 @@ pub struct UnitCompositionProvider<'a> {
     max_callers: usize,
     attribution: OwnedMemoCapability,
     memo_budget: Rc<CompositionMemoBudget>,
-    partial: CompositionMap<DurableProcedureKey, Arc<ProcedurePartialFlows>>,
+    partial: CompositionMap<
+        ExactProcedureIdentity,
+        crate::analyzer::usages::common::AdmittedMemoValue<Arc<ProcedurePartialFlows>>,
+    >,
     dispatches: UnitDispatchMemo,
-    sweeps: CompositionMap<DurableProcedureKey, ProcedureOpenness>,
-    openness: CompositionMap<DurableProcedureKey, Openness>,
+    sweeps: CompositionMap<ExactProcedureIdentity, ProcedureOpenness>,
+    openness: CompositionMap<ExactProcedureIdentity, Openness>,
     /// Write-only diagnostic inventory for excluded reverse-call candidates.
     excluded_callers: RefCell<Vec<(crate::analyzer::ProjectFile, crate::analyzer::Range)>>,
 }
@@ -675,6 +910,10 @@ impl CallModelSource for UnitCompositionProvider<'_> {
 impl InteriorProjectionClient for UnitCompositionProvider<'_> {
     type Error = SemanticProviderError;
 
+    fn selected_entry_workspace(&self) -> &WorkspaceAnalyzer {
+        self.discovery.workspace
+    }
+
     fn implicit_heap_reads(&self) -> bool {
         false
     }
@@ -718,14 +957,14 @@ impl LocalOpennessClient<WorkspaceCompositionDiscovery<'_>> for UnitCompositionP
 
     fn openness_sweep(
         &self,
-        procedure: &DurableProcedureKey,
         handle: &ProcedureHandle,
         request: &mut SemanticRequest<'_>,
     ) -> Result<ProcedureOpenness, SemanticProviderError> {
+        let key = handle.exact_identity();
         let answer = self.sweeps.read(
             &self.attribution.capability(),
             |memo, capture| -> Result<_, SemanticProviderError> {
-                if let Some(entry) = memo.borrow().get(procedure).cloned() {
+                if let Some(entry) = memo.borrow().get(&key).cloned() {
                     return Ok(entry);
                 }
                 let entry = capture.try_build_weighted(|| {
@@ -737,7 +976,7 @@ impl LocalOpennessClient<WorkspaceCompositionDiscovery<'_>> for UnitCompositionP
                 })?;
                 Ok(admit_composition_entry(
                     memo,
-                    procedure,
+                    &key,
                     entry,
                     &self.memo_budget,
                     request.stop_observed(),
@@ -760,48 +999,75 @@ impl LocalOpennessClient<WorkspaceCompositionDiscovery<'_>> for UnitCompositionP
     }
 }
 
+enum PartialFlowMemoReadError {
+    Provider(SemanticProviderError),
+    Unretained(Arc<ProcedurePartialFlows>),
+}
+
 impl crate::taint::compose::CompositionProvider for UnitCompositionProvider<'_> {
     type Error = SemanticProviderError;
     type Fact = ();
     type Function = ();
+
+    fn acquisition_refusal(
+        &self,
+        error: &Self::Error,
+    ) -> Option<crate::analyzer::semantic::CandidateLocatorRefusal> {
+        self.discovery.locator_refusal(error)
+    }
 
     fn partial_flows(
         &self,
         procedure: &DurableProcedureKey,
         request: &mut SemanticRequest<'_>,
     ) -> Result<Arc<ProcedurePartialFlows>, Self::Error> {
+        use crate::analyzer::usages::common::{
+            MemoValueAdmission, QueryMemoOwner, try_capture_partial_flow_memo_entry,
+        };
+        let memo_key = self
+            .discovery
+            .selected_procedure(procedure, request)?
+            .exact_identity();
         let flows = self.partial.read(
             &self.attribution.capability(),
-            |memo, capture| -> Result<_, SemanticProviderError> {
-                if let Some(entry) = memo.borrow().get(procedure).cloned() {
+            |memo, capture| -> Result<_, PartialFlowMemoReadError> {
+                if let Some(entry) = memo.borrow().get(&memo_key).cloned() {
                     return Ok(entry);
                 }
-                let entry = capture.try_build_weighted(|| {
-                    let handle = self.discovery.procedure(procedure, request)?;
-                    let flows = match stored_partial_flows(&self.discovery, &handle)? {
-                        Some(flows) => flows,
-                        None => project_partial_flows(
-                            &self.discovery,
-                            &handle,
-                            &self.execution_budget,
-                            request,
-                        )?,
-                    };
-                    let weight = partial_flows_weight(&flows);
-                    Ok::<_, SemanticProviderError>((Arc::new(flows), weight))
-                })?;
-                let operational_stop = request.stop_observed()
-                    || entry.value().outcome == PartialFlowOutcome::ExceededBudget;
-                Ok(admit_composition_entry(
-                    memo,
-                    procedure,
-                    entry,
-                    &self.memo_budget,
-                    operational_stop,
-                ))
+                let admission = try_capture_partial_flow_memo_entry(
+                    QueryMemoOwner::CompositionPartialFlow,
+                    self.discovery.workspace().analyzer(),
+                    capture,
+                    request,
+                    |request| {
+                        let selected = self
+                            .discovery
+                            .selected_procedure_and_flows(procedure, request)?;
+                        Ok(Arc::new(selected.flows))
+                    },
+                    |flows| partial_flows_weight(flows),
+                    || self.discovery.artifacts.clear(),
+                )
+                .map_err(PartialFlowMemoReadError::Provider)?;
+                match admission {
+                    MemoValueAdmission::Admitted(entry) => Ok(admit_composition_entry(
+                        memo,
+                        &memo_key,
+                        entry,
+                        &self.memo_budget,
+                        false,
+                    )),
+                    MemoValueAdmission::Unretained(flows) => {
+                        Err(PartialFlowMemoReadError::Unretained(flows))
+                    }
+                }
             },
-        )?;
-        Ok(Arc::clone(&flows))
+        );
+        match flows {
+            Ok(flows) => Ok(Arc::clone(&flows)),
+            Err(PartialFlowMemoReadError::Unretained(flows)) => Ok(flows),
+            Err(PartialFlowMemoReadError::Provider(error)) => Err(error),
+        }
     }
 
     fn interior_flows(
@@ -812,7 +1078,7 @@ impl crate::taint::compose::CompositionProvider for UnitCompositionProvider<'_> 
         witnesses: bool,
         request: &mut SemanticRequest<'_>,
     ) -> Result<InteriorFlows, Self::Error> {
-        let handle = self.discovery.procedure(procedure, request)?;
+        let handle = self.discovery.selected_procedure(procedure, request)?;
         let answer =
             self.discovery
                 .procedure_snapshot(&handle, &OracleCallContext::empty(), request)?;
@@ -841,10 +1107,16 @@ impl crate::taint::compose::CompositionProvider for UnitCompositionProvider<'_> 
         call: &DurableCallSiteKey,
         request: &mut SemanticRequest<'_>,
     ) -> Result<(Dispatch, Option<CallModel<()>>), Self::Error> {
+        let memo_key = (
+            self.discovery
+                .locator_procedure(&call.0, request)?
+                .exact_identity(),
+            call.1,
+        );
         let entry = self.dispatches.read(
             &self.attribution.capability(),
             |memo, capture| -> Result<_, SemanticProviderError> {
-                if let Some(entry) = memo.borrow().get(call).cloned() {
+                if let Some(entry) = memo.borrow().get(&memo_key).cloned() {
                     return Ok(entry);
                 }
                 let entry = capture.try_build_weighted(|| {
@@ -868,7 +1140,7 @@ impl crate::taint::compose::CompositionProvider for UnitCompositionProvider<'_> 
                 let operational_stop = request.stop_observed();
                 Ok(admit_composition_entry(
                     memo,
-                    call,
+                    &memo_key,
                     entry,
                     &self.memo_budget,
                     operational_stop,
@@ -911,7 +1183,7 @@ impl crate::taint::compose::CompositionProvider for UnitCompositionProvider<'_> 
         call: &DurableCallSiteKey,
         request: &mut SemanticRequest<'_>,
     ) -> Result<FallbackPorts, Self::Error> {
-        let handle = self.discovery.procedure(&call.0, request)?;
+        let handle = self.discovery.locator_procedure(&call.0, request)?;
         let site = handle.semantics().call_site(call.1).ok_or_else(|| {
             self.discovery
                 .unavailable(format!("call {:?} is not in its procedure", call.1))
@@ -928,10 +1200,14 @@ impl crate::taint::compose::CompositionProvider for UnitCompositionProvider<'_> 
         procedure: &DurableProcedureKey,
         request: &mut SemanticRequest<'_>,
     ) -> Result<Openness, Self::Error> {
+        let memo_key = self
+            .discovery
+            .selected_procedure(procedure, request)?
+            .exact_identity();
         let openness = self.openness.read(
             &self.attribution.capability(),
             |memo, capture| -> Result<_, SemanticProviderError> {
-                if let Some(entry) = memo.borrow().get(procedure).cloned() {
+                if let Some(entry) = memo.borrow().get(&memo_key).cloned() {
                     return Ok(entry);
                 }
                 let entry = capture.try_build_weighted(|| {
@@ -950,7 +1226,7 @@ impl crate::taint::compose::CompositionProvider for UnitCompositionProvider<'_> 
                     );
                 Ok(admit_composition_entry(
                     memo,
-                    procedure,
+                    &memo_key,
                     entry,
                     &self.memo_budget,
                     operational_stop,
@@ -1009,8 +1285,8 @@ pub struct TypestateCompositionProvider<'a> {
     subject: &'a crate::typestate::BoundTypestateSubject,
     bindings: &'a crate::typestate::TypestateBindingPlan,
     context: crate::typestate::TypestateBindingContext,
-    local: CompositionMap<DurableProcedureKey, Arc<ProcedurePartialFlows>>,
-    dispatches: CompositionMap<DurableCallSiteKey, Dispatch>,
+    local: CompositionMap<ExactProcedureIdentity, Arc<ProcedurePartialFlows>>,
+    dispatches: CompositionMap<ExactCallSiteKey, Dispatch>,
     formal_entry: Option<(DurableProcedureKey, PartialFlowPort)>,
     summaries: Rc<CompositionMap<TypestateSummaryKey, TypestateSummary>>,
     pending_summaries: Rc<RefCell<HashSet<TypestateSummaryKey>>>,
@@ -1018,7 +1294,7 @@ pub struct TypestateCompositionProvider<'a> {
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct TypestateSummaryKey {
-    callee: DurableProcedureKey,
+    callee: ExactProcedureIdentity,
     formal: PartialFlowPort,
     exit: CallHandoffExit,
 }
@@ -1143,6 +1419,7 @@ impl<'a> TypestateCompositionProvider<'a> {
 
     fn callee_summary(
         &self,
+        callee: &DurableProcedureKey,
         key: TypestateSummaryKey,
         request: &mut SemanticRequest<'_>,
     ) -> Result<TypestateSummary, SemanticProviderError> {
@@ -1200,7 +1477,7 @@ impl<'a> TypestateCompositionProvider<'a> {
                         context: crate::typestate::TypestateBindingContext::root(),
                         local: ReplayingMemo::new(RefCell::new(HashMap::new())),
                         dispatches: ReplayingMemo::new(RefCell::new(HashMap::new())),
-                        formal_entry: Some((key.callee.clone(), key.formal.clone())),
+                        formal_entry: Some((callee.clone(), key.formal.clone())),
                         summaries: Rc::clone(&self.summaries),
                         pending_summaries: Rc::clone(&self.pending_summaries),
                     };
@@ -1209,7 +1486,7 @@ impl<'a> TypestateCompositionProvider<'a> {
                         CallHandoffExit::Exceptional => ObjectAnchorSite::ExceptionalExit,
                     };
                     let root = ObjectAnchor {
-                        procedure: key.callee.clone(),
+                        procedure: callee.clone(),
                         site,
                         role: ObjectAnchorRole::CurrentObject,
                         object: self.subject.object().clone(),
@@ -1767,7 +2044,7 @@ impl<'a> TypestateCompositionProvider<'a> {
                 ));
             }
             if let crate::taint::compose::Hop::CallHandoff { call, exit, .. } = hop {
-                let handle = self.discovery.procedure(&call.0, request)?;
+                let handle = self.discovery.locator_procedure(&call.0, request)?;
                 let site = handle
                     .semantics()
                     .call_site(call.1)
@@ -1776,7 +2053,8 @@ impl<'a> TypestateCompositionProvider<'a> {
                     .point_handle(site.point)
                     .expect("a retained call point belongs to its procedure");
                 let origin = handle
-                    .call_site_handle(call.1)
+                    .resolve_durable_call(call)
+                    .map_err(|error| self.discovery.refuse_locator(error))?
                     .expect("a retained call belongs to its procedure");
                 let return_kind = match exit {
                     CallHandoffExit::Normal => IcfgEdgeKind::NormalReturn,
@@ -1831,9 +2109,10 @@ impl<'a> TypestateCompositionProvider<'a> {
                 continue;
             }
             let key = relation.site();
-            let procedure = self.discovery.procedure(&key.0, request)?;
+            let procedure = self.discovery.locator_procedure(&key.0, request)?;
             let call = procedure
-                .call_site_handle(key.1)
+                .resolve_durable_call(key)
+                .map_err(|error| self.discovery.refuse_locator(error))?
                 .expect("retained relation names a call");
             let site = call
                 .locator()
@@ -2046,7 +2325,6 @@ impl LocalOpennessClient<WorkspaceCompositionDiscovery<'_>> for TypestateComposi
 
     fn openness_sweep(
         &self,
-        _procedure: &DurableProcedureKey,
         handle: &ProcedureHandle,
         request: &mut SemanticRequest<'_>,
     ) -> Result<ProcedureOpenness, SemanticProviderError> {
@@ -2076,6 +2354,13 @@ impl crate::taint::compose::CompositionProvider for TypestateCompositionProvider
     type Fact = crate::typestate::TypestateComposeFact;
     type Function = crate::typestate::TypestateComposeFunction;
 
+    fn acquisition_refusal(
+        &self,
+        error: &Self::Error,
+    ) -> Option<crate::analyzer::semantic::CandidateLocatorRefusal> {
+        self.discovery.locator_refusal(error)
+    }
+
     fn object_relation(
         &self,
         procedure: &DurableProcedureKey,
@@ -2100,7 +2385,7 @@ impl crate::taint::compose::CompositionProvider for TypestateCompositionProvider
             relation.cross_call = false;
             return Ok(relation);
         }
-        let handle = self.discovery.procedure(procedure, request)?;
+        let handle = self.discovery.selected_procedure(procedure, request)?;
         relation.complete = self
             .discovery
             .workspace
@@ -2290,23 +2575,20 @@ impl crate::taint::compose::CompositionProvider for TypestateCompositionProvider
         procedure: &DurableProcedureKey,
         request: &mut SemanticRequest<'_>,
     ) -> Result<Arc<ProcedurePartialFlows>, Self::Error> {
+        let memo_key = self
+            .discovery
+            .selected_procedure(procedure, request)?
+            .exact_identity();
         let flows = self.local.read(
             &self.attribution.capability(),
             |memo, capture| -> Result<_, SemanticProviderError> {
-                if let Some(entry) = memo.borrow().get(procedure).cloned() {
+                if let Some(entry) = memo.borrow().get(&memo_key).cloned() {
                     return Ok(entry);
                 }
                 let entry = capture.try_build_weighted(|| {
-                let handle = self.discovery.procedure(procedure, request)?;
-                let mut flows = match stored_partial_flows(self.discovery.as_ref(), &handle)? {
-                    Some(flows) => flows,
-                    None => project_partial_flows(
-                        self.discovery.as_ref(),
-                        &handle,
-                        &self.execution_budget,
-                        request,
-                    )?,
-                };
+                let selected = self.discovery.selected_procedure_and_flows(procedure, request)?;
+                let handle = selected.procedure;
+                let mut flows = selected.flows;
                 for exit in [
                     PartialFlowPort::NormalReturn,
                     PartialFlowPort::ExceptionalReturn,
@@ -2440,7 +2722,7 @@ impl crate::taint::compose::CompositionProvider for TypestateCompositionProvider
                 let operational_stop = request.stop_observed()
                     || entry.value().outcome == PartialFlowOutcome::ExceededBudget;
                 Ok(admit_composition_entry(
-                    memo, procedure, entry, &self.memo_budget, operational_stop,
+                    memo, &memo_key, entry, &self.memo_budget, operational_stop,
                 ))
             },
         )?;
@@ -2455,7 +2737,7 @@ impl crate::taint::compose::CompositionProvider for TypestateCompositionProvider
         _witnesses: bool,
         request: &mut SemanticRequest<'_>,
     ) -> Result<InteriorFlows, Self::Error> {
-        let handle = self.discovery.procedure(procedure, request)?;
+        let handle = self.discovery.selected_procedure(procedure, request)?;
         Ok(incomplete_interior(
             handle,
             "object roots use ordered semantic IR, not value-flow interior",
@@ -2467,10 +2749,16 @@ impl crate::taint::compose::CompositionProvider for TypestateCompositionProvider
         call: &DurableCallSiteKey,
         request: &mut SemanticRequest<'_>,
     ) -> Result<(Dispatch, Option<CallModel<Self::Function>>), Self::Error> {
+        let memo_key = (
+            self.discovery
+                .locator_procedure(&call.0, request)?
+                .exact_identity(),
+            call.1,
+        );
         let answer = self.dispatches.read(
             &self.attribution.capability(),
             |memo, capture| -> Result<_, SemanticProviderError> {
-                if let Some(entry) = memo.borrow().get(call).cloned() {
+                if let Some(entry) = memo.borrow().get(&memo_key).cloned() {
                     return Ok(entry);
                 }
                 let entry = capture.try_build_weighted(|| {
@@ -2483,7 +2771,7 @@ impl crate::taint::compose::CompositionProvider for TypestateCompositionProvider
                 })?;
                 Ok(admit_composition_entry(
                     memo,
-                    call,
+                    &memo_key,
                     entry,
                     &self.memo_budget,
                     request.stop_observed(),
@@ -2550,8 +2838,11 @@ impl crate::taint::compose::CompositionProvider for TypestateCompositionProvider
         let AbstractObjectIdentity::Value(object_value) = root.object.identity() else {
             return Ok(None);
         };
-        let handle = self.discovery.procedure(&call.0, request)?;
-        let Some(call_handle) = handle.call_site_handle(call.1) else {
+        let handle = self.discovery.locator_procedure(&call.0, request)?;
+        let Some(call_handle) = handle
+            .resolve_durable_call(call)
+            .map_err(|error| self.discovery.refuse_locator(error))?
+        else {
             return Ok(None);
         };
         let Some(row) = handle.semantics().call_site(call.1) else {
@@ -2628,14 +2919,14 @@ impl crate::taint::compose::CompositionProvider for TypestateCompositionProvider
                 .transfers
                 .iter()
                 .any(|transfer| match &transfer.output {
-                    CompiledSummaryOutput::NormalReturn {} => origin.ordinal == 0,
-                    CompiledSummaryOutput::IndexedNormalReturn { ordinal } => {
+                    CompiledSummaryOutput::NormalReturn { .. } => origin.ordinal == 0,
+                    CompiledSummaryOutput::IndexedNormalReturn { ordinal, .. } => {
                         *ordinal == origin.ordinal
                     }
                     CompiledSummaryOutput::Heap { .. }
                     | CompiledSummaryOutput::Capture { .. }
-                    | CompiledSummaryOutput::Receiver {} => true,
-                    CompiledSummaryOutput::ExceptionalReturn {} => false,
+                    | CompiledSummaryOutput::Receiver { .. } => true,
+                    CompiledSummaryOutput::ExceptionalReturn { .. } => false,
                 })
         {
             return Ok(None);
@@ -2652,7 +2943,7 @@ impl crate::taint::compose::CompositionProvider for TypestateCompositionProvider
         call: &DurableCallSiteKey,
         request: &mut SemanticRequest<'_>,
     ) -> Result<FallbackPorts, Self::Error> {
-        let handle = self.discovery.procedure(&call.0, request)?;
+        let handle = self.discovery.locator_procedure(&call.0, request)?;
         let site = handle
             .semantics()
             .call_site(call.1)
@@ -2711,7 +3002,7 @@ impl crate::taint::compose::CompositionProvider for TypestateCompositionProvider
         else {
             return Ok(None);
         };
-        let handle = self.discovery.procedure(procedure, request)?;
+        let handle = self.discovery.selected_procedure(procedure, request)?;
         self.ordered
             .read(&self.attribution.capability(), |memo| {
                 memo.borrow_mut()
@@ -2725,7 +3016,7 @@ impl crate::taint::compose::CompositionProvider for TypestateCompositionProvider
         call: &DurableCallSiteKey,
         request: &mut SemanticRequest<'_>,
     ) -> Result<Vec<crate::taint::compose::ObjectPredecessor<Self::Function>>, Self::Error> {
-        let procedure = self.discovery.procedure(&call.0, request)?;
+        let procedure = self.discovery.locator_procedure(&call.0, request)?;
         let site = procedure
             .semantics()
             .call_sites()
@@ -2733,7 +3024,8 @@ impl crate::taint::compose::CompositionProvider for TypestateCompositionProvider
             .find(|site| site.id == call.1)
             .expect("call belongs to procedure");
         let call_handle = procedure
-            .call_site_handle(call.1)
+            .resolve_durable_call(call)
+            .map_err(|error| self.discovery.refuse_locator(error))?
             .expect("call belongs to procedure");
         let answer = self.discovery.resolve_call(&call_handle, request)?;
         let conversion =
@@ -2807,9 +3099,10 @@ impl crate::taint::compose::CompositionProvider for TypestateCompositionProvider
         exit: CallHandoffExit,
         request: &mut SemanticRequest<'_>,
     ) -> Result<CallHandoffInventory<Self::Function>, Self::Error> {
-        let handle = self.discovery.procedure(&call.0, request)?;
+        let handle = self.discovery.locator_procedure(&call.0, request)?;
         let site = handle
-            .call_site_handle(call.1)
+            .resolve_durable_call(call)
+            .map_err(|error| self.discovery.refuse_locator(error))?
             .expect("a selected call belongs to its procedure");
         let answer = self.discovery.resolve_call(&site, request)?;
         let Some(target) = answer.available_value().and_then(|dispatch| {
@@ -3010,11 +3303,14 @@ impl crate::taint::compose::CompositionProvider for TypestateCompositionProvider
             let handoff = ordered.handoff;
             let formal = &candidate.arguments[handoff.binding.argument_index].1;
             let key = TypestateSummaryKey {
-                callee: candidate.procedure.clone(),
+                callee: self
+                    .discovery
+                    .selected_procedure(&candidate.procedure, request)?
+                    .exact_identity(),
                 formal: formal.clone(),
                 exit,
             };
-            let summary = self.callee_summary(key, request)?;
+            let summary = self.callee_summary(&candidate.procedure, key, request)?;
             complete &= summary.complete;
             for (function, quality) in summary.reaches {
                 let function = function.try_rewrite_guards(|guard| {
@@ -3099,6 +3395,197 @@ pub struct LocalDispatch<Function> {
     pub boundaries: Box<[DispatchBoundary]>,
 }
 
+/// Project independent source-root products through the existing worklist.
+/// Ordinary boundary/partial-flow products are neither replaced nor stored by
+/// this entry point. Each selected product contains only its certified seed.
+#[allow(clippy::too_many_arguments)]
+pub fn interior_source_root_products<C: InteriorProjectionClient>(
+    client: &C,
+    handle: ProcedureHandle,
+    snapshot: &ValueFlowSnapshot,
+    seeds: &[InteriorSeed],
+    observations: &[InteriorObservation],
+    witnesses: bool,
+    edge_kills: &[GuardEdgeKill],
+    execution_budget: &SemanticExecutionBudget,
+    request: &mut SemanticRequest<'_>,
+) -> Result<Vec<InteriorFlows>, C::Error> {
+    let partitions =
+        crate::value_flow::partition_source_roots(seeds.iter().map(|seed| match seed {
+            InteriorSeed::Source { selected_entry, .. } => selected_entry.clone(),
+            _ => None,
+        }));
+    let mut products = Vec::with_capacity(partitions.len());
+    for partition in partitions {
+        let selected_seeds = partition
+            .indices
+            .iter()
+            .map(|&index| seeds[index].clone())
+            .collect::<Vec<_>>();
+        let (root, snapshot) = match &partition.entry {
+            Some(entry) => {
+                let [
+                    InteriorSeed::Source {
+                        point,
+                        phase,
+                        carrier,
+                        ..
+                    },
+                ] = selected_seeds.as_slice()
+                else {
+                    unreachable!("selected products have one source root");
+                };
+                let root = entry.observation().point().procedure();
+                if root.durable_key() != handle.durable_key()
+                    || root
+                        .point_handle(*point)
+                        .is_none_or(|point| !entry.matches_source(&point, *phase, carrier))
+                {
+                    products.push(incomplete_interior(
+                        handle.clone(),
+                        "selected entry names another source root",
+                    ));
+                    continue;
+                }
+                entry.replay_reads(client.selected_entry_workspace());
+                (root.clone(), entry.selected_snapshot())
+            }
+            None => (handle.clone(), snapshot),
+        };
+        let mut product = interior_from_snapshot(
+            client,
+            root,
+            snapshot,
+            &selected_seeds,
+            observations,
+            witnesses,
+            edge_kills,
+            execution_budget,
+            request,
+        )?;
+        for flow in &mut product.flows {
+            flow.seed = partition.indices[flow.seed];
+        }
+        products.push(product);
+    }
+    Ok(products)
+}
+
+/// A legacy caller requesting one aggregate keeps all residual uncertainty.
+/// Root-aware callers consume the independent products without merging status.
+pub fn merge_interior_source_products(products: Vec<InteriorFlows>) -> InteriorFlows {
+    let mut products = products.into_iter();
+    let mut answer = products
+        .next()
+        .expect("source partitioning retains an ordinary empty root");
+    for product in products {
+        answer.flows.extend(product.flows);
+        if !matches!(product.completeness, Completeness::Complete) {
+            answer.completeness = product
+                .completeness
+                .preserving_operational_cause(&answer.completeness);
+        }
+    }
+    answer
+}
+
+/// A component explicitly produced by an admitted projected model. Keep its
+/// point-local selector evidence; native IR need not contain this component.
+/// Search and witness reconstruction use the same construction.
+pub(crate) fn projected_return_seed(
+    handle: &ProcedureHandle,
+    port: &PartialFlowPort,
+) -> Option<InteriorSeed> {
+    let PartialFlowPort::Heap {
+        root,
+        selectors,
+        tail,
+    } = port
+    else {
+        return None;
+    };
+    let PartialFlowPort::CallResult { call, ordinal } = root.as_ref() else {
+        return None;
+    };
+    let row = handle.semantics().call_site(*call)?;
+    let result = match ordinal {
+        None => row.result?,
+        Some(ordinal) => row.normal_result(*ordinal as usize)?,
+    };
+    let ControlContinuation::Target(point) = row.normal_continuation else {
+        return None;
+    };
+    let value = handle.value_handle(result).expect("a call result is live");
+    let origin = crate::value_flow::value_location(
+        &value,
+        crate::analyzer::semantic::OracleLimits::default(),
+    )
+    .ok()?;
+    let location = caller_read_location(handle, &origin, selectors, *tail);
+    Some(InteriorSeed::Source {
+        point,
+        phase: ValueFlowObservationPhase::AfterEffects,
+        carrier: ValueFlowCarrier::Location(Box::new(location)),
+        selected_entry: None,
+    })
+}
+
+fn implicit_read_seed_carriers(
+    handle: &ProcedureHandle,
+    snapshot: &ValueFlowSnapshot,
+    extra_seeds: &[ExtraSeed],
+    read: &crate::analyzer::semantic::AbstractLocation,
+    completeness: &mut Completeness,
+) -> Vec<(ValueFlowEndpoint, bool)> {
+    let mut seed_carriers = Vec::new();
+    for seed in extra_seeds {
+        if let ValueFlowEndpoint::Port(port) = &seed.carrier
+            && matches!(read.path().root(),
+                AccessPathRoot::ProcedurePort(root) | AccessPathRoot::CaptureSlot(root)
+                    if root == port)
+        {
+            seed_carriers.push((seed.carrier.clone(), false));
+            continue;
+        }
+        let value = match &seed.carrier {
+            ValueFlowEndpoint::Value(value) => Some(value.clone()),
+            ValueFlowEndpoint::Port(_) => handle
+                .semantics()
+                .values()
+                .iter()
+                .map(|value| {
+                    handle
+                        .value_handle(value.id)
+                        .expect("a procedure's semantic value is live")
+                })
+                .find(|value| ValueFlowEndpoint::for_value(value.clone()) == seed.carrier),
+            ValueFlowEndpoint::Location(_) => None,
+        };
+        let Some(value) = value else {
+            continue;
+        };
+        let seed_origins =
+            caller_content_locations(&value, snapshot, ValueFlowPlanLimits::default());
+        if !seed_origins.complete {
+            *completeness =
+                content_incomplete("the storage behind a taint source is not fully known")
+                    .preserving_operational_cause(completeness);
+        }
+        for seed_origin in &seed_origins.locations {
+            if exact_location_covers_read(&seed_origin.location, read) {
+                seed_carriers.push((
+                    seed.carrier.clone(),
+                    !seed_origins.complete
+                        || seed_origins.locations.len() > 1
+                        || !seed_origin.proven_complete,
+                ));
+                break;
+            }
+        }
+    }
+    seed_carriers
+}
+
 /// Project a local interior run, retaining all carrier and path uncertainty.
 #[allow(clippy::too_many_arguments)]
 pub fn interior_from_snapshot<C: InteriorProjectionClient>(
@@ -3122,6 +3609,7 @@ pub fn interior_from_snapshot<C: InteriorProjectionClient>(
                 point,
                 phase,
                 carrier,
+                ..
             } => Some(ExtraSeed {
                 point: *point,
                 phase: extra_phase(phase),
@@ -3242,58 +3730,13 @@ pub fn interior_from_snapshot<C: InteriorProjectionClient>(
                             location.tail,
                         )
                     {
-                        let mut seed_carriers = Vec::new();
-                        for seed in &extra_seeds {
-                            if let ValueFlowEndpoint::Port(port) = &seed.carrier
-                                && matches!(read.path().root(),
-                                        AccessPathRoot::ProcedurePort(root) | AccessPathRoot::CaptureSlot(root)
-                                            if root == port)
-                            {
-                                seed_carriers.push((seed.carrier.clone(), false));
-                                continue;
-                            }
-                            let value = match &seed.carrier {
-                                ValueFlowEndpoint::Value(value) => Some(value.clone()),
-                                ValueFlowEndpoint::Port(_) => handle
-                                    .semantics()
-                                    .values()
-                                    .iter()
-                                    .map(|value| {
-                                        handle
-                                            .value_handle(value.id)
-                                            .expect("a procedure's semantic value is live")
-                                    })
-                                    .find(|value| {
-                                        ValueFlowEndpoint::for_value(value.clone()) == seed.carrier
-                                    }),
-                                ValueFlowEndpoint::Location(_) => None,
-                            };
-                            let Some(value) = value else {
-                                continue;
-                            };
-                            let seed_origins = caller_content_locations(
-                                &value,
-                                snapshot,
-                                ValueFlowPlanLimits::default(),
-                            );
-                            if !seed_origins.complete {
-                                completeness = content_incomplete(
-                                    "the storage behind a taint source is not fully known",
-                                )
-                                .preserving_operational_cause(&completeness);
-                            }
-                            for seed_origin in &seed_origins.locations {
-                                if exact_location_covers_read(&seed_origin.location, &read) {
-                                    seed_carriers.push((
-                                        seed.carrier.clone(),
-                                        !seed_origins.complete
-                                            || seed_origins.locations.len() > 1
-                                            || !seed_origin.proven_complete,
-                                    ));
-                                    break;
-                                }
-                            }
-                        }
+                        let seed_carriers = implicit_read_seed_carriers(
+                            &handle,
+                            snapshot,
+                            &extra_seeds,
+                            &read,
+                            &mut completeness,
+                        );
                         extra_observations.push(ExtraObservation {
                             point: site.point,
                             phase: ExtraPhase::BeforeEffects,
@@ -3309,12 +3752,35 @@ pub fn interior_from_snapshot<C: InteriorProjectionClient>(
                             seed_carriers,
                         });
                     }
-                    let carriers = caller_location_carriers(
+                    let mut carriers = caller_location_carriers(
                         snapshot,
                         &origin.location,
                         &location.selectors,
                         location.tail,
                     );
+                    let read = caller_read_location(
+                        &handle,
+                        &origin.location,
+                        &location.selectors,
+                        location.tail,
+                    );
+                    if !read.path().is_exact() {
+                        // An authored Element read may have no native snapshot
+                        // carrier. Observe that same uncertain location without
+                        // manufacturing a source or exact prefix coverage.
+                        let endpoint = ValueFlowEndpoint::Location(Box::new(read));
+                        carriers.retain(|carrier| carrier != &endpoint);
+                        extra_observations.push(ExtraObservation {
+                            point: site.point,
+                            phase: ExtraPhase::BeforeEffects,
+                            carrier: endpoint,
+                        });
+                        observation_of_extra.push((index, true));
+                        completeness = content_incomplete(
+                            "a summarized caller-side element observation is uncertain",
+                        )
+                        .preserving_operational_cause(&completeness);
+                    }
                     if carriers.is_empty() && !bound_by_implicit_read {
                         let actual_endpoint = ValueFlowEndpoint::for_value(actual.clone());
                         let copied_actual = snapshot.relations().iter().any(|relation| {
@@ -3336,16 +3802,166 @@ pub fn interior_from_snapshot<C: InteriorProjectionClient>(
                         }
                     }
                     for carrier in carriers {
+                        let uncertain = several
+                            || !origin.proven_complete
+                            || matches!(&carrier, ValueFlowEndpoint::Location(location) if !location.path().is_exact());
                         extra_observations.push(ExtraObservation {
                             point: site.point,
                             phase: ExtraPhase::BeforeEffects,
                             carrier,
                         });
-                        observation_of_extra.push((index, several || !origin.proven_complete));
+                        observation_of_extra.push((index, uncertain));
                     }
                 }
             }
         }
+    }
+    if client.implicit_heap_reads() {
+        let mut known_reads = implicit_reads
+            .iter()
+            .map(|read| read.location.clone())
+            .collect::<HashSet<_>>();
+        for selected in &snapshot.payload_projection().replacements {
+            for relation in &selected.relations {
+                let ValueFlowEndpoint::Location(location) = &relation.source else {
+                    continue;
+                };
+                if !known_reads.insert(location.as_ref().clone()) {
+                    continue;
+                }
+                let seed_carriers = implicit_read_seed_carriers(
+                    &handle,
+                    snapshot,
+                    &extra_seeds,
+                    location,
+                    &mut completeness,
+                );
+                implicit_reads.push(ImplicitHeapRead {
+                    location: location.as_ref().clone(),
+                    seed_carriers,
+                });
+            }
+        }
+    }
+    let value_obligations = handle
+        .semantics()
+        .logical_gaps()
+        .filter(|gap| {
+            gap.base.discharge == crate::analyzer::semantic::SemanticGapDischarge::DataDependency
+        })
+        .collect::<Vec<_>>();
+    let has_interference = handle.semantics().points().iter().any(|point| {
+        point.events.iter().any(|event| {
+            event.effect == crate::analyzer::semantic::SemanticEffect::MemoryInterference
+        })
+    });
+    let call_dependency_edges =
+        handle
+            .semantics()
+            .call_sites()
+            .iter()
+            .fold(0usize, |count, call| {
+                count
+                    .saturating_add(call.arguments.len())
+                    .saturating_add(call.normal_result_values().count())
+                    .saturating_add(2)
+            });
+    let dependency_work = crate::analyzer::semantic::SemanticWork {
+        events: snapshot
+            .relations()
+            .len()
+            .saturating_add(call_dependency_edges)
+            .saturating_mul(4),
+        values: handle.semantics().values().len(),
+        control_edges: handle.semantics().control_edges().len(),
+        nested_entries: snapshot
+            .relations()
+            .len()
+            .saturating_add(call_dependency_edges)
+            .saturating_mul(4)
+            .saturating_add(handle.semantics().values().len()),
+        ..Default::default()
+    };
+    let dependency_requested = !value_obligations.is_empty() || has_interference;
+    let dependency_admitted = !dependency_requested
+        || (!request.cancellation.is_cancelled()
+            && request.budget.admit(dependency_work).is_ok()
+            && request.charge_execution_traversal(
+                dependency_work
+                    .events
+                    .saturating_add(dependency_work.values)
+                    .saturating_add(dependency_work.control_edges),
+            ));
+    if dependency_requested && !dependency_admitted {
+        completeness = Completeness::operational(
+            if request.cancellation.is_cancelled() {
+                OperationalCause::Cancelled
+            } else {
+                OperationalCause::Budget(BudgetLane::Semantic)
+            },
+            "requested dependency accounting did not finish",
+        )
+        .preserving_operational_cause(&completeness);
+    }
+    if dependency_requested && dependency_admitted {
+        let roots = extra_seeds
+            .iter()
+            .map(|seed| crate::value_flow::ValueFlowCarrier::from(&seed.carrier))
+            .chain(extra_observations.iter().map(|observation| {
+                crate::value_flow::ValueFlowCarrier::from(&observation.carrier)
+            }));
+        let dependencies = crate::value_flow::snapshot_data_dependencies(snapshot, roots);
+        for obligation in &value_obligations {
+            if let crate::analyzer::semantic::SemanticGapSubject::Value(value) =
+                obligation.subject()
+                && handle.value_handle(value).is_some_and(|value| {
+                    dependencies.contains(&crate::value_flow::ValueFlowCarrier::for_value(value))
+                })
+            {
+                completeness =
+                    content_incomplete("requested data depends on a withheld value producer")
+                        .preserving_operational_cause(&completeness);
+            }
+        }
+        if has_interference {
+            let ownership =
+                crate::analyzer::semantic::workspace_oracle::MemoryInterferenceOwnership::new(
+                    &handle,
+                );
+            let affected =
+                crate::analyzer::semantic::workspace_oracle::memory_interference_successors(
+                    handle.semantics(),
+                );
+            let prefix = |point: ProgramPointId| {
+                handle.semantics().point(point).is_some_and(|point| {
+                    point.events.first().is_some_and(|event| {
+                        event.effect
+                            == crate::analyzer::semantic::SemanticEffect::MemoryInterference
+                    })
+                })
+            };
+            let unknown_read =
+                crate::value_flow::snapshot_has_unknown_memory_dependency(snapshot, &dependencies)
+                    || extra_observations.iter().any(|observation| {
+                        let ValueFlowEndpoint::Location(location) = &observation.carrier else {
+                            return false;
+                        };
+                        (affected.contains(&observation.point)
+                            || (observation.phase == ExtraPhase::AfterEffects
+                                && prefix(observation.point)))
+                            && ownership.may_modify(location)
+                    });
+            if unknown_read {
+                completeness =
+                    content_incomplete("MemoryInterference leaves requested shared memory unknown")
+                        .preserving_operational_cause(&completeness);
+            }
+        }
+        let keys = value_obligations
+            .iter()
+            .map(|gap| gap.key())
+            .collect::<Vec<_>>();
+        client.record_value_obligation_accounting(&handle, &keys, request);
     }
     let mut fixpoint_request = request.staged_with_execution_budget(execution_budget);
     let ExtendedPartialFlows { partial, flows } = client.run_interior_fixpoint(
@@ -3516,7 +4132,8 @@ where
     C: LocalOpennessClient<D>,
 {
     let _timing = brokk_bifrost_analysis::profiling::scope("taint.compose.openness");
-    let handle = discovery.procedure(procedure, request)?;
+    let handle = discovery.selected_procedure(procedure, request)?;
+    let procedure = &handle.durable_key();
     // The ICFG engine blocks a snapshot with an unproven relation before
     // it classifies any gap (`classify_snapshot_openness`), and a gap sweep
     // cannot see the relation. The head's fact answers it from the
@@ -3528,8 +4145,8 @@ where
     // on this path only. The workspace snapshot reads cross-file hooks and
     // describes a different derivation from the one that opened the
     // procedure (#10400).
-    let head = client.relations_head(procedure, request)?;
-    if !head.relations_proven() {
+    let head = client.relations_head(&handle.durable_key(), request)?;
+    let relation = if !head.relations_proven() {
         let outcome = file_local_procedure_relations(&handle, &OracleCallContext::empty(), request)
             .map_err(|error| discovery.provider_error(error.to_string()))?;
         let status = SemanticInputStatus::from_outcome(&outcome);
@@ -3547,42 +4164,55 @@ where
             || outcome
                 .available_value()
                 .is_some_and(|snapshot| snapshot.coverage() == CandidateCoverage::Truncated);
-        return Ok(Openness::Open {
-            residual: Box::default(),
-            residual_causes: Box::default(),
-            cause: file_local_promotion_cause(head.outcome, status, budget_limited),
-            blocked: None,
+        Some((
             status,
-            reason: "the procedure has incomplete boundary member coverage".into(),
-        });
-    }
-    let sweep = client.openness_sweep(procedure, &handle, request)?;
-    if !sweep.open {
+            file_local_promotion_cause(head.outcome, status, budget_limited),
+        ))
+    } else {
+        None
+    };
+    let sweep = client.openness_sweep(&handle, request)?;
+    if !sweep.open && relation.is_none() {
         return Ok(Openness::Closed);
     }
     if sweep.relevant_gaps.is_empty() {
-        // The procedure is open with no gap to refine: a value-flow
-        // capability or a Go builtin assumption. No dispatch answers it.
-        let status = snapshot_status(discovery, &handle, request)?;
+        // Preserve an unproven relation independently of gaps the workspace
+        // can refine. Otherwise this is the existing capability/builtin gap.
+        let status = match relation {
+            Some((status, _)) => status,
+            None => snapshot_status(discovery, &handle, request)?,
+        };
         return Ok(Openness::Open {
             residual: Box::default(),
             residual_causes: Box::default(),
-            cause: status_cause(status),
+            relation_cause: relation.map(|(_, cause)| cause),
+            cause: relation.map_or_else(|| status_cause(status), |(_, cause)| cause),
             blocked: None,
             status,
-            reason: "a value-flow capability or builtin assumption keeps the procedure open".into(),
+            reason: "a local relation, value-flow capability or builtin assumption keeps the procedure open".into(),
         });
     }
     let abort_user_code = abort_paths_run_user_code(handle.semantics());
     let mut answered: HashMap<CallSiteId, Option<IncompleteCause>> = HashMap::new();
     let mut residual: Vec<DurableCallSiteKey> = Vec::new();
     let mut residual_causes = Vec::new();
-    let mut blocked: Vec<(SemanticGapId, SemanticCapability)> = Vec::new();
+    let mut blocked: Vec<(crate::analyzer::semantic::GapKey, SemanticCapability)> = Vec::new();
+    // Whether the sweep named a gap this handle's procedure does not have.
+    // Then the sweep read another interpretation of the procedure (#11842):
+    // no gap can be named, and the sweep's answer cannot be trusted to be
+    // closed, so the procedure stays open (#11826). The other gaps are still
+    // classified, so their residual calls and causes are reported as usual.
+    let mut foreign_gap = false;
     for gap_id in &sweep.relevant_gaps {
-        let gap = handle
-            .semantics()
-            .gap(*gap_id)
-            .expect("a relevant gap is a gap of its procedure");
+        let Some(gap) = handle.semantics().logical_gap(*gap_id) else {
+            foreign_gap = true;
+            continue;
+        };
+        if gap.base.discharge == crate::analyzer::semantic::SemanticGapDischarge::DataDependency
+            && client.value_obligation_accounted(&handle, *gap_id)
+        {
+            continue;
+        }
         match classify_gap_openness(handle.semantics(), gap, abort_user_code) {
             GapOpenness::RefinementCall(call) => {
                 let cause = match answered.get(&call) {
@@ -3606,34 +4236,53 @@ where
                     residual_causes.push(cause);
                 }
             }
-            GapOpenness::Blocked => blocked.push((*gap_id, gap.capability)),
-            GapOpenness::Irrelevant | GapOpenness::Discharged => unreachable!(
-                "the gap sweep keeps a gap open only when classification leaves it: {gap:?}"
-            ),
+            // The sweep is the workspace host's answer (memoized, possibly
+            // under another handle of the procedure) and kept this gap open;
+            // the local classification here reads only the procedure's own
+            // semantics. Both apply the same value-flow test, so they agree
+            // when they read the same semantics. A real run disagreed on the
+            // Rust lowering's unmodeled-Drop `Calls` gap and crashed the
+            // whole analysis here (#11826); why the sweep read other
+            // semantics is #11842. A gap that no complete dispatch answers is
+            // an unanswered gap: fail closed and name it, as a Blocked gap is
+            // named.
+            GapOpenness::Blocked | GapOpenness::Irrelevant | GapOpenness::Discharged => {
+                blocked.push((*gap_id, gap.base.capability))
+            }
         }
     }
-    if residual.is_empty() && blocked.is_empty() {
+    if residual.is_empty() && blocked.is_empty() && relation.is_none() && !foreign_gap {
         return Ok(Openness::Closed);
     }
     // Durable call keys include workspace identity. Keep the explanatory text
     // independent of the mount while the typed fields retain the exact sites.
-    let reason = "residual calls or blocked gaps keep the procedure open";
+    let reason = if foreign_gap {
+        "the workspace gap sweep named a gap this procedure interpretation lacks"
+    } else {
+        "unproven local relations, residual calls or blocked gaps keep the procedure open"
+    };
     // A blocked gap decides the diagnostic even when residual calls
     // remain: the ICFG engine's plan returns its blocked gap whenever one
     // exists in the procedure (`classify_snapshot_openness`).
     let blocked = blocked.first().map(|(gap, capability)| BlockedGap {
         gap: handle
-            .gap_handle(*gap)
+            .logical_gap_handle(*gap)
             .expect("a blocked gap is a gap of its procedure"),
         capability: *capability,
     });
-    let status = snapshot_status(discovery, &handle, request)?;
-    let cause = if residual_causes
+    let status = match relation {
+        Some((status, _)) => status,
+        None => snapshot_status(discovery, &handle, request)?,
+    };
+    let relation_cause = relation.map(|(_, cause)| cause);
+    let cause = if relation_cause
         .iter()
+        .chain(residual_causes.iter())
         .any(|cause| matches!(cause, IncompleteCause::Operational(_)))
     {
-        residual_causes
+        relation_cause
             .iter()
+            .chain(residual_causes.iter())
             .copied()
             .find(|cause| matches!(cause, IncompleteCause::Operational(_)))
             .expect("checked operational residual")
@@ -3643,6 +4292,7 @@ where
     Ok(Openness::Open {
         residual: residual.into_boxed_slice(),
         residual_causes: residual_causes.into_boxed_slice(),
+        relation_cause,
         cause,
         blocked,
         status,
@@ -3676,16 +4326,31 @@ fn file_local_promotion_cause(
         PartialFlowOutcome::Error => Some(IncompleteCause::Operational(OperationalCause::Provider)),
         PartialFlowOutcome::Complete => None,
     };
-    let instability = |cause: &IncompleteCause| match cause {
-        IncompleteCause::Content => 0,
-        IncompleteCause::Operational(OperationalCause::Budget(_)) => 1,
-        IncompleteCause::Operational(OperationalCause::Provider) => 2,
-        IncompleteCause::Operational(OperationalCause::Cancelled) => 3,
+    let causes = head.into_iter().chain([projection]);
+    // Whether the promotion depends on execution is the reuse-verdict join.
+    // Its two execution causes do not yet rank provider errors above budget
+    // stops, so the less stable operational stop is chosen here.
+    let verdict = causes
+        .clone()
+        .fold(ReuseVerdict::Content, |verdict, cause| {
+            verdict.join(cause.reuse_verdict())
+        });
+    if verdict.is_content() {
+        return IncompleteCause::Content;
+    }
+    let instability = |stop: &OperationalCause| match stop {
+        OperationalCause::Budget(_) => 0,
+        OperationalCause::Provider => 1,
+        OperationalCause::Cancelled => 2,
     };
-    head.into_iter()
-        .chain([projection])
+    causes
+        .filter_map(|cause| match cause {
+            IncompleteCause::Operational(stop) => Some(stop),
+            IncompleteCause::Content => None,
+        })
         .max_by_key(instability)
-        .expect("the projection always contributes a cause")
+        .map(IncompleteCause::Operational)
+        .expect("an execution-dependent verdict has an operational cause")
 }
 
 // Preserve the existing classification outside incomplete-relation promotion.
@@ -3745,10 +4410,11 @@ pub fn refinement_calls(
     let mut calls = Vec::new();
     let mut seen = HashSet::new();
     for gap_id in &sweep.relevant_gaps {
-        let gap = handle
-            .semantics()
-            .gap(*gap_id)
-            .expect("a relevant gap is a gap of its procedure");
+        // A gap this handle lacks is reported by `decide_openness`, which
+        // reads the same sweep; there is no call to prefetch for it.
+        let Some(gap) = handle.semantics().logical_gap(*gap_id) else {
+            continue;
+        };
         let GapOpenness::RefinementCall(call) =
             classify_gap_openness(handle.semantics(), gap, abort_user_code)
         else {
@@ -3780,8 +4446,10 @@ where
         handle: call_handle,
         answer,
     } = raw;
-    let handle = call_handle.procedure().clone();
     let call = call_handle.durable_key();
+    discovery.locator_procedure(&call.0, request)?;
+    // Keep the exact selected caller that owns the raw dispatch's oracle arena.
+    let handle = call_handle.procedure().clone();
     let result = answer.available_value();
     let status = SemanticInputStatus::from_outcome(&answer);
     let mut coverage = result.map_or_else(
@@ -3794,7 +4462,19 @@ where
     let conversion = discovery.call_conversion_may_run_user_code(&call_handle, &answer, request)?;
     discovery.require_outcome(&conversion, "argument conversion effects")?;
     let conversion_open = conversion.available_value().copied().unwrap_or(true);
-    let decision = models.dispatch_model(&call_handle, &answer)?;
+    let output = discovery.payload_constructor_output(&call_handle, request)?;
+    let mut decision = models.dispatch_model(&call_handle, &answer)?;
+    if let Some(Some(endpoint)) = output.available_value()
+        && let Some(model) = decision.model.as_mut()
+    {
+        let output = crate::analyzer::semantic::partial_flow::ports::port_of_endpoint(endpoint)
+            .expect("a constructor payload is a call-result member");
+        model.endpoint_projections = true;
+        for transfer in &mut model.transfers {
+            transfer.output = output.clone();
+            transfer.preserves_member_contents = true;
+        }
+    }
     let continuation = if conversion_open {
         HopQuality::new(decision.continuation.proven, false)
     } else {
@@ -3811,6 +4491,9 @@ where
                 transfer.output,
                 PartialFlowPort::CallReceiver { .. } | PartialFlowPort::CallArgument { .. }
             ) || matches!(transfer.actual, PartialFlowPort::CallReceiver { .. })
+                || (model.endpoint_projections && [&transfer.actual, &transfer.output].iter().any(|port|
+                    matches!(port, PartialFlowPort::Heap { root, .. } if matches!(root.as_ref(),
+                        PartialFlowPort::CallReceiver { .. } | PartialFlowPort::CallArgument { .. }))))
         }) {
             let snapshot =
                 discovery.procedure_snapshot(&handle, &OracleCallContext::empty(), request)?;
@@ -3823,6 +4506,10 @@ where
                 .expect("a modeled call belongs to its procedure");
             let mut writeback = Vec::new();
             for output in model.transfers.iter().map(|transfer| &transfer.output) {
+                let output = match output {
+                    PartialFlowPort::Heap { root, .. } if model.endpoint_projections => root.as_ref(),
+                    output => output,
+                };
                 if writeback
                     .iter()
                     .any(|binding: &WritebackBinding| &binding.actual == output)
@@ -3899,13 +4586,32 @@ where
                 });
             }
             model.writeback = writeback.into_boxed_slice();
-            if model
-                .transfers
-                .iter()
-                .any(|transfer| matches!(transfer.actual, PartialFlowPort::CallReceiver { .. }))
-            {
-                let port = PartialFlowPort::CallReceiver { call: call.1 };
-                let actual = row.receiver.and_then(|value| handle.value_handle(value));
+            let mut read_ports = Vec::new();
+            for transfer in &model.transfers {
+                let port = match &transfer.actual {
+                    port @ PartialFlowPort::CallReceiver { .. } => Some(port),
+                    PartialFlowPort::Heap { root, .. }
+                        if model.endpoint_projections
+                            && matches!(
+                                root.as_ref(),
+                                PartialFlowPort::CallReceiver { .. }
+                                    | PartialFlowPort::CallArgument { .. }
+                            ) =>
+                    {
+                        Some(root.as_ref())
+                    }
+                    _ => None,
+                };
+                if let Some(port) = port
+                    && !read_ports.contains(port)
+                {
+                    read_ports.push(port.clone());
+                }
+            }
+            let mut receiver_reads = Vec::new();
+            for port in read_ports {
+                let actual =
+                    call_input_value(row, &port).and_then(|value| handle.value_handle(value));
                 if let Some(actual) = actual {
                     let actual = CallArgumentEndpoint::Value(actual);
                     let sharing = snapshot.available_value().zip(index.as_ref()).map_or(
@@ -3921,7 +4627,11 @@ where
                         },
                     );
                     let storage = snapshot.available_value().map(|snapshot| {
-                        caller_storage_locations(&actual, snapshot, ValueFlowPlanLimits::default())
+                        if model.endpoint_projections {
+                            caller_content_locations(actual.value(), snapshot, ValueFlowPlanLimits::default())
+                        } else {
+                            caller_storage_locations(&actual, snapshot, ValueFlowPlanLimits::default())
+                        }
                     });
                     let complete = storage.as_ref().is_some_and(|storage| storage.complete);
                     let locations = storage
@@ -3940,7 +4650,7 @@ where
                         )
                         .preserving_operational_cause(&model.completeness);
                     }
-                    model.receiver_reads = vec![WritebackBinding {
+                    receiver_reads.push(WritebackBinding {
                         actual: port.clone(),
                         formal: port,
                         shares_storage: sharing,
@@ -3950,14 +4660,14 @@ where
                         proven: true,
                         complete,
                         storage: locations.into_boxed_slice(),
-                    }]
-                    .into_boxed_slice();
+                    });
                 } else {
                     model.completeness =
                         Completeness::content("a model receiver input has no caller storage value")
                             .preserving_operational_cause(&model.completeness);
                 }
             }
+            model.receiver_reads = receiver_reads.into_boxed_slice();
         }
         if model.retains_dispatch {
             retained_model = Some(model);
@@ -4042,6 +4752,15 @@ where
         .available_value()
         .map(CallStorageRelationIndex::new);
     for candidate in result.candidates() {
+        let selected = discovery.selected_procedure_handle(candidate.target(), request)?;
+        let candidate = crate::analyzer::semantic::service::reseal_selected_candidate(
+            candidate,
+            &call_handle,
+            &selected,
+            crate::analyzer::semantic::OracleLimits::default(),
+        )
+        .map_err(|error| discovery.unavailable(error.to_string()))?;
+        let candidate = &candidate;
         let callee_snapshot = discovery.procedure_snapshot(
             candidate.target(),
             &OracleCallContext::empty(),
@@ -4057,6 +4776,39 @@ where
         bindings.push(BindingCoverage::Answered {
             status: SemanticInputStatus::from_outcome(&outcome),
         });
+        if candidate.target().semantics().properties().invocation
+            == crate::analyzer::semantic::ProcedureInvocationKind::DeferredBody
+        {
+            // Construction names the body but cannot enter its formal, heap,
+            // or return ports without an activation certificate. Keep the
+            // native binding refusal visible even when it has no retained rows.
+            completeness = completeness_from_outcome(
+                &outcome,
+                "async body caller effects remain deferred until activation",
+            )
+            .preserving_operational_cause(&completeness);
+            continue;
+        }
+        // The mapping-quality check is intentionally unreachable for DeferredBody.
+        // Each retained mapping becomes an actual/formal dependence edge.
+        // Partial mapping or conversion evidence must travel with those
+        // edges. Whole-binding openness from other evaluation/return gaps
+        // belongs to the existing procedure-openness checks instead.
+        if outcome.available_value().is_some_and(|bindings| {
+            bindings.bindings().iter().any(|binding| match binding {
+                CallBinding::ArgumentGroup(group) => group.mappings().iter().any(|mapping| {
+                    mapping.completeness() != &EvidenceCompleteness::Complete
+                        || matches!(mapping.value().conversion(), Some(Err(_)))
+                }),
+                _ => false,
+            })
+        }) {
+            completeness = completeness_from_outcome(
+                &outcome,
+                "a selected argument mapping has incomplete conversion or binding evidence",
+            )
+            .preserving_operational_cause(&completeness);
+        }
         let composed = outcome
             .available_value()
             .ok_or_else(|| "the call bindings have no answer".to_owned())
@@ -4080,7 +4832,7 @@ where
                 ) && (!callee_rows.relations_proven()
                     || !returned_members_bound(
                         &callee_rows.ports,
-                        &caller_rows.ports,
+                        &caller_rows,
                         &composed.returns,
                         |field| {
                             models.canonical_returned_field(
@@ -4122,14 +4874,41 @@ where
     })
 }
 
+/// A whole-value boundary relation consumes every returned member. This includes
+/// returns, arguments, heap stores and captures; unfamiliar destinations also
+/// demand all members. Member-only reads are checked separately below.
+/// Local aliases need no raw snapshot walk: an alias can affect the answer
+/// through a retained boundary relation, or through an explicit member read
+/// checked below. A local alias with neither use is not a demand. Unproven
+/// caller relations cannot exclude whole uses and therefore demand all members.
+fn caller_whole_value_demands(caller: &ProcedurePartialFlows) -> HashSet<&PartialFlowPort> {
+    caller
+        .flows
+        .iter()
+        .filter_map(|flow| {
+            let source = caller
+                .ports
+                .get(flow.from.index())
+                .expect("a relation source belongs to its port table");
+            let target = caller
+                .ports
+                .get(flow.to.index())
+                .expect("a relation target belongs to its port table");
+            (source != target).then_some(source)
+        })
+        .collect()
+}
+
 fn returned_members_bound(
     callee_ports: &[PartialFlowPort],
-    caller_ports: &[PartialFlowPort],
+    caller: &ProcedurePartialFlows,
     returns: &[(PartialFlowPort, PartialFlowPort)],
     mut canonical_field: impl FnMut(
         &crate::analyzer::semantic::SemanticLocator,
     ) -> Option<crate::analyzer::semantic::SemanticLocator>,
 ) -> bool {
+    let caller_ports = &caller.ports;
+    let whole_demands = caller_whole_value_demands(caller);
     let callee_covered = callee_ports.iter().all(|port| {
         let PartialFlowPort::Heap { root, .. } = port else {
             return true;
@@ -4142,15 +4921,16 @@ fn returned_members_bound(
         }
         returns.iter().any(|(returned, result)| {
             returned == root.as_ref()
-                && caller_ports.iter().any(|caller| {
-                    bound_return_member_matches(
-                        caller,
-                        port,
-                        result,
-                        returned,
-                        &mut canonical_field,
-                    )
-                })
+                && ((caller.relations_proven() && !whole_demands.contains(result))
+                    || caller_ports.iter().any(|caller| {
+                        bound_return_member_matches(
+                            caller,
+                            port,
+                            result,
+                            returned,
+                            &mut canonical_field,
+                        )
+                    }))
         })
     });
     callee_covered
@@ -4214,15 +4994,20 @@ pub fn project_partial_flows<D: LocalTransferDiscovery>(
 }
 
 /// The semantic calls at one source range. One range can name several calls.
-pub fn matching_calls(
+pub fn matching_calls<D: LocalTransferDiscovery>(
+    discovery: &D,
     caller: &Arc<SemanticArtifact>,
     range: (usize, usize),
-) -> Vec<(ProcedureHandle, CallSiteHandle)> {
+    request: &mut SemanticRequest<'_>,
+) -> Result<Vec<(ProcedureHandle, CallSiteHandle)>, D::Error> {
     let mut matched = Vec::new();
     for procedure in caller.procedures() {
-        let Some(handle) = caller.procedure_handle(procedure.id()) else {
-            continue;
-        };
+        // Enumerate structural procedure IDs, then inspect only the selected body.
+        let base = caller
+            .procedure_handle(procedure.id())
+            .expect("enumerated procedure");
+        let handle = discovery.selected_procedure_handle(&base, request)?;
+        let procedure = handle.semantics();
         for row in procedure.call_sites() {
             let Some(mapping) = procedure.source_mapping(row.source) else {
                 continue;
@@ -4236,7 +5021,7 @@ pub fn matching_calls(
             }
         }
     }
-    matched
+    Ok(matched)
 }
 
 /// Call inputs and the singular result and thrown output used by the ICFG fallback.
@@ -4834,7 +5619,7 @@ where
     F: FnMut(&CallSiteHandle, &SemanticOutcome<DispatchResult>) -> Result<bool, D::Error>,
 {
     let _timing = brokk_bifrost_analysis::profiling::scope("taint.compose.callers");
-    let handle = discovery.procedure(procedure, request)?;
+    let handle = discovery.selected_procedure(procedure, request)?;
     let workspace = discovery.workspace();
     let analyzer = workspace.analyzer();
     let Some(file) = file_for_locator(workspace, handle.semantics().locator()) else {
@@ -4948,7 +5733,12 @@ where
                     .preserving_operational_cause(&completeness);
             continue;
         };
-        let matched = matching_calls(&caller, (site.range.start_byte, site.range.end_byte));
+        let matched = matching_calls(
+            discovery,
+            &caller,
+            (site.range.start_byte, site.range.end_byte),
+            request,
+        )?;
         if matched.is_empty() {
             completeness = content_incomplete("an incoming call site has no semantic call")
                 .preserving_operational_cause(&completeness);
@@ -4963,10 +5753,11 @@ where
                 .preserving_operational_cause(&completeness);
                 continue;
             };
-            let confirmed = result
-                .candidates()
-                .iter()
-                .any(|candidate| candidate.target().durable_key() == target_key);
+            let mut confirmed = false;
+            for candidate in result.candidates() {
+                let selected = discovery.selected_procedure_handle(candidate.target(), request)?;
+                confirmed |= selected.durable_key() == target_key;
+            }
             if confirmed {
                 let key = (caller_handle.durable_key(), call_handle.id());
                 if seen.insert(key.clone()) {
@@ -5059,6 +5850,7 @@ mod activation_tests {
             ) -> Result<CallModelDecision<()>, Self::Error> {
                 Ok(CallModelDecision {
                     model: Some(CallModel {
+                        endpoint_projections: false,
                         summary: None,
                         summary_target: None,
                         transfers: Vec::new(),
@@ -5158,6 +5950,148 @@ pub fn run(w: &W) { sink(w); }
                 .completeness,
             Completeness::Complete
         ));
+    }
+
+    /// A client whose workspace sweep names these gaps as relevant, as the
+    /// panicking runs' sweeps did, while the head's relations are proven.
+    struct SweepNamesGap(Vec<crate::analyzer::semantic::GapKey>);
+    impl LocalOpennessClient<WorkspaceCompositionDiscovery<'_>> for SweepNamesGap {
+        fn relations_head(
+            &self,
+            _procedure: &DurableProcedureKey,
+            _request: &mut SemanticRequest<'_>,
+        ) -> Result<Arc<ProcedurePartialFlows>, SemanticProviderError> {
+            Ok(Arc::new(ProcedurePartialFlows::new(
+                PartialFlowOutcome::Complete,
+                None,
+                Vec::new(),
+                Vec::new(),
+                false,
+                true,
+                Vec::new(),
+            )))
+        }
+        fn openness_sweep(
+            &self,
+            _handle: &ProcedureHandle,
+            _request: &mut SemanticRequest<'_>,
+        ) -> Result<ProcedureOpenness, SemanticProviderError> {
+            Ok(ProcedureOpenness {
+                open: true,
+                relevant_gaps: self.0.clone(),
+            })
+        }
+        fn dispatch_completeness(
+            &self,
+            _call: &DurableCallSiteKey,
+            _request: &mut SemanticRequest<'_>,
+        ) -> Result<Completeness, SemanticProviderError> {
+            unimplemented!("a gap with no refinement call needs no dispatch")
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#11826+#11842: a swept implicit-Drop gap the handle discards, or a swept gap it lacks, panicked"
+    )]
+    fn a_swept_implicit_drop_gap_leaves_the_procedure_open_without_panicking() {
+        let project = crate::inline_project::InlineTestProject::with_language(
+            crate::analyzer::Language::Rust,
+        )
+        .file(
+            "main.rs",
+            r#"
+struct Guard(u32);
+impl Drop for Guard {
+    fn drop(&mut self) {}
+}
+fn sink(_text: &str) {}
+pub fn scoped(password: &str) {
+    let _guard = Guard(1);
+    sink(password);
+}
+"#,
+        )
+        .build();
+        let workspace = project.workspace_analyzer(crate::analyzer::AnalyzerConfig::default());
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let mut request = SemanticRequest::new(&mut budget, &cancellation);
+        let artifact = workspace
+            .materialize_program_semantics(&project.file("main.rs"), &mut request)
+            .expect("semantics")
+            .available_value()
+            .cloned()
+            .expect("artifact");
+        let scoped = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some("scoped")
+            })
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .expect("scoped");
+        let drop_gap = scoped
+            .semantics()
+            .logical_gaps()
+            .find(|gap| {
+                gap.base.capability == SemanticCapability::Calls
+                    && gap
+                        .base
+                        .detail
+                        .contains("implicit Drop::drop invocations are not emitted")
+            })
+            .expect("the lowering emits the unmodeled-Drop Calls gap");
+        assert!(
+            !crate::analyzer::semantic::workspace_oracle::gap_impacts_value_flow(drop_gap.base),
+            "the gap has no value-flow impact, so local classification leaves it out"
+        );
+        let discovery = WorkspaceCompositionDiscovery::new(
+            &workspace,
+            WorkspaceValueFlowProvider::new(&workspace, ValueFlowCache::default()),
+        );
+        // The procedure has no gap with this id, as in the log-injection run
+        // whose sweep named a gap the handle lacked.
+        let foreign = crate::analyzer::semantic::GapKey::Gap(
+            crate::analyzer::semantic::SemanticGapId::new(1_000_000),
+        );
+        assert!(scoped.semantics().logical_gap(foreign).is_none());
+        let mut decide = |gaps: Vec<crate::analyzer::semantic::GapKey>| {
+            decide_openness(
+                &discovery,
+                &SweepNamesGap(gaps),
+                &scoped.durable_key(),
+                &mut request,
+            )
+            .expect("a swept gap the handle discards or lacks is not an error")
+        };
+
+        for gaps in [vec![drop_gap.key()], vec![drop_gap.key(), foreign]] {
+            let openness = decide(gaps.clone());
+            let Openness::Open {
+                blocked: Some(blocked),
+                ..
+            } = &openness
+            else {
+                panic!("the procedure stays open and names the gap for {gaps:?}: {openness:?}");
+            };
+            assert_eq!(blocked.capability, SemanticCapability::Calls);
+            assert_eq!(blocked.gap.id(), drop_gap.key());
+        }
+        let openness = decide(vec![foreign]);
+        assert!(
+            matches!(
+                &openness,
+                Openness::Open { blocked: None, reason, .. } if reason.contains("lacks")
+            ),
+            "a gap the handle lacks keeps the procedure open: {openness:?}"
+        );
     }
 
     #[test]
@@ -5588,6 +6522,945 @@ mod memo_receipt_tests {
     use crate::inline_project::InlineTestProject;
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11234: composition memo hits lost typed incompleteness of an incomplete head"
+    )]
+    fn unit_partial_flow_memo_completion_conformance() {
+        use crate::analyzer::semantic::ValueFlowOracle;
+        use crate::analyzer::semantic::{CancellationToken, SemanticBudget};
+        use crate::analyzer::usages::common::{
+            QueryMemoOwner, assert_memo_owner_conformance_for_test,
+        };
+        use crate::value_flow::{
+            ValueFlowCache, ValueFlowEventKey, ValueFlowEventKind, ValueFlowInput,
+            ValueFlowSinkSpec, ValueFlowSourceSpec,
+        };
+        for (source, incomplete) in [
+            ("pub fn subject(input: u8) -> u8 { input }", false),
+            (
+                "pub unsafe fn subject(ptr: *mut u8, input: u8) -> u8 { unsafe { *ptr = input; } input }",
+                true,
+            ),
+        ] {
+            let project = InlineTestProject::with_language(Language::Rust)
+                .file(
+                    "Cargo.toml",
+                    "[package]\nname=\"memo-head\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+                )
+                .file(
+                    "src/lib.rs",
+                    format!("{source}\npub fn plan_root(input: u8) -> u8 {{ input }}"),
+                )
+                .build();
+            let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+            let _scope = AnalyzerQueryScope::new(workspace.analyzer());
+            let cancellation = CancellationToken::new();
+            let mut budget = SemanticBudget::default();
+            let artifact = workspace
+                .materialize_program_semantics(
+                    &project.file("src/lib.rs"),
+                    &mut SemanticRequest::new(&mut budget, &cancellation),
+                )
+                .unwrap()
+                .available_value()
+                .cloned()
+                .unwrap();
+            let procedure = |name| {
+                artifact
+                    .procedures()
+                    .iter()
+                    .find(|procedure| {
+                        procedure
+                            .locator()
+                            .declaration()
+                            .segments()
+                            .last()
+                            .and_then(|segment| segment.name())
+                            == Some(name)
+                    })
+                    .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+                    .unwrap()
+            };
+            // Keep the endpoint plan representable while acquiring each head.
+            let root = procedure("plan_root");
+            let key = procedure("subject").durable_key();
+            let outcome = workspace
+                .semantic_oracle_provider()
+                .procedure_relations(
+                    &root,
+                    &OracleCallContext::empty(),
+                    &mut SemanticRequest::new(&mut budget, &cancellation),
+                )
+                .unwrap();
+            let status = SemanticInputStatus::from_outcome(&outcome);
+            let snapshot = outcome.available_value().cloned().unwrap();
+            let relation = snapshot.relations().last().expect("return relation");
+            let point = relation.point.clone();
+            let source = ValueFlowSourceSpec::new(
+                ValueFlowEventKey::at_point(&point, 0, ValueFlowEventKind::Source).unwrap(),
+                point.clone(),
+                ValueFlowObservationPhase::BeforeEffects,
+                ValueFlowCarrier::from(&relation.source),
+                ProofStatus::Proven,
+                EvidenceCompleteness::Complete,
+            );
+            let sink = ValueFlowSinkSpec::new(
+                ValueFlowEventKey::at_point(&point, 0, ValueFlowEventKind::Sink).unwrap(),
+                point,
+                ValueFlowObservationPhase::AfterEffects,
+                ValueFlowCarrier::from(&relation.target),
+                ProofStatus::Proven,
+                EvidenceCompleteness::Complete,
+            );
+            let plan = ValueFlowPlan::try_new(
+                root.clone(),
+                vec![ValueFlowInput::new(snapshot, status)],
+                Vec::new(),
+                vec![source],
+                vec![sink],
+            )
+            .unwrap();
+            let make = |bytes| {
+                UnitCompositionProvider::new(
+                    &workspace,
+                    WorkspaceValueFlowProvider::new(&workspace, ValueFlowCache::default()),
+                    &plan,
+                    SemanticExecutionBudget::new(8),
+                    128,
+                    bytes,
+                )
+            };
+            let query = |provider: &mut UnitCompositionProvider<'_>| {
+                let cancellation = CancellationToken::new();
+                let mut budget = SemanticBudget::default();
+                let head = <UnitCompositionProvider<'_> as crate::taint::compose::CompositionProvider>::partial_flows(
+                    provider, &key, &mut SemanticRequest::new(&mut budget, &cancellation),
+                ).unwrap();
+                assert_eq!(head.may_omit_flows(), incomplete, "{head:?}");
+                assert_eq!(head.outcome, PartialFlowOutcome::Complete, "{head:?}");
+                head
+            };
+            let retained = |provider: &UnitCompositionProvider<'_>| {
+                let retained = provider
+                    .partial
+                    .account(|entries| usize::from(!entries.borrow().is_empty()))
+                    != 0;
+                if !retained {
+                    assert!(
+                        provider
+                            .discovery
+                            .artifacts
+                            .account(|artifacts| artifacts.borrow().len())
+                            == 0,
+                        "rejected fill retained local artifact refs"
+                    );
+                    assert_eq!(provider.memo_budget.remaining.get(), usize::MAX);
+                }
+                retained
+            };
+            assert_memo_owner_conformance_for_test(
+                QueryMemoOwner::CompositionPartialFlow,
+                workspace.analyzer(),
+                || make(usize::MAX),
+                query,
+                retained,
+            );
+            let mut zero = make(0);
+            let first = query(&mut zero);
+            let second = query(&mut zero);
+            assert!(
+                !Arc::ptr_eq(&first, &second),
+                "zero-quota retry must rebuild"
+            );
+            assert_eq!(*first, *second);
+            assert_eq!(zero.partial.account(|entries| entries.borrow().len()), 0);
+            assert_eq!(zero.memo_budget.remaining.get(), 0);
+        }
+    }
+
+    #[test]
+    fn durable_candidate_call_locators_refuse_cross_interpretation() {
+        use crate::analyzer::semantic::{CancellationToken, SemanticBudget};
+        use crate::value_flow::ValueFlowCache;
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file("Cargo.toml", "[package]\nname=\"locator-test\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[dependencies]\nlog=\"0.4\"\n")
+            .file("src/lib.rs", "fn sink(x:u32)->u32{x} fn emit(value:u32){log::info!(\"{}\",sink(value));} fn caller(){emit(1);}")
+            .build();
+        let filesystem = crate::analyzer::FilesystemProject::new(project.root()).unwrap();
+        let workspace =
+            WorkspaceAnalyzer::build_persisted(Arc::new(filesystem), AnalyzerConfig::default())
+                .unwrap();
+        let _scope = AnalyzerQueryScope::new(workspace.analyzer());
+        let live = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let mut request = SemanticRequest::new(&mut budget, &live);
+        let artifact = workspace
+            .materialize_program_semantics(&project.file("src/lib.rs"), &mut request)
+            .unwrap()
+            .available_value()
+            .cloned()
+            .unwrap();
+        let base = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some("emit")
+            })
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .unwrap();
+        let discovery = WorkspaceCompositionDiscovery::new(
+            &workspace,
+            WorkspaceValueFlowProvider::new(&workspace, ValueFlowCache::default()),
+        );
+        let selected = discovery
+            .selected_procedure(&base.durable_key(), &mut request)
+            .unwrap();
+        assert!(selected.is_candidate_alternate());
+        let base_call = base
+            .call_site_handle(base.semantics().call_sites()[0].id)
+            .unwrap();
+        let alternate_call = selected
+            .call_site_handle(selected.semantics().call_sites()[0].id)
+            .unwrap();
+        for refusal in [
+            alternate_call
+                .durable_locator()
+                .validate_owner(&base)
+                .unwrap_err(),
+            base_call
+                .durable_locator()
+                .validate_owner(&selected)
+                .unwrap_err(),
+        ] {
+            assert!(matches!(refusal, crate::analyzer::semantic::ProcedureLocalLocatorError::CandidateAlternateLocatorUntranslated { .. }));
+        }
+        for refusal in [
+            base.resolve_durable_call(&alternate_call.durable_key())
+                .unwrap_err(),
+            selected
+                .resolve_durable_call(&base_call.durable_key())
+                .unwrap_err(),
+        ] {
+            assert_eq!(refusal.label(), "candidate_alternate_locator_untranslated");
+        }
+        assert!(
+            base.resolve_durable_call(&base_call.durable_key())
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            selected
+                .resolve_durable_call(&alternate_call.durable_key())
+                .unwrap()
+                .is_some()
+        );
+        let caller = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some("caller")
+            })
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .unwrap();
+        let call = caller
+            .call_site_handle(caller.semantics().call_sites()[0].id)
+            .unwrap();
+        let dispatch = discovery.resolve_call(&call, &mut request).unwrap();
+        let candidate = &dispatch.available_value().unwrap().candidates()[0];
+        let resealed = crate::analyzer::semantic::service::reseal_selected_candidate(
+            candidate,
+            &call,
+            &selected,
+            crate::analyzer::semantic::OracleLimits::default(),
+        )
+        .unwrap();
+        let bindings = discovery
+            .call_bindings(&call, &resealed, &OracleCallContext::empty(), &mut request)
+            .unwrap();
+        let bindings = bindings.available_value().unwrap();
+        assert_eq!(bindings.callee(), &selected);
+        assert!(bindings.callee().is_candidate_alternate());
+        assert!(!bindings.bindings().is_empty());
+    }
+
+    #[test]
+    fn selected_caller_and_callee_keep_executable_identities() {
+        use crate::analyzer::semantic::{CancellationToken, SemanticBudget};
+        use crate::value_flow::ValueFlowCache;
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file("Cargo.toml", "[package]\nname=\"locator-test\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[dependencies]\nlog=\"0.4\"\n")
+            .file("src/lib.rs", "fn sink(x:u32)->u32{x} fn emit(value:u32){log::info!(\"{}\",sink(value));} fn caller(){log::info!(\"{}\",{emit(1);1});}")
+            .build();
+        let filesystem = crate::analyzer::FilesystemProject::new(project.root()).unwrap();
+        let workspace =
+            WorkspaceAnalyzer::build_persisted(Arc::new(filesystem), AnalyzerConfig::default())
+                .unwrap();
+        let _scope = AnalyzerQueryScope::new(workspace.analyzer());
+        let live = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let mut request = SemanticRequest::new(&mut budget, &live);
+        let artifact = workspace
+            .materialize_program_semantics(&project.file("src/lib.rs"), &mut request)
+            .unwrap()
+            .available_value()
+            .cloned()
+            .unwrap();
+        let base = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some("emit")
+            })
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .unwrap();
+        let discovery = WorkspaceCompositionDiscovery::new(
+            &workspace,
+            WorkspaceValueFlowProvider::new(&workspace, ValueFlowCache::default()),
+        );
+        let selected = discovery
+            .selected_procedure(&base.durable_key(), &mut request)
+            .unwrap();
+        assert!(selected.is_candidate_alternate());
+        let base_call = base
+            .call_site_handle(base.semantics().call_sites()[0].id)
+            .unwrap();
+        let alternate_call = selected
+            .call_site_handle(selected.semantics().call_sites()[0].id)
+            .unwrap();
+        for refusal in [
+            alternate_call
+                .durable_locator()
+                .validate_owner(&base)
+                .unwrap_err(),
+            base_call
+                .durable_locator()
+                .validate_owner(&selected)
+                .unwrap_err(),
+        ] {
+            assert!(matches!(refusal, crate::analyzer::semantic::ProcedureLocalLocatorError::CandidateAlternateLocatorUntranslated { .. }));
+        }
+        for refusal in [
+            base.resolve_durable_call(&alternate_call.durable_key())
+                .unwrap_err(),
+            selected
+                .resolve_durable_call(&base_call.durable_key())
+                .unwrap_err(),
+        ] {
+            assert_eq!(refusal.label(), "candidate_alternate_locator_untranslated");
+        }
+        assert!(
+            base.resolve_durable_call(&base_call.durable_key())
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            selected
+                .resolve_durable_call(&alternate_call.durable_key())
+                .unwrap()
+                .is_some()
+        );
+        let caller = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some("caller")
+            })
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .unwrap();
+        let selected_caller = discovery
+            .selected_procedure(&caller.durable_key(), &mut request)
+            .unwrap();
+        assert!(selected_caller.is_candidate_alternate());
+        let row = selected_caller
+            .semantics()
+            .call_sites()
+            .iter()
+            .find(|row| {
+                let call = selected_caller.call_site_handle(row.id).unwrap();
+                let outcome = discovery.resolve_call(&call, &mut request).unwrap();
+                outcome.available_value().is_some_and(|dispatch| {
+                    dispatch
+                        .candidates()
+                        .iter()
+                        .any(|candidate| candidate.target().id() == base.id())
+                })
+            })
+            .unwrap();
+        let span = selected_caller
+            .semantics()
+            .source_mapping(row.source)
+            .unwrap()
+            .locator
+            .anchor()
+            .span();
+        let matched = matching_calls(
+            &discovery,
+            &artifact,
+            (span.start_byte() as usize, span.end_byte() as usize),
+            &mut request,
+        )
+        .unwrap();
+        let (matched_owner, call) = matched
+            .into_iter()
+            .find(|(_, call)| call.id() == row.id)
+            .unwrap();
+        assert_eq!(matched_owner.durable_key(), selected_caller.durable_key());
+        assert!(call.procedure().is_candidate_alternate());
+        let refusal = call_structure::resolve_call_structure(
+            &discovery,
+            &caller
+                .call_site_handle(caller.semantics().call_sites()[0].id)
+                .unwrap()
+                .durable_key(),
+            &mut request,
+        )
+        .err()
+        .unwrap();
+        assert!(
+            refusal
+                .to_string()
+                .contains("candidate_alternate_locator_untranslated")
+        );
+        let raw =
+            call_structure::resolve_call_structure(&discovery, &call.durable_key(), &mut request)
+                .unwrap();
+        let projected = dispatch_from_structure(
+            &discovery,
+            &UnitCallModels::new(&workspace),
+            raw,
+            &mut request,
+        )
+        .unwrap();
+        assert!(projected.handle.procedure().is_candidate_alternate());
+        assert!(
+            projected
+                .dispatch
+                .candidates
+                .iter()
+                .any(|candidate| candidate.procedure == selected.durable_key())
+        );
+        let dispatch = discovery.resolve_call(&call, &mut request).unwrap();
+        let candidate = &dispatch.available_value().unwrap().candidates()[0];
+        let resealed = crate::analyzer::semantic::service::reseal_selected_candidate(
+            candidate,
+            &call,
+            &selected,
+            crate::analyzer::semantic::OracleLimits::default(),
+        )
+        .unwrap();
+        let bindings = discovery
+            .call_bindings(&call, &resealed, &OracleCallContext::empty(), &mut request)
+            .unwrap();
+        let bindings = bindings.available_value().unwrap();
+        assert_eq!(bindings.callee(), &selected);
+        assert!(bindings.callee().is_candidate_alternate());
+        assert!(!bindings.bindings().is_empty());
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10972+#11826+#11842: composition paired base flows or memoized gaps with another interpretation"
+    )]
+    fn composition_candidate_pair_and_receipt() {
+        use crate::analyzer::i_analyzer::QueryReadReceipt;
+        use crate::analyzer::semantic::{CancellationToken, SemanticBudget, SemanticEffect};
+        use crate::value_flow::ValueFlowCache;
+        for (prefix, dependency, alternate, handle_first) in [
+            ("", "log=\"0.4\"", true, true),
+            ("", "log=\"0.4\"", true, false),
+            ("", "log={package=\"other\",version=\"0.4\"}", false, true),
+            ("mod fake {}", "log=\"0.4\"", false, true),
+        ] {
+            let source = format!(
+                "{prefix}\nfn sink(x:u32)->u32 {{x}}\nfn emit(mut target:u32, value:u32) {{ log::info!(\"{{}}\", sink(log::debug!(\"{{}}\", {{target=value;value}}))); }}"
+            );
+            let source = if prefix.is_empty() {
+                source
+            } else {
+                format!(
+                    "{prefix}\nfn sink(x:u32)->u32 {{x}}\nfn emit(mut target:u32, value:u32) {{ use crate::fake as log; log::info!(\"{{}}\", sink({{ log::debug!(\"{{}}\", {{target=value;value}}) }})); }}"
+                )
+            };
+            let project = InlineTestProject::with_language(Language::Rust)
+                .file("Cargo.toml", format!("[package]\nname=\"pair-test\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[dependencies]\n{dependency}\n"))
+                .file("src/lib.rs", &source).build();
+            let filesystem = crate::analyzer::FilesystemProject::new(project.root()).unwrap();
+            let workspace =
+                WorkspaceAnalyzer::build_persisted(Arc::new(filesystem), AnalyzerConfig::default())
+                    .unwrap();
+            let _scope = AnalyzerQueryScope::new(workspace.analyzer());
+            let live = CancellationToken::default();
+            let artifact = workspace
+                .materialize_program_semantics(
+                    &project.file("src/lib.rs"),
+                    &mut SemanticRequest::new(&mut SemanticBudget::default(), &live),
+                )
+                .unwrap()
+                .available_value()
+                .cloned()
+                .unwrap();
+            let id = artifact
+                .procedures()
+                .iter()
+                .find(|procedure| {
+                    procedure
+                        .locator()
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some("emit")
+                })
+                .unwrap()
+                .id();
+            let base = artifact.procedure_handle(id).unwrap();
+            let discovery = WorkspaceCompositionDiscovery::new(
+                &workspace,
+                WorkspaceValueFlowProvider::new(&workspace, ValueFlowCache::default()),
+            );
+            let base_flows = workspace.stored_partial_flows(&base).unwrap().unwrap();
+            let assignment_count = |handle: &ProcedureHandle| {
+                handle
+                    .semantics()
+                    .points()
+                    .iter()
+                    .flat_map(|point| &point.events)
+                    .filter(|event| matches!(event.effect, SemanticEffect::Assignment { .. }))
+                    .count()
+            };
+            let acquire_handle = || {
+                workspace
+                    .selected_procedure_handle(
+                        &base,
+                        &mut SemanticRequest::new(&mut SemanticBudget::default(), &live),
+                    )
+                    .unwrap()
+                    .available_value()
+                    .cloned()
+                    .unwrap()
+            };
+            let mut handle = handle_first.then(acquire_handle);
+            let mut first = None;
+            for alternate_entry in [false, true] {
+                let entry = if alternate_entry {
+                    handle
+                        .as_ref()
+                        .expect("the first pair selected a handle")
+                        .handle
+                        .clone()
+                } else {
+                    base.clone()
+                };
+                let (pair, reads) = QueryReadReceipt::capture(workspace.analyzer(), || {
+                    discovery
+                        .selected_procedure_and_flows(
+                            &entry.durable_key(),
+                            &mut SemanticRequest::new(&mut SemanticBudget::default(), &live),
+                        )
+                        .unwrap()
+                });
+                let handle = handle.get_or_insert_with(acquire_handle);
+                assert_eq!(handle.handle, pair.procedure);
+                assert_eq!(handle.side, pair.side);
+                assert_eq!(
+                    pair.procedure.is_candidate_alternate(),
+                    alternate,
+                    "{prefix} {dependency}"
+                );
+                assert_eq!(
+                    pair.procedure.semantics().call_sites().len()
+                        > base.semantics().call_sites().len(),
+                    alternate
+                );
+                assert_eq!(
+                    assignment_count(&pair.procedure) > assignment_count(&base),
+                    alternate
+                );
+                if alternate {
+                    assert!(pair.flows.ports.len() > base_flows.ports.len());
+                } else {
+                    assert_eq!(pair.flows, base_flows);
+                }
+                // Dense call IDs in flow ports must belong to this interpretation.
+                for port in &pair.flows.ports {
+                    if let PartialFlowPort::CallReceiver { call }
+                    | PartialFlowPort::CallArgument { call, .. }
+                    | PartialFlowPort::CallResult { call, .. }
+                    | PartialFlowPort::CallThrown { call } = port
+                    {
+                        assert!(pair.procedure.semantics().call_site(*call).is_some());
+                    }
+                }
+                let (_, replay) = QueryReadReceipt::capture(workspace.analyzer(), || {
+                    pair.admissions.replay(workspace.analyzer())
+                });
+                assert_eq!(reads.digest(), replay.digest());
+                if alternate {
+                    let execution = SemanticExecutionBudget::new(8);
+                    let sweep = |h: &ProcedureHandle| {
+                        openness_sweep(
+                            &discovery,
+                            h,
+                            &execution,
+                            &mut SemanticRequest::new(&mut SemanticBudget::default(), &live),
+                        )
+                        .unwrap()
+                    };
+                    let expected = [sweep(&base), sweep(&pair.procedure)];
+                    assert_ne!(expected[0], expected[1]);
+                    assert_ne!(base.durable_key(), pair.procedure.durable_key());
+                    let plan = ValueFlowPlan::try_new(
+                        base.clone(),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                    .unwrap();
+                    let mut classifications = None;
+                    for order in [[0, 1], [1, 0]] {
+                        // Prefetch each interpretation before classification through either alias.
+                        let provider = UnitCompositionProvider {
+                            discovery: WorkspaceCompositionDiscovery::new(
+                                &workspace,
+                                WorkspaceValueFlowProvider::new(
+                                    &workspace,
+                                    ValueFlowCache::default(),
+                                ),
+                            ),
+                            models: UnitCallModels::new(&workspace),
+                            plan: &plan,
+                            execution_budget: SemanticExecutionBudget::new(8),
+                            max_callers: 128,
+                            attribution: workspace_memo_attribution(&workspace),
+                            memo_budget: Rc::new(CompositionMemoBudget::new(usize::MAX)),
+                            partial: ReplayingMemo::new(RefCell::new(HashMap::new())),
+                            dispatches: ReplayingMemo::new(RefCell::new(HashMap::new())),
+                            sweeps: ReplayingMemo::new(RefCell::new(HashMap::new())),
+                            openness: ReplayingMemo::new(RefCell::new(HashMap::new())),
+                            excluded_callers: RefCell::new(Vec::new()),
+                        };
+                        for index in order {
+                            let handle = [&base, &pair.procedure][index];
+                            assert_eq!(
+                                provider
+                                    .openness_sweep(
+                                        handle,
+                                        &mut SemanticRequest::new(
+                                            &mut SemanticBudget::default(),
+                                            &live
+                                        )
+                                    )
+                                    .unwrap(),
+                                expected[index]
+                            );
+                        }
+                        let answers = [&base, &pair.procedure].map(|entry| {
+                            let (answer, receipt) =
+                                QueryReadReceipt::capture(workspace.analyzer(), || {
+                                    decide_openness(
+                                        &provider.discovery,
+                                        &provider,
+                                        &entry.durable_key(),
+                                        &mut SemanticRequest::new(
+                                            &mut SemanticBudget::default(),
+                                            &live,
+                                        ),
+                                    )
+                                    .unwrap()
+                                });
+                            (format!("{answer:?}"), receipt.digest())
+                        });
+                        assert_eq!(answers[0], answers[1]);
+                        if let Some(previous) = &classifications {
+                            assert_eq!(previous, &answers);
+                        }
+                        classifications = Some(answers);
+                        let stopped = CancellationToken::default();
+                        stopped.cancel();
+                        assert!(
+                            decide_openness(
+                                &provider.discovery,
+                                &provider,
+                                &entry.durable_key(),
+                                &mut SemanticRequest::new(&mut SemanticBudget::default(), &stopped)
+                            )
+                            .is_err()
+                        );
+                    }
+                }
+                let signature = (
+                    pair.procedure.is_candidate_alternate(),
+                    pair.flows,
+                    pair.admissions.digest(),
+                );
+                if let Some(first) = &first {
+                    assert_eq!(first, &signature);
+                }
+                first = Some(signature);
+            }
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11935: a cancelled admission left a stale Complete(Base) for a later live request"
+    )]
+    fn cancelled_candidate_admission_is_not_retained_in_root_query() {
+        use crate::analyzer::semantic::{CancellationToken, SemanticBudget};
+
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file("Cargo.toml", "[package]\nname=\"pair-test\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[dependencies]\nlog=\"0.4\"\n")
+            .file("src/lib.rs", "fn sink(x:u32)->u32 {x}\nfn emit(mut target:u32, value:u32) { log::info!(\"{}\", sink(log::debug!(\"{}\", {target=value;value}))); }\n")
+            .build();
+        let filesystem = crate::analyzer::FilesystemProject::new(project.root()).unwrap();
+        let workspace =
+            WorkspaceAnalyzer::build_persisted(Arc::new(filesystem), AnalyzerConfig::default())
+                .unwrap();
+        let _scope = AnalyzerQueryScope::new(workspace.analyzer());
+        let live = CancellationToken::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &project.file("src/lib.rs"),
+                &mut SemanticRequest::new(&mut SemanticBudget::default(), &live),
+            )
+            .unwrap()
+            .available_value()
+            .cloned()
+            .unwrap();
+        let base = artifact
+            .procedures()
+            .iter()
+            .find(|p| {
+                p.locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|s| s.name())
+                    == Some("emit")
+            })
+            .map(|p| artifact.procedure_handle(p.id()).unwrap())
+            .unwrap();
+        // Warm the retained arena in a separate root; admission must still run
+        // in the fresh root below.
+        workspace
+            .selected_procedure_handle(
+                &base,
+                &mut SemanticRequest::new(&mut SemanticBudget::default(), &live),
+            )
+            .unwrap();
+        drop(_scope);
+        let _scope = AnalyzerQueryScope::new(workspace.analyzer());
+        // Wrapper entry and the two publication checks pass, then the
+        // selection entry check passes; the first candidate check cancels.
+        let cancelled = CancellationToken::cancel_after_checks_for_test(5);
+        let result = workspace
+            .selected_procedure_handle(
+                &base,
+                &mut SemanticRequest::new(&mut SemanticBudget::default(), &cancelled),
+            )
+            .unwrap();
+        assert!(matches!(
+            result,
+            crate::analyzer::semantic::SemanticOutcome::Cancelled { .. }
+        ));
+        let _live_answer =
+            AnalyzerQueryScope::independent_answer(workspace.analyzer(), Some(&live));
+        let outcome = workspace
+            .selected_procedure_handle(
+                &base,
+                &mut SemanticRequest::new(&mut SemanticBudget::default(), &live),
+            )
+            .unwrap();
+        let selected = outcome.available_value().unwrap();
+        assert!(selected.handle.is_candidate_alternate());
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11910: a selected alternate handle passed back in missed its base's pinned selection"
+    )]
+    fn selected_alternate_handle_finds_its_pinned_selection() {
+        use crate::analyzer::semantic::{CancellationToken, SemanticBudget};
+
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file("Cargo.toml", "[package]\nname=\"pair-test\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[dependencies]\nlog=\"0.4\"\n")
+            .file("src/lib.rs", "fn sink(x:u32)->u32 {x}\nfn emit(mut target:u32, value:u32) { log::info!(\"{}\", sink(log::debug!(\"{}\", {target=value;value}))); }\n")
+            .build();
+        let filesystem = crate::analyzer::FilesystemProject::new(project.root()).unwrap();
+        let workspace =
+            WorkspaceAnalyzer::build_persisted(Arc::new(filesystem), AnalyzerConfig::default())
+                .unwrap();
+        let _scope = AnalyzerQueryScope::new(workspace.analyzer());
+        let live = CancellationToken::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &project.file("src/lib.rs"),
+                &mut SemanticRequest::new(&mut SemanticBudget::default(), &live),
+            )
+            .unwrap()
+            .available_value()
+            .cloned()
+            .unwrap();
+        let base = artifact
+            .procedures()
+            .iter()
+            .find(|p| {
+                p.locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|s| s.name())
+                    == Some("emit")
+            })
+            .map(|p| artifact.procedure_handle(p.id()).unwrap())
+            .unwrap();
+        let first = workspace
+            .selected_procedure_handle(
+                &base,
+                &mut SemanticRequest::new(&mut SemanticBudget::default(), &live),
+            )
+            .unwrap();
+        let alternate = first.available_value().unwrap().handle.clone();
+        assert!(alternate.is_candidate_alternate());
+        // Wrapper entry, publication and selection entry checks pass; a rerun
+        // of admission would cancel at its first candidate check. The pinned
+        // selection must be found instead.
+        let _answer = AnalyzerQueryScope::independent_answer(workspace.analyzer(), Some(&live));
+        let cancelling = CancellationToken::cancel_after_checks_for_test(5);
+        let again = workspace
+            .selected_procedure_handle(
+                &alternate,
+                &mut SemanticRequest::new(&mut SemanticBudget::default(), &cancelling),
+            )
+            .unwrap();
+        let again = again.available_value().expect("the pinned selection");
+        assert_eq!(again.handle, alternate);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11910: a budget-stopped selection was retained for the rest of the root query"
+    )]
+    fn budget_stopped_candidate_selection_is_not_retained_in_root_query() {
+        use crate::analyzer::semantic::{CancellationToken, SemanticBudget, SemanticWork};
+
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file("Cargo.toml", "[package]\nname=\"pair-test\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[dependencies]\nlog=\"0.4\"\n")
+            .file("src/lib.rs", "fn sink(x:u32)->u32 {x}\nfn emit(mut target:u32, value:u32) { log::info!(\"{}\", sink(log::debug!(\"{}\", {target=value;value}))); }\n")
+            .build();
+        let filesystem = crate::analyzer::FilesystemProject::new(project.root()).unwrap();
+        let workspace =
+            WorkspaceAnalyzer::build_persisted(Arc::new(filesystem), AnalyzerConfig::default())
+                .unwrap();
+        let live = CancellationToken::default();
+        let base = {
+            let _scope = AnalyzerQueryScope::new(workspace.analyzer());
+            let artifact = workspace
+                .materialize_program_semantics(
+                    &project.file("src/lib.rs"),
+                    &mut SemanticRequest::new(&mut SemanticBudget::default(), &live),
+                )
+                .unwrap()
+                .available_value()
+                .cloned()
+                .unwrap();
+            artifact
+                .procedures()
+                .iter()
+                .find(|p| {
+                    p.locator()
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|s| s.name())
+                        == Some("emit")
+                })
+                .map(|p| artifact.procedure_handle(p.id()).unwrap())
+                .unwrap()
+        };
+        let starved = |call_sites: usize| {
+            SemanticBudget::new(SemanticWork {
+                call_sites,
+                ..SemanticWork::default_limits()
+            })
+            .unwrap()
+        };
+        // The largest call-site limit that still stops the acquisition is the
+        // last budget check before a selection exists: candidate admission.
+        // Each probe runs in its own root, so no probe sees another's table.
+        let stops = |call_sites: usize| {
+            let _probe = AnalyzerQueryScope::new(workspace.analyzer());
+            matches!(
+                workspace
+                    .selected_procedure_handle(
+                        &base,
+                        &mut SemanticRequest::new(&mut starved(call_sites), &live),
+                    )
+                    .unwrap(),
+                crate::analyzer::semantic::SemanticOutcome::ExceededBudget { .. }
+            )
+        };
+        let (mut stopping, mut selecting) = (1, SemanticWork::default_limits().call_sites);
+        assert!(stops(stopping) && !stops(selecting));
+        while selecting - stopping > 1 {
+            let middle = stopping + (selecting - stopping) / 2;
+            if stops(middle) {
+                stopping = middle;
+            } else {
+                selecting = middle;
+            }
+        }
+        // One root query: the admission-stopped acquisition, then a
+        // default-budget one, which must run admission and select.
+        let _scope = AnalyzerQueryScope::new(workspace.analyzer());
+        let mut starved = starved(stopping);
+        let stopped = workspace
+            .selected_procedure_handle(&base, &mut SemanticRequest::new(&mut starved, &live))
+            .unwrap();
+        assert!(
+            matches!(
+                stopped,
+                crate::analyzer::semantic::SemanticOutcome::ExceededBudget { .. }
+            ),
+            "{stopped:?}"
+        );
+        let _answer = AnalyzerQueryScope::independent_answer(workspace.analyzer(), Some(&live));
+        let outcome = workspace
+            .selected_procedure_handle(
+                &base,
+                &mut SemanticRequest::new(&mut SemanticBudget::default(), &live),
+            )
+            .unwrap();
+        let selected = outcome.available_value().unwrap();
+        assert!(selected.handle.is_candidate_alternate());
+    }
+
+    #[test]
     fn composition_memo_hits_replay_reads_for_each_answer_shape() {
         let project = InlineTestProject::with_language(Language::Rust)
             .file("main.rs", "pub fn caller() { leaf(); } fn leaf() {}\n")
@@ -5740,6 +7613,106 @@ mod memo_receipt_tests {
         assert!(first_reads.reuse_refused());
         assert!(second_reads.reuse_refused());
     }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11953: a warm composition artifact hit dropped its fill's semantic-model read"
+    )]
+    fn warm_procedure_lookup_keeps_the_artifact_fill_reads() {
+        use crate::analyzer::semantic::{CancellationToken, SemanticBudget};
+        use crate::analyzer::{
+            ChangedFacts, HeadInputs, LookupMemo, LookupReplayLimits, NoSummaryAnswers,
+            verify_read_set,
+        };
+        use crate::value_flow::ValueFlowCache;
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file("main.rs", "pub fn caller() { leaf(); } fn leaf() {}\n")
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let live = CancellationToken::default();
+        let key = {
+            let artifact = workspace
+                .materialize_program_semantics(
+                    &project.file("main.rs"),
+                    &mut SemanticRequest::new(&mut SemanticBudget::default(), &live),
+                )
+                .unwrap()
+                .available_value()
+                .cloned()
+                .unwrap();
+            let caller = artifact
+                .procedures()
+                .iter()
+                .find(|procedure| {
+                    procedure
+                        .locator()
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some("caller")
+                })
+                .unwrap()
+                .id();
+            artifact.procedure_handle(caller).unwrap().durable_key()
+        };
+        // Both lookups run in one root query, so the second hits the memo.
+        let _scope = AnalyzerQueryScope::new(workspace.analyzer());
+        let discovery = WorkspaceCompositionDiscovery::new(
+            &workspace,
+            WorkspaceValueFlowProvider::new(&workspace, ValueFlowCache::default()),
+        );
+        let lookup = || {
+            capture_query_reads(workspace.analyzer(), || {
+                discovery
+                    .procedure(
+                        &key,
+                        &mut SemanticRequest::new(&mut SemanticBudget::default(), &live),
+                    )
+                    .unwrap()
+            })
+            .1
+            .keys()
+        };
+        let cold = lookup();
+        let warm = lookup();
+        assert_eq!(discovery.artifacts.account(|memo| memo.borrow().len()), 1);
+        let models = cold
+            .iter()
+            .find_map(|key| match key {
+                ReadKey::Models(models) => Some(*models),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("the fill reads the active model set: {cold:#?}"));
+        assert_eq!(cold, warm);
+
+        // A product validated from the warm receipt sees a model-set change.
+        let placeholder = StableDigest::sha256(b"inputs this lookup does not read");
+        let verify = |models| {
+            verify_read_set(
+                &workspace,
+                &ChangedFacts::between(&workspace, &workspace),
+                &HeadInputs {
+                    models,
+                    policy_semantic_hash: placeholder,
+                    policy_source: placeholder,
+                    configuration: placeholder,
+                    epoch: placeholder,
+                },
+                &warm,
+                LookupReplayLimits::default(),
+                &NoSummaryAnswers,
+                &mut LookupMemo::new(),
+            )
+        };
+        assert!(verify(models).is_unchanged(), "{:?}", verify(models));
+        let activated = verify(StableDigest::sha256(b"a pack was activated"));
+        assert_eq!(
+            activated.changed().map(|changed| &changed.key),
+            Some(&ReadKey::Models(models)),
+            "{activated:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -5819,5 +7792,78 @@ mod promotion_cause_tests {
             ),
             IncompleteCause::Operational(OperationalCause::Cancelled)
         );
+    }
+}
+
+#[cfg(test)]
+mod return_demand_tests {
+    use super::*;
+    use crate::analyzer::semantic::AccessPathTail;
+    use crate::analyzer::semantic::partial_flow::ports::{HeapSelector, PortId};
+    use crate::analyzer::semantic::partial_flow::{PartialFlow, PartialFlowOutcome};
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#11268: unused callee tuple members incorrectly opened caller coverage")]
+    fn returned_members_follow_caller_consumption() {
+        let result = PartialFlowPort::CallResult {
+            call: CallSiteId::new(0),
+            ordinal: None,
+        };
+        let member = |root: PartialFlowPort, name: &str| PartialFlowPort::Heap {
+            root: Box::new(root),
+            selectors: vec![HeapSelector::Property(name.into())].into_boxed_slice(),
+            tail: AccessPathTail::Exact,
+        };
+        let callee = vec![
+            member(PartialFlowPort::NormalReturn, "a"),
+            member(PartialFlowPort::NormalReturn, "b"),
+        ];
+        let returns = vec![(PartialFlowPort::NormalReturn, result.clone())];
+        let make_rows = |ports, flows| {
+            ProcedurePartialFlows::new(
+                PartialFlowOutcome::Complete,
+                None,
+                ports,
+                flows,
+                false,
+                true,
+                Vec::new(),
+            )
+        };
+        let mut caller = make_rows(vec![result.clone(), member(result.clone(), "a")], vec![]);
+        assert!(returned_members_bound(&callee, &caller, &returns, |_| None));
+        // Each boundary use of the whole value demands both members. Unknown
+        // destinations obey the same rule, without a destination allowlist.
+        for destination in [
+            PartialFlowPort::CallArgument {
+                call: CallSiteId::new(1),
+                ordinal: 0,
+            },
+            member(PartialFlowPort::Parameter { ordinal: 0 }, "stored"),
+            PartialFlowPort::NormalReturn,
+            PartialFlowPort::Capture {
+                slot: crate::analyzer::semantic::MemoryLocationId::new(0),
+            },
+        ] {
+            caller.ports.push(destination);
+            caller.flows.push(PartialFlow {
+                from: PortId::new(0),
+                to: PortId::new(2),
+                uncertain: false,
+                crossed: vec![Box::default()].into_boxed_slice(),
+            });
+            assert!(!returned_members_bound(&callee, &caller, &returns, |_| {
+                None
+            }));
+            caller.ports.push(member(result.clone(), "b"));
+            assert!(returned_members_bound(&callee, &caller, &returns, |_| None));
+            caller.ports.truncate(2);
+            caller.flows.clear();
+        }
+        caller.ports.push(member(result, "unmatched"));
+        assert!(!returned_members_bound(&callee, &caller, &returns, |_| {
+            None
+        }));
     }
 }

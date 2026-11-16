@@ -2,7 +2,7 @@ use crate::*;
 
 fn catalog(name: &str, count: usize) -> TaintCatalogDefinition {
     TaintCatalogDefinition {
-        schema_version: 1,
+        schema_version: crate::definition::POLICY_DOCUMENT_SCHEMA_VERSION,
         name: PolicyId::new(name).unwrap(),
         version: 1,
         categories: vec![PolicyCategoryId::new("input.user").unwrap()],
@@ -188,7 +188,7 @@ fn external_model_only_catalog_is_nonempty() {
         selector: crate::test_support::inline_match_selector("transfer"),
         transfers: vec![TaintTransferSpec {
             from: PolicyPort::ArgumentIndex { index: 0 },
-            to: PolicyPort::ReturnValue,
+            to: PolicyPort::ReturnValue { path: None },
             labels: vec![TaintLabel::new("untrusted").unwrap()],
             effect: TaintTransferEffect::Propagate,
         }],

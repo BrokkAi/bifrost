@@ -210,6 +210,23 @@ impl SourceImportPathFact {
 }
 
 impl SourceImportFact {
+    /// Owned buffers for a pure cache; source-admission estimates remain raw.
+    pub fn allocated_retained_bytes(&self) -> usize {
+        use crate::allocation_size::allocation_size;
+        use crate::hash::allocated_vec_slot_bytes;
+        let string = |s: &String| allocation_size(s.capacity());
+        string(&self.statement)
+            + self.identifier.as_ref().map_or(0, string)
+            + self.alias.as_ref().map_or(0, string)
+            + self.path.as_ref().map_or(0, |path| {
+                allocated_vec_slot_bytes(&path.segments)
+                    + path.segments.iter().map(string).sum::<usize>()
+                    + allocated_vec_slot_bytes(&path.lexical_prefixes)
+                    + path.lexical_prefixes.iter().map(string).sum::<usize>()
+                    + allocated_vec_slot_bytes(&path.lexical_scopes)
+            })
+    }
+
     /// Heap storage owned by this leaf, excluding its inline struct storage.
     pub fn estimated_retained_bytes(&self) -> usize {
         self.statement

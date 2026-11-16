@@ -14,7 +14,8 @@
 //! hierarchy draws the same line.
 
 use brokk_bifrost_core::analyzer::capabilities::{
-    DescendantIndexScope, DirectDescendantIndex, build_direct_descendant_index_from_candidates,
+    DescendantIndexScope, DirectDescendantIndex, HierarchyAnswer,
+    build_direct_descendant_index_from_candidates,
 };
 use brokk_bifrost_core::analyzer::model::{CodeUnit, ImportInfo, Range};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
@@ -126,7 +127,19 @@ where
             })
             .or_insert_with(|| (declaration.clone(), facts.primary_range()));
     }
-    candidates.retain(|facts| scope.admits(facts.declaration()));
+    let mut admitted = Vec::with_capacity(candidates.len());
+    for facts in candidates {
+        if match scope.admits(facts.declaration()) {
+            Ok(value) => value,
+            Err(reason) => {
+                let _unavailable = reason;
+                return None;
+            }
+        } {
+            admitted.push(facts);
+        }
+    }
+    let candidates = admitted;
 
     // Hydration is batched because each candidate needs two facts that are not
     // in the candidate row itself — the supertypes it spells and the file's
@@ -176,12 +189,12 @@ where
             .map(|facts| facts.declaration().clone())
             .collect(),
         |candidate| {
-            Some(
+            Some(HierarchyAnswer::complete(
                 ancestors_by_owner
                     .get(candidate)
                     .cloned()
                     .unwrap_or_default(),
-            )
+            ))
         },
         &scope.keep_going(),
     )

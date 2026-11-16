@@ -593,7 +593,7 @@ pub fn run_graph_stages<Adapter: GraphStageAdapter>(
     let worker_count = worker_count.min(MAX_GRAPH_STAGE_WORKERS);
     // Borrow the admitted units and contiguous file slices only for this request.
     // Metadata is a scheduling proxy, never a source of resolution authority.
-    let use_workers = worker_count > 1 && !operation.worker_store().uses_single_connection_reads();
+    let use_workers = worker_count > 1;
     let file_sizes = use_workers.then(|| {
         groups.iter().map(|(_, files)| {
             files.iter().map(|file| match std::fs::metadata(file.abs_path()) {

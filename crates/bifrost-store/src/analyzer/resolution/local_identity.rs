@@ -2856,6 +2856,9 @@ pub trait ResolutionIdentityTranslation {
                 Reason::ReceiverBudgetExhausted(self.semantic(*id))
             }
             Reason::TimeBudgetExceeded(id) => Reason::TimeBudgetExceeded(self.semantic(*id)),
+            Reason::OverlayFrontierUnknown(id) => {
+                Reason::OverlayFrontierUnknown(self.semantic(*id))
+            }
             Reason::UnmountedFile { fragment } => Reason::UnmountedFile {
                 fragment: self.fragment(*fragment),
             },

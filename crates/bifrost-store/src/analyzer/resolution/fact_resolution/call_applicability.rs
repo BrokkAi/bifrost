@@ -93,6 +93,25 @@ pub enum IntrinsicCallType {
     Double,
 }
 
+/// Interpretation of a repeated formal for one selected actual.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum RepeatedParameterAssessment {
+    Component(ResolutionTypeRef),
+    FixedArray {
+        actual: ResolutionTypeRef,
+        component: ResolutionTypeRef,
+        kind: ConversionKind,
+    },
+}
+
+/// Formal identities retain the same query-local view used by Java conversions.
+#[doc(hidden)]
+pub type CallFormalType = brokk_bifrost_jvm::java::conversion::JavaTypeView<SemanticId>;
+
+#[doc(hidden)]
+pub type FormalSubtypeRelations = HashMap<(CallFormalType, CallFormalType), bool>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[doc(hidden)]
 pub struct ConversionEvidence {
@@ -101,6 +120,18 @@ pub struct ConversionEvidence {
     pub source_type: Option<SemanticId>,
     pub target_type: Option<SemanticId>,
     pub kind: ConversionKind,
+    pub repeated: Option<RepeatedParameterAssessment>,
+}
+
+impl ConversionEvidence {
+    pub fn formal_type(&self) -> Option<CallFormalType> {
+        match self.repeated {
+            Some(RepeatedParameterAssessment::FixedArray { component, .. }) => {
+                Some(CallFormalType::ImplicitArray(component.identity()))
+            }
+            _ => self.target_type.map(CallFormalType::Real),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +142,8 @@ pub struct CandidateAssessment {
     pub reason: Option<CallableRejectionReason>,
     pub conversions: Vec<ConversionEvidence>,
     pub used_vararg: bool,
+    pub fixed_array_invocation:
+        Option<brokk_bifrost_semantic::analyzer::semantic::call_binding::FixedArrayInvocation>,
     pub used_defaults: u32,
 }
 
@@ -161,6 +194,7 @@ impl CandidateAssessment {
             reason: None,
             conversions: Vec::new(),
             used_vararg: false,
+            fixed_array_invocation: None,
             used_defaults: 0,
         }
     }
@@ -172,6 +206,7 @@ impl CandidateAssessment {
             reason: Some(reason),
             conversions: Vec::new(),
             used_vararg: false,
+            fixed_array_invocation: None,
             used_defaults: 0,
         }
     }
@@ -240,8 +275,8 @@ pub trait CallApplicabilityAdapter: Sync {
         formal: ResolutionTypeRef,
         _repeated_actual_count: usize,
         _states: &StateMap,
-    ) -> StoreResult<Option<ResolutionTypeRef>> {
-        Ok(Some(formal))
+    ) -> StoreResult<Option<RepeatedParameterAssessment>> {
+        Ok(Some(RepeatedParameterAssessment::Component(formal)))
     }
 
     fn implicit_receiver_lookup(&self) -> Option<ImplicitReceiverLookup> {
@@ -571,6 +606,21 @@ pub trait CallApplicabilityAdapter: Sync {
         Ok(Some(false))
     }
 
+    fn candidate_formal_view_is_subtype(
+        &self,
+        evaluation: &mut FactEvaluation<'_, '_>,
+        subtype: CallFormalType,
+        supertype: CallFormalType,
+        states: &StateMap,
+    ) -> StoreResult<Option<bool>> {
+        match (subtype, supertype) {
+            (CallFormalType::Real(a), CallFormalType::Real(b)) => {
+                self.candidate_formal_is_subtype(evaluation, a, b, states)
+            }
+            _ => Ok(None),
+        }
+    }
+
     fn invocation_phase(&self, _candidate: &CandidateAssessment) -> Option<InvocationPhase> {
         None
     }
@@ -586,7 +636,7 @@ pub trait CallApplicabilityAdapter: Sync {
         &self,
         left: ConversionEvidence,
         right: ConversionEvidence,
-        _subtype_relations: &HashMap<(SemanticId, SemanticId), bool>,
+        _subtype_relations: &FormalSubtypeRelations,
     ) -> PartialOrder {
         if left == right {
             PartialOrder::Equal
@@ -1469,7 +1519,7 @@ fn map_matching_argument_lists(
 pub fn compare_formal_types(
     left: ConversionEvidence,
     right: ConversionEvidence,
-    subtype_relations: &HashMap<(SemanticId, SemanticId), bool>,
+    subtype_relations: &FormalSubtypeRelations,
 ) -> PartialOrder {
     if left.kind == ConversionKind::Unknown || right.kind == ConversionKind::Unknown {
         return PartialOrder::Unknown;
@@ -1477,8 +1527,8 @@ pub fn compare_formal_types(
     let (Some(left_source), Some(right_source), Some(left_target), Some(right_target)) = (
         left.source_type,
         right.source_type,
-        left.target_type,
-        right.target_type,
+        left.formal_type(),
+        right.formal_type(),
     ) else {
         return PartialOrder::Unknown;
     };
@@ -1515,7 +1565,7 @@ enum SelectionDisposition {
 fn selection_dispositions<A: CallApplicabilityAdapter + ?Sized>(
     adapter: &A,
     assessments: &[CandidateAssessment],
-    subtype_relations: &HashMap<(SemanticId, SemanticId), bool>,
+    subtype_relations: &FormalSubtypeRelations,
 ) -> Vec<SelectionDisposition> {
     let earliest_phase = assessments
         .iter()
@@ -1556,7 +1606,7 @@ fn selection_dispositions<A: CallApplicabilityAdapter + ?Sized>(
 pub fn select_candidate_indices<A: CallApplicabilityAdapter + ?Sized>(
     adapter: &A,
     assessments: &[CandidateAssessment],
-    subtype_relations: &HashMap<(SemanticId, SemanticId), bool>,
+    subtype_relations: &FormalSubtypeRelations,
 ) -> Vec<usize> {
     selection_dispositions(adapter, assessments, subtype_relations)
         .into_iter()
@@ -1575,7 +1625,7 @@ pub fn select_candidate_indices<A: CallApplicabilityAdapter + ?Sized>(
 pub fn less_specific_indices<A: CallApplicabilityAdapter + ?Sized>(
     adapter: &A,
     assessments: &[CandidateAssessment],
-    subtype_relations: &HashMap<(SemanticId, SemanticId), bool>,
+    subtype_relations: &FormalSubtypeRelations,
 ) -> Vec<usize> {
     selection_dispositions(adapter, assessments, subtype_relations)
         .into_iter()
@@ -2109,7 +2159,7 @@ fn dominates<A: CallApplicabilityAdapter + ?Sized>(
     adapter: &A,
     left: &CandidateAssessment,
     right: &CandidateAssessment,
-    subtype_relations: &HashMap<(SemanticId, SemanticId), bool>,
+    subtype_relations: &FormalSubtypeRelations,
 ) -> bool {
     if adapter.invocation_phase(left) != adapter.invocation_phase(right)
         || left.conversions.len() != right.conversions.len()
@@ -2187,6 +2237,7 @@ pub mod registry_fixture_support {
             verdict,
             reason: None,
             conversions: vec![ConversionEvidence {
+                repeated: None,
                 argument_ordinal: 0,
                 parameter_ordinal: 0,
                 source_type: None,
@@ -2194,6 +2245,7 @@ pub mod registry_fixture_support {
                 kind,
             }],
             used_vararg: false,
+            fixed_array_invocation: None,
             used_defaults: 0,
         }
     }
@@ -2219,7 +2271,7 @@ mod tests {
             &self,
             left: ConversionEvidence,
             right: ConversionEvidence,
-            _subtype_relations: &HashMap<(SemanticId, SemanticId), bool>,
+            _subtype_relations: &FormalSubtypeRelations,
         ) -> PartialOrder {
             match (left.kind, right.kind) {
                 (ConversionKind::Exact, ConversionKind::Subtype) => PartialOrder::Better,
@@ -2265,7 +2317,7 @@ mod tests {
                 &self,
                 left: ConversionEvidence,
                 right: ConversionEvidence,
-                _subtype_relations: &HashMap<(SemanticId, SemanticId), bool>,
+                _subtype_relations: &FormalSubtypeRelations,
             ) -> PartialOrder {
                 match (left.argument_ordinal, left.kind, right.kind) {
                     (0, ConversionKind::Exact, ConversionKind::Subtype)
@@ -2285,6 +2337,7 @@ mod tests {
         second.conversions[0].argument_ordinal = 0;
         second.conversions[0].kind = ConversionKind::Subtype;
         first.conversions.push(ConversionEvidence {
+            repeated: None,
             argument_ordinal: 1,
             parameter_ordinal: 1,
             source_type: None,
@@ -2292,6 +2345,7 @@ mod tests {
             kind: ConversionKind::Subtype,
         });
         second.conversions.push(ConversionEvidence {
+            repeated: None,
             argument_ordinal: 1,
             parameter_ordinal: 1,
             source_type: None,

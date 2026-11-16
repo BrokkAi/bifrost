@@ -14,7 +14,12 @@ use rusqlite::types::Value;
 use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
+pub mod publication_lineage;
 pub mod sql_profile;
+mod staged_import;
+
+use publication_lineage::mint_publication_nonce;
+use staged_import::import_newest_older_store;
 
 use sql_profile::ConnectionRole;
 
@@ -126,21 +131,63 @@ struct CacheMigration {
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub fn test_connection_through_262() -> Connection {
+    test_connection_through_migration(262)
+}
+
+/// A populated migration test starts with the last schema before raw derivation identities.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn test_connection_through_405() -> Connection {
+    test_connection_through_migration(405)
+}
+
+/// Pre-structural-trait-impl schema for populated admission upgrade tests.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn test_connection_before_structural_trait_impls() -> Connection {
+    let previous = POST_BASELINE_MIGRATIONS
+        .iter()
+        .rfind(|migration| migration.version < 460)
+        .unwrap()
+        .version;
+    test_connection_through_migration(previous)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn test_connection_through_migration(version: i64) -> Connection {
     disable_sqlite_memory_statistics();
     let mut conn = Connection::open_in_memory().expect("open test cache");
     configure_connection(&mut conn).expect("configure test cache");
     conn.execute_batch(BASELINE_SCHEMA_SQL)
         .expect("create baseline schema");
-    for migration in POST_BASELINE_MIGRATIONS.iter().filter(|m| m.version <= 262) {
+    for migration in POST_BASELINE_MIGRATIONS
+        .iter()
+        .filter(|m| m.version <= version)
+    {
         conn.execute_batch(migration.sql)
-            .expect("apply pre-presence migration");
+            .expect("apply historical migration");
     }
-    conn.pragma_update(None, "user_version", 262)
-        .expect("set pre-presence schema version");
+    conn.pragma_update(None, "user_version", version)
+        .expect("set historical schema version");
     conn
 }
 
-/// Compatible migrations after the schema 125 floor.
+/// Exercise registered forward SQL with FK enforcement still enabled, unlike normal upgrades.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn test_migrate_with_foreign_keys_enabled(conn: &mut Connection) {
+    assert!(
+        conn.pragma_query_value(None, "foreign_keys", |r| r.get::<_, bool>(0))
+            .unwrap()
+    );
+    assert!(matches!(
+        migrate_locked(conn, false).expect("upgrade with foreign keys enabled"),
+        LockedMigrationOutcome::Complete
+    ));
+}
+
+/// Forward migrations after the schema 125 import floor. Reader-breaking
+/// additions are fenced by versioned store files and the user_version check.
 const POST_BASELINE_MIGRATIONS: &[CacheMigration] = &[
     CacheMigration {
         version: 126,
@@ -710,6 +757,201 @@ const POST_BASELINE_MIGRATIONS: &[CacheMigration] = &[
         version: 311,
         sql: include_str!("../migrations/cache/0311-rust-unit-summary-context-lookups.sql"),
     },
+    // Compatible: separate guarded rows leave all existing publications unchanged.
+    CacheMigration {
+        version: 314,
+        sql: include_str!("../migrations/cache/0314-candidate-macro-semantic-ir.sql"),
+    },
+    // Rebuilds derived JVM inventories; source declaration facts remain intact.
+    CacheMigration {
+        version: 315,
+        sql: include_str!("../migrations/cache/0315-jvm-external-member-abstract.sql"),
+    },
+    // Compatible: per-file surface products do not change sealed fact rows.
+    CacheMigration {
+        version: 316,
+        sql: include_str!("../migrations/cache/0316-surface-relations.sql"),
+    },
+    CacheMigration {
+        version: 323,
+        sql: include_str!("../migrations/cache/0323-rust-summary-representations.sql"),
+    },
+    CacheMigration {
+        version: 324,
+        sql: include_str!("../migrations/cache/0324-csharp-compound-visibility.sql"),
+    },
+    CacheMigration {
+        version: 325,
+        sql: include_str!("../migrations/cache/0325-csharp-friend-attributes.sql"),
+    },
+    // #11183 M2: purges every unit summary (all are re-derived under new
+    // derivation versions) and rebuilds the shared summary tables on surface
+    // coordinates, without dense per-file coordinates.
+    CacheMigration {
+        version: 334,
+        sql: include_str!("../migrations/cache/0334-unit-summary-surface-coordinates.sql"),
+    },
+    CacheMigration {
+        version: 338,
+        sql: include_str!("../migrations/cache/0338-cleanup-chains.sql"),
+    },
+    // Compatible: the four Rust binding-authority summary tables have no writer or reader
+    // before this migration (empty, unread by any build); they are recreated with dense
+    // child coordinates and name-form foreign references (#11173 M2b).
+    CacheMigration {
+        version: 345,
+        sql: include_str!("../migrations/cache/0345-rust-binding-authority-dense-children.sql"),
+    },
+    // Compatible: adds a lookup digest equal to the existing summary digest and an
+    // empty consumed-unit relation, so every existing summary stays reusable
+    // (#11173).
+    CacheMigration {
+        version: 346,
+        sql: include_str!("../migrations/cache/0346-unit-summary-consumed-units.sql"),
+    },
+    // Compatible: the topology column subject_rank was never filled or read by any build, and
+    // the two inherent-impl summary tables have no writer or reader before this migration
+    // (empty, unread by any build); they are recreated with dense child coordinates and the
+    // name-form subject (#11173 M2b slice 3).
+    CacheMigration {
+        version: 361,
+        sql: include_str!("../migrations/cache/0361-rust-inherent-impl-name-form.sql"),
+    },
+    // #11482: the selection-authority reads each aggregate evaluation consumed.
+    CacheMigration {
+        version: 369,
+        sql: include_str!("../migrations/cache/0369-policy-evaluation-selection-reads.sql"),
+    },
+    // Compatible: recreates two derived Rust summary tables without the coordinates of
+    // another unit's rows (a foreign `mod` declaration id, a foreign route counter); the
+    // Rust derivation version moves with it, so every summary is derived again (#11173).
+    CacheMigration {
+        version: 379,
+        sql: include_str!("../migrations/cache/0379-rust-summary-foreign-name-form.sql"),
+    },
+    // Compatible: adds two nullable member columns. Older binaries insert member
+    // rows without a column list, but versioned filenames exclude mixed-version
+    // writers, so none writes to a migrated store. Imported rows read NULL, which
+    // never matches the liveness check, so their summaries re-derive (#11183
+    // M2-key: Go/Python members record the consumed input, a surface fingerprint
+    // or no-facts OID, so liveness can compare it with the selected blob's input).
+    CacheMigration {
+        version: 382,
+        sql: include_str!("../migrations/cache/0382-unit-summary-member-inputs.sql"),
+    },
+    // Compatible: adds nullable columns to two derived Rust topology tables, naming the
+    // item that declares each end of a trait impl; the Rust crate derivation version moves
+    // with it, so every topology is derived again with them filled (#11173).
+    CacheMigration {
+        version: 396,
+        sql: include_str!("../migrations/cache/0396-rust-trait-impl-declaring-names.sql"),
+    },
+    // Compatible: versioned store files exclude mixed-version writers. Rebuild
+    // the parent without cascading child rows; legacy question columns stay empty.
+    CacheMigration {
+        version: 402,
+        sql: include_str!("../migrations/cache/0402-policy-unit-operands.sql"),
+    },
+    // #11607: the view an evaluation's selection reads were taken over, and the
+    // tree part of a JVM dependency selection.
+    CacheMigration {
+        version: 404,
+        sql: include_str!("../migrations/cache/0404-evaluation-selection-tree-part.sql"),
+    },
+    // Compatible: a nullable source-fact column. Existing rows read NULL, which
+    // leaves their derive surfaces open until the bumped Rust source-facts
+    // version republishes them.
+    CacheMigration {
+        version: 405,
+        sql: include_str!("../migrations/cache/0405-rust-builtin-derives.sql"),
+    },
+    CacheMigration {
+        version: 409,
+        sql: include_str!("../migrations/cache/0409-cleanup-owner-gap-subject.sql"),
+    },
+    // #11251: source-anchored candidate records (anchor, base call, realization).
+    CacheMigration {
+        version: 410,
+        sql: include_str!("../migrations/cache/0410-candidate-macro-records.sql"),
+    },
+    // #11535: independent publication lineages for newly created stores.
+    CacheMigration {
+        version: 411,
+        sql: include_str!("../migrations/cache/0411-store-publication-lineage.sql"),
+    },
+    CacheMigration {
+        version: 414,
+        sql: include_str!("../migrations/cache/0414-rust-unresolved-impl-reasons.sql"),
+    },
+    // COMPATIBLE: index-only; older readers are unaffected and SQLite maintains
+    // the index for rows written by an older daemon. Working number: 0418.
+    CacheMigration {
+        version: 418,
+        sql: include_str!("../migrations/cache/0418-python-member-any-writes.sql"),
+    },
+    // Compatible: discard derived certificates and their descendants before changing
+    // equality-only versions to raw lever identities. Durable input rows survive.
+    CacheMigration {
+        version: 419,
+        sql: include_str!("../migrations/cache/0419-derivation-identities.sql"),
+    },
+    // Reader-breaking discharge code 14; versioned files and transactional
+    // user_version fencing exclude older readers. Existing rows remain intact.
+    CacheMigration {
+        version: 420,
+        sql: include_str!("../migrations/cache/0420-rust-drop-inventory-read-keys.sql"),
+    },
+    // #12128: reader-breaking, fenced by user_version.
+    CacheMigration {
+        version: 421,
+        sql: include_str!("../migrations/cache/0421-rust-async-body-execution.sql"),
+    },
+    // BREAKING: older Rust gap decoders reject the new typed cycle-edge cause.
+    // user_version and rust-crate-derivation identity fence retained products.
+    CacheMigration {
+        version: 422,
+        sql: include_str!("../migrations/cache/0422-rust-dev-cycle-gap.sql"),
+    },
+    // Compatible: independent per-unit discovery output; old readers ignore it.
+    CacheMigration {
+        version: 423,
+        sql: include_str!("../migrations/cache/0423-rust-feature-projections.sql"),
+    },
+    // Compatible: existing candidates retain NULL and discharge nothing (#9925).
+    CacheMigration {
+        version: 424,
+        sql: include_str!("../migrations/cache/0424-guarded-pattern-gap-link.sql"),
+    },
+    // COMPATIBLE: withdraw derived JVM projections and add nullable generic metadata.
+    CacheMigration {
+        version: 425,
+        sql: include_str!("../migrations/cache/0425-jvm-external-generic-surfaces.sql"),
+    },
+    // #12413: compatible nullable scalar, fenced by evaluation engine v6.
+    CacheMigration {
+        version: 426,
+        sql: include_str!("../migrations/cache/0426-policy-evaluation-cut-hint.sql"),
+    },
+    // Compatible additive runtime binary operations; old facts rederive by lever.
+    CacheMigration {
+        version: 427,
+        sql: include_str!("../migrations/cache/0427-binary-operations.sql"),
+    },
+    // BREAKING: macro type candidates require selected identity certification.
+    CacheMigration {
+        version: 447,
+        sql: include_str!("../migrations/cache/0447-rust-macro-type-candidates.sql"),
+    },
+    // COMPATIBLE: new tables only; older readers never read them.
+    CacheMigration {
+        version: 448,
+        sql: include_str!("../migrations/cache/0448-ruby-workspace-signatures.sql"),
+    },
+    // Compatible-additive: older binaries ignore the new per-file table.
+    CacheMigration {
+        version: 460,
+        sql: include_str!("../migrations/cache/0460-rust-structural-trait-impls.sql"),
+    },
 ];
 
 static CACHE_DB_FILE_NAME: Lazy<String> =
@@ -735,8 +977,8 @@ static CURRENT_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|
 // in-memory database on every process start. The regression test below derives
 // the value through SQLite and forces this constant to move with a migration.
 const CURRENT_SCHEMA_OBJECTS_SHA256: [u8; 32] = [
-    235, 181, 232, 130, 46, 179, 240, 253, 46, 204, 235, 58, 116, 148, 189, 13, 4, 63, 162, 103,
-    108, 46, 217, 196, 78, 55, 108, 52, 38, 76, 135, 230,
+    157, 87, 106, 123, 20, 15, 91, 189, 214, 99, 232, 81, 97, 110, 50, 197, 170, 205, 244, 39, 123,
+    76, 71, 25, 223, 45, 62, 202, 201, 194, 160, 73,
 ];
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
 // One primary-repository cache is intentionally shared by every linked worktree.
@@ -971,20 +1213,6 @@ fn open_store_connection(
         conn.set_transaction_behavior(TransactionBehavior::Immediate);
     }
     sql_profile::install(&conn, role);
-    Ok(conn)
-}
-
-/// The single-connection in-memory store used by tests. Production ephemeral
-/// stores require a temp file so their reader pool can open independent read
-/// connections. It has no path, so it cannot go through
-/// [`open_store_connection`], and it is the only other way a process reaches a
-/// store.
-pub fn open_in_memory_store_connection() -> rusqlite::Result<Connection> {
-    disable_sqlite_memory_statistics();
-    let mut conn = Connection::open_in_memory()?;
-    register_seal_validation(&conn)?;
-    conn.set_transaction_behavior(TransactionBehavior::Immediate);
-    sql_profile::install(&conn, ConnectionRole::Ephemeral);
     Ok(conn)
 }
 
@@ -1252,10 +1480,7 @@ fn open_unified_connection_unclassified(
         let _scope = crate::profiling::scope("cache_db.migrate");
         migrate(&mut conn)?;
     }
-    if seeded {
-        // The template's cadence started when the template was built.
-        start_collection_cadence(&conn)?;
-    }
+    publication_lineage::require_publication_nonce(&conn).map_err(|error| error.to_string())?;
     if !initialized_before_open {
         delete_legacy_cache_files(&db_path);
     }
@@ -1432,6 +1657,19 @@ pub fn open_readonly_temp_connection(db_path: &Path) -> Result<Connection> {
 /// after advancing to the next file group. Keeping these connections separate
 /// prevents their page cache from displacing interactive analyzer queries.
 pub fn open_streaming_readonly_connection(db_path: &Path) -> Result<Connection> {
+    let conn = open_streaming_readonly_connection_before_query_only(db_path)?;
+    enable_streaming_readonly_query_only(&conn)?;
+    Ok(conn)
+}
+
+/// Open a streaming reader before its connection is restricted to queries.
+///
+/// Store initialization registers SQL functions and the TEMP views they use
+/// after opening the connection. TEMP DDL is rejected once `query_only` is on,
+/// so the store arms the restriction with
+/// [`enable_streaming_readonly_query_only`] after registration.
+#[doc(hidden)]
+pub fn open_streaming_readonly_connection_before_query_only(db_path: &Path) -> Result<Connection> {
     let conn = open_readonly_store_connection(
         db_path,
         ConnectionRole::StreamingReader,
@@ -1444,10 +1682,15 @@ pub fn open_streaming_readonly_connection(db_path: &Path) -> Result<Connection> 
         .map_err(|err| format!("cache DB streaming read-only SQLite error: {err}"))?;
     conn.pragma_update(None, "mmap_size", 0)
         .map_err(|err| format!("cache DB streaming read-only SQLite error: {err}"))?;
-    conn.pragma_update(None, "query_only", "ON")
-        .map_err(|err| format!("cache DB streaming read-only SQLite error: {err}"))?;
     conn.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE_CAPACITY);
     Ok(conn)
+}
+
+/// Restrict an initialized streaming reader to queries.
+#[doc(hidden)]
+pub fn enable_streaming_readonly_query_only(conn: &Connection) -> Result<()> {
+    conn.pragma_update(None, "query_only", "ON")
+        .map_err(|err| format!("cache DB streaming read-only SQLite error: {err}"))
 }
 
 fn canonicalize_cache_db_parent(db_path: &Path) -> Result<PathBuf> {
@@ -1634,112 +1877,7 @@ pub fn prepare_cache_dir(cache_dir: &Path) -> Result<PathBuf> {
         .map_err(|err| format!("cache DB I/O error: {err}"))
 }
 
-/// Seed this build's store from the newest older one, when it has none yet.
-///
-/// Version-keyed naming means an upgrade lands on a file that does not exist,
-/// which would otherwise mean a cold start for a corpus that is already
-/// extracted -- for a semantically indexed corpus, hours of GPU embedding for
-/// vectors that are already on disk and still valid. Copy the newest store this
-/// build can migrate forward instead, carry the copy the rest of the way with
-/// the ordinary migration machinery, and publish it only once it has arrived.
-///
-/// The source is only ever read. An older checkout keeps opening it, and the
-/// existence of a newer file says nothing about whether the older one is still
-/// live (issue #1589). Collection keeps at most one other versioned store next
-/// to this build's: it may remove this source sooner when another candidate
-/// has more recent use, and removes the retained alternate after it has gone
-/// [`VERSION_STORE_GRACE_SECS`] unused. Renaming instead of copying would save
-/// a transient doubling of one store's bytes and cost exactly the guarantee
-/// #1589 was filed to establish.
-///
-/// The copy goes through SQLite's backup API rather than the filesystem
-/// because a live source holds committed pages in its `-wal` sidecar; copying
-/// the main file alone would silently drop them.
-///
-/// Only the holder of the cache directory's upgrade lock stages a copy. Each
-/// copy is as large as the source store, and every linked worktree of a
-/// repository shares one cache directory, so without the lock ten processes
-/// starting at once each wrote their own 10 GB copy, and the ones that were
-/// killed left those copies behind. A process that waited for the lock finds
-/// the store the holder published and stages nothing.
-///
-/// The lock also guards *reading* the older stores. Selecting a candidate reads
-/// its `user_version`, and SQLite's WAL locking protocol does not tolerate a
-/// burst of concurrent openers on one store: an unlucky opener can spend the
-/// protocol retry budget -- about ten seconds -- and then report
-/// SQLITE_PROTOCOL. Every process starting while this build's store is missing
-/// would otherwise probe the same older store at once (#5150).
-fn import_newest_older_store(db_path: &Path) -> Result<()> {
-    if db_path.file_name() != Some(std::ffi::OsStr::new(cache_db_file_name())) {
-        return Ok(());
-    }
-    // A store this build owns already exists. It wins unconditionally: a
-    // downgrade-then-upgrade session must never let an older store overwrite
-    // the newer data written since.
-    if db_path.exists() {
-        return Ok(());
-    }
-    let cache_dir = db_path
-        .parent()
-        .expect("a prepared cache DB path has a parent directory");
-    // Decide whether there is anything to import by name alone. Opening a
-    // candidate here, before the lock, is what let a group of openers land on
-    // one older store at the same time (#5150). A name this build cannot
-    // import only costs one uncontended lock acquisition.
-    if !has_importable_store_candidate(cache_dir)? {
-        return Ok(());
-    }
-    // Held until this function returns, which is after the publish below.
-    let upgrade_lock = open_upgrade_lock(cache_dir)?;
-    match upgrade_lock.try_lock() {
-        Ok(()) => {}
-        Err(std::fs::TryLockError::WouldBlock) => {
-            eprintln!(
-                "Bifrost cache upgrade waiting for another process that is upgrading a store in {}",
-                cache_dir.display()
-            );
-            upgrade_lock
-                .lock()
-                .map_err(|err| format!("cache DB I/O error locking upgrades: {err}"))?;
-        }
-        Err(std::fs::TryLockError::Error(err)) => {
-            return Err(format!("cache DB I/O error locking upgrades: {err}"));
-        }
-    }
-    if db_path.exists() {
-        return Ok(());
-    }
-    // Free the space before this upgrade takes as much again.
-    if let Err(error) = remove_abandoned_staged_copies(cache_dir) {
-        eprintln!("Bifrost cache cleanup of interrupted upgrades skipped: {error}");
-    }
-    // The previous holder or a version-store sweep may have changed the
-    // candidates while this process waited.
-    let Some(source) = newest_importable_store(cache_dir)? else {
-        return Ok(());
-    };
-    let upgraded = stage_upgraded_store(cache_dir, &source)?;
-    match upgraded.persist_noclobber(db_path) {
-        Ok(()) => {
-            eprintln!(
-                "Bifrost cache upgraded {} to schema version {} as {}",
-                source.display(),
-                CURRENT_MIGRATION_VERSION,
-                db_path.display()
-            );
-            Ok(())
-        }
-        // Another process published its own upgrade first. It drew from the
-        // same candidate set, so ours has nothing to add.
-        Err(err) if err.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(err) => Err(format!(
-            "failed to atomically publish upgraded cache DB {}: {}",
-            db_path.display(),
-            err.error
-        )),
-    }
-}
-
+/// Open the file that serializes older-store selection and import.
 fn open_upgrade_lock(cache_dir: &Path) -> Result<std::fs::File> {
     let lock_path = cache_dir.join(UPGRADE_LOCK_FILE_NAME);
     std::fs::OpenOptions::new()
@@ -1820,60 +1958,7 @@ fn staged_copy_paths(cache_dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-/// Copy `source` aside, migrate the copy to this build's schema, and prove the
-/// result before anyone can see it.
-///
-/// Publishing first and migrating afterwards is what made a failed upgrade
-/// unrecoverable: the half-migrated copy already carried this build's file
-/// name, so every later open found the file present, skipped the upgrade, and
-/// failed the same migration again. Nothing here is visible under that name
-/// until the migration has run, the schema matches this build's exactly, and
-/// `quick_check` passes; a failure drops the staged path and leaves the source
-/// untouched.
-fn stage_upgraded_store(cache_dir: &Path, source: &Path) -> Result<tempfile::TempPath> {
-    let source_conn = open_store_connection(
-        source,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-        ConnectionRole::UpgradeSource,
-    )
-    .map_err(|err| {
-        format!(
-            "cache DB upgrade SQLite error reading {}: {err}",
-            source.display()
-        )
-    })?;
-    refuse_pre_native_import(&source_conn, source)?;
-    let staged = tempfile::Builder::new()
-        .prefix(STAGED_UPGRADE_PREFIX)
-        .tempfile_in(cache_dir)
-        .map_err(|err| format!("failed to stage cache DB upgrade: {err}"))?
-        // Release the handle. SQLite owns the path from here; the guard only
-        // keeps the deletion-on-drop that makes a failed upgrade leave nothing.
-        .into_temp_path();
-    {
-        source_conn
-            .backup(rusqlite::MAIN_DB, &staged, None)
-            .map_err(|err| {
-                format!(
-                    "cache DB upgrade SQLite error copying {}: {err}",
-                    source.display()
-                )
-            })?;
-    }
-    let mut conn = open_store_connection(
-        &staged,
-        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-        ConnectionRole::UpgradeTarget,
-    )
-    .map_err(|err| format!("cache DB upgrade SQLite error: {err}"))?;
-    install_busy_timeout(&conn)?;
-    refuse_pre_native_import(&conn, source)?;
-    migrate(&mut conn)?;
-    verify_upgraded_store(&conn, source)?;
-    drop(conn);
-    Ok(staged)
-}
-
+/// Reject stores that predate the native schema migration chain.
 fn refuse_pre_native_import(conn: &Connection, source: &Path) -> Result<()> {
     let version = cache_migration_version(conn)?;
     if version < FIRST_NATIVE_CACHE_VERSION {
@@ -2709,6 +2794,86 @@ fn migrate_locked(
     }
 
     let schema_objects = user_schema_objects(&tx)?;
+    // A pre-publication F store already used schema version 325 for its C#
+    // migrations. Later master migrations 0315, 0316 and 0323 sort below that
+    // version, so repair the missing JVM, surface and summary schema before the
+    // normal shape check. The public migrate path sees such a store at 325 on
+    // the non-rebuild pass, before it applies 0334, so the repair cannot be
+    // limited to the rebuild pass. Running it there is safe: migrate disables
+    // foreign keys whenever user_version is below the current version, and a
+    // store already at the current version is repaired on the rebuild pass,
+    // which also disables them.
+    // Migration 0315 invalidates its derived JVM inventory; all repairs leave
+    // source facts and the independent C# friend-attribute family intact.
+    let legacy_f_schema = if user_version >= 325
+        && (user_version < CURRENT_MIGRATION_VERSION || rebuild_invalid_schema)
+    {
+        tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='resolution_csharp_friend_attributes')
+                AND EXISTS(SELECT 1 FROM pragma_table_info('resolution_fragment_interiors') WHERE name='expected_csharp_friend_attribute_count')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|err| format!("cache DB SQLite error: {err}"))?
+    } else {
+        false
+    };
+    let legacy_f_schema_missing_jvm_abstract = legacy_f_schema
+        && tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='jvm_external_owner_members')
+                    AND NOT EXISTS(SELECT 1 FROM pragma_table_info('jvm_external_owner_members') WHERE name='is_abstract')",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|err| format!("cache DB SQLite error: {err}"))?;
+    let legacy_f_schema_missing_surface_relations = legacy_f_schema
+        && tx
+            .query_row(
+                "SELECT NOT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='surface_sets')
+                    AND NOT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='surface_ids')",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|err| format!("cache DB SQLite error: {err}"))?;
+    let legacy_f_schema_missing_summary_representations = legacy_f_schema
+        && tx
+            .query_row(
+                "SELECT NOT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='resolution_unit_summary_input_files')",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|err| format!("cache DB SQLite error: {err}"))?;
+    if legacy_f_schema_missing_jvm_abstract {
+        let migration = POST_BASELINE_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 315)
+            .expect("migration 0315 is registered");
+        tx.execute_batch(migration.sql).map_err(|err| {
+            format!("cache DB migration error applying legacy version 315: {err}")
+        })?;
+    }
+    // F stores used user_version 325 before master introduced migration 0316.
+    // Run the absent compatible migration in place so existing C# friend rows
+    // survive instead of treating the lower-numbered schema addition as done.
+    if legacy_f_schema_missing_surface_relations {
+        let migration = POST_BASELINE_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 316)
+            .expect("migration 0316 is registered");
+        tx.execute_batch(migration.sql).map_err(|err| {
+            format!("cache DB migration error applying legacy version 316: {err}")
+        })?;
+    }
+    if legacy_f_schema_missing_summary_representations {
+        let migration = POST_BASELINE_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 323)
+            .expect("migration 0323 is registered");
+        tx.execute_batch(migration.sql).map_err(|err| {
+            format!("cache DB migration error applying legacy version 323: {err}")
+        })?;
+    }
     let below_floor = user_version < BASELINE_MIGRATION_VERSION
         && (user_version != 0 || !schema_objects.is_empty());
     let current_schema_invalid =
@@ -2723,6 +2888,7 @@ fn migrate_locked(
 
     if user_version == 0 && schema_objects.is_empty() {
         initialize_fresh_schema(&tx)?;
+        mint_publication_nonce(&tx)?;
         tx.pragma_update(None, "user_version", CURRENT_MIGRATION_VERSION)
             .map_err(|err| format!("cache DB current-schema version error: {err}"))?;
         start_collection_cadence(&tx)?;
@@ -2742,7 +2908,29 @@ fn migrate_locked(
         .filter(|migration| migration.version > user_version)
     {
         let version = migration.version;
-        {
+        // Earlier M6a3 drafts assigned the friend-attribute schema to 0313.
+        // Those stores report schema 313 but already contain both objects
+        // added by 0325, so only advance the version for this duplicate step.
+        let legacy_friend_attributes_already_present = if version == 325 {
+            let has_table: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='resolution_csharp_friend_attributes')",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|err| format!("cache DB SQLite error: {err}"))?;
+            let has_column: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('resolution_fragment_interiors') WHERE name='expected_csharp_friend_attribute_count')",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|err| format!("cache DB SQLite error: {err}"))?;
+            has_table && has_column
+        } else {
+            false
+        };
+        if !legacy_friend_attributes_already_present {
             let _scope = crate::profiling::scope_with(|| format!("cache_db.migration.{version}"));
             tx.execute_batch(migration.sql).map_err(|err| {
                 format!("cache DB migration error applying version {version}: {err}")
@@ -2810,28 +2998,66 @@ static STORE_TEMPLATE: Lazy<crate::sqlite_template::Template> = Lazy::new(|| {
 /// whose schema identity check rejects a template that does not match this
 /// build.
 fn seed_new_store_from_template(db_path: &Path, template_dir: Option<&Path>) -> Result<bool> {
-    crate::sqlite_template::seed_missing_database(
+    crate::sqlite_template::seed_missing_database_with_finalizer(
         db_path,
         template_dir,
         &STORE_TEMPLATE,
-        build_fresh_store,
+        build_store_template,
+        finalize_new_store,
     )
 }
 
-/// Create an empty current-schema store at `path` through the ordinary path.
-fn build_fresh_store(path: &Path) -> Result<()> {
+/// Construct reusable, unminted material; normal migrate() mints new stores.
+fn build_store_template(path: &Path) -> Result<()> {
     let mut conn = open_store_connection(
         path,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         ConnectionRole::Writer,
     )
-    .map_err(|err| format!("cache DB template SQLite error: {err}"))?;
+    .map_err(|error| format!("cache DB template SQLite error: {error}"))?;
     configure_connection(&mut conn)?;
-    migrate(&mut conn)?;
-    // Closing the only connection checkpoints the WAL into the main file and
-    // removes the WAL, so the main file alone is the complete store.
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| format!("cache DB template transaction: {error}"))?;
+    initialize_fresh_schema(&tx)?;
+    tx.pragma_update(None, "user_version", CURRENT_MIGRATION_VERSION)
+        .map_err(|error| format!("cache DB template version: {error}"))?;
+    tx.commit()
+        .map_err(|error| format!("cache DB template commit: {error}"))?;
+    close_created_store(conn)
+}
+
+/// Mint only a private template destination, never an existing target path.
+fn finalize_new_store(path: &Path) -> Result<()> {
+    let mut conn = open_store_connection(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        ConnectionRole::Writer,
+    )
+    .map_err(|error| format!("cache DB destination SQLite error: {error}"))?;
+    install_busy_timeout(&conn)?;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| format!("cache DB destination transaction: {error}"))?;
+    if !current_schema_shape_is_valid(&tx)? {
+        return Err("cache DB template does not match the current schema".to_owned());
+    }
+    mint_publication_nonce(&tx)?;
+    start_collection_cadence(&tx)?;
+    tx.commit()
+        .map_err(|error| format!("cache DB destination commit: {error}"))?;
+    close_created_store(conn)
+}
+
+fn close_created_store(conn: Connection) -> Result<()> {
+    let checkpoint = checkpoint_wal_for_close(&conn)?;
+    if checkpoint != CloseCheckpoint::Complete {
+        return Err(format!(
+            "private store checkpoint could not complete: {checkpoint:?}"
+        ));
+    }
     conn.close()
-        .map_err(|(_, err)| format!("cache DB template close error: {err}"))
+        .map_err(|(_, error)| format!("private store close failed: {error}"))
 }
 
 pub fn now_unix_seconds() -> i64 {
@@ -2941,7 +3167,14 @@ fn delete_store_if_idle(store: &Path) -> Result<bool> {
     // On Unix, keep the SQLite claim live through unlink. On Windows, the
     // delete claim denies new reads and writes while permitting deletion.
     // Delete the database last so a sidecar error leaves authoritative data.
-    for suffix in ["-wal", "-shm", "-journal", ""] {
+    for suffix in [
+        crate::cache_gc::BUILD_LOCK_HOLDER_SUFFIX,
+        crate::cache_gc::BUILD_LOCK_HOLDER_MARK_SUFFIX,
+        "-wal",
+        "-shm",
+        "-journal",
+        "",
+    ] {
         let path = store_file_with_suffix(store, suffix);
         match std::fs::remove_file(&path) {
             Ok(()) => {}
@@ -3174,10 +3407,136 @@ fn parse_sqlite_version(version: &str) -> Option<(u32, u32, u32)> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+    use std::fs;
+    use std::path::Path;
     use std::sync::{Arc, Barrier};
     use std::thread;
 
     use super::*;
+
+    // These tests assert earlier migrations' data effects before 0419 deliberately
+    // withdraws the derived families. Finish with migrate() after those assertions.
+    fn apply_migrations_before_derivation_identities(conn: &Connection) {
+        let version = cache_migration_version(conn).unwrap();
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
+        for migration in POST_BASELINE_MIGRATIONS
+            .iter()
+            .filter(|m| m.version > version && m.version < 419)
+        {
+            conn.execute_batch(migration.sql).unwrap();
+            conn.pragma_update(None, "user_version", migration.version)
+                .unwrap();
+        }
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        validate_foreign_keys(conn).unwrap();
+    }
+
+    #[test]
+    fn cut_hint_migration_preserves_populated_evaluation_rows() {
+        for foreign_keys in [false, true] {
+            let conn = create_current_baseline_without_migration();
+            for migration in POST_BASELINE_MIGRATIONS
+                .iter()
+                .filter(|migration| migration.version < 426)
+            {
+                conn.execute_batch(migration.sql).unwrap();
+            }
+            conn.pragma_update(None, "foreign_keys", foreign_keys)
+                .unwrap();
+            let hash = "a".repeat(64);
+            conn.execute("INSERT INTO policy_evaluations(evaluation_id,base_tree_oid,options_digest,configuration_fingerprint,active_model_set_hash,engine_epoch,resolved_commit,published_at) VALUES(1,?1,?2,?2,?2,?2,?1,1)", rusqlite::params!["b".repeat(40), hash]).unwrap();
+            conn.execute("INSERT INTO policy_evaluation_policies(evaluation_id,policy_id,source_hash,semantic_hash,completion,completion_detail,qualified,qualification_detail,diagnostics) VALUES(1,'test.cut-hint',?1,?1,'complete','\"complete\"',1,'','[]')", [&hash]).unwrap();
+            conn.execute("INSERT INTO policy_evaluation_identities(evaluation_id,policy_id,finding_id) VALUES(1,'test.cut-hint',?1)", [[7_u8; 32].as_slice()]).unwrap();
+            conn.execute_batch(
+                POST_BASELINE_MIGRATIONS
+                    .iter()
+                    .find(|migration| migration.version == 426)
+                    .unwrap()
+                    .sql,
+            )
+            .unwrap();
+            let row: (Option<Vec<u8>>, Vec<u8>) = conn.query_row("SELECT cut_hint_digest,finding_id FROM policy_evaluations JOIN policy_evaluation_identities USING(evaluation_id)", [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+            assert_eq!(row, (None, vec![7; 32]));
+            conn.execute(
+                "UPDATE policy_evaluations SET cut_hint_digest = ?1",
+                [[9_u8; 32].as_slice()],
+            )
+            .unwrap();
+            let digest: Vec<u8> = conn
+                .query_row(
+                    "SELECT cut_hint_digest FROM policy_evaluations",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(digest, [9; 32]);
+            validate_foreign_keys(&conn).unwrap();
+        }
+    }
+
+    #[test]
+    fn post_baseline_migrations_are_ordered_and_match_their_filenames() {
+        let mut seen_versions = HashSet::new();
+        for pair in POST_BASELINE_MIGRATIONS.windows(2) {
+            assert!(
+                pair[0].version < pair[1].version,
+                "migration versions are not strictly increasing: {} then {}",
+                pair[0].version,
+                pair[1].version
+            );
+        }
+
+        // A migration file is named for its version, so a registered migration
+        // finds its file by that version. Contents need not be unique: a repair
+        // migration may repeat an earlier idempotent migration's SQL.
+        let migration_directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations/cache");
+        let mut files_by_version: std::collections::HashMap<i64, Vec<(String, String)>> =
+            std::collections::HashMap::new();
+        for entry in fs::read_dir(&migration_directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|extension| extension != "sql") {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let Some(version) = name
+                .split_once('-')
+                .and_then(|(version, _)| version.parse::<i64>().ok())
+            else {
+                continue;
+            };
+            let sql = fs::read_to_string(&path).unwrap();
+            files_by_version
+                .entry(version)
+                .or_default()
+                .push((name, sql));
+        }
+
+        for migration in POST_BASELINE_MIGRATIONS {
+            assert!(
+                seen_versions.insert(migration.version),
+                "duplicate registered migration version {}",
+                migration.version
+            );
+            let files = files_by_version
+                .get(&migration.version)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let names = files.iter().map(|(name, _)| name).collect::<Vec<_>>();
+            assert_eq!(
+                files.len(),
+                1,
+                "migration version {} must have exactly one file named for it, found {names:?}",
+                migration.version
+            );
+            assert!(
+                files[0].1 == migration.sql,
+                "registered SQL for migration version {} differs from {}",
+                migration.version,
+                files[0].0
+            );
+        }
+    }
 
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
@@ -3294,6 +3653,12 @@ mod tests {
             (
                 "lookup",
                 "'derivation:rust_unit_inputs:v1'",
+                "rel_path,name,digest",
+                "'a.rs','Thing',zeroblob(32)",
+            ),
+            (
+                "lookup",
+                "'derivation:rust_unit_inputs:v2'",
                 "rel_path,name,digest",
                 "'a.rs','Thing',zeroblob(32)",
             ),
@@ -3696,6 +4061,7 @@ mod tests {
     use crate::cache_gc::PlannerStatisticsState;
 
     #[test]
+    #[hardwon("#11535: independent template destinations inherited one publication nonce")]
     fn a_store_seeded_from_the_template_matches_a_store_opened_without_one() {
         let temp = tempfile::tempdir().unwrap();
         // The template builders open with SQLITE_OPEN_NOFOLLOW, which rejects a
@@ -3772,6 +4138,72 @@ mod tests {
             migrate(&mut conn).unwrap();
             assert!(current_schema_is_valid(&conn).unwrap());
         }
+        let template = Connection::open(template_dir.join(STORE_TEMPLATE.file_name())).unwrap();
+        assert!(matches!(
+            publication_lineage::require_publication_nonce(&template),
+            Err(publication_lineage::PublicationLineageError::Unminted)
+        ));
+        let mut nonces = HashSet::new();
+        for path in [&reference, &first, &second] {
+            let mut conn = Connection::open(path).unwrap();
+            let nonce = publication_lineage::require_publication_nonce(&conn).unwrap();
+            assert!(
+                nonces.insert(nonce),
+                "independent destinations shared lineage"
+            );
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            assert!(
+                mint_publication_nonce(&tx).is_err(),
+                "mint must not be idempotent"
+            );
+            tx.commit().unwrap();
+            conn.execute(
+                "UPDATE blob_publication_witness_sequence SET next_witness = next_witness + 7",
+                [],
+            )
+            .unwrap();
+            drop(conn);
+            let reopened = open_unified_connection_with_template_dir(path, None).unwrap();
+            assert_eq!(
+                publication_lineage::require_publication_nonce(&reopened).unwrap(),
+                nonce
+            );
+            assert_eq!(
+                reopened
+                    .query_row(
+                        "SELECT next_witness FROM blob_publication_witness_sequence",
+                        [],
+                        |row| row.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                8
+            );
+        }
+        let raced = root.join("raced.db");
+        let winner_nonce =
+            publication_lineage::require_publication_nonce(&Connection::open(&reference).unwrap())
+                .unwrap();
+        let published = crate::sqlite_template::seed_missing_database_with_finalizer(
+            &raced,
+            Some(&template_dir),
+            &STORE_TEMPLATE,
+            build_store_template,
+            |stage| {
+                finalize_new_store(stage)?;
+                // A separate creator wins while this copy is still private.
+                std::fs::copy(&reference, &raced).map_err(|error| error.to_string())?;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(!published);
+        assert_eq!(
+            publication_lineage::require_publication_nonce(&Connection::open(&raced).unwrap())
+                .unwrap(),
+            winner_nonce
+        );
     }
 
     #[test]
@@ -3845,6 +4277,245 @@ mod tests {
         );
     }
 
+    #[test]
+    #[hardwon("#9925: guarded-pattern migration omitted the candidate gap column")]
+    fn guarded_pattern_gap_upgrade_preserves_both_namespaces() {
+        // Start after the registered prerequisites, retaining raw identities
+        // and the historical publication lineage through 0423.
+        let conn = test_connection_through_migration(423);
+        // The historical constructor mints in 0264; 0411 preserves that installed
+        // lineage. A NULL-only constructor mint must not run on this existing store.
+        let nonce = publication_lineage::require_publication_nonce(&conn).unwrap();
+        for (table, column) in [
+            ("csharp_compilation_sets", "derivation_identity"),
+            ("go_context_selections", "derivation_identity"),
+            ("jvm_context_revisions", "derivation_identity"),
+            ("resolution_unit_summaries", "derivation_identity"),
+            ("rust_source_listing_certificates", "derivation_identity"),
+            ("jvm_external_provider_publications", "projection_identity"),
+            ("rust_crate_reconciliations", "derivation_identity"),
+        ] {
+            assert_eq!(
+                conn.query_row(
+                    "SELECT type FROM pragma_table_info(?1) WHERE name = ?2",
+                    rusqlite::params![table, column],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+                "BLOB",
+                "pre-422 raw identity in {table}"
+            );
+        }
+        let before = schema_object_definitions(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, 'rust', 0)",
+            ["a".repeat(40)],
+        )
+        .unwrap();
+        let blob = conn.last_insert_rowid();
+        conn.execute("INSERT INTO semantic_ir_publications(blob_id, lang, producer_epoch, content_digest, source_bytes, outcome, procedure_count, logical_rows, payload_bytes, go_predeclared_builtins, publication_state) VALUES(?1, 'rust', 'fixture', zeroblob(32), 0, 0, 0, 2, 4, jsonb('[]'), 'complete')", [blob]).unwrap();
+        let tables = [
+            "semantic_ir_guarded_pattern_projections",
+            "candidate_macro_semantic_ir_guarded_pattern_projections",
+        ];
+        for table in tables {
+            for ordinal in [0, 1] {
+                conn.execute(
+                    &format!("INSERT INTO {table} VALUES(?1, 0, ?2, 0, 0, 0, 0, 0, 1, 0)"),
+                    rusqlite::params![blob, ordinal],
+                )
+                .unwrap();
+            }
+        }
+        let (migration_version, migration_sql) = POST_BASELINE_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 424)
+            .map(|migration| (migration.version, migration.sql))
+            .expect("guarded-pattern gap migration");
+        assert!(
+            conn.pragma_query_value(None, "foreign_keys", |row| row.get::<_, bool>(0))
+                .unwrap()
+        );
+        conn.execute_batch(migration_sql)
+            .expect("apply guarded-pattern gap migration with foreign keys enabled");
+        conn.pragma_update(None, "user_version", migration_version)
+            .unwrap();
+        assert_eq!(cache_migration_version(&conn).unwrap(), migration_version);
+        assert_eq!(
+            publication_lineage::require_publication_nonce(&conn).unwrap(),
+            nonce
+        );
+        for table in tables {
+            assert_eq!(
+                conn.query_row(
+                    &format!("SELECT count(*) FROM {table} WHERE gap IS NULL"),
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                2
+            );
+            conn.execute(&format!("UPDATE {table} SET gap = 7 WHERE ordinal = 0"), [])
+                .unwrap();
+            assert_eq!(
+                conn.query_row(
+                    &format!("SELECT gap FROM {table} WHERE ordinal = 0"),
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                7
+            );
+            assert!(
+                conn.execute(&format!("UPDATE {table} SET gap = 7 WHERE ordinal = 1"), [])
+                    .is_err()
+            );
+            assert!(
+                conn.execute(
+                    &format!("UPDATE {table} SET gap = -1 WHERE ordinal = 1"),
+                    []
+                )
+                .is_err()
+            );
+            assert_eq!(
+                conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                2
+            );
+        }
+        // Reverse in migration order, retaining the legacy rows and schema.
+        for (table, index) in [
+            (tables[1], "candidate_macro_semantic_ir_guarded_pattern_gap"),
+            (tables[0], "semantic_ir_guarded_pattern_gap"),
+        ] {
+            conn.execute_batch(&format!(
+                "DROP INDEX {index}; ALTER TABLE {table} DROP COLUMN gap;"
+            ))
+            .unwrap();
+            assert_eq!(
+                conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                2
+            );
+        }
+        assert_eq!(schema_object_definitions(&conn).unwrap(), before);
+    }
+
+    #[test]
+    fn candidate_macro_migration_preserves_rows_and_publication_lifetime() {
+        let conn = create_current_baseline_without_migration();
+        for migration in POST_BASELINE_MIGRATIONS.iter().filter(|m| m.version < 314) {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, 'rust', 0)",
+            ["a".repeat(40)],
+        )
+        .unwrap();
+        let blob = conn.last_insert_rowid();
+        conn.execute("INSERT INTO semantic_ir_publications(blob_id, lang, producer_epoch, content_digest, source_bytes, outcome, procedure_count, logical_rows, payload_bytes, go_predeclared_builtins, publication_state) VALUES(?1, 'rust', 'fixture', zeroblob(32), 0, 0, 0, 2, 4, jsonb('[]'), 'complete')", [blob]).unwrap();
+        conn.execute(
+            "INSERT INTO semantic_ir_texts VALUES(?1, 0, 'base')",
+            [blob],
+        )
+        .unwrap();
+        let before = raw_schema_object_definitions(&conn).unwrap();
+        let candidate_macro_migration = POST_BASELINE_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 314)
+            .unwrap();
+        conn.execute_batch(candidate_macro_migration.sql).unwrap();
+        let after = raw_schema_object_definitions(&conn).unwrap();
+        for object in before {
+            assert!(
+                after.contains(&object),
+                "existing object changed: {object:?}"
+            );
+        }
+        assert_eq!(
+            conn.query_row(
+                "SELECT text FROM semantic_ir_texts WHERE blob_id=?1",
+                [blob],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "base"
+        );
+        let guarded_tables = conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name GLOB 'candidate_macro_semantic_ir_*' ORDER BY name").unwrap().query_map([], |r| r.get::<_, String>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        assert_eq!(guarded_tables.len(), 50);
+        for guarded in &guarded_tables {
+            if guarded == "candidate_macro_semantic_ir_candidates" {
+                continue;
+            }
+            let base = guarded.strip_prefix("candidate_macro_").unwrap();
+            let columns = |name: &str| {
+                conn.prepare(&format!(
+                    "SELECT name,type,\"notnull\",dflt_value,pk FROM pragma_table_info('{name}')"
+                ))
+                .unwrap()
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, i64>(4)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+            };
+            assert_eq!(columns(guarded), columns(base), "{guarded}");
+        }
+        conn.execute(
+            "INSERT INTO candidate_macro_semantic_ir_texts VALUES(?1, 0, 'alternate')",
+            [blob],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM semantic_ir_publications WHERE blob_id=?1",
+            [blob],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM candidate_macro_semantic_ir_texts",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        conn.execute("INSERT INTO semantic_ir_publications(blob_id, lang, producer_epoch, content_digest, source_bytes, outcome, procedure_count, logical_rows, payload_bytes, go_predeclared_builtins, publication_state) VALUES(?1, 'rust', 'fixture', zeroblob(32), 0, 0, 0, 1, 0, jsonb('[]'), 'complete')", [blob]).unwrap();
+        conn.execute(
+            "INSERT INTO candidate_macro_semantic_ir_texts VALUES(?1, 0, 'alternate')",
+            [blob],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM blobs WHERE id=?1", [blob])
+            .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM candidate_macro_semantic_ir_texts",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            0
+        );
+    }
+
     fn current_rust_connection() -> Connection {
         let mut connection = Connection::open_in_memory().expect("open in-memory cache DB");
         configure_connection(&mut connection).expect("configure cache DB");
@@ -3884,6 +4555,8 @@ mod tests {
     mod cpp_class_templates;
     #[path = "csharp_compilation_migration.rs"]
     mod csharp_compilation_migration;
+    #[path = "policy_unit_operands.rs"]
+    mod policy_unit_operands;
     #[path = "resolution_schema.rs"]
     mod resolution_schema;
     #[path = "rust_crate_rows.rs"]
@@ -4159,6 +4832,12 @@ mod tests {
                 b"",
             )
             .unwrap();
+            for suffix in [
+                crate::cache_gc::BUILD_LOCK_HOLDER_SUFFIX,
+                crate::cache_gc::BUILD_LOCK_HOLDER_MARK_SUFFIX,
+            ] {
+                std::fs::write(store_file_with_suffix(&store, suffix), b"").unwrap();
+            }
         }
 
         let current = temp.path().join(cache_db_file_name());
@@ -4168,6 +4847,12 @@ mod tests {
             let store = temp.path().join(cache_db_file_name_for_version(version));
             assert!(!store.exists(), "obsolete schema {version} survived open");
             assert!(!store_file_with_suffix(&store, INITIAL_BUILD_LOCK_SUFFIX).exists());
+            for suffix in [
+                crate::cache_gc::BUILD_LOCK_HOLDER_SUFFIX,
+                crate::cache_gc::BUILD_LOCK_HOLDER_MARK_SUFFIX,
+            ] {
+                assert!(!store_file_with_suffix(&store, suffix).exists(), "{suffix}");
+            }
         }
     }
 
@@ -4202,7 +4887,7 @@ mod tests {
     fn create_importable_store(cache_dir: &Path) {
         let legacy = cache_dir.join(LEGACY_CACHE_DB_FILE_NAME);
         std::fs::File::create(&legacy).unwrap();
-        build_fresh_store(&legacy).unwrap();
+        drop(open_unified_connection_with_template_dir(&legacy, None).unwrap());
     }
 
     /// The files a process killed mid-upgrade leaves: the staged copy and its
@@ -4229,6 +4914,62 @@ mod tests {
         // Staging opens with SQLITE_OPEN_NOFOLLOW (#4604).
         let root = std::fs::canonicalize(temp.path()).unwrap();
         create_importable_store(&root);
+        let source_path = root.join(LEGACY_CACHE_DB_FILE_NAME);
+        let source = open_unified_connection_with_template_dir(&source_path, None).unwrap();
+        let source_nonce = publication_lineage::require_publication_nonce(&source).unwrap();
+        // Source facts publish after their parsed parent is complete, with
+        // the visibility requirement matching the helper's facts_version=1.
+        let kept = insert_visibility_blob_fixture(&source, "kept-import-publication", Some(1), 1);
+        insert_empty_visibility_source(&source, kept);
+        assert_eq!(
+            source
+                .query_row(
+                    "SELECT meta.is_complete, meta.declaration_visibility_version,
+                    marker.facts_version, facts.publication_state
+             FROM blob_meta AS meta JOIN source_declaration_visibility_manifests AS marker
+               ON marker.blob_id=meta.blob_id
+             JOIN source_fact_manifests AS facts ON facts.blob_id=meta.blob_id
+             WHERE meta.blob_id=?1",
+                    [kept],
+                    |row| Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?
+                    )),
+                )
+                .unwrap(),
+            (1, 1, 1, "complete".to_owned())
+        );
+        let retired =
+            insert_visibility_blob_fixture(&source, "deleted-import-publication", None, 1);
+        source
+            .execute("DELETE FROM blobs WHERE id=?1", [retired])
+            .unwrap();
+        let source_next: i64 = source
+            .query_row(
+                "SELECT next_witness FROM blob_publication_witness_sequence",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let kept_witness: i64 = source
+            .query_row(
+                "SELECT publication_witness FROM blob_meta WHERE blob_id=?1",
+                [kept],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let failed_destination = root.join("failed-creation.db");
+        staged_import::assert_failed_creation_is_unpublished(
+            &root,
+            &source_path,
+            &failed_destination,
+        );
+        assert_eq!(
+            publication_lineage::require_publication_nonce(&source).unwrap(),
+            source_nonce
+        );
         let db_path = root.join(cache_db_file_name());
         let barrier = Barrier::new(UPGRADERS);
         let finished = std::sync::atomic::AtomicBool::new(false);
@@ -4287,6 +5028,116 @@ mod tests {
             CURRENT_MIGRATION_VERSION
         );
         assert!(staged_copy_paths(&root).unwrap().is_empty());
+        let imported_nonce = publication_lineage::require_publication_nonce(&conn).unwrap();
+        assert_ne!(imported_nonce, source_nonce);
+        assert_eq!(
+            conn.query_row(
+                "SELECT next_witness FROM blob_publication_witness_sequence",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            source_next
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT publication_witness FROM blob_meta WHERE blob_id=?1",
+                [kept],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            kept_witness
+        );
+        assert!(
+            conn.execute(
+                "UPDATE blob_publication_witness_sequence SET store_nonce=randomblob(16)",
+                []
+            )
+            .is_err()
+        );
+        let later = insert_visibility_blob_fixture(&source, "source-still-live", None, 1);
+        assert_eq!(
+            source
+                .query_row(
+                    "SELECT publication_witness FROM blob_meta WHERE blob_id=?1",
+                    [later],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            source_next
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT next_witness FROM blob_publication_witness_sequence",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            source_next
+        );
+        drop(conn);
+        let reopened = open_unified_connection_with_template_dir(&db_path, None).unwrap();
+        assert_eq!(
+            publication_lineage::require_publication_nonce(&reopened).unwrap(),
+            imported_nonce
+        );
+        assert_eq!(
+            publication_lineage::require_publication_nonce(&source).unwrap(),
+            source_nonce
+        );
+        assert_eq!(
+            reopened
+                .query_row(
+                    "SELECT publication_state FROM source_fact_manifests WHERE blob_id=?1",
+                    [kept],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "complete"
+        );
+        assert!(
+            reopened
+                .execute(
+                    "UPDATE source_fact_manifests SET payload_bytes=1 WHERE blob_id=?1",
+                    [kept]
+                )
+                .is_err()
+        );
+        // An exhausted imported clock remains exhausted; creation never resets
+        // it to the empty template's counter or recomputes from live rows.
+        let exhausted_dir = root.join("exhausted");
+        std::fs::create_dir(&exhausted_dir).unwrap();
+        create_importable_store(&exhausted_dir);
+        let exhausted_source = open_unified_connection_with_template_dir(
+            &exhausted_dir.join(LEGACY_CACHE_DB_FILE_NAME),
+            None,
+        )
+        .unwrap();
+        exhausted_source
+            .execute(
+                "UPDATE blob_publication_witness_sequence SET next_witness=9223372036854775807",
+                [],
+            )
+            .unwrap();
+        let exhausted_nonce =
+            publication_lineage::require_publication_nonce(&exhausted_source).unwrap();
+        let exhausted_target = exhausted_dir.join(cache_db_file_name());
+        import_newest_older_store(&exhausted_target).unwrap();
+        let exhausted = Connection::open(&exhausted_target).unwrap();
+        assert_ne!(
+            publication_lineage::require_publication_nonce(&exhausted).unwrap(),
+            exhausted_nonce
+        );
+        assert_eq!(
+            exhausted
+                .query_row(
+                    "SELECT next_witness FROM blob_publication_witness_sequence",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            i64::MAX
+        );
     }
 
     #[test]
@@ -5476,10 +6327,10 @@ mod tests {
         conn.execute_batch("INSERT INTO blobs(id,blob_oid,lang,generation) VALUES(1,printf('%040d',1),'go',0);
           INSERT INTO resolution_unit_summary_members VALUES(1,0,1,'main.go','source');
           INSERT INTO resolution_unit_summary_containers VALUES(1,'',NULL);
-          INSERT INTO resolution_unit_summary_placements VALUES(1,'',0,0);
+          INSERT INTO resolution_unit_summary_placements(summary_id,container_path,member_ordinal,scope_ordinal) VALUES(1,'',0,0);
           INSERT INTO resolution_unit_summary_dependencies VALUES(1,0,zeroblob(32),zeroblob(32),'external',NULL);
           INSERT INTO resolution_unit_summary_dependency_names VALUES(1,'normal','dep',0);
-          INSERT INTO resolution_unit_summary_imports VALUES(1,1,0,'named',0,0,'resolved');
+          INSERT INTO resolution_unit_summary_imports(summary_id,blob_id,import_id,kind,import_definition_key,dependency_ordinal,state) VALUES(1,1,0,'named',0,0,'resolved');
           INSERT INTO resolution_unit_summary_reads VALUES(1,0,'epoch',zeroblob(32),zeroblob(32));
           INSERT INTO resolution_unit_summary_gaps VALUES(1,'test','',jsonb('{}'));").unwrap();
         validate_foreign_keys(&conn).unwrap();
@@ -5604,7 +6455,7 @@ mod tests {
         )
         .unwrap();
         conn.execute_batch("INSERT INTO resolution_unit_summary_containers VALUES(2,'',NULL);
-            INSERT INTO resolution_unit_summary_placements VALUES(2,'',0,0);
+            INSERT INTO resolution_unit_summary_placements(summary_id,container_path,member_ordinal,scope_ordinal) VALUES(2,'',0,0);
             INSERT INTO rust_resolution_unit_summary_container_attributes(summary_id,container_path,kind) VALUES(2,'','module');
             INSERT INTO rust_resolution_unit_summary_placement_attributes(summary_id,container_path,member_ordinal,placement,source_kind) VALUES(2,'',0,'root','declared');
             INSERT INTO resolution_unit_summary_dependencies VALUES(2,0,zeroblob(32),zeroblob(32),'external',NULL);
@@ -5621,14 +6472,14 @@ mod tests {
         );
         assert!(
             conn.execute(
-                "INSERT INTO resolution_unit_summary_placements VALUES(2,'missing',0,0)",
+                "INSERT INTO resolution_unit_summary_placements(summary_id,container_path,member_ordinal,scope_ordinal) VALUES(2,'missing',0,0)",
                 []
             )
             .is_err()
         );
         assert!(
             conn.execute(
-                "INSERT INTO resolution_unit_summary_placements VALUES(2,'',1,0)",
+                "INSERT INTO resolution_unit_summary_placements(summary_id,container_path,member_ordinal,scope_ordinal) VALUES(2,'',1,0)",
                 []
             )
             .is_err()
@@ -6093,12 +6944,14 @@ mod tests {
                 |row| row.get::<_, i64>(0)
             )
             .unwrap(),
-            1
+            // Migration 0334 withdraws every unit summary so the surface-coordinate
+            // family is re-derived under the new derivation versions.
+            0
         );
         validate_foreign_keys(&conn).unwrap();
         assert!(current_schema_is_valid(&conn).unwrap());
         // Exactly the approved new kind and profile authority are admitted.
-        conn.execute("INSERT INTO resolution_unit_summaries(summary_id,lang,unit_kind,unit_key,summary_digest,producer_epoch,derivation_version,complete,publication_state) VALUES(101,'python','python_environment',zeroblob(32),?1,'native',1,0,'building')", [[101u8;32].as_slice()]).unwrap();
+        conn.execute("INSERT INTO resolution_unit_summaries(summary_id,lang,unit_kind,unit_key,summary_digest,producer_epoch,derivation_identity,complete,publication_state) VALUES(101,'python','python_environment',zeroblob(32),?1,'native',zeroblob(32),0,'building')", [[101u8;32].as_slice()]).unwrap();
         conn.execute("INSERT INTO resolution_unit_summary_versions(workspace_id,lang,generation,unit_key,profile_digest,valid_from,summary_id) VALUES(?1,'python',4,zeroblob(32),?2,7,101)",rusqlite::params!["w".repeat(64),[5u8;32].as_slice()]).unwrap();
         for lang in ["rust", "java", "kotlin", "scala"] {
             assert!(conn.execute("INSERT INTO resolution_unit_summary_versions(workspace_id,lang,generation,unit_key,profile_digest,valid_from,summary_id) VALUES(?1,?2,4,zeroblob(32),?3,7,101)",rusqlite::params!["w".repeat(64),lang,[5u8;32].as_slice()]).is_err());
@@ -6824,11 +7677,796 @@ mod tests {
     }
 
     #[test]
+    fn rust_drop_inventory_receipt_migration_preserves_rows_and_checks_columns() {
+        for fresh in [false, true] {
+            let conn = create_current_baseline_without_migration();
+            for migration in POST_BASELINE_MIGRATIONS
+                .iter()
+                .filter(|m| fresh || m.version < 420)
+            {
+                conn.execute_batch(migration.sql).unwrap();
+            }
+            if !fresh {
+                conn.execute("INSERT INTO policy_read_keys(key_digest,kind,languages,rel_path) VALUES(zeroblob(32),'path_absent','rust','missing.rs')", []).unwrap();
+                conn.execute_batch(include_str!(
+                    "../migrations/cache/0420-rust-drop-inventory-read-keys.sql"
+                ))
+                .unwrap();
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT rel_path FROM policy_read_keys WHERE kind='path_absent'",
+                        [],
+                        |r| r.get::<_, String>(0)
+                    )
+                    .unwrap(),
+                    "missing.rs"
+                );
+            }
+            // This test exercises receipt CHECKs independently of summary ownership.
+            conn.pragma_update(None, "foreign_keys", false).unwrap();
+            let fields = [
+                "drop_owning_unit",
+                "drop_module_path",
+                "drop_identity_digest",
+                "drop_config_digest",
+                "drop_proof_version",
+            ];
+            for table in ["policy_read_keys", "class_set_summary_reads"] {
+                let prefix = if table == "class_set_summary_reads" {
+                    "summary_id,read_ordinal,"
+                } else {
+                    ""
+                };
+                let values = if table == "class_set_summary_reads" {
+                    "1,1,"
+                } else {
+                    ""
+                };
+                let insert = format!(
+                    "INSERT INTO {table}({prefix}key_digest,kind,family,digest,rel_path,blob_oid,start_byte,end_byte,{}) VALUES({values}randomblob(32),'lookup',?1,zeroblob(32),'src/lib.rs',hex(zeroblob(20)),0,1,?2,?3,?4,?5,?6)",
+                    fields.join(",")
+                );
+                let valid = [
+                    rusqlite::types::Value::Blob(vec![1; 32]),
+                    rusqlite::types::Value::Text("crate".into()),
+                    rusqlite::types::Value::Blob(vec![2; 32]),
+                    rusqlite::types::Value::Blob(vec![3; 32]),
+                    rusqlite::types::Value::Integer(1),
+                ];
+                for missing in 0..5 {
+                    let mut parameters =
+                        vec![rusqlite::types::Value::Text("rust_drop_inventory".into())];
+                    parameters.extend(valid.iter().cloned());
+                    parameters[missing + 1] = rusqlite::types::Value::Null;
+                    assert!(
+                        conn.execute(&insert, rusqlite::params_from_iter(&parameters))
+                            .is_err(),
+                        "{table}: {}",
+                        fields[missing]
+                    );
+                    let mut foreign =
+                        vec![rusqlite::types::Value::Text("rust_drop_subject".into())];
+                    foreign.extend(std::iter::repeat_n(rusqlite::types::Value::Null, 5));
+                    foreign[missing + 1] = valid[missing].clone();
+                    assert!(
+                        conn.execute(&insert, rusqlite::params_from_iter(&foreign))
+                            .is_err(),
+                        "{table}: foreign {}",
+                        fields[missing]
+                    );
+                }
+                let mut parameters =
+                    vec![rusqlite::types::Value::Text("rust_drop_inventory".into())];
+                parameters.extend(valid);
+                conn.execute(&insert, rusqlite::params_from_iter(&parameters))
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn surface_migration_cascades_sets_and_ordinals() {
+        let conn = open_in_memory_cache();
+        conn.execute_batch(
+            "INSERT INTO blobs(id, blob_oid, lang) VALUES(1, '0000000000000000000000000000000000000001', 'go');
+             INSERT INTO surface_sets VALUES(1, 1, 0, 1, 1, 'test', 1, zeroblob(32), zeroblob(32));
+             INSERT INTO surface_ids VALUES(1, 0, 12, 0);",
+        ).unwrap();
+        assert!(
+            conn.execute("INSERT INTO surface_ids VALUES(1, 0, 13, 0)", [])
+                .is_err()
+        );
+        conn.execute_batch(
+            "INSERT INTO surface_sets VALUES(2, 1, 0, 1, 1, 'test', 1, randomblob(32), zeroblob(32));
+             INSERT INTO surface_ids VALUES(2, 0, 12, 0);",
+        ).unwrap();
+        conn.execute("DELETE FROM surface_sets WHERE set_id = 1", [])
+            .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM surface_ids WHERE set_id=1",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        conn.execute_batch(
+            "INSERT INTO surface_sets VALUES(1, 1, 0, 1, 1, 'test', 1, zeroblob(32), zeroblob(32));
+             INSERT INTO surface_ids VALUES(1, 0, 12, 0);
+             DELETE FROM blobs WHERE id = 1;",
+        )
+        .unwrap();
+        for table in ["surface_sets", "surface_ids"] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn surface_summary_migration_clears_every_obsolete_child() {
+        let mut conn = create_current_baseline_without_migration();
+        for migration in POST_BASELINE_MIGRATIONS.iter().filter(|m| m.version < 334) {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        // Disable integrity checks to seed every child independently, including
+        // orphan rows. The migration must purge these explicitly with FKs off.
+        conn.execute_batch("PRAGMA foreign_keys=OFF; PRAGMA ignore_check_constraints=ON;")
+            .unwrap();
+        let tables = [
+            "python_unit_summary_export_names",
+            "python_unit_summary_imports",
+            "python_unit_summary_providers",
+            "python_unit_summary_roots",
+            "python_unit_summary_spellings",
+            "python_unit_summary_surfaces",
+            "resolution_unit_summary_containers",
+            "resolution_unit_summary_dependencies",
+            "resolution_unit_summary_dependency_names",
+            "resolution_unit_summary_exports",
+            "resolution_unit_summary_gaps",
+            "resolution_unit_summary_imports",
+            "resolution_unit_summary_members",
+            "resolution_unit_summary_placements",
+            "resolution_unit_summary_reads",
+            "resolution_unit_summary_versions",
+            "rust_resolution_unit_summary_binding_completeness",
+            "rust_resolution_unit_summary_container_attributes",
+            "rust_resolution_unit_summary_contexts",
+            "rust_resolution_unit_summary_effective_bindings",
+            "rust_resolution_unit_summary_exports",
+            "rust_resolution_unit_summary_file_naming",
+            "rust_resolution_unit_summary_gaps",
+            "rust_resolution_unit_summary_generated_names",
+            "rust_resolution_unit_summary_glob_imports",
+            "rust_resolution_unit_summary_glob_reexport_routes",
+            "rust_resolution_unit_summary_import_route_provenance",
+            "rust_resolution_unit_summary_import_routes",
+            "rust_resolution_unit_summary_macro_decisions",
+            "rust_resolution_unit_summary_placement_attributes",
+            "rust_resolution_unit_summary_reexport_routes",
+            "rust_resolution_unit_summary_root_routes",
+            "rust_resolution_unit_summary_trait_endpoints",
+            "rust_resolution_unit_summary_versions",
+            "resolution_unit_summary_input_files",
+            "rust_resolution_unit_summary_binding_owners",
+            "rust_resolution_unit_summary_binding_names",
+            "rust_resolution_unit_summary_binding_alternatives",
+            "rust_resolution_unit_summary_binding_blockers",
+            "rust_resolution_unit_summary_inherent_impls",
+            "rust_resolution_unit_summary_unresolved_inherent_impls",
+            "rust_resolution_unit_summary_public_surface_gaps",
+            "rust_resolution_unit_summary_inactive_placements",
+            "resolution_unit_summaries",
+        ];
+        for table in tables {
+            let columns: Vec<(String, String)> = conn
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .unwrap()
+                .query_map([], |row| Ok((row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            let names = columns
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            let values = columns
+                .iter()
+                .map(|(_, kind)| match kind.as_str() {
+                    "INTEGER" => "1",
+                    "BLOB" => "zeroblob(32)",
+                    "TEXT" => "'fixture'",
+                    other => panic!("unexpected summary column type {other}"),
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            conn.execute_batch(&format!("INSERT INTO {table}({names}) VALUES({values});"))
+                .unwrap();
+        }
+        conn.execute_batch("PRAGMA ignore_check_constraints=OFF;")
+            .unwrap();
+        conn.pragma_update(None, "user_version", 325).unwrap();
+        migrate(&mut conn).unwrap();
+        for table in tables {
+            let count: i64 = conn
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "obsolete rows in {table}");
+        }
+        assert!(
+            !conn
+                .prepare("PRAGMA foreign_key_check")
+                .unwrap()
+                .exists([])
+                .unwrap()
+        );
+    }
+
+    #[test]
     fn current_schema_digest_matches_the_baseline_chain() {
         let conn = create_current_baseline_without_migration();
         for migration in POST_BASELINE_MIGRATIONS {
             conn.execute_batch(migration.sql).unwrap();
         }
+        assert_eq!(
+            schema_object_definitions_sha256(&conn).unwrap(),
+            CURRENT_SCHEMA_OBJECTS_SHA256
+        );
+    }
+
+    #[test]
+    fn consumed_unit_migration_keeps_existing_summaries_reusable() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cache.sqlite3");
+        let predecessor_version = POST_BASELINE_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version < 346)
+            .map(|migration| migration.version)
+            .max()
+            .expect("a migration immediately before 0346");
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            configure_connection(&mut conn).unwrap();
+            conn.execute_batch(BASELINE_SCHEMA_SQL).unwrap();
+            for migration in POST_BASELINE_MIGRATIONS
+                .iter()
+                .filter(|migration| migration.version < 346)
+            {
+                conn.execute_batch(migration.sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", predecessor_version)
+                .unwrap();
+            // Two summaries written before 0346, with distinct digests.
+            for (id, digest) in [(1_i64, [7u8; 32]), (2, [8; 32])] {
+                conn.execute(
+                    "INSERT INTO resolution_unit_summaries(summary_id,lang,unit_kind,unit_key,summary_digest,producer_epoch,derivation_version,complete,output_digest,publication_state)
+                     VALUES(?1,'rust','rust_crate',zeroblob(32),?2,'preserved',1,1,?2,'complete')",
+                    rusqlite::params![id, digest.as_slice()],
+                )
+                .unwrap();
+            }
+        }
+
+        let mut conn = Connection::open(&path).unwrap();
+        configure_connection(&mut conn).unwrap();
+        for migration in POST_BASELINE_MIGRATIONS
+            .iter()
+            .filter(|m| m.version >= 346 && m.version < 419)
+        {
+            conn.execute_batch(migration.sql).unwrap();
+            conn.pragma_update(None, "user_version", migration.version)
+                .unwrap();
+        }
+
+        // Every existing summary consumed nothing beyond its direct
+        // dependencies, so its lookup digest is its summary digest and its
+        // consumed set is empty. None is withdrawn.
+        let rows: Vec<(i64, Vec<u8>, Vec<u8>)> = conn
+            .prepare("SELECT summary_id, summary_digest, lookup_digest FROM resolution_unit_summaries ORDER BY summary_id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![(1, vec![7; 32], vec![7; 32]), (2, vec![8; 32], vec![8; 32])]
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM resolution_unit_summary_consumed_units",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        migrate(&mut conn).unwrap();
+        // 0419 deliberately withdraws the derived summaries after 0346 preserved them.
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM resolution_unit_summaries",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert!(current_schema_shape_is_valid(&conn).unwrap());
+        assert_eq!(
+            schema_object_definitions_sha256(&conn).unwrap(),
+            CURRENT_SCHEMA_OBJECTS_SHA256
+        );
+    }
+
+    #[test]
+    fn csharp_visibility_migrations_upgrade_a_persistent_314_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cache.sqlite3");
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            configure_connection(&mut conn).unwrap();
+            conn.execute_batch(BASELINE_SCHEMA_SQL).unwrap();
+            for migration in POST_BASELINE_MIGRATIONS
+                .iter()
+                .filter(|migration| migration.version <= 314)
+            {
+                conn.execute_batch(migration.sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 314).unwrap();
+        }
+
+        let mut conn = Connection::open(&path).unwrap();
+        configure_connection(&mut conn).unwrap();
+        assert!(!table_exists(&conn, "resolution_csharp_friend_attributes").unwrap());
+        migrate(&mut conn).unwrap();
+
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
+        assert!(current_schema_shape_is_valid(&conn).unwrap());
+        assert!(table_exists(&conn, "resolution_csharp_friend_attributes").unwrap());
+        assert_eq!(
+            schema_object_definitions_sha256(&conn).unwrap(),
+            CURRENT_SCHEMA_OBJECTS_SHA256
+        );
+    }
+
+    /// The #12385 migration that clears the JVM external projection. Tests name it
+    /// here so a renumber at landing moves one line.
+    const JVM_GENERIC_SURFACES_VERSION: i64 = 422;
+
+    fn last_migration_before(version: i64) -> i64 {
+        POST_BASELINE_MIGRATIONS
+            .iter()
+            .map(|migration| migration.version)
+            .filter(|&candidate| candidate < version)
+            .max()
+            .expect("a migration precedes the JVM generic surfaces migration")
+    }
+
+    #[test]
+    fn generic_surface_upgrade_clears_populated_jvm_inventory() {
+        for foreign_keys in [false, true] {
+            let mut conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(BASELINE_SCHEMA_SQL).unwrap();
+            for migration in POST_BASELINE_MIGRATIONS
+                .iter()
+                .filter(|migration| migration.version < JVM_GENERIC_SURFACES_VERSION)
+            {
+                conn.execute_batch(migration.sql).unwrap();
+            }
+            conn.pragma_update(None, "foreign_keys", foreign_keys)
+                .unwrap();
+            conn.execute_batch("INSERT INTO jvm_external_owners VALUES('provider','Owner',1,1,1,1);
+INSERT INTO jvm_external_owner_members(provider_id,owner_fqn,ordinal,member_name,member_kind,visibility,is_static,signature_present,callable_family_complete,parameters_jsonb) VALUES('provider','Owner',0,'method','method','public',1,1,1,jsonb('[]'));
+INSERT INTO jvm_external_owner_supertypes VALUES('provider','Owner','Parent',0);
+INSERT INTO jvm_external_provider_publications VALUES('provider','source',zeroblob(32),zeroblob(32),1,1,1);").unwrap();
+            conn.pragma_update(
+                None,
+                "user_version",
+                last_migration_before(JVM_GENERIC_SURFACES_VERSION),
+            )
+            .unwrap();
+            migrate(&mut conn).unwrap();
+            for table in [
+                "jvm_external_provider_publications",
+                "jvm_external_owners",
+                "jvm_external_owner_members",
+                "jvm_external_owner_supertypes",
+            ] {
+                let count: i64 = conn
+                    .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(count, 0, "{table}");
+            }
+            validate_foreign_keys(&conn).unwrap();
+            assert!(current_schema_shape_is_valid(&conn).unwrap());
+        }
+    }
+
+    #[test]
+    fn csharp_friend_migrations_preserve_a_persistent_315_jvm_row() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cache.sqlite3");
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            configure_connection(&mut conn).unwrap();
+            conn.execute_batch(BASELINE_SCHEMA_SQL).unwrap();
+            for migration in POST_BASELINE_MIGRATIONS
+                .iter()
+                .filter(|migration| migration.version <= 315)
+            {
+                conn.execute_batch(migration.sql).unwrap();
+            }
+            conn.execute(
+                "INSERT INTO jvm_external_owners(provider_id,owner_fqn,callables_complete,values_complete,types_complete,supertypes_complete) VALUES('provider', 'example.Owner', 1, 1, 1, 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO jvm_external_owner_members(provider_id,owner_fqn,ordinal,member_name,member_kind,visibility,is_static,signature_present,callable_family_complete,non_overridable,parameters_jsonb,return_type_jsonb,is_abstract) VALUES('provider','example.Owner',0,'run','method','public',0,1,1,NULL,jsonb('[]'),NULL,1)",
+                [],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 315).unwrap();
+        }
+
+        let mut conn = Connection::open(&path).unwrap();
+        configure_connection(&mut conn).unwrap();
+        for migration in POST_BASELINE_MIGRATIONS.iter().filter(|migration| {
+            migration.version > 315 && migration.version < JVM_GENERIC_SURFACES_VERSION
+        }) {
+            conn.execute_batch(migration.sql).unwrap();
+            conn.pragma_update(None, "user_version", migration.version)
+                .unwrap();
+        }
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            last_migration_before(JVM_GENERIC_SURFACES_VERSION)
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT is_abstract FROM jvm_external_owner_members WHERE provider_id='provider' AND owner_fqn='example.Owner' AND member_name='run'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+
+        conn.execute(
+            "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, 'csharp', 0)",
+            ["b".repeat(40)],
+        )
+        .unwrap();
+        let blob_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO resolution_fragment_interiors(blob_id,lang,semantic_language,producer_epoch,interior_digest,expected_semantic_site_count,logical_rows,payload_bytes,publication_state) VALUES(?1,'csharp','csharp','315-upgrade',zeroblob(32),0,1,0,'building')",
+            [blob_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO resolution_csharp_friend_attributes(blob_id,site,scope,name_segments,identity_state,parse_state,has_public_key) VALUES(?1,0,0,'[]','unresolved','non_constant',0)",
+            [blob_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut conn = Connection::open(&path).unwrap();
+        configure_connection(&mut conn).unwrap();
+        migrate(&mut conn).unwrap();
+        assert!(current_schema_shape_is_valid(&conn).unwrap());
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM resolution_csharp_friend_attributes",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            schema_object_definitions_sha256(&conn).unwrap(),
+            CURRENT_SCHEMA_OBJECTS_SHA256
+        );
+    }
+
+    #[test]
+    #[hardwon("#10879: widening implicit-drop discharge must preserve both populated gap tables")]
+    fn implicit_drop_discharge_migration_preserves_populated_gap_tables() {
+        let predecessor_version = POST_BASELINE_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version < 419)
+            .map(|migration| migration.version)
+            .max()
+            .unwrap();
+        for foreign_keys in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("cache.sqlite3");
+            let mut conn = Connection::open(&path).unwrap();
+            configure_connection(&mut conn).unwrap();
+            conn.execute_batch(BASELINE_SCHEMA_SQL).unwrap();
+            for migration in POST_BASELINE_MIGRATIONS
+                .iter()
+                .filter(|migration| migration.version < 419)
+            {
+                conn.execute_batch(migration.sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", predecessor_version)
+                .unwrap();
+            conn.execute(
+                "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, 'rust', 0)",
+                ["d".repeat(40)],
+            )
+            .unwrap();
+            let blob = conn.last_insert_rowid();
+            conn.execute("INSERT INTO semantic_ir_publications(blob_id, lang, producer_epoch, content_digest, source_bytes, outcome, procedure_count, logical_rows, payload_bytes, go_predeclared_builtins, publication_state) VALUES(?1, 'rust', 'implicit-drop-migration', zeroblob(32), 0, 0, 0, 4, 0, jsonb('[]'), 'complete')", [blob]).unwrap();
+            let tables = ["semantic_ir_gaps", "candidate_macro_semantic_ir_gaps"];
+            let insert = |table: &str| {
+                format!(
+                    "INSERT INTO {table}(blob_id, procedure, gap, point, subject, capability, impacts, kind, discharge, detail, source, evidence) VALUES(?1, 0, ?2, 3, 1, 8, 124, 1, ?3, 7, 2, 4)"
+                )
+            };
+            let rows = |conn: &Connection, table: &str| {
+                let mut statement = conn
+                    .prepare(&format!(
+                        "SELECT * FROM {table} ORDER BY blob_id, procedure, gap"
+                    ))
+                    .unwrap();
+                let columns = statement.column_count();
+                statement
+                    .query_map([], |row| {
+                        (0..columns)
+                            .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+            };
+            for table in tables {
+                conn.execute(&insert(table), rusqlite::params![blob, 0, 0])
+                    .unwrap();
+                conn.execute(&insert(table), rusqlite::params![blob, 1, 13])
+                    .unwrap();
+                assert!(
+                    conn.execute(&insert(table), rusqlite::params![blob, 2, 14])
+                        .is_err()
+                );
+            }
+            let before = tables.map(|table| rows(&conn, table));
+            conn.pragma_update(None, "foreign_keys", foreign_keys)
+                .unwrap();
+            validate_foreign_keys(&conn).unwrap();
+            migrate(&mut conn).unwrap();
+            assert_eq!(
+                cache_migration_version(&conn).unwrap(),
+                CURRENT_MIGRATION_VERSION
+            );
+            assert!(current_schema_shape_is_valid(&conn).unwrap());
+            assert_eq!(
+                tables.map(|table| rows(&conn, table)),
+                before,
+                "initial foreign_keys={foreign_keys}"
+            );
+            assert!(
+                conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, bool>(0))
+                    .unwrap()
+            );
+            validate_foreign_keys(&conn).unwrap();
+            for table in tables {
+                conn.execute(&insert(table), rusqlite::params![blob, 2, 14])
+                    .unwrap();
+                assert!(
+                    conn.execute(&insert(table), rusqlite::params![blob, 3, 16])
+                        .is_err()
+                );
+                assert!(
+                    conn.execute(&insert(table), rusqlite::params![blob + 1, 0, 0])
+                        .is_err()
+                );
+                assert!(conn.execute(&format!("INSERT INTO {table}(blob_id, procedure, gap, point, subject, capability, impacts, kind, discharge, detail, source, evidence, segment_head) VALUES(?1, 0, 4, 3, 8, 8, 124, 1, 0, 7, 2, 4, 999)"), [blob]).is_err());
+            }
+            for enabled in [false, true] {
+                conn.pragma_update(None, "foreign_keys", enabled).unwrap();
+                validate_foreign_keys(&conn).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn csharp_friend_attributes_survive_missed_0315_in_a_legacy_325_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cache.sqlite3");
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            configure_connection(&mut conn).unwrap();
+            conn.execute_batch(BASELINE_SCHEMA_SQL).unwrap();
+            for migration in POST_BASELINE_MIGRATIONS.iter().filter(|migration| {
+                migration.version <= 314 || matches!(migration.version, 324 | 325)
+            }) {
+                conn.execute_batch(migration.sql).unwrap();
+            }
+            conn.execute(
+                "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, 'csharp', 0)",
+                ["c".repeat(40)],
+            )
+            .unwrap();
+            let blob_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO resolution_fragment_interiors(blob_id,lang,semantic_language,producer_epoch,interior_digest,expected_semantic_site_count,logical_rows,payload_bytes,publication_state) VALUES(?1,'csharp','csharp','legacy-325',zeroblob(32),0,1,0,'building')",
+                [blob_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO resolution_csharp_friend_attributes(blob_id,site,scope,name_segments,identity_state,parse_state,has_public_key) VALUES(?1,0,0,'[]','unresolved','non_constant',0)",
+                [blob_id],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 325).unwrap();
+        }
+
+        let mut conn = Connection::open(&path).unwrap();
+        configure_connection(&mut conn).unwrap();
+        migrate(&mut conn).unwrap();
+
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
+        assert!(current_schema_shape_is_valid(&conn).unwrap());
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM resolution_csharp_friend_attributes",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('jvm_external_owner_members') WHERE name='is_abstract'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            schema_object_definitions_sha256(&conn).unwrap(),
+            CURRENT_SCHEMA_OBJECTS_SHA256
+        );
+    }
+
+    #[test]
+    #[hardwon("c6495c3f86bd: legacy v325 stores skipped lower-numbered migration 0316")]
+    fn surface_relations_migrate_legacy_325_store_without_dropping_friend_facts() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cache.sqlite3");
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            configure_connection(&mut conn).unwrap();
+            conn.execute_batch(BASELINE_SCHEMA_SQL).unwrap();
+            for migration in POST_BASELINE_MIGRATIONS.iter().filter(|migration| {
+                migration.version <= 315 || matches!(migration.version, 324 | 325)
+            }) {
+                conn.execute_batch(migration.sql).unwrap();
+            }
+            conn.execute(
+                "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, 'csharp', 0)",
+                ["d".repeat(40)],
+            )
+            .unwrap();
+            let blob_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO resolution_fragment_interiors(blob_id,lang,semantic_language,producer_epoch,interior_digest,expected_semantic_site_count,logical_rows,payload_bytes,publication_state) VALUES(?1,'csharp','csharp','legacy-325',zeroblob(32),0,1,0,'building')",
+                [blob_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO resolution_csharp_friend_attributes(blob_id,site,scope,name_segments,identity_state,parse_state,has_public_key) VALUES(?1,0,0,'[]','unresolved','non_constant',0)",
+                [blob_id],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 325).unwrap();
+        }
+
+        let mut conn = Connection::open(&path).unwrap();
+        configure_connection(&mut conn).unwrap();
+        migrate(&mut conn).unwrap();
+
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
+        assert!(current_schema_shape_is_valid(&conn).unwrap());
+        assert!(table_exists(&conn, "surface_sets").unwrap());
+        assert!(table_exists(&conn, "surface_ids").unwrap());
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM resolution_csharp_friend_attributes",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            schema_object_definitions_sha256(&conn).unwrap(),
+            CURRENT_SCHEMA_OBJECTS_SHA256
+        );
+    }
+
+    #[test]
+    fn csharp_visibility_migrations_accept_a_legacy_313_friend_attribute_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cache.sqlite3");
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            configure_connection(&mut conn).unwrap();
+            conn.execute_batch(BASELINE_SCHEMA_SQL).unwrap();
+            for migration in POST_BASELINE_MIGRATIONS
+                .iter()
+                .filter(|migration| migration.version <= 311)
+            {
+                conn.execute_batch(migration.sql).unwrap();
+            }
+            // This is the same friend-attribute schema shipped in an earlier
+            // M6a3 draft as migration 0313.
+            conn.execute_batch(include_str!(
+                "../migrations/cache/0325-csharp-friend-attributes.sql"
+            ))
+            .unwrap();
+            conn.execute(
+                "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, 'csharp', 0)",
+                ["a".repeat(40)],
+            )
+            .unwrap();
+            let blob_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO resolution_fragment_interiors(blob_id,lang,semantic_language,producer_epoch,interior_digest,expected_semantic_site_count,logical_rows,payload_bytes,publication_state) VALUES(?1,'csharp','csharp','legacy',zeroblob(32),0,1,0,'building')",
+                [blob_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO resolution_csharp_friend_attributes(blob_id,site,scope,name_segments,identity_state,parse_state,has_public_key) VALUES(?1,0,0,'[]','unresolved','non_constant',0)",
+                [blob_id],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 313).unwrap();
+        }
+
+        let mut conn = Connection::open(&path).unwrap();
+        configure_connection(&mut conn).unwrap();
+        migrate(&mut conn).unwrap();
+
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
+        assert!(current_schema_shape_is_valid(&conn).unwrap());
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM resolution_csharp_friend_attributes",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
         assert_eq!(
             schema_object_definitions_sha256(&conn).unwrap(),
             CURRENT_SCHEMA_OBJECTS_SHA256
@@ -6880,7 +8518,81 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#11535: independent stores reused allocator authority and NULL construction could publish"
+    )]
     fn publication_witness_migration_backfills_and_exhaustion_aborts() {
+        use rusqlite::functions::FunctionFlags;
+        use rusqlite::hooks::Action;
+        type PublicationEvents = Arc<Mutex<Vec<(Action, i64)>>>;
+        // blob_meta is WITHOUT ROWID, so update_hook cannot observe it.
+        // Calibrate the linked SQLite's TEMP-before-main AFTER trigger order
+        // on actual 0264 failures before trusting a zero-event BEFORE refusal.
+        // The observer only records Rust events, which survive SQL rollback.
+        fn observe_valid_publications(conn: &Connection, seed: &str) -> PublicationEvents {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            for (name, action) in [
+                ("bifrost_test_publication_insert", Action::SQLITE_INSERT),
+                ("bifrost_test_publication_update", Action::SQLITE_UPDATE),
+            ] {
+                let captured = Arc::clone(&events);
+                conn.create_scalar_function(
+                    name,
+                    1,
+                    FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_INNOCUOUS,
+                    move |context| {
+                        captured.lock().unwrap().push((action, context.get(0)?));
+                        Ok(0_i64)
+                    },
+                )
+                .unwrap();
+            }
+            conn.execute_batch(
+                "CREATE TEMP TRIGGER test_publication_insert
+                 AFTER INSERT ON main.blob_meta BEGIN
+                   SELECT bifrost_test_publication_insert(NEW.blob_id);
+                 END;
+                 CREATE TEMP TRIGGER test_publication_update
+                 AFTER UPDATE OF is_complete ON main.blob_meta
+                 WHEN OLD.is_complete=0 AND NEW.is_complete=1 BEGIN
+                   SELECT bifrost_test_publication_update(NEW.blob_id);
+                 END;",
+            )
+            .unwrap();
+            // Fixture OIDs keep the first 20 bytes, so distinguish the action
+            // before the shared seed instead of after its truncated prefix.
+            let inserted = insert_visibility_blob_fixture(conn, &format!("insert-{seed}"), None, 1);
+            assert!(
+                events
+                    .lock()
+                    .unwrap()
+                    .contains(&(Action::SQLITE_INSERT, inserted))
+            );
+            let completed =
+                insert_visibility_blob_fixture(conn, &format!("complete-{seed}"), None, 0);
+            events.lock().unwrap().clear();
+            conn.execute(
+                "UPDATE blob_meta SET is_complete=1 WHERE blob_id=?1",
+                [completed],
+            )
+            .unwrap();
+            assert!(
+                events
+                    .lock()
+                    .unwrap()
+                    .contains(&(Action::SQLITE_UPDATE, completed))
+            );
+            events.lock().unwrap().clear();
+            events
+        }
+        const COMPLETE_INSERT: &str =
+            "INSERT INTO blob_meta(blob_id,lang,contains_tests,content_package,
+            stored_unit_count,range_count,signature_count,signature_metadata_count,
+            supertype_count,child_count,import_statement_count,type_identifier_count,is_complete)
+            VALUES(?1,'java',0,'',0,0,0,0,0,0,0,0,1)";
+        const DROP_OBSERVERS: &str = "DROP TRIGGER temp.test_publication_insert;
+                                    DROP TRIGGER temp.test_publication_update;";
+
         let conn = create_current_baseline_without_migration();
         for migration in POST_BASELINE_MIGRATIONS.iter().filter(|m| m.version < 264) {
             conn.execute_batch(migration.sql).unwrap();
@@ -6914,6 +8626,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!((nonce_size, next), (16, a.max(b) + 1));
+        let historical_events = observe_valid_publications(&conn, "historical-hook-control");
         conn.execute(
             "UPDATE blob_publication_witness_sequence SET next_witness = 9223372036854775807",
             [],
@@ -6937,6 +8650,53 @@ mod tests {
             )
             .unwrap();
         assert_eq!(unchanged, (0, None));
+        assert!(
+            historical_events
+                .lock()
+                .unwrap()
+                .contains(&(Action::SQLITE_UPDATE, incomplete)),
+            "linked SQLite must expose the actual AFTER-rollback completion for calibration"
+        );
+        historical_events.lock().unwrap().clear();
+        conn.execute(
+            "INSERT INTO blobs(blob_oid,lang,generation) VALUES(?1,'java',0)",
+            [seeded_oid("historical-exhausted-insert")],
+        )
+        .unwrap();
+        let exhausted_insert = conn.last_insert_rowid();
+        let error = conn
+            .execute(COMPLETE_INSERT, [exhausted_insert])
+            .unwrap_err();
+        assert_eq!(
+            error.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::ConstraintViolation)
+        );
+        assert!(
+            historical_events
+                .lock()
+                .unwrap()
+                .contains(&(Action::SQLITE_INSERT, exhausted_insert)),
+            "linked SQLite must expose the actual AFTER-rollback insert for calibration"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM blob_meta WHERE blob_id=?1",
+                [exhausted_insert],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT next_witness FROM blob_publication_witness_sequence",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            i64::MAX
+        );
+        conn.execute_batch(DROP_OBSERVERS).unwrap();
         conn.execute("DELETE FROM blob_publication_witness_sequence", [])
             .unwrap();
         let error = conn
@@ -6973,6 +8733,237 @@ mod tests {
         assert!(
             error.to_string().contains("publication witness exhausted"),
             "{error}"
+        );
+        // The new compatible migration preserves the actual installed lineage
+        // and consumed history, then protects it even without recursive triggers.
+        let conn = create_current_baseline_without_migration();
+        for migration in POST_BASELINE_MIGRATIONS.iter().filter(|m| m.version < 411) {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        let retired = insert_visibility_blob_fixture(&conn, "retired-clock-history", None, 1);
+        conn.execute("DELETE FROM blobs WHERE id = ?1", [retired])
+            .unwrap();
+        let before: (Vec<u8>, i64) = conn
+            .query_row(
+                "SELECT store_nonce,next_witness FROM blob_publication_witness_sequence",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        conn.execute_batch(
+            POST_BASELINE_MIGRATIONS
+                .iter()
+                .find(|m| m.version == 411)
+                .unwrap()
+                .sql,
+        )
+        .unwrap();
+        for recursive in [false, true] {
+            conn.pragma_update(None, "recursive_triggers", recursive)
+                .unwrap();
+            for sql in [
+                "DELETE FROM blob_publication_witness_sequence",
+                "UPDATE blob_publication_witness_sequence SET store_nonce = NULL",
+                "UPDATE blob_publication_witness_sequence SET store_nonce = randomblob(16)",
+                "UPDATE blob_publication_witness_sequence SET next_witness = next_witness - 1",
+                "UPDATE OR REPLACE blob_publication_witness_sequence SET id = 2",
+                "INSERT OR REPLACE INTO blob_publication_witness_sequence VALUES(1,randomblob(16),1)",
+                "REPLACE INTO blob_publication_witness_sequence VALUES(1,randomblob(16),1)",
+            ] {
+                assert!(conn.execute(sql, []).is_err(), "accepted reset: {sql}");
+            }
+            let after: (Vec<u8>, i64) = conn
+                .query_row(
+                    "SELECT store_nonce,next_witness FROM blob_publication_witness_sequence",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(after, before);
+        }
+        let early_events = observe_valid_publications(&conn, "early-hook-control");
+        let early_completion =
+            insert_visibility_blob_fixture(&conn, "early-exhausted-completion", None, 0);
+        conn.execute(
+            "INSERT INTO blobs(blob_oid,lang,generation) VALUES(?1,'java',0)",
+            [seeded_oid("early-exhausted-insert")],
+        )
+        .unwrap();
+        let early_insert = conn.last_insert_rowid();
+        early_events.lock().unwrap().clear();
+        conn.execute(
+            "UPDATE blob_publication_witness_sequence SET next_witness=9223372036854775807",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            publication_lineage::require_publication_nonce(&conn)
+                .unwrap()
+                .as_slice(),
+            before.0.as_slice()
+        );
+
+        let error = conn
+            .execute(
+                "UPDATE blob_meta SET is_complete=1 WHERE blob_id=?1",
+                [early_completion],
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::ConstraintViolation)
+        );
+        assert_eq!(
+            *early_events.lock().unwrap(),
+            Vec::<(Action, i64)>::new(),
+            "exhausted completion must refuse before any row notification"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT is_complete,publication_witness FROM blob_meta WHERE blob_id=?1",
+                [early_completion],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
+            )
+            .unwrap(),
+            (0, None)
+        );
+        early_events.lock().unwrap().clear();
+        let error = conn.execute(COMPLETE_INSERT, [early_insert]).unwrap_err();
+        assert_eq!(
+            error.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::ConstraintViolation)
+        );
+        assert_eq!(
+            *early_events.lock().unwrap(),
+            Vec::<(Action, i64)>::new(),
+            "exhausted insert must refuse before any row notification"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM blob_meta WHERE blob_id=?1",
+                [early_insert],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT next_witness FROM blob_publication_witness_sequence",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            i64::MAX
+        );
+        conn.execute_batch(DROP_OBSERVERS).unwrap();
+
+        // A canonical NULL template is not a published store and is never
+        // repaired merely by opening it. SQL and typed readers both refuse.
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let path = root.join("unminted.db");
+        std::fs::File::create(&path).unwrap();
+        build_store_template(&path).unwrap();
+        assert!(open_unified_connection_with_template_dir(&path, None).is_err());
+        let mut conn = Connection::open(&path).unwrap();
+        register_seal_validation(&conn).unwrap();
+        assert!(matches!(
+            publication_lineage::require_publication_nonce(&conn),
+            Err(publication_lineage::PublicationLineageError::Unminted)
+        ));
+        assert!(
+            conn.execute(
+                "UPDATE blob_publication_witness_sequence SET next_witness=2",
+                []
+            )
+            .is_err()
+        );
+        let incomplete = insert_visibility_blob_fixture(&conn, "unminted-completion", None, 0);
+        assert!(
+            conn.execute(
+                "UPDATE blob_meta SET is_complete=1 WHERE blob_id=?1",
+                [incomplete]
+            )
+            .is_err()
+        );
+        conn.execute(
+            "INSERT INTO blobs(blob_oid,lang,generation) VALUES(?1,'java',0)",
+            [seeded_oid("unminted-insert")],
+        )
+        .unwrap();
+        let new_blob = conn.last_insert_rowid();
+        assert!(
+            conn.execute(
+                "INSERT INTO blob_meta(blob_id,lang,contains_tests,content_package,
+             stored_unit_count,range_count,signature_count,signature_metadata_count,
+             supertype_count,child_count,import_statement_count,type_identifier_count,is_complete)
+             VALUES(?1,'java',0,'',0,0,0,0,0,0,0,0,1)",
+                [new_blob],
+            )
+            .is_err()
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT is_complete FROM blob_meta WHERE blob_id=?1",
+                [incomplete],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM blob_meta WHERE blob_id=?1",
+                [new_blob],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT next_witness FROM blob_publication_witness_sequence",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            mint_publication_nonce(&tx).unwrap();
+            assert!(mint_publication_nonce(&tx).is_err());
+            tx.rollback().unwrap();
+        }
+        assert!(matches!(
+            publication_lineage::require_publication_nonce(&conn),
+            Err(publication_lineage::PublicationLineageError::Unminted)
+        ));
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let nonce = mint_publication_nonce(&tx).unwrap();
+        tx.commit().unwrap();
+        conn.execute(
+            "UPDATE blob_meta SET is_complete=1 WHERE blob_id=?1",
+            [incomplete],
+        )
+        .unwrap();
+        assert_eq!(
+            publication_lineage::require_publication_nonce(&conn).unwrap(),
+            nonce
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT next_witness FROM blob_publication_witness_sequence",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            2
         );
     }
 
@@ -7072,7 +9063,7 @@ mod tests {
         "#6214: existing JVM package visibility labels must migrate to the reader's canonical label"
     )]
     fn jvm_package_private_visibility_migration_rewrites_legacy_label() {
-        let mut conn = create_current_baseline_without_migration();
+        let conn = create_current_baseline_without_migration();
         for migration in POST_BASELINE_MIGRATIONS.iter().filter(|m| m.version <= 196) {
             conn.execute_batch(migration.sql).unwrap();
         }
@@ -7087,7 +9078,13 @@ mod tests {
         )
         .unwrap();
         conn.pragma_update(None, "user_version", 196).unwrap();
-        migrate(&mut conn).unwrap();
+        for migration in POST_BASELINE_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version > 196 && migration.version <= 198)
+        {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 198).unwrap();
         let visibility: String = conn
             .query_row(
                 "SELECT visibility FROM jvm_external_owner_members WHERE provider_id='provider' AND owner_fqn='example.Owner' AND ordinal=0",
@@ -8070,6 +10067,120 @@ mod tests {
         conn
     }
 
+    #[test]
+    fn binary_operation_migration_preserves_populated_store_and_checks_operator_codes() {
+        let mut conn = create_current_baseline_without_migration();
+        let binary = POST_BASELINE_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 427)
+            .expect("binary migration is registered");
+        assert!(
+            binary
+                .sql
+                .contains("CREATE TABLE resolution_binary_operations")
+        );
+        let previous = POST_BASELINE_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version < 427)
+            .collect::<Vec<_>>();
+        for migration in &previous {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        conn.pragma_update(
+            None,
+            "user_version",
+            previous.last().expect("prior migration").version,
+        )
+        .unwrap();
+        conn.execute("INSERT INTO blobs(blob_oid, lang, generation) VALUES('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'rust', 0)", []).unwrap();
+        let blob = conn.last_insert_rowid();
+        conn.execute("INSERT INTO resolution_fragment_interiors(blob_id, lang, semantic_language, producer_epoch, interior_digest, expected_semantic_site_count, logical_rows, payload_bytes, publication_state) VALUES(?1, 'rust', 'rust', 'old-binary-producer', zeroblob(32), 0, 4, 0, 'building')", [blob]).unwrap();
+        for key in 0..3 {
+            let mut digest = [0u8; 32];
+            digest[0] = key as u8;
+            conn.execute("INSERT INTO resolution_semantic_catalog(blob_id,local_key,identity_digest) VALUES(?1,?2,?3)", rusqlite::params![blob,key,digest]).unwrap();
+        }
+        migrate(&mut conn).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT producer_epoch FROM resolution_fragment_interiors WHERE blob_id=?1",
+                [blob],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "old-binary-producer"
+        );
+        for operator in 0..10 {
+            conn.execute(
+                "INSERT INTO resolution_binary_operations VALUES(?1,0,1,2,?2,0)",
+                rusqlite::params![blob, operator],
+            )
+            .unwrap();
+            assert_eq!(conn.query_row("SELECT left_slot,right_slot,operator FROM resolution_binary_operations WHERE blob_id=?1", [blob], |row| Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?))).unwrap(), (1,2,operator));
+            conn.execute(
+                "DELETE FROM resolution_binary_operations WHERE blob_id=?1",
+                [blob],
+            )
+            .unwrap();
+        }
+        assert!(
+            conn.execute(
+                "INSERT INTO resolution_binary_operations VALUES(?1,0,1,2,10,0)",
+                [blob]
+            )
+            .is_err()
+        );
+        for reference in 0..3 {
+            conn.execute(
+                "INSERT INTO resolution_binary_operations VALUES(?1,0,1,2,0,?2)",
+                rusqlite::params![blob, reference],
+            )
+            .unwrap();
+            assert_eq!(
+                conn.query_row(
+                    "SELECT right_reference FROM resolution_binary_operations WHERE blob_id=?1",
+                    [blob],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+                reference
+            );
+            conn.execute(
+                "DELETE FROM resolution_binary_operations WHERE blob_id=?1",
+                [blob],
+            )
+            .unwrap();
+        }
+        assert!(
+            conn.execute(
+                "INSERT INTO resolution_binary_operations VALUES(?1,0,1,2,0,3)",
+                [blob]
+            )
+            .is_err()
+        );
+        conn.execute(
+            "INSERT INTO resolution_binary_operations VALUES(?1,0,1,2,0,0)",
+            [blob],
+        )
+        .unwrap();
+        assert!(current_schema_is_valid(&conn).unwrap());
+        assert_eq!(
+            schema_object_definitions_sha256(&conn).unwrap(),
+            CURRENT_SCHEMA_OBJECTS_SHA256
+        );
+        conn.execute("DELETE FROM blobs WHERE id=?1", [blob])
+            .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM resolution_binary_operations",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+
     fn create_schema_through_140() -> Connection {
         let conn = create_current_baseline_without_migration();
         for migration in POST_BASELINE_MIGRATIONS
@@ -8099,6 +10210,63 @@ mod tests {
         connection
             .execute_batch("CREATE TABLE legacy_cache(value TEXT) STRICT;")
             .unwrap();
+    }
+
+    #[test]
+    fn rust_feature_projection_upgrade_preserves_inputs_and_cascades() {
+        let conn = create_current_baseline_without_migration();
+        for migration in POST_BASELINE_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version < 423)
+        {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        let workspace = "a".repeat(64);
+        conn.execute(
+            "INSERT INTO rust_crate_reconciliations VALUES(?1,1,1,zeroblob(32))",
+            [&workspace],
+        )
+        .unwrap();
+        conn.execute_batch(include_str!(
+            "../migrations/cache/0423-rust-feature-projections.sql"
+        ))
+        .unwrap();
+        validate_foreign_keys(&conn).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT revision FROM rust_crate_reconciliations WHERE workspace_id=?1",
+                [&workspace],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        conn.execute(
+            "INSERT INTO rust_feature_discoveries VALUES(?1,1,zeroblob(32),1)",
+            [&workspace],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO rust_feature_projections VALUES(?1,1,zeroblob(32),zeroblob(32),zeroblob(32),0,'activation_not_established','Cargo.toml','')", [&workspace]).unwrap();
+        conn.execute("INSERT INTO rust_feature_projection_packages VALUES(?1,1,zeroblob(32),zeroblob(32),'Cargo.toml',jsonb('[\"on\"]'),0)", [&workspace]).unwrap();
+        validate_foreign_keys(&conn).unwrap();
+        conn.execute(
+            "DELETE FROM rust_crate_reconciliations WHERE workspace_id=?1",
+            [&workspace],
+        )
+        .unwrap();
+        for table in [
+            "rust_feature_discoveries",
+            "rust_feature_projections",
+            "rust_feature_projection_packages",
+        ] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
+        validate_foreign_keys(&conn).unwrap();
     }
 
     /// A workspace whose `.bifrost` parent cannot be written must say how to
@@ -8193,6 +10361,24 @@ mod tests {
         assert_elevated_permission_advice(&error, &cache_dir);
     }
 
+    fn assert_no_async_body_scratch_relations(conn: &Connection) {
+        let relations = conn
+            .prepare(
+                "SELECT name FROM main.sqlite_schema WHERE name GLOB '_async_body_*'
+                 UNION ALL
+                 SELECT name FROM temp.sqlite_schema WHERE name GLOB '_async_body_*'",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            relations.is_empty(),
+            "migration scratch relations remain: {relations:?}"
+        );
+    }
+
     #[test]
     #[hardwon("8133f3a74309: fresh stores and analyzer processes replayed historical migrations")]
     fn fresh_cache_matches_the_historical_migration_chain() {
@@ -8200,9 +10386,11 @@ mod tests {
         for migration in POST_BASELINE_MIGRATIONS {
             historical.execute_batch(migration.sql).unwrap();
         }
+        assert_no_async_body_scratch_relations(&historical);
         let before = now_unix_seconds();
         let conn = open_in_memory_cache();
         let after = now_unix_seconds();
+        assert_no_async_body_scratch_relations(&conn);
 
         assert_eq!(
             schema_object_definitions(&conn).unwrap(),
@@ -8259,6 +10447,198 @@ mod tests {
             )
             .unwrap();
         assert!(type_name_index, "schema 156 installs the type-name index");
+    }
+
+    #[test]
+    #[hardwon(
+        "#12128: widening async execution kinds must preserve populated IR with foreign keys enabled"
+    )]
+    fn async_body_upgrade_preserves_populated_ir_with_foreign_keys_on_and_off() {
+        for foreign_keys in [false, true] {
+            let conn = create_current_baseline_without_migration();
+            for migration in POST_BASELINE_MIGRATIONS.iter().filter(|m| m.version < 421) {
+                conn.execute_batch(migration.sql).unwrap();
+            }
+            conn.pragma_update(None, "foreign_keys", foreign_keys)
+                .unwrap();
+            conn.execute_batch("INSERT INTO blobs(id,blob_oid,lang) VALUES(1,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','rust');
+                INSERT INTO semantic_ir_publications(blob_id,lang,producer_epoch,content_digest,source_bytes,outcome,procedure_count,logical_rows,payload_bytes,go_predeclared_builtins,publication_state)
+                VALUES(1,'rust','test',zeroblob(32),1,0,1,1,1,jsonb('[]'),'building');").unwrap();
+            for prefix in ["semantic_ir", "candidate_macro_semantic_ir"] {
+                conn.execute_batch(&format!("INSERT INTO {prefix}_procedures(blob_id,procedure,locator,kind,is_async,is_generator,is_static,is_synthetic,invocation,dispatch_extensibility,call_boundary,receiver_binding,construction_return,source,evidence)
+                    VALUES(1,0,0,0,1,0,0,0,1,0,0,0,0,0,0);
+                    INSERT INTO {prefix}_gaps(blob_id,procedure,gap,point,subject,capability,impacts,kind,discharge,detail,source,evidence)
+                    VALUES(1,0,0,0,0,23,15,1,0,0,0,0);
+                    INSERT INTO {prefix}_events(blob_id,procedure,point,ordinal,effect,source,evidence) VALUES(1,0,0,0,0,0,0);
+                    INSERT INTO {prefix}_footprint_coverage VALUES(1,0,1,1,NULL);
+                    INSERT INTO {prefix}_footprint_coverage_classes VALUES(1,0,1,1,NULL);" )).unwrap();
+            }
+            let rows = |conn: &Connection| {
+                let mut result = Vec::new();
+                for prefix in ["semantic_ir", "candidate_macro_semantic_ir"] {
+                    for suffix in [
+                        "procedures",
+                        "gaps",
+                        "events",
+                        "footprint_coverage",
+                        "footprint_coverage_classes",
+                    ] {
+                        let mut stmt = conn
+                            .prepare(&format!("SELECT * FROM {prefix}_{suffix} ORDER BY 1,2"))
+                            .unwrap();
+                        let width = stmt.column_count();
+                        result.push(
+                            stmt.query_map([], |row| {
+                                (0..width)
+                                    .map(|i| row.get::<_, rusqlite::types::Value>(i))
+                                    .collect::<rusqlite::Result<Vec<_>>>()
+                            })
+                            .unwrap()
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                            .unwrap(),
+                        );
+                    }
+                }
+                result
+            };
+            let before = rows(&conn);
+            let tx = conn.unchecked_transaction().unwrap();
+            tx.execute_batch(include_str!(
+                "../migrations/cache/0421-rust-async-body-execution.sql"
+            ))
+            .unwrap();
+            tx.commit().unwrap();
+            assert_no_async_body_scratch_relations(&conn);
+            assert_eq!(before, rows(&conn), "foreign_keys={foreign_keys}");
+            validate_foreign_keys(&conn).unwrap();
+            for prefix in ["semantic_ir", "candidate_macro_semantic_ir"] {
+                conn.execute_batch(&format!(
+                    "UPDATE {prefix}_procedures SET invocation=2;
+                    UPDATE {prefix}_gaps SET subject=9,discharge=15;
+                    UPDATE {prefix}_gaps SET subject=10;
+                    UPDATE {prefix}_events SET effect=21;"
+                ))
+                .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn cleanup_gap_subject_upgrade_from_real_m1_schema() {
+        let conn = create_current_baseline_without_migration();
+        // Every migration that precedes 0409, whatever master adds below it.
+        for migration in POST_BASELINE_MIGRATIONS.iter().filter(|m| m.version < 409) {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        assert!(
+            conn.prepare("SELECT segment_head FROM semantic_ir_gaps")
+                .is_err()
+        );
+        conn.execute_batch(include_str!(
+            "../migrations/cache/0409-cleanup-owner-gap-subject.sql"
+        ))
+        .unwrap();
+        conn.execute_batch(include_str!(
+            "../migrations/cache/0410-candidate-macro-records.sql"
+        ))
+        .unwrap();
+        // Compare against the current shape after replaying every later migration.
+        for migration in POST_BASELINE_MIGRATIONS.iter().filter(|m| m.version > 410) {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        assert_eq!(
+            schema_object_definitions_sha256(&conn).unwrap(),
+            CURRENT_SCHEMA_OBJECTS_SHA256
+        );
+        validate_foreign_keys(&conn).unwrap();
+    }
+
+    #[test]
+    fn candidate_records_upgrade_from_real_m2_schema() {
+        let conn = create_current_baseline_without_migration();
+        for migration in POST_BASELINE_MIGRATIONS.iter().filter(|m| m.version < 410) {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        assert!(
+            conn.prepare("SELECT anchor_start FROM candidate_macro_semantic_ir_candidates")
+                .is_err()
+        );
+        conn.execute_batch(include_str!(
+            "../migrations/cache/0410-candidate-macro-records.sql"
+        ))
+        .unwrap();
+        // Compare against the current shape after replaying every later migration.
+        for migration in POST_BASELINE_MIGRATIONS.iter().filter(|m| m.version > 410) {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        assert_eq!(
+            schema_object_definitions_sha256(&conn).unwrap(),
+            CURRENT_SCHEMA_OBJECTS_SHA256
+        );
+        validate_foreign_keys(&conn).unwrap();
+        // The alternate call is present exactly for a runtime-call realization.
+        for (realization, alternate, accepted) in [
+            ("call", "7", true),
+            ("call", "NULL", false),
+            ("intrinsic", "NULL", true),
+            ("intrinsic", "7", false),
+            ("lexical_no_items_introduced", "NULL", true),
+            ("other", "NULL", false),
+        ] {
+            conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+            let inserted = conn.execute(
+                &format!(
+                    "INSERT INTO candidate_macro_semantic_ir_candidates VALUES (1, 0, {}, 9, 2, '{realization}', {alternate})",
+                    if accepted { "3" } else { "4" }
+                ),
+                [],
+            );
+            assert_eq!(inserted.is_ok(), accepted, "{realization}/{alternate}");
+            if accepted {
+                conn.execute_batch("DELETE FROM candidate_macro_semantic_ir_candidates")
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn cleanup_chains_upgrade_from_real_pre_m1_schema() {
+        let conn = create_current_baseline_without_migration();
+        for migration in POST_BASELINE_MIGRATIONS.iter().filter(|m| m.version < 338) {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name LIKE '%cleanup_nodes'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+        for migration in POST_BASELINE_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version >= 338)
+        {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        assert_eq!(
+            schema_object_definitions_sha256(&conn).unwrap(),
+            CURRENT_SCHEMA_OBJECTS_SHA256
+        );
+        validate_foreign_keys(&conn).unwrap();
+        for prefix in ["semantic_ir_", "candidate_macro_semantic_ir_"] {
+            for relation in [
+                "cleanup_nodes",
+                "cleanup_actions",
+                "cleanup_owners",
+                "cleanup_anchors",
+                "cleanup_projections",
+                "cleanup_projection_members",
+            ] {
+                conn.prepare(&format!("SELECT * FROM {prefix}{relation}"))
+                    .unwrap();
+            }
+        }
     }
 
     #[test]
@@ -8429,7 +10809,7 @@ mod tests {
          INSERT INTO csharp_compilation_items(compilation_id,ordinal,set_id,kind,rel_path,excluded_trees) VALUES(1,0,1,'default_tree','App',jsonb('[\"App/obj\"]'));
          INSERT INTO csharp_project_references VALUES(1,2);
          INSERT INTO csharp_compilation_symbols VALUES(1,'DEBUG','sdk');").unwrap();
-        migrate(&mut conn).unwrap();
+        apply_migrations_before_derivation_identities(&conn);
         for (table, expected) in [
             ("csharp_compilations", 2),
             ("csharp_compilation_items", 1),
@@ -8450,6 +10830,7 @@ mod tests {
         assert!(conn.execute("INSERT INTO csharp_compilation_items(compilation_id,ordinal,set_id,kind,rel_path) VALUES(1,2,1,'open','App/X.cs')",[]).is_err());
         assert!(conn.execute("UPDATE csharp_compilations SET inventory_open=0, inventory_gap_indices=jsonb('[0]') WHERE compilation_id=1", []).is_err());
         validate_foreign_keys(&conn).unwrap();
+        migrate(&mut conn).unwrap();
         assert!(current_schema_is_valid(&conn).unwrap());
     }
 
@@ -8574,6 +10955,113 @@ mod tests {
             }
             validate_foreign_keys(conn).unwrap();
         }
+    }
+
+    #[test]
+    fn structural_trait_impl_migration_preserves_populated_interiors() {
+        let mut conn = create_current_baseline_without_migration();
+        for migration in POST_BASELINE_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version < 460)
+        {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        let previous_version = POST_BASELINE_MIGRATIONS
+            .iter()
+            .rfind(|migration| migration.version < 460)
+            .unwrap()
+            .version;
+        conn.pragma_update(None, "user_version", previous_version)
+            .unwrap();
+        conn.execute(
+            "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, 'rust', 0)",
+            [seeded_oid("structural-trait-impl-upgrade")],
+        )
+        .unwrap();
+        let blob = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO resolution_fragment_interiors(
+               blob_id, lang, semantic_language, producer_epoch, interior_digest,
+               expected_semantic_site_count, expected_trait_implementation_count,
+               logical_rows, payload_bytes, publication_state
+             ) VALUES(?1, 'rust', 'rust', 'before-structural-trait-impls', zeroblob(32),
+                      0, 2, 3, 0, 'complete')",
+            [blob],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO resolution_trait_implementations(
+               blob_id, relation_key, side, position, terminal_spelling,
+               impl_site, impl_start_byte, impl_end_byte
+             ) VALUES(?1, 0, 'subject', 0, 'Example', 0, 0, 32),
+                     (?1, 0, 'trait', 0, 'Display', 0, 0, 32)",
+            [blob],
+        )
+        .unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        let manifest = conn
+            .query_row(
+                "SELECT producer_epoch, expected_trait_implementation_count,
+                        expected_structural_trait_impl_count, publication_state
+                 FROM resolution_fragment_interiors WHERE blob_id = ?1",
+                [blob],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            manifest,
+            (
+                "before-structural-trait-impls".to_owned(),
+                2,
+                0,
+                "complete".to_owned()
+            )
+        );
+        let existing_rows: Vec<(String, String, i64, i64, i64)> = conn
+            .prepare(
+                "SELECT side, terminal_spelling, impl_site, impl_start_byte, impl_end_byte
+                 FROM resolution_trait_implementations WHERE blob_id = ?1 ORDER BY side",
+            )
+            .unwrap()
+            .query_map([blob], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            existing_rows,
+            vec![
+                ("subject".to_owned(), "Example".to_owned(), 0, 0, 32),
+                ("trait".to_owned(), "Display".to_owned(), 0, 0, 32),
+            ]
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM resolution_rust_structural_trait_impls",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        validate_foreign_keys(&conn).unwrap();
+        assert!(current_schema_is_valid(&conn).unwrap());
     }
 
     #[test]
@@ -10570,6 +13058,54 @@ mod tests {
         assert!(
             busy_timeout_ms >= 60_000,
             "shared-cache writers need a substantial serialization budget, got {busy_timeout_ms}ms"
+        );
+    }
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12358: legal dev-dependency cycles forced library crates incomplete and made every Rust route partial"
+    )]
+    fn dev_cycle_gap_upgrade_preserves_populated_rows_and_foreign_keys() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;
+            CREATE TABLE rust_crate_topologies(topology_id INTEGER PRIMARY KEY);
+            INSERT INTO rust_crate_topologies VALUES(7);
+            CREATE TABLE rust_crate_gaps(
+                topology_id INTEGER NOT NULL,
+                gap_kind TEXT NOT NULL CHECK(gap_kind IN ('external_dependency','unsupported_manifest','inactive_placement','unknown_activation','unplaced_module','duplicate_placement','unresolved_import','unresolved_reexport','open_export_inventory','unresolved_visibility','unresolved_trait_impl')),
+                subject TEXT NOT NULL,
+                detail BLOB NOT NULL CHECK(json_valid(detail,8) AND json_type(detail)='object'),
+                PRIMARY KEY(topology_id,gap_kind,subject),
+                FOREIGN KEY(topology_id) REFERENCES rust_crate_topologies(topology_id) ON DELETE CASCADE
+            ) WITHOUT ROWID, STRICT;
+            INSERT INTO rust_crate_gaps VALUES(7,'external_dependency','old',jsonb('{\"preserved\":true}'));
+            PRAGMA user_version=419;").unwrap();
+        let tx = conn.transaction().unwrap();
+        tx.execute_batch(include_str!(
+            "../migrations/cache/0422-rust-dev-cycle-gap.sql"
+        ))
+        .unwrap();
+        tx.pragma_update(None, "user_version", 422).unwrap();
+        validate_foreign_keys(&tx).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT json(detail) FROM rust_crate_gaps WHERE subject='old'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "{\"preserved\":true}"
+        );
+        conn.execute("INSERT INTO rust_crate_gaps VALUES(7,'dev_dependency_cycle_edge_dropped','b',jsonb('{}'))",[]).unwrap();
+        assert!(conn.execute("INSERT INTO rust_crate_gaps VALUES(99,'dev_dependency_cycle_edge_dropped','bad',jsonb('{}'))",[]).is_err());
+        validate_foreign_keys(&conn).unwrap();
+        conn.execute("DELETE FROM rust_crate_topologies WHERE topology_id=7", [])
+            .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM rust_crate_gaps", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
         );
     }
 }

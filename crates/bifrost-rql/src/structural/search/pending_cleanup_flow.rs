@@ -214,6 +214,7 @@ fn cleanup_outcome(
     incoming_kind: PendingKind,
     root: Option<Node<'_>>,
     cancellation: Option<&CancellationToken>,
+    reuse: &mut ReuseVerdict,
 ) -> CleanupAnalysis {
     let mut pending = vec![entry];
     let mut seen = HashSet::default();
@@ -238,6 +239,7 @@ fn cleanup_outcome(
                     )
                 });
                 analyzer.mark_execution_dependent();
+                reuse.join_in(EXECUTION_DEPENDENT);
                 return CleanupAnalysis {
                     outcome: CleanupOutcome::Unknown,
                     transitions,
@@ -378,6 +380,10 @@ fn diagnostic(
     diagnostics.push(super::QueryExecutionState::diagnostic(
         analyzer,
         CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            has_non_utf8_refusal: false,
+            refusal_sites: Default::default(),
+            call_relation_facts: None,
+            uses_omissions: Vec::new(),
             incompleteness: brokk_bifrost_rql::Incompleteness::Content,
             related: Vec::new(),
             source: None,
@@ -488,6 +494,7 @@ pub(super) fn pending_cleanup_flow_expansions(
     procedure: &SemanticProcedureValue,
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    reuse: &mut ReuseVerdict,
 ) -> Vec<PipelineExpansion> {
     let language = language_for_file(procedure.file());
     let tree = parse_tree_for_language(procedure.file(), language, procedure.source_text());
@@ -556,6 +563,7 @@ pub(super) fn pending_cleanup_flow_expansions(
                 )
             });
             analyzer.mark_execution_dependent();
+            reuse.join_in(EXECUTION_DEPENDENT);
             diagnostic(
                 analyzer,
                 procedure,
@@ -633,6 +641,7 @@ pub(super) fn pending_cleanup_flow_expansions(
                 )
             });
             analyzer.mark_execution_dependent();
+            reuse.join_in(EXECUTION_DEPENDENT);
             diagnostic(
                 analyzer,
                 procedure,
@@ -650,6 +659,7 @@ pub(super) fn pending_cleanup_flow_expansions(
                 )
             });
             analyzer.mark_execution_dependent();
+            reuse.join_in(EXECUTION_DEPENDENT);
             diagnostic(
                 analyzer,
                 procedure,
@@ -688,6 +698,7 @@ pub(super) fn pending_cleanup_flow_expansions(
             pending_edge.pending_kind,
             Some(root),
             cancellation,
+            reuse,
         );
         let mut reason = None;
         let exact_selection_incomplete = procedure.exact_selection_incomplete_reason().is_some();

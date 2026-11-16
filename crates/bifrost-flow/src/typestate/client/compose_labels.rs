@@ -57,7 +57,11 @@ mod provenance_tests {
             DependencyFingerprint::hash_bytes(b"deps"),
         );
         let guard = TypestateAliasGuard::new(
-            (artifact, ProcedureId::new(0)),
+            (
+                artifact,
+                ProcedureId::new(0),
+                crate::analyzer::semantic::ProcedureInterpretation::Base,
+            ),
             PartialFlowPort::Parameter { ordinal: 0 },
             PartialFlowPort::Parameter { ordinal: 1 },
         );
@@ -489,6 +493,8 @@ impl TypestateComposeFact {
 pub enum TypestateComposeStep {
     Event(TypestateEventBindingId),
     Incomplete(TypestateUncertainty),
+    // Introducing production remapping requires extending the finding-primary
+    // domain proof first: the current policy pipeline preserves subject IDs.
     MapSubject {
         from: TypestateSubjectId,
         to: TypestateSubjectId,

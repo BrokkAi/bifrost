@@ -181,7 +181,7 @@ pub(crate) fn exact_formal_reborrow(
         .iter()
         .flat_map(|point| &point.events)
         .filter(|event| {
-            matches!(event.effect, SemanticEffect::Assignment { target, .. } if target == query.value().id())
+            matches!(event.effect, SemanticEffect::Assignment { target, .. } | SemanticEffect::ValueFlow { kind: crate::analyzer::semantic::ValueFlowKind::AddressOf, target, .. } if target == query.value().id())
         });
     let Some(association) = associations.next() else {
         return false;
@@ -189,7 +189,7 @@ pub(crate) fn exact_formal_reborrow(
     if associations.next().is_some() {
         return false;
     }
-    matches!(association.effect, SemanticEffect::Assignment { value, .. } if value == formal.id)
+    matches!(association.effect, SemanticEffect::Assignment { value, .. } | SemanticEffect::ValueFlow { kind: crate::analyzer::semantic::ValueFlowKind::AddressOf, source: value, .. } if value == formal.id)
         && procedure
             .semantics()
             .evidence_row(association.evidence)

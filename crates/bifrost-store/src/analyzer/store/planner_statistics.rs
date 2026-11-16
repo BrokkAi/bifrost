@@ -453,7 +453,8 @@ pub mod pinned_plans {
         // Keep the registry self-contained for ephemeral planner-pin stores,
         // preserving the production mount table's WITHOUT ROWID key layout.
         conn.execute_batch(
-            "CREATE TEMP TABLE IF NOT EXISTS unit_summary_order(ordinal INTEGER PRIMARY KEY, unit_id INTEGER NOT NULL UNIQUE, unit_key BLOB UNIQUE) STRICT;
+            "CREATE TEMP TABLE IF NOT EXISTS rust_unit_summary_owner_handles(owner_id INTEGER PRIMARY KEY, owner_handle INTEGER NOT NULL UNIQUE, member_ordinal INTEGER);
+             CREATE TEMP TABLE IF NOT EXISTS unit_summary_order(ordinal INTEGER PRIMARY KEY, unit_id INTEGER NOT NULL UNIQUE, unit_key BLOB UNIQUE) STRICT;
              CREATE TEMP TABLE IF NOT EXISTS selected_resolution_overlay_masks(storage_language TEXT NOT NULL, persisted_relative_path TEXT NOT NULL, intent TEXT NOT NULL DEFAULT 'replacement', masked_file_version_id INTEGER, masked_blob_oid TEXT, masked_projection_digest BLOB, expected_transient_replacement_count INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(storage_language,persisted_relative_path)) WITHOUT ROWID;
              CREATE TEMP TABLE IF NOT EXISTS selected_resolution_mounts(
                 mount_ordinal INTEGER PRIMARY KEY,
@@ -481,6 +482,13 @@ pub mod pinned_plans {
             crate::analyzer::store::resolution_operation::go_context::GO_TRANSIENT_PLACEMENTS_SQL,
         )
         .expect("selected Go transient placement pin view");
+        super::super::surface_relations::create_surface_views(
+            conn,
+            super::super::surface_relations::PYTHON_RELATIONS,
+        )
+        .expect("Python summary surface pin views");
+        super::super::go_unit_summaries::install_go_summary_surface_views(conn)
+            .expect("Go summary surface pin views");
         super::super::go_unit_summaries::install_go_summary_sources(conn)
             .expect("Go summary revision pin view");
         conn.execute_batch(crate::analyzer::store::resolution_operation::rust_crate_context::SELECTED_MODULE_PLACEMENTS_SCHEMA_SQL)
@@ -945,11 +953,48 @@ pub mod pinned_plans {
                 text("module3/src/main0"),
             ],
         )];
+        queries.extend([
+            pin(
+                "python_structural_import_containers",
+                super::super::resolution_operation::PYTHON_STRUCTURAL_IMPORT_CONTAINERS_SQL,
+                vec![integer(1), integer(1), integer(1), integer(1)],
+            ),
+            pin(
+                "python_structural_import_builtins",
+                super::super::resolution_operation::PYTHON_STRUCTURAL_IMPORTED_BUILTINS_SQL,
+                vec![integer(1), integer(1), integer(1), integer(1)],
+            ),
+            pin(
+                "python_structural_import_cells",
+                super::super::resolution_operation::PYTHON_STRUCTURAL_IMPORTED_CELLS_SQL,
+                vec![integer(1), integer(1), integer(1), integer(1)],
+            ),
+            pin(
+                "python_mount_shape_a",
+                super::super::resolution_operation::python_demand::PYTHON_HALF_PLACEMENTS,
+                vec![integer(1), integer(1)],
+            ),
+            pin(
+                "python_mount_shape_b",
+                super::super::resolution_operation::python_demand::PYTHON_IMPORT_STARTS_SQL,
+                vec![integer(1), text("client"), integer(0), integer(1)],
+            ),
+            pin(
+                "python_mount_shape_c",
+                super::super::resolution_operation::python_reverse::PYTHON_AUTHORED_MEMBER_SQL,
+                vec![integer(1), integer(1), integer(1), text("client.py")],
+            ),
+            pin(
+                "python_mount_shape_d",
+                super::super::resolution_operation::python_reverse::PYTHON_PROVIDER_BLOB_SQL,
+                vec![integer(1), text("client")],
+            ),
+        ]);
         // Unit reads bind the complete typed partition tuple, including both
         // halves of root, prefix and output questions.
         queries.push(pin(
             "policy_unit_batch",
-            super::super::policy_units::policy_unit_batch_sql("(?,?,?,?,?,?,?,?,?,?,?,?)"),
+            super::super::policy_units::policy_unit_batch_sql("(?,?,?,?,?,?,?,?,?,?,?,?,?)"),
             vec![
                 text(&"a".repeat(64)),
                 text("match"),
@@ -961,7 +1006,18 @@ pub mod pinned_plans {
                 text(&"1".repeat(40)),
             ]
             .into_iter()
-            .chain((0..9).map(|_| text(&"e".repeat(64))))
+            .chain([
+                text(""),
+                text(""),
+                text(&"e".repeat(64)),
+                text(&"e".repeat(64)),
+                text(""),
+                text(""),
+                text(""),
+                text(""),
+                text(""),
+                text(""),
+            ])
             .collect(),
         ));
         queries.push(pin(
@@ -978,6 +1034,11 @@ pub mod pinned_plans {
             "rust_receiver_kind",
             RUST_RECEIVER_KIND_SQL,
             vec![integer(1), integer(1)],
+        ));
+        queries.push(pin(
+            "rust_selected_added_edge_target",
+            super::super::rust_unit_summaries::RUST_ADDED_EDGE_TARGET_SQL,
+            vec![text("src/foo.rs")],
         ));
         queries.push(pin(
             "python_reference_by_source_site",
@@ -1122,7 +1183,8 @@ pub mod pinned_plans {
         ));
         queries.push(pin(
             "go_interval_resolution_operation_go_reverse_rows_go_reverse_dot_export_rows_sql",
-            super::super::resolution_operation::go_reverse_rows::GO_REVERSE_DOT_EXPORT_ROWS_SQL,
+            super::super::resolution_operation::go_reverse_rows::GO_REVERSE_DOT_EXPORT_ROWS_SQL
+                .as_str(),
             vec![
                 integer(1),
                 integer(1),
@@ -1591,7 +1653,8 @@ pub mod pinned_plans {
         ));
         queries.push(pin(
             "go_reverse_summary_export_rows",
-            super::super::resolution_operation::go_reverse_rows::GO_REVERSE_SUMMARY_EXPORT_ROWS_SQL,
+            super::super::resolution_operation::go_reverse_rows::GO_REVERSE_SUMMARY_EXPORT_ROWS_SQL
+                .as_str(),
             vec![
                 integer(1),
                 text("[[1,\"type\"]]"),
@@ -1654,7 +1717,8 @@ pub mod pinned_plans {
         ));
         queries.push(pin(
             "go_reverse_dot_export_rows",
-            super::super::resolution_operation::go_reverse_rows::GO_REVERSE_DOT_EXPORT_ROWS_SQL,
+            super::super::resolution_operation::go_reverse_rows::GO_REVERSE_DOT_EXPORT_ROWS_SQL
+                .as_str(),
             vec![
                 integer(1),
                 integer(1),
@@ -2071,6 +2135,11 @@ pub mod pinned_plans {
             super::super::rust_impl_children::sql(),
             vec![Value::Null; 11],
         ));
+        queries.push(pin(
+            "rust_impl_children_gaps",
+            super::super::rust_impl_children::gaps_sql(),
+            vec![Value::Null; 9],
+        ));
         queries.extend(root_terminal_demand_queries());
         queries.extend(
             crate::analyzer::store::rust_crates::sql_pins()
@@ -2131,7 +2200,7 @@ pub mod pinned_plans {
         queries.push(pin(
             "rust_crate_item_macro_decisions",
             crate::analyzer::store::rust_crates::ITEM_MACRO_DECISIONS_SQL,
-            vec![text("[]"), text("[]")],
+            vec![text("[]"), text("[]"), text("[]")],
         ));
         queries.push(pin(
             "rust_crate_collect_unbound",
@@ -2920,6 +2989,28 @@ pub mod pinned_plans {
             ],
         ));
         queries.push(pin(
+            "go_source_inventory_file",
+            super::super::go_package_context::SOURCE_INVENTORY_FILE_SQL,
+            vec![
+                text("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                integer(1),
+                integer(2),
+                text("pkg/1/main.go"),
+            ],
+        ));
+        queries.push(pin(
+            "go_source_inventory_membership",
+            super::super::go_package_context::SOURCE_INVENTORY_MEMBERSHIP_SQL,
+            vec![
+                text("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                integer(1),
+                integer(2),
+                text("pkg/1/main.go"),
+                integer(1),
+                integer(super::super::source_facts::SOURCE_FACTS_VERSION),
+            ],
+        ));
+        queries.push(pin(
             "go_native_prior_heads",
             super::super::go_package_context::PRIOR_HEADS_SQL,
             vec![
@@ -3010,26 +3101,26 @@ pub mod pinned_plans {
             ],
         ));
         queries.push(pin(
-            "csharp_membership_cap",
-            super::super::csharp_compilation::MEMBERSHIP_CAP_SQL,
-            vec![
-                integer(1),
-                text(
-                    &serde_json::to_string(&super::super::csharp_compilation::MEMBERSHIP_CAP_CODES)
-                        .unwrap(),
-                ),
-            ],
-        ));
-        queries.push(pin(
             "csharp_membership_coverage",
             super::super::csharp_compilation::MEMBERSHIP_COVERAGE_SQL,
             vec![integer(1)],
         ));
-        queries.push(pin(
-            "csharp_inventory",
-            super::super::csharp_compilation::INVENTORY_SQL,
-            vec![integer(1)],
-        ));
+        for (name, sql) in [
+            (
+                "csharp_rule_gaps",
+                super::super::csharp_compilation::RULE_GAPS_SQL,
+            ),
+            (
+                "csharp_rule_compilations",
+                super::super::csharp_compilation::RULE_COMPILATIONS_SQL,
+            ),
+            (
+                "csharp_rule_items",
+                super::super::csharp_compilation::RULE_ITEMS_SQL,
+            ),
+        ] {
+            queries.push(pin(name, sql, vec![integer(1)]));
+        }
         queries.push(pin(
             "csharp_open_inventories",
             super::super::csharp_compilation::OPEN_INVENTORIES_SQL,
@@ -3150,7 +3241,7 @@ pub mod pinned_plans {
             super::super::resolution_operation::csharp_units::SELECTED_GLOBAL_USING_COVERAGE,
             vec![
                 integer(1),
-                integer(super::super::csharp_compilation::DERIVATION_VERSION),
+                Value::Blob(super::super::csharp_compilation::derivation_identity().to_vec()),
             ],
         ));
         queries.push(pin(
@@ -3256,15 +3347,6 @@ pub mod pinned_plans {
                 ],
             ),
             (
-                "csharp_delete_unrooted_chains",
-                super::super::csharp_compilation::DELETE_UNROOTED_CHAINS_SQL,
-                vec![
-                    text("1111111111111111111111111111111111111111"),
-                    text("csharp"),
-                    digest(1),
-                ],
-            ),
-            (
                 "csharp_delete_replaced_chains",
                 super::super::csharp_compilation::DELETE_REPLACED_CHAINS_SQL,
                 vec![
@@ -3299,7 +3381,7 @@ pub mod pinned_plans {
             super::super::csharp_compilation::SET_MEMBERSHIP_SQL,
             vec![
                 integer(1),
-                integer(super::super::csharp_compilation::DERIVATION_VERSION),
+                Value::Blob(super::super::csharp_compilation::derivation_identity().to_vec()),
             ],
         ));
         queries.push(pin(
@@ -3327,7 +3409,7 @@ pub mod pinned_plans {
                 text("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
                 text("csharp"),
                 integer(1),
-                integer(super::super::csharp_compilation::DERIVATION_VERSION),
+                Value::Blob(super::super::csharp_compilation::derivation_identity().to_vec()),
                 digest(0),
             ],
         ));
@@ -3360,24 +3442,9 @@ pub mod pinned_plans {
             vec![integer(1)],
         ));
         queries.push(pin(
-            "csharp_implicit_compilation",
-            super::super::csharp_compilation::IMPLICIT_COMPILATION_SQL,
-            vec![integer(1)],
-        ));
-        queries.push(pin(
-            "csharp_path_items",
-            super::super::csharp_compilation::PATH_ITEMS_SQL,
-            vec![integer(1), text("App/Sub/Thing.cs")],
-        ));
-        queries.push(pin(
             "csharp_reference_closure",
             super::super::csharp_compilation::REFERENCE_CLOSURE_SQL,
             vec![integer(1)],
-        ));
-        queries.push(pin(
-            "csharp_tree_items",
-            super::super::csharp_compilation::TREE_ITEMS_SQL,
-            vec![integer(1), text(r#"["","App","App/Sub"]"#)],
         ));
         queries.push(pin(
             "csharp_project_count",
@@ -3796,11 +3863,6 @@ pub mod pinned_plans {
             vec![text(OID), text("java"), integer(1), Value::Blob(Vec::new())],
         ));
         queries.push(pin(
-            "definition_inventory_blob_delete_gc",
-            super::super::UNROOTED_BLOB_GC_DELETE_SQL,
-            vec![text(OID), text("java"), Value::Blob(Vec::new())],
-        ));
-        queries.push(pin(
             "index_digest_blob",
             super::super::INDEX_DIGEST_BLOB_SQL,
             vec![text(OID), text("java"), Value::Blob(Vec::new()), integer(0)],
@@ -4143,7 +4205,7 @@ pub mod pinned_plans {
         // the rows of a real Go store.
         queries.push(pin(
             "unit_summary_live_version",
-            super::super::go_unit_summaries::GO_LIVE_SUMMARY_SQL,
+            super::super::go_unit_summaries::GO_LIVE_SUMMARY_SQL.as_str(),
             vec![
                 text(&"7".repeat(64)),
                 text("go"),
@@ -4155,6 +4217,35 @@ pub mod pinned_plans {
                 digest(2),
                 digest(3),
             ],
+        ));
+        queries.push(pin(
+            "unit_summary_find_by_summary_digest",
+            super::super::unit_summaries::FIND_SUMMARY_SQL,
+            vec![digest(1), integer(1)],
+        ));
+        queries.push(pin(
+            "unit_summary_consumed_units_current",
+            super::super::unit_summaries::CONSUMED_UNITS_CURRENT_SQL,
+            vec![
+                text(&"7".repeat(64)),
+                text("go"),
+                integer(1),
+                integer(1),
+                integer(1),
+                text("go-resolution-epoch"),
+                integer(1),
+                digest(3),
+            ],
+        ));
+        queries.push(pin(
+            "unit_summary_open_candidate",
+            super::super::unit_summaries::OPEN_CANDIDATE_SQL,
+            vec![digest(1), integer(1)],
+        ));
+        queries.push(pin(
+            "unit_summary_other_candidates",
+            super::super::unit_summaries::OTHER_CANDIDATES_SQL,
+            vec![digest(1), integer(1)],
         ));
         for (name, sql, params) in [
             (
@@ -4245,6 +4336,20 @@ pub mod pinned_plans {
             ],
         ));
         queries.push(pin(
+            "python_unit_summary_live_version",
+            super::super::python_unit_summaries::LIVE.as_str(),
+            vec![
+                text(&"7".repeat(64)),
+                text("python"),
+                integer(1),
+                digest(1),
+                integer(1),
+                text("python-resolution-epoch"),
+                integer(3),
+                digest(2),
+            ],
+        ));
+        queries.push(pin(
             "rust_unit_summary_live_version",
             super::super::unit_summaries::LIVE_SUMMARY_SQL,
             vec![
@@ -4254,26 +4359,62 @@ pub mod pinned_plans {
                 digest(1),
                 integer(1),
                 text("rust-resolution-epoch"),
-                integer(super::super::rust_unit_summaries::RUST_UNIT_SUMMARY_DERIVATION_VERSION),
+                Value::Blob(
+                    super::super::rust_unit_summaries::rust_unit_summary_derivation_identity()
+                        .to_vec(),
+                ),
             ],
         ));
+        // The summary-backed export walk reads one consumed unit's rows by summary id.
+        {
+            use super::super::rust_unit_summaries::export_walk;
+            queries.push(pin(
+                "rust_walk_endpoint_row",
+                export_walk::ENDPOINT_ROW_SQL,
+                vec![integer(1), text("crate::api"), text("type"), text("item")],
+            ));
+            queries.push(pin(
+                "rust_walk_alias_modules",
+                export_walk::ALIAS_MODULES_SQL,
+                vec![
+                    digest(2),
+                    text("crate::api::nested"),
+                    text("item"),
+                    text("type"),
+                    integer(1),
+                    integer(1),
+                ],
+            ));
+            queries.push(pin(
+                "rust_walk_module_rows",
+                export_walk::MODULE_ROWS_SQL,
+                vec![integer(1)],
+            ));
+            queries.push(pin(
+                "rust_walk_route_rows",
+                export_walk::ROUTE_ROWS_SQL,
+                vec![integer(1)],
+            ));
+            queries.push(pin(
+                "rust_walk_containers",
+                export_walk::CONTAINERS_SQL,
+                vec![integer(1)],
+            ));
+        }
         queries.push(pin(
-            "rust_unit_summary_dependency_reexport_witness",
-            super::super::rust_unit_summaries::DEPENDENCY_REEXPORT_WITNESS_SQL,
-            vec![
-                text(&"7".repeat(64)),
-                text("rust"),
-                integer(1),
-                digest(1),
-                integer(1),
-                text("rust-resolution-epoch"),
-                integer(super::super::rust_unit_summaries::RUST_UNIT_SUMMARY_DERIVATION_VERSION),
-                digest(2),
-                text("crate::api::nested"),
-                text("value"),
-                text("item"),
-                integer(1),
-            ],
+            "rust_unit_binding_authority_names",
+            super::super::rust_unit_summaries::BINDING_AUTHORITY_NAMES_SQL,
+            vec![integer(1)],
+        ));
+        queries.push(pin(
+            "rust_unit_binding_authority_blockers",
+            super::super::rust_unit_summaries::BINDING_AUTHORITY_BLOCKERS_SQL,
+            vec![integer(1), integer(1)],
+        ));
+        queries.push(pin(
+            "rust_unit_binding_authority_alternatives",
+            super::super::rust_unit_summaries::binding_authority_alternatives_sql(),
+            vec![integer(1), integer(1)],
         ));
         queries.push(pin(
             "rust_crate_named_reexport_targets",
@@ -4329,7 +4470,7 @@ pub mod pinned_plans {
         conn: &Connection,
         query: &PinnedQuery,
     ) -> std::result::Result<Vec<String>, String> {
-        if query.name == "rust_impl_children" {
+        if query.name.starts_with("rust_impl_children") {
             use rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_QPSG;
 
             // Match the retained resolution reader's production policy. Other
@@ -4455,6 +4596,42 @@ pub mod tests {
 
     #[cfg(test)]
     use brokk_bifrost_core::cache_gc::with_representative_statistics;
+
+    #[cfg(test)]
+    #[test]
+    #[hardwon("#13072: structural import lookups joined all providers to all summary imports")]
+    fn python_structural_imports_seek_selected_rows_before_provider_join() {
+        for state in PlannerStatisticsState::BOTH {
+            let store = AnalyzerStore::open_ephemeral().expect("open store");
+            let conn = store.conn.lock().expect("store mutex");
+            store
+                .select_writer_workspace_snapshots(&conn, &HashMap::default())
+                .expect("workspace selection views");
+            prepare_pin_context(&conn);
+            state.install(&conn);
+            for name in [
+                "python_structural_import_containers",
+                "python_structural_import_builtins",
+                "python_structural_import_cells",
+            ] {
+                let plan = explain_pin(&conn, &pinned(name));
+                assert!(
+                    plan.iter()
+                        .any(|detail| detail.contains("MATERIALIZE selected_import")),
+                    "{state} {name} must bind the selected import before its consumers: {plan:?}"
+                );
+                assert!(
+                    plan.iter().any(|detail| {
+                        detail.contains("SEARCH imported USING PRIMARY KEY")
+                            && detail.contains(
+                                "summary_id=? AND member_ordinal=? AND import_surface_ordinal=?",
+                            )
+                    }),
+                    "{state} {name} must seek one member's import surface: {plan:?}"
+                );
+            }
+        }
+    }
 
     #[cfg(test)]
     pub(crate) fn assert_pinned_query_uses_index(
@@ -6606,62 +6783,222 @@ pub mod tests {
         }
     }
 
+    #[test]
+    #[hardwon("#12895: names and blockers must seek from unit handles")]
+    fn rust_binding_authority_names_and_blockers_seek_handles() {
+        for state in PlannerStatisticsState::BOTH {
+            let store = AnalyzerStore::open_ephemeral().expect("open store");
+            let conn = store.conn.lock().expect("store mutex");
+            conn.execute_batch(
+                "CREATE TEMP TABLE rust_unit_summary_owner_handles(
+                owner_id INTEGER PRIMARY KEY, owner_handle INTEGER NOT NULL UNIQUE,
+                member_ordinal INTEGER)",
+            )
+            .unwrap();
+            let _fixture = crate::analyzer::store::sealed_families::Fixture::new(&conn);
+            conn.execute_batch("PRAGMA foreign_keys=OFF;
+                WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1024)
+                INSERT INTO rust_crate_binding_alternatives(owner_id,namespace,name,
+                    target_crate_key,target_module_path,target_name,origin,
+                    declaration_blob_id,declaration_site,visibility)
+                SELECT x,'type','Item',CASE x WHEN 2 THEN x'0100000000000000000000000000000000000000000000000000000000000000' ELSE zeroblob(32) END,'crate','Item','declaration',x,0,'public' FROM n;
+                WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1024)
+                INSERT INTO resolution_unit_summary_members(summary_id,member_ordinal,
+                    blob_id,rel_path,source_role)
+                SELECT 1,x,x,'src/'||x||'.rs','source' FROM n;
+                INSERT INTO rust_crate_topologies(topology_id,topology_digest,crate_key,
+                    producer_epoch,target_kind,crate_name,edition,prelude,cfg_atoms,
+                    inventory_complete,publication_state)
+                VALUES(1,zeroblob(32),zeroblob(32),'pin','lib','selected','2021','std',jsonb('[]'),1,'building');
+                INSERT INTO resolution_unit_summary_placements(summary_id,container_path,member_ordinal)
+                SELECT summary_id,CASE member_ordinal WHEN 1 THEN '' ELSE 'crate::m'||member_ordinal END,
+                       member_ordinal FROM resolution_unit_summary_members;
+                INSERT INTO rust_resolution_unit_summary_placement_attributes(
+                    summary_id,container_path,member_ordinal,placement,source_kind)
+                SELECT summary_id,container_path,member_ordinal,
+                       CASE member_ordinal WHEN 1 THEN 'root' ELSE 'mod_declaration' END,'declared'
+                FROM resolution_unit_summary_placements;
+                INSERT INTO rust_unit_summary_owner_handles VALUES(1,0,1),(2,1,2);").unwrap();
+            conn.execute_batch("INSERT INTO rust_crate_binding_names(owner_id,namespace,name,complete)
+                SELECT owner_id,namespace,name,1 FROM rust_crate_binding_alternatives;
+                INSERT INTO rust_crate_binding_blockers(owner_id,namespace,name,reason,boundary,
+                    evidence_crate_key,evidence_module_path,evidence_rel_path,evidence_kind,evidence_key)
+                SELECT owner_id,namespace,name,'test','test',zeroblob(32),'crate','','owner',0
+                FROM rust_crate_binding_alternatives;").unwrap();
+            state.install(&conn);
+            for (name, accesses) in [
+                (
+                    "rust_unit_binding_authority_names",
+                    vec![("names", "(owner_id=?)")],
+                ),
+                (
+                    "rust_unit_binding_authority_blockers",
+                    vec![
+                        ("blocker", "(owner_id=?)"),
+                        (
+                            "evidence_source",
+                            "(topology_id=? AND rel_path=? AND container_path=?)",
+                        ),
+                        ("evidence_member", "(blob_id=? AND summary_id=?)"),
+                        (
+                            "evidence_owner",
+                            "(topology_id=? AND module_path=? AND rel_path=? AND scope_identity=?)",
+                        ),
+                    ],
+                ),
+            ] {
+                let query = pinned(name);
+                let plan = explain_pin(&conn, &query);
+                for (alias, keys) in accesses {
+                    let rows = plan
+                        .iter()
+                        .filter(|row| {
+                            row.starts_with(&format!("SEARCH {alias} "))
+                                || row.starts_with(&format!("SCAN {alias} "))
+                        })
+                        .collect::<Vec<_>>();
+                    assert!(!rows.is_empty(), "{state}: missing {alias}: {plan:?}");
+                    assert!(
+                        rows.iter()
+                            .all(|row| row.starts_with("SEARCH ") && row.contains(keys)),
+                        "{state}: {alias} must seek {keys}: {plan:?}"
+                    );
+                }
+                assert!(
+                    !plan.iter().any(|row| row.contains("AUTOMATIC")),
+                    "{state}: {plan:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon("#12849: alternatives scanned all topology rows and unit placements per binding")]
+    fn rust_binding_authority_alternatives_seek_handles_and_blobs() {
+        for state in PlannerStatisticsState::BOTH {
+            let store = AnalyzerStore::open_ephemeral().expect("open store");
+            let conn = store.conn.lock().expect("store mutex");
+            conn.execute_batch(
+                "CREATE TEMP TABLE rust_unit_summary_owner_handles(
+                owner_id INTEGER PRIMARY KEY, owner_handle INTEGER NOT NULL UNIQUE,
+                member_ordinal INTEGER)",
+            )
+            .unwrap();
+            let _fixture = crate::analyzer::store::sealed_families::Fixture::new(&conn);
+            conn.execute_batch("PRAGMA foreign_keys=OFF;
+                WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1024)
+                INSERT INTO rust_crate_binding_alternatives(owner_id,namespace,name,
+                    target_crate_key,target_module_path,target_name,origin,
+                    declaration_blob_id,declaration_site,visibility)
+                SELECT x,'type','Item',CASE x WHEN 2 THEN x'0100000000000000000000000000000000000000000000000000000000000000' ELSE zeroblob(32) END,'crate','Item','declaration',x,0,'public' FROM n;
+                WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1024)
+                INSERT INTO resolution_unit_summary_members(summary_id,member_ordinal,
+                    blob_id,rel_path,source_role)
+                SELECT 1,x,x,'src/'||x||'.rs','source' FROM n;
+                INSERT INTO rust_crate_topologies(topology_id,topology_digest,crate_key,
+                    producer_epoch,target_kind,crate_name,edition,prelude,cfg_atoms,
+                    inventory_complete,publication_state)
+                VALUES(1,zeroblob(32),zeroblob(32),'pin','lib','selected','2021','std',jsonb('[]'),1,'building');
+                INSERT INTO resolution_unit_summary_placements(summary_id,container_path,member_ordinal)
+                SELECT summary_id,CASE member_ordinal WHEN 1 THEN '' ELSE 'crate::m'||member_ordinal END,
+                       member_ordinal FROM resolution_unit_summary_members;
+                INSERT INTO rust_resolution_unit_summary_placement_attributes(
+                    summary_id,container_path,member_ordinal,placement,source_kind)
+                SELECT summary_id,container_path,member_ordinal,
+                       CASE member_ordinal WHEN 1 THEN 'root' ELSE 'mod_declaration' END,'declared'
+                FROM resolution_unit_summary_placements;
+                INSERT INTO rust_unit_summary_owner_handles VALUES(1,0,1),(2,1,2);").unwrap();
+            state.install(&conn);
+            let query = pinned("rust_unit_binding_authority_alternatives");
+            let plan = explain_pin(&conn, &query);
+            // Inspect every occurrence: the correlated target lookup repeats these
+            // aliases, and one good branch must not hide a summary-wide seek.
+            for (alias, keys) in [
+                ("alt", "(owner_id=?)"),
+                ("members", "(blob_id=? AND summary_id=?)"),
+                ("placed", "(blob_id=? AND summary_id=?)"),
+                ("placement", "(summary_id=? AND member_ordinal=?)"),
+                (
+                    "naming",
+                    "(summary_id=? AND container_path=? AND member_ordinal=?)",
+                ),
+            ] {
+                let accesses = plan
+                    .iter()
+                    .filter(|row| {
+                        row.starts_with(&format!("SEARCH {alias} "))
+                            || row.starts_with(&format!("SCAN {alias} "))
+                    })
+                    .collect::<Vec<_>>();
+                assert!(!accesses.is_empty(), "{state}: missing {alias}: {plan:?}");
+                assert!(
+                    accesses
+                        .iter()
+                        .all(|row| row.starts_with("SEARCH ") && row.contains(keys)),
+                    "{state}: every {alias} access must seek {keys}: {plan:?}"
+                );
+            }
+            let handles = plan
+                .iter()
+                .position(|row| {
+                    row.starts_with("SCAN handles ") || row.starts_with("SEARCH handles ")
+                })
+                .expect("handles driver");
+            let alternatives = plan
+                .iter()
+                .position(|row| row.starts_with("SEARCH alt "))
+                .expect("alternatives seek");
+            assert!(
+                handles < alternatives,
+                "{state}: handles must drive alternatives: {plan:?}"
+            );
+            let mut rows = conn
+                .prepare(&query.sql)
+                .unwrap()
+                .query_map([1, 1], |row| {
+                    Ok((
+                        row.get::<_, i64>("owner_handle")?,
+                        row.get::<_, String>("target_form")?,
+                        row.get::<_, Option<i64>>("target_member_ordinal")?,
+                        row.get::<_, Option<i64>>("target_member_matches")?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            rows.sort();
+            assert_eq!(
+                rows,
+                vec![
+                    (0, "local_site".into(), Some(1), Some(1)),
+                    (1, "foreign".into(), None, None)
+                ],
+                "{state}: populated alternatives"
+            );
+            assert!(
+                !plan.iter().any(|row| row.contains("AUTOMATIC")),
+                "{state}: no automatic indexes: {plan:?}"
+            );
+        }
+    }
+
     #[cfg(test)]
     #[test]
     #[hardwon(
         "#5133: dependency export witnesses missed the alias-target index and scanned module exports"
     )]
-    fn rust_dependency_reexport_witness_seeks_target_coordinates_in_both_statistics_states() {
-        use rusqlite::{params, params_from_iter};
+    fn rust_export_walk_reads_seek_one_summary_in_both_statistics_states() {
+        use rusqlite::params;
 
         for state in PlannerStatisticsState::BOTH {
             let store = AnalyzerStore::open_ephemeral().expect("open store");
             let conn = store.conn.lock().expect("store mutex");
             let _fixture = crate::analyzer::store::sealed_families::Fixture::new(&conn);
             conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
-            let pin = pinned("rust_unit_summary_dependency_reexport_witness");
-            // A selected dependency among unrelated summaries, each with both
-            // declarations and aliases. Bind the registry's real target shape.
-            for summary in 1..=16 {
-                let key = vec![summary as u8; 32];
-                conn.execute(
-                    "INSERT INTO resolution_unit_summaries(
-                       summary_id,lang,unit_kind,unit_key,summary_digest,producer_epoch,
-                       derivation_version,complete,output_digest,publication_state)
-                     VALUES(?1,'rust','rust_crate',?2,?2,?3,?4,1,?2,'complete')",
-                    params![summary, key, pin.params[5], pin.params[6]],
-                )
-                .unwrap();
-                conn.execute(
-                    "INSERT INTO resolution_unit_summary_versions
-                     (workspace_id,lang,generation,unit_key,valid_from,valid_until,summary_id)
-                     VALUES(?1,'rust',1,?2,1,NULL,?3)",
-                    params![pin.params[0], key, summary],
-                )
-                .unwrap();
-                conn.execute(
-                    "INSERT INTO rust_crate_topologies(
-                       topology_id,topology_digest,crate_key,producer_epoch,target_kind,
-                       crate_name,edition,prelude,cfg_atoms,inventory_complete,
-                       export_surface_digest,publication_state)
-                     VALUES(?1,?2,?2,'rust-resolution-epoch','lib','planner_fixture',
-                            '2021','std',jsonb('[]'),1,?2,'complete')",
-                    params![summary, key],
-                )
-                .unwrap();
-                conn.execute(
-                    "INSERT INTO rust_resolution_unit_summary_versions
-                     (workspace_id,lang,generation,unit_key,valid_from,summary_id,manifest_file_version_id,topology_id)
-                     VALUES(?1,'rust',1,?2,1,?3,NULL,?4)",
-                    params![pin.params[0], key, summary, summary + 1],
-                )
-                .unwrap();
-                conn.execute(
-                    "INSERT INTO rust_crate_versions
-                     VALUES(?1,'rust',1,?2,1,NULL,NULL,?3)",
-                    params![pin.params[0], key, summary],
-                )
-                .unwrap();
+            // Unrelated summaries, each with declarations, aliases, containers and
+            // routes, around the one the walk reads.
+            for summary in 1..=16_i64 {
+                let target = vec![2_u8; 32];
                 conn.execute(
                     "WITH RECURSIVE names(n) AS (
                        VALUES(1) UNION ALL SELECT n+1 FROM names WHERE n<128
@@ -6669,9 +7006,9 @@ pub mod tests {
                      INSERT INTO rust_resolution_unit_summary_exports(
                        summary_id,module_path,namespace,name,identity_id,visibility,origin,
                        target_unit_key,alias_identity_id,target_module_path,target_name)
-                     SELECT ?1,'crate','value','alias_'||n,1,'public','reexport',
+                     SELECT ?1,'crate::api','type','alias_'||n,1,'public','reexport',
                             ?2,1,'crate::api::nested','item_'||n FROM names",
-                    params![summary, pin.params[7]],
+                    params![summary, target],
                 )
                 .unwrap();
                 conn.execute(
@@ -6680,91 +7017,63 @@ pub mod tests {
                      )
                      INSERT INTO rust_resolution_unit_summary_exports(
                        summary_id,module_path,namespace,name,identity_id,visibility,origin)
-                     SELECT ?1,'crate','value','local_'||n,1,'public','declaration' FROM names",
+                     SELECT ?1,'crate::api','type','local_'||n,1,'public','declaration' FROM names",
                     [summary],
                 )
                 .unwrap();
+                conn.execute(
+                    "WITH RECURSIVE names(n) AS (
+                       VALUES(1) UNION ALL SELECT n+1 FROM names WHERE n<64
+                     )
+                     INSERT INTO rust_resolution_unit_summary_container_attributes(
+                       summary_id,container_path,kind)
+                     SELECT ?1,'crate::m'||n,'module' FROM names",
+                    [summary],
+                )
+                .unwrap();
+                conn.execute(
+                    "WITH RECURSIVE names(n) AS (
+                       VALUES(1) UNION ALL SELECT n+1 FROM names WHERE n<64
+                     )
+                     INSERT INTO rust_resolution_unit_summary_reexport_routes(
+                       summary_id,module_path,bound_name,target_unit_key,
+                       target_module_path,target_name,visibility)
+                     SELECT ?1,'crate::api','route_'||n,?2,'crate','m'||n,'public' FROM names",
+                    params![summary, target],
+                )
+                .unwrap();
             }
-            conn.execute(
-                "INSERT INTO rust_resolution_unit_summary_exports(
-                   summary_id,module_path,namespace,name,identity_id,visibility,origin,
-                   target_unit_key,alias_identity_id,target_module_path,target_name)
-                 VALUES(1,'crate','value','item',1,'public','reexport',
-                        ?1,1,'crate::api::nested','item')",
-                [&pin.params[7]],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO rust_crate_public_module_reachability
-                 VALUES(1,?1,'crate::api::nested')",
-                [&pin.params[7]],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO rust_crate_public_module_reachability
-                 VALUES(2,?1,'crate::api::nested'),(1,?2,'crate::api::decoy')",
-                params![pin.params[7], vec![99_u8; 32]],
-            )
-            .unwrap();
             state.install(&conn);
-            let plan = explain_pin(&conn, &pin);
-            for expected in [
-                "SEARCH versions USING PRIMARY KEY (workspace_id=? AND lang=? AND generation=? AND crate_key=? AND valid_from<?)",
-                "SEARCH topology USING INTEGER PRIMARY KEY (rowid=?)",
-                "SEARCH reachability USING PRIMARY KEY (topology_id=? AND target_crate_key=? AND target_module_path=?)",
+            for (name, summary_scope) in [
+                ("rust_walk_endpoint_row", "summary_id=?"),
+                ("rust_walk_alias_modules", "summary_id=?"),
+                ("rust_walk_module_rows", "summary_id=?"),
+                ("rust_walk_route_rows", "summary_id=?"),
+                ("rust_walk_containers", "summary_id=?"),
             ] {
+                let plan = explain_pin(&conn, &pinned(name));
                 assert!(
-                    plan.iter().any(|row| row.contains(expected)),
-                    "{state} {expected}: {plan:?}"
+                    plan.iter().any(|row| row.starts_with("SEARCH")
+                        && row.contains("rust_resolution_unit_summary_")
+                        && row.contains(summary_scope)),
+                    "{state} {name}: the read must seek its summary: {plan:?}"
+                );
+                assert!(
+                    plan.iter().all(|row| {
+                        !row.starts_with("SCAN")
+                            && !row.contains("AUTOMATIC")
+                            && !row.contains("TEMP B-TREE")
+                    }),
+                    "{state} {name}: the read must not scan the table or build a transient index: {plan:?}"
                 );
             }
+            // The alias lookup keeps the alias-target index (#5133).
+            let plan = explain_pin(&conn, &pinned("rust_walk_alias_modules"));
             assert!(
-                plan.iter().any(|row| {
-                    row.starts_with("SEARCH exports USING")
-                        && row.contains("(target_unit_key=? AND target_module_path=? AND target_name=? AND namespace=? AND alias_identity_id=? AND summary_id=?)")
-                }),
-                "{state}: alias witnesses must seek target coordinates in the selected summary: {plan:?}"
-            );
-            assert!(
-                plan.iter().all(|row| {
-                    ![
-                        "SCAN exports",
-                        "SCAN exported_module",
-                        "SCAN versions",
-                        "SCAN reachability",
-                        "AUTOMATIC",
-                        "TEMP B-TREE",
-                    ]
-                    .iter()
-                    .any(|forbidden| row.contains(forbidden))
-                }),
-                "{state} export witness must seek base rows without transient indexes: {plan:?}"
-            );
-            let witnessed = || {
-                conn.query_row(&pin.sql, params_from_iter(&pin.params), |row| {
-                    row.get::<_, bool>(0)
-                })
-                .unwrap()
-            };
-            assert!(witnessed(), "{state}: exact public alias");
-            conn.execute(
-                "DELETE FROM rust_resolution_unit_summary_exports WHERE name='item'",
-                [],
-            )
-            .unwrap();
-            assert!(
-                witnessed(),
-                "{state}: selected topology proves the canonical target module"
-            );
-            conn.execute(
-                "DELETE FROM rust_crate_public_module_reachability
-                 WHERE topology_id=1 AND target_crate_key=?1 AND target_module_path=?2",
-                params![pin.params[7], pin.params[8]],
-            )
-            .unwrap();
-            assert!(
-                !witnessed(),
-                "{state}: membership in another topology is not a proof"
+                plan.iter().any(|row| row.contains(
+                    "(target_unit_key=? AND target_module_path=? AND target_name=? AND namespace=? AND alias_identity_id=? AND summary_id=?)"
+                )),
+                "{state}: alias rows must seek target coordinates in the selected summary: {plan:?}"
             );
         }
     }
@@ -7113,6 +7422,93 @@ pub mod tests {
             }
             for query in pinned_queries() {
                 let plan = explain_pin(&conn, &query);
+                if matches!(
+                    query.name.as_str(),
+                    "unit_summary_find_by_summary_digest"
+                        | "unit_summary_open_candidate"
+                        | "unit_summary_other_candidates"
+                ) {
+                    assert!(
+                        plan.iter().all(|step| {
+                            !step.starts_with("SCAN candidate")
+                                && !step.starts_with("SCAN resolution_unit_summary_consumed_units")
+                        }),
+                        "{state} unit-summary candidate lookup must not scan summaries or consumed units: {plan:?}"
+                    );
+                    assert!(
+                        plan.iter()
+                            .any(|step| step.starts_with("SEARCH candidate USING")),
+                        "{state} unit-summary candidate lookup must use a keyed search: {plan:?}"
+                    );
+                }
+                if query.name == "unit_summary_consumed_units_current" {
+                    assert!(
+                        plan.iter().any(|step| {
+                            // The recorded set is read by the primary key's summary_id
+                            // prefix; each row then probes the unit's live summary.
+                            step.contains("SEARCH consumed USING PRIMARY KEY (summary_id=?")
+                        }),
+                        "{state} consumed-unit validation must seek the recorded set by summary primary key: {plan:?}"
+                    );
+                    assert!(
+                        plan.iter().all(|step| !step.starts_with("SCAN consumed")),
+                        "{state} consumed-unit validation must not scan recorded units: {plan:?}"
+                    );
+                }
+                if query.name == "unit_summary_other_candidates" {
+                    assert!(
+                        plan.iter().any(|step| {
+                            step.contains("SEARCH candidate USING INDEX resolution_unit_summaries_lookup (lookup_digest=?)")
+                        }),
+                        "{state} candidate lookup must seek the lookup_digest index: {plan:?}"
+                    );
+                    assert!(
+                        plan.iter().all(|step| !step.starts_with("SCAN candidate")),
+                        "{state} candidate lookup must not scan summaries: {plan:?}"
+                    );
+                }
+                let migrated_reader = matches!(
+                    query.name.as_str(),
+                    "unit_summary_export_point"
+                        | "unit_summary_graph_join"
+                        | "rust_unit_summary_export_point"
+                        | "rust_unit_summary_import_graph_binding_surfaces"
+                        | "rust_point_item_macro_decisions"
+                        | "rust_point_summary_importing_files"
+                        | "rust_point_store_trait_impl_rows"
+                        | "rust_point_store_trait_impl_spellings"
+                        | "rust_point_store_traits_of_impl"
+                        | "rust_copy_absence"
+                        | "rust_copy_absence_question"
+                ) || query
+                    .name
+                    .starts_with("rust_point_store_trait_impl_counterparts_");
+                if migrated_reader
+                    || query.name.starts_with("python_mount_shape_")
+                    || query.sql.contains("selected_unit_member_mounts")
+                    || query.sql.contains("selected_unit_member_paths")
+                {
+                    eprintln!("M2 reader {}: {plan:?}", query.name);
+                    assert!(
+                        plan.iter().all(|step| {
+                            !step.contains("MATERIALIZE selected_unit_member_blobs")
+                                && !step.contains("MATERIALIZE selected_unit_member_mounts")
+                                && !step.contains("MATERIALIZE selected_unit_member_paths")
+                                && !step.contains("MATERIALIZE surface_dense")
+                                && !(step.contains("AUTOMATIC")
+                                    && (step.contains("selected_unit_member_blobs")
+                                        || step.contains("surface_dense")
+                                        || step.contains("selected_unit_member_mounts")
+                                        || step.contains("selected_unit_member_paths")))
+                                && !step.starts_with("SCAN surface_sets")
+                                && !step.starts_with("SCAN surface_ids")
+                                && !step.starts_with("SCAN selected_unit_member_mounts")
+                                && !step.starts_with("SCAN selected_unit_member_paths")
+                        }),
+                        "{state} {} must use bounded keyed translation seeks: {plan:?}",
+                        query.name
+                    );
+                }
                 if query.name.starts_with("definition_inventory_") {
                     assert!(
                         plan.iter().all(|step| !step.contains("AUTOMATIC")
@@ -7242,15 +7638,19 @@ pub mod tests {
                     );
                     assert!(
                         plan.iter().any(|detail| {
-                            detail.contains("SEARCH parent_file USING INDEX idx_workspace_file_versions_snapshot_kind")
-                                || detail.contains("SEARCH parent_file USING INDEX sqlite_autoindex_workspace_file_versions_1")
+                            detail.contains("SEARCH parent_file USING")
+                                && (detail.contains("idx_workspace_file_versions_snapshot_kind")
+                                    || detail
+                                        .contains("sqlite_autoindex_workspace_file_versions_1"))
                         }),
                         "{state} Cargo-route lookup must seek the parent's live root file version: {plan:?}"
                     );
                     assert!(
                         plan.iter().any(|detail| {
-                            detail.contains("SEARCH child_file USING INDEX idx_workspace_file_versions_snapshot_kind")
-                                || detail.contains("SEARCH child_file USING INDEX sqlite_autoindex_workspace_file_versions_1")
+                            detail.contains("SEARCH child_file USING")
+                                && (detail.contains("idx_workspace_file_versions_snapshot_kind")
+                                    || detail
+                                        .contains("sqlite_autoindex_workspace_file_versions_1"))
                         }),
                         "{state} Cargo-route lookup must seek the dependency's live root file version: {plan:?}"
                     );
@@ -7317,11 +7717,19 @@ pub mod tests {
                         "{state} {} must seek its selected source path: {plan:?}",
                         query.name
                     );
-                    // Membership is a keyed seek: by selected blob, or by the summary
-                    // when the query reaches members through the selected file version.
+                    // Membership is a bounded keyed seek: by selected blob, by
+                    // summary when the query reaches members through the
+                    // selected file version, or by rel_path when it reaches
+                    // them through a selected mount. The path index is
+                    // (rel_path, summary_id), so the equality seek touches only
+                    // the member rows of summaries that include that path.
+                    // #11519 moved the macro-walk readers onto this path after
+                    // retiring their blob-keyed membership seek.
                     assert!(
                         plan.iter().any(|detail| {
                             detail.contains("resolution_unit_summary_members_blob")
+                                || detail
+                                    .contains("resolution_unit_summary_members_path (rel_path=?")
                                 || detail
                                     .contains("SEARCH members USING PRIMARY KEY (summary_id=?)")
                         }),
@@ -7454,6 +7862,50 @@ pub mod tests {
                     .any(|detail| detail.starts_with("SCAN test_package")),
                 "{state} candidate target must not scan the context's packages: {plan:?}"
             );
+        }
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn go_and_python_liveness_gate_probes_members_by_key_under_both_statistics_states() {
+        for state in PlannerStatisticsState::BOTH {
+            let store = AnalyzerStore::open_ephemeral().expect("open store");
+            let conn = store.conn.lock().expect("store mutex");
+            store
+                .select_writer_workspace_snapshots(&conn, &HashMap::default())
+                .expect("workspace selection views");
+            prepare_pin_context(&conn);
+            state.install(&conn);
+            for name in [
+                "unit_summary_live_version",
+                "python_unit_summary_live_version",
+            ] {
+                let plan = explain_pin(&conn, &pinned(name));
+                // Each member's recorded input is compared by indexed probes: the
+                // member rows by summary, the selected file version by path, the
+                // blob and its surface set by key. A scan of any of them would
+                // make a point read cost the size of the store.
+                for needle in [
+                    "SEARCH recorded USING PRIMARY KEY (summary_id=?)",
+                    "idx_workspace_file_versions_snapshot_kind",
+                    "SEARCH sets USING COVERING INDEX sqlite_autoindex_surface_sets_1",
+                ] {
+                    assert!(
+                        plan.iter().any(|detail| detail.contains(needle)),
+                        "{state} {name} gate must probe {needle}: {plan:?}"
+                    );
+                }
+                assert!(
+                    plan.iter().all(|detail| {
+                        !["recorded", "files", "blobs", "sets"]
+                            .iter()
+                            .any(|table| detail.starts_with(&format!("SCAN {table}")))
+                            && !detail.contains("AUTOMATIC")
+                            && !detail.contains("MATERIALIZE")
+                    }),
+                    "{state} {name} gate must stay indexed: {plan:?}"
+                );
+            }
         }
     }
 
@@ -7671,8 +8123,24 @@ pub mod tests {
             conn.execute_batch("UPDATE python_member_operations SET form=1,effect=1,callee_reference=site,receiver_reference=site").unwrap();
             let workspace = "e".repeat(64);
             conn.execute("INSERT INTO workspace_revisions VALUES(?1,'python',0,1)", [&workspace]).unwrap();
+            // The member-operation readers translate members through
+            // temp.selected_unit_member_blobs. A published summary always has
+            // its header, and a selected workspace always has its revision, so
+            // seed both instead of leaving the bridge empty.
+            conn.execute("INSERT INTO temp.selected_workspace_revisions VALUES(?1,'python',0,1)", [&workspace]).unwrap();
+            conn.execute_batch("INSERT INTO resolution_unit_summaries(summary_id,lang,unit_kind,unit_key,summary_digest,producer_epoch,derivation_identity,complete,output_digest,publication_state) VALUES(1,'python','python_environment',zeroblob(32),zeroblob(32),'plan',x'0101010101010101010101010101010101010101010101010101010101010101',1,zeroblob(32),'complete')").unwrap();
+            // The staging readers see per-file facts only through the generated
+            // surface views, which hold a row only for a blob with a surface set
+            // and for a dense id the set maps. Publish both, or every view is
+            // empty and the pins would plan over no persistent facts. Spaces:
+            // slot=0, import=1, source marker=3, export=4.
+            let python_list_digest = super::super::surface_relations::list_digest(super::super::surface_relations::PYTHON_RELATIONS);
             for blob in 1..=16 {
                 conn.execute("INSERT INTO python_binding_source VALUES(?1,?2,0,0)",rusqlite::params![blob,super::super::python_binding_rows::NATIVE_SOURCE_FORMAT]).unwrap();
+                conn.execute("INSERT INTO surface_sets(set_id,blob_id,generation,source_facts_version,producer_epoch,publication_witness,list_digest,fingerprint) VALUES(?1,?1,0,1,'plan',?1,?2,zeroblob(32))",rusqlite::params![blob,python_list_digest.as_slice()]).unwrap();
+                for (space, dense_id) in [(0, 0), (1, 0), (3, blob), (4, 0)] {
+                    conn.execute("INSERT INTO surface_ids VALUES(?1,?2,?3,0)",rusqlite::params![blob,space,dense_id]).unwrap();
+                }
                 let path=format!("file{blob}.py");
                 let oid = format!("{blob:040x}");
                 conn.execute("INSERT INTO blobs(id,blob_oid,lang,generation) VALUES(?1,?2,'python',0)",rusqlite::params![blob,oid]).unwrap();
@@ -7684,6 +8152,15 @@ pub mod tests {
                 conn.execute("INSERT INTO temp.selected_resolution_mounts(mount_ordinal,blob_id,storage_language,persisted_relative_path) VALUES(?1,?1,'python',?2)",rusqlite::params![blob,path]).unwrap();
                 conn.execute("INSERT INTO resolution_unit_summary_members(summary_id,member_ordinal,blob_id,rel_path,source_role) VALUES(1,?1,?1,?2,'source')",rusqlite::params![blob,path]).unwrap();
             }
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM temp.selected_unit_member_blobs WHERE summary_id=1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                ).unwrap(),
+                16,
+                "the summary header and selected revision must translate every source member",
+            );
             let mut environment_plans = Vec::new();
             for state in PlannerStatisticsState::BOTH {
                 state.install(conn);
@@ -7699,7 +8176,7 @@ pub mod tests {
                     let query = pinned(name);
                     let plan = explain_pin(conn, &query);
                     eprintln!("{state} {name}: {plan:#?}");
-                    assert!(plan.iter().all(|step| !step.contains("AUTOMATIC") && !["f", "b", "s", "i", "slots", "e", "op", "reset", "providers", "roots", "segments", "target", "provider", "imports", "names"].iter().any(|alias| {
+                    assert!(plan.iter().all(|step| !step.contains("AUTOMATIC") && !step.starts_with("MATERIALIZE surface_") && !["f", "b", "s", "i", "slots", "e", "op", "reset", "providers", "roots", "segments", "target", "provider", "imports", "names"].iter().any(|alias| {
                         // f/slots are selected TEMP inputs in fact staging. Only
                         // persistent tables must always be sought by their keys.
                         let base_alias = match *alias {
@@ -7870,6 +8347,137 @@ pub mod tests {
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .unwrap();
             assert_eq!(rows, [(1, 0, 1001), (2, 7, 1002)]);
+        }
+    }
+
+    #[test]
+    fn go_inventory_reuse_seeks_the_contexts_source_versions() {
+        use rusqlite::params;
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let conn = store.conn.lock().unwrap();
+        // Publication/epoch FKs do not affect the selected-version reader.
+        conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        let workspace = "a".repeat(64);
+        for id in 1..=256_i64 {
+            let oid = format!("{id:040x}");
+            conn.execute(
+                "INSERT INTO blobs(id,blob_oid,lang,generation) VALUES(?1,?2,'go',1)",
+                params![id, oid],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO blob_meta(blob_id,lang,contains_tests,content_package,stored_unit_count,range_count,signature_count,signature_metadata_count,supertype_count,child_count,import_statement_count,type_identifier_count,is_complete,go_source_version) VALUES(?1,'go',0,'main',0,0,0,0,0,0,0,0,?2,1)",params![id,id!=6]).unwrap();
+            conn.execute("INSERT INTO source_fact_manifests(blob_id,facts_version,source_bytes,occurrence_count,declaration_count,declaration_unit_count,node_count,role_count,occurrence_role_count,logical_rows,payload_bytes,publication_state) VALUES(?1,?2,0,0,0,0,0,0,0,1,0,'building')",params![id,super::super::source_facts::SOURCE_FACTS_VERSION]).unwrap();
+            conn.execute("INSERT INTO source_go_manifests(blob_id,facts_version,logical_rows,payload_bytes,membership_digest) VALUES(?1,1,1,0,?2)",params![id,(id!=5).then_some(if id==3 {[3_u8;32]} else {[1_u8;32]})]).unwrap();
+            if id != 6 {
+                conn.execute("UPDATE source_fact_manifests SET publication_state='complete' WHERE blob_id=?1",[id]).unwrap();
+            }
+            conn.execute("INSERT INTO go_context_publications VALUES(?1,?1,?2,'go',1,1,NULL,?3,?3,0,jsonb('[]'))",params![id,workspace,[1_u8;32]]).unwrap();
+            if id > 4 {
+                conn.execute("INSERT INTO workspace_file_versions(workspace_id,lang,generation,rel_path,blob_oid,projection_digest,valid_from) VALUES(?1,'go',1,?2,?3,?4,1)",params![workspace,format!("pkg/{id}/main.go"),oid,"c".repeat(64)]).unwrap();
+            }
+        }
+        // Header A, a body edit under A, header B, then a return to header A.
+        for revision in 1..=4_i64 {
+            conn.execute("INSERT INTO workspace_file_versions(workspace_id,lang,generation,rel_path,blob_oid,projection_digest,valid_from,valid_until) VALUES(?1,'go',1,'pkg/1/main.go',?2,?3,?4,?5)",params![workspace,format!("{revision:040x}"),"c".repeat(64),revision,(revision<4).then_some(revision+1)]).unwrap();
+        }
+        for (path, blob) in [("pkg/null/main.go", 5), ("pkg/partial/main.go", 6)] {
+            for revision in 1..=2_i64 {
+                let source = if revision == 1 { 1 } else { blob };
+                conn.execute("INSERT INTO workspace_file_versions(workspace_id,lang,generation,rel_path,blob_oid,projection_digest,valid_from,valid_until) VALUES(?1,'go',1,?2,?3,?4,?5,?6)",params![workspace,path,format!("{source:040x}"),"c".repeat(64),revision,(revision==1).then_some(2)]).unwrap();
+            }
+        }
+        conn.execute(
+            "UPDATE go_context_publications SET valid_until=3 WHERE context_id=1",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE go_context_publications SET valid_from=3 WHERE context_id=2",
+            [],
+        )
+        .unwrap();
+        for state in PlannerStatisticsState::BOTH {
+            state.install(&conn);
+            let point = pinned("go_source_inventory_file");
+            let point_plan = explain_pin(&conn, &point);
+            assert!(
+                point_plan
+                    .iter()
+                    .any(|line| line.starts_with("SEARCH f USING") && line.contains("rel_path=?")),
+                "{state}: indexed normalized projection: {point_plan:?}"
+            );
+            assert!(
+                !point_plan.iter().any(|line| line.starts_with("SCAN ")
+                    || line.contains("AUTOMATIC")
+                    || line.contains("TEMP B-TREE")),
+                "{state}: point projection does not enumerate workspace sources: {point_plan:?}"
+            );
+            let query = pinned("go_source_inventory_membership");
+            let plan = explain_pin(&conn, &query);
+            assert!(
+                plan.iter()
+                    .any(|line| line.starts_with("SEARCH context USING INTEGER PRIMARY KEY")),
+                "{state}: context seek: {plan:?}"
+            );
+            for table in ["current_file", "old_file"] {
+                assert!(
+                    plan.iter()
+                        .any(|line| line.starts_with(&format!("SEARCH {table} USING"))
+                            && line.contains("rel_path=?")),
+                    "{state}: indexed changed-path versions: {plan:?}"
+                );
+            }
+            assert!(
+                !plan.iter().any(|line| line.starts_with("SCAN ")
+                    || line.contains("AUTOMATIC")
+                    || line.contains("TEMP B-TREE")
+                    || line.contains("CO-ROUTINE")),
+                "{state}: bounded membership proof: {plan:?}"
+            );
+            let matches = |revision, context, path: &str| -> bool {
+                conn.query_row(
+                    &query.sql,
+                    params![
+                        workspace,
+                        1,
+                        revision,
+                        path,
+                        context,
+                        super::super::source_facts::SOURCE_FACTS_VERSION
+                    ],
+                    |row| row.get(0),
+                )
+                .unwrap()
+            };
+            assert!(
+                matches(2, 1, "pkg/1/main.go"),
+                "{state}: body edit keeps the original header"
+            );
+            assert!(
+                matches(3, 2, "pkg/1/main.go"),
+                "{state}: context 2 matches its source header"
+            );
+            // Context 2's source is B even if retained summaries still contain A.
+            assert!(
+                !matches(4, 2, "pkg/1/main.go"),
+                "{state}: restoring A cannot certify context B"
+            );
+            assert!(
+                !matches(4, 1, "pkg/1/main.go"),
+                "{state}: withdrawn context is unavailable"
+            );
+            assert!(
+                !matches(2, 1, "pkg/missing/main.go"),
+                "{state}: missing member requires publication"
+            );
+            assert!(
+                !matches(2, 1, "pkg/null/main.go"),
+                "{state}: unknown header cannot prove reuse"
+            );
+            assert!(
+                !matches(2, 1, "pkg/partial/main.go"),
+                "{state}: partial source requires publication"
+            );
         }
     }
 
@@ -8069,6 +8677,58 @@ pub mod tests {
                     || line.starts_with("SCAN active")),
                 "{state}: {plan:?}"
             );
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#11183: generated surface views were joins, so SQLite materialized them on the right of a LEFT JOIN"
+    )]
+    fn go_summary_readers_seek_generated_surface_views_with_both_statistics_states() {
+        let store = AnalyzerStore::open_ephemeral().expect("open Go planner store");
+        let conn = store.conn.lock().expect("store mutex");
+        store
+            .select_writer_workspace_snapshots(&conn, &HashMap::default())
+            .expect("selected revisions");
+        prepare_pin_context(&conn);
+        // A generated surface view is a join, so SQLite flattens it into the
+        // statement only as an inner JOIN. Those aliases must be sought by key.
+        // A LEFT JOINed view is named inside a subquery that is restricted to
+        // the selected blobs, and SQLite materializes that subquery; its plan
+        // must start from the selected blobs and seek each source, never scan
+        // a source, the surface sets or the id map. (SQLite names such a
+        // materialization after the view it flattened, so the name says
+        // nothing about whether it is bounded.) The two extra reasons a view
+        // cannot flatten, a virtual table or a join in its own source, apply to
+        // the occurrence and bridge views.
+        let inner_joined = [
+            "aliases",
+            "members",
+            "catalog",
+            "source_imports",
+            "alias_name",
+            "interiors",
+        ];
+        for state in PlannerStatisticsState::BOTH {
+            state.install(&conn);
+            for query in pinned_queries()
+                .into_iter()
+                .filter(|query| query.name.starts_with("go_interval_go_unit_summaries"))
+            {
+                let plan = explain_pin(&conn, &query);
+                assert!(
+                    plan.iter()
+                        .all(|step| !["b", "sets", "owner", "arena", "surface_row"]
+                            .iter()
+                            .any(|alias| step == &format!("SCAN {alias}")
+                                || step.starts_with(&format!("SCAN {alias} ")))
+                            && !inner_joined.iter().any(|alias| step
+                                .starts_with(&format!("SEARCH {alias} USING AUTOMATIC"))
+                                || step == &format!("SCAN {alias}"))),
+                    "{state} {} must seek generated surface views by key: {plan:#?}",
+                    query.name
+                );
+            }
         }
     }
 
@@ -8557,7 +9217,7 @@ mod native_tests {
     fn statistics_refresh_retires_idle_and_checked_out_readers() {
         use super::super::SelectedReader;
 
-        let pool = ReaderPool::new(None);
+        let pool = ReaderPool::new(std::path::PathBuf::new());
         let open = |statistics_epoch| SelectedReader {
             serial: 0,
             pooled_after_clear: false,

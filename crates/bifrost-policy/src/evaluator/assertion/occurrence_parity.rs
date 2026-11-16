@@ -233,6 +233,7 @@ mod tests {
         let descriptor = PolicyRuleDescriptor::from_loaded(policy);
         let flow_state = brokk_bifrost_flow::FlowWorkspaceState::default();
         let context = PolicyEvaluationContext {
+            acceptance_hint: None,
             analyzer: analyzer.as_ref(),
             workspace: None,
             flow_state: &flow_state,
@@ -695,7 +696,7 @@ mod tests {
                 "src/heads.rs",
                 "heads",
                 "render",
-                "pub fn render() -> u32 {\n    1\n}\n\npub fn caller() -> u32 {\n    render()\n}\n",
+                "pub fn render() -> u32 {\n    1\n}\n\npub fn caller() {\n    let alias = render;\n}\n",
                 "pub fn render() -> u32 {\n    1\n}\n",
             ),
         ];

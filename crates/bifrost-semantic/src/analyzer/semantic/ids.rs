@@ -278,21 +278,34 @@ pub const SEMANTIC_IR_SCHEMA_DOMAIN: &[u8] = b"bifrost-language-neutral-semantic
 /// producer-authored constant index magnitudes, slice allocation and
 /// backing-store flow identities, aggregate-copy boundaries, and orthogonal
 /// call invocation-mode and execution-timing facts while retaining revision
-/// 14's structural source-mapping identity. Every cached semantic artifact
-/// and every wire id derived from one rotates exactly once when this constant
-/// moves; that is a mechanical consequence of extending the IR, not a signal
-/// that anything else changed. A checked-in golden expectation that embeds one
-/// of those ids must be re-blessed with `BIFROST_BLESS=1` in the same change;
-/// the code-query tutorial pages elide them (#5016).
-// #10582: static value classes and declared result classes.
-pub const SEMANTIC_IR_SCHEMA_VERSION: u32 = 47;
+/// 14's structural source-mapping identity.
+///
+/// The schema is the semantic IR schema lever (#11570), one change name per
+/// line in `levers/semantic-ir-schema.tokens`. Every cached semantic artifact
+/// and every wire id derived from one rotates exactly once when a line is
+/// added; that is a mechanical consequence of extending the IR, not a signal
+/// that anything else changed. The golden harness and the code-query tutorial
+/// pages elide the ids and digests that embed it (#5016).
+pub fn semantic_ir_schema_label() -> &'static str {
+    brokk_bifrost_core::lever_label!("semantic-ir-schema", "semantic-ir-schema.tokens")
+}
+
+/// The label a head one schema change older had, for tests that show a new
+/// token moves every identity derived from the schema.
+#[doc(hidden)]
+pub fn semantic_ir_schema_label_before_last_token() -> String {
+    brokk_bifrost_core::lever_tokens::lever_label_before_last_token(
+        "semantic-ir-schema",
+        brokk_bifrost_core::lever_file!("semantic-ir-schema.tokens"),
+    )
+}
 
 impl SemanticIrVersion {
     /// The contract-owned fingerprint shared by every language adapter that
     /// emits the current semantic IR schema.
     pub fn current() -> Self {
         let mut digest = LengthDelimitedDigest::new(SEMANTIC_IR_SCHEMA_DOMAIN);
-        digest.push(&SEMANTIC_IR_SCHEMA_VERSION.to_le_bytes());
+        digest.push(semantic_ir_schema_label().as_bytes());
         Self::from_digest(digest.finish())
     }
 }
@@ -1243,12 +1256,11 @@ impl SemanticArtifactKey {
 
     /// Hashes the semantic environment that scopes every public wire id: the
     /// adapter name and fingerprint, the IR version, configuration and
-    /// dependencies. Changing any of them (an adapter `ADAPTER_VERSION` bump or
-    /// a `SEMANTIC_IR_SCHEMA_VERSION` bump) rotates every id derived from this
-    /// key even when the documented behavior does not change. A checked-in
-    /// golden expectation that embeds such an id must be re-blessed with
-    /// `BIFROST_BLESS=1` in the same change; the code-query tutorial pages
-    /// elide these volatile ids instead (#5016).
+    /// dependencies. Changing any of them (a line added to an adapter lever
+    /// file or to `semantic-ir-schema.tokens`) rotates every id derived from
+    /// this key even when the documented behavior does not change. The golden
+    /// harness and the code-query tutorial pages elide these volatile ids
+    /// instead (#5016).
     fn push_environment_identity(&self, digest: &mut LengthDelimitedDigest) {
         digest.push(self.adapter.name().as_bytes());
         digest.push(self.adapter.fingerprint().as_bytes());

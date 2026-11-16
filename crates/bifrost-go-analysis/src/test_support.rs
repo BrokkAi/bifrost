@@ -5,6 +5,15 @@ use brokk_bifrost_core::cancellation::CancellationToken;
 use std::path::Path;
 use std::sync::Arc;
 
+/// Script body for a fake `go` that reports another toolchain default from
+/// `go env` and hands every other command to the real toolchain.
+///
+/// GOEXPERIMENT is reported on every architecture. GOAMD64, which these tests
+/// used to rewrite, is amd64-only, so on arm64 the substitution was a no-op
+/// and the fake environment stayed identical (#11986).
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) const OTHER_TOOLCHAIN_GO_ENV_SCRIPT: &str = r#"if [ "$1" = env ]; then go "$@" | sed 's/"GOEXPERIMENT": "[^"]*"/"GOEXPERIMENT": "aliastypeparams"/'; else exec go "$@"; fi"#;
+
 #[cfg(any(test, feature = "test-support"))]
 #[track_caller]
 #[allow(clippy::too_many_arguments)] // Keep discovery inputs and panic attribution at their callers.

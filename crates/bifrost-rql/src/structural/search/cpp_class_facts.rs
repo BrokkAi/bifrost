@@ -46,6 +46,10 @@ pub(super) fn cpp_class_fact_expansions(
             Ok(matches) => matches,
             Err(incompleteness) => {
                 diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                     incompleteness,
                     related: Vec::new(),
                     source: None,

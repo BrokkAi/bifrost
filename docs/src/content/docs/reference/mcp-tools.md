@@ -132,7 +132,7 @@ protocol details.
 | Instructions | Routing text for the selected toolsets. A named-workspace server adds a sentence that tells the agent to set `workspace`. |
 | Resources | One resource: `bifrost://agent-guidance/agents.md` (`text/markdown`), the text shown on [Agent Instructions](/agents/) |
 | Annotations | Every tool has `readOnlyHint: true`, except `refresh` and `activate_workspace`, which have `readOnlyHint: false`. Every tool has `destructiveHint: false`, `idempotentHint: true`, and `openWorldHint: false`. |
-| Output schemas | JSON Schema 2020-12 `outputSchema` for `search_symbols`, `get_definitions_by_location`, `get_symbol_locations`, `get_symbol_ancestors`, `get_active_workspace`, `list_function_sources`, `analyze_diff`, `score_diff`, `blast_radius`, `cyclomatic_complexity`, `missing_tests`, `list_policies`, `report_test_assertion_smells`, and `report_structural_clone_smells`. Other tools return `structuredContent` without a published schema. |
+| Output schemas | JSON Schema 2020-12 `outputSchema` for `search_symbols`, `get_definitions_by_location`, `get_symbol_locations`, `get_symbol_ancestors`, `get_active_workspace`, `list_function_sources`, `analyze_diff`, `score_diff`, `relation_brief`, `blast_radius`, `cyclomatic_complexity`, `missing_tests`, `list_policies`, `report_test_assertion_smells`, and `report_structural_clone_smells`. Other tools return `structuredContent` without a published schema. |
 | Cache hints (`2026-07-28` clients) | `tools/list` is `private` for five minutes. The agent-guidance resource is `public` for one hour. Tool results are not cacheable. |
 
 ## Result conventions
@@ -217,9 +217,14 @@ Output: `sources` (each with `label`, `path`, `start_line`, `end_line`,
 `text`), `not_found`, and `ambiguous` (at most 25 candidates per name; the
 note gives the true count).
 
-Completeness: `complete` is false when a lookup was cancelled or an analyzer
-read recorded incompleteness; `incomplete` lists each affected target with
-`reason: "cancelled"` or `reason: "read_incomplete"` and its `detail`. A glob that matches
+Completeness: `complete` is false when a lookup was cancelled, an analyzer
+read recorded incompleteness, a returned declaration lies inside a construct
+its file's parse never closed, or a file's source could not be read.
+`incomplete` lists each affected target with its `reason` and, when known, a
+`detail`. The reasons are `cancelled`, `read_incomplete`,
+`inside_unclosed_construct`, and `source_unavailable`. A file target whose
+source cannot be read is listed with `source_unavailable` instead of in
+`not_found`, and the other matched files are still returned. A glob that matches
 more than 10 files is skipped and listed in `too_broad` (`target`, `matched`,
 `cap`, `matched_kind`, `sample`, `note`). `ambiguous_paths` lists path inputs
 that match more than one file.
@@ -625,6 +630,31 @@ Incomplete reasons: `target_graph_cancelled`, `compilation_scope_unresolved`,
 `reference_graph_stale`. Only `missing_functions` supports "no test reaches
 this function", and only as static evidence, not runtime coverage.
 
+### relation_brief
+
+`relation_brief(base?, target?, include_tests=false, max_items=25, max_chars=7000)`
+returns a bounded review brief with Affected callers, Paths, and Value flow
+sections. Caller references and two-hop incoming use chains use the target snapshot; every
+item cites at least one location outside the changed lines. Added and removed
+outgoing calls cite surviving target declarations. Subjects and items report
+typed completeness; incomplete scans remain visible even when they find no
+relations. The top-level `incomplete` list preserves changed-symbol inventory
+diagnostics separately from relation scans. `deleted_subjects` lists deleted
+declarations at their base positions with `deleted_symbol_not_scanned`; their
+former users are not examined, so both computed sections remain incomplete.
+Moved declarations are handled through their target positions. Value flow is not computed in this
+version.
+
+Selection alternates between sections; within a section, round-robin across
+changed symbols in diff order.
+Budget omissions are counted per section. `max_items` accepts 1 through 200;
+`max_chars` accepts 1000 through 100000. The defaults follow BrokkAi/mjolnir
+b1aed1fe's review-arms brief WRITER.md and brief_driver.py. Headings and
+incompleteness notes remain when the item budget is exhausted. When the size
+budget requires it, per-symbol scan notes are summarized before items are
+removed; `notes_summarized` records this while structured notes keep the detail. Endpoint
+resolution follows `analyze_diff`.
+
 ### score_diff
 
 Return raw maintenance-cost features for a diff, with no weights and no single
@@ -705,6 +735,8 @@ workspace snapshot.
 | `policy_categories` | array of strings | As above | - | As above | `--policy-category` | Built-in categories. |
 | `policy_ids` | array of strings | As above | - | As above | `--policy-id` | Built-in policy IDs. The only way to select an opt-in policy. |
 | `policy_files` | array of strings | As above | - | 1 to 256 items; 1,024 bytes each; no duplicates | `--policy-file` | Workspace-relative `.rqlp` files, evaluated in the same batch. |
+| `sources` | array of strings | No | Whole workspace | No count limit | `--sources` (repeatable) | Files, directories, or globs selecting a scoped workspace, using the CLI's path normalization. Paths outside the workspace are refused. |
+| `inline_suppression_prefix` | string | No | `bifrost` | 1 to 32 ASCII letters, digits, underscores or hyphens | `--inline-suppression-prefix` | Prefix before `: ignore` in inline suppression comments. |
 | `evaluation_date` | string `YYYY-MM-DD` | Yes | - | - | `--evaluation-date` | UTC date for suppression expiry. |
 | `fail_on` | `never`, `finding`, `note`, `warning`, `error` | No | `warning` | - | `--fail-on` | Finding threshold for `status`. `finding` includes unrated findings. |
 | `suppression_file` | string | No | `.bifrost/suppressions.json`, `.bifrost/suppressions.private.json`, and `.bifrost/suppressions.local.json`, read in that order | 1 to 1,024 bytes | `--suppressions-file` | Accepted-finding file. When set, it replaces all three default files. |
@@ -717,6 +749,10 @@ workspace snapshot.
 | `stream_runs` | boolean | No | `false` | Needs a `progressToken` | - | Send each policy's run when that policy finishes, before the result, as a `notifications/progress` whose `_meta["io.bifrost/policy-run"]` is `{policy_id, progress, run}`. `progress` is `completed`, `interrupted`, `timed_out` or `pending`. A streamed run is not yet reviewed: suppressions, the scope file, the baseline and the `diff_base` classification appear only in the final report, which stays authoritative. Delivery is best effort. A call run as an MCP task streams nothing. |
 | `include_stage_timings` | boolean | No | `false` | - | `--policy-timings` (CLI reports per-policy time instead) | Add a `stage_timings` field with wall-clock time per stage. |
 
+Source selections use the same isolated workspace projection as the CLI; they
+never filter an already computed whole-workspace report. The stdio transport
+has no finite request-size limit, and `sources` adds no separate item bound.
+
 Selector rules: values within one selector array form a union. Different
 selector arrays intersect: a built-in policy runs only when it matches every
 array you supplied. A combination that matches no policy is an invalid-params
@@ -725,7 +761,7 @@ category, or ID values are invalid-params errors. No other property is
 allowed.
 
 Output: `status` (`clean`, `finding`, `unreliable`), `exit_status` (`0`, `1`,
-`2`), `report` (the schema-7 policy report), `request_correlation_id`
+`2`), `report` (the schema-18 policy report), `request_correlation_id`
 (`sha256:` of the JSON-RPC request ID), and `stage_timings` when requested.
 Each run in `report.runs` has a `completion` state; see
 [Agent Result Safety](/agent-result-safety/). With no budget configured, a

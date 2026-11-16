@@ -26,7 +26,7 @@ WHERE selected.lang = 'rust'
   AND (versions.valid_until IS NULL OR selected.revision < versions.valid_until)
   AND summaries.lang = 'rust' AND summaries.unit_kind = 'rust_crate'
   AND summaries.publication_state = 'complete'
-  AND summaries.derivation_version = :rust_unit_summary_derivation_version;
+  AND summaries.derivation_identity = :rust_unit_summary_derivation_identity;
 
 INSERT INTO temp.selected_rust_unit_closure
 WITH RECURSIVE closure(root_unit_key, unit_key, summary_id, topology_id, workspace_id, generation) AS (

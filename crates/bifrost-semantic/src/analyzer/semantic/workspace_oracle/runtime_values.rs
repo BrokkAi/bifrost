@@ -12,8 +12,6 @@ use crate::analyzer::semantic::MemoryLocationId;
 
 use crate::analyzer::semantic::ProofStatus;
 
-use crate::analyzer::semantic::SemanticGapId;
-
 use crate::analyzer::semantic::StableDigest;
 
 use crate::analyzer::semantic::ValueAtPoint;
@@ -108,7 +106,51 @@ pub struct RuntimeKeyedReadEndpoint {
     #[doc(hidden)]
     pub runtime_object: crate::analyzer::semantic::RuntimeObjectRoot,
     #[doc(hidden)]
-    pub discharged_gaps: Arc<[SemanticGapId]>,
+    pub discharged_gaps: Arc<[crate::analyzer::semantic::GapKey]>,
+}
+
+impl RuntimeKeyedReadEndpoint {
+    /// Owned endpoint payload and actual semantic owners; no runtime query.
+    #[doc(hidden)]
+    pub fn retained_allocations(
+        &self,
+        census: &mut impl crate::analyzer::semantic::service::ArtifactRetentionVisitor,
+    ) {
+        census.project_file(&self.file);
+        for text in [
+            &self.runtime,
+            &self.global,
+            &self.container,
+            &self.active_model_set_hash,
+            &self.exposure_id,
+            &self.behavior_id,
+            &self.manifest_digest,
+            &self.shard_id,
+            &self.activation_source,
+            &self.producer,
+            &self.runtime_profile_digest,
+        ] {
+            census.owned_string(text);
+        }
+        if let RuntimeAccessKey::Property(property) = &self.key {
+            census.owned_string(property);
+        }
+        census.exclusive(self.proof.retained_heap_bytes());
+        census.exclusive(self.completeness.retained_heap_bytes());
+        self.runtime_object.retained_allocations(census);
+        census.shared_allocation(
+            Arc::as_ptr(&self.discharged_gaps).cast::<()>() as usize,
+            || {
+                std::mem::size_of_val(self.discharged_gaps.as_ref())
+                    + 2 * std::mem::size_of::<usize>()
+            },
+        );
+        for observation in [&self.observation, &self.container_observation] {
+            census.procedure(observation.point().procedure());
+            census.procedure(observation.value().procedure());
+            census.context(observation.context());
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -569,18 +611,28 @@ impl RetainedBytes for RuntimeSyntaxSnapshot {
         let facts = &self.facts;
         let weight = self.admission.retained_bytes()
             + std::mem::size_of::<RuntimeSyntaxSnapshot>()
-            + facts.reads.capacity() * std::mem::size_of::<RuntimeSyntaxRead>()
-            + facts.writes.capacity() * std::mem::size_of::<String>();
+            + brokk_bifrost_core::allocation_size::allocation_size(
+                facts.reads.capacity() * std::mem::size_of::<RuntimeSyntaxRead>(),
+            )
+            + brokk_bifrost_core::allocation_size::allocation_size(
+                facts.writes.capacity() * std::mem::size_of::<String>(),
+            );
         facts.reads.iter().fold(
             facts.writes.iter().fold(weight, |total, write| {
-                total.saturating_add(write.capacity())
+                total.saturating_add(brokk_bifrost_core::allocation_size::allocation_size(
+                    write.capacity(),
+                ))
             }),
             |total, read| {
                 total.saturating_add(
-                    read.root_name.capacity()
-                        + read.container.capacity()
+                    brokk_bifrost_core::allocation_size::allocation_size(read.root_name.capacity())
+                        + brokk_bifrost_core::allocation_size::allocation_size(
+                            read.container.capacity(),
+                        )
                         + match &read.key {
-                            Ok(RuntimeAccessKey::Property(key)) => key.capacity(),
+                            Ok(RuntimeAccessKey::Property(key)) => {
+                                brokk_bifrost_core::allocation_size::allocation_size(key.capacity())
+                            }
                             _ => 0,
                         },
                 )
@@ -638,47 +690,79 @@ pub fn runtime_read_cache(budget: &RetentionBudget) -> RuntimeReadCache {
 
 impl RetainedBytes for RuntimeKeyedReadResult {
     fn retained_bytes(&self) -> usize {
-        self.endpoints.iter().fold(
-            256usize.saturating_add(self.candidates.iter().fold(0usize, |total, candidate| {
-                total.saturating_add(
-                    std::mem::size_of::<RuntimeKeyedReadCandidate>()
-                        + candidate.global.len()
-                        + candidate.container.len()
-                        + candidate.key.as_ref().map_or(0, |key| match key {
-                            RuntimeAccessKey::Property(property) => property.len(),
-                            RuntimeAccessKey::Index(_) => 0,
-                        }),
-                )
-            })),
-            |total, endpoint| {
-                total.saturating_add(
-                    512 + endpoint.runtime.len()
-                        + endpoint.global.len()
-                        + endpoint.container.len()
-                        + endpoint.active_model_set_hash.len()
-                        + endpoint.manifest_digest.len()
-                        + endpoint.shard_id.len()
-                        + endpoint.activation_source.len()
-                        + endpoint.producer.len()
-                        + endpoint.runtime_profile_digest.len()
-                        + endpoint.exposure_id.len()
-                        + endpoint.behavior_id.len()
-                        + match &endpoint.key {
-                            RuntimeAccessKey::Property(key) => key.len(),
-                            RuntimeAccessKey::Index(_) => 16,
-                        }
-                        + endpoint.discharged_gaps.len() * std::mem::size_of::<SemanticGapId>(),
-                )
-            },
-        )
+        use brokk_bifrost_core::allocation_size::allocation_size;
+        let buffers = std::mem::size_of::<Self>()
+            + allocation_size(
+                self.endpoints.capacity() * std::mem::size_of::<RuntimeKeyedReadEndpoint>(),
+            )
+            + allocation_size(
+                self.candidates.capacity() * std::mem::size_of::<RuntimeKeyedReadCandidate>(),
+            )
+            + allocation_size(
+                self.limitations.capacity() * std::mem::size_of::<RuntimeReadLimitation>(),
+            );
+        let candidates = self
+            .candidates
+            .iter()
+            .map(|candidate| {
+                allocation_size(candidate.global.capacity())
+                    + allocation_size(candidate.container.capacity())
+                    + candidate.key.as_ref().map_or(0, |key| match key {
+                        RuntimeAccessKey::Property(value) => allocation_size(value.capacity()),
+                        RuntimeAccessKey::Index(_) => 0,
+                    })
+            })
+            .sum::<usize>();
+        let endpoints = self
+            .endpoints
+            .iter()
+            .map(|endpoint| {
+                let strings = [
+                    &endpoint.runtime,
+                    &endpoint.global,
+                    &endpoint.container,
+                    &endpoint.active_model_set_hash,
+                    &endpoint.manifest_digest,
+                    &endpoint.shard_id,
+                    &endpoint.activation_source,
+                    &endpoint.producer,
+                    &endpoint.runtime_profile_digest,
+                    &endpoint.exposure_id,
+                    &endpoint.behavior_id,
+                ];
+                strings
+                    .into_iter()
+                    .map(|text| allocation_size(text.capacity()))
+                    .sum::<usize>()
+                    + endpoint.file.allocated_heap_bytes()
+                    + endpoint.runtime_object.allocated_heap_bytes()
+                    + allocation_size(endpoint.proof.retained_heap_bytes())
+                    + allocation_size(endpoint.completeness.retained_heap_bytes())
+                    + [&endpoint.observation, &endpoint.container_observation]
+                        .into_iter()
+                        .map(|observation| {
+                            allocation_size(std::mem::size_of_val(observation.context().calls()))
+                        })
+                        .sum::<usize>()
+                    + match &endpoint.key {
+                        RuntimeAccessKey::Property(value) => allocation_size(value.capacity()),
+                        RuntimeAccessKey::Index(_) => 0,
+                    }
+                    + allocation_size(
+                        2 * std::mem::size_of::<usize>()
+                            + std::mem::size_of_val(endpoint.discharged_gaps.as_ref()),
+                    )
+            })
+            .sum::<usize>();
+        buffers.saturating_add(candidates).saturating_add(endpoints)
     }
 }
 
 impl RuntimeKeyedReadResult {
     #[doc(hidden)]
-    pub fn discharges(&self, gap: SemanticGapId) -> bool {
+    pub fn discharges(&self, gap: crate::analyzer::semantic::GapKey) -> bool {
         self.endpoints
             .iter()
-            .any(|endpoint| endpoint.discharged_gaps.contains(&gap))
+            .any(|endpoint| gap.is_discharged_by(|key| endpoint.discharged_gaps.contains(&key)))
     }
 }

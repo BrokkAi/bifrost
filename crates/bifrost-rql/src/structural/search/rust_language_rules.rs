@@ -8,15 +8,18 @@ use brokk_bifrost_analysis::analyzer::WorkspaceAnalyzer;
 use brokk_bifrost_analysis::analyzer::languages::{
     SelectedBindingUnavailable, SelectedTupleBinding,
 };
-use brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::WorkspaceSemanticOracle;
-use brokk_bifrost_analysis::analyzer::semantic::{SemanticArtifact, SemanticRequest};
+use brokk_bifrost_analysis::analyzer::semantic::type_flow::source_span_for_node;
+use brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::{
+    SelectedPatternObservation, WorkspaceSemanticOracle,
+};
+use brokk_bifrost_analysis::analyzer::semantic::{SemanticArtifact, SemanticRequest, SourceSpan};
 use brokk_bifrost_analysis::analyzer::semantic_model::ActiveSemanticModelSnapshot;
 use brokk_bifrost_rust_analysis::analyzer::rust::{RustPatternName, rust_pattern_name_bounded};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tree_sitter::Node;
 
-use super::language_rules::{LanguageRuleMatches, UndecidedSite};
+use super::language_rules::{LanguageRuleMatch, LanguageRuleMatches, UndecidedSite};
 use super::semantic::{ArtifactUnavailable, SemanticQueryContext};
 
 const QUERY: &str = "poem.web.query.Query";
@@ -75,7 +78,17 @@ pub(super) fn matches_for_file(
         .iter()
         .zip(&kinds)
         .filter(|(_, kind)| !matches!(kind, Constructor::NotPoem))
-        .map(|(node, _)| (node.start_byte(), node.end_byte()))
+        .flat_map(|(node, _)| {
+            let constructor = node.child_by_field_name("type").map(|child| child.id());
+            node.children(&mut node.walk())
+                .filter(|child| {
+                    (child.is_named() || child.kind() == "_")
+                        && !child.is_extra()
+                        && Some(child.id()) != constructor
+                })
+                .map(source_span_for_node)
+                .collect::<Vec<_>>()
+        })
         .collect::<HashSet<_>>();
     let mut ranges = Vec::new();
     let mut undecided = Vec::new();
@@ -113,54 +126,88 @@ pub(super) fn matches_for_file(
                 ));
                 continue;
             };
-            if let Some(reason) = selected
+            let has_selected = selected.as_ref().is_some_and(|binders| {
+                binders.admits_within(node.start_byte(), node.end_byte())
+                    && node.children(&mut node.walk()).any(|field| {
+                        field.id() != constructor.id()
+                            && matches!(
+                                binders.decision(field.start_byte(), field.end_byte()),
+                                Some(SelectedBinder::Admitted)
+                            )
+                    })
+            });
+            let unavailable = selected
                 .as_ref()
-                .and_then(|binders| binders.unavailable_within(node.start_byte(), node.end_byte()))
-            {
-                // This candidate hit a limit; the other patterns in the file
-                // keep their own decisions.
-                undecided.push(UndecidedSite::at(node_range(constructor), reason));
-                continue;
-            }
-            let has_selected = selected
-                .as_ref()
-                .is_some_and(|binders| binders.admits_within(node.start_byte(), node.end_byte()));
+                .and_then(|binders| binders.unavailable_within(node.start_byte(), node.end_byte()));
             if !has_selected {
                 match kind {
                     Constructor::NotPoem => continue,
                     Constructor::Unresolved(reason) => {
-                        undecided.push(UndecidedSite::at(node_range(constructor), reason));
+                        // The definition lookup could not name this constructor,
+                        // but the selected admission may still have hit a named
+                        // limit for it. Report that limit rather than the
+                        // prefilter's generic reason.
+                        undecided.push(UndecidedSite::at(
+                            node_range(constructor),
+                            unavailable.unwrap_or(reason),
+                        ));
                         continue;
                     }
                     Constructor::Poem => {}
                 }
             }
+            if let Some(reason) = unavailable {
+                // This candidate hit a limit; the other patterns in the file
+                // keep their own decisions.
+                undecided.push(UndecidedSite::at(node_range(constructor), reason));
+                continue;
+            }
             let mut cursor = node.walk();
-            for field in node.named_children(&mut cursor) {
+            for field in node
+                .children(&mut cursor)
+                .filter(|child| (child.is_named() || child.kind() == "_") && !child.is_extra())
+            {
                 if field.id() == constructor.id() {
+                    continue;
+                }
+                if semantic.is_some() {
+                    match selected
+                        .as_ref()
+                        .and_then(|binders| binders.decision(field.start_byte(), field.end_byte()))
+                    {
+                        Some(SelectedBinder::Admitted) => {
+                            for admitted in
+                                &selected.as_ref().expect("selected field").field_binders
+                                    [&(field.start_byte(), field.end_byte())]
+                            {
+                                let (start, end) = (admitted.start, admitted.end);
+                                let binder = root
+                                    .descendant_for_byte_range(start, end)
+                                    .expect("admitted binder belongs to selected AST");
+                                assert_eq!((binder.start_byte(), binder.end_byte()), (start, end));
+                                ranges.push(LanguageRuleMatch {
+                                    selected_pattern_source:
+                                        super::SelectedPatternSourceEvidence::Admitted(Arc::clone(
+                                            &admitted.proof,
+                                        )),
+                                    select: node_range(binder),
+                                    report: node_range(field),
+                                    heuristic: None,
+                                });
+                            }
+                        }
+                        Some(
+                            SelectedBinder::Rejected(reason) | SelectedBinder::Unavailable(reason),
+                        ) => undecided.push(UndecidedSite::at(node_range(field), reason)),
+                        None => undecided.push(UndecidedSite::at(
+                            node_range(field),
+                            "selected Poem field has no admitted value observation",
+                        )),
+                    }
                     continue;
                 }
                 match field.kind() {
                     "identifier" => {
-                        if let Some(selected) = selected.as_ref().and_then(|binders| {
-                            binders.decision(field.start_byte(), field.end_byte())
-                        }) {
-                            match selected {
-                                SelectedBinder::Admitted => ranges.push(node_range(field)),
-                                SelectedBinder::Rejected(reason)
-                                | SelectedBinder::Unavailable(reason) => {
-                                    undecided.push(UndecidedSite::at(node_range(field), reason))
-                                }
-                            }
-                            continue;
-                        }
-                        if semantic.is_some() {
-                            undecided.push(UndecidedSite::at(
-                                node_range(field),
-                                "selected Poem field admission missing",
-                            ));
-                            continue;
-                        }
                         let mode =
                             rust_pattern_name_bounded(
                                 root,
@@ -169,7 +216,7 @@ pub(super) fn matches_for_file(
                                 &mut |_| Ok::<_, ()>(()),
                             );
                         match mode {
-                            Ok(RustPatternName::Binding) => ranges.push(node_range(field)),
+                            Ok(RustPatternName::Binding) => ranges.push(node_range(field).into()),
                             Ok(RustPatternName::Unknown) | Err(()) => undecided.push(
                                 UndecidedSite::at(node_range(field), "field binder is unresolved"),
                             ),
@@ -191,7 +238,7 @@ pub(super) fn matches_for_file(
                                 binder.start_byte(),
                                 binder.end_byte(),
                             ) {
-                                WrappedBinder::Match => ranges.push(node_range(binder)),
+                                WrappedBinder::Match => ranges.push(node_range(binder).into()),
                                 WrappedBinder::Undecided(reason) => {
                                     undecided.push(UndecidedSite::at(node_range(binder), reason))
                                 }
@@ -501,7 +548,14 @@ impl std::fmt::Display for SelectedBinderError {
 
 /// Selected decisions keyed by binder span, with the admitted spans sorted so a
 /// pattern finds its admitted binders without scanning every decision.
+struct AdmittedFieldBinder {
+    start: usize,
+    end: usize,
+    proof: Arc<SelectedPatternObservation>,
+}
+
 struct SelectedBinders {
+    field_binders: HashMap<(usize, usize), Vec<AdmittedFieldBinder>>,
     decisions: HashMap<(usize, usize), SelectedBinder>,
     admitted: Vec<(usize, usize)>,
     unavailable: Vec<((usize, usize), &'static str)>,
@@ -545,7 +599,7 @@ impl SelectedBinders {
 fn selected_binders(
     semantic: &mut SemanticQueryContext<'_>,
     file: &ProjectFile,
-    wanted_patterns: &HashSet<(usize, usize)>,
+    wanted_patterns: &HashSet<SourceSpan>,
 ) -> Result<SelectedBinders, SelectedBinderError> {
     match semantic.with_cached_artifact(file, |workspace, snapshot, artifact, request| {
         admit_wanted_patterns(workspace, snapshot, artifact, request, wanted_patterns)
@@ -560,12 +614,124 @@ fn selected_binders(
     }
 }
 
+// File-local containment index. The sorted leaves preserve the old admission
+// order, including nested fields; each balanced subtree records its maximum
+// end so unrelated prefixes are pruned rather than scanned backwards.
+struct WantedFieldIndex {
+    fields: Vec<SourceSpan>,
+    max_end: Vec<u32>,
+    leaf_count: usize,
+}
+
+impl WantedFieldIndex {
+    fn new(
+        fields: impl IntoIterator<Item = SourceSpan>,
+        mut visit: impl FnMut() -> Result<(), SelectedBinderError>,
+    ) -> Result<Self, SelectedBinderError> {
+        let mut sorted = Vec::new();
+        for field in fields {
+            visit()?;
+            sorted.push(field);
+        }
+        // Fallible bottom-up merge sort: even sorting observes request stops,
+        // without an uninterruptible comparison callback or recursive walk.
+        let mut scratch = Vec::with_capacity(sorted.len());
+        let mut width = 1;
+        while width < sorted.len() {
+            scratch.clear();
+            for lo in (0..sorted.len()).step_by(width.saturating_mul(2)) {
+                let middle = (lo + width).min(sorted.len());
+                let end = middle.saturating_add(width).min(sorted.len());
+                let (mut left, mut right) = (lo, middle);
+                while left < middle || right < end {
+                    visit()?;
+                    let next = if right == end || (left < middle && sorted[left] <= sorted[right]) {
+                        let next = sorted[left];
+                        left += 1;
+                        next
+                    } else {
+                        let next = sorted[right];
+                        right += 1;
+                        next
+                    };
+                    scratch.push(next);
+                }
+            }
+            std::mem::swap(&mut sorted, &mut scratch);
+            width = width.saturating_mul(2);
+        }
+        let leaf_count = sorted.len().max(1).next_power_of_two();
+        let mut max_end = Vec::with_capacity(2 * leaf_count);
+        for _ in 0..2 * leaf_count {
+            visit()?;
+            max_end.push(0);
+        }
+        for (offset, field) in sorted.iter().enumerate() {
+            visit()?;
+            max_end[leaf_count + offset] = field.end_byte();
+        }
+        for node in (1..leaf_count).rev() {
+            visit()?;
+            max_end[node] = max_end[2 * node].max(max_end[2 * node + 1]);
+        }
+        Ok(Self {
+            fields: sorted,
+            max_end,
+            leaf_count,
+        })
+    }
+
+    fn containing(
+        &self,
+        binder: SourceSpan,
+        mut visit: impl FnMut() -> Result<(), SelectedBinderError>,
+    ) -> Result<Vec<SourceSpan>, SelectedBinderError> {
+        let mut matches = Vec::new();
+        let mut pending = vec![(1, 0, self.leaf_count)];
+        while let Some((node, lo, hi)) = pending.pop() {
+            visit()?;
+            if lo >= self.fields.len()
+                || self.fields[lo].start_byte() > binder.start_byte()
+                || self.max_end[node] < binder.end_byte()
+            {
+                continue;
+            }
+            if hi - lo == 1 {
+                matches.push(self.fields[lo]);
+            } else {
+                let middle = lo + (hi - lo) / 2;
+                pending.push((2 * node + 1, middle, hi));
+                pending.push((2 * node, lo, middle));
+            }
+        }
+        Ok(matches)
+    }
+}
+
+fn visit_wanted_field_index(request: &mut SemanticRequest<'_>) -> Result<(), SelectedBinderError> {
+    if request.cancellation.is_cancelled() {
+        return Err(SelectedBinderError::Interrupted("cancelled"));
+    }
+    if !request.charge_execution_traversal(1) {
+        return Err(SelectedBinderError::Interrupted(
+            "semantic traversal budget exhausted",
+        ));
+    }
+    request
+        .budget
+        .charge_work(brokk_bifrost_analysis::analyzer::semantic::SemanticWork {
+            nested_entries: 1,
+            ..Default::default()
+        });
+    Ok(())
+}
+
 fn admit_wanted_patterns(
     workspace: &WorkspaceAnalyzer,
     snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
     artifact: &Arc<SemanticArtifact>,
     request: &mut SemanticRequest<'_>,
-    wanted_patterns: &HashSet<(usize, usize)>,
+    wanted_patterns: &HashSet<SourceSpan>,
 ) -> Result<SelectedBinders, SelectedBinderError> {
     let oracle = WorkspaceSemanticOracle::with_dispatch_hints(
         workspace,
@@ -573,49 +739,91 @@ fn admit_wanted_patterns(
         brokk_bifrost_analysis::analyzer::semantic::DispatchHints::empty(),
     );
     let mut decisions = HashMap::new();
+    let mut field_binders: HashMap<_, Vec<_>> = HashMap::new();
+    let fields = WantedFieldIndex::new(wanted_patterns.iter().copied(), || {
+        visit_wanted_field_index(request)
+    })?;
     for procedure in artifact.procedures() {
+        visit_wanted_field_index(request)?;
         let handle = artifact
             .procedure_handle(procedure.id())
             .ok_or(SelectedBinderError::Unavailable("procedure handle missing"))?;
-        // One traversal of the procedure's candidates admits every wanted one,
-        // each on its own: a candidate that hits a limit marks only itself.
-        let selected = oracle
-            .selected_pattern_projections_where(&handle, request, |candidate| {
-                procedure
-                    .source_mapping(candidate.pattern_source)
-                    .is_some_and(|mapping| {
-                        let span = mapping.locator.anchor().span();
-                        wanted_patterns
-                            .contains(&(span.start_byte() as usize, span.end_byte() as usize))
-                    })
-            })
-            .map_err(|error| SelectedBinderError::Provider(error.to_string()))?
-            .ok_or(SelectedBinderError::Interrupted("cancelled"))?;
-        for projection in selected.iter() {
-            let mapping = procedure
-                .source_mapping(projection.candidate.binder_source)
-                .ok_or(SelectedBinderError::Unavailable("binder mapping missing"))?;
-            let span = mapping.locator.anchor().span();
-            let range = (span.start_byte() as usize, span.end_byte() as usize);
-            let decision = match &projection.binding {
-                SelectedTupleBinding::Admitted(binding)
-                    if matches!(
-                        binding.reads.selected_constructor.as_deref(),
-                        Some(QUERY | PATH)
-                    ) =>
-                {
-                    SelectedBinder::Admitted
-                }
-                SelectedTupleBinding::Admitted(_) => continue,
-                SelectedTupleBinding::Rejected { reason, .. } => SelectedBinder::Rejected(reason),
-                SelectedTupleBinding::Unavailable(SelectedBindingUnavailable::Cancelled) => {
-                    return Err(SelectedBinderError::Interrupted("cancelled"));
-                }
-                SelectedTupleBinding::Unavailable(cause) => {
-                    SelectedBinder::Unavailable(cause.reason())
-                }
+        for candidate in procedure.guarded_pattern_projections() {
+            visit_wanted_field_index(request)?;
+            let Some(mapping) = procedure.source_mapping(candidate.binder_source) else {
+                return Err(SelectedBinderError::Unavailable("binder mapping missing"));
             };
-            decisions.insert(range, decision);
+            let binder_span = mapping.locator.anchor().span();
+            for field in fields.containing(binder_span, || visit_wanted_field_index(request))? {
+                let projection = oracle
+                    .selected_pattern_source_at(
+                        &handle,
+                        candidate.ordinal,
+                        field.start_byte() as usize..field.end_byte() as usize,
+                        request,
+                    )
+                    .map_err(|error| SelectedBinderError::Provider(error.to_string()))?
+                    .ok_or(SelectedBinderError::Interrupted("cancelled"))?;
+                let decision = match &projection.binding {
+                    SelectedTupleBinding::Admitted(binding)
+                        if matches!(
+                            binding.reads.selected_constructor.as_deref(),
+                            Some(QUERY | PATH)
+                        ) =>
+                    {
+                        SelectedBinder::Admitted
+                    }
+                    SelectedTupleBinding::Observed(source)
+                        if matches!(
+                            source.binding.reads.selected_constructor.as_deref(),
+                            Some(QUERY | PATH)
+                        ) =>
+                    {
+                        SelectedBinder::Admitted
+                    }
+                    SelectedTupleBinding::Admitted(_) | SelectedTupleBinding::Observed(_) => {
+                        continue;
+                    }
+                    SelectedTupleBinding::Rejected { reason, .. } => {
+                        SelectedBinder::Rejected(reason)
+                    }
+                    SelectedTupleBinding::Unavailable(SelectedBindingUnavailable::Cancelled) => {
+                        return Err(SelectedBinderError::Interrupted("cancelled"));
+                    }
+                    SelectedTupleBinding::Unavailable(cause) => {
+                        SelectedBinder::Unavailable(cause.reason())
+                    }
+                };
+                let range = (field.start_byte() as usize, field.end_byte() as usize);
+                if matches!(decision, SelectedBinder::Admitted) {
+                    let proof = Arc::new(
+                        projection
+                            .into_binding_observation()
+                            .expect("canonical admitted field has a binding observation"),
+                    );
+                    proof.replay_reads(workspace);
+                    field_binders
+                        .entry(range)
+                        .or_default()
+                        .push(AdmittedFieldBinder {
+                            start: binder_span.start_byte() as usize,
+                            end: binder_span.end_byte() as usize,
+                            proof,
+                        });
+                }
+                // A field with several observable binders remains undecided if
+                // any of those observations could not be admitted.
+                match decisions.entry(range) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(decision);
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        if matches!(entry.get(), SelectedBinder::Admitted) {
+                            entry.insert(decision);
+                        }
+                    }
+                }
+            }
         }
     }
     let mut admitted = Vec::new();
@@ -630,6 +838,7 @@ fn admit_wanted_patterns(
     admitted.sort_unstable();
     unavailable.sort_unstable();
     Ok(SelectedBinders {
+        field_binders,
         decisions,
         admitted,
         unavailable,
@@ -673,6 +882,138 @@ mod tests {
         )
     }
 
+    fn index_test_span(start: u32, end: u32) -> SourceSpan {
+        use brokk_bifrost_analysis::analyzer::semantic::SourcePosition;
+        SourceSpan::new(
+            SourcePosition::new(start, 0, start),
+            SourcePosition::new(end, 0, end),
+        )
+        .expect("ordered single-line span")
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9925: every binder scanned every wanted field, including unrelated spans"
+    )]
+    fn wanted_field_index_prunes_unrelated_fields_and_preserves_nested_order() {
+        for exponent in [8, 12] {
+            let count = 1usize << exponent;
+            let outer = index_test_span(0, (count * 10) as u32);
+            let fields = std::iter::once(outer).chain(
+                (1..count)
+                    .rev()
+                    .map(|i| index_test_span((i * 10) as u32, (i * 10 + 8) as u32)),
+            );
+            let mut build_visits = 0;
+            let index = WantedFieldIndex::new(fields, || {
+                build_visits += 1;
+                Ok(())
+            })
+            .unwrap_or_else(|error| panic!("{error}"));
+            assert_eq!(build_visits, (exponent + 5) * count - 1);
+            let mut query_visits = 0;
+            for i in 1..count {
+                let binder = index_test_span((i * 10 + 2) as u32, (i * 10 + 4) as u32);
+                let matches = index
+                    .containing(binder, || {
+                        query_visits += 1;
+                        Ok(())
+                    })
+                    .unwrap_or_else(|error| panic!("{error}"));
+                assert_eq!(
+                    matches,
+                    vec![outer, index_test_span((i * 10) as u32, (i * 10 + 8) as u32)]
+                );
+            }
+            // Two containing leaves (one long-lived outer field) require at
+            // most two root-to-leaf paths and their rejected siblings.
+            assert!(query_visits <= (count - 1) * (4 * exponent + 1));
+            assert!(build_visits + query_visits < count * (count - 1));
+        }
+        let fields = [
+            index_test_span(2, 90),
+            index_test_span(2, 60),
+            index_test_span(8, 40),
+        ];
+        let index =
+            WantedFieldIndex::new(fields, || Ok(())).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            index
+                .containing(index_test_span(10, 12), || Ok(()))
+                .unwrap_or_else(|error| panic!("{error}")),
+            vec![fields[1], fields[0], fields[2]]
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9925: skipped field candidates bypassed request cancellation and traversal limits"
+    )]
+    fn wanted_field_index_build_and_pruned_queries_observe_request_stops() {
+        use brokk_bifrost_analysis::analyzer::semantic::SemanticExecutionBudget;
+        let fields = (0..64)
+            .map(|i| index_test_span(i * 10, i * 10 + 8))
+            .collect::<Vec<_>>();
+        let index = WantedFieldIndex::new(fields.iter().copied(), || Ok(()))
+            .unwrap_or_else(|error| panic!("{error}"));
+        let cancellation = crate::cancellation::CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let execution = SemanticExecutionBudget::for_fixpoint(10);
+        let mut request =
+            SemanticRequest::with_execution_budget(&mut budget, &cancellation, &execution);
+        assert!(matches!(
+            WantedFieldIndex::new(fields.iter().copied(), || visit_wanted_field_index(
+                &mut request
+            )),
+            Err(SelectedBinderError::Interrupted(
+                "semantic traversal budget exhausted"
+            ))
+        ));
+        assert_eq!(execution.work().traversal_steps, 10);
+        assert!(execution.work().exhausted);
+
+        // Cancellation during sorting must stop before the index escapes.
+        let cancellation = crate::cancellation::CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let mut request = SemanticRequest::new(&mut budget, &cancellation);
+        let mut visits = 0;
+        assert!(matches!(
+            WantedFieldIndex::new(fields.iter().copied(), || {
+                visits += 1;
+                if visits == fields.len() + 7 {
+                    cancellation.cancel();
+                }
+                visit_wanted_field_index(&mut request)
+            }),
+            Err(SelectedBinderError::Interrupted("cancelled"))
+        ));
+        assert_eq!(visits, fields.len() + 7);
+
+        // A completely unrelated query still visits (and charges) its pruned
+        // root; no successful empty result can hide exhausted execution work.
+        let cancellation = crate::cancellation::CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let execution = SemanticExecutionBudget::for_fixpoint(0);
+        let mut request =
+            SemanticRequest::with_execution_budget(&mut budget, &cancellation, &execution);
+        assert!(matches!(
+            index.containing(index_test_span(1000, 1002), || visit_wanted_field_index(
+                &mut request
+            )),
+            Err(SelectedBinderError::Interrupted(
+                "semantic traversal budget exhausted"
+            ))
+        ));
+        assert!(execution.work().exhausted);
+        cancellation.cancel();
+        assert!(matches!(
+            index.containing(index_test_span(1000, 1002), || visit_wanted_field_index(
+                &mut request
+            )),
+            Err(SelectedBinderError::Interrupted("cancelled"))
+        ));
+    }
+
     #[test]
     fn admitted_binders_are_found_by_span_without_a_scan() {
         let mut decisions = HashMap::new();
@@ -682,6 +1023,7 @@ mod tests {
         }
         decisions.insert((20, 22), SelectedBinder::Rejected("binder is by reference"));
         let binders = SelectedBinders {
+            field_binders: HashMap::new(),
             decisions,
             admitted: admitted.to_vec(),
             unavailable: Vec::new(),
@@ -720,6 +1062,7 @@ mod tests {
     #[test]
     fn wrapped_binders_take_the_selected_decision() {
         let binders = SelectedBinders {
+            field_binders: HashMap::new(),
             decisions: HashMap::from([
                 ((10, 11), SelectedBinder::Admitted),
                 ((20, 21), SelectedBinder::Rejected("binder is by reference")),
@@ -803,6 +1146,332 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9925: language-rule admission authority was dropped before policy source binding"
+    )]
+    fn selected_field_authority_survives_set_merges_but_not_projection() {
+        use super::super::{
+            PipelineValue, SeedMatch, SelectedPatternSourceEvidence,
+            detailed_evidence_for_pipeline_value,
+        };
+        use crate::query::CodeQuery;
+        use crate::structural::matcher::{CaptureBinding, match_query};
+
+        let source = "use poem::web::Query as Extract;\nfn h(Extract(value): Extract<u8>) { let _ = value; }\n";
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file("Cargo.toml", "[package]\nname = \"sample\"\nversion = \"0.1.0\"\n[dependencies]\npoem = \"3.1.7\"\n")
+            .file("src/lib.rs", source).build();
+        let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
+            project.project_dyn(),
+            AnalyzerConfig::default(),
+        )
+        .expect("Rust workspace");
+        let snapshot = activate_poem_pack(&workspace);
+        let _scope = crate::analyzer::AnalyzerQueryScope::with_active_semantic_model_snapshot(
+            workspace.analyzer(),
+            Some(snapshot),
+        );
+        let file = ProjectFile::new(workspace.analyzer().project().root(), "src/lib.rs");
+        let matched = rule_matches(&workspace, &file, source);
+        assert!(matched.diagnostics.is_empty(), "{:?}", matched.diagnostics);
+        let [selected] = matched.matches.as_slice() else {
+            panic!("one selected binder");
+        };
+        let SelectedPatternSourceEvidence::Admitted(proof) = &selected.selected_pattern_source
+        else {
+            panic!("selected field proof");
+        };
+        let provider = workspace
+            .analyzer()
+            .structural_fact_providers()
+            .into_iter()
+            .find(|provider| provider.structural_language() == Language::Rust)
+            .expect("Rust facts");
+        let facts = provider.structural_facts(&file).expect("facts");
+        let query = CodeQuery::from_json(&serde_json::json!({"schema_version": 1, "match": {"kind": "identifier", "name": "value"}})).expect("identifier query");
+        let matches = match_query(query.seed().expect("seed"), &facts, 100);
+        let mut selected_facts =
+            super::super::seeds::language_rule_matches(&facts, matches, &matched.matches);
+        assert_eq!(selected_facts.len(), 1);
+        let fact_match = selected_facts.pop().expect("field fact");
+        let seed = Arc::new(SeedMatch {
+            language: Language::Rust,
+            file: file.clone(),
+            facts: Arc::clone(&facts),
+            fact_match,
+            python_import: None,
+        });
+        let mut ordinary = (*seed).clone();
+        ordinary.fact_match.selected_pattern_source = Default::default();
+        let ordinary = Arc::new(ordinary);
+        let admitted = PipelineValue::StructuralMatch(Arc::clone(&seed));
+        let plain = PipelineValue::StructuralMatch(ordinary);
+        assert_eq!(
+            admitted.key(),
+            plain.key(),
+            "proof is not part of row identity"
+        );
+        for merge in [
+            PipelineValue::merge_evidence as fn(&mut PipelineValue, PipelineValue),
+            PipelineValue::merge_intersect_evidence,
+        ] {
+            for (mut left, right) in [
+                (admitted.clone(), plain.clone()),
+                (plain.clone(), admitted.clone()),
+                (admitted.clone(), admitted.clone()),
+            ] {
+                merge(&mut left, right);
+                let evidence = detailed_evidence_for_pipeline_value(0, &left, Some(source), None);
+                let SelectedPatternSourceEvidence::Admitted(retained) =
+                    &evidence.selected_pattern_source
+                else {
+                    panic!("set merge lost authority");
+                };
+                assert!(
+                    Arc::ptr_eq(proof, retained),
+                    "the SAME allocation reaches detailed evidence"
+                );
+            }
+            // Independent admission owners conflict even on identical source.
+            let other = rule_matches(&workspace, &file, source);
+            let mut conflicting = (*seed).clone();
+            conflicting.fact_match.selected_pattern_source =
+                other.matches[0].selected_pattern_source.clone();
+            for (mut left, right) in [
+                (
+                    admitted.clone(),
+                    PipelineValue::StructuralMatch(Arc::new(conflicting.clone())),
+                ),
+                (
+                    PipelineValue::StructuralMatch(Arc::new(conflicting)),
+                    admitted.clone(),
+                ),
+            ] {
+                merge(&mut left, right);
+                merge(&mut left, plain.clone());
+                let evidence = detailed_evidence_for_pipeline_value(0, &left, Some(source), None);
+                assert!(matches!(
+                    evidence.selected_pattern_source,
+                    SelectedPatternSourceEvidence::Conflict
+                ));
+            }
+        }
+        let mut projected = seed.fact_match.clone();
+        let start = source.rfind("value").expect("different use span");
+        projected.captures = vec![CaptureBinding {
+            name: "different".into(),
+            span: crate::structural::facts::Span {
+                start_byte: start,
+                end_byte: start + 5,
+            },
+            text: "value".into(),
+            start_line: 2,
+            end_line: 2,
+            start_column: 0,
+            end_column: 5,
+            kind: None,
+            source_identity: facts.source_identity(),
+            node: None,
+        }]
+        .into();
+        let projected =
+            super::super::pipeline::capture_anchor_matches(&projected, &facts, "different");
+        assert_eq!(projected.len(), 1);
+        assert!(matches!(
+            projected[0].selected_pattern_source,
+            SelectedPatternSourceEvidence::NotRequired
+        ));
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9925: admitted partial-artifact proofs escaped file windows without retained owner charges"
+    )]
+    fn selected_proof_owners_cross_file_windows_and_parent_acceptance() {
+        use super::super::{CodeQueryExecutionLimits, SelectedPatternSourceEvidence};
+        use crate::analyzer::semantic::{
+            SemanticArtifactLeaseSet, SemanticCapability, SemanticExecutionBudget, SemanticOutcome,
+            SemanticWork,
+        };
+
+        fn context<'a>(
+            workspace: &'a WorkspaceAnalyzer,
+            leases: &SemanticArtifactLeaseSet,
+            limits: CodeQuerySemanticLimits,
+        ) -> SemanticQueryContext<'a> {
+            let budget = SemanticBudget::default();
+            let execution = SemanticExecutionBudget::new(10);
+            let (before, child) = execution.fork();
+            SemanticQueryContext::new_with_parent_scope(
+                workspace,
+                None,
+                limits,
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                0,
+                None,
+                workspace.analyzer().active_semantic_model_snapshot(),
+                None,
+                None,
+                &budget.scope_snapshot(),
+                super::super::semantic::semantic_budget_limits(limits),
+                super::super::type_flow::CodeQueryRootAllotment::from_execution_limits(
+                    &CodeQueryExecutionLimits {
+                        semantic: limits,
+                        ..Default::default()
+                    },
+                ),
+                before,
+                child,
+                leases.snapshot(),
+            )
+        }
+        fn proof(
+            workspace: &WorkspaceAnalyzer,
+            context: &mut SemanticQueryContext<'_>,
+            file: &ProjectFile,
+            source: &str,
+        ) -> Arc<SelectedPatternObservation> {
+            let matches = matches_for_file(
+                workspace.analyzer(),
+                Some(context),
+                None,
+                file,
+                source,
+                RustRule::PoemHandlerParam,
+            );
+            let [matched] = matches.matches.as_slice() else {
+                panic!("one source proof: {:?}", matches.diagnostics);
+            };
+            let SelectedPatternSourceEvidence::Admitted(proof) = &matched.selected_pattern_source
+            else {
+                panic!("canonical selected source");
+            };
+            Arc::clone(proof)
+        }
+        let second = "use poem::web::Query;\nfn h(Query(value): Query<u8>) { let _ = value; }\n";
+        let first = format!("mod second;\n{second}");
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file("Cargo.toml", "[package]\nname = \"sample\"\nversion = \"0.1.0\"\n[dependencies]\npoem = \"3.1.7\"\n")
+            .file("src/lib.rs", &first).file("src/second.rs", second).build();
+        let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
+            project.project_dyn(),
+            AnalyzerConfig::default(),
+        )
+        .expect("Rust workspace");
+        let snapshot = activate_poem_pack(&workspace);
+        let _scope = crate::analyzer::AnalyzerQueryScope::with_active_semantic_model_snapshot(
+            workspace.analyzer(),
+            Some(snapshot),
+        );
+        let root = workspace.analyzer().project().root();
+        let first_file = ProjectFile::new(root, "src/lib.rs");
+        let second_file = ProjectFile::new(root, "src/second.rs");
+        let limits = CodeQuerySemanticLimits::default();
+        let mut parent = SemanticArtifactLeaseSet::new(limits.max_retained_bytes);
+        let mut query = context(&workspace, &parent, limits);
+        query.start_artifact_window(first_file.clone());
+        let original = proof(&workspace, &mut query, &first_file, &first);
+        let partial = SemanticOutcome::Unsupported {
+            capability: SemanticCapability::Values,
+            partial: Some(Arc::clone(
+                original.observation().point().procedure().artifact(),
+            )),
+            work: SemanticWork::default(),
+        };
+        assert!(query.retain_selected_pattern_source(&first_file, &original));
+        let charged = query.work().retained_bytes;
+        assert!(query.retain_selected_pattern_source(&first_file, &original));
+        assert_eq!(
+            query.work().retained_bytes,
+            charged,
+            "an exact owner alias has no additional charge"
+        );
+        let distinct = proof(&workspace, &mut query, &first_file, &first);
+        assert!(!Arc::ptr_eq(&original, &distinct));
+        assert!(query.retain_selected_pattern_source(&first_file, &distinct));
+        assert!(
+            query.work().retained_bytes > charged,
+            "equal source in a distinct proof allocation consumes memory"
+        );
+        query.release_artifact_window();
+        assert!(query.can_start_artifact_windows());
+        query.start_artifact_window(second_file.clone());
+        let other = proof(&workspace, &mut query, &second_file, second);
+        assert!(query.retain_selected_pattern_source(&second_file, &other));
+        query.release_artifact_window();
+        let (_, _, _, charge) = query.into_receipt().expect("query receipt").into_parts();
+        parent
+            .try_apply_charge(charge, 0)
+            .expect("atomic parent acceptance");
+        assert!(
+            !partial.is_complete(),
+            "allocation accounting does not promote partial quality"
+        );
+        assert!(
+            parent
+                .snapshot()
+                .contains_exact(partial.available_value().expect("partial artifact"))
+        );
+        assert!(
+            parent
+                .snapshot()
+                .contains_exact(other.observation().point().procedure().artifact())
+        );
+        let mut owners = 0;
+        parent.snapshot().census_owners(|_| owners += 1);
+        assert_eq!(
+            owners, 3,
+            "both file windows handed their actual proof owners to the caller"
+        );
+
+        let tight = CodeQuerySemanticLimits {
+            max_retained_bytes: parent.retained_bytes() + 1,
+            ..limits
+        };
+        let mut next = context(&workspace, &parent, tight);
+        assert!(
+            next.retain_selected_pattern_source(&first_file, &original),
+            "inherited owner is already charged"
+        );
+        // Produce a separate admission outside the restricted query to test
+        // the retained-owner boundary independently of source preparation.
+        let mut unbounded = context(&workspace, &parent, limits);
+        let rejected = proof(&workspace, &mut unbounded, &first_file, &first);
+        assert!(!next.retain_selected_pattern_source(&first_file, &rejected));
+        assert!(
+            next.take_diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code
+                    == super::super::CodeQueryDiagnosticCode::SemanticBudgetExhausted)
+        );
+        next.release_artifact_window();
+        let (_, _, _, charge) = next
+            .into_receipt()
+            .expect("refused query receipt")
+            .into_parts();
+        assert!(
+            charge.is_empty(),
+            "refusal publishes no owner or artifact addition"
+        );
+        owners = 0;
+        parent.snapshot().census_owners(|_| owners += 1);
+        assert_eq!(owners, 3);
+        let pinned = Arc::downgrade(&original);
+        drop(original);
+        drop(distinct);
+        drop(other);
+        assert!(
+            pinned.upgrade().is_some(),
+            "parent charge pins every pointer record's allocation"
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12555: the unresolved-constructor prefilter masked the admission's named alias limit"
+    )]
     fn an_oversized_poem_formal_marks_only_itself_incomplete() {
         // The second formal's type exceeds the admission alias budget, so its own
         // admission is unavailable. The valid handler before it must still match.
@@ -853,6 +1522,7 @@ mod tests {
     #[test]
     fn a_limit_marks_the_stopped_binder_with_its_named_cause() {
         let binders = SelectedBinders {
+            field_binders: HashMap::new(),
             decisions: HashMap::from([
                 ((10, 11), SelectedBinder::Admitted),
                 (
@@ -999,9 +1669,8 @@ mod tests {
 
     #[test]
     fn an_extractor_nested_inside_another_pattern_is_never_silently_absent() {
-        // `Some` is definitely not Poem, but the `Query` written inside it is a
-        // possible extractor. It is not an admitted parameter position, so it
-        // must read as undecided rather than disappear.
+        // The root is Some and the selected inner field is Query's field 0.
+        // The full recorded path must be checked before admitting that source.
         let source = "use poem::web::Query;\n\
              pub fn h(opt: Option<Query<String>>) { if let Some(Query(x)) = opt { let _ = x; } }\n";
         let project = InlineTestProject::with_language(Language::Rust)
@@ -1023,14 +1692,13 @@ mod tests {
         );
         let file = ProjectFile::new(workspace.analyzer().project().root(), "src/lib.rs");
         let matched = rule_matches(&workspace, &file, source);
-        assert!(matched.matches.is_empty(), "{:?}", matched.matches);
-        let [diagnostic] = matched.diagnostics.as_slice() else {
-            panic!(
-                "the nested extractor is undecided: {:?}",
-                matched.diagnostics
-            );
-        };
-        assert!(format!("{diagnostic:?}").contains("constructor identity unresolved"));
+        let spans = matched
+            .matches
+            .iter()
+            .map(|matched| &source[matched.select.start_byte..matched.select.end_byte])
+            .collect::<Vec<_>>();
+        assert_eq!(spans, ["x"], "{:?}", matched.diagnostics);
+        assert!(matched.diagnostics.is_empty(), "{:?}", matched.diagnostics);
     }
 
     fn two_handler_workspace() -> (
@@ -1202,6 +1870,9 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12555: the unresolved-constructor prefilter masked the admission's named syntax limit"
+    )]
     fn a_file_over_the_syntax_limit_leaves_a_possible_extractor_undecided() {
         // Admission reads the file's syntax under a 1 MiB limit. Past it, a
         // possible extractor is undecided with the named limit, not clean.

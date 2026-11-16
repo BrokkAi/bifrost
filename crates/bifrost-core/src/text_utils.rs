@@ -1,30 +1,48 @@
-pub fn compute_line_starts(content: &str) -> Vec<usize> {
-    let mut starts = vec![0usize];
+fn line_start_offsets(content: &str) -> impl Iterator<Item = usize> + '_ {
     let mut iter = content.char_indices().peekable();
-
-    while let Some((index, ch)) = iter.next() {
-        match ch {
-            '\r' => {
-                let mut next_start = index + ch.len_utf8();
-                if let Some((next_index, '\n')) = iter.peek().copied() {
-                    next_start = next_index + '\n'.len_utf8();
-                    iter.next();
+    std::iter::once(0).chain(std::iter::from_fn(move || {
+        loop {
+            let (index, ch) = iter.next()?;
+            let next_start = match ch {
+                '\r' => {
+                    if let Some((next_index, '\n')) = iter.peek().copied() {
+                        iter.next();
+                        next_index + '\n'.len_utf8()
+                    } else {
+                        index + ch.len_utf8()
+                    }
                 }
-                if next_start <= content.len() {
-                    starts.push(next_start);
-                }
-            }
-            '\n' => {
-                let next_start = index + ch.len_utf8();
-                if next_start <= content.len() {
-                    starts.push(next_start);
-                }
-            }
-            _ => {}
+                '\n' => index + ch.len_utf8(),
+                _ => continue,
+            };
+            return Some(next_start);
         }
-    }
+    }))
+}
 
-    starts
+pub fn compute_line_starts(content: &str) -> Vec<usize> {
+    line_start_offsets(content).collect()
+}
+
+/// Refuse an index whose slots exceed the allowance before allocating them.
+/// Counting and filling use the same canonical mixed-line-ending iterator.
+pub fn compute_line_starts_bounded(content: &str, max_bytes: usize) -> Option<Vec<usize>> {
+    let count = line_start_offsets(content).count();
+    let bytes = count.checked_mul(std::mem::size_of::<usize>())?;
+    if bytes > max_bytes {
+        return None;
+    }
+    let mut starts = Vec::with_capacity(count);
+    if starts
+        .capacity()
+        .checked_mul(std::mem::size_of::<usize>())?
+        > max_bytes
+    {
+        return None;
+    }
+    starts.extend(line_start_offsets(content));
+    debug_assert_eq!(starts.len(), count);
+    Some(starts)
 }
 
 pub fn find_line_index_for_offset(line_starts: &[usize], offset: usize) -> usize {
@@ -517,9 +535,9 @@ mod tests {
 #[cfg(test)]
 mod text_utils_properties {
     use super::{
-        compute_line_starts, find_line_index_for_offset, find_word, identifier_at_offset,
-        identifier_prefix_before_offset, identifier_span_at_offset, is_ident_byte,
-        line_column_for_offset, render_location_diagnostic, snippet_around_line,
+        compute_line_starts, compute_line_starts_bounded, find_line_index_for_offset, find_word,
+        identifier_at_offset, identifier_prefix_before_offset, identifier_span_at_offset,
+        is_ident_byte, line_column_for_offset, render_location_diagnostic, snippet_around_line,
         trimmed_snippet_around_line, trimmed_snippet_around_range,
     };
     use proptest::prelude::*;
@@ -662,6 +680,12 @@ mod text_utils_properties {
         #[test]
         fn compute_line_starts_matches_an_independent_line_table(content in content()) {
             let starts = compute_line_starts(&content);
+            let exact_bytes = starts.len() * std::mem::size_of::<usize>();
+            prop_assert!(compute_line_starts_bounded(&content, 0).is_none());
+            prop_assert!(compute_line_starts_bounded(&content, exact_bytes - 1).is_none());
+            let bounded = compute_line_starts_bounded(&content, exact_bytes).unwrap();
+            prop_assert_eq!(bounded.capacity() * std::mem::size_of::<usize>(), exact_bytes);
+            prop_assert_eq!(&bounded, &reference_line_starts(&content));
 
             prop_assert_eq!(starts.first().copied(), Some(0), "table for {:?}", content);
             for window in starts.windows(2) {

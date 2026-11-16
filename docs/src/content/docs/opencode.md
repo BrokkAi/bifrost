@@ -95,7 +95,7 @@ On Windows, use forward slashes in these JSON paths or escape each backslash.
 
 The extensions above are the source files that Bifrost analyzes.
 [Languages](/reference/languages/) is the source of this list. Bifrost
-does not analyze `.vue`, `.svelte`, `.razor`, or `.cshtml` files, so do not add
+does not analyze `.vue`, `.svelte`, `.razor`, `.cshtml`, or `.erb` files, so do not add
 them.
 
 `--root` is the fallback workspace root. OpenCode also sends the workspace

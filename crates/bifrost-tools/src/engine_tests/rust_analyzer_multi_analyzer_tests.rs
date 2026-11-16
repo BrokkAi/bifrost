@@ -40,9 +40,41 @@ mod rust_departing_tests_tests {
             updated.test_hooks().full_declaration_scan_count_for_test(),
             0
         );
+        // A metadata-only generation has a new membership owner, so it starts a
+        // fresh generation-scoped activation publication (#11902, #12218). The
+        // content-keyed caches inside the container ride the update (#2449): a
+        // value keyed by content an edit did not touch stays exact.
         assert!(
-            Arc::ptr_eq(&analyzer.snapshot_caches, &updated.snapshot_caches),
-            "an update touching no analyzed file must keep the workspace derived-layer caches"
+            !Arc::ptr_eq(&analyzer.snapshot_caches, &updated.snapshot_caches),
+            "a metadata-only generation starts a fresh activation publication"
+        );
+        assert!(
+            std::ptr::eq(
+                analyzer.snapshot_caches.derived_layers(),
+                updated.snapshot_caches.derived_layers()
+            ),
+            "derived layers are keyed by content and must carry forward"
+        );
+        assert!(
+            std::ptr::eq(
+                analyzer.snapshot_caches.usage_graphs(),
+                updated.snapshot_caches.usage_graphs()
+            ),
+            "usage graphs are keyed by content and must carry forward"
+        );
+        assert!(
+            std::ptr::eq(
+                analyzer.snapshot_caches.derivations(),
+                updated.snapshot_caches.derivations()
+            ),
+            "derivations are keyed by content and must carry forward"
+        );
+        assert!(
+            std::ptr::eq(
+                analyzer.snapshot_caches.java_usage_evidence(),
+                updated.snapshot_caches.java_usage_evidence()
+            ),
+            "JVM usage evidence is keyed by content and must carry forward"
         );
     }
 

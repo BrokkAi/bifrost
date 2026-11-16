@@ -10,7 +10,7 @@ MostRelevantFilesRankingModeValue = Literal[
     "cascade", "history_imports", "usage_graph", "usage_graph_exact"
 ]
 MostRelevantFilesIncompleteReasonValue = Literal["cancelled", "time_budget"]
-SymbolSourcesIncompleteReasonValue = Literal["cancelled", "inside_unclosed_construct", "read_incomplete"]
+SymbolSourcesIncompleteReasonValue = Literal["cancelled", "inside_unclosed_construct", "read_incomplete", "source_unavailable"]
 DefinitionLookupIncompleteReasonValue = Literal[
     "cancelled",
     "time_budget",
@@ -53,6 +53,7 @@ MissingTestsIncompleteReasonValue = Literal[
     "usage_target_ambiguous",
     "usage_analysis_failure",
     "usage_analysis_incomplete",
+    "test_status_unknown_outside_scoped_diff_image",
     "unproven_references",
     "usage_site_without_enclosing_declaration",
     "unresolved_changed_target",
@@ -90,6 +91,13 @@ def _strict_bool(data: dict, key: str, default: object = _MISSING) -> bool:
     if type(value) is not bool:
         raise TypeError(f"{key} must be a boolean")
     return value
+
+
+def _nullable_bool(data: dict, key: str) -> bool | None:
+    value = data[key]
+    if value is None:
+        return None
+    return _strict_bool(data, key)
 
 
 def _strict_nonnegative_int(data: dict, key: str) -> int:
@@ -5734,7 +5742,14 @@ class CodeQueryDiagnosticCode(StrEnum):
     USES_PARSER_UNSUPPORTED = "uses_parser_unsupported"
     USES_CANDIDATE_LIMIT = "uses_candidate_limit"
     USES_TARGETS_AMBIGUOUS = "uses_targets_ambiguous"
-    USES_CANDIDATES_OMITTED = "uses_candidates_omitted"
+    USES_CANDIDATE_UNAVAILABLE = "uses_candidate_unavailable"
+    USES_CANDIDATE_INCOMPLETE = "uses_candidate_incomplete"
+    USES_CANDIDATE_UNRESOLVED = "uses_candidate_unresolved"
+    USES_REFERENCE_PROJECTION_MISSING = "uses_reference_projection_missing"
+    USES_DEFINITION_PROJECTION_MISSING = "uses_definition_projection_missing"
+    USES_INVERSE_UNCONFIRMED = "uses_inverse_unconfirmed"
+    USES_INDEXED_SOURCE_UNAVAILABLE = "uses_indexed_source_unavailable"
+    USES_TARGET_RANGE_UNAVAILABLE = "uses_target_range_unavailable"
     EXECUTION_BUDGET_EXHAUSTED = "execution_budget_exhausted"
     PIPELINE_BUDGET_EXHAUSTED = "pipeline_budget_exhausted"
     IMPORT_GRAPH_BUDGET_EXHAUSTED = "import_graph_budget_exhausted"
@@ -8604,7 +8619,7 @@ class CyclomaticComplexityFunction:
     start_line: int
     end_line: int
     language: str
-    is_test: bool
+    is_test: bool | None
     complexity: int
 
     @classmethod
@@ -8617,7 +8632,7 @@ class CyclomaticComplexityFunction:
             start_line=_strict_nonnegative_int(data, "start_line"),
             end_line=_strict_nonnegative_int(data, "end_line"),
             language=data["language"],
-            is_test=_strict_bool(data, "is_test"),
+            is_test=_nullable_bool(data, "is_test"),
             complexity=_strict_nonnegative_int(data, "complexity"),
         )
 
@@ -8786,7 +8801,7 @@ class BlastRadiusCallableSymbol:
     start_line: int
     end_line: int
     language: str
-    in_test_context: bool
+    in_test_context: bool | None
 
     @classmethod
     def from_dict(cls, data: dict) -> BlastRadiusCallableSymbol:
@@ -8799,7 +8814,7 @@ class BlastRadiusCallableSymbol:
             start_line=int(data["start_line"]),
             end_line=int(data["end_line"]),
             language=data["language"],
-            in_test_context=bool(data["in_test_context"]),
+            in_test_context=_nullable_bool(data, "in_test_context"),
         )
 
 
@@ -9149,7 +9164,7 @@ class CommitSymbol:
     start_line: int
     end_line: int
     language: str
-    is_test: bool
+    is_test: bool | None
 
     @classmethod
     def from_dict(cls, data: dict) -> CommitSymbol:
@@ -9162,7 +9177,7 @@ class CommitSymbol:
             start_line=int(data["start_line"]),
             end_line=int(data["end_line"]),
             language=data["language"],
-            is_test=bool(data["is_test"]),
+            is_test=_nullable_bool(data, "is_test"),
         )
 
 
@@ -9817,6 +9832,7 @@ class CodeQualityReport:
 # the generated data classes; fields, enums, defaults, and decoding all come
 # from the producer contract.
 from . import _generated_query_models as _generated_query_models  # noqa: E402
+from ._generated_query_models import OmissionCount, OmissionExactness  # noqa: E402
 
 _legacy_query_models = dict(globals())
 for _generated_name in dir(_generated_query_models):

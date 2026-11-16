@@ -28,7 +28,21 @@ pub struct ReadChannels {
     /// zero, which reads as "not a budget refusal".
     pub budget_dependences: usize,
     pub reuse_refused: bool,
+    /// A store read failed under the capture (#11534). Implies `reuse_refused`;
+    /// carried apart because a publisher with no read receipt of its own asks
+    /// the consuming ledger whether a failure reached it.
+    pub store_failed: bool,
     pub persistence_refusals: usize,
+    /// The verdict producers returned explicitly. Shadows the two counts above
+    /// until every producer returns one; decisions still read the counts.
+    pub explicit_verdict: super::reuse_verdict::ReuseVerdict,
+}
+
+impl ReadChannels {
+    /// The one definition of whether captured read channels are bounded.
+    pub fn is_bounded(&self) -> bool {
+        self.unattributed_reads == 0 && self.execution_dependences == 0 && !self.reuse_refused
+    }
 }
 
 /// Refuse retained reuse in the current consuming capture. This capability
@@ -48,6 +62,10 @@ pub trait ReadReuseRefusal: Send + Sync {
 pub trait MemoAttribution {
     type Key;
     fn is_capturing(&self) -> bool;
+    /// Authorities also feed evaluation evidence without an ordinary capture.
+    fn is_recording_authorities(&self) -> bool {
+        self.is_capturing()
+    }
     fn capture_identity(&self) -> Option<CaptureIdentity>;
     #[track_caller]
     fn record_unattributed(&self);
@@ -56,6 +74,48 @@ pub trait MemoAttribution {
         build: impl FnOnce() -> T,
     ) -> (T, CapturedMemoReads<Self::Key>, Option<CaptureIdentity>);
     fn replay(&self, reads: &CapturedMemoReads<Self::Key>);
+
+    /// [`Self::capture`] for a build that returns its own reuse verdict. The
+    /// verdict joins the capture's own ledger before that ledger closes, so
+    /// the ledger's decision, its shadow comparison and its forward to the
+    /// enclosing capture all see it.
+    fn capture_judged<T: super::reuse_verdict::CarriesReuseVerdict>(
+        &self,
+        build: impl FnOnce() -> T,
+    ) -> (T, CapturedMemoReads<Self::Key>, Option<CaptureIdentity>) {
+        let (value, mut reads, forwarded_to) = self.capture(|| {
+            let value = build();
+            let verdict = value.reuse_verdict();
+            if !verdict.is_content() {
+                self.replay(&CapturedMemoReads {
+                    runtime_cache_touched: false,
+                    keys: Arc::from(Vec::new()),
+                    channels: ReadChannels {
+                        explicit_verdict: verdict,
+                        ..ReadChannels::default()
+                    },
+                    first_refusal: None,
+                    first_execution_refusal: None,
+                });
+            }
+            value
+        });
+        // A capability whose captured channels do not come from the reads it
+        // replayed still returns the verdict with the entry.
+        reads
+            .channels
+            .explicit_verdict
+            .join_in(value.reuse_verdict());
+        reads
+            .channels
+            .explicit_verdict
+            .debug_assert_not_stricter_than(super::reuse_verdict::ReuseVerdict::from_counts(
+                reads.channels.execution_dependences,
+                reads.channels.budget_dependences,
+            ));
+        (value, reads, forwarded_to)
+    }
+
     fn capture_authority<T>(&self, build: impl FnOnce() -> T) -> (T, CapturedMemoReads<Self::Key>);
 }
 
@@ -71,6 +131,11 @@ impl<A: MemoAttribution> MemoCapability<A> {
     pub fn is_capturing(&self) -> bool {
         self.attribution.is_capturing()
     }
+    /// Whether an authority read made now has a consumer: an ordinary capture
+    /// or an evaluation's selection evidence.
+    pub fn is_recording_authorities(&self) -> bool {
+        self.attribution.is_recording_authorities()
+    }
     pub fn capture_identity(&self) -> Option<CaptureIdentity> {
         self.attribution.capture_identity()
     }
@@ -83,6 +148,13 @@ impl<A: MemoAttribution> MemoCapability<A> {
         build: impl FnOnce() -> T,
     ) -> (T, CapturedMemoReads<A::Key>, Option<CaptureIdentity>) {
         self.attribution.capture(build)
+    }
+    fn capture_judged<T>(
+        &self,
+        build: impl FnOnce() -> super::reuse_verdict::Judged<T>,
+    ) -> (T, CapturedMemoReads<A::Key>) {
+        let (judged, reads, _) = self.attribution.capture_judged(build);
+        (judged.value, reads)
     }
     fn replay(&self, reads: &CapturedMemoReads<A::Key>) {
         self.attribution.replay(reads);
@@ -102,7 +174,7 @@ impl<A: MemoAttribution> MemoCapability<A> {
         A: AuthorityRecorder<F, I>,
     {
         self.record_detached_read();
-        if !self.is_capturing() {
+        if !self.attribution.is_recording_authorities() {
             return read();
         }
         let (answer, reads) = self.attribution.capture_authority(read);
@@ -302,6 +374,16 @@ impl<T, K> ReplayingMemoEntry<T, K> {
         }
     }
 
+    /// [`Self::capture`] for a build that returns its own reuse verdict, which
+    /// joins the entry's captured channels and the enclosing capture's.
+    pub fn capture_judged<A: MemoAttribution<Key = K>>(
+        attribution: &MemoCapability<A>,
+        build: impl FnOnce() -> super::reuse_verdict::Judged<T>,
+    ) -> Self {
+        let (value, reads) = attribution.capture_judged(build);
+        Self::from_parts(value, reads)
+    }
+
     pub fn value(&self) -> &T {
         &self.value
     }
@@ -377,6 +459,12 @@ impl<T, K> ReplayingMemoEntry<T, K> {
             )
     }
 
+    /// Borrow the actual captured read owner for a joint retained census.
+    /// No read replay, cloning or semantic authority is introduced.
+    pub fn captured_reads(&self) -> &CapturedMemoReads<K> {
+        &self.reads
+    }
+
     /// Charge this entry's bytes to the owner's budget before it is shared, so
     /// every `Arc` of it, including the one a replayed hit holds, keeps them
     /// charged. An entry the budget cannot take stays uncharged and
@@ -387,6 +475,45 @@ impl<T, K> ReplayingMemoEntry<T, K> {
         key_heap_bytes: impl Fn(&K) -> usize,
     ) {
         let bytes = self.retained_bytes(key_heap_bytes);
+        self.charge = crate::retention_budget::AllocationCharge::acquire(budget, bytes);
+    }
+
+    /// Owned receipt allocations for a pure cache. The raw census above is
+    /// retained for refusing callers and source-admission limits.
+    pub fn allocated_read_bytes(&self, key_heap_bytes: impl Fn(&K) -> usize) -> usize {
+        use crate::allocation_size::allocation_size;
+        use std::mem::{size_of, size_of_val};
+        allocation_size(size_of_val(self.reads.keys.as_ref()) + 2 * size_of::<usize>())
+            .saturating_add(self.reads.keys.iter().map(key_heap_bytes).sum::<usize>())
+            .saturating_add(
+                [
+                    &self.reads.first_refusal,
+                    &self.reads.first_execution_refusal,
+                ]
+                .into_iter()
+                .flatten()
+                .map(|r| allocation_size(r.reason.capacity()))
+                .sum::<usize>(),
+            )
+    }
+
+    pub fn allocated_retained_bytes(&self, key_heap_bytes: impl Fn(&K) -> usize) -> usize {
+        self.value_bytes
+            .saturating_add(self.allocated_read_bytes(key_heap_bytes))
+    }
+
+    /// Fund an Arc-owned pure cache entry by its allocated storage. Refusing
+    /// consumers retain the original raw `charge` and read-byte computation.
+    pub fn charge_allocated(
+        &mut self,
+        budget: &crate::retention_budget::RetentionBudget,
+        key_heap_bytes: impl Fn(&K) -> usize,
+    ) {
+        use crate::allocation_size::allocation_size;
+        use std::mem::size_of;
+        let bytes = allocation_size(size_of::<Self>() + 2 * size_of::<usize>())
+            .saturating_add(self.value_bytes.saturating_sub(size_of::<T>()))
+            .saturating_add(self.allocated_read_bytes(key_heap_bytes));
         self.charge = crate::retention_budget::AllocationCharge::acquire(budget, bytes);
     }
 
@@ -541,6 +668,33 @@ impl<M> ReplayingMemo<M> {
     /// Byte/weight accounting only; this projection cannot return an answer.
     pub fn account(&self, account: impl FnOnce(&M) -> usize) -> usize {
         account(&self.memo)
+    }
+}
+
+impl<K, V> ReplayingMemo<crate::retention_budget::BudgetRegion<K, V>>
+where
+    K: Eq
+        + std::hash::Hash
+        + Clone
+        + Send
+        + Sync
+        + crate::retention_budget::RetainedBytes
+        + 'static,
+    V: Send + Sync + crate::retention_budget::RetainedBytes + 'static,
+{
+    /// Invalidate every entry owned by this memo's budget region.
+    ///
+    /// A value still held by a caller keeps its charge until that holder drops.
+    pub fn invalidate_all(&self) {
+        self.memo.invalidate_all();
+    }
+}
+
+impl<K, V> ReplayingMemo<std::cell::RefCell<std::collections::HashMap<K, V>>> {
+    /// Drop every entry of a query-local memo, for an owner that must leave
+    /// nothing retained after a rejected fill.
+    pub fn clear(&self) {
+        self.memo.borrow_mut().clear();
     }
 }
 

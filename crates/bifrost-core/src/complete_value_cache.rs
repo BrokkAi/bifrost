@@ -354,6 +354,36 @@ where
         }
     }
 
+    /// Observe resident ready entries without advancing Moka maintenance.
+    ///
+    /// This is for explicit test-support diagnostics only. Unlike
+    /// [`Self::visit_ready`], it does not run pending tasks: a census must not
+    /// trigger cache eviction or value destruction. The returned count and
+    /// weight are Moka's resident metrics and are not structural byte totals.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn visit_ready_passively_for_test(
+        &self,
+        mut visitor: impl FnMut(&K, &Arc<V>),
+    ) -> (u64, u64) {
+        for (key, value) in self.entries.iter() {
+            let value = value.get();
+            visitor(key.as_ref(), &value);
+        }
+        (self.entries.entry_count(), self.entries.weighted_size())
+    }
+
+    /// Number of same-key builds currently running. Read-only: does not join
+    /// or otherwise alter the flights.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn in_flight_count_for_test(&self) -> usize {
+        self.in_flight
+            .lock()
+            .expect("complete-value single-flight map mutex poisoned")
+            .len()
+    }
+
     /// Return a resident complete value without reserving build leadership.
     /// This supports physical planners that may reuse an index for a narrow
     /// request but must not construct the whole-workspace value for it.

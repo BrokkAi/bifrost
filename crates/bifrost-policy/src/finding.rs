@@ -1,4 +1,4 @@
-//! Stable policy evaluation and schema-version-7 match-evidence report types.
+//! Stable policy evaluation and canonical match-evidence report types.
 //!
 //! This module deliberately contains no query-to-finding conversion.  The
 //! evaluator must combine a loaded policy, detailed analyzer evidence, and a
@@ -6,11 +6,12 @@
 
 use brokk_bifrost_analysis::analyzer::usages::python_class_hierarchy::PythonAncestryBasis;
 use brokk_bifrost_flow::model_attribution::BoundedContributors;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::mem::size_of;
 
 use serde::de;
+use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
@@ -28,8 +29,8 @@ use super::definition::{
     FindingSeverity, PolicyAnalysisType, PolicyId, UnknownVerdict, is_valid_namespaced_identifier,
 };
 use super::finding_identity::{
-    EvidenceRef, FindingIdentityStability, MatchFindingAnchor, MatchResultDomain, PolicyFindingId,
-    StableSemanticIdentity, WitnessId,
+    AnalysisSubjectRef, EvidenceRef, FindingIdentityStability, MatchFindingAnchor,
+    MatchResultDomain, PolicyFindingId, StableSemanticIdentity, WitnessId,
 };
 use super::future_evidence::{FlowFindingEvidence, TaintFindingEvidence, TypestateFindingEvidence};
 use super::identity::PolicySemanticHash;
@@ -42,7 +43,8 @@ use super::scope::PolicyFindingScope;
 use super::suppression::PolicyFindingSuppression;
 use crate::is_false;
 
-pub(crate) const MAX_REPORT_PROSE_BYTES: usize = 4_096;
+pub(crate) const MAX_REPORT_PROSE_BYTES: usize =
+    brokk_bifrost_core::bounded_output::MAX_DIAGNOSTIC_MESSAGE_BYTES;
 const MAX_REPORT_IDENTIFIER_BYTES: usize = 128;
 const MAX_TYPED_REASONS: usize = 256;
 
@@ -755,6 +757,13 @@ pub enum PolicyIncompleteReason {
     PipelineRowBudget,
     ImportGraphBudget,
     ReferenceCandidateBudget,
+    UsesCandidateUnavailable,
+    UsesCandidateIncomplete,
+    UsesCandidateUnresolved,
+    UsesInverseUnconfirmed,
+    UsesSourceUnavailable,
+    UsesProjectionMissing,
+
     NoAnalyzableFiles,
     PartialDiscovery,
     CapabilityIncomplete,
@@ -786,6 +795,12 @@ impl PolicyIncompleteReason {
             Self::FactNodeBudget => "fact_node_budget",
             Self::PipelineRowBudget => "pipeline_row_budget",
             Self::ImportGraphBudget => "import_graph_budget",
+            Self::UsesCandidateUnavailable => "uses_candidate_unavailable",
+            Self::UsesCandidateIncomplete => "uses_candidate_incomplete",
+            Self::UsesCandidateUnresolved => "uses_candidate_unresolved",
+            Self::UsesInverseUnconfirmed => "uses_inverse_unconfirmed",
+            Self::UsesSourceUnavailable => "uses_source_unavailable",
+            Self::UsesProjectionMissing => "uses_projection_missing",
             Self::ReferenceCandidateBudget => "reference_candidate_budget",
             Self::NoAnalyzableFiles => "no_analyzable_files",
             Self::PartialDiscovery => "partial_discovery",
@@ -1840,6 +1855,10 @@ pub enum PolicyQueryResultRef {
         query_result_kind: String,
         location: Option<PolicySourceLocation>,
     },
+    /// A canonical AST source owner, not a selected procedure interpretation.
+    Procedure {
+        source_owner: StableSemanticIdentity,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2236,7 +2255,8 @@ impl PolicyQueryResultRef {
             Self::FieldWriteValue { .. } => Some(MatchResultDomain::FieldWriteValue),
             Self::MemberTargetAnalysis { .. }
             | Self::ReceiverAnalysis { .. }
-            | Self::Unsupported { .. } => None,
+            | Self::Unsupported { .. }
+            | Self::Procedure { .. } => None,
         }
     }
 
@@ -2261,7 +2281,7 @@ impl PolicyQueryResultRef {
             | Self::MemberTargetAnalysis { location, .. }
             | Self::FieldWriteValue { location, .. }
             | Self::ReceiverAnalysis { location, .. } => Some(location),
-            Self::File { .. } => None,
+            Self::File { .. } | Self::Procedure { .. } => None,
             Self::Unsupported { location, .. } => location.as_ref(),
         }
     }
@@ -2269,12 +2289,20 @@ impl PolicyQueryResultRef {
     pub fn path(&self) -> Option<&str> {
         match self {
             Self::File { path } => Some(path.as_str()),
+            Self::Procedure { source_owner } => Some(source_owner.path().as_str()),
             _ => self.location().map(PolicySourceLocation::path),
         }
     }
 
     pub fn validate(&self) -> Result<(), ReportValueError> {
         match self {
+            Self::Procedure { source_owner } => {
+                if source_owner.derivation()
+                    != Some(crate::finding_identity::StableIdentityDerivation::CanonicalAstIdentity)
+                {
+                    return Err(ReportValueError::InvalidIdentifier);
+                }
+            }
             Self::DependencyEvidence {
                 location,
                 id,
@@ -2593,6 +2621,7 @@ impl PolicyQueryResultRef {
 
     fn tighten_owned_storage(&mut self) {
         match self {
+            Self::Procedure { .. } => {}
             Self::DependencyEvidence {
                 id,
                 ecosystem,
@@ -2829,6 +2858,7 @@ impl PolicyQueryResultRef {
 impl RetainedSize for PolicyQueryResultRef {
     fn retained_size(&self) -> usize {
         size_of::<Self>().saturating_add(match self {
+            Self::Procedure { source_owner } => retained_extra(source_owner),
             Self::DependencyEvidence {
                 location,
                 id,
@@ -3860,24 +3890,592 @@ impl WitnessStepKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// How many related locations a diagnostic omitted while being retained.
+///
+/// Known values are lower bounds; `Unknown` means the omitted locations could
+/// not be counted without making an unsupported assumption about overlap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RelatedLocationOmissions {
+    Known(u64),
+    Unknown,
+}
+
+impl Serialize for RelatedLocationOmissions {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Known(count) => serializer.serialize_u64(*count),
+            Self::Unknown => {
+                let mut state = serializer.serialize_struct("RelatedLocationOmissions", 1)?;
+                state.serialize_field("kind", "unknown")?;
+                state.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for RelatedLocationOmissions {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct UnknownWire {
+            kind: UnknownKind,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "lowercase")]
+        enum UnknownKind {
+            Unknown,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Known(u64),
+            Unknown(UnknownWire),
+        }
+
+        match Wire::deserialize(deserializer)? {
+            Wire::Known(count) => Ok(Self::Known(count)),
+            Wire::Unknown(UnknownWire {
+                kind: UnknownKind::Unknown,
+            }) => Ok(Self::Unknown),
+        }
+    }
+}
+
+/// Exact rendered omissions for a refused call. Native non-UTF-8 sites are
+/// excluded from both counts and declared separately by the flag.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallBindingRefusalOmissions {
+    pub bound_trimmed: u64,
+    pub unrepresentable_path: u64,
+    pub has_non_utf8_refusal: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct PolicyDiagnostic {
     code: PolicyDiagnosticCode,
     severity: PolicyDiagnosticSeverity,
     impact: PolicyDiagnosticImpact,
+    #[serde(skip)]
+    execution_cause: PolicyDiagnosticExecutionCause,
     family: String,
     message: String,
     /// How many produced diagnostics this entry stands for. It is 1 for a
     /// verbatim diagnostic and the family's total once a capped list has been
     /// folded by family.
     family_count: u64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    exhausted_roots: Vec<brokk_bifrost_rql::structural::CodeQueryExhaustedRoot>,
+    // Request-local lane metadata survives bounded witness sampling and folding.
+    // The complete set is serialized on PolicyRun, not on each diagnostic.
+    #[serde(skip)]
+    budget_refusals: Vec<String>,
     primary: Option<PolicySourceLocation>,
     related: Vec<RelatedPolicyLocation>,
+    /// Exact for call-binding refusals, excluding native non-UTF-8 sites;
+    /// those are declared by refusal_omissions.has_non_utf8_refusal.
+    omitted_related_locations_lower_bound: RelatedLocationOmissions,
+    /// Exact refusal inventory, absent when family folding loses exact
+    /// location knowledge. Unknown public omissions never carry exact counts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refusal_omissions: Option<CallBindingRefusalOmissions>,
     /// The structured account of an incomplete selector discovery, for the
     /// concise human view. The message keeps the complete diagnostic list, so
     /// JSON and SARIF need nothing from this.
     #[serde(skip)]
     selector_gap: Option<PolicySelectorGapSummary>,
+}
+
+// Execution provenance has its own lossless inventory. It must not duplicate
+// otherwise identical presentation details or consume their retention slots.
+impl PartialEq for PolicyDiagnostic {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            execution_cause: _,
+            code,
+            severity,
+            impact,
+            family,
+            message,
+            family_count,
+            exhausted_roots,
+            budget_refusals,
+            primary,
+            related,
+            omitted_related_locations_lower_bound,
+            refusal_omissions,
+            selector_gap,
+        } = self;
+        let Self {
+            execution_cause: _,
+            code: other_code,
+            severity: other_severity,
+            impact: other_impact,
+            family: other_family,
+            message: other_message,
+            family_count: other_family_count,
+            exhausted_roots: other_exhausted_roots,
+            budget_refusals: other_budget_refusals,
+            primary: other_primary,
+            related: other_related,
+            omitted_related_locations_lower_bound: other_omitted_related_locations_lower_bound,
+            refusal_omissions: other_refusal_omissions,
+            selector_gap: other_selector_gap,
+        } = other;
+        refusal_omissions == other_refusal_omissions
+            && (
+                code,
+                severity,
+                impact,
+                family,
+                message,
+                family_count,
+                exhausted_roots,
+                budget_refusals,
+                primary,
+                related,
+                omitted_related_locations_lower_bound,
+                selector_gap,
+            ) == (
+                other_code,
+                other_severity,
+                other_impact,
+                other_family,
+                other_message,
+                other_family_count,
+                other_exhausted_roots,
+                other_budget_refusals,
+                other_primary,
+                other_related,
+                other_omitted_related_locations_lower_bound,
+                other_selector_gap,
+            )
+    }
+}
+impl Eq for PolicyDiagnostic {}
+
+/// A finite diagnostic discriminator, without site or scope payloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct PolicyDiagnosticCause {
+    code: &'static str,
+    impact: PolicyDiagnosticImpact,
+    execution_cause: PolicyDiagnosticExecutionCause,
+}
+impl PolicyDiagnosticCause {
+    pub const fn code(&self) -> &'static str {
+        self.code
+    }
+    pub const fn impact(&self) -> PolicyDiagnosticImpact {
+        self.impact
+    }
+    pub const fn execution_cause(&self) -> PolicyDiagnosticExecutionCause {
+        self.execution_cause
+    }
+}
+
+/// Product admission metadata, with unknown distinct from proven content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PolicyDiagnosticExecutionCause {
+    Known(Option<brokk_bifrost_rql::DiagnosticExecutionCause>),
+    /// Existing ExecutionCause::Other: known execution dependence without a
+    /// finer category (core/analyzer/reuse_verdict.rs).
+    Other,
+    Unknown,
+    DetailRetention,
+    FindingRetention,
+}
+
+impl PolicyDiagnosticExecutionCause {
+    fn index(self) -> usize {
+        use brokk_bifrost_rql::DiagnosticExecutionCause;
+        match self {
+            Self::Known(None) => 0,
+            Self::Known(Some(DiagnosticExecutionCause::Cancelled)) => 1,
+            Self::Known(Some(DiagnosticExecutionCause::Budget)) => 2,
+            Self::Known(Some(DiagnosticExecutionCause::Snapshot)) => 3,
+            Self::Known(Some(DiagnosticExecutionCause::Provider)) => 4,
+            Self::Other => 5,
+            Self::Unknown => 6,
+            Self::DetailRetention => 7,
+            Self::FindingRetention => 8,
+        }
+    }
+}
+
+impl Serialize for PolicyDiagnosticExecutionCause {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Known(cause) => cause.serialize(serializer),
+            Self::Other => serializer.serialize_str("other"),
+            Self::Unknown => serializer.serialize_str("unknown"),
+            Self::DetailRetention => serializer.serialize_str("detail_retention"),
+            Self::FindingRetention => serializer.serialize_str("finding_retention"),
+        }
+    }
+}
+
+const DIAGNOSTIC_EXECUTION_CAUSES: &[PolicyDiagnosticExecutionCause] = &[
+    PolicyDiagnosticExecutionCause::Known(None),
+    PolicyDiagnosticExecutionCause::Known(Some(
+        brokk_bifrost_rql::DiagnosticExecutionCause::Cancelled,
+    )),
+    PolicyDiagnosticExecutionCause::Known(Some(
+        brokk_bifrost_rql::DiagnosticExecutionCause::Budget,
+    )),
+    PolicyDiagnosticExecutionCause::Known(Some(
+        brokk_bifrost_rql::DiagnosticExecutionCause::Snapshot,
+    )),
+    PolicyDiagnosticExecutionCause::Known(Some(
+        brokk_bifrost_rql::DiagnosticExecutionCause::Provider,
+    )),
+    PolicyDiagnosticExecutionCause::Other,
+    PolicyDiagnosticExecutionCause::Unknown,
+    PolicyDiagnosticExecutionCause::DetailRetention,
+    PolicyDiagnosticExecutionCause::FindingRetention,
+];
+
+// This is the existing policy vocabulary, not an additional cause vocabulary.
+// Query labels come directly from their single declared enum table.
+const ROOT_DIAGNOSTIC_LABELS: &[&str] = &[
+    "unsupported_analysis",
+    "stable_anchor_unavailable",
+    "endpoint_dominance_undecidable",
+    "evaluation_failure",
+    "empty_selection",
+    "unknown_verdict_fail_closed",
+    "batch_finding_limit",
+    "report_retention_budget",
+    "cvss_variant_budget",
+    "projection_scenario_membership_budget",
+    "organizational_risk_overlay_budget",
+    "duplicate_finding_id",
+    "internal_error",
+];
+const DIAGNOSTIC_IMPACTS: &[PolicyDiagnosticImpact] = &[
+    PolicyDiagnosticImpact::Advisory,
+    PolicyDiagnosticImpact::DeclaredNonExhaustive,
+    PolicyDiagnosticImpact::FindingPartial,
+    PolicyDiagnosticImpact::RunIncomplete,
+    PolicyDiagnosticImpact::RunUnsupported,
+    PolicyDiagnosticImpact::RunFailed,
+];
+const DIAGNOSTIC_CODE_COUNT: usize =
+    CodeQueryDiagnosticCode::LABELS.len() + ROOT_DIAGNOSTIC_LABELS.len();
+const DIAGNOSTIC_CAUSE_WORDS: usize =
+    (DIAGNOSTIC_CODE_COUNT * DIAGNOSTIC_EXECUTION_CAUSES.len() * DIAGNOSTIC_IMPACTS.len())
+        .div_ceil(64);
+
+/// All observed code/cause pairs in the closed vocabulary. No site-dependent allocation
+/// or retention cap is needed, even when detail admission has zero allowance.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PolicyDiagnosticCauses {
+    words: [u64; DIAGNOSTIC_CAUSE_WORDS],
+}
+impl Default for PolicyDiagnosticCauses {
+    fn default() -> Self {
+        Self {
+            words: [0; DIAGNOSTIC_CAUSE_WORDS],
+        }
+    }
+}
+impl PolicyDiagnosticCauses {
+    fn insert_index(
+        &mut self,
+        code: usize,
+        impact: PolicyDiagnosticImpact,
+        execution_cause: PolicyDiagnosticExecutionCause,
+    ) {
+        let impact = DIAGNOSTIC_IMPACTS
+            .iter()
+            .position(|value| *value == impact)
+            .expect("new impacts must enter the cause inventory");
+        let cause = execution_cause.index();
+        let bit =
+            (code * DIAGNOSTIC_EXECUTION_CAUSES.len() + cause) * DIAGNOSTIC_IMPACTS.len() + impact;
+        self.words[bit / 64] |= 1u64 << (bit % 64);
+    }
+    fn insert(&mut self, code: &PolicyDiagnosticCode, impact: PolicyDiagnosticImpact) {
+        self.insert_with_execution_cause(code, impact, PolicyDiagnosticExecutionCause::Unknown);
+    }
+    fn insert_with_execution_cause(
+        &mut self,
+        code: &PolicyDiagnosticCode,
+        impact: PolicyDiagnosticImpact,
+        execution_cause: PolicyDiagnosticExecutionCause,
+    ) {
+        if matches!(code, PolicyDiagnosticCode::InternalError { .. }) {
+            assert_eq!(impact, PolicyDiagnosticImpact::RunFailed);
+            assert_ne!(execution_cause, PolicyDiagnosticExecutionCause::Known(None));
+        }
+        let index = match code {
+            PolicyDiagnosticCode::CodeQuery { code } => code.raw_code() as usize,
+            code => {
+                CodeQueryDiagnosticCode::LABELS.len()
+                    + ROOT_DIAGNOSTIC_LABELS
+                        .iter()
+                        .position(|value| *value == code.cause_label())
+                        .expect("new policy codes must enter the cause inventory")
+            }
+        };
+        self.insert_index(index, impact, execution_cause);
+    }
+    fn insert_query(&mut self, code: CodeQueryDiagnosticCode, impact: PolicyDiagnosticImpact) {
+        self.insert_index(
+            code as usize,
+            impact,
+            PolicyDiagnosticExecutionCause::Unknown,
+        );
+    }
+    fn contains(&self, diagnostic: &PolicyDiagnostic) -> bool {
+        let mut required = Self::default();
+        required.insert_with_execution_cause(
+            diagnostic.code(),
+            diagnostic.impact(),
+            diagnostic.execution_cause,
+        );
+        self.words
+            .iter()
+            .zip(required.words)
+            .all(|(actual, required)| *actual & required == required)
+    }
+    fn union(&mut self, other: &Self) {
+        for (left, right) in self.words.iter_mut().zip(other.words) {
+            *left |= right;
+        }
+    }
+    pub fn iter(&self) -> impl Iterator<Item = PolicyDiagnosticCause> + '_ {
+        (0..DIAGNOSTIC_CODE_COUNT * DIAGNOSTIC_EXECUTION_CAUSES.len()).filter_map(|pair| {
+            // A code/cause pair can have several impacts. Keep the strongest
+            // existing impact, independently of producer or retention order.
+            let impact = (0..DIAGNOSTIC_IMPACTS.len()).rev().find(|impact| {
+                let bit = pair * DIAGNOSTIC_IMPACTS.len() + impact;
+                self.words[bit / 64] & (1u64 << (bit % 64)) != 0
+            })?;
+            let code = pair / DIAGNOSTIC_EXECUTION_CAUSES.len();
+            let code = if code < CodeQueryDiagnosticCode::LABELS.len() {
+                CodeQueryDiagnosticCode::LABELS[code]
+            } else {
+                ROOT_DIAGNOSTIC_LABELS[code - CodeQueryDiagnosticCode::LABELS.len()]
+            };
+            Some(PolicyDiagnosticCause {
+                code,
+                impact: DIAGNOSTIC_IMPACTS[impact],
+                execution_cause: DIAGNOSTIC_EXECUTION_CAUSES
+                    [pair % DIAGNOSTIC_EXECUTION_CAUSES.len()],
+            })
+        })
+    }
+}
+impl std::fmt::Debug for PolicyDiagnosticCauses {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_set().entries(self.iter()).finish()
+    }
+}
+impl Serialize for PolicyDiagnosticCauses {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.iter())
+    }
+}
+impl RetainedSize for PolicyDiagnosticCauses {
+    fn retained_size(&self) -> usize {
+        size_of::<Self>()
+    }
+}
+
+/// One producer stream: detail retention never removes its cause inventory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PolicyDiagnostics {
+    entries: Vec<PolicyDiagnostic>,
+    causes: PolicyDiagnosticCauses,
+    worst_omitted_diagnostic_severity: Option<PolicyDiagnosticSeverity>,
+}
+impl PolicyDiagnostics {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+    pub(crate) fn causes(&self) -> &PolicyDiagnosticCauses {
+        &self.causes
+    }
+    pub(crate) fn record_omitted_severity(&mut self, severity: PolicyDiagnosticSeverity) {
+        self.worst_omitted_diagnostic_severity =
+            self.worst_omitted_diagnostic_severity.max(Some(severity));
+    }
+    pub(crate) fn omitted_summary(&self) -> Self {
+        Self {
+            entries: Vec::new(),
+            causes: self.causes.clone(),
+            worst_omitted_diagnostic_severity: self
+                .worst_omitted_diagnostic_severity
+                .max(self.entries.iter().map(PolicyDiagnostic::severity).max()),
+        }
+    }
+    pub(crate) fn merge_omitted_summary(&mut self, summary: &Self) {
+        debug_assert!(summary.entries.is_empty());
+        self.causes.union(&summary.causes);
+        self.worst_omitted_diagnostic_severity = self
+            .worst_omitted_diagnostic_severity
+            .max(summary.worst_omitted_diagnostic_severity);
+    }
+    pub(crate) fn worst_omitted_diagnostic_severity(&self) -> Option<PolicyDiagnosticSeverity> {
+        self.worst_omitted_diagnostic_severity
+    }
+    pub(crate) fn record_cause(
+        &mut self,
+        code: &PolicyDiagnosticCode,
+        impact: PolicyDiagnosticImpact,
+    ) {
+        self.causes.insert(code, impact);
+    }
+    pub(crate) fn record_typed_cause(
+        &mut self,
+        code: &PolicyDiagnosticCode,
+        impact: PolicyDiagnosticImpact,
+        cause: PolicyDiagnosticExecutionCause,
+    ) {
+        self.causes.insert_with_execution_cause(code, impact, cause);
+    }
+    pub(crate) fn record_query_cause(
+        &mut self,
+        code: CodeQueryDiagnosticCode,
+        impact: PolicyDiagnosticImpact,
+    ) {
+        self.causes.insert_query(code, impact);
+    }
+    pub(crate) fn record_query_diagnostic(
+        &mut self,
+        diagnostic: &brokk_bifrost_rql::structural::CodeQueryDiagnostic,
+        impact: PolicyDiagnosticImpact,
+    ) {
+        self.causes.insert_index(
+            diagnostic.code as usize,
+            impact,
+            PolicyDiagnosticExecutionCause::Known(diagnostic.incompleteness.execution_cause()),
+        );
+    }
+    pub(crate) fn push(&mut self, diagnostic: PolicyDiagnostic) {
+        self.record_diagnostic(&diagnostic);
+        self.entries.push(diagnostic);
+    }
+    pub(crate) fn record_diagnostic(&mut self, diagnostic: &PolicyDiagnostic) {
+        self.causes.insert_with_execution_cause(
+            &diagnostic.code,
+            diagnostic.impact,
+            diagnostic.execution_cause,
+        );
+    }
+    pub(crate) fn replace(&mut self, index: usize, diagnostic: PolicyDiagnostic) {
+        self.record_diagnostic(&diagnostic);
+        self.entries[index] = diagnostic;
+    }
+    pub(crate) fn insert(&mut self, index: usize, diagnostic: PolicyDiagnostic) {
+        self.causes.insert_with_execution_cause(
+            &diagnostic.code,
+            diagnostic.impact,
+            diagnostic.execution_cause,
+        );
+        self.entries.insert(index, diagnostic);
+    }
+    pub(crate) fn extend(&mut self, diagnostics: impl IntoIterator<Item = PolicyDiagnostic>) {
+        for diagnostic in diagnostics {
+            self.push(diagnostic);
+        }
+    }
+    pub(crate) fn pop(&mut self) -> Option<PolicyDiagnostic> {
+        let diagnostic = self.entries.pop();
+        if let Some(diagnostic) = &diagnostic {
+            self.record_omitted_severity(diagnostic.severity());
+        }
+        diagnostic
+    }
+    pub(crate) fn truncate(&mut self, len: usize) {
+        if let Some(severity) = self
+            .entries
+            .iter()
+            .skip(len)
+            .map(PolicyDiagnostic::severity)
+            .max()
+        {
+            self.record_omitted_severity(severity);
+        }
+        self.entries.truncate(len);
+    }
+    pub(crate) fn clear(&mut self) {
+        self.truncate(0);
+    }
+    pub(crate) fn dedup(&mut self) {
+        self.entries.dedup();
+    }
+    pub(crate) fn sort_by(
+        &mut self,
+        compare: impl FnMut(&PolicyDiagnostic, &PolicyDiagnostic) -> std::cmp::Ordering,
+    ) {
+        self.entries.sort_by(compare);
+    }
+    pub(crate) fn retain(&mut self, mut f: impl FnMut(&PolicyDiagnostic) -> bool) {
+        let mut worst = self.worst_omitted_diagnostic_severity;
+        self.entries.retain(|diagnostic| {
+            let keep = f(diagnostic);
+            if !keep {
+                worst = worst.max(Some(diagnostic.severity()));
+            }
+            keep
+        });
+        self.worst_omitted_diagnostic_severity = worst;
+    }
+    /// These diagnostics describe semantic incompleteness superseded by a
+    /// failure. Selecting the failed-run presentation is not a retention cut.
+    pub(crate) fn retain_failed_run_diagnostics(&mut self) {
+        self.entries.retain(|diagnostic| {
+            !matches!(
+                diagnostic.impact(),
+                PolicyDiagnosticImpact::RunIncomplete
+                    | PolicyDiagnosticImpact::DeclaredNonExhaustive
+            )
+        });
+    }
+    pub(crate) fn capacity(&self) -> usize {
+        self.entries.capacity()
+    }
+    pub(crate) fn reserve_exact(&mut self, additional: usize) {
+        self.entries.reserve_exact(additional);
+    }
+}
+impl RetainedSize for PolicyDiagnostics {
+    fn retained_size(&self) -> usize {
+        size_of::<Self>() + retained_extra(&self.entries)
+    }
+}
+impl std::ops::Deref for PolicyDiagnostics {
+    type Target = [PolicyDiagnostic];
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+impl From<Vec<PolicyDiagnostic>> for PolicyDiagnostics {
+    fn from(entries: Vec<PolicyDiagnostic>) -> Self {
+        entries.into_iter().collect()
+    }
+}
+impl FromIterator<PolicyDiagnostic> for PolicyDiagnostics {
+    fn from_iter<T: IntoIterator<Item = PolicyDiagnostic>>(iter: T) -> Self {
+        let mut result = Self::new();
+        result.extend(iter);
+        result
+    }
+}
+impl<'a> IntoIterator for &'a PolicyDiagnostics {
+    type Item = &'a PolicyDiagnostic;
+    type IntoIter = std::slice::Iter<'a, PolicyDiagnostic>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.iter()
+    }
 }
 
 /// One endpoint selector whose discovery did not finish, summarized for a
@@ -3946,9 +4544,19 @@ impl PolicyDiagnostic {
         message: impl Into<String>,
         primary: Option<PolicySourceLocation>,
         related: Vec<RelatedPolicyLocation>,
+        omitted_related_locations_lower_bound: RelatedLocationOmissions,
     ) -> Result<Self, ReportValueError> {
         let family = code.stable_label();
-        Self::try_new_in_family(code, severity, impact, family, message, primary, related)
+        Self::try_new_in_family(
+            code,
+            severity,
+            impact,
+            family,
+            message,
+            primary,
+            related,
+            omitted_related_locations_lower_bound,
+        )
     }
 
     /// One diagnostic that declares the reason family its message belongs to.
@@ -3967,6 +4575,7 @@ impl PolicyDiagnostic {
         message: impl Into<String>,
         primary: Option<PolicySourceLocation>,
         mut related: Vec<RelatedPolicyLocation>,
+        omitted_related_locations_lower_bound: RelatedLocationOmissions,
     ) -> Result<Self, ReportValueError> {
         let mut message = message.into();
         let mut family = family.into();
@@ -3983,20 +4592,111 @@ impl PolicyDiagnostic {
         related.sort();
         related.dedup();
         tighten_vec(&mut related);
+        // A typed store failure is known execution dependence. Its producer
+        // supplies no finer derivation cause, so retain the existing core
+        // ExecutionCause::Other meaning (reuse_verdict.rs:14-18).
+        let execution_cause = if matches!(&code, PolicyDiagnosticCode::InternalError { .. }) {
+            assert_eq!(impact, PolicyDiagnosticImpact::RunFailed);
+            PolicyDiagnosticExecutionCause::Other
+        } else {
+            PolicyDiagnosticExecutionCause::Unknown
+        };
         Ok(Self {
             code,
             severity,
             impact,
+            execution_cause,
             family,
             message,
             family_count: 1,
+            exhausted_roots: Vec::new(),
+            budget_refusals: Vec::new(),
             primary,
             related,
+            omitted_related_locations_lower_bound,
+            refusal_omissions: None,
             selector_gap: None,
         })
     }
 
-    /// Attach the human summary of the selector gap this diagnostic reports.
+    pub(crate) fn with_execution_cause(
+        self,
+        cause: Option<brokk_bifrost_rql::DiagnosticExecutionCause>,
+    ) -> Self {
+        self.with_policy_execution_cause(PolicyDiagnosticExecutionCause::Known(cause))
+    }
+
+    pub(crate) fn with_policy_execution_cause(
+        mut self,
+        cause: PolicyDiagnosticExecutionCause,
+    ) -> Self {
+        assert!(
+            !matches!(self.code, PolicyDiagnosticCode::InternalError { .. })
+                || cause != PolicyDiagnosticExecutionCause::Known(None),
+            "an internal error cannot be deterministic"
+        );
+        self.execution_cause = cause;
+        self
+    }
+
+    /// Representative admission witnesses; the run retains every refused lane.
+    pub fn exhausted_roots(&self) -> &[brokk_bifrost_rql::structural::CodeQueryExhaustedRoot] {
+        &self.exhausted_roots
+    }
+
+    pub(crate) fn with_exhausted_roots(
+        mut self,
+        roots: Vec<brokk_bifrost_rql::structural::CodeQueryExhaustedRoot>,
+    ) -> Self {
+        self.budget_refusals = roots
+            .iter()
+            .filter(|root| root.is_budget_refusal())
+            .map(|root| root.lane.clone())
+            .collect();
+        self.budget_refusals.sort();
+        self.budget_refusals.dedup();
+        tighten_vec(&mut self.budget_refusals);
+        self.exhausted_roots.clear();
+        for root in roots {
+            self.retain_exhausted_root_witness(root);
+        }
+        tighten_vec(&mut self.exhausted_roots);
+        self
+    }
+
+    fn retain_exhausted_root_witness(
+        &mut self,
+        mut root: brokk_bifrost_rql::structural::CodeQueryExhaustedRoot,
+    ) {
+        // Match report prose normalization: spare producer capacity must not
+        // decide which otherwise identical witness fits the retained bytes.
+        tighten_string(&mut root.path);
+        tighten_string(&mut root.lane);
+        if let Some(procedure) = &mut root.procedure {
+            tighten_string(procedure);
+        }
+        if let Some(stage) = &mut root.stage {
+            tighten_string(stage);
+        }
+        // A family can cover arbitrarily many sites. Retain one witness per
+        // lane, bounded in both count and owned bytes, independently of the
+        // complete refused-lane set carried into the run.
+        let retained_bytes = self
+            .exhausted_roots
+            .iter()
+            .map(RetainedSize::retained_size)
+            .sum::<usize>();
+        if self.exhausted_roots.len() < MAX_RELATED_LOCATIONS
+            && !self
+                .exhausted_roots
+                .iter()
+                .any(|known| known.lane == root.lane)
+            && retained_bytes.saturating_add(root.retained_size()) <= MAX_REPORT_PROSE_BYTES
+        {
+            self.exhausted_roots.push(root);
+        }
+    }
+
     pub fn with_selector_gap(mut self, summary: PolicySelectorGapSummary) -> Self {
         self.selector_gap = Some(summary);
         self
@@ -4023,7 +4723,9 @@ impl PolicyDiagnostic {
             message,
             None,
             Vec::new(),
+            RelatedLocationOmissions::Known(0),
         )
+        .map(|diagnostic| diagnostic.with_execution_cause(None))
     }
 
     /// One location-free diagnostic whose message is bounded, never rejected.
@@ -4040,8 +4742,16 @@ impl PolicyDiagnostic {
         message: impl Into<String>,
     ) -> Self {
         let message = bounded_report_prose(message);
-        Self::try_new(code, severity, impact, message, None, Vec::new())
-            .expect("a bounded location-free diagnostic must construct")
+        Self::try_new(
+            code,
+            severity,
+            impact,
+            message,
+            None,
+            Vec::new(),
+            RelatedLocationOmissions::Known(0),
+        )
+        .expect("a bounded location-free diagnostic must construct")
     }
 
     pub const fn code(&self) -> &PolicyDiagnosticCode {
@@ -4075,6 +4785,29 @@ impl PolicyDiagnostic {
         &self.message
     }
 
+    pub(crate) fn with_refusal_subjects(
+        mut self,
+        primary: Option<PolicySourceLocation>,
+        related: Vec<RelatedPolicyLocation>,
+        omissions: CallBindingRefusalOmissions,
+        reason: &str,
+    ) -> Self {
+        self.primary = primary;
+        self.related = related;
+        self.omitted_related_locations_lower_bound = RelatedLocationOmissions::Known(
+            omissions
+                .bound_trimmed
+                .saturating_add(omissions.unrepresentable_path),
+        );
+        self.refusal_omissions = Some(omissions);
+        self.message = bounded_report_prose(format!("{}\n{}", self.message, reason));
+        self
+    }
+
+    pub const fn refusal_omissions(&self) -> Option<&CallBindingRefusalOmissions> {
+        self.refusal_omissions.as_ref()
+    }
+
     pub const fn primary(&self) -> Option<&PolicySourceLocation> {
         self.primary.as_ref()
     }
@@ -4083,8 +4816,60 @@ impl PolicyDiagnostic {
         &self.related
     }
 
+    pub const fn omitted_related_locations_lower_bound(&self) -> RelatedLocationOmissions {
+        self.omitted_related_locations_lower_bound
+    }
+
     pub const fn selector_gap(&self) -> Option<&PolicySelectorGapSummary> {
         self.selector_gap.as_ref()
+    }
+}
+
+/// Attribution is mandatory only for a policy typestate-partial diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TypestatePartialScope {
+    Evaluation,
+    Root { subject_key: AnalysisSubjectRef },
+}
+
+/// A raw RQL partial cannot cross the policy boundary without attribution.
+/// Other codes use a private validated payload and cannot carry a scope.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(tag = "code")]
+pub enum PolicyCodeQueryDiagnostic {
+    #[serde(rename = "typestate_analysis_partial")]
+    TypestatePartial { scope: TypestatePartialScope },
+    #[serde(untagged)]
+    Other(OtherPolicyCodeQueryDiagnostic),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct OtherPolicyCodeQueryDiagnostic {
+    code: CodeQueryDiagnosticCode,
+}
+
+impl TryFrom<CodeQueryDiagnosticCode> for PolicyCodeQueryDiagnostic {
+    type Error = ReportValueError;
+
+    fn try_from(code: CodeQueryDiagnosticCode) -> Result<Self, Self::Error> {
+        if code == CodeQueryDiagnosticCode::TypestateAnalysisPartial {
+            return Err(ReportValueError::TypestatePartialScopeRequired);
+        }
+        Ok(Self::Other(OtherPolicyCodeQueryDiagnostic { code }))
+    }
+}
+
+impl PolicyCodeQueryDiagnostic {
+    pub fn raw_code(&self) -> CodeQueryDiagnosticCode {
+        match self {
+            Self::TypestatePartial { .. } => CodeQueryDiagnosticCode::TypestateAnalysisPartial,
+            Self::Other(other) => other.code,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        self.raw_code().as_str()
     }
 }
 
@@ -4092,12 +4877,18 @@ impl PolicyDiagnostic {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PolicyDiagnosticCode {
     CodeQuery {
-        code: CodeQueryDiagnosticCode,
+        #[serde(flatten)]
+        code: PolicyCodeQueryDiagnostic,
     },
     UnsupportedAnalysis,
     StableAnchorUnavailable,
     EndpointDominanceUndecidable,
     EvaluationFailure,
+    InternalError {
+        cause: PolicyInternalErrorCause,
+        policy_id: PolicyId,
+        error: String,
+    },
     /// A declared selection bound no location in the scanned workspace, so the
     /// verdict it participates in is vacuous rather than proven (#2659). The
     /// run stays honest about what it did -- zero findings over an empty
@@ -4113,31 +4904,44 @@ pub enum PolicyDiagnosticCode {
     CvssVariantBudget,
     ProjectionScenarioMembershipBudget,
     OrganizationalRiskOverlayBudget,
+    /// Two or more findings of one run share a finding id. Both are kept and
+    /// the run goes on; this advisory names the rule and their anchors so the
+    /// collision can be fixed (#12029).
+    DuplicateFindingId,
 }
 
 impl PolicyDiagnosticCode {
-    /// The stable rendering label, and the default reason family of a
-    /// diagnostic that does not declare one.
+    /// The stable rendering label and default diagnostic reason family.
     pub fn stable_label(&self) -> String {
         match self {
             Self::CodeQuery { code } => format!("code_query/{}", code.as_str()),
-            Self::UnsupportedAnalysis => "unsupported_analysis".to_owned(),
-            Self::StableAnchorUnavailable => "stable_anchor_unavailable".to_owned(),
-            Self::EndpointDominanceUndecidable => "endpoint_dominance_undecidable".to_owned(),
-            Self::EvaluationFailure => "evaluation_failure".to_owned(),
-            Self::EmptySelection => "empty_selection".to_owned(),
-            Self::UnknownVerdictFailClosed => "unknown_verdict_fail_closed".to_owned(),
-            Self::BatchFindingLimit => "batch_finding_limit".to_owned(),
-            Self::ReportRetentionBudget => "report_retention_budget".to_owned(),
-            Self::CvssVariantBudget => "cvss_variant_budget".to_owned(),
-            Self::ProjectionScenarioMembershipBudget => {
-                "projection_scenario_membership_budget".to_owned()
-            }
-            Self::OrganizationalRiskOverlayBudget => {
-                "organizational_risk_overlay_budget".to_owned()
-            }
+            code => code.cause_label().to_owned(),
         }
     }
+    fn cause_label(&self) -> &'static str {
+        match self {
+            Self::CodeQuery { code } => code.as_str(),
+            Self::UnsupportedAnalysis => "unsupported_analysis",
+            Self::StableAnchorUnavailable => "stable_anchor_unavailable",
+            Self::EndpointDominanceUndecidable => "endpoint_dominance_undecidable",
+            Self::InternalError { .. } => "internal_error",
+            Self::EvaluationFailure => "evaluation_failure",
+            Self::EmptySelection => "empty_selection",
+            Self::UnknownVerdictFailClosed => "unknown_verdict_fail_closed",
+            Self::BatchFindingLimit => "batch_finding_limit",
+            Self::ReportRetentionBudget => "report_retention_budget",
+            Self::CvssVariantBudget => "cvss_variant_budget",
+            Self::ProjectionScenarioMembershipBudget => "projection_scenario_membership_budget",
+            Self::OrganizationalRiskOverlayBudget => "organizational_risk_overlay_budget",
+            Self::DuplicateFindingId => "duplicate_finding_id",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyInternalErrorCause {
+    StoreRead,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -4168,8 +4972,14 @@ pub struct PolicyWorkReport {
     examined_references: u64,
     retained_findings: u64,
     omitted_findings_lower_bound: u64,
+    retention_omitted_findings_lower_bound: u64,
+    retention_omitted_findings_by_dimension: std::collections::BTreeMap<String, u64>,
+    semantic_omitted_findings_lower_bound: u64,
     retained_report_bytes: u64,
     metrics: Vec<PolicyWorkMetric>,
+    // Transfer to PolicyRun before diagnostic retention can discard a family.
+    #[serde(skip)]
+    budget_refusals: Vec<String>,
 }
 
 /// Observations from the preliminary source inventory that composition discarded.
@@ -4230,9 +5040,47 @@ impl PolicyWorkReport {
             examined_references,
             retained_findings,
             omitted_findings_lower_bound,
+            retention_omitted_findings_lower_bound: 0,
+            retention_omitted_findings_by_dimension: Default::default(),
+            semantic_omitted_findings_lower_bound: omitted_findings_lower_bound,
             retained_report_bytes,
             metrics,
+            budget_refusals: Vec::new(),
         })
+    }
+
+    pub(crate) fn record_budget_refusal(&mut self, dimension: &str) {
+        if !self.budget_refusals.iter().any(|known| known == dimension) {
+            self.budget_refusals.push(dimension.to_string());
+            self.budget_refusals.sort();
+        }
+    }
+
+    pub(crate) fn with_budget_refusals(mut self, dimensions: &[String]) -> Self {
+        for dimension in dimensions {
+            self.record_budget_refusal(dimension);
+        }
+        self
+    }
+
+    pub(crate) fn record_diagnostic_refusals(&mut self, diagnostics: &[PolicyDiagnostic]) {
+        for diagnostic in diagnostics {
+            for lane in &diagnostic.budget_refusals {
+                self.record_budget_refusal(lane);
+            }
+        }
+    }
+
+    pub(crate) fn record_finding_refusals(&mut self, findings: &[PolicyFinding]) {
+        // Match projections also carry upstream source omissions. Their
+        // assembly records the actual local budget cut before combining counts.
+        // Other finding evidence still uses this flag for local projection cuts.
+        if findings.iter().any(|finding| {
+            finding.related_truncated()
+                && !matches!(finding.evidence(), PolicyFindingEvidence::Match { .. })
+        }) {
+            self.record_budget_refusal("policy/related_locations_per_finding");
+        }
     }
 
     pub const fn scanned_files(&self) -> u64 {
@@ -4257,6 +5105,51 @@ impl PolicyWorkReport {
 
     pub const fn retained_findings(&self) -> u64 {
         self.retained_findings
+    }
+
+    pub const fn retention_omitted_findings_lower_bound(&self) -> u64 {
+        self.retention_omitted_findings_lower_bound
+    }
+    pub const fn semantic_omitted_findings_lower_bound(&self) -> u64 {
+        self.semantic_omitted_findings_lower_bound
+    }
+    pub fn retention_omitted_findings_by_dimension(
+        &self,
+    ) -> &std::collections::BTreeMap<String, u64> {
+        &self.retention_omitted_findings_by_dimension
+    }
+
+    pub(crate) fn add_retention_omitted_findings(&mut self, count: u64) {
+        self.add_retention_omitted_findings_for_dimension("policy/evaluator_retention", count);
+    }
+
+    pub(crate) fn add_retention_omitted_findings_for_dimension(
+        &mut self,
+        dimension: &str,
+        count: u64,
+    ) {
+        if count == 0 {
+            return;
+        }
+        let entry = self
+            .retention_omitted_findings_by_dimension
+            .entry(dimension.to_owned())
+            .or_default();
+        *entry = entry.saturating_add(count);
+        self.retention_omitted_findings_lower_bound = self
+            .retention_omitted_findings_lower_bound
+            .saturating_add(count);
+        self.omitted_findings_lower_bound = self
+            .semantic_omitted_findings_lower_bound
+            .saturating_add(self.retention_omitted_findings_lower_bound);
+    }
+    pub(crate) fn add_omitted_findings(&mut self, count: u64) {
+        self.semantic_omitted_findings_lower_bound = self
+            .semantic_omitted_findings_lower_bound
+            .saturating_add(count);
+        self.omitted_findings_lower_bound = self
+            .semantic_omitted_findings_lower_bound
+            .saturating_add(self.retention_omitted_findings_lower_bound);
     }
 
     pub const fn omitted_findings_lower_bound(&self) -> u64 {
@@ -4303,6 +5196,12 @@ impl PolicyWorkReport {
         retained_report_bytes: u64,
     ) {
         self.retained_findings = retained_findings;
+        assert!(
+            omitted_findings_lower_bound >= self.retention_omitted_findings_lower_bound,
+            "retention total cannot discard producer omissions"
+        );
+        self.semantic_omitted_findings_lower_bound =
+            omitted_findings_lower_bound - self.retention_omitted_findings_lower_bound;
         self.omitted_findings_lower_bound = omitted_findings_lower_bound;
         self.retained_report_bytes = retained_report_bytes;
     }
@@ -4658,7 +5557,19 @@ impl RetainedSize for ModelAttribution {
     }
 }
 
-/// One normalized finding in the canonical schema-version-7 report model.
+fn serialize_related_omissions<S: serde::Serializer>(
+    omitted: &brokk_bifrost_core::omission::OmissionCount,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeMap as _;
+    let mut fields = serializer.serialize_map(Some(3))?;
+    fields.serialize_entry("related_truncated", &!omitted.is_empty())?;
+    fields.serialize_entry("omitted_related_locations_lower_bound", &omitted.count())?;
+    fields.serialize_entry("omitted_related_locations_exactness", &omitted.exactness())?;
+    fields.end()
+}
+
+/// One normalized finding in the canonical policy report model.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PolicyFinding {
     #[serde(skip_serializing_if = "crate::ValueTypeBarrierNotes::is_empty")]
@@ -4674,9 +5585,11 @@ pub struct PolicyFinding {
     certainty: FindingCertainty,
     completeness: FindingCompleteness,
     primary: PolicySourceLocation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    evaluation_location: Option<PolicySourceLocation>,
     related: Vec<RelatedPolicyLocation>,
-    related_truncated: bool,
-    omitted_related_locations_lower_bound: u64,
+    #[serde(flatten, serialize_with = "serialize_related_omissions")]
+    related_omissions: brokk_bifrost_core::omission::OmissionCount,
     evidence: PolicyFindingEvidence,
     #[serde(skip_serializing_if = "Option::is_none")]
     model_attribution: Option<ModelAttribution>,
@@ -4701,8 +5614,216 @@ pub struct PolicyFinding {
 }
 
 impl PolicyFinding {
+    /// Release optional presentation detail without changing finding identity.
+    pub(crate) fn omit_optional_detail(&mut self) -> bool {
+        let mut changed =
+            !self.related.is_empty() || !self.witnesses.is_empty() || !self.display_path.is_empty();
+        let before_refs = distinct_evidence_ref_count(
+            &self.classification,
+            &self.related,
+            &self.evidence,
+            self.cvss.as_ref(),
+            self.organizational_risk.as_ref(),
+            &self.proof,
+            &self.witnesses,
+        );
+        changed |= self.value_type_barrier_notes.omit_optional_detail();
+        let related = self.related.len() as u64;
+        self.related_omissions = self
+            .related_omissions
+            .combined(brokk_bifrost_core::omission::OmissionCount::exact(related));
+        self.related = Vec::new();
+        let witnesses = self.witnesses.len() as u64;
+        self.witnesses_truncated |= witnesses > 0;
+        self.omitted_witnesses_lower_bound =
+            self.omitted_witnesses_lower_bound.saturating_add(witnesses);
+        self.witnesses = Vec::new();
+        self.display_path = Default::default();
+        if let Some(attribution) = &mut self.model_attribution {
+            let minimal = attribution.without_detail();
+            changed |= *attribution != minimal;
+            *attribution = minimal;
+        }
+        match &mut self.evidence {
+            PolicyFindingEvidence::Match { evidence } => {
+                changed |= !evidence.provenance.is_empty();
+                evidence.provenance_truncated |= !evidence.provenance.is_empty();
+                evidence.provenance = Vec::new();
+            }
+            PolicyFindingEvidence::Taint { evidence } => {
+                changed |= evidence.omit_optional_detail();
+            }
+            PolicyFindingEvidence::Flow { evidence } => {
+                changed |= evidence.omit_optional_detail();
+            }
+            PolicyFindingEvidence::Typestate { evidence } => {
+                changed |= evidence.omit_optional_detail();
+            }
+            PolicyFindingEvidence::Assertion { evidence } => {
+                changed |= evidence.observed.take().is_some();
+                if !evidence.effect_derivations.is_empty() {
+                    changed = true;
+                    evidence.effect_derivations_truncated = true;
+                    evidence.omitted_effect_derivations_lower_bound = evidence
+                        .omitted_effect_derivations_lower_bound
+                        .saturating_add(evidence.effect_derivations.len() as u64);
+                    evidence.effect_derivations = Vec::new();
+                }
+            }
+        }
+        if let Some(cvss) = &mut self.cvss {
+            changed |= cvss.omit_optional_detail();
+        }
+        let after_refs = distinct_evidence_ref_count(
+            &self.classification,
+            &self.related,
+            &self.evidence,
+            self.cvss.as_ref(),
+            self.organizational_risk.as_ref(),
+            &self.proof,
+            &self.witnesses,
+        );
+        let removed_refs = before_refs.saturating_sub(after_refs) as u64;
+        self.evidence_refs_truncated |= removed_refs > 0;
+        self.omitted_evidence_refs_lower_bound = self
+            .omitted_evidence_refs_lower_bound
+            .saturating_add(removed_refs);
+        // Preserve every existing reason, adding those required by omissions.
+        while let Err(PolicyFindingError::MissingCompletenessReason { reason }) =
+            validate_required_completeness_reasons(
+                &self.completeness,
+                &self.evidence,
+                &self.related,
+                !self.related_omissions.is_empty(),
+                self.evidence_refs_truncated,
+                &self.proof,
+                &self.witnesses,
+                self.witnesses_truncated,
+                self.cvss.as_ref(),
+            )
+        {
+            let mut reasons = self.completeness.reasons().to_vec();
+            reasons.push(reason);
+            reasons.sort();
+            reasons.dedup();
+            self.completeness = FindingCompleteness::Partial { reasons };
+        }
+        changed
+    }
+
+    /// Trusted producers may shed optional detail before applying the request
+    /// budget. Readers continue using the strict constructor below.
+    /// Shape validation precedes budget admission, so oversized optional detail
+    /// can be removed without relaxing the final request limits.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_new_shedding_detail(
+        policy_id: PolicyId,
+        policy_hash: PolicySemanticHash,
+        severity: FindingSeverity,
+        message: String,
+        classification: FindingClassification,
+        certainty: FindingCertainty,
+        completeness: FindingCompleteness,
+        primary: PolicySourceLocation,
+        related: Vec<RelatedPolicyLocation>,
+        related_truncated: bool,
+        omitted_related_locations_lower_bound: u64,
+        evidence: PolicyFindingEvidence,
+        evidence_refs_truncated: bool,
+        omitted_evidence_refs_lower_bound: u64,
+        cvss: Option<CvssAssessmentSet>,
+        organizational_risk: Option<OrganizationalRiskAssessment>,
+        proof: ProofMetadata,
+        witnesses: Vec<BoundedWitness>,
+        witnesses_truncated: bool,
+        omitted_witnesses_lower_bound: u64,
+        budget: &PolicyBudget,
+    ) -> Result<(Self, bool), PolicyFindingError> {
+        let mut finding = Self::try_new_shape(
+            policy_id,
+            policy_hash,
+            severity,
+            message,
+            classification,
+            certainty,
+            completeness,
+            primary,
+            related,
+            related_truncated,
+            omitted_related_locations_lower_bound,
+            evidence,
+            evidence_refs_truncated,
+            omitted_evidence_refs_lower_bound,
+            cvss,
+            organizational_risk,
+            proof,
+            witnesses,
+            witnesses_truncated,
+            omitted_witnesses_lower_bound,
+        )?;
+        let mut detail_omitted = false;
+        if let Err(error) = finding.validate_against_budget(budget) {
+            if !error.is_budget_limit_exceeded() {
+                return Err(error);
+            }
+            detail_omitted = finding.omit_optional_detail();
+            finding.validate_against_budget(budget)?;
+        }
+        Ok((finding, detail_omitted))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_new(
+        policy_id: PolicyId,
+        policy_hash: PolicySemanticHash,
+        severity: FindingSeverity,
+        message: String,
+        classification: FindingClassification,
+        certainty: FindingCertainty,
+        completeness: FindingCompleteness,
+        primary: PolicySourceLocation,
+        related: Vec<RelatedPolicyLocation>,
+        related_truncated: bool,
+        omitted_related_locations_lower_bound: u64,
+        evidence: PolicyFindingEvidence,
+        evidence_refs_truncated: bool,
+        omitted_evidence_refs_lower_bound: u64,
+        cvss: Option<CvssAssessmentSet>,
+        organizational_risk: Option<OrganizationalRiskAssessment>,
+        proof: ProofMetadata,
+        witnesses: Vec<BoundedWitness>,
+        witnesses_truncated: bool,
+        omitted_witnesses_lower_bound: u64,
+        budget: &PolicyBudget,
+    ) -> Result<Self, PolicyFindingError> {
+        let finding = Self::try_new_shape(
+            policy_id,
+            policy_hash,
+            severity,
+            message,
+            classification,
+            certainty,
+            completeness,
+            primary,
+            related,
+            related_truncated,
+            omitted_related_locations_lower_bound,
+            evidence,
+            evidence_refs_truncated,
+            omitted_evidence_refs_lower_bound,
+            cvss,
+            organizational_risk,
+            proof,
+            witnesses,
+            witnesses_truncated,
+            omitted_witnesses_lower_bound,
+        )?;
+        finding.validate_against_budget(budget)?;
+        Ok(finding)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_new_shape(
         policy_id: PolicyId,
         policy_hash: PolicySemanticHash,
         severity: FindingSeverity,
@@ -4723,7 +5844,6 @@ impl PolicyFinding {
         mut witnesses: Vec<BoundedWitness>,
         witnesses_truncated: bool,
         omitted_witnesses_lower_bound: u64,
-        budget: &PolicyBudget,
     ) -> Result<Self, PolicyFindingError> {
         if message.is_empty() {
             return Err(PolicyFindingError::EmptyMessage);
@@ -4746,42 +5866,10 @@ impl PolicyFinding {
             omitted_witnesses_lower_bound,
         )?;
 
-        if related.len() > budget.max_related_locations_per_finding() {
-            return Err(ReportValueError::TooManyItems {
-                field: "finding_related_locations",
-                max_items: budget.max_related_locations_per_finding(),
-            }
-            .into());
-        }
         related.sort();
         related.dedup();
         tighten_vec(&mut related);
 
-        if witnesses.len() > budget.max_witnesses_per_finding() {
-            return Err(ReportValueError::TooManyItems {
-                field: "finding_witnesses",
-                max_items: budget.max_witnesses_per_finding(),
-            }
-            .into());
-        }
-        for witness in &witnesses {
-            if witness.steps().len() > budget.max_witness_steps() {
-                return Err(ReportValueError::TooManyItems {
-                    field: "witness_steps",
-                    max_items: budget.max_witness_steps(),
-                }
-                .into());
-            }
-            if usize::try_from(witness.retained_bytes()).unwrap_or(usize::MAX)
-                > budget.max_witness_bytes()
-            {
-                return Err(ReportValueError::TooManyBytes {
-                    field: "witness",
-                    max_bytes: u64::try_from(budget.max_witness_bytes()).unwrap_or(u64::MAX),
-                }
-                .into());
-            }
-        }
         witnesses.sort_by(|left, right| left.id().cmp(right.id()));
         if witnesses
             .windows(2)
@@ -4843,8 +5931,13 @@ impl PolicyFinding {
             completeness,
             primary,
             related,
-            related_truncated,
-            omitted_related_locations_lower_bound,
+            related_omissions: if omitted_related_locations_lower_bound == 0 {
+                brokk_bifrost_core::omission::OmissionCount::exact(0)
+            } else {
+                brokk_bifrost_core::omission::OmissionCount::lower_bound(
+                    omitted_related_locations_lower_bound,
+                )
+            },
             evidence,
             model_attribution: None,
             evidence_refs_truncated,
@@ -4858,11 +5951,17 @@ impl PolicyFinding {
             display_path: super::display_path::TaintDisplayPathCache::default(),
             suppression: None,
             inline_suppression: None,
+            evaluation_location: None,
             scope: None,
             diff: None,
             baseline: None,
         };
-        finding.validate_against_budget(budget)?;
+        validate_retained_witness_references(
+            &finding.evidence,
+            finding.cvss.as_ref(),
+            &finding.witnesses,
+        )?;
+        validate_cvss_finding_join_optional(finding.cvss.as_ref(), &finding.evidence)?;
         Ok(finding)
     }
 
@@ -4902,20 +6001,38 @@ impl PolicyFinding {
         self,
         attribution: Option<ModelAttribution>,
         budget: &PolicyBudget,
-    ) -> Result<Self, PolicyFindingError> {
+    ) -> Result<(Self, bool), PolicyFindingError> {
         match self
             .clone()
             .with_model_attribution(attribution.clone(), budget)
         {
             Err(error) if error.is_budget_limit_exceeded() && attribution.is_some() => {
+                let omitted = attribution
+                    .as_ref()
+                    .is_some_and(|value| !value.contributors.is_empty());
                 self.with_model_attribution(attribution.map(|value| value.without_detail()), budget)
+                    .map(|finding| (finding, omitted))
             }
-            result => result,
+            result => result.map(|finding| (finding, false)),
         }
     }
 
     pub const fn model_attribution(&self) -> Option<&ModelAttribution> {
         self.model_attribution.as_ref()
+    }
+
+    // All report renderers consume this canonical order. Semantic IDs can hash
+    // adapter-derived AST identities; source coordinates keep unrelated lever
+    // rotations from shuffling findings at distinct locations (#12026).
+    fn report_order_key(&self) -> (&str, Option<(u64, u64)>, &str, PolicyFindingId) {
+        (
+            self.primary.path(),
+            self.primary
+                .region()
+                .map(|region| (region.start_line(), region.start_column())),
+            self.policy_id.as_str(),
+            self.id,
+        )
     }
 
     pub const fn id(&self) -> PolicyFindingId {
@@ -4948,6 +6065,20 @@ impl PolicyFinding {
     pub const fn completeness(&self) -> &FindingCompleteness {
         &self.completeness
     }
+    /// The evaluation point when the rendered evidence has a different location.
+    /// Absent means equal to primary, including when replaying older reports.
+    pub const fn evaluation_location(&self) -> Option<&PolicySourceLocation> {
+        self.evaluation_location.as_ref()
+    }
+
+    pub(crate) fn with_evaluation_location(
+        mut self,
+        location: Option<PolicySourceLocation>,
+    ) -> Self {
+        self.evaluation_location = location.filter(|location| location != &self.primary);
+        self
+    }
+
     pub const fn primary(&self) -> &PolicySourceLocation {
         &self.primary
     }
@@ -4955,10 +6086,27 @@ impl PolicyFinding {
         &self.related
     }
     pub const fn related_truncated(&self) -> bool {
-        self.related_truncated
+        !self.related_omissions.is_empty()
     }
     pub const fn omitted_related_locations_lower_bound(&self) -> u64 {
-        self.omitted_related_locations_lower_bound
+        self.related_omissions.count()
+    }
+    pub const fn related_locations_omitted(&self) -> brokk_bifrost_core::omission::OmissionCount {
+        self.related_omissions
+    }
+
+    /// Refine the count guarantee without changing truncation or identity.
+    pub(crate) fn with_related_locations_omitted(
+        mut self,
+        omitted: brokk_bifrost_core::omission::OmissionCount,
+    ) -> Self {
+        assert_eq!(
+            self.related_omissions.count(),
+            omitted.count(),
+            "omission refinement keeps the validated count"
+        );
+        self.related_omissions = omitted;
+        self
     }
     pub const fn evidence(&self) -> &PolicyFindingEvidence {
         &self.evidence
@@ -5265,6 +6413,7 @@ impl RetainedSize for PolicyFinding {
             .saturating_add(retained_extra(&self.witnesses))
             .saturating_add(retained_extra(&self.suppression))
             .saturating_add(retained_extra(&self.inline_suppression))
+            .saturating_add(retained_extra(&self.evaluation_location))
             .saturating_add(retained_extra(&self.scope))
             .saturating_add(retained_extra(&self.diff))
             .saturating_add(retained_extra(&self.baseline))
@@ -5652,11 +6801,26 @@ pub struct SubjectSelectorEnumeration {
     pub enumeration: SubjectEnumeration,
 }
 
-/// Conservative spatial bound for findings that have not been ruled out.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+/// The complete domain of possible primary locations under the compiled
+/// subject association, not a claim about event discovery or solve completion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum FindingLocationBound {
     Unbounded,
+    Sites {
+        locations: Vec<PolicySourceLocation>,
+    },
+}
+
+pub const MAX_FINDING_LOCATION_SITES: usize = 256;
+
+impl RetainedSize for FindingLocationBound {
+    fn retained_size(&self) -> usize {
+        size_of::<Self>().saturating_add(match self {
+            Self::Unbounded => 0,
+            Self::Sites { locations } => retained_extra(locations),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -5680,6 +6844,7 @@ impl FurtherFindingsAbsent {
 pub enum SubjectVerdict {
     Selected {
         bindings: u32,
+        subject_keys: Vec<AnalysisSubjectRef>,
         findings: Vec<PolicyFindingId>,
         further_findings_absent: FurtherFindingsAbsent,
         finding_location_bound: Option<FindingLocationBound>,
@@ -5712,6 +6877,15 @@ impl PolicySubjectVerdict {
 pub struct SubjectVerdictOmissions {
     pub selected: u64,
     pub undecided: u64,
+}
+
+/// Count records, preserving collisions that share a public finding ID.
+pub(crate) fn finding_record_counts(findings: &[PolicyFinding]) -> HashMap<PolicyFindingId, usize> {
+    let mut counts = HashMap::new();
+    for finding in findings {
+        *counts.entry(finding.id()).or_default() += 1;
+    }
+    counts
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -5794,11 +6968,14 @@ impl PolicySubjectVerdicts {
             match &entry.verdict {
                 SubjectVerdict::Selected {
                     bindings,
+                    subject_keys,
                     findings,
                     further_findings_absent,
                     finding_location_bound,
                 } => {
                     if *bindings == 0
+                        || usize::try_from(*bindings).ok() != Some(subject_keys.len())
+                        || subject_keys.windows(2).any(|pair| pair[0] >= pair[1])
                         || matches!(
                             further_findings_absent,
                             FurtherFindingsAbsent::Partial { .. }
@@ -5813,14 +6990,27 @@ impl PolicySubjectVerdicts {
                     {
                         return Err(invalid());
                     }
+                    if let Some(FindingLocationBound::Sites { locations }) = finding_location_bound
+                        && (locations.len() > MAX_FINDING_LOCATION_SITES
+                            || locations
+                                .iter()
+                                .any(|location| location.byte_span().is_none())
+                            || locations.windows(2).any(|pair| pair[0] >= pair[1]))
+                    {
+                        return Err(invalid());
+                    }
                     for id in findings {
                         if !ids.contains(id) || !referenced.insert((&entry.selector, *id)) {
                             return Err(invalid());
                         }
                     }
                 }
-                SubjectVerdict::Undecided { reasons, .. } => {
-                    if reasons.is_empty()
+                SubjectVerdict::Undecided {
+                    reasons,
+                    finding_location_bound,
+                } => {
+                    if !matches!(finding_location_bound, FindingLocationBound::Unbounded)
+                        || reasons.is_empty()
                         || reasons.iter().any(String::is_empty)
                         || reasons.windows(2).any(|pair| pair[0] >= pair[1])
                     {
@@ -5833,7 +7023,25 @@ impl PolicySubjectVerdicts {
     }
 
     /// Drop every referenced finding the run did not retain.
-    pub(crate) fn retain_findings(&mut self, retained: &HashSet<PolicyFindingId>) {
+    pub(crate) fn retain_findings(
+        &mut self,
+        original_counts: &HashMap<PolicyFindingId, usize>,
+        retained_findings: &[PolicyFinding],
+    ) {
+        self.retain_finding_counts(original_counts, &finding_record_counts(retained_findings));
+    }
+
+    pub(crate) fn retain_finding_counts(
+        &mut self,
+        original_counts: &HashMap<PolicyFindingId, usize>,
+        retained_counts: &HashMap<PolicyFindingId, usize>,
+    ) {
+        for (id, original_count) in original_counts {
+            if retained_counts.get(id).copied().unwrap_or(0) < *original_count {
+                self.mark_finding_incomplete(*id);
+            }
+        }
+        let retained = retained_counts.keys().copied().collect::<HashSet<_>>();
         let dropped = self
             .entries
             .iter()
@@ -5850,6 +7058,15 @@ impl PolicySubjectVerdicts {
     }
 
     pub(crate) fn drop_finding(&mut self, id: PolicyFindingId) {
+        self.mark_finding_incomplete(id);
+        for entry in &mut self.entries {
+            if let SubjectVerdict::Selected { findings, .. } = &mut entry.verdict {
+                findings.retain(|finding| *finding != id);
+            }
+        }
+    }
+
+    fn mark_finding_incomplete(&mut self, id: PolicyFindingId) {
         for entry in &mut self.entries {
             if let SubjectVerdict::Selected {
                 findings,
@@ -5859,7 +7076,6 @@ impl PolicySubjectVerdicts {
             } = &mut entry.verdict
                 && findings.contains(&id)
             {
-                findings.retain(|finding| *finding != id);
                 let mut reasons = match further_findings_absent {
                     FurtherFindingsAbsent::Complete => Vec::new(),
                     FurtherFindingsAbsent::Partial { reasons } => std::mem::take(reasons),
@@ -5885,14 +7101,19 @@ impl RetainedSize for PolicySubjectVerdict {
         let extra = match &self.verdict {
             SubjectVerdict::Selected {
                 findings,
+                subject_keys,
                 further_findings_absent,
+                finding_location_bound,
                 ..
             } => {
                 let reasons = match further_findings_absent {
                     FurtherFindingsAbsent::Complete => 0,
                     FurtherFindingsAbsent::Partial { reasons } => retained_extra(reasons),
                 };
-                retained_extra(findings).saturating_add(reasons)
+                retained_extra(findings)
+                    .saturating_add(reasons)
+                    .saturating_add(retained_extra(subject_keys))
+                    .saturating_add(retained_extra(finding_location_bound))
             }
             SubjectVerdict::Undecided { reasons, .. } => retained_extra(reasons),
         };
@@ -5923,6 +7144,9 @@ pub struct PolicyRun {
     subjects: Option<PolicySubjectVerdicts>,
     diagnostics: Vec<PolicyDiagnostic>,
     diagnostics_truncated: bool,
+    worst_omitted_diagnostic_severity: Option<PolicyDiagnosticSeverity>,
+    diagnostic_causes: PolicyDiagnosticCauses,
+    budget_refusals: Vec<String>,
     /// The negative-proof obligations this run could not meet, in the
     /// evaluation's own deterministic order. Always serialized, so a reader
     /// can tell "no obligation was unmet" from "this schema has no such
@@ -5988,6 +7212,124 @@ fn validate_finding_for_run(
 }
 
 impl PolicyRun {
+    /// Measure the closed admission-metadata envelope from this policy's actual
+    /// identities and subject sites. This clone is used only for reservation.
+    pub(crate) fn reserve_admission_metadata(
+        &mut self,
+        findings: &[&PolicyFinding],
+        dimensions: &[&str],
+    ) {
+        self.replace_findings(findings.iter().map(|finding| (*finding).clone()).collect());
+        self.take_findings();
+        for dimension in dimensions {
+            self.work
+                .add_retention_omitted_findings_for_dimension(dimension, u64::MAX);
+        }
+        for dimension in [
+            "policy/findings",
+            "policy/retained_report_bytes",
+            "batch/retained_report_bytes",
+        ] {
+            self.record_budget_refusal(dimension);
+        }
+        for reason in [
+            PolicyIncompleteReason::BatchFindingLimit,
+            PolicyIncompleteReason::ReportRetentionBudget,
+            PolicyIncompleteReason::StableAnchorUnavailable,
+            PolicyIncompleteReason::PartialDiscovery,
+        ] {
+            self.mark_inconclusive(reason);
+        }
+        self.record_detail_retention();
+        if let Some(subjects) = &mut self.subjects {
+            for finding in findings {
+                subjects.mark_finding_incomplete(finding.id());
+            }
+        }
+        self.refresh_retained_bytes();
+    }
+
+    /// Exhaust optional finding and diagnostic detail before any finding drop.
+    pub(crate) fn omit_optional_detail(&mut self) -> bool {
+        let mut changed = false;
+        for finding in &mut self.findings {
+            changed |= finding.omit_optional_detail();
+        }
+        if !self.diagnostics.is_empty() {
+            changed = true;
+            self.worst_omitted_diagnostic_severity = self.worst_omitted_diagnostic_severity.max(
+                self.diagnostics
+                    .iter()
+                    .map(PolicyDiagnostic::severity)
+                    .max(),
+            );
+            self.diagnostics = Vec::new();
+            self.diagnostics_truncated = true;
+        }
+        if changed {
+            self.record_detail_retention();
+            self.record_budget_refusal("policy/retained_report_bytes");
+        }
+        self.refresh_retained_bytes();
+        changed
+    }
+
+    /// Record detail incompleteness; the caller records its budget dimension.
+    pub(crate) fn record_detail_retention(&mut self) {
+        self.completion
+            .mark_inconclusive(PolicyIncompleteReason::ReportRetentionBudget);
+        self.diagnostic_causes.insert_with_execution_cause(
+            &PolicyDiagnosticCode::ReportRetentionBudget,
+            PolicyDiagnosticImpact::RunIncomplete,
+            PolicyDiagnosticExecutionCause::DetailRetention,
+        );
+    }
+
+    fn certify_retention_causes(&mut self) {
+        let omitted = self.work.retention_omitted_findings_lower_bound > 0;
+        let mut impacts = Vec::new();
+        let index = CodeQueryDiagnosticCode::LABELS.len()
+            + ROOT_DIAGNOSTIC_LABELS
+                .iter()
+                .position(|label| *label == "report_retention_budget")
+                .expect("registered retention code");
+        for cause in self.diagnostic_causes.iter() {
+            if cause.code == "report_retention_budget" {
+                impacts.push(cause.impact);
+            }
+        }
+        for cause in 0..DIAGNOSTIC_EXECUTION_CAUSES.len() {
+            for impact in 0..DIAGNOSTIC_IMPACTS.len() {
+                let bit = (index * DIAGNOSTIC_EXECUTION_CAUSES.len() + cause)
+                    * DIAGNOSTIC_IMPACTS.len()
+                    + impact;
+                self.diagnostic_causes.words[bit / 64] &= !(1u64 << (bit % 64));
+            }
+        }
+        let cause = if omitted {
+            PolicyDiagnosticExecutionCause::FindingRetention
+        } else if self.work.omitted_findings_lower_bound == 0 {
+            PolicyDiagnosticExecutionCause::DetailRetention
+        } else {
+            PolicyDiagnosticExecutionCause::Unknown
+        };
+        if omitted {
+            impacts.push(PolicyDiagnosticImpact::RunIncomplete);
+        }
+        for impact in impacts {
+            self.diagnostic_causes.insert_with_execution_cause(
+                &PolicyDiagnosticCode::ReportRetentionBudget,
+                impact,
+                cause,
+            );
+        }
+        for diagnostic in &mut self.diagnostics {
+            if matches!(diagnostic.code, PolicyDiagnosticCode::ReportRetentionBudget) {
+                diagnostic.execution_cause = cause;
+            }
+        }
+    }
+
     /// Attach the request-time subject projection after validating its finding joins.
     pub fn with_subjects(
         mut self,
@@ -6009,6 +7351,7 @@ impl PolicyRun {
     fn fit_subjects_to_budget(&mut self, budget: &PolicyBudget) -> Result<(), PolicyRunError> {
         self.refresh_retained_bytes();
         while self.retained_size() > budget.max_retained_report_bytes() {
+            self.record_budget_refusal("policy/retained_report_bytes");
             self.completion
                 .mark_inconclusive(PolicyIncompleteReason::PartialDiscovery);
             let subjects = self
@@ -6077,7 +7420,12 @@ impl PolicyRun {
 
     pub fn drop_subject_finding(&mut self, id: PolicyFindingId) {
         if let Some(subjects) = &mut self.subjects {
-            subjects.drop_finding(id);
+            if self.findings.iter().any(|finding| finding.id() == id) {
+                // Omission does not sever a surviving record's subject link.
+                subjects.mark_finding_incomplete(id);
+            } else {
+                subjects.drop_finding(id);
+            }
             if subjects.has_uncertainty() {
                 self.completion
                     .mark_inconclusive(PolicyIncompleteReason::PartialDiscovery);
@@ -6115,11 +7463,18 @@ impl PolicyRun {
         analysis_type: PolicyAnalysisType,
         completion: PolicyRunCompletion,
         mut findings: Vec<PolicyFinding>,
-        mut diagnostics: Vec<PolicyDiagnostic>,
+        diagnostics: impl Into<PolicyDiagnostics>,
         diagnostics_truncated: bool,
         mut work: PolicyWorkReport,
         budget: &PolicyBudget,
     ) -> Result<Self, PolicyRunError> {
+        let PolicyDiagnostics {
+            entries: mut diagnostics,
+            causes: mut diagnostic_causes,
+            worst_omitted_diagnostic_severity,
+        } = diagnostics.into();
+        let diagnostics_truncated =
+            diagnostics_truncated || worst_omitted_diagnostic_severity.is_some();
         completion.validate()?;
         if findings.len() > budget.max_findings() {
             return Err(PolicyRunError::TooManyFindings {
@@ -6129,12 +7484,19 @@ impl PolicyRun {
         for finding in &findings {
             validate_finding_for_run(finding, &policy_id, policy_hash, analysis_type, budget)?;
         }
-        findings.sort_by_key(PolicyFinding::id);
-        if findings.windows(2).any(|pair| pair[0].id == pair[1].id) {
-            return Err(PolicyRunError::DuplicateFindingId);
-        }
+        findings.sort_by(|left, right| left.report_order_key().cmp(&right.report_order_key()));
         tighten_vec(&mut findings);
 
+        if let Some(duplicates) = duplicate_finding_id_diagnostic(&policy_id, &findings) {
+            diagnostic_causes.insert_with_execution_cause(
+                duplicates.code(),
+                duplicates.impact(),
+                duplicates.execution_cause,
+            );
+            if diagnostics.len() < budget.max_diagnostics() {
+                diagnostics.push(duplicates);
+            }
+        }
         diagnostics.sort_by(compare_policy_diagnostics);
         diagnostics.dedup();
         if diagnostics.len() > budget.max_diagnostics() {
@@ -6148,7 +7510,7 @@ impl PolicyRun {
             return Err(PolicyRunError::CompletionDoesNotReflectDiagnostics);
         }
         for diagnostic in &diagnostics {
-            if !completion_allows_diagnostic_impact(&completion, diagnostic.impact) {
+            if !completion_allows_diagnostic(&completion, diagnostic) {
                 return Err(PolicyRunError::CompletionDoesNotReflectDiagnostics);
             }
         }
@@ -6175,6 +7537,7 @@ impl PolicyRun {
             work.omitted_findings_lower_bound,
             0,
         );
+        work.record_finding_refusals(&findings);
         let mut run = Self {
             policy_id,
             policy_hash,
@@ -6184,6 +7547,9 @@ impl PolicyRun {
             subjects: None,
             diagnostics,
             diagnostics_truncated,
+            worst_omitted_diagnostic_severity,
+            diagnostic_causes,
+            budget_refusals: std::mem::take(&mut work.budget_refusals),
             obligations: Vec::new(),
             obligations_truncated: false,
             omitted_obligations_lower_bound: 0,
@@ -6193,6 +7559,14 @@ impl PolicyRun {
             scope: None,
             unknown_verdict: None,
         };
+        for diagnostic in &run.diagnostics {
+            for lane in &diagnostic.budget_refusals {
+                if !run.budget_refusals.contains(lane) {
+                    run.budget_refusals.push(lane.clone());
+                }
+            }
+        }
+        run.budget_refusals.sort();
         run.refresh_retained_bytes();
         if run.retained_size() > budget.max_retained_report_bytes() {
             return Err(PolicyRunError::RetainedReportBytesExceeded {
@@ -6200,6 +7574,47 @@ impl PolicyRun {
             });
         }
         Ok(run)
+    }
+
+    pub const fn worst_omitted_diagnostic_severity(&self) -> Option<PolicyDiagnosticSeverity> {
+        self.worst_omitted_diagnostic_severity
+    }
+    pub(crate) fn record_omitted_diagnostic_severity(
+        &mut self,
+        severity: PolicyDiagnosticSeverity,
+    ) {
+        self.worst_omitted_diagnostic_severity =
+            self.worst_omitted_diagnostic_severity.max(Some(severity));
+        self.diagnostics_truncated = true;
+        self.refresh_retained_bytes();
+    }
+    pub(crate) fn merge_diagnostic_summary(&mut self, summary: &PolicyDiagnostics) {
+        debug_assert!(summary.entries.is_empty());
+        self.diagnostic_causes.union(summary.causes());
+        if let Some(severity) = summary.worst_omitted_diagnostic_severity() {
+            self.record_omitted_diagnostic_severity(severity);
+        }
+        self.refresh_retained_bytes();
+    }
+    pub fn diagnostic_causes(&self) -> &PolicyDiagnosticCauses {
+        &self.diagnostic_causes
+    }
+
+    pub(crate) fn merge_diagnostic_causes(&mut self, causes: &PolicyDiagnosticCauses) {
+        self.diagnostic_causes.union(causes);
+        self.refresh_retained_bytes();
+    }
+
+    pub fn budget_refusals(&self) -> &[String] {
+        &self.budget_refusals
+    }
+
+    pub(crate) fn record_budget_refusal(&mut self, dimension: &str) {
+        if !self.budget_refusals.iter().any(|known| known == dimension) {
+            self.budget_refusals.push(dimension.to_string());
+            self.budget_refusals.sort();
+        }
+        self.refresh_retained_bytes();
     }
 
     pub const fn policy_id(&self) -> &PolicyId {
@@ -6224,6 +7639,12 @@ impl PolicyRun {
 
     pub(crate) fn work_mut(&mut self) -> &mut PolicyWorkReport {
         &mut self.work
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn into_report_parts_for_test(mut self) -> (Self, Vec<PolicyFinding>) {
+        let findings = self.take_findings();
+        (self, findings)
     }
 
     pub(crate) fn take_findings(&mut self) -> Vec<PolicyFinding> {
@@ -6348,14 +7769,20 @@ impl PolicyRun {
                     .map(|reason| reason.label())
                     .collect::<Vec<_>>()
                     .join(", ");
-                self.diagnostics.push(PolicyDiagnostic::new_bounded(
+                let diagnostic = PolicyDiagnostic::new_bounded(
                     PolicyDiagnosticCode::UnknownVerdictFailClosed,
                     PolicyDiagnosticSeverity::Error,
                     PolicyDiagnosticImpact::RunIncomplete,
                     format!(
                         "the policy declares (on-unknown :verdict fail-closed) and this run reached no verdict: {named}"
                     ),
-                ));
+                );
+                self.diagnostic_causes.insert_with_execution_cause(
+                    diagnostic.code(),
+                    diagnostic.impact(),
+                    diagnostic.execution_cause,
+                );
+                self.diagnostics.push(diagnostic);
                 self.diagnostics.sort_by(compare_policy_diagnostics);
                 self.diagnostics.dedup();
                 if self.diagnostics.len() > budget.max_diagnostics() {
@@ -6444,50 +7871,82 @@ impl PolicyRun {
     /// partial list mid-rewrite would drop findings still to be restored.
     pub(crate) fn reconcile_subject_findings(
         &mut self,
+        original_counts: &HashMap<PolicyFindingId, usize>,
         budget: &PolicyBudget,
     ) -> Result<(), PolicyRunError> {
         let Some(subjects) = &mut self.subjects else {
             return Ok(());
         };
-        let retained = self
-            .findings
-            .iter()
-            .map(PolicyFinding::id)
-            .collect::<HashSet<_>>();
-        subjects.retain_findings(&retained);
+        subjects.retain_findings(original_counts, &self.findings);
         // The reasons a dropped reference adds can take a run that fit over
         // its budget again.
         self.fit_subjects_to_budget(budget)
     }
 
     pub(crate) fn replace_findings(&mut self, mut findings: Vec<PolicyFinding>) {
-        findings.sort_by_key(PolicyFinding::id);
+        findings.sort_by(|left, right| left.report_order_key().cmp(&right.report_order_key()));
         tighten_vec(&mut findings);
+        self.diagnostics
+            .retain(|diagnostic| diagnostic.code != PolicyDiagnosticCode::DuplicateFindingId);
+        if let Some(duplicates) = duplicate_finding_id_diagnostic(&self.policy_id, &findings) {
+            self.diagnostic_causes.insert_with_execution_cause(
+                duplicates.code(),
+                duplicates.impact(),
+                duplicates.execution_cause,
+            );
+            self.diagnostics.push(duplicates);
+            self.diagnostics.sort_by(compare_policy_diagnostics);
+        }
         self.findings = findings;
         self.work.retained_findings = u64::try_from(self.findings.len()).unwrap_or(u64::MAX);
         self.refresh_retained_bytes();
     }
 
-    pub(crate) fn increment_omitted_findings(&mut self) {
-        self.add_omitted_findings(1);
+    pub(crate) fn add_retention_omitted_findings(&mut self, count: u64) {
+        self.work.add_retention_omitted_findings(count);
+        self.refresh_retained_bytes();
     }
 
+    #[cfg(test)]
     pub(crate) fn add_omitted_findings(&mut self, count: u64) {
-        self.work.omitted_findings_lower_bound =
-            self.work.omitted_findings_lower_bound.saturating_add(count);
+        self.work.add_omitted_findings(count);
         self.refresh_retained_bytes();
     }
 
     pub(crate) fn replace_diagnostics(
         &mut self,
-        mut diagnostics: Vec<PolicyDiagnostic>,
+        diagnostics: impl Into<PolicyDiagnostics>,
         truncated: bool,
     ) {
+        let PolicyDiagnostics {
+            entries: mut diagnostics,
+            causes,
+            worst_omitted_diagnostic_severity,
+        } = diagnostics.into();
+        let replaced = self
+            .diagnostics
+            .iter()
+            .filter(|old| !diagnostics.contains(old))
+            .map(PolicyDiagnostic::severity)
+            .max();
+        self.worst_omitted_diagnostic_severity = self
+            .worst_omitted_diagnostic_severity
+            .max(worst_omitted_diagnostic_severity)
+            .max(replaced);
+        self.diagnostic_causes.union(&causes);
         diagnostics.sort_by(compare_policy_diagnostics);
         diagnostics.dedup();
         tighten_vec(&mut diagnostics);
+        for diagnostic in &diagnostics {
+            for lane in &diagnostic.budget_refusals {
+                if !self.budget_refusals.contains(lane) {
+                    self.budget_refusals.push(lane.clone());
+                }
+            }
+        }
+        self.budget_refusals.sort();
         self.diagnostics = diagnostics;
-        self.diagnostics_truncated |= truncated;
+        self.diagnostics_truncated |= truncated || self.worst_omitted_diagnostic_severity.is_some();
         self.refresh_retained_bytes();
     }
 
@@ -6497,6 +7956,13 @@ impl PolicyRun {
     }
 
     fn refresh_retained_bytes(&mut self) {
+        self.certify_retention_causes();
+        debug_assert!(
+            self.diagnostics
+                .iter()
+                .all(|diagnostic| self.diagnostic_causes.contains(diagnostic)),
+            "retained diagnostic missing from its producer cause set"
+        );
         self.set_retained_report_bytes(self.retained_size());
     }
 }
@@ -6509,6 +7975,8 @@ impl RetainedSize for PolicyRun {
             .saturating_add(retained_extra(&self.completion))
             .saturating_add(retained_extra(&self.findings))
             .saturating_add(retained_extra(&self.diagnostics))
+            .saturating_add(retained_extra(&self.diagnostic_causes))
+            .saturating_add(retained_extra(&self.budget_refusals))
             .saturating_add(retained_extra(&self.obligations))
             .saturating_add(retained_extra(&self.work))
             .saturating_add(retained_extra(&self.authored_arm_closures))
@@ -6561,7 +8029,6 @@ pub enum PolicyRunError {
         max: usize,
     },
     FindingJoinMismatch,
-    DuplicateFindingId,
     CompletionDoesNotReflectDiagnostics,
     WeakFindingRequiresIncompleteRun,
     OmittedFindingsRequireIncompleteRun,
@@ -6608,9 +8075,6 @@ impl fmt::Display for PolicyRunError {
             Self::FindingJoinMismatch => formatter.write_str(
                 "every finding must join its run by policy ID, policy hash, and analysis type",
             ),
-            Self::DuplicateFindingId => {
-                formatter.write_str("policy run finding identifiers must be unique")
-            }
             Self::CompletionDoesNotReflectDiagnostics => formatter.write_str(
                 "policy run completion does not reflect retained or omitted diagnostic impact",
             ),
@@ -6939,7 +8403,7 @@ fn append_classification_refs<'a>(
 }
 
 pub(crate) fn insert_policy_diagnostic_bounded(
-    diagnostics: &mut Vec<PolicyDiagnostic>,
+    diagnostics: &mut PolicyDiagnostics,
     diagnostic: PolicyDiagnostic,
     max_diagnostics: usize,
 ) -> bool {
@@ -6954,7 +8418,7 @@ pub(crate) fn insert_policy_diagnostic_bounded(
 }
 
 pub(crate) fn normalize_policy_diagnostics_bounded(
-    diagnostics: &mut Vec<PolicyDiagnostic>,
+    diagnostics: &mut PolicyDiagnostics,
     max_diagnostics: usize,
 ) -> bool {
     diagnostics.sort_by(compare_policy_diagnostics);
@@ -6967,7 +8431,9 @@ pub(crate) fn normalize_policy_diagnostics_bounded(
     // one: the report then named some abstention causes and hid the rest
     // (#2356). Folding by declared reason family keeps every cause with the
     // count of the sites it covers, and only then does the cap apply.
-    fold_policy_diagnostics_by_family(diagnostics);
+    if let Some(severity) = fold_policy_diagnostics_by_family(&mut diagnostics.entries) {
+        diagnostics.record_omitted_severity(severity);
+    }
     if diagnostics.len() > max_diagnostics {
         diagnostics.truncate(max_diagnostics);
     }
@@ -6981,9 +8447,15 @@ pub(crate) fn normalize_policy_diagnostics_bounded(
 /// message and loses the per-site locations, because a message and a location
 /// that named one site cannot stand for many. A family that covers exactly one
 /// diagnostic keeps that diagnostic verbatim.
-fn fold_policy_diagnostics_by_family(diagnostics: &mut Vec<PolicyDiagnostic>) {
+fn fold_policy_diagnostics_by_family(
+    diagnostics: &mut Vec<PolicyDiagnostic>,
+) -> Option<PolicyDiagnosticSeverity> {
+    let mut worst = None;
     let mut folded = Vec::<PolicyDiagnostic>::new();
-    for diagnostic in std::mem::take(diagnostics) {
+    for mut diagnostic in std::mem::take(diagnostics) {
+        if diagnostic.family_count > 1 {
+            diagnostic.omitted_related_locations_lower_bound = RelatedLocationOmissions::Unknown;
+        }
         match folded.iter_mut().find(|candidate| {
             candidate.family == diagnostic.family
                 && candidate.code == diagnostic.code
@@ -6991,9 +8463,51 @@ fn fold_policy_diagnostics_by_family(diagnostics: &mut Vec<PolicyDiagnostic>) {
                 && candidate.impact == diagnostic.impact
         }) {
             Some(existing) => {
+                worst = worst.max(Some(diagnostic.severity()));
+                existing.budget_refusals.extend(diagnostic.budget_refusals);
+                existing.budget_refusals.sort();
+                existing.budget_refusals.dedup();
+                tighten_vec(&mut existing.budget_refusals);
+                for root in diagnostic.exhausted_roots {
+                    existing.retain_exhausted_root_witness(root);
+                }
+                tighten_vec(&mut existing.exhausted_roots);
+                let merged_omissions = match (
+                    existing.omitted_related_locations_lower_bound,
+                    diagnostic.omitted_related_locations_lower_bound,
+                ) {
+                    (RelatedLocationOmissions::Known(0), RelatedLocationOmissions::Known(0))
+                        if existing.related.is_empty() && diagnostic.related.is_empty() =>
+                    {
+                        RelatedLocationOmissions::Known(0)
+                    }
+                    _ => RelatedLocationOmissions::Unknown,
+                };
+                existing.related.clear();
                 existing.family_count = existing
                     .family_count
                     .saturating_add(diagnostic.family_count);
+                existing.omitted_related_locations_lower_bound = merged_omissions;
+                let has_non_utf8_refusal = existing
+                    .refusal_omissions
+                    .is_some_and(|omissions| omissions.has_non_utf8_refusal)
+                    || diagnostic
+                        .refusal_omissions
+                        .is_some_and(|omissions| omissions.has_non_utf8_refusal);
+                existing.refusal_omissions =
+                    if merged_omissions == RelatedLocationOmissions::Known(0) {
+                        // Keep an already rendered zero inventory; only the
+                        // native-name presence flag needs to be joined.
+                        existing
+                            .refusal_omissions
+                            .or(diagnostic.refusal_omissions)
+                            .map(|mut omissions| {
+                                omissions.has_non_utf8_refusal = has_non_utf8_refusal;
+                                omissions
+                            })
+                    } else {
+                        None
+                    };
             }
             None => folded.push(diagnostic),
         }
@@ -7002,12 +8516,21 @@ fn fold_policy_diagnostics_by_family(diagnostics: &mut Vec<PolicyDiagnostic>) {
         if entry.family_count > 1 {
             entry.message = entry.family.clone();
             entry.primary = None;
+            if !entry.related.is_empty()
+                && entry.omitted_related_locations_lower_bound == RelatedLocationOmissions::Known(0)
+            {
+                entry.omitted_related_locations_lower_bound = RelatedLocationOmissions::Unknown;
+            }
             entry.related = Vec::new();
+            if entry.omitted_related_locations_lower_bound == RelatedLocationOmissions::Unknown {
+                entry.refusal_omissions = None;
+            }
             entry.selector_gap = None;
         }
     }
     folded.sort_by(compare_policy_diagnostics);
     *diagnostics = folded;
+    worst
 }
 
 fn compare_policy_diagnostics(
@@ -7032,6 +8555,72 @@ fn compare_policy_diagnostics(
             &right.primary,
             &right.related,
         ))
+}
+
+/// The advisory for findings of one run that share an id, or `None` when every
+/// id in `findings` is distinct. `findings` may be in any order.
+///
+/// A collision is a defect in a finding anchor, not in the analyzed code, so
+/// it never aborts the run or drops a finding: both findings are kept and this
+/// names the rule, the id and every colliding anchor (#12029).
+pub(crate) fn duplicate_finding_id_diagnostic(
+    policy_id: &PolicyId,
+    findings: &[PolicyFinding],
+) -> Option<PolicyDiagnostic> {
+    let mut by_id = findings.iter().collect::<Vec<_>>();
+    by_id.sort_by_key(|finding| finding.id);
+    let mut collisions = Vec::new();
+    for group in by_id.chunk_by(|left, right| left.id == right.id) {
+        if group.len() < 2 {
+            continue;
+        }
+        let anchors = group
+            .iter()
+            .map(|finding| match &finding.evidence {
+                PolicyFindingEvidence::Match { evidence } => format!("{:?}", evidence.anchor()),
+                PolicyFindingEvidence::Taint { evidence } => format!("{:?}", evidence.anchor()),
+                PolicyFindingEvidence::Flow { evidence } => format!("{:?}", evidence.anchor()),
+                PolicyFindingEvidence::Typestate { evidence } => {
+                    format!("{:?}", evidence.anchor())
+                }
+                PolicyFindingEvidence::Assertion { evidence } => {
+                    format!("{:?}", evidence.anchor())
+                }
+            })
+            .collect::<Vec<_>>();
+        collisions.push(format!(
+            "{} from anchors [{}]",
+            group[0].id,
+            anchors.join(", ")
+        ));
+    }
+    (!collisions.is_empty()).then(|| {
+        PolicyDiagnostic::new_bounded(
+            PolicyDiagnosticCode::DuplicateFindingId,
+            PolicyDiagnosticSeverity::Warning,
+            PolicyDiagnosticImpact::Advisory,
+            brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+                format_args!(
+                    "policy {policy_id} gave more than one finding the same id; all are kept: {}",
+                    collisions.join("; ")
+                ),
+                format_args!(
+                    "policy {policy_id} gave more than one finding the same id; all are kept"
+                ),
+                collisions.iter(),
+            ),
+        )
+    })
+}
+
+pub(crate) fn completion_allows_diagnostic(
+    completion: &PolicyRunCompletion,
+    diagnostic: &PolicyDiagnostic,
+) -> bool {
+    (matches!(completion, PolicyRunCompletion::Failed { .. })
+        && diagnostic.impact == PolicyDiagnosticImpact::RunIncomplete
+        && matches!(diagnostic.code, PolicyDiagnosticCode::InternalError { .. }))
+        || completion_allows_diagnostic_impact(completion, diagnostic.impact)
 }
 
 pub(crate) fn completion_allows_diagnostic_impact(
@@ -7067,6 +8656,7 @@ fn completion_has_incomplete_reason(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReportValueError {
+    TypestatePartialScopeRequired,
     EmptyIdentifier,
     EmptyCollection {
         field: &'static str,
@@ -7107,6 +8697,7 @@ pub enum ReportValueError {
 impl fmt::Display for ReportValueError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::TypestatePartialScopeRequired => formatter.write_str("policy typestate partial requires explicit scope"),
             Self::EmptyIdentifier => formatter.write_str("report identifier must not be empty"),
             Self::EmptyCollection { field } => {
                 write!(formatter, "{field} must contain at least one item")
@@ -7304,19 +8895,87 @@ impl RetainedSize for CertaintyReason {
     }
 }
 
+impl RetainedSize for PolicyDiagnosticCode {
+    fn retained_size(&self) -> usize {
+        size_of::<Self>().saturating_add(match self {
+            Self::CodeQuery {
+                code:
+                    PolicyCodeQueryDiagnostic::TypestatePartial {
+                        scope: TypestatePartialScope::Root { subject_key },
+                    },
+            } => retained_extra(subject_key),
+            Self::InternalError {
+                policy_id, error, ..
+            } => retained_extra(policy_id).saturating_add(error.capacity()),
+            _ => 0,
+        })
+    }
+}
+
+impl RetainedSize for brokk_bifrost_rql::structural::CodeQueryExhaustedRoot {
+    fn retained_size(&self) -> usize {
+        size_of::<Self>()
+            .saturating_add(self.path.capacity())
+            .saturating_add(self.lane.capacity())
+            .saturating_add(self.procedure.as_ref().map_or(0, String::capacity))
+            .saturating_add(self.stage.as_ref().map_or(0, String::capacity))
+    }
+}
+
+impl RetainedSize for PolicySelectorGapSummary {
+    fn retained_size(&self) -> usize {
+        size_of::<Self>()
+            .saturating_add(self.endpoint.capacity())
+            .saturating_add(
+                self.codes
+                    .capacity()
+                    .saturating_mul(size_of::<(String, u64)>())
+                    .saturating_add(
+                        self.codes
+                            .iter()
+                            .map(|(code, _)| code.capacity())
+                            .sum::<usize>(),
+                    ),
+            )
+            .saturating_add(
+                self.sites
+                    .capacity()
+                    .saturating_mul(size_of::<(String, Option<usize>)>())
+                    .saturating_add(
+                        self.sites
+                            .iter()
+                            .map(|(site, _)| site.capacity())
+                            .sum::<usize>(),
+                    ),
+            )
+    }
+}
+
 impl RetainedSize for PolicyDiagnostic {
     fn retained_size(&self) -> usize {
         size_of::<Self>()
+            .saturating_add(retained_extra(&self.code))
             .saturating_add(self.family.capacity())
             .saturating_add(self.message.capacity())
+            .saturating_add(retained_extra(&self.exhausted_roots))
+            .saturating_add(retained_extra(&self.budget_refusals))
             .saturating_add(retained_extra(&self.primary))
             .saturating_add(retained_extra(&self.related))
+            .saturating_add(retained_extra(&self.selector_gap))
     }
 }
 
 impl RetainedSize for PolicyWorkReport {
     fn retained_size(&self) -> usize {
-        size_of::<Self>().saturating_add(retained_extra(&self.metrics))
+        size_of::<Self>()
+            .saturating_add(
+                self.retention_omitted_findings_by_dimension
+                    .keys()
+                    .map(|key| size_of::<String>() + size_of::<u64>() + key.capacity())
+                    .sum::<usize>(),
+            )
+            .saturating_add(retained_extra(&self.metrics))
+            .saturating_add(retained_extra(&self.budget_refusals))
     }
 }
 
@@ -7346,7 +9005,6 @@ fixed_report_retained_size!(
     ProofState,
     PolicyLocationRelationship,
     WitnessStepKind,
-    PolicyDiagnosticCode,
     PolicyDiagnosticImpact,
     PolicyDiagnosticSeverity,
     PolicyWorkUnit,
@@ -7916,9 +9574,14 @@ impl<'de> de::DeserializeSeed<'de> for PolicyFindingSeed<'_> {
             certainty: FindingCertainty,
             completeness: FindingCompleteness,
             primary: PolicySourceLocation,
+            #[serde(default)]
+            evaluation_location: Option<PolicySourceLocation>,
             related: Vec<RelatedPolicyLocation>,
             related_truncated: bool,
             omitted_related_locations_lower_bound: u64,
+            #[serde(default)]
+            omitted_related_locations_exactness:
+                Option<brokk_bifrost_core::omission::OmissionExactness>,
             evidence: PolicyFindingEvidence,
             #[serde(default)]
             model_attribution: Option<ModelAttribution>,
@@ -7959,6 +9622,24 @@ impl<'de> de::DeserializeSeed<'de> for PolicyFindingSeed<'_> {
             }
         }
 
+        let related_omissions = match wire.omitted_related_locations_exactness {
+            Some(brokk_bifrost_core::omission::OmissionExactness::Exact) => {
+                brokk_bifrost_core::omission::OmissionCount::exact(
+                    wire.omitted_related_locations_lower_bound,
+                )
+            }
+            Some(brokk_bifrost_core::omission::OmissionExactness::LowerBound) => {
+                brokk_bifrost_core::omission::OmissionCount::lower_bound(
+                    wire.omitted_related_locations_lower_bound,
+                )
+            }
+            None if wire.omitted_related_locations_lower_bound == 0 => {
+                brokk_bifrost_core::omission::OmissionCount::exact(0)
+            }
+            None => brokk_bifrost_core::omission::OmissionCount::lower_bound(
+                wire.omitted_related_locations_lower_bound,
+            ),
+        };
         let finding = PolicyFinding::try_new(
             wire.policy_id,
             wire.policy_hash,
@@ -7983,6 +9664,8 @@ impl<'de> de::DeserializeSeed<'de> for PolicyFindingSeed<'_> {
             self.budget,
         )
         .map_err(de::Error::custom)?
+        .with_related_locations_omitted(related_omissions)
+        .with_evaluation_location(wire.evaluation_location)
         .with_value_type_barrier_notes(wire.value_type_barrier_notes, self.budget)
         .map_err(de::Error::custom)?
         .with_model_attribution(wire.model_attribution, self.budget)
@@ -8027,6 +9710,47 @@ mod tests {
     use crate::resolved::LoadedPolicy;
     use brokk_bifrost_test_macros::hardwon;
     use serde_json::json;
+
+    #[test]
+    #[hardwon("#12316: selector_gap heap was not counted in PolicyDiagnostic RetainedSize")]
+    fn selector_gap_heap_is_included_in_diagnostic_retained_size() {
+        let endpoint = "endpoint".repeat(256);
+        let codes = (0..128).map(|index| format!("code-{index}-{}", "c".repeat(64)));
+        let sites = (0..128).map(|index| (format!("site-{index}-{}", "s".repeat(64)), Some(index)));
+        let summary = PolicySelectorGapSummary::new(endpoint, codes, sites);
+        let summary_size = summary.retained_size();
+        let string_capacities = summary.endpoint.capacity()
+            + summary
+                .codes
+                .iter()
+                .map(|(code, _)| code.capacity())
+                .sum::<usize>()
+            + summary
+                .sites
+                .iter()
+                .map(|(site, _)| site.capacity())
+                .sum::<usize>();
+        let diagnostic = PolicyDiagnostic::try_new(
+            PolicyDiagnosticCode::EvaluationFailure,
+            PolicyDiagnosticSeverity::Warning,
+            PolicyDiagnosticImpact::RunIncomplete,
+            "selector gap",
+            None,
+            Vec::new(),
+            RelatedLocationOmissions::Known(0),
+        )
+        .unwrap();
+        // The diagnostic's own size_of already holds the summary's inline
+        // headers, so attaching it adds exactly the summary's heap bytes.
+        let summary_heap = summary_size - size_of::<PolicySelectorGapSummary>();
+        let with_gap = diagnostic.clone().with_selector_gap(summary);
+        assert_eq!(
+            with_gap.retained_size() - diagnostic.retained_size(),
+            summary_heap
+        );
+        // The heap covers the vector allocations as well as every string.
+        assert!(summary_heap > string_capacities);
+    }
 
     /// #2779: an oversized message must be truncated, never rejected, so a
     /// run-level failure explanation cannot vanish for being too complete.
@@ -8077,6 +9801,7 @@ mod tests {
                         format!("{family} at site {site}"),
                         None,
                         Vec::new(),
+                        crate::RelatedLocationOmissions::Known(0),
                     )
                     .expect("a valid diagnostic"),
                 );
@@ -8084,6 +9809,7 @@ mod tests {
         }
         let produced = u64::try_from(diagnostics.len()).expect("the fixture is small");
 
+        let mut diagnostics: PolicyDiagnostics = diagnostics.into();
         let truncated = normalize_policy_diagnostics_bounded(&mut diagnostics, 256);
 
         assert!(truncated, "a condensed list is not the verbatim list");
@@ -8248,6 +9974,226 @@ mod tests {
         )
         .unwrap();
         CvssAssessmentSet::try_new(vec![variant], None).unwrap()
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12105: default staging rejected optional evidence before it could be shed"
+    )]
+    fn retention_sheds_detail_above_default_before_admission() {
+        let budget = PolicyBudget::default();
+        let loaded = loaded_match_policy();
+        let mut finding =
+            finding_with(&loaded, match_evidence(), Vec::new(), None, &budget).unwrap();
+        for i in 0..3 {
+            let refs = (0..150)
+                .map(|j| {
+                    EvidenceRef::try_new("query", format!("{}-{i}-{j}", "a".repeat(100))).unwrap()
+                })
+                .collect();
+            finding.related.push(
+                RelatedPolicyLocation::try_new(
+                    PolicyLocationRelationship::CallTarget,
+                    location(),
+                    refs,
+                )
+                .unwrap(),
+            );
+        }
+        assert!(
+            finding
+                .validate_against_budget(&budget)
+                .unwrap_err()
+                .is_budget_limit_exceeded()
+        );
+        let id = finding.id;
+        let (shed, detail_omitted) = PolicyFinding::try_new_shedding_detail(
+            finding.policy_id,
+            finding.policy_hash,
+            finding.severity,
+            finding.message,
+            finding.classification,
+            finding.certainty,
+            finding.completeness,
+            finding.primary,
+            finding.related,
+            false,
+            0,
+            finding.evidence,
+            false,
+            0,
+            finding.cvss,
+            finding.organizational_risk,
+            finding.proof,
+            finding.witnesses,
+            false,
+            0,
+            &budget,
+        )
+        .unwrap();
+        assert!(detail_omitted);
+        assert_eq!(shed.id, id);
+        assert!(shed.related.is_empty());
+        assert_eq!(round_trip(&shed, &budget), shed);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12105: semantic projection omissions were mislabeled report-budget loss"
+    )]
+    fn retention_origin_is_structural_and_semantic_omissions_stay_semantic() {
+        for (semantic, retention, detail, expected) in [
+            (1, 0, false, None),
+            (
+                0,
+                0,
+                true,
+                Some(PolicyDiagnosticExecutionCause::DetailRetention),
+            ),
+            (1, 0, true, Some(PolicyDiagnosticExecutionCause::Unknown)),
+            (
+                0,
+                1,
+                false,
+                Some(PolicyDiagnosticExecutionCause::FindingRetention),
+            ),
+            (
+                1,
+                1,
+                true,
+                Some(PolicyDiagnosticExecutionCause::FindingRetention),
+            ),
+        ] {
+            let mut run = run_at(
+                PolicyRunCompletion::inconclusive(vec![PolicyIncompleteReason::PartialDiscovery])
+                    .unwrap(),
+            );
+            let mut diagnostics: PolicyDiagnostics = vec![
+                PolicyDiagnostic::new_bounded(
+                    PolicyDiagnosticCode::EvaluationFailure,
+                    PolicyDiagnosticSeverity::Warning,
+                    PolicyDiagnosticImpact::RunIncomplete,
+                    "semantic projection gap",
+                )
+                .with_execution_cause(None),
+            ]
+            .into();
+            if detail {
+                diagnostics.push(PolicyDiagnostic::new_bounded(
+                    PolicyDiagnosticCode::ReportRetentionBudget,
+                    PolicyDiagnosticSeverity::Warning,
+                    PolicyDiagnosticImpact::RunIncomplete,
+                    "detail omitted",
+                ));
+            }
+            run.replace_diagnostics(diagnostics, detail);
+            run.add_omitted_findings(semantic);
+            run.add_retention_omitted_findings(retention);
+            assert_eq!(
+                run.work.omitted_findings_lower_bound(),
+                semantic + retention
+            );
+            assert_eq!(run.work.semantic_omitted_findings_lower_bound(), semantic);
+            assert_eq!(run.work.retention_omitted_findings_lower_bound(), retention);
+            assert_eq!(
+                run.diagnostic_causes
+                    .iter()
+                    .find(|c| c.code == "report_retention_budget")
+                    .map(|c| c.execution_cause),
+                expected
+            );
+            assert!(
+                run.diagnostic_causes
+                    .iter()
+                    .any(|c| c.code == "evaluation_failure"
+                        && c.execution_cause == PolicyDiagnosticExecutionCause::Known(None))
+            );
+            run.work.set_retention(0, semantic + retention + 2, 0);
+            assert_eq!(
+                run.work.semantic_omitted_findings_lower_bound(),
+                semantic + 2
+            );
+            assert_eq!(run.work.retention_omitted_findings_lower_bound(), retention);
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12105: report retention dropped identities before exhausting optional detail"
+    )]
+    fn retention_detail_preserves_identity_and_drop_is_certified() {
+        let budget = PolicyBudget::default();
+        let loaded = loaded_match_policy();
+        let mut finding =
+            finding_with(&loaded, match_evidence(), Vec::new(), None, &budget).unwrap();
+        finding.related.push(
+            RelatedPolicyLocation::try_new(
+                PolicyLocationRelationship::CallTarget,
+                location(),
+                Vec::new(),
+            )
+            .unwrap(),
+        );
+        let original = serde_json::to_value(&finding).unwrap();
+        let mut run = PolicyRun::try_new(
+            loaded.definition().metadata.id.clone(),
+            loaded.semantic_hash(),
+            PolicyAnalysisType::Match,
+            PolicyRunCompletion::Complete,
+            vec![finding],
+            Vec::new(),
+            false,
+            PolicyWorkReport::default(),
+            &budget,
+        )
+        .unwrap();
+        assert!(run.omit_optional_detail());
+        assert_eq!(run.findings.len(), 1);
+        let trimmed = serde_json::to_value(&run.findings[0]).unwrap();
+        for key in [
+            "id",
+            "identity_stability",
+            "policy_id",
+            "policy_hash",
+            "primary",
+        ] {
+            assert_eq!(
+                serde_json::to_vec(&original[key]).unwrap(),
+                serde_json::to_vec(&trimmed[key]).unwrap(),
+                "{key}"
+            );
+        }
+        let anchor = &original["evidence"]["evidence"]["anchor"];
+        assert!(!anchor.is_null());
+        assert_eq!(
+            serde_json::to_vec(anchor).unwrap(),
+            serde_json::to_vec(&trimmed["evidence"]["evidence"]["anchor"]).unwrap()
+        );
+        assert_eq!(round_trip(&run.findings[0], &budget), run.findings[0]);
+        assert!(
+            run.diagnostic_causes
+                .iter()
+                .any(|c| c.execution_cause == PolicyDiagnosticExecutionCause::DetailRetention)
+        );
+        assert!(!run.omit_optional_detail(), "minimal form is idempotent");
+        run.findings.clear();
+        run.add_retention_omitted_findings(1);
+        assert!(
+            run.diagnostic_causes
+                .iter()
+                .any(|c| c.execution_cause == PolicyDiagnosticExecutionCause::FindingRetention)
+        );
+        assert!(
+            !run.diagnostic_causes
+                .iter()
+                .any(|c| c.execution_cause == PolicyDiagnosticExecutionCause::DetailRetention)
+        );
+        run.replace_diagnostics(Vec::new(), true);
+        assert!(
+            run.diagnostic_causes
+                .iter()
+                .any(|c| c.execution_cause == PolicyDiagnosticExecutionCause::FindingRetention)
+        );
     }
 
     fn finding_with(
@@ -8978,10 +10924,11 @@ mod tests {
                 message,
                 None,
                 Vec::new(),
+                crate::RelatedLocationOmissions::Known(0),
             )
             .unwrap()
         };
-        let mut retained = Vec::new();
+        let mut retained = PolicyDiagnostics::new();
         assert!(!insert_policy_diagnostic_bounded(
             &mut retained,
             diagnostic("same cause"),
@@ -9016,6 +10963,214 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#10984: diagnostic family folding must preserve omission knowledge")]
+    fn folded_diagnostics_preserve_only_proven_empty_related_knowledge() {
+        let related = |path: &str| {
+            RelatedPolicyLocation::try_new(
+                PolicyLocationRelationship::Evidence,
+                PolicySourceLocation::artifact(WorkspaceRelativePath::new(path).unwrap()),
+                Vec::new(),
+            )
+            .unwrap()
+        };
+        let diagnostic = |message: &str,
+                          related: Vec<RelatedPolicyLocation>,
+                          omissions: RelatedLocationOmissions| {
+            PolicyDiagnostic::try_new(
+                PolicyDiagnosticCode::EvaluationFailure,
+                PolicyDiagnosticSeverity::Warning,
+                PolicyDiagnosticImpact::RunIncomplete,
+                message,
+                None,
+                related,
+                omissions,
+            )
+            .unwrap()
+        };
+
+        let duplicate = related("src/shared.rs");
+        let mut exact: PolicyDiagnostics = vec![
+            diagnostic(
+                "first",
+                vec![duplicate.clone()],
+                RelatedLocationOmissions::Known(0),
+            ),
+            diagnostic(
+                "second",
+                vec![duplicate],
+                RelatedLocationOmissions::Known(0),
+            ),
+        ]
+        .into();
+        assert!(normalize_policy_diagnostics_bounded(&mut exact, 1));
+        assert_eq!(exact.len(), 1);
+        assert!(exact[0].related().is_empty());
+        assert_eq!(exact[0].family_count(), 2);
+        assert_eq!(
+            exact[0].omitted_related_locations_lower_bound(),
+            RelatedLocationOmissions::Unknown
+        );
+
+        let mut unknown: PolicyDiagnostics = vec![
+            diagnostic(
+                "first",
+                vec![related("src/first.rs")],
+                RelatedLocationOmissions::Known(0),
+            ),
+            diagnostic(
+                "second",
+                vec![related("src/second.rs")],
+                RelatedLocationOmissions::Unknown,
+            ),
+        ]
+        .into();
+        assert!(normalize_policy_diagnostics_bounded(&mut unknown, 1));
+        assert_eq!(
+            unknown[0].omitted_related_locations_lower_bound(),
+            RelatedLocationOmissions::Unknown
+        );
+
+        let mut lower_bounds: PolicyDiagnostics = vec![
+            diagnostic("first", Vec::new(), RelatedLocationOmissions::Known(3)),
+            diagnostic("second", Vec::new(), RelatedLocationOmissions::Known(4)),
+        ]
+        .into();
+        assert!(normalize_policy_diagnostics_bounded(&mut lower_bounds, 1));
+        assert_eq!(
+            lower_bounds[0].omitted_related_locations_lower_bound(),
+            RelatedLocationOmissions::Unknown
+        );
+
+        let mut empty: PolicyDiagnostics = vec![
+            diagnostic("first", Vec::new(), RelatedLocationOmissions::Known(0)),
+            diagnostic("second", Vec::new(), RelatedLocationOmissions::Known(0)),
+        ]
+        .into();
+        assert!(normalize_policy_diagnostics_bounded(&mut empty, 1));
+        assert_eq!(
+            empty[0].omitted_related_locations_lower_bound(),
+            RelatedLocationOmissions::Known(0)
+        );
+        assert!(empty[0].related().is_empty());
+
+        let mut already_aggregated: PolicyDiagnostics = vec![
+            diagnostic(
+                "aggregated",
+                vec![related("src/representative.rs")],
+                RelatedLocationOmissions::Known(0),
+            )
+            .with_family_count(2),
+            diagnostic(
+                "another representative",
+                vec![related("src/another.rs")],
+                RelatedLocationOmissions::Known(0),
+            ),
+        ]
+        .into();
+        assert!(normalize_policy_diagnostics_bounded(
+            &mut already_aggregated,
+            1
+        ));
+        assert_eq!(
+            already_aggregated[0].omitted_related_locations_lower_bound(),
+            RelatedLocationOmissions::Unknown
+        );
+        assert!(already_aggregated[0].related().is_empty());
+        // Later aggregate retention may fold diagnostics after exact refusal
+        // metadata was attached. Losing locations must also lose exact counts.
+        for already_folded in [false, true] {
+            let counts = CallBindingRefusalOmissions {
+                bound_trimmed: 1,
+                unrepresentable_path: 2,
+                has_non_utf8_refusal: true,
+            };
+            let mut first = diagnostic(
+                "first refusal",
+                Vec::new(),
+                RelatedLocationOmissions::Known(0),
+            )
+            .with_refusal_subjects(
+                None,
+                vec![related("src/first.rs")],
+                counts,
+                "call-binding refusal: CalleeUnresolved",
+            );
+            if already_folded {
+                first = first.with_family_count(2);
+            }
+            let second = diagnostic(
+                "second refusal",
+                Vec::new(),
+                RelatedLocationOmissions::Known(0),
+            )
+            .with_refusal_subjects(
+                None,
+                vec![related("src/second.rs")],
+                counts,
+                "call-binding refusal: CalleeUnresolved",
+            );
+            let mut refusals: PolicyDiagnostics = vec![first, second].into();
+            let mut baseline = refusals.clone();
+            for entry in &mut baseline.entries {
+                entry.refusal_omissions = None;
+            }
+            assert!(normalize_policy_diagnostics_bounded(&mut refusals, 1));
+            assert!(normalize_policy_diagnostics_bounded(&mut baseline, 1));
+            assert_eq!(
+                refusals, baseline,
+                "the existing cap decision and folded public fields stay unchanged"
+            );
+            assert_eq!(
+                refusals[0].omitted_related_locations_lower_bound(),
+                RelatedLocationOmissions::Unknown
+            );
+            assert!(refusals[0].refusal_omissions().is_none());
+            assert!(
+                serde_json::to_value(&refusals[0])
+                    .unwrap()
+                    .get("refusal_omissions")
+                    .is_none()
+            );
+        }
+        // A proven zero remains exact. Keep the ORed native-name flag even
+        // when a generic member of the same family had no refusal metadata.
+        for (left, right) in [
+            (Some(false), Some(true)),
+            (Some(true), Some(false)),
+            (None, Some(true)),
+            (Some(true), None),
+        ] {
+            let make = |message, flag| {
+                let diagnostic =
+                    diagnostic(message, Vec::new(), RelatedLocationOmissions::Known(0));
+                match flag {
+                    Some(has_non_utf8_refusal) => diagnostic.with_refusal_subjects(
+                        None,
+                        Vec::new(),
+                        CallBindingRefusalOmissions {
+                            has_non_utf8_refusal,
+                            ..Default::default()
+                        },
+                        "call-binding refusal: CalleeUnresolved",
+                    ),
+                    None => diagnostic,
+                }
+            };
+            let mut refusals: PolicyDiagnostics =
+                vec![make("first", left), make("second", right)].into();
+            assert!(normalize_policy_diagnostics_bounded(&mut refusals, 1));
+            assert_eq!(
+                refusals[0].omitted_related_locations_lower_bound(),
+                RelatedLocationOmissions::Known(0)
+            );
+            let counts = refusals[0].refusal_omissions().unwrap();
+            assert_eq!(counts.bound_trimmed, 0);
+            assert_eq!(counts.unrepresentable_path, 0);
+            assert!(counts.has_non_utf8_refusal);
+        }
+    }
+
+    #[test]
     fn an_assertion_finding_reads_back_as_the_finding_that_was_written() {
         let budget = PolicyBudget::default();
         let loaded = loaded_match_policy();
@@ -9032,6 +11187,141 @@ mod tests {
         let finding = finding_with(&loaded, match_evidence(), Vec::new(), None, &budget).unwrap();
 
         assert_eq!(round_trip(&finding, &budget), finding);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11267: source omission metadata disappeared from policy JSON and renderers"
+    )]
+    fn related_omissions_round_trip_and_leave_ids_fingerprints_and_baselines_unchanged() {
+        use brokk_bifrost_core::omission::OmissionCount;
+        let budget = PolicyBudget::default();
+        let loaded = loaded_match_policy();
+        let original = finding_with(&loaded, match_evidence(), Vec::new(), None, &budget).unwrap();
+        let report = |finding: PolicyFinding| {
+            let run = PolicyRun::try_new(
+                loaded.definition().metadata.id.clone(),
+                loaded.semantic_hash(),
+                PolicyAnalysisType::Match,
+                PolicyRunCompletion::Complete,
+                vec![finding],
+                Vec::new(),
+                false,
+                PolicyWorkReport::default(),
+                &budget,
+            )
+            .unwrap();
+            crate::PolicyReportDocument::try_new(
+                vec![crate::PolicyRuleDescriptor::from_loaded(&loaded)],
+                vec![run],
+                Vec::new(),
+                false,
+                0,
+                None,
+            )
+            .unwrap()
+        };
+        let baseline = |report: &crate::PolicyReportDocument| {
+            crate::PolicyBaselineDocument::from_completed_report(
+                report,
+                "reviewed",
+                None,
+                "2026-11-10".parse().unwrap(),
+            )
+            .unwrap()
+            .0
+            .to_canonical_json()
+        };
+        let sarif = |report: &crate::PolicyReportDocument| {
+            let mut bytes = Vec::new();
+            crate::write_policy_sarif(
+                report,
+                &crate::SarifToolIdentity::default(),
+                &mut bytes,
+                usize::MAX,
+            )
+            .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+        let original_report = report(original.clone());
+        let original_sarif = sarif(&original_report);
+        for count in [OmissionCount::exact(2), OmissionCount::lower_bound(1)] {
+            let mut changed = original.clone();
+            changed.related_omissions = count;
+            changed.completeness = FindingCompleteness::partial(vec![
+                FindingIncompleteReason::RelatedLocationsTruncated,
+            ])
+            .unwrap();
+            assert_eq!(changed.id(), original.id());
+            assert_eq!(round_trip(&changed, &budget), changed);
+            let json = serde_json::to_value(&changed).unwrap();
+            assert_eq!(json["related_truncated"], true);
+            assert_eq!(json["omitted_related_locations_lower_bound"], count.count());
+            assert_eq!(
+                json["omitted_related_locations_exactness"],
+                serde_json::to_value(count.exactness()).unwrap()
+            );
+            let changed_report = report(changed);
+            assert_eq!(baseline(&changed_report), baseline(&original_report));
+            let changed_sarif = sarif(&changed_report);
+            assert_eq!(
+                changed_sarif["runs"][0]["results"][0]["partialFingerprints"],
+                original_sarif["runs"][0]["results"][0]["partialFingerprints"]
+            );
+            assert_eq!(
+                changed_sarif["runs"][0]["results"][0]["properties"]["bifrost.omittedRelatedLocationsExactness"],
+                serde_json::to_value(count.exactness()).unwrap()
+            );
+            let mut bytes = Vec::new();
+            crate::write_policy_human(
+                &changed_report,
+                &crate::HumanRenderOptions::new(
+                    crate::HumanRenderDetail::Verbose,
+                    Default::default(),
+                ),
+                &mut bytes,
+                usize::MAX,
+            )
+            .unwrap();
+            let text = String::from_utf8(bytes).unwrap();
+            let expected = match count.exactness() {
+                brokk_bifrost_core::omission::OmissionExactness::Exact => {
+                    "related locations truncated: 2 omitted"
+                }
+                brokk_bifrost_core::omission::OmissionExactness::LowerBound => {
+                    "related locations truncated: at least 1 omitted"
+                }
+            };
+            assert!(text.contains(expected), "{text}");
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11266: moved evidence must preserve finding identity and old report replay"
+    )]
+    fn evaluation_location_replays_without_changing_identity() {
+        let budget = PolicyBudget::default();
+        let loaded = loaded_match_policy();
+        let finding = finding_with(&loaded, match_evidence(), Vec::new(), None, &budget).unwrap();
+        let bytes = serde_json::to_string(&finding).unwrap();
+        assert!(!bytes.contains("evaluation_location"));
+        assert_eq!(round_trip(&finding, &budget), finding);
+        let same = finding
+            .clone()
+            .with_evaluation_location(Some(finding.primary().clone()));
+        assert_eq!(serde_json::to_string(&same).unwrap(), bytes);
+        let evaluation = PolicySourceLocation::span(
+            path(),
+            PolicyByteSpan::new(0, 10).unwrap(),
+            PolicyDisplayRegion::new(1, 1, 2, 9).unwrap(),
+        );
+        let moved = finding
+            .clone()
+            .with_evaluation_location(Some(evaluation.clone()));
+        assert_eq!(moved.id(), finding.id());
+        assert_eq!(round_trip(&moved, &budget), moved);
+        assert_eq!(moved.evaluation_location(), Some(&evaluation));
     }
 
     #[test]
@@ -9684,6 +11974,7 @@ mod tests {
     mod finding_report_contract_tests {
         include!("finding_report_contract_tests.rs");
     }
+    mod diagnostic_cause_contract_tests;
     mod run_contract_tests;
 }
 
@@ -9694,3 +11985,35 @@ mod finding_ancestry_byte_contract_tests;
 #[cfg(test)]
 #[path = "finding_closure_budget_tests.rs"]
 mod finding_closure_budget_tests;
+
+/// Bound and escape diagnostic prose without dropping the structured error collection.
+pub(crate) fn safe_report_text(value: String) -> String {
+    const MAX_BYTES: usize = 4_096;
+    let mut escaped = String::with_capacity(value.len().min(MAX_BYTES));
+    for character in value.chars() {
+        let unsafe_character = character.is_control()
+            || matches!(
+                character,
+                '\u{061c}'
+                    | '\u{200e}'
+                    | '\u{200f}'
+                    | '\u{0080}'..='\u{009f}'
+                    | '\u{202a}'..='\u{202e}'
+                    | '\u{2066}'..='\u{2069}'
+            );
+        let fragment = if unsafe_character {
+            format!("\\u{{{:X}}}", u32::from(character))
+        } else {
+            character.to_string()
+        };
+        if escaped.len().saturating_add(fragment.len()) > MAX_BYTES {
+            break;
+        }
+        escaped.push_str(&fragment);
+    }
+    if escaped.is_empty() {
+        "policy operation failed".to_string()
+    } else {
+        escaped
+    }
+}

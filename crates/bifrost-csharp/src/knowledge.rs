@@ -9,6 +9,12 @@ use brokk_bifrost_core::analyzer::structural::spec::StructuralSpec;
 pub struct CSharpKnowledge;
 
 impl LanguageKnowledge for CSharpKnowledge {
+    // ECMA-334 13.6.2: an implicitly typed local takes its initializer's type.
+    // Later assignments change observed values, never the local's static type.
+    fn inferred_local_type_is_initializer_type(&self) -> bool {
+        true
+    }
+
     fn unmarked_member_stores(
         &self,
     ) -> brokk_bifrost_core::analyzer::language_knowledge::UnmarkedMemberStores {

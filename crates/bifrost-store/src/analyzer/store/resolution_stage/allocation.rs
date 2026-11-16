@@ -172,6 +172,11 @@ fn lookup(
 
 /// Reserve a contiguous run, or observe an existing key with count zero. The
 /// exhausted sentinel is representable; only actual emitted keys must fit u32.
+/// Stage Local numbers are unique store-local coordinates within one selected
+/// request, not content-determined identities: they depend on admission history.
+/// Before entering a persisted key or digest, translate them through the
+/// content identity authority in
+/// `resolution/canonical_identity.rs` (`selected_identity_content_digest`).
 #[doc(hidden)]
 pub fn reserve(
     connection: &Connection,

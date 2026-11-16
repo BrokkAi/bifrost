@@ -10,6 +10,9 @@ pub mod open_packs;
 // both. It stays ungated so its hermetic scoring-core unit tests run under a
 // plain `cargo test`.
 pub mod owasp_benchmark;
+// The OpenSSF CVE Benchmark scorer (#11041), built on the OWASP harness's
+// policy rendering and evaluation.
+pub mod ossf_cve_benchmark;
 #[cfg(feature = "python")]
 mod python_module;
 mod shard;
@@ -142,7 +145,7 @@ pub fn open_pack_engine_profile() -> serde_json::Value {
         "model_set_sha256": brokk_bifrost_analysis::analyzer::canonical_hash::lower_hex_string(&model_set.finalize().into()),
         "capability_contract_version": 1,
         "schemas": {
-            "policy_document": [policy::schema::POLICY_SCHEMA_VERSION],
+            "policy_document": policy::schema::supported_policy_schema_versions(),
             "rql": rql::query::schema::supported_query_schema_versions(),
             "builtin_catalog": [policy::BUILT_IN_MANIFEST_SCHEMA_VERSION],
             "policy_bundle": [],

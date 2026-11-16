@@ -809,6 +809,7 @@ fn augment_go_api_surface(
                     generic_arity,
                     parameter_types: &parameter_types,
                     parameter_variadics: &parameter_variadics,
+                    extension_receiver: None,
                     return_type,
                 });
                 members.push(promoted);
@@ -1031,6 +1032,7 @@ fn module_type_drafts(
                         hierarchy: Vec::new(),
                         aliases,
                         extension_surfaces: Vec::new(),
+                        rust_stability: None,
                         guard: None,
                         locator: Locator::artifact(&path, &name),
                     },
@@ -1295,6 +1297,7 @@ fn collect_type_draft(
                 .into_iter()
                 .collect(),
             extension_surfaces: Vec::new(),
+            rust_stability: None,
             guard: None,
             locator: Locator::artifact(&parsed.path, &canonical_name),
         },
@@ -1662,6 +1665,7 @@ fn push_member(
         generic_arity,
         parameter_types: &parameter_types,
         parameter_variadics: &parameter_variadics,
+        extension_receiver: None,
         return_type,
     });
     let referenced_type_ids = signature
@@ -1701,6 +1705,7 @@ fn push_member(
             extension_receiver: None,
             extension_receiver_constraints: Vec::new(),
             aliases: Vec::new(),
+            rust_stability: None,
             guard: None,
             locator,
         },
@@ -2815,6 +2820,7 @@ func Slices(seq Box[[]byte]) {}
                     parameter_arity: 1,
                     parameter_types: std::slice::from_ref(&parameter),
                     parameter_variadics: &[false],
+                    extension_receiver: None,
                     return_type: returns.as_ref(),
                 });
                 assert_eq!(member.id, expected_id, "{name}");

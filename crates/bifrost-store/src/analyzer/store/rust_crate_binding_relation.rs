@@ -42,12 +42,67 @@ CREATE TEMP TABLE IF NOT EXISTS cr_binding_uncertain(
 CREATE TEMP TABLE IF NOT EXISTS cr_binding_certain(
  node INTEGER NOT NULL,target_crate_key BLOB NOT NULL,target_module_path TEXT NOT NULL,target_name TEXT NOT NULL,
  PRIMARY KEY(node,target_crate_key,target_module_path,target_name)) WITHOUT ROWID;
+-- An import whose path crosses a module name that resolves to more than one
+-- module, or crosses a binding that is itself unproven, proves nothing (rustc
+-- E0659). UNPROVEN_PATHS_SQL lists those imports.
+-- For a named import, and for a binding that depends on one, the whole node is
+-- unproven (UNPROVEN_SQL). A glob import expands to names the importing module
+-- cannot know, so its endpoints are unproven one by one
+-- (UNPROVEN_GLOB_ENDPOINTS_SQL). Unproven endpoints keep their place in the
+-- canonical relation but are never projected as exact exports or bindings.
+CREATE TEMP TABLE IF NOT EXISTS cr_binding_unproven_paths(
+ blob_id INTEGER NOT NULL,import_ordinal INTEGER NOT NULL,module_path TEXT NOT NULL,
+ PRIMARY KEY(blob_id,import_ordinal,module_path)) WITHOUT ROWID;
+CREATE TEMP TABLE IF NOT EXISTS cr_binding_unproven(node INTEGER PRIMARY KEY);
+-- A foreign name form is unique only when its declaring unit publishes exactly
+-- one declaration. Do not treat a legacy export representative as proof of
+-- uniqueness. Own duplicate gaps below preserve alternatives that publication
+-- would otherwise collapse.
+CREATE TEMP VIEW IF NOT EXISTS cr_binding_rankless_conflicts AS
+ SELECT DISTINCT node.node FROM cr_binding_targets target
+ CROSS JOIN cr_binding_nodes node ON node.owner=target.owner
+ AND node.namespace=target.namespace AND node.name=target.name
+ CROSS JOIN cr_identity identity
+ WHERE target.target_crate_key<>identity.crate_key AND target.target_name<>'self'
+ AND (SELECT COUNT(*) FROM rust_crate_binding_alternatives declaration
+ JOIN rust_crate_binding_owners owner ON owner.owner_id=declaration.owner_id
+ JOIN cr_foreign dependency ON dependency.topology_id=owner.topology_id
+ WHERE dependency.crate_key=target.target_crate_key AND owner.kind='module'
+ AND owner.module_path=target.target_module_path AND declaration.namespace=target.namespace
+ AND declaration.name=target.target_name AND declaration.origin='declaration')<>1
+ UNION
+ -- Record own duplicates before publication chooses a representative for the
+ -- legacy export table. Consumers must retain this conflict even when the
+ -- rankless endpoint is identical along two import routes.
+ SELECT node.node FROM cr_binding_nodes node
+ CROSS JOIN cr_binding_owners owner ON owner.owner=node.owner
+ CROSS JOIN cr_identity identity ON identity.crate_key=owner.crate_key
+ JOIN cr_exports declaration ON declaration.crate_key=owner.crate_key
+ AND declaration.module_path=owner.module_path AND declaration.namespace=node.namespace
+ AND declaration.name=node.name AND declaration.origin='declaration'
+ WHERE owner.blob_id=0 AND owner.binder_scope=0
+ GROUP BY node.node HAVING COUNT(*)>1;
+CREATE TEMP TABLE IF NOT EXISTS cr_binding_unproven_endpoints(
+ node INTEGER NOT NULL,target_crate_key BLOB NOT NULL,target_module_path TEXT NOT NULL,target_name TEXT NOT NULL,
+ PRIMARY KEY(node,target_crate_key,target_module_path,target_name)) WITHOUT ROWID;
+CREATE TEMP VIEW IF NOT EXISTS cr_binding_unproven_imports AS
+ SELECT DISTINCT source.blob_id,source.import_ordinal,source.module_path
+ FROM cr_binding_imports source
+ CROSS JOIN cr_binding_destinations destination ON destination.blob_id=source.blob_id
+ AND destination.import_ordinal=source.import_ordinal AND destination.module_path=source.module_path
+ CROSS JOIN cr_binding_nodes node ON node.owner=destination.owner AND node.name=source.bound_name
+ WHERE source.is_glob=0 AND (EXISTS(SELECT 1 FROM cr_binding_unproven unproven WHERE unproven.node=node.node)
+ OR EXISTS(SELECT 1 FROM cr_binding_unproven_endpoints bad WHERE bad.node=node.node));
 CREATE TEMP VIEW IF NOT EXISTS cr_binding_exact_targets AS
  SELECT target.* FROM cr_binding_targets target CROSS JOIN cr_binding_nodes node
  ON node.owner=target.owner AND node.namespace=target.namespace AND node.name=target.name
  CROSS JOIN cr_binding_certain proof ON proof.node=node.node
  AND proof.target_crate_key=target.target_crate_key
- AND proof.target_module_path=target.target_module_path AND proof.target_name=target.target_name;
+ AND proof.target_module_path=target.target_module_path AND proof.target_name=target.target_name
+ WHERE NOT EXISTS(SELECT 1 FROM cr_binding_unproven unproven WHERE unproven.node=node.node)
+ AND NOT EXISTS(SELECT 1 FROM cr_binding_unproven_endpoints bad WHERE bad.node=node.node
+ AND bad.target_crate_key=target.target_crate_key AND bad.target_module_path=target.target_module_path
+ AND bad.target_name=target.target_name);
 
 CREATE TEMP TABLE IF NOT EXISTS cr_binding_delta AS SELECT * FROM cr_binding_targets WHERE 0;
 CREATE UNIQUE INDEX IF NOT EXISTS cr_binding_delta_key ON cr_binding_delta(owner,namespace,name,target_crate_key,target_module_path,target_name);
@@ -100,6 +155,25 @@ CREATE TEMP TABLE IF NOT EXISTS cr_binding_open_names(
  reason TEXT NOT NULL DEFAULT 'OpenBoundary',boundary TEXT NOT NULL DEFAULT 'workspace_local',
  inventory TEXT NOT NULL DEFAULT 'null' CHECK(json_valid(inventory)),
  PRIMARY KEY(owner,namespace,name,reason,boundary,inventory)) WITHOUT ROWID;
+-- NULL namespace denotes an owner-wide opening. A binding inventory may
+-- instead open one namespace; feed those through existing open-name inputs.
+CREATE TEMP VIEW IF NOT EXISTS cr_binding_inventory_openness AS
+SELECT owner, CASE WHEN json_extract(evidence.value,'$.subject_level')='binding'
+                   THEN NULLIF(json_extract(evidence.value,'$.namespace'),'') END AS namespace
+FROM (
+ SELECT owner.owner AS owner,gap.detail AS detail
+ FROM cr_binding_owners owner CROSS JOIN cr_identity identity ON identity.crate_key=owner.crate_key
+ CROSS JOIN cr_gaps gap ON gap.subject=owner.module_path
+ AND gap.gap_kind IN ('open_export_inventory','unknown_activation','unresolved_visibility')
+ UNION ALL
+ SELECT owner.owner,gap.detail
+ FROM cr_binding_owners owner CROSS JOIN cr_foreign foreign_crate ON foreign_crate.crate_key=owner.crate_key
+ CROSS JOIN rust_crate_gaps gap ON gap.topology_id=foreign_crate.topology_id AND gap.subject=owner.module_path
+ AND gap.gap_kind IN ('open_export_inventory','unknown_activation','unresolved_visibility')
+) AS inventory
+-- Match gap_evidence: a flat detail is one item, not an empty inventory.
+CROSS JOIN json_each(CASE WHEN json_type(inventory.detail,'$.evidence') IS NOT NULL
+ THEN json_extract(inventory.detail,'$.evidence') ELSE json_array(json(inventory.detail)) END) evidence;
 CREATE TEMP TABLE IF NOT EXISTS cr_binding_fallback(
  owner INTEGER NOT NULL, namespace TEXT NOT NULL, name TEXT NOT NULL,
  PRIMARY KEY(owner,namespace,name)) WITHOUT ROWID;
@@ -182,9 +256,13 @@ CREATE TEMP TRIGGER IF NOT EXISTS cr_binding_lookup_queued AFTER INSERT ON cr_bi
  INSERT INTO cr_binding_lookup_new VALUES(NEW.blob_id,NEW.import_ordinal,NEW.module_path,NEW.position,NEW.owner,NEW.namespace,NEW.name);
 END;
 CREATE TEMP TRIGGER IF NOT EXISTS cr_binding_glob_names AFTER INSERT ON cr_binding_globs BEGIN
- INSERT OR IGNORE INTO cr_binding_names SELECT NEW.target_owner,namespace,name FROM cr_binding_names WHERE owner=NEW.owner;
- INSERT OR IGNORE INTO cr_binding_names SELECT NEW.owner,namespace,name FROM cr_binding_targets target WHERE owner=NEW.target_owner
- AND NOT EXISTS(SELECT 1 FROM cr_binding_masks mask WHERE mask.owner=NEW.owner AND mask.name<>target.name);
+ INSERT INTO cr_binding_names SELECT * FROM (
+SELECT NEW.target_owner,namespace,name FROM cr_binding_names WHERE owner=NEW.owner
+) WHERE true ON CONFLICT DO NOTHING;
+ INSERT INTO cr_binding_names SELECT * FROM (
+SELECT NEW.owner,namespace,name FROM cr_binding_targets target WHERE owner=NEW.target_owner
+ AND NOT EXISTS(SELECT 1 FROM cr_binding_masks mask WHERE mask.owner=NEW.owner AND mask.name<>target.name)
+) WHERE true ON CONFLICT DO NOTHING;
 END;
 CREATE INDEX IF NOT EXISTS cr_binding_lookups_name ON cr_binding_lookups(name,namespace,position);
 CREATE TEMP VIEW IF NOT EXISTS cr_binding_prelude_reads(blob_id,import_ordinal,module_path,position,owner,namespace,name,target_crate_key,target_module_path,target_name,declaration_blob_id,declaration_site,origin,visibility,restricted_module_path) AS
@@ -270,7 +348,7 @@ CREATE TEMP VIEW IF NOT EXISTS cr_binding_visibility_reads AS
 ";
 
 pub(super) const CLEAR_SQL: &str = "
-DELETE FROM cr_binding_absolute_sources; DELETE FROM cr_binding_certain; DELETE FROM cr_binding_uncertain; DELETE FROM cr_binding_masks; DELETE FROM cr_binding_destinations; DELETE FROM cr_binding_lookups; DELETE FROM cr_binding_nodes; DELETE FROM cr_binding_edges; DELETE FROM cr_binding_delta; DELETE FROM cr_binding_delta_next; DELETE FROM cr_binding_segments; DELETE FROM cr_binding_route_sources; DELETE FROM cr_binding_targets; DELETE FROM cr_binding_names;
+DELETE FROM cr_binding_absolute_sources; DELETE FROM cr_binding_unproven_paths; DELETE FROM cr_binding_unproven; DELETE FROM cr_binding_unproven_endpoints; DELETE FROM cr_binding_certain; DELETE FROM cr_binding_uncertain; DELETE FROM cr_binding_masks; DELETE FROM cr_binding_destinations; DELETE FROM cr_binding_lookups; DELETE FROM cr_binding_nodes; DELETE FROM cr_binding_edges; DELETE FROM cr_binding_delta; DELETE FROM cr_binding_delta_next; DELETE FROM cr_binding_segments; DELETE FROM cr_binding_route_sources; DELETE FROM cr_binding_targets; DELETE FROM cr_binding_names;
 DELETE FROM cr_binding_complete; DELETE FROM cr_binding_paths;
 DELETE FROM cr_binding_path_complete; DELETE FROM cr_binding_import_complete;
 DELETE FROM cr_binding_open_names; DELETE FROM cr_binding_fallback; DELETE FROM cr_binding_globs; DELETE FROM cr_binding_components;
@@ -281,15 +359,17 @@ DELETE FROM cr_binding_name_next;
 DELETE FROM cr_binding_lookup_new;
 ";
 
-pub(super) const OWNERS_SQL: &str = "INSERT OR IGNORE INTO cr_binding_owners(
+pub(super) const OWNERS_SQL: &str = "INSERT INTO cr_binding_owners(
  crate_key,module_path,blob_id,binder_scope)
- SELECT crate_key,container_path,0,0 FROM cr_containers_all
+ SELECT * FROM (
+SELECT crate_key,container_path,0,0 FROM cr_containers_all
  UNION SELECT crate_key,'crate',0,-1 FROM cr_identity
  UNION SELECT identity.crate_key,source.module_path,source.blob_id,source.binder_scope
  FROM cr_identity identity CROSS JOIN cr_source_imports source
  WHERE NOT EXISTS(SELECT 1 FROM cr_module_imports module
  WHERE module.blob_id=source.blob_id AND module.import_ordinal=source.import_ordinal
- AND module.module_path=source.module_path)";
+ AND module.module_path=source.module_path)
+) WHERE true ON CONFLICT DO NOTHING";
 
 pub(super) const PARENTS_SQL: &str = "UPDATE cr_binding_owners AS owner SET parent_owner=(
  SELECT parent.owner FROM cr_binding_owners parent
@@ -338,17 +418,20 @@ pub(super) const IMPORTS_SQL: &str = "INSERT INTO cr_binding_imports
  LEFT JOIN cr_restrictions restriction ON restriction.module_path=source.module_path
  AND restriction.visibility=source.visibility";
 
-pub(super) const SEED_SQL: &str = "INSERT OR IGNORE INTO cr_binding_targets
- SELECT owner.owner,exports.namespace,exports.name,exports.crate_key,exports.module_path,exports.name,
+pub(super) const SEED_SQL: &str = "INSERT INTO cr_binding_targets
+ SELECT * FROM (
+SELECT owner.owner,exports.namespace,exports.name,exports.crate_key,exports.module_path,exports.name,
  exports.declaration_blob_id,exports.declaration_site,'declaration',exports.visibility,exports.restricted_module_path
  FROM cr_exports exports CROSS JOIN cr_binding_owners owner
  ON owner.crate_key=exports.crate_key AND owner.module_path=exports.module_path
- AND owner.blob_id=0 AND owner.binder_scope=0 WHERE exports.origin='declaration'";
+ AND owner.blob_id=0 AND owner.binder_scope=0 WHERE exports.origin='declaration'
+) WHERE true ON CONFLICT DO NOTHING";
 
 // The root anchor is already lowered into the path's first local identity.
 // Read it by the source path/catalog keys; no syntax or lowered fact changes.
-pub(super) const ABSOLUTE_SOURCES_SQL: &str = "INSERT OR IGNORE INTO cr_binding_absolute_sources
- SELECT source.blob_id,source.import_ordinal,source.module_path
+pub(super) const ABSOLUTE_SOURCES_SQL: &str = "INSERT INTO cr_binding_absolute_sources
+ SELECT * FROM (
+SELECT source.blob_id,source.import_ordinal,source.module_path
  FROM cr_source_imports source CROSS JOIN source_rust_import_targets syntax
  ON syntax.blob_id=source.blob_id AND syntax.ordinal=source.import_ordinal
  WHERE syntax.leading_absolute=1
@@ -367,10 +450,12 @@ pub(super) const ABSOLUTE_SOURCES_SQL: &str = "INSERT OR IGNORE INTO cr_binding_
  FROM cr_impl_sources source CROSS JOIN source_rust_impl_items item
  ON item.blob_id=source.blob_id AND item.declaration_id=source.impl_declaration_id
  CROSS JOIN source_rust_types target ON target.blob_id=item.blob_id
- AND target.occurrence_id=item.trait_type_occurrence_id AND target.leading_absolute=1";
+ AND target.occurrence_id=item.trait_type_occurrence_id AND target.leading_absolute=1
+) WHERE true ON CONFLICT DO NOTHING";
 
-pub(super) const SEED_PATHS_SQL: &str = "INSERT OR IGNORE INTO cr_binding_paths
- SELECT source.blob_id,source.import_ordinal,source.module_path,0,
+pub(super) const SEED_PATHS_SQL: &str = "INSERT INTO cr_binding_paths
+ SELECT * FROM (
+SELECT source.blob_id,source.import_ordinal,source.module_path,0,
  CASE WHEN ?1<>'2015' AND EXISTS(SELECT 1 FROM cr_binding_absolute_sources absolute
  WHERE absolute.blob_id=source.blob_id AND absolute.import_ordinal=source.import_ordinal
  AND absolute.module_path=source.module_path) THEN extern_prelude.owner
@@ -384,20 +469,26 @@ pub(super) const SEED_PATHS_SQL: &str = "INSERT OR IGNORE INTO cr_binding_paths
  CROSS JOIN cr_binding_owners root ON root.crate_key=identity.crate_key
  AND root.module_path='crate' AND root.blob_id=0 AND root.binder_scope=0
  CROSS JOIN cr_binding_owners extern_prelude ON extern_prelude.crate_key=identity.crate_key
- AND extern_prelude.module_path='crate' AND extern_prelude.blob_id=0 AND extern_prelude.binder_scope=-1";
+ AND extern_prelude.module_path='crate' AND extern_prelude.blob_id=0 AND extern_prelude.binder_scope=-1
+) WHERE true ON CONFLICT DO NOTHING";
 
-pub(super) const SEED_PATH_COMPLETE_SQL: &str = "INSERT OR IGNORE INTO cr_binding_path_complete
- SELECT blob_id,import_ordinal,module_path,0 FROM cr_binding_imports";
+pub(super) const SEED_PATH_COMPLETE_SQL: &str = "INSERT INTO cr_binding_path_complete
+ SELECT * FROM (
+SELECT blob_id,import_ordinal,module_path,0 FROM cr_binding_imports
+) WHERE true ON CONFLICT DO NOTHING";
 
-pub(super) const SEED_DEMANDS_SQL: &str = "INSERT OR IGNORE INTO cr_binding_names
- SELECT source.owner,namespace.value,source.bound_name FROM cr_binding_imports source
+pub(super) const SEED_DEMANDS_SQL: &str = "INSERT INTO cr_binding_names
+ SELECT * FROM (
+SELECT source.owner,namespace.value,source.bound_name FROM cr_binding_imports source
  CROSS JOIN json_each('[\"type\",\"value\",\"macro\"]') namespace
  WHERE source.is_glob=0 AND source.bound_name IS NOT NULL
  UNION SELECT mask.owner,namespace.value,mask.name FROM cr_binding_masks mask
- CROSS JOIN json_each('[\"type\",\"value\",\"macro\"]') namespace";
+ CROSS JOIN json_each('[\"type\",\"value\",\"macro\"]') namespace
+) WHERE true ON CONFLICT DO NOTHING";
 
-pub(super) const DEMANDS_SQL: &str = "INSERT OR IGNORE INTO cr_binding_names
- SELECT owner,namespace,name FROM cr_binding_delta
+pub(super) const DEMANDS_SQL: &str = "INSERT INTO cr_binding_names
+ SELECT * FROM (
+SELECT owner,namespace,name FROM cr_binding_delta
  UNION SELECT owner,namespace,name FROM cr_binding_lookup_new
  UNION SELECT glob.target_owner,name.namespace,name.name FROM cr_binding_globs glob
  CROSS JOIN cr_binding_name_delta name ON name.owner=glob.owner
@@ -405,10 +496,12 @@ pub(super) const DEMANDS_SQL: &str = "INSERT OR IGNORE INTO cr_binding_names
  CROSS JOIN cr_binding_delta target ON target.owner=glob.target_owner
  WHERE NOT EXISTS(SELECT 1 FROM cr_binding_masks mask WHERE mask.owner=glob.owner AND mask.name<>target.name)
  UNION SELECT owner.parent_owner,name.namespace,name.name FROM cr_binding_name_delta name
- CROSS JOIN cr_binding_owners owner ON owner.owner=name.owner WHERE owner.parent_owner IS NOT NULL";
+ CROSS JOIN cr_binding_owners owner ON owner.owner=name.owner WHERE owner.parent_owner IS NOT NULL
+) WHERE true ON CONFLICT DO NOTHING";
 
-pub(super) const PATHS_SQL: &str = "INSERT OR IGNORE INTO cr_binding_paths
- SELECT path.blob_id,path.import_ordinal,path.module_path,path.position+1,destination.owner
+pub(super) const PATHS_SQL: &str = "INSERT INTO cr_binding_paths
+ SELECT * FROM (
+SELECT path.blob_id,path.import_ordinal,path.module_path,path.position+1,destination.owner
  FROM cr_binding_path_delta path CROSS JOIN cr_binding_segments segment
  ON segment.blob_id=path.blob_id AND segment.import_ordinal=path.import_ordinal AND segment.ordinal=path.position
  CROSS JOIN cr_binding_owners current ON current.owner=path.owner
@@ -439,30 +532,37 @@ pub(super) const PATHS_SQL: &str = "INSERT OR IGNORE INTO cr_binding_paths
  OR substr(requesting.module_path,1,length(CASE binding.visibility WHEN 'private' THEN current.module_path
  WHEN 'crate' THEN 'crate' ELSE binding.restricted_module_path END)+2)=
  CASE binding.visibility WHEN 'private' THEN current.module_path
- WHEN 'crate' THEN 'crate' ELSE binding.restricted_module_path END || '::')))";
+ WHEN 'crate' THEN 'crate' ELSE binding.restricted_module_path END || '::')))
+) WHERE true ON CONFLICT DO NOTHING";
 
-pub(super) const GLOB_EDGES_SQL: &str = "INSERT OR IGNORE INTO cr_binding_globs
- SELECT destination.owner,path.owner FROM cr_binding_imports source
+pub(super) const GLOB_EDGES_SQL: &str = "INSERT INTO cr_binding_globs
+ SELECT * FROM (
+SELECT destination.owner,path.owner FROM cr_binding_imports source
  CROSS JOIN cr_binding_paths path ON path.blob_id=source.blob_id AND path.import_ordinal=source.import_ordinal
  AND path.module_path=source.module_path AND path.position=source.segments
  CROSS JOIN cr_binding_destinations destination ON destination.blob_id=source.blob_id
- AND destination.import_ordinal=source.import_ordinal AND destination.module_path=source.module_path WHERE source.is_glob=1";
+ AND destination.import_ordinal=source.import_ordinal AND destination.module_path=source.module_path WHERE source.is_glob=1
+) WHERE true ON CONFLICT DO NOTHING";
 
 // All binding writes share accessibility, domain intersection and endpoint
 // deduplication. Precedence is decided before a glob endpoint can enter.
 pub(super) const ADMIT_SQL: &str = include_str!("rust_crate_export_fixpoint.sql");
 
-pub(super) const FALLBACK_REQUESTS_SQL: &str = "INSERT OR IGNORE INTO cr_binding_fallback
- SELECT owner.owner,done.namespace,done.name FROM cr_binding_owners owner
+pub(super) const FALLBACK_REQUESTS_SQL: &str = "INSERT INTO cr_binding_fallback
+ SELECT * FROM (
+SELECT owner.owner,done.namespace,done.name FROM cr_binding_owners owner
  CROSS JOIN cr_binding_complete done ON done.owner=owner.owner
  WHERE owner.parent_owner IS NOT NULL AND NOT EXISTS(SELECT 1 FROM cr_binding_targets local
- WHERE local.owner=owner.owner AND local.namespace=done.namespace AND local.name=done.name)";
+ WHERE local.owner=owner.owner AND local.namespace=done.namespace AND local.name=done.name)
+) WHERE true ON CONFLICT DO NOTHING";
 
-pub(super) const FALLBACK_SQL: &str = "INSERT OR IGNORE INTO cr_binding_targets
- SELECT owner.owner,target.namespace,target.name,target.target_crate_key,target.target_module_path,target.target_name,
+pub(super) const FALLBACK_SQL: &str = "INSERT INTO cr_binding_targets
+ SELECT * FROM (
+SELECT owner.owner,target.namespace,target.name,target.target_crate_key,target.target_module_path,target.target_name,
  target.declaration_blob_id,target.declaration_site,target.origin,target.visibility,target.restricted_module_path
  FROM cr_binding_owners owner CROSS JOIN cr_binding_targets target ON target.owner=owner.parent_owner
- CROSS JOIN cr_binding_fallback done ON done.owner=owner.owner AND done.namespace=target.namespace AND done.name=target.name";
+ CROSS JOIN cr_binding_fallback done ON done.owner=owner.owner AND done.namespace=target.namespace AND done.name=target.name
+) WHERE true ON CONFLICT DO NOTHING";
 
 pub(super) const EDGES_SQL: &str = "SELECT node.node,edge.target,COALESCE(edge.negative,0) FROM cr_binding_nodes node LEFT JOIN cr_binding_edges edge ON edge.source=node.node ORDER BY node.node,edge.target";
 
@@ -516,8 +616,9 @@ pub(super) fn components(conn: &Connection) -> Result<()> {
 
 // Both completion statements run every pass. The first test skips rows an
 // earlier pass already settled, so each pass pays the proof only for open rows.
-pub(super) const PATH_COMPLETE_SQL: &str = "INSERT OR IGNORE INTO cr_binding_path_complete
- SELECT done.blob_id,done.import_ordinal,done.module_path,done.position+1
+pub(super) const PATH_COMPLETE_SQL: &str = "INSERT INTO cr_binding_path_complete
+ SELECT * FROM (
+SELECT done.blob_id,done.import_ordinal,done.module_path,done.position+1
  FROM cr_binding_path_complete done CROSS JOIN cr_binding_segments segment
  ON segment.blob_id=done.blob_id AND segment.import_ordinal=done.import_ordinal AND segment.ordinal=done.position
  WHERE NOT EXISTS(SELECT 1 FROM cr_binding_path_complete next WHERE next.blob_id=done.blob_id
@@ -525,10 +626,12 @@ pub(super) const PATH_COMPLETE_SQL: &str = "INSERT OR IGNORE INTO cr_binding_pat
  AND NOT EXISTS(SELECT 1 FROM cr_binding_lookups lookup WHERE lookup.blob_id=done.blob_id
  AND lookup.import_ordinal=done.import_ordinal AND lookup.module_path=done.module_path AND lookup.position=done.position
  AND NOT EXISTS(SELECT 1 FROM cr_binding_complete target WHERE target.owner=lookup.owner
- AND target.namespace=lookup.namespace AND target.name=lookup.name))";
+ AND target.namespace=lookup.namespace AND target.name=lookup.name))
+) WHERE true ON CONFLICT DO NOTHING";
 
-pub(super) const IMPORT_COMPLETE_SQL: &str = "INSERT OR IGNORE INTO cr_binding_import_complete
- SELECT source.blob_id,source.import_ordinal,source.module_path,namespace.value
+pub(super) const IMPORT_COMPLETE_SQL: &str = "INSERT INTO cr_binding_import_complete
+ SELECT * FROM (
+SELECT source.blob_id,source.import_ordinal,source.module_path,namespace.value
  FROM cr_binding_imports source CROSS JOIN json_each('[\"type\",\"value\",\"macro\"]') namespace
  CROSS JOIN cr_binding_path_complete done ON done.blob_id=source.blob_id AND done.import_ordinal=source.import_ordinal
  AND done.module_path=source.module_path AND done.position=source.segments
@@ -540,18 +643,22 @@ pub(super) const IMPORT_COMPLETE_SQL: &str = "INSERT OR IGNORE INTO cr_binding_i
  WHERE lookup.blob_id=source.blob_id AND lookup.import_ordinal=source.import_ordinal
  AND lookup.module_path=source.module_path AND lookup.position=source.segments AND lookup.namespace=namespace.value
  AND NOT EXISTS(SELECT 1 FROM cr_binding_complete target WHERE target.owner=lookup.owner
- AND target.namespace=lookup.namespace AND target.name=lookup.name)))";
+ AND target.namespace=lookup.namespace AND target.name=lookup.name)))
+) WHERE true ON CONFLICT DO NOTHING";
 
-pub(super) const DECLARATION_COMPLETE_SQL: &str = "INSERT OR IGNORE INTO cr_binding_complete
- SELECT target.owner,target.namespace,target.name FROM cr_binding_targets target
- WHERE target.origin='declaration'";
+pub(super) const DECLARATION_COMPLETE_SQL: &str = "INSERT INTO cr_binding_complete
+ SELECT * FROM (
+SELECT target.owner,target.namespace,target.name FROM cr_binding_targets target
+ WHERE target.origin='declaration'
+) WHERE true ON CONFLICT DO NOTHING";
 
 // Close an entire positive stratum together after propagation quiesces.
 // Pending negative predecessors and open inputs block their positive dependents.
 // This avoids rescanning every positive chain once per component; negative
 // strata still re-enter propagation before their successors can close.
-pub(super) const COMPLETE_SQL: &str = "INSERT OR IGNORE INTO cr_binding_complete
- WITH RECURSIVE settled AS MATERIALIZED (SELECT * FROM cr_binding_complete),
+pub(super) const COMPLETE_SQL: &str = "INSERT INTO cr_binding_complete
+ SELECT * FROM (
+WITH RECURSIVE settled AS MATERIALIZED (SELECT * FROM cr_binding_complete),
  blocked(component) AS (
  SELECT DISTINCT component.component FROM cr_binding_components component
  CROSS JOIN cr_binding_nodes key ON key.node=component.node
@@ -571,10 +678,12 @@ pub(super) const COMPLETE_SQL: &str = "INSERT OR IGNORE INTO cr_binding_complete
  )
  SELECT node.owner,node.namespace,node.name FROM cr_binding_nodes node
  CROSS JOIN cr_binding_components component ON component.node=node.node
- WHERE NOT EXISTS(SELECT 1 FROM blocked WHERE blocked.component=component.component)";
+ WHERE NOT EXISTS(SELECT 1 FROM blocked WHERE blocked.component=component.component)
+) WHERE true ON CONFLICT DO NOTHING";
 
-pub(super) const SELF_SQL: &str = "INSERT OR IGNORE INTO cr_binding_targets
- SELECT owner.owner,'type','self',owner.crate_key,owner.module_path,'self',0,0,'declaration',
+pub(super) const SELF_SQL: &str = "INSERT INTO cr_binding_targets
+ SELECT * FROM (
+SELECT owner.owner,'type','self',owner.crate_key,owner.module_path,'self',0,0,'declaration',
  CASE WHEN declaration.visibility='private' AND declaration.module_path='crate' THEN 'crate'
  WHEN declaration.visibility='private' THEN 'restricted' ELSE COALESCE(declaration.visibility,'public') END,
  CASE WHEN declaration.visibility='private' AND declaration.module_path<>'crate' THEN declaration.module_path
@@ -587,14 +696,17 @@ pub(super) const SELF_SQL: &str = "INSERT OR IGNORE INTO cr_binding_targets
  AND declaration.namespace='type' AND declaration.origin='declaration'
  AND (declaration.name=module.module_name OR (module.module_name IS NULL
  AND owner.module_path=declaration.module_path || '::' || declaration.name))
- WHERE owner.blob_id=0 AND owner.binder_scope=0";
+ WHERE owner.blob_id=0 AND owner.binder_scope=0
+) WHERE true ON CONFLICT DO NOTHING";
 
-pub(super) const OPEN_SQL: &str = "UPDATE cr_binding_owners AS owner SET open=1 WHERE
- EXISTS(SELECT 1 FROM cr_gaps gap WHERE gap.gap_kind IN ('open_export_inventory','unknown_activation','unresolved_visibility')
- AND gap.subject=owner.module_path)";
+pub(super) const OPEN_SQL: &str = "UPDATE cr_binding_owners AS owner SET open=1
+ WHERE owner.crate_key=(SELECT crate_key FROM cr_identity)
+ AND EXISTS(SELECT 1 FROM cr_binding_inventory_openness opened
+ WHERE opened.owner=owner.owner AND opened.namespace IS NULL)";
 
-pub(super) const FOREIGN_SQL: &str = "INSERT OR IGNORE INTO cr_binding_targets
- SELECT owner.owner,export.namespace,export.name,export.target_crate_key,export.target_module_path,export.target_name,
+pub(super) const FOREIGN_SQL: &str = "INSERT INTO cr_binding_targets
+ SELECT * FROM (
+SELECT owner.owner,export.namespace,export.name,export.target_crate_key,export.target_module_path,export.target_name,
  export.declaration_blob_id,export.declaration_site,export.origin,export.visibility,export.restricted_module_path
  FROM cr_binding_owners owner CROSS JOIN cr_foreign foreign_crate ON foreign_crate.crate_key=owner.crate_key
  CROSS JOIN rust_crate_exports export ON export.topology_id=foreign_crate.topology_id
@@ -602,16 +714,18 @@ pub(super) const FOREIGN_SQL: &str = "INSERT OR IGNORE INTO cr_binding_targets
  WHERE owner.blob_id=0 AND owner.binder_scope=0 AND (
  EXISTS(SELECT 1 FROM cr_binding_names demand WHERE demand.owner=owner.owner
  AND demand.namespace=export.namespace AND demand.name=export.name)
- OR EXISTS(SELECT 1 FROM cr_binding_globs glob WHERE glob.target_owner=owner.owner))";
+ OR EXISTS(SELECT 1 FROM cr_binding_globs glob WHERE glob.target_owner=owner.owner))
+) WHERE true ON CONFLICT DO NOTHING";
 
 // Conflict evidence preserves private members too: a consumer needs the whole
 // group to decide whether its effective visibility is known from these facts.
 // Owners and foreign gaps are fixed, so each queued name needs one read.
-pub(super) const FOREIGN_CONFLICT_SQL: &str = "INSERT OR IGNORE INTO cr_binding_targets
- SELECT owner.owner,json_extract(evidence.value,'$.namespace'),node.name,
+pub(super) const FOREIGN_CONFLICT_SQL: &str = "INSERT INTO cr_binding_targets
+ SELECT * FROM (
+SELECT owner.owner,json_extract(evidence.value,'$.namespace'),node.name,
  unhex(json_extract(target.value,'$.crate')),json_extract(target.value,'$.module'),json_extract(target.value,'$.name'),
- json_extract(target.value,'$.binding.blob'),json_extract(target.value,'$.binding.site'),
- json_extract(target.value,'$.binding.origin'),json_extract(target.value,'$.binding.visibility'),
+ COALESCE(declared.declaration_blob_id,0),COALESCE(declared.declaration_site,0),
+ COALESCE(json_extract(target.value,'$.binding.binding_origin'),json_extract(target.value,'$.binding.origin')),json_extract(target.value,'$.binding.visibility'),
  json_extract(target.value,'$.binding.restriction')
  FROM cr_binding_name_delta node CROSS JOIN cr_binding_owners owner ON owner.owner=node.owner
  CROSS JOIN cr_foreign foreign_crate ON foreign_crate.crate_key=owner.crate_key
@@ -619,41 +733,160 @@ pub(super) const FOREIGN_CONFLICT_SQL: &str = "INSERT OR IGNORE INTO cr_binding_
  AND gap.gap_kind='open_export_inventory' AND gap.subject=owner.module_path || '::' || node.name
  CROSS JOIN json_each(gap.detail,'$.evidence') evidence
  CROSS JOIN json_each(evidence.value,'$.targets') target
+ LEFT JOIN cr_foreign declaring_unit ON declaring_unit.crate_key=unhex(json_extract(target.value,'$.crate'))
+ LEFT JOIN rust_crate_exports declared ON declared.topology_id=declaring_unit.topology_id
+ AND declared.module_path=json_extract(target.value,'$.module')
+ AND declared.namespace=json_extract(evidence.value,'$.namespace')
+ AND declared.name=json_extract(target.value,'$.name') AND declared.origin='declaration'
  WHERE json_extract(evidence.value,'$.reason')='InconsistentPrecedence'
  AND json_extract(evidence.value,'$.namespace')=node.namespace
  AND json_extract(evidence.value,'$.member_blob')=0
  AND json_extract(evidence.value,'$.binder_scope')=0
- AND json_extract(target.value,'$.binding.visibility') IS NOT NULL";
+ AND json_extract(target.value,'$.binding.visibility') IS NOT NULL
+) WHERE true ON CONFLICT DO NOTHING";
 
 pub(super) const FOREIGN_OPEN_SQL: &str = "UPDATE cr_binding_owners AS owner SET open=1
- WHERE EXISTS(SELECT 1 FROM cr_foreign foreign_crate CROSS JOIN rust_crate_gaps gap
- ON gap.topology_id=foreign_crate.topology_id
- WHERE foreign_crate.crate_key=owner.crate_key
- AND gap.gap_kind IN ('open_export_inventory','unknown_activation','unresolved_visibility')
- AND gap.subject=owner.module_path)";
+ WHERE EXISTS(SELECT 1 FROM cr_foreign foreign_crate WHERE foreign_crate.crate_key=owner.crate_key)
+ AND EXISTS(SELECT 1 FROM cr_binding_inventory_openness opened
+ WHERE opened.owner=owner.owner AND opened.namespace IS NULL)";
 
-pub(super) const EXPORTS_SQL: &str = "INSERT OR IGNORE INTO cr_exports
- SELECT owner.crate_key,owner.module_path,target.namespace,target.name,target.origin,
+pub(super) const EXPORTS_SQL: &str = "INSERT INTO cr_exports
+ SELECT * FROM (
+SELECT owner.crate_key,owner.module_path,target.namespace,target.name,target.origin,
  target.visibility,target.restricted_module_path,target.declaration_blob_id,target.declaration_site
  FROM cr_binding_exact_targets target CROSS JOIN cr_binding_owners owner ON owner.owner=target.owner
  CROSS JOIN cr_identity identity ON identity.crate_key=owner.crate_key
  WHERE owner.blob_id=0 AND owner.binder_scope=0 AND target.declaration_blob_id<>0
- AND (target.origin='declaration' OR target.visibility<>'private')";
+ AND (target.origin='declaration' OR target.visibility<>'private')
+) WHERE true ON CONFLICT DO NOTHING";
 
 pub(super) const ROUTES_SQL: &str = "INSERT OR IGNORE INTO cr_routes
  SELECT source.blob_id,source.import_ordinal,source.module_path,owner.crate_key,owner.module_path
  FROM cr_binding_imports source CROSS JOIN cr_binding_paths path
  ON path.blob_id=source.blob_id AND path.import_ordinal=source.import_ordinal
  AND path.module_path=source.module_path AND path.position=source.segments
- CROSS JOIN cr_binding_owners owner ON owner.owner=path.owner WHERE source.import_ordinal>=0";
+ CROSS JOIN cr_binding_owners owner ON owner.owner=path.owner WHERE source.import_ordinal>=0
+ AND NOT (source.is_glob=1 AND EXISTS(SELECT 1 FROM cr_binding_unproven_paths hop
+ WHERE hop.blob_id=source.blob_id AND hop.import_ordinal=source.import_ordinal AND hop.module_path=source.module_path))";
+
+// A path is unproven when a module segment holds more than one binding or is
+// itself an unproven binding (a node in cr_binding_unproven, or one holding an
+// unproven endpoint): no endpoint of the import is proven, the same rule the
+// summary walk applies. Ambiguity of the leaf name needs no such test, because
+// its competing endpoints are already a conflict group with their own gap.
+// This predicate, UNPROVEN_SQL and UNPROVEN_GLOB_ENDPOINTS_SQL feed one
+// another, so derive runs them until none adds a row.
+pub(super) const UNPROVEN_PATHS_SQL: &str = "INSERT INTO cr_binding_unproven_paths
+ SELECT * FROM (
+SELECT DISTINCT lookup.blob_id,lookup.import_ordinal,lookup.module_path
+ FROM cr_binding_lookups lookup
+ CROSS JOIN cr_binding_imports source ON source.blob_id=lookup.blob_id
+ AND source.import_ordinal=lookup.import_ordinal AND source.module_path=lookup.module_path
+ WHERE (source.is_glob=1 OR source.bound_name IS NOT NULL)
+ AND lookup.position<source.segments AND lookup.namespace='type'
+ AND ((SELECT COUNT(*) FROM cr_binding_targets hop WHERE hop.owner=lookup.owner
+ AND hop.namespace='type' AND hop.name=lookup.name)>1
+ OR EXISTS(SELECT 1 FROM cr_binding_nodes segment WHERE segment.owner=lookup.owner
+ AND segment.namespace='type' AND segment.name=lookup.name
+ AND (EXISTS(SELECT 1 FROM cr_binding_unproven unproven WHERE unproven.node=segment.node)
+ OR EXISTS(SELECT 1 FROM cr_binding_unproven_endpoints bad WHERE bad.node=segment.node))))
+) WHERE true ON CONFLICT DO NOTHING";
+
+// The dependency edges that carry ambiguity also carry this unproof to the
+// bindings that read the import.
+pub(super) const UNPROVEN_SQL: &str = "INSERT OR IGNORE INTO cr_binding_unproven
+ WITH RECURSIVE unproven(node) AS (
+ SELECT node FROM cr_binding_rankless_conflicts
+ UNION SELECT node.node FROM cr_binding_unproven_paths hop
+ CROSS JOIN cr_binding_imports source ON source.blob_id=hop.blob_id
+ AND source.import_ordinal=hop.import_ordinal AND source.module_path=hop.module_path
+ CROSS JOIN cr_binding_destinations destination ON destination.blob_id=source.blob_id
+ AND destination.import_ordinal=source.import_ordinal AND destination.module_path=source.module_path
+ CROSS JOIN cr_binding_nodes node ON node.owner=destination.owner AND node.name=source.bound_name
+ WHERE source.is_glob=0
+ UNION
+ SELECT edge.source FROM unproven CROSS JOIN cr_binding_edges edge INDEXED BY cr_binding_edges_target
+ ON edge.target=unproven.node AND edge.negative=0 AND edge.propagates_ambiguity=1
+ ) SELECT unproven.node FROM unproven CROSS JOIN cr_binding_nodes key ON key.node=unproven.node
+ WHERE NOT EXISTS(SELECT 1 FROM cr_binding_targets own WHERE own.owner=key.owner
+ AND own.namespace=key.namespace AND own.name=key.name AND own.origin='declaration')";
+
+// A glob edge is sound when some glob import of the same destination reaches
+// the same provider without an unproven path. A glob endpoint is unproven when
+// only unsound edges supply it. The edges that carry ambiguity then carry the
+// unproof to the endpoint a reader binds from it, unless a sound glob edge
+// of the reader reaches a provider that still proves that endpoint. Derive
+// repeats this statement, so a provider that turns unproven later withdraws
+// the exemption it gave earlier.
+pub(super) const UNPROVEN_GLOB_ENDPOINTS_SQL: &str = "INSERT INTO cr_binding_unproven_endpoints
+ SELECT * FROM (
+WITH edges AS MATERIALIZED (
+ SELECT destination.owner AS owner,path.owner AS provider,
+ MAX(hop.blob_id IS NULL) AS sound
+ FROM cr_binding_imports source
+ CROSS JOIN cr_binding_destinations destination ON destination.blob_id=source.blob_id
+ AND destination.import_ordinal=source.import_ordinal AND destination.module_path=source.module_path
+ CROSS JOIN cr_binding_paths path ON path.blob_id=source.blob_id
+ AND path.import_ordinal=source.import_ordinal AND path.module_path=source.module_path
+ AND path.position=source.segments
+ LEFT JOIN cr_binding_unproven_paths hop ON hop.blob_id=source.blob_id
+ AND hop.import_ordinal=source.import_ordinal AND hop.module_path=source.module_path
+ WHERE source.is_glob=1 GROUP BY destination.owner,path.owner
+ ), moved(node,target_crate_key,target_module_path,target_name) AS (
+ SELECT node.node,glob.target_crate_key,glob.target_module_path,glob.target_name
+ FROM edges bad CROSS JOIN cr_binding_targets glob ON glob.owner=bad.owner AND glob.origin='glob_reexport'
+ CROSS JOIN cr_binding_nodes node ON node.owner=glob.owner AND node.namespace=glob.namespace AND node.name=glob.name
+ WHERE bad.sound=0
+ AND EXISTS(SELECT 1 FROM cr_binding_targets supplied WHERE supplied.owner=bad.provider
+ AND supplied.namespace=glob.namespace AND supplied.name=glob.name
+ AND supplied.target_crate_key=glob.target_crate_key AND supplied.target_module_path=glob.target_module_path
+ AND supplied.target_name=glob.target_name)
+ AND NOT EXISTS(SELECT 1 FROM edges good CROSS JOIN cr_binding_targets supplied ON supplied.owner=good.provider
+ WHERE good.owner=glob.owner AND good.sound=1 AND supplied.namespace=glob.namespace AND supplied.name=glob.name
+ AND supplied.target_crate_key=glob.target_crate_key AND supplied.target_module_path=glob.target_module_path
+ AND supplied.target_name=glob.target_name)
+ UNION
+ SELECT consumer.node,unproven.target_crate_key,unproven.target_module_path,unproven.target_name
+ FROM cr_binding_unproven_endpoints unproven CROSS JOIN cr_binding_edges edge INDEXED BY cr_binding_edges_target
+ ON edge.target=unproven.node AND edge.negative=0 AND edge.propagates_ambiguity=1
+ CROSS JOIN cr_binding_nodes consumer ON consumer.node=edge.source
+ CROSS JOIN cr_binding_targets bound ON bound.owner=consumer.owner AND bound.namespace=consumer.namespace
+ AND bound.name=consumer.name AND bound.target_crate_key=unproven.target_crate_key
+ AND bound.target_module_path=unproven.target_module_path AND bound.target_name=unproven.target_name
+ AND bound.origin<>'declaration'
+ WHERE NOT EXISTS(SELECT 1 FROM edges good CROSS JOIN cr_binding_targets supplied ON supplied.owner=good.provider
+ WHERE good.owner=consumer.owner AND good.sound=1 AND supplied.namespace=consumer.namespace
+ AND supplied.name=consumer.name AND supplied.target_crate_key=unproven.target_crate_key
+ AND supplied.target_module_path=unproven.target_module_path AND supplied.target_name=unproven.target_name
+ AND NOT EXISTS(SELECT 1 FROM cr_binding_unproven_endpoints sub CROSS JOIN cr_binding_nodes provider
+ ON provider.node=sub.node WHERE provider.owner=good.provider AND provider.namespace=consumer.namespace
+ AND provider.name=consumer.name AND sub.target_crate_key=unproven.target_crate_key
+ AND sub.target_module_path=unproven.target_module_path AND sub.target_name=unproven.target_name)
+ AND NOT EXISTS(SELECT 1 FROM cr_binding_unproven whole CROSS JOIN cr_binding_nodes provider
+ ON provider.node=whole.node WHERE provider.owner=good.provider AND provider.namespace=consumer.namespace
+ AND provider.name=consumer.name))
+ ) SELECT * FROM moved
+) WHERE true ON CONFLICT DO NOTHING";
+
+// The importing module cannot know which names an ambiguous glob brings, so
+// its inventory is open. The reason is not a binding-level one: a reader sees
+// an incomplete crate context, not a proved absence.
+pub(super) const UNPROVEN_GLOB_GAPS_SQL: &str = "INSERT INTO cr_gaps
+ SELECT 'open_export_inventory',source.module_path,
+ json_object('subject_level','module','member_blob',source.blob_id,'import_ordinal',source.import_ordinal,
+ 'reason','AmbiguousGlobSource')
+ FROM cr_binding_unproven_paths hop CROSS JOIN cr_binding_imports source ON source.blob_id=hop.blob_id
+ AND source.import_ordinal=hop.import_ordinal AND source.module_path=hop.module_path
+ WHERE source.is_glob=1";
 
 // A partially accessible glob conflict has no fact-defined export visibility.
 // Classify it only after the binding fixed point, without choosing an import
 // order or withdrawing endpoints. Completeness and binding-flow dependencies
 // both retain the uncertainty; only actual endpoints are excluded from exact
 // publication, so an independent visible binding remains available.
-pub(super) const UNCERTAIN_SQL: &str = "INSERT OR IGNORE INTO cr_binding_uncertain
- WITH RECURSIVE partial AS MATERIALIZED (
+pub(super) const UNCERTAIN_SQL: &str = "INSERT INTO cr_binding_uncertain
+ SELECT * FROM (
+WITH RECURSIVE partial AS MATERIALIZED (
  SELECT consumer,provider,namespace,name FROM cr_binding_visibility_reads
  GROUP BY consumer,provider,namespace,name HAVING MIN(accessible)=0 AND MAX(accessible)=1
  AND MIN(origin)='glob_reexport' AND MAX(origin)='glob_reexport'
@@ -680,14 +913,16 @@ pub(super) const UNCERTAIN_SQL: &str = "INSERT OR IGNORE INTO cr_binding_uncerta
  SELECT edge.source,affected.target_crate_key,affected.target_module_path,affected.target_name
  FROM affected CROSS JOIN cr_binding_edges edge INDEXED BY cr_binding_edges_target ON edge.target=affected.node
  WHERE edge.negative=1 OR edge.propagates_ambiguity=1
- ) SELECT * FROM affected";
+ ) SELECT * FROM affected
+) WHERE true ON CONFLICT DO NOTHING";
 
 // An endpoint can have both an uncertain source and an independent exact
 // witness. Keep that witness even when endpoint deduplication merged the rows.
 // This finite positive proof closure runs once, after the canonical fixed
 // point: no binding is withdrawn and no per-round relation is recomputed.
-pub(super) const CERTAIN_SQL: &str = "INSERT OR IGNORE INTO cr_binding_certain
- WITH RECURSIVE partial AS MATERIALIZED (
+pub(super) const CERTAIN_SQL: &str = "INSERT INTO cr_binding_certain
+ SELECT * FROM (
+WITH RECURSIVE partial AS MATERIALIZED (
  SELECT consumer,provider,namespace,name FROM cr_binding_visibility_reads
  GROUP BY consumer,provider,namespace,name HAVING MIN(accessible)=0 AND MAX(accessible)=1
  AND MIN(origin)='glob_reexport' AND MAX(origin)='glob_reexport'
@@ -709,7 +944,8 @@ pub(super) const CERTAIN_SQL: &str = "INSERT OR IGNORE INTO cr_binding_certain
  AND target.target_crate_key=proof.target_crate_key AND target.target_module_path=proof.target_module_path AND target.target_name=proof.target_name
  WHERE NOT EXISTS(SELECT 1 FROM partial WHERE partial.consumer=consumer.owner AND partial.provider=provider.owner
  AND partial.namespace=provider.namespace AND partial.name=provider.name)
- ) SELECT * FROM proof";
+ ) SELECT * FROM proof
+) WHERE true ON CONFLICT DO NOTHING";
 
 pub(super) const MIXED_VISIBILITY_SQL: &str = "INSERT INTO cr_gaps
  SELECT 'open_export_inventory',owner.module_path || '::' || node.name,
@@ -728,14 +964,32 @@ pub(super) const MIXED_VISIBILITY_SQL: &str = "INSERT INTO cr_gaps
  WHERE node.name<>'self' AND NOT EXISTS(SELECT 1 FROM cr_binding_masks mask WHERE mask.owner=node.owner)
  GROUP BY node.node";
 
+// The destination of a named import through an unproven path carries the same
+// precedence uncertainty as a binding with competing exact targets. Without
+// its own gap a qualified reader that never reaches the binding would report a
+// definite absence. Propagated importers keep the evidence they already get
+// from the module and foreign gap paths; seeding them all would also make a
+// private glob conflict's non-exported name ambiguous to unrelated readers.
 pub(super) const AMBIGUITY_SQL: &str = "INSERT INTO cr_gaps
  WITH RECURSIVE choices AS MATERIALIZED (
  SELECT owner,namespace,name,target_crate_key,target_module_path,target_name FROM cr_binding_exact_targets
  UNION SELECT owner,namespace,name,target_crate_key,target_module_path,target_name FROM cr_binding_prelude_reads
+ UNION SELECT target.owner,target.namespace,target.name,target.target_crate_key,target.target_module_path,target.target_name
+ FROM cr_binding_targets target JOIN cr_binding_nodes node ON node.owner=target.owner
+ AND node.namespace=target.namespace AND node.name=target.name
+ JOIN cr_binding_rankless_conflicts conflict ON conflict.node=node.node
  ), affected(node) AS (
- SELECT node.node FROM choices target CROSS JOIN cr_binding_nodes node
+ SELECT node FROM cr_binding_rankless_conflicts
+ UNION SELECT node.node FROM choices target CROSS JOIN cr_binding_nodes node
  ON node.owner=target.owner AND node.namespace=target.namespace AND node.name=target.name
  GROUP BY node.node HAVING COUNT(*)>1
+ UNION SELECT node.node FROM cr_binding_unproven_paths hop
+ CROSS JOIN cr_binding_imports source ON source.blob_id=hop.blob_id
+ AND source.import_ordinal=hop.import_ordinal AND source.module_path=hop.module_path
+ CROSS JOIN cr_binding_destinations destination ON destination.blob_id=source.blob_id
+ AND destination.import_ordinal=source.import_ordinal AND destination.module_path=source.module_path
+ CROSS JOIN cr_binding_nodes node ON node.owner=destination.owner AND node.name=source.bound_name
+ WHERE source.is_glob=0
  UNION SELECT node.node FROM cr_binding_nodes node
  CROSS JOIN cr_binding_owners owner ON owner.owner=node.owner
  CROSS JOIN cr_foreign foreign_crate ON foreign_crate.crate_key=owner.crate_key
@@ -754,8 +1008,18 @@ pub(super) const AMBIGUITY_SQL: &str = "INSERT INTO cr_gaps
  'dependency_ambiguity',json(CASE WHEN (SELECT COUNT(*) FROM choices target
  WHERE target.owner=node.owner AND target.namespace=node.namespace AND target.name=node.name)<2 THEN 'true' ELSE 'false' END),
  'targets',json((SELECT json_group_array(json_object('crate',hex(target.target_crate_key),'module',target.target_module_path,'name',target.target_name,
- 'binding',json((SELECT json_object('origin',witness.origin,'visibility',witness.visibility,
+ 'binding',json((SELECT CASE WHEN witness.target_crate_key=identity.crate_key THEN
+ json_object('origin',witness.origin,'visibility',witness.visibility,
  'restriction',witness.restricted_module_path,'blob',witness.declaration_blob_id,'site',witness.declaration_site)
+ ELSE json_object('unit_key',hex(witness.target_crate_key),'module_path',witness.target_module_path,
+ 'kind',CASE WHEN witness.declaration_blob_id<>0 THEN 'declaration'
+ WHEN EXISTS(SELECT 1 FROM cr_foreign declaring_unit
+ JOIN rust_crate_macro_items generated ON generated.topology_id=declaring_unit.topology_id
+ WHERE declaring_unit.crate_key=witness.target_crate_key
+ AND generated.module_path=witness.target_module_path AND generated.namespace=witness.namespace
+ AND generated.name=witness.target_name) THEN 'generated' ELSE 'module' END,
+ 'namespace',witness.namespace,'name',witness.target_name,'origin','declaration',
+ 'binding_origin',witness.origin,'visibility',witness.visibility,'restriction',witness.restricted_module_path) END
  FROM cr_binding_targets witness WHERE witness.owner=target.owner AND witness.namespace=target.namespace AND witness.name=target.name
  AND witness.target_crate_key=target.target_crate_key AND witness.target_module_path=target.target_module_path AND witness.target_name=target.target_name)))
  ORDER BY target.target_crate_key,target.target_module_path,target.target_name)
@@ -777,7 +1041,7 @@ pub(super) const PENDING_SQL: &str = "INSERT INTO cr_gaps
  CROSS JOIN cr_gaps gap ON gap.subject=owner.module_path
  AND gap.gap_kind IN ('open_export_inventory','unknown_activation','unresolved_visibility')
  UNION
- SELECT owner.owner,CASE WHEN json_extract(evidence.value,'$.reason')='UnsupportedMacroGeneratedModule' THEN evidence.value ELSE 'null' END
+ SELECT owner.owner,CASE WHEN json_extract(evidence.value,'$.reason')='UnsupportedMacroGeneratedModule' THEN CASE WHEN json_extract(evidence.value,'$.unit_key')=(SELECT hex(crate_key) FROM cr_identity) THEN evidence.value ELSE json_remove(evidence.value,'$.member_blob','$.invocation_occurrence') END ELSE 'null' END
  FROM cr_binding_owners owner CROSS JOIN cr_foreign foreign_crate ON foreign_crate.crate_key=owner.crate_key
  CROSS JOIN rust_crate_gaps gap ON gap.topology_id=foreign_crate.topology_id AND gap.subject=owner.module_path
  AND gap.gap_kind IN ('open_export_inventory','unknown_activation','unresolved_visibility')
@@ -891,7 +1155,9 @@ pub(super) fn derive(conn: &Connection, edition: &str, _crate_name: &str, cfg: &
     conn.prepare_cached(super::binding_authority::LOCAL_DECLARATIONS_SQL)?
         .execute([cfg])?;
     conn.prepare_cached(
-        "INSERT OR IGNORE INTO cr_binding_targets SELECT * FROM cr_authority_local_seeds",
+        "INSERT INTO cr_binding_targets SELECT * FROM (
+SELECT * FROM cr_authority_local_seeds
+) WHERE true ON CONFLICT DO NOTHING",
     )?
     .execute([])?;
     let absolute_anchor = crate::analyzer::resolution::root_import_anchor_semantic_identity(
@@ -919,6 +1185,10 @@ pub(super) fn derive(conn: &Connection, edition: &str, _crate_name: &str, cfg: &
             let (mut export_written, mut export_steps, mut route_steps) = (0, 0, 0);
             let mut added = 0;
             for &(sql, writes_edge_input) in PASS_STATEMENTS {
+                #[cfg(any(test, feature = "test-support"))]
+                if sql == FOREIGN_SQL || sql == FOREIGN_CONFLICT_SQL || sql == FOREIGN_ROOT_SQL {
+                    super::summary_equality_probes::capture(conn, sql)?;
+                }
                 let (written, _steps) = super::execute_with_vm_steps(conn, sql, [])?;
                 added += written;
                 edge_inputs_changed |= writes_edge_input && written > 0;
@@ -992,7 +1262,21 @@ pub(super) fn derive(conn: &Connection, edition: &str, _crate_name: &str, cfg: &
             break;
         }
     }
+    loop {
+        let mut added = 0;
+        for sql in [
+            UNPROVEN_PATHS_SQL,
+            UNPROVEN_SQL,
+            UNPROVEN_GLOB_ENDPOINTS_SQL,
+        ] {
+            added += conn.prepare_cached(sql)?.execute([])?;
+        }
+        if added == 0 {
+            break;
+        }
+    }
     for sql in [
+        UNPROVEN_GLOB_GAPS_SQL,
         UNCERTAIN_SQL,
         CERTAIN_SQL,
         EXPORTS_SQL,
@@ -1061,6 +1345,14 @@ pub(super) fn query_registry() -> Vec<(&'static str, &'static str, usize)> {
         ("rust_binding_complete", COMPLETE_SQL, 0),
         ("rust_binding_exports", EXPORTS_SQL, 0),
         ("rust_binding_routes", ROUTES_SQL, 0),
+        ("rust_binding_unproven_paths", UNPROVEN_PATHS_SQL, 0),
+        ("rust_binding_unproven", UNPROVEN_SQL, 0),
+        (
+            "rust_binding_unproven_glob_endpoints",
+            UNPROVEN_GLOB_ENDPOINTS_SQL,
+            0,
+        ),
+        ("rust_binding_unproven_glob_gaps", UNPROVEN_GLOB_GAPS_SQL, 0),
         ("rust_binding_uncertain", UNCERTAIN_SQL, 0),
         ("rust_binding_certain", CERTAIN_SQL, 0),
         ("rust_binding_mixed_visibility", MIXED_VISIBILITY_SQL, 0),
@@ -1102,8 +1394,9 @@ pub(super) const ROUTE_SOURCES_SQL: &str = "INSERT INTO cr_binding_route_sources
  UNION ALL SELECT 'cr_impl_trait_segments',blob_id,relation_key,module_path,-3-4*relation_key FROM cr_impl_sources
  WHERE trait_name IS NOT NULL";
 
-pub(super) const SEGMENTS_SQL: &str = "INSERT OR IGNORE INTO cr_binding_segments
- SELECT segment.blob_id,segment.import_ordinal,segment.ordinal,segment.segment
+pub(super) const SEGMENTS_SQL: &str = "INSERT INTO cr_binding_segments
+ SELECT * FROM (
+SELECT segment.blob_id,segment.import_ordinal,segment.ordinal,segment.segment
  FROM cr_source_imports source CROSS JOIN source_rust_import_module_segments segment
  ON segment.blob_id=source.blob_id AND segment.import_ordinal=source.import_ordinal
  UNION ALL SELECT segment.blob_id,-1-4*segment.route_key,segment.ordinal,segment.segment
@@ -1114,17 +1407,21 @@ pub(super) const SEGMENTS_SQL: &str = "INSERT OR IGNORE INTO cr_binding_segments
  ON segment.blob_id=source.blob_id AND segment.relation_key=source.relation_key
  UNION ALL SELECT segment.blob_id,-3-4*segment.relation_key,segment.ordinal,segment.segment
  FROM cr_impl_sources source CROSS JOIN cr_impl_trait_segments segment
- ON segment.blob_id=source.blob_id AND segment.relation_key=source.relation_key";
+ ON segment.blob_id=source.blob_id AND segment.relation_key=source.relation_key
+) WHERE true ON CONFLICT DO NOTHING";
 
-pub(super) const MACRO_SEED_SQL: &str = "INSERT OR IGNORE INTO cr_binding_targets
- SELECT owner.owner,item.namespace,item.name,owner.crate_key,item.module_path,item.name,
+pub(super) const MACRO_SEED_SQL: &str = "INSERT INTO cr_binding_targets
+ SELECT * FROM (
+SELECT owner.owner,item.namespace,item.name,owner.crate_key,item.module_path,item.name,
  0,0,'declaration',item.visibility,item.restricted_module_path
  FROM cr_macro_items item CROSS JOIN cr_identity identity
  CROSS JOIN cr_binding_owners owner ON owner.crate_key=identity.crate_key
- AND owner.module_path=item.module_path AND owner.blob_id=0 AND owner.binder_scope=0";
+ AND owner.module_path=item.module_path AND owner.blob_id=0 AND owner.binder_scope=0
+) WHERE true ON CONFLICT DO NOTHING";
 
-pub(super) const OPEN_NAMES_SQL: &str = "INSERT OR IGNORE INTO cr_binding_open_names(owner,namespace,name,boundary)
- SELECT destination.owner,opened.namespace,COALESCE(source.bound_name,name.name),'external_declared_unindexed'
+pub(super) const OPEN_NAMES_SQL: &str = "INSERT INTO cr_binding_open_names(owner,namespace,name,boundary)
+ SELECT * FROM (
+SELECT destination.owner,opened.namespace,COALESCE(source.bound_name,name.name),'external_declared_unindexed'
  FROM cr_binding_open_sources opened CROSS JOIN cr_binding_imports source
  ON source.blob_id=opened.blob_id AND source.import_ordinal=opened.import_ordinal AND source.module_path=opened.module_path
  CROSS JOIN cr_binding_destinations destination ON destination.blob_id=source.blob_id
@@ -1141,7 +1438,12 @@ pub(super) const OPEN_NAMES_SQL: &str = "INSERT OR IGNORE INTO cr_binding_open_n
  AND (NOT EXISTS(SELECT 1 FROM cr_binding_import_complete complete WHERE complete.blob_id=named.blob_id
  AND complete.import_ordinal=named.import_ordinal AND complete.module_path=named.module_path AND complete.namespace=name.namespace)
  OR EXISTS(SELECT 1 FROM cr_binding_import_present present WHERE present.blob_id=named.blob_id
- AND present.import_ordinal=named.import_ordinal AND present.module_path=named.module_path AND present.namespace=name.namespace))))";
+ AND present.import_ordinal=named.import_ordinal AND present.module_path=named.module_path AND present.namespace=name.namespace))))
+ UNION
+ SELECT name.owner,name.namespace,name.name,'workspace_local'
+ FROM cr_binding_names name CROSS JOIN cr_binding_inventory_openness opened
+ ON opened.owner=name.owner AND opened.namespace=name.namespace
+) WHERE true ON CONFLICT DO NOTHING";
 
 const ADVANCE_DELTA_SQL: &str = "DELETE FROM cr_binding_delta;
  INSERT INTO cr_binding_delta SELECT * FROM cr_binding_delta_next;
@@ -1154,8 +1456,9 @@ const ADVANCE_DELTA_SQL: &str = "DELETE FROM cr_binding_delta;
  DELETE FROM cr_binding_name_next;
  DELETE FROM cr_binding_lookup_new;";
 
-pub(super) const FOREIGN_MACRO_SQL: &str = "INSERT OR IGNORE INTO cr_binding_targets
- SELECT owner.owner,item.namespace,item.name,owner.crate_key,item.module_path,item.name,
+pub(super) const FOREIGN_MACRO_SQL: &str = "INSERT INTO cr_binding_targets
+ SELECT * FROM (
+SELECT owner.owner,item.namespace,item.name,owner.crate_key,item.module_path,item.name,
  0,0,'declaration',item.visibility,item.restricted_module_path
  FROM cr_binding_owners owner CROSS JOIN cr_foreign foreign_crate ON foreign_crate.crate_key=owner.crate_key
  CROSS JOIN rust_crate_macro_items item ON item.topology_id=foreign_crate.topology_id
@@ -1163,13 +1466,15 @@ pub(super) const FOREIGN_MACRO_SQL: &str = "INSERT OR IGNORE INTO cr_binding_tar
  WHERE owner.blob_id=0 AND owner.binder_scope=0 AND (
  EXISTS(SELECT 1 FROM cr_binding_names demand WHERE demand.owner=owner.owner
  AND demand.namespace=item.namespace AND demand.name=item.name)
- OR EXISTS(SELECT 1 FROM cr_binding_globs glob WHERE glob.target_owner=owner.owner))";
+ OR EXISTS(SELECT 1 FROM cr_binding_globs glob WHERE glob.target_owner=owner.owner))
+) WHERE true ON CONFLICT DO NOTHING";
 
 // Presence is independent of the publication frontier. A determined named
 // source with an endpoint queued for publication still blocks every glob in
 // that namespace; absence is concluded only after both facts are settled.
-pub(super) const PRESENT_SQL: &str = "INSERT OR IGNORE INTO cr_binding_import_present
- SELECT source.blob_id,source.import_ordinal,source.module_path,target.namespace
+pub(super) const PRESENT_SQL: &str = "INSERT INTO cr_binding_import_present
+ SELECT * FROM (
+SELECT source.blob_id,source.import_ordinal,source.module_path,target.namespace
  FROM cr_binding_imports source
  CROSS JOIN cr_binding_paths path ON path.blob_id=source.blob_id
  AND path.import_ordinal=source.import_ordinal AND path.module_path=source.module_path
@@ -1186,15 +1491,17 @@ pub(super) const PRESENT_SQL: &str = "INSERT OR IGNORE INTO cr_binding_import_pr
  WHEN 'crate' THEN 'crate' ELSE target.restricted_module_path END)+2)=
  CASE target.visibility WHEN 'private' THEN exporting.module_path
  WHEN 'crate' THEN 'crate' ELSE target.restricted_module_path END || '::')))
-";
+) WHERE true ON CONFLICT DO NOTHING";
 
-pub(super) const FOREIGN_ROOT_SQL: &str = "INSERT OR IGNORE INTO cr_binding_targets
- SELECT owner.owner,'type',route.bound_name,route.target_crate_key,route.target_module_path,'self',
+pub(super) const FOREIGN_ROOT_SQL: &str = "INSERT INTO cr_binding_targets
+ SELECT * FROM (
+SELECT owner.owner,'type',route.bound_name,route.target_crate_key,route.target_module_path,'self',
  0,0,'reexport',route.visibility,route.restricted_module_path
  FROM cr_binding_owners owner CROSS JOIN cr_foreign foreign_crate ON foreign_crate.crate_key=owner.crate_key
  CROSS JOIN rust_crate_reexport_routes route ON route.topology_id=foreign_crate.topology_id
  AND route.module_path=owner.module_path AND route.target_name='self' AND route.visibility='public'
- WHERE owner.blob_id=0 AND owner.binder_scope=0";
+ WHERE owner.blob_id=0 AND owner.binder_scope=0
+) WHERE true ON CONFLICT DO NOTHING";
 
 // Each row depends on one name and on gaps, owners and foreign crates that
 // are fixed while the fixpoint runs, so only the names a pass queued need
@@ -1212,7 +1519,7 @@ INSERT INTO cr_binding_open_names
  UNION
  SELECT name.owner,name.namespace,name.name,
  CASE WHEN json_extract(evidence.value,'$.reason')='CyclicExpansion' THEN 'CyclicExpansion' ELSE 'OpenBoundary' END,COALESCE(json_extract(evidence.value,'$.boundary'),'workspace_local'),
- COALESCE(json_extract(evidence.value,'$.inventory'),'null')
+ CASE WHEN json_extract(evidence.value,'$.inventory.kind')='macro_invocation' AND json_extract(evidence.value,'$.inventory.unit_key')<>(SELECT hex(crate_key) FROM cr_identity) THEN json_remove(json_extract(evidence.value,'$.inventory'),'$.member_blob','$.invocation_occurrence') ELSE COALESCE(json_extract(evidence.value,'$.inventory'),'null') END
  FROM cr_binding_name_delta name CROSS JOIN cr_binding_owners owner ON owner.owner=name.owner
  CROSS JOIN cr_foreign foreign_crate ON foreign_crate.crate_key=owner.crate_key
  CROSS JOIN rust_crate_gaps gap ON gap.topology_id=foreign_crate.topology_id
@@ -1246,14 +1553,17 @@ pub(super) const DESTINATIONS_SQL: &str = "INSERT INTO cr_binding_destinations
  WHERE (source.is_glob=1 OR source.bound_name=mask.name)
  AND (source.blob_id<>mask.blob_id OR source.import_ordinal<>mask.import_ordinal OR source.module_path<>mask.module_path)";
 
-pub(super) const MASK_SEED_SQL: &str = "INSERT OR IGNORE INTO cr_binding_targets
- SELECT mask.owner,target.namespace,target.name,target.target_crate_key,target.target_module_path,target.target_name,
+pub(super) const MASK_SEED_SQL: &str = "INSERT INTO cr_binding_targets
+ SELECT * FROM (
+SELECT mask.owner,target.namespace,target.name,target.target_crate_key,target.target_module_path,target.target_name,
  target.declaration_blob_id,target.declaration_site,target.origin,target.visibility,target.restricted_module_path
  FROM cr_binding_masks mask CROSS JOIN cr_binding_targets target ON target.owner=mask.base_owner
- AND target.name=mask.name AND target.origin='declaration' ";
+ AND target.name=mask.name AND target.origin='declaration'
+) WHERE true ON CONFLICT DO NOTHING";
 
-pub(super) const LOOKUPS_SQL: &str = "INSERT OR IGNORE INTO cr_binding_lookups
- SELECT path.blob_id,path.import_ordinal,path.module_path,path.position,
+pub(super) const LOOKUPS_SQL: &str = "INSERT INTO cr_binding_lookups
+ SELECT * FROM (
+SELECT path.blob_id,path.import_ordinal,path.module_path,path.position,
  CASE WHEN path.owner=source.owner AND name.name=source.bound_name THEN COALESCE(mask.owner,path.owner) ELSE path.owner END,
  name.namespace,name.name
  FROM cr_binding_path_delta path CROSS JOIN cr_binding_imports source
@@ -1266,10 +1576,14 @@ pub(super) const LOOKUPS_SQL: &str = "INSERT OR IGNORE INTO cr_binding_lookups
  FROM cr_binding_path_delta path CROSS JOIN cr_binding_imports source ON source.blob_id=path.blob_id
  AND source.import_ordinal=path.import_ordinal AND source.module_path=path.module_path AND path.position=source.segments
  CROSS JOIN json_each('[\"type\",\"value\",\"macro\"]') namespace WHERE source.is_glob=0 AND source.imported_name IS NOT NULL) name
- ON name.blob_id=path.blob_id AND name.import_ordinal=path.import_ordinal AND name.module_path=path.module_path AND name.position=path.position";
+ ON name.blob_id=path.blob_id AND name.import_ordinal=path.import_ordinal AND name.module_path=path.module_path AND name.position=path.position
+) WHERE true ON CONFLICT DO NOTHING";
 
 // Node ids follow the names' key order, whichever index the planner reads.
-pub(super) const NODES_SQL: &str = "INSERT OR IGNORE INTO cr_binding_nodes(owner,namespace,name) SELECT owner,namespace,name FROM cr_binding_names ORDER BY owner,namespace,name";
+pub(super) const NODES_SQL: &str =
+    "INSERT INTO cr_binding_nodes(owner,namespace,name) SELECT * FROM (
+SELECT owner,namespace,name FROM cr_binding_names ORDER BY owner,namespace,name
+) WHERE true ON CONFLICT DO NOTHING";
 
 // The external-root arm makes a name bound by an import rooted at an unindexed
 // crate wait for that root lookup. A glob binds every name of its destination,
@@ -1283,7 +1597,7 @@ pub(super) const NODES_SQL: &str = "INSERT OR IGNORE INTO cr_binding_nodes(owner
 // glob against an outer scope during import resolution). Otherwise
 // `use std::x::*; use dep::y::*;` makes `std` and `dep` wait on each other's
 // absence, a cycle that never closes.
-pub(super) const DEPENDENCIES_SQL: &str = "INSERT OR IGNORE INTO cr_binding_edges
+pub(super) const DEPENDENCIES_SQL: &str = "INSERT INTO cr_binding_edges
  WITH import_names AS MATERIALIZED (
  -- A destination name an import can bind, with whether it carries the
  -- import's ambiguity. The flag does not depend on the lookup, so it is
@@ -1362,8 +1676,9 @@ pub(super) const CLEAR_EDGES_SQL: &str = "DELETE FROM cr_binding_edges";
 pub(super) const CLEAR_COMPONENTS_SQL: &str = "DELETE FROM cr_binding_components";
 pub(super) const INSERT_COMPONENT_SQL: &str = "INSERT INTO cr_binding_components VALUES(?1,?2)";
 
-pub(super) const SOURCE_OPEN_SQL: &str = "INSERT OR IGNORE INTO cr_binding_open_sources
- SELECT source.blob_id,source.import_ordinal,source.module_path,namespace.value
+pub(super) const SOURCE_OPEN_SQL: &str = "INSERT INTO cr_binding_open_sources
+ SELECT * FROM (
+SELECT source.blob_id,source.import_ordinal,source.module_path,namespace.value
  FROM cr_binding_imports source CROSS JOIN cr_binding_lookups lookup
  ON lookup.blob_id=source.blob_id AND lookup.import_ordinal=source.import_ordinal
  AND lookup.module_path=source.module_path AND lookup.position=0 AND lookup.namespace='type'
@@ -1373,7 +1688,8 @@ pub(super) const SOURCE_OPEN_SQL: &str = "INSERT OR IGNORE INTO cr_binding_open_
  AND (lookup.name IN ('std','core','alloc') OR EXISTS(SELECT 1 FROM cr_dependencies dependency
  WHERE dependency.extern_name=lookup.name AND dependency.dependency_crate_key IS NULL))
  AND NOT EXISTS(SELECT 1 FROM cr_binding_targets strong WHERE strong.owner=lookup.owner
- AND strong.namespace='type' AND strong.name=lookup.name AND strong.origin IN ('declaration','reexport'))";
+ AND strong.namespace='type' AND strong.name=lookup.name AND strong.origin IN ('declaration','reexport'))
+) WHERE true ON CONFLICT DO NOTHING";
 
 // An opaque known macro can mention a binding the crate's glob currently
 // supplies. Its structured transcriber identifiers are a conservative name
@@ -1389,8 +1705,9 @@ pub(super) const SOURCE_OPEN_SQL: &str = "INSERT OR IGNORE INTO cr_binding_open_
 // explicitly imported type alias was opened (#6136). At quiescence every
 // admitted target has passed through PRESENT_SQL, and COMPLETE_SQL and
 // PENDING_SQL, the only readers of open names, run after it.
-pub(super) const MACRO_OPEN_NAMES_SQL: &str = "INSERT OR IGNORE INTO cr_binding_open_names(owner,namespace,name,inventory)
- SELECT name.owner,name.namespace,name.name,
+pub(super) const MACRO_OPEN_NAMES_SQL: &str = "INSERT INTO cr_binding_open_names(owner,namespace,name,inventory)
+ SELECT * FROM (
+SELECT name.owner,name.namespace,name.name,
  CASE WHEN owner.crate_key=(SELECT crate_key FROM cr_identity) THEN gap.detail ELSE 'null' END
  FROM cr_binding_names name CROSS JOIN cr_binding_owners owner ON owner.owner=name.owner
  CROSS JOIN cr_gaps gap ON gap.gap_kind='open_export_inventory' AND gap.subject=owner.module_path
@@ -1407,7 +1724,8 @@ pub(super) const MACRO_OPEN_NAMES_SQL: &str = "INSERT OR IGNORE INTO cr_binding_
  AND (NOT EXISTS(SELECT 1 FROM cr_binding_import_complete done WHERE done.blob_id=named.blob_id AND done.import_ordinal=named.import_ordinal
  AND done.module_path=named.module_path AND done.namespace=name.namespace)
  OR EXISTS(SELECT 1 FROM cr_binding_import_present present WHERE present.blob_id=named.blob_id AND present.import_ordinal=named.import_ordinal
- AND present.module_path=named.module_path AND present.namespace=name.namespace)))";
+ AND present.module_path=named.module_path AND present.namespace=name.namespace)))
+) WHERE true ON CONFLICT DO NOTHING";
 
 #[cfg(test)]
 mod edge_input_tests {

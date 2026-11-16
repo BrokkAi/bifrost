@@ -214,7 +214,8 @@ Anonymous class expressions are queryable as `class`, but the assignment binding
       "code": "unsupported_structural_feature",
       "impact": "incomplete",
       "language": "javascript",
-      "message": "structural adapter for javascript does not support role(s): kwargs"
+      "message": "structural adapter for javascript does not support role(s): kwargs",
+      "incompleteness": "content"
     }
   ]
 }

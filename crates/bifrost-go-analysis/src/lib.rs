@@ -61,14 +61,13 @@ pub mod analyzer {
         resolve_go_semantic_pack_dependencies,
     };
     pub use go::{GoCallResultUseIndex, go_call_result_use};
+    pub use go::{go_explicit_binding_type_identity, go_selected_callable_result_type_identities};
     pub use go::{
-        GoHttpHandlerDispatch, GoHttpHandlerOpenReason, go_http_handler_dispatch,
         go_native_error_bound_function_value_obligations,
         go_native_error_function_value_obligations, go_native_error_result_obligation,
         go_native_obligation_exclusion, reference_assertion_payload_type_is_exact,
         workspace_reference_assertion_accepts_payload,
     };
-    pub use go::{go_explicit_binding_type_identity, go_selected_callable_result_type_identities};
 
     pub mod usages {
         pub mod get_definition {

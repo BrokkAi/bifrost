@@ -12,6 +12,209 @@ use crate::structural::reference_edges::{
 };
 use brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution;
 
+/// A portable exact source occurrence, independent of allocation and artifact handles.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CallPathLocation {
+    pub rel_path: String,
+    pub byte_span: std::ops::Range<usize>,
+    pub display_range: CodeQueryRange,
+}
+
+/// The structured proof used to admit an edge; ordinary UsageProof alone is insufficient.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum StaticCallProof {
+    DirectDeclaration,
+    NonvirtualReceiver,
+    ExactExternalProcedure,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CallPathSource {
+    pub location: CallPathLocation,
+    pub identity: String,
+    pub expansion_origin: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CallPathEdge {
+    pub caller: String,
+    pub call_site: CallPathLocation,
+    pub static_target: String,
+    pub proof: StaticCallProof,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StaticCallPath {
+    pub source: CallPathSource,
+    pub primary_root: CallPathLocation,
+    pub root_identity: String,
+    /// Root outward, including the final selected sink call.
+    pub edges: Vec<CallPathEdge>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum CallPathGap {
+    UnreadableOwner,
+    UncertifiedDispatch,
+    ExternalBodyUnavailable,
+    MissingExpansionProvenance,
+    RelationIncomplete,
+    DepthBoundReached,
+    ExecutionBudget,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CallPathCoverage {
+    Complete,
+    Incomplete(Vec<CallPathGap>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CallPathEvidence {
+    pub paths: Vec<StaticCallPath>,
+    pub coverage: CallPathCoverage,
+    pub truncated: bool,
+}
+
+impl CallPathEvidence {
+    pub fn add_gap(&mut self, gap: CallPathGap) {
+        let CallPathCoverage::Incomplete(gaps) = &mut self.coverage else {
+            self.coverage = CallPathCoverage::Incomplete(vec![gap]);
+            return;
+        };
+        if !gaps.contains(&gap) {
+            gaps.push(gap);
+            gaps.sort_unstable();
+        }
+    }
+
+    pub fn merge(&mut self, other: Self) {
+        self.paths.extend(other.paths);
+        self.truncated |= other.truncated;
+        if let CallPathCoverage::Incomplete(gaps) = other.coverage {
+            for gap in gaps {
+                self.add_gap(gap);
+            }
+        }
+        self.canonicalize();
+        // The source certificates already paid for their owned buffers. Do not
+        // retain extra growth capacity introduced while combining set rows.
+        self.paths.shrink_to_fit();
+        if let CallPathCoverage::Incomplete(gaps) = &mut self.coverage {
+            gaps.shrink_to_fit();
+        }
+    }
+
+    pub fn canonicalize(&mut self) {
+        self.paths.sort_by_cached_key(|path| {
+            (
+                path.source.location.rel_path.clone(),
+                path.source.location.byte_span.start,
+                path.source.location.byte_span.end,
+                path.source.expansion_origin.clone(),
+                path.edges.last().map(|edge| {
+                    (
+                        edge.call_site.rel_path.clone(),
+                        edge.call_site.byte_span.start,
+                        edge.call_site.byte_span.end,
+                        edge.static_target.clone(),
+                    )
+                }),
+                path.edges
+                    .iter()
+                    .map(|edge| {
+                        (
+                            edge.caller.clone(),
+                            edge.call_site.rel_path.clone(),
+                            edge.call_site.byte_span.start,
+                            edge.call_site.byte_span.end,
+                            edge.static_target.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        });
+        self.paths.dedup();
+    }
+
+    /// Validate both endpoints and every correlated edge on retained-unit hydration.
+    pub fn validate(&self) -> bool {
+        let valid_location = |location: &CallPathLocation| {
+            !location.rel_path.is_empty()
+                && !std::path::Path::new(&location.rel_path).is_absolute()
+                && std::path::Path::new(&location.rel_path)
+                    .components()
+                    .all(|part| matches!(part, std::path::Component::Normal(_)))
+                && location.byte_span.start < location.byte_span.end
+                && location.display_range.start_line > 0
+                && location.display_range.start_column > 0
+                && location.display_range.end_column > 0
+                && (location.display_range.end_line != location.display_range.start_line
+                    || location.display_range.end_column >= location.display_range.start_column)
+                && location.display_range.end_line >= location.display_range.start_line
+        };
+        !self.paths.is_empty()
+            && self.paths.iter().all(|path| {
+                valid_location(&path.source.location)
+                    && valid_location(&path.primary_root)
+                    && !path.source.identity.is_empty()
+                    && !path.root_identity.is_empty()
+                    && !path.edges.is_empty()
+                    && path.edges.iter().all(|edge| {
+                        valid_location(&edge.call_site)
+                            && !edge.caller.is_empty()
+                            && !edge.static_target.is_empty()
+                    })
+                    && path.edges.first().is_some_and(|edge| {
+                        edge.caller == path.root_identity
+                            && edge.call_site.rel_path == path.primary_root.rel_path
+                            && edge.call_site.byte_span.start >= path.primary_root.byte_span.start
+                            && edge.call_site.byte_span.end <= path.primary_root.byte_span.end
+                    })
+                    && path
+                        .edges
+                        .windows(2)
+                        .all(|edges| edges[0].static_target == edges[1].caller)
+            })
+    }
+
+    /// Full owned allocations, including vector capacity and endpoint strings.
+    pub fn retained_bytes(&self) -> usize {
+        let location_heap = |location: &CallPathLocation| location.rel_path.capacity();
+        let mut bytes = std::mem::size_of::<Self>()
+            + self.paths.capacity() * std::mem::size_of::<StaticCallPath>();
+        for path in &self.paths {
+            bytes = bytes
+                .saturating_add(location_heap(&path.source.location))
+                .saturating_add(path.source.identity.capacity())
+                .saturating_add(
+                    path.source
+                        .expansion_origin
+                        .as_ref()
+                        .map_or(0, String::capacity),
+                )
+                .saturating_add(location_heap(&path.primary_root))
+                .saturating_add(path.root_identity.capacity())
+                .saturating_add(path.edges.capacity() * std::mem::size_of::<CallPathEdge>());
+            for edge in &path.edges {
+                bytes = bytes
+                    .saturating_add(edge.caller.capacity())
+                    .saturating_add(edge.static_target.capacity())
+                    .saturating_add(location_heap(&edge.call_site));
+            }
+        }
+        if let CallPathCoverage::Incomplete(gaps) = &self.coverage {
+            bytes = bytes.saturating_add(gaps.capacity() * std::mem::size_of::<CallPathGap>());
+        }
+        bytes
+    }
+}
+
 #[derive(Clone)]
 struct CallTraversalWork {
     unit: CodeUnit,
@@ -48,6 +251,10 @@ fn finish_call_declaration_expansions(
     }
     diagnostics.extend(traversal_diagnostics);
     diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
         incompleteness: brokk_bifrost_rql::Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Provider),
         related: Vec::new(),
         source: None,
@@ -170,69 +377,31 @@ pub(super) fn call_declaration_expansions(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     cache_profile: &mut Option<QueryCacheProfile>,
     depth_probe: &mut CallDepthProbeInput,
+    mut projection: Option<&mut super::call_reachability::CallPathProjection<'_, '_>>,
 ) -> (Vec<PipelineExpansion>, bool) {
-    let incoming = matches!(step, QueryStep::Callers(_));
-    if incoming {
-        // A newly registered caller can change a negative membership result
-        // even when the current caller files and their blobs are unchanged.
-        analyzer.record_read(analyzer.workspace_scope_read_key(&Language::ANALYZABLE));
-    }
-    let declared_non_exhaustive = incoming
-        && filter.completeness == brokk_bifrost_rql::CallTraversalCompleteness::ProvenSubset;
-    let diagnostic_start = diagnostics.len();
-    let mut queue = VecDeque::from([CallTraversalWork {
-        unit: declaration.unit.clone(),
-        depth: 0,
-        path_tail: None,
-    }]);
-    let mut paths = Vec::new();
-    let mut emitted = HashSet::default();
-    if depth_probe.enabled {
-        depth_probe
-            .members
-            .insert(declaration.unit.clone(), (declaration.clone(), 0));
-    }
-    let mut expansions = Vec::new();
-    let mut exhausted = false;
-    let mut omitted = 0usize;
-    while let Some(work) = queue.pop_front() {
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return finish_call_declaration_expansions(
-                diagnostics,
-                diagnostic_start,
-                declaration,
-                incoming,
-                declared_non_exhaustive,
-                omitted,
-                expansions,
-                true,
-            );
+    let before = *budget;
+    let answer = (|| {
+        let incoming = matches!(step, QueryStep::Callers(_));
+        let declared_non_exhaustive = incoming
+            && filter.completeness == brokk_bifrost_rql::CallTraversalCompleteness::ProvenSubset;
+        let diagnostic_start = diagnostics.len();
+        let mut queue = VecDeque::from([CallTraversalWork {
+            unit: declaration.unit.clone(),
+            depth: 0,
+            path_tail: None,
+        }]);
+        let mut paths: Vec<CallPathNode> = Vec::new();
+        let mut emitted = HashSet::default();
+        let mut visited = HashSet::from_iter([declaration.unit.clone()]);
+        if depth_probe.enabled {
+            depth_probe
+                .members
+                .insert(declaration.unit.clone(), (declaration.clone(), 0));
         }
-        let relation_diagnostic_start = diagnostics.len();
-        let result = cached_call_relation(
-            analyzer,
-            token,
-            &work.unit,
-            incoming,
-            cache,
-            budget,
-            limits,
-            cancellation,
-            diagnostics,
-            cache_profile,
-        );
-        if declared_non_exhaustive {
-            reclassify_declared_subset_omissions(&mut diagnostics[relation_diagnostic_start..]);
-        } else if filter.proof == Some(UsageProof::Proven) {
-            mark_proven_call_ambiguity_incomplete(&result, diagnostics);
-        }
-        depth_probe.observe_relation(&result, incoming, filter.proof);
-        exhausted |= result.truncated || result.cancelled;
-        for site in result
-            .sites
-            .into_iter()
-            .filter(|site| filter.proof.is_none_or(|proof| proof == site.proof))
-        {
+        let mut expansions = Vec::new();
+        let mut exhausted = false;
+        let mut omitted = 0usize;
+        while let Some(work) = queue.pop_front() {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 return finish_call_declaration_expansions(
                     diagnostics,
@@ -245,54 +414,98 @@ pub(super) fn call_declaration_expansions(
                     true,
                 );
             }
-            let next_unit = if incoming {
-                site.caller.clone()
+            let relation_diagnostic_start = diagnostics.len();
+            let result = cached_call_relation(
+                analyzer,
+                token,
+                &work.unit,
+                incoming,
+                cache,
+                budget,
+                limits,
+                cancellation,
+                diagnostics,
+                cache_profile,
+            );
+            if declared_non_exhaustive {
+                reclassify_declared_subset_omissions(&mut diagnostics[relation_diagnostic_start..]);
+            } else if filter.proof == Some(UsageProof::Proven) {
+                mark_proven_call_ambiguity_incomplete(&result, diagnostics);
+            }
+            depth_probe.observe_relation(&result, incoming, filter.proof);
+            if let Some(projection) = projection.as_deref_mut() {
+                // Read retained relation gaps on every memo hit, independently of
+                // diagnostic deduplication for an earlier source root.
+                projection.observe_relation(&result, incoming);
+            }
+            exhausted |= result.truncated || result.cancelled;
+            let certified = if let Some(projection) = projection.as_deref_mut() {
+                let prefix = work.path_tail.map_or_else(Vec::new, |tail| {
+                    parent_path_values(tail, work.depth, |id| {
+                        (paths[id].via.clone(), paths[id].parent)
+                    })
+                });
+                let owner = if work.depth == 0 {
+                    Some(declaration.clone())
+                } else {
+                    indexed.get(analyzer, &work.unit)
+                };
+                if owner.is_none() {
+                    projection.missing_owner();
+                }
+                owner.map(|owner| {
+                    projection.visit(
+                        analyzer,
+                        &owner,
+                        &prefix,
+                        cache,
+                        budget,
+                        limits,
+                        cancellation,
+                        diagnostics,
+                    )
+                })
             } else {
-                site.callee.clone()
+                None
             };
-            let Some(next) = indexed.get(analyzer, &next_unit) else {
-                omitted = omitted.saturating_add(1);
-                continue;
-            };
-            if !emitted.contains(&next_unit) && emitted.len() >= max_outputs {
-                return finish_call_declaration_expansions(
-                    diagnostics,
-                    diagnostic_start,
-                    declaration,
-                    incoming,
-                    declared_non_exhaustive,
-                    omitted,
-                    expansions,
-                    true,
-                );
+            let mut sites = result
+                .sites
+                .into_iter()
+                .filter(|site| filter.proof.is_none_or(|proof| proof == site.proof))
+                .collect::<Vec<_>>();
+            if projection.is_some() {
+                sites.sort_by_cached_key(|site| {
+                    (
+                        if incoming {
+                            site.caller.fq_name()
+                        } else {
+                            site.callee.fq_name()
+                        },
+                        if incoming {
+                            site.caller.declaration_id().to_string()
+                        } else {
+                            site.callee.declaration_id().to_string()
+                        },
+                        rel_path_string(&site.file),
+                        site.range.start_byte,
+                        site.range.end_byte,
+                        site.callee.declaration_id().to_string(),
+                    )
+                });
             }
-            if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
-                budget.pipeline_rows,
-                limits.max_pipeline_rows,
-            )
-            .allows(1)
-            {
-                return finish_call_declaration_expansions(
-                    diagnostics,
-                    diagnostic_start,
-                    declaration,
-                    incoming,
-                    declared_non_exhaustive,
-                    omitted,
-                    expansions,
-                    true,
-                );
-            }
-            let cycle = match call_path_contains(
-                &paths,
-                work.path_tail,
-                &declaration.unit,
-                &next_unit,
-                &mut budget.provenance_steps,
-                limits.max_pipeline_rows,
-            ) {
-                Some(cycle) => cycle,
-                None => {
+            for site in sites {
+                let certified_site = if projection.is_some() {
+                    let Some(value) = certified
+                        .as_ref()
+                        .and_then(|sites| sites.get(&super::call_reachability::site_key(&site)))
+                    else {
+                        continue;
+                    };
+                    Some(value.clone())
+                } else {
+                    None
+                };
+                if cancellation.is_some_and(CancellationToken::is_cancelled) {
                     return finish_call_declaration_expansions(
                         diagnostics,
                         diagnostic_start,
@@ -304,73 +517,164 @@ pub(super) fn call_declaration_expansions(
                         true,
                     );
                 }
-            };
-            let next_depth = work.depth + 1;
-            if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
-                budget.provenance_steps.saturating_add(next_depth),
-                limits.max_pipeline_rows,
-            )
-            .allows(0)
-            {
-                budget.provenance_steps = limits.max_pipeline_rows;
-                return finish_call_declaration_expansions(
-                    diagnostics,
-                    diagnostic_start,
-                    declaration,
-                    incoming,
-                    declared_non_exhaustive,
-                    omitted,
-                    expansions,
-                    true,
-                );
-            }
-            budget.provenance_steps += next_depth;
-            budget.pipeline_rows += 1;
-            let call_site = CallSiteValue::new(
-                site,
-                CallBindingStatus::Unavailable,
-                None,
-                CallSiteIdentityFacts::default(),
-            );
-            let path_tail = paths.len();
-            paths.push(CallPathNode {
-                value: next.clone(),
-                via: call_site,
-                parent: work.path_tail,
-            });
-            expansions.push(PipelineExpansion {
-                value: PipelineValue::Declaration(next.clone()),
-                trace: call_trace_values(&paths, path_tail, next_depth),
-                budgeted: true,
-            });
-            emitted.insert(next_unit.clone());
-            if depth_probe.enabled {
-                depth_probe
-                    .members
-                    .entry(next_unit.clone())
-                    .and_modify(|(_, depth)| *depth = (*depth).min(next_depth))
-                    .or_insert((next, next_depth));
-            }
-            if !cycle && next_depth < filter.depth.get() {
-                queue.push_back(CallTraversalWork {
-                    unit: next_unit,
-                    depth: next_depth,
-                    path_tail: Some(path_tail),
+                let next_unit = if incoming {
+                    site.caller.clone()
+                } else {
+                    site.callee.clone()
+                };
+                if projection.is_some() && emitted.contains(&next_unit) {
+                    continue;
+                }
+                let Some(next) = indexed.get(analyzer, &next_unit) else {
+                    omitted = omitted.saturating_add(1);
+                    if let Some(projection) = projection.as_deref_mut() {
+                        projection.missing_target_body(&next_unit, diagnostics);
+                    }
+                    continue;
+                };
+                if !emitted.contains(&next_unit) && emitted.len() >= max_outputs {
+                    return finish_call_declaration_expansions(
+                        diagnostics,
+                        diagnostic_start,
+                        declaration,
+                        incoming,
+                        declared_non_exhaustive,
+                        omitted,
+                        expansions,
+                        true,
+                    );
+                }
+                if brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                    budget.pipeline_rows,
+                    limits.max_pipeline_rows,
+                )
+                .try_allow(1)
+                .is_err()
+                {
+                    return finish_call_declaration_expansions(
+                        diagnostics,
+                        diagnostic_start,
+                        declaration,
+                        incoming,
+                        declared_non_exhaustive,
+                        omitted,
+                        expansions,
+                        true,
+                    );
+                }
+                let first_visit = if projection.is_some() {
+                    visited.insert(next_unit.clone())
+                } else {
+                    match call_path_contains(
+                        &paths,
+                        work.path_tail,
+                        &declaration.unit,
+                        &next_unit,
+                        &mut budget.provenance_steps,
+                        limits.max_pipeline_rows,
+                    ) {
+                        Some(cycle) => !cycle,
+                        None => {
+                            return finish_call_declaration_expansions(
+                                diagnostics,
+                                diagnostic_start,
+                                declaration,
+                                incoming,
+                                declared_non_exhaustive,
+                                omitted,
+                                expansions,
+                                true,
+                            );
+                        }
+                    }
+                };
+                let next_depth = work.depth + 1;
+                if brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                    budget.provenance_steps.saturating_add(next_depth),
+                    limits.max_pipeline_rows,
+                )
+                .try_allow(0)
+                .is_err()
+                {
+                    budget.provenance_steps = limits.max_pipeline_rows;
+                    return finish_call_declaration_expansions(
+                        diagnostics,
+                        diagnostic_start,
+                        declaration,
+                        incoming,
+                        declared_non_exhaustive,
+                        omitted,
+                        expansions,
+                        true,
+                    );
+                }
+                budget.provenance_steps += next_depth;
+                budget.pipeline_rows += 1;
+                let call_site = certified_site.unwrap_or_else(|| {
+                    CallSiteValue::new(
+                        site,
+                        CallBindingStatus::Unavailable,
+                        None,
+                        CallSiteIdentityFacts::default(),
+                    )
                 });
+                let path_tail = paths.len();
+                paths.push(CallPathNode {
+                    value: next.clone(),
+                    via: call_site,
+                    parent: work.path_tail,
+                });
+                expansions.push(PipelineExpansion {
+                    value: PipelineValue::Declaration(next.clone()),
+                    trace: call_trace_values(&paths, path_tail, next_depth),
+                    call_path_evidence: None,
+                    budgeted: true,
+                });
+                emitted.insert(next_unit.clone());
+                if depth_probe.enabled {
+                    depth_probe
+                        .members
+                        .entry(next_unit.clone())
+                        .and_modify(|(_, depth)| *depth = (*depth).min(next_depth))
+                        .or_insert((next, next_depth));
+                }
+                if first_visit && next_depth < filter.depth.get() {
+                    queue.push_back(CallTraversalWork {
+                        unit: next_unit,
+                        depth: next_depth,
+                        path_tail: Some(path_tail),
+                    });
+                }
             }
         }
-    }
-    depth_probe.undecided |= omitted > 0;
-    finish_call_declaration_expansions(
-        diagnostics,
-        diagnostic_start,
-        declaration,
-        incoming,
-        declared_non_exhaustive,
-        omitted,
-        expansions,
-        exhausted,
-    )
+        depth_probe.undecided |= omitted > 0;
+        finish_call_declaration_expansions(
+            diagnostics,
+            diagnostic_start,
+            declaration,
+            incoming,
+            declared_non_exhaustive,
+            omitted,
+            expansions,
+            exhausted,
+        )
+    })();
+    let charged = budget.saturating_sub(before);
+    brokk_bifrost_analysis::profiling::note_with(|| {
+        format!(
+            "rql.call_expansion declarations={} sites={} terminals={} limit={} hit={}",
+            charged.call_declarations,
+            charged.call_sites,
+            charged.call_terminals,
+            limits.max_fact_nodes,
+            budget
+                .call_declarations
+                .saturating_add(budget.call_sites)
+                .saturating_add(budget.call_terminals)
+                >= limits.max_fact_nodes,
+        )
+    });
+    answer
 }
 
 fn depth_probe_budget_stopped(result: &CallRelationResult) -> bool {
@@ -397,7 +701,7 @@ fn cached_depth_probe_relation(
     cancellation: Option<&CancellationToken>,
 ) -> Arc<CachedDepthProbeRelation> {
     let key = (unit.clone(), incoming);
-    cache
+    let entry = cache
         .relations
         .read_mut(&memo_attribution(analyzer), |entries| {
             if let Some(entry) = entries.get_mut(&key) {
@@ -414,7 +718,7 @@ fn cached_depth_probe_relation(
                 return Arc::clone(entry);
             }
             let mut diagnostics = Vec::new();
-            let result = cached_call_relation(
+            let result = super::relations::unadmitted_call_relation(
                 analyzer,
                 token,
                 unit,
@@ -437,7 +741,15 @@ fn cached_depth_probe_relation(
                 entries.insert(key, Arc::clone(&entry));
             }
             entry
-        })
+        });
+    let mut admitted = (*entry).clone();
+    admitted.result = super::relations::admit_call_relation(
+        admitted.result,
+        budget,
+        limits,
+        &mut admitted.diagnostics,
+    );
+    Arc::new(admitted)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -452,6 +764,7 @@ pub(super) fn probe_call_depth_bound(
     cancellation: Option<&CancellationToken>,
     depth_probe: &mut CallDepthProbeInput,
 ) -> DepthBoundStatus {
+    let before = *budget;
     let mut indexed = IndexedDeclarations::default();
     let incoming = matches!(step, QueryStep::Callers(_));
     let mut frontier = depth_probe
@@ -484,9 +797,6 @@ pub(super) fn probe_call_depth_bound(
         let probe = cache
             .depth_probe
             .get_or_insert_with(|| Box::new(CallDepthProbeCache::default()));
-        if incoming && !frontier.is_empty() {
-            analyzer.record_read(analyzer.workspace_scope_read_key(&Language::ANALYZABLE));
-        }
         for unit in frontier {
             let read_scope =
                 brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::for_advisory_read(analyzer);
@@ -534,6 +844,7 @@ pub(super) fn probe_call_depth_bound(
                 .any(brokk_bifrost_analysis::analyzer::QueryReadIncomplete::is_execution_dependent)
             {
                 analyzer.mark_execution_dependent();
+                cache.reuse.join_in(EXECUTION_DEPENDENT);
             }
             uncertain |= !read_gaps.is_empty();
             if uncertain {
@@ -544,6 +855,17 @@ pub(super) fn probe_call_depth_bound(
             }
         }
     }
+    let charged = budget.saturating_sub(before);
+    brokk_bifrost_analysis::profiling::note_with(|| {
+        format!(
+            "rql.call_depth_probe declarations={} sites={} terminals={} limit={} hit={}",
+            charged.call_declarations,
+            charged.call_sites,
+            charged.call_terminals,
+            limits.max_fact_nodes,
+            answer.budget_stopped,
+        )
+    });
     let status = answer.status();
     depth_probe.answer = Some(answer);
     status
@@ -595,6 +917,7 @@ mod depth_probe_tests {
             &mut Vec::new(),
             &mut None,
             &mut input,
+            None,
         );
         assert!(!exhausted);
         assert_eq!(
@@ -623,13 +946,11 @@ mod depth_probe_tests {
                 !partial.sites.is_empty(),
                 "the partial relation retains its edge"
             );
-            partial.diagnostics.push(CallRelationDiagnostic {
-                code,
-                message: "a bounded relation omitted an undecided declaration".into(),
-                context: "bounded relation".into(),
-                semantic_count: None,
-                reason_kind: None,
-            });
+            let mut relation_diagnostic = CallRelationDiagnostic::new(code, brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationDiagnosticPayload::Failure { reason: brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationFailure::Upstream { kind: "fixture".into() } }, "bounded relation".into());
+            if code == CallRelationDiagnosticCode::AnalysisFailed {
+                relation_diagnostic.reason_kind = Some("fixture".into());
+            }
+            partial.diagnostics.push(relation_diagnostic);
             cache
                 .outgoing
                 .read_mut(&memo_attribution(analyzer), |entries| {
@@ -651,6 +972,7 @@ mod depth_probe_tests {
                 &mut Vec::new(),
                 &mut None,
                 &mut input,
+                None,
             );
             assert!(!rows.is_empty(), "{code:?} must retain the bounded edge");
             assert_eq!(
@@ -692,13 +1014,7 @@ mod depth_probe_tests {
             },
         );
         let result = CallRelationResult {
-            diagnostics: vec![CallRelationDiagnostic {
-                code: CallRelationDiagnosticCode::CandidatesOmitted,
-                message: "unprojectable caller".to_string(),
-                context: "caller inventory".to_string(),
-                semantic_count: None,
-                reason_kind: None,
-            }],
+            diagnostics: vec![CallRelationDiagnostic::new(CallRelationDiagnosticCode::CandidatesOmitted, brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationDiagnosticPayload::Failure { reason: brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationFailure::Upstream { kind: "fixture".into() } }, "caller inventory".to_string())],
             ..CallRelationResult::default()
         };
         let mut cache = CallTraversalCache::default();
@@ -731,6 +1047,7 @@ mod depth_probe_tests {
             &mut Vec::new(),
             &mut None,
             &mut input,
+            None,
         );
         assert!(rows.is_empty());
         assert!(!exhausted);
@@ -964,6 +1281,7 @@ mod depth_probe_tests {
             &mut Vec::new(),
             &mut None,
             &mut input,
+            None,
         );
         assert!(!exhausted);
         let stopped = probe_call_depth_bound(
@@ -1077,8 +1395,9 @@ fn call_path_contains(
         return Some(true);
     }
     while let Some(index) = tail {
-        if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(*work, max_work)
-            .allows(1)
+        if brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(*work, max_work)
+            .try_allow(1)
+            .is_err()
         {
             return None;
         }
@@ -1143,16 +1462,16 @@ pub(super) fn inbound_reference_expansions(
         let diagnostic_start = diagnostics.len();
         let remaining_files = limits
             .max_scanned_files
-            .saturating_sub(budget.scanned_files);
+            .saturating_sub(budget.scanned_files.saturating_add(budget.call_scanned_files));
         if remaining_files == 0 {
-            push_budget_diagnostic(diagnostics, budget);
+            push_spent_budget_diagnostic(diagnostics, budget, limits, 0);
             return (Vec::new(), true);
         }
         let remaining_source_bytes = limits
             .max_scanned_source_bytes
-            .saturating_sub(budget.scanned_source_bytes);
+            .saturating_sub(budget.scanned_source_bytes.saturating_add(budget.call_scanned_source_bytes));
         if remaining_source_bytes == 0 {
-            push_budget_diagnostic(diagnostics, budget);
+            push_spent_budget_diagnostic(diagnostics, budget, limits, 1);
             return (Vec::new(), true);
         }
         let mut finder = UsageFinder::new();
@@ -1169,6 +1488,35 @@ pub(super) fn inbound_reference_expansions(
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return (Vec::new(), true);
         }
+        // Keep provider admission witnesses on its existing truncation code.
+        // A new global ExecutionBudgetExhausted diagnostic would trigger a
+        // union retry, changing query execution merely to report telemetry.
+        let reference_start = *budget;
+        let admission_roots = [
+            query.candidate_files_budget_exhausted.then(|| {
+                let limit = MAX_SCANNED_FILES.min(remaining_files);
+                ("query/scanned_files", reference_start.scanned_files, limit, limit, limit)
+            }),
+            query.source_byte_refusal.map(|(consumed, attempted, limit)| {
+                ("query/scanned_source_bytes", reference_start.scanned_source_bytes,
+                    consumed, attempted, limit)
+            }),
+        ].into_iter().flatten().map(|(lane, prior, consumed, attempted, limit)| {
+            let limit = prior.saturating_add(limit);
+            let consumed = prior.saturating_add(consumed);
+            let attempted = prior.saturating_add(attempted);
+            CodeQueryExhaustedRoot {
+                path: ".".to_string(), procedure: None, lane: lane.to_string(),
+                stage: Some("reference_scan".to_string()),
+                budget: Some(CodeQueryExhaustedBudget {
+                    consumed, limit,
+                }),
+                charge: (attempted > limit).then_some(CodeQueryExhaustedCharge {
+                    attempted, limit,
+                }),
+                feedback_iteration: None,
+            }
+        }).collect::<Vec<_>>();
         let examined_references = fuzzy_result_examination_count(&query.result);
         if charge_reference_scan(
             budget,
@@ -1177,7 +1525,12 @@ pub(super) fn inbound_reference_expansions(
             query.scanned_source_bytes,
             examined_references,
         ) {
-            push_budget_diagnostic(diagnostics, budget);
+            push_budget_diagnostic(diagnostics, budget, limits, Some(&reference_start), "reference_scan");
+            let diagnostic = diagnostics.iter_mut().find(|diagnostic| {
+                diagnostic.branch.is_empty()
+                    && diagnostic.code == CodeQueryDiagnosticCode::ExecutionBudgetExhausted
+            }).expect("the rejected charge recorded its diagnostic");
+            extend_budget_lane_witnesses(&mut diagnostic.exhausted_roots, admission_roots);
             inbound.insert(declaration.unit.clone(), Vec::new());
             if cache_profile.is_some() {
                 cache.inbound_incomplete.insert(declaration.unit.clone());
@@ -1193,6 +1546,10 @@ pub(super) fn inbound_reference_expansions(
         if report && query.source_bytes_truncated {
             exhausted = true;
             diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                 incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                 related: Vec::new(),
                 source: None,
@@ -1205,12 +1562,16 @@ pub(super) fn inbound_reference_expansions(
                     "references_of source-byte budget truncated candidate files for {}",
                     declaration.unit.fq_name()
                 ),
-                exhausted_roots: Vec::new(),
+                exhausted_roots: admission_roots,
                 withheld_rows_path: None,
             }));
         } else if report && query.candidate_files_truncated {
             exhausted = true;
             diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                 incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                 related: Vec::new(),
                 source: None,
@@ -1223,7 +1584,7 @@ pub(super) fn inbound_reference_expansions(
                     "references_of candidate files were truncated for {}",
                     declaration.unit.fq_name()
                 ),
-                exhausted_roots: Vec::new(),
+                exhausted_roots: admission_roots,
                 withheld_rows_path: None,
             }));
         }
@@ -1234,6 +1595,10 @@ pub(super) fn inbound_reference_expansions(
             && report
         {
             diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                 incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                 related: Vec::new(),
                 source: None,
@@ -1243,9 +1608,16 @@ pub(super) fn inbound_reference_expansions(
                 branch: Vec::new(),
                 language: crate::analyzer::common::language_for_file(declaration.unit.source())
                     .config_label(),
-                message: format!(
-                    "references_of analysis is incomplete for {}: {reasons:?}",
-                    declaration.unit.fq_name()
+                message: brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+                    format_args!(
+                        "references_of analysis is incomplete for {}: {reasons:?}",
+                        declaration.unit.fq_name()
+                    ),
+                    format_args!(
+                        "references_of analysis is incomplete for {}",
+                        declaration.unit.fq_name()
+                    ),
+                    reasons.iter(),
                 ),
                 withheld_rows_path: None,
             }));
@@ -1289,6 +1661,10 @@ pub(super) fn inbound_reference_expansions(
                         );
                     if omitted > 0 {
                         diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                             incompleteness: brokk_bifrost_rql::Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Provider),
                             related: Vec::new(),
                             source: None,
@@ -1324,6 +1700,10 @@ pub(super) fn inbound_reference_expansions(
                 exhausted = true;
                 if report {
                     diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                         incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                         related: Vec::new(),
                         source: None,
@@ -1346,6 +1726,10 @@ pub(super) fn inbound_reference_expansions(
             FuzzyResult::Failure { reason, .. } => {
                 if report {
                     diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                         incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                         related: Vec::new(),
                         source: None,
@@ -1440,6 +1824,10 @@ pub(super) fn inbound_reference_expansions(
             diagnostic.code != CodeQueryDiagnosticCode::ReferenceTargetsAmbiguous
         });
         diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
             incompleteness: brokk_bifrost_rql::Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Provider),
             related: Vec::new(),
             source: None,
@@ -1515,6 +1903,7 @@ pub(super) struct OutboundLookupCandidates {
     pub(super) ambiguous_sites: usize,
     pub(super) ambiguous_candidates_complete: bool,
     pub(super) omitted_sites: usize,
+    pub(super) omissions: BTreeMap<CodeQueryDiagnosticCode, Vec<UsesOmissionSite>>,
 }
 
 pub(super) fn group_outbound_lookup_candidates(
@@ -1526,9 +1915,55 @@ pub(super) fn group_outbound_lookup_candidates(
         ambiguous_sites: 0,
         ambiguous_candidates_complete: true,
         omitted_sites: 0,
+        omissions: BTreeMap::new(),
     };
 
     for outcome in outcomes {
+        let range = outcome
+            .reference
+            .as_ref()
+            .map(|r| (r.focus_start_byte, r.focus_end_byte));
+        let omission = match outcome.status {
+            DefinitionLookupStatus::NotAReference => continue,
+            DefinitionLookupStatus::Cancelled => Some((
+                CodeQueryDiagnosticCode::Cancelled,
+                UsesOmissionEvidence::Unresolved {
+                    status: outcome.status,
+                },
+            )),
+            DefinitionLookupStatus::ExceededBudget(_) => Some((
+                CodeQueryDiagnosticCode::UsesCandidateLimit,
+                UsesOmissionEvidence::Unresolved {
+                    status: outcome.status,
+                },
+            )),
+            DefinitionLookupStatus::Unavailable => Some((
+                CodeQueryDiagnosticCode::UsesCandidateUnavailable,
+                UsesOmissionEvidence::Unavailable {
+                    inventory_evidence: outcome.inventory_evidence.clone(),
+                },
+            )),
+            DefinitionLookupStatus::Incomplete => Some((
+                CodeQueryDiagnosticCode::UsesCandidateIncomplete,
+                UsesOmissionEvidence::Incomplete {
+                    evidence: outcome.incomplete_evidence.clone(),
+                },
+            )),
+            DefinitionLookupStatus::Resolved | DefinitionLookupStatus::Ambiguous => None,
+            status => Some((
+                CodeQueryDiagnosticCode::UsesCandidateUnresolved,
+                UsesOmissionEvidence::Unresolved { status },
+            )),
+        };
+        if let Some((code, evidence)) = omission {
+            grouped
+                .omissions
+                .entry(code)
+                .or_default()
+                .push(UsesOmissionSite { range, evidence });
+            grouped.omitted_sites += 1;
+            continue;
+        }
         let ambiguous = outcome.status == DefinitionLookupStatus::Ambiguous;
         match outcome.status {
             DefinitionLookupStatus::Resolved | DefinitionLookupStatus::Ambiguous => {}
@@ -1541,11 +1976,27 @@ pub(super) fn group_outbound_lookup_candidates(
             grouped.ambiguous_sites = grouped.ambiguous_sites.saturating_add(1);
         }
         let Some(reference) = outcome.reference else {
+            grouped
+                .omissions
+                .entry(CodeQueryDiagnosticCode::UsesReferenceProjectionMissing)
+                .or_default()
+                .push(UsesOmissionSite {
+                    range,
+                    evidence: UsesOmissionEvidence::ReferenceProjectionMissing,
+                });
             grouped.omitted_sites = grouped.omitted_sites.saturating_add(1);
             grouped.ambiguous_candidates_complete &= !ambiguous;
             continue;
         };
         if outcome.definitions.is_empty() {
+            grouped
+                .omissions
+                .entry(CodeQueryDiagnosticCode::UsesDefinitionProjectionMissing)
+                .or_default()
+                .push(UsesOmissionSite {
+                    range,
+                    evidence: UsesOmissionEvidence::DefinitionProjectionMissing,
+                });
             grouped.omitted_sites = grouped.omitted_sites.saturating_add(1);
             grouped.ambiguous_candidates_complete &= !ambiguous;
             continue;
@@ -1568,10 +2019,14 @@ pub(super) fn append_outbound_lookup_diagnostics(
     file: &ProjectFile,
     ambiguous_sites: usize,
     ambiguous_candidates_complete: bool,
-    omitted: usize,
+    omissions: BTreeMap<CodeQueryDiagnosticCode, Vec<UsesOmissionSite>>,
 ) {
     if ambiguous_sites > 0 && ambiguous_candidates_complete {
         diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            has_non_utf8_refusal: false,
+            refusal_sites: Default::default(),
+            call_relation_facts: None,
+            uses_omissions: Vec::new(),
             incompleteness: brokk_bifrost_rql::Incompleteness::Content,
             related: Vec::new(),
             source: None,
@@ -1588,12 +2043,17 @@ pub(super) fn append_outbound_lookup_diagnostics(
             withheld_rows_path: None,
         }));
     }
-    if omitted > 0 {
+    for (code, uses_omissions) in omissions {
+        let omitted = uses_omissions.len();
         diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
-            incompleteness: brokk_bifrost_rql::Incompleteness::Operational(brokk_bifrost_rql::DiagnosticExecutionCause::Provider),
+            has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+            call_relation_facts: None,
+            uses_omissions,
+            incompleteness: brokk_bifrost_rql::Incompleteness::Operational(code.inherent_execution_cause().unwrap_or(brokk_bifrost_rql::DiagnosticExecutionCause::Provider)),
             related: Vec::new(),
             source: None,
-            code: CodeQueryDiagnosticCode::UsesCandidatesOmitted,
+            code,
             impact: CodeQueryDiagnosticImpact::Incomplete,
             branch: Vec::new(),
             language: language.config_label(),
@@ -1629,16 +2089,25 @@ pub(super) fn scan_outbound_reference_hits(
                 line!()
             )
         });
+        // The execution-state diagnostic this pushes carries the dependence into
+        // the query's reuse verdict.
         analyzer.mark_execution_dependent();
         diagnostics.push(super::QueryExecutionState::diagnostic(
             analyzer,
             CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: vec![UsesOmissionSite {
+                    range: None,
+                    evidence: UsesOmissionEvidence::IndexedSourceUnavailable,
+                }],
                 incompleteness: brokk_bifrost_rql::Incompleteness::Operational(
                     brokk_bifrost_rql::DiagnosticExecutionCause::Provider,
                 ),
                 related: Vec::new(),
                 source: None,
-                code: CodeQueryDiagnosticCode::UsesCandidatesOmitted,
+                code: CodeQueryDiagnosticCode::UsesIndexedSourceUnavailable,
                 impact: CodeQueryDiagnosticImpact::Incomplete,
                 branch: Vec::new(),
                 language: language.config_label(),
@@ -1653,21 +2122,37 @@ pub(super) fn scan_outbound_reference_hits(
         ));
         return (Vec::new(), true);
     };
-    let remaining_source_bytes = limits
-        .max_scanned_source_bytes
-        .saturating_sub(budget.scanned_source_bytes);
-    if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
-        budget.scanned_files,
+    let remaining_source_bytes = limits.max_scanned_source_bytes.saturating_sub(
+        budget
+            .scanned_source_bytes
+            .saturating_add(budget.call_scanned_source_bytes),
+    );
+    if brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+        budget
+            .scanned_files
+            .saturating_add(budget.call_scanned_files),
         limits.max_scanned_files,
     )
-    .allows(1)
-        || !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+    .try_allow(1)
+    .is_err()
+        || brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
             0,
             remaining_source_bytes,
         )
-        .allows(source.len())
+        .try_allow(source.len())
+        .is_err()
     {
-        push_budget_diagnostic(diagnostics, budget);
+        let mut attempted = *budget;
+        attempted.scanned_files = attempted.scanned_files.saturating_add(1);
+        attempted.scanned_source_bytes =
+            attempted.scanned_source_bytes.saturating_add(source.len());
+        push_budget_diagnostic(
+            diagnostics,
+            &attempted,
+            limits,
+            Some(budget),
+            "call_source_admission",
+        );
         return (Vec::new(), true);
     }
     budget.scanned_files += 1;
@@ -1682,6 +2167,10 @@ pub(super) fn scan_outbound_reference_hits(
     };
     let Ok(Some(tree)) = parsed else {
         diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            has_non_utf8_refusal: false,
+            refusal_sites: Default::default(),
+            call_relation_facts: None,
+            uses_omissions: Vec::new(),
             incompleteness,
             related: Vec::new(),
             source: None,
@@ -1700,7 +2189,7 @@ pub(super) fn scan_outbound_reference_hits(
         .max_fact_nodes
         .saturating_sub(budget.fact_nodes.saturating_add(budget.examined_references));
     if remaining_reference_budget == 0 {
-        push_budget_diagnostic(diagnostics, budget);
+        push_spent_budget_diagnostic(diagnostics, budget, limits, 2);
         return (Vec::new(), true);
     }
     let retained_work_budget = max_step_outputs.saturating_mul(64).max(256);
@@ -1730,9 +2219,13 @@ pub(super) fn scan_outbound_reference_hits(
     budget.examined_references = budget.examined_references.saturating_add(ranges.len());
     if exhausted {
         if candidate_limit == remaining_reference_budget {
-            push_budget_diagnostic(diagnostics, budget);
+            push_spent_budget_diagnostic(diagnostics, budget, limits, 2);
         } else {
             diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                 incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                 related: Vec::new(),
                 source: None,
@@ -1752,6 +2245,10 @@ pub(super) fn scan_outbound_reference_hits(
     if candidate_limit == 0 {
         exhausted = true;
         diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            has_non_utf8_refusal: false,
+            refusal_sites: Default::default(),
+            call_relation_facts: None,
+            uses_omissions: Vec::new(),
             incompleteness: brokk_bifrost_rql::Incompleteness::Content,
             related: Vec::new(),
             source: None,
@@ -1802,6 +2299,7 @@ pub(super) fn scan_outbound_reference_hits(
     candidate_files.insert(file.clone());
     let provider = ExplicitCandidateProvider::new(Arc::new(candidate_files));
     let mut hits = Vec::new();
+    let mut truncated_targets = BTreeSet::new();
     for (target, candidate_ranges) in &grouped.by_target {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return (Vec::new(), true);
@@ -1826,6 +2324,10 @@ pub(super) fn scan_outbound_reference_hits(
         } = &result.result
         {
             diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                 incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                 related: Vec::new(),
                 source: None,
@@ -1834,9 +2336,13 @@ pub(super) fn scan_outbound_reference_hits(
                 impact: CodeQueryDiagnosticImpact::Incomplete,
                 branch: Vec::new(),
                 language: language.config_label(),
-                message: format!(
-                    "uses analysis is incomplete for {}: {reasons:?}",
-                    target.fq_name()
+                message: brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+                    format_args!(
+                        "uses analysis is incomplete for {}: {reasons:?}",
+                        target.fq_name()
+                    ),
+                    format_args!("uses analysis is incomplete for {}", target.fq_name()),
+                    reasons.iter(),
                 ),
                 withheld_rows_path: None,
             }));
@@ -1845,7 +2351,12 @@ pub(super) fn scan_outbound_reference_hits(
             reference_hits_for_target(analyzer, result.result, target);
         if target_truncated {
             exhausted = true;
+            truncated_targets.insert(target.clone());
             diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                 incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                 related: Vec::new(),
                 source: None,
@@ -1857,7 +2368,7 @@ pub(super) fn scan_outbound_reference_hits(
                     "uses retained a bounded positive reference sample for {} after the usage analyzer reached its candidate limit",
                     target.fq_name()
                 ),
-            exhausted_roots: Vec::new(),
+                exhausted_roots: Vec::new(),
                 withheld_rows_path: None,
             }));
         }
@@ -1870,7 +2381,7 @@ pub(super) fn scan_outbound_reference_hits(
         }
     }
 
-    let mut omitted = grouped.omitted_sites;
+    let mut omissions = grouped.omissions;
     let mut ambiguous_candidates_complete = grouped.ambiguous_candidates_complete;
     for (range, expectation) in &grouped.sites {
         let fully_retained = expectation
@@ -1878,7 +2389,22 @@ pub(super) fn scan_outbound_reference_hits(
             .iter()
             .all(|target| retained_candidates.contains(&(target.clone(), *range)));
         if !fully_retained {
-            omitted = omitted.saturating_add(1);
+            for target in &expectation.targets {
+                if !retained_candidates.contains(&(target.clone(), *range))
+                    && !truncated_targets.contains(target)
+                {
+                    omissions
+                        .entry(CodeQueryDiagnosticCode::UsesInverseUnconfirmed)
+                        .or_default()
+                        .push(UsesOmissionSite {
+                            range: Some(*range),
+                            evidence: UsesOmissionEvidence::InverseUnconfirmed {
+                                target: target.clone(),
+                                range: *range,
+                            },
+                        });
+                }
+            }
             if expectation.ambiguous {
                 ambiguous_candidates_complete = false;
             }
@@ -1890,7 +2416,31 @@ pub(super) fn scan_outbound_reference_hits(
         file,
         grouped.ambiguous_sites,
         ambiguous_candidates_complete,
-        omitted,
+        omissions,
     );
     (hits, exhausted)
+}
+
+impl<'de> Deserialize<'de> for CallPathEvidence {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            paths: Vec<StaticCallPath>,
+            coverage: CallPathCoverage,
+            truncated: bool,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let evidence = Self {
+            paths: wire.paths,
+            coverage: wire.coverage,
+            truncated: wire.truncated,
+        };
+        if !evidence.validate() {
+            return Err(serde::de::Error::custom(
+                "invalid static call-path certificate",
+            ));
+        }
+        Ok(evidence)
+    }
 }

@@ -452,7 +452,8 @@ pub fn is_call_expression_node(node: Node<'_>, language: Language) -> bool {
             node.kind(),
             "invocation_expression" | "object_creation_expression"
         ),
-        Language::Ruby => node.kind() == "call",
+        // `r[i]` and `r[i] = v` call `[]` and `[]=`.
+        Language::Ruby => matches!(node.kind(), "call" | "element_reference"),
         Language::Kotlin => matches!(node.kind(), "call_expression" | "constructor_invocation"),
         Language::None => false,
     }
@@ -488,7 +489,7 @@ pub fn callee_node_for_call<'tree>(node: Node<'tree>, language: Language) -> Opt
         Language::Kotlin => {
             crate::analyzer::languages::language_knowledge(language)?.call_callee_node(node)
         }
-        Language::Ruby => node.child_by_field_name("method"),
+        Language::Ruby => brokk_bifrost_ruby::syntax::ruby_callee_token(node),
         _ => node
             .child_by_field_name("function")
             .or_else(|| node.child_by_field_name("name"))

@@ -44,8 +44,11 @@ use brokk_bifrost_analysis::analyzer::semantic::{
     ProgramPointHandle, SemanticLocator, WorkspaceIcfgProvider, WorkspaceRelativePath,
 };
 use brokk_bifrost_analysis::analyzer::semantic_model::ActiveSemanticModelSnapshot;
+use brokk_bifrost_analysis::analyzer::store::cache_budget::RetainedHeap;
 use brokk_bifrost_flow::dataflow::{SemanticInputStatus, SolverTermination, SummaryWitness};
-use brokk_bifrost_flow::taint::{TaintAnalysisPlan, TaintFindingReport};
+use brokk_bifrost_flow::taint::{
+    ProductionTaintAnalysisResult, TaintAnalysisPlan, TaintBatch, TaintFindingReport,
+};
 use brokk_bifrost_flow::value_flow::{ValueFlowEventKind, ValueFlowIncompleteCause};
 use brokk_bifrost_rql::structural::CodeQueryCompletion;
 
@@ -218,6 +221,42 @@ pub(crate) struct CandidatePass {
 }
 
 impl CandidatePass {
+    pub(crate) fn discard_projection(&mut self) {
+        // A negative/counterfactual question has finished using the ordinary
+        // finding projector. Do not keep its duplicate prepared/public rows
+        // alive just to compare the actual solver inputs.
+        self.evaluator = ProductionTaintPolicyEvaluator::default();
+    }
+
+    pub(crate) fn discard_negative_display(&mut self) {
+        self.discard_projection();
+        if let Some(solve) = &mut self.solve {
+            assert!(
+                !solve.reached,
+                "only an unreached authored candidate discards its display evidence"
+            );
+            solve.witnesses = Vec::new();
+            solve.store_crossings = Vec::new();
+        }
+    }
+    pub(crate) fn collective_kill_dependence(&self, relaxed: &Self) -> Result<(), &'static str> {
+        if !self.selection_gaps.is_empty() || !relaxed.selection_gaps.is_empty() {
+            return Err("the authored or counterfactual selector coverage is incomplete");
+        }
+        if self.store_channel_search || relaxed.store_channel_search {
+            return Err(
+                "the actual store inventory and seed closure have no established correspondence",
+            );
+        }
+        let (Some(strict), Some(loose)) = (&self.solve, &relaxed.solve) else {
+            return Err("one candidate execution produced no solved relation");
+        };
+        if strict.kills.is_empty() {
+            return Err("the authored candidate has no bound declared kill set");
+        }
+        strict.collective_kill_dependence(loose)
+    }
+
     fn stopped(boundary: CandidateBoundary) -> Self {
         Self {
             origin: CandidateBinding::Unevaluated,
@@ -246,6 +285,24 @@ pub(crate) struct CandidateSolve {
     store_crossings: Vec<(Arc<SummaryWitness>, Option<usize>, StoreCrossingProvenance)>,
     /// The kills bound inside the candidate regions, in compile order.
     kills: Vec<CandidateKill>,
+    inputs: CandidateInputs,
+}
+
+/// Owned products of this execution, never a portable admission certificate.
+enum CandidateInputs {
+    Native {
+        analyses: Vec<Arc<ProductionTaintAnalysisResult>>,
+        origin: SiteKey,
+        observation: SiteKey,
+    },
+    Composed {
+        batches: Vec<TaintBatch>,
+        reports: Box<[Option<super::ComposedCandidateReport>]>,
+        origin: SiteKey,
+        observation: SiteKey,
+    },
+    Unavailable(&'static str),
+    RetentionRefused,
 }
 
 struct CandidateKill {
@@ -254,6 +311,294 @@ struct CandidateKill {
 }
 
 impl CandidateSolve {
+    pub(crate) fn input_retention_refused(&self) -> bool {
+        matches!(self.inputs, CandidateInputs::RetentionRefused)
+    }
+
+    /// Complete strict absence and a corresponding relaxed meeting establish
+    /// dependence on the collective bound kill set, independently of display
+    /// path retention. No result's IDs or admission are used in the other run.
+    fn collective_kill_dependence(&self, relaxed: &Self) -> Result<(), &'static str> {
+        if matches!(&self.inputs, CandidateInputs::Composed { .. }) {
+            return self.composed_kill_dependence(relaxed);
+        }
+        let CandidateInputs::Native {
+            analyses: strict,
+            origin,
+            observation,
+            ..
+        } = &self.inputs
+        else {
+            return Err(match &self.inputs {
+                CandidateInputs::Unavailable(reason) => reason,
+                CandidateInputs::RetentionRefused => {
+                    "the report allowance refused retained input products"
+                }
+                CandidateInputs::Native { .. } => unreachable!(),
+                CandidateInputs::Composed { .. } => "the two passes used different engines",
+            });
+        };
+        let CandidateInputs::Native {
+            analyses: loose,
+            origin: loose_origin,
+            observation: loose_observation,
+            ..
+        } = &relaxed.inputs
+        else {
+            return Err(match &relaxed.inputs {
+                CandidateInputs::Unavailable(reason) => reason,
+                CandidateInputs::RetentionRefused => {
+                    "the report allowance refused retained input products"
+                }
+                CandidateInputs::Native { .. } => unreachable!(),
+                CandidateInputs::Composed { .. } => "the two passes used different engines",
+            });
+        };
+        if origin != loose_origin
+            || observation != loose_observation
+            || strict.is_empty()
+            || strict.len() != loose.len()
+        {
+            return Err(
+                "the actual source, observation or region inventory differs between passes",
+            );
+        }
+        if !self.boundaries.is_empty() || !relaxed.boundaries.is_empty() {
+            return Err("an actual candidate execution retains an open coverage boundary");
+        }
+        let mut positive = false;
+        for (index, analysis) in strict.iter().enumerate() {
+            if strict[..index].iter().any(|previous| {
+                previous.plan().value_flow().root() == analysis.plan().value_flow().root()
+            }) {
+                return Err("the correspondence between solved regions is ambiguous");
+            }
+            let mut corresponding = loose.iter().filter(|candidate| {
+                candidate.plan().value_flow().root() == analysis.plan().value_flow().root()
+            });
+            let Some(other) = corresponding.next() else {
+                return Err("a solved region has no corresponding relaxed region");
+            };
+            if corresponding.next().is_some() {
+                return Err("the correspondence between solved regions is ambiguous");
+            }
+            if !analysis.plan_report_match() || !other.plan_report_match() {
+                return Err("a retained result does not belong to its own executed plan");
+            }
+            let complete = |report: &TaintFindingReport| {
+                report.result().termination().is_fixed_point()
+                    && (report.is_complete()
+                        || (report.is_proven_by_authored_summaries()
+                            && !report.authored_arm_closures().is_empty()))
+            };
+            if !complete(analysis.report()) || !complete(other.report()) {
+                return Err("the actual source or accepted-meeting domain did not complete");
+            }
+            if analysis.report().authored_arm_closures() != other.report().authored_arm_closures() {
+                return Err("the actual authored model closure differs between passes");
+            }
+            if !analysis
+                .plan()
+                .has_same_inputs_without_sanitizers(other.plan())
+            {
+                return Err(
+                    "actual nonkill inputs, endpoint bindings or bound kill removal do not correspond",
+                );
+            }
+            if [analysis, other].into_iter().any(|analysis| {
+                analysis.report().findings().iter().any(|finding| {
+                    observation.matches(finding.key().sink().site())
+                        && (finding.origins().origin_truncated()
+                            || finding.origins().evidence().is_empty())
+                })
+            }) {
+                return Err("accepted meetings have incomplete source attribution");
+            }
+            // Native IDE values merge origins. Absence of the candidate in a
+            // bounded origin reconstruction therefore cannot prove absence.
+            // Require the stronger, source-independent fact: this complete
+            // report has NO accepted meeting at the observation. A peer meeting
+            // conservatively prevents attribution too.
+            if analysis
+                .report()
+                .findings()
+                .iter()
+                .any(|finding| observation.matches(finding.key().sink().site()))
+            {
+                return Err("the complete strict observation domain contains an accepted meeting");
+            }
+            // Positive evidence can name an actual own-source contribution
+            // without enumerating every alternative.
+            let reaches = |analysis: &ProductionTaintAnalysisResult| {
+                analysis.report().findings().iter().any(|finding| {
+                    observation.matches(finding.key().sink().site())
+                        && finding.origins().evidence().iter().any(|evidence| {
+                            analysis.plan().sources().iter().any(|source| {
+                                source.origin() == evidence.origin()
+                                    && origin.matches(source.origin().value_flow_key().site())
+                                    && source.classes().intersects(evidence.classes())
+                                    && finding.classes().intersects(evidence.reached_classes())
+                            })
+                        })
+                })
+            };
+            positive |= reaches(other);
+        }
+        if !positive {
+            return Err("the relaxed executed relation contains no accepted own-source meeting");
+        }
+        Ok(())
+    }
+
+    fn composed_kill_dependence(&self, relaxed: &Self) -> Result<(), &'static str> {
+        let (
+            CandidateInputs::Composed {
+                batches,
+                reports,
+                origin,
+                observation,
+            },
+            CandidateInputs::Composed {
+                batches: loose_batches,
+                reports: loose_reports,
+                origin: loose_origin,
+                observation: loose_observation,
+            },
+        ) = (&self.inputs, &relaxed.inputs)
+        else {
+            return Err("the two passes do not retain corresponding composed input owners");
+        };
+        if origin != loose_origin
+            || observation != loose_observation
+            || batches.is_empty()
+            || batches.len() != loose_batches.len()
+            || reports.len() != batches.len()
+            || loose_reports.len() != loose_batches.len()
+        {
+            return Err("the actual source, observation or composed region inventory differs");
+        }
+        if !self.boundaries.is_empty() || !relaxed.boundaries.is_empty() {
+            return Err("an actual composed execution retains an open coverage boundary");
+        }
+        let mut positive = false;
+        for (index, batch) in batches.iter().enumerate() {
+            let root = batch.analysis().value_flow().root();
+            if batches[..index]
+                .iter()
+                .any(|previous| previous.analysis().value_flow().root() == root)
+            {
+                return Err("the correspondence between composed regions is ambiguous");
+            }
+            let mut matching = loose_batches
+                .iter()
+                .enumerate()
+                .filter(|(_, candidate)| candidate.analysis().value_flow().root() == root);
+            let Some((other_index, other_batch)) = matching.next() else {
+                return Err("a composed region has no corresponding relaxed region");
+            };
+            if matching.next().is_some() {
+                return Err("the correspondence between composed regions is ambiguous");
+            }
+            let (Some(strict), Some(loose)) = (&reports[index], &loose_reports[other_index]) else {
+                return Err("a composed region produced no owned execution result");
+            };
+            if strict.batch_index != index
+                || loose.batch_index != other_index
+                || !batch
+                    .analysis()
+                    .has_same_inputs_without_sanitizers(other_batch.analysis())
+            {
+                return Err("actual composed root bindings or nonkill plan inputs differ");
+            }
+            let (Some(inputs), Some(other_inputs)) = (&strict.inputs, &loose.inputs) else {
+                return Err("an actual composed execution did not retain its input domain");
+            };
+            if !inputs.shared.has_same_nonkill_inputs(&other_inputs.shared)
+                || !inputs
+                    .provider
+                    .has_same_nonkill_inputs(&other_inputs.provider)
+                || !inputs
+                    .discovery
+                    .has_same_inputs(&other_inputs.discovery, root)
+            {
+                return Err(
+                    "actual composed support, interpretation or nonkill inputs do not correspond",
+                );
+            }
+            if !inputs.provider.all_sanitizers_match(|sanitizer| {
+                self.kills
+                    .iter()
+                    .any(|kill| sanitizer.is_bound_to(&kill.site.endpoint, &kill.point))
+            }) || !other_inputs.provider.all_sanitizers_match(|_| false)
+            {
+                return Err(
+                    "an actual frontier sanitizer is outside the bound collective kill set",
+                );
+            }
+            if !inputs.shared.all_sanitizers_match(|sanitizer| {
+                sanitizer.proven
+                    && sanitizer.resolved
+                    && batch.analysis().sanitizers().iter().any(|binding| {
+                        binding.is_proven()
+                            && binding.is_resolved()
+                            && binding.point() == &sanitizer.point
+                            && batch.analysis().value_flow().carrier(binding.carrier())
+                                == Some(&sanitizer.input)
+                            && batch.analysis().value_flow().carrier(binding.output())
+                                == Some(&sanitizer.output)
+                            && sanitizer.function.is_kill_of(binding.removed())
+                    })
+            }) || !other_inputs.shared.all_sanitizers_match(|_| false)
+            {
+                return Err(
+                    "an actual composed sanitizer recipe differs from the bound root kill set",
+                );
+            }
+            let complete = |report: &TaintFindingReport| {
+                report.result().termination().is_fixed_point()
+                    && (report.is_complete()
+                        || (report.is_proven_by_authored_summaries()
+                            && !report.authored_arm_closures().is_empty()))
+            };
+            if !complete(&strict.report)
+                || !complete(&loose.report)
+                || strict.report.authored_arm_closures() != loose.report.authored_arm_closures()
+            {
+                return Err(
+                    "the actual composed accepted-meeting domain or model closure is incomplete",
+                );
+            }
+            // Any accepted strict origin refuses the stronger absence premise;
+            // a bounded displayed origin inventory cannot prove a negative.
+            if strict
+                .report
+                .findings()
+                .iter()
+                .any(|finding| observation.matches(finding.key().sink().site()))
+            {
+                return Err("the complete strict observation domain contains an accepted meeting");
+            }
+            let Some(sources) = other_inputs.shared.input_caches() else {
+                return Err("the relaxed source inventory is unavailable");
+            };
+            positive |= loose.report.findings().iter().any(|finding| {
+                observation.matches(finding.key().sink().site())
+                    && finding.origins().evidence().iter().any(|evidence| {
+                        sources.sources.iter().any(|source| {
+                            source.origin == *evidence.origin()
+                                && origin.matches(source.origin.value_flow_key().site())
+                                && source.classes.intersects(evidence.classes())
+                                && finding.classes().intersects(evidence.reached_classes())
+                        })
+                    })
+            });
+        }
+        if !positive {
+            return Err("the relaxed composed relation contains no accepted own-source meeting");
+        }
+        Ok(())
+    }
+
     pub(crate) fn kill_sites(&self) -> impl Iterator<Item = &CandidateSite> {
         self.kills.iter().map(|kill| &kill.site)
     }
@@ -474,6 +819,7 @@ pub(crate) fn solve_flow_candidate(
     cancellation: Option<&CancellationToken>,
     budget: &PolicyBudget,
     candidate: &FlowExplanationCandidate,
+    input_retention: Option<&mut RetainedHeap>,
 ) -> CandidatePass {
     let flow_state = flow_state.into();
     #[cfg(test)]
@@ -564,10 +910,13 @@ pub(crate) fn solve_flow_candidate(
                 None,
                 authored_selector_summary,
                 incomplete_selectors,
+                Vec::new(),
                 |path| selector_endpoint_label(spec, path),
+                budget.max_related_locations_per_finding(),
             );
             solve_candidate_regions(
                 policy,
+                spec,
                 &flow_state,
                 workspace,
                 active_semantic_model_snapshot,
@@ -580,6 +929,7 @@ pub(crate) fn solve_flow_candidate(
                 payload,
                 gaps,
                 compilation_elapsed,
+                input_retention,
             )
             .unwrap_or_else(|message| CandidatePass::stopped(invalid_plan(message)))
         }
@@ -600,6 +950,7 @@ fn invalid_plan(message: String) -> CandidateBoundary {
 #[allow(clippy::too_many_arguments)]
 fn solve_candidate_regions(
     policy: &LoadedPolicy,
+    spec: &ResolvedTaintPolicySpec,
     flow_state: impl Into<brokk_bifrost_rql::SemanticFlowResources> + Clone,
     workspace: &WorkspaceAnalyzer,
     active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
@@ -612,6 +963,7 @@ fn solve_candidate_regions(
     payload: crate::projection::TaintProjectionPayload,
     selection_gaps: Vec<CandidateBoundary>,
     compilation_elapsed: std::time::Duration,
+    mut input_retention: Option<&mut RetainedHeap>,
 ) -> Result<CandidatePass, String> {
     let flow_state = flow_state.into();
     let compiled_regions = roots.len();
@@ -657,6 +1009,7 @@ fn solve_candidate_regions(
         metadata.insert(
             root.internal_policy_id,
             PreparedTaintPlan {
+                selected_entry_scope: root.selected_entry_scope,
                 selection_answer,
                 policy_id: policy_id.clone(),
                 sources: root.sources,
@@ -700,7 +1053,6 @@ fn solve_candidate_regions(
     let mut retained_analyses = Vec::new();
     let mut retained_batch_indices = Vec::new();
     let mut retained_output_rows = Vec::new();
-    let mut composed_reports = Vec::new();
     let composed = metadata
         .values()
         .next()
@@ -709,6 +1061,44 @@ fn solve_candidate_regions(
     let planning_started = Instant::now();
     let batches = super::partition_taint_batches(plans).map_err(|error| error.to_string())?;
     let batch_planning_elapsed = planning_started.elapsed();
+    let slot_count = if composed { batches.len() } else { 0 };
+    let slot_bytes =
+        slot_count.saturating_mul(std::mem::size_of::<Option<super::ComposedCandidateReport>>());
+    if let Some(heap) = input_retention.as_deref_mut()
+        && !heap.reserve_scratch(slot_bytes)
+    {
+        return Ok(CandidatePass::stopped(CandidateBoundary::new(
+            CandidateBoundaryKind::OutputBudget,
+            vec![PolicyIncompleteReason::ReportRetentionBudget],
+            None,
+            "the report allowance refused candidate input owner slots".to_owned(),
+        )));
+    }
+    let mut slots = Box::<[Option<super::ComposedCandidateReport>]>::new_uninit_slice(slot_count);
+    for slot in &mut slots {
+        slot.write(None);
+    }
+    // SAFETY: every slot was initialized to None above.
+    let slots = unsafe { slots.assume_init() };
+    if let Some(heap) = input_retention.as_deref_mut()
+        && slot_bytes != 0
+        && !heap.adopt_allocation(slots.as_ptr() as usize, slot_bytes, slot_bytes)
+    {
+        drop(slots);
+        heap.release_scratch(slot_bytes);
+        return Ok(CandidatePass::stopped(CandidateBoundary::new(
+            CandidateBoundaryKind::OutputBudget,
+            vec![PolicyIncompleteReason::ReportRetentionBudget],
+            None,
+            "the report allowance refused candidate input owner census".to_owned(),
+        )));
+    }
+    let mut composed_reports = super::CandidateComposition {
+        spec,
+        reports: slots,
+        input_retention,
+        batch_index: 0,
+    };
     let seeding = super::seed_store_channels(
         &batches,
         &metadata,
@@ -736,6 +1126,7 @@ fn solve_candidate_regions(
     }
     let composition_memo = CompositionMemo::default();
     for (batch_index, batch) in batches.iter().enumerate() {
+        composed_reports.batch_index = batch_index;
         let seeds = &seeding.seeds[batch_index];
         let seed_classes = seeds
             .iter()
@@ -788,6 +1179,12 @@ fn solve_candidate_regions(
         let Err(failure) = result else {
             continue;
         };
+        // A failed production/projection path may have dropped input owners
+        // whose metadata was already admitted. Never reuse their pointer
+        // records for a later batch or counterfactual allocation.
+        if let Some(heap) = composed_reports.input_retention.as_deref_mut() {
+            heap.refuse();
+        }
         let payload = payloads
             .get_mut(&policy_id)
             .expect("the candidate's own payload was seeded above");
@@ -815,6 +1212,17 @@ fn solve_candidate_regions(
                     format!("ICFG value-type barrier refinement stopped: {termination:?}"),
                 ));
             }
+            TaintBatchError::SourceCoverageIncomplete(cause) => {
+                // Its sole constructor, icfg_batch_error, currently wraps a
+                // retained-byte refusal; successful partial outcomes use their data path.
+                super::record_source_coverage_incomplete(payload, &cause);
+                boundaries.push(CandidateBoundary::new(
+                    CandidateBoundaryKind::OutputBudget,
+                    vec![PolicyIncompleteReason::ReportRetentionBudget],
+                    None,
+                    format!("ICFG source attribution coverage stopped: {cause:?}"),
+                ));
+            }
             TaintBatchError::Internal(message)
             | TaintBatchError::SemanticBudgetRefused(message) => {
                 merge.envelopes.remove(&policy_id);
@@ -834,7 +1242,7 @@ fn solve_candidate_regions(
     let mut matched_store_crossings = Vec::new();
     let mut matched_seed_crossings = Vec::new();
     if composed {
-        for composed in &composed_reports {
+        for composed in composed_reports.reports.iter().flatten() {
             let report = &composed.report;
             if !report.is_complete() {
                 if report.is_proven_by_authored_summaries() {
@@ -911,6 +1319,81 @@ fn solve_candidate_regions(
             composed_crossing_evidence(plan, &origin_sites[0].endpoint, &crossing);
         store_crossings.push((crossing.witness, Some(prefix), evidence));
     }
+    let input_retention = composed_reports.input_retention.take();
+    // Crossing metadata already served candidate projection above. It is not
+    // an input to the collective theorem; do not extend a second copy's life.
+    for result in composed_reports.reports.iter_mut().flatten() {
+        result.store_crossings = Vec::new();
+    }
+    let inputs = if let Some(heap) = input_retention {
+        // These are already computed production products, moved rather than
+        // copied. One census stays live across BOTH passes: shared backing is
+        // counted once, while its own index is admitted before allocation.
+        if !composed && retained_analyses.capacity() != 0 {
+            heap.allocation(
+                retained_analyses.as_ptr() as usize,
+                retained_analyses.capacity()
+                    * std::mem::size_of::<Arc<ProductionTaintAnalysisResult>>(),
+            );
+        }
+        for site in [&origin_key, &observation_key] {
+            let path = site.path.as_str();
+            if !path.is_empty() {
+                heap.allocation(path.as_ptr() as usize, path.len());
+            }
+        }
+        for sites in [&origin_sites, &observation_sites] {
+            heap.vec(sites);
+            for site in sites {
+                heap.add(crate::retained::retained_extra(&site.endpoint));
+                heap.add(crate::retained::retained_extra(&site.location));
+            }
+        }
+        heap.vec(&kills);
+        for kill in &kills {
+            heap.add(crate::retained::retained_extra(&kill.site.endpoint));
+            heap.add(crate::retained::retained_extra(&kill.site.location));
+        }
+        if composed {
+            if batches.capacity() != 0 {
+                heap.allocation(
+                    batches.as_ptr() as usize,
+                    batches.capacity() * std::mem::size_of::<TaintBatch>(),
+                );
+            }
+            for batch in &batches {
+                batch.retained_heap(heap);
+            }
+            for result in composed_reports.reports.iter().flatten() {
+                result.report.retained_inputs_heap(heap);
+                if let Some(inputs) = &result.inputs {
+                    inputs.retained_heap(heap);
+                }
+            }
+        } else {
+            for analysis in &retained_analyses {
+                ProductionTaintAnalysisResult::retained_heap(analysis, heap);
+            }
+        }
+        if heap.is_refused() {
+            CandidateInputs::RetentionRefused
+        } else if composed {
+            CandidateInputs::Composed {
+                batches,
+                reports: composed_reports.reports,
+                origin: origin_key,
+                observation: observation_key,
+            }
+        } else {
+            CandidateInputs::Native {
+                analyses: retained_analyses,
+                origin: origin_key,
+                observation: observation_key,
+            }
+        }
+    } else {
+        CandidateInputs::Unavailable("this question did not retain counterfactual input products")
+    };
     Ok(CandidatePass {
         origin: CandidateBinding::Bound(origin_sites),
         observation: CandidateBinding::Bound(observation_sites),
@@ -925,6 +1408,7 @@ fn solve_candidate_regions(
             witnesses,
             store_crossings,
             kills,
+            inputs,
         }),
         evaluator: ProductionTaintPolicyEvaluator {
             prepared: std::sync::Mutex::new(payloads),
@@ -1096,6 +1580,13 @@ struct SiteKey {
 }
 
 impl SiteKey {
+    fn matches(&self, locator: &SemanticLocator) -> bool {
+        let span = locator.anchor().span();
+        self.path == *locator.path()
+            && self.span.start == span.start_byte()
+            && self.span.end == span.end_byte()
+    }
+
     fn of(locator: &SemanticLocator) -> Self {
         let span = locator.anchor().span();
         Self {
@@ -1177,7 +1668,11 @@ fn selection_gaps(
             CandidateBoundaryKind::RefusedSite,
             vec![PolicyIncompleteReason::CapabilityIncomplete],
             None,
-            format!("selector rows bound no single site: {incomplete_refusals:?}"),
+            brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+                format_args!("selector rows bound no single site: {incomplete_refusals:?}"),
+                format_args!("selector rows bound no single site"),
+                incomplete_refusals.iter(),
+            ),
         ));
     }
     if skipped_region_roots > 0 {
@@ -1212,7 +1707,10 @@ fn compile_boundary(error: &TaintPolicyCompileError) -> CandidateBoundary {
             CandidateBoundaryKind::DiscoveryIncomplete,
             absence_reasons(completion),
         ),
-        TaintPolicyCompileError::SemanticProvider(_)
+        // Untranslated retained identities are a content limitation.
+        TaintPolicyCompileError::CandidateLocatorRefusal(_)
+        | TaintPolicyCompileError::ProcedureLocalLocatorRefusal(_)
+        | TaintPolicyCompileError::SemanticProvider(_)
         | TaintPolicyCompileError::SemanticUnavailable(_)
         | TaintPolicyCompileError::AmbiguousSemanticSite(_) => (
             CandidateBoundaryKind::SemanticUnavailable,

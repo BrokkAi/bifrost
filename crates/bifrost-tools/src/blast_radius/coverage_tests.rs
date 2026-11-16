@@ -100,6 +100,14 @@ fn changed_and_missing_functions_render_distinct_outcomes() {
         "src/changed.rs",
         "pub fn value() -> i32 { 2 }\npub fn uncovered() -> i32 { 2 }\n",
     );
+    // Scoped endpoint images hold only changed files; without a target root,
+    // module ancestry is unavailable (#11385). Touch the parent to retain
+    // production evidence and exercise the original reference behavior.
+    write(
+        root,
+        "src/lib.rs",
+        "pub mod changed;\n// endpoint context\n",
+    );
     let target = commit_all(&repo, "target");
     let blast = blast_radius_at_root(
         root,
@@ -171,6 +179,13 @@ fn external_test_and_production_caller_reach_changed_function() {
         root,
         "src/changed.rs",
         "pub fn value() -> i32 { 2 }\npub fn wrapper() -> i32 { value() }\n",
+    );
+    // Scoped endpoints need the parent module to witness production (#11385),
+    // keeping the direct-test reachability assertion observable.
+    write(
+        root,
+        "src/lib.rs",
+        "pub mod changed;\n// endpoint context\n",
     );
     let target = commit_all(&repo, "target");
     let result = missing_tests_at_root(
@@ -250,6 +265,13 @@ fn same_file_test_call_reaches_changed_function() {
         root,
         "src/changed.rs",
         "pub fn value() -> i32 { 2 }\npub fn wrapper() -> i32 { value() }\n#[test]\nfn checks_value() { assert_eq!(value(), 2); }\n",
+    );
+    // Scoped endpoints need the parent module to witness production (#11385),
+    // keeping the direct-test reachability assertion observable.
+    write(
+        root,
+        "src/lib.rs",
+        "pub mod changed;\n// endpoint context\n",
     );
     let target = commit_all(&repo, "target");
     let result = missing_tests_at_root(

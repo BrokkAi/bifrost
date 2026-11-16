@@ -6,6 +6,7 @@
 
 #![allow(dead_code)]
 
+use crate::analyzer::reuse_verdict::{CarriesReuseVerdict, ExecutionCause, ReuseVerdict};
 use crate::analyzer::{CodeUnit, Language, ProjectFile, Range};
 use crate::cancellation::CancellationToken;
 use std::any::Any;
@@ -394,6 +395,8 @@ pub struct ReceiverAnalysisBudgetTracker {
     budget: ReceiverAnalysisBudget,
     summary_expansions: usize,
     scope_nodes: usize,
+    /// Joined at every refused limit.
+    reuse: ReuseVerdict,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -494,6 +497,19 @@ pub struct ReceiverMemberTargetReport {
     pub analysis: ReceiverAnalysisReport<CodeUnit>,
 }
 
+/// Truncated candidates depend on the target limit, which is an execution
+/// input. A report does not say whether the work that produced its outcome
+/// stopped; the tracker that built it does.
+impl<T> CarriesReuseVerdict for ReceiverAnalysisReport<T> {
+    fn reuse_verdict(&self) -> ReuseVerdict {
+        if self.candidates_truncated {
+            ReuseVerdict::ExecutionDependent(ExecutionCause::Other)
+        } else {
+            ReuseVerdict::Content
+        }
+    }
+}
+
 impl<T> ReceiverAnalysisReport<T> {
     pub fn without_work(
         mut outcome: ReceiverAnalysisOutcome<T>,
@@ -521,17 +537,19 @@ impl ReceiverAnalysisBudgetTracker {
             budget,
             summary_expansions: 0,
             scope_nodes: 0,
+            reuse: ReuseVerdict::Content,
         }
     }
 
     pub fn record_summary_expansion(&mut self) -> Result<(), ReceiverBudgetLimit> {
         self.summary_expansions += 1;
-        if !crate::analyzer::work_budget::LimitedCounter::from_usage(
+        if let Err(refused) = crate::analyzer::work_budget::LimitedCounter::from_usage(
             self.summary_expansions,
             self.budget.max_summary_expansions,
         )
-        .allows(0)
+        .try_allow(0)
         {
+            self.reuse.join_in(refused.reuse_verdict());
             Err(ReceiverBudgetLimit::SummaryExpansions)
         } else {
             Ok(())
@@ -540,12 +558,13 @@ impl ReceiverAnalysisBudgetTracker {
 
     pub fn record_scope_node(&mut self) -> Result<(), ReceiverBudgetLimit> {
         self.scope_nodes += 1;
-        if !crate::analyzer::work_budget::LimitedCounter::from_usage(
+        if let Err(refused) = crate::analyzer::work_budget::LimitedCounter::from_usage(
             self.scope_nodes,
             self.budget.max_scope_nodes,
         )
-        .allows(0)
+        .try_allow(0)
         {
+            self.reuse.join_in(refused.reuse_verdict());
             Err(ReceiverBudgetLimit::ScopeNodes)
         } else {
             Ok(())
@@ -562,6 +581,8 @@ impl ReceiverAnalysisBudgetTracker {
         }
     }
 
+    /// The report's verdict covers only its truncation; the tracker's own
+    /// verdict covers the limits it refused.
     pub fn report<T>(&self, mut outcome: ReceiverAnalysisOutcome<T>) -> ReceiverAnalysisReport<T> {
         let candidates_truncated = outcome
             .values()
@@ -576,6 +597,12 @@ impl ReceiverAnalysisBudgetTracker {
             work: self.work(),
             candidates_truncated,
         }
+    }
+}
+
+impl CarriesReuseVerdict for ReceiverAnalysisBudgetTracker {
+    fn reuse_verdict(&self) -> ReuseVerdict {
+        self.reuse
     }
 }
 

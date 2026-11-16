@@ -1,9 +1,10 @@
-//! Bounded strong leases for complete semantic artifact allocations.
+//! Bounded strong leases for exact semantic allocations.
 //!
 //! A lease is deliberately not an artifact cache. It preserves the exact
 //! allocation that produced pointer-scoped semantic handles while ordinary
 //! provider lookup continues to derive and validate the current artifact key.
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::mem::size_of;
@@ -31,6 +32,9 @@ const LEASE_INDEX_BYTES: usize = size_of::<SemanticArtifactLease>()
     + size_of::<usize>()
     + ALLOCATION_HEADER_BYTES
     + 4 * size_of::<usize>();
+// Allow the sparsest allocated hash table (four buckets for its first owner),
+// including controls and alignment. Owner payloads are counted separately.
+const OWNER_INDEX_BYTES: usize = 4 * (size_of::<(usize, RetainedOwner)>() + 1) + 16;
 #[doc(hidden)]
 pub const LEASE_STORAGE_BASE_BYTES: usize = ARC_HEADER_BYTES
     + size_of::<LeaseState>()
@@ -38,7 +42,7 @@ pub const LEASE_STORAGE_BASE_BYTES: usize = ARC_HEADER_BYTES
     + size_of::<HashMap<StableDigest, Vec<usize>>>()
     + 2 * ALLOCATION_HEADER_BYTES;
 
-/// One exact complete artifact allocation and its project-file identity.
+/// One exact artifact allocation and its project-file identity.
 ///
 /// Distinct allocations with equal semantic keys remain distinct leases:
 /// semantic handles are allocation-scoped, so key equality cannot substitute
@@ -103,6 +107,33 @@ pub struct LeaseStorage {
     leases: Vec<SemanticArtifactLease>,
     indices_by_key: HashMap<StableDigest, Vec<usize>>,
     entry_retained_bytes: usize,
+    // Strong allocation pins for retained-memory accounting, not answer lookup.
+    owners: HashMap<usize, RetainedOwner>,
+}
+
+/// Accounting-only strong owner. This never serves a semantic answer.
+#[derive(Clone)]
+struct RetainedOwner {
+    allocation: Arc<dyn Any + Send + Sync>,
+    bytes: usize,
+}
+impl fmt::Debug for RetainedOwner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RetainedOwner")
+            .field("bytes", &self.bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RetainedOwner {
+    fn identity(&self) -> usize {
+        Arc::as_ptr(&self.allocation).cast::<()>() as usize
+    }
+    fn retained_bytes(&self) -> Result<usize, SemanticArtifactLeaseError> {
+        self.bytes
+            .checked_add(OWNER_INDEX_BYTES)
+            .ok_or(SemanticArtifactLeaseError::RetainedBytesOverflow)
+    }
 }
 
 impl LeaseStorage {
@@ -111,7 +142,22 @@ impl LeaseStorage {
     }
 
     fn is_empty(&self) -> bool {
-        self.leases.is_empty()
+        self.leases.is_empty() && self.owners.is_empty()
+    }
+
+    fn insert_owner(&mut self, owner: RetainedOwner) -> Result<bool, SemanticArtifactLeaseError> {
+        let identity = owner.identity();
+        if self.owners.contains_key(&identity) {
+            return Ok(false);
+        }
+        let bytes = owner.retained_bytes()?;
+        let total = self
+            .entry_retained_bytes
+            .checked_add(bytes)
+            .ok_or(SemanticArtifactLeaseError::RetainedBytesOverflow)?;
+        self.owners.insert(identity, owner);
+        self.entry_retained_bytes = total;
+        Ok(true)
     }
 
     fn contains_artifact(&self, artifact: &Arc<SemanticArtifact>) -> bool {
@@ -170,7 +216,11 @@ impl LeaseStorage {
             }
         }
         self.indices_by_key.clear();
-        self.entry_retained_bytes = 0;
+        self.entry_retained_bytes = self
+            .owners
+            .values()
+            .map(|owner| owner.retained_bytes().expect("retained owner charge fits"))
+            .sum();
         for lease in retained {
             assert_eq!(
                 self.try_insert(lease),
@@ -184,6 +234,7 @@ impl LeaseStorage {
     #[cfg(any(test, feature = "test-support"))]
     fn take_all(&mut self) -> Vec<SemanticArtifactLease> {
         self.indices_by_key.clear();
+        self.owners.clear();
         self.entry_retained_bytes = 0;
         std::mem::take(&mut self.leases)
     }
@@ -307,6 +358,21 @@ impl SemanticArtifactLeaseSet {
         self.state.storage.is_empty()
     }
 
+    /// Borrow an already retained file identity without materializing source or
+    /// artifacts. Callers admit the linear scan of `len()` leases separately.
+    pub fn retained_file(
+        &self,
+        root: &std::path::Path,
+        path: &std::path::Path,
+    ) -> Option<&ProjectFile> {
+        self.state
+            .storage
+            .leases
+            .iter()
+            .map(|lease| &lease.file)
+            .find(|file| file.root() == root && file.rel_path() == path)
+    }
+
     /// Capture this exact committed generation in O(1) time.
     pub fn snapshot(&self) -> SemanticArtifactLeaseSnapshot {
         SemanticArtifactLeaseSnapshot {
@@ -343,6 +409,11 @@ impl SemanticArtifactLeaseSet {
             .leases
             .iter()
             .any(|lease| self.state.storage.contains_artifact(lease.artifact()))
+            || charge
+                .additions
+                .owners
+                .keys()
+                .any(|identity| self.state.storage.owners.contains_key(identity))
         {
             return Err(SemanticArtifactLeaseError::Overlap);
         }
@@ -372,6 +443,13 @@ impl SemanticArtifactLeaseSet {
                 "prechecked semantic lease charge became overlapping"
             );
         }
+        for (_, owner) in charge.additions.owners {
+            assert_eq!(
+                state.storage.insert_owner(owner),
+                Ok(true),
+                "prechecked owner charge became overlapping"
+            );
+        }
         Ok(())
     }
 
@@ -391,6 +469,13 @@ pub struct SemanticArtifactLeaseSnapshot {
 }
 
 impl SemanticArtifactLeaseSnapshot {
+    /// Visit pinned accounting owners to seed one child allocation census.
+    /// These are not a semantic lookup or a reusable answer cache.
+    pub fn census_owners(&self, mut visit: impl FnMut(&Arc<dyn Any + Send + Sync>)) {
+        for owner in self.state.storage.owners.values() {
+            visit(&owner.allocation);
+        }
+    }
     pub fn retained_bytes(&self) -> usize {
         self.state.retained_bytes()
     }
@@ -548,6 +633,33 @@ pub struct SemanticArtifactLeaseWindow {
 }
 
 impl SemanticArtifactLeaseWindow {
+    /// Retain the exact artifact and a proven row's owner under one capacity
+    /// preflight. Partial artifacts are allowed ONLY as retained allocations:
+    /// this method neither observes Complete nor changes provider quality.
+    /// `owned_bytes` includes the owner's Arc payload/header and nested heaps,
+    /// deduplicated by the caller against every inherited accounting owner.
+    pub fn retain_exact_owner<T: Any + Send + Sync>(
+        &self,
+        file: &ProjectFile,
+        artifact: &Arc<SemanticArtifact>,
+        owner: &Arc<T>,
+        owned_bytes: usize,
+    ) -> Result<(), SemanticArtifactLeaseError> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("semantic artifact lease window mutex poisoned");
+        state.open_for_handle();
+        state.retain_exact(
+            file,
+            artifact,
+            Some(RetainedOwner {
+                allocation: owner.clone(),
+                bytes: owned_bytes,
+            }),
+        );
+        state.overflow().map_or(Ok(()), Err)
+    }
     pub fn collector(&self) -> SemanticArtifactCollector {
         SemanticArtifactCollector {
             state: SemanticArtifactCollectorState::Bounded(Arc::clone(&self.state)),
@@ -634,7 +746,7 @@ impl SemanticArtifactLeaseWindow {
         )
     }
 
-    /// Promote this complete window into its originating child atomically.
+    /// Promote this fully admitted window into its originating child atomically.
     pub fn commit(
         self,
         child: &mut SemanticArtifactLeaseChild,
@@ -693,6 +805,16 @@ impl SemanticArtifactLeaseWindow {
                 additions.try_insert(lease),
                 Ok(true),
                 "prechecked semantic lease window became overlapping"
+            );
+        }
+        for (identity, owner) in staged.owners {
+            if child.base.storage.owners.contains_key(&identity) {
+                continue;
+            }
+            assert_eq!(
+                additions.insert_owner(owner),
+                Ok(true),
+                "prechecked owner window became overlapping"
             );
         }
         Ok(())
@@ -856,6 +978,15 @@ impl LeaseWindowState {
     }
 
     fn observe_complete(&mut self, file: &ProjectFile, artifact: &Arc<SemanticArtifact>) {
+        self.retain_exact(file, artifact, None);
+    }
+
+    fn retain_exact(
+        &mut self,
+        file: &ProjectFile,
+        artifact: &Arc<SemanticArtifact>,
+        owner: Option<RetainedOwner>,
+    ) {
         let other_live_bytes = self.other_live_bytes;
         let LeaseWindowPhase::Open(open) = &mut self.phase else {
             return;
@@ -871,14 +1002,33 @@ impl LeaseWindowState {
             overflow,
             ..
         } = open;
-        if base.storage.contains_artifact(artifact)
+        let artifact_exists = base.storage.contains_artifact(artifact)
             || promoted.contains_artifact(artifact)
-            || staged.contains_artifact(artifact)
-        {
+            || staged.contains_artifact(artifact);
+        let owner = owner.filter(|owner| {
+            let identity = owner.identity();
+            !base.storage.owners.contains_key(&identity)
+                && !promoted.owners.contains_key(&identity)
+                && !staged.owners.contains_key(&identity)
+        });
+        if artifact_exists && owner.is_none() {
             return;
         }
 
-        let candidate_bytes = match retained_artifact_bytes(file, artifact) {
+        let candidate_bytes = match (if artifact_exists {
+            Ok(0)
+        } else {
+            retained_artifact_bytes(file, artifact)
+        })
+        .and_then(|bytes| {
+            bytes
+                .checked_add(
+                    owner
+                        .as_ref()
+                        .map_or(Ok(0), RetainedOwner::retained_bytes)?,
+                )
+                .ok_or(SemanticArtifactLeaseError::RetainedBytesOverflow)
+        }) {
             Ok(bytes) => bytes,
             Err(error) => {
                 *overflow = Some(error);
@@ -918,14 +1068,23 @@ impl LeaseWindowState {
             ));
             return;
         }
-        assert_eq!(
-            staged.try_insert(SemanticArtifactLease::new(
-                file.clone(),
-                Arc::clone(artifact),
-            )),
-            Ok(true),
-            "prechecked semantic lease candidate must fit"
-        );
+        if !artifact_exists {
+            assert_eq!(
+                staged.try_insert(SemanticArtifactLease::new(
+                    file.clone(),
+                    Arc::clone(artifact),
+                )),
+                Ok(true),
+                "prechecked semantic lease candidate must fit"
+            );
+        }
+        if let Some(owner) = owner {
+            assert_eq!(
+                staged.insert_owner(owner),
+                Ok(true),
+                "prechecked retained owner must fit"
+            );
+        }
     }
 }
 

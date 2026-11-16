@@ -6,6 +6,8 @@
 //! conservative.  All syntax access is through the prepared tree-sitter tree;
 //! there is no source-text parser here.
 
+use brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelNamespace;
+
 use brokk_bifrost_semantic::analyzer::semantic_model::csmi::python::conditional_special_form_semantics;
 
 use brokk_bifrost_semantic::analyzer::semantic_model::csmi::python::narrowing_annotation;
@@ -346,7 +348,10 @@ fn external_predicate_refinement(
     call: &SemanticCallSite,
     atoms: &[&ClassIdentity],
 ) -> Option<CallGuardOutcome> {
-    let overlay = workspace.analyzer().semantic_model_overlay()?;
+    let overlay = workspace
+        .analyzer()
+        .semantic_model_overlay_read()
+        .published()?;
     let symbols = overlay.symbols_named_for(canonical, "python");
     if semantic_model_callable_family_id(&symbols.records).is_none()
         || symbols.records.iter().any(|symbol| {
@@ -457,7 +462,10 @@ fn predicate_refinement_outcome(
     semantics: CsmiConditionalTypeSemantics,
     class: Option<ClassIdentity>,
 ) -> CallGuardOutcome {
-    let overlay = workspace.analyzer().semantic_model_overlay();
+    let overlay = workspace
+        .analyzer()
+        .semantic_model_overlay_read()
+        .published();
     let class = class.filter(|class| {
         adapter.guard_classes_have_supported_instance_checks(
             workspace,
@@ -722,7 +730,7 @@ fn predicate_target_symbol<'target>(
             })
             .collect::<Vec<_>>(),
         None => overlay
-            .symbols_named_in_family(name?, "python")
+            .symbols_named_in_family(name?, "python", SemanticModelNamespace::Unknown)
             .records
             .into_iter()
             .filter(|symbol| Some(symbol.qualified_name.as_str()) == name)

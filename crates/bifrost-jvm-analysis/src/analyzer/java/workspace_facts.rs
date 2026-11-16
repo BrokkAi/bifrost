@@ -202,6 +202,136 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#10984: same-name missing dependency gaps lost their consuming AST sites")]
+    fn lookup_provenance_survives_warm_order_and_receipt_replay() {
+        use crate::analyzer::java::unshadowed::UseSite;
+        use crate::analyzer::jvm::external::{TestClassFile, write_test_class_jar};
+        use brokk_bifrost_analysis::analyzer::{AnalyzerConfig, JvmExternalArtifact};
+
+        use brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadReceipt;
+        let source = "class App { Missing first; Missing second; }";
+        let project = InlineTestProject::with_language(Language::Java)
+            .file("App.java", source)
+            .file("pom.xml", "<project><modelVersion>4.0.0</modelVersion><groupId>test</groupId><artifactId>app</artifactId><version>1</version><dependencies><dependency><groupId>test</groupId><artifactId>missing</artifactId><version>1</version></dependency></dependencies></project>")
+            .build();
+        let mut config = AnalyzerConfig::default();
+        config.jvm.standard_library_discovery.discover_java_home = false;
+        config.jvm.external_dependencies.repository_roots = vec![project.root().join("empty")];
+        let jar = project.root().join("present.jar");
+        write_test_class_jar(
+            &jar,
+            &[TestClassFile {
+                internal_name: "unrelated/Present",
+                super_internal_name: "java/lang/Object",
+                methods: &[],
+                private_nested: false,
+            }],
+        );
+        config
+            .jvm
+            .external_dependencies
+            .artifact_paths
+            .push(JvmExternalArtifact {
+                artifact_path: jar,
+                source_artifact_path: None,
+                coordinate: None,
+                origin: brokk_bifrost_analysis::analyzer::JvmExternalArtifactOrigin::Explicit,
+            });
+        let base = project.workspace_analyzer(config);
+        let java = resolve_analyzer::<JavaAnalyzer>(base.analyzer()).unwrap();
+        let file = project.file("App.java");
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_java::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let mut stack = vec![tree.root_node()];
+        let mut nodes = Vec::new();
+        while let Some(node) = stack.pop() {
+            if node.kind() == "type_identifier" {
+                nodes.push(node);
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.children(&mut cursor));
+        }
+        nodes.sort_by_key(|node| node.start_byte());
+        assert_eq!(nodes.len(), 2);
+        let name = brokk_bifrost_jvm::java::graph_support::JavaTypeName::from_normalized_spelling(
+            "Missing",
+        )
+        .unwrap();
+        for order in [[0, 1], [1, 0]] {
+            let outer = AnalyzerQueryScope::capturing_read_incompleteness(java);
+            for index in order {
+                let capture = AnalyzerQueryScope::capturing_candidate_classification(java);
+                let site = UseSite {
+                    token: capture.token(),
+                    source,
+                    node: nodes[index],
+                };
+                let (_, receipt) = QueryReadReceipt::capture(java, || {
+                    for _ in 0..2 {
+                        java.resolve_type_name_at(
+                            capture.token(),
+                            None,
+                            &file,
+                            &name,
+                            None,
+                            Some(&site),
+                        );
+                    }
+                });
+                let reasons = receipt.incomplete_reasons();
+                assert!(!reasons.is_empty());
+                for reason in reasons {
+                    let lookup = reason.lookup_provenance().expect("located external read");
+                    assert_eq!(lookup.file, file);
+                    assert_eq!(lookup.byte_span, nodes[index].byte_range());
+                    assert_eq!(&*lookup.name, "Missing");
+                    assert!(matches!(lookup.tier, "same-package" | "on-demand"));
+                    assert_eq!(reason.label(), reason.base_cause().label());
+                    assert_eq!(
+                        reason.execution_cause(),
+                        reason.base_cause().execution_cause()
+                    );
+                }
+                for tier in ["same-package", "on-demand"] {
+                    assert!(
+                        reasons.iter().any(|reason| reason
+                            .lookup_provenance()
+                            .is_some_and(|lookup| lookup.tier == tier)),
+                        "missing tier {tier}: {reasons:?}"
+                    );
+                }
+                let before = capture.captured_read_incompleteness();
+                receipt.replay(java);
+                assert_eq!(before, capture.captured_read_incompleteness());
+                drop(capture);
+                receipt.replay(java);
+            }
+            let reasons = outer.captured_read_incompleteness();
+            assert!(reasons.iter().any(|reason| {
+                reason
+                    .lookup_provenance()
+                    .is_some_and(|lookup| lookup.byte_span == nodes[0].byte_range())
+            }));
+            assert!(reasons.iter().any(|reason| {
+                reason
+                    .lookup_provenance()
+                    .is_some_and(|lookup| lookup.byte_span == nodes[1].byte_range())
+            }));
+        }
+        let capture = AnalyzerQueryScope::capturing_read_incompleteness(java);
+        java.resolve_type_name_at(capture.token(), None, &file, &name, None, None);
+        assert!(
+            capture
+                .captured_read_incompleteness()
+                .iter()
+                .all(|reason| reason.lookup_provenance().is_none())
+        );
+    }
+
+    #[test]
     #[hardwon(
         "#8184: a retained replayable fill replayed the enclosing query's unrelated gap to later queries"
     )]
@@ -893,16 +1023,26 @@ mod merged_cache_read_tests {
             .build();
         let java = JavaAnalyzer::new(project.project_arc());
         let file = project.file("app/Sample.java");
-        let (warm, cold_reads) =
-            capture_query_reads(&java, || java.statement_source_facts(&file).unwrap());
+        let (warm, cold_reads) = capture_query_reads(&java, || {
+            java.statement_source_facts(
+                &file,
+                &mut brokk_bifrost_analysis::analyzer::reuse_verdict::ReuseVerdict::Content,
+            )
+            .unwrap()
+        });
         assert!(!warm.switches.is_empty(), "must run enum-switch resolution");
         assert!(
             cold_reads.keys().len() > 1,
             "must consult inputs beyond the source blob: {cold_reads:?}"
         );
         for _ in 0..2 {
-            let (hit, reads) =
-                capture_query_reads(&java, || java.statement_source_facts(&file).unwrap());
+            let (hit, reads) = capture_query_reads(&java, || {
+                java.statement_source_facts(
+                    &file,
+                    &mut brokk_bifrost_analysis::analyzer::reuse_verdict::ReuseVerdict::Content,
+                )
+                .unwrap()
+            });
             assert!(
                 Arc::ptr_eq(&warm, &hit),
                 "must exercise the retained statement facts"
@@ -925,19 +1065,34 @@ mod merged_cache_read_tests {
             .build();
         let java = JavaAnalyzer::new(project.project_arc());
         let file = project.file("Sample.java");
-        let old = java.statement_source_facts(&file).unwrap();
+        let old = java
+            .statement_source_facts(
+                &file,
+                &mut brokk_bifrost_analysis::analyzer::reuse_verdict::ReuseVerdict::Content,
+            )
+            .unwrap();
         project.file("Sample.java").write(changed).unwrap();
         let mut head = JavaAnalyzer::new(project.project_arc());
         // Share storage deliberately: this must test the blob key, rather
         // than pass just because a new generation starts with an empty cache.
         head.memo_caches = Arc::clone(&java.memo_caches);
-        let (fresh, reads) =
-            capture_query_reads(&head, || head.statement_source_facts(&file).unwrap());
+        let (fresh, reads) = capture_query_reads(&head, || {
+            head.statement_source_facts(
+                &file,
+                &mut brokk_bifrost_analysis::analyzer::reuse_verdict::ReuseVerdict::Content,
+            )
+            .unwrap()
+        });
         assert!(!Arc::ptr_eq(&old, &fresh));
         assert!(fresh.conditions.len() > old.conditions.len());
         source_key(&reads, "Sample.java", changed);
-        let (hit, reads) =
-            capture_query_reads(&head, || head.statement_source_facts(&file).unwrap());
+        let (hit, reads) = capture_query_reads(&head, || {
+            head.statement_source_facts(
+                &file,
+                &mut brokk_bifrost_analysis::analyzer::reuse_verdict::ReuseVerdict::Content,
+            )
+            .unwrap()
+        });
         assert!(Arc::ptr_eq(&fresh, &hit));
         source_key(&reads, "Sample.java", changed);
     }

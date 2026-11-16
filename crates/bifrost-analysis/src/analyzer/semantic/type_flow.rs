@@ -394,7 +394,7 @@ pub fn validate_prepared_syntax_source_for_procedure(
                 line!()
             )
         });
-        workspace.analyzer().mark_execution_dependent();
+        crate::analyzer::i_analyzer::join_execution_dependence(workspace.analyzer());
     }
     exact
         .then_some(prepared)

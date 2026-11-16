@@ -109,10 +109,18 @@ pub(super) fn descendants(
             let index = build_direct_descendant_index_by_unit(host, host, scope)?;
             // Enumerate the complete row domain, including imported ancestors.
             // The temporary vectors die with this one build; only the digest stays.
-            let mut classes = host
-                .all_declarations()
-                .filter(|class| class.is_class() && scope.admits(class))
-                .collect::<Vec<_>>();
+            let mut classes = Vec::new();
+            for class in host.all_declarations().filter(|class| class.is_class()) {
+                if match scope.admits(&class) {
+                    Ok(value) => value,
+                    Err(reason) => {
+                        let _unavailable = reason;
+                        return None;
+                    }
+                } {
+                    classes.push(class);
+                }
+            }
             let ancestors = classes
                 .iter()
                 .flat_map(|class| {
@@ -142,6 +150,19 @@ pub(super) fn descendants(
                 hash.value(class.as_bytes());
                 hash.sequence("descendants", &children, |hash, child| {
                     hash.value(child.as_bytes())
+                });
+            }
+            // The open set is part of every row's answer: a change to it must
+            // change the digest even when no definite row moves. An empty set
+            // adds nothing, so a workspace without one keeps its digest.
+            let open_candidates = index
+                .open_candidates()
+                .iter()
+                .map(unit_identity)
+                .collect::<Vec<_>>();
+            if !open_candidates.is_empty() {
+                hash.sequence("open_candidates", &open_candidates, |hash, candidate| {
+                    hash.value(candidate.as_bytes())
                 });
             }
             Some(Descendants {
@@ -296,10 +317,16 @@ pub(super) fn answer(
         }
         WorkspaceFactFamily::JsTsProductionDescendants => {
             let excluded = |file: &brokk_bifrost_core::analyzer::ProjectFile| {
-                brokk_bifrost_core::analyzer::test_paths::is_test_like_path(
+                if brokk_bifrost_core::analyzer::test_paths::is_test_like_path(
                     &rel_path_string(file),
                     language,
-                ) || analyzer.file_is_test_only(file)
+                ) {
+                    return Ok(true);
+                }
+                analyzer.file_is_test_only(file).map_err(|reason| {
+                    analyzer.record_query_incomplete(reason);
+                    brokk_bifrost_core::analyzer::capabilities::SourceExclusionUnavailable
+                })
             };
             descendants(
                 host,

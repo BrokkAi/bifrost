@@ -1,6 +1,7 @@
 //! Deterministic public results for in-memory summary tabulation.
 
 use super::summary::MemberReadReceipt;
+use crate::analyzer::store::cache_budget::RetainedHeap;
 use crate::hash::{HashMap, HashSet};
 use std::{
     cmp::Ordering,
@@ -836,7 +837,7 @@ pub struct SummaryMetrics {
 pub struct SummaryDataflowResult<Fact> {
     caller_conversions: HashSet<CallSiteHandle>,
     member_receipts: Option<HashMap<ProcedureHandle, MemberReadReceipt>>,
-    facts: Box<[Fact]>,
+    facts: Arc<Box<[Fact]>>,
     reached: Box<[SummaryReachedFact]>,
     end_summaries: Box<[TabulationEndSummary]>,
     entry_transfers: Box<[SummaryEntryTransfer]>,
@@ -879,7 +880,7 @@ impl<Fact> SummaryDataflowResult<Fact> {
         Self {
             caller_conversions: HashSet::default(),
             member_receipts,
-            facts: facts.into_boxed_slice(),
+            facts: Arc::new(facts.into_boxed_slice()),
             reached: reached.into_boxed_slice(),
             end_summaries: end_summaries.into_boxed_slice(),
             entry_transfers: entry_transfers.into_boxed_slice(),
@@ -891,6 +892,27 @@ impl<Fact> SummaryDataflowResult<Fact> {
             metrics,
             witness_store,
             witness_retention_truncated,
+        }
+    }
+
+    /// Share the immutable fact namespace without retaining solved rows or proofs.
+    pub(crate) fn facts_only(&self, termination: SolverTermination) -> Self {
+        Self {
+            caller_conversions: HashSet::default(),
+            member_receipts: None,
+            facts: Arc::clone(&self.facts),
+            reached: Box::default(),
+            end_summaries: Box::default(),
+            entry_transfers: Box::default(),
+            incoming_calls: Box::default(),
+            coverage: SummaryCoverage::from_parts(Vec::new(), Vec::new(), Vec::new()),
+            termination,
+            work: SolverWork::default(),
+            semantic_work: SemanticWork::default(),
+            metrics: SummaryMetrics::default(),
+            witness_store: super::WitnessArena::new(super::WitnessRetentionLimits::disabled())
+                .into_store(),
+            witness_retention_truncated: false,
         }
     }
 
@@ -1002,8 +1024,20 @@ impl<Fact> SummaryDataflowResult<Fact> {
         self.witness_retention_truncated
     }
 
-    /// Conservative bytes owned directly by this immutable result snapshot.
-    /// Shared semantic artifacts behind handles and `Arc`s are intentionally excluded.
+    /// The shared owner allocation and its exclusively owned fact slice.
+    pub(crate) fn fact_storage_retained_bytes(&self) -> usize {
+        size_of::<Box<[Fact]>>()
+            .saturating_add(2 * size_of::<usize>())
+            .saturating_add(size_of_val(self.facts()))
+    }
+
+    pub(crate) fn retained_facts_heap(&self, heap: &mut RetainedHeap) {
+        heap.arc(&self.facts, |boxed, heap| heap.slice(boxed));
+    }
+
+    /// Conservative bytes retained by this immutable result snapshot.
+    /// Includes shared fact storage once for this snapshot. Shared semantic
+    /// artifacts behind handles and other `Arc`s are intentionally excluded.
     pub fn retained_bytes(&self) -> usize {
         size_of::<Self>()
             .saturating_add(
@@ -1011,7 +1045,7 @@ impl<Fact> SummaryDataflowResult<Fact> {
                     .capacity()
                     .saturating_mul(size_of::<CallSiteHandle>()),
             )
-            .saturating_add(size_of_val(self.facts()))
+            .saturating_add(self.fact_storage_retained_bytes())
             .saturating_add(size_of_val(self.reached()))
             .saturating_add(size_of_val(self.end_summaries()))
             .saturating_add(size_of_val(self.entry_transfers()))

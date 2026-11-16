@@ -18,6 +18,7 @@ use crate::analyzer::semantic::ids::AllocationId;
 use crate::analyzer::semantic::ids::BlockId;
 
 use crate::analyzer::semantic::ids::CallSiteId;
+use crate::analyzer::semantic::ids::SourceAnchor;
 
 use crate::analyzer::semantic::ids::CaptureId;
 
@@ -63,10 +64,51 @@ use crate::analyzer::semantic::ir::validation::measure_artifact_work;
 
 use crate::analyzer::semantic::ir::validation::validate_artifact;
 
+/// Workspace-relative paths whose artifacts the validator rejects, for tests
+/// that need a file-level rejection without relying on a lowering defect that
+/// will later be fixed (#12571).
+#[cfg(any(test, feature = "test-support"))]
+static REJECTED_ARTIFACT_PATHS_FOR_TEST: std::sync::Mutex<Vec<String>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Keeps one path's artifacts rejected until it is dropped.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub struct ArtifactRejectionForTest(String);
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for ArtifactRejectionForTest {
+    fn drop(&mut self) {
+        let mut paths = REJECTED_ARTIFACT_PATHS_FOR_TEST
+            .lock()
+            .expect("rejected artifact paths mutex poisoned");
+        let index = paths
+            .iter()
+            .position(|path| path == &self.0)
+            .expect("a registered rejection stays registered until dropped");
+        paths.remove(index);
+    }
+}
+
+/// Reject every artifact built for the workspace-relative `path` with a
+/// `GapContract` error, as the validator rejects an artifact whose gap
+/// records break the contract. Use a path no other test uses: the registry is
+/// process-wide.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn reject_artifacts_at_path_for_test(path: &str) -> ArtifactRejectionForTest {
+    REJECTED_ARTIFACT_PATHS_FOR_TEST
+        .lock()
+        .expect("rejected artifact paths mutex poisoned")
+        .push(path.to_owned());
+    ArtifactRejectionForTest(path.to_owned())
+}
+
 /// Failure to validate or fit a semantic artifact into its retained-work
 /// budget.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SemanticArtifactBuildError {
+    Cancelled,
     Invalid(SemanticIrError),
     ExceededBudget(SemanticBudgetExceeded),
 }
@@ -74,6 +116,7 @@ pub enum SemanticArtifactBuildError {
 impl SemanticArtifactBuildError {
     pub const fn invalid_ir(&self) -> Option<&SemanticIrError> {
         match self {
+            Self::Cancelled => None,
             Self::Invalid(error) => Some(error),
             Self::ExceededBudget(_) => None,
         }
@@ -81,7 +124,7 @@ impl SemanticArtifactBuildError {
 
     pub const fn budget_exceeded(&self) -> Option<SemanticBudgetExceeded> {
         match self {
-            Self::Invalid(_) => None,
+            Self::Invalid(_) | Self::Cancelled => None,
             Self::ExceededBudget(error) => Some(*error),
         }
     }
@@ -89,7 +132,11 @@ impl SemanticArtifactBuildError {
 
 impl From<SemanticIrError> for SemanticArtifactBuildError {
     fn from(error: SemanticIrError) -> Self {
-        Self::Invalid(error)
+        if error.kind() == SemanticIrErrorKind::Cancelled {
+            Self::Cancelled
+        } else {
+            Self::Invalid(error)
+        }
     }
 }
 
@@ -102,6 +149,7 @@ impl From<SemanticBudgetExceeded> for SemanticArtifactBuildError {
 impl fmt::Display for SemanticArtifactBuildError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cancelled => formatter.write_str("semantic publication cancelled"),
             Self::Invalid(error) => error.fmt(formatter),
             Self::ExceededBudget(error) => error.fmt(formatter),
         }
@@ -111,6 +159,7 @@ impl fmt::Display for SemanticArtifactBuildError {
 impl std::error::Error for SemanticArtifactBuildError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Cancelled => None,
             Self::Invalid(error) => Some(error),
             Self::ExceededBudget(error) => Some(error),
         }
@@ -566,6 +615,13 @@ struct ProcedureMaterializationId(StableDigest);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SemanticArtifactMaterializationId(StableDigest);
 
+impl SemanticArtifactMaterializationId {
+    /// The exact frozen artifact-content identity.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        self.0.as_bytes()
+    }
+}
+
 impl fmt::Display for SemanticArtifactMaterializationId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(formatter)
@@ -604,11 +660,29 @@ struct CallGapScopes {
     points: Box<[(ProgramPointId, usize)]>,
     values: Box<[(ValueId, usize)]>,
     calls: Box<[(CallSiteId, usize)]>,
+    /// Gaps whose subject is a cleanup-owner segment. Their members need a
+    /// membership test, so they cannot sit in the value index.
+    cleanup_owners: Box<[usize]>,
+}
+
+/// One isolated body and the authority its query owner must admit.
+/// Executable evidence lives in the query receipt, never in the artifact.
+#[derive(Debug, Clone)]
+struct GuardedProcedureBody {
+    semantics: ProcedureSemantics,
+    authority: GuardedProcedureAuthority,
+}
+
+#[derive(Debug, Clone)]
+enum GuardedProcedureAuthority {
+    Macro(Box<[CandidateRecord]>),
+    Executable,
 }
 
 /// One validated executable body.
 #[derive(Debug, Clone)]
 pub struct ProcedureSemantics {
+    guarded_alternate: Option<Box<GuardedProcedureBody>>,
     callable_selection_dominance: CallableSelectionDominance,
     call_gap_derived: CallGapDerived,
     declared_result_classes: Option<Box<[StaticTypeClass]>>,
@@ -635,6 +709,7 @@ pub struct ProcedureSemantics {
     source_mappings: Box<[SourceMapping]>,
     statement_entries: Box<[StatementEntrySite]>,
     loop_sites: Box<[LoopSite]>,
+    cleanup_chains: super::CleanupChains,
     drops: Box<[DropFact]>,
     move_outs: Box<[MoveOutFact]>,
     scope_ends: Box<[ScopeEndFact]>,
@@ -658,12 +733,88 @@ pub struct ProcedureSemantics {
 }
 
 impl ProcedureSemantics {
+    /// Isolated candidate lowering; callers must never substitute it without admission.
+    /// Dedicated alternate projection keeps this interpretation separate from base handles.
+    pub fn candidate_macro_alternate(&self) -> Option<(&ProcedureSemantics, &[CandidateRecord])> {
+        let alternate = self.guarded_alternate.as_deref()?;
+        match &alternate.authority {
+            GuardedProcedureAuthority::Macro(sites) => Some((&alternate.semantics, sites)),
+            GuardedProcedureAuthority::Executable => None,
+        }
+    }
+
+    /// Frozen guarded contents, for representation accounting only. This is
+    /// not an executable selection and supplies no admission authority.
+    #[doc(hidden)]
+    pub fn guarded_alternate(&self) -> Option<&ProcedureSemantics> {
+        self.guarded_alternate
+            .as_deref()
+            .map(|body| &body.semantics)
+    }
+
+    #[doc(hidden)]
+    pub fn guarded_alternate_wrapper_bytes(&self) -> u64 {
+        self.guarded_alternate
+            .as_ref()
+            .map_or(0, |_| size_of::<GuardedProcedureBody>() as u64)
+    }
+
+    /// An isolated body refined by executable refinement, requiring the owning
+    /// query's recorded declaration proofs before it may execute.
+    #[doc(hidden)]
+    pub fn executable_alternate(&self) -> Option<&ProcedureSemantics> {
+        let alternate = self.guarded_alternate.as_deref()?;
+        match alternate.authority {
+            GuardedProcedureAuthority::Executable => Some(&alternate.semantics),
+            GuardedProcedureAuthority::Macro(_) => None,
+        }
+    }
+
+    /// The source anchor that locates a candidate's invocation in this
+    /// alternate, for refusal evidence: the realizing call when there is one,
+    /// otherwise the alternate source mapping at the record's anchor.
+    pub fn candidate_source_anchor(&self, record: &CandidateRecord) -> SourceAnchor {
+        if let CandidateRealization::RuntimeCall(call) = record.realization {
+            let call = self.call_site(call).expect("validated candidate call");
+            return self
+                .source_mapping(call.source)
+                .expect("validated call mapping")
+                .locator
+                .anchor();
+        }
+        self.source_mappings
+            .iter()
+            .map(|mapping| mapping.locator.anchor())
+            .find(|anchor| CandidateAnchor::of(anchor.span()) == record.anchor)
+            .expect("validated candidate anchor has an alternate source mapping")
+    }
+
     fn try_from_parts(
-        parts: ProcedureSemanticsParts,
+        mut parts: ProcedureSemanticsParts,
         entry_point: ProgramPointId,
         normal_exit_point: ProgramPointId,
         exceptional_exit_point: ProgramPointId,
     ) -> Result<Self, SemanticIrError> {
+        let guarded_alternate = parts
+            .candidate_alternate
+            .take()
+            .map(|alternate| {
+                let CandidateMacroAlternateParts { parts, candidates } = *alternate;
+                let boundaries = find_boundaries(&parts)?;
+                Self::try_from_parts(
+                    parts,
+                    boundaries.entry,
+                    boundaries.normal_exit,
+                    boundaries.exceptional_exit,
+                )
+                .map(|semantics| {
+                    Box::new(GuardedProcedureBody {
+                        semantics,
+                        authority: GuardedProcedureAuthority::Macro(candidates),
+                    })
+                })
+            })
+            .transpose()?;
         let cfg =
             ControlFlowGraph::try_from_edges(parts.id, parts.points.len(), parts.control_edges)?;
         let guard_facts = freeze_guard_facts(&cfg, &parts.guard_facts);
@@ -672,6 +823,7 @@ impl ProcedureSemantics {
         let value_identity_ordinals =
             duplicate_value_ordinals(&parts.values, &parts.source_mappings);
         let mut semantics = Self {
+            guarded_alternate,
             callable_selection_dominance: CallableSelectionDominance::default(),
             call_gap_derived: CallGapDerived::default(),
             id: parts.id,
@@ -695,6 +847,7 @@ impl ProcedureSemantics {
             source_mappings: parts.source_mappings.into_boxed_slice(),
             statement_entries: parts.statement_entries.into_boxed_slice(),
             loop_sites: parts.loop_sites.into_boxed_slice(),
+            cleanup_chains: parts.cleanup_chains,
             drops: parts.drops.into_boxed_slice(),
             move_outs: parts.move_outs.into_boxed_slice(),
             scope_ends: parts.scope_ends.into_boxed_slice(),
@@ -744,6 +897,9 @@ impl ProcedureSemantics {
         self.source_mappings.hash(&mut digest);
         self.statement_entries.hash(&mut digest);
         self.loop_sites.hash(&mut digest);
+        self.cleanup_chains.nodes().hash(&mut digest);
+        self.cleanup_chains.anchors().hash(&mut digest);
+        self.cleanup_chains.projections().hash(&mut digest);
         self.drops.hash(&mut digest);
         self.move_outs.hash(&mut digest);
         self.scope_ends.hash(&mut digest);
@@ -773,6 +929,19 @@ impl ProcedureSemantics {
 
     pub const fn id(&self) -> ProcedureId {
         self.id
+    }
+
+    /// Content identity of this procedure's parts, independent of its guarded alternative.
+    #[doc(hidden)]
+    pub const fn parts_materialization_id(&self) -> StableDigest {
+        self.materialization_id.0
+    }
+
+    /// Identity of the isolated alternate parts; base-only changes do not affect it.
+    #[doc(hidden)]
+    pub fn candidate_macro_alternate_materialization_id(&self) -> Option<StableDigest> {
+        self.candidate_macro_alternate()
+            .map(|(alternate, _)| alternate.parts_materialization_id())
     }
 
     const fn materialization_id(&self) -> ProcedureMaterializationId {
@@ -897,6 +1066,156 @@ impl ProcedureSemantics {
 
     /// Every explicit or implicit place destruction represented in this
     /// procedure artifact.
+    pub fn cleanup_chains(&self) -> &super::CleanupChains {
+        &self.cleanup_chains
+    }
+
+    /// Logical facts preserve direct/anchor publication order using direct-row offsets.
+    /// No expanded cleanup rows are retained by the artifact.
+    pub fn logical_drops(&self) -> impl Iterator<Item = super::LogicalDropFact<'_>> {
+        logical_drops(&self.drops, &self.cleanup_chains)
+    }
+
+    pub fn logical_scope_ends(&self) -> impl Iterator<Item = super::LogicalScopeEndFact<'_>> {
+        use crate::analyzer::semantic::cfg::ScopeCleanupAction;
+        let direct = self
+            .scope_ends
+            .iter()
+            .map(|fact| super::LogicalScopeEndFact {
+                place: &fact.place,
+                at: fact.at,
+                source: fact.source,
+                evidence: fact.evidence,
+            });
+        let anchored = self.cleanup_chains.anchors().iter().flat_map(|anchor| {
+            let actions = self
+                .cleanup_chains
+                .anchor_actions(anchor)
+                .filter_map(move |entry| {
+                    if anchor.purpose != super::CleanupAnchorPurpose::Completion {
+                        return None;
+                    }
+                    match &entry.action {
+                        ScopeCleanupAction::ScopeEnd {
+                            place,
+                            source,
+                            evidence,
+                        } => Some(super::LogicalScopeEndFact {
+                            place,
+                            at: super::ScopeEndAt::Point(anchor.point),
+                            source: *source,
+                            evidence: *evidence,
+                        }),
+                        _ => None,
+                    }
+                });
+            let owners = self
+                .cleanup_chains
+                .owners(anchor.segment)
+                .filter_map(move |owner| {
+                    (anchor.purpose == super::CleanupAnchorPurpose::LifetimeEnd
+                        && owner.lifecycle == super::CleanupOwnerLifecycle::ScopeEnd)
+                        .then_some(super::LogicalScopeEndFact {
+                            place: &owner.place,
+                            at: super::ScopeEndAt::Point(anchor.point),
+                            source: owner.source,
+                            evidence: owner.evidence,
+                        })
+                });
+            actions
+                .chain(owners)
+                .map(move |fact| (anchor.scope_end_offset, fact))
+        });
+        merge_cleanup_facts(direct, anchored)
+    }
+
+    pub fn logical_incomplete_facts(
+        &self,
+    ) -> impl Iterator<Item = super::LogicalIncompleteFact<'_>> {
+        use super::{LogicalIncompleteSubject as Subject, SemanticIncompleteSubject};
+        use crate::analyzer::semantic::cfg::ScopeCleanupAction;
+        let direct = self
+            .incomplete_facts
+            .iter()
+            .map(|fact| super::LogicalIncompleteFact {
+                point: fact.point,
+                subject: match &fact.subject {
+                    SemanticIncompleteSubject::Procedure => Subject::Procedure,
+                    SemanticIncompleteSubject::Place(place) => Subject::Place(place),
+                    SemanticIncompleteSubject::Value(value) => Subject::Value(*value),
+                    SemanticIncompleteSubject::PointerOrigin(origin) => {
+                        Subject::PointerOrigin(*origin)
+                    }
+                },
+                reason: fact.reason,
+                source: fact.source,
+                evidence: fact.evidence,
+            });
+        let anchored = self
+            .cleanup_chains
+            .anchors()
+            .iter()
+            .filter(|a| a.purpose == super::CleanupAnchorPurpose::Completion)
+            .flat_map(|anchor| {
+                self.cleanup_chains
+                    .anchor_actions(anchor)
+                    .filter_map(move |entry| {
+                        let incomplete = entry.incomplete.as_ref()?;
+                        let (place, source) = match &entry.action {
+                            ScopeCleanupAction::Drop { place, source, .. }
+                            | ScopeCleanupAction::ScopeEnd { place, source, .. } => (place, source),
+                        };
+                        Some(super::LogicalIncompleteFact {
+                            point: anchor.point,
+                            subject: Subject::Place(place),
+                            reason: super::SemanticIncompleteReason::Lifecycle(incomplete.reason),
+                            source: *source,
+                            evidence: incomplete.evidence,
+                        })
+                    })
+                    .map(move |fact| (anchor.incomplete_offset, fact))
+            });
+        merge_cleanup_facts(direct, anchored)
+    }
+
+    pub fn logical_pointer_invalidations(&self) -> impl Iterator<Item = PointerInvalidation> + '_ {
+        let direct = self.pointer_invalidations.iter().cloned();
+        let anchored = self
+            .cleanup_chains
+            .anchors()
+            .iter()
+            .filter(|a| a.purpose == super::CleanupAnchorPurpose::LifetimeEnd)
+            .flat_map(|anchor| {
+                self.cleanup_chains
+                    .owners(anchor.segment)
+                    .filter_map(move |owner| {
+                        let invalidation = owner.invalidation?;
+                        Some(PointerInvalidation {
+                            point: anchor.point,
+                            target: invalidation.target,
+                            cause: invalidation.cause,
+                            strength: invalidation.strength,
+                            source: owner.source,
+                            evidence: owner.evidence,
+                        })
+                    })
+                    .map(move |fact| (anchor.pointer_invalidation_offset, fact))
+            });
+        merge_cleanup_facts(direct, anchored)
+    }
+
+    /// Owners are queried from compact segments without a route-times-owner index.
+    pub fn cleanup_anchors_for_owner(
+        &self,
+        value: ValueId,
+    ) -> impl Iterator<Item = &super::CleanupAnchor> {
+        self.cleanup_chains.anchors().iter().filter(move |anchor| {
+            self.cleanup_chains
+                .owners(anchor.segment)
+                .any(|owner| owner.value == value)
+        })
+    }
+
     pub fn drops(&self) -> &[DropFact] {
         &self.drops
     }
@@ -960,6 +1279,71 @@ impl ProcedureSemantics {
 
     pub fn evidence_rows(&self) -> &[Evidence] {
         &self.evidence_rows
+    }
+
+    /// Expand only the requested logical view; compact storage stays unchanged.
+    pub fn logical_gaps(&self) -> impl Iterator<Item = super::LogicalGapRef<'_>> {
+        self.gaps
+            .iter()
+            .flat_map(move |gap| self.logical_gaps_of(gap))
+    }
+
+    /// The logical obligations of one gap of this procedure: the gap itself,
+    /// or one member per owner of its cleanup-owner segment. A caller that
+    /// holds one gap asks this instead of filtering [`Self::logical_gaps`],
+    /// which would visit every gap of the procedure.
+    pub fn logical_gaps_of<'a>(
+        &'a self,
+        gap: &'a SemanticGap,
+    ) -> impl Iterator<Item = super::LogicalGapRef<'a>> + 'a {
+        let segment = match gap.subject {
+            SemanticGapSubject::CleanupOwners(segment) => Some(segment),
+            _ => None,
+        };
+        segment
+            .is_none()
+            .then_some(super::LogicalGapRef {
+                base: gap,
+                member: None,
+            })
+            .into_iter()
+            .chain(segment.into_iter().flat_map(move |segment| {
+                self.cleanup_chains
+                    .member_owners(segment)
+                    .map(move |owner| super::LogicalGapRef {
+                        base: gap,
+                        member: Some(super::GapMemberRef {
+                            base_gap_id: gap.id,
+                            owner,
+                        }),
+                    })
+            }))
+    }
+
+    /// Resolve a key only in its owning procedure, validating exact membership.
+    pub fn logical_gap(&self, key: super::GapKey) -> Option<super::LogicalGapRef<'_>> {
+        match key {
+            super::GapKey::Gap(id) => {
+                let base = self.gap(id)?;
+                if matches!(base.subject, SemanticGapSubject::CleanupOwners(_)) {
+                    return None;
+                }
+                Some(super::LogicalGapRef { base, member: None })
+            }
+            super::GapKey::Member(member) => {
+                let base = self.gap(member.base_gap_id)?;
+                let SemanticGapSubject::CleanupOwners(segment) = base.subject else {
+                    return None;
+                };
+                self.value(member.owner)?;
+                self.cleanup_chains
+                    .contains_owner(segment, member.owner)
+                    .then_some(super::LogicalGapRef {
+                        base,
+                        member: Some(member),
+                    })
+            }
+        }
     }
 
     pub fn gaps(&self) -> &[SemanticGap] {
@@ -1292,7 +1676,7 @@ impl ProcedureSemantics {
     }
 
     /// Gaps whose subjects can affect this call, in original gap-id order.
-    pub fn call_gap_candidates(&self, call: &SemanticCallSite) -> Vec<&SemanticGap> {
+    pub fn call_gap_candidates(&self, call: &SemanticCallSite) -> Vec<super::LogicalGapRef<'_>> {
         // A derived index of immutable IR is not charged: a fill charge lands on
         // whichever request fills it first, making persisted and rendered work
         // counters depend on request order.
@@ -1301,15 +1685,19 @@ impl ProcedureSemantics {
             let mut points = Vec::new();
             let mut values = Vec::new();
             let mut calls = Vec::new();
+            let mut cleanup_owners = Vec::new();
             for (index, gap) in self.gaps.iter().enumerate() {
                 match gap.subject {
-                    SemanticGapSubject::Procedure => procedure.push(index),
+                    SemanticGapSubject::Procedure
+                    | SemanticGapSubject::FutureConstruction
+                    | SemanticGapSubject::FutureActivation => procedure.push(index),
                     SemanticGapSubject::Point => points.push((gap.point, index)),
                     SemanticGapSubject::Value(value) => values.push((value, index)),
                     SemanticGapSubject::CallSite(call)
                     | SemanticGapSubject::CallContinuation {
                         call_site: call, ..
                     } => calls.push((call, index)),
+                    SemanticGapSubject::CleanupOwners(_) => cleanup_owners.push(index),
                     SemanticGapSubject::MemoryLocation(_)
                     | SemanticGapSubject::Capture(_)
                     | SemanticGapSubject::AsyncContinuation { .. } => {}
@@ -1323,6 +1711,7 @@ impl ProcedureSemantics {
                 points: points.into_boxed_slice(),
                 values: values.into_boxed_slice(),
                 calls: calls.into_boxed_slice(),
+                cleanup_owners: cleanup_owners.into_boxed_slice(),
             }
         });
         fn append<K: Ord>(rows: &[(K, usize)], key: K, candidates: &mut Vec<usize>) {
@@ -1344,14 +1733,46 @@ impl ProcedureSemantics {
         values.extend(call.thrown);
         values.sort_unstable();
         values.dedup();
-        for value in values {
+        for &value in &values {
             append(&scopes.values, value, &mut candidates);
         }
         candidates.sort_unstable_by_key(|index| self.gaps[*index].id);
-        candidates
+        let mut logical = candidates
             .into_iter()
-            .map(|index| &self.gaps[index])
-            .collect()
+            .map(|index| super::LogicalGapRef {
+                base: &self.gaps[index],
+                member: None,
+            })
+            .collect::<Vec<_>>();
+        // Ordinary Value gaps came from the value index above. Only cleanup-owner
+        // gaps need a membership test, so a procedure without them pays nothing.
+        for &index in scopes.cleanup_owners.iter() {
+            let gap = &self.gaps[index];
+            let SemanticGapSubject::CleanupOwners(segment) = gap.subject else {
+                unreachable!("the cleanup-owner index holds only cleanup-owner gaps");
+            };
+            for &owner in &values {
+                if self.cleanup_chains.contains_owner(segment, owner) {
+                    logical.push(super::LogicalGapRef {
+                        base: gap,
+                        member: Some(super::GapMemberRef {
+                            base_gap_id: gap.id,
+                            owner,
+                        }),
+                    });
+                }
+            }
+        }
+        logical.sort_unstable_by_key(|gap| {
+            (
+                gap.base.point,
+                gap.base.capability,
+                gap.member.map(|member| member.owner),
+                gap.base.id,
+            )
+        });
+        logical.dedup_by_key(|gap| gap.key());
+        logical
     }
 
     /// Complete abort-path answer, derived without request reads or limits.
@@ -1895,9 +2316,26 @@ fn boxed_slice_index_retained_bytes<K, V>(index: &HashMap<K, Box<[V]>>) -> u64 {
         })
 }
 
+struct CandidateEvidence {
+    value: Arc<dyn std::any::Any + Send + Sync>,
+    bytes: usize,
+}
+
+impl std::fmt::Debug for CandidateEvidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CandidateEvidence")
+            .field("bytes", &self.bytes)
+            .finish_non_exhaustive()
+    }
+}
+
 /// One immutable interpretation of one mounted source snapshot.
 #[derive(Debug)]
 pub struct SemanticArtifact {
+    /// Guarded IR shares the lifetime and allocation identity of this base.
+    /// Flows and admission decisions remain per acquisition.
+    candidate_arena: std::sync::OnceLock<std::sync::Mutex<CandidateArena>>,
+    candidate_evidence: Option<CandidateEvidence>,
     pub(crate) charge: brokk_bifrost_core::retention_budget::AllocationCharge,
     pub(crate) cache_pins: Arc<ArtifactCachePins>,
     #[doc(hidden)]
@@ -1906,8 +2344,10 @@ pub struct SemanticArtifact {
     materialization_id: SemanticArtifactMaterializationId,
     capabilities: SemanticCapabilities,
     work: SemanticWork,
+    base_work: SemanticWork,
     go_predeclared_builtin_assumptions: Box<[GoPredeclaredBuiltin]>,
     procedures: Box<[ProcedureSemantics]>,
+    ownership_projection: Option<Box<OwnershipProjection>>,
     procedures_by_locator: HashMap<SemanticLocator, ProcedureId>,
     /// Procedures lexically enclosed by each procedure, built once from the
     /// validated parent links so a closure walk never rescans the procedure
@@ -1917,6 +2357,87 @@ pub struct SemanticArtifact {
     /// Built once so a range lookup examines only procedures that can own a
     /// call site containing the range.
     call_source_extents: Box<[CallSourceExtent]>,
+}
+
+/// A demand view owns one target and shares every unrelated body and index.
+#[derive(Debug)]
+struct OwnershipProjection {
+    base: Arc<SemanticArtifact>,
+    target: ProcedureSemantics,
+    owned_bytes: u64,
+}
+
+/// Dense logical procedure table backed by either an ordinary artifact or a
+/// shared base plus one demand-local substitution. No table is copied.
+#[derive(Clone, Copy)]
+pub struct SemanticProcedures<'a>(&'a SemanticArtifact);
+
+impl<'a> SemanticProcedures<'a> {
+    pub fn len(self) -> usize {
+        self.0
+            .ownership_projection
+            .as_ref()
+            .map_or(self.0.procedures.len(), |view| view.base.procedures().len())
+    }
+    pub fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+    pub fn get(self, index: usize) -> Option<&'a ProcedureSemantics> {
+        self.0
+            .procedure(ProcedureId::new(u32::try_from(index).ok()?))
+    }
+    pub fn first(self) -> Option<&'a ProcedureSemantics> {
+        self.get(0)
+    }
+    pub fn iter(self) -> SemanticProcedureIter<'a> {
+        SemanticProcedureIter {
+            table: self,
+            indices: 0..self.len(),
+        }
+    }
+}
+#[derive(Clone)]
+pub struct SemanticProcedureIter<'a> {
+    table: SemanticProcedures<'a>,
+    indices: std::ops::Range<usize>,
+}
+impl<'a> Iterator for SemanticProcedureIter<'a> {
+    type Item = &'a ProcedureSemantics;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.indices.next().and_then(|index| self.table.get(index))
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.indices.size_hint()
+    }
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        self.indices.nth(n).and_then(|index| self.table.get(index))
+    }
+}
+impl ExactSizeIterator for SemanticProcedureIter<'_> {}
+impl DoubleEndedIterator for SemanticProcedureIter<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.indices
+            .next_back()
+            .and_then(|index| self.table.get(index))
+    }
+}
+impl<'a> IntoIterator for SemanticProcedures<'a> {
+    type Item = &'a ProcedureSemantics;
+    type IntoIter = SemanticProcedureIter<'a>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+impl std::fmt::Debug for SemanticProcedures<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+impl std::ops::Index<usize> for SemanticProcedures<'_> {
+    type Output = ProcedureSemantics;
+    fn index(&self, index: usize) -> &Self::Output {
+        self.get(index).expect("procedure index")
+    }
 }
 
 /// The hull of one procedure's call-site source mappings. `max_end_byte` is
@@ -1930,7 +2451,215 @@ struct CallSourceExtent {
     max_end_byte: usize,
 }
 
+#[derive(Debug, Default)]
+struct CandidateArena {
+    live: std::sync::Weak<SemanticArtifact>,
+    retained: Option<Arc<SemanticArtifact>>,
+}
+
 impl SemanticArtifact {
+    #[doc(hidden)]
+    pub fn candidate_evidence(&self) -> Option<&Arc<dyn std::any::Any + Send + Sync>> {
+        self.candidate_evidence
+            .as_ref()
+            .map(|evidence| &evidence.value)
+    }
+
+    #[doc(hidden)]
+    pub fn attach_candidate_evidence(
+        &mut self,
+        evidence: Arc<dyn std::any::Any + Send + Sync>,
+        bytes: usize,
+    ) {
+        assert!(self.candidate_evidence.is_none());
+        self.work.owned_text_bytes = self.work.owned_text_bytes.saturating_add(bytes);
+        self.candidate_evidence = Some(CandidateEvidence {
+            value: evidence,
+            bytes,
+        });
+    }
+
+    /// Include retained projection rows in the complete-artifact census.
+    #[doc(hidden)]
+    pub fn include_candidate_census(&mut self, census: SemanticWork) {
+        self.work = self.work.saturating_add(census);
+    }
+
+    #[doc(hidden)]
+    pub fn candidate_evidence_retained_bytes(&self) -> usize {
+        self.candidate_evidence
+            .as_ref()
+            .map_or(0, |evidence| evidence.bytes)
+    }
+
+    #[doc(hidden)]
+    pub fn try_candidate_arena<E>(
+        &self,
+        build: impl FnOnce() -> Result<Option<Arc<Self>>, E>,
+    ) -> Result<Option<Arc<Self>>, E> {
+        assert!(
+            !self.has_executable_projection(),
+            "an executable body cannot acquire a macro arena"
+        );
+        let mut slot = self
+            .candidate_arena
+            .get_or_init(Default::default)
+            .lock()
+            .expect("candidate arena mutex poisoned");
+        if let Some(live) = slot.live.upgrade() {
+            return Ok(Some(live));
+        }
+        let Some(artifact) = build()? else {
+            return Ok(None);
+        };
+        assert!(
+            !artifact.has_executable_projection(),
+            "a macro arena cannot retain an executable body"
+        );
+        slot.live = Arc::downgrade(&artifact);
+        slot.retained = artifact.charge.is_charged().then(|| Arc::clone(&artifact));
+        Ok(Some(artifact))
+    }
+
+    #[doc(hidden)]
+    pub fn canonical_candidate_arena(&self, artifact: Arc<Self>) -> Arc<Self> {
+        assert!(
+            !self.has_executable_projection(),
+            "an executable body cannot acquire a macro arena"
+        );
+        debug_assert_eq!(self.key(), artifact.key());
+        debug_assert_eq!(self.capabilities(), artifact.capabilities());
+        assert!(
+            !artifact.has_executable_projection(),
+            "a macro arena cannot canonicalize an executable body"
+        );
+        let mut slot = self
+            .candidate_arena
+            .get_or_init(Default::default)
+            .lock()
+            .expect("candidate arena mutex poisoned");
+        if let Some(live) = slot.live.upgrade() {
+            return live;
+        }
+        slot.live = Arc::downgrade(&artifact);
+        slot.retained = artifact.charge.is_charged().then(|| Arc::clone(&artifact));
+        artifact
+    }
+
+    #[doc(hidden)]
+    pub fn candidate_arena_retained_bytes(&self) -> u64 {
+        self.candidate_arena.get().map_or(0, |slot| {
+            let slot = slot.lock().expect("candidate arena mutex poisoned");
+            slot.retained.as_ref().map_or(0, |arena| {
+                crate::analyzer::semantic::service::semantic_artifact_retained_bytes(arena)
+            })
+        })
+    }
+
+    /// Borrow the actual retained arena owner without building a census or
+    /// copying its graph. The callback must not reenter this artifact's slot.
+    #[doc(hidden)]
+    pub fn for_each_retained_candidate_arena(&self, mut visit: impl FnMut(&Arc<Self>)) {
+        if let Some(slot) = self.candidate_arena.get() {
+            let slot = slot.lock().expect("candidate arena mutex poisoned");
+            if let Some(arena) = &slot.retained {
+                visit(arena);
+            }
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub(crate) fn retained_candidate_arena_for_test(&self) -> Option<Arc<Self>> {
+        let slot = self.candidate_arena.get()?;
+        {
+            let slot = slot.lock().expect("candidate arena mutex poisoned");
+            slot.retained.as_ref().map(Arc::clone)
+        }
+    }
+
+    /// Attach decoded guarded parts before the ordinary full artifact validation.
+    /// M4 uses this entry point to freeze alternatives in their base context.
+    pub fn try_new_with_candidate_alternates(
+        key: SemanticArtifactKey,
+        capabilities: SemanticCapabilities,
+        base_parts: Vec<ProcedureSemanticsParts>,
+        alternates: impl IntoIterator<Item = (ProcedureSemanticsParts, Box<[CandidateRecord]>)>,
+    ) -> Result<Self, SemanticIrError> {
+        let mut budget = SemanticBudget::producer();
+        Self::try_new_with_candidate_alternates_and_budget(
+            key,
+            capabilities,
+            base_parts,
+            alternates,
+            &mut budget,
+            &brokk_bifrost_core::cancellation::CancellationToken::default(),
+        )
+        .map_err(|error| match error {
+            SemanticArtifactBuildError::Invalid(error) => error,
+            SemanticArtifactBuildError::Cancelled => SemanticIrError::artifact(
+                SemanticIrErrorKind::Cancelled,
+                "semantic validation cancelled",
+            ),
+            SemanticArtifactBuildError::ExceededBudget(error) => {
+                SemanticIrError::artifact(SemanticIrErrorKind::ResourceLimit, error.to_string())
+            }
+        })
+    }
+
+    /// Attach guarded parts and charge their complete census to the caller.
+    pub fn try_new_with_candidate_alternates_and_budget(
+        key: SemanticArtifactKey,
+        capabilities: SemanticCapabilities,
+        mut base_parts: Vec<ProcedureSemanticsParts>,
+        alternates: impl IntoIterator<Item = (ProcedureSemanticsParts, Box<[CandidateRecord]>)>,
+        budget: &mut SemanticBudget,
+        cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+    ) -> Result<Self, SemanticArtifactBuildError> {
+        for (alternate, candidates) in alternates {
+            let id = alternate.id;
+            let base = base_parts
+                .get_mut(id.index())
+                .filter(|base| base.id == id)
+                .ok_or_else(|| {
+                    SemanticIrError::procedure(
+                        id,
+                        SemanticIrErrorKind::OutOfBounds,
+                        "unknown guarded procedure",
+                    )
+                })?;
+            if base.candidate_alternate.is_some() || alternate.candidate_alternate.is_some() {
+                return Err(SemanticIrError::procedure(
+                    id,
+                    SemanticIrErrorKind::CallContract,
+                    "duplicate or nested guarded alternative",
+                )
+                .into());
+            }
+            if base.locator != alternate.locator {
+                return Err(SemanticIrError::procedure(
+                    id,
+                    SemanticIrErrorKind::CallContract,
+                    "invalid guarded locator",
+                )
+                .into());
+            }
+            if let Err(violation) = validate_candidate_records(base, &alternate, &candidates) {
+                return Err(SemanticIrError::procedure(
+                    id,
+                    SemanticIrErrorKind::CallContract,
+                    format!("invalid guarded candidate records: {violation}"),
+                )
+                .into());
+            }
+            base.candidate_alternate = Some(Box::new(CandidateMacroAlternateParts {
+                parts: alternate,
+                candidates,
+            }));
+        }
+        Self::try_new_with_budget(key, capabilities, base_parts, budget, cancellation)
+    }
+
     /// Validate all artifact, procedure, side-table, event, and topology
     /// invariants before exposing immutable semantics.
     pub fn try_new(
@@ -1938,15 +2667,24 @@ impl SemanticArtifact {
         capabilities: SemanticCapabilities,
         procedure_parts: Vec<ProcedureSemanticsParts>,
     ) -> Result<Self, SemanticIrError> {
-        let mut budget = SemanticBudget::default();
-        Self::try_new_with_budget(key, capabilities, procedure_parts, &mut budget).map_err(
-            |error| match error {
-                SemanticArtifactBuildError::Invalid(error) => error,
-                SemanticArtifactBuildError::ExceededBudget(error) => {
-                    SemanticIrError::artifact(SemanticIrErrorKind::ResourceLimit, error.to_string())
-                }
-            },
+        let mut budget = SemanticBudget::producer();
+        Self::try_new_with_budget(
+            key,
+            capabilities,
+            procedure_parts,
+            &mut budget,
+            &brokk_bifrost_core::cancellation::CancellationToken::default(),
         )
+        .map_err(|error| match error {
+            SemanticArtifactBuildError::Invalid(error) => error,
+            SemanticArtifactBuildError::Cancelled => SemanticIrError::artifact(
+                SemanticIrErrorKind::Cancelled,
+                "semantic validation cancelled",
+            ),
+            SemanticArtifactBuildError::ExceededBudget(error) => {
+                SemanticIrError::artifact(SemanticIrErrorKind::ResourceLimit, error.to_string())
+            }
+        })
     }
 
     /// Validate and publish an artifact while atomically charging every
@@ -1957,6 +2695,7 @@ impl SemanticArtifact {
         capabilities: SemanticCapabilities,
         mut procedure_parts: Vec<ProcedureSemanticsParts>,
         budget: &mut SemanticBudget,
+        cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
     ) -> Result<Self, SemanticArtifactBuildError> {
         let mut go_predeclared_builtin_assumptions = Vec::new();
         for procedure in &mut procedure_parts {
@@ -1965,11 +2704,25 @@ impl SemanticArtifact {
         }
         go_predeclared_builtin_assumptions.sort_unstable_by_key(|builtin| builtin.name());
         go_predeclared_builtin_assumptions.dedup();
-        let work =
+        let (base_work, work) =
             measure_artifact_work(&key, &procedure_parts, &go_predeclared_builtin_assumptions);
         let mut charged_budget = budget.clone();
         charged_budget.admit_artifact_rows(work)?;
-        validate_artifact(&key, &capabilities, &procedure_parts)?;
+        #[cfg(any(test, feature = "test-support"))]
+        if REJECTED_ARTIFACT_PATHS_FOR_TEST
+            .lock()
+            .expect("rejected artifact paths mutex poisoned")
+            .iter()
+            .any(|path| path == key.path().as_str())
+        {
+            return Err(SemanticArtifactBuildError::Invalid(
+                SemanticIrError::artifact(
+                    SemanticIrErrorKind::GapContract,
+                    "artifact rejected by the test registry",
+                ),
+            ));
+        }
+        validate_artifact(&key, &capabilities, &procedure_parts, cancellation)?;
 
         let mut procedures_by_locator = HashMap::default();
         let mut procedures = Vec::with_capacity(procedure_parts.len());
@@ -2003,6 +2756,8 @@ impl SemanticArtifact {
             &go_predeclared_builtin_assumptions,
         );
         let artifact = Self {
+            candidate_arena: Default::default(),
+            candidate_evidence: None,
             charge: Default::default(),
             cache_pins: Arc::new(ArtifactCachePins::default()),
             query_source: None,
@@ -2010,14 +2765,200 @@ impl SemanticArtifact {
             materialization_id,
             capabilities,
             work,
+            base_work,
             go_predeclared_builtin_assumptions: go_predeclared_builtin_assumptions.into(),
             procedures,
+            ownership_projection: None,
             procedures_by_locator,
             lexical_children,
             call_source_extents,
         };
         *budget = charged_budget;
         Ok(artifact)
+    }
+
+    /// Freeze one demand-local target in an already validated base context.
+    /// The logical census and fingerprint equal a complete target-only rebuild.
+    #[doc(hidden)]
+    pub fn try_ownership_projection(
+        base: Arc<Self>,
+        alternate: ProcedureSemanticsParts,
+        candidates: Box<[CandidateRecord]>,
+        native_target_census: SemanticWork,
+        budget: &mut SemanticBudget,
+        cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+    ) -> Result<Self, SemanticArtifactBuildError> {
+        let original = Self::validate_ownership_target(&base, &alternate, cancellation)?;
+        let id = alternate.id;
+        if let Err(detail) = super::model::validate_candidate_records_with_anchor(
+            |call| {
+                original
+                    .call_site(call)
+                    .and_then(|call| original.source_mapping(call.source))
+                    .map(|mapping| CandidateAnchor::of(mapping.locator.anchor().span()))
+            },
+            &alternate,
+            &candidates,
+        ) {
+            return Err(
+                SemanticIrError::procedure(id, SemanticIrErrorKind::CallContract, detail).into(),
+            );
+        }
+        Self::freeze_ownership_projection(
+            base,
+            alternate,
+            GuardedProcedureAuthority::Macro(candidates),
+            native_target_census,
+            budget,
+        )
+    }
+
+    /// Freeze a demand-only body whose executable refinement evidence is owned
+    /// by the acquiring query's receipt. This does not admit the body or put
+    /// it in the native artifact cache. Legacy macro authority cannot share this executable slot.
+    #[doc(hidden)]
+    pub fn try_executable_projection(
+        base: Arc<Self>,
+        alternate: ProcedureSemanticsParts,
+        native_target_census: SemanticWork,
+        budget: &mut SemanticBudget,
+        cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+    ) -> Result<Self, SemanticArtifactBuildError> {
+        Self::validate_ownership_target(&base, &alternate, cancellation)?;
+        Self::freeze_ownership_projection(
+            base,
+            alternate,
+            GuardedProcedureAuthority::Executable,
+            native_target_census,
+            budget,
+        )
+    }
+
+    fn validate_ownership_target<'a>(
+        base: &'a Self,
+        alternate: &ProcedureSemanticsParts,
+        cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+    ) -> Result<&'a ProcedureSemantics, SemanticArtifactBuildError> {
+        super::validation::validate_ownership_projection(base, alternate, cancellation)?;
+        let original = base
+            .procedure(alternate.id)
+            .expect("validated ownership target");
+        if original.guarded_alternate().is_some()
+            || alternate.candidate_macro_alternate_parts().is_some()
+        {
+            return Err(SemanticIrError::procedure(
+                alternate.id,
+                SemanticIrErrorKind::CallContract,
+                "duplicate or mixed ownership alternative",
+            )
+            .into());
+        }
+        Ok(original)
+    }
+
+    fn freeze_ownership_projection(
+        base: Arc<Self>,
+        alternate: ProcedureSemanticsParts,
+        authority: GuardedProcedureAuthority,
+        native_target_census: SemanticWork,
+        budget: &mut SemanticBudget,
+    ) -> Result<Self, SemanticArtifactBuildError> {
+        let original = base
+            .procedure(alternate.id)
+            .expect("validated ownership target");
+        let candidate_count = match &authority {
+            GuardedProcedureAuthority::Macro(candidates) => candidates.len(),
+            GuardedProcedureAuthority::Executable => 0,
+        };
+        let mut extra = super::validation::measure_procedure_work(&alternate);
+        extra.procedures = 0;
+        extra.nested_entries = extra.nested_entries.saturating_add(candidate_count);
+        let work = base.work.conservative_add(extra);
+        let mut staged = budget.clone();
+        staged.admit_artifact_rows(work)?;
+        let owned_bytes =
+            crate::analyzer::semantic::service::procedure_parts_retained_bytes(&alternate) as u64
+                + crate::analyzer::semantic::service::frozen_procedure_row_bytes(
+                    original,
+                    native_target_census,
+                )
+                + (candidate_count * size_of::<CandidateRecord>()) as u64;
+        let boundaries = find_boundaries(&alternate)?;
+        let alternate = ProcedureSemantics::try_from_parts(
+            alternate,
+            boundaries.entry,
+            boundaries.normal_exit,
+            boundaries.exceptional_exit,
+        )?;
+        let mut target = original.clone();
+        target.guarded_alternate = Some(Box::new(GuardedProcedureBody {
+            semantics: alternate,
+            authority,
+        }));
+        let mut view = Self {
+            candidate_arena: Default::default(),
+            candidate_evidence: None,
+            charge: Default::default(),
+            cache_pins: Arc::new(ArtifactCachePins::default()),
+            query_source: base.query_source.clone(),
+            key: base.key.clone(),
+            materialization_id: base.materialization_id,
+            capabilities: base.capabilities.clone(),
+            work,
+            base_work: base.base_work,
+            go_predeclared_builtin_assumptions: Box::default(),
+            procedures: Box::default(),
+            procedures_by_locator: HashMap::default(),
+            lexical_children: HashMap::default(),
+            call_source_extents: Box::default(),
+            ownership_projection: Some(Box::new(OwnershipProjection {
+                base,
+                target,
+                owned_bytes,
+            })),
+        };
+        view.materialization_id = compute_artifact_materialization_id(
+            &view.key,
+            &view.capabilities,
+            view.procedures().iter(),
+            view.go_predeclared_builtin_assumptions(),
+        );
+        *budget = staged;
+        Ok(view)
+    }
+
+    #[doc(hidden)]
+    pub fn shared_ownership_base(&self) -> Option<&Arc<Self>> {
+        self.ownership_projection.as_ref().map(|view| &view.base)
+    }
+
+    fn has_executable_projection(&self) -> bool {
+        self.ownership_projection
+            .as_ref()
+            .is_some_and(|view| view.target.executable_alternate().is_some())
+    }
+
+    #[doc(hidden)]
+    pub fn ownership_projection_retained_bytes(&self) -> Option<u64> {
+        self.ownership_projection.as_ref().map(|view| {
+            // Shared base/index/source storage has its own allocation charge.
+            view.owned_bytes
+                .saturating_add(size_of::<Self>() as u64)
+                .saturating_add(size_of::<OwnershipProjection>() as u64)
+                .saturating_add(view.target.call_indexes_retained_bytes())
+                .saturating_add(view.target.cleanup_chains().index_retained_bytes() as u64)
+                .saturating_add(view.target.callable_selection_dominance_reserved_bytes())
+                .saturating_add(view.target.call_gap_index_reserved_bytes())
+                .saturating_add(view.target.value_identity_index_retained_bytes())
+                .saturating_add(view.target.guarded_alternate().map_or(0, |alternate| {
+                    alternate
+                        .call_indexes_retained_bytes()
+                        .saturating_add(alternate.cleanup_chains().index_retained_bytes() as u64)
+                        .saturating_add(alternate.callable_selection_dominance_reserved_bytes())
+                        .saturating_add(alternate.call_gap_index_reserved_bytes())
+                        .saturating_add(alternate.value_identity_index_retained_bytes())
+                }))
+        })
     }
 
     /// Retain one selected source file only for this demand materialization.
@@ -2052,30 +2993,50 @@ impl SemanticArtifact {
         &self.capabilities
     }
 
+    /// Retained row census of the ordinary IR, excluding isolated guarded rows.
+    #[doc(hidden)]
+    pub const fn base_work(&self) -> SemanticWork {
+        self.base_work
+    }
+
     pub const fn work(&self) -> SemanticWork {
         self.work
     }
 
     pub fn go_predeclared_builtin_assumptions(&self) -> &[GoPredeclaredBuiltin] {
-        &self.go_predeclared_builtin_assumptions
+        self.ownership_projection
+            .as_ref()
+            .map_or(self.go_predeclared_builtin_assumptions.as_ref(), |view| {
+                view.base.go_predeclared_builtin_assumptions()
+            })
     }
 
-    pub fn procedures(&self) -> &[ProcedureSemantics] {
-        &self.procedures
+    pub fn procedures(&self) -> SemanticProcedures<'_> {
+        SemanticProcedures(self)
     }
 
     pub fn procedure(&self, id: ProcedureId) -> Option<&ProcedureSemantics> {
-        self.procedures.get(id.index())
+        match &self.ownership_projection {
+            Some(view) if view.target.id == id => Some(&view.target),
+            Some(view) => view.base.procedure(id),
+            None => self.procedures.get(id.index()),
+        }
     }
 
     pub fn procedure_id(&self, locator: &SemanticLocator) -> Option<ProcedureId> {
-        self.procedures_by_locator.get(locator).copied()
+        self.ownership_projection.as_ref().map_or_else(
+            || self.procedures_by_locator.get(locator).copied(),
+            |view| view.base.procedure_id(locator),
+        )
     }
 
     /// Procedures lexically enclosed by `procedure`, in procedure-table
     /// order. The index is built once at construction from the validated
     /// parent links; a childless procedure returns an empty slice.
     pub fn lexical_children(&self, procedure: ProcedureId) -> &[ProcedureId] {
+        if let Some(view) = &self.ownership_projection {
+            return view.base.lexical_children(procedure);
+        }
         self.lexical_children
             .get(&procedure)
             .map_or(&[][..], Box::as_ref)
@@ -2096,6 +3057,9 @@ impl SemanticArtifact {
     /// Every returned procedure is a candidate; the caller still checks each
     /// call site's own mapping.
     pub(crate) fn procedures_with_call_source_containing(&self, range: Range) -> Vec<ProcedureId> {
+        if let Some(view) = &self.ownership_projection {
+            return view.base.procedures_with_call_source_containing(range);
+        }
         let candidates = self
             .call_source_extents
             .partition_point(|extent| extent.start_byte <= range.start_byte);
@@ -2127,6 +3091,37 @@ impl SemanticArtifact {
         Some(ProcedureHandle {
             artifact: Arc::clone(self),
             id,
+            interpretation: ProcedureInterpretation::Base,
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn candidate_alternate_handle(
+        self: &Arc<Self>,
+        id: ProcedureId,
+    ) -> Option<ProcedureHandle> {
+        if self.procedure(id)?.executable_alternate().is_some() {
+            return None;
+        }
+        Some(ProcedureHandle {
+            artifact: Arc::clone(self),
+            id,
+            interpretation: ProcedureInterpretation::CandidateAlternate,
+        })
+    }
+
+    /// Mint only an actually present executable body. Admission belongs to its
+    /// owning query and must be replayed before this handle executes.
+    #[doc(hidden)]
+    pub fn executable_alternate_handle(
+        self: &Arc<Self>,
+        id: ProcedureId,
+    ) -> Option<ProcedureHandle> {
+        self.procedure(id)?.executable_alternate()?;
+        Some(ProcedureHandle {
+            artifact: Arc::clone(self),
+            id,
+            interpretation: ProcedureInterpretation::ExecutableAlternate,
         })
     }
 }
@@ -2168,12 +3163,13 @@ fn call_source_extent_index(procedures: &[ProcedureSemantics]) -> Box<[CallSourc
     extents.into_boxed_slice()
 }
 
-fn compute_artifact_materialization_id(
+fn compute_artifact_materialization_id<'a>(
     key: &SemanticArtifactKey,
     capabilities: &SemanticCapabilities,
-    procedures: &[ProcedureSemantics],
+    procedures: impl IntoIterator<Item = &'a ProcedureSemantics, IntoIter: ExactSizeIterator + Clone>,
     go_predeclared_builtin_assumptions: &[GoPredeclaredBuiltin],
 ) -> SemanticArtifactMaterializationId {
+    let procedures = procedures.into_iter();
     let mut digest = MaterializationFingerprintHasher::new(ARTIFACT_MATERIALIZATION_ID_DOMAIN);
     key.fingerprint().hash(&mut digest);
     capabilities.iter().for_each(|(capability, support)| {
@@ -2182,9 +3178,49 @@ fn compute_artifact_materialization_id(
     });
     procedures.len().hash(&mut digest);
     go_predeclared_builtin_assumptions.hash(&mut digest);
-    for procedure in procedures {
+    for procedure in procedures.clone() {
         procedure.id().hash(&mut digest);
         procedure.materialization_id().hash(&mut digest);
+    }
+    // Preserve base-only identities. Once an artifact has an alternate, bind
+    // every procedure's presence tag, alternate rows and candidate metadata.
+    // The base row digest deliberately excludes these guarded contents.
+    if procedures
+        .clone()
+        .any(|procedure| procedure.candidate_macro_alternate().is_some())
+    {
+        b"candidate-alternate-materializations-v1".hash(&mut digest);
+        procedures.len().hash(&mut digest);
+        for procedure in procedures.clone() {
+            procedure.id().hash(&mut digest);
+            match procedure.candidate_macro_alternate() {
+                None => 0_u8.hash(&mut digest),
+                Some((alternate, candidates)) => {
+                    1_u8.hash(&mut digest);
+                    alternate.materialization_id().hash(&mut digest);
+                    candidates.hash(&mut digest);
+                }
+            }
+        }
+    }
+    // An executable alternative has no legacy macro records. Preserve the existing base
+    // and macro encodings and bind its presence and rows in its own section.
+    if procedures
+        .clone()
+        .any(|procedure| procedure.executable_alternate().is_some())
+    {
+        b"executable-alternate-materializations-v1".hash(&mut digest);
+        procedures.len().hash(&mut digest);
+        for procedure in procedures {
+            procedure.id().hash(&mut digest);
+            match procedure.executable_alternate() {
+                None => 0_u8.hash(&mut digest),
+                Some(alternate) => {
+                    1_u8.hash(&mut digest);
+                    alternate.materialization_id().hash(&mut digest);
+                }
+            }
+        }
     }
     SemanticArtifactMaterializationId(digest.finish_digest())
 }
@@ -2192,10 +3228,60 @@ fn compute_artifact_materialization_id(
 /// An artifact-instance-scoped procedure identity safe for provider/oracle
 /// boundaries.  Two materializations may share a durable artifact key while
 /// retaining different partial rows, so equality includes `Arc` identity.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcedureInterpretation {
+    Base,
+    CandidateAlternate,
+    ExecutableAlternate,
+}
+
+/// Artifact, procedure and executable body interpretation.
+pub type DurableProcedureKey = (SemanticArtifactKey, ProcedureId, ProcedureInterpretation);
+
+/// Exact frozen contents and executable interpretation of one procedure.
+/// A value identity; unlike handle equality it does not retain an allocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ExactProcedureIdentity {
+    materialization: SemanticArtifactMaterializationId,
+    procedure: ProcedureId,
+    interpretation: ProcedureInterpretation,
+}
+
+/// A call's dense ID is scoped to the exact selected procedure contents.
+pub type ExactCallSiteKey = (ExactProcedureIdentity, CallSiteId);
+
+/// A dense locator cannot cross executable interpretations until translated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CandidateLocatorRefusal {
+    CandidateAlternateLocatorUntranslated {
+        procedure: ProcedureId,
+        minted: ProcedureInterpretation,
+        selected: ProcedureInterpretation,
+    },
+}
+
+impl CandidateLocatorRefusal {
+    pub const fn label(&self) -> &'static str {
+        "candidate_alternate_locator_untranslated"
+    }
+}
+
+impl std::fmt::Display for CandidateLocatorRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {:?}", self.label(), self)
+    }
+}
+
+impl std::error::Error for CandidateLocatorRefusal {}
+
 #[derive(Clone)]
 pub struct ProcedureHandle {
     artifact: Arc<SemanticArtifact>,
     id: ProcedureId,
+    interpretation: ProcedureInterpretation,
 }
 
 impl brokk_bifrost_core::retention_budget::RetainedBytes for ProcedureHandle {
@@ -2205,6 +3291,14 @@ impl brokk_bifrost_core::retention_budget::RetainedBytes for ProcedureHandle {
 }
 
 impl ProcedureHandle {
+    pub fn exact_identity(&self) -> ExactProcedureIdentity {
+        ExactProcedureIdentity {
+            materialization: self.artifact.materialization_id(),
+            procedure: self.id,
+            interpretation: self.interpretation,
+        }
+    }
+
     pub fn artifact(&self) -> &Arc<SemanticArtifact> {
         &self.artifact
     }
@@ -2214,7 +3308,7 @@ impl ProcedureHandle {
     }
 
     /// The procedure's durable identity: the owning artifact's validity key and
-    /// this procedure's dense ID.
+    /// this procedure's dense ID and executable interpretation.
     ///
     /// Handle equality is materialization-scoped, so a handle minted from a
     /// second materialization of one immutable artifact is unequal to the
@@ -2226,13 +3320,101 @@ impl ProcedureHandle {
     ///
     /// This is the owned, hashable form of the comparison
     /// `value_flow::model` uses for carriers.
-    pub fn durable_key(&self) -> (SemanticArtifactKey, ProcedureId) {
-        (self.artifact.key().clone(), self.id)
+    pub fn durable_key(&self) -> DurableProcedureKey {
+        (self.artifact.key().clone(), self.id, self.interpretation)
+    }
+
+    pub fn interpretation(&self) -> ProcedureInterpretation {
+        self.interpretation
+    }
+
+    /// Recover the opaque interpretation from this handle's owning allocation.
+    pub fn base_interpretation(&self) -> Self {
+        let base = self
+            .artifact
+            .procedure_handle(self.id)
+            .expect("owned procedure");
+        debug_assert_eq!(base.interpretation(), ProcedureInterpretation::Base);
+        base
+    }
+
+    /// Whether this handle names the guarded executable interpretation.
+    pub fn is_candidate_alternate(&self) -> bool {
+        self.interpretation == ProcedureInterpretation::CandidateAlternate
+    }
+
+    /// Whether this handle requires an owning query's guarded-body receipt.
+    pub fn is_guarded_alternate(&self) -> bool {
+        match self.interpretation {
+            ProcedureInterpretation::Base => false,
+            ProcedureInterpretation::CandidateAlternate
+            | ProcedureInterpretation::ExecutableAlternate => true,
+        }
+    }
+
+    /// Check interpretation before inspecting any procedure-local dense ID.
+    pub fn validate_durable_locator(
+        &self,
+        key: &DurableProcedureKey,
+    ) -> Result<(), CandidateLocatorRefusal> {
+        debug_assert_eq!(&key.0, self.artifact.key());
+        debug_assert_eq!(key.1, self.id);
+        if key.2 != self.interpretation {
+            return Err(
+                CandidateLocatorRefusal::CandidateAlternateLocatorUntranslated {
+                    procedure: self.id,
+                    minted: key.2,
+                    selected: self.interpretation,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    pub fn resolve_durable_call(
+        &self,
+        key: &(DurableProcedureKey, CallSiteId),
+    ) -> Result<Option<CallSiteHandle>, CandidateLocatorRefusal> {
+        self.validate_durable_locator(&key.0)?;
+        Ok(self.call_site_handle(key.1))
+    }
+
+    pub fn resolve_durable_value(
+        &self,
+        key: &(DurableProcedureKey, ValueId),
+    ) -> Result<Option<ValueHandle>, CandidateLocatorRefusal> {
+        self.validate_durable_locator(&key.0)?;
+        Ok(self.value_handle(key.1))
+    }
+
+    pub fn resolve_durable_point(
+        &self,
+        key: &(DurableProcedureKey, ProgramPointId),
+    ) -> Result<Option<ProgramPointHandle>, CandidateLocatorRefusal> {
+        self.validate_durable_locator(&key.0)?;
+        Ok(self.point_handle(key.1))
     }
 
     pub fn semantics(&self) -> &ProcedureSemantics {
-        // Construction is private and checked by SemanticArtifact::procedure_handle.
-        &self.artifact.procedures[self.id.index()]
+        let base = self
+            .artifact
+            .procedure(self.id)
+            .expect("validated procedure");
+        match self.interpretation {
+            ProcedureInterpretation::Base => base,
+            ProcedureInterpretation::CandidateAlternate => base
+                .candidate_macro_alternate()
+                .map_or(base, |(alternate, _)| alternate),
+            ProcedureInterpretation::ExecutableAlternate => base
+                .executable_alternate()
+                .expect("an executable interpretation is minted only for its present body"),
+        }
+    }
+
+    // Admission belongs to the query owner, independently for each procedure.
+    // File-local projections have no proof for the target, so use its opaque base.
+    pub(crate) fn local_procedure_handle(&self, id: ProcedureId) -> Option<Self> {
+        self.artifact.procedure_handle(id)
     }
 
     fn scoped<I>(&self, id: I) -> ProcedureLocalHandle<I> {
@@ -2296,6 +3478,11 @@ impl ProcedureHandle {
         Some(self.scoped(id))
     }
 
+    pub fn logical_gap_handle(&self, key: super::GapKey) -> Option<LogicalGapHandle> {
+        self.semantics().logical_gap(key)?;
+        Some(self.scoped(key))
+    }
+
     pub fn gap_handle(&self, id: SemanticGapId) -> Option<SemanticGapHandle> {
         self.semantics().gap(id)?;
         Some(self.scoped(id))
@@ -2314,7 +3501,9 @@ impl fmt::Debug for ProcedureHandle {
 
 impl PartialEq for ProcedureHandle {
     fn eq(&self, other: &Self) -> bool {
-        self.id == other.id && Arc::ptr_eq(&self.artifact, &other.artifact)
+        self.id == other.id
+            && self.interpretation == other.interpretation
+            && Arc::ptr_eq(&self.artifact, &other.artifact)
     }
 }
 
@@ -2323,6 +3512,7 @@ impl Eq for ProcedureHandle {}
 impl Hash for ProcedureHandle {
     fn hash<H: Hasher>(&self, state: &mut H) {
         crate::analyzer::semantic::hash_arc_key(&self.artifact, &self.id, state);
+        self.interpretation.hash(state);
     }
 }
 
@@ -2341,6 +3531,7 @@ pub struct ProcedureLocalLocator<I> {
     artifact_key: SemanticArtifactKey,
     artifact_materialization_id: SemanticArtifactMaterializationId,
     procedure_locator: SemanticLocator,
+    interpretation: ProcedureInterpretation,
     id: I,
 }
 
@@ -2368,6 +3559,15 @@ impl<I: Copy> ProcedureLocalLocator<I> {
         if &self.artifact_key != procedure.artifact().key() {
             return Err(ProcedureLocalLocatorError::ArtifactKeyMismatch);
         }
+        if self.interpretation != procedure.interpretation {
+            return Err(
+                ProcedureLocalLocatorError::CandidateAlternateLocatorUntranslated {
+                    procedure: procedure.id(),
+                    minted: self.interpretation,
+                    selected: procedure.interpretation,
+                },
+            );
+        }
         if self.artifact_materialization_id != procedure.artifact().materialization_id() {
             return Err(ProcedureLocalLocatorError::ArtifactMaterializationMismatch);
         }
@@ -2382,6 +3582,11 @@ impl<I: Copy> ProcedureLocalLocator<I> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ProcedureLocalLocatorError {
+    CandidateAlternateLocatorUntranslated {
+        procedure: ProcedureId,
+        minted: ProcedureInterpretation,
+        selected: ProcedureInterpretation,
+    },
     ArtifactKeyMismatch,
     ArtifactMaterializationMismatch,
     ProcedureLocatorMismatch,
@@ -2390,7 +3595,19 @@ pub enum ProcedureLocalLocatorError {
 
 impl fmt::Display for ProcedureLocalLocatorError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Self::CandidateAlternateLocatorUntranslated {
+            procedure,
+            minted,
+            selected,
+        } = self
+        {
+            return write!(
+                formatter,
+                "candidate_alternate_locator_untranslated: procedure {procedure:?}, minted {minted:?}, selected {selected:?}"
+            );
+        }
         formatter.write_str(match self {
+            Self::CandidateAlternateLocatorUntranslated { .. } => unreachable!("handled above"),
             Self::ArtifactKeyMismatch => "semantic artifact validity key changed",
             Self::ArtifactMaterializationMismatch => {
                 "semantic artifact capabilities or frozen rows changed beneath their validity key"
@@ -2431,13 +3648,18 @@ impl<I: Copy> ProcedureLocalHandle<I> {
     /// This mirrors [`ProcedureHandle::durable_key`] and shares its
     /// materialization-shape precondition. Use [`Self::durable_locator`] when a
     /// row must survive release and exact re-materialization of its artifact.
-    pub fn durable_key(&self) -> ((SemanticArtifactKey, ProcedureId), I) {
+    pub fn durable_key(&self) -> (DurableProcedureKey, I) {
         (self.procedure.durable_key(), self.id)
+    }
+
+    pub fn exact_key(&self) -> (ExactProcedureIdentity, I) {
+        (self.procedure.exact_identity(), self.id)
     }
 
     /// Convert this artifact-retaining handle into a durable locator.
     pub fn durable_locator(&self) -> ProcedureLocalLocator<I> {
         ProcedureLocalLocator {
+            interpretation: self.procedure.interpretation,
             artifact_key: self.procedure.artifact().key().clone(),
             artifact_materialization_id: self.procedure.artifact().materialization_id(),
             procedure_locator: self.procedure.semantics().locator().clone(),
@@ -2545,6 +3767,7 @@ pub type CaptureHandle = ProcedureLocalHandle<CaptureId>;
 pub type SourceMappingHandle = ProcedureLocalHandle<SourceMappingId>;
 pub type EvidenceHandle = ProcedureLocalHandle<EvidenceId>;
 pub type SemanticGapHandle = ProcedureLocalHandle<SemanticGapId>;
+pub type LogicalGapHandle = ProcedureLocalHandle<super::GapKey>;
 
 impl ProcedureLocalLocator<ControlEdgeId> {
     /// Resolve this durable edge identity within a matching materialized
@@ -2566,6 +3789,28 @@ impl ProcedureLocalLocator<ControlEdgeId> {
 mod tests {
 
     use crate::analyzer::semantic::ir::artifact::*;
+
+    #[test]
+    fn base_only_materialization_identity_pin() {
+        use crate::analyzer::semantic::*;
+        let key = SemanticArtifactKey::new(
+            WorkspaceMountId::hash_bytes(b"materialization-pin"),
+            WorkspaceRelativePath::try_from_path(std::path::Path::new("pin.rs")).unwrap(),
+            SemanticLanguage::Standard(brokk_bifrost_core::analyzer::model::Language::Rust),
+            SourceRevision::Disk {
+                content: ContentIdentity::hash_bytes(b"pin"),
+            },
+            AdapterSemanticsVersion::new("pin", StableDigest::sha256(b"pin")).unwrap(),
+            SemanticIrVersion::from_digest(StableDigest::sha256(b"fixed-pin-schema")),
+            ConfigurationFingerprint::hash_bytes(b"pin"),
+            DependencyFingerprint::hash_bytes(b"pin"),
+        );
+        let artifact = SemanticArtifact::try_new(key, Default::default(), vec![]).unwrap();
+        assert_eq!(
+            artifact.materialization_id().to_string(),
+            "5677f2e1c18b1da5bdd93a3c9413e7276eb8c1849aa594583cdc65448c931b83"
+        );
+    }
 
     #[test]
     fn cloned_procedure_dominance_starts_uninitialized() {
@@ -2656,4 +3901,72 @@ impl SemanticProcedureReference {
         locator.push_stable_identity(&mut digest);
         digest.finish()
     }
+}
+
+/// Merge one domain's direct facts with its lazy anchored stream. Anchor offsets
+/// count only direct rows; facts from equal-offset anchors keep anchor order.
+fn merge_cleanup_facts<T>(
+    direct: impl Iterator<Item = T>,
+    anchored: impl Iterator<Item = (u32, T)>,
+) -> impl Iterator<Item = T> {
+    let mut direct = direct.peekable();
+    let mut anchored = anchored.peekable();
+    let mut direct_index = 0usize;
+    std::iter::from_fn(move || {
+        if anchored
+            .peek()
+            .is_some_and(|(offset, _)| *offset as usize <= direct_index)
+        {
+            return anchored.next().map(|(_, fact)| fact);
+        }
+        if let Some(fact) = direct.next() {
+            direct_index += 1;
+            return Some(fact);
+        }
+        assert!(
+            anchored.peek().is_none(),
+            "anchor offset exceeds direct fact count"
+        );
+        None
+    })
+}
+
+/// Shared logical drop projection for frozen artifacts and decoded parts.
+pub(super) fn logical_drops<'a>(
+    drops: &'a [DropFact],
+    cleanup_chains: &'a super::CleanupChains,
+) -> impl Iterator<Item = super::LogicalDropFact<'a>> {
+    use crate::analyzer::semantic::cfg::ScopeCleanupAction;
+    let direct = drops.iter().map(|fact| super::LogicalDropFact {
+        place: &fact.place,
+        point: fact.point,
+        behavior: &fact.behavior,
+        source: fact.source,
+        evidence: fact.evidence,
+    });
+    let anchored = cleanup_chains
+        .anchors()
+        .iter()
+        .filter(|a| a.purpose == super::CleanupAnchorPurpose::Completion)
+        .flat_map(|anchor| {
+            cleanup_chains
+                .anchor_actions(anchor)
+                .filter_map(move |entry| match &entry.action {
+                    ScopeCleanupAction::Drop {
+                        place,
+                        behavior,
+                        source,
+                        evidence,
+                    } => Some(super::LogicalDropFact {
+                        place,
+                        behavior,
+                        point: anchor.point,
+                        source: *source,
+                        evidence: *evidence,
+                    }),
+                    _ => None,
+                })
+                .map(move |fact| (anchor.drop_offset, fact))
+        });
+    merge_cleanup_facts(direct, anchored)
 }

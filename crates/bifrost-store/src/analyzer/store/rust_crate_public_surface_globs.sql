@@ -2,7 +2,8 @@
 -- The next iteration selects that same namespace/name in the destination before
 -- any further route is considered, preserving named/declaration shadowing
 -- at every hop. The request primary key terminates glob cycles and diamonds.
-INSERT OR IGNORE INTO cr_surface_requests
+INSERT INTO cr_surface_requests
+SELECT * FROM (
 SELECT selected.owner_crate_key, selected.owner_module_path, selected.owner_namespace, selected.owner_name,
        routes.target_crate_key, routes.target_module_path, selected.name, 0
 FROM cr_surface_lookup AS selected
@@ -17,4 +18,5 @@ CROSS JOIN cr_foreign AS foreign_crate ON foreign_crate.crate_key = selected.cra
 CROSS JOIN rust_crate_glob_reexport_routes AS routes
   ON routes.topology_id = foreign_crate.topology_id
  AND routes.module_path = selected.module_path
-WHERE selected.origin = 'glob_reexport' AND routes.visibility = 'public';
+WHERE selected.origin = 'glob_reexport' AND routes.visibility = 'public'
+) WHERE true ON CONFLICT DO NOTHING;

@@ -7,11 +7,12 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use super::WorkspaceSemanticOracle;
 use super::common::WorkStager;
 use crate::analyzer::semantic::{
-    CallArgumentEndpoint, CallBinding, CallInvocationMode, CallSiteHandle, CandidateCoverage,
-    DispatchOracle, EvidenceCompleteness, ExecutionTiming, FootprintAdmission, MemoryLocationKind,
-    OracleCallContext, ProcedureHandle, ProcedurePortKind, ProofStatus, SemanticArtifactKey,
-    SemanticEffect, SemanticGapSubject, SemanticProviderError, SemanticRequest, SemanticValueKind,
-    SemanticWork, ValueFlowKind, ValueFlowOracle, ValueId, ValueUseKind, call_target_gap_pair,
+    CallArgumentEndpoint, CallBinding, CallInvocationMode, CallSiteHandle, CallTargetGapIndex,
+    CandidateCoverage, DispatchOracle, EvidenceCompleteness, ExecutionTiming, FootprintAdmission,
+    MemoryLocationKind, OracleCallContext, ProcedureHandle, ProcedurePortKind, ProofStatus,
+    SemanticArtifactKey, SemanticEffect, SemanticGapSubject, SemanticProviderError,
+    SemanticRequest, SemanticValueKind, SemanticWork, ValueFlowKind, ValueFlowOracle, ValueId,
+    ValueUseKind,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,7 +62,7 @@ enum FlowClass {
 
 fn classify_flow(kind: ValueFlowKind) -> FlowClass {
     match kind {
-        ValueFlowKind::Local => FlowClass::ExactLocal,
+        ValueFlowKind::Local | ValueFlowKind::AddressOf => FlowClass::ExactLocal,
         ValueFlowKind::Parameter | ValueFlowKind::Receiver => FlowClass::PortAnnotation,
         ValueFlowKind::Transfer(_)
         | ValueFlowKind::OwnershipUnknown
@@ -72,6 +73,7 @@ fn classify_flow(kind: ValueFlowKind) -> FlowClass {
         | ValueFlowKind::IndexedReturn { .. }
         | ValueFlowKind::ReferenceBoxing
         | ValueFlowKind::ReferenceUnboxing
+        | ValueFlowKind::MemoryLoad { .. }
         | ValueFlowKind::LanguageDefined
         | ValueFlowKind::ByValueCapture => FlowClass::Refuse,
     }
@@ -91,6 +93,7 @@ fn value_use_refusal(kind: ValueUseKind) -> FootprintUnknown {
 struct MemoKey {
     artifact: SemanticArtifactKey,
     procedure: crate::analyzer::semantic::ProcedureId,
+    interpretation: crate::analyzer::semantic::ProcedureInterpretation,
     context: OracleCallContext,
     d1: Vec<ProcedurePortKind>,
     d2: Vec<ProcedurePortKind>,
@@ -112,6 +115,7 @@ impl MemoKey {
         Self {
             artifact: procedure.artifact().key().clone(),
             procedure: procedure.id(),
+            interpretation: procedure.interpretation(),
             context,
             d1,
             d2,
@@ -142,7 +146,7 @@ struct Child {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MappingStamp {
     call: CallSiteHandle,
-    candidate: (SemanticArtifactKey, crate::analyzer::semantic::ProcedureId),
+    candidate: crate::analyzer::semantic::DurableProcedureKey,
     positions: Vec<(BindingPosition, ValueId, ProcedurePortKind)>,
 }
 
@@ -236,7 +240,11 @@ fn prove(
         }
         if frame.next == frame.children.len() {
             let done = stack.pop().expect("active frame exists");
-            active.remove(&(done.key.artifact.clone(), done.key.procedure));
+            active.remove(&(
+                done.key.artifact.clone(),
+                done.key.procedure,
+                done.key.interpretation,
+            ));
             memo.insert(done.key, done.stamp);
             continue;
         }
@@ -382,6 +390,13 @@ fn scan(
     else {
         return Ok(Err(FootprintUnknown::AdmissionRefused));
     };
+    if !super::cleanup_drop_obligations_discharged(
+        procedure,
+        oracle.workspace(),
+        &mut staged.request(request.cancellation),
+    )? {
+        return Ok(Err(FootprintUnknown::UnaccountedGap));
+    }
     let semantics = procedure.semantics();
     let mut d1 = HashSet::new();
     let mut d2 = HashSet::new();
@@ -436,8 +451,12 @@ fn scan(
     {
         return Ok(Err(FootprintUnknown::UnmappedPosition));
     }
+    let mut gap_index = None;
     let mut obligation_gaps = HashSet::new();
     for obligation in &call_target_obligations {
+        if let Some(reason) = interrupted(request) {
+            return Ok(Err(reason));
+        }
         if staged
             .admit(SemanticWork {
                 gaps: 1,
@@ -454,9 +473,41 @@ fn scan(
         let Some(call) = semantics.call_site(obligation.call) else {
             return Ok(Err(FootprintUnknown::UnaccountedGap));
         };
+        if gap_index.is_none() {
+            // One facts row plus a grouping map row and vector member is the
+            // largest insertion. Reserve only while the temporary index lives.
+            let scratch = SemanticWork {
+                nested_entries: semantics.gaps().len().saturating_mul(3),
+                ..SemanticWork::default()
+            };
+            if staged.admit(scratch).is_err() {
+                return Ok(Err(FootprintUnknown::Budget));
+            }
+            let mut index = CallTargetGapIndex::default();
+            for gap in semantics.gaps() {
+                if let Some(reason) = interrupted(request) {
+                    return Ok(Err(reason));
+                }
+                staged.charge_work(SemanticWork {
+                    gaps: 1,
+                    ..SemanticWork::default()
+                });
+                index.insert(gap);
+            }
+            gap_index = Some((index, scratch));
+        }
+        staged.charge_work(SemanticWork {
+            gaps: 2,
+            ..SemanticWork::default()
+        });
         // The writer derives each obligation from this pair, so both of its
         // gaps are accounted for, and nothing else is.
-        let Some((resolution, callable)) = call_target_gap_pair(call, semantics.gaps()) else {
+        let Some((resolution, callable)) = gap_index
+            .as_ref()
+            .expect("an obligation initialized the gap index")
+            .0
+            .pair(call)
+        else {
             return Ok(Err(FootprintUnknown::UnaccountedGap));
         };
         if gap.subject != SemanticGapSubject::CallSite(obligation.call)
@@ -467,6 +518,10 @@ fn scan(
         }
         obligation_gaps.insert(resolution.id);
         obligation_gaps.insert(callable.id);
+    }
+    if let Some((index, scratch)) = gap_index {
+        drop(index);
+        staged.budget.release_admission(scratch);
     }
     // Revisit rows when a MAY set grows; every revisit is charged.
     let points = semantics.points();
@@ -634,6 +689,7 @@ fn scan(
                     }
                 }
                 SemanticEffect::Synchronization { .. }
+                | SemanticEffect::MemoryInterference
                 | SemanticEffect::AsyncSuspend { .. }
                 | SemanticEffect::AsyncResume { .. } => {
                     return Ok(Err(FootprintUnknown::AmbientEffect));
@@ -648,7 +704,13 @@ fn scan(
                 }
                 // Only a call-target obligation accounts for a persisted gap effect.
                 SemanticEffect::Gap { gap } => {
-                    if !obligation_gaps.contains(&gap) {
+                    if !obligation_gaps.contains(&gap)
+                        && !semantics.gap(gap).is_some_and(|gap|
+                            crate::analyzer::semantic::workspace_oracle::value_flow::implicit_abort_gap_is_discharged(gap, true))
+                        && !semantics.gap(gap).is_some_and(|gap| {
+                            matches!(gap.control_flow_discharge(), crate::analyzer::semantic::SemanticGapDischarge::InertDropGlue | crate::analyzer::semantic::SemanticGapDischarge::NonRejoiningExceptionalExitAfterInertDrops)
+                        })
+                    {
                         return Ok(Err(FootprintUnknown::UnaccountedGap));
                     }
                 }

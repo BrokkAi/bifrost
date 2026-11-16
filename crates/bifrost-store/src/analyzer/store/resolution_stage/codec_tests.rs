@@ -79,7 +79,7 @@ fn round_trip(path: &PartialPath) -> PartialPath {
     decode_path(
         encode_node(path.start().node()),
         encode_node(path.end().node()),
-        &encode_path(path),
+        &encode_path(path).unwrap(),
     )
 }
 
@@ -307,9 +307,41 @@ fn root_requests_retain_foreign_context_shared_and_proper_prefix_cells() {
 }
 
 #[test]
+#[hardwon("#11510: reader-local Unclassified completion must not acquire a private stage tag")]
+fn unclassified_completion_and_path_are_rejected_before_staging() {
+    let reason = ResolutionIncompleteReason::Unclassified(SemanticId::context_local(47));
+    let completion = ResolutionCompletion::incomplete([reason]);
+    assert!(encode_completion(&completion).is_err());
+    let path = runtime_path([None; 3], completion);
+    assert!(encode_path(&path).is_err());
+    let fragment = crate::analyzer::resolution::LoweredResolutionFragment::new_for_test(
+        BindingFragmentId::at_ordinal(0),
+        crate::analyzer::Language::Rust,
+        vec![],
+        vec![(PartialPathId::local(0, 1), path)],
+    );
+    assert!(
+        super::super::lexical::prepare_lexical_fragment(&fragment, &CancellationToken::default(),)
+            .is_err()
+    );
+    // Lexical-choice metadata carries its own reason independently of the
+    // main path completion; it must not bypass the same typed rejection.
+    let path = runtime_path([None; 3], ResolutionCompletion::Complete);
+    let record = LexicalChoiceRecord {
+        source_fragment: BindingFragmentId::at_ordinal(31),
+        source_path: PartialPathId::local(31, 9),
+        reason,
+        owner: path.start().node(),
+        precedence: path.precedence()[..1].to_vec().into_boxed_slice(),
+        segment_position: 0,
+    };
+    assert!(encode_path(&path.with_lexical_choice(record, true)).is_err());
+}
+
+#[test]
 fn malformed_nested_cells_and_cancelled_completion_are_rejected() {
     let original = runtime_path([None; 3], ResolutionCompletion::Complete);
-    let body: Value = serde_json::from_str(&encode_path(&original)).unwrap();
+    let body: Value = serde_json::from_str(&encode_path(&original).unwrap()).unwrap();
     let mut invalid_scope = body.clone();
     invalid_scope[0][0][1][0] = json!(-1);
     let mut fractional_semantic = body.clone();

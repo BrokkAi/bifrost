@@ -27,7 +27,11 @@ use brokk_bifrost_rql::structural::{
 
 use super::identity::EndpointSetSemanticHash;
 
-pub const POLICY_DOCUMENT_SCHEMA_VERSION: u32 = 1;
+// #11466: catalog return-value ports preserve optional typed component paths.
+pub const POLICY_DOCUMENT_SCHEMA_VERSION: u32 = 2;
+
+/// First catalog schema that can represent projected return ports.
+pub(crate) const PROJECTED_RETURN_VALUE_CATALOG_SCHEMA_VERSION: u32 = 2;
 
 /// The one resolved-selector path an assertion policy registers. Kept beside
 /// the model so the registry, the canonical projection, the loaded-model
@@ -1673,10 +1677,18 @@ impl EndpointRole {
 pub enum PolicyEndpointBinding {
     MatchedValue,
     Receiver,
-    ReturnValue,
-    ResultIndex { index: u32 },
-    ArgumentIndex { index: u32 },
-    ArgumentName { name: String },
+    ReturnValue {
+        path: Option<brokk_bifrost_analysis::analyzer::semantic_model::SummaryEndpointPath>,
+    },
+    ResultIndex {
+        index: u32,
+    },
+    ArgumentIndex {
+        index: u32,
+    },
+    ArgumentName {
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2022,7 +2034,9 @@ pub enum EndpointRef {
 pub enum PolicyPort {
     MatchedValue,
     Receiver,
-    ReturnValue,
+    ReturnValue {
+        path: Option<brokk_bifrost_analysis::analyzer::semantic_model::SummaryEndpointPath>,
+    },
     ResultIndex {
         index: u32,
     },
@@ -3414,6 +3428,15 @@ pub enum PolicyEvidenceRef {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PolicySelectorPath(Box<str>);
+
+/// The key that matches an event's file reference to its loaded selector.
+/// Inline selectors hash this spelling into policy identity, so decoding uses it too.
+pub(crate) fn typestate_event_selector_path(id: &TypestateEventId) -> String {
+    format!(
+        "/analysis/automaton/events/{}/selector",
+        json_pointer_segment(id.as_str())
+    )
+}
 
 pub(crate) fn json_pointer_segment(value: &str) -> String {
     value.replace('~', "~0").replace('/', "~1")

@@ -1635,6 +1635,7 @@ fn unsupported(
 
 fn resolution_incomplete(
     diagnostics: &mut Vec<super::results::CodeQueryDiagnostic>,
+
     incompleteness: brokk_bifrost_rql::Incompleteness,
     seed: &SeedMatch,
     detail: &str,
@@ -1653,6 +1654,7 @@ fn push_incomplete_diagnostic(
     seed: &SeedMatch,
     detail: &str,
     code: super::results::CodeQueryDiagnosticCode,
+
     incompleteness: brokk_bifrost_rql::Incompleteness,
 ) {
     use super::results::{CodeQueryDiagnostic, CodeQueryDiagnosticImpact};
@@ -1670,6 +1672,10 @@ fn push_incomplete_diagnostic(
         return;
     }
     diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        has_non_utf8_refusal: false,
+        refusal_sites: Default::default(),
+        call_relation_facts: None,
+        uses_omissions: Vec::new(),
         incompleteness,
         related: Vec::new(),
         source: None,

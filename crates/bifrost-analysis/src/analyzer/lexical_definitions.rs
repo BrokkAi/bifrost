@@ -330,11 +330,19 @@ pub fn resolve_lexical_binding_with_visibility(
         || focus_end > source.len()
         || identifier.is_empty()
     {
-        return Ok(None);
+        return if language == Language::Rust {
+            Err(LexicalBindingUnproven::Unknown)
+        } else {
+            Ok(None)
+        };
     }
 
     let Some(focus) = smallest_named_node(root, focus_start, focus_end) else {
-        return Ok(None);
+        return if language == Language::Rust {
+            Err(LexicalBindingUnproven::Unknown)
+        } else {
+            Ok(None)
+        };
     };
     if language == Language::Cpp
         && let Some(definition) = c_label_binding(focus, source, identifier)
@@ -499,11 +507,17 @@ pub fn resolve_lexical_binding_from_focus(
     .flatten()
 }
 
-/// A binding may shadow this name, but its parameter layout or pattern
-/// visibility was not established. No outer-binding fallback is justified.
+/// Lexical resolution was refused: the focus, parameter layout, or pattern
+/// visibility is unproven. This does not establish absence of a local.
 #[derive(Debug, Clone, Copy)]
 #[doc(hidden)]
-pub struct LexicalBindingUnproven;
+pub enum LexicalBindingUnproven {
+    /// The binding or its visibility could not be established.
+    Unknown,
+    /// Syntax proves this is not a value use, so it cannot capture a local.
+    /// A member/type lookup may still apply at this position.
+    NonLexicalFocus,
+}
 
 /// The same lexical search, preserving a binding refusal for consumers that
 /// must not reinterpret it as a proved field or absent capture.
@@ -515,6 +529,13 @@ pub fn resolve_lexical_binding_from_focus_with_visibility(
     focus_start: usize,
     identifier: &str,
 ) -> Result<Option<LexicalBindingResolution>, LexicalBindingUnproven> {
+    // Legacy visibility consumers distinguish a non-value syntax role from
+    // complete lexical absence. Preserve that distinction at this boundary.
+    if let Some(LexicalBindingUnproven::NonLexicalFocus) =
+        lexical_focus_refusal(language, focus, &Node::parent)
+    {
+        return Err(LexicalBindingUnproven::NonLexicalFocus);
+    }
     resolve_lexical_binding_with_candidate_index(
         language,
         focus,
@@ -522,19 +543,80 @@ pub fn resolve_lexical_binding_from_focus_with_visibility(
         focus_start,
         identifier,
         None,
+        &Node::parent,
     )
+    .into_legacy()
+}
+
+/// A complete lexical search distinguishes absence from an unproven search.
+#[derive(Debug)]
+#[doc(hidden)]
+pub enum LexicalLookupOutcome {
+    Binding(LexicalBindingResolution),
+    ProvenNonLocal,
+    Unresolved(LexicalBindingUnproven),
+}
+
+impl LexicalLookupOutcome {
+    /// Preserve the legacy caller policy where refusal and absence are handled
+    /// by the caller's existing fallback rather than as capture evidence.
+    pub fn into_legacy(self) -> Result<Option<LexicalBindingResolution>, LexicalBindingUnproven> {
+        match self {
+            Self::Binding(binding) => Ok(Some(binding)),
+            Self::ProvenNonLocal => Ok(None),
+            Self::Unresolved(reason) => Err(reason),
+        }
+    }
 }
 
 /// The shared lexical search with optional exact-tree structural preparation.
 /// Admission must be performed by the owner before retaining preparation.
 #[doc(hidden)]
-pub fn resolve_lexical_binding_with_candidate_index(
+pub fn resolve_lexical_binding_with_candidate_index<'tree>(
     language: Language,
-    focus: Node<'_>,
+    focus: Node<'tree>,
+    source: &str,
+    focus_start: usize,
+    identifier: &str,
+    index: Option<&mut LexicalScopeCandidateIndex>,
+    parent_of: &dyn Fn(&Node<'tree>) -> Option<Node<'tree>>,
+) -> LexicalLookupOutcome {
+    // Error recovery and missing nodes cannot establish absence. Checking each
+    // enclosing node covers recovery on the lexical path itself.
+    if language == Language::Rust {
+        let mut cursor = Some(focus);
+        while let Some(node) = cursor {
+            if node.is_error() || node.is_missing() {
+                return LexicalLookupOutcome::Unresolved(LexicalBindingUnproven::Unknown);
+            }
+            cursor = parent_of(&node);
+        }
+    }
+    match search_lexical_binding_with_candidate_index(
+        language,
+        focus,
+        source,
+        focus_start,
+        identifier,
+        index,
+        parent_of,
+    ) {
+        Ok(Some(binding)) => LexicalLookupOutcome::Binding(binding),
+        Ok(None) | Err(LexicalBindingUnproven::NonLexicalFocus) => {
+            LexicalLookupOutcome::ProvenNonLocal
+        }
+        Err(reason) => LexicalLookupOutcome::Unresolved(reason),
+    }
+}
+
+fn search_lexical_binding_with_candidate_index<'tree>(
+    language: Language,
+    focus: Node<'tree>,
     source: &str,
     focus_start: usize,
     identifier: &str,
     mut index: Option<&mut LexicalScopeCandidateIndex>,
+    parent_of: &dyn Fn(&Node<'tree>) -> Option<Node<'tree>>,
 ) -> Result<Option<LexicalBindingResolution>, LexicalBindingUnproven> {
     // A grammar-inserted MISSING node, such as the iterable of a recovered
     // `for (String key : )`, is zero-width and focused at its own start. Its
@@ -544,21 +626,58 @@ pub fn resolve_lexical_binding_with_candidate_index(
             && (focus_start < focus.end_byte()
                 || (focus.is_missing() && focus_start == focus.end_byte()))
     );
-    if !focus_can_resolve_lexical(language, focus) {
-        return Ok(None);
+    if let Some(refusal) = lexical_focus_refusal(language, focus, parent_of) {
+        return Err(refusal);
     }
     let mut ancestors = Vec::new();
     let mut cursor = Some(focus);
     while let Some(node) = cursor {
+        // Rust's modeled binding containers enumerate their children. A new
+        // grammar pattern must not become a proof of absence by omission.
+        if language == Language::Rust
+            && (is_lexical_scope(language, node.kind())
+                || is_parameter_owner(language, node.kind())
+                || matches!(
+                    node.kind(),
+                    "if_expression" | "while_expression" | "match_arm" | "for_expression"
+                ))
+        {
+            let unproven_start = if !is_parameter_owner(language, node.kind()) {
+                match index.as_deref_mut() {
+                    Some(index) => index.unproven_scope_start(language, node, source),
+                    None => rust_scope_unproven_start(node),
+                }
+            } else {
+                rust_scope_unproven_start(node)
+            };
+            if unproven_start.is_some_and(|start| start <= focus_start) {
+                return Err(LexicalBindingUnproven::Unknown);
+            }
+        }
         ancestors.push(node);
-        cursor = node.parent();
+        cursor = parent_of(&node);
     }
 
     let patterns = language_support_for_hook(language, "lexical_pattern_bindings")
         .and_then(|support| support.lexical_pattern_bindings());
     // Walk lexical scopes from the focus outwards.  A local in an inner block
     // must win before an enclosing callable's parameters are considered.
-    for node in &ancestors {
+    for (depth, node) in ancestors.iter().enumerate() {
+        // A header binder sits outside the body block, so the statement that
+        // owns it answers for the child the walk came up through.
+        if let Some(child) = depth.checked_sub(1).map(|below| ancestors[below])
+            && let Some(definition) = header_binding(
+                language,
+                *node,
+                child,
+                focus,
+                source,
+                focus_start,
+                identifier,
+            )
+        {
+            return Ok(Some(LexicalBindingResolution::OtherLocal(definition)));
+        }
         if (is_lexical_scope(language, node.kind())
             || patterns.is_some_and(|patterns| (patterns.is_scope)(node.kind())))
             && let Some(definition) = scope_matching_local_prepared(
@@ -593,7 +712,7 @@ pub fn resolve_lexical_binding_with_candidate_index(
     // The focus can still sit in a function body the parser cut loose from its
     // own function node, in which case none of its ancestors is that function.
     if language == Language::Cpp
-        && let Some(fragment) = cpp_recovered_function_body(focus, focus_start)
+        && let Some(fragment) = cpp_recovered_function_body(focus, focus_start, parent_of)
     {
         if let Some(body) = fragment.child_by_field_name("body")
             && let Some(definition) = scope_matching_local_prepared(
@@ -647,12 +766,13 @@ pub fn resolve_lexical_binding_with_candidate_index(
 pub fn cpp_recovered_function_body<'tree>(
     focus: Node<'tree>,
     focus_start: usize,
+    parent_of: &dyn Fn(&Node<'tree>) -> Option<Node<'tree>>,
 ) -> Option<Node<'tree>> {
     let mut ancestors = Vec::new();
     let mut cursor = Some(focus);
     while let Some(node) = cursor {
         ancestors.push(node);
-        cursor = node.parent();
+        cursor = parent_of(&node);
     }
     if ancestors
         .iter()
@@ -752,31 +872,52 @@ fn smallest_named_node(root: Node<'_>, start: usize, end: usize) -> Option<Node<
         .or_else(|| root.descendant_for_byte_range(start, end))
 }
 
-fn focus_can_resolve_lexical(language: Language, focus: Node<'_>) -> bool {
-    if language_support_for_hook(language, "focus_resolves_lexically")
-        .is_some_and(|support| !support.focus_resolves_lexically(focus))
-    {
-        return false;
-    }
-
+fn lexical_focus_refusal<'tree>(
+    language: Language,
+    focus: Node<'tree>,
+    parent_of: &dyn Fn(&Node<'tree>) -> Option<Node<'tree>>,
+) -> Option<LexicalBindingUnproven> {
     let mut current = focus;
-    while let Some(parent) = current.parent() {
+    while let Some(parent) = parent_of(&current) {
+        if language == Language::Rust
+            && parent.kind() == "field_pattern"
+            && parent.child_by_field_name("pattern") == Some(current)
+        {
+            // A struct-pattern payload declares a binder (or names a pattern
+            // item), rather than reading an outer local. Guards are outside
+            // this field and retain ordinary value-position lookup.
+            return Some(LexicalBindingUnproven::NonLexicalFocus);
+        }
+
         if ["type", "return_type", "superclass", "interfaces"]
             .into_iter()
             .any(|field| parent.child_by_field_name(field) == Some(current))
         {
-            return false;
+            // Syntax proves this is not a value use, even if its token is an
+            // identifier (for example module in module::Type).
+            return Some(LexicalBindingUnproven::NonLexicalFocus);
         }
-        if is_parameter_declaration(language, parent.kind()) {
-            return true;
-        }
-        if is_parameter_owner(language, parent.kind()) || is_lexical_scope(language, parent.kind())
+        if is_parameter_declaration(language, parent.kind())
+            || is_parameter_owner(language, parent.kind())
+            || is_lexical_scope(language, parent.kind())
         {
             break;
         }
         current = parent;
     }
-    true
+    if language_support_for_hook(language, "focus_resolves_lexically")
+        .is_some_and(|support| !support.focus_resolves_lexically(focus))
+    {
+        return Some(
+            if language == Language::Rust && matches!(focus.kind(), "identifier" | "self") {
+                // A refused possible value use must not silently lose a capture.
+                LexicalBindingUnproven::Unknown
+            } else {
+                LexicalBindingUnproven::NonLexicalFocus
+            },
+        );
+    }
+    None
 }
 
 fn matching_parameter<'tree>(
@@ -805,7 +946,7 @@ fn matching_parameter<'tree>(
     // cannot turn an earlier name into a complete binding decision.
     let declarations =
         parameter_declarations_from_roots(language, owner, roots, source, &mut || true)
-            .ok_or(LexicalBindingUnproven)?;
+            .ok_or(LexicalBindingUnproven::Unknown)?;
     for declaration in declarations {
         for name in declaration.names {
             if identifier_matches(language, name, source, identifier) {
@@ -1257,10 +1398,10 @@ fn parameter_declarations_with_step<'tree>(
                 }
             }
             let kind = forced_kind.unwrap_or_else(|| {
-                if matches!(
-                    (language, node.kind()),
-                    (Language::Rust, "self_parameter") | (Language::Java, "receiver_parameter")
-                ) {
+                if (language == Language::Rust
+                    && brokk_bifrost_rust::declarations::rust_parameter_is_receiver(node))
+                    || (language == Language::Java && node.kind() == "receiver_parameter")
+                {
                     DeclarationKind::ReceiverParameter
                 } else if lambda {
                     DeclarationKind::LambdaParameter
@@ -1374,6 +1515,50 @@ impl LexicalScopeCandidateIndex {
             ..Self::default()
         }
     }
+    fn shared_scope(
+        &mut self,
+        language: Language,
+        scope: Node<'_>,
+        source: &str,
+    ) -> brokk_bifrost_core::retention_budget::BudgetedValue<IndexedLexicalScope> {
+        let (cache, content) = self.shared.as_ref().expect("shared index owns its region");
+        let mut key = crate::analyzer::semantic::LengthDelimitedDigest::new(b"lexical.scope.v1");
+        key.push(content.as_bytes());
+        key.push(&scope.start_byte().to_le_bytes());
+        key.push(&scope.end_byte().to_le_bytes());
+        key.push(&scope.kind_id().to_le_bytes());
+        let key = key.finish();
+        if let Some(value) = cache.get(&key) {
+            brokk_bifrost_core::retention_budget::BudgetedValue::Retained(value)
+        } else {
+            let prepared = IndexedLexicalScope::build(language, scope, source);
+            {
+                self.work.scope_builds += 1;
+                self.work.build_visits += prepared.nodes.len();
+            }
+            cache.insert(key, prepared)
+        }
+    }
+
+    fn unproven_scope_start(
+        &mut self,
+        language: Language,
+        scope: Node<'_>,
+        source: &str,
+    ) -> Option<usize> {
+        if self.shared.is_some() {
+            self.shared_scope(language, scope, source).unproven_start
+        } else {
+            let prepared = self.scopes.entry(scope.id()).or_insert_with(|| {
+                let prepared = IndexedLexicalScope::build(language, scope, source);
+                self.work.scope_builds += 1;
+                self.work.build_visits += prepared.nodes.len();
+                prepared
+            });
+            prepared.unproven_start
+        }
+    }
+
     pub fn work(&self) -> LexicalIndexWork {
         self.work
     }
@@ -1381,20 +1566,28 @@ impl LexicalScopeCandidateIndex {
 
 #[derive(Default)]
 pub struct IndexedLexicalScope {
+    // The earliest unmodeled binding syntax in this exact immutable scope.
+    // Keep the absence proof with the existing budgeted preparation so a
+    // warm indexed lookup does not rescan the scope for each name.
+    unproven_start: Option<usize>,
     nodes: Vec<IndexedLexicalNode>,
     names: crate::hash::HashMap<String, Vec<usize>>,
 }
 
 impl brokk_bifrost_core::retention_budget::RetainedBytes for IndexedLexicalScope {
     fn retained_bytes(&self) -> usize {
+        use brokk_bifrost_core::allocation_size::allocation_size;
         std::mem::size_of::<Self>()
-            + self.nodes.capacity() * std::mem::size_of::<IndexedLexicalNode>()
-            + self.names.capacity() * std::mem::size_of::<(String, Vec<usize>)>()
+            + brokk_bifrost_core::hash::allocated_vec_slot_bytes(&self.nodes)
+            + brokk_bifrost_core::hash::allocated_table_slot_bytes::<(String, Vec<usize>)>(
+                self.names.capacity(),
+            )
             + self
                 .names
                 .iter()
                 .map(|(name, entries)| {
-                    name.capacity() + entries.capacity() * std::mem::size_of::<usize>()
+                    allocation_size(name.capacity())
+                        + brokk_bifrost_core::hash::allocated_vec_slot_bytes(entries)
                 })
                 .sum::<usize>()
     }
@@ -1413,7 +1606,12 @@ impl IndexedLexicalScope {
     fn build(language: Language, scope: Node<'_>, source: &str) -> Self {
         let patterns = language_support_for_hook(language, "lexical_pattern_bindings")
             .and_then(|support| support.lexical_pattern_bindings());
-        let mut result = Self::default();
+        let mut result = Self {
+            unproven_start: (language == Language::Rust)
+                .then(|| rust_scope_unproven_start(scope))
+                .flatten(),
+            ..Self::default()
+        };
         let mut stack = Vec::new();
         stack.extend(
             (0..scope.named_child_count())
@@ -1447,10 +1645,16 @@ impl IndexedLexicalScope {
                 }
                 continue;
             }
-            if patterns
-                .and_then(|p| (p.declaration_for_name)(node))
-                .is_some()
+            if let Some(declaration) = patterns.and_then(|p| (p.declaration_for_name)(node))
+                && (!is_local_declaration(language, declaration.kind())
+                    || declaration.id() == scope.id())
             {
+                // A local declaration already contributes its binders under
+                // the declaration node below. The pattern hook would add the
+                // same declaration again under the name node, charging one
+                // candidate twice. A pattern scope that is itself the local
+                // declaration has no such node among its indexed children,
+                // so keep that entry.
                 names.push(node);
             }
             if is_local_declaration(language, node.kind()) {
@@ -1562,6 +1766,109 @@ fn candidate_children<'tree>(
         .collect()
 }
 
+/// The header binder of `identifier` that `statement` makes visible at the
+/// focus, where `child` is the child of `statement` on the path to the focus.
+/// Every binder is visible in the body. In a sequential header a binder is
+/// also visible in the binders after it, but not in its own declaration, and
+/// the nearest preceding one wins. A focus on a binder name is that binder's
+/// own declaration site; anywhere else in the statement no binder is visible.
+fn header_binding(
+    language: Language,
+    statement: Node<'_>,
+    child: Node<'_>,
+    focus: Node<'_>,
+    source: &str,
+    focus_start: usize,
+    identifier: &str,
+) -> Option<LexicalDefinition> {
+    let header = language_support_for_hook(language, "scope_header")?.scope_header(statement)?;
+    let in_body = child.id() == header.body.id();
+    let in_sequential_header = header
+        .sequential_header
+        .is_some_and(|region| region.id() == child.id());
+    let definition = |name: Node<'_>, declaration: Node<'_>| LexicalDefinition {
+        source_file: None,
+        identifier: identifier.to_owned(),
+        kind: local_declaration_kind(declaration.kind()),
+        name_range: node_range(name),
+        declaration_range: node_range(declaration),
+    };
+    let mut nearest = None;
+    for binder in &header.binders {
+        for name in binding_name_nodes(language, binder.pattern, false) {
+            if !identifier_matches(language, name, source, identifier) {
+                continue;
+            }
+            if name.id() == focus.id() {
+                return Some(definition(name, binder.declaration));
+            }
+            if (in_body || (in_sequential_header && binder.declaration.end_byte() <= focus_start))
+                && nearest.is_none_or(|(best, _): (Node<'_>, Node<'_>)| {
+                    name.start_byte() > best.start_byte()
+                })
+            {
+                nearest = Some((name, binder.declaration));
+            }
+        }
+    }
+    nearest.map(|(name, declaration)| definition(name, declaration))
+}
+
+/// The declaration nodes of the header binders `node` owns, recorded so that
+/// a scan of an enclosing block does not read them as ordinary locals. The
+/// scan visits a statement before its descendants, so a binder is recorded
+/// before the scan reaches it.
+fn record_header_binders(
+    support: Option<&'static dyn crate::analyzer::languages::LanguageSupport>,
+    node: Node<'_>,
+    header_binders: &mut Vec<usize>,
+) {
+    if let Some(header) = support.and_then(|support| support.scope_header(node)) {
+        header_binders.extend(header.binders.iter().map(|binder| binder.declaration.id()));
+    }
+}
+
+fn rust_scope_unproven_start(scope: Node<'_>) -> Option<usize> {
+    let mut earliest: Option<usize> = None;
+    let mut pending = vec![scope];
+    while let Some(part) = pending.pop() {
+        if part != scope
+            && (is_nested_scope(Language::Rust, part.kind())
+                || is_parameter_owner(Language::Rust, part.kind()))
+        {
+            continue;
+        }
+        // Missing/error declarations and unsupported generic or macro
+        // patterns cannot prove that no local was introduced. Macro
+        // invocations and definitions themselves are intentionally excluded.
+        if part.is_error()
+            || part.is_missing()
+            || matches!(
+                part.kind(),
+                "generic_pattern"
+                    | "token_binding_pattern"
+                    | "token_repetition_pattern"
+                    | "token_tree_pattern"
+            )
+        {
+            earliest = Some(earliest.map_or(part.start_byte(), |at| at.min(part.start_byte())));
+        }
+        if !matches!(part.kind(), "macro_invocation" | "macro_definition") {
+            push_named_children(part, &mut pending);
+        }
+    }
+    earliest
+}
+
+fn rust_declaration_not_yet_visible(language: Language, node: Node<'_>, focus: usize) -> bool {
+    language == Language::Rust
+        && node.end_byte() > focus
+        && !(node.kind() == "for_expression"
+            && node
+                .child_by_field_name("body")
+                .is_some_and(|body| body.start_byte() <= focus && focus < body.end_byte()))
+}
+
 /// The local binder in `scope` that a read of `identifier` at `focus_start`
 /// resolves to. The nearest declaration whose bound name precedes the focus
 /// wins; a hoisted declaration name (JS/TS function or class, or a JS/TS `var`
@@ -1587,6 +1894,8 @@ fn scope_matching_local(
     let mut nearest_before: Option<(Node<'_>, Node<'_>)> = None;
     let mut first_any: Option<(Node<'_>, Node<'_>)> = None;
     let mut hoisted: Option<(Node<'_>, Node<'_>)> = None;
+    let header_support = language_support_for_hook(language, "scope_header");
+    let mut header_binders = Vec::new();
     let mut stack = Vec::new();
     stack.extend((0..scope.named_child_count()).rev().map(|index| {
         (
@@ -1596,6 +1905,7 @@ fn scope_matching_local(
         )
     }));
     while let Some((node, ordinary_bindings_visible, pattern_bindings_visible)) = stack.pop() {
+        record_header_binders(header_support, node, &mut header_binders);
         // Function declarations are hoisted and class declarations shadow through their TDZ,
         // so source order does not limit declaration-name visibility.
         if hoisted.is_none()
@@ -1646,7 +1956,7 @@ fn scope_matching_local(
             && node.start_byte() < focus_start
             && identifier_matches(language, node, source, identifier)
             && nearest_before.is_none_or(|(best, _)| node.start_byte() > best.start_byte())
-            && (patterns.visible_at)(declaration, focus).ok_or(LexicalBindingUnproven)?
+            && (patterns.visible_at)(declaration, focus).ok_or(LexicalBindingUnproven::Unknown)?
         {
             nearest_before = Some((node, declaration));
         }
@@ -1657,7 +1967,7 @@ fn scope_matching_local(
             if starts_after_focus && binding_scope.is_none() {
                 continue;
             }
-            if language == Language::Rust && node.end_byte() > focus_start {
+            if rust_declaration_not_yet_visible(language, node, focus_start) {
                 continue;
             }
             if crate::analyzer::languages::language_knowledge(language)
@@ -1687,7 +1997,14 @@ fn scope_matching_local(
             {
                 continue;
             }
-            for name in binding_name_nodes(language, node, false) {
+            // A header binder is visible only through its statement's header
+            // (`header_binding`); its pattern binders are still read below.
+            let names = if header_binders.contains(&node.id()) {
+                Vec::new()
+            } else {
+                binding_name_nodes(language, node, false)
+            };
+            for name in names {
                 if !identifier_matches(language, name, source, identifier)
                     || (!ordinary_bindings_visible
                         && patterns
@@ -1699,7 +2016,8 @@ fn scope_matching_local(
                 if let Some(patterns) = patterns
                     && let Some(pattern) = (patterns.declaration_for_name)(name)
                     && (!pattern_bindings_visible
-                        || !(patterns.visible_at)(pattern, focus).ok_or(LexicalBindingUnproven)?)
+                        || !(patterns.visible_at)(pattern, focus)
+                            .ok_or(LexicalBindingUnproven::Unknown)?)
                 {
                     continue;
                 }
@@ -1791,24 +2109,8 @@ fn scope_matching_local_prepared(
     let mut hoisted: Option<(Node<'_>, Node<'_>)> = None;
     let mut shared_value = None;
     let prepared = index.and_then(|index| {
-        let prepared = if let Some((cache, content)) = &index.shared {
-            let mut key =
-                crate::analyzer::semantic::LengthDelimitedDigest::new(b"lexical.scope.v1");
-            key.push(content.as_bytes());
-            key.push(&scope.start_byte().to_le_bytes());
-            key.push(&scope.end_byte().to_le_bytes());
-            key.push(&scope.kind_id().to_le_bytes());
-            let key = key.finish();
-            shared_value = Some(if let Some(value) = cache.get(&key) {
-                brokk_bifrost_core::retention_budget::BudgetedValue::Retained(value)
-            } else {
-                let prepared = IndexedLexicalScope::build(language, scope, source);
-                {
-                    index.work.scope_builds += 1;
-                    index.work.build_visits += prepared.nodes.len();
-                }
-                cache.insert(key, prepared)
-            });
+        let prepared = if index.shared.is_some() {
+            shared_value = Some(index.shared_scope(language, scope, source));
             if matches!(
                 shared_value,
                 Some(brokk_bifrost_core::retention_budget::BudgetedValue::RequestOwned { .. })
@@ -1840,6 +2142,8 @@ fn scope_matching_local_prepared(
     let selected = prepared
         .as_ref()
         .and_then(|scope| scope.selected_paths(language, identifier));
+    let header_support = language_support_for_hook(language, "scope_header");
+    let mut header_binders = Vec::new();
     let mut stack = Vec::new();
     stack.extend(
         candidate_children(scope, scope, selected.as_ref())
@@ -1847,6 +2151,7 @@ fn scope_matching_local_prepared(
             .map(|node| (node, true, true)),
     );
     while let Some((node, ordinary_bindings_visible, pattern_bindings_visible)) = stack.pop() {
+        record_header_binders(header_support, node, &mut header_binders);
         // Function declarations are hoisted and class declarations shadow through their TDZ,
         // so source order does not limit declaration-name visibility.
         if hoisted.is_none()
@@ -1895,7 +2200,7 @@ fn scope_matching_local_prepared(
             && node.start_byte() < focus_start
             && identifier_matches(language, node, source, identifier)
             && nearest_before.is_none_or(|(best, _)| node.start_byte() > best.start_byte())
-            && (patterns.visible_at)(declaration, focus).ok_or(LexicalBindingUnproven)?
+            && (patterns.visible_at)(declaration, focus).ok_or(LexicalBindingUnproven::Unknown)?
         {
             nearest_before = Some((node, declaration));
         }
@@ -1906,7 +2211,7 @@ fn scope_matching_local_prepared(
             if starts_after_focus && binding_scope.is_none() {
                 continue;
             }
-            if language == Language::Rust && node.end_byte() > focus_start {
+            if rust_declaration_not_yet_visible(language, node, focus_start) {
                 continue;
             }
             if crate::analyzer::languages::language_knowledge(language)
@@ -1936,7 +2241,14 @@ fn scope_matching_local_prepared(
             {
                 continue;
             }
-            for name in binding_name_nodes(language, node, false) {
+            // A header binder is visible only through its statement's header
+            // (`header_binding`); its pattern binders are still read below.
+            let names = if header_binders.contains(&node.id()) {
+                Vec::new()
+            } else {
+                binding_name_nodes(language, node, false)
+            };
+            for name in names {
                 if !identifier_matches(language, name, source, identifier)
                     || (!ordinary_bindings_visible
                         && patterns
@@ -1948,7 +2260,8 @@ fn scope_matching_local_prepared(
                 if let Some(patterns) = patterns
                     && let Some(pattern) = (patterns.declaration_for_name)(name)
                     && (!pattern_bindings_visible
-                        || !(patterns.visible_at)(pattern, focus).ok_or(LexicalBindingUnproven)?)
+                        || !(patterns.visible_at)(pattern, focus)
+                            .ok_or(LexicalBindingUnproven::Unknown)?)
                 {
                     continue;
                 }
@@ -2602,6 +2915,8 @@ fn binding_container(language: Language, kind: &str) -> bool {
                 | "captured_pattern"
                 | "ref_pattern"
                 | "self_parameter"
+                | "or_pattern"
+                | "match_pattern"
         ),
         Language::Ruby => kind == "destructured_parameter",
         // Kotlin parameter and binding nodes carry no name field, so the leaf
@@ -2951,7 +3266,7 @@ mod tests {
             let focus = first_named_kind(statement, "identifier");
             assert_eq!(focus.start_byte(), statement.start_byte());
             assert_eq!(
-                cpp_recovered_function_body(focus, focus.start_byte()),
+                cpp_recovered_function_body(focus, focus.start_byte(), &Node::parent),
                 Some(function)
             );
             let complete_tree = parser.parse(complete, None).unwrap();
@@ -3041,96 +3356,6 @@ mod tests {
         };
         assert_eq!(definition.name_range, node_range(expected));
         assert_eq!(definition.kind, DeclarationKind::ResourceVariable);
-    }
-
-    #[test]
-    #[hardwon(
-        "97a35feae74c: quicksilver round 12 on brokk-bifrost-analysis: catch bindings lost to enclosing formals"
-    )]
-    #[ignore = "finds real bug: #7632, catch bindings resolve to enclosing formals"]
-    fn catch_parameters_shadow_enclosing_formals() {
-        let _rules = crate::analyzer::languages::neutral_fixture::neutral_rules_fixture(&[
-            Language::JavaScript,
-            Language::TypeScript,
-        ]);
-        let mut resolutions = Vec::new();
-        for (language, grammar) in [
-            (
-                Language::JavaScript,
-                tree_sitter_javascript::LANGUAGE.into(),
-            ),
-            (
-                Language::TypeScript,
-                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            ),
-        ] {
-            for source in [
-                "function f(err) { try { throw 1; } catch(err) { return err; } }",
-                "function f(err) { try { throw 1; } catch({err}) { return err; } }",
-            ] {
-                let mut parser = Parser::new();
-                parser.set_language(&grammar).unwrap();
-                let tree = parser.parse(source, None).unwrap();
-                assert!(!tree.root_node().has_error());
-                let catch = first_named_kind(tree.root_node(), "catch_clause");
-                let parameter = catch.child_by_field_name("parameter").unwrap();
-                let focus = source.rfind("err").unwrap();
-                let result = resolve_lexical_binding(
-                    language,
-                    tree.root_node(),
-                    source,
-                    focus,
-                    focus + 3,
-                    "err",
-                );
-                let valid = matches!(
-                    &result,
-                    Some(LexicalBindingResolution::OtherLocal(definition))
-                        if definition.kind == DeclarationKind::CatchParameter
-                            && definition.name_range.start_byte >= parameter.start_byte()
-                            && definition.name_range.end_byte <= parameter.end_byte()
-                );
-                resolutions.push((language, source, result, valid));
-            }
-        }
-        assert_eq!(resolutions.len(), 4);
-        assert!(resolutions.iter().all(|result| result.3), "{resolutions:?}");
-    }
-
-    #[test]
-    #[hardwon(
-        "97a35feae74c: quicksilver round 12 on brokk-bifrost-analysis: resource binding leaked past try"
-    )]
-    #[ignore = "finds real bug: #7632, resource bindings remain visible after try"]
-    fn resource_bindings_end_with_the_try_body() {
-        let _rules =
-            crate::analyzer::languages::neutral_fixture::neutral_rules_fixture(&[Language::Java]);
-        let source = "class C { AutoCloseable r; void m() throws Exception { try(AutoCloseable r = open()) { use(r); } use(r); } }";
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_java::LANGUAGE.into())
-            .unwrap();
-        let tree = parser.parse(source, None).unwrap();
-        assert!(!tree.root_node().has_error());
-        let resource = first_named_kind(tree.root_node(), "resource");
-        assert_eq!(
-            resource
-                .child_by_field_name("name")
-                .unwrap()
-                .utf8_text(source.as_bytes())
-                .unwrap(),
-            "r"
-        );
-        let focus = source.rfind("use(r)").unwrap() + 4;
-        let result = resolve_lexical_binding(
-            Language::Java,
-            tree.root_node(),
-            source,
-            focus,
-            focus + 1,
-            "r",
-        );
-        assert!(result.is_none(), "resource escaped its try: {result:?}");
     }
 
     #[test]

@@ -62,6 +62,23 @@ pub struct PhaseGuard {
     sink: Option<PhaseSink>,
 }
 
+impl PhaseGuard {
+    /// Describe this guard's phase anew, for a wait whose description changes
+    /// as it goes on, such as its elapsed time. A host reads the phase when the
+    /// request's budget runs out, so a description fixed at entry would report
+    /// how long the wait had lasted then, not how long it lasted.
+    ///
+    /// Call it only while this guard's phase is the current one, that is, with
+    /// no phase entered inside it still open.
+    pub fn update(&self, phase: impl Into<String>) {
+        let phase = phase.into();
+        if let Some(sink) = &self.sink {
+            sink.publish(&phase);
+        }
+        *self.phase.lock().expect("cancellation phase lock poisoned") = Some(phase);
+    }
+}
+
 impl Drop for PhaseGuard {
     fn drop(&mut self) {
         let restored = self.previous.take();
@@ -135,9 +152,15 @@ impl CancellationToken {
 
     /// Observe both independent cancellation chains for one operation.
     pub fn combined_with(&self, other: &Self) -> Self {
+        // Clones share a signal, but may carry different deadlines. Retain
+        // both chains in that case; duplicate identical chains need only one
+        // parent. The combined token still owns its local cancellation flag.
+        let same_signal = Arc::ptr_eq(&self.cancelled, &other.cancelled)
+            && self.deadline == other.deadline
+            && self.soft_deadline == other.soft_deadline;
         Self {
             parent: Some(Arc::new(self.clone())),
-            additional_parent: Some(Arc::new(other.clone())),
+            additional_parent: (!same_signal).then(|| Arc::new(other.clone())),
             ..Self::default()
         }
     }
@@ -248,6 +271,22 @@ impl CancellationToken {
         self
     }
 
+    /// Remaining hard time allowance at the sampling instant, including parents.
+    /// This observes the grant without polling cancellation or recording a read.
+    pub fn remaining_time(&self) -> Option<Duration> {
+        let now = Instant::now();
+        let mut deadline = None::<Instant>;
+        let mut pending = vec![self];
+        while let Some(token) = pending.pop() {
+            if let Some(value) = token.deadline {
+                deadline = Some(deadline.map_or(value, |current| current.min(value)));
+            }
+            pending.extend(token.parent.as_deref());
+            pending.extend(token.additional_parent.as_deref());
+        }
+        deadline.map(|deadline| deadline.saturating_duration_since(now))
+    }
+
     pub fn with_deadline(mut self, deadline: Instant) -> Self {
         self.deadline = Some(
             self.deadline
@@ -299,6 +338,10 @@ impl CancellationToken {
             .is_some_and(|deadline| Instant::now() >= deadline)
             || self
                 .parent
+                .as_ref()
+                .is_some_and(|parent| parent.soft_deadline_passed_unrecorded())
+            || self
+                .additional_parent
                 .as_ref()
                 .is_some_and(|parent| parent.soft_deadline_passed_unrecorded())
     }
@@ -506,6 +549,44 @@ mod tests {
 
         assert!(token.is_cancelled());
         assert!(token.is_timed_out());
+    }
+
+    #[test]
+    #[hardwon("#11970: combined tokens ignored an additional parent's soft deadline")]
+    fn combined_token_observes_additional_soft_deadline() {
+        let operation = CancellationToken::default();
+        let request = CancellationToken::default().with_soft_deadline(Instant::now());
+        let combined = operation.combined_with(&request);
+        assert!(combined.soft_deadline_passed());
+        assert!(!combined.is_cancelled());
+    }
+
+    #[test]
+    #[hardwon("#11970: combining a token with its clone duplicated cancellation chains")]
+    fn combined_token_deduplicates_identical_signals_without_cancelling_parent() {
+        let parent = CancellationToken::default();
+        let combined = parent.combined_with(&parent.clone());
+        assert!(combined.additional_parent.is_none());
+        combined.cancel();
+        assert!(combined.is_cancelled());
+        assert!(
+            !parent.is_cancelled(),
+            "combined cancellation stays operation-local"
+        );
+    }
+
+    #[test]
+    #[hardwon("#11970: a shared cancellation flag does not imply identical deadlines")]
+    fn combined_token_keeps_differing_deadlines() {
+        let parent = CancellationToken::default();
+        let later = Instant::now() + Duration::from_secs(60);
+        for other in [
+            parent.clone().with_deadline(later),
+            parent.clone().with_soft_deadline(later),
+        ] {
+            let combined = parent.combined_with(&other);
+            assert!(combined.additional_parent.is_some());
+        }
     }
 
     #[test]

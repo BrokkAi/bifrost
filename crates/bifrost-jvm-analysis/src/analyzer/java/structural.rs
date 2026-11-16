@@ -14,6 +14,10 @@ mod structural_spec_tests {
     use brokk_bifrost_analysis::analyzer::structural::adapter_helpers::block_facts_of;
 
     use brokk_bifrost_analysis::analyzer::structural::adapter_helpers::occurrence_roles_of;
+    use brokk_bifrost_analysis::analyzer::structural::extract::extract_file_facts;
+    use brokk_bifrost_analysis::analyzer::structural::kinds::{NormalizedKind, Role};
+    use brokk_bifrost_core::analyzer::structural::callable::CallKind;
+    use brokk_bifrost_core::analyzer::structural::facts::{ArgumentMode, Span};
     use brokk_bifrost_core::analyzer::structural::occurrences::OccurrenceRole;
     use brokk_bifrost_jvm::java::structural::{JAVA_KIND_TABLE, JAVA_STRUCTURAL_SPEC};
 
@@ -144,6 +148,120 @@ mod structural_spec_tests {
         assert_occurrence_role(&found, at("java.util"), OccurrenceRole::PathSegment);
         assert_occurrence_role(&found, at("util.List"), OccurrenceRole::PathSegment);
         assert_occurrence_role(&found, at("List<String>"), OccurrenceRole::TypeOperand);
+    }
+
+    /// One call fact as the structural arena states it: the call text, its
+    /// kind, its callee, its receivers and its written arguments as
+    /// `(value text, passing mode)`, in source order.
+    #[derive(Debug, Clone, PartialEq)]
+    struct CallRow {
+        text: String,
+        kind: Option<CallKind>,
+        callee: Option<String>,
+        receivers: Vec<String>,
+        arguments: Vec<(String, ArgumentMode)>,
+    }
+
+    fn row(
+        text: &str,
+        kind: Option<CallKind>,
+        callee: &str,
+        arguments: &[(&str, ArgumentMode)],
+    ) -> CallRow {
+        CallRow {
+            text: text.to_owned(),
+            kind,
+            callee: Some(callee.to_owned()),
+            receivers: Vec::new(),
+            arguments: arguments
+                .iter()
+                .map(|(value, mode)| ((*value).to_owned(), *mode))
+                .collect(),
+        }
+    }
+
+    /// Every call fact of `source`, in fact order.
+    fn call_rows_of(source: &str) -> Vec<CallRow> {
+        let facts = extract_file_facts(
+            &JAVA_STRUCTURAL_SPEC,
+            &tree_sitter_java::LANGUAGE.into(),
+            source,
+        )
+        .expect("structural extraction should succeed for the fixture");
+        let text = |span: Span| source[span.start_byte..span.end_byte].to_owned();
+        (0..facts.nodes().len() as u32)
+            .filter(|&id| facts.node(id).kind == NormalizedKind::Call)
+            .map(|id| {
+                let node = facts.node(id);
+                CallRow {
+                    text: text(node.span()),
+                    kind: node.call_site.as_ref().and_then(|site| site.call_kind),
+                    callee: facts
+                        .role_targets(id, Role::Callee)
+                        .next()
+                        .map(|target| text(target.span)),
+                    receivers: facts
+                        .role_targets(id, Role::Receiver)
+                        .map(|target| text(target.span))
+                        .collect(),
+                    arguments: facts
+                        .role_targets(id, Role::Arg)
+                        .map(|target| (text(target.span), target.mode))
+                        .collect(),
+                }
+            })
+            .collect()
+    }
+
+    /// `this(...)` and `super(...)` are `explicit_constructor_invocation`
+    /// nodes, which the kind table once left out, so queries over calls and
+    /// their arguments missed constructor chaining and reported complete.
+    /// The qualifier of `outer.super(v)` is the enclosing instance, which is
+    /// neither a written argument nor a receiver.
+    #[test]
+    #[hardwon("#10319: constructor chaining was not a call fact and queries reported complete")]
+    fn java_constructor_chaining_sites_are_constructor_calls_with_written_arguments() {
+        use ArgumentMode::Plain;
+        let source = concat!(
+            "class Outer { class In { In(int v) {} } }\n",
+            "class Base { Base(int a, String s) {} }\n",
+            "class Sub extends Base {\n",
+            "    Sub(int x) { super(x, \"s\"); }\n",
+            "    Sub() { this(1); }\n",
+            "    Sub(boolean b) { this(); Object o = new Object(); log(b); }\n",
+            "    void log(boolean b) {}\n",
+            "}\n",
+            "class Sub2 extends Outer.In {\n",
+            "    Sub2(Outer o, int v) { o.super(v); }\n",
+            "}\n",
+        );
+        let ctor = Some(CallKind::Constructor);
+        let (chaining, controls): (Vec<_>, Vec<_>) = call_rows_of(source)
+            .into_iter()
+            // An `explicit_constructor_invocation` node includes its `;`.
+            .partition(|row| row.text.ends_with(';'));
+        assert_eq!(
+            chaining,
+            vec![
+                row(
+                    "super(x, \"s\");",
+                    ctor,
+                    "super",
+                    &[("x", Plain), ("\"s\"", Plain)],
+                ),
+                row("this(1);", ctor, "this", &[("1", Plain)]),
+                row("this();", ctor, "this", &[]),
+                row("o.super(v);", ctor, "super", &[("v", Plain)]),
+            ]
+        );
+        // Ordinary calls and creations in the same file keep their rows.
+        assert_eq!(
+            controls,
+            vec![
+                row("new Object()", ctor, "Object", &[]),
+                row("log(b)", None, "log", &[("b", Plain)]),
+            ]
+        );
     }
 
     #[test]

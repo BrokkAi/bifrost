@@ -328,7 +328,7 @@ fn occurrence_targets_are_resolved_only_after_the_query_demands_them() {
     let workspace = project.workspace_analyzer(AnalyzerConfig::default());
     let flow = brokk_bifrost_flow::FlowWorkspaceState::new();
 
-    let identity_only = CodeQuery::from_sexp("(occurrences :role [type_operand value_reference])")
+    let identity_only = CodeQuery::from_sexp("(occurrences :role [type_operand callee_position])")
         .expect("identity-only occurrence query");
     let identity_result = execute_workspace(&workspace, &flow, &identity_only);
     assert_eq!(
@@ -346,7 +346,7 @@ fn occurrence_targets_are_resolved_only_after_the_query_demands_them() {
     }));
 
     let target_filter = CodeQuery::from_sexp(
-        "(filter :where ((role eq (enum value_reference)) (target_kind eq (enum resolved))) (occurrences :role [type_operand value_reference]))",
+        "(filter :where ((role eq (enum callee_position)) (target_kind eq (enum resolved))) (occurrences :role [type_operand callee_position]))",
     )
     .expect("target-dependent occurrence filter");
     let filtered = execute_workspace(&workspace, &flow, &target_filter);
@@ -364,7 +364,7 @@ fn occurrence_targets_are_resolved_only_after_the_query_demands_them() {
     ));
 
     let target_step =
-        CodeQuery::from_sexp("(occurrence-target (occurrences :role [value_reference]))")
+        CodeQuery::from_sexp("(occurrence-target (occurrences :role [callee_position]))")
             .expect("occurrence-target step");
     let targeted = execute_workspace(&workspace, &flow, &target_step);
     assert_eq!(targeted.results.len(), 1, "{}", targeted.render_text());
@@ -374,7 +374,7 @@ fn occurrence_targets_are_resolved_only_after_the_query_demands_them() {
     assert_eq!(value.fq_name, "target");
 
     let target_projection = CodeQuery::from_sexp(
-        "(project :columns (target_kind) (filter :where ((role eq (enum value_reference))) (occurrences :role [type_operand value_reference])))",
+        "(project :columns (target_kind) (filter :where ((role eq (enum callee_position))) (occurrences :role [type_operand callee_position])))",
     )
     .expect("target projection after occurrence filtering");
     let projected = execute_workspace(&workspace, &flow, &target_projection);
@@ -1367,7 +1367,6 @@ fn rust_macro_operand_pattern_binding_stays_open() {
 #[test]
 #[hardwon("#10389: Rust macro scope is scanned once per request")]
 fn rust_macro_scope_presence_is_request_local_and_memoized() {
-    use brokk_bifrost_core::analyzer::structural::kinds::NormalizedKind;
     let project = InlineTestProject::with_language(Language::Rust)
         .file(
             "src/lib.rs",
@@ -1383,15 +1382,12 @@ fn rust_macro_scope_presence_is_request_local_and_memoized() {
         .unwrap();
     let file = ProjectFile::new(project.root().to_path_buf(), "src/lib.rs");
     let facts = provider.structural_facts(&file).unwrap();
-    let callable = facts
-        .nodes()
-        .iter()
-        .position(|node| node.kind == NormalizedKind::Function)
-        .unwrap() as u32;
     let mut cache = OccurrenceTraversalCache::default();
     for _ in 0..128 {
         assert_eq!(
-            cache.rust_scope_has_macro(&file, &facts, Some(callable), None),
+            cache
+                .rust_macro_ranges(&file, &facts, None)
+                .map(|ranges| ranges.overlaps(0, usize::MAX)),
             Some(true)
         );
     }
@@ -3289,6 +3285,9 @@ fn profile_marks_unsupported_import_builds_and_replays_incomplete() {
 }
 
 #[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#11321: telemetry-only global budget diagnostics triggered an extra union retry"
+)]
 fn profile_preserves_incomplete_reference_cache_state_for_a_sibling() {
     let temp = tempfile::tempdir().expect("temp dir");
     let root = temp.path().canonicalize().expect("canonical root");
@@ -8513,10 +8512,17 @@ fn type_flow_query(root: &str, op: &str) -> serde_json::Value {
 
 #[test]
 fn conditional_declared_parameter_condition_states_its_closed_annotation() {
+    // Keep the unrelated unbounded write on a non-generic class. A PEP 695
+    // class with an unresolved `setattr` keeps its implicit typing.Generic
+    // factory open, so every workspace class then has an open descendant
+    // inventory and the closed-annotation premise this test checks is
+    // correctly withheld (#12070). The generic method still makes its
+    // receiver explicitly unbounded, so the write remains a Conditional
+    // remainder.
     let (_project, workspace) = type_flow_workspace_with_source(concat!(
         "class C:\n    pass\n\n",
-        "class Unbounded[A]:\n",
-        "    def write(self, agent: A, name, value):\n",
+        "class Unbounded:\n",
+        "    def write[A](self, agent: A, name, value):\n",
         "        setattr(agent, name, value)\n\n",
         "def check(space: C):\n",
         "    return space.missing\n",
@@ -8545,12 +8551,666 @@ fn conditional_declared_parameter_condition_states_its_closed_annotation() {
     );
 }
 
+#[hardwon("#8590: Go nilness proves uninitialized unresolved pointers nil")]
+#[test]
+fn go_nilness_treats_uninitialized_unresolved_pointers_as_nil_like_explicit_nil() {
+    let zero_typedef_source = r#"package main
+
+import "example.com/missing"
+
+func uninitDirect() {
+    var p *missing.Item
+    _ = *p
+}
+
+func uninitParen() {
+    var p ((*missing.Item))
+    _ = *p
+}
+
+func uninitDouble() {
+    var p **missing.Item
+    _ = *p
+}
+
+func uninitBoxPtr() {
+    var p *missing.Box[int]
+    _ = *p
+}
+
+func uninitGrouped() {
+    var (
+        p *missing.Item
+    )
+    _ = *p
+}
+
+func uninitMultiBlank() {
+    var _, p *missing.Item
+    _ = *p
+}
+
+func uninitGenericTypeParam[T any]() {
+    var p *T
+    _ = *p
+}
+
+func unknownPtr(p *missing.Item) missing.Item {
+    return *p
+}
+"#;
+    let alias_source = r#"package main
+
+import "example.com/missing"
+
+type ptrAlias *missing.Item
+type genericPtr[T any] *T
+
+func uninitAlias() {
+    var p ptrAlias
+    _ = *p
+}
+
+func uninitGenericAlias() {
+    var p genericPtr[missing.Item]
+    _ = *p
+}
+"#;
+
+    for (source, nil_functions) in [
+        (
+            zero_typedef_source,
+            [
+                "uninitDirect",
+                "uninitParen",
+                "uninitDouble",
+                "uninitBoxPtr",
+                "uninitGrouped",
+                "uninitMultiBlank",
+                "uninitGenericTypeParam",
+            ]
+            .as_slice(),
+        ),
+        (
+            alias_source,
+            ["uninitAlias", "uninitGenericAlias"].as_slice(),
+        ),
+    ] {
+        let project = InlineTestProject::with_language(Language::Go)
+            .file("main.go", source)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        for fn_name in nil_functions {
+            let query = CodeQuery::from_json(&json!({
+                "languages": ["go"],
+                "match": { "kind": "function", "name": fn_name },
+                "steps": [
+                    { "op": "procedure_of" },
+                    { "op": "nilness_operations" }
+                ],
+                "result_detail": "full"
+            }))
+            .expect("Go nilness query");
+            let result = execute_workspace(
+                &workspace,
+                &brokk_bifrost_flow::FlowWorkspaceState::new(),
+                &query,
+            );
+            assert_eq!(
+                result.completion(),
+                CodeQueryCompletion::Complete,
+                "{fn_name}: {result:#?}"
+            );
+            let [item] = result.results.as_slice() else {
+                panic!(
+                    "one pointer dereference in {fn_name}: {}",
+                    result.render_text()
+                );
+            };
+            let CodeQueryResultValue::NilnessOperation { value } = &item.value else {
+                panic!("expected nilness operation in {fn_name}: {item:#?}");
+            };
+            assert_eq!(value.fact, "nil", "{fn_name}: {value:#?}");
+            assert_eq!(value.proof, "exact", "{fn_name}: {value:#?}");
+            assert_eq!(value.coverage, "exhaustive", "{fn_name}: {value:#?}");
+        }
+    }
+
+    let control_project = InlineTestProject::with_language(Language::Go)
+        .file("main.go", zero_typedef_source)
+        .build();
+    let control_workspace = control_project.workspace_analyzer(AnalyzerConfig::default());
+    let control_query = CodeQuery::from_json(&json!({
+        "languages": ["go"],
+        "match": { "kind": "function", "name": "unknownPtr" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "nilness_operations" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("Go open control nilness query");
+    let control_result = execute_workspace(
+        &control_workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &control_query,
+    );
+    let [control_item] = control_result.results.as_slice() else {
+        panic!("one open pointer dereference: {control_result:#?}");
+    };
+    let CodeQueryResultValue::NilnessOperation { value } = &control_item.value else {
+        panic!("expected nilness operation: {control_item:#?}");
+    };
+    assert_eq!(value.fact, "unknown");
+    assert_eq!(value.proof, "unknown");
+    assert_eq!(value.coverage, "open");
+    assert_eq!(value.reason, Some("scalar_fact_unknown"));
+}
+
+#[hardwon(
+    "#8590: Go result-contract validation treats uninitialized nil-zero declarations like = nil"
+)]
+#[test]
+fn go_result_contract_validation_treats_uninitialized_nil_zero_declarations_like_explicit_nil() {
+    use crate::analyzer::semantic_model::{
+        ActivationSelector, ArtifactProducerLimits, ArtifactProductionRequest, Compatibility,
+        Completeness, ExternalArtifactKind, Provenance, Safety, compile_pack,
+        read_exact_source_set,
+    };
+    use brokk_bifrost_go_analysis::analyzer::{GoModulePackProducer, GoPinnedPackage};
+    use std::path::PathBuf;
+
+    let registry_source = r#"package registry
+
+type FieldResult struct { Name string }
+type Box[T any] struct { Value T }
+
+func SliceField() ([]*FieldResult, bool) { return nil, false }
+func MapField() (map[string]*FieldResult, bool) { return nil, false }
+func ChanField() (chan *FieldResult, bool) { return nil, false }
+func FuncField() (func(int) *FieldResult, bool) { return nil, false }
+func PointerField() (*FieldResult, bool) { return nil, false }
+func Byte() (uint8, bool) { return 0, false }
+func AnyField() (any, bool) { return nil, false }
+func BoxField() (Box[int], bool) { return Box[int]{}, false }
+"#;
+    let decl_project = InlineTestProject::with_language(Language::Go)
+        .file("registry/registry.go", registry_source)
+        .build();
+    let limits = ArtifactProducerLimits::default();
+    let relative_paths = [PathBuf::from("registry/registry.go")];
+    let artifact = read_exact_source_set(decl_project.root(), &relative_paths, 1, 8, &limits)
+        .expect("exact Go declaration source set");
+    let request = ArtifactProductionRequest {
+        path: decl_project.root().to_path_buf(),
+        artifact_kind: ExternalArtifactKind::GoSourceSet,
+        pack_id: "test.rql.go-nil-zero-declarations".to_owned(),
+        pack_version: "1.0.0".to_owned(),
+        ecosystem: "go".to_owned(),
+        compatibility: Compatibility {
+            bifrost: None,
+            toolchains: Vec::new(),
+        },
+        activation: vec![ActivationSelector {
+            package: None,
+            module: None,
+            toolchain: None,
+            targets: Vec::new(),
+            configurations: Vec::new(),
+            artifact_sha256: None,
+        }],
+        provenance: Provenance {
+            rust_artifact_approximation: None,
+            source: "test:rql-go-nil-zero-declarations".to_owned(),
+            revision: Some("reviewed".to_owned()),
+        },
+        license: "Apache-2.0".to_owned(),
+        safety: Safety {
+            generated_code_only: false,
+            review_required: false,
+        },
+    };
+    let production = GoModulePackProducer.produce_loaded_source_set(
+        &request,
+        &limits,
+        None,
+        &artifact,
+        &[GoPinnedPackage {
+            import_path: "example.com/app/registry".to_owned(),
+            name: "registry".to_owned(),
+            files: vec!["registry/registry.go".to_owned()],
+        }],
+    );
+    assert!(
+        production.diagnostics.is_empty(),
+        "Go declaration pack production failed: {:#?}",
+        production.diagnostics
+    );
+    let mut authored_decls = production.pack.expect("generated Go declaration pack");
+    authored_decls.completeness = Completeness::Partial;
+    for shard in &mut authored_decls.shards {
+        for selector in &mut shard.activation {
+            selector.artifact_sha256 = None;
+        }
+    }
+    let declaration_pack = compile_pack(&authored_decls, &CompilerOptions::default())
+        .unwrap_or_else(|diagnostics| panic!("Go declaration pack failed: {diagnostics:#?}"));
+
+    let summary_json = serde_json::to_vec(&json!({
+        "schema_version": 2,
+        "pack_id": "test.rql.go-nil-zero-result-contract",
+        "version": "1.0.0",
+        "producer": { "name": "bifrost-rql-test", "version": "1.0.0" },
+        "language": "go",
+        "ecosystem": "go",
+        "compatibility": { "bifrost": ">=0.10.5, <1.0.0", "toolchains": [] },
+        "provenance": { "source": "test:rql-go-nil-zero-result-contract", "revision": "reviewed" },
+        "license": "Apache-2.0",
+        "completeness": "complete",
+        "safety": { "generated_code_only": false, "review_required": false },
+        "shards": [{
+            "id": "go.nil-zero-result-contract",
+            "activation": [{}],
+            "payload": {
+                "kind": "procedure_summaries",
+                "summaries": [
+                    {
+                        "id": "registry.slice-field",
+                        "target": { "path": "registry/registry.go", "symbol": "example.com/app/registry.SliceField()", "has_receiver": false, "parameter_count": 0 },
+                        "completeness": "complete",
+                        "normal_result_count": 2,
+                        "transfers": [],
+                        "effects": [],
+                        "result_contracts": [{ "result_ordinal": 0, "condition_result_ordinal": 1, "predicate": "true", "result_success_predicate": "non_null", "member_contracts": [] }]
+                    },
+                    {
+                        "id": "registry.map-field",
+                        "target": { "path": "registry/registry.go", "symbol": "example.com/app/registry.MapField()", "has_receiver": false, "parameter_count": 0 },
+                        "completeness": "complete",
+                        "normal_result_count": 2,
+                        "transfers": [],
+                        "effects": [],
+                        "result_contracts": [{ "result_ordinal": 0, "condition_result_ordinal": 1, "predicate": "true", "result_success_predicate": "non_null", "member_contracts": [] }]
+                    },
+                    {
+                        "id": "registry.chan-field",
+                        "target": { "path": "registry/registry.go", "symbol": "example.com/app/registry.ChanField()", "has_receiver": false, "parameter_count": 0 },
+                        "completeness": "complete",
+                        "normal_result_count": 2,
+                        "transfers": [],
+                        "effects": [],
+                        "result_contracts": [{ "result_ordinal": 0, "condition_result_ordinal": 1, "predicate": "true", "result_success_predicate": "non_null", "member_contracts": [] }]
+                    },
+                    {
+                        "id": "registry.func-field",
+                        "target": { "path": "registry/registry.go", "symbol": "example.com/app/registry.FuncField()", "has_receiver": false, "parameter_count": 0 },
+                        "completeness": "complete",
+                        "normal_result_count": 2,
+                        "transfers": [],
+                        "effects": [],
+                        "result_contracts": [{ "result_ordinal": 0, "condition_result_ordinal": 1, "predicate": "true", "result_success_predicate": "non_null", "member_contracts": [] }]
+                    },
+                    {
+                        "id": "registry.pointer-field",
+                        "target": { "path": "registry/registry.go", "symbol": "example.com/app/registry.PointerField()", "has_receiver": false, "parameter_count": 0 },
+                        "completeness": "complete",
+                        "normal_result_count": 2,
+                        "transfers": [],
+                        "effects": [],
+                        "result_contracts": [{ "result_ordinal": 0, "condition_result_ordinal": 1, "predicate": "true", "result_success_predicate": "non_null", "member_contracts": [] }]
+                    },
+                    {
+                        "id": "registry.byte",
+                        "target": { "path": "registry/registry.go", "symbol": "example.com/app/registry.Byte()", "has_receiver": false, "parameter_count": 0 },
+                        "completeness": "complete",
+                        "normal_result_count": 2,
+                        "transfers": [],
+                        "effects": [],
+                        "result_contracts": [{ "result_ordinal": 0, "condition_result_ordinal": 1, "predicate": "true", "result_success_predicate": "non_null", "member_contracts": [] }]
+                    },
+                    {
+                        "id": "registry.any-field",
+                        "target": { "path": "registry/registry.go", "symbol": "example.com/app/registry.AnyField()", "has_receiver": false, "parameter_count": 0 },
+                        "completeness": "complete",
+                        "normal_result_count": 2,
+                        "transfers": [],
+                        "effects": [],
+                        "result_contracts": [{ "result_ordinal": 0, "condition_result_ordinal": 1, "predicate": "true", "result_success_predicate": "non_null", "member_contracts": [] }]
+                    },
+                    {
+                        "id": "registry.box-field",
+                        "target": { "path": "registry/registry.go", "symbol": "example.com/app/registry.BoxField()", "has_receiver": false, "parameter_count": 0 },
+                        "completeness": "complete",
+                        "normal_result_count": 2,
+                        "transfers": [],
+                        "effects": [],
+                        "result_contracts": [{ "result_ordinal": 0, "condition_result_ordinal": 1, "predicate": "true", "result_success_predicate": "non_null", "member_contracts": [] }]
+                    }
+                ]
+            }
+        }]
+    }))
+    .expect("registry pack json");
+    let summary_pack = compile_source(
+        SourceFormat::Json,
+        &summary_json,
+        &CompilerOptions::default(),
+    )
+    .expect("registry summary pack compiles");
+
+    let run_registry_query = |main_source: &str, callee_name: &str| -> CodeQueryResult {
+        let project = InlineTestProject::with_language(Language::Go)
+            .file("go.mod", "module example.com/app\n")
+            .file("main.go", main_source)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
+            .expect("ephemeral catalog");
+        catalog
+            .register_session_pack(
+                &declaration_pack,
+                &SessionPackSource {
+                    kind: SessionPackSourceKind::Embedded,
+                    source_id: "test:rql-go-nil-zero-declarations".to_owned(),
+                },
+            )
+            .expect("register declaration pack");
+        catalog
+            .register_session_pack(
+                &summary_pack,
+                &SessionPackSource {
+                    kind: SessionPackSourceKind::Embedded,
+                    source_id: "test:rql-go-nil-zero-result-contract".to_owned(),
+                },
+            )
+            .expect("register summary pack");
+        let activation = acquire_active_semantic_models(
+            workspace.analyzer(),
+            &catalog,
+            None,
+            &SemanticModelActivationRequest {
+                approximate_standard_libraries: Vec::new(),
+                bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).expect("crate version"),
+                evidence: vec![SemanticModelActivationEvidence {
+                    language: "go".to_owned(),
+                    ecosystem: "go".to_owned(),
+                    package: None,
+                    module: None,
+                    toolchain: None,
+                    target: None,
+                    configuration: None,
+                    artifact_sha256: None,
+                }],
+                controls: Vec::new(),
+                limits: SemanticModelRuntimeLimits::default(),
+            },
+            &CancellationToken::default(),
+        );
+        assert!(
+            matches!(activation, SemanticModelRuntimeOutcome::Ready { .. }),
+            "pack activates: {activation:#?}"
+        );
+        let query = CodeQuery::from_json(&json!({
+            "languages": ["go"],
+            "match": { "kind": "call", "callee": { "name": callee_name } },
+            "steps": [
+                { "op": "call_shape" },
+                { "op": "call_result_contracts" },
+                { "op": "result_contract_uses" }
+            ],
+            "result_detail": "full"
+        }))
+        .expect("result-contract query");
+        execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        )
+    };
+
+    for (callable, declared_type) in [
+        ("SliceField", "[]*registry.FieldResult"),
+        ("MapField", "map[string]*registry.FieldResult"),
+        ("PointerField", "*registry.FieldResult"),
+        ("Byte", "uint8"),
+    ] {
+        for initializer in ["", " = nil"] {
+            if declared_type == "uint8" && !initializer.is_empty() {
+                continue;
+            }
+            let main_source = format!(
+                "package main\nimport registry \"example.com/app/registry\"\nfunc use() {{\n    var value {declared_type}{initializer}\n    var ok bool\n    value, ok = registry.{callable}()\n    if ok {{ _ = value }}\n}}\n"
+            );
+            let result = run_registry_query(&main_source, callable);
+            assert_eq!(
+                result.completion(),
+                CodeQueryCompletion::Complete,
+                "{callable} ({declared_type}{initializer}): {result:#?}"
+            );
+            let [item] = result.results.as_slice() else {
+                panic!("one contract for {callable}: {result:#?}");
+            };
+            let value = call_result_contract_value(&item.value);
+            assert_eq!(value.coverage, "exhaustive", "{callable}: {value:#?}");
+            assert_eq!(value.result_use_count, Some(0), "{callable}: {value:#?}");
+            assert_eq!(value.success_guard_count, 1, "{callable}: {value:#?}");
+            assert_eq!(
+                value.success_guard_coverage,
+                Some(EffectCoverage::Exhaustive),
+                "{callable}: {value:#?}"
+            );
+            assert_eq!(
+                value.unguarded_result_use_count,
+                Some(0),
+                "{callable}: {value:#?}"
+            );
+            assert_eq!(
+                value.use_validation,
+                Some("unused"),
+                "{callable}: {value:#?}"
+            );
+            assert_eq!(
+                value.use_validation_coverage,
+                Some("exhaustive"),
+                "{callable}: {value:#?}"
+            );
+        }
+    }
+
+    // Channel and function callable results currently return None from
+    // `selected_go_callable_result_types` in `go_model.rs`, so uninitialized and `= nil`
+    // declarations still leave those contracts open, and both forms must agree identically.
+    for (callable, declared_type) in [
+        ("ChanField", "chan *registry.FieldResult"),
+        ("FuncField", "func(int) *registry.FieldResult"),
+    ] {
+        let mut contracts = ["", " = nil"].into_iter().map(|initializer| {
+            let main_source = format!(
+                "package main\nimport registry \"example.com/app/registry\"\nfunc use() {{\n    var value {declared_type}{initializer}\n    var ok bool\n    value, ok = registry.{callable}()\n    if ok {{ _ = value }}\n}}\n"
+            );
+            let result = run_registry_query(&main_source, callable);
+            let completion = result.completion();
+            let [item] = result.results.as_slice() else {
+                panic!("one contract for {callable} ({declared_type}{initializer}): {result:#?}");
+            };
+            let value = call_result_contract_value(&item.value);
+            (
+                completion,
+                value.coverage.to_string(),
+                value.success_guard_count,
+                value.success_guard_coverage,
+                value.use_validation.map(str::to_string),
+                value.use_validation_coverage.map(str::to_string),
+            )
+        });
+        let uninit = contracts.next().expect("uninitialized case");
+        let explicit_nil = contracts.next().expect("explicit nil case");
+        assert_eq!(uninit, explicit_nil, "{callable} ({declared_type})");
+        assert_ne!(
+            uninit.0,
+            CodeQueryCompletion::Complete,
+            "{callable}: {uninit:#?}"
+        );
+        assert_eq!(uninit.1, "exhaustive", "{callable}: {uninit:#?}");
+        assert_eq!(uninit.2, 1, "{callable}: {uninit:#?}");
+        assert_eq!(
+            uninit.3,
+            Some(EffectCoverage::Open),
+            "{callable}: {uninit:#?}"
+        );
+        assert_eq!(
+            uninit.4.as_deref(),
+            Some("unknown"),
+            "{callable}: {uninit:#?}"
+        );
+        assert_eq!(uninit.5.as_deref(), Some("open"), "{callable}: {uninit:#?}");
+    }
+
+    // Grouped, local alias, pointer alias, multi-name, and mixed blank forms.
+    let forms_source = r#"package main
+
+import registry "example.com/app/registry"
+
+type (
+    localAlias = []*registry.FieldResult
+    ptrAlias   = *registry.FieldResult
+)
+
+func uninitGrouped() {
+    var (
+        value []*registry.FieldResult
+        ok    bool
+    )
+    value, ok = registry.SliceField()
+    if ok { _ = value }
+}
+
+func uninitAlias() {
+    var value localAlias
+    var ok bool
+    value, ok = registry.SliceField()
+    if ok { _ = value }
+}
+
+func uninitPtrAlias() {
+    var value ptrAlias
+    var ok bool
+    value, ok = registry.PointerField()
+    if ok { _ = value }
+}
+
+func uninitMultiName() {
+    var value, extra []*registry.FieldResult
+    var ok bool
+    value, ok = registry.SliceField()
+    if ok { _ = value }
+    _ = extra
+}
+
+func uninitMixedBlank() {
+    var _, value []*registry.FieldResult
+    var ok bool
+    value, ok = registry.SliceField()
+    if ok { _ = value }
+}
+"#;
+    for (callable, expected_count) in [("SliceField", 4), ("PointerField", 1)] {
+        let result = run_registry_query(forms_source, callable);
+        assert_eq!(
+            result.completion(),
+            CodeQueryCompletion::Complete,
+            "{callable}: {result:#?}"
+        );
+        assert_eq!(
+            result.results.len(),
+            expected_count,
+            "{callable}: {result:#?}"
+        );
+        for item in &result.results {
+            let value = call_result_contract_value(&item.value);
+            assert_eq!(value.use_validation, Some("unused"), "{value:#?}");
+            assert_eq!(
+                value.use_validation_coverage,
+                Some("exhaustive"),
+                "{value:#?}"
+            );
+        }
+    }
+
+    let zero_typedef_paren_source = r#"package main
+
+import registry "example.com/app/registry"
+
+func uninitParenSlice() {
+    var value ([]*registry.FieldResult)
+    var ok bool
+    value, ok = registry.SliceField()
+    if ok { _ = value }
+}
+
+func uninitParenPtr() {
+    var value ((*registry.FieldResult))
+    var ok bool
+    value, ok = registry.PointerField()
+    if ok { _ = value }
+}
+"#;
+    for callable in ["SliceField", "PointerField"] {
+        let result = run_registry_query(zero_typedef_paren_source, callable);
+        assert_eq!(
+            result.completion(),
+            CodeQueryCompletion::Complete,
+            "{callable} paren: {result:#?}"
+        );
+        let [item] = result.results.as_slice() else {
+            panic!("one paren contract for {callable}: {result:#?}");
+        };
+        let value = call_result_contract_value(&item.value);
+        assert_eq!(value.use_validation, Some("unused"), "{value:#?}");
+        assert_eq!(
+            value.use_validation_coverage,
+            Some("exhaustive"),
+            "{value:#?}"
+        );
+    }
+
+    // Control cases: interface boxing (`Byte` -> `any`) and unresolved non-nil-zero generic
+    // nominal types (`registry.Box[int]`) remain open rather than spuriously exhausting.
+    for (callable, declared_type) in [("Byte", "any"), ("BoxField", "registry.Box[int]")] {
+        let control_source = format!(
+            "package main\nimport registry \"example.com/app/registry\"\nfunc use() {{\n    var value {declared_type}\n    var ok bool\n    value, ok = registry.{callable}()\n    if ok {{ _ = value }}\n}}\n"
+        );
+        let result = run_registry_query(&control_source, callable);
+        assert_ne!(
+            result.completion(),
+            CodeQueryCompletion::Complete,
+            "{callable} ({declared_type}): {result:#?}"
+        );
+        let [item] = result.results.as_slice() else {
+            panic!("one control contract for {callable} ({declared_type}): {result:#?}");
+        };
+        let value = call_result_contract_value(&item.value);
+        assert_eq!(
+            value.use_validation,
+            Some("unknown"),
+            "{callable} ({declared_type}): {value:#?}"
+        );
+        assert_eq!(
+            value.use_validation_coverage,
+            Some("open"),
+            "{callable} ({declared_type}): {value:#?}"
+        );
+    }
+}
+
 #[test]
 fn conditional_dynamic_write_condition_names_each_possible_write_site() {
+    // The write stays on a generic method rather than a PEP 695 class, whose
+    // implicit typing.Generic factory this unresolved setattr would keep open.
     let (_project, workspace) = type_flow_workspace_with_source(concat!(
         "class ContinuousSpace:\n    pass\n\n",
-        "class Unbounded[A]:\n",
-        "    def write(self, agent: A, name, value):\n",
+        "class Unbounded:\n",
+        "    def write[A](self, agent: A, name, value):\n",
         "        setattr(agent, name, value)\n\n",
         "def check_space():\n",
         "    return ContinuousSpace()._agent_to_index\n",
@@ -10584,7 +11244,10 @@ fn dispatch_file_operations_in_memory_multi_file_query_completes() {
         .file("src/other.rs", "pub fn caller() { crate::first(); crate::second(); }\n")
         .build();
     let project_dyn = project.project_dyn();
-    let store = brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::single_connection_store_context_for_test(project_dyn.as_ref()).expect("in-memory store");
+    let store = brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::ephemeral_store_context(
+        project_dyn.as_ref(),
+    )
+    .expect("in-memory store");
     let workspace = WorkspaceAnalyzer::build_with_store_context_for_test(
         project_dyn,
         AnalyzerConfig {
@@ -11446,4 +12109,18 @@ fn qualifying_type_seed_union_preserves_unknowns_after_capture_render_truncation
     assert!(reopened.diagnostics.iter().any(|diagnostic| {
         diagnostic.code == CodeQueryDiagnosticCode::RenderedCapturesTruncated
     }));
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#13055: an unsuffixed integer initializer was assumed to be i32"
+)]
+fn unsuffixed_integer_initializer_does_not_bound_later_values() {
+    let rows = contradictory_condition_rows(
+        Language::Rust,
+        "sample.rs",
+        "fn read_u64() -> u64 { 0 } fn f() { let mut x = 5; x = read_u64(); if x > 2_147_483_647 {} }",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_ne!(rows[0].1, Some("always_false"), "{rows:?}");
 }

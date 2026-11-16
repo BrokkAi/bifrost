@@ -29,6 +29,21 @@ impl PartialEq for RustCargoManifestDocument {
 
 impl Eq for RustCargoManifestDocument {}
 
+/// The stage that rejected retained manifest input.
+#[derive(Clone, Debug)]
+pub enum RustCargoManifestError {
+    Syntax(String),
+    RetainedSource(String),
+}
+
+impl RustCargoManifestError {
+    pub fn diagnostic(&self) -> &str {
+        match self {
+            Self::Syntax(message) | Self::RetainedSource(message) => message,
+        }
+    }
+}
+
 impl RustCargoManifestDocument {
     /// Parse exact UTF-8 manifest bytes and compute their Git blob identity.
     pub fn from_source_bytes(source_bytes: Box<[u8]>) -> Result<Self, String> {
@@ -44,17 +59,33 @@ impl RustCargoManifestDocument {
 
     /// Rehydrate a document from bytes retained under a content OID.
     pub fn from_retained_source(content_oid: Oid, source_bytes: Box<[u8]>) -> Result<Self, String> {
-        let actual_oid =
-            Oid::hash_object(ObjectType::Blob, &source_bytes).map_err(|error| error.to_string())?;
+        Self::from_retained_source_classified(content_oid, source_bytes)
+            .map_err(|error| error.diagnostic().to_owned())
+    }
+
+    /// Preserve the parsing stage for completeness attribution.
+    pub fn from_retained_source_classified(
+        content_oid: Oid,
+        source_bytes: Box<[u8]>,
+    ) -> Result<Self, RustCargoManifestError> {
+        let actual_oid = Oid::hash_object(ObjectType::Blob, &source_bytes)
+            .map_err(|error| RustCargoManifestError::RetainedSource(error.to_string()))?;
         if actual_oid != content_oid {
-            return Err(format!(
+            return Err(RustCargoManifestError::RetainedSource(format!(
                 "retained Cargo manifest bytes hash to {actual_oid}, expected {content_oid}"
-            ));
+            )));
         }
-        let source = std::str::from_utf8(&source_bytes)
-            .map_err(|error| format!("retained Cargo manifest bytes are not UTF-8: {error}"))?;
-        let value =
-            toml::from_str(source).map_err(|error| format!("invalid Cargo manifest: {error}"))?;
+        let source = std::str::from_utf8(&source_bytes).map_err(|error| {
+            RustCargoManifestError::RetainedSource(format!(
+                "retained Cargo manifest bytes are not UTF-8: {error}"
+            ))
+        })?;
+        // Known limit: our TOML parser can reject syntax accepted by newer Cargo.
+        // Callers must keep this manifest's own source subtree partial even when
+        // treating a syntax-rejected manifest as defining no compilation units.
+        let value = toml::from_str(source).map_err(|error| {
+            RustCargoManifestError::Syntax(format!("invalid Cargo manifest: {error}"))
+        })?;
         Ok(Self {
             source_bytes,
             content_oid,
@@ -299,5 +330,28 @@ mod tests {
         let error = RustCargoManifestDocument::from_retained_source(oid, other)
             .expect_err("mismatched retained bytes");
         assert!(error.contains("expected"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod parser_version_contract {
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11799: syntax rejection excludes Cargo compilation units"
+    )]
+    fn syntax_rejection_parser_version_requires_review() {
+        let lock: toml::Value = toml::from_str(include_str!("../../../Cargo.lock")).unwrap();
+        let versions: Vec<_> = lock["package"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|package| package["name"].as_str() == Some("toml"))
+            .map(|package| package["version"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            versions,
+            ["0.8.23"],
+            "Re-examine syntax-rejection completeness against Cargo when the parser changes"
+        );
     }
 }

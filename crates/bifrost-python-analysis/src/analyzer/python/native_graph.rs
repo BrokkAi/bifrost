@@ -141,9 +141,15 @@ impl PythonNativeWorkspaceGraphProvider {
                 return Ok(Outcome::Unavailable(format!("{kind}: {message}")));
             }
         };
-        let (obligations, mut unplaced) = request
+        let Some((obligations, mut unplaced)) = request
             .operation
-            .python_graph_input_evidence(&request.environment, cancellation)?;
+            .python_graph_input_evidence(&request.environment, cancellation)?
+        else {
+            return Ok(Outcome::Unavailable(
+                "python_environment_unavailable: the selected environment no longer matches the selected files"
+                    .into(),
+            ));
+        };
         unplaced.sort();
         unplaced.dedup();
         let callers = HashSet::from_iter(files.iter().cloned());
@@ -164,7 +170,7 @@ impl PythonNativeWorkspaceGraphProvider {
                 let staged = stage_python_graph_units(
                     operation,
                     analyzer,
-                    request.environment,
+                    request.environment.clone(),
                     files,
                     python.inner.analyzer_config().parallelism(),
                     cancellation,

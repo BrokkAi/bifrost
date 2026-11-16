@@ -812,6 +812,7 @@ impl ExtensionWorkspace {
                         )
                         .into_boxed_str(),
                         evidence: Box::new([]),
+                        omission_causes: Box::new([]),
                         reason_summary: None,
                     }
                 }));
@@ -846,14 +847,15 @@ impl ExtensionWorkspace {
                     let semantic_gaps = snapshot
                         .procedure()
                         .semantics()
-                        .gaps()
-                        .iter()
-                        .filter(|gap| {
+                        .logical_gaps()
+                        .filter(|logical| {
+                            let gap = logical.base;
                             brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::gap_impacts_value_flow(
                                 gap,
-                            ) && !snapshot.gap_is_discharged(gap.id)
+                            ) && !snapshot.gap_is_discharged(logical.key())
                         })
-                        .map(|gap| {
+                        .map(|logical| {
+                            let gap = logical.base;
                             let evidence = procedure
                                 .evidence_row(gap.evidence)
                                 .expect("validated semantic-gap evidence");
@@ -898,12 +900,24 @@ impl ExtensionWorkspace {
                             }
                         })
                         .collect::<Vec<_>>();
+                    let omission_causes = snapshot
+                        .omission_causes()
+                        .iter()
+                        .map(|cause| match cause {
+                            brokk_bifrost_analysis::analyzer::semantic::oracle::value_flow::ValueFlowOmissionCause::UntransportedReturnMember => {
+                                SemanticRelationOmissionCause::UntransportedReturnMember
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice();
+                    assert!(omission_causes.is_empty() || snapshot.relations_may_be_missing());
                     relation_boundaries.push(SemanticRelationBoundary {
                         kind: SemanticRelationBoundaryKind::MissingSemantics,
                         at: None,
                         relations: vec![SemanticRelationKind::ValueDependence].into_boxed_slice(),
                         message: "value-flow candidate coverage is not exhaustive".into(),
                         evidence: Box::new([]),
+                        omission_causes,
                         reason_summary: if semantic_gaps.is_empty() {
                             None
                         } else {
@@ -1013,6 +1027,7 @@ impl ExtensionWorkspace {
                 relations: request.relations.clone(),
                 message: format!("{} exhausted", dimension.limit).into_boxed_str(),
                 evidence: Box::new([]),
+                omission_causes: Box::new([]),
                 reason_summary: None,
             })
             .collect::<Vec<_>>();

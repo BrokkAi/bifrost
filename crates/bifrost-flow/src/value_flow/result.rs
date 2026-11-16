@@ -2,10 +2,12 @@ use std::sync::Arc;
 
 use crate::hash::HashSet;
 
-use crate::analyzer::semantic::ProgramPointHandle;
+use crate::analyzer::read_ledger::DerivationExecutionCause;
+use crate::analyzer::semantic::{DispatchBoundaryKind, ProgramPointHandle};
 use crate::dataflow::{
-    PathQuality, PathQualityFrontier, SummaryDataflowResult, SummaryEntry, SummaryWitness,
-    SummaryWitnessError, WitnessReconstructionLimits,
+    PathQuality, PathQualityFrontier, SemanticInputStatus, SolverTermination, SummaryBoundaryKind,
+    SummaryDataflowResult, SummaryEntry, SummaryWitness, SummaryWitnessError,
+    WitnessReconstructionLimits,
 };
 
 use super::{
@@ -84,11 +86,90 @@ pub enum ValueFlowSinkOutcome<'result> {
     Inconclusive,
 }
 
+/// Why discovery remains open after applying this plan's model discharges.
+/// Semantic gaps are content; an execution stop is never inferred from prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueFlowDiscoveryStatus {
+    Complete,
+    Content,
+    Operational(DerivationExecutionCause),
+}
+
+impl ValueFlowDiscoveryStatus {
+    fn from_status(status: SemanticInputStatus) -> Self {
+        match status {
+            SemanticInputStatus::Cancelled => {
+                Self::Operational(DerivationExecutionCause::Cancelled)
+            }
+            SemanticInputStatus::ExceededBudget { .. } => {
+                Self::Operational(DerivationExecutionCause::Budget)
+            }
+            SemanticInputStatus::Complete => Self::Complete,
+            SemanticInputStatus::Ambiguous
+            | SemanticInputStatus::Unknown
+            | SemanticInputStatus::Unsupported { .. }
+            | SemanticInputStatus::Unproven => Self::Content,
+        }
+    }
+
+    fn combine(self, incoming: Self) -> Self {
+        match (self, incoming) {
+            (Self::Operational(DerivationExecutionCause::Cancelled), _)
+            | (_, Self::Operational(DerivationExecutionCause::Cancelled)) => {
+                Self::Operational(DerivationExecutionCause::Cancelled)
+            }
+            (Self::Operational(_), _) => self,
+            (_, Self::Operational(_)) => incoming,
+            (Self::Content, _) | (_, Self::Content) => Self::Content,
+            (Self::Complete, Self::Complete) => Self::Complete,
+        }
+    }
+
+    fn for_result(plan: &ValueFlowPlan, result: &SummaryDataflowResult<ValueFlowFact>) -> Self {
+        // Completion owns semantic model discharge. Operational refusals cannot
+        // be discharged by a curated model or hidden by an unsupported edge.
+        let complete = plan.execution_result_complete(result);
+        let mut status = match result.termination() {
+            SolverTermination::Cancelled => Self::Operational(DerivationExecutionCause::Cancelled),
+            SolverTermination::ExceededBudget(_) => {
+                Self::Operational(DerivationExecutionCause::Budget)
+            }
+            SolverTermination::FixedPoint => Self::Complete,
+        };
+        status = status.combine(Self::from_status(plan.discovery_status()));
+        for boundary in result.coverage().boundaries() {
+            let cause = match boundary.kind() {
+                SummaryBoundaryKind::Semantic(status) => Self::from_status(*status),
+                SummaryBoundaryKind::Limit(_)
+                | SummaryBoundaryKind::Dispatch(DispatchBoundaryKind::Truncated) => {
+                    Self::Operational(DerivationExecutionCause::Budget)
+                }
+                SummaryBoundaryKind::Dispatch(_) | SummaryBoundaryKind::Continuation { .. } => {
+                    Self::Content
+                }
+            };
+            status = status.combine(cause);
+        }
+        match status {
+            Self::Operational(_) => status,
+            _ if complete => Self::Complete,
+            _ => Self::Content,
+        }
+    }
+
+    pub const fn execution_cause(self) -> Option<DerivationExecutionCause> {
+        match self {
+            Self::Operational(cause) => Some(cause),
+            Self::Complete | Self::Content => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ValueFlowSummaryResult {
     result: SummaryDataflowResult<ValueFlowFact>,
     meetings: Box<[ValueFlowMeeting]>,
-    discovery_complete: bool,
+    discovery_status: ValueFlowDiscoveryStatus,
     proven_by_authored_summaries: bool,
     authored_arm_closures: Box<[AuthoredArmClosure]>,
     owner: Arc<()>,
@@ -129,10 +210,12 @@ impl ValueFlowSummaryResult {
         // refinement calls are fully modeled by this result's boundaries, so
         // absence of a meeting never reads as a clean negative past an open
         // discovery input.
-        let discovery_complete = plan.execution_result_complete(&result);
+        let discovery_status = ValueFlowDiscoveryStatus::for_result(plan, &result);
+        let discovery_complete = discovery_status == ValueFlowDiscoveryStatus::Complete;
         // Mirrors the taint layer (#1916): the run is not derived-complete, yet
         // accepting authored-complete external summaries closes it.
         let proven_by_authored_summaries = !discovery_complete
+            && discovery_status.execution_cause().is_none()
             && plan.execution_result_complete_accepting_authored_summaries(&result);
         // Record what proved an authored boundary closure only when such a
         // closure decided the run (#2342). A derived-complete run closed nothing
@@ -146,7 +229,7 @@ impl ValueFlowSummaryResult {
         Ok(Self {
             result,
             meetings: meetings.into_boxed_slice(),
-            discovery_complete,
+            discovery_status,
             proven_by_authored_summaries,
             authored_arm_closures,
             owner: Arc::clone(plan.owner()),
@@ -166,7 +249,13 @@ impl ValueFlowSummaryResult {
     }
 
     pub fn is_complete(&self) -> bool {
-        self.discovery_complete
+        self.discovery_status == ValueFlowDiscoveryStatus::Complete
+    }
+
+    /// Typed discovery cause retained alongside this solve's coverage.
+    /// Provider errors returned by the solver remain errors, not content gaps.
+    pub const fn discovery_status(&self) -> ValueFlowDiscoveryStatus {
+        self.discovery_status
     }
 
     /// Whether the run is not derived-complete, but every open boundary is

@@ -1,6 +1,7 @@
 -- Only the current frontier's selected public bindings enter the graph. The
 -- foreign branch is tied to the exact topology selected for this wave.
-INSERT OR IGNORE INTO cr_surface_bindings
+INSERT INTO cr_surface_bindings
+SELECT * FROM (
 SELECT selected.crate_key, selected.module_path, selected.namespace, selected.name,
        selected.origin,
        selected.namespace = 'type' AND EXISTS (
@@ -29,4 +30,5 @@ FROM (
     ON exports.topology_id = foreign_crate.topology_id
    AND exports.module_path = frontier.module_path
   WHERE exports.visibility = 'public'
-) AS selected;
+) AS selected
+) WHERE true ON CONFLICT DO NOTHING;

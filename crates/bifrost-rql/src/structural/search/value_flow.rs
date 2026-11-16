@@ -1,4 +1,5 @@
-use super::{DerivationExecutionCause, Incompleteness};
+use super::{DerivationExecutionCause, EXECUTION_DEPENDENT, Incompleteness};
+use brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict;
 use std::sync::Arc;
 
 use super::witness_projection::{
@@ -74,6 +75,8 @@ pub(super) struct ValueFlowQueryState {
     semantic_budget_exhausted: bool,
     query_budget_exhausted: bool,
     witness_reconstruction_steps: usize,
+    /// The execution dependences these endpoints and witnesses marked.
+    pub(super) reuse: ReuseVerdict,
 }
 
 #[derive(Debug, Clone)]
@@ -237,6 +240,7 @@ impl ValueFlowQueryState {
                     )
                 });
                 workspace.analyzer().mark_execution_dependent();
+                self.reuse.join_in(EXECUTION_DEPENDENT);
                 self.push_context_error(error);
                 return Vec::new();
             }
@@ -326,6 +330,7 @@ impl ValueFlowQueryState {
                             )
                         });
                         workspace.analyzer().mark_execution_dependent();
+                        self.reuse.join_in(EXECUTION_DEPENDENT);
                         push_deduplicated_diagnostic(
                             &mut self.diagnostics,
                             CodeQueryDiagnosticCode::ValueFlowProviderFailed,
@@ -370,6 +375,7 @@ impl ValueFlowQueryState {
                             )
                         });
                         workspace.analyzer().mark_execution_dependent();
+                        self.reuse.join_in(EXECUTION_DEPENDENT);
                         push_deduplicated_diagnostic(
                             &mut self.diagnostics,
                             CodeQueryDiagnosticCode::ValueFlowSolverBudgetExhausted,
@@ -852,6 +858,7 @@ impl ValueFlowQueryState {
                     )
                 });
                 workspace.analyzer().mark_execution_dependent();
+                self.reuse.join_in(EXECUTION_DEPENDENT);
                 push_deduplicated_diagnostic(
                     &mut self.diagnostics,
                     CodeQueryDiagnosticCode::ValueFlowWitnessTruncated,
@@ -869,6 +876,7 @@ impl ValueFlowQueryState {
                     )
                 });
                 workspace.analyzer().mark_execution_dependent();
+                self.reuse.join_in(EXECUTION_DEPENDENT);
                 push_deduplicated_diagnostic(
                     &mut self.diagnostics,
                     CodeQueryDiagnosticCode::ValueFlowWitnessTruncated,

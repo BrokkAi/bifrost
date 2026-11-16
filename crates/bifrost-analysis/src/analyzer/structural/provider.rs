@@ -360,6 +360,20 @@ pub enum StructuralSyntaxLimitedOutcome {
     Unavailable,
 }
 
+/// By shape, like the prepared-syntax outcome it projects: an exceeded
+/// source limit and a cancellation stopped for this run's execution state.
+impl crate::analyzer::reuse_verdict::CarriesReuseVerdict for StructuralSyntaxLimitedOutcome {
+    fn reuse_verdict(&self) -> crate::analyzer::reuse_verdict::ReuseVerdict {
+        use crate::analyzer::reuse_verdict::{ExecutionCause, ReuseVerdict};
+        match self {
+            Self::Exceeded { .. } | Self::Cancelled => {
+                ReuseVerdict::ExecutionDependent(ExecutionCause::Other)
+            }
+            Self::Available(_) | Self::Unavailable => ReuseVerdict::Content,
+        }
+    }
+}
+
 /// Opaque prepared syntax returned by a structural provider. Its concrete
 /// tree and declaration state remain internal to the analyzer.
 #[doc(hidden)]
@@ -405,6 +419,20 @@ pub enum StructuralSourceLimitedOutcome {
     Exceeded { minimum_source_bytes: usize },
     Cancelled,
     Unavailable,
+}
+
+/// By shape: an exceeded source limit and a cancellation stopped for this
+/// run's execution state.
+impl crate::analyzer::reuse_verdict::CarriesReuseVerdict for StructuralSourceLimitedOutcome {
+    fn reuse_verdict(&self) -> crate::analyzer::reuse_verdict::ReuseVerdict {
+        use crate::analyzer::reuse_verdict::{ExecutionCause, ReuseVerdict};
+        match self {
+            Self::Exceeded { .. } | Self::Cancelled => {
+                ReuseVerdict::ExecutionDependent(ExecutionCause::Other)
+            }
+            Self::Available(_) | Self::Unavailable => ReuseVerdict::Content,
+        }
+    }
 }
 
 /// Byte-budgeted facts cache keyed by the content its entries describe.
@@ -648,7 +676,10 @@ impl StructuralFactsCache {
         let bytes = usize::try_from(facts.estimated_bytes())
             .unwrap_or(usize::MAX)
             .saturating_add(std::mem::size_of::<FileFacts>())
-            .saturating_add(key.blob.lang.capacity().saturating_mul(2));
+            .saturating_add(
+                brokk_bifrost_core::allocation_size::allocation_size(key.blob.lang.capacity())
+                    .saturating_mul(2),
+            );
         Arc::get_mut(&mut facts)
             .expect("fresh facts have one owner")
             .charge = AllocationCharge::acquire(&self.budget, bytes);
@@ -843,7 +874,7 @@ impl<A: LanguageAdapter> TreeSitterAnalyzer<A> {
                         self.record_store_error(
                             error.context("reading back prepared canonical structural facts"),
                         );
-                        self.mark_execution_dependent();
+                        crate::analyzer::i_analyzer::join_execution_dependence(self);
                         None
                     }
                 }
@@ -1557,7 +1588,7 @@ mod tests {
 
     #[test]
     fn structural_facts_cache_reuses_live_allocations_after_eviction() {
-        let cache = StructuralFactsCache::new(&RetentionBudget::new(1024 * 1024));
+        let cache = StructuralFactsCache::new(&RetentionBudget::for_test_capacity(1024 * 1024));
         let shared = cache.sharing_entries();
         let source = "live facts";
         let key = &StructuralSnapshotKey::for_test(source, "typescript");
@@ -1597,7 +1628,7 @@ mod tests {
     #[test]
     #[hardwon("#7445: dead live-facts registry entries outlived the query that held them")]
     fn structural_facts_cache_releases_registrations_and_capacity() {
-        let cache = StructuralFactsCache::new(&RetentionBudget::new(1024 * 1024));
+        let cache = StructuralFactsCache::new(&RetentionBudget::for_test_capacity(1024 * 1024));
         let holders: Vec<_> = (0..128)
             .map(|index| {
                 let source = format!("live facts {index}");
@@ -1656,7 +1687,7 @@ mod tests {
     fn structural_facts_cache_cancelled_waiter_leaves_blocked_leader() {
         use std::sync::mpsc;
 
-        let cache = StructuralFactsCache::new(&RetentionBudget::new(1024 * 1024));
+        let cache = StructuralFactsCache::new(&RetentionBudget::for_test_capacity(1024 * 1024));
         let key = &StructuralSnapshotKey::for_test("cancelled waiter", "typescript");
         let cancellation = CancellationToken::new();
         let (started_tx, started_rx) = mpsc::channel();
@@ -1720,7 +1751,7 @@ mod tests {
         use std::time::{Duration, Instant};
 
         for fail_leader in [false, true] {
-            let cache = StructuralFactsCache::new(&RetentionBudget::new(1024 * 1024));
+            let cache = StructuralFactsCache::new(&RetentionBudget::for_test_capacity(1024 * 1024));
             let key = &StructuralSnapshotKey::for_test("shared build", "typescript");
             let builds = AtomicU64::new(0);
             let (started_tx, started_rx) = mpsc::channel();
@@ -1794,7 +1825,7 @@ mod tests {
 
     #[test]
     fn structural_facts_cache_reentrant_build_adopts_inner_allocation() {
-        let cache = StructuralFactsCache::new(&RetentionBudget::new(1024 * 1024));
+        let cache = StructuralFactsCache::new(&RetentionBudget::for_test_capacity(1024 * 1024));
         let key = &StructuralSnapshotKey::for_test("reentrant", "typescript");
         let mut inner = None;
         let (outer, _) = cache
@@ -1821,7 +1852,7 @@ mod tests {
     fn structural_facts_cache_reports_exact_materialization_outcomes() {
         let source = "export function demo() {}\n";
         let key = &StructuralSnapshotKey::for_test(source, "typescript");
-        let hydrated = StructuralFactsCache::new(&RetentionBudget::new(1024 * 1024));
+        let hydrated = StructuralFactsCache::new(&RetentionBudget::for_test_capacity(1024 * 1024));
 
         assert!(hydrated.get(key).is_none());
         let (facts, outcome) = hydrated.materialize(
@@ -1846,7 +1877,7 @@ mod tests {
                 .is_none()
         );
 
-        let extracted = StructuralFactsCache::new(&RetentionBudget::new(1024 * 1024));
+        let extracted = StructuralFactsCache::new(&RetentionBudget::for_test_capacity(1024 * 1024));
         let (facts, outcome) =
             extracted.materialize(key.clone(), || None, || Some(empty_facts(source)));
         assert!(facts.is_some());
@@ -1860,7 +1891,8 @@ mod tests {
         assert!(shared.get(key).is_some());
         assert_eq!(shared.extraction_count(), 0);
 
-        let unavailable = StructuralFactsCache::new(&RetentionBudget::new(1024 * 1024));
+        let unavailable =
+            StructuralFactsCache::new(&RetentionBudget::for_test_capacity(1024 * 1024));
         let (facts, outcome) = unavailable.materialize(
             StructuralSnapshotKey::for_test("other\n", "typescript"),
             || None,

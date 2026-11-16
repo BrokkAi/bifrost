@@ -8,7 +8,7 @@ use brokk_bifrost_core::analyzer::source_facts::{
 use brokk_bifrost_core::analyzer::structural::resolution::{DeclaredVisibility, HoistingClass};
 use brokk_bifrost_core::analyzer::tree_walk::ParentIndex;
 use brokk_bifrost_core::analyzer::tree_walk::{
-    children_by_field_name, first_named_child_of_kind, named_children,
+    children_by_field_name, first_named_child_of_kind, named_children, single_named_child_matching,
 };
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use tree_sitter::{Node, Tree};
@@ -16,6 +16,7 @@ use tree_sitter::{Node, Tree};
 mod imports;
 mod names;
 mod types;
+mod values;
 
 #[derive(Default)]
 pub struct SourceBridges {
@@ -231,6 +232,7 @@ pub fn produce<'s>(
             continue;
         }
         let mut skip = false;
+        let mut field_initializer_declaration = None;
         match node.kind() {
             "namespace_declaration" | "file_scoped_namespace_declaration" => {
                 let Some(name) = node.child_by_field_name("name") else {
@@ -561,6 +563,13 @@ pub fn produce<'s>(
                         },
                         kind,
                     );
+                    if node.kind() == "variable_declarator" {
+                        if field {
+                            field_initializer_declaration = Some(site);
+                        } else {
+                            p.initialize_value(node, site, ctx);
+                        }
+                    }
                     if field && let Some(owner) = ctx.owner {
                         let declaration = node.parent().and_then(|n| n.parent()).unwrap();
                         p.member(
@@ -656,13 +665,22 @@ pub fn produce<'s>(
                     }
                     _ => ResolutionGapKind::UnsupportedMemberScope,
                 };
-                p.omit(node, ctx.scope, kind);
+                let site = p.omit(node, ctx.scope, kind);
+                if node.kind() == "attribute" {
+                    p.collect_friend_attribute(node, ctx.scope, site);
+                }
                 skip = true;
             }
             "qualified_name" | "alias_qualified_name" | "member_access_expression"
                 if !p.claimed.contains(&node.id()) =>
             {
-                if p.path(node).is_some() {
+                if node.kind() == "member_access_expression"
+                    && node
+                        .child_by_field_name("expression")
+                        .is_some_and(|receiver| matches!(receiver.kind(), "this" | "base"))
+                {
+                    p.instance_member(node, ctx);
+                } else if p.path(node).is_some() {
                     p.reference_path(node, ctx);
                 } else {
                     let site = p.site(node, ctx.scope, ResolutionSiteKind::UnsupportedExpression);
@@ -689,6 +707,30 @@ pub fn produce<'s>(
                     p.reference_path(node, ctx);
                 }
             }
+            "assignment_expression" => {
+                if let (Some(left), Some(right)) = (
+                    node.child_by_field_name("left"),
+                    node.child_by_field_name("right"),
+                ) {
+                    if left.kind() == "identifier" {
+                        let simple_assignment = {
+                            let mut cursor = node.walk();
+                            node.children(&mut cursor).any(|child| child.kind() == "=")
+                        };
+                        let target = p.value_reference(left, ctx);
+                        let value =
+                            p.expression_value(if simple_assignment { right } else { node }, ctx);
+                        p.facts
+                            .local_writes
+                            .push(ResolutionLocalWriteFact { target, value });
+                    } else {
+                        let site =
+                            p.site(node, ctx.scope, ResolutionSiteKind::UnsupportedExpression);
+                        p.facts
+                            .add_gap(site, ResolutionGapKind::UnsupportedExpression);
+                    }
+                }
+            }
             "ERROR" => {
                 if let Some(&site) = error_sites.get(&node.id()) {
                     // Preserve the ordinary omission's lexical scope (including file namespaces).
@@ -699,7 +741,146 @@ pub fn produce<'s>(
                 }
                 skip = true;
             }
-            _ => {}
+            "constructor_initializer" | "element_access_expression" => {
+                // The implicit constructor/indexer target is unenumerated, but
+                // arguments and receivers still contain independently known references.
+                let site = p.site(node, ctx.scope, ResolutionSiteKind::UnsupportedRoute);
+                p.facts
+                    .add_gap(site, ResolutionGapKind::UnsupportedExpression);
+                p.facts
+                    .add_reference_enumeration_gap(site, ResolutionGapKind::UnsupportedExpression);
+                if node.kind() == "constructor_initializer" {
+                    for child in named_children(node) {
+                        if matches!(child.kind(), "this" | "base") {
+                            p.claim_tree(child);
+                        }
+                    }
+                }
+            }
+            // These paths were already published or claimed by declaration/type lowering.
+            // Descend anyway: a generic path can still contain unclaimed arguments.
+            "identifier"
+            | "generic_name"
+            | "qualified_name"
+            | "alias_qualified_name"
+            | "member_access_expression" => {}
+            "boolean_literal" => {} // Boolean value cannot name a declaration.
+            "integer_literal" => {} // Numeric value cannot name a declaration.
+            "real_literal" => {}    // Numeric value cannot name a declaration.
+            "character_literal" => {} // Character value cannot name a declaration.
+            "string_literal" => {}  // String value cannot name a declaration.
+            "verbatim_string_literal" => {} // String value cannot name a declaration.
+            "raw_string_literal" => {} // String value cannot name a declaration.
+            "null_literal" => {}    // Null value cannot name a declaration.
+            "modifier" => {}        // Declaration modifier keyword does not name a declaration.
+            "implicit_type" => {}   // Inferred type keyword has no explicit target.
+            "predefined_type" => {} // Intrinsic type keyword has no source declaration target.
+            "break_statement" => {} // Control transfer has no declaration target.
+            "continue_statement" => {} // Control transfer has no declaration target.
+            "empty_statement" => {} // Empty statement contains no reference.
+            "comment" => {}         // Comment is not executable syntax.
+            "string_content" => {}  // Literal content cannot name a declaration.
+            "string_literal_content" => {} // Literal content cannot name a declaration.
+            "escape_sequence" => {} // Escaped literal content cannot name a declaration.
+            "interpolation_format_clause" => {} // Format text cannot name a declaration.
+            "string_literal_encoding" => {} // Encoding suffix cannot name a declaration.
+            "interpolation_start" => {} // String delimiter cannot name a declaration.
+            "interpolation_quote" => {} // String delimiter cannot name a declaration.
+            "interpolation_brace" => {} // String delimiter cannot name a declaration.
+            "raw_string_start" => {} // String delimiter cannot name a declaration.
+            "raw_string_end" => {}  // String delimiter cannot name a declaration.
+            "raw_string_content" => {} // Literal content cannot name a declaration.
+            "character_literal_content" => {} // Literal content cannot name a declaration.
+            "discard" => {}         // Discard has no declaration target.
+            "constructor_constraint" => {} // Constructor constraint keyword has no selected constructor.
+            // Containers delegate reference enumeration to their named children.
+            "array_type"
+            | "global_attribute"
+            | "switch_section"
+            | "when_clause"
+            | "throw_expression"
+            | "typeof_expression"
+            | "sizeof_expression"
+            | "default_expression"
+            | "type_pattern"
+            | "subpattern"
+            | "property_pattern_clause"
+            | "positional_pattern_clause"
+            | "ref_expression"
+            | "range_expression"
+            | "unary_expression"
+            | "accessor_list"
+            | "argument"
+            | "argument_list"
+            | "array_rank_specifier"
+            | "arrow_expression_clause"
+            | "attribute_list"
+            | "base_list"
+            | "bracketed_argument_list"
+            | "bracketed_parameter_list"
+            | "catch_filter_clause"
+            | "compilation_unit"
+            | "declaration_list"
+            | "enum_member_declaration_list"
+            | "expression_statement"
+            | "field_declaration"
+            | "event_field_declaration"
+            | "finally_clause"
+            | "if_statement"
+            | "do_statement"
+            | "while_statement"
+            | "return_statement"
+            | "throw_statement"
+            | "try_statement"
+            | "local_declaration_statement"
+            | "parameter_list"
+            | "type_argument_list"
+            | "type_parameter_list"
+            | "type_parameter_constraints_clause"
+            | "type_parameter_constraint"
+            | "parenthesized_expression"
+            | "conditional_expression"
+            | "invocation_expression"
+            | "object_creation_expression"
+            | "array_creation_expression"
+            | "implicit_array_creation_expression"
+            | "initializer_expression"
+            | "binary_expression"
+            | "prefix_unary_expression"
+            | "postfix_unary_expression"
+            | "cast_expression"
+            | "as_expression"
+            | "is_expression"
+            | "is_pattern_expression"
+            | "await_expression"
+            | "checked_expression"
+            | "checked_statement"
+            | "lock_statement"
+            | "unsafe_statement"
+            | "yield_statement"
+            | "tuple_expression"
+            | "tuple_element"
+            | "constant_pattern"
+            | "and_pattern"
+            | "or_pattern"
+            | "negated_pattern"
+            | "parenthesized_pattern"
+            | "relational_pattern"
+            | "switch_expression"
+            | "switch_statement"
+            | "expression_element"
+            | "collection_element"
+            | "interpolation"
+            | "interpolation_alignment_clause"
+            | "interpolated_string_expression"
+            | "preproc_if"
+            | "preproc_elif"
+            | "preproc_else" => {}
+            _ if p.claimed.contains(&node.id()) => {}
+            _ => {
+                p.omit(node, ctx.scope, ResolutionGapKind::UnsupportedExpression);
+                skip = true;
+            }
         }
         if !skip {
             // ECMA-334 7.3: the constructor body's declaration space is
@@ -755,6 +936,12 @@ pub fn produce<'s>(
                         child.start_byte(),
                         child.end_byte(),
                     );
+                }
+                if initializer.is_some_and(|initializer| initializer.id() == child.id())
+                    && !p.is_excluded(child)
+                    && let Some(declaration) = field_initializer_declaration
+                {
+                    p.initialize_value(node, declaration, child_ctx);
                 }
                 stack.push((child, child_ctx));
             }
@@ -1101,18 +1288,27 @@ impl Producer<'_, '_> {
                 .into_iter()
                 .filter(|modifier| csharp_has_modifier(self.source, modifier_owner, modifier))
                 .count();
-            // The vocabulary has no protected-internal/private-protected union
-            // or intersection, nor file access. Preserve these as Unknown.
-            let visibility =
-                if modifier_count > 1 || csharp_has_modifier(self.source, modifier_owner, "file") {
-                    DeclaredVisibility::Unknown
-                } else {
-                    crate::declarations::csharp_declared_visibility(
-                        modifier_owner,
-                        self.source,
-                        default,
-                    )
-                };
+            let visibility = if csharp_has_modifier(self.source, modifier_owner, "file") {
+                DeclaredVisibility::Unknown
+            } else if modifier_count == 2
+                && csharp_has_modifier(self.source, modifier_owner, "protected")
+                && csharp_has_modifier(self.source, modifier_owner, "internal")
+            {
+                DeclaredVisibility::ProtectedInternal
+            } else if modifier_count == 2
+                && csharp_has_modifier(self.source, modifier_owner, "private")
+                && csharp_has_modifier(self.source, modifier_owner, "protected")
+            {
+                DeclaredVisibility::PrivateProtected
+            } else if modifier_count > 1 {
+                DeclaredVisibility::Unknown
+            } else {
+                crate::declarations::csharp_declared_visibility(
+                    modifier_owner,
+                    self.source,
+                    default,
+                )
+            };
             self.facts
                 .visibility_eligibilities
                 .push(ResolutionVisibilityEligibilityFact { declaration: site });
@@ -1169,6 +1365,67 @@ impl Producer<'_, '_> {
             },
         });
     }
+    fn collect_friend_attribute(
+        &mut self,
+        node: Node<'_>,
+        scope: ResolutionScopeId,
+        site: ResolutionSiteId,
+    ) {
+        let Some(parent) = node
+            .parent()
+            .filter(|parent| parent.kind() == "global_attribute")
+        else {
+            return;
+        };
+        let mut cursor = parent.walk();
+        if !parent
+            .children(&mut cursor)
+            .any(|child| child.kind() == "assembly")
+        {
+            return;
+        }
+        let name_segments = node
+            .child_by_field_name("name")
+            .map(|name| crate::syntax::csharp_type_node_segments(name, self.source))
+            .unwrap_or_default();
+        let argument = first_named_child_of_kind(node, "attribute_argument_list")
+            .and_then(|list| single_named_child_matching(list, |child| !child.is_extra()))
+            .filter(|argument| {
+                argument.kind() == "attribute_argument"
+                    && argument.child_by_field_name("name").is_none()
+            })
+            .and_then(|argument| single_named_child_matching(argument, |child| !child.is_extra()))
+            .and_then(|value| match value.kind() {
+                "string_literal" | "verbatim_string_literal" => {
+                    crate::structural::csharp_string_literal_value(value, self.source)
+                }
+                _ => None,
+            });
+        let mut parse_state = CSharpFriendArgumentState::NonConstant;
+        let mut friend_name = None;
+        let mut has_public_key = false;
+        if let Some(argument) = &argument {
+            (friend_name, has_public_key) = friend_display_name(argument.trim());
+            parse_state = if friend_name.is_some() {
+                CSharpFriendArgumentState::Complete
+            } else {
+                CSharpFriendArgumentState::InvalidDisplayName
+            };
+        }
+
+        self.facts
+            .csharp_friend_attributes
+            .push(ResolutionCSharpFriendAttributeFact {
+                site,
+                scope,
+                name_segments,
+                argument,
+                parse_state,
+                friend_name,
+                has_public_key,
+            });
+    }
+
     fn claim_tree(&mut self, node: Node<'_>) {
         let mut stack = vec![node];
         while let Some(n) = stack.pop() {
@@ -1230,6 +1487,142 @@ impl Producer<'_, '_> {
         }
         self.claim_tree(node);
     }
+}
+
+// Parse the already-decoded assembly display-name value, not C# source.
+// Token quoting and escaping follow AssemblyIdentity.DisplayName.cs in Roslyn.
+fn friend_display_name(value: &str) -> (Option<String>, bool) {
+    fn token(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<String> {
+        while chars
+            .peek()
+            .is_some_and(|ch| matches!(ch, ' ' | '\t' | '\r' | '\n'))
+        {
+            chars.next();
+        }
+        let quote = chars.peek().copied().filter(|ch| matches!(ch, '\'' | '"'));
+        if quote.is_some() {
+            chars.next();
+        }
+        let mut result = String::new();
+        let mut closed = quote.is_none();
+        while let Some(ch) = chars.peek().copied() {
+            if quote == Some(ch) {
+                chars.next();
+                closed = true;
+                while chars
+                    .peek()
+                    .is_some_and(|ch| matches!(ch, ' ' | '\t' | '\r' | '\n'))
+                {
+                    chars.next();
+                }
+                if chars.peek().is_some_and(|ch| !matches!(ch, ',' | '=')) {
+                    return None;
+                }
+                break;
+            }
+            if quote.is_none() && matches!(ch, ',' | '=') {
+                break;
+            }
+            chars.next();
+            if ch == '\0' || (quote.is_none() && matches!(ch, '\'' | '"')) {
+                return None;
+            }
+            if ch != '\\' {
+                result.push(ch);
+                continue;
+            }
+            let escaped = match chars.next()? {
+                ch @ (',' | '=' | '\\' | '/' | '\'' | '"') => ch,
+                't' => '\t',
+                'r' => '\r',
+                'n' => '\n',
+                'u' => {
+                    let mut hex = String::new();
+                    loop {
+                        let ch = chars.next()?;
+                        if ch == ';' {
+                            break;
+                        }
+                        if !ch.is_ascii_hexdigit() {
+                            return None;
+                        }
+                        hex.push(ch);
+                    }
+                    let ch = char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?;
+                    if ch == '\0' {
+                        return None;
+                    }
+                    ch
+                }
+                _ => return None,
+            };
+            result.push(escaped);
+        }
+        if quote.is_none() {
+            result.truncate(result.trim_end_matches([' ', '\t', '\r', '\n']).len());
+        }
+        (closed && !result.is_empty()).then_some(result)
+    }
+    let mut chars = value.chars().peekable();
+    let Some(name) = token(&mut chars) else {
+        return (None, false);
+    };
+    let mut valid = true;
+    let mut has_public_key = false;
+    while let Some(separator) = chars.next() {
+        if separator != ',' {
+            return (None, has_public_key);
+        }
+        let Some(property) = token(&mut chars) else {
+            return (None, has_public_key);
+        };
+        let is_public_key = property.eq_ignore_ascii_case("PublicKey");
+        let duplicate_key = is_public_key && has_public_key;
+        has_public_key |= is_public_key;
+        if chars.next() != Some('=') {
+            return (None, has_public_key);
+        }
+        let Some(value) = token(&mut chars) else {
+            return (None, has_public_key);
+        };
+        // Version, Culture, PublicKeyToken and ProcessorArchitecture cannot
+        // occur in a friend grant. Unknown properties also remain open.
+        valid &= is_public_key && !duplicate_key && friend_public_key_is_valid(&value);
+    }
+    (valid.then_some(name), has_public_key)
+}
+
+// Roslyn's AssemblyIdentity.TryParsePublicKey validates this strong-name
+// envelope, including the ECMA neutral key; it does not prove caller identity.
+// https://github.com/dotnet/roslyn/blob/main/src/Compilers/Core/Portable/StrongName/CryptoBlobParser.cs
+fn friend_public_key_is_valid(value: &str) -> bool {
+    const ECMA_KEY: &str = "00000000000000000400000000000000";
+    if value.len() < 26
+        || !value.len().is_multiple_of(2)
+        || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return false;
+    }
+    let mut header = [0_u8; 13];
+    for (byte, pair) in header.iter_mut().zip(value.as_bytes().as_chunks::<2>().0) {
+        let high = char::from(pair[0])
+            .to_digit(16)
+            .expect("validated hex digit");
+        let low = char::from(pair[1])
+            .to_digit(16)
+            .expect("validated hex digit");
+        *byte = ((high << 4) | low) as u8;
+    }
+    let signature = u32::from_le_bytes(header[0..4].try_into().expect("fixed header range"));
+    let hash = u32::from_le_bytes(header[4..8].try_into().expect("fixed header range"));
+    let data_size = u32::from_le_bytes(header[8..12].try_into().expect("fixed header range"));
+    if data_size as usize != value.len() / 2 - 12 {
+        return false;
+    }
+    value.eq_ignore_ascii_case(ECMA_KEY)
+        || (header[12] == 0x06
+            && (signature == 0 || (signature >> 13) & 7 == 1)
+            && (hash == 0 || ((hash >> 13) & 7 == 4 && hash & 0x1ff >= 4)))
 }
 
 #[cfg(test)]

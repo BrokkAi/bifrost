@@ -1,3 +1,6 @@
+use brokk_bifrost_core::analyzer::reuse_verdict::{
+    CarriesReuseVerdict, ExecutionCause, ReuseVerdict,
+};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -171,6 +174,51 @@ struct RuntimeObjectCapturedParts {
 }
 
 impl RuntimeObjectRoot {
+    /// Heap allocation charge for a P runtime-read cache; the shared raw
+    /// visitor remains unchanged for semantic/refusing admission paths.
+    pub fn allocated_heap_bytes(&self) -> usize {
+        [
+            &self.runtime_profile_digest,
+            &self.realm,
+            &self.exposure_id,
+            &self.container_member,
+            &self.state_boundary,
+            &self.activation.active_model_set_hash,
+            &self.activation.runtime_profile_digest,
+            &self.activation.manifest_digest,
+            &self.activation.shard_id,
+            &self.activation.exposure_id,
+            &self.activation.behavior_id,
+            &self.activation.activation_source,
+        ]
+        .into_iter()
+        .map(|text| brokk_bifrost_core::allocation_size::allocation_size(text.capacity()))
+        .sum()
+    }
+
+    #[doc(hidden)]
+    pub fn retained_allocations(
+        &self,
+        census: &mut impl crate::analyzer::semantic::service::ArtifactRetentionVisitor,
+    ) {
+        for text in [
+            &self.runtime_profile_digest,
+            &self.realm,
+            &self.exposure_id,
+            &self.container_member,
+            &self.state_boundary,
+            &self.activation.active_model_set_hash,
+            &self.activation.runtime_profile_digest,
+            &self.activation.manifest_digest,
+            &self.activation.shard_id,
+            &self.activation.exposure_id,
+            &self.activation.behavior_id,
+            &self.activation.activation_source,
+        ] {
+            census.owned_string(text);
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn captured(
         runtime_profile_digest: String,
@@ -309,6 +357,69 @@ mod runtime_object_tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9925: endpoint selector/property allocations were omitted from retained snapshot weights"
+    )]
+    fn retained_endpoint_census_counts_owned_payloads_once() {
+        use crate::analyzer::semantic::service::{
+            ArtifactRetentionCensus, ArtifactRetentionVisitor,
+        };
+        let root = RuntimeObjectRoot::captured(
+            "node".into(),
+            "main".into(),
+            "process".into(),
+            "env".into(),
+            "entry".into(),
+            StableDigest::sha256("read"),
+            activation(),
+        )
+        .unwrap();
+        let mut property = String::with_capacity(8192);
+        property.push_str("selected_property");
+        let endpoint = ValueFlowEndpoint::for_path(
+            AccessPath::bounded(
+                AccessPathRoot::RuntimeObject(root),
+                vec![AccessSelector::Property(property)],
+                AccessPathTail::Exact,
+                OracleLimits::default(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let ValueFlowEndpoint::Location(location) = &endpoint else {
+            unreachable!()
+        };
+        let selectors = location.path().selectors();
+        let AccessSelector::Property(property) = &selectors[0] else {
+            unreachable!()
+        };
+        let mut census = ArtifactRetentionCensus::default();
+        census.owned_slice::<u64>(&[]);
+        census.owned_string(&String::new());
+        assert_eq!(census.shared_allocation_records().count(), 0);
+        endpoint.retained_artifacts(&mut census);
+        let once = census.retained_bytes();
+        let records: Vec<_> = census.shared_allocation_records().collect();
+        assert!(records.contains(&(
+            std::ptr::from_ref(location.as_ref()) as usize,
+            std::mem::size_of_val(location.as_ref())
+        )));
+        assert!(records.contains(&(
+            selectors.as_ptr() as usize,
+            std::mem::size_of_val(selectors)
+        )));
+        assert!(records.contains(&(property.as_ptr() as usize, property.capacity())));
+        endpoint.retained_artifacts(&mut census);
+        assert_eq!(census.retained_bytes(), once);
+        assert_eq!(census.shared_allocation_records().count(), records.len());
+        // A structural clone owns distinct boxes and string buffers; equal
+        // semantic identity must not make those allocations disappear.
+        let distinct_owner = endpoint.clone();
+        distinct_owner.retained_artifacts(&mut census);
+        assert!(census.retained_bytes() > once);
+    }
+
+    #[test]
     fn runtime_root_requires_matching_activation_and_preserves_unknown_cardinality() {
         let root = RuntimeObjectRoot::captured(
             "node".into(),
@@ -375,6 +486,29 @@ mod runtime_object_tests {
         ));
     }
 }
+/// What one entering call proves about the actual it binds to one formal
+/// parameter of its callee.
+///
+/// `Class` names the class the caller's language proves the actual is an
+/// instance of, in that language's own class vocabulary, so a hypothesis
+/// built from it reaches the same language rules that produced it.
+/// `CallerParameter` is the unchanged value of the caller's own formal
+/// parameter, whose class only the caller's context can supply.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ArgumentClass {
+    Class(Box<str>),
+    CallerParameter(u32),
+}
+
+/// The argument classes one entering call proves for the formal parameters
+/// of its unique, proven, complete callee. A parameter without a proven
+/// class is absent.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ArgumentClasses {
+    pub callee: ProcedureHandle,
+    pub classes: Vec<(u32, ArgumentClass)>,
+}
+
 /// A recent-call suffix retained by a bounded oracle query.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct OracleCallContext {
@@ -442,6 +576,18 @@ impl OracleCallContext {
             brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
         }
         self.truncated
+    }
+}
+
+/// The explicit counterpart of [`OracleCallContext::was_truncated`]'s mark: a
+/// consumer whose answer observed the truncation joins this verdict.
+impl CarriesReuseVerdict for OracleCallContext {
+    fn reuse_verdict(&self) -> ReuseVerdict {
+        if self.truncated {
+            ReuseVerdict::ExecutionDependent(ExecutionCause::Other)
+        } else {
+            ReuseVerdict::Content
+        }
     }
 }
 
@@ -913,40 +1059,235 @@ pub enum AccessPathRoot {
     },
 }
 
+// One stack owns the existing model/provenance walk, including return-flow
+// endpoints nested in call-result roots. No recursion through retained models.
+pub(super) enum RetainedModelPart<'a> {
+    Root(&'a AccessPathRoot),
+    Path(&'a AccessPath),
+    Selectors(&'a [AccessSelector]),
+    Endpoint(&'a ValueFlowEndpoint),
+    Location(&'a AbstractLocation),
+    Relation(&'a ValueFlowRelation),
+    Durable(&'a DurableObjectIdentity),
+}
+
+pub(super) fn collect_retained_model(
+    first: RetainedModelPart<'_>,
+    census: &mut impl crate::analyzer::semantic::service::ArtifactRetentionVisitor,
+) {
+    use RetainedModelPart as Part;
+    let mut pending = crate::analyzer::semantic::service::RetentionScratch::default();
+    pending.push(first, census);
+    while !census.is_refused() {
+        let Some(part) = pending.pop() else {
+            break;
+        };
+        match part {
+            Part::Root(root) => {
+                if let Some(procedure) = root.scoped_procedure() {
+                    census.procedure(procedure);
+                }
+                match root {
+                    AccessPathRoot::FieldPath { base, member } => {
+                        census.locator(member);
+                        if census.owned_box(base.as_ref()) {
+                            pending.push(Part::Root(base), census);
+                        }
+                    }
+                    AccessPathRoot::CallResult(result) => {
+                        census.procedure(result.callee());
+                        census.context(result.caller_context());
+                        census.context(result.callee_context());
+                        census.owned_slice(result.dispatch_provenance());
+                        for relation in result.dispatch_provenance() {
+                            relation.retained_artifacts(census);
+                        }
+                        result.binding_relation().retained_artifacts(census);
+                        let returns = result.return_relations();
+                        if !returns.is_empty()
+                            && census.shared_allocation(returns.as_ptr() as usize, || {
+                                returns.iter().fold(
+                                    std::mem::size_of_val(returns),
+                                    |bytes, relation| {
+                                        bytes
+                                            .saturating_add(relation.proof.retained_heap_bytes())
+                                            .saturating_add(
+                                                relation.completeness.retained_heap_bytes(),
+                                            )
+                                    },
+                                )
+                            })
+                        {
+                            pending.extend(returns.iter().map(Part::Relation), census);
+                        }
+                    }
+                    AccessPathRoot::CallSubstitution { context, base, .. } => {
+                        census.context(context);
+                        if census.owned_box(base.as_ref()) {
+                            pending.push(Part::Durable(base), census);
+                        }
+                    }
+                    AccessPathRoot::Static(locator)
+                    | AccessPathRoot::TypeSummary(locator)
+                    | AccessPathRoot::ModuleObject(locator)
+                    | AccessPathRoot::External(locator) => {
+                        census.artifact(locator.scope());
+                        census.locator(locator.locator());
+                    }
+                    AccessPathRoot::RuntimeObject(root) => root.retained_allocations(census),
+                    _ => {}
+                }
+            }
+            Part::Path(path) => {
+                pending.push(Part::Root(path.root()), census);
+                pending.push(Part::Selectors(path.selectors()), census);
+            }
+            Part::Selectors(selectors) => {
+                if census.owned_slice(selectors) {
+                    for selector in selectors {
+                        match selector {
+                            AccessSelector::Property(property) => census.owned_string(property),
+                            AccessSelector::Field(field) => {
+                                census.artifact(field.scope());
+                                census.locator(field.locator());
+                            }
+                            AccessSelector::Index(IndexSelector::Exact(value)) => {
+                                census.procedure(value.procedure())
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            Part::Endpoint(endpoint) => match endpoint {
+                ValueFlowEndpoint::Value(value) => census.procedure(value.procedure()),
+                ValueFlowEndpoint::Port(port) => census.procedure(port.procedure()),
+                ValueFlowEndpoint::Location(location) => {
+                    if census.owned_box(location.as_ref()) {
+                        pending.push(Part::Location(location), census);
+                    }
+                }
+            },
+            Part::Location(location) => {
+                pending.push(Part::Root(location.object().identity()), census);
+                pending.push(Part::Path(location.path()), census);
+            }
+            Part::Relation(relation) => {
+                census.procedure(relation.point.procedure());
+                relation.id.retained_artifacts(census);
+                pending.push(Part::Endpoint(&relation.source), census);
+                pending.push(Part::Endpoint(&relation.target), census);
+                if let Some(original) = &relation.original_cell {
+                    pending.push(Part::Location(original), census);
+                }
+                if let Some(super::value_flow::CollapseRead::Load(selectors)) =
+                    &relation.collapse_read
+                {
+                    pending.push(Part::Selectors(selectors), census);
+                }
+            }
+            Part::Durable(root) => match root {
+                DurableObjectIdentity::FieldPath { base, member } => {
+                    census.locator(member);
+                    if census.owned_box(base.as_ref()) {
+                        pending.push(Part::Durable(base), census);
+                    }
+                }
+                DurableObjectIdentity::CallSubstitution { context, base } => {
+                    retained_durable_context(context, census);
+                    if census.owned_box(base.as_ref()) {
+                        pending.push(Part::Durable(base), census);
+                    }
+                }
+                DurableObjectIdentity::Value(value) => retained_durable_value(value, census),
+                DurableObjectIdentity::CallResult {
+                    call,
+                    result,
+                    callee,
+                    caller_context,
+                    callee_context,
+                } => {
+                    census.locator(call);
+                    census.locator(callee);
+                    retained_durable_value(result, census);
+                    retained_durable_context(caller_context, census);
+                    retained_durable_context(callee_context, census);
+                }
+                DurableObjectIdentity::ProcedurePort { procedure, port }
+                | DurableObjectIdentity::CaptureSlot { procedure, port } => {
+                    census.locator(procedure);
+                    if let DurablePortIdentity::Capture { locator, .. } = port {
+                        census.locator(locator);
+                    }
+                }
+                DurableObjectIdentity::Allocation { locator }
+                | DurableObjectIdentity::Static { locator }
+                | DurableObjectIdentity::TypeSummary { locator }
+                | DurableObjectIdentity::ModuleObject { locator }
+                | DurableObjectIdentity::External { locator } => census.locator(locator),
+                DurableObjectIdentity::LexicalCell { locator, binding } => {
+                    census.locator(locator);
+                    retained_durable_value(binding, census);
+                }
+                DurableObjectIdentity::RuntimeObject {
+                    runtime_profile_digest,
+                    realm,
+                    exposure_id,
+                    container_member,
+                    state_boundary,
+                    active_model_set_hash,
+                    manifest_digest,
+                    shard_id,
+                    behavior_id,
+                    activation_source,
+                    ..
+                } => {
+                    for text in [
+                        runtime_profile_digest,
+                        realm,
+                        exposure_id,
+                        container_member,
+                        state_boundary,
+                        active_model_set_hash,
+                        manifest_digest,
+                        shard_id,
+                        behavior_id,
+                        activation_source,
+                    ] {
+                        census.owned_string(text);
+                    }
+                }
+            },
+        }
+    }
+    pending.release(census);
+}
+
+fn retained_durable_context(
+    context: &DurableCallContext,
+    census: &mut impl crate::analyzer::semantic::service::ArtifactRetentionVisitor,
+) {
+    if census.owned_slice(&context.calls) {
+        for call in &context.calls {
+            census.locator(call);
+        }
+    }
+}
+
+fn retained_durable_value(
+    value: &DurableValueIdentity,
+    census: &mut impl crate::analyzer::semantic::service::ArtifactRetentionVisitor,
+) {
+    census.locator(&value.locator);
+    census.owned_slice(value.role.as_bytes());
+}
+
 impl AccessPathRoot {
     pub(super) fn retained_artifacts(
         &self,
-        census: &mut crate::analyzer::semantic::service::ArtifactRetentionCensus,
+        census: &mut impl crate::analyzer::semantic::service::ArtifactRetentionVisitor,
     ) {
-        let mut root = self;
-        loop {
-            if let Some(procedure) = root.scoped_procedure() {
-                census.procedure(procedure);
-            }
-            match root {
-                Self::FieldPath { base, .. } => {
-                    root = base;
-                }
-                Self::CallResult(result) => {
-                    census.procedure(result.callee());
-                    census.context(result.caller_context());
-                    census.context(result.callee_context());
-                    for relation in result.dispatch_provenance() {
-                        relation.retained_artifacts(census);
-                    }
-                    result.binding_relation().retained_artifacts(census);
-                    for relation in result.return_relations() {
-                        relation.retained_artifacts(census);
-                    }
-                    break;
-                }
-                Self::CallSubstitution { context, .. } => {
-                    census.context(context);
-                    break;
-                }
-                _ => break,
-            }
-        }
+        collect_retained_model(RetainedModelPart::Root(self), census);
     }
 
     /// The procedure whose local handle domain scopes this root, if any.
@@ -1092,14 +1433,9 @@ pub struct AccessPath {
 impl AccessPath {
     pub(super) fn retained_artifacts(
         &self,
-        census: &mut crate::analyzer::semantic::service::ArtifactRetentionCensus,
+        census: &mut impl crate::analyzer::semantic::service::ArtifactRetentionVisitor,
     ) {
-        self.root.retained_artifacts(census);
-        for selector in self.selectors.iter() {
-            if let AccessSelector::Index(IndexSelector::Exact(value)) = selector {
-                census.procedure(value.procedure());
-            }
-        }
+        collect_retained_model(RetainedModelPart::Path(self), census);
     }
 
     /// Retain at most the configured number of selectors.  Truncation always
@@ -1331,6 +1667,16 @@ pub enum DurablePortIdentity {
 }
 
 impl DurablePortIdentity {
+    #[doc(hidden)]
+    pub fn retained_allocations(
+        &self,
+        census: &mut impl crate::analyzer::semantic::service::ArtifactRetentionVisitor,
+    ) {
+        if let Self::Capture { locator, .. } = self {
+            census.locator(locator);
+        }
+    }
+
     pub fn of(port: &ProcedurePortHandle) -> Result<Self, DurableIdentityError> {
         Ok(match port.kind() {
             ProcedurePortKind::Receiver => Self::Receiver,
@@ -1630,6 +1976,15 @@ pub struct AbstractLocation {
 }
 
 impl AbstractLocation {
+    /// Visit existing allocation owners using the caller's funded census.
+    #[doc(hidden)]
+    pub fn visit_retained_allocations(
+        &self,
+        census: &mut impl crate::analyzer::semantic::service::ArtifactRetentionVisitor,
+    ) {
+        collect_retained_model(RetainedModelPart::Location(self), census);
+    }
+
     pub fn new(object: AbstractObject, path: AccessPath) -> Result<Self, OracleContractError> {
         if &object.identity != path.root() {
             return Err(OracleContractError::ObjectPathMismatch);
@@ -2168,6 +2523,16 @@ pub enum DispatchBoundaryKind {
 }
 
 impl DispatchBoundaryKind {
+    #[doc(hidden)]
+    pub fn retained_allocations(
+        &self,
+        census: &mut impl crate::analyzer::semantic::service::ArtifactRetentionVisitor,
+    ) {
+        if let Some(target) = self.target_locator() {
+            census.locator(target);
+        }
+    }
+
     /// The value domain the `dispatch_target.boundary_kind` row field
     /// publishes (issue #2515).
     pub const LABELS: &'static [&'static str] = &[

@@ -174,6 +174,7 @@ pub(crate) struct AnalyzerGoDefinitionProvider<'a> {
 }
 
 impl<'a> AnalyzerGoDefinitionProvider<'a> {
+    #[cfg(test)]
     pub(crate) fn new(
         analyzer: &'a GoAnalyzer,
         semantic_model_overlay: Option<
@@ -307,14 +308,17 @@ impl AnalyzerGoDefinitionProvider<'_> {
         {
             return None;
         }
-        if let Some((results, _)) =
+        let (lowered, reuse) =
             crate::analyzer::go::type_identity_proof::go_selected_callable_result_type_identities(
                 self.analyzer,
                 file,
                 &member,
                 cancellation,
-            )
-        {
+            );
+        // A result count cannot carry a verdict; it joins the current captures,
+        // where the lowering's ambient marks went.
+        self.analyzer.join_reuse_verdict(reuse);
+        if let Some((results, _)) = lowered {
             return Some(results.len());
         }
         if cancellation.is_cancelled() {
@@ -663,25 +667,116 @@ pub(crate) fn go_function_value_result_type_identities(
     range: Range,
     cancellation: &CancellationToken,
 ) -> Option<Vec<Option<StructuredTypeIdentity>>> {
+    let session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), Some(cancellation));
+    let mut reuse = brokk_bifrost_analysis::analyzer::reuse_verdict::ReuseVerdict::Content;
+    let identities = function_value_result_type_identities(
+        analyzer,
+        file,
+        range,
+        cancellation,
+        &session,
+        &mut reuse,
+    );
+    // Result identities cannot carry a verdict; the proof's and its session's
+    // join the current captures, where their ambient marks went.
+    analyzer.join_reuse_verdict(reuse.join(
+        brokk_bifrost_analysis::analyzer::reuse_verdict::CarriesReuseVerdict::reuse_verdict(
+            &session,
+        ),
+    ));
+    identities
+}
+
+fn function_value_result_type_identities(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    range: Range,
+    cancellation: &CancellationToken,
+    session: &ResolutionSession,
+    reuse: &mut brokk_bifrost_analysis::analyzer::reuse_verdict::ReuseVerdict,
+) -> Option<Vec<Option<StructuredTypeIdentity>>> {
+    use crate::analyzer::go::native_points::{GoNativePointRequest, GoNativePointRequestOpen};
+    use brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause;
+    use brokk_bifrost_analysis::analyzer::resolution::local_identity::SelectedSemanticLocator;
+    use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperationOutcome;
+
+    enum SelectedBinding<T> {
+        Complete(Option<T>),
+        Stopped,
+    }
+    fn charged_binding<T>(
+        session: &ResolutionSession,
+        answer: BoundedResolution<SelectedResolutionOperationOutcome<Option<T>>>,
+        stopped: impl Fn(DerivationExecutionCause),
+    ) -> SelectedBinding<T> {
+        if !session.charge_work(&answer.work()) {
+            let cause = match session.finish(()) {
+                BoundedResolution::Cancelled { .. } => DerivationExecutionCause::Cancelled,
+                BoundedResolution::Exceeded { .. } => DerivationExecutionCause::Budget,
+                _ => unreachable!("refused work has stopped the bounded session"),
+            };
+            stopped(cause);
+            return SelectedBinding::Stopped;
+        }
+        let cause = match answer {
+            BoundedResolution::Complete {
+                value: SelectedResolutionOperationOutcome::Native(value),
+                ..
+            } => return SelectedBinding::Complete(value),
+            BoundedResolution::Complete {
+                value: SelectedResolutionOperationOutcome::Cancelled(_),
+                ..
+            }
+            | BoundedResolution::Cancelled { .. } => DerivationExecutionCause::Cancelled,
+            BoundedResolution::Complete {
+                value: SelectedResolutionOperationOutcome::Unavailable(_),
+                ..
+            }
+            | BoundedResolution::Unavailable { .. } => DerivationExecutionCause::Provider,
+            BoundedResolution::Complete {
+                value: SelectedResolutionOperationOutcome::Stale(_),
+                ..
+            } => DerivationExecutionCause::Snapshot,
+            BoundedResolution::Exceeded { .. } => DerivationExecutionCause::Budget,
+        };
+        stopped(cause);
+        SelectedBinding::Stopped
+    }
+
     if file.declaration_language() != Language::Go || range.start_byte >= range.end_byte {
         return None;
     }
     if !go_application_proof_step(analyzer, cancellation) {
         return None;
     }
-    let source = analyzer.indexed_source(file)?;
+    let _model_scope = match AnalyzerQueryScope::pin_selected_model_snapshot(analyzer) {
+        Ok(scope) => scope,
+        Err(_) => {
+            analyzer.mark_execution_dependent();
+            reuse.join_in(
+                brokk_bifrost_analysis::analyzer::reuse_verdict::ReuseVerdict::ExecutionDependent(
+                    brokk_bifrost_analysis::analyzer::reuse_verdict::ExecutionCause::Other,
+                ),
+            );
+            return None;
+        }
+    };
+    let go = resolve_analyzer::<GoAnalyzer>(analyzer)?;
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let syntax = go.prepared_result_shape_syntax(scope.token(), file)?;
+    let source = syntax.source();
     if source.len() > 1024 * 1024 {
         analyzer.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceUnavailable(
             "Go application type source exceeds proof bound".into(),
         ));
         return None;
     }
-    let tree = parse_go_tree_for_proof(analyzer, &source)?;
-    let root = tree.root_node();
-    let go = resolve_analyzer::<GoAnalyzer>(analyzer)?;
-    let session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), Some(cancellation));
-    let support =
-        AnalyzerGoDefinitionProvider::bounded(go, &session, analyzer.semantic_model_overlay());
+    let root = syntax.tree().root_node();
+    let support = AnalyzerGoDefinitionProvider::bounded(
+        go,
+        session,
+        analyzer.semantic_model_overlay_read().published(),
+    );
     let mut step = || go_application_proof_step(analyzer, cancellation) && support.scope_step();
     let mut node = brokk_bifrost_core::analyzer::usages::reference_site::smallest_named_node_covering_with_scope(
         root, range.start_byte, range.end_byte, &mut step,
@@ -699,43 +794,191 @@ pub(crate) fn go_function_value_result_type_identities(
         return None;
     }
     let function = node.child_by_field_name("function")?;
-    if function.kind() == "identifier"
-        && let Some(GoLocalBinding::Type(type_node)) = go_nearest_visible_binding_with_evaluation(
-            &support,
-            root,
-            &source,
-            go_node_text(function, &source),
-            function.start_byte(),
-            GoLexicalEvaluation::ordinary(),
-        )
-    {
-        let declaration = type_node.parent()?;
-        let mut binding = None;
-        let mut cursor = declaration.walk();
-        for child in declaration.named_children(&mut cursor) {
-            if !support.scope_step() {
-                return None;
-            }
-            if child.kind() == "identifier"
-                && child.end_byte() <= type_node.start_byte()
-                && go_node_text(child, &source) == go_node_text(function, &source)
-                && binding.replace(child).is_some()
+    if function.kind() != "identifier" {
+        return None;
+    }
+    let stopped = |cause| {
+        analyzer.record_query_incomplete(QueryReadIncomplete::ProofStopped {
+            reason: "Go function-value binding proof stopped",
+            cause: Some(cause),
+        })
+    };
+    let mut request = match GoNativePointRequest::open_for_file(
+        go,
+        file,
+        analyzer.semantic_model_overlay_read().published(),
+        cancellation,
+    ) {
+        Ok(GoNativePointRequestOpen::Ready(request)) => request,
+        Ok(GoNativePointRequestOpen::Cancelled) => {
+            stopped(DerivationExecutionCause::Cancelled);
+            return None;
+        }
+        Ok(GoNativePointRequestOpen::Unavailable { kind, message }) => {
+            analyzer.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceUnavailable(
+                format!("{kind}: {message}").into(),
+            ));
+            return None;
+        }
+        Err(error) => {
+            analyzer.record_query_failure(error);
+            return None;
+        }
+    };
+    let locator = SelectedSemanticLocator::for_reference_range(
+        "go",
+        brokk_bifrost_core::path_utils::rel_path_string(file),
+        function.start_byte(),
+        function.end_byte(),
+    );
+    let answer = match request.resolve_source_declaration_candidate(
+        &locator,
+        session
+            .remaining_budget()
+            .expect("bounded application proof"),
+        cancellation,
+    ) {
+        Ok(answer) => answer,
+        Err(error) => {
+            analyzer.record_query_failure(error);
+            return None;
+        }
+    };
+    // A certified lexical candidate admits further proof, not package absence.
+    // Only an exact written source variable needs the full package validation.
+    let candidate = match charged_binding(session, answer, stopped) {
+        SelectedBinding::Complete(candidate) => candidate,
+        SelectedBinding::Stopped => return None,
+    };
+    use brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::SelectedNativeDefinition;
+    let (binding, type_node) = match candidate {
+        Some((_, SelectedNativeDefinition::Lexical(definition)))
+            if matches!(
+                definition.kind,
+                DeclarationKind::LocalVariable
+                    | DeclarationKind::Parameter
+                    | DeclarationKind::ReceiverParameter
+            ) =>
+        {
+            if definition
+                .source_file
+                .as_ref()
+                .is_some_and(|source| source != file)
             {
                 return None;
             }
+            crate::analyzer::go::type_identity_proof::explicit_binding_type_nodes(
+                root,
+                definition.name_range,
+                &mut step,
+            )?
         }
-        return go_declared_application_result_identities(
-            analyzer,
-            file,
-            &source,
-            root,
-            type_node,
-            binding?,
-            cancellation,
-            &support,
-        );
-    }
-    None
+        Some((identity, SelectedNativeDefinition::Unit(unit)))
+            if unit.is_field() && unit.source() == file =>
+        {
+            let ranges = go.ranges_limited(&unit, 2);
+            if !ranges.complete {
+                return None;
+            }
+            let mut selected: Option<(Node<'_>, Node<'_>)> = None;
+            for range in &ranges.rows {
+                if !step() {
+                    return None;
+                }
+                let owner = brokk_bifrost_core::analyzer::usages::reference_site::smallest_named_node_covering_with_scope(
+                    root, range.start_byte, range.end_byte, &mut step,
+                )?;
+                if owner.start_byte() != range.start_byte
+                    || owner.end_byte() != range.end_byte
+                    || owner.has_error()
+                {
+                    return None;
+                }
+                let declaration = match owner.kind() {
+                    "var_spec" => owner,
+                    "var_declaration" => {
+                        let mut cursor = owner.walk();
+                        let mut specification = None;
+                        for child in owner.named_children(&mut cursor) {
+                            if !step() {
+                                return None;
+                            }
+                            if child.kind() == "var_spec" {
+                                if brokk_bifrost_go::declarations::sole_spec_declaration_node(
+                                    child,
+                                    "var_spec",
+                                    "var_declaration",
+                                ) != owner
+                                {
+                                    return None;
+                                }
+                                specification = Some(child);
+                                break;
+                            }
+                        }
+                        specification?
+                    }
+                    _ => return None,
+                };
+                let mut cursor = declaration.walk();
+                for name in declaration.children_by_field_name("name", &mut cursor) {
+                    if !step() {
+                        return None;
+                    }
+                    let binding_range = brokk_bifrost_core::analyzer::tree_walk::node_range(name);
+                    if !crate::analyzer::go::type_identity_proof::selected_unit_binding_is_exact(
+                        &unit,
+                        file,
+                        source,
+                        binding_range,
+                        &ranges.rows,
+                    ) {
+                        continue;
+                    }
+                    let pair =
+                        crate::analyzer::go::type_identity_proof::explicit_binding_type_nodes(
+                            root,
+                            binding_range,
+                            &mut step,
+                        )?;
+                    if selected.is_some_and(|(previous, _)| previous.id() != pair.0.id()) {
+                        return None;
+                    }
+                    selected = Some(pair);
+                }
+            }
+            let selected = selected?;
+            let answer = match request.validate_source_field_candidate(
+                (identity, &unit),
+                &locator,
+                session
+                    .remaining_budget()
+                    .expect("bounded application proof"),
+                cancellation,
+            ) {
+                Ok(answer) => answer,
+                Err(error) => {
+                    analyzer.record_query_failure(error);
+                    return None;
+                }
+            };
+            match charged_binding(session, answer, stopped) {
+                SelectedBinding::Complete(Some(())) => selected,
+                SelectedBinding::Complete(None) | SelectedBinding::Stopped => return None,
+            }
+        }
+        _ => return None,
+    };
+    go_declared_application_result_identities(
+        analyzer,
+        file,
+        source,
+        root,
+        type_node,
+        binding,
+        cancellation,
+        &support,
+    )
 }
 
 // Both recipients resolve the written application type from their binding;
@@ -765,38 +1008,42 @@ fn go_declared_application_result_identities(
             support,
         );
     }
-    let selected =
-        match crate::analyzer::go::type_identity_proof::go_explicit_binding_application_type(
-            analyzer,
-            file,
-            source,
-            Range {
-                start_byte: binding.start_byte(),
-                end_byte: binding.end_byte(),
-                start_line: binding.start_position().row + 1,
-                end_line: binding.end_position().row + 1,
-            },
-            cancellation,
-        ) {
-            BoundedResolution::Complete { value, .. } => value,
-            BoundedResolution::Exceeded { limit, .. } => {
-                analyzer.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceUnavailable(
-                    format!("Go explicit binding type resolution budget exceeded: {limit:?}")
-                        .into(),
-                ));
-                return None;
-            }
-            BoundedResolution::Cancelled { .. } => {
-                analyzer.record_query_incomplete(QueryReadIncomplete::Cancelled);
-                return None;
-            }
-            BoundedResolution::Unavailable { reason, .. } => {
-                analyzer.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceUnavailable(
-                    reason.into(),
-                ));
-                return None;
-            }
-        };
+    let mut reuse = brokk_bifrost_analysis::analyzer::reuse_verdict::ReuseVerdict::Content;
+    let resolution = crate::analyzer::go::type_identity_proof::go_explicit_binding_application_type(
+        analyzer,
+        file,
+        source,
+        Range {
+            start_byte: binding.start_byte(),
+            end_byte: binding.end_byte(),
+            start_line: binding.start_position().row + 1,
+            end_line: binding.end_position().row + 1,
+        },
+        cancellation,
+        &mut reuse,
+    );
+    // Result identities cannot carry a verdict; it joins the current captures,
+    // where the proof's ambient marks went.
+    analyzer.join_reuse_verdict(reuse);
+    let selected = match resolution {
+        BoundedResolution::Complete { value, .. } => value,
+        BoundedResolution::Exceeded { limit, .. } => {
+            analyzer.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceUnavailable(
+                format!("Go explicit binding type resolution budget exceeded: {limit:?}").into(),
+            ));
+            return None;
+        }
+        BoundedResolution::Cancelled { .. } => {
+            analyzer.record_query_incomplete(QueryReadIncomplete::Cancelled);
+            return None;
+        }
+        BoundedResolution::Unavailable { reason, .. } => {
+            analyzer.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceUnavailable(
+                reason.into(),
+            ));
+            return None;
+        }
+    };
     let nominal = selected.nominal?;
     let Some(receipt) = selected.application_source else {
         analyzer.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceUnavailable(
@@ -868,8 +1115,11 @@ pub(crate) fn go_bound_function_value_result_type_identities(
     let root = tree.root_node();
     let go = resolve_analyzer::<GoAnalyzer>(analyzer)?;
     let session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), Some(cancellation));
-    let support =
-        AnalyzerGoDefinitionProvider::bounded(go, &session, analyzer.semantic_model_overlay());
+    let support = AnalyzerGoDefinitionProvider::bounded(
+        go,
+        &session,
+        analyzer.semantic_model_overlay_read().published(),
+    );
     let mut step = || go_application_proof_step(analyzer, cancellation) && support.scope_step();
     let mut call = brokk_bifrost_core::analyzer::usages::reference_site::smallest_named_node_covering_with_scope(
         root, range.start_byte, range.end_byte, &mut step,
@@ -1167,125 +1417,78 @@ fn go_import_paths(
         .collect()
 }
 
-pub(crate) fn go_imported_package_at_range(
-    analyzer: &dyn IAnalyzer,
-    file: &ProjectFile,
-    source: &str,
-    start_byte: usize,
-    end_byte: usize,
-) -> Option<String> {
-    let go = resolve_analyzer::<GoAnalyzer>(analyzer)?;
-    let tree = parse_go_tree(source)?;
-    let node = tree
-        .root_node()
-        .named_descendant_for_byte_range(start_byte, end_byte)?;
-    if !matches!(node.kind(), "identifier" | "package_identifier") {
-        return None;
-    }
-    let mut root = node;
-    while let Some(parent) = root.parent() {
-        root = parent;
-    }
-    let support = AnalyzerGoDefinitionProvider::new(go, analyzer.semantic_model_overlay());
-    let name = go_node_text(node, source);
-    if go_nearest_visible_binding(&support, root, source, name, start_byte).is_some() {
-        return None;
-    }
-    let scope = brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope::new(analyzer);
-    go_import_paths(&support, scope.token(), go, file).remove(name)
-}
-
-pub(crate) fn go_native_external_import_binding_resolution(
+/// Present a native-selected namespace without resolving names again.
+pub(crate) fn go_selected_import_namespace_resolution(
     query: brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery<'_>,
-    go: &GoAnalyzer,
     session: &ResolutionSession,
-    selected_import: &GoSelectedExternalImport,
+    selected: brokk_bifrost_analysis::analyzer::store::resolution_operation::go_named::GoSelectedImportNamespace,
 ) -> Option<DefinitionLookupOutcome> {
-    let tree = query.tree?;
-    let selector =
-        brokk_bifrost_go::references::go_selector_descriptor(tree.root_node(), query.site)?;
-    if selector.focus_segment != 0 {
-        return None;
-    }
-    let support =
-        AnalyzerGoDefinitionProvider::bounded(go, session, query.analyzer.semantic_model_overlay());
-    let scope = AnalyzerQueryScope::new(query.analyzer);
-    let import_spec = go_selected_external_import_spec(
-        query,
-        &support,
-        scope.token(),
-        selected_import,
-        tree.root_node(),
-        selector.base,
-    )?;
-    let identifier = go_node_text(selector.base, query.source);
-    let binder = import_spec
-        .child_by_field_name("name")
-        .or_else(|| import_spec.child_by_field_name("path"))?;
-    let range = |node: tree_sitter::Node<'_>| Range {
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        start_line: node.start_position().row + 1,
-        end_line: node.end_position().row + 1,
-    };
-    let definition = LexicalDefinition {
-        source_file: None,
-        identifier: identifier.to_string(),
-        kind: DeclarationKind::ImportAlias,
-        name_range: range(binder),
-        declaration_range: range(import_spec),
-    };
-    let mut outcome = lexical_definition_outcome(definition);
-    outcome.reference = Some(query.site.clone());
-    Some(outcome)
-}
-
-pub(crate) fn go_native_import_namespace_resolution(
-    query: brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery<'_>,
-    go: &GoAnalyzer,
-    session: &ResolutionSession,
-) -> Option<DefinitionLookupOutcome> {
-    let tree = query.tree?;
-    let selector =
-        brokk_bifrost_go::references::go_selector_descriptor(tree.root_node(), query.site)?;
-    if selector.focus_segment != 0
-        || !matches!(selector.base.kind(), "identifier" | "package_identifier")
-    {
-        return None;
-    }
-    let support =
-        AnalyzerGoDefinitionProvider::bounded(go, session, query.analyzer.semantic_model_overlay());
-    let query_scope = AnalyzerQueryScope::new(query.analyzer);
-    let token = query_scope.token();
-    let alias = go_node_text(selector.base, query.source);
-    if go_nearest_visible_binding(
-        &support,
-        tree.root_node(),
-        query.source,
-        alias,
-        query.site.focus_start_byte,
-    )
-    .is_some()
-    {
-        return None;
-    }
-    let package = go_import_paths(&support, token, go, query.file).remove(alias)?;
-    let workspace_status = go_workspace_package_status(&support, &package);
-    let mut outcome = match workspace_status {
-        GoWorkspacePackageStatus::Present => no_definition(
+    use brokk_bifrost_analysis::analyzer::store::resolution_operation::go_named::GoSelectedImportNamespaceProvider;
+    let identifier = query
+        .source
+        .get(query.site.focus_start_byte..query.site.focus_end_byte)?;
+    let mut outcome = match selected.provider {
+        GoSelectedImportNamespaceProvider::Source => no_definition(
             "workspace_package_namespace",
             format!(
-                "`{alias}` names a Go package in this workspace, not a single indexed declaration"
+                "`{identifier}` names a Go package in this workspace, not a single indexed declaration"
             ),
         ),
-        GoWorkspacePackageStatus::Absent => go_workspace_package_boundary(
-            &package,
-            workspace_status,
-            format!("`{package}` is outside this partial Go workspace analysis"),
-            "no_indexed_definition",
-            format!("`{alias}` is not indexed in Go package `{package}`"),
-        ),
-        GoWorkspacePackageStatus::Unknown => go_workspace_package_status_unknown(&package),
+        GoSelectedImportNamespaceProvider::External => {
+            // Only project the selected import's syntax. Its native binder has
+            // already established import choice, precedence and shadowing.
+            let mut import_spec =
+                brokk_bifrost_core::analyzer::tree_walk::node_for_exact_range_with_step(
+                    query.tree?.root_node(),
+                    &Range {
+                        start_byte: selected.import_start_byte,
+                        end_byte: selected.import_end_byte,
+                        start_line: 0,
+                        end_line: 0,
+                    },
+                    || session.scope_step(),
+                )?;
+            while import_spec.kind() != "import_spec" {
+                if !session.scope_step() {
+                    return None;
+                }
+                import_spec = import_spec.parent()?;
+                if import_spec.start_byte() != selected.import_start_byte
+                    || import_spec.end_byte() != selected.import_end_byte
+                {
+                    return None;
+                }
+            }
+            let binder = import_spec
+                .child_by_field_name("name")
+                .or_else(|| import_spec.child_by_field_name("path"))?;
+            let range = |node: tree_sitter::Node<'_>| Range {
+                start_byte: node.start_byte(),
+                end_byte: node.end_byte(),
+                start_line: node.start_position().row + 1,
+                end_line: node.end_position().row + 1,
+            };
+            lexical_definition_outcome(LexicalDefinition {
+                source_file: None,
+                identifier: identifier.to_owned(),
+                kind: DeclarationKind::ImportAlias,
+                name_range: range(binder),
+                declaration_range: range(import_spec),
+            })
+        }
+        GoSelectedImportNamespaceProvider::UnindexedExternal { provider_path } => {
+            // The selected import has no source declarations and no model or
+            // tool provider row, so its unindexed frontier is the
+            // external-boundary proof. Answer the boundary instead of leaving
+            // the unavailable native projection to stand.
+            go_workspace_package_boundary(
+                &provider_path,
+                GoWorkspacePackageStatus::Absent,
+                format!("`{provider_path}` is outside this partial Go workspace analysis"),
+                "no_indexed_definition",
+                format!("`{identifier}` is not indexed in Go package `{provider_path}`"),
+            )
+        }
     };
     outcome.reference = Some(query.site.clone());
     Some(outcome)
@@ -1303,8 +1506,11 @@ pub(crate) fn go_native_external_dot_import_call_resolution(
 )> {
     let tree = query.tree?;
     let root = tree.root_node();
-    let support =
-        AnalyzerGoDefinitionProvider::bounded(go, session, query.analyzer.semantic_model_overlay());
+    let support = AnalyzerGoDefinitionProvider::bounded(
+        go,
+        session,
+        query.analyzer.semantic_model_overlay_read().published(),
+    );
     let callable = go_smallest_named_node_covering(
         &support,
         root,
@@ -1734,7 +1940,7 @@ pub(crate) fn go_native_source_imported_member_resolution(
     {
         return None;
     }
-    let overlay = query.analyzer.semantic_model_overlay();
+    let overlay = query.analyzer.semantic_model_overlay_read().published();
     let support = AnalyzerGoDefinitionProvider::bounded(go, session, overlay.clone());
     let alias = go_node_text(selector.base, query.source);
     if go_name_shadowed_at_with_scope(
@@ -1926,8 +2132,11 @@ pub(crate) fn go_native_workspace_unqualified_call_resolution(
 ) -> Option<DefinitionLookupOutcome> {
     let tree = query.tree?;
     let go = resolve_analyzer::<GoAnalyzer>(query.analyzer)?;
-    let support =
-        AnalyzerGoDefinitionProvider::bounded(go, session, query.analyzer.semantic_model_overlay());
+    let support = AnalyzerGoDefinitionProvider::bounded(
+        go,
+        session,
+        query.analyzer.semantic_model_overlay_read().published(),
+    );
     if !support.workspace_declaration_identities_authoritative()
         || !support.workspace_package_inventory_complete()
         || !go_identifier_is_call_target(&support, tree.root_node(), query.site)
@@ -2200,12 +2409,12 @@ fn go_dot_import_path(support: &dyn GoDefinitionProvider, import: &ImportInfo) -
         .flatten()
 }
 
-/// How a local binding names its type: an explicit `var x T` annotation, or the
-/// value expression of an inferred `x := value` binding to derive it from. An
-/// opaque binding still has exact lexical authority to shadow an import even
-/// when this resolver has no useful type to infer for its value.
+/// Legacy binding categories retained by the remaining shadow guards.
+/// Function-value result types now use native bindings, so this walk no longer
+/// retains written type nodes. Switch inputs keep their evaluation location
+/// until the remaining guard consumers are migrated.
 enum GoLocalBinding<'tree> {
-    Type(Node<'tree>),
+    Type,
     Variadic,
     /// Multi-type, nil and default clauses retain the switch input's type.
     SwitchInput(Node<'tree>),
@@ -2471,7 +2680,7 @@ fn go_parameter_list_binding<'tree>(
         }
         return Some(
             match (parameter.kind(), parameter.child_by_field_name("type")) {
-                ("parameter_declaration", Some(type_node)) => GoLocalBinding::Type(type_node),
+                ("parameter_declaration", Some(_)) => GoLocalBinding::Type,
                 ("variadic_parameter_declaration", Some(_)) => GoLocalBinding::Variadic,
                 ("type_parameter_declaration", _) => GoLocalBinding::OpaqueType,
                 _ => GoLocalBinding::Opaque,
@@ -2522,7 +2731,7 @@ fn go_clause_binding<'tree>(
     if let (Some(type_node), None) = (first, second)
         && go_node_text(type_node, source) != "nil"
     {
-        return Some(GoLocalBinding::Type(type_node));
+        return Some(GoLocalBinding::Type);
     }
     // Evaluate the operand before the case-local alias exists. In particular,
     // an operand with the alias's spelling still names the enclosing binding.
@@ -3760,8 +3969,8 @@ fn go_var_spec_binding<'tree>(
         return None;
     }
     let index = go_named_identifier_index(support, spec, source, name)?;
-    if let Some(type_node) = spec.child_by_field_name("type") {
-        return Some(GoLocalBinding::Type(type_node));
+    if spec.child_by_field_name("type").is_some() {
+        return Some(GoLocalBinding::Type);
     }
     Some(
         spec.child_by_field_name("value")
@@ -3916,8 +4125,11 @@ pub(crate) fn go_call_argument_partition_is_complete(
     let Some(go) = resolve_analyzer::<GoAnalyzer>(analyzer) else {
         return false;
     };
-    let support =
-        AnalyzerGoDefinitionProvider::bounded(go, &session, analyzer.semantic_model_overlay());
+    let support = AnalyzerGoDefinitionProvider::bounded(
+        go,
+        &session,
+        analyzer.semantic_model_overlay_read().published(),
+    );
     let file = &shape.outcome.file;
     let Some(source) = analyzer.indexed_source(file) else {
         return false;
@@ -4238,8 +4450,11 @@ pub(crate) fn go_source_call_arity_rejection(
         return None;
     }
     let go = resolve_analyzer::<GoAnalyzer>(query.analyzer)?;
-    let support =
-        AnalyzerGoDefinitionProvider::bounded(go, session, query.analyzer.semantic_model_overlay());
+    let support = AnalyzerGoDefinitionProvider::bounded(
+        go,
+        session,
+        query.analyzer.semantic_model_overlay_read().published(),
+    );
     let tree = query.tree?;
     let scope = AnalyzerQueryScope::new(query.analyzer);
     let count = if let Some(selector) =
@@ -4454,7 +4669,7 @@ pub(crate) fn resolve_definition_dispatch<'a>(
     go_session: Option<
         &brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession,
     >,
-    mut definition_batch: Option<&mut GoDefinitionBatchOperation<'a>>,
+    definition_batch: Option<&mut GoDefinitionBatchOperation<'a>>,
 ) -> std::ops::ControlFlow<
     brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionResolution,
     brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionResolution,
@@ -4475,53 +4690,73 @@ pub(crate) fn resolve_definition_dispatch<'a>(
             cancellation,
         };
         evidence.authority = DefinitionResolutionAuthority::NativeGoSelected;
-        let native = definition_batch
-            .as_mut()
-            .and_then(|batch| batch.resolve(query))
-            .unwrap_or_else(|| {
-                crate::analyzer::go::native_points::resolve_go_definition_with_evidence_bounded(
-                    query,
-                    || {},
-                )
-            });
-        match native {
-            BoundedResolution::Complete { value, .. } => {
-                evidence.source_member_evidence = value.source_member_evidence;
-                evidence.native_resolution = value.native_resolution;
-                evidence.model_member_selection = value.model_member_selection;
-                evidence.call_application = value.call_application;
-                evidence.external_callee_identity = value.external_callee_identity;
-                if let Some(proof) = value.exact_external_call {
-                    evidence.call_application = proof.call_application();
-                    evidence.dispatch_extensibility = proof.dispatch_extensibility();
-                    evidence.exact_external_call = Some(proof);
-                }
-                value.outcome
-            }
-            BoundedResolution::Exceeded { limit, .. } => exceeded_budget(
-                limit,
-                format!(
-                    "Go definition resolution exceeded its {} budget",
-                    limit.as_str()
-                ),
-            ),
-            BoundedResolution::Cancelled { .. } => {
-                cancelled("Go definition resolution was cancelled")
-            }
-            BoundedResolution::Unavailable { reason, .. } => {
-                brokk_bifrost_analysis::analyzer::native_points::unavailable_definition(
-                    site,
-                    "native_input_unavailable",
-                    reason.into(),
-                )
-            }
-        }
+        let native = resolve_native_definition(definition_batch, query);
+        finish_native_definition(native, site, &mut evidence)
     };
     std::ops::ControlFlow::Continue(DefinitionResolution {
         outcome,
         evidence,
         call_binding_discharge_digests: Vec::new(),
     })
+}
+
+/// The native answer rides in a box through the dispatch and memo-capture
+/// frames. A debug frame holds every by-value copy of the large resolution, and
+/// this call chain nests deep enough (#11691) that each copy counts.
+type BoxedNativeDefinition =
+    Box<BoundedResolution<crate::analyzer::go::native_points::GoNativeDefinitionResolution>>;
+
+fn resolve_native_definition<'a>(
+    definition_batch: Option<&mut GoDefinitionBatchOperation<'a>>,
+    query: brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery<'_>,
+) -> BoxedNativeDefinition {
+    definition_batch
+        .and_then(|batch| batch.resolve(query))
+        .unwrap_or_else(|| {
+            Box::new(
+                crate::analyzer::go::native_points::resolve_go_definition_with_evidence_bounded(
+                    query,
+                    || {},
+                ),
+            )
+        })
+}
+
+fn finish_native_definition(
+    native: BoxedNativeDefinition,
+    site: &ResolvedReferenceSite,
+    evidence: &mut CallEvidence,
+) -> DefinitionLookupOutcome {
+    match *native {
+        BoundedResolution::Complete { value, .. } => {
+            evidence.source_member_evidence = value.source_member_evidence;
+            evidence.native_resolution = value.native_resolution;
+            evidence.model_member_selection = value.model_member_selection;
+            evidence.call_application = value.call_application;
+            evidence.external_callee_identity = value.external_callee_identity;
+            if let Some(proof) = value.exact_external_call {
+                evidence.call_application = proof.call_application();
+                evidence.dispatch_extensibility = proof.dispatch_extensibility();
+                evidence.exact_external_call = Some(proof);
+            }
+            value.outcome
+        }
+        BoundedResolution::Exceeded { limit, .. } => exceeded_budget(
+            limit,
+            format!(
+                "Go definition resolution exceeded its {} budget",
+                limit.as_str()
+            ),
+        ),
+        BoundedResolution::Cancelled { .. } => cancelled("Go definition resolution was cancelled"),
+        BoundedResolution::Unavailable { reason, .. } => {
+            brokk_bifrost_analysis::analyzer::native_points::unavailable_definition(
+                site,
+                "native_input_unavailable",
+                reason.into(),
+            )
+        }
+    }
 }
 
 pub(crate) struct GoDefinitionBatchOperation<'a> {
@@ -4556,8 +4791,34 @@ impl<'a> GoDefinitionBatchOperation<'a> {
     fn resolve(
         &mut self,
         query: brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery<'_>,
-    ) -> Option<BoundedResolution<crate::analyzer::go::native_points::GoNativeDefinitionResolution>>
-    {
+    ) -> Option<BoxedNativeDefinition> {
+        let analyzer = self.analyzer;
+        let previous = self.open_reads.take();
+        let (result, reads) =
+            brokk_bifrost_analysis::analyzer::usages::common::capture_mutable_memo_reads(
+                brokk_bifrost_analysis::analyzer::usages::common::QueryMemoOwner::GoDefinition,
+                analyzer,
+                self,
+                previous.as_ref(),
+                |operation| {
+                    operation.request = None;
+                    operation.file = None;
+                    operation.open_reads = None;
+                    operation.selected_snapshot = None;
+                    operation.disabled = false;
+                },
+                |operation| operation.resolve_with_memo(query),
+            );
+        if self.request.is_some() {
+            self.open_reads = reads;
+        }
+        result
+    }
+
+    fn resolve_with_memo(
+        &mut self,
+        query: brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery<'_>,
+    ) -> Option<BoxedNativeDefinition> {
         let _model_scope = if let Some(snapshot) = &self.selected_snapshot {
             AnalyzerQueryScope::with_compatible_selected_model_snapshot(
                 self.analyzer,
@@ -4575,37 +4836,60 @@ impl<'a> GoDefinitionBatchOperation<'a> {
         let _model_scope = match _model_scope {
             Ok(scope) => scope,
             Err(_) => {
-                return Some(
-                    crate::analyzer::go::native_points::unavailable_go_definition_open(
-                        query,
-                        "native_model_authority_stale",
-                        "Go batch request conflicts with the outer model selection".into(),
-                    ),
-                );
+                return Some(unavailable_go_definition_open_boxed(
+                    query,
+                    "native_model_authority_stale",
+                    "Go batch request conflicts with the outer model selection".into(),
+                ));
             }
         };
+        if let std::ops::ControlFlow::Break(early) = self.open_request(query) {
+            return early;
+        }
+        let request = self.request.as_mut().expect("Go batch request opened");
+        // Only completed candidate artifacts survive across sites. The owner
+        // frontier charge belongs to this site's independent budget.
+        request.begin_receiver_query(query.file);
+        let result = resolve_definition_boxed(request, query);
+        let release = !matches!(&*result, BoundedResolution::Complete { value, .. } if !value.outcome.diagnostics.iter().any(|diagnostic| brokk_bifrost_analysis::analyzer::usages::common::is_native_operation_failure(&diagnostic.kind)));
+        if release {
+            self.request = None;
+            self.open_reads = None;
+        }
+        Some(result)
+    }
+
+    /// Open the file's native request when none is retained. `Break` carries
+    /// the answer for a site that cannot use one. This frame returns before
+    /// the resolution runs, so its by-value results never share a frame with
+    /// the deep resolver call.
+    fn open_request(
+        &mut self,
+        query: brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery<'_>,
+    ) -> std::ops::ControlFlow<Option<BoxedNativeDefinition>> {
+        use std::ops::ControlFlow::Break;
         if self.disabled {
-            return None;
+            return Break(None);
         }
         if self.file.as_ref().is_some_and(|file| file != query.file) {
             self.request = None;
             self.open_reads = None;
         }
         if self.request.is_none() {
-            let go = resolve_analyzer::<GoAnalyzer>(self.analyzer)?;
+            let Some(go) = resolve_analyzer::<GoAnalyzer>(self.analyzer) else {
+                return Break(None);
+            };
             let cancellation = query.cancellation.cloned().unwrap_or_default();
-            let (opened, reads) =
-                brokk_bifrost_analysis::analyzer::usages::common::capture_memo_reads(
-                    self.analyzer,
-                    || {
-                        crate::analyzer::go::native_points::GoNativePointRequest::open_for_file(
-                            go,
-                            query.file,
-                            self.analyzer.semantic_model_overlay(),
-                            &cancellation,
-                        )
-                    },
-                );
+            let opened = crate::analyzer::go::native_points::GoNativePointRequest::open_for_file(
+                go,
+                query.file,
+                self.analyzer.semantic_model_overlay_read().published(),
+                &cancellation,
+            );
+            let opened = brokk_bifrost_analysis::analyzer::usages::common::memo_store_result(
+                self.analyzer,
+                opened,
+            );
             match opened {
                 Ok(crate::analyzer::go::native_points::GoNativePointRequestOpen::Ready(
                     request,
@@ -4616,67 +4900,57 @@ impl<'a> GoDefinitionBatchOperation<'a> {
                     }
                     self.request = Some(request);
                     self.file = Some(query.file.clone());
-                    self.open_reads = Some(reads);
                 }
                 Ok(crate::analyzer::go::native_points::GoNativePointRequestOpen::Unavailable {
                     kind,
                     message,
                 }) => {
                     self.disabled = true;
-                    return Some(
-                        crate::analyzer::go::native_points::unavailable_go_definition_open(
-                            query, kind, message,
-                        ),
-                    );
+                    return Break(Some(unavailable_go_definition_open_boxed(
+                        query, kind, message,
+                    )));
                 }
                 Ok(crate::analyzer::go::native_points::GoNativePointRequestOpen::Cancelled) => {
-                    return Some(BoundedResolution::Cancelled {
+                    return Break(Some(Box::new(BoundedResolution::Cancelled {
                         work: Default::default(),
-                    });
+                    })));
                 }
                 Err(error) => {
                     self.disabled = true;
-                    return Some(
-                        crate::analyzer::go::native_points::unavailable_go_definition_open(
-                            query,
-                            "native_store_error",
-                            error.to_string(),
-                        ),
-                    );
+                    return Break(Some(unavailable_go_definition_open_boxed(
+                        query,
+                        "native_store_error",
+                        error.to_string(),
+                    )));
                 }
             }
-        } else if let Some(reads) = self.open_reads.as_ref() {
-            brokk_bifrost_analysis::analyzer::usages::common::replay_memo_reads(
-                reads,
-                self.analyzer,
-            );
         }
-        let request = self.request.as_mut().expect("Go batch request opened");
-        // Only completed candidate artifacts survive across sites. The owner
-        // frontier charge belongs to this site's independent budget.
-        request.begin_receiver_query(query.file);
-        let result = request.resolve_definition_with_evidence(query);
-        let release = request.reader_excludes_store_access()
-            || !matches!(&result, BoundedResolution::Complete { value, .. } if !value.outcome.diagnostics.iter().any(|diagnostic| brokk_bifrost_analysis::analyzer::usages::common::is_native_operation_failure(&diagnostic.kind)));
-        if release {
-            self.request = None;
-            self.open_reads = None;
-        }
-        Some(result)
+        std::ops::ControlFlow::Continue(())
     }
 }
 
+fn unavailable_go_definition_open_boxed(
+    query: brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery<'_>,
+    kind: &'static str,
+    message: String,
+) -> BoxedNativeDefinition {
+    Box::new(
+        crate::analyzer::go::native_points::unavailable_go_definition_open(query, kind, message),
+    )
+}
+
+/// Boxing here, rather than in `resolve_with_memo`, leaves the large result
+/// out of the memo-capture frames above the resolver.
+fn resolve_definition_boxed(
+    request: &mut crate::analyzer::go::native_points::GoNativePointRequest<'_>,
+    query: brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery<'_>,
+) -> BoxedNativeDefinition {
+    Box::new(request.resolve_definition_with_evidence(query))
+}
+
 impl<'a> DefinitionBatchResolver<'a> for GoDefinitionBatchOperation<'a> {
-    fn release_before_store_read(&mut self) {
-        if self
-            .request
-            .as_ref()
-            .is_some_and(|request| request.reader_excludes_store_access())
-        {
-            self.request = None;
-            self.open_reads = None;
-        }
-    }
+    // Pooled readers remain reusable across independent store reads.
+    fn release_before_store_read(&mut self) {}
 
     fn precompute(
         &mut self,
@@ -4723,11 +4997,12 @@ pub(crate) fn resolve_definition_call_target_batch(
     file: ProjectFile,
     source: Arc<str>,
     cancellation: Option<&CancellationToken>,
+    reuse: &mut brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict,
 ) -> Vec<CallTargetLookupOutcome> {
     let _model_scope = match AnalyzerQueryScope::pin_selected_model_snapshot(analyzer) {
         Ok(scope) => scope,
         Err(_) => {
-            analyzer.mark_execution_dependent();
+            reuse.join_in(crate::analyzer::go::execution_dependent(analyzer));
             return Vec::new();
         }
     };
@@ -4807,7 +5082,111 @@ mod bounded_tests {
     use brokk_bifrost_test_macros::hardwon;
 
     #[test]
-    #[hardwon("#9015: a Go file batch reopened native selection and context for every call")]
+    #[hardwon(
+        "#11234: Go batch opening receipts lost typed completion and retained failed request state"
+    )]
+    fn go_definition_memo_completion_conformance() {
+        use brokk_bifrost_analysis::analyzer::usages::common::{
+            QueryMemoOwner, assert_memo_owner_conformance_for_test,
+        };
+        let source = Arc::<str>::from(
+            "package main\nimport \"example.com/app/helper\"\nfunc use(){ helper.Target() }\n",
+        );
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Go,
+            &[
+                ("go.mod", "module example.com/app\n"),
+                ("helper/helper.go", "package helper\nfunc Target(){}\n"),
+                ("main.go", &source),
+            ],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "main.go");
+        let analyzer = fixture.analyzer.analyzer();
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let start = source.find("Target").unwrap();
+        let request = DefinitionLookupRequest {
+            file: file.clone(),
+            line: None,
+            column: None,
+            start_byte: Some(start),
+            end_byte: Some(start + 6),
+        };
+        assert_memo_owner_conformance_for_test(
+            QueryMemoOwner::GoDefinition,
+            analyzer,
+            || GoDefinitionBatchOperation {
+                analyzer,
+                selected_snapshot: None,
+                request: None,
+                file: None,
+                open_reads: None,
+                disabled: false,
+                opened_operations: 0,
+            },
+            |batch| {
+                let mut context = DefinitionBatchContext::new(analyzer, scope.token());
+                context
+                    .sources
+                    .insert(file.clone(), Ok(Arc::clone(&source)));
+                let answer = resolve_one_with_evidence(
+                    analyzer,
+                    scope.token(),
+                    &mut context,
+                    request.clone(),
+                    None,
+                    None,
+                    None,
+                    Some(batch),
+                );
+                (answer.outcome.status, answer.outcome.definitions)
+            },
+            |batch| {
+                if batch.request.is_none() {
+                    assert!(batch.open_reads.is_none());
+                    assert!(batch.file.is_none());
+                    assert!(batch.selected_snapshot.is_none());
+                    assert!(!batch.disabled);
+                }
+                batch.request.is_some() && batch.open_reads.is_some()
+            },
+        );
+    }
+
+    #[test]
+    #[hardwon("#11234: a Go demand panicked after a soft deadline refused its prepared context")]
+    fn go_demand_deadline_at_preparation_boundary_is_cancelled() {
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Go,
+            &[
+                ("go.mod", "module example.com/app\n"),
+                ("helper/helper.go", "package helper\nfunc Target() {}\n"),
+                (
+                    "main.go",
+                    "package main\nimport \"example.com/app/helper\"\nfunc use(){ helper.Target() }\n",
+                ),
+            ],
+        );
+        let analyzer = fixture.analyzer.analyzer();
+        let _scope = AnalyzerQueryScope::new(analyzer);
+        let go = resolve_analyzer::<GoAnalyzer>(analyzer).unwrap();
+        let opened = crate::analyzer::go::native_points::GoNativePointRequest::open_for_file(
+            go,
+            &ProjectFile::new(fixture.project_root(), "main.go"),
+            analyzer.semantic_model_overlay_read().published(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let crate::analyzer::go::native_points::GoNativePointRequestOpen::Ready(request) = opened
+        else {
+            panic!("Go fixture opens a native request")
+        };
+        request.assert_demand_deadline_at_preparation_boundary_for_test("main.go");
+    }
+
+    #[test]
+    #[hardwon(
+        "#9015+#11234: Go batches reuse complete context and preserve or discard memo completion"
+    )]
     fn go_many_call_batch_profile() {
         let source = "package main\nimport \"example.com/app/helper\"\nfunc use() {\n    helper.Target()\n    helper.Target()\n    helper.Target()\n    helper.Target()\n    helper.Target()\n    helper.Target()\n    helper.Target()\n    helper.Target()\n}\n";
         let fixture = AnalyzerFixture::new_for_language(
@@ -4842,6 +5221,7 @@ mod bounded_tests {
                 file.clone(),
                 Arc::from(source),
                 None,
+                &mut brokk_bifrost_analysis::analyzer::reuse_verdict::ReuseVerdict::Content,
             )
         };
         assert_eq!(outcomes.len(), 8);
@@ -4942,6 +5322,52 @@ mod bounded_tests {
                 .expect("retained Go operation")
                 .prepared_file_contexts_for_test(),
             1
+        );
+        batch
+            .request
+            .as_mut()
+            .expect("retained Go operation")
+            .assert_rejected_context_fill_rolls_back_for_test("main.go");
+        // The inner context was independently completed before the outer cut.
+        // A fresh operation must reuse its snapshot and still prepare correctly.
+        let go = resolve_analyzer::<GoAnalyzer>(analyzer).expect("Go fixture analyzer");
+        let hits = batch
+            .request
+            .as_ref()
+            .expect("retained request")
+            .snapshot_hits_for_test();
+        batch.request = None;
+        batch.open_reads = None;
+        let next = crate::analyzer::go::native_points::GoNativePointRequest::open_for_file(
+            go,
+            &ProjectFile::new(fixture.project_root(), "main.go"),
+            analyzer.semantic_model_overlay_read().published(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let crate::analyzer::go::native_points::GoNativePointRequestOpen::Ready(mut next) = next
+        else {
+            panic!("fresh native request must open")
+        };
+        next.assert_rejected_context_fill_rolls_back_for_test("main.go");
+        assert!(
+            next.snapshot_hits_for_test() > hits,
+            "an independently completed inner snapshot remains reusable after the outer cut"
+        );
+        next.assert_file_context_conformance_for_test("main.go");
+        let file = ProjectFile::new(fixture.project_root(), "main.go");
+        let tree = parse_go_tree(source).expect("Go source tree");
+        let site = site_for(&file, source, "helper.Target()", "Target");
+        let answer = next.resolve_definition_with_evidence(
+            brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery {
+                analyzer, file: &file, source, tree: Some(&tree), site: &site,
+                budget: brokk_bifrost_core::analyzer::usages::receiver_analysis::INTERACTIVE_TYPE_LOOKUP_BUDGET,
+                cancellation: None,
+            });
+        assert!(
+            matches!(&answer, BoundedResolution::Complete { value, .. }
+            if value.outcome.status == DefinitionLookupStatus::Resolved),
+            "{answer:?}"
         );
     }
 
@@ -6385,7 +6811,11 @@ func NewWorker() Worker { return Worker{} }
 
             let provider = AnalyzerGoDefinitionProvider::new(
                 go,
-                fixture.analyzer.analyzer().semantic_model_overlay(),
+                fixture
+                    .analyzer
+                    .analyzer()
+                    .semantic_model_overlay_read()
+                    .published(),
             );
             let scope = AnalyzerQueryScope::capturing_read_incompleteness(go);
             for _ in 0..2 {
@@ -6432,7 +6862,11 @@ func NewWorker() Worker { return Worker{} }
             let provider = AnalyzerGoDefinitionProvider::bounded(
                 go,
                 &session,
-                fixture.analyzer.analyzer().semantic_model_overlay(),
+                fixture
+                    .analyzer
+                    .analyzer()
+                    .semantic_model_overlay_read()
+                    .published(),
             );
             let scope = AnalyzerQueryScope::capturing_read_incompleteness(go);
             assert_eq!(
@@ -6453,7 +6887,11 @@ func NewWorker() Worker { return Worker{} }
 
             let mut provider = AnalyzerGoDefinitionProvider::new(
                 go,
-                fixture.analyzer.analyzer().semantic_model_overlay(),
+                fixture
+                    .analyzer
+                    .analyzer()
+                    .semantic_model_overlay_read()
+                    .published(),
             );
             provider.native_budget = ReceiverAnalysisBudget {
                 max_scope_nodes: 0,

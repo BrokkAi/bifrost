@@ -133,6 +133,7 @@ impl DemandInstall for CSharpDemandInstaller {
         let reason = ready.context_identities.named_semantic(
             hash.finish(),
             "csharp_method_applicability_unmodeled",
+            crate::analyzer::resolution::ReasonDeterminism::Unaudited,
             &evidence,
         );
         Ok(ResolutionCompletion::incomplete([
@@ -496,20 +497,13 @@ impl<'store, 'input> DemandRules for CSharpRules<'_, 'store, 'input> {
         let generated = self
             .arena
             .borrow()
-            .generated_base_completion(endpoint, self.session);
+            .generated_base_admission(endpoint, self.session);
         if self.cancellation.is_cancelled() || !self.session.observe_cancellation() {
             return Ok(Read::Cancelled(cancelled_completion()));
         }
         // A generated terminal reuses its owning source route's coverage.
         Ok(Read::ready(match generated {
-            Some((completion, use_base)) => EndpointAdmission::Context(Admission::BaseOwned {
-                completion,
-                base: if use_base {
-                    BaseEligibility::Retain
-                } else {
-                    BaseEligibility::Exclude
-                },
-            }),
+            Some(admission) => EndpointAdmission::Context(admission),
             None => EndpointAdmission::Discover,
         }))
     }
@@ -577,10 +571,10 @@ impl<'store, 'input> DemandRules for CSharpRules<'_, 'store, 'input> {
                 hash.field("selection", &self.ready.inventory.scope_identity());
                 hash.field("compilation", &open.compilation_id.to_le_bytes());
                 let mut evidence = Vec::new();
-                for region in open.regions {
+                for region in open.regions.iter() {
                     hash.field("kind", region.kind.as_bytes());
                     hash.field("region", region.rel_path.as_bytes());
-                    for gap in region.gaps {
+                    for gap in &region.gaps {
                         hash.field("gap_code", gap.code.as_bytes());
                         hash.field("gap_path", gap.path.as_bytes());
                         evidence.push(format!(
@@ -598,6 +592,7 @@ impl<'store, 'input> DemandRules for CSharpRules<'_, 'store, 'input> {
                 let reason = self.ready.context_identities.named_semantic(
                     hash.finish(),
                     "csharp_compilation_usings_incomplete",
+                    crate::analyzer::resolution::ReasonDeterminism::Unaudited,
                     &evidence,
                 );
                 self.external_gaps
@@ -646,6 +641,7 @@ impl<'store, 'input> DemandRules for CSharpRules<'_, 'store, 'input> {
                 let reason = self.ready.context_identities.named_semantic(
                     hash.finish(),
                     "csharp_compilation_usings_incomplete",
+                    crate::analyzer::resolution::ReasonDeterminism::Unaudited,
                     &evidence,
                 );
                 self.external_gaps
@@ -671,6 +667,7 @@ impl<'store, 'input> DemandRules for CSharpRules<'_, 'store, 'input> {
                     let reason = self.ready.context_identities.named_semantic(
                         hash.finish(),
                         "csharp_compilation_usings_incomplete",
+                        crate::analyzer::resolution::ReasonDeterminism::Unaudited,
                         &evidence,
                     );
                     self.external_gaps
@@ -708,10 +705,12 @@ impl<'store, 'input> DemandRules for CSharpRules<'_, 'store, 'input> {
                 source.demand.namespace(),
                 source.demand.spelling()
             );
-            let reason =
-                self.ready
-                    .context_identities
-                    .named_semantic(hash.finish(), label, &evidence);
+            let reason = self.ready.context_identities.named_semantic(
+                hash.finish(),
+                label,
+                crate::analyzer::resolution::ReasonDeterminism::Unaudited,
+                &evidence,
+            );
             OpenHalf::new(ResolutionCompletion::incomplete([
                 ResolutionIncompleteReason::UnsupportedSemantic(reason),
             ]))
@@ -793,9 +792,12 @@ impl HalfRules for CSharpHalf<'_, '_, '_> {
             .entry(placement.compilation_id)
             .or_insert_with(|| {
                 (
-                    placement.project_path.clone().unwrap_or_else(|| {
-                        format!("implicit compilation {}", placement.compilation_id)
-                    }),
+                    super::super::csharp_compilation::framework_qualified_label(
+                        placement.project_path.clone().unwrap_or_else(|| {
+                            format!("implicit compilation {}", placement.compilation_id)
+                        }),
+                        placement.target_framework.as_deref(),
+                    ),
                     HashSet::default(),
                 )
             });
@@ -877,6 +879,7 @@ impl HalfRules for CSharpHalf<'_, '_, '_> {
                         let reason = self.rules.ready.context_identities.named_semantic(
                             hash.finish(),
                             "csharp_alias_cycle",
+                            crate::analyzer::resolution::ReasonDeterminism::Unaudited,
                             "cyclic using alias target",
                         );
                         resolved.insert(
@@ -1158,6 +1161,7 @@ impl HalfRules for CSharpHalf<'_, '_, '_> {
             let reason = self.rules.ready.context_identities.named_semantic(
                 hash.finish(),
                 "csharp_external_unindexed",
+                crate::analyzer::resolution::ReasonDeterminism::Unaudited,
                 &evidence,
             );
             self.rules
@@ -1213,6 +1217,7 @@ impl CSharpHalf<'_, '_, '_> {
         let reason = self.rules.ready.context_identities.named_semantic(
             hash.finish(),
             "csharp_compilation_usings_incomplete",
+            crate::analyzer::resolution::ReasonDeterminism::Unaudited,
             &format!("compilation answers disagree: {ordered:?}"),
         );
         Some(reason)
@@ -1378,6 +1383,7 @@ impl CSharpHalf<'_, '_, '_> {
             let reason = self.rules.ready.context_identities.named_semantic(
                 hash.finish(),
                 "csharp_compilation_usings_incomplete",
+                crate::analyzer::resolution::ReasonDeterminism::Unaudited,
                 &format!(
                     "using target {route} does not settle to one namespace or type: {locations:?}"
                 ),
@@ -2023,11 +2029,12 @@ impl CSharpHalf<'_, '_, '_> {
                 format!("namespace {}", namespace.join("."))
             }
         );
-        let reason =
-            self.rules
-                .ready
-                .context_identities
-                .named_semantic(hash.finish(), label, &evidence);
+        let reason = self.rules.ready.context_identities.named_semantic(
+            hash.finish(),
+            label,
+            crate::analyzer::resolution::ReasonDeterminism::Unaudited,
+            &evidence,
+        );
         let mut gaps = self.rules.using_gaps.borrow_mut();
         if !gaps
             .iter()
@@ -2055,11 +2062,12 @@ impl CSharpHalf<'_, '_, '_> {
         hash.field("source", &self.source.token.get().to_le_bytes());
         hash.field("scope", &scope.get().to_le_bytes());
         hash.field("evidence", evidence.as_bytes());
-        let reason =
-            self.rules
-                .ready
-                .context_identities
-                .named_semantic(hash.finish(), label, evidence);
+        let reason = self.rules.ready.context_identities.named_semantic(
+            hash.finish(),
+            label,
+            crate::analyzer::resolution::ReasonDeterminism::Unaudited,
+            evidence,
+        );
         let gap = (self.source.identity, reason);
         let mut gaps = self.rules.external_gaps.borrow_mut();
         if !gaps.contains(&gap) {
@@ -2293,6 +2301,7 @@ impl CSharpRouteRules<'_, '_, '_, '_> {
             let reason = rules.ready.context_identities.named_semantic(
                 hash.finish(),
                 "OwnerInventoryOpen",
+                crate::analyzer::resolution::ReasonDeterminism::Unaudited,
                 &format!(
                     "{}: the owner has no member scope to read",
                     caller.persisted_relative_path()
@@ -2368,6 +2377,7 @@ impl CSharpRouteRules<'_, '_, '_, '_> {
                     let reason = rules.ready.context_identities.named_semantic(
                         hash.finish(),
                         "csharp_inherited_types_unmodeled",
+                        crate::analyzer::resolution::ReasonDeterminism::Unaudited,
                         &format!(
                             "{}: {} may be inherited by type {}",
                             caller.persisted_relative_path(),
@@ -2416,6 +2426,7 @@ impl CSharpRouteRules<'_, '_, '_, '_> {
         let reason = rules.ready.context_identities.named_semantic(
             hash.finish(),
             "csharp_external_unindexed",
+            crate::analyzer::resolution::ReasonDeterminism::Unaudited,
             &evidence,
         );
         rules
@@ -2587,4 +2598,35 @@ pub fn probe_configuration_admission(
         .ready
         .certified_csharp_view()
         .map(|view| view.is_some())
+}
+
+/// Exercise the raw readers under the certificate built by this operation.
+#[cfg(any(test, feature = "test-support"))]
+pub fn probe_certified_reader_receipt(
+    operation: &SelectedResolutionOperation<'_, '_>,
+    caller: &str,
+) -> Result<usize> {
+    let ready = &operation.ready;
+    let certified = ready
+        .certified_csharp_view()?
+        .expect("certified C# fixture");
+    let mut units = CSharpUnitReader::new(
+        &ready.inventory,
+        ready.snapshot("csharp").expect("C# snapshot"),
+        &certified,
+        &ready.context_identities,
+    )?;
+    let placements = units.placements(caller)?.expect("selected fixture");
+    for placement in &placements {
+        assert!(
+            units
+                .global_usings(
+                    placement,
+                    &CancellationToken::new(),
+                    &ResolutionSession::unbounded(),
+                )?
+                .is_some()
+        );
+    }
+    Ok(placements.len())
 }

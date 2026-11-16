@@ -21,6 +21,7 @@ pub use assignment_facts::python_overwritten_local_candidates;
 pub use assignment_facts::rust_dead_write_macro_sources_by_binding;
 pub use assignment_facts::rust_dead_write_macro_sources_without_read;
 pub use assignment_facts::single_target_overwritten_local_candidates;
+pub use brokk_bifrost_core::analyzer::reuse_verdict;
 
 pub use loop_facts::LoopCandidate;
 pub use loop_facts::LoopCandidates;
@@ -97,6 +98,7 @@ pub mod reference_candidates;
 #[doc(hidden)]
 pub mod relational_frontier;
 pub mod rename;
+pub mod search_pattern;
 // The native engine lands before the first language route so its algebra can
 // be tested independently. Remove this allowance when the Java spike becomes
 // its first non-test caller.
@@ -118,15 +120,22 @@ pub fn whole_workspace_descendants(
     operation(&scope).expect("a descendant index that cannot stop always completes")
 }
 
-/// Preserve inherited stable gaps when descendant evidence is unavailable.
+/// A descendant lookup that was withheld records, in its own receipt, the reason
+/// that withheld it. An incomplete fill has already recorded its reasons on the
+/// current domain chain, so the chain's first reason is recorded here and not
+/// left to be copied into nested scopes when they open.
 #[doc(hidden)]
 pub fn record_descendant_query_failure(analyzer: &dyn IAnalyzer) {
     use crate::analyzer::i_analyzer::QueryReadIncomplete;
-    if analyzer.current_query_read_completion().is_ok() {
-        analyzer.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceUnavailable(
-            "descendant index is incomplete".into(),
-        ));
-    }
+    let reason = analyzer
+        .current_query_read_completion()
+        .err()
+        .unwrap_or_else(|| {
+            QueryReadIncomplete::SemanticEvidenceUnavailable(
+                "descendant index is incomplete".into(),
+            )
+        });
+    analyzer.record_query_incomplete(reason);
     analyzer.record_unattributed_read();
 }
 
@@ -348,6 +357,14 @@ pub use config::RustDependencyApiEvidence;
 pub use config::RustPackageApiArtifact;
 pub use config::RustSelectedTarget;
 pub use config::ensure_global_rayon_pool;
+pub use config::{
+    PythonDeclaredConfigInput, PythonDeclaredConfigInputRole, PythonDeclaredEditableInstallMode,
+    PythonDeclaredEntryMode, PythonDeclaredEntryPoint, PythonDeclaredEnvironmentConfig,
+    PythonDeclaredEnvironmentMode, PythonDeclaredFinderMode, PythonDeclaredImportPathMode,
+    PythonDeclaredInterpreter, PythonDeclaredIsolationMode, PythonDeclaredLaunchSemantics,
+    PythonDeclaredNativeExtensionMode, PythonDeclaredRootRole, PythonDeclaredRootSlot,
+    PythonDeclaredSiteStartupMode, PythonRuntimeArtifactConfig, PythonRuntimeEnvironmentConfig,
+};
 
 pub use fq_name::FqName;
 
@@ -397,6 +414,7 @@ pub use i_analyzer::SearchSymbolCandidates;
 pub use i_analyzer::SearchSymbolPatternBatch;
 pub use i_analyzer::WorkspaceFileIndex;
 pub use i_analyzer::WorkspaceFileIndexCell;
+pub use i_analyzer::WorkspaceFileInventoryCell;
 pub use i_analyzer::enter_product_entry;
 pub use i_analyzer::{OuterRequest, current_outer_request, current_outer_request_or_transient};
 pub use i_analyzer::{
@@ -487,6 +505,8 @@ pub use multi_analyzer::AnalyzerDelegate;
 pub use multi_analyzer::LanguageAnalyzer;
 pub use multi_analyzer::MultiAnalyzer;
 pub use multi_analyzer::is_language_configuration_input;
+pub use multi_analyzer::is_language_signature_input;
+pub use multi_analyzer::language_signature_input_root;
 
 pub(crate) use pool_memo::install_on_dedicated_build_pool;
 pub(crate) use pool_memo::spawn_on_dedicated_build_pool;
@@ -654,7 +674,9 @@ pub mod selected_services;
 #[doc(hidden)]
 pub mod store_support;
 
-pub use brokk_bifrost_core::analyzer::carried_context::CarriedContext;
+pub use brokk_bifrost_core::analyzer::carried_context::{
+    CarriedContext, EvaluationExecution, join_evaluation_verdict,
+};
 #[doc(hidden)]
 pub use brokk_bifrost_core::analyzer::project_reads::without_project_reads;
 pub use i_analyzer::{

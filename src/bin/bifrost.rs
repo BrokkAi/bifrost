@@ -31,12 +31,12 @@ use brokk_bifrost::mcp_registry::{
 };
 use brokk_bifrost::policy::{
     BuiltInPolicyCatalogManifest, BuiltInPolicySelection, BuiltInPolicySelectionRecord,
-    ExplanationCandidate, ExplanationGeneration, ExplanationLimits, ExplanationTarget,
-    FlowExplanationCandidate, HumanRenderColor, HumanRenderDetail, HumanRenderOptions,
-    InlineSuppressionPrefix, MAX_RQLP_SOURCE_BYTES, NearMissCandidates, POLICY_EXIT_CLEAN,
-    POLICY_EXIT_UNRELIABLE, PolicyBaselineDocument, PolicyBaselineOptions, PolicyBaselineSource,
-    PolicyBatchOutcome, PolicyEvaluationDate, PolicyEvaluationInput, PolicyEvaluationOptions,
-    PolicyExecutionStage, PolicyFailOn, PolicyFindingId, PolicyInlineSuppressionOptions,
+    BuiltInRejectionNotice, ExplanationCandidate, ExplanationGeneration, ExplanationLimits,
+    ExplanationTarget, FlowExplanationCandidate, HumanRenderColor, HumanRenderDetail,
+    HumanRenderOptions, MAX_RQLP_SOURCE_BYTES, NearMissCandidates, POLICY_EXIT_CLEAN,
+    POLICY_EXIT_UNRELIABLE, PolicyActivation, PolicyBaselineDocument, PolicyBaselineOptions,
+    PolicyBaselineSource, PolicyBatchOutcome, PolicyEvaluationDate, PolicyEvaluationInput,
+    PolicyEvaluationOptions, PolicyExecutionStage, PolicyFailOn, PolicyFindingId,
     PolicyOnInconclusive, PolicyRangeRequest, PolicyRenderError, PolicyScopeOptions,
     PolicyScopeSource, PolicySourceIdentity, PolicySourceIdentityResolution,
     PolicySuppressionOptions, PolicySuppressionSource, SarifToolIdentity, built_in_policy_catalog,
@@ -129,6 +129,13 @@ enum PolicyColorMode {
 const CLI_STACK_BYTES: usize = 8 * 1024 * 1024;
 
 fn main() -> ExitCode {
+    // Match the cfg of GLOBAL_ALLOCATOR above; Cargo features alone cannot
+    // establish which allocator an embedding binary or test harness selected.
+    #[cfg(not(any(target_env = "msvc", target_os = "android")))]
+    brokk_bifrost_analysis::allocation_size::install_allocation_estimator(|bytes| {
+        // nallocx queries a size class without allocating or requiring a pointer.
+        unsafe { tikv_jemalloc_sys::nallocx(bytes, 0) }
+    });
     let args = env::args().skip(1).collect::<Vec<_>>();
     let result = if let Some(result) = run_portable_runtime_command(&args) {
         result.map_err(|message| CliRunError {
@@ -813,7 +820,7 @@ fn run_inner(
     let mut policy_suppressions_seen = false;
     let mut policy_scope = PolicyScopeOptions::default();
     let mut policy_scope_seen = false;
-    let mut policy_inline_suppressions = PolicyInlineSuppressionOptions::default();
+    let mut policy_inline_suppressions = None;
     let mut policy_inline_suppressions_seen = false;
     let mut policy_baseline = PolicyBaselineOptions::default();
     let mut policy_baseline_seen = false;
@@ -1097,9 +1104,7 @@ fn run_inner(
                 if policy_inline_suppressions_seen {
                     return Err("--inline-suppression-prefix may only be provided once".to_string());
                 }
-                let prefix = InlineSuppressionPrefix::new(&value)
-                    .map_err(|error| format!("Invalid --inline-suppression-prefix: {error}"))?;
-                policy_inline_suppressions = PolicyInlineSuppressionOptions::new(prefix);
+                policy_inline_suppressions = Some(value);
                 policy_inline_suppressions_seen = true;
             }
             "--baseline-file" => {
@@ -1429,9 +1434,12 @@ fn run_inner(
         if !bundle_inputs.is_empty() {
             use_builtin_default = false;
         }
-        let (mut policy_inputs, builtin_selection) =
+        let (mut policy_inputs, builtin_selection, builtin_pack_rejections) =
             if use_builtin_default || !policy_selection.is_empty() {
                 let catalog = built_in_policy_catalog().map_err(|error| error.to_string())?;
+                if use_builtin_default {
+                    refuse_default_run_without_runnable_policies(catalog.document())?;
+                }
                 let effective_selection = if use_builtin_default {
                     BuiltInPolicySelection {
                         packs: catalog
@@ -1461,9 +1469,14 @@ fn run_inner(
                     .into_iter()
                     .map(PolicyEvaluationInput::selected_builtin)
                     .collect::<Vec<_>>();
-                (policy_inputs, builtin_selection)
+                let builtin_pack_rejections = if effective_selection.is_empty() {
+                    Vec::new()
+                } else {
+                    catalog.rejection_notices(&effective_selection)
+                };
+                (policy_inputs, builtin_selection, builtin_pack_rejections)
             } else {
-                (Vec::new(), None)
+                (Vec::new(), None, Vec::new())
             };
         policy_inputs.extend(bundle_inputs);
         policy_inputs.extend(
@@ -1516,6 +1529,7 @@ fn run_inner(
                 require_explicit_schema_versions,
                 sources: tool_sources,
                 builtin_selection,
+                builtin_pack_rejections,
             },
             &policy_inputs,
             retention_budget,
@@ -1829,6 +1843,7 @@ fn run_scan(
     install_semantic_model_packs_for_process()?;
     let catalog = built_in_policy_catalog().map_err(|error| error.to_string())?;
     let document = catalog.document();
+    refuse_default_run_without_runnable_policies(document)?;
     let selection = BuiltInPolicySelection {
         packs: document.packs.iter().map(|pack| pack.id.clone()).collect(),
         ..BuiltInPolicySelection::default()
@@ -1862,6 +1877,7 @@ fn run_scan(
     }
 
     let builtin_selection = Some(BuiltInPolicySelectionRecord::new(catalog, &selected, &[]));
+    let builtin_pack_rejections = catalog.rejection_notices(&selection);
     let policy_inputs = selected
         .into_iter()
         .map(PolicyEvaluationInput::selected_builtin)
@@ -1875,7 +1891,7 @@ fn run_scan(
             evaluation_date,
             suppressions: PolicySuppressionOptions::default(),
             scope: PolicyScopeOptions::default(),
-            inline_suppressions: PolicyInlineSuppressionOptions::default(),
+            inline_suppressions: None,
             baseline: PolicyBaselineOptions::default(),
             accept_current: false,
             diff_base: None,
@@ -1889,6 +1905,7 @@ fn run_scan(
             color,
             require_explicit_schema_versions: false,
             builtin_selection,
+            builtin_pack_rejections,
             sources: Vec::new(),
         },
         &policy_inputs,
@@ -1915,8 +1932,53 @@ fn builtin_pack_witness_lines(
             pack.policies.len()
         ));
     }
+    for rejected in &document.rejected_packs {
+        lines.push(format!(
+            "builtin-policy-pack-rejected {} reason={}: {}",
+            escape_terminal_text(&rejected.pack),
+            rejected.reason.label(),
+            escape_terminal_text(&rejected.message)
+        ));
+    }
+    for rejected in &document.rejected_policies {
+        lines.push(format!(
+            "builtin-policy-rejected {}/{} reason={}: {}",
+            escape_terminal_text(&rejected.pack),
+            escape_terminal_text(&rejected.id),
+            rejected.reason.label(),
+            escape_terminal_text(&rejected.message)
+        ));
+    }
     lines.push(format!("builtin-policy-catalog sha256={digest}"));
     lines
+}
+
+/// Refuse a default run when the loaded packs hold no policy a default
+/// selection runs but the catalog rejected a pack or policy that may have:
+/// the run would evaluate nothing, and its selection error would not say
+/// why (#10941).
+fn refuse_default_run_without_runnable_policies(
+    document: &BuiltInPolicyCatalogManifest,
+) -> Result<(), String> {
+    let runnable = document
+        .packs
+        .iter()
+        .flat_map(|pack| pack.policies.iter())
+        .any(|policy| policy.activation == PolicyActivation::Default);
+    let lost = document
+        .rejected_packs
+        .iter()
+        .filter(|rejected| rejected.reason.may_lose_policies())
+        .map(ToString::to_string)
+        .chain(document.rejected_policies.iter().map(ToString::to_string))
+        .collect::<Vec<_>>();
+    if !runnable && !lost.is_empty() {
+        return Err(format!(
+            "the built-in policy catalog loaded no policy a default run selects and rejected {}",
+            lost.join("; ")
+        ));
+    }
+    Ok(())
 }
 
 /// One stderr summary of what a scan activated, honest about a build that
@@ -2280,7 +2342,7 @@ struct PolicyModeRequest {
     evaluation_date: Option<PolicyEvaluationDate>,
     suppressions: PolicySuppressionOptions,
     scope: PolicyScopeOptions,
-    inline_suppressions: PolicyInlineSuppressionOptions,
+    inline_suppressions: Option<String>,
     baseline: PolicyBaselineOptions,
     accept_current: bool,
     diff_base: Option<String>,
@@ -2295,6 +2357,7 @@ struct PolicyModeRequest {
     require_explicit_schema_versions: bool,
     sources: Vec<String>,
     builtin_selection: Option<BuiltInPolicySelectionRecord>,
+    builtin_pack_rejections: Vec<BuiltInRejectionNotice>,
 }
 
 fn run_policy_mode(
@@ -2321,7 +2384,6 @@ fn run_policy_mode(
     let mut options =
         PolicyEvaluationOptions::with_suppressions(evaluation_date, request.suppressions.clone())
             .with_scope(request.scope.clone())
-            .with_inline_suppressions(request.inline_suppressions.clone())
             .with_baseline(request.baseline.clone())
             .with_required_schema_versions(request.require_explicit_schema_versions)
             .with_fail_on(request.fail_on)
@@ -2339,11 +2401,27 @@ fn run_policy_mode(
     if let Some(selection) = &request.builtin_selection {
         options = options.with_builtin_selection(selection.clone());
     }
-    let evaluation = if request.sources.is_empty() {
+    options = options.with_builtin_pack_rejections(request.builtin_pack_rejections.clone());
+    let (sources, options) = match brokk_bifrost_mcp::scoped_project::prepare_policy_source_request(
+        &request.root,
+        &request.sources,
+        request.inline_suppressions.as_deref(),
+        options,
+    ) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            eprintln!(
+                "bifrost: invalid policy request: {}",
+                escape_terminal_text(&error)
+            );
+            return POLICY_EXIT_UNRELIABLE;
+        }
+    };
+    let evaluation = if sources.is_empty() {
         evaluate_policy_inputs(&request.root, policy_inputs, &options, retention_budget)
             .map_err(|error| error.to_string())
     } else {
-        create_scoped_service(request.root.clone(), &request.sources, None).and_then(|service| {
+        create_scoped_service(request.root.clone(), &sources, None).and_then(|service| {
             service.evaluate_policy_inputs(&request.root, policy_inputs, &options)
         })
     };

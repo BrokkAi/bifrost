@@ -9,6 +9,28 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::analyzer::ProjectFile;
 
+/// Strip a native filesystem prefix, respecting Windows path casing.
+#[cfg(windows)]
+pub fn strip_native_path_prefix(path: &Path, root: &Path) -> Option<PathBuf> {
+    let mut path_components = path.components();
+    for root_component in root.components() {
+        let path_component = path_components.next()?;
+        if !path_component
+            .as_os_str()
+            .eq_ignore_ascii_case(root_component.as_os_str())
+        {
+            return None;
+        }
+    }
+    Some(path_components.as_path().to_path_buf())
+}
+
+/// Strip a native filesystem prefix, respecting Windows path casing.
+#[cfg(not(windows))]
+pub fn strip_native_path_prefix(path: &Path, root: &Path) -> Option<PathBuf> {
+    path.strip_prefix(root).ok().map(Path::to_path_buf)
+}
+
 pub fn normalize_pattern(pattern: &str) -> String {
     pattern.replace('\\', "/")
 }

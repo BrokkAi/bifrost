@@ -347,6 +347,9 @@ pub const JAVA_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("method_invocation", NormalizedKind::Call),
     ("method_reference", NormalizedKind::Call),
     ("object_creation_expression", NormalizedKind::Call),
+    // `this(...)` and `super(...)` chain to another constructor of the same
+    // or the direct superclass type, so each is one constructor call.
+    ("explicit_constructor_invocation", NormalizedKind::Call),
     // The implicit `close` of a try-with-resources statement runs at the
     // construct's own exit, so the statement is the source fact the
     // resource-lifecycle selector names for that release.
@@ -925,9 +928,8 @@ impl StructuralSpec for JavaStructuralSpec {
     /// the classification is a node-type reading with no source-text work:
     /// `new T(x)` is an `object_creation_expression` and `T::f` a
     /// `method_reference`, which names a callable without applying it
-    /// (#1478). `this(x)`/`super(x)` stay unclassified because
-    /// `explicit_constructor_invocation` is not in this adapter's kind table,
-    /// so those sites are not call facts at all.
+    /// (#1478). `this(x)` and `super(x)` are `explicit_constructor_invocation`
+    /// nodes: constructor calls that no `new` spells (#10319).
     fn call_site_facts(
         &self,
         node: Node<'_>,
@@ -935,7 +937,9 @@ impl StructuralSpec for JavaStructuralSpec {
         _context: &CallSiteContext,
     ) -> Option<CallSiteFacts> {
         match node.kind() {
-            "object_creation_expression" => Some(CallSiteFacts::of_kind(CallKind::Constructor)),
+            "object_creation_expression" | "explicit_constructor_invocation" => {
+                Some(CallSiteFacts::of_kind(CallKind::Constructor))
+            }
             "method_reference" => Some(CallSiteFacts::of_kind(CallKind::MethodValue)),
             _ => None,
         }
@@ -1234,6 +1238,17 @@ impl StructuralSpec for JavaStructuralSpec {
                             }
                         }
                     }
+                    "explicit_constructor_invocation" => {
+                        // The `this` or `super` keyword names the callee, as
+                        // the type does for `new T(x)`. The qualifier of
+                        // `outer.super(x)` is the enclosing instance that the
+                        // JVM passes as a hidden leading argument: it is
+                        // neither a written argument nor a receiver, so it
+                        // gets no role (#10319).
+                        if let Some(keyword) = node.child_by_field_name("constructor") {
+                            attach_terminal_callee(sink, keyword, Some(keyword));
+                        }
+                    }
                     "method_reference" => {
                         let mut cursor = node.walk();
                         let children = node.named_children(&mut cursor).collect::<Vec<_>>();
@@ -1466,13 +1481,14 @@ pub fn java_pattern_instanceof(mut pattern: Node<'_>) -> Option<Node<'_>> {
     }
 }
 
-/// A deliberately bounded Java abrupt-completion proof. Finally, break,
-/// continue and loop reasoning require more than a syntactic last statement.
+/// A deliberately bounded Java abrupt-completion proof (JLS 14.22).
+/// Finally and loop completion require more than a syntactic last statement.
 fn java_pattern_guard_is_abrupt(statement: Node<'_>) -> Option<bool> {
     let mut pending = vec![statement];
     while let Some(node) = pending.pop() {
         match node.kind() {
-            "return_statement" | "throw_statement" => {}
+            "return_statement" | "throw_statement" | "break_statement" | "continue_statement"
+            | "yield_statement" => {}
             "block" => {
                 let mut cursor = node.walk();
                 let Some(last) = node
@@ -1502,31 +1518,39 @@ fn java_pattern_guard_is_abrupt(statement: Node<'_>) -> Option<bool> {
     Some(true)
 }
 
-/// Java's definitely-matched visibility rules (JLS 6.3), using structured
-/// control syntax. Unproved alternatives never acquire a binding by byte order.
-pub fn java_pattern_binding_visible(pattern: Node<'_>, focus: Node<'_>) -> Option<bool> {
-    if pattern.has_error() || focus.start_byte() < pattern.end_byte() {
-        return Some(false);
+/// Definitely matched subtrees and statement suffixes for one Java binder.
+/// Unknown suffixes remain separate so semantic reads retain their tri-state
+/// answer, while native publication can reject the entire uncertain binder.
+#[derive(Default)]
+pub struct JavaPatternBindingRegions {
+    pub proven: Vec<std::ops::Range<usize>>,
+    pub unknown: Vec<std::ops::Range<usize>>,
+}
+
+/// Compute Java's definitely-matched regions once (JLS 6.3.1 and 6.3.2).
+/// All walks are iterative; unsupported normal completion stays unknown.
+pub fn java_pattern_binding_regions(pattern: Node<'_>) -> JavaPatternBindingRegions {
+    let mut regions = JavaPatternBindingRegions::default();
+    if pattern.has_error() {
+        return regions;
     }
-    let test = java_pattern_instanceof(pattern);
-    if test.is_none() {
-        // Switch patterns bind only in their selected arm, including its guard.
+    let Some(test) = java_pattern_instanceof(pattern) else {
         let mut owner = pattern.parent();
         while let Some(node) = owner {
             if matches!(node.kind(), "switch_rule" | "switch_block_statement_group") {
-                return Some(java_contains(node, focus));
+                regions.proven.push(pattern.end_byte()..node.end_byte());
+                break;
             }
             if matches!(
                 node.kind(),
                 "block" | "lambda_expression" | "method_declaration"
             ) {
-                return Some(false);
+                break;
             }
             owner = node.parent();
         }
-        return Some(false);
-    }
-    let test = test.expect("instanceof case");
+        return regions;
+    };
     let proves = |condition, outcome| {
         if !java_contains(condition, test) {
             return false;
@@ -1559,86 +1583,61 @@ pub fn java_pattern_binding_visible(pattern: Node<'_>, focus: Node<'_>) -> Optio
         }
         required == outcome
     };
-    let mut ancestor = focus.parent();
+    let mut ancestor = test.parent();
+    let mut suffix_allowed = true;
     while let Some(node) = ancestor {
-        if let Some(left) = node.child_by_field_name("left")
-            && node.kind() == "binary_expression"
-            && node
-                .child_by_field_name("right")
-                .is_some_and(|right| java_contains(right, focus))
+        if node.kind() == "binary_expression"
+            && let (Some(left), Some(right), Some(op)) = (
+                node.child_by_field_name("left"),
+                node.child_by_field_name("right"),
+                node.child_by_field_name("operator"),
+            )
+            && ((op.kind() == "&&" && proves(left, true))
+                || (op.kind() == "||" && proves(left, false)))
         {
-            match node.child_by_field_name("operator").map(|op| op.kind()) {
-                Some("&&") if proves(left, true) => return Some(true),
-                Some("||") if proves(left, false) => return Some(true),
-                _ => {}
-            }
+            regions.proven.push(right.byte_range());
         }
         if let Some(condition) = node.child_by_field_name("condition") {
-            for (field, outcome) in [
-                ("consequence", true),
-                ("alternative", false),
-                ("body", true),
-                ("update", true),
-            ] {
-                if matches!(
-                    node.kind(),
-                    "if_statement" | "ternary_expression" | "while_statement" | "for_statement"
-                ) && node
-                    .child_by_field_name(field)
-                    .is_some_and(|arm| java_contains(arm, focus))
-                    && proves(condition, outcome)
-                {
-                    return Some(true);
+            if matches!(
+                node.kind(),
+                "if_statement" | "ternary_expression" | "while_statement" | "for_statement"
+            ) {
+                for (field, outcome) in [
+                    ("consequence", true),
+                    ("alternative", false),
+                    ("body", true),
+                    ("update", true),
+                ] {
+                    if proves(condition, outcome) {
+                        let mut cursor = node.walk();
+                        for arm in node.children_by_field_name(field, &mut cursor) {
+                            regions.proven.push(arm.byte_range());
+                        }
+                    }
                 }
             }
-        }
-        ancestor = node.parent();
-    }
-    // A negated loop condition may bind a pattern after normal loop exit,
-    // but break/label/finally paths require a flow proof we do not have here.
-    let mut owner = test.parent();
-    while let Some(node) = owner {
-        if matches!(
-            node.kind(),
-            "while_statement" | "do_statement" | "for_statement"
-        ) && node.end_byte() <= focus.start_byte()
-            && node
-                .parent()
-                .is_some_and(|block| block.kind() == "block" && java_contains(block, focus))
-            && node
-                .child_by_field_name("condition")
-                .is_some_and(|condition| proves(condition, false))
-        {
-            return None;
-        }
-        if matches!(
-            node.kind(),
-            "block" | "lambda_expression" | "method_declaration"
-        ) {
-            break;
-        }
-        owner = node.parent();
-    }
-    // An abrupt opposite arm admits the matched binding after the if, in the
-    // same enclosing block. This also covers references inside later lambdas.
-    let mut unproven = false;
-    let mut ancestor = test.parent();
-    while let Some(node) = ancestor {
-        if node.kind() == "if_statement"
-            && node.end_byte() <= focus.start_byte()
-            && node
-                .parent()
-                .is_some_and(|block| block.kind() == "block" && java_contains(block, focus))
-            && let Some(condition) = node.child_by_field_name("condition")
-        {
-            for (field, remaining) in [("consequence", false), ("alternative", true)] {
-                if proves(condition, remaining)
-                    && let Some(arm) = node.child_by_field_name(field)
+            if suffix_allowed
+                && let Some(block) = node.parent().filter(|parent| parent.kind() == "block")
+            {
+                let suffix = node.end_byte()..block.end_byte();
+                if matches!(
+                    node.kind(),
+                    "while_statement" | "do_statement" | "for_statement"
+                ) && proves(condition, false)
                 {
-                    match java_pattern_guard_is_abrupt(arm) {
-                        Some(true) => return Some(true),
-                        None => unproven = true,
-                        Some(false) => {}
+                    regions.unknown.push(suffix.clone());
+                }
+                if node.kind() == "if_statement" {
+                    for (field, remaining) in [("consequence", false), ("alternative", true)] {
+                        if proves(condition, remaining)
+                            && let Some(arm) = node.child_by_field_name(field)
+                        {
+                            match java_pattern_guard_is_abrupt(arm) {
+                                Some(true) => regions.proven.push(suffix.clone()),
+                                None => regions.unknown.push(suffix.clone()),
+                                Some(false) => {}
+                            }
+                        }
                     }
                 }
             }
@@ -1647,11 +1646,43 @@ pub fn java_pattern_binding_visible(pattern: Node<'_>, focus: Node<'_>) -> Optio
             node.kind(),
             "block" | "lambda_expression" | "method_declaration"
         ) {
-            break;
+            suffix_allowed = false;
         }
         ancestor = node.parent();
     }
-    if unproven { None } else { Some(false) }
+    regions
+        .proven
+        .sort_unstable_by_key(|range| (range.start, range.end));
+    let mut merged: Vec<std::ops::Range<usize>> = Vec::new();
+    for range in regions.proven {
+        if let Some(last) = merged.last_mut()
+            && range.start <= last.end
+        {
+            last.end = last.end.max(range.end);
+        } else {
+            merged.push(range);
+        }
+    }
+    regions.proven = merged;
+    regions
+}
+
+/// Semantic reads use the same region geometry as native binder publication.
+pub fn java_pattern_binding_visible(pattern: Node<'_>, focus: Node<'_>) -> Option<bool> {
+    if pattern.has_error() || focus.start_byte() < pattern.end_byte() {
+        return Some(false);
+    }
+    let regions = java_pattern_binding_regions(pattern);
+    let contains = |range: &std::ops::Range<usize>| {
+        range.start <= focus.start_byte() && focus.end_byte() <= range.end
+    };
+    if regions.proven.iter().any(contains) {
+        Some(true)
+    } else if regions.unknown.iter().any(contains) {
+        None
+    } else {
+        Some(false)
+    }
 }
 
 /// The text one plain Java string literal denotes.

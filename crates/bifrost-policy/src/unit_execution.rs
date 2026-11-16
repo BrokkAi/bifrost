@@ -39,6 +39,7 @@ use brokk_bifrost_analysis::analyzer::invalidation::{
 };
 use brokk_bifrost_analysis::analyzer::read_ledger::ReadLedger;
 use brokk_bifrost_analysis::analyzer::read_ledger::{FactSubject, WorkspaceFactFamily};
+use brokk_bifrost_analysis::analyzer::reuse_verdict::{ExecutionCause, ReuseVerdict};
 use brokk_bifrost_analysis::analyzer::semantic::{
     IcfgProvider, SemanticWork, StableDigest, WorkspaceIcfgProvider, type_flow_adapter,
 };
@@ -677,7 +678,7 @@ impl<'a> UnitReuse<'a> {
                 };
                 Some(variant)
             }
-            UnitPartition::Whole => None,
+            UnitPartition::Whole | UnitPartition::Operand { .. } => None,
         };
         let snapshots = self.incremental.publication_snapshots(&reads);
         self.staged.borrow_mut().stage(PolicyUnit::new(
@@ -699,6 +700,7 @@ impl<'a> UnitReuse<'a> {
 /// reads mean the ledger could not attribute every read, which makes the
 /// product unbounded and therefore never publishable -- but the product itself
 /// is still the answer this run computed, and the caller uses it.
+#[cfg(test)]
 pub(crate) fn recompute_unit<T>(
     analyzer: &dyn IAnalyzer,
     cancellation: Option<&CancellationToken>,
@@ -706,7 +708,9 @@ pub(crate) fn recompute_unit<T>(
     run: impl FnOnce() -> T,
 ) -> (T, Option<Vec<ReadKey>>, Duration) {
     let (product, reads, elapsed, _) =
-        recompute_unit_observed(analyzer, cancellation, unit_label, run);
+        recompute_unit_judged(analyzer, cancellation, unit_label, || {
+            (run(), ReuseVerdict::Content)
+        });
     (product, reads, elapsed)
 }
 
@@ -726,14 +730,34 @@ pub(crate) struct ReceiptDependences {
     pub(crate) persistence_refusals: usize,
 }
 
-/// [`recompute_unit`] that also reports why the receipt is unbounded: the
-/// ledger's channels at the end of the execution. A caller that can tell which
-/// execution dependences it explains uses them to judge whether a rerun repeats.
+/// [`recompute_unit`] for tests that read the receipt's channels.
+#[cfg(test)]
 pub(crate) fn recompute_unit_observed<T>(
     analyzer: &dyn IAnalyzer,
     cancellation: Option<&CancellationToken>,
     unit_label: impl FnOnce() -> String,
     run: impl FnOnce() -> T,
+) -> (T, Option<Vec<ReadKey>>, Duration, ReceiptDependences) {
+    recompute_unit_judged(analyzer, cancellation, unit_label, || {
+        (run(), ReuseVerdict::Content)
+    })
+}
+
+/// [`recompute_unit`] that returns the execution's own reuse verdict, which
+/// joins the unit ledger's before the ledger is read, and also reports why the
+/// receipt is unbounded: the ledger's channels at the end of the execution. A
+/// caller that can tell which execution dependences it explains uses them to
+/// judge whether a rerun repeats.
+///
+/// Every production unit boundary calls this body directly. Nested generic
+/// return frames materialize the unit product twice, and on the Go
+/// result-contract selector chain that extra copy is about 23 KiB, which
+/// overflows the 2 MiB Windows test-thread stack (#11474).
+pub(crate) fn recompute_unit_judged<T>(
+    analyzer: &dyn IAnalyzer,
+    cancellation: Option<&CancellationToken>,
+    unit_label: impl FnOnce() -> String,
+    run: impl FnOnce() -> (T, ReuseVerdict),
 ) -> (T, Option<Vec<ReadKey>>, Duration, ReceiptDependences) {
     let unit_label = unit_label();
     let ledger = Arc::new(ReadLedger::new());
@@ -746,7 +770,8 @@ pub(crate) fn recompute_unit_observed<T>(
             Arc::clone(&ledger),
             unit_label.clone(),
         );
-        let product = run();
+        let (product, verdict) = run();
+        ledger.join_verdict(verdict);
         unit_boundary = cancellation.is_some_and(CancellationToken::is_cancelled)
             || analyzer
                 .active_query_cancellation()
@@ -785,6 +810,7 @@ pub(crate) fn recompute_unit_observed<T>(
                 }),
             );
             ledger.mark_execution_dependent();
+            ledger.join_verdict(ReuseVerdict::ExecutionDependent(ExecutionCause::Other));
         }
         (product, started.elapsed())
     };
@@ -1089,6 +1115,12 @@ pub(crate) trait UnitSlice {
     fn refusal_execution_stable(&self, _prefix: &Self::Prefix) -> bool {
         false
     }
+    /// The reuse verdict an execution returned with its product, joined into
+    /// the unit's ledger. A slice whose product carries a query execution's
+    /// verdict returns it; the default is for products no query produced.
+    fn reuse_verdict(&self, _result: &Result<Self::Prefix, Self::Error>) -> ReuseVerdict {
+        ReuseVerdict::Content
+    }
     /// Execute a unit and return its own refusal evidence with the result.
     /// Most slices cannot refuse a semantic ledger. Output overrides this to
     /// return the count from its independent ledger, including error exits.
@@ -1194,16 +1226,17 @@ pub(crate) fn evaluate_reusable_slice_with_state<'a, S: UnitSlice>(
                     matches!(key.partition, UnitPartition::Output { .. }).then(|| {
                         crate::phase_cpu::Scope::new(crate::phase_cpu::Phase::OutputRecompute)
                     });
-                let ((mut result, own_refusals), reads, elapsed, channels) =
-                    recompute_unit_observed(
-                        analyzer,
-                        cancellation,
-                        || format!("policy={} partition={:?}", reuse.policy_id, key.partition),
-                        || {
-                            slice.replay_preparation_reads(analyzer, &seed);
-                            slice.prefix_with_refusals(&seed, allowance)
-                        },
-                    );
+                let ((mut result, own_refusals), reads, elapsed, channels) = recompute_unit_judged(
+                    analyzer,
+                    cancellation,
+                    || format!("policy={} partition={:?}", reuse.policy_id, key.partition),
+                    || {
+                        slice.replay_preparation_reads(analyzer, &seed);
+                        let (result, own_refusals) = slice.prefix_with_refusals(&seed, allowance);
+                        let verdict = slice.reuse_verdict(&result);
+                        ((result, own_refusals), verdict)
+                    },
+                );
                 drop(recompute_cpu);
                 if let Ok(prefix) = &mut result {
                     slice.after_recompute(prefix, &capture, cancellation);
@@ -1301,7 +1334,7 @@ fn charge_shared_slice_budget(
 ) {
     state.0 = state.0.saturating_add(work);
     let mut shared = budgeted.clone();
-    shared.step_outputs.clear();
+    shared.step_outputs = Some(Vec::new());
     state.1 = state.1.saturating_add(&shared);
 }
 
@@ -1360,9 +1393,6 @@ where
         let Some(allowance) = self.remaining(state) else {
             return false;
         };
-        let work = rows.work;
-        let budgeted = &rows.budgeted_work;
-        let below = |used: u64, cap: usize| used < cap as u64;
         // A product must have been complete under its own physical plan caps.
         // The cumulative step-output proof belongs to the final merge.
         if rows
@@ -1376,21 +1406,7 @@ where
         {
             return false;
         }
-        below(
-            work.scanned_files.max(budgeted.import_files_resolved),
-            allowance.max_scanned_files,
-        ) && below(
-            work.scanned_source_bytes,
-            allowance.max_scanned_source_bytes,
-        ) && below(
-            work.fact_nodes.saturating_add(work.examined_references),
-            allowance.max_fact_nodes,
-        ) && below(
-            work.pipeline_rows
-                .max(budgeted.provenance_steps)
-                .max(budgeted.import_edges_resolved),
-            allowance.max_pipeline_rows,
-        )
+        remaining_unit_limits(allowance, &rows.work, &rows.budgeted_work).is_some()
     }
 
     fn capture<'b>(&self, analyzer: &'b dyn IAnalyzer) -> Self::Capture<'b> {
@@ -1409,12 +1425,13 @@ where
 
     fn publishable(&self, rows: &Self::Prefix) -> bool {
         check_exhaustive_rows(rows).is_ok()
-            && !rows.diagnostics.iter().any(|diagnostic| {
-                matches!(
-                    diagnostic.incompleteness,
-                    brokk_bifrost_rql::Incompleteness::Operational(_)
-                )
-            })
+    }
+
+    fn reuse_verdict(&self, result: &Result<Self::Prefix, Self::Error>) -> ReuseVerdict {
+        match result {
+            Ok(rows) => rows.reuse,
+            Err(error) => match *error {},
+        }
     }
 
     fn failure(&self, error: Self::Error, _products: Vec<Self::Prefix>) -> Self::Output {
@@ -1434,7 +1451,13 @@ where
         merged.apply_result_limit(self.query.limit);
         if skipped > 0 {
             merged.mark_truncated();
-            push_skipped_unit_diagnostic(&mut merged.diagnostics, skipped);
+            push_skipped_unit_diagnostic(
+                &mut merged.diagnostics,
+                skipped,
+                self.execution.limits,
+                &merged.work,
+                &merged.budgeted_work,
+            );
         }
         merged
     }
@@ -1522,6 +1545,10 @@ impl UnitSlice for OperandProbeSlice<'_> {
             rows.diagnostics
                 .push(brokk_bifrost_rql::CodeQueryDiagnostic::new(
                     brokk_bifrost_rql::CodeQueryDiagnostic {
+                        has_non_utf8_refusal: false,
+                        refusal_sites: Default::default(),
+                        call_relation_facts: None,
+                        uses_omissions: Vec::new(),
                         incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                         related: Vec::new(),
                         source: None,
@@ -1565,6 +1592,12 @@ impl UnitSlice for OperandProbeSlice<'_> {
     }
     fn encode(&self, probe: &Self::Prefix) -> PolicyUnitProduct {
         PolicyUnitProduct::Prefix(serde_json::to_string(&probe.rows).expect("probe rows serialize"))
+    }
+    fn reuse_verdict(&self, result: &Result<Self::Prefix, Self::Error>) -> ReuseVerdict {
+        match result {
+            Ok(probe) => probe.rows.reuse,
+            Err(error) => match *error {},
+        }
     }
     fn charge(&self, state: &mut Self::BudgetState, probe: &Self::Prefix) {
         charge_shared_slice_budget(state, probe.rows.work, &probe.rows.budgeted_work);
@@ -1700,6 +1733,13 @@ impl UnitSlice for IntersectPrefixSlice<'_> {
         )
     }
 
+    fn reuse_verdict(&self, result: &Result<Self::Prefix, Self::Error>) -> ReuseVerdict {
+        match result {
+            Ok(prefix) => prefix.reuse,
+            Err(error) => match *error {},
+        }
+    }
+
     fn charge(&self, state: &mut Self::BudgetState, prefix: &Self::Prefix) {
         charge_shared_slice_budget(state, prefix.work, &prefix.budgeted_work);
     }
@@ -1711,24 +1751,7 @@ impl UnitSlice for IntersectPrefixSlice<'_> {
         if prefix.reached_limit(self.query, &allowance).is_some() {
             return false;
         }
-        let work = prefix.work;
-        let budgeted = &prefix.budgeted_work;
-        let below = |used: u64, cap: usize| used < cap as u64;
-        below(
-            work.scanned_files.max(budgeted.import_files_resolved),
-            allowance.max_scanned_files,
-        ) && below(
-            work.scanned_source_bytes,
-            allowance.max_scanned_source_bytes,
-        ) && below(
-            work.fact_nodes.saturating_add(work.examined_references),
-            allowance.max_fact_nodes,
-        ) && below(
-            work.pipeline_rows
-                .max(budgeted.provenance_steps)
-                .max(budgeted.import_edges_resolved),
-            allowance.max_pipeline_rows,
-        )
+        remaining_unit_limits(allowance, &prefix.work, &prefix.budgeted_work).is_some()
     }
 
     fn capture<'a>(&self, analyzer: &'a dyn IAnalyzer) -> Self::Capture<'a> {
@@ -1765,6 +1788,10 @@ impl UnitSlice for IntersectPrefixSlice<'_> {
     fn publishable(&self, prefix: &Self::Prefix) -> bool {
         prefix.reads_closed
             && prefix.completion == brokk_bifrost_rql::CodeQueryCompletion::Complete
+            && prefix
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.incompleteness.execution_cause().is_none())
             && prefix.encode_product_json(&self.query.plan).is_ok()
     }
 
@@ -1818,6 +1845,13 @@ pub(crate) fn query_slicing_widen_reason(query: &CodeQuery) -> Option<QuerySlici
 
 fn policy_partitioning(query: &CodeQuery) -> PlanPartitioning {
     let partitioning = PlanPartitioning::classify_for_prefix(&query.plan);
+    if !matches!(partitioning, PlanPartitioning::Whole(_))
+        && reachability_units::has_operator(&query.plan)
+    {
+        return PlanPartitioning::Prefix {
+            cut: brokk_bifrost_rql::query::IntersectCut::CallReachability,
+        };
+    }
     if let PlanPartitioning::Prefix { cut } = partitioning {
         // Every operand must produce the SAME single Declaration or Occurrence
         // kind, so the set operator compares rows of one identity space. The
@@ -1933,6 +1967,22 @@ pub(crate) fn sliced_query_units(
     let seed_files = plan_seed_files(&query.plan, execution.workspace_files);
     attempt.enumerated(seed_files.len());
     let inputs = incremental.inputs();
+    if matches!(
+        policy_partitioning(query),
+        PlanPartitioning::Prefix {
+            cut: brokk_bifrost_rql::query::IntersectCut::CallReachability,
+        }
+    ) {
+        return reachability_units::sliced(
+            policy,
+            query,
+            reuse,
+            execution,
+            partition,
+            attempt,
+            &seed_files,
+        );
+    }
 
     let prefix_digests = match policy_partitioning(query) {
         PlanPartitioning::Prefix { cut } => {
@@ -2102,9 +2152,20 @@ pub(crate) fn sliced_query_units(
             // probes that used up the physical limits exactly skip no unit,
             // yet leave no room for the continuation.
             if skipped > 0 {
-                push_skipped_unit_diagnostic(&mut merged.diagnostics, skipped);
+                push_skipped_unit_diagnostic(
+                    &mut merged.diagnostics,
+                    skipped,
+                    execution.limits,
+                    &budget_state.0,
+                    &budget_state.1,
+                );
             } else if budget_exhausted {
-                push_unit_budget_diagnostic(&mut merged.diagnostics);
+                push_unit_budget_diagnostic(
+                    &mut merged.diagnostics,
+                    execution.limits,
+                    &budget_state.0,
+                    &budget_state.1,
+                );
             }
             if cancelled {
                 brokk_bifrost_rql::fold_query_read_incompleteness(
@@ -2133,6 +2194,10 @@ pub(crate) fn sliced_query_units(
         )?;
         for probe in probe_rows {
             merged.work = merged.work.saturating_add(probe.work);
+            merged.budgeted_work.admission = merged
+                .budgeted_work
+                .admission
+                .saturating_add(probe.budgeted_work.admission);
             merged.budgeted_work.provenance_steps = merged
                 .budgeted_work
                 .provenance_steps
@@ -2257,16 +2322,17 @@ fn fold_unit_execution_state(
 }
 
 /// Truncation prevents a partition from representing its complete rows.
-/// Diagnostics are additive; execution dependence is checked by its ledger.
+/// Deterministic diagnostics are additive; operational causes cannot authorize replay.
 pub(super) fn check_exhaustive_rows(rows: &UnitExecutionResult) -> Result<(), WidenReason> {
-    if rows.truncated {
+    // A unit that stopped or was invalid before it counted any step has no
+    // per-step counts to store, so it is not a product.
+    if rows.truncated || rows.budgeted_work.step_outputs.is_none() {
         return Err(WidenReason::UnitNotExhaustive);
     }
-    if rows
-        .diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.code.is_execution_state())
-    {
+    if rows.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code.is_execution_state()
+            || diagnostic.incompleteness.execution_cause().is_some()
+    }) {
         return Err(WidenReason::UnitDiagnostics);
     }
     Ok(())
@@ -2281,6 +2347,252 @@ mod cache_fill_tests {
     use brokk_bifrost_cpp_analysis::CppAnalyzer;
     use brokk_bifrost_rql::merge_unit_rows;
     use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon(
+        "5849600a4049: eager route prefill made structural-only Rust policies derive crate routes"
+    )]
+    fn rust_route_prefill_cold_and_warm_unit_slices_agree() {
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname='slice_routes'\nversion='0.1.0'\nedition='2021'\n",
+            )
+            .file("src/lib.rs", "pub fn first() {}\npub fn second() {}\n")
+            .build();
+        let workspace = fixture.certified_workspace_analyzer(Default::default());
+        let analyzer = workspace.analyzer();
+        let files = analyzer.analyzed_files();
+        let file = files
+            .iter()
+            .find(|file| file.rel_path() == std::path::Path::new("src/lib.rs"))
+            .unwrap();
+        let branch = serde_json::json!({"languages": ["rust"], "match": {"kind": "function"}});
+        let query =
+            CodeQuery::from_json(&serde_json::json!({"intersect": [branch.clone(), branch]}))
+                .unwrap();
+        let limits = CodeQueryExecutionLimits::default();
+        let flow = brokk_bifrost_flow::FlowWorkspaceState::default();
+        let execution = UnitQueryExecution {
+            analyzer,
+            flow_state: (&flow).into(),
+            workspace: Some(&workspace),
+            cancellation: None,
+            limits,
+            depth_opt_in: false,
+            workspace_files: &files,
+            subject_batch: None,
+        };
+        for name in [
+            "FileQuerySlice",
+            "OperandProbeSlice",
+            "IntersectPrefixSlice",
+        ] {
+            // A fresh outer scope owns a cold route memo for this slice.
+            let _outer = AnalyzerQueryScope::new(analyzer);
+            let mut cold = None;
+            for _ in 0..2 {
+                let ledger = Arc::new(brokk_bifrost_analysis::analyzer::ReadLedger::new());
+                let _reads = AnalyzerQueryScope::with_read_ledger(analyzer, ledger.clone());
+                let capture = AnalyzerQueryScope::capturing_read_incompleteness(analyzer);
+                let answer = match name {
+                    "FileQuerySlice" => {
+                        let slice = FileQuerySlice {
+                            query: &query,
+                            execution: &execution,
+                            execute: |(seed, allowance): (
+                                &ProjectFile,
+                                CodeQueryExecutionLimits,
+                            )| {
+                                execute_code_query_unit(
+                                    analyzer,
+                                    &flow,
+                                    Some(&workspace),
+                                    &query,
+                                    allowance,
+                                    None,
+                                    CodeQueryExecutionScope::for_seed_files(
+                                        std::slice::from_ref(seed),
+                                        &files,
+                                    ),
+                                )
+                            },
+                        };
+                        let rows = slice.prefix(&file, limits).unwrap();
+                        serde_json::json!({"rows": rows.rows, "completion": rows.completion, "diagnostics": rows.diagnostics})
+                    }
+                    "OperandProbeSlice" => {
+                        let slice = OperandProbeSlice {
+                            query: &query,
+                            execution: &execution,
+                        };
+                        let rows = slice.prefix(file, limits).unwrap().rows;
+                        serde_json::json!({"rows": rows.rows, "completion": rows.completion, "diagnostics": rows.diagnostics})
+                    }
+                    "IntersectPrefixSlice" => {
+                        let slice = IntersectPrefixSlice {
+                            query: &query,
+                            execution: &execution,
+                            seeds: &files,
+                        };
+                        let prefix = slice.prefix(file, limits).unwrap();
+                        let rows = slice.suffix(vec![prefix], 0);
+                        let completion = rows.completion();
+                        serde_json::json!({"items": rows.items, "completion": completion, "diagnostics": rows.diagnostics})
+                    }
+                    _ => unreachable!(),
+                };
+                let incomplete = format!("{:?}", capture.captured_read_incompleteness());
+                let reads = ledger
+                    .publishable_keys()
+                    .unwrap_or_else(|| panic!("{name} must publish: {incomplete}"));
+                assert!(!reads.is_empty(), "{name} must retain its structural reads");
+                let rust = brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<
+                    brokk_bifrost_rust_analysis::analyzer::rust::RustAnalyzer,
+                >(analyzer)
+                .unwrap();
+                let host = rust.derivations().unwrap();
+                for family in [
+                    "derivation:rust_broad_file_units:v1",
+                    "derivation:rust_unit_routes:v1",
+                ] {
+                    let counters = host.counters(
+                        brokk_bifrost_analysis::analyzer::semantic::derivation::DerivationKindId(
+                            family,
+                        ),
+                    );
+                    assert_eq!(counters.recomputed, 0, "{name}: {family}: {counters:?}");
+                    assert_eq!(
+                        counters.current_hits + counters.verified_unchanged + counters.unavailable,
+                        0,
+                        "{name}: {family}: {counters:?}"
+                    );
+                }
+                let result = (answer, incomplete);
+                if let Some(cold) = &cold {
+                    assert_eq!(cold, &result, "{name} cold/warm");
+                } else {
+                    cold = Some(result);
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon("#11825: optional route preparation made structural overlay queries incomplete")]
+    fn rust_route_prefill_keeps_structural_overlay_complete_and_route_use_typed() {
+        use brokk_bifrost_analysis::analyzer::{OverlayProject, resolve_analyzer};
+        use brokk_bifrost_rust_analysis::RustAnalyzer;
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname='overlay_routes'\nversion='0.1.0'\nedition='2021'\n",
+            )
+            .file("src/lib.rs", "pub fn base() {}\n")
+            .build();
+        let workspace = fixture.certified_workspace_analyzer(Default::default());
+        let base = resolve_analyzer::<RustAnalyzer>(workspace.analyzer()).unwrap();
+        for (source, topology_kept) in [
+            ("pub fn changed() {}\n", true),
+            (
+                "pub mod nested { pub fn added() {} }\npub fn changed() {}\n",
+                false,
+            ),
+        ] {
+            let overlay = OverlayProject::new(fixture.project_dyn());
+            let file = fixture.file("src/lib.rs");
+            assert!(overlay.set(file.abs_path(), source.to_owned()));
+            let rust = base.clone_with_project(Arc::new(overlay.snapshot()));
+            let analyzer: &dyn IAnalyzer = &rust;
+            let files = vec![file.clone()];
+            let query = CodeQuery::from_json(&serde_json::json!({
+                "languages": ["rust"], "match": {"kind": "function", "name": "changed"},
+            }))
+            .unwrap();
+            let flow = brokk_bifrost_flow::FlowWorkspaceState::default();
+            let limits = CodeQueryExecutionLimits::default();
+            let execution = UnitQueryExecution {
+                analyzer,
+                flow_state: (&flow).into(),
+                workspace: Some(&workspace),
+                cancellation: None,
+                limits,
+                depth_opt_in: false,
+                workspace_files: &files,
+                subject_batch: None,
+            };
+            let _outer = AnalyzerQueryScope::new(analyzer);
+            let execute = |(seed, allowance): (&ProjectFile, CodeQueryExecutionLimits)| {
+                execute_code_query_unit(
+                    analyzer,
+                    &flow,
+                    Some(&workspace),
+                    &query,
+                    allowance,
+                    None,
+                    CodeQueryExecutionScope::for_seed_files(std::slice::from_ref(seed), &files),
+                )
+            };
+            {
+                let structural = FileQuerySlice {
+                    query: &query,
+                    execution: &execution,
+                    execute: &execute,
+                };
+                let capture = structural.capture(analyzer);
+                let mut rows = structural.prefix(&&file, limits).unwrap();
+                structural.after_recompute(&mut rows, &capture, None);
+                assert_eq!(
+                    rows.rows.len(),
+                    1,
+                    "the changed buffer must supply the structural row"
+                );
+                assert_eq!(
+                    rows.completion,
+                    brokk_bifrost_rql::CodeQueryCompletion::Complete,
+                    "{:?}",
+                    rows.diagnostics
+                );
+                assert!(capture.captured_read_incompleteness().is_empty());
+            }
+            let consuming = FileQuerySlice {
+                query: &query,
+                execution: &execution,
+                execute: |(seed, allowance): (&ProjectFile, CodeQueryExecutionLimits)| {
+                    // Test classification is a real route consumer of this policy unit.
+                    if let Err(reason) = analyzer.file_is_test_only(seed) {
+                        analyzer.record_query_incomplete(reason);
+                    }
+                    execute((seed, allowance))
+                },
+            };
+            let capture = consuming.capture(analyzer);
+            let mut rows = consuming.prefix(&&file, limits).unwrap();
+            consuming.after_recompute(&mut rows, &capture, None);
+            if topology_kept {
+                assert_eq!(
+                    rows.completion,
+                    brokk_bifrost_rql::CodeQueryCompletion::Complete,
+                    "{:?}",
+                    rows.diagnostics
+                );
+                assert!(rows.diagnostics.is_empty(), "{:?}", rows.diagnostics);
+                assert!(capture.captured_read_incompleteness().is_empty());
+            } else {
+                assert_ne!(
+                    rows.completion,
+                    brokk_bifrost_rql::CodeQueryCompletion::Complete
+                );
+                assert!(
+                    rows.diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic.message.contains("RustMembershipOverlaid")),
+                    "{:?}",
+                    rows.diagnostics
+                );
+            }
+        }
+    }
 
     #[test]
     fn merged_union_rows_reach_the_root_result_cap_across_seed_files() {
@@ -2457,7 +2769,11 @@ mod cache_fill_tests {
                 // this partial crate, which is not a proof of "production".
                 for file in &files {
                     use brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer;
-                    assert!(!analyzer.file_is_test_only(file));
+                    assert!(
+                        !analyzer
+                            .file_is_test_only(file)
+                            .expect("partial routes retain their answer")
+                    );
                 }
                 rows
             },
@@ -2731,7 +3047,7 @@ mod field_slot_verification_tests {
         );
         let policy = registry.policies().next().expect("policy");
         let old_inputs =
-            WorkspaceUnitInputs::of(&base, None, None).with_epoch_before_8837(&base, None);
+            WorkspaceUnitInputs::of(&base, None, None).with_previous_epoch(&base, None);
         let partition = UnitPartition::AssertFile {
             language: Language::CSharp,
             rel_path: "app.cs".into(),
@@ -2746,6 +3062,7 @@ mod field_slot_verification_tests {
             old_key.clone(),
             Some(brokk_bifrost_analysis::gitblob::ParseVariant::Empty),
             PolicyUnitProduct::AssertFile(AssertFileProduct {
+                retention: crate::units::AssertFileRetention::None,
                 findings: Vec::new(),
                 unconcluded: Vec::new(),
                 row_completions: Vec::new(),
@@ -3133,6 +3450,7 @@ mod field_slot_verification_tests {
                     );
                 }
                 PolicyUnitProduct::AssertFile(AssertFileProduct {
+                    retention: crate::units::AssertFileRetention::None,
                     findings: Vec::new(),
                     unconcluded: Vec::new(),
                     row_completions: Vec::new(),
@@ -3562,3 +3880,8 @@ mod fresh_refusal_tests {
         assert!(!attempt.refused_only_for_answer_content());
     }
 }
+
+#[cfg(test)]
+mod call_reachability_operand_tests;
+
+mod reachability_units;

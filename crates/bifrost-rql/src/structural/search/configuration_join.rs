@@ -372,8 +372,12 @@ pub(super) fn execute(
         diagnostics.push(QueryExecutionState::diagnostic(state.analyzer, cross_domain_diagnostic(
             CodeQueryDiagnosticCode::CrossDomainDocumentIncomplete,
             CodeQueryDiagnosticImpact::Incomplete,
-            format!(
-                "configuration_code retained no negative claim for incomplete inputs: {incomplete_reasons:?}"
+            brokk_bifrost_core::bounded_output::bounded_diagnostic_items(
+                format_args!(
+                    "configuration_code retained no negative claim for incomplete inputs: {incomplete_reasons:?}"
+                ),
+                format_args!("configuration_code retained no negative claim for incomplete inputs"),
+                incomplete_reasons.iter(),
             ),
         ), (relation.absence && (code.is_truncated() || configuration.is_truncated())).then_some(DerivationExecutionCause::Budget)));
     }

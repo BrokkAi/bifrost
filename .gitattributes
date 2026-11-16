@@ -230,3 +230,7 @@ crates/bifrost-core/migrations/cache/0233-policy-unit-typed-partition.sql text e
 
 schemas/semantic-model-pack-v31.schema.json text eol=lf
 schemas/semantic-model-compiled-manifest-v31.schema.json text eol=lf
+
+# Cache-identity lever token files (#11570): each line names one change, and two
+# branches that each add a line must keep both without a conflict.
+crates/*/levers/*.tokens merge=union

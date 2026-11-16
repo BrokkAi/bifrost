@@ -1197,6 +1197,21 @@ pub enum DependencyDiscoveryInformationalEvidence {
     /// language present in the workspace, and whether the workspace selects
     /// it. Not selecting a pack is an answer, not a discovery failure.
     StandardLibraryPack(StandardLibraryPackExpectation),
+    /// The lowest toolchain release a workspace declares when discovery did
+    /// not observe its toolchain. Standard-library packs whose requirements
+    /// admit every release from the floor activate as approximate.
+    ToolchainFloor(ToolchainFloorExpectation),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolchainFloorExpectation {
+    pub language: brokk_bifrost_core::analyzer::model::Language,
+    /// The manifest ecosystem of the standard-library packs.
+    pub pack_ecosystem: &'static str,
+    pub toolchain: &'static str,
+    pub floor: semver::Version,
+    /// No release of the toolchain reaches this version.
+    pub ceiling: semver::Version,
 }
 
 /// The standard-library semantic pack Bifrost's activation contract expects
@@ -1298,8 +1313,15 @@ impl StandardLibraryPackExpectation {
     }
 }
 
+/// A named boundary that prevented discovery from observing its inputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DependencyDiscoveryIncompleteReason {
+    GenerationListingUnavailable,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DependencyDiscoveryOutcome {
+    pub incomplete_reason: Option<DependencyDiscoveryIncompleteReason>,
     pub dependencies: Vec<ResolvedDependency>,
     pub diagnostics: Vec<DependencyPackDiagnostic>,
     pub suppressed_diagnostics: SuppressedDiagnostics,
@@ -1309,8 +1331,27 @@ pub struct DependencyDiscoveryOutcome {
 }
 
 impl DependencyDiscoveryOutcome {
+    pub fn generation_listing_unavailable(
+        cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+    ) -> Self {
+        let mut outcome = Self::complete(Vec::new());
+        outcome.complete = false;
+        outcome.cancelled = cancellation.is_cancelled();
+        outcome.incomplete_reason =
+            Some(DependencyDiscoveryIncompleteReason::GenerationListingUnavailable);
+        outcome.diagnostics.push(DependencyPackDiagnostic {
+            severity: DependencyPackDiagnosticSeverity::Error,
+            code: "discovery.generation_listing_unavailable".into(),
+            dependency_id: None,
+            location: None,
+            message: "This generation has no captured workspace listing; rebuild the analyzer before dependency discovery".into(),
+        });
+        outcome
+    }
+
     pub fn complete(dependencies: Vec<ResolvedDependency>) -> Self {
         Self {
+            incomplete_reason: None,
             profile: DependencyDiscoveryProfile {
                 metadata_inputs_considered: 0,
                 dependencies_resolved: dependencies.len(),
@@ -1331,6 +1372,7 @@ impl DependencyDiscoveryOutcome {
         profile: DependencyDiscoveryProfile,
     ) -> Self {
         Self {
+            incomplete_reason: None,
             dependencies: Vec::new(),
             diagnostics,
             suppressed_diagnostics,
@@ -1366,8 +1408,65 @@ impl DependencyDiscoveryOutcome {
                 DependencyDiscoveryInformationalEvidence::StandardLibraryPack(expectation) => {
                     Some(expectation)
                 }
-                DependencyDiscoveryInformationalEvidence::CppMissingWorkspaceSources { .. } => None,
+                DependencyDiscoveryInformationalEvidence::CppMissingWorkspaceSources { .. }
+                | DependencyDiscoveryInformationalEvidence::ToolchainFloor(_) => None,
             })
+    }
+
+    /// The standard-library packs this discovery requests without exact
+    /// toolchain evidence, as activation expectations for `ecosystem`.
+    pub fn approximate_standard_libraries(
+        &self,
+        ecosystem: &str,
+    ) -> impl Iterator<Item = crate::analyzer::semantic_model::ApproximateSemanticModelExpectation>
+    {
+        use crate::analyzer::semantic_model::{
+            ApproximateSemanticModelExpectation, ApproximateStandardLibrarySelection,
+        };
+        use brokk_bifrost_core::analyzer::model::Language;
+        self.profile
+            .informational_evidence
+            .iter()
+            .filter_map(move |evidence| match evidence {
+                DependencyDiscoveryInformationalEvidence::StandardLibraryPack(expectation)
+                    if expectation.approximate =>
+                {
+                    Some(ApproximateSemanticModelExpectation {
+                        toolchain: (expectation.language == Language::Rust)
+                            .then(|| "rust".to_owned()),
+                        language: expectation.language.config_label().to_owned(),
+                        ecosystem: ecosystem.to_owned(),
+                        selection: ApproximateStandardLibrarySelection::Pack(
+                            expectation.pack_id.to_owned(),
+                        ),
+                    })
+                }
+                DependencyDiscoveryInformationalEvidence::ToolchainFloor(floor) => {
+                    Some(ApproximateSemanticModelExpectation {
+                        toolchain: None,
+                        language: floor.language.config_label().to_owned(),
+                        ecosystem: ecosystem.to_owned(),
+                        selection: ApproximateStandardLibrarySelection::ToolchainFloor {
+                            pack_ecosystem: floor.pack_ecosystem.to_owned(),
+                            toolchain: floor.toolchain.to_owned(),
+                            floor: floor.floor.clone(),
+                            ceiling: floor.ceiling.clone(),
+                        },
+                    })
+                }
+                DependencyDiscoveryInformationalEvidence::StandardLibraryPack(_)
+                | DependencyDiscoveryInformationalEvidence::CppMissingWorkspaceSources { .. } => {
+                    None
+                }
+            })
+    }
+
+    /// Record the toolchain floor the workspace declares. Like a pack
+    /// expectation, it never changes completeness.
+    pub fn expect_toolchain_floor(&mut self, floor: ToolchainFloorExpectation) {
+        self.profile.informational_evidence.push(
+            DependencyDiscoveryInformationalEvidence::ToolchainFloor(floor),
+        );
     }
 
     /// Record one standard-library pack expectation. It never changes
@@ -1450,6 +1549,9 @@ pub enum ExternalDiscoveryRead {
     Environment {
         name: Box<str>,
         value: Option<std::ffi::OsString>,
+        /// The process directory used to resolve a relative environment path.
+        /// Ephemeral only; durable acquisition records retain its hash.
+        working_directory: Option<std::path::PathBuf>,
     },
     Unverifiable(UnverifiableDiscoveryRead),
 }
@@ -1476,14 +1578,16 @@ impl ExternalDiscoveryRead {
     /// Check a file key without reading beyond the original byte budget.
     pub fn still_matches(&self) -> bool {
         match self {
-            Self::AbsentFile { absolute_path } => !absolute_path.exists(),
+            Self::AbsentFile { absolute_path } => std::fs::metadata(absolute_path)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
             Self::File {
                 absolute_path,
                 content,
                 size,
             } => {
                 use std::io::Read;
-                let Ok(file) = std::fs::File::open(absolute_path) else {
+                let Ok(file) = brokk_bifrost_core::content_digest::open_regular_file(absolute_path)
+                else {
                     return false;
                 };
                 let mut bytes = Vec::new();
@@ -1497,7 +1601,16 @@ impl ExternalDiscoveryRead {
                 bytes.len() as u64 == *size
                     && crate::analyzer::semantic::ids::StableDigest::sha256(&bytes) == *content
             }
-            Self::Environment { name, value } => std::env::var_os(name.as_ref()) == *value,
+            Self::Environment {
+                name,
+                value,
+                working_directory,
+            } => {
+                std::env::var_os(name.as_ref()) == *value
+                    && working_directory.as_ref().is_none_or(|directory| {
+                        std::env::current_dir().is_ok_and(|current| current == *directory)
+                    })
+            }
             Self::OverBudgetFile { .. } | Self::Unverifiable(_) => false,
         }
     }
@@ -1559,12 +1672,19 @@ impl DependencyDiscoveryEvidence {
                     hash.field("path", path(absolute_path).as_bytes());
                     hash.field("size", &size.to_be_bytes());
                 }
-                ExternalDiscoveryRead::Environment { name, value } => {
+                ExternalDiscoveryRead::Environment {
+                    name,
+                    value,
+                    working_directory,
+                } => {
                     hash.field("kind", b"environment");
                     hash.field("name", name.as_bytes());
                     hash.field("present", &[value.is_some() as u8]);
                     if let Some(value) = value {
                         hash.field("value", value.to_string_lossy().as_bytes());
+                    }
+                    if let Some(directory) = working_directory {
+                        hash.field("working-directory", path(directory).as_bytes());
                     }
                 }
                 ExternalDiscoveryRead::Unverifiable(reason) => {
@@ -1767,6 +1887,45 @@ pub fn retained_discovery_verdict(
             RetainedDiscoveryVerdict::Declared
         }
         Some(_) => RetainedDiscoveryVerdict::Undeclared,
+    }
+}
+
+/// A declared dependency is indexed only when its own package is active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeclaredDependencyVerdict {
+    Undeclared,
+    Truncated,
+    DeclaredIndexed,
+    DeclaredUnindexed,
+}
+
+/// Classify a dependency path using retained declarations and package activation.
+/// The separator describes a module/load-path value, not source syntax.
+pub fn declared_dependency_verdict(
+    evidence: Option<&DependencyDiscoveryEvidence>,
+    path: &str,
+    separator: char,
+    package_active: impl Fn(&str) -> bool,
+) -> DeclaredDependencyVerdict {
+    let Some(evidence) = evidence else {
+        return DeclaredDependencyVerdict::Undeclared;
+    };
+    if evidence.truncated() {
+        return DeclaredDependencyVerdict::Truncated;
+    }
+    let mut prefix = path;
+    loop {
+        if evidence.declared_modules.contains(prefix) {
+            return if package_active(prefix) {
+                DeclaredDependencyVerdict::DeclaredIndexed
+            } else {
+                DeclaredDependencyVerdict::DeclaredUnindexed
+            };
+        }
+        let Some((head, _)) = prefix.rsplit_once(separator) else {
+            return DeclaredDependencyVerdict::Undeclared;
+        };
+        prefix = head;
     }
 }
 

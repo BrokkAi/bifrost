@@ -978,6 +978,165 @@ fn kotlin_source_alias_parent_closes_in_selected_native_hierarchy() {
 }
 
 #[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#12948: a forwarded type parameter bound to a nameless declaration"
+)]
+fn java_forwarded_type_parameter_declaration_range_finds_its_binding_target() {
+    use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_analysis::analyzer::resolution::{
+        LoweredSemanticRole, SelectedFactOperationBlueprintConstruction,
+        SelectedResolutionContextValidationOutcome, SelectedSemanticLocator,
+    };
+    use brokk_bifrost_analysis::analyzer::store::resolution_lexical::SelectedSemanticLookupOutcome;
+    use brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_demand::JvmForwardOperationContext;
+    use brokk_bifrost_analysis::analyzer::store::resolution_operation::*;
+    use brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionLanguage;
+    use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::TreeSitterAnalyzer;
+    use brokk_bifrost_core::analyzer::Language;
+    use brokk_bifrost_core::analyzer::resolution_facts::{
+        PositionedIdentifierFact, ResolutionIdentifierRole, ResolutionNamespace,
+    };
+    use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
+    use brokk_bifrost_core::cancellation::CancellationToken;
+    use brokk_bifrost_jvm_analysis::analyzer::java::adapter::JavaAdapter;
+
+    let source = "interface Fn<T> {} interface Chain<V> extends Fn<V> {}";
+    let fixture = InlineTestProject::with_language(Language::Java)
+        .file("Chain.java", source)
+        .build();
+    let analyzer = TreeSitterAnalyzer::new(fixture.project_dyn(), JavaAdapter);
+    let state = analyzer
+        .fetch_file_state(&fixture.file("Chain.java"))
+        .unwrap();
+    let name = |identifier: &PositionedIdentifierFact| {
+        state.resolution_facts.names[identifier.name.index()]
+            .spelling
+            .as_str()
+    };
+    let reference_site = state
+        .resolution_facts
+        .identifiers
+        .iter()
+        .find(|identifier| {
+            identifier.role == ResolutionIdentifierRole::Reference
+                && identifier.namespace == ResolutionNamespace::Type
+                && name(identifier) == "V"
+                && state.resolution_facts.sites[identifier.site.index()].start_byte
+                    == source.rfind("Fn<V>").unwrap() + 3
+        })
+        .expect("forwarded V reference")
+        .site;
+    let declaration_site = state
+        .resolution_facts
+        .identifiers
+        .iter()
+        .find(|identifier| {
+            identifier.role == ResolutionIdentifierRole::Declaration
+                && identifier.namespace == ResolutionNamespace::Type
+                && name(identifier) == "V"
+        })
+        .expect("Chain type parameter declaration")
+        .site;
+
+    let cancellation = CancellationToken::new();
+    let snapshots = analyzer.selected_workspace_snapshots();
+    let languages = [SelectedResolutionLanguage::new("java", Language::Java)];
+    let input = SelectedResolutionOperationInput::new(
+        analyzer.project(),
+        analyzer.workspace_id(),
+        snapshots.as_ref(),
+        &languages,
+        &[],
+    );
+    let SelectedResolutionOperationOpenOutcome::Ready(operation) = analyzer
+        .analyzer_store()
+        .open_selected_resolution_operation(input, &cancellation)
+        .unwrap()
+    else {
+        panic!("open selected Java operation")
+    };
+    let jvm_context::JvmImportContext::Ready {
+        context,
+        scoped_gaps: gaps,
+        ..
+    } = operation
+        .java_import_context("Chain.java", &cancellation)
+        .unwrap()
+    else {
+        panic!("Java import context")
+    };
+    let SelectedResolutionContextValidationOutcome::Ready(context) = operation
+        .prepare_context(*context, &cancellation, &SelectedResolutionContextMetrics)
+        .unwrap()
+    else {
+        panic!("validate Java context")
+    };
+    let SelectedFactOperationBlueprintConstruction::Ready(blueprint) = operation
+        .ready
+        .collect_blueprint(context, &cancellation)
+        .unwrap()
+    else {
+        panic!("Java blueprint")
+    };
+    let lexical = operation.ready.lexical_source();
+    let typed = operation.ready.typed_source();
+    let locate = |site, role| {
+        let locator = SelectedSemanticLocator::new("java", "Chain.java", site, role);
+        let LocatedSemantic::Found(semantic) = operation
+            .ready
+            .lookup_locator(&lexical, &locator, &cancellation)
+            .unwrap()
+        else {
+            panic!("locate Java semantic site")
+        };
+        semantic
+    };
+    let reference = locate(reference_site, LoweredSemanticRole::Reference);
+    let declaration = locate(declaration_site, LoweredSemanticRole::Definition);
+    let session = ResolutionSession::unbounded();
+    operation
+        .with_jvm_hierarchy_query(
+            JvmForwardOperationContext {
+                storage_language: "java",
+                blueprint: &blueprint,
+                caller_path: "Chain.java",
+                import_gaps: &gaps,
+                lexical: &lexical,
+                typed: &typed,
+                cancellation: &cancellation,
+                session: &session,
+            },
+            |query| {
+                let binding = query.resolve_reference_uncached_for_test(reference)?;
+                assert_eq!(
+                    *binding.binding().completion(),
+                    brokk_bifrost_analysis::analyzer::resolution::ResolutionCompletion::Complete,
+                    "forwarded V binding: {binding:?}"
+                );
+                assert_eq!(binding.binding().targets(), &[declaration]);
+                let declaration_range = &state.resolution_facts.sites[declaration_site.index()];
+                let locator = SelectedSemanticLocator::for_declaration_range(
+                    "java",
+                    "Chain.java",
+                    declaration_range.start_byte,
+                    declaration_range.end_byte,
+                );
+                let SelectedSemanticLookupOutcome::Found(sites) = operation
+                    .ready()
+                    .lexical_source()
+                    .lookup_semantic_sites(&locator, &cancellation, &session)?
+                else {
+                    panic!("declaration-range lookup for Chain.V did not find the binding target")
+                };
+                assert_eq!(sites.len(), 1, "declaration-range sites: {sites:?}");
+                assert_eq!(sites[0].semantic(), declaration);
+                Ok(())
+            },
+        )
+        .unwrap();
+}
+
+#[test]
 fn jvm_descendant_alias_worklist() {
     use crate::inline_project::InlineTestProject;
     use brokk_bifrost_analysis::analyzer::resolution::{

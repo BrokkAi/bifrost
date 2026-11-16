@@ -39,6 +39,7 @@ pub(super) const RESOLUTION: &[&str] = &[
     "resolution_root_imports",
     "resolution_call_obligations",
     "resolution_type_productions",
+    "resolution_binary_operations",
     "resolution_member_type_coverage",
     "resolution_declaration_types",
     "resolution_definition_unit_crosswalks",
@@ -61,6 +62,7 @@ pub(super) const RESOLUTION: &[&str] = &[
 pub(super) const UNIT_SUMMARY: &[&str] = &[
     "resolution_unit_summary_members",
     "resolution_unit_summary_dependencies",
+    "resolution_unit_summary_consumed_units",
     "resolution_unit_summary_dependency_names",
     "resolution_unit_summary_containers",
     "resolution_unit_summary_placements",
@@ -77,6 +79,15 @@ pub(super) const UNIT_SUMMARY: &[&str] = &[
     "rust_resolution_unit_summary_reexport_routes",
     "rust_resolution_unit_summary_glob_reexport_routes",
     "rust_resolution_unit_summary_root_routes",
+    "resolution_unit_summary_input_files",
+    "rust_resolution_unit_summary_binding_owners",
+    "rust_resolution_unit_summary_binding_names",
+    "rust_resolution_unit_summary_binding_alternatives",
+    "rust_resolution_unit_summary_binding_blockers",
+    "rust_resolution_unit_summary_inherent_impls",
+    "rust_resolution_unit_summary_unresolved_inherent_impls",
+    "rust_resolution_unit_summary_public_surface_gaps",
+    "rust_resolution_unit_summary_inactive_placements",
 ];
 
 #[cfg(any(debug_assertions, test, feature = "test-support"))]
@@ -87,6 +98,9 @@ pub(super) const CRATE_TOPOLOGY: &[&str] = &[
     "rust_crate_binding_blockers",
     "rust_crate_gaps",
     "rust_crate_path_probes",
+    "rust_feature_discoveries",
+    "rust_feature_projections",
+    "rust_feature_projection_packages",
     "rust_crate_imports",
     "rust_crate_containers",
     "rust_crate_container_sources",
@@ -154,7 +168,7 @@ mod enabled {
             #[cfg(not(any(test, feature = "test-support")))]
             let fixture = false;
             if current != Some(expected)
-                && !(action == "DELETE" && CASCADE_DELETE.get() > 0)
+                && !(matches!(action, "DELETE" | "UPDATE") && CASCADE_DELETE.get() > 0)
                 && !fixture
             {
                 VIOLATION.with_borrow_mut(|slot| {
@@ -197,7 +211,9 @@ mod enabled {
         }
     }
 
-    /// Permits only cascaded deletes while a parent row is removed.
+    /// Permits the cascaded deletes, and the `ON DELETE SET NULL` updates (for
+    /// example `resolution_unit_summary_consumed_units.consumed_summary_id`),
+    /// that removing a parent row performs.
     pub(crate) struct CascadeDelete<'a>(&'a Connection);
     impl<'a> CascadeDelete<'a> {
         pub(crate) fn new(conn: &'a Connection) -> Self {

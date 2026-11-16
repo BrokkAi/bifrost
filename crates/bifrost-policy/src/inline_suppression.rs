@@ -8,20 +8,23 @@
 //! code covers its own line. A blanket directive (no policy list) must carry a
 //! reason, or it accepts nothing.
 //!
-//! Directives are a report-time input: they are read after every policy ran,
-//! only from files that hold an unaccepted finding, so cached analysis never
-//! depends on the configured prefix.
+//! Directives are scanned once before evaluation. The evaluator hint and the
+//! report acceptance join borrow the same scan; only the report confirms claims.
 
+use brokk_bifrost_core::retention_budget::{
+    AllocationCharge, BudgetRegion, ENTRY_OVERHEAD_BYTES, RetentionBudget, SelfCharged,
+    SharedAllocation,
+};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 use std::mem::size_of;
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 
 use brokk_bifrost_analysis::analyzer::structural::{FileFacts, Span};
 use brokk_bifrost_analysis::analyzer::{ProjectFile, WorkspaceAnalyzer};
-use brokk_bifrost_analysis::path_utils::rel_path_string;
 use brokk_bifrost_rql::structural::NormalizedKind;
 
 use super::classification::{TextValidationError, validate_single_line_text};
@@ -420,59 +423,188 @@ impl RetainedSize for PolicyInlineSuppressionReview {
     }
 }
 
-/// Read directives from every file that holds a finding no other decision
-/// claimed yet, attach the matching directive to each such finding, and
-/// return the audit. `None` when no such file holds a directive.
+/// One request's lazily scanned files. Retention and report joins share the
+/// same parse, including empty results. The owner charge pins each answer for
+/// this request even if its fresh region refuses admission or evicts it.
+pub(crate) struct InlineDirectiveScan<'a> {
+    workspace: Option<&'a WorkspaceAnalyzer>,
+    options: &'a PolicyInlineSuppressionOptions,
+    budget: &'a RetentionBudget,
+    files: Mutex<HashMap<String, Arc<ScannedDirectives>>>,
+    region: BudgetRegion<String, SharedAllocation<ScannedDirectives>>,
+}
+
+struct ScannedDirectives {
+    located: Vec<LocatedDirective>,
+    charge: AllocationCharge,
+}
+impl SelfCharged for ScannedDirectives {
+    fn allocation_charge(&self) -> &AllocationCharge {
+        &self.charge
+    }
+}
+impl RetainedSize for Directive {
+    fn retained_size(&self) -> usize {
+        size_of::<Self>() + retained_extra(&self.policies) + retained_extra(&self.reason)
+    }
+}
+impl RetainedSize for LocatedDirective {
+    fn retained_size(&self) -> usize {
+        size_of::<Self>()
+            + match &self.directive {
+                Ok(directive) => directive
+                    .retained_size()
+                    .saturating_sub(size_of::<Directive>()),
+                Err(detail) => detail.capacity(),
+            }
+    }
+}
+
+/// All locations consulted by inline matching and report scanning. There are
+/// no enclosing-item or file-level directives: coverage is line-based.
+fn inline_locations(
+    finding: &crate::PolicyFinding,
+) -> impl Iterator<Item = &crate::PolicySourceLocation> {
+    std::iter::once(finding.primary()).chain(finding.evaluation_location())
+}
+
+impl<'a> InlineDirectiveScan<'a> {
+    pub(crate) fn new(
+        options: &'a PolicyInlineSuppressionOptions,
+        workspace: Option<&'a WorkspaceAnalyzer>,
+        budget: &'a RetentionBudget,
+    ) -> Self {
+        let budget = workspace.map_or(budget, WorkspaceAnalyzer::retention_budget);
+        Self {
+            workspace,
+            options,
+            budget,
+            files: Mutex::new(HashMap::new()),
+            region: budget.region("policy.inline-directives.request", None),
+        }
+    }
+
+    fn file(&self, path: &str) -> Arc<ScannedDirectives> {
+        let mut files = self.files.lock().expect("inline directive memo poisoned");
+        if let Some(scanned) = files.get(path) {
+            return Arc::clone(scanned);
+        }
+        let located = self.workspace.map_or_else(Vec::new, |workspace| {
+            let analyzer = workspace.analyzer();
+            let file = ProjectFile::new(analyzer.project().root(), std::path::Path::new(path));
+            // Exactly the analyzed-source membership used by analyzed_files(),
+            // with a point lookup rather than enumerating the workspace. No
+            // hint or report scan can read an external/non-analyzed location.
+            if !analyzer.is_analyzed(&file) {
+                return Vec::new();
+            }
+            analyzer
+                .structural_fact_providers()
+                .iter()
+                .find_map(|provider| provider.structural_facts(&file))
+                .map_or_else(Vec::new, |facts| {
+                    located_directives(&facts, self.options.prefix().as_str())
+                })
+        });
+        // The conservative per-entry allowance also covers the request's map
+        // key, Arc and hash-table slack. Required charging keeps once-per-file
+        // semantics independent of parallel fill order and region pressure.
+        let allocation = brokk_bifrost_core::allocation_size::allocation_size;
+        let owned = allocation(located.capacity() * size_of::<LocatedDirective>())
+            + located
+                .iter()
+                .map(|located| match &located.directive {
+                    Ok(directive) => {
+                        allocation(directive.policies.capacity() * size_of::<PolicyId>())
+                            + directive
+                                .policies
+                                .iter()
+                                .map(|id| allocation(id.as_str().len()))
+                                .sum::<usize>()
+                            + directive
+                                .reason
+                                .as_ref()
+                                .map_or(0, |reason| allocation(reason.len()))
+                    }
+                    Err(detail) => allocation(detail.capacity()),
+                })
+                .sum::<usize>();
+        // This required request-owned payload belongs to the P owner's scan;
+        // report RetainedSize formulas remain raw for their separate limits.
+        let bytes =
+            size_of::<ScannedDirectives>() + owned + allocation(path.len()) + ENTRY_OVERHEAD_BYTES;
+        let scanned = Arc::new(ScannedDirectives {
+            located,
+            charge: AllocationCharge::acquire_required(self.budget, bytes),
+        });
+        let admitted = self
+            .region
+            .insert_shared(path.to_owned(), SharedAllocation::new(Arc::clone(&scanned)));
+        drop(admitted);
+        files.insert(path.to_owned(), Arc::clone(&scanned));
+        scanned
+    }
+
+    pub(crate) fn candidate_matches(&self, finding: &crate::PolicyFinding) -> bool {
+        inline_locations(finding)
+            .filter(|location| location.region().is_some())
+            .any(|location| {
+                let scanned = self.file(location.path());
+                scanned
+                    .located
+                    .iter()
+                    .any(|directive| inline_candidate_matches(location.path(), directive, finding))
+            })
+    }
+}
+impl Drop for InlineDirectiveScan<'_> {
+    fn drop(&mut self) {
+        self.region.invalidate_all();
+    }
+}
+
+fn inline_candidate_matches(
+    path: &str,
+    located: &LocatedDirective,
+    finding: &crate::PolicyFinding,
+) -> bool {
+    let Ok(directive) = &located.directive else {
+        return false;
+    };
+    located
+        .covered_line
+        .is_some_and(|line| finding_is_covered(finding, path, line))
+        && (directive.policies.is_empty() || directive.policies.contains(finding.policy_id()))
+}
+
+/// Attach cached directives to unclaimed findings and return their audit.
+/// Only files holding those findings contribute audit entries.
 pub(crate) fn apply_inline_suppressions(
     options: &PolicyInlineSuppressionOptions,
-    workspace: Option<&WorkspaceAnalyzer>,
+    scan: &InlineDirectiveScan<'_>,
     runs: &mut HashMap<PolicyId, PolicyRun>,
 ) -> Option<PolicyInlineSuppressionReview> {
-    let workspace = workspace?;
-    let mut paths = runs
+    let paths = runs
         .values()
         .flat_map(PolicyRun::findings)
         .filter(|finding| !finding.is_explicitly_accepted())
-        .filter(|finding| finding.primary().region().is_some())
-        .map(|finding| finding.primary().path())
-        .collect::<Vec<_>>();
-    paths.sort_unstable();
-    paths.dedup();
-    if paths.is_empty() {
-        return None;
-    }
-    let analyzer = workspace.analyzer();
-    let files = analyzer
-        .analyzed_files()
-        .into_iter()
-        .map(|file| (rel_path_string(&file), file))
-        .collect::<HashMap<String, ProjectFile>>();
-    let providers = analyzer.structural_fact_providers();
-    let prefix = options.prefix().as_str();
-    let directives = paths
-        .into_iter()
-        .filter_map(|path| {
-            let file = files.get(path)?;
-            let facts = providers
-                .iter()
-                .find_map(|provider| provider.structural_facts(file))?;
-            let located = located_directives(&facts, prefix);
-            (!located.is_empty()).then(|| (Box::<str>::from(path), located))
-        })
-        .collect::<Vec<_>>();
-    if directives.is_empty() {
-        return None;
-    }
-
+        .flat_map(inline_locations)
+        .filter(|location| location.region().is_some())
+        .map(|location| location.path().to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
     let mut entries = Vec::new();
-    for (path, located) in directives {
-        for directive in located {
-            entries.push(match_directive(&path, directive, runs));
+    for path in paths {
+        let scanned = scan.file(&path);
+        for directive in &scanned.located {
+            entries.push(match_directive(&path, directive.clone(), runs));
         }
     }
     let omitted_entries = entries.len().saturating_sub(MAX_INLINE_SUPPRESSION_REVIEWS);
     entries.truncate(MAX_INLINE_SUPPRESSION_REVIEWS);
     entries.shrink_to_fit();
+    if entries.is_empty() {
+        return None;
+    }
     Some(PolicyInlineSuppressionReview {
         prefix: options.prefix().clone(),
         entries,
@@ -485,6 +617,7 @@ fn match_directive(
     located: LocatedDirective,
     runs: &mut HashMap<PolicyId, PolicyRun>,
 ) -> PolicyInlineSuppressionEntry {
+    let candidate = located.clone();
     let LocatedDirective {
         line,
         covered_line,
@@ -519,7 +652,7 @@ fn match_directive(
         entry.state = PolicyInlineSuppressionState::MissingReason;
         return entry;
     }
-    let Some(covered_line) = covered_line else {
+    let Some(_) = covered_line else {
         return entry;
     };
     let attachment = PolicyFindingInlineSuppression {
@@ -527,17 +660,10 @@ fn match_directive(
         policies: directive.policies,
         reason: directive.reason,
     };
-    for (policy_id, run) in runs.iter_mut() {
-        if !attachment.policies.is_empty() && !attachment.policies.contains(policy_id) {
-            continue;
-        }
+    for run in runs.values_mut() {
         for finding in run.findings_mut() {
             if finding.is_explicitly_accepted()
-                || finding.primary().path() != path
-                || finding
-                    .primary()
-                    .region()
-                    .is_none_or(|region| region.start_line() != covered_line)
+                || !inline_candidate_matches(path, &candidate, finding)
             {
                 continue;
             }
@@ -551,9 +677,79 @@ fn match_directive(
     entry
 }
 
+/// A directive may cover either the evaluation point or rendered operand evidence.
+/// Old reports without evaluation evidence retain primary-only coverage.
+fn finding_is_covered(finding: &crate::PolicyFinding, path: &str, line: u64) -> bool {
+    inline_locations(finding).any(|location| {
+        location.path() == path
+            && location
+                .region()
+                .is_some_and(|region| region.start_line() == line)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn directive_memo_scans_only_requested_analyzed_files_once_and_charges_the_owner() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("app.ts"),
+            "// bifrost: ignore[test.audit] -- reviewed\nexport function target() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("untouched.ts"),
+            "export function untouched() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("outside.json"),
+            "// bifrost: ignore[test.audit] -- never analyzed\n",
+        )
+        .unwrap();
+        let project =
+            brokk_bifrost_analysis::FilesystemProject::new(root.path().to_path_buf()).unwrap();
+        let workspace =
+            WorkspaceAnalyzer::build_ephemeral_footgun(Arc::new(project), Default::default())
+                .unwrap();
+        // No capacity remains for a cache admission. The once-per-file result
+        // must remain shared and charged for the lifetime of this request.
+        let budget = RetentionBudget::for_test_capacity(0);
+        let options = PolicyInlineSuppressionOptions::DEFAULT;
+        let memo = InlineDirectiveScan {
+            workspace: Some(&workspace),
+            options: &options,
+            budget: &budget,
+            files: Mutex::new(HashMap::new()),
+            region: budget.region("policy.inline-directives.test", None),
+        };
+        assert!(memo.files.lock().unwrap().is_empty());
+        let first = memo.file("app.ts");
+        assert_eq!(first.located.len(), 1);
+        let second = memo.file("app.ts");
+        assert!(Arc::ptr_eq(&first, &second));
+        let outside = memo.file("outside.json");
+        assert!(outside.located.is_empty());
+        assert_eq!(
+            memo.files
+                .lock()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["app.ts".to_owned(), "outside.json".to_owned()].into()
+        );
+        assert!(budget.occupied_bytes() > 0);
+        drop(first);
+        drop(second);
+        drop(outside);
+        drop(memo);
+        budget.run_pending_tasks();
+        assert_eq!(budget.occupied_bytes(), 0);
+    }
 
     fn parse(comment: &str) -> Option<Result<Directive, String>> {
         parse_directive("bifrost", comment)

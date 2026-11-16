@@ -348,6 +348,132 @@ fn incomplete_macro_composed_fields_are_cached_and_replayed() {
 }
 
 #[test]
+fn historical_git_source_is_complete_when_working_tree_source_is_unavailable() {
+    let (fixture, owner, analyzer) = macro_composed_fields_fixture();
+    let original = std::fs::read(owner.abs_path()).unwrap();
+    let repo = git2::Repository::init(fixture.root()).unwrap();
+    let oid = repo.blob(&original).unwrap();
+    for replacement in [None, Some(b"\0".as_slice())] {
+        if owner.abs_path().exists() {
+            std::fs::remove_file(owner.abs_path()).unwrap();
+        }
+        if let Some(bytes) = replacement {
+            std::fs::write(owner.abs_path(), bytes).unwrap();
+        }
+        let scope = AnalyzerQueryScope::capturing_read_incompleteness(&analyzer);
+        assert_eq!(
+            analyzer
+                .inner
+                .source_for_oid(&owner, oid)
+                .unwrap()
+                .as_bytes(),
+            original
+        );
+        assert!(scope.captured_read_incompleteness().is_empty());
+        assert!(scope.read_completion().is_ok());
+        assert!(scope.store_error().is_none());
+    }
+}
+
+#[test]
+fn source_oid_reader_records_snapshot_and_git_io_and_recovers() {
+    use brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause;
+    let (fixture, owner, analyzer) = macro_composed_fields_fixture();
+    let mut original = std::fs::read(owner.abs_path()).unwrap();
+    original.extend_from_slice(b"\n// acquisition recovery\n");
+    let oid = git2::Oid::hash_object(git2::ObjectType::Blob, &original).unwrap();
+    let _repo = git2::Repository::init(fixture.root()).unwrap();
+    std::fs::remove_file(owner.abs_path()).unwrap();
+    {
+        let scope = AnalyzerQueryScope::capturing_read_incompleteness(&analyzer);
+        assert!(analyzer.inner.source_for_oid(&owner, oid).is_none());
+        let reasons = scope.captured_read_incompleteness();
+        assert!(
+            reasons.len() >= 2,
+            "snapshot and missing Git object: {reasons:?}"
+        );
+        assert!(
+            reasons.iter().all(|reason| {
+                reason.execution_cause() == Some(DerivationExecutionCause::Provider)
+                    && reason.stable_replay_reason().is_none()
+            }),
+            "I/O cannot become a stable artifact gap: {reasons:?}"
+        );
+    }
+    std::fs::write(owner.abs_path(), &original).unwrap();
+    for _ in 0..2 {
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        assert_eq!(
+            analyzer
+                .inner
+                .source_for_oid(&owner, oid)
+                .unwrap()
+                .as_bytes(),
+            original
+        );
+        assert!(scope.read_completion().is_ok());
+    }
+}
+
+#[test]
+fn fixed_limit_file_cache_replays_the_same_cold_and_warm_receipt() {
+    use brokk_bifrost_analysis::analyzer::QueryReadIncomplete;
+    let (_fixture, owner, analyzer) = macro_composed_fields_fixture();
+    let cache = cache::build_file_read_cache(1024, |_: &ProjectFile, _: &Arc<Vec<usize>>| 1);
+    let first;
+    let cold;
+    {
+        let scope = AnalyzerQueryScope::capturing_read_incompleteness(&analyzer);
+        first = analyzer.cached_complete_read(&cache, &owner, || {
+            analyzer.record_query_incomplete(QueryReadIncomplete::ProofStopped {
+                reason: "fixed_limit",
+                cause: None,
+            });
+            vec![1]
+        });
+        cold = scope.captured_read_incompleteness();
+    }
+    assert!(cache.contains_key(&owner));
+    let scope = AnalyzerQueryScope::capturing_read_incompleteness(&analyzer);
+    let second =
+        analyzer.cached_complete_read(&cache, &owner, || panic!("warm limit must be retained"));
+    assert!(Arc::ptr_eq(&first, &second));
+    assert_eq!(scope.captured_read_incompleteness(), cold);
+    assert_eq!(cold[0].execution_cause(), None);
+    assert_eq!(
+        cold[0].stable_replay_reason().as_deref(),
+        Some("proof\0fixed_limit")
+    );
+}
+
+#[test]
+fn runtime_budget_stop_is_not_retained_by_cpp_file_cache() {
+    use brokk_bifrost_analysis::analyzer::QueryReadIncomplete;
+    use brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause;
+    let (_fixture, owner, analyzer) = macro_composed_fields_fixture();
+    let cache = cache::build_file_read_cache(1024, |_: &ProjectFile, _: &Arc<Vec<usize>>| 1);
+    {
+        let scope = AnalyzerQueryScope::capturing_read_incompleteness(&analyzer);
+        analyzer.cached_complete_read(&cache, &owner, || {
+            analyzer.record_query_incomplete(QueryReadIncomplete::ProofStopped {
+                reason: "request_work_exhausted",
+                cause: Some(DerivationExecutionCause::Budget),
+            });
+            vec![1]
+        });
+        assert_eq!(
+            scope.read_completion().unwrap_err().execution_cause(),
+            Some(DerivationExecutionCause::Budget)
+        );
+    }
+    assert!(!cache.contains_key(&owner));
+    assert_eq!(
+        *analyzer.cached_complete_read(&cache, &owner, || vec![2]),
+        vec![2]
+    );
+}
+
+#[test]
 fn unavailable_macro_source_io_is_retried_after_recovery() {
     use brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadIncomplete;
 
@@ -400,9 +526,9 @@ fn absent_file_membership_memo_preserves_complete_read() {
 
 #[test]
 #[hardwon(
-    "#6380: review: a memoized transient source-read failure was cached as a stable StructureUnavailable"
+    "#6380+#11701: a memoized transient source-read failure was cached as a stable StructureUnavailable; an operational failure must stay local to the scope that read it"
 )]
-fn negative_source_memo_replays_transient_failure_into_later_builder() {
+fn operational_source_failure_is_not_a_reusable_negative_memo() {
     use brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadIncomplete;
 
     let (fixture, owner, analyzer) = macro_composed_fields_fixture();
@@ -410,7 +536,7 @@ fn negative_source_memo_replays_transient_failure_into_later_builder() {
     let original = std::fs::read(donor.abs_path()).expect("read donor");
     analyzer.reset_macro_composed_fields_build_count_for_test();
     {
-        let outer = AnalyzerQueryScope::new(&analyzer);
+        let outer = AnalyzerQueryScope::capturing_read_incompleteness(&analyzer);
         analyzer.record_query_incomplete(QueryReadIncomplete::StructureUnavailable(owner.clone()));
         std::fs::remove_file(donor.abs_path()).expect("temporarily remove donor");
         assert!(
@@ -424,19 +550,28 @@ fn negative_source_memo_replays_transient_failure_into_later_builder() {
         assert!(
             matches!(outer.read_completion(), Err(QueryReadIncomplete::StructureUnavailable(file)) if file == owner)
         );
+        let outer_reasons = outer.captured_read_incompleteness();
+        assert!(
+            outer_reasons
+                .iter()
+                .any(|reason| matches!(reason, QueryReadIncomplete::StoreFailure(_))),
+            "the failed source read leaves its operational reason on the scope that made it: {outer_reasons:?}"
+        );
 
         let reader = AnalyzerQueryScope::capturing_read_incompleteness(&analyzer);
         analyzer.macro_composed_fields(&owner);
         let reasons = reader.captured_read_incompleteness();
         assert!(
-            reasons
-                .iter()
-                .any(|reason| matches!(reason, QueryReadIncomplete::StoreFailure(_))),
-            "memo must replay I/O provenance: {reasons:?}"
+            reasons.is_empty(),
+            "a later scope must not inherit the enclosing request's source-read failure: {reasons:?}"
+        );
+        assert!(
+            reader.read_completion().is_ok(),
+            "the later scope reports only its own complete reads"
         );
         assert!(
             analyzer.macro_composed_fields_by_file.contains_key(&owner),
-            "a fresh fill domain rereads the restored donor despite the caller's failed request memo"
+            "an operational source failure must not become a reusable negative memo; the later scope rereads the restored donor"
         );
     }
     let fresh = AnalyzerQueryScope::new(&analyzer);
@@ -511,8 +646,10 @@ fn cancelled_macro_composed_fields_does_not_poison_cache() {
 }
 
 #[test]
-#[hardwon("#3078: a nested cancelled type read lost incompleteness from the outer query")]
-fn nested_cancelled_macro_composed_field_read_marks_outer_scope_incomplete() {
+#[hardwon(
+    "#3078+#11701: a nested cancelled type read must reach the outer query but must not become a later scope's own incompleteness"
+)]
+fn nested_cancelled_macro_composed_field_read_marks_outer_scope_but_not_later_scope() {
     let (_fixture, owner, analyzer) = macro_composed_fields_fixture();
     let owner_unit = analyzer
         .get_definitions("Owner")
@@ -536,13 +673,19 @@ fn nested_cancelled_macro_composed_field_read_marks_outer_scope_incomplete() {
         ),
         "an outer query must retain cancellation observed by a nested read"
     );
-    let later_scope = AnalyzerQueryScope::new(&analyzer);
+    let later_scope = AnalyzerQueryScope::capturing_read_incompleteness(&analyzer);
     assert!(
-        matches!(
-            later_scope.read_completion(),
-            Err(brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadIncomplete::Cancelled)
-        ),
-        "a later scope sharing the request memos must inherit their incompleteness"
+        later_scope.read_completion().is_ok(),
+        "a later scope must not inherit the enclosing request's cancellation"
+    );
+    let reasons = later_scope.captured_read_incompleteness();
+    assert!(
+        reasons.is_empty(),
+        "a later scope reports only the reads it made: {reasons:?}"
+    );
+    assert!(
+        !analyzer.direct_ancestors.contains_key(&owner_unit),
+        "the cancelled read must not populate the ancestor cache"
     );
     assert!(
         analyzer
@@ -553,6 +696,15 @@ fn nested_cancelled_macro_composed_field_read_marks_outer_scope_incomplete() {
     assert!(
         analyzer.direct_ancestors.get(&owner_unit).is_some(),
         "a fresh fill after cancellation ends may retain its own complete ancestor read"
+    );
+    let reasons = later_scope.captured_read_incompleteness();
+    assert!(
+        reasons.is_empty(),
+        "the fresh ancestor fill reports only its own reads: {reasons:?}"
+    );
+    assert!(
+        later_scope.read_completion().is_ok(),
+        "the fresh ancestor fill completes on its own"
     );
 }
 

@@ -16,11 +16,13 @@ use brokk_bifrost_core::analyzer::model::{
     CodeUnit, ImportInfo, Language, Range, SignatureMetadata,
 };
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
+use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 use brokk_bifrost_core::cancellation::CancellationToken;
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 
 use crate::java::graph_support::{JavaSource, resolve_java_lexical_type_name};
 use crate::java::imports::non_static_import_path;
+use tree_sitter::Node;
 
 const HIERARCHY_FACT_BATCH_SIZE: usize = 4_096;
 
@@ -153,6 +155,188 @@ pub fn java_preferred_declaring_owners(
     })
 }
 
+/// How the class body that lexically encloses an explicit `super` receiver
+/// names its direct superclass.
+///
+/// `super.m()`, `super.f` and `super::m` read the members of the direct
+/// superclass of the class whose body lexically contains them (JLS 15.11.2,
+/// 15.12.1, 15.13.1). They never read the enclosing class's own members, so an
+/// override that calls `super.m()` does not call itself, and they never read
+/// the enclosing class's direct superinterfaces, which only `I.super.m()`
+/// names. The tree says which form the enclosing body has; the type hierarchy
+/// says which class that form resolves to ([`java_super_receiver_class`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JavaSuperclassForm<'tree> {
+    /// A named class's `extends` clause, holding the written superclass type.
+    Extends(Node<'tree>),
+    /// An anonymous class body, holding the instantiated type. That type is
+    /// the superclass when it names a class, and `java.lang.Object` is when it
+    /// names an interface (JLS 15.9.5).
+    Instantiated(Node<'tree>),
+    /// An enum constant's own body, whose superclass is the declaring enum
+    /// (JLS 8.9.1).
+    EnumConstant,
+    /// A body that writes no superclass: a class without `extends` reads
+    /// `java.lang.Object`, an enum `java.lang.Enum` and a record
+    /// `java.lang.Record`. An interface or annotation body has no superclass,
+    /// and a bare `super` member access there does not compile.
+    Implicit,
+}
+
+/// The superclass form of the innermost class body that lexically encloses
+/// `super_node`, or `None` when no class body encloses it.
+///
+/// The walk stops at the first class-like body, so a `super` written in an
+/// anonymous class's constructor arguments (`new Base(super.m()) { ... }`)
+/// reads the class around the creation expression, not the anonymous class.
+pub fn java_superclass_form(super_node: Node<'_>) -> Option<JavaSuperclassForm<'_>> {
+    let mut current = super_node.parent();
+    while let Some(node) = current {
+        match node.kind() {
+            "class_body" => {
+                let owner = node.parent()?;
+                return match owner.kind() {
+                    "class_declaration" => Some(
+                        owner
+                            .child_by_field_name("superclass")
+                            .and_then(|superclass| {
+                                let mut cursor = superclass.walk();
+                                superclass
+                                    .named_children(&mut cursor)
+                                    .find(|child| !child.is_extra())
+                            })
+                            .map_or(JavaSuperclassForm::Implicit, JavaSuperclassForm::Extends),
+                    ),
+                    "object_creation_expression" => owner
+                        .child_by_field_name("type")
+                        .map(JavaSuperclassForm::Instantiated),
+                    "enum_constant" => Some(JavaSuperclassForm::EnumConstant),
+                    "record_declaration" => Some(JavaSuperclassForm::Implicit),
+                    _ => None,
+                };
+            }
+            "enum_body" | "interface_body" | "annotation_type_body" => {
+                return Some(JavaSuperclassForm::Implicit);
+            }
+            _ => current = node.parent(),
+        }
+    }
+    None
+}
+
+/// What an explicit `super` receiver reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JavaSuperclass {
+    /// The direct superclass is this workspace class. Member lookup starts at
+    /// it and walks its own hierarchy, exactly as for a receiver of that
+    /// static type.
+    Indexed(CodeUnit),
+    /// The direct superclass is `java.lang.Object`, `java.lang.Enum` or
+    /// `java.lang.Record`, whose members no workspace declares.
+    Implicit,
+    /// The written superclass names no workspace class: it is declared
+    /// outside the workspace, or its spelling did not resolve. The member it
+    /// reads stays unknown.
+    Open,
+}
+
+/// The superclass an explicit `super` reads, from the superclass `form` of
+/// the enclosing class body and that class's complete direct ancestors.
+///
+/// A Java class has exactly one direct superclass and every other direct
+/// ancestor is an interface, so the superclass is the one ancestor that is
+/// not an interface. `direct_ancestors` is called only when the form writes a
+/// superclass. `Err` means the canonical interface metadata, the hierarchy
+/// answer, or the declaration facts (two class ancestors) cannot say which
+/// ancestor is the superclass, so the caller must stay open.
+pub fn java_super_receiver_class(
+    source: &dyn CodeUnitIndex,
+    form: JavaSuperclassForm<'_>,
+    direct_ancestors: impl FnOnce() -> Result<Vec<CodeUnit>, JavaHierarchyFactError>,
+) -> Result<JavaSuperclass, JavaHierarchyFactError> {
+    if form == JavaSuperclassForm::Implicit {
+        return Ok(JavaSuperclass::Implicit);
+    }
+    let ancestors = direct_ancestors()?;
+    let mut classes = Vec::new();
+    for ancestor in &ancestors {
+        if !java_is_interface(source, ancestor)? {
+            classes.push(ancestor);
+        }
+    }
+    match classes.as_slice() {
+        [superclass] => Ok(JavaSuperclass::Indexed((*superclass).clone())),
+        [] if matches!(form, JavaSuperclassForm::Instantiated(_)) && !ancestors.is_empty() => {
+            Ok(JavaSuperclass::Implicit)
+        }
+        [] => Ok(JavaSuperclass::Open),
+        _ => Err(JavaHierarchyFactError::MetadataUnavailable),
+    }
+}
+
+/// Whether code in `site_class` may access `member`, the declaration that
+/// member lookup selected through an explicit `super` receiver written in
+/// `site_class` (JLS 6.6.1).
+///
+/// `super.m()` selects the nearest *accessible* implementation, so a site
+/// whose nearest declaration is inaccessible does not compile and has no
+/// proven target. A public or protected member is accessible: `super` reads a
+/// superclass of `site_class`, so a protected member is reached from a
+/// subclass (JLS 6.6.2.1). A package-private member is accessible from its own
+/// package, and a private member from the body of the top-level class that
+/// encloses its declaration. `Err` means the member's canonical visibility is
+/// absent, not a Java visibility, or disagrees across its declarations, so
+/// the caller must stay open.
+pub fn java_super_member_is_accessible(
+    source: &dyn CodeUnitIndex,
+    member: &CodeUnit,
+    site_class: &CodeUnit,
+) -> Result<bool, JavaHierarchyFactError> {
+    let alternatives = source.signature_metadata(member);
+    let visibility = alternatives
+        .first()
+        .and_then(SignatureMetadata::callable_declared_visibility)
+        .ok_or(JavaHierarchyFactError::MetadataUnavailable)?;
+    if alternatives
+        .iter()
+        .any(|alternative| alternative.callable_declared_visibility() != Some(visibility))
+    {
+        return Err(JavaHierarchyFactError::MetadataUnavailable);
+    }
+    match visibility {
+        DeclaredVisibility::Public | DeclaredVisibility::Protected => Ok(true),
+        DeclaredVisibility::PackagePrivate => {
+            Ok(member.package_name() == site_class.package_name())
+        }
+        DeclaredVisibility::Private => {
+            let member_top = java_top_level_class(source, member)
+                .ok_or(JavaHierarchyFactError::MetadataUnavailable)?;
+            Ok(java_top_level_class(source, site_class)
+                .is_some_and(|site_top| site_top == member_top))
+        }
+        DeclaredVisibility::Internal
+        | DeclaredVisibility::CrateOrModule
+        | DeclaredVisibility::ProtectedInternal
+        | DeclaredVisibility::PrivateProtected
+        | DeclaredVisibility::Unknown => Err(JavaHierarchyFactError::MetadataUnavailable),
+    }
+}
+
+/// The outermost class that encloses `unit`, or `unit` itself when it is a
+/// top-level class. Local and anonymous classes are reached through the
+/// methods that own them.
+fn java_top_level_class(source: &dyn CodeUnitIndex, unit: &CodeUnit) -> Option<CodeUnit> {
+    let mut top = unit.is_class().then(|| unit.clone());
+    let mut current = source.parent_of(unit);
+    while let Some(parent) = current {
+        if parent.is_class() {
+            top = Some(parent.clone());
+        }
+        current = source.parent_of(&parent);
+    }
+    top
+}
+
 /// The owners on the *nearest* supertype level of `owner` that declare the
 /// member `declares` tests for, reduced by [`java_preferred_declaring_owners`].
 ///
@@ -232,7 +416,7 @@ pub fn java_direct_ancestors(
 /// bounds the hydration pass: `None` means the build stopped short and must not
 /// be published (issue #1748).
 pub fn build_java_direct_descendant_index<F, H>(
-    mut candidates: Vec<F>,
+    candidates: Vec<F>,
     hydrate: H,
     scope: &DescendantIndexScope<'_>,
 ) -> Option<DirectDescendantIndex>
@@ -240,7 +424,19 @@ where
     F: JavaHierarchyFact,
     H: Fn(&mut Vec<F>) -> bool,
 {
-    candidates.retain(|facts| scope.admits(facts.declaration()));
+    let mut admitted = Vec::with_capacity(candidates.len());
+    for facts in candidates {
+        if match scope.admits(facts.declaration()) {
+            Ok(value) => value,
+            Err(reason) => {
+                let _unavailable = reason;
+                return None;
+            }
+        } {
+            admitted.push(facts);
+        }
+    }
+    let mut candidates = admitted;
     candidates.sort_by(|left, right| {
         left.declaration()
             .source()

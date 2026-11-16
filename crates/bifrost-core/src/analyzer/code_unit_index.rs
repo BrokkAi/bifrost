@@ -44,6 +44,35 @@ where
         .map(|(_, candidate)| candidate)
 }
 
+/// Return the candidate with the narrowest range enclosing the requested byte
+/// span. When a candidate has multiple enclosing ranges, its narrowest one is
+/// used; the earliest candidate wins a tie.
+pub fn narrowest_enclosing_by_bytes<T, R>(
+    candidates: impl IntoIterator<Item = (T, R)>,
+    start_byte: usize,
+    end_byte: usize,
+) -> Option<T>
+where
+    R: IntoIterator<Item = Range>,
+{
+    assert!(
+        start_byte <= end_byte,
+        "enclosing byte span end ({end_byte}) precedes start ({start_byte})"
+    );
+    candidates
+        .into_iter()
+        .filter_map(|(candidate, ranges)| {
+            let span = ranges
+                .into_iter()
+                .filter(|range| range.start_byte <= start_byte && range.end_byte >= end_byte)
+                .map(|range| range.end_byte - range.start_byte)
+                .min()?;
+            Some((span, candidate))
+        })
+        .min_by_key(|(span, _)| *span)
+        .map(|(_, candidate)| candidate)
+}
+
 /// Keep declarations whose fully qualified name matches `fq_name` exactly.
 pub fn declarations_with_fq_name(
     candidates: impl IntoIterator<Item = CodeUnit>,
@@ -518,9 +547,28 @@ pub trait CodeUnitIndex: Send + Sync {
     /// Source text retained by the analyzer generation that produced this
     /// file's declarations and byte ranges. The text is owned because a
     /// persisted analyzer may hydrate it on demand rather than retain a
-    /// workspace-sized source map.
+    /// workspace-sized source map. Another source may supply these bytes only
+    /// after verification against the generation's blob identity. Missing
+    /// verified bytes return None and record typed query incompleteness.
     fn indexed_source(&self, _file: &ProjectFile) -> Option<String> {
         None
+    }
+
+    /// Whether this generation's adapters own a candidate path. Uses the same
+    /// ownership rule as indexed membership, including adopted include files.
+    /// Does not require that a recognized-language path is already indexed.
+    /// The conservative default treats every candidate as owned: this fence
+    /// must never pass silently when an implementation has not defined
+    /// ownership, because doing so could hide new or changed source files.
+    fn owns_source_file(&self, _file: &ProjectFile) -> bool {
+        true
+    }
+
+    /// Immutable indexed membership of this resident analyzer generation.
+    /// Never enumerates live disk or hydrates store rows. Incomplete inventory
+    /// cannot certify absence; consumers must fail closed on `complete == false`.
+    fn indexed_source_files(&self) -> crate::analyzer::query_batch::QueryBatch<ProjectFile> {
+        crate::analyzer::query_batch::QueryBatch::incomplete(Vec::new(), 0)
     }
 
     /// Raw Git blob identity of the bytes indexed for this file generation.
@@ -889,8 +937,9 @@ mod parent_of_tests {
 
 #[cfg(test)]
 mod narrowest_enclosing_properties {
-    use super::narrowest_enclosing_by_lines;
+    use super::{narrowest_enclosing_by_bytes, narrowest_enclosing_by_lines};
     use crate::analyzer::model::Range;
+    use brokk_bifrost_test_macros::hardwon;
     use proptest::prelude::*;
 
     fn lines(start_line: usize, length: usize) -> Range {
@@ -900,6 +949,56 @@ mod narrowest_enclosing_properties {
             start_line,
             end_line: start_line + length,
         }
+    }
+
+    fn bytes(start_byte: usize, length: usize) -> Range {
+        Range {
+            start_byte,
+            end_byte: start_byte + length,
+            start_line: 1,
+            end_line: 1,
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#7237: same-line enclosing lookup must select innermost byte range regardless of declaration order"
+    )]
+    fn same_line_byte_ranges_prefer_innermost_candidate_regardless_of_order() {
+        let candidates = vec![
+            ("class", vec![bytes(0, 120)]),
+            ("field", vec![bytes(15, 25)]),
+            ("first", vec![bytes(42, 30)]),
+            ("second", vec![bytes(74, 30)]),
+            ("multi", vec![bytes(0, 120), bytes(110, 8)]),
+        ];
+
+        assert_eq!(
+            narrowest_enclosing_by_bytes(candidates.clone(), 4, 9),
+            Some("class")
+        );
+        assert_eq!(
+            narrowest_enclosing_by_bytes(candidates.clone(), 20, 30),
+            Some("field")
+        );
+        assert_eq!(
+            narrowest_enclosing_by_bytes(candidates.clone(), 50, 59),
+            Some("first")
+        );
+        assert_eq!(
+            narrowest_enclosing_by_bytes(candidates.clone(), 80, 89),
+            Some("second")
+        );
+        assert_eq!(
+            narrowest_enclosing_by_bytes(candidates, 112, 116),
+            Some("multi")
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "precedes start")]
+    fn narrowest_enclosing_by_bytes_rejects_inverted_span() {
+        let _ = narrowest_enclosing_by_bytes([("outer", vec![bytes(0, 50)])], 20, 10);
     }
 
     proptest! {
@@ -941,6 +1040,48 @@ mod narrowest_enclosing_properties {
 
             prop_assert_eq!(
                 narrowest_enclosing_by_lines(input, query_start, query_end),
+                best.map(|(id, _)| id)
+            );
+        }
+
+        /// Brute-force reference: a candidate qualifies through its narrowest
+        /// enclosing byte range even when all candidates share line 1; the
+        /// earliest candidate wins an equal-byte-span tie.
+        #[test]
+        fn picks_the_candidate_with_the_fewest_enclosing_bytes(
+            candidates in proptest::collection::vec(
+                proptest::collection::vec((0usize..200, 0usize..120), 0..4),
+                0..8,
+            ),
+            query in (0usize..240, 0usize..30),
+        ) {
+            let (query_start, query_length) = query;
+            let query_end = query_start + query_length;
+            let input: Vec<(usize, Vec<Range>)> = candidates
+                .iter()
+                .enumerate()
+                .map(|(id, ranges)| {
+                    (id, ranges.iter().map(|&(s, l)| bytes(s, l)).collect())
+                })
+                .collect();
+
+            let mut best: Option<(usize, usize)> = None;
+            for (id, ranges) in candidates.iter().enumerate() {
+                let candidate_min = ranges
+                    .iter()
+                    .copied()
+                    .filter(|&(start, length)| start <= query_start && start + length >= query_end)
+                    .map(|(_, length)| length)
+                    .min();
+                if let Some(length) = candidate_min
+                    && best.is_none_or(|(_, fewest)| length < fewest)
+                {
+                    best = Some((id, length));
+                }
+            }
+
+            prop_assert_eq!(
+                narrowest_enclosing_by_bytes(input, query_start, query_end),
                 best.map(|(id, _)| id)
             );
         }

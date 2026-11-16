@@ -222,7 +222,19 @@ The module role is the imported path, not the local alias used by later Go expre
 
 <!-- code-query-case:unsupported-kwargs:expected -->
 ```json
-{"results":[],"truncated":false,"diagnostics":[{"code":"unsupported_structural_feature","impact":"incomplete","language":"go","message":"structural adapter for go does not support role(s): kwargs"}]}
+{
+  "results": [],
+  "truncated": false,
+  "diagnostics": [
+    {
+      "code": "unsupported_structural_feature",
+      "impact": "incomplete",
+      "language": "go",
+      "message": "structural adapter for go does not support role(s): kwargs",
+      "incompleteness": "content"
+    }
+  ]
+}
 ```
 
 <!-- code-query-case:unsupported-decorators:rql -->
@@ -237,7 +249,19 @@ The module role is the imported path, not the local alias used by later Go expre
 
 <!-- code-query-case:unsupported-decorators:expected -->
 ```json
-{"results":[],"truncated":false,"diagnostics":[{"code":"unsupported_structural_feature","impact":"incomplete","language":"go","message":"structural adapter for go does not support role(s): decorators"}]}
+{
+  "results": [],
+  "truncated": false,
+  "diagnostics": [
+    {
+      "code": "unsupported_structural_feature",
+      "impact": "incomplete",
+      "language": "go",
+      "message": "structural adapter for go does not support role(s): decorators",
+      "incompleteness": "content"
+    }
+  ]
+}
 ```
 
 ## Precision Boundary

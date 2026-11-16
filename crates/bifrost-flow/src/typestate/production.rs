@@ -1,6 +1,6 @@
 //! Production ownership and projection for reusable typestate summaries.
 //!
-//! The repository is content-keyed and generation-independent, following
+//! Reusable summaries are content-keyed and generation-independent, following
 //! [`ValueFlowCache`](crate::value_flow::ValueFlowCache).
 //!
 //! Every entry is addressed by a key that already names each of its semantic
@@ -17,10 +17,12 @@
 //! any close-match approximation claim) recomputes it. A
 //! protocol summary adds the protocol and binding hashes. A whole solved result
 //! adds the entry facts, the full provider execution behavior, and both
-//! remaining budgets.
+//! remaining budgets, plus the exact root and binding artifact allocations.
+//! Weak allocation identities scope raw solver handles without pinning arenas.
 //!
-//! This remains generation-independent: a stale entry is simply an entry
-//! nothing asks for again, and the byte and entry limits retire it. The full
+//! Reusable summaries remain independent of analyzer generations. Exact results
+//! can be reused only while the root and binding allocations agree. A stale
+//! entry is one nothing asks for again; byte and entry limits retire it. The full
 //! workspace behavior conservatively rotates provider-dependent summaries
 //! after an analyzed edit, while call-free leaves remain reusable. This
 //! replaces an earlier generation gate that rotated the whole repository on
@@ -39,7 +41,7 @@ use crate::analyzer::workspace_authority::{ReplayingMemo, ReplayingMemoEntry};
 use crate::semantic_summary::{ProcedureDependencyComponentOrder, ProcedureDependencyGraph};
 use brokk_bifrost_core::analyzer::memo_attribution::ReplayedMemoValue;
 use std::fmt;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 
 use crate::analyzer::semantic::cfg_algorithms::{
     CfgAlgorithmBudget, CfgAlgorithmError, CfgAlgorithmRequest, strongly_connected_components,
@@ -458,7 +460,9 @@ impl ProductionSummaryLifecycleCounters {
     }
 }
 
-/// One bounded, content-keyed in-memory repository owned by one workspace.
+/// One bounded in-memory repository owned by one workspace.
+/// Reusable summaries are content keyed. Exact solver results additionally
+/// bind the root and binding artifact allocations whose live handles they retain.
 ///
 /// Storage survives analyzer generations. Each query creates a reader with
 /// its current analyzer's owned attribution capability; storage never retains
@@ -491,6 +495,24 @@ struct ProductionTypestateSummaryRepositoryState {
     max_result_bytes: usize,
 }
 
+impl ProductionTypestateSummaryRepositoryState {
+    fn evict_expired_results(&mut self) -> usize {
+        let mut evictions = 0;
+        let mut removed_bytes = 0usize;
+        self.results.retain(|key, value| {
+            if key.allocations_are_live() {
+                return true;
+            }
+            evictions += 1;
+            removed_bytes = removed_bytes
+                .saturating_add(key.retained_bytes().saturating_add(value.retained_bytes()));
+            false
+        });
+        self.retained_result_bytes = self.retained_result_bytes.saturating_sub(removed_bytes);
+        evictions
+    }
+}
+
 /// Verification's side of the summary read funnel: what this repository would
 /// answer for a summary identity a base run recorded.
 impl crate::analyzer::SummaryAnswers for ProductionTypestateSummaryRepository {
@@ -510,6 +532,72 @@ impl Default for ProductionTypestateSummaryStorage {
 }
 
 impl ProductionTypestateSummaryStorage {
+    #[cfg(feature = "test-support")]
+    pub(crate) fn retention_census_for_test(
+        self: &Arc<Self>,
+        census: &mut brokk_bifrost_core::retention_census::RetentionCensus<'_>,
+        family: &'static str,
+    ) {
+        use brokk_bifrost_core::retention_census::{
+            AllocationAccounting, FamilyLifetime, ResidentWeightUnit, UnknownKind,
+        };
+
+        const LIFETIME: FamilyLifetime = FamilyLifetime::Persistent;
+        census.record_arc_allocation(
+            Arc::clone(self),
+            family,
+            LIFETIME,
+            "typestate-summary-storage-owner",
+            std::mem::size_of::<Self>() as u64,
+            AllocationAccounting::OutsideBudget,
+        );
+
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        census.record_resident_reading(
+            family,
+            LIFETIME,
+            state.protocol.len().saturating_add(state.results.len()) as u64,
+            state
+                .protocol
+                .retained_bytes()
+                .saturating_add(state.retained_result_bytes) as u64,
+            ResidentWeightUnit::BytesEstimate,
+        );
+        census.record_unknown(
+            family,
+            LIFETIME,
+            UnknownKind::NativeBytes,
+            "protocol-and-result-map-capacity-and-nested-payloads",
+        );
+        census.record_unknown(
+            family,
+            LIFETIME,
+            UnknownKind::ActivePins,
+            "typestate_repository_reader_arc_pins_not_enumerated",
+        );
+        drop(state);
+
+        let flights = self
+            .flights
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !flights.is_empty() {
+            census.record_unknown(
+                family,
+                LIFETIME,
+                UnknownKind::ActivePins,
+                "active-typestate-summary-flights",
+            );
+        }
+        drop(flights);
+
+        self.semantic_summaries
+            .retention_census_for_test(census, "flow.typestate.semantic_summaries");
+    }
+
     pub(crate) fn with_limits(limits: TypestateSummaryRepositoryLimits) -> Self {
         Self::with_shared_semantic_summaries(
             limits,
@@ -575,11 +663,16 @@ impl ProductionTypestateSummaryRepository {
 
     #[cfg(test)]
     pub(super) fn retained_result_receipt_bytes(&self) -> usize {
-        self.state()
+        let mut state = self.state();
+        let evictions = state.evict_expired_results();
+        let bytes = state
             .results
             .values()
             .map(|cached| cached.entry.retained_read_bytes(read_key_heap_bytes))
-            .sum()
+            .sum();
+        drop(state);
+        self.add_evictions(evictions);
+        bytes
     }
 
     /// Retained semantic procedure summaries, the identities shared by every
@@ -642,6 +735,10 @@ impl ProductionTypestateSummaryRepository {
         &self,
         key: &ProductionSummaryResultKey,
     ) -> Option<ReplayedMemoValue<CachedTypestateSummaryResult, ReadKey>> {
+        if !key.allocations_are_live() {
+            self.evict_result(key);
+            return None;
+        }
         ReplayingMemo::new(())
             .read(&self.attribution.capability(), |_, _| {
                 self.state()
@@ -678,8 +775,11 @@ impl ProductionTypestateSummaryRepository {
         entry: Arc<ReplayingMemoEntry<CachedTypestateSummaryResult, ReadKey>>,
     ) -> (bool, usize) {
         let mut state = self.state();
+        let mut evictions = state.evict_expired_results();
         if state.results.contains_key(&key) {
-            return (true, 0);
+            drop(state);
+            self.add_evictions(evictions);
+            return (true, evictions);
         }
         let mut retained = RetainedTypestateSummaryResult {
             entry,
@@ -690,10 +790,10 @@ impl ProductionTypestateSummaryRepository {
             .saturating_add(retained.retained_bytes());
         if state.max_result_entries == 0 || retained_bytes > state.max_result_bytes {
             drop(state);
+            self.add_evictions(evictions);
             self.record_rejection();
-            return (false, 0);
+            return (false, evictions);
         }
-        let mut evictions = 0usize;
         while state.results.len().saturating_add(1) > state.max_result_entries
             || state.retained_result_bytes.saturating_add(retained_bytes) > state.max_result_bytes
         {
@@ -704,6 +804,7 @@ impl ProductionTypestateSummaryRepository {
                 .map(|(key, _)| key.clone())
             else {
                 drop(state);
+                self.add_evictions(evictions);
                 self.record_rejection();
                 return (false, evictions);
             };
@@ -941,12 +1042,47 @@ fn retained_result_entry_bytes(
         .saturating_add(4 * std::mem::size_of::<usize>())
 }
 
+/// A Weak reserves allocation identity without keeping the artifact alive.
+/// Its control block prevents address reuse until this cache key is dropped.
+#[derive(Clone)]
+struct ArtifactAllocation(Weak<crate::analyzer::semantic::SemanticArtifact>);
+
+impl PartialEq for ArtifactAllocation {
+    fn eq(&self, other: &Self) -> bool {
+        Weak::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ArtifactAllocation {}
+
+impl std::hash::Hash for ArtifactAllocation {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::ptr::hash(self.0.as_ptr(), state);
+    }
+}
+
+impl fmt::Debug for ArtifactAllocation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("ArtifactAllocation")
+            .field(&self.0.as_ptr())
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ProductionSummaryResultKey {
     root: ProcedureSummaryIdentity,
     provider_behavior: SummaryBehaviorKey,
     protocol: TypestateProtocolHash,
     bindings: TypestateBindingPlanHash,
+    // Raw reached points and witnesses compare their owning artifact Arcs.
+    // Scope both entries and flights to the root plus every retained binding
+    // arena. Rebuilt plans with the same allocations can hit, while a new
+    // analyzer's equal-content allocations cannot receive stale live handles.
+    // Weak keys reserve identity without pinning arenas; expired entries miss
+    // and are evicted before serving or during publication's entry scan.
+    allocations: Box<[ArtifactAllocation]>,
     entry_facts: Box<[ProtocolFactKey]>,
     provider_context: ProductionTypestateProviderContext,
     semantic_allowance: SemanticWork,
@@ -954,9 +1090,16 @@ struct ProductionSummaryResultKey {
 }
 
 impl ProductionSummaryResultKey {
+    fn allocations_are_live(&self) -> bool {
+        self.allocations
+            .iter()
+            .all(|allocation| allocation.0.upgrade().is_some())
+    }
+
     fn retained_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
             .saturating_add(self.root.retained_bytes())
+            .saturating_add(std::mem::size_of_val(self.allocations.as_ref()))
             .saturating_add(
                 self.entry_facts
                     .iter()
@@ -1092,6 +1235,7 @@ where
             production_summary_behavior(projection_provider.behavior_identity());
         let result_key = production_result_key(
             summary_identity(root, projection_behavior),
+            root.artifact(),
             provider_behavior,
             entry_facts,
             protocol,
@@ -1529,6 +1673,7 @@ where
 #[allow(clippy::too_many_arguments)]
 fn production_result_key(
     root: ProcedureSummaryIdentity,
+    root_artifact: &Arc<crate::analyzer::semantic::SemanticArtifact>,
     provider_behavior: SummaryBehaviorKey,
     entry_facts: &[TypestateFact],
     protocol: &CompiledProtocol,
@@ -1546,11 +1691,18 @@ fn production_result_key(
     stable_entry_facts.push(ProtocolFactKey::Zero);
     stable_entry_facts.sort_unstable();
     stable_entry_facts.dedup();
+    let mut allocations = vec![ArtifactAllocation(Arc::downgrade(root_artifact))];
+    bindings.for_each_retained_artifact(|artifact| {
+        allocations.push(ArtifactAllocation(Arc::downgrade(artifact)));
+    });
+    allocations.sort_unstable_by_key(|allocation| allocation.0.as_ptr() as usize);
+    allocations.dedup();
     Ok(ProductionSummaryResultKey {
         root,
         provider_behavior,
         protocol: protocol.hash(),
         bindings: bindings.hash(),
+        allocations: allocations.into_boxed_slice(),
         entry_facts: stable_entry_facts.into_boxed_slice(),
         provider_context,
         semantic_allowance,
@@ -1786,6 +1938,161 @@ mod root_closure_tests {
     use crate::dataflow::MemberReadReceipt;
     use crate::inline_project::InlineTestProject;
     use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon(
+        "#12266: exact-result keys pinned unused binding arenas instead of evicting expired allocation identities"
+    )]
+    fn expired_binding_allocation_is_evicted_before_exact_result_reuse() {
+        use crate::analyzer::semantic::{
+            AbstractObject, AccessPathRoot, ObjectCardinality, SemanticArtifact,
+        };
+        use crate::cancellation::CancellationToken;
+        use crate::dataflow::{NoSummaryReadObserver, SolverBudget};
+        use crate::typestate::{
+            BoundTypestateSubjectSpec, ProtocolSpec, TypestateBindingQuality,
+            TypestateSubjectClassKey,
+        };
+
+        let project = InlineTestProject::with_language(Language::TypeScript)
+            .file("root.ts", "export function root() { return 1; }\n")
+            .file(
+                "spare.ts",
+                "export function spare(value: object) { return value; }\n",
+            )
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let materialize = |workspace: &WorkspaceAnalyzer, path: &str| {
+            workspace
+                .materialize_program_semantics(
+                    &project.file(path),
+                    &mut SemanticRequest::new(
+                        &mut SemanticBudget::default(),
+                        &CancellationToken::default(),
+                    ),
+                )
+                .unwrap()
+                .available_value()
+                .cloned()
+                .unwrap()
+        };
+        let procedure = |artifact: &Arc<SemanticArtifact>, name: &str| {
+            artifact
+                .procedures()
+                .iter()
+                .find(|procedure| {
+                    procedure
+                        .locator()
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some(name)
+                })
+                .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+                .unwrap()
+        };
+        let root_artifact = materialize(&workspace, "root.ts");
+        let root = procedure(&root_artifact, "root");
+        let protocol = ProtocolSpec::from_json(br#"{
+            "schema_version": 1, "states": ["ready"], "initial_state": "ready",
+            "accepting_states": ["ready"], "error_states": [], "events": [],
+            "transitions": [], "terminal_expectations": [],
+            "semantics": {"analysis_mode": "may", "unmatched_event": "preserve_state",
+                "uncertainty": {"ambiguous_dispatch": "preserve_uncertainty",
+                    "unknown_call": "preserve_uncertainty", "external_call": "preserve_uncertainty",
+                    "escape": "preserve_uncertainty", "incomplete_analysis": "preserve_uncertainty"}}
+        }"#).unwrap().compile().unwrap();
+        let bindings_for = |artifact: &Arc<SemanticArtifact>| {
+            let spare = procedure(artifact, "spare");
+            let value = spare.semantics().values().first().unwrap().id;
+            let object = AbstractObject::new(
+                AccessPathRoot::Value(spare.value_handle(value).unwrap()),
+                ObjectCardinality::Singleton,
+            )
+            .unwrap();
+            // This subject belongs to another root. The binding key must name
+            // its arena, but the cached root's result has no reason to pin it.
+            TypestateBindingPlan::try_new(
+                &protocol,
+                vec![BoundTypestateSubjectSpec::new(
+                    TypestateSubjectClassKey::new("spare").unwrap(),
+                    object,
+                    TypestateBindingQuality::proven_unique(),
+                )],
+                vec![],
+                vec![],
+                vec![],
+            )
+            .unwrap()
+        };
+
+        // Cover both lookup of an expired old key and opportunistic pruning
+        // when publishing a result for the rebuilt, equal-content allocation.
+        for lookup_expired in [true, false] {
+            let repository = ProductionTypestateSummaryRepository::new(
+                crate::analyzer::workspace_authority::workspace_memo_attribution(&workspace),
+            );
+            let solve = |bindings: &TypestateBindingPlan| {
+                let mut solver = SolverBudget::default();
+                solve_typestate_with_production_summaries(
+                    &repository,
+                    &NoSummaryReadObserver,
+                    &root,
+                    &[],
+                    &workspace.icfg_provider(),
+                    &workspace.icfg_provider(),
+                    None,
+                    ProductionTypestateExecutionContext::Workspace,
+                    &protocol,
+                    bindings,
+                    &mut SemanticBudget::default(),
+                    &mut DataflowRequest::new(&mut solver, &CancellationToken::default()),
+                )
+                .unwrap()
+            };
+            let (expired, old_key, artifact_key) = {
+                let spare_workspace = project.workspace_analyzer(AnalyzerConfig::default());
+                let artifact = materialize(&spare_workspace, "spare.ts");
+                let bindings = bindings_for(&artifact);
+                let filled = solve(&bindings);
+                assert_eq!(
+                    filled.cache_status(),
+                    TypestateProductionCacheStatus::MissPublished
+                );
+                assert_eq!(repository.retained_result_count(), 1);
+                let key = repository.state().results.keys().next().unwrap().clone();
+                (Arc::downgrade(&artifact), key, artifact.key().clone())
+            };
+            assert!(
+                expired.upgrade().is_none(),
+                "the cache key must not pin the unused binding arena"
+            );
+
+            let rebuilt_workspace = project.workspace_analyzer(AnalyzerConfig::default());
+            let rebuilt_artifact = materialize(&rebuilt_workspace, "spare.ts");
+            assert_eq!(rebuilt_artifact.key(), &artifact_key);
+            assert!(!Weak::ptr_eq(&expired, &Arc::downgrade(&rebuilt_artifact)));
+            let rebuilt = bindings_for(&rebuilt_artifact);
+            assert_eq!(rebuilt.hash(), old_key.bindings);
+            if lookup_expired {
+                assert!(repository.result(&old_key).is_none());
+                assert_eq!(repository.retained_result_count(), 0);
+            }
+            let recomputed = solve(&rebuilt);
+            assert_eq!(
+                recomputed.cache_status(),
+                TypestateProductionCacheStatus::MissPublished
+            );
+            assert_eq!(
+                recomputed.lifecycle().evictions,
+                usize::from(!lookup_expired)
+            );
+            assert_eq!(repository.retained_result_count(), 1);
+            assert_eq!(repository.counters().evictions, 1);
+            assert!(repository.result(&old_key).is_none());
+        }
+    }
 
     #[test]
     fn unknown_definition_inventory_refuses_conversion() {
@@ -2191,6 +2498,14 @@ where
     while cursor < procedures.len() {
         let procedure = procedures[cursor].clone();
         let mut outstanding_obligations = HashSet::default();
+        if let Some(workspace) = coverage_source
+            && !brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::cleanup_drop_obligations_discharged(
+                &procedure, workspace, request,
+            )? {
+            closure_complete = false;
+            closure_reasons.push(RootCallClosureIncompleteReason::OutstandingObligation);
+        }
+
         let decision = if let Some(workspace) = coverage_source {
             // Both admissions must describe the exact artifact being projected.
             // Keep their decision in one place while the non-call rule is settled.
@@ -2553,17 +2868,34 @@ fn direct_summary_port(
 }
 
 fn direct_value_is_reassigned(
-    semantics: &crate::analyzer::semantic::ProcedureSemantics,
+    procedure: &ProcedureHandle,
     value: ValueId,
     indirect_writes: &HashSet<ValueId>,
 ) -> bool {
+    let semantics = procedure.semantics();
+    let definitely_assigned = crate::analyzer::languages::language_support(
+        procedure.artifact().key().language().language(),
+    )
+    .is_some_and(|support| support.locals_are_definitely_assigned());
+    // With definite assignment, a single assignment can establish a local
+    // scalar. Two writes are mutation, and formal values are never fresh.
+    let mut assignments = semantics.points().iter().flat_map(|point| &point.events)
+        .filter(|event| matches!(event.effect, SemanticEffect::Assignment { target, .. } if target == value));
+    let has_assignment = assignments.next().is_some();
+    let mutated = assignments.next().is_some()
+        || (has_assignment
+            && (!definitely_assigned
+                || semantics
+                    .value(value)
+                    .is_none_or(|value| value.kind != SemanticValueKind::Local)));
     indirect_writes.contains(&value)
+        || mutated
         || semantics
             .points()
             .iter()
             .flat_map(|point| point.events.iter().map(move |event| (point.id, event)))
             .any(|(point, event)| match event.effect {
-                SemanticEffect::Assignment { target, .. } => target == value,
+                SemanticEffect::Assignment { .. } => false,
                 SemanticEffect::MemoryStore { location, .. } => {
                     !semantics.is_formal_cell_initialization(point, &event.effect)
                         && semantics.memory_location(location).is_some_and(
@@ -2587,6 +2919,36 @@ fn indirect_binding_write_targets(
 ) -> HashSet<ValueId> {
     let mut written = HashSet::default();
     let address_taken = origins.address_taken_bindings();
+    // A closure-write can reach the parent's binding unless capture proves
+    // independent value/move storage. Unknown capture modes fail closed.
+    for capture in semantics.captures() {
+        if matches!(
+            capture.mode,
+            crate::analyzer::semantic::CaptureMode::Value
+                | crate::analyzer::semantic::CaptureMode::Move
+        ) {
+            continue;
+        }
+        match capture.captured {
+            crate::analyzer::semantic::CaptureSource::Value(value) => {
+                written.insert(value);
+            }
+            crate::analyzer::semantic::CaptureSource::Location(location) => {
+                if let Some(
+                    MemoryLocationKind::LexicalCell { binding }
+                    | MemoryLocationKind::Capture {
+                        binding: Some(binding),
+                        ..
+                    },
+                ) = semantics
+                    .memory_location(location)
+                    .map(|location| &location.kind)
+                {
+                    written.insert(*binding);
+                }
+            }
+        }
+    }
     for point in semantics.points() {
         for event in &point.events {
             let SemanticEffect::MemoryStore { location, .. } = event.effect else {
@@ -2636,9 +2998,10 @@ pub enum DirectScalarSource {
 /// temporary's value kind loses the exact source. A computed expression,
 /// assignment, or competing source remains unavailable.
 pub fn direct_scalar_source(
-    semantics: &crate::analyzer::semantic::ProcedureSemantics,
+    procedure: &ProcedureHandle,
     mut value: ValueId,
 ) -> Option<DirectScalarSource> {
+    let semantics = procedure.semantics();
     let mut visited = crate::hash::HashSet::default();
     let binding_origins = BindingOriginIndex::from_semantics(semantics);
     let indirect_writes = indirect_binding_write_targets(semantics, &binding_origins);
@@ -2646,7 +3009,7 @@ pub fn direct_scalar_source(
         if !visited.insert(value) {
             return None;
         }
-        let reassigned = direct_value_is_reassigned(semantics, value, &indirect_writes);
+        let reassigned = direct_value_is_reassigned(procedure, value, &indirect_writes);
         if reassigned {
             return None;
         }
@@ -2672,6 +3035,15 @@ pub fn direct_scalar_source(
                     source,
                     target,
                 } if *target == value => Some((*source, None)),
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::Transfer(transfer),
+                    source,
+                    target,
+                } if *target == value
+                    && transfer.kind == crate::analyzer::semantic::TransferKind::Copy =>
+                {
+                    Some((*source, None))
+                }
                 SemanticEffect::ValueFlow {
                     kind: ValueFlowKind::IntegerOffset { offset },
                     source,

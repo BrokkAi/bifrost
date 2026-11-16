@@ -22,7 +22,7 @@ use crate::imports::{
     PythonImportBinding, PythonImportDetails, imported_module_assignment_at,
     python_function_scoped_import_binding, python_import_bindings_from_imports,
     python_import_details, python_imports_by_statement, resolve_fqn_candidates,
-    resolve_python_relative_module,
+    resolve_python_module_specifier,
 };
 use crate::syntax::{
     attribute_chain, is_declaration_identifier, leftmost_identifier, python_plain_string_literal,
@@ -712,7 +712,7 @@ impl ScanCtx<'_> {
     fn function_import_binding_targets_query(&self, ident: &str, node: Node<'_>) -> Option<bool> {
         let binding =
             python_function_scoped_import_binding(self.scoped_import_bindings, ident, node)?;
-        let qualified_name = resolve_python_relative_module(
+        let qualified_name = resolve_python_module_specifier(
             self.python.project(),
             self.file,
             &binding.qualified_name,
@@ -1909,9 +1909,12 @@ fn imported_module_bindings(
             && reference.end_byte() <= binding.scope_end_byte
             && binding.local_name == root_text
     }) {
-        let qualified_name =
-            resolve_python_relative_module(ctx.python.project(), ctx.file, &binding.qualified_name)
-                .unwrap_or_else(|| binding.qualified_name.clone());
+        let qualified_name = resolve_python_module_specifier(
+            ctx.python.project(),
+            ctx.file,
+            &binding.qualified_name,
+        )
+        .unwrap_or_else(|| binding.qualified_name.clone());
         return if usage_resolve_module_files(ctx.python, ctx.file, &qualified_name).is_empty() {
             Vec::new()
         } else {

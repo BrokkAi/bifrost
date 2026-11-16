@@ -32,6 +32,7 @@ pub fn overlay(
     super::composition::freeze_relation_order(relations.iter_mut());
     let budget = brokk_bifrost_core::retention_budget::RetentionBudget::for_tests();
     let mut overlay = SemanticModelOverlay {
+        identity: super::trait_owner_memo::OverlayIdentity::new(),
         rust_reexport_roots: Default::default(),
         rust_reexport_shards: Default::default(),
         rust_reexport_published_roots: Default::default(),

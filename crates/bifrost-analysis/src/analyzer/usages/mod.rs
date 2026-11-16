@@ -12,6 +12,9 @@
 //! - Language-specific graph strategies for JavaScript / TypeScript, Python, PHP, Rust,
 //!   Java, Kotlin, C#, C++, Go, Ruby, and Scala targets.
 
+mod answer;
+#[doc(hidden)]
+pub use answer::{CompleteUsageAnswer, reusable_usage_answer_digest, usage_answer_digest};
 pub mod applicability;
 pub mod call_binding;
 pub mod call_conversion;
@@ -78,10 +81,13 @@ pub use brokk_bifrost_core::analyzer::usages::receiver_analysis;
 pub use brokk_bifrost_core::analyzer::usages::reference_site;
 
 #[doc(hidden)]
-pub fn read_source(file: &crate::analyzer::ProjectFile) -> Result<String, String> {
-    file.read_to_string().map_err(|err| {
+pub fn read_source(
+    analyzer: &dyn crate::analyzer::IAnalyzer,
+    file: &crate::analyzer::ProjectFile,
+) -> Result<String, String> {
+    analyzer.indexed_source(file).ok_or_else(|| {
         format!(
-            "failed to read `{}`: {err}",
+            "indexed source unavailable for `{}`",
             crate::path_utils::rel_path_string(file)
         )
     })
@@ -138,10 +144,12 @@ pub use call_relations::CallArgument;
 
 pub use call_relations::CallBindingCache;
 pub use call_relations::CallBindingStatus;
+pub use call_relations::CallRelationBudgetRefusal;
 pub use call_relations::CallRelationDiagnostic;
 pub use call_relations::CallRelationDiagnosticCode;
 pub use call_relations::CallRelationLimits;
 pub use call_relations::CallRelationResult;
+pub use call_relations::CallRelationScanLimit;
 pub use call_relations::CallSite;
 pub use call_relations::bind_call_site_arguments;
 
@@ -232,9 +240,22 @@ use crate::analyzer::IAnalyzer;
 /// Convenience equivalent to [`crate::analyzer::IAnalyzer::find_usages`] for callers that
 /// only hold a `&dyn IAnalyzer`.
 pub fn find_usages(analyzer: &dyn IAnalyzer, overloads: &[CodeUnit]) -> FuzzyResult {
-    let result = crate::analyzer::i_analyzer::capture_usage_lookup_reads(analyzer, || {
-        UsageFinder::new().find_usages(analyzer, overloads, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES)
+    query_usages(analyzer, overloads, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES)
+        .into_fuzzy_result(overloads)
+}
+
+/// Query and publish the full usage answer, including execution coverage.
+pub fn query_usages(
+    analyzer: &dyn IAnalyzer,
+    overloads: &[CodeUnit],
+    max_files: usize,
+    max_usages: usize,
+) -> QueryResult {
+    let query = crate::analyzer::i_analyzer::capture_usage_lookup_reads(analyzer, || {
+        UsageFinder::new()
+            .with_cancellation(analyzer.active_query_cancellation().unwrap_or_default())
+            .query(analyzer, overloads, max_files, max_usages)
     });
-    crate::analyzer::i_analyzer::record_usage_lookup(analyzer, overloads, &result);
-    result
+    crate::analyzer::i_analyzer::record_usage_lookup(analyzer, overloads, &query);
+    query
 }

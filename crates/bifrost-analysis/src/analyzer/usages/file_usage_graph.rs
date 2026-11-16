@@ -36,7 +36,7 @@ pub fn build_workspace_file_usage_graph_with_cancellation(
 ) -> WorkspaceFileUsageGraphBuildOutcome {
     let (files, inventory_complete) = {
         let _scope = profiling::scope("file_usage_graph.files");
-        let inventory = analyzer.source_file_inventory();
+        let inventory = crate::analyzer::i_analyzer::SourceInventoryPreflight::acquire(analyzer);
         let mut files = inventory
             .rows
             .into_iter()
@@ -48,7 +48,7 @@ pub fn build_workspace_file_usage_graph_with_cancellation(
             .collect::<Vec<_>>();
         files.sort();
         files.dedup();
-        (files, inventory.complete)
+        (files, inventory.completion)
     };
     if cancellation.is_cancelled() {
         return WorkspaceFileUsageGraphBuildOutcome::Cancelled;
@@ -67,7 +67,7 @@ pub fn build_workspace_file_usage_graph_with_cancellation(
             .collect();
         let adjacency = vec![Vec::new(); files.len()];
         let graph = file_graph(files, indices, adjacency, contains_tests);
-        return if inventory_complete {
+        return if inventory_complete.is_complete() {
             WorkspaceFileUsageGraphBuildOutcome::Complete(graph)
         } else {
             WorkspaceFileUsageGraphBuildOutcome::Incomplete(graph)
@@ -103,7 +103,7 @@ pub fn build_workspace_file_usage_graph_with_cancellation(
 
     // Optional prefetch implementations may hydrate their whole input set.
     // A partial authoritative batch must not invite catch-up for missing files.
-    if inventory_complete && import_facts_complete {
+    if inventory_complete.is_complete() && import_facts_complete {
         let _scope = profiling::scope("file_usage_graph.prefetch_targets");
         provider.prefetch_file_dependency_targets(&files, import_infos.as_ref(), cancellation);
     }
@@ -181,7 +181,8 @@ pub fn build_workspace_file_usage_graph_with_cancellation(
         let _scope = profiling::scope("file_usage_graph.compact");
         file_graph(files, indices, adjacency, contains_tests)
     };
-    if inventory_complete && import_facts_complete && additional_dependencies_complete {
+    if inventory_complete.is_complete() && import_facts_complete && additional_dependencies_complete
+    {
         WorkspaceFileUsageGraphBuildOutcome::Complete(graph)
     } else {
         WorkspaceFileUsageGraphBuildOutcome::Incomplete(graph)

@@ -33,7 +33,12 @@
 -- inventory read (`rust_crate_point_inventory.sql`) reopens the module.
 INSERT INTO cr_gaps
 SELECT 'open_export_inventory', member.module_path,
-       json_object('subject_level', 'module', 'member_blob', member.blob_id,
+       json_object('subject_level', 'module', 'unit_key', (SELECT hex(crate_key) FROM cr_identity),
+                   'module_path', member.module_path, 'kind', 'macro_invocation',
+                   'namespace', 'macro', 'origin', 'invocation',
+                   'name', (SELECT head.macro_name FROM source_rust_macro_invocations AS head
+                            WHERE head.blob_id=invocation.blob_id AND head.occurrence_id=invocation.invocation_occurrence_id),
+                   'member_blob', member.blob_id,
                    'invocation_occurrence', invocation.invocation_occurrence_id,
                    'macro', (SELECT head.macro_name FROM source_rust_macro_invocations AS head
                              WHERE head.blob_id=invocation.blob_id
@@ -107,7 +112,12 @@ UNION ALL
 -- above cannot see it, because the invocation encloses this module rather
 -- than lying in it.
 SELECT 'open_export_inventory', member.module_path,
-       json_object('subject_level', 'module', 'member_blob', member.blob_id,
+       json_object('subject_level', 'module', 'unit_key', (SELECT hex(crate_key) FROM cr_identity),
+                   'module_path', member.module_path, 'kind', 'macro_invocation',
+                   'namespace', 'macro', 'origin', 'invocation',
+                   'name', (SELECT head.macro_name FROM source_rust_macro_invocations AS head
+                            WHERE head.blob_id=invocation.blob_id AND head.occurrence_id=invocation.invocation_occurrence_id),
+                   'member_blob', member.blob_id,
                    'invocation_occurrence', invocation.invocation_occurrence_id,
                    'macro', (SELECT head.macro_name FROM source_rust_macro_invocations AS head
                              WHERE head.blob_id=invocation.blob_id
@@ -172,4 +182,20 @@ WHERE candidate.nearest_declaration_boundary = 0
                    AND invocation.invocation_start_byte <= declaration.start_byte
                    AND declaration.end_byte <= invocation.invocation_end_byte
                   WHERE declaration.blob_id = candidate.blob_id
-                    AND declaration.declaration_id = candidate.declaration_id);
+                    AND declaration.declaration_id = candidate.declaration_id)
+UNION ALL
+-- These exported macros have no CodeUnit or persisted native name (#13030).
+-- They belong to the crate root, whose macro inventory cannot prove absence.
+-- Binding-level evidence scopes this unnamed owner blocker to macros; opaque
+-- invocation evidence uses subject_level=module to open every namespace.
+SELECT DISTINCT 'open_export_inventory', 'crate',
+       json_object('subject_level', 'binding', 'namespace', 'macro',
+                   'member_blob', properties.blob_id,
+                   'declaration_id', properties.declaration_id,
+                   'reason', 'UnloweredDeclaration')
+FROM cr_placed_source_declarations AS declaration
+CROSS JOIN rust_body_local_macro_exports AS properties
+ ON properties.blob_id=declaration.blob_id
+ AND properties.declaration_id=declaration.declaration_id
+-- The same stored effective condition and evaluator serve selected overlays.
+WHERE cr_cfg(properties.cfg_condition, ?2)<>0;

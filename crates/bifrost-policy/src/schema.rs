@@ -1,4 +1,4 @@
-//! Executable schema metadata for RQLP schema version 1.
+//! Executable schema metadata for RQLP schema version 2.
 //!
 //! This module is the single vocabulary registry for policy and endpoint
 //! authoring.  The source decoder, hover/completion support, formatter, and
@@ -7,30 +7,68 @@
 
 use super::definition::CvssMetricValueToken;
 use brokk_bifrost_analysis::schema_version::{
-    SchemaVersionDescriptor, SchemaVersionRegistry, SchemaVersionResolution,
+    SchemaVersionChange, SchemaVersionDescriptor, SchemaVersionRegistry, SchemaVersionResolution,
     UnsupportedSchemaVersion,
 };
 use std::sync::OnceLock;
 
-pub const POLICY_SCHEMA_VERSION: u32 = 1;
+// #11466: typed return-value paths require explicit policy syntax support.
+pub const POLICY_SCHEMA_VERSION: u32 = 2;
 
-const POLICY_SCHEMA_VERSIONS: &[SchemaVersionDescriptor] = &[SchemaVersionDescriptor::new(
-    POLICY_SCHEMA_VERSION,
-    None,
-    true,
-)];
+/// First policy syntax that can represent projected return ports.
+pub(crate) const PROJECTED_RETURN_VALUE_SCHEMA_VERSION: u32 = 2;
+
+const POLICY_SCHEMA_VERSIONS: &[SchemaVersionDescriptor] = &[
+    SchemaVersionDescriptor::new(1, None, true),
+    SchemaVersionDescriptor::new(POLICY_SCHEMA_VERSION, Some(1), true),
+];
 
 static POLICY_SCHEMA_VERSION_REGISTRY: OnceLock<SchemaVersionRegistry> = OnceLock::new();
+
+/// Every readable policy schema, including retained exact older pins.
+pub fn supported_policy_schema_versions() -> Vec<u32> {
+    POLICY_SCHEMA_VERSIONS
+        .iter()
+        .map(|descriptor| descriptor.version)
+        .collect()
+}
+
+// Every policy format version must declare whether it changes old meaning.
+// Additive vocabulary must not rotate identities for untouched documents.
+const POLICY_SCHEMA_CHANGES: &[(u32, SchemaVersionChange)] = &[
+    (1, SchemaVersionChange::Additive),
+    (2, SchemaVersionChange::Additive),
+];
+
+fn policy_schema_registry() -> &'static SchemaVersionRegistry {
+    POLICY_SCHEMA_VERSION_REGISTRY.get_or_init(|| {
+        SchemaVersionRegistry::new(POLICY_SCHEMA_VERSIONS)
+            .expect("the compiled-in RQLP schema lineage must be valid")
+            .with_changes(POLICY_SCHEMA_CHANGES)
+    })
+}
 
 pub(crate) fn resolve_policy_schema_version(
     authored_version: Option<u32>,
 ) -> Result<SchemaVersionResolution, UnsupportedSchemaVersion> {
-    POLICY_SCHEMA_VERSION_REGISTRY
-        .get_or_init(|| {
-            SchemaVersionRegistry::new(POLICY_SCHEMA_VERSIONS)
-                .expect("the compiled-in RQLP schema lineage must be valid")
-        })
-        .resolve(authored_version)
+    match authored_version {
+        Some(version) => policy_schema_registry().resolve(Some(version)),
+        None => infer_policy_schema_version(1),
+    }
+}
+
+pub(crate) fn infer_policy_schema_version(
+    required_version: u32,
+) -> Result<SchemaVersionResolution, UnsupportedSchemaVersion> {
+    policy_schema_registry().infer_for_constructs(required_version)
+}
+
+/// Decode the supported vocabulary first, then infer from the typed document.
+/// Explicit pins stay exact so a newer construct remains a typed rejection.
+pub(crate) fn decode_policy_schema_version(
+    authored_version: Option<u32>,
+) -> Result<SchemaVersionResolution, UnsupportedSchemaVersion> {
+    policy_schema_registry().resolve(authored_version)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -299,6 +337,11 @@ policy_records! {
     GeneratedMessage { labels: ["generated-message"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(generated-message :relation can-reach)", description: "Generate the fixed source-display can-reach sink-display message after proven flow." }
     CvssSeverity { labels: ["cvss-severity"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ALL, signature: "(cvss-severity :when-unscored unrated|note|warning|error)", description: "Derive severity from CVSS with an explicit unscored fallback." }
     ProvenSubset { labels: ["proven-subset"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ALL, signature: "(proven-subset :reason \"text\")", description: "Declare that the policy reports proven findings but is not exhaustive." }
+    ReturnValue { labels: ["return-value"], layout: KeywordPairs, owner: OwnerApplicability::BOTH, signature: "(return-value :path [STEP...])", description: "Bind a typed component of the normal return value." }
+    ProjectionElement { labels: ["element"], layout: KeywordPairs, owner: OwnerApplicability::BOTH, signature: "(element)", description: "Select a summarized indexed element." }
+    ProjectionTuple { labels: ["tuple"], layout: KeywordPairs, owner: OwnerApplicability::BOTH, signature: "(tuple :index N)", description: "Select a tuple component." }
+    ProjectionNamed { labels: ["named"], layout: KeywordPairs, owner: OwnerApplicability::BOTH, signature: "(named :name NAME)", description: "Select a named field." }
+    ProjectionVariant { labels: ["variant"], layout: KeywordPairs, owner: OwnerApplicability::BOTH, signature: "(variant :declaration ID)", description: "Select a variant by authoritative member declaration ID." }
     Argument { labels: ["argument"], layout: KeywordPairs, owner: OwnerApplicability::BOTH, signature: "(argument :index N) | (argument :name \"NAME\")", description: "Bind a zero-based argument index or exact formal argument name." }
     ArgumentCondition { labels: ["argument-condition"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TYPESTATE, signature: "(argument-condition :argument (argument :index N) :equals true|false)", description: "Require one direct call argument to have an exact Boolean value." }
     Result { labels: ["result"], layout: Mixed, owner: OwnerApplicability::BOTH, signature: "(result :index N) | (result true|false|nil|non-nil [:index N])", description: "Bind one zero-based normal call result, or name the accepting result of a conditional sanitizer." }
@@ -679,6 +722,7 @@ macro_rules! value_shapes {
                     | Self::TaintTags
                     | Self::TaintImpacts
                     | Self::Strings
+                    | Self::ProjectionPath
                     | Self::CatalogRefs
                     | Self::MatchEndpointSets
                     | Self::EndpointSetFileRefs
@@ -733,6 +777,7 @@ macro_rules! value_shapes {
             /// `atom_domain` and `description`.
             pub fn accepted_records(self) -> &'static [PolicyRecord] {
                 match self {
+                    Self::ProjectionPath => &[PolicyRecord::ProjectionElement, PolicyRecord::ProjectionTuple, PolicyRecord::ProjectionNamed, PolicyRecord::ProjectionVariant],
                     Self::SanitizerWhen => &[PolicyRecord::Result],
                     Self::SanitizerOperand => &[PolicyRecord::Argument],
                     Self::SanitizerRequires => &[PolicyRecord::ReceiverRequirement, PolicyRecord::Argument],
@@ -757,11 +802,12 @@ macro_rules! value_shapes {
                     | Self::PolicyPort
                     | Self::TypestateBinding
                     | Self::TypestateCallBinding
-                    | Self::ExternalModelPort => &[PolicyRecord::Argument, PolicyRecord::Result],
+                    | Self::ExternalModelPort => &[PolicyRecord::Argument, PolicyRecord::Result, PolicyRecord::ReturnValue],
                     Self::TypestateArgumentCondition => &[PolicyRecord::ArgumentCondition],
                     Self::ExternalModelWritePort => &[
                         PolicyRecord::Argument,
                         PolicyRecord::Result,
+                        PolicyRecord::ReturnValue,
                         PolicyRecord::Field,
                     ],
                     Self::EndpointSemantics => &[
@@ -1038,6 +1084,7 @@ value_shapes! {
     EndpointRole => "source or sink",
     EndpointBinding => "matched-value, receiver, return-value, an indexed result record, or an argument record",
     EndpointSemantics => "source-semantics or sink-semantics matching the endpoint role",
+    ProjectionPath => "a non-empty vector of typed component steps",
     PolicyPort => "matched-value, receiver, return-value, an indexed result record, or an argument record",
     SanitizerWhen => "a result condition: true, false, nil, or non-nil, with optional result index",
     SanitizerResult => "true, false, nil, or non-nil",
@@ -1257,6 +1304,11 @@ const SET_256: ValueMultiplicity = ValueMultiplicity::set(0, 256);
 const NON_EMPTY_SET_256: ValueMultiplicity = ValueMultiplicity::set(1, 256);
 
 policy_fields! {
+    ReturnValuePath { record: ReturnValue, labels: ["path"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: ProjectionPath, owner: OwnerApplicability::BOTH, signature: ":path [STEP...]", description: "Select a typed return component." }
+    ProjectionTupleIndex { record: ProjectionTuple, labels: ["index"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: NonNegativeInteger, owner: OwnerApplicability::BOTH, signature: ":index N", description: "Zero-based tuple component." }
+    ProjectionNamedName { record: ProjectionNamed, labels: ["name"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: Name, owner: OwnerApplicability::BOTH, signature: ":name NAME", description: "Exact field name." }
+    ProjectionVariantDeclaration { record: ProjectionVariant, labels: ["declaration"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: Name, owner: OwnerApplicability::BOTH, signature: ":declaration ID", description: "Authoritative variant member declaration ID." }
+
     PolicySchemaVersion { record: Policy, labels: ["schema-version"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: SchemaVersion, owner: OwnerApplicability::POLICY_ALL, signature: ":schema-version N", description: "Pin the RQLP version exactly; omission selects the compatible lineage head." }
     PolicyId { record: Policy, labels: ["id"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: PolicyId, owner: OwnerApplicability::POLICY_ALL, signature: ":id \"lowercase.policy-id\"", description: "Set the stable opaque policy and SARIF rule identity." }
     PolicyName { record: Policy, labels: ["name"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: Name, owner: OwnerApplicability::POLICY_ALL, signature: ":name \"Human name\"", description: "Set the human-readable policy name." }
@@ -1964,6 +2016,7 @@ atom_values! {
     RoleValueReference { domain: OccurrenceRole, spellings: ["value_reference"], owner: OwnerApplicability::POLICY_ASSERTION, description: "A plain read or write of a value in expression position." }
     RoleGlobalDirective { domain: OccurrenceRole, spellings: ["global_directive"], owner: OwnerApplicability::POLICY_ASSERTION, description: "A name declared by a Python global statement." }
     RoleNonlocalDirective { domain: OccurrenceRole, spellings: ["nonlocal_directive"], owner: OwnerApplicability::POLICY_ASSERTION, description: "A name declared by a Python nonlocal statement." }
+    RoleCalleePosition { domain: OccurrenceRole, spellings: ["callee_position"], owner: OwnerApplicability::POLICY_ASSERTION, description: "The terminal identifier of a Rust call's callee path, including local-binding callees; policies opt in explicitly." }
     ExpectDeclaration { domain: ExpectedOccurrence, spellings: ["declaration"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Require declaration-class rows at the asserted role." }
     ExpectReference { domain: ExpectedOccurrence, spellings: ["reference"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Require reference-class rows at the asserted role." }
     ExpectBinding { domain: ExpectedOccurrence, spellings: ["binding"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Require binding-class rows at the asserted role." }
@@ -2157,15 +2210,20 @@ mod tests {
     }
 
     #[test]
-    fn policy_schema_version_one_is_the_compatible_head_and_exact_pin() {
+    fn policy_schema_versions_keep_exact_pins_and_advance_the_compatible_head() {
         let inferred = resolve_policy_schema_version(None).unwrap();
-        assert_eq!(inferred.version, POLICY_SCHEMA_VERSION);
+        assert_eq!(inferred.version, 1);
+        assert_eq!(
+            decode_policy_schema_version(None).unwrap().version,
+            POLICY_SCHEMA_VERSION
+        );
         assert_eq!(inferred.origin, SchemaVersionOrigin::ImplicitCompatible);
 
         let explicit = resolve_policy_schema_version(Some(1)).unwrap();
-        assert_eq!(explicit.version, POLICY_SCHEMA_VERSION);
+        assert_eq!(explicit.version, 1);
         assert_eq!(explicit.origin, SchemaVersionOrigin::Explicit);
-        assert!(resolve_policy_schema_version(Some(2)).is_err());
+        assert!(resolve_policy_schema_version(Some(POLICY_SCHEMA_VERSION)).is_ok());
+        assert!(resolve_policy_schema_version(Some(POLICY_SCHEMA_VERSION + 1)).is_err());
     }
     #[test]
     fn lookup_is_record_contextual_and_accepts_colon_prefixed_keywords() {

@@ -1834,7 +1834,7 @@ fn java_native_nested_creation_actual_never_borrows_an_imported_type() {
             for outcome in [&stored.value_types, &direct.value_types] {
                 assert_eq!(
                     outcome.status,
-                    brokk_bifrost_analysis::analyzer::usages::get_type::TypeLookupStatus::Incomplete,
+                    brokk_bifrost_analysis::analyzer::usages::get_type::TypeLookupStatus::Resolved,
                     "{outcome:?}"
                 );
                 let candidates = outcome
@@ -1843,21 +1843,8 @@ fn java_native_nested_creation_actual_never_borrows_an_imported_type() {
                     .map(|ty| ty.fqn.as_str())
                     .collect::<Vec<_>>();
                 assert_eq!(candidates, ["Types.Nested"], "{outcome:?}");
-                assert_eq!(outcome.diagnostics.len(), 2, "{outcome:?}");
-                let unsupported = outcome
-                    .diagnostics
-                    .iter()
-                    .find(|diagnostic| diagnostic.kind == "UnsupportedSemantic")
-                    .expect("qualified-prefix obligation");
-                let payload: serde_json::Value =
-                    serde_json::from_str(&unsupported.message).expect("structured diagnostic");
-                assert_eq!(payload["semantic"], "ambiguous_qualified_type");
-                assert!(
-                    outcome
-                        .diagnostics
-                        .iter()
-                        .any(|diagnostic| { diagnostic.kind == "incomplete_native_type" })
-                );
+                // JLS 6.4.2: the unique source type answers the qualified-prefix obligation.
+                assert!(outcome.diagnostics.is_empty(), "{outcome:?}");
             }
         }
         assert_eq!(
@@ -1882,10 +1869,9 @@ fn java_native_nested_creation_actual_never_borrows_an_imported_type() {
         known_owner.is_some() && known_owner != imported,
         "the known enclosing instance supplies Holder.Input, never the imported Input: {known_owner:?}"
     );
-    // S3 prefix reclassification discharges the qualified-prefix obligation and restores
-    // the static type; S2 keeps that obligation Open.
+    // The selected type frontier discharges the qualified-prefix obligation (JLS 6.4.2).
     assert!(
-        type_qualified.is_none() && type_qualified != imported && type_qualified != known_owner,
+        type_qualified.is_some() && type_qualified != imported && type_qualified != known_owner,
         "a type-qualified creation never borrows either Input type: {type_qualified:?}"
     );
     // #5344: both focused selectors must finish, not just retain the right target.
@@ -2597,6 +2583,7 @@ fn static_type_qualifier_boundary_requires_its_active_model_owner_identity() {
     let boundary = SemanticId::local(0, 1);
     let digest = [42; 32];
     let binding = NativeExternalArgumentBinding {
+        implicit_receiver: false,
         completion: ResolutionCompletion::incomplete([ResolutionIncompleteReason::OpenBoundary {
             semantic: boundary,
             status: BoundaryStatus::ExternalDeclaredUnindexed,
@@ -2619,11 +2606,11 @@ fn static_type_qualifier_boundary_requires_its_active_model_owner_identity() {
     let mut same_model = Vec::new();
     binding.extend_static_type_qualifier_reasons(&proofs[0], &mut same_model);
     assert_eq!(same_model, vec![digest], "prove the identity guard ran");
-    assert!(binding.admits(&proofs[0], "java.lang.Class", "forName", &same_model));
+    assert!(binding.admits(&proofs[0], "java.lang.Class", "forName", &same_model, &[]));
     let mut other_model = Vec::new();
     binding.extend_static_type_qualifier_reasons(&proofs[1], &mut other_model);
     assert!(other_model.is_empty());
-    assert!(!binding.admits(&proofs[1], "java.lang.Class", "forName", &other_model));
+    assert!(!binding.admits(&proofs[1], "java.lang.Class", "forName", &other_model, &[]));
 }
 
 #[test]
@@ -2737,6 +2724,7 @@ fn model_declared_value_receiver_keeps_its_owner_boundary() {
         "{outcome:?}"
     );
     let binding = NativeExternalArgumentBinding {
+        implicit_receiver: false,
         completion: ResolutionCompletion::incomplete([owner_reason]),
         members: Vec::new(),
         reason_digests: vec![(semantic, digest)],
@@ -2991,7 +2979,10 @@ fn java_native_nested_argument_budget_stop_keeps_outer_point_incomplete() {
     };
     use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit;
 
-    let source = "class A { void run() { int x0 = 0; int x1 = x0 + 1; int x2 = x1 + 1; int x3 = x2 + 1; sink(x3); } }";
+    // The nested argument is a nominal reference type. #12370 resolves an
+    // intrinsic primitive leaf without the exact-type-links walk, which would
+    // make the argument point cheaper than the outer binding root.
+    let source = "class A { static class B {} void run() { B x0 = new B(); B x1 = x0; B x2 = x1; B x3 = x2; sink(x3); } }";
     let path = "A.java";
     let fixture = InlineTestProject::with_language(Language::Java)
         .file(path, source)
@@ -3906,4 +3897,210 @@ fn java_native_batch_candidate_paths_keep_operation_ledgers() {
         operations * 2,
         "each point keeps its own operation"
     );
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#11529: an equal omission of one JVM operation passed, since empty profiles emitted no line and lines had no identity"
+)]
+fn jvm_operation_lines_cover_every_request_range_exactly() {
+    use brokk_bifrost_analysis::analyzer::usages::get_definition::{
+        DefinitionLookupRequest, resolve_call_target_batch_with_source,
+    };
+    use brokk_bifrost_core::analyzer::query_token::QueryScope;
+    use serde_json::Value;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    // The profile path is read once per process, so the child process owns it.
+    const CHILD: &str = "BIFROST_TEST_JVM_OPERATION_INVENTORY_CHILD";
+    let profile = tempfile::TempDir::new().unwrap();
+    let seam = profile.path().join("seam.jsonl");
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "analyzer::java::native_points::tests::jvm_operation_lines_cover_every_request_range_exactly",
+                "--nocapture",
+            ])
+            .env("BIFROST_SEAM_PROFILE", &seam)
+            .env(CHILD, "1")
+            .env("BIFROST_TRIAL_NATIVE_JAVA", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let rows = std::fs::read_to_string(&seam)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let operations = rows
+            .iter()
+            .filter(|row| row["kind"] == "jvm_operation_reads")
+            .collect::<Vec<_>>();
+        let requests = rows
+            .iter()
+            .filter(|row| row["kind"] == "request")
+            .collect::<Vec<_>>();
+        let ids = operations
+            .iter()
+            .map(|operation| operation["op"].as_u64().unwrap())
+            .collect::<Vec<_>>();
+        // Every id is written once, with nothing missing below the highest.
+        assert_eq!(
+            ids.iter().copied().collect::<BTreeSet<_>>(),
+            (0..ids.len() as u64).collect::<BTreeSet<_>>(),
+            "ids are unique and dense: {ids:?}"
+        );
+        assert!(
+            operations
+                .iter()
+                .all(|operation| operation["status"] == "completed")
+        );
+        let by_id = operations
+            .iter()
+            .map(|operation| (operation["op"].as_u64().unwrap(), *operation))
+            .collect::<BTreeMap<_, _>>();
+        // Four requests: two sequential, then a nested pair that overlap.
+        assert_eq!(requests.len(), 4, "{requests:?}");
+        let mut covered = BTreeSet::new();
+        for request in &requests {
+            let seq = request["seq"].as_u64().unwrap();
+            let range = &request["jvm_operations"];
+            let (first, next) = (
+                range["first"].as_u64().unwrap(),
+                range["next"].as_u64().unwrap(),
+            );
+            assert!(next > first, "request {seq} opened no operation: {request}");
+            assert_eq!(range["completed"].as_u64().unwrap(), next - first);
+            for id in first..next {
+                let operation = by_id[&id];
+                if request["overlapped"] == true {
+                    assert!(
+                        operation["overlapped"] == true || operation["request"].is_u64(),
+                        "{operation}"
+                    );
+                } else {
+                    assert_eq!(operation["request"], seq, "{operation}");
+                    assert!(operation.get("unattributed").is_none());
+                }
+                // Overlapping requests share the ids opened while both were open.
+                if request["overlapped"] == true {
+                    covered.insert(id);
+                } else {
+                    assert!(covered.insert(id), "id {id} is in two request ranges");
+                }
+            }
+        }
+        // The batch outside every request is unattributed, and only it is.
+        let unattributed = by_id
+            .iter()
+            .filter(|(_, operation)| operation["unattributed"] == true)
+            .map(|(id, _)| *id)
+            .collect::<BTreeSet<_>>();
+        assert!(!unattributed.is_empty());
+        assert_eq!(
+            unattributed,
+            (0..ids.len() as u64)
+                .collect::<BTreeSet<_>>()
+                .difference(&covered)
+                .copied()
+                .collect::<BTreeSet<_>>()
+        );
+        // The overlapped pair is two requests that opened together.
+        assert!(requests[2]["overlapped"] == true && requests[3]["overlapped"] == true);
+        assert!(requests[0]["overlapped"] == false && requests[1]["overlapped"] == false);
+        // An operation that read nothing is an explicit empty line.
+        assert!(
+            operations
+                .iter()
+                .any(|operation| operation["reads"].as_array().unwrap().is_empty()),
+            "{operations:?}"
+        );
+        assert!(
+            operations
+                .iter()
+                .any(|operation| !operation["reads"].as_array().unwrap().is_empty())
+        );
+        return;
+    }
+
+    let source = "package p; class A { void run(Missing a) { f(f(f(0))); f(0); } }";
+    let path = "src/main/java/p/A.java";
+    let fixture = InlineTestProject::with_language(Language::Java)
+        .file(path, source)
+        .build();
+    let analyzer = JavaAnalyzer::new(fixture.project_dyn());
+    let _inventory = analyzer.external_declaration_index();
+    let file = fixture.file(path);
+    let tree = brokk_bifrost_analysis::analyzer::usages::get_definition::parse_tree_for_language(
+        &file,
+        Language::Java,
+        source,
+    )
+    .unwrap();
+    let mut pending = vec![tree.root_node()];
+    let mut sites = Vec::new();
+    while let Some(node) = pending.pop() {
+        if node.kind() == "method_invocation" {
+            sites.push(node.child_by_field_name("name").unwrap());
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.named_children(&mut cursor));
+    }
+    sites.sort_by_key(|node| node.start_byte());
+    let lookup = || {
+        let requests = sites
+            .iter()
+            .map(|node| DefinitionLookupRequest {
+                file: file.clone(),
+                line: None,
+                column: None,
+                start_byte: Some(node.start_byte()),
+                end_byte: Some(node.end_byte()),
+            })
+            .collect();
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let outcomes = resolve_call_target_batch_with_source(
+            &analyzer,
+            scope.token(),
+            requests,
+            file.clone(),
+            source.into(),
+            None,
+        );
+        assert_eq!(outcomes.len(), sites.len());
+    };
+    use brokk_bifrost_analysis::seam_profile::request_scope;
+    {
+        let _request = request_scope("first");
+        lookup();
+        // An operation that opens and reads nothing: a known-empty line, not
+        // an absent one. Point lookups always read, so open one directly.
+        let cancellation = CancellationToken::new();
+        let recipe =
+            crate::analyzer::jvm::selected_operation::SelectedJvmRecipe::new(analyzer.inner())
+                .unwrap();
+        let opened = recipe.open(&cancellation).unwrap();
+        assert!(matches!(
+            opened,
+            crate::analyzer::jvm::selected_operation::SelectedJvmOperationOutcome::Ready(_)
+        ));
+        drop(opened);
+    }
+    {
+        let _request = request_scope("second");
+        lookup();
+    }
+    {
+        let _outer = request_scope("outer");
+        let _inner = request_scope("inner");
+        lookup();
+    }
+    // Opened while no request is: a warm-up or a path no tool call covers.
+    lookup();
 }

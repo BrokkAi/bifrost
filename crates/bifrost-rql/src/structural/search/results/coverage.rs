@@ -221,6 +221,7 @@ impl CodeQueryResultValue {
                     value.coverage,
                     coverage if coverage == CallShapeCoverage::Exact.label()
                         || coverage == CallShapeCoverage::ExactMacroDerived.label()
+                        || coverage == CallShapeCoverage::AdmittedCandidateMacro.label()
                 ) {
                     CodeQueryRowCoverageExtent::Exhaustive
                 } else {

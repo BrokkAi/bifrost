@@ -208,10 +208,6 @@ pub fn run_selected_worker<'store, 'project, A: WorkerAnswer>(
 where
     'store: 'project,
 {
-    assert!(
-        !store.uses_single_connection_reads(),
-        "workers require independent readers"
-    );
     let mut selected =
         match store.open_selected_resolution_operation(input.input(), cancellation)? {
             SelectedResolutionOperationOpenOutcome::Ready(selected) => *selected,
@@ -281,10 +277,6 @@ pub fn schedule_selected_queue<I: Sync, A: WorkerAnswer>(
     };
 
     assert!(worker_count > 0);
-    assert!(
-        !store.uses_single_connection_reads(),
-        "queue workers require independent readers"
-    );
     assert_eq!(items.len(), dispatch_order.len());
     let mut seen = vec![false; items.len()];
     for &index in dispatch_order {

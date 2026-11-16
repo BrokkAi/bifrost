@@ -217,8 +217,10 @@ pub(in crate::analyzer::kotlin::semantic) fn type_admits_overrides(declaration: 
 /// Whether a `navigation_expression` selects through the null-safe `?.`
 /// operator rather than the ordinary `.`.
 pub(in crate::analyzer::kotlin::semantic) fn is_safe_navigation(node: Node<'_>) -> bool {
-    node.kind() == "navigation_expression"
-        && child_of_kind(node, "navigation_suffix").is_some_and(|suffix| has_token(suffix, "?."))
+    matches!(
+        node.kind(),
+        "navigation_expression" | "directly_assignable_expression"
+    ) && child_of_kind(node, "navigation_suffix").is_some_and(|suffix| has_token(suffix, "?."))
 }
 
 /// The member selected by a `navigation_expression`.
@@ -457,6 +459,114 @@ pub(in crate::analyzer::kotlin::semantic) fn assignment_target(
         },
         Some(_) => AssignmentTarget::Opaque(node),
     }
+}
+
+/// The property a `getter`/`setter` belongs to.
+///
+/// The grammar admits both nestings: an accessor written on the same line is a
+/// child of the `property_declaration`, while one written on the following line
+/// becomes its next sibling in the class body.
+pub(in crate::analyzer::kotlin::semantic) fn accessor_property<'tree>(
+    accessor: Node<'tree>,
+) -> Option<Node<'tree>> {
+    let parent = accessor.parent()?;
+    if parent.kind() == "property_declaration" {
+        return Some(parent);
+    }
+    let mut previous = accessor.prev_named_sibling();
+    while let Some(candidate) = previous {
+        match candidate.kind() {
+            "property_declaration" => return Some(candidate),
+            kind if matches!(kind, "getter" | "setter") || is_comment_kind(kind) => {
+                previous = candidate.prev_named_sibling();
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Prove a local backing-field store without resolving another receiver's type.
+pub(in crate::analyzer::kotlin::semantic) fn direct_backing_field_write(
+    source: &str,
+    member: Node<'_>,
+) -> bool {
+    if node_text(source, member) == Some("field")
+        && member
+            .parent()
+            .is_some_and(|target| matches!(assignment_target(target), AssignmentTarget::Name(_)))
+    {
+        let mut ancestor = member.parent();
+        while let Some(node) = ancestor {
+            if matches!(node.kind(), "getter" | "setter") {
+                return accessor_property(node).is_some();
+            }
+            if matches!(
+                node.kind(),
+                "function_declaration" | "class_body" | "lambda_literal"
+            ) {
+                return false;
+            }
+            ancestor = node.parent();
+        }
+        return false;
+    }
+    let Some(property) = enclosing_property(source, member) else {
+        return false;
+    };
+    if property_delegate_expression(property).is_some() {
+        return false;
+    }
+    let class =
+        enclosing_type_declaration(property).expect("member property has an enclosing class");
+    // Public default properties on this in a final class and default private
+    // setters in open classes can compile to putfield too. Keep their setter
+    // abort/gap conservatively; public lateinit can still invoke a setter.
+    let setter = child_of_kind(property, "setter").or_else(|| {
+        let mut sibling = property.next_named_sibling();
+        while let Some(accessor) = sibling {
+            match accessor.kind() {
+                "setter" => return Some(accessor),
+                kind if kind == "getter" || is_comment_kind(kind) => {
+                    sibling = accessor.next_named_sibling();
+                }
+                _ => break,
+            }
+        }
+        None
+    });
+    let custom = setter.is_some_and(|setter| child_of_kind(setter, "function_body").is_some());
+    !custom
+        && (has_modifier(property, "private")
+            || (!type_admits_overrides(class)
+                && setter.is_some_and(|setter| has_modifier(setter, "private"))))
+}
+
+/// Resolve a property on the lexical class receiver, without source-text parsing.
+pub(in crate::analyzer::kotlin::semantic) fn enclosing_property<'tree>(
+    source: &str,
+    member: Node<'tree>,
+) -> Option<Node<'tree>> {
+    let mut ancestor = member.parent();
+    while let Some(node) = ancestor {
+        if matches!(node.kind(), "class_body" | "enum_class_body") {
+            break;
+        }
+        if node.kind() == "lambda_literal" || node.child_by_field_name("receiver").is_some() {
+            return None;
+        }
+        ancestor = node.parent();
+    }
+    let class = enclosing_type_declaration(member)?;
+    let body = child_of_kind(class, "class_body")?;
+    named_children(body).into_iter().find(|property| {
+        property.kind() == "property_declaration"
+            && binding_node(*property).is_some_and(|binding| {
+                binding_names(binding)
+                    .into_iter()
+                    .any(|name| node_text(source, name) == node_text(source, member))
+            })
+    })
 }
 
 /// The base and index of an `indexing_expression`.

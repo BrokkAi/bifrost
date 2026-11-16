@@ -19,6 +19,94 @@ fn explain_admission(step: serde_json::Value, limits: CodeQueryExecutionLimits) 
 }
 
 #[test]
+#[hardwon("#12107: per-seed overlay receipt hashing and warm request basename index builds")]
+fn preflight_overlay_inventory_receipt_is_scalar_and_replayed_per_consumer() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/preflight-cost\n\ngo 1.23\n")
+        .file("main.go", "package example\nfunc run() {}\n")
+        .build();
+    let cache = Arc::new(
+        brokk_bifrost_core::analyzer::project::WorkspaceFileListingCache::new(
+            project.root().canonicalize().unwrap(),
+        ),
+    );
+    let delegate: Arc<dyn crate::analyzer::Project> = Arc::new(
+        crate::analyzer::FilesystemProject::with_cached_listing(project.root(), Arc::clone(&cache))
+            .unwrap(),
+    );
+    delegate.all_files_shared().unwrap();
+    let overlay = Arc::new(OverlayProject::new(Arc::clone(&delegate)));
+    assert!(overlay.set(
+        project.root().join("main.go"),
+        "package example\nfunc edited() {}\n".to_owned()
+    ));
+    let overlay: Arc<dyn crate::analyzer::Project> = overlay;
+    for (view, expected_hashes) in [(delegate, 0), (overlay, 1)] {
+        let workspace =
+            WorkspaceAnalyzer::build_ephemeral_footgun(view, AnalyzerConfig::default()).unwrap();
+        let analyzer = workspace.analyzer();
+        for _ in 0..2 {
+            let _request = crate::analyzer::AnalyzerQueryScope::new(analyzer);
+            // Preflight receives the caller's already enumerated seed files.
+            let _files = analyzer.analyzed_files();
+            let cell = analyzer.workspace_file_inventory_cell().unwrap();
+            assert!(
+                cell.get().is_none(),
+                "the receipt must die with its request"
+            );
+            let walks = cache.walk_count();
+            let hashes =
+                brokk_bifrost_core::analyzer::project_reads::file_set_receipt_build_count();
+            for _ in 0..2 {
+                let (certified, reads) = crate::analyzer::capture_query_reads(analyzer, || {
+                    crate::analyzer::workspace_authority::record_request_workspace_file_inventory(
+                        analyzer,
+                    )
+                });
+                assert!(
+                    certified,
+                    "view hashes={expected_hashes}, cell={:?}, reads={:?}",
+                    cell.get(),
+                    reads
+                );
+                assert!(
+                    reads.keys().iter().any(|key| matches!(
+                        key,
+                        crate::analyzer::ReadKey::Lookup {
+                            question: crate::analyzer::LookupQuestion::WorkspaceFact {
+                                family:
+                                    crate::analyzer::WorkspaceFactFamily::WorkspaceFileInventory,
+                                ..
+                            },
+                            ..
+                        }
+                    )),
+                    "every consumer receives the scalar authority"
+                );
+            }
+            assert_eq!(
+                brokk_bifrost_core::analyzer::project_reads::file_set_receipt_build_count()
+                    - hashes,
+                expected_hashes,
+                "warm production reuses its receipt; overlays build it once per request"
+            );
+            assert_eq!(
+                cache.walk_count(),
+                walks,
+                "warm requests must not walk the workspace"
+            );
+            assert!(
+                analyzer
+                    .workspace_file_index_cell()
+                    .unwrap()
+                    .get()
+                    .is_none()
+            );
+        }
+    }
+}
+
+#[test]
 #[hardwon("#9179: unused RQL preflight listings left a Rust Scope read on store Output units")]
 fn query_without_file_inventory_consumer_records_no_scope() {
     let project = InlineTestProject::with_language(Language::Rust)
@@ -55,7 +143,34 @@ fn reused_file_inventory_replays_scope_to_each_consumer() {
     let project = InlineTestProject::with_language(Language::Python)
         .file("main.py", "def run(): pass\n")
         .build();
-    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    struct UnattestedProject(std::path::PathBuf);
+    impl crate::analyzer::Project for UnattestedProject {
+        fn root(&self) -> &std::path::Path {
+            &self.0
+        }
+        fn analyzer_languages(&self) -> std::collections::BTreeSet<Language> {
+            std::collections::BTreeSet::from([Language::Python])
+        }
+        fn all_files(&self) -> std::io::Result<std::collections::BTreeSet<ProjectFile>> {
+            Ok(std::collections::BTreeSet::from([ProjectFile::new(
+                &self.0, "main.py",
+            )]))
+        }
+        fn analyzable_files(
+            &self,
+            _: Language,
+        ) -> std::io::Result<std::collections::BTreeSet<ProjectFile>> {
+            self.all_files()
+        }
+        fn file_by_rel_path(&self, rel: &std::path::Path) -> Option<ProjectFile> {
+            self.0
+                .join(rel)
+                .is_file()
+                .then(|| ProjectFile::new(&self.0, rel))
+        }
+    }
+    let analyzer = PythonAnalyzer::from_project(UnattestedProject(project.root().to_path_buf()));
+    let _request = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
     let query = CodeQuery::from_json(&json!({
         "languages": ["python"],
         "match": {"kind": "function"},
@@ -69,11 +184,22 @@ fn reused_file_inventory_replays_scope_to_each_consumer() {
         relation_capabilities::preflight(
             &query.plan,
             inventory.files(&analyzer, || analyzer.analyzed_files()),
+            &analyzer,
             None,
             &mut diagnostics,
         );
         diagnostics
     });
+    assert!(
+        analyzer
+            .workspace_file_inventory_cell()
+            .unwrap()
+            .get()
+            .unwrap()
+            .1
+            .is_none(),
+        "a custom getter without an attested inventory must retain the scope fallback"
+    );
     let (languages, second) = crate::analyzer::capture_query_reads(&analyzer, || {
         inventory
             .files(&analyzer, || panic!("cached inventory was listed again"))
@@ -88,6 +214,171 @@ fn reused_file_inventory_replays_scope_to_each_consumer() {
             "{:?}",
             ledger.keys()
         );
+    }
+}
+
+#[test]
+#[hardwon("#12107: subset preflight bypassed the file inventory receipt, including on memo hits")]
+fn subset_preflight_receipt_rejects_added_and_removed_dialect_files() {
+    use crate::analyzer::{
+        ChangedFacts, LookupMemo, LookupQuestion, LookupReplayLimits, NoSummaryAnswers, ReadKey,
+        WorkspaceFactFamily, verify_read_set,
+    };
+    let project = InlineTestProject::new()
+        .with_git()
+        .file("go.mod", "module example.com/preflight\n\ngo 1.23\n")
+        .file("src/main.go", "package preflight\nfunc run() {}\n")
+        // Keep the Python analyzer present while the selected scope is Go-only.
+        .file("outside.py", "def outside(): pass\n")
+        .build();
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["go", "python"], "where": ["src/**"],
+        "match": {"kind": "function"},
+        "steps": [{"op": "procedure_of"}, {"op": "nilness_operations"}]
+    }))
+    .expect("mixed dialect query");
+    let capture = |workspace: &WorkspaceAnalyzer| {
+        let analyzer = workspace.analyzer();
+        let _request = crate::analyzer::AnalyzerQueryScope::new(analyzer);
+        // The narrowed-unit branch receives this enumeration from its caller,
+        // outside its ledger; the consult itself must certify the dependency.
+        let files = analyzer.analyzed_files();
+        // Review found a whole-workspace hash rebuilt even without a consumer.
+        // An uncaptured preflight must use only its supplied file list.
+        let listings_before = analyzer.project().workspace_file_listing_count();
+        let mut uncaptured = Vec::new();
+        relation_capabilities::preflight(
+            &query.plan,
+            &files,
+            analyzer,
+            Some(workspace),
+            &mut uncaptured,
+        );
+        assert_eq!(
+            analyzer.project().workspace_file_listing_count(),
+            listings_before,
+            "an uncaptured preflight must not consult the workspace listing"
+        );
+        // Warm the production getter independently of this new request cell.
+        analyzer.project().all_files_shared().unwrap();
+        let hashes_before_consumers =
+            brokk_bifrost_core::analyzer::project_reads::file_set_receipt_build_count();
+        let listings_before_consumers = analyzer.project().workspace_file_listing_count();
+        let inventory = QueryFileInventory::default();
+        let mut receipts = Vec::new();
+        let mut answer = Vec::new();
+        for cached in [false, true] {
+            let (diagnostics, receipt) = crate::analyzer::capture_query_reads(analyzer, || {
+                let files = inventory.files(analyzer, || {
+                    assert!(!cached, "exercise the actual inventory memo hit");
+                    files.clone()
+                });
+                let mut diagnostics = Vec::new();
+                relation_capabilities::preflight(
+                    &query.plan,
+                    files,
+                    analyzer,
+                    Some(workspace),
+                    &mut diagnostics,
+                );
+                diagnostics
+            });
+            let reads = receipt.keys();
+            assert!(
+                reads.iter().any(|key| matches!(
+                    key,
+                    ReadKey::Lookup {
+                        question: LookupQuestion::WorkspaceFact {
+                            family: WorkspaceFactFamily::WorkspaceFileInventory,
+                            ..
+                        },
+                        ..
+                    }
+                )),
+                "missing selected dialect membership receipt: {reads:?}"
+            );
+            if cached {
+                assert_eq!(diagnostics, answer, "cold/warm preflight parity");
+            }
+            answer = diagnostics;
+            receipts.push(reads);
+        }
+        // This counter includes cheap cached getter calls, not only walks.
+        assert_eq!(
+            analyzer.project().workspace_file_listing_count() - listings_before_consumers,
+            1,
+            "two warm consumers share one cached getter consult"
+        );
+        assert_eq!(
+            brokk_bifrost_core::analyzer::project_reads::file_set_receipt_build_count(),
+            hashes_before_consumers,
+            "warm consumers must reuse the getter's scalar certificate without hashing"
+        );
+        assert!(
+            analyzer
+                .workspace_file_index_cell()
+                .unwrap()
+                .get()
+                .is_none(),
+            "preflight must not build the unrelated basename resolver index"
+        );
+        (answer, receipts)
+    };
+    let verify = |base: &WorkspaceAnalyzer, head: &WorkspaceAnalyzer, reads: &[ReadKey]| {
+        verify_read_set(
+            head,
+            &ChangedFacts::between(base, head),
+            &brokk_bifrost_analysis::test_support::read_ledger_test_inputs(),
+            reads,
+            LookupReplayLimits::default(),
+            &NoSummaryAnswers,
+            &mut LookupMemo::new(),
+        )
+        .is_unchanged()
+    };
+    let base = project.certified_workspace_analyzer(AnalyzerConfig::default());
+    let (before, base_receipts) = capture(&base);
+    assert!(before.is_empty(), "Go supports nilness: {before:?}");
+    for reads in &base_receipts {
+        assert!(verify(&base, &base, reads));
+    }
+    project
+        .file("src/main.go")
+        .write("package preflight\nfunc run() { _ = 1 }\n")
+        .expect("edit a body without changing dialect membership");
+    let body_edit = project.certified_workspace_analyzer(AnalyzerConfig::default());
+    let (same_coverage, _) = capture(&body_edit);
+    assert_eq!(same_coverage, before);
+    for reads in &base_receipts {
+        assert!(
+            verify(&base, &body_edit, reads),
+            "body-only edits must reuse the preflight answer"
+        );
+    }
+    let added = project.file("src/added.py");
+    added
+        .write("def added(): pass\n")
+        .expect("add selected Python file");
+    let head = project.certified_workspace_analyzer(AnalyzerConfig::default());
+    let (after, head_receipts) = capture(&head);
+    assert!(
+        after.iter().any(|diagnostic| diagnostic.code
+            == CodeQueryDiagnosticCode::UnsupportedStructuralFeature
+            && diagnostic.language == "python"),
+        "the added dialect changes preflight coverage: {after:?}"
+    );
+    for reads in &base_receipts {
+        assert!(!verify(&base, &head, reads));
+    }
+    std::fs::remove_file(added.abs_path()).expect("remove selected Python file");
+    let removed = project.certified_workspace_analyzer(AnalyzerConfig::default());
+    let (restored, _) = capture(&removed);
+    assert_eq!(restored, before);
+    for reads in &head_receipts {
+        assert!(!verify(&head, &removed, reads));
+    }
+    for reads in &base_receipts {
+        assert!(verify(&base, &removed, reads));
     }
 }
 
@@ -267,4 +558,133 @@ fn semantic_file_refusal_renders_attempted_charge_before_limit() {
     );
     let text = result.render_text();
     assert!(text.contains("charged 2 limit 1"), "{text}");
+}
+
+#[test]
+fn rust_macro_access_receipt_rejects_shadowing_edits() {
+    use crate::analyzer::{
+        ChangedFacts, LookupMemo, LookupReplayLimits, NoSummaryAnswers, ReadKey, verify_read_set,
+    };
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"macro_receipt\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .file("src/lib.rs", "mod calls;\n")
+        .file(
+            "src/calls.rs",
+            "pub fn run() { let a = 1; println!(\"unrelated\"); assert_eq!(1, 1); }\n",
+        )
+        .build();
+    let capture = |workspace: &WorkspaceAnalyzer, expected_access| {
+        let analyzer = workspace.analyzer();
+        let _request = crate::analyzer::AnalyzerQueryScope::new(analyzer);
+        let file = ProjectFile::new(project.root().to_path_buf(), "src/calls.rs");
+        let facts = analyzer
+            .structural_fact_providers()
+            .into_iter()
+            .find(|provider| provider.structural_language() == Language::Rust)
+            .unwrap()
+            .structural_facts(&file)
+            .unwrap();
+        let mut cache = OccurrenceTraversalCache::default();
+        let (_, reads) = crate::analyzer::capture_query_reads(analyzer, || {
+            // Index fills and hits share the enclosing query capture and replay
+            // the combined receipt, including cross-file identity reads.
+            for _ in 0..2 {
+                for node in facts
+                    .nodes()
+                    .iter()
+                    .filter(|node| node.construct.as_deref() == Some("rust_macro_invocation"))
+                {
+                    let index = cache
+                        .rust_macro_access_index(analyzer, &file, &facts, None)
+                        .unwrap();
+                    let actual = index.may_access(node.range.start_byte, node.range.end_byte, "a");
+                    assert_eq!(actual, expected_access, "{node:?}");
+                }
+            }
+        });
+        assert!(
+            reads.keys().iter().any(|key| matches!(key,
+            ReadKey::File { rel_path, .. } if rel_path.as_ref() == "src/calls.rs")),
+            "the invocation source and its lexical macro definitions must be recorded: {:?}",
+            reads.keys()
+        );
+        reads.keys()
+    };
+    let base = project.certified_workspace_analyzer(AnalyzerConfig::default());
+    let reads = capture(&base, false);
+    project.file("src/lib.rs").write(
+        "macro_rules! println { ($($t:tt)*) => {} }\nmacro_rules! assert_eq { ($($t:tt)*) => {} }\nmod calls;\n"
+    ).unwrap();
+    let edited = base.update_all();
+    capture(&edited, true);
+    assert!(
+        !verify_read_set(
+            &edited,
+            &ChangedFacts::between(&base, &edited),
+            &brokk_bifrost_analysis::test_support::read_ledger_test_inputs(),
+            &reads,
+            LookupReplayLimits::default(),
+            &NoSummaryAnswers,
+            &mut LookupMemo::new()
+        )
+        .is_unchanged(),
+        "a warm query must revalidate the changed macro definition"
+    );
+}
+
+#[test]
+fn rust_macro_access_index_is_built_once_for_many_bindings_and_invocations() {
+    for count in [200, 400] {
+        let bindings = (0..count)
+            .map(|n| format!("let a{n}: usize; "))
+            .collect::<String>();
+        let source = format!(
+            "pub fn run() {{ {bindings} {} }}",
+            "println!(\"unrelated\");".repeat(count)
+        );
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"macro_inventory\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+            )
+            .file("src/lib.rs", source)
+            .build();
+        let workspace = project.certified_workspace_analyzer(AnalyzerConfig::default());
+        let analyzer = workspace.analyzer();
+        let _request = crate::analyzer::AnalyzerQueryScope::new(analyzer);
+        let file = ProjectFile::new(project.root().to_path_buf(), "src/lib.rs");
+        let facts = analyzer
+            .structural_fact_providers()
+            .into_iter()
+            .find(|provider| provider.structural_language() == Language::Rust)
+            .unwrap()
+            .structural_facts(&file)
+            .unwrap();
+        let mut cache = OccurrenceTraversalCache::default();
+        crate::analyzer::capture_query_reads(analyzer, || {
+            assert_eq!(
+                facts
+                    .nodes()
+                    .iter()
+                    .filter(|node| node.construct.as_deref() == Some("rust_macro_invocation"))
+                    .count(),
+                count
+            );
+            for n in 0..count {
+                let index = cache
+                    .rust_macro_access_index(analyzer, &file, &facts, None)
+                    .unwrap();
+                assert!(!index.may_access(0, usize::MAX, &format!("a{n}")));
+            }
+            assert_eq!(
+                cache.rust_macro_definition_builds, 1,
+                "{count} bindings and invocations"
+            );
+            assert_eq!(cache.rust_macro_proof_evaluations, count);
+            assert_eq!(cache.rust_macro_index_builds, 1);
+        });
+    }
 }

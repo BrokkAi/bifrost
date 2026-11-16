@@ -483,6 +483,9 @@ fn python_import_cycles_select_only_persisted_cycle_sites_and_keep_absence_incom
 }
 
 #[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#11321: import cycle budget diagnostics omitted the refused file lane"
+)]
 fn python_import_cycles_keep_budget_limited_absence_incomplete() {
     let project = InlineTestProject::with_language(Language::Python)
         .file("a.py", "import c\n")
@@ -537,6 +540,10 @@ fn python_import_cycles_keep_budget_limited_absence_incomplete() {
     assert!(bounded.diagnostics.iter().any(|diagnostic| {
         diagnostic.code == CodeQueryDiagnosticCode::ImportGraphBudgetExhausted
             && diagnostic.impact == CodeQueryDiagnosticImpact::Incomplete
+            && diagnostic
+                .exhausted_roots
+                .iter()
+                .any(|root| root.lane == "query/scanned_files")
     }));
 }
 

@@ -20,7 +20,9 @@ use brokk_bifrost_core::analyzer::query_token::QueryScope;
 use brokk_bifrost_core::analyzer::usages::inverted_edges::first_precise;
 use brokk_bifrost_core::analyzer::usages::local_inference::LocalInferenceConfig;
 use brokk_bifrost_core::analyzer::usages::local_inference::LocalInferenceEngine;
-use brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution;
+use brokk_bifrost_core::analyzer::usages::resolution_session::{
+    BoundedResolution, ResolutionSession,
+};
 use tree_sitter::Node;
 use tree_sitter::Tree;
 pub mod lambda;
@@ -49,10 +51,6 @@ use brokk_bifrost_analysis::analyzer::usages::applicability::arity_applicability
 
 use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
 
-use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisWork;
-
-use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit;
-
 use brokk_bifrost_core::analyzer::usages::reference_site::node_range;
 
 use brokk_bifrost_analysis::analyzer::usages::target_kind::TypeLookupTargetKind;
@@ -72,31 +70,25 @@ use brokk_bifrost_jvm::java::graph::return_type::{
     is_java_local_type_scope_node, java_type_name_components,
 };
 use brokk_bifrost_jvm::java::graph_support::{JavaSource, normalize_java_type_text};
-use brokk_bifrost_jvm::java::hierarchy::{JavaHierarchyFactError, java_preferred_declaring_owners};
+use brokk_bifrost_jvm::java::hierarchy::{
+    JavaHierarchyFactError, JavaSuperclass, JavaSuperclassForm, java_preferred_declaring_owners,
+    java_super_member_is_accessible, java_super_receiver_class, java_superclass_form,
+};
 use brokk_bifrost_jvm::java::source_facts::JavaFileSourceFacts;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
-
-#[derive(Debug, Clone, Copy)]
-enum JavaResolutionStop {
-    Exceeded(ReceiverBudgetLimit),
-    Unavailable(&'static str),
-    Cancelled,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct JavaResolutionState {
-    work: ReceiverAnalysisWork,
-    stop: Option<JavaResolutionStop>,
-}
 
 /// A single bounded lookup view shared by every structured Java resolver
 /// expansion in one receiver-compatibility request.
 pub(crate) struct JavaResolutionSession<'a> {
     support: &'a dyn BoundedDefinitionLookup,
-    budget: Option<ReceiverAnalysisBudget>,
-    cancellation: Option<CancellationToken>,
-    state: RefCell<JavaResolutionState>,
+    /// The shared bounded session: work accounting, budget stops and
+    /// cancellation, each of which marks this run's captures.
+    resolution: ResolutionSession,
+    bounded: bool,
+    /// A Java-only stop: catalog rows the request needs are unavailable. The
+    /// first stop wins, so this is set only while `resolution` runs.
+    unavailable: Cell<Option<&'static str>>,
     /// What each type parameter this request has already expanded denotes for
     /// member lookup, keyed by its `type_parameter` declaration site. `None`
     /// marks an expansion still in progress, which is the cycle a bound that
@@ -110,14 +102,14 @@ pub(crate) struct JavaResolutionSession<'a> {
 impl<'a> JavaResolutionSession<'a> {
     fn new(
         support: &'a dyn BoundedDefinitionLookup,
-        budget: Option<ReceiverAnalysisBudget>,
-        cancellation: Option<&CancellationToken>,
+        resolution: ResolutionSession,
+        bounded: bool,
     ) -> Self {
         Self {
             support,
-            budget,
-            cancellation: cancellation.cloned(),
-            state: RefCell::new(JavaResolutionState::default()),
+            resolution,
+            bounded,
+            unavailable: Cell::new(None),
             type_parameter_bounds:
                 brokk_bifrost_analysis::analyzer::workspace_authority::CaptureScopedMemo::default(),
             receiver_depth: Cell::new(0),
@@ -125,7 +117,7 @@ impl<'a> JavaResolutionSession<'a> {
     }
 
     pub(crate) fn unbounded(support: &'a dyn BoundedDefinitionLookup) -> Self {
-        Self::new(support, None, None)
+        Self::new(support, ResolutionSession::unbounded(), false)
     }
 
     pub(crate) fn bounded(
@@ -133,64 +125,43 @@ impl<'a> JavaResolutionSession<'a> {
         budget: ReceiverAnalysisBudget,
         cancellation: Option<&CancellationToken>,
     ) -> Self {
-        Self::new(support, Some(budget), cancellation)
+        Self::new(
+            support,
+            ResolutionSession::bounded(budget, cancellation),
+            true,
+        )
     }
 
     pub(crate) fn finish<T>(&self, value: T) -> BoundedResolution<T> {
-        self.observe_cancellation();
-        let state = *self.state.borrow();
-        match state.stop {
-            Some(JavaResolutionStop::Exceeded(limit)) => BoundedResolution::Exceeded {
-                work: state.work,
-                limit,
-            },
-            Some(JavaResolutionStop::Unavailable(reason)) => BoundedResolution::Unavailable {
+        match self.unavailable.get() {
+            Some(reason) => BoundedResolution::Unavailable {
                 reason,
-                work: state.work,
+                work: self.resolution.finish(()).work(),
             },
-            Some(JavaResolutionStop::Cancelled) => {
-                BoundedResolution::Cancelled { work: state.work }
-            }
-            None => BoundedResolution::Complete {
-                value,
-                work: state.work,
-            },
+            None => self.resolution.finish(value),
         }
     }
 
     fn observe_cancellation(&self) -> bool {
-        if self.budget.is_none() && self.cancellation.is_none() {
-            return true;
-        }
-        let mut state = self.state.borrow_mut();
-        if state.stop.is_none()
-            && self
-                .cancellation
-                .as_ref()
-                .is_some_and(CancellationToken::is_cancelled)
-        {
-            state.stop = Some(JavaResolutionStop::Cancelled);
-        }
-        state.stop.is_none()
+        self.unavailable.get().is_none() && self.resolution.observe_cancellation()
     }
 
     fn charge_scope_step(&self) -> bool {
-        self.charge(ReceiverBudgetLimit::ScopeNodes)
+        self.unavailable.get().is_none() && self.resolution.scope_step()
     }
 
     fn is_stopped(&self) -> bool {
-        self.state.borrow().stop.is_some()
+        self.unavailable.get().is_some() || self.resolution.is_stopped()
     }
 
     pub(crate) fn unavailable(&self, reason: &'static str) {
-        let mut state = self.state.borrow_mut();
-        if state.stop.is_none() {
-            state.stop = Some(JavaResolutionStop::Unavailable(reason));
+        if !self.is_stopped() {
+            self.unavailable.set(Some(reason));
         }
     }
 
     fn charge_hierarchy_expansion(&self) -> bool {
-        self.charge(ReceiverBudgetLimit::SummaryExpansions)
+        self.unavailable.get().is_none() && self.resolution.summary_step()
     }
 
     fn enclosing_unit(
@@ -331,7 +302,7 @@ impl<'a> JavaResolutionSession<'a> {
     }
 
     fn track_rows<T>(&self, rows: Vec<T>) -> Vec<T> {
-        if self.budget.is_none() && self.cancellation.is_none() {
+        if !self.bounded {
             return rows;
         }
         for _ in &rows {
@@ -457,46 +428,6 @@ impl<'a> JavaResolutionSession<'a> {
             return Err(JavaHierarchyFactError::MetadataUnavailable);
         }
         Ok(self.track_rows(ancestors.edges))
-    }
-
-    fn charge(&self, limit: ReceiverBudgetLimit) -> bool {
-        if self.budget.is_none() && self.cancellation.is_none() {
-            return true;
-        }
-        if !self.observe_cancellation() {
-            return false;
-        }
-        let Some(budget) = self.budget else {
-            return true;
-        };
-        let mut state = self.state.borrow_mut();
-        let (used, maximum) = match limit {
-            ReceiverBudgetLimit::ScopeNodes => {
-                (&mut state.work.scope_nodes, budget.max_scope_nodes)
-            }
-            ReceiverBudgetLimit::SummaryExpansions => (
-                &mut state.work.summary_expansions,
-                budget.max_summary_expansions,
-            ),
-            ReceiverBudgetLimit::ResolutionRounds => (
-                &mut state.work.resolution_rounds,
-                budget.max_resolution_rounds,
-            ),
-            ReceiverBudgetLimit::HierarchyOrderSteps => (
-                &mut state.work.hierarchy_order_steps,
-                budget.max_hierarchy_order_work,
-            ),
-            ReceiverBudgetLimit::TotalWork => {
-                unreachable!("Java sessions do not opt into aggregate work")
-            }
-        };
-        if *used == maximum {
-            state.stop = Some(JavaResolutionStop::Exceeded(limit));
-            false
-        } else {
-            *used += 1;
-            true
-        }
     }
 
     fn bool_query(&self, query: impl FnOnce() -> bool) -> bool {
@@ -1149,6 +1080,9 @@ fn java_default_import_intrinsic(
     }
     let canonical = entry.identity_spelling.to_owned();
     let outcome = DefinitionLookupOutcome {
+        selected_sites: Vec::new(),
+        inventory_evidence: None,
+        incomplete_evidence: None,
         modeled_definitions: Vec::new(),
         status: DefinitionLookupStatus::NoDefinition,
         reference: Some(ResolvedReferenceSite {
@@ -1715,7 +1649,7 @@ fn java_bound_method_invocation_binding(
             call_site,
         );
         return JavaInvocationBinding {
-            outcome,
+            outcome: java_super_member_access_outcome(analyzer, session, file, object, outcome),
             receiver,
             evidence: CallEvidence::default(),
         };
@@ -1823,7 +1757,10 @@ fn resolve_java_method_reference(
     }
     let mut owner =
         java_receiver_types(analyzer, token, session, file, source, root, receiver_node);
-    if owner.is_empty() {
+    // An explicit `super` is a receiver, never a type name: resolving its text
+    // as a type would ask the type resolver about a type called `super` after
+    // receiver typing already found the superclass open (#9703).
+    if owner.is_empty() && receiver_node.kind() != "super" {
         owner = java_type_text_with_context(
             analyzer,
             token,
@@ -1863,15 +1800,21 @@ fn resolve_java_method_reference(
         );
     }
     if !owner.is_empty() {
-        return java_member_candidates_across(
+        return java_super_member_access_outcome(
             analyzer,
-            token,
             session,
-            &owner,
-            member,
-            JavaMemberLookupKind::Method,
-            None,
-            None,
+            file,
+            receiver_node,
+            java_member_candidates_across(
+                analyzer,
+                token,
+                session,
+                &owner,
+                member,
+                JavaMemberLookupKind::Method,
+                None,
+                None,
+            ),
         );
     }
 
@@ -2001,6 +1944,7 @@ fn resolve_java_constructor_call(
     let proof = ExactExternalCallProof::java_external_constructor(&owner, &member, parameter_count);
     let evidence = CallEvidence {
         source_member_evidence: None,
+        fixed_array_source: None,
         native_resolution: None,
         model_member_selection: None,
         call_application: proof.call_application(),
@@ -2080,7 +2024,7 @@ fn java_external_constructor_family(
         return None;
     }
     let components = java_type_name_components(type_node, source)?;
-    let overlay = analyzer.semantic_model_overlay()?;
+    let overlay = analyzer.semantic_model_overlay_read().published()?;
     let resolved = session.query_optional_row(|| {
         java.resolve_type_name_with_external(
             token,
@@ -2166,13 +2110,33 @@ fn java_external_constructor_family(
     })
 }
 
-fn java_constructor_outcome(
+/// The constructors of a workspace class that a creation's argument count
+/// reaches. Selection reads arity only; argument conversions stay a separate
+/// obligation of each consumer.
+pub(crate) enum JavaConstructorSelection {
+    /// The declared constructors that accept the call's arity.
+    Declared(Vec<CodeUnit>),
+    /// No constructor is declared, and the owner's implicit default or record
+    /// canonical constructor accepts the call's arity.
+    Implicit,
+    /// An active Java semantic model supplies the constructor.
+    Modeled,
+    /// No declared, implicit or modeled constructor accepts the call's arity.
+    NoneApplicable,
+    /// The canonical constructor facts are absent or conflicting.
+    Unavailable,
+    /// The active Java semantic model's member list for the owner is open, so
+    /// whether it supplies the constructor is undecided.
+    ModelUnavailable,
+}
+
+pub(crate) fn java_constructor_selection(
     analyzer: &dyn IAnalyzer,
     java: &JavaAnalyzer,
     session: &JavaResolutionSession<'_>,
-    owner: CodeUnit,
+    owner: &CodeUnit,
     arity: Option<usize>,
-) -> DefinitionLookupOutcome {
+) -> JavaConstructorSelection {
     let support: &dyn BoundedDefinitionLookup = session;
     let candidates = support
         .fqn(&format!("{}.{}", owner.fq_name(), owner.identifier()))
@@ -2181,65 +2145,79 @@ fn java_constructor_outcome(
             unit.is_function() && !unit.is_synthetic() && unit.source() == owner.source()
         })
         .collect::<Vec<_>>();
-    let Some(context) = java.constructor_context(&owner, candidates, arity) else {
-        return diagnostic_outcome(
-            DefinitionLookupStatus::Unavailable,
-            "unavailable_java_constructor_facts",
-            format!(
-                "canonical constructor metadata for `{}` is absent or conflicting",
-                owner.fq_name()
-            ),
-        );
+    let Some(context) = java.constructor_context(owner, candidates, arity) else {
+        return JavaConstructorSelection::Unavailable;
     };
     let constructors =
         java_filter_candidates_by_arity(analyzer, session, context.constructors, arity);
     if !constructors.is_empty() {
-        return candidates_outcome(constructors);
+        return JavaConstructorSelection::Declared(constructors);
     }
-
     let Some(modeled_constructor_exists) =
-        java_modeled_constructor_exists(analyzer, session, &owner, arity)
+        java_modeled_constructor_exists(analyzer, session, owner, arity)
     else {
-        return diagnostic_outcome(
-            DefinitionLookupStatus::Unavailable,
-            "unavailable_java_constructor_model",
-            format!(
-                "active constructor model for `{}` is incomplete",
-                owner.fq_name()
-            ),
-        );
+        return JavaConstructorSelection::ModelUnavailable;
     };
     if modeled_constructor_exists {
-        return no_definition(
+        JavaConstructorSelection::Modeled
+    } else if context.owner_shape_accepts {
+        JavaConstructorSelection::Implicit
+    } else {
+        JavaConstructorSelection::NoneApplicable
+    }
+}
+
+fn java_constructor_outcome(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    owner: CodeUnit,
+    arity: Option<usize>,
+) -> DefinitionLookupOutcome {
+    match java_constructor_selection(analyzer, java, session, &owner, arity) {
+        JavaConstructorSelection::Declared(constructors) => candidates_outcome(constructors),
+        JavaConstructorSelection::Implicit => candidates_outcome(vec![owner]),
+        JavaConstructorSelection::Modeled => no_definition(
             "modeled_java_constructor",
             format!(
                 "`{}.{}` is supplied by an active Java semantic model",
                 owner.fq_name(),
                 owner.identifier()
             ),
-        );
-    }
-
-    if context.owner_shape_accepts {
-        candidates_outcome(vec![owner])
-    } else {
-        no_definition(
+        ),
+        JavaConstructorSelection::NoneApplicable => no_definition(
             "no_applicable_java_constructor",
             format!(
                 "`{}` has no indexed constructor matching this call",
                 owner.fq_name()
             ),
-        )
+        ),
+        JavaConstructorSelection::Unavailable => diagnostic_outcome(
+            DefinitionLookupStatus::Unavailable,
+            "unavailable_java_constructor_facts",
+            format!(
+                "canonical constructor metadata for `{}` is absent or conflicting",
+                owner.fq_name()
+            ),
+        ),
+        JavaConstructorSelection::ModelUnavailable => diagnostic_outcome(
+            DefinitionLookupStatus::Unavailable,
+            "unavailable_java_constructor_model",
+            format!(
+                "active constructor model for `{}` is incomplete",
+                owner.fq_name()
+            ),
+        ),
     }
 }
 
-fn java_modeled_constructor_exists(
+pub(crate) fn java_modeled_constructor_exists(
     analyzer: &dyn IAnalyzer,
     session: &JavaResolutionSession<'_>,
     owner: &CodeUnit,
     arity: Option<usize>,
 ) -> Option<bool> {
-    let Some(overlay) = analyzer.semantic_model_overlay() else {
+    let Some(overlay) = analyzer.semantic_model_overlay_read().published() else {
         return Some(false);
     };
     let members = session.structured_query(|| overlay.members_of(&owner.fq_name()))?;
@@ -2645,15 +2623,21 @@ fn resolve_java_field_access(
         if !nested_types.is_empty() && java_field_access_is_selector_receiver(node) {
             return candidates_outcome(nested_types);
         }
-        return java_member_candidates_across(
+        return java_super_member_access_outcome(
             analyzer,
-            token,
             session,
-            &owner,
-            field,
-            JavaMemberLookupKind::Field,
-            None,
-            None,
+            file,
+            object,
+            java_member_candidates_across(
+                analyzer,
+                token,
+                session,
+                &owner,
+                field,
+                JavaMemberLookupKind::Field,
+                None,
+                None,
+            ),
         );
     }
     java_unresolved_receiver_outcome(
@@ -2708,6 +2692,12 @@ fn resolve_java_field_access(
 /// evidence is published only when that arity, the receiver shape, and one
 /// recorded external signature agree. The canonical name is still published
 /// without that signature; it is not itself the proof (#3522).
+///
+/// An explicit `super` receiver is answered first and separately. Its members
+/// belong to the containing class's direct superclass (JLS 15.11.2), which is
+/// neither the enclosing class nor what the receiver's spelling names as a
+/// type, so the answer names that superclass boundary instead of formatting the
+/// spelling `super.m` (#9703).
 #[allow(clippy::too_many_arguments)]
 fn java_unresolved_receiver_outcome(
     analyzer: &dyn IAnalyzer,
@@ -2723,6 +2713,54 @@ fn java_unresolved_receiver_outcome(
     unresolved_message: String,
     call_arity: Option<usize>,
 ) -> (DefinitionLookupOutcome, CallEvidence) {
+    if object.kind() == "super"
+        && let Some(JavaSuperReceiver {
+            class, superclass, ..
+        }) = java_super_receiver(analyzer, session, file, object)
+    {
+        let fqn = class.fq_name();
+        match superclass {
+            Err(JavaHierarchyFactError::MetadataUnavailable) => {
+                return (java_hierarchy_unavailable(&class), CallEvidence::default());
+            }
+            Ok(JavaSuperclass::Implicit) => {
+                return (
+                    no_definition(
+                        "no_indexed_definition",
+                        format!(
+                            "`super.{member}` in `{fqn}` reads a superclass (java.lang.Object, Enum or Record) that this workspace does not declare"
+                        ),
+                    ),
+                    CallEvidence::default(),
+                );
+            }
+            Ok(JavaSuperclass::Open) => {
+                return (
+                    gated_boundary(
+                        || {
+                            !java_hierarchy_crosses_unindexed_supertype(
+                                analyzer, token, session, &class,
+                            )
+                        },
+                        format!(
+                            "`super.{member}` in `{fqn}` reads a Java superclass not indexed in this workspace"
+                        ),
+                        UnindexedClaim::unindexed_owner(
+                            format!("{fqn}.{member}"),
+                            ClaimSubjectRole::Member,
+                        ),
+                        "unresolved_java_super_receiver",
+                        format!("the superclass of `{fqn}` is not resolved"),
+                    ),
+                    CallEvidence::default(),
+                );
+            }
+            // `Indexed` means receiver typing stopped after classifying the
+            // superclass (budget or cancellation), which the ordinary
+            // unresolved-receiver route below already reports.
+            Ok(JavaSuperclass::Indexed(_)) => {}
+        }
+    }
     let spelling = format!("{}.{}", java_node_text(object, source), member);
     let java = resolve_analyzer::<JavaAnalyzer>(analyzer);
     let imported_bound = java.and_then(|java| {
@@ -2818,6 +2856,9 @@ fn java_unresolved_receiver_outcome(
                 java.and_then(|java| java.selected_jdk_artifact_for_file(analyzer, file)),
                 owner.jdk_artifact_sha256.as_deref(),
             );
+            if let Some(proof) = evidence.exact_external_call.as_mut() {
+                proof.declaration_is_abstract = owner.declaration_is_abstract;
+            }
             if owner.non_overridable.is_some() {
                 evidence.dispatch_extensibility = Some(DispatchExtensibility::Closed);
                 if let Some(proof) = evidence.exact_external_call.as_mut() {
@@ -2872,7 +2913,7 @@ fn java_resolve_type_with_selected_jdk(
     let selected = java.selected_jdk_artifact_for_file(analyzer, file);
     java.resolve_type_name_outcome_at(
         token,
-        analyzer.semantic_model_overlay(),
+        analyzer.semantic_model_overlay_read().published(),
         file,
         name,
         selected
@@ -2892,7 +2933,7 @@ fn java_resolve_member_with_selected_jdk(
     let selected = java.selected_jdk_artifact_for_file(analyzer, file);
     java.resolve_member_name_with_selected_jdk(
         token,
-        analyzer.semantic_model_overlay(),
+        analyzer.semantic_model_overlay_read().published(),
         file,
         name,
         selected
@@ -2913,7 +2954,7 @@ fn java_resolve_member_of_resolved_owner(
 ) -> Option<crate::analyzer::jvm::external::JvmExternalMember> {
     let selected = java.selected_jdk_artifact_for_file(analyzer, file);
     java.resolve_member_of_hit(
-        analyzer.semantic_model_overlay(),
+        analyzer.semantic_model_overlay_read().published(),
         file,
         owner,
         member_name,
@@ -2958,6 +2999,7 @@ enum JavaExternalReceiverForm {
 struct JavaExternalOwner {
     non_overridable:
         Option<brokk_bifrost_analysis::analyzer::semantic_model::NonOverridableEvidence>,
+    declaration_is_abstract: Option<bool>,
     fqn: String,
     member_declared: bool,
     /// A named declaration and its actual applicability do not prove an
@@ -3005,6 +3047,7 @@ impl JavaExternalOwner {
             member_declared: false,
             receiver_proven: true,
             non_overridable: None,
+            declaration_is_abstract: None,
             form,
             jdk_artifact_sha256: None,
             applicable_parameter_count: None,
@@ -3024,6 +3067,7 @@ impl JavaExternalOwner {
             member_declared: true,
             receiver_proven: true,
             non_overridable: None,
+            declaration_is_abstract: None,
             form,
             jdk_artifact_sha256,
             applicable_parameter_count,
@@ -3088,6 +3132,45 @@ fn java_external_receiver_owner_fqn(
         {
             return Some(owner);
         }
+    }
+    // A `var` local writes no type: its static type is its initializer's
+    // (JLS 14.4.1), so the ladder continues from that expression, as workspace
+    // receiver typing does. The variable binds the name, so the type-name
+    // tier below never applies to it. Only a value initializer types a
+    // variable, and an anonymous class body makes the static type the
+    // anonymous class rather than the class it names.
+    if object.kind() == "identifier"
+        && let Some(JavaLocalType::Initializer(initializer)) = first_precise(
+            &java_bindings_before_scoped(session, file, source, root, object.start_byte()),
+            java_node_text(object, source),
+        )
+    {
+        let initializer = session.smallest_named_node_covering(
+            root,
+            initializer.start_byte,
+            initializer.end_byte,
+        )?;
+        if initializer.kind() == "object_creation_expression"
+            && initializer
+                .named_children(&mut initializer.walk())
+                .any(|child| child.kind() == "class_body")
+        {
+            return None;
+        }
+        return java_external_receiver_owner_fqn(
+            analyzer,
+            token,
+            java,
+            session,
+            file,
+            source,
+            root,
+            initializer,
+            member_name,
+            chain_budget.checked_sub(1)?,
+            call_arity,
+        )
+        .filter(|owner| matches!(owner.form, JavaExternalReceiverForm::BoundValue));
     }
     // #2454: a receiver that is itself a call writes its type nowhere in the
     // reading file, so the written-type tier above answers nothing for it. Its
@@ -3261,7 +3344,7 @@ fn java_external_call_return_type_fqn(
         call,
         chain_budget,
     )?;
-    let external = java.external_declarations(analyzer.semantic_model_overlay());
+    let external = java.external_declarations(analyzer.semantic_model_overlay_read().published());
     // A type a member signature of a witness-backed owner names derives a
     // witness: its members and member types are JDK too.
     let derived = |fqn: &str| {
@@ -3335,7 +3418,7 @@ fn java_external_invocation_member(
     )?;
     let member = session.query_optional_row(|| {
         if let Some(witness) = owner.witness.as_ref() {
-            java.external_declarations(analyzer.semantic_model_overlay())
+            java.external_declarations(analyzer.semantic_model_overlay_read().published())
                 .resolve_member_of_unshadowed_owner(
                     &crate::analyzer::jvm::external::QueryGapRecorder::new(java),
                     witness,
@@ -3353,6 +3436,67 @@ fn java_external_invocation_member(
         }
     })?;
     Some((owner, member))
+}
+
+/// The declared type of the external field a field access reads, such as
+/// `java.util.Locale` for `java.util.Locale.US` (#12136). The qualifier is
+/// typed by the same receiver ladder as an invocation's, with its shadowing
+/// and depth bounds. Only a field whose own declaration writes its type
+/// answers; a same-named method, an artifact field with no recorded type and
+/// an unresolved qualifier answer nothing.
+pub(crate) fn java_external_field_type(
+    java: &JavaAnalyzer,
+    token: QueryToken<'_>,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    access: Node<'_>,
+) -> Option<brokk_bifrost_analysis::analyzer::semantic_model::TypeRef> {
+    if access.kind() != "field_access" || access.has_error() || access.is_missing() {
+        return None;
+    }
+    let mut root = access;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    let field = java_node_text(access.child_by_field_name("field")?, source);
+    if field.is_empty() {
+        return None;
+    }
+    let object = access.child_by_field_name("object")?;
+    let owner = java_external_receiver_owner_fqn(
+        java,
+        token,
+        java,
+        session,
+        file,
+        source,
+        root,
+        object,
+        field,
+        JAVA_CHAINED_RECEIVER_LIMIT - 1,
+        None,
+    )?;
+    let member = session.query_optional_row(|| {
+        if let Some(witness) = owner.witness.as_ref() {
+            java.external_declarations(java.semantic_model_overlay_read().published())
+                .resolve_member_of_unshadowed_owner(
+                    &crate::analyzer::jvm::external::QueryGapRecorder::new(java),
+                    witness,
+                    field,
+                    &java.package_name_of(file).unwrap_or_default(),
+                )
+        } else {
+            java_resolve_member_with_selected_jdk(
+                java,
+                token,
+                java,
+                file,
+                &format!("{}.{field}", owner.fqn),
+            )
+        }
+    })?;
+    member.declared_field_type().cloned()
 }
 
 /// The full declared return term of a uniquely selected external invocation.
@@ -3418,7 +3562,7 @@ pub(crate) fn java_external_signature_type_witness(
         JAVA_CHAINED_RECEIVER_LIMIT,
     )?;
     owner.witness.as_ref()?.signature_type(
-        &java.external_declarations(java.semantic_model_overlay()),
+        &java.external_declarations(java.semantic_model_overlay_read().published()),
         &member,
         type_ref,
     )
@@ -3471,7 +3615,10 @@ fn java_selected_external_invocation_return_type(
         })?;
     Some(
         crate::analyzer::jvm::external::normalize_jvm_model_type_ref(
-            analyzer.semantic_model_overlay().as_deref(),
+            analyzer
+                .semantic_model_overlay_read()
+                .published()
+                .as_deref(),
             returned,
         ),
     )
@@ -3616,23 +3763,24 @@ fn java_owner_of_external_type(
                 )
             })
             .filter(|_| receiver_proven);
-        return Some(
-            JavaExternalOwner::with_declared_member(
-                member
-                    .fqn()
-                    .rsplit_once('.')
-                    .map_or_else(|| member.fqn().to_owned(), |(owner, _)| owner.to_owned()),
-                form,
-                applicable,
-                member.jdk_artifact_sha256().map(str::to_owned),
-            )
-            .with_receiver_proof(receiver_proven)
-            .with_witness(external_type.witness())
-            .with_non_overridable(applicable.and(call_arity).and_then(|arity| {
-                member
-                    .non_overridable_at(matches!(form, JavaExternalReceiverForm::BoundValue), arity)
-            })),
-        );
+        let mut owner = JavaExternalOwner::with_declared_member(
+            member
+                .fqn()
+                .rsplit_once('.')
+                .map_or_else(|| member.fqn().to_owned(), |(owner, _)| owner.to_owned()),
+            form,
+            applicable,
+            member.jdk_artifact_sha256().map(str::to_owned),
+        )
+        .with_receiver_proof(receiver_proven)
+        .with_witness(external_type.witness())
+        .with_non_overridable(applicable.and(call_arity).and_then(|arity| {
+            member.non_overridable_at(matches!(form, JavaExternalReceiverForm::BoundValue), arity)
+        }));
+        owner.declaration_is_abstract = applicable.and(call_arity).and_then(|arity| {
+            member.abstract_at(matches!(form, JavaExternalReceiverForm::BoundValue), arity)
+        });
+        return Some(owner);
     }
     Some(
         JavaExternalOwner::type_only(external_type.fqn().to_owned(), form)
@@ -4074,6 +4222,10 @@ fn java_type_qualifier(
 /// Empty is "nothing structural typed this receiver". Exactly one entry is the
 /// ordinary case. More than one is a type parameter with an intersection bound
 /// (`T extends A & B`), whose member surface is every bound's at once.
+///
+/// An explicit `this` and an explicit `super` are not the same receiver: `this`
+/// is the enclosing class, `super` is its direct superclass
+/// ([`java_super_receiver_type`]).
 fn java_receiver_types(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
@@ -4101,18 +4253,13 @@ fn java_receiver_types(
     if !types.is_empty() {
         return types;
     }
-    if object.kind() == "super" {
-        let superclass = session
-            .smallest_named_node_covering(root, object.start_byte(), object.end_byte())
-            .and_then(|node| java_enclosing_type_declaration(session, node))
-            .and_then(|declaration| declaration.child_by_field_name("superclass"))
-            .and_then(|clause| clause.named_child(0));
-        return superclass.map_or_else(Vec::new, |ty| {
-            java_receiver_types_in_tree(analyzer, token, java, session, file, source, ty)
-        });
-    }
     if object.kind() == "this" {
         return java_enclosing_receiver_type(analyzer, session, file, root, object.start_byte())
+            .into_iter()
+            .collect();
+    }
+    if object.kind() == "super" {
+        return java_super_receiver_type(analyzer, session, file, object)
             .into_iter()
             .collect();
     }
@@ -4148,6 +4295,135 @@ fn java_enclosing_receiver_type(
         })
         .unwrap_or_default();
     Some(JavaReceiverType { unit, arguments })
+}
+
+/// What an explicit `super` receiver reads: the class whose body lexically
+/// contains it, the superclass form that body writes, and the class that form
+/// resolves to.
+struct JavaSuperReceiver<'tree> {
+    class: CodeUnit,
+    form: JavaSuperclassForm<'tree>,
+    superclass: Result<JavaSuperclass, JavaHierarchyFactError>,
+}
+
+/// The superclass an explicit `super` receiver, field access or method
+/// reference reads, classified once for both the receiver-typing path
+/// ([`java_super_receiver_type`]) and the open outcome a stopped or unindexed
+/// superclass reports ([`java_unresolved_receiver_outcome`]).
+///
+/// `super.m()`, `super.f` and `super::m` name members of the direct superclass
+/// of the class whose body lexically contains them (JLS 15.11.2, 15.12.1,
+/// 15.13.1). The body that contains the receiver supplies the form and the
+/// hierarchy supplies the class, so an override that calls `super.m()` reads
+/// its parent rather than itself (#9703). `None` means no class body encloses
+/// the receiver or this request cannot reach the class or the hierarchy.
+fn java_super_receiver<'tree>(
+    analyzer: &dyn IAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    object: Node<'tree>,
+) -> Option<JavaSuperReceiver<'tree>> {
+    let form = java_superclass_form(object)?;
+    let class = session.enclosing_unit(analyzer, file, object.start_byte())?;
+    let provider = analyzer.type_hierarchy_provider()?;
+    let superclass = java_super_receiver_class(analyzer, form, || {
+        session.direct_ancestors(analyzer, provider, &class)
+    });
+    Some(JavaSuperReceiver {
+        class,
+        form,
+        superclass,
+    })
+}
+
+/// The receiver type an explicit `super` member reference reads: the direct
+/// superclass of the class whose body lexically contains it (JLS 15.11.2,
+/// 15.12.1, 15.13.1).
+///
+/// Member lookup starts at that class and walks its own hierarchy, exactly as
+/// for a receiver written with that static type, so `super.m()` in an override
+/// binds the overridden declaration instead of the override (#9703). `None`
+/// keeps the receiver open: `java.lang.Object`, `java.lang.Enum`, a superclass
+/// outside the workspace, and unavailable hierarchy metadata all answer
+/// nothing, and none of them may fall back to the enclosing class.
+fn java_super_receiver_type(
+    analyzer: &dyn IAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    object: Node<'_>,
+) -> Option<JavaReceiverType> {
+    let JavaSuperReceiver {
+        form, superclass, ..
+    } = java_super_receiver(analyzer, session, file, object)?;
+    let Ok(JavaSuperclass::Indexed(unit)) = superclass else {
+        return None;
+    };
+    let arguments = match form {
+        JavaSuperclassForm::Extends(type_node) | JavaSuperclassForm::Instantiated(type_node) => {
+            brokk_bifrost_jvm::java::graph_support::java_type_argument_nodes(type_node)
+                .into_iter()
+                .map(|argument| JavaTypeArgument::Active(JavaTypeSpelling::new(file, argument)))
+                .collect()
+        }
+        JavaSuperclassForm::EnumConstant | JavaSuperclassForm::Implicit => Vec::new(),
+    };
+    Some(JavaReceiverType { unit, arguments })
+}
+
+/// Hold a member that member lookup selected through an explicit `super`
+/// receiver to Java's accessibility rule (JLS 6.6.1).
+///
+/// `super.m()` and `super.f` select the nearest *accessible* declaration of the
+/// superclass hierarchy, so a nearest declaration the site cannot access is
+/// never the target. The declaration stays in the outcome as the place lookup
+/// reached, and the outcome stops being resolved: the forward edge to it is
+/// unproven, which is what the inverse side reports for the same site.
+/// Only a resolved outcome of a `super` receiver is reconsidered -- an ordinary
+/// receiver's missing accessibility tier is a separate question.
+fn java_super_member_access_outcome(
+    analyzer: &dyn IAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    super_node: Node<'_>,
+    mut outcome: DefinitionLookupOutcome,
+) -> DefinitionLookupOutcome {
+    if super_node.kind() != "super" || outcome.status != DefinitionLookupStatus::Resolved {
+        return outcome;
+    }
+    let Some(site_class) = session.enclosing_unit(analyzer, file, super_node.start_byte()) else {
+        return outcome;
+    };
+    let mut diagnostics = Vec::new();
+    for member in &outcome.definitions {
+        match java_super_member_is_accessible(analyzer, member, &site_class) {
+            Ok(true) => {}
+            Ok(false) => diagnostics.push(DefinitionLookupDiagnostic {
+                kind: "inaccessible_java_super_member".into(),
+                message: format!(
+                    "`{}` is not accessible from `{}`, so the `super` receiver written there does not select it",
+                    member.fq_name(),
+                    site_class.fq_name()
+                ),
+                claim: None,
+            }),
+            Err(JavaHierarchyFactError::MetadataUnavailable) => {
+                diagnostics.push(DefinitionLookupDiagnostic {
+                    kind: "unknown_java_super_member_access".into(),
+                    message: format!(
+                        "the declared visibility of `{}` is unavailable, so `{}` does not prove its `super` receiver selects it",
+                        member.fq_name(),
+                        site_class.fq_name()
+                    ),
+                    claim: None,
+                });
+            }
+        }
+    }
+    if !diagnostics.is_empty() {
+        outcome.status = DefinitionLookupStatus::Incomplete;
+        outcome.diagnostics.extend(diagnostics);
+    }
+    outcome
 }
 
 /// The one class a Java receiver's static type names.
@@ -5464,7 +5740,7 @@ fn java_type_name_is_ambiguous(
     !matches!(
         java.resolve_type_name_outcome_at(
             token,
-            analyzer.semantic_model_overlay(),
+            analyzer.semantic_model_overlay_read().published(),
             file,
             &name,
             selected

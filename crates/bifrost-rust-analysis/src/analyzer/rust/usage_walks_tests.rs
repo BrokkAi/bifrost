@@ -572,34 +572,43 @@ mod hidden { use crate::other::Thing; }include!("generated.rs");"#,
     /// A deep re-export chain must not exhaust the stack. This is deliberately
     /// far deeper than a normal module tree: the explicit work queue must
     /// carry the ladder instead of consuming one Rust stack frame per link.
+    ///
+    /// The ladder is 512 modules deep but spans only four files. One file per
+    /// link made certified fixture construction, not the walk, dominate the
+    /// test and pushed it into the profile-wide nextest kill (#11761); the
+    /// depth is what exercises the worklist.
     #[test]
     #[hardwon("#549: The test pins target preservation through a deep re-export ladder.")]
     fn an_export_chain_survives_a_deep_re_export_ladder() {
         const LINKS: usize = 512;
-        let mut files: Vec<(String, String)> = Vec::new();
-        let mut lib = String::new();
-        for index in 0..LINKS {
-            lib.push_str(&format!("pub mod link{index};\n"));
-        }
-        files.push(("src/lib.rs".to_string(), lib));
-        for index in 0..LINKS {
-            let body = if index + 1 == LINKS {
-                "pub struct Value;\n".to_string()
+        let mut links = String::new();
+        for index in 1..LINKS - 1 {
+            if index + 1 == LINKS - 1 {
+                links.push_str(&format!(
+                    "pub mod link{index} {{ pub use crate::tail::Value; }}\n"
+                ));
             } else {
-                format!("pub use crate::link{}::Value;\n", index + 1)
-            };
-            files.push((format!("src/link{index}.rs"), body));
+                links.push_str(&format!(
+                    "pub mod link{index} {{ pub use crate::links::link{}::Value; }}\n",
+                    index + 1
+                ));
+            }
         }
-        let borrowed: Vec<(&str, &str)> = files
-            .iter()
-            .map(|(rel, body)| (rel.as_str(), body.as_str()))
-            .collect();
-        let (_temp, analyzer) = project(&borrowed);
+        let files = [
+            (
+                "src/lib.rs",
+                "pub mod link0;\npub mod links;\npub mod tail;\n",
+            ),
+            ("src/link0.rs", "pub use crate::links::link1::Value;\n"),
+            ("src/links.rs", links.as_str()),
+            ("src/tail.rs", "pub struct Value;\n"),
+        ];
+        let (_temp, analyzer) = project(&files);
         let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
         let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token())
             .expect("Cargo routes available for the fixture");
         let head = file(&analyzer, "link0.rs");
-        let tail = file(&analyzer, &format!("link{}.rs", LINKS - 1));
+        let tail = file(&analyzer, "tail.rs");
         let head_module = walks.physical_root_of(&head).expect("link0 is analyzed");
 
         let bindings = walks
@@ -612,6 +621,11 @@ mod hidden { use crate::other::Thing; }include!("generated.rs");"#,
         assert_eq!(
             value.origin.file, tail,
             "the whole ladder resolves to the one real declaration"
+        );
+        assert!(
+            walks.recursion_computations() >= LINKS,
+            "the walk must visit every link in the ladder: {} for {LINKS} links",
+            walks.recursion_computations()
         );
         assert!(
             walks.recursion_computations() <= 8 * LINKS + 1,
@@ -1107,6 +1121,67 @@ mod hidden { use crate::other::Thing; }include!("generated.rs");"#,
             walks.import_binding_computations() <= (MODULES + 1) as u64,
             "cyclic fixed-point rounds must decode each import-bearing file once: {} for {MODULES} modules",
             walks.import_binding_computations()
+        );
+    }
+
+    #[hardwon("#11799: the Rust usage walk re-read Cargo.toml for every non-rooted path segment")]
+    #[test]
+    fn the_walk_reads_each_manifest_directory_once_not_once_per_segment() {
+        const MODULES: usize = 8;
+        const STD_IMPORTS: [&str; 10] = [
+            "std::collections::HashMap",
+            "std::collections::HashSet",
+            "std::collections::BTreeMap",
+            "std::collections::BTreeSet",
+            "std::collections::VecDeque",
+            "std::fmt::Debug",
+            "std::fmt::Display",
+            "std::sync::Arc",
+            "std::sync::Mutex",
+            "std::path::PathBuf",
+        ];
+        let mut lib = String::new();
+        for index in 0..MODULES {
+            lib.push_str(&format!("pub mod m{index};\n"));
+        }
+        let mut files: Vec<(String, String)> = vec![("src/lib.rs".to_string(), lib)];
+        for index in 0..MODULES {
+            let mut body = format!(
+                "pub use crate::m{}::*;\npub struct Item{index};\n",
+                (index + 1) % MODULES
+            );
+            for import in STD_IMPORTS {
+                body.push_str(&format!("use {import};\n"));
+            }
+            files.push((format!("src/m{index}.rs"), body));
+        }
+        let borrowed: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(rel, body)| (rel.as_str(), body.as_str()))
+            .collect();
+        let (_temp, analyzer) = project(&borrowed);
+        let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
+        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token())
+            .expect("Cargo routes available for the fixture");
+        let root = file(&analyzer, "m0.rs").root().to_path_buf();
+
+        let before = brokk_bifrost_rust::crate_naming::manifest_probes(&root);
+        for index in 0..MODULES {
+            walks
+                .origin_routes_of(&file(&analyzer, &format!("m{index}.rs")))
+                .expect("uncancelled walk");
+        }
+        let probes = brokk_bifrost_rust::crate_naming::manifest_probes(&root) - before;
+
+        // The fixture has two manifest directories to ask about, `src` and
+        // the root, and the owner's caches remember each answer. A walk that
+        // built its own caches per path segment probed on every one of the
+        // MODULES * STD_IMPORTS.len() imports instead.
+        assert!(
+            probes <= 2,
+            "{probes} manifest probes for {} imports: the walk must read the \
+             owner's manifest source, memoized per directory",
+            MODULES * STD_IMPORTS.len()
         );
     }
 

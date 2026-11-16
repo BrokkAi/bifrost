@@ -68,6 +68,9 @@ pub struct CSharpAuthoritativeUsageBatch<'a> {
     analyzer: &'a dyn IAnalyzer,
     resolver: CSharpQueryResolver<'a>,
     prepared_files: HashMap<ProjectFile, Arc<PreparedCSharpFile>>,
+    /// Roots whose indexed source could not be read. An empty or unparseable
+    /// file is not here: it has nothing to scan.
+    unavailable_files: HashSet<ProjectFile>,
     token: QueryToken<'a>,
     #[cfg(any(test, feature = "test-support"))]
     batch_file_scans: AtomicUsize,
@@ -118,18 +121,22 @@ impl<'a> CSharpAuthoritativeUsageBatch<'a> {
         roots: &HashSet<ProjectFile>,
     ) -> Option<Self> {
         let resolver = CSharpQueryResolver::try_new(analyzer)?;
-        let prepared_files = roots
-            .iter()
-            .filter_map(|file| {
-                let source = analyzer.project().read_source(file).ok()?;
-                prepare_file(resolver.csharp, file, source)
-                    .map(|prepared| (file.clone(), Arc::new(prepared)))
-            })
-            .collect();
+        let mut prepared_files = HashMap::default();
+        let mut unavailable_files = HashSet::default();
+        for file in roots {
+            let Some(source) = analyzer.indexed_source(file) else {
+                unavailable_files.insert(file.clone());
+                continue;
+            };
+            if let Some(prepared) = prepare_file(resolver.csharp, file, source) {
+                prepared_files.insert(file.clone(), Arc::new(prepared));
+            }
+        }
         Some(Self {
             analyzer,
             resolver,
             prepared_files,
+            unavailable_files,
             token,
             #[cfg(any(test, feature = "test-support"))]
             batch_file_scans: AtomicUsize::new(0),
@@ -178,6 +185,20 @@ impl<'a> CSharpAuthoritativeUsageBatch<'a> {
                 plans.push(None);
                 continue;
             };
+            let mut unavailable: Vec<_> = request
+                .candidate_files
+                .iter()
+                .filter(|file| self.unavailable_files.contains(*file))
+                .cloned()
+                .collect();
+            unavailable.sort();
+            if !unavailable.is_empty() {
+                outcomes[index] = Some(GraphUsageOutcome::TerminalFailure(
+                    brokk_bifrost_core::analyzer::usages::model::UsageAnalysisDiagnostic::indexed_source_unavailable(&unavailable),
+                ));
+                plans.push(None);
+                continue;
+            }
             let specs = match csharp_target_specs(request.overloads, |overload| {
                 TargetSpec::from_target(&graph, overload)
             }) {
@@ -333,19 +354,21 @@ impl CSharpQueryResolver<'_> {
             if scan_scope.is_cancelled() || usages.limit_reached() {
                 break;
             }
-            let local_prepared = prepared_files
-                .is_none()
-                .then(|| {
-                    analyzer
-                        .project()
-                        .read_source(&file)
-                        .ok()
-                        .and_then(|source| prepare_file(self.csharp, &file, source))
-                })
-                .flatten();
-            let prepared = prepared_files
-                .and_then(|files| files.get(&file).map(Arc::as_ref))
-                .or(local_prepared.as_ref());
+            let local_prepared;
+            let prepared = match prepared_files {
+                // The batch reported unavailable roots before planning.
+                Some(files) => files.get(&file).map(Arc::as_ref),
+                None => {
+                    let Some(source) = analyzer.indexed_source(&file) else {
+                        return GraphUsageOutcome::TerminalFailure(
+                            brokk_bifrost_core::analyzer::usages::model::UsageAnalysisDiagnostic::indexed_source_unavailable(&[file]),
+                        );
+                    };
+                    local_prepared = prepare_file(self.csharp, &file, source);
+                    local_prepared.as_ref()
+                }
+            };
+            // An empty or unparseable file has nothing to scan.
             let Some(prepared) = prepared else {
                 continue;
             };

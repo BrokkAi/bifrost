@@ -8,7 +8,7 @@ use crate::analyzer::i_analyzer::{capture_query_reads, replay_query_reads};
 use crate::analyzer::resolution::FactResolutionBatchSummary;
 use crate::analyzer::resolution::local_identity::ResolutionIdentityTranslation;
 use crate::analyzer::resolution::worker_transport::WorkerAnswer;
-use crate::analyzer::semantic_model::{ActiveSemanticModelSnapshot, SemanticModelOverlay};
+use crate::analyzer::semantic_model::ActiveSemanticModelSnapshot;
 use crate::analyzer::store::Result;
 use crate::analyzer::store::resolution_operation::graph_stage::*;
 use crate::analyzer::store::resolution_operation::{
@@ -23,7 +23,7 @@ use crate::analyzer::{AnalyzerQueryScope, IAnalyzer, ProjectFile, ReadAttributio
 struct WorkerAnalyzerState {
     owner: ThreadId,
     snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
-    overlay: Option<Arc<SemanticModelOverlay>>,
+    overlay: crate::analyzer::semantic_model::runtime::SemanticModelOverlayRead,
 }
 
 struct AnalyzerGraphAdapter<'a, A> {
@@ -106,7 +106,7 @@ impl<A: GraphStageAdapter> GraphStageAdapter for AnalyzerGraphAdapter<'_, A> {
             );
             // An explicit overlay can be newer than the snapshot override;
             // install the owner's effective overlay last to retain precedence.
-            let _overlay = AnalyzerQueryScope::with_semantic_model_overlay(
+            let _overlay = AnalyzerQueryScope::with_frozen_semantic_model_overlay(
                 self.analyzer,
                 state.overlay.clone(),
             );
@@ -151,12 +151,10 @@ pub(crate) fn run_analyzer_graph_stages<A: GraphStageAdapter>(
     // Install before scheduling captures the request context. Owner replay can
     // overlap live worker captures and must never broadcast into their ledgers.
     let _attribution = ReadAttribution::for_request().install();
-    let worker_state = (worker_count > 1
-        && !operation.worker_store().uses_single_connection_reads())
-    .then(|| WorkerAnalyzerState {
+    let worker_state = (worker_count > 1).then(|| WorkerAnalyzerState {
         owner: std::thread::current().id(),
         snapshot: analyzer.active_semantic_model_snapshot(),
-        overlay: analyzer.semantic_model_overlay(),
+        overlay: analyzer.semantic_model_overlay_read(),
     });
     run_graph_stages(
         operation,

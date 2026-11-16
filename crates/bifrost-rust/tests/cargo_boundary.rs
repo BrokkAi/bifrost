@@ -71,7 +71,21 @@ fn cargo_boundary_workspace_matrix() {
         let without_member = manifests
             .iter()
             .filter(|m| m.relative_path != Path::new("member/Cargo.toml"))
-            .cloned()
+            .map(|manifest| {
+                // Members activate every declared feature (#12164); dep must remain a dependency here.
+                if manifest.relative_path == Path::new("Cargo.toml") {
+                    RustSelectedManifestMount::from_source(
+                        "Cargo.toml",
+                        &std::str::from_utf8(manifest.source_bytes())
+                            .unwrap()
+                            .replace("members = [\"app\", \"dep\",", "members = [\"app\",")
+                            .replace("[workspace]", "[workspace]\nexclude = [\"dep\"]"),
+                    )
+                    .unwrap()
+                } else {
+                    manifest.clone()
+                }
+            })
             .collect();
         let reduced = rust_crate_targets(
             paths.clone(),
@@ -452,6 +466,7 @@ fn cargo_boundary_selected_units_keep_disjoint_dependency_routes() {
         &HashMap::default(),
         &rows,
         &paths,
+        &Default::default(),
         &|| true,
     )
     .unwrap();

@@ -18,6 +18,40 @@ use brokk_bifrost_core::analyzer::tree_walk::{ParentIndex, named_children_iter};
 use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex};
 use tree_sitter::Node;
 
+/// Whether `this` or `base` is used only as the receiver of a member access.
+pub fn is_receiver_only_keyword(node: Node<'_>) -> bool {
+    matches!(node.kind(), "this" | "base")
+        && node.parent().is_some_and(|parent| {
+            parent.kind() == "member_access_expression"
+                && parent
+                    .child_by_field_name("expression")
+                    .is_some_and(|expression| expression == node)
+        })
+}
+
+/// Interpret nominal declaration kind from the grammar, including record structs.
+pub(crate) fn csharp_nominal_kind(
+    node: Node<'_>,
+) -> brokk_bifrost_core::analyzer::model::ClassLikeKind {
+    use brokk_bifrost_core::analyzer::model::ClassLikeKind;
+    match node.kind() {
+        "record_declaration"
+            if {
+                let mut cursor = node.walk();
+                node.children(&mut cursor)
+                    .any(|child| child.kind() == "struct")
+            } =>
+        {
+            ClassLikeKind::Struct
+        }
+        "class_declaration" | "record_declaration" => ClassLikeKind::Class,
+        "struct_declaration" | "record_struct_declaration" => ClassLikeKind::Struct,
+        "interface_declaration" => ClassLikeKind::Interface,
+        "enum_declaration" => ClassLikeKind::Enum,
+        _ => unreachable!("admitted nominal C# declaration"),
+    }
+}
+
 pub fn csharp_is_member_variable_owner_kind(kind: &str) -> bool {
     matches!(kind, "field_declaration" | "event_field_declaration")
 }
@@ -1420,7 +1454,8 @@ pub fn normalize_csharp_type_fragment(reference: &str) -> String {
 pub const CSHARP_INDEXER_MEMBER_NAME: &str = "Item";
 
 /// Whether a case pattern matches every value before any when guard.
-pub(crate) fn csharp_is_irrefutable_pattern(mut pattern: Node<'_>) -> bool {
+#[doc(hidden)]
+pub fn csharp_is_irrefutable_pattern(mut pattern: Node<'_>) -> bool {
     while pattern.kind() == "parenthesized_pattern" {
         let Some(inner) = named_children_iter(pattern).find(|child| !child.is_extra()) else {
             return false;

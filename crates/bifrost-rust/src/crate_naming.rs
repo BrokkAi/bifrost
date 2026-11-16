@@ -15,17 +15,18 @@
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::LazyLock;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::RwLock;
 
+use brokk_bifrost_core::allocation_size::allocation_size;
 use brokk_bifrost_core::analyzer::fq_name::FqName;
 #[cfg(test)]
 use brokk_bifrost_core::analyzer::fq_name::segment_interner;
 use brokk_bifrost_core::analyzer::project::IdentityWalkInput;
 use brokk_bifrost_core::analyzer::{PackageAnchor, ProjectFile};
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use brokk_bifrost_core::hash::HashMap;
 use brokk_bifrost_core::retention_budget::{Accounted, RetentionBudget};
 
@@ -560,15 +561,17 @@ impl RustCrateNamingCaches {
                     naming_weight(
                         size_of::<NearestCrateEntry>()
                             + value.nearest.as_ref().map_or(0, |nearest| {
-                                nearest.directory.capacity()
-                                    + nearest.crate_name.capacity()
-                                    + nearest.library_path.capacity()
+                                allocation_size(nearest.directory.capacity())
+                                    + allocation_size(nearest.crate_name.capacity())
+                                    + allocation_size(nearest.library_path.capacity())
                             })
                             // Charge the full shared allocation for each entry.
-                            + std::mem::size_of_val(value.inputs.as_ref())
+                            + allocation_size(std::mem::size_of_val(value.inputs.as_ref()))
                             + value.inputs.iter().map(|input| match input {
                                 IdentityWalkInput::File { rel_path, .. }
-                                | IdentityWalkInput::PathAbsent { rel_path } => rel_path.capacity(),
+                                | IdentityWalkInput::PathAbsent { rel_path } => {
+                                    allocation_size(rel_path.capacity())
+                                }
                                 IdentityWalkInput::Unavailable => 0,
                             }).sum::<usize>(),
                     )
@@ -581,8 +584,8 @@ impl RustCrateNamingCaches {
                 |_, value| {
                     // The vectors' buffers and each string's full capacity.
                     let strings = |parts: &Vec<String>| {
-                        brokk_bifrost_core::hash::vec_slot_bytes(parts)
-                            + parts.iter().map(String::capacity).sum::<usize>()
+                        crate::cache::vec_buffer_bytes(parts)
+                            + parts.iter().map(crate::cache::string_bytes).sum::<usize>()
                     };
                     naming_weight(
                         size_of::<CratePaths>()
@@ -703,7 +706,7 @@ fn nearest_crate_entry_with(
             break entry.nearest.clone();
         }
         walked.push((relative.to_path_buf(), inputs.len()));
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         record_manifest_probe(root);
         let path = relative.join("Cargo.toml");
         let rel_path = brokk_bifrost_core::path_utils::workspace_relative_slash_path(&path);
@@ -756,24 +759,36 @@ fn nearest_crate_entry_with(
     result.expect("the starting directory was probed")
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 const POISONED: &str = "crate-naming test probe lock is poisoned";
 
 /// Ancestor-walk manifest probes per workspace root, so a test can prove the
 /// walk runs once per directory rather than once per file. Per root, because
 /// unit tests in this binary run concurrently and each owns its own fixture
-/// root.
-#[cfg(test)]
+/// root. A `cfg(test)` item is invisible across a crate boundary, so the
+/// analysis crate's walk tests reach it under `test-support`.
+#[cfg(any(test, feature = "test-support"))]
 static MANIFEST_PROBES: LazyLock<RwLock<HashMap<PathBuf, usize>>> =
     LazyLock::new(|| RwLock::new(HashMap::default()));
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn record_manifest_probe(root: &Path) {
     *MANIFEST_PROBES
         .write()
         .expect(POISONED)
         .entry(root.to_path_buf())
         .or_default() += 1;
+}
+
+/// Ancestor-walk manifest probes charged to `root` so far.
+#[cfg(any(test, feature = "test-support"))]
+pub fn manifest_probes(root: &Path) -> usize {
+    MANIFEST_PROBES
+        .read()
+        .expect(POISONED)
+        .get(root)
+        .copied()
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -816,12 +831,7 @@ mod tests {
 
         /// Ancestor-walk manifest probes charged to this fixture's root so far.
         fn manifest_probes(&self) -> usize {
-            MANIFEST_PROBES
-                .read()
-                .expect(POISONED)
-                .get(&self.root)
-                .copied()
-                .unwrap_or_default()
+            super::manifest_probes(&self.root)
         }
 
         /// Package/root for a file that must be Cargo-managed.

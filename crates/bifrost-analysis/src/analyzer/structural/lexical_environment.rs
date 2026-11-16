@@ -283,6 +283,12 @@ pub enum EnvironmentIncompleteReason {
     SyntaxUnavailable,
     /// The binder alternatives do not prove one name and binding mode.
     BindingIdentityUnknown,
+    /// An adapter's Open roles do not prove source-only uncertainty. Rust's
+    /// current canonical producer instead emits BindingIdentityUnknown.
+    BindingRoleUnknown,
+    /// A source-determined engine limit stopped identity derivation. This is
+    /// cacheable, but does not establish agreement about the analyzed code.
+    BoundedWorkLimit(brokk_bifrost_core::analyzer::structural::spec::BindingWorkLimit),
     /// The adapter could not state an activation interval for at least one
     /// binder, so the binding set is missing rows rather than complete.
     BindingActivationUnknown,
@@ -327,7 +333,9 @@ impl EnvironmentCompleteness {
                             *unsupported == axis
                         }
                         EnvironmentIncompleteReason::BindingActivationUnknown
-                        | EnvironmentIncompleteReason::BindingIdentityUnknown => {
+                        | EnvironmentIncompleteReason::BindingIdentityUnknown
+                        | EnvironmentIncompleteReason::BindingRoleUnknown
+                        | EnvironmentIncompleteReason::BoundedWorkLimit(_) => {
                             axis == EnvironmentAxis::BindingIntervals
                         }
                         EnvironmentIncompleteReason::ImportTargetUnstructured => {
@@ -435,6 +443,8 @@ impl EnvironmentFileResult {
                     if !unsupported_axes.contains(&EnvironmentAxis::BindingIntervals)
                     && reasons.iter().all(|reason| matches!(reason,
                         EnvironmentIncompleteReason::BindingIdentityUnknown
+                        | EnvironmentIncompleteReason::BindingRoleUnknown
+                        | EnvironmentIncompleteReason::BoundedWorkLimit(_)
                         | EnvironmentIncompleteReason::BindingActivationUnknown
                         | EnvironmentIncompleteReason::AxisUnsupported(EnvironmentAxis::ImportBinders)
                         | EnvironmentIncompleteReason::ImportTargetUnstructured))))
@@ -649,6 +659,28 @@ fn enclosing_scope(facts: &FileFacts, scope_of_node: &[Option<u32>], node: u32) 
     0
 }
 
+/// Keep diagnostic evidence bounded by the number of named limits, even
+/// when many candidates stop at different work counts. The maximum observed
+/// work is deterministic and remains an actual stop value from this file.
+fn note_binding_work_limit(
+    reasons: &mut Vec<EnvironmentIncompleteReason>,
+    limit: brokk_bifrost_core::analyzer::structural::spec::BindingWorkLimit,
+) {
+    for reason in reasons.iter_mut() {
+        if let EnvironmentIncompleteReason::BoundedWorkLimit(previous) = reason
+            && previous.bound == limit.bound
+        {
+            if limit.value > previous.value
+                || (limit.value == previous.value && limit.limit < previous.limit)
+            {
+                *previous = limit;
+            }
+            return;
+        }
+    }
+    reasons.push(EnvironmentIncompleteReason::BoundedWorkLimit(limit));
+}
+
 /// Every binder token of the file, turned into a binding with an interval.
 fn binding_rows(
     spec: &dyn StructuralSpec,
@@ -667,15 +699,65 @@ fn binding_rows(
         }
     }
 
+    // Preserve the admitted fragment ancestry when joining fact ranges to syntax.
+    // Primary token-tree tokens have the same bytes but different binding owners.
+    let cancellation = crate::analyzer::i_analyzer::current_query_cancellation();
+    // Repeated nested operands must not retain quadratic syntax for linear
+    // source. Allow four syntax nodes per admitted source byte, capped at the
+    // ordinary two-million-node query budget; excess remains incomplete.
+    let syntax_budget = source.len().saturating_mul(4).min(2_000_000);
+    let forest = match brokk_bifrost_core::analyzer::structural::spec::EmbeddedSyntaxForest::parse(
+        spec,
+        root,
+        source,
+        syntax_budget,
+        cancellation.as_ref(),
+    ) {
+        Ok(forest) => forest,
+        Err(_) => {
+            super::note_once(
+                reasons,
+                EnvironmentIncompleteReason::BindingActivationUnknown,
+            );
+            return (Vec::new(), Vec::new(), None);
+        }
+    };
+    let mut embedded_by_range = HashMap::new();
+    for tree in forest.trees() {
+        let tree_id = tree.tree.root_node().id();
+        let mut pending = vec![tree.root()];
+        while let Some(node) = pending.pop() {
+            if cancellation
+                .as_ref()
+                .is_some_and(|token| token.is_cancelled())
+            {
+                super::note_once(
+                    reasons,
+                    EnvironmentIncompleteReason::BindingActivationUnknown,
+                );
+                return (Vec::new(), Vec::new(), None);
+            }
+            embedded_by_range.insert((node.start_byte(), node.end_byte()), (node, tree_id));
+            let mut cursor = node.walk();
+            pending.extend(node.named_children(&mut cursor));
+        }
+    }
+    let syntax_for_range = |start, end| {
+        embedded_by_range
+            .get(&(start, end))
+            .map(|(node, _)| *node)
+            .or_else(|| root.named_descendant_for_byte_range(start, end))
+    };
     // Correspondence lives only for this prepared file/query. No language walks
     // syntax ancestors independently of the parent-linked scope rows.
     let scope_syntax: Vec<_> = scopes
         .iter()
         .map(|scope| match scope.anchor {
             ScopeAnchor::File => Some(BindingScopeCandidate::File { root }),
-            ScopeAnchor::Node { .. } => root
-                .descendant_for_byte_range(scope.range.start_byte, scope.range.end_byte)
-                .map(BindingScopeCandidate::Syntax),
+            ScopeAnchor::Node { .. } => {
+                syntax_for_range(scope.range.start_byte, scope.range.end_byte)
+                    .map(BindingScopeCandidate::Syntax)
+            }
         })
         .collect();
     // One file/query correspondence, dropped with the derived rows. Implicit
@@ -706,7 +788,9 @@ fn binding_rows(
     // Index only binding candidates. The syntax walk below also collects
     // barriers, including owners such as static fields that have no scope row.
     let mut candidates_by_syntax: HashMap<_, Vec<_>> = HashMap::new();
-    let mut anchor_candidates = Vec::new();
+    let mut anchor_candidates_by_tree: HashMap<_, Vec<_>> = HashMap::new();
+    let mut opaque_ancestors = HashMap::new();
+    let mut ancestry = Vec::new();
     for (index, normalized) in facts.nodes().iter().enumerate() {
         let node = u32::try_from(index).expect("facts arena node count fits in u32");
         let roles = facts.occurrence_roles(node);
@@ -717,12 +801,58 @@ fn binding_rows(
             binder_nodes_by_range.insert(range, node);
             // Preserve the fact-to-syntax join for contextual wrappers and
             // explicit subspans instead of assuming exact range equality.
-            let Some(binder) = root.named_descendant_for_byte_range(range.0, range.1) else {
-                super::note_once(reasons, EnvironmentIncompleteReason::SyntaxUnavailable);
+            let Some(binder) = syntax_for_range(range.0, range.1) else {
+                super::note_once(
+                    reasons,
+                    EnvironmentIncompleteReason::BindingActivationUnknown,
+                );
                 continue;
             };
+            if !embedded_by_range.contains_key(&range) && !spec.embedded_syntax_kinds().is_empty() {
+                // Each primary syntax ancestor is inspected at most once per
+                // file, including on deeply nested ordinary binding paths.
+                ancestry.clear();
+                let mut ancestor = binder.parent();
+                let opaque = loop {
+                    let Some(parent) = ancestor else {
+                        break false;
+                    };
+                    if cancellation
+                        .as_ref()
+                        .is_some_and(|token| token.is_cancelled())
+                    {
+                        super::note_once(
+                            reasons,
+                            EnvironmentIncompleteReason::BindingActivationUnknown,
+                        );
+                        return (Vec::new(), Vec::new(), None);
+                    }
+                    if let Some(&opaque) = opaque_ancestors.get(&parent.id()) {
+                        break opaque;
+                    }
+                    ancestry.push(parent.id());
+                    if spec.embedded_syntax_kinds().contains(&parent.kind()) {
+                        break true;
+                    }
+                    ancestor = parent.parent();
+                };
+                for ancestor in ancestry.drain(..) {
+                    let previous = opaque_ancestors.insert(ancestor, opaque);
+                    debug_assert!(previous.is_none());
+                }
+                if opaque {
+                    super::note_once(reasons, EnvironmentIncompleteReason::SyntaxUnavailable);
+                    continue;
+                }
+            }
             if roles.contains(&OccurrenceRole::Binder) {
-                anchor_candidates.push(binder);
+                let tree_id = embedded_by_range
+                    .get(&range)
+                    .map_or(root.id(), |(_, tree)| *tree);
+                anchor_candidates_by_tree
+                    .entry(tree_id)
+                    .or_default()
+                    .push(binder);
             }
             candidates_by_syntax
                 .entry(binder.id())
@@ -730,13 +860,27 @@ fn binding_rows(
                 .push(node);
         }
     }
-    let anchor_answers = spec.logical_binding_anchors(&anchor_candidates, source);
-    debug_assert_eq!(anchor_answers.len(), anchor_candidates.len());
-    let anchors_by_syntax: HashMap<_, _> = anchor_candidates
-        .iter()
-        .zip(anchor_answers)
-        .map(|(binder, anchor)| (binder.id(), anchor))
-        .collect();
+    let mut anchors_by_syntax = HashMap::new();
+    for anchor_candidates in anchor_candidates_by_tree.values() {
+        if cancellation
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+        {
+            super::note_once(
+                reasons,
+                EnvironmentIncompleteReason::BindingActivationUnknown,
+            );
+            return (Vec::new(), Vec::new(), None);
+        }
+        let anchor_answers = spec.logical_binding_anchors_checked(anchor_candidates, source);
+        debug_assert_eq!(anchor_answers.len(), anchor_candidates.len());
+        anchors_by_syntax.extend(
+            anchor_candidates
+                .iter()
+                .zip(anchor_answers)
+                .map(|(binder, anchor)| (binder.id(), anchor)),
+        );
+    }
     let mut rows = Vec::new();
     let mut unknown_names = Some(UnknownBindingIntervals::new());
     let note_unknown =
@@ -754,7 +898,18 @@ fn binding_rows(
         };
     let mut barriers = Vec::new();
     let mut pending = vec![root];
+    pending.extend(forest.trees().iter().map(|tree| tree.root()));
     while let Some(syntax) = pending.pop() {
+        if cancellation
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+        {
+            super::note_once(
+                reasons,
+                EnvironmentIncompleteReason::BindingActivationUnknown,
+            );
+            return (Vec::new(), Vec::new(), None);
+        }
         let mut cursor = syntax.walk();
         pending.extend(syntax.named_children(&mut cursor));
         if spec.type_parameter_scope_barrier(syntax) {
@@ -845,16 +1000,32 @@ fn binding_rows(
                 }
                 continue;
             };
+            // Preserve engine-limit evidence even when the stored role is Open.
+            // Neither case may manufacture an identity or a complete binding set.
+            let anchor_answer = anchors_by_syntax.get(&binder.id()).copied();
+            if let Some(Err(limit)) = anchor_answer {
+                note_binding_work_limit(reasons, limit);
+                note_unknown(&mut unknown_names, node, Some(activation.activation));
+            }
             if open_binder {
-                super::note_once(reasons, EnvironmentIncompleteReason::BindingIdentityUnknown);
+                // Canonical Rust facts are uncapped. Store hydration requires
+                // the exact current facts version and active producer generation,
+                // so an Open role here reflects source ambiguity, not preparation
+                // exhaustion. Keep the row withheld and its unknown interval.
+                let reason = if spec.language() == Language::Rust {
+                    EnvironmentIncompleteReason::BindingIdentityUnknown
+                } else {
+                    EnvironmentIncompleteReason::BindingRoleUnknown
+                };
+                super::note_once(reasons, reason);
                 note_unknown(&mut unknown_names, node, Some(activation.activation));
                 continue;
             }
             let mut row = make_row(node, declaring_scope, activation);
             if is_binder {
-                row.logical_anchor = anchors_by_syntax.get(&binder.id()).copied().flatten();
+                row.logical_anchor = anchor_answer.and_then(Result::ok).flatten();
                 row.syntax = spec.binding_syntax(binder);
-                if row.logical_anchor.is_none() {
+                if row.logical_anchor.is_none() && !matches!(anchor_answer, Some(Err(_))) {
                     super::note_once(reasons, EnvironmentIncompleteReason::BindingIdentityUnknown);
                     note_unknown(&mut unknown_names, node, Some(row.activation));
                 }
@@ -906,9 +1077,17 @@ fn binding_rows(
                 continue;
             };
             let mut row = make_row(node, scope.index, activation);
-            row.logical_anchor = spec.logical_binding_anchor(binder.name, source);
+            let anchor_answer = spec.logical_binding_anchor_checked(binder.name, source);
+            row.logical_anchor = match anchor_answer {
+                Ok(anchor) => anchor,
+                Err(limit) => {
+                    note_binding_work_limit(reasons, limit);
+                    note_unknown(&mut unknown_names, node, Some(row.activation));
+                    None
+                }
+            };
             row.syntax = spec.binding_syntax(binder.name);
-            if row.logical_anchor.is_none() {
+            if row.logical_anchor.is_none() && anchor_answer.is_ok() {
                 super::note_once(reasons, EnvironmentIncompleteReason::BindingIdentityUnknown);
                 note_unknown(&mut unknown_names, node, Some(row.activation));
             }
@@ -1400,6 +1579,32 @@ pub mod test_support;
 mod tests {
     use super::*;
     use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    fn binding_work_limit_reasons_stay_bounded_across_many_stops() {
+        use brokk_bifrost_core::analyzer::structural::spec::{BindingWorkBound, BindingWorkLimit};
+        let mut reasons = Vec::new();
+        for value in 129..2_129 {
+            note_binding_work_limit(
+                &mut reasons,
+                BindingWorkLimit {
+                    bound: BindingWorkBound::OrPatternCandidates,
+                    limit: 128,
+                    value,
+                },
+            );
+        }
+        assert_eq!(
+            reasons,
+            vec![EnvironmentIncompleteReason::BoundedWorkLimit(
+                BindingWorkLimit {
+                    bound: BindingWorkBound::OrPatternCandidates,
+                    limit: 128,
+                    value: 2_128,
+                }
+            )]
+        );
+    }
 
     fn parsed_environment(source: &str) -> EnvironmentFileResult {
         let spec = &brokk_bifrost_python::structural::PYTHON_STRUCTURAL_SPEC;

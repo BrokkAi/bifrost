@@ -397,9 +397,12 @@ mod cpp_extraction_tests {
                         .canonical_cpp_source_facts(&file, "cpp", &moka::sync::Cache::new(1))
                         .is_none()
                 );
+                let reason = scope.read_completion().unwrap_err();
                 assert!(
-                    matches!(scope.read_completion(), Err(QueryReadIncomplete::SemanticEvidenceUnavailable(reason)) if reason.contains("ExcludedNodes") && reason.contains("8192"))
+                    matches!(&reason, QueryReadIncomplete::SemanticEvidenceGap(detail) if detail.contains("ExcludedNodes") && detail.contains("8192"))
                 );
+                assert_eq!(reason.execution_cause(), None);
+                assert!(reason.stable_replay_reason().is_some());
                 assert!(scope.store_error().is_none());
             }
             let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes()).unwrap();
@@ -483,14 +486,18 @@ mod cpp_extraction_tests {
                 ),
                 format!("int data[] = {{{}}};\n", "1,".repeat(600_000)),
             ] {
-                assert!(matches!(
-                    parse(&CppAdapter, &source, None),
-                    BoundedParse::Refused(SourceAdmissionRefusal::Budget {
-                        dimension: brokk_bifrost_analysis::analyzer::semantic::source_admission::AdmissionDimension::ExcludedNodes,
-                        limit: 8192,
-                        ..
-                    })
-                ));
+                let outcome = parse(&CppAdapter, &source, None);
+                assert!(
+                    matches!(
+                        &outcome,
+                        BoundedParse::Refused(SourceAdmissionRefusal::Budget {
+                            dimension: brokk_bifrost_analysis::analyzer::semantic::source_admission::AdmissionDimension::ExcludedNodes,
+                            limit: 8192,
+                            ..
+                        })
+                    ),
+                    "expected the excluded-node budget refusal, got {outcome:?}"
+                );
             }
             let source = format!(
                 "int data[] = {{{}}};\n",

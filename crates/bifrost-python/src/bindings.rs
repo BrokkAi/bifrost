@@ -315,7 +315,7 @@ enum PythonLocalBindingKind {
 
 #[derive(Clone, Debug)]
 struct PythonComprehensionBinding {
-    name: Box<str>,
+    parent: Option<usize>,
     start_byte: usize,
     end_byte: usize,
     enclosing_iterable_ranges: Vec<(usize, usize)>,
@@ -343,7 +343,7 @@ pub struct PythonLexicalScopeBindings {
     global_binding_events: HashSet<Box<str>>,
     globals: HashSet<Box<str>>,
     nonlocals: HashSet<Box<str>>,
-    comprehensions: Vec<PythonComprehensionBinding>,
+    comprehensions: HashMap<Box<str>, Vec<PythonComprehensionBinding>>,
 }
 
 impl PythonLexicalScopeBindings {
@@ -387,15 +387,28 @@ impl PythonLexicalScopeBindings {
         reference: Node<'_>,
         mut scope_step: impl FnMut() -> bool,
     ) -> Option<bool> {
+        if !scope_step() {
+            return None;
+        }
+        let Some(bindings) = self.comprehensions.get(name) else {
+            return Some(false);
+        };
         let reference_byte = reference.start_byte();
-        for binding in &self.comprehensions {
+        let mut completed = true;
+        let end = bindings.partition_point(|binding| {
+            completed &= scope_step();
+            binding.start_byte <= reference_byte
+        });
+        if !completed {
+            return None;
+        }
+        let mut index = end.checked_sub(1);
+        while let Some(current) = index {
             if !scope_step() {
                 return None;
             }
-            if binding.name.as_ref() == name
-                && binding.start_byte <= reference_byte
-                && reference_byte < binding.end_byte
-            {
+            let binding = &bindings[current];
+            if reference_byte < binding.end_byte {
                 let mut in_outer_iterable = false;
                 for (start, end) in &binding.enclosing_iterable_ranges {
                     if !scope_step() {
@@ -407,6 +420,9 @@ impl PythonLexicalScopeBindings {
                     return Some(true);
                 }
             }
+            // Ranges are laminar. Skip completed siblings directly to the
+            // enclosing same-name comprehension, rather than scanning them.
+            index = binding.parent;
         }
         Some(false)
     }
@@ -585,7 +601,7 @@ impl<'tree> PythonLexicalScopeInventory<'tree> {
                 global_binding_events: HashSet::default(),
                 globals: HashSet::default(),
                 nonlocals: HashSet::default(),
-                comprehensions: Vec::new(),
+                comprehensions: HashMap::default(),
             },
         };
         // Recovery can replace the module grammar node with an ERROR root.
@@ -783,17 +799,48 @@ impl<'tree> PythonLexicalScopeInventory<'tree> {
                         .filter(|child| child.kind() == "for_in_clause")
                     {
                         if let Some(target) = clause.child_by_field_name("left") {
+                            let mut names = Vec::new();
                             collect_binding_targets(target, source, &mut scope_step, |name, _| {
-                                inventory.bindings.comprehensions.push(
-                                    PythonComprehensionBinding {
-                                        name: name.into(),
-                                        start_byte: range.0,
-                                        end_byte: range.1,
-                                        enclosing_iterable_ranges: enclosing_iterable_ranges
-                                            .clone(),
-                                    },
-                                );
+                                names.push(name.to_owned());
                             })?;
+                            for name in names {
+                                if !scope_step() {
+                                    return None;
+                                }
+                                let bindings = inventory
+                                    .bindings
+                                    .comprehensions
+                                    .entry(name.into())
+                                    .or_default();
+                                if bindings.last().is_some_and(|previous| {
+                                    (previous.start_byte, previous.end_byte) == range
+                                }) {
+                                    continue;
+                                }
+                                // Inventory traversal is source-order preorder.
+                                debug_assert!(
+                                    bindings
+                                        .last()
+                                        .is_none_or(|previous| previous.start_byte <= range.0)
+                                );
+                                let mut parent = bindings.len().checked_sub(1);
+                                while let Some(index) = parent {
+                                    if !scope_step() {
+                                        return None;
+                                    }
+                                    if bindings[index].end_byte > range.0 {
+                                        debug_assert!(bindings[index].end_byte >= range.1);
+                                        break;
+                                    }
+                                    parent = bindings[index].parent;
+                                }
+                                bindings.push(PythonComprehensionBinding {
+                                    parent,
+                                    start_byte: range.0,
+                                    end_byte: range.1,
+                                    enclosing_iterable_ranges: enclosing_iterable_ranges.clone(),
+                                });
+                            }
                         }
                     }
                     for child in children.into_iter().rev() {
@@ -855,6 +902,16 @@ impl<'tree> PythonLexicalScopeInventory<'tree> {
     ) -> Option<PythonLexicalNameResolution> {
         self.bindings
             .name_resolution_at_bounded(name, reference, scope_step)
+    }
+
+    pub(crate) fn comprehension_binds_name_at_bounded(
+        &self,
+        name: &str,
+        reference: Node<'_>,
+        scope_step: impl FnMut() -> bool,
+    ) -> Option<bool> {
+        self.bindings
+            .comprehension_binds_name_at_bounded(name, reference, scope_step)
     }
 
     pub fn has_runtime_callable_binding_at(&self, name: &str, reference: Node<'_>) -> bool {

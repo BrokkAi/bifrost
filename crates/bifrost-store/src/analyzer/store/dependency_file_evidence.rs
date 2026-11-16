@@ -16,7 +16,11 @@ use std::sync::Arc;
 // the producer that wrote it. v4: Cargo owned lock rows cover each member's
 // transitive lock closure (#9055). v6: absent configuration candidates no
 // longer count toward the input file cap (#8780).
-const PRODUCER: &[u8] = b"bifrost.static-dependency-evidence.v6";
+// v7: complete acquired Cargo configuration retires unchanged-source rows
+// produced before configuration classification (#12398).
+// v8: `[env]` and other source-neutral Cargo sections no longer count as an
+// unresolved package-source override (#12600).
+const PRODUCER: &[u8] = b"bifrost.static-dependency-evidence.v8";
 pub(super) const READ_ROWS_SQL: &str = "SELECT ecosystem,package,kind,version_requirement,exact_version,source,locator,declared_by,scope,conditions,build_file,source_digest,start_byte,end_byte,complete FROM dependency_file_evidence WHERE set_id = ?1 ORDER BY id";
 
 /// Each language that publishes static dependency evidence, by the snapshot
@@ -53,6 +57,7 @@ fn prepare_selected(
     selected: &[(ProjectFile, ProjectSourceSnapshot)],
     presence: &[Option<bool>],
     limits: &DependencyFileEvidenceLimits,
+    acquired: Option<&brokk_bifrost_rust::cargo_config::acquired::RustCargoAcquiredConfigView>,
 ) -> DependencyFileEvidence {
     assert_eq!(selected.len(), presence.len());
     let language = PUBLISHING_LANGUAGES
@@ -65,24 +70,32 @@ fn prepare_selected(
         "selected_dependency_file_evidence",
     )
     .expect("selected dependency evidence language has a support")
-    .selected_dependency_file_evidence(
+    .selected_dependency_file_evidence_with_rust_config(
         root,
         &selected
             .iter()
             .zip(presence)
             .map(|((file, source), presence)| (file.clone(), source.clone(), *presence))
             .collect::<Vec<_>>(),
+        acquired,
         limits,
     )
 }
 
-#[doc(hidden)]
-pub fn publish(tx: &Transaction<'_>, snapshot: &WorkspaceSnapshotId) -> Result<()> {
+pub(super) fn publish_with_acquired(
+    tx: &Transaction<'_>,
+    snapshot: &WorkspaceSnapshotId,
+    acquired: &brokk_bifrost_rust::cargo_config::acquired::RustCargoAcquiredConfigView,
+) -> Result<()> {
     if !supports_language(&snapshot.lang) {
         return Ok(());
     }
+    let acquired = (snapshot.lang == "rust").then_some(acquired);
     let limits = DependencyFileEvidenceLimits::default();
     let mut hash = CanonicalHasher::new(PRODUCER);
+    let mut acquired_valid = true;
+    let mut acquired_refs = 0usize;
+
     // The indexed, ordered metadata cursor has constant memory even when the
     // workspace exceeds the acquisition cap. Include omitted identities in the
     // digest so a relevant edit cannot reuse a stale limit result.
@@ -94,7 +107,16 @@ pub fn publish(tx: &Transaction<'_>, snapshot: &WorkspaceSnapshotId) -> Result<(
         snapshot.revision
     ])?;
     while let Some(row) = cursor.next()? {
-        hash.field("path", row.get::<_, String>(0)?.as_bytes());
+        let path: String = row.get(0)?;
+        if let Some(input) =
+            acquired.and_then(|view| view.local_inputs.get(std::path::Path::new(&path)))
+        {
+            acquired_refs += 1;
+            acquired_valid &= row.get::<_, String>(1)? == input.oid.to_string()
+                && row.get::<_, Option<bool>>(2)? == input.present
+                && input.present.is_some();
+        }
+        hash.field("path", path.as_bytes());
         hash.field("oid", row.get::<_, String>(1)?.as_bytes());
         hash.field(
             "presence",
@@ -106,6 +128,35 @@ pub fn publish(tx: &Transaction<'_>, snapshot: &WorkspaceSnapshotId) -> Result<(
         );
     }
     let digest = lower_hex_string(&hash.finish());
+    // The selected input record is an admission certificate. Verify all local
+    // references against this immutable revision once here, so hot owner reads
+    // can project its indexed facts without scanning the whole workspace.
+    let mut incomplete = None;
+    if let Some(view) = acquired
+        && (!acquired_valid || acquired_refs != view.local_inputs.len())
+    {
+        let mut view = view.clone();
+        view.complete = false;
+        if !view
+            .reads
+            .iter()
+            .any(|read| read.label == "selected-local-inputs")
+        {
+            view.reads.push(brokk_bifrost_rust::cargo_config::acquired::RustCargoConfigRead {
+            label:"selected-local-inputs".into(),state:brokk_bifrost_rust::cargo_config::acquired::RustCargoConfigReadState::Unavailable {
+                reason:brokk_bifrost_rust::cargo_config::acquired::RustCargoConfigReadFailure::Unclassifiable,
+            },
+        });
+        }
+        incomplete = Some(view);
+    }
+    let acquired = incomplete.as_ref().or(acquired);
+    let digest = if let Some(acquired) = acquired {
+        let acquired_digest = super::rust_acquired_cargo_config::persist(tx, snapshot, acquired)?;
+        super::rust_acquired_cargo_config::bound_digest(&digest, &acquired_digest)
+    } else {
+        digest
+    };
     let existing = tx.query_row("SELECT set_id FROM dependency_evidence_sets WHERE workspace_id=?1 AND lang=?2 AND generation=?3 AND input_digest=?4", params![snapshot.workspace_id.as_str(),snapshot.lang,snapshot.generation.0,digest], |r| r.get::<_,i64>(0)).optional()?;
     let set_id = if let Some(id) = existing {
         id
@@ -118,11 +169,21 @@ pub fn publish(tx: &Transaction<'_>, snapshot: &WorkspaceSnapshotId) -> Result<(
             selected_inputs(tx, snapshot, &root, &limits, std::iter::empty(), |_, _| {
                 unreachable!("disk publication has no overlay inputs")
             })?;
-        let mut evidence = prepare_selected(&snapshot.lang, &root, &selected, &presence, &limits);
+        let mut evidence = prepare_selected(
+            &snapshot.lang,
+            &root,
+            &selected,
+            &presence,
+            &limits,
+            acquired,
+        );
         evidence.gaps.extend(gaps);
         insert_set(tx, snapshot, &digest, &evidence, &selected)?
     };
     tx.execute("INSERT INTO dependency_evidence_selections VALUES(?1,?2,?3,?4,?5) ON CONFLICT(workspace_id,lang,generation,revision) DO UPDATE SET set_id=excluded.set_id", params![snapshot.workspace_id.as_str(),snapshot.lang,snapshot.generation.0,snapshot.revision,set_id])?;
+    if snapshot.lang == "rust" {
+        super::rust_acquired_cargo_config::reclaim(tx, snapshot)?;
+    }
     Ok(())
 }
 
@@ -425,8 +486,55 @@ fn read_set(conn: &Connection, set: i64) -> Result<DependencyFileEvidence> {
 pub struct ScopedDependencyEvidence {
     store: Arc<AnalyzerStore>,
     set_id: i64,
+    cargo: Option<CargoOverlayInputs>,
+}
+struct CargoOverlayInputs {
+    snapshot: WorkspaceSnapshotId,
+    selected: Vec<(ProjectFile, ProjectSourceSnapshot, Option<bool>)>,
+    external_reads: Arc<[crate::analyzer::semantic_model::ExternalDiscoveryRead]>,
+    complete: bool,
+    _charge: brokk_bifrost_core::retention_budget::AllocationCharge,
 }
 impl ScopedDependencyEvidence {
+    #[doc(hidden)]
+    pub fn acquired_rust_configuration(
+        &self,
+    ) -> Result<Option<brokk_bifrost_rust::cargo_config::RustCargoConfiguration>> {
+        let Some(cargo) = &self.cargo else {
+            return Ok(None);
+        };
+        let conn = self.store.read_conn()?;
+        let Some(view) =
+            super::rust_acquired_cargo_config::load_for_set(&conn, self.set_id, &cargo.snapshot)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(
+            brokk_bifrost_rust::cargo_config::RustCargoConfiguration::from_acquired_view(
+                &view,
+                cargo.selected.iter().map(|(file, source, present)| {
+                    (
+                        file.rel_path(),
+                        source.oid(),
+                        *present,
+                        source.source().as_bytes(),
+                    )
+                }),
+            ),
+        ))
+    }
+    #[doc(hidden)]
+    pub fn cargo_acquisition_inputs_complete(&self) -> bool {
+        self.cargo.as_ref().is_none_or(|cargo| cargo.complete)
+    }
+    #[doc(hidden)]
+    pub fn cargo_external_reads(
+        &self,
+    ) -> &[crate::analyzer::semantic_model::ExternalDiscoveryRead] {
+        self.cargo
+            .as_ref()
+            .map_or(&[], |cargo| cargo.external_reads.as_ref())
+    }
     #[doc(hidden)]
     pub fn locations(
         &self,
@@ -450,6 +558,7 @@ impl Drop for ScopedDependencyEvidence {
         let id = self.set_id;
         if let Err(error) = self.store.conn.execute(move |conn| -> Result<()> {
             conn.execute("DELETE FROM dependency_evidence_sets WHERE set_id=?1", [id])?;
+            super::rust_acquired_cargo_config::reclaim_all(conn)?;
             Ok(())
         }) {
             eprintln!("reclaiming scoped dependency evidence {id} failed: {error}");
@@ -469,14 +578,27 @@ pub fn publish_overlay(
     project: &dyn Project,
     language: crate::analyzer::Language,
 ) -> Result<Option<Arc<ScopedDependencyEvidence>>> {
+    publish_overlay_with_rust_refresh(store, snapshots, project, language, false)
+}
+
+#[doc(hidden)]
+pub fn publish_overlay_with_rust_refresh(
+    store: &Arc<AnalyzerStore>,
+    snapshots: &WorkspaceSnapshots,
+    project: &dyn Project,
+    language: crate::analyzer::Language,
+    force_rust_refresh: bool,
+) -> Result<Option<Arc<ScopedDependencyEvidence>>> {
     brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
         let Some(overlay) = project.overlay_content() else {
             return Ok(None);
         };
         let entries = overlay.entries();
-        if !entries.iter().any(|(file, _)| {
-            super::WorkspaceConfigurationInput::is_native_input(language, file.rel_path())
-        }) {
+        if !(language == crate::analyzer::Language::Rust && force_rust_refresh)
+            && !entries.iter().any(|(file, _)| {
+                super::WorkspaceConfigurationInput::is_native_input(language, file.rel_path())
+            })
+        {
             return Ok(None);
         }
         let Some(&(key, _)) = PUBLISHING_LANGUAGES
@@ -489,7 +611,7 @@ pub fn publish_overlay(
             super::StoreError::new("dependency overlay has no selected input revision")
         })?;
         let limits = DependencyFileEvidenceLimits::default();
-        let (selected, presence, gaps) = {
+        let (mut selected, mut presence, gaps) = {
             let conn = store.read_conn_for_workspace(snapshots)?;
             selected_inputs(
                 &conn,
@@ -516,20 +638,154 @@ pub fn publish_overlay(
                 },
             )?
         };
+        let legacy_presence = presence.iter().any(Option::is_none);
+        let mut acquired = None;
+        let mut external_reads = Arc::default();
+        if language == crate::analyzer::Language::Rust {
+            let mut capture = selected
+                .iter()
+                .zip(&presence)
+                .map(|((file, source), present)| {
+                    let path = brokk_bifrost_core::path_utils::rel_path_string(file);
+                    if *present == Some(false) {
+                        super::WorkspaceConfigurationInput::absent(path)
+                    } else {
+                        super::WorkspaceConfigurationInput::new(
+                            path,
+                            source.source().as_bytes().into(),
+                        )
+                    }
+                })
+                .collect::<Vec<_>>();
+            super::store_language_support_for_hook(language, "acquire_configuration_inputs")
+                .expect("Rust configuration support")
+                .acquire_configuration_inputs(project, &mut capture)
+                .map_err(|_| {
+                    super::StoreError::new("cannot acquire overlay Cargo configuration")
+                })?;
+            acquired =
+                super::WorkspaceConfigurationInput::rust_cargo_acquisition(&capture).cloned();
+            external_reads =
+                super::WorkspaceConfigurationInput::rust_cargo_external_reads(&capture);
+            if legacy_presence && let Some(view) = &mut acquired {
+                view.complete = false;
+                view.reads.push(brokk_bifrost_rust::cargo_config::acquired::RustCargoConfigRead {
+                    label:"overlay/legacy-input-presence".into(),
+                    state:brokk_bifrost_rust::cargo_config::acquired::RustCargoConfigReadState::Unavailable {reason:brokk_bifrost_rust::cargo_config::acquired::RustCargoConfigReadFailure::Unclassifiable},
+                });
+            }
+            if acquired.is_some() {
+                let mut inputs = selected
+                    .into_iter()
+                    .zip(presence)
+                    .map(|((file, source), present)| {
+                        (file.rel_path().to_path_buf(), (file, source, present))
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>();
+                for input in capture {
+                    let path = PathBuf::from(input.relative_path());
+                    let existing = inputs.get(&path);
+                    if existing.is_some_and(|(_, source, present)| {
+                        source.oid() == input.content_oid() && *present == Some(input.file_present)
+                    }) {
+                        continue;
+                    }
+                    let source = std::str::from_utf8(input.source_bytes()).map_err(|_| {
+                        super::StoreError::new("invalid acquired local Cargo input")
+                    })?;
+                    inputs.insert(
+                        path.clone(),
+                        (
+                            ProjectFile::new(project.root(), path),
+                            ProjectSourceSnapshot::disk(source),
+                            Some(input.file_present),
+                        ),
+                    );
+                }
+                selected = Vec::new();
+                presence = Vec::new();
+                let mut bytes = 0usize;
+                let mut files = 0usize;
+                for (_, (file, source, present)) in inputs {
+                    let fits = source.source().len() <= limits.max_file_bytes
+                        && bytes.saturating_add(source.source().len()) <= limits.max_total_bytes
+                        && (present == Some(false) || files < limits.max_files);
+                    if !fits {
+                        if let Some(view) = &mut acquired {
+                            use brokk_bifrost_rust::cargo_config::acquired::{
+                                RustCargoConfigRead, RustCargoConfigReadFailure,
+                                RustCargoConfigReadState,
+                            };
+                            view.complete = false;
+                            let (name, reason) = if source.source().len() > limits.max_file_bytes {
+                                (
+                                    "DependencyFileEvidenceLimits.max_file_bytes",
+                                    RustCargoConfigReadFailure::FileBytesLimit,
+                                )
+                            } else if bytes.saturating_add(source.source().len())
+                                > limits.max_total_bytes
+                            {
+                                (
+                                    "DependencyFileEvidenceLimits.max_total_bytes",
+                                    RustCargoConfigReadFailure::TotalBytesLimit,
+                                )
+                            } else {
+                                (
+                                    "DependencyFileEvidenceLimits.max_files",
+                                    RustCargoConfigReadFailure::SourceFilesLimit,
+                                )
+                            };
+                            view.reads.push(RustCargoConfigRead {
+                                label: format!("overlay/{name}"),
+                                state: RustCargoConfigReadState::Unavailable { reason },
+                            });
+                        }
+                        continue;
+                    }
+                    bytes = bytes.saturating_add(source.source().len());
+                    files += usize::from(present != Some(false));
+                    selected.push((file, source));
+                    presence.push(present);
+                }
+            }
+        }
         let mut evidence = prepare_selected(
             &snapshot.lang,
             project.root(),
             &selected,
             &presence,
             &limits,
+            acquired.as_ref(),
         );
         evidence.gaps.extend(gaps);
         // A private set has one Arc lease. UUID ownership prevents a drop from
         // deleting an identical publication still owned by another analyzer.
         let digest = format!("overlay:{}", uuid::Uuid::new_v4());
         let snapshot = snapshot.clone();
+        let retained=acquired.as_ref().map(|view| {
+            let retained=selected.iter().zip(&presence).map(|((file,source),present)|(file.clone(),source.clone(),*present)).collect::<Vec<_>>();
+            let bytes=retained.iter().map(|(file,source,_)|std::mem::size_of_val(file)+std::mem::size_of_val(source)+file.rel_path().as_os_str().len()+source.source().len()).sum::<usize>()
+                + external_reads.iter().map(|read|std::mem::size_of_val(read)+match read {
+                    crate::analyzer::semantic_model::ExternalDiscoveryRead::File {absolute_path,..} | crate::analyzer::semantic_model::ExternalDiscoveryRead::AbsentFile {absolute_path} | crate::analyzer::semantic_model::ExternalDiscoveryRead::OverBudgetFile {absolute_path,..}=>absolute_path.capacity(),
+                    crate::analyzer::semantic_model::ExternalDiscoveryRead::Environment {name,value,working_directory}=>name.len()+value.as_ref().map_or(0,|value|value.as_encoded_bytes().len())+working_directory.as_ref().map_or(0,|path|path.capacity()),
+                    _=>0,
+                }).sum::<usize>();
+            CargoOverlayInputs {snapshot:snapshot.clone(),selected:retained,external_reads,complete:view.complete,
+                _charge:brokk_bifrost_core::retention_budget::AllocationCharge::acquire_required(store.retention_budget(),bytes)}
+        });
         let set_id = store.conn.execute(move |conn| -> Result<i64> {
             let tx = conn.transaction()?;
+            let digest = if let Some(view) = &acquired {
+                let acquired = super::rust_acquired_cargo_config::persist(&tx, &snapshot, view)?;
+                super::rust_acquired_cargo_config::bound_digest(
+                    &lower_hex_string(&brokk_bifrost_core::analyzer::canonical_hash::sha256_bytes(
+                        digest.as_bytes(),
+                    )),
+                    &acquired,
+                )
+            } else {
+                digest
+            };
             let id = insert_set(&tx, &snapshot, &digest, &evidence, &selected)?;
             tx.commit()?;
             Ok(id)
@@ -537,6 +793,7 @@ pub fn publish_overlay(
         Ok(Some(Arc::new(ScopedDependencyEvidence {
             store: Arc::clone(store),
             set_id,
+            cargo: retained,
         })))
     })
 }
@@ -718,6 +975,71 @@ mod tests {
             }
             DependencyFileEvidence::default()
         }
+    }
+
+    #[test]
+    fn pre_12398_producer_is_not_reused_for_unchanged_inputs() {
+        struct PublicationCounter(std::sync::atomic::AtomicUsize);
+        impl StoreLanguageSupport for PublicationCounter {
+            fn is_configuration_input_path(&self, path: &std::path::Path) -> bool {
+                path == std::path::Path::new("Cargo.toml")
+            }
+            fn selected_dependency_file_evidence(
+                &self,
+                _root: &std::path::Path,
+                selected: &[(ProjectFile, ProjectSourceSnapshot, Option<bool>)],
+                _limits: &DependencyFileEvidenceLimits,
+            ) -> DependencyFileEvidence {
+                assert_eq!(selected.len(), 1);
+                assert_eq!(selected[0].1.source(), OVERLAY);
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                DependencyFileEvidence::default()
+            }
+        }
+        static SUPPORT: PublicationCounter =
+            PublicationCounter(std::sync::atomic::AtomicUsize::new(0));
+        let _support =
+            super::super::language_support::neutral_fixture::dependency_overlay_fixture(&SUPPORT);
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let generation = store
+            .ensure_language_epoch_value("rust", "producer-retirement-test")
+            .unwrap();
+        let snapshot = store
+            .sync_workspace_inputs_for_workspace(
+                &WorkspaceId("b".repeat(64)),
+                "rust",
+                generation,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[WorkspaceConfigurationInput::new(
+                    "Cargo.toml".into(),
+                    OVERLAY.as_bytes().into(),
+                )],
+                &[],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(SUPPORT.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+        store.conn.execute(move |conn| -> Result<()> {
+            let tx=conn.transaction()?;
+            let old_id:i64=tx.query_row("SELECT set_id FROM dependency_evidence_selections WHERE workspace_id=?1 AND lang='rust' AND generation=?2 AND revision=?3", params![snapshot.workspace_id.as_str(),snapshot.generation.0,snapshot.revision], |row|row.get(0))?;
+            let mut old=CanonicalHasher::new(b"bifrost.static-dependency-evidence.v6");
+            old.field("path", b"Cargo.toml");
+            old.field("oid", git2::Oid::hash_object(git2::ObjectType::Blob, OVERLAY.as_bytes()).unwrap().to_string().as_bytes());
+            old.field("presence", &[1]);
+            tx.execute("UPDATE dependency_evidence_sets SET input_digest=?1 WHERE set_id=?2", params![lower_hex_string(&old.finish()),old_id])?;
+            // The source revision is identical. Only the current producer differs.
+            publish_with_acquired(&tx, &snapshot, &Default::default())?;
+            let fresh_id:i64=tx.query_row("SELECT set_id FROM dependency_evidence_selections WHERE workspace_id=?1 AND lang='rust' AND generation=?2 AND revision=?3", params![snapshot.workspace_id.as_str(),snapshot.generation.0,snapshot.revision], |row|row.get(0))?;
+            assert_ne!(old_id,fresh_id);
+            tx.commit()?;
+            Ok(())
+        }).unwrap();
+        assert_eq!(SUPPORT.0.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
     #[test]

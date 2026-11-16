@@ -61,7 +61,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken as McpCancellationToken;
@@ -712,7 +712,7 @@ struct ProgressReporter {
     steps: AtomicU64,
     request_id: Value,
     workspace_generation: u64,
-    last_build_revision: Mutex<Option<(u64, u64)>>,
+    last_build_revision: Mutex<Option<(u64, u64, Option<String>)>>,
     /// When the last build-counter notification went out. The build revision
     /// moves on every persisted batch, and the 100 ms poll would otherwise
     /// forward each move: a cold build of a large repository sent ~10
@@ -722,6 +722,7 @@ struct ProgressReporter {
     last_build_sent: Mutex<Option<Instant>>,
     minimum_build_generation: u64,
     task_id: Option<String>,
+    delivery: ProgressDelivery,
 }
 
 /// Minimum spacing between two build-counter progress notifications of one
@@ -731,6 +732,100 @@ const BUILD_PROGRESS_MIN_INTERVAL: Duration = Duration::from_secs(1);
 /// How long one partial result may wait for a slow client before it is
 /// dropped. It holds up only this request's own task, never the analyzer.
 const PARTIAL_RESULT_SEND_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How many progress notifications may be queued behind one slow transport
+/// write. Phase and workspace observations beyond this bound are dropped;
+/// partial results are never dropped.
+const MAX_PENDING_PROGRESS_DELIVERIES: usize = 256;
+
+/// Delivers progress notifications in the order the request produced them.
+///
+/// `rmcp`'s `Peer::send_notification` enqueues the notification on the peer
+/// channel before it waits for the transport, so dropping a timed-out send
+/// future does not withdraw the notification: the serve loop can still write
+/// it later. Each send is therefore chained behind the previous one and kept
+/// until it finishes, and [`Self::finish`] drains the chain before the request
+/// returns its response. A notification can then never be written after that
+/// response, while each individual send still gets only its own timeout on the
+/// request task, so a slow client cannot hold up analyzer work or cooperative
+/// cancellation.
+#[derive(Default)]
+struct ProgressDelivery {
+    pending: Arc<AtomicUsize>,
+    last: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Tripwire, not a concurrency barrier: every send currently comes from
+    /// the request task, which calls `finish` only after its last send. A
+    /// send after that would race the response, so `enqueue` rejects it.
+    finished: AtomicBool,
+}
+
+/// Decrements the pending-delivery count even if a delivery task panics.
+struct PendingProgressDelivery(Arc<AtomicUsize>);
+
+impl Drop for PendingProgressDelivery {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl ProgressDelivery {
+    async fn enqueue<F>(&self, timeout: Duration, droppable: bool, send: F)
+    where
+        F: std::future::Future<Output = Result<(), String>> + Send + 'static,
+    {
+        assert!(
+            !self.finished.load(Ordering::Acquire),
+            "no progress notification may be enqueued after finish"
+        );
+        if droppable && self.pending.load(Ordering::Relaxed) >= MAX_PENDING_PROGRESS_DELIVERIES {
+            return;
+        }
+        let previous = self
+            .last
+            .lock()
+            .expect("progress delivery lock poisoned")
+            .take();
+        self.pending.fetch_add(1, Ordering::Relaxed);
+        let pending = PendingProgressDelivery(Arc::clone(&self.pending));
+        let mut delivery = tokio::spawn(async move {
+            let _pending_delivery = pending;
+            if let Some(previous) = previous
+                && let Err(error) = previous.await
+            {
+                eprintln!("bifrost: MCP progress delivery task panicked: {error}");
+            }
+            if let Err(error) = send.await {
+                eprintln!("bifrost: failed to send MCP progress notification: {error}");
+            }
+        });
+        match tokio::time::timeout(timeout, &mut delivery).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                eprintln!("bifrost: MCP progress delivery task panicked: {error}")
+            }
+            Err(_slow_client) => {
+                *self.last.lock().expect("progress delivery lock poisoned") = Some(delivery);
+            }
+        }
+    }
+
+    /// Wait until every notification enqueued so far has reached the
+    /// transport. Called before the request returns its response.
+    async fn finish(&self) {
+        self.finished.store(true, Ordering::Release);
+        let handle = self
+            .last
+            .lock()
+            .expect("progress delivery lock poisoned")
+            .take();
+        let Some(handle) = handle else {
+            return;
+        };
+        if let Err(error) = handle.await {
+            eprintln!("bifrost: MCP progress delivery task panicked: {error}");
+        }
+    }
+}
 
 impl ProgressReporter {
     /// A reporter for this request, or `None` when the caller did not opt in.
@@ -764,6 +859,7 @@ impl ProgressReporter {
             last_build_revision: Mutex::new(None),
             last_build_sent: Mutex::new(None),
             task_id: None,
+            delivery: ProgressDelivery::default(),
         })
     }
 
@@ -788,23 +884,38 @@ impl ProgressReporter {
         params.meta = Some(rmcp::model::NotificationMetaObject::from(
             serde_json::Map::from_iter([(kind, value)]),
         ));
-        self.send_within(params, PARTIAL_RESULT_SEND_TIMEOUT).await;
+        self.send_within(params, PARTIAL_RESULT_SEND_TIMEOUT, false)
+            .await;
     }
 
     async fn send(&self, params: rmcp::model::ProgressNotificationParam) {
         // A slow/disconnected client loses observations, never analyzer capacity
-        // or prompt cancellation. There is at most one send per request.
-        self.send_within(params, Duration::from_millis(25)).await;
+        // or prompt cancellation. A notification that has already been enqueued
+        // is still flushed before the response by `finish`.
+        self.send_within(params, Duration::from_millis(25), true)
+            .await;
     }
 
-    async fn send_within(&self, params: rmcp::model::ProgressNotificationParam, timeout: Duration) {
-        match tokio::time::timeout(timeout, self.peer.notify_progress(params)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                eprintln!("bifrost: failed to send MCP progress notification: {error}")
-            }
-            Err(_slow_client) => {}
-        }
+    async fn send_within(
+        &self,
+        params: rmcp::model::ProgressNotificationParam,
+        timeout: Duration,
+        droppable: bool,
+    ) {
+        let peer = self.peer.clone();
+        self.delivery
+            .enqueue(timeout, droppable, async move {
+                peer.notify_progress(params)
+                    .await
+                    .map_err(|error| error.to_string())
+            })
+            .await;
+    }
+
+    /// Deliver every notification queued by this request before its response
+    /// is returned.
+    async fn finish(&self) {
+        self.delivery.finish().await;
     }
 
     /// A poll-driven counter update: forwarded only when the previous
@@ -821,13 +932,22 @@ impl ProgressReporter {
         if recently_sent {
             return;
         }
-        self.workspace(service, None).await;
+        self.workspace_with(service, None, true).await;
     }
 
     async fn workspace(
         &self,
         service: &SearchToolsService,
         request_status: Option<RequestOutcome>,
+    ) {
+        self.workspace_with(service, request_status, false).await;
+    }
+
+    async fn workspace_with(
+        &self,
+        service: &SearchToolsService,
+        request_status: Option<RequestOutcome>,
+        droppable: bool,
     ) {
         if service.workspace_generation() != self.workspace_generation {
             return;
@@ -838,13 +958,17 @@ impl ProgressReporter {
         if snapshot.generation < self.minimum_build_generation {
             return;
         }
-        let revision = (snapshot.generation, snapshot.revision);
+        let revision = (
+            snapshot.generation,
+            snapshot.revision,
+            snapshot.phase.clone(),
+        );
         {
             let mut last = self
                 .last_build_revision
                 .lock()
                 .expect("progress revision lock poisoned");
-            if *last == Some(revision) && request_status.is_none() {
+            if last.as_ref() == Some(&revision) && request_status.is_none() {
                 return;
             }
             *last = Some(revision);
@@ -854,9 +978,13 @@ impl ProgressReporter {
                 .expect("progress send-time lock poisoned") = Some(Instant::now());
         }
         let step = self.steps.fetch_add(1, Ordering::Relaxed) + 1;
+        let message = match &snapshot.phase {
+            Some(phase) => format!("workspace indexing: {phase}"),
+            None => "workspace indexing".to_owned(),
+        };
         let mut params =
             rmcp::model::ProgressNotificationParam::new(self.token.clone(), step as f64)
-                .with_message("workspace indexing");
+                .with_message(message);
         let mut measured = json!(snapshot);
         measured["request_id"] = self.request_id.clone();
         if let Some(task_id) = &self.task_id {
@@ -868,7 +996,8 @@ impl ProgressReporter {
         params.meta = Some(rmcp::model::NotificationMetaObject::from(
             serde_json::Map::from_iter([("io.bifrost/workspace-build".to_owned(), measured)]),
         ));
-        self.send(params).await;
+        self.send_within(params, Duration::from_millis(25), droppable)
+            .await;
     }
 }
 
@@ -1951,6 +2080,44 @@ async fn run_tool_as_task(
     if let Some(progress) = &mut progress {
         progress.task_id = Some(task_context.task_id().to_owned());
     }
+    let result = run_tool_as_task_inner(
+        service,
+        analyzer_pool,
+        in_flight,
+        render_options,
+        name,
+        arguments,
+        suppression_preflight,
+        workspace_scope,
+        ttl,
+        request_correlation_id,
+        task_context,
+        &progress,
+    )
+    .await;
+    // The terminal task result must not overtake a progress notification the
+    // task already queued for this transport.
+    if let Some(progress) = &progress {
+        progress.finish().await;
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_tool_as_task_inner(
+    service: Arc<SearchToolsService>,
+    analyzer_pool: Arc<AnalyzerExecutionPool>,
+    in_flight: Arc<InFlightRequests>,
+    render_options: RenderOptions,
+    name: String,
+    arguments: Value,
+    suppression_preflight: Option<PreparedRunPolicyPreflight>,
+    workspace_scope: WorkspaceRequestScope,
+    ttl: Duration,
+    request_correlation_id: Option<String>,
+    task_context: TaskContext,
+    progress: &Option<ProgressReporter>,
+) -> Result<CallToolResult, TaskExit> {
     let deadline = Instant::now() + ttl;
     let cancellation = crate::CancellationToken::default().with_deadline(deadline);
 
@@ -1996,7 +2163,7 @@ async fn run_tool_as_task(
             }
         }
     };
-    if let Some(progress) = &progress {
+    if let Some(progress) = progress {
         progress
             .workspace(
                 &service,
@@ -2485,6 +2652,28 @@ impl ServerHandler for BifrostMcpHandler {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         let name = request.name.to_string();
+        // A measurement control, deliberately absent from every descriptor and
+        // public tools/list. rmcp's default get_tool returns None, permitting
+        // dispatch without inventing a second protocol or advertising a schema.
+        #[cfg(feature = "test-support")]
+        if name == "__bifrost_retention_census" {
+            let arguments = request.arguments.map_or_else(|| json!({}), Value::Object);
+            let service = Arc::clone(&self.service);
+            let output = tokio::task::spawn_blocking(move || {
+                service.call_tool_output_with_cancellation(
+                    "__bifrost_retention_census",
+                    arguments,
+                    RenderOptions::default(),
+                    None,
+                )
+            })
+            .await
+            .map_err(|error| {
+                ErrorData::internal_error(format!("retention census panicked: {error}"), None)
+            })?
+            .map_err(|error| map_service_error(error.code, error.message))?;
+            return Ok(tool_success_result(output).into());
+        }
         if !self.tool_names.contains(&name) {
             return Ok(tool_error_result(format!("Unknown tool: {name}")).into());
         }
@@ -2654,9 +2843,18 @@ impl ServerHandler for BifrostMcpHandler {
             ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let readiness = loop {
                 tokio::select! {
-                    result = &mut readiness => break result.map_err(|error| {
-                        ErrorData::internal_error(format!("workspace readiness wait panicked: {error}"), None)
-                    })?,
+                    result = &mut readiness => match result {
+                        Ok(readiness) => break readiness,
+                        Err(error) => {
+                            if let Some(progress) = &progress {
+                                progress.finish().await;
+                            }
+                            return Err(ErrorData::internal_error(
+                                format!("workspace readiness wait panicked: {error}"),
+                                None,
+                            ));
+                        }
+                    },
                     _ = ticks.tick(), if progress.is_some() => {
                         progress.as_ref().unwrap().workspace_tick(&service).await;
                     }
@@ -2676,7 +2874,12 @@ impl ServerHandler for BifrostMcpHandler {
             if cold_workspace && readiness.is_err() {
                 profiling::duration("mcp_cold.first_tool_execution", std::time::Duration::ZERO);
             }
-            readiness.map_err(|error| map_service_error(error.code, error.message))?;
+            if let Err(error) = readiness {
+                if let Some(progress) = &progress {
+                    progress.finish().await;
+                }
+                return Err(map_service_error(error.code, error.message));
+            }
             workspace_readiness_wait = accepted_at.elapsed();
         }
 
@@ -2704,6 +2907,7 @@ impl ServerHandler for BifrostMcpHandler {
                                 Some(RequestOutcome::after_error(context.ct.is_cancelled())),
                             )
                             .await;
+                        progress.finish().await;
                     }
                     return Err(error);
                 }
@@ -2738,6 +2942,9 @@ impl ServerHandler for BifrostMcpHandler {
         // rebound in the meantime. Re-check before spending a slot on a scope
         // the client no longer authorizes.
         if workspace_scope.is_some_and(|scope| scope.generation != service.workspace_generation()) {
+            if let Some(progress) = &progress {
+                progress.finish().await;
+            }
             return Err(ErrorData::resource_not_found(
                 "workspace changed before the tool call could start; retry the request",
                 None,
@@ -2775,6 +2982,9 @@ impl ServerHandler for BifrostMcpHandler {
         // `response_queue_wait` and `writer_delivery` when it delivers it.
         self.response_timings
             .arm(context.id.clone(), name, correlation_id);
+        if let Some(progress) = &progress {
+            progress.finish().await;
+        }
         Ok(response?.into())
     }
 
@@ -3367,5 +3577,46 @@ mod in_flight_scope_tests {
         });
         assert!(!first.is_cancelled());
         assert!(second.is_cancelled());
+    }
+}
+
+#[cfg(test)]
+mod progress_delivery_tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[tokio::test]
+    #[hardwon("#12761: a timed-out progress send was delivered after the request response")]
+    async fn finish_waits_for_timed_out_sends_and_preserves_order() {
+        let delivery = ProgressDelivery::default();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let order = Arc::new(Mutex::new(Vec::new()));
+
+        let first_release = Arc::clone(&release);
+        let first_order = Arc::clone(&order);
+        delivery
+            .enqueue(Duration::from_millis(5), false, async move {
+                first_release.notified().await;
+                first_order.lock().unwrap().push(1);
+                Ok::<(), String>(())
+            })
+            .await;
+        assert!(order.lock().unwrap().is_empty());
+
+        let second_order = Arc::clone(&order);
+        delivery
+            .enqueue(Duration::from_millis(5), false, async move {
+                second_order.lock().unwrap().push(2);
+                Ok::<(), String>(())
+            })
+            .await;
+        assert!(
+            order.lock().unwrap().is_empty(),
+            "a later send must not overtake an earlier timed-out send"
+        );
+
+        release.notify_one();
+        delivery.finish().await;
+        assert_eq!(*order.lock().unwrap(), vec![1, 2]);
     }
 }

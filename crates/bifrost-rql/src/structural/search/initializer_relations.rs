@@ -51,10 +51,15 @@ pub(super) fn initializer_relation_expansions(
                 )
             });
             workspace.analyzer().mark_execution_dependent();
+            flow_state_cache.reuse.join_in(EXECUTION_DEPENDENT);
         }
         diagnostics.push(super::QueryExecutionState::diagnostic(
             workspace.analyzer(),
             CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                 incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                 related: Vec::new(),
                 source: None,
@@ -199,6 +204,8 @@ fn exact_row(
         proof: "exact",
         coverage: EffectCoverage::Exhaustive,
         reason: None,
+        reason_codes: Vec::new(),
+        open_reasons: Vec::new(),
         replacement_events: Vec::new(),
         read_event: None,
     };
@@ -280,6 +287,8 @@ fn relation_row(
             proof,
             coverage,
             reason,
+            reason_codes: Vec::new(),
+            open_reasons: Vec::new(),
             replacement_events: Vec::new(),
             read_event: None,
         },

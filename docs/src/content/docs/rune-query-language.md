@@ -306,6 +306,44 @@ A policy approximating
 unbounded call reachability can declare that `reached` or `unknown` makes its
 run inconclusive.
 
+`call-reachability` returns the callable owning a selected source when a certified
+static call path reaches a selected sink call:
+
+```scheme
+(call-reachability
+  :sources (language rust (function :name "startup"))
+  :sinks (language rust (call :callee (name "send"))))
+```
+
+Both arguments are ordinary RQL plans. Sources may produce declarations or
+structural occurrences with a unique callable owner, including attributes.
+Sinks may produce structural call occurrences, call-site rows, or dispatch-target
+rows. Sink plans retain ordinary workspace semantics, including intermediate
+call seeds outside the reached graph. Only their final endpoints are correlated
+with certified reached calls. Dispatch-target sinks retain the selected target identity.
+The result domain is Declaration, grouped by root before finding identity
+allocation. The engine contains no attribute or library name rules.
+
+An optional `:depth N` accepts a positive integer and uses the existing call-depth
+frontier probe. Omission adds no depth cap. A reached or unknown frontier makes
+this operator incomplete, even if the bounded portion has no selected sink.
+Existing work, source, retention and cancellation limits also remain in effect.
+
+Only exact declaration bindings, certified nonvirtual receiver calls and exact
+external procedure identities can certify path edges. An unresolved branch or
+unavailable body makes coverage incomplete while preserving independently proved
+paths. An external sink can be selected without its body. Invocation-only macro
+evidence cannot certify generated calls without expansion provenance.
+Cycles terminate through a visited set. Witnesses choose the shortest path, then
+stable declaration identities and call-site positions. Policy findings use the
+root as primary and retain correlated source, propagation at the root, intermediate
+call and final violation steps, with Source and CallTarget related locations.
+
+Policy packs using this form must declare `rql-call-reachability` in
+`required_capabilities`. Engines without that capability refuse the pack explicitly.
+The canonical JSON plan source is `call_reachability`, whose object contains
+`sources`, `sinks`, and optional `depth`.
+
 A Rust `call` pattern can constrain the canonical static type qualifying an
 associated call, including a source alias and its substituted defaults:
 

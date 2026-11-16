@@ -1,16 +1,22 @@
-use crate::analyzer::is_language_configuration_input;
+use crate::analyzer::{is_language_configuration_input, language_signature_input_root};
 use crate::hash::HashSet;
 use crate::path_normalization::NormalizePath;
 use crate::{BIFROST_IGNORE_FILE_NAME, Project, ProjectFile};
 use brokk_bifrost_core::analyzer::project::AnalyzerOwnedPaths;
 use notify::event::{CreateKind, ModifyKind, RemoveKind};
 use notify::{
-    Config, Event, EventKind, PathOp, PollWatcher, RecommendedWatcher, Watcher, recommended_watcher,
+    Config, Event, EventKind, EventKindMask, PathOp, PollWatcher, RecommendedWatcher, Watcher,
 };
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+/// Own reads can flood inotify's queue; a Rescan remains correct if events are lost.
+/// The Access discard in `handle_event` is defense only.
+fn watcher_config() -> Config {
+    Config::default().with_event_kinds(EventKindMask::CORE | EventKindMask::ACCESS_CLOSE)
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ChangeDelta {
@@ -22,10 +28,13 @@ pub struct ChangeDelta {
 struct PendingChanges {
     files: HashSet<ProjectFile>,
     requires_full_refresh: bool,
+    rearm_exclude_watch: bool,
 }
 
 pub struct ProjectChangeWatcher {
     _watcher: WatcherBackend,
+    exclude_directory: Option<PathBuf>,
+    recursive_exclude_ancestor: Option<PathBuf>,
     pending: Arc<Mutex<PendingChanges>>,
 }
 
@@ -45,7 +54,7 @@ impl ProjectChangeWatcher {
     ) -> Result<Self, String> {
         let handler_project = Arc::clone(&project);
         Self::start_with_backend(project, claimed_files, move |pending| {
-            recommended_watcher(event_handler(&handler_project, pending))
+            RecommendedWatcher::new(event_handler(&handler_project, pending), watcher_config())
                 .map(|watcher| WatcherBackend::Recommended { _watcher: watcher })
                 .map_err(|err| format!("Failed to create project watcher: {err}"))
         })
@@ -63,7 +72,7 @@ impl ProjectChangeWatcher {
     ) -> Result<Self, String> {
         let handler_project = Arc::clone(&project);
         Self::start_with_backend(project, claimed_files, move |pending| {
-            let config = Config::default()
+            let config = watcher_config()
                 .with_poll_interval(Duration::from_millis(20))
                 .with_compare_contents(true);
             PollWatcher::new(event_handler(&handler_project, pending), config)
@@ -79,23 +88,86 @@ impl ProjectChangeWatcher {
     ) -> Result<Self, String> {
         let pending = Arc::new(Mutex::new(PendingChanges::default()));
         let mut watcher = create_backend(&pending)?;
-        match &mut watcher {
+        let recursive_roots = match &mut watcher {
             WatcherBackend::Recommended { _watcher } => {
                 _watcher
-                    .configure(Config::default())
+                    .configure(watcher_config())
                     .map_err(|err| format!("Failed to configure project watcher: {err}"))?;
-                watch_project_paths(_watcher, project.as_ref(), claimed_files)?;
+                watch_project_paths(_watcher, project.as_ref(), claimed_files)?
             }
             WatcherBackend::Poll { _watcher } => {
-                watch_project_paths(_watcher, project.as_ref(), claimed_files)?;
+                watch_project_paths(_watcher, project.as_ref(), claimed_files)?
             }
-        }
+        };
+        let exclude_directory = git_info_directory(project.as_ref());
+        // Minimal recursive roots are disjoint, so at most one can contain
+        // info. Keep only that path, rather than duplicating all source roots.
+        let recursive_exclude_ancestor = recursive_roots.into_iter().find(|root| {
+            exclude_directory
+                .as_ref()
+                .is_some_and(|info| info.starts_with(root))
+        });
         Ok(Self {
             _watcher: watcher,
+            exclude_directory,
+            recursive_exclude_ancestor,
             pending,
         })
     }
 
+    /// Owner-side maintenance only: notify registration may wait on its
+    /// callback thread. Never call this while holding pending's mutex.
+    pub(crate) fn rearm_exclude_watch(&mut self) -> Result<(), String> {
+        // Consume only the current request. Events during registration must
+        // remain pending; a registration failure restores the consumed request.
+        let rearm = mem::take(
+            &mut self
+                .pending
+                .lock()
+                .expect("project watcher pending state poisoned")
+                .rearm_exclude_watch,
+        );
+        if !rearm {
+            return Ok(());
+        }
+        let registration = self
+            .exclude_directory
+            .as_deref()
+            .map(existing_exclude_watch_directory)
+            .transpose();
+        let result = registration.and_then(|path| {
+            let Some(path) = path else {
+                return Ok(());
+            };
+            let mode = if self.recursive_exclude_ancestor.as_ref() == Some(&path) {
+                notify::RecursiveMode::Recursive
+            } else {
+                notify::RecursiveMode::NonRecursive
+            };
+            // notify 9.0.0-rc.5 replaces matching explicit watches idempotently
+            // (inotify::add_watch; PollWatcher::watch replaces its map entry).
+            match &mut self._watcher {
+                WatcherBackend::Recommended { _watcher } => _watcher.watch(&path, mode),
+                WatcherBackend::Poll { _watcher } => _watcher.watch(&path, mode),
+            }
+            .map_err(|error| {
+                format!(
+                    "Failed to re-arm Git exclude watch at {}: {error}",
+                    path.display()
+                )
+            })
+        });
+        if result.is_err() {
+            self.pending
+                .lock()
+                .expect("project watcher pending state poisoned")
+                .rearm_exclude_watch = true;
+        }
+        result
+    }
+
+    /// Drain after owner-side `rearm_exclude_watch` maintenance. Read-only
+    /// accumulator users do not register watches from this method.
     pub fn take_changed_files(&self) -> ChangeDelta {
         let mut pending = self
             .pending
@@ -125,7 +197,7 @@ impl ProjectChangeWatcher {
             .pending
             .lock()
             .expect("project watcher pending state poisoned");
-        pending.requires_full_refresh || !pending.files.is_empty()
+        pending.rearm_exclude_watch || pending.requires_full_refresh || !pending.files.is_empty()
     }
 }
 
@@ -136,13 +208,15 @@ fn event_handler(
     let pending_for_callback = Arc::clone(pending);
     let project_for_callback = Arc::clone(project);
     let owned_paths = watcher_owned_paths(project.as_ref());
+    let exclude_directory = git_info_directory(project.as_ref());
     move |result: notify::Result<Event>| {
         brokk_bifrost_analysis::analyzer::without_project_reads(|| match result {
-            Ok(event) => handle_event(
+            Ok(event) => handle_event_with_exclude_directory(
                 &project_for_callback,
                 &owned_paths,
                 &pending_for_callback,
                 event,
+                exclude_directory.as_deref(),
             ),
             Err(_) => {
                 project_for_callback.invalidate_cached_file_listing();
@@ -177,11 +251,28 @@ fn watcher_owned_paths(project: &dyn Project) -> AnalyzerOwnedPaths {
     owned
 }
 
+#[cfg(test)]
 fn handle_event(
     project: &Arc<dyn Project>,
     owned_paths: &AnalyzerOwnedPaths,
     pending: &Arc<Mutex<PendingChanges>>,
     event: Event,
+) {
+    handle_event_with_exclude_directory(
+        project,
+        owned_paths,
+        pending,
+        event,
+        git_info_directory(project.as_ref()).as_deref(),
+    );
+}
+
+fn handle_event_with_exclude_directory(
+    project: &Arc<dyn Project>,
+    owned_paths: &AnalyzerOwnedPaths,
+    pending: &Arc<Mutex<PendingChanges>>,
+    event: Event,
+    exclude_directory: Option<&Path>,
 ) {
     if matches!(event.kind, EventKind::Access(_)) {
         return;
@@ -206,6 +297,29 @@ fn handle_event(
     let mut git_ref_state_changed = false;
     let mut paths = Vec::with_capacity(event.paths.len());
     for path in &event.paths {
+        let lifecycle = matches!(
+            event.kind,
+            EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
+        );
+        if let Some(info) = exclude_directory.filter(|info| {
+            path.to_path_buf().normalize() == info.join("exclude").normalize()
+                || (lifecycle && info.starts_with(path.to_path_buf().normalize()))
+        }) {
+            project.invalidate_cached_file_listing();
+            let exclude = info.join("exclude");
+            let mut pending = pending
+                .lock()
+                .expect("project watcher pending state poisoned");
+            pending.rearm_exclude_watch |= lifecycle;
+            if let Ok(relative) = exclude.strip_prefix(project.root()) {
+                pending
+                    .files
+                    .insert(ProjectFile::new(project.root(), relative));
+            } else {
+                pending.requires_full_refresh = true;
+            }
+            continue;
+        }
         match git_internal_disposition(project.as_ref(), path) {
             Some(GitInternalPath::RefState) => git_ref_state_changed = true,
             Some(GitInternalPath::Churn) => {}
@@ -343,6 +457,21 @@ const GIT_REF_STATE_FILE_NAMES: [&str; 4] = ["HEAD", "packed-refs", "MERGE_HEAD"
 const GIT_REFS_DIR_NAME: &str = "refs";
 const GIT_DIR_NAME: &str = ".git";
 
+fn git_info_directory(project: &dyn Project) -> Option<PathBuf> {
+    brokk_bifrost_core::gitblob::discover(project.root())
+        .map(|repo| repo.commondir().join("info").normalize())
+}
+
+fn existing_exclude_watch_directory(info: &Path) -> Result<PathBuf, String> {
+    let mut directory = info.to_path_buf();
+    while !directory.is_dir() {
+        if !directory.pop() {
+            return Err("Git info directory has no existing parent".into());
+        }
+    }
+    Ok(directory)
+}
+
 /// Classify a path that lives inside a `.git` directory of the watched tree,
 /// or `None` when the path is not `.git`-internal. The `.git` boundary matches
 /// the workspace walk, which refuses to descend *any* directory named `.git`
@@ -395,8 +524,10 @@ fn classify_project_path(
     }
 
     let file = ProjectFile::new(project.root().to_path_buf(), rel_path.to_path_buf());
-    if project.is_bifrostignored(rel_path) {
-        return PathDisposition::IgnoredInternal;
+    match project.is_bifrostignored(rel_path) {
+        Ok(true) => return PathDisposition::IgnoredInternal,
+        Ok(false) => {}
+        Err(_) => return PathDisposition::RefreshFallback,
     }
     if file.exists() && project.is_gitignored(rel_path) {
         return PathDisposition::RefreshFallback;
@@ -425,7 +556,7 @@ fn watch_project_paths(
     watcher: &mut impl Watcher,
     project: &dyn Project,
     claimed_files: &[ProjectFile],
-) -> Result<(), String> {
+) -> Result<Vec<PathBuf>, String> {
     let recursive_roots = watch_roots(project, claimed_files)?;
     let mut operations = Vec::new();
 
@@ -457,6 +588,11 @@ fn watch_project_paths(
             configuration_directories.insert(directory);
         }
     }
+    if let Some(info) = git_info_directory(project) {
+        // Setup never creates watched directories; owner-side re-arming uses
+        // this same resolution after directory creation or replacement.
+        configuration_directories.insert(existing_exclude_watch_directory(&info)?);
+    }
     for directory in configuration_directories {
         if !recursive_roots
             .iter()
@@ -466,8 +602,8 @@ fn watch_project_paths(
         }
     }
 
-    for path in recursive_roots {
-        operations.push(PathOp::watch_recursive(path));
+    for path in &recursive_roots {
+        operations.push(PathOp::watch_recursive(path.clone()));
     }
 
     // FSEvents represents all paths in one stream. Adding them one at a time
@@ -477,7 +613,7 @@ fn watch_project_paths(
     watcher
         .update_paths(operations)
         .map_err(|err| format!("Failed to watch project paths: {err:?}"))?;
-    Ok(())
+    Ok(recursive_roots)
 }
 
 fn watch_roots(
@@ -505,6 +641,22 @@ fn watch_roots(
             .map(Path::to_path_buf)
             .unwrap_or_else(|| project.root().to_path_buf());
         directories.push(dir);
+    }
+    // Signature files (Ruby `sig/**/*.rbs`, #12967) type sources but are not
+    // sources; their root directory is watched recursively, so a file added
+    // anywhere below it is seen. A root that holds no signature file at
+    // startup is not watched until the next rebuild.
+    let languages = project.analyzer_languages();
+    for file in project
+        .all_files()
+        .map_err(|err| format!("Failed to list workspace files for watcher setup: {err}"))?
+    {
+        directories.extend(
+            languages
+                .iter()
+                .filter_map(|language| language_signature_input_root(*language, &file))
+                .map(|root| project.root().join(root)),
+        );
     }
 
     let project_configuration = project.root().join(crate::gitblob::PROJECT_DIR_NAME);
@@ -549,6 +701,112 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tempfile::TempDir;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[hardwon("#12889: our own reads overflowed the inotify queue and forced a full rescan")]
+    fn watcher_registers_mutation_bits_without_read_access_bits() {
+        let temp = TempDir::new().unwrap();
+        for n in 0..3 {
+            let dir = temp.path().join(format!("d{n}"));
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(format!("f{n}.rs")), b"fn item() {}\n").unwrap();
+        }
+        let project = Arc::new(FilesystemProject::new(temp.path().canonicalize().unwrap()).unwrap())
+            as Arc<dyn Project>;
+        let watcher = ProjectChangeWatcher::start(Arc::clone(&project)).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let root_ino = fs::metadata(temp.path()).unwrap().ino();
+        let subdir_ino = fs::metadata(temp.path().join("d0")).unwrap().ino();
+        let candidates = inotify_fd_masks();
+        let matching = candidates
+            .into_iter()
+            .filter(|(_, watches)| {
+                watches.iter().any(|(_, ino, _)| *ino == root_ino)
+                    && watches.iter().any(|(_, ino, _)| *ino == subdir_ino)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matching.len(),
+            1,
+            "expected one inotify fd watching root inode {root_ino} and subdirectory inode {subdir_ino}; matching={matching:#x?}"
+        );
+        let (fd, masks) = matching.into_iter().next().unwrap();
+        assert!(!masks.is_empty(), "no inotify watch masks found on fd {fd}");
+        for (wd, _, mask) in &masks {
+            assert_eq!(mask & 0x20, 0, "IN_OPEN set for wd {wd}; masks={masks:#x?}");
+            assert_eq!(
+                mask & 0x10,
+                0,
+                "IN_CLOSE_NOWRITE set for wd {wd}; masks={masks:#x?}"
+            );
+            for (bit, name) in [
+                (0x8, "IN_CLOSE_WRITE"),
+                (0x2, "IN_MODIFY"),
+                (0x4, "IN_ATTRIB"),
+                (0x100, "IN_CREATE"),
+                (0x200, "IN_DELETE"),
+                (0x40, "IN_MOVED_FROM"),
+                (0x80, "IN_MOVED_TO"),
+                (0x800, "IN_MOVE_SELF"),
+            ] {
+                assert_ne!(
+                    mask & bit,
+                    0,
+                    "{name} missing for wd {wd}; masks={masks:#x?}"
+                );
+            }
+        }
+        let changed = temp.path().join("d0/f0.rs");
+        fs::write(&changed, b"changed").unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(watcher.has_pending(), "write event was not delivered");
+        assert!(!watcher.take_changed_files().requires_full_refresh);
+    }
+
+    #[cfg(target_os = "linux")]
+    type InotifyWatchMask = (i32, u64, u32);
+
+    #[cfg(target_os = "linux")]
+    type InotifyFdMasks = (i32, Vec<InotifyWatchMask>);
+
+    #[cfg(target_os = "linux")]
+    fn inotify_fd_masks() -> Vec<InotifyFdMasks> {
+        fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let fd = entry.file_name().to_string_lossy().parse::<i32>().ok()?;
+                if fs::read_link(entry.path()).ok()?.to_string_lossy() != "anon_inode:inotify" {
+                    return None;
+                }
+                let fdinfo = fs::read_to_string(format!("/proc/self/fdinfo/{fd}")).ok()?;
+                let watches = fdinfo
+                    .lines()
+                    .filter_map(|line| {
+                        let mut fields = line.split_whitespace();
+                        if fields.next() != Some("inotify") {
+                            return None;
+                        }
+                        let mut wd = None;
+                        let mut ino = None;
+                        let mut mask = None;
+                        for field in fields {
+                            if let Some(value) = field.strip_prefix("wd:") {
+                                wd = i32::from_str_radix(value, 16).ok();
+                            } else if let Some(value) = field.strip_prefix("ino:") {
+                                ino = u64::from_str_radix(value, 16).ok();
+                            } else if let Some(value) = field.strip_prefix("mask:") {
+                                mask = u32::from_str_radix(value, 16).ok();
+                            }
+                        }
+                        Some((wd?, ino?, mask?))
+                    })
+                    .collect::<Vec<_>>();
+                Some((fd, watches))
+            })
+            .collect()
+    }
 
     pub(super) fn project_with_files(paths: &[&str]) -> (TempDir, Arc<dyn Project>) {
         let temp = TempDir::new().unwrap();
@@ -757,6 +1015,153 @@ mod tests {
         assert!(!state.requires_full_refresh);
     }
 
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#12752: info exclude writes were discarded as Git churn before update delivery"
+    )]
+    fn ignore_membership_info_exclude_reaches_update() {
+        use crate::WorkspaceFileListingCache;
+        use notify::event::DataChange;
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap().normalize();
+        let repo = git2::Repository::init(&root).unwrap();
+        fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+        let cache = Arc::new(WorkspaceFileListingCache::new(root.clone()));
+        let project: Arc<dyn crate::Project> = Arc::new(
+            FilesystemProject::with_cached_listing(root.clone(), Arc::clone(&cache)).unwrap(),
+        );
+        cache.files().unwrap();
+        let walks = cache.walk_count();
+        let exclude = repo.commondir().join("info/exclude");
+        fs::write(&exclude, "main.rs\n").unwrap();
+        let pending = Arc::new(Mutex::new(PendingChanges::default()));
+        handle_event(
+            &project,
+            &AnalyzerOwnedPaths::new(project.root()),
+            &pending,
+            Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
+                .add_path(exclude.clone()),
+        );
+        let state = pending.lock().unwrap();
+        assert!(
+            state.files.contains(&ProjectFile::new(
+                &root,
+                exclude.strip_prefix(&root).unwrap()
+            )),
+            "exclude event must survive the empty-change return"
+        );
+        assert!(!state.requires_full_refresh);
+        // This is the maintenance entry used by the next explicit update.
+        project.revalidate_symlink_omissions(&state.files.iter().cloned().collect());
+        assert!(
+            !project
+                .all_files()
+                .unwrap()
+                .contains(&ProjectFile::new(&root, "main.rs"))
+        );
+        assert_eq!(cache.walk_count(), walks + 1);
+    }
+
+    fn exclude_watch_fixture() -> (TempDir, git2::Repository) {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("repo");
+        let repo = git2::Repository::init(&root).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
+        (temp, repo)
+    }
+
+    fn assert_real_exclude_watch(selected: &std::path::Path, exclude: &std::path::Path) {
+        let project: Arc<dyn Project> = Arc::new(FilesystemProject::new(selected).unwrap());
+        let watcher = ProjectChangeWatcher::start(project).unwrap();
+        fs::write(exclude, "*.rs\n").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let pending = watcher.pending.lock().unwrap();
+            let received = match exclude.strip_prefix(selected) {
+                Ok(relative) => pending
+                    .files
+                    .contains(&ProjectFile::new(selected, relative)),
+                Err(_) => pending.requires_full_refresh,
+            };
+            if received {
+                break;
+            }
+            drop(pending);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "exclude event never arrived"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    #[hardwon("#12752: the watcher never subscribed to the git exclude directory")]
+    fn ignore_membership_real_subdirectory_exclude_watch() {
+        let (_temp, repo) = exclude_watch_fixture();
+        assert_real_exclude_watch(
+            repo.workdir().unwrap(),
+            &repo.commondir().join("info/exclude"),
+        );
+    }
+
+    #[test]
+    #[hardwon("#12752: the watcher never subscribed to the git exclude directory")]
+    fn ignore_membership_real_worktree_exclude_watch() {
+        let (temp, repo) = exclude_watch_fixture();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("src/main.rs")).unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let sig = git2::Signature::now("test", "test@example.com").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "initial", &tree, &[])
+            .unwrap();
+        let selected = temp.path().join("linked");
+        repo.worktree("linked", &selected, None).unwrap();
+        assert_real_exclude_watch(&selected, &repo.commondir().join("info/exclude"));
+    }
+
+    #[test]
+    #[hardwon("#12752: a git info directory created after watcher start was never watched")]
+    fn ignore_membership_real_info_directory_recreation() {
+        fn drain(watcher: &mut ProjectChangeWatcher, expected: &ProjectFile) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                if watcher.pending.lock().unwrap().files.contains(expected) {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "exclude change was not delivered"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            watcher.rearm_exclude_watch().unwrap();
+            let delta = watcher.take_changed_files();
+            assert!(delta.files.contains(expected), "{delta:?}");
+        }
+        let (_temp, repo) = exclude_watch_fixture();
+        let root = repo.workdir().unwrap();
+        let info = repo.commondir().join("info");
+        fs::remove_dir_all(&info).unwrap();
+        let project: Arc<dyn Project> = Arc::new(FilesystemProject::new(root).unwrap());
+        let mut watcher = ProjectChangeWatcher::start(project).unwrap();
+        let expected = ProjectFile::new(root, ".git/info/exclude");
+        for cycle in 0..2 {
+            fs::create_dir(&info).unwrap();
+            fs::write(info.join("exclude"), "# created\n").unwrap();
+            drain(&mut watcher, &expected);
+            // This write needs the info watch installed by the preceding drain.
+            fs::write(info.join("exclude"), "*.rs\n").unwrap();
+            drain(&mut watcher, &expected);
+            if cycle == 0 {
+                fs::remove_dir_all(&info).unwrap();
+                drain(&mut watcher, &expected);
+            }
+        }
+    }
+
     /// Gate 13 defect 3: a content write to a listed file changes the file,
     /// not the listing, so the watcher keeps the listing (no worktree walk)
     /// and still hands the file to the next snapshot. A write to a
@@ -774,6 +1179,40 @@ mod tests {
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
         fs::write(root.join(".gitignore"), "target/\n").unwrap();
+        let repository = git2::Repository::init(&root).unwrap();
+        // A warm-save control needs an established receipt, rather than the
+        // racy timestamps of freshly created fixture rules and directories.
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        for path in [
+            root.join(".gitignore"),
+            repository.path().join("config"),
+            repository.commondir().join("info/exclude"),
+        ] {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        for path in [
+            root.clone(),
+            root.join("src"),
+            repository.path().to_path_buf(),
+            repository.commondir().join("info"),
+        ] {
+            let mut options = fs::OpenOptions::new();
+            options.read(true);
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                // FILE_WRITE_ATTRIBUTES and FILE_FLAG_BACKUP_SEMANTICS.
+                options.access_mode(0x100).custom_flags(0x02000000);
+            }
+            options.open(path).unwrap().set_modified(old).unwrap();
+        }
+        drop(repository);
+        std::thread::sleep(std::time::Duration::from_millis(2100));
         let cache = Arc::new(WorkspaceFileListingCache::new(root.clone()));
         let project: Arc<dyn crate::Project> = Arc::new(
             FilesystemProject::with_cached_listing(root.clone(), Arc::clone(&cache)).unwrap(),
@@ -795,6 +1234,7 @@ mod tests {
                 Event::new(kind).add_path(main.abs_path()),
             );
         }
+        project.revalidate_symlink_omissions(&std::collections::BTreeSet::from([main.clone()]));
         cache.files().unwrap();
         assert_eq!(
             cache.walk_count(),
@@ -1538,6 +1978,8 @@ mod pending_changes_properties {
             .expect("an unwatched poll watcher must start");
         ProjectChangeWatcher {
             _watcher: WatcherBackend::Poll { _watcher: watcher },
+            exclude_directory: None,
+            recursive_exclude_ancestor: None,
             pending: Arc::new(Mutex::new(PendingChanges::default())),
         }
     }

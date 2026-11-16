@@ -111,8 +111,6 @@ use crate::analyzer::semantic::SemanticCallSite;
 
 use crate::analyzer::semantic::SemanticEffect;
 
-use crate::analyzer::semantic::SemanticGapId;
-
 use crate::analyzer::semantic::SemanticOutcome;
 
 use crate::analyzer::semantic::SemanticRequest;
@@ -143,7 +141,7 @@ use std::sync::Arc;
 /// continuation only over the call's continuation edges, whose proof and
 /// completeness come from the call's dispatch; a composition derives the
 /// same quality from these sets.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PartialFlow {
     pub from: PortId,
     pub to: PortId,
@@ -219,7 +217,7 @@ pub enum PartialFlowOutcome {
 
 /// Partial flows of one procedure. `ports` is indexed by [`PortId`] and holds
 /// every port that is an input seed, a call port, or an observed output.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ProcedurePartialFlows {
     pub outcome: PartialFlowOutcome,
     /// The head's text: the error message of an [`PartialFlowOutcome::Error`]
@@ -235,10 +233,90 @@ pub struct ProcedurePartialFlows {
     /// relation as an incomplete snapshot before it looks at any gap, so
     /// composition checks this fact first. `false` when projection failed.
     relations_complete: bool,
-    pub discharged_gaps: Vec<SemanticGapId>,
+    pub discharged_gaps: Vec<crate::analyzer::semantic::GapKey>,
 }
 
 impl ProcedurePartialFlows {
+    /// Census of decoded rows, nested path members and owned text.
+    pub fn semantic_work(&self) -> crate::analyzer::semantic::SemanticWork {
+        use crate::analyzer::semantic::partial_flow::ports::HeapSelector;
+        let mut work = crate::analyzer::semantic::SemanticWork {
+            nested_entries: self
+                .ports
+                .len()
+                .saturating_add(self.flows.len())
+                .saturating_add(self.discharged_gaps.len()),
+            owned_text_bytes: self.detail.as_ref().map_or(0, String::len),
+            ..Default::default()
+        };
+        for port in &self.ports {
+            let mut current = port;
+            while let PartialFlowPort::Heap {
+                root, selectors, ..
+            } = current
+            {
+                work.nested_entries = work
+                    .nested_entries
+                    .saturating_add(1)
+                    .saturating_add(selectors.len());
+                for selector in selectors {
+                    if let HeapSelector::Property(name) | HeapSelector::ConstantIndex(name) =
+                        selector
+                    {
+                        work.owned_text_bytes = work.owned_text_bytes.saturating_add(name.len());
+                    }
+                }
+                current = root;
+            }
+        }
+        for flow in &self.flows {
+            work.nested_entries = work.nested_entries.saturating_add(flow.crossed.len());
+            for calls in &flow.crossed {
+                work.nested_entries = work.nested_entries.saturating_add(calls.len());
+            }
+        }
+        work
+    }
+
+    /// Owned payload bytes, excluding any separately charged artifact owner.
+    pub fn retained_bytes(&self) -> usize {
+        let mut bytes = std::mem::size_of::<ProcedurePartialFlows>()
+            + self.detail.as_ref().map_or(0, String::capacity)
+            + self.ports.capacity() * std::mem::size_of::<PartialFlowPort>()
+            + self.flows.capacity()
+                * std::mem::size_of::<crate::analyzer::semantic::partial_flow::PartialFlow>()
+            + self.discharged_gaps.capacity()
+                * std::mem::size_of::<crate::analyzer::semantic::GapKey>();
+        for port in &self.ports {
+            let mut current = port;
+            while let PartialFlowPort::Heap {
+                root, selectors, ..
+            } = current
+            {
+                bytes += std::mem::size_of::<PartialFlowPort>()
+                    + std::mem::size_of_val(selectors.as_ref());
+                for selector in selectors.iter() {
+                    use crate::analyzer::semantic::partial_flow::ports::HeapSelector;
+                    if let HeapSelector::Property(name) | HeapSelector::ConstantIndex(name) =
+                        selector
+                    {
+                        bytes += name.len();
+                    }
+                }
+                current = root;
+            }
+        }
+        for flow in &self.flows {
+            bytes += std::mem::size_of_val(flow.crossed.as_ref());
+            bytes += flow
+                .crossed
+                .iter()
+                .map(|calls| std::mem::size_of_val(calls.as_ref()))
+                .sum::<usize>();
+        }
+        bytes
+    }
+
     /// A head with the given facts. `open` and `relations_complete` are
     /// private so that a reader asks [`Self::may_omit_flows`] instead of
     /// pairing the two by hand (#10466).
@@ -249,7 +327,7 @@ impl ProcedurePartialFlows {
         flows: Vec<PartialFlow>,
         open: bool,
         relations_complete: bool,
-        discharged_gaps: Vec<SemanticGapId>,
+        discharged_gaps: Vec<crate::analyzer::semantic::GapKey>,
     ) -> Self {
         Self {
             outcome,
@@ -918,6 +996,8 @@ struct Fixpoint<'a, 'r, F> {
     traversal: SemanticExecutionBudget,
     filter: &'a mut F,
     semantics: &'a ProcedureSemantics,
+    interference_ownership:
+        crate::analyzer::semantic::workspace_oracle::MemoryInterferenceOwnership<'a>,
     /// The crossed calls of a seed: one path class that crossed nothing.
     start: Crossed,
     carriers: Carriers,
@@ -1321,6 +1401,16 @@ impl<F: ObservationFilter> Fixpoint<'_, '_, F> {
         let mut cursor = 0;
         for (event_index, event) in semantics.points()[index].events.iter().enumerate() {
             let event_index = u32::try_from(event_index).expect("an event index fits u32");
+            if event.effect == SemanticEffect::MemoryInterference {
+                for (&(carrier, _), fact) in live.iter_mut() {
+                    if let ValueFlowEndpoint::Location(location) =
+                        &self.carriers.endpoints[carrier as usize]
+                        && self.interference_ownership.may_modify(location)
+                    {
+                        fact.uncertain = true;
+                    }
+                }
+            }
             let call = match &event.effect {
                 SemanticEffect::Invoke { call_site } => Some(*call_site),
                 _ => None,
@@ -1690,15 +1780,39 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
     // A use-site field spelling is a canonical member only when its field
     // identity gap has been discharged. Otherwise even different anchors
     // cannot certify that two member paths are disjoint.
-    let caller_field_identity_open = semantics.gaps().iter().any(|gap| {
-        gap.capability == crate::analyzer::semantic::SemanticCapability::FieldMemory
-            && !snapshot.gap_is_discharged(gap.id)
+    let caller_field_identity_open = semantics.logical_gaps().any(|gap| {
+        gap.base.capability == crate::analyzer::semantic::SemanticCapability::FieldMemory
+            && !snapshot.gap_is_discharged(gap.key())
     });
     let point_count = semantics.points().len();
     let traversal = SemanticExecutionBudget::for_fixpoint(MAX_PARTIAL_FLOW_FACT_VISITS);
     // Refuse before the uninterruptible CFG ordering and relation indexing.
-    let preflight = point_count.saturating_add(semantics.control_edges().len());
-    if request.cancellation.is_cancelled()
+    let ownership_work = if semantics.points().iter().any(|point| {
+        point
+            .events
+            .iter()
+            .any(|event| event.effect == SemanticEffect::MemoryInterference)
+    }) {
+        crate::analyzer::semantic::SemanticWork {
+            values: semantics.values().len(),
+            events: semantics
+                .points()
+                .iter()
+                .map(|point| point.events.len())
+                .sum(),
+            nested_entries: semantics.values().len().saturating_mul(10),
+            ..Default::default()
+        }
+    } else {
+        Default::default()
+    };
+    let ownership_admitted = request.budget.admit(ownership_work).is_ok();
+    let preflight = point_count
+        .saturating_add(semantics.control_edges().len())
+        .saturating_add(ownership_work.values)
+        .saturating_add(ownership_work.events);
+    if !ownership_admitted
+        || request.cancellation.is_cancelled()
         || !request.charge_execution_traversal(preflight)
         || !traversal.charge_traversal(preflight)
     {
@@ -1978,7 +2092,7 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
                                     CallableTarget::Local(id),
                                 ),
                                 PartialFlowPort::CallArgument { ordinal, .. },
-                            ) => procedure.artifact().procedure_handle(*id).map(|callee| {
+                            ) => procedure.local_procedure_handle(*id).map(|callee| {
                                 (callee, PartialFlowPort::Parameter { ordinal: *ordinal })
                             }),
                             (
@@ -1987,8 +2101,7 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
                                 ),
                                 PartialFlowPort::CallReceiver { .. },
                             ) => procedure
-                                .artifact()
-                                .procedure_handle(*id)
+                                .local_procedure_handle(*id)
                                 .map(|callee| (callee, PartialFlowPort::Receiver)),
                             _ => None,
                         };
@@ -2216,13 +2329,14 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
     // A member of a call result becomes live at that call's normal
     // continuation. It is never an entry seed or an exit output.
     let mut unbound_result_member = false;
-    let call_results = CallResultIndex::new(semantics);
+    let call_results = CallResultIndex::new(semantics, snapshot);
     for relation in snapshot.relations() {
         let ValueFlowEndpoint::Location(_) = &relation.source else {
             continue;
         };
         let port = call_result_member_port(
             procedure,
+            snapshot,
             &call_results,
             relation.point.id(),
             relation.event_index,
@@ -2433,6 +2547,8 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
     // dominated classes can make a later widened union smaller than the old
     // historical union; this is the intentional rows-versioned improvement.
     let mut fixpoint = Fixpoint {
+        interference_ownership:
+            crate::analyzer::semantic::workspace_oracle::MemoryInterferenceOwnership::new(procedure),
         request,
         traversal,
         filter,
@@ -2595,10 +2711,19 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
         if !gap_impacts_value_flow(gap) {
             continue;
         }
-        if snapshot.gap_is_discharged(gap.id) {
-            discharged_gaps.push(gap.id);
-        } else {
-            open = true;
+        let stored_key = crate::analyzer::semantic::GapKey::Gap(gap.id);
+        if snapshot.gap_is_discharged(stored_key) {
+            discharged_gaps.push(stored_key);
+            continue;
+        }
+        for logical in semantics.logical_gaps_of(gap) {
+            if snapshot.gap_is_discharged(logical.key()) {
+                // Preserve query-time owner keys; the encoder rejects them.
+                // Never silently convert an owner proof to a stored base ID.
+                discharged_gaps.push(logical.key());
+            } else {
+                open = true;
+            }
         }
     }
 
@@ -2734,7 +2859,20 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
                     // are not known to survive this binding.
                     ValueFlowKind::OwnershipUnknown => {}
                     ValueFlowKind::IntegerOffset { .. } => {}
-                    _ => value_sources.entry(target).or_default().push(source),
+                    ValueFlowKind::Local
+                    | ValueFlowKind::AddressOf
+                    | ValueFlowKind::Transfer(_)
+                    | ValueFlowKind::BackingStore { .. }
+                    | ValueFlowKind::BackingStoreAlternative { .. }
+                    | ValueFlowKind::Parameter
+                    | ValueFlowKind::Receiver
+                    | ValueFlowKind::ReferenceBoxing
+                    | ValueFlowKind::ReferenceUnboxing
+                    | ValueFlowKind::MemoryLoad { .. }
+                    | ValueFlowKind::LanguageDefined
+                    | ValueFlowKind::ByValueCapture => {
+                        value_sources.entry(target).or_default().push(source)
+                    }
                 },
                 _ => {}
             }
@@ -2774,6 +2912,8 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
                 SemanticEffect::ValueFlow {
                     kind:
                         ValueFlowKind::Local
+                        | ValueFlowKind::AddressOf
+                        | ValueFlowKind::MemoryLoad { .. }
                         | ValueFlowKind::LanguageDefined
                         | ValueFlowKind::ByValueCapture,
                     source,
@@ -2933,7 +3073,12 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
     }
     let published = published_ports.iter().collect::<HashSet<_>>();
     let boundary_ports_complete = boundary_census_complete
-        && !(return_alternatives >= 2 && has_returned_member_relation)
+        && (!(return_alternatives >= 2 && has_returned_member_relation)
+            || selected_return_boundaries_are_certified(
+                semantics.points(),
+                snapshot.payload_projection(),
+                &published,
+            ))
         && snapshot.relations().iter().all(|relation| {
             let ValueFlowEndpoint::Location(location) = &relation.target else {
                 return true;
@@ -2987,6 +3132,79 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
     })
 }
 
+/// A positive member relation from one arm cannot certify another (#9010).
+/// Selected replacements certify all relations of their exact producing event,
+/// including a proven empty result. Require one for every return alternative;
+/// a selected constructor elsewhere in the procedure proves nothing here.
+fn selected_return_boundaries_are_certified(
+    points: &[crate::analyzer::semantic::ProgramPoint],
+    projection: &crate::analyzer::semantic::SelectedPayloadProjection,
+    published: &HashSet<&PartialFlowPort>,
+) -> bool {
+    if !projection.limitations.is_empty() {
+        return false;
+    }
+    let event_is_certified = |point, index, expected: PartialFlowPort| {
+        let Some(replacement) = projection.replacement_at(point, index) else {
+            return false;
+        };
+        replacement.relations.iter().all(|relation| {
+            if relation.kind != ValueFlowRelationKind::NormalReturn {
+                return false;
+            }
+            let Some(port) = port_of_endpoint(&relation.target) else {
+                return false;
+            };
+            let root = match &port {
+                PartialFlowPort::Heap { root, .. } => root.as_ref(),
+                port => port,
+            };
+            root == &expected && published.contains(&port)
+        })
+    };
+    points.iter().all(|point| {
+        point.events.iter().enumerate().all(|(index, event)| {
+            match event.effect {
+                SemanticEffect::ProcedureReturn {
+                    value: Some(returned),
+                } => {
+                    // The completion and its value-producing event describe
+                    // one return, not two arms. Do not borrow a later writer.
+                    let mut found = false;
+                    let certified =
+                        point.events[..index]
+                            .iter()
+                            .enumerate()
+                            .all(|(index, event)| {
+                                if !matches!(event.effect,
+                            SemanticEffect::ValueFlow { kind: ValueFlowKind::Return, target, .. }
+                            if target == returned)
+                                {
+                                    return true;
+                                }
+                                found = true;
+                                event_is_certified(
+                                    point.id,
+                                    u32::try_from(index).expect("event count fits u32"),
+                                    PartialFlowPort::NormalReturn,
+                                )
+                            });
+                    found && certified
+                }
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::IndexedReturn { ordinal },
+                    ..
+                } => event_is_certified(
+                    point.id,
+                    u32::try_from(index).expect("event count fits u32"),
+                    PartialFlowPort::IndexedNormalReturn { ordinal },
+                ),
+                _ => true,
+            }
+        })
+    })
+}
+
 /// The extra seed at which a run takes one input port of `procedure`: an
 /// input port is live at its procedure's entry (receiver, parameter, capture
 /// slot, or a heap location rooted at one of them) or at the continuation of
@@ -2995,6 +3213,7 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
 /// reads or writes: that location carries no value the run can follow.
 fn call_result_member_port(
     procedure: &ProcedureHandle,
+    snapshot: &ValueFlowSnapshot,
     call_results: &CallResultIndex,
     point: ProgramPointId,
     event_index: u32,
@@ -3014,9 +3233,35 @@ fn call_result_member_port(
         .events
         .get(usize::try_from(event_index).ok()?)?;
     let SemanticEffect::MemoryLoad { location, .. } = event.effect else {
-        // A projected call-result location without a read event does not
-        // prove that the caller still observes those contents after writes.
-        return None;
+        // Selected payload reads are attested by the same owner that excluded
+        // this event's whole-value relation. Preserve reaching-definition
+        // checks; a projected residual write is not a whole-object alias.
+        let selected = snapshot
+            .payload_projection()
+            .replacement_at(point, event_index)?;
+        if !selected.relations.iter().any(|row| &row.source == source) {
+            return None;
+        }
+        let ValueFlowEndpoint::Location(location) = source else {
+            unreachable!();
+        };
+        let AccessPathRoot::Value(value) = location.path().root() else {
+            return direct;
+        };
+        let (root, mut prefix) = reaching_call_result(
+            procedure,
+            snapshot,
+            call_results,
+            point,
+            event_index,
+            value.id(),
+        )?;
+        prefix.extend(heap_selectors(location.path().selectors()));
+        return Some(PartialFlowPort::Heap {
+            root: Box::new(root),
+            selectors: prefix.into_boxed_slice(),
+            tail: location.path().tail(),
+        });
     };
     let row = semantics.memory_location(location)?;
     let (base, selector) = match &row.kind {
@@ -3041,7 +3286,8 @@ fn call_result_member_port(
         ),
         _ => return None,
     };
-    let root = reaching_call_result(procedure, call_results, point, event_index, base)?;
+    let (root, mut prefix) =
+        reaching_call_result(procedure, snapshot, call_results, point, event_index, base)?;
     if let Some(port) = direct {
         let PartialFlowPort::Heap {
             root: direct_root, ..
@@ -3049,11 +3295,12 @@ fn call_result_member_port(
         else {
             unreachable!("a direct call-result member is a heap port")
         };
-        return (**direct_root == root).then_some(port);
+        return (prefix.is_empty() && **direct_root == root).then_some(port);
     }
+    prefix.push(selector);
     Some(PartialFlowPort::Heap {
         root: Box::new(root),
-        selectors: vec![selector].into_boxed_slice(),
+        selectors: prefix.into_boxed_slice(),
         tail: AccessPathTail::Exact,
     })
 }
@@ -3064,16 +3311,17 @@ fn call_result_member_port(
 /// continuation; a merge, unknown producer or unsupported transfer declines.
 fn reaching_call_result(
     procedure: &ProcedureHandle,
+    snapshot: &ValueFlowSnapshot,
     call_results: &CallResultIndex,
     point: ProgramPointId,
     event_index: u32,
     base: ValueId,
-) -> Option<PartialFlowPort> {
+) -> Option<(PartialFlowPort, Vec<HeapSelector>)> {
     let semantics = procedure.semantics();
-    let mut pending = vec![(point, event_index as usize, base)];
+    let mut pending = vec![(point, event_index as usize, base, Vec::new())];
     let mut seen = HashSet::new();
     let mut result = None;
-    while let Some((point, before, value)) = pending.pop() {
+    while let Some((point, before, value, mut prefix)) = pending.pop() {
         if !seen.insert((point, before, value)) {
             // A cyclic path without a new definition has no unique origin.
             return None;
@@ -3081,6 +3329,39 @@ fn reaching_call_result(
         let events = &semantics.point(point)?.events;
         let mut source = None;
         for (index, event) in events[..before].iter().enumerate().rev() {
+            if call_results.projected.contains(&(point, index))
+                && matches!(event.effect, SemanticEffect::Assignment { target, .. }
+                    | SemanticEffect::ValueFlow { target, .. } if target == value)
+            {
+                // A selected load extracts an aggregate without losing its
+                // member prefix. Residual writes and ambiguous replacements
+                // are not aliases of a whole call result.
+                let selected = snapshot
+                    .payload_projection()
+                    .replacement_at(point, index as u32)?;
+                let [row] = selected.relations.as_ref() else {
+                    return None;
+                };
+                let (ValueFlowEndpoint::Location(location), ValueFlowEndpoint::Value(target)) =
+                    (&row.source, &row.target)
+                else {
+                    return None;
+                };
+                if row.kind != ValueFlowRelationKind::MemoryLoad
+                    || target.id() != value
+                    || !location.path().is_exact()
+                {
+                    return None;
+                }
+                let AccessPathRoot::Value(root) = location.path().root() else {
+                    return None;
+                };
+                let mut selected_prefix = heap_selectors(location.path().selectors()).into_vec();
+                selected_prefix.append(&mut prefix);
+                prefix = selected_prefix;
+                source = Some((index, root.id()));
+                break;
+            }
             match event.effect {
                 SemanticEffect::Assignment {
                     target,
@@ -3096,7 +3377,10 @@ fn reaching_call_result(
                 } if target == value => {
                     if !matches!(
                         kind,
-                        ValueFlowKind::Local | ValueFlowKind::Parameter | ValueFlowKind::Receiver
+                        ValueFlowKind::Local
+                            | ValueFlowKind::AddressOf
+                            | ValueFlowKind::Parameter
+                            | ValueFlowKind::Receiver
                     ) && !matches!(kind, ValueFlowKind::Transfer(transfer) if transfer.preserves_member_contents())
                     {
                         return None;
@@ -3108,7 +3392,7 @@ fn reaching_call_result(
             }
         }
         if let Some((index, input)) = source {
-            pending.push((point, index, input));
+            pending.push((point, index, input, prefix));
             continue;
         }
         if let Some((_, port)) = call_results
@@ -3118,10 +3402,11 @@ fn reaching_call_result(
             .flatten()
             .find(|(result, _)| *result == value)
         {
-            if result.as_ref().is_some_and(|old| old != port) {
+            let origin = (port.clone(), prefix);
+            if result.as_ref().is_some_and(|old| old != &origin) {
                 return None;
             }
-            result = Some(port.clone());
+            result = Some(origin);
             continue;
         }
         let before_count = pending.len();
@@ -3134,6 +3419,7 @@ fn reaching_call_result(
                     .events
                     .len(),
                 value,
+                prefix.clone(),
             )
         }));
         if pending.len() == before_count {
@@ -3194,10 +3480,17 @@ struct CallResultIndex {
     results: HashSet<ValueId>,
     /// The assignment and value-flow sources of each value.
     sources: HashMap<ValueId, Vec<ValueId>>,
+    projected: HashSet<(ProgramPointId, usize)>,
 }
 
 impl CallResultIndex {
-    fn new(semantics: &ProcedureSemantics) -> Self {
+    fn new(semantics: &ProcedureSemantics, snapshot: &ValueFlowSnapshot) -> Self {
+        let projected = snapshot
+            .payload_projection()
+            .replacements
+            .iter()
+            .map(|row| (row.point, row.event as usize))
+            .collect::<HashSet<_>>();
         let mut live_at = HashMap::<_, Vec<_>>::new();
         let mut results = HashSet::new();
         for call in semantics.call_sites() {
@@ -3212,7 +3505,16 @@ impl CallResultIndex {
             }
         }
         let mut sources = HashMap::<_, Vec<_>>::new();
-        for event in semantics.points().iter().flat_map(|point| &point.events) {
+        for (point, index, event) in semantics.points().iter().flat_map(|point| {
+            point
+                .events
+                .iter()
+                .enumerate()
+                .map(move |(index, event)| (point.id, index, event))
+        }) {
+            if projected.contains(&(point, index)) {
+                continue;
+            }
             match event.effect {
                 SemanticEffect::Assignment {
                     target,
@@ -3228,6 +3530,7 @@ impl CallResultIndex {
             live_at,
             results,
             sources,
+            projected,
         }
     }
 }
@@ -3302,10 +3605,11 @@ pub fn input_port_seed(
         PartialFlowPort::Heap { root, .. }
             if matches!(root.as_ref(), PartialFlowPort::CallResult { .. }) =>
         {
-            let call_results = CallResultIndex::new(semantics);
+            let call_results = CallResultIndex::new(semantics, snapshot);
             let carrier = snapshot.relations().iter().find_map(|relation| {
                 (call_result_member_port(
                     procedure,
+                    snapshot,
                     &call_results,
                     relation.point.id(),
                     relation.event_index,
@@ -3482,17 +3786,16 @@ pub fn caller_returned_member_locator(
     caller_member_locator(locator, caller)
 }
 
-/// Substitute an exact callee read into a caller origin. Inexact selectors
-/// retain the ordinary carrier matching rather than acquiring prefix taint.
-pub fn caller_exact_read_location(
+/// Substitute a callee read into a caller origin without strengthening its
+/// selector evidence. A foreign or unknown index denotes a summarized cell.
+#[doc(hidden)]
+pub fn caller_read_location(
     procedure: &ProcedureHandle,
     origin: &AbstractLocation,
     selectors: &[HeapSelector],
     tail: AccessPathTail,
-) -> Option<AbstractLocation> {
-    if !origin.path().is_exact() || tail != AccessPathTail::Exact {
-        return None;
-    }
+) -> AbstractLocation {
+    let mut summarized = !origin.path().is_exact() || tail == AccessPathTail::Summary;
     let mut path = origin.path().selectors().to_vec();
     for selector in selectors {
         path.push(match selector {
@@ -3507,21 +3810,50 @@ pub fn caller_exact_read_location(
             HeapSelector::ConstantIndex(index) => AccessSelector::Index(IndexSelector::Constant(
                 index.parse().expect("a constant heap index is an integer"),
             )),
-            HeapSelector::ExactIndex(_) | HeapSelector::AnyIndex => return None,
+            HeapSelector::ExactIndex(_) | HeapSelector::AnyIndex => {
+                summarized = true;
+                AccessSelector::Index(IndexSelector::Any)
+            }
         });
     }
     // Both input paths are already bounded. Retain their full substitution:
-    // applying the default limit again could silently drop an exact read.
+    // applying the default limit again could silently drop a read.
     let mut limits = OracleLimits::default().values();
     limits.access_path_length = path.len().max(1);
     let limits = OracleLimits::new(limits).expect("the substituted path bound is positive");
-    let path = AccessPath::exact(origin.path().root().clone(), path, limits)
+    let tail = if summarized {
+        AccessPathTail::Summary
+    } else {
+        AccessPathTail::Exact
+    };
+    let path = AccessPath::bounded(origin.path().root().clone(), path, tail, limits)
         .expect("a caller read extends a validated path");
-    debug_assert!(path.is_exact());
-    Some(
-        AbstractLocation::new(origin.object().clone(), path)
-            .expect("a substituted read preserves its origin object"),
-    )
+    AbstractLocation::new(origin.object().clone(), path)
+        .expect("a substituted read preserves its origin object")
+}
+
+/// Substitute an exact callee read into a caller origin. Inexact selectors
+/// retain the ordinary carrier matching rather than acquiring prefix taint.
+pub fn caller_exact_read_location(
+    procedure: &ProcedureHandle,
+    origin: &AbstractLocation,
+    selectors: &[HeapSelector],
+    tail: AccessPathTail,
+) -> Option<AbstractLocation> {
+    if !origin.path().is_exact()
+        || tail != AccessPathTail::Exact
+        || selectors.iter().any(|selector| {
+            matches!(
+                selector,
+                HeapSelector::ExactIndex(_) | HeapSelector::AnyIndex
+            )
+        })
+    {
+        return None;
+    }
+    let location = caller_read_location(procedure, origin, selectors, tail);
+    debug_assert!(location.path().is_exact());
+    Some(location)
 }
 
 /// The partial flows of every procedure of one validated artifact, projected
@@ -3547,69 +3879,12 @@ pub fn parse_time_partial_flows_with_limits(
     cancellation: &CancellationToken,
     limits: OracleLimits,
 ) -> Option<Vec<ProcedurePartialFlows>> {
-    let host = FileLocalProjectionHost {
-        syntax: Some(syntax),
-    };
-    let context = OracleCallContext::empty();
-    let mut flows = Vec::with_capacity(artifact.procedures().len());
-    for procedure in artifact.procedures() {
-        let handle = artifact
+    let handles = artifact.procedures().iter().map(|procedure| {
+        artifact
             .procedure_handle(procedure.id())
-            .expect("a procedure of the artifact has a handle");
-        let mut budget = SemanticBudget::default();
-        let projected = project_procedure_relations(
-            &host,
-            &handle,
-            &context,
-            limits,
-            &mut SemanticRequest::new(&mut budget, cancellation),
-        );
-        let execution = SemanticExecutionBudget::for_fixpoint(MAX_PARTIAL_FLOW_FACT_VISITS);
-        let mut request =
-            SemanticRequest::with_execution_budget(&mut budget, cancellation, &execution);
-        flows.push(match projected {
-            Ok(SemanticOutcome::Complete { value, .. }) => {
-                compute_partial_flows(&handle, &value, &mut request)
-            }
-            Ok(SemanticOutcome::Cancelled { .. }) => return None,
-            Ok(SemanticOutcome::ExceededBudget { .. }) => {
-                ProcedurePartialFlows::without_flows(PartialFlowOutcome::ExceededBudget)
-            }
-            // An unresolved dispatch gap makes the projection incomplete while
-            // its snapshot is still the answer for every relation it names. The
-            // procedure is open, and its flows are the ones the snapshot proves.
-            Ok(outcome) => match outcome.available_value() {
-                Some(snapshot) => {
-                    let mut result = compute_partial_flows(&handle, snapshot, &mut request);
-                    match result.outcome {
-                        // A budget stop records no flows and no label.
-                        PartialFlowOutcome::ExceededBudget => {}
-                        // The snapshot's candidate set was cut by a constant
-                        // limit, so the relations are not all present. The head
-                        // stays Truncated, which readers re-project. A Truncated
-                        // head carries no text (the stored-head decoder rejects
-                        // it); the outcome names the cause.
-                        PartialFlowOutcome::Truncated => result.open = true,
-                        PartialFlowOutcome::Complete => {
-                            result.open = true;
-                            result.detail = Some(outcome.label().to_owned());
-                        }
-                        PartialFlowOutcome::Error => {
-                            unreachable!("a solved snapshot never yields an error head")
-                        }
-                    }
-                    result
-                }
-                None => ProcedurePartialFlows::failed(outcome.label().to_owned()),
-            },
-            Err(error) => ProcedurePartialFlows::failed(error.to_string()),
-        });
-    }
-    // compute_partial_flows reports a cancellation as an ExceededBudget head,
-    // which is a different cause. A cancelled preparation holds no heads.
-    if cancellation.is_cancelled() {
-        return None;
-    }
+            .expect("validated procedure")
+    });
+    let flows = solve_parse_time_handles(handles, syntax, cancellation, limits)?;
     brokk_bifrost_core::profiling::note_with(|| {
         let exceeded = artifact
             .procedures()
@@ -3628,4 +3903,253 @@ pub fn parse_time_partial_flows_with_limits(
         format!("partial_flows.heads exceeded_budget={exceeded:?} truncated={truncated:?}")
     });
     Some(flows)
+}
+
+/// Isolated, unadmitted alternate results. The procedure handle and flows must
+/// travel together; ordinary artifact handles continue to expose the base IR.
+#[doc(hidden)]
+pub struct CandidateMacroPartialFlows {
+    pub procedure: crate::analyzer::semantic::ir::ProcedureHandle,
+    pub partial: ProcedurePartialFlows,
+}
+
+impl CandidateMacroPartialFlows {
+    /// Final IR-and-flow identity, including the status of the flow solve.
+    pub fn materialization_id(&self) -> crate::analyzer::semantic::ids::StableDigest {
+        Self::materialization_id_for(
+            self.procedure.semantics().parts_materialization_id(),
+            self.procedure.id(),
+            &self.partial,
+        )
+    }
+
+    /// Compute the same paired identity for row-decoded alternate parts.
+    #[doc(hidden)]
+    pub fn materialization_id_for(
+        parts: crate::analyzer::semantic::ids::StableDigest,
+        procedure: crate::analyzer::semantic::ProcedureId,
+        partial: &ProcedurePartialFlows,
+    ) -> crate::analyzer::semantic::ids::StableDigest {
+        use std::hash::Hash;
+        let mut digest = crate::analyzer::semantic::ids::SemanticDigestHasher::new(
+            b"candidate-macro-ir-and-flows-v1",
+        );
+        parts.hash(&mut digest);
+        procedure.hash(&mut digest);
+        partial.hash(&mut digest);
+        digest.finish_digest()
+    }
+
+    pub fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() - std::mem::size_of::<ProcedurePartialFlows>()
+            + self.partial.retained_bytes()
+    }
+}
+
+#[doc(hidden)]
+pub fn candidate_macro_partial_flows_with_limits(
+    artifact: &Arc<SemanticArtifact>,
+    syntax: &PreparedSyntaxTree,
+    cancellation: &CancellationToken,
+    limits: OracleLimits,
+) -> Option<Vec<CandidateMacroPartialFlows>> {
+    let handles = artifact
+        .procedures()
+        .iter()
+        .filter(|procedure| procedure.candidate_macro_alternate().is_some())
+        .map(|procedure| {
+            artifact
+                .candidate_alternate_handle(procedure.id())
+                .expect("validated alternate")
+        })
+        .collect::<Vec<_>>();
+    let flows = solve_parse_time_handles(handles.iter().cloned(), syntax, cancellation, limits)?;
+    Some(
+        handles
+            .into_iter()
+            .zip(flows)
+            .map(|(procedure, partial)| CandidateMacroPartialFlows { procedure, partial })
+            .collect(),
+    )
+}
+
+fn solve_parse_time_handles(
+    handles: impl Iterator<Item = crate::analyzer::semantic::ir::ProcedureHandle>,
+    syntax: &PreparedSyntaxTree,
+    cancellation: &CancellationToken,
+    limits: OracleLimits,
+) -> Option<Vec<ProcedurePartialFlows>> {
+    let host = FileLocalProjectionHost {
+        syntax: Some(syntax),
+    };
+    let context = OracleCallContext::empty();
+    let mut flows = Vec::new();
+    for handle in handles {
+        let mut budget = SemanticBudget::default();
+        let projected = project_procedure_relations(
+            &host,
+            &handle,
+            &context,
+            limits,
+            &mut SemanticRequest::new(&mut budget, cancellation),
+        );
+        let execution = SemanticExecutionBudget::for_fixpoint(MAX_PARTIAL_FLOW_FACT_VISITS);
+        let mut request =
+            SemanticRequest::with_execution_budget(&mut budget, cancellation, &execution);
+        flows.push(partial_flows_from_projection(
+            &handle,
+            projected,
+            &mut request,
+        )?);
+    }
+    // compute_partial_flows reports a cancellation as an ExceededBudget head,
+    // which is a different cause. A cancelled preparation holds no heads.
+    if cancellation.is_cancelled() {
+        return None;
+    }
+    Some(flows)
+}
+
+/// Common status-preserving flow solve for both stored publication and query fallback.
+pub fn partial_flows_from_projection(
+    handle: &crate::analyzer::semantic::ProcedureHandle,
+    projected: Result<
+        SemanticOutcome<crate::analyzer::semantic::ValueFlowSnapshot>,
+        crate::analyzer::semantic::SemanticProviderError,
+    >,
+    request: &mut SemanticRequest<'_>,
+) -> Option<ProcedurePartialFlows> {
+    Some(match projected {
+        Ok(SemanticOutcome::Complete { value, .. }) => {
+            compute_partial_flows(handle, &value, request)
+        }
+        Ok(SemanticOutcome::Cancelled { .. }) => return None,
+        Ok(SemanticOutcome::ExceededBudget { .. }) => {
+            ProcedurePartialFlows::without_flows(PartialFlowOutcome::ExceededBudget)
+        }
+        // An unresolved dispatch gap makes the projection incomplete while
+        // its snapshot is still the answer for every relation it names. The
+        // procedure is open, and its flows are the ones the snapshot proves.
+        Ok(outcome) => match outcome.available_value() {
+            Some(snapshot) => {
+                let mut result = compute_partial_flows(handle, snapshot, request);
+                match result.outcome {
+                    // A budget stop records no flows and no label.
+                    PartialFlowOutcome::ExceededBudget => {}
+                    // The snapshot's candidate set was cut by a constant
+                    // limit, so the relations are not all present. The head
+                    // stays Truncated, which readers re-project. A Truncated
+                    // head carries no text (the stored-head decoder rejects
+                    // it); the outcome names the cause.
+                    PartialFlowOutcome::Truncated => result.open = true,
+                    PartialFlowOutcome::Complete => {
+                        result.open = true;
+                        result.detail = Some(outcome.label().to_owned());
+                    }
+                    PartialFlowOutcome::Error => {
+                        unreachable!("a solved snapshot never yields an error head")
+                    }
+                }
+                result
+            }
+            None => ProcedurePartialFlows::failed(outcome.label().to_owned()),
+        },
+        Err(error) => ProcedurePartialFlows::failed(error.to_string()),
+    })
+}
+
+#[cfg(test)]
+mod return_boundary_tests {
+    use super::*;
+    use crate::analyzer::semantic::{
+        BlockId, EvidenceId, ProgramPoint, SelectedPayloadEvent, SelectedPayloadProjection,
+        SemanticEvent, SourceMappingId, StableDigest,
+    };
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#12250: one selected return arm must not certify another arm without a replacement")]
+    fn partial_flow_selected_return_certificates_cover_every_arm() {
+        let source = SourceMappingId::new(0);
+        let evidence = EvidenceId::new(0);
+        let points = [0, 1].map(|id| ProgramPoint {
+            id: ProgramPointId::new(id),
+            block: BlockId::new(id),
+            events: vec![
+                SemanticEvent::new(
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Return,
+                        source: ValueId::new(0),
+                        target: ValueId::new(1),
+                    },
+                    source,
+                    evidence,
+                ),
+                SemanticEvent::new(
+                    SemanticEffect::ProcedureReturn {
+                        value: Some(ValueId::new(1)),
+                    },
+                    source,
+                    evidence,
+                ),
+            ]
+            .into_boxed_slice(),
+            source,
+            evidence,
+        });
+        let replacement = |point| SelectedPayloadEvent {
+            point,
+            event: 0,
+            relations: Box::default(),
+            constructor_path: None,
+        };
+        let mut projection = SelectedPayloadProjection {
+            identity: Some(StableDigest::sha256(b"test-only-12250")),
+            replacements: vec![replacement(points[0].id)].into_boxed_slice(),
+            limitations: Box::default(),
+        };
+        let published = HashSet::new();
+        assert!(!selected_return_boundaries_are_certified(
+            &points,
+            &projection,
+            &published
+        ));
+        projection.replacements = points.iter().map(|point| replacement(point.id)).collect();
+        assert!(
+            selected_return_boundaries_are_certified(&points, &projection, &published),
+            "both proven empty returns certify their own events"
+        );
+        projection.replacements[1].event = 1;
+        assert!(
+            !selected_return_boundaries_are_certified(&points, &projection, &published),
+            "a completion replacement cannot stand in for its producing event"
+        );
+
+        let mut indexed = points[1].clone();
+        indexed.events = vec![SemanticEvent::new(
+            SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::IndexedReturn { ordinal: 0 },
+                source: ValueId::new(0),
+                target: ValueId::new(1),
+            },
+            source,
+            evidence,
+        )]
+        .into_boxed_slice();
+        projection.replacements[1].event = 0;
+        assert!(selected_return_boundaries_are_certified(
+            &[points[0].clone(), indexed.clone()],
+            &projection,
+            &published
+        ));
+        projection.replacements = vec![replacement(points[0].id)].into_boxed_slice();
+        assert!(
+            !selected_return_boundaries_are_certified(
+                &[points[0].clone(), indexed],
+                &projection,
+                &published
+            ),
+            "an indexed return needs its own producing-event proof too"
+        );
+    }
 }

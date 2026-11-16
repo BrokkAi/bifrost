@@ -148,9 +148,22 @@ pub const UNRESOLVED: &str = "SELECT DISTINCT b.blob_oid, m.rel_path, e.impl_dec
  INDEXED BY rust_resolution_unit_summary_trait_endpoints_unresolved
  CROSS JOIN selected_rust_unit_summaries u ON u.summary_id=e.summary_id
  CROSS JOIN resolution_unit_summary_members m ON m.summary_id=e.summary_id AND m.member_ordinal=e.member_ordinal
+-- Rust-only derived-from blob until #11183 M3 converts Rust child rows
  CROSS JOIN blobs b ON b.id=m.blob_id
  CROSS JOIN live_workspace_files live ON live.blob_id=m.blob_id AND live.rel_path=m.rel_path
  WHERE e.endpoint_role='trait' AND e.endpoint_state='unresolved' AND e.unresolved_spelling=?1
+UNION
+-- A trait impl whose subject has no nominal path has a structural row and
+-- has no summary endpoint (#12956); it is found by the written trait spelling.
+SELECT DISTINCT b.blob_oid, m.rel_path, NULL
+ FROM resolution_rust_structural_trait_impls t
+ INDEXED BY resolution_rust_structural_trait_impls_spelling
+ CROSS JOIN resolution_unit_summary_members m INDEXED BY resolution_unit_summary_members_blob
+   ON m.blob_id=t.blob_id
+ CROSS JOIN selected_rust_unit_summaries u ON u.summary_id=m.summary_id
+ CROSS JOIN blobs b ON b.id=m.blob_id
+ CROSS JOIN live_workspace_files live ON live.blob_id=m.blob_id AND live.rel_path=m.rel_path
+ WHERE t.trait_terminal_spelling=?1
  ORDER BY 1,2,3";
 
 #[doc(hidden)]
@@ -165,6 +178,7 @@ pub const BOUND: &str = "SELECT DISTINCT ib.blob_oid, im.rel_path, e.impl_declar
  CROSS JOIN rust_resolution_unit_summary_trait_endpoints e INDEXED BY rust_resolution_unit_summary_trait_endpoints_target ON e.target_unit_key=au.unit_key AND e.target_module_path=ae.module_path AND e.target_identity_id=ae.identity_id AND e.endpoint_role='trait' AND e.endpoint_state='resolved'
  CROSS JOIN selected_rust_unit_summaries iu ON iu.summary_id=e.summary_id
  CROSS JOIN resolution_unit_summary_members im ON im.summary_id=e.summary_id AND im.member_ordinal=e.member_ordinal
+ -- Rust-only derived-from blob until #11183 M3 converts Rust child rows
  CROSS JOIN blobs ib ON ib.id=im.blob_id
  CROSS JOIN live_workspace_files il ON il.blob_id=im.blob_id AND il.rel_path=im.rel_path
  CROSS JOIN rust_resolution_unit_summary_trait_endpoints subject ON subject.summary_id=e.summary_id AND subject.member_ordinal=e.member_ordinal AND subject.owner_module_path=e.owner_module_path AND subject.source_relation_key=e.source_relation_key AND subject.endpoint_role='subject' AND subject.endpoint_state='resolved'
@@ -189,6 +203,7 @@ pub const IMPLEMENTED: &str = "SELECT DISTINCT ib.blob_oid, im.rel_path, e.impl_
  CROSS JOIN rust_resolution_unit_summary_trait_endpoints e INDEXED BY rust_resolution_unit_summary_trait_endpoints_target ON e.target_unit_key=au.unit_key AND e.target_module_path=ae.module_path AND e.target_identity_id=ae.identity_id AND e.endpoint_role='subject' AND e.endpoint_state='resolved'
  CROSS JOIN selected_rust_unit_summaries iu ON iu.summary_id=e.summary_id
  CROSS JOIN resolution_unit_summary_members im ON im.summary_id=e.summary_id AND im.member_ordinal=e.member_ordinal
+ -- Rust-only derived-from blob until #11183 M3 converts Rust child rows
  CROSS JOIN blobs ib ON ib.id=im.blob_id
  CROSS JOIN live_workspace_files il ON il.blob_id=im.blob_id AND il.rel_path=im.rel_path
  CROSS JOIN rust_resolution_unit_summary_trait_endpoints subject ON subject.summary_id=e.summary_id AND subject.member_ordinal=e.member_ordinal AND subject.owner_module_path=e.owner_module_path AND subject.source_relation_key=e.source_relation_key AND subject.endpoint_role='trait' AND subject.endpoint_state='resolved'
@@ -271,7 +286,7 @@ impl RustInventoryReadinessMemo {
             return Ok(*readiness);
         }
         let readiness = conn.prepare_cached(READINESS)?.query_row(
-            params![super::rust_unit_summaries::RUST_UNIT_SUMMARY_DERIVATION_VERSION],
+            params![super::rust_unit_summaries::rust_unit_summary_derivation_identity()],
             |row| {
                 Ok(RustInventoryReadiness([
                     row.get(0)?,
@@ -309,7 +324,7 @@ const READINESS: &str = "SELECT
  WHERE m.blob_id=live.blob_id AND m.rel_path=live.rel_path)),
  NOT EXISTS(SELECT 1 FROM selected_rust_unit_summaries u
  JOIN resolution_unit_summaries s ON s.summary_id=u.summary_id
- WHERE s.derivation_version<>?1 OR s.publication_state<>'complete'),
+ WHERE s.derivation_identity<>?1 OR s.publication_state<>'complete'),
  NOT EXISTS(SELECT 1 FROM selected_rust_unit_summaries u
  JOIN rust_crate_topologies t ON t.topology_id=u.topology_id
  WHERE t.publication_state<>'complete'),
@@ -340,254 +355,287 @@ impl AnalyzerStore {
         row_budget: usize,
         readiness: &RustInventoryReadinessMemo,
     ) -> Result<Option<RustInventoryAnswer>> {
-        if let (
-            LookupKind::RustBoundTraitImplInventory | LookupKind::RustTraitsImplementedByInventory,
-            LookupQuestion::RustPlacedDeclaration {
-                blob,
-                declaration,
-                rel_path,
-            },
-        ) = (kind, question)
-        {
-            let mut conn = self.read_conn_for_workspace(snapshots)?;
-            let tx = conn.transaction()?;
-            return with_resolution_read_progress_handler(&tx, cancellation, |conn| {
-                let ready = readiness.readiness(conn, snapshots)?;
-                if cancellation.is_cancelled() {
-                    return Ok(None);
+        let supported = matches!(
+            (kind, question),
+            (
+                LookupKind::RustBoundTraitImplInventory
+                    | LookupKind::RustTraitsImplementedByInventory,
+                LookupQuestion::RustPlacedDeclaration { .. }
+            ) | (
+                LookupKind::RustMacroExpansionInventory
+                    | LookupKind::RustUnresolvedTraitImplInventory
+                    | LookupKind::RustModuleImportCandidateInventory
+                    | LookupKind::RustIdentifierOccurrenceInventory
+                    | LookupKind::RustAliasBlobInventory,
+                LookupQuestion::Name {
+                    language: Some(Language::Rust),
+                    ..
                 }
-                if !ready.allows_rows(kind) {
-                    return Ok(Some(ready.empty(kind)));
-                }
-                let mut statement = conn.prepare_cached(match kind {
-                    LookupKind::RustBoundTraitImplInventory => BOUND,
-                    LookupKind::RustTraitsImplementedByInventory => IMPLEMENTED,
-                    _ => unreachable!(),
-                })?;
-                let mut stream = statement.query(params![
-                    Oid::from_bytes(blob)?.to_string(),
-                    declaration,
-                    rel_path.as_ref()
-                ])?;
-                let mut rows = Vec::new();
-                while let Some(row) = stream.next()? {
-                    if cancellation.is_cancelled() || rows.len() >= row_budget {
-                        return Ok(None);
-                    }
-                    let subject = row
-                        .get::<_, Option<u32>>(4)?
-                        .map(|declaration| -> Result<_> {
-                            Ok((
-                                Oid::from_str(&row.get::<_, String>(3)?)?,
-                                declaration,
-                                row.get::<_, String>(5)?,
-                            ))
-                        })
-                        .transpose()?;
-                    rows.push((
-                        Oid::from_str(&row.get::<_, String>(0)?)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<u32>>(2)?,
-                        subject,
-                    ));
-                }
-                rows.sort();
-                rows.dedup();
-                let mut hash = CanonicalHasher::new(match kind {
-                    LookupKind::RustTraitsImplementedByInventory => {
-                        b"bifrost-rust-traits-implemented-by-inventory:v1".as_slice()
-                    }
-                    _ => b"bifrost-rust-bound-trait-impl-inventory:v1".as_slice(),
-                });
-                hash.field("count", &(rows.len() as u64).to_be_bytes());
-                for (blob, path, declaration, subject) in &rows {
-                    hash.field("blob", blob.as_bytes());
-                    hash.field("path", path.as_bytes());
-                    hash.field("declaration-present", &[u8::from(declaration.is_some())]);
-                    if let Some(declaration) = declaration {
-                        hash.field("declaration", &declaration.to_be_bytes());
-                    }
-                    hash.field("subject-present", &[u8::from(subject.is_some())]);
-                    if let Some((blob, declaration, path)) = subject {
-                        hash.field("subject-blob", blob.as_bytes());
-                        hash.field("subject-declaration", &declaration.to_be_bytes());
-                        hash.field("subject-path", path.as_bytes());
-                    }
-                }
-                if cancellation.is_cancelled() {
-                    return Ok(None);
-                }
-                Ok(Some(ready.answer(
-                    kind,
-                    RustInventoryRows::Bound(rows),
-                    hash,
-                )))
-            });
-        }
-        let LookupQuestion::Name {
-            language: Some(Language::Rust),
-            name,
-        } = question
-        else {
+            )
+        );
+        if !supported {
             return Ok(None);
-        };
-        if kind == LookupKind::RustMacroExpansionInventory {
-            let mut conn = self.read_conn_for_workspace(snapshots)?;
-            let tx = conn.transaction()?;
-            return with_resolution_read_progress_handler(&tx, cancellation, |conn| {
-                let ready = readiness.readiness(conn, snapshots)?;
-                if cancellation.is_cancelled() {
-                    return Ok(None);
-                }
-                if !ready.allows_rows(kind) {
-                    return Ok(Some(ready.empty(kind)));
-                }
-                let mut statement = conn.prepare_cached(MACROS)?;
-                let mut stream = statement.query(params![
-                    name.as_ref(),
-                    super::RUST_OCCURRENCE_MACRO,
-                    super::RUST_OCCURRENCE_CODE | super::RUST_OCCURRENCE_MACRO
-                ])?;
-                // Consumers expand each blob to every live path and read it
-                // there, so the answer identity covers each live placement.
-                let mut placed = Vec::new();
-                while let Some(row) = stream.next()? {
-                    if cancellation.is_cancelled() || placed.len() >= row_budget {
-                        return Ok(None);
-                    }
-                    let via = match (
-                        row.get::<_, Option<String>>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                    ) {
-                        (Some(name), Some(blob)) => Some((name, Oid::from_str(&blob)?)),
-                        (None, None) => None,
-                        other => unreachable!("macro reason must include name and blob: {other:?}"),
-                    };
-                    placed.push((
-                        super::StoredMacroExpansionBlob {
-                            blob: Oid::from_str(&row.get::<_, String>(0)?)?,
-                            via,
-                        },
-                        row.get::<_, String>(1)?,
-                    ));
-                }
-                placed.sort();
-                placed.dedup();
-                let mut hash = CanonicalHasher::new(b"bifrost-rust-macro-expansion-inventory:v1");
-                hash.field("count", &(placed.len() as u64).to_be_bytes());
-                for (row, path) in &placed {
-                    hash.field("blob", row.blob.as_bytes());
-                    hash.field("path", path.as_bytes());
-                    hash.field("via-present", &[u8::from(row.via.is_some())]);
-                    if let Some((name, blob)) = &row.via {
-                        hash.field("via-name", name.as_bytes());
-                        hash.field("via-blob", blob.as_bytes());
-                    }
-                }
-                let mut rows = placed.into_iter().map(|(row, _)| row).collect::<Vec<_>>();
-                rows.sort();
-                rows.dedup();
-                if cancellation.is_cancelled() {
-                    return Ok(None);
-                }
-                Ok(Some(ready.answer(
-                    kind,
-                    RustInventoryRows::Macros(rows),
-                    hash,
-                )))
-            });
         }
-        let (sql, domain): (&str, &[u8]) = match kind {
-            LookupKind::RustUnresolvedTraitImplInventory => {
-                (UNRESOLVED, b"bifrost-rust-unresolved-impl-inventory:v1")
-            }
-            LookupKind::RustModuleImportCandidateInventory => {
-                (IMPORTS, b"bifrost-rust-import-inventory:v1")
-            }
-            LookupKind::RustIdentifierOccurrenceInventory => {
-                (OCCURRENCES, b"bifrost-rust-occurrence-inventory:v1")
-            }
-            LookupKind::RustAliasBlobInventory => {
-                (ALIASES, b"bifrost-rust-alias-blob-inventory:v1")
-            }
-            _ => return Ok(None),
-        };
         let mut conn = self.read_conn_for_workspace(snapshots)?;
         let tx = conn.transaction()?;
         with_resolution_read_progress_handler(&tx, cancellation, |conn| {
-            if cancellation.is_cancelled() {
-                return Ok(None);
-            }
-            let ready = readiness.readiness(conn, snapshots)?;
-            if !ready.allows_rows(kind) {
-                return Ok(Some(ready.empty(kind)));
-            }
-            let mut statement = conn.prepare_cached(sql)?;
-            let mut stream = statement.query(params![name.as_ref()])?;
-            let mut rows = Vec::new();
-            loop {
-                if cancellation.is_cancelled() {
-                    return Ok(None);
-                }
-                let Some(row) = stream.next()? else { break };
-                // An inventory of exactly row_budget rows fits; refuse only a
-                // row beyond it, as the bound and macro readers do.
-                if rows.len() >= row_budget {
-                    return Ok(None);
-                }
-                rows.push((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<u32>>(2)?,
-                ));
-            }
-            let mut hash = CanonicalHasher::new(domain);
-            hash.field("count", &(rows.len() as u64).to_be_bytes());
-            let mut unresolved = Vec::new();
-            let mut imports = Vec::new();
-            let mut occurrences = Vec::new();
-            for (oid, path, value) in rows {
-                let oid = Oid::from_str(&oid)?;
-                hash.field("blob", oid.as_bytes());
-                hash.field("path", path.as_bytes());
-                hash.field("present", &[u8::from(value.is_some())]);
-                if let Some(value) = value {
-                    hash.field("value", &value.to_be_bytes());
-                }
-                match kind {
-                    LookupKind::RustUnresolvedTraitImplInventory => {
-                        unresolved.push((oid, path, value))
-                    }
-                    LookupKind::RustModuleImportCandidateInventory
-                    | LookupKind::RustAliasBlobInventory => imports.push(oid),
-                    LookupKind::RustIdentifierOccurrenceInventory => {
-                        occurrences.push((oid, value.expect("context mask is non-null")))
-                    }
-                    _ => unreachable!(),
-                }
-            }
-            // Rows carry each live placement for the digest; the answer keeps
-            // one entry per blob, which consumers expand to its live paths.
-            imports.dedup();
-            occurrences.sort_unstable();
-            occurrences.dedup();
-            if cancellation.is_cancelled() {
-                return Ok(None);
-            }
-            let rows = match kind {
-                LookupKind::RustUnresolvedTraitImplInventory => {
-                    RustInventoryRows::Unresolved(unresolved)
-                }
-                LookupKind::RustModuleImportCandidateInventory
-                | LookupKind::RustAliasBlobInventory => RustInventoryRows::Imports(imports),
-                LookupKind::RustIdentifierOccurrenceInventory => {
-                    RustInventoryRows::Occurrences(occurrences)
-                }
-                _ => unreachable!(),
-            };
-            Ok(Some(ready.answer(kind, rows, hash)))
+            rust_inventory_answer_on_connection(
+                conn,
+                snapshots,
+                kind,
+                question,
+                cancellation,
+                row_budget,
+                readiness,
+            )
         })
     }
+}
+
+/// The canonical inventory algorithm over the caller's already-selected rows.
+/// Native operations borrow their own connection and keep its progress/read
+/// frame. This function never opens a connection, installs a handler, routes
+/// a file, or starts another evaluation.
+pub(crate) fn rust_inventory_answer_on_connection(
+    conn: &rusqlite::Connection,
+    snapshots: &WorkspaceSnapshots,
+    kind: LookupKind,
+    question: &LookupQuestion,
+    cancellation: &CancellationToken,
+    row_budget: usize,
+    readiness: &RustInventoryReadinessMemo,
+) -> Result<Option<RustInventoryAnswer>> {
+    if let (
+        LookupKind::RustBoundTraitImplInventory | LookupKind::RustTraitsImplementedByInventory,
+        LookupQuestion::RustPlacedDeclaration {
+            blob,
+            declaration,
+            rel_path,
+        },
+    ) = (kind, question)
+    {
+        let ready = readiness.readiness(conn, snapshots)?;
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        if !ready.allows_rows(kind) {
+            return Ok(Some(ready.empty(kind)));
+        }
+        let mut statement = conn.prepare_cached(match kind {
+            LookupKind::RustBoundTraitImplInventory => BOUND,
+            LookupKind::RustTraitsImplementedByInventory => IMPLEMENTED,
+            _ => unreachable!(),
+        })?;
+        let mut stream = statement.query(params![
+            Oid::from_bytes(blob)?.to_string(),
+            declaration,
+            rel_path.as_ref()
+        ])?;
+        let mut rows = Vec::new();
+        while let Some(row) = stream.next()? {
+            if cancellation.is_cancelled() || rows.len() >= row_budget {
+                return Ok(None);
+            }
+            let subject = row
+                .get::<_, Option<u32>>(4)?
+                .map(|declaration| -> Result<_> {
+                    Ok((
+                        Oid::from_str(&row.get::<_, String>(3)?)?,
+                        declaration,
+                        row.get::<_, String>(5)?,
+                    ))
+                })
+                .transpose()?;
+            rows.push((
+                Oid::from_str(&row.get::<_, String>(0)?)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<u32>>(2)?,
+                subject,
+            ));
+        }
+        rows.sort();
+        rows.dedup();
+        let mut hash = CanonicalHasher::new(match kind {
+            LookupKind::RustTraitsImplementedByInventory => {
+                b"bifrost-rust-traits-implemented-by-inventory:v1".as_slice()
+            }
+            _ => b"bifrost-rust-bound-trait-impl-inventory:v1".as_slice(),
+        });
+        hash.field("count", &(rows.len() as u64).to_be_bytes());
+        for (blob, path, declaration, subject) in &rows {
+            hash.field("blob", blob.as_bytes());
+            hash.field("path", path.as_bytes());
+            hash.field("declaration-present", &[u8::from(declaration.is_some())]);
+            if let Some(declaration) = declaration {
+                hash.field("declaration", &declaration.to_be_bytes());
+            }
+            hash.field("subject-present", &[u8::from(subject.is_some())]);
+            if let Some((blob, declaration, path)) = subject {
+                hash.field("subject-blob", blob.as_bytes());
+                hash.field("subject-declaration", &declaration.to_be_bytes());
+                hash.field("subject-path", path.as_bytes());
+            }
+        }
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        return Ok(Some(ready.answer(
+            kind,
+            RustInventoryRows::Bound(rows),
+            hash,
+        )));
+    }
+    let LookupQuestion::Name {
+        language: Some(Language::Rust),
+        name,
+    } = question
+    else {
+        return Ok(None);
+    };
+    if kind == LookupKind::RustMacroExpansionInventory {
+        let ready = readiness.readiness(conn, snapshots)?;
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        if !ready.allows_rows(kind) {
+            return Ok(Some(ready.empty(kind)));
+        }
+        let mut statement = conn.prepare_cached(MACROS)?;
+        let mut stream = statement.query(params![
+            name.as_ref(),
+            super::RUST_OCCURRENCE_MACRO,
+            super::RUST_OCCURRENCE_CODE | super::RUST_OCCURRENCE_MACRO
+        ])?;
+        // Consumers expand each blob to every live path and read it
+        // there, so the answer identity covers each live placement.
+        let mut placed = Vec::new();
+        while let Some(row) = stream.next()? {
+            if cancellation.is_cancelled() || placed.len() >= row_budget {
+                return Ok(None);
+            }
+            let via = match (
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ) {
+                (Some(name), Some(blob)) => Some((name, Oid::from_str(&blob)?)),
+                (None, None) => None,
+                other => unreachable!("macro reason must include name and blob: {other:?}"),
+            };
+            placed.push((
+                super::StoredMacroExpansionBlob {
+                    blob: Oid::from_str(&row.get::<_, String>(0)?)?,
+                    via,
+                },
+                row.get::<_, String>(1)?,
+            ));
+        }
+        placed.sort();
+        placed.dedup();
+        let mut hash = CanonicalHasher::new(b"bifrost-rust-macro-expansion-inventory:v1");
+        hash.field("count", &(placed.len() as u64).to_be_bytes());
+        for (row, path) in &placed {
+            hash.field("blob", row.blob.as_bytes());
+            hash.field("path", path.as_bytes());
+            hash.field("via-present", &[u8::from(row.via.is_some())]);
+            if let Some((name, blob)) = &row.via {
+                hash.field("via-name", name.as_bytes());
+                hash.field("via-blob", blob.as_bytes());
+            }
+        }
+        let mut rows = placed.into_iter().map(|(row, _)| row).collect::<Vec<_>>();
+        rows.sort();
+        rows.dedup();
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        return Ok(Some(ready.answer(
+            kind,
+            RustInventoryRows::Macros(rows),
+            hash,
+        )));
+    }
+    let (sql, domain): (&str, &[u8]) = match kind {
+        LookupKind::RustUnresolvedTraitImplInventory => {
+            (UNRESOLVED, b"bifrost-rust-unresolved-impl-inventory:v1")
+        }
+        LookupKind::RustModuleImportCandidateInventory => {
+            (IMPORTS, b"bifrost-rust-import-inventory:v1")
+        }
+        LookupKind::RustIdentifierOccurrenceInventory => {
+            (OCCURRENCES, b"bifrost-rust-occurrence-inventory:v1")
+        }
+        LookupKind::RustAliasBlobInventory => (ALIASES, b"bifrost-rust-alias-blob-inventory:v1"),
+        _ => return Ok(None),
+    };
+    if cancellation.is_cancelled() {
+        return Ok(None);
+    }
+    let ready = readiness.readiness(conn, snapshots)?;
+    if !ready.allows_rows(kind) {
+        return Ok(Some(ready.empty(kind)));
+    }
+    let mut statement = conn.prepare_cached(sql)?;
+    let mut stream = statement.query(params![name.as_ref()])?;
+    let mut rows = Vec::new();
+    loop {
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        let Some(row) = stream.next()? else { break };
+        // An inventory of exactly row_budget rows fits; refuse only a
+        // row beyond it, as the bound and macro readers do.
+        if rows.len() >= row_budget {
+            return Ok(None);
+        }
+        rows.push((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<u32>>(2)?,
+        ));
+    }
+    let mut hash = CanonicalHasher::new(domain);
+    hash.field("count", &(rows.len() as u64).to_be_bytes());
+    let mut unresolved = Vec::new();
+    let mut imports = Vec::new();
+    let mut occurrences = Vec::new();
+    for (oid, path, value) in rows {
+        let oid = Oid::from_str(&oid)?;
+        hash.field("blob", oid.as_bytes());
+        hash.field("path", path.as_bytes());
+        hash.field("present", &[u8::from(value.is_some())]);
+        if let Some(value) = value {
+            hash.field("value", &value.to_be_bytes());
+        }
+        match kind {
+            LookupKind::RustUnresolvedTraitImplInventory => unresolved.push((oid, path, value)),
+            LookupKind::RustModuleImportCandidateInventory | LookupKind::RustAliasBlobInventory => {
+                imports.push(oid)
+            }
+            LookupKind::RustIdentifierOccurrenceInventory => {
+                occurrences.push((oid, value.expect("context mask is non-null")))
+            }
+            _ => unreachable!(),
+        }
+    }
+    // Rows carry each live placement for the digest; the answer keeps
+    // one entry per blob, which consumers expand to its live paths.
+    imports.dedup();
+    occurrences.sort_unstable();
+    occurrences.dedup();
+    if cancellation.is_cancelled() {
+        return Ok(None);
+    }
+    let rows = match kind {
+        LookupKind::RustUnresolvedTraitImplInventory => RustInventoryRows::Unresolved(unresolved),
+        LookupKind::RustModuleImportCandidateInventory | LookupKind::RustAliasBlobInventory => {
+            RustInventoryRows::Imports(imports)
+        }
+        LookupKind::RustIdentifierOccurrenceInventory => {
+            RustInventoryRows::Occurrences(occurrences)
+        }
+        _ => unreachable!(),
+    };
+    Ok(Some(ready.answer(kind, rows, hash)))
 }
 
 #[cfg(test)]

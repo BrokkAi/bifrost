@@ -1079,7 +1079,8 @@ pub struct CodeQueryCallBinding {
     pub dispatch_target_count: usize,
     pub dispatch_targets_truncated: bool,
     /// Exact endpoint-selection proof, deliberately separate from the runtime
-    /// dispatch fields above. Authored-summary exactness preserves its summary
+    /// dispatch fields above. `resolver_declaration` proves declaration selection
+    /// without complete body effects. Authored-summary exactness preserves its summary
     /// record and active-pack provenance on the fields below.
     pub selector_exact: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1629,6 +1630,70 @@ pub struct CodeQuerySwitchCoverage {
 }
 
 /// One source-backed assignment relation and its proof/coverage conclusion.
+/// Complete typed reasons retained by the binding dead-write proof.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(tag = "code", rename_all = "snake_case")]
+pub enum CodeQueryWriteLivenessOpenReason {
+    AxisUnsupported {
+        axis: &'static str,
+    },
+    NoSemanticProvider,
+    SemanticProviderFailed {
+        detail: String,
+    },
+    SemanticAnalysisPartial {
+        detail: String,
+    },
+    Cancelled,
+    SourceGenerationChanged,
+    BindingScopeLivenessUnavailable {
+        detail: String,
+    },
+    ControlProjectionRejected {
+        detail: String,
+    },
+    ModeledControlProjectionIncomplete {
+        detail: String,
+    },
+    NoStructuralFacts,
+    LoweringGap {
+        capability: &'static str,
+        kind: &'static str,
+        detail: String,
+        gap_ids: Vec<u32>,
+        sources: Vec<CodeQueryRelatedSource>,
+    },
+    BudgetExhausted {
+        axis: &'static str,
+        detail: String,
+    },
+    BindingStateNotClosed {
+        binding_value_id: u64,
+    },
+}
+
+impl CodeQueryWriteLivenessOpenReason {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::AxisUnsupported { .. } => "axis_unsupported",
+            Self::NoSemanticProvider => "no_semantic_provider",
+            Self::SemanticProviderFailed { .. } => "semantic_provider_failed",
+            Self::SemanticAnalysisPartial { .. } => "semantic_analysis_partial",
+            Self::Cancelled => "cancelled",
+            Self::SourceGenerationChanged => "source_generation_changed",
+            Self::BindingScopeLivenessUnavailable { .. } => "binding_scope_liveness_unavailable",
+            Self::ControlProjectionRejected { .. } => "control_projection_rejected",
+            Self::ModeledControlProjectionIncomplete { .. } => {
+                "modeled_control_projection_incomplete"
+            }
+            Self::NoStructuralFacts => "no_structural_facts",
+            Self::LoweringGap { .. } => "lowering_gap",
+            Self::BudgetExhausted { .. } => "budget_exhausted",
+            Self::BindingStateNotClosed { .. } => "binding_state_not_closed",
+        }
+    }
+}
+
 #[cfg_attr(feature = "query-result-fixtures", derive(Default))]
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryAssignmentRelation {
@@ -1652,6 +1717,13 @@ pub struct CodeQueryAssignmentRelation {
     pub coverage: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<&'static str>,
+    /// One code per structured Open reason, in the same stable order.
+    /// RQL reads and compares this whole list; per-code membership filtering
+    /// is not supported yet. Inspect `open_reasons` for typed per-code data.
+    pub reason_codes: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schemars(default)]
+    pub open_reasons: Vec<CodeQueryWriteLivenessOpenReason>,
     /// Every first replacement established on a modeled continuation.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[schemars(default)]

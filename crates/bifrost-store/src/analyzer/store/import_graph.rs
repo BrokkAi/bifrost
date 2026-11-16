@@ -1,4 +1,5 @@
 use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
+use brokk_bifrost_core::analyzer::reuse_verdict::{CarriesReuseVerdict, ReuseVerdict};
 use rusqlite::{OptionalExtension, params, params_from_iter, types::Value};
 use std::sync::{LazyLock, Mutex};
 
@@ -479,6 +480,15 @@ pub enum WorkspaceImportDirection {
 pub struct WorkspaceImportGraphRead {
     pub edges: Vec<(String, String)>,
     pub exhausted: bool,
+    /// The verdict of the edge-limit refusal that set `exhausted`, carried to
+    /// the caller that captures the adjacency.
+    pub reuse: ReuseVerdict,
+}
+
+impl CarriesReuseVerdict for WorkspaceImportGraphRead {
+    fn reuse_verdict(&self) -> ReuseVerdict {
+        self.reuse
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1859,6 +1869,7 @@ impl AnalyzerStore {
             return Ok(Some(WorkspaceImportGraphRead {
                 edges: Vec::new(),
                 exhausted: false,
+                reuse: ReuseVerdict::Content,
             }));
         }
 
@@ -1945,14 +1956,21 @@ impl AnalyzerStore {
                 }
             }
         }
-        let exhausted = !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+        let refused = brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
             edges.len(),
             edge_limit,
         )
-        .allows(0);
+        .try_allow(0)
+        .err();
+        let exhausted = refused.is_some();
+        let reuse = refused.map_or(ReuseVerdict::Content, |refused| refused.reuse_verdict());
         edges.truncate(edge_limit);
         transaction.commit()?;
-        Ok(Some(WorkspaceImportGraphRead { edges, exhausted }))
+        Ok(Some(WorkspaceImportGraphRead {
+            edges,
+            exhausted,
+            reuse,
+        }))
     }
 }
 

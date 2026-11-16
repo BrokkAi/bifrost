@@ -160,6 +160,61 @@ impl RustImportOwner {
             Self::Module { module, .. } | Self::LocalOnly { module, .. } => module,
         }
     }
+
+    /// Whether a path-based import so owned is in scope at `byte`, given the
+    /// extent of the module holding `byte` (`rust_module_extent_at`). A module
+    /// import is visible throughout its own module's body, including nested
+    /// blocks, but a child or sibling module does not inherit it. A block
+    /// import is also limited to its block.
+    pub fn visible_at(&self, module_extent: (usize, usize), byte: usize) -> bool {
+        match self {
+            Self::Module { start, end, .. } => crate::lexical_scope::use_statement_visible_at(
+                byte,
+                Some(module_extent),
+                Some((*start, *end)),
+                None,
+            ),
+            Self::LocalOnly {
+                module_start,
+                module_end,
+                start,
+                end,
+                ..
+            } => crate::lexical_scope::use_statement_visible_at(
+                byte,
+                Some(module_extent),
+                Some((*module_start, *module_end)),
+                Some((*start, *end)),
+            ),
+        }
+    }
+}
+
+/// The extent `rust_import_owner` assigns to the module that directly holds
+/// `byte`: the body of the innermost enclosing named `mod` item, or the whole
+/// source for the file root. Iterative descent; no recursion.
+pub fn rust_module_extent_at(root: Node<'_>, source: &str, byte: usize) -> (usize, usize) {
+    let mut extent = (0, source.len());
+    let mut current = root;
+    'descend: loop {
+        let mut cursor = current.walk();
+        for child in current.named_children(&mut cursor) {
+            if child.start_byte() <= byte && byte < child.end_byte() {
+                if child.kind() == "mod_item"
+                    && child
+                        .child_by_field_name("name")
+                        .and_then(|name| simple_segment(name, source))
+                        .is_some()
+                {
+                    let body = child.child_by_field_name("body").unwrap_or(child);
+                    extent = (body.start_byte(), body.end_byte());
+                }
+                current = child;
+                continue 'descend;
+            }
+        }
+        return extent;
+    }
 }
 
 #[derive(Clone)]
@@ -314,7 +369,7 @@ pub(crate) fn rust_item_has_attribute(node: Node<'_>, source: &str, expected: &s
     rust_item_attribute(node, source, expected).is_some()
 }
 
-fn rust_item_attribute<'tree>(
+pub(crate) fn rust_item_attribute<'tree>(
     node: Node<'tree>,
     source: &str,
     expected: &str,
@@ -615,6 +670,95 @@ pub(crate) fn rust_imports_with_visibility_from_use_declaration_with_sources<'tr
         Ok::<_, std::convert::Infallible>(())
     })
     .expect("infallible legacy use projection")
+}
+
+/// Syntax-only names and paths for lexical classification. This type cannot
+/// be published as declaration facts: it carries no visibility or scope rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RustUseBinding {
+    path: Vec<String>,
+    binding: RustImportBindingName<'static>,
+    pub(crate) module_self: bool,
+}
+
+impl RustUseBinding {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        brokk_bifrost_core::hash::vec_slot_bytes(&self.path)
+            + self.path.iter().map(String::capacity).sum::<usize>()
+            + match &self.binding {
+                RustImportBindingName::Named(Cow::Owned(name)) => name.capacity(),
+                _ => 0,
+            }
+    }
+
+    pub(crate) fn from_import(mut import: RustImportInfo) -> Self {
+        let binding = match import.binding_name() {
+            RustImportBindingName::Named(name) => {
+                RustImportBindingName::Named(Cow::Owned(name.into_owned()))
+            }
+            RustImportBindingName::Unnamed => RustImportBindingName::Unnamed,
+            RustImportBindingName::Glob => RustImportBindingName::Glob,
+        };
+        Self {
+            path: import
+                .info
+                .path
+                .take()
+                .expect("use leaf has a structured path")
+                .segments,
+            binding,
+            module_self: import.module_self,
+        }
+    }
+
+    pub(crate) fn binding_name(&self) -> RustImportBindingName<'_> {
+        match &self.binding {
+            RustImportBindingName::Named(name) => {
+                RustImportBindingName::Named(Cow::Borrowed(name.as_ref()))
+            }
+            RustImportBindingName::Unnamed => RustImportBindingName::Unnamed,
+            RustImportBindingName::Glob => RustImportBindingName::Glob,
+        }
+    }
+
+    pub(crate) fn path(&self) -> &[String] {
+        &self.path
+    }
+}
+
+/// Reuse the use-tree collector without deriving declaration-owner ancestry.
+/// Canonical scope summaries already know their parent relation and need only
+/// bindings, so rebuilding a full scope chain per use would multiply depth.
+pub(crate) fn rust_use_bindings_bounded<F, E>(
+    node: Node<'_>,
+    source: &str,
+    mut charge: F,
+) -> Result<Vec<RustUseBinding>, E>
+where
+    F: FnMut(usize) -> Result<(), E>,
+{
+    charge(1)?;
+    if node.kind() != "use_declaration" {
+        return Ok(Vec::new());
+    }
+    let Some(argument) = node.child_by_field_name("argument") else {
+        return Ok(Vec::new());
+    };
+    let declaration = RustUseDeclaration {
+        visibility: RustVisibility::Private,
+        lexical_scopes: Vec::new(),
+        lexical_scope_nodes: Vec::new(),
+        declaration_start_byte: node.start_byte(),
+    };
+    let mut leaves = Vec::new();
+    collect_rust_use_tree_bounded(argument, source, &declaration, &mut leaves, &mut charge)?;
+    let mut bindings = Vec::with_capacity(leaves.len());
+    for leaf in leaves {
+        charge(1)?;
+        bindings.push(RustUseBinding::from_import(leaf.import));
+    }
+    charge(0)?;
+    Ok(bindings)
 }
 
 /// The existing use-tree projection, with interruption before traversal or
@@ -1619,6 +1763,53 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    #[hardwon("#11906: canonical lexical summaries derived full import-owner ancestry per use")]
+    fn binding_only_projection_keeps_names_paths_and_module_self() {
+        for source in [
+            "pub(in crate::m) use ::dep::{self as d, r#type as t, Thing, hidden as _, *};",
+            "mod m { pub(super) use super::other::{self, C as Alias}; fn f(){use foo::bar;} }",
+        ] {
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_rust::LANGUAGE.into())
+                .unwrap();
+            let tree = parser.parse(source, None).unwrap();
+            let mut pending = vec![tree.root_node()];
+            while let Some(node) = pending.pop() {
+                if node.kind() == "use_declaration" {
+                    let full = rust_imports_with_visibility_from_use_declaration_with_sources(
+                        node, source,
+                    );
+                    let expected: Vec<_> = full
+                        .iter()
+                        .map(|leaf| {
+                            (
+                                format!("{:?}", leaf.import.binding_name()),
+                                leaf.import.path().to_vec(),
+                                leaf.import.module_self,
+                            )
+                        })
+                        .collect();
+                    let bindings =
+                        rust_use_bindings_bounded(node, source, |_| Ok::<_, ()>(())).unwrap();
+                    let actual: Vec<_> = bindings
+                        .iter()
+                        .map(|leaf| {
+                            (
+                                format!("{:?}", leaf.binding_name()),
+                                leaf.path().to_vec(),
+                                leaf.module_self,
+                            )
+                        })
+                        .collect();
+                    assert_eq!(actual, expected, "{source}");
+                }
+                pending.extend(node.named_children(&mut node.walk()));
+            }
+        }
     }
 
     fn structured_import(

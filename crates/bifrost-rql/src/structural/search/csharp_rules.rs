@@ -17,7 +17,9 @@ use brokk_bifrost_analysis::analyzer::structural::lexical_environment::{
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
     csharp_integer_literal_value, declaration_modifier_words, declarator_initializer,
 };
-use brokk_bifrost_core::analyzer::structural::conditional_regions::{Activation, ConditionalRegions};
+use brokk_bifrost_core::analyzer::structural::conditional_regions::{
+    Activation, ConditionalRegions,
+};
 use brokk_bifrost_core::analyzer::structural::facts::IntegerLiteralValue;
 use brokk_bifrost_core::analyzer::structural::occurrences::Namespace;
 use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
@@ -52,8 +54,11 @@ pub(super) fn matches_for_file(
             | CSharpRule::MissingXmldocTypeParameter
             | CSharpRule::UnknownXmldocTypeParameter
     ) {
-        let regions = syntax.preprocessor().as_ref()
-            .map(|p| p.conditional_regions(source)).unwrap_or_default();
+        let regions = syntax
+            .preprocessor()
+            .as_ref()
+            .map(|p| p.conditional_regions(source))
+            .unwrap_or_default();
         return documentation_parameter_matches(tree, source, rule, file, &regions);
     }
     let preprocessor = syntax.preprocessor();
@@ -103,18 +108,29 @@ fn documentation_parameter_matches(
             rule,
             CSharpRule::MissingXmldocTypeParameter | CSharpRule::UnknownXmldocTypeParameter
         );
-        if !matches!(declaration.kind(), "method_declaration" | "constructor_declaration")
-            && !(type_rule && matches!(declaration.kind(),
-                "class_declaration" | "struct_declaration" | "interface_declaration"
-                | "record_declaration" | "record_struct_declaration" | "delegate_declaration"))
+        if !matches!(
+            declaration.kind(),
+            "method_declaration" | "constructor_declaration"
+        ) && !(type_rule
+            && matches!(
+                declaration.kind(),
+                "class_declaration"
+                    | "struct_declaration"
+                    | "interface_declaration"
+                    | "record_declaration"
+                    | "record_struct_declaration"
+                    | "delegate_declaration"
+            ))
         {
             continue;
         }
-        let type_parameters = declaration.child_by_field_name("type_parameters").or_else(|| {
-            named_children(declaration)
-                .into_iter()
-                .find(|child| child.kind() == "type_parameter_list")
-        });
+        let type_parameters = declaration
+            .child_by_field_name("type_parameters")
+            .or_else(|| {
+                named_children(declaration)
+                    .into_iter()
+                    .find(|child| child.kind() == "type_parameter_list")
+            });
         if type_rule && type_parameters.is_none() {
             continue;
         }
@@ -130,10 +146,19 @@ fn documentation_parameter_matches(
             }
             previous = sibling.prev_named_sibling();
         }
-        let header_end = (if type_rule { type_parameters } else {
+        let header_end = (if type_rule {
+            type_parameters
+        } else {
             declaration.child_by_field_name("parameters")
-        }).map_or_else(|| declaration.child_by_field_name("body")
-            .map_or(declaration.end_byte(), |body| body.start_byte()), |list| list.end_byte());
+        })
+        .map_or_else(
+            || {
+                declaration
+                    .child_by_field_name("body")
+                    .map_or(declaration.end_byte(), |body| body.start_byte())
+            },
+            |list| list.end_byte(),
+        );
         if regions.has_uncertain_text(start..header_end) {
             undecided.push(UndecidedSite::at(
                 node_range(declaration),
@@ -153,11 +178,20 @@ fn documentation_parameter_matches(
             type_parameters
         } else {
             declaration.child_by_field_name("parameters")
-        }) else { continue; };
+        }) else {
+            continue;
+        };
         let mut cursor = parameters.walk();
         let mut parameter_names = parameters
             .named_children(&mut cursor)
-            .filter(|node| node.kind() == if type_rule { "type_parameter" } else { "parameter" })
+            .filter(|node| {
+                node.kind()
+                    == if type_rule {
+                        "type_parameter"
+                    } else {
+                        "parameter"
+                    }
+            })
             .filter_map(|node| {
                 node.child_by_field_name("name")
                     .or_else(|| type_rule.then(|| node.named_child(0)).flatten())
@@ -174,7 +208,14 @@ fn documentation_parameter_matches(
             .collect::<Vec<_>>();
         let named_tags = tags
             .iter()
-            .filter(|tag| tag.kind == if type_rule { TagKind::TypeParam } else { TagKind::Param })
+            .filter(|tag| {
+                tag.kind
+                    == if type_rule {
+                        TagKind::TypeParam
+                    } else {
+                        TagKind::Param
+                    }
+            })
             .map(|tag| NamedTag {
                 name: tag.name.as_deref(),
                 acceptable: tag.has_body,
@@ -190,6 +231,7 @@ fn documentation_parameter_matches(
                     if missing_tag(text, &named_tags) {
                         let report = node_range(*parameter);
                         matches.push(LanguageRuleMatch {
+                            selected_pattern_source: Default::default(),
                             select: report,
                             report,
                             heuristic: None,

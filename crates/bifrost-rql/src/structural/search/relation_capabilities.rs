@@ -19,9 +19,25 @@ use crate::query::{
 pub(super) fn preflight(
     plan: &CodeQueryPlan,
     files: &[ProjectFile],
+    analyzer: &dyn IAnalyzer,
     workspace: Option<&WorkspaceAnalyzer>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) {
+    // Even a narrowed seed unit consumes the whole selected dialect inventory.
+    // Reuse the request's existing single-flight index/authority so an overlay
+    // receipt is built once per evaluation, then replayed into every consuming
+    // unit. The inventory names membership/ignore metadata, not source bytes.
+    if analyzer.current_thread_read_ledger().is_some()
+        && !crate::analyzer::workspace_authority::record_request_workspace_file_inventory(analyzer)
+    {
+        // Custom projects without a request cell or an attested listing keep
+        // the broader source dependency. An unnamed index read also retains
+        // the authority recorder's existing fail-closed reuse refusal.
+        let mut languages = crate::query::plan_code_languages(plan);
+        languages.sort_unstable();
+        languages.dedup();
+        analyzer.record_read(analyzer.workspace_scope_read_key(&languages));
+    }
     let mut reported = BTreeSet::new();
     preflight_plan(plan, files, workspace, &mut reported, diagnostics);
 }
@@ -181,6 +197,10 @@ fn report_unsupported(
         return;
     }
     diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
         incompleteness: brokk_bifrost_rql::Incompleteness::Content,
         related: Vec::new(),
         source: None,
@@ -233,6 +253,9 @@ fn source_dialects(
             .iter()
             .flat_map(|branch| source_dialects(&branch.source, files))
             .collect(),
+        CodeQueryPlanSource::CallReachability(relation) => {
+            source_dialects(&relation.sources.source, files)
+        }
         CodeQueryPlanSource::Correlate(correlation) => {
             source_dialects(&correlation.code.source, files)
         }

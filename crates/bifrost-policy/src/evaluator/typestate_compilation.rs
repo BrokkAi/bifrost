@@ -5,12 +5,12 @@ pub(crate) enum TypestateCompilationFailure {
     Incomplete {
         reasons: Box<[PolicyIncompleteReason]>,
         message: Box<str>,
-        work: PolicyWorkReport,
+        work: Box<PolicyWorkReport>,
     },
     Failed {
         reason: PolicyFailureReason,
         message: Box<str>,
-        work: PolicyWorkReport,
+        work: Box<PolicyWorkReport>,
     },
 }
 
@@ -25,7 +25,7 @@ impl TypestateCompilationFailure {
         Self::Incomplete {
             reasons: reasons.into_boxed_slice(),
             message: message.into(),
-            work,
+            work: Box::new(work),
         }
     }
 
@@ -41,7 +41,7 @@ impl TypestateCompilationFailure {
         Self::Failed {
             reason,
             message: message.into(),
-            work,
+            work: Box::new(work),
         }
     }
 }

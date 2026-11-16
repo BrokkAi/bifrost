@@ -150,6 +150,8 @@ pub(crate) fn go_reference_lookup_namespace_codes(namespace: ResolutionNamespace
 pub enum ResolutionInteriorPreparation {
     Prepared(Box<PreparedResolutionBundle>),
     Cancelled,
+    /// Reader-local completion evidence cannot enter a durable bundle.
+    Rejected(super::StoreError),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -480,12 +482,88 @@ fn prepare_catalog_authority(
     true
 }
 
+/// Reject reader-local evidence before any completion-kind conversion or
+/// serialization. Check lexical paths and every typed completion collection.
+fn reject_unclassified_completions(
+    lowered: &LoweredResolutionFactsWithIdentityCatalog,
+    cancellation: &CancellationToken,
+) -> super::Result<()> {
+    let typed = lowered.typed();
+    let completions = typed
+        .transfers()
+        .iter()
+        .map(|transfer| transfer.rule().completion())
+        .chain(
+            typed
+                .intrinsic_seeds()
+                .iter()
+                .map(|seed| seed.frontier().completion()),
+        )
+        .chain(
+            typed
+                .call_obligations()
+                .iter()
+                .map(|obligation| obligation.completion()),
+        )
+        .chain(
+            typed
+                .callable_signatures()
+                .iter()
+                .map(|signature| signature.completion()),
+        )
+        .chain(
+            lowered
+                .lexical()
+                .paths()
+                .iter()
+                .map(|(_, path)| path.completion()),
+        );
+    for completion in completions {
+        if cancellation.is_cancelled() {
+            return Ok(());
+        }
+        if let ResolutionCompletion::Incomplete(reasons) = completion
+            && reasons.iter().any(|reason| {
+                matches!(
+                    reason,
+                    ResolutionIncompleteReason::Unclassified(_)
+                        | ResolutionIncompleteReason::OverlayFrontierUnknown(_)
+                )
+            })
+        {
+            return Err(super::StoreError::new(
+                "reader-local Unclassified completion cannot be persisted",
+            ));
+        }
+    }
+    for (_, path) in lowered.lexical().paths() {
+        if cancellation.is_cancelled() {
+            return Ok(());
+        }
+        if path.lexical_choices().iter().any(|record| {
+            matches!(
+                record.reason,
+                ResolutionIncompleteReason::Unclassified(_)
+                    | ResolutionIncompleteReason::OverlayFrontierUnknown(_)
+            )
+        }) {
+            return Err(super::StoreError::new(
+                "reader-local Unclassified lexical metadata cannot be persisted",
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[doc(hidden)]
 pub fn prepare_resolution_bundle_with_unit_keys(
     lowered: &LoweredResolutionFactsWithIdentityCatalog,
     unit_keys: Option<&HashMap<CodeUnit, i64>>,
     cancellation: &CancellationToken,
 ) -> ResolutionInteriorPreparation {
+    if let Err(error) = reject_unclassified_completions(lowered, cancellation) {
+        return ResolutionInteriorPreparation::Rejected(error);
+    }
     prepare_resolution_bundle_rows(
         lowered,
         unit_keys,
@@ -524,6 +602,7 @@ pub fn prepare_resolution_bundle_with_source_facts_and_epoch(
     producer_epoch: &'static str,
     cancellation: &CancellationToken,
 ) -> super::Result<ResolutionInteriorPreparation> {
+    reject_unclassified_completions(lowered, cancellation)?;
     let mut rows = PreparedResolutionBundleRows::default();
     if lowered.lexical().language() == Language::Rust {
         let source = source.expect("parsed Rust publication has canonical source facts");
@@ -670,6 +749,21 @@ fn prepare_common_rows(
             return false;
         }
         rows.extern_aliases.push(row![*site, *scope, name.clone()]);
+    }
+    for fact in &common.shared_language.csharp_friend_attributes {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        rows.csharp_friend_attributes.push(row![
+            fact.site.get(),
+            fact.scope.get(),
+            serde_json::to_string(&fact.name_segments).expect("attribute segments serialize"),
+            "unresolved",
+            fact.argument.clone(),
+            fact.parse_state.label(),
+            fact.friend_name.clone(),
+            i64::from(fact.has_public_key),
+        ]);
     }
     for fact in &common.shared_language.compilation_imports {
         if cancellation.is_cancelled() {
@@ -841,6 +935,15 @@ fn prepare_common_rows(
         ]);
     }
     let identities = lowered.identities();
+    for fact in &common.structural_trait_impls {
+        rows.structural_trait_impls.push(row![
+            keys.semantic(fact.relation),
+            lookup_spelling(lowered.identities(), fact.trait_terminal),
+            i64::from(fact.impl_site),
+            usize_i64(fact.impl_start_byte),
+            usize_i64(fact.impl_end_byte),
+        ]);
+    }
     for fact in &common.trait_implementations {
         if cancellation.is_cancelled() {
             return false;
@@ -1074,6 +1177,9 @@ fn prepare_common_rows(
     } else {
         None
     };
+    let structural_index = source
+        .filter(|_| lowered.lexical().language() == Language::Rust)
+        .map(RustGapSpanIndexes::new);
     let mut common_candidates_by_site = BTreeMap::<_, (bool, BTreeSet<(String, String)>)>::new();
     for candidate in &common.rust_reverse_gap_candidates {
         if cancellation.is_cancelled() {
@@ -1097,8 +1203,9 @@ fn prepare_common_rows(
         if cancellation.is_cancelled() {
             return false;
         }
-        let glob_import_site =
-            source.is_some_and(|source| rust_gap_is_glob_import_site(site, source));
+        let glob_import_site = source
+            .zip(structural_index.as_ref())
+            .is_some_and(|(source, index)| index.glob_import_site(site, source));
         // Macro candidates are the complete structured view for their site,
         // including the wildcard when that view is uncertain.
         if macro_candidates
@@ -1113,7 +1220,9 @@ fn prepare_common_rows(
             Some(BTreeSet::new())
         } else {
             source.zip(source_text).and_then(|(source, source_text)| {
-                rust_structural_gap_candidate_names(site, source, source_text)
+                structural_index
+                    .as_ref()?
+                    .candidate_names(site, source, source_text)
             })
         };
         if !glob_import_site {
@@ -1443,87 +1552,94 @@ fn prepare_lexical_rows(
     !cancellation.is_cancelled()
 }
 
-/// Names inside a non-macro gap, selected from names attached to structured
-/// Rust AST nodes. `None` means the source cannot prove a closed name set.
-fn rust_gap_is_glob_import_site(
-    site: brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteId,
-    source: &brokk_bifrost_core::analyzer::parsed_file::ParsedSourceFacts,
-) -> bool {
-    let Some(occurrence) = source.native_site_occurrences.get(site.index()).copied() else {
-        return false;
-    };
-    let gap = source.occurrences.occurrence(occurrence).range;
-    source.imports.iter().any(|import| {
-        if !import.is_wildcard {
-            return false;
-        }
-        let range = source.occurrences.occurrence(import.declaration).range;
-        range.start_byte <= gap.end_byte && gap.start_byte <= range.end_byte
-    })
+/// All indexes live for one blob preparation and are discarded before return.
+struct RustGapSpanIndexes {
+    names: crate::analyzer::span_index::SpanIndex<(usize, usize)>,
+    unknown: crate::analyzer::span_index::SpanIndex<()>,
+    globs: crate::analyzer::span_index::SpanIndex<()>,
 }
 
+impl RustGapSpanIndexes {
+    fn new(source: &brokk_bifrost_core::analyzer::parsed_file::ParsedSourceFacts) -> Self {
+        let mut names = Vec::new();
+        let mut unknown = Vec::new();
+        let mut globs = Vec::new();
+        for region in source.structural.recovered_regions() {
+            unknown.push((region.start_byte, region.end_byte, ()));
+        }
+        for import in &source.imports {
+            let range = source.occurrences.occurrence(import.declaration).range;
+            if import.is_wildcard {
+                globs.push((range.start_byte, range.end_byte, ()));
+            }
+            if import.path.is_none() {
+                unknown.push((range.start_byte, range.end_byte, ()));
+            }
+        }
+        for node in source.structural.nodes() {
+            if let Some(name) = node.name {
+                let range = source.occurrences.occurrence(name).range;
+                names.push((
+                    range.start_byte,
+                    range.end_byte,
+                    (range.start_byte, range.end_byte),
+                ));
+            } else if node.kind == NormalizedKind::Identifier {
+                let range = source.occurrences.occurrence(node.occurrence).range;
+                unknown.push((range.start_byte, range.end_byte, ()));
+            }
+        }
+        Self {
+            names: crate::analyzer::span_index::SpanIndex::new(names),
+            unknown: crate::analyzer::span_index::SpanIndex::new(unknown),
+            globs: crate::analyzer::span_index::SpanIndex::new(globs),
+        }
+    }
+
+    fn glob_import_site(
+        &self,
+        site: brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteId,
+        source: &brokk_bifrost_core::analyzer::parsed_file::ParsedSourceFacts,
+    ) -> bool {
+        let Some(&occurrence) = source.native_site_occurrences.get(site.index()) else {
+            return false;
+        };
+        let gap = source.occurrences.occurrence(occurrence).range;
+        self.globs.overlaps(gap.start_byte, gap.end_byte, true)
+    }
+
+    fn candidate_names(
+        &self,
+        site: brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteId,
+        source: &brokk_bifrost_core::analyzer::parsed_file::ParsedSourceFacts,
+        source_text: &str,
+    ) -> Option<BTreeSet<String>> {
+        let occurrence = *source.native_site_occurrences.get(site.index())?;
+        let gap = source.occurrences.occurrence(occurrence).range;
+        if self.unknown.overlaps(gap.start_byte, gap.end_byte, false) {
+            return None;
+        }
+        let mut candidates = BTreeSet::new();
+        for &(start, end) in self.names.contained(gap.start_byte, gap.end_byte) {
+            let spelling = source_text.get(start..end)?;
+            let spelling =
+                brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix(spelling);
+            if spelling.is_empty() {
+                return None;
+            }
+            candidates.insert(spelling.to_owned());
+        }
+        Some(candidates)
+    }
+}
+
+#[cfg(test)]
 fn rust_structural_gap_candidate_names(
     site: brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteId,
     source: &brokk_bifrost_core::analyzer::parsed_file::ParsedSourceFacts,
     source_text: &str,
 ) -> Option<BTreeSet<String>> {
-    let occurrence = *source.native_site_occurrences.get(site.index())?;
-    let gap = source.occurrences.occurrence(occurrence).range;
-    let overlaps = |start: usize, end: usize| {
-        if start == end {
-            gap.start_byte <= start && start <= gap.end_byte
-        } else {
-            start < gap.end_byte && gap.start_byte < end
-        }
-    };
-    if source.structural.recovered_regions().iter().any(|region| {
-        let (start, end) = (region.start_byte, region.end_byte);
-        if start == end {
-            gap.start_byte <= start && start <= gap.end_byte
-        } else {
-            start < gap.end_byte && gap.start_byte < end
-        }
-    }) {
-        return None;
-    }
-    if source.imports.iter().any(|import| {
-        if import.path.is_some() {
-            return false;
-        }
-        let range = source.occurrences.occurrence(import.declaration).range;
-        overlaps(range.start_byte, range.end_byte)
-    }) {
-        return None;
-    }
-
-    let mut candidates = BTreeSet::new();
-    for node in source.structural.nodes() {
-        let node_range = source.occurrences.occurrence(node.occurrence).range;
-        let Some(name) = node.name else {
-            // Calls and field accesses are structural wrappers. Their callee
-            // or field identifier carries the candidate spelling when one
-            // exists; treating a nameless wrapper as an unknown identifier
-            // would make every such gap a wildcard.
-            if node.kind == NormalizedKind::Identifier
-                && overlaps(node_range.start_byte, node_range.end_byte)
-            {
-                return None;
-            }
-            continue;
-        };
-        let range = source.occurrences.occurrence(name).range;
-        if range.start_byte < gap.start_byte || range.end_byte > gap.end_byte {
-            continue;
-        }
-        let spelling = source_text.get(range.start_byte..range.end_byte)?;
-        let spelling =
-            brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix(spelling);
-        if spelling.is_empty() {
-            return None;
-        }
-        candidates.insert(spelling.to_owned());
-    }
-    Some(candidates)
+    RustGapSpanIndexes::new(source).candidate_names(site, source, source_text)
 }
 
 /// Candidate names from an unresolved macro frontier. A visible `macro_rules!`
@@ -3065,6 +3181,10 @@ fn serialized_completion_reason(
     keys: &ResolutionLocalKeys,
 ) -> Box<[PreparedResolutionValue]> {
     match reason {
+        ResolutionIncompleteReason::Unclassified(_)
+        | ResolutionIncompleteReason::OverlayFrontierUnknown(_) => {
+            unreachable!("Unclassified is rejected at the preparation entry point")
+        }
         ResolutionIncompleteReason::Cancelled => {
             panic!("operation-local cancellation is not persistable completion evidence")
         }
@@ -3532,5 +3652,149 @@ mod tests {
             candidates.contains("target_marker"),
             "transcriber names remain target candidates: {candidates:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod span_index_regressions {
+    use super::*;
+    use crate::analyzer::resolution::{BindingFragmentId, test_shared_names};
+    use brokk_bifrost_test_macros::hardwon;
+
+    fn thread_ticks() -> u64 {
+        // Linux operator measurements report these at `getconf CLK_TCK` ticks/s.
+        // Other platforms still run the regression using elapsed durations.
+        std::fs::read_to_string("/proc/thread-self/stat")
+            .ok()
+            .and_then(|stat| stat.rsplit_once(')').map(|(_, fields)| fields.to_owned()))
+            .map(|fields| {
+                fields
+                    .split_whitespace()
+                    .skip(11)
+                    .take(2)
+                    .filter_map(|field| field.parse::<u64>().ok())
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
+    fn measure(
+        source: &str,
+    ) -> (
+        PreparedResolutionBundleRows,
+        std::time::Duration,
+        std::time::Duration,
+    ) {
+        let _support =
+            crate::analyzer::store::language_support::neutral_fixture::neutral_rules_fixture(&[
+                Language::Rust,
+            ]);
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let file =
+            crate::analyzer::ProjectFile::new(std::env::temp_dir().join("12997-blob"), "lib.rs");
+        let parsed = brokk_bifrost_rust::declarations::parse_rust_file_with(
+            &brokk_bifrost_rust::crate_naming::RustCrateNamingCaches::new(
+                &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing(),
+            ),
+            &file,
+            source,
+            &tree,
+        );
+        let cpu_start = thread_ticks();
+        let start = std::time::Instant::now();
+        let lowered = crate::analyzer::resolution::lower_resolution_facts_for_selection(
+            BindingFragmentId::for_test(b"12997"),
+            test_shared_names(),
+            Language::Rust,
+            &parsed.resolution_facts,
+        );
+        let lowering = start.elapsed();
+        let lowering_cpu = thread_ticks() - cpu_start;
+        let cancellation = CancellationToken::new();
+        let keys = ResolutionLocalKeys::new(&lowered, &cancellation).unwrap();
+        let unit_keys = lowered
+            .common()
+            .definition_unit_crosswalks
+            .iter()
+            .enumerate()
+            .map(|(index, fact)| (fact.unit.clone(), i64::try_from(index).unwrap()))
+            .collect();
+        let mut rows = PreparedResolutionBundleRows::default();
+        let cpu_start = thread_ticks();
+        let start = std::time::Instant::now();
+        assert!(prepare_common_rows(
+            &lowered,
+            &keys,
+            Some(&unit_keys),
+            parsed.source_facts.as_ref(),
+            Some(source),
+            &mut rows,
+            &cancellation
+        ));
+        let prepare = start.elapsed();
+        let prepare_cpu = thread_ticks() - cpu_start;
+        eprintln!("lowering_cpu_ticks={lowering_cpu} common_prepare_cpu_ticks={prepare_cpu}");
+        eprintln!(
+            "bytes={} gaps={} routes={} segments={} structural_nodes={} candidates={} lowering={lowering:?} common_prepare={prepare:?}",
+            source.len(),
+            parsed.resolution_facts.gaps.len(),
+            parsed.resolution_facts.root_references.len(),
+            parsed.resolution_facts.root_reference_segments.len(),
+            parsed
+                .source_facts
+                .as_ref()
+                .unwrap()
+                .structural
+                .nodes()
+                .len(),
+            rows.rust_reverse_gap_candidates.len()
+        );
+        (rows, lowering, prepare)
+    }
+
+    #[test]
+    #[ignore = "operator single-blob differential; BIFROST_SPAN_SOURCE and BIFROST_SPAN_DUMP select input and output"]
+    fn span_index_blob_row_dump() {
+        let source =
+            std::fs::read_to_string(std::env::var("BIFROST_SPAN_SOURCE").unwrap()).unwrap();
+        let (rows, _, _) = measure(&source);
+        std::fs::write(
+            std::env::var("BIFROST_SPAN_DUMP").unwrap(),
+            format!("{rows:#?}"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    #[hardwon("#12997: per-gap route and structural scans made one large Rust blob quadratic")]
+    fn span_index_file_scaling() {
+        let mut previous = None;
+        for count in [256, 512, 1024] {
+            let source = (0..count)
+                .map(|i| {
+                    format!("fn f{i}() {{ callbacks[0]().inspect(); module::Thing::call(); }}\n")
+                })
+                .collect::<String>();
+            // The minimum rejects scheduler pauses and cold-start noise. Keep
+            // every input uncapped so quadratic work still fails this guard.
+            let cost = (0..5)
+                .map(|_| {
+                    let (_, lowering, prepare) = measure(&source);
+                    lowering + prepare
+                })
+                .min()
+                .unwrap();
+            if let Some(previous) = previous {
+                assert!(
+                    cost < previous * 3,
+                    "doubling source should stay near linear: {previous:?} -> {cost:?}"
+                );
+            }
+            previous = Some(cost);
+        }
     }
 }

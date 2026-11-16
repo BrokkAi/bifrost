@@ -12,6 +12,10 @@ use std::{
 
 const SCHEMA: &str = "1.0";
 
+fn omission_causes_empty(causes: &[SemanticRelationOmissionCause]) -> bool {
+    causes.is_empty()
+}
+
 /// Maximum number of semantic-gap reasons retained in one boundary summary.
 ///
 /// This is deliberately a fixed contract limit rather than a caller budget:
@@ -619,6 +623,12 @@ pub enum SemanticRelationBoundaryKind {
     NonExitingRegion,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticRelationOmissionCause {
+    UntransportedReturnMember,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SemanticRelationBoundary {
@@ -627,6 +637,9 @@ pub struct SemanticRelationBoundary {
     pub relations: Box<[SemanticRelationKind]>,
     pub message: Box<str>,
     pub evidence: Box<[SemanticEvidence]>,
+    /// Known causes for relations omitted from this boundary's relation set.
+    #[serde(default, skip_serializing_if = "omission_causes_empty")]
+    pub omission_causes: Box<[SemanticRelationOmissionCause]>,
     /// Source-backed explanations are meaningful only for a missing-semantic
     /// frontier. Other boundary kinds leave this optional field absent.
     ///
@@ -799,6 +812,12 @@ impl SemanticRelationSnapshot {
         edges.sort_by(|a, b| {
             (a.kind, &a.subtype, a.source, a.target).cmp(&(b.kind, &b.subtype, b.source, b.target))
         });
+        for boundary in &mut boundaries {
+            let mut causes = std::mem::take(&mut boundary.omission_causes).into_vec();
+            causes.sort_unstable();
+            causes.dedup();
+            boundary.omission_causes = causes.into_boxed_slice();
+        }
         boundaries.sort_by_key(|b| (b.kind, b.at));
         let zero = StableDigest::parse("0".repeat(64)).expect("valid digest");
         let mut snapshot = Self {

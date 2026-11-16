@@ -180,7 +180,133 @@ The conditional initializer has two bounded candidates. The row remains `ambiguo
 
 <!-- code-query-case:call-input:expected -->
 ```json
-{"diagnostics":[{"code":"call_relation_candidates_omitted","impact":"incomplete","language":"typescript","message":"omitted 1 unresolved call candidate for consume"}],"results":[{"analysis_kind":"points_to","input_kind":"new_expression","language":"typescript","outcome":"ambiguous","path":"receiver.ts","provenance":[{"seed":{"end_line":15,"kind":"function","path":"receiver.ts","result_type":"structural_match","start_line":13},"steps":[{"op":"enclosing_decl","result":{"end_line":15,"fq_name":"consume","kind":"function","path":"receiver.ts","result_type":"declaration","start_line":13}},{"op":"call_sites_to","result":{"callee_fq_name":"consume","caller_fq_name":"caller","path":"receiver.ts","proof":"proven","range":{"end_column":25,"end_line":27,"start_column":3,"start_line":27},"result_type":"call_site"}},{"op":"call_input","result":{"input_kind":"parameter","parameter_index":0,"parameter_name":"value","path":"receiver.ts","range":{"end_column":24,"end_line":27,"start_column":11,"start_line":27},"result_type":"expression_site"}},{"op":"points_to","result":{"analysis_kind":"points_to","outcome":"ambiguous","path":"receiver.ts","range":{"end_column":24,"end_line":27,"start_column":11,"start_line":27},"result_type":"receiver_analysis"}}]}],"range":{"end_column":24,"end_line":27,"start_column":11,"start_line":27},"result_type":"receiver_analysis","site_ast_id":"<public-id>","site_id":"<public-id>","text":"new Service()","values":[{"allocation_site":{"path":"receiver.ts","range":{"end_column":24,"end_line":27,"start_column":11,"start_line":27}},"receiver_value_kind":"allocation_site","type_declaration":{"end_line":3,"fq_name":"Service","kind":"class","language":"typescript","path":"receiver.ts","signature":"class Service {","start_line":1}}]}],"truncated":false}
+{
+  "diagnostics": [
+    {
+      "code": "call_relation_candidates_omitted",
+      "impact": "incomplete",
+      "language": "typescript",
+      "message": "omitted 1 unresolved call candidate for consume",
+      "incompleteness": {
+        "operational": "provider"
+      }
+    }
+  ],
+  "results": [
+    {
+      "analysis_kind": "points_to",
+      "input_kind": "new_expression",
+      "language": "typescript",
+      "outcome": "ambiguous",
+      "path": "receiver.ts",
+      "provenance": [
+        {
+          "seed": {
+            "end_line": 15,
+            "kind": "function",
+            "path": "receiver.ts",
+            "result_type": "structural_match",
+            "start_line": 13
+          },
+          "steps": [
+            {
+              "op": "enclosing_decl",
+              "result": {
+                "end_line": 15,
+                "fq_name": "consume",
+                "kind": "function",
+                "path": "receiver.ts",
+                "result_type": "declaration",
+                "start_line": 13
+              }
+            },
+            {
+              "op": "call_sites_to",
+              "result": {
+                "callee_fq_name": "consume",
+                "caller_fq_name": "caller",
+                "path": "receiver.ts",
+                "proof": "proven",
+                "range": {
+                  "end_column": 25,
+                  "end_line": 27,
+                  "start_column": 3,
+                  "start_line": 27
+                },
+                "result_type": "call_site"
+              }
+            },
+            {
+              "op": "call_input",
+              "result": {
+                "input_kind": "parameter",
+                "parameter_index": 0,
+                "parameter_name": "value",
+                "path": "receiver.ts",
+                "range": {
+                  "end_column": 24,
+                  "end_line": 27,
+                  "start_column": 11,
+                  "start_line": 27
+                },
+                "result_type": "expression_site"
+              }
+            },
+            {
+              "op": "points_to",
+              "result": {
+                "analysis_kind": "points_to",
+                "outcome": "ambiguous",
+                "path": "receiver.ts",
+                "range": {
+                  "end_column": 24,
+                  "end_line": 27,
+                  "start_column": 11,
+                  "start_line": 27
+                },
+                "result_type": "receiver_analysis"
+              }
+            }
+          ]
+        }
+      ],
+      "range": {
+        "end_column": 24,
+        "end_line": 27,
+        "start_column": 11,
+        "start_line": 27
+      },
+      "result_type": "receiver_analysis",
+      "site_ast_id": "<public-id>",
+      "site_id": "<public-id>",
+      "text": "new Service()",
+      "values": [
+        {
+          "allocation_site": {
+            "path": "receiver.ts",
+            "range": {
+              "end_column": 24,
+              "end_line": 27,
+              "start_column": 11,
+              "start_line": 27
+            }
+          },
+          "receiver_value_kind": "allocation_site",
+          "type_declaration": {
+            "end_line": 3,
+            "fq_name": "Service",
+            "kind": "class",
+            "language": "typescript",
+            "path": "receiver.ts",
+            "signature": "class Service {",
+            "start_line": 1
+          }
+        }
+      ]
+    }
+  ],
+  "truncated": false
+}
 ```
 
 ## Typed Receiver Rows
@@ -206,7 +332,7 @@ The nested report above is the compatibility projection. Policy evaluation and r
 
 <!-- code-query-case:receiver-outcome-row:expected -->
 ```json
-{"results":[{"analysis_kind":"points_to","candidate_count":1,"candidates_truncated":false,"coverage":"exhaustive","id":"<public-id>","language":"typescript","outcome":"precise","path":"receiver.ts","provenance":[{"seed":{"end_line":19,"kind":"call","path":"receiver.ts","result_type":"structural_match","start_line":19},"steps":[{"op":"points_to","result":{"analysis_kind":"points_to","capture":"receiver","outcome":"precise","path":"receiver.ts","range":{"end_column":9,"end_line":19,"start_column":3,"start_line":19},"result_type":"receiver_analysis"}},{"op":"receiver_outcome","result":{"coverage":"exhaustive","id":"<public-id>","outcome":"precise","path":"receiver.ts","range":{"end_column":9,"end_line":19,"start_column":3,"start_line":19},"result_type":"receiver_outcome","site_id":"<public-id>"}}]}],"range":{"end_column":9,"end_line":19,"start_column":3,"start_line":19},"result_type":"receiver_outcome","scope_nodes":1953,"setup_nodes":94,"site_ast_id":"<public-id>","site_id":"<public-id>","summary_expansions":15}],"truncated":false}
+{"results":[{"analysis_kind":"points_to","candidate_count":1,"candidates_truncated":false,"coverage":"exhaustive","id":"<public-id>","language":"typescript","outcome":"precise","path":"receiver.ts","provenance":[{"seed":{"end_line":19,"kind":"call","path":"receiver.ts","result_type":"structural_match","start_line":19},"steps":[{"op":"points_to","result":{"analysis_kind":"points_to","capture":"receiver","outcome":"precise","path":"receiver.ts","range":{"end_column":9,"end_line":19,"start_column":3,"start_line":19},"result_type":"receiver_analysis"}},{"op":"receiver_outcome","result":{"coverage":"exhaustive","id":"<public-id>","outcome":"precise","path":"receiver.ts","range":{"end_column":9,"end_line":19,"start_column":3,"start_line":19},"result_type":"receiver_outcome","site_id":"<public-id>"}}]}],"range":{"end_column":9,"end_line":19,"start_column":3,"start_line":19},"result_type":"receiver_outcome","scope_nodes":1960,"setup_nodes":94,"site_ast_id":"<public-id>","site_id":"<public-id>","summary_expansions":15}],"truncated":false}
 ```
 
 A factory receiver's evidence is a parent-linked chain: the `factory_return` row is hop zero, and the value it returned links back through `parent_evidence_id`.

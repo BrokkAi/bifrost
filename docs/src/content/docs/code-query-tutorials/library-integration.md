@@ -350,7 +350,8 @@ three `commit` calls, and it says so twice: `truncated` is `true`, and a
       "code": "result_limit_reached",
       "impact": "incomplete",
       "language": "workspace",
-      "message": "query_code reached the query limit of 2 and returned the first 2 results; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern"
+      "message": "query_code reached the query limit of 2 and returned the first 2 results; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern",
+      "incompleteness": "configured_cap"
     }
   ],
   "results": [

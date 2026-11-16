@@ -9,7 +9,9 @@
 //! Seed-query pruning is literal-anchor based: every exact `name` predicate (and
 //! every `kwargs` keyword) reachable through conjunctive positive pattern
 //! positions matches a span of the file's own source text, so a file whose
-//! source does not contain one of those strings cannot match. Anchors are
+//! source does not contain one of those strings cannot match. A name that a
+//! call spelling derives from a different token (`attr=`, `[]`; see
+//! `CalleeSpelling`) also admits that token. Anchors are
 //! checked against the analyzer's retained in-memory source before any parse
 //! happens. This subsumes declaration-index pruning: a declared name is a
 //! source span like any other.
@@ -20,6 +22,7 @@ use crate::structural::index_query::{
     SourceAnchorGroup, StructuralAccessRequirements, StructuralPostingTerm,
     supports_exact_role_name_posting,
 };
+use brokk_bifrost_core::analyzer::structural::callable::CalleeSpelling;
 use brokk_bifrost_rql::{CodeQuerySeed, Pattern, StringPredicate};
 
 /// Language-independent execution plan derived from a parsed query.
@@ -180,11 +183,20 @@ fn collect_positive_source_anchors(
 /// as the matcher). Only conjunctive positive positions contribute; `not_has`
 /// is skipped.
 fn collect_pattern_anchors(pattern: &Pattern, out: &mut Vec<SourceAnchorGroup>) {
-    if let Some(alternatives) = pattern
+    if let Some(mut alternatives) = pattern
         .name
         .as_ref()
         .and_then(StringPredicate::exact_alternatives)
     {
+        // A spelled callee (`attr=`, `[]`) is written as a different token.
+        let recorded = alternatives
+            .iter()
+            .filter_map(|name| CalleeSpelling::recorded_token_of(name))
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        alternatives.extend(recorded);
+        alternatives.sort_unstable();
+        alternatives.dedup();
         out.push(SourceAnchorGroup::new(alternatives));
     }
     for &role in Role::single_target_roles() {

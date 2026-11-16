@@ -51,9 +51,7 @@ pub(crate) fn is_nuget_evidence_input(path: &Path) -> bool {
     name.eq_ignore_ascii_case("packages.lock.json")
         || name.eq_ignore_ascii_case("project.assets.json")
         || name.eq_ignore_ascii_case("Directory.Packages.props")
-        || path
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("csproj"))
+        || super::compilation::is_csharp_project_file(path)
 }
 
 /// The #2448 build-project identity a NuGet row names in `declared_by`.
@@ -167,7 +165,7 @@ pub(crate) fn csharp_selected_dependency_file_evidence(
     }
     let projects = inputs
         .iter()
-        .filter(|input| has_extension(input.path, "csproj"))
+        .filter(|input| super::compilation::is_csharp_project_file(input.path))
         .map(|input| input.path)
         .collect::<Vec<_>>();
     // Capture retains an absent Directory.Packages.props as empty bytes.
@@ -207,7 +205,7 @@ pub(crate) fn csharp_selected_dependency_file_evidence(
         }
     }
     for input in &inputs {
-        let result = if has_extension(input.path, "csproj") {
+        let result = if super::compilation::is_csharp_project_file(input.path) {
             project_rows(input, &central, &configuration_by_path, &mut evidence)
         } else if is_named(input.path, "packages.lock.json") {
             lock_rows(input, &projects, &mut evidence)
@@ -236,11 +234,6 @@ pub(crate) fn csharp_selected_dependency_file_evidence(
         }
     }
     evidence
-}
-
-fn has_extension(path: &Path, expected: &str) -> bool {
-    path.extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case(expected))
 }
 
 fn is_named(path: &Path, expected: &str) -> bool {

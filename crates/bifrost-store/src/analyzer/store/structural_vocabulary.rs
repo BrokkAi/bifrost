@@ -112,8 +112,14 @@ use brokk_bifrost_core::analyzer::structural::facts::IntegerLiteralValue;
 /// Version 52 stores a C# object-initializer label as a field access whose
 /// object is the creation expression (#8305).
 /// Version 53 stores per-owner coverage for certified structural list roles (#9613).
+/// Version 54 marks Rust logging macro shapes as non-exact identity candidates (#10972).
+/// Version 55 stores the call-site callee spelling as trailing structural
+/// node-array position 26 and publishes Ruby attribute-writer calls and
+/// element references as call facts with their operands (#11369).
+/// Version 56 removes canonical Rust binding preparation cutoffs (#11906).
+/// Version 57 distinguishes terminal Rust callee-path occurrences (#11988).
 #[doc(hidden)]
-pub const STRUCTURAL_FACTS_VERSION: i64 = 53;
+pub const STRUCTURAL_FACTS_VERSION: i64 = 57;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[doc(hidden)]
@@ -155,6 +161,8 @@ pub struct PersistedCallSite {
     pub call_kind: Option<u8>,
     pub coverage: u8,
     pub continues_callee_groups: bool,
+    /// `CalleeSpelling::code()`, decoded in `from_persisted_rows`.
+    pub callee_spelling: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

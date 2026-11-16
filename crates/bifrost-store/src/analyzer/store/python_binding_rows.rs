@@ -71,11 +71,13 @@ pub(crate) struct PythonBindingRows {
     pub(crate) imports: Vec<PythonNativeImportFact>,
     pub(crate) import_positions: Vec<(u32, u32, usize)>,
     pub(crate) loop_regions: Vec<(u32, std::ops::Range<usize>)>,
+    module_statements: Vec<(usize, usize)>,
+    pub(crate) builtin_type_unshadowed: bool,
 }
 
 impl super::cache_budget::RetainedBytes for PythonBindingRows {
     fn retained_bytes(&self) -> usize {
-        let mut heap = super::cache_budget::RetainedHeap::default();
+        let mut heap = super::cache_budget::RetainedHeap::allocated();
         heap.add(std::mem::size_of::<Self>());
         heap.vec(&self.scopes);
         heap.vec(&self.slots);
@@ -88,11 +90,12 @@ impl super::cache_budget::RetainedBytes for PythonBindingRows {
         heap.vec(&self.imports);
         heap.vec(&self.import_positions);
         heap.vec(&self.loop_regions);
+        heap.vec(&self.module_statements);
         for slot in &self.slots {
-            heap.add(slot.name.capacity());
+            heap.add(heap.allocation_bytes(slot.name.capacity()));
         }
         for directive in &self.directives {
-            heap.add(directive.name.capacity());
+            heap.add(heap.allocation_bytes(directive.name.capacity()));
         }
         heap.total()
     }
@@ -803,7 +806,72 @@ impl AnalyzerStore {
     }
 }
 
+/// The source site of `<reference>` when the declaration at `authored` is the
+/// only writer of its name and is the unconditional, direct assignment
+/// `name = <reference>`. One statement; no rows are loaded or retained.
+pub(crate) fn assignment_alias_source_site(
+    conn: &Connection,
+    blob: i64,
+    authored: u32,
+) -> Result<Option<u32>> {
+    let assign = EVENT_KINDS
+        .iter()
+        .position(|kind| *kind == ResolutionBindingEventKind::Assign)
+        .expect("assignment is an event kind") as i64;
+    Ok(conn
+        .prepare_cached(
+            "SELECT event.source_reference FROM resolution_binding_events event
+             WHERE event.blob_id=?1 AND event.authored=?2 AND event.kind=?3
+               AND event.source_reference IS NOT NULL
+               AND NOT EXISTS(SELECT 1 FROM resolution_root_imports imported
+                              JOIN resolution_binding_slots slot ON slot.blob_id=event.blob_id AND slot.slot=event.slot
+                              WHERE imported.blob_id=event.blob_id AND imported.kind='glob'
+                                AND imported.root_scope=slot.scope)
+               AND NOT EXISTS(SELECT 1 FROM python_member_annotations annotation
+                              WHERE annotation.blob_id=event.blob_id
+                                AND annotation.owner IN (event.slot,event.target,event.authored))
+               AND (SELECT COUNT(*) FROM resolution_binding_events writer
+                     WHERE writer.blob_id=event.blob_id AND writer.slot=event.slot)=1
+               AND NOT EXISTS(SELECT 1 FROM python_binding_site_guards guard
+                               WHERE guard.blob_id=event.blob_id AND guard.site=event.target)",
+        )?
+        .query_row(rusqlite::params![blob, authored, assign], |row| {
+            row.get::<_, u32>(0)
+        })
+        .optional()?)
+}
+
 impl PythonBindingRows {
+    pub(crate) fn module_statement_start(&self, point: usize) -> Option<usize> {
+        let index = self
+            .module_statements
+            .partition_point(|(start, _)| *start <= point);
+        index.checked_sub(1).and_then(|index| {
+            let (start, end) = self.module_statements[index];
+            (point < end).then_some(start)
+        })
+    }
+
+    pub(crate) fn executes_at_import_time(&self, scope: u32) -> bool {
+        find_scope_in_chain(
+            Some(ResolutionScopeId::new(scope)),
+            |id| {
+                self.scopes
+                    .iter()
+                    .find(|row| row.scope == id.get())
+                    .expect("retained scope")
+                    .parent
+                    .map(ResolutionScopeId::new)
+            },
+            |id| {
+                self.scopes
+                    .iter()
+                    .find(|row| row.scope == id.get())
+                    .is_some_and(|row| row.parent.is_none() || !row.class_body)
+            },
+        )
+        .is_some_and(|id| id.get() == 0)
+    }
     pub(crate) fn load(
         conn: &Connection,
         cache: &super::cache_budget::StoreCacheBudget,
@@ -1037,6 +1105,47 @@ impl PythonBindingRows {
         if cancellation.is_cancelled() {
             return Ok(None);
         }
+        // Content-local structural inputs share the binding-row cache identity and budget.
+        {
+            use brokk_bifrost_core::analyzer::structural::kinds::NormalizedKind;
+            let mut statement = conn.prepare_cached(
+                "SELECT node.value->>0,node.value->>3,node.value->>4,node.value->>7
+                 FROM source_structural_facts facts CROSS JOIN json_each(facts.nodes) node
+                 WHERE facts.blob_id=?1",
+            )?;
+            let nodes = statement.query_map([blob], |row| {
+                Ok((
+                    row.get::<_, u8>(0)?,
+                    row.get::<_, usize>(1)?,
+                    row.get::<_, usize>(2)?,
+                    row.get::<_, Option<usize>>(3)?,
+                ))
+            })?;
+            let mut kinds = Vec::new();
+            for node in nodes {
+                if cancellation.is_cancelled() {
+                    return Ok(None);
+                }
+                let (kind, start, end, parent) = node?;
+                if parent.is_some_and(|parent| kinds[parent] == NormalizedKind::Module as u8) {
+                    result.module_statements.push((start, end));
+                }
+                kinds.push(kind);
+            }
+            result.module_statements.sort_unstable();
+        }
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        result.builtin_type_unshadowed = !result.slots.iter().any(|slot| slot.name == "type")
+            && !conn
+                .prepare_cached(
+                    "SELECT EXISTS(SELECT 1 FROM resolution_gaps WHERE blob_id=?1 AND covers=5)",
+                )?
+                .query_row([blob], |row| row.get::<_, bool>(0))?;
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
         Ok(Some(result))
     }
 }
@@ -1063,54 +1172,167 @@ impl super::python_unit_summaries::PythonEnvironmentPublication {
         use std::fmt::Write;
         let mut snapshot = self.snapshot.clone();
         snapshot.revision = revision;
+        // Selection and translation share the connection lock for the whole read.
+        let connection = self
+            .store
+            .conn
+            .lock()
+            .expect("local publication connection");
+        self.store.select_writer_workspace_snapshots(
+            &connection,
+            &crate::hash::HashMap::from_iter([("python".to_owned(), snapshot.clone())]),
+        )?;
         let profile = self.profile.clone();
         let cache = self.store.cache_budget.clone();
-        self.store.conn.execute(move |conn| {
-            let summary = crate::analyzer::store::python_unit_summaries::selected_binding_summary(conn,&snapshot,&profile)?
-                .expect("reconciled selected Python environment");
+        {
+            let conn = &*connection;
+            let summary = crate::analyzer::store::python_unit_summaries::selected_binding_summary(
+                conn, &snapshot, &profile,
+            )?
+            .expect("reconciled selected Python environment");
             let mut statement = conn.prepare_cached(
-                "SELECT rel_path,blob_id FROM resolution_unit_summary_members
-                 WHERE summary_id=?1 ORDER BY rel_path")?;
-            let selected = statement.query_map([summary],
-                |row|Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)?)))?
+                "SELECT member.rel_path,selected.blob_id
+                 FROM resolution_unit_summary_members AS member
+                 JOIN temp.selected_unit_member_blobs AS selected
+                   ON selected.summary_id=member.summary_id
+                  AND selected.member_ordinal=member.member_ordinal
+                 WHERE member.summary_id=?1 ORDER BY member.rel_path",
+            )?;
+            let selected = statement
+                .query_map([summary], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             let mut output = String::new();
-            for (path,blob) in selected {
+            for (path, blob) in selected {
                 let rows = crate::analyzer::store::python_binding_rows::PythonBindingRows::load(
-                    conn,&cache,blob,None,&CancellationToken::default())?.expect("native temporal source format");
-                writeln!(output,"{path}").expect("string output");
-                for row in &rows.scopes { writeln!(output,"scope {} parent={:?}",row.scope,row.parent).unwrap(); }
-                for row in &rows.slots { writeln!(output,"slot {} scope={} name={} whole={}",row.slot,row.scope,row.name,row.whole_scope).unwrap(); }
-                for row in &rows.events { writeln!(output,"event {} slot={} target={} kind={:?} authored={:?} value={:?} execution={} entry={} commit={}:{}",row.event,row.slot,row.target,row.kind,row.authored,row.value_slot,row.execution_scope,row.entry_byte,row.commit_byte,row.phase).unwrap(); }
-                for row in &rows.observations { writeln!(output,"observe {} scope={} point={} {:?}",row.reference.get(),row.execution_scope.get(),row.point_byte,row.kind).unwrap(); }
-                for row in &rows.directives { writeln!(output,"directive {} {:?} target={:?}",row.fact.reference.get(),row.fact.kind,row.fact.target).unwrap(); }
-                for row in &rows.guards { writeln!(output,"guard {} parent={:?} site={} scope={} {:?} arm={} predicate={:?}",row.id,row.parent,row.site.get(),row.execution_scope.get(),row.kind,row.arm_ordinal,row.predicate).unwrap(); }
-                for row in &rows.site_guards { writeln!(output,"guarded {} guard={}",row.site.get(),row.guard).unwrap(); }
-                for row in &rows.predicates { writeln!(output,"predicate {} {:?} operand={:?}",row.predicate.get(),row.kind,row.operand).unwrap(); }
-                for row in &rows.imports { writeln!(output,"import {} {:?} level={} segments={} event={:?}",row.import_site.get(),row.form,row.relative_level,row.module_segment_count,row.binding_event).unwrap(); }
-                if let Some(slot) = rows.slots.iter().find(|slot| rows.scopes.iter()
-                    .any(|scope|scope.scope == slot.scope && scope.parent.is_none())) {
-                    use crate::analyzer::store::resolution_operation::python_lexical;
+                    conn,
+                    &cache,
+                    blob,
+                    None,
+                    &CancellationToken::default(),
+                )?
+                .expect("native temporal source format");
+                writeln!(output, "{path}").expect("string output");
+                for row in &rows.scopes {
+                    writeln!(output, "scope {} parent={:?}", row.scope, row.parent).unwrap();
+                }
+                for row in &rows.slots {
+                    writeln!(
+                        output,
+                        "slot {} scope={} name={} whole={}",
+                        row.slot, row.scope, row.name, row.whole_scope
+                    )
+                    .unwrap();
+                }
+                for row in &rows.events {
+                    writeln!(output,"event {} slot={} target={} kind={:?} authored={:?} value={:?} execution={} entry={} commit={}:{}",row.event,row.slot,row.target,row.kind,row.authored,row.value_slot,row.execution_scope,row.entry_byte,row.commit_byte,row.phase).unwrap();
+                }
+                for row in &rows.observations {
+                    writeln!(
+                        output,
+                        "observe {} scope={} point={} {:?}",
+                        row.reference.get(),
+                        row.execution_scope.get(),
+                        row.point_byte,
+                        row.kind
+                    )
+                    .unwrap();
+                }
+                for row in &rows.directives {
+                    writeln!(
+                        output,
+                        "directive {} {:?} target={:?}",
+                        row.fact.reference.get(),
+                        row.fact.kind,
+                        row.fact.target
+                    )
+                    .unwrap();
+                }
+                for row in &rows.guards {
+                    writeln!(
+                        output,
+                        "guard {} parent={:?} site={} scope={} {:?} arm={} predicate={:?}",
+                        row.id,
+                        row.parent,
+                        row.site.get(),
+                        row.execution_scope.get(),
+                        row.kind,
+                        row.arm_ordinal,
+                        row.predicate
+                    )
+                    .unwrap();
+                }
+                for row in &rows.site_guards {
+                    writeln!(output, "guarded {} guard={}", row.site.get(), row.guard).unwrap();
+                }
+                for row in &rows.predicates {
+                    writeln!(
+                        output,
+                        "predicate {} {:?} operand={:?}",
+                        row.predicate.get(),
+                        row.kind,
+                        row.operand
+                    )
+                    .unwrap();
+                }
+                for row in &rows.imports {
+                    writeln!(
+                        output,
+                        "import {} {:?} level={} segments={} event={:?}",
+                        row.import_site.get(),
+                        row.form,
+                        row.relative_level,
+                        row.module_segment_count,
+                        row.binding_event
+                    )
+                    .unwrap();
+                }
+                if let Some(slot) = rows.slots.iter().find(|slot| {
+                    rows.scopes
+                        .iter()
+                        .any(|scope| scope.scope == slot.scope && scope.parent.is_none())
+                }) {
                     use crate::analyzer::resolution::temporal_binding::SessionBudget;
+                    use crate::analyzer::store::resolution_operation::python_lexical;
                     use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
                     let cancellation = CancellationToken::default();
                     let boundary = crate::analyzer::resolution::with_bounded_resolution_session(
-                        ReceiverAnalysisBudget::default(),&cancellation,|session| {
-                            let mode = if matches!(profile.observation,
-                                super::python_unit_summaries::PythonSummaryObservation::Typing) {
+                        ReceiverAnalysisBudget::default(),
+                        &cancellation,
+                        |session| {
+                            let mode = if matches!(
+                                profile.observation,
+                                super::python_unit_summaries::PythonSummaryObservation::Typing
+                            ) {
                                 python_lexical::PythonBindingProfile::Typing
-                            } else {python_lexical::PythonBindingProfile::Runtime};
-                            let mut state = python_lexical::module_selection(&rows,slot.scope,&slot.name,
-                                mode,python_lexical::PythonBindingProofs::default());
-                            python_lexical::select_lexical(&mut state,&rows,
-                                &mut SessionBudget{session,cancellation:&cancellation},&cancellation)?;
-                            Ok(format!("{:?}",state.selection))
-                        })?;
-                    writeln!(output,"module boundary {} {boundary:?}",slot.name).unwrap();
+                            } else {
+                                python_lexical::PythonBindingProfile::Runtime
+                            };
+                            let mut state = python_lexical::module_selection(
+                                &rows,
+                                slot.scope,
+                                &slot.name,
+                                mode,
+                                python_lexical::PythonBindingProofs::default(),
+                            );
+                            python_lexical::select_lexical(
+                                &mut state,
+                                &rows,
+                                &mut SessionBudget {
+                                    session,
+                                    cancellation: &cancellation,
+                                },
+                                &cancellation,
+                            )?;
+                            Ok(format!("{:?}", state.selection))
+                        },
+                    )?;
+                    writeln!(output, "module boundary {} {boundary:?}", slot.name).unwrap();
                 }
             }
             Ok(output)
-        })
+        }
     }
 
     /// Native lexical validation only. This entry does not enable a production
@@ -1127,6 +1349,16 @@ impl super::python_unit_summaries::PythonEnvironmentPublication {
         use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
         let mut snapshot = self.snapshot.clone();
         snapshot.revision = revision;
+        // Selection and translation share the connection lock for the whole read.
+        let connection = self
+            .store
+            .conn
+            .lock()
+            .expect("local publication connection");
+        self.store.select_writer_workspace_snapshots(
+            &connection,
+            &crate::hash::HashMap::from_iter([("python".to_owned(), snapshot.clone())]),
+        )?;
         let profile = self.profile.clone();
         let path = path.to_owned();
         let name = name.to_owned();
@@ -1135,32 +1367,82 @@ impl super::python_unit_summaries::PythonEnvironmentPublication {
             crate::analyzer::store::python_unit_summaries::PythonSummaryObservation::Typing
         );
         let cache = self.store.cache_budget.clone();
-        self.store.conn.execute(move |conn| {
-            let summary = crate::analyzer::store::python_unit_summaries::selected_binding_summary(conn,&snapshot,&profile)?
-                .expect("reconciled selected Python environment");
-            let blob = conn.prepare_cached("SELECT blob_id FROM resolution_unit_summary_members WHERE summary_id=?1 AND rel_path=?2")?.query_row(
-                rusqlite::params![summary,path],|row|row.get(0))?;
+        {
+            let conn = &*connection;
+            let summary = crate::analyzer::store::python_unit_summaries::selected_binding_summary(
+                conn, &snapshot, &profile,
+            )?
+            .expect("reconciled selected Python environment");
+            let blob = conn
+                .prepare_cached(
+                    "SELECT selected.blob_id FROM resolution_unit_summary_members AS member
+                 JOIN temp.selected_unit_member_blobs AS selected
+                   ON selected.summary_id=member.summary_id
+                  AND selected.member_ordinal=member.member_ordinal
+                 WHERE member.summary_id=?1 AND member.rel_path=?2",
+                )?
+                .query_row(rusqlite::params![summary, path], |row| row.get(0))?;
             let cancellation = CancellationToken::default();
             let rows = crate::analyzer::store::python_binding_rows::PythonBindingRows::load(
-                conn,&cache,blob,None,&cancellation)?.expect("native temporal source format");
-            let observation = rows.observations.iter().find(|row|row.point_byte == point)
+                conn,
+                &cache,
+                blob,
+                None,
+                &cancellation,
+            )?
+            .expect("native temporal source format");
+            let observation = rows
+                .observations
+                .iter()
+                .find(|row| row.point_byte == point)
                 .expect("exact retained reference position");
             crate::analyzer::resolution::with_bounded_resolution_session(
-                ReceiverAnalysisBudget::default(),&cancellation,|session| {
-                    let profile = if typing { python_lexical::PythonBindingProfile::Typing }
-                        else { python_lexical::PythonBindingProfile::Runtime };
-                    let mut state = python_lexical::lexical_selection(&rows,
-                        observation.reference.get(),&name,profile,
-                        python_lexical::PythonBindingProofs::default()).expect("lexical observation");
-                    let mut budget = SessionBudget {session,cancellation:&cancellation};
-                    python_lexical::select_lexical(&mut state,&rows,&mut budget,&cancellation)?;
-                    let definitions = state.selection.selected.iter().filter_map(|selected|
-                        rows.events.iter().find(|event|event.event == selected.occurrence))
-                        .map(|event|format!("{:?}@{}:{}",event.kind,event.entry_byte,event.commit_byte))
+                ReceiverAnalysisBudget::default(),
+                &cancellation,
+                |session| {
+                    let profile = if typing {
+                        python_lexical::PythonBindingProfile::Typing
+                    } else {
+                        python_lexical::PythonBindingProfile::Runtime
+                    };
+                    let mut state = python_lexical::lexical_selection(
+                        &rows,
+                        observation.reference.get(),
+                        &name,
+                        profile,
+                        python_lexical::PythonBindingProofs::default(),
+                    )
+                    .expect("lexical observation");
+                    let mut budget = SessionBudget {
+                        session,
+                        cancellation: &cancellation,
+                    };
+                    python_lexical::select_lexical(&mut state, &rows, &mut budget, &cancellation)?;
+                    let definitions = state
+                        .selection
+                        .selected
+                        .iter()
+                        .filter_map(|selected| {
+                            rows.events
+                                .iter()
+                                .find(|event| event.event == selected.occurrence)
+                        })
+                        .map(|event| {
+                            format!(
+                                "{:?}@{}:{}",
+                                event.kind, event.entry_byte, event.commit_byte
+                            )
+                        })
                         .collect::<Vec<_>>();
-                    Ok(format!("definitions={definitions:?} rank={:?} {:?}",python_lexical::TemporalRank(0),state.selection))
-                }).map(|result|format!("{result:?}"))
-        })
+                    Ok(format!(
+                        "definitions={definitions:?} rank={:?} {:?}",
+                        python_lexical::TemporalRank(0),
+                        state.selection
+                    ))
+                },
+            )
+            .map(|result| format!("{result:?}"))
+        }
     }
 }
 
@@ -1168,6 +1450,50 @@ impl super::python_unit_summaries::PythonEnvironmentPublication {
 mod cache_tests {
     use super::super::cache_budget::{RetainedBytes, StoreCacheBudget};
     use super::*;
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11183: publication writer lacked summary translation views"
+    )]
+    fn publication_connection_installs_summary_translation_views() {
+        use super::super::python_unit_summaries::{
+            PythonEnvironmentPublication, PythonSummaryAuthority, PythonSummaryObservation,
+            PythonSummaryProfile,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("publication.db");
+        for _ in 0..2 {
+            let publication = PythonEnvironmentPublication::open(
+                &database,
+                directory.path(),
+                "translation-test",
+                PythonSummaryProfile {
+                    authority: PythonSummaryAuthority::Workspace,
+                    observation: PythonSummaryObservation::Runtime,
+                    roots: Vec::new(),
+                    ordered: false,
+                    target_digest: [0; 32],
+                    python_version: None,
+                },
+            )
+            .unwrap();
+            publication
+                .store
+                .conn
+                .execute(|connection| -> Result<()> {
+                    for view in ["selected_unit_member_blobs", "surface_dense"] {
+                        let count: i64 = connection.query_row(
+                            &format!("SELECT count(*) FROM temp.{view}"),
+                            [],
+                            |row| row.get(0),
+                        )?;
+                        assert_eq!(count, 0);
+                    }
+                    Ok(())
+                })
+                .unwrap();
+        }
+    }
 
     #[test]
     fn format_seven_source_rows_are_missing_and_rederived_on_reopen() {
@@ -1286,7 +1612,7 @@ mod cache_tests {
 
     #[test]
     fn binding_cache_reads_current_identity_and_only_retains_complete_loads() {
-        let store = AnalyzerStore::open_in_memory_single_connection().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let cache = store.cache_budget.clone();
         store
             .conn
@@ -1368,10 +1694,23 @@ mod cache_tests {
                     "the row read reached the cancellation checkpoint"
                 );
                 assert_eq!(cache.weighted_bytes(), 0);
+                use brokk_bifrost_core::analyzer::structural::kinds::NormalizedKind;
+                let structural = serde_json::json!([
+                    [NormalizedKind::Module as u8,null,null,0,100,null,null,null,4],
+                    [NormalizedKind::Function as u8,null,null,10,40,null,null,0,3],
+                    [NormalizedKind::Call as u8,null,null,20,30,null,null,1,3],
+                    [NormalizedKind::Class as u8,null,null,50,80,null,null,0,4]
+                ]);
+                conn.execute("INSERT INTO blob_meta(blob_id,lang,contains_tests,content_package,stored_unit_count,range_count,signature_count,signature_metadata_count,supertype_count,child_count,import_statement_count,type_identifier_count,is_complete) VALUES(?1,'python',0,'',0,0,0,0,0,0,0,0,1)",[blob])?;
+                conn.execute("INSERT INTO source_fact_manifests(blob_id,facts_version,source_bytes,occurrence_count,declaration_count,declaration_unit_count,node_count,role_count,occurrence_role_count,logical_rows,payload_bytes,publication_state) VALUES(?1,1,100,0,0,0,4,0,0,5,0,'building')",[blob])?;
+                conn.execute("INSERT INTO source_structural_facts(blob_id,nodes,roles,occurrence_roles,role_coverage) VALUES(?1,jsonb(?2),jsonb('[]'),jsonb('[]'),jsonb('[]'))",params![blob,structural.to_string()])?;
                 let cancellation = CancellationToken::default();
                 let first =
                     PythonBindingRows::load(conn, &cache, blob, None, &cancellation)?.unwrap();
                 assert_eq!(first.scopes[0].scope, 0);
+                assert_eq!(first.module_statement_start(22), Some(10));
+                assert_eq!(first.module_statement_start(60), Some(50));
+                assert_eq!(first.module_statement_start(45), None);
                 assert!(cache.weighted_bytes() > first.retained_bytes() as u64);
                 let again =
                     PythonBindingRows::load(conn, &cache, blob, None, &cancellation)?.unwrap();
@@ -1414,7 +1753,7 @@ mod cache_tests {
                     PythonBindingRows::load(conn, &cache, blob, None, &cancellation)?.unwrap();
                 assert_eq!(replacement.scopes[0].scope, 7);
                 assert!(!std::ptr::eq(&*first, &*replacement));
-                let tiny = StoreCacheBudget::new(&brokk_bifrost_core::retention_budget::RetentionBudget::new(1));
+                let tiny = StoreCacheBudget::new(&brokk_bifrost_core::retention_budget::RetentionBudget::for_test_capacity(1));
                 let uncached =
                     PythonBindingRows::load(conn, &tiny, blob, None, &cancellation)?.unwrap();
                 let reread =

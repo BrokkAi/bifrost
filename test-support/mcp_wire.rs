@@ -1,38 +1,61 @@
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Cursor, Read, Write};
 use std::process::{Child, ChildStderr};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 /// The server's stderr, drained on its own thread from the moment the server
 /// starts. A pipe holds about 64 KiB; a server that logs more than that (for
 /// example every span under `BIFROST_TIMING=1`) blocks on its next write, and
 /// a client that only reads stdout then waits forever for a reply the server
-/// can no longer produce. The drained bytes are kept for the failure message.
+/// can no longer produce. The drained bytes are kept for the failure message,
+/// and [`DrainedStderr::text_so_far`] shows them while the server still runs.
 pub struct DrainedStderr {
-    drain: Option<JoinHandle<Vec<u8>>>,
+    drain: Option<JoinHandle<()>>,
+    drained: Arc<Mutex<Vec<u8>>>,
     captured: Cursor<Vec<u8>>,
 }
 
 impl DrainedStderr {
     pub fn spawn(mut stderr: ChildStderr) -> Self {
+        let drained = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&drained);
         let drain = std::thread::spawn(move || {
-            let mut captured = Vec::new();
-            stderr
-                .read_to_end(&mut captured)
-                .expect("read the server's stderr");
-            captured
+            let mut chunk = [0u8; 8192];
+            loop {
+                let read = stderr.read(&mut chunk).expect("read the server's stderr");
+                if read == 0 {
+                    return;
+                }
+                sink.lock()
+                    .expect("stderr capture lock poisoned")
+                    .extend_from_slice(&chunk[..read]);
+            }
         });
         Self {
             drain: Some(drain),
+            drained,
             captured: Cursor::new(Vec::new()),
         }
+    }
+
+    /// Everything the server has written to stderr so far.
+    pub fn text_so_far(&self) -> String {
+        String::from_utf8_lossy(&self.drained.lock().expect("stderr capture lock poisoned"))
+            .into_owned()
     }
 }
 
 impl Read for DrainedStderr {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         if let Some(drain) = self.drain.take() {
-            self.captured = Cursor::new(drain.join().expect("the stderr drain thread panicked"));
+            drain.join().expect("the stderr drain thread panicked");
+            self.captured = Cursor::new(
+                self.drained
+                    .lock()
+                    .expect("stderr capture lock poisoned")
+                    .clone(),
+            );
         }
         self.captured.read(buffer)
     }

@@ -99,6 +99,33 @@ pub struct CAssignmentCandidates {
     pub reason: Option<&'static str>,
 }
 
+/// The reuse verdict of a candidate fact that stopped for `reason`: execution
+/// dependent when the reason names an execution cause, content otherwise.
+pub(crate) fn candidate_reason_reuse_verdict(
+    reason: Option<&'static str>,
+) -> brokk_bifrost_analysis::analyzer::reuse_verdict::ReuseVerdict {
+    use brokk_bifrost_analysis::analyzer::reuse_verdict::{ExecutionCause, ReuseVerdict};
+    match reason {
+        Some(reason)
+            if brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause::from_reason(
+                reason,
+            )
+            .is_some() =>
+        {
+            ReuseVerdict::ExecutionDependent(ExecutionCause::Other)
+        }
+        _ => ReuseVerdict::Content,
+    }
+}
+
+impl brokk_bifrost_analysis::analyzer::reuse_verdict::CarriesReuseVerdict
+    for CAssignmentCandidates
+{
+    fn reuse_verdict(&self) -> brokk_bifrost_analysis::analyzer::reuse_verdict::ReuseVerdict {
+        candidate_reason_reuse_verdict(self.reason)
+    }
+}
+
 const DEFAULT_MAX_SOURCE_BYTES: usize = 1_048_576;
 
 pub fn c_assignment_candidates(

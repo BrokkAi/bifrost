@@ -88,6 +88,10 @@ impl RewritePathTraversalCache {
             diagnostics.push(super::QueryExecutionState::diagnostic(
                 analyzer,
                 CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                    has_non_utf8_refusal: false,
+                    refusal_sites: Default::default(),
+                    call_relation_facts: None,
+                    uses_omissions: Vec::new(),
                     incompleteness: match cause {
                         Some(cause) => brokk_bifrost_rql::Incompleteness::Operational(cause),
                         None => brokk_bifrost_rql::Incompleteness::Content,

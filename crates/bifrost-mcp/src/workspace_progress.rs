@@ -1,6 +1,7 @@
 //! Bounded, source-free observations of one workspace build. No subscriber lists
 //! or per-file data are retained, and producers never perform transport IO.
 use crate::analyzer::{BuildProgressEvent, BuildProgressPhase};
+use brokk_bifrost_core::CancellationToken;
 use serde::Serialize;
 use std::sync::{Arc, Mutex};
 
@@ -34,30 +35,47 @@ pub(crate) struct BuildSnapshot {
     pub workspace_generation: u64,
     pub revision: u64,
     pub status: BuildStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
     pub counters: Vec<BuildCounter>,
     // One real intermediate observation per language/phase survives a build
     // faster than the polling interval. This is bounded, not an event history.
     pub intermediate: Vec<BuildCounter>,
 }
 
+struct BuildState {
+    snapshot: BuildSnapshot,
+    // The shared token owns the current phase. Read it for every snapshot:
+    // sink-pushed text goes stale when a PhaseGuard restores no phase.
+    cancellation: CancellationToken,
+}
+
 #[derive(Default)]
-pub(crate) struct WorkspaceBuildProgress(Mutex<Option<BuildSnapshot>>);
+pub(crate) struct WorkspaceBuildProgress(Mutex<Option<BuildState>>);
 
 impl WorkspaceBuildProgress {
     pub fn begin(self: &Arc<Self>, workspace_generation: u64) -> BuildObservation {
         let mut state = self.0.lock().expect("workspace progress lock poisoned");
-        let generation = state.as_ref().map_or(1, |state| state.generation + 1);
-        *state = Some(BuildSnapshot {
-            generation,
-            workspace_generation,
-            revision: 1,
-            status: BuildStatus::Running,
-            counters: Vec::new(),
-            intermediate: Vec::new(),
+        let generation = state
+            .as_ref()
+            .map_or(1, |state| state.snapshot.generation + 1);
+        let cancellation = CancellationToken::default();
+        *state = Some(BuildState {
+            cancellation: cancellation.clone(),
+            snapshot: BuildSnapshot {
+                generation,
+                workspace_generation,
+                revision: 1,
+                status: BuildStatus::Running,
+                phase: None,
+                counters: Vec::new(),
+                intermediate: Vec::new(),
+            },
         });
         BuildObservation {
             progress: Arc::clone(self),
             generation,
+            cancellation,
             finished: false,
         }
     }
@@ -67,14 +85,21 @@ impl WorkspaceBuildProgress {
             .lock()
             .expect("workspace progress lock poisoned")
             .as_ref()
-            .filter(|state| state.workspace_generation == workspace_generation)
-            .cloned()
+            .filter(|state| state.snapshot.workspace_generation == workspace_generation)
+            .map(|state| {
+                let mut snapshot = state.snapshot.clone();
+                snapshot.phase = (snapshot.status == BuildStatus::Running)
+                    .then(|| state.cancellation.phase())
+                    .flatten();
+                snapshot
+            })
     }
 }
 
 pub(crate) struct BuildObservation {
     progress: Arc<WorkspaceBuildProgress>,
     generation: u64,
+    pub cancellation: CancellationToken,
     finished: bool,
 }
 
@@ -90,8 +115,8 @@ impl BuildObservation {
                 BuildProgressPhase::Persist => ("persist", "blobs"),
                 BuildProgressPhase::Index => ("index", "files"),
             };
-            // Discard the path before taking the lock; neither the snapshot nor
-            // the wire type can represent a file label or source text.
+            // Discard the path before taking the lock; counters cannot represent
+            // a file label or source text.
             let counter = BuildCounter {
                 language: event.language,
                 phase,
@@ -100,9 +125,13 @@ impl BuildObservation {
                 total: (event.total != 0).then_some(event.total),
             };
             let mut state = progress.0.lock().expect("workspace progress lock poisoned");
-            let Some(state) = state.as_mut().filter(|state| {
-                state.generation == generation && state.status == BuildStatus::Running
-            }) else {
+            let Some(state) = state
+                .as_mut()
+                .map(|state| &mut state.snapshot)
+                .filter(|state| {
+                    state.generation == generation && state.status == BuildStatus::Running
+                })
+            else {
                 return;
             };
             if counter.completed > 0
@@ -144,6 +173,7 @@ impl BuildObservation {
             .lock()
             .expect("workspace progress lock poisoned")
             .as_mut()
+            .map(|state| &mut state.snapshot)
             .filter(|state| state.generation == self.generation)
         {
             state.status = status;

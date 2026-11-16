@@ -25,7 +25,7 @@ fn load(text: &str) -> crate::LoadedPolicy {
 
 fn policy(stores: &str) -> String {
     format!(
-        r#"(policy :id "test.canonical" :name "Canonical" :message "M" :severity warning
+        r#"(policy :schema-version 1 :id "test.canonical" :name "Canonical" :message "M" :severity warning
       :analysis (analysis :type taint :mode may
         :sources (endpoint-set :entries [(source :id raw :display-name "Raw" :categories [input.user]
           :selector (rql (call)) :bind return-value :labels [untrusted])])
@@ -119,7 +119,7 @@ fn directory_manifests_publish_complete_selected_endpoint_identities() {
             temp.path().join(format!("endpoints/{id}.rqlp")),
             format!(
                 r#"
-          (endpoint :id "test.{id}" :name "{id}" :display-name "{id}" :role source
+          (endpoint :schema-version 1 :id "test.{id}" :name "{id}" :display-name "{id}" :role source
             :categories [input.user] :selector (rql (call :callee (name "{id}")))
             :binding return-value :taint (source-semantics :labels [untrusted]))"#
             ),
@@ -251,7 +251,7 @@ fn loaded_catalog_closure_is_public_and_order_independent() {
                         query: brokk_bifrost_rql::CodeQuery::from_sexp("(call)").unwrap(),
                         resolved_locators: vec![],
                     },
-                    bind: PolicyPort::ReturnValue,
+                    bind: PolicyPort::ReturnValue { path: None },
                     labels: vec![TaintLabel::new("untrusted").unwrap()],
                     threat_model: None,
                     evidence: Some(crate::TaintSourceEvidence {

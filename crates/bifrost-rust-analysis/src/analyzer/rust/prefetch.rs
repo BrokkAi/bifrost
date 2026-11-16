@@ -140,6 +140,7 @@ pub(crate) fn prefetch_caller_files(
             // artifact; it admits no file on the execution ledger.
             let Some(source) = workspace
                 .current_program_semantics_artifact_source(file, usize::MAX)
+                .and_then(|outcome| outcome.held_or_refused())
                 .map_err(|error| StoreError::new(error.to_string()))?
             else {
                 return Ok(answer);
@@ -208,7 +209,7 @@ pub(crate) fn prefetch_caller_files(
                             use crate::analyzer::rust::std_types::RustProofAttempt;
 
                             use crate::analyzer::rust::std_types::completed_proof;
-                            let attempt = completed_proof(Some(cancellation), || {
+                            let attempt = completed_proof(analyzer, Some(cancellation), || {
                                 crate::analyzer::rust::expand_rust_imported_external_callee_attempt_with_operation(
                                                     analyzer, file, text, Some(&external_site), factory, &mut *operation,
                                                 ).into_value()
@@ -330,9 +331,6 @@ fn prefetch_file_groups<'a, A: WorkerAnswer>(
         _ => return Ok(Vec::new()),
     };
     let store = selected.worker_store();
-    if store.uses_single_connection_reads() {
-        return Ok(Vec::new());
-    }
     let input = selected.worker_input();
     let results = files.iter().map(|_| Mutex::new(None)).collect::<Vec<_>>();
     let context = brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();

@@ -149,7 +149,7 @@ Count is a predicate; captures from its counted children are not exported to the
 | `parameter_type` with regex | `:parameter-type/regex`, `:parameter_type/regex` | `(parameter-type/regex "re")`, `(parameter_type/regex "re")` | regular expression | Match the recorded parameter type spelling with a regular expression. |
 | `has` | `:has P` | `(has P)` | pattern | Require a matching descendant. |
 | `each` | `:each P` | `(each P)` | pattern | Match this fact or any descendant against `P`; retain captures from every matching node. A capture label inside an `each` may be repeated within one descendant's match, but may not also be bound outside that `each` or in another `each`. Only labels the child guarantees (every `any` alternative binds them) leave the `each`; other labels are not exported. Each binding is charged its text length plus 64 bytes against a 1 MiB per-row budget before it is copied. Recovered syntax or a fact or capture-byte budget stop makes the answer incomplete. Rendered captures share a 16 MiB response budget, charged by snippet bytes plus 64 bytes per capture. Exhaustion leaves later captures empty without dropping rows. One `rendered_captures_truncated` diagnostic reports affected rows and the budget. |
-| `argument_mode` | `:argument-mode [ref out]` | `(argument-mode ref out)` | nonempty list of `plain`, `spread`, `ref`, `out`, `in` | Match an argument value by the passing mode recorded on its argument role edge. A language declares a mode as recorded only when every argument container in its grammar emits an argument edge carrying that mode. No language declares one today, so a non-match is always incomplete and a positive match still matches. Known gaps: C# target-typed `new(...)` arguments (until #10270 lands) and `: base(...)` / `: this(...)` constructor initializers; Java `this(...)` and `super(...)` explicit constructor invocations; PHP `...$spread` arguments. The other languages have not been audited for argument containers without edges. |
+| `argument_mode` | `:argument-mode [ref out]` | `(argument-mode ref out)` | nonempty list of `plain`, `spread`, `ref`, `out`, `in` | Match an argument value by the passing mode recorded on its argument role edge. A language declares a mode as recorded only when every argument container in its grammar emits an argument edge carrying that mode. No language declares one today, so a non-match is always incomplete and a positive match still matches. Known gaps, where an argument has no edge: Java enum-constant arguments; C# primary-constructor base-type arguments (`class D(int x) : B(x)`), indexer arguments (`a[i]`) and tuple elements; PHP `...$spread` arguments. Java `this(...)` / `super(...)` and C# `: base(...)` / `: this(...)` are calls whose written arguments have edges, as are C# target-typed `new(...)` arguments. The other languages have not been audited for argument containers without edges. |
 | `not_has` | `:not-has P`, `:not_has P` | `(not-has P)`, `(not_has P)` | pattern | Reject nodes with a matching descendant. Never used for file pruning. |
 
 Role fields (`callee`, `args`, and the others) are listed under [Roles](#roles).
@@ -226,6 +226,12 @@ roles of its subtypes only where listed.
 
 C# target-typed `new()` is a `call` with no written name or callee. `:name`,
 `name/regex`, and `:callee` do not match it.
+
+Java `this(...)` and `super(...)` and C# `: this(...)` and `: base(...)` are
+constructor `call`s whose callee is the `this`, `super` or `base` keyword. The
+qualifier of Java `outer.super(...)` is neither an argument nor a receiver.
+Their arguments are the written ones, in order, with C# `ref`, `out`, `in` and
+named forms.
 
 | Role | Value | RQL value | Valid parent kinds | Meaning |
 | --- | --- | --- | --- | --- |
@@ -1047,7 +1053,7 @@ in the last column is left out of the JSON when it has no value. With
 | `result_contract_failure_use` | `acquisition_id`, `acquisition_site_ast_id`, `acquisition_site_id`, `condition_result_ordinal`, `consumer`, `consumer_point_id`, `coverage`, `failure_provenance`, `id`, `language`, `operand_value_id`, `path`, `procedure_id`, `proof`, `range` | `argument_ordinal`, `ast_id`, `binding_value_id`, `condition_value_id`, `consumer_call_id`, `consumer_site_ast_id`, `consumer_site_id`, `establishment_point_id`, `establishment_value_id`, `failure_edge_id`, `model_id`, `pack_id`, `summary_id` |
 | `nilness_operation` | `coverage`, `fact`, `id`, `language`, `operation_point_id`, `origin`, `path`, `procedure_id`, `proof`, `range`, `subject_value_id`, `use_kind` | `ast_id`, `reason` |
 | `switch_coverage` | `case_count`, `default_present`, `has_false_case`, `has_true_case`, `id`, `kind`, `language`, `path`, `procedure_id`, `proof`, `range`, `selector_domain`, `switch_fact_id`, `verdict` | `ast_id`, `reason`, `selector_value_id` |
-| `assignment_relation` | `coverage`, `id`, `language`, `path`, `procedure_id`, `proof`, `range`, `relation_kind`, `storage_kind`, `verdict` | `assignment_point_id`, `ast_id`, `reason`, `replacement_events`, `rhs_value_id`, `target_value_id` |
+| `assignment_relation` | `coverage`, `id`, `language`, `path`, `procedure_id`, `proof`, `range`, `reason_codes`, `relation_kind`, `storage_kind`, `verdict` | `assignment_point_id`, `ast_id`, `reason`, `open_reasons`, `replacement_events`, `rhs_value_id`, `target_value_id` |
 | `detached_task_transfer` | `call_id`, `call_point_id`, `coverage`, `id`, `language`, `path`, `procedure_id`, `proof`, `range`, `role`, `timing`, `value_id` | `ast_id`, `object_cardinality`, `object_id`, `ordinal`, `reason` |
 | `procedure_effect` | `coverage`, `derivation`, `id`, `language`, `path`, `procedure_id`, `procedure_name`, `range`, `site_id`, `terminal`, `witness_available`, `witness_steps`, `witness_truncated` | `certainty`, `classification`, `depth`, `effect_id`, `execution_timing`, `model_id`, `pack_id`, `reason`, `summary_id`, `timing`, `witness_chain`, `witness_effect_site_id`, `witness_site_id` |
 | `callable_signature` | `coverage`, `declaration`, `declaration_only`, `generic_arity`, `id`, `language`, `ordinal`, `parameter_count`, `path`, `range`, `repeated`, `role`, `site_id` | `label`, `receiver_contract`, `required_arity`, `return_type`, `special_method_expected_maximum`, `special_method_expected_minimum`, `special_method_reason`, `special_method_status`, `total_arity` |
@@ -1288,7 +1294,14 @@ The impact column gives the impact that `query_code` uses for each code.
 | `uses_parser_unsupported` | `incomplete` | `uses` cannot parse this language. |
 | `uses_candidate_limit` | `incomplete` | `uses` reached its candidate limit. |
 | `uses_targets_ambiguous` | `advisory` | A use has more than one possible target. |
-| `uses_candidates_omitted` | `incomplete` | `uses` candidates were left out. |
+| `uses_candidate_unavailable` | `incomplete` | `uses` candidate omission: candidate unavailable. |
+| `uses_candidate_incomplete` | `incomplete` | `uses` candidate omission: candidate incomplete. |
+| `uses_candidate_unresolved` | `incomplete` | `uses` candidate omission: candidate unresolved. |
+| `uses_reference_projection_missing` | `incomplete` | `uses` candidate omission: reference projection missing. |
+| `uses_definition_projection_missing` | `incomplete` | `uses` candidate omission: definition projection missing. |
+| `uses_inverse_unconfirmed` | `incomplete` | `uses` candidate omission: inverse unconfirmed. |
+| `uses_indexed_source_unavailable` | `incomplete` | `uses` candidate omission: indexed source unavailable. |
+| `uses_target_range_unavailable` | `incomplete` | `uses` candidate omission: target range unavailable. |
 | `execution_budget_exhausted` | `incomplete` | The query scan budget ran out (files, source bytes, or fact nodes). |
 | `pipeline_budget_exhausted` | `incomplete` | The seed and edge row budget ran out. |
 | `import_graph_budget_exhausted` | `incomplete` | The import graph budget ran out; import results are partial. |
@@ -1300,6 +1313,7 @@ The impact column gives the impact that `query_code` uses for each code.
 | `materialization_derivation_incomplete` | `incomplete` | Materialization rows could not be fully derived. |
 | `materialization_row_budget_exhausted` | `incomplete` | The materialization row budget ran out. |
 | `environment_derivation_incomplete` | `incomplete` | Scopes, bindings, or intervals could not be fully derived. |
+| `environment_bounded_work_limit` | `incomplete` | A fixed engine work limit stopped binding identity derivation. The message names the bound, limit, and observed value. The binding set remains incomplete. |
 | `environment_row_budget_exhausted` | `incomplete` | The lexical-environment or configuration row budget ran out. |
 | `resolution_trace_incomplete` | `incomplete` | The resolver records only selected candidates, so a missing rejection row proves nothing. |
 | `edge_axis_unsupported` | `incomplete` | An adapter does not support an edge projection, such as forward edges. |
@@ -1786,3 +1800,16 @@ selects one declared method on a closed bound receiver. Refinement only fills
 or contains an enclosing function type parameter remains `unknown`, unless
 the syntax-only producer already decided its provenance. Ambiguous, gapped,
 and unresolved targets remain `unknown`.
+
+### Write-liveness Open evidence
+
+An `assignment_relation` row for `dead_write` keeps `reason` equal to
+`write_liveness_open` when the binding proof is incomplete. `reason_codes` is a
+queryable string list with one code per structured `open_reasons` item, in the
+same stable order. RQL currently reads and matches the whole list; per-code
+membership filtering is not supported yet. Use the JSON DTO's typed
+`open_reasons` for per-code inspection. The tagged reasons retain the complete
+reason collection, including capability, gap kind, detail, related source
+locations, and binding value identity where applicable. The row's
+`procedure_id` and `target_value_id` identify the selected binding. These
+fields add evidence; they do not turn an Open proof into a finding.

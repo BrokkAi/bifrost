@@ -30,6 +30,14 @@ pub trait DependencyResolver: Send + Sync {
         true
     }
 
+    /// Select membership changes that can affect discovery, including paths
+    /// whose existence is observed without reading their contents. Kept
+    /// separate from content candidates so an inventory census does not widen
+    /// bounded file acquisition.
+    fn is_discovery_membership_candidate(&self, rel_path: &std::path::Path) -> bool {
+        self.is_discovery_candidate(rel_path)
+    }
+
     /// The pack adapter that produces semantic packs from what this resolver
     /// resolves. Pairing them here is what removes the chance of activating an
     /// ecosystem's dependencies through another's adapter.
@@ -234,6 +242,24 @@ pub fn prepare_dependency_semantic_packs(
     outcome
 }
 
+fn catalog_diagnostics(
+    catalog: &SemanticPackCatalog,
+    limits: &DependencyPackLimits,
+) -> BoundedDependencyDiagnostics {
+    let mut diagnostics = BoundedDependencyDiagnostics::new(limits);
+    match catalog.upgrade_diagnostics() {
+        Ok(warnings) => {
+            for warning in warnings {
+                diagnostics.warning(warning.code, None, warning.message);
+            }
+        }
+        Err(error) => {
+            diagnostics.warning("catalog.default_upgrade_report", None, error.to_string())
+        }
+    }
+    diagnostics
+}
+
 fn prepare_produced_dependency_semantic_packs(
     catalog: &SemanticPackCatalog,
     adapter: &dyn DependencyPackAdapter,
@@ -241,7 +267,7 @@ fn prepare_produced_dependency_semantic_packs(
     limits: &DependencyPackLimits,
     cancellation: Option<&CancellationToken>,
 ) -> DependencyPackPreparationOutcome {
-    let mut diagnostics = BoundedDependencyDiagnostics::new(limits);
+    let mut diagnostics = catalog_diagnostics(catalog, limits);
     let mut packs = Vec::new();
     let mut installed_packs = Vec::new();
     let mut evidence = Vec::new();
@@ -936,7 +962,7 @@ pub fn prepare_compatible_installed_semantic_packs(
     limits: &DependencyPackLimits,
     cancellation: Option<&CancellationToken>,
 ) -> DependencyPackPreparationOutcome {
-    let mut diagnostics = BoundedDependencyDiagnostics::new(limits);
+    let mut diagnostics = catalog_diagnostics(catalog, limits);
     let mut installed_packs = Vec::new();
     let mut evidence = Vec::new();
     let mut profile = DependencyPackPreparationProfile::default();
@@ -1067,7 +1093,7 @@ pub fn prepare_installed_dependency_packs(
     limits: &DependencyPackLimits,
     cancellation: Option<&CancellationToken>,
 ) -> InstalledDependencyPackPreparation {
-    let mut diagnostics = BoundedDependencyDiagnostics::new(limits);
+    let mut diagnostics = catalog_diagnostics(catalog, limits);
     let mut installed_packs = Vec::new();
     let mut evidence = Vec::new();
     let mut profile = DependencyPackPreparationProfile::default();
@@ -1786,7 +1812,7 @@ pub fn discovery_membership_unchanged(
         && added
             .iter()
             .chain(removed)
-            .all(|path| !resolver.is_discovery_candidate(path))
+            .all(|path| !resolver.is_discovery_membership_candidate(path))
 }
 
 #[cfg(test)]

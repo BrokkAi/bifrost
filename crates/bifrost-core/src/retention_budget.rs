@@ -1,4 +1,4 @@
-//! One process-wide byte budget for immutable cross-request values.
+//! Independent retention budgets sharing one process-required memory account.
 #[cfg(any(test, feature = "test-support"))]
 use std::any::Any;
 use std::any::TypeId;
@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use std::hash::Hash;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
 use crate::hash::HashMap;
 use moka::policy::EvictionPolicy;
@@ -24,7 +24,12 @@ pub trait RetainedBytes {
     }
 }
 /// Allowance for cache bookkeeping and one allocation control block.
-pub const ENTRY_OVERHEAD_BYTES: usize = 512;
+// Dense System counting measurements found about 160-167 additional requested
+// bytes per entry beyond 512 (about 672-680 total). Allow 704 for bookkeeping.
+pub const ENTRY_OVERHEAD_BYTES: usize = 704;
+/// Frozen metadata allowance for refusing value-flow funding authorities.
+/// Their byte admission behavior is outside the evictable-cache conversion.
+pub const UNROUNDED_ENTRY_OVERHEAD_BYTES: usize = 512;
 impl RetainedBytes for [u8; 32] {
     fn retained_bytes(&self) -> usize {
         std::mem::size_of_val(self)
@@ -46,17 +51,17 @@ inline_retained_bytes!(git2::Oid);
 inline_retained_bytes!(std::time::SystemTime);
 impl RetainedBytes for crate::gitblob::BlobKey {
     fn retained_bytes(&self) -> usize {
-        std::mem::size_of::<Self>() + self.lang.capacity()
+        std::mem::size_of::<Self>() + crate::allocation_size::allocation_size(self.lang.capacity())
     }
 }
 impl RetainedBytes for String {
     fn retained_bytes(&self) -> usize {
-        std::mem::size_of::<Self>() + self.capacity()
+        std::mem::size_of::<Self>() + crate::allocation_size::allocation_size(self.capacity())
     }
 }
 impl RetainedBytes for Box<str> {
     fn retained_bytes(&self) -> usize {
-        std::mem::size_of::<Self>() + self.len()
+        std::mem::size_of::<Self>() + crate::allocation_size::allocation_size(self.len())
     }
 }
 // No impl for a general `Arc<T>`: a cache that stored one would hand out a
@@ -65,12 +70,13 @@ impl RetainedBytes for Box<str> {
 // out `Retained<T>`. A shared string is immutable and small, so keys may use it.
 impl RetainedBytes for Arc<str> {
     fn retained_bytes(&self) -> usize {
-        std::mem::size_of::<Self>() + 2 * std::mem::size_of::<usize>() + self.len()
+        std::mem::size_of::<Self>()
+            + crate::allocation_size::allocation_size(2 * std::mem::size_of::<usize>() + self.len())
     }
 }
 impl RetainedBytes for std::path::PathBuf {
     fn retained_bytes(&self) -> usize {
-        std::mem::size_of::<Self>() + self.capacity()
+        std::mem::size_of::<Self>() + crate::allocation_size::allocation_size(self.capacity())
     }
 }
 impl<T: RetainedBytes> RetainedBytes for Option<T> {
@@ -116,7 +122,9 @@ impl<A: RetainedBytes, B: RetainedBytes, C: RetainedBytes> RetainedBytes for (A,
 impl<T: RetainedBytes> RetainedBytes for Vec<T> {
     fn retained_bytes(&self) -> usize {
         std::mem::size_of_val(self)
-            + self.capacity() * std::mem::size_of::<T>()
+            + crate::allocation_size::allocation_size(
+                self.capacity().saturating_mul(std::mem::size_of::<T>()),
+            )
             + self
                 .iter()
                 .map(|item| {
@@ -149,7 +157,64 @@ impl Clone for Ready {
         }
     }
 }
+trait RegionObserver: Send + Sync {
+    fn snapshot(&self) -> RetentionRegionSnapshot;
+}
+
+/// Required process-lifetime storage shared by independent retention budgets.
+/// This owner never holds services, budgets, or eviction callbacks.
+#[derive(Debug)]
+pub struct ProcessRequiredMemory {
+    owner_id: u64,
+    bytes: AtomicU64,
+}
+impl ProcessRequiredMemory {
+    fn new() -> Arc<Self> {
+        static NEXT_OWNER_ID: AtomicU64 = AtomicU64::new(1);
+        Arc::new(Self {
+            owner_id: NEXT_OWNER_ID.fetch_add(1, Ordering::Relaxed),
+            bytes: AtomicU64::new(0),
+        })
+    }
+    pub fn global() -> Arc<Self> {
+        static GLOBAL: OnceLock<Arc<ProcessRequiredMemory>> = OnceLock::new();
+        Arc::clone(GLOBAL.get_or_init(Self::new))
+    }
+    pub fn owner_id(&self) -> u64 {
+        self.owner_id
+    }
+    pub fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Acquire)
+    }
+    pub(crate) fn grow(&self, bytes: u64) {
+        let mut current = self.bytes.load(Ordering::Acquire);
+        loop {
+            let next = current
+                .checked_add(bytes)
+                .expect("process required memory accounting overflow");
+            match self.bytes.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn for_tests() -> Arc<Self> {
+        Self::new()
+    }
+}
+
 struct BudgetInner {
+    process_required: Arc<ProcessRequiredMemory>,
+    owner_id: u64,
+    sample_sequence: AtomicU64,
+    regions: Mutex<HashMap<u64, Weak<dyn RegionObserver>>>,
     capacity: u64,
     // Charges hold this counter, not the budget: the budget's cache holds the
     // charged values, so a strong budget reference in a charge is a cycle.
@@ -159,6 +224,8 @@ struct BudgetInner {
     deferred: Arc<Mutex<Vec<DeferredDrop>>>,
     types: Mutex<HashMap<&'static str, (TypeId, TypeId)>>,
     entries: Cache<u64, Ready>,
+    // Weak bookkeeping only; charges never keep BudgetInner or actual owners alive.
+    keyed_backings: Mutex<HashMap<usize, Weak<SharedBacking>>>,
 }
 // Moka can destroy values while processing any cache operation. Its listener
 // transfers ownership here; callbacks and final value drops run without admission.
@@ -221,16 +288,18 @@ impl Admission<'_> {
 }
 impl Drop for Admission<'_> {
     fn drop(&mut self) {
-        self.drain();
+        self.budget.reclaim_required(self, 0);
     }
 }
-/// Shared across all regions owned by one process.
+/// Shared across all regions of one independent retention owner.
 #[derive(Clone)]
 pub struct RetentionBudget(Arc<BudgetInner>);
 impl RetentionBudget {
     #[cfg(any(test, feature = "test-support"))]
     pub fn for_tests() -> Self {
-        Self::new(crate::analyzer::config::AnalyzerConfig::default().retention_budget_bytes())
+        Self::for_test_capacity(
+            crate::analyzer::config::AnalyzerConfig::default().retention_budget_bytes(),
+        )
     }
     fn admission(&self) -> Admission<'_> {
         Admission {
@@ -249,50 +318,103 @@ impl RetentionBudget {
         additional: u64,
         evictions: Arc<AtomicU64>,
     ) -> bool {
+        self.reclaim_required(admission, 0);
+        if self.process_required_bytes() >= self.capacity_bytes() {
+            return false;
+        }
+        let fits = self.reclaim_available(admission, additional, evictions);
+        if !fits {
+            // A drain can grow required process storage reentrantly.
+            self.reclaim_required(admission, 0);
+        }
+        fits
+    }
+    fn reclaim_available(
+        &self,
+        admission: &Admission<'_>,
+        additional: u64,
+        evictions: Arc<AtomicU64>,
+    ) -> bool {
         loop {
             admission.settle();
-            let accounted = self.accounted_bytes();
             let resident = self.0.entries.weighted_size();
-            let nonresident = accounted.saturating_sub(resident);
+            let nonresident = self
+                .accounted_bytes()
+                .saturating_sub(resident)
+                .saturating_add(self.process_required_bytes());
             let Some(required) = nonresident.checked_add(additional) else {
                 return false;
             };
             if required > self.0.capacity {
                 return false;
             }
-            if accounted.saturating_add(additional) <= self.0.capacity {
+            if self.fits(additional) {
                 return true;
             }
-            // One moka weight is a u32, so a budget above 4 GiB may need
-            // several probes to reserve `required` bytes at once.
-            let mut probes = Vec::new();
-            let mut remaining = required;
-            while remaining > 0 {
-                let weight = remaining.min(u64::from(u32::MAX));
-                let probe = self.0.next_id.fetch_add(1, Ordering::Relaxed);
-                self.0.entries.insert(
-                    probe,
-                    Ready {
-                        value: None,
-                        weight: weight as u32,
-                        evictions: evictions.clone(),
-                    },
-                );
-                probes.push(probe);
-                remaining -= weight;
-            }
-            self.0.entries.run_pending_tasks();
-            for probe in &probes {
-                self.0.entries.invalidate(probe);
-            }
-            self.0.entries.run_pending_tasks();
+            self.probe_eviction(required, evictions.clone());
             // Judge progress by residency while admission is still held:
             // accounting can rise during the unlocked drain when another
             // admission refills the freed bytes.
             if self.0.entries.weighted_size() >= resident {
                 admission.drain();
-                return self.accounted_bytes().saturating_add(additional) <= self.0.capacity;
+                return self.fits(additional);
             }
+        }
+    }
+    // Moka weights are u32, so large reservations need several probes.
+    fn probe_eviction(&self, required: u64, evictions: Arc<AtomicU64>) {
+        let mut probes = Vec::new();
+        let mut remaining = required;
+        while remaining > 0 {
+            let weight = remaining.min(u64::from(u32::MAX));
+            let probe = self.0.next_id.fetch_add(1, Ordering::Relaxed);
+            self.0.entries.insert(
+                probe,
+                Ready {
+                    value: None,
+                    weight: weight as u32,
+                    evictions: evictions.clone(),
+                },
+            );
+            probes.push(probe);
+            remaining -= weight;
+        }
+        self.0.entries.run_pending_tasks();
+        for probe in probes {
+            self.0.entries.invalidate(&probe);
+        }
+        self.0.entries.run_pending_tasks();
+    }
+    // Required storage is never refused. Reclaim the possible room and settle
+    // destruction outside admission, then recalculate after reentrant growth.
+    fn reclaim_required(&self, guard: &Admission<'_>, bytes: u64) {
+        let mut refused: Option<u64> = None;
+        loop {
+            guard.settle();
+            let resident = self.0.entries.weighted_size();
+            let nonresident = self
+                .accounted_bytes()
+                .saturating_sub(resident)
+                .saturating_add(self.process_required_bytes());
+            if nonresident >= self.0.capacity {
+                if resident == 0 {
+                    return;
+                }
+                self.probe_eviction(self.0.capacity.max(1), Arc::new(AtomicU64::new(0)));
+                // Even pinned values must lose residency; their charges remain.
+                guard.settle();
+                if self.0.entries.weighted_size() >= resident {
+                    return;
+                }
+                continue;
+            }
+            let room = bytes.min(self.0.capacity.saturating_sub(nonresident));
+            if refused.is_some_and(|refused| room >= refused)
+                || self.reclaim_available(guard, room, Arc::new(AtomicU64::new(0)))
+            {
+                return;
+            }
+            refused = Some(room);
         }
     }
     /// A budget that keeps nothing, for a workspace that has no owner to
@@ -302,14 +424,36 @@ impl RetentionBudget {
         Self::new(0)
     }
     pub fn new(capacity: u64) -> Self {
+        Self::with_process_required(capacity, ProcessRequiredMemory::global())
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn with_process_required_for_test(
+        capacity: u64,
+        process: Arc<ProcessRequiredMemory>,
+    ) -> Self {
+        Self::with_process_required(capacity, process)
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn for_test_capacity(capacity: u64) -> Self {
+        Self::with_process_required(capacity, ProcessRequiredMemory::for_tests())
+    }
+    fn with_process_required(capacity: u64, process_required: Arc<ProcessRequiredMemory>) -> Self {
+        static NEXT_OWNER_ID: AtomicU64 = AtomicU64::new(1);
         let deferred = Arc::new(Mutex::new(Vec::new()));
         Self(Arc::new(BudgetInner {
+            process_required,
+            owner_id: NEXT_OWNER_ID.fetch_add(1, Ordering::Relaxed),
+            sample_sequence: AtomicU64::new(0),
+            regions: Mutex::new(HashMap::default()),
             capacity,
             accounted: Arc::new(AtomicU64::new(0)),
             next_id: AtomicU64::new(1),
             admission: Mutex::new(()),
             deferred: deferred.clone(),
             types: Mutex::new(HashMap::default()),
+            keyed_backings: Mutex::new(HashMap::default()),
             entries: Cache::builder()
                 .max_capacity(capacity.max(1))
                 .eviction_policy(EvictionPolicy::lru())
@@ -339,6 +483,20 @@ impl RetentionBudget {
     pub fn accounted_bytes(&self) -> u64 {
         self.0.accounted.load(Ordering::Acquire)
     }
+    fn fits(&self, additional: u64) -> bool {
+        self.accounted_bytes()
+            .checked_add(self.process_required_bytes())
+            .and_then(|bytes| bytes.checked_add(additional))
+            .is_some_and(|bytes| bytes <= self.capacity_bytes())
+    }
+    /// Local retained bytes plus the shared process-required account.
+    pub fn occupied_bytes(&self) -> u64 {
+        self.accounted_bytes()
+            .saturating_add(self.process_required_bytes())
+    }
+    pub fn process_required_bytes(&self) -> u64 {
+        self.0.process_required.bytes()
+    }
     pub fn region<K, V>(&self, name: &'static str, entry_cap: Option<usize>) -> BudgetRegion<K, V>
     where
         K: Eq + Hash + Clone + Send + Sync + RetainedBytes + 'static,
@@ -352,7 +510,7 @@ impl RetentionBudget {
                 "region type changed"
             );
         }
-        BudgetRegion {
+        let region = BudgetRegion {
             inner: Arc::new(RegionInner {
                 budget: self.clone(),
                 name,
@@ -381,45 +539,132 @@ impl RetentionBudget {
                     seen: HashMap::default(),
                 }),
             }),
+        };
+        let observer: Arc<dyn RegionObserver> = region.inner.clone();
+        self.0
+            .regions
+            .lock()
+            .expect("region registry poisoned")
+            .insert(region.inner.namespace, Arc::downgrade(&observer));
+        region
+    }
+
+    /// Settle maintenance before observing this owner's retained allocations.
+    /// Rows and cumulative counters can change during concurrent operations;
+    /// this is owner-wide occupancy, not allocation attributed to a request.
+    /// Shared backing and required state also charge the owner directly, so
+    /// the accounted total is deliberately not the sum of the region rows.
+    pub fn snapshot(&self) -> RetentionSnapshot {
+        self.run_pending_tasks();
+        let observers = {
+            let mut registry = self.0.regions.lock().expect("region registry poisoned");
+            let mut observers = Vec::with_capacity(registry.len());
+            registry.retain(|_, weak| {
+                if let Some(observer) = weak.upgrade() {
+                    observers.push(observer);
+                    true
+                } else {
+                    false
+                }
+            });
+            observers
+        };
+        // Observers settle their entry caps too. Neither the registry nor the
+        // admission lock may be held while maintenance destroys values.
+        let mut regions = observers
+            .iter()
+            .map(|observer| observer.snapshot())
+            .collect::<Vec<_>>();
+        regions.sort_unstable_by_key(|region| (region.name, region.namespace));
+        self.run_pending_tasks();
+        let accounted_bytes = self.accounted_bytes();
+        let process_required_bytes = self.process_required_bytes();
+        RetentionSnapshot {
+            owner_id: self.0.owner_id,
+            sample_sequence: self.0.sample_sequence.fetch_add(1, Ordering::Relaxed) + 1,
+            capacity_bytes: self.capacity_bytes(),
+            accounted_bytes,
+            process_required_owner_id: self.0.process_required.owner_id(),
+            process_required_bytes,
+            occupied_bytes: accounted_bytes.saturating_add(process_required_bytes),
+            regions,
         }
     }
+
     pub fn run_pending_tasks(&self) {
-        self.admission().settle();
+        self.reclaim_required(&self.admission(), 0);
     }
     /// Charge one shared allocation once, regardless of the number of leases.
     pub fn shared_backing(&self, bytes: u64) -> Option<SharedBackingLease> {
         let guard = self.admission();
         self.shared_backing_locked(&guard, bytes)
     }
+    /// Share a charge for one actual allocation within this budget only.
+    ///
+    /// The object holding the lease must also pin the actual allocation until
+    /// that lease is dropped. The index and lease hold no actual owner. Equal
+    /// IDs with different live immutable byte weights are refused. `bytes()`
+    /// reports payload bytes; accounting additionally includes one conservative
+    /// UNROUNDED_ENTRY_OVERHEAD_BYTES allowance for the weak index and control block.
+    pub fn shared_backing_for(&self, allocation: usize, bytes: u64) -> Option<SharedBackingLease> {
+        let guard = self.admission();
+        if let Some(existing) = self.keyed_backing(allocation) {
+            return (existing.bytes == bytes).then_some(SharedBackingLease(existing));
+        }
+        // This keyed backing API funds the refusing value-flow authorities, not
+        // named evictable cache entries. Preserve their master charge exactly.
+        let charge = bytes.checked_add(UNROUNDED_ENTRY_OVERHEAD_BYTES as u64)?;
+        let fits = self.reclaim_for(&guard, charge, Arc::new(AtomicU64::new(0)));
+        // Reclaim drains destructors without admission. A concurrent admission
+        // may have published this exact owner while that lock was released.
+        if let Some(existing) = self.keyed_backing(allocation) {
+            return (existing.bytes == bytes).then_some(SharedBackingLease(existing));
+        }
+        if !fits {
+            return None;
+        }
+        let mut index = self
+            .0
+            .keyed_backings
+            .lock()
+            .expect("shared backing index poisoned");
+        // Each entry reserves 512 bytes, covering its weak/control allocation
+        // and the hash table's spare buckets. Final removal shrinks the table.
+        self.0.accounted.fetch_add(charge, Ordering::AcqRel);
+        if index.try_reserve(1).is_err() {
+            self.0.accounted.fetch_sub(charge, Ordering::AcqRel);
+            return None;
+        }
+        let backing = Arc::new(SharedBacking {
+            accounted: Arc::clone(&self.0.accounted),
+            bytes,
+            keyed_owner: Some((Arc::downgrade(&self.0), allocation)),
+        });
+        index.insert(allocation, Arc::downgrade(&backing));
+        drop(index);
+        Some(SharedBackingLease(backing))
+    }
+
+    fn keyed_backing(&self, allocation: usize) -> Option<Arc<SharedBacking>> {
+        // Return the upgraded Arc only AFTER unlocking: dropping a final
+        // upgraded holder (including a refused weight mismatch) cleans this index.
+        self.0
+            .keyed_backings
+            .lock()
+            .expect("shared backing index poisoned")
+            .get(&allocation)
+            .and_then(Weak::upgrade)
+    }
+
     /// Charge required state; see [`AllocationCharge::acquire_required`].
     fn required_backing(&self, bytes: u64) -> SharedBackingLease {
         let guard = self.admission();
-        // Evict as much as eviction can free, up to `bytes`: reclaim_for gives
-        // up at once on a request that cannot fit, so ask only for what can.
-        // Its drains release admission, and a destructor or another admission
-        // can charge non-resident bytes meanwhile, so ask again for the
-        // smaller room until one is reclaimed or the room stops shrinking.
-        // The charge does not depend on the outcome.
-        let mut refused: Option<u64> = None;
-        loop {
-            // Values evicted but not yet destroyed stay charged without being
-            // resident; destroy them first so they do not count as unevictable.
-            guard.settle();
-            let nonresident = self
-                .accounted_bytes()
-                .saturating_sub(self.0.entries.weighted_size());
-            let room = bytes.min(self.0.capacity.saturating_sub(nonresident));
-            if refused.is_some_and(|refused| room >= refused)
-                || self.reclaim_for(&guard, room, Arc::new(AtomicU64::new(0)))
-            {
-                break;
-            }
-            refused = Some(room);
-        }
+        self.reclaim_required(&guard, bytes);
         self.0.accounted.fetch_add(bytes, Ordering::AcqRel);
         SharedBackingLease(Arc::new(SharedBacking {
             accounted: self.0.accounted.clone(),
             bytes,
+            keyed_owner: None,
         }))
     }
     fn shared_backing_locked(
@@ -435,21 +680,55 @@ impl RetentionBudget {
         Some(SharedBackingLease(Arc::new(SharedBacking {
             accounted: self.0.accounted.clone(),
             bytes,
+            keyed_owner: None,
         })))
     }
 }
 struct SharedBacking {
     accounted: Arc<AtomicU64>,
     bytes: u64,
+    keyed_owner: Option<(Weak<BudgetInner>, usize)>,
 }
 impl Drop for SharedBacking {
     fn drop(&mut self) {
-        self.accounted.fetch_sub(self.bytes, Ordering::AcqRel);
+        let mut charge = self.bytes;
+        if let Some((budget, allocation)) = &self.keyed_owner {
+            charge += UNROUNDED_ENTRY_OVERHEAD_BYTES as u64;
+            if let Some(budget) = budget.upgrade() {
+                let mut index = budget
+                    .keyed_backings
+                    .lock()
+                    .expect("shared backing index poisoned");
+                // A last-strong drop may race a new owner at the same ID. An
+                // old destructor must never delete the replacement's record.
+                if index
+                    .get(allocation)
+                    .is_some_and(|weak| std::ptr::eq(weak.as_ptr(), self))
+                {
+                    index.remove(allocation);
+                    if index.is_empty() {
+                        *index = HashMap::default();
+                    } else {
+                        index.shrink_to_fit();
+                    }
+                }
+            }
+        }
+        self.accounted.fetch_sub(charge, Ordering::AcqRel);
     }
 }
 #[derive(Clone)]
 pub struct SharedBackingLease(Arc<SharedBacking>);
 impl SharedBackingLease {
+    /// Actual control allocation, distinct from its charged payload bytes.
+    /// The address is query-local and valid only while a lease pins this owner.
+    pub fn retained_control_allocation(&self) -> (usize, usize) {
+        (
+            Arc::as_ptr(&self.0) as usize,
+            std::mem::size_of::<SharedBacking>() + 2 * std::mem::size_of::<usize>(),
+        )
+    }
+
     pub fn bytes(&self) -> u64 {
         self.0.bytes
     }
@@ -503,6 +782,13 @@ impl AllocationCharge {
             drop_hooks: Mutex::new(Vec::new()),
         }
     }
+    /// Control allocation only; the owning value visits its payload separately.
+    pub fn retained_control_allocation(&self) -> Option<(usize, usize)> {
+        self.lease
+            .as_ref()
+            .map(SharedBackingLease::retained_control_allocation)
+    }
+
     pub fn is_charged(&self) -> bool {
         self.lease.is_some()
     }
@@ -846,6 +1132,12 @@ impl<K, V> Drop for RegionInner<K, V> {
     /// A dropped region can revive nothing: release the drop hooks, and their
     /// registration charges, that held allocations still carry for it.
     fn drop(&mut self) {
+        self.budget
+            .0
+            .regions
+            .lock()
+            .expect("region registry poisoned")
+            .remove(&self.namespace);
         let entries = std::mem::take(&mut *self.live.lock().expect("region live map poisoned"));
         for entry in entries.into_values() {
             if let Some(revive) = entry.revive {
@@ -863,6 +1155,28 @@ impl<K, V> Clone for BudgetRegion<K, V> {
         Self {
             inner: self.inner.clone(),
         }
+    }
+}
+impl<K, V> BudgetRegion<K, V> {
+    /// A handle that does not keep the region, or the budget behind it, alive.
+    ///
+    /// Every region holds its budget, and the budget's cache holds the values
+    /// of all its regions. A strong region clone held by something that
+    /// outlives the region's owner (a project's read recorder, for example)
+    /// therefore retains every value the budget caches.
+    pub fn downgrade(&self) -> WeakBudgetRegion<K, V> {
+        WeakBudgetRegion {
+            inner: Arc::downgrade(&self.inner),
+        }
+    }
+}
+/// See [`BudgetRegion::downgrade`].
+pub struct WeakBudgetRegion<K, V> {
+    inner: std::sync::Weak<RegionInner<K, V>>,
+}
+impl<K, V> WeakBudgetRegion<K, V> {
+    pub fn upgrade(&self) -> Option<BudgetRegion<K, V>> {
+        self.inner.upgrade().map(|inner| BudgetRegion { inner })
     }
 }
 pub struct Charged<V> {
@@ -996,6 +1310,27 @@ impl<V> Deref for BudgetedValue<V> {
     }
 }
 
+/// A settled observation of one owner. IDs are process-local diagnostics,
+/// never cache identities. Required state can exceed `capacity_bytes`.
+#[derive(Debug, Clone)]
+pub struct RetentionSnapshot {
+    pub owner_id: u64,
+    pub sample_sequence: u64,
+    pub capacity_bytes: u64,
+    pub accounted_bytes: u64,
+    pub process_required_owner_id: u64,
+    pub process_required_bytes: u64,
+    pub occupied_bytes: u64,
+    pub regions: Vec<RetentionRegionSnapshot>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RetentionRegionSnapshot {
+    pub name: &'static str,
+    pub namespace: u64,
+    pub stats: RegionStats,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RegionStats {
     pub entries: usize,
@@ -1046,29 +1381,44 @@ where
                 entry.revive.clone(),
             )
         };
-        let revived = match weak.upgrade() {
+        // Capture the original registration before settlement can unlock and
+        // invoke a destructor that invalidates or replaces this key.
+        if !budget.reclaim_for(&guard, 0, self.inner.evictions.clone()) {
+            return None;
+        }
+        let still_current = self
+            .inner
+            .live
+            .lock()
+            .expect("region live map poisoned")
+            .get(key)
+            .is_some_and(|entry| entry.id == id && Weak::ptr_eq(&entry.value, &weak));
+        if !still_current {
+            return None;
+        }
+        let (revived, was_resident) = match weak.upgrade() {
             Some(value) => {
-                if budget.0.entries.get(&id).is_some() {
-                    return Some(Retained::from_arc(value));
+                let was_resident = budget.0.entries.get(&id).is_some();
+                if !was_resident {
+                    if let Some(cap) = &self.inner.cap_cache {
+                        cap.insert(id, ());
+                        cap.run_pending_tasks();
+                    }
+                    budget.0.entries.insert(
+                        id,
+                        Ready {
+                            value: Some(Arc::new(Mutex::new(Some(DeferredDrop {
+                                value: Some(value.clone()),
+                                callback: value.on_evict.clone(),
+                                evicted: false,
+                            })))),
+                            weight: value.weight,
+                            evictions: self.inner.evictions.clone(),
+                        },
+                    );
+                    budget.0.entries.run_pending_tasks();
                 }
-                if let Some(cap) = &self.inner.cap_cache {
-                    cap.insert(id, ());
-                    cap.run_pending_tasks();
-                }
-                budget.0.entries.insert(
-                    id,
-                    Ready {
-                        value: Some(Arc::new(Mutex::new(Some(DeferredDrop {
-                            value: Some(value.clone()),
-                            callback: value.on_evict.clone(),
-                            evicted: false,
-                        })))),
-                        weight: value.weight,
-                        evictions: self.inner.evictions.clone(),
-                    },
-                );
-                budget.0.entries.run_pending_tasks();
-                Retained::from_arc(value)
+                (Retained::from_arc(value), was_resident)
             }
             // The entry is gone but its shared allocation may still be held.
             None => {
@@ -1077,7 +1427,7 @@ where
                 // Re-admit under the map's own key allocation, which the
                 // registration's charge and drop hook already cover.
                 match self.admit(&guard, stored_key, value, None, Some(revivable), None) {
-                    Ok((retained, _)) => retained,
+                    Ok((retained, _)) => (retained, false),
                     Err((value, _)) => {
                         guard.defer(move || drop(value));
                         return None;
@@ -1085,6 +1435,25 @@ where
                 }
             }
         };
+        // Final admission cleanup can run more callbacks than pre-publication
+        // reclaim. Validate the published wrapper only after those callbacks.
+        drop(guard);
+        let still_current = self
+            .inner
+            .live
+            .lock()
+            .expect("region live map poisoned")
+            .get(key)
+            .is_some_and(|entry| {
+                Weak::ptr_eq(&entry.value, &Arc::downgrade(&revived.0))
+                    && budget.0.entries.contains_key(&entry.id)
+            });
+        if !still_current {
+            return None;
+        }
+        if was_resident {
+            return Some(revived);
+        }
         self.inner.revivals.fetch_add(1, Ordering::Relaxed);
         #[cfg(any(test, feature = "test-support"))]
         {
@@ -1107,7 +1476,6 @@ where
                 tracker.census.distinct_values += 1;
             }
         }
-        drop(guard);
         Some(revived)
     }
     pub fn insert(&self, key: K, value: V) -> BudgetedValue<V> {
@@ -1227,6 +1595,9 @@ where
                 })
                 .map(|entry| entry.id)
         });
+        // Settle process growth even when this candidate immediately refuses
+        // an oversized weight or a zero entry cap.
+        self.inner.budget.reclaim_required(_admission, 0);
         let Some(charge) = (K::retained_bytes(&key) as u64)
             .checked_add(value.retained_bytes() as u64)
             .and_then(|sum| sum.checked_add(ENTRY_OVERHEAD_BYTES as u64))
@@ -1467,10 +1838,36 @@ where
             self.inner.budget.run_pending_tasks();
         }
     }
-    pub fn stats(&self) -> RegionStats {
-        self.run_pending_tasks();
-        let values = self
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn allocation_index_capacities(&self) -> (usize, usize) {
+        let live = self.inner.live.lock().expect("region live map").capacity();
+        let tracked = self
             .inner
+            .tracked
+            .lock()
+            .expect("region tracked map")
+            .capacity();
+        (live, tracked)
+    }
+
+    pub fn stats(&self) -> RegionStats {
+        self.inner.snapshot().stats
+    }
+}
+
+impl<K, V> RegionObserver for RegionInner<K, V>
+where
+    K: Eq + Hash + Clone + Send + Sync + RetainedBytes + 'static,
+    V: Send + Sync + RetainedBytes + 'static,
+{
+    fn snapshot(&self) -> RetentionRegionSnapshot {
+        self.budget.run_pending_tasks();
+        if let Some(cap) = &self.cap_cache {
+            cap.run_pending_tasks();
+            self.budget.run_pending_tasks();
+        }
+        let values = self
             .tracked
             .lock()
             .expect("region tracked map poisoned")
@@ -1481,16 +1878,20 @@ where
         for (id, value) in values {
             let charge = value.charge.load(Ordering::Acquire);
             stats.accounted_bytes += charge;
-            if self.inner.budget.0.entries.get(&id).is_some() {
+            if self.budget.0.entries.contains_key(&id) {
                 stats.entries += 1;
             } else if value.external.load(Ordering::Acquire) != 0 {
                 stats.deferred_bytes += charge;
             }
         }
-        stats.evictions = self.inner.evictions.load(Ordering::Relaxed);
-        stats.refused_admissions = self.inner.refused.load(Ordering::Relaxed);
-        stats.revivals = self.inner.revivals.load(Ordering::Relaxed);
-        stats
+        stats.evictions = self.evictions.load(Ordering::Relaxed);
+        stats.refused_admissions = self.refused.load(Ordering::Relaxed);
+        stats.revivals = self.revivals.load(Ordering::Relaxed);
+        RetentionRegionSnapshot {
+            name: self.name,
+            namespace: self.namespace,
+            stats,
+        }
     }
 }
 
@@ -1501,6 +1902,244 @@ mod tests {
     use crate::budgeted_value_cache::{BudgetedValueAcquisition, BudgetedValueCache};
     use std::sync::Barrier;
     use std::thread;
+
+    #[test]
+    fn process_required_storage_is_shared_without_duplicating_local_charges() {
+        let process = ProcessRequiredMemory::for_tests();
+        let first = RetentionBudget::with_process_required_for_test(4_000, process.clone());
+        let second = RetentionBudget::with_process_required_for_test(4_000, process.clone());
+        let first_region = first.region::<Key, Value>("first", None);
+        let second_region = second.region::<Key, Value>("second", None);
+        drop(first_region.insert(Key(1), Value(100)));
+        drop(second_region.insert(Key(1), Value(100)));
+        let before_first = first.snapshot();
+        let before_second = second.snapshot();
+        assert_ne!(before_first.owner_id, before_second.owner_id);
+        process.grow(400);
+        for (budget, before) in [(&first, &before_first), (&second, &before_second)] {
+            let after = budget.snapshot();
+            assert_eq!(after.process_required_owner_id, process.owner_id());
+            assert_eq!(after.process_required_bytes, 400);
+            assert_eq!(after.accounted_bytes, before.accounted_bytes);
+            assert_eq!(after.occupied_bytes, before.occupied_bytes + 400);
+            assert_eq!(
+                after.capacity_bytes - after.occupied_bytes,
+                before.capacity_bytes - before.occupied_bytes - 400
+            );
+        }
+        let first_owner = Arc::downgrade(&first.0);
+        let first_accounted = first.0.accounted.clone();
+        drop(first_region);
+        first.run_pending_tasks();
+        drop(first);
+        assert!(first_owner.upgrade().is_none());
+        assert_eq!(first_accounted.load(Ordering::Acquire), 0);
+        assert_eq!(process.bytes(), 400);
+        assert_eq!(second.process_required_bytes(), 400);
+        assert_eq!(second.accounted_bytes(), before_second.accounted_bytes);
+    }
+
+    #[test]
+    fn process_required_capacity_boundary_evicts_residents_but_keeps_pins_and_required_work() {
+        for required_bytes in [2_000, 2_001] {
+            let process = ProcessRequiredMemory::for_tests();
+            let budget = RetentionBudget::with_process_required_for_test(2_000, process.clone());
+            let region = budget.region::<Key, Value>("boundary", None);
+            let held = region.insert(Key(1), Value(100));
+            drop(region.insert(Key(2), Value(100)));
+            let held_bytes = 812;
+            process.grow(required_bytes);
+            let snapshot = budget.snapshot();
+            assert_eq!(snapshot.regions[0].stats.entries, 0);
+            assert_eq!(snapshot.regions[0].stats.evictions, 2);
+            assert_eq!(snapshot.accounted_bytes, held_bytes);
+            assert_eq!(snapshot.occupied_bytes, held_bytes + required_bytes);
+            assert!(region.get(&Key(1)).is_none());
+            assert!(region.revive(&Key(1)).is_none());
+            assert!(matches!(
+                region.insert(Key(3), Value(100)),
+                BudgetedValue::RequestOwned { .. }
+            ));
+            assert!(budget.shared_backing(1).is_none());
+            let required = AllocationCharge::acquire_required(&budget, 300);
+            assert!(required.is_charged());
+            assert_eq!(budget.accounted_bytes(), held_bytes + 300);
+            drop(held);
+            drop(required);
+            assert_eq!(budget.accounted_bytes(), 0);
+            assert_eq!(budget.occupied_bytes(), required_bytes);
+        }
+    }
+
+    #[test]
+    fn early_optional_refusals_still_settle_process_growth() {
+        for entry_cap in [None, Some(0)] {
+            let process = ProcessRequiredMemory::for_tests();
+            let budget = RetentionBudget::with_process_required_for_test(2_000, process.clone());
+            let resident = budget.region::<Key, Value>("existing", None);
+            drop(resident.insert(Key(1), Value(100)));
+            budget.run_pending_tasks();
+            let candidate = budget.region::<Key, Value>("candidate", entry_cap);
+            process.grow(2_000);
+            let value = if entry_cap.is_some() {
+                Value(100)
+            } else {
+                Value(3_000)
+            };
+            assert!(matches!(
+                candidate.insert(Key(2), value),
+                BudgetedValue::RequestOwned { .. }
+            ));
+            assert!(resident.get(&Key(1)).is_none());
+            assert_eq!(budget.accounted_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn reentrant_process_growth_rechecks_occupied_bytes_after_destruction() {
+        struct Growing(Arc<ProcessRequiredMemory>);
+        impl RetainedBytes for Growing {
+            fn retained_bytes(&self) -> usize {
+                400
+            }
+        }
+        impl Drop for Growing {
+            fn drop(&mut self) {
+                self.0.grow(3_000);
+            }
+        }
+        let process = ProcessRequiredMemory::for_tests();
+        let budget = RetentionBudget::with_process_required_for_test(3_576, process.clone());
+        let growing = budget.region::<Key, Growing>("growing", None);
+        let values = budget.region::<Key, Value>("values", None);
+        drop(growing.insert(Key(1), Growing(process.clone())));
+        let held = values.insert(Key(2), Value(400));
+        drop(values.insert(Key(3), Value(400)));
+        budget.run_pending_tasks();
+        assert_eq!(growing.stats().entries + values.stats().entries, 3);
+        process.grow(1_000);
+        // The local required charge evicts Growing; its destructor grows the
+        // process account while admission is released, forcing more eviction.
+        let required = AllocationCharge::acquire_required(&budget, 1_000);
+        let snapshot = budget.snapshot();
+        assert_eq!(snapshot.process_required_bytes, 4_000);
+        assert!(
+            snapshot
+                .regions
+                .iter()
+                .all(|region| region.stats.entries == 0)
+        );
+        assert_eq!(snapshot.accounted_bytes, 1112 + 1_000);
+        assert_eq!(snapshot.occupied_bytes, 4_000 + 1112 + 1_000);
+        drop(held);
+        drop(required);
+        assert_eq!(budget.accounted_bytes(), 0);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9737: retention telemetry promoted entries in hash iteration order and changed LRU eviction"
+    )]
+    fn owner_snapshot_preserves_lru_eviction_order() {
+        fn filled() -> (RetentionBudget, BudgetRegion<Key, Value>) {
+            let budget = RetentionBudget::for_test_capacity(3 * 812);
+            let region = budget.region::<Key, Value>("lru-observation", None);
+            for key in 1..=3 {
+                drop(region.insert(Key(key), Value(100)));
+                budget.run_pending_tasks();
+            }
+            (budget, region)
+        }
+        let (observed, observed_region) = filled();
+        let (control, control_region) = filled();
+        // Choose an LRU order opposite to the observer's hash traversal, so
+        // promoting membership checks would deterministically reverse it.
+        let traversal = observed_region
+            .inner
+            .tracked
+            .lock()
+            .unwrap()
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(traversal.len(), 3);
+        for id in traversal.iter().rev() {
+            assert!(observed.0.entries.get(id).is_some());
+            assert!(control.0.entries.get(id).is_some());
+        }
+        observed.run_pending_tasks();
+        control.run_pending_tasks();
+        let oldest = *traversal.last().unwrap();
+        let snapshot = observed.snapshot();
+        assert_eq!(snapshot.regions[0].stats.entries, 3);
+        drop(observed_region.insert(Key(9), Value(100)));
+        drop(control_region.insert(Key(9), Value(100)));
+        observed.run_pending_tasks();
+        control.run_pending_tasks();
+        assert!(!control.0.entries.contains_key(&oldest));
+        assert!(
+            !observed.0.entries.contains_key(&oldest),
+            "observing occupancy must not change the next LRU victim"
+        );
+        assert_eq!(observed.accounted_bytes(), control.accounted_bytes());
+    }
+
+    #[test]
+    fn owner_snapshot_keeps_held_charges_without_retaining_regions() {
+        let budget = RetentionBudget::for_test_capacity(2_000);
+        let first = budget.region::<Key, Value>("same-name", None);
+        let second = budget.region::<Key, Value>("same-name", None);
+        let held = first.insert(Key(1), Value(100));
+        let initial = budget.snapshot();
+        assert_eq!(initial.regions.len(), 2);
+        assert!(initial.regions[0].namespace < initial.regions[1].namespace);
+        assert_eq!(initial.regions[0].stats.entries, 1);
+        assert_eq!(initial.accounted_bytes, 812);
+
+        first.evict_ready_for_test(&Key(1));
+        let evicted = budget.snapshot();
+        assert_eq!(evicted.regions[0].stats.entries, 0);
+        assert_eq!(evicted.regions[0].stats.deferred_bytes, 812);
+        assert_eq!(evicted.accounted_bytes, initial.accounted_bytes);
+        assert!(evicted.sample_sequence > initial.sample_sequence);
+        assert_eq!(evicted.owner_id, initial.owner_id);
+        drop((first, second));
+        assert!(budget.0.regions.lock().unwrap().is_empty());
+        let orphaned = budget.snapshot();
+        assert!(orphaned.regions.is_empty());
+        assert_eq!(orphaned.accounted_bytes, 812);
+        drop(held);
+        assert_eq!(budget.snapshot().accounted_bytes, 0);
+
+        // Required state is charged directly, even above the owner's capacity.
+        let required = AllocationCharge::acquire_required(&budget, 3_000);
+        let snapshot = budget.snapshot();
+        assert!(snapshot.regions.is_empty());
+        assert_eq!(snapshot.accounted_bytes, 3_000);
+        assert_eq!(snapshot.capacity_bytes, 2_000);
+        drop(required);
+        for _ in 0..100 {
+            drop(budget.region::<Key, Value>("short-lived", None));
+            assert!(budget.0.regions.lock().unwrap().is_empty());
+        }
+        let weak = Arc::downgrade(&budget.0);
+        drop(budget);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn reporting_guard_samples_only_when_timing_is_enabled() {
+        let budget = RetentionBudget::for_test_capacity(2_000);
+        let region = budget.region::<Key, Value>("telemetry-smoke", None);
+        drop(region.insert(Key(1), Value(100)));
+        {
+            let _report = crate::profiling::retention_scope(&budget, "service_request", "smoke");
+        }
+        assert_eq!(
+            budget.0.sample_sequence.load(Ordering::Relaxed),
+            u64::from(crate::profiling::enabled())
+        );
+    }
 
     #[brokk_bifrost_test_macros::hardwon(
         "#9559: admission evicted a value whose drop re-entered the same budget and deadlocked"
@@ -1520,7 +2159,7 @@ mod tests {
         }
         let (send, recv) = std::sync::mpsc::channel();
         thread::spawn(move || {
-            let budget = RetentionBudget::new(2000);
+            let budget = RetentionBudget::for_test_capacity(2000);
             let target = budget.region::<Key, Value>("reentrant-target", None);
             let victims = budget.region::<Key, Reentrant>("reentrant-victim", None);
             let candidates = budget.region::<Key, Value>("reentrant-candidate", None);
@@ -1573,7 +2212,7 @@ mod tests {
                 }
             }
             for replacement in [None, Some(())] {
-                let budget = RetentionBudget::new(100_000);
+                let budget = RetentionBudget::for_test_capacity(100_000);
                 let region = budget.region::<Key, SharedAllocation<Shared>>("revival-fence", None);
                 let held = Arc::new(Shared(AllocationCharge::acquire(&budget, 1000)));
                 drop(region.insert_shared(Key(1), SharedAllocation::new(held.clone())));
@@ -1653,7 +2292,7 @@ mod tests {
             }
         }
         let dropped = Arc::new(AtomicU64::new(0));
-        let budget = RetentionBudget::new(1_600);
+        let budget = RetentionBudget::for_test_capacity(1_600);
         let region = budget.region::<Key, Tracked>("resident", None);
         let backing = budget.shared_backing(100).expect("backing fits");
         drop(region.insert_with_backing(Key(1), Tracked(dropped.clone()), Some(backing)));
@@ -1676,7 +2315,7 @@ mod tests {
                 &self.0
             }
         }
-        let budget = RetentionBudget::new(1_600);
+        let budget = RetentionBudget::for_test_capacity(1_600);
         let region = budget.region::<Key, SharedAllocation<Shared>>("shared-allocation", None);
         let held = Arc::new(Shared(AllocationCharge::acquire(&budget, 300)));
         drop(region.insert(Key(1), SharedAllocation::new(held.clone())));
@@ -1711,7 +2350,7 @@ mod tests {
 
     #[test]
     fn invalidate_all_clears_one_instance_and_keeps_held_values_charged() {
-        let budget = RetentionBudget::new(10_000);
+        let budget = RetentionBudget::for_test_capacity(10_000);
         let cleared = budget.region::<Key, Value>("snapshot-scoped", None);
         let other = budget.region::<Key, Value>("snapshot-scoped", None);
         let held = cleared.insert(Key(1), Value(100));
@@ -1745,7 +2384,7 @@ mod tests {
                 &self.0
             }
         }
-        let budget = RetentionBudget::new(1_600);
+        let budget = RetentionBudget::for_test_capacity(1_600);
         let region = budget.region::<Key, SharedAllocation<Shared>>("evictable-shared", None);
         let resident = Arc::new(Shared(AllocationCharge::acquire(&budget, 1_000)));
         assert!(resident.allocation_charge().is_charged());
@@ -1768,7 +2407,7 @@ mod tests {
                 &self.0
             }
         }
-        let budget = RetentionBudget::new(2_500);
+        let budget = RetentionBudget::for_test_capacity(2_500);
         let left = budget.region::<Key, SharedAllocation<Shared>>("shared-left", None);
         let right = budget.region::<Key, SharedAllocation<Shared>>("shared-right", None);
         let shared = Arc::new(Shared(AllocationCharge::acquire(&budget, 1_000)));
@@ -1784,7 +2423,7 @@ mod tests {
 
     #[test]
     fn a_required_charge_evicts_cached_entries_and_may_run_over_capacity() {
-        let budget = RetentionBudget::new(2_000);
+        let budget = RetentionBudget::for_test_capacity(2_000);
         let region = budget.region::<Key, Value>("evictable", None);
         drop(region.insert(Key(1), Value(500)));
         budget.run_pending_tasks();
@@ -1806,7 +2445,7 @@ mod tests {
         "#11083: a required charge sized its eviction before destroying queued drops, so it ran over capacity with entries still resident"
     )]
     fn a_required_charge_sizes_eviction_after_queued_drops() {
-        let budget = RetentionBudget::new(2_000);
+        let budget = RetentionBudget::for_test_capacity(2_384);
         let region = budget.region::<Key, Value>("queued-drop", None);
         drop(region.insert(Key(1), Value(400)));
         drop(region.insert(Key(2), Value(400)));
@@ -1849,7 +2488,7 @@ mod tests {
                 self.kept.lock().unwrap().push(charge);
             }
         }
-        let budget = RetentionBudget::new(3_000);
+        let budget = RetentionBudget::for_test_capacity(3_000);
         let values = budget.region::<Key, Value>("reentrant-charge-values", None);
         let charging = budget.region::<Key, Charging>("reentrant-charge-victim", None);
         let kept = Arc::new(Mutex::new(Vec::new()));
@@ -1893,7 +2532,7 @@ mod tests {
                 drop(self.0.insert(Key(9), Value(400)));
             }
         }
-        let budget = RetentionBudget::new(3_000);
+        let budget = RetentionBudget::for_test_capacity(3_384);
         let values = budget.region::<Key, Value>("refill-values", None);
         let refilling = budget.region::<Key, Refilling>("refill-victim", None);
         drop(refilling.insert(Key(1), Refilling(values.clone())));
@@ -1916,7 +2555,7 @@ mod tests {
         "#9737: inserting an existing key left the replaced entry resident and charged"
     )]
     fn reinserting_a_key_releases_the_replaced_entry() {
-        let budget = RetentionBudget::new(100_000);
+        let budget = RetentionBudget::for_test_capacity(100_000);
         let region = budget.region::<Key, Value>("reinsert", None);
         drop(region.insert(Key(1), Value(100)));
         budget.run_pending_tasks();
@@ -1937,7 +2576,7 @@ mod tests {
                 &self.0
             }
         }
-        let budget = RetentionBudget::new(10_000);
+        let budget = RetentionBudget::for_test_capacity(10_000);
         let region = budget.region::<Key, SharedAllocation<Shared>>("revivable", None);
         let held = Arc::new(Shared(AllocationCharge::acquire(&budget, 1_000)));
         drop(region.insert_shared(Key(1), SharedAllocation::new(held.clone())));
@@ -2025,7 +2664,7 @@ mod tests {
 
     #[test]
     fn cross_region_charge_and_caller_held_eviction() {
-        let budget = RetentionBudget::new(1_600);
+        let budget = RetentionBudget::for_test_capacity(1_600);
         let left = budget.region::<Key, Value>("left", None);
         let right = budget.region::<Key, Value>("right", None);
         let held = left.insert(Key(1), Value(300));
@@ -2058,7 +2697,7 @@ mod tests {
 
     #[test]
     fn lru_trades_regions_and_pinned_charge_refuses() {
-        let budget = RetentionBudget::new(1_600);
+        let budget = RetentionBudget::for_test_capacity(1_600);
         let left = budget.region::<Key, Value>("trade-left", None);
         let right = budget.region::<Key, Value>("trade-right", None);
         drop(left.insert(Key(1), Value(300)));
@@ -2068,7 +2707,7 @@ mod tests {
         assert!(matches!(admitted, BudgetedValue::Retained(_)));
         assert!(left.get(&Key(1)).is_none());
         assert!(right.get(&Key(2)).is_some());
-        assert_eq!(budget.accounted_bytes(), 820);
+        assert_eq!(budget.accounted_bytes(), 1012);
 
         right.evict_ready_for_test(&Key(2));
         budget.run_pending_tasks();
@@ -2089,8 +2728,237 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9925: factory and plan holders must share one charge until final owner release"
+    )]
+    fn keyed_shared_backing_clones_scopes_refusals_and_final_release() {
+        let bytes = 80;
+        let charge = bytes + UNROUNDED_ENTRY_OVERHEAD_BYTES as u64;
+        let budget = RetentionBudget::new(charge);
+        let lease = budget.shared_backing_for(7, bytes).unwrap();
+        let alias = budget.shared_backing_for(7, bytes).unwrap();
+        assert!(Arc::ptr_eq(&lease.0, &alias.0));
+        assert_eq!(lease.bytes(), bytes);
+        assert_eq!(budget.accounted_bytes(), charge);
+        let capacity = budget.0.keyed_backings.lock().unwrap().capacity();
+        assert!(budget.shared_backing_for(7, bytes + 1).is_none());
+        assert!(budget.shared_backing_for(8, bytes).is_none());
+        assert!(budget.shared_backing_for(8, u64::MAX).is_none());
+        {
+            let index = budget.0.keyed_backings.lock().unwrap();
+            assert_eq!(index.len(), 1);
+            assert_eq!(index.capacity(), capacity);
+        }
+        assert_eq!(budget.accounted_bytes(), charge);
+        let other = RetentionBudget::new(charge);
+        let independent = other.shared_backing_for(7, bytes).unwrap();
+        assert!(!Arc::ptr_eq(&lease.0, &independent.0));
+        let clone = alias.clone();
+        drop((lease, alias));
+        assert_eq!(budget.accounted_bytes(), charge);
+        drop(clone);
+        assert_eq!(budget.accounted_bytes(), 0);
+        assert_eq!(other.accounted_bytes(), charge);
+        let index = budget.0.keyed_backings.lock().unwrap();
+        assert!(index.is_empty());
+        assert_eq!(index.capacity(), 0);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9925: concurrent same-ID holders must not publish multiple charged backing allocations"
+    )]
+    fn keyed_shared_backing_concurrent_acquisition_and_budget_drop() {
+        let budget = RetentionBudget::new(4096);
+        let rendezvous = Arc::new(std::sync::Barrier::new(2));
+        let holders = std::thread::scope(|scope| {
+            let tasks: Vec<_> = (0..2)
+                .map(|_| {
+                    let budget = &budget;
+                    let rendezvous = &rendezvous;
+                    scope.spawn(move || {
+                        rendezvous.wait();
+                        budget.shared_backing_for(11, 100).unwrap()
+                    })
+                })
+                .collect();
+            tasks
+                .into_iter()
+                .map(|task| task.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(
+            holders
+                .iter()
+                .all(|lease| Arc::ptr_eq(&lease.0, &holders[0].0))
+        );
+        assert_eq!(
+            budget.accounted_bytes(),
+            100 + UNROUNDED_ENTRY_OVERHEAD_BYTES as u64
+        );
+        let counter = Arc::clone(&budget.0.accounted);
+        let weak_budget = Arc::downgrade(&budget.0);
+        drop(budget);
+        assert!(
+            weak_budget.upgrade().is_none(),
+            "leases must not retain BudgetInner"
+        );
+        assert_eq!(
+            counter.load(Ordering::Acquire),
+            100 + UNROUNDED_ENTRY_OVERHEAD_BYTES as u64
+        );
+        drop(holders);
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9925: reclaim may publish the requested shared ID while admission is released for destructors"
+    )]
+    fn keyed_shared_backing_rechecks_after_reentrant_reclaim() {
+        struct PublishOnDrop {
+            budget: RetentionBudget,
+            holder: Arc<Mutex<Option<SharedBackingLease>>>,
+        }
+        impl RetainedBytes for PublishOnDrop {
+            fn retained_bytes(&self) -> usize {
+                1000
+            }
+        }
+        impl Drop for PublishOnDrop {
+            fn drop(&mut self) {
+                *self.holder.lock().unwrap() =
+                    Some(self.budget.shared_backing_for(23, 100).unwrap());
+            }
+        }
+        let budget = RetentionBudget::new(4096);
+        let holder = Arc::new(Mutex::new(None));
+        let region = budget.region::<Key, PublishOnDrop>("keyed-reentrant", None);
+        drop(region.insert(
+            Key(1),
+            PublishOnDrop {
+                budget: budget.clone(),
+                holder: holder.clone(),
+            },
+        ));
+        budget.run_pending_tasks();
+        let id = region.inner.live.lock().unwrap().get(&Key(1)).unwrap().id;
+        // Queue destruction, but leave it to shared_backing_for's reclaim
+        // window to release admission and run the reentrant publication.
+        budget.0.entries.invalidate(&id);
+        let outer = budget.shared_backing_for(23, 100).unwrap();
+        let inner = holder.lock().unwrap().take().unwrap();
+        assert!(Arc::ptr_eq(&outer.0, &inner.0));
+        assert_eq!(
+            budget.accounted_bytes(),
+            100 + UNROUNDED_ENTRY_OVERHEAD_BYTES as u64
+        );
+        drop((outer, inner));
+        assert_eq!(budget.accounted_bytes(), 0);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9925: a delayed final drop must not remove a replacement weak owner at the same ID"
+    )]
+    fn keyed_shared_backing_delayed_drop_preserves_replacement() {
+        let budget = RetentionBudget::new(4096);
+        let old = budget.shared_backing_for(19, 70).unwrap();
+        let old_weak = Arc::downgrade(&old.0);
+        let mut index = budget.0.keyed_backings.lock().unwrap();
+        let (finished, completion) = std::sync::mpsc::channel();
+        let dropping = std::thread::spawn(move || {
+            drop(old);
+            finished
+                .send(())
+                .expect("completion receiver exists unless the test already timed out");
+        });
+        // Deadlock guards only, not performance assertions. Release the index
+        // before failing, and detach rather than join a worker that timed out.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while old_weak.strong_count() != 0 {
+            if std::time::Instant::now() >= deadline {
+                drop(index);
+                drop(dropping);
+                panic!("old backing never entered final drop; index released, worker detached");
+            }
+            std::thread::yield_now();
+        }
+        // Force the otherwise scheduler-dependent replacement publication
+        // between last-strong release and old destructor index cleanup. Use
+        // normal admission for the replacement's payload/control charge.
+        let mut replacement = budget
+            .shared_backing(90 + UNROUNDED_ENTRY_OVERHEAD_BYTES as u64)
+            .unwrap();
+        let backing = Arc::get_mut(&mut replacement.0).unwrap();
+        backing.bytes = 90;
+        backing.keyed_owner = Some((Arc::downgrade(&budget.0), 19));
+        index.insert(19, Arc::downgrade(&replacement.0));
+        drop(index);
+        if completion
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .is_err()
+        {
+            // A broken worker might still own the index mutex. Do not let
+            // failure unwinding drop this lease and block on that same mutex.
+            std::mem::forget(replacement);
+            drop(dropping);
+            panic!("old backing cleanup did not finish; worker detached, test lease leaked");
+        }
+        dropping
+            .join()
+            .expect("completed cleanup worker must not panic");
+        let retained = budget.shared_backing_for(19, 90).unwrap();
+        assert!(Arc::ptr_eq(&retained.0, &replacement.0));
+        assert_eq!(
+            budget.accounted_bytes(),
+            90 + UNROUNDED_ENTRY_OVERHEAD_BYTES as u64
+        );
+        drop((retained, replacement));
+        assert_eq!(budget.accounted_bytes(), 0);
+        assert!(budget.0.keyed_backings.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9925: shrinking a weak owner index must not leave uncharged backing capacity"
+    )]
+    fn keyed_shared_backing_index_capacity_shrinks_with_owners() {
+        let budget = RetentionBudget::new(1_000_000);
+        let mut leases: Vec<_> = (0..256)
+            .map(|id| budget.shared_backing_for(id, 1).unwrap())
+            .collect();
+        while let Some(lease) = leases.pop() {
+            drop(lease);
+            let index = budget.0.keyed_backings.lock().unwrap();
+            assert_eq!(index.len(), leases.len());
+            assert_eq!(
+                budget.accounted_bytes(),
+                leases.len() as u64 * (1 + UNROUNDED_ENTRY_OVERHEAD_BYTES as u64)
+            );
+            // Include spare hash buckets, controls, backing/control blocks and
+            // the index's fixed header in the per-entry conservative allowance.
+            if index.is_empty() {
+                assert_eq!(index.capacity(), 0);
+            } else {
+                let buckets = index
+                    .capacity()
+                    .saturating_mul(8)
+                    .div_ceil(7)
+                    .next_power_of_two();
+                let metadata = buckets * (std::mem::size_of::<(usize, Weak<SharedBacking>)>() + 1)
+                    + 16
+                    + std::mem::size_of_val(&*index)
+                    + index.len()
+                        * (std::mem::size_of::<SharedBacking>() + 2 * std::mem::size_of::<usize>());
+                assert!(metadata <= index.len() * UNROUNDED_ENTRY_OVERHEAD_BYTES);
+            }
+        }
+    }
+
+    #[test]
     fn revival_and_shared_backing_charge_once() {
-        let budget = RetentionBudget::new(3_000);
+        let budget = RetentionBudget::for_test_capacity(3_000);
         let region = budget.region::<Key, Value>("values", None);
         let lease = budget.shared_backing(400).expect("backing fits");
         let held = region.insert_with_backing(Key(1), Value(100), Some(lease.clone()));
@@ -2113,7 +2981,7 @@ mod tests {
 
     #[test]
     fn refusal_and_entry_cap() {
-        let budget = RetentionBudget::new(2_000);
+        let budget = RetentionBudget::for_test_capacity(2_000);
         let region = budget.region::<Key, Value>("capped", Some(1));
         let first = region.insert(Key(1), Value(100));
         let second = region.insert(Key(2), Value(100));
@@ -2134,7 +3002,7 @@ mod tests {
         assert!(region.get(&Key(3)).is_none());
         assert!(region.revive(&Key(3)).is_none());
         drop((first, second, large));
-        let huge_budget = RetentionBudget::new(u64::MAX);
+        let huge_budget = RetentionBudget::for_test_capacity(u64::MAX);
         let huge = huge_budget.region::<Key, Value>("huge", None);
         let value = huge.insert(Key(4), Value(u32::MAX as usize));
         assert!(matches!(
@@ -2151,7 +3019,7 @@ mod tests {
 
     #[test]
     fn refused_flight_is_usable_without_retention() {
-        let budget = RetentionBudget::new(700);
+        let budget = RetentionBudget::for_test_capacity(700);
         let cache = BudgetedValueCache::new(budget.region::<Key, Value>("refused-flight", None));
         let token = CancellationToken::new();
         let (acquired, _) = cache.acquire(&Key(1), &token);
@@ -2187,7 +3055,7 @@ mod tests {
 
     #[test]
     fn last_drop_clears_live_and_next_demand_rebuilds() {
-        let budget = RetentionBudget::new(2_000);
+        let budget = RetentionBudget::for_test_capacity(2_000);
         let cache = BudgetedValueCache::new(budget.region::<Key, Value>("rebuild", None));
         let token = CancellationToken::new();
         let (acquired, _) = cache.acquire(&Key(1), &token);
@@ -2213,7 +3081,7 @@ mod tests {
     )]
     #[test]
     fn invalidation_fences_a_running_build() {
-        let budget = RetentionBudget::new(4_000);
+        let budget = RetentionBudget::for_test_capacity(4_000);
         let cache = BudgetedValueCache::new(budget.region::<Key, Value>("fenced", None));
         let token = CancellationToken::new();
         for invalidate_all in [true, false] {
@@ -2254,7 +3122,7 @@ mod tests {
 
     #[test]
     fn single_flight_and_registration_cleanup() {
-        let budget = RetentionBudget::new(4_000);
+        let budget = RetentionBudget::for_test_capacity(4_000);
         let cache = BudgetedValueCache::new(budget.region::<Key, Value>("flight", None));
         let token = CancellationToken::new();
         let (acquired, _) = cache.acquire(&Key(1), &token);
@@ -2306,18 +3174,18 @@ mod tests {
     }
     #[test]
     fn probe_accounts_for_deferred_and_resident() {
-        let budget = RetentionBudget::new(3_000);
+        let budget = RetentionBudget::for_test_capacity(3_000);
         let region = budget.region::<Key, Value>("probe-regression", None);
-        let held = region.insert(Key(1), Value(980)); // charge 1500
+        let held = region.insert(Key(1), Value(980)); // charge 1692
         region.evict_ready_for_test(&Key(1));
-        drop(region.insert(Key(2), Value(480))); // charge 1000, resident
+        drop(region.insert(Key(2), Value(480))); // charge 1192, resident
         region.run_pending_tasks();
-        assert_eq!(budget.accounted_bytes(), 2500);
+        assert_eq!(budget.accounted_bytes(), 2884);
         let candidate = region.insert(Key(3), Value(480));
         region.run_pending_tasks();
         assert!(matches!(candidate, BudgetedValue::Retained(_)));
         assert!(region.get(&Key(2)).is_none());
-        assert_eq!(budget.accounted_bytes(), 2500);
+        assert_eq!(budget.accounted_bytes(), 2884);
         drop(held);
     }
 
@@ -2340,7 +3208,7 @@ mod tests {
                 self.release.lock().unwrap().recv().unwrap();
             }
         }
-        let budget = RetentionBudget::new(2000);
+        let budget = RetentionBudget::for_test_capacity(2000);
         let region = budget.region::<Key, BlockingValue>("blocked-drop", None);
         let (observed_tx, observed_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -2355,8 +3223,8 @@ mod tests {
         region.invalidate(&Key(1));
         region.run_pending_tasks();
         let child = thread::spawn(move || drop(handle));
-        assert_eq!(observed_rx.recv().unwrap(), 620);
-        assert_eq!(budget.accounted_bytes(), 620);
+        assert_eq!(observed_rx.recv().unwrap(), 812);
+        assert_eq!(budget.accounted_bytes(), 812);
         release_tx.send(()).unwrap();
         child.join().unwrap();
         assert_eq!(budget.accounted_bytes(), 0);
@@ -2364,7 +3232,7 @@ mod tests {
 
     #[test]
     fn rejected_followers_share_failure_wave() {
-        let budget = RetentionBudget::new(2000);
+        let budget = RetentionBudget::for_test_capacity(2000);
         let cache = BudgetedValueCache::new(budget.region::<Key, Value>("failure-wave", None));
         let (first, _) = cache.acquire(&Key(1), &CancellationToken::new());
         let BudgetedValueAcquisition::Leader { permit } = first else {
@@ -2388,7 +3256,7 @@ mod tests {
 
     #[test]
     fn two_owners_keep_shared_backing() {
-        let budget = RetentionBudget::new(3000);
+        let budget = RetentionBudget::for_test_capacity(3000);
         let region = budget.region::<Key, Value>("two-owner", None);
         let lease = budget.shared_backing(400).unwrap();
         let first = region.insert_with_backing(Key(1), Value(100), Some(lease.clone()));
@@ -2398,14 +3266,14 @@ mod tests {
         region.invalidate(&Key(2));
         region.run_pending_tasks();
         drop(first);
-        assert_eq!(budget.accounted_bytes(), 1020);
+        assert_eq!(budget.accounted_bytes(), 1212);
         drop(second);
         assert_eq!(budget.accounted_bytes(), 0);
     }
 
     #[test]
     fn concurrent_admission_drop_stress() {
-        let budget = RetentionBudget::new(3000);
+        let budget = RetentionBudget::for_test_capacity(3000);
         let region = budget.region::<Key, Value>("stress", None);
         thread::scope(|scope| {
             for worker in 0..4 {
@@ -2424,6 +3292,20 @@ mod tests {
             }
         });
         region.run_pending_tasks();
+        assert_eq!(budget.accounted_bytes(), 0);
+    }
+}
+
+#[cfg(test)]
+mod allocated_charge_pins {
+    use super::*;
+    #[test]
+    fn keyed_refusing_backing_keeps_master_metadata_charge() {
+        let budget = RetentionBudget::for_test_capacity(8192);
+        let backing = budget.shared_backing_for(7, 128).expect("room");
+        assert_eq!(budget.accounted_bytes(), 640);
+        assert_eq!(backing.bytes(), 128);
+        drop(backing);
         assert_eq!(budget.accounted_bytes(), 0);
     }
 }

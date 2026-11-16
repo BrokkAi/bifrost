@@ -183,7 +183,7 @@ impl TypeHierarchyProvider for CppAnalyzer {
                 open: vec![brokk_bifrost_core::analyzer::capabilities::HierarchyOpenReason::MemberFamily(
                     brokk_bifrost_core::analyzer::structural::resolution::MemberFamilyReason::HierarchyTruncated,
                 )],
-                ..HierarchyAnswer::default()
+                ..HierarchyAnswer::complete(Vec::new())
             },
         })
     }

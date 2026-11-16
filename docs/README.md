@@ -17,7 +17,7 @@ the configured base or points at a missing output target.
 ## Release Documentation
 
 Bifrost release tags use the `v<semver>` form, such as `v0.7.2`. The docs workflow publishes the static site at
-`https://bifrost.brokk.ai` in two places:
+`https://bifrost.slopcop.com` in two places:
 
 - the custom-domain root, which represents the latest published docs;
 - `versions/<tag>/`, which preserves the docs for that exact release tag.

@@ -11,6 +11,12 @@ pub mod go_extraction_support_13 {
     use brokk_bifrost_analysis::inline_project::InlineTestProject;
     use brokk_bifrost_go::package_discovery::GoPackageDiscovery;
     use serde_json::json;
+    pub(crate) fn source_inventory_config() -> AnalyzerConfig {
+        let mut config = AnalyzerConfig::default();
+        config.go.dependency_discovery.mode =
+            brokk_bifrost_core::analyzer::config::GoDependencyDiscoveryMode::Disabled;
+        config
+    }
     #[doc(hidden)]
     pub struct Fixture {
         #[doc(hidden)]
@@ -23,6 +29,10 @@ pub mod go_extraction_support_13 {
     impl Fixture {
         #[doc(hidden)]
         pub fn new() -> Self {
+            Self::new_with_config(source_inventory_config())
+        }
+        #[doc(hidden)]
+        pub fn new_with_config(config: AnalyzerConfig) -> Self {
             let project = InlineTestProject::with_language(Language::Go)
                 .file("go.mod", "module example.test/root\n\ngo 1.22\n")
                 .file(
@@ -31,17 +41,21 @@ pub mod go_extraction_support_13 {
                 )
                 .file("provider/item.go", "package provider\ntype Item struct{}\n")
                 .build();
-            Self::from_project(project)
+            Self::from_project_with_config(project, config)
         }
         #[doc(hidden)]
         pub fn from_project(
             project: brokk_bifrost_analysis::inline_project::BuiltInlineTestProject,
         ) -> Self {
-            let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
-                project.project_dyn(),
-                AnalyzerConfig::default(),
-            )
-            .unwrap();
+            Self::from_project_with_config(project, source_inventory_config())
+        }
+        #[doc(hidden)]
+        pub fn from_project_with_config(
+            project: brokk_bifrost_analysis::inline_project::BuiltInlineTestProject,
+            config: AnalyzerConfig,
+        ) -> Self {
+            let workspace =
+                WorkspaceAnalyzer::build_ephemeral_footgun(project.project_dyn(), config).unwrap();
             let store = workspace.store().unwrap();
             let conn = store.read_conn().unwrap();
             let id = brokk_bifrost_analysis::analyzer::store::WorkspaceId::for_root(project.root());

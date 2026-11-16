@@ -35,6 +35,7 @@ use brokk_bifrost_analysis::analyzer::semantic_model::ResolvedDependencyArtifact
 use brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelActivationEvidence;
 
 use brokk_bifrost_analysis::analyzer::semantic_model::SuppressedDiagnostics;
+use brokk_bifrost_analysis::analyzer::semantic_model::ToolchainFloorExpectation;
 use brokk_bifrost_analysis::analyzer::topology::DependencyScope;
 
 use brokk_bifrost_core::analyzer::config::GoAnalyzerConfig;
@@ -277,25 +278,7 @@ fn discover_domain_with_runner(
         project.root().join(&domain.gowork_path).into_os_string()
     };
     set_env(&mut base_env, "GOWORK", &gowork);
-    let env_invocation = GoInvocation {
-        args: [
-            "env",
-            "-json",
-            "GOROOT",
-            "GOPATH",
-            "GOMODCACHE",
-            "GOVERSION",
-            "GOWORK",
-            "GOOS",
-            "GOARCH",
-        ]
-        .into_iter()
-        .map(OsString::from)
-        .collect(),
-        env: base_env,
-        stdout_limit: MAX_GO_ENV_STDOUT_BYTES,
-        description: "Go environment discovery",
-    };
+    let env_invocation = go_env_invocation(base_env, "Go environment discovery");
     let environment = if let Some(environment) = environment {
         environment
     } else {
@@ -687,6 +670,7 @@ fn build_curated_pack_evidence_outcome(
         diagnostics.truncate(limits.max_diagnostics);
     }
     DependencyDiscoveryOutcome {
+        incomplete_reason: None,
         profile: DependencyDiscoveryProfile {
             metadata_inputs_considered: 2,
             dependencies_resolved: dependencies.len(),
@@ -707,6 +691,7 @@ fn hardened_environment(config: &GoDependencyDiscoveryConfig) -> Vec<(OsString, 
         report_external_discovery_read(ExternalDiscoveryRead::Environment {
             name: name.into(),
             value: value.clone(),
+            working_directory: None,
         });
         value
     });
@@ -744,6 +729,19 @@ fn hardened_environment(config: &GoDependencyDiscoveryConfig) -> Vec<(OsString, 
         env.push(os_env("GOARCH", goarch));
     }
     env
+}
+
+/// The one `go env -json` capture. It names no key, so it reports the Go
+/// command's complete effective configuration under `env`, the hardened
+/// environment discovery runs `go list` in. [`GoEnvironment`] keeps all of it, and
+/// the build profile folds it (#11607).
+fn go_env_invocation(env: Vec<(OsString, OsString)>, description: &'static str) -> GoInvocation {
+    GoInvocation {
+        args: ["env", "-json"].into_iter().map(OsString::from).collect(),
+        env,
+        stdout_limit: MAX_GO_ENV_STDOUT_BYTES,
+        description,
+    }
 }
 
 fn validate_config(config: &GoDependencyDiscoveryConfig) -> Result<(), String> {
@@ -1147,6 +1145,7 @@ fn build_outcome(
         diagnostics.truncate(limits.max_diagnostics);
     }
     DependencyDiscoveryOutcome {
+        incomplete_reason: None,
         profile: DependencyDiscoveryProfile {
             metadata_inputs_considered: 2,
             dependencies_resolved: dependencies.len(),
@@ -1443,6 +1442,7 @@ fn failed_outcome(
         return cancelled_outcome();
     }
     DependencyDiscoveryOutcome {
+        incomplete_reason: None,
         dependencies: Vec::new(),
         diagnostics: vec![error_diagnostic(code, None, message, limits)],
         suppressed_diagnostics: SuppressedDiagnostics::default(),
@@ -1493,6 +1493,9 @@ pub(crate) fn append_vendor_activation_rows(
         }
     };
     let mut snapshots = Vec::new();
+    // A build file that was not read leaves no row and no gap, so it must
+    // also withhold the toolchain floor: it could declare a lower `go` line.
+    let mut unread_build_file = false;
     for file in files.iter().filter(|file| {
         brokk_bifrost_go::packages::go_vendor_root(file.rel_path()).is_some()
             || file
@@ -1503,6 +1506,7 @@ pub(crate) fn append_vendor_activation_rows(
         match project.read_source_snapshot_limited(file, evidence_limits.max_file_bytes) {
             Ok(Some(snapshot)) => snapshots.push((file.rel_path().to_path_buf(), snapshot)),
             Ok(None) => {
+                unread_build_file = true;
                 outcome.complete = false;
                 outcome.diagnostics.push(error_diagnostic(
                     "go.vendor_evidence_incomplete",
@@ -1516,6 +1520,7 @@ pub(crate) fn append_vendor_activation_rows(
                 ));
             }
             Err(error) => {
+                unread_build_file = true;
                 outcome.complete = false;
                 outcome.diagnostics.push(error_diagnostic(
                     "go.vendor_files",
@@ -1556,6 +1561,17 @@ pub(crate) fn append_vendor_activation_rows(
                 limits,
             ));
         }
+    }
+    if !unread_build_file
+        && let Some(floor) = declared_toolchain_floor(outcome, &snapshots, &evidence)
+    {
+        outcome.expect_toolchain_floor(ToolchainFloorExpectation {
+            language: brokk_bifrost_core::analyzer::model::Language::Go,
+            pack_ecosystem: "go-stdlib",
+            toolchain: "go",
+            floor,
+            ceiling: Version::new(2, 0, 0),
+        });
     }
     let named = outcome
         .dependencies
@@ -1618,6 +1634,66 @@ pub(crate) fn append_vendor_activation_rows(
     }
 }
 
+/// The lowest Go release every workspace module admits, read from the
+/// modules' `go` directives when no observed toolchain selected the standard
+/// library (#12499).
+///
+/// Since Go 1.21 the go command refuses to build a module whose `go` line is
+/// newer than itself, so a toolchain that builds the workspace is at least
+/// the lowest `go` line among its modules. That is a floor, not the
+/// toolchain: it may be any later release, and a toolchain older than Go 1.21
+/// does not enforce the line, so packs selected from the floor are
+/// approximate. A language version such as `go 1.26` also admits that
+/// release's candidates, which carry its frozen API; the floor reads it as
+/// the 1.26.0 release.
+///
+/// There is no floor when a module states no `go` line (Go then assumes
+/// 1.16), or when its build file was rejected, cut short or unparsable: an
+/// unread module could declare a lower line. The caller withholds the floor
+/// for a build file it could not read at all, which leaves no gap here.
+fn declared_toolchain_floor(
+    outcome: &DependencyDiscoveryOutcome,
+    snapshots: &[super::build_evidence::GoBuildSnapshot<'_>],
+    evidence: &brokk_bifrost_analysis::analyzer::semantic_model::DependencyFileEvidence,
+) -> Option<Version> {
+    use brokk_bifrost_analysis::analyzer::semantic_model::DependencyEvidenceGapKind;
+    if outcome
+        .dependencies
+        .iter()
+        .any(|dependency| dependency.evidence.ecosystem == "go-stdlib")
+        || evidence.gaps.iter().any(|gap| {
+            matches!(
+                gap.kind,
+                DependencyEvidenceGapKind::Limit | DependencyEvidenceGapKind::Cancelled
+            )
+        })
+    {
+        return None;
+    }
+    let mut floor = None::<Version>;
+    for snapshot in snapshots {
+        if snapshot.path.file_name() != Some(OsStr::new("go.mod"))
+            || brokk_bifrost_go::package_discovery::go_tool_ignores_directory(
+                snapshot.path.parent().expect("a go.mod path has a parent"),
+            )
+        {
+            continue;
+        }
+        let declared = evidence.rows.iter().find(|row| {
+            row.build_file.as_path() == snapshot.path
+                && row.ecosystem == super::build_evidence::GO_TOOLCHAIN_ECOSYSTEM
+                && row.complete
+                && row.conditions.iter().any(|condition| {
+                    condition.kind == "go_constraint"
+                        && condition.value == "declared_language_requirement"
+                })
+        })?;
+        let version = go_version(declared.version_requirement.as_deref()?)?;
+        floor = Some(floor.map_or(version.clone(), |floor| floor.min(version)));
+    }
+    floor
+}
+
 fn cancelled_outcome() -> DependencyDiscoveryOutcome {
     DependencyDiscoveryOutcome::cancelled_with_message("Go dependency discovery was cancelled")
 }
@@ -1644,25 +1720,7 @@ pub(crate) fn domain_environment(
             .unwrap_or_else(|| Path::new("go")),
         &project.root().join(&domain.directory),
         config,
-        &GoInvocation {
-            args: [
-                "env",
-                "-json",
-                "GOROOT",
-                "GOPATH",
-                "GOMODCACHE",
-                "GOVERSION",
-                "GOWORK",
-                "GOOS",
-                "GOARCH",
-            ]
-            .into_iter()
-            .map(OsString::from)
-            .collect(),
-            env,
-            stdout_limit: MAX_GO_ENV_STDOUT_BYTES,
-            description: "Go domain environment discovery",
-        },
+        &go_env_invocation(env, "Go domain environment discovery"),
         Some(cancellation),
     )?;
     serde_json::from_slice(&bytes).map_err(|error| format!("invalid Go environment: {error}"))
@@ -1693,6 +1751,8 @@ pub(crate) fn discover_domain(
 mod tests {
 
     use crate::analyzer::go::dependency_discovery::*;
+    #[cfg(target_os = "linux")]
+    use crate::test_support::OTHER_TOOLCHAIN_GO_ENV_SCRIPT;
     use brokk_bifrost_analysis::analyzer::dependency_support::capture_external_discovery_reads;
     use brokk_bifrost_analysis::analyzer::semantic_model::ResolvedDependencyArtifactInput;
 
@@ -2260,7 +2320,8 @@ mod tests {
         assert!(outcome.complete, "{:?}", outcome.diagnostics);
         let invocations = runner.invocations.borrow();
         assert_eq!(invocations.len(), 2);
-        assert_eq!(invocations[0].args[0], "env");
+        // The capture names no key: it is go's whole effective configuration.
+        assert_eq!(invocations[0].args, ["env", "-json"].map(OsString::from));
         assert_eq!(invocations[1].args[0], "list");
         assert!(invocations[1].args.iter().any(|arg| arg == "-deps"));
         assert!(invocations[1].args.iter().any(|arg| arg == "-test"));
@@ -2304,6 +2365,173 @@ mod tests {
             Some(&OsString::from(r"D:\go-build"))
         );
         assert!(!env.contains_key(OsStr::new("UNREVIEWED_SECRET")));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn go_is_installed() -> bool {
+        Command::new("go").arg("version").output().is_ok()
+    }
+
+    /// The environment discovery captures for `project`'s root domain through `go_executable`.
+    #[cfg(target_os = "linux")]
+    fn capture_environment(go_executable: &Path, project: &TestProject) -> GoEnvironment {
+        let mut config = GoAnalyzerConfig::default();
+        config.dependency_discovery.go_executable = Some(go_executable.to_path_buf());
+        domain_environment(
+            &config,
+            project,
+            &Default::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn profile_of(environment: GoEnvironment) -> [u8; 32] {
+        let config = GoAnalyzerConfig::default();
+        let build_configuration = selected_build_configuration(
+            &config.dependency_discovery,
+            &environment.goos,
+            &environment.goarch,
+        );
+        brokk_bifrost_analysis::analyzer::store::go_package_context::base_profile_digest(
+            &GoPackageDiscovery {
+                domain: Default::default(),
+                input_digest: None,
+                failure: None,
+                packages: Vec::new(),
+                environment,
+                build_configuration,
+                workspace_patterns: config.dependency_discovery.workspace_patterns,
+                vendor: false,
+            },
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn go_wrapper(directory: &Path, name: &str, script: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = directory.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// `go env -json` reports a fresh temporary directory in GOGCCFLAGS and the
+    /// checkout's go.mod in GOMOD. Two real captures from different checkouts
+    /// and temporary directories must still give one profile digest.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[hardwon(
+        "#11607: review found a per-invocation go env field made the Go profile digest differ between two runs"
+    )]
+    fn two_real_go_env_captures_give_one_profile_digest() {
+        if !go_is_installed() {
+            return;
+        }
+        let temporary = tempfile::tempdir().unwrap();
+        let mut digests = Vec::new();
+        for name in ["first", "second"] {
+            let root = temporary.path().join(name).join("project");
+            let scratch = temporary.path().join(name).join("tmp");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::create_dir_all(&scratch).unwrap();
+            std::fs::write(
+                root.join("go.mod"),
+                format!("module example.com/{name}\n\ngo 1.21\n"),
+            )
+            .unwrap();
+            let go = go_wrapper(
+                temporary.path(),
+                &format!("go-{name}"),
+                &format!("TMPDIR={} exec go \"$@\"", scratch.display()),
+            );
+            let environment = capture_environment(&go, &TestProject::new(&root, Language::Go));
+            // The two fields really differ between these captures.
+            assert!(
+                environment.settings["GOGCCFLAGS"].contains(scratch.to_str().unwrap()),
+                "{:?}",
+                environment.settings["GOGCCFLAGS"]
+            );
+            digests.push(profile_of(environment));
+        }
+        assert_eq!(digests[0], digests[1]);
+    }
+
+    /// Two captures of an unchanged environment give one profile, a toolchain
+    /// that reports another default for a key the profile did not name before
+    /// gives another, and a value that only the GOENV file sets reaches
+    /// neither the capture nor `go list`, because discovery pins GOENV=off.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[hardwon(
+        "#11607: base_profile_digest pinned only GOTOOLCHAIN, so a toolchain default outside its short list left the profile unchanged"
+    )]
+    fn the_profile_follows_the_go_env_capture_discovery_runs_under() {
+        if !go_is_installed() {
+            return;
+        }
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("project");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(
+            root.join("go.mod"),
+            "module example.com/profile\n\ngo 1.21\n",
+        )
+        .unwrap();
+        let project = TestProject::new(&root, Language::Go);
+        let plain = Path::new("go");
+        let baseline_environment = capture_environment(plain, &project);
+        let baseline = profile_of(baseline_environment.clone());
+        // `go env` reports a temporary directory in GOGCCFLAGS and the checkout
+        // in GOMOD; neither may make two captures differ.
+        assert_eq!(baseline, profile_of(capture_environment(plain, &project)));
+
+        let other_default = go_wrapper(
+            temporary.path(),
+            "go-other-default",
+            OTHER_TOOLCHAIN_GO_ENV_SCRIPT,
+        );
+        assert_ne!(
+            baseline,
+            profile_of(capture_environment(&other_default, &project))
+        );
+
+        // Control: with GOENV unpinned the file is honored, so the fixture
+        // would show if discovery read it.
+        let config_home = temporary.path().join("config");
+        std::fs::create_dir_all(config_home.join("go")).unwrap();
+        std::fs::write(
+            config_home.join("go/env"),
+            "GOPRIVATE=example.com/private\n",
+        )
+        .unwrap();
+        let with_file = go_wrapper(
+            temporary.path(),
+            "go-with-goenv-file",
+            &format!(
+                "export XDG_CONFIG_HOME={}\nexec go \"$@\"",
+                config_home.display()
+            ),
+        );
+        let honored = Command::new(&with_file)
+            .args(["env", "GOPRIVATE"])
+            .env_remove("GOENV")
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&honored.stdout).trim(),
+            "example.com/private"
+        );
+        let mut with_file_environment = capture_environment(&with_file, &project);
+        assert_eq!(with_file_environment.settings["GOPRIVATE"], "");
+        // Moving the configuration directory also moves the default telemetry
+        // directory, which is only a location: keep the baseline's.
+        with_file_environment.settings.insert(
+            "GOTELEMETRYDIR".into(),
+            baseline_environment.settings["GOTELEMETRYDIR"].clone(),
+        );
+        assert_eq!(baseline, profile_of(with_file_environment));
     }
 
     #[test]
@@ -2607,8 +2835,18 @@ mod tests {
                 .map(PathBuf::from)
                 .collect::<Vec<_>>()
         };
+        assert_eq!(
+            runs().len(),
+            2,
+            "construction discovers each initial module once"
+        );
+        clear();
         assert!(activate(&workspace).complete);
-        assert_eq!(runs().len(), 2, "each initial module invokes Go once");
+        assert_eq!(
+            runs(),
+            vec![fixture.root().to_path_buf()],
+            "activation retries the root domain and reuses the complete sibling"
+        );
         let context = |workspace: &WorkspaceAnalyzer, directory: &str| {
             let conn = workspace.store().unwrap().read_conn().unwrap();
             conn.query_row("SELECT p.context_id,s.profile_digest,p.complete FROM go_context_selections s JOIN go_context_publications p USING(selection_id) WHERE s.domain_dir=?1 AND p.valid_until IS NULL AND s.profile_digest<>?2",
@@ -2652,18 +2890,36 @@ mod tests {
             conn.query_row("SELECT versions.valid_from FROM resolution_unit_summary_versions versions JOIN resolution_unit_summaries summary USING(summary_id) WHERE versions.lang='go' AND versions.valid_until IS NULL AND versions.profile_digest=?1 LIMIT 1",[&root.1],|row|row.get::<_,i64>(0)).unwrap()
         };
         let previous = summary(&workspace);
-        let source =
-            "package root\nfunc Value() string {return \"new\"}\nfunc caller(){_ = Value()}\n";
-        fixture.file("root.go").write(source).unwrap();
+        // The unit summary is keyed on member surface fingerprints (#11183), and
+        // a Go summary cannot read return types, so a return-type edit reuses it.
+        fixture
+            .file("root.go")
+            .write(
+                "package root\nfunc Value() string {return \"new\"}\nfunc caller(){_ = Value()}\n",
+            )
+            .unwrap();
         workspace = workspace.update(&BTreeSet::from([fixture.file("root.go")]));
         assert_eq!(
             context(&workspace, "").0,
             root.0,
             "signature edit leaves placement unchanged"
         );
+        assert_eq!(
+            summary(&workspace),
+            previous,
+            "a return-type edit keeps the surface and reuses the summary"
+        );
+        let source = "package root\nfunc Value() string {return \"new\"}\nfunc caller(){_ = Value()}\nfunc Added() int {return 0}\n";
+        fixture.file("root.go").write(source).unwrap();
+        workspace = workspace.update(&BTreeSet::from([fixture.file("root.go")]));
+        assert_eq!(
+            context(&workspace, "").0,
+            root.0,
+            "a new declaration leaves placement unchanged"
+        );
         assert!(
             summary(&workspace) > previous,
-            "changed member blob rolls the summary version despite cutoff"
+            "a surface edit rolls the summary version despite the placement cutoff"
         );
         let analyzer =
             resolve_analyzer::<crate::analyzer::GoAnalyzer>(workspace.analyzer()).unwrap();

@@ -141,7 +141,7 @@ The two revisions also differ in where negotiation lives, and Bifrost keeps the 
 
 A tool call that carries a `progressToken` in its `_meta` receives `notifications/progress`; a call without the token receives none. The token is echoed exactly, string or number. The top-level `progress` is an increasing notification ordinal and `total` is absent. Neither is a file count or a percentage. Phase messages describe readiness, analyzer admission, execution, analyzer phases, and cancellation.
 
-Workspace indexing observations use the same notification with `message: "workspace indexing"` and a structured payload at `params._meta["io.bifrost/workspace-build"]`:
+Workspace indexing observations use the same notification with `message: "workspace indexing"` (or `"workspace indexing: <phase>"` while the build has a current phase) and a structured payload at `params._meta["io.bifrost/workspace-build"]`:
 
 ```json
 {
@@ -159,11 +159,13 @@ Workspace indexing observations use the same notification with `message: "worksp
 }
 ```
 
-`generation` identifies one build or refresh within this server process. `workspace_generation` identifies the authorized workspace binding, and `revision` changes as observations arrive. A retry or refresh starts a new build generation and clears its counters. `status` is `running`, `completed`, or `failed`; completion means the analyzer build completed, not that the requesting tool completed. A late subscriber waiting for startup can immediately receive the latest completed build snapshot. A warm refresh emits only its new generation and does not replay previous parse counters. Task observations also carry `task_id` while retaining the initiating `request_id` and progress token. When a readiness wait or execution budget ends, `request_status` distinguishes cancellation or failure of that wait from the shared build's status. A cancelled waiter does not cancel another request's shared cold build. MCP cancellation may suppress the cancelled request's final notification and response; in that case the client's own cancellation ends its stream.
+`generation` identifies one build or refresh within this server process. `workspace_generation` identifies the authorized workspace binding, and `revision` changes as counter or status observations arrive. The optional current `phase` is sampled independently and can change without a new revision. A retry or refresh starts a new build generation and clears its counters. `status` is `running`, `completed`, or `failed`; completion means the analyzer build completed, not that the requesting tool completed. A late subscriber waiting for startup can immediately receive the latest completed build snapshot. A warm refresh emits only its new generation and does not replay previous parse counters. Task observations also carry `task_id` while retaining the initiating `request_id` and progress token. When a readiness wait or execution budget ends, `request_status` distinguishes cancellation or failure of that wait from the shared build's status. A cancelled waiter does not cancel another request's shared cold build. MCP cancellation may suppress the cancelled request's final notification and response; in that case the client's own cancellation ends its stream.
+
+The optional `phase` string describes what a running build is doing now, including a shared analyzer cache build lock wait with its path, holder pid, host and purpose, and the UTC times at which the wait began and the holder took the lock. The server reads the current phase on each snapshot; it disappears when the wait ends and is absent from completed or failed snapshots. A cold-workspace not-ready error also includes the current phase when available.
 
 Counters copy real analyzer events. `enumerate`, `reconcile`, and `index` use `files`; `parse` and `persist` use `blobs` (the source representatives selected for parsing/persistence). `reconcile` measures reuse of cached facts; cached files are not reported as newly parsed. Phases and languages have independent denominators: never sum them into a global percentage. A null `total` is indeterminate. Totals can change, and counters describe only the producer's work, not successful parsing or the absence of diagnostics. The `intermediate` array preserves the first actual nonterminal observation for each language/phase when the build finishes between notification ticks; it is a historical sample, not an additional counter to add to `counters`.
 
-Observations contain no file labels, absolute paths, source text, or diagnostic strings. Recording starts before background cold indexing, so a first request can observe a build already in flight or completed. Refresh waits for the initial build before starting its own generation. The server retains at most 128 latest counters and 128 intermediate samples for one build per workspace, with no subscriber list or event history. Requests coalesce observations at 100 ms intervals and flush the latest state before returning. Transport waits are limited to 25 ms; slow or disconnected clients may miss observations without blocking indexing or cancellation. Request/task completion drops the observer, and workspace revocation prevents observations crossing workspace bindings.
+Counters contain no file labels, absolute paths, source text, or diagnostic strings. The optional build phase can name a cache path and the holder's build purpose. Recording starts before background cold indexing, so a first request can observe a build already in flight or completed. Refresh waits for the initial build before starting its own generation. The server retains at most 128 latest counters and 128 intermediate samples for one build per workspace, with no subscriber list or event history. Requests coalesce observations at 100 ms intervals and flush the latest state before returning. Phase and workspace-counter observations wait at most 25 ms each for the transport; partial policy-run observations wait up to 1 s. A slow or disconnected client may miss later phase or workspace observations without blocking indexing or cancellation. On normal request or task completion, a notification already handed to the transport is flushed before the response or terminal task result is published, so an observation never follows its answer; a client that stops reading can delay its own response. Request/task completion drops the observer, and workspace revocation prevents observations crossing workspace bindings.
 
 `list_policies` reads only the built-in policy pack and reports no progress. Workspace activation rounds likewise report none: they are answers requesting authorization, not phases of an executing call. Tasks are useful when policy work may outlive its initiating request, as described below.
 
@@ -315,6 +317,11 @@ unresolved, ambiguous, and unproven searches appear in
 `indeterminate_functions`. The result is static reachability evidence, not
 runtime coverage.
 
+`relation_brief` uses the same endpoints to summarize target-anchored callers,
+two-hop incoming use chains and changed outgoing calls. Every item includes a
+location outside changed lines. Typed completeness and budget omissions stay
+visible; Value flow is explicitly not computed. Tests are excluded by default.
+
 `score_diff` shares those endpoint rules and returns a deterministic vector of
 raw named features describing how hard a revision range makes future
 maintenance. It publishes no weights and no single score, because no validated
@@ -448,7 +455,7 @@ The other arguments match the CLI policy flags:
 [MCP Tools Reference](/reference/mcp-tools/) gives the type, bounds, and CLI
 flag of each argument.
 
-The structured result contains the canonical schema-5 `report` (see [Policy
+The structured result contains the canonical schema-13 `report` (see [Policy
 Reference](/reference/policies/) for its fields), a `status` of
 `clean`, `finding`, or `unreliable`, and the equivalent `exit_status` value
 `0`, `1`, or `2`. Read each run's completion state before you call a result

@@ -163,7 +163,8 @@ impl NativePointBatch {
                 .active_semantic_model_snapshot()
                 .map(NativePointPublication),
             analyzer
-                .semantic_model_overlay()
+                .semantic_model_overlay_read()
+                .published()
                 .map(NativePointPublication),
         );
         let (snapshots, languages) = native_point_operation_inputs(inner)?;
@@ -209,7 +210,8 @@ impl NativePointBatch {
                 .map(NativePointPublication)
                 == self.model.0
             && analyzer
-                .semantic_model_overlay()
+                .semantic_model_overlay_read()
+                .published()
                 .map(NativePointPublication)
                 == self.model.1
     }
@@ -381,7 +383,7 @@ impl NativePointBatch {
             if !value.admissible() {
                 // A nested failed point may be consumed as unknown by an
                 // enclosing point. That outer fill must not retain the failure.
-                query.analyzer.mark_execution_dependent();
+                crate::analyzer::i_analyzer::join_execution_dependence(query.analyzer);
                 return result;
             }
             // The exhaustive DTO audit also classifies optional request-local
@@ -1100,7 +1102,31 @@ fn resolve_native_definition_reference<A: LanguageAdapter, T>(
                 }
             }
         },
-        |site, kind, message| (unavailable_definition(site, kind, message), None),
+        |site, kind, message, certificate| {
+            use crate::analyzer::store::resolution_operation::ReferenceInventoryCompleteness;
+            let mut outcome = unavailable_definition(site, kind, message);
+            outcome.inventory_evidence = certificate.clone();
+            match certificate {
+                Some(ReferenceInventoryCompleteness::Certified) => {
+                    outcome.status = DefinitionLookupStatus::NotAReference;
+                    outcome.diagnostics[0].kind = "native_not_a_reference".into();
+                    if let Some(key) = crate::analyzer::structural::provider::StructuralFactProvider::structural_file_read_key(inner, query.file) {
+                        query.analyzer.record_read(key);
+                    }
+                }
+                Some(ReferenceInventoryCompleteness::Incomplete(completion)) => {
+                    outcome.incomplete_evidence = Some(
+                        crate::analyzer::usages::get_definition::DefinitionLookupEvidence {
+                            completion,
+                            reasons: Vec::new(),
+                            snapshot_stops: Vec::new(),
+                        },
+                    );
+                }
+                _ => {}
+            }
+            (outcome, None)
+        },
     )
 }
 
@@ -1169,7 +1195,12 @@ fn resolve_native_point_bounded<A: LanguageAdapter, T, O>(
         ReceiverAnalysisWork,
         Option<std::sync::Arc<crate::analyzer::semantic_model::SemanticModelSymbol>>,
     ) -> BoundedResolution<O>,
-    unavailable_value: impl Fn(&ResolvedReferenceSite, &str, String) -> O,
+    unavailable_value: impl Fn(
+        &ResolvedReferenceSite,
+        &str,
+        String,
+        Option<crate::analyzer::store::resolution_operation::ReferenceInventoryCompleteness>,
+    ) -> O,
 ) -> BoundedResolution<O> {
     let NativePointReference {
         #[cfg(any(test, feature = "test-support"))]
@@ -1179,7 +1210,7 @@ fn resolve_native_point_bounded<A: LanguageAdapter, T, O>(
         call_argument_ordinal,
     } = reference;
     let unavailable = |kind: &str, message: String| BoundedResolution::Complete {
-        value: unavailable_value(query.site, kind, message),
+        value: unavailable_value(query.site, kind, message, None),
         work: ReceiverAnalysisWork::default(),
     };
     let cancellation = query.cancellation.cloned().unwrap_or_default();
@@ -1348,17 +1379,21 @@ fn resolve_native_point_bounded<A: LanguageAdapter, T, O>(
                         SelectedResolutionLocated::Found(answer),
                     ) => return Ok(adapt(answer, work, selected_import_symbol)),
                     SelectedResolutionOperationOutcome::Native(
-                        SelectedResolutionLocated::Missing,
+                        SelectedResolutionLocated::Missing(certificate),
                     ) => unavailable_value(
                         query.site,
                         "native_reference_unavailable",
                         "the selected producer has no reference at this source range".into(),
+                        Some(certificate),
                     ),
-                    SelectedResolutionOperationOutcome::Unavailable(reason) => {
-                        unavailable_value(query.site, "native_unavailable", format!("{reason:?}"))
-                    }
+                    SelectedResolutionOperationOutcome::Unavailable(reason) => unavailable_value(
+                        query.site,
+                        "native_unavailable",
+                        format!("{reason:?}"),
+                        None,
+                    ),
                     SelectedResolutionOperationOutcome::Stale(reason) => {
-                        unavailable_value(query.site, "native_stale", format!("{reason:?}"))
+                        unavailable_value(query.site, "native_stale", format!("{reason:?}"), None)
                     }
                     SelectedResolutionOperationOutcome::Cancelled(_) => {
                         return Ok(BoundedResolution::Cancelled { work });
@@ -1384,6 +1419,9 @@ pub fn unavailable_definition(
     message: String,
 ) -> DefinitionLookupOutcome {
     DefinitionLookupOutcome {
+        selected_sites: Vec::new(),
+        inventory_evidence: None,
+        incomplete_evidence: None,
         modeled_definitions: Vec::new(),
         status: DefinitionLookupStatus::Unavailable,
         reference: Some(site.clone()),
@@ -1455,6 +1493,9 @@ fn adapt_definition_answer_impl(
         });
     if answer.predeclared_symbol {
         return DefinitionLookupOutcome {
+            selected_sites: Vec::new(),
+            inventory_evidence: None,
+            incomplete_evidence: None,
             modeled_definitions: Vec::new(),
             status: DefinitionLookupStatus::NoDefinition,
             reference: Some(site.clone()),
@@ -1513,6 +1554,9 @@ fn adapt_definition_answer_impl(
             ),
         };
         let outcome = DefinitionLookupOutcome {
+            selected_sites: Vec::new(),
+            inventory_evidence: None,
+            incomplete_evidence: None,
             modeled_definitions: Vec::new(),
             status,
             reference: Some(site.clone()),
@@ -1927,6 +1971,9 @@ fn adapt_definition_answer_impl(
             status
         };
     let mut outcome = DefinitionLookupOutcome {
+        selected_sites: Vec::new(),
+        inventory_evidence: None,
+        incomplete_evidence: None,
         modeled_definitions,
         status,
         reference: Some({
@@ -2219,7 +2266,7 @@ pub fn resolve_native_type_bounded<A: LanguageAdapter>(
                 work,
             },
         },
-        unavailable_type,
+        |site, kind, message, _| unavailable_type(site, kind, message),
     )
 }
 
@@ -2267,7 +2314,7 @@ pub fn resolve_native_observed_value_type_bounded<A: LanguageAdapter>(
                 work,
             },
         },
-        |_, _, _| ObservedValueType::Undecided(ValueTypeBarrierReason::IncompleteType),
+        |_, _, _, _| ObservedValueType::Undecided(ValueTypeBarrierReason::IncompleteType),
     )
 }
 
@@ -2430,7 +2477,7 @@ fn resolve_native_expression_type_projection_bounded<A: LanguageAdapter>(
                 }
             }
         },
-        |site, kind, message| NativeExpressionValueTypeLookup {
+        |site, kind, message, _| NativeExpressionValueTypeLookup {
             value_types: unavailable_type(site, kind, message),
             static_type: None,
         },
@@ -3013,43 +3060,8 @@ fn render_projected_type_shape(
 ) -> Option<(String, Vec<crate::analyzer::CodeUnit>)> {
     use crate::analyzer::resolution::SemanticId;
 
-    let nodes = shape
-        .nodes()
-        .iter()
-        .map(|node| (node.slot(), node))
-        .collect::<std::collections::HashMap<SemanticId, _>>();
-    let mut rendered = std::collections::HashMap::<SemanticId, String>::new();
     let mut definitions = std::collections::BTreeMap::<String, crate::analyzer::CodeUnit>::new();
-    let mut active = std::collections::HashSet::new();
-    let mut pending = vec![(shape.root_slot(), false)];
-    while let Some((slot, finish)) = pending.pop() {
-        let node = nodes.get(&slot)?;
-        if !finish {
-            if rendered.contains_key(&slot) {
-                continue;
-            }
-            if !active.insert(slot) {
-                return None;
-            }
-            pending.push((slot, true));
-            match node.form() {
-                FactProjectedTypeNodeForm::Alias(child)
-                | FactProjectedTypeNodeForm::Slice(child)
-                | FactProjectedTypeNodeForm::Array(child) => pending.push((*child, false)),
-                FactProjectedTypeNodeForm::Map { key, value } => {
-                    pending.push((*value, false));
-                    pending.push((*key, false));
-                }
-                FactProjectedTypeNodeForm::Applied(arguments) => {
-                    pending.extend(arguments.iter().rev().map(|argument| (*argument, false)));
-                }
-                FactProjectedTypeNodeForm::Leaf
-                | FactProjectedTypeNodeForm::Channel { .. }
-                | FactProjectedTypeNodeForm::Unsupported => {}
-            }
-            continue;
-        }
-
+    let spelling = render_type_shape_with(shape, |node, rendered| {
         let mut resolve_identity = |identity: SemanticId| -> Option<String> {
             if let Some(descriptor) = intrinsic.iter().find(|item| item.identity() == identity) {
                 return Some(descriptor.spelling().to_owned());
@@ -3109,13 +3121,63 @@ fn render_projected_type_shape(
         } else {
             format!("{}{spelling}", "*".repeat(indirection))
         };
+        Some(spelling)
+    })?;
+    Some((spelling, definitions.into_values().collect()))
+}
+
+/// Render a flat selected type expression with language-owned spelling hooks.
+/// The shared walk owns cycle detection and stack-safe child evaluation.
+#[doc(hidden)]
+pub fn render_type_shape_with(
+    shape: &FactProjectedTypeShape,
+    mut render: impl FnMut(
+        &crate::analyzer::resolution::FactProjectedTypeNode,
+        &std::collections::HashMap<crate::analyzer::resolution::SemanticId, String>,
+    ) -> Option<String>,
+) -> Option<String> {
+    use crate::analyzer::resolution::SemanticId;
+    let nodes = shape
+        .nodes()
+        .iter()
+        .map(|node| (node.slot(), node))
+        .collect::<std::collections::HashMap<SemanticId, _>>();
+    let mut rendered = std::collections::HashMap::<SemanticId, String>::new();
+    let mut active = std::collections::HashSet::new();
+    let mut pending = vec![(shape.root_slot(), false)];
+    while let Some((slot, finish)) = pending.pop() {
+        let node = nodes.get(&slot)?;
+        if !finish {
+            if rendered.contains_key(&slot) {
+                continue;
+            }
+            if !active.insert(slot) {
+                return None;
+            }
+            pending.push((slot, true));
+            match node.form() {
+                FactProjectedTypeNodeForm::Alias(child)
+                | FactProjectedTypeNodeForm::Slice(child)
+                | FactProjectedTypeNodeForm::Array(child) => pending.push((*child, false)),
+                FactProjectedTypeNodeForm::Map { key, value } => {
+                    pending.push((*value, false));
+                    pending.push((*key, false));
+                }
+                FactProjectedTypeNodeForm::Applied(arguments) => {
+                    pending.extend(arguments.iter().rev().map(|argument| (*argument, false)));
+                }
+                FactProjectedTypeNodeForm::Leaf
+                | FactProjectedTypeNodeForm::Channel { .. }
+                | FactProjectedTypeNodeForm::Unsupported => {}
+            }
+            continue;
+        }
+
+        let spelling = render(node, &rendered)?;
         rendered.insert(slot, spelling);
         active.remove(&slot);
     }
-    Some((
-        rendered.remove(&shape.root_slot())?,
-        definitions.into_values().collect(),
-    ))
+    rendered.remove(&shape.root_slot())
 }
 
 /// Caller-visible native type evidence for the private differential harness.
@@ -3258,7 +3320,7 @@ pub fn probe_jvm_assignment_value<A: LanguageAdapter>(
             value: adapt_assignment_value_probe(query.site, language, answer),
             work,
         },
-        unavailable_assignment_value_probe,
+        |site, kind, message, _| unavailable_assignment_value_probe(site, kind, message),
     )
 }
 

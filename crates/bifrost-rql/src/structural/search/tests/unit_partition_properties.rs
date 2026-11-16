@@ -389,7 +389,10 @@ fn assert_no_cap_was_reached(
     // The final step's cap is the root limit, every earlier step's is
     // `max_pipeline_rows`, and the root limit is the smaller here.
     prop_assert!(
-        detailed.budgeted_work.max_step_outputs()
+        detailed
+            .budgeted_work
+            .max_step_outputs()
+            .expect("a completed execution counted its steps")
             < query.limit.min(limits.max_pipeline_rows) as u64,
         "{label}: max_step_outputs"
     );
@@ -682,9 +685,17 @@ proptest! {
                 "{}: import_edges_resolved",
                 label
             );
-            for (index, outputs) in whole.budgeted_work.step_outputs.iter().enumerate() {
+            let merged_steps = merged.budgeted_work.step_outputs.as_ref().unwrap();
+            for (index, outputs) in whole
+                .budgeted_work
+                .step_outputs
+                .as_ref()
+                .unwrap()
+                .iter()
+                .enumerate()
+            {
                 prop_assert!(
-                    merged.budgeted_work.step_outputs[index] >= *outputs,
+                    merged_steps[index] >= *outputs,
                     "{}: step {} outputs",
                     label,
                     index

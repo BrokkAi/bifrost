@@ -35,7 +35,7 @@
 //! ## Cache keys cover every verdict input
 //!
 //! A snapshot key is
-//! `(SemanticArtifactKey.fingerprint(), ProcedureId, OracleLimits, OracleCallContext)`.
+//! `(SemanticArtifactKey.fingerprint(), ProcedureId, selected interpretation, OracleLimits, OracleCallContext)`.
 //! The artifact fingerprint is a SHA-256 over every validity input of the
 //! artifact -- mount, path, language, exact source revision, adapter semantics
 //! version, IR version, configuration fingerprint, and dependency fingerprint --
@@ -107,6 +107,7 @@
 
 use crate::analyzer::semantic::service::ArtifactRetentionCensus;
 use crate::analyzer::workspace_authority::{ReplayingMemoEntry, memo_attribution};
+use brokk_bifrost_core::analyzer::reuse_verdict::Judged;
 use std::fmt;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -121,7 +122,7 @@ use crate::analyzer::semantic::{
     DispatchReadAttribution, DispatchResult, EvidenceCompleteness, IcfgProvider,
     IcfgProviderBehaviorIdentity, OracleCallContext, OracleLimits, PreparedWorkspaceDispatchPool,
     ProcedureHandle, ProcedureId, ProofStatus, SemanticOutcome, SemanticProviderError,
-    SemanticRequest, SemanticWork, StableDigest, ValueFlowOracle, ValueFlowRelation,
+    SemanticRequest, SemanticWork, StableDigest, ValueFlowEndpoint, ValueFlowOracle,
     ValueFlowSnapshot, WorkspaceIcfgProvider, WorkspaceSemanticOracle, dispatch_read_attribution,
 };
 use crate::analyzer::store::cache_budget::{RetainedHeap, retained_read_key};
@@ -171,6 +172,35 @@ pub trait ValueFlowProvider {
     /// durable key across materializations pins one instance (#2289).
     fn canonical_procedure(&self, procedure: &ProcedureHandle) -> ProcedureHandle {
         procedure.clone()
+    }
+
+    /// Acquire the owner-selected executable body and replay its complete receipt.
+    fn selected_executable_procedure(
+        &self,
+        procedure: &ProcedureHandle,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<ProcedureHandle>, Self::Error>;
+
+    fn payload_projection_identity(
+        &self,
+        _procedure: &ProcedureHandle,
+        _request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<Option<StableDigest>>, Self::Error> {
+        Ok(SemanticOutcome::Complete {
+            value: None,
+            work: Default::default(),
+        })
+    }
+
+    fn payload_constructor_output(
+        &self,
+        _call: &CallSiteHandle,
+        _request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<Option<ValueFlowEndpoint>>, Self::Error> {
+        Ok(SemanticOutcome::Complete {
+            value: None,
+            work: Default::default(),
+        })
     }
 
     /// Materialize the procedure-local value-flow snapshot on demand.
@@ -259,11 +289,19 @@ impl DispatchReadCollector {
     }
 }
 
+type ContextCallKey = (
+    StableDigest,
+    usize,
+    ProcedureId,
+    crate::analyzer::semantic::ProcedureInterpretation,
+    CallSiteId,
+);
+
 // Preserve exact context-handle equality without retaining artifacts in keys.
 // CompleteValueCache keeps weak-value registry keys after ready eviction.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct CallContextCacheKey {
-    calls: Box<[(StableDigest, usize, ProcedureId, CallSiteId)]>,
+    calls: Box<[ContextCallKey]>,
     truncated: bool,
 }
 
@@ -279,12 +317,36 @@ impl CallContextCacheKey {
                         procedure.artifact().key().fingerprint(),
                         Arc::as_ptr(procedure.artifact()) as usize,
                         procedure.id(),
+                        procedure.interpretation(),
                         call.id(),
                     )
                 })
                 .collect(),
             truncated: context.was_truncated(),
         }
+    }
+}
+
+// Cached answers own oracle arenas tied to one materialization. A weak identity
+// prevents the cache's weak-value registry from pinning evicted artifact contents.
+#[derive(Clone)]
+struct ArtifactInstance(std::sync::Weak<crate::analyzer::semantic::SemanticArtifact>);
+
+impl ArtifactInstance {
+    fn of(procedure: &ProcedureHandle) -> Self {
+        Self(Arc::downgrade(procedure.artifact()))
+    }
+}
+
+impl PartialEq for ArtifactInstance {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.ptr_eq(&other.0)
+    }
+}
+impl Eq for ArtifactInstance {}
+impl std::hash::Hash for ArtifactInstance {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&self.0.as_ptr(), state);
     }
 }
 
@@ -298,8 +360,11 @@ impl CallContextCacheKey {
 /// argument in full.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct SnapshotKey {
+    owner: ArtifactInstance,
     artifact: StableDigest,
     procedure: ProcedureId,
+    interpretation: crate::analyzer::semantic::ProcedureInterpretation,
+    projection: Option<StableDigest>,
     limits: OracleLimits,
     context: CallContextCacheKey,
 }
@@ -309,10 +374,14 @@ impl SnapshotKey {
         procedure: &ProcedureHandle,
         context: &OracleCallContext,
         limits: OracleLimits,
+        projection: Option<StableDigest>,
     ) -> Self {
         Self {
+            owner: ArtifactInstance::of(procedure),
             artifact: procedure.artifact().key().fingerprint(),
             procedure: procedure.id(),
+            interpretation: procedure.interpretation(),
+            projection,
             limits,
             context: CallContextCacheKey::of(context),
         }
@@ -343,8 +412,10 @@ type MemoizedDispatch = ReplayingMemoEntry<SemanticOutcome<DispatchResult>, Read
 /// explicit verdict input.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct DispatchKey {
+    owner: ArtifactInstance,
     caller_artifact: StableDigest,
     caller_procedure: ProcedureId,
+    caller_interpretation: crate::analyzer::semantic::ProcedureInterpretation,
     call_site: CallSiteId,
     provider_behavior: IcfgProviderBehaviorIdentity,
     limits: OracleLimits,
@@ -357,8 +428,10 @@ impl DispatchKey {
         limits: OracleLimits,
     ) -> Self {
         Self {
+            owner: ArtifactInstance::of(call.procedure()),
             caller_artifact: call.procedure().artifact().key().fingerprint(),
             caller_procedure: call.procedure().id(),
+            caller_interpretation: call.procedure().interpretation(),
             call_site: call.id(),
             provider_behavior,
             limits,
@@ -376,12 +449,16 @@ impl DispatchKey {
 /// are pinned too, then the call context and the oracle limits.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct BindingsKey {
+    caller: ArtifactInstance,
+    target: ArtifactInstance,
     provider_behavior: Option<IcfgProviderBehaviorIdentity>,
     caller_artifact: StableDigest,
     caller_procedure: ProcedureId,
+    caller_interpretation: crate::analyzer::semantic::ProcedureInterpretation,
     call_site: CallSiteId,
     target_artifact: StableDigest,
     target_procedure: ProcedureId,
+    target_interpretation: crate::analyzer::semantic::ProcedureInterpretation,
     candidate_proof: ProofStatus,
     candidate_completeness: EvidenceCompleteness,
     excluded_targets: Box<[ProcedureId]>,
@@ -400,6 +477,8 @@ impl BindingsKey {
         let caller = call.procedure();
         let target = candidate.target();
         Self {
+            caller: ArtifactInstance::of(caller),
+            target: ArtifactInstance::of(target),
             provider_behavior: (caller.artifact().key().language()
                 == crate::analyzer::semantic::SemanticLanguage::Standard(
                     crate::analyzer::Language::Java,
@@ -411,9 +490,11 @@ impl BindingsKey {
             .then_some(provider_behavior),
             caller_artifact: caller.artifact().key().fingerprint(),
             caller_procedure: caller.id(),
+            caller_interpretation: caller.interpretation(),
             call_site: call.id(),
             target_artifact: target.artifact().key().fingerprint(),
             target_procedure: target.id(),
+            target_interpretation: target.interpretation(),
             candidate_proof: candidate.proof().clone(),
             candidate_completeness: candidate.completeness().clone(),
             excluded_targets: candidate
@@ -431,25 +512,21 @@ impl BindingsKey {
 /// shared provenance arena is `Arc`-shared across relations, so this counts the
 /// owned relation rows and the entire retained arena once, including records
 /// whose projected rows were filtered out.
-fn weigh_snapshot(_key: &SnapshotKey, outcome: &Arc<MemoizedSnapshot>) -> u32 {
-    let relations = outcome
-        .value()
-        .available_value()
-        .map_or(0, |snapshot| snapshot.relations().len())
-        .saturating_mul(size_of::<ValueFlowRelation>());
+fn weigh_snapshot(key: &SnapshotKey, outcome: &Arc<MemoizedSnapshot>) -> u32 {
     let mut census = ArtifactRetentionCensus::default();
     if let Some(snapshot) = outcome.value().available_value() {
         snapshot.retained_artifacts(&mut census);
     }
     size_of::<MemoizedSnapshot>()
-        .saturating_add(relations)
+        .saturating_add(size_of::<SnapshotKey>())
+        .saturating_add(std::mem::size_of_val(key.context.calls.as_ref()))
         .saturating_add(retained_memo_read_bytes(outcome))
         .saturating_add(census.retained_bytes().min(usize::MAX as u64) as usize)
         .min(u32::MAX as usize) as u32
 }
 
 /// Conservative structural byte weight of one retained binding verdict.
-fn weigh_bindings(_key: &BindingsKey, outcome: &Arc<MemoizedBindings>) -> u32 {
+fn weigh_bindings(key: &BindingsKey, outcome: &Arc<MemoizedBindings>) -> u32 {
     let rows = outcome
         .value()
         .available_value()
@@ -465,6 +542,8 @@ fn weigh_bindings(_key: &BindingsKey, outcome: &Arc<MemoizedBindings>) -> u32 {
         bindings.retained_artifacts(&mut census);
     }
     size_of::<MemoizedBindings>()
+        .saturating_add(size_of::<BindingsKey>())
+        .saturating_add(std::mem::size_of_val(key.context.calls.as_ref()))
         .saturating_add(rows)
         .saturating_add(excluded_targets)
         .saturating_add(retained_memo_read_bytes(outcome))
@@ -514,6 +593,7 @@ fn weigh_dispatch(_key: &DispatchKey, outcome: &Arc<MemoizedDispatch>) -> u32 {
         dispatch.retained_artifacts(&mut census);
     }
     size_of::<MemoizedDispatch>()
+        .saturating_add(size_of::<DispatchKey>())
         .saturating_add(rows)
         .saturating_add(retained_memo_read_bytes(outcome))
         .saturating_add(census.retained_bytes().min(usize::MAX as u64) as usize)
@@ -623,6 +703,182 @@ impl ValueFlowCache {
         census.artifact_bytes()
     }
 
+    /// Observe the three workspace-owned value-flow memo roots without
+    /// advancing Moka maintenance or changing admission/eviction.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn retention_census_for_test(
+        &self,
+        census: &mut brokk_bifrost_core::retention_census::RetentionCensus<'_>,
+    ) {
+        use brokk_bifrost_core::retention_census::{
+            AllocationAccounting, FamilyLifetime, ResidentWeightUnit, UnknownKind,
+        };
+
+        const LIFETIME: FamilyLifetime = FamilyLifetime::Persistent;
+        let (count, weight) = self.snapshots.visit_ready_passively_for_test(|key, value| {
+            let mut backing = ArtifactRetentionCensus::default();
+            if let Some(snapshot) = value.value().available_value() {
+                snapshot.retention_census_for_test(census, "flow.value_flow.snapshots");
+                snapshot.retained_artifacts(&mut backing);
+            }
+            let backing_bytes = backing.retained_bytes();
+            let weight = weigh_snapshot(key, value);
+            let family = "flow.value_flow.snapshots";
+            if weight == u32::MAX || backing_bytes > u64::from(weight) {
+                census.record_unknown(
+                    family,
+                    LIFETIME,
+                    UnknownKind::Coverage,
+                    "memoized_value_or_backing_estimate_saturated",
+                );
+            } else {
+                census.record_arc_allocation(
+                    Arc::clone(value),
+                    family,
+                    LIFETIME,
+                    "memoized-value-owned-estimate",
+                    u64::from(weight) - backing_bytes,
+                    AllocationAccounting::OutsideBudget,
+                );
+            }
+        });
+        census.record_resident_reading(
+            "flow.value_flow.snapshots",
+            LIFETIME,
+            count,
+            weight,
+            ResidentWeightUnit::BytesEstimate,
+        );
+        let (count, weight) = self.dispatch.visit_ready_passively_for_test(|key, value| {
+            let mut backing = ArtifactRetentionCensus::default();
+            if let Some(dispatch) = value.value().available_value() {
+                let family = "flow.value_flow.dispatch";
+                for candidate in dispatch.candidates() {
+                    candidate.retention_census_for_test(census, family);
+                }
+                for boundary in dispatch.boundaries() {
+                    for relation in &boundary.provenance {
+                        relation.retention_census_for_test(census, family);
+                    }
+                }
+                if let Some(returned) = dispatch.returned_callable() {
+                    returned.retention_census_for_test(census, family);
+                }
+                if let Some(argument) = dispatch.argument_callable() {
+                    argument.retention_census_for_test(census, family);
+                }
+                for value in dispatch.stable_package_values() {
+                    value.retention_census_for_test(census, family);
+                }
+                dispatch.retained_artifacts(&mut backing);
+            }
+            let backing_bytes = backing.retained_bytes();
+            let weight = weigh_dispatch(key, value);
+            let family = "flow.value_flow.dispatch";
+            if weight == u32::MAX || backing_bytes > u64::from(weight) {
+                census.record_unknown(
+                    family,
+                    LIFETIME,
+                    UnknownKind::Coverage,
+                    "memoized_value_or_backing_estimate_saturated",
+                );
+            } else {
+                census.record_arc_allocation(
+                    Arc::clone(value),
+                    family,
+                    LIFETIME,
+                    "memoized-value-owned-estimate",
+                    u64::from(weight) - backing_bytes,
+                    AllocationAccounting::OutsideBudget,
+                );
+            }
+        });
+        census.record_resident_reading(
+            "flow.value_flow.dispatch",
+            LIFETIME,
+            count,
+            weight,
+            ResidentWeightUnit::BytesEstimate,
+        );
+        let (count, weight) = self.bindings.visit_ready_passively_for_test(|key, value| {
+            let mut backing = ArtifactRetentionCensus::default();
+            if let Some(bindings) = value.value().available_value() {
+                bindings.retention_census_for_test(census, "flow.value_flow.bindings");
+                bindings.retained_artifacts(&mut backing);
+            }
+            let backing_bytes = backing.retained_bytes();
+            let weight = weigh_bindings(key, value);
+            let family = "flow.value_flow.bindings";
+            if weight == u32::MAX || backing_bytes > u64::from(weight) {
+                census.record_unknown(
+                    family,
+                    LIFETIME,
+                    UnknownKind::Coverage,
+                    "memoized_value_or_backing_estimate_saturated",
+                );
+            } else {
+                census.record_arc_allocation(
+                    Arc::clone(value),
+                    family,
+                    LIFETIME,
+                    "memoized-value-owned-estimate",
+                    u64::from(weight) - backing_bytes,
+                    AllocationAccounting::OutsideBudget,
+                );
+            }
+        });
+        census.record_resident_reading(
+            "flow.value_flow.bindings",
+            LIFETIME,
+            count,
+            weight,
+            ResidentWeightUnit::BytesEstimate,
+        );
+
+        for family in [
+            "flow.value_flow.snapshots",
+            "flow.value_flow.dispatch",
+            "flow.value_flow.bindings",
+        ] {
+            census.record_unknown(
+                family,
+                LIFETIME,
+                UnknownKind::NativeBytes,
+                "moka_table_key_and_container_capacity_unavailable",
+            );
+            census.record_unknown(
+                family,
+                LIFETIME,
+                UnknownKind::ActivePins,
+                "evicted_live_value_or_external_provider_pins_not_enumerated",
+            );
+        }
+        for (family, flights) in [
+            (
+                "flow.value_flow.snapshots",
+                self.snapshots.in_flight_count_for_test(),
+            ),
+            (
+                "flow.value_flow.dispatch",
+                self.dispatch.in_flight_count_for_test(),
+            ),
+            (
+                "flow.value_flow.bindings",
+                self.bindings.in_flight_count_for_test(),
+            ),
+        ] {
+            if flights != 0 {
+                census.record_unknown(
+                    family,
+                    LIFETIME,
+                    UnknownKind::ActivePins,
+                    "active_value_flow_materialization_flights",
+                );
+            }
+        }
+    }
+
     /// Count of snapshot lookups served from a ready cache entry.
     pub fn snapshot_hits(&self) -> u64 {
         self.stats.snapshot_hits.load(Ordering::Relaxed)
@@ -726,6 +982,34 @@ impl<'a> WorkspaceValueFlowProvider<'a> {
         }
     }
 
+    /// Select an executable body, retaining cancellation and budget refusal as outcomes.
+    pub fn select_executable_procedure(
+        workspace: &crate::analyzer::WorkspaceAnalyzer,
+        procedure: &ProcedureHandle,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<ProcedureHandle>, SemanticProviderError> {
+        if procedure.interpretation()
+            == crate::analyzer::semantic::ProcedureInterpretation::ExecutableAlternate
+        {
+            return workspace
+                .executable_procedure_handle(procedure, request)
+                .map(|outcome| outcome.map(|selected| selected.handle));
+        }
+        match workspace.replay_ownership_procedure_handle(procedure, request)? {
+            SemanticOutcome::Complete {
+                value: Some(handle),
+                work,
+            } => Ok(SemanticOutcome::Complete {
+                value: handle,
+                work,
+            }),
+            SemanticOutcome::Complete { value: None, .. } => workspace
+                .executable_procedure_handle(procedure, request)
+                .map(|outcome| outcome.map(|selected| selected.handle)),
+            outcome => Ok(outcome.map(|_| unreachable!("stopped ownership replay has no handle"))),
+        }
+    }
+
     /// Derive a provider that reports every dispatch input to `collector`
     /// while sharing this provider's immutable oracle and value cache.
     pub(crate) fn observing_dispatch_reads(&self, collector: DispatchReadCollector) -> Self {
@@ -780,27 +1064,48 @@ impl fmt::Debug for WorkspaceValueFlowProvider<'_> {
 fn complete_provider_fill<T>(
     analyzer: &dyn brokk_bifrost_analysis::analyzer::IAnalyzer,
     request: &mut SemanticRequest<'_>,
-    build: impl FnOnce(&mut SemanticRequest<'_>) -> T,
-) -> (T, bool) {
-    let refusals_before = request.budget.refusal_count();
+    build: impl FnOnce(&mut SemanticRequest<'_>) -> Judged<T>,
+) -> Judged<(T, bool)> {
     let filled =
         brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(analyzer, || {
-            let value = build(request);
-            if request.budget.refusal_count() > refusals_before
-                || request.cancellation.is_cancelled()
-            {
+            let judged = build(request);
+            if !judged.reuse.is_content() {
                 analyzer.mark_execution_dependent();
             }
-            value
+            judged
         });
-    match filled {
-        Ok(value) => (value, true),
-        Err(value) => (value, false),
+    let retainable = filled.is_ok();
+    let (Ok(Judged { value, reuse }) | Err(Judged { value, reuse })) = filled;
+    Judged {
+        value: (value, retainable),
+        reuse,
     }
 }
 
 impl ValueFlowProvider for WorkspaceValueFlowProvider<'_> {
     type Error = SemanticProviderError;
+    fn payload_projection_identity(
+        &self,
+        procedure: &ProcedureHandle,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<Option<StableDigest>>, Self::Error> {
+        self.oracle.payload_projection_identity(procedure, request)
+    }
+
+    fn payload_constructor_output(
+        &self,
+        call: &CallSiteHandle,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<Option<ValueFlowEndpoint>>, Self::Error> {
+        self.oracle.payload_constructor_output(call, request)
+    }
+    fn selected_executable_procedure(
+        &self,
+        procedure: &ProcedureHandle,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<ProcedureHandle>, Self::Error> {
+        Self::select_executable_procedure(self.oracle.workspace(), procedure, request)
+    }
 
     fn procedure_snapshot(
         &self,
@@ -808,7 +1113,14 @@ impl ValueFlowProvider for WorkspaceValueFlowProvider<'_> {
         context: &OracleCallContext,
         request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<ValueFlowSnapshot>, SemanticProviderError> {
-        let key = SnapshotKey::for_query(procedure, context, *self.oracle.limits());
+        let projection = self
+            .oracle
+            .payload_projection_identity(procedure, request)?;
+        if !matches!(projection, SemanticOutcome::Complete { .. }) {
+            return self.oracle.procedure_relations(procedure, context, request);
+        }
+        let identity = projection.available_value().copied().flatten();
+        let key = SnapshotKey::for_query(procedure, context, *self.oracle.limits(), identity);
         let (acquisition, _wait) = self.cache.snapshots.acquire(&key, request.cancellation);
         match acquisition {
             CompleteValueAcquisition::Cached { value } => {
@@ -827,13 +1139,16 @@ impl ValueFlowProvider for WorkspaceValueFlowProvider<'_> {
                     .stats
                     .snapshot_misses
                     .fetch_add(1, Ordering::Relaxed);
-                let ((outcome, retainable), reads) = ReplayingMemoEntry::capture(
+                let ((outcome, retainable), reads) = ReplayingMemoEntry::capture_judged(
                     &memo_attribution(self.oracle.workspace().analyzer()),
                     || {
                         complete_provider_fill(
                             self.oracle.workspace().analyzer(),
                             request,
-                            |request| self.oracle.procedure_relations(procedure, context, request),
+                            |request| {
+                                self.oracle
+                                    .procedure_relations_judged(procedure, context, request)
+                            },
                         )
                     },
                 )
@@ -888,13 +1203,13 @@ impl ValueFlowProvider for WorkspaceValueFlowProvider<'_> {
                     .stats
                     .dispatch_misses
                     .fetch_add(1, Ordering::Relaxed);
-                let ((outcome, retainable), reads) = ReplayingMemoEntry::capture(
+                let ((outcome, retainable), reads) = ReplayingMemoEntry::capture_judged(
                     &memo_attribution(self.oracle.workspace().analyzer()),
                     || {
                         complete_provider_fill(
                             self.oracle.workspace().analyzer(),
                             request,
-                            |request| self.dispatch_sessions.resolve_call(call, request),
+                            |request| self.dispatch_sessions.resolve_call_judged(call, request),
                         )
                     },
                 )
@@ -986,13 +1301,16 @@ impl ValueFlowProvider for WorkspaceValueFlowProvider<'_> {
                     .stats
                     .binding_misses
                     .fetch_add(1, Ordering::Relaxed);
-                let ((outcome, retainable), reads) = ReplayingMemoEntry::capture(
+                let ((outcome, retainable), reads) = ReplayingMemoEntry::capture_judged(
                     &memo_attribution(self.oracle.workspace().analyzer()),
                     || {
                         complete_provider_fill(
                             self.oracle.workspace().analyzer(),
                             request,
-                            |request| self.oracle.call_bindings(call, candidate, context, request),
+                            |request| {
+                                self.oracle
+                                    .call_bindings_judged(call, candidate, context, request)
+                            },
                         )
                     },
                 )
@@ -1081,7 +1399,108 @@ mod tests {
         body(&workspace, calls, ValueFlowCache::default());
     }
 
+    #[cfg(feature = "test-support")]
     #[test]
+    fn retention_census_deduplicates_shared_dispatch_arena_and_charged_artifact() {
+        let project = InlineTestProject::with_language(Language::TypeScript)
+            .file(
+                "flow.ts",
+                "function leaf(v: number) { return v; }\nexport function caller() { return leaf(1); }\n",
+            )
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &project.file("flow.ts"),
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("fixture semantic materialization")
+            .available_value()
+            .cloned()
+            .expect("charged fixture artifact");
+        let caller = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some("caller")
+            })
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .expect("fixture caller");
+        let call = caller
+            .call_site_handle(caller.semantics().call_sites()[0].id)
+            .expect("fixture call");
+        let context = OracleCallContext::bounded(vec![call.clone()], OracleLimits::default());
+        let cache = ValueFlowCache::default();
+        let provider = WorkspaceValueFlowProvider::new(&workspace, cache.clone());
+
+        let snapshot = provider
+            .procedure_snapshot(
+                &caller,
+                &context,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("value-flow snapshot");
+        assert!(snapshot.available_value().is_some());
+        let dispatch = provider
+            .resolve_call(&call, &mut SemanticRequest::new(&mut budget, &cancellation))
+            .expect("dispatch");
+        let candidate = dispatch
+            .available_value()
+            .and_then(|dispatch| dispatch.candidates().first())
+            .expect("local leaf candidate");
+        assert!(!candidate.provenance().is_empty());
+        let bindings = provider
+            .call_bindings(
+                &call,
+                candidate,
+                &context,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("call bindings");
+        assert!(bindings.available_value().is_some());
+
+        let mut census = brokk_bifrost_core::retention_census::RetentionCensus::new();
+        cache.retention_census_for_test(&mut census);
+        let report = census.finish();
+        let shared_arena = report.allocation_groups.iter().find(|group| {
+            group.kind == Some("oracle-relation-arena")
+                && group.families.contains(&"flow.value_flow.dispatch")
+                && group.families.contains(&"flow.value_flow.bindings")
+        });
+        assert!(
+            shared_arena.is_some(),
+            "dispatch provenance arena is shared with cached call bindings: {report:?}"
+        );
+        assert_eq!(
+            shared_arena.and_then(|group| group.accounting),
+            Some(brokk_bifrost_core::retention_census::AllocationAccounting::OutsideBudget)
+        );
+        assert!(
+            report.allocation_groups.iter().any(|group| {
+                group.kind == Some("semantic-artifact")
+                    && group.accounting
+                        == Some(
+                            brokk_bifrost_core::retention_census::AllocationAccounting::AlreadyBudgeted,
+                        )
+                    && group.families.contains(&"flow.value_flow.dispatch")
+                    && group.families.contains(&"flow.value_flow.bindings")
+            }),
+            "the charged caller artifact is shared across the two cached results: {report:?}"
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#9925: nested base/alternate call contexts collided and returned the cached snapshot's wrong context"
+    )]
     fn execution_dependent_snapshot_is_recomputed_but_clear_snapshot_is_retained() {
         let project = InlineTestProject::with_language(Language::Go)
             .file(
@@ -1193,6 +1612,62 @@ mod tests {
             );
             assert_eq!(clear_cache.snapshot_misses(), 1);
             assert_eq!(clear_cache.snapshot_hits(), 1);
+
+            // Both nested calls retain the SAME artifact allocation and dense
+            // IDs. Only their executable interpretation differs.
+            let base_call = procedure
+                .call_site_handle(procedure.semantics().call_sites()[0].id)
+                .expect("fixture run calls helper");
+            let alternate = artifact
+                .candidate_alternate_handle(procedure.id())
+                .expect("fixture alternate interpretation");
+            let alternate_call = alternate
+                .call_site_handle(base_call.id())
+                .expect("same dense call in alternate interpretation");
+            assert!(Arc::ptr_eq(
+                base_call.procedure().artifact(),
+                alternate_call.procedure().artifact(),
+            ));
+            assert_ne!(base_call, alternate_call);
+            let contexts = [base_call, alternate_call]
+                .map(|call| OracleCallContext::bounded(vec![call], OracleLimits::default()));
+            assert_ne!(contexts[0], contexts[1]);
+            for (index, context) in contexts.iter().enumerate() {
+                let mut budget = SemanticBudget::default();
+                let first = clear_provider
+                    .procedure_snapshot(
+                        &procedure,
+                        context,
+                        &mut SemanticRequest::new(&mut budget, &cancellation),
+                    )
+                    .expect("distinct nested-context snapshot");
+                assert_eq!(
+                    first
+                        .available_value()
+                        .expect("snapshot available")
+                        .context(),
+                    context,
+                );
+                assert_eq!(clear_cache.snapshot_misses(), index as u64 + 2);
+                let mut budget = SemanticBudget::default();
+                let second = clear_provider
+                    .procedure_snapshot(
+                        &procedure,
+                        context,
+                        &mut SemanticRequest::new(&mut budget, &cancellation),
+                    )
+                    .expect("retained nested-context snapshot");
+                assert_eq!(
+                    second
+                        .available_value()
+                        .expect("snapshot available")
+                        .context(),
+                    context,
+                );
+                assert_eq!(first.available_value(), second.available_value());
+                assert_eq!(clear_cache.snapshot_misses(), index as u64 + 2);
+                assert_eq!(clear_cache.snapshot_hits(), index as u64 + 2);
+            }
         }
 
         let interface_project = InlineTestProject::with_language(Language::Go)
@@ -1269,55 +1744,184 @@ mod tests {
         assert_eq!(interface_cache.snapshot_hits(), 0);
     }
 
+    fn fixture_procedure_parts(
+        procedure: &crate::analyzer::semantic::ProcedureSemantics,
+    ) -> crate::analyzer::semantic::ProcedureSemanticsParts {
+        use crate::analyzer::semantic::ProcedureSemanticsParts;
+        assert!(procedure.guard_facts().is_empty());
+        assert!(procedure.switch_facts().is_empty());
+        let mut parts = ProcedureSemanticsParts::new(
+            procedure.id(),
+            procedure.locator().clone(),
+            procedure.kind(),
+            procedure.source(),
+            procedure.evidence(),
+        );
+        parts.lexical_parent = procedure.lexical_parent();
+        parts.properties = procedure.properties();
+        macro_rules! copy_rows {
+            ($($field:ident),* $(,)?) => { $(parts.$field = procedure.$field().to_vec();)* };
+        }
+        copy_rows!(
+            values,
+            allocations,
+            memory_locations,
+            captures,
+            call_sites,
+            source_mappings,
+            statement_entries,
+            loop_sites,
+            evidence_rows,
+            gaps,
+            blocks,
+            points,
+            drops,
+            move_outs,
+            scope_ends,
+            pointer_origins,
+            pointer_aliases,
+            pointer_accesses,
+            pointer_invalidations,
+            incomplete_facts,
+            receiver_type_facts
+        );
+        parts.control_edges = procedure.cfg().edges().to_vec();
+        parts
+    }
+
+    #[test]
+    fn executable_body_identity_survives_warm_keys_and_output_coordinates() {
+        use crate::analyzer::semantic::{ProcedureInterpretation, SemanticArtifact};
+        use crate::taint::output_product::OutputCallRow;
+        with_batch_calls(|_, calls, _| {
+            let original = calls[0].procedure();
+            let parts = fixture_procedure_parts(original.semantics());
+            let census = crate::analyzer::semantic::ir::measure_procedure_work(&parts);
+            let projected = Arc::new(
+                SemanticArtifact::try_executable_projection(
+                    original.artifact().clone(),
+                    parts,
+                    census,
+                    &mut SemanticBudget::default(),
+                    &CancellationToken::default(),
+                )
+                .expect("validated one-body projection"),
+            );
+            let base = projected.procedure_handle(original.id()).unwrap();
+            let executable = projected
+                .executable_alternate_handle(original.id())
+                .unwrap();
+            assert_ne!(
+                projected.materialization_id(),
+                original.artifact().materialization_id()
+            );
+            assert!(Arc::ptr_eq(base.artifact(), executable.artifact()));
+            assert_eq!(base.id(), executable.id());
+            assert!(
+                projected
+                    .procedure(base.id())
+                    .unwrap()
+                    .candidate_macro_alternate()
+                    .is_none()
+            );
+            assert!(projected.candidate_alternate_handle(base.id()).is_none());
+            assert!(
+                executable
+                    .validate_durable_locator(&base.durable_key())
+                    .is_err()
+            );
+            assert!(
+                base.validate_durable_locator(&executable.durable_key())
+                    .is_err()
+            );
+            assert_ne!(
+                crate::flow_state::procedure_public_digest(&base),
+                crate::flow_state::procedure_public_digest(&executable)
+            );
+            assert_eq!(
+                crate::flow_state::procedure_public_digest(&base),
+                crate::analyzer::semantic::SemanticProcedureReference::public_digest_for(
+                    base.artifact().key(),
+                    base.semantics().locator()
+                )
+            );
+            let context = OracleCallContext::empty();
+            let limits = OracleLimits::default();
+            let behavior = IcfgProviderBehaviorIdentity::hash_bytes(b"executable-key-boundary");
+            assert!(
+                SnapshotKey::for_query(&base, &context, limits, None)
+                    != SnapshotKey::for_query(&executable, &context, limits, None)
+            );
+            let base_call = base.call_site_handle(calls[0].id()).unwrap();
+            let executable_call = executable.call_site_handle(calls[0].id()).unwrap();
+            assert!(
+                DispatchKey::for_query(&base_call, behavior, limits)
+                    != DispatchKey::for_query(&executable_call, behavior, limits)
+            );
+            let candidate = |target| {
+                DispatchCandidate::new(
+                    target,
+                    ProofStatus::Proven,
+                    EvidenceCompleteness::Complete,
+                    [],
+                    limits,
+                )
+                .unwrap()
+            };
+            let base_candidate = candidate(base.clone());
+            let executable_candidate = candidate(executable.clone());
+            let base_binding =
+                BindingsKey::for_query(&base_call, &base_candidate, &context, limits, behavior);
+            assert!(
+                base_binding
+                    != BindingsKey::for_query(
+                        &executable_call,
+                        &base_candidate,
+                        &context,
+                        limits,
+                        behavior
+                    )
+            );
+            assert!(
+                base_binding
+                    != BindingsKey::for_query(
+                        &base_call,
+                        &executable_candidate,
+                        &context,
+                        limits,
+                        behavior
+                    )
+            );
+            let mut rows = Vec::new();
+            for interpretation in [
+                ProcedureInterpretation::Base,
+                ProcedureInterpretation::CandidateAlternate,
+                ProcedureInterpretation::ExecutableAlternate,
+            ] {
+                let key = (
+                    (base.artifact().key().clone(), base.id(), interpretation),
+                    base_call.id(),
+                );
+                let row = OutputCallRow::encode(&key);
+                let json = serde_json::to_value(&row).unwrap();
+                let decoded: OutputCallRow = serde_json::from_value(json.clone()).unwrap();
+                assert_eq!(decoded.decode().unwrap(), key);
+                assert!(!rows.contains(&json));
+                rows.push(json);
+            }
+            assert_eq!(rows.len(), 3);
+        });
+    }
+
     fn rematerialize_fixture_artifact(
         original: &crate::analyzer::semantic::SemanticArtifact,
     ) -> Arc<crate::analyzer::semantic::SemanticArtifact> {
-        use crate::analyzer::semantic::{ProcedureSemanticsParts, SemanticArtifact};
+        use crate::analyzer::semantic::SemanticArtifact;
         assert!(original.go_predeclared_builtin_assumptions().is_empty());
         let parts = original
             .procedures()
             .iter()
-            .map(|procedure| {
-                assert!(procedure.guard_facts().is_empty());
-                assert!(procedure.switch_facts().is_empty());
-                let mut parts = ProcedureSemanticsParts::new(
-                    procedure.id(),
-                    procedure.locator().clone(),
-                    procedure.kind(),
-                    procedure.source(),
-                    procedure.evidence(),
-                );
-                parts.lexical_parent = procedure.lexical_parent();
-                parts.properties = procedure.properties();
-                macro_rules! copy_rows {
-                ($($field:ident),* $(,)?) => { $(parts.$field = procedure.$field().to_vec();)* };
-            }
-                copy_rows!(
-                    values,
-                    allocations,
-                    memory_locations,
-                    captures,
-                    call_sites,
-                    source_mappings,
-                    statement_entries,
-                    loop_sites,
-                    evidence_rows,
-                    gaps,
-                    blocks,
-                    points,
-                    drops,
-                    move_outs,
-                    scope_ends,
-                    pointer_origins,
-                    pointer_aliases,
-                    pointer_accesses,
-                    pointer_invalidations,
-                    incomplete_facts,
-                    receiver_type_facts
-                );
-                parts.control_edges = procedure.cfg().edges().to_vec();
-                parts
-            })
+            .map(fixture_procedure_parts)
             .collect();
         let artifact = Arc::new(
             SemanticArtifact::try_new(

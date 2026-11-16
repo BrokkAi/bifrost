@@ -9,6 +9,7 @@ use brokk_bifrost_analysis::analyzer::rename::exact::{
     ExactRenameEditIssue, ExactRenameHooks, RenameAssemblyIssue, RenameAssemblyLimits,
     RenameEditCoordinateSegments, RenameSourceIssue, admit_selected_native_source,
     assemble_exact_rename, check_exact_rename_edits, check_rename_authority,
+    describe_incomplete_inventory,
 };
 
 use crate::analyzer::rust::selected_projection::rust_selected_workspace_identity_gap;
@@ -18,14 +19,12 @@ use brokk_bifrost_analysis::analyzer::rename::RenameEdit;
 use brokk_bifrost_analysis::analyzer::rename::RenameResult;
 
 use brokk_bifrost_analysis::analyzer::resolution::model::{
-    ExactCompletionAccumulator, ResolutionCompletion,
+    ExactCompletionAccumulator, ResolutionCompletion, ResolutionIncompleteReason,
 };
 
 use brokk_bifrost_analysis::analyzer::resolution::local_identity::SelectedSemanticLocator;
 
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionLocated;
-
-use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperationInput;
 
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperationOpenOutcome;
 
@@ -125,6 +124,7 @@ struct RustRenamePositionState {
 #[doc(hidden)]
 pub enum RustRenameSafetyOutcome {
     Safe,
+    Refused(String),
     CapturedOrRebound {
         positions: BTreeSet<RustRenamePosition>,
     },
@@ -151,6 +151,18 @@ pub enum RustBindingWorldOutcome {
     Stale(String),
     Cancelled,
     StoreError(String),
+}
+
+fn overlay_frontier_rename_refusal(completion: &ResolutionCompletion) -> Option<String> {
+    completion
+        .has_reason(|reason| {
+            matches!(reason, ResolutionIncompleteReason::OverlayFrontierUnknown(_))
+        })
+        .then(|| {
+            format!(
+                "native rename refused: the editor overlay adds a module edge, so ownership of the renamed item's references cannot be proven yet (OverlayFrontierUnknown; temporary until exact overlay reach, #12219); {completion:?}"
+            )
+        })
 }
 
 impl RustCounterfactualFile {
@@ -219,14 +231,9 @@ fn selected_rust_binding_world_with_candidates(
         return RustBindingWorldOutcome::Unavailable(detail);
     }
     let languages = [SelectedResolutionLanguage::new("rust", Language::Rust)];
-    let input = SelectedResolutionOperationInput::new(
-        rust.inner.project(),
-        rust.inner.workspace_id(),
-        snapshots,
-        &languages,
-        masks,
-    )
-    .with_content_mounts(content_mounts.clone());
+    let input = rust
+        .selected_resolution_operation_input(snapshots, &languages, masks)
+        .with_content_mounts(content_mounts.clone());
     let operation = match rust
         .inner
         .analyzer_store()
@@ -267,9 +274,9 @@ fn selected_rust_binding_world_with_candidates(
         }
         RustBindingTargetProof::Established(definition) => definition,
     };
-    let candidates =
+    let (candidates, frontier) =
         match operation.rust_row_binding_candidates(&target, names, seeds, cancellation) {
-            Ok(Some(candidates)) => candidates,
+            Ok(Some(found)) => found,
             Ok(None) => {
                 return RustBindingWorldOutcome::Unavailable(
                     "selected rename candidate has no persisted crate route".into(),
@@ -279,18 +286,19 @@ fn selected_rust_binding_world_with_candidates(
         };
     let mut sites = Vec::new();
     let mut completion = ExactCompletionAccumulator::default();
+    if completion
+        .include(&frontier, &mut || cancellation.is_cancelled())
+        .is_none()
+    {
+        return RustBindingWorldOutcome::Cancelled;
+    }
     for (root, locator) in candidates {
         if cancellation.is_cancelled() {
             return RustBindingWorldOutcome::Cancelled;
         }
-        let point_input = SelectedResolutionOperationInput::new(
-            rust.inner.project(),
-            rust.inner.workspace_id(),
-            snapshots,
-            &languages,
-            masks,
-        )
-        .with_content_mounts(content_mounts.clone());
+        let point_input = rust
+            .selected_resolution_operation_input(snapshots, &languages, masks)
+            .with_content_mounts(content_mounts.clone());
         let point = match rust
             .inner
             .analyzer_store()
@@ -346,7 +354,7 @@ fn selected_rust_binding_world_with_candidates(
                 );
             }
             Ok(SelectedRustCallerReferenceOutcome::Operation(
-                SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Missing),
+                SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Missing(_)),
             )) => {
                 return RustBindingWorldOutcome::Unavailable(format!(
                     "selected rename reference is missing: {locator:?}"
@@ -727,6 +735,9 @@ pub(crate) fn validate_selected_rust_rename(
             ));
         }
     };
+    if let Some(message) = overlay_frontier_rename_refusal(original.completion()) {
+        return RustRenameSafetyOutcome::Refused(message);
+    }
     let (hypothetical_masks, hypothetical_content_mounts) = match rust_rename_overlay_inputs(
         rust,
         snapshots.as_ref(),
@@ -776,6 +787,9 @@ pub(crate) fn validate_selected_rust_rename(
             ));
         }
     };
+    if let Some(message) = overlay_frontier_rename_refusal(hypothetical.completion()) {
+        return RustRenameSafetyOutcome::Refused(message);
+    }
     let original_states = match rust_rename_position_states(
         project,
         &original,
@@ -919,6 +933,7 @@ pub fn native_rust_rename(
     }
     match safety {
         RustRenameSafetyOutcome::Safe => Ok(result),
+        RustRenameSafetyOutcome::Refused(message) => Err(message),
         failure => Err(format!(
             "native rename cannot certify capture safety: {failure:?}"
         )),
@@ -942,7 +957,10 @@ fn rename_assembly_failure(
     let message = match issue {
         RenameAssemblyIssue::IncompleteInventory(result)
         | RenameAssemblyIssue::UnprovenInventory(result) => {
-            format!("native rename reference evidence is incomplete or ambiguous: {result:?}")
+            format!(
+                "native rename reference evidence is incomplete or ambiguous: {}",
+                describe_incomplete_inventory(result)
+            )
         }
         RenameAssemblyIssue::TooManyUsages(_) => "native rename exceeds the usage limit".into(),
         RenameAssemblyIssue::TooManyFiles => "native rename exceeds the file limit".into(),

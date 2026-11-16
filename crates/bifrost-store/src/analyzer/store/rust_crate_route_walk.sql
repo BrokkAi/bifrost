@@ -14,4 +14,7 @@ CROSS JOIN cr_binding_paths AS path
  ON path.blob_id=input.blob_id AND path.import_ordinal=input.import_ordinal
  AND path.module_path=input.module_path AND path.position=input.segments
 CROSS JOIN cr_binding_owners AS owner ON owner.owner=path.owner
+WHERE NOT (input.is_glob=1 AND EXISTS(SELECT 1 FROM cr_binding_unproven_paths AS hop
+ WHERE hop.blob_id=input.blob_id AND hop.import_ordinal=input.import_ordinal
+ AND hop.module_path=input.module_path))
 ;

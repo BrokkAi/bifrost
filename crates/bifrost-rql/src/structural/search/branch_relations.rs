@@ -23,6 +23,7 @@ use crate::analyzer::usages::get_definition::{
 use brokk_bifrost_analysis::analyzer::read_ledger::reason as derivation_reason;
 use brokk_bifrost_analysis::analyzer::workspace_authority::{CaptureScopedMemo, memo_attribution};
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
+use brokk_bifrost_core::analyzer::reuse_verdict::CarriesReuseVerdict;
 use brokk_bifrost_core::analyzer::structural::conditional_regions::ConditionalRegions;
 use brokk_bifrost_rql::{BranchRelationFilter, BranchRelationKind};
 use tree_sitter::Node;
@@ -38,6 +39,9 @@ pub(super) struct BranchRelationTraversalCache {
     >,
     regions: CaptureScopedMemo<HashMap<ProjectFile, ConditionalRegions>>,
     reported: HashSet<(ProjectFile, &'static str, &'static str)>,
+    /// The execution dependences marked through this cache; the query joins it
+    /// into its reuse verdict.
+    pub(super) reuse: ReuseVerdict,
 }
 
 #[derive(Debug, Clone)]
@@ -169,11 +173,16 @@ fn report(
             )
         });
         analyzer.mark_execution_dependent();
+        cache.reuse.join_in(EXECUTION_DEPENDENT);
     }
     if cache.reported.insert((seed.file.clone(), relation, cause)) {
         diagnostics.push(super::QueryExecutionState::diagnostic(
             analyzer,
             CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                has_non_utf8_refusal: false,
+                refusal_sites: Default::default(),
+                call_relation_facts: None,
+                uses_omissions: Vec::new(),
                 incompleteness: brokk_bifrost_rql::Incompleteness::Content,
                 related: Vec::new(),
                 source: None,
@@ -419,7 +428,7 @@ pub(super) fn branch_relation_expansions(
                 proofs.get(&seed.file).cloned()
             })
             .unwrap_or_default();
-        cache
+        let relations = cache
             .regions
             .read_mut(&memo_attribution(analyzer), |regions| {
                 let regions = regions
@@ -433,7 +442,11 @@ pub(super) fn branch_relation_expansions(
                     &members,
                     regions,
                 )
-            })
+            });
+        // A refused chain budget shapes the rows even when the relation filter
+        // drops every open row it produced.
+        cache.reuse.join_in(relations.reuse_verdict());
+        relations.rows
     } else {
         Vec::new()
     };
@@ -457,6 +470,7 @@ pub(super) fn branch_relation_expansions(
                 BranchRelationVerdict::Open(reason) => {
                     if reason.execution_cause().is_some() {
                         analyzer.mark_execution_dependent();
+                        cache.reuse.join_in(EXECUTION_DEPENDENT);
                     }
                     Some(reason.label())
                 }
@@ -600,6 +614,7 @@ fn scalar_outcomes_for_procedure(
         Arc::clone(syntax),
         cancellation,
         &reference_calls,
+        &mut cache.reuse,
     )
     .map(Arc::new);
     cache
@@ -754,7 +769,9 @@ fn resolve_branch_references(
     syntax_cache: &mut HashMap<ProjectFile, Arc<StructuralSyntaxLimitedOutcome>>,
     cancellation: Option<&CancellationToken>,
 ) -> ReferenceProofs {
-    let sites = match branch_relations::reference_sites(syntax, seed.language, &seed.facts, env) {
+    let collected = branch_relations::reference_sites(syntax, seed.language, &seed.facts, env);
+    analyzer.join_reuse_verdict(collected.reuse_verdict());
+    let sites = match collected.sites {
         Ok(sites) => sites,
         Err(reason) => {
             return ReferenceProofs {
@@ -775,13 +792,15 @@ pub(super) fn resolve_references_in_ranges(
     syntax_cache: &mut HashMap<ProjectFile, Arc<StructuralSyntaxLimitedOutcome>>,
     cancellation: Option<&CancellationToken>,
 ) -> ReferenceProofs {
-    let sites = match branch_relations::reference_sites_in_ranges(
+    let collected = branch_relations::reference_sites_in_ranges(
         syntax,
         seed.language,
         &seed.facts,
         env,
         ranges,
-    ) {
+    );
+    analyzer.join_reuse_verdict(collected.reuse_verdict());
+    let sites = match collected.sites {
         Ok(sites) => sites,
         Err(reason) => {
             return ReferenceProofs {

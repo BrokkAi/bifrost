@@ -1,11 +1,16 @@
 use super::*;
 use crate::analyzer::semantic::SemanticBudgetDimension;
+use crate::{UsesOmissionEvidence, UsesOmissionSite};
 
 fn diagnostic(
     code: CodeQueryDiagnosticCode,
     impact: CodeQueryDiagnosticImpact,
 ) -> CodeQueryDiagnostic {
     CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        has_non_utf8_refusal: false,
+        refusal_sites: Default::default(),
+        call_relation_facts: None,
+        uses_omissions: Vec::new(),
         incompleteness: brokk_bifrost_rql::Incompleteness::Operational(
             brokk_bifrost_rql::DiagnosticExecutionCause::Provider,
         ),
@@ -278,6 +283,10 @@ fn shared_provenance_and_diagnostic_presentation_preserves_order_and_deduplicate
         Some("provenance: 3 paths (truncated); branches 1.0, 0")
     );
     let diagnostic = CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        has_non_utf8_refusal: false,
+        refusal_sites: Default::default(),
+        call_relation_facts: None,
+        uses_omissions: Vec::new(),
         incompleteness: brokk_bifrost_rql::Incompleteness::Content,
         related: Vec::new(),
         source: None,
@@ -448,6 +457,7 @@ fn semantic_result_contracts_serialize_render_and_retain_source_evidence() {
             path: path.to_string(),
             procedure_kind: "function",
             range: procedure_range,
+            source_owner: None,
         },
         CodeQueryResultRef::ProgramPoint {
             id: point_id.clone(),
@@ -482,6 +492,7 @@ fn semantic_result_contracts_serialize_render_and_retain_source_evidence() {
             semantic_key: id.to_string(),
         };
         DetailedCodeQueryEvidence {
+            selected_pattern_source: Default::default(),
             result_index: index,
             domain,
             key,
@@ -497,6 +508,7 @@ fn semantic_result_contracts_serialize_render_and_retain_source_evidence() {
             source_slice_sha256: Some([u8::try_from(index).unwrap(); 32]),
             provenance: Vec::new(),
             decorated_parameter: None,
+            call_path_evidence: None,
             runtime_keyed_read: None,
         }
     };
@@ -507,6 +519,7 @@ fn semantic_result_contracts_serialize_render_and_retain_source_evidence() {
             ..CodeQueryExecutionWork::default()
         },
         budgeted_work: CodeQueryBudgetedWork::default(),
+        candidate_site_set: Default::default(),
         evidence: vec![
             evidence_for(
                 0,
@@ -538,6 +551,7 @@ fn semantic_result_contracts_serialize_render_and_retain_source_evidence() {
         profile: None,
         semantic_receipt: None,
         depth_answers: Vec::new(),
+        reuse: brokk_bifrost_core::analyzer::reuse_verdict::ReuseVerdict::Content,
     };
     detailed.assert_invariants();
 }
@@ -588,7 +602,14 @@ fn diagnostic_codes_have_exhaustive_stable_impacts_and_completion() {
         (Code::UsesParserUnsupported, Impact::Incomplete),
         (Code::UsesCandidateLimit, Impact::Incomplete),
         (Code::UsesTargetsAmbiguous, Impact::Advisory),
-        (Code::UsesCandidatesOmitted, Impact::Incomplete),
+        (Code::UsesCandidateUnavailable, Impact::Incomplete),
+        (Code::UsesCandidateIncomplete, Impact::Incomplete),
+        (Code::UsesCandidateUnresolved, Impact::Incomplete),
+        (Code::UsesReferenceProjectionMissing, Impact::Incomplete),
+        (Code::UsesDefinitionProjectionMissing, Impact::Incomplete),
+        (Code::UsesInverseUnconfirmed, Impact::Incomplete),
+        (Code::UsesIndexedSourceUnavailable, Impact::Incomplete),
+        (Code::UsesTargetRangeUnavailable, Impact::Incomplete),
         (Code::ExecutionBudgetExhausted, Impact::Incomplete),
         (Code::PipelineBudgetExhausted, Impact::Incomplete),
         (Code::ImportGraphBudgetExhausted, Impact::Incomplete),
@@ -771,13 +792,7 @@ fn call_cache_profile_uses_typed_diagnostics_for_completeness() {
             entries.insert(
                 unit.clone(),
                 CallRelationResult {
-                    diagnostics: vec![CallRelationDiagnostic {
-                        code: CallRelationDiagnosticCode::ParseFailed,
-                        message: "parse failed".to_string(),
-                        context: "caller".to_string(),
-                        semantic_count: None,
-                        reason_kind: None,
-                    }],
+                    diagnostics: vec![CallRelationDiagnostic::new(CallRelationDiagnosticCode::ParseFailed, brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationDiagnosticPayload::Failure { reason: brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationFailure::Upstream { kind: "fixture".into() } }, "caller".to_string())],
                     ..CallRelationResult::default()
                 },
             )
@@ -812,13 +827,7 @@ fn call_cache_profile_uses_typed_diagnostics_for_completeness() {
     assert_eq!(profile.incoming_call.complete_hits, 0);
 
     let advisory = CallRelationResult {
-        diagnostics: vec![CallRelationDiagnostic {
-            code: CallRelationDiagnosticCode::TargetsAmbiguous,
-            message: "ambiguous".to_string(),
-            context: "caller".to_string(),
-            semantic_count: None,
-            reason_kind: None,
-        }],
+        diagnostics: vec![CallRelationDiagnostic::new(CallRelationDiagnosticCode::TargetsAmbiguous, brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationDiagnosticPayload::Failure { reason: brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationFailure::Upstream { kind: "fixture".into() } }, "caller".to_string())],
         ..CallRelationResult::default()
     };
     assert!(call_relation_result_complete(&advisory, true));
@@ -889,7 +898,7 @@ fn call_cache_profile_uses_typed_diagnostics_for_completeness() {
 }
 
 #[test]
-fn outbound_uses_missing_reference_or_definitions_is_typed_incomplete() {
+fn outbound_uses_omission_codes_preserve_evidence_and_skip_certified_nonreferences() {
     let root = std::env::temp_dir().join("bifrost-outbound-lookup-completeness");
     let file = ProjectFile::new(root, "src/app.ts");
     let definition = CodeUnit::new(file.clone(), CodeUnitType::Function, "", "target");
@@ -905,16 +914,42 @@ fn outbound_uses_missing_reference_or_definitions_is_typed_incomplete() {
         focus_start_byte: 10,
         focus_end_byte: 16,
     };
-    let grouped = group_outbound_lookup_candidates(vec![
+    let additional = [
+        DefinitionLookupStatus::NotAReference,
+        DefinitionLookupStatus::Unavailable,
+        DefinitionLookupStatus::Incomplete,
+        DefinitionLookupStatus::NoDefinition,
+    ].map(|status| DefinitionLookupOutcome {
+        selected_sites: Vec::new(),
+        inventory_evidence: Some(crate::analyzer::store::resolution_operation::ReferenceInventoryCompleteness::Unavailable),
+        incomplete_evidence: Some(crate::analyzer::usages::get_definition::DefinitionLookupEvidence {
+            completion: crate::analyzer::resolution::ResolutionCompletion::Complete,
+            snapshot_stops: Vec::new(),
+            reasons: vec![crate::analyzer::usages::get_definition::DefinitionLookupReason::UnknownActivation],
+        }),
+        modeled_definitions: Vec::new(),
+        status,
+        reference: Some(reference.clone()),
+        definitions: Vec::new(),
+        lexical_definition: None,
+        diagnostics: Vec::new(),
+    });
+    let mut outcomes = vec![
         DefinitionLookupOutcome {
+            selected_sites: Vec::new(),
+            inventory_evidence: None,
+            incomplete_evidence: None,
             modeled_definitions: Vec::new(),
             status: DefinitionLookupStatus::Ambiguous,
             reference: None,
-            definitions: vec![definition],
+            definitions: vec![definition.clone()],
             lexical_definition: None,
             diagnostics: Vec::new(),
         },
         DefinitionLookupOutcome {
+            selected_sites: Vec::new(),
+            inventory_evidence: None,
+            incomplete_evidence: None,
             modeled_definitions: Vec::new(),
             status: DefinitionLookupStatus::Ambiguous,
             reference: Some(reference),
@@ -922,11 +957,38 @@ fn outbound_uses_missing_reference_or_definitions_is_typed_incomplete() {
             lexical_definition: None,
             diagnostics: Vec::new(),
         },
-    ]);
+    ];
+    outcomes.extend(additional);
+    let mut grouped = group_outbound_lookup_candidates(outcomes);
 
-    assert_eq!(grouped.omitted_sites, 2);
+    assert_eq!(grouped.omitted_sites, 5);
     assert_eq!(grouped.ambiguous_sites, 2);
     assert!(!grouped.ambiguous_candidates_complete);
+    for (code, evidence) in [
+        (
+            CodeQueryDiagnosticCode::UsesInverseUnconfirmed,
+            UsesOmissionEvidence::InverseUnconfirmed {
+                target: definition.clone(),
+                range: (10, 16),
+            },
+        ),
+        (
+            CodeQueryDiagnosticCode::UsesIndexedSourceUnavailable,
+            UsesOmissionEvidence::IndexedSourceUnavailable,
+        ),
+        (
+            CodeQueryDiagnosticCode::UsesTargetRangeUnavailable,
+            UsesOmissionEvidence::TargetRangeUnavailable,
+        ),
+    ] {
+        grouped.omissions.insert(
+            code,
+            vec![UsesOmissionSite {
+                range: Some((10, 16)),
+                evidence,
+            }],
+        );
+    }
     let mut diagnostics = Vec::new();
     append_outbound_lookup_diagnostics(
         &mut diagnostics,
@@ -934,13 +996,40 @@ fn outbound_uses_missing_reference_or_definitions_is_typed_incomplete() {
         &file,
         grouped.ambiguous_sites,
         grouped.ambiguous_candidates_complete,
-        grouped.omitted_sites,
+        grouped.omissions,
     );
-    assert_eq!(diagnostics.len(), 1);
-    assert_eq!(
-        diagnostics[0].code,
-        CodeQueryDiagnosticCode::UsesCandidatesOmitted
+    assert_eq!(diagnostics.len(), 8);
+    assert!(diagnostics.iter().all(|d| d.uses_omissions.len() == 1));
+    assert!(matches!(&diagnostics[0].uses_omissions[0].evidence, UsesOmissionEvidence::Unavailable { inventory_evidence: Some(crate::analyzer::store::resolution_operation::ReferenceInventoryCompleteness::Unavailable) }));
+    assert!(matches!(
+        &diagnostics[1].uses_omissions[0].evidence,
+        UsesOmissionEvidence::Incomplete { evidence: Some(evidence) } if matches!(evidence.reasons.as_slice(), [crate::analyzer::usages::get_definition::DefinitionLookupReason::UnknownActivation])
+    ));
+    assert!(matches!(
+        &diagnostics[2].uses_omissions[0].evidence,
+        UsesOmissionEvidence::Unresolved {
+            status: DefinitionLookupStatus::NoDefinition
+        }
+    ));
+    assert!(matches!(
+        &diagnostics[3].uses_omissions[0].evidence,
+        UsesOmissionEvidence::ReferenceProjectionMissing
+    ));
+    assert!(matches!(
+        &diagnostics[4].uses_omissions[0].evidence,
+        UsesOmissionEvidence::DefinitionProjectionMissing
+    ));
+    assert!(
+        matches!(&diagnostics[5].uses_omissions[0].evidence, UsesOmissionEvidence::InverseUnconfirmed { target, range: (10, 16) } if target == &definition)
     );
+    assert!(matches!(
+        &diagnostics[6].uses_omissions[0].evidence,
+        UsesOmissionEvidence::IndexedSourceUnavailable
+    ));
+    assert!(matches!(
+        &diagnostics[7].uses_omissions[0].evidence,
+        UsesOmissionEvidence::TargetRangeUnavailable
+    ));
     assert_eq!(diagnostics[0].impact, CodeQueryDiagnosticImpact::Incomplete);
     assert!(matches!(
         CodeQueryResult {
@@ -952,7 +1041,7 @@ fn outbound_uses_missing_reference_or_definitions_is_typed_incomplete() {
         }
         .completion(),
         CodeQueryCompletion::Incomplete { codes }
-            if codes == vec![CodeQueryDiagnosticCode::UsesCandidatesOmitted]
+            if codes == vec![CodeQueryDiagnosticCode::UsesCandidateUnavailable, CodeQueryDiagnosticCode::UsesCandidateIncomplete, CodeQueryDiagnosticCode::UsesCandidateUnresolved, CodeQueryDiagnosticCode::UsesReferenceProjectionMissing, CodeQueryDiagnosticCode::UsesDefinitionProjectionMissing, CodeQueryDiagnosticCode::UsesInverseUnconfirmed, CodeQueryDiagnosticCode::UsesIndexedSourceUnavailable, CodeQueryDiagnosticCode::UsesTargetRangeUnavailable]
     ));
 }
 
@@ -961,7 +1050,14 @@ fn outbound_uses_ambiguity_is_advisory_only_when_every_target_survives() {
     let root = std::env::temp_dir().join("bifrost-outbound-lookup-advisory");
     let file = ProjectFile::new(root, "src/app.ts");
     let mut diagnostics = Vec::new();
-    append_outbound_lookup_diagnostics(&mut diagnostics, Language::TypeScript, &file, 1, true, 0);
+    append_outbound_lookup_diagnostics(
+        &mut diagnostics,
+        Language::TypeScript,
+        &file,
+        1,
+        true,
+        BTreeMap::new(),
+    );
 
     assert_eq!(diagnostics.len(), 1);
     assert_eq!(
@@ -1002,13 +1098,7 @@ fn cached_ambiguity_keeps_the_second_proven_operand_unknown() {
             receiver: None,
             arguments: Vec::new(),
         }],
-        diagnostics: vec![CallRelationDiagnostic {
-            code: CallRelationDiagnosticCode::TargetsAmbiguous,
-            message: "retained ambiguous targets".into(),
-            context: "root".into(),
-            semantic_count: None,
-            reason_kind: None,
-        }],
+        diagnostics: vec![CallRelationDiagnostic::new(CallRelationDiagnosticCode::TargetsAmbiguous, brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationDiagnosticPayload::Failure { reason: brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationFailure::Upstream { kind: "fixture".into() } }, "root".into())],
         ..Default::default()
     };
     let scope = AnalyzerQueryScope::new(&analyzer);
@@ -1053,6 +1143,7 @@ fn cached_ambiguity_keeps_the_second_proven_operand_unknown() {
             &mut diagnostics,
             &mut None,
             &mut input,
+            None,
         );
         assert!(!exhausted);
         if index == 0 {
@@ -1116,13 +1207,7 @@ fn call_declaration_projection_reports_retained_file_scope_target_as_omitted() {
                 caller,
                 CallRelationResult {
                     sites: vec![site],
-                    diagnostics: vec![CallRelationDiagnostic {
-                        code: CallRelationDiagnosticCode::TargetsAmbiguous,
-                        message: "ambiguous".to_string(),
-                        context: "caller".to_string(),
-                        semantic_count: None,
-                        reason_kind: None,
-                    }],
+                    diagnostics: vec![CallRelationDiagnostic::new(CallRelationDiagnosticCode::TargetsAmbiguous, brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationDiagnosticPayload::Failure { reason: brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationFailure::Upstream { kind: "fixture".into() } }, "caller".to_string())],
                     ..CallRelationResult::default()
                 },
             )
@@ -1146,6 +1231,7 @@ fn call_declaration_projection_reports_retained_file_scope_target_as_omitted() {
         &mut diagnostics,
         &mut None,
         &mut CallDepthProbeInput::default(),
+        None,
     );
 
     assert!(expansions.is_empty());
@@ -1217,7 +1303,7 @@ fn outbound_uses_projection_reports_unindexed_target_and_suppresses_advisory() {
     assert_eq!(diagnostics.len(), 1);
     assert_eq!(
         diagnostics[0].code,
-        CodeQueryDiagnosticCode::UsesCandidatesOmitted
+        CodeQueryDiagnosticCode::UsesTargetRangeUnavailable
     );
     assert_eq!(diagnostics[0].impact, CodeQueryDiagnosticImpact::Incomplete);
 }
@@ -1785,6 +1871,7 @@ fn final_diagnostic_dedup_preserves_every_field_and_first_occurrence() {
         procedure: None,
         lane: "rows".to_string(),
         stage: None,
+        budget: None,
         charge: None,
         feedback_iteration: None,
     }];
@@ -1800,4 +1887,41 @@ fn final_diagnostic_dedup_preserves_every_field_and_first_occurrence() {
         .flat_map(|value| [value.clone(), base.clone(), value.clone()])
         .collect();
     assert_eq!(normalize_query_diagnostics(input), expected);
+}
+
+proptest::proptest! {
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon("#12107: diagnostic dedup kept only the first operational cause")]
+    fn diagnostic_cause_inventory_is_order_independent_and_deduplicated(
+        kinds in proptest::collection::vec(0usize..6, 0..64)
+    ) {
+        use brokk_bifrost_rql::{DiagnosticExecutionCause as Cause, Incompleteness as Inc};
+        let causes = [Inc::Content, Inc::ConfiguredCap, Inc::Operational(Cause::Cancelled),
+            Inc::Operational(Cause::Budget), Inc::Operational(Cause::Snapshot),
+            Inc::Operational(Cause::Provider)];
+        let input = kinds.iter().map(|&kind| {
+            let mut row = diagnostic(CodeQueryDiagnosticCode::FlowStateAxisUnsupported,
+                CodeQueryDiagnosticImpact::Incomplete);
+            row.incompleteness = causes[kind];
+            row
+        }).collect::<Vec<_>>();
+        let assemble = |rows: Vec<CodeQueryDiagnostic>| {
+            let mut pushed = Vec::new();
+            for row in rows {
+                push_deduplicated_diagnostic(&mut pushed, row.code, row.incompleteness, row.message);
+            }
+            normalize_query_diagnostics(pushed)
+        };
+        let actual = assemble(input.clone());
+        let reversed = assemble(input.iter().rev().cloned().collect());
+        let duplicated = assemble(input.iter().chain(&input).cloned().collect());
+        // Diagnostic PartialEq deliberately omits provenance: compare the
+        // actual wire values so dropped or reordered causes cannot pass.
+        proptest::prop_assert_eq!(serde_json::to_value(&actual).unwrap(), serde_json::to_value(&reversed).unwrap());
+        proptest::prop_assert_eq!(serde_json::to_value(&actual).unwrap(), serde_json::to_value(&duplicated).unwrap());
+        let mut wanted = kinds.into_iter().collect::<std::collections::BTreeSet<_>>();
+        if wanted.iter().any(|kind| *kind != 0) { wanted.remove(&0); }
+        let expected = wanted.into_iter().map(|kind| causes[kind]).collect::<Vec<_>>();
+        proptest::prop_assert_eq!(actual.iter().map(|row| row.incompleteness).collect::<Vec<_>>(), expected);
+    }
 }

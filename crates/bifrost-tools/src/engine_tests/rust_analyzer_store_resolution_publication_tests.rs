@@ -93,6 +93,120 @@ mod rust_departing_root_tests {
     }
 
     #[test]
+    fn surface_creation_cost_splits_a_small_batch_before_writing() {
+        use brokk_bifrost_analysis::analyzer::store::PersistBatchTargets;
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let snapshot = owner(&store, 'a');
+        let first = prepared(&snapshot);
+        let source = "pub struct Other;";
+        let second = AnalyzerStore::prepare_parsed_blob(
+            &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid(source.as_bytes()), "rust"),
+            snapshot.generation,
+            &RustAdapter::for_tests(),
+            parsed_fixture_state(&RustAdapter::for_tests(), "src/other.rs", source),
+        )
+        .unwrap();
+        let estimated_rows = first.mutation_logical_rows() + second.mutation_logical_rows();
+        let (outcomes, stats) = store.persist_prepared_blobs(
+            vec![first, second],
+            PersistBatchTargets {
+                max_blobs: 256,
+                max_rows: estimated_rows,
+                max_payload_bytes: usize::MAX,
+            },
+        );
+        assert!(
+            outcomes.iter().all(|outcome| outcome.error.is_none()),
+            "{outcomes:?}"
+        );
+        assert_eq!(
+            stats.failed_transaction_attempts, 0,
+            "surface rows split the batch before any transaction starts"
+        );
+        assert_eq!(
+            stats.transactions, 2,
+            "each indivisible source publishes in its own transaction"
+        );
+        store.conn.execute(move |conn| {
+            assert_eq!(
+                conn.query_row("SELECT count(*) FROM blobs", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                2
+            );
+            assert_eq!(
+                conn.query_row("SELECT count(*) FROM surface_sets", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                2,
+                "rolled-back batch leaves no surface set behind"
+            );
+            let surface_rows = conn
+                .query_row(
+                    "SELECT (SELECT count(*) FROM surface_sets)+(SELECT count(*) FROM surface_ids)",
+                    [],
+                    |r| r.get::<_, usize>(0),
+                )
+                .unwrap();
+            assert_eq!(stats.logical_rows, estimated_rows + surface_rows);
+        });
+    }
+
+    #[test]
+    fn surface_republication_retires_every_relation_list() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let snapshot = owner(&store, 'a');
+        publish(&store, &snapshot);
+        let seed_obsolete = || {
+            store.conn.execute(|conn| {
+            conn.execute("INSERT INTO surface_sets(blob_id,generation,source_facts_version,go_source_version,producer_epoch,publication_witness,list_digest,fingerprint) SELECT blob_id,generation,source_facts_version,go_source_version,producer_epoch,publication_witness,zeroblob(32),fingerprint FROM surface_sets LIMIT 1", []).unwrap();
+            assert_eq!(conn.query_row("SELECT count(*) FROM surface_sets", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
+        })
+        };
+        let assert_current = || {
+            store.conn.execute(|conn| {
+                assert_eq!(
+                    conn.query_row("SELECT count(*) FROM surface_sets", [], |r| r
+                        .get::<_, i64>(0))
+                        .unwrap(),
+                    1
+                );
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT count(*) FROM surface_sets WHERE list_digest=zeroblob(32)",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                    0
+                );
+            })
+        };
+        seed_obsolete();
+        persist_one(&store, prepared(&snapshot));
+        assert_current();
+        seed_obsolete();
+        store.conn.execute(|conn| conn.execute("UPDATE resolution_producer_epochs SET producer_epoch='obsolete' WHERE lang='rust'", [])).unwrap();
+        assert!(
+            store
+                .ensure_resolution_producer_epoch(
+                    "rust",
+                    brokk_bifrost_core::analyzer::Language::Rust
+                )
+                .unwrap()
+        );
+        store.conn.execute(|conn| {
+            assert_eq!(
+                conn.query_row("SELECT count(*) FROM surface_sets", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            )
+        });
+        persist_one(&store, prepared(&snapshot));
+        assert_current();
+    }
+
+    #[test]
     fn selected_publication_new_cached_and_cancelled_retry_are_atomic() {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let snapshot = owner(&store, 'a');
@@ -242,7 +356,14 @@ mod rust_departing_root_tests {
             before,
             "ordinary DELETE/reinsert preserves all valid revision owners"
         );
-        assert_eq!(store.gc_with(|_| false).unwrap(), 0);
+        assert_eq!(
+            brokk_bifrost_analysis::analyzer::store::collect_ephemeral_candidates_for_test(
+                &store,
+                |_| false
+            )
+            .unwrap(),
+            0
+        );
         store
             .conn
             .execute(|conn| conn.execute("DELETE FROM workspace_revisions WHERE revision=1", []))
@@ -251,12 +372,78 @@ mod rust_departing_root_tests {
             roots(&store),
             vec![(later.workspace_id.as_str().to_owned(), 2)]
         );
-        assert_eq!(store.gc_with(|_| false).unwrap(), 0);
+        assert_eq!(
+            brokk_bifrost_analysis::analyzer::store::collect_ephemeral_candidates_for_test(
+                &store,
+                |_| false
+            )
+            .unwrap(),
+            0
+        );
         store
             .conn
             .execute(|conn| conn.execute("DELETE FROM workspace_revisions", []))
             .unwrap();
-        assert_eq!(store.gc_with(|_| false).unwrap(), 1);
+        assert_eq!(
+            brokk_bifrost_analysis::analyzer::store::collect_ephemeral_candidates_for_test(
+                &store,
+                |_| false
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn migrated_structural_trait_impl_manifest_refuses_old_producer_at_admission() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        store.conn.execute(|conn| {
+            *conn = brokk_bifrost_core::cache_db::test_connection_before_structural_trait_impls();
+        });
+        let snapshot = owner(&store, 'f');
+        let generation = snapshot.generation.0;
+        let key = brokk_bifrost_core::gitblob::BlobKey::unvaried(oid(SOURCE.as_bytes()), "rust");
+        let content_oid = key.oid.to_string();
+        store.conn.execute(move |conn| {
+            conn.execute(
+                "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, 'rust', ?2)",
+                params![content_oid, generation],
+            )
+            .unwrap();
+            let blob = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO resolution_fragment_interiors(
+                    blob_id, lang, semantic_language, producer_epoch, interior_digest,
+                    expected_semantic_site_count, logical_rows, payload_bytes, publication_state
+                 ) VALUES(?1, 'rust', 'rust', ?2, zeroblob(32), 0, 1, 0, 'complete')",
+                params![
+                    blob,
+                    brokk_bifrost_core::lever_tokens::lever_label_before_last_token(
+                        "resolution-bundle-rust",
+                        include_str!("../../../bifrost-store/levers/resolution-bundle-rust.tokens"),
+                    )
+                ],
+            )
+            .unwrap();
+            brokk_bifrost_core::cache_db::migrate(conn).unwrap();
+        });
+        assert!(matches!(
+            store
+                .admit_cached_selected_content(
+                    &snapshot,
+                    HOST,
+                    &key,
+                    &ResolutionContentInput::Parsed {
+                        key: key.clone(),
+                        semantic_language: Language::Rust,
+                    },
+                    &CancellationToken::default(),
+                )
+                .unwrap(),
+            ResolutionContentPublicationOutcome::Stale(
+                SelectedResolutionStale::ProducerEpoch { .. }
+            )
+        ));
     }
 
     #[test]
@@ -425,8 +612,9 @@ mod rust_departing_root_tests {
         let snapshot = owner(&store, '2');
         publish(&store, &snapshot);
         let repair = prepared(&snapshot);
-        let new_rows = repair.mutation_logical_rows();
-        let new_bytes = repair.mutation_payload_bytes();
+        let surface_cost: (usize, usize) = store.conn.execute(|conn| conn.query_row("SELECT (SELECT count(*) FROM surface_sets)+(SELECT count(*) FROM surface_ids), (SELECT SUM(length(CAST(producer_epoch AS BLOB))+64) FROM surface_sets)", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap());
+        let new_rows = repair.mutation_logical_rows() + surface_cost.0;
+        let new_bytes = repair.mutation_payload_bytes() + surface_cost.1;
         let costs = store
             .stored_blob_cascade_costs(&store.read_conn().unwrap(), &[repair])
             .unwrap();
@@ -648,7 +836,7 @@ mod rust_departing_root_tests {
         // Separate processes are necessary: same-path stores share a writer queue.
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("publication-race.db");
-        let collector = AnalyzerStore::open_persistent(&path).unwrap();
+        let repo = brokk_bifrost_core::gitblob::test_repo::init_repo(temp.path());
         let publisher = Arc::new(AnalyzerStore::open_persistent(&path).unwrap());
         let snapshot = owner(&publisher, '4');
         let witness = publish(&publisher, &snapshot).into_parts().0;
@@ -656,22 +844,31 @@ mod rust_departing_root_tests {
             .conn
             .execute(|conn| conn.execute("DELETE FROM workspace_resolution_content_roots", []))
             .unwrap();
-        // Keep this test focused on StoreError's primary and extended SQLite codes.
-        // Production writable connections now default to IMMEDIATE; explicitly
-        // restore DEFERRED only here to construct the stale-snapshot failure.
-        collector.conn.execute(|conn| {
-            conn.set_transaction_behavior(rusqlite::TransactionBehavior::Deferred);
-        });
+        // 3da13ca2218b pinned loss of a root committed after the candidate
+        // snapshot. The old DEFERRED test got SQLITE_BUSY_SNAPSHOT on upgrade;
+        // production now snapshots before its IMMEDIATE transaction, so the
+        // equivalent outcome is a successful collection retaining the new root.
+        let retry_key = brokk_bifrost_core::gitblob::BlobKey::unvaried(witness.blob_oid(), "rust");
+        let retry_input = witness.input().clone();
+        let blob_id = witness.blob_id();
+        let callback_path = path.clone();
         let pending = Arc::new(std::sync::Mutex::new(None::<PendingPublisher>));
         let callback_pending = Arc::clone(&pending);
-        let result = collector.gc_with(move |candidate| {
-        assert_eq!(candidate, witness.blob_oid().to_string());
-        assert_eq!(witness.input(), &ResolutionContentInput::Parsed {
-            key: brokk_bifrost_core::gitblob::BlobKey::unvaried(witness.blob_oid(), "rust"), semantic_language: Language::Rust,
-        });
-        let child = std::process::Command::new(std::env::current_exe().unwrap())
+        let _hook = brokk_bifrost_core::cache_gc::after_resolution_candidate_snapshot_for_test(
+            move || {
+                assert_eq!(
+                    witness.input(),
+                    &ResolutionContentInput::Parsed {
+                        key: brokk_bifrost_core::gitblob::BlobKey::unvaried(
+                            witness.blob_oid(),
+                            "rust"
+                        ),
+                        semantic_language: Language::Rust,
+                    }
+                );
+                let child = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "engine_tests::rust_analyzer_store_resolution_publication_tests::rust_departing_root_tests::collector_snapshot_cannot_delete_an_externally_admitted_cached_blob", "--nocapture"])
-            .env(CHILD_DB, &path)
+            .env(CHILD_DB, &callback_path)
             .env("BIFROST_RP_CHILD_WORKSPACE", snapshot.workspace_id.as_str())
             .env("BIFROST_RP_CHILD_LANGUAGE", &snapshot.lang)
             .env("BIFROST_RP_CHILD_GENERATION", snapshot.generation.get().to_string())
@@ -683,12 +880,17 @@ mod rust_departing_root_tests {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
             .spawn().unwrap();
-        let mut pending = callback_pending.lock().unwrap();
-        *pending = Some(PendingPublisher { child: Some(child), ready_output: String::new() });
-        pending.as_mut().unwrap().await_admission();
-        false
-    });
-        // gc_with has now committed or unwound its transaction. Normal child
+                let mut pending = callback_pending.lock().unwrap();
+                *pending = Some(PendingPublisher {
+                    child: Some(child),
+                    ready_output: String::new(),
+                });
+                pending.as_mut().unwrap().await_admission();
+            },
+        );
+        let result = brokk_bifrost_core::cache_gc::force_gc(&path, &repo, temp.path());
+        drop(_hook);
+        // GC has now committed or unwound its transaction. Normal child
         // writer close/checkpoint is safe only after this snapshot is released.
         let output = pending.lock().unwrap().as_mut().unwrap().finish().unwrap();
         assert!(
@@ -699,16 +901,50 @@ mod rust_departing_root_tests {
             String::from_utf8_lossy(&output.stdout).contains("1 passed"),
             "external publisher test did not execute: {output:?}"
         );
-        let error = result.expect_err("SQLite rejects upgrading the obsolete read snapshot");
-        assert_eq!(
-            error.to_string(),
-            format!(
-                "analyzer store SQLite error: database is locked (code: DatabaseBusy, extended code: {})",
-                rusqlite::ffi::SQLITE_BUSY_SNAPSHOT
-            )
-        );
+        assert_eq!(result.unwrap().analyzer_dropped, 0);
         assert_eq!(roots(&publisher).len(), 1);
-        assert_eq!(collector.gc_with(|_| false).unwrap(), 0);
+
+        // A different publisher cannot interleave a write after IMMEDIATE has
+        // acquired the lock. A zero-timeout independent connection observes
+        // SQLITE_BUSY; retry through the product publisher succeeds after GC.
+        let retry_snapshot = owner(&publisher, '6');
+        let during_snapshot = retry_snapshot.clone();
+        let during_path = path.clone();
+        let attempted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let during_attempted = Arc::clone(&attempted);
+        let _hook = brokk_bifrost_core::cache_gc::after_resolution_write_lock_for_test(move || {
+            let conn = rusqlite::Connection::open(during_path).unwrap();
+            conn.pragma_update(None, "foreign_keys", true).unwrap();
+            conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+            let error = conn.execute("INSERT INTO workspace_resolution_content_roots(workspace_id,lang,generation,revision,blob_id) VALUES(?1,?2,?3,?4,?5)",
+                params![during_snapshot.workspace_id.as_str(), during_snapshot.lang, during_snapshot.generation.get(), during_snapshot.revision, blob_id]).unwrap_err();
+            assert_eq!(
+                error.sqlite_error_code(),
+                Some(rusqlite::ErrorCode::DatabaseBusy)
+            );
+            during_attempted.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        assert_eq!(
+            brokk_bifrost_core::cache_gc::force_gc(&path, &repo, temp.path())
+                .unwrap()
+                .analyzer_dropped,
+            0
+        );
+        drop(_hook);
+        assert!(attempted.load(std::sync::atomic::Ordering::SeqCst));
+        ready(
+            publisher
+                .admit_cached_selected_content(
+                    &retry_snapshot,
+                    HOST,
+                    &retry_key,
+                    &retry_input,
+                    &CancellationToken::default(),
+                )
+                .unwrap(),
+        );
+        assert_eq!(roots(&publisher).len(), 2);
+        assert!(publisher.contains_blob(&retry_key).unwrap());
     }
 
     #[test]

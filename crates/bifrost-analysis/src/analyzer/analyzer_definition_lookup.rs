@@ -480,6 +480,13 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
         !self.incomplete.load(Ordering::Acquire)
     }
 
+    /// A failed outer mutable fill drops its request state. Completed lookup
+    /// answers are independently guarded by can_publish; the failure flag
+    /// belongs only to the discarded fill and must not poison its retry.
+    pub(crate) fn discard_failed_request_state(&self) {
+        self.incomplete.store(false, Ordering::Release);
+    }
+
     fn identifier_name(identifier: &str) -> Option<RelationalName> {
         if identifier.is_empty() {
             return None;

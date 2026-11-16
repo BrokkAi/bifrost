@@ -52,7 +52,7 @@ fn file_unchanged(
         let Some(file) = project.file_by_rel_path(std::path::Path::new(rel_path)) else {
             return false;
         };
-        brokk_bifrost_core::analyzer::common::workspace_language_for_file(&file) == language
+        crate::analyzer::store::WorkspaceConfigurationInput::may_record_file_read(language, &file)
             && project
                 .read_file_snapshot(&file)
                 .is_ok_and(|snapshot| snapshot.oid() == blob)

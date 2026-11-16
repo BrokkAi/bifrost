@@ -101,12 +101,17 @@ impl JavaUsageEvidenceTargetKey {
     }
 
     fn estimated_retained_bytes(&self) -> u64 {
-        (size_of::<Self>() as u64).saturating_add(
-            self.target_ids
+        size_of::<Self>() as u64
+            + brokk_bifrost_core::allocation_size::allocation_size(std::mem::size_of_val(
+                self.target_ids.as_ref(),
+            )) as u64
+            + self
+                .target_ids
                 .iter()
-                .map(|id| size_of::<DeclarationId>() as u64 + id.as_str().len() as u64)
-                .sum::<u64>(),
-        )
+                .map(|id| {
+                    brokk_bifrost_core::allocation_size::allocation_size(id.as_str().len()) as u64
+                })
+                .sum::<u64>()
     }
 }
 
@@ -208,28 +213,26 @@ impl RetainedBytes for JavaFileUsageEvidence {
 }
 
 fn retained_hit_set_bytes(hits: &BTreeSet<UsageHit>) -> u64 {
-    size_of::<BTreeSet<UsageHit>>() as u64
-        + hits
-            .iter()
-            .map(|hit| {
-                // The payload and owned snippet are direct allocations. The
-                // small per-node tree links are counted explicitly so the
-                // admission decision does not pretend a set is free.
-                size_of::<UsageHit>() as u64
-                    + (3 * size_of::<usize>()) as u64
-                    + hit.file.retained_bytes() as u64
-                    + retained_code_unit_bytes(&hit.enclosing)
-                    + hit.snippet.capacity() as u64
-            })
-            .sum::<u64>()
+    use crate::analyzer::store::cache_budget::RetainedHeap;
+    use brokk_bifrost_core::allocation_size::allocation_size;
+    let mut heap = RetainedHeap::allocated();
+    heap.add(size_of::<BTreeSet<UsageHit>>());
+    heap.btree_set(hits);
+    for hit in hits {
+        heap.add(hit.file.allocated_heap_bytes());
+        heap.add(retained_code_unit_bytes(&hit.enclosing) as usize - size_of::<CodeUnit>());
+        heap.add(allocation_size(hit.snippet.capacity()));
+        heap.add(
+            hit.reason_kind
+                .as_ref()
+                .map_or(0, |s| allocation_size(s.capacity())),
+        );
+    }
+    heap.total() as u64
 }
 
 fn retained_code_unit_bytes(unit: &CodeUnit) -> u64 {
-    size_of::<CodeUnit>() as u64
-        + unit.source().retained_bytes() as u64
-        + unit.package_name().len() as u64
-        + unit.short_name().len() as u64
-        + unit.signature().map_or(0, str::len) as u64
+    unit.allocated_bytes() as u64
 }
 
 /// Typed reason a file could not produce complete exact evidence.
@@ -334,7 +337,7 @@ impl RetainedBytes for ReplayableQueryCacheValue<JavaFileUsageEvidence> {
                 .value()
                 .retained_bytes()
                 .saturating_sub(size_of::<JavaFileUsageEvidence>())
-            + self.retained_receipt_bytes()
+            + self.allocated_receipt_bytes()
     }
 }
 
@@ -669,7 +672,7 @@ mod tests {
         assert!(sample.retained_receipt_bytes() > 0);
         let key_bytes = key(1).retained_bytes() as u64;
         let allocation_bytes = sample.retained_bytes() as u64;
-        let budget = RetentionBudget::new(
+        let budget = RetentionBudget::for_test_capacity(
             allocation_bytes
                 + 2 * (key_bytes
                     + brokk_bifrost_core::retention_budget::ENTRY_OVERHEAD_BYTES as u64)
@@ -888,7 +891,7 @@ mod tests {
 
     #[test]
     fn oversized_complete_evidence_is_returned_but_not_retained() {
-        let cache = SnapshotJavaUsageEvidenceCache::new(&RetentionBudget::new(1));
+        let cache = SnapshotJavaUsageEvidenceCache::new(&RetentionBudget::for_test_capacity(1));
         let cancellation = CancellationToken::default();
         let first = ready(cache.acquire(
             &crate::analyzer::MultiAnalyzer::default(),

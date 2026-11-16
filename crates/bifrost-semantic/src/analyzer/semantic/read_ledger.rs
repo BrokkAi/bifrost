@@ -1,4 +1,5 @@
 use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
+use brokk_bifrost_core::analyzer::reuse_verdict::SelectionClass;
 
 use crate::analyzer::semantic::content_identity::WorkspaceContentIdentity;
 
@@ -214,6 +215,7 @@ pub enum WorkspaceFactFamily {
     RubySemanticFacts,
     RubyTypesByIdentifier,
     RubySingletonMemberMutation,
+    RubyWorkspaceSignatures,
     PhpDirectDescendants,
     PhpReverseImports,
     PhpComposerAutoload,
@@ -287,9 +289,100 @@ pub enum WorkspaceFactFamily {
     ScalaReverseImportIndex,
     ScalaSamePackageReferenceIndex,
     JavaImportedTypeResolution,
+    CSharpCompilationMembershipCompleteness,
 }
 
 impl WorkspaceFactFamily {
+    /// These answers consume discovery or environment authority in addition
+    /// to committed tree content. Aggregate evaluations must retain them.
+    pub fn is_selection_authority(self) -> bool {
+        matches!(
+            self,
+            Self::GoBuildSelection
+                | Self::CSharpCompilationConfiguration
+                | Self::CSharpCompilationMembershipCompleteness
+                | Self::JvmSelectedRootPresence
+                | Self::JvmExternalGaps
+        )
+    }
+
+    /// The class of a selection-authority fact (#11482, #11607): what can
+    /// verify its recorded answer when the head differs from the base tree.
+    /// Each declaration below cites the producer that makes its claim true; a
+    /// family or subject with no declaration is `TreeDependent`, so a newly
+    /// declared selection family fails closed.
+    pub fn selection_class(self, subject: &FactSubject) -> SelectionClass {
+        match (self, subject) {
+            // base_profile_digest folds GOOS, GOARCH, Go version, GOROOT, GOPATH,
+            // GOMODCACHE, workspace patterns, build tags and every other key of
+            // the `go env -json` capture discovery ran `go list` under (the
+            // hardened context: GOENV=off, pinned GOFLAGS/GOPROXY/GOTOOLCHAIN,
+            // and go's own defaults), except the per-invocation ones. The
+            // patterns and tags are configuration, which the evaluation key
+            // already carries.
+            (Self::GoBuildSelection, FactSubject::Named { name }) if name.as_ref() == "profile" => {
+                SelectionClass::EnvironmentOnly
+            }
+            // The domains and each domain's membership rows come from `go list`
+            // run over the selected tree under the profile above. Every Go
+            // evaluation records that profile read, and replay checks all reads
+            // together, so these two are a function of the exported tree and the
+            // profile, which already holds go's complete effective configuration
+            // (base_profile_digest folds the whole hardened `go env -json`).
+            // What `go list` also read outside the tree, the module and
+            // standard-library package directories, is the provider-state read
+            // below; the writer records it with every membership whose rows are
+            // determined by the tree, and records an unverifiable marker (the
+            // default class) for any other.
+            (Self::GoBuildSelection, FactSubject::NamedMember { .. }) => {
+                SelectionClass::ExportDetermined
+            }
+            (Self::GoBuildSelection, FactSubject::Named { name })
+                if matches!(name.as_ref(), "domains" | "error") =>
+            {
+                SelectionClass::ExportDetermined
+            }
+            // workspace_facts.rs provider_module_trees_answer,
+            // provider_standard_directories_answer and provider_roots_answer: a
+            // function of the module and standard-library directories and
+            // module roots alone.
+            (Self::GoBuildSelection, FactSubject::NameGroupMember { member, .. })
+                if matches!(
+                    member.as_ref(),
+                    "providers" | "provider_standard" | "provider_roots"
+                ) =>
+            {
+                SelectionClass::EnvironmentOnly
+            }
+            // read_config_digest hashes the MSBuild inputs of the listing: the
+            // configuration files the listing holds, the Directory.Build.* and
+            // Directory.Packages.props files of every project ancestor up to the
+            // workspace root, and the restore outputs those projects name inside
+            // the root. It reads no SDK install, NuGet configuration or
+            // environment variable, and asserts that every input is under the
+            // root. An export holds no restore output.
+            // Produced from the selected listing alone, including export gitlinks
+            // and directory/file omissions; no environment or persistent state.
+            (Self::CSharpCompilationMembershipCompleteness, FactSubject::Whole) => {
+                SelectionClass::ExportDetermined
+            }
+            (Self::CSharpCompilationConfiguration, FactSubject::Whole) => {
+                SelectionClass::ExportDetermined
+            }
+            // jvm_selected_root_presence reads the selected resolution's mounted
+            // fragments (persisted per-file facts) and their open-inventory
+            // gaps. It has no JDK, environment or process input.
+            (Self::JvmSelectedRootPresence, FactSubject::Named { .. }) => {
+                SelectionClass::ExportDetermined
+            }
+            // The gap identity is the unresolved coordinates and artifact
+            // diagnostics the manifests' coordinates produce in this
+            // environment, plus the Maven platform override.
+            (Self::JvmExternalGaps, FactSubject::Whole) => SelectionClass::Split,
+            _ => SelectionClass::TreeDependent,
+        }
+    }
+
     pub const LABELS: &[(Self, &str)] = &[
         (
             Self::CSharpDeadCodeUsageEdges,
@@ -423,6 +516,7 @@ impl WorkspaceFactFamily {
             Self::RubySingletonMemberMutation,
             "ruby_singleton_member_mutation",
         ),
+        (Self::RubyWorkspaceSignatures, "ruby_workspace_signatures"),
         (Self::PhpDirectDescendants, "php_direct_descendants"),
         (Self::PhpReverseImports, "php_reverse_imports"),
         (Self::PhpComposerAutoload, "php_composer_autoload"),
@@ -552,6 +646,10 @@ impl WorkspaceFactFamily {
             Self::JavaImportedTypeResolution,
             "java_imported_type_resolution",
         ),
+        (
+            Self::CSharpCompilationMembershipCompleteness,
+            "csharp_compilation_membership",
+        ),
     ];
 
     pub fn stable_label(self) -> &'static str {
@@ -621,6 +719,21 @@ pub enum FactSubject {
         member: Box<str>,
         environment: Option<StableDigest>,
     },
+}
+
+/// A selection-authority read an aggregate evaluation consumed, with the tree
+/// part its class needs for replay.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SelectionRead {
+    pub key: ReadKey,
+    /// Present for a `Split` read whose tree part could be recorded.
+    pub basis: Option<brokk_bifrost_core::analyzer::external_selection::JvmDependencyBasis>,
+}
+
+impl SelectionRead {
+    pub fn keyed(key: ReadKey) -> Self {
+        Self { key, basis: None }
+    }
 }
 
 impl FactSubject {
@@ -710,6 +823,13 @@ pub enum LookupKind {
     /// as source-selected dispatch. Source selection separately records its
     /// whole-artifact input, including an empty or partial selection.
     ProcedureDispatch,
+    /// The classes of the actuals one entering call binds to the formal
+    /// parameters of its unique callee, through the same stable
+    /// procedure/rank address as [`Self::ProcedureDispatch`].
+    ArgumentClasses,
+    /// Dispatch of one call under the hypothesis that its receiver holds an
+    /// instance of a named class.
+    ConditionalDispatch,
     /// One procedure summary, by its mount-free identity.
     ProcedureSummary,
     /// A named workspace authority answer.
@@ -721,6 +841,9 @@ pub enum LookupKind {
     StructuralRecoveredInventory,
     /// A selected Rust crate's closed census of impl subjects for one local ADT.
     RustCopyAbsence,
+    RustDropSubject,
+    RustDropInventory,
+    RustMacroInvocations,
     /// The external (dependency) semantic-pack inputs one request selected,
     /// recorded as the digest of the selection question and the digest of the
     /// answer it produced.
@@ -764,18 +887,18 @@ impl PersistedDerivationFamily {
     /// registered kind cannot be persisted without an explicit decision.
     pub fn of(label: &str) -> Option<Self> {
         let (id, language, subject, rel_path, name, memory_only) = match label {
+            "derivation:rust_candidate_macro_procedure_overlay:v1" => (
+                "derivation:rust_candidate_macro_procedure_overlay:v1",
+                true,
+                true,
+                false,
+                false,
+                true,
+            ),
             "derivation:unit_summary:v1" => (
                 "derivation:unit_summary:v1",
                 true,
                 true,
-                false,
-                false,
-                false,
-            ),
-            "derivation:rust_unit_set:v1" => (
-                "derivation:rust_unit_set:v1",
-                true,
-                false,
                 false,
                 false,
                 false,
@@ -852,6 +975,30 @@ impl PersistedDerivationFamily {
                 false,
                 false,
             ),
+            "derivation:rust_local_glob_name_absence:v1" => (
+                "derivation:rust_local_glob_name_absence:v1",
+                true,
+                false,
+                true,
+                true,
+                false,
+            ),
+            "derivation:rust_unit_configuration:v1" => (
+                "derivation:rust_unit_configuration:v1",
+                true,
+                false,
+                true,
+                true,
+                false,
+            ),
+            "derivation:rust_unit_inputs:v2" => (
+                "derivation:rust_unit_inputs:v2",
+                true,
+                true,
+                false,
+                false,
+                false,
+            ),
             "derivation:rust_unit_dependents:v1" => (
                 "derivation:rust_unit_dependents:v1",
                 true,
@@ -888,6 +1035,17 @@ impl PersistedDerivationFamily {
                 "derivation:rust_unit_package_rows:v1",
                 true,
                 true,
+                false,
+                false,
+                false,
+            ),
+            // Retired by #9737: no production consumer was registered. Keep
+            // the historical shape decodable; replay misses without a kind.
+            // Never register this label again: use a new label or version.
+            "derivation:rust_unit_set:v1" => (
+                "derivation:rust_unit_set:v1",
+                true,
+                false,
                 false,
                 false,
                 false,
@@ -992,12 +1150,17 @@ impl LookupKind {
             Self::Descendants => "descendants",
             Self::Dispatch => "dispatch",
             Self::ProcedureDispatch => "procedure_dispatch",
+            Self::ArgumentClasses => "argument_classes",
+            Self::ConditionalDispatch => "conditional_dispatch",
             Self::ProcedureSummary => "procedure_summary",
             Self::WorkspaceFact => "workspace_fact",
             Self::StructuralNameInventory => "structural_name_inventory",
             Self::StructuralRoleNameInventory => "structural_role_name_inventory",
             Self::StructuralRecoveredInventory => "structural_recovered_inventory",
             Self::RustCopyAbsence => "rust_copy_absence",
+            Self::RustDropSubject => "rust_drop_subject",
+            Self::RustDropInventory => "rust_drop_inventory",
+            Self::RustMacroInvocations => "rust_macro_invocations",
             Self::ExternalSelection => "external_selection",
         }
     }
@@ -1076,6 +1239,22 @@ pub enum ReadKey {
 }
 
 impl ReadKey {
+    /// Classification belongs to the authority vocabulary, so adding a
+    /// selection family requires no changes to evaluation collection.
+    pub fn is_selection_authority(&self) -> bool {
+        match self {
+            Self::Lookup {
+                kind: LookupKind::ExternalSelection,
+                ..
+            } => true,
+            Self::Lookup {
+                question: LookupQuestion::WorkspaceFact { family, .. },
+                ..
+            } => family.is_selection_authority(),
+            _ => false,
+        }
+    }
+
     /// Whether a persisted read set may hold this key.
     ///
     /// The one predicate every publisher of a read set to disk applies. A
@@ -1309,6 +1488,11 @@ pub enum LookupQuestion {
     StoredSemanticIrPublication(StoredSemanticIrPublicationQuestion),
     /// Mount-free key of a registered derivation.
     Derivation(crate::analyzer::semantic::derivation::DerivationQuestion),
+    RustMacroInvocations {
+        unit_key: StableDigest,
+        module_path: Box<str>,
+        macro_name: Box<str>,
+    },
     /// The selected crate, target declaration and authorities for Copy absence.
     RustCopyAbsence {
         owning_unit: StableDigest,
@@ -1318,6 +1502,25 @@ pub enum LookupQuestion {
         census_version: u32,
         config_digest: StableDigest,
         producer_digest: StableDigest,
+    },
+    /// Current ownership and configuration of an exact source declaration.
+    RustDropSubject {
+        rel_path: Box<str>,
+        blob: [u8; 20],
+        start_byte: usize,
+        end_byte: usize,
+    },
+    /// Stable nominal placement and selected crate configuration for Drop.
+    RustDropInventory {
+        rel_path: Box<str>,
+        blob: [u8; 20],
+        start_byte: usize,
+        end_byte: usize,
+        owning_unit: StableDigest,
+        module_path: Box<str>,
+        identity_digest: StableDigest,
+        config_digest: StableDigest,
+        proof_version: u32,
     },
     /// Exact-name posting inventory under one provider's selection authority.
     StructuralName {
@@ -1368,6 +1571,15 @@ pub enum LookupQuestion {
         rel_path: Box<str>,
         procedure: StableDigest,
         site: CallSiteLocator,
+    },
+    /// One call addressed like [`Self::CallSite`], asked under the
+    /// hypothesis that its receiver holds an instance of `receiver_class`, a
+    /// class name in the call's own language.
+    ReceiverCallSite {
+        rel_path: Box<str>,
+        procedure: StableDigest,
+        site: CallSiteLocator,
+        receiver_class: Box<str>,
     },
     /// One procedure summary, by its mount-free identity.
     Summary {
@@ -1472,12 +1684,16 @@ impl LookupQuestion {
             Self::Declaration { .. } => "declaration",
             Self::File { .. } => "file",
             Self::CallSite { .. } => "call_site",
+            Self::ReceiverCallSite { .. } => "receiver_call_site",
             Self::Summary { .. } => "summary",
             Self::WorkspaceFact { .. } => "workspace_fact",
             Self::StructuralName { .. } => "structural_name",
             Self::StructuralRoleName { .. } => "structural_role_name",
             Self::StructuralRecovered { .. } => "structural_recovered",
             Self::RustCopyAbsence { .. } => "rust_copy_absence",
+            Self::RustDropSubject { .. } => "rust_drop_subject",
+            Self::RustDropInventory { .. } => "rust_drop_inventory",
+            Self::RustMacroInvocations { .. } => "rust_macro_invocations",
             Self::ExternalSelection { .. } => "external_selection",
         }
     }
@@ -1494,11 +1710,16 @@ impl LookupQuestion {
             | Self::StructuralName { .. }
             | Self::StructuralRoleName { .. }
             | Self::StructuralRecovered { .. } => None,
-            Self::RustCopyAbsence { .. } | Self::ExternalSelection { .. } => None,
+            Self::RustDropSubject { rel_path, .. } => Some(rel_path),
+            Self::RustDropInventory { .. }
+            | Self::RustCopyAbsence { .. }
+            | Self::RustMacroInvocations { .. }
+            | Self::ExternalSelection { .. } => None,
             Self::RustPlacedDeclaration { rel_path, .. }
             | Self::Declaration { rel_path, .. }
             | Self::File { rel_path }
-            | Self::CallSite { rel_path, .. } => Some(rel_path),
+            | Self::CallSite { rel_path, .. }
+            | Self::ReceiverCallSite { rel_path, .. } => Some(rel_path),
         }
     }
 
@@ -1563,6 +1784,47 @@ impl LookupQuestion {
                 if let Some(name) = &question.name {
                     hasher.field("name", name.as_bytes());
                 }
+            }
+            Self::RustDropSubject {
+                rel_path,
+                blob,
+                start_byte,
+                end_byte,
+            } => {
+                hasher.field("rel_path", rel_path.as_bytes());
+                hasher.field("blob", blob);
+                hasher.field("start_byte", &(*start_byte as u64).to_be_bytes());
+                hasher.field("end_byte", &(*end_byte as u64).to_be_bytes());
+            }
+            Self::RustDropInventory {
+                rel_path,
+                blob,
+                start_byte,
+                end_byte,
+                owning_unit,
+                module_path,
+                identity_digest,
+                config_digest,
+                proof_version,
+            } => {
+                hasher.field("rel_path", rel_path.as_bytes());
+                hasher.field("blob", blob);
+                hasher.field("start_byte", &(*start_byte as u64).to_be_bytes());
+                hasher.field("end_byte", &(*end_byte as u64).to_be_bytes());
+                hasher.field("owning_unit", owning_unit.as_bytes());
+                hasher.field("module_path", module_path.as_bytes());
+                hasher.field("identity_digest", identity_digest.as_bytes());
+                hasher.field("config_digest", config_digest.as_bytes());
+                hasher.field("proof_version", &proof_version.to_be_bytes());
+            }
+            Self::RustMacroInvocations {
+                unit_key,
+                module_path,
+                macro_name,
+            } => {
+                hasher.field("unit_key", unit_key.as_bytes());
+                hasher.field("module_path", module_path.as_bytes());
+                hasher.field("macro_name", macro_name.as_bytes());
             }
             Self::RustCopyAbsence {
                 owning_unit,
@@ -1647,6 +1909,17 @@ impl LookupQuestion {
                 hasher.field("procedure", procedure.as_bytes());
                 hasher.field("ordinal", &(site.ordinal as u64).to_be_bytes());
             }
+            Self::ReceiverCallSite {
+                rel_path,
+                procedure,
+                site,
+                receiver_class,
+            } => {
+                hasher.field("rel_path", rel_path.as_bytes());
+                hasher.field("procedure", procedure.as_bytes());
+                hasher.field("ordinal", &(site.ordinal as u64).to_be_bytes());
+                hasher.field("receiver_class", receiver_class.as_bytes());
+            }
             Self::Summary { identity } => hasher.field("identity", identity.as_bytes()),
             Self::ExternalSelection { question_digest } => {
                 hasher.field("question_digest", question_digest)
@@ -1717,27 +1990,50 @@ impl LookupQuestion {
 
 // The derivation budget owns the cloned keys in its read vector. Count the
 // vector's inline slots at the entry and the allocations here.
-impl brokk_bifrost_core::retention_budget::RetainedBytes for ReadKey {
-    fn retained_bytes(&self) -> usize {
+impl ReadKey {
+    /// Cache-only allocated estimate. Resident semantic and registration limits
+    /// keep the raw RetainedBytes computation below.
+    pub fn allocated_retained_bytes(&self) -> usize {
+        self.charge_retained(brokk_bifrost_core::allocation_size::allocation_size)
+    }
+    fn charge_retained(&self, allocation: fn(usize) -> usize) -> usize {
         use std::mem::size_of;
         let owned = match self {
-            Self::File { rel_path, .. } | Self::PathAbsent { rel_path, .. } => rel_path.len(),
-            Self::Index { key, .. } => key.len(),
+            Self::File { rel_path, .. } | Self::PathAbsent { rel_path, .. } => {
+                allocation(rel_path.len())
+            }
+            Self::Index { key, .. } => allocation(key.len()),
             Self::Lookup { question, .. } => match question {
                 LookupQuestion::CertifiedDefinition {
                     name, delegates, ..
-                } => name.len() + delegates.capacity() * size_of::<Language>(),
+                } => {
+                    allocation(name.len())
+                        + allocation(delegates.capacity() * size_of::<Language>())
+                }
                 LookupQuestion::StoredSemanticIrPublication(q) => {
-                    q.rel_path.len() + q.storage_language.len()
+                    allocation(q.rel_path.len()) + allocation(q.storage_language.len())
                 }
                 LookupQuestion::Derivation(q) => {
-                    q.rel_path.as_ref().map_or(0, |p| p.len())
-                        + q.name.as_ref().map_or(0, |n| n.len())
+                    q.rel_path.as_ref().map_or(0, |p| allocation(p.len()))
+                        + q.name.as_ref().map_or(0, |n| allocation(n.len()))
                 }
-                LookupQuestion::RustCopyAbsence { module_path, .. } => module_path.len(),
+                LookupQuestion::RustDropSubject { rel_path, .. } => allocation(rel_path.len()),
+                LookupQuestion::RustCopyAbsence { module_path, .. } => {
+                    allocation(module_path.len())
+                }
+                LookupQuestion::RustDropInventory {
+                    module_path,
+                    rel_path,
+                    ..
+                } => allocation(module_path.len()) + allocation(rel_path.len()),
+                LookupQuestion::RustMacroInvocations {
+                    module_path,
+                    macro_name,
+                    ..
+                } => allocation(module_path.len()) + allocation(macro_name.len()),
                 LookupQuestion::StructuralName { name, .. }
                 | LookupQuestion::StructuralRoleName { name, .. }
-                | LookupQuestion::Name { name, .. } => name.len(),
+                | LookupQuestion::Name { name, .. } => allocation(name.len()),
                 LookupQuestion::StructuralRecovered { .. }
                 | LookupQuestion::Summary { .. }
                 | LookupQuestion::ExternalSelection { .. } => 0,
@@ -1747,34 +2043,72 @@ impl brokk_bifrost_core::retention_budget::RetainedBytes for ReadKey {
                     signature,
                     ..
                 } => {
-                    rel_path.len() + fq_name.len() + signature.as_ref().map_or(0, String::capacity)
+                    allocation(rel_path.len())
+                        + allocation(fq_name.len())
+                        + signature
+                            .as_ref()
+                            .map_or(0, |value| allocation(value.capacity()))
                 }
                 LookupQuestion::RustPlacedDeclaration { rel_path, .. }
                 | LookupQuestion::File { rel_path }
-                | LookupQuestion::CallSite { rel_path, .. } => rel_path.len(),
+                | LookupQuestion::CallSite { rel_path, .. } => allocation(rel_path.len()),
+                LookupQuestion::ReceiverCallSite {
+                    rel_path,
+                    receiver_class,
+                    ..
+                } => allocation(rel_path.len()) + allocation(receiver_class.len()),
                 LookupQuestion::WorkspaceFact { subject, .. } => match subject {
                     FactSubject::Whole | FactSubject::Class { .. } => 0,
-                    FactSubject::File { rel_path } => rel_path.len(),
-                    FactSubject::Named { name } => name.len(),
-                    FactSubject::NamedMember { owner, member } => owner.len() + member.len(),
-                    FactSubject::ClassMember { member, .. } => member.len(),
+                    FactSubject::File { rel_path } => allocation(rel_path.len()),
+                    FactSubject::Named { name } => allocation(name.len()),
+                    FactSubject::NamedMember { owner, member } => {
+                        allocation(owner.len()) + allocation(member.len())
+                    }
+                    FactSubject::ClassMember { member, .. } => allocation(member.len()),
                     FactSubject::NameGroupMember { names, member } => {
-                        names.capacity() * size_of::<Box<str>>()
-                            + names.iter().map(|name| name.len()).sum::<usize>()
-                            + member.len()
+                        allocation(names.capacity() * size_of::<Box<str>>())
+                            + names
+                                .iter()
+                                .map(|name| allocation(name.len()))
+                                .sum::<usize>()
+                            + allocation(member.len())
                     }
                     FactSubject::FileNamedMember {
                         rel_path,
                         owner,
                         member,
                         ..
-                    } => rel_path.len() + owner.len() + member.len(),
+                    } => {
+                        allocation(rel_path.len())
+                            + allocation(owner.len())
+                            + allocation(member.len())
+                    }
                 },
             },
-            Self::Artifact { rel_path, .. } => rel_path.as_ref().map_or(0, |p| p.len()),
-            Self::Scope { languages, .. } => languages.len() * size_of::<Language>(),
+            Self::Artifact { rel_path, .. } => rel_path.as_ref().map_or(0, |p| allocation(p.len())),
+            Self::Scope { languages, .. } => allocation(languages.len() * size_of::<Language>()),
             Self::Models(_) | Self::Policy { .. } | Self::Configuration(_) | Self::Epoch(_) => 0,
         };
         size_of::<Self>().saturating_add(owned)
+    }
+}
+impl brokk_bifrost_core::retention_budget::RetainedBytes for ReadKey {
+    fn retained_bytes(&self) -> usize {
+        self.charge_retained(|bytes| bytes)
+    }
+}
+
+#[cfg(test)]
+mod allocated_cache_charge_pins {
+    use super::*;
+    use brokk_bifrost_core::retention_budget::RetainedBytes;
+    #[test]
+    fn raw_read_key_charge_is_the_master_refusing_value() {
+        let key = ReadKey::PathAbsent {
+            language: Language::Rust,
+            rel_path: "lib.rs".into(),
+        };
+        assert_eq!(key.retained_bytes(), std::mem::size_of::<ReadKey>() + 6);
+        assert!(key.allocated_retained_bytes() > key.retained_bytes());
     }
 }

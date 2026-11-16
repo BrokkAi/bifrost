@@ -153,6 +153,7 @@ pub fn resolve_ruby_semantic_pack_dependencies(
     let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
     declare_external_discovery_reads_complete();
     DependencyDiscoveryOutcome {
+        incomplete_reason: None,
         profile: DependencyDiscoveryProfile {
             metadata_inputs_considered,
             dependencies_resolved: dependencies.len(),

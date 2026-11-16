@@ -484,20 +484,26 @@ fn translate_summary_row(
         MadRoot::Argument(items) => items
             .iter()
             .flat_map(|item| match item {
-                MadArgumentItem::This => vec![AuthoredSummaryInput::Receiver {}],
+                MadArgumentItem::This => vec![AuthoredSummaryInput::Receiver { path: None }],
                 MadArgumentItem::Index(index) => {
-                    vec![AuthoredSummaryInput::Parameter { ordinal: *index }]
+                    vec![AuthoredSummaryInput::Parameter {
+                        ordinal: *index,
+                        path: None,
+                    }]
                 }
                 MadArgumentItem::Range(low, high) => (*low..=*high)
-                    .map(|index| AuthoredSummaryInput::Parameter { ordinal: index })
+                    .map(|index| AuthoredSummaryInput::Parameter {
+                        ordinal: index,
+                        path: None,
+                    })
                     .collect(),
             })
             .collect::<Vec<_>>(),
     };
     let authored_output = match &output.root {
-        MadRoot::ReturnValue => AuthoredSummaryOutput::NormalReturn {},
+        MadRoot::ReturnValue => AuthoredSummaryOutput::NormalReturn { path: None },
         MadRoot::Argument(items) if items.as_slice() == [MadArgumentItem::This] => {
-            AuthoredSummaryOutput::Receiver {}
+            AuthoredSummaryOutput::Receiver { path: None }
         }
         MadRoot::Argument(_) => {
             skip(
@@ -516,7 +522,10 @@ fn translate_summary_row(
     };
     if let Some(arity) = target.signature.arity() {
         for input in &inputs {
-            if let AuthoredSummaryInput::Parameter { ordinal: index } = input
+            if let AuthoredSummaryInput::Parameter {
+                ordinal: index,
+                path: None,
+            } = input
                 && *index >= arity
             {
                 skip(

@@ -29,6 +29,48 @@ use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+/// Prepare the source selection and inline directives for both policy entry points.
+/// Source selection has the CLI's file, directory and glob semantics, with no
+/// item-count limit (the stdio transport also has no finite request-size limit).
+pub fn prepare_policy_source_request(
+    root: &Path,
+    sources: &[String],
+    inline_prefix: Option<&str>,
+    options: crate::policy::PolicyEvaluationOptions,
+) -> Result<(Vec<String>, crate::policy::PolicyEvaluationOptions), String> {
+    let prefix = inline_prefix
+        .map(crate::policy::InlineSuppressionPrefix::new)
+        .transpose()
+        .map_err(|error| format!("invalid inline_suppression_prefix: {error}"))?
+        .unwrap_or_default();
+    let sources = sources
+        .iter()
+        .map(|source| {
+            let source = source.trim();
+            if source.is_empty() {
+                return Ok(String::new());
+            }
+            if contains_glob_syntax(source) {
+                normalize_source_pattern(source, root)
+            } else {
+                normalize_literal_source_path(source, root)
+                    .map(|path| path.to_string_lossy().replace('\\', "/"))
+            }
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok((
+        sources,
+        options
+            .with_inline_suppressions(crate::policy::PolicyInlineSuppressionOptions::new(prefix)),
+    ))
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static SESSION_LOCK_BLOCKED_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    pub(crate) static CONSTRUCTION_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
 pub fn create_scoped_service(
     root: PathBuf,
     sources: &[String],
@@ -39,6 +81,12 @@ pub fn create_scoped_service(
         .map_err(|err| format!("Failed to resolve project root {}: {err}", root.display()))?;
     let Some(revision) = revision.map(str::trim).filter(|rev| !rev.is_empty()) else {
         let rel_paths = resolve_sources(&root, sources)?;
+        #[cfg(test)]
+        CONSTRUCTION_HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
         let project = Arc::new(FileSetProject::new(root, rel_paths));
         // Isolate the partial file set while sharing persistent blob facts.
         return SearchToolsService::new_manual_scoped_persisted_for_project(
@@ -233,7 +281,46 @@ pub fn resolve_sources(root: &Path, inputs: &[String]) -> Result<Vec<PathBuf>, S
                 .to_string(),
         );
     }
+    for path in &selected {
+        normalize_literal_source_path(&path.to_string_lossy(), root)?;
+    }
     Ok(selected.into_iter().collect())
+}
+
+/// Expand a selection over an immutable resident file set, without disk metadata.
+pub(crate) fn resident_source_members(
+    root: &Path,
+    input: &str,
+    paths: &[String],
+) -> Result<BTreeSet<PathBuf>, String> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let rel = normalize_literal_source_path(input, root)?;
+    let name = rel.to_string_lossy().replace('\\', "/");
+    if paths.contains(&name) {
+        return Ok(BTreeSet::from([rel]));
+    }
+    let prefix = format!("{name}/");
+    let directory: BTreeSet<_> = paths
+        .iter()
+        .filter(|path| name.is_empty() || path.starts_with(&prefix))
+        .map(PathBuf::from)
+        .collect();
+    if !directory.is_empty() {
+        return Ok(directory);
+    }
+    if contains_glob_syntax(input) {
+        let pattern = normalize_source_pattern(input, root)?;
+        let glob = Pattern::new(&pattern).map_err(|error| error.to_string())?;
+        return Ok(paths
+            .iter()
+            .filter(|path| glob.matches(path))
+            .map(PathBuf::from)
+            .collect());
+    }
+    Ok(BTreeSet::new())
 }
 
 fn resolve_sources_at_revision(
@@ -363,7 +450,21 @@ fn normalize_literal_source_path(raw: &str, root: &Path) -> Result<PathBuf, Stri
         return normalize_relative_path(&normalize_absolute_source_string(raw, root)?);
     }
 
-    normalize_relative_path(raw)
+    let rel = normalize_relative_path(raw)?;
+    let absolute = root.join(&rel);
+    if absolute.exists() {
+        let canonical = absolute.canonicalize().map_err(|error| {
+            format!(
+                "Failed to resolve source path {}: {error}",
+                absolute.display()
+            )
+        })?;
+        let canonical_root = root.canonicalize().map_err(|error| error.to_string())?;
+        canonical
+            .strip_prefix(&canonical_root)
+            .map_err(|_| crate::mcp_common::absolute_path_outside_workspace_error(raw, root))?;
+    }
+    Ok(rel)
 }
 
 fn normalize_absolute_source_string(raw: &str, root: &Path) -> Result<String, String> {

@@ -3,7 +3,7 @@ title: Python
 description: Query Python comparisons by operand binding identity alongside calls, decorators, assignments, and callable containment.
 ---
 
-> Last verified end to end: 2026-10-18 (`query_code` schema version 1).
+> Last verified end to end: 2026-11-12 (`query_code` schema version 1).
 
 For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](/code-query-tutorials/reference-traversal/).
 
@@ -153,6 +153,7 @@ def documented_function():
       "completeness": "complete",
       "decorator_count": 0,
       "docstring_present": false,
+      "entry_point": "no",
       "id": "<public-id>",
       "is_override": false,
       "is_property_accessor": false,
@@ -226,7 +227,8 @@ def documented_function():
       },
       "relation": "documentation",
       "result_type": "python_rule_fact",
-      "scope_is_public": true
+      "scope_is_public": true,
+      "test_scope": "no"
     }
   ],
   "truncated": false
@@ -951,172 +953,7 @@ class CleanupLeaf(CleanupBase):
         super().__del__()
 ```
 
-<!-- code-query-fixture:python/inference.py -->
-```python
-class KnownBase:
-    pass
-
-class UnresolvedBase(MissingBase):
-    pass
-
-class ResolvableChild(KnownBase):
-    pass
-```
-
-The `inference_failure` fact identifies a particular written base the analyzer could not resolve. Its class, base ordinal, spelling, and reason form a definite row; the same query still reports open hierarchy coverage for checks that depend on the full MRO.
-
-<!-- code-query-case:failed-inheritance-inference:rql -->
-```lisp
-(filter
-  :where ((fact_kind eq inference_failure)
-          (coverage eq complete))
-  (class-hierarchy
-    (enclosing-decl
-      (language python
-        (class :name "UnresolvedBase")))))
-```
-
-<!-- code-query-case:failed-inheritance-inference:json -->
-```json
-{"languages":["python"],"match":{"kind":"class","name":"UnresolvedBase"},"steps":[{"op":"enclosing_decl"},{"op":"class_hierarchy"},{"op":"filter","where":[{"field":"fact_kind","op":"eq","value":{"enum":"inference_failure"}},{"field":"coverage","op":"eq","value":{"enum":"complete"}}]}],"result_detail":"compact"}
-```
-
-<!-- code-query-case:failed-inheritance-inference:expected -->
-```json
-{
-  "diagnostics": [
-    {
-      "code": "python_hierarchy_derivation_incomplete",
-      "impact": "incomplete",
-      "language": "python",
-      "message": "Python class hierarchy is open: unresolved_base",
-      "source": {
-        "end_byte": 70,
-        "path": "python/inference.py",
-        "range": {
-          "end_column": 9,
-          "end_line": 5,
-          "start_column": 1,
-          "start_line": 4
-        },
-        "start_byte": 27
-      }
-    }
-  ],
-  "results": [
-    {
-      "ancestry_basis": {
-        "claims": []
-      },
-      "base_resolution": "unresolved",
-      "base_spelling": "MissingBase",
-      "coverage": "complete",
-      "fact_kind": "inference_failure",
-      "id": "<public-id>",
-      "language": "python",
-      "ordinal": 0,
-      "outcome": "unresolved",
-      "path": "python/inference.py",
-      "provenance": [
-        {
-          "seed": {
-            "end_line": 5,
-            "kind": "class",
-            "path": "python/inference.py",
-            "result_type": "structural_match",
-            "start_line": 4
-          },
-          "steps": [
-            {
-              "op": "enclosing_decl",
-              "result": {
-                "end_line": 5,
-                "fq_name": "python.inference.UnresolvedBase",
-                "kind": "class",
-                "path": "python/inference.py",
-                "result_type": "declaration",
-                "start_line": 4
-              }
-            },
-            {
-              "op": "class_hierarchy",
-              "result": {
-                "ancestry_basis": {
-                  "claims": []
-                },
-                "coverage": "complete",
-                "declaration_id": null,
-                "fact_kind": "inference_failure",
-                "id": "<public-id>",
-                "outcome": "unresolved",
-                "owner_id": null,
-                "path": "python/inference.py",
-                "range": {
-                  "end_column": 9,
-                  "end_line": 5,
-                  "start_column": 1,
-                  "start_line": 4
-                },
-                "reason": "unresolved_base",
-                "result_type": "python_hierarchy_fact",
-                "root_id": "<public-id>",
-                "target_id": null,
-                "target_owner_id": null
-              }
-            },
-            {
-              "op": "filter",
-              "result": {
-                "ancestry_basis": {
-                  "claims": []
-                },
-                "coverage": "complete",
-                "declaration_id": null,
-                "fact_kind": "inference_failure",
-                "id": "<public-id>",
-                "outcome": "unresolved",
-                "owner_id": null,
-                "path": "python/inference.py",
-                "range": {
-                  "end_column": 9,
-                  "end_line": 5,
-                  "start_column": 1,
-                  "start_line": 4
-                },
-                "reason": "unresolved_base",
-                "result_type": "python_hierarchy_fact",
-                "root_id": "<public-id>",
-                "target_id": null,
-                "target_owner_id": null
-              }
-            }
-          ]
-        }
-      ],
-      "range": {
-        "end_column": 9,
-        "end_line": 5,
-        "start_column": 1,
-        "start_line": 4
-      },
-      "reason": "unresolved_base",
-      "result_type": "python_hierarchy_fact",
-      "root": {
-        "end_line": 5,
-        "fq_name": "python.inference.UnresolvedBase",
-        "kind": "class",
-        "language": "python",
-        "path": "python/inference.py",
-        "signature": "class UnresolvedBase(MissingBase):",
-        "start_line": 4
-      },
-      "root_declaration_id": "<public-id>",
-      "root_id": "<public-id>"
-    }
-  ],
-  "truncated": false
-}
-```
+For definite facts about unresolved bases, see [Python inheritance inference](/code-query-tutorials/python-inheritance-inference/).
 
 ## Narrow A Member Call
 
@@ -2985,7 +2822,8 @@ The kind queries below each return a concrete match. The operator and test roles
       "code": "result_limit_reached",
       "impact": "incomplete",
       "language": "workspace",
-      "message": "query_code reached the query limit of 1 and returned the first 1 results; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern"
+      "message": "query_code reached the query limit of 1 and returned the first 1 results; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern",
+      "incompleteness": "configured_cap"
     }
   ],
   "results": [
@@ -3054,7 +2892,8 @@ The kind queries below each return a concrete match. The operator and test roles
       "code": "result_limit_reached",
       "impact": "incomplete",
       "language": "workspace",
-      "message": "query_code reached the query limit of 1 and returned the first 1 results; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern"
+      "message": "query_code reached the query limit of 1 and returned the first 1 results; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern",
+      "incompleteness": "configured_cap"
     }
   ],
   "results": [
@@ -3139,7 +2978,8 @@ comments are excluded.
       "code": "result_limit_reached",
       "impact": "incomplete",
       "language": "workspace",
-      "message": "query_code reached the query limit of 1 and returned the first 1 results; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern"
+      "message": "query_code reached the query limit of 1 and returned the first 1 results; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern",
+      "incompleteness": "configured_cap"
     }
   ],
   "results": [
@@ -3178,7 +3018,8 @@ comments are excluded.
       "code": "result_limit_reached",
       "impact": "incomplete",
       "language": "workspace",
-      "message": "query_code reached the query limit of 1 and returned the first 1 results; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern"
+      "message": "query_code reached the query limit of 1 and returned the first 1 results; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern",
+      "incompleteness": "configured_cap"
     }
   ],
   "results": [
@@ -3248,7 +3089,8 @@ comments are excluded.
       "code": "result_limit_reached",
       "impact": "incomplete",
       "language": "workspace",
-      "message": "query_code reached the query limit of 1 and returned the first 1 results; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern"
+      "message": "query_code reached the query limit of 1 and returned the first 1 results; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern",
+      "incompleteness": "configured_cap"
     }
   ],
   "results": [
@@ -3287,7 +3129,8 @@ comments are excluded.
       "code": "result_limit_reached",
       "impact": "incomplete",
       "language": "workspace",
-      "message": "query_code reached the query limit of 1 and returned the first 1 results; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern"
+      "message": "query_code reached the query limit of 1 and returned the first 1 results; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern",
+      "incompleteness": "configured_cap"
     }
   ],
   "results": [
@@ -3326,7 +3169,8 @@ comments are excluded.
       "code": "result_limit_reached",
       "impact": "incomplete",
       "language": "workspace",
-      "message": "query_code reached the query limit of 1 and returned the first 1 results; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern"
+      "message": "query_code reached the query limit of 1 and returned the first 1 results; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern",
+      "incompleteness": "configured_cap"
     }
   ],
   "results": [
@@ -3365,7 +3209,8 @@ comments are excluded.
       "code": "result_limit_reached",
       "impact": "incomplete",
       "language": "workspace",
-      "message": "query_code reached the query limit of 1 and returned the first 1 results; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern"
+      "message": "query_code reached the query limit of 1 and returned the first 1 results; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern",
+      "incompleteness": "configured_cap"
     }
   ],
   "results": [
@@ -3404,7 +3249,8 @@ comments are excluded.
       "code": "result_limit_reached",
       "impact": "incomplete",
       "language": "workspace",
-      "message": "query_code reached the query limit of 1 and returned the first 1 results; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern"
+      "message": "query_code reached the query limit of 1 and returned the first 1 results; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern",
+      "incompleteness": "configured_cap"
     }
   ],
   "results": [
@@ -3443,7 +3289,8 @@ comments are excluded.
       "code": "result_limit_reached",
       "impact": "incomplete",
       "language": "workspace",
-      "message": "query_code reached the query limit of 1 and returned the first 1 results; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern"
+      "message": "query_code reached the query limit of 1 and returned the first 1 results; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern",
+      "incompleteness": "configured_cap"
     }
   ],
   "results": [
@@ -3482,7 +3329,8 @@ comments are excluded.
       "code": "result_limit_reached",
       "impact": "incomplete",
       "language": "workspace",
-      "message": "query_code reached the query limit of 1 and returned the first 1 results; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern"
+      "message": "query_code reached the query limit of 1 and returned the first 1 results; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern",
+      "incompleteness": "configured_cap"
     }
   ],
   "results": [
@@ -3521,7 +3369,8 @@ comments are excluded.
       "code": "result_limit_reached",
       "impact": "incomplete",
       "language": "workspace",
-      "message": "query_code reached the query limit of 1 and returned the first 1 results; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern"
+      "message": "query_code reached the query limit of 1 and returned the first 1 results; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern",
+      "incompleteness": "configured_cap"
     }
   ],
   "results": [
@@ -3560,7 +3409,8 @@ comments are excluded.
       "code": "result_limit_reached",
       "impact": "incomplete",
       "language": "workspace",
-      "message": "query_code reached the query limit of 1 and returned the first 1 results; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern"
+      "message": "query_code reached the query limit of 1 and returned the first 1 results; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern",
+      "incompleteness": "configured_cap"
     }
   ],
   "results": [
@@ -3630,7 +3480,8 @@ comments are excluded.
       "code": "result_limit_reached",
       "impact": "incomplete",
       "language": "workspace",
-      "message": "query_code reached the query limit of 1 and returned the first 1 results; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern"
+      "message": "query_code reached the query limit of 1 and returned the first 1 results; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern",
+      "incompleteness": "configured_cap"
     }
   ],
   "results": [
@@ -3669,7 +3520,8 @@ comments are excluded.
       "code": "result_limit_reached",
       "impact": "incomplete",
       "language": "workspace",
-      "message": "query_code reached the query limit of 1 and returned the first 1 results; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern"
+      "message": "query_code reached the query limit of 1 and returned the first 1 results; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern",
+      "incompleteness": "configured_cap"
     }
   ],
   "results": [
@@ -3708,7 +3560,8 @@ comments are excluded.
       "code": "result_limit_reached",
       "impact": "incomplete",
       "language": "workspace",
-      "message": "query_code reached the query limit of 1 and returned the first 1 results; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern"
+      "message": "query_code reached the query limit of 1 and returned the first 1 results; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern",
+      "incompleteness": "configured_cap"
     }
   ],
   "results": [
@@ -4177,7 +4030,12 @@ comments are excluded.
                   "start_column": 1,
                   "start_line": 15
                 },
-                "result_type": "procedure"
+                "result_type": "procedure",
+                "source_owner": {
+                  "derivation": "canonical_ast_identity",
+                  "namespace": "python",
+                  "semantic_key": "[[\"module\",null],[\"function\",\"maybe\"]]"
+                }
               }
             },
             {
@@ -5168,7 +5026,12 @@ own range, so both missing-comma locations remain independently selectable.
                   "start_column": 1,
                   "start_line": 20
                 },
-                "result_type": "procedure"
+                "result_type": "procedure",
+                "source_owner": {
+                  "derivation": "canonical_ast_identity",
+                  "namespace": "python",
+                  "semantic_key": "[[\"module\",null],[\"function\",\"tuple_return\"]]"
+                }
               }
             },
             {
@@ -7417,13 +7280,22 @@ def nested_loop(items, children):
       "code": "occurrence_role_unsupported",
       "impact": "incomplete",
       "language": "python",
-      "message": "structural adapter for python does not support occurrence role(s): pattern_position"
+      "message": "structural adapter for python does not support occurrence role(s): pattern_position",
+      "incompleteness": "content"
     },
     {
       "code": "occurrence_role_unsupported",
       "impact": "incomplete",
       "language": "python",
-      "message": "structural adapter for python does not support occurrence role(s): generated_source"
+      "message": "structural adapter for python does not support occurrence role(s): generated_source",
+      "incompleteness": "content"
+    },
+    {
+      "code": "occurrence_role_unsupported",
+      "impact": "incomplete",
+      "language": "python",
+      "message": "structural adapter for python does not support occurrence role(s): callee_position",
+      "incompleteness": "content"
     }
   ],
   "results": [

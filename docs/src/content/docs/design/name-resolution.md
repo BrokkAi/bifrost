@@ -39,8 +39,10 @@ answer is a claim of absence only when the search finished.
 - **No global graph to patch.** An edit replaces one file's facts. Nothing
   else is rewritten, and no structure describing the whole workspace has to be
   kept consistent with the edit.
-- **Bounded memory.** Workspace-scale state lives in SQLite. Rust holds only
-  what one query needs, for that query's lifetime.
+- **Bounded memory.** File facts and unit-context rows live in SQLite.
+  Reusable derived values share the warm process's retention budget.
+  Per-reference lexical and typed search state currently lasts for one query;
+  dependency-tracked reuse of those answers is planned follow-on work.
 - **Explicit completeness.** An answer carries the reasons it may be
   incomplete. Incomplete is never reported as absent.
 - **Shared algorithm, language-specific rules.** A language supplies facts
@@ -261,6 +263,19 @@ files depends on configuration:
 - Other languages: project references, include paths, preprocessor
   configuration, or import roots.
 
+For Rust, Bifrost analyzes every certified workspace member with all of its
+declared Cargo features enabled, together with the implicit optional-dependency
+features that Cargo does not suppress, plus the `test` configuration. This
+matches the default of CodeQL's Rust extraction, so code behind any feature is
+analyzed rather than only the default profile. A member's feature universe
+does not depend on whether its outgoing dependency graph is complete.
+Dependencies keep the features that the requesting crates actually ask for.
+Target cfgs keep their configured values, and custom cfgs such as
+`tokio_unstable` stay unknown. When two enabled configurations select
+different declarations, the answer is a typed ambiguity, never a guess. The
+activation policy is part of each crate topology's identity, so changing it
+re-derives the affected topologies.
+
 For Go, the go command is the package authority. In module mode, vendoring
 uses the main module root's `vendor` directory; nested `vendor` directories
 are not providers. Bifrost reports the tool's discovery error for an unresolved
@@ -269,6 +284,13 @@ This retires the legacy nearest-vendor guarantee (#5697). A package in a vendor
 tree, a `vendor` directory that holds `modules.txt`, has the import path below
 `vendor/` as its identity: `vendor/github.com/x/y` declares `github.com/x/y`,
 as the go command builds it, not a subpackage of the enclosing module (#9052).
+When an active `go-module` model was selected for the module that
+`vendor/modules.txt` lists for that package, at the listed version, the
+vendored declaration and the model's record are one callable: a qualified call
+locator resolves to the model's identity, and a call keeps its exact source
+binding while carrying the model record, as it would without vendored source
+(#11322). Workspace code that only shares a model's qualified name stays an
+ambiguous locator.
 
 After a workspace update, native Go discovery includes unsaved Go source when
 an edit changes build constraints, the package clause, cgo use, or imports.
@@ -524,20 +546,8 @@ selections include indexed temporary rows for revision-valid unit summaries,
 workspace dependency reachability and module placements. The connection
 rebuilds these rows when the selection changes or its validity check fails. Ordinary
 workspace readers check both revision snapshots and SQLite publication freshness:
-summary publication can finish without changing the workspace revision. The
-writer fallback explicitly invalidates its selection after publication because
-SQLite's data version does not include that connection's own commits.
-
-On the writer fallback, the query's connection is the store's only connection,
-and the caller of a Rust reverse query reads the store between the query's
-answers. The query therefore lends its connection to the caller and takes it
-back for each answer; it publishes macro capsules on that same connection.
-Ordinary reads share the query's revision rows. A read of other snapshots
-replaces them, and the query restores them when it takes the connection back.
-Any other change made while the connection was lent, such as another query
-staging its own selection, makes the query stale. A request that waits for the
-connection, to open a query or to take its connection back, stops waiting when
-it is cancelled.
+summary publication can finish without changing the workspace revision. A
+request waiting to acquire its query's pooled reader observes cancellation.
 
 A query can narrow which mounts a name may bind into. A forward Rust lookup,
 for example, binds only into the crates that the referencing crate can see. A
@@ -566,6 +576,24 @@ when a field of an annotated type
 supplied the receiver. These obligations do not imply missing authored reference
 sites, so reverse inventory completeness does not become worse because of
 additive generation.
+
+The built-in derives (`Clone`, `Copy`, `Debug`, `Default`, `Eq`, `Hash`,
+`Ord`, `PartialEq`, `PartialOrd`) are not unknown expansions. rustc implements
+each as exactly one impl of its standard trait, adding no name and no inherent
+member. An item whose only generated surface is unconditional, bare built-in
+derive names records those names. Its generated-surface reason closes, everywhere
+it reaches, once the crate route proves that each name falls through to the
+prelude's derive macro at every placement of the item: no workspace macro,
+external binding, open inventory or unindexed scope binds it. This is the same
+absence proof that closes derive-helper attributes. After that proof, the
+type's generated member surface is the derived traits' reviewed items
+(`crates/bifrost-rust/src/prelude.rs`). A member lookup that finds no authored
+member, but names such an item, resolves to that standard trait item as an
+exact external callee (`core::default::Default::default` for
+`Limits::default()`). A derive that is not proven, or a derive set that
+includes any other derive, keeps the surface open as above. Call bindings take
+the item's formals from the same table, because no semantic pack records a
+derived impl.
 
 Definitionless function-like macros invoked in item position follow the same
 name-binding rule. Argument references recovered by guessing the macro's input
@@ -841,10 +869,14 @@ Only a matching JDK-pack signature hit receives the reduced rule. The safe
 package set is `java.*`, assuming no platform override is visible in the build
 model; modeling unseen overrides remains (#10492).
 
-Declaration proof does not close a virtual dispatch family. Those computations
-retain all gaps and report an independent incomplete boundary when a workspace
-supertype cannot be resolved: it might hide an override through an intermediate
-class. This is the interim rule pending (#10497).
+Declaration proof does not close a virtual dispatch family. The Java, Kotlin
+and Scala walks that enumerate the workspace overrides of an external member
+follow each workspace type's external supertypes through one shared external
+supertype closure, reading artifact and pack hierarchy facts, so a workspace
+type below the root through dependency intermediates is a candidate (#10497,
+#11162). A supertype that nothing resolves might hide an override through an
+intermediate class: the family keeps the overrides it proved as possible
+targets and reports itself incomplete.
 
 The request owner admits an incomplete dependency selection only when its
 failure list is exactly `[UnresolvedCoordinates]` and the JDK selection is
@@ -1050,6 +1082,34 @@ assigns no standard receiver model owner and makes no conditional `Option`
 Copy claim. This preserves uncertainty when a cross-file glob or another
 unresolved binding could change the type's identity.
 
+### Rust external glob bindings
+
+A glob import of an external module, such as `use std::io::*;`, does not by
+itself say which names it binds. Selected resolution therefore stops a bare
+name that only such a glob could bind at an unindexed import boundary. When the
+name is called, the Rust definition hook can still prove the callee (#9949).
+The selected answer has already applied Rust's precedence and namespaces, so
+locals, workspace items and workspace globs have been ruled out. What remains
+is to decide each glob that is visible at the call in the call's own module.
+The activated semantic models decide each glob from their record of the
+module it names. The call selects a free function only when one glob's module
+publicly declares a free function of that name at the written arity, and every
+other glob's module has a complete record with no value of that name. A module,
+type, trait or macro of the same spelling is in another namespace and does not
+compete. A struct can compete, because unit and tuple structs also declare a
+value.
+
+The call stays open when the models cannot decide: no model declares the
+module, a partial record lacks the name, a glob has a `cfg` attribute, or a glob
+leads into the workspace. A workspace glob can forward an external glob, and
+its exports are the store's to enumerate. The call also stays open when two
+globs export the name. An explicit import of the same spelling outranks every
+glob and is proved by the named-import route instead. A glob binds names only
+in its own module, not in modules nested inside it. The proven answer names
+the glob's route in its diagnostic. A qualified call such as
+`std::io::stdout()` needs no enumeration, because its path names the module
+directly.
+
 ### Reverse search
 
 Finding the references to a declaration works in two steps:
@@ -1134,14 +1194,20 @@ and joins them in memory.
 Bifrost stores the same per-file content as relational rows, indexed by the
 values the search looks up. A query reads only the rows its frontier reaches.
 The working state of a query (its mount table, selected context, and the
-projections of each search stage) lives in temporary SQLite tables, and the
-Rust process keeps only the values of the query in progress. No map, index, or
-arena in Rust whose size grows with the workspace survives a query.
+projections of each search stage) lives in temporary SQLite tables. A warm
+process may retain compact cross-file derived data across requests inside the
+shared memory budget. Each entry records its dependencies and is invalidated
+when those inputs change. Recomputing an entry propagates to its dependents
+only when its output changes.
 
-This is a deliberate trade-off. A keyed SQLite read costs far more than a
-lookup in an in-memory hash table, so the engine batches reads across a whole
-frontier and shares work between the references of one file. In return, memory
-stays bounded on large workspaces, and the stored rows serve every process and
+A cache may cover the workspace through independently invalidated entries.
+The unit of recomputation cannot be the whole workspace: changing one file
+must not force a whole-workspace derivation to rebuild. Per-file facts remain
+in SQLite.
+
+The engine batches indexed reads across a frontier and shares work between
+references in one file. Budgeted warm entries avoid repeating cross-file
+derivations on later requests, while the durable rows serve every process and
 worktree that opens the cache.
 
 A query, or one file window of a step that runs in file windows, owns one

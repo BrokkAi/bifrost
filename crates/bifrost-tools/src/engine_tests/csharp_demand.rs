@@ -1,11 +1,12 @@
 use crate::inline_project::InlineTestProject;
+use brokk_bifrost_analysis::analyzer::QueryScope;
 use brokk_bifrost_analysis::analyzer::resolution::SelectedSemanticLocator;
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::{
     SelectedResolutionOperationInput, SelectedResolutionOperationOpenOutcome,
     csharp_demand::probe_type,
 };
 use brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionLanguage;
-use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::single_connection_store_context_for_test;
+use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::ephemeral_store_context;
 use brokk_bifrost_analysis::analyzer::{AnalyzerConfig, WorkspaceAnalyzer};
 use brokk_bifrost_core::{analyzer::Language, cancellation::CancellationToken};
 
@@ -44,7 +45,7 @@ fn csharp_demand_searches_only_reached_namespace_levels() {
             "namespace A.B { public class Peer {} } namespace Other { public class Peer {} public class X {} }",
         )
         .build();
-    let context = single_connection_store_context_for_test(fixture.project_dyn().as_ref()).unwrap();
+    let context = ephemeral_store_context(fixture.project_dyn().as_ref()).unwrap();
     let workspace_id = context.workspace_id.clone();
     let store = std::sync::Arc::clone(&context.store);
     let workspace = WorkspaceAnalyzer::build_with_store_context_for_test(
@@ -220,8 +221,7 @@ fn csharp_demand_unmodeled_using_stops_outer_namespace_lookup() {
             .file("App/Caller.cs", source)
             .file("App/Other.cs", other)
             .build();
-        let context =
-            single_connection_store_context_for_test(fixture.project_dyn().as_ref()).unwrap();
+        let context = ephemeral_store_context(fixture.project_dyn().as_ref()).unwrap();
         let workspace_id = context.workspace_id.clone();
         let store = std::sync::Arc::clone(&context.store);
         let workspace = WorkspaceAnalyzer::build_with_store_context_for_test(
@@ -382,12 +382,13 @@ fn csharp_demand_unmodeled_using_stops_outer_namespace_lookup() {
 #[brokk_bifrost_test_macros::hardwon(
     "#7314: C# certification deadlocked on a single-connection store inside a selected operation"
 )]
-fn csharp_configuration_overlay_refuses_single_connection_demand() {
+fn csharp_configuration_overlay_refuses_pooled_demand() {
+    // This regression now runs on the pooled store.
     if std::env::var_os("BIFROST_TRIAL_NATIVE_CSHARP").is_none() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "engine_tests::csharp_demand::csharp_configuration_overlay_refuses_single_connection_demand",
+                "engine_tests::csharp_demand::csharp_configuration_overlay_refuses_pooled_demand",
                 "--nocapture",
             ])
             .env("BIFROST_TRIAL_NATIVE_CSHARP", "1")
@@ -403,7 +404,7 @@ fn csharp_configuration_overlay_refuses_single_connection_demand() {
         .file("App/App.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\" />")
         .file("App/Caller.cs", source)
         .build();
-    let context = single_connection_store_context_for_test(fixture.project_dyn().as_ref()).unwrap();
+    let context = ephemeral_store_context(fixture.project_dyn().as_ref()).unwrap();
     let workspace_id = context.workspace_id.clone();
     let store = std::sync::Arc::clone(&context.store);
     let workspace = WorkspaceAnalyzer::build_with_store_context_for_test(
@@ -546,6 +547,7 @@ fn csharp_configuration_overlay_refuses_single_connection_demand() {
     "#7314: a live configuration overlay could change between two admissions of one C# operation"
 )]
 fn csharp_live_configuration_overlay_refuses_the_next_admission() {
+    // This regression now runs on the pooled store.
     if std::env::var_os("BIFROST_TRIAL_NATIVE_CSHARP").is_none() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
@@ -572,7 +574,7 @@ fn csharp_live_configuration_overlay_refuses_the_next_admission() {
             "class Caller { Peer value; } class Peer {}",
         )
         .build();
-    let context = single_connection_store_context_for_test(fixture.project_dyn().as_ref()).unwrap();
+    let context = ephemeral_store_context(fixture.project_dyn().as_ref()).unwrap();
     let workspace_id = context.workspace_id.clone();
     let store = std::sync::Arc::clone(&context.store);
     let workspace = WorkspaceAnalyzer::build_with_store_context_for_test(
@@ -665,12 +667,13 @@ fn csharp_live_configuration_overlay_refuses_the_next_admission() {
 #[brokk_bifrost_test_macros::hardwon(
     "#9962: nested C# store reads inside a selected operation deadlocked a single-connection store"
 )]
-fn csharp_nested_selected_reads_agree_across_connection_modes() {
+fn csharp_nested_selected_reads_on_pooled_store() {
+    // This regression now runs on the pooled store.
     if std::env::var_os("BIFROST_TRIAL_NATIVE_CSHARP").is_none() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "engine_tests::csharp_demand::csharp_nested_selected_reads_agree_across_connection_modes",
+                "engine_tests::csharp_demand::csharp_nested_selected_reads_on_pooled_store",
                 "--nocapture",
             ])
             .env("BIFROST_TRIAL_NATIVE_CSHARP", "1")
@@ -680,81 +683,409 @@ fn csharp_nested_selected_reads_agree_across_connection_modes() {
         return;
     }
     use brokk_bifrost_core::analyzer::project::OverlayProject;
-    let mut answers = Vec::new();
-    for single_connection in [true, false] {
-        let source = "class Caller { Peer value; } class Peer {}";
+    let source = "class Caller { Peer value; } class Peer {}";
+    let fixture = InlineTestProject::with_language(Language::CSharp)
+        .file("App/App.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\" />")
+        .file("App/Caller.cs", source)
+        .build();
+    let disk = fixture.project_dyn();
+    let context = ephemeral_store_context(disk.as_ref()).unwrap();
+    let workspace_id = context.workspace_id.clone();
+    let store = std::sync::Arc::clone(&context.store);
+    let workspace = WorkspaceAnalyzer::build_with_store_context_for_test(
+        std::sync::Arc::clone(&disk),
+        AnalyzerConfig::default(),
+        context,
+    )
+    .unwrap();
+    let overlay = OverlayProject::new(std::sync::Arc::clone(&disk));
+    assert!(overlay.set(fixture.file("App/Caller.cs").abs_path(), source.into(),));
+    let request = workspace.clone_with_project(std::sync::Arc::new(overlay.snapshot()));
+    let csharp = brokk_bifrost_analysis::analyzer::resolve_analyzer::<
+        brokk_bifrost_csharp_analysis::analyzer::csharp::CSharpAnalyzer,
+    >(request.analyzer())
+    .unwrap();
+    let services =
+        brokk_bifrost_analysis::analyzer::native_points::selected_analyzer_services_for_test(
+            csharp,
+        );
+    let snapshots = store
+        .workspace_snapshots_for_current_languages(&workspace_id, &["csharp".into()])
+        .unwrap();
+    let languages = [SelectedResolutionLanguage::with_epoch(
+        "csharp",
+        Language::CSharp,
+        brokk_bifrost_analysis::analyzer::store::resolution::csharp_trial_bundle_epoch(),
+    )];
+    let cancellation = CancellationToken::new();
+    // Begin the query before retaining the selected operation's only reader.
+    brokk_bifrost_analysis::analyzer::capture_query_reads(csharp, || ());
+    let SelectedResolutionOperationOpenOutcome::Ready(operation) = store
+        .open_selected_resolution_operation(
+            SelectedResolutionOperationInput::new(
+                disk.as_ref(),
+                &workspace_id,
+                &snapshots,
+                &languages,
+                &[],
+            )
+            .with_analyzer(&services),
+            &cancellation,
+        )
+        .unwrap()
+    else {
+        panic!("selected C# operation");
+    };
+    let locator = SelectedSemanticLocator::for_reference_range("csharp", "App/Caller.cs", 15, 19);
+    // Both nested reads use immutable (workspace, generation, revision) rows;
+    // their answers do not depend on the connection's snapshot.
+    let (result, reads) = brokk_bifrost_analysis::analyzer::capture_query_reads(csharp, || {
+        probe_type(&operation, &snapshots["csharp"], &locator, &cancellation)
+    });
+    assert!(
+        !reads.keys().is_empty(),
+        "selected demand must record reads"
+    );
+    let result = result.unwrap().unwrap();
+    assert_eq!(
+        result.targets,
+        vec![("App/Caller.cs".into(), "Peer".into())]
+    );
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#12013: an uncertified C# reference absence was counted as an omitted uses() candidate"
+)]
+fn csharp_reference_inventory_certificate() {
+    if std::env::var_os("BIFROST_TRIAL_NATIVE_CSHARP").is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "engine_tests::csharp_demand::csharp_reference_inventory_certificate",
+                "--nocapture",
+            ])
+            .env("BIFROST_TRIAL_NATIVE_CSHARP", "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+            "{output:?}"
+        );
+        return;
+    }
+    use brokk_bifrost_analysis::analyzer::resolution::ResolutionCompletion;
+    use brokk_bifrost_analysis::analyzer::store::resolution_operation::{
+        ReferenceInventoryCompleteness, SelectedResolutionContextMetrics,
+        SelectedResolutionLocated, SelectedResolutionOperationOutcome,
+    };
+    for trial in [true, false] {
+        for (language, storage, path, source, expected) in [
+            (
+                Language::CSharp,
+                "csharp",
+                "App/Caller.cs",
+                "class Caller { int Value() { return 1; } }",
+                "certified",
+            ),
+            (
+                Language::CSharp,
+                "csharp",
+                "App/Caller.cs",
+                "class Caller { Caller Value() { return this; } }",
+                "incomplete",
+            ),
+            (
+                Language::Go,
+                "go",
+                "caller.go",
+                "package app\ntype Caller struct {}\n",
+                "unavailable",
+            ),
+        ] {
+            let fixture = InlineTestProject::with_language(language)
+                .file("App/App.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\" />")
+                .file(path, source)
+                .build();
+            let context = ephemeral_store_context(fixture.project_dyn().as_ref()).unwrap();
+            let workspace_id = context.workspace_id.clone();
+            let store = std::sync::Arc::clone(&context.store);
+            let mut config = AnalyzerConfig::default();
+            if !trial {
+                config.csharp.native_trial =
+                    brokk_bifrost_core::analyzer::config::CSharpNativeTrial::Off;
+            }
+            let workspace = WorkspaceAnalyzer::build_with_store_context_for_test(
+                fixture.project_dyn(),
+                config,
+                context,
+            )
+            .unwrap();
+            let snapshots = store
+                .workspace_snapshots_for_current_languages(&workspace_id, &[storage.to_owned()])
+                .unwrap();
+            let languages = [SelectedResolutionLanguage::with_epoch(
+                storage,
+                language,
+                if language == Language::CSharp && trial {
+                    brokk_bifrost_analysis::analyzer::store::resolution::csharp_trial_bundle_epoch()
+                } else {
+                    brokk_bifrost_analysis::analyzer::store::resolution::resolution_bundle_epoch(
+                        language,
+                    )
+                },
+            )];
+            let cancellation = CancellationToken::new();
+            let project = fixture.project_dyn();
+            let SelectedResolutionOperationOpenOutcome::Ready(operation) = store
+                .open_selected_resolution_operation(
+                    SelectedResolutionOperationInput::new(
+                        project.as_ref(),
+                        &workspace_id,
+                        &snapshots,
+                        &languages,
+                        &[],
+                    ),
+                    &cancellation,
+                )
+                .unwrap()
+            else {
+                panic!("selected operation");
+            };
+            let start = source.find("Caller").unwrap();
+            let locator =
+                SelectedSemanticLocator::for_reference_range(storage, path, start, start + 6);
+            let contexts = operation
+                .empty_contexts(&ResolutionCompletion::Complete)
+                .unwrap();
+            let outcome = operation
+                .resolve_reference(
+                    contexts,
+                    &locator,
+                    &cancellation,
+                    &mut SelectedResolutionContextMetrics,
+                )
+                .unwrap();
+            let SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Missing(
+                certificate,
+            )) = outcome
+            else {
+                panic!("expected Missing: {outcome:?}");
+            };
+            if trial && language == Language::CSharp {
+                use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
+                use brokk_bifrost_analysis::analyzer::usages::get_definition::{
+                    DefinitionLookupRequest, DefinitionLookupStatus, resolve_definition_batch,
+                };
+                let analyzer = workspace.analyzer();
+                let scope = AnalyzerQueryScope::new(analyzer);
+                let outcomes = resolve_definition_batch(
+                    analyzer,
+                    scope.token(),
+                    vec![DefinitionLookupRequest {
+                        file: brokk_bifrost_core::analyzer::model::ProjectFile::new(
+                            project.root(),
+                            path,
+                        ),
+                        line: None,
+                        column: None,
+                        start_byte: Some(start),
+                        end_byte: Some(start + 6),
+                    }],
+                );
+                if expected == "certified" {
+                    assert_eq!(outcomes[0].status, DefinitionLookupStatus::NotAReference);
+                } else {
+                    assert_eq!(outcomes[0].status, DefinitionLookupStatus::Unavailable);
+                    assert!(matches!(
+                        outcomes[0].incomplete_evidence.as_ref().unwrap().completion,
+                        ResolutionCompletion::Incomplete(_)
+                    ));
+                }
+            }
+            let expected = if !trial { "unavailable" } else { expected };
+            match expected {
+                "certified" => assert_eq!(certificate, ReferenceInventoryCompleteness::Certified),
+                "incomplete" => assert!(
+                    matches!(certificate, ReferenceInventoryCompleteness::Incomplete(_)),
+                    "{certificate:?}"
+                ),
+                _ => assert_eq!(certificate, ReferenceInventoryCompleteness::Unavailable),
+            }
+        }
+    }
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#12013: a retained C# NotAReference survived an edit that decertified the file"
+)]
+fn csharp_reference_inventory_warm_edit() {
+    use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
+    use brokk_bifrost_analysis::analyzer::usages::get_definition::{
+        DefinitionLookupRequest, DefinitionLookupStatus, resolve_definition_batch,
+    };
+    use brokk_bifrost_core::analyzer::model::ProjectFile;
+    let initial = "class C { int Value; }";
+    for edited in [
+        "class C {     Other field; }",
+        "class C { int Value; C M() { return this; } }",
+    ] {
         let fixture = InlineTestProject::with_language(Language::CSharp)
             .file("App/App.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\" />")
-            .file("App/Caller.cs", source)
+            .file("App/Caller.cs", initial)
             .build();
-        let disk = fixture.project_dyn();
-        let context = if single_connection {
-            single_connection_store_context_for_test(disk.as_ref()).unwrap()
-        } else {
-            brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::ephemeral_store_context(
-                disk.as_ref(),
+        let project = fixture.project_dyn();
+        let file = ProjectFile::new(project.root(), "App/Caller.cs");
+        let mut config = AnalyzerConfig::default();
+        config.csharp.native_trial = brokk_bifrost_core::analyzer::config::CSharpNativeTrial::On;
+        let build = || {
+            WorkspaceAnalyzer::build_with_store_context_for_test(
+                project.clone(),
+                config.clone(),
+                ephemeral_store_context(project.as_ref()).unwrap(),
             )
             .unwrap()
         };
-        let workspace_id = context.workspace_id.clone();
-        let store = std::sync::Arc::clone(&context.store);
-        let workspace = WorkspaceAnalyzer::build_with_store_context_for_test(
-            std::sync::Arc::clone(&disk),
-            AnalyzerConfig::default(),
-            context,
-        )
-        .unwrap();
-        let overlay = OverlayProject::new(std::sync::Arc::clone(&disk));
-        assert!(overlay.set(fixture.file("App/Caller.cs").abs_path(), source.into(),));
-        let request = workspace.clone_with_project(std::sync::Arc::new(overlay.snapshot()));
-        let csharp = brokk_bifrost_analysis::analyzer::resolve_analyzer::<
-            brokk_bifrost_csharp_analysis::analyzer::csharp::CSharpAnalyzer,
-        >(request.analyzer())
-        .unwrap();
-        let services =
-            brokk_bifrost_analysis::analyzer::native_points::selected_analyzer_services_for_test(
-                csharp,
-            );
-        let snapshots = store
-            .workspace_snapshots_for_current_languages(&workspace_id, &["csharp".into()])
-            .unwrap();
-        let languages = [SelectedResolutionLanguage::with_epoch(
-            "csharp",
-            Language::CSharp,
-            brokk_bifrost_analysis::analyzer::store::resolution::csharp_trial_bundle_epoch(),
-        )];
-        let cancellation = CancellationToken::new();
-        // Begin the query before retaining the selected operation's only reader.
-        brokk_bifrost_analysis::analyzer::capture_query_reads(csharp, || ());
-        let SelectedResolutionOperationOpenOutcome::Ready(operation) = store
-            .open_selected_resolution_operation(
-                SelectedResolutionOperationInput::new(
-                    disk.as_ref(),
-                    &workspace_id,
-                    &snapshots,
-                    &languages,
-                    &[],
-                )
-                .with_analyzer(&services),
-                &cancellation,
+        let warm = build();
+        let lookup = |workspace: &WorkspaceAnalyzer| {
+            let analyzer = workspace.analyzer();
+            let scope = AnalyzerQueryScope::new(analyzer);
+            resolve_definition_batch(
+                analyzer,
+                scope.token(),
+                vec![DefinitionLookupRequest {
+                    file: file.clone(),
+                    line: None,
+                    column: None,
+                    start_byte: Some(14),
+                    end_byte: Some(19),
+                }],
             )
-            .unwrap()
-        else {
-            panic!("selected C# operation");
+            .remove(0)
         };
-        let locator =
-            SelectedSemanticLocator::for_reference_range("csharp", "App/Caller.cs", 15, 19);
-        // Both nested reads use immutable (workspace, generation, revision) rows;
-        // their answers do not depend on the connection's snapshot.
-        let (result, reads) = brokk_bifrost_analysis::analyzer::capture_query_reads(csharp, || {
-            probe_type(&operation, &snapshots["csharp"], &locator, &cancellation)
-        });
-        assert!(
-            !reads.keys().is_empty(),
-            "selected demand must record reads"
+        assert_eq!(lookup(&warm).status, DefinitionLookupStatus::NotAReference);
+        file.write(edited).unwrap();
+        let updated = warm.update(&std::collections::BTreeSet::from([file.clone()]));
+        let actual = lookup(&updated);
+        let cold = lookup(&build());
+        assert_ne!(
+            actual.status,
+            DefinitionLookupStatus::NotAReference,
+            "edited={edited}; actual={actual:?}; cold={cold:?}"
         );
-        let result = result.unwrap().unwrap();
-        answers.push((result.targets, result.visited));
+        assert_eq!(actual.status, cold.status);
+        assert_eq!(
+            format!("{:?}", actual.incomplete_evidence),
+            format!("{:?}", cold.incomplete_evidence)
+        );
     }
-    assert_eq!(answers[0], answers[1]);
+}
+
+// Raw C# placement and global-using reads are covered by certification keys
+// recorded where the operation builds its handle.
+#[test]
+fn csharp_certified_raw_read_receipt_contract() {
+    if std::env::var_os("BIFROST_TRIAL_NATIVE_CSHARP").is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "engine_tests::csharp_demand::csharp_certified_raw_read_receipt_contract",
+                "--nocapture",
+            ])
+            .env("BIFROST_TRIAL_NATIVE_CSHARP", "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+        return;
+    }
+    use brokk_bifrost_analysis::analyzer::read_ledger::{
+        FactSubject, ReadKey, WorkspaceFactFamily,
+    };
+    use brokk_bifrost_analysis::analyzer::semantic::read_ledger::LookupQuestion;
+    let fixture = InlineTestProject::with_language(Language::CSharp)
+        .file("App/App.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\" />")
+        .file(
+            "App/Caller.cs",
+            "global using System; class Caller { Peer value; } class Peer {}",
+        )
+        .build();
+    let context = ephemeral_store_context(fixture.project_dyn().as_ref()).unwrap();
+    let workspace_id = context.workspace_id.clone();
+    let store = std::sync::Arc::clone(&context.store);
+    let workspace = WorkspaceAnalyzer::build_with_store_context_for_test(
+        fixture.project_dyn(),
+        AnalyzerConfig::default(),
+        context,
+    )
+    .unwrap();
+    let disk = fixture.project_dyn();
+    let csharp = brokk_bifrost_analysis::analyzer::resolve_analyzer::<
+        brokk_bifrost_csharp_analysis::analyzer::csharp::CSharpAnalyzer,
+    >(workspace.analyzer())
+    .unwrap();
+    let services =
+        brokk_bifrost_analysis::analyzer::native_points::selected_analyzer_services_for_test(
+            csharp,
+        );
+    let snapshots = store
+        .workspace_snapshots_for_current_languages(&workspace_id, &["csharp".into()])
+        .unwrap();
+    let languages = [SelectedResolutionLanguage::with_epoch(
+        "csharp",
+        Language::CSharp,
+        brokk_bifrost_analysis::analyzer::store::resolution::csharp_trial_bundle_epoch(),
+    )];
+    let cancellation = CancellationToken::new();
+    // Begin the query before retaining the selected operation's only reader.
+    brokk_bifrost_analysis::analyzer::capture_query_reads(csharp, || ());
+    let SelectedResolutionOperationOpenOutcome::Ready(operation) = store
+        .open_selected_resolution_operation(
+            SelectedResolutionOperationInput::new(
+                disk.as_ref(),
+                &workspace_id,
+                &snapshots,
+                &languages,
+                &[],
+            )
+            .with_analyzer(&services),
+            &cancellation,
+        )
+        .unwrap()
+    else {
+        panic!("selected C# operation");
+    };
+    let admit = || {
+        brokk_bifrost_analysis::analyzer::capture_query_reads(csharp, || {
+            brokk_bifrost_analysis::analyzer::store::resolution_operation::csharp_demand::probe_certified_reader_receipt(&operation, "App/Caller.cs").unwrap()
+        })
+    };
+    let (admitted, reads) = admit();
+    assert_eq!(admitted, 1, "one placement exercises both raw readers");
+    assert!(!reads.reuse_refused());
+    let keys = reads.keys();
+    assert!(
+        keys.iter().any(|key| matches!(
+            key,
+            ReadKey::Lookup {
+                question: LookupQuestion::WorkspaceFact {
+                    family: WorkspaceFactFamily::CSharpCompilationConfiguration,
+                    language: Language::CSharp,
+                    subject: FactSubject::Whole,
+                },
+                ..
+            }
+        )),
+        "admission must record the configuration fact: {keys:?}"
+    );
+
+    assert!(
+        keys.iter().any(|key| matches!(
+            key,
+            ReadKey::Scope { languages, .. } if languages.as_ref() == [Language::CSharp]
+        )),
+        "certification must record C# membership: {keys:?}"
+    );
 }

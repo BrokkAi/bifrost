@@ -1842,7 +1842,9 @@ fn context_publishable_qualifier_completion(
             | ResolutionIncompleteReason::CyclicPrefixDependency(_)
             | ResolutionIncompleteReason::ReceiverBudgetExhausted(_)
             | ResolutionIncompleteReason::TimeBudgetExceeded(_)
-            | ResolutionIncompleteReason::UnmountedFile { .. } => false,
+            | ResolutionIncompleteReason::UnmountedFile { .. }
+            | ResolutionIncompleteReason::OverlayFrontierUnknown(_)
+            | ResolutionIncompleteReason::Unclassified(_) => false,
         })
         .copied()
         .collect::<Vec<_>>();
@@ -2567,6 +2569,7 @@ impl JvmDemandState<'_, '_, '_> {
         Ok(self.operation.ready.context_identities.named_semantic(
             descriptor.finish(),
             "jvm-expression-prefix-unproven",
+            crate::analyzer::resolution::ReasonDeterminism::Unaudited,
             "Java expression prefix has non-unique or unsupported type evidence",
         ))
     }
@@ -3229,7 +3232,12 @@ impl<'a, 'store, 'input> JvmRules<'a, 'store, 'input> {
                     .operation
                     .ready
                     .context_identities
-                    .named_semantic(descriptor.finish(), kind, &detail);
+                    .named_semantic(
+                        descriptor.finish(),
+                        kind,
+                        crate::analyzer::resolution::ReasonDeterminism::Unaudited,
+                        &detail,
+                    );
                 self.state
                     .operation
                     .ready
@@ -5274,11 +5282,12 @@ impl JvmHalfRows<'_, '_, '_> {
             "start",
             CanonicalIdentityPart::Content(&(cursor.start_step as u64).to_le_bytes()),
         )?;
-        let reason =
-            operation
-                .ready
-                .context_identities
-                .named_semantic(descriptor.finish(), kind, detail);
+        let reason = operation.ready.context_identities.named_semantic(
+            descriptor.finish(),
+            kind,
+            crate::analyzer::resolution::ReasonDeterminism::Unaudited,
+            detail,
+        );
         operation
             .ready
             .context_identities

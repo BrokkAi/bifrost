@@ -37,6 +37,13 @@ pub struct MemberIdentity<'a> {
     pub parameter_types: &'a [TypeRef],
     pub parameter_variadics: &'a [bool],
     pub return_type: Option<&'a TypeRef>,
+    /// The declared receiver of a source-level extension method whose
+    /// receiver is not one of its ordinary parameters, such as a Scala 3
+    /// `extension (prefix: IArray[T]) def ++:(arr: IArray[U])`. Two such
+    /// extensions in one owner can share every ordinary parameter and differ
+    /// only here. It is hashed under its own field only when present, so the
+    /// identity of every other member is unchanged.
+    pub extension_receiver: Option<&'a TypeRef>,
 }
 
 pub fn type_declaration_id(identity: TypeIdentity<'_>) -> String {
@@ -83,6 +90,11 @@ pub fn member_declaration_id(identity: MemberIdentity<'_>) -> String {
     let return_type = serde_json::to_vec(&identity.return_type)
         .expect("optional return type is JSON serializable");
     hasher.field("return_type", &return_type);
+    if let Some(receiver) = identity.extension_receiver {
+        let encoded =
+            serde_json::to_vec(receiver).expect("extension receivers are JSON serializable");
+        hasher.field("extension_receiver", &encoded);
+    }
     format!("member.{}", lower_hex_string(&hasher.finish()))
 }
 
@@ -105,6 +117,7 @@ mod tests {
                 generic_arity: 0,
                 parameter_types,
                 parameter_variadics: &[],
+                extension_receiver: None,
                 return_type: None,
             }
         }
@@ -156,6 +169,7 @@ mod tests {
                 generic_arity: 0,
                 parameter_types,
                 parameter_variadics: &[],
+                extension_receiver: None,
                 return_type: None,
             }
         }

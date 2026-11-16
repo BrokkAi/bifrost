@@ -31,6 +31,7 @@ pub const BODY_MANIFEST_COLUMNS: &[&str] = &[
     "expected_call_obligation_count",
     "expected_callable_signature_count",
     "expected_callable_parameter_owner_count",
+    "expected_binary_operation_count",
     "expected_capsule_input_count",
     "expected_capsule_declaration_count",
     "expected_capsule_reference_context_count",
@@ -269,6 +270,13 @@ canonical_row!(
     reference_indirection_delta,
     value_transform,
     completion
+);
+canonical_row!(
+    PreparedBinaryOperationRow,
+    output_slot,
+    left_slot,
+    right_slot,
+    operator
 );
 canonical_row!(
     PreparedTypeProductionRow,
@@ -526,6 +534,18 @@ pub(super) fn complete_body_digest(
         out.extend_from_slice(&recipe.namespace.to_be_bytes());
         put_bytes(out, recipe.spelling.as_bytes());
     }
+    // Empty and absent operator inventories have identical identity. Only
+    // Rust rotates its producer token for this family; appending a nonempty
+    // extension preserves all existing non-Rust body digests.
+    if !typed.binary_operations.is_empty() {
+        family(
+            &mut hash,
+            "binary_operations",
+            &typed.binary_operations,
+            &typed.shared,
+            cancellation,
+        )?;
+    }
     Some(hash.finish())
 }
 
@@ -562,6 +582,7 @@ pub(super) fn body_counts(
         typed.call_obligations.len(),
         typed.callable_signatures.len(),
         typed.callable_parameter_owners.len(),
+        typed.binary_operations.len(),
         0,
         0,
         0,
@@ -594,6 +615,7 @@ pub(super) const COMPLETE_PUBLICATION_COUNTS_SQL: &str =
        (SELECT COUNT(*) FROM resolution_declaration_access_boundaries WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_member_scope_properties WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_member_owner_properties WHERE blob_id = ?1),
+       (SELECT COUNT(*) FROM resolution_rust_structural_trait_impls WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_trait_implementations WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_inherent_implementations WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_typed_fact_lookups WHERE blob_id = ?1),
@@ -611,6 +633,7 @@ pub(super) const COMPLETE_PUBLICATION_COUNTS_SQL: &str =
        (SELECT COUNT(*) FROM resolution_package_routes WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_package_route_segments WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_singleton_relations WHERE blob_id = ?1),
+       (SELECT COUNT(*) FROM resolution_csharp_friend_attributes WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_extern_aliases WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_compilation_imports WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_reference_package_contexts WHERE blob_id = ?1),
@@ -641,6 +664,7 @@ pub(super) const COMPLETE_PUBLICATION_COUNTS_SQL: &str =
        (SELECT COUNT(*) FROM resolution_call_obligations WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_callable_signatures WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_callable_parameter_owners WHERE blob_id = ?1),
+       (SELECT COUNT(*) FROM resolution_binary_operations WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_capsule_inputs WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_capsule_declarations WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_capsule_reference_contexts WHERE blob_id = ?1),
@@ -669,6 +693,7 @@ pub(super) const COMPLETE_PUBLICATION_PAYLOAD_BYTES_SQL: &str = "SELECT (SELECT 
        + (SELECT COALESCE(SUM(length(CAST(scope_kind AS BLOB))),0) FROM resolution_member_scope_properties WHERE blob_id = ?1)
        + (SELECT COALESCE(SUM(COALESCE(length(CAST(member_name AS BLOB)),0) + COALESCE(length(CAST(member_kind AS BLOB)),0) + COALESCE(length(CAST(member_access AS BLOB)),0) + COALESCE(length(CAST(qualifier_compatibility AS BLOB)),0)),0) FROM resolution_member_owner_properties WHERE blob_id = ?1)
        + (SELECT COALESCE(SUM(COALESCE(length(CAST(segment AS BLOB)),0) + COALESCE(length(CAST(terminal_spelling AS BLOB)),0)),0) FROM resolution_inherent_implementations WHERE blob_id = ?1)
+       + (SELECT COALESCE(SUM(length(CAST(trait_terminal_spelling AS BLOB))),0) FROM resolution_rust_structural_trait_impls WHERE blob_id = ?1)
        + (SELECT COALESCE(SUM(COALESCE(length(CAST(side AS BLOB)),0) + COALESCE(length(CAST(segment AS BLOB)),0) + COALESCE(length(CAST(terminal_spelling AS BLOB)),0)),0) FROM resolution_trait_implementations WHERE blob_id = ?1)
        + (SELECT COALESCE(SUM(COALESCE(length(CAST(length_token AS BLOB)),0)),0) FROM resolution_type_productions WHERE blob_id = ?1)
        + (SELECT COALESCE(SUM(COALESCE(length(CAST(label AS BLOB)),0)),0) FROM resolution_call_arguments WHERE blob_id = ?1)
@@ -934,6 +959,25 @@ mod tests {
     #[test]
     #[hardwon("3da13ca2218b: resolution body identity changed with row or shared-intern order")]
     fn body_identity_is_independent_of_row_order_and_shared_intern_order() {
+        // Independent 805a7b6e2a framing: an absent binary family must not
+        // change identities for languages whose producer token did not move.
+        assert_eq!(
+            complete_body_digest(
+                [0; 32],
+                &PreparedPathRows::default(),
+                &[],
+                &PreparedTypedRows::default(),
+                &PreparedGapRows::default(),
+                &[],
+                &[],
+                &CancellationToken::default(),
+            )
+            .unwrap(),
+            [
+                73, 131, 23, 43, 249, 92, 199, 166, 117, 91, 224, 251, 87, 114, 255, 235, 46, 213,
+                226, 155, 35, 17, 140, 87, 33, 218, 27, 35, 186, 27, 106, 237
+            ]
+        );
         let row = PreparedPathRow {
             path: 1,
             start_node: 2,

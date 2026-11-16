@@ -56,4 +56,4 @@ pub use summary::{
     solve_taint_with_reusable_summaries_with_model_receipts,
 };
 
-pub use barriers::{IcfgBarrierError, IcfgBarrierOutcome, IcfgBarrierSession};
+pub use barriers::{IcfgTaintError, IcfgTaintIncomplete, IcfgTaintOutcome, IcfgTaintSession};

@@ -113,7 +113,7 @@ pub fn jsts_member_candidates(
     }
 }
 
-fn ts_return_expression(node: Node<'_>) -> Option<Node<'_>> {
+pub(crate) fn ts_return_expression(node: Node<'_>) -> Option<Node<'_>> {
     debug_assert_eq!(node.kind(), "return_statement");
     node.named_children(&mut node.walk())
         .find(|child| !child.is_extra())
@@ -2918,16 +2918,24 @@ export function caller(items: string[]): Wrapped<string> | string {
         let root = tempfile::tempdir().expect("tempdir");
         let mut host = FakeJsTsSource::new(root.path(), "");
         host.source_inventory_complete = false;
+        // The defect #2744 fixed is in graph construction, so the pin moved there:
+        // the graph builder reads `complete_usage_index` and refuses an index built
+        // over an incomplete inventory. The index itself builds and resolves what
+        // the inventory lists.
+        assert!(host.complete_usage_index(None).is_none());
         for parallel in [false, true] {
-            assert!(
-                crate::graph::resolver::build_jsts_usage_index(
-                    &host,
-                    host.aliases.as_ref(),
-                    Language::TypeScript,
-                    parallel
-                )
-                .is_none()
-            );
+            let index = crate::graph::resolver::build_jsts_usage_index(
+                &host,
+                host.aliases.as_ref(),
+                Language::TypeScript,
+                parallel,
+            )
+            .expect("an incomplete inventory still builds the index");
+            assert!(index.binders_by_file.contains_key(&host.file));
+            assert!(matches!(
+                index.inventory,
+                crate::graph::resolver::IndexInventory::Incomplete(_)
+            ));
         }
     }
 

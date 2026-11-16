@@ -5,14 +5,15 @@
 
 use std::sync::Arc;
 
+use crate::analyzer::reuse_verdict::{CarriesReuseVerdict, ExecutionCause, ReuseVerdict};
 use crate::analyzer::semantic::partial_flow::{
     CrossedCalls, HeapSelector, PartialFlowPort, ProcedurePartialFlows,
 };
 use crate::analyzer::semantic::{
     AbstractLocation, AccessPathTail, BarrierObservation, CallInvocationMode, CallSiteId,
     CandidateCoverage, CaptureBinding, DispatchBoundaryKind, DurableCallContext, ExecutionTiming,
-    ObservationPhase, ProcedureHandle, ProgramPointHandle, ProgramPointId, SemanticCapability,
-    SemanticGapHandle, SemanticLocator, SemanticRequest, ValueId, ValueTypeBarrierDecision,
+    LogicalGapHandle, ObservationPhase, ProcedureHandle, ProgramPointHandle, ProgramPointId,
+    SemanticCapability, SemanticLocator, SemanticRequest, ValueId, ValueTypeBarrierDecision,
     ValueTypePredicate,
 };
 use crate::dataflow::{SemanticInputStatus, UnmodeledCallBehavior};
@@ -205,10 +206,52 @@ pub struct ExecutionEndpoints<Fact> {
 pub type ProjectedPartialFlows<F> = Vec<(Option<F>, Arc<ProcedurePartialFlows>)>;
 pub type ProjectedInteriorFlows<F> = Vec<(Option<F>, InteriorFlows)>;
 
+/// Whether the provider exposes the immutable policy input backing needed by
+/// a candidate comparison. This is not a completeness or admission verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompositionProviderInputSupport {
+    Unsupported,
+    PolicyInputs,
+}
+
+/// Answers supplied to the shared composition algorithm. Candidate input
+/// support is separate from the ordinary provider contract.
 pub trait CompositionProvider {
+    /// Pure capability metadata. PolicyInputs is valid only alongside the
+    /// policy provider's owned typed backing/comparator for nonneutral hooks.
+    /// A generic provider with unrepresented hooks keeps Unsupported.
+    fn candidate_input_support(&self) -> CompositionProviderInputSupport {
+        CompositionProviderInputSupport::Unsupported
+    }
+
     type Error: std::fmt::Display;
     type Fact: Clone + Eq + std::hash::Hash + std::fmt::Debug;
     type Function: Clone + Eq + std::hash::Hash + std::fmt::Debug;
+
+    /// Whether this composition admits endpoint projection content. This is
+    /// fixed for the provider's lifetime and must not perform I/O or dispatch.
+    /// The search captures it once; false preserves legacy whole-value reads.
+    fn endpoint_projections_enabled(&self) -> bool {
+        false
+    }
+
+    /// Certify the inputs of a refused returned-member model consult. A
+    /// provider records the selected model-set read in this consult's receipt
+    /// before returning Content, including when dispatch was memoized. Providers
+    /// without that certificate stay operational. This does not certify the
+    /// dispatch or the model's other incompleteness; the search joins those
+    /// typed causes separately.
+    fn certify_model_content_refusal(&self, _request: &mut SemanticRequest<'_>) -> IncompleteCause {
+        IncompleteCause::Operational(OperationalCause::Provider)
+    }
+
+    /// Classify a refused acquisition separately from provider failures.
+    fn acquisition_refusal(
+        &self,
+        _error: &Self::Error,
+    ) -> Option<crate::analyzer::semantic::CandidateLocatorRefusal> {
+        None
+    }
 
     /// A request-local execution discovery shared by selected sink searches.
     fn execution_discovery<E>(
@@ -312,6 +355,19 @@ pub trait CompositionProvider {
     /// stored-summary path and performs no barrier type lookup.
     fn has_value_type_barriers(&self) -> bool {
         false
+    }
+
+    /// Lazily requested only after a schema-35 component producer is known.
+    /// None means not provided and preserves legacy consumption; Some includes
+    /// answered empty sets and reports incomplete origin searches explicitly.
+    fn modeled_input_locations(
+        &self,
+        _procedure: &ProcedureHandle,
+        _call: CallSiteId,
+        _actual: &PartialFlowPort,
+        _request: &mut SemanticRequest<'_>,
+    ) -> Result<Option<crate::value_flow::CallerContentLocations>, Self::Error> {
+        Ok(None)
     }
 
     /// Cheap pre-dispatch check for a call that may share caller storage.
@@ -626,6 +682,18 @@ pub trait CompositionProvider {
         request: &mut SemanticRequest<'_>,
     ) -> Result<ProcedureEndpoints<Self::Fact, Self::Function>, Self::Error>;
 
+    /// Couple an endpoint consult to every typed cause it consumed. Providers
+    /// with a richer inventory override this method; legacy producers retain
+    /// their already typed completeness cause through the default.
+    fn endpoints_with_causes(
+        &self,
+        procedure: &DurableProcedureKey,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<ProcedureEndpointAnswer<Self::Fact, Self::Function>, Self::Error> {
+        self.endpoints(procedure, request)
+            .map(ProcedureEndpointAnswer::from)
+    }
+
     /// The selector evidence of a source whose `evidence` is
     /// [`EndpointEvidence::Unknown`], judged the way the ICFG engine judges
     /// every source it binds. Asked once per source, and only for a source on
@@ -711,6 +779,25 @@ impl<Fact, Function> ProcedureEndpoints<Fact, Function> {
     }
 }
 
+/// An ephemeral endpoint answer and the finite causes observed at its consult.
+/// This wrapper is never serialized or stored as a cell value.
+pub struct ProcedureEndpointAnswer<Fact = TaintClassSet, Function = TaintEdgeFunction> {
+    pub endpoints: ProcedureEndpoints<Fact, Function>,
+    pub causes: Vec<IncompleteCause>,
+}
+
+impl<Fact, Function> From<ProcedureEndpoints<Fact, Function>>
+    for ProcedureEndpointAnswer<Fact, Function>
+{
+    fn from(endpoints: ProcedureEndpoints<Fact, Function>) -> Self {
+        let causes = match &endpoints.completeness {
+            Completeness::Complete => Vec::new(),
+            Completeness::Incomplete { cause, .. } => vec![*cause],
+        };
+        Self { endpoints, causes }
+    }
+}
+
 /// The proof and completeness of an endpoint's selector evidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EndpointEvidence {
@@ -732,6 +819,7 @@ pub enum EndpointEvidence {
 /// that reach a sink.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoundSource<Fact = TaintClassSet> {
+    pub selected_entry: Option<Arc<crate::value_flow::SelectedSourceEntryView>>,
     pub point: ProgramPointHandle,
     pub phase: ValueFlowObservationPhase,
     pub carrier: ValueFlowCarrier,
@@ -791,6 +879,27 @@ pub enum OperationalCause {
     Provider,
 }
 
+impl IncompleteCause {
+    /// The product's operational cause, without its optional budget-lane payload.
+    pub const fn execution_cause(
+        self,
+    ) -> Option<crate::analyzer::read_ledger::DerivationExecutionCause> {
+        use crate::analyzer::read_ledger::DerivationExecutionCause;
+        match self {
+            Self::Content => None,
+            Self::Operational(OperationalCause::Budget(_)) => {
+                Some(DerivationExecutionCause::Budget)
+            }
+            Self::Operational(OperationalCause::Cancelled) => {
+                Some(DerivationExecutionCause::Cancelled)
+            }
+            Self::Operational(OperationalCause::Provider) => {
+                Some(DerivationExecutionCause::Provider)
+            }
+        }
+    }
+}
+
 impl Completeness {
     pub fn content(reason: impl Into<Box<str>>) -> Self {
         Self::Incomplete {
@@ -838,6 +947,27 @@ impl Completeness {
     }
 }
 
+impl CarriesReuseVerdict for Completeness {
+    fn reuse_verdict(&self) -> ReuseVerdict {
+        match self {
+            Self::Complete => ReuseVerdict::Content,
+            Self::Incomplete { cause, .. } => cause.reuse_verdict(),
+        }
+    }
+}
+
+impl CarriesReuseVerdict for IncompleteCause {
+    /// An operational stop reaches the ambient channel as a non-budget
+    /// dependence, a semantic budget stop included, so each one is `Other`.
+    fn reuse_verdict(&self) -> ReuseVerdict {
+        if self.execution_cause().is_some() {
+            ReuseVerdict::ExecutionDependent(ExecutionCause::Other)
+        } else {
+            ReuseVerdict::Content
+        }
+    }
+}
+
 /// A location in the caller that a callee's `Heap` input port reads: the
 /// access path `selectors` with `tail`, rooted at the caller-side value bound
 /// to the call input port `actual` (`CallReceiver` or `CallArgument` of
@@ -858,6 +988,7 @@ pub enum InteriorSeed {
         point: ProgramPointId,
         phase: ValueFlowObservationPhase,
         carrier: ValueFlowCarrier,
+        selected_entry: Option<Arc<crate::value_flow::SelectedSourceEntryView>>,
     },
     /// An input port of the procedure (receiver, parameter, capture slot,
     /// heap input, call result or thrown value).
@@ -1068,6 +1199,15 @@ pub struct ModelTransfer<Function = TaintEdgeFunction> {
     /// which concrete receiver or argument storage receives this output.
     /// Only a source/sink path through this transfer is left incomplete.
     pub unresolved_output_storage: bool,
+    /// Member paths are identical across this transfer. False means no proof,
+    /// not proof of changed contents: component demands remain incomplete.
+    pub preserves_member_contents: bool,
+}
+
+impl<Function> ModelTransfer<Function> {
+    pub fn preserves_member_contents(&self) -> bool {
+        self.preserves_member_contents
+    }
 }
 
 /// A model that replaces one call to one candidate.
@@ -1083,6 +1223,9 @@ pub struct ModelTransfer<Function = TaintEdgeFunction> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallModel<Function = TaintEdgeFunction> {
     pub transfers: Vec<ModelTransfer<Function>>,
+    /// The selected schema-35 model carries typed endpoint paths. Its exact
+    /// component transfers can answer returned-member demands.
+    pub endpoint_projections: bool,
     /// Identity of the selected procedure summary, retained as provenance.
     pub summary: Option<crate::dataflow::ProcedureSummaryKey>,
     /// Exact dispatch boundary whose selected summary contributed transfers.
@@ -1140,6 +1283,8 @@ pub enum Openness {
         residual: Box<[DurableCallSiteKey]>,
         /// Cause aligned with each residual call.
         residual_causes: Box<[IncompleteCause]>,
+        /// An independently unproven local relation, even when calls refine.
+        relation_cause: Option<IncompleteCause>,
         cause: IncompleteCause,
         blocked: Option<BlockedGap>,
         status: SemanticInputStatus,
@@ -1152,6 +1297,6 @@ pub enum Openness {
 /// for the same gap.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BlockedGap {
-    pub gap: SemanticGapHandle,
+    pub gap: LogicalGapHandle,
     pub capability: SemanticCapability,
 }

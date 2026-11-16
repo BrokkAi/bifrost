@@ -5,6 +5,9 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use brokk_bifrost_core::analyzer::model::ProjectFile;
+use brokk_bifrost_core::analyzer::reuse_verdict::{
+    CarriesReuseVerdict, ExecutionCause, Judged, ReuseVerdict,
+};
 
 use crate::analyzer::semantic::read_ledger::StoredSemanticIrPublicationAnswer;
 use brokk_bifrost_core::cancellation::CancellationToken;
@@ -92,13 +95,17 @@ use crate::analyzer::semantic::partial_flow::ProcedurePartialFlows;
 
 use brokk_bifrost_core::analyzer::work_budget::BudgetLedger;
 
-use brokk_bifrost_core::analyzer::work_budget::WorkBudgetExceeded;
+use brokk_bifrost_core::analyzer::work_budget::{BudgetRefused, WorkBudgetShortfall};
 
 use brokk_bifrost_core::analyzer::work_budget::define_work_dimensions;
 
 /// A moment in a semantic budget's refusal count. See
 /// [`SemanticBudget::refusal_mark`].
-pub type SemanticBudgetRefusalMark = brokk_bifrost_core::analyzer::work_budget::RefusalMark;
+#[derive(Debug, Clone)]
+pub struct SemanticBudgetRefusalMark {
+    refusals: Arc<Mutex<SemanticBudgetRefusalState>>,
+    base: usize,
+}
 
 define_work_dimensions! {
     #[repr(u8)]
@@ -307,6 +314,8 @@ pub struct SemanticBudget {
     root_work_peak: SemanticWork,
     replay_observers: Vec<ReplayObserver>,
     lowering_work: Option<Arc<Mutex<SemanticWork>>>,
+    // Demand-only observer; ordinary replay observers are deliberately separate.
+    admission_peak: Option<Arc<Mutex<AdmissionPeakCapture>>>,
     resident_peak: SemanticWork,
     /// What this ledger itself held at its peak, apart from rows it inherited
     /// from a parent (see [`ResidentInterval`]).
@@ -318,14 +327,30 @@ pub struct SemanticBudget {
     scope: Arc<SemanticBudgetScope>,
     charged_artifacts: Arc<HashSet<StableDigest>>,
     shared_summary_expansion_limit: Option<usize>,
-    /// The first charge this ledger refused. Clones share it, so a refusal
-    /// on a staging copy that is then discarded is still recorded; a child
-    /// ledger has its own.
-    first_refusal: Arc<std::sync::OnceLock<SemanticBudgetRefusal>>,
+    /// One refusal owner keeps the count and its real first cause together.
+    /// Clones share it; independent unit ledgers start without a refusal.
+    refusals: Arc<Mutex<SemanticBudgetRefusalState>>,
     refusal_origins: Arc<Mutex<SemanticRefusalOrigins>>,
     unit_resident_lane: bool,
     // Timing-only query history. Lightweight scope identities never retain it.
     lowered: Arc<Mutex<HashSet<StableDigest>>>,
+}
+
+/// A demand-only cold body's resident admission bound. This is never persisted
+/// and never changes ordinary replay snapshots or their observer lifetimes.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SemanticAdmissionPeak {
+    pub required: SemanticWork,
+    pub checks: usize,
+    /// Relative credit is reusable only while inherited dependencies stayed live.
+    pub replayable: bool,
+}
+#[derive(Debug)]
+struct AdmissionPeakCapture {
+    baseline: SemanticWork,
+    owners: Arc<ResidentOwners>,
+    artifacts: Arc<ResidentArtifacts>,
+    receipt: SemanticAdmissionPeak,
 }
 
 /// The admission authority that produced a refusal.
@@ -366,6 +391,57 @@ pub struct ResidentCensus {
 pub struct SemanticBudgetRefusal {
     pub exceeded: SemanticBudgetExceeded,
     pub site: &'static std::panic::Location<'static>,
+}
+
+/// Complete refusal state for one logical semantic ledger. A counted refusal
+/// always includes its first real dimension and source location.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticBudgetRefusalState {
+    #[default]
+    NotRefused,
+    Refused {
+        first: SemanticBudgetRefusal,
+        count: usize,
+    },
+}
+
+impl SemanticBudgetRefusalState {
+    const fn count(self) -> usize {
+        match self {
+            Self::NotRefused => 0,
+            Self::Refused { count, .. } => count,
+        }
+    }
+}
+
+/// Refusals belong to the work that recorded them, not another unit sharing
+/// the lifetime ledger. Nested scopes forward the same value to their parent.
+struct SemanticRefusalCapture {
+    first: Mutex<Option<SemanticBudgetRefusal>>,
+    parent: Option<Arc<Self>>,
+}
+
+impl SemanticRefusalCapture {
+    fn record(&self, refusal: SemanticBudgetRefusal) {
+        let mut capture = Some(self);
+        while let Some(current) = capture {
+            {
+                let mut first = current.first.lock().unwrap_or_else(|poisoned| {
+                    current.first.clear_poison();
+                    poisoned.into_inner()
+                });
+                first.get_or_insert(refusal);
+            }
+            capture = current.parent.as_deref();
+        }
+    }
+
+    fn first(&self) -> Option<SemanticBudgetRefusal> {
+        *self.first.lock().unwrap_or_else(|poisoned| {
+            self.first.clear_poison();
+            poisoned.into_inner()
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -495,12 +571,12 @@ impl fmt::Display for SemanticBudgetExceeded {
 
 impl std::error::Error for SemanticBudgetExceeded {}
 
-impl From<WorkBudgetExceeded<SemanticBudgetDimension>> for SemanticBudgetExceeded {
-    fn from(exceeded: WorkBudgetExceeded<SemanticBudgetDimension>) -> Self {
+impl From<WorkBudgetShortfall<SemanticBudgetDimension>> for SemanticBudgetExceeded {
+    fn from(shortfall: WorkBudgetShortfall<SemanticBudgetDimension>) -> Self {
         Self {
-            dimension: exceeded.dimension(),
-            limit: exceeded.limit(),
-            attempted: exceeded.attempted(),
+            dimension: shortfall.dimension(),
+            limit: shortfall.limit(),
+            attempted: shortfall.attempted(),
         }
     }
 }
@@ -528,6 +604,7 @@ impl SemanticBudget {
             root_work_peak: SemanticWork::default(),
             replay_observers: Vec::new(),
             lowering_work: None,
+            admission_peak: None,
             resident_peak: SemanticWork::default(),
             own: ResidentInterval::independent(),
             resident_artifacts: Arc::default(),
@@ -537,7 +614,7 @@ impl SemanticBudget {
             scope: Arc::new(SemanticBudgetScope),
             charged_artifacts: Arc::new(HashSet::new()),
             shared_summary_expansion_limit: None,
-            first_refusal: Arc::default(),
+            refusals: Arc::default(),
             refusal_origins: Arc::default(),
             unit_resident_lane: false,
             lowered: Arc::default(),
@@ -950,20 +1027,28 @@ impl SemanticBudget {
     }
 
     pub fn refusal_count(&self) -> usize {
-        self.ledger.refusal_count()
+        self.refusal_state().count()
     }
 
     /// The refusals observed so far. A request built with
     /// [`SemanticRequest::observing_refusals_since`] treats a refusal before
     /// this mark as another unit's, not its own.
     pub fn refusal_mark(&self) -> SemanticBudgetRefusalMark {
-        self.ledger.refusal_mark()
+        SemanticBudgetRefusalMark {
+            refusals: Arc::clone(&self.refusals),
+            base: self.refusal_count(),
+        }
     }
 
     /// Refusals recorded since `mark`; all of this budget's refusals when the
     /// mark belongs to another logical budget.
     pub fn refusals_since(&self, mark: &SemanticBudgetRefusalMark) -> usize {
-        self.ledger.refusals_since(mark)
+        let count = self.refusal_count();
+        if Arc::ptr_eq(&self.refusals, &mark.refusals) {
+            count.saturating_sub(mark.base)
+        } else {
+            count
+        }
     }
 
     /// Record a bounded proof's deadline as a budget stop without inventing
@@ -978,16 +1063,116 @@ impl SemanticBudget {
         };
         let exceeded = SemanticBudgetExceeded::new(dimension, limit, limit.saturating_add(1));
         self.note_refusal_origin(SemanticRefusalOrigin::Other);
-        self.ledger.record_refusal();
-        self.first_refusal.get_or_init(|| SemanticBudgetRefusal {
-            exceeded,
-            site: std::panic::Location::caller(),
-        });
+        self.record_refusal(exceeded, std::panic::Location::caller());
     }
 
+    /// Observe one lowering body, including staging clones that are discarded.
+    /// Cost: one small Arc/Mutex and two shared registry references per opted
+    /// body; each admission inspects those existing registries under one lock.
+    /// Receipt storage is constant, and ordinary callers opt into nothing.
+    #[doc(hidden)]
+    pub fn with_admission_peak<R>(
+        &self,
+        run: impl FnOnce(&Self) -> R,
+    ) -> (R, SemanticAdmissionPeak) {
+        assert!(
+            self.admission_peak.is_none(),
+            "nested demand admission capture"
+        );
+        let capture = Arc::new(Mutex::new(AdmissionPeakCapture {
+            baseline: self.resident(),
+            owners: self.resident_owners.clone(),
+            artifacts: self.resident_artifacts.clone(),
+            receipt: SemanticAdmissionPeak {
+                replayable: true,
+                ..Default::default()
+            },
+        }));
+        let tracked = Self {
+            admission_peak: Some(capture.clone()),
+            ..self.clone()
+        };
+        let result = run(&tracked);
+        let receipt = capture.lock().expect("admission peak capture").receipt;
+        (result, receipt)
+    }
+
+    #[track_caller]
     pub fn check_admission(&self, work: SemanticWork) -> Result<(), SemanticBudgetExceeded> {
+        let site = std::panic::Location::caller();
+        if let Some(capture) = &self.admission_peak {
+            let requested = self.resident().conservative_add(work);
+            let mut capture = capture.lock().expect("admission peak capture");
+            if capture
+                .owners
+                .values()
+                .any(|(owner, _)| owner.strong_count() == 0)
+                || capture
+                    .artifacts
+                    .values()
+                    .any(|(artifact, _)| !artifact.has_consumer())
+            {
+                // A relative baseline cannot lend credit that expired. The
+                // consumer must execute the bounded cold body instead.
+                capture.receipt.replayable = false;
+            }
+            capture.receipt.required = capture
+                .receipt
+                .required
+                .component_max(requested.saturating_sub(capture.baseline));
+            capture.receipt.checks = capture.receipt.checks.saturating_add(1);
+        }
         self.check_admission_without_recording(work)
-            .inspect_err(|_| self.ledger.record_refusal())
+            .inspect_err(|exceeded| {
+                self.record_refusal(*exceeded, site);
+            })
+    }
+
+    /// Every refusing path records one complete transition. Emit attribution
+    /// after releasing the lock; it must not run callbacks under this mutex.
+    fn record_refusal(
+        &self,
+        exceeded: SemanticBudgetExceeded,
+        site: &'static std::panic::Location<'static>,
+    ) -> SemanticBudgetRefusal {
+        let refusal = SemanticBudgetRefusal { exceeded, site };
+        {
+            let mut state = self.refusal_state_guard();
+            *state = match *state {
+                SemanticBudgetRefusalState::NotRefused => SemanticBudgetRefusalState::Refused {
+                    first: refusal,
+                    count: 1,
+                },
+                SemanticBudgetRefusalState::Refused { first, count } => {
+                    SemanticBudgetRefusalState::Refused {
+                        first,
+                        count: count
+                            .checked_add(1)
+                            .expect("semantic refusal count overflow"),
+                    }
+                }
+            };
+        }
+        let refused = BudgetRefused::record::<SemanticWork>();
+        debug_assert_eq!(
+            refused.reuse_verdict(),
+            ReuseVerdict::ExecutionDependent(ExecutionCause::BudgetRefusal)
+        );
+        if let Some(capture) = brokk_bifrost_core::analyzer::carried_context::refusal_observer::<
+            SemanticRefusalCapture,
+        >() {
+            capture.record(refusal);
+        }
+        refusal
+    }
+
+    fn refusal_state_guard(&self) -> std::sync::MutexGuard<'_, SemanticBudgetRefusalState> {
+        self.refusals.lock().unwrap_or_else(|poisoned| {
+            // Each transition assigns a complete Copy value. An interrupted
+            // transition therefore leaves valid state, which can be recovered.
+            self.refusals.clear_poison();
+            poisoned.into_inner()
+        })
     }
 
     fn check_admission_without_recording(
@@ -1084,13 +1269,14 @@ impl SemanticBudget {
         let site = std::panic::Location::caller();
         self.require_room(work)?;
         self.reconcile_residency();
-        self.ledger.charge(work).map_err(|exceeded| {
-            self.note_refusal_origin(SemanticRefusalOrigin::UnitResident);
-            let exceeded = SemanticBudgetExceeded::from(exceeded);
-            self.first_refusal
-                .get_or_init(|| SemanticBudgetRefusal { exceeded, site });
-            exceeded
-        })?;
+        self.ledger
+            .charge_without_recording(work)
+            .map_err(|shortfall| {
+                self.note_refusal_origin(SemanticRefusalOrigin::UnitResident);
+                let exceeded = SemanticBudgetExceeded::from(shortfall);
+                self.record_refusal(exceeded, site);
+                exceeded
+            })?;
         let used = self.ledger.used();
         self.resident_peak = self.resident_peak.component_max(used);
         self.observe_resident(used);
@@ -1101,12 +1287,7 @@ impl SemanticBudget {
     /// resident balance. Nothing is admitted.
     #[track_caller]
     fn require_room(&self, work: SemanticWork) -> Result<(), SemanticBudgetExceeded> {
-        let site = std::panic::Location::caller();
-        self.check_admission(work).inspect_err(|exceeded| {
-            let exceeded = *exceeded;
-            self.first_refusal
-                .get_or_init(|| SemanticBudgetRefusal { exceeded, site });
-        })
+        self.check_admission(work)
     }
 
     /// Record the highest resident balance every open measurement interval saw,
@@ -1745,7 +1926,15 @@ impl SemanticBudget {
 
     /// The first charge this ledger, or a staging copy of it, refused.
     pub fn first_refusal(&self) -> Option<SemanticBudgetRefusal> {
-        self.first_refusal.get().copied()
+        match self.refusal_state() {
+            SemanticBudgetRefusalState::NotRefused => None,
+            SemanticBudgetRefusalState::Refused { first, .. } => Some(first),
+        }
+    }
+
+    /// Snapshot the count and first cause under their one owner.
+    pub fn refusal_state(&self) -> SemanticBudgetRefusalState {
+        *self.refusal_state_guard()
     }
 
     /// Snapshot this budget's logical scope and paid artifact identities.
@@ -1820,6 +2009,7 @@ impl SemanticBudget {
             root_work_peak: SemanticWork::default(),
             replay_observers: Vec::new(),
             lowering_work: None,
+            admission_peak: None,
             resident_peak: SemanticWork::default(),
             own: ResidentInterval::independent(),
             resident_artifacts: Arc::default(),
@@ -1829,7 +2019,7 @@ impl SemanticBudget {
             scope: Arc::clone(&parent.scope),
             charged_artifacts: Arc::clone(&parent.charged_artifacts),
             shared_summary_expansion_limit: parent.shared_summary_expansion_limit,
-            first_refusal: Arc::default(),
+            refusals: Arc::default(),
             refusal_origins: Arc::clone(&parent.refusal_origins),
             unit_resident_lane: false,
             lowered: Arc::clone(&parent.lowered),
@@ -1855,6 +2045,7 @@ impl SemanticBudget {
         // Copy the raw balance with its raw weak registry, then refund once.
         // An effective balance with expired entries would refund them twice.
         child.ledger = parent.ledger.with_used(parent.ledger.used());
+        child.refusals = Arc::clone(&parent.refusals);
         child.shared_summary_expansion_limit = parent.shared_summary_expansion_limit;
         child.resident_artifacts = Arc::clone(&parent.resident_artifacts);
         child.resident_owners = Arc::clone(&parent.resident_owners);
@@ -2080,6 +2271,27 @@ impl SemanticBudget {
         Ok(())
     }
 
+    /// Admit an artifact whose handle the caller already holds, so no lookup
+    /// happens and none is charged. A live allocation already admitted in this
+    /// budget costs nothing more. A census this budget paid for an allocation
+    /// that is not resident here spends residency again. An artifact this
+    /// budget never paid for pays its full census.
+    #[track_caller]
+    pub fn admit_held_artifact(
+        &mut self,
+        artifact: &Arc<SemanticArtifact>,
+    ) -> Result<(), SemanticBudgetExceeded> {
+        if self.has_charged_allocation(artifact) {
+            return Ok(());
+        }
+        if self.has_charged_artifact(artifact.key().fingerprint()) {
+            self.admit_resident_artifact_rows(artifact.work())?;
+            self.track_resident_artifact(artifact);
+            return Ok(());
+        }
+        self.charge_complete_artifact(artifact)
+    }
+
     /// Record that this budget has paid one artifact's full retained-row
     /// census, so a later cache hit on the same artifact is charged as the
     /// lookup it is.
@@ -2161,7 +2373,13 @@ impl SemanticBudget {
     /// depend only on source content and producer identity. Parse-time and
     /// on-demand publication must use the same producer budget.
     pub fn producer() -> Self {
-        Self::default()
+        let mut limits = SemanticWork::uniform(usize::MAX);
+        // NestedEntries stays bounded as a whole until #12363 makes the
+        // embedded forest linear. Suffix reparsing uses 15,808/56,192/210,688
+        // bytes for 64/128/256 operands; nesting at depth 64 parses 40,000
+        // bytes and retains 10,207 nodes through overlapping operand trees.
+        limits.nested_entries = SemanticWork::default_limits().nested_entries;
+        Self::new(limits).expect("producer semantic limits are positive")
     }
 }
 
@@ -2186,6 +2404,10 @@ struct SemanticExecutionBudgetState {
     externally_materialized_files: usize,
     traversal_steps: usize,
     exhausted: bool,
+    /// Refused charges and replays, which `SemanticRequest::judged` reads to
+    /// judge the work it ran. It is not part of the snapshot: two ledgers
+    /// that differ only in it admit the same work.
+    refusals: usize,
 }
 
 /// Exact in-process identity of the provider work already charged to one
@@ -2280,6 +2502,7 @@ impl SemanticExecutionBudget {
                 externally_materialized_files: 0,
                 traversal_steps: 0,
                 exhausted: max_materialized_files == 0,
+                refusals: 0,
             })),
         }
     }
@@ -2348,6 +2571,7 @@ impl SemanticExecutionBudget {
                 externally_materialized_files: state.externally_materialized_files,
                 traversal_steps: state.traversal_steps,
                 exhausted: state.exhausted,
+                refusals: 0,
             })),
         };
         (before, child)
@@ -2440,12 +2664,22 @@ impl SemanticExecutionBudget {
         expected_before: &SemanticExecutionBudgetSnapshot,
         charge: &SemanticExecutionBudgetCharge,
     ) -> bool {
+        self.try_replay_charge(expected_before, charge).is_ok()
+    }
+
+    /// [`Self::replay_charge`], returning the refusal with its reuse verdict.
+    pub fn try_replay_charge(
+        &self,
+        expected_before: &SemanticExecutionBudgetSnapshot,
+        charge: &SemanticExecutionBudgetCharge,
+    ) -> Result<(), ReplayRefusal> {
         let mut state = self.state.lock().expect("semantic execution budget lock");
         let Some((_, attempted_traversal)) =
             Self::replay_charge_totals(&state, expected_before, charge)
         else {
+            state.refusals += 1;
             brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
-            return false;
+            return Err(ReplayRefusal(()));
         };
         if !charge.materialized_files.is_empty() {
             Arc::make_mut(&mut state.materialized_files)
@@ -2454,7 +2688,16 @@ impl SemanticExecutionBudget {
         state.externally_materialized_files += charge.externally_materialized_files;
         state.traversal_steps = attempted_traversal;
         state.exhausted |= charge.exhausted;
-        true
+        Ok(())
+    }
+
+    /// Refused charges and replays so far, shared by every clone. A fork
+    /// counts its own from zero.
+    fn refusal_count(&self) -> usize {
+        self.state
+            .lock()
+            .expect("semantic execution budget lock")
+            .refusals
     }
 
     pub fn remaining_materialized_files(&self) -> usize {
@@ -2471,6 +2714,7 @@ impl SemanticExecutionBudget {
     /// never reused as content.
     fn refuse(state: &mut SemanticExecutionBudgetState) -> BudgetRefusal {
         state.exhausted = true;
+        state.refusals += 1;
         brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
         BudgetRefusal(())
     }
@@ -2567,6 +2811,27 @@ impl SemanticExecutionBudget {
 #[must_use = "a refused execution-budget charge stops the work that asked for it"]
 #[derive(Debug)]
 pub(crate) struct BudgetRefusal(());
+
+/// `refuse` reports `Other` to the ambient channel, so the explicit verdict is
+/// `Other` too. Counting it as a budget refusal is a later, deliberate change.
+impl CarriesReuseVerdict for BudgetRefusal {
+    fn reuse_verdict(&self) -> ReuseVerdict {
+        ReuseVerdict::ExecutionDependent(ExecutionCause::Other)
+    }
+}
+
+/// A cached solve's charge that [`SemanticExecutionBudget::try_replay_charge`]
+/// could not reproduce. The caller recomputes, and the answer it was about to
+/// reuse depended on the execution ledger's state.
+#[must_use = "a refused replay means the cached solve cannot stand in for the work"]
+#[derive(Debug)]
+pub struct ReplayRefusal(());
+
+impl CarriesReuseVerdict for ReplayRefusal {
+    fn reuse_verdict(&self) -> ReuseVerdict {
+        ReuseVerdict::ExecutionDependent(ExecutionCause::Other)
+    }
+}
 
 /// A semantic result whose uncertainty, partial value, and work remain explicit.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2904,6 +3169,52 @@ impl<'a> SemanticRequest<'a> {
         self.execution.as_ref()
     }
 
+    /// Run `build` and judge its value by the stops this request observed
+    /// while it ran, each with the cause its ambient mark reports: a refusal
+    /// of the semantic ledger is `BudgetRefusal`; a refusal of the execution
+    /// ledger and a cancellation are `Other` (an execution-ledger refusal
+    /// is not yet `BudgetRefusal`). The verdict comes from the ledgers and
+    /// the token, never from the shape of the value: an `ExceededBudget`
+    /// outcome may have either cause.
+    pub fn judged<T>(&mut self, build: impl FnOnce(&mut Self) -> T) -> Judged<T> {
+        self.judged_with_refusal(build).0
+    }
+
+    /// Judge the work and return its own recorded refusal by value. Lifetime
+    /// counters and first causes cannot identify which concurrent unit refused.
+    pub fn judged_with_refusal<T>(
+        &mut self,
+        build: impl FnOnce(&mut Self) -> T,
+    ) -> (Judged<T>, Option<SemanticBudgetRefusal>) {
+        use brokk_bifrost_core::analyzer::carried_context;
+        let capture = Arc::new(SemanticRefusalCapture {
+            first: Mutex::new(None),
+            parent: carried_context::refusal_observer(),
+        });
+        let _scope = carried_context::push_refusal_observer(Arc::clone(&capture));
+        let execution = self.execution.clone();
+        let execution_refusals = |execution: &Option<SemanticExecutionBudget>| {
+            execution
+                .as_ref()
+                .map_or(0, SemanticExecutionBudget::refusal_count)
+        };
+        let execution_refusals_before = execution_refusals(&execution);
+        let value = build(self);
+        let refusal = capture.first();
+        let mut reuse = ReuseVerdict::Content;
+        if refusal.is_some() {
+            reuse.join_in(ReuseVerdict::ExecutionDependent(
+                ExecutionCause::BudgetRefusal,
+            ));
+        }
+        if execution_refusals(&execution) > execution_refusals_before
+            || self.cancellation.is_cancelled()
+        {
+            reuse.join_in(ReuseVerdict::ExecutionDependent(ExecutionCause::Other));
+        }
+        (Judged { value, reuse }, refusal)
+    }
+
     /// A query-local proof stopped before it could establish complete data.
     /// Capture-scoped memos must not retain values produced under this state.
     pub fn stop_observed(&self) -> bool {
@@ -2955,6 +3266,7 @@ impl<'a> SemanticRequest<'a> {
 /// [`SemanticOutcome`] and must not be used to disguise these failures.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SemanticProviderError {
+    CandidateLocatorRefusal(super::CandidateLocatorRefusal),
     SourceAccess(Box<str>),
     SourceAdmissionRefused {
         file: brokk_bifrost_core::analyzer::model::ProjectFile,
@@ -3000,6 +3312,27 @@ impl SemanticProviderError {
     }
 }
 
+/// The verdict each constructor reports to the ambient channel: every
+/// operational failure is `Other`. A locator refusal and an intrinsic source
+/// rejection are properties of the source, so they are content.
+impl CarriesReuseVerdict for SemanticProviderError {
+    fn reuse_verdict(&self) -> ReuseVerdict {
+        match self {
+            Self::CandidateLocatorRefusal(_) => ReuseVerdict::Content,
+            Self::SourceAdmissionRefused { reason, .. }
+                if reason.is_intrinsic_source_rejection() =>
+            {
+                ReuseVerdict::Content
+            }
+            Self::SourceAdmissionRefused { .. }
+            | Self::SourceAccess(_)
+            | Self::InvalidIdentity(_)
+            | Self::InvalidArtifact(_)
+            | Self::Internal(_) => ReuseVerdict::ExecutionDependent(ExecutionCause::Other),
+        }
+    }
+}
+
 impl From<SemanticIrError> for SemanticProviderError {
     fn from(error: SemanticIrError) -> Self {
         brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
@@ -3009,7 +3342,13 @@ impl From<SemanticIrError> for SemanticProviderError {
 
 impl fmt::Display for SemanticProviderError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if !matches!(self, Self::CandidateLocatorRefusal(_))
+            && !self.is_intrinsic_source_rejection()
+        {
+            brokk_bifrost_core::analyzer::carried_context::debug_assert_evaluation_execution_dependent();
+        }
         match self {
+            Self::CandidateLocatorRefusal(refusal) => write!(formatter, "{refusal}"),
             Self::SourceAdmissionRefused { file, reason } => {
                 write!(formatter, "{file}: {reason}")
             }
@@ -3029,6 +3368,7 @@ impl std::error::Error for SemanticProviderError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::InvalidArtifact(error) => Some(error),
+            Self::CandidateLocatorRefusal(refusal) => Some(refusal),
             Self::SourceAdmissionRefused { .. }
             | Self::SourceAccess(_)
             | Self::InvalidIdentity(_)
@@ -3215,6 +3555,44 @@ pub trait ProgramSemanticsProvider: Send + Sync {
         ))
     }
 
+    fn selected_procedure_handle(
+        &self,
+        _file: &ProjectFile,
+        _base: &ProcedureHandle,
+        _request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<super::service::SelectedProcedureHandle>, SemanticProviderError>
+    {
+        Err(SemanticProviderError::internal(
+            "selected handle unavailable".to_owned(),
+        ))
+    }
+
+    /// Acquire executable semantics and their matching flows as one selection.
+    fn selected_procedure_and_flows(
+        &self,
+        _file: &ProjectFile,
+        _base: &ProcedureHandle,
+        _request: &mut SemanticRequest<'_>,
+    ) -> Result<super::service::CandidateProcedureOutcome<()>, SemanticProviderError> {
+        Err(SemanticProviderError::internal(
+            "selected procedure acquisition is unavailable".to_owned(),
+        ))
+    }
+
+    /// Prepare validated guarded alternatives without selecting executable semantics.
+    fn stored_candidate_macro_artifact(
+        &self,
+        _file: &ProjectFile,
+        _key: &SemanticArtifactKey,
+        _capabilities: &crate::analyzer::semantic::SemanticCapabilities,
+        _request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<Option<StoredCandidateMacroArtifact>>, SemanticProviderError> {
+        Ok(crate::analyzer::semantic::SemanticOutcome::Complete {
+            value: None,
+            work: crate::analyzer::semantic::SemanticWork::default(),
+        })
+    }
+
     /// Decode one procedure from the artifact's complete stored IR rows.
     /// A provider without matching rows returns `None`.
     fn stored_semantic_ir_procedure(
@@ -3237,6 +3615,13 @@ pub trait ProgramSemanticsProvider: Send + Sync {
     ) -> Result<bool, SemanticProviderError> {
         Ok(false)
     }
+}
+
+/// Query-owned guarded artifact and the stored flows paired with each alternate.
+/// This is preparation only: ordinary artifact handles still select the base.
+pub struct StoredCandidateMacroArtifact<F = Vec<(ProcedureId, ProcedurePartialFlows)>> {
+    pub artifact: Arc<SemanticArtifact>,
+    pub flows: F,
 }
 
 /// A [`ProgramSemanticsProvider`] for languages whose lowering is not
@@ -3277,6 +3662,188 @@ impl ProgramSemanticsProvider for UnsupportedProgramSemantics {
 mod tests {
     use crate::analyzer::semantic::provider::*;
     use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#11445: aggregate replay retained transient provider failure")]
+    fn typed_provider_failures_reach_the_evaluation_collector_before_formatting() {
+        use brokk_bifrost_core::analyzer::carried_context::EvaluationExecution;
+        let execution = Arc::new(EvaluationExecution::default());
+        let _scope = execution.install();
+        let error = SemanticProviderError::source_access("selected source unavailable");
+        assert!(!execution.verdict().is_content());
+        assert!(error.to_string().contains("selected source unavailable"));
+    }
+
+    #[test]
+    #[hardwon("#10972: review: a warm candidate arena skipped current-budget admission")]
+    fn candidate_arena_hits_admit_the_complete_census_at_both_edges() {
+        use crate::analyzer::semantic::*;
+        let key = SemanticArtifactKey::new(
+            WorkspaceMountId::hash_bytes(b"arena"),
+            WorkspaceRelativePath::try_from_path(std::path::Path::new("arena.rs")).unwrap(),
+            SemanticLanguage::Standard(brokk_bifrost_core::analyzer::model::Language::Rust),
+            SourceRevision::Disk {
+                content: ContentIdentity::hash_bytes(b"arena"),
+            },
+            AdapterSemanticsVersion::new("arena", StableDigest::sha256(b"arena")).unwrap(),
+            SemanticIrVersion::current(),
+            ConfigurationFingerprint::hash_bytes(b"arena"),
+            DependencyFingerprint::hash_bytes(b"arena"),
+        );
+        let build = || {
+            let mut artifact =
+                SemanticArtifact::try_new(key.clone(), Default::default(), vec![]).unwrap();
+            artifact.include_candidate_census(SemanticWork {
+                evidence: 7,
+                nested_entries: 11,
+                ..Default::default()
+            });
+            artifact.attach_candidate_evidence(Arc::new(()), 1024);
+            Arc::new(artifact)
+        };
+        let base = build();
+        let held = base
+            .try_candidate_arena(|| Ok::<_, ()>(Some(build())))
+            .unwrap()
+            .unwrap();
+        let mut first = SemanticBudget::default();
+        first.charge_complete_artifact(&held).unwrap();
+        let census = held.work();
+        let mut warm_budgets = Vec::new();
+        for cap in [census.owned_text_bytes - 1, census.owned_text_bytes] {
+            let limits = SemanticWork {
+                owned_text_bytes: cap,
+                ..SemanticBudget::default().limits()
+            };
+            let cold = build();
+            let warm = base
+                .try_candidate_arena(|| panic!("live arena must hit"))
+                .unwrap_or_else(|_: ()| unreachable!())
+                .unwrap();
+            let mut cold_budget = SemanticBudget::new(limits).unwrap();
+            let mut warm_budget = SemanticBudget::new(limits).unwrap();
+            let cold_result = cold_budget.charge_complete_artifact(&cold);
+            let warm_result = warm_budget.charge_complete_artifact(&warm);
+            assert_eq!(warm_result, cold_result);
+            assert_eq!(warm_budget.resident(), cold_budget.resident());
+            assert_eq!(
+                warm_budget.resident_artifacts.len(),
+                cold_budget.resident_artifacts.len()
+            );
+            assert_eq!(warm_result.is_ok(), cap == census.owned_text_bytes);
+            drop(cold);
+            assert_eq!(cold_budget.resident(), SemanticWork::default());
+            drop(warm);
+            // The first consumer still holds the warm allocation.
+            warm_budgets.push(warm_budget);
+        }
+        drop(held);
+        first.reconcile_residency();
+        assert_eq!(first.resident(), SemanticWork::default());
+        assert!(first.resident_artifacts.is_empty());
+        for mut budget in warm_budgets {
+            budget.reconcile_residency();
+            assert_eq!(budget.resident(), SemanticWork::default());
+            assert!(budget.resident_artifacts.is_empty());
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    #[hardwon("#9737: census attributed retained candidate bytes to the base artifact")]
+    fn retention_census_counts_retained_candidate_artifact_once_with_its_own_charge() {
+        use brokk_bifrost_core::retention_budget::RetentionBudget;
+        use brokk_bifrost_core::retention_census::{AllocationAccounting, RetentionCensus};
+
+        use crate::analyzer::semantic::*;
+
+        let key = SemanticArtifactKey::new(
+            WorkspaceMountId::hash_bytes(b"retained-candidate-census"),
+            WorkspaceRelativePath::try_from_path(std::path::Path::new("candidate.rs")).unwrap(),
+            SemanticLanguage::Standard(brokk_bifrost_core::analyzer::model::Language::Rust),
+            SourceRevision::Disk {
+                content: ContentIdentity::hash_bytes(b"retained-candidate-census"),
+            },
+            AdapterSemanticsVersion::new(
+                "retained-candidate-census",
+                StableDigest::sha256(b"retained-candidate-census"),
+            )
+            .unwrap(),
+            SemanticIrVersion::current(),
+            ConfigurationFingerprint::hash_bytes(b"retained-candidate-census"),
+            DependencyFingerprint::hash_bytes(b"retained-candidate-census"),
+        );
+        let base = std::sync::Arc::new(
+            SemanticArtifact::try_new(key.clone(), Default::default(), vec![]).unwrap(),
+        );
+        let budget = RetentionBudget::for_test_capacity(1_000_000);
+        let candidate = base
+            .try_candidate_arena(|| {
+                let mut candidate =
+                    SemanticArtifact::try_new(key, Default::default(), vec![]).unwrap();
+                candidate.attach_candidate_evidence(std::sync::Arc::new(()), 1024);
+                candidate.charge_guarded_arena(&budget);
+                Ok::<_, ()>(Some(std::sync::Arc::new(candidate)))
+            })
+            .unwrap()
+            .unwrap();
+        assert!(!base.charge.is_charged());
+        assert!(candidate.charge.is_charged());
+        let retained_candidate = base
+            .retained_candidate_arena_for_test()
+            .expect("charged candidate is retained by its base");
+        assert!(std::sync::Arc::ptr_eq(&candidate, &retained_candidate));
+
+        let mut census = RetentionCensus::new();
+        base.retention_census_for_test(&mut census, "semantic.candidate.base");
+        candidate.retention_census_for_test(&mut census, "semantic.candidate.direct");
+        let report = census.finish();
+
+        let base_bytes =
+            crate::analyzer::semantic::service::retained_artifact_bytes(base.key(), &base)
+                + base.candidate_evidence_retained_bytes() as u64;
+        let candidate_bytes = crate::analyzer::semantic::service::retained_artifact_bytes(
+            candidate.key(),
+            &candidate,
+        ) + candidate.candidate_evidence_retained_bytes() as u64;
+        assert_ne!(base_bytes, candidate_bytes);
+        let artifact_groups = report
+            .allocation_groups
+            .iter()
+            .filter(|group| group.kind == Some("semantic-artifact"))
+            .collect::<Vec<_>>();
+        assert_eq!(artifact_groups.len(), 2);
+
+        let base_group = artifact_groups
+            .iter()
+            .find(|group| group.estimated_bytes == Some(base_bytes))
+            .expect("base has its own estimate");
+        assert_eq!(
+            base_group.accounting,
+            Some(AllocationAccounting::OutsideBudget)
+        );
+        assert_eq!(base_group.families, ["semantic.candidate.base"]);
+
+        let candidate_group = artifact_groups
+            .iter()
+            .find(|group| group.estimated_bytes == Some(candidate_bytes))
+            .expect("candidate has its own estimate");
+        assert_eq!(
+            candidate_group.accounting,
+            Some(AllocationAccounting::AlreadyBudgeted)
+        );
+        assert!(
+            candidate_group
+                .families
+                .contains(&"semantic.candidate.base")
+        );
+        assert!(
+            candidate_group
+                .families
+                .contains(&"semantic.candidate.direct")
+        );
+        assert_eq!(report.union.known_bytes, base_bytes + candidate_bytes);
+    }
 
     #[test]
     fn provider_without_store_refuses_publication_read() {
@@ -3525,7 +4092,11 @@ mod tests {
             fill.record_source_reacquisition(
                 &owner,
                 MemoSourceDependency {
-                    procedure: (key.clone(), ProcedureId::new(0)),
+                    procedure: (
+                        key.clone(),
+                        ProcedureId::new(0),
+                        crate::analyzer::semantic::ProcedureInterpretation::Base,
+                    ),
                     acquisition: MemoSourceAcquisition::Hold,
                 },
             );
@@ -5048,6 +5619,38 @@ pub struct SemanticMemoAdmission {
 }
 
 impl SemanticMemoAdmission {
+    /// Descriptor allocations and actual control owners only. Weak receipts
+    /// do not pin or upgrade the semantic value's nested payload.
+    pub fn retained_allocations(
+        &self,
+        census: &mut impl crate::analyzer::semantic::service::ArtifactRetentionVisitor,
+    ) {
+        census.hash_set(&self.acquired_owners);
+        census.hash_set(&self.acquired_artifacts);
+        census.map(&self.owners);
+        census.map(&self.artifacts);
+        for (owner, _) in self.owners.values() {
+            census.weak_allocation(
+                owner.allocation.as_ptr().cast::<()>() as usize,
+                owner.allocation_bytes,
+            );
+            if let Some(source) = &owner.source {
+                census.artifact_key(&source.procedure.0);
+            }
+        }
+        for (artifact, _) in self.artifacts.values() {
+            census.weak_allocation(
+                artifact.allocation.as_ptr() as usize,
+                std::mem::size_of::<SemanticArtifact>() + 2 * std::mem::size_of::<usize>(),
+            );
+            census.artifact_key(&artifact.key);
+            census.shared_allocation(Arc::as_ptr(&artifact.cache_pins) as usize, || {
+                std::mem::size_of_val(artifact.cache_pins.as_ref())
+                    + 2 * std::mem::size_of::<usize>()
+            });
+        }
+    }
+
     /// Payload capacity census for the descriptor's owned hash tables.
     pub fn retained_bytes(&self) -> usize {
         let identities = self
@@ -5175,6 +5778,9 @@ type ResidentOwners = HashMap<usize, (ResidentOwnerReceipt, SemanticWork)>;
 #[derive(Debug, Clone)]
 struct ResidentOwnerReceipt {
     allocation: Weak<ResidentOwner>,
+    // A Weak keeps the allocation's inline storage after the value drops.
+    // Capture its concrete size before erasure; never inspect a dead value.
+    allocation_bytes: usize,
     source: Option<MemoSourceDependency>,
 }
 
@@ -5190,10 +5796,7 @@ impl ResidentOwnerReceipt {
 /// Exact source address; the artifact key includes the blob and adapter identity.
 #[derive(Debug, Clone)]
 pub struct MemoSourceDependency {
-    pub procedure: (
-        crate::analyzer::semantic::SemanticArtifactKey,
-        crate::analyzer::semantic::ProcedureId,
-    ),
+    pub procedure: crate::analyzer::semantic::DurableProcedureKey,
     pub acquisition: MemoSourceAcquisition,
 }
 
@@ -5301,9 +5904,13 @@ pub trait MemoDependencyReacquirer {
 }
 
 fn weak_resident_owner<T: Send + Sync + 'static>(owner: &Arc<T>) -> ResidentOwnerReceipt {
+    // Match the shared census's Arc inline-plus-two-counter convention.
+    // This excludes nested allocations owned only by a live strong value.
+    let allocation_bytes = std::mem::size_of::<T>() + 2 * std::mem::size_of::<usize>();
     let erased: Arc<ResidentOwner> = Arc::clone(owner) as Arc<ResidentOwner>;
     ResidentOwnerReceipt {
         allocation: Arc::downgrade(&erased),
+        allocation_bytes,
         source: None,
     }
 }
@@ -5423,3 +6030,102 @@ use std::collections::HashMap;
 use std::sync::Weak;
 
 use crate::analyzer::semantic::leases::SemanticArtifactLeaseChild;
+
+#[cfg(test)]
+mod demand_admission_peak_tests {
+    use super::*;
+
+    #[test]
+    fn demand_admission_peak_observes_discarded_clones_without_changing_default_replay() {
+        let initial = SemanticWork {
+            program_points: 3,
+            ..SemanticWork::default()
+        };
+        let extra = SemanticWork {
+            program_points: 7,
+            ..SemanticWork::default()
+        };
+        let mut baseline = SemanticBudget::default();
+        baseline.admit(initial).unwrap();
+        let before = baseline.replay_snapshot();
+        let mut ordinary = baseline.clone();
+        ordinary.admit(extra).unwrap();
+        let expected = ordinary.replay_since(&before);
+        let (observed, peak) = baseline.with_admission_peak(|tracked| {
+            let mut clone = tracked.clone();
+            clone.admit(extra).unwrap();
+            clone
+        });
+        assert_eq!(observed.replay_since(&before), expected);
+        assert_eq!(
+            baseline.replay_since(&before),
+            SemanticBudgetReplay::default()
+        );
+        assert_eq!(peak.required, extra);
+        assert_eq!(peak.checks, 1);
+        assert!(peak.replayable);
+        assert_eq!(baseline.resident(), initial);
+        assert_eq!(baseline.refusal_count(), 0);
+    }
+
+    #[test]
+    fn demand_admission_peak_includes_nested_stage_room_and_ignores_performed_work() {
+        let mut baseline = SemanticBudget::default();
+        baseline
+            .admit(SemanticWork {
+                values: 5,
+                ..SemanticWork::default()
+            })
+            .unwrap();
+        let (_, peak) = baseline.with_admission_peak(|tracked| {
+            let mut first = tracked.clone();
+            first
+                .admit(SemanticWork {
+                    values: 4,
+                    ..SemanticWork::default()
+                })
+                .unwrap();
+            let mut nested = first.clone();
+            nested
+                .admit(SemanticWork {
+                    values: 8,
+                    ..SemanticWork::default()
+                })
+                .unwrap();
+            nested.charge_work(SemanticWork {
+                values: 1000,
+                ..SemanticWork::default()
+            });
+        });
+        assert_eq!(peak.required.values, 12);
+        assert_eq!(peak.checks, 2);
+        assert_eq!(baseline.resident().values, 5);
+        assert_eq!(baseline.performed().values, 5);
+    }
+    #[test]
+    fn demand_admission_peak_refuses_credit_from_expired_inherited_holders() {
+        let rows = SemanticWork {
+            values: 5,
+            ..Default::default()
+        };
+        let owner = Arc::new(());
+        let mut baseline = SemanticBudget::default();
+        baseline.admit(rows).unwrap();
+        baseline.track_replay_holder(&owner, rows);
+        let (_, peak) = baseline.with_admission_peak(|tracked| {
+            drop(owner);
+            let mut staged = tracked.clone();
+            staged
+                .admit(SemanticWork {
+                    values: 3,
+                    ..Default::default()
+                })
+                .unwrap();
+        });
+        assert!(
+            !peak.replayable,
+            "a warm body must fall back to cold admission"
+        );
+        assert_eq!(baseline.refusal_count(), 0);
+    }
+}

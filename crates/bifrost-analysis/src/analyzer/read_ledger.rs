@@ -46,13 +46,76 @@
 //! [`ReadSetDigest`]. That equality is the property the whole plan rests on: it
 //! is what lets a unit published from the exported base match a unit the head
 //! would have computed.
-pub use brokk_bifrost_store::analyzer::read_ledger::{ReadSetDigest, read_set_digest};
+pub use brokk_bifrost_store::analyzer::read_ledger::{
+    ReadSetDigest, SelectionRead, read_set_digest,
+};
 
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_core::analyzer::reuse_verdict::{ExecutionCause, ReuseVerdict};
 use std::borrow::Cow;
 use std::hash::BuildHasher;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+
+/// Selection evidence survives nested captures and is independent of unit
+/// publication, including evaluations that produce no units.
+#[derive(Default)]
+pub struct EvaluationSelectionReads {
+    keys: Mutex<HashSet<ReadKey>>,
+}
+
+impl EvaluationSelectionReads {
+    pub fn keys(&self) -> Vec<ReadKey> {
+        let mut keys: Vec<_> = self
+            .keys
+            .lock()
+            .expect("selection reads poisoned")
+            .iter()
+            .cloned()
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+}
+
+/// Hand the reads a nested evaluation collected to the evaluation around it.
+pub fn forward_evaluation_selection_reads(keys: &[ReadKey]) {
+    for key in keys {
+        record_evaluation_selection_read(key);
+    }
+}
+
+/// Whether collected selection reads may be recorded with an admitted row:
+/// every one is a named key a persisted read set may hold. An unnamed or
+/// unboundable selection read never reaches this set; it joins the evaluation
+/// verdict instead.
+pub fn recordable_selection_evidence(
+    keys: &[ReadKey],
+) -> brokk_bifrost_core::analyzer::reuse_verdict::SelectionEvidence {
+    use brokk_bifrost_core::analyzer::reuse_verdict::SelectionEvidence;
+    if keys
+        .iter()
+        .all(|key| key.is_selection_authority() && key.is_persistable())
+    {
+        SelectionEvidence::Complete
+    } else {
+        SelectionEvidence::Incomplete
+    }
+}
+
+pub(crate) fn record_evaluation_selection_read(key: &ReadKey) {
+    if key.is_selection_authority()
+        && let Some(evaluation) =
+            brokk_bifrost_core::analyzer::carried_context::current_evaluation()
+    {
+        evaluation
+            .selection_reads::<EvaluationSelectionReads>()
+            .keys
+            .lock()
+            .expect("selection reads poisoned")
+            .insert(key.clone());
+    }
+}
 
 use crate::analyzer::canonical_hash::CanonicalHasher;
 use crate::analyzer::semantic::ids::StableDigest;
@@ -293,242 +356,9 @@ pub fn file_set_digest<'a>(files: impl IntoIterator<Item = &'a ProjectFile>) -> 
     StableDigest::from_array(hasher.finish())
 }
 
-/// Operational causes carried by producer-owned derivation reason values.
-/// These labels describe outcomes, never source syntax or rendered messages.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DerivationExecutionCause {
-    Cancelled,
-    Budget,
-    Snapshot,
-    Provider,
-}
-
-impl DerivationExecutionCause {
-    /// Unknown labels are operational until their producer's cause is audited.
-    pub fn from_reason(reason: &str) -> Option<Self> {
-        reason::classify_known(reason).unwrap_or(Some(Self::Provider))
-    }
-
-    pub fn from_cfg_error<Node: std::fmt::Debug>(
-        error: &crate::analyzer::semantic::cfg_algorithms::CfgAlgorithmError<Node>,
-    ) -> Self {
-        use crate::analyzer::semantic::cfg_algorithms::CfgAlgorithmError;
-        match error {
-            CfgAlgorithmError::Cancelled { .. } => Self::Cancelled,
-            CfgAlgorithmError::ExceededBudget(_) => Self::Budget,
-            CfgAlgorithmError::InvalidNode(node) => {
-                panic!("validated procedure has invalid CFG point {node:?}")
-            }
-        }
-    }
-}
-
-/// Producer-owned labels. One table also generates the regression inventory.
-pub mod reason {
-    use super::DerivationExecutionCause;
-    macro_rules! reasons {
-        ($($name:ident = $label:expr => $cause:expr),* $(,)?) => {
-            $(pub const $name: &str = $label;)*
-            pub fn classify_known(label: &str) -> Option<Option<DerivationExecutionCause>> {
-                match label {
-                    $($name => Some($cause),)*
-                    _ => None,
-                }
-            }
-            #[cfg(test)]
-            const ALL: &[(&str, Option<DerivationExecutionCause>)] = &[$(($name, $cause)),*];
-        };
-    }
-    reasons! {
-        JAVA_CALLER_PUBLIC_IDENTITY_MISSING = "java_caller_public_identity_missing" => Some(DerivationExecutionCause::Provider),
-        JAVA_REFERENCE_EXECUTION_CONTEXT_UNKNOWN = "java_reference_execution_context_unknown" => None,
-        JAVA_REFERENCE_EXECUTION_CONTEXT_CAPABILITY_ABSENT = "java_reference_execution_context_capability_absent" => Some(DerivationExecutionCause::Provider),
-        JAVA_REFERENCE_EXECUTION_CONTEXT_ROW_ABSENT = "java_reference_execution_context_row_absent" => Some(DerivationExecutionCause::Snapshot),
-        JAVA_REFERENCE_EXECUTION_CONTEXT_CORRUPT = "java_reference_execution_context_corrupt" => Some(DerivationExecutionCause::Provider),
-        RUST_COPY_CENSUS_MISSING = "rust_copy.census_missing" => None,
-        RUST_COPY_CENSUS_CORRUPT = "rust_copy.census_corrupt" => None,
-        RUST_COPY_BOUNDARY_MACRO = "rust_copy.boundary_macro" => None,
-        RUST_COPY_BOUNDARY_DERIVE = "rust_copy.boundary_derive" => None,
-        RUST_COPY_BOUNDARY_EXPANDING_ATTRIBUTE = "rust_copy.boundary_expanding_attribute" => None,
-        RUST_COPY_BOUNDARY_INTERNAL_ATTRIBUTE = "rust_copy.boundary_internal_attribute" => None,
-        RUST_COPY_BOUNDARY_SYNTAX_ERROR = "rust_copy.boundary_syntax_error" => None,
-        RUST_COPY_MODULE_UNIVERSE_OPEN = "rust_copy.module_universe_open" => None,
-        RUST_COPY_UNRESOLVED_SUBJECT = "rust_copy.unresolved_subject" => None,
-        RUST_COPY_ALIAS_SUBJECT = "rust_copy.alias_subject" => None,
-        RUST_COPY_UNPAIRED_IMPL = "rust_copy.unpaired_impl" => None,
-        RUST_COPY_MATCHING_TRAIT_IMPL = "rust_copy.matching_trait_impl" => None,
-        RUST_COPY_PUBLICATION_INCOMPLETE = "rust_copy.publication_incomplete" => None,
-        RUST_COPY_TARGET_UNAVAILABLE = "rust_copy.target_unavailable" => Some(DerivationExecutionCause::Provider),
-        JVM_INDEX_CAPPED_ENTRIES = "jvm.index.capped_entries" => None,
-        ARTIFACT_MEMBERS_LIMIT = "limit.artifact_members" => None,
-        KOTLIN_CLASSIFICATION_CAPPED = "kotlin.classification_capped" => None,
-        KOTLIN_CLASSIFICATION_MALFORMED = "kotlin.classification_malformed" => None,
-        PREPROCESSING_PRESENT = "preprocessing_present" => None,
-        MACRO_POSSIBLE = "macro_possible" => None,
-        CPP_ANALYZER_UNAVAILABLE = "cpp_analyzer_unavailable" => Some(DerivationExecutionCause::Provider),
-        NOT_CPP = "not_cpp" => None,
-        ANCHOR_SYNTAX_MISSING = "anchor_syntax_missing" => None,
-        RETURN_SEMANTICS_MISSING = "return_semantics_missing" => None,
-        ASSIGNMENT_SEMANTICS_MISSING = "assignment_semantics_missing" => None,
-        RESOLVED_CALL_IDENTITY_UNAVAILABLE = "resolved_call_identity_unavailable" => None,
-        CALL_FUNCTION_MISSING = "call_function_missing" => None,
-        RESOLVED_CALL_NAME_MISSING = "resolved_call_name_missing" => None,
-        RESOLVED_CALL_IDENTITY_MISMATCH = "resolved_call_identity_mismatch" => None,
-        CALL_SEMANTICS_MISSING = "call_semantics_missing" => None,
-        RESOLVED_CALL_HEADER_OWNER_MISSING = "resolved_call_header_owner_missing" => None,
-        CALL_ARGUMENTS_MISSING = "call_arguments_missing" => None,
-        CALL_ARGUMENT_MISSING = "call_argument_missing" => None,
-        CALL_ARGUMENT_UNREADABLE = "call_argument_unreadable" => None,
-        CALL_ARGUMENT_ALIAS_UNKNOWN = "call_argument_alias_unknown" => None,
-        // An external boundary depends on the selected external inventory, which
-        // is neither a unit-key dimension nor a ledgered read yet. Promote these
-        // reasons to content only when #7633 (and its per-language siblings) ledger it.
-        // Selected C# configuration is neither a demonstrated unit-key dimension
-        // nor a ledgered read, so compilation disagreement is operational.
-        CSHARP_COMPILATION_ACCESS_UNKNOWN = "csharp-compilation-access-unknown" => Some(DerivationExecutionCause::Provider),
-        // The unmodeled tier includes compilation-wide usings, whose selected
-        // extent is not yet ledgered. Preserve provider uncertainty.
-        CSHARP_COMPILATION_USINGS_INCOMPLETE = "csharp_compilation_usings_incomplete" => Some(DerivationExecutionCause::Provider),
-        CSHARP_CONDITIONAL_BRANCH_UNSEEN = "csharp_conditional_branch_unseen" => None,
-        CSHARP_MEMBER_ACCESS_UNMODELED = "csharp_member_access_unmodeled" => Some(DerivationExecutionCause::Provider),
-        CSHARP_SOURCE_ANCHOR_UNMODELED = "csharp_source_anchor_unmodeled" => Some(DerivationExecutionCause::Provider),
-        CSHARP_SOURCE_IMPORT_UNMODELED = "csharp_source_import_unmodeled" => Some(DerivationExecutionCause::Provider),
-        PYTHON_BINDING_ROWS_MISSING = "python_binding_rows_missing" => Some(DerivationExecutionCause::Provider),
-        PYTHON_BINDING_FORMAT_STALE = "python_binding_format_stale" => Some(DerivationExecutionCause::Provider),
-        CSHARP_ALIAS_CYCLE = "csharp_alias_cycle" => Some(DerivationExecutionCause::Provider),
-        CSHARP_EXTERNAL_UNINDEXED = "csharp_external_unindexed" => Some(DerivationExecutionCause::Provider),
-        CSHARP_INHERITED_TYPES_UNMODELED = "csharp_inherited_types_unmodeled" => Some(DerivationExecutionCause::Provider),
-        CSHARP_METHOD_APPLICABILITY_UNMODELED = "csharp_method_applicability_unmodeled" => Some(DerivationExecutionCause::Provider),
-        OPEN_BOUNDARY = "OpenBoundary" => Some(DerivationExecutionCause::Provider),
-        JVM_UNIT_PACKAGE_UNKNOWN = "jvm-unit-package-unknown" => Some(DerivationExecutionCause::Provider),
-        JVM_PACKAGE_PROVIDER_PARTIAL = "jvm-package-provider-partial" => Some(DerivationExecutionCause::Provider),
-        JVM_PACKAGE_PROVIDER_UNACQUIRED = "jvm-package-provider-unacquired" => Some(DerivationExecutionCause::Provider),
-        JVM_EXPRESSION_PREFIX_UNPROVEN = "jvm-expression-prefix-unproven" => None,
-        EXTERNAL_DECLARED_UNINDEXED = "external_declared_unindexed" => Some(DerivationExecutionCause::Provider),
-        // A Go import is incomplete when its package rows are missing or
-        // unconfirmed, which also depends on the selected external inventory.
-        GO_IMPORT_INCOMPLETE = "go-import-incomplete" => Some(DerivationExecutionCause::Provider),
-        GO_EXTERNAL_MEMBER_UNPROVIDED = "go-external-member-unprovided" => Some(DerivationExecutionCause::Provider),
-        OWNER_INVENTORY_OPEN = "OwnerInventoryOpen" => Some(DerivationExecutionCause::Provider),
-        // A missing nominal member can depend on a selected provider surface.
-        // Retain the operational barrier until its absence has a ledgered input.
-        // #7979: workspace class decorators retain candidates without member-preservation proof.
-        PYTHON_MODEL_ALLOCATOR_RESULT_UNKNOWN = "python_model_allocator_result_unknown" => Some(DerivationExecutionCause::Provider),
-        PYTHON_MODEL_MEMBER_INVENTORY_OPEN = "python_model_member_inventory_open" => Some(DerivationExecutionCause::Provider),
-        PYTHON_MODEL_DESCRIPTOR_ROLE_UNKNOWN = "python_model_descriptor_role_unknown" => Some(DerivationExecutionCause::Provider),
-        PYTHON_SOURCE_IMPLICIT_PROTOCOL_OPEN = "python_source_implicit_protocol_open" => Some(DerivationExecutionCause::Provider),
-        PYTHON_CLASS_DECORATOR_UNPROVEN = "python_class_decorator_unproven" => Some(DerivationExecutionCause::Provider),
-        PYTHON_RECEIVER_SUBCLASS_MEMBER_MISSING = "python_receiver_subclass_member_missing" => Some(DerivationExecutionCause::Provider),
-        UNACQUIRED_OBJECT_MEMBER = "UnacquiredObjectMember" => Some(DerivationExecutionCause::Provider),
-        HIERARCHY_INCOMPLETE = "hierarchy_incomplete" => None,
-        HIERARCHY_AMBIGUOUS = "hierarchy_ambiguous" => None,
-        COVERAGE_INCOMPLETE = "coverage_incomplete" => None,
-        PROVIDER_UNAVAILABLE = "provider_unavailable" => Some(DerivationExecutionCause::Provider),
-        FORWARD_SATISFACTION_INCOMPLETE = "forward_satisfaction_incomplete" => None,
-        GO_ALIAS_TERMINAL_INCOMPLETE = "alias target has no complete selected terminal" => None,
-        // These explicit registrations preserve the prior unknown-label fallback.
-        JVM_IMPORT_SELECTOR_OPEN = "jvm-import-selector-open" => Some(DerivationExecutionCause::Provider),
-        JVM_IMPORT_OWNER_OPEN = "jvm-import-owner-open" => Some(DerivationExecutionCause::Provider),
-        SCALA_PACKAGE_CLAUSE_BOUNDARY_OPEN = "scala-package-clause-boundary-open" => Some(DerivationExecutionCause::Provider),
-        JVM_SOURCE_DOMAIN_OPEN = "jvm-source-domain-open" => Some(DerivationExecutionCause::Provider),
-        JVM_PACKAGE_ALIAS_ROUTE_OPEN = "jvm-package-alias-route-open" => Some(DerivationExecutionCause::Provider),
-        JVM_PACK_PACKAGE_MEMBER = "jvm-pack-package-member" => Some(DerivationExecutionCause::Provider),
-        JVM_PACK_PACKAGE_MEMBER_OPEN = "JvmPackPackageMemberOpen" => Some(DerivationExecutionCause::Provider),
-        AMBIGUOUS_MEMBER = "ambiguous_member" => None,
-        AMBIGUOUS_PROCEDURE = "ambiguous_procedure" => None,
-        AMBIGUOUS_STATEMENT_SPAN = "ambiguous_statement_span" => None,
-        ASSESSMENT_INCOMPLETE = "assessment_incomplete" => Some(DerivationExecutionCause::Provider),
-        BODY_FIELD_MISSING = "body_field_missing" => None,
-        CANCELLED = brokk_bifrost_semantic::analyzer::semantic::statement_entries::reason::CANCELLED => Some(DerivationExecutionCause::Cancelled),
-        CAUGHT_TYPE_UNRESOLVED = "caught_type_unresolved" => None,
-        CLEANUP_KIND_UNRECOGNIZED = "cleanup_kind_unrecognized" => None,
-        CLEANUP_OUTCOME_UNPROVEN = "cleanup_outcome_unproven" => None,
-        CLEANUP_SEMANTICS_UNPUBLISHED = "cleanup_semantics_unpublished" => None,
-        CLEANUP_SOURCE_MAPPING_MISSING = "cleanup_source_mapping_missing" => None,
-        COMPARISON_BUDGET = "comparison_budget" => Some(DerivationExecutionCause::Budget),
-        CONDITION_FIELD_MISSING = "condition_field_missing" => None,
-        CONTROL_BUDGET_EXHAUSTED = brokk_bifrost_semantic::analyzer::semantic::statement_entries::reason::CONTROL_BUDGET_EXHAUSTED => Some(DerivationExecutionCause::Budget),
-        CONTROL_EVIDENCE_INCOMPLETE = brokk_bifrost_semantic::analyzer::semantic::statement_entries::reason::CONTROL_EVIDENCE_INCOMPLETE => None,
-        CONTROL_FRONTIER_INCOMPLETE = brokk_bifrost_semantic::analyzer::semantic::statement_entries::reason::CONTROL_FRONTIER_INCOMPLETE => None,
-        DEFERRED_BODY = "deferred_body" => None,
-        EFFECTFUL_BODY = "effectful_body" => None,
-        EFFECTFUL_CONDITION = "effectful_condition" => None,
-        HANDLER_IDENTITY_UNPROVEN = "handler_identity_unproven" => None,
-        LEXICAL_BINDING_UNAVAILABLE = "lexical_binding_unavailable" => None,
-        LEXICAL_ENVIRONMENT_INCOMPLETE = "lexical_environment_incomplete" => None,
-        MEMBER_RESOLUTION_UNAVAILABLE = "member_resolution_unavailable" => None,
-        MISSING_BODY = "missing_body" => None,
-        MISSING_BRANCH_FIELD = "missing_branch_field" => None,
-        MISSING_STATEMENT_ENTRY = "missing_statement_entry" => None,
-        MISSING_TRY_BODY = "missing_try_body" => None,
-        NO_ENCLOSING_PROCEDURE = "no_enclosing_procedure" => None,
-        NON_LOCAL_REFERENCE = "non_local_reference" => None,
-        PARTIAL_PROCEDURE = "partial_procedure" => None,
-        PARTIAL_PRODUCER = "partial_producer" => None,
-        PENDING_CLEANUP_STATE_BUDGET_EXHAUSTED = "pending_cleanup_state_budget_exhausted" => Some(DerivationExecutionCause::Budget),
-        PREPARED_SYNTAX_UNAVAILABLE = "prepared_syntax_unavailable" => Some(DerivationExecutionCause::Provider),
-        PROCEDURE_MAPPING_INEXACT = "procedure_mapping_inexact" => None,
-        PROCEDURE_MAPPING_MISSING = "procedure_mapping_missing" => None,
-        PROCEDURE_SEMANTIC_QUALITY_INCOMPLETE = "procedure_semantic_quality_incomplete" => None,
-        PROCEDURE_SYNTAX_AMBIGUOUS = "procedure_syntax_ambiguous" => None,
-        PROCEDURE_SYNTAX_INEXACT = "procedure_syntax_inexact" => None,
-        PROCEDURE_SYNTAX_MISSING = "procedure_syntax_missing" => None,
-        PROCEDURE_SYNTAX_RECOVERY = "procedure_syntax_recovery" => None,
-        METHOD_OVERRIDE_LIMIT = "method_override_limit" => Some(DerivationExecutionCause::Budget),
-        METHOD_OVERRIDE_INCOMPLETE = "method_override_incomplete" => Some(DerivationExecutionCause::Provider),
-        QUERY_INCOMPLETE = "query_incomplete" => Some(DerivationExecutionCause::Provider),
-        SNAPSHOT_MISMATCH = "snapshot_mismatch" => Some(DerivationExecutionCause::Snapshot),
-        SOURCE_BUDGET_EXHAUSTED = "source_budget_exhausted" => Some(DerivationExecutionCause::Budget),
-        SOURCE_IDENTITY_MISMATCH = "source_identity_mismatch" => Some(DerivationExecutionCause::Snapshot),
-        SOURCE_LIMIT = "source_limit" => Some(DerivationExecutionCause::Budget),
-        STALE_SOURCE = "stale_source" => Some(DerivationExecutionCause::Snapshot),
-        SYNTAX_RECOVERY = "syntax_recovery" => None,
-        SYNTAX_UNAVAILABLE = "syntax_unavailable" => Some(DerivationExecutionCause::Provider),
-        TARGET_RECEIVER_READ_UNAVAILABLE = "target_receiver_read_unavailable" => Some(DerivationExecutionCause::Provider),
-        UNKNOWN = "unknown" => Some(DerivationExecutionCause::Provider),
-        TYPESTATE_UNPROVEN_HANDOFF = "typestate-unproven-handoff" => None,
-        TYPESTATE_UNPROVEN_GUARD = "typestate-unproven-guard" => None,
-        UNPROVEN_ACTIVATION = "unproven_activation" => None,
-        UNSUPPORTED_CALLABLE_KIND = "unsupported_callable_kind" => None,
-        UNSUPPORTED_CASE_FACT = "unsupported_case_fact" => None,
-        UNSUPPORTED_CONDITION = "unsupported_condition" => None,
-        UNSUPPORTED_LANGUAGE = "unsupported_language" => None,
-        UNSUPPORTED_RELATION = "unsupported_relation" => None,
-        WORK_LIMIT = "work_limit" => Some(DerivationExecutionCause::Budget),
-    }
-
-    #[test]
-    #[brokk_bifrost_test_macros::hardwon(
-        "#7278: unrecognized operational reason labels defaulted to content"
-    )]
-    fn every_registered_reason_constant_is_classified_and_unknowns_fail_closed() {
-        // This inventories declared constants, not arbitrary future literals
-        // outside the table. Producer regressions must also exercise their
-        // emitted reasons, since their public result fields remain strings.
-        for &(label, expected) in ALL {
-            assert_eq!(classify_known(label), Some(expected), "{label}");
-            assert_eq!(
-                DerivationExecutionCause::from_reason(label),
-                expected,
-                "{label}"
-            );
-        }
-        for label in [JVM_IMPORT_SELECTOR_OPEN, JVM_IMPORT_OWNER_OPEN] {
-            assert_eq!(
-                classify_known(label),
-                Some(Some(DerivationExecutionCause::Provider))
-            );
-            assert_eq!(
-                DerivationExecutionCause::from_reason(label),
-                DerivationExecutionCause::from_reason("future_execution_stop")
-            );
-        }
-        assert_eq!(
-            DerivationExecutionCause::from_reason("future_execution_stop"),
-            Some(DerivationExecutionCause::Provider)
-        );
-    }
-}
+pub use brokk_bifrost_semantic::analyzer::semantic::derivation_cause::{
+    DerivationExecutionCause, reason,
+};
 
 // Hash once per routed read, including when several ledgers consume it.
 // Equality still compares the entire key; the hash is never an identity.
@@ -601,20 +431,28 @@ struct ReadSnapshot {
 
 impl ReadSnapshot {
     fn unique_keys(&self) -> hashbrown::HashTable<(u64, &ReadKey)> {
+        self.unique_keys_with_work().0
+    }
+
+    fn unique_keys_with_work(&self) -> (hashbrown::HashTable<(u64, &ReadKey)>, usize) {
+        let mut work = 0usize;
         let mut unique = hashbrown::HashTable::new();
         let mut stack = vec![self];
         let mut visited = HashSet::default();
         let mut receipts = HashSet::default();
         while let Some(snapshot) = stack.pop() {
+            work = work.saturating_add(1);
             if !visited.insert(std::ptr::from_ref(snapshot)) {
                 continue;
             }
             for (hash, key) in &snapshot.local.table {
+                work = work.saturating_add(1);
                 unique
                     .entry(*hash, |(_, previous)| *previous == key, |(hash, _)| *hash)
                     .or_insert((*hash, key));
             }
             for input in &snapshot.inputs {
+                work = work.saturating_add(1);
                 match input {
                     ReadInput::Capture(child) => stack.push(child),
                     ReadInput::Receipt(keys) => {
@@ -622,6 +460,7 @@ impl ReadSnapshot {
                             continue;
                         }
                         for key in keys.iter() {
+                            work = work.saturating_add(1);
                             let hash = read_key_hash(key);
                             unique
                                 .entry(hash, |(_, previous)| *previous == key, |(hash, _)| *hash)
@@ -631,14 +470,17 @@ impl ReadSnapshot {
                 }
             }
         }
-        unique
+        (unique, work)
     }
 
     fn unordered_keys(&self) -> Vec<ReadKey> {
-        self.unique_keys()
-            .iter()
-            .map(|(_, key)| (*key).clone())
-            .collect()
+        self.unordered_keys_with_work().0
+    }
+
+    fn unordered_keys_with_work(&self) -> (Vec<ReadKey>, usize) {
+        let (unique, visits) = self.unique_keys_with_work();
+        let work = visits.saturating_add(unique.len());
+        (unique.iter().map(|(_, key)| (*key).clone()).collect(), work)
     }
 
     fn contains(&self, key: &ReadKey) -> bool {
@@ -700,7 +542,15 @@ pub struct ReadLedger {
     // The part of `execution_dependences` caused by a refused budget charge.
     budget_dependences: AtomicUsize,
     reuse_refused: std::sync::atomic::AtomicBool,
+    // A store read failed while this capture was open. Unlike the execution
+    // dependences above, no replay may stand in for the failed read: a product
+    // built under this capture is never shared (#11534).
+    store_failed: std::sync::atomic::AtomicBool,
     persistence_refusals: AtomicUsize,
+    // The explicitly returned `ReuseVerdict`, encoded by `verdict_rank` so a
+    // join is one `fetch_max`. Shadows the two counts above until every
+    // producer returns a verdict; decisions still read the counts.
+    explicit_verdict: AtomicU8,
     first_refusal: OnceLock<brokk_bifrost_core::profiling::ReadRefusal>,
     // Nested resolver funnels subsume unattributed inputs, but still forward
     // execution dependence. Retain its origin independently for that channel.
@@ -708,6 +558,16 @@ pub struct ReadLedger {
     // Profiling only: the token stop count when this capture opened, for the
     // execution census. Zero when profiling is off.
     opened_at_stops: u64,
+}
+
+// The join order as a byte, so `ReadLedger::join_verdict` is one `fetch_max`.
+const fn verdict_rank(verdict: ReuseVerdict) -> u8 {
+    match verdict {
+        ReuseVerdict::Content => 0,
+        ReuseVerdict::ExecutionDependent(ExecutionCause::ConfiguredCap) => 1,
+        ReuseVerdict::ExecutionDependent(ExecutionCause::BudgetRefusal) => 2,
+        ReuseVerdict::ExecutionDependent(ExecutionCause::Other) => 3,
+    }
 }
 
 impl Default for ReadLedger {
@@ -723,7 +583,9 @@ impl Default for ReadLedger {
             execution_dependences: AtomicUsize::default(),
             budget_dependences: AtomicUsize::default(),
             reuse_refused: std::sync::atomic::AtomicBool::default(),
+            store_failed: std::sync::atomic::AtomicBool::default(),
             persistence_refusals: AtomicUsize::default(),
+            explicit_verdict: AtomicU8::new(verdict_rank(ReuseVerdict::Content)),
             first_refusal: OnceLock::new(),
             first_execution_refusal: OnceLock::new(),
             opened_at_stops: brokk_bifrost_core::analyzer::execution_census::stop_observations(),
@@ -738,12 +600,91 @@ impl Drop for ReadLedger {
                 self.opened_at_stops,
                 self.is_bounded(),
                 self.execution_dependences() > 0,
+                self.explicit_verdict() < self.ambient_verdict(),
             );
         }
     }
 }
 
 impl ReadLedger {
+    /// Census existing read backing without publishing snapshots or cloning keys.
+    /// The caller accounts for this ledger's inline value and Arc header.
+    #[doc(hidden)]
+    pub fn retained_heap(&self, heap: &mut crate::analyzer::store::cache_budget::RetainedHeap) {
+        use crate::analyzer::store::cache_budget::retained_read_key;
+
+        enum Owner<'a> {
+            Local(&'a Arc<LocalReadKeys>),
+            Snapshot(&'a Arc<ReadSnapshot>),
+            Receipt(&'a Arc<[ReadKey]>),
+        }
+        fn input_owner(input: &ReadInput) -> Owner<'_> {
+            match input {
+                ReadInput::Receipt(keys) => Owner::Receipt(keys),
+                ReadInput::Capture(snapshot) => Owner::Snapshot(snapshot),
+            }
+        }
+
+        let keys = self.keys.lock().expect("read ledger mutex poisoned");
+        heap.map(&keys.inputs);
+        let mut pending = vec![Owner::Local(&keys.local)];
+        pending.extend(keys.inputs.values().map(input_owner));
+        if let Some(snapshot) = &keys.snapshot {
+            pending.push(Owner::Snapshot(snapshot));
+        }
+        while let Some(owner) = pending.pop() {
+            match owner {
+                Owner::Local(local) => heap.arc(local, |local, heap| {
+                    let table = &local.table;
+                    heap.add_entries(table.len());
+                    // Match RetainedHeap's hash-map bucket/control accounting.
+                    if table.capacity() != 0 {
+                        let buckets = table
+                            .capacity()
+                            .saturating_mul(8)
+                            .div_ceil(7)
+                            .next_power_of_two();
+                        // One table allocation: control bytes and buckets together.
+                        heap.add_allocation(
+                            buckets
+                                .saturating_mul(std::mem::size_of::<(u64, ReadKey)>() + 1)
+                                .saturating_add(16),
+                        );
+                    }
+                    for (_, key) in table {
+                        retained_read_key(heap, key);
+                    }
+                }),
+                Owner::Receipt(keys) => heap.arc(keys, |keys, heap| {
+                    // arc already includes the entire slice's inline storage.
+                    heap.add_entries(keys.len());
+                    for key in keys {
+                        retained_read_key(heap, key);
+                    }
+                }),
+                Owner::Snapshot(snapshot) => {
+                    let mut first = false;
+                    heap.arc(snapshot, |snapshot, heap| {
+                        first = true;
+                        heap.vec(&snapshot.inputs);
+                    });
+                    if first {
+                        pending.push(Owner::Local(&snapshot.local));
+                        pending.extend(snapshot.inputs.iter().map(input_owner));
+                        if let Some(keys) = snapshot.canonical.get() {
+                            pending.push(Owner::Receipt(keys));
+                        }
+                    }
+                }
+            }
+        }
+        for refusal in [&self.first_refusal, &self.first_execution_refusal] {
+            if let Some(refusal) = refusal.get() {
+                heap.add_allocation(refusal.reason.capacity());
+            }
+        }
+    }
+
     /// Runtime cache access affects scoped retry eligibility only.
     pub fn mark_runtime_cache_touched(&self) {
         self.runtime_cache_touched.store(true, Ordering::Relaxed);
@@ -773,6 +714,7 @@ impl ReadLedger {
     }
 
     fn record_key(&self, key: Cow<'_, ReadKey>, hash: &mut Option<u64>) {
+        record_evaluation_selection_read(&key);
         let mut keys = self.keys.lock().expect("read ledger mutex poisoned");
         if keys
             .last
@@ -822,6 +764,9 @@ impl ReadLedger {
     }
 
     pub(crate) fn absorb_receipt(&self, receipt: &Arc<[ReadKey]>) {
+        for key in receipt.iter() {
+            record_evaluation_selection_read(key);
+        }
         if receipt.is_empty() {
             return;
         }
@@ -832,6 +777,12 @@ impl ReadLedger {
     }
 
     pub(crate) fn absorb_capture(&self, capture: &ReadLedger) {
+        if brokk_bifrost_core::analyzer::carried_context::current_evaluation().is_some() {
+            capture.keys_satisfy(|key| {
+                record_evaluation_selection_read(key);
+                true
+            });
+        }
         if self.identity == capture.identity || capture.is_empty() {
             return;
         }
@@ -937,6 +888,11 @@ impl ReadLedger {
 
     #[track_caller]
     pub fn mark_execution_dependent_reads(&self, count: usize) {
+        if count > 0 {
+            brokk_bifrost_core::analyzer::carried_context::join_evaluation_verdict(
+                ReuseVerdict::ExecutionDependent(ExecutionCause::Other),
+            );
+        }
         if count > 0 && brokk_bifrost_core::profiling::enabled() {
             brokk_bifrost_core::analyzer::execution_census::record_ledger_mark(
                 std::panic::Location::caller(),
@@ -978,6 +934,16 @@ impl ReadLedger {
         self.first_execution_refusal.get().cloned()
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_test_refusal_origins(
+        &self,
+        read: brokk_bifrost_core::profiling::ReadRefusal,
+        execution: brokk_bifrost_core::profiling::ReadRefusal,
+    ) {
+        self.first_refusal.get_or_init(|| read);
+        self.first_execution_refusal.get_or_init(|| execution);
+    }
+
     pub fn first_refusal(&self) -> Option<brokk_bifrost_core::profiling::ReadRefusal> {
         self.first_refusal.get().cloned()
     }
@@ -996,6 +962,24 @@ impl ReadLedger {
         self.reuse_refused.load(Ordering::Relaxed)
     }
 
+    /// A store read failed under this capture. The product it captured must
+    /// not be published for another consumer: that consumer would replay the
+    /// failure as an incomplete answer instead of making its own read, and
+    /// would carry no store error of its own (#11534). The failure also
+    /// refuses reuse, so every publisher that already checks `reuse_refused`
+    /// declines the product without a separate rule.
+    #[track_caller]
+    pub fn record_store_failure(&self) {
+        self.store_failed.store(true, Ordering::Relaxed);
+        self.refuse_read_reuse();
+    }
+
+    /// Whether a store read failed under this capture. Publishers whose
+    /// product has no read receipt ask this directly.
+    pub fn store_failed(&self) -> bool {
+        self.store_failed.load(Ordering::Relaxed)
+    }
+
     pub fn refuse_persistence(&self) {
         self.record_persistence_refusals(1);
     }
@@ -1009,19 +993,53 @@ impl ReadLedger {
         self.persistence_refusals.load(Ordering::Relaxed)
     }
 
+    /// Join a verdict a computation returned into this capture's.
+    pub fn join_verdict(&self, verdict: ReuseVerdict) {
+        brokk_bifrost_core::analyzer::carried_context::join_evaluation_verdict(verdict);
+        self.explicit_verdict
+            .fetch_max(verdict_rank(verdict), Ordering::Relaxed);
+    }
+
+    pub fn explicit_verdict(&self) -> ReuseVerdict {
+        match self.explicit_verdict.load(Ordering::Relaxed) {
+            0 => ReuseVerdict::Content,
+            1 => ReuseVerdict::ExecutionDependent(ExecutionCause::ConfiguredCap),
+            2 => ReuseVerdict::ExecutionDependent(ExecutionCause::BudgetRefusal),
+            3 => ReuseVerdict::ExecutionDependent(ExecutionCause::Other),
+            rank => unreachable!("reuse verdict rank {rank} was never encoded"),
+        }
+    }
+
+    /// The verdict today's execution-dependence counts imply.
+    pub fn ambient_verdict(&self) -> ReuseVerdict {
+        ReuseVerdict::from_counts(self.execution_dependences(), self.budget_dependences())
+    }
+
+    #[track_caller]
+    fn debug_assert_explicit_not_stricter(&self) {
+        if cfg!(debug_assertions) {
+            self.explicit_verdict()
+                .debug_assert_not_stricter_than(self.ambient_verdict());
+        }
+    }
+
     pub fn channels(&self) -> brokk_bifrost_core::analyzer::memo_attribution::ReadChannels {
+        self.debug_assert_explicit_not_stricter();
         brokk_bifrost_core::analyzer::memo_attribution::ReadChannels {
             unattributed_reads: self.unattributed_reads(),
             execution_dependences: self.execution_dependences(),
             budget_dependences: self.budget_dependences(),
             reuse_refused: self.reuse_refused(),
+            store_failed: self.store_failed(),
             persistence_refusals: self.persistence_refusals(),
+            explicit_verdict: self.explicit_verdict(),
         }
     }
 
     /// Whether every read this ledger observed was named.
     pub fn is_bounded(&self) -> bool {
-        self.unattributed_reads() == 0 && self.execution_dependences() == 0 && !self.reuse_refused()
+        self.debug_assert_explicit_not_stricter();
+        self.channels().is_bounded()
     }
 
     /// The keys to publish to disk, or `None` when this ledger must not be
@@ -1033,7 +1051,17 @@ impl ReadLedger {
             return None;
         }
         let keys = self.keys();
-        keys.iter().all(ReadKey::is_persistable).then_some(keys)
+        if !keys.iter().all(ReadKey::is_persistable) {
+            return None;
+        }
+        brokk_bifrost_core::analyzer::reuse_verdict::admit(
+            brokk_bifrost_core::analyzer::reuse_verdict::CapBinding::Unbound,
+            keys,
+            self.explicit_verdict(),
+            self.ambient_verdict(),
+            brokk_bifrost_core::analyzer::reuse_verdict::SelectionEvidence::NotApplicable,
+        )
+        .map(|admitted| admitted.into_inner())
     }
 
     /// How many funnel crossings could not be attributed to a key.
@@ -1061,10 +1089,92 @@ impl ReadLedger {
         self.snapshot().contains(key)
     }
 
+    /// Weigh a completed capture, including shared DAG containers and the
+    /// canonical key publications its immutable snapshots can memoize later.
+    pub(crate) fn retained_snapshot_bytes(&self) -> usize {
+        use brokk_bifrost_core::retention_budget::RetainedBytes;
+        use std::mem::size_of;
+        const ARC_HEADER: usize = 2 * size_of::<usize>();
+        let snapshot = self.snapshot();
+        let keys = self.keys.lock().expect("read ledger mutex poisoned");
+        debug_assert_eq!(keys.generation, snapshot.generation);
+        let mut bytes = size_of::<Self>()
+            + ARC_HEADER
+            + keys.inputs.capacity().next_power_of_two()
+                * (size_of::<(ReadInputIdentity, ReadInput)>() + 1);
+        for refusal in [self.first_refusal.get(), self.first_execution_refusal.get()]
+            .into_iter()
+            .flatten()
+        {
+            bytes += refusal.reason.capacity();
+        }
+        let mut stack = vec![snapshot.as_ref()];
+        let mut snapshots = HashSet::default();
+        let mut locals = HashSet::default();
+        let mut receipts = HashSet::default();
+        let mut receipt_bytes = |keys: &Arc<[ReadKey]>| {
+            if receipts.insert(keys.as_ptr() as usize) {
+                ARC_HEADER
+                    + keys
+                        .iter()
+                        .map(RetainedBytes::retained_bytes)
+                        .sum::<usize>()
+            } else {
+                0
+            }
+        };
+        while let Some(snapshot) = stack.pop() {
+            if !snapshots.insert(std::ptr::from_ref(snapshot)) {
+                continue;
+            }
+            bytes += size_of::<ReadSnapshot>()
+                + ARC_HEADER
+                + snapshot.inputs.capacity() * size_of::<ReadInput>();
+            if locals.insert(Arc::as_ptr(&snapshot.local)) {
+                bytes += size_of::<LocalReadKeys>()
+                    + ARC_HEADER
+                    + snapshot.local.table.capacity().next_power_of_two()
+                        * (size_of::<(u64, ReadKey)>() + 1)
+                    + snapshot
+                        .local
+                        .table
+                        .iter()
+                        .map(|(_, key)| key.retained_bytes() - size_of::<ReadKey>())
+                        .sum::<usize>();
+            }
+            bytes += match snapshot.canonical.get() {
+                Some(keys) => receipt_bytes(keys),
+                // Reserve the lazy publication now: populating it later must
+                // not grow an already admitted arena beyond its charge.
+                None => {
+                    ARC_HEADER
+                        + snapshot
+                            .unique_keys()
+                            .iter()
+                            .map(|(_, key)| key.retained_bytes())
+                            .sum::<usize>()
+                }
+            };
+            for input in &snapshot.inputs {
+                match input {
+                    ReadInput::Capture(child) => stack.push(child),
+                    ReadInput::Receipt(keys) => bytes += receipt_bytes(keys),
+                }
+            }
+        }
+        bytes
+    }
+
     /// Set-valued receipts and internal forwarding do not require ordering.
     #[doc(hidden)]
     pub fn unordered_keys(&self) -> Vec<ReadKey> {
         self.snapshot().unordered_keys()
+    }
+
+    /// Gather once and return actual DAG/node/key visits before deduplication.
+    #[doc(hidden)]
+    pub fn unordered_keys_with_work(&self) -> (Vec<ReadKey>, usize) {
+        self.snapshot().unordered_keys_with_work()
     }
 
     /// Inspect a completed read set by reference, without cloning or ordering
@@ -1105,6 +1215,96 @@ impl ReadLedger {
 mod tests {
     use super::*;
     use crate::test_support::synthetic_oid as oid;
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9925: selected-entry receipts retained uncounted shared read DAG allocations"
+    )]
+    fn retained_receipts_count_owners_without_publishing_or_flattening() {
+        use crate::analyzer::store::cache_budget::RetainedHeap;
+
+        fn bytes(ledgers: &[&Arc<ReadLedger>]) -> usize {
+            let mut heap = RetainedHeap::default();
+            for ledger in ledgers {
+                heap.arc(ledger, |ledger, heap| ledger.retained_heap(heap));
+            }
+            let flat = heap
+                .shared_allocations()
+                .map(|(_, bytes)| bytes)
+                .sum::<usize>();
+            let exclusive = heap.exclusive_bytes();
+            let total = heap.total();
+            assert_eq!(
+                exclusive + flat,
+                total,
+                "flat records exclude nested Arc owners"
+            );
+            total
+        }
+        let key = ReadKey::index(IndexFamily::DefinitionExact, "long-name".repeat(1024));
+        let source = ReadLedger::new();
+        source.record(key.clone());
+        let middle = ReadLedger::new();
+        middle.absorb_capture(&source);
+        let left = Arc::new(ReadLedger::new());
+        left.absorb_capture(&middle);
+        let right = Arc::new(ReadLedger::new());
+        right.absorb_capture(&middle);
+        let source_snapshot = source.snapshot();
+        let middle_snapshot = middle.snapshot();
+        let shared = bytes(&[&left, &right]);
+        assert_eq!(shared, bytes(&[&left, &right, &left]));
+        assert!(source_snapshot.canonical.get().is_none());
+        assert!(middle_snapshot.canonical.get().is_none());
+        assert!(left.keys.lock().unwrap().snapshot.is_none());
+        assert!(right.keys.lock().unwrap().snapshot.is_none());
+
+        // Equal key values in a different backing are real retained memory.
+        let independent_source = ReadLedger::new();
+        independent_source.record(key);
+        let independent_middle = ReadLedger::new();
+        independent_middle.absorb_capture(&independent_source);
+        let independent_right = Arc::new(ReadLedger::new());
+        independent_right.absorb_capture(&independent_middle);
+        assert!(bytes(&[&left, &independent_right]) > shared + 8192);
+    }
+
+    // The collector never names a family: a family declared a selection
+    // authority beside the read vocabulary is collected, and one that is not
+    // declared is not.
+    #[test]
+    fn every_declared_selection_family_is_collected_without_collector_changes() {
+        use brokk_bifrost_core::analyzer::carried_context::EvaluationExecution;
+        let mut declared = 0;
+        for (family, label) in WorkspaceFactFamily::LABELS {
+            let evaluation = Arc::new(EvaluationExecution::default());
+            let _installed = evaluation.install();
+            let key = ReadKey::Lookup {
+                kind: LookupKind::WorkspaceFact,
+                question: LookupQuestion::WorkspaceFact {
+                    family: *family,
+                    language: Language::None,
+                    subject: FactSubject::Whole,
+                },
+                digest: StableDigest::from_array([3; 32]),
+            };
+            ReadLedger::new().record(key.clone());
+            let collected = evaluation
+                .selection_reads::<EvaluationSelectionReads>()
+                .keys();
+            assert_eq!(
+                collected,
+                if family.is_selection_authority() {
+                    vec![key]
+                } else {
+                    Vec::new()
+                },
+                "{label}"
+            );
+            declared += usize::from(family.is_selection_authority());
+        }
+        assert!(declared > 0);
+    }
 
     fn file_key(path: &str, byte: u8) -> ReadKey {
         ReadKey::file(
@@ -1453,6 +1653,11 @@ mod tests {
     #[test]
     fn a_lookup_question_round_trips_through_serde() {
         let questions = [
+            LookupQuestion::WorkspaceFact {
+                family: WorkspaceFactFamily::CSharpCompilationMembershipCompleteness,
+                language: Language::CSharp,
+                subject: FactSubject::Whole,
+            },
             LookupQuestion::StructuralRoleName {
                 language: Language::Rust,
                 role: brokk_bifrost_core::analyzer::structural::kinds::Role::Callee,

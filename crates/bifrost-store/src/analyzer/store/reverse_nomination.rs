@@ -60,8 +60,15 @@ pub(super) struct ReverseSourceLookup {
 pub struct ReverseCandidateSet {
     pub(super) locators: Vec<SelectedSemanticLocator>,
     pub(super) names: Vec<(i64, String, String)>,
+    pub(super) completion: ResolutionCompletion,
 }
 impl ReverseCandidateSet {
+    /// Request-local evidence about routes the selected placements cannot prove.
+    #[doc(hidden)]
+    pub fn completion(&self) -> &ResolutionCompletion {
+        &self.completion
+    }
+
     pub(super) fn into_seeded_locators(
         mut self,
         seeds: &[SelectedSemanticLocator],
@@ -85,6 +92,11 @@ impl ReverseCandidateSet {
                 .map(move |locator| ProjectFile::new(root, locator.relative_path())),
         )
     }
+}
+
+pub(super) enum ReverseTargetFrontier {
+    Unavailable(crate::analyzer::store::resolution_selection::MissingDefinitionReason),
+    Placed(ResolutionCompletion),
 }
 
 /// Language hooks read existing indexed summaries and classify source forms.
@@ -113,6 +125,17 @@ pub(super) trait ReverseNominationHooks {
         name: &str,
         cancellation: &CancellationToken,
     ) -> Result<Vec<SelectedSemanticLocator>>;
+    /// Availability and frontier completeness are one selected outcome. A
+    /// placed definition can retain routes even when ownership is incomplete.
+    fn target_frontier(
+        &self,
+        _target: &CodeUnit,
+        _definition: SemanticId,
+    ) -> Result<ReverseTargetFrontier> {
+        Ok(ReverseTargetFrontier::Placed(
+            ResolutionCompletion::Complete,
+        ))
+    }
     fn exposure_seeds(
         &self,
         target: &CodeUnit,
@@ -214,12 +237,34 @@ pub(super) fn nominate_reverse_target(
     extra_names: &[String],
     cancellation: &CancellationToken,
 ) -> Result<Option<ReverseCandidateSet>> {
+    Ok(
+        nominate_reverse_target_with_reason(operation, hooks, target, extra_names, cancellation)?
+            .ok(),
+    )
+}
+
+pub(super) fn nominate_reverse_target_with_reason(
+    operation: &SelectedResolutionOperation<'_, '_>,
+    hooks: &impl ReverseNominationHooks,
+    target: &CodeUnit,
+    extra_names: &[String],
+    cancellation: &CancellationToken,
+) -> Result<
+    std::result::Result<
+        ReverseCandidateSet,
+        crate::analyzer::store::resolution_selection::MissingDefinitionReason,
+    >,
+> {
     let Some(definition) = hooks.locate_reverse_definition(target, cancellation)? else {
-        return Ok(None);
+        return Ok(Err(
+            crate::analyzer::store::resolution_selection::MissingDefinitionReason::UncertifiedDefinition,
+        ));
     };
     let lexical = operation.ready.lexical_source();
     let Some(provenance) = lexical.semantic_provenance(definition, cancellation)? else {
-        return Ok(None);
+        return Ok(Err(
+            crate::analyzer::store::resolution_selection::MissingDefinitionReason::UncertifiedDefinition,
+        ));
     };
     let SelectedSemanticProvenance::FragmentLocal(local) = provenance else {
         return Err(StoreError::new(
@@ -244,10 +289,15 @@ pub(super) fn nominate_reverse_target(
                 )?,
         )
     };
+    let completion = match hooks.target_frontier(target, definition)? {
+        ReverseTargetFrontier::Unavailable(reason) => return Ok(Err(reason)),
+        ReverseTargetFrontier::Placed(completion) => completion,
+    };
     let Some((blob, site)) = coordinate else {
-        return Ok(Some(ReverseCandidateSet {
+        return Ok(Ok(ReverseCandidateSet {
             locators: overlay_locators,
             names: Vec::new(),
+            completion,
         }));
     };
     let seeds = hooks.exposure_seeds(target, blob, site)?;
@@ -262,7 +312,9 @@ pub(super) fn nominate_reverse_target(
     let mut inventory_names = Vec::new();
     while let Some(exposure) = pending.pop() {
         if cancellation.is_cancelled() {
-            return Ok(None);
+            return Ok(Err(
+                crate::analyzer::store::resolution_selection::MissingDefinitionReason::UncertifiedDefinition,
+            ));
         }
         if exposure.depth == 64 {
             return Err(StoreError::new("reverse export route reached depth 64"));
@@ -303,7 +355,9 @@ pub(super) fn nominate_reverse_target(
     let mut lookup_keys = Vec::new();
     for (blob, name, scope) in sources {
         if cancellation.is_cancelled() {
-            return Ok(None);
+            return Ok(Err(
+                crate::analyzer::store::resolution_selection::MissingDefinitionReason::UncertifiedDefinition,
+            ));
         }
         let found = hooks.source_lookup(blob, &name, scope, cancellation)?;
         candidates.extend(found.candidates);
@@ -312,7 +366,9 @@ pub(super) fn nominate_reverse_target(
     let Some(groups) =
         read_reverse_candidates_with_arms(operation, &lookup_keys, candidate_arms, cancellation)?
     else {
-        return Ok(None);
+        return Ok(Err(
+            crate::analyzer::store::resolution_selection::MissingDefinitionReason::UncertifiedDefinition,
+        ));
     };
     for candidate in groups.into_iter().flatten() {
         candidates.insert((candidate.context.blob, candidate.site.get()));
@@ -320,7 +376,9 @@ pub(super) fn nominate_reverse_target(
     let mut root_keys = Vec::new();
     for name in &names {
         let Some(found) = hooks.root_lookup(name, cancellation)? else {
-            return Ok(None);
+            return Ok(Err(
+                crate::analyzer::store::resolution_selection::MissingDefinitionReason::UncertifiedDefinition,
+            ));
         };
         candidates.extend(found.candidates);
         root_keys.extend(found.keys);
@@ -328,7 +386,9 @@ pub(super) fn nominate_reverse_target(
     let Some(groups) =
         read_reverse_candidates_with_arms(operation, &root_keys, candidate_arms, cancellation)?
     else {
-        return Ok(None);
+        return Ok(Err(
+            crate::analyzer::store::resolution_selection::MissingDefinitionReason::UncertifiedDefinition,
+        ));
     };
     for candidate in groups.into_iter().flatten() {
         candidates.insert((candidate.context.blob, candidate.site.get()));
@@ -348,7 +408,9 @@ pub(super) fn nominate_reverse_target(
     let mut observations = Vec::new();
     for &(blob, site) in &candidates {
         let Some(observed) = hooks.observation_sites(blob, site, cancellation)? else {
-            return Ok(None);
+            return Ok(Err(
+                crate::analyzer::store::resolution_selection::MissingDefinitionReason::UncertifiedDefinition,
+            ));
         };
         observations.extend(observed.into_iter().map(|site| (blob, site.get())));
     }
@@ -357,7 +419,9 @@ pub(super) fn nominate_reverse_target(
     locators.extend(range_locators);
     for (blob, site) in candidates {
         if cancellation.is_cancelled() {
-            return Ok(None);
+            return Ok(Err(
+                crate::analyzer::store::resolution_selection::MissingDefinitionReason::UncertifiedDefinition,
+            ));
         }
         locators.extend(hooks.site_locators(blob, site)?);
     }
@@ -365,8 +429,9 @@ pub(super) fn nominate_reverse_target(
     locators.dedup();
     inventory_names.sort_unstable();
     inventory_names.dedup();
-    Ok(Some(ReverseCandidateSet {
+    Ok(Ok(ReverseCandidateSet {
         locators,
         names: inventory_names,
+        completion,
     }))
 }
